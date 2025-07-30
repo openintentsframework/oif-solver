@@ -14,7 +14,9 @@ pub mod implementations {
 	pub mod onchain {
 		pub mod _7683;
 	}
-	pub mod offchain {}
+	pub mod offchain {
+		pub mod _7683;
+	}
 }
 
 /// Errors that can occur during intent discovery operations.
@@ -26,6 +28,12 @@ pub enum DiscoveryError {
 	/// Error that occurs when trying to start monitoring on an already active source.
 	#[error("Already monitoring")]
 	AlreadyMonitoring,
+	/// Error that occurs when parsing or decoding data fails.
+	#[error("Parse error: {0}")]
+	ParseError(String),
+	/// Error that occurs when validating intent data.
+	#[error("Validation error: {0}")]
+	ValidationError(String),
 }
 
 /// Trait defining the interface for intent discovery sources.

@@ -12,6 +12,7 @@ use thiserror::Error;
 /// Re-export implementations
 pub mod implementations {
 	pub mod file;
+	pub mod memory;
 }
 
 /// Errors that can occur during storage operations.

@@ -178,12 +178,19 @@ impl DeliveryService {
 	/// This method tries all providers until one recognizes the transaction.
 	pub async fn get_status(&self, hash: &TransactionHash) -> Result<bool, DeliveryError> {
 		// Try all providers until one recognizes the transaction
-		for (_chain_id, provider) in self.providers.iter() {
+		// TODO: Improve this so it doesn't make redundant requests
+		for (chain_id, provider) in self.providers.iter() {
 			match provider.get_receipt(hash).await {
 				Ok(receipt) => {
 					return Ok(receipt.success);
 				}
-				Err(_) => {
+				Err(e) => {
+					tracing::trace!(
+						"Provider for chain {} cannot find transaction {}: {}",
+						chain_id,
+						hex::encode(&hash.0),
+						e
+					);
 					continue;
 				}
 			}

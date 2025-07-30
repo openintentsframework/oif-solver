@@ -1,5 +1,43 @@
 #!/bin/bash
-# send_intent.sh - Send a test intent transaction that calls InputSettler7683.open()
+# send_onchain_intent.sh - Send a test intent transaction that calls InputSettler7683.open()
+#
+# This script creates an on-chain EIP-7683 cross-chain intent by calling the InputSettler
+# contract's open() function. This demonstrates the flow for on-chain intent creation.
+#
+# FLOW:
+# 1. Validate environment:
+#    - Check that Anvil chains are running
+#    - Verify contracts are deployed
+#    - Load configuration from config/demo.toml
+#
+# 2. Build EIP-7683 intent data:
+#    - Create MandateERC7683 struct with cross-chain order details
+#    - Set 1 hour expiry time
+#    - Specify input (1 TEST on origin) and output (1 TEST on destination)
+#    - Encode data according to EIP-7683 specification
+#
+# 3. Approve tokens:
+#    - Ensure InputSettler can spend user's TEST tokens
+#    - Approve max amount if not already approved
+#
+# 4. Send intent transaction:
+#    - Call InputSettler7683.open() with the encoded order data
+#    - User's tokens are locked in the settler contract
+#    - Intent is emitted as an on-chain event
+#
+# 5. Verify transaction:
+#    - Check that user's balance decreased by 1 TEST
+#    - Confirm tokens are held by InputSettler
+#    - Display final balances on both chains
+#
+# PREREQUISITES:
+#   - Run ./setup_local_anvil.sh first to deploy contracts
+#   - Solver service should be running to discover and fill the intent
+#
+# USAGE:
+#   ./send_onchain_intent.sh          - Send a complete intent transaction
+#   ./send_onchain_intent.sh balances - Just check current balances
+#   ./send_onchain_intent.sh approve  - Just approve tokens (no intent)
 
 set -e
 
@@ -65,14 +103,6 @@ echo -e "   Dest Token:       $DEST_TOKEN_ADDRESS (Chain 31338)"
 echo -e "   InputSettler:     $INPUT_SETTLER_ADDRESS (Origin)"
 echo -e "   OutputSettler:    $OUTPUT_SETTLER_ADDRESS (Destination)"
 
-# Debug mode - uncomment to see what's being extracted
-if [ "$DEBUG" = "1" ]; then
-    echo -e "${YELLOW}🔍 Debug Info:${NC}"
-    echo -e "   RPC_URL: $RPC_URL"
-    echo -e "   ORIGIN_TOKEN_ADDRESS length: ${#ORIGIN_TOKEN_ADDRESS}"
-    echo -e "   USER_ADDR length: ${#USER_ADDR}"
-    echo -e "   Config file exists: $([ -f "config/demo.toml" ] && echo "Yes" || echo "No")"
-fi
 
 # Function to check balances
 check_balance() {
@@ -81,27 +111,11 @@ check_balance() {
     local rpc_url=${3:-$RPC_URL}
     local token_addr=${4:-$ORIGIN_TOKEN_ADDRESS}
     
-    # Debug mode - show the exact command being run
-    if [ "$DEBUG" = "1" ]; then
-        echo -e "${YELLOW}   Debug: cast call $token_addr \"balanceOf(address)\" $address --rpc-url $rpc_url${NC}"
-    fi
-    
-    # Filter out debug logs and only get the hex value (starts with 0x)
     local balance_hex=$(cast call $token_addr "balanceOf(address)" $address --rpc-url $rpc_url 2>&1 | grep -E '^0x[0-9a-fA-F]+$' | tail -1)
     
-    # Debug: Check if balance_hex is empty
     if [ -z "$balance_hex" ]; then
-        # Try without suppressing errors to see what's wrong
-        local error_msg=$(cast call $token_addr "balanceOf(address)" $address --rpc-url $rpc_url 2>&1)
-        if [ "$DEBUG" = "1" ]; then
-            echo -e "${RED}   Error for $name: $error_msg${NC}"
-        fi
         echo -e "   $name: 0 TEST (Error: check RPC connection)"
         return
-    fi
-    
-    if [ "$DEBUG" = "1" ]; then
-        echo -e "${YELLOW}   Hex balance for $name: $balance_hex${NC}"
     fi
     
     local balance_dec=$(cast to-dec $balance_hex 2>/dev/null || echo "0")
@@ -225,7 +239,6 @@ approve_tokens() {
     echo -e "${YELLOW}🔓 Approving InputSettler to spend tokens...${NC}"
     
     # Check current allowance
-    # Filter out debug logs and only get the hex value
     CURRENT_ALLOWANCE=$(cast call $ORIGIN_TOKEN_ADDRESS \
         "allowance(address,address)" \
         $USER_ADDR \
@@ -273,11 +286,8 @@ send_intent() {
         --private-key $USER_PRIVATE_KEY 2>&1)
     
     if [ $? -eq 0 ]; then
-        # Extract transaction hash from the output
-        # First try to find it in the standard output format
         TX_HASH=$(echo "$INTENT_TX" | grep -o '"transactionHash":"0x[^"]*"' | head -1 | cut -d'"' -f4)
         
-        # If that doesn't work, try alternative format
         if [ -z "$TX_HASH" ]; then
             TX_HASH=$(echo "$INTENT_TX" | grep -o '0x[a-fA-F0-9]\{64\}' | head -1)
         fi
@@ -286,13 +296,6 @@ send_intent() {
         
         if [ -n "$TX_HASH" ]; then
             echo -e "${BLUE}   Transaction Hash: $TX_HASH${NC}"
-            
-            # Extract block number if available
-            BLOCK_NUM=$(echo "$INTENT_TX" | grep -o '"blockNumber":"0x[^"]*"' | head -1 | cut -d'"' -f4)
-            if [ -n "$BLOCK_NUM" ]; then
-                BLOCK_DEC=$(printf "%d" "$BLOCK_NUM" 2>/dev/null || echo "unknown")
-                echo -e "${BLUE}   Block: $BLOCK_DEC${NC}"
-            fi
         fi
         
         # Wait for transaction to be mined
@@ -429,7 +432,6 @@ main() {
     
     echo ""
     echo -e "${GREEN}🎉 Intent Transaction Complete!${NC}"
-    echo -e "${YELLOW}📡 Monitor the solver with: ./monitor_api.sh${NC}"
     echo -e "${YELLOW}🔍 Check discovery events at: http://localhost:8080/api/v1/discovery/stats${NC}"
 }
 
@@ -494,10 +496,6 @@ case "${1:-send}" in
         echo "  send (default) - Send a complete intent transaction"
         echo "  balances       - Check current token balances"
         echo "  approve        - Just approve tokens (no intent)"
-        echo ""
-        echo "Environment variables:"
-        echo "  DEBUG=1       - Enable debug output"
-        echo "  WAIT_TIME=60  - Set wait time after transaction (default: 30s)"
         exit 1
         ;;
 esac

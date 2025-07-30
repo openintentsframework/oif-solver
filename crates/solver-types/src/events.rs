@@ -40,6 +40,12 @@ pub enum DiscoveryEvent {
 /// Events related to order processing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OrderEvent {
+	/// An order is being prepared for execution (e.g., openFor for off-chain orders).
+	Preparing {
+		intent: Intent,
+		order: Order,
+		params: ExecutionParams,
+	},
 	/// An order is being executed with the specified parameters.
 	Executing {
 		order: Order,
@@ -95,6 +101,8 @@ pub enum SettlementEvent {
 /// Types of transactions in the solver system.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum TransactionType {
+	/// Transaction that prepares an off-chain order on-chain (e.g., openFor).
+	Prepare,
 	/// Transaction that fills an order on the destination chain.
 	Fill,
 	/// Transaction that claims rewards on the origin chain.

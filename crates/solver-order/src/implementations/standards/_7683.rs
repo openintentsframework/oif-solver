@@ -8,14 +8,32 @@ use crate::{OrderError, OrderInterface};
 use alloy_primitives::{Address as AlloyAddress, FixedBytes, U256};
 use alloy_sol_types::{sol, SolCall, SolValue};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use solver_types::{
-	Address, ConfigSchema, ExecutionParams, Field, FieldType, FillProof, Intent, Order, Schema,
-	Transaction,
+	eip7683::Eip7683OrderData, Address, ConfigSchema, ExecutionParams, Field, FieldType, FillProof,
+	Intent, Order, Schema, Transaction,
 };
 
 // Solidity type definitions for EIP-7683 contract interactions.
 sol! {
+	/// OnchainCrossChainOrder for open() call
+	struct OnchainCrossChainOrder {
+		uint32 fillDeadline;
+		bytes32 orderDataType;
+		bytes orderData;
+	}
+
+	/// GaslessCrossChainOrder for openFor() call
+	struct GaslessCrossChainOrder {
+		address originSettler;
+		address user;
+		uint256 nonce;
+		uint256 originChainId;
+		uint32 openDeadline;
+		uint32 fillDeadline;
+		bytes32 orderDataType;
+		bytes orderData;
+	}
+
 	/// MandateOutput structure used in fill operations.
 	struct MandateOutput {
 		bytes32 oracle;
@@ -48,41 +66,30 @@ sol! {
 	/// IInputSettler interface for finalizing orders.
 	interface IInputSettler {
 		function finaliseSelf(OrderStruct order, uint32[] timestamps, bytes32 solver) external;
+		function open(OnchainCrossChainOrder calldata order) external;
+		function openFor(GaslessCrossChainOrder calldata order, bytes calldata signature, bytes calldata originFillerData) external;
 	}
-}
-
-/// EIP-7683 specific order data structure.
-///
-/// Contains all the necessary information for processing a cross-chain order
-/// according to the EIP-7683 standard.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Eip7683OrderData {
-	pub user: String,
-	pub nonce: u64,
-	pub origin_chain_id: u64,
-	pub destination_chain_id: u64,
-	pub expires: u32, // Changed from open_deadline to match contract
-	pub fill_deadline: u32,
-	pub local_oracle: String,   // Added oracle address
-	pub inputs: Vec<[U256; 2]>, // Added inputs array [token, amount]
-	pub order_id: [u8; 32],
-	pub settle_gas_limit: u64,
-	pub fill_gas_limit: u64,
-	pub outputs: Vec<Output>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Output {
-	pub token: String,
-	pub amount: U256,
-	pub recipient: String,
-	pub chain_id: u64,
 }
 
 /// EIP-7683 order implementation.
 ///
-/// Handles validation and transaction generation for EIP-7683 cross-chain orders.
-/// Manages interactions with both input and output settler contracts.
+/// This struct implements the `OrderInterface` trait for EIP-7683 cross-chain orders.
+/// It handles validation and transaction generation for filling orders across chains,
+/// managing interactions with both input (origin chain) and output (destination chain)
+/// settler contracts.
+///
+/// # Architecture
+///
+/// The implementation supports three main operations:
+/// 1. **Prepare** - For off-chain orders, creates on-chain order via `openFor()`
+/// 2. **Fill** - Executes order on destination chain via settler's `fill()`
+/// 3. **Claim** - Claims rewards on origin chain via `finaliseSelf()`
+///
+/// # Fields
+///
+/// * `output_settler_address` - Settler contract on destination chains for fills
+/// * `input_settler_address` - Settler contract on origin chain for claims
+/// * `solver_address` - Solver address for reward attribution
 pub struct Eip7683OrderImpl {
 	/// Address of the output settler contract on destination chains.
 	output_settler_address: Address,
@@ -94,6 +101,16 @@ pub struct Eip7683OrderImpl {
 
 impl Eip7683OrderImpl {
 	/// Creates a new EIP-7683 order implementation.
+	///
+	/// # Arguments
+	///
+	/// * `output_settler` - Hex-encoded address of the output settler contract
+	/// * `input_settler` - Hex-encoded address of the input settler contract
+	/// * `solver` - Hex-encoded address of the solver
+	///
+	/// # Panics
+	///
+	/// Panics if any of the provided addresses are invalid hex strings.
 	pub fn new(output_settler: String, input_settler: String, solver: String) -> Self {
 		Self {
 			output_settler_address: Address(
@@ -112,6 +129,17 @@ impl Eip7683OrderImpl {
 }
 
 /// Configuration schema for EIP-7683 order implementation.
+///
+/// Validates configuration parameters required for the EIP-7683 order processor.
+/// Ensures all addresses are valid Ethereum addresses in hex format.
+///
+/// # Required Configuration
+///
+/// ```toml
+/// output_settler_address = "0x..."  # 42-char hex address
+/// input_settler_address = "0x..."   # 42-char hex address
+/// solver_address = "0x..."          # 42-char hex address
+/// ```
 pub struct Eip7683OrderSchema;
 
 impl ConfigSchema for Eip7683OrderSchema {
@@ -160,6 +188,24 @@ impl OrderInterface for Eip7683OrderImpl {
 	}
 
 	/// Validates an EIP-7683 intent and converts it to an order.
+	///
+	/// Performs validation checks to ensure the intent is a valid EIP-7683 order
+	/// that hasn't expired. Extracts and validates the order data structure.
+	///
+	/// # Arguments
+	///
+	/// * `intent` - The intent to validate
+	///
+	/// # Returns
+	///
+	/// Returns a validated `Order` ready for processing.
+	///
+	/// # Errors
+	///
+	/// Returns `OrderError::ValidationFailed` if:
+	/// - The intent is not an EIP-7683 order
+	/// - The order data cannot be parsed
+	/// - The order has expired
 	async fn validate_intent(&self, intent: &Intent) -> Result<Order, OrderError> {
 		if intent.standard != "eip7683" {
 			return Err(OrderError::ValidationFailed(
@@ -193,7 +239,120 @@ impl OrderInterface for Eip7683OrderImpl {
 		})
 	}
 
+	/// Generates a transaction to prepare an order for filling (if needed).
+	///
+	/// For off-chain orders, this calls `openFor()` to create the order on-chain.
+	/// On-chain orders don't require preparation and return `None`.
+	///
+	/// # Arguments
+	///
+	/// * `intent` - The original intent (used to check if off-chain)
+	/// * `order` - The validated order
+	/// * `_params` - Execution parameters (currently unused)
+	///
+	/// # Returns
+	///
+	/// Returns `Some(Transaction)` for off-chain orders that need to be opened,
+	/// or `None` for on-chain orders.
+	///
+	/// # Errors
+	///
+	/// Returns `OrderError::ValidationFailed` if:
+	/// - Order data is missing required fields for off-chain orders
+	/// - Address parsing fails
+	/// - Hex decoding fails
+	async fn generate_prepare_transaction(
+		&self,
+		intent: &Intent,
+		order: &Order,
+		_params: &ExecutionParams,
+	) -> Result<Option<Transaction>, OrderError> {
+		// Only off-chain orders need preparation
+		if intent.source != "off-chain" {
+			return Ok(None);
+		}
+
+		let order_data: Eip7683OrderData =
+			serde_json::from_value(order.data.clone()).map_err(|e| {
+				OrderError::ValidationFailed(format!("Failed to parse order data: {}", e))
+			})?;
+
+		let origin_settler = self.input_settler_address.clone();
+
+		let raw_order_data = order_data.raw_order_data.as_ref().ok_or_else(|| {
+			OrderError::ValidationFailed("Missing raw order data for off-chain order".to_string())
+		})?;
+
+		let order_data_type = order_data.order_data_type.ok_or_else(|| {
+			OrderError::ValidationFailed("Missing order data type for off-chain order".to_string())
+		})?;
+
+		let signature = order_data.signature.as_ref().ok_or_else(|| {
+			OrderError::ValidationFailed("Missing signature for off-chain order".to_string())
+		})?;
+
+		// Create GaslessCrossChainOrder for openFor
+		let gasless_order = GaslessCrossChainOrder {
+			originSettler: AlloyAddress::from_slice(&origin_settler.0),
+			user: AlloyAddress::from_slice(
+				&hex::decode(order_data.user.trim_start_matches("0x")).map_err(|e| {
+					OrderError::ValidationFailed(format!("Invalid user address: {}", e))
+				})?,
+			),
+			nonce: U256::from(order_data.nonce),
+			originChainId: U256::from(order_data.origin_chain_id),
+			openDeadline: order_data.expires,
+			fillDeadline: order_data.fill_deadline,
+			orderDataType: FixedBytes::<32>::from(order_data_type),
+			orderData: hex::decode(raw_order_data.trim_start_matches("0x"))
+				.map_err(|e| OrderError::ValidationFailed(format!("Invalid order data: {}", e)))?
+				.into(),
+		};
+
+		// Encode openFor call
+		let open_for_data = IInputSettler::openForCall {
+			order: gasless_order,
+			signature: hex::decode(signature.trim_start_matches("0x"))
+				.map_err(|e| OrderError::ValidationFailed(format!("Invalid signature: {}", e)))?
+				.into(),
+			originFillerData: vec![].into(), // Empty filler data
+		}
+		.abi_encode();
+
+		Ok(Some(Transaction {
+			to: Some(self.input_settler_address.clone()),
+			data: open_for_data,
+			value: U256::ZERO,
+			chain_id: order_data.origin_chain_id,
+			nonce: None,
+			gas_limit: Some(300_000), // TODO: Determine gas limit here
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+		}))
+	}
+
 	/// Generates a transaction to fill an EIP-7683 order on the destination chain.
+	///
+	/// Creates a transaction that calls the destination settler's `fill()` function
+	/// with the appropriate order data and solver information.
+	///
+	/// # Arguments
+	///
+	/// * `order` - The order to fill
+	/// * `_params` - Execution parameters (currently unused)
+	///
+	/// # Returns
+	///
+	/// Returns a transaction ready to be signed and submitted.
+	///
+	/// # Errors
+	///
+	/// Returns `OrderError::ValidationFailed` if:
+	/// - Order data cannot be parsed
+	/// - Order is a same-chain order (not supported)
+	/// - No output exists for the destination chain
+	/// - Address parsing fails
 	async fn generate_fill_transaction(
 		&self,
 		order: &Order,
@@ -279,6 +438,25 @@ impl OrderInterface for Eip7683OrderImpl {
 	}
 
 	/// Generates a transaction to claim rewards for a filled order on the origin chain.
+	///
+	/// Creates a transaction that calls the origin settler's `finaliseSelf()` function
+	/// to claim solver rewards after successfully filling an order.
+	///
+	/// # Arguments
+	///
+	/// * `order` - The filled order
+	/// * `fill_proof` - Proof of fill containing oracle attestation
+	///
+	/// # Returns
+	///
+	/// Returns a transaction to claim rewards on the origin chain.
+	///
+	/// # Errors
+	///
+	/// Returns `OrderError::ValidationFailed` if:
+	/// - Order data cannot be parsed
+	/// - Order is a same-chain order (not supported)
+	/// - Address parsing fails
 	async fn generate_claim_transaction(
 		&self,
 		order: &Order,
@@ -405,10 +583,29 @@ impl OrderInterface for Eip7683OrderImpl {
 
 /// Factory function to create an EIP-7683 order implementation from configuration.
 ///
+/// This function is called by the order module factory system to instantiate
+/// a new EIP-7683 order processor with the provided configuration.
+///
+/// # Arguments
+///
+/// * `config` - TOML configuration value containing required parameters
+///
+/// # Returns
+///
+/// Returns a boxed `OrderInterface` implementation for EIP-7683 orders.
+///
+/// # Configuration
+///
 /// Required configuration parameters:
-/// - `output_settler_address`: Address of the output settler contract
-/// - `input_settler_address`: Address of the input settler contract
-/// - `solver_address`: Address of the solver for claiming rewards
+/// ```toml
+/// output_settler_address = "0x..."  # Output settler contract address
+/// input_settler_address = "0x..."   # Input settler contract address
+/// solver_address = "0x..."          # Solver address for rewards
+/// ```
+///
+/// # Panics
+///
+/// Panics if any required configuration parameter is missing.
 pub fn create_order_impl(config: &toml::Value) -> Box<dyn OrderInterface> {
 	let output_settler = config
 		.get("output_settler_address")

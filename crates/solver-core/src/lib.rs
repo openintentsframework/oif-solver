@@ -14,8 +14,8 @@ use solver_order::OrderService;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
 use solver_types::{
-	DeliveryEvent, DiscoveryEvent, EventBus, ExecutionContext, ExecutionDecision, Intent, Order,
-	OrderEvent, SettlementEvent, SolverEvent, TransactionType,
+	DeliveryEvent, DiscoveryEvent, EventBus, ExecutionContext, ExecutionDecision, ExecutionParams,
+	Intent, Order, OrderEvent, SettlementEvent, SolverEvent, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -110,6 +110,9 @@ impl SolverEngine {
 				// Handle events
 				Ok(event) = event_receiver.recv() => {
 					match event {
+						SolverEvent::Order(OrderEvent::Preparing { intent, order, params }) => {
+							self.handle_order_preparation(intent, order, params).await?;
+						}
 						SolverEvent::Order(OrderEvent::Executing { order, params }) => {
 							self.handle_order_execution(order, params).await?;
 						}
@@ -120,6 +123,10 @@ impl SolverEngine {
 
 						SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed { tx_hash, receipt, tx_type }) => {
 							self.handle_transaction_confirmed(tx_hash, receipt, tx_type).await?;
+						}
+
+						SolverEvent::Delivery(DeliveryEvent::TransactionFailed {  tx_hash, error }) => {
+							self.handle_transaction_failed( tx_hash, error).await?;
 						}
 
 						SolverEvent::Settlement(SettlementEvent::ClaimReady { order_id }) => {
@@ -174,13 +181,23 @@ impl SolverEngine {
 					.await
 					.map_err(|e| SolverError::Service(e.to_string()))?;
 
+				// Store intent for later use
+				self.storage
+					.store("intents", &order.id, &intent)
+					.await
+					.map_err(|e| SolverError::Service(e.to_string()))?;
+
 				// Check execution strategy
 				let context = self.build_execution_context().await?;
 				match self.order.should_execute(&order, &context).await {
 					ExecutionDecision::Execute(params) => {
-						tracing::info!("Executing order");
+						tracing::info!("Preparing order for execution");
 						self.event_bus
-							.publish(SolverEvent::Order(OrderEvent::Executing { order, params }))
+							.publish(SolverEvent::Order(OrderEvent::Preparing {
+								intent: intent.clone(),
+								order,
+								params,
+							}))
 							.ok();
 					}
 					ExecutionDecision::Skip(reason) => {
@@ -209,6 +226,66 @@ impl SolverEngine {
 					}))
 					.ok();
 			}
+		}
+
+		Ok(())
+	}
+
+	/// Handles order preparation for off-chain orders.
+	///
+	/// This method:
+	/// 1. Generates a prepare transaction (e.g., openFor)
+	/// 2. Submits the transaction through the delivery service
+	/// 3. Stores the transaction hash and order details for later execution
+	#[instrument(skip_all, fields(order_id = %truncate_id(&order.id)))]
+	async fn handle_order_preparation(
+		&self,
+		intent: Intent,
+		order: Order,
+		params: solver_types::ExecutionParams,
+	) -> Result<(), SolverError> {
+		// Generate prepare transaction
+		if let Some(prepare_tx) = self
+			.order
+			.generate_prepare_transaction(&intent, &order, &params)
+			.await
+			.map_err(|e| SolverError::Service(e.to_string()))?
+		{
+			tracing::info!("Preparing order with transaction");
+
+			// Submit prepare transaction
+			let prepare_tx_hash = self
+				.delivery
+				.deliver(prepare_tx)
+				.await
+				.map_err(|e| SolverError::Service(e.to_string()))?;
+
+			self.event_bus
+				.publish(SolverEvent::Delivery(DeliveryEvent::TransactionPending {
+					order_id: order.id.clone(),
+					tx_hash: prepare_tx_hash.clone(),
+					tx_type: TransactionType::Prepare,
+				}))
+				.ok();
+
+			// Store tx_hash -> order_id mapping
+			self.storage
+				.store("tx_to_order", &hex::encode(&prepare_tx_hash.0), &order.id)
+				.await
+				.map_err(|e| SolverError::Service(e.to_string()))?;
+
+			// Store order and params for later execution after prepare is confirmed
+			let order_id = order.id.clone();
+			self.storage
+				.store("pending_execution", &order_id, &(order, params))
+				.await
+				.map_err(|e| SolverError::Service(e.to_string()))?;
+		} else {
+			// No preparation needed, publish Executing event
+			tracing::info!("No preparation needed, proceeding to execution");
+			self.event_bus
+				.publish(SolverEvent::Order(OrderEvent::Executing { order, params }))
+				.ok();
 		}
 
 		Ok(())
@@ -310,6 +387,7 @@ impl SolverEngine {
 									tx_hash = %truncate_id(&hex::encode(&tx_hash.0)),
 									"Confirmed {}",
 									match tx_type {
+										TransactionType::Prepare => "prepare",
 										TransactionType::Fill => "fill",
 										TransactionType::Claim => "claim",
 									}
@@ -349,7 +427,7 @@ impl SolverEngine {
 					Err(e) => {
 						// Transaction not yet confirmed or error
 						// Show user-friendly message for common cases
-						let message = match e {
+						let message = match &e {
 							DeliveryError::NoProviderAvailable => {
 								"Waiting for transaction to be mined"
 							}
@@ -375,6 +453,20 @@ impl SolverEngine {
 		Ok(())
 	}
 
+	/// Handles failed transactions.
+	///
+	/// Logs an error message for failed transactions.
+	#[instrument(skip_all, fields(tx_hash = %truncate_id(&hex::encode(&tx_hash.0))))]
+	async fn handle_transaction_failed(
+		&self,
+		tx_hash: solver_types::TransactionHash,
+		error: String,
+	) -> Result<(), SolverError> {
+		tracing::error!("Transaction failed: {}", error);
+		// TODO: check if we need to update any status in storage
+		Ok(())
+	}
+
 	/// Handles confirmed transactions based on their type.
 	///
 	/// Routes handling to specific methods based on whether this is a fill
@@ -386,6 +478,7 @@ impl SolverEngine {
 		_receipt: solver_types::TransactionReceipt,
 		tx_type: TransactionType,
 	) -> Result<(), SolverError> {
+		// Defensive check
 		if !_receipt.success {
 			self.event_bus
 				.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
@@ -398,6 +491,10 @@ impl SolverEngine {
 
 		// Handle based on transaction type
 		match tx_type {
+			TransactionType::Prepare => {
+				// For prepare transactions, proceed to execution
+				self.handle_prepare_confirmed(tx_hash).await?;
+			}
 			TransactionType::Fill => {
 				// For fill transactions, start settlement monitoring
 				self.handle_fill_confirmed(tx_hash, _receipt).await?;
@@ -407,6 +504,54 @@ impl SolverEngine {
 				self.handle_claim_confirmed(tx_hash, _receipt).await?;
 			}
 		}
+
+		Ok(())
+	}
+
+	/// Handles prepare transaction confirmation.
+	///
+	/// When a prepare transaction is confirmed, retrieve the pending
+	/// execution details and publish an Executing event to proceed with fill.
+	async fn handle_prepare_confirmed(
+		&self,
+		tx_hash: solver_types::TransactionHash,
+	) -> Result<(), SolverError> {
+		// Look up the order ID from the transaction hash
+		let order_id = match self
+			.storage
+			.retrieve::<String>("tx_to_order", &hex::encode(&tx_hash.0))
+			.await
+		{
+			Ok(id) => id,
+			Err(_) => {
+				return Ok(()); // TODO: check if we should just continue or fail
+			}
+		};
+
+		tracing::info!(order_id = %truncate_id(&order_id), "Prepare transaction confirmed");
+
+		// Retrieve pending execution details
+		let pending_data: Option<(Order, ExecutionParams)> = self
+			.storage
+			.retrieve("pending_execution", &order_id)
+			.await
+			.map_err(|e| {
+				SolverError::Service(format!("Failed to retrieve pending execution: {}", e))
+			})?;
+
+		let (order, params) = pending_data
+			.ok_or_else(|| SolverError::Service("Pending execution not found".to_string()))?;
+
+		// Remove from pending execution
+		self.storage
+			.remove("pending_execution", &order_id)
+			.await
+			.map_err(|e| SolverError::Service(e.to_string()))?;
+
+		// Now publish Executing event to proceed with fill
+		self.event_bus
+			.publish(SolverEvent::Order(OrderEvent::Executing { order, params }))
+			.ok();
 
 		Ok(())
 	}
@@ -429,7 +574,7 @@ impl SolverEngine {
 		{
 			Ok(id) => id,
 			Err(_) => {
-				return Ok(()); // Don't fail the handler, just continue
+				return Ok(()); // TODO: check if we should just continue or fail
 			}
 		};
 
@@ -472,7 +617,7 @@ impl SolverEngine {
 
 			// Monitor claim readiness
 			let monitoring_timeout = tokio::time::Duration::from_secs(timeout_minutes * 60);
-			let check_interval = tokio::time::Duration::from_secs(1); // Check every 1 second for faster claim detection
+			let check_interval = tokio::time::Duration::from_secs(3);
 			let start_time = tokio::time::Instant::now();
 
 			loop {

@@ -1,5 +1,35 @@
 #!/bin/bash
 # setup_local_anvil.sh - Deploy dual-chain local Anvil setup with EIP-7683 contracts
+#
+# This script sets up a complete local testing environment for EIP-7683 cross-chain intents:
+#
+# FLOW:
+# 1. Start two Anvil chains:
+#    - Origin chain (port 8545, chain ID 31337) - Where intents are created
+#    - Destination chain (port 8546, chain ID 31338) - Where intents are fulfilled
+#
+# 2. Deploy contracts on both chains:
+#    - Origin: TestToken, Permit2, TheCompact, AlwaysYesOracle, InputSettler7683
+#    - Destination: TestToken, Permit2, OutputSettler7683
+#
+# 3. Setup initial state:
+#    - Mint 100 TEST tokens to user on origin chain (for creating intents)
+#    - Mint 100 TEST tokens to solver on destination chain (for fulfilling intents)
+#    - Approve OutputSettler to spend solver's tokens
+#
+# 4. Generate configuration:
+#    - Creates config/demo.toml with all deployed addresses
+#    - Creates .env file with RPC URLs
+#
+# USAGE:
+#   ./setup_local_anvil.sh         - Setup everything and keep running
+#   ./setup_local_anvil.sh stop    - Stop all Anvil instances
+#   ./setup_local_anvil.sh status  - Check if chains are running
+#
+# ACCOUNTS:
+#   Solver: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 (Anvil account #0)
+#   User: 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 (Anvil account #1)
+#   Recipient: 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC (Anvil account #2)
 
 set -e
 
@@ -118,20 +148,75 @@ deploy_permit2() {
     local chain_name=$1
     local rpc_url=$2
     
-    echo -e "${BLUE}🔐 Deploying Permit2 on $chain_name chain...${NC}" >&2
+    echo -e "${BLUE}🔐 Checking Permit2 on $chain_name chain...${NC}" >&2
     local permit2_address="0x000000000022D473030F116dDEE9F6B43aC78BA3"
     
     # Check if Permit2 is already deployed
-    local permit2_code=$(~/.foundry/bin/cast code $permit2_address --rpc-url $rpc_url 2>/dev/null)
+    local permit2_code=$(RUST_LOG= ~/.foundry/bin/cast code $permit2_address --rpc-url $rpc_url 2>&1)
     
-    if [ "$permit2_code" == "0x" ] || [ -z "$permit2_code" ]; then
-        cd lib/permit2
-        ~/.foundry/bin/forge build --use 0.8.17 > /dev/null 2>&1
-        local permit2_bytecode=$(cat out/Permit2.sol/Permit2.json | jq -r '.bytecode.object')
-        ~/.foundry/bin/cast rpc anvil_setCode $permit2_address $permit2_bytecode --rpc-url $rpc_url > /dev/null 2>&1
-        cd ../..
+    # Extract just the hex code from output
+    permit2_code=$(echo "$permit2_code" | grep "^0x" | tail -n1)
+    
+    # If no valid hex found, default to "0x"
+    if [ -z "$permit2_code" ]; then
+        permit2_code="0x"
     fi
-    echo -e "${GREEN}✅ Permit2 deployed on $chain_name: $permit2_address${NC}" >&2
+    if [ "$permit2_code" = "0x" ]; then
+        echo -e "${YELLOW}   Permit2 NOT deployed, fetching bytecode from mainnet...${NC}" >&2
+        
+        # Get Permit2 bytecode from mainnet
+        echo -e "${BLUE}   Fetching from mainnet (this may take a moment)...${NC}" >&2
+        
+        # Get Permit2 bytecode from mainnet using a temp file
+        local temp_file="/tmp/permit2_code_$$.txt"
+        RUST_LOG= ~/.foundry/bin/cast code $permit2_address --rpc-url https://eth.llamarpc.com > "$temp_file" 2>/dev/null
+        
+        # Read the bytecode from file
+        local mainnet_permit2_code=""
+        if [ -f "$temp_file" ]; then
+            mainnet_permit2_code=$(grep "^0x" "$temp_file" | head -n1)
+            rm -f "$temp_file"
+        fi
+        
+        if [ ! -z "$mainnet_permit2_code" ] && [ "$mainnet_permit2_code" != "0x" ]; then
+            echo -e "${BLUE}   Deploying Permit2 bytecode (${#mainnet_permit2_code} chars)...${NC}" >&2
+            
+            # Deploy using mainnet bytecode
+            echo -e "${BLUE}   Executing deployment...${NC}" >&2
+            local deploy_output=$(~/.foundry/bin/cast rpc anvil_setCode $permit2_address "$mainnet_permit2_code" --rpc-url $rpc_url 2>&1)
+            local deploy_exit_code=$?
+            
+            if [ $deploy_exit_code -ne 0 ]; then
+                echo -e "${RED}   ❌ Deployment command failed with exit code: $deploy_exit_code${NC}" >&2
+                echo -e "${RED}   Error output: $deploy_output${NC}" >&2
+                exit 1
+            fi
+            
+            # Verify deployment by checking the code again
+            echo -e "${BLUE}   Verifying deployment...${NC}" >&2
+            local new_code_output=$(RUST_LOG= ~/.foundry/bin/cast code $permit2_address --rpc-url $rpc_url 2>&1)
+            
+            # Extract just the hex code
+            local new_code=$(echo "$new_code_output" | grep "^0x" | tail -n1)
+            if [ ! -z "$new_code" ] && [ "$new_code" != "0x" ] && [[ "$new_code" =~ ^0x[0-9a-fA-F]+$ ]]; then
+                echo -e "${GREEN}   ✅ Permit2 deployed successfully (${#new_code} chars)${NC}" >&2
+            else
+                echo -e "${RED}   ❌ Failed to deploy Permit2 - verification failed${NC}" >&2
+                echo -e "${RED}   Deploy output: '$deploy_output'${NC}" >&2
+                echo -e "${RED}   Verification output: '$new_code_output'${NC}" >&2
+                echo -e "${RED}   Extracted code: '$new_code'${NC}" >&2
+                echo -e "${RED}   ❌ Off-chain intents will NOT work${NC}" >&2
+                exit 1
+            fi
+        else
+            echo -e "${RED}   ❌ Could not fetch Permit2 bytecode from mainnet${NC}" >&2
+            echo -e "${RED}   ❌ Off-chain intents will NOT work without Permit2${NC}" >&2
+            exit 1
+        fi
+    else
+        echo -e "${GREEN}   ✅ Permit2 already deployed (${#permit2_code} chars)${NC}" >&2
+    fi
+    
     echo $permit2_address
 }
 
@@ -375,62 +460,58 @@ id = "oif-solver-local-dual-chain"
 monitoring_timeout_minutes = 5
 
 [storage]
-backend = "file"
-[storage.config]
-storage_path = "./data/storage"
+backend = "memory" # or "file"
+[storage.config] 
+# storage_path = "./data/storage" # Only relevant for "file" backend
 
 [account]
 provider = "local"
 [account.config]
-# Using Anvil's default account #0
 private_key = "$PRIVATE_KEY"
 
 [delivery]
 min_confirmations = 1
-# Configure multiple delivery providers for different chains
 [delivery.providers.origin]
 rpc_url = "$ORIGIN_RPC_URL"
 private_key = "$PRIVATE_KEY"
-chain_id = $ORIGIN_CHAIN_ID  # Anvil origin chain
+chain_id = $ORIGIN_CHAIN_ID
 
 [delivery.providers.destination]
 rpc_url = "$DEST_RPC_URL"
 private_key = "$PRIVATE_KEY"
-chain_id = $DEST_CHAIN_ID  # Anvil destination chain
+chain_id = $DEST_CHAIN_ID
 
 [discovery]
-# Configure multiple discovery sources
-[discovery.sources.origin_eip7683]
+[discovery.sources.onchain_eip7683]
 rpc_url = "$ORIGIN_RPC_URL"
-# InputSettler address on origin chain (where orders are created)
 settler_addresses = ["$INPUT_SETTLER_ADDRESS"]
 
+[discovery.sources.offchain_eip7683]
+api_host = "0.0.0.0"
+api_port = 8081
+rpc_url = "http://localhost:8545"
+# auth_token = "your-secret-token"
+
 [order]
-# EIP-7683 order implementations
 [order.implementations.eip7683]
-# OutputSettler address (destination chain)
 output_settler_address = "$OUTPUT_SETTLER_ADDRESS"
-# InputSettler address (origin chain)
 input_settler_address = "$INPUT_SETTLER_ADDRESS"
-# Solver address (derived from the account private key)
 solver_address = "$PUBLIC_KEY"
 
 [order.execution_strategy]
 strategy_type = "simple"
 [order.execution_strategy.config]
-max_gas_price_gwei = 100  # Maximum gas price in gwei
+max_gas_price_gwei = 100
 
 [settlement]
-# Direct settlement implementations
 [settlement.implementations.eip7683]
-rpc_url = "$DEST_RPC_URL"  # Settlement needs to validate fills on destination chain
-# Oracle address on origin chain
+rpc_url = "$DEST_RPC_URL"
 oracle_address = "$ORACLE_ADDRESS"
-dispute_period_seconds = 1  # 1 seconds for testing
+dispute_period_seconds = 1
 
 # ============================================================================
 # DEMO SCRIPT CONFIGURATION
-# The following sections are used by demo scripts (send_intent.sh, etc.)
+# The following sections are used by demo scripts (send_onchain_intent.sh, etc.)
 # and are NOT required by the solver itself. The solver only needs the
 # configurations above.
 # ============================================================================
@@ -457,11 +538,10 @@ permit2 = "$DEST_PERMIT2_ADDRESS"
 solver = "$PUBLIC_KEY"
 user = "$USER_ADDR"
 user_private_key = "$USER_KEY"
-recipient = "$RECIPIENT_ADDR"  # Account #2 - recipient for cross-chain intents
+recipient = "$RECIPIENT_ADDR"
 EOF
 
     cat > .env << EOF
-# Local dual-chain development environment
 ORIGIN_RPC_URL=$ORIGIN_RPC_URL
 DEST_RPC_URL=$DEST_RPC_URL
 ETH_PRIVATE_KEY=$PRIVATE_KEY
@@ -500,8 +580,8 @@ show_summary() {
     echo ""
     echo -e "${YELLOW}📚 Next Steps:${NC}"
     echo -e "   1. Start solver: ${BLUE}cargo run --bin solver-service -- --config config/demo.toml${NC}"
-    echo -e "   2. Send intent:  ${BLUE}./send_intent.sh${NC} (will create cross-chain order)"
-    echo -e "   3. Monitor:      ${BLUE}./monitor_api.sh${NC}"
+    echo -e "   2. Send (on-chain) intent:  ${BLUE}./send_onchain_intent.sh${NC} (will create cross-chain order)"
+    echo -e "   3. Send (off-chain) intent:  ${BLUE}./send_offchain_intent.sh${NC} (will create cross-chain order)"
     echo ""
     echo -e "${YELLOW}🛑 To stop Anvil:${NC} kill \$(cat origin_anvil.pid) \$(cat destination_anvil.pid) or Ctrl+C"
 }

@@ -30,7 +30,7 @@ chain_id = 31338  # Anvil destination chain
 
 [discovery]
 # Configure multiple discovery sources
-[discovery.sources.origin_eip7683]
+[discovery.sources.onchain_eip7683]
 rpc_url = "http://localhost:8545"
 # InputSettler address on origin chain (where orders are created)
 settler_addresses = ["0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"]
@@ -65,7 +65,7 @@ dispute_period_seconds = 1  # 1 seconds for testing
 
 # ============================================================================
 # DEMO SCRIPT CONFIGURATION
-# The following sections are used by demo scripts (send_intent.sh, etc.)
+# The following sections are used by demo scripts (send_onchain_intent.sh, etc.)
 # and are NOT required by the solver itself. The solver only needs the
 # configurations above.
 # ============================================================================

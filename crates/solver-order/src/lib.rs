@@ -56,6 +56,20 @@ pub trait OrderInterface: Send + Sync {
 	/// is well-formed and can be processed by the solver.
 	async fn validate_intent(&self, intent: &Intent) -> Result<Order, OrderError>;
 
+	/// Generates a transaction to prepare an order for filling (if needed).
+	///
+	/// For off-chain orders, this might involve calling openFor() to create
+	/// the order on-chain. Returns None if no preparation is needed.
+	async fn generate_prepare_transaction(
+		&self,
+		_intent: &Intent,
+		_order: &Order,
+		_params: &ExecutionParams,
+	) -> Result<Option<Transaction>, OrderError> {
+		// Default implementation: no preparation needed
+		Ok(None)
+	}
+
 	/// Generates a transaction to fill the given order.
 	///
 	/// Creates a blockchain transaction that will execute the order fill
@@ -139,6 +153,25 @@ impl OrderService {
 		context: &ExecutionContext,
 	) -> ExecutionDecision {
 		self.strategy.should_execute(order, context).await
+	}
+
+	/// Generates a prepare transaction for the given order if needed.
+	///
+	/// Uses the appropriate standard implementation to create the transaction.
+	pub async fn generate_prepare_transaction(
+		&self,
+		intent: &Intent,
+		order: &Order,
+		params: &ExecutionParams,
+	) -> Result<Option<Transaction>, OrderError> {
+		let implementation = self
+			.implementations
+			.get(&order.standard)
+			.ok_or_else(|| OrderError::ValidationFailed("Unknown standard".into()))?;
+
+		implementation
+			.generate_prepare_transaction(intent, order, params)
+			.await
 	}
 
 	/// Generates a fill transaction for the given order.

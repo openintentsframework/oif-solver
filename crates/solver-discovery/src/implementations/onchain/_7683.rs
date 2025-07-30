@@ -10,7 +10,10 @@ use alloy_rpc_types::{Filter, Log};
 use alloy_sol_types::{sol, SolEvent};
 use alloy_transport_http::Http;
 use async_trait::async_trait;
-use solver_types::{ConfigSchema, Field, FieldType, Intent, IntentMetadata, Schema};
+use solver_types::{
+	eip7683::{Eip7683OrderData, Output as Eip7683Output},
+	ConfigSchema, Field, FieldType, Intent, IntentMetadata, Schema,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -90,8 +93,8 @@ impl Eip7683Discovery {
 			.collect();
 
 		if addresses.is_empty() {
-			return Err(DiscoveryError::Connection(
-				"No valid settler addresses".to_string(),
+			return Err(DiscoveryError::ValidationError(
+				"No valid settler addresses provided".to_string(),
 			));
 		}
 
@@ -121,8 +124,9 @@ impl Eip7683Discovery {
 		};
 
 		// Decode the Open event
-		let open_event = Open::decode_log(&prim_log, true)
-			.map_err(|e| DiscoveryError::Connection(format!("Failed to decode event: {}", e)))?;
+		let open_event = Open::decode_log(&prim_log, true).map_err(|e| {
+			DiscoveryError::ParseError(format!("Failed to decode Open event: {}", e))
+		})?;
 
 		let order = &open_event.order;
 		let order_id = open_event.orderId;
@@ -131,46 +135,56 @@ impl Eip7683Discovery {
 		let destination_chain_id = if !order.maxSpent.is_empty() {
 			order.maxSpent[0].chainId
 		} else {
-			return Err(DiscoveryError::Connection(
-				"No outputs in order".to_string(),
+			return Err(DiscoveryError::ValidationError(
+				"Order must have at least one output".to_string(),
 			));
 		};
 
 		// Convert to the format expected by the order implementation
 		// The order implementation expects Eip7683OrderData with specific fields
-		let order_data = serde_json::json!({
-			"user": order.user.to_string(),
-			"nonce": 0u64, // For onchain orders, nonce is always 0
-			"origin_chain_id": order.originChainId.to::<u64>(),
-			"destination_chain_id": destination_chain_id.to::<u64>(),
-			"expires": if order.openDeadline == 0 { order.fillDeadline } else { order.openDeadline }, // For onchain orders with openDeadline=0, use fillDeadline
-			"fill_deadline": order.fillDeadline,
-			"local_oracle": "0x0000000000000000000000000000000000000000", // Default to zero address
-			"inputs": order.minReceived.iter().map(|input| {
-				// Create [token, amount] array where token is bytes32 converted to U256
-				// The token is already in bytes32 format, just use it as U256
-				[
-					serde_json::to_value(U256::from_be_bytes(input.token.0)).unwrap(),
-					serde_json::to_value(input.amount).unwrap()
-				]
-			}).collect::<Vec<_>>(),
-			"order_id": order_id.0,
-			"settle_gas_limit": 200_000u64, // Default gas limit
-			"fill_gas_limit": 200_000u64, // Default gas limit
-			"outputs": order.maxSpent.iter().map(|output| {
-				serde_json::json!({
-					"token": format!("0x{}", hex::encode(&output.token.0[12..])), // Convert bytes32 to address
-					"amount": output.amount.to_string(),
-					"recipient": format!("0x{}", hex::encode(&output.recipient.0[12..])), // Convert bytes32 to address
-					"chain_id": output.chainId.to::<u64>()
+		let order_data = Eip7683OrderData {
+			user: order.user.to_string(),
+			nonce: 0u64, // For onchain orders, nonce is always 0
+			origin_chain_id: order.originChainId.to::<u64>(),
+			destination_chain_id: destination_chain_id.to::<u64>(),
+			expires: if order.openDeadline == 0 {
+				order.fillDeadline
+			} else {
+				order.openDeadline
+			}, // For onchain orders with openDeadline=0, use fillDeadline
+			fill_deadline: order.fillDeadline,
+			local_oracle: "0x0000000000000000000000000000000000000000".to_string(), // Default to zero address
+			inputs: order
+				.minReceived
+				.iter()
+				.map(|input| {
+					// Create [token, amount] array where token is bytes32 converted to U256
+					// The token is already in bytes32 format, just use it as U256
+					[U256::from_be_bytes(input.token.0), input.amount]
 				})
-			}).collect::<Vec<_>>()
-		});
+				.collect::<Vec<_>>(),
+			order_id: order_id.0,
+			settle_gas_limit: 200_000u64, // TODO: calculate exactly
+			fill_gas_limit: 200_000u64,   // TODO: calculate exactly
+			outputs: order
+				.maxSpent
+				.iter()
+				.map(|output| Eip7683Output {
+					token: format!("0x{}", hex::encode(&output.token.0[12..])),
+					amount: output.amount,
+					recipient: format!("0x{}", hex::encode(&output.recipient.0[12..])),
+					chain_id: output.chainId.to::<u64>(),
+				})
+				.collect::<Vec<_>>(),
+			// On-chain orders don't have raw order data or signatures
+			raw_order_data: None,
+			order_data_type: None,
+			signature: None,
+		};
 
-		// Convert to intent
 		Ok(Intent {
 			id: hex::encode(order_id),
-			source: "eip7683".to_string(),
+			source: "on-chain".to_string(),
 			standard: "eip7683".to_string(),
 			metadata: IntentMetadata {
 				requires_auction: false,
@@ -180,7 +194,9 @@ impl Eip7683Discovery {
 					.unwrap()
 					.as_secs(),
 			},
-			data: order_data,
+			data: serde_json::to_value(&order_data).map_err(|e| {
+				DiscoveryError::ParseError(format!("Failed to serialize order data: {}", e))
+			})?,
 		})
 	}
 

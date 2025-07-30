@@ -190,7 +190,7 @@ rpc_url = "http://localhost:8545"
 chain_id = 31337
 
 # Discovery sources
-[discovery.sources.origin_eip7683]
+[discovery.sources.onchain_eip7683]
 rpc_url = "http://localhost:8545"
 settler_addresses = ["0x..."]
 
@@ -306,7 +306,7 @@ In another terminal, execute the send intent script to create and observe a cros
 
 ```bash
 # Send a cross-chain intent
-./scripts/demo/send_intent.sh
+./scripts/demo/send_onchain_intent.sh
 ```
 
 This script will:

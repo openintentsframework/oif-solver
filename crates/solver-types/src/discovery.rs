@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 pub struct Intent {
 	/// Unique identifier for this intent.
 	pub id: String,
-	/// Source from which this intent was discovered (e.g., "eip7683").
+	/// Source from which this intent was discovered (e.g., "on-chain").
 	pub source: String,
 	/// Standard this intent conforms to (e.g., "eip7683").
 	pub standard: String,

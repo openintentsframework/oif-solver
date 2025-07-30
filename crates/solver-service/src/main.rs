@@ -12,12 +12,14 @@ use std::path::PathBuf;
 // Import implementations from individual crates
 use solver_account::implementations::local::create_account;
 use solver_delivery::implementations::evm::alloy::create_http_delivery;
-use solver_discovery::implementations::onchain::_7683::create_discovery;
+use solver_discovery::implementations::offchain::_7683::create_discovery as offchain_create_discovery;
+// use solver_discovery::implementations::onchain::_7683::create_discovery as onchain_create_discovery;
 use solver_order::implementations::{
 	standards::_7683::create_order_impl, strategies::simple::create_strategy,
 };
 use solver_settlement::implementations::direct::create_settlement;
-use solver_storage::implementations::file::create_storage;
+// use solver_storage::implementations::file::create_storage as create_file_storage;
+use solver_storage::implementations::memory::create_storage as create_memory_storage;
 
 /// Command-line arguments for the solver service.
 #[derive(Parser, Debug)]
@@ -88,14 +90,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn build_solver(config: Config) -> Result<SolverEngine, Box<dyn std::error::Error>> {
 	let builder = SolverBuilder::new(config)
         // Storage implementations
-        .with_storage_factory(create_storage)
+        .with_storage_factory(create_memory_storage)
         // Account implementations
         .with_account_factory(create_account)
         // Delivery implementations
         .with_delivery_factory("origin", create_http_delivery)
         .with_delivery_factory("destination", create_http_delivery)
         // Discovery implementations
-        .with_discovery_factory("origin_eip7683", create_discovery)
+        // .with_discovery_factory("onchain_eip7683", onchain_create_discovery)
+		// Discovery implementations
+		.with_discovery_factory("offchain_eip7683", offchain_create_discovery)
         // Order implementations
         .with_order_factory("eip7683", create_order_impl)
         // Settlement implementations
