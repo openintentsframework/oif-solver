@@ -1,0 +1,21 @@
+[package]
+name = "solver-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+solver-types = { path = "../solver-types" }
+solver-config = { path = "../solver-config" }
+solver-storage = { path = "../solver-storage" }
+solver-delivery = { path = "../solver-delivery" }
+solver-account = { path = "../solver-account" }
+solver-discovery = { path = "../solver-discovery" }
+solver-order = { path = "../solver-order" }
+solver-settlement = { path = "../solver-settlement" }
+tokio = { version = "1.0", features = ["full"] }
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+toml = "0.8"
+alloy-primitives = { version = "0.8", features = ["serde"] }

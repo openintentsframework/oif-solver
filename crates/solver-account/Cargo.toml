@@ -1,0 +1,16 @@
+[package]
+name = "solver-account"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alloy-consensus = "0.8"
+alloy-network = "0.8"
+alloy-primitives = "0.8"
+alloy-signer = "0.8"
+alloy-signer-local = "0.8"
+async-trait = "0.1"
+hex = "0.4"
+solver-types = { path = "../solver-types" }
+thiserror = "1.0"
+toml = "0.8"

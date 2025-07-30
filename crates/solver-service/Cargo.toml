@@ -1,0 +1,31 @@
+[package]
+name = "solver-service"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "solver"
+path = "src/main.rs"
+
+[dependencies]
+solver-account = { path = "../solver-account" }
+solver-config = { path = "../solver-config" }
+solver-core = { path = "../solver-core" }
+solver-delivery = { path = "../solver-delivery" }
+solver-discovery = { path = "../solver-discovery" }
+solver-order = { path = "../solver-order" }
+solver-settlement = { path = "../solver-settlement" }
+solver-storage = { path = "../solver-storage" }
+solver-types = { path = "../solver-types" }
+
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive"] }
+env_logger = "0.11"
+reqwest = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,0 +1,27 @@
+[package]
+name = "solver-delivery"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alloy-provider = "0.8"
+alloy-primitives = "0.8"
+alloy-consensus = "0.8"
+alloy-network = "0.8"
+alloy-rpc-types = "0.8"
+alloy-sol-types = "0.8"
+reqwest = "0.12"
+serde_json = "1.0"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+solver-account = { path = "../solver-account" }
+solver-types = { path = "../solver-types" }
+thiserror = "1.0"
+tracing = "0.1"
+hex = "0.4"
+toml = "0.8"
+tokio = { version = "1.0", features = ["rt-multi-thread"] }
+alloy-signer = "0.8"
+alloy-signer-local = "0.8"
+alloy-transport = "0.8"
+alloy-transport-http = "0.8"
