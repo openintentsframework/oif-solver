@@ -27,7 +27,7 @@ pub enum ConfigError {
 ///
 /// This structure contains all configuration sections required for the solver
 /// to operate, including solver identity, storage, delivery, accounts, discovery,
-/// order processing, and settlement configurations.
+/// order processing, settlement configurations, and API server.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
 	/// Configuration specific to the solver instance.
@@ -44,6 +44,8 @@ pub struct Config {
 	pub order: OrderConfig,
 	/// Configuration for settlement operations.
 	pub settlement: SettlementConfig,
+	/// Configuration for the HTTP API server.
+	pub api: Option<ApiConfig>,
 }
 
 /// Configuration specific to the solver instance.
@@ -130,6 +132,70 @@ pub struct SettlementConfig {
 	/// Map of settlement implementation names to their configurations.
 	/// Each implementation handles specific settlement mechanisms.
 	pub implementations: HashMap<String, toml::Value>,
+}
+
+/// Configuration for the HTTP API server.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ApiConfig {
+	/// Whether the API server is enabled.
+	#[serde(default)]
+	pub enabled: bool,
+	/// Host address to bind the server to.
+	#[serde(default = "default_api_host")]
+	pub host: String,
+	/// Port to bind the server to.
+	#[serde(default = "default_api_port")]
+	pub port: u16,
+	/// Request timeout in seconds.
+	#[serde(default = "default_api_timeout")]
+	pub timeout_seconds: u64,
+	/// Maximum request size in bytes.
+	#[serde(default = "default_max_request_size")]
+	pub max_request_size: usize,
+	/// Rate limiting configuration.
+	pub rate_limiting: Option<RateLimitConfig>,
+	/// CORS configuration.
+	pub cors: Option<CorsConfig>,
+}
+
+/// Rate limiting configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RateLimitConfig {
+	/// Maximum requests per minute per IP.
+	pub requests_per_minute: u32,
+	/// Burst allowance for requests.
+	pub burst_size: u32,
+}
+
+/// CORS configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CorsConfig {
+	/// Allowed origins for CORS.
+	pub allowed_origins: Vec<String>,
+	/// Allowed headers for CORS.
+	pub allowed_headers: Vec<String>,
+	/// Allowed methods for CORS.
+	pub allowed_methods: Vec<String>,
+}
+
+/// Returns the default API host.
+fn default_api_host() -> String {
+	"127.0.0.1".to_string()
+}
+
+/// Returns the default API port.
+fn default_api_port() -> u16 {
+	3000
+}
+
+/// Returns the default API timeout in seconds.
+fn default_api_timeout() -> u64 {
+	30
+}
+
+/// Returns the default maximum request size in bytes.
+fn default_max_request_size() -> usize {
+	1024 * 1024 // 1MB
 }
 
 impl Config {

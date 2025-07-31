@@ -8,6 +8,10 @@ use clap::Parser;
 use solver_config::Config;
 use solver_core::{SolverBuilder, SolverEngine};
 use std::path::PathBuf;
+use std::sync::Arc;
+
+mod apis;
+mod server;
 
 // Import implementations from individual crates
 use solver_account::implementations::local::create_account;
@@ -67,11 +71,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	tracing::info!("Loaded configuration [{}]", config.solver.id);
 
 	// Build solver engine with implementations
-	let solver = build_solver(config)?;
+	let solver = build_solver(config.clone())?;
+	let solver = Arc::new(solver);
 	tracing::info!("Loaded solver engine");
 
-	// Run the solver
-	solver.run().await?;
+	// Check if API server should be started
+	let api_enabled = config.api.as_ref().map_or(false, |api| api.enabled);
+	
+	if api_enabled {
+		let api_config = config.api.as_ref().unwrap().clone();
+		let api_solver = Arc::clone(&solver);
+		
+		// Start both the solver and the API server concurrently
+		let solver_task = solver.run();
+		let api_task = server::start_server(api_config, api_solver);
+		
+		tracing::info!("Starting solver and API server");
+		
+		// Run both tasks concurrently
+		tokio::select! {
+			result = solver_task => {
+				tracing::info!("Solver finished");
+				result?;
+			}
+			result = api_task => {
+				tracing::info!("API server finished");
+				result?;
+			}
+		}
+	} else {
+		// Run only the solver
+		tracing::info!("Starting solver only");
+		solver.run().await?;
+	}
 
 	tracing::info!("Stopped solver");
 	Ok(())

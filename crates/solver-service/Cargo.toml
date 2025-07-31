@@ -16,7 +16,7 @@ solver-discovery = { path = "../solver-discovery" }
 solver-order = { path = "../solver-order" }
 solver-settlement = { path = "../solver-settlement" }
 solver-storage = { path = "../solver-storage" }
-solver-types = { path = "../solver-types" }
+solver-types = { path = "../solver-types", features = ["axum"] }
 
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
@@ -29,3 +29,11 @@ tokio = { version = "1.0", features = ["full"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Web server dependencies
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+alloy-primitives = { version = "0.8", features = ["std", "serde"] }

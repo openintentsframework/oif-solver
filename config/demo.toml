@@ -54,6 +54,14 @@ rpc_url = "http://localhost:8546"
 oracle_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
 dispute_period_seconds = 1
 
+# API server configuration
+[api]
+enabled = true
+host = "127.0.0.1"
+port = 3000
+timeout_seconds = 30
+max_request_size = 1048576  # 1MB
+
 # ============================================================================
 # DEMO SCRIPT CONFIGURATION
 # The following sections are used by demo scripts (send_onchain_intent.sh, etc.)
