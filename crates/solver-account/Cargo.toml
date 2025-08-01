@@ -13,4 +13,4 @@ async-trait = "0.1"
 hex = "0.4"
 solver-types = { path = "../solver-types" }
 thiserror = "1.0"
-toml = "0.8"
+toml = { workspace = true }

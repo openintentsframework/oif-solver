@@ -57,8 +57,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use solver_types::{
-	eip7683::{Eip7683OrderData, Output as Eip7683Output},
-	ConfigSchema, Field, FieldType, Intent, IntentMetadata, Schema,
+	ConfigSchema, Eip7683OrderData, Eip7683Output, Field, FieldType, Intent, IntentMetadata, Schema,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};

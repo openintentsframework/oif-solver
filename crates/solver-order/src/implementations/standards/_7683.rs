@@ -9,7 +9,7 @@ use alloy_primitives::{Address as AlloyAddress, FixedBytes, U256};
 use alloy_sol_types::{sol, SolCall, SolValue};
 use async_trait::async_trait;
 use solver_types::{
-	eip7683::Eip7683OrderData, Address, ConfigSchema, ExecutionParams, Field, FieldType, FillProof,
+	Address, ConfigSchema, Eip7683OrderData, ExecutionParams, Field, FieldType, FillProof,
 	Intent, Order, Schema, Transaction,
 };
 
