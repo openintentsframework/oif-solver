@@ -77,36 +77,3 @@ async fn handle_quote(
 
 
 
-/// Convert QuoteError to APIError with appropriate HTTP status codes.
-impl From<crate::apis::quote::QuoteError> for APIError {
-    fn from(quote_error: crate::apis::quote::QuoteError) -> Self {
-        use crate::apis::quote::QuoteError;
-        
-        match quote_error {
-            QuoteError::InvalidRequest(msg) => APIError::BadRequest {
-                error_type: "INVALID_REQUEST".to_string(),
-                message: msg,
-                details: None,
-            },
-            QuoteError::UnsupportedAsset(asset) => APIError::UnprocessableEntity {
-                error_type: "UNSUPPORTED_ASSET".to_string(),
-                message: format!("Asset not supported by solver: {}", asset),
-                details: Some(serde_json::json!({ "asset": asset })),
-            },
-            QuoteError::InsufficientLiquidity => APIError::UnprocessableEntity {
-                error_type: "INSUFFICIENT_LIQUIDITY".to_string(),
-                message: "Insufficient liquidity available for the requested amount".to_string(),
-                details: None,
-            },
-            QuoteError::SolverCapacityExceeded => APIError::ServiceUnavailable {
-                error_type: "SOLVER_CAPACITY_EXCEEDED".to_string(),
-                message: "Solver capacity exceeded, please try again later".to_string(),
-                retry_after: Some(60), // Suggest retry after 60 seconds
-            },
-            QuoteError::Internal(msg) => APIError::InternalServerError {
-                error_type: "INTERNAL_ERROR".to_string(),
-                message: format!("An internal error occurred: {}", msg),
-            },
-        }
-    }
-}

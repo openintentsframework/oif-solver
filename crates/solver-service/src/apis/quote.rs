@@ -191,30 +191,13 @@
 use alloy_primitives::U256;
 use solver_core::SolverEngine;
 use solver_types::{
-    AssetAmount, AvailableInput, GetQuoteRequest, GetQuoteResponse, QuoteOption, 
+    AssetAmount, AvailableInput, GetQuoteRequest, GetQuoteResponse, QuoteError, QuoteOption, 
     QuotePreference, SettlementOrder, SettlementType,
 };
-use thiserror::Error;
 use tracing::info;
 use uuid::Uuid;
 
-/// Errors that can occur during quote processing.
-#[derive(Debug, Error)]
-pub enum QuoteError {
-    #[error("Invalid request: {0}")]
-    InvalidRequest(String),
-    #[error("Unsupported asset: {0}")]
-    #[allow(dead_code)]
-    UnsupportedAsset(String),
-    #[error("Insufficient liquidity for requested amount")]
-    InsufficientLiquidity,
-    #[error("Solver capacity exceeded")]
-    #[allow(dead_code)]
-    SolverCapacityExceeded,
-    #[error("Internal error: {0}")]
-    #[allow(dead_code)]
-    Internal(String),
-}
+
 
 /// Processes a quote request and returns available quote options.
 ///
