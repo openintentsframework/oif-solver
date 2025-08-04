@@ -6,11 +6,11 @@ A high-performance cross-chain solver implementation for the Open Intents Framew
 
 The OIF Solver is designed to:
 
-* Discover and monitor cross-chain intents from multiple sources
-* Find optimal execution paths across different chains and liquidity sources
-* Execute transactions efficiently while minimizing costs
-* Provide comprehensive monitoring and observability
-* Support multiple order types and protocols (currently EIP-7683)
+- Discover and monitor cross-chain intents from multiple sources
+- Find optimal execution paths across different chains and liquidity sources
+- Execute transactions efficiently while minimizing costs
+- Provide comprehensive monitoring and observability
+- Support multiple order types and protocols (currently EIP-7683)
 
 ## High-Level Architecture
 
@@ -55,22 +55,22 @@ The solver is built as a modular Rust workspace with clearly defined service bou
 
 ### Core Components
 
-* **solver-core**: Orchestrates the entire solver workflow and coordinates between services
-* **solver-types**: Defines shared data structures, traits, and interfaces used across all components
-* **solver-config**: Handles configuration loading and validation
-* **solver-storage**: Provides persistent storage abstraction with TTL management for solver state
-* **solver-account**: Manages cryptographic keys and signing operations
+- **solver-core**: Orchestrates the entire solver workflow and coordinates between services
+- **solver-types**: Defines shared data structures, traits, and interfaces used across all components
+- **solver-config**: Handles configuration loading and validation
+- **solver-storage**: Provides persistent storage abstraction with TTL management for solver state
+- **solver-account**: Manages cryptographic keys and signing operations
 
 ### Service Components
 
-* **solver-discovery**: Discovers new intents/orders from various blockchain and off-chain sources
-* **solver-order**: Validates intents, manages execution strategies, and generates transactions
-* **solver-delivery**: Handles transaction preparation, submission, and monitoring across multiple chains
-* **solver-settlement**: Manages settlement verification and claim processing after transaction execution
+- **solver-discovery**: Discovers new intents/orders from various blockchain and off-chain sources
+- **solver-order**: Validates intents, manages execution strategies, and generates transactions
+- **solver-delivery**: Handles transaction preparation, submission, and monitoring across multiple chains
+- **solver-settlement**: Manages settlement verification and claim processing after transaction execution
 
 ### Binary
 
-* **solver-service**: Main executable that wires up all components and runs the solver
+- **solver-service**: Main executable that wires up all components and runs the solver
 
 ## Project Structure
 
@@ -96,53 +96,53 @@ oif-solver/
 
 ### solver-core
 
-* Orchestrates the entire order lifecycle
-* Manages event-driven communication between services
-* Implements the main solver loop
-* Handles graceful shutdown
-* Provides factory pattern for building solver instances
+- Orchestrates the entire order lifecycle
+- Manages event-driven communication between services
+- Implements the main solver loop
+- Handles graceful shutdown
+- Provides factory pattern for building solver instances
 
 ### solver-discovery
 
-* Monitors blockchain events for new intents
-* Supports multiple discovery sources simultaneously
-* Filters and validates discovered intents
-* Pushes valid intents to the core engine
+- Monitors blockchain events for new intents
+- Supports multiple discovery sources simultaneously
+- Filters and validates discovered intents
+- Pushes valid intents to the core engine
 
 ### solver-order
 
-* Validates intents and converts them to orders
-* Implements execution strategies (when to execute)
-* Generates fill and claim transactions
-* Manages order-specific logic for different protocols
+- Validates intents and converts them to orders
+- Implements execution strategies (when to execute)
+- Generates fill and claim transactions
+- Manages order-specific logic for different protocols
 
 ### solver-delivery
 
-* Submits transactions to multiple blockchains
-* Monitors transaction confirmation status
-* Manages gas estimation and pricing
-* Handles transaction retries and failures
+- Submits transactions to multiple blockchains
+- Monitors transaction confirmation status
+- Manages gas estimation and pricing
+- Handles transaction retries and failures
 
 ### solver-settlement
 
-* Validates fill transactions
-* Extracts and stores fill proofs
-* Monitors when orders can be claimed
-* Manages dispute periods and oracle interactions
+- Validates fill transactions
+- Extracts and stores fill proofs
+- Monitors when orders can be claimed
+- Manages dispute periods and oracle interactions
 
 ### solver-storage
 
-* Provides persistent storage for orders and state
-* Implements TTL (time-to-live) for temporary data
-* Supports different storage backends
-* Ensures data consistency across services
+- Provides persistent storage for orders and state
+- Implements TTL (time-to-live) for temporary data
+- Supports different storage backends
+- Ensures data consistency across services
 
 ### solver-account
 
-* Manages private keys and signing operations
-* Supports different key management backends
-* Provides secure signing for transactions
-* Handles address derivation
+- Manages private keys and signing operations
+- Supports different key management backends
+- Provides secure signing for transactions
+- Handles address derivation
 
 ## Quick Start
 
@@ -234,11 +234,12 @@ RUST_LOG=debug cargo run -- --config config/demo.toml
 ```
 
 Available log levels (from most to least verbose):
-* `trace` - Very detailed debugging information
-* `debug` - Debugging information
-* `info` - General information (default)
-* `warn` - Warning messages
-* `error` - Error messages only
+
+- `trace` - Very detailed debugging information
+- `debug` - Debugging information
+- `info` - General information (default)
+- `warn` - Warning messages
+- `error` - Error messages only
 
 The `--log-level` flag acts as a fallback when `RUST_LOG` is not set:
 
@@ -253,8 +254,8 @@ The project includes a complete demo setup for testing cross-chain intent execut
 
 ### Prerequisites
 
-* [Foundry](https://book.getfoundry.sh/getting-started/installation) (for Anvil, Forge, and Cast)
-* Rust toolchain (stable)
+- [Foundry](https://book.getfoundry.sh/getting-started/installation) (for Anvil, Forge, and Cast)
+- Rust toolchain (stable)
 
 ### Step 1: Setup Local Test Environment
 
@@ -271,8 +272,8 @@ chmod +x scripts/demo/*.sh
 This script will:
 
 1. Start two Anvil instances:
-   * Origin chain (ID: 31337) on port 8545
-   * Destination chain (ID: 31338) on port 8546
+   - Origin chain (ID: 31337) on port 8545
+   - Destination chain (ID: 31338) on port 8546
 2. Deploy test tokens on both chains
 3. Deploy settler contracts (InputSettler, OutputSettler)
 4. Create a `config/demo.toml` configuration file
@@ -296,9 +297,9 @@ RUST_LOG=solver_core=debug,solver_delivery=info,info cargo run --bin solver -- -
 
 The solver will:
 
-* Connect to both local chains
-* Start monitoring for new intents
-* Process discovered intents automatically
+- Connect to both local chains
+- Start monitoring for new intents
+- Process discovered intents automatically
 
 ### Step 3: Run the Demo
 
@@ -317,8 +318,9 @@ This script will:
 4. Show final balances demonstrating successful execution
 
 You can also check balances at any time using:
+
 ```bash
-./scripts/demo/show_balances.sh
+./scripts/demo/send_onchain_intent.sh balances
 ```
 
 ### What the Demo Demonstrates
@@ -332,8 +334,8 @@ You can also check balances at any time using:
 
 You can monitor the solver's activity through:
 
-* Console logs (with debug level logging enabled)
-* Storage files in `./data/storage/` (when using file storage backend)
+- Console logs (with debug level logging enabled)
+- Storage files in `./data/storage/` (when using file storage backend)
 
 ### Troubleshooting
 

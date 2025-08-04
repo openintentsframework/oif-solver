@@ -26,6 +26,7 @@ RECIPIENT_ADDR="0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
 ORIGIN_COMPACT_ADDRESS=""
 ORIGIN_PERMIT2_ADDRESS="0x000000000022D473030F116dDEE9F6B43aC78BA3"
 DEST_PERMIT2_ADDRESS="0x000000000022D473030F116dDEE9F6B43aC78BA3"
+OIF_PINNED_COMMIT="f2a9e8ab9d652894a090814421a7acb9a0547737"
 
 echo -e "${BLUE}🔧 Simple Dual-Chain Anvil Setup${NC}"
 echo "======================================"
@@ -128,6 +129,20 @@ if [ -z "$TOKEN_ORIGIN" ]; then
     exit 1
 fi
 echo -e "${GREEN}✓${NC} $TOKEN_ORIGIN"
+
+# Clone or update oif-contracts to specific commit
+if [ ! -d "oif-contracts" ]; then
+    echo -n "  Cloning oif-contracts... "
+    git clone https://github.com/openintentsframework/oif-contracts.git > /dev/null 2>&1
+    echo -e "${GREEN}✓${NC}"
+fi
+
+cd oif-contracts
+echo -n "  Checking out oif-contracts commit ${OIF_PINNED_COMMIT}... "
+git fetch origin > /dev/null 2>&1
+git checkout ${OIF_PINNED_COMMIT} > /dev/null 2>&1
+echo -e "${GREEN}✓${NC}"
+cd ..
 
 # Deploy Oracle from actual contract
 echo -n "  Deploying AlwaysYesOracle... "
