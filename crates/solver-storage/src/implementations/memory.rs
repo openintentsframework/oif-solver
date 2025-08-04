@@ -116,8 +116,8 @@ impl StorageInterface for MemoryStorage {
 ///
 /// Configuration parameters:
 /// - None required for memory storage
-pub fn create_storage(_config: &toml::Value) -> Box<dyn StorageInterface> {
-	Box::new(MemoryStorage::new())
+pub fn create_storage(_config: &toml::Value) -> Result<Box<dyn StorageInterface>, StorageError> {
+	Ok(Box::new(MemoryStorage::new()))
 }
 
 #[cfg(test)]

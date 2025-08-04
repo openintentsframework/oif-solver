@@ -81,26 +81,36 @@ impl ConfigSchema for AlloyDeliverySchema {
 			// Required fields
 			vec![
 				Field::new("rpc_url", FieldType::String).with_validator(|value| {
-					let url = value.as_str().unwrap();
-					if url.starts_with("http://") || url.starts_with("https://") {
-						Ok(())
-					} else {
-						Err("RPC URL must start with http:// or https://".to_string())
+					match value.as_str() {
+						Some(url) => {
+							if url.starts_with("http://") || url.starts_with("https://") {
+								Ok(())
+							} else {
+								Err("RPC URL must start with http:// or https://".to_string())
+							}
+						}
+						None => Err("Expected string value for rpc_url".to_string()),
 					}
 				}),
 				Field::new("private_key", FieldType::String).with_validator(|value| {
-					let key = value.as_str().unwrap();
-					let key_without_prefix = key.strip_prefix("0x").unwrap_or(key);
+					match value.as_str() {
+						Some(key) => {
+							let key_without_prefix = key.strip_prefix("0x").unwrap_or(key);
 
-					if key_without_prefix.len() != 64 {
-						return Err("Private key must be 64 hex characters (32 bytes)".to_string());
+							if key_without_prefix.len() != 64 {
+								return Err(
+									"Private key must be 64 hex characters (32 bytes)".to_string()
+								);
+							}
+
+							if hex::decode(key_without_prefix).is_err() {
+								return Err("Private key must be valid hexadecimal".to_string());
+							}
+
+							Ok(())
+						}
+						None => Err("Expected string value for private_key".to_string()),
 					}
-
-					if hex::decode(key_without_prefix).is_err() {
-						return Err("Private key must be valid hexadecimal".to_string());
-					}
-
-					Ok(())
 				}),
 				Field::new(
 					"chain_id",
@@ -258,30 +268,35 @@ impl DeliveryInterface for AlloyDelivery {
 /// - `rpc_url`: The HTTP RPC endpoint URL
 /// - `chain_id`: The blockchain network chain ID
 /// - `private_key`: The private key for transaction signing
-pub fn create_http_delivery(config: &toml::Value) -> Box<dyn DeliveryInterface> {
+pub fn create_http_delivery(
+	config: &toml::Value,
+) -> Result<Box<dyn DeliveryInterface>, DeliveryError> {
 	let rpc_url = config
 		.get("rpc_url")
 		.and_then(|v| v.as_str())
-		.expect("rpc_url is required");
+		.ok_or_else(|| DeliveryError::Network("rpc_url is required".to_string()))?;
 
 	let chain_id = config
 		.get("chain_id")
 		.and_then(|v| v.as_integer())
-		.expect("chain_id is required") as u64;
+		.ok_or_else(|| DeliveryError::Network("chain_id is required".to_string()))?
+		as u64;
 
 	let private_key = config
 		.get("private_key")
 		.and_then(|v| v.as_str())
-		.expect("private_key is required");
+		.ok_or_else(|| DeliveryError::Network("private_key is required".to_string()))?;
 
 	// Parse the private key
-	let signer: PrivateKeySigner = private_key.parse().expect("Invalid private key");
+	let signer: PrivateKeySigner = private_key
+		.parse()
+		.map_err(|e| DeliveryError::Network(format!("Invalid private key: {}", e)))?;
 
 	// Create delivery service synchronously, but the actual connection happens async
 	let delivery = tokio::task::block_in_place(|| {
 		tokio::runtime::Handle::current()
 			.block_on(async { AlloyDelivery::new(rpc_url, chain_id, signer).await })
-	});
+	})?;
 
-	Box::new(delivery.expect("Failed to create delivery service"))
+	Ok(Box::new(delivery))
 }

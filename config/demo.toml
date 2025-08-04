@@ -29,18 +29,19 @@ chain_id = 31338
 [discovery]
 [discovery.sources.onchain_eip7683]
 rpc_url = "http://localhost:8545"
-settler_addresses = ["0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"]
+settler_addresses = ["0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"]
 
 [discovery.sources.offchain_eip7683]
-api_host = "0.0.0.0"
+api_host = "127.0.0.1"
 api_port = 8081
 rpc_url = "http://localhost:8545"
+settler_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
 # auth_token = "your-secret-token"
 
 [order]
 [order.implementations.eip7683]
-output_settler_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
-input_settler_address = "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"
+output_settler_address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+input_settler_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
 solver_address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 
 [order.execution_strategy]
@@ -51,7 +52,7 @@ max_gas_price_gwei = 100
 [settlement]
 [settlement.implementations.eip7683]
 rpc_url = "http://localhost:8546"
-oracle_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+oracle_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 dispute_period_seconds = 1
 
 # API server configuration
@@ -74,16 +75,16 @@ max_request_size = 1048576  # 1MB
 chain_id = 31337
 rpc_url = "http://localhost:8545"
 token = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
-input_settler = "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"
-the_compact = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+input_settler = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+the_compact = ""
 permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
-oracle = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+oracle = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 
 [contracts.destination]
 chain_id = 31338
 rpc_url = "http://localhost:8546"
-token = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
-output_settler = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+token = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+output_settler = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
 permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 
 # Test accounts (used by demo scripts)

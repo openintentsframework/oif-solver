@@ -41,27 +41,32 @@ pub struct LocalWalletSchema;
 
 impl ConfigSchema for LocalWalletSchema {
 	fn validate(&self, config: &toml::Value) -> Result<(), solver_types::ValidationError> {
-		let schema = Schema::new(
-			// Required fields
-			vec![
-				Field::new("private_key", FieldType::String).with_validator(|value| {
-					let key = value.as_str().unwrap();
-					let key_without_prefix = key.strip_prefix("0x").unwrap_or(key);
+		let schema =
+			Schema::new(
+				// Required fields
+				vec![Field::new("private_key", FieldType::String).with_validator(
+					|value| match value.as_str() {
+						Some(key) => {
+							let key_without_prefix = key.strip_prefix("0x").unwrap_or(key);
 
-					if key_without_prefix.len() != 64 {
-						return Err("Private key must be 64 hex characters (32 bytes)".to_string());
-					}
+							if key_without_prefix.len() != 64 {
+								return Err(
+									"Private key must be 64 hex characters (32 bytes)".to_string()
+								);
+							}
 
-					if hex::decode(key_without_prefix).is_err() {
-						return Err("Private key must be valid hexadecimal".to_string());
-					}
+							if hex::decode(key_without_prefix).is_err() {
+								return Err("Private key must be valid hexadecimal".to_string());
+							}
 
-					Ok(())
-				}),
-			],
-			// Optional fields
-			vec![],
-		);
+							Ok(())
+						}
+						None => Err("Expected string value for private_key".to_string()),
+					},
+				)],
+				// Optional fields
+				vec![],
+			);
 
 		schema.validate(config)
 	}
@@ -131,11 +136,19 @@ impl AccountInterface for LocalWallet {
 /// This function reads the account configuration and creates the appropriate
 /// AccountInterface implementation. Currently only supports local wallets
 /// with a private_key configuration parameter.
-pub fn create_account(config: &toml::Value) -> Box<dyn AccountInterface> {
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - `private_key` is not provided in the configuration
+/// - The wallet creation fails
+pub fn create_account(config: &toml::Value) -> Result<Box<dyn AccountInterface>, AccountError> {
 	let private_key = config
 		.get("private_key")
 		.and_then(|v| v.as_str())
-		.expect("private_key is required for local wallet");
+		.ok_or_else(|| {
+			AccountError::InvalidKey("private_key is required for local wallet".to_string())
+		})?;
 
-	Box::new(LocalWallet::new(private_key).expect("Failed to create wallet"))
+	Ok(Box::new(LocalWallet::new(private_key)?))
 }

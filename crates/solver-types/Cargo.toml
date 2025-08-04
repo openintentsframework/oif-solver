@@ -7,8 +7,9 @@ edition = "2021"
 alloy-primitives = { version = "0.8", features = ["std", "serde"] }
 alloy-rpc-types = { version = "0.8" }
 async-trait = { workspace = true }
-axum = { workspace = true, optional = true }
+axum = { workspace = true }
 bytes = { workspace = true }
+hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

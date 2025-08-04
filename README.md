@@ -316,6 +316,11 @@ This script will:
 3. Wait for the solver to discover and fill the intent
 4. Show final balances demonstrating successful execution
 
+You can also check balances at any time using:
+```bash
+./scripts/demo/show_balances.sh
+```
+
 ### What the Demo Demonstrates
 
 1. **Intent Creation**: User deposits tokens into the InputSettler contract on the origin chain

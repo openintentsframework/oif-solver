@@ -97,12 +97,12 @@ impl StorageInterface for FileStorage {
 ///
 /// Configuration parameters:
 /// - `storage_path`: Base directory for file storage (default: "./data/storage")
-pub fn create_storage(config: &toml::Value) -> Box<dyn StorageInterface> {
+pub fn create_storage(config: &toml::Value) -> Result<Box<dyn StorageInterface>, StorageError> {
 	let storage_path = config
 		.get("storage_path")
 		.and_then(|v| v.as_str())
 		.unwrap_or("./data/storage")
 		.to_string();
 
-	Box::new(FileStorage::new(PathBuf::from(storage_path)))
+	Ok(Box::new(FileStorage::new(PathBuf::from(storage_path))))
 }

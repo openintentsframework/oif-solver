@@ -1,43 +1,11 @@
 #!/bin/bash
-# send_onchain_intent.sh - Send a test intent transaction that calls InputSettler7683.open()
+# Send an on-chain cross-chain intent by calling InputSettlerEscrow.open()
+# Prerequisites: Run ./setup_local_anvil.sh and start the solver service
 #
-# This script creates an on-chain EIP-7683 cross-chain intent by calling the InputSettler
-# contract's open() function. This demonstrates the flow for on-chain intent creation.
-#
-# FLOW:
-# 1. Validate environment:
-#    - Check that Anvil chains are running
-#    - Verify contracts are deployed
-#    - Load configuration from config/demo.toml
-#
-# 2. Build EIP-7683 intent data:
-#    - Create MandateERC7683 struct with cross-chain order details
-#    - Set 1 hour expiry time
-#    - Specify input (1 TEST on origin) and output (1 TEST on destination)
-#    - Encode data according to EIP-7683 specification
-#
-# 3. Approve tokens:
-#    - Ensure InputSettler can spend user's TEST tokens
-#    - Approve max amount if not already approved
-#
-# 4. Send intent transaction:
-#    - Call InputSettler7683.open() with the encoded order data
-#    - User's tokens are locked in the settler contract
-#    - Intent is emitted as an on-chain event
-#
-# 5. Verify transaction:
-#    - Check that user's balance decreased by 1 TEST
-#    - Confirm tokens are held by InputSettler
-#    - Display final balances on both chains
-#
-# PREREQUISITES:
-#   - Run ./setup_local_anvil.sh first to deploy contracts
-#   - Solver service should be running to discover and fill the intent
-#
-# USAGE:
-#   ./send_onchain_intent.sh          - Send a complete intent transaction
-#   ./send_onchain_intent.sh balances - Just check current balances
-#   ./send_onchain_intent.sh approve  - Just approve tokens (no intent)
+# Usage:
+#   ./send_onchain_intent.sh          - Send intent transaction
+#   ./send_onchain_intent.sh balances - Check balances only
+#   ./send_onchain_intent.sh approve  - Approve tokens only
 
 set -e
 
@@ -71,16 +39,11 @@ if [ ! -f "config/demo.toml" ]; then
     exit 1
 fi
 
-# Extract contract addresses from config - new format
-# Parse the order section
+# Load addresses from config
 INPUT_SETTLER_ADDRESS=$(grep 'input_settler_address = ' config/demo.toml | cut -d'"' -f2)
 OUTPUT_SETTLER_ADDRESS=$(grep 'output_settler_address = ' config/demo.toml | cut -d'"' -f2)
 SOLVER_ADDR=$(grep 'solver_address = ' config/demo.toml | cut -d'"' -f2)
-
-# Parse the settlement section
 ORACLE_ADDRESS=$(grep 'oracle_address = ' config/demo.toml | cut -d'"' -f2)
-
-# Parse the demo configuration section
 ORIGIN_TOKEN_ADDRESS=$(grep -A 10 '\[contracts.origin\]' config/demo.toml | grep 'token = ' | cut -d'"' -f2)
 DEST_TOKEN_ADDRESS=$(grep -A 10 '\[contracts.destination\]' config/demo.toml | grep 'token = ' | cut -d'"' -f2)
 USER_ADDR=$(grep -A 10 '\[accounts\]' config/demo.toml | grep 'user = ' | cut -d'"' -f2)
@@ -92,6 +55,8 @@ ORIGIN_RPC_URL="http://localhost:8545"
 DEST_RPC_URL="http://localhost:8546"
 RPC_URL=$ORIGIN_RPC_URL  # Default for compatibility
 AMOUNT="1000000000000000000"  # 1 token
+ORIGIN_CHAIN_ID=31337
+DEST_CHAIN_ID=31338
 
 echo -e "${BLUE}📋 Cross-Chain Intent Details:${NC}"
 echo -e "   User (depositor): $USER_ADDR"
@@ -139,99 +104,26 @@ show_balances() {
     check_balance $OUTPUT_SETTLER_ADDRESS "OutputSettler" $DEST_RPC_URL $DEST_TOKEN_ADDRESS
 }
 
-# Function to build EIP-7683 intent data
+# Build StandardOrder data
 build_intent_data() {
-    echo -e "${YELLOW}🔧 Building EIP-7683 intent data...${NC}"
+    echo -e "${YELLOW}🔧 Building StandardOrder intent data...${NC}"
     
-    # Calculate expiry (1 hour from now)
-    EXPIRY=$(( $(date +%s) + 3600 ))
+    CURRENT_TIME=$(date +%s)
+    EXPIRY=$(( CURRENT_TIME + 3600 ))        # 1 hour
+    FILL_DEADLINE=$(( CURRENT_TIME + 7200 )) # 2 hours
+    NONCE=$CURRENT_TIME
     
-    # Convert values to hex format
-    AMOUNT_HEX=$(printf "%064x" $AMOUNT)
-    EXPIRY_HEX=$(printf "%064x" $EXPIRY)
+    # Convert addresses to bytes32 (right-padded)
+    ORACLE_BYTES32="0x0000000000000000000000000000000000000000000000000000000000000000"  # Zero for outputs
+    SETTLER_BYTES32="0x000000000000000000000000$(echo $OUTPUT_SETTLER_ADDRESS | cut -c3-)"
+    TOKEN_BYTES32="0x000000000000000000000000$(echo $DEST_TOKEN_ADDRESS | cut -c3-)"
+    RECIPIENT_BYTES32="0x000000000000000000000000$(echo $RECIPIENT_ADDR | cut -c3-)"
     
-    # Remove 0x prefix and pad addresses to 32 bytes (using origin token for input)
-    ORIGIN_TOKEN_BYTES32="000000000000000000000000${ORIGIN_TOKEN_ADDRESS:2}"
-    DEST_TOKEN_BYTES32="000000000000000000000000${DEST_TOKEN_ADDRESS:2}"
-    RECIPIENT_BYTES32="000000000000000000000000${RECIPIENT_ADDR:2}"
-    ORACLE_BYTES32="000000000000000000000000${ORACLE_ADDRESS:2}"
+    # Encode StandardOrder
+    ORDER_DATA=$(cast abi-encode "f((address,uint256,uint256,uint32,uint32,address,(uint256,uint256)[],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))" \
+        "($USER_ADDR,$NONCE,$ORIGIN_CHAIN_ID,$EXPIRY,$FILL_DEADLINE,$ORACLE_ADDRESS,[($ORIGIN_TOKEN_ADDRESS,$AMOUNT)],[($ORACLE_BYTES32,$SETTLER_BYTES32,$DEST_CHAIN_ID,$TOKEN_BYTES32,$AMOUNT,$RECIPIENT_BYTES32,0x,0x)])")
     
-    # Build MandateERC7683 struct
-    ORDER_DATA="0x"
-    
-    # Offset to struct (32 bytes)
-    ORDER_DATA="${ORDER_DATA}0000000000000000000000000000000000000000000000000000000000000020"
-    
-    # expiry (uint32 padded to 32 bytes)
-    ORDER_DATA="${ORDER_DATA}${EXPIRY_HEX}"
-    
-    # localOracle (use AlwaysYesOracle address)
-    ORDER_DATA="${ORDER_DATA}${ORACLE_BYTES32}"
-    
-    # offset to inputs array (0x80 = 128 bytes from struct start)
-    ORDER_DATA="${ORDER_DATA}0000000000000000000000000000000000000000000000000000000000000080"
-    
-    # offset to outputs array (0xe0 = 224 bytes from struct start)
-    ORDER_DATA="${ORDER_DATA}00000000000000000000000000000000000000000000000000000000000000e0"
-    
-    # inputs array: 1 input
-    ORDER_DATA="${ORDER_DATA}0000000000000000000000000000000000000000000000000000000000000001"
-    
-    # Input struct: (token, amount) - user deposits this on origin chain
-    ORDER_DATA="${ORDER_DATA}${ORIGIN_TOKEN_BYTES32}"
-    ORDER_DATA="${ORDER_DATA}${AMOUNT_HEX}"
-    
-    # outputs array: 1 output  
-    ORDER_DATA="${ORDER_DATA}0000000000000000000000000000000000000000000000000000000000000001"
-    
-    # offset to first output (0x20 = 32 bytes from outputs array start)
-    ORDER_DATA="${ORDER_DATA}0000000000000000000000000000000000000000000000000000000000000020"
-    
-    # MandateOutput struct:
-    # oracle (bytes32) - zero for same-chain
-    ORDER_DATA="${ORDER_DATA}0000000000000000000000000000000000000000000000000000000000000000"
-    
-    # settler (bytes32) - use OutputSettler on destination chain
-    OUTPUT_SETTLER_BYTES32="000000000000000000000000${OUTPUT_SETTLER_ADDRESS:2}"
-    ORDER_DATA="${ORDER_DATA}${OUTPUT_SETTLER_BYTES32}"
-    
-    # chainId - destination chain (31338)
-    ORDER_DATA="${ORDER_DATA}0000000000000000000000000000000000000000000000000000000000007a6a"
-    
-    # token (bytes32) - destination token
-    ORDER_DATA="${ORDER_DATA}${DEST_TOKEN_BYTES32}"
-    
-    # amount - same amount
-    ORDER_DATA="${ORDER_DATA}${AMOUNT_HEX}"
-    
-    # recipient (bytes32)
-    ORDER_DATA="${ORDER_DATA}${RECIPIENT_BYTES32}"
-    
-    # offset to call data (0x100 = 256 bytes from output struct start)
-    ORDER_DATA="${ORDER_DATA}0000000000000000000000000000000000000000000000000000000000000100"
-    
-    # offset to context data (0x120 = 288 bytes from output struct start)
-    ORDER_DATA="${ORDER_DATA}0000000000000000000000000000000000000000000000000000000000000120"
-    
-    # call data - empty (length = 0)
-    ORDER_DATA="${ORDER_DATA}0000000000000000000000000000000000000000000000000000000000000000"
-    
-    # context data - empty (length = 0)
-    ORDER_DATA="${ORDER_DATA}0000000000000000000000000000000000000000000000000000000000000000"
-    
-    # EIP-712 typehash for MandateERC7683
-    ORDER_DATA_TYPE="0x532668680e4ed97945ec5ed6aee3633e99abe764fd2d2861903dc7c109b00e82"
-    
-    echo -e "${GREEN}✅ Intent data built successfully${NC}"
-    echo -e "   Data length: ${#ORDER_DATA} characters"
-    # Use platform-agnostic date formatting
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        # macOS
-        echo -e "   Expiry: $(date -r $EXPIRY)"
-    else
-        # Linux
-        echo -e "   Expiry: $(date -d @$EXPIRY)"
-    fi
+    echo -e "${GREEN}✅ StandardOrder data built${NC}"
 }
 
 # Function to approve tokens
@@ -276,16 +168,18 @@ approve_tokens() {
 send_intent() {
     echo -e "${YELLOW}🚀 Sending intent transaction...${NC}"
     
-    # Call InputSettler7683.open()
-    echo -e "${BLUE}   Calling InputSettler7683.open()...${NC}"
+    # Call InputSettlerEscrow.open()
+    echo -e "${BLUE}   Calling InputSettlerEscrow.open()...${NC}"
     
     INTENT_TX=$(cast send $INPUT_SETTLER_ADDRESS \
-        "open((uint32,bytes32,bytes))" \
-        "($EXPIRY,$ORDER_DATA_TYPE,$ORDER_DATA)" \
+        "open(bytes)" \
+        "$ORDER_DATA" \
         --rpc-url $RPC_URL \
         --private-key $USER_PRIVATE_KEY 2>&1)
     
-    if [ $? -eq 0 ]; then
+    CAST_EXIT_CODE=$?
+    
+    if [ $CAST_EXIT_CODE -eq 0 ]; then
         TX_HASH=$(echo "$INTENT_TX" | grep -o '"transactionHash":"0x[^"]*"' | head -1 | cut -d'"' -f4)
         
         if [ -z "$TX_HASH" ]; then
@@ -305,59 +199,40 @@ send_intent() {
         
         return 0
     else
-        echo -e "${RED}❌ Intent transaction failed:${NC}"
+        echo -e "${RED}❌ Intent transaction failed (exit code: $CAST_EXIT_CODE):${NC}"
         echo "$INTENT_TX"
+        echo -e "${YELLOW}Debug info:${NC}"
+        echo "  INPUT_SETTLER_ADDRESS: $INPUT_SETTLER_ADDRESS"
+        echo "  ORDER_DATA length: ${#ORDER_DATA}"
+        echo "  First 100 chars of ORDER_DATA: ${ORDER_DATA:0:100}..."
         return 1
     fi
 }
 
-# Function to verify transaction
+# Verify transaction
 verify_transaction() {
-    echo -e "${YELLOW}🔍 Verifying cross-chain intent creation...${NC}"
+    echo -e "${YELLOW}🔍 Verifying intent creation...${NC}"
     
-    # For cross-chain intents, we expect:
-    # Origin chain: User deposits tokens to InputSettler
-    # Destination chain: No immediate changes (solver will fill later)
-    
-    # Get current balances on origin chain
+    # Get current balances
     USER_BALANCE_HEX=$(cast call $ORIGIN_TOKEN_ADDRESS "balanceOf(address)" $USER_ADDR --rpc-url $ORIGIN_RPC_URL 2>&1 | grep -E '^0x[0-9a-fA-F]+$' | tail -1)
     USER_BALANCE_DEC=$(cast to-dec $USER_BALANCE_HEX 2>/dev/null || echo "0")
     
     SETTLER_BALANCE_HEX=$(cast call $ORIGIN_TOKEN_ADDRESS "balanceOf(address)" $INPUT_SETTLER_ADDRESS --rpc-url $ORIGIN_RPC_URL 2>&1 | grep -E '^0x[0-9a-fA-F]+$' | tail -1)
     SETTLER_BALANCE_DEC=$(cast to-dec $SETTLER_BALANCE_HEX 2>/dev/null || echo "0")
     
-    # Calculate balance changes
+    # Calculate changes
     USER_BALANCE_CHANGE=$(echo "$USER_BALANCE_DEC - $INITIAL_USER_BALANCE" | bc)
     SETTLER_BALANCE_CHANGE=$(echo "$SETTLER_BALANCE_DEC - $INITIAL_SETTLER_BALANCE" | bc)
     
-    # Expected changes: User loses 1 TEST (deposited via InputSettler)
     EXPECTED_USER_CHANGE=$(echo "-$AMOUNT" | bc)
-    EXPECTED_SETTLER_CHANGE="0"
     
-    # Verify origin chain changes
-    USER_CORRECT=$(echo "$USER_BALANCE_CHANGE == $EXPECTED_USER_CHANGE" | bc)
-    SETTLER_CORRECT=$(echo "$SETTLER_BALANCE_CHANGE == $EXPECTED_SETTLER_CHANGE" | bc)
-    
-    if [ "$USER_CORRECT" -eq 1 ] && [ "$SETTLER_CORRECT" -eq 1 ]; then
-        echo -e "${GREEN}✅ Cross-chain intent created successfully!${NC}"
-        echo ""
-        echo -e "${BLUE}📊 Origin Chain (31337) - Intent Created:${NC}"
-        echo -e "   User deposited: $(echo "scale=2; -1 * $USER_BALANCE_CHANGE / 1000000000000000000" | bc -l) TEST → InputSettler"
-        echo -e "   InputSettler holding: $(echo "scale=2; $SETTLER_BALANCE_CHANGE / 1000000000000000000" | bc -l) TEST"
-        echo ""
-        echo -e "${YELLOW}⏳ Waiting for solver to fill on destination chain...${NC}"
-        echo -e "   The solver will:"
-        echo -e "   1. Send 1 TEST to recipient on destination chain (31338)"
-        echo -e "   2. Claim 1 TEST from InputSettler on origin chain (31337)"
+    if [ $(echo "$USER_BALANCE_CHANGE == $EXPECTED_USER_CHANGE" | bc) -eq 1 ]; then
+        echo -e "${GREEN}✅ Intent created successfully!${NC}"
+        echo -e "   User deposited: 1.0 TEST → InputSettler"
     else
         echo -e "${RED}❌ Intent creation failed${NC}"
-        echo -e "   User balance change: $(echo "scale=2; $USER_BALANCE_CHANGE / 1000000000000000000" | bc -l) TEST (expected: -1.0)"
-        echo -e "   InputSettler balance change: $(echo "scale=2; $SETTLER_BALANCE_CHANGE / 1000000000000000000" | bc -l) TEST (expected: +1.0)"
         return 1
     fi
-    
-    echo ""
-    echo -e "${BLUE}📋 Cross-chain intent is ready for solver discovery${NC}"
 }
 
 # Global variables to store initial balances

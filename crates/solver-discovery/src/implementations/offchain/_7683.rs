@@ -57,7 +57,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use solver_types::{
-	ConfigSchema, Eip7683OrderData, Eip7683Output, Field, FieldType, Intent, IntentMetadata, Schema,
+	standards::eip7683::MandateOutput, ConfigSchema, Eip7683OrderData, Field, FieldType, Intent,
+	IntentMetadata, Schema,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,33 +66,34 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tower_http::cors::CorsLayer;
 
-// Import the Solidity types from IERC7683.sol
+/// Helper function to get current timestamp, returns 0 if system time is before UNIX epoch
+fn current_timestamp() -> u64 {
+	std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|d| d.as_secs())
+		.unwrap_or(0)
+}
+
+// Import the Solidity types for the OIF contracts
 sol! {
 	#[sol(rpc)]
-	interface IErc7683 {
-		struct GaslessCrossChainOrder {
-			address originSettler;
-			address user;
-			uint256 nonce;
-			uint256 originChainId;
-			uint32 openDeadline;
-			uint32 fillDeadline;
-			bytes32 orderDataType;
-			bytes orderData;
-		}
-
-		function orderIdentifier(GaslessCrossChainOrder calldata order) external view returns (bytes32);
+	interface IInputSettlerEscrow {
+		function orderIdentifier(bytes calldata order) external view returns (bytes32);
+		function openFor(bytes calldata order, address sponsor, bytes calldata signature) external;
 	}
 
-	// MandateERC7683 struct for decoding orderData
-	struct MandateERC7683 {
-		uint32 expiry;
-		bytes32 localOracle;
+	struct StandardOrder {
+		address user;
+		uint256 nonce;
+		uint256 originChainId;
+		uint32 expires;
+		uint32 fillDeadline;
+		address inputOracle;
 		uint256[2][] inputs;
-		MandateOutput[] outputs;
+		SolMandateOutput[] outputs;
 	}
 
-	struct MandateOutput {
+	struct SolMandateOutput {
 		bytes32 oracle;
 		bytes32 settler;
 		uint256 chainId;
@@ -103,34 +105,50 @@ sol! {
 	}
 }
 
-/// API representation of GaslessCrossChainOrder for JSON deserialization.
+/// API representation of StandardOrder for JSON deserialization.
 ///
-/// This struct represents the order format expected by the HTTP API endpoint.
-/// It mirrors the Solidity `GaslessCrossChainOrder` struct but uses API-friendly
-/// types for JSON serialization/deserialization.
+/// This struct represents the order format for the OIF contracts.
+/// The order is sent as encoded bytes along with sponsor and signature.
 ///
 /// # Fields
 ///
-/// * `origin_settler` - Address of the settler contract on the origin chain
 /// * `user` - Address of the user creating the order
 /// * `nonce` - Unique nonce to prevent replay attacks
 /// * `origin_chain_id` - Chain ID where the order originates
-/// * `open_deadline` - Unix timestamp after which the order can be filled
-/// * `fill_deadline` - Unix timestamp when the order expires
-/// * `order_data_type` - 32-byte identifier for the order data format
-/// * `order_data` - Encoded order data (typically MandateERC7683)
+/// * `expires` - Unix timestamp when the order expires
+/// * `fill_deadline` - Unix timestamp by which the order must be filled
+/// * `input_oracle` - Address of the oracle responsible for validating fills
+/// * `inputs` - Array of [token, amount] pairs as U256
+/// * `outputs` - Array of MandateOutput structs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ApiGaslessCrossChainOrder {
-	origin_settler: Address,
+struct ApiStandardOrder {
 	user: Address,
 	nonce: U256,
 	origin_chain_id: U256,
-	open_deadline: u32,
+	expires: u32,
 	fill_deadline: u32,
+	input_oracle: Address,
+	inputs: Vec<[U256; 2]>,
+	outputs: Vec<ApiMandateOutput>,
+}
+
+/// API representation of MandateOutput
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiMandateOutput {
 	#[serde(deserialize_with = "deserialize_bytes32")]
-	order_data_type: [u8; 32],
-	order_data: Bytes,
+	oracle: [u8; 32],
+	#[serde(deserialize_with = "deserialize_bytes32")]
+	settler: [u8; 32],
+	chain_id: U256,
+	#[serde(deserialize_with = "deserialize_bytes32")]
+	token: [u8; 32],
+	amount: U256,
+	#[serde(deserialize_with = "deserialize_bytes32")]
+	recipient: [u8; 32],
+	call: Bytes,
+	context: Bytes,
 }
 
 /// Custom deserializer for bytes32 that accepts hex strings.
@@ -168,22 +186,18 @@ where
 
 /// API request wrapper for intent submission.
 ///
-/// This is the top-level structure for POST /intent requests.
+/// This is the top-level structure for POST /intent requests with the OIF format.
 ///
 /// # Fields
 ///
-/// * `order` - The gasless cross-chain order to submit
-/// * `signature` - Optional signature for order validation
-/// * `_quote_id` - Optional quote identifier (currently unused)
-/// * `_provider` - Optional provider identifier (currently unused)
+/// * `order` - The StandardOrder encoded as hex bytes
+/// * `sponsor` - The address sponsoring the order (usually the user)
+/// * `signature` - The Permit2Witness signature
 #[derive(Debug, Deserialize)]
 struct IntentRequest {
-	order: ApiGaslessCrossChainOrder,
-	signature: Option<Bytes>,
-	#[serde(default)]
-	_quote_id: Option<String>,
-	#[serde(default, alias = "provider")]
-	_provider: Option<String>,
+	order: Bytes,
+	sponsor: Address,
+	signature: Bytes,
 }
 
 /// API response for intent submission.
@@ -212,6 +226,7 @@ struct IntentResponse {
 /// * `intent_sender` - Channel to broadcast discovered intents to the solver system
 /// * `auth_token` - Optional authentication token for API access control
 /// * `provider` - RPC provider for interacting with on-chain contracts
+/// * `settler_address` - Address of the settler contract
 #[derive(Clone)]
 struct ApiState {
 	/// Channel to send discovered intents
@@ -221,6 +236,8 @@ struct ApiState {
 	auth_token: Option<String>,
 	/// RPC provider for calling settler contracts
 	provider: RootProvider<Http<reqwest::Client>>,
+	/// Settler contract address
+	settler_address: Address,
 }
 
 /// EIP-7683 offchain discovery implementation.
@@ -236,6 +253,8 @@ pub struct Eip7683OffchainDiscovery {
 	auth_token: Option<String>,
 	/// RPC provider for calling settler contracts
 	provider: RootProvider<Http<reqwest::Client>>,
+	/// Settler contract address
+	settler_address: Address,
 	/// Flag indicating if the server is running
 	is_running: Arc<AtomicBool>,
 	/// Channel for signaling server shutdown
@@ -251,6 +270,7 @@ impl Eip7683OffchainDiscovery {
 	/// * `api_port` - The port number to listen on
 	/// * `auth_token` - Optional authentication token for API access
 	/// * `rpc_url` - Ethereum RPC URL for calling settler contracts
+	/// * `settler_address` - Address of the settler contract
 	///
 	/// # Returns
 	///
@@ -259,11 +279,13 @@ impl Eip7683OffchainDiscovery {
 	/// # Errors
 	///
 	/// Returns `DiscoveryError::Connection` if the RPC URL cannot be parsed.
+	/// Returns `DiscoveryError::ValidationError` if the settler address is invalid.
 	pub fn new(
 		api_host: String,
 		api_port: u16,
 		auth_token: Option<String>,
 		rpc_url: String,
+		settler_address: String,
 	) -> Result<Self, DiscoveryError> {
 		let provider = RootProvider::new_http(
 			rpc_url
@@ -271,97 +293,58 @@ impl Eip7683OffchainDiscovery {
 				.map_err(|e| DiscoveryError::Connection(format!("Invalid RPC URL: {}", e)))?,
 		);
 
+		let settler_address = settler_address.parse::<Address>().map_err(|e| {
+			DiscoveryError::ValidationError(format!("Invalid settler address: {}", e))
+		})?;
+
 		Ok(Self {
 			api_host,
 			api_port,
 			auth_token,
 			provider,
+			settler_address,
 			is_running: Arc::new(AtomicBool::new(false)),
 			shutdown_signal: Arc::new(Mutex::new(None)),
 		})
 	}
 
-	/// Parses order data to extract outputs and other details.
+	/// Parses StandardOrder data from raw bytes.
 	///
-	/// Decodes the MandateERC7683 struct from the raw order data bytes
-	/// and extracts the inputs, outputs, expiry, and oracle information.
+	/// Decodes the StandardOrder struct from the raw order data bytes
+	/// and extracts all necessary fields.
 	///
 	/// # Arguments
 	///
-	/// * `order` - The API order containing encoded order data
+	/// * `order_bytes` - The encoded StandardOrder bytes
 	///
 	/// # Returns
 	///
-	/// Returns a JSON value containing:
-	/// - `outputs`: Array of output specifications
-	/// - `inputs`: Array of input token/amount pairs
-	/// - `expiry`: Order expiration timestamp
-	/// - `local_oracle`: Address of the local oracle
+	/// Returns the decoded StandardOrder struct.
 	///
 	/// # Errors
 	///
 	/// Returns `DiscoveryError::ParseError` if the order data cannot be decoded.
-	fn parse_order_data(
-		order: &ApiGaslessCrossChainOrder,
-	) -> Result<serde_json::Value, DiscoveryError> {
+	fn parse_standard_order(order_bytes: &Bytes) -> Result<StandardOrder, DiscoveryError> {
 		use alloy_sol_types::SolValue;
 
-		// Decode the MandateERC7683 struct from the order data
-		let mandate = MandateERC7683::abi_decode(&order.order_data, true).map_err(|e| {
-			DiscoveryError::ParseError(format!("Failed to decode MandateERC7683: {}", e))
+		// Decode the StandardOrder struct from the order data
+		let order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+			DiscoveryError::ParseError(format!("Failed to decode StandardOrder: {}", e))
 		})?;
 
-		// Convert inputs
-		let inputs: Vec<[serde_json::Value; 2]> = mandate
-			.inputs
-			.iter()
-			.map(|input| {
-				[
-					serde_json::to_value(input[0]).unwrap(),
-					serde_json::to_value(input[1]).unwrap(),
-				]
-			})
-			.collect();
-
-		// Convert outputs
-		let outputs: Vec<Eip7683Output> = mandate
-			.outputs
-			.iter()
-			.map(|output| {
-				// Convert bytes32 token to address (last 20 bytes)
-				let token_bytes = &output.token.0[12..];
-				let token = format!("0x{}", hex::encode(token_bytes));
-
-				// Convert bytes32 recipient to address (last 20 bytes)
-				let recipient_bytes = &output.recipient.0[12..];
-				let recipient = format!("0x{}", hex::encode(recipient_bytes));
-
-				Eip7683Output {
-					token,
-					amount: output.amount,
-					recipient,
-					chain_id: output.chainId.to::<u64>(),
-				}
-			})
-			.collect();
-
-		Ok(serde_json::json!({
-			"outputs": outputs,
-			"inputs": inputs,
-			"expiry": mandate.expiry,
-			"local_oracle": format!("0x{}", hex::encode(&mandate.localOracle.0[12..]))
-		}))
+		Ok(order)
 	}
 
-	/// Validates the incoming order.
+	/// Validates the incoming StandardOrder.
 	///
 	/// Performs validation checks on order deadlines to ensure
 	/// the order is still valid and can be processed.
 	///
 	/// # Arguments
 	///
-	/// * `order` - The order to validate
-	/// * `_signature` - Optional signature (validation not yet implemented)
+	/// * `order` - The StandardOrder to validate
+	/// * `sponsor` - The sponsor address
+	/// * `signature` - The Permit2Witness signature
 	///
 	/// # Returns
 	///
@@ -370,38 +353,34 @@ impl Eip7683OffchainDiscovery {
 	/// # Errors
 	///
 	/// Returns `DiscoveryError::ValidationError` if:
-	/// - The open deadline has passed (if non-zero)
+	/// - The expiry has passed
 	/// - The fill deadline has passed
 	///
 	/// # TODO
 	///
-	/// - Implement signature validation
+	/// - Implement Permit2Witness signature validation
 	async fn validate_order(
-		order: &ApiGaslessCrossChainOrder,
-		_signature: &Option<Bytes>,
+		order: &StandardOrder,
+		_sponsor: &Address,
+		_signature: &Bytes,
 	) -> Result<(), DiscoveryError> {
 		// Check if deadlines are still valid
-		let current_time = std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.unwrap()
-			.as_secs() as u32;
+		let current_time = current_timestamp() as u32;
 
-		if order.open_deadline > 0 && order.open_deadline < current_time {
+		if order.expires < current_time {
 			return Err(DiscoveryError::ValidationError(
-				"Order open deadline has passed".to_string(),
+				"Order has expired".to_string(),
 			));
 		}
 
-		if order.fill_deadline < current_time {
+		if order.fillDeadline < current_time {
 			return Err(DiscoveryError::ValidationError(
 				"Order fill deadline has passed".to_string(),
 			));
 		}
 
-		// TODO: Implement signature validation
-		// if let Some(sig) = signature {
-		//     // Verify signature matches the user address
-		// }
+		// TODO: Implement Permit2Witness signature validation
+		// The signature should be validated against the Permit2 contract
 
 		Ok(())
 	}
@@ -431,54 +410,56 @@ impl Eip7683OffchainDiscovery {
 	/// - Order data parsing fails
 	/// - No outputs are present in the order
 	async fn order_to_intent(
-		order: &ApiGaslessCrossChainOrder,
+		order_bytes: &Bytes,
+		sponsor: &Address,
+		signature: &Bytes,
 		provider: &RootProvider<Http<reqwest::Client>>,
-		signature: &Option<Bytes>,
+		settler_address: Address,
 	) -> Result<Intent, DiscoveryError> {
+		// Parse the StandardOrder
+		let order = Self::parse_standard_order(order_bytes)?;
+
 		// Generate order ID from order data
-		let order_id = Self::compute_order_id(order, provider).await?;
+		let order_id = Self::compute_order_id(order_bytes, provider, settler_address).await?;
 
-		// Parse order data
-		let parsed_data = Self::parse_order_data(order)?;
+		// Validate that order has outputs
+		if order.outputs.is_empty() {
+			return Err(DiscoveryError::ValidationError(
+				"Order must have at least one output".to_string(),
+			));
+		}
 
-		// Parse outputs from parsed_data
-		let outputs: Vec<Eip7683Output> = serde_json::from_value(parsed_data["outputs"].clone())
-			.map_err(|e| DiscoveryError::ParseError(format!("Failed to parse outputs: {}", e)))?;
-
-		// Parse inputs from parsed_data
-		let inputs: Vec<[U256; 2]> = serde_json::from_value(parsed_data["inputs"].clone())
-			.map_err(|e| DiscoveryError::ParseError(format!("Failed to parse inputs: {}", e)))?;
-
-		// Extract destination chain ID from first output (if available)
-		let destination_chain_id =
-			outputs
-				.first()
-				.map(|output| output.chain_id)
-				.ok_or_else(|| {
-					DiscoveryError::ValidationError(
-						"Order must have at least one output".to_string(),
-					)
-				})?;
-
-		// Convert to intent format matching the onchain implementation
+		// Convert to intent format
 		let order_data = Eip7683OrderData {
-			user: order.user.to_string(),
-			nonce: order.nonce.to::<u64>(),
-			origin_chain_id: order.origin_chain_id.to::<u64>(),
-			destination_chain_id,
-			expires: order.open_deadline,
-			fill_deadline: order.fill_deadline,
-			local_oracle: "0x0000000000000000000000000000000000000000".to_string(),
-			inputs,
+			user: format!("0x{}", hex::encode(order.user)),
+			nonce: order.nonce,
+			origin_chain_id: order.originChainId,
+			expires: order.expires,
+			fill_deadline: order.fillDeadline,
+			input_oracle: format!("0x{}", hex::encode(order.inputOracle)),
+			inputs: order.inputs.clone(),
 			order_id,
-			settle_gas_limit: 200_000u64,
-			fill_gas_limit: 200_000u64,
-			outputs,
+			settle_gas_limit: 200_000u64, // TODO: calculate exactly
+			fill_gas_limit: 200_000u64,   // TODO: calculate exactly
+			outputs: order
+				.outputs
+				.iter()
+				.map(|output| MandateOutput {
+					oracle: output.oracle.0,
+					settler: output.settler.0,
+					chain_id: output.chainId,
+					token: output.token.0,
+					amount: output.amount,
+					recipient: output.recipient.0,
+					call: output.call.clone().into(),
+					context: output.context.clone().into(),
+				})
+				.collect(),
 			// Include raw order data for openFor
-			raw_order_data: Some(order.order_data.to_string()),
-			order_data_type: Some(order.order_data_type),
-			// Include signature if provided
-			signature: signature.as_ref().map(|s| s.to_string()),
+			raw_order_data: Some(format!("0x{}", hex::encode(order_bytes))),
+			// Include signature and sponsor
+			signature: Some(format!("0x{}", hex::encode(signature))),
+			sponsor: Some(sponsor.to_string()),
 		};
 
 		Ok(Intent {
@@ -488,10 +469,7 @@ impl Eip7683OffchainDiscovery {
 			metadata: IntentMetadata {
 				requires_auction: false,
 				exclusive_until: None,
-				discovered_at: std::time::SystemTime::now()
-					.duration_since(std::time::UNIX_EPOCH)
-					.unwrap()
-					.as_secs(),
+				discovered_at: current_timestamp(),
 			},
 			data: serde_json::to_value(&order_data).map_err(|e| {
 				DiscoveryError::ParseError(format!("Failed to serialize order data: {}", e))
@@ -517,25 +495,14 @@ impl Eip7683OffchainDiscovery {
 	///
 	/// Returns `DiscoveryError::Connection` if the contract call fails.
 	async fn compute_order_id(
-		order: &ApiGaslessCrossChainOrder,
+		order_bytes: &Bytes,
 		provider: &RootProvider<Http<reqwest::Client>>,
+		settler_address: Address,
 	) -> Result<[u8; 32], DiscoveryError> {
-		let settler = IErc7683::new(order.origin_settler, provider);
-
-		// Convert API order to contract format
-		let contract_order = IErc7683::GaslessCrossChainOrder {
-			originSettler: order.origin_settler,
-			user: order.user,
-			nonce: order.nonce,
-			originChainId: order.origin_chain_id,
-			openDeadline: order.open_deadline,
-			fillDeadline: order.fill_deadline,
-			orderDataType: order.order_data_type.into(),
-			orderData: order.order_data.clone(),
-		};
+		let settler = IInputSettlerEscrow::new(settler_address, provider);
 
 		let order_id = settler
-			.orderIdentifier(contract_order)
+			.orderIdentifier(order_bytes.clone())
 			.call()
 			.await
 			.map_err(|e| {
@@ -557,11 +524,12 @@ impl Eip7683OffchainDiscovery {
 	/// * `intent_sender` - Channel to send discovered intents
 	/// * `auth_token` - Optional authentication token
 	/// * `provider` - RPC provider for contract calls
+	/// * `settler_address` - Address of the settler contract
 	/// * `shutdown_rx` - Channel to receive shutdown signal
 	///
-	/// # Panics
+	/// # Errors
 	///
-	/// Panics if:
+	/// Returns an error if:
 	/// - The address cannot be parsed
 	/// - The TCP listener cannot bind to the address
 	/// - The server encounters a fatal error
@@ -571,12 +539,14 @@ impl Eip7683OffchainDiscovery {
 		intent_sender: mpsc::UnboundedSender<Intent>,
 		auth_token: Option<String>,
 		provider: RootProvider<Http<reqwest::Client>>,
+		settler_address: Address,
 		mut shutdown_rx: mpsc::Receiver<()>,
-	) {
+	) -> Result<(), String> {
 		let state = ApiState {
 			intent_sender,
 			auth_token,
 			provider,
+			settler_address,
 		};
 
 		let app = Router::new()
@@ -586,11 +556,11 @@ impl Eip7683OffchainDiscovery {
 
 		let addr = format!("{}:{}", api_host, api_port)
 			.parse::<SocketAddr>()
-			.expect("Invalid address");
+			.map_err(|e| format!("Invalid address '{}:{}': {}", api_host, api_port, e))?;
 
 		let listener = tokio::net::TcpListener::bind(addr)
 			.await
-			.expect("Failed to bind address");
+			.map_err(|e| format!("Failed to bind address {}: {}", addr, e))?;
 
 		tracing::info!("EIP-7683 offchain discovery API listening on {}", addr);
 
@@ -600,7 +570,9 @@ impl Eip7683OffchainDiscovery {
 				tracing::info!("Shutting down API server");
 			})
 			.await
-			.expect("Server error");
+			.map_err(|e| format!("Server error: {}", e))?;
+
+		Ok(())
 	}
 }
 
@@ -640,9 +612,25 @@ async fn handle_intent_submission(
 	//     // Check Authorization header
 	// }
 
+	// Parse the StandardOrder from bytes
+	let order = match Eip7683OffchainDiscovery::parse_standard_order(&request.order) {
+		Ok(order) => order,
+		Err(e) => {
+			return (
+				StatusCode::BAD_REQUEST,
+				Json(IntentResponse {
+					order_id: String::new(),
+					status: "error".to_string(),
+					message: Some(format!("Failed to parse order: {}", e)),
+				}),
+			)
+				.into_response();
+		}
+	};
+
 	// Validate order
 	if let Err(e) =
-		Eip7683OffchainDiscovery::validate_order(&request.order, &request.signature).await
+		Eip7683OffchainDiscovery::validate_order(&order, &request.sponsor, &request.signature).await
 	{
 		return (
 			StatusCode::BAD_REQUEST,
@@ -655,11 +643,16 @@ async fn handle_intent_submission(
 			.into_response();
 	}
 
+	// Get settler address from the API state
+	let settler_address = state.settler_address;
+
 	// Convert to intent
 	match Eip7683OffchainDiscovery::order_to_intent(
 		&request.order,
-		&state.provider,
+		&request.sponsor,
 		&request.signature,
+		&state.provider,
+		settler_address,
 	)
 	.await
 	{
@@ -733,13 +726,29 @@ impl ConfigSchema for Eip7683OffchainDiscoverySchema {
 				),
 				Field::new("api_host", FieldType::String),
 				Field::new("rpc_url", FieldType::String).with_validator(|value| {
-					let url = value.as_str().unwrap();
-					if url.starts_with("http://") || url.starts_with("https://") {
-						Ok(())
-					} else {
-						Err("RPC URL must start with http:// or https://".to_string())
+					match value.as_str() {
+						Some(url) => {
+							if url.starts_with("http://") || url.starts_with("https://") {
+								Ok(())
+							} else {
+								Err("RPC URL must start with http:// or https://".to_string())
+							}
+						}
+						None => Err("Expected string value for rpc_url".to_string()),
 					}
 				}),
+				Field::new("settler_address", FieldType::String).with_validator(
+					|value| match value.as_str() {
+						Some(addr) => {
+							if addr.len() != 42 || !addr.starts_with("0x") {
+								Err("settler_address must be a valid Ethereum address".to_string())
+							} else {
+								Ok(())
+							}
+						}
+						None => Err("Expected string value for settler_address".to_string()),
+					},
+				),
 			],
 			// Optional fields
 			vec![
@@ -780,17 +789,22 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 		let api_port = self.api_port;
 		let auth_token = self.auth_token.clone();
 		let provider = self.provider.clone();
+		let settler_address = self.settler_address;
 
 		tokio::spawn(async move {
-			Self::run_server(
+			if let Err(e) = Self::run_server(
 				api_host,
 				api_port,
 				sender,
 				auth_token,
 				provider,
+				settler_address,
 				shutdown_rx,
 			)
-			.await;
+			.await
+			{
+				tracing::error!("API server error: {}", e);
+			}
 		});
 
 		self.is_running.store(true, Ordering::SeqCst);
@@ -833,14 +847,18 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 /// api_port = 8081              # optional, defaults to 8081
 /// auth_token = "secret"        # optional
 /// rpc_url = "https://..."      # required
+/// settler_address = "0x..."    # required
 /// ```
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if:
+/// Returns an error if:
 /// - `rpc_url` is not provided in the configuration
+/// - `settler_address` is not provided in the configuration
 /// - The discovery service cannot be created
-pub fn create_discovery(config: &toml::Value) -> Box<dyn DiscoveryInterface> {
+pub fn create_discovery(
+	config: &toml::Value,
+) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError> {
 	let api_host = config
 		.get("api_host")
 		.and_then(|v| v.as_str())
@@ -860,11 +878,23 @@ pub fn create_discovery(config: &toml::Value) -> Box<dyn DiscoveryInterface> {
 	let rpc_url = config
 		.get("rpc_url")
 		.and_then(|v| v.as_str())
-		.expect("rpc_url is required")
+		.ok_or_else(|| DiscoveryError::ValidationError("rpc_url is required".to_string()))?
 		.to_string();
 
-	Box::new(
-		Eip7683OffchainDiscovery::new(api_host, api_port, auth_token, rpc_url)
-			.expect("Failed to create offchain discovery service"),
-	)
+	let settler_address = config
+		.get("settler_address")
+		.and_then(|v| v.as_str())
+		.ok_or_else(|| DiscoveryError::ValidationError("settler_address is required".to_string()))?
+		.to_string();
+
+	let discovery =
+		Eip7683OffchainDiscovery::new(api_host, api_port, auth_token, rpc_url, settler_address)
+			.map_err(|e| {
+				DiscoveryError::Connection(format!(
+					"Failed to create offchain discovery service: {}",
+					e
+				))
+			})?;
+
+	Ok(Box::new(discovery))
 }

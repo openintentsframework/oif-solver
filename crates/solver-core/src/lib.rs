@@ -251,8 +251,6 @@ impl SolverEngine {
 			.await
 			.map_err(|e| SolverError::Service(e.to_string()))?
 		{
-			tracing::info!("Preparing order with transaction");
-
 			// Submit prepare transaction
 			let prepare_tx_hash = self
 				.delivery
@@ -528,8 +526,6 @@ impl SolverEngine {
 			}
 		};
 
-		tracing::info!(order_id = %truncate_id(&order_id), "Prepare transaction confirmed");
-
 		// Retrieve pending execution details
 		let pending_data: Option<(Order, ExecutionParams)> = self
 			.storage
@@ -600,7 +596,7 @@ impl SolverEngine {
 					tracing::error!(
 						order_id = %truncate_id(&order_id),
 						error = %e,
-						"Failed to validate fill"
+						"Failed to get attestation for fill transaction"
 					);
 					return;
 				}
@@ -777,20 +773,49 @@ impl SolverEngine {
 }
 
 /// Type alias for storage backend factory function.
-type StorageFactory = Box<dyn Fn(&toml::Value) -> Box<dyn solver_storage::StorageInterface> + Send>;
+type StorageFactory = Box<
+	dyn Fn(
+			&toml::Value,
+		) -> Result<Box<dyn solver_storage::StorageInterface>, solver_storage::StorageError>
+		+ Send,
+>;
 /// Type alias for account provider factory function.
-type AccountFactory = Box<dyn Fn(&toml::Value) -> Box<dyn solver_account::AccountInterface> + Send>;
+type AccountFactory = Box<
+	dyn Fn(
+			&toml::Value,
+		) -> Result<Box<dyn solver_account::AccountInterface>, solver_account::AccountError>
+		+ Send,
+>;
 /// Type alias for delivery provider factory function.
-type DeliveryFactory =
-	Box<dyn Fn(&toml::Value) -> Box<dyn solver_delivery::DeliveryInterface> + Send>;
+type DeliveryFactory = Box<
+	dyn Fn(
+			&toml::Value,
+		) -> Result<Box<dyn solver_delivery::DeliveryInterface>, solver_delivery::DeliveryError>
+		+ Send,
+>;
 /// Type alias for discovery source factory function.
-type DiscoveryFactory =
-	Box<dyn Fn(&toml::Value) -> Box<dyn solver_discovery::DiscoveryInterface> + Send>;
+type DiscoveryFactory = Box<
+	dyn Fn(
+			&toml::Value,
+		) -> Result<
+			Box<dyn solver_discovery::DiscoveryInterface>,
+			solver_discovery::DiscoveryError,
+		> + Send,
+>;
 /// Type alias for order implementation factory function.
-type OrderFactory = Box<dyn Fn(&toml::Value) -> Box<dyn solver_order::OrderInterface> + Send>;
+type OrderFactory = Box<
+	dyn Fn(&toml::Value) -> Result<Box<dyn solver_order::OrderInterface>, solver_order::OrderError>
+		+ Send,
+>;
 /// Type alias for settlement implementation factory function.
-type SettlementFactory =
-	Box<dyn Fn(&toml::Value) -> Box<dyn solver_settlement::SettlementInterface> + Send>;
+type SettlementFactory = Box<
+	dyn Fn(
+			&toml::Value,
+		) -> Result<
+			Box<dyn solver_settlement::SettlementInterface>,
+			solver_settlement::SettlementError,
+		> + Send,
+>;
 /// Type alias for execution strategy factory function.
 type StrategyFactory = Box<dyn Fn(&toml::Value) -> Box<dyn solver_order::ExecutionStrategy> + Send>;
 
@@ -828,7 +853,12 @@ impl SolverBuilder {
 	/// Sets the factory function for creating storage backends.
 	pub fn with_storage_factory<F>(mut self, factory: F) -> Self
 	where
-		F: Fn(&toml::Value) -> Box<dyn solver_storage::StorageInterface> + Send + 'static,
+		F: Fn(
+				&toml::Value,
+			)
+				-> Result<Box<dyn solver_storage::StorageInterface>, solver_storage::StorageError>
+			+ Send
+			+ 'static,
 	{
 		self.storage_factory = Some(Box::new(factory));
 		self
@@ -837,7 +867,12 @@ impl SolverBuilder {
 	/// Sets the factory function for creating account providers.
 	pub fn with_account_factory<F>(mut self, factory: F) -> Self
 	where
-		F: Fn(&toml::Value) -> Box<dyn solver_account::AccountInterface> + Send + 'static,
+		F: Fn(
+				&toml::Value,
+			)
+				-> Result<Box<dyn solver_account::AccountInterface>, solver_account::AccountError>
+			+ Send
+			+ 'static,
 	{
 		self.account_factory = Some(Box::new(factory));
 		self
@@ -848,7 +883,13 @@ impl SolverBuilder {
 	/// The name parameter should match the provider name in the configuration.
 	pub fn with_delivery_factory<F>(mut self, name: &str, factory: F) -> Self
 	where
-		F: Fn(&toml::Value) -> Box<dyn solver_delivery::DeliveryInterface> + Send + 'static,
+		F: Fn(
+				&toml::Value,
+			) -> Result<
+				Box<dyn solver_delivery::DeliveryInterface>,
+				solver_delivery::DeliveryError,
+			> + Send
+			+ 'static,
 	{
 		self.delivery_factories
 			.insert(name.to_string(), Box::new(factory));
@@ -860,7 +901,13 @@ impl SolverBuilder {
 	/// The name parameter should match the source name in the configuration.
 	pub fn with_discovery_factory<F>(mut self, name: &str, factory: F) -> Self
 	where
-		F: Fn(&toml::Value) -> Box<dyn solver_discovery::DiscoveryInterface> + Send + 'static,
+		F: Fn(
+				&toml::Value,
+			) -> Result<
+				Box<dyn solver_discovery::DiscoveryInterface>,
+				solver_discovery::DiscoveryError,
+			> + Send
+			+ 'static,
 	{
 		self.discovery_factories
 			.insert(name.to_string(), Box::new(factory));
@@ -872,7 +919,11 @@ impl SolverBuilder {
 	/// The name parameter should match the implementation name in the configuration.
 	pub fn with_order_factory<F>(mut self, name: &str, factory: F) -> Self
 	where
-		F: Fn(&toml::Value) -> Box<dyn solver_order::OrderInterface> + Send + 'static,
+		F: Fn(
+				&toml::Value,
+			) -> Result<Box<dyn solver_order::OrderInterface>, solver_order::OrderError>
+			+ Send
+			+ 'static,
 	{
 		self.order_factories
 			.insert(name.to_string(), Box::new(factory));
@@ -884,7 +935,13 @@ impl SolverBuilder {
 	/// The name parameter should match the implementation name in the configuration.
 	pub fn with_settlement_factory<F>(mut self, name: &str, factory: F) -> Self
 	where
-		F: Fn(&toml::Value) -> Box<dyn solver_settlement::SettlementInterface> + Send + 'static,
+		F: Fn(
+				&toml::Value,
+			) -> Result<
+				Box<dyn solver_settlement::SettlementInterface>,
+				solver_settlement::SettlementError,
+			> + Send
+			+ 'static,
 	{
 		self.settlement_factories
 			.insert(name.to_string(), Box::new(factory));
@@ -913,7 +970,19 @@ impl SolverBuilder {
 			.storage_factory
 			.ok_or_else(|| SolverError::Config("Storage factory not provided".into()))?(
 			&self.config.storage.config,
-		);
+		)
+		.map_err(|e| {
+			tracing::error!(
+				component = "storage",
+				implementation = %self.config.storage.backend,
+				error = %e,
+				"Failed to create storage backend"
+			);
+			SolverError::Config(format!(
+				"Failed to create storage backend '{}': {}",
+				self.config.storage.backend, e
+			))
+		})?;
 		let storage = Arc::new(StorageService::new(storage_backend));
 		tracing::info!(component = "storage", implementation = %self.config.storage.backend, "Loaded");
 
@@ -922,44 +991,95 @@ impl SolverBuilder {
 			.account_factory
 			.ok_or_else(|| SolverError::Config("Account factory not provided".into()))?(
 			&self.config.account.config,
-		);
+		)
+		.map_err(|e| {
+			tracing::error!(
+				component = "account",
+				implementation = %self.config.account.provider,
+				error = %e,
+				"Failed to create account provider"
+			);
+			SolverError::Config(format!(
+				"Failed to create account provider '{}': {}",
+				self.config.account.provider, e
+			))
+		})?;
 		let account = Arc::new(AccountService::new(account_provider));
 		tracing::info!(component = "account", implementation = %self.config.account.provider, "Loaded");
 
 		// Create delivery providers
 		let mut delivery_providers = HashMap::new();
+		let mut configured_chains = Vec::new();
+
 		for (name, config) in &self.config.delivery.providers {
 			if let Some(factory) = self.delivery_factories.get(name) {
 				// Extract chain_id from the config
-				let chain_id = config
-					.get("chain_id")
-					.and_then(|v| v.as_integer())
-					.ok_or_else(|| {
-						SolverError::Config(format!(
-							"chain_id missing for delivery provider {}",
-							name
-						))
-					})? as u64;
+				let chain_id = match config.get("chain_id").and_then(|v| v.as_integer()) {
+					Some(id) => id as u64,
+					None => {
+						tracing::error!(
+							component = "delivery",
+							implementation = %name,
+							"chain_id missing for delivery provider, skipping"
+						);
+						continue;
+					}
+				};
 
-				let provider = factory(config);
+				// Track all configured chains
+				configured_chains.push((name.clone(), chain_id));
 
-				// Validate the configuration using the provider's schema
-				provider.config_schema().validate(config).map_err(|e| {
-					SolverError::Config(format!(
-						"Invalid configuration for delivery provider '{}': {}",
-						name, e
-					))
-				})?;
-
-				delivery_providers.insert(chain_id, provider);
-				tracing::info!(component = "delivery", implementation = %name, chain_id = %chain_id, "Loaded");
+				match factory(config) {
+					Ok(provider) => {
+						// Validate the configuration using the provider's schema
+						match provider.config_schema().validate(config) {
+							Ok(_) => {
+								delivery_providers.insert(chain_id, provider);
+								tracing::info!(component = "delivery", implementation = %name, chain_id = %chain_id, "Loaded");
+							}
+							Err(e) => {
+								tracing::error!(
+									component = "delivery",
+									implementation = %name,
+									chain_id = %chain_id,
+									error = %e,
+									"Invalid configuration for delivery provider, skipping"
+								);
+							}
+						}
+					}
+					Err(e) => {
+						tracing::error!(
+							component = "delivery",
+							implementation = %name,
+							chain_id = %chain_id,
+							error = %e,
+							"Failed to create delivery provider, skipping"
+						);
+					}
+				}
 			}
 		}
 
+		// Check which configured chains are missing delivery providers
+		let missing_chains: Vec<(String, u64)> = configured_chains
+			.into_iter()
+			.filter(|(_, chain_id)| !delivery_providers.contains_key(chain_id))
+			.collect();
+
+		if !missing_chains.is_empty() {
+			let missing_info: Vec<String> = missing_chains
+				.iter()
+				.map(|(name, chain_id)| format!("{} (chain {})", name, chain_id))
+				.collect();
+			tracing::warn!(
+				"Failed to create delivery providers for: {}. Transactions on these chains will fail.",
+				missing_info.join(", ")
+			);
+		}
+
 		if delivery_providers.is_empty() {
-			return Err(SolverError::Config(
-				"No delivery providers configured".into(),
-			));
+			tracing::warn!("No delivery providers available - solver will not be able to submit any transactions");
 		}
 
 		let delivery = Arc::new(DeliveryService::new(
@@ -972,19 +1092,41 @@ impl SolverBuilder {
 		let mut discovery_sources = Vec::new();
 		for (name, config) in &self.config.discovery.sources {
 			if let Some(factory) = self.discovery_factories.get(name) {
-				let source = factory(config);
-
-				// Validate the configuration using the source's schema
-				source.config_schema().validate(config).map_err(|e| {
-					SolverError::Config(format!(
-						"Invalid configuration for discovery source '{}': {}",
-						name, e
-					))
-				})?;
-
-				discovery_sources.push(source);
-				tracing::info!(component = "discovery", implementation = %name, "Loaded");
+				match factory(config) {
+					Ok(source) => {
+						// Validate the configuration using the source's schema
+						match source.config_schema().validate(config) {
+							Ok(_) => {
+								discovery_sources.push(source);
+								tracing::info!(component = "discovery", implementation = %name, "Loaded");
+							}
+							Err(e) => {
+								tracing::error!(
+									component = "discovery",
+									implementation = %name,
+									error = %e,
+									"Invalid configuration for discovery source, skipping"
+								);
+							}
+						}
+					}
+					Err(e) => {
+						tracing::error!(
+							component = "discovery",
+							implementation = %name,
+							error = %e,
+							"Failed to create discovery source, skipping"
+						);
+					}
+				}
 			}
+		}
+
+		// Log a warning if no discovery sources were successfully created
+		if discovery_sources.is_empty() {
+			tracing::warn!(
+				"No discovery sources available - solver will not discover any new orders"
+			);
 		}
 
 		let discovery = Arc::new(DiscoveryService::new(discovery_sources));
@@ -993,22 +1135,38 @@ impl SolverBuilder {
 		let mut order_impls = HashMap::new();
 		for (name, config) in &self.config.order.implementations {
 			if let Some(factory) = self.order_factories.get(name) {
-				let implementation = factory(config);
-
-				// Validate the configuration using the implementation's schema
-				implementation
-					.config_schema()
-					.validate(config)
-					.map_err(|e| {
-						SolverError::Config(format!(
-							"Invalid configuration for order implementation '{}': {}",
-							name, e
-						))
-					})?;
-
-				order_impls.insert(name.clone(), implementation);
-				tracing::info!(component = "order", implementation = %name, "Loaded");
+				match factory(config) {
+					Ok(implementation) => {
+						// Validate the configuration using the implementation's schema
+						match implementation.config_schema().validate(config) {
+							Ok(_) => {
+								order_impls.insert(name.clone(), implementation);
+								tracing::info!(component = "order", implementation = %name, "Loaded");
+							}
+							Err(e) => {
+								tracing::error!(
+									component = "order",
+									implementation = %name,
+									error = %e,
+									"Invalid configuration for order implementation, skipping"
+								);
+							}
+						}
+					}
+					Err(e) => {
+						tracing::error!(
+							component = "order",
+							implementation = %name,
+							error = %e,
+							"Failed to create order implementation, skipping"
+						);
+					}
+				}
 			}
+		}
+
+		if order_impls.is_empty() {
+			tracing::warn!("No order implementations available - solver will not be able to process any orders");
 		}
 
 		// Create execution strategy
@@ -1025,22 +1183,38 @@ impl SolverBuilder {
 		let mut settlement_impls = HashMap::new();
 		for (name, config) in &self.config.settlement.implementations {
 			if let Some(factory) = self.settlement_factories.get(name) {
-				let implementation = factory(config);
-
-				// Validate the configuration using the implementation's schema
-				implementation
-					.config_schema()
-					.validate(config)
-					.map_err(|e| {
-						SolverError::Config(format!(
-							"Invalid configuration for settlement '{}': {}",
-							name, e
-						))
-					})?;
-
-				settlement_impls.insert(name.clone(), implementation);
-				tracing::info!(component = "settlement", implementation = %name, "Loaded");
+				match factory(config) {
+					Ok(implementation) => {
+						// Validate the configuration using the implementation's schema
+						match implementation.config_schema().validate(config) {
+							Ok(_) => {
+								settlement_impls.insert(name.clone(), implementation);
+								tracing::info!(component = "settlement", implementation = %name, "Loaded");
+							}
+							Err(e) => {
+								tracing::error!(
+									component = "settlement",
+									implementation = %name,
+									error = %e,
+									"Invalid configuration for settlement implementation, skipping"
+								);
+							}
+						}
+					}
+					Err(e) => {
+						tracing::error!(
+							component = "settlement",
+							implementation = %name,
+							error = %e,
+							"Failed to create settlement implementation, skipping"
+						);
+					}
+				}
 			}
+		}
+
+		if settlement_impls.is_empty() {
+			tracing::warn!("No settlement implementations available - solver will not be able to monitor and claim settlements");
 		}
 
 		let settlement = Arc::new(SettlementService::new(settlement_impls));

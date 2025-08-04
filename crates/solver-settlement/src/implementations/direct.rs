@@ -11,8 +11,9 @@ use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types::BlockTransactionsKind;
 use alloy_transport_http::Http;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use solver_types::{ConfigSchema, Field, FieldType, FillProof, Order, Schema, TransactionHash};
+use solver_types::{
+	ConfigSchema, Eip7683OrderData, Field, FieldType, FillProof, Order, Schema, TransactionHash,
+};
 
 /// Direct settlement implementation.
 ///
@@ -25,15 +26,6 @@ pub struct DirectSettlement {
 	oracle_address: String,
 	/// Dispute period duration in seconds.
 	dispute_period_seconds: u64,
-}
-
-/// EIP-7683 specific order data used for parsing order information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Eip7683OrderData {
-	order_id: [u8; 32],
-	user: String,
-	origin_chain_id: u64,
-	destination_chain_id: u64,
 }
 
 impl DirectSettlement {
@@ -74,19 +66,29 @@ impl ConfigSchema for DirectSettlementSchema {
 			// Required fields
 			vec![
 				Field::new("rpc_url", FieldType::String).with_validator(|value| {
-					let url = value.as_str().unwrap();
-					if url.starts_with("http://") || url.starts_with("https://") {
-						Ok(())
-					} else {
-						Err("RPC URL must start with http:// or https://".to_string())
+					match value.as_str() {
+						Some(url) => {
+							if url.starts_with("http://") || url.starts_with("https://") {
+								Ok(())
+							} else {
+								Err("RPC URL must start with http:// or https://".to_string())
+							}
+						}
+						None => Err("Expected string value for rpc_url".to_string()),
 					}
 				}),
-				Field::new("oracle_address", FieldType::String).with_validator(|value| {
-					let addr = value.as_str().unwrap();
-					if addr.len() != 42 || !addr.starts_with("0x") {
-						return Err("oracle_address must be a valid Ethereum address".to_string());
+				Field::new("oracle_address", FieldType::String).with_validator(|value| match value
+					.as_str()
+				{
+					Some(addr) => {
+						if addr.len() != 42 || !addr.starts_with("0x") {
+							return Err(
+								"oracle_address must be a valid Ethereum address".to_string()
+							);
+						}
+						Ok(())
 					}
-					Ok(())
+					None => Err("Expected string value for oracle_address".to_string()),
 				}),
 			],
 			// Optional fields
@@ -220,16 +222,20 @@ impl SettlementInterface for DirectSettlement {
 ///
 /// Optional configuration parameters:
 /// - `dispute_period_seconds`: Dispute period duration (default: 300)
-pub fn create_settlement(config: &toml::Value) -> Box<dyn SettlementInterface> {
+pub fn create_settlement(
+	config: &toml::Value,
+) -> Result<Box<dyn SettlementInterface>, SettlementError> {
 	let rpc_url = config
 		.get("rpc_url")
 		.and_then(|v| v.as_str())
-		.expect("rpc_url is required");
+		.ok_or_else(|| SettlementError::ValidationFailed("rpc_url is required".to_string()))?;
 
 	let oracle_address = config
 		.get("oracle_address")
 		.and_then(|v| v.as_str())
-		.expect("oracle_address is required");
+		.ok_or_else(|| {
+			SettlementError::ValidationFailed("oracle_address is required".to_string())
+		})?;
 
 	let dispute_period_seconds = config
 		.get("dispute_period_seconds")
@@ -241,7 +247,7 @@ pub fn create_settlement(config: &toml::Value) -> Box<dyn SettlementInterface> {
 		tokio::runtime::Handle::current().block_on(async {
 			DirectSettlement::new(rpc_url, oracle_address.to_string(), dispute_period_seconds).await
 		})
-	});
+	})?;
 
-	Box::new(settlement.expect("Failed to create settlement service"))
+	Ok(Box::new(settlement))
 }

@@ -16,7 +16,7 @@ solver-discovery = { path = "../solver-discovery" }
 solver-order = { path = "../solver-order" }
 solver-settlement = { path = "../solver-settlement" }
 solver-storage = { path = "../solver-storage" }
-solver-types = { path = "../solver-types", features = ["axum"] }
+solver-types = { path = "../solver-types" }
 
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }

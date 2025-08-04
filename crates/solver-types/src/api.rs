@@ -134,10 +134,7 @@ pub enum APIError {
 		retry_after: Option<u64>,
 	},
 	/// Internal server error (500)
-	InternalServerError {
-		error_type: String,
-		message: String,
-	},
+	InternalServerError { error_type: String, message: String },
 }
 
 impl APIError {
@@ -154,25 +151,40 @@ impl APIError {
 	/// Convert to ErrorResponse for JSON serialization.
 	pub fn to_error_response(&self) -> ErrorResponse {
 		match self {
-			APIError::BadRequest { error_type, message, details } => ErrorResponse {
+			APIError::BadRequest {
+				error_type,
+				message,
+				details,
+			} => ErrorResponse {
 				error: error_type.clone(),
 				message: message.clone(),
 				details: details.clone(),
 				retry_after: None,
 			},
-			APIError::UnprocessableEntity { error_type, message, details } => ErrorResponse {
+			APIError::UnprocessableEntity {
+				error_type,
+				message,
+				details,
+			} => ErrorResponse {
 				error: error_type.clone(),
 				message: message.clone(),
 				details: details.clone(),
 				retry_after: None,
 			},
-			APIError::ServiceUnavailable { error_type, message, retry_after } => ErrorResponse {
+			APIError::ServiceUnavailable {
+				error_type,
+				message,
+				retry_after,
+			} => ErrorResponse {
 				error: error_type.clone(),
 				message: message.clone(),
 				details: None,
 				retry_after: *retry_after,
 			},
-			APIError::InternalServerError { error_type, message } => ErrorResponse {
+			APIError::InternalServerError {
+				error_type,
+				message,
+			} => ErrorResponse {
 				error: error_type.clone(),
 				message: message.clone(),
 				details: None,
@@ -186,9 +198,15 @@ impl fmt::Display for APIError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			APIError::BadRequest { message, .. } => write!(f, "Bad Request: {}", message),
-			APIError::UnprocessableEntity { message, .. } => write!(f, "Unprocessable Entity: {}", message),
-			APIError::ServiceUnavailable { message, .. } => write!(f, "Service Unavailable: {}", message),
-			APIError::InternalServerError { message, .. } => write!(f, "Internal Server Error: {}", message),
+			APIError::UnprocessableEntity { message, .. } => {
+				write!(f, "Unprocessable Entity: {}", message)
+			}
+			APIError::ServiceUnavailable { message, .. } => {
+				write!(f, "Service Unavailable: {}", message)
+			}
+			APIError::InternalServerError { message, .. } => {
+				write!(f, "Internal Server Error: {}", message)
+			}
 		}
 	}
 }
@@ -198,7 +216,7 @@ impl std::error::Error for APIError {}
 impl axum::response::IntoResponse for APIError {
 	fn into_response(self) -> axum::response::Response {
 		use axum::{http::StatusCode, response::Json};
-		
+
 		let status = match self.status_code() {
 			400 => StatusCode::BAD_REQUEST,
 			422 => StatusCode::UNPROCESSABLE_ENTITY,
@@ -206,7 +224,7 @@ impl axum::response::IntoResponse for APIError {
 			500 => StatusCode::INTERNAL_SERVER_ERROR,
 			_ => StatusCode::INTERNAL_SERVER_ERROR,
 		};
-		
+
 		let error_response = self.to_error_response();
 		(status, Json(error_response)).into_response()
 	}
@@ -236,45 +254,45 @@ pub mod u256_serde {
 /// Errors that can occur during quote processing.
 #[derive(Debug, thiserror::Error)]
 pub enum QuoteError {
-    #[error("Invalid request: {0}")]
-    InvalidRequest(String),
-    #[error("Unsupported asset: {0}")]
-    UnsupportedAsset(String),
-    #[error("Insufficient liquidity for requested amount")]
-    InsufficientLiquidity,
-    #[error("Solver capacity exceeded")]
-    SolverCapacityExceeded,
-    #[error("Internal error: {0}")]
-    Internal(String),
+	#[error("Invalid request: {0}")]
+	InvalidRequest(String),
+	#[error("Unsupported asset: {0}")]
+	UnsupportedAsset(String),
+	#[error("Insufficient liquidity for requested amount")]
+	InsufficientLiquidity,
+	#[error("Solver capacity exceeded")]
+	SolverCapacityExceeded,
+	#[error("Internal error: {0}")]
+	Internal(String),
 }
 
 impl From<QuoteError> for APIError {
-    fn from(quote_error: QuoteError) -> Self {
-        match quote_error {
-            QuoteError::InvalidRequest(msg) => APIError::BadRequest {
-                error_type: "INVALID_REQUEST".to_string(),
-                message: msg,
-                details: None,
-            },
-            QuoteError::UnsupportedAsset(asset) => APIError::UnprocessableEntity {
-                error_type: "UNSUPPORTED_ASSET".to_string(),
-                message: format!("Asset not supported by solver: {}", asset),
-                details: Some(serde_json::json!({ "asset": asset })),
-            },
-            QuoteError::InsufficientLiquidity => APIError::UnprocessableEntity {
-                error_type: "INSUFFICIENT_LIQUIDITY".to_string(),
-                message: "Insufficient liquidity available for the requested amount".to_string(),
-                details: None,
-            },
-            QuoteError::SolverCapacityExceeded => APIError::ServiceUnavailable {
-                error_type: "SOLVER_CAPACITY_EXCEEDED".to_string(),
-                message: "Solver capacity exceeded, please try again later".to_string(),
-                retry_after: Some(60), // Suggest retry after 60 seconds
-            },
-            QuoteError::Internal(msg) => APIError::InternalServerError {
-                error_type: "INTERNAL_ERROR".to_string(),
-                message: format!("An internal error occurred: {}", msg),
-            },
-        }
-    }
+	fn from(quote_error: QuoteError) -> Self {
+		match quote_error {
+			QuoteError::InvalidRequest(msg) => APIError::BadRequest {
+				error_type: "INVALID_REQUEST".to_string(),
+				message: msg,
+				details: None,
+			},
+			QuoteError::UnsupportedAsset(asset) => APIError::UnprocessableEntity {
+				error_type: "UNSUPPORTED_ASSET".to_string(),
+				message: format!("Asset not supported by solver: {}", asset),
+				details: Some(serde_json::json!({ "asset": asset })),
+			},
+			QuoteError::InsufficientLiquidity => APIError::UnprocessableEntity {
+				error_type: "INSUFFICIENT_LIQUIDITY".to_string(),
+				message: "Insufficient liquidity available for the requested amount".to_string(),
+				details: None,
+			},
+			QuoteError::SolverCapacityExceeded => APIError::ServiceUnavailable {
+				error_type: "SOLVER_CAPACITY_EXCEEDED".to_string(),
+				message: "Solver capacity exceeded, please try again later".to_string(),
+				retry_after: Some(60), // Suggest retry after 60 seconds
+			},
+			QuoteError::Internal(msg) => APIError::InternalServerError {
+				error_type: "INTERNAL_ERROR".to_string(),
+				message: format!("An internal error occurred: {}", msg),
+			},
+		}
+	}
 }

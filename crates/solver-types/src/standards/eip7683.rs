@@ -1,7 +1,8 @@
 //! EIP-7683 Cross-Chain Order Types
 //!
 //! This module defines the data structures for EIP-7683 cross-chain orders
-//! that are shared across the solver system.
+//! that are shared across the solver system. Updated to match the new OIF
+//! contracts structure with StandardOrder and MandateOutput types.
 
 use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
@@ -9,25 +10,23 @@ use serde::{Deserialize, Serialize};
 /// EIP-7683 specific order data structure.
 ///
 /// Contains all the necessary information for processing a cross-chain order
-/// according to the EIP-7683 standard. This structure supports both on-chain
-/// and off-chain order types, with optional fields for off-chain specific data.
+/// based on the StandardOrder format from the OIF contracts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Eip7683OrderData {
 	/// The address of the user initiating the cross-chain order
 	pub user: String,
 	/// Unique nonce to prevent order replay attacks
-	pub nonce: u64,
+	pub nonce: U256,
 	/// Chain ID where the order originates
-	pub origin_chain_id: u64,
-	/// Chain ID where the order should be filled
-	pub destination_chain_id: u64,
+	pub origin_chain_id: U256,
 	/// Unix timestamp when the order expires
 	pub expires: u32,
 	/// Deadline by which the order must be filled
 	pub fill_deadline: u32,
 	/// Address of the oracle responsible for validating fills
-	pub local_oracle: String,
+	pub input_oracle: String,
 	/// Input tokens and amounts as tuples of [token_address, amount]
+	/// Format: Vec<[token_as_U256, amount_as_U256]>
 	pub inputs: Vec<[U256; 2]>,
 	/// Unique 32-byte identifier for the order
 	pub order_id: [u8; 32],
@@ -36,31 +35,65 @@ pub struct Eip7683OrderData {
 	/// Gas limit for fill transaction
 	pub fill_gas_limit: u64,
 	/// List of outputs specifying tokens, amounts, and recipients
-	pub outputs: Vec<Output>,
-	/// Optional raw order data for off-chain orders
+	pub outputs: Vec<MandateOutput>,
+	/// Optional raw order data (StandardOrder encoded as bytes)
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub raw_order_data: Option<String>,
-	/// Optional type identifier for off-chain order data format
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub order_data_type: Option<[u8; 32]>,
-	/// Optional signature for off-chain order validation
+	/// Optional signature for off-chain order validation (Permit2Witness signature)
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub signature: Option<String>,
+	/// Optional sponsor address for off-chain orders
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub sponsor: Option<String>,
 }
 
-/// Represents an output in an EIP-7683 cross-chain order.
+/// Represents a MandateOutput of the OIF contracts.
 ///
 /// Outputs define the tokens and amounts that should be received by recipients
-/// as a result of executing the cross-chain order. Each output can specify
-/// a different chain, allowing for multi-chain settlement patterns.
+/// as a result of executing the cross-chain order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Output {
-	/// The address of the token to be received
-	pub token: String,
+pub struct MandateOutput {
+	/// Oracle implementation responsible for collecting proof (bytes32)
+	/// Zero value indicates same-chain or default oracle
+	pub oracle: [u8; 32],
+	/// Output Settler on the output chain responsible for settling (bytes32)
+	pub settler: [u8; 32],
+	/// The chain ID where the output should be delivered
+	pub chain_id: U256,
+	/// The token to be received (bytes32 - padded address)
+	pub token: [u8; 32],
 	/// The amount of tokens to be received
 	pub amount: U256,
-	/// The address that should receive the tokens
-	pub recipient: String,
-	/// The chain ID where the output should be delivered
-	pub chain_id: u64,
+	/// The recipient that should receive the tokens (bytes32 - padded address)
+	pub recipient: [u8; 32],
+	/// Data delivered to recipient through settlement callback
+	#[serde(with = "hex_string")]
+	pub call: Vec<u8>,
+	/// Additional output context for settlement
+	#[serde(with = "hex_string")]
+	pub context: Vec<u8>,
+}
+
+/// Alias for backward compatibility
+pub type Output = MandateOutput;
+
+/// Hex string serialization helper
+mod hex_string {
+	use serde::{Deserialize, Deserializer, Serializer};
+
+	pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		serializer.serialize_str(&format!("0x{}", hex::encode(bytes)))
+	}
+
+	pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		let s = String::deserialize(deserializer)?;
+		let s = s.strip_prefix("0x").unwrap_or(&s);
+		hex::decode(s).map_err(serde::de::Error::custom)
+	}
 }
