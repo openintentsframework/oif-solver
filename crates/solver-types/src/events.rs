@@ -4,11 +4,9 @@
 //! communication between different components. Events flow through an event bus
 //! allowing services to react to state changes in other parts of the system.
 
+use crate::{ExecutionParams, FillProof, Intent, Order, TransactionHash, TransactionReceipt};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tokio::sync::broadcast;
-
-use crate::{ExecutionParams, FillProof, Intent, Order, TransactionHash, TransactionReceipt};
 
 /// Main event type encompassing all solver events.
 ///
@@ -107,45 +105,4 @@ pub enum TransactionType {
 	Fill,
 	/// Transaction that claims rewards on the origin chain.
 	Claim,
-}
-
-/// Event bus for broadcasting solver events.
-///
-/// The EventBus provides a pub-sub mechanism for services to communicate
-/// asynchronously. Multiple services can subscribe to receive events while
-/// any service can publish events.
-pub struct EventBus {
-	/// The broadcast channel sender.
-	sender: broadcast::Sender<SolverEvent>,
-}
-
-impl EventBus {
-	/// Creates a new EventBus with the specified channel capacity.
-	pub fn new(capacity: usize) -> Self {
-		let (sender, _) = broadcast::channel(capacity);
-		Self { sender }
-	}
-
-	/// Creates a new subscriber to receive events.
-	pub fn subscribe(&self) -> broadcast::Receiver<SolverEvent> {
-		self.sender.subscribe()
-	}
-
-	/// Publishes an event to all subscribers.
-	pub fn publish(
-		&self,
-		event: SolverEvent,
-	) -> Result<(), broadcast::error::SendError<SolverEvent>> {
-		self.sender.send(event)?;
-		Ok(())
-	}
-}
-
-/// Clone implementation for EventBus to allow sharing across services.
-impl Clone for EventBus {
-	fn clone(&self) -> Self {
-		Self {
-			sender: self.sender.clone(),
-		}
-	}
 }

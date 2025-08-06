@@ -5,6 +5,7 @@
 //! to execute the complete order lifecycle. It includes the event-driven architecture
 //! and factory pattern for building solver instances.
 
+use crate::event_bus::EventBus;
 use alloy_primitives::{hex, U256};
 use solver_account::AccountService;
 use solver_config::Config;
@@ -14,8 +15,8 @@ use solver_order::OrderService;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
 use solver_types::{
-	DeliveryEvent, DiscoveryEvent, EventBus, ExecutionContext, ExecutionDecision, Intent, Order,
-	OrderEvent, OrderStatus, SettlementEvent, SolverEvent, TransactionType,
+	DeliveryEvent, DiscoveryEvent, ExecutionContext, ExecutionDecision, Intent, Order, OrderEvent,
+	OrderStatus, SettlementEvent, SolverEvent, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
