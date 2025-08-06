@@ -48,6 +48,15 @@ pub struct Config {
 	pub api: Option<ApiConfig>,
 }
 
+/// Domain configuration for EIP-712 signatures in quotes.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DomainConfig {
+	/// Chain ID where the settlement contract is deployed.
+	pub chain_id: u64,
+	/// Settlement contract address.
+	pub address: String,
+}
+
 /// Configuration specific to the solver instance.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SolverConfig {
@@ -132,6 +141,8 @@ pub struct SettlementConfig {
 	/// Map of settlement implementation names to their configurations.
 	/// Each implementation handles specific settlement mechanisms.
 	pub implementations: HashMap<String, toml::Value>,
+	/// Domain configuration for EIP-712 signatures in quotes.
+	pub domain: Option<DomainConfig>,
 }
 
 /// Configuration for the HTTP API server.

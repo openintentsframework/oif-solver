@@ -6,6 +6,7 @@
 use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use crate::erc7930::InteropAddress;
 /// Asset amount representation using ERC-7930 interoperable address format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetAmount {
@@ -16,24 +17,62 @@ pub struct AssetAmount {
 	pub amount: U256,
 }
 
-/// Available input with optional priority weighting.
+/// Lock information for inputs that are already locked
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AvailableInput {
-	/// The input asset and amount
-	pub input: AssetAmount,
-	/// Optional priority weighting (0-100)
-	pub priority: Option<u8>,
+pub struct Lock {
+	/// Type of lock mechanism
+	pub kind: LockKind,
+	/// Lock-specific parameters
+	pub params: Option<serde_json::Value>,
 }
 
-/// Request for getting price quotes.
+/// Supported lock mechanisms
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LockKind {
+	TheCompact,
+	Rhinestone,
+}
+
+/// Available input with lock information and user
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AvailableInput {
+	/// User address in ERC-7930 interoperable format
+	pub user: InteropAddress,
+	/// Asset address in ERC-7930 interoperable format
+	pub asset: InteropAddress,
+	/// Amount as a big integer
+	#[serde(with = "u256_serde")]
+	pub amount: U256,
+	/// Lock information if asset is already locked
+	pub lock: Option<Lock>,
+}
+
+/// Requested output with receiver and optional calldata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestedOutput {
+	/// Receiver address in ERC-7930 interoperable format
+	pub receiver: InteropAddress,
+	/// Asset address in ERC-7930 interoperable format
+	pub asset: InteropAddress,
+	/// Amount as a big integer
+	#[serde(with = "u256_serde")]
+	pub amount: U256,
+	/// Optional calldata for the output
+	pub calldata: Option<String>,
+}
+
+/// Request for getting price quotes following UII standard
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetQuoteRequest {
-	/// Available inputs with optional priority
+	/// User making the request in ERC-7930 interoperable format
+	pub user: InteropAddress,
+	/// Available inputs (order significant if preference is 'input-priority')
 	#[serde(rename = "availableInputs")]
 	pub available_inputs: Vec<AvailableInput>,
-	/// Requested minimum outputs
-	#[serde(rename = "requestedMinOutputs")]
-	pub requested_min_outputs: Vec<AssetAmount>,
+	/// Requested outputs
+	#[serde(rename = "requestedOutputs")]
+	pub requested_outputs: Vec<RequestedOutput>,
 	/// Minimum quote validity duration in seconds
 	#[serde(rename = "minValidUntil")]
 	pub min_valid_until: Option<u64>,
@@ -41,46 +80,67 @@ pub struct GetQuoteRequest {
 	pub preference: Option<QuotePreference>,
 }
 
-/// Quote optimization preferences.
+/// Quote optimization preferences following UII standard
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum QuotePreference {
 	Price,
 	Speed,
 	InputPriority,
+	TrustMinimization,
 }
 
-/// Settlement order data for quotes.
+/// EIP-712 compliant order structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SettlementOrder {
-	/// Settlement contract address
-	pub settler: String,
-	/// Settlement-specific data to be signed
-	pub data: serde_json::Value,
+pub struct QuoteOrder {
+	/// Signature type (eip-712 or erc-3009)
+	#[serde(rename = "signatureType")]
+	pub signature_type: SignatureType,
+	/// ERC-7930 interoperable address of the domain
+	pub domain: InteropAddress,
+	/// Primary type for EIP-712 signing
+	#[serde(rename = "primaryType")]
+	pub primary_type: String,
+	/// Message object to be signed and submitted
+	pub message: serde_json::Value,
 }
 
-/// A quote option with all necessary execution details.
+/// Supported signature types
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QuoteOption {
-	/// Settlement orders
-	pub orders: SettlementOrder,
-	/// Required token allowances
-	#[serde(rename = "requiredAllowances")]
-	pub required_allowances: Vec<AssetAmount>,
+#[serde(rename_all = "kebab-case")]
+pub enum SignatureType {
+	Eip712,
+	Erc3009,
+}
+
+/// Quote details matching the request structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuoteDetails {
+	/// Requested outputs for this quote
+	#[serde(rename = "requestedOutputs")]
+	pub requested_outputs: Vec<RequestedOutput>,
+	/// Available inputs for this quote
+	#[serde(rename = "availableInputs")]
+	pub available_inputs: Vec<AvailableInput>,
+}
+
+/// A quote option following UII standard
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Quote {
+	/// Array of EIP-712 compliant orders
+	pub orders: Vec<QuoteOrder>,
+	/// Quote details matching request structure
+	pub details: QuoteDetails,
 	/// Quote validity timestamp
 	#[serde(rename = "validUntil")]
-	pub valid_until: u64,
+	pub valid_until: Option<u64>,
 	/// Estimated time to completion in seconds
-	pub eta: u64,
-	/// Total cost in USD
-	#[serde(rename = "totalFeeUsd")]
-	pub total_fee_usd: f64,
+	pub eta: Option<u64>,
 	/// Unique quote identifier
 	#[serde(rename = "quoteId")]
 	pub quote_id: String,
-	/// Settlement mechanism type
-	#[serde(rename = "settlementType")]
-	pub settlement_type: SettlementType,
+	/// Provider identifier
+	pub provider: String, // not used by the solver, only relevant for the aggregator
 }
 
 /// Settlement mechanism types.
@@ -91,11 +151,11 @@ pub enum SettlementType {
 	ResourceLock,
 }
 
-/// Response containing quote options.
+/// Response containing quote options following UII standard
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetQuoteResponse {
-	/// Available quote options
-	pub quotes: Vec<QuoteOption>,
+	/// Available quotes
+	pub quotes: Vec<Quote>,
 }
 
 /// API error response.

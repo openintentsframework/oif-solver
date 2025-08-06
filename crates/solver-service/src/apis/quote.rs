@@ -189,10 +189,11 @@
 //! - **Analytics**: Log quote parameters for optimization
 
 use alloy_primitives::U256;
+use solver_config::Config;
 use solver_core::SolverEngine;
 use solver_types::{
-	AssetAmount, AvailableInput, GetQuoteRequest, GetQuoteResponse, QuoteError, QuoteOption,
-	QuotePreference, SettlementOrder, SettlementType,
+	GetQuoteRequest, GetQuoteResponse, QuoteError, Quote, QuotePreference,
+	QuoteDetails, QuoteOrder, SignatureType, InteropAddress,
 };
 use tracing::info;
 use uuid::Uuid;
@@ -204,6 +205,7 @@ use uuid::Uuid;
 pub async fn process_quote_request(
 	request: GetQuoteRequest,
 	_solver: &SolverEngine,
+	config: &Config,
 ) -> Result<GetQuoteResponse, QuoteError> {
 	info!(
 		"Processing quote request with {} inputs",
@@ -217,7 +219,7 @@ pub async fn process_quote_request(
 	// TODO: Implement solver capability checking
 
 	// 3. Generate quotes based on available inputs and requested outputs
-	let quotes = generate_quotes(&request).await?;
+	let quotes = generate_quotes(&request, config).await?;
 
 	info!("Generated {} quote options", quotes.len());
 
@@ -234,35 +236,32 @@ fn validate_quote_request(request: &GetQuoteRequest) -> Result<(), QuoteError> {
 	}
 
 	// Check that we have at least one requested output
-	if request.requested_min_outputs.is_empty() {
+	if request.requested_outputs.is_empty() {
 		return Err(QuoteError::InvalidRequest(
 			"At least one requested output is required".to_string(),
 		));
 	}
 
-	// Validate asset addresses (basic format check)
+	// Validate user address
+	validate_interop_address(&request.user)?;
+
+	// Validate asset addresses and amounts for inputs
 	for input in &request.available_inputs {
-		validate_asset_address(&input.input.asset)?;
+		validate_interop_address(&input.user)?;
+		validate_interop_address(&input.asset)?;
 
 		// Check that amount is positive
-		if input.input.amount == U256::ZERO {
+		if input.amount == U256::ZERO {
 			return Err(QuoteError::InvalidRequest(
 				"Input amount must be greater than zero".to_string(),
 			));
 		}
-
-		// Validate priority if specified
-		if let Some(priority) = input.priority {
-			if priority > 100 {
-				return Err(QuoteError::InvalidRequest(
-					"Priority must be between 0 and 100".to_string(),
-				));
-			}
-		}
 	}
 
-	for output in &request.requested_min_outputs {
-		validate_asset_address(&output.asset)?;
+	// Validate asset addresses and amounts for outputs
+	for output in &request.requested_outputs {
+		validate_interop_address(&output.receiver)?;
+		validate_interop_address(&output.asset)?;
 
 		if output.amount == U256::ZERO {
 			return Err(QuoteError::InvalidRequest(
@@ -274,26 +273,23 @@ fn validate_quote_request(request: &GetQuoteRequest) -> Result<(), QuoteError> {
 	Ok(())
 }
 
-/// Validates an asset address format.
-fn validate_asset_address(address: &str) -> Result<(), QuoteError> {
-	// Basic validation - should be a valid Ethereum address format
-	if !address.starts_with("0x") || address.len() != 42 {
-		return Err(QuoteError::InvalidRequest(format!(
-			"Invalid asset address format: {}",
-			address
-		)));
-	}
+/// Validates an ERC-7930 interoperable address.
+fn validate_interop_address(address: &InteropAddress) -> Result<(), QuoteError> {
+	// Validate the interoperable address format
+	address.validate().map_err(|e| {
+		QuoteError::InvalidRequest(format!("Invalid interoperable address: {}", e))
+	})?;
 
 	// Additional validation could include:
-	// - ERC-7930 interoperable address format validation
 	// - Chain-specific address validation
 	// - Token contract existence checks
+	// - Supported chain verification
 
 	Ok(())
 }
 
-/// Generates quote options for the given request.
-async fn generate_quotes(request: &GetQuoteRequest) -> Result<Vec<QuoteOption>, QuoteError> {
+/// Generates quote options for the given request following UII standard.
+async fn generate_quotes(request: &GetQuoteRequest, config: &Config) -> Result<Vec<Quote>, QuoteError> {
 	let mut quotes = Vec::new();
 
 	// For demo purposes, generate a basic quote
@@ -301,22 +297,11 @@ async fn generate_quotes(request: &GetQuoteRequest) -> Result<Vec<QuoteOption>, 
 	// 1. Check solver balances and capabilities
 	// 2. Query current gas prices and market rates
 	// 3. Calculate optimal routes and execution costs
-	// 4. Generate settlement-specific order data
+	// 4. Generate EIP-712 compliant order data
 
-	for input in &request.available_inputs {
-		for output in &request.requested_min_outputs {
-			// Generate escrow quote
-			if let Ok(escrow_quote) = generate_escrow_quote(input, output, &request.preference) {
-				quotes.push(escrow_quote);
-			}
-
-			// Generate ResourceLock quote if applicable
-			if let Ok(resource_lock_quote) =
-				generate_resource_lock_quote(input, output, &request.preference)
-			{
-				quotes.push(resource_lock_quote);
-			}
-		}
+	// Generate a quote that combines all inputs and outputs
+	if let Ok(quote) = generate_uii_quote(request, config) {
+		quotes.push(quote);
 	}
 
 	if quotes.is_empty() {
@@ -326,151 +311,99 @@ async fn generate_quotes(request: &GetQuoteRequest) -> Result<Vec<QuoteOption>, 
 	// Sort quotes based on preference
 	sort_quotes_by_preference(&mut quotes, &request.preference);
 
-	// Limit to top 5 quotes to avoid overwhelming response
-	quotes.truncate(5);
-
 	Ok(quotes)
 }
 
-/// Generates an escrow-based quote option.
-fn generate_escrow_quote(
-	input: &AvailableInput,
-	output: &AssetAmount,
-	preference: &Option<QuotePreference>,
-) -> Result<QuoteOption, QuoteError> {
+/// Generates a UII-compliant quote option.
+fn generate_uii_quote(request: &GetQuoteRequest, config: &Config) -> Result<Quote, QuoteError> {
 	let quote_id = Uuid::new_v4().to_string();
+	
+	let domain_address = match &config.settlement.domain {
+		Some(domain_config) => {
+			// Parse the address from the configuration
+			let address = domain_config.address.parse()
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid domain address in config: {}", e)))?;
+			InteropAddress::new_ethereum(domain_config.chain_id, address)
+		}
+		None => {
+			return Err(QuoteError::InvalidRequest(
+				"Domain configuration is required but not provided in solver config".to_string()
+			));
+		}
+	};
 
-	// Mock settlement contract address (would be from config in real implementation)
-	let settler_address = "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9".to_string();
-
-	// Generate mock order data for escrow settlement
-	let order_data = serde_json::json!({
-		"settlementType": "escrow",
-		"inputToken": input.input.asset,
-		"inputAmount": input.input.amount.to_string(),
-		"outputToken": output.asset,
-		"outputAmount": output.amount.to_string(),
-		"recipient": "0x0000000000000000000000000000000000000000", // Would be provided by user
-		"fillDeadline": chrono::Utc::now().timestamp() + 300 // 5 minutes from now
+	// Generate EIP-712 compliant order message (TODO we need to return the real orderType (permit2, 3009, orderData etc))
+	let order_message = serde_json::json!({
+		"user": request.user,
+		"availableInputs": request.available_inputs,
+		"requestedOutputs": request.requested_outputs,
+		"nonce": chrono::Utc::now().timestamp(),
+		"deadline": chrono::Utc::now().timestamp() + 300 // 5 minutes from now TODO - Calculate ()
 	});
 
-	// Calculate estimated fees and timing
-	let (total_fee_usd, eta) =
-		calculate_fees_and_timing(input, output, &SettlementType::Escrow, preference);
+	// Create EIP-712 compliant order
+	let order = QuoteOrder {
+		signature_type: SignatureType::Eip712,
+		domain: domain_address,
+		primary_type: "GaslessCrossChainOrder".to_string(),
+		message: order_message,
+	};
 
-	Ok(QuoteOption {
-		orders: SettlementOrder {
-			settler: settler_address.clone(),
-			data: order_data,
-		},
-		required_allowances: vec![input.input.clone()],
-		valid_until: chrono::Utc::now().timestamp() as u64 + 300, // 5 minutes validity
-		eta,
-		total_fee_usd,
+	// Create quote details
+	let details = QuoteDetails {
+		requested_outputs: request.requested_outputs.clone(),
+		available_inputs: request.available_inputs.clone(),
+	};
+
+	// Calculate estimated timing
+	let eta = calculate_eta(&request.preference);
+
+	Ok(Quote {
+		orders: vec![order],
+		details,
+		valid_until: Some(chrono::Utc::now().timestamp() as u64 + 300), // 5 minutes validity
+		eta: Some(eta),
 		quote_id,
-		settlement_type: SettlementType::Escrow,
+		provider: "oif-solver".to_string(),
 	})
 }
 
-/// Generates a ResourceLock-based quote option.
-fn generate_resource_lock_quote(
-	input: &AvailableInput,
-	output: &AssetAmount,
-	preference: &Option<QuotePreference>,
-) -> Result<QuoteOption, QuoteError> {
-	let quote_id = Uuid::new_v4().to_string();
-
-	// Mock settlement contract address
-	let settler_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512".to_string();
-
-	// Generate mock order data for ResourceLock settlement
-	let order_data = serde_json::json!({
-		"settlementType": "resourceLock",
-		"lockContract": "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0",
-		"inputToken": input.input.asset,
-		"inputAmount": input.input.amount.to_string(),
-		"outputToken": output.asset,
-		"outputAmount": output.amount.to_string(),
-		"recipient": "0x0000000000000000000000000000000000000000"
-	});
-
-	let (total_fee_usd, eta) =
-		calculate_fees_and_timing(input, output, &SettlementType::ResourceLock, preference);
-
-	Ok(QuoteOption {
-		orders: SettlementOrder {
-			settler: settler_address,
-			data: order_data,
-		},
-		required_allowances: vec![input.input.clone()],
-		valid_until: chrono::Utc::now().timestamp() as u64 + 300,
-		eta,
-		total_fee_usd,
-		quote_id,
-		settlement_type: SettlementType::ResourceLock,
-	})
-}
-
-/// Calculates fees and timing estimates for a quote.
-fn calculate_fees_and_timing(
-	_input: &AvailableInput,
-	_output: &AssetAmount,
-	settlement_type: &SettlementType,
-	preference: &Option<QuotePreference>,
-) -> (f64, u64) {
-	// Mock calculation - in real implementation would consider:
-	// - Current gas prices on origin and destination chains
-	// - Bridge/settlement fees
-	// - Market rates and slippage
-	// - Network congestion
-	// - Solver profit margins
-
-	let base_fee = match settlement_type {
-		SettlementType::Escrow => 2.50,       // Lower fee for escrow
-		SettlementType::ResourceLock => 3.75, // Higher fee for ResourceLock
-	};
-
-	let base_eta = match settlement_type {
-		SettlementType::Escrow => 120,       // 2 minutes
-		SettlementType::ResourceLock => 180, // 3 minutes
-	};
+/// Calculates estimated time to completion based on preference.
+/// TODO - This is a placeholder, we need to calculate the actual ETA based on the request and the solver's capabilities
+fn calculate_eta(preference: &Option<QuotePreference>) -> u64 {
+	// Base ETA of 2 minutes
+	let base_eta = 120;
 
 	// Adjust based on preference
-	let (fee_multiplier, eta_multiplier) = match preference {
-		Some(QuotePreference::Price) => (0.9, 1.2), // Lower fee, longer time
-		Some(QuotePreference::Speed) => (1.2, 0.8), // Higher fee, faster time
-		Some(QuotePreference::InputPriority) => (1.0, 1.0), // Balanced
-		None => (1.0, 1.0),                         // Default
-	};
-
-	let total_fee = base_fee * fee_multiplier;
-	let eta = (base_eta as f64 * eta_multiplier) as u64;
-
-	(total_fee, eta)
+	match preference {
+		Some(QuotePreference::Speed) => (base_eta as f64 * 0.8) as u64, // Faster
+		Some(QuotePreference::Price) => (base_eta as f64 * 1.2) as u64, // Slower but cheaper
+		Some(QuotePreference::TrustMinimization) => (base_eta as f64 * 1.5) as u64, // Slower for security
+		_ => base_eta, // Default
+	}
 }
 
 /// Sorts quotes based on user preference.
-fn sort_quotes_by_preference(quotes: &mut [QuoteOption], preference: &Option<QuotePreference>) {
+fn sort_quotes_by_preference(quotes: &mut [Quote], preference: &Option<QuotePreference>) {
 	match preference {
-		Some(QuotePreference::Price) => {
-			// Sort by lowest fee first
-			quotes.sort_by(|a, b| a.total_fee_usd.partial_cmp(&b.total_fee_usd).unwrap());
-		}
 		Some(QuotePreference::Speed) => {
 			// Sort by fastest ETA first
-			quotes.sort_by(|a, b| a.eta.cmp(&b.eta));
+			quotes.sort_by(|a, b| {
+				match (a.eta, b.eta) {
+					(Some(eta_a), Some(eta_b)) => eta_a.cmp(&eta_b),
+					(Some(_), None) => std::cmp::Ordering::Less,
+					(None, Some(_)) => std::cmp::Ordering::Greater,
+					(None, None) => std::cmp::Ordering::Equal,
+				}
+			});
 		}
 		Some(QuotePreference::InputPriority) => {
-			// Would sort by input priority if we tracked it
-			// For now, maintain original order
+			// Maintain original order based on input sequence
+			// This respects the significance of input order mentioned in UII spec
 		}
-		None => {
-			// Default: balance between price and speed
-			quotes.sort_by(|a, b| {
-				let score_a = a.total_fee_usd + (a.eta as f64 * 0.01);
-				let score_b = b.total_fee_usd + (b.eta as f64 * 0.01);
-				score_a.partial_cmp(&score_b).unwrap()
-			});
+		Some(QuotePreference::Price) | Some(QuotePreference::TrustMinimization) | None => {
+			// For now, maintain original order
+			// In real implementation, would sort by calculated cost/trust metrics
 		}
 	}
 }
