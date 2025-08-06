@@ -194,6 +194,7 @@ impl Eip7683Discovery {
 			data: serde_json::to_value(&order_data).map_err(|e| {
 				DiscoveryError::ParseError(format!("Failed to serialize order data: {}", e))
 			})?,
+			quote_id: None,
 		})
 	}
 

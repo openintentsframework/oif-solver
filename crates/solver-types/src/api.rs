@@ -2,11 +2,11 @@
 //!
 //! This module defines the request and response types for the OIF Solver API
 //! endpoints, following the ERC-7683 Cross-Chain Intents Standard.
-
+use crate::erc7930::InteropAddress;
 use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use crate::erc7930::InteropAddress;
+
 /// Asset amount representation using ERC-7930 interoperable address format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetAmount {
@@ -156,6 +156,13 @@ pub enum SettlementType {
 pub struct GetQuoteResponse {
 	/// Available quotes
 	pub quotes: Vec<Quote>,
+}
+
+/// Response containing order details.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetOrderResponse {
+	/// Order details
+	pub order: crate::order::OrderResponse,
 }
 
 /// API error response.
@@ -350,6 +357,39 @@ impl From<QuoteError> for APIError {
 				retry_after: Some(60), // Suggest retry after 60 seconds
 			},
 			QuoteError::Internal(msg) => APIError::InternalServerError {
+				error_type: "INTERNAL_ERROR".to_string(),
+				message: format!("An internal error occurred: {}", msg),
+			},
+		}
+	}
+}
+
+/// Errors that can occur during order processing.
+#[derive(Debug, thiserror::Error)]
+pub enum GetOrderError {
+	#[error("Order not found: {0}")]
+	NotFound(String),
+	#[error("Invalid order ID format: {0}")]
+	InvalidId(String),
+	#[error("Internal error: {0}")]
+	Internal(String),
+}
+
+/// Convert OrderError to APIError with appropriate HTTP status codes.
+impl From<GetOrderError> for APIError {
+	fn from(order_error: GetOrderError) -> Self {
+		match order_error {
+			GetOrderError::NotFound(id) => APIError::BadRequest {
+				error_type: "ORDER_NOT_FOUND".to_string(),
+				message: format!("Order not found: {}", id),
+				details: Some(serde_json::json!({ "order_id": id })),
+			},
+			GetOrderError::InvalidId(id) => APIError::BadRequest {
+				error_type: "INVALID_ORDER_ID".to_string(),
+				message: format!("Invalid order ID format: {}", id),
+				details: Some(serde_json::json!({ "provided_id": id })),
+			},
+			GetOrderError::Internal(msg) => APIError::InternalServerError {
 				error_type: "INTERNAL_ERROR".to_string(),
 				message: format!("An internal error occurred: {}", msg),
 			},

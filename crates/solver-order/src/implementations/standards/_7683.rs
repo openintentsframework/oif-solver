@@ -10,7 +10,7 @@ use alloy_sol_types::{sol, SolCall, SolValue};
 use async_trait::async_trait;
 use solver_types::{
 	Address, ConfigSchema, Eip7683OrderData, ExecutionParams, Field, FieldType, FillProof, Intent,
-	Order, Schema, Transaction,
+	Order, OrderStatus, Schema, Transaction,
 };
 
 // Solidity type definitions for EIP-7683 contract interactions.
@@ -257,6 +257,17 @@ impl OrderInterface for Eip7683OrderImpl {
 			created_at: intent.metadata.discovered_at,
 			data: serde_json::to_value(&order_data)
 				.map_err(|e| OrderError::ValidationFailed(format!("Failed to serialize: {}", e)))?,
+			quote_id: intent.quote_id.clone(),
+			updated_at: std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.map(|d| d.as_secs())
+				.unwrap_or(0),
+			status: OrderStatus::Pending,
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			claim_tx_hash: None,
+			fill_proof: None,
 		})
 	}
 

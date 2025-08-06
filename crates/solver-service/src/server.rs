@@ -3,10 +3,15 @@
 //! This module provides a minimal HTTP server infrastructure
 //! for the OIF Solver API.
 
-use axum::{extract::State, response::Json, routing::post, Router};
+use axum::{
+	extract::{Path, State},
+	response::Json,
+	routing::{get, post},
+	Router,
+};
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
-use solver_types::{APIError, GetQuoteRequest, GetQuoteResponse};
+use solver_types::{APIError, GetOrderResponse, GetQuoteRequest, GetQuoteResponse};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower::ServiceBuilder;
@@ -32,15 +37,17 @@ pub async fn start_server(
 ) -> Result<(), Box<dyn std::error::Error>> {
 	// Get the full config from the solver engine
 	let config = solver.config().clone();
-	
-	let app_state = AppState { 
-		solver,
-		config,
-	};
+
+	let app_state = AppState { solver, config };
 
 	// Build the router with /api base path and quote endpoint
 	let app = Router::new()
-		.nest("/api", Router::new().route("/quote", post(handle_quote)))
+		.nest(
+			"/api",
+			Router::new()
+				.route("/quote", post(handle_quote))
+				.route("/order/{id}", get(handle_get_order_by_id)),
+		)
 		.layer(ServiceBuilder::new().layer(CorsLayer::permissive()))
 		.with_state(app_state);
 
@@ -66,6 +73,23 @@ async fn handle_quote(
 		Ok(response) => Ok(Json(response)),
 		Err(e) => {
 			warn!("Quote request failed: {}", e);
+			Err(APIError::from(e))
+		}
+	}
+}
+
+/// Handles GET /api/order/{id} requests.
+///
+/// This endpoint retrieves order details by ID, providing status information
+/// and execution details for cross-chain intent orders.
+async fn handle_get_order_by_id(
+	Path(id): Path<String>,
+	State(state): State<AppState>,
+) -> Result<Json<GetOrderResponse>, APIError> {
+	match crate::apis::order::get_order_by_id(Path(id), &state.solver).await {
+		Ok(response) => Ok(Json(response)),
+		Err(e) => {
+			warn!("Order retrieval failed: {}", e);
 			Err(APIError::from(e))
 		}
 	}

@@ -21,6 +21,8 @@ pub struct Intent {
 	pub metadata: IntentMetadata,
 	/// Raw intent data in JSON format, structure depends on the standard.
 	pub data: serde_json::Value,
+	/// Quote ID associated with this intent.
+	pub quote_id: Option<String>,
 }
 
 /// Metadata associated with a discovered intent.

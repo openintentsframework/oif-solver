@@ -99,7 +99,7 @@ pub enum SettlementEvent {
 }
 
 /// Types of transactions in the solver system.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum TransactionType {
 	/// Transaction that prepares an off-chain order on-chain (e.g., openFor).
 	Prepare,

@@ -14,11 +14,12 @@ use solver_order::OrderService;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
 use solver_types::{
-	DeliveryEvent, DiscoveryEvent, EventBus, ExecutionContext, ExecutionDecision, ExecutionParams,
-	Intent, Order, OrderEvent, SettlementEvent, SolverEvent, TransactionType,
+	DeliveryEvent, DiscoveryEvent, EventBus, ExecutionContext, ExecutionDecision, Intent, Order,
+	OrderEvent, OrderStatus, SettlementEvent, SolverEvent, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::instrument;
@@ -272,17 +273,26 @@ impl SolverEngine {
 				.await
 				.map_err(|e| SolverError::Service(e.to_string()))?;
 
-			// Store order and params for later execution after prepare is confirmed
-			let order_id = order.id.clone();
-			self.storage
-				.store("pending_execution", &order_id, &(order, params))
-				.await
-				.map_err(|e| SolverError::Service(e.to_string()))?;
+			// Update order with execution params
+			self.update_order_with(&order.id, |order| {
+				order.execution_params = Some(params.clone());
+				order.status = OrderStatus::Pending;
+				order.prepare_tx_hash = Some(prepare_tx_hash);
+			})
+			.await?;
 		} else {
-			// No preparation needed, publish Executing event
-			tracing::info!("No preparation needed, proceeding to execution");
+			// No preparation needed, set execution params and proceed
+			self.update_order_with(&order.id, |order| {
+				order.execution_params = Some(params.clone());
+				order.status = OrderStatus::Pending;
+			})
+			.await?;
+
 			self.event_bus
-				.publish(SolverEvent::Order(OrderEvent::Executing { order, params }))
+				.publish(SolverEvent::Order(OrderEvent::Executing {
+					order: order.clone(),
+					params,
+				}))
 				.ok();
 		}
 
@@ -324,10 +334,10 @@ impl SolverEngine {
 			.ok();
 
 		// Store fill transaction and timestamp
-		self.storage
-			.store("fills", &order.id, &tx_hash)
-			.await
-			.map_err(|e| SolverError::Service(e.to_string()))?;
+		self.update_order_with(&order.id, |order| {
+			order.fill_tx_hash = Some(tx_hash.clone());
+		})
+		.await?;
 
 		// Store reverse mapping: tx_hash -> order_id
 		self.storage
@@ -461,7 +471,31 @@ impl SolverEngine {
 		error: String,
 	) -> Result<(), SolverError> {
 		tracing::error!("Transaction failed: {}", error);
-		// TODO: check if we need to update any status in storage
+
+		// Look up order ID and transaction type from the hash
+		if let Ok(order_id) = self
+			.storage
+			.retrieve::<String>("tx_to_order", &hex::encode(&tx_hash.0))
+			.await
+		{
+			// Determine transaction type from stored transaction hashes
+			if let Ok(order) = self.storage.retrieve::<Order>("orders", &order_id).await {
+				let tx_type = if order.prepare_tx_hash.as_ref().map(|h| &h.0) == Some(&tx_hash.0) {
+					TransactionType::Prepare
+				} else if order.fill_tx_hash.as_ref().map(|h| &h.0) == Some(&tx_hash.0) {
+					TransactionType::Fill
+				} else {
+					TransactionType::Claim
+				};
+
+				// Update order status with specific failure type
+				self.update_order_with(&order_id, |order| {
+					order.status = OrderStatus::Failed(tx_type);
+				})
+				.await?;
+			}
+		}
+
 		Ok(())
 	}
 
@@ -526,23 +560,24 @@ impl SolverEngine {
 			}
 		};
 
-		// Retrieve pending execution details
-		let pending_data: Option<(Order, ExecutionParams)> = self
+		// Retrieve the full order with execution parameters
+		let order: Order = self
 			.storage
-			.retrieve("pending_execution", &order_id)
+			.retrieve("orders", &order_id)
 			.await
-			.map_err(|e| {
-				SolverError::Service(format!("Failed to retrieve pending execution: {}", e))
-			})?;
+			.map_err(|e| SolverError::Service(format!("Failed to retrieve order: {}", e)))?;
 
-		let (order, params) = pending_data
-			.ok_or_else(|| SolverError::Service("Pending execution not found".to_string()))?;
+		// Extract execution params
+		let params = order
+			.execution_params
+			.clone()
+			.ok_or_else(|| SolverError::Service("Order missing execution params".to_string()))?;
 
-		// Remove from pending execution
-		self.storage
-			.remove("pending_execution", &order_id)
-			.await
-			.map_err(|e| SolverError::Service(e.to_string()))?;
+		// Update order status to executing
+		self.update_order_with(&order.id, |order| {
+			order.status = OrderStatus::Executed;
+		})
+		.await?;
 
 		// Now publish Executing event to proceed with fill
 		self.event_bus
@@ -602,12 +637,22 @@ impl SolverEngine {
 				}
 			};
 
-			// Store the fill proof
-			if storage
-				.store("fill_proofs", &order.id, &fill_proof)
-				.await
-				.is_err()
-			{
+			// Store the fill proof - inline the logic from set_order_fill_proof
+			let mut order: Order = match storage.retrieve("orders", &order_id).await {
+				Ok(order) => order,
+				Err(_) => return,
+			};
+			order.fill_proof = Some(fill_proof.clone());
+			order.updated_at = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.unwrap()
+				.as_secs();
+			if let Err(e) = storage.update("orders", &order_id, &order).await {
+				tracing::error!(
+					order_id = %truncate_id(&order_id),
+					error = %e,
+					"Failed to store fill proof"
+				);
 				return;
 			}
 
@@ -669,18 +714,25 @@ impl SolverEngine {
 			}
 		};
 
+		// Update order with claim transaction hash and mark as finalized
+		self.update_order_with(&order_id, |order| {
+			order.claim_tx_hash = Some(tx_hash.clone());
+			order.status = OrderStatus::Finalized;
+		})
+		.await?;
+
 		// Emit completed event
 		tracing::info!(
 			order_id = %truncate_id(&order_id),
-			"Completed"
+			"Completed and finalized"
 		);
+
+		// Publish completed event
 		self.event_bus
 			.publish(SolverEvent::Settlement(SettlementEvent::Completed {
 				order_id: order_id.clone(),
 			}))
 			.ok();
-
-		// Optional: Clean up storage for completed orders
 
 		Ok(())
 	}
@@ -703,11 +755,11 @@ impl SolverEngine {
 				.map_err(|e| SolverError::Service(e.to_string()))?;
 
 			// Retrieve fill proof (already validated when ClaimReady was emitted)
-			let fill_proof: solver_types::FillProof = self
-				.storage
-				.retrieve("fill_proofs", &order_id)
-				.await
-				.map_err(|e| SolverError::Service(e.to_string()))?;
+			let order_fill_proof = order.clone();
+			let fill_proof = order_fill_proof
+				.fill_proof
+				.clone()
+				.ok_or_else(|| SolverError::Service("Order missing fill proof".to_string()))?;
 
 			// Generate claim transaction
 			let claim_tx = self
@@ -731,11 +783,11 @@ impl SolverEngine {
 				}))
 				.ok();
 
-			// Store claim transaction hash
-			self.storage
-				.store("claims", &order.id, &claim_tx_hash)
-				.await
-				.map_err(|e| SolverError::Service(e.to_string()))?;
+			// Update order with claim transaction hash
+			self.update_order_with(&order.id, |order| {
+				order.claim_tx_hash = Some(claim_tx_hash.clone());
+			})
+			.await?;
 
 			// Store reverse mapping: tx_hash -> order_id
 			self.storage
@@ -769,6 +821,37 @@ impl SolverEngine {
 	/// Returns a reference to the configuration.
 	pub fn config(&self) -> &Config {
 		&self.config
+	}
+
+	/// Returns a reference to the storage service.
+	pub fn storage(&self) -> &Arc<StorageService> {
+		&self.storage
+	}
+
+	/// Generic helper to update any part of an order
+	async fn update_order_with<F>(&self, order_id: &str, updater: F) -> Result<(), SolverError>
+	where
+		F: FnOnce(&mut Order),
+	{
+		let mut order: Order = self
+			.storage
+			.retrieve("orders", order_id)
+			.await
+			.map_err(|e| SolverError::Service(e.to_string()))?;
+
+		// Apply the update
+		updater(&mut order);
+
+		// Automatically set updated_at timestamp
+		order.updated_at = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.map_err(|e| SolverError::Service(format!("Time error: {}", e)))?
+			.as_secs();
+
+		self.storage
+			.update("orders", &order_id, &order)
+			.await
+			.map_err(|e| SolverError::Service(e.to_string()))
 	}
 }
 

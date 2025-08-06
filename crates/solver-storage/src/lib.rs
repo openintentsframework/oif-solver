@@ -123,4 +123,58 @@ impl StorageService {
 		let key = format!("{}:{}", namespace, id);
 		self.backend.delete(&key).await
 	}
+
+	/// Updates an existing value in storage.
+	///
+	/// This method first checks if the key exists, then updates the value.
+	/// Returns an error if the key doesn't exist, making it semantically different
+	/// from store() which will create or overwrite.
+	pub async fn update<T: Serialize>(
+		&self,
+		namespace: &str,
+		id: &str,
+		data: &T,
+	) -> Result<(), StorageError> {
+		let key = format!("{}:{}", namespace, id);
+
+		// Check if the key exists first
+		if !self.backend.exists(&key).await? {
+			return Err(StorageError::NotFound);
+		}
+
+		let bytes =
+			serde_json::to_vec(data).map_err(|e| StorageError::Serialization(e.to_string()))?;
+		self.backend.set_bytes(&key, bytes, None).await
+	}
+
+	/// Updates an existing value in storage with time-to-live.
+	///
+	/// This method first checks if the key exists, then updates the value with TTL.
+	/// Returns an error if the key doesn't exist.
+	pub async fn update_with_ttl<T: Serialize>(
+		&self,
+		namespace: &str,
+		id: &str,
+		data: &T,
+		ttl: Option<Duration>,
+	) -> Result<(), StorageError> {
+		let key = format!("{}:{}", namespace, id);
+
+		// Check if the key exists first
+		if !self.backend.exists(&key).await? {
+			return Err(StorageError::NotFound);
+		}
+
+		let bytes =
+			serde_json::to_vec(data).map_err(|e| StorageError::Serialization(e.to_string()))?;
+		self.backend.set_bytes(&key, bytes, ttl).await
+	}
+
+	/// Checks if a value exists in storage.
+	///
+	/// The namespace and id are combined to form the lookup key.
+	pub async fn exists(&self, namespace: &str, id: &str) -> Result<bool, StorageError> {
+		let key = format!("{}:{}", namespace, id);
+		self.backend.exists(&key).await
+	}
 }
