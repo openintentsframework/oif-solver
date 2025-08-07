@@ -18,6 +18,8 @@ pub mod events;
 pub mod order;
 /// Standard-specific types for different cross-chain protocols.
 pub mod standards;
+/// Storage types for managing persistent data.
+pub mod storage;
 /// Configuration validation types for ensuring type-safe configurations.
 pub mod validation;
 
@@ -32,4 +34,5 @@ pub use standards::{
 	eip7683::{Eip7683OrderData, Output as Eip7683Output},
 	eip7930::{InteropAddress, InteropAddressError},
 };
+pub use storage::*;
 pub use validation::*;
