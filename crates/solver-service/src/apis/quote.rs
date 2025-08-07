@@ -192,8 +192,8 @@ use alloy_primitives::U256;
 use solver_config::Config;
 use solver_core::SolverEngine;
 use solver_types::{
-	GetQuoteRequest, GetQuoteResponse, QuoteError, Quote, QuotePreference,
-	QuoteDetails, QuoteOrder, SignatureType, InteropAddress,
+	GetQuoteRequest, GetQuoteResponse, InteropAddress, Quote, QuoteDetails, QuoteError, QuoteOrder,
+	QuotePreference, SignatureType,
 };
 use tracing::info;
 use uuid::Uuid;
@@ -276,9 +276,9 @@ fn validate_quote_request(request: &GetQuoteRequest) -> Result<(), QuoteError> {
 /// Validates an ERC-7930 interoperable address.
 fn validate_interop_address(address: &InteropAddress) -> Result<(), QuoteError> {
 	// Validate the interoperable address format
-	address.validate().map_err(|e| {
-		QuoteError::InvalidRequest(format!("Invalid interoperable address: {}", e))
-	})?;
+	address
+		.validate()
+		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid interoperable address: {}", e)))?;
 
 	// Additional validation could include:
 	// - Chain-specific address validation
@@ -289,7 +289,10 @@ fn validate_interop_address(address: &InteropAddress) -> Result<(), QuoteError> 
 }
 
 /// Generates quote options for the given request following UII standard.
-async fn generate_quotes(request: &GetQuoteRequest, config: &Config) -> Result<Vec<Quote>, QuoteError> {
+async fn generate_quotes(
+	request: &GetQuoteRequest,
+	config: &Config,
+) -> Result<Vec<Quote>, QuoteError> {
 	let mut quotes = Vec::new();
 
 	// For demo purposes, generate a basic quote
@@ -317,17 +320,18 @@ async fn generate_quotes(request: &GetQuoteRequest, config: &Config) -> Result<V
 /// Generates a UII-compliant quote option.
 fn generate_uii_quote(request: &GetQuoteRequest, config: &Config) -> Result<Quote, QuoteError> {
 	let quote_id = Uuid::new_v4().to_string();
-	
+
 	let domain_address = match &config.settlement.domain {
 		Some(domain_config) => {
 			// Parse the address from the configuration
-			let address = domain_config.address.parse()
-				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid domain address in config: {}", e)))?;
+			let address = domain_config.address.parse().map_err(|e| {
+				QuoteError::InvalidRequest(format!("Invalid domain address in config: {}", e))
+			})?;
 			InteropAddress::new_ethereum(domain_config.chain_id, address)
 		}
 		None => {
 			return Err(QuoteError::InvalidRequest(
-				"Domain configuration is required but not provided in solver config".to_string()
+				"Domain configuration is required but not provided in solver config".to_string(),
 			));
 		}
 	};
@@ -379,7 +383,7 @@ fn calculate_eta(preference: &Option<QuotePreference>) -> u64 {
 		Some(QuotePreference::Speed) => (base_eta as f64 * 0.8) as u64, // Faster
 		Some(QuotePreference::Price) => (base_eta as f64 * 1.2) as u64, // Slower but cheaper
 		Some(QuotePreference::TrustMinimization) => (base_eta as f64 * 1.5) as u64, // Slower for security
-		_ => base_eta, // Default
+		_ => base_eta,                                                  // Default
 	}
 }
 
@@ -388,13 +392,11 @@ fn sort_quotes_by_preference(quotes: &mut [Quote], preference: &Option<QuotePref
 	match preference {
 		Some(QuotePreference::Speed) => {
 			// Sort by fastest ETA first
-			quotes.sort_by(|a, b| {
-				match (a.eta, b.eta) {
-					(Some(eta_a), Some(eta_b)) => eta_a.cmp(&eta_b),
-					(Some(_), None) => std::cmp::Ordering::Less,
-					(None, Some(_)) => std::cmp::Ordering::Greater,
-					(None, None) => std::cmp::Ordering::Equal,
-				}
+			quotes.sort_by(|a, b| match (a.eta, b.eta) {
+				(Some(eta_a), Some(eta_b)) => eta_a.cmp(&eta_b),
+				(Some(_), None) => std::cmp::Ordering::Less,
+				(None, Some(_)) => std::cmp::Ordering::Greater,
+				(None, None) => std::cmp::Ordering::Equal,
 			});
 		}
 		Some(QuotePreference::InputPriority) => {

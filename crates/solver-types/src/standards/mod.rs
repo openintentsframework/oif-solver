@@ -11,5 +11,8 @@
 /// EIP-7683 cross-chain order types
 pub mod eip7683;
 
+/// ERC-7930 Interoperable Address types for cross-chain addressing.
+pub mod eip7930;
+
 // Re-export commonly used types for convenience
 pub use eip7683::{Eip7683OrderData, Output as Eip7683Output};

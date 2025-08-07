@@ -2,7 +2,7 @@
 //!
 //! This module defines the request and response types for the OIF Solver API
 //! endpoints, following the ERC-7683 Cross-Chain Intents Standard.
-use crate::erc7930::InteropAddress;
+use crate::standards::eip7930::InteropAddress;
 use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 use std::fmt;
