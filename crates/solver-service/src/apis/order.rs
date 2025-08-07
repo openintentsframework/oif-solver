@@ -13,7 +13,7 @@ use solver_types::{
 };
 use tracing::info;
 
-/// Handles GET /order/{id} requests.
+/// Handles GET /orders/{id} requests.
 ///
 /// This endpoint retrieves order details by ID, providing status information
 /// and execution details for cross-chain intent orders.
@@ -182,10 +182,10 @@ async fn convert_eip7683_order_to_response(
 
 	// Create settlement data from the raw order data
 	let settlement_data = serde_json::json!({
-		"raw_order_data": order.data.get("raw_order_data").cloned().unwrap_or_else(|| serde_json::json!(null)),
-		"signature": order.data.get("signature").cloned().unwrap_or_else(|| serde_json::json!(null)),
-		"nonce": order.data.get("nonce").cloned().unwrap_or_else(|| serde_json::json!(null)),
-		"expires": order.data.get("expires").cloned().unwrap_or_else(|| serde_json::json!(null))
+		"raw_order_data": order.data.get("raw_order_data").cloned().unwrap_or(serde_json::json!(null)),
+		"signature": order.data.get("signature").cloned().unwrap_or(serde_json::json!(null)),
+		"nonce": order.data.get("nonce").cloned().unwrap_or(serde_json::json!(null)),
+		"expires": order.data.get("expires").cloned().unwrap_or(serde_json::json!(null))
 	});
 
 	// Try to retrieve fill transaction hash from storage

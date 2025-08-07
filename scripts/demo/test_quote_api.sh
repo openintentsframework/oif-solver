@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Test script for the OIF Solver Quote API
-# This script demonstrates how to call the POST /quote endpoint
+# This script demonstrates how to call the POST /quotes endpoint
 # 
 # Note: All addresses use ERC-7930 Interoperable Address format:
 # - 0x010000011401742d35cc6634c0532925a3b8d4ad62d93b3d1234 = User address on Ethereum mainnet (chain ID 1)
@@ -12,7 +12,7 @@
 set -e
 
 API_URL="http://127.0.0.1:3000"
-QUOTE_ENDPOINT="$API_URL/api/quote"
+QUOTE_ENDPOINT="$API_URL/api/quotes"
 
 echo "Testing OIF Solver Quote API at $QUOTE_ENDPOINT"
 echo "================================================="

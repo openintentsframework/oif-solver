@@ -41,9 +41,38 @@ DEST_RPC_URL=$(grep -A 10 '\[contracts.destination\]' config/demo.toml | grep 'r
 ORIGIN_CHAIN_ID=$(grep -A 10 '\[contracts.origin\]' config/demo.toml | grep 'chain_id = ' | head -1 | awk '{print $3}')
 DEST_CHAIN_ID=$(grep -A 10 '\[contracts.destination\]' config/demo.toml | grep 'chain_id = ' | head -1 | awk '{print $3}')
 
-# API endpoint - read from config if available
-API_PORT=$(grep -A 10 '\[discovery.sources.offchain_eip7683\]' config/demo.toml | grep 'api_port = ' | awk '{print $3}')
-API_URL="http://localhost:${API_PORT:-8081}/intent"
+# API endpoint - can be overridden via command line argument
+# Default: Use solver's /orders API (port 3000) which forwards to discovery service
+# Alternative: Use discovery service directly (port 8081) with --direct flag or custom URL
+if [ "$1" = "--direct" ]; then
+    # Use discovery service directly
+    API_PORT=$(grep -A 10 '\[discovery.sources.offchain_eip7683\]' config/demo.toml | grep 'api_port = ' | awk '{print $3}')
+    API_URL="http://localhost:${API_PORT:-8081}/intent"
+    echo -e "${YELLOW}Using direct discovery API at $API_URL${NC}"
+elif [ -n "$1" ] && [ "$1" != "--help" ]; then
+    # Use custom URL provided as argument
+    API_URL="$1"
+    echo -e "${YELLOW}Using custom API URL: $API_URL${NC}"
+else
+    # Default: Use solver's /orders API which forwards to discovery
+    API_URL="http://localhost:3000/api/orders"
+fi
+
+# Show help if requested
+if [ "$1" = "--help" ]; then
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  --direct        Use discovery service directly (port 8081)"
+    echo "  <URL>          Use custom API URL"
+    echo "  --help         Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  $0                                    # Use default (solver /orders API)"
+    echo "  $0 --direct                          # Use discovery service directly"
+    echo "  $0 http://localhost:8080/api/orders  # Use custom URL"
+    exit 0
+fi
 
 # Amount in wei (1 token = 1e18 wei)
 AMOUNT="1000000000000000000"

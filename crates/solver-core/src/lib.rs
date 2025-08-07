@@ -123,12 +123,12 @@ impl SolverEngine {
 							self.handle_transaction_pending(order_id, tx_hash, tx_type).await?;
 						}
 
-						SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed { tx_hash, receipt, tx_type }) => {
-							self.handle_transaction_confirmed(tx_hash, receipt, tx_type).await?;
+						SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed { order_id, tx_hash, tx_type, receipt }) => {
+							self.handle_transaction_confirmed(order_id, tx_hash, tx_type, receipt).await?;
 						}
 
-						SolverEvent::Delivery(DeliveryEvent::TransactionFailed {  tx_hash, error }) => {
-							self.handle_transaction_failed( tx_hash, error).await?;
+						SolverEvent::Delivery(DeliveryEvent::TransactionFailed {  order_id, tx_hash, tx_type, error  }) => {
+							self.handle_transaction_failed( order_id, tx_hash, tx_type, error).await?;
 						}
 
 						SolverEvent::Settlement(SettlementEvent::ClaimReady { order_id }) => {
@@ -353,7 +353,7 @@ impl SolverEngine {
 	///
 	/// Spawns an async task that polls the transaction status at regular intervals
 	/// until the transaction is confirmed, fails, or the monitoring timeout is reached.
-	#[instrument(skip_all, fields(order_id = %truncate_id(&order_id), tx_hash = %truncate_id(&hex::encode(&tx_hash.0))))]
+	#[instrument(skip_all, fields(order_id = %truncate_id(&order_id), tx_hash = %truncate_id(&hex::encode(&tx_hash.0)), tx_type = ?tx_type))]
 	async fn handle_transaction_pending(
 		&self,
 		order_id: String,
@@ -394,19 +394,16 @@ impl SolverEngine {
 								tracing::info!(
 									order_id = %truncate_id(&order_id),
 									tx_hash = %truncate_id(&hex::encode(&tx_hash.0)),
-									"Confirmed {}",
-									match tx_type {
-										TransactionType::Prepare => "prepare",
-										TransactionType::Fill => "fill",
-										TransactionType::Claim => "claim",
-									}
+									tx_type = ?tx_type,
+									"Confirmed",
 								);
 								event_bus
 									.publish(SolverEvent::Delivery(
 										DeliveryEvent::TransactionConfirmed {
+											order_id,
 											tx_hash: tx_hash.clone(),
-											receipt,
 											tx_type,
+											receipt,
 										},
 									))
 									.ok();
@@ -427,7 +424,9 @@ impl SolverEngine {
 						// Transaction failed
 						event_bus
 							.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+								order_id,
 								tx_hash: tx_hash.clone(),
+								tx_type,
 								error: "Transaction reverted".to_string(),
 							}))
 							.ok();
@@ -465,37 +464,21 @@ impl SolverEngine {
 	/// Handles failed transactions.
 	///
 	/// Logs an error message for failed transactions.
-	#[instrument(skip_all, fields(tx_hash = %truncate_id(&hex::encode(&tx_hash.0))))]
+	#[instrument(skip_all, fields(order_id = %truncate_id(&order_id), tx_hash = %truncate_id(&hex::encode(&tx_hash.0)), tx_type = ?tx_type))]
 	async fn handle_transaction_failed(
 		&self,
+		order_id: String,
 		tx_hash: solver_types::TransactionHash,
+		tx_type: TransactionType,
 		error: String,
 	) -> Result<(), SolverError> {
 		tracing::error!("Transaction failed: {}", error);
 
-		// Look up order ID and transaction type from the hash
-		if let Ok(order_id) = self
-			.storage
-			.retrieve::<String>("tx_to_order", &hex::encode(&tx_hash.0))
-			.await
-		{
-			// Determine transaction type from stored transaction hashes
-			if let Ok(order) = self.storage.retrieve::<Order>("orders", &order_id).await {
-				let tx_type = if order.prepare_tx_hash.as_ref().map(|h| &h.0) == Some(&tx_hash.0) {
-					TransactionType::Prepare
-				} else if order.fill_tx_hash.as_ref().map(|h| &h.0) == Some(&tx_hash.0) {
-					TransactionType::Fill
-				} else {
-					TransactionType::Claim
-				};
-
-				// Update order status with specific failure type
-				self.update_order_with(&order_id, |order| {
-					order.status = OrderStatus::Failed(tx_type);
-				})
-				.await?;
-			}
-		}
+		// Update order status with specific failure type
+		self.update_order_with(&order_id, |order| {
+			order.status = OrderStatus::Failed(tx_type);
+		})
+		.await?;
 
 		Ok(())
 	}
@@ -504,18 +487,21 @@ impl SolverEngine {
 	///
 	/// Routes handling to specific methods based on whether this is a fill
 	/// or claim transaction.
-	#[instrument(skip_all, fields(tx_hash = %truncate_id(&hex::encode(&tx_hash.0))))]
+	#[instrument(skip_all, fields(order_id = %truncate_id(&order_id), tx_type = ?tx_type))]
 	async fn handle_transaction_confirmed(
 		&self,
+		order_id: String,
 		tx_hash: solver_types::TransactionHash,
-		_receipt: solver_types::TransactionReceipt,
 		tx_type: TransactionType,
+		receipt: solver_types::TransactionReceipt,
 	) -> Result<(), SolverError> {
 		// Defensive check
-		if !_receipt.success {
+		if !receipt.success {
 			self.event_bus
 				.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+					order_id,
 					tx_hash,
+					tx_type,
 					error: "Transaction reverted".to_string(),
 				}))
 				.ok();
@@ -530,11 +516,11 @@ impl SolverEngine {
 			}
 			TransactionType::Fill => {
 				// For fill transactions, start settlement monitoring
-				self.handle_fill_confirmed(tx_hash, _receipt).await?;
+				self.handle_fill_confirmed(tx_hash, receipt).await?;
 			}
 			TransactionType::Claim => {
 				// For claim transactions, mark order as completed
-				self.handle_claim_confirmed(tx_hash, _receipt).await?;
+				self.handle_claim_confirmed(tx_hash, receipt).await?;
 			}
 		}
 
@@ -725,7 +711,7 @@ impl SolverEngine {
 		// Emit completed event
 		tracing::info!(
 			order_id = %truncate_id(&order_id),
-			"Completed and finalized"
+			"Completed"
 		);
 
 		// Publish completed event
@@ -850,7 +836,7 @@ impl SolverEngine {
 			.as_secs();
 
 		self.storage
-			.update("orders", &order_id, &order)
+			.update("orders", order_id, &order)
 			.await
 			.map_err(|e| SolverError::Service(e.to_string()))
 	}

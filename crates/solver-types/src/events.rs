@@ -69,13 +69,16 @@ pub enum DeliveryEvent {
 	},
 	/// A transaction has been confirmed on-chain.
 	TransactionConfirmed {
+		order_id: String,
 		tx_hash: TransactionHash,
-		receipt: TransactionReceipt,
 		tx_type: TransactionType,
+		receipt: TransactionReceipt,
 	},
 	/// A transaction has failed.
 	TransactionFailed {
+		order_id: String,
 		tx_hash: TransactionHash,
+		tx_type: TransactionType,
 		error: String,
 	},
 }
