@@ -307,7 +307,6 @@ main() {
     
     echo ""
     echo -e "${GREEN}🎉 Intent Transaction Complete!${NC}"
-    echo -e "${YELLOW}🔍 Check discovery events at: http://localhost:8080/api/v1/discovery/stats${NC}"
 }
 
 # Handle different commands

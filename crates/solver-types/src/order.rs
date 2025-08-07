@@ -143,13 +143,15 @@ pub struct OrderResponse {
 /// Status of an order in the solver system.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum OrderStatus {
+	/// Order has been created but not yet prepared.
+	Created,
 	/// Order is pending execution.
 	Pending,
 	/// Order has been executed.
 	Executed,
-	/// Order has been claimed.
-	Claimed,
-	/// Order is finalized and complete (after some block confirmations).
+	/// Order has been settled and is ready to be claimed.
+	Settled,
+	/// Order is finalized and complete (after claim confirmation).
 	Finalized,
 	/// Order execution failed with specific transaction type.
 	Failed(TransactionType),

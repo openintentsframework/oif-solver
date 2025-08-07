@@ -27,7 +27,6 @@ config.toml
 out/
 cache/
 data/
-state/
 
 # Contracts
 oif-contracts/

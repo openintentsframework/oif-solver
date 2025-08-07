@@ -262,7 +262,7 @@ impl OrderInterface for Eip7683OrderImpl {
 				.duration_since(std::time::UNIX_EPOCH)
 				.map(|d| d.as_secs())
 				.unwrap_or(0),
-			status: OrderStatus::Pending,
+			status: OrderStatus::Created,
 			execution_params: None,
 			prepare_tx_hash: None,
 			fill_tx_hash: None,

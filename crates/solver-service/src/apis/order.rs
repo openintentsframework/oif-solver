@@ -192,11 +192,29 @@ async fn convert_eip7683_order_to_response(
 	let fill_transaction = order.fill_tx_hash.as_ref().map(|fill_tx_hash| {
 		// Determine fill transaction status based on order status
 		let tx_status = match order.status {
-			OrderStatus::Executed | OrderStatus::Claimed | OrderStatus::Finalized => "executed",
-			OrderStatus::Pending => "pending",
-			OrderStatus::Failed(TransactionType::Fill)
-			| OrderStatus::Failed(TransactionType::Prepare) => "failed",
-			OrderStatus::Failed(TransactionType::Claim) => "executed", // Fill succeeded, Claim failed
+			// Fill transaction completed successfully
+			OrderStatus::Executed | OrderStatus::Settled | OrderStatus::Finalized => "executed",
+			// These states shouldn't have a fill_tx_hash, but if they do, log warning
+			OrderStatus::Created | OrderStatus::Pending => {
+				tracing::warn!(
+					order_id = %order.id,
+					status = ?order.status,
+					"Unexpected fill_tx_hash in pre-execution state"
+				);
+				"pending"
+			}
+			// Fill transaction failed
+			OrderStatus::Failed(TransactionType::Fill) => "failed",
+			// Prepare failed - shouldn't have fill_tx_hash
+			OrderStatus::Failed(TransactionType::Prepare) => {
+				tracing::warn!(
+					order_id = %order.id,
+					"Unexpected fill_tx_hash when prepare transaction failed"
+				);
+				"failed"
+			}
+			// Fill succeeded but claim failed
+			OrderStatus::Failed(TransactionType::Claim) => "executed",
 		};
 
 		serde_json::json!({

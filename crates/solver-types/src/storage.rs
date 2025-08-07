@@ -1,26 +1,26 @@
 //! Storage-related types for the solver system.
 
-/// Table names for storage operations.
+/// Storage keys for different data collections.
 ///
 /// This enum provides type safety for storage operations by replacing
 /// string literals with strongly typed variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum StorageTable {
-	/// Table for storing order data
+pub enum StorageKey {
+	/// Key for storing order data
 	Orders,
-	/// Table for storing intent data  
+	/// Key for storing intent data  
 	Intents,
-	/// Table for mapping transaction hashes to order IDs
-	TxToOrder,
+	/// Key for mapping transaction hashes to order IDs
+	OrderByTxHash,
 }
 
-impl StorageTable {
-	/// Returns the string representation of the table name.
+impl StorageKey {
+	/// Returns the string representation of the storage key.
 	pub fn as_str(&self) -> &'static str {
 		match self {
-			StorageTable::Orders => "orders",
-			StorageTable::Intents => "intents",
-			StorageTable::TxToOrder => "tx_to_order",
+			StorageKey::Orders => "orders",
+			StorageKey::Intents => "intents",
+			StorageKey::OrderByTxHash => "order_by_tx_hash",
 		}
 	}
 }

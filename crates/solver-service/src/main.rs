@@ -6,7 +6,7 @@
 
 use clap::Parser;
 use solver_config::Config;
-use solver_core::{SolverBuilder, SolverEngine};
+use solver_core::{SolverBuilder, SolverEngine, SolverFactories};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -109,6 +109,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	Ok(())
 }
 
+/// Macro to create a factory HashMap with the appropriate type aliases
+macro_rules! create_factory_map {
+    ($interface:path, $error:path, $( $name:literal => $factory:expr ),* $(,)?) => {{
+        let mut factories = std::collections::HashMap::new();
+        $(
+            factories.insert(
+                $name.to_string(),
+                $factory as fn(&toml::Value) -> Result<Box<dyn $interface>, $error>
+            );
+        )*
+        factories
+    }};
+}
+
 /// Builds the solver engine with all necessary implementations.
 ///
 /// This function wires up all the concrete implementations for:
@@ -120,26 +134,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// - Settlement mechanisms (e.g., direct settlement)
 /// - Execution strategies (e.g., always execute, limit orders)
 fn build_solver(config: Config) -> Result<SolverEngine, Box<dyn std::error::Error>> {
-	let builder = SolverBuilder::new(config)
-        // Storage implementations
-        .with_storage_factory(create_memory_storage)
-        // Account implementations
-        .with_account_factory(create_account)
-        // Delivery implementations
-        .with_delivery_factory("origin", create_http_delivery)
-        .with_delivery_factory("destination", create_http_delivery)
-        // Discovery implementations
-		// Note: Comment out on-chain discovery when using offchain_eip7683 
-		//       as it will discover `open` events from `openFor` function and attempt to fill it
-        .with_discovery_factory("onchain_eip7683", onchain_create_discovery)
-		// Discovery implementations
-		.with_discovery_factory("offchain_eip7683", offchain_create_discovery)
-        // Order implementations
-        .with_order_factory("eip7683", create_order_impl)
-        // Settlement implementations
-        .with_settlement_factory("eip7683", create_settlement)
-        // Strategy implementation
-        .with_strategy_factory(create_strategy);
+	let builder = SolverBuilder::new(config);
 
-	Ok(builder.build()?)
+	// Create factory maps using the macro - much cleaner!
+	let delivery_factories = create_factory_map!(
+		solver_delivery::DeliveryInterface,
+		solver_delivery::DeliveryError,
+		"origin" => create_http_delivery,
+		"destination" => create_http_delivery,
+	);
+
+	// Note: Comment out on-chain discovery when using offchain_eip7683
+	//       as it will discover `open` events from `openFor` function and attempt to fill it
+	let discovery_factories = create_factory_map!(
+		solver_discovery::DiscoveryInterface,
+		solver_discovery::DiscoveryError,
+		"onchain_eip7683" => onchain_create_discovery,
+		"offchain_eip7683" => offchain_create_discovery,
+	);
+
+	let order_factories = create_factory_map!(
+		solver_order::OrderInterface,
+		solver_order::OrderError,
+		"eip7683" => create_order_impl,
+	);
+
+	let settlement_factories = create_factory_map!(
+		solver_settlement::SettlementInterface,
+		solver_settlement::SettlementError,
+		"eip7683" => create_settlement,
+	);
+
+	let factories = SolverFactories {
+		storage_factory: create_memory_storage,
+		account_factory: create_account,
+		delivery_factories,
+		discovery_factories,
+		order_factories,
+		settlement_factories,
+		strategy_factory: create_strategy,
+	};
+
+	Ok(builder.build(factories)?)
 }

@@ -18,16 +18,6 @@ use solver_types::{
 };
 use std::sync::Arc;
 
-/// Utility function to truncate a transaction hash for display.
-fn truncate_hash(hash: &TransactionHash) -> String {
-	let hash_str = hex::encode(&hash.0);
-	if hash_str.len() <= 8 {
-		hash_str
-	} else {
-		format!("{}..", &hash_str[..8])
-	}
-}
-
 /// Alloy-based EVM delivery implementation.
 ///
 /// This implementation uses the Alloy library to submit and monitor transactions
@@ -181,7 +171,6 @@ impl DeliveryInterface for AlloyDelivery {
 
 		// Log high-level info about what we're doing
 		tracing::info!(
-			tx_hash = %truncate_hash(hash),
 			"Waiting for {} confirmations (timeout: {}s)",
 			confirmations,
 			timeout_seconds
