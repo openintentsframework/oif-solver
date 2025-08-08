@@ -2,6 +2,8 @@
 # Send an off-chain cross-chain intent via the solver's HTTP API
 # This demonstrates the gasless flow using Permit2 and EIP-712 signatures
 #
+# NOTE: This script has been tested on macOS systems only.
+#
 # Prerequisites: Run ./setup_local_anvil.sh and start the solver service
 # Usage: ./send_offchain_intent.sh
 
@@ -112,10 +114,10 @@ approve_permit2
 # Build StandardOrder data
 build_order_data() {
     CURRENT_TIME=$(date +%s)
+    # Use milliseconds for nonce to avoid collisions when sending multiple intents quickly
+    NONCE=$(perl -MTime::HiRes=time -e 'printf "%.0f\n", time * 1000')
     FILL_DEADLINE=$((CURRENT_TIME + 3600))  # 1 hour
     EXPIRY=$FILL_DEADLINE
-    NONCE=$CURRENT_TIME
-    
     
     # Convert addresses to bytes32
     OUTPUT_SETTLER_BYTES32="0x000000000000000000000000${OUTPUT_SETTLER_ADDRESS:2}"

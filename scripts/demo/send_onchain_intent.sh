@@ -2,6 +2,8 @@
 # Send an on-chain cross-chain intent by calling InputSettlerEscrow.open()
 # Prerequisites: Run ./setup_local_anvil.sh and start the solver service
 #
+# NOTE: This script has been tested on macOS systems only.
+#
 # Usage:
 #   ./send_onchain_intent.sh          - Send intent transaction
 #   ./send_onchain_intent.sh balances - Check balances only

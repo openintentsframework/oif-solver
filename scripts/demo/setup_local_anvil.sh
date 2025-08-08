@@ -1,6 +1,37 @@
 #!/bin/bash
 
-# Simple dual-chain Anvil setup script
+# OIF Solver Demo Environment Setup Script
+# =========================================
+#
+# This script sets up a complete local testing environment for the OIF cross-chain solver.
+# It performs the following operations:
+#
+# 1. Starts two Anvil instances simulating different blockchain networks:
+#    - Origin chain on port 8545 (chain ID: 31337)
+#    - Destination chain on port 8546 (chain ID: 31338)
+#
+# 2. Deploys smart contracts on both chains:
+#    - ERC20 test tokens for simulating asset transfers
+#    - InputSettlerEscrow on the origin chain (handles deposits)
+#    - OutputSettler on the destination chain (handles fills)
+#    - Mock Oracle contract for intent validation
+#
+# 3. Configures the test environment:
+#    - Funds test accounts with ETH and tokens
+#    - Sets up token approvals for the settler contracts
+#    - Generates configuration file (config/demo.toml) for the solver
+#
+# 4. Prepares the environment for testing:
+#    - Creates deterministic addresses for all participants
+#    - Sets up proper permissions and allowances
+#    - Ensures contracts are ready to process intents
+#
+# After running this script, you can:
+# - Start the solver with: cargo run --bin solver -- --config config/demo.toml
+# - Send onchain test intents using: ./scripts/demo/send_onchain_intent.sh
+# - Send offchain test intents using: ./scripts/demo/send_offchain_intent.sh
+#
+# NOTE: This script has been tested on macOS systems only.
 
 # Colors
 RED='\033[0;31m'

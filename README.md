@@ -252,6 +252,8 @@ cargo run -- --config config/demo.toml --log-level info
 
 The project includes a complete demo setup for testing cross-chain intent execution between two local chains.
 
+**Note:** The demo scripts have been tested on macOS systems only.
+
 ### Prerequisites
 
 - [Foundry](https://book.getfoundry.sh/getting-started/installation) (for Anvil, Forge, and Cast)

@@ -144,8 +144,6 @@ fn build_solver(config: Config) -> Result<SolverEngine, Box<dyn std::error::Erro
 		"destination" => create_http_delivery,
 	);
 
-	// Note: Comment out on-chain discovery when using offchain_eip7683
-	//       as it will discover `open` events from `openFor` function and attempt to fill it
 	let discovery_factories = create_factory_map!(
 		solver_discovery::DiscoveryInterface,
 		solver_discovery::DiscoveryError,

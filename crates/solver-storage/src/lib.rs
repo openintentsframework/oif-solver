@@ -147,6 +147,15 @@ impl StorageService {
 		self.backend.set_bytes(&key, bytes, None).await
 	}
 
+	/// Checks if a value exists in storage.
+	///
+	/// The namespace and id are combined to form the lookup key.
+	/// Returns true if the key exists, false otherwise.
+	pub async fn exists(&self, namespace: &str, id: &str) -> Result<bool, StorageError> {
+		let key = format!("{}:{}", namespace, id);
+		self.backend.exists(&key).await
+	}
+
 	/// Updates an existing value in storage with time-to-live.
 	///
 	/// This method first checks if the key exists, then updates the value with TTL.
@@ -168,13 +177,5 @@ impl StorageService {
 		let bytes =
 			serde_json::to_vec(data).map_err(|e| StorageError::Serialization(e.to_string()))?;
 		self.backend.set_bytes(&key, bytes, ttl).await
-	}
-
-	/// Checks if a value exists in storage.
-	///
-	/// The namespace and id are combined to form the lookup key.
-	pub async fn exists(&self, namespace: &str, id: &str) -> Result<bool, StorageError> {
-		let key = format!("{}:{}", namespace, id);
-		self.backend.exists(&key).await
 	}
 }
