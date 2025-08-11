@@ -17,9 +17,10 @@ use solver_order::OrderService;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
 use solver_types::{DeliveryEvent, OrderEvent, SettlementEvent, SolverEvent};
+use std::future::Future;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -32,6 +33,7 @@ pub enum EngineError {
 }
 
 /// Main solver engine that orchestrates the order execution lifecycle.
+#[derive(Clone)]
 pub struct SolverEngine {
 	/// Solver configuration.
 	pub(crate) config: Config,
@@ -143,51 +145,84 @@ impl SolverEngine {
 		// Batch claim processing
 		let mut claim_batch = Vec::new();
 
+		// TODO: Make this configurable?
+		let semaphore = Arc::new(Semaphore::new(100)); // Limit to 100 concurrent tasks
+
 		loop {
 			tokio::select! {
 				// Handle discovered intents
 				Some(intent) = intent_rx.recv() => {
-					if let Err(e) = self.intent_handler.handle(intent).await {
-						tracing::error!("Failed to handle intent: {}", e);
-					}
+					self.spawn_handler(&semaphore, move |engine| async move {
+						if let Err(e) = engine.intent_handler.handle(intent).await {
+							return Err(EngineError::Service(format!("Failed to handle intent: {}", e)));
+						}
+						Ok(())
+					})
+					.await;
 				}
 
 				// Handle events
 				Ok(event) = event_receiver.recv() => {
 					match event {
 						SolverEvent::Order(OrderEvent::Preparing { intent, order, params }) => {
-							if let Err(e) = self.order_handler.handle_preparation(intent, order, params).await {
-								tracing::error!("Failed to handle order preparation: {}", e);
-							}
+							self.spawn_handler(&semaphore, move |engine| async move {
+								if let Err(e) = engine.order_handler.handle_preparation(intent, order, params).await {
+									return Err(EngineError::Service(format!("Failed to handle order preparation: {}", e)));
+								}
+								Ok(())
+							})
+							.await;
 						}
 						SolverEvent::Order(OrderEvent::Executing { order, params }) => {
-							if let Err(e) = self.order_handler.handle_execution(order, params).await {
-								tracing::error!("Failed to handle order execution: {}", e);
-							}
+							self.spawn_handler(&semaphore, move |engine| async move {
+								if let Err(e) = engine.order_handler.handle_execution(order, params).await {
+									return Err(EngineError::Service(format!("Failed to handle order execution: {}", e)));
+								}
+								Ok(())
+							})
+							.await;
 						}
 
 						SolverEvent::Delivery(DeliveryEvent::TransactionPending { order_id, tx_hash, tx_type }) => {
-							self.transaction_handler.monitor_transaction(order_id, tx_hash, tx_type).await;
+							self.spawn_handler(&semaphore, move |engine| async move {
+								engine.transaction_handler.monitor_transaction(order_id, tx_hash, tx_type).await;
+								Ok(())
+							})
+							.await;
 						}
 
 						SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed { order_id, tx_hash, tx_type, receipt }) => {
-							if let Err(e) = self.transaction_handler.handle_confirmed(order_id, tx_hash, tx_type, receipt).await {
-								tracing::error!("Failed to handle transaction confirmation: {}", e);
-							}
+							self.spawn_handler(&semaphore, move |engine| async move {
+								if let Err(e) = engine.transaction_handler.handle_confirmed(order_id, tx_hash, tx_type, receipt).await {
+									return Err(EngineError::Service(format!("Failed to handle transaction confirmation: {}", e)));
+								}
+								Ok(())
+							})
+							.await;
 						}
 
 						SolverEvent::Delivery(DeliveryEvent::TransactionFailed { order_id, tx_hash, tx_type, error }) => {
-							if let Err(e) = self.transaction_handler.handle_failed(order_id, tx_hash, tx_type, error).await {
-								tracing::error!("Failed to handle transaction failure: {}", e);
-							}
+							self.spawn_handler(&semaphore, move |engine| async move {
+								if let Err(e) = engine.transaction_handler.handle_failed(order_id, tx_hash, tx_type, error).await {
+									return Err(EngineError::Service(format!("Failed to handle transaction failure: {}", e)));
+								}
+								Ok(())
+							})
+							.await;
 						}
 
 						SolverEvent::Settlement(SettlementEvent::ClaimReady { order_id }) => {
 							claim_batch.push(order_id);
 							if claim_batch.len() >= CLAIM_BATCH {
-								if let Err(e) = self.settlement_handler.process_claim_batch(&mut claim_batch).await {
-									tracing::error!("Failed to process claim batch: {}", e);
-								}
+								let mut batch = std::mem::take(&mut claim_batch);
+								claim_batch.clear();
+								self.spawn_handler(&semaphore, move |engine| async move {
+									if let Err(e) = engine.settlement_handler.process_claim_batch(&mut batch).await {
+										return Err(EngineError::Service(format!("Failed to process claim batch: {}", e)));
+									}
+									Ok(())
+								})
+								.await;
 							}
 						}
 
@@ -224,5 +259,32 @@ impl SolverEngine {
 	/// Returns a reference to the storage service.
 	pub fn storage(&self) -> &Arc<StorageService> {
 		&self.storage
+	}
+
+	/// Helper method to spawn handler tasks with semaphore-based concurrency control.
+	///
+	/// This method:
+	/// 1. Acquires a permit from the semaphore to limit concurrent tasks
+	/// 2. Clones the engine and spawns the handler in a new task
+	/// 3. Handles errors by logging them appropriately
+	async fn spawn_handler<F, Fut>(&self, semaphore: &Arc<Semaphore>, handler: F)
+	where
+		F: FnOnce(SolverEngine) -> Fut + Send + 'static,
+		Fut: Future<Output = Result<(), EngineError>> + Send,
+	{
+		let engine = self.clone();
+		match semaphore.clone().acquire_owned().await {
+			Ok(permit) => {
+				tokio::spawn(async move {
+					let _permit = permit; // Keep permit alive for duration of task
+					if let Err(e) = handler(engine).await {
+						tracing::error!("Handler error: {}", e);
+					}
+				});
+			}
+			Err(e) => {
+				tracing::error!("Failed to acquire semaphore permit: {}", e);
+			}
+		}
 	}
 }
