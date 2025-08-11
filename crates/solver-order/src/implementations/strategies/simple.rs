@@ -30,7 +30,7 @@ impl SimpleStrategy {
 }
 
 /// Configuration schema for SimpleStrategy.
-/// 
+///
 /// This schema validates the configuration for the simple execution strategy,
 /// ensuring the optional maximum gas price parameter is valid if provided.
 pub struct SimpleStrategySchema;
@@ -65,12 +65,22 @@ impl ExecutionStrategy for SimpleStrategy {
 		_order: &Order,
 		context: &ExecutionContext,
 	) -> ExecutionDecision {
-		if context.gas_price > self.max_gas_price {
+		// Find the maximum gas price across all chains in the context
+		let max_gas_price = context
+			.chain_data
+			.values()
+			.map(|chain_data| chain_data.gas_price.parse::<U256>().unwrap_or(U256::ZERO))
+			.max()
+			.unwrap_or(U256::ZERO);
+
+		// Check if any chain has gas price above our limit
+		if max_gas_price > self.max_gas_price {
 			return ExecutionDecision::Defer(std::time::Duration::from_secs(60));
 		}
 
+		// Use the maximum gas price for execution (could be made more sophisticated)
 		ExecutionDecision::Execute(ExecutionParams {
-			gas_price: context.gas_price,
+			gas_price: max_gas_price,
 			priority_fee: Some(U256::from(2) * U256::from(10u64.pow(9))), // 2 gwei priority
 		})
 	}

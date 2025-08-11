@@ -48,7 +48,7 @@ load_config() {
     USER_ADDR=$(grep -A 10 '\[accounts\]' config/demo.toml | grep 'user = ' | cut -d'"' -f2)
     RECIPIENT_ADDR=$(grep -A 10 '\[accounts\]' config/demo.toml | grep 'recipient = ' | cut -d'"' -f2)
     SOLVER_KEY=$(grep 'solver_private_key = ' config/demo.toml | cut -d'"' -f2)
-    SOLVER_ADDR=$(grep 'solver_address = ' config/demo.toml | cut -d'"' -f2)
+    SOLVER_ADDR=$(grep -A 10 '\[accounts\]' config/demo.toml | grep 'solver = ' | cut -d'"' -f2)
 }
 
 # Extract and display contract metadata using forge inspect

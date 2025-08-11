@@ -369,7 +369,6 @@ settler_address = "$INPUT_SETTLER"
 [order.implementations.eip7683]
 output_settler_address = "$OUTPUT_SETTLER"
 input_settler_address = "$INPUT_SETTLER"
-solver_address = "$SOLVER_ADDRESS"
 
 [order.execution_strategy]
 strategy_type = "simple"

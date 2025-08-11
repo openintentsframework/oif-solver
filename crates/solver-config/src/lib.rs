@@ -69,7 +69,7 @@ pub struct SolverConfig {
 }
 
 /// Returns the default monitoring timeout in minutes.
-/// 
+///
 /// This provides a default value of 480 minutes (8 hours) for monitoring operations
 /// when no explicit timeout is configured.
 fn default_monitoring_timeout_minutes() -> u64 {
@@ -100,7 +100,7 @@ pub struct DeliveryConfig {
 }
 
 /// Returns the default number of confirmations required.
-/// 
+///
 /// This provides a default value of 12 confirmations for transaction finality
 /// when no explicit confirmation count is configured.
 fn default_confirmations() -> u64 {
@@ -198,7 +198,7 @@ pub struct CorsConfig {
 }
 
 /// Returns the default API host.
-/// 
+///
 /// This provides a default host address of 127.0.0.1 (localhost) for the API server
 /// when no explicit host is configured.
 fn default_api_host() -> String {
@@ -206,7 +206,7 @@ fn default_api_host() -> String {
 }
 
 /// Returns the default API port.
-/// 
+///
 /// This provides a default port of 3000 for the API server
 /// when no explicit port is configured.
 fn default_api_port() -> u16 {
@@ -214,7 +214,7 @@ fn default_api_port() -> u16 {
 }
 
 /// Returns the default API timeout in seconds.
-/// 
+///
 /// This provides a default timeout of 30 seconds for API requests
 /// when no explicit timeout is configured.
 fn default_api_timeout() -> u64 {
@@ -222,7 +222,7 @@ fn default_api_timeout() -> u64 {
 }
 
 /// Returns the default maximum request size in bytes.
-/// 
+///
 /// This provides a default maximum request size of 1MB (1024 * 1024 bytes)
 /// when no explicit limit is configured.
 fn default_max_request_size() -> usize {

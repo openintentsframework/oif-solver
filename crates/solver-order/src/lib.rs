@@ -6,8 +6,8 @@
 
 use async_trait::async_trait;
 use solver_types::{
-	ConfigSchema, ExecutionContext, ExecutionDecision, ExecutionParams, FillProof, Intent, Order,
-	Transaction,
+	Address, ConfigSchema, ExecutionContext, ExecutionDecision, ExecutionParams, FillProof, Intent,
+	Order, Transaction,
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -53,8 +53,18 @@ pub trait OrderInterface: Send + Sync {
 	/// Validates an intent and converts it to a standard order format.
 	///
 	/// This method performs standard-specific validation to ensure the intent
-	/// is well-formed and can be processed by the solver.
-	async fn validate_intent(&self, intent: &Intent) -> Result<Order, OrderError>;
+	/// is well-formed and can be processed by the solver. The solver address
+	/// is included in the resulting order for reward attribution.
+	///
+	/// # Arguments
+	///
+	/// * `intent` - The intent to validate
+	/// * `solver_address` - The solver's address for reward attribution
+	async fn validate_intent(
+		&self,
+		intent: &Intent,
+		solver_address: &Address,
+	) -> Result<Order, OrderError>;
 
 	/// Generates a transaction to prepare an order for filling (if needed).
 	///
@@ -137,13 +147,23 @@ impl OrderService {
 	/// Validates an intent using the appropriate standard implementation.
 	///
 	/// Selects the implementation based on the intent's standard field
-	/// and delegates validation to that implementation.
-	pub async fn validate_intent(&self, intent: &Intent) -> Result<Order, OrderError> {
+	/// and delegates validation to that implementation. The solver address
+	/// is included in the resulting order for reward attribution.
+	///
+	/// # Arguments
+	///
+	/// * `intent` - The intent to validate
+	/// * `solver_address` - The solver's address for reward attribution
+	pub async fn validate_intent(
+		&self,
+		intent: &Intent,
+		solver_address: &Address,
+	) -> Result<Order, OrderError> {
 		let implementation = self.implementations.get(&intent.standard).ok_or_else(|| {
 			OrderError::ValidationFailed(format!("Unknown standard: {}", intent.standard))
 		})?;
 
-		implementation.validate_intent(intent).await
+		implementation.validate_intent(intent, solver_address).await
 	}
 
 	/// Determines whether an order should be executed using the configured strategy.

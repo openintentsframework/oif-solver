@@ -44,7 +44,8 @@ fi
 # Load addresses from config
 INPUT_SETTLER_ADDRESS=$(grep 'input_settler_address = ' config/demo.toml | cut -d'"' -f2)
 OUTPUT_SETTLER_ADDRESS=$(grep 'output_settler_address = ' config/demo.toml | cut -d'"' -f2)
-SOLVER_ADDR=$(grep 'solver_address = ' config/demo.toml | cut -d'"' -f2)
+# Solver address from accounts section
+SOLVER_ADDR=$(grep -A 10 '\[accounts\]' config/demo.toml | grep 'solver = ' | cut -d'"' -f2)
 ORACLE_ADDRESS=$(grep 'oracle_address = ' config/demo.toml | cut -d'"' -f2)
 ORIGIN_TOKEN_ADDRESS=$(grep -A 10 '\[contracts.origin\]' config/demo.toml | grep 'token = ' | cut -d'"' -f2)
 DEST_TOKEN_ADDRESS=$(grep -A 10 '\[contracts.destination\]' config/demo.toml | grep 'token = ' | cut -d'"' -f2)
@@ -328,7 +329,8 @@ case "${1:-send}" in
             # Parse the order section
             INPUT_SETTLER_ADDRESS=$(grep 'input_settler_address = ' config/demo.toml | cut -d'"' -f2)
             OUTPUT_SETTLER_ADDRESS=$(grep 'output_settler_address = ' config/demo.toml | cut -d'"' -f2)
-            SOLVER_ADDR=$(grep 'solver_address = ' config/demo.toml | cut -d'"' -f2)
+            # Solver address from accounts section
+            SOLVER_ADDR=$(grep -A 10 '\[accounts\]' config/demo.toml | grep 'solver = ' | cut -d'"' -f2)
             
             # Parse the demo configuration section
             ORIGIN_TOKEN_ADDRESS=$(grep -A 10 '\[contracts.origin\]' config/demo.toml | grep 'token = ' | cut -d'"' -f2)

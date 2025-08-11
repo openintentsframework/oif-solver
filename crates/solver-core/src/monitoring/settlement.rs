@@ -11,7 +11,7 @@ use solver_types::{Order, SettlementEvent, SolverEvent, TransactionHash};
 use std::sync::Arc;
 
 /// Monitor for tracking settlement readiness of filled orders.
-/// 
+///
 /// The SettlementMonitor watches filled orders to determine when they are ready
 /// for claiming by retrieving attestations and checking claim conditions periodically
 /// until the order is claimable or a timeout is reached.

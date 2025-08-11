@@ -83,14 +83,11 @@ sol! {
 ///
 /// * `output_settler_address` - Settler contract on destination chains for fills
 /// * `input_settler_address` - Settler contract on origin chain for claims
-/// * `solver_address` - Solver address for reward attribution
 pub struct Eip7683OrderImpl {
 	/// Address of the output settler contract on destination chains.
 	output_settler_address: Address,
 	/// Address of the input settler contract on origin chains.
 	input_settler_address: Address,
-	/// Address of the solver for claiming rewards.
-	solver_address: Address,
 }
 
 impl Eip7683OrderImpl {
@@ -100,16 +97,11 @@ impl Eip7683OrderImpl {
 	///
 	/// * `output_settler` - Hex-encoded address of the output settler contract
 	/// * `input_settler` - Hex-encoded address of the input settler contract
-	/// * `solver` - Hex-encoded address of the solver
 	///
 	/// # Panics
 	///
 	/// Panics if any of the provided addresses are invalid hex strings.
-	pub fn new(
-		output_settler: String,
-		input_settler: String,
-		solver: String,
-	) -> Result<Self, OrderError> {
+	pub fn new(output_settler: String, input_settler: String) -> Result<Self, OrderError> {
 		let output_settler_address = Address(
 			hex::decode(output_settler.trim_start_matches("0x")).map_err(|e| {
 				OrderError::ValidationFailed(format!("Invalid output settler address: {}", e))
@@ -120,15 +112,10 @@ impl Eip7683OrderImpl {
 				OrderError::ValidationFailed(format!("Invalid input settler address: {}", e))
 			})?,
 		);
-		let solver_address =
-			Address(hex::decode(solver.trim_start_matches("0x")).map_err(|e| {
-				OrderError::ValidationFailed(format!("Invalid solver address: {}", e))
-			})?);
 
 		Ok(Self {
 			output_settler_address,
 			input_settler_address,
-			solver_address,
 		})
 	}
 }
@@ -139,16 +126,15 @@ impl Eip7683OrderImpl {
 /// Ensures all addresses are valid Ethereum addresses in hex format.
 ///
 /// Configuration schema for EIP-7683 order implementation.
-/// 
+///
 /// This schema validates the configuration for the EIP-7683 order processor,
 /// ensuring all required addresses are present and properly formatted.
-/// 
+///
 /// # Required Configuration
 ///
 /// ```toml
 /// output_settler_address = "0x..."  # 42-char hex address
 /// input_settler_address = "0x..."   # 42-char hex address
-/// solver_address = "0x..."          # 42-char hex address
 /// ```
 pub struct Eip7683OrderSchema;
 
@@ -185,19 +171,6 @@ impl ConfigSchema for Eip7683OrderSchema {
 						None => Err("Expected string value for input_settler_address".to_string()),
 					}
 				}),
-				Field::new("solver_address", FieldType::String).with_validator(|value| match value
-					.as_str()
-				{
-					Some(addr) => {
-						if addr.len() != 42 || !addr.starts_with("0x") {
-							return Err(
-								"solver_address must be a valid Ethereum address".to_string()
-							);
-						}
-						Ok(())
-					}
-					None => Err("Expected string value for solver_address".to_string()),
-				}),
 			],
 			// Optional fields
 			vec![],
@@ -221,10 +194,11 @@ impl OrderInterface for Eip7683OrderImpl {
 	/// # Arguments
 	///
 	/// * `intent` - The intent to validate
+	/// * `solver_address` - The solver's address for reward attribution
 	///
 	/// # Returns
 	///
-	/// Returns a validated `Order` ready for processing.
+	/// Returns a validated `Order` ready for processing with the solver address included.
 	///
 	/// # Errors
 	///
@@ -232,7 +206,11 @@ impl OrderInterface for Eip7683OrderImpl {
 	/// - The intent is not an EIP-7683 order
 	/// - The order data cannot be parsed
 	/// - The order has expired
-	async fn validate_intent(&self, intent: &Intent) -> Result<Order, OrderError> {
+	async fn validate_intent(
+		&self,
+		intent: &Intent,
+		solver_address: &Address,
+	) -> Result<Order, OrderError> {
 		if intent.standard != "eip7683" {
 			return Err(OrderError::ValidationFailed(
 				"Not an EIP-7683 order".to_string(),
@@ -262,6 +240,7 @@ impl OrderInterface for Eip7683OrderImpl {
 			created_at: intent.metadata.discovered_at,
 			data: serde_json::to_value(&order_data)
 				.map_err(|e| OrderError::ValidationFailed(format!("Failed to serialize: {}", e)))?,
+			solver_address: solver_address.clone(),
 			quote_id: intent.quote_id.clone(),
 			updated_at: std::time::SystemTime::now()
 				.duration_since(std::time::UNIX_EPOCH)
@@ -426,7 +405,7 @@ impl OrderInterface for Eip7683OrderImpl {
 			fillerData: {
 				// FillerData should contain the solver address as bytes32
 				let mut solver_bytes32 = [0u8; 32];
-				solver_bytes32[12..32].copy_from_slice(&self.solver_address.0);
+				solver_bytes32[12..32].copy_from_slice(&order.solver_address.0);
 				solver_bytes32.to_vec().into()
 			},
 		}
@@ -555,12 +534,12 @@ impl OrderInterface for Eip7683OrderImpl {
 
 		// Create solver bytes32 array (single solver in this case)
 		let mut solver_bytes32 = [0u8; 32];
-		solver_bytes32[12..32].copy_from_slice(&self.solver_address.0);
+		solver_bytes32[12..32].copy_from_slice(&order.solver_address.0);
 		let solvers = vec![FixedBytes::<32>::from(solver_bytes32)];
 
 		// Create destination bytes32 (solver address for self-finalisation)
 		let mut destination_bytes32 = [0u8; 32];
-		destination_bytes32[12..32].copy_from_slice(&self.solver_address.0);
+		destination_bytes32[12..32].copy_from_slice(&order.solver_address.0);
 		let destination = FixedBytes::<32>::from(destination_bytes32);
 
 		// Empty call data for simple finalisation
@@ -609,7 +588,6 @@ impl OrderInterface for Eip7683OrderImpl {
 /// ```toml
 /// output_settler_address = "0x..."  # Output settler contract address
 /// input_settler_address = "0x..."   # Input settler contract address
-/// solver_address = "0x..."          # Solver address for rewards
 /// ```
 ///
 /// # Panics
@@ -630,16 +608,7 @@ pub fn create_order_impl(config: &toml::Value) -> Result<Box<dyn OrderInterface>
 			OrderError::ValidationFailed("input_settler_address is required".to_string())
 		})?;
 
-	let solver_address = config
-		.get("solver_address")
-		.and_then(|v| v.as_str())
-		.ok_or_else(|| OrderError::ValidationFailed("solver_address is required".to_string()))?;
-
-	let order_impl = Eip7683OrderImpl::new(
-		output_settler.to_string(),
-		input_settler.to_string(),
-		solver_address.to_string(),
-	)?;
+	let order_impl = Eip7683OrderImpl::new(output_settler.to_string(), input_settler.to_string())?;
 
 	Ok(Box::new(order_impl))
 }

@@ -235,11 +235,7 @@ impl FileStorage {
 						}
 					}
 					Err(e) => {
-						tracing::debug!(
-							"Skipping file {:?}: could not be read: {}",
-							path,
-							e
-						);
+						tracing::debug!("Skipping file {:?}: could not be read: {}", path, e);
 					}
 				}
 			}

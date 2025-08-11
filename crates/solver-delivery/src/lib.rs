@@ -6,7 +6,9 @@
 
 use async_trait::async_trait;
 use solver_account::AccountService;
-use solver_types::{ConfigSchema, Signature, Transaction, TransactionHash, TransactionReceipt};
+use solver_types::{
+	ChainData, ConfigSchema, Signature, Transaction, TransactionHash, TransactionReceipt,
+};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -73,6 +75,32 @@ pub trait DeliveryInterface: Send + Sync {
 		&self,
 		hash: &TransactionHash,
 	) -> Result<TransactionReceipt, DeliveryError>;
+
+	/// Gets the current gas price for the network.
+	///
+	/// Returns the recommended gas price in wei as a decimal string.
+	async fn get_gas_price(&self) -> Result<String, DeliveryError>;
+
+	/// Gets the balance for an address.
+	///
+	/// For native tokens, pass None for the token parameter.
+	/// For ERC-20 tokens, pass the contract address as Some(address).
+	/// Returns the balance as a decimal string.
+	async fn get_balance(
+		&self,
+		address: &str,
+		token: Option<&str>,
+	) -> Result<String, DeliveryError>;
+
+	/// Gets the current nonce for an address.
+	///
+	/// Returns the next valid nonce for transaction submission.
+	async fn get_nonce(&self, address: &str) -> Result<u64, DeliveryError>;
+
+	/// Gets the current block number.
+	///
+	/// Returns the latest block number on the network.
+	async fn get_block_number(&self) -> Result<u64, DeliveryError>;
 }
 
 /// Service that manages transaction delivery across multiple blockchain networks.
@@ -196,6 +224,84 @@ impl DeliveryService {
 			}
 		}
 
+		Err(DeliveryError::NoProviderAvailable)
+	}
+
+	/// Gets chain-specific data for the given chain ID.
+	///
+	/// Returns gas price, block number, and other chain state information.
+	pub async fn get_chain_data(&self, chain_id: u64) -> Result<ChainData, DeliveryError> {
+		let provider = self
+			.providers
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoProviderAvailable)?;
+
+		let gas_price = provider.get_gas_price().await?;
+		let block_number = provider.get_block_number().await?;
+
+		Ok(ChainData {
+			chain_id,
+			gas_price,
+			block_number,
+			timestamp: std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_secs(),
+		})
+	}
+
+	/// Gets the balance for an address on a specific chain.
+	///
+	/// Convenience method that routes to the appropriate provider.
+	pub async fn get_balance(
+		&self,
+		chain_id: u64,
+		address: &str,
+		token: Option<&str>,
+	) -> Result<String, DeliveryError> {
+		let provider = self
+			.providers
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoProviderAvailable)?;
+
+		provider.get_balance(address, token).await
+	}
+
+	/// Gets the nonce for an address on a specific chain.
+	///
+	/// Convenience method that routes to the appropriate provider.
+	pub async fn get_nonce(&self, chain_id: u64, address: &str) -> Result<u64, DeliveryError> {
+		let provider = self
+			.providers
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoProviderAvailable)?;
+
+		provider.get_nonce(address).await
+	}
+
+	/// Gets the current gas price from the first available provider.
+	///
+	/// Returns the gas price as a string in wei.
+	pub async fn get_gas_price(&self) -> Result<String, DeliveryError> {
+		// Use the first available provider
+		for provider in self.providers.values() {
+			if let Ok(gas_price) = provider.get_gas_price().await {
+				return Ok(gas_price);
+			}
+		}
+		Err(DeliveryError::NoProviderAvailable)
+	}
+
+	/// Gets the current block number from the first available provider.
+	///
+	/// Returns the latest block number.
+	pub async fn get_block_number(&self) -> Result<u64, DeliveryError> {
+		// Use the first available provider
+		for provider in self.providers.values() {
+			if let Ok(block_number) = provider.get_block_number().await {
+				return Ok(block_number);
+			}
+		}
 		Err(DeliveryError::NoProviderAvailable)
 	}
 }

@@ -5,7 +5,7 @@ id = "oif-solver-local-dual-chain"
 monitoring_timeout_minutes = 5
 
 [storage]
-primary = "memory"
+primary = "file"
 cleanup_interval_seconds = 3600
 
 [storage.implementations.memory]
@@ -50,7 +50,6 @@ settler_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
 [order.implementations.eip7683]
 output_settler_address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
 input_settler_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
-solver_address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 
 [order.execution_strategy]
 strategy_type = "simple"

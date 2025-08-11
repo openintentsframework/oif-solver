@@ -19,7 +19,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
 /// Helper function to get current timestamp, returns 0 if system time is before UNIX epoch.
-/// 
+///
 /// This function safely retrieves the current UNIX timestamp in seconds,
 /// returning 0 if the system time is somehow before the UNIX epoch.
 fn current_timestamp() -> u64 {
@@ -281,7 +281,7 @@ impl Eip7683Discovery {
 }
 
 /// Configuration schema for EIP-7683 on-chain discovery.
-/// 
+///
 /// This schema validates the configuration for on-chain discovery,
 /// ensuring all required fields are present and have valid values
 /// for monitoring blockchain events.

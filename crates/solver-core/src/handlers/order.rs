@@ -19,7 +19,7 @@ use thiserror::Error;
 use tracing::instrument;
 
 /// Errors that can occur during order processing.
-/// 
+///
 /// These errors represent failures in service operations,
 /// storage operations, or state transitions during order handling.
 #[derive(Debug, Error)]
@@ -33,7 +33,7 @@ pub enum OrderError {
 }
 
 /// Handler for processing order preparation and execution.
-/// 
+///
 /// The OrderHandler manages the generation and submission of prepare
 /// transactions for off-chain orders and fill transactions for all orders,
 /// while updating order state and publishing relevant events.

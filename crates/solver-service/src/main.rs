@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	tracing::info!("Loaded configuration [{}]", config.solver.id);
 
 	// Build solver engine with implementations
-	let solver = build_solver(config.clone())?;
+	let solver = build_solver(config.clone()).await?;
 	let solver = Arc::new(solver);
 	tracing::info!("Loaded solver engine");
 
@@ -133,7 +133,7 @@ macro_rules! create_factory_map {
 /// - Order implementations (e.g., EIP-7683)
 /// - Settlement mechanisms (e.g., direct settlement)
 /// - Execution strategies (e.g., always execute, limit orders)
-fn build_solver(config: Config) -> Result<SolverEngine, Box<dyn std::error::Error>> {
+async fn build_solver(config: Config) -> Result<SolverEngine, Box<dyn std::error::Error>> {
 	let builder = SolverBuilder::new(config);
 
 	// Create factory maps using the macro - much cleaner!
@@ -180,5 +180,5 @@ fn build_solver(config: Config) -> Result<SolverEngine, Box<dyn std::error::Erro
 		strategy_factory: create_strategy,
 	};
 
-	Ok(builder.build(factories)?)
+	Ok(builder.build(factories).await?)
 }

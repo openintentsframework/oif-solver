@@ -22,3 +22,19 @@ pub struct TransactionReceipt {
 	/// Whether the transaction executed successfully.
 	pub success: bool,
 }
+
+/// Chain data structure containing current blockchain state information.
+///
+/// This structure provides a snapshot of blockchain state at a specific point in time,
+/// useful for making execution decisions and calculating transaction costs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChainData {
+	/// The chain ID.
+	pub chain_id: u64,
+	/// Current gas price as a string in wei.
+	pub gas_price: String,
+	/// Latest block number.
+	pub block_number: u64,
+	/// Timestamp when this data was fetched (Unix timestamp).
+	pub timestamp: u64,
+}

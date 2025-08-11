@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tracing::instrument;
 
 /// Monitor for tracking pending blockchain transactions.
-/// 
+///
 /// The TransactionMonitor polls transaction status at regular intervals
 /// until confirmation or failure, publishing appropriate events to the
 /// event bus for further processing by the transaction handler.

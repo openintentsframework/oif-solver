@@ -21,7 +21,7 @@ use thiserror::Error;
 use tracing::instrument;
 
 /// Errors that can occur during transaction processing.
-/// 
+///
 /// These errors represent failures in storage operations,
 /// state transitions, or service operations during transaction handling.
 #[derive(Debug, Error)]
@@ -35,7 +35,7 @@ pub enum TransactionError {
 }
 
 /// Handler for managing blockchain transaction lifecycle.
-/// 
+///
 /// The TransactionHandler manages transaction confirmations, failures,
 /// and state transitions based on transaction type. It spawns monitoring
 /// tasks for pending transactions and coordinates with settlement monitoring.

@@ -67,7 +67,7 @@ use tokio::sync::{mpsc, Mutex};
 use tower_http::cors::CorsLayer;
 
 /// Helper function to get current timestamp, returns 0 if system time is before UNIX epoch.
-/// 
+///
 /// This function safely retrieves the current UNIX timestamp in seconds,
 /// returning 0 if the system time is somehow before the UNIX epoch.
 fn current_timestamp() -> u64 {
@@ -711,16 +711,16 @@ async fn handle_intent_submission(
 /// - `rpc_url` - HTTP(S) URL for Ethereum RPC
 ///
 /// Configuration schema for EIP-7683 off-chain discovery service.
-/// 
+///
 /// This schema validates the configuration for the off-chain discovery API,
 /// ensuring all required fields are present and have valid values.
-/// 
+///
 /// # Required Fields
-/// 
+///
 /// - `api_port` - Port number for the API server (1-65535)
 /// - `api_host` - Host address for the API server
 /// - `rpc_url` - Ethereum RPC URL for contract interactions
-/// 
+///
 /// # Optional Fields
 ///
 /// - `auth_token` - Authentication token string

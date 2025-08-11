@@ -18,7 +18,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 /// Errors that can occur during solver engine construction.
-/// 
+///
 /// These errors indicate problems with configuration or missing required components
 /// when building a solver engine instance.
 #[derive(Debug, Error)]
@@ -30,7 +30,7 @@ pub enum BuilderError {
 }
 
 /// Container for all factory functions needed to build a SolverEngine.
-/// 
+///
 /// This struct holds factory functions for creating implementations of each
 /// service type required by the solver engine. Each factory function takes
 /// a TOML configuration value and returns the corresponding service implementation.
@@ -56,7 +56,7 @@ impl SolverBuilder {
 	}
 
 	/// Builds the SolverEngine using factories for each component type.
-	pub fn build<SF, AF, DF, DIF, OF, SEF, STF>(
+	pub async fn build<SF, AF, DF, DIF, OF, SEF, STF>(
 		self,
 		factories: SolverFactories<SF, AF, DF, DIF, OF, SEF, STF>,
 	) -> Result<SolverEngine, BuilderError>
@@ -140,7 +140,23 @@ impl SolverBuilder {
 				))
 			})?;
 		let account = Arc::new(AccountService::new(account_provider));
-		tracing::info!(component = "account", implementation = %self.config.account.provider, "Loaded");
+
+		// Fetch the solver address once during initialization
+		let solver_address = account.get_address().await.map_err(|e| {
+			tracing::error!(
+				component = "account",
+				error = %e,
+				"Failed to get solver address"
+			);
+			BuilderError::Config(format!("Failed to get solver address: {}", e))
+		})?;
+
+		tracing::info!(
+			component = "account",
+			implementation = %self.config.account.provider,
+			address = %solver_address,
+			"Loaded"
+		);
 
 		// Create delivery providers
 		let mut delivery_providers = HashMap::new();
@@ -330,6 +346,8 @@ impl SolverBuilder {
 		Ok(SolverEngine::new(
 			self.config,
 			storage,
+			account,
+			solver_address,
 			delivery,
 			discovery,
 			order,

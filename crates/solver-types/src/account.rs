@@ -5,12 +5,20 @@
 
 use alloy_primitives::{Address as AlloyAddress, Bytes, PrimitiveSignature, U256};
 use alloy_rpc_types::TransactionRequest;
+use std::fmt;
 
 /// Blockchain address representation.
 ///
 /// Stores addresses as raw bytes to support different blockchain formats.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Address(pub Vec<u8>);
+
+impl fmt::Display for Address {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		// Format as hex string with 0x prefix
+		write!(f, "0x{}", hex::encode(&self.0))
+	}
+}
 
 /// Cryptographic signature representation.
 ///

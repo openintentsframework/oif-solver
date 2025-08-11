@@ -7,7 +7,7 @@ use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::{Address, AssetAmount, SettlementType, TransactionHash, TransactionType};
+use crate::{Address, AssetAmount, ChainData, SettlementType, TransactionHash, TransactionType};
 
 /// Represents a validated cross-chain order with execution state.
 ///
@@ -27,6 +27,8 @@ pub struct Order {
 	pub status: OrderStatus,
 	/// Standard-specific order data in JSON format.
 	pub data: serde_json::Value,
+	/// The solver's address for this order (for reward attribution).
+	pub solver_address: Address,
 	/// Quote ID associated with this order.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub quote_id: Option<String>,
@@ -60,15 +62,19 @@ pub struct ExecutionParams {
 
 /// Context information for making execution decisions.
 ///
-/// Provides current market conditions and solver state to execution strategies.
+/// Provides chain-specific market conditions and solver state to execution strategies.
+/// This context is built specifically for each intent, containing only relevant chain data.
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
-	/// Current gas price on the network.
-	pub gas_price: U256,
-	/// Current timestamp.
+	/// Chain-specific data indexed by chain ID.
+	/// Contains gas prices, block numbers, and timestamps for each involved chain.
+	pub chain_data: HashMap<u64, ChainData>,
+	/// Solver's balance per chain and token.
+	/// Key format: (chain_id, token_address) where token_address is None for native tokens.
+	/// Value is balance as decimal string.
+	pub solver_balances: HashMap<(u64, Option<String>), String>,
+	/// Timestamp when this context was built.
 	pub timestamp: u64,
-	/// Solver's balance across different addresses and tokens.
-	pub solver_balance: HashMap<Address, U256>,
 }
 
 /// Decision made by an execution strategy.
