@@ -34,6 +34,7 @@ chain_id = 31338  # Anvil destination chain
 rpc_url = "http://localhost:8545"
 # InputSettler address on origin chain (where orders are created)
 settler_addresses = ["0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"]
+polling_interval_secs = 3  # Poll every 3 seconds
 
 [discovery.sources.destination_eip7683]
 rpc_url = "http://localhost:8546"
