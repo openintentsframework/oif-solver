@@ -10,6 +10,11 @@ use solver_settlement::SettlementService;
 use solver_types::{Order, SettlementEvent, SolverEvent, TransactionHash};
 use std::sync::Arc;
 
+/// Monitor for tracking settlement readiness of filled orders.
+/// 
+/// The SettlementMonitor watches filled orders to determine when they are ready
+/// for claiming by retrieving attestations and checking claim conditions periodically
+/// until the order is claimable or a timeout is reached.
 pub struct SettlementMonitor {
 	settlement: Arc<SettlementService>,
 	state_machine: Arc<OrderStateMachine>,
@@ -81,7 +86,6 @@ impl SettlementMonitor {
 
 			// Check if we can claim
 			if settlement.can_claim(&order, &fill_proof).await {
-				tracing::info!(order_id = %truncate_id(&order.id), "Ready to claim");
 				self.event_bus
 					.publish(SolverEvent::Settlement(SettlementEvent::ClaimReady {
 						order_id: order.id,

@@ -30,6 +30,9 @@ impl SimpleStrategy {
 }
 
 /// Configuration schema for SimpleStrategy.
+/// 
+/// This schema validates the configuration for the simple execution strategy,
+/// ensuring the optional maximum gas price parameter is valid if provided.
 pub struct SimpleStrategySchema;
 
 impl ConfigSchema for SimpleStrategySchema {

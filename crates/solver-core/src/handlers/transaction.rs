@@ -20,6 +20,10 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::instrument;
 
+/// Errors that can occur during transaction processing.
+/// 
+/// These errors represent failures in storage operations,
+/// state transitions, or service operations during transaction handling.
 #[derive(Debug, Error)]
 pub enum TransactionError {
 	#[error("Storage error: {0}")]
@@ -30,6 +34,11 @@ pub enum TransactionError {
 	Service(String),
 }
 
+/// Handler for managing blockchain transaction lifecycle.
+/// 
+/// The TransactionHandler manages transaction confirmations, failures,
+/// and state transitions based on transaction type. It spawns monitoring
+/// tasks for pending transactions and coordinates with settlement monitoring.
 pub struct TransactionHandler {
 	delivery: Arc<DeliveryService>,
 	settlement: Arc<SettlementService>,
@@ -230,9 +239,6 @@ impl TransactionHandler {
 			})
 			.await
 			.map_err(|e| TransactionError::State(e.to_string()))?;
-
-		// Emit completed event
-		tracing::info!(order_id = %truncate_id(&order_id), "Completed");
 
 		// Publish completed event
 		self.event_bus

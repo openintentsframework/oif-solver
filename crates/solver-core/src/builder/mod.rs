@@ -17,6 +17,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 
+/// Errors that can occur during solver engine construction.
+/// 
+/// These errors indicate problems with configuration or missing required components
+/// when building a solver engine instance.
 #[derive(Debug, Error)]
 pub enum BuilderError {
 	#[error("Configuration error: {0}")]
@@ -25,9 +29,13 @@ pub enum BuilderError {
 	MissingComponent(String),
 }
 
-/// Container for all factory functions needed to build a SolverEngine
+/// Container for all factory functions needed to build a SolverEngine.
+/// 
+/// This struct holds factory functions for creating implementations of each
+/// service type required by the solver engine. Each factory function takes
+/// a TOML configuration value and returns the corresponding service implementation.
 pub struct SolverFactories<SF, AF, DF, DIF, OF, SEF, STF> {
-	pub storage_factory: SF,
+	pub storage_factories: HashMap<String, SF>,
 	pub account_factory: AF,
 	pub delivery_factories: HashMap<String, DF>,
 	pub discovery_factories: HashMap<String, DIF>,
@@ -53,7 +61,7 @@ impl SolverBuilder {
 		factories: SolverFactories<SF, AF, DF, DIF, OF, SEF, STF>,
 	) -> Result<SolverEngine, BuilderError>
 	where
-		SF: FnOnce(&toml::Value) -> Result<Box<dyn StorageInterface>, StorageError>,
+		SF: Fn(&toml::Value) -> Result<Box<dyn StorageInterface>, StorageError>,
 		AF: FnOnce(&toml::Value) -> Result<Box<dyn AccountInterface>, AccountError>,
 		DF: Fn(&toml::Value) -> Result<Box<dyn DeliveryInterface>, DeliveryError>,
 		DIF: Fn(&toml::Value) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError>,
@@ -61,22 +69,61 @@ impl SolverBuilder {
 		SEF: Fn(&toml::Value) -> Result<Box<dyn SettlementInterface>, SettlementError>,
 		STF: FnOnce(&toml::Value) -> Box<dyn ExecutionStrategy>,
 	{
-		// Create storage backend
-		let storage_backend =
-			(factories.storage_factory)(&self.config.storage.config).map_err(|e| {
-				tracing::error!(
-					component = "storage",
-					implementation = %self.config.storage.backend,
-					error = %e,
-					"Failed to create storage backend"
-				);
-				BuilderError::Config(format!(
-					"Failed to create storage backend '{}': {}",
-					self.config.storage.backend, e
-				))
-			})?;
+		// Create storage implementations
+		let mut storage_impls = HashMap::new();
+		for (name, config) in &self.config.storage.implementations {
+			if let Some(factory) = factories.storage_factories.get(name) {
+				match factory(config) {
+					Ok(implementation) => {
+						// Validate the configuration using the implementation's schema
+						match implementation.config_schema().validate(config) {
+							Ok(_) => {
+								storage_impls.insert(name.clone(), implementation);
+								let impl_name = if name == &self.config.storage.primary {
+									format!("{} (primary)", name)
+								} else {
+									name.to_string()
+								};
+								tracing::info!(component = "storage", implementation = %impl_name, "Loaded");
+							}
+							Err(e) => {
+								tracing::error!(
+									component = "storage",
+									implementation = %name,
+									error = %e,
+									"Invalid configuration for storage implementation, skipping"
+								);
+							}
+						}
+					}
+					Err(e) => {
+						tracing::error!(
+							component = "storage",
+							implementation = %name,
+							error = %e,
+							"Failed to create storage implementation, skipping"
+						);
+					}
+				}
+			}
+		}
+
+		if storage_impls.is_empty() {
+			return Err(BuilderError::Config(
+				"No valid storage implementations available".into(),
+			));
+		}
+
+		// Get the primary storage implementation
+		let primary_storage = &self.config.storage.primary;
+		let storage_backend = storage_impls.remove(primary_storage).ok_or_else(|| {
+			BuilderError::Config(format!(
+				"Primary storage '{}' failed to load or has invalid configuration",
+				primary_storage
+			))
+		})?;
+
 		let storage = Arc::new(StorageService::new(storage_backend));
-		tracing::info!(component = "storage", implementation = %self.config.storage.backend, "Loaded");
 
 		// Create account provider
 		let account_provider =

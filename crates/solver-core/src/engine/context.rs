@@ -7,7 +7,11 @@ use alloy_primitives::U256;
 use solver_types::ExecutionContext;
 use std::collections::HashMap;
 
-/// Builds execution context for strategy decisions
+/// Builder for creating execution context used in strategy decisions.
+/// 
+/// The ContextBuilder provides methods to construct ExecutionContext instances
+/// populated with current market conditions like gas prices, timestamps, and
+/// solver balances for use in order execution strategies.
 pub struct ContextBuilder;
 
 impl ContextBuilder {

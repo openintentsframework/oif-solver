@@ -22,7 +22,7 @@ use solver_order::implementations::{
 	standards::_7683::create_order_impl, strategies::simple::create_strategy,
 };
 use solver_settlement::implementations::direct::create_settlement;
-// use solver_storage::implementations::file::create_storage as create_file_storage;
+use solver_storage::implementations::file::create_storage as create_file_storage;
 use solver_storage::implementations::memory::create_storage as create_memory_storage;
 
 /// Command-line arguments for the solver service.
@@ -163,8 +163,15 @@ fn build_solver(config: Config) -> Result<SolverEngine, Box<dyn std::error::Erro
 		"eip7683" => create_settlement,
 	);
 
+	let storage_factories = create_factory_map!(
+		solver_storage::StorageInterface,
+		solver_storage::StorageError,
+		"file" => create_file_storage,
+		"memory" => create_memory_storage,
+	);
+
 	let factories = SolverFactories {
-		storage_factory: create_memory_storage,
+		storage_factories,
 		account_factory: create_account,
 		delivery_factories,
 		discovery_factories,

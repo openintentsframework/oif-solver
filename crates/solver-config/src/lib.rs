@@ -69,6 +69,9 @@ pub struct SolverConfig {
 }
 
 /// Returns the default monitoring timeout in minutes.
+/// 
+/// This provides a default value of 480 minutes (8 hours) for monitoring operations
+/// when no explicit timeout is configured.
 fn default_monitoring_timeout_minutes() -> u64 {
 	480 // Default to 8 hours
 }
@@ -76,10 +79,12 @@ fn default_monitoring_timeout_minutes() -> u64 {
 /// Configuration for the storage backend.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StorageConfig {
-	/// The type of storage backend to use (e.g., "memory", "redis", "postgres").
-	pub backend: String,
-	/// Backend-specific configuration parameters as raw TOML values.
-	pub config: toml::Value,
+	/// Which implementation to use as primary.
+	pub primary: String,
+	/// Map of storage implementation names to their configurations.
+	pub implementations: HashMap<String, toml::Value>,
+	/// Interval in seconds for cleaning up expired storage entries.
+	pub cleanup_interval_seconds: u64,
 }
 
 /// Configuration for delivery mechanisms.
@@ -95,6 +100,9 @@ pub struct DeliveryConfig {
 }
 
 /// Returns the default number of confirmations required.
+/// 
+/// This provides a default value of 12 confirmations for transaction finality
+/// when no explicit confirmation count is configured.
 fn default_confirmations() -> u64 {
 	12 // Default to 12 confirmations
 }
@@ -190,21 +198,33 @@ pub struct CorsConfig {
 }
 
 /// Returns the default API host.
+/// 
+/// This provides a default host address of 127.0.0.1 (localhost) for the API server
+/// when no explicit host is configured.
 fn default_api_host() -> String {
 	"127.0.0.1".to_string()
 }
 
 /// Returns the default API port.
+/// 
+/// This provides a default port of 3000 for the API server
+/// when no explicit port is configured.
 fn default_api_port() -> u16 {
 	3000
 }
 
 /// Returns the default API timeout in seconds.
+/// 
+/// This provides a default timeout of 30 seconds for API requests
+/// when no explicit timeout is configured.
 fn default_api_timeout() -> u64 {
 	30
 }
 
 /// Returns the default maximum request size in bytes.
+/// 
+/// This provides a default maximum request size of 1MB (1024 * 1024 bytes)
+/// when no explicit limit is configured.
 fn default_max_request_size() -> usize {
 	1024 * 1024 // 1MB
 }
@@ -236,9 +256,34 @@ impl Config {
 		}
 
 		// Validate storage config
-		if self.storage.backend.is_empty() {
+		if self.storage.implementations.is_empty() {
 			return Err(ConfigError::Validation(
-				"Storage backend cannot be empty".into(),
+				"At least one storage implementation must be configured".into(),
+			));
+		}
+		if self.storage.primary.is_empty() {
+			return Err(ConfigError::Validation(
+				"Storage primary implementation cannot be empty".into(),
+			));
+		}
+		if !self
+			.storage
+			.implementations
+			.contains_key(&self.storage.primary)
+		{
+			return Err(ConfigError::Validation(format!(
+				"Primary storage '{}' not found in implementations",
+				self.storage.primary
+			)));
+		}
+		if self.storage.cleanup_interval_seconds == 0 {
+			return Err(ConfigError::Validation(
+				"Storage cleanup_interval_seconds must be greater than 0".into(),
+			));
+		}
+		if self.storage.cleanup_interval_seconds > 86400 {
+			return Err(ConfigError::Validation(
+				"Storage cleanup_interval_seconds cannot exceed 86400 (24 hours)".into(),
 			));
 		}
 

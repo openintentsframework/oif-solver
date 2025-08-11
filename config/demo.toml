@@ -5,9 +5,17 @@ id = "oif-solver-local-dual-chain"
 monitoring_timeout_minutes = 5
 
 [storage]
-backend = "memory" # or "file"
-[storage.config] 
-# storage_path = "./data/storage" # Only relevant for "file" backend
+primary = "memory"
+cleanup_interval_seconds = 3600
+
+[storage.implementations.memory]
+# Memory storage has no configuration
+
+[storage.implementations.file]
+storage_path = "./data/storage"
+ttl_orders = 0                  # Permanent
+ttl_intents = 86400             # 24 hours
+ttl_order_by_tx_hash = 86400    # 24 hours
 
 [account]
 provider = "local"

@@ -15,6 +15,10 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::instrument;
 
+/// Errors that can occur during settlement processing.
+/// 
+/// These errors represent failures in storage operations,
+/// service operations, or state transitions during settlement handling.
 #[derive(Debug, Error)]
 pub enum SettlementError {
 	#[error("Storage error: {0}")]
@@ -25,6 +29,11 @@ pub enum SettlementError {
 	State(String),
 }
 
+/// Handler for processing settlement claim operations.
+/// 
+/// The SettlementHandler manages batch processing of orders ready for claiming,
+/// generating claim transactions and submitting them through the delivery service
+/// to complete the settlement lifecycle.
 pub struct SettlementHandler {
 	#[allow(dead_code)]
 	settlement: Arc<SettlementService>,

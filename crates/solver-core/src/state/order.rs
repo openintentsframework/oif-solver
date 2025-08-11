@@ -12,6 +12,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+/// Errors that can occur during order state management.
+/// 
+/// These errors represent failures in storage operations,
+/// invalid state transitions, missing orders, or time-related issues.
 #[derive(Debug, Error)]
 pub enum OrderStateError {
 	#[error("Storage error: {0}")]
