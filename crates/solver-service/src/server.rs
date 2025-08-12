@@ -87,7 +87,9 @@ pub async fn start_server(
 			Router::new()
 				.route("/quotes", post(handle_quote))
 				.route("/orders", post(handle_order))
-				.route("/orders/{id}", get(handle_get_order_by_id)),
+				.route("/orders/{id}", get(handle_get_order_by_id))
+				.route("/tokens", get(handle_get_tokens))
+				.route("/tokens/{chain_id}", get(handle_get_tokens_for_chain)),
 		)
 		.layer(ServiceBuilder::new().layer(CorsLayer::permissive()))
 		.with_state(app_state);
@@ -134,6 +136,25 @@ async fn handle_get_order_by_id(
 			Err(APIError::from(e))
 		}
 	}
+}
+
+/// Handles GET /api/tokens requests.
+///
+/// Returns all supported tokens across all configured networks.
+async fn handle_get_tokens(
+	State(state): State<AppState>,
+) -> Json<crate::apis::tokens::TokensResponse> {
+	crate::apis::tokens::get_tokens(State(state.solver)).await
+}
+
+/// Handles GET /api/tokens/{chain_id} requests.
+///
+/// Returns supported tokens for a specific chain.
+async fn handle_get_tokens_for_chain(
+	Path(chain_id): Path<u64>,
+	State(state): State<AppState>,
+) -> Result<Json<crate::apis::tokens::NetworkTokens>, StatusCode> {
+	crate::apis::tokens::get_tokens_for_chain(Path(chain_id), State(state.solver)).await
 }
 
 /// Handles POST /api/orders requests.

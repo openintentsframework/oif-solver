@@ -4,14 +4,15 @@
 //! chain information from intents and fetching real-time blockchain data such as
 //! gas prices and solver balances.
 
+use super::token_manager::TokenManager;
+use crate::SolverError;
+use alloy_primitives::hex;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
 use solver_types::{Address, ExecutionContext, Intent};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use crate::SolverError;
 
 /// Execution context builder for the solver engine.
 ///
@@ -20,15 +21,22 @@ use crate::SolverError;
 pub struct ContextBuilder {
 	delivery: Arc<DeliveryService>,
 	solver_address: Address,
+	token_manager: Arc<TokenManager>,
 	_config: Config,
 }
 
 impl ContextBuilder {
 	/// Creates a new context builder.
-	pub fn new(delivery: Arc<DeliveryService>, solver_address: Address, config: Config) -> Self {
+	pub fn new(
+		delivery: Arc<DeliveryService>,
+		solver_address: Address,
+		token_manager: Arc<TokenManager>,
+		config: Config,
+	) -> Self {
 		Self {
 			delivery,
 			solver_address,
+			token_manager,
 			_config: config,
 		}
 	}
@@ -47,14 +55,7 @@ impl ContextBuilder {
 
 		// 1. Extract chains involved from the intent data
 		let involved_chains = match self.extract_chains_from_intent(intent) {
-			Ok(chains) => {
-				tracing::debug!(
-					intent_id = %intent.id,
-					chains = ?chains,
-					"Successfully extracted chains from intent"
-				);
-				chains
-			}
+			Ok(chains) => chains,
 			Err(e) => {
 				tracing::error!(
 					intent_id = %intent.id,
@@ -159,17 +160,12 @@ impl ContextBuilder {
 			}
 		}
 
-		// Extract from requested outputs (ERC-7930 interoperable addresses)
-		if let Some(outputs) = data.get("requestedOutputs").and_then(|v| v.as_array()) {
-			for (_, output) in outputs.iter().enumerate() {
-				if let Some(asset) = output.get("asset").and_then(|v| v.as_str()) {
-					match self.extract_chain_from_interop_address(asset) {
-						Ok(chain_id) => {
-							chains.push(chain_id);
-						}
-						Err(e) => {
-							tracing::warn!("Failed to extract chain from asset {}: {}", asset, e);
-						}
+		// Extract from outputs array (EIP-7683 orders/intents)
+		if let Some(outputs) = data.get("outputs").and_then(|v| v.as_array()) {
+			for output in outputs.iter() {
+				if let Some(chain_id_value) = output.get("chain_id") {
+					if let Some(chain_id) = parse_chain_id(chain_id_value) {
+						chains.push(chain_id);
 					}
 				}
 			}
@@ -186,58 +182,6 @@ impl ContextBuilder {
 		}
 
 		Ok(chains)
-	}
-
-	/// Extracts chain ID from ERC-7930 interoperable address format.
-	///
-	/// Expected format: "eip155:{chain_id}:{address}" or similar
-	/// Handles both decimal and hex chain IDs (e.g., "0x7a69").
-	fn extract_chain_from_interop_address(&self, address: &str) -> Result<u64, SolverError> {
-		tracing::trace!("Attempting to extract chain from address: {}", address);
-
-		// Handle ERC-7930 format: "eip155:1:0x..." or "eip155:0x7a69:0x..."
-		if let Some(eip155_part) = address.strip_prefix("eip155:") {
-			tracing::trace!("Found eip155 prefix, remaining part: {}", eip155_part);
-			if let Some(colon_pos) = eip155_part.find(':') {
-				let chain_part = &eip155_part[..colon_pos];
-				tracing::trace!("Extracting chain_id from: {}", chain_part);
-
-				// Try parsing as hex first (if it starts with "0x"), then as decimal
-				let chain_id = if let Some(hex_str) = chain_part.strip_prefix("0x") {
-					// Parse hex chain ID
-					u64::from_str_radix(hex_str, 16).map_err(|e| {
-						SolverError::Service(format!(
-							"Invalid hex chain ID '{}' in address {}: {}",
-							chain_part, address, e
-						))
-					})?
-				} else {
-					// Parse decimal chain ID
-					chain_part.parse::<u64>().map_err(|e| {
-						SolverError::Service(format!(
-							"Invalid decimal chain ID '{}' in address {}: {}",
-							chain_part, address, e
-						))
-					})?
-				};
-
-				tracing::trace!(
-					"Successfully parsed chain_id {} from {}",
-					chain_id,
-					chain_part
-				);
-				return Ok(chain_id);
-			} else {
-				tracing::trace!("No second colon found in eip155 part: {}", eip155_part);
-			}
-		} else {
-			tracing::trace!("Address does not start with eip155: prefix");
-		}
-
-		Err(SolverError::Service(format!(
-			"Could not extract chain ID from address: {}",
-			address
-		)))
 	}
 
 	/// Fetches solver balances for all relevant chains and tokens.
@@ -273,7 +217,6 @@ impl ContextBuilder {
 			}
 
 			// Get balances for common tokens on this chain
-			// TODO: This should be configurable per chain
 			let common_tokens = self.get_common_tokens_for_chain(chain_id);
 			for token_address in common_tokens {
 				match self
@@ -299,32 +242,14 @@ impl ContextBuilder {
 		Ok(balances)
 	}
 
-	/// Gets common token addresses for a given chain.
+	/// Gets token addresses for a given chain from the token manager.
 	///
-	/// Returns addresses of commonly used tokens that the solver might hold.
+	/// Returns addresses of tokens configured for this chain.
 	fn get_common_tokens_for_chain(&self, chain_id: u64) -> Vec<String> {
-		// TODO: This should be configurable and loaded from config
-		// For now, return some well-known token addresses per chain
-		match chain_id {
-			1 => vec![
-				// Ethereum mainnet
-				"0xA0b86a33E6441f8C4e73D2B95b8eCf3f1e9BfECa".to_string(), // USDC
-				"0xdAC17F958D2ee523a2206206994597C13D831ec7".to_string(), // USDT
-				"0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".to_string(), // WETH
-			],
-			137 => vec![
-				// Polygon
-				"0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174".to_string(), // USDC
-				"0xc2132D05D31c914a87C6611C10748AEb04B58e8F".to_string(), // USDT
-				"0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619".to_string(), // WETH
-			],
-			42161 => vec![
-				// Arbitrum One
-				"0xA7D7079b0FEaD91F3e65f86E8915Cb59c1a4C664".to_string(), // USDC
-				"0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9".to_string(), // USDT
-				"0x82aF49447D8a07e3bd95BD0d56f35241523fBab1".to_string(), // WETH
-			],
-			_ => vec![], // No common tokens configured for this chain
-		}
+		self.token_manager
+			.get_tokens_for_chain(chain_id)
+			.into_iter()
+			.map(|token| hex::encode(&token.address.0))
+			.collect()
 	}
 }

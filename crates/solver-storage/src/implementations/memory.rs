@@ -40,10 +40,7 @@ impl Default for MemoryStorage {
 impl StorageInterface for MemoryStorage {
 	async fn get_bytes(&self, key: &str) -> Result<Vec<u8>, StorageError> {
 		let store = self.store.read().await;
-		store
-			.get(key)
-			.map(|data| data.clone())
-			.ok_or(StorageError::NotFound)
+		store.get(key).cloned().ok_or(StorageError::NotFound)
 	}
 
 	async fn set_bytes(

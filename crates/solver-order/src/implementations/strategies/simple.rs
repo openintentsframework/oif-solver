@@ -5,8 +5,8 @@
 use alloy_primitives::U256;
 use async_trait::async_trait;
 use solver_types::{
-	ConfigSchema, ExecutionContext, ExecutionDecision, ExecutionParams, Field, FieldType, Order,
-	Schema,
+	bytes32_to_address, with_0x_prefix, ConfigSchema, Eip7683OrderData, ExecutionContext,
+	ExecutionDecision, ExecutionParams, Field, FieldType, Order, Schema,
 };
 
 use crate::ExecutionStrategy;
@@ -60,11 +60,7 @@ impl ExecutionStrategy for SimpleStrategy {
 		Box::new(SimpleStrategySchema)
 	}
 
-	async fn should_execute(
-		&self,
-		_order: &Order,
-		context: &ExecutionContext,
-	) -> ExecutionDecision {
+	async fn should_execute(&self, order: &Order, context: &ExecutionContext) -> ExecutionDecision {
 		// Find the maximum gas price across all chains in the context
 		let max_gas_price = context
 			.chain_data
@@ -76,6 +72,76 @@ impl ExecutionStrategy for SimpleStrategy {
 		// Check if any chain has gas price above our limit
 		if max_gas_price > self.max_gas_price {
 			return ExecutionDecision::Defer(std::time::Duration::from_secs(60));
+		}
+
+		// Check token balances based on order standard
+		match order.standard.as_str() {
+			"eip7683" => {
+				if let Ok(order_data) =
+					serde_json::from_value::<Eip7683OrderData>(order.data.clone())
+				{
+					// Check each output to ensure we have sufficient balance
+					for output in &order_data.outputs {
+						let chain_id = output.chain_id.to::<u64>();
+						// Convert bytes32 token to address format (without "0x" for balance lookup)
+						let token_address = bytes32_to_address(&output.token);
+
+						// Build the balance key (chain_id, Some(token_address))
+						let balance_key = (chain_id, Some(token_address.clone()));
+
+						// Check if we have the balance for this token
+						if let Some(balance_str) = context.solver_balances.get(&balance_key) {
+							// Parse balance and required amount
+							let balance = balance_str.parse::<U256>().unwrap_or(U256::ZERO);
+							let required = output.amount;
+
+							if balance < required {
+								tracing::warn!(
+									order_id = %order.id,
+									chain_id = chain_id,
+									token = %with_0x_prefix(&token_address),
+									balance = ?balance,
+									required = ?required,
+									"Insufficient token balance for order"
+								);
+								return ExecutionDecision::Skip(format!(
+									"Insufficient balance on chain {}: have {} need {} of token {}",
+									chain_id,
+									balance,
+									required,
+									with_0x_prefix(&token_address)
+								));
+							}
+						} else {
+							// No balance info available for this token
+							tracing::warn!(
+								order_id = %order.id,
+								chain_id = chain_id,
+								token = %with_0x_prefix(&token_address),
+								"No balance information available for token"
+							);
+							return ExecutionDecision::Skip(format!(
+								"No balance information for token {} on chain {}",
+								with_0x_prefix(&token_address),
+								chain_id
+							));
+						}
+					}
+				} else {
+					tracing::error!(
+						order_id = %order.id,
+						"Failed to parse EIP-7683 order data"
+					);
+				}
+			}
+			_ => {
+				// For unknown standards, skip balance checks
+				tracing::debug!(
+					order_id = %order.id,
+					standard = %order.standard,
+					"Skipping balance check for unknown order standard"
+				);
+			}
 		}
 
 		// Use the maximum gas price for execution (could be made more sophisticated)

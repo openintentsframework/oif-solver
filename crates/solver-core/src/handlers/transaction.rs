@@ -7,14 +7,13 @@
 use crate::engine::event_bus::EventBus;
 use crate::monitoring::TransactionMonitor;
 use crate::state::OrderStateMachine;
-use crate::utils::truncate_id;
 use alloy_primitives::hex;
 use solver_delivery::DeliveryService;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
 use solver_types::{
-	DeliveryEvent, Order, OrderEvent, OrderStatus, SolverEvent, StorageKey, TransactionHash,
-	TransactionReceipt, TransactionType,
+	truncate_id, DeliveryEvent, Order, OrderEvent, OrderStatus, SolverEvent, StorageKey,
+	TransactionHash, TransactionReceipt, TransactionType,
 };
 use std::sync::Arc;
 use thiserror::Error;

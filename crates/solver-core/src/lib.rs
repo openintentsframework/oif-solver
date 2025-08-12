@@ -10,7 +10,6 @@ pub mod engine;
 pub mod handlers;
 pub mod monitoring;
 pub mod state;
-pub mod utils;
 
 // Re-export main types
 pub use builder::{BuilderError, SolverBuilder, SolverFactories};

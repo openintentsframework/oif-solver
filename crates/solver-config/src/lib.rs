@@ -5,6 +5,7 @@
 //! all required configuration values are properly set.
 
 use serde::{Deserialize, Serialize};
+use solver_types::{networks::deserialize_networks, NetworksConfig};
 use std::collections::HashMap;
 use std::str::FromStr;
 use thiserror::Error;
@@ -32,6 +33,9 @@ pub enum ConfigError {
 pub struct Config {
 	/// Configuration specific to the solver instance.
 	pub solver: SolverConfig,
+	/// Network and token configurations.
+	#[serde(deserialize_with = "deserialize_networks")]
+	pub networks: NetworksConfig,
 	/// Configuration for the storage backend.
 	pub storage: StorageConfig,
 	/// Configuration for delivery mechanisms.
@@ -249,10 +253,43 @@ impl Config {
 	/// - Ensures at least one discovery source exists
 	/// - Validates order implementations and strategy are configured
 	/// - Checks that settlement implementations are present
+	/// - Validates networks configuration
 	fn validate(&self) -> Result<(), ConfigError> {
 		// Validate solver config
 		if self.solver.id.is_empty() {
 			return Err(ConfigError::Validation("Solver ID cannot be empty".into()));
+		}
+
+		// Validate networks config
+		if self.networks.is_empty() {
+			return Err(ConfigError::Validation(
+				"Networks configuration cannot be empty".into(),
+			));
+		}
+		if self.networks.len() < 2 {
+			return Err(ConfigError::Validation(
+				"At least 2 different networks must be configured".into(),
+			));
+		}
+		for (chain_id, network) in &self.networks {
+			if network.input_settler_address.0.is_empty() {
+				return Err(ConfigError::Validation(format!(
+					"Network {} must have input_settler_address",
+					chain_id
+				)));
+			}
+			if network.output_settler_address.0.is_empty() {
+				return Err(ConfigError::Validation(format!(
+					"Network {} must have output_settler_address",
+					chain_id
+				)));
+			}
+			if network.tokens.is_empty() {
+				return Err(ConfigError::Validation(format!(
+					"Network {} must have at least 1 token configured",
+					chain_id
+				)));
+			}
 		}
 
 		// Validate storage config

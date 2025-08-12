@@ -4,9 +4,37 @@
 id = "oif-solver-local-dual-chain"
 monitoring_timeout_minutes = 5
 
+# Networks configuration
+[networks.31337]
+input_settler_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+output_settler_address = "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"
+[[networks.31337.tokens]]
+address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+symbol = "TOKA"
+decimals = 18
+[[networks.31337.tokens]]
+address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+symbol = "TOKB"
+decimals = 18
+
+[networks.31338]
+input_settler_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+output_settler_address = "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"
+[[networks.31338.tokens]]
+address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+symbol = "TOKA"
+decimals = 18
+[[networks.31338.tokens]]
+address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+symbol = "TOKB"
+decimals = 18
+
 [storage]
 primary = "file"
 cleanup_interval_seconds = 3600
+
+[storage.implementations.memory]
+# Memory storage has no configuration
 
 [storage.implementations.file]
 storage_path = "./data/storage"
@@ -14,70 +42,56 @@ ttl_orders = 0                  # Permanent
 ttl_intents = 86400             # 24 hours
 ttl_order_by_tx_hash = 86400    # 24 hours
 
-[storage.implementations.memory]
-# Memory storage as fallback (not used unless primary is changed)
-
 [account]
 provider = "local"
 [account.config]
-# Using Anvil's default account #0
 private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 
 [delivery]
 min_confirmations = 1
-# Configure multiple delivery providers for different chains
 [delivery.providers.origin]
 rpc_url = "http://localhost:8545"
 private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-chain_id = 31337  # Anvil origin chain
+chain_id = 31337
 
 [delivery.providers.destination]
 rpc_url = "http://localhost:8546"
 private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-chain_id = 31338  # Anvil destination chain
+chain_id = 31338
 
 [discovery]
-# Configure multiple discovery sources
 [discovery.sources.onchain_eip7683]
 rpc_url = "http://localhost:8545"
-# InputSettler address on origin chain (where orders are created)
-settler_addresses = ["0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"]
-polling_interval_secs = 3  # Poll every 3 seconds
+chain_id = 31337
 
-[discovery.sources.destination_eip7683]
-rpc_url = "http://localhost:8546"
-# OutputSettler address on destination chain (where orders are fulfilled)
-settler_addresses = ["0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"]
+[discovery.sources.offchain_eip7683]
+api_host = "127.0.0.1"
+api_port = 8081
+rpc_url = "http://localhost:8545"
+# auth_token = "your-secret-token"
 
 [order]
-# EIP-7683 order implementations
 [order.implementations.eip7683]
-# OutputSettler address (destination chain)
-output_settler_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
-# InputSettler address (origin chain)
-input_settler_address = "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"
+# No config needed - uses networks config
 
 [order.execution_strategy]
 strategy_type = "simple"
 [order.execution_strategy.config]
-max_gas_price_gwei = 100  # Maximum gas price in gwei
+max_gas_price_gwei = 100
 
 [settlement]
-# Direct settlement implementations
-[settlement.implementations.eip7683]
-rpc_url = "http://localhost:8546"  # Settlement needs to validate fills on destination chain
-# Oracle address on origin chain
-oracle_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
-dispute_period_seconds = 1  # 1 seconds for testing
-
-# Domain configuration for EIP-712 signatures in quotes
 [settlement.domain]
-chain_id = 1  # Ethereum mainnet 
-address = "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"
+# Domain configuration for EIP-712 signatures in quotes
+chain_id = 1  # Ethereum mainnet
+address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+[settlement.implementations.eip7683]
+rpc_url = "http://localhost:8546"
+oracle_address = "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"
+dispute_period_seconds = 1
 
 # API server configuration
 [api]
-enabled = false
+enabled = true
 host = "127.0.0.1"
 port = 3000
 timeout_seconds = 30
@@ -94,17 +108,21 @@ max_request_size = 1048576  # 1MB
 [contracts.origin]
 chain_id = 31337
 rpc_url = "http://localhost:8545"
-token = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
-input_settler = "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"
-the_compact = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+tokenA = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+tokenB = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+input_settler = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+output_settler = "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"
+the_compact = ""
 permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
-oracle = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+oracle = "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"
 
 [contracts.destination]
 chain_id = 31338
 rpc_url = "http://localhost:8546"
-token = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
-output_settler = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+tokenA = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+tokenB = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+input_settler = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+output_settler = "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"
 permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 
 # Test accounts (used by demo scripts)
@@ -112,4 +130,4 @@ permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 solver = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 user = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
 user_private_key = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
-recipient = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"  # Account #2 - recipient for cross-chain intents
+recipient = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"

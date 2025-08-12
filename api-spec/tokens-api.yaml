@@ -1,0 +1,178 @@
+openapi: 3.0.3
+info:
+  title: OIF Solver Tokens API
+  description: |
+    API endpoints for querying supported tokens and networks configured in the OIF Solver.
+    These endpoints allow third-party services to discover which tokens and networks
+    the solver supports for executing cross-chain intents.
+  version: 1.0.0
+servers:
+  - url: http://localhost:3000/api
+    description: Local development server
+  - url: https://api.solver.example.com/api
+    description: Production server (replace with actual URL)
+
+paths:
+  /tokens:
+    get:
+      summary: Get all supported tokens
+      description: |
+        Returns all supported tokens across all configured networks.
+        This endpoint provides a comprehensive view of the solver's capabilities,
+        showing which tokens can be used for intents on each supported blockchain.
+      operationId: getAllTokens
+      tags:
+        - Tokens
+      responses:
+        "200":
+          description: Successful response with all supported tokens
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokensResponse"
+              example:
+                networks:
+                  "1":
+                    chain_id: 1
+                    input_settler: "0x1234567890abcdef1234567890abcdef12345678"
+                    output_settler: "0xabcdef1234567890abcdef1234567890abcdef12"
+                    tokens:
+                      - address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                        symbol: "USDC"
+                        decimals: 6
+                      - address: "0xdac17f958d2ee523a2206206994597c13d831ec7"
+                        symbol: "USDT"
+                        decimals: 6
+                  "42161":
+                    chain_id: 42161
+                    input_settler: "0x9876543210fedcba9876543210fedcba98765432"
+                    output_settler: "0xfedcba9876543210fedcba9876543210fedcba98"
+                    tokens:
+                      - address: "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+                        symbol: "USDC"
+                        decimals: 6
+                      - address: "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"
+                        symbol: "USDT"
+                        decimals: 6
+
+  /tokens/{chain_id}:
+    get:
+      summary: Get tokens for specific chain
+      description: |
+        Returns supported tokens for a specific blockchain network.
+        Use this endpoint to check if the solver supports a particular chain
+        and which tokens are available for intents on that chain.
+      operationId: getTokensForChain
+      tags:
+        - Tokens
+      parameters:
+        - name: chain_id
+          in: path
+          required: true
+          description: The blockchain network ID (e.g., 1 for Ethereum mainnet, 42161 for Arbitrum)
+          schema:
+            type: integer
+            format: int64
+            example: 1
+      responses:
+        "200":
+          description: Successful response with tokens for the specified chain
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkTokens"
+              example:
+                chain_id: 1
+                input_settler: "0x1234567890abcdef1234567890abcdef12345678"
+                output_settler: "0xabcdef1234567890abcdef1234567890abcdef12"
+                tokens:
+                  - address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                    symbol: "USDC"
+                    decimals: 6
+                  - address: "0xdac17f958d2ee523a2206206994597c13d831ec7"
+                    symbol: "USDT"
+                    decimals: 6
+        "404":
+          description: Chain not supported by this solver
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Chain ID 999 is not supported"
+
+components:
+  schemas:
+    TokensResponse:
+      type: object
+      description: Response containing all supported tokens across all networks
+      required:
+        - networks
+      properties:
+        networks:
+          type: object
+          description: Map of chain ID (as string) to network token information
+          additionalProperties:
+            $ref: "#/components/schemas/NetworkTokens"
+
+    NetworkTokens:
+      type: object
+      description: Token information for a specific blockchain network
+      required:
+        - chain_id
+        - input_settler
+        - output_settler
+        - tokens
+      properties:
+        chain_id:
+          type: integer
+          format: int64
+          description: The blockchain network ID
+          example: 1
+        input_settler:
+          type: string
+          pattern: "^0x[a-fA-F0-9]{40}$"
+          description: Input settler contract address for this network
+          example: "0x1234567890abcdef1234567890abcdef12345678"
+        output_settler:
+          type: string
+          pattern: "^0x[a-fA-F0-9]{40}$"
+          description: Output settler contract address for this network
+          example: "0xabcdef1234567890abcdef1234567890abcdef12"
+        tokens:
+          type: array
+          description: List of supported tokens on this network
+          items:
+            $ref: "#/components/schemas/TokenInfo"
+
+    TokenInfo:
+      type: object
+      description: Information about a specific token
+      required:
+        - address
+        - symbol
+        - decimals
+      properties:
+        address:
+          type: string
+          pattern: "^0x[a-fA-F0-9]{40}$"
+          description: Token contract address
+          example: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+        symbol:
+          type: string
+          description: Token symbol (e.g., "USDC", "USDT", "WETH")
+          example: "USDC"
+        decimals:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: Number of decimal places for the token
+          example: 6
+
+tags:
+  - name: Tokens
+    description: |
+      Endpoints for querying supported tokens and networks.
+      Use these endpoints to discover solver supported network-token routes.

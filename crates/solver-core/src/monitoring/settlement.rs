@@ -5,9 +5,8 @@
 
 use crate::engine::event_bus::EventBus;
 use crate::state::OrderStateMachine;
-use crate::utils::truncate_id;
 use solver_settlement::SettlementService;
-use solver_types::{Order, SettlementEvent, SolverEvent, TransactionHash};
+use solver_types::{truncate_id, Order, SettlementEvent, SolverEvent, TransactionHash};
 use std::sync::Arc;
 
 /// Monitor for tracking settlement readiness of filled orders.

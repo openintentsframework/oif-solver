@@ -31,7 +31,13 @@ impl StorageKey {
 
 	/// Returns an iterator over all StorageKey variants.
 	pub fn all() -> impl Iterator<Item = Self> {
-		[Self::Orders, Self::Intents, Self::OrderByTxHash, Self::Quotes].into_iter()
+		[
+			Self::Orders,
+			Self::Intents,
+			Self::OrderByTxHash,
+			Self::Quotes,
+		]
+		.into_iter()
 	}
 }
 

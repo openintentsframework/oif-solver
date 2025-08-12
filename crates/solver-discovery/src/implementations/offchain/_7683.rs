@@ -57,8 +57,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use solver_types::{
-	standards::eip7683::MandateOutput, ConfigSchema, Eip7683OrderData, Field, FieldType, Intent,
-	IntentMetadata, Schema,
+	standards::eip7683::MandateOutput, with_0x_prefix, ConfigSchema, Eip7683OrderData, Field,
+	FieldType, Intent, IntentMetadata, NetworksConfig, Schema,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -229,7 +229,7 @@ struct IntentResponse {
 /// * `intent_sender` - Channel to broadcast discovered intents to the solver system
 /// * `auth_token` - Optional authentication token for API access control
 /// * `provider` - RPC provider for interacting with on-chain contracts
-/// * `settler_address` - Address of the settler contract
+/// * `networks` - Networks configuration for settler lookups
 #[derive(Clone)]
 struct ApiState {
 	/// Channel to send discovered intents
@@ -239,8 +239,8 @@ struct ApiState {
 	auth_token: Option<String>,
 	/// RPC provider for calling settler contracts
 	provider: RootProvider<Http<reqwest::Client>>,
-	/// Settler contract address
-	settler_address: Address,
+	/// Networks configuration for settler lookups
+	networks: NetworksConfig,
 }
 
 /// EIP-7683 offchain discovery implementation.
@@ -256,8 +256,8 @@ pub struct Eip7683OffchainDiscovery {
 	auth_token: Option<String>,
 	/// RPC provider for calling settler contracts
 	provider: RootProvider<Http<reqwest::Client>>,
-	/// Settler contract address
-	settler_address: Address,
+	/// Networks configuration for settler lookups
+	networks: NetworksConfig,
 	/// Flag indicating if the server is running
 	is_running: Arc<AtomicBool>,
 	/// Channel for signaling server shutdown
@@ -273,7 +273,7 @@ impl Eip7683OffchainDiscovery {
 	/// * `api_port` - The port number to listen on
 	/// * `auth_token` - Optional authentication token for API access
 	/// * `rpc_url` - Ethereum RPC URL for calling settler contracts
-	/// * `settler_address` - Address of the settler contract
+	/// * `networks` - Networks configuration
 	///
 	/// # Returns
 	///
@@ -282,13 +282,13 @@ impl Eip7683OffchainDiscovery {
 	/// # Errors
 	///
 	/// Returns `DiscoveryError::Connection` if the RPC URL cannot be parsed.
-	/// Returns `DiscoveryError::ValidationError` if the settler address is invalid.
+	/// Returns `DiscoveryError::ValidationError` if networks config is invalid.
 	pub fn new(
 		api_host: String,
 		api_port: u16,
 		auth_token: Option<String>,
 		rpc_url: String,
-		settler_address: String,
+		networks: NetworksConfig,
 	) -> Result<Self, DiscoveryError> {
 		let provider = RootProvider::new_http(
 			rpc_url
@@ -296,16 +296,19 @@ impl Eip7683OffchainDiscovery {
 				.map_err(|e| DiscoveryError::Connection(format!("Invalid RPC URL: {}", e)))?,
 		);
 
-		let settler_address = settler_address.parse::<Address>().map_err(|e| {
-			DiscoveryError::ValidationError(format!("Invalid settler address: {}", e))
-		})?;
+		// Validate networks config has at least one network
+		if networks.is_empty() {
+			return Err(DiscoveryError::ValidationError(
+				"Networks configuration cannot be empty".to_string(),
+			));
+		}
 
 		Ok(Self {
 			api_host,
 			api_port,
 			auth_token,
 			provider,
-			settler_address,
+			networks,
 			is_running: Arc::new(AtomicBool::new(false)),
 			shutdown_signal: Arc::new(Mutex::new(None)),
 		})
@@ -401,6 +404,7 @@ impl Eip7683OffchainDiscovery {
 	/// * `order` - The API order to convert
 	/// * `provider` - RPC provider for calling contracts
 	/// * `signature` - Optional order signature
+	/// * `networks` - Networks configuration for settler lookups
 	///
 	/// # Returns
 	///
@@ -417,10 +421,26 @@ impl Eip7683OffchainDiscovery {
 		sponsor: &Address,
 		signature: &Bytes,
 		provider: &RootProvider<Http<reqwest::Client>>,
-		settler_address: Address,
+		networks: &NetworksConfig,
 	) -> Result<Intent, DiscoveryError> {
 		// Parse the StandardOrder
 		let order = Self::parse_standard_order(order_bytes)?;
+
+		// Get the input settler address for the order's origin chain
+		let origin_chain_id = order.originChainId.to::<u64>();
+		let network = networks.get(&origin_chain_id).ok_or_else(|| {
+			DiscoveryError::ValidationError(format!(
+				"Chain ID {} not found in networks configuration",
+				order.originChainId
+			))
+		})?;
+
+		if network.input_settler_address.0.len() != 20 {
+			return Err(DiscoveryError::ValidationError(
+				"Invalid settler address length".to_string(),
+			));
+		}
+		let settler_address = Address::from_slice(&network.input_settler_address.0);
 
 		// Generate order ID from order data
 		let order_id = Self::compute_order_id(order_bytes, provider, settler_address).await?;
@@ -434,12 +454,12 @@ impl Eip7683OffchainDiscovery {
 
 		// Convert to intent format
 		let order_data = Eip7683OrderData {
-			user: format!("0x{}", hex::encode(order.user)),
+			user: with_0x_prefix(&hex::encode(order.user)),
 			nonce: order.nonce,
 			origin_chain_id: order.originChainId,
 			expires: order.expires,
 			fill_deadline: order.fillDeadline,
-			input_oracle: format!("0x{}", hex::encode(order.inputOracle)),
+			input_oracle: with_0x_prefix(&hex::encode(order.inputOracle)),
 			inputs: order.inputs.clone(),
 			order_id,
 			settle_gas_limit: 200_000u64, // TODO: calculate exactly
@@ -459,9 +479,9 @@ impl Eip7683OffchainDiscovery {
 				})
 				.collect(),
 			// Include raw order data for openFor
-			raw_order_data: Some(format!("0x{}", hex::encode(order_bytes))),
+			raw_order_data: Some(with_0x_prefix(&hex::encode(order_bytes))),
 			// Include signature and sponsor
-			signature: Some(format!("0x{}", hex::encode(signature))),
+			signature: Some(with_0x_prefix(&hex::encode(signature))),
 			sponsor: Some(sponsor.to_string()),
 		};
 
@@ -528,7 +548,7 @@ impl Eip7683OffchainDiscovery {
 	/// * `intent_sender` - Channel to send discovered intents
 	/// * `auth_token` - Optional authentication token
 	/// * `provider` - RPC provider for contract calls
-	/// * `settler_address` - Address of the settler contract
+	/// * `networks` - Networks configuration for settler lookups
 	/// * `shutdown_rx` - Channel to receive shutdown signal
 	///
 	/// # Errors
@@ -543,14 +563,14 @@ impl Eip7683OffchainDiscovery {
 		intent_sender: mpsc::UnboundedSender<Intent>,
 		auth_token: Option<String>,
 		provider: RootProvider<Http<reqwest::Client>>,
-		settler_address: Address,
+		networks: NetworksConfig,
 		mut shutdown_rx: mpsc::Receiver<()>,
 	) -> Result<(), String> {
 		let state = ApiState {
 			intent_sender,
 			auth_token,
 			provider,
-			settler_address,
+			networks,
 		};
 
 		let app = Router::new()
@@ -647,16 +667,13 @@ async fn handle_intent_submission(
 			.into_response();
 	}
 
-	// Get settler address from the API state
-	let settler_address = state.settler_address;
-
 	// Convert to intent
 	match Eip7683OffchainDiscovery::order_to_intent(
 		&request.order,
 		&request.sponsor,
 		&request.signature,
 		&state.provider,
-		settler_address,
+		&state.networks,
 	)
 	.await
 	{
@@ -752,18 +769,6 @@ impl ConfigSchema for Eip7683OffchainDiscoverySchema {
 						None => Err("Expected string value for rpc_url".to_string()),
 					}
 				}),
-				Field::new("settler_address", FieldType::String).with_validator(
-					|value| match value.as_str() {
-						Some(addr) => {
-							if addr.len() != 42 || !addr.starts_with("0x") {
-								Err("settler_address must be a valid Ethereum address".to_string())
-							} else {
-								Ok(())
-							}
-						}
-						None => Err("Expected string value for settler_address".to_string()),
-					},
-				),
 			],
 			// Optional fields
 			vec![
@@ -804,7 +809,7 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 		let api_port = self.api_port;
 		let auth_token = self.auth_token.clone();
 		let provider = self.provider.clone();
-		let settler_address = self.settler_address;
+		let networks = self.networks.clone();
 
 		tokio::spawn(async move {
 			if let Err(e) = Self::run_server(
@@ -813,7 +818,7 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 				sender,
 				auth_token,
 				provider,
-				settler_address,
+				networks,
 				shutdown_rx,
 			)
 			.await
@@ -862,17 +867,16 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 /// api_port = 8081              # optional, defaults to 8081
 /// auth_token = "secret"        # optional
 /// rpc_url = "https://..."      # required
-/// settler_address = "0x..."    # required
 /// ```
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// - `rpc_url` is not provided in the configuration
-/// - `settler_address` is not provided in the configuration
 /// - The discovery service cannot be created
 pub fn create_discovery(
 	config: &toml::Value,
+	networks: &NetworksConfig,
 ) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError> {
 	let api_host = config
 		.get("api_host")
@@ -896,14 +900,8 @@ pub fn create_discovery(
 		.ok_or_else(|| DiscoveryError::ValidationError("rpc_url is required".to_string()))?
 		.to_string();
 
-	let settler_address = config
-		.get("settler_address")
-		.and_then(|v| v.as_str())
-		.ok_or_else(|| DiscoveryError::ValidationError("settler_address is required".to_string()))?
-		.to_string();
-
 	let discovery =
-		Eip7683OffchainDiscovery::new(api_host, api_port, auth_token, rpc_url, settler_address)
+		Eip7683OffchainDiscovery::new(api_host, api_port, auth_token, rpc_url, networks.clone())
 			.map_err(|e| {
 				DiscoveryError::Connection(format!(
 					"Failed to create offchain discovery service: {}",

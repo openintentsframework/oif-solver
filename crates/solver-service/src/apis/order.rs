@@ -8,8 +8,8 @@ use axum::extract::Path;
 use solver_core::SolverEngine;
 use solver_storage;
 use solver_types::{
-	AssetAmount, GetOrderError, GetOrderResponse, Order, OrderResponse, OrderStatus, Settlement,
-	SettlementType, TransactionType,
+	bytes32_to_address, with_0x_prefix, AssetAmount, GetOrderError, GetOrderResponse, Order,
+	OrderResponse, OrderStatus, Settlement, SettlementType, TransactionType,
 };
 use tracing::info;
 
@@ -74,14 +74,16 @@ fn validate_order_id(order_id: &str) -> Result<(), GetOrderError> {
 
 /// Converts a storage Order to an API OrderResponse.
 async fn convert_order_to_response(order: Order) -> Result<OrderResponse, GetOrderError> {
-	// Handle EIP-7683 order format
-	if order.standard == "eip7683" {
-		convert_eip7683_order_to_response(order).await
-	} else {
-		// Handle other standards
-		Err(GetOrderError::Internal(
-			"Unsupported order standard".to_string(),
-		))
+	// Handle different order standards
+	match order.standard.as_str() {
+		"eip7683" => convert_eip7683_order_to_response(order).await,
+		_ => {
+			// Handle unknown standards
+			Err(GetOrderError::Internal(format!(
+				"Unsupported order standard: {}",
+				order.standard
+			)))
+		}
 	}
 }
 
@@ -153,12 +155,12 @@ async fn convert_eip7683_order_to_response(
 		GetOrderError::Internal("Invalid token format - expected bytes array".to_string())
 	})?;
 
-	// Extract last 20 bytes (address part) from the 32-byte token field
-	let mut token_bytes = [0u8; 20];
-	for (i, byte_val) in token_array.iter().skip(12).take(20).enumerate() {
-		token_bytes[i] = byte_val.as_u64().unwrap_or(0) as u8;
+	// Convert bytes32 array from JSON to [u8; 32]
+	let mut token_bytes32 = [0u8; 32];
+	for (i, byte_val) in token_array.iter().take(32).enumerate() {
+		token_bytes32[i] = byte_val.as_u64().unwrap_or(0) as u8;
 	}
-	let output_token = format!("0x{}", alloy_primitives::hex::encode(token_bytes));
+	let output_token = with_0x_prefix(&bytes32_to_address(&token_bytes32));
 
 	let output_amount_str = first_output
 		.get("amount")
@@ -218,7 +220,7 @@ async fn convert_eip7683_order_to_response(
 		};
 
 		serde_json::json!({
-			"hash": format!("0x{}", alloy_primitives::hex::encode(&fill_tx_hash.0)),
+			"hash": with_0x_prefix(&alloy_primitives::hex::encode(&fill_tx_hash.0)),
 			"status": tx_status,
 			"timestamp": order.updated_at
 		})

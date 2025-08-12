@@ -5,7 +5,12 @@
 # NOTE: This script has been tested on macOS systems only.
 #
 # Prerequisites: Run ./setup_local_anvil.sh and start the solver service
-# Usage: ./send_offchain_intent.sh
+# Usage: 
+#   ./send_offchain_intent.sh [origin_token] [dest_token] [--direct|api_url]
+#   ./send_offchain_intent.sh                              # Use default TokenA
+#   ./send_offchain_intent.sh 0xABC... 0xDEF...          # Specific tokens
+#   ./send_offchain_intent.sh --direct                     # Use discovery service
+#   ./send_offchain_intent.sh 0xABC... 0xDEF... --direct  # Specific tokens + discovery
 
 set -e
 
@@ -26,44 +31,94 @@ if [ ! -f "config/demo.toml" ]; then
     exit 1
 fi
 
-# Load addresses from config
-INPUT_SETTLER_ADDRESS=$(grep 'input_settler_address = ' config/demo.toml | cut -d'"' -f2)
-OUTPUT_SETTLER_ADDRESS=$(grep 'output_settler_address = ' config/demo.toml | cut -d'"' -f2)
+# Load addresses from config - now from networks section
+# For origin chain (31337)
+INPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31337\]' config/demo.toml | grep 'input_settler_address = ' | cut -d'"' -f2)
+# For destination chain (31338)
+OUTPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31338\]' config/demo.toml | grep 'output_settler_address = ' | cut -d'"' -f2)
 # Solver address from accounts section
-SOLVER_ADDR=$(grep -A 10 '\[accounts\]' config/demo.toml | grep 'solver = ' | cut -d'"' -f2)
+SOLVER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'solver = ' | head -1 | cut -d'"' -f2)
 ORACLE_ADDRESS=$(grep 'oracle_address = ' config/demo.toml | cut -d'"' -f2)
-ORIGIN_TOKEN_ADDRESS=$(grep -A 10 '\[contracts.origin\]' config/demo.toml | grep 'token = ' | cut -d'"' -f2)
-DEST_TOKEN_ADDRESS=$(grep -A 10 '\[contracts.destination\]' config/demo.toml | grep 'token = ' | cut -d'"' -f2)
-USER_ADDR=$(grep -A 10 '\[accounts\]' config/demo.toml | grep 'user = ' | cut -d'"' -f2)
-USER_PRIVATE_KEY=$(grep -A 10 '\[accounts\]' config/demo.toml | grep 'user_private_key = ' | cut -d'"' -f2)
-RECIPIENT_ADDR=$(grep -A 10 '\[accounts\]' config/demo.toml | grep 'recipient = ' | cut -d'"' -f2)
+# Default to TokenA addresses
+DEFAULT_ORIGIN_TOKEN=$(grep -A 2 '\[contracts.origin\]' config/demo.toml | grep 'tokenA = ' | head -1 | cut -d'"' -f2)
+DEFAULT_DEST_TOKEN=$(grep -A 2 '\[contracts.destination\]' config/demo.toml | grep 'tokenA = ' | head -1 | cut -d'"' -f2)
+TOKENB_ORIGIN=$(grep -A 2 '\[contracts.origin\]' config/demo.toml | grep 'tokenB = ' | head -1 | cut -d'"' -f2)
+TOKENB_DEST=$(grep -A 2 '\[contracts.destination\]' config/demo.toml | grep 'tokenB = ' | head -1 | cut -d'"' -f2)
+USER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'user = ' | head -1 | cut -d'"' -f2)
+USER_PRIVATE_KEY=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'user_private_key = ' | head -1 | cut -d'"' -f2)
+RECIPIENT_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'recipient = ' | head -1 | cut -d'"' -f2)
 
-# Load RPC URLs and chain IDs from config
-ORIGIN_RPC_URL=$(grep -A 10 '\[contracts.origin\]' config/demo.toml | grep 'rpc_url = ' | cut -d'"' -f2)
-DEST_RPC_URL=$(grep -A 10 '\[contracts.destination\]' config/demo.toml | grep 'rpc_url = ' | cut -d'"' -f2)
-ORIGIN_CHAIN_ID=$(grep -A 10 '\[contracts.origin\]' config/demo.toml | grep 'chain_id = ' | head -1 | awk '{print $3}')
-DEST_CHAIN_ID=$(grep -A 10 '\[contracts.destination\]' config/demo.toml | grep 'chain_id = ' | head -1 | awk '{print $3}')
+# Load RPC URLs and chain IDs from delivery config
+ORIGIN_RPC_URL=$(grep -A 2 '\[delivery.providers.origin\]' config/demo.toml | grep 'rpc_url = ' | head -1 | cut -d'"' -f2)
+DEST_RPC_URL=$(grep -A 2 '\[delivery.providers.destination\]' config/demo.toml | grep 'rpc_url = ' | head -1 | cut -d'"' -f2)
+ORIGIN_CHAIN_ID=$(grep -A 3 '\[delivery.providers.origin\]' config/demo.toml | grep 'chain_id = ' | head -1 | awk '{print $3}')
+DEST_CHAIN_ID=$(grep -A 3 '\[delivery.providers.destination\]' config/demo.toml | grep 'chain_id = ' | head -1 | awk '{print $3}')
 
-# API endpoint - can be overridden via command line argument
-# Default: Use solver's /orders API (port 3000) which forwards to discovery service
-# Alternative: Use discovery service directly (port 8081) with --direct flag or custom URL
-if [ "$1" = "--direct" ]; then
-    # Use discovery service directly
+# Parse command line arguments
+ORIGIN_TOKEN_ADDRESS=""
+DEST_TOKEN_ADDRESS=""
+API_MODE=""
+
+# Process arguments
+for arg in "$@"; do
+    if [ "$arg" = "--direct" ]; then
+        API_MODE="direct"
+    elif [ "$arg" = "--help" ]; then
+        API_MODE="help"
+    elif [[ "$arg" =~ ^http ]]; then
+        API_MODE="custom"
+        API_URL="$arg"
+    elif [[ "$arg" =~ ^0x[a-fA-F0-9]{40}$ ]]; then
+        if [ -z "$ORIGIN_TOKEN_ADDRESS" ]; then
+            ORIGIN_TOKEN_ADDRESS="$arg"
+        elif [ -z "$DEST_TOKEN_ADDRESS" ]; then
+            DEST_TOKEN_ADDRESS="$arg"
+        fi
+    fi
+done
+
+# Set default tokens if not provided
+if [ -z "$ORIGIN_TOKEN_ADDRESS" ]; then
+    ORIGIN_TOKEN_ADDRESS="$DEFAULT_ORIGIN_TOKEN"
+fi
+if [ -z "$DEST_TOKEN_ADDRESS" ]; then
+    DEST_TOKEN_ADDRESS="$DEFAULT_DEST_TOKEN"
+fi
+
+# Determine token symbols
+get_token_symbol() {
+    local addr="$1"
+    if [ "$addr" = "$DEFAULT_ORIGIN_TOKEN" ] || [ "$addr" = "$DEFAULT_DEST_TOKEN" ]; then
+        echo "TOKA"
+    elif [ "$addr" = "$TOKENB_ORIGIN" ] || [ "$addr" = "$TOKENB_DEST" ]; then
+        echo "TOKB"
+    else
+        echo "CUSTOM"
+    fi
+}
+
+ORIGIN_SYMBOL=$(get_token_symbol "$ORIGIN_TOKEN_ADDRESS")
+DEST_SYMBOL=$(get_token_symbol "$DEST_TOKEN_ADDRESS")
+
+# Set API endpoint based on mode
+if [ "$API_MODE" = "direct" ]; then
     API_PORT=$(grep -A 10 '\[discovery.sources.offchain_eip7683\]' config/demo.toml | grep 'api_port = ' | awk '{print $3}')
     API_URL="http://localhost:${API_PORT:-8081}/intent"
     echo -e "${YELLOW}Using direct discovery API at $API_URL${NC}"
-elif [ -n "$1" ] && [ "$1" != "--help" ]; then
-    # Use custom URL provided as argument
-    API_URL="$1"
+elif [ "$API_MODE" = "custom" ]; then
     echo -e "${YELLOW}Using custom API URL: $API_URL${NC}"
-else
-    # Default: Use solver's /orders API which forwards to discovery
+elif [ "$API_MODE" != "help" ]; then
+    # Default: Use solver's /orders API
     API_URL="http://localhost:3000/api/orders"
 fi
 
 # Show help if requested
-if [ "$1" = "--help" ]; then
-    echo "Usage: $0 [OPTIONS]"
+if [ "$API_MODE" = "help" ]; then
+    echo "Usage: $0 [origin_token] [dest_token] [OPTIONS]"
+    echo ""
+    echo "Arguments:"
+    echo "  origin_token    Origin token address (default: TokenA)"
+    echo "  dest_token      Destination token address (default: TokenA)"
     echo ""
     echo "Options:"
     echo "  --direct        Use discovery service directly (port 8081)"
@@ -71,9 +126,11 @@ if [ "$1" = "--help" ]; then
     echo "  --help         Show this help message"
     echo ""
     echo "Examples:"
-    echo "  $0                                    # Use default (solver /orders API)"
-    echo "  $0 --direct                          # Use discovery service directly"
-    echo "  $0 http://localhost:8080/api/orders  # Use custom URL"
+    echo "  $0                                    # TokenA → TokenA via solver API"
+    echo "  $0 --direct                          # TokenA → TokenA via discovery"
+    echo "  $0 $DEFAULT_ORIGIN_TOKEN $TOKENB_DEST               # TokenA → TokenB"
+    echo "  $0 $TOKENB_ORIGIN $DEFAULT_DEST_TOKEN               # TokenB → TokenA"
+    echo "  $0 $DEFAULT_ORIGIN_TOKEN $TOKENB_DEST --direct      # TokenA → TokenB via discovery"
     exit 0
 fi
 
@@ -159,7 +216,9 @@ build_order_data
 
 echo -e "${BLUE}📋 Order Details:${NC}"
 echo -e "   User: $USER_ADDR → Recipient: $RECIPIENT_ADDR"
-echo -e "   Amount: 1.0 TEST (Chain $ORIGIN_CHAIN_ID → $DEST_CHAIN_ID)"
+echo -e "   Amount: 1.0 tokens ($ORIGIN_SYMBOL on chain $ORIGIN_CHAIN_ID → $DEST_SYMBOL on chain $DEST_CHAIN_ID)"
+echo -e "   Origin Token: $ORIGIN_TOKEN_ADDRESS"
+echo -e "   Dest Token:   $DEST_TOKEN_ADDRESS"
 echo -e "   Fill Deadline: $(date -r $FILL_DEADLINE 2>/dev/null || date -d @$FILL_DEADLINE)"
 
 echo ""
@@ -335,3 +394,4 @@ fi
 echo ""
 echo -e "${GREEN}🎉 Offchain Intent Submitted!${NC}"
 echo -e "${YELLOW}📡 The solver should discover this intent via the API${NC}"
+echo -e "${BLUE}   Route: $ORIGIN_SYMBOL → $DEST_SYMBOL${NC}"

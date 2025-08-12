@@ -79,13 +79,14 @@ pub type Output = MandateOutput;
 
 /// Hex string serialization helper
 mod hex_string {
+	use crate::with_0x_prefix;
 	use serde::{Deserialize, Deserializer, Serializer};
 
 	pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
 	where
 		S: Serializer,
 	{
-		serializer.serialize_str(&format!("0x{}", hex::encode(bytes)))
+		serializer.serialize_str(&with_0x_prefix(&hex::encode(bytes)))
 	}
 
 	pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>

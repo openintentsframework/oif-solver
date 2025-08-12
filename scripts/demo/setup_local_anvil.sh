@@ -95,17 +95,52 @@ echo
 # Step 3: Deploy contracts
 echo -e "${YELLOW}3. Deploying contracts...${NC}"
 
-# Prepare contract sources
-cat > /tmp/TestToken.sol << 'EOF'
+# Define deploy_permit2 function first
+deploy_permit2() {
+    local chain_name=$1
+    local rpc_url=$2
+    local permit2_address="0x000000000022D473030F116dDEE9F6B43aC78BA3"
+    
+    echo -n "  Deploying Permit2 on $chain_name... "
+    
+    # Check if Permit2 is already deployed
+    local permit2_code=$(cast code $permit2_address --rpc-url $rpc_url 2>&1)
+    if [ "$permit2_code" = "0x" ] || [ -z "$permit2_code" ]; then
+        # Get Permit2 bytecode from mainnet
+        local mainnet_permit2_code=$(cast code $permit2_address --rpc-url https://eth.llamarpc.com 2>/dev/null | grep "^0x" | head -n1)
+        
+        if [ ! -z "$mainnet_permit2_code" ] && [ "$mainnet_permit2_code" != "0x" ]; then
+            # Deploy using mainnet bytecode
+            cast rpc anvil_setCode $permit2_address "$mainnet_permit2_code" --rpc-url $rpc_url > /dev/null 2>&1
+            
+            # Verify deployment
+            local new_code=$(cast code $permit2_address --rpc-url $rpc_url 2>&1)
+            if [ ! -z "$new_code" ] && [ "$new_code" != "0x" ]; then
+                echo -e "${GREEN}✓${NC} $permit2_address"
+            else
+                echo -e "${RED}Failed${NC}"
+                exit 1
+            fi
+        else
+            echo -e "${RED}Failed to fetch Permit2 bytecode from mainnet${NC}"
+            exit 1
+        fi
+    else
+        echo -e "${GREEN}✓${NC} $permit2_address (already deployed)"
+    fi
+}
+
+# Prepare contract sources for TokenA and TokenB
+cat > /tmp/TokenA.sol << 'EOF'
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-contract TestToken {
+contract TokenA {
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
     
-    string public name = "Test Token";
-    string public symbol = "TEST";
+    string public name = "Token A";
+    string public symbol = "TOKA";
     uint8 public decimals = 18;
     uint256 public totalSupply;
     
@@ -144,22 +179,56 @@ contract TestToken {
 }
 EOF
 
-# Deploy contracts on origin chain
-echo -e "${BLUE}=== Origin Chain Deployments ===${NC}"
+cat > /tmp/TokenB.sol << 'EOF'
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
 
-# Deploy token
-echo -n "  Deploying TestToken... "
-TOKEN_OUTPUT=$(~/.foundry/bin/forge create /tmp/TestToken.sol:TestToken \
-    --rpc-url http://localhost:$ORIGIN_PORT \
-    --private-key $PRIVATE_KEY \
-    --broadcast 2>&1)
-TOKEN_ORIGIN=$(echo "$TOKEN_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
-if [ -z "$TOKEN_ORIGIN" ]; then
-    echo -e "${RED}Failed to deploy token${NC}"
-    echo "Full output: $TOKEN_OUTPUT"
-    exit 1
-fi
-echo -e "${GREEN}✓${NC} $TOKEN_ORIGIN"
+contract TokenB {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    
+    string public name = "Token B";
+    string public symbol = "TOKB";
+    uint8 public decimals = 18;
+    uint256 public totalSupply;
+    
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+    
+    function mint(address to, uint256 amount) public {
+        balanceOf[to] += amount;
+        totalSupply += amount;
+        emit Transfer(address(0), to, amount);
+    }
+    
+    function approve(address spender, uint256 amount) public returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        emit Approval(msg.sender, spender, amount);
+        return true;
+    }
+    
+    function transfer(address to, uint256 amount) public returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "Insufficient balance");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        emit Transfer(msg.sender, to, amount);
+        return true;
+    }
+    
+    function transferFrom(address from, address to, uint256 amount) public returns (bool) {
+        require(balanceOf[from] >= amount, "Insufficient balance");
+        require(allowance[from][msg.sender] >= amount, "Insufficient allowance");
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        allowance[from][msg.sender] -= amount;
+        emit Transfer(from, to, amount);
+        return true;
+    }
+}
+EOF
+
+# Clone or update oif-contracts (needed for contracts)
+echo -e "${BLUE}=== Setting up OIF contracts ===${NC}"
 
 # Clone or update oif-contracts to specific commit
 if [ ! -d "oif-contracts" ]; then
@@ -173,139 +242,178 @@ echo -n "  Checking out oif-contracts commit ${OIF_PINNED_COMMIT}... "
 git fetch origin > /dev/null 2>&1
 git checkout ${OIF_PINNED_COMMIT} > /dev/null 2>&1
 echo -e "${GREEN}✓${NC}"
-cd ..
 
-# Deploy Oracle from actual contract
-echo -n "  Deploying AlwaysYesOracle... "
-cd oif-contracts
-ORACLE_OUTPUT=$(~/.foundry/bin/forge create test/mocks/AlwaysYesOracle.sol:AlwaysYesOracle \
+# Deploy contracts in the same order on both chains for deterministic addresses
+echo
+echo -e "${BLUE}=== Deploying Contracts ===${NC}"
+
+# Deploy Permit2 on both chains first
+deploy_permit2 "origin" "http://localhost:$ORIGIN_PORT"
+deploy_permit2 "destination" "http://localhost:$DEST_PORT"
+
+# Deploy TokenA (Contract #1 - same address on both chains)
+echo -n "  Deploying TokenA on both chains... "
+TOKENA_OUTPUT=$(~/.foundry/bin/forge create /tmp/TokenA.sol:TokenA \
     --rpc-url http://localhost:$ORIGIN_PORT \
     --private-key $PRIVATE_KEY \
     --broadcast 2>&1)
-ORACLE=$(echo "$ORACLE_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
-if [ -z "$ORACLE" ]; then
-    echo -e "${RED}Failed to deploy oracle${NC}"
-    echo "Oracle output: $ORACLE_OUTPUT"
+TOKENA=$(echo "$TOKENA_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
+if [ -z "$TOKENA" ]; then
+    echo -e "${RED}Failed on origin${NC}"
     exit 1
 fi
-echo -e "${GREEN}✓${NC} $ORACLE"
 
-# Deploy Permit2 on origin chain
-deploy_permit2() {
-    local chain_name=$1
-    local rpc_url=$2
-    local permit2_address="0x000000000022D473030F116dDEE9F6B43aC78BA3"
-    
-    echo -n "  Deploying Permit2 on $chain_name... "
-    
-    # Check if Permit2 is already deployed
-    local permit2_code=$(cast code $permit2_address --rpc-url $rpc_url 2>&1)
-    if [ "$permit2_code" = "0x" ] || [ -z "$permit2_code" ]; then
-        # Get Permit2 bytecode from mainnet
-        local mainnet_permit2_code=$(cast code $permit2_address --rpc-url https://eth.llamarpc.com 2>/dev/null | grep "^0x" | head -n1)
-        
-        if [ ! -z "$mainnet_permit2_code" ] && [ "$mainnet_permit2_code" != "0x" ]; then
-            # Deploy using mainnet bytecode
-            cast rpc anvil_setCode $permit2_address "$mainnet_permit2_code" --rpc-url $rpc_url > /dev/null 2>&1
-            
-            # Verify deployment
-            local new_code=$(cast code $permit2_address --rpc-url $rpc_url 2>&1)
-            if [ ! -z "$new_code" ] && [ "$new_code" != "0x" ]; then
-                echo -e "${GREEN}✓${NC} $permit2_address"
-            else
-                echo -e "${RED}Failed${NC}"
-                exit 1
-            fi
-        else
-            echo -e "${RED}Failed to fetch Permit2 bytecode from mainnet${NC}"
-            exit 1
-        fi
-    else
-        echo -e "${GREEN}✓${NC} $permit2_address (already deployed)"
-    fi
-}
+TOKENA_DEST_OUTPUT=$(~/.foundry/bin/forge create /tmp/TokenA.sol:TokenA \
+    --rpc-url http://localhost:$DEST_PORT \
+    --private-key $PRIVATE_KEY \
+    --broadcast 2>&1)
+TOKENA_DEST_CHECK=$(echo "$TOKENA_DEST_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
+if [ "$TOKENA" != "$TOKENA_DEST_CHECK" ]; then
+    echo -e "${RED}Address mismatch!${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓${NC} $TOKENA"
 
-# Deploy Permit2 on origin chain
-deploy_permit2 "origin" "http://localhost:$ORIGIN_PORT"
+# Deploy TokenB (Contract #2 - same address on both chains)
+echo -n "  Deploying TokenB on both chains... "
+TOKENB_OUTPUT=$(~/.foundry/bin/forge create /tmp/TokenB.sol:TokenB \
+    --rpc-url http://localhost:$ORIGIN_PORT \
+    --private-key $PRIVATE_KEY \
+    --broadcast 2>&1)
+TOKENB=$(echo "$TOKENB_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
+if [ -z "$TOKENB" ]; then
+    echo -e "${RED}Failed on origin${NC}"
+    exit 1
+fi
 
-# Deploy InputSettlerEscrow
-echo -n "  Deploying InputSettlerEscrow... "
+TOKENB_DEST_OUTPUT=$(~/.foundry/bin/forge create /tmp/TokenB.sol:TokenB \
+    --rpc-url http://localhost:$DEST_PORT \
+    --private-key $PRIVATE_KEY \
+    --broadcast 2>&1)
+TOKENB_DEST_CHECK=$(echo "$TOKENB_DEST_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
+if [ "$TOKENB" != "$TOKENB_DEST_CHECK" ]; then
+    echo -e "${RED}Address mismatch!${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓${NC} $TOKENB"
+
+# Deploy InputSettlerEscrow (Contract #3 - same address on both chains)
+echo -n "  Deploying InputSettlerEscrow on both chains... "
 INPUT_SETTLER_OUTPUT=$(~/.foundry/bin/forge create src/input/escrow/InputSettlerEscrow.sol:InputSettlerEscrow \
     --rpc-url http://localhost:$ORIGIN_PORT \
     --private-key $PRIVATE_KEY \
     --broadcast 2>&1)
 INPUT_SETTLER=$(echo "$INPUT_SETTLER_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
 if [ -z "$INPUT_SETTLER" ]; then
-    echo -e "${RED}Failed to deploy InputSettler${NC}"
-    echo "InputSettler output: $INPUT_SETTLER_OUTPUT"
+    echo -e "${RED}Failed on origin${NC}"
+    exit 1
+fi
+
+INPUT_SETTLER_DEST_OUTPUT=$(~/.foundry/bin/forge create src/input/escrow/InputSettlerEscrow.sol:InputSettlerEscrow \
+    --rpc-url http://localhost:$DEST_PORT \
+    --private-key $PRIVATE_KEY \
+    --broadcast 2>&1)
+INPUT_SETTLER_DEST_CHECK=$(echo "$INPUT_SETTLER_DEST_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
+if [ "$INPUT_SETTLER" != "$INPUT_SETTLER_DEST_CHECK" ]; then
+    echo -e "${RED}Address mismatch!${NC}"
     exit 1
 fi
 echo -e "${GREEN}✓${NC} $INPUT_SETTLER"
 
-# Deploy OutputSettler on destination chain
-echo
-echo -e "${BLUE}=== Destination Chain Deployments ===${NC}"
-
-# Deploy Permit2 on destination chain
-deploy_permit2 "destination" "http://localhost:$DEST_PORT"
-
-echo -n "  Deploying OutputSettler... "
+# Deploy OutputSettler (Contract #4 - same address on both chains)
+echo -n "  Deploying OutputSettler on both chains... "
 OUTPUT_SETTLER_OUTPUT=$(~/.foundry/bin/forge create src/output/coin/OutputSettler7683.sol:OutputInputSettlerEscrow \
-    --rpc-url http://localhost:$DEST_PORT \
+    --rpc-url http://localhost:$ORIGIN_PORT \
     --private-key $PRIVATE_KEY \
     --broadcast 2>&1)
 OUTPUT_SETTLER=$(echo "$OUTPUT_SETTLER_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
 if [ -z "$OUTPUT_SETTLER" ]; then
-    echo -e "${RED}Failed to deploy OutputSettler${NC}"
-    echo "OutputSettler output: $OUTPUT_SETTLER_OUTPUT"
+    echo -e "${RED}Failed on origin${NC}"
+    exit 1
+fi
+
+OUTPUT_SETTLER_DEST_OUTPUT=$(~/.foundry/bin/forge create src/output/coin/OutputSettler7683.sol:OutputInputSettlerEscrow \
+    --rpc-url http://localhost:$DEST_PORT \
+    --private-key $PRIVATE_KEY \
+    --broadcast 2>&1)
+OUTPUT_SETTLER_DEST_CHECK=$(echo "$OUTPUT_SETTLER_DEST_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
+if [ "$OUTPUT_SETTLER" != "$OUTPUT_SETTLER_DEST_CHECK" ]; then
+    echo -e "${RED}Address mismatch!${NC}"
     exit 1
 fi
 echo -e "${GREEN}✓${NC} $OUTPUT_SETTLER"
 
-cd ..
-
-# Deploy token on destination chain
-echo -n "  Deploying TestToken... "
-TOKEN_DEST_OUTPUT=$(~/.foundry/bin/forge create /tmp/TestToken.sol:TestToken \
-    --rpc-url http://localhost:$DEST_PORT \
+# Deploy Oracle only on origin chain (Contract #5 on origin only)
+echo -n "  Deploying AlwaysYesOracle on origin... "
+ORACLE_OUTPUT=$(~/.foundry/bin/forge create test/mocks/AlwaysYesOracle.sol:AlwaysYesOracle \
+    --rpc-url http://localhost:$ORIGIN_PORT \
     --private-key $PRIVATE_KEY \
     --broadcast 2>&1)
-TOKEN_DEST=$(echo "$TOKEN_DEST_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
-if [ -z "$TOKEN_DEST" ]; then
-    echo -e "${RED}Failed to deploy token on destination${NC}"
-    echo "Token output: $TOKEN_DEST_OUTPUT"
+ORACLE=$(echo "$ORACLE_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
+if [ -z "$ORACLE" ]; then
+    echo -e "${RED}Failed${NC}"
     exit 1
 fi
-echo -e "${GREEN}✓${NC} $TOKEN_DEST"
+echo -e "${GREEN}✓${NC} $ORACLE"
+
+cd ..
 
 # Step 4: Setup tokens
 echo
 echo -e "${YELLOW}4. Setting up tokens...${NC}"
 
-# Mint tokens on origin chain (100 to user)
-echo -n "  Minting 100 tokens to user on origin... "
-cast send $TOKEN_ORIGIN "mint(address,uint256)" $USER_ADDRESS 100000000000000000000 \
+# Mint TokenA on origin chain (100 to user)
+echo -n "  Minting 100 TokenA to user on origin... "
+cast send $TOKENA "mint(address,uint256)" $USER_ADDRESS 100000000000000000000 \
     --rpc-url http://localhost:$ORIGIN_PORT \
     --private-key $PRIVATE_KEY > /dev/null
 echo -e "${GREEN}✓${NC}"
 
-# Mint tokens on destination chain (100 to solver)
-echo -n "  Minting 100 tokens to solver on destination... "
-cast send $TOKEN_DEST "mint(address,uint256)" $SOLVER_ADDRESS 100000000000000000000 \
+# Mint TokenA on destination chain (100 to solver)
+echo -n "  Minting 100 TokenA to solver on destination... "
+cast send $TOKENA "mint(address,uint256)" $SOLVER_ADDRESS 100000000000000000000 \
     --rpc-url http://localhost:$DEST_PORT \
     --private-key $PRIVATE_KEY > /dev/null
 echo -e "${GREEN}✓${NC}"
 
-# Approve OutputSettler to spend solver's tokens
-echo -n "  Approving OutputSettler to spend solver's tokens... "
-cast send $TOKEN_DEST "approve(address,uint256)" $OUTPUT_SETTLER 100000000000000000000 \
+# Also mint TokenA to solver on origin chain for bidirectional testing
+echo -n "  Minting 100 TokenA to solver on origin... "
+cast send $TOKENA "mint(address,uint256)" $SOLVER_ADDRESS 100000000000000000000 \
+    --rpc-url http://localhost:$ORIGIN_PORT \
+    --private-key $PRIVATE_KEY > /dev/null
+echo -e "${GREEN}✓${NC}"
+
+# Mint TokenB on origin chain (100 to user)
+echo -n "  Minting 100 TokenB to user on origin... "
+cast send $TOKENB "mint(address,uint256)" $USER_ADDRESS 100000000000000000000 \
+    --rpc-url http://localhost:$ORIGIN_PORT \
+    --private-key $PRIVATE_KEY > /dev/null
+echo -e "${GREEN}✓${NC}"
+
+# Mint TokenB on destination chain (100 to solver)
+echo -n "  Minting 100 TokenB to solver on destination... "
+cast send $TOKENB "mint(address,uint256)" $SOLVER_ADDRESS 100000000000000000000 \
     --rpc-url http://localhost:$DEST_PORT \
     --private-key $PRIVATE_KEY > /dev/null
 echo -e "${GREEN}✓${NC}"
 
-# Approve Permit2 to spend user's tokens on origin chain
-echo -n "  Approving Permit2 to spend user's tokens on origin... "
-cast send $TOKEN_ORIGIN "approve(address,uint256)" $ORIGIN_PERMIT2_ADDRESS "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" \
+# Also mint TokenB to solver on origin chain for bidirectional testing
+echo -n "  Minting 100 TokenB to solver on origin... "
+cast send $TOKENB "mint(address,uint256)" $SOLVER_ADDRESS 100000000000000000000 \
+    --rpc-url http://localhost:$ORIGIN_PORT \
+    --private-key $PRIVATE_KEY > /dev/null
+echo -e "${GREEN}✓${NC}"
+
+# Approve Permit2 to spend user's TokenA on origin chain
+echo -n "  Approving Permit2 to spend user's TokenA on origin... "
+cast send $TOKENA "approve(address,uint256)" $ORIGIN_PERMIT2_ADDRESS "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" \
+    --rpc-url http://localhost:$ORIGIN_PORT \
+    --private-key $USER_PRIVATE_KEY > /dev/null
+echo -e "${GREEN}✓${NC}"
+
+# Approve Permit2 to spend user's TokenB on origin chain
+echo -n "  Approving Permit2 to spend user's TokenB on origin... "
+cast send $TOKENB "approve(address,uint256)" $ORIGIN_PERMIT2_ADDRESS "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" \
     --rpc-url http://localhost:$ORIGIN_PORT \
     --private-key $USER_PRIVATE_KEY > /dev/null
 echo -e "${GREEN}✓${NC}"
@@ -322,6 +430,31 @@ cat > config/demo.toml << EOF
 [solver]
 id = "oif-solver-local-dual-chain"
 monitoring_timeout_minutes = 5
+
+# Networks configuration
+[networks.$ORIGIN_CHAIN_ID]
+input_settler_address = "$INPUT_SETTLER"
+output_settler_address = "$OUTPUT_SETTLER"
+[[networks.$ORIGIN_CHAIN_ID.tokens]]
+address = "$TOKENA"
+symbol = "TOKA"
+decimals = 18
+[[networks.$ORIGIN_CHAIN_ID.tokens]]
+address = "$TOKENB"
+symbol = "TOKB"
+decimals = 18
+
+[networks.$DEST_CHAIN_ID]
+input_settler_address = "$INPUT_SETTLER"
+output_settler_address = "$OUTPUT_SETTLER"
+[[networks.$DEST_CHAIN_ID.tokens]]
+address = "$TOKENA"
+symbol = "TOKA"
+decimals = 18
+[[networks.$DEST_CHAIN_ID.tokens]]
+address = "$TOKENB"
+symbol = "TOKB"
+decimals = 18
 
 [storage]
 primary = "file"
@@ -356,19 +489,17 @@ chain_id = $DEST_CHAIN_ID
 [discovery]
 [discovery.sources.onchain_eip7683]
 rpc_url = "http://localhost:$ORIGIN_PORT"
-settler_addresses = ["$INPUT_SETTLER"]
+chain_id = $ORIGIN_CHAIN_ID
 
 [discovery.sources.offchain_eip7683]
 api_host = "127.0.0.1"
 api_port = 8081
 rpc_url = "http://localhost:8545"
-settler_address = "$INPUT_SETTLER"
 # auth_token = "your-secret-token"
 
 [order]
 [order.implementations.eip7683]
-output_settler_address = "$OUTPUT_SETTLER"
-input_settler_address = "$INPUT_SETTLER"
+# No config needed - uses networks config
 
 [order.execution_strategy]
 strategy_type = "simple"
@@ -404,8 +535,10 @@ max_request_size = 1048576  # 1MB
 [contracts.origin]
 chain_id = $ORIGIN_CHAIN_ID
 rpc_url = "http://localhost:$ORIGIN_PORT"
-token = "$TOKEN_ORIGIN"
+tokenA = "$TOKENA"
+tokenB = "$TOKENB"
 input_settler = "$INPUT_SETTLER"
+output_settler = "$OUTPUT_SETTLER"
 the_compact = "$ORIGIN_COMPACT_ADDRESS"
 permit2 = "$ORIGIN_PERMIT2_ADDRESS"
 oracle = "$ORACLE"
@@ -413,7 +546,9 @@ oracle = "$ORACLE"
 [contracts.destination]
 chain_id = $DEST_CHAIN_ID
 rpc_url = "http://localhost:$DEST_PORT"
-token = "$TOKEN_DEST"
+tokenA = "$TOKENA"
+tokenB = "$TOKENB"
+input_settler = "$INPUT_SETTLER"
 output_settler = "$OUTPUT_SETTLER"
 permit2 = "$DEST_PERMIT2_ADDRESS"
 
@@ -434,20 +569,17 @@ echo -e "${BLUE}🔗 Networks:${NC}"
 echo "  Origin:      http://localhost:$ORIGIN_PORT (chain $ORIGIN_CHAIN_ID)"
 echo "  Destination: http://localhost:$DEST_PORT (chain $DEST_CHAIN_ID)"
 echo
-echo -e "${BLUE}📋 Contracts:${NC}"
-echo "  Origin Chain:"
-echo "    Token:       $TOKEN_ORIGIN"
-echo "    InputSettler: $INPUT_SETTLER"
-echo "    Oracle:      $ORACLE"
-echo "    Permit2:     $ORIGIN_PERMIT2_ADDRESS"
-echo "  Destination Chain:"
-echo "    Token:       $TOKEN_DEST"
-echo "    OutputSettler: $OUTPUT_SETTLER"
-echo "    Permit2:     $DEST_PERMIT2_ADDRESS"
+echo -e "${BLUE}📋 Contracts (same addresses on both chains):${NC}"
+echo "  TokenA:        $TOKENA"
+echo "  TokenB:        $TOKENB"
+echo "  InputSettler:  $INPUT_SETTLER"
+echo "  OutputSettler: $OUTPUT_SETTLER"
+echo "  Oracle:        $ORACLE (origin only)"
+echo "  Permit2:       $ORIGIN_PERMIT2_ADDRESS"
 echo
 echo -e "${BLUE}💰 Token Balances:${NC}"
-echo "  User:   100 TEST on origin chain (Permit2 approved)"
-echo "  Solver: 100 TEST on destination chain"
+echo "  User:   100 TOKA and 100 TOKB on origin chain (Permit2 approved)"
+echo "  Solver: 100 TOKA and 100 TOKB on both chains"
 echo
 echo -e "${BLUE}📋 Configuration:${NC}"
 echo "  Config file: config/demo.toml"

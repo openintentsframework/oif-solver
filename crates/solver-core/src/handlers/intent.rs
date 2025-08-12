@@ -3,15 +3,15 @@
 //! Responsible for validating intents, creating orders, storing them,
 //! and determining execution strategy through the order service.
 
-use crate::engine::{context::ContextBuilder, event_bus::EventBus};
+use crate::engine::{context::ContextBuilder, event_bus::EventBus, token_manager::TokenManager};
 use crate::state::OrderStateMachine;
-use crate::utils::truncate_id;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
 use solver_order::OrderService;
 use solver_storage::StorageService;
 use solver_types::{
-	Address, DiscoveryEvent, ExecutionDecision, Intent, OrderEvent, SolverEvent, StorageKey,
+	truncate_id, Address, DiscoveryEvent, ExecutionDecision, Intent, OrderEvent, SolverEvent,
+	StorageKey,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -43,10 +43,12 @@ pub struct IntentHandler {
 	event_bus: EventBus,
 	delivery: Arc<DeliveryService>,
 	solver_address: Address,
+	token_manager: Arc<TokenManager>,
 	config: Config,
 }
 
 impl IntentHandler {
+	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		order_service: Arc<OrderService>,
 		storage: Arc<StorageService>,
@@ -54,6 +56,7 @@ impl IntentHandler {
 		event_bus: EventBus,
 		delivery: Arc<DeliveryService>,
 		solver_address: Address,
+		token_manager: Arc<TokenManager>,
 		config: Config,
 	) -> Self {
 		Self {
@@ -63,6 +66,7 @@ impl IntentHandler {
 			event_bus,
 			delivery,
 			solver_address,
+			token_manager,
 			config,
 		}
 	}
@@ -126,6 +130,7 @@ impl IntentHandler {
 				let builder = ContextBuilder::new(
 					self.delivery.clone(),
 					self.solver_address.clone(),
+					self.token_manager.clone(),
 					self.config.clone(),
 				);
 				let context = builder

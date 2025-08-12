@@ -13,8 +13,8 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_transport_http::Http;
 use async_trait::async_trait;
 use solver_types::{
-	ConfigSchema, Field, FieldType, Schema, Signature, Transaction as SolverTransaction,
-	TransactionHash, TransactionReceipt,
+	with_0x_prefix, ConfigSchema, Field, FieldType, Schema, Signature,
+	Transaction as SolverTransaction, TransactionHash, TransactionReceipt,
 };
 use std::sync::Arc;
 
@@ -54,6 +54,10 @@ impl AlloyDelivery {
 			.with_recommended_fillers()
 			.wallet(wallet)
 			.on_http(url);
+
+		provider
+			.client()
+			.set_poll_interval(std::time::Duration::from_secs(7));
 
 		Ok(Self {
 			provider: Arc::new(provider),
@@ -143,7 +147,7 @@ impl DeliveryInterface for AlloyDelivery {
 
 		// Get the transaction hash
 		let tx_hash = *pending_tx.tx_hash();
-		let hash_str = hex::encode(tx_hash.0);
+		let hash_str = with_0x_prefix(&hex::encode(tx_hash.0));
 		tracing::info!(tx_hash = %hash_str, "Submitted transaction");
 
 		Ok(TransactionHash(tx_hash.0.to_vec()))
@@ -312,6 +316,54 @@ impl DeliveryInterface for AlloyDelivery {
 				Ok(balance.to_string())
 			}
 		}
+	}
+
+	async fn get_allowance(
+		&self,
+		owner: &str,
+		spender: &str,
+		token_address: &str,
+	) -> Result<String, DeliveryError> {
+		let owner_addr: Address = owner
+			.parse()
+			.map_err(|e| DeliveryError::Network(format!("Invalid owner address: {}", e)))?;
+
+		let spender_addr: Address = spender
+			.parse()
+			.map_err(|e| DeliveryError::Network(format!("Invalid spender address: {}", e)))?;
+
+		let token_addr: Address = token_address
+			.parse()
+			.map_err(|e| DeliveryError::Network(format!("Invalid token address: {}", e)))?;
+
+		// Create the allowance call data
+		// allowance(address,address) selector is 0xdd62ed3e
+		let selector = [0xdd, 0x62, 0xed, 0x3e];
+		let mut call_data = Vec::new();
+		call_data.extend_from_slice(&selector);
+		call_data.extend_from_slice(&[0; 12]); // Pad owner address to 32 bytes
+		call_data.extend_from_slice(owner_addr.as_slice());
+		call_data.extend_from_slice(&[0; 12]); // Pad spender address to 32 bytes
+		call_data.extend_from_slice(spender_addr.as_slice());
+
+		let call_request = TransactionRequest::default()
+			.to(token_addr)
+			.input(call_data.into());
+
+		let call_result = self
+			.provider
+			.call(&call_request)
+			.await
+			.map_err(|e| DeliveryError::Network(format!("Failed to call allowance: {}", e)))?;
+
+		if call_result.len() < 32 {
+			return Err(DeliveryError::Network(
+				"Invalid allowance response".to_string(),
+			));
+		}
+
+		let allowance = U256::from_be_slice(&call_result[..32]);
+		Ok(allowance.to_string())
 	}
 
 	async fn get_nonce(&self, address: &str) -> Result<u64, DeliveryError> {

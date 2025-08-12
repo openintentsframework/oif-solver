@@ -4,10 +4,9 @@
 //! publishing appropriate events to the event bus for further processing.
 
 use crate::engine::event_bus::EventBus;
-use crate::utils::truncate_id;
 use alloy_primitives::hex;
 use solver_delivery::{DeliveryError, DeliveryService};
-use solver_types::{DeliveryEvent, SolverEvent, TransactionHash, TransactionType};
+use solver_types::{truncate_id, DeliveryEvent, SolverEvent, TransactionHash, TransactionType};
 use std::sync::Arc;
 use tracing::instrument;
 

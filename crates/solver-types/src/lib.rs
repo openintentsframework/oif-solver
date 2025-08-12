@@ -14,12 +14,16 @@ pub mod delivery;
 pub mod discovery;
 /// Event types for inter-service communication.
 pub mod events;
+/// Network and token configuration types.
+pub mod networks;
 /// Order processing types including intents, orders, and execution contexts.
 pub mod order;
 /// Standard-specific types for different cross-chain protocols.
 pub mod standards;
 /// Storage types for managing persistent data.
 pub mod storage;
+/// Utility functions for common type conversions.
+pub mod utils;
 /// Configuration validation types for ensuring type-safe configurations.
 pub mod validation;
 
@@ -29,10 +33,14 @@ pub use api::*;
 pub use delivery::*;
 pub use discovery::*;
 pub use events::*;
+pub use networks::{NetworkConfig, NetworksConfig, TokenConfig};
 pub use order::*;
 pub use standards::{
 	eip7683::{Eip7683OrderData, Output as Eip7683Output},
 	eip7930::{InteropAddress, InteropAddressError},
 };
 pub use storage::*;
+pub use utils::{
+	bytes32_to_address, format_token_amount, truncate_id, with_0x_prefix, without_0x_prefix,
+};
 pub use validation::*;

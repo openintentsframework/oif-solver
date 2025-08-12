@@ -92,6 +92,17 @@ pub trait DeliveryInterface: Send + Sync {
 		token: Option<&str>,
 	) -> Result<String, DeliveryError>;
 
+	/// Gets the ERC-20 token allowance for an owner-spender pair.
+	///
+	/// Returns the amount of tokens that the spender is allowed to transfer
+	/// on behalf of the owner, as a decimal string.
+	async fn get_allowance(
+		&self,
+		owner: &str,
+		spender: &str,
+		token_address: &str,
+	) -> Result<String, DeliveryError>;
+
 	/// Gets the current nonce for an address.
 	///
 	/// Returns the next valid nonce for transaction submission.
@@ -277,6 +288,24 @@ impl DeliveryService {
 			.ok_or(DeliveryError::NoProviderAvailable)?;
 
 		provider.get_nonce(address).await
+	}
+
+	/// Gets the ERC-20 token allowance for an owner-spender pair on a specific chain.
+	///
+	/// Convenience method that routes to the appropriate provider.
+	pub async fn get_allowance(
+		&self,
+		chain_id: u64,
+		owner: &str,
+		spender: &str,
+		token_address: &str,
+	) -> Result<String, DeliveryError> {
+		let provider = self
+			.providers
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoProviderAvailable)?;
+
+		provider.get_allowance(owner, spender, token_address).await
 	}
 
 	/// Gets the current gas price from the first available provider.

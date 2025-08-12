@@ -43,12 +43,12 @@ load_config() {
     INPUT_SETTLER_ADDRESS=$(grep 'input_settler_address = ' config/demo.toml | cut -d'"' -f2)
     OUTPUT_SETTLER_ADDRESS=$(grep 'output_settler_address = ' config/demo.toml | cut -d'"' -f2)
     ORACLE_ADDRESS=$(grep 'oracle_address = ' config/demo.toml | cut -d'"' -f2)
-    ORIGIN_TOKEN_ADDRESS=$(grep -A 10 '\[contracts.origin\]' config/demo.toml | grep 'token = ' | cut -d'"' -f2)
-    DEST_TOKEN_ADDRESS=$(grep -A 10 '\[contracts.destination\]' config/demo.toml | grep 'token = ' | cut -d'"' -f2)
-    USER_ADDR=$(grep -A 10 '\[accounts\]' config/demo.toml | grep 'user = ' | cut -d'"' -f2)
-    RECIPIENT_ADDR=$(grep -A 10 '\[accounts\]' config/demo.toml | grep 'recipient = ' | cut -d'"' -f2)
-    SOLVER_KEY=$(grep 'solver_private_key = ' config/demo.toml | cut -d'"' -f2)
-    SOLVER_ADDR=$(grep -A 10 '\[accounts\]' config/demo.toml | grep 'solver = ' | cut -d'"' -f2)
+    ORIGIN_TOKEN_ADDRESS=$(grep -A 2 '\[contracts.origin\]' config/demo.toml | grep 'tokenA = ' | head -1 | cut -d'"' -f2)
+    DEST_TOKEN_ADDRESS=$(grep -A 2 '\[contracts.destination\]' config/demo.toml | grep 'tokenA = ' | head -1 | cut -d'"' -f2)
+    USER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'user = ' | head -1 | cut -d'"' -f2)
+    RECIPIENT_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'recipient = ' | head -1 | cut -d'"' -f2)
+    SOLVER_KEY=$(grep 'solver_private_key = ' config/demo.toml | head -1 | cut -d'"' -f2)
+    SOLVER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'solver = ' | head -1 | cut -d'"' -f2)
 }
 
 # Extract and display contract metadata using forge inspect

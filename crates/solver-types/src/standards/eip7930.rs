@@ -16,6 +16,7 @@
 //!                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Address:              20 bytes of ethereum address
 //! ```
 
+use crate::with_0x_prefix;
 use alloy_primitives::Address;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -167,7 +168,7 @@ impl InteropAddress {
 
 	/// Convert to hex string with 0x prefix
 	pub fn to_hex(&self) -> String {
-		format!("0x{}", hex::encode(self.to_bytes()))
+		with_0x_prefix(&hex::encode(self.to_bytes()))
 	}
 
 	/// Extract Ethereum chain ID (only works for EIP155 addresses)

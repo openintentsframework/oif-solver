@@ -167,43 +167,110 @@ The solver uses TOML configuration files. See `config/example.toml` for a comple
 ```toml
 # Solver identity and settings
 [solver]
-id = "my-solver"
+id = "oif-solver-local"
 monitoring_timeout_minutes = 5
 
-# Storage backend configuration
+# Networks configuration - defines supported chains and tokens
+[networks.31337]  # Origin chain
+input_settler_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+output_settler_address = "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"
+[[networks.31337.tokens]]
+address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+symbol = "TOKA"
+decimals = 18
+[[networks.31337.tokens]]
+address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+symbol = "TOKB"
+decimals = 18
+
+[networks.31338]  # Destination chain
+input_settler_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+output_settler_address = "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"
+[[networks.31338.tokens]]
+address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+symbol = "TOKA"
+decimals = 18
+
+# Storage configuration with TTL management
 [storage]
-backend = "file"
-[storage.config]
+primary = "file"
+cleanup_interval_seconds = 3600
+
+[storage.implementations.file]
 storage_path = "./data/storage"
+ttl_orders = 0                  # Permanent
+ttl_intents = 86400             # 24 hours
+ttl_order_by_tx_hash = 86400    # 24 hours
 
 # Account management
 [account]
 provider = "local"
 [account.config]
-private_key = "0x..."
+private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 
 # Delivery providers for different chains
 [delivery]
 min_confirmations = 1
 [delivery.providers.origin]
 rpc_url = "http://localhost:8545"
+private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 chain_id = 31337
 
-# Discovery sources
+[delivery.providers.destination]
+rpc_url = "http://localhost:8546"
+private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+chain_id = 31338
+
+# Discovery sources for finding intents
 [discovery.sources.onchain_eip7683]
 rpc_url = "http://localhost:8545"
-settler_addresses = ["0x..."]
+chain_id = 31337
 
-# Order processing
+[discovery.sources.offchain_eip7683]
+api_host = "127.0.0.1"
+api_port = 8081
+rpc_url = "http://localhost:8545"
+
+# Order execution strategy
+[order]
 [order.implementations.eip7683]
-output_settler_address = "0x..."
+# Uses networks config for settler addresses
+
 [order.execution_strategy]
 strategy_type = "simple"
+[order.execution_strategy.config]
+max_gas_price_gwei = 100
 
 # Settlement configuration
+[settlement]
+[settlement.domain]
+chain_id = 1  # For EIP-712 signatures
+address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+
 [settlement.implementations.eip7683]
 rpc_url = "http://localhost:8546"
+oracle_address = "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"
+dispute_period_seconds = 1
+
+# API server (optional)
+[api]
+enabled = true
+host = "127.0.0.1"
+port = 3000
+timeout_seconds = 30
+max_request_size = 1048576  # 1MB
 ```
+
+### Key Configuration Sections
+
+- **networks**: Defines supported chains with their settler contracts and available tokens
+- **storage**: Configures persistence backend with TTL for different data types
+- **account**: Manages signing keys for the solver
+- **delivery**: RPC endpoints and keys for submitting transactions to each chain
+- **discovery**: Sources for discovering new intents (on-chain events, off-chain APIs)
+- **order**: Execution strategy and protocol-specific settings
+- **settlement**: Configuration for claiming rewards and handling disputes
+- **api**: Optional REST API server for receiving off-chain intents
 
 ### Running with Custom Configuration
 
@@ -214,6 +281,58 @@ cargo run -- --config path/to/your/config.toml
 # Using environment variable
 CONFIG_FILE=path/to/your/config.toml cargo run
 ```
+
+## API Reference
+
+The solver provides a REST API for interacting with the system and submitting off-chain intents. Full OpenAPI specifications are available in the `api-spec/` directory.
+
+### API Specifications
+
+- **Orders API**: [`api-spec/orders-api.yaml`](api-spec/orders-api.yaml) - Submit and track cross-chain intent orders
+- **Tokens API**: [`api-spec/tokens-api.yaml`](api-spec/tokens-api.yaml) - Query supported tokens and networks
+
+### Available Endpoints
+
+#### Orders
+
+- **POST `/api/orders`** - Submit a new EIP-7683 intent order
+  - Request body: `{ order: "0x...", sponsor: "0x...", signature: "0x00..." }`
+  - Returns: `{ status: "success", order_id: "...", message: null }`
+
+- **GET `/api/orders/{id}`** - Get order status and details
+  - Returns complete order information including status, amounts, settlement data, and fill transaction
+
+#### Tokens
+
+- **GET `/api/tokens`** - Get all supported tokens across all networks
+  - Returns a map of chain IDs to network configurations with supported tokens
+
+- **GET `/api/tokens/{chain_id}`** - Get supported tokens for a specific chain
+  - Returns network configuration including settler addresses and token list
+
+### Example Usage
+
+```bash
+# Submit an off-chain intent order
+curl -X POST http://localhost:3000/api/orders \
+  -H "Content-Type: application/json" \
+  -d '{
+    "order": "0x...",
+    "sponsor": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+    "signature": "0x00..."
+  }'
+
+# Check order status
+curl http://localhost:3000/api/orders/1fa518079ecf01372290adf75c55858771efcbcee080594cc8bc24e3309a3a09
+
+# Get supported tokens for chain 31338
+curl http://localhost:3000/api/tokens/31338
+
+# Get all supported tokens
+curl http://localhost:3000/api/tokens
+```
+
+The API server is enabled by default on port 3000 when the solver is running. You can disable it or change the port in the configuration file.
 
 ### Logging Configuration
 
@@ -276,11 +395,11 @@ This script will:
 1. Start two Anvil instances:
    - Origin chain (ID: 31337) on port 8545
    - Destination chain (ID: 31338) on port 8546
-2. Deploy test tokens on both chains
+2. Deploy two test tokens (TokenA and TokenB) on both chains
 3. Deploy settler contracts (InputSettler, OutputSettler)
 4. Create a `config/demo.toml` configuration file
-5. Fund test accounts with tokens
-6. Approves token spend for settler contracts
+5. Fund test accounts with both tokens
+6. Approve token spending for settler contracts
 
 ### Step 2: Start the Solver Service
 
@@ -307,23 +426,48 @@ The solver will:
 
 In another terminal, execute the send intent script to create and observe a cross-chain intent:
 
+#### On-Chain Intents
+
 ```bash
-# Send a cross-chain intent
+# Send with default tokens (TokenA → TokenA)
 ./scripts/demo/send_onchain_intent.sh
+
+# Send with specific token routing
+./scripts/demo/send_onchain_intent.sh <origin_token> <dest_token>
+
+# Examples of cross-token swaps:
+# TokenA on origin → TokenB on destination
+./scripts/demo/send_onchain_intent.sh 0x5FbDB2315678afecb367f032d93F642f64180aa3 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512
+
+# TokenB on origin → TokenA on destination
+./scripts/demo/send_onchain_intent.sh 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512 0x5FbDB2315678afecb367f032d93F642f64180aa3
+
+# Check all token balances
+./scripts/demo/send_onchain_intent.sh balances
 ```
 
-This script will:
+#### Off-Chain Intents (Gasless)
 
-1. Show initial balances on both chains
+```bash
+# Send with default tokens (TokenA → TokenA)
+./scripts/demo/send_offchain_intent.sh
+
+# Send with specific token routing
+./scripts/demo/send_offchain_intent.sh <origin_token> <dest_token>
+
+# Use direct discovery API
+./scripts/demo/send_offchain_intent.sh --direct
+
+# Combine token routing with direct API
+./scripts/demo/send_offchain_intent.sh 0x5FbDB2315678afecb367f032d93F642f64180aa3 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512 --direct
+```
+
+The scripts will:
+
+1. Show initial balances for the relevant tokens
 2. Create a cross-chain intent (user deposits tokens on origin chain)
 3. Wait for the solver to discover and fill the intent
 4. Show final balances demonstrating successful execution
-
-You can also check balances at any time using:
-
-```bash
-./scripts/demo/send_onchain_intent.sh balances
-```
 
 ### What the Demo Demonstrates
 
@@ -331,6 +475,8 @@ You can also check balances at any time using:
 2. **Discovery**: The solver detects the new intent through event monitoring
 3. **Execution**: The solver fills the intent on the destination chain
 4. **Settlement**: The solver claims rewards by providing attestations
+5. **Multi-Token Support**: Solver can handle different token pairs (TokenA → TokenA, TokenA → TokenB, etc.)
+6. **Cross-Token Swaps**: Demonstrates atomic swaps between different tokens across chains
 
 ### Monitoring the Demo
 

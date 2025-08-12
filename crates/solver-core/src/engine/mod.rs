@@ -7,7 +7,9 @@
 pub mod context;
 pub mod event_bus;
 pub mod lifecycle;
+pub mod token_manager;
 
+use self::token_manager::TokenManager;
 use crate::handlers::{IntentHandler, OrderHandler, SettlementHandler, TransactionHandler};
 use crate::state::OrderStateMachine;
 use solver_account::AccountService;
@@ -60,6 +62,9 @@ pub struct SolverEngine {
 	/// Settlement service for monitoring and claiming.
 	#[allow(dead_code)]
 	pub(crate) settlement: Arc<SettlementService>,
+	/// Token manager for token approvals and validation.
+	#[allow(dead_code)]
+	pub(crate) token_manager: Arc<TokenManager>,
 	/// Event bus for inter-service communication.
 	pub(crate) event_bus: event_bus::EventBus,
 	/// Order state machine
@@ -94,6 +99,7 @@ impl SolverEngine {
 		order: Arc<OrderService>,
 		settlement: Arc<SettlementService>,
 		event_bus: event_bus::EventBus,
+		token_manager: Arc<TokenManager>,
 	) -> Self {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 
@@ -104,6 +110,7 @@ impl SolverEngine {
 			event_bus.clone(),
 			delivery.clone(),
 			solver_address,
+			token_manager.clone(),
 			config.clone(),
 		));
 
@@ -141,6 +148,7 @@ impl SolverEngine {
 			discovery,
 			order,
 			settlement,
+			token_manager,
 			event_bus,
 			state_machine,
 			intent_handler,
@@ -302,6 +310,11 @@ impl SolverEngine {
 	/// Returns a reference to the storage service.
 	pub fn storage(&self) -> &Arc<StorageService> {
 		&self.storage
+	}
+
+	/// Returns a reference to the token manager.
+	pub fn token_manager(&self) -> &Arc<TokenManager> {
+		&self.token_manager
 	}
 
 	/// Helper method to spawn handler tasks with semaphore-based concurrency control.
