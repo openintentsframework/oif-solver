@@ -31,7 +31,6 @@ pub struct Lock {
 #[serde(rename_all = "kebab-case")]
 pub enum LockKind {
 	TheCompact,
-	Rhinestone,
 }
 
 /// Available input with lock information and user
@@ -325,6 +324,8 @@ pub enum QuoteError {
 	InvalidRequest(String),
 	#[error("Unsupported asset: {0}")]
 	UnsupportedAsset(String),
+	#[error("Unsupported settlement: {0}")]
+	UnsupportedSettlement(String),
 	#[error("Insufficient liquidity for requested amount")]
 	InsufficientLiquidity,
 	#[error("Solver capacity exceeded")]
@@ -345,6 +346,11 @@ impl From<QuoteError> for APIError {
 				error_type: "UNSUPPORTED_ASSET".to_string(),
 				message: format!("Asset not supported by solver: {}", asset),
 				details: Some(serde_json::json!({ "asset": asset })),
+			},
+			QuoteError::UnsupportedSettlement(msg) => APIError::UnprocessableEntity {
+				error_type: "UNSUPPORTED_SETTLEMENT".to_string(),
+				message: msg,
+				details: None,
 			},
 			QuoteError::InsufficientLiquidity => APIError::UnprocessableEntity {
 				error_type: "INSUFFICIENT_LIQUIDITY".to_string(),

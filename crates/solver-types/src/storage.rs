@@ -14,6 +14,8 @@ pub enum StorageKey {
 	Intents,
 	/// Key for mapping transaction hashes to order IDs
 	OrderByTxHash,
+	/// Key for storing quote data
+	Quotes,
 }
 
 impl StorageKey {
@@ -23,12 +25,13 @@ impl StorageKey {
 			StorageKey::Orders => "orders",
 			StorageKey::Intents => "intents",
 			StorageKey::OrderByTxHash => "order_by_tx_hash",
+			StorageKey::Quotes => "quotes",
 		}
 	}
 
 	/// Returns an iterator over all StorageKey variants.
 	pub fn all() -> impl Iterator<Item = Self> {
-		[Self::Orders, Self::Intents, Self::OrderByTxHash].into_iter()
+		[Self::Orders, Self::Intents, Self::OrderByTxHash, Self::Quotes].into_iter()
 	}
 }
 
@@ -40,6 +43,7 @@ impl FromStr for StorageKey {
 			"orders" => Ok(Self::Orders),
 			"intents" => Ok(Self::Intents),
 			"order_by_tx_hash" => Ok(Self::OrderByTxHash),
+			"quotes" => Ok(Self::Quotes),
 			_ => Err(()),
 		}
 	}
