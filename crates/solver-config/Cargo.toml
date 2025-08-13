@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 solver-types = { path = "../solver-types" }
 thiserror = "1.0"

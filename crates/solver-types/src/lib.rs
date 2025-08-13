@@ -18,6 +18,8 @@ pub mod events;
 pub mod networks;
 /// Order processing types including intents, orders, and execution contexts.
 pub mod order;
+/// Secure string type for handling sensitive data.
+pub mod secret_string;
 /// Standard-specific types for different cross-chain protocols.
 pub mod standards;
 /// Storage types for managing persistent data.
@@ -35,6 +37,7 @@ pub use discovery::*;
 pub use events::*;
 pub use networks::{NetworkConfig, NetworksConfig, TokenConfig};
 pub use order::*;
+pub use secret_string::SecretString;
 pub use standards::{
 	eip7683::{Eip7683OrderData, Output as Eip7683Output},
 	eip7930::{InteropAddress, InteropAddressError},

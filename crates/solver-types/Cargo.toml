@@ -15,5 +15,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 toml = { workspace = true }
+zeroize = { version = "1.8", features = ["derive"] }
 
 

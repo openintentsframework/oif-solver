@@ -12,18 +12,20 @@ use alloy_rpc_types::BlockTransactionsKind;
 use alloy_transport_http::Http;
 use async_trait::async_trait;
 use solver_types::{
-	ConfigSchema, Eip7683OrderData, Field, FieldType, FillProof, Order, Schema, TransactionHash,
+	ConfigSchema, Eip7683OrderData, Field, FieldType, FillProof, NetworksConfig, Order, Schema,
+	TransactionHash,
 };
+use std::collections::HashMap;
 
 /// Direct settlement implementation.
 ///
 /// This implementation validates fills by checking transaction receipts
 /// and manages dispute periods before allowing claims.
 pub struct DirectSettlement {
-	/// The Alloy provider for blockchain interaction.
-	provider: RootProvider<Http<reqwest::Client>>,
-	/// Oracle address for attestation verification.
-	oracle_address: String,
+	/// RPC providers for each supported network.
+	providers: HashMap<u64, RootProvider<Http<reqwest::Client>>>,
+	/// Oracle addresses for each network (network_id -> oracle_address).
+	oracle_addresses: HashMap<u64, String>,
 	/// Dispute period duration in seconds.
 	dispute_period_seconds: u64,
 }
@@ -31,27 +33,50 @@ pub struct DirectSettlement {
 impl DirectSettlement {
 	/// Creates a new DirectSettlement instance.
 	///
-	/// Configures settlement validation with the specified oracle address
+	/// Configures settlement validation with multiple networks, oracle addresses,
 	/// and dispute period.
 	pub async fn new(
-		rpc_url: &str,
-		oracle_address: String,
+		network_ids: Vec<u64>,
+		networks: &NetworksConfig,
+		oracle_addresses: HashMap<u64, String>,
 		dispute_period_seconds: u64,
 	) -> Result<Self, SettlementError> {
-		// Create provider
-		let provider =
-			RootProvider::new_http(rpc_url.parse().map_err(|e| {
-				SettlementError::ValidationFailed(format!("Invalid RPC URL: {}", e))
+		// Create RPC providers for each supported network
+		let mut providers = HashMap::new();
+
+		for network_id in &network_ids {
+			let network = networks.get(network_id).ok_or_else(|| {
+				SettlementError::ValidationFailed(format!(
+					"Network {} not found in configuration",
+					network_id
+				))
+			})?;
+
+			let provider = RootProvider::new_http(network.rpc_url.parse().map_err(|e| {
+				SettlementError::ValidationFailed(format!(
+					"Invalid RPC URL for network {}: {}",
+					network_id, e
+				))
 			})?);
 
-		// Parse oracle address
-		let oracle = oracle_address.parse::<AlloyAddress>().map_err(|e| {
-			SettlementError::ValidationFailed(format!("Invalid oracle address: {}", e))
-		})?;
+			providers.insert(*network_id, provider);
+		}
+
+		// Validate oracle addresses
+		let mut validated_oracle_addresses = HashMap::new();
+		for (network_id, oracle_address) in oracle_addresses {
+			let oracle = oracle_address.parse::<AlloyAddress>().map_err(|e| {
+				SettlementError::ValidationFailed(format!(
+					"Invalid oracle address for network {}: {}",
+					network_id, e
+				))
+			})?;
+			validated_oracle_addresses.insert(network_id, oracle.to_string());
+		}
 
 		Ok(Self {
-			provider,
-			oracle_address: oracle.to_string(),
+			providers,
+			oracle_addresses: validated_oracle_addresses,
 			dispute_period_seconds,
 		})
 	}
@@ -60,35 +85,55 @@ impl DirectSettlement {
 /// Configuration schema for DirectSettlement.
 pub struct DirectSettlementSchema;
 
+impl DirectSettlementSchema {
+	/// Static validation method for use before instance creation
+	pub fn validate_config(config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+		let instance = Self;
+		instance.validate(config)
+	}
+}
+
 impl ConfigSchema for DirectSettlementSchema {
 	fn validate(&self, config: &toml::Value) -> Result<(), solver_types::ValidationError> {
 		let schema = Schema::new(
 			// Required fields
 			vec![
-				Field::new("rpc_url", FieldType::String).with_validator(|value| {
-					match value.as_str() {
-						Some(url) => {
-							if url.starts_with("http://") || url.starts_with("https://") {
-								Ok(())
+				Field::new(
+					"network_ids",
+					FieldType::Array(Box::new(FieldType::Integer {
+						min: Some(1),
+						max: None,
+					})),
+				),
+				Field::new(
+					"oracle_addresses",
+					FieldType::Table(Schema::new(
+						vec![], // No required fields - network IDs are dynamic
+						vec![], // No optional fields - all entries should be valid addresses
+					)),
+				)
+				.with_validator(|value| {
+					// Validate that all values in the table are valid Ethereum addresses
+					if let Some(table) = value.as_table() {
+						for (network_id, address_value) in table {
+							if let Some(addr) = address_value.as_str() {
+								if addr.len() != 42 || !addr.starts_with("0x") {
+									return Err(format!(
+										"oracle_addresses.{} must be a valid Ethereum address",
+										network_id
+									));
+								}
 							} else {
-								Err("RPC URL must start with http:// or https://".to_string())
+								return Err(format!(
+									"oracle_addresses.{} must be a string",
+									network_id
+								));
 							}
 						}
-						None => Err("Expected string value for rpc_url".to_string()),
-					}
-				}),
-				Field::new("oracle_address", FieldType::String).with_validator(|value| match value
-					.as_str()
-				{
-					Some(addr) => {
-						if addr.len() != 42 || !addr.starts_with("0x") {
-							return Err(
-								"oracle_address must be a valid Ethereum address".to_string()
-							);
-						}
 						Ok(())
+					} else {
+						Err("oracle_addresses must be a table".to_string())
 					}
-					None => Err("Expected string value for oracle_address".to_string()),
 				}),
 			],
 			// Optional fields
@@ -120,12 +165,45 @@ impl SettlementInterface for DirectSettlement {
 		order: &Order,
 		tx_hash: &TransactionHash,
 	) -> Result<FillProof, SettlementError> {
+		// Parse order data to get the destination chain ID
+		let order_data: Eip7683OrderData =
+			serde_json::from_value(order.data.clone()).map_err(|e| {
+				SettlementError::ValidationFailed(format!("Failed to parse order data: {}", e))
+			})?;
+
+		// Get the destination chain ID from the first output
+		// Note: For now we assume all outputs are on the same chain
+		let destination_chain_id = order_data
+			.outputs
+			.first()
+			.ok_or_else(|| SettlementError::ValidationFailed("No outputs in order".to_string()))?
+			.chain_id
+			.to::<u64>();
+
+		// Get the appropriate provider for this chain
+		let provider = self.providers.get(&destination_chain_id).ok_or_else(|| {
+			SettlementError::ValidationFailed(format!(
+				"No provider configured for chain {}",
+				destination_chain_id
+			))
+		})?;
+
+		// Get the oracle address for this chain
+		let oracle_address = self
+			.oracle_addresses
+			.get(&destination_chain_id)
+			.ok_or_else(|| {
+				SettlementError::ValidationFailed(format!(
+					"No oracle address configured for chain {}",
+					destination_chain_id
+				))
+			})?;
+
 		// Convert tx hash
 		let hash = FixedBytes::<32>::from_slice(&tx_hash.0);
 
 		// Get transaction receipt
-		let receipt = self
-			.provider
+		let receipt = provider
 			.get_transaction_receipt(hash)
 			.await
 			.map_err(|e| {
@@ -144,15 +222,8 @@ impl SettlementInterface for DirectSettlement {
 
 		let tx_block = receipt.block_number.unwrap_or(0);
 
-		// Parse order data to get order ID
-		let order_data: Eip7683OrderData =
-			serde_json::from_value(order.data.clone()).map_err(|e| {
-				SettlementError::ValidationFailed(format!("Failed to parse order data: {}", e))
-			})?;
-
 		// Get the block timestamp
-		let block = self
-			.provider
+		let block = provider
 			.get_block_by_number(
 				alloy_rpc_types::BlockNumberOrTag::Number(tx_block),
 				BlockTransactionsKind::Hashes,
@@ -170,7 +241,7 @@ impl SettlementInterface for DirectSettlement {
 		Ok(FillProof {
 			tx_hash: tx_hash.clone(),
 			block_number: tx_block,
-			oracle_address: self.oracle_address.to_string(),
+			oracle_address: oracle_address.clone(),
 			attestation_data: Some(order_data.order_id.to_vec()),
 			filled_timestamp: block_timestamp,
 		})
@@ -180,11 +251,28 @@ impl SettlementInterface for DirectSettlement {
 	///
 	/// Verifies that the dispute period has passed and all claim
 	/// requirements are met.
-	async fn can_claim(&self, _order: &Order, fill_proof: &FillProof) -> bool {
+	async fn can_claim(&self, order: &Order, fill_proof: &FillProof) -> bool {
+		// Parse order data to get the destination chain ID
+		let order_data: Eip7683OrderData = match serde_json::from_value(order.data.clone()) {
+			Ok(data) => data,
+			Err(_) => return false,
+		};
+
+		// Get the destination chain ID from the first output
+		let destination_chain_id = match order_data.outputs.first() {
+			Some(output) => output.chain_id.to::<u64>(),
+			None => return false,
+		};
+
+		// Get the appropriate provider for this chain
+		let provider = match self.providers.get(&destination_chain_id) {
+			Some(p) => p,
+			None => return false,
+		};
+
 		// Get current block to check timestamp
-		let current_block = match self.provider.get_block_number().await {
-			Ok(block_num) => match self
-				.provider
+		let current_block = match provider.get_block_number().await {
+			Ok(block_num) => match provider
 				.get_block_by_number(block_num.into(), BlockTransactionsKind::Hashes)
 				.await
 			{
@@ -217,25 +305,57 @@ impl SettlementInterface for DirectSettlement {
 /// Factory function to create a settlement provider from configuration.
 ///
 /// Required configuration parameters:
-/// - `rpc_url`: The HTTP RPC endpoint URL
-/// - `oracle_address`: Address of the attestation oracle
+/// - `network_ids`: Array of network IDs to monitor
+/// - `oracle_addresses`: Table mapping network_id -> oracle address
 ///
 /// Optional configuration parameters:
 /// - `dispute_period_seconds`: Dispute period duration (default: 300)
 pub fn create_settlement(
 	config: &toml::Value,
+	networks: &NetworksConfig,
 ) -> Result<Box<dyn SettlementInterface>, SettlementError> {
-	let rpc_url = config
-		.get("rpc_url")
-		.and_then(|v| v.as_str())
-		.ok_or_else(|| SettlementError::ValidationFailed("rpc_url is required".to_string()))?;
+	// Validate configuration first
+	DirectSettlementSchema::validate_config(config)
+		.map_err(|e| SettlementError::ValidationFailed(format!("Invalid configuration: {}", e)))?;
 
-	let oracle_address = config
-		.get("oracle_address")
-		.and_then(|v| v.as_str())
+	// Get network IDs
+	let network_ids = config
+		.get("network_ids")
+		.and_then(|v| v.as_array())
+		.ok_or_else(|| SettlementError::ValidationFailed("network_ids is required".to_string()))?
+		.iter()
+		.filter_map(|v| v.as_integer().map(|i| i as u64))
+		.collect::<Vec<_>>();
+
+	if network_ids.is_empty() {
+		return Err(SettlementError::ValidationFailed(
+			"network_ids cannot be empty".to_string(),
+		));
+	}
+
+	// Get oracle addresses table
+	let addresses_table = config
+		.get("oracle_addresses")
+		.and_then(|v| v.as_table())
 		.ok_or_else(|| {
-			SettlementError::ValidationFailed("oracle_address is required".to_string())
+			SettlementError::ValidationFailed("oracle_addresses is required".to_string())
 		})?;
+
+	// Build oracle addresses map
+	let mut oracle_addresses = HashMap::new();
+	for network_id in &network_ids {
+		let network_id_str = network_id.to_string();
+		let address = addresses_table
+			.get(&network_id_str)
+			.and_then(|v| v.as_str())
+			.ok_or_else(|| {
+				SettlementError::ValidationFailed(format!(
+					"oracle_addresses missing entry for network {}",
+					network_id
+				))
+			})?;
+		oracle_addresses.insert(*network_id, address.to_string());
+	}
 
 	let dispute_period_seconds = config
 		.get("dispute_period_seconds")
@@ -245,7 +365,13 @@ pub fn create_settlement(
 	// Create settlement service synchronously
 	let settlement = tokio::task::block_in_place(|| {
 		tokio::runtime::Handle::current().block_on(async {
-			DirectSettlement::new(rpc_url, oracle_address.to_string(), dispute_period_seconds).await
+			DirectSettlement::new(
+				network_ids,
+				networks,
+				oracle_addresses,
+				dispute_period_seconds,
+			)
+			.await
 		})
 	})?;
 

@@ -28,6 +28,9 @@ pub enum StorageError {
 	/// Error that occurs in the storage backend.
 	#[error("Backend error: {0}")]
 	Backend(String),
+	/// Error that occurs during configuration validation.
+	#[error("Configuration error: {0}")]
+	Configuration(String),
 }
 
 /// Trait defining the low-level interface for storage backends.

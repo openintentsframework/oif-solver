@@ -346,6 +346,14 @@ impl StorageInterface for FileStorage {
 /// Configuration schema for FileStorage.
 pub struct FileStorageSchema;
 
+impl FileStorageSchema {
+	/// Static validation method for use before instance creation
+	pub fn validate_config(config: &toml::Value) -> Result<(), ValidationError> {
+		let instance = Self;
+		instance.validate(config)
+	}
+}
+
 impl ConfigSchema for FileStorageSchema {
 	fn validate(&self, config: &toml::Value) -> Result<(), ValidationError> {
 		// Build TTL fields dynamically based on StorageKey variants
@@ -383,6 +391,10 @@ impl ConfigSchema for FileStorageSchema {
 /// - `ttl_intents`: TTL in seconds for intents (default: 0)
 /// - `ttl_order_by_tx_hash`: TTL in seconds for order_by_tx_hash (default: 0)
 pub fn create_storage(config: &toml::Value) -> Result<Box<dyn StorageInterface>, StorageError> {
+	// Validate configuration first
+	FileStorageSchema::validate_config(config)
+		.map_err(|e| StorageError::Configuration(format!("Invalid configuration: {}", e)))?;
+
 	let storage_path = config
 		.get("storage_path")
 		.and_then(|v| v.as_str())

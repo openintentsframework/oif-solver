@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	tracing::info!("Started solver");
 
 	// Load configuration
-	let config = Config::from_file(args.config.to_str().unwrap())?;
+	let config = Config::from_file_async(args.config.to_str().unwrap()).await?;
 	tracing::info!("Loaded configuration [{}]", config.solver.id);
 
 	// Build solver engine with implementations
@@ -118,6 +118,30 @@ macro_rules! create_factory_map {
         )*
         factories
     }};
+
+    // Variant for factories that take networks config
+    ($interface:path, $error:path, networks, $( $name:literal => $factory:expr ),* $(,)?) => {{
+        let mut factories = std::collections::HashMap::new();
+        $(
+            factories.insert(
+                $name.to_string(),
+                $factory as fn(&toml::Value, &solver_types::NetworksConfig) -> Result<Box<dyn $interface>, $error>
+            );
+        )*
+        factories
+    }};
+
+    // Variant for delivery factories that take networks and optional private key
+    ($interface:path, $error:path, delivery, $( $name:literal => $factory:expr ),* $(,)?) => {{
+        let mut factories = std::collections::HashMap::new();
+        $(
+            factories.insert(
+                $name.to_string(),
+                $factory as fn(&toml::Value, &solver_types::NetworksConfig, Option<&solver_types::SecretString>) -> Result<Box<dyn $interface>, $error>
+            );
+        )*
+        factories
+    }};
 }
 
 /// Builds the solver engine with all necessary implementations.
@@ -133,60 +157,46 @@ macro_rules! create_factory_map {
 async fn build_solver(config: Config) -> Result<SolverEngine, Box<dyn std::error::Error>> {
 	let builder = SolverBuilder::new(config);
 
-	// Create factory maps using the macro
-	let delivery_factories = create_factory_map!(
-		solver_delivery::DeliveryInterface,
-		solver_delivery::DeliveryError,
-		"origin" => create_http_delivery,
-		"destination" => create_http_delivery,
-	);
-
-	// Discovery and order factories are stored directly since they have different signatures
-	let mut discovery_factories = std::collections::HashMap::new();
-	discovery_factories.insert(
-		"onchain_eip7683".to_string(),
-		onchain_create_discovery
-			as fn(
-				&toml::Value,
-				&solver_types::NetworksConfig,
-			) -> Result<
-				Box<dyn solver_discovery::DiscoveryInterface>,
-				solver_discovery::DiscoveryError,
-			>,
-	);
-	discovery_factories.insert(
-		"offchain_eip7683".to_string(),
-		offchain_create_discovery
-			as fn(
-				&toml::Value,
-				&solver_types::NetworksConfig,
-			) -> Result<
-				Box<dyn solver_discovery::DiscoveryInterface>,
-				solver_discovery::DiscoveryError,
-			>,
-	);
-
-	let mut order_factories = std::collections::HashMap::new();
-	order_factories.insert(
-		"eip7683".to_string(),
-		create_order_impl
-			as fn(
-				&toml::Value,
-				&solver_types::NetworksConfig,
-			) -> Result<Box<dyn solver_order::OrderInterface>, solver_order::OrderError>,
-	);
-
-	let settlement_factories = create_factory_map!(
-		solver_settlement::SettlementInterface,
-		solver_settlement::SettlementError,
-		"eip7683" => create_settlement,
-	);
-
+	// Storage factories (simple config-only interface)
 	let storage_factories = create_factory_map!(
 		solver_storage::StorageInterface,
 		solver_storage::StorageError,
 		"file" => create_file_storage,
 		"memory" => create_memory_storage,
+	);
+
+	// Delivery factories (config + networks + optional private key)
+	let delivery_factories = create_factory_map!(
+		solver_delivery::DeliveryInterface,
+		solver_delivery::DeliveryError,
+		delivery,
+		"origin" => create_http_delivery,
+		"destination" => create_http_delivery,
+	);
+
+	// Discovery factories (config + networks)
+	let discovery_factories = create_factory_map!(
+		solver_discovery::DiscoveryInterface,
+		solver_discovery::DiscoveryError,
+		networks,
+		"onchain_eip7683" => onchain_create_discovery,
+		"offchain_eip7683" => offchain_create_discovery,
+	);
+
+	// Order factories (config + networks)
+	let order_factories = create_factory_map!(
+		solver_order::OrderInterface,
+		solver_order::OrderError,
+		networks,
+		"eip7683" => create_order_impl,
+	);
+
+	// Settlement factories (config + networks)
+	let settlement_factories = create_factory_map!(
+		solver_settlement::SettlementInterface,
+		solver_settlement::SettlementError,
+		networks,
+		"eip7683" => create_settlement,
 	);
 
 	let factories = SolverFactories {

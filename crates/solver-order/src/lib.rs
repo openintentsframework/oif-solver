@@ -34,6 +34,9 @@ pub enum OrderError {
 	/// Error that occurs when the order cannot be satisfied given current conditions.
 	#[error("Cannot satisfy order")]
 	CannotSatisfyOrder,
+	/// Error that occurs when the order configuration is invalid.
+	#[error("Invalid order: {0}")]
+	InvalidOrder(String),
 }
 
 /// Trait defining the interface for order standard implementations.

@@ -63,7 +63,11 @@ impl SolverBuilder {
 	where
 		SF: Fn(&toml::Value) -> Result<Box<dyn StorageInterface>, StorageError>,
 		AF: FnOnce(&toml::Value) -> Result<Box<dyn AccountInterface>, AccountError>,
-		DF: Fn(&toml::Value) -> Result<Box<dyn DeliveryInterface>, DeliveryError>,
+		DF: Fn(
+			&toml::Value,
+			&solver_types::NetworksConfig,
+			Option<&solver_types::SecretString>,
+		) -> Result<Box<dyn DeliveryInterface>, DeliveryError>,
 		DIF: Fn(
 			&toml::Value,
 			&solver_types::NetworksConfig,
@@ -72,7 +76,10 @@ impl SolverBuilder {
 			&toml::Value,
 			&solver_types::NetworksConfig,
 		) -> Result<Box<dyn OrderInterface>, OrderError>,
-		SEF: Fn(&toml::Value) -> Result<Box<dyn SettlementInterface>, SettlementError>,
+		SEF: Fn(
+			&toml::Value,
+			&solver_types::NetworksConfig,
+		) -> Result<Box<dyn SettlementInterface>, SettlementError>,
 		STF: FnOnce(&toml::Value) -> Box<dyn ExecutionStrategy>,
 	{
 		// Create storage implementations
@@ -81,34 +88,26 @@ impl SolverBuilder {
 			if let Some(factory) = factories.storage_factories.get(name) {
 				match factory(config) {
 					Ok(implementation) => {
-						// Validate the configuration using the implementation's schema
-						match implementation.config_schema().validate(config) {
-							Ok(_) => {
-								storage_impls.insert(name.clone(), implementation);
-								let impl_name = if name == &self.config.storage.primary {
-									format!("{} (primary)", name)
-								} else {
-									name.to_string()
-								};
-								tracing::info!(component = "storage", implementation = %impl_name, "Loaded");
-							}
-							Err(e) => {
-								tracing::error!(
-									component = "storage",
-									implementation = %name,
-									error = %e,
-									"Invalid configuration for storage implementation, skipping"
-								);
-							}
-						}
+						// Validation already happened in the factory
+						storage_impls.insert(name.clone(), implementation);
+						let impl_name = if name == &self.config.storage.primary {
+							format!("{} (primary)", name)
+						} else {
+							name.to_string()
+						};
+						tracing::info!(component = "storage", implementation = %impl_name, "Loaded");
 					}
 					Err(e) => {
 						tracing::error!(
 							component = "storage",
 							implementation = %name,
 							error = %e,
-							"Failed to create storage implementation, skipping"
+							"Failed to create storage implementation"
 						);
+						return Err(BuilderError::Config(format!(
+							"Failed to create storage implementation '{}': {}",
+							name, e
+						)));
 					}
 				}
 			}
@@ -132,30 +131,39 @@ impl SolverBuilder {
 		let storage = Arc::new(StorageService::new(storage_backend));
 
 		// Create account provider
-		let account_provider =
-			(factories.account_factory)(&self.config.account.config).map_err(|e| {
+		let account_provider = match (factories.account_factory)(&self.config.account.config) {
+			Ok(provider) => provider,
+			Err(e) => {
 				tracing::error!(
 					component = "account",
 					implementation = %self.config.account.provider,
 					error = %e,
 					"Failed to create account provider"
 				);
-				BuilderError::Config(format!(
+				return Err(BuilderError::Config(format!(
 					"Failed to create account provider '{}': {}",
 					self.config.account.provider, e
-				))
-			})?;
+				)));
+			}
+		};
+
 		let account = Arc::new(AccountService::new(account_provider));
 
 		// Fetch the solver address once during initialization
-		let solver_address = account.get_address().await.map_err(|e| {
-			tracing::error!(
-				component = "account",
-				error = %e,
-				"Failed to get solver address"
-			);
-			BuilderError::Config(format!("Failed to get solver address: {}", e))
-		})?;
+		let solver_address = match account.get_address().await {
+			Ok(address) => address,
+			Err(e) => {
+				tracing::error!(
+					component = "account",
+					error = %e,
+					"Failed to get solver address"
+				);
+				return Err(BuilderError::Config(format!(
+					"Failed to get solver address: {}",
+					e
+				)));
+			}
+		};
 
 		tracing::info!(
 			component = "account",
@@ -166,48 +174,32 @@ impl SolverBuilder {
 
 		// Create delivery providers
 		let mut delivery_providers = HashMap::new();
+		let default_private_key = account.get_private_key();
+
 		for (name, config) in &self.config.delivery.providers {
 			if let Some(factory) = factories.delivery_factories.get(name) {
-				// Extract chain_id from the config
-				let chain_id = match config.get("chain_id").and_then(|v| v.as_integer()) {
-					Some(id) => id as u64,
-					None => {
-						tracing::error!(
-							component = "delivery",
-							implementation = %name,
-							"chain_id missing for delivery provider, skipping"
-						);
-						continue;
-					}
-				};
-
-				match factory(config) {
+				match factory(config, &self.config.networks, default_private_key.as_ref()) {
 					Ok(provider) => {
-						// Validate the configuration using the provider's schema
-						match provider.config_schema().validate(config) {
-							Ok(_) => {
-								delivery_providers.insert(chain_id, provider);
-								tracing::info!(component = "delivery", implementation = %name, chain_id = %chain_id, "Loaded");
-							}
-							Err(e) => {
-								tracing::error!(
-									component = "delivery",
-									implementation = %name,
-									chain_id = %chain_id,
-									error = %e,
-									"Invalid configuration for delivery provider, skipping"
-								);
-							}
-						}
+						// Validation already happened in the factory, extract chain_id for the map key
+						let chain_id = config
+							.get("network_id")
+							.and_then(|v| v.as_integer())
+							.expect("network_id validated by factory") as u64;
+
+						delivery_providers.insert(chain_id, provider);
+						tracing::info!(component = "delivery", implementation = %name, chain_id = %chain_id, "Loaded");
 					}
 					Err(e) => {
 						tracing::error!(
 							component = "delivery",
 							implementation = %name,
-							chain_id = %chain_id,
 							error = %e,
-							"Failed to create delivery provider, skipping"
+							"Failed to create delivery provider"
 						);
+						return Err(BuilderError::Config(format!(
+							"Failed to create delivery provider '{}': {}",
+							name, e
+						)));
 					}
 				}
 			}
@@ -229,29 +221,21 @@ impl SolverBuilder {
 			if let Some(factory) = factories.discovery_factories.get(name) {
 				match factory(config, &self.config.networks) {
 					Ok(source) => {
-						// Validate the configuration using the source's schema
-						match source.config_schema().validate(config) {
-							Ok(_) => {
-								discovery_sources.push(source);
-								tracing::info!(component = "discovery", implementation = %name, "Loaded");
-							}
-							Err(e) => {
-								tracing::error!(
-									component = "discovery",
-									implementation = %name,
-									error = %e,
-									"Invalid configuration for discovery source, skipping"
-								);
-							}
-						}
+						// Validation already happened in the factory
+						discovery_sources.push(source);
+						tracing::info!(component = "discovery", implementation = %name, "Loaded");
 					}
 					Err(e) => {
 						tracing::error!(
 							component = "discovery",
 							implementation = %name,
 							error = %e,
-							"Failed to create discovery source, skipping"
+							"Failed to create discovery source"
 						);
+						return Err(BuilderError::Config(format!(
+							"Failed to create discovery source '{}': {}",
+							name, e
+						)));
 					}
 				}
 			}
@@ -271,29 +255,21 @@ impl SolverBuilder {
 			if let Some(factory) = factories.order_factories.get(name) {
 				match factory(config, &self.config.networks) {
 					Ok(implementation) => {
-						// Validate the configuration using the implementation's schema
-						match implementation.config_schema().validate(config) {
-							Ok(_) => {
-								order_impls.insert(name.clone(), implementation);
-								tracing::info!(component = "order", implementation = %name, "Loaded");
-							}
-							Err(e) => {
-								tracing::error!(
-									component = "order",
-									implementation = %name,
-									error = %e,
-									"Invalid configuration for order implementation, skipping"
-								);
-							}
-						}
+						// Validation already happened in the factory
+						order_impls.insert(name.clone(), implementation);
+						tracing::info!(component = "order", implementation = %name, "Loaded");
 					}
 					Err(e) => {
 						tracing::error!(
 							component = "order",
 							implementation = %name,
 							error = %e,
-							"Failed to create order implementation, skipping"
+							"Failed to create order implementation"
 						);
+						return Err(BuilderError::Config(format!(
+							"Failed to create order implementation '{}': {}",
+							name, e
+						)));
 					}
 				}
 			}
@@ -313,31 +289,23 @@ impl SolverBuilder {
 		let mut settlement_impls = HashMap::new();
 		for (name, config) in &self.config.settlement.implementations {
 			if let Some(factory) = factories.settlement_factories.get(name) {
-				match factory(config) {
+				match factory(config, &self.config.networks) {
 					Ok(implementation) => {
-						// Validate the configuration using the implementation's schema
-						match implementation.config_schema().validate(config) {
-							Ok(_) => {
-								settlement_impls.insert(name.clone(), implementation);
-								tracing::info!(component = "settlement", implementation = %name, "Loaded");
-							}
-							Err(e) => {
-								tracing::error!(
-									component = "settlement",
-									implementation = %name,
-									error = %e,
-									"Invalid configuration for settlement implementation, skipping"
-								);
-							}
-						}
+						// Validation already happened in the factory
+						settlement_impls.insert(name.clone(), implementation);
+						tracing::info!(component = "settlement", implementation = %name, "Loaded");
 					}
 					Err(e) => {
 						tracing::error!(
 							component = "settlement",
 							implementation = %name,
 							error = %e,
-							"Failed to create settlement implementation, skipping"
+							"Failed to create settlement implementation"
 						);
+						return Err(BuilderError::Config(format!(
+							"Failed to create settlement implementation '{}': {}",
+							name, e
+						)));
 					}
 				}
 			}
@@ -357,14 +325,26 @@ impl SolverBuilder {
 		));
 
 		// Ensure all token approvals are set
-		token_manager.ensure_approvals().await.map_err(|e| {
-			tracing::error!(
-				component = "token_manager",
-				error = %e,
-				"Failed to ensure token approvals"
-			);
-			BuilderError::Config(format!("Failed to ensure token approvals: {}", e))
-		})?;
+		match token_manager.ensure_approvals().await {
+			Ok(()) => {
+				tracing::info!(
+					component = "token_manager",
+					networks = self.config.networks.len(),
+					"Token manager initialized with approvals"
+				);
+			}
+			Err(e) => {
+				tracing::error!(
+					component = "token_manager",
+					error = %e,
+					"Failed to ensure token approvals"
+				);
+				return Err(BuilderError::Config(format!(
+					"Failed to ensure token approvals: {}",
+					e
+				)));
+			}
+		}
 
 		// Log initial balances for monitoring
 		match token_manager.check_balances().await {
@@ -391,12 +371,6 @@ impl SolverBuilder {
 				);
 			}
 		}
-
-		tracing::info!(
-			component = "token_manager",
-			networks = self.config.networks.len(),
-			"Token manager initialized with approvals"
-		);
 
 		Ok(SolverEngine::new(
 			self.config,

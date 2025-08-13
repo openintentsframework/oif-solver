@@ -4,6 +4,7 @@
 //! It supports loading configuration from TOML files and provides validation to ensure
 //! all required configuration values are properly set.
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use solver_types::{networks::deserialize_networks, NetworksConfig};
 use std::collections::HashMap;
@@ -17,11 +18,19 @@ pub enum ConfigError {
 	#[error("IO error: {0}")]
 	Io(#[from] std::io::Error),
 	/// Error that occurs when parsing TOML configuration.
-	#[error("Parse error: {0}")]
-	Parse(#[from] toml::de::Error),
+	#[error("Configuration error: {0}")]
+	Parse(String),
 	/// Error that occurs when configuration validation fails.
 	#[error("Validation error: {0}")]
 	Validation(String),
+}
+
+impl From<toml::de::Error> for ConfigError {
+	fn from(err: toml::de::Error) -> Self {
+		// Extract just the message without the huge input dump
+		let message = err.message().to_string();
+		ConfigError::Parse(message)
+	}
 }
 
 /// Main configuration structure for the OIF solver.
@@ -233,14 +242,83 @@ fn default_max_request_size() -> usize {
 	1024 * 1024 // 1MB
 }
 
+/// Resolves environment variables in a string.
+///
+/// Replaces ${VAR_NAME} with the value of the environment variable VAR_NAME.
+/// Supports default values with ${VAR_NAME:-default_value}.
+///
+/// Input strings are limited to 1MB to prevent ReDoS attacks.
+fn resolve_env_vars(input: &str) -> Result<String, ConfigError> {
+	// Limit input size to prevent ReDoS attacks
+	const MAX_INPUT_SIZE: usize = 1024 * 1024; // 1MB
+	if input.len() > MAX_INPUT_SIZE {
+		return Err(ConfigError::Validation(format!(
+			"Configuration file too large: {} bytes (max: {} bytes)",
+			input.len(),
+			MAX_INPUT_SIZE
+		)));
+	}
+
+	let re = Regex::new(r"\$\{([A-Z_][A-Z0-9_]{0,127})(?::-([^}]{0,256}))?\}")
+		.map_err(|e| ConfigError::Parse(format!("Regex error: {}", e)))?;
+
+	let mut result = input.to_string();
+	let mut replacements = Vec::new();
+
+	for cap in re.captures_iter(input) {
+		let full_match = cap.get(0).unwrap();
+		let var_name = cap.get(1).unwrap().as_str();
+		let default_value = cap.get(2).map(|m| m.as_str());
+
+		let value = match std::env::var(var_name) {
+			Ok(v) => v,
+			Err(_) => {
+				if let Some(default) = default_value {
+					default.to_string()
+				} else {
+					return Err(ConfigError::Validation(format!(
+						"Environment variable '{}' not found",
+						var_name
+					)));
+				}
+			}
+		};
+
+		replacements.push((full_match.start(), full_match.end(), value));
+	}
+
+	// Apply replacements in reverse order to maintain positions
+	for (start, end, value) in replacements.iter().rev() {
+		result.replace_range(start..end, value);
+	}
+
+	Ok(result)
+}
+
 impl Config {
 	/// Loads configuration from a file at the specified path.
 	///
-	/// This method reads the file content and parses it as TOML configuration.
-	/// The configuration is validated before being returned.
+	/// This method reads the file content, resolves environment variables,
+	/// and parses it as TOML configuration. The configuration is validated
+	/// before being returned.
+	///
+	/// Environment variables can be referenced using:
+	/// - `${VAR_NAME}` - Required environment variable
+	/// - `${VAR_NAME:-default}` - With default value if not set
 	pub fn from_file(path: &str) -> Result<Self, ConfigError> {
 		let content = std::fs::read_to_string(path)?;
-		content.parse()
+		let resolved = resolve_env_vars(&content)?;
+		resolved.parse()
+	}
+
+	/// Loads configuration from a file with async environment variable resolution.
+	///
+	/// This method is async-ready for future extensions that might need
+	/// async secret resolution (e.g., from Vault, AWS KMS, etc).
+	pub async fn from_file_async(path: &str) -> Result<Self, ConfigError> {
+		// For now, just calls the sync version
+		// In the future, this could use async resolvers
+		Self::from_file(path)
 	}
 
 	/// Validates the configuration to ensure all required fields are properly set.
@@ -383,13 +461,111 @@ impl Config {
 /// Implementation of FromStr trait for Config to enable parsing from string.
 ///
 /// This allows configuration to be parsed from TOML strings using the standard
-/// string parsing interface. The configuration is automatically validated after parsing.
+/// string parsing interface. Environment variables are resolved and the
+/// configuration is automatically validated after parsing.
 impl FromStr for Config {
 	type Err = ConfigError;
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		let config: Config = toml::from_str(s)?;
+		let resolved = resolve_env_vars(s)?;
+		let config: Config = toml::from_str(&resolved)?;
 		config.validate()?;
 		Ok(config)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_env_var_resolution() {
+		// Set up test environment variables
+		std::env::set_var("TEST_HOST", "localhost");
+		std::env::set_var("TEST_PORT", "5432");
+
+		let input = "host = \"${TEST_HOST}:${TEST_PORT}\"";
+		let result = resolve_env_vars(input).unwrap();
+		assert_eq!(result, "host = \"localhost:5432\"");
+
+		// Clean up
+		std::env::remove_var("TEST_HOST");
+		std::env::remove_var("TEST_PORT");
+	}
+
+	#[test]
+	fn test_env_var_with_default() {
+		let input = "value = \"${MISSING_VAR:-default_value}\"";
+		let result = resolve_env_vars(input).unwrap();
+		assert_eq!(result, "value = \"default_value\"");
+	}
+
+	#[test]
+	fn test_missing_env_var_error() {
+		let input = "value = \"${MISSING_VAR}\"";
+		let result = resolve_env_vars(input);
+		assert!(result.is_err());
+		assert!(result.unwrap_err().to_string().contains("MISSING_VAR"));
+	}
+
+	#[test]
+	fn test_config_with_env_vars() {
+		// Set environment variable
+		std::env::set_var("TEST_SOLVER_ID", "test-solver");
+
+		let config_str = r#"
+[solver]
+id = "${TEST_SOLVER_ID}"
+monitoring_timeout_minutes = 5
+
+[networks.1]
+rpc_url = "http://localhost:8545"
+input_settler_address = "0x1234567890123456789012345678901234567890"
+output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.1.tokens]]
+address = "0xabcdef1234567890abcdef1234567890abcdef12"
+symbol = "TEST"
+decimals = 18
+
+[networks.2]
+rpc_url = "http://localhost:8546"
+input_settler_address = "0x1234567890123456789012345678901234567890"
+output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.2.tokens]]
+address = "0xabcdef1234567890abcdef1234567890abcdef12"
+symbol = "TEST"
+decimals = 18
+
+[storage]
+primary = "memory"
+cleanup_interval_seconds = 3600
+[storage.implementations.memory]
+
+[delivery]
+[delivery.providers.test]
+
+[account]
+provider = "local"
+[account.config]
+private_key = "${TEST_PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
+
+[discovery]
+[discovery.sources.test]
+
+[order]
+[order.implementations.test]
+[order.execution_strategy]
+strategy_type = "simple"
+[order.execution_strategy.config]
+
+[settlement]
+[settlement.implementations.test]
+"#;
+
+		let config: Config = config_str.parse().unwrap();
+		assert_eq!(config.solver.id, "test-solver");
+
+		// Clean up
+		std::env::remove_var("TEST_SOLVER_ID");
 	}
 }

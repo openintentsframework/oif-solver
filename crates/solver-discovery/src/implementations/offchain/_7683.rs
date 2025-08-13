@@ -60,6 +60,7 @@ use solver_types::{
 	standards::eip7683::MandateOutput, with_0x_prefix, ConfigSchema, Eip7683OrderData, Field,
 	FieldType, Intent, IntentMetadata, NetworksConfig, Schema,
 };
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -237,8 +238,8 @@ struct ApiState {
 	/// Optional authentication token
 	#[allow(dead_code)]
 	auth_token: Option<String>,
-	/// RPC provider for calling settler contracts
-	provider: RootProvider<Http<reqwest::Client>>,
+	/// RPC providers for each supported network
+	providers: HashMap<u64, RootProvider<Http<reqwest::Client>>>,
 	/// Networks configuration for settler lookups
 	networks: NetworksConfig,
 }
@@ -254,8 +255,8 @@ pub struct Eip7683OffchainDiscovery {
 	api_host: String,
 	api_port: u16,
 	auth_token: Option<String>,
-	/// RPC provider for calling settler contracts
-	provider: RootProvider<Http<reqwest::Client>>,
+	/// RPC providers for each supported network
+	providers: HashMap<u64, RootProvider<Http<reqwest::Client>>>,
 	/// Networks configuration for settler lookups
 	networks: NetworksConfig,
 	/// Flag indicating if the server is running
@@ -272,30 +273,24 @@ impl Eip7683OffchainDiscovery {
 	/// * `api_host` - The host address to bind the API server
 	/// * `api_port` - The port number to listen on
 	/// * `auth_token` - Optional authentication token for API access
-	/// * `rpc_url` - Ethereum RPC URL for calling settler contracts
-	/// * `networks` - Networks configuration
+	/// * `network_ids` - List of network IDs this discovery source supports
+	/// * `networks` - Networks configuration with RPC URLs
 	///
 	/// # Returns
 	///
-	/// Returns a new discovery instance or an error if the RPC URL is invalid.
+	/// Returns a new discovery instance or an error if any RPC URL is invalid.
 	///
 	/// # Errors
 	///
-	/// Returns `DiscoveryError::Connection` if the RPC URL cannot be parsed.
+	/// Returns `DiscoveryError::Connection` if any RPC URL cannot be parsed.
 	/// Returns `DiscoveryError::ValidationError` if networks config is invalid.
 	pub fn new(
 		api_host: String,
 		api_port: u16,
 		auth_token: Option<String>,
-		rpc_url: String,
-		networks: NetworksConfig,
+		network_ids: Vec<u64>,
+		networks: &NetworksConfig,
 	) -> Result<Self, DiscoveryError> {
-		let provider = RootProvider::new_http(
-			rpc_url
-				.parse()
-				.map_err(|e| DiscoveryError::Connection(format!("Invalid RPC URL: {}", e)))?,
-		);
-
 		// Validate networks config has at least one network
 		if networks.is_empty() {
 			return Err(DiscoveryError::ValidationError(
@@ -303,12 +298,37 @@ impl Eip7683OffchainDiscovery {
 			));
 		}
 
+		// Create RPC providers for each supported network
+		let mut providers = HashMap::new();
+		for network_id in &network_ids {
+			if let Some(network) = networks.get(network_id) {
+				let provider = RootProvider::new_http(network.rpc_url.parse().map_err(|e| {
+					DiscoveryError::Connection(format!(
+						"Invalid RPC URL for network {}: {}",
+						network_id, e
+					))
+				})?);
+				providers.insert(*network_id, provider);
+			} else {
+				tracing::warn!(
+					"Network {} in supported_networks not found in networks config",
+					network_id
+				);
+			}
+		}
+
+		if providers.is_empty() {
+			return Err(DiscoveryError::ValidationError(
+				"No valid RPC providers could be created for supported networks".to_string(),
+			));
+		}
+
 		Ok(Self {
 			api_host,
 			api_port,
 			auth_token,
-			provider,
-			networks,
+			providers,
+			networks: networks.clone(),
 			is_running: Arc::new(AtomicBool::new(false)),
 			shutdown_signal: Arc::new(Mutex::new(None)),
 		})
@@ -420,7 +440,7 @@ impl Eip7683OffchainDiscovery {
 		order_bytes: &Bytes,
 		sponsor: &Address,
 		signature: &Bytes,
-		provider: &RootProvider<Http<reqwest::Client>>,
+		providers: &HashMap<u64, RootProvider<Http<reqwest::Client>>>,
 		networks: &NetworksConfig,
 	) -> Result<Intent, DiscoveryError> {
 		// Parse the StandardOrder
@@ -441,6 +461,14 @@ impl Eip7683OffchainDiscovery {
 			));
 		}
 		let settler_address = Address::from_slice(&network.input_settler_address.0);
+
+		// Get provider for the origin chain
+		let provider = providers.get(&origin_chain_id).ok_or_else(|| {
+			DiscoveryError::ValidationError(format!(
+				"No RPC provider configured for chain ID {}",
+				origin_chain_id
+			))
+		})?;
 
 		// Generate order ID from order data
 		let order_id = Self::compute_order_id(order_bytes, provider, settler_address).await?;
@@ -562,14 +590,14 @@ impl Eip7683OffchainDiscovery {
 		api_port: u16,
 		intent_sender: mpsc::UnboundedSender<Intent>,
 		auth_token: Option<String>,
-		provider: RootProvider<Http<reqwest::Client>>,
+		providers: HashMap<u64, RootProvider<Http<reqwest::Client>>>,
 		networks: NetworksConfig,
 		mut shutdown_rx: mpsc::Receiver<()>,
 	) -> Result<(), String> {
 		let state = ApiState {
 			intent_sender,
 			auth_token,
-			provider,
+			providers,
 			networks,
 		};
 
@@ -672,7 +700,7 @@ async fn handle_intent_submission(
 		&request.order,
 		&request.sponsor,
 		&request.signature,
-		&state.provider,
+		&state.providers,
 		&state.networks,
 	)
 	.await
@@ -744,6 +772,14 @@ async fn handle_intent_submission(
 /// - `rate_limit` - Request rate limit (1-10000)
 pub struct Eip7683OffchainDiscoverySchema;
 
+impl Eip7683OffchainDiscoverySchema {
+	/// Static validation method for use before instance creation
+	pub fn validate_config(config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+		let instance = Self;
+		instance.validate(config)
+	}
+}
+
 impl ConfigSchema for Eip7683OffchainDiscoverySchema {
 	fn validate(&self, config: &toml::Value) -> Result<(), solver_types::ValidationError> {
 		let schema = Schema::new(
@@ -757,22 +793,17 @@ impl ConfigSchema for Eip7683OffchainDiscoverySchema {
 					},
 				),
 				Field::new("api_host", FieldType::String),
-				Field::new("rpc_url", FieldType::String).with_validator(|value| {
-					match value.as_str() {
-						Some(url) => {
-							if url.starts_with("http://") || url.starts_with("https://") {
-								Ok(())
-							} else {
-								Err("RPC URL must start with http:// or https://".to_string())
-							}
-						}
-						None => Err("Expected string value for rpc_url".to_string()),
-					}
-				}),
 			],
 			// Optional fields
 			vec![
 				Field::new("auth_token", FieldType::String),
+				Field::new(
+					"network_ids",
+					FieldType::Array(Box::new(FieldType::Integer {
+						min: Some(1),
+						max: None,
+					})),
+				),
 				Field::new(
 					"rate_limit",
 					FieldType::Integer {
@@ -808,7 +839,7 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 		let api_host = self.api_host.clone();
 		let api_port = self.api_port;
 		let auth_token = self.auth_token.clone();
-		let provider = self.provider.clone();
+		let providers = self.providers.clone();
 		let networks = self.networks.clone();
 
 		tokio::spawn(async move {
@@ -817,7 +848,7 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 				api_port,
 				sender,
 				auth_token,
-				provider,
+				providers,
 				networks,
 				shutdown_rx,
 			)
@@ -854,6 +885,7 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 /// # Arguments
 ///
 /// * `config` - TOML configuration value containing service parameters
+/// * `networks` - Global networks configuration with RPC URLs and settler addresses
 ///
 /// # Returns
 ///
@@ -866,18 +898,22 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 /// api_host = "0.0.0.0"         # optional, defaults to "0.0.0.0"
 /// api_port = 8081              # optional, defaults to 8081
 /// auth_token = "secret"        # optional
-/// rpc_url = "https://..."      # required
+/// network_ids = [1, 10, 137]  # optional, defaults to all networks
 /// ```
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - `rpc_url` is not provided in the configuration
+/// - The networks configuration is invalid
 /// - The discovery service cannot be created
 pub fn create_discovery(
 	config: &toml::Value,
 	networks: &NetworksConfig,
 ) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError> {
+	// Validate configuration first
+	Eip7683OffchainDiscoverySchema::validate_config(config)
+		.map_err(|e| DiscoveryError::ValidationError(format!("Invalid configuration: {}", e)))?;
+
 	let api_host = config
 		.get("api_host")
 		.and_then(|v| v.as_str())
@@ -894,14 +930,19 @@ pub fn create_discovery(
 		.and_then(|v| v.as_str())
 		.map(String::from);
 
-	let rpc_url = config
-		.get("rpc_url")
-		.and_then(|v| v.as_str())
-		.ok_or_else(|| DiscoveryError::ValidationError("rpc_url is required".to_string()))?
-		.to_string();
+	// Get network_ids from config, or default to all networks
+	let network_ids = config
+		.get("network_ids")
+		.and_then(|v| v.as_array())
+		.map(|arr| {
+			arr.iter()
+				.filter_map(|v| v.as_integer().map(|i| i as u64))
+				.collect::<Vec<_>>()
+		})
+		.unwrap_or_else(|| networks.keys().cloned().collect());
 
 	let discovery =
-		Eip7683OffchainDiscovery::new(api_host, api_port, auth_token, rpc_url, networks.clone())
+		Eip7683OffchainDiscovery::new(api_host, api_port, auth_token, network_ids, networks)
 			.map_err(|e| {
 				DiscoveryError::Connection(format!(
 					"Failed to create offchain discovery service: {}",

@@ -13,8 +13,8 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_transport_http::Http;
 use async_trait::async_trait;
 use solver_types::{
-	with_0x_prefix, ConfigSchema, Field, FieldType, Schema, Signature,
-	Transaction as SolverTransaction, TransactionHash, TransactionReceipt,
+	with_0x_prefix, ConfigSchema, Field, FieldType, NetworksConfig, Schema, SecretString,
+	Signature, Transaction as SolverTransaction, TransactionHash, TransactionReceipt,
 };
 use std::sync::Arc;
 
@@ -72,25 +72,29 @@ impl AlloyDelivery {
 /// delivery provider, including RPC URL and chain ID validation.
 pub struct AlloyDeliverySchema;
 
+impl AlloyDeliverySchema {
+	/// Static validation method for use before instance creation
+	pub fn validate_config(config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+		let instance = Self;
+		instance.validate(config)
+	}
+}
+
 impl ConfigSchema for AlloyDeliverySchema {
 	fn validate(&self, config: &toml::Value) -> Result<(), solver_types::ValidationError> {
-		let schema = Schema::new(
-			// Required fields
-			vec![
-				Field::new("rpc_url", FieldType::String).with_validator(|value| {
-					match value.as_str() {
-						Some(url) => {
-							if url.starts_with("http://") || url.starts_with("https://") {
-								Ok(())
-							} else {
-								Err("RPC URL must start with http:// or https://".to_string())
-							}
-						}
-						None => Err("Expected string value for rpc_url".to_string()),
-					}
-				}),
-				Field::new("private_key", FieldType::String).with_validator(|value| {
-					match value.as_str() {
+		let schema =
+			Schema::new(
+				// Required fields
+				vec![Field::new(
+					"network_id",
+					FieldType::Integer {
+						min: Some(1),
+						max: None,
+					},
+				)],
+				// Optional fields - private_key is now optional, defaults to account.config.private_key
+				vec![Field::new("private_key", FieldType::String).with_validator(
+					|value| match value.as_str() {
 						Some(key) => {
 							let key_without_prefix = key.strip_prefix("0x").unwrap_or(key);
 
@@ -107,19 +111,9 @@ impl ConfigSchema for AlloyDeliverySchema {
 							Ok(())
 						}
 						None => Err("Expected string value for private_key".to_string()),
-					}
-				}),
-				Field::new(
-					"chain_id",
-					FieldType::Integer {
-						min: Some(1),
-						max: None,
 					},
-				),
-			],
-			// Optional fields
-			vec![],
-		);
+				)],
+			);
 
 		schema.validate(config)
 	}
@@ -389,37 +383,49 @@ impl DeliveryInterface for AlloyDelivery {
 ///
 /// This function reads the delivery configuration and creates an AlloyDelivery
 /// instance. Required configuration parameters:
-/// - `rpc_url`: The HTTP RPC endpoint URL
-/// - `chain_id`: The blockchain network chain ID
-/// - `private_key`: The private key for transaction signing
+/// - `network_id`: The network ID (which is the chain ID)
+///
+/// Optional parameters:
+/// - `private_key`: The private key for transaction signing (defaults to account.config.private_key)
 pub fn create_http_delivery(
 	config: &toml::Value,
+	networks: &NetworksConfig,
+	default_private_key: Option<&SecretString>,
 ) -> Result<Box<dyn DeliveryInterface>, DeliveryError> {
-	let rpc_url = config
-		.get("rpc_url")
-		.and_then(|v| v.as_str())
-		.ok_or_else(|| DeliveryError::Network("rpc_url is required".to_string()))?;
+	// Validate configuration first
+	AlloyDeliverySchema::validate_config(config)
+		.map_err(|e| DeliveryError::Network(format!("Invalid configuration: {}", e)))?;
 
-	let chain_id = config
-		.get("chain_id")
+	let network_id = config
+		.get("network_id")
 		.and_then(|v| v.as_integer())
-		.ok_or_else(|| DeliveryError::Network("chain_id is required".to_string()))?
-		as u64;
+		.expect("network_id already validated") as u64;
 
-	let private_key = config
-		.get("private_key")
-		.and_then(|v| v.as_str())
-		.ok_or_else(|| DeliveryError::Network("private_key is required".to_string()))?;
+	// Resolve network configuration to get RPC URL
+	let network = networks.get(&network_id).ok_or_else(|| {
+		DeliveryError::Network(format!("Network {} not found in configuration", network_id))
+	})?;
 
-	// Parse the private key
-	let signer: PrivateKeySigner = private_key
-		.parse()
-		.map_err(|e| DeliveryError::Network(format!("Invalid private key: {}", e)))?;
+	// Parse the private key using with_exposed for better security
+	let signer: PrivateKeySigner =
+		if let Some(pk) = config.get("private_key").and_then(|v| v.as_str()) {
+			pk.parse()
+				.map_err(|_| DeliveryError::Network("Invalid private key format".to_string()))?
+		} else if let Some(default_pk) = default_private_key {
+			default_pk.with_exposed(|key| {
+				key.parse()
+					.map_err(|_| DeliveryError::Network("Invalid private key format".to_string()))
+			})?
+		} else {
+			return Err(DeliveryError::Network(
+				"private_key is required (either in provider config or account.config)".to_string(),
+			));
+		};
 
 	// Create delivery service synchronously, but the actual connection happens async
 	let delivery = tokio::task::block_in_place(|| {
 		tokio::runtime::Handle::current()
-			.block_on(async { AlloyDelivery::new(rpc_url, chain_id, signer).await })
+			.block_on(async { AlloyDelivery::new(&network.rpc_url, network_id, signer).await })
 	})?;
 
 	Ok(Box::new(delivery))

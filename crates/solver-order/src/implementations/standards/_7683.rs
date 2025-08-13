@@ -123,6 +123,14 @@ impl Eip7683OrderImpl {
 /// ```
 pub struct Eip7683OrderSchema;
 
+impl Eip7683OrderSchema {
+	/// Static validation method for use before instance creation
+	pub fn validate_config(config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+		let instance = Self;
+		instance.validate(config)
+	}
+}
+
 impl ConfigSchema for Eip7683OrderSchema {
 	fn validate(&self, config: &toml::Value) -> Result<(), solver_types::ValidationError> {
 		let schema = Schema::new(
@@ -599,9 +607,13 @@ impl OrderInterface for Eip7683OrderImpl {
 ///
 /// Returns an error if networks configuration is invalid.
 pub fn create_order_impl(
-	_config: &toml::Value,
+	config: &toml::Value,
 	networks: &NetworksConfig,
 ) -> Result<Box<dyn OrderInterface>, OrderError> {
+	// Validate configuration first
+	Eip7683OrderSchema::validate_config(config)
+		.map_err(|e| OrderError::InvalidOrder(format!("Invalid configuration: {}", e)))?;
+
 	let order_impl = Eip7683OrderImpl::new(networks.clone())?;
 	Ok(Box::new(order_impl))
 }

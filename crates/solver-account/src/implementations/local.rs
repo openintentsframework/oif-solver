@@ -10,7 +10,10 @@ use alloy_primitives::{Address as AlloyAddress, Bytes, TxKind};
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
-use solver_types::{Address, ConfigSchema, Field, FieldType, Schema, Signature, Transaction};
+use solver_types::{
+	with_0x_prefix, Address, ConfigSchema, Field, FieldType, Schema, SecretString, Signature,
+	Transaction,
+};
 
 /// Local wallet implementation using Alloy's signer.
 ///
@@ -34,10 +37,23 @@ impl LocalWallet {
 
 		Ok(Self { signer })
 	}
+
+	/// Returns the private key as a SecretString with 0x prefix.
+	pub fn get_private_key(&self) -> SecretString {
+		SecretString::from(&with_0x_prefix(&hex::encode(self.signer.to_bytes())) as &str)
+	}
 }
 
 /// Configuration schema for LocalWallet.
 pub struct LocalWalletSchema;
+
+impl LocalWalletSchema {
+	/// Static validation method for use before instance creation
+	pub fn validate_config(config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+		let instance = Self;
+		instance.validate(config)
+	}
+}
 
 impl ConfigSchema for LocalWalletSchema {
 	fn validate(&self, config: &toml::Value) -> Result<(), solver_types::ValidationError> {
@@ -129,6 +145,10 @@ impl AccountInterface for LocalWallet {
 
 		Ok(signature.into())
 	}
+
+	fn get_private_key(&self) -> Option<SecretString> {
+		Some(self.get_private_key())
+	}
 }
 
 /// Factory function to create an account provider from configuration.
@@ -143,12 +163,14 @@ impl AccountInterface for LocalWallet {
 /// - `private_key` is not provided in the configuration
 /// - The wallet creation fails
 pub fn create_account(config: &toml::Value) -> Result<Box<dyn AccountInterface>, AccountError> {
+	// Validate configuration first
+	LocalWalletSchema::validate_config(config)
+		.map_err(|e| AccountError::InvalidKey(format!("Invalid configuration: {}", e)))?;
+
 	let private_key = config
 		.get("private_key")
 		.and_then(|v| v.as_str())
-		.ok_or_else(|| {
-			AccountError::InvalidKey("private_key is required for local wallet".to_string())
-		})?;
+		.expect("private_key already validated");
 
 	Ok(Box::new(LocalWallet::new(private_key)?))
 }

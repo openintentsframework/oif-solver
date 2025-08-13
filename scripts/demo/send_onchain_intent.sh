@@ -46,30 +46,41 @@ if [ ! -f "config/demo.toml" ]; then
     exit 1
 fi
 
-# Load addresses from config - now from networks section
+# Load addresses from config - from networks section
 # For origin chain (31337)
 INPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31337\]' config/demo.toml | grep 'input_settler_address = ' | cut -d'"' -f2)
+OUTPUT_SETTLER_ADDRESS_ORIGIN=$(grep -A 5 '\[networks.31337\]' config/demo.toml | grep 'output_settler_address = ' | cut -d'"' -f2)
 # For destination chain (31338)
+INPUT_SETTLER_ADDRESS_DEST=$(grep -A 5 '\[networks.31338\]' config/demo.toml | grep 'input_settler_address = ' | cut -d'"' -f2)
 OUTPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31338\]' config/demo.toml | grep 'output_settler_address = ' | cut -d'"' -f2)
-# Solver address from accounts section
+
+# Get oracle address from settlement section - now it's a map per chain
+# Extract oracle address for origin chain (31337)
+ORACLE_ADDRESS=$(grep 'oracle_addresses = ' config/demo.toml | sed 's/.*31337 = "\([^"]*\)".*/\1/')
+
+# Parse token addresses from networks section
+# For origin chain tokens (31337)
+DEFAULT_ORIGIN_TOKEN=$(awk '/\[\[networks.31337.tokens\]\]/{f=1} f && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
+TOKENB_ORIGIN=$(awk '/\[\[networks.31337.tokens\]\]/{c++} c==2 && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
+
+# For destination chain tokens (31338)
+DEFAULT_DEST_TOKEN=$(awk '/\[\[networks.31338.tokens\]\]/{f=1} f && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
+TOKENB_DEST=$(awk '/\[\[networks.31338.tokens\]\]/{c++} c==2 && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
+
+# Account addresses from accounts section
 SOLVER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'solver = ' | cut -d'"' -f2)
-ORACLE_ADDRESS=$(grep 'oracle_address = ' config/demo.toml | cut -d'"' -f2)
-# Default to TokenA addresses
-DEFAULT_ORIGIN_TOKEN=$(grep -A 2 '\[contracts.origin\]' config/demo.toml | grep 'tokenA = ' | head -1 | cut -d'"' -f2)
-DEFAULT_DEST_TOKEN=$(grep -A 2 '\[contracts.destination\]' config/demo.toml | grep 'tokenA = ' | head -1 | cut -d'"' -f2)
-TOKENB_ORIGIN=$(grep -A 2 '\[contracts.origin\]' config/demo.toml | grep 'tokenB = ' | head -1 | cut -d'"' -f2)
-TOKENB_DEST=$(grep -A 2 '\[contracts.destination\]' config/demo.toml | grep 'tokenB = ' | head -1 | cut -d'"' -f2)
 USER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'user = ' | cut -d'"' -f2)
 USER_PRIVATE_KEY=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'user_private_key = ' | cut -d'"' -f2)
 RECIPIENT_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'recipient = ' | cut -d'"' -f2)
 
-# Configuration
-ORIGIN_RPC_URL=$(grep -A 2 '\[delivery.providers.origin\]' config/demo.toml | grep 'rpc_url = ' | head -1 | cut -d'"' -f2)
-DEST_RPC_URL=$(grep -A 2 '\[delivery.providers.destination\]' config/demo.toml | grep 'rpc_url = ' | head -1 | cut -d'"' -f2)
+# Configuration - Parse chain IDs and RPC URLs from networks section
+# Chain IDs are the network keys themselves
+ORIGIN_CHAIN_ID=31337
+DEST_CHAIN_ID=31338
+ORIGIN_RPC_URL=$(grep -A 2 '\[networks.31337\]' config/demo.toml | grep 'rpc_url = ' | cut -d'"' -f2)
+DEST_RPC_URL=$(grep -A 2 '\[networks.31338\]' config/demo.toml | grep 'rpc_url = ' | cut -d'"' -f2)
 RPC_URL=$ORIGIN_RPC_URL  # Default for compatibility
 AMOUNT="1000000000000000000"  # 1 token
-ORIGIN_CHAIN_ID=$(grep -A 3 '\[delivery.providers.origin\]' config/demo.toml | grep 'chain_id = ' | head -1 | awk '{print $3}')
-DEST_CHAIN_ID=$(grep -A 3 '\[delivery.providers.destination\]' config/demo.toml | grep 'chain_id = ' | head -1 | awk '{print $3}')
 
 # Parse command line arguments for token addresses
 if [ -n "$1" ] && [[ "$1" =~ ^0x[a-fA-F0-9]{40}$ ]]; then
@@ -106,8 +117,8 @@ echo -e "   User (depositor): $USER_ADDR"
 echo -e "   Solver:           $SOLVER_ADDR"
 echo -e "   Recipient:        $RECIPIENT_ADDR"
 echo -e "   Amount:           1.0 tokens"
-echo -e "   Origin Token:     $ORIGIN_TOKEN_ADDRESS ($ORIGIN_SYMBOL - Chain 31337)"
-echo -e "   Dest Token:       $DEST_TOKEN_ADDRESS ($DEST_SYMBOL - Chain 31338)"
+echo -e "   Origin Token:     $ORIGIN_TOKEN_ADDRESS ($ORIGIN_SYMBOL - Chain $ORIGIN_CHAIN_ID)"
+echo -e "   Dest Token:       $DEST_TOKEN_ADDRESS ($DEST_SYMBOL - Chain $DEST_CHAIN_ID)"
 echo -e "   InputSettler:     $INPUT_SETTLER_ADDRESS (Origin)"
 echo -e "   OutputSettler:    $OUTPUT_SETTLER_ADDRESS (Destination)"
 
@@ -136,38 +147,38 @@ check_balance() {
 show_balances() {
     if [ "$COMMAND" = "balances" ]; then
         # Show all token balances when checking balances
-        echo -e "${BLUE}💰 TokenA Balances on Origin Chain (31337):${NC}"
-        check_balance $USER_ADDR "User" $ORIGIN_RPC_URL $TOKENA_ORIGIN
-        check_balance $SOLVER_ADDR "Solver" $ORIGIN_RPC_URL $TOKENA_ORIGIN
-        check_balance $RECIPIENT_ADDR "Recipient" $ORIGIN_RPC_URL $TOKENA_ORIGIN
-        check_balance $INPUT_SETTLER_ADDRESS "InputSettler" $ORIGIN_RPC_URL $TOKENA_ORIGIN
+        echo -e "${BLUE}💰 TokenA Balances on Origin Chain ($ORIGIN_CHAIN_ID):${NC}"
+        check_balance $USER_ADDR "User" $ORIGIN_RPC_URL $DEFAULT_ORIGIN_TOKEN
+        check_balance $SOLVER_ADDR "Solver" $ORIGIN_RPC_URL $DEFAULT_ORIGIN_TOKEN
+        check_balance $RECIPIENT_ADDR "Recipient" $ORIGIN_RPC_URL $DEFAULT_ORIGIN_TOKEN
+        check_balance $INPUT_SETTLER_ADDRESS "InputSettler" $ORIGIN_RPC_URL $DEFAULT_ORIGIN_TOKEN
         
-        echo -e "${BLUE}💰 TokenB Balances on Origin Chain (31337):${NC}"
+        echo -e "${BLUE}💰 TokenB Balances on Origin Chain ($ORIGIN_CHAIN_ID):${NC}"
         check_balance $USER_ADDR "User" $ORIGIN_RPC_URL $TOKENB_ORIGIN
         check_balance $SOLVER_ADDR "Solver" $ORIGIN_RPC_URL $TOKENB_ORIGIN
         check_balance $RECIPIENT_ADDR "Recipient" $ORIGIN_RPC_URL $TOKENB_ORIGIN
         check_balance $INPUT_SETTLER_ADDRESS "InputSettler" $ORIGIN_RPC_URL $TOKENB_ORIGIN
         
-        echo -e "${BLUE}💰 TokenA Balances on Destination Chain (31338):${NC}"
-        check_balance $USER_ADDR "User" $DEST_RPC_URL $TOKENA_DEST
-        check_balance $SOLVER_ADDR "Solver" $DEST_RPC_URL $TOKENA_DEST
-        check_balance $RECIPIENT_ADDR "Recipient" $DEST_RPC_URL $TOKENA_DEST
-        check_balance $OUTPUT_SETTLER_ADDRESS "OutputSettler" $DEST_RPC_URL $TOKENA_DEST
+        echo -e "${BLUE}💰 TokenA Balances on Destination Chain ($DEST_CHAIN_ID):${NC}"
+        check_balance $USER_ADDR "User" $DEST_RPC_URL $DEFAULT_DEST_TOKEN
+        check_balance $SOLVER_ADDR "Solver" $DEST_RPC_URL $DEFAULT_DEST_TOKEN
+        check_balance $RECIPIENT_ADDR "Recipient" $DEST_RPC_URL $DEFAULT_DEST_TOKEN
+        check_balance $OUTPUT_SETTLER_ADDRESS "OutputSettler" $DEST_RPC_URL $DEFAULT_DEST_TOKEN
         
-        echo -e "${BLUE}💰 TokenB Balances on Destination Chain (31338):${NC}"
+        echo -e "${BLUE}💰 TokenB Balances on Destination Chain ($DEST_CHAIN_ID):${NC}"
         check_balance $USER_ADDR "User" $DEST_RPC_URL $TOKENB_DEST
         check_balance $SOLVER_ADDR "Solver" $DEST_RPC_URL $TOKENB_DEST
         check_balance $RECIPIENT_ADDR "Recipient" $DEST_RPC_URL $TOKENB_DEST
         check_balance $OUTPUT_SETTLER_ADDRESS "OutputSettler" $DEST_RPC_URL $TOKENB_DEST
     else
         # Show only relevant token balances for intent
-        echo -e "${BLUE}💰 Current Balances on Origin Chain (31337) - $ORIGIN_SYMBOL:${NC}"
+        echo -e "${BLUE}💰 Current Balances on Origin Chain ($ORIGIN_CHAIN_ID) - $ORIGIN_SYMBOL:${NC}"
         check_balance $USER_ADDR "User" $ORIGIN_RPC_URL $ORIGIN_TOKEN_ADDRESS
         check_balance $SOLVER_ADDR "Solver" $ORIGIN_RPC_URL $ORIGIN_TOKEN_ADDRESS
         check_balance $RECIPIENT_ADDR "Recipient" $ORIGIN_RPC_URL $ORIGIN_TOKEN_ADDRESS
         check_balance $INPUT_SETTLER_ADDRESS "InputSettler" $ORIGIN_RPC_URL $ORIGIN_TOKEN_ADDRESS
         
-        echo -e "${BLUE}💰 Current Balances on Destination Chain (31338) - $DEST_SYMBOL:${NC}"
+        echo -e "${BLUE}💰 Current Balances on Destination Chain ($DEST_CHAIN_ID) - $DEST_SYMBOL:${NC}"
         check_balance $USER_ADDR "User" $DEST_RPC_URL $DEST_TOKEN_ADDRESS
         check_balance $SOLVER_ADDR "Solver" $DEST_RPC_URL $DEST_TOKEN_ADDRESS
         check_balance $RECIPIENT_ADDR "Recipient" $DEST_RPC_URL $DEST_TOKEN_ADDRESS
@@ -411,21 +422,28 @@ case "$COMMAND" in
                 exit 1
             fi
             
-            # Parse the order section - now from networks section
+            # Chain IDs are the network keys themselves
+            ORIGIN_CHAIN_ID=31337
+            DEST_CHAIN_ID=31338
+            
+            # Parse addresses from networks section
             INPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31337\]' config/demo.toml | grep 'input_settler_address = ' | cut -d'"' -f2)
             OUTPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31338\]' config/demo.toml | grep 'output_settler_address = ' | cut -d'"' -f2)
-            # Solver address from accounts section
-            SOLVER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'solver = ' | cut -d'"' -f2)
             
-            # Parse the demo configuration section - use both tokens for balance check
-            TOKENA_ORIGIN=$(grep -A 2 '\[contracts.origin\]' config/demo.toml | grep 'tokenA = ' | head -1 | cut -d'"' -f2)
-            TOKENA_DEST=$(grep -A 2 '\[contracts.destination\]' config/demo.toml | grep 'tokenA = ' | head -1 | cut -d'"' -f2)
-            TOKENB_ORIGIN=$(grep -A 2 '\[contracts.origin\]' config/demo.toml | grep 'tokenB = ' | head -1 | cut -d'"' -f2)
-            TOKENB_DEST=$(grep -A 2 '\[contracts.destination\]' config/demo.toml | grep 'tokenB = ' | head -1 | cut -d'"' -f2)
+            # Parse token addresses from networks section
+            DEFAULT_ORIGIN_TOKEN=$(awk '/\[\[networks.31337.tokens\]\]/{f=1} f && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
+            TOKENB_ORIGIN=$(awk '/\[\[networks.31337.tokens\]\]/{c++} c==2 && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
+            DEFAULT_DEST_TOKEN=$(awk '/\[\[networks.31338.tokens\]\]/{f=1} f && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
+            TOKENB_DEST=$(awk '/\[\[networks.31338.tokens\]\]/{c++} c==2 && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
+            
+            # Account addresses from accounts section
+            SOLVER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'solver = ' | cut -d'"' -f2)
             USER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'user = ' | head -1 | cut -d'"' -f2)
             RECIPIENT_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'recipient = ' | head -1 | cut -d'"' -f2)
-            ORIGIN_RPC_URL=$(grep -A 10 '\\[delivery.providers.origin\\]' config/demo.toml | grep 'rpc_url = ' | cut -d'\"' -f2)
-            DEST_RPC_URL=$(grep -A 10 '\\[delivery.providers.destination\\]' config/demo.toml | grep 'rpc_url = ' | cut -d'\"' -f2)
+            
+            # RPC URLs from networks section
+            ORIGIN_RPC_URL=$(grep -A 2 '\[networks.31337\]' config/demo.toml | grep 'rpc_url = ' | cut -d'"' -f2)
+            DEST_RPC_URL=$(grep -A 2 '\[networks.31338\]' config/demo.toml | grep 'rpc_url = ' | cut -d'"' -f2)
             show_balances
         else
             echo -e "${RED}❌ Configuration not found!${NC}"
@@ -440,14 +458,18 @@ case "$COMMAND" in
                 exit 1
             fi
             
-            # Parse the order section - now from networks section
+            # Parse addresses from networks section
             INPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31337\]' config/demo.toml | grep 'input_settler_address = ' | cut -d'"' -f2)
             
-            # Parse the demo configuration section
-            ORIGIN_TOKEN_ADDRESS=$(grep -A 2 '\[contracts.origin\]' config/demo.toml | grep 'tokenA = ' | head -1 | cut -d'"' -f2)
+            # Parse token address from networks section (default to TokenA)
+            ORIGIN_TOKEN_ADDRESS=$(awk '/\[\[networks.31337.tokens\]\]/{f=1} f && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
+            
+            # Account addresses from accounts section
             USER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'user = ' | head -1 | cut -d'"' -f2)
             USER_PRIVATE_KEY=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'user_private_key = ' | head -1 | cut -d'"' -f2)
-            RPC_URL=$(grep -A 10 '\\[delivery.providers.origin\\]' config/demo.toml | grep 'rpc_url = ' | cut -d'\"' -f2)
+            
+            # RPC URL from networks section
+            RPC_URL=$(grep -A 2 '\[networks.31337\]' config/demo.toml | grep 'rpc_url = ' | cut -d'"' -f2)
             AMOUNT="1000000000000000000"  # 1 token
             approve_tokens
         else

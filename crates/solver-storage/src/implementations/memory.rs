@@ -74,6 +74,14 @@ impl StorageInterface for MemoryStorage {
 /// Configuration schema for MemoryStorage.
 pub struct MemoryStorageSchema;
 
+impl MemoryStorageSchema {
+	/// Static validation method for use before instance creation
+	pub fn validate_config(config: &toml::Value) -> Result<(), ValidationError> {
+		let instance = Self;
+		instance.validate(config)
+	}
+}
+
 impl ConfigSchema for MemoryStorageSchema {
 	fn validate(&self, _config: &toml::Value) -> Result<(), ValidationError> {
 		// Memory storage has no required configuration
@@ -86,7 +94,11 @@ impl ConfigSchema for MemoryStorageSchema {
 ///
 /// Configuration parameters:
 /// - None required for memory storage
-pub fn create_storage(_config: &toml::Value) -> Result<Box<dyn StorageInterface>, StorageError> {
+pub fn create_storage(config: &toml::Value) -> Result<Box<dyn StorageInterface>, StorageError> {
+	// Validate configuration first (even though memory storage has no config)
+	MemoryStorageSchema::validate_config(config)
+		.map_err(|e| StorageError::Configuration(format!("Invalid configuration: {}", e)))?;
+
 	Ok(Box::new(MemoryStorage::new()))
 }
 

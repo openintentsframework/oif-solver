@@ -302,31 +302,25 @@ impl Eip7683Discovery {
 /// for monitoring blockchain events.
 pub struct Eip7683DiscoverySchema;
 
+impl Eip7683DiscoverySchema {
+	/// Static validation method for use before instance creation
+	pub fn validate_config(config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+		let instance = Self;
+		instance.validate(config)
+	}
+}
+
 impl ConfigSchema for Eip7683DiscoverySchema {
 	fn validate(&self, config: &toml::Value) -> Result<(), solver_types::ValidationError> {
 		let schema = Schema::new(
 			// Required fields
-			vec![
-				Field::new("rpc_url", FieldType::String).with_validator(|value| {
-					match value.as_str() {
-						Some(url) => {
-							if url.starts_with("http://") || url.starts_with("https://") {
-								Ok(())
-							} else {
-								Err("RPC URL must start with http:// or https://".to_string())
-							}
-						}
-						None => Err("Expected string value for rpc_url".to_string()),
-					}
-				}),
-				Field::new(
-					"chain_id",
-					FieldType::Integer {
-						min: Some(1),
-						max: None,
-					},
-				),
-			],
+			vec![Field::new(
+				"network_id",
+				FieldType::Integer {
+					min: Some(1),
+					max: None,
+				},
+			)],
 			// Optional fields
 			vec![
 				Field::new(
@@ -431,16 +425,22 @@ pub fn create_discovery(
 	config: &toml::Value,
 	networks: &NetworksConfig,
 ) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError> {
-	let rpc_url = config
-		.get("rpc_url")
-		.and_then(|v| v.as_str())
-		.ok_or_else(|| DiscoveryError::ValidationError("rpc_url is required".to_string()))?;
+	// Validate configuration first
+	Eip7683DiscoverySchema::validate_config(config)
+		.map_err(|e| DiscoveryError::ValidationError(format!("Invalid configuration: {}", e)))?;
 
-	let chain_id = config
-		.get("chain_id")
+	let network_id = config
+		.get("network_id")
 		.and_then(|v| v.as_integer())
-		.ok_or_else(|| DiscoveryError::ValidationError("chain_id is required".to_string()))?
-		as u64;
+		.expect("network_id already validated") as u64;
+
+	// Resolve network configuration to get RPC URL
+	let network = networks.get(&network_id).ok_or_else(|| {
+		DiscoveryError::ValidationError(format!(
+			"Network {} not found in configuration",
+			network_id
+		))
+	})?;
 
 	let polling_interval_secs = config
 		.get("polling_interval_secs")
@@ -450,7 +450,13 @@ pub fn create_discovery(
 	// Create discovery service synchronously
 	let discovery = tokio::task::block_in_place(|| {
 		tokio::runtime::Handle::current().block_on(async {
-			Eip7683Discovery::new(rpc_url, chain_id, networks.clone(), polling_interval_secs).await
+			Eip7683Discovery::new(
+				&network.rpc_url,
+				network_id,
+				networks.clone(),
+				polling_interval_secs,
+			)
+			.await
 		})
 	})?;
 

@@ -74,6 +74,7 @@ async fn store_quotes(solver: &SolverEngine, quotes: &[Quote], ttl: Duration) {
 	}
 }
 
+#[allow(dead_code)]
 /// Retrieves a stored quote by its ID.
 ///
 /// This function looks up a previously generated quote in storage.
@@ -99,6 +100,7 @@ pub async fn get_quote_by_id(quote_id: &str, solver: &SolverEngine) -> Result<Qu
 	}
 }
 
+#[allow(dead_code)]
 /// Checks if a quote exists in storage.
 ///
 /// This is useful for validating quote IDs before processing intents.

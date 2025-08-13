@@ -5,7 +5,7 @@
 //! such as address retrieval and transaction signing.
 
 use async_trait::async_trait;
-use solver_types::{Address, ConfigSchema, Signature, Transaction};
+use solver_types::{Address, ConfigSchema, SecretString, Signature, Transaction};
 use thiserror::Error;
 
 /// Re-export implementations
@@ -57,6 +57,14 @@ pub trait AccountInterface: Send + Sync {
 	/// Takes a byte slice representing the message and returns a signature.
 	/// This is useful for message authentication and verification purposes.
 	async fn sign_message(&self, message: &[u8]) -> Result<Signature, AccountError>;
+
+	/// Returns the private key as a SecretString with 0x prefix.
+	///
+	/// This is used by delivery providers that need access to the private key
+	/// when not explicitly configured.
+	fn get_private_key(&self) -> Option<SecretString> {
+		None // Default implementation returns None
+	}
 }
 
 /// Service that manages account operations.
@@ -89,5 +97,12 @@ impl AccountService {
 	/// This method delegates to the underlying provider's sign_transaction method.
 	pub async fn sign(&self, tx: &Transaction) -> Result<Signature, AccountError> {
 		self.provider.sign_transaction(tx).await
+	}
+
+	/// Returns the private key as a SecretString.
+	///
+	/// This is used by delivery providers when they don't have an explicit private key configured.
+	pub fn get_private_key(&self) -> Option<SecretString> {
+		self.provider.get_private_key()
 	}
 }
