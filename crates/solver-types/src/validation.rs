@@ -1,4 +1,8 @@
 //! Configuration validation utilities for the OIF solver system.
+//!
+//! This module provides a flexible and type-safe framework for validating TOML configuration
+//! files. It supports hierarchical validation with nested schemas, custom validators, and
+//! detailed error reporting.
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -24,20 +28,40 @@ pub enum ValidationError {
 	DeserializationError(String),
 }
 
-/// Type of a configuration field.
+/// Represents the type of a configuration field.
+///
+/// This enum defines the possible types that a field in a TOML configuration
+/// can have, including primitive types and complex structures.
 #[derive(Debug)]
 pub enum FieldType {
+	/// A string value.
 	String,
-	Integer { min: Option<i64>, max: Option<i64> },
+	/// An integer value with optional minimum and maximum bounds.
+	Integer {
+		/// Minimum allowed value (inclusive).
+		min: Option<i64>,
+		/// Maximum allowed value (inclusive).
+		max: Option<i64>,
+	},
+	/// A boolean value (true/false).
 	Boolean,
+	/// An array of values, all of the same type.
 	Array(Box<FieldType>),
+	/// A nested table with its own schema.
 	Table(Schema),
 }
 
 /// Type alias for field validator functions.
+///
+/// Validators are custom functions that can perform additional validation
+/// beyond type checking. They receive a TOML value and return an error
+/// message if validation fails.
 pub type FieldValidator = Box<dyn Fn(&toml::Value) -> Result<(), String> + Send + Sync>;
 
-/// A field definition with name and type.
+/// Represents a field in a configuration schema.
+///
+/// A field has a name, a type, and an optional custom validator function.
+/// Fields can be either required or optional within a schema.
 pub struct Field {
 	pub name: String,
 	pub field_type: FieldType,
@@ -56,6 +80,11 @@ impl std::fmt::Debug for Field {
 
 impl Field {
 	/// Creates a new field with the given name and type.
+	///
+	/// # Arguments
+	///
+	/// * `name` - The name of the field as it appears in the TOML configuration
+	/// * `field_type` - The expected type of the field
 	pub fn new(name: impl Into<String>, field_type: FieldType) -> Self {
 		Self {
 			name: name.into(),
@@ -65,6 +94,14 @@ impl Field {
 	}
 
 	/// Adds a custom validator to this field.
+	///
+	/// Custom validators allow for complex validation logic beyond simple type checking.
+	/// The validator function receives the field's value and should return an error
+	/// message if validation fails.
+	///
+	/// # Arguments
+	///
+	/// * `validator` - A closure that validates the field value
 	pub fn with_validator<F>(mut self, validator: F) -> Self
 	where
 		F: Fn(&toml::Value) -> Result<(), String> + Send + Sync + 'static,
@@ -74,7 +111,13 @@ impl Field {
 	}
 }
 
-/// Schema definition with required and optional fields.
+/// Defines a validation schema for TOML configuration.
+///
+/// A schema consists of required fields that must be present and optional
+/// fields that may be present. Each field has a type and optional custom
+/// validation logic.
+///
+/// Schemas can be nested to validate complex hierarchical configurations.
 #[derive(Debug)]
 pub struct Schema {
 	pub required: Vec<Field>,
@@ -83,11 +126,39 @@ pub struct Schema {
 
 impl Schema {
 	/// Creates a new schema with required and optional fields.
+	///
+	/// # Arguments
+	///
+	/// * `required` - Fields that must be present in the configuration
+	/// * `optional` - Fields that may be present but are not required
 	pub fn new(required: Vec<Field>, optional: Vec<Field>) -> Self {
 		Self { required, optional }
 	}
 
 	/// Validates a TOML value against this schema.
+	///
+	/// This method performs comprehensive validation:
+	/// 1. Checks that all required fields are present
+	/// 2. Validates the type of each field
+	/// 3. Runs custom validators if defined
+	/// 4. Recursively validates nested tables
+	///
+	/// # Arguments
+	///
+	/// * `config` - The TOML value to validate
+	///
+	/// # Returns
+	///
+	/// * `Ok(())` if validation succeeds
+	/// * `Err(ValidationError)` with details about what failed
+	///
+	/// # Errors
+	///
+	/// Returns an error if:
+	/// - A required field is missing
+	/// - A field has the wrong type
+	/// - A custom validator fails
+	/// - A nested schema validation fails
 	pub fn validate(&self, config: &toml::Value) -> Result<(), ValidationError> {
 		let table = config
 			.as_table()
@@ -134,6 +205,21 @@ impl Schema {
 }
 
 /// Validates that a value matches the expected field type.
+///
+/// This function performs type checking and recursively validates nested structures.
+/// For integers, it also checks min/max bounds. For arrays, it validates each element.
+/// For tables, it delegates to the nested schema.
+///
+/// # Arguments
+///
+/// * `field_name` - The name of the field being validated (for error messages)
+/// * `value` - The TOML value to validate
+/// * `expected_type` - The expected type of the field
+///
+/// # Returns
+///
+/// * `Ok(())` if the value matches the expected type
+/// * `Err(ValidationError)` with details about the type mismatch
 fn validate_field_type(
 	field_name: &str,
 	value: &toml::Value,
@@ -225,6 +311,10 @@ fn validate_field_type(
 }
 
 /// Trait defining a configuration schema that can validate TOML values.
+///
+/// Implement this trait to create custom configuration validators that can
+/// be used across different parts of the application. This is particularly
+/// useful for plugin systems or when you need polymorphic validation behavior.
 #[async_trait]
 pub trait ConfigSchema: Send + Sync {
 	/// Validates a TOML configuration value against this schema.

@@ -9,14 +9,12 @@ pub mod validation;
 
 // Re-export main functionality
 pub use generation::QuoteGenerator;
-pub use validation::QuoteValidator;
-
-// Main API function
 use solver_config::Config;
 use solver_core::SolverEngine;
 use solver_types::{GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, StorageKey};
 use std::time::Duration;
 use tracing::info;
+pub use validation::QuoteValidator;
 
 /// Processes a quote request and returns available quote options.
 ///
@@ -35,14 +33,23 @@ pub async fn process_quote_request(
 	// 1. Validate the request
 	QuoteValidator::validate_request(&request)?;
 
-	// 2. Check solver capabilities
-	// TODO: Implement solver capability checking
+	// 2. Check solver capabilities: networks only (token support is enforced during collection below)
+	QuoteValidator::validate_supported_networks(&request, solver)?;
 
-	// 3. Generate quotes using the business logic layer
+	// 3. Collect supported assets for this request (for later use: balances/custody/pricing)
+	let (_supported_inputs, supported_outputs) = (
+		QuoteValidator::collect_supported_available_inputs(&request, solver)?,
+		QuoteValidator::validate_and_collect_requested_outputs(&request, solver)?,
+	);
+
+	// Check destination balances for required outputs
+	QuoteValidator::ensure_destination_balances(solver, &supported_outputs).await?;
+
+	// 4. Generate quotes using the business logic layer
 	let quote_generator = QuoteGenerator::new();
 	let quotes = quote_generator.generate_quotes(&request, config).await?;
 
-	// 4. Persist quotes
+	// 5. Persist quotes
 	let quote_ttl = Duration::from_secs(300);
 	store_quotes(solver, &quotes, quote_ttl).await;
 

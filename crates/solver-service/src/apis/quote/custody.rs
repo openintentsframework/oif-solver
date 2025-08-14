@@ -200,6 +200,19 @@ impl CustodyStrategy {
 				.parse()
 				.unwrap(),
 		);
+		// Local Anvil demo chains
+		addresses.insert(
+			31337,
+			"0x000000000022D473030F116dDEE9F6B43aC78BA3"
+				.parse()
+				.unwrap(),
+		);
+		addresses.insert(
+			31338,
+			"0x000000000022D473030F116dDEE9F6B43aC78BA3"
+				.parse()
+				.unwrap(),
+		);
 
 		addresses
 	}
