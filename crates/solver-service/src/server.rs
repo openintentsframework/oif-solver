@@ -53,7 +53,7 @@ pub async fn start_server(
 	// Extract discovery service URL once during startup
 	let discovery_url = config
 		.discovery
-		.sources
+		.implementations
 		.get("offchain_eip7683")
 		.map(|discovery_config| {
 			let api_host = discovery_config

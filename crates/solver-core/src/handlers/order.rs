@@ -79,7 +79,7 @@ impl OrderHandler {
 			// Submit prepare transaction
 			let prepare_tx_hash = self
 				.delivery
-				.deliver(prepare_tx)
+				.deliver(prepare_tx.clone())
 				.await
 				.map_err(|e| OrderError::Service(e.to_string()))?;
 
@@ -88,6 +88,7 @@ impl OrderHandler {
 					order_id: order.id.clone(),
 					tx_hash: prepare_tx_hash.clone(),
 					tx_type: TransactionType::Prepare,
+					tx_chain_id: prepare_tx.chain_id,
 				}))
 				.ok();
 
@@ -148,7 +149,7 @@ impl OrderHandler {
 		// Submit transaction
 		let tx_hash = self
 			.delivery
-			.deliver(tx)
+			.deliver(tx.clone())
 			.await
 			.map_err(|e| OrderError::Service(e.to_string()))?;
 
@@ -157,6 +158,7 @@ impl OrderHandler {
 				order_id: order.id.clone(),
 				tx_hash: tx_hash.clone(),
 				tx_type: TransactionType::Fill,
+				tx_chain_id: tx.chain_id,
 			}))
 			.ok();
 

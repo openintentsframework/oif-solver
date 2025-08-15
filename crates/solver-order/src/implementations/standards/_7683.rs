@@ -617,3 +617,17 @@ pub fn create_order_impl(
 	let order_impl = Eip7683OrderImpl::new(networks.clone())?;
 	Ok(Box::new(order_impl))
 }
+
+/// Registry for the EIP-7683 order implementation.
+pub struct Registry;
+
+impl solver_types::ImplementationRegistry for Registry {
+	const NAME: &'static str = "eip7683";
+	type Factory = crate::OrderFactory;
+
+	fn factory() -> Self::Factory {
+		create_order_impl
+	}
+}
+
+impl crate::OrderRegistry for Registry {}

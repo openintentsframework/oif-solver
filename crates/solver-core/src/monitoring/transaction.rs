@@ -37,6 +37,7 @@ impl TransactionMonitor {
 		order_id: String,
 		tx_hash: TransactionHash,
 		tx_type: TransactionType,
+		tx_chain_id: u64,
 	) {
 		let monitoring_timeout = tokio::time::Duration::from_secs(self.timeout_minutes * 60);
 		let poll_interval = tokio::time::Duration::from_secs(3);
@@ -57,10 +58,14 @@ impl TransactionMonitor {
 			}
 
 			// Try to get transaction status
-			match self.delivery.get_status(&tx_hash).await {
+			match self.delivery.get_status(&tx_hash, tx_chain_id).await {
 				Ok(true) => {
 					// Transaction is confirmed and successful
-					match self.delivery.confirm_with_default(&tx_hash).await {
+					match self
+						.delivery
+						.confirm_with_default(&tx_hash, tx_chain_id)
+						.await
+					{
 						Ok(receipt) => {
 							tracing::info!("Confirmed",);
 							self.event_bus
@@ -101,7 +106,9 @@ impl TransactionMonitor {
 				Err(e) => {
 					// Transaction not yet confirmed or error
 					let message = match &e {
-						DeliveryError::NoProviderAvailable => "Waiting for transaction to be mined",
+						DeliveryError::NoImplementationAvailable => {
+							"Waiting for transaction to be mined"
+						}
 						_ => "Checking transaction status",
 					};
 

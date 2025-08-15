@@ -18,6 +18,8 @@ pub mod events;
 pub mod networks;
 /// Order processing types including intents, orders, and execution contexts.
 pub mod order;
+/// Registry trait for self-registering implementations.
+pub mod registry;
 /// Secure string type for handling sensitive data.
 pub mod secret_string;
 /// Standard-specific types for different cross-chain protocols.
@@ -37,6 +39,7 @@ pub use discovery::*;
 pub use events::*;
 pub use networks::{NetworkConfig, NetworksConfig, TokenConfig};
 pub use order::*;
+pub use registry::ImplementationRegistry;
 pub use secret_string::SecretString;
 pub use standards::{
 	eip7683::{Eip7683OrderData, Output as Eip7683Output},
@@ -44,6 +47,7 @@ pub use standards::{
 };
 pub use storage::*;
 pub use utils::{
-	bytes32_to_address, format_token_amount, truncate_id, with_0x_prefix, without_0x_prefix,
+	bytes32_to_address, current_timestamp, format_token_amount, truncate_id, with_0x_prefix,
+	without_0x_prefix,
 };
 pub use validation::*;

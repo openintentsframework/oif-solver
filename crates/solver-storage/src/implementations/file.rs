@@ -408,3 +408,17 @@ pub fn create_storage(config: &toml::Value) -> Result<Box<dyn StorageInterface>,
 		ttl_config,
 	)))
 }
+
+/// Registry for the file storage implementation.
+pub struct Registry;
+
+impl solver_types::ImplementationRegistry for Registry {
+	const NAME: &'static str = "file";
+	type Factory = crate::StorageFactory;
+
+	fn factory() -> Self::Factory {
+		create_storage
+	}
+}
+
+impl crate::StorageRegistry for Registry {}

@@ -232,9 +232,9 @@ impl SolverEngine {
 							.await;
 						}
 
-						SolverEvent::Delivery(DeliveryEvent::TransactionPending { order_id, tx_hash, tx_type }) => {
+						SolverEvent::Delivery(DeliveryEvent::TransactionPending { order_id, tx_hash, tx_type, tx_chain_id }) => {
 							self.spawn_handler(&semaphore, move |engine| async move {
-								engine.transaction_handler.monitor_transaction(order_id, tx_hash, tx_type).await;
+								engine.transaction_handler.monitor_transaction(order_id, tx_hash, tx_type, tx_chain_id).await;
 								Ok(())
 							})
 							.await;

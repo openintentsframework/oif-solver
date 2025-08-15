@@ -6,24 +6,14 @@
 
 use clap::Parser;
 use solver_config::Config;
-use solver_core::{SolverBuilder, SolverEngine, SolverFactories};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 mod apis;
+mod factory_registry;
 mod server;
 
-// Import implementations from individual crates
-use solver_account::implementations::local::create_account;
-use solver_delivery::implementations::evm::alloy::create_http_delivery;
-use solver_discovery::implementations::offchain::_7683::create_discovery as offchain_create_discovery;
-use solver_discovery::implementations::onchain::_7683::create_discovery as onchain_create_discovery;
-use solver_order::implementations::{
-	standards::_7683::create_order_impl, strategies::simple::create_strategy,
-};
-use solver_settlement::implementations::direct::create_settlement;
-use solver_storage::implementations::file::create_storage as create_file_storage;
-use solver_storage::implementations::memory::create_storage as create_memory_storage;
+use factory_registry::build_solver_from_config;
 
 /// Command-line arguments for the solver service.
 #[derive(Parser, Debug)]
@@ -67,11 +57,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	tracing::info!("Started solver");
 
 	// Load configuration
-	let config = Config::from_file_async(args.config.to_str().unwrap()).await?;
+	let config = Config::from_file(args.config.to_str().unwrap()).await?;
 	tracing::info!("Loaded configuration [{}]", config.solver.id);
 
-	// Build solver engine with implementations
-	let solver = build_solver(config.clone()).await?;
+	// Build solver engine with implementations using the factory registry
+	let solver = build_solver_from_config(config.clone()).await?;
 	let solver = Arc::new(solver);
 
 	// Check if API server should be started
@@ -104,110 +94,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 	tracing::info!("Stopped solver");
 	Ok(())
-}
-
-/// Macro to create a factory HashMap with the appropriate type aliases
-macro_rules! create_factory_map {
-    ($interface:path, $error:path, $( $name:literal => $factory:expr ),* $(,)?) => {{
-        let mut factories = std::collections::HashMap::new();
-        $(
-            factories.insert(
-                $name.to_string(),
-                $factory as fn(&toml::Value) -> Result<Box<dyn $interface>, $error>
-            );
-        )*
-        factories
-    }};
-
-    // Variant for factories that take networks config
-    ($interface:path, $error:path, networks, $( $name:literal => $factory:expr ),* $(,)?) => {{
-        let mut factories = std::collections::HashMap::new();
-        $(
-            factories.insert(
-                $name.to_string(),
-                $factory as fn(&toml::Value, &solver_types::NetworksConfig) -> Result<Box<dyn $interface>, $error>
-            );
-        )*
-        factories
-    }};
-
-    // Variant for delivery factories that take networks and optional private key
-    ($interface:path, $error:path, delivery, $( $name:literal => $factory:expr ),* $(,)?) => {{
-        let mut factories = std::collections::HashMap::new();
-        $(
-            factories.insert(
-                $name.to_string(),
-                $factory as fn(&toml::Value, &solver_types::NetworksConfig, Option<&solver_types::SecretString>) -> Result<Box<dyn $interface>, $error>
-            );
-        )*
-        factories
-    }};
-}
-
-/// Builds the solver engine with all necessary implementations.
-///
-/// This function wires up all the concrete implementations for:
-/// - Storage backends (e.g., in-memory, Redis)
-/// - Account providers (e.g., local keys, AWS KMS)
-/// - Delivery mechanisms (e.g., HTTP RPC, WebSocket)
-/// - Discovery sources (e.g., on-chain events, off-chain APIs)
-/// - Order implementations (e.g., EIP-7683)
-/// - Settlement mechanisms (e.g., direct settlement)
-/// - Execution strategies (e.g., always execute, limit orders)
-async fn build_solver(config: Config) -> Result<SolverEngine, Box<dyn std::error::Error>> {
-	let builder = SolverBuilder::new(config);
-
-	// Storage factories (simple config-only interface)
-	let storage_factories = create_factory_map!(
-		solver_storage::StorageInterface,
-		solver_storage::StorageError,
-		"file" => create_file_storage,
-		"memory" => create_memory_storage,
-	);
-
-	// Delivery factories (config + networks + optional private key)
-	let delivery_factories = create_factory_map!(
-		solver_delivery::DeliveryInterface,
-		solver_delivery::DeliveryError,
-		delivery,
-		"origin" => create_http_delivery,
-		"destination" => create_http_delivery,
-	);
-
-	// Discovery factories (config + networks)
-	let discovery_factories = create_factory_map!(
-		solver_discovery::DiscoveryInterface,
-		solver_discovery::DiscoveryError,
-		networks,
-		"onchain_eip7683" => onchain_create_discovery,
-		"offchain_eip7683" => offchain_create_discovery,
-	);
-
-	// Order factories (config + networks)
-	let order_factories = create_factory_map!(
-		solver_order::OrderInterface,
-		solver_order::OrderError,
-		networks,
-		"eip7683" => create_order_impl,
-	);
-
-	// Settlement factories (config + networks)
-	let settlement_factories = create_factory_map!(
-		solver_settlement::SettlementInterface,
-		solver_settlement::SettlementError,
-		networks,
-		"eip7683" => create_settlement,
-	);
-
-	let factories = SolverFactories {
-		storage_factories,
-		account_factory: create_account,
-		delivery_factories,
-		discovery_factories,
-		order_factories,
-		settlement_factories,
-		strategy_factory: create_strategy,
-	};
-
-	Ok(builder.build(factories).await?)
 }

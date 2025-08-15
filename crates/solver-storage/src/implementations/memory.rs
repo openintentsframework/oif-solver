@@ -102,6 +102,20 @@ pub fn create_storage(config: &toml::Value) -> Result<Box<dyn StorageInterface>,
 	Ok(Box::new(MemoryStorage::new()))
 }
 
+/// Registry for the memory storage implementation.
+pub struct Registry;
+
+impl solver_types::ImplementationRegistry for Registry {
+	const NAME: &'static str = "memory";
+	type Factory = crate::StorageFactory;
+
+	fn factory() -> Self::Factory {
+		create_storage
+	}
+}
+
+impl crate::StorageRegistry for Registry {}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

@@ -72,6 +72,7 @@ impl TransactionHandler {
 		order_id: String,
 		tx_hash: TransactionHash,
 		tx_type: TransactionType,
+		tx_chain_id: u64,
 	) {
 		let monitor = TransactionMonitor::new(
 			self.delivery.clone(),
@@ -80,7 +81,9 @@ impl TransactionHandler {
 		);
 
 		tokio::spawn(async move {
-			monitor.monitor(order_id, tx_hash, tx_type).await;
+			monitor
+				.monitor(order_id, tx_hash, tx_type, tx_chain_id)
+				.await;
 		});
 	}
 

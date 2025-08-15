@@ -5,7 +5,9 @@
 //! for various order standards.
 
 use async_trait::async_trait;
-use solver_types::{ConfigSchema, FillProof, Order, TransactionHash};
+use solver_types::{
+	ConfigSchema, FillProof, ImplementationRegistry, NetworksConfig, Order, TransactionHash,
+};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -63,6 +65,29 @@ pub trait SettlementInterface: Send + Sync {
 	/// - Solver permissions
 	/// - Reward availability
 	async fn can_claim(&self, order: &Order, fill_proof: &FillProof) -> bool;
+}
+
+/// Type alias for settlement factory functions.
+///
+/// This is the function signature that all settlement implementations must provide
+/// to create instances of their settlement interface.
+pub type SettlementFactory =
+	fn(&toml::Value, &NetworksConfig) -> Result<Box<dyn SettlementInterface>, SettlementError>;
+
+/// Registry trait for settlement implementations.
+///
+/// This trait extends the base ImplementationRegistry to specify that
+/// settlement implementations must provide a SettlementFactory.
+pub trait SettlementRegistry: ImplementationRegistry<Factory = SettlementFactory> {}
+
+/// Get all registered settlement implementations.
+///
+/// Returns a vector of (name, factory) tuples for all available settlement implementations.
+/// This is used by the factory registry to automatically register all implementations.
+pub fn get_all_implementations() -> Vec<(&'static str, SettlementFactory)> {
+	use implementations::direct;
+
+	vec![(direct::Registry::NAME, direct::Registry::factory())]
 }
 
 /// Service that manages settlement operations with multiple implementations.

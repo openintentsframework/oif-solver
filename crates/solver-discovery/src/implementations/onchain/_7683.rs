@@ -10,24 +10,16 @@ use alloy_rpc_types::{Filter, Log};
 use alloy_sol_types::{sol, SolEvent, SolValue};
 use alloy_transport_http::Http;
 use async_trait::async_trait;
+use solver_types::current_timestamp;
 use solver_types::{
 	standards::eip7683::MandateOutput, with_0x_prefix, ConfigSchema, Eip7683OrderData, Field,
 	FieldType, Intent, IntentMetadata, NetworksConfig, Schema,
 };
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
-
-/// Helper function to get current timestamp, returns 0 if system time is before UNIX epoch.
-///
-/// This function safely retrieves the current UNIX timestamp in seconds,
-/// returning 0 if the system time is somehow before the UNIX epoch.
-fn current_timestamp() -> u64 {
-	std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
-		.map(|d| d.as_secs())
-		.unwrap_or(0)
-}
+use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::task::JoinHandle;
 
 // Solidity type definitions for the OIF contracts.
 //
@@ -66,19 +58,22 @@ sol! {
 ///
 /// This implementation monitors blockchain events for new EIP-7683 cross-chain
 /// orders and converts them into intents for the solver to process.
+/// Supports monitoring multiple chains concurrently.
 pub struct Eip7683Discovery {
-	/// The Alloy provider for blockchain interaction.
-	provider: RootProvider<Http<reqwest::Client>>,
-	/// The chain ID being monitored.
-	chain_id: u64,
+	/// RPC providers for each monitored network.
+	providers: HashMap<u64, RootProvider<Http<reqwest::Client>>>,
+	/// The chain IDs being monitored.
+	network_ids: Vec<u64>,
 	/// Networks configuration for settler lookups.
 	networks: NetworksConfig,
-	/// The last processed block number.
-	last_block: Arc<Mutex<u64>>,
+	/// The last processed block number for each chain.
+	last_blocks: Arc<Mutex<HashMap<u64, u64>>>,
 	/// Flag indicating if monitoring is active.
 	is_monitoring: Arc<AtomicBool>,
+	/// Handles for monitoring tasks.
+	monitoring_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
 	/// Channel for signaling monitoring shutdown.
-	stop_signal: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+	stop_signal: Arc<Mutex<Option<broadcast::Sender<()>>>>,
 	/// Polling interval for monitoring loop in seconds.
 	polling_interval_secs: u64,
 }
@@ -86,40 +81,59 @@ pub struct Eip7683Discovery {
 impl Eip7683Discovery {
 	/// Creates a new EIP-7683 discovery instance.
 	///
-	/// Configures monitoring for the settler contract on the specified chain
-	/// using the blockchain accessible via the RPC URL.
+	/// Configures monitoring for the settler contracts on the specified chains.
 	pub async fn new(
-		rpc_url: &str,
-		chain_id: u64,
+		network_ids: Vec<u64>,
 		networks: NetworksConfig,
 		polling_interval_secs: Option<u64>,
 	) -> Result<Self, DiscoveryError> {
-		// Create provider
-		let provider = RootProvider::new_http(
-			rpc_url
-				.parse()
-				.map_err(|e| DiscoveryError::Connection(format!("Invalid RPC URL: {}", e)))?,
-		);
-
-		// Validate that the chain_id exists in networks config
-		if !networks.contains_key(&chain_id) {
-			return Err(DiscoveryError::ValidationError(format!(
-				"Chain ID {} not found in networks configuration",
-				chain_id
-			)));
+		// Validate at least one network
+		if network_ids.is_empty() {
+			return Err(DiscoveryError::ValidationError(
+				"At least one network_id must be specified".to_string(),
+			));
 		}
 
-		// Get current block
-		let current_block = provider.get_block_number().await.map_err(|e| {
-			DiscoveryError::Connection(format!("Failed to get block number: {}", e))
-		})?;
+		// Create providers and get initial blocks for each network
+		let mut providers = HashMap::new();
+		let mut last_blocks = HashMap::new();
+
+		for network_id in &network_ids {
+			// Validate network exists
+			let network = networks.get(network_id).ok_or_else(|| {
+				DiscoveryError::ValidationError(format!(
+					"Network {} not found in configuration",
+					network_id
+				))
+			})?;
+
+			// Create provider
+			let provider = RootProvider::new_http(network.rpc_url.parse().map_err(|e| {
+				DiscoveryError::Connection(format!(
+					"Invalid RPC URL for network {}: {}",
+					network_id, e
+				))
+			})?);
+
+			// Get initial block number
+			let current_block = provider.get_block_number().await.map_err(|e| {
+				DiscoveryError::Connection(format!(
+					"Failed to get block for chain {}: {}",
+					network_id, e
+				))
+			})?;
+
+			providers.insert(*network_id, provider);
+			last_blocks.insert(*network_id, current_block);
+		}
 
 		Ok(Self {
-			provider,
-			chain_id,
+			providers,
+			network_ids,
 			networks,
-			last_block: Arc::new(Mutex::new(current_block)),
+			last_blocks: Arc::new(Mutex::new(last_blocks)),
 			is_monitoring: Arc::new(AtomicBool::new(false)),
+			monitoring_handles: Arc::new(Mutex::new(Vec::new())),
 			stop_signal: Arc::new(Mutex::new(None)),
 			polling_interval_secs: polling_interval_secs.unwrap_or(3), // Default to 3 seconds
 		})
@@ -205,17 +219,17 @@ impl Eip7683Discovery {
 		})
 	}
 
-	/// Main monitoring loop for discovering new intents.
+	/// Monitoring loop for a single chain.
 	///
 	/// Polls the blockchain for new Open events and sends discovered
 	/// intents through the provided channel.
-	async fn monitoring_loop(
+	async fn monitor_single_chain(
 		provider: RootProvider<Http<reqwest::Client>>,
 		chain_id: u64,
 		networks: NetworksConfig,
-		last_block: Arc<Mutex<u64>>,
+		last_blocks: Arc<Mutex<HashMap<u64, u64>>>,
 		sender: mpsc::UnboundedSender<Intent>,
-		mut stop_rx: mpsc::Receiver<()>,
+		mut stop_rx: broadcast::Receiver<()>,
 		polling_interval_secs: u64,
 	) {
 		let mut interval =
@@ -229,18 +243,22 @@ impl Eip7683Discovery {
 		loop {
 			tokio::select! {
 				_ = interval.tick() => {
-					let mut last_block_num = last_block.lock().await;
+					// Get last processed block for this chain
+					let last_block_num = {
+						let blocks = last_blocks.lock().await;
+						*blocks.get(&chain_id).unwrap_or(&0)
+					};
 
 					// Get current block
 					let current_block = match provider.get_block_number().await {
 						Ok(block) => block,
 						Err(e) => {
-							tracing::error!("Failed to get block number: {}", e);
+							tracing::error!(chain = chain_id, "Failed to get block number: {}", e);
 							continue;
 						}
 					};
 
-					if current_block <= *last_block_num {
+					if current_block <= last_block_num {
 						continue; // No new blocks
 					}
 
@@ -251,7 +269,7 @@ impl Eip7683Discovery {
 					let settler_address = match networks.get(&chain_id) {
 						Some(network) => {
 							if network.input_settler_address.0.len() != 20 {
-								tracing::error!("Invalid settler address length");
+								tracing::error!(chain = chain_id, "Invalid settler address length");
 								continue;
 							}
 							AlloyAddress::from_slice(&network.input_settler_address.0)
@@ -265,14 +283,14 @@ impl Eip7683Discovery {
 					let filter = Filter::new()
 						.address(vec![settler_address])
 						.event_signature(vec![open_sig])
-						.from_block(*last_block_num + 1)
+						.from_block(last_block_num + 1)
 						.to_block(current_block);
 
 					// Get logs
 					let logs = match provider.get_logs(&filter).await {
 						Ok(logs) => logs,
 						Err(e) => {
-							tracing::error!("Failed to get logs: {}", e);
+							tracing::error!(chain = chain_id, "Failed to get logs: {}", e);
 							continue;
 						}
 					};
@@ -284,10 +302,11 @@ impl Eip7683Discovery {
 						}
 					}
 
-					// Update last block
-					*last_block_num = current_block;
+					// Update last block for this chain
+					last_blocks.lock().await.insert(chain_id, current_block);
 				}
 				_ = stop_rx.recv() => {
+					tracing::info!(chain = chain_id, "Stopping monitor");
 					break;
 				}
 			}
@@ -315,36 +334,30 @@ impl ConfigSchema for Eip7683DiscoverySchema {
 		let schema = Schema::new(
 			// Required fields
 			vec![Field::new(
-				"network_id",
-				FieldType::Integer {
+				"network_ids",
+				FieldType::Array(Box::new(FieldType::Integer {
 					min: Some(1),
 					max: None,
+				})),
+			)
+			.with_validator(|value| {
+				if let Some(arr) = value.as_array() {
+					if arr.is_empty() {
+						return Err("network_ids cannot be empty".to_string());
+					}
+					Ok(())
+				} else {
+					Err("network_ids must be an array".to_string())
+				}
+			})],
+			// Optional fields
+			vec![Field::new(
+				"polling_interval_secs",
+				FieldType::Integer {
+					min: Some(1),
+					max: Some(300), // Maximum 5 minutes
 				},
 			)],
-			// Optional fields
-			vec![
-				Field::new(
-					"start_block",
-					FieldType::Integer {
-						min: Some(0),
-						max: None,
-					},
-				),
-				Field::new(
-					"block_confirmations",
-					FieldType::Integer {
-						min: Some(0),
-						max: Some(100),
-					},
-				),
-				Field::new(
-					"polling_interval_secs",
-					FieldType::Integer {
-						min: Some(1),
-						max: Some(300), // Maximum 5 minutes
-					},
-				),
-			],
 		);
 
 		schema.validate(config)
@@ -364,29 +377,39 @@ impl DiscoveryInterface for Eip7683Discovery {
 			return Err(DiscoveryError::AlreadyMonitoring);
 		}
 
-		let (stop_tx, stop_rx) = mpsc::channel(1);
-		*self.stop_signal.lock().await = Some(stop_tx);
+		// Create broadcast channel for shutdown
+		let (stop_tx, _) = broadcast::channel(1);
+		*self.stop_signal.lock().await = Some(stop_tx.clone());
 
-		// Spawn monitoring task
-		let provider = self.provider.clone();
-		let chain_id = self.chain_id;
-		let networks = self.networks.clone();
-		let last_block = self.last_block.clone();
-		let polling_interval_secs = self.polling_interval_secs;
+		let mut handles = Vec::new();
 
-		tokio::spawn(async move {
-			Self::monitoring_loop(
-				provider,
-				chain_id,
-				networks,
-				last_block,
-				sender,
-				stop_rx,
-				polling_interval_secs,
-			)
-			.await;
-		});
+		// Spawn monitoring task for each network
+		for network_id in &self.network_ids {
+			let provider = self.providers.get(network_id).unwrap().clone();
+			let networks = self.networks.clone();
+			let last_blocks = self.last_blocks.clone();
+			let sender = sender.clone();
+			let stop_rx = stop_tx.subscribe();
+			let polling_interval_secs = self.polling_interval_secs;
+			let chain_id = *network_id;
 
+			let handle = tokio::spawn(async move {
+				Self::monitor_single_chain(
+					provider,
+					chain_id,
+					networks,
+					last_blocks,
+					sender,
+					stop_rx,
+					polling_interval_secs,
+				)
+				.await;
+			});
+
+			handles.push(handle);
+		}
+
+		*self.monitoring_handles.lock().await = handles;
 		self.is_monitoring.store(true, Ordering::SeqCst);
 		Ok(())
 	}
@@ -396,11 +419,24 @@ impl DiscoveryInterface for Eip7683Discovery {
 			return Ok(());
 		}
 
+		// Send shutdown signal to all monitoring tasks
 		if let Some(stop_tx) = self.stop_signal.lock().await.take() {
-			let _ = stop_tx.send(()).await;
+			let _ = stop_tx.send(());
+		}
+
+		// Wait for all monitoring tasks to complete
+		let handles = self
+			.monitoring_handles
+			.lock()
+			.await
+			.drain(..)
+			.collect::<Vec<_>>();
+		for handle in handles {
+			let _ = handle.await;
 		}
 
 		self.is_monitoring.store(false, Ordering::SeqCst);
+		tracing::info!("Stopped monitoring all chains");
 		Ok(())
 	}
 }
@@ -409,8 +445,7 @@ impl DiscoveryInterface for Eip7683Discovery {
 ///
 /// This function reads the discovery configuration and creates an Eip7683Discovery
 /// instance. Required configuration parameters:
-/// - `rpc_url`: The HTTP RPC endpoint URL
-/// - `chain_id`: The chain ID to monitor
+/// - `network_ids`: Array of chain IDs to monitor
 ///
 /// Optional configuration parameters:
 /// - `polling_interval_secs`: Polling interval in seconds (defaults to 3)
@@ -418,8 +453,8 @@ impl DiscoveryInterface for Eip7683Discovery {
 /// # Errors
 ///
 /// Returns an error if:
-/// - `rpc_url` is not provided in the configuration
-/// - `chain_id` is not provided in the configuration
+/// - `network_ids` is not provided or is empty
+/// - Any network_id is not found in the networks configuration
 /// - The discovery service cannot be created (e.g., connection failure)
 pub fn create_discovery(
 	config: &toml::Value,
@@ -429,18 +464,22 @@ pub fn create_discovery(
 	Eip7683DiscoverySchema::validate_config(config)
 		.map_err(|e| DiscoveryError::ValidationError(format!("Invalid configuration: {}", e)))?;
 
-	let network_id = config
-		.get("network_id")
-		.and_then(|v| v.as_integer())
-		.expect("network_id already validated") as u64;
+	// Parse network_ids (required field)
+	let network_ids = config
+		.get("network_ids")
+		.and_then(|v| v.as_array())
+		.map(|arr| {
+			arr.iter()
+				.filter_map(|v| v.as_integer().map(|i| i as u64))
+				.collect::<Vec<_>>()
+		})
+		.ok_or_else(|| DiscoveryError::ValidationError("network_ids is required".to_string()))?;
 
-	// Resolve network configuration to get RPC URL
-	let network = networks.get(&network_id).ok_or_else(|| {
-		DiscoveryError::ValidationError(format!(
-			"Network {} not found in configuration",
-			network_id
-		))
-	})?;
+	if network_ids.is_empty() {
+		return Err(DiscoveryError::ValidationError(
+			"network_ids cannot be empty".to_string(),
+		));
+	}
 
 	let polling_interval_secs = config
 		.get("polling_interval_secs")
@@ -450,15 +489,23 @@ pub fn create_discovery(
 	// Create discovery service synchronously
 	let discovery = tokio::task::block_in_place(|| {
 		tokio::runtime::Handle::current().block_on(async {
-			Eip7683Discovery::new(
-				&network.rpc_url,
-				network_id,
-				networks.clone(),
-				polling_interval_secs,
-			)
-			.await
+			Eip7683Discovery::new(network_ids, networks.clone(), polling_interval_secs).await
 		})
 	})?;
 
 	Ok(Box::new(discovery))
 }
+
+/// Registry for the onchain EIP-7683 discovery implementation.
+pub struct Registry;
+
+impl solver_types::ImplementationRegistry for Registry {
+	const NAME: &'static str = "onchain_eip7683";
+	type Factory = crate::DiscoveryFactory;
+
+	fn factory() -> Self::Factory {
+		create_discovery
+	}
+}
+
+impl crate::DiscoveryRegistry for Registry {}

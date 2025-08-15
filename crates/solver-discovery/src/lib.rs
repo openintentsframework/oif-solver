@@ -1,11 +1,11 @@
 //! Intent discovery module for the OIF solver system.
 //!
-//! This module handles the discovery of new intents from various sources.
+//! This module handles the discovery of new intents from various implementations.
 //! It provides abstractions for different discovery mechanisms such as
-//! on-chain event monitoring, off-chain APIs, or other intent sources.
+//! on-chain event monitoring, off-chain APIs, or other intent implementations.
 
 use async_trait::async_trait;
-use solver_types::{ConfigSchema, Intent};
+use solver_types::{ConfigSchema, ImplementationRegistry, Intent, NetworksConfig};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -22,10 +22,10 @@ pub mod implementations {
 /// Errors that can occur during intent discovery operations.
 #[derive(Debug, Error)]
 pub enum DiscoveryError {
-	/// Error that occurs when connecting to a discovery source fails.
+	/// Error that occurs when connecting to a discovery implementation fails.
 	#[error("Connection error: {0}")]
 	Connection(String),
-	/// Error that occurs when trying to start monitoring on an already active source.
+	/// Error that occurs when trying to start monitoring on an already active implementation.
 	#[error("Already monitoring")]
 	AlreadyMonitoring,
 	/// Error that occurs when parsing or decoding data fails.
@@ -36,9 +36,9 @@ pub enum DiscoveryError {
 	ValidationError(String),
 }
 
-/// Trait defining the interface for intent discovery sources.
+/// Trait defining the interface for intent discovery implementations.
 ///
-/// This trait must be implemented by any discovery source that wants to
+/// This trait must be implemented by any discovery implementation that wants to
 /// integrate with the solver system. It provides methods for starting and
 /// stopping intent monitoring.
 #[async_trait]
@@ -47,10 +47,10 @@ pub trait DiscoveryInterface: Send + Sync {
 	///
 	/// This allows each implementation to define its own configuration requirements
 	/// with specific validation rules. The schema is used to validate TOML configuration
-	/// before initializing the discovery source.
+	/// before initializing the discovery implementation.
 	fn config_schema(&self) -> Box<dyn ConfigSchema>;
 
-	/// Starts monitoring for new intents from this source.
+	/// Starts monitoring for new intents from this implementation.
 	///
 	/// Discovered intents are sent through the provided channel. The implementation
 	/// should continue monitoring until stop_monitoring is called or an error occurs.
@@ -59,53 +59,85 @@ pub trait DiscoveryInterface: Send + Sync {
 		sender: mpsc::UnboundedSender<Intent>,
 	) -> Result<(), DiscoveryError>;
 
-	/// Stops monitoring for new intents from this source.
+	/// Stops monitoring for new intents from this implementation.
 	///
 	/// This method should cleanly shut down any active monitoring tasks
 	/// and release associated resources.
 	async fn stop_monitoring(&self) -> Result<(), DiscoveryError>;
 }
 
-/// Service that manages multiple intent discovery sources.
+/// Type alias for discovery factory functions.
 ///
-/// The DiscoveryService coordinates multiple discovery sources, allowing
+/// This is the function signature that all discovery implementations must provide
+/// to create instances of their discovery interface.
+pub type DiscoveryFactory =
+	fn(&toml::Value, &NetworksConfig) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError>;
+
+/// Registry trait for discovery implementations.
+///
+/// This trait extends the base ImplementationRegistry to specify that
+/// discovery implementations must provide a DiscoveryFactory.
+pub trait DiscoveryRegistry: ImplementationRegistry<Factory = DiscoveryFactory> {}
+
+/// Get all registered discovery implementations.
+///
+/// Returns a vector of (name, factory) tuples for all available discovery implementations.
+/// This is used by the factory registry to automatically register all implementations.
+pub fn get_all_implementations() -> Vec<(&'static str, DiscoveryFactory)> {
+	use implementations::{offchain, onchain};
+
+	vec![
+		(
+			onchain::_7683::Registry::NAME,
+			onchain::_7683::Registry::factory(),
+		),
+		(
+			offchain::_7683::Registry::NAME,
+			offchain::_7683::Registry::factory(),
+		),
+	]
+}
+
+/// Service that manages multiple intent discovery implementations.
+///
+/// The DiscoveryService coordinates multiple discovery implementations, allowing
 /// the solver to find intents from various channels simultaneously.
 pub struct DiscoveryService {
-	/// Collection of discovery sources to monitor.
-	sources: Vec<Box<dyn DiscoveryInterface>>,
+	/// Collection of discovery implementations to monitor.
+	implementations: Vec<Box<dyn DiscoveryInterface>>,
 }
 
 impl DiscoveryService {
-	/// Creates a new DiscoveryService with the specified sources.
+	/// Creates a new DiscoveryService with the specified implementations.
 	///
-	/// Each source will be monitored independently when monitoring is started.
-	pub fn new(sources: Vec<Box<dyn DiscoveryInterface>>) -> Self {
-		Self { sources }
+	/// Each implementation will be monitored independently when monitoring is started.
+	pub fn new(implementations: Vec<Box<dyn DiscoveryInterface>>) -> Self {
+		Self { implementations }
 	}
 
-	/// Starts monitoring on all configured discovery sources.
+	/// Starts monitoring on all configured discovery implementations.
 	///
-	/// All discovered intents from any source will be sent through the
-	/// provided channel. If any source fails to start, the entire operation
-	/// fails and no sources will be monitoring.
+	/// All discovered intents from any implementation will be sent through the
+	/// provided channel. If any implementation fails to start, the entire operation
+	/// fails and no implementations will be monitoring.
 	pub async fn start_all(
 		&self,
 		sender: mpsc::UnboundedSender<Intent>,
 	) -> Result<(), DiscoveryError> {
-		for source in &self.sources {
-			source.start_monitoring(sender.clone()).await?;
+		for implementation in &self.implementations {
+			implementation.start_monitoring(sender.clone()).await?;
 		}
 		Ok(())
 	}
 
-	/// Stops monitoring on all active discovery sources.
+	/// Stops monitoring on all active discovery implementations.
 	///
-	/// This method attempts to stop all sources, even if some fail.
-	/// The first error encountered is returned, but all sources are
+	/// This method attempts to stop all implementations, even if some fail.
+	/// The first error encountered is returned, but all implementations are
 	/// attempted to be stopped.
 	pub async fn stop_all(&self) -> Result<(), DiscoveryError> {
-		for source in &self.sources {
-			source.stop_monitoring().await?;
+		for implementation in &self.implementations {
+			implementation.stop_monitoring().await?;
 		}
 		Ok(())
 	}

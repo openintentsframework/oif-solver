@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
-use solver_types::ConfigSchema;
+use solver_types::{ConfigSchema, ImplementationRegistry};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -66,6 +66,31 @@ pub trait StorageInterface: Send + Sync {
 	async fn cleanup_expired(&self) -> Result<usize, StorageError> {
 		Ok(0) // Default implementation for backends without TTL support
 	}
+}
+
+/// Type alias for storage factory functions.
+///
+/// This is the function signature that all storage implementations must provide
+/// to create instances of their storage interface.
+pub type StorageFactory = fn(&toml::Value) -> Result<Box<dyn StorageInterface>, StorageError>;
+
+/// Registry trait for storage implementations.
+///
+/// This trait extends the base ImplementationRegistry to specify that
+/// storage implementations must provide a StorageFactory.
+pub trait StorageRegistry: ImplementationRegistry<Factory = StorageFactory> {}
+
+/// Get all registered storage implementations.
+///
+/// Returns a vector of (name, factory) tuples for all available storage implementations.
+/// This is used by the factory registry to automatically register all implementations.
+pub fn get_all_implementations() -> Vec<(&'static str, StorageFactory)> {
+	use implementations::{file, memory};
+
+	vec![
+		(file::Registry::NAME, file::Registry::factory()),
+		(memory::Registry::NAME, memory::Registry::factory()),
+	]
 }
 
 /// High-level storage service that provides typed operations.

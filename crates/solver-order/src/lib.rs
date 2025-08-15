@@ -6,8 +6,8 @@
 
 use async_trait::async_trait;
 use solver_types::{
-	Address, ConfigSchema, ExecutionContext, ExecutionDecision, ExecutionParams, FillProof, Intent,
-	Order, Transaction,
+	Address, ConfigSchema, ExecutionContext, ExecutionDecision, ExecutionParams, FillProof,
+	ImplementationRegistry, Intent, NetworksConfig, Order, Transaction,
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -37,6 +37,23 @@ pub enum OrderError {
 	/// Error that occurs when the order configuration is invalid.
 	#[error("Invalid order: {0}")]
 	InvalidOrder(String),
+}
+
+/// Errors that can occur during strategy creation and execution.
+#[derive(Debug, Error)]
+pub enum StrategyError {
+	/// Error that occurs when strategy configuration is invalid.
+	#[error("Invalid configuration: {0}")]
+	InvalidConfig(String),
+	/// Error that occurs when a required parameter is missing.
+	#[error("Missing required parameter: {0}")]
+	MissingParameter(String),
+	/// Error that occurs during strategy initialization.
+	#[error("Initialization failed: {0}")]
+	InitializationFailed(String),
+	/// Error that occurs when strategy implementation is not available.
+	#[error("Implementation not available: {0}")]
+	ImplementationNotAvailable(String),
 }
 
 /// Trait defining the interface for order standard implementations.
@@ -122,6 +139,51 @@ pub trait ExecutionStrategy: Send + Sync {
 	/// Returns an ExecutionDecision indicating whether to execute now,
 	/// skip the order, or defer execution to a later time.
 	async fn should_execute(&self, order: &Order, context: &ExecutionContext) -> ExecutionDecision;
+}
+
+/// Type alias for order factory functions.
+///
+/// This is the function signature that all order implementations must provide
+/// to create instances of their order interface.
+pub type OrderFactory =
+	fn(&toml::Value, &NetworksConfig) -> Result<Box<dyn OrderInterface>, OrderError>;
+
+/// Type alias for strategy factory functions.
+///
+/// This is the function signature that all strategy implementations must provide
+/// to create instances of their execution strategy.
+pub type StrategyFactory = fn(&toml::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError>;
+
+/// Registry trait for order implementations.
+///
+/// This trait extends the base ImplementationRegistry to specify that
+/// order implementations must provide an OrderFactory.
+pub trait OrderRegistry: ImplementationRegistry<Factory = OrderFactory> {}
+
+/// Registry trait for strategy implementations.
+///
+/// This trait extends the base ImplementationRegistry to specify that
+/// strategy implementations must provide a StrategyFactory.
+pub trait StrategyRegistry: ImplementationRegistry<Factory = StrategyFactory> {}
+
+/// Get all registered order implementations.
+///
+/// Returns a vector of (name, factory) tuples for all available order implementations.
+/// This is used by the factory registry to automatically register all implementations.
+pub fn get_all_order_implementations() -> Vec<(&'static str, OrderFactory)> {
+	use implementations::standards::_7683;
+
+	vec![(_7683::Registry::NAME, _7683::Registry::factory())]
+}
+
+/// Get all registered strategy implementations.
+///
+/// Returns a vector of (name, factory) tuples for all available strategy implementations.
+/// This is used by the factory registry to automatically register all implementations.
+pub fn get_all_strategy_implementations() -> Vec<(&'static str, StrategyFactory)> {
+	use implementations::strategies::simple;
+
+	vec![(simple::Registry::NAME, simple::Registry::factory())]
 }
 
 /// Service that manages order processing with multiple implementations and strategies.

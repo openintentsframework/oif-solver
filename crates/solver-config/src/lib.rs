@@ -3,11 +3,20 @@
 //! This module provides structures and utilities for managing solver configuration.
 //! It supports loading configuration from TOML files and provides validation to ensure
 //! all required configuration values are properly set.
+//!
+//! ## Modular Configuration Support
+//!
+//! Configurations can be split into multiple files for better organization:
+//! - Use `include = ["file1.toml", "file2.toml"]` to include other config files
+//! - Each top-level section must be unique across all files (no duplicates allowed)
+
+mod loader;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use solver_types::{networks::deserialize_networks, NetworksConfig};
 use std::collections::HashMap;
+use std::path::Path;
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -103,9 +112,9 @@ pub struct StorageConfig {
 /// Configuration for delivery mechanisms.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeliveryConfig {
-	/// Map of delivery provider names to their configurations.
-	/// Each provider has its own configuration format stored as raw TOML values.
-	pub providers: HashMap<String, toml::Value>,
+	/// Map of delivery implementation names to their configurations.
+	/// Each implementation has its own configuration format stored as raw TOML values.
+	pub implementations: HashMap<String, toml::Value>,
 	/// Minimum number of confirmations required for transactions.
 	/// Defaults to 12 confirmations if not specified.
 	#[serde(default = "default_confirmations")]
@@ -123,18 +132,18 @@ fn default_confirmations() -> u64 {
 /// Configuration for account management.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AccountConfig {
-	/// The type of account provider to use (e.g., "local", "aws-kms", "hardware").
-	pub provider: String,
-	/// Provider-specific configuration parameters as raw TOML values.
-	pub config: toml::Value,
+	/// Which implementation to use as primary.
+	pub primary: String,
+	/// Map of account implementation names to their configurations.
+	pub implementations: HashMap<String, toml::Value>,
 }
 
 /// Configuration for order discovery.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DiscoveryConfig {
-	/// Map of discovery source names to their configurations.
-	/// Each source has its own configuration format stored as raw TOML values.
-	pub sources: HashMap<String, toml::Value>,
+	/// Map of discovery implementation names to their configurations.
+	/// Each implementation has its own configuration format stored as raw TOML values.
+	pub implementations: HashMap<String, toml::Value>,
 }
 
 /// Configuration for order processing.
@@ -144,16 +153,16 @@ pub struct OrderConfig {
 	/// Each implementation handles specific order types.
 	pub implementations: HashMap<String, toml::Value>,
 	/// Strategy configuration for order execution.
-	pub execution_strategy: StrategyConfig,
+	pub strategy: StrategyConfig,
 }
 
 /// Configuration for execution strategies.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StrategyConfig {
-	/// The type of strategy to use (e.g., "fifo", "priority", "custom").
-	pub strategy_type: String,
-	/// Strategy-specific configuration parameters as raw TOML values.
-	pub config: toml::Value,
+	/// Which strategy implementation to use as primary.
+	pub primary: String,
+	/// Map of strategy implementation names to their configurations.
+	pub implementations: HashMap<String, toml::Value>,
 }
 
 /// Configuration for settlement operations.
@@ -248,7 +257,7 @@ fn default_max_request_size() -> usize {
 /// Supports default values with ${VAR_NAME:-default_value}.
 ///
 /// Input strings are limited to 1MB to prevent ReDoS attacks.
-fn resolve_env_vars(input: &str) -> Result<String, ConfigError> {
+pub(crate) fn resolve_env_vars(input: &str) -> Result<String, ConfigError> {
 	// Limit input size to prevent ReDoS attacks
 	const MAX_INPUT_SIZE: usize = 1024 * 1024; // 1MB
 	if input.len() > MAX_INPUT_SIZE {
@@ -296,29 +305,21 @@ fn resolve_env_vars(input: &str) -> Result<String, ConfigError> {
 }
 
 impl Config {
-	/// Loads configuration from a file at the specified path.
-	///
-	/// This method reads the file content, resolves environment variables,
-	/// and parses it as TOML configuration. The configuration is validated
-	/// before being returned.
-	///
-	/// Environment variables can be referenced using:
-	/// - `${VAR_NAME}` - Required environment variable
-	/// - `${VAR_NAME:-default}` - With default value if not set
-	pub fn from_file(path: &str) -> Result<Self, ConfigError> {
-		let content = std::fs::read_to_string(path)?;
-		let resolved = resolve_env_vars(&content)?;
-		resolved.parse()
-	}
-
 	/// Loads configuration from a file with async environment variable resolution.
 	///
-	/// This method is async-ready for future extensions that might need
-	/// async secret resolution (e.g., from Vault, AWS KMS, etc).
-	pub async fn from_file_async(path: &str) -> Result<Self, ConfigError> {
-		// For now, just calls the sync version
-		// In the future, this could use async resolvers
-		Self::from_file(path)
+	/// This method supports modular configuration through include directives:
+	/// - `include = ["file1.toml", "file2.toml"]` - Include specific files
+	///
+	/// Each top-level section must be unique across all configuration files.
+	pub async fn from_file(path: &str) -> Result<Self, ConfigError> {
+		let path_buf = Path::new(path);
+		let base_dir = path_buf.parent().unwrap_or_else(|| Path::new("."));
+
+		let mut loader = loader::ConfigLoader::new(base_dir);
+		let file_name = path_buf
+			.file_name()
+			.ok_or_else(|| ConfigError::Validation(format!("Invalid path: {}", path)))?;
+		loader.load_config(file_name).await
 	}
 
 	/// Validates the configuration to ensure all required fields are properly set.
@@ -403,9 +404,9 @@ impl Config {
 		}
 
 		// Validate delivery config
-		if self.delivery.providers.is_empty() {
+		if self.delivery.implementations.is_empty() {
 			return Err(ConfigError::Validation(
-				"At least one delivery provider required".into(),
+				"At least one delivery implementation required".into(),
 			));
 		}
 
@@ -422,16 +423,16 @@ impl Config {
 		}
 
 		// Validate account config
-		if self.account.provider.is_empty() {
+		if self.account.implementations.is_empty() {
 			return Err(ConfigError::Validation(
-				"Account provider cannot be empty".into(),
+				"Account implementation cannot be empty".into(),
 			));
 		}
 
 		// Validate discovery config
-		if self.discovery.sources.is_empty() {
+		if self.discovery.implementations.is_empty() {
 			return Err(ConfigError::Validation(
-				"At least one discovery source required".into(),
+				"At least one discovery implementation required".into(),
 			));
 		}
 
@@ -441,9 +442,14 @@ impl Config {
 				"At least one order implementation required".into(),
 			));
 		}
-		if self.order.execution_strategy.strategy_type.is_empty() {
+		if self.order.strategy.primary.is_empty() {
 			return Err(ConfigError::Validation(
-				"Execution strategy type cannot be empty".into(),
+				"Order strategy primary cannot be empty".into(),
+			));
+		}
+		if self.order.strategy.implementations.is_empty() {
+			return Err(ConfigError::Validation(
+				"At least one strategy implementation required".into(),
 			));
 		}
 
@@ -542,21 +548,21 @@ cleanup_interval_seconds = 3600
 [storage.implementations.memory]
 
 [delivery]
-[delivery.providers.test]
+[delivery.implementations.test]
 
 [account]
-provider = "local"
-[account.config]
+primary = "local"
+[account.implementations.local]
 private_key = "${TEST_PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
 
 [discovery]
-[discovery.sources.test]
+[discovery.implementations.test]
 
 [order]
 [order.implementations.test]
-[order.execution_strategy]
-strategy_type = "simple"
-[order.execution_strategy.config]
+[order.strategy]
+primary = "simple"
+[order.strategy.implementations.simple]
 
 [settlement]
 [settlement.implementations.test]

@@ -66,6 +66,7 @@ pub enum DeliveryEvent {
 		order_id: String,
 		tx_hash: TransactionHash,
 		tx_type: TransactionType,
+		tx_chain_id: u64,
 	},
 	/// A transaction has been confirmed on-chain.
 	TransactionConfirmed {

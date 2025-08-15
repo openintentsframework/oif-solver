@@ -93,7 +93,7 @@ impl SettlementHandler {
 			// Submit claim transaction through delivery service
 			let claim_tx_hash = self
 				.delivery
-				.deliver(claim_tx)
+				.deliver(claim_tx.clone())
 				.await
 				.map_err(|e| SettlementError::Service(e.to_string()))?;
 
@@ -102,6 +102,7 @@ impl SettlementHandler {
 					order_id: order.id.clone(),
 					tx_hash: claim_tx_hash.clone(),
 					tx_type: TransactionType::Claim,
+					tx_chain_id: claim_tx.chain_id,
 				}))
 				.ok();
 

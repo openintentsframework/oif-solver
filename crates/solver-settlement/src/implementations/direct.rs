@@ -377,3 +377,17 @@ pub fn create_settlement(
 
 	Ok(Box::new(settlement))
 }
+
+/// Registry for the direct settlement implementation.
+pub struct Registry;
+
+impl solver_types::ImplementationRegistry for Registry {
+	const NAME: &'static str = "eip7683";
+	type Factory = crate::SettlementFactory;
+
+	fn factory() -> Self::Factory {
+		create_settlement
+	}
+}
+
+impl crate::SettlementRegistry for Registry {}

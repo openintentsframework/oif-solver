@@ -8,7 +8,6 @@
 #   ./send_onchain_intent.sh [origin_token] [dest_token]  - Send intent with specified tokens
 #   ./send_onchain_intent.sh                              - Send intent with default TokenA
 #   ./send_onchain_intent.sh balances                     - Check balances only
-#   ./send_onchain_intent.sh approve                      - Approve tokens only
 #
 # Examples:
 #   ./send_onchain_intent.sh 0x5FbDB2315678afecb367f032d93F642f64180aa3 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512
@@ -39,46 +38,50 @@ if ! command -v cast &> /dev/null; then
     exit 1
 fi
 
-# Check if config exists
-if [ ! -f "config/demo.toml" ]; then
+# Check if modular config exists
+if [ ! -f "config/demo.toml" ] || [ ! -f "config/demo/networks.toml" ]; then
     echo -e "${RED}❌ Configuration not found!${NC}"
     echo -e "${YELLOW}💡 Run './setup_local_anvil.sh' first${NC}"
     exit 1
 fi
 
-# Load addresses from config - from networks section
+# Use modular configuration paths
+MAIN_CONFIG="config/demo.toml"
+NETWORKS_CONFIG="config/demo/networks.toml"
+
+# Load addresses from networks config
 # For origin chain (31337)
-INPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31337\]' config/demo.toml | grep 'input_settler_address = ' | cut -d'"' -f2)
-OUTPUT_SETTLER_ADDRESS_ORIGIN=$(grep -A 5 '\[networks.31337\]' config/demo.toml | grep 'output_settler_address = ' | cut -d'"' -f2)
+INPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31337\]' $NETWORKS_CONFIG | grep 'input_settler_address = ' | cut -d'"' -f2)
+OUTPUT_SETTLER_ADDRESS_ORIGIN=$(grep -A 5 '\[networks.31337\]' $NETWORKS_CONFIG | grep 'output_settler_address = ' | cut -d'"' -f2)
 # For destination chain (31338)
-INPUT_SETTLER_ADDRESS_DEST=$(grep -A 5 '\[networks.31338\]' config/demo.toml | grep 'input_settler_address = ' | cut -d'"' -f2)
-OUTPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31338\]' config/demo.toml | grep 'output_settler_address = ' | cut -d'"' -f2)
+INPUT_SETTLER_ADDRESS_DEST=$(grep -A 5 '\[networks.31338\]' $NETWORKS_CONFIG | grep 'input_settler_address = ' | cut -d'"' -f2)
+OUTPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31338\]' $NETWORKS_CONFIG | grep 'output_settler_address = ' | cut -d'"' -f2)
 
-# Get oracle address from settlement section - now it's a map per chain
+# Get oracle address from settlement section in main config
 # Extract oracle address for origin chain (31337)
-ORACLE_ADDRESS=$(grep 'oracle_addresses = ' config/demo.toml | sed 's/.*31337 = "\([^"]*\)".*/\1/')
+ORACLE_ADDRESS=$(grep 'oracle_addresses = ' $MAIN_CONFIG | sed 's/.*31337 = "\([^"]*\)".*/\1/')
 
-# Parse token addresses from networks section
+# Parse token addresses from networks config
 # For origin chain tokens (31337)
-DEFAULT_ORIGIN_TOKEN=$(awk '/\[\[networks.31337.tokens\]\]/{f=1} f && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
-TOKENB_ORIGIN=$(awk '/\[\[networks.31337.tokens\]\]/{c++} c==2 && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
+DEFAULT_ORIGIN_TOKEN=$(awk '/\[\[networks.31337.tokens\]\]/{f=1} f && /address =/{gsub(/"/, "", $3); print $3; exit}' $NETWORKS_CONFIG)
+TOKENB_ORIGIN=$(awk '/\[\[networks.31337.tokens\]\]/{c++} c==2 && /address =/{gsub(/"/, "", $3); print $3; exit}' $NETWORKS_CONFIG)
 
 # For destination chain tokens (31338)
-DEFAULT_DEST_TOKEN=$(awk '/\[\[networks.31338.tokens\]\]/{f=1} f && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
-TOKENB_DEST=$(awk '/\[\[networks.31338.tokens\]\]/{c++} c==2 && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
+DEFAULT_DEST_TOKEN=$(awk '/\[\[networks.31338.tokens\]\]/{f=1} f && /address =/{gsub(/"/, "", $3); print $3; exit}' $NETWORKS_CONFIG)
+TOKENB_DEST=$(awk '/\[\[networks.31338.tokens\]\]/{c++} c==2 && /address =/{gsub(/"/, "", $3); print $3; exit}' $NETWORKS_CONFIG)
 
-# Account addresses from accounts section
-SOLVER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'solver = ' | cut -d'"' -f2)
-USER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'user = ' | cut -d'"' -f2)
-USER_PRIVATE_KEY=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'user_private_key = ' | cut -d'"' -f2)
-RECIPIENT_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'recipient = ' | cut -d'"' -f2)
+# Account addresses from main config
+SOLVER_ADDR=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'solver = ' | cut -d'"' -f2)
+USER_ADDR=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'user = ' | cut -d'"' -f2)
+USER_PRIVATE_KEY=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'user_private_key = ' | cut -d'"' -f2)
+RECIPIENT_ADDR=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'recipient = ' | cut -d'"' -f2)
 
-# Configuration - Parse chain IDs and RPC URLs from networks section
+# Configuration - Parse chain IDs and RPC URLs from networks config
 # Chain IDs are the network keys themselves
 ORIGIN_CHAIN_ID=31337
 DEST_CHAIN_ID=31338
-ORIGIN_RPC_URL=$(grep -A 2 '\[networks.31337\]' config/demo.toml | grep 'rpc_url = ' | cut -d'"' -f2)
-DEST_RPC_URL=$(grep -A 2 '\[networks.31338\]' config/demo.toml | grep 'rpc_url = ' | cut -d'"' -f2)
+ORIGIN_RPC_URL=$(grep -A 2 '\[networks.31337\]' $NETWORKS_CONFIG | grep 'rpc_url = ' | cut -d'"' -f2)
+DEST_RPC_URL=$(grep -A 2 '\[networks.31338\]' $NETWORKS_CONFIG | grep 'rpc_url = ' | cut -d'"' -f2)
 RPC_URL=$ORIGIN_RPC_URL  # Default for compatibility
 AMOUNT="1000000000000000000"  # 1 token
 
@@ -394,13 +397,12 @@ main() {
 # Handle different commands
 # Check if first argument is a special command or a token address
 COMMAND="send"
-if [ "$1" = "balances" ] || [ "$1" = "approve" ]; then
+if [ "$1" = "balances" ]; then
     COMMAND="$1"
 elif [ -n "$1" ] && ! [[ "$1" =~ ^0x[a-fA-F0-9]{40}$ ]]; then
     # Invalid argument that's not a hex address
     echo "Usage: $0 [origin_token_address] [dest_token_address]"
     echo "       $0 balances"
-    echo "       $0 approve"
     echo ""
     echo "Examples:"
     echo "  $0                     # Use default TokenA → TokenA"
@@ -414,77 +416,18 @@ case "$COMMAND" in
         main
         ;;
     "balances")
-        if [ -f "config/demo.toml" ]; then
-            # Check required commands first
-            if ! command -v bc &> /dev/null; then
-                echo -e "${RED}❌ 'bc' command not found!${NC}"
-                echo -e "${YELLOW}💡 Install bc: brew install bc (macOS) or apt-get install bc (Linux)${NC}"
-                exit 1
-            fi
-            
-            # Chain IDs are the network keys themselves
-            ORIGIN_CHAIN_ID=31337
-            DEST_CHAIN_ID=31338
-            
-            # Parse addresses from networks section
-            INPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31337\]' config/demo.toml | grep 'input_settler_address = ' | cut -d'"' -f2)
-            OUTPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31338\]' config/demo.toml | grep 'output_settler_address = ' | cut -d'"' -f2)
-            
-            # Parse token addresses from networks section
-            DEFAULT_ORIGIN_TOKEN=$(awk '/\[\[networks.31337.tokens\]\]/{f=1} f && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
-            TOKENB_ORIGIN=$(awk '/\[\[networks.31337.tokens\]\]/{c++} c==2 && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
-            DEFAULT_DEST_TOKEN=$(awk '/\[\[networks.31338.tokens\]\]/{f=1} f && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
-            TOKENB_DEST=$(awk '/\[\[networks.31338.tokens\]\]/{c++} c==2 && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
-            
-            # Account addresses from accounts section
-            SOLVER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'solver = ' | cut -d'"' -f2)
-            USER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'user = ' | head -1 | cut -d'"' -f2)
-            RECIPIENT_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'recipient = ' | head -1 | cut -d'"' -f2)
-            
-            # RPC URLs from networks section
-            ORIGIN_RPC_URL=$(grep -A 2 '\[networks.31337\]' config/demo.toml | grep 'rpc_url = ' | cut -d'"' -f2)
-            DEST_RPC_URL=$(grep -A 2 '\[networks.31338\]' config/demo.toml | grep 'rpc_url = ' | cut -d'"' -f2)
-            show_balances
-        else
-            echo -e "${RED}❌ Configuration not found!${NC}"
-        fi
-        ;;
-    "approve")
-        if [ -f "config/demo.toml" ]; then
-            # Check required commands first
-            if ! command -v bc &> /dev/null; then
-                echo -e "${RED}❌ 'bc' command not found!${NC}"
-                echo -e "${YELLOW}💡 Install bc: brew install bc (macOS) or apt-get install bc (Linux)${NC}"
-                exit 1
-            fi
-            
-            # Parse addresses from networks section
-            INPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31337\]' config/demo.toml | grep 'input_settler_address = ' | cut -d'"' -f2)
-            
-            # Parse token address from networks section (default to TokenA)
-            ORIGIN_TOKEN_ADDRESS=$(awk '/\[\[networks.31337.tokens\]\]/{f=1} f && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
-            
-            # Account addresses from accounts section
-            USER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'user = ' | head -1 | cut -d'"' -f2)
-            USER_PRIVATE_KEY=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'user_private_key = ' | head -1 | cut -d'"' -f2)
-            
-            # RPC URL from networks section
-            RPC_URL=$(grep -A 2 '\[networks.31337\]' config/demo.toml | grep 'rpc_url = ' | cut -d'"' -f2)
-            AMOUNT="1000000000000000000"  # 1 token
-            approve_tokens
-        else
-            echo -e "${RED}❌ Configuration not found!${NC}"
-        fi
+        # The balances command reuses the same configuration variables already loaded
+        # at the top of the script from the modular config files
+        show_balances
         ;;
     *)
         echo "Usage: $0 [origin_token_address] [dest_token_address]"
-        echo "       $0 [balances|approve]"
+        echo "       $0 balances"
         echo ""
         echo "Commands:"
         echo "  (no args)      - Send intent with default TokenA → TokenA"
         echo "  address address - Send intent with specified tokens"
         echo "  balances       - Check all token balances"
-        echo "  approve        - Just approve tokens (no intent)"
         echo ""
         echo "Examples:"
         echo "  $0                     # TokenA → TokenA"

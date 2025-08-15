@@ -1,0 +1,9 @@
+# API Server Configuration
+# Configures the HTTP API for receiving off-chain intents
+
+[api]
+enabled = true
+host = "127.0.0.1"
+port = 3000
+timeout_seconds = 30
+max_request_size = 1048576  # 1MB

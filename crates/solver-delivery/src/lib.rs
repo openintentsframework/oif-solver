@@ -5,10 +5,11 @@
 //! blockchain networks, managing transaction signing, submission, and confirmation.
 
 use async_trait::async_trait;
-use solver_account::AccountService;
 use solver_types::{
-	ChainData, ConfigSchema, Signature, Transaction, TransactionHash, TransactionReceipt,
+	ChainData, ConfigSchema, ImplementationRegistry, NetworksConfig, Transaction, TransactionHash,
+	TransactionReceipt,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -28,14 +29,14 @@ pub enum DeliveryError {
 	/// Error that occurs when a transaction execution fails.
 	#[error("Transaction failed: {0}")]
 	TransactionFailed(String),
-	/// Error that occurs when no suitable provider is available for the operation.
-	#[error("No provider available")]
-	NoProviderAvailable,
+	/// Error that occurs when no suitable implementation is available for the operation.
+	#[error("No implementation available")]
+	NoImplementationAvailable,
 }
 
-/// Trait defining the interface for transaction delivery providers.
+/// Trait defining the interface for transaction delivery implementations.
 ///
-/// This trait must be implemented by any delivery provider that wants to
+/// This trait must be implemented by any delivery implementation that wants to
 /// integrate with the solver system. It provides methods for submitting
 /// transactions and monitoring their confirmation status.
 #[async_trait]
@@ -44,18 +45,14 @@ pub trait DeliveryInterface: Send + Sync {
 	///
 	/// This allows each implementation to define its own configuration requirements
 	/// with specific validation rules. The schema is used to validate TOML configuration
-	/// before initializing the delivery provider.
+	/// before initializing the delivery implementation.
 	fn config_schema(&self) -> Box<dyn ConfigSchema>;
 
-	/// Submits a signed transaction to the blockchain.
+	/// Signs and submits a transaction to the blockchain.
 	///
-	/// Takes a transaction and its signature, submits it to the network,
-	/// and returns the transaction hash.
-	async fn submit(
-		&self,
-		tx: Transaction,
-		signature: &Signature,
-	) -> Result<TransactionHash, DeliveryError>;
+	/// Takes a transaction, signs it with the appropriate signer for the chain,
+	/// then submits it to the network and returns the transaction hash.
+	async fn submit(&self, tx: Transaction) -> Result<TransactionHash, DeliveryError>;
 
 	/// Waits for a transaction to be confirmed with the specified number of confirmations.
 	///
@@ -64,6 +61,7 @@ pub trait DeliveryInterface: Send + Sync {
 	async fn wait_for_confirmation(
 		&self,
 		hash: &TransactionHash,
+		chain_id: u64,
 		confirmations: u64,
 	) -> Result<TransactionReceipt, DeliveryError>;
 
@@ -74,12 +72,13 @@ pub trait DeliveryInterface: Send + Sync {
 	async fn get_receipt(
 		&self,
 		hash: &TransactionHash,
+		chain_id: u64,
 	) -> Result<TransactionReceipt, DeliveryError>;
 
 	/// Gets the current gas price for the network.
 	///
 	/// Returns the recommended gas price in wei as a decimal string.
-	async fn get_gas_price(&self) -> Result<String, DeliveryError>;
+	async fn get_gas_price(&self, chain_id: u64) -> Result<String, DeliveryError>;
 
 	/// Gets the balance for an address.
 	///
@@ -90,6 +89,7 @@ pub trait DeliveryInterface: Send + Sync {
 		&self,
 		address: &str,
 		token: Option<&str>,
+		chain_id: u64,
 	) -> Result<String, DeliveryError>;
 
 	/// Gets the ERC-20 token allowance for an owner-spender pair.
@@ -101,46 +101,69 @@ pub trait DeliveryInterface: Send + Sync {
 		owner: &str,
 		spender: &str,
 		token_address: &str,
+		chain_id: u64,
 	) -> Result<String, DeliveryError>;
 
 	/// Gets the current nonce for an address.
 	///
 	/// Returns the next valid nonce for transaction submission.
-	async fn get_nonce(&self, address: &str) -> Result<u64, DeliveryError>;
+	async fn get_nonce(&self, address: &str, chain_id: u64) -> Result<u64, DeliveryError>;
 
 	/// Gets the current block number.
 	///
 	/// Returns the latest block number on the network.
-	async fn get_block_number(&self) -> Result<u64, DeliveryError>;
+	async fn get_block_number(&self, chain_id: u64) -> Result<u64, DeliveryError>;
+}
+
+/// Type alias for delivery factory functions.
+///
+/// This is the function signature that all delivery implementations must provide
+/// to create instances of their delivery interface.
+pub type DeliveryFactory = fn(
+	&toml::Value,
+	&NetworksConfig,
+	&solver_types::SecretString,               // Default/primary private key
+	&HashMap<u64, solver_types::SecretString>, // Per-network private keys
+) -> Result<Box<dyn DeliveryInterface>, DeliveryError>;
+
+/// Registry trait for delivery implementations.
+///
+/// This trait extends the base ImplementationRegistry to specify that
+/// delivery implementations must provide a DeliveryFactory.
+pub trait DeliveryRegistry: ImplementationRegistry<Factory = DeliveryFactory> {}
+
+/// Get all registered delivery implementations.
+///
+/// Returns a vector of (name, factory) tuples for all available delivery implementations.
+/// This is used by the factory registry to automatically register all implementations.
+pub fn get_all_implementations() -> Vec<(&'static str, DeliveryFactory)> {
+	use implementations::evm::alloy;
+
+	vec![(alloy::Registry::NAME, alloy::Registry::factory())]
 }
 
 /// Service that manages transaction delivery across multiple blockchain networks.
 ///
-/// The DeliveryService coordinates between different delivery providers based on
-/// chain ID, handles transaction signing through the account service, and provides
-/// methods for transaction submission and confirmation monitoring.
+/// The DeliveryService coordinates between different delivery implementations based on
+/// chain ID and provides methods for transaction submission and confirmation monitoring.
 pub struct DeliveryService {
-	/// Map of chain IDs to their corresponding delivery providers.
-	providers: std::collections::HashMap<u64, Box<dyn DeliveryInterface>>,
-	/// Account service for signing transactions.
-	account: Arc<AccountService>,
+	/// Map of chain IDs to their corresponding delivery implementations.
+	implementations: std::collections::HashMap<u64, Arc<dyn DeliveryInterface>>,
 	/// Default number of confirmations required for transactions.
 	min_confirmations: u64,
 }
 
 impl DeliveryService {
-	/// Creates a new DeliveryService with the specified providers and configuration.
+	/// Creates a new DeliveryService with the specified implementations and configuration.
 	///
-	/// The providers map should contain delivery implementations for each supported
-	/// chain ID. The account service is used for transaction signing.
+	/// The implementations map should contain delivery implementations for each supported
+	/// chain ID.
 	pub fn new(
-		providers: std::collections::HashMap<u64, Box<dyn DeliveryInterface>>,
-		account: Arc<AccountService>,
+		implementations: std::collections::HashMap<u64, Arc<dyn DeliveryInterface>>,
 		min_confirmations: u64,
 	) -> Self {
 		Self {
-			providers,
-			account,
+			implementations,
 			min_confirmations,
 		}
 	}
@@ -148,56 +171,37 @@ impl DeliveryService {
 	/// Delivers a transaction to the appropriate blockchain network.
 	///
 	/// This method:
-	/// 1. Selects the appropriate provider based on the transaction's chain ID
-	/// 2. Signs the transaction using the account service
-	/// 3. Submits the signed transaction through the provider
+	/// 1. Selects the appropriate implementation based on the transaction's chain ID
+	/// 2. Submits the transaction through the implementation (which handles signing)
 	pub async fn deliver(&self, tx: Transaction) -> Result<TransactionHash, DeliveryError> {
-		// Get the provider for the transaction's chain ID
-		let provider = self
-			.providers
+		// Get the implementation for the transaction's chain ID
+		let implementation = self
+			.implementations
 			.get(&tx.chain_id)
-			.ok_or(DeliveryError::NoProviderAvailable)?;
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
-		// Sign transaction
-		let signature = self
-			.account
-			.sign(&tx)
-			.await
-			.map_err(|e| DeliveryError::Network(e.to_string()))?;
-
-		// Submit using the chain-specific provider
-		provider.submit(tx, &signature).await
+		// Submit using the chain-specific implementation (which handles signing)
+		implementation.submit(tx).await
 	}
 
 	/// Waits for a transaction to be confirmed with the specified number of confirmations.
 	///
-	/// This method first checks which provider has the transaction, then waits for confirmations
-	/// on that specific provider to avoid timeout issues.
+	/// This method uses the chain_id to directly route to the correct implementation.
 	pub async fn confirm(
 		&self,
 		hash: &TransactionHash,
+		chain_id: u64,
 		confirmations: u64,
 	) -> Result<TransactionReceipt, DeliveryError> {
-		// First, quickly check which provider has the transaction
-		let mut provider_with_tx = None;
+		// Get the implementation for the specified chain
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
-		for (chain_id, provider) in self.providers.iter() {
-			// Just check if the transaction exists, don't wait for confirmations yet
-			match provider.get_receipt(hash).await {
-				Ok(_) => {
-					provider_with_tx = Some((*chain_id, provider));
-					break;
-				}
-				Err(_) => continue,
-			}
-		}
-
-		// If we found a provider with the transaction, wait for confirmations
-		if let Some((_chain_id, provider)) = provider_with_tx {
-			provider.wait_for_confirmation(hash, confirmations).await
-		} else {
-			Err(DeliveryError::NoProviderAvailable)
-		}
+		implementation
+			.wait_for_confirmation(hash, chain_id, confirmations)
+			.await
 	}
 
 	/// Waits for a transaction to be confirmed with the default number of confirmations.
@@ -206,49 +210,40 @@ impl DeliveryService {
 	pub async fn confirm_with_default(
 		&self,
 		hash: &TransactionHash,
+		chain_id: u64,
 	) -> Result<TransactionReceipt, DeliveryError> {
 		// Use configured confirmations
-		self.confirm(hash, self.min_confirmations).await
+		self.confirm(hash, chain_id, self.min_confirmations).await
 	}
 
-	/// Checks the current status of a transaction.
+	/// Checks the current status of a transaction on a specific chain.
 	///
 	/// Returns true if the transaction was successful, false if it failed.
-	/// This method tries all providers until one recognizes the transaction.
-	pub async fn get_status(&self, hash: &TransactionHash) -> Result<bool, DeliveryError> {
-		// Try all providers until one recognizes the transaction
-		// TODO: Improve this so it doesn't make redundant requests
-		for (chain_id, provider) in self.providers.iter() {
-			match provider.get_receipt(hash).await {
-				Ok(receipt) => {
-					return Ok(receipt.success);
-				}
-				Err(e) => {
-					tracing::trace!(
-						"Provider for chain {} cannot find transaction {}: {}",
-						chain_id,
-						hex::encode(&hash.0),
-						e
-					);
-					continue;
-				}
-			}
-		}
+	pub async fn get_status(
+		&self,
+		hash: &TransactionHash,
+		chain_id: u64,
+	) -> Result<bool, DeliveryError> {
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
-		Err(DeliveryError::NoProviderAvailable)
+		let receipt = implementation.get_receipt(hash, chain_id).await?;
+		Ok(receipt.success)
 	}
 
 	/// Gets chain-specific data for the given chain ID.
 	///
 	/// Returns gas price, block number, and other chain state information.
 	pub async fn get_chain_data(&self, chain_id: u64) -> Result<ChainData, DeliveryError> {
-		let provider = self
-			.providers
+		let implementation = self
+			.implementations
 			.get(&chain_id)
-			.ok_or(DeliveryError::NoProviderAvailable)?;
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
-		let gas_price = provider.get_gas_price().await?;
-		let block_number = provider.get_block_number().await?;
+		let gas_price = implementation.get_gas_price(chain_id).await?;
+		let block_number = implementation.get_block_number(chain_id).await?;
 
 		Ok(ChainData {
 			chain_id,
@@ -263,36 +258,36 @@ impl DeliveryService {
 
 	/// Gets the balance for an address on a specific chain.
 	///
-	/// Convenience method that routes to the appropriate provider.
+	/// Convenience method that routes to the appropriate implementation.
 	pub async fn get_balance(
 		&self,
 		chain_id: u64,
 		address: &str,
 		token: Option<&str>,
 	) -> Result<String, DeliveryError> {
-		let provider = self
-			.providers
+		let implementation = self
+			.implementations
 			.get(&chain_id)
-			.ok_or(DeliveryError::NoProviderAvailable)?;
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
-		provider.get_balance(address, token).await
+		implementation.get_balance(address, token, chain_id).await
 	}
 
 	/// Gets the nonce for an address on a specific chain.
 	///
-	/// Convenience method that routes to the appropriate provider.
+	/// Convenience method that routes to the appropriate implementation.
 	pub async fn get_nonce(&self, chain_id: u64, address: &str) -> Result<u64, DeliveryError> {
-		let provider = self
-			.providers
+		let implementation = self
+			.implementations
 			.get(&chain_id)
-			.ok_or(DeliveryError::NoProviderAvailable)?;
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
-		provider.get_nonce(address).await
+		implementation.get_nonce(address, chain_id).await
 	}
 
 	/// Gets the ERC-20 token allowance for an owner-spender pair on a specific chain.
 	///
-	/// Convenience method that routes to the appropriate provider.
+	/// Convenience method that routes to the appropriate implementation.
 	pub async fn get_allowance(
 		&self,
 		chain_id: u64,
@@ -300,37 +295,37 @@ impl DeliveryService {
 		spender: &str,
 		token_address: &str,
 	) -> Result<String, DeliveryError> {
-		let provider = self
-			.providers
+		let implementation = self
+			.implementations
 			.get(&chain_id)
-			.ok_or(DeliveryError::NoProviderAvailable)?;
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
-		provider.get_allowance(owner, spender, token_address).await
+		implementation
+			.get_allowance(owner, spender, token_address, chain_id)
+			.await
 	}
 
-	/// Gets the current gas price from the first available provider.
+	/// Gets the current gas price for a specific chain.
 	///
 	/// Returns the gas price as a string in wei.
-	pub async fn get_gas_price(&self) -> Result<String, DeliveryError> {
-		// Use the first available provider
-		for provider in self.providers.values() {
-			if let Ok(gas_price) = provider.get_gas_price().await {
-				return Ok(gas_price);
-			}
-		}
-		Err(DeliveryError::NoProviderAvailable)
+	pub async fn get_gas_price(&self, chain_id: u64) -> Result<String, DeliveryError> {
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
+
+		implementation.get_gas_price(chain_id).await
 	}
 
-	/// Gets the current block number from the first available provider.
+	/// Gets the current block number for a specific chain.
 	///
 	/// Returns the latest block number.
-	pub async fn get_block_number(&self) -> Result<u64, DeliveryError> {
-		// Use the first available provider
-		for provider in self.providers.values() {
-			if let Ok(block_number) = provider.get_block_number().await {
-				return Ok(block_number);
-			}
-		}
-		Err(DeliveryError::NoProviderAvailable)
+	pub async fn get_block_number(&self, chain_id: u64) -> Result<u64, DeliveryError> {
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
+
+		implementation.get_block_number(chain_id).await
 	}
 }

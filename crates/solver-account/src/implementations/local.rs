@@ -146,8 +146,8 @@ impl AccountInterface for LocalWallet {
 		Ok(signature.into())
 	}
 
-	fn get_private_key(&self) -> Option<SecretString> {
-		Some(self.get_private_key())
+	fn get_private_key(&self) -> SecretString {
+		self.get_private_key()
 	}
 }
 
@@ -174,3 +174,17 @@ pub fn create_account(config: &toml::Value) -> Result<Box<dyn AccountInterface>,
 
 	Ok(Box::new(LocalWallet::new(private_key)?))
 }
+
+/// Registry for the local account implementation.
+pub struct Registry;
+
+impl solver_types::ImplementationRegistry for Registry {
+	const NAME: &'static str = "local";
+	type Factory = crate::AccountFactory;
+
+	fn factory() -> Self::Factory {
+		create_account
+	}
+}
+
+impl crate::AccountRegistry for Registry {}

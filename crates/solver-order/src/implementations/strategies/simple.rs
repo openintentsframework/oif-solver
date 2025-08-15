@@ -9,7 +9,7 @@ use solver_types::{
 	ExecutionDecision, ExecutionParams, Field, FieldType, Order, Schema,
 };
 
-use crate::ExecutionStrategy;
+use crate::{ExecutionStrategy, StrategyError};
 
 /// Simple execution strategy that considers gas price limits.
 ///
@@ -156,11 +156,31 @@ impl ExecutionStrategy for SimpleStrategy {
 ///
 /// Configuration parameters:
 /// - `max_gas_price_gwei`: Maximum gas price in gwei (default: 100)
-pub fn create_strategy(config: &toml::Value) -> Box<dyn ExecutionStrategy> {
+pub fn create_strategy(config: &toml::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError> {
+	// Validate configuration using the schema
+	let schema = SimpleStrategySchema;
+	schema
+		.validate(config)
+		.map_err(|e| StrategyError::InvalidConfig(e.to_string()))?;
+
 	let max_gas_price = config
 		.get("max_gas_price_gwei")
 		.and_then(|v| v.as_integer())
 		.unwrap_or(100) as u64;
 
-	Box::new(SimpleStrategy::new(max_gas_price))
+	Ok(Box::new(SimpleStrategy::new(max_gas_price)))
 }
+
+/// Registry for the simple strategy implementation.
+pub struct Registry;
+
+impl solver_types::ImplementationRegistry for Registry {
+	const NAME: &'static str = "simple";
+	type Factory = crate::StrategyFactory;
+
+	fn factory() -> Self::Factory {
+		create_strategy
+	}
+}
+
+impl crate::StrategyRegistry for Registry {}

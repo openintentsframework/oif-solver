@@ -428,47 +428,24 @@ cast send $TOKENB "approve(address,uint256)" $ORIGIN_PERMIT2_ADDRESS "0xffffffff
     --private-key $USER_PRIVATE_KEY > /dev/null
 echo -e "${GREEN}✓${NC}"
 
-# Step 5: Create config file
+# Step 5: Create config files (modular structure)
 echo
-echo -e "${YELLOW}5. Creating config file...${NC}"
+echo -e "${YELLOW}5. Creating modular config files...${NC}"
 
-mkdir -p config
+mkdir -p config/demo
 
+# Create main config file with includes
 cat > config/demo.toml << EOF
-# OIF Solver Configuration
+# OIF Solver Configuration - Main File
+
+include = [
+    "demo/networks.toml",
+    "demo/api.toml"
+]
 
 [solver]
 id = "oif-solver-demo"
 monitoring_timeout_minutes = 5
-
-# ============================================================================
-# NETWORKS - Central configuration for all chains
-# ============================================================================
-[networks.$ORIGIN_CHAIN_ID]
-rpc_url = "http://localhost:$ORIGIN_PORT"
-input_settler_address = "$INPUT_SETTLER"
-output_settler_address = "$OUTPUT_SETTLER"
-[[networks.$ORIGIN_CHAIN_ID.tokens]]
-address = "$TOKENA"
-symbol = "TOKA"
-decimals = 18
-[[networks.$ORIGIN_CHAIN_ID.tokens]]
-address = "$TOKENB"
-symbol = "TOKB"
-decimals = 18
-
-[networks.$DEST_CHAIN_ID]
-rpc_url = "http://localhost:$DEST_PORT"
-input_settler_address = "$INPUT_SETTLER"
-output_settler_address = "$OUTPUT_SETTLER"
-[[networks.$DEST_CHAIN_ID.tokens]]
-address = "$TOKENA"
-symbol = "TOKA"
-decimals = 18
-[[networks.$DEST_CHAIN_ID.tokens]]
-address = "$TOKENB"
-symbol = "TOKB"
-decimals = 18
 
 # ============================================================================
 # STORAGE
@@ -490,78 +467,59 @@ ttl_order_by_tx_hash = 86400    # 24 hours
 # ACCOUNT
 # ============================================================================
 [account]
-provider = "local"
-[account.config]
+primary = "local"
+
+[account.implementations.local]
 private_key = "\${ETH_PRIVATE_KEY:-$PRIVATE_KEY}"
 
 # ============================================================================
-# DELIVERY - References networks by ID
+# DELIVERY
 # ============================================================================
 [delivery]
 min_confirmations = 1
 
-[delivery.providers.origin]
-network_id = $ORIGIN_CHAIN_ID  # References networks.$ORIGIN_CHAIN_ID for RPC URL and chain ID
-# private_key omitted - uses account.config.private_key by default
-
-[delivery.providers.destination]
-network_id = $DEST_CHAIN_ID  # References networks.$DEST_CHAIN_ID
-# private_key omitted - uses account.config.private_key by default
-
-# Example: Override for specific provider if needed
-# [delivery.providers.special]
-# network_id = 1
-# private_key = "0x..."  # Explicit override for this provider
+[delivery.implementations.evm_alloy]
+network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]
 
 # ============================================================================
-# DISCOVERY - References networks for chain-specific sources
+# DISCOVERY
 # ============================================================================
 [discovery]
 
-[discovery.sources.onchain_eip7683]
-network_id = $ORIGIN_CHAIN_ID  # Required: specifies which chain to monitor
+[discovery.implementations.onchain_eip7683]
+network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]
 
-[discovery.sources.offchain_eip7683]
+[discovery.implementations.offchain_eip7683]
 api_host = "127.0.0.1"
 api_port = 8081
-network_ids = [$ORIGIN_CHAIN_ID]  # Optional: declares multi-chain support
-# auth_token = "your-secret-token"
+network_ids = [$ORIGIN_CHAIN_ID]
 
 # ============================================================================
 # ORDER
 # ============================================================================
 [order]
-[order.implementations.eip7683]
-# Uses networks config for all chain-specific settings
 
-[order.execution_strategy]
-strategy_type = "simple"
-[order.execution_strategy.config]
+[order.implementations.eip7683]
+
+[order.strategy]
+primary = "simple"
+
+[order.strategy.implementations.simple]
 max_gas_price_gwei = 100
 
 # ============================================================================
-# SETTLEMENT - References networks for chain config
+# SETTLEMENT
 # ============================================================================
 [settlement]
+
 [settlement.domain]
-# Domain configuration for EIP-712 signatures in quotes
-chain_id = 1  # Ethereum mainnet for signature domain
+chain_id = 1
 address = "$INPUT_SETTLER"
 
 [settlement.implementations.eip7683]
-network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]  # Monitor multiple chains for oracle verification
+network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]
 oracle_addresses = { $ORIGIN_CHAIN_ID = "$ORACLE", $DEST_CHAIN_ID = "$ORACLE" }
 dispute_period_seconds = 1
-
-# ============================================================================
-# API SERVER
-# ============================================================================
-[api]
-enabled = true
-host = "127.0.0.1"
-port = 3000
-timeout_seconds = 30
-max_request_size = 1048576  # 1MB
 
 
 # ============================================================================
@@ -590,6 +548,60 @@ user_private_key = "$USER_PRIVATE_KEY"
 recipient = "$RECIPIENT_ADDR"
 EOF
 
+# Create networks.toml
+cat > config/demo/networks.toml << EOF
+# Network Configuration
+# Defines all supported blockchain networks and their tokens
+
+[networks.$ORIGIN_CHAIN_ID]
+rpc_url = "http://localhost:$ORIGIN_PORT"
+input_settler_address = "$INPUT_SETTLER"
+output_settler_address = "$OUTPUT_SETTLER"
+
+[[networks.$ORIGIN_CHAIN_ID.tokens]]
+address = "$TOKENA"
+symbol = "TOKA"
+decimals = 18
+
+[[networks.$ORIGIN_CHAIN_ID.tokens]]
+address = "$TOKENB"
+symbol = "TOKB"
+decimals = 18
+
+[networks.$DEST_CHAIN_ID]
+rpc_url = "http://localhost:$DEST_PORT"
+input_settler_address = "$INPUT_SETTLER"
+output_settler_address = "$OUTPUT_SETTLER"
+
+[[networks.$DEST_CHAIN_ID.tokens]]
+address = "$TOKENA"
+symbol = "TOKA"
+decimals = 18
+
+[[networks.$DEST_CHAIN_ID.tokens]]
+address = "$TOKENB"
+symbol = "TOKB"
+decimals = 18
+EOF
+
+# Create api.toml
+cat > config/demo/api.toml << EOF
+# API Server Configuration
+# Configures the HTTP API for receiving off-chain intents
+
+[api]
+enabled = true
+host = "127.0.0.1"
+port = 3000
+timeout_seconds = 30
+max_request_size = 1048576  # 1MB
+EOF
+
+echo -e "  ${GREEN}✓${NC} Created modular config files:"
+echo -e "    - config/demo.toml (main config with includes)"
+echo -e "    - config/demo/networks.toml (network configurations)"
+echo -e "    - config/demo/api.toml (API server settings)"
+
 # Done!
 echo
 echo -e "${GREEN}✅ Setup complete!${NC}"
@@ -612,10 +624,11 @@ echo "  User:   100 TOKA and 100 TOKB on origin chain (Permit2 approved)"
 echo "  Solver: 100 TOKA and 100 TOKB on both chains"
 echo
 echo -e "${BLUE}📋 Configuration:${NC}"
-echo "  Config file: config/demo.toml"
+echo "  Main config: config/demo.toml (with modular includes)"
+echo "  Modules: config/demo/networks.toml, config/demo/api.toml"
 echo
 echo -e "${YELLOW}To start the solver:${NC}"
-echo "  cargo run --bin solver-service -- --config config/demo.toml"
+echo "  cargo run --bin solver -- --config config/demo.toml"
 echo
 echo -e "${YELLOW}Press Ctrl+C to stop Anvil chains${NC}"
 

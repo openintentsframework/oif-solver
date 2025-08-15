@@ -11,6 +11,7 @@
 #   ./send_offchain_intent.sh 0xABC... 0xDEF...          # Specific tokens
 #   ./send_offchain_intent.sh --direct                     # Use discovery service
 #   ./send_offchain_intent.sh 0xABC... 0xDEF... --direct  # Specific tokens + discovery
+#   ./send_offchain_intent.sh balances                     # Check balances only
 
 set -e
 
@@ -24,41 +25,47 @@ NC='\033[0m' # No Color
 echo -e "${BLUE}📤 Sending EIP-7683 Intent via Offchain API${NC}"
 echo "========================================="
 
-# Check if config exists
-if [ ! -f "config/demo.toml" ]; then
+# Check if modular config exists
+if [ ! -f "config/demo.toml" ] || [ ! -f "config/demo/networks.toml" ]; then
     echo -e "${RED}❌ Configuration not found!${NC}"
     echo -e "${YELLOW}💡 Run './setup_local_anvil.sh' first${NC}"
     exit 1
 fi
 
-# Load addresses from config - from networks section
+# Use modular configuration paths
+MAIN_CONFIG="config/demo.toml"
+NETWORKS_CONFIG="config/demo/networks.toml"
+
+# Load addresses from networks config
 # For origin chain (31337)
-INPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31337\]' config/demo.toml | grep 'input_settler_address = ' | cut -d'"' -f2)
+INPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31337\]' $NETWORKS_CONFIG | grep 'input_settler_address = ' | cut -d'"' -f2)
+OUTPUT_SETTLER_ADDRESS_ORIGIN=$(grep -A 5 '\[networks.31337\]' $NETWORKS_CONFIG | grep 'output_settler_address = ' | cut -d'"' -f2)
 # For destination chain (31338)
-OUTPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31338\]' config/demo.toml | grep 'output_settler_address = ' | cut -d'"' -f2)
+INPUT_SETTLER_ADDRESS_DEST=$(grep -A 5 '\[networks.31338\]' $NETWORKS_CONFIG | grep 'input_settler_address = ' | cut -d'"' -f2)
+OUTPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31338\]' $NETWORKS_CONFIG | grep 'output_settler_address = ' | cut -d'"' -f2)
 
-# Get oracle address from settlement section - now it's a map per chain
+# Get oracle address from settlement section in main config
 # Extract oracle address for origin chain (31337)
-ORACLE_ADDRESS=$(grep 'oracle_addresses = ' config/demo.toml | sed 's/.*31337 = "\([^"]*\)".*/\1/')
+ORACLE_ADDRESS=$(grep 'oracle_addresses = ' $MAIN_CONFIG | sed 's/.*31337 = "\([^"]*\)".*/\1/')
 
-# Parse token addresses from networks section
+# Parse token addresses from networks config
 # For origin chain tokens (31337)
-DEFAULT_ORIGIN_TOKEN=$(awk '/\[\[networks.31337.tokens\]\]/{f=1} f && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
-TOKENB_ORIGIN=$(awk '/\[\[networks.31337.tokens\]\]/{c++} c==2 && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
+DEFAULT_ORIGIN_TOKEN=$(awk '/\[\[networks.31337.tokens\]\]/{f=1} f && /address =/{gsub(/"/, "", $3); print $3; exit}' $NETWORKS_CONFIG)
+TOKENB_ORIGIN=$(awk '/\[\[networks.31337.tokens\]\]/{c++} c==2 && /address =/{gsub(/"/, "", $3); print $3; exit}' $NETWORKS_CONFIG)
 
 # For destination chain tokens (31338)
-DEFAULT_DEST_TOKEN=$(awk '/\[\[networks.31338.tokens\]\]/{f=1} f && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
-TOKENB_DEST=$(awk '/\[\[networks.31338.tokens\]\]/{c++} c==2 && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
+DEFAULT_DEST_TOKEN=$(awk '/\[\[networks.31338.tokens\]\]/{f=1} f && /address =/{gsub(/"/, "", $3); print $3; exit}' $NETWORKS_CONFIG)
+TOKENB_DEST=$(awk '/\[\[networks.31338.tokens\]\]/{c++} c==2 && /address =/{gsub(/"/, "", $3); print $3; exit}' $NETWORKS_CONFIG)
 
-# Account addresses from accounts section
-SOLVER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'solver = ' | head -1 | cut -d'"' -f2)
-USER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'user = ' | head -1 | cut -d'"' -f2)
-USER_PRIVATE_KEY=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'user_private_key = ' | head -1 | cut -d'"' -f2)
-RECIPIENT_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'recipient = ' | head -1 | cut -d'"' -f2)
+# Account addresses from main config
+SOLVER_ADDR=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'solver = ' | cut -d'"' -f2)
+USER_ADDR=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'user = ' | cut -d'"' -f2)
+USER_PRIVATE_KEY=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'user_private_key = ' | cut -d'"' -f2)
+RECIPIENT_ADDR=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'recipient = ' | cut -d'"' -f2)
 
-# Load RPC URLs from networks section
-ORIGIN_RPC_URL=$(grep -A 2 '\[networks.31337\]' config/demo.toml | grep 'rpc_url = ' | cut -d'"' -f2)
-DEST_RPC_URL=$(grep -A 2 '\[networks.31338\]' config/demo.toml | grep 'rpc_url = ' | cut -d'"' -f2)
+# Load RPC URLs from networks config
+ORIGIN_RPC_URL=$(grep -A 2 '\[networks.31337\]' $NETWORKS_CONFIG | grep 'rpc_url = ' | cut -d'"' -f2)
+DEST_RPC_URL=$(grep -A 2 '\[networks.31338\]' $NETWORKS_CONFIG | grep 'rpc_url = ' | cut -d'"' -f2)
 ORIGIN_CHAIN_ID=31337
 DEST_CHAIN_ID=31338
 
@@ -67,23 +74,29 @@ ORIGIN_TOKEN_ADDRESS=""
 DEST_TOKEN_ADDRESS=""
 API_MODE=""
 
-# Process arguments
-for arg in "$@"; do
-    if [ "$arg" = "--direct" ]; then
-        API_MODE="direct"
-    elif [ "$arg" = "--help" ]; then
-        API_MODE="help"
-    elif [[ "$arg" =~ ^http ]]; then
-        API_MODE="custom"
-        API_URL="$arg"
-    elif [[ "$arg" =~ ^0x[a-fA-F0-9]{40}$ ]]; then
-        if [ -z "$ORIGIN_TOKEN_ADDRESS" ]; then
-            ORIGIN_TOKEN_ADDRESS="$arg"
-        elif [ -z "$DEST_TOKEN_ADDRESS" ]; then
-            DEST_TOKEN_ADDRESS="$arg"
+# Check if first argument is balances command
+if [ "$1" = "balances" ]; then
+    COMMAND="balances"
+else
+    COMMAND="send"
+    # Process arguments for send command
+    for arg in "$@"; do
+        if [ "$arg" = "--direct" ]; then
+            API_MODE="direct"
+        elif [ "$arg" = "--help" ]; then
+            API_MODE="help"
+        elif [[ "$arg" =~ ^http ]]; then
+            API_MODE="custom"
+            API_URL="$arg"
+        elif [[ "$arg" =~ ^0x[a-fA-F0-9]{40}$ ]]; then
+            if [ -z "$ORIGIN_TOKEN_ADDRESS" ]; then
+                ORIGIN_TOKEN_ADDRESS="$arg"
+            elif [ -z "$DEST_TOKEN_ADDRESS" ]; then
+                DEST_TOKEN_ADDRESS="$arg"
+            fi
         fi
-    fi
-done
+    done
+fi
 
 # Set default tokens if not provided
 if [ -z "$ORIGIN_TOKEN_ADDRESS" ]; then
@@ -108,9 +121,87 @@ get_token_symbol() {
 ORIGIN_SYMBOL=$(get_token_symbol "$ORIGIN_TOKEN_ADDRESS")
 DEST_SYMBOL=$(get_token_symbol "$DEST_TOKEN_ADDRESS")
 
-# Set API endpoint based on mode
+# Function to check balances (same as in onchain script)
+check_balance() {
+    local address=$1
+    local name=$2
+    local rpc_url=${3:-$ORIGIN_RPC_URL}
+    local token_addr=${4:-$ORIGIN_TOKEN_ADDRESS}
+    
+    local balance_hex=$(cast call $token_addr "balanceOf(address)" $address --rpc-url $rpc_url 2>&1 | grep -E '^0x[0-9a-fA-F]+$' | tail -1)
+    
+    if [ -z "$balance_hex" ]; then
+        echo -e "   $name: 0 tokens (Error: check RPC connection)"
+        return
+    fi
+    
+    local balance_dec=$(cast to-dec $balance_hex 2>/dev/null || echo "0")
+    # Use explicit decimal division instead of exponentiation
+    local balance_formatted=$(echo "scale=2; $balance_dec / 1000000000000000000" | bc -l 2>/dev/null || echo "0")
+    echo -e "   $name: ${balance_formatted} tokens"
+}
+
+# Function to show current balances
+show_balances() {
+    if [ "$COMMAND" = "balances" ]; then
+        # Show all token balances when checking balances
+        echo -e "${BLUE}💰 TokenA Balances on Origin Chain ($ORIGIN_CHAIN_ID):${NC}"
+        check_balance $USER_ADDR "User" $ORIGIN_RPC_URL $DEFAULT_ORIGIN_TOKEN
+        check_balance $SOLVER_ADDR "Solver" $ORIGIN_RPC_URL $DEFAULT_ORIGIN_TOKEN
+        check_balance $RECIPIENT_ADDR "Recipient" $ORIGIN_RPC_URL $DEFAULT_ORIGIN_TOKEN
+        check_balance $INPUT_SETTLER_ADDRESS "InputSettler" $ORIGIN_RPC_URL $DEFAULT_ORIGIN_TOKEN
+        
+        echo -e "${BLUE}💰 TokenB Balances on Origin Chain ($ORIGIN_CHAIN_ID):${NC}"
+        check_balance $USER_ADDR "User" $ORIGIN_RPC_URL $TOKENB_ORIGIN
+        check_balance $SOLVER_ADDR "Solver" $ORIGIN_RPC_URL $TOKENB_ORIGIN
+        check_balance $RECIPIENT_ADDR "Recipient" $ORIGIN_RPC_URL $TOKENB_ORIGIN
+        check_balance $INPUT_SETTLER_ADDRESS "InputSettler" $ORIGIN_RPC_URL $TOKENB_ORIGIN
+        
+        echo -e "${BLUE}💰 TokenA Balances on Destination Chain ($DEST_CHAIN_ID):${NC}"
+        check_balance $USER_ADDR "User" $DEST_RPC_URL $DEFAULT_DEST_TOKEN
+        check_balance $SOLVER_ADDR "Solver" $DEST_RPC_URL $DEFAULT_DEST_TOKEN
+        check_balance $RECIPIENT_ADDR "Recipient" $DEST_RPC_URL $DEFAULT_DEST_TOKEN
+        check_balance $OUTPUT_SETTLER_ADDRESS "OutputSettler" $DEST_RPC_URL $DEFAULT_DEST_TOKEN
+        
+        echo -e "${BLUE}💰 TokenB Balances on Destination Chain ($DEST_CHAIN_ID):${NC}"
+        check_balance $USER_ADDR "User" $DEST_RPC_URL $TOKENB_DEST
+        check_balance $SOLVER_ADDR "Solver" $DEST_RPC_URL $TOKENB_DEST
+        check_balance $RECIPIENT_ADDR "Recipient" $DEST_RPC_URL $TOKENB_DEST
+        check_balance $OUTPUT_SETTLER_ADDRESS "OutputSettler" $DEST_RPC_URL $TOKENB_DEST
+    else
+        # Show only relevant token balances for intent
+        echo -e "${BLUE}💰 Current Balances on Origin Chain ($ORIGIN_CHAIN_ID) - $ORIGIN_SYMBOL:${NC}"
+        check_balance $USER_ADDR "User" $ORIGIN_RPC_URL $ORIGIN_TOKEN_ADDRESS
+        check_balance $SOLVER_ADDR "Solver" $ORIGIN_RPC_URL $ORIGIN_TOKEN_ADDRESS
+        check_balance $RECIPIENT_ADDR "Recipient" $ORIGIN_RPC_URL $ORIGIN_TOKEN_ADDRESS
+        check_balance $INPUT_SETTLER_ADDRESS "InputSettler" $ORIGIN_RPC_URL $ORIGIN_TOKEN_ADDRESS
+        
+        echo -e "${BLUE}💰 Current Balances on Destination Chain ($DEST_CHAIN_ID) - $DEST_SYMBOL:${NC}"
+        check_balance $USER_ADDR "User" $DEST_RPC_URL $DEST_TOKEN_ADDRESS
+        check_balance $SOLVER_ADDR "Solver" $DEST_RPC_URL $DEST_TOKEN_ADDRESS
+        check_balance $RECIPIENT_ADDR "Recipient" $DEST_RPC_URL $DEST_TOKEN_ADDRESS
+        check_balance $OUTPUT_SETTLER_ADDRESS "OutputSettler" $DEST_RPC_URL $DEST_TOKEN_ADDRESS
+    fi
+}
+
+# Handle balances command
+if [ "$COMMAND" = "balances" ]; then
+    # Check required commands
+    if ! command -v bc &> /dev/null; then
+        echo -e "${RED}❌ 'bc' command not found!${NC}"
+        echo -e "${YELLOW}💡 Install bc: brew install bc (macOS) or apt-get install bc (Linux)${NC}"
+        exit 1
+    fi
+    
+    echo -e "${BLUE}📊 Checking Token Balances${NC}"
+    echo "================================"
+    show_balances
+    exit 0
+fi
+
+# Set API endpoint based on mode (for send command)
 if [ "$API_MODE" = "direct" ]; then
-    API_PORT=$(grep -A 10 '\[discovery.sources.offchain_eip7683\]' config/demo.toml | grep 'api_port = ' | awk '{print $3}')
+    API_PORT=$(grep -A 10 '\[discovery.implementations.offchain_eip7683\]' $MAIN_CONFIG | grep 'api_port = ' | awk '{print $3}')
     API_URL="http://localhost:${API_PORT:-8081}/intent"
     echo -e "${YELLOW}Using direct discovery API at $API_URL${NC}"
 elif [ "$API_MODE" = "custom" ]; then
@@ -132,6 +223,7 @@ if [ "$API_MODE" = "help" ]; then
     echo "  --direct        Use discovery service directly (port 8081)"
     echo "  <URL>          Use custom API URL"
     echo "  --help         Show this help message"
+    echo "  balances       Check all token balances"
     echo ""
     echo "Examples:"
     echo "  $0                                    # TokenA → TokenA via solver API"
@@ -139,11 +231,19 @@ if [ "$API_MODE" = "help" ]; then
     echo "  $0 $DEFAULT_ORIGIN_TOKEN $TOKENB_DEST               # TokenA → TokenB"
     echo "  $0 $TOKENB_ORIGIN $DEFAULT_DEST_TOKEN               # TokenB → TokenA"
     echo "  $0 $DEFAULT_ORIGIN_TOKEN $TOKENB_DEST --direct      # TokenA → TokenB via discovery"
+    echo "  $0 balances                          # Check all token balances"
     exit 0
 fi
 
 # Amount in wei (1 token = 1e18 wei)
 AMOUNT="1000000000000000000"
+
+# Check required commands
+if ! command -v bc &> /dev/null; then
+    echo -e "${RED}❌ 'bc' command not found!${NC}"
+    echo -e "${YELLOW}💡 Install bc: brew install bc (macOS) or apt-get install bc (Linux)${NC}"
+    exit 1
+fi
 
 # Approve tokens for Permit2
 approve_permit2() {
@@ -228,6 +328,10 @@ echo -e "   Amount: 1.0 tokens ($ORIGIN_SYMBOL on chain $ORIGIN_CHAIN_ID → $DE
 echo -e "   Origin Token: $ORIGIN_TOKEN_ADDRESS"
 echo -e "   Dest Token:   $DEST_TOKEN_ADDRESS"
 echo -e "   Fill Deadline: $(date -r $FILL_DEADLINE 2>/dev/null || date -d @$FILL_DEADLINE)"
+
+echo ""
+echo -e "${BLUE}📊 Current Balances:${NC}"
+show_balances
 
 echo ""
 echo -e "${YELLOW}🔏 Generating EIP-712 signature...${NC}"
