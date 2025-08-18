@@ -57,7 +57,13 @@ impl DirectSettlement {
 				))
 			})?;
 
-			let provider = RootProvider::new_http(network.rpc_url.parse().map_err(|e| {
+			let http_url = network.get_http_url().ok_or_else(|| {
+				SettlementError::ValidationFailed(format!(
+					"No HTTP RPC URL configured for network {}",
+					network_id
+				))
+			})?;
+			let provider = RootProvider::new_http(http_url.parse().map_err(|e| {
 				SettlementError::ValidationFailed(format!(
 					"Invalid RPC URL for network {}: {}",
 					network_id, e

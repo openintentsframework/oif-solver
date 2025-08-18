@@ -63,9 +63,9 @@ USER_ADDR=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'user = ' | cut -d'"' -
 USER_PRIVATE_KEY=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'user_private_key = ' | cut -d'"' -f2)
 RECIPIENT_ADDR=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'recipient = ' | cut -d'"' -f2)
 
-# Load RPC URLs from networks config
-ORIGIN_RPC_URL=$(grep -A 2 '\[networks.31337\]' $NETWORKS_CONFIG | grep 'rpc_url = ' | cut -d'"' -f2)
-DEST_RPC_URL=$(grep -A 2 '\[networks.31338\]' $NETWORKS_CONFIG | grep 'rpc_url = ' | cut -d'"' -f2)
+# Load RPC URLs from networks config (extract HTTP URL from first rpc_urls entry)
+ORIGIN_RPC_URL=$(awk '/\[\[networks.31337.rpc_urls\]\]/{f=1} f && /^http = /{print; exit}' $NETWORKS_CONFIG | cut -d'"' -f2)
+DEST_RPC_URL=$(awk '/\[\[networks.31338.rpc_urls\]\]/{f=1} f && /^http = /{print; exit}' $NETWORKS_CONFIG | cut -d'"' -f2)
 ORIGIN_CHAIN_ID=31337
 DEST_CHAIN_ID=31338
 

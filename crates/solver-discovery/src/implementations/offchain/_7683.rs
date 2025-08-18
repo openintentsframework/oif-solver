@@ -293,7 +293,13 @@ impl Eip7683OffchainDiscovery {
 		let mut providers = HashMap::new();
 		for network_id in &network_ids {
 			if let Some(network) = networks.get(network_id) {
-				let provider = RootProvider::new_http(network.rpc_url.parse().map_err(|e| {
+				let http_url = network.get_http_url().ok_or_else(|| {
+					DiscoveryError::Connection(format!(
+						"No HTTP RPC URL configured for network {}",
+						network_id
+					))
+				})?;
+				let provider = RootProvider::new_http(http_url.parse().map_err(|e| {
 					DiscoveryError::Connection(format!(
 						"Invalid RPC URL for network {}: {}",
 						network_id, e

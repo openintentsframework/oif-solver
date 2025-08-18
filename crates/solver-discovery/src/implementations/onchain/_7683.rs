@@ -5,11 +5,14 @@
 
 use crate::{DiscoveryError, DiscoveryInterface};
 use alloy_primitives::{Address as AlloyAddress, Log as PrimLog, LogData};
-use alloy_provider::{Provider, RootProvider};
+use alloy_provider::{Provider, ProviderBuilder, RootProvider};
+use alloy_pubsub::PubSubFrontend;
 use alloy_rpc_types::{Filter, Log};
 use alloy_sol_types::{sol, SolEvent, SolValue};
 use alloy_transport_http::Http;
+use alloy_transport_ws::WsConnect;
 use async_trait::async_trait;
+use futures::StreamExt;
 use solver_types::current_timestamp;
 use solver_types::{
 	standards::eip7683::{GasLimitOverrides, MandateOutput},
@@ -55,19 +58,31 @@ sol! {
 	event Open(bytes32 indexed orderId, bytes order);
 }
 
+const DEFAULT_POLLING_INTERVAL_SECS: u64 = 3;
+const MAX_POLLING_INTERVAL_SECS: u64 = 300;
+
+/// Provider types for different transport modes.
+enum ProviderType {
+	/// HTTP provider for polling mode.
+	Http(RootProvider<Http<reqwest::Client>>),
+	/// WebSocket provider for subscription mode.
+	WebSocket(RootProvider<PubSubFrontend>),
+}
+
 /// EIP-7683 on-chain discovery implementation.
 ///
 /// This implementation monitors blockchain events for new EIP-7683 cross-chain
 /// orders and converts them into intents for the solver to process.
-/// Supports monitoring multiple chains concurrently.
+/// Supports monitoring multiple chains concurrently using either HTTP polling
+/// or WebSocket subscriptions (when polling_interval_secs = 0).
 pub struct Eip7683Discovery {
 	/// RPC providers for each monitored network.
-	providers: HashMap<u64, RootProvider<Http<reqwest::Client>>>,
+	providers: HashMap<u64, ProviderType>,
 	/// The chain IDs being monitored.
 	network_ids: Vec<u64>,
 	/// Networks configuration for settler lookups.
 	networks: NetworksConfig,
-	/// The last processed block number for each chain.
+	/// The last processed block number for each chain (HTTP mode only).
 	last_blocks: Arc<Mutex<HashMap<u64, u64>>>,
 	/// Flag indicating if monitoring is active.
 	is_monitoring: Arc<AtomicBool>,
@@ -75,7 +90,7 @@ pub struct Eip7683Discovery {
 	monitoring_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
 	/// Channel for signaling monitoring shutdown.
 	stop_signal: Arc<Mutex<Option<broadcast::Sender<()>>>>,
-	/// Polling interval for monitoring loop in seconds.
+	/// Polling interval for monitoring loop in seconds (0 = WebSocket mode).
 	polling_interval_secs: u64,
 }
 
@@ -83,6 +98,7 @@ impl Eip7683Discovery {
 	/// Creates a new EIP-7683 discovery instance.
 	///
 	/// Configures monitoring for the settler contracts on the specified chains.
+	/// When polling_interval_secs = 0, uses WebSocket subscriptions instead of polling.
 	pub async fn new(
 		network_ids: Vec<u64>,
 		networks: NetworksConfig,
@@ -94,6 +110,9 @@ impl Eip7683Discovery {
 				"At least one network_id must be specified".to_string(),
 			));
 		}
+
+		let interval = polling_interval_secs.unwrap_or(DEFAULT_POLLING_INTERVAL_SECS);
+		let use_websocket = interval == 0;
 
 		// Create providers and get initial blocks for each network
 		let mut providers = HashMap::new();
@@ -108,24 +127,61 @@ impl Eip7683Discovery {
 				))
 			})?;
 
-			// Create provider
-			let provider = RootProvider::new_http(network.rpc_url.parse().map_err(|e| {
-				DiscoveryError::Connection(format!(
-					"Invalid RPC URL for network {}: {}",
-					network_id, e
-				))
-			})?);
+			if use_websocket {
+				// WebSocket mode
+				let ws_url = network.get_ws_url().ok_or_else(|| {
+					DiscoveryError::Connection(format!(
+						"No WebSocket RPC URL configured for network {}",
+						network_id
+					))
+				})?;
 
-			// Get initial block number
-			let current_block = provider.get_block_number().await.map_err(|e| {
-				DiscoveryError::Connection(format!(
-					"Failed to get block for chain {}: {}",
-					network_id, e
-				))
-			})?;
+				tracing::info!(
+					"Creating WebSocket provider for network {}: {}",
+					network_id,
+					ws_url
+				);
 
-			providers.insert(*network_id, provider);
-			last_blocks.insert(*network_id, current_block);
+				let ws_connect = WsConnect::new(ws_url.to_string());
+				let provider = ProviderBuilder::new()
+					.with_recommended_fillers()
+					.on_ws(ws_connect)
+					.await
+					.map_err(|e| {
+						DiscoveryError::Connection(format!(
+							"Failed to create WebSocket provider for network {}: {}",
+							network_id, e
+						))
+					})?;
+
+				let root_provider = provider.root().clone();
+				providers.insert(*network_id, ProviderType::WebSocket(root_provider));
+			} else {
+				// HTTP polling mode
+				let http_url = network.get_http_url().ok_or_else(|| {
+					DiscoveryError::Connection(format!(
+						"No HTTP RPC URL configured for network {}",
+						network_id
+					))
+				})?;
+				let provider = RootProvider::new_http(http_url.parse().map_err(|e| {
+					DiscoveryError::Connection(format!(
+						"Invalid RPC URL for network {}: {}",
+						network_id, e
+					))
+				})?);
+
+				// Get initial block number
+				let current_block = provider.get_block_number().await.map_err(|e| {
+					DiscoveryError::Connection(format!(
+						"Failed to get block for chain {}: {}",
+						network_id, e
+					))
+				})?;
+
+				providers.insert(*network_id, ProviderType::Http(provider));
+				last_blocks.insert(*network_id, current_block);
+			}
 		}
 
 		Ok(Self {
@@ -136,7 +192,7 @@ impl Eip7683Discovery {
 			is_monitoring: Arc::new(AtomicBool::new(false)),
 			monitoring_handles: Arc::new(Mutex::new(Vec::new())),
 			stop_signal: Arc::new(Mutex::new(None)),
-			polling_interval_secs: polling_interval_secs.unwrap_or(3), // Default to 3 seconds
+			polling_interval_secs: interval,
 		})
 	}
 
@@ -219,11 +275,27 @@ impl Eip7683Discovery {
 		})
 	}
 
-	/// Monitoring loop for a single chain.
+	/// Process discovered logs into intents and send them.
 	///
-	/// Polls the blockchain for new Open events and sends discovered
-	/// intents through the provided channel.
-	async fn monitor_single_chain(
+	/// Common logic for both polling and subscription modes.
+	fn process_discovered_logs(
+		logs: Vec<Log>,
+		sender: &mpsc::UnboundedSender<Intent>,
+		chain_id: u64,
+	) {
+		for log in logs {
+			if let Ok(intent) = Self::parse_open_event(&log) {
+				tracing::info!(chain = chain_id, "Discovered intent: {}", intent.id);
+				let _ = sender.send(intent);
+			}
+		}
+	}
+
+	/// Polling-based monitoring for a single chain.
+	///
+	/// Periodically polls the blockchain for new Open events and sends
+	/// discovered intents through the provided channel.
+	async fn monitor_chain_polling(
 		provider: RootProvider<Http<reqwest::Client>>,
 		chain_id: u64,
 		networks: NetworksConfig,
@@ -295,18 +367,76 @@ impl Eip7683Discovery {
 						}
 					};
 
-					// Parse logs into intents
-					for log in logs {
-						if let Ok(intent) = Self::parse_open_event(&log) {
-							let _ = sender.send(intent);
-						}
-					}
+					// Process discovered logs
+					Self::process_discovered_logs(logs, &sender, chain_id);
 
 					// Update last block for this chain
 					last_blocks.lock().await.insert(chain_id, current_block);
 				}
 				_ = stop_rx.recv() => {
 					tracing::info!(chain = chain_id, "Stopping monitor");
+					break;
+				}
+			}
+		}
+	}
+
+	/// Subscription-based monitoring for a single chain.
+	///
+	/// Uses WebSocket connection to subscribe to Open events via eth_subscribe
+	/// and processes events as they arrive in real-time.
+	async fn monitor_chain_subscription(
+		provider: RootProvider<PubSubFrontend>,
+		chain_id: u64,
+		networks: NetworksConfig,
+		sender: mpsc::UnboundedSender<Intent>,
+		mut stop_rx: broadcast::Receiver<()>,
+	) {
+		// Get the input settler address for this chain
+		let settler_address = match networks.get(&chain_id) {
+			Some(network) => {
+				if network.input_settler_address.0.len() != 20 {
+					tracing::error!(chain = chain_id, "Invalid settler address length");
+					return;
+				}
+				AlloyAddress::from_slice(&network.input_settler_address.0)
+			}
+			None => {
+				tracing::error!("Chain ID {} not found in networks config", chain_id);
+				return;
+			}
+		};
+
+		// Create filter for Open events
+		let open_sig = Open::SIGNATURE_HASH;
+		let filter = Filter::new()
+			.address(vec![settler_address])
+			.event_signature(vec![open_sig]);
+
+		// Subscribe to logs
+		let subscription = match provider.subscribe_logs(&filter).await {
+			Ok(sub) => sub,
+			Err(e) => {
+				tracing::error!(chain = chain_id, "Failed to subscribe to logs: {}", e);
+				return;
+			}
+		};
+
+		let mut stream = subscription.into_stream();
+		tracing::info!(
+			chain = chain_id,
+			"WebSocket monitoring started for settler {}",
+			settler_address
+		);
+
+		loop {
+			tokio::select! {
+				Some(log) = stream.next() => {
+					// Process single log as it arrives
+					Self::process_discovered_logs(vec![log], &sender, chain_id);
+				}
+				_ = stop_rx.recv() => {
+					tracing::info!(chain = chain_id, "Stopping WebSocket monitor");
 					break;
 				}
 			}
@@ -354,8 +484,8 @@ impl ConfigSchema for Eip7683DiscoverySchema {
 			vec![Field::new(
 				"polling_interval_secs",
 				FieldType::Integer {
-					min: Some(1),
-					max: Some(300), // Maximum 5 minutes
+					min: Some(0),                                // 0 = WebSocket mode
+					max: Some(MAX_POLLING_INTERVAL_SECS as i64), // Maximum 5 minutes
 				},
 			)],
 		);
@@ -385,26 +515,40 @@ impl DiscoveryInterface for Eip7683Discovery {
 
 		// Spawn monitoring task for each network
 		for network_id in &self.network_ids {
-			let provider = self.providers.get(network_id).unwrap().clone();
+			let provider = self.providers.get(network_id).unwrap();
 			let networks = self.networks.clone();
-			let last_blocks = self.last_blocks.clone();
 			let sender = sender.clone();
 			let stop_rx = stop_tx.subscribe();
-			let polling_interval_secs = self.polling_interval_secs;
 			let chain_id = *network_id;
 
-			let handle = tokio::spawn(async move {
-				Self::monitor_single_chain(
-					provider,
-					chain_id,
-					networks,
-					last_blocks,
-					sender,
-					stop_rx,
-					polling_interval_secs,
-				)
-				.await;
-			});
+			let handle = match provider {
+				ProviderType::Http(http_provider) => {
+					let provider = http_provider.clone();
+					let last_blocks = self.last_blocks.clone();
+					let polling_interval_secs = self.polling_interval_secs;
+					tokio::spawn(async move {
+						Self::monitor_chain_polling(
+							provider,
+							chain_id,
+							networks,
+							last_blocks,
+							sender,
+							stop_rx,
+							polling_interval_secs,
+						)
+						.await;
+					})
+				}
+				ProviderType::WebSocket(ws_provider) => {
+					let provider = ws_provider.clone();
+					tokio::spawn(async move {
+						Self::monitor_chain_subscription(
+							provider, chain_id, networks, sender, stop_rx,
+						)
+						.await;
+					})
+				}
+			};
 
 			handles.push(handle);
 		}

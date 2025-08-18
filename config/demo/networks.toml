@@ -2,9 +2,13 @@
 # Defines all supported blockchain networks and their tokens
 
 [networks.31337]
-rpc_url = "http://localhost:8545"
 input_settler_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
 output_settler_address = "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"
+
+# RPC endpoints with both HTTP and WebSocket URLs for each network
+[[networks.31337.rpc_urls]]
+http = "http://localhost:8545"
+ws = "ws://localhost:8545"
 
 [[networks.31337.tokens]]
 address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
@@ -17,9 +21,13 @@ symbol = "TOKB"
 decimals = 18
 
 [networks.31338]
-rpc_url = "http://localhost:8546"
 input_settler_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
 output_settler_address = "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"
+
+# RPC endpoints with both HTTP and WebSocket URLs for each network
+[[networks.31338.rpc_urls]]
+http = "http://localhost:8546"
+ws = "ws://localhost:8546"
 
 [[networks.31338.tokens]]
 address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"

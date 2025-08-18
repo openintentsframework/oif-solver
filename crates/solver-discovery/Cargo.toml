@@ -6,7 +6,8 @@ edition = "2021"
 [dependencies]
 alloy-contract = "0.8"
 alloy-primitives = "0.8"
-alloy-provider = "0.8"
+alloy-provider = { version = "0.8", features = ["ws"] }
+alloy-pubsub = "0.8"
 alloy-rpc-types = "0.8"
 alloy-sol-types = "0.8"
 async-trait = "0.1"
@@ -21,6 +22,8 @@ toml = { workspace = true }
 tracing = "0.1"
 alloy-transport = "0.8"
 alloy-transport-http = "0.8"
+alloy-transport-ws = "0.8"
+futures = "0.3"
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }

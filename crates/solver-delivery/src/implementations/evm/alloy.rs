@@ -56,8 +56,16 @@ impl AlloyDelivery {
 				DeliveryError::Network(format!("Network {} not found in configuration", network_id))
 			})?;
 
+			// Get HTTP URL from network configuration
+			let http_url = network.get_http_url().ok_or_else(|| {
+				DeliveryError::Network(format!(
+					"No HTTP RPC URL configured for network {}",
+					network_id
+				))
+			})?;
+
 			// Parse RPC URL
-			let url = network.rpc_url.parse().map_err(|e| {
+			let url = http_url.parse().map_err(|e| {
 				DeliveryError::Network(format!("Invalid RPC URL for network {}: {}", network_id, e))
 			})?;
 

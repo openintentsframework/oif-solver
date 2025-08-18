@@ -50,6 +50,7 @@ network_ids = [31337, 31338]
 
 [discovery.implementations.onchain_eip7683]
 network_ids = [31337, 31338]
+polling_interval_secs = 0  # Use WebSocket subscriptions instead of polling
 
 [discovery.implementations.offchain_eip7683]
 api_host = "127.0.0.1"

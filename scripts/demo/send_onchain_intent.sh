@@ -80,8 +80,9 @@ RECIPIENT_ADDR=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'recipient = ' | c
 # Chain IDs are the network keys themselves
 ORIGIN_CHAIN_ID=31337
 DEST_CHAIN_ID=31338
-ORIGIN_RPC_URL=$(grep -A 2 '\[networks.31337\]' $NETWORKS_CONFIG | grep 'rpc_url = ' | cut -d'"' -f2)
-DEST_RPC_URL=$(grep -A 2 '\[networks.31338\]' $NETWORKS_CONFIG | grep 'rpc_url = ' | cut -d'"' -f2)
+# Load RPC URLs from networks config (extract HTTP URL from first rpc_urls entry)
+ORIGIN_RPC_URL=$(awk '/\[\[networks.31337.rpc_urls\]\]/{f=1} f && /^http = /{print; exit}' $NETWORKS_CONFIG | cut -d'"' -f2)
+DEST_RPC_URL=$(awk '/\[\[networks.31338.rpc_urls\]\]/{f=1} f && /^http = /{print; exit}' $NETWORKS_CONFIG | cut -d'"' -f2)
 RPC_URL=$ORIGIN_RPC_URL  # Default for compatibility
 AMOUNT="1000000000000000000"  # 1 token
 
