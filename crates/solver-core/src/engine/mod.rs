@@ -431,6 +431,16 @@ impl SolverEngine {
 		&self.token_manager
 	}
 
+	/// Returns a reference to the settlement service.
+	pub fn settlement(&self) -> &Arc<SettlementService> {
+		&self.settlement
+	}
+
+	/// Returns a reference to the discovery service.
+	pub fn discovery(&self) -> &Arc<DiscoveryService> {
+		&self.discovery
+	}
+
 	/// Helper method to spawn handler tasks with semaphore-based concurrency control.
 	///
 	/// This method:

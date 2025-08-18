@@ -516,7 +516,8 @@ max_gas_price_gwei = 100
 chain_id = 1
 address = "$INPUT_SETTLER"
 
-[settlement.implementations.eip7683]
+[settlement.implementations.direct]
+order = "eip7683"
 network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]
 oracle_addresses = { $ORIGIN_CHAIN_ID = "$ORACLE", $DEST_CHAIN_ID = "$ORACLE" }
 dispute_period_seconds = 1
@@ -595,6 +596,9 @@ host = "127.0.0.1"
 port = 3000
 timeout_seconds = 30
 max_request_size = 1048576  # 1MB
+
+[api.implementations]
+discovery = "offchain_eip7683"
 EOF
 
 echo -e "  ${GREEN}✓${NC} Created modular config files:"

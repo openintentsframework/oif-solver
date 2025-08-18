@@ -134,7 +134,7 @@ print_error_summary() {
   fi
 }
 
-call_quote() {
+send_quote() {
   local payload="$1"
   curl -s -X POST "$QUOTE_ENDPOINT" \
     -H "Content-Type: application/json" \
@@ -147,7 +147,7 @@ run_scenario() {
   local expect_success="$1"; shift || true
 
   echo -e "${YELLOW}$TESTTUBE $title${NC}"
-  local resp=$(call_quote "$payload")
+  local resp=$(send_quote "$payload")
   local is_success=$(echo "$resp" | jq -e '.quotes' >/dev/null 2>&1 && echo yes || echo no)
 
   if [ "$is_success" = "yes" ]; then

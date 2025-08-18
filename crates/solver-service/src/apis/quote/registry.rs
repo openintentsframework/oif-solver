@@ -1,0 +1,150 @@
+//! Protocol and token registry for managing capabilities.
+//!
+//! Centralizes knowledge about protocol deployments and token capabilities
+//! to avoid duplication and make it easy to add new chains/tokens.
+
+use alloy_primitives::Address;
+use once_cell::sync::Lazy;
+use std::collections::{HashMap, HashSet};
+
+/// Global protocol registry instance
+pub static PROTOCOL_REGISTRY: Lazy<ProtocolRegistry> = Lazy::new(ProtocolRegistry::default);
+
+/// Registry for protocol deployments and token capabilities
+#[derive(Debug, Clone)]
+pub struct ProtocolRegistry {
+	/// Permit2 deployment addresses by chain ID
+	permit2_deployments: HashMap<u64, Address>,
+	/// ERC-3009 capable tokens by chain ID
+	erc3009_tokens: HashMap<u64, HashSet<Address>>,
+}
+
+impl Default for ProtocolRegistry {
+	fn default() -> Self {
+		let mut registry = Self {
+			permit2_deployments: HashMap::new(),
+			erc3009_tokens: HashMap::new(),
+		};
+
+		// Configure Permit2 deployments (using canonical address for most chains)
+		const PERMIT2_CANONICAL: &str = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
+
+		// Standard deployments at canonical address
+		registry.add_permit2_deployment(1, PERMIT2_CANONICAL); // Ethereum Mainnet
+		registry.add_permit2_deployment(137, PERMIT2_CANONICAL); // Polygon
+		registry.add_permit2_deployment(42161, PERMIT2_CANONICAL); // Arbitrum One
+		registry.add_permit2_deployment(10, PERMIT2_CANONICAL); // Optimism
+		registry.add_permit2_deployment(8453, PERMIT2_CANONICAL); // Base
+		registry.add_permit2_deployment(31337, PERMIT2_CANONICAL); // Local Anvil
+		registry.add_permit2_deployment(31338, PERMIT2_CANONICAL); // Local Anvil secondary
+
+		// Configure ERC-3009 tokens (USDC on various chains)
+		registry.add_erc3009_token(1, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"); // Mainnet USDC
+		registry.add_erc3009_token(137, "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"); // Polygon USDC.e
+		registry.add_erc3009_token(137, "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"); // Polygon native USDC
+		registry.add_erc3009_token(42161, "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8"); // Arbitrum USDC.e
+		registry.add_erc3009_token(42161, "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"); // Arbitrum native USDC
+		registry.add_erc3009_token(10, "0x7F5c764cBc14f9669B88837ca1490cCa17c31607"); // Optimism USDC.e
+		registry.add_erc3009_token(10, "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"); // Optimism native USDC
+		registry.add_erc3009_token(8453, "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"); // Base USDC
+
+		registry
+	}
+}
+
+impl ProtocolRegistry {
+	/// Adds a Permit2 deployment for a specific chain
+	pub fn add_permit2_deployment(&mut self, chain_id: u64, permit2_address: &str) {
+		let address = permit2_address
+			.parse()
+			.unwrap_or_else(|_| panic!("Valid Permit2 address: {}", permit2_address));
+
+		self.permit2_deployments.insert(chain_id, address);
+	}
+
+	/// Adds an ERC-3009 capable token
+	pub fn add_erc3009_token(&mut self, chain_id: u64, token_address: &str) {
+		let address = token_address
+			.parse()
+			.unwrap_or_else(|_| panic!("Valid token address: {}", token_address));
+
+		self.erc3009_tokens
+			.entry(chain_id)
+			.or_default()
+			.insert(address);
+	}
+
+	/// Checks if Permit2 is available on a specific chain
+	pub fn supports_permit2(&self, chain_id: u64) -> bool {
+		self.permit2_deployments.contains_key(&chain_id)
+	}
+
+	/// Gets the Permit2 address if available on the chain
+	pub fn get_permit2_address(&self, chain_id: u64) -> Option<Address> {
+		self.permit2_deployments.get(&chain_id).copied()
+	}
+
+	/// Checks if a token supports ERC-3009
+	pub fn supports_erc3009(&self, chain_id: u64, token_address: Address) -> bool {
+		self.erc3009_tokens
+			.get(&chain_id)
+			.map(|tokens| tokens.contains(&token_address))
+			.unwrap_or(false)
+	}
+
+	#[allow(dead_code)]
+	/// Gets all ERC-3009 tokens for a specific chain
+	pub fn get_erc3009_tokens(&self, chain_id: u64) -> Option<&HashSet<Address>> {
+		self.erc3009_tokens.get(&chain_id)
+	}
+
+	/// Gets complete token capabilities
+	pub fn get_token_capabilities(
+		&self,
+		chain_id: u64,
+		token_address: Address,
+	) -> TokenCapabilities {
+		TokenCapabilities {
+			supports_erc3009: self.supports_erc3009(chain_id, token_address),
+			permit2_available: self.supports_permit2(chain_id),
+		}
+	}
+}
+
+/// Token capabilities for deposit/settlement decisions
+#[derive(Debug, Clone)]
+pub struct TokenCapabilities {
+	pub supports_erc3009: bool,
+	pub permit2_available: bool,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_permit2_availability() {
+		let registry = ProtocolRegistry::default();
+
+		assert!(registry.supports_permit2(1)); // Mainnet
+		assert!(registry.supports_permit2(137)); // Polygon
+		assert!(!registry.supports_permit2(999)); // Unknown chain
+	}
+
+	#[test]
+	fn test_erc3009_support() {
+		let registry = ProtocolRegistry::default();
+
+		// Test mainnet USDC
+		let usdc_mainnet: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+			.parse()
+			.unwrap();
+		assert!(registry.supports_erc3009(1, usdc_mainnet));
+
+		// Test random token
+		let random_token: Address = "0x0000000000000000000000000000000000000000"
+			.parse()
+			.unwrap();
+		assert!(!registry.supports_erc3009(1, random_token));
+	}
+}

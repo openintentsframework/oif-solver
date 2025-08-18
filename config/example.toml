@@ -111,7 +111,8 @@ max_gas_price_gwei = 100
 chain_id = 1  # Ethereum mainnet for signature domain
 address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
 
-[settlement.implementations.eip7683]
+[settlement.implementations.direct]
+order = "eip7683"
 network_ids = [31337, 31338]
 oracle_addresses = { 31337 = "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9", 31338 = "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9" }
 dispute_period_seconds = 1

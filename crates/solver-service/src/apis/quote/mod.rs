@@ -1,20 +1,85 @@
-//! Quote Business Logic Module
+//! Quote processing pipeline for cross-chain intent execution.
 //!
-//! This module contains the core business logic for quote processing,
-//! separated from the HTTP API layer for better maintainability and testing.
+//! This module implements the complete quote generation system for the OIF solver.
+//! It processes user requests for cross-chain token transfers and generates executable
+//! quotes with appropriate signatures, settlement mechanisms, and execution guarantees.
+//!
+//! ## Architecture
+//!
+//! The quote module is organized into specialized submodules:
+//!
+//! - **Validation**: Request validation and capability checking
+//! - **Custody**: Token custody decision engine
+//! - **Generation**: Quote assembly and optimization
+//! - **Signing**: Signature payload generation
+//!
+//! ## Quote Lifecycle
+//!
+//! 1. **Request Reception**: User submits transfer intent with inputs/outputs
+//! 2. **Validation**: Verify request format, supported chains, and token availability
+//! 3. **Capability Check**: Ensure solver can execute on specified chains
+//! 4. **Balance Verification**: Confirm solver has sufficient output tokens
+//! 5. **Quote Generation**: Create multiple quote options with different mechanisms
+//! 6. **Storage**: Persist quotes for later retrieval and execution
+//!
+//! ## Key Features
+//!
+//! ### Multi-Protocol Support
+//! - Permit2 for universal token approvals
+//! - ERC-3009 for native gasless transfers
+//! - TheCompact for resource lock allocations
+//!
+//! ### Optimization Strategies
+//! - Speed optimization for fastest execution
+//! - Cost optimization for lowest fees
+//! - Trust minimization for maximum security
+//! - Input prioritization for token preferences
+//!
+//! ### Security Guarantees
+//! - Cryptographic binding via EIP-712 signatures
+//! - Oracle verification for settlement
+//! - Expiry times to prevent stale quotes
+//! - Nonce management for replay protection
+//!
+//! ## API Integration
+//!
+//! The module exposes three main functions:
+//! - `process_quote_request`: Main entry point for quote generation
+//! - `get_quote_by_id`: Retrieve stored quotes
+//! - `quote_exists`: Check quote validity
+//!
+//! ## Storage Model
+//!
+//! Quotes are stored with:
+//! - TTL-based expiry (default 5 minutes)
+//! - Unique IDs for retrieval
+//! - Complete execution details
+//!
+//! ## Error Handling
+//!
+//! The module provides detailed error types:
+//! - `InvalidRequest`: Malformed or unsupported requests
+//! - `InsufficientLiquidity`: Solver lacks required tokens
+//! - `UnsupportedChain`: Chain not configured
+//! - `Internal`: System errors
 
 pub mod custody;
 pub mod generation;
+pub mod registry;
+pub mod signing;
 pub mod validation;
 
 // Re-export main functionality
 pub use generation::QuoteGenerator;
+pub use signing::payloads::permit2;
+pub use validation::QuoteValidator;
+
 use solver_config::Config;
 use solver_core::SolverEngine;
 use solver_types::{GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, StorageKey};
+
 use std::time::Duration;
 use tracing::info;
-pub use validation::QuoteValidator;
 
 /// Processes a quote request and returns available quote options.
 ///
@@ -46,7 +111,8 @@ pub async fn process_quote_request(
 	QuoteValidator::ensure_destination_balances(solver, &supported_outputs).await?;
 
 	// 4. Generate quotes using the business logic layer
-	let quote_generator = QuoteGenerator::new();
+	let settlement_service = solver.settlement();
+	let quote_generator = QuoteGenerator::new(settlement_service.clone());
 	let quotes = quote_generator.generate_quotes(&request, config).await?;
 
 	// 5. Persist quotes

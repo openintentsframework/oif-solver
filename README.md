@@ -494,6 +494,26 @@ In another terminal, execute the send intent script to create and observe a cros
 ./scripts/demo/send_offchain_intent.sh balances
 ```
 
+#### Quote → Sign → Submit (One-shot)
+
+We provide a streamlined flow to request a quote, sign the server-provided EIP-712 digest, encode the StandardOrder, and submit it to the solver in one command.
+
+```bash
+# Request a quote using defaults from config/demo.toml, then sign and submit
+./scripts/demo/send_quote_intent.sh                # defaults to http://127.0.0.1:3000
+./scripts/demo/send_quote_intent.sh http://localhost:3000
+
+# Alternatively, use a previously saved quote JSON
+./scripts/demo/build_transaction.sh scripts/demo/quote.json
+# Or via stdin
+cat scripts/demo/quote.json | ./scripts/demo/build_transaction.sh
+```
+
+What happens:
+- The quote API returns a Permit2 EIP-712 final digest and structured fields.
+- `build_transaction.sh` signs the digest with `--no-hash`, encodes the StandardOrder bytes, and POSTs to `/api/orders`.
+- Logs show nonce, deadlines, oracle, settler, token bytes32, signature, and payload preview.
+
 The scripts will:
 
 1. Show initial balances for the relevant tokens

@@ -244,6 +244,8 @@ primary = "simple"
 
 [settlement]
 [settlement.implementations.test]
+order = "test"
+network_ids = [1, 2]
 "#;
 
 		fs::write(&config_path, config_content).unwrap();
@@ -313,6 +315,8 @@ primary = "simple"
 
 [settlement]
 [settlement.implementations.test]
+order = "test"
+network_ids = [1, 2]
 "#;
 
 		fs::write(temp_dir.path().join("main.toml"), main_config).unwrap();

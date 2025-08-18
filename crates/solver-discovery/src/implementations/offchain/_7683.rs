@@ -851,6 +851,10 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 		self.is_running.store(false, Ordering::SeqCst);
 		Ok(())
 	}
+
+	fn get_url(&self) -> Option<String> {
+		Some(format!("{}:{}", self.api_host, self.api_port))
+	}
 }
 
 /// Factory function to create an EIP-7683 offchain discovery provider.

@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use solver_types::{ConfigSchema, ImplementationRegistry, Intent, NetworksConfig};
+use std::collections::HashMap;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -64,6 +65,18 @@ pub trait DiscoveryInterface: Send + Sync {
 	/// This method should cleanly shut down any active monitoring tasks
 	/// and release associated resources.
 	async fn stop_monitoring(&self) -> Result<(), DiscoveryError>;
+
+	/// Returns the URL for external API access if this discovery implementation provides one.
+	///
+	/// This is primarily used by offchain discovery implementations that expose
+	/// an HTTP API for intent submission. Most implementations will return None.
+	///
+	/// # Returns
+	/// * `Some(String)` - The URL for the discovery service API
+	/// * `None` - If this implementation doesn't provide an external API
+	fn get_url(&self) -> Option<String> {
+		None
+	}
 }
 
 /// Type alias for discovery factory functions.
@@ -103,16 +116,32 @@ pub fn get_all_implementations() -> Vec<(&'static str, DiscoveryFactory)> {
 /// The DiscoveryService coordinates multiple discovery implementations, allowing
 /// the solver to find intents from various channels simultaneously.
 pub struct DiscoveryService {
-	/// Collection of discovery implementations to monitor.
-	implementations: Vec<Box<dyn DiscoveryInterface>>,
+	/// Map of implementation names to their interfaces.
+	implementations: HashMap<String, Box<dyn DiscoveryInterface>>,
 }
 
 impl DiscoveryService {
 	/// Creates a new DiscoveryService with the specified implementations.
 	///
 	/// Each implementation will be monitored independently when monitoring is started.
-	pub fn new(implementations: Vec<Box<dyn DiscoveryInterface>>) -> Self {
+	pub fn new(implementations: HashMap<String, Box<dyn DiscoveryInterface>>) -> Self {
 		Self { implementations }
+	}
+
+	/// Gets a specific discovery implementation by name.
+	///
+	/// Returns None if the implementation doesn't exist.
+	pub fn get(&self, name: &str) -> Option<&dyn DiscoveryInterface> {
+		self.implementations.get(name).map(|b| b.as_ref())
+	}
+
+	/// Gets the URL for a specific discovery implementation.
+	///
+	/// Returns None if the implementation doesn't exist or doesn't provide a URL.
+	pub fn get_url(&self, implementation_name: &str) -> Option<String> {
+		self.implementations
+			.get(implementation_name)
+			.and_then(|impl_| impl_.get_url())
 	}
 
 	/// Starts monitoring on all configured discovery implementations.
@@ -124,7 +153,7 @@ impl DiscoveryService {
 		&self,
 		sender: mpsc::UnboundedSender<Intent>,
 	) -> Result<(), DiscoveryError> {
-		for implementation in &self.implementations {
+		for implementation in self.implementations.values() {
 			implementation.start_monitoring(sender.clone()).await?;
 		}
 		Ok(())
@@ -136,7 +165,7 @@ impl DiscoveryService {
 	/// The first error encountered is returned, but all implementations are
 	/// attempted to be stopped.
 	pub async fn stop_all(&self) -> Result<(), DiscoveryError> {
-		for implementation in &self.implementations {
+		for implementation in self.implementations.values() {
 			implementation.stop_monitoring().await?;
 		}
 		Ok(())

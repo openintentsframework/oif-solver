@@ -280,13 +280,13 @@ impl SolverBuilder {
 		));
 
 		// Create discovery implementations
-		let mut discovery_implementations = Vec::new();
+		let mut discovery_implementations = HashMap::new();
 		for (name, config) in &self.config.discovery.implementations {
 			if let Some(factory) = factories.discovery_factories.get(name) {
 				match factory(config, &self.config.networks) {
 					Ok(implementation) => {
 						// Validation already happened in the factory
-						discovery_implementations.push(implementation);
+						discovery_implementations.insert(name.clone(), implementation);
 						tracing::info!(component = "discovery", implementation = %name, "Loaded");
 					}
 					Err(e) => {

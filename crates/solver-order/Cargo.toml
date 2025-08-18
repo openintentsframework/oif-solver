@@ -15,3 +15,5 @@ solver-types = { path = "../solver-types" }
 thiserror = "1.0"
 toml = { workspace = true }
 tracing = "0.1"
+uuid = { version = "1.8", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }

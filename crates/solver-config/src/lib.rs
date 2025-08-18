@@ -175,6 +175,19 @@ pub struct SettlementConfig {
 	pub domain: Option<DomainConfig>,
 }
 
+/// Implementation references for API functionality.
+///
+/// Specifies which implementations to use for various API features.
+/// These must match the names of configured implementations in their respective sections.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ApiImplementations {
+	/// Discovery implementation to use for order forwarding.
+	/// Must match one of the configured implementations in [discovery.implementations].
+	/// Used by the /orders endpoint to forward intent submissions to the discovery service.
+	/// If not specified, order forwarding will be disabled.
+	pub discovery: Option<String>,
+}
+
 /// Configuration for the HTTP API server.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ApiConfig {
@@ -193,6 +206,9 @@ pub struct ApiConfig {
 	/// Maximum request size in bytes.
 	#[serde(default = "default_max_request_size")]
 	pub max_request_size: usize,
+	/// Implementation references for API functionality.
+	#[serde(default)]
+	pub implementations: ApiImplementations,
 	/// Rate limiting configuration.
 	pub rate_limiting: Option<RateLimitConfig>,
 	/// CORS configuration.
@@ -460,6 +476,108 @@ impl Config {
 			));
 		}
 
+		// Validate API config if enabled
+		if let Some(ref api) = self.api {
+			if api.enabled {
+				// Validate discovery implementation exists if specified
+				if let Some(ref discovery) = api.implementations.discovery {
+					if !self.discovery.implementations.contains_key(discovery) {
+						return Err(ConfigError::Validation(format!(
+							"API discovery implementation '{}' not found in discovery.implementations",
+							discovery
+						)));
+					}
+				}
+			}
+		}
+
+		// Validate settlement configurations and coverage
+		self.validate_settlement_coverage()?;
+
+		Ok(())
+	}
+
+	/// Validates settlement implementation coverage.
+	///
+	/// # Returns
+	/// * `Ok(())` if coverage is valid and complete
+	/// * `Err(ConfigError::Validation)` with specific error
+	///
+	/// # Validation Rules
+	/// 1. Each settlement must declare 'standard' and 'network_ids'
+	/// 2. No two settlements may cover same standard+network
+	/// 3. Every order standard must have at least one settlement
+	/// 4. All network_ids must exist in networks configuration
+	fn validate_settlement_coverage(&self) -> Result<(), ConfigError> {
+		// Track coverage: (standard, network_id) -> implementation_name
+		let mut coverage: HashMap<(String, u64), String> = HashMap::new();
+
+		// Parse and validate each settlement implementation
+		for (impl_name, impl_config) in &self.settlement.implementations {
+			// Extract standard field
+			let order_standard = impl_config
+				.get("order")
+				.and_then(|v| v.as_str())
+				.ok_or_else(|| {
+					ConfigError::Validation(format!(
+						"Settlement implementation '{}' missing 'order' field",
+						impl_name
+					))
+				})?;
+
+			// Extract network_ids
+			let network_ids = impl_config
+				.get("network_ids")
+				.and_then(|v| v.as_array())
+				.ok_or_else(|| {
+					ConfigError::Validation(format!(
+						"Settlement implementation '{}' missing 'network_ids' field",
+						impl_name
+					))
+				})?;
+
+			// Check for duplicate coverage
+			for network_value in network_ids {
+				let network_id = network_value.as_integer().ok_or_else(|| {
+					ConfigError::Validation(format!(
+						"Invalid network_id in settlement '{}'",
+						impl_name
+					))
+				})? as u64;
+
+				let key = (order_standard.to_string(), network_id);
+
+				if let Some(existing) = coverage.insert(key.clone(), impl_name.clone()) {
+					return Err(ConfigError::Validation(format!(
+						"Duplicate settlement coverage for order '{}' on network {}: '{}' and '{}'",
+						order_standard, network_id, existing, impl_name
+					)));
+				}
+
+				// Validate network exists in networks config
+				if !self.networks.contains_key(&network_id) {
+					return Err(ConfigError::Validation(format!(
+						"Settlement '{}' references network {} which doesn't exist in networks config",
+						impl_name, network_id
+					)));
+				}
+			}
+		}
+
+		// Validate all order implementations have settlement coverage
+		for order_standard in self.order.implementations.keys() {
+			// Orders might not specify networks directly, but we need to ensure
+			// the standard is covered somewhere
+			let has_coverage = coverage.keys().any(|(std, _)| std == order_standard);
+
+			if !has_coverage {
+				return Err(ConfigError::Validation(format!(
+					"Order standard '{}' has no settlement implementations",
+					order_standard
+				)));
+			}
+		}
+
 		Ok(())
 	}
 }
@@ -566,6 +684,8 @@ primary = "simple"
 
 [settlement]
 [settlement.implementations.test]
+order = "test"
+network_ids = [1, 2]
 "#;
 
 		let config: Config = config_str.parse().unwrap();
@@ -573,5 +693,262 @@ primary = "simple"
 
 		// Clean up
 		std::env::remove_var("TEST_SOLVER_ID");
+	}
+
+	#[test]
+	fn test_duplicate_settlement_coverage_rejected() {
+		let config_str = r#"
+[solver]
+id = "test"
+monitoring_timeout_minutes = 5
+
+[networks.1]
+rpc_url = "http://localhost:8545"
+input_settler_address = "0x1234567890123456789012345678901234567890"
+output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.1.tokens]]
+address = "0xabcdef1234567890abcdef1234567890abcdef12"
+symbol = "TEST"
+decimals = 18
+
+[networks.2]
+rpc_url = "http://localhost:8546"
+input_settler_address = "0x1234567890123456789012345678901234567890"
+output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.2.tokens]]
+address = "0xabcdef1234567890abcdef1234567890abcdef12"
+symbol = "TEST"
+decimals = 18
+
+[networks.3]
+rpc_url = "http://localhost:8547"
+input_settler_address = "0x1234567890123456789012345678901234567890"
+output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.3.tokens]]
+address = "0xabcdef1234567890abcdef1234567890abcdef12"
+symbol = "TEST"
+decimals = 18
+
+[storage]
+primary = "memory"
+cleanup_interval_seconds = 3600
+[storage.implementations.memory]
+
+[delivery]
+[delivery.implementations.test]
+
+[account]
+primary = "local"
+[account.implementations.local]
+private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+
+[discovery]
+[discovery.implementations.test]
+
+[order]
+[order.implementations.eip7683]
+[order.strategy]
+primary = "simple"
+[order.strategy.implementations.simple]
+
+[settlement.implementations.impl1]
+order = "eip7683"
+network_ids = [1, 2]
+
+[settlement.implementations.impl2]
+order = "eip7683"
+network_ids = [2, 3]  # Network 2 overlaps with impl1
+"#;
+
+		let result = Config::from_str(config_str);
+		assert!(result.is_err());
+		let err = result.unwrap_err();
+		// The test should fail because network 2 is covered by both impl1 and impl2
+		// Check for the key parts of the error message
+		let error_msg = err.to_string();
+		assert!(
+			error_msg.contains("network 2")
+				&& error_msg.contains("impl1")
+				&& error_msg.contains("impl2"),
+			"Expected duplicate coverage error for network 2, got: {}",
+			err
+		);
+	}
+
+	#[test]
+	fn test_missing_settlement_standard_rejected() {
+		let config_str = r#"
+[solver]
+id = "test"
+monitoring_timeout_minutes = 5
+
+[networks.1]
+rpc_url = "http://localhost:8545"
+input_settler_address = "0x1234567890123456789012345678901234567890"
+output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.1.tokens]]
+address = "0xabcdef1234567890abcdef1234567890abcdef12"
+symbol = "TEST"
+decimals = 18
+
+[networks.2]
+rpc_url = "http://localhost:8546"
+input_settler_address = "0x1234567890123456789012345678901234567890"
+output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.2.tokens]]
+address = "0xabcdef1234567890abcdef1234567890abcdef12"
+symbol = "TEST"
+decimals = 18
+
+[storage]
+primary = "memory"
+cleanup_interval_seconds = 3600
+[storage.implementations.memory]
+
+[delivery]
+[delivery.implementations.test]
+
+[account]
+primary = "local"
+[account.implementations.local]
+private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+
+[discovery]
+[discovery.implementations.test]
+
+[order]
+[order.implementations.eip7683]
+[order.strategy]
+primary = "simple"
+[order.strategy.implementations.simple]
+
+[settlement.implementations.impl1]
+# Missing 'standard' field
+network_ids = [1, 2]
+"#;
+
+		let result = Config::from_str(config_str);
+		assert!(result.is_err());
+		let err = result.unwrap_err();
+		assert!(err.to_string().contains("missing 'standard' field"));
+	}
+
+	#[test]
+	fn test_settlement_references_invalid_network() {
+		let config_str = r#"
+[solver]
+id = "test"
+monitoring_timeout_minutes = 5
+
+[networks.1]
+rpc_url = "http://localhost:8545"
+input_settler_address = "0x1234567890123456789012345678901234567890"
+output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.1.tokens]]
+address = "0xabcdef1234567890abcdef1234567890abcdef12"
+symbol = "TEST"
+decimals = 18
+
+[networks.2]
+rpc_url = "http://localhost:8546"
+input_settler_address = "0x1234567890123456789012345678901234567890"
+output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.2.tokens]]
+address = "0xabcdef1234567890abcdef1234567890abcdef12"
+symbol = "TEST"
+decimals = 18
+
+[storage]
+primary = "memory"
+cleanup_interval_seconds = 3600
+[storage.implementations.memory]
+
+[delivery]
+[delivery.implementations.test]
+
+[account]
+primary = "local"
+[account.implementations.local]
+private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+
+[discovery]
+[discovery.implementations.test]
+
+[order]
+[order.implementations.eip7683]
+[order.strategy]
+primary = "simple"
+[order.strategy.implementations.simple]
+
+[settlement.implementations.impl1]
+order = "eip7683"
+network_ids = [1, 2, 999]  # Network 999 doesn't exist
+"#;
+
+		let result = Config::from_str(config_str);
+		assert!(result.is_err());
+		let err = result.unwrap_err();
+		assert!(err.to_string().contains("references network 999"));
+	}
+
+	#[test]
+	fn test_order_standard_without_settlement() {
+		let config_str = r#"
+[solver]
+id = "test"
+monitoring_timeout_minutes = 5
+
+[networks.1]
+rpc_url = "http://localhost:8545"
+input_settler_address = "0x1234567890123456789012345678901234567890"
+output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.1.tokens]]
+address = "0xabcdef1234567890abcdef1234567890abcdef12"
+symbol = "TEST"
+decimals = 18
+
+[networks.2]
+rpc_url = "http://localhost:8546"
+input_settler_address = "0x1234567890123456789012345678901234567890"
+output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.2.tokens]]
+address = "0xabcdef1234567890abcdef1234567890abcdef12"
+symbol = "TEST"
+decimals = 18
+
+[storage]
+primary = "memory"
+cleanup_interval_seconds = 3600
+[storage.implementations.memory]
+
+[delivery]
+[delivery.implementations.test]
+
+[account]
+primary = "local"
+[account.implementations.local]
+private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+
+[discovery]
+[discovery.implementations.test]
+
+[order]
+[order.implementations.eip7683]
+[order.implementations.eip9999]  # Order standard with no settlement
+[order.strategy]
+primary = "simple"
+[order.strategy.implementations.simple]
+
+[settlement.implementations.impl1]
+order = "eip7683"  # Only covers eip7683, not eip9999
+network_ids = [1, 2]
+"#;
+
+		let result = Config::from_str(config_str);
+		assert!(result.is_err());
+		let err = result.unwrap_err();
+		assert!(err
+			.to_string()
+			.contains("Order standard 'eip9999' has no settlement"));
 	}
 }
