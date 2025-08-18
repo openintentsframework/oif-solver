@@ -7,6 +7,20 @@
 use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 
+/// Gas limit overrides for various transaction types
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub struct GasLimitOverrides {
+	/// Gas limit for settlement transaction
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub settle_gas_limit: Option<u64>,
+	/// Gas limit for fill transaction
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub fill_gas_limit: Option<u64>,
+	/// Gas limit for prepare transaction
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub prepare_gas_limit: Option<u64>,
+}
+
 /// EIP-7683 specific order data structure.
 ///
 /// Contains all the necessary information for processing a cross-chain order
@@ -30,10 +44,8 @@ pub struct Eip7683OrderData {
 	pub inputs: Vec<[U256; 2]>,
 	/// Unique 32-byte identifier for the order
 	pub order_id: [u8; 32],
-	/// Gas limit for settlement transaction
-	pub settle_gas_limit: u64,
-	/// Gas limit for fill transaction
-	pub fill_gas_limit: u64,
+	/// Gas limit overrides for transaction execution
+	pub gas_limit_overrides: GasLimitOverrides,
 	/// List of outputs specifying tokens, amounts, and recipients
 	pub outputs: Vec<MandateOutput>,
 	/// Optional raw order data (StandardOrder encoded as bytes)
