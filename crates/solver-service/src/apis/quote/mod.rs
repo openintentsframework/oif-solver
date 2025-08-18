@@ -70,6 +70,7 @@ async fn store_quotes(solver: &SolverEngine, quotes: &[Quote], ttl: Duration) {
 				StorageKey::Quotes.as_str(),
 				&quote.quote_id,
 				quote,
+				None, // No indexes needed for quotes
 				Some(ttl),
 			)
 			.await

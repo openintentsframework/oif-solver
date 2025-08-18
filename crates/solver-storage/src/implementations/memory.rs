@@ -3,7 +3,7 @@
 //! This module provides a memory-based implementation of the StorageInterface trait,
 //! useful for testing and development scenarios where persistence is not required.
 
-use crate::{StorageError, StorageInterface};
+use crate::{QueryFilter, StorageError, StorageIndexes, StorageInterface};
 use async_trait::async_trait;
 use solver_types::{ConfigSchema, Schema, ValidationError};
 use std::collections::HashMap;
@@ -15,7 +15,8 @@ use tokio::sync::RwLock;
 ///
 /// This implementation stores data in a HashMap in memory,
 /// providing fast access but no persistence across restarts.
-/// TTL is ignored as this is primarily for testing.
+/// TTL and indexes are ignored as this is primarily for testing
+/// and has no recovery capability.
 pub struct MemoryStorage {
 	/// The in-memory store protected by a read-write lock.
 	store: Arc<RwLock<HashMap<String, Vec<u8>>>>,
@@ -47,9 +48,10 @@ impl StorageInterface for MemoryStorage {
 		&self,
 		key: &str,
 		value: Vec<u8>,
+		_indexes: Option<StorageIndexes>,
 		_ttl: Option<Duration>,
 	) -> Result<(), StorageError> {
-		// TTL is ignored for memory storage
+		// TTL and indexes are ignored for memory storage
 		let mut store = self.store.write().await;
 		store.insert(key.to_string(), value);
 		Ok(())
@@ -68,6 +70,29 @@ impl StorageInterface for MemoryStorage {
 
 	fn config_schema(&self) -> Box<dyn ConfigSchema> {
 		Box::new(MemoryStorageSchema)
+	}
+
+	async fn query(
+		&self,
+		_namespace: &str,
+		_filter: QueryFilter,
+	) -> Result<Vec<String>, StorageError> {
+		// Memory storage doesn't support recovery, so querying is not meaningful.
+		// Return empty for compatibility.
+		Ok(Vec::new())
+	}
+
+	async fn get_batch(&self, keys: &[String]) -> Result<Vec<(String, Vec<u8>)>, StorageError> {
+		let store = self.store.read().await;
+		let mut results = Vec::new();
+
+		for key in keys {
+			if let Some(value) = store.get(key) {
+				results.push((key.clone(), value.clone()));
+			}
+		}
+
+		Ok(results)
 	}
 }
 
@@ -127,7 +152,10 @@ mod tests {
 		// Test set and get
 		let key = "test_key";
 		let value = b"test_value".to_vec();
-		storage.set_bytes(key, value.clone(), None).await.unwrap();
+		storage
+			.set_bytes(key, value.clone(), None, None)
+			.await
+			.unwrap();
 
 		let retrieved = storage.get_bytes(key).await.unwrap();
 		assert_eq!(retrieved, value);
@@ -153,12 +181,18 @@ mod tests {
 		let value2 = b"value2".to_vec();
 
 		// Set initial value
-		storage.set_bytes(key, value1.clone(), None).await.unwrap();
+		storage
+			.set_bytes(key, value1.clone(), None, None)
+			.await
+			.unwrap();
 		let retrieved = storage.get_bytes(key).await.unwrap();
 		assert_eq!(retrieved, value1);
 
 		// Overwrite with new value
-		storage.set_bytes(key, value2.clone(), None).await.unwrap();
+		storage
+			.set_bytes(key, value2.clone(), None, None)
+			.await
+			.unwrap();
 		let retrieved = storage.get_bytes(key).await.unwrap();
 		assert_eq!(retrieved, value2);
 	}

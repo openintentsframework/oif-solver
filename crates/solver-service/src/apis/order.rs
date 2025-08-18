@@ -6,7 +6,6 @@
 
 use axum::extract::Path;
 use solver_core::SolverEngine;
-use solver_storage;
 use solver_types::{
 	bytes32_to_address, with_0x_prefix, AssetAmount, GetOrderError, GetOrderResponse, Order,
 	OrderResponse, OrderStatus, Settlement, SettlementType, TransactionType,

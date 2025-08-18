@@ -116,7 +116,7 @@ impl IntentHandler {
 
 				// Store intent for deduplication
 				self.storage
-					.store(StorageKey::Intents.as_str(), &order.id, &intent)
+					.store(StorageKey::Intents.as_str(), &order.id, &intent, None)
 					.await
 					.map_err(|e| IntentError::Storage(e.to_string()))?;
 

@@ -9,6 +9,7 @@ pub mod builder;
 pub mod engine;
 pub mod handlers;
 pub mod monitoring;
+pub mod recovery;
 pub mod state;
 
 // Re-export main types

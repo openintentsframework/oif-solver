@@ -98,6 +98,7 @@ impl OrderHandler {
 					StorageKey::OrderByTxHash.as_str(),
 					&hex::encode(&prepare_tx_hash.0),
 					&order.id,
+					None,
 				)
 				.await
 				.map_err(|e| OrderError::Storage(e.to_string()))?;
@@ -174,6 +175,7 @@ impl OrderHandler {
 				StorageKey::OrderByTxHash.as_str(),
 				&hex::encode(&tx_hash.0),
 				&order.id,
+				None,
 			)
 			.await
 			.map_err(|e| OrderError::Storage(e.to_string()))?;

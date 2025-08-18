@@ -118,6 +118,7 @@ impl SettlementHandler {
 					StorageKey::OrderByTxHash.as_str(),
 					&hex::encode(&claim_tx_hash.0),
 					&order.id,
+					None,
 				)
 				.await
 				.map_err(|e| SettlementError::Storage(e.to_string()))?;

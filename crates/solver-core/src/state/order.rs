@@ -5,7 +5,7 @@
 //! Also handles failure states and provides utilities for updating order fields.
 
 use once_cell::sync::Lazy;
-use solver_storage::StorageService;
+use solver_storage::{StorageIndexes, StorageService};
 use solver_types::{Order, OrderStatus, StorageKey, TransactionType};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -62,8 +62,11 @@ impl OrderStateMachine {
 			.map_err(|e| OrderStateError::TimeError(e.to_string()))?
 			.as_secs();
 
+		// Update with status index
+		let indexes = StorageIndexes::new().with_field("status", order.status.to_string());
+
 		self.storage
-			.update(StorageKey::Orders.as_str(), order_id, &order)
+			.update(StorageKey::Orders.as_str(), order_id, &order, Some(indexes))
 			.await
 			.map_err(|e| OrderStateError::Storage(e.to_string()))?;
 
@@ -160,10 +163,13 @@ impl OrderStateMachine {
 			.map_err(|e| OrderStateError::Storage(e.to_string()))
 	}
 
-	/// Stores a new order
+	/// Stores a new order with indexed status
 	pub async fn store_order(&self, order: &Order) -> Result<(), OrderStateError> {
+		// Store with status index for recovery queries
+		let indexes = StorageIndexes::new().with_field("status", order.status.to_string());
+
 		self.storage
-			.store(StorageKey::Orders.as_str(), &order.id, order)
+			.store(StorageKey::Orders.as_str(), &order.id, order, Some(indexes))
 			.await
 			.map_err(|e| OrderStateError::Storage(e.to_string()))
 	}

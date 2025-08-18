@@ -165,20 +165,17 @@ impl SettlementInterface for DirectSettlement {
 		order: &Order,
 		tx_hash: &TransactionHash,
 	) -> Result<FillProof, SettlementError> {
-		// Parse order data to get the destination chain ID
+		// Get the destination chain ID from the order
+		// Note: For now we assume all outputs are on the same chain
+		let destination_chain_id = *order.output_chain_ids.first().ok_or_else(|| {
+			SettlementError::ValidationFailed("No output chains in order".to_string())
+		})?;
+
+		// Parse order data for other fields we need
 		let order_data: Eip7683OrderData =
 			serde_json::from_value(order.data.clone()).map_err(|e| {
 				SettlementError::ValidationFailed(format!("Failed to parse order data: {}", e))
 			})?;
-
-		// Get the destination chain ID from the first output
-		// Note: For now we assume all outputs are on the same chain
-		let destination_chain_id = order_data
-			.outputs
-			.first()
-			.ok_or_else(|| SettlementError::ValidationFailed("No outputs in order".to_string()))?
-			.chain_id
-			.to::<u64>();
 
 		// Get the appropriate provider for this chain
 		let provider = self.providers.get(&destination_chain_id).ok_or_else(|| {
@@ -252,17 +249,17 @@ impl SettlementInterface for DirectSettlement {
 	/// Verifies that the dispute period has passed and all claim
 	/// requirements are met.
 	async fn can_claim(&self, order: &Order, fill_proof: &FillProof) -> bool {
-		// Parse order data to get the destination chain ID
-		let order_data: Eip7683OrderData = match serde_json::from_value(order.data.clone()) {
-			Ok(data) => data,
-			Err(_) => return false,
-		};
-
-		// Get the destination chain ID from the first output
-		let destination_chain_id = match order_data.outputs.first() {
-			Some(output) => output.chain_id.to::<u64>(),
+		// Get the destination chain ID from the order
+		let destination_chain_id = match order.output_chain_ids.first() {
+			Some(&chain_id) => chain_id,
 			None => return false,
 		};
+
+		// TODO: Parse order data if needed for dispute deadline check
+		// let order_data: Eip7683OrderData = match serde_json::from_value(order.data.clone()) {
+		//     Ok(data) => data,
+		//     Err(_) => return false,
+		// };
 
 		// Get the appropriate provider for this chain
 		let provider = match self.providers.get(&destination_chain_id) {
