@@ -76,7 +76,7 @@ impl ConfigSchema for LocalWalletSchema {
 							}
 
 							Ok(())
-						}
+						},
 						None => Err("Expected string value for private_key".to_string()),
 					},
 				)],

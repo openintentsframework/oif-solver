@@ -44,18 +44,18 @@ async fn process_order_request(
 		Ok(order) => {
 			// Order found in storage, convert to OrderResponse
 			convert_order_to_response(order).await
-		}
+		},
 		Err(solver_storage::StorageError::NotFound) => {
 			// Order not found in storage
 			Err(GetOrderError::NotFound(format!(
 				"Order not found: {}",
 				order_id
 			)))
-		}
+		},
 		Err(e) => {
 			// Other storage error
 			Err(GetOrderError::Internal(format!("Storage error: {}", e)))
-		}
+		},
 	}
 }
 
@@ -82,7 +82,7 @@ async fn convert_order_to_response(order: Order) -> Result<OrderResponse, GetOrd
 				"Unsupported order standard: {}",
 				order.standard
 			)))
-		}
+		},
 	}
 }
 
@@ -203,7 +203,7 @@ async fn convert_eip7683_order_to_response(
 					"Unexpected fill_tx_hash in pre-execution state"
 				);
 				"pending"
-			}
+			},
 			// Fill transaction failed
 			OrderStatus::Failed(TransactionType::Fill) => "failed",
 			// Prepare failed - shouldn't have fill_tx_hash
@@ -213,7 +213,7 @@ async fn convert_eip7683_order_to_response(
 					"Unexpected fill_tx_hash when prepare transaction failed"
 				);
 				"failed"
-			}
+			},
 			// Fill succeeded but claim failed
 			OrderStatus::Failed(TransactionType::Claim) => "executed",
 		};

@@ -329,7 +329,7 @@ impl FileStorage {
 							e
 						);
 						NamespaceIndex::default()
-					}
+					},
 				}
 			} else {
 				NamespaceIndex::default()
@@ -473,10 +473,10 @@ impl FileStorage {
 								FileHeader::SIZE
 							);
 						}
-					}
+					},
 					Err(e) => {
 						tracing::debug!("Skipping file {:?}: could not be read: {}", path, e);
-					}
+					},
 				}
 			}
 		}
@@ -493,7 +493,7 @@ impl StorageInterface for FileStorage {
 			Ok(data) => data,
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
 				return Err(StorageError::NotFound)
-			}
+			},
 			Err(e) => return Err(StorageError::Backend(e.to_string())),
 		};
 
@@ -511,11 +511,11 @@ impl StorageInterface for FileStorage {
 				} else {
 					Ok(Vec::new())
 				}
-			}
+			},
 			Err(_) => {
 				// Legacy file without header, return as-is
 				Ok(data)
-			}
+			},
 		}
 	}
 
@@ -575,7 +575,7 @@ impl StorageInterface for FileStorage {
 				let namespace = key.split(':').next().unwrap_or("");
 				self.remove_from_indexes(namespace, key).await?;
 				Ok(())
-			}
+			},
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
 			Err(e) => Err(StorageError::Backend(e.to_string())),
 		}
@@ -629,7 +629,7 @@ impl StorageInterface for FileStorage {
 					}
 				}
 				all_keys.into_iter().collect()
-			}
+			},
 			QueryFilter::Equals(field, value) => namespace_index
 				.indexes
 				.get(&field)
@@ -646,7 +646,7 @@ impl StorageInterface for FileStorage {
 					}
 				}
 				keys.into_iter().collect()
-			}
+			},
 			QueryFilter::In(field, values) => {
 				let mut keys = HashSet::new();
 				if let Some(field_index) = namespace_index.indexes.get(&field) {
@@ -657,7 +657,7 @@ impl StorageInterface for FileStorage {
 					}
 				}
 				keys.into_iter().collect()
-			}
+			},
 			QueryFilter::NotIn(field, values) => {
 				let mut keys = HashSet::new();
 				if let Some(field_index) = namespace_index.indexes.get(&field) {
@@ -668,7 +668,7 @@ impl StorageInterface for FileStorage {
 					}
 				}
 				keys.into_iter().collect()
-			}
+			},
 		};
 
 		// Filter out expired entries

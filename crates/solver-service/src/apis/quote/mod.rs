@@ -163,14 +163,14 @@ pub async fn get_quote_by_id(quote_id: &str, solver: &SolverEngine) -> Result<Qu
 		Ok(quote) => {
 			tracing::debug!("Retrieved quote {} from storage", quote_id);
 			Ok(quote)
-		}
+		},
 		Err(e) => {
 			tracing::warn!("Failed to retrieve quote {}: {}", quote_id, e);
 			Err(QuoteError::InvalidRequest(format!(
 				"Quote not found: {}",
 				quote_id
 			)))
-		}
+		},
 	}
 }
 
@@ -185,10 +185,10 @@ pub async fn quote_exists(quote_id: &str, solver: &SolverEngine) -> Result<bool,
 		Ok(exists) => {
 			tracing::debug!("Quote {} exists: {}", quote_id, exists);
 			Ok(exists)
-		}
+		},
 		Err(e) => {
 			tracing::warn!("Failed to check quote existence {}: {}", quote_id, e);
 			Err(QuoteError::Internal(format!("Storage error: {}", e)))
-		}
+		},
 	}
 }

@@ -673,7 +673,7 @@ async fn handle_intent_submission(
 				}),
 			)
 				.into_response();
-		}
+		},
 	};
 
 	// Validate order
@@ -726,7 +726,7 @@ async fn handle_intent_submission(
 				}),
 			)
 				.into_response()
-		}
+		},
 		Err(e) => (
 			StatusCode::BAD_REQUEST,
 			Json(IntentResponse {

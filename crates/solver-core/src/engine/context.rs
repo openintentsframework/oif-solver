@@ -63,7 +63,7 @@ impl ContextBuilder {
 					"Failed to extract chains from intent"
 				);
 				return Err(e);
-			}
+			},
 		};
 
 		// 2. Fetch chain data for each relevant chain
@@ -113,7 +113,7 @@ impl ContextBuilder {
 					"Unsupported intent standard: {}",
 					intent.standard
 				)))
-			}
+			},
 		}
 	}
 
@@ -133,7 +133,7 @@ impl ContextBuilder {
 							Err(e) => {
 								tracing::warn!("Failed to parse hex chain ID '{}': {}", s, e);
 								None
-							}
+							},
 						}
 					} else {
 						// Parse decimal string
@@ -141,14 +141,14 @@ impl ContextBuilder {
 							Ok(parsed) => {
 								tracing::info!("Parsed decimal chain ID '{}' as {}", s, parsed);
 								Some(parsed)
-							}
+							},
 							Err(e) => {
 								tracing::warn!("Failed to parse decimal chain ID '{}': {}", s, e);
 								None
-							}
+							},
 						}
 					}
-				}
+				},
 				_ => None,
 			}
 		};
@@ -206,14 +206,14 @@ impl ContextBuilder {
 			{
 				Ok(balance) => {
 					balances.insert((chain_id, None), balance);
-				}
+				},
 				Err(e) => {
 					tracing::warn!(
 						chain_id = chain_id,
 						error = %e,
 						"Failed to fetch native balance for chain"
 					);
-				}
+				},
 			}
 
 			// Get balances for common tokens on this chain
@@ -226,7 +226,7 @@ impl ContextBuilder {
 				{
 					Ok(balance) => {
 						balances.insert((chain_id, Some(token_address.clone())), balance);
-					}
+					},
 					Err(e) => {
 						tracing::warn!(
 							chain_id = chain_id,
@@ -234,7 +234,7 @@ impl ContextBuilder {
 							error = %e,
 							"Failed to fetch token balance"
 						);
-					}
+					},
 				}
 			}
 		}

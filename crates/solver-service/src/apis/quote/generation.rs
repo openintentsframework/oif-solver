@@ -112,10 +112,10 @@ impl QuoteGenerator {
 		let order = match custody_decision {
 			CustodyDecision::ResourceLock { kind } => {
 				self.generate_resource_lock_order(request, config, kind)?
-			}
+			},
 			CustodyDecision::Escrow { kind } => {
 				self.generate_escrow_order(request, config, kind)?
-			}
+			},
 		};
 		let details = QuoteDetails {
 			requested_outputs: request.requested_outputs.clone(),
@@ -262,7 +262,7 @@ impl QuoteGenerator {
 					domain_config.chain_id,
 					address,
 				))
-			}
+			},
 			None => Err(QuoteError::InvalidRequest(format!(
 				"Domain configuration required for lock type: {:?}",
 				lock_kind
@@ -303,8 +303,8 @@ impl QuoteGenerator {
 				(None, Some(_)) => std::cmp::Ordering::Greater,
 				(None, None) => std::cmp::Ordering::Equal,
 			}),
-			Some(QuotePreference::InputPriority) => {}
-			Some(QuotePreference::Price) | Some(QuotePreference::TrustMinimization) | None => {}
+			Some(QuotePreference::InputPriority) => {},
+			Some(QuotePreference::Price) | Some(QuotePreference::TrustMinimization) | None => {},
 		}
 	}
 }

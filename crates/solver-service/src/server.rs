@@ -112,7 +112,7 @@ async fn handle_quote(
 		Err(e) => {
 			tracing::warn!("Quote request failed: {}", e);
 			Err(APIError::from(e))
-		}
+		},
 	}
 }
 
@@ -129,7 +129,7 @@ async fn handle_get_order_by_id(
 		Err(e) => {
 			tracing::warn!("Order retrieval failed: {}", e);
 			Err(APIError::from(e))
-		}
+		},
 	}
 }
 
@@ -173,7 +173,7 @@ async fn handle_order(
 				})),
 			)
 				.into_response();
-		}
+		},
 	};
 
 	tracing::debug!("Forwarding order submission to: {}", forward_url);
@@ -195,7 +195,7 @@ async fn handle_order(
 					let axum_status = StatusCode::from_u16(status.as_u16())
 						.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 					(axum_status, Json(body)).into_response()
-				}
+				},
 				Err(e) => {
 					tracing::warn!("Failed to parse response from discovery API: {}", e);
 					(
@@ -205,9 +205,9 @@ async fn handle_order(
 						})),
 					)
 						.into_response()
-				}
+				},
 			}
-		}
+		},
 		Err(e) => {
 			tracing::warn!("Failed to forward request to discovery API: {}", e);
 			(
@@ -217,6 +217,6 @@ async fn handle_order(
 				})),
 			)
 				.into_response()
-		}
+		},
 	}
 }

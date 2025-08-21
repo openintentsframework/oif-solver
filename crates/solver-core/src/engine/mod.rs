@@ -213,12 +213,12 @@ impl SolverEngine {
 
 				// Events have already been published by the recovery service
 				Ok(orphaned_intents)
-			}
+			},
 			Err(e) => {
 				tracing::error!("State recovery failed: {}", e);
 				// TODO: Decide whether to continue or fail based on configuration
 				Ok(Vec::new())
-			}
+			},
 		}
 	}
 
@@ -278,11 +278,11 @@ impl SolverEngine {
 				match storage.cleanup_expired().await {
 					Ok(count) if count > 0 => {
 						tracing::debug!("Storage cleanup: removed {} expired entries", count);
-					}
+					},
 					Err(e) => {
 						tracing::warn!("Storage cleanup failed: {}", e);
-					}
-					_ => {} // No expired entries
+					},
+					_ => {}, // No expired entries
 				}
 			}
 		});
@@ -461,10 +461,10 @@ impl SolverEngine {
 						tracing::error!("Handler error: {}", e);
 					}
 				});
-			}
+			},
 			Err(e) => {
 				tracing::error!("Failed to acquire semaphore permit: {}", e);
-			}
+			},
 		}
 	}
 }
