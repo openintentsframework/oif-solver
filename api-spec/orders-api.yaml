@@ -74,7 +74,7 @@ paths:
                     nullable: true
                     description: Optional message about the submission
                     example: null
-                  order_id:
+                  orderId:
                     type: string
                     description: Unique identifier for the submitted order
                     example: "1fa518079ecf01372290adf75c55858771efcbcee080594cc8bc24e3309a3a09"
@@ -233,13 +233,13 @@ components:
         - Finalized: Order is complete (after claim confirmation)
         - Failed: Order execution failed (with transaction type details)
       enum:
-        - Created
-        - Pending
-        - Executed
-        - Settled
-        - Finalized
-        - Failed
-      example: "Executed"
+        - created
+        - pending
+        - executed
+        - settled
+        - finalized
+        - failed
+      example: "executed"
 
     AssetAmount:
       type: object

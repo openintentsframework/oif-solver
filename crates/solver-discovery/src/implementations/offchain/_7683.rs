@@ -205,6 +205,7 @@ struct IntentRequest {
 /// * `status` - Either "success" or "error"
 /// * `message` - Optional error message when status is "error"
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct IntentResponse {
 	order_id: String,
 	status: String, // error | success
