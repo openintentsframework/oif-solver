@@ -8,7 +8,7 @@ use axum::{
 	http::StatusCode,
 	response::{IntoResponse, Json},
 	routing::{get, post},
-	Router,
+	Router, ServiceExt,
 };
 use serde_json::Value;
 use solver_config::{ApiConfig, Config};
@@ -18,6 +18,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
+use tower_http::normalize_path::NormalizePath;
 
 /// Shared application state for the API server.
 #[derive(Clone)]
@@ -94,7 +95,11 @@ pub async fn start_server(
 
 	tracing::info!("OIF Solver API server starting on {}", bind_address);
 
-	axum::serve(listener, app).await?;
+	// Wrap the entire app with NormalizePath to handle trailing slashes
+	let app = NormalizePath::trim_trailing_slash(app);
+	let service = ServiceExt::<axum::http::Request<axum::body::Body>>::into_make_service(app);
+
+	axum::serve(listener, service).await?;
 
 	Ok(())
 }

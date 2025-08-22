@@ -3,6 +3,8 @@
 //! This module provides utility functions for converting between different
 //! data formats commonly used in the solver system.
 
+use crate::Address;
+
 use super::formatting::without_0x_prefix;
 use alloy_primitives::{hex, Address as AlloyAddress};
 
@@ -43,6 +45,33 @@ pub fn bytes20_to_alloy_address(bytes: &[u8]) -> Result<AlloyAddress, String> {
 	let mut arr = [0u8; 20];
 	arr.copy_from_slice(bytes);
 	Ok(AlloyAddress::from(arr))
+}
+
+/// Parse a hex string address to solver Address type.
+///
+/// This function parses a hex string (with or without "0x" prefix) into
+/// a 20-byte Address type used throughout the solver system.
+///
+/// # Arguments
+/// * `hex_str` - A hex string representing an Ethereum address
+///
+/// # Returns
+/// * `Ok(Address)` if the string is a valid 20-byte address
+/// * `Err(String)` with error description if parsing fails
+pub fn parse_address(hex_str: &str) -> Result<Address, String> {
+	let hex = without_0x_prefix(hex_str);
+	hex::decode(hex)
+		.map_err(|e| format!("Invalid hex: {}", e))
+		.and_then(|bytes| {
+			if bytes.len() != 20 {
+				Err(format!(
+					"Invalid address length: expected 20 bytes, got {}",
+					bytes.len()
+				))
+			} else {
+				Ok(Address(bytes))
+			}
+		})
 }
 
 #[cfg(test)]

@@ -387,6 +387,7 @@ impl FileStorage {
 
 		let index_path_clone = index_path.clone();
 		let key_owned = key.to_string();
+		let namespace_owned = namespace.to_string();
 
 		// Execute with file lock
 		Self::with_index_lock(&index_path, move || async move {
@@ -409,18 +410,37 @@ impl FileStorage {
 				!value_map.is_empty()
 			});
 
-			// Write updated index atomically
-			let temp_path = index_path_clone.with_extension("tmp");
-			fs::write(
-				&temp_path,
-				serde_json::to_vec(&namespace_index)
-					.map_err(|e| StorageError::Serialization(e.to_string()))?,
-			)
-			.await
-			.map_err(|e| StorageError::Backend(e.to_string()))?;
-			fs::rename(temp_path, index_path_clone)
+			// Check if the index is completely empty
+			if namespace_index.indexes.is_empty() {
+				// Delete the index file and lock file
+				fs::remove_file(&index_path_clone)
+					.await
+					.map_err(|e| StorageError::Backend(e.to_string()))?;
+
+				// Also remove the lock file if it exists
+				let lock_path = index_path_clone.with_extension("lock");
+				if lock_path.exists() {
+					let _ = fs::remove_file(&lock_path).await;
+				}
+
+				tracing::debug!(
+					"Removed empty index and lock files for namespace: {}",
+					namespace_owned
+				);
+			} else {
+				// Write updated index atomically
+				let temp_path = index_path_clone.with_extension("tmp");
+				fs::write(
+					&temp_path,
+					serde_json::to_vec(&namespace_index)
+						.map_err(|e| StorageError::Serialization(e.to_string()))?,
+				)
 				.await
 				.map_err(|e| StorageError::Backend(e.to_string()))?;
+				fs::rename(temp_path, index_path_clone)
+					.await
+					.map_err(|e| StorageError::Backend(e.to_string()))?;
+			}
 
 			Ok(())
 		})

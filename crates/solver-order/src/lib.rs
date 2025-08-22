@@ -145,8 +145,11 @@ pub trait ExecutionStrategy: Send + Sync {
 ///
 /// This is the function signature that all order implementations must provide
 /// to create instances of their order interface.
-pub type OrderFactory =
-	fn(&toml::Value, &NetworksConfig) -> Result<Box<dyn OrderInterface>, OrderError>;
+pub type OrderFactory = fn(
+	&toml::Value,
+	&NetworksConfig,
+	&solver_types::oracle::OracleRoutes,
+) -> Result<Box<dyn OrderInterface>, OrderError>;
 
 /// Type alias for strategy factory functions.
 ///

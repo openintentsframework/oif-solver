@@ -5,14 +5,14 @@
 //! readiness checks using simple transaction receipt verification without
 //! complex attestation mechanisms.
 
-use crate::{SettlementError, SettlementInterface};
-use alloy_primitives::{hex, Address as AlloyAddress, FixedBytes};
+use crate::{utils::parse_oracle_config, OracleConfig, SettlementError, SettlementInterface};
+use alloy_primitives::{hex, FixedBytes};
 use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types::BlockTransactionsKind;
 use alloy_transport_http::Http;
 use async_trait::async_trait;
 use solver_types::{
-	without_0x_prefix, ConfigSchema, Eip7683OrderData, Field, FieldType, FillProof, NetworksConfig,
+	with_0x_prefix, ConfigSchema, Eip7683OrderData, Field, FieldType, FillProof, NetworksConfig,
 	Order, Schema, TransactionHash,
 };
 use std::collections::HashMap;
@@ -22,14 +22,10 @@ use std::collections::HashMap;
 /// This implementation validates fills by checking transaction receipts
 /// and manages dispute periods before allowing claims.
 pub struct DirectSettlement {
-	/// The order type this implementation handles
-	order: String,
-	/// Supported network IDs
-	network_ids: Vec<u64>,
 	/// RPC providers for each supported network.
 	providers: HashMap<u64, RootProvider<Http<reqwest::Client>>>,
-	/// Oracle addresses for each network (network_id -> oracle_address).
-	oracle_addresses: HashMap<u64, String>,
+	/// Oracle configuration including addresses and routes
+	oracle_config: OracleConfig,
 	/// Dispute period duration in seconds.
 	dispute_period_seconds: u64,
 }
@@ -37,20 +33,28 @@ pub struct DirectSettlement {
 impl DirectSettlement {
 	/// Creates a new DirectSettlement instance.
 	///
-	/// Configures settlement validation with multiple networks, oracle addresses,
+	/// Configures settlement validation with oracle configuration
 	/// and dispute period.
 	pub async fn new(
-		order: String,
-		network_ids: Vec<u64>,
 		networks: &NetworksConfig,
-		oracle_addresses: HashMap<u64, String>,
+		oracle_config: OracleConfig,
 		dispute_period_seconds: u64,
 	) -> Result<Self, SettlementError> {
-		// Create RPC providers for each supported network
+		// Create RPC providers for each network that has oracles configured
 		let mut providers = HashMap::new();
 
-		for network_id in &network_ids {
-			let network = networks.get(network_id).ok_or_else(|| {
+		// Collect unique network IDs from input and output oracles
+		let mut all_network_ids: Vec<u64> = oracle_config
+			.input_oracles
+			.keys()
+			.chain(oracle_config.output_oracles.keys())
+			.copied()
+			.collect();
+		all_network_ids.sort_unstable();
+		all_network_ids.dedup();
+
+		for network_id in all_network_ids {
+			let network = networks.get(&network_id).ok_or_else(|| {
 				SettlementError::ValidationFailed(format!(
 					"Network {} not found in configuration",
 					network_id
@@ -70,26 +74,12 @@ impl DirectSettlement {
 				))
 			})?);
 
-			providers.insert(*network_id, provider);
-		}
-
-		// Validate oracle addresses
-		let mut validated_oracle_addresses = HashMap::new();
-		for (network_id, oracle_address) in oracle_addresses {
-			let oracle = oracle_address.parse::<AlloyAddress>().map_err(|e| {
-				SettlementError::ValidationFailed(format!(
-					"Invalid oracle address for network {}: {}",
-					network_id, e
-				))
-			})?;
-			validated_oracle_addresses.insert(network_id, oracle.to_string());
+			providers.insert(network_id, provider);
 		}
 
 		Ok(Self {
-			order,
-			network_ids: network_ids.clone(),
 			providers,
-			oracle_addresses: validated_oracle_addresses,
+			oracle_config,
 			dispute_period_seconds,
 		})
 	}
@@ -111,53 +101,27 @@ impl ConfigSchema for DirectSettlementSchema {
 		let schema = Schema::new(
 			// Required fields
 			vec![
-				Field::new("order", FieldType::String),
 				Field::new(
-					"network_ids",
-					FieldType::Array(Box::new(FieldType::Integer {
-						min: Some(1),
-						max: None,
-					})),
+					"dispute_period_seconds",
+					FieldType::Integer {
+						min: Some(0),
+						max: Some(86400),
+					},
 				),
 				Field::new(
-					"oracle_addresses",
+					"oracles",
 					FieldType::Table(Schema::new(
-						vec![], // No required fields - network IDs are dynamic
-						vec![], // No optional fields - all entries should be valid addresses
+						vec![
+							Field::new("input", FieldType::Table(Schema::new(vec![], vec![]))),
+							Field::new("output", FieldType::Table(Schema::new(vec![], vec![]))),
+						],
+						vec![],
 					)),
-				)
-				.with_validator(|value| {
-					// Validate that all values in the table are valid Ethereum addresses
-					if let Some(table) = value.as_table() {
-						for (network_id, address_value) in table {
-							if let Some(addr) = address_value.as_str() {
-								if addr.len() != 42 || !addr.starts_with("0x") {
-									return Err(format!(
-										"oracle_addresses.{} must be a valid Ethereum address",
-										network_id
-									));
-								}
-							} else {
-								return Err(format!(
-									"oracle_addresses.{} must be a string",
-									network_id
-								));
-							}
-						}
-						Ok(())
-					} else {
-						Err("oracle_addresses must be a table".to_string())
-					}
-				}),
+				),
+				Field::new("routes", FieldType::Table(Schema::new(vec![], vec![]))),
 			],
 			// Optional fields
-			vec![Field::new(
-				"dispute_period_seconds",
-				FieldType::Integer {
-					min: Some(0),
-					max: Some(86400),
-				},
-			)],
+			vec![Field::new("oracle_selection_strategy", FieldType::String)],
 		);
 
 		schema.validate(config)
@@ -166,37 +130,12 @@ impl ConfigSchema for DirectSettlementSchema {
 
 #[async_trait]
 impl SettlementInterface for DirectSettlement {
-	fn supported_order(&self) -> &str {
-		&self.order
-	}
-
-	fn supported_networks(&self) -> &[u64] {
-		&self.network_ids
+	fn oracle_config(&self) -> &OracleConfig {
+		&self.oracle_config
 	}
 
 	fn config_schema(&self) -> Box<dyn ConfigSchema> {
 		Box::new(DirectSettlementSchema)
-	}
-
-	/// Returns the oracle address configured for a specific chain.
-	///
-	/// This implementation stores oracle addresses per chain in its configuration.
-	/// The addresses are stored as hex strings and converted to the Address type on demand.
-	///
-	/// # Arguments
-	/// * `chain_id` - The chain ID to get the oracle address for
-	///
-	/// # Returns
-	/// * `Some(Address)` if an oracle is configured for this chain and the address is valid
-	/// * `None` if no oracle is configured or the address format is invalid
-	fn get_oracle_address(&self, chain_id: u64) -> Option<solver_types::Address> {
-		self.oracle_addresses.get(&chain_id).and_then(|addr_str| {
-			let hex_str = without_0x_prefix(addr_str);
-			hex::decode(hex_str)
-				.ok()
-				.filter(|bytes| bytes.len() == 20)
-				.map(solver_types::Address)
-		})
 	}
 
 	/// Gets attestation data for a filled order and generates a fill proof.
@@ -208,6 +147,11 @@ impl SettlementInterface for DirectSettlement {
 		order: &Order,
 		tx_hash: &TransactionHash,
 	) -> Result<FillProof, SettlementError> {
+		// Get the origin chain ID from the order
+		// Note: For now we assume all inputs are on the same chain
+		let origin_chain_id = *order.input_chain_ids.first().ok_or_else(|| {
+			SettlementError::ValidationFailed("No input chains in order".to_string())
+		})?;
 		// Get the destination chain ID from the order
 		// Note: For now we assume all outputs are on the same chain
 		let destination_chain_id = *order.output_chain_ids.first().ok_or_else(|| {
@@ -228,14 +172,23 @@ impl SettlementInterface for DirectSettlement {
 			))
 		})?;
 
-		// Get the oracle address for this chain
+		// Get the oracle address for this chain using the selection strategy
+		let oracle_addresses = self.get_input_oracles(origin_chain_id);
+		if oracle_addresses.is_empty() {
+			return Err(SettlementError::ValidationFailed(format!(
+				"No input oracle configured for chain {}",
+				origin_chain_id
+			)));
+		}
+
+		// Use selection strategy with order nonce as context for deterministic selection
+		let selection_context = order_data.nonce.to::<u64>();
 		let oracle_address = self
-			.oracle_addresses
-			.get(&destination_chain_id)
+			.select_oracle(&oracle_addresses, Some(selection_context))
 			.ok_or_else(|| {
 				SettlementError::ValidationFailed(format!(
-					"No oracle address configured for chain {}",
-					destination_chain_id
+					"Failed to select oracle for chain {}",
+					origin_chain_id
 				))
 			})?;
 
@@ -281,7 +234,7 @@ impl SettlementInterface for DirectSettlement {
 		Ok(FillProof {
 			tx_hash: tx_hash.clone(),
 			block_number: tx_block,
-			oracle_address: oracle_address.clone(),
+			oracle_address: with_0x_prefix(&hex::encode(&oracle_address.0)),
 			attestation_data: Some(order_data.order_id.to_vec()),
 			filled_timestamp: block_timestamp,
 		})
@@ -359,51 +312,8 @@ pub fn create_settlement(
 	DirectSettlementSchema::validate_config(config)
 		.map_err(|e| SettlementError::ValidationFailed(format!("Invalid configuration: {}", e)))?;
 
-	// Get order type
-	let order_standard = config
-		.get("order")
-		.and_then(|v| v.as_str())
-		.ok_or_else(|| SettlementError::ValidationFailed("order is required".to_string()))?
-		.to_string();
-
-	// Get network IDs
-	let network_ids = config
-		.get("network_ids")
-		.and_then(|v| v.as_array())
-		.ok_or_else(|| SettlementError::ValidationFailed("network_ids is required".to_string()))?
-		.iter()
-		.filter_map(|v| v.as_integer().map(|i| i as u64))
-		.collect::<Vec<_>>();
-
-	if network_ids.is_empty() {
-		return Err(SettlementError::ValidationFailed(
-			"network_ids cannot be empty".to_string(),
-		));
-	}
-
-	// Get oracle addresses table
-	let addresses_table = config
-		.get("oracle_addresses")
-		.and_then(|v| v.as_table())
-		.ok_or_else(|| {
-			SettlementError::ValidationFailed("oracle_addresses is required".to_string())
-		})?;
-
-	// Build oracle addresses map
-	let mut oracle_addresses = HashMap::new();
-	for network_id in &network_ids {
-		let network_id_str = network_id.to_string();
-		let address = addresses_table
-			.get(&network_id_str)
-			.and_then(|v| v.as_str())
-			.ok_or_else(|| {
-				SettlementError::ValidationFailed(format!(
-					"oracle_addresses missing entry for network {}",
-					network_id
-				))
-			})?;
-		oracle_addresses.insert(*network_id, address.to_string());
-	}
+	// Parse oracle configuration using common utilities
+	let oracle_config = parse_oracle_config(config)?;
 
 	let dispute_period_seconds = config
 		.get("dispute_period_seconds")
@@ -413,14 +323,7 @@ pub fn create_settlement(
 	// Create settlement service synchronously
 	let settlement = tokio::task::block_in_place(|| {
 		tokio::runtime::Handle::current().block_on(async {
-			DirectSettlement::new(
-				order_standard,
-				network_ids,
-				networks,
-				oracle_addresses,
-				dispute_period_seconds,
-			)
-			.await
+			DirectSettlement::new(networks, oracle_config, dispute_period_seconds).await
 		})
 	})?;
 

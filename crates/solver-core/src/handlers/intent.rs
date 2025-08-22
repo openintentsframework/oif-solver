@@ -166,6 +166,10 @@ impl IntentHandler {
 				}
 			},
 			Err(e) => {
+				tracing::warn!(
+					reason = %e,
+					"Intent rejected during validation"
+				);
 				self.event_bus
 					.publish(SolverEvent::Discovery(DiscoveryEvent::IntentRejected {
 						intent_id: intent.id,

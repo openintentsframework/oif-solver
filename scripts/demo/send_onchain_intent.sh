@@ -58,8 +58,8 @@ INPUT_SETTLER_ADDRESS_DEST=$(grep -A 5 '\[networks.31338\]' $NETWORKS_CONFIG | g
 OUTPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31338\]' $NETWORKS_CONFIG | grep 'output_settler_address = ' | cut -d'"' -f2)
 
 # Get oracle address from settlement section in main config
-# Extract oracle address for origin chain (31337)
-ORACLE_ADDRESS=$(grep 'oracle_addresses = ' $MAIN_CONFIG | sed 's/.*31337 = "\([^"]*\)".*/\1/')
+# Extract oracle address for origin chain (31337) from the new format: input = { 31337 = ["0x..."] }
+ORACLE_ADDRESS=$(grep -A5 '\[settlement.implementations.direct.oracles\]' $MAIN_CONFIG | grep 'input = ' | sed 's/.*31337 = \["\([^"]*\)".*/\1/')
 
 # Parse token addresses from networks config
 # For origin chain tokens (31337)

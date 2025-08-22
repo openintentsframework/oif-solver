@@ -268,21 +268,26 @@ impl SolverEngine {
 
 		// Start storage cleanup task
 		let storage = self.storage.clone();
-		let cleanup_interval = tokio::time::interval(Duration::from_secs(
-			self.config.storage.cleanup_interval_seconds,
-		));
+		let cleanup_interval_seconds = self.config.storage.cleanup_interval_seconds;
+		let cleanup_interval = tokio::time::interval(Duration::from_secs(cleanup_interval_seconds));
+		tracing::info!(
+			"Starting storage cleanup service, will run every {} seconds",
+			cleanup_interval_seconds
+		);
 		let cleanup_handle = tokio::spawn(async move {
 			let mut interval = cleanup_interval;
 			loop {
 				interval.tick().await;
 				match storage.cleanup_expired().await {
-					Ok(count) if count > 0 => {
-						tracing::debug!("Storage cleanup: removed {} expired entries", count);
+					Ok(0) => {
+						tracing::debug!("Storage cleanup: no expired entries found");
+					},
+					Ok(count) => {
+						tracing::info!("Storage cleanup: removed {} expired entries", count);
 					},
 					Err(e) => {
 						tracing::warn!("Storage cleanup failed: {}", e);
 					},
-					_ => {}, // No expired entries
 				}
 			}
 		});

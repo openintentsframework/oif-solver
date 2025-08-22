@@ -35,7 +35,8 @@ use solver_types::{
 pub fn build_permit2_batch_witness_digest(
 	request: &GetQuoteRequest,
 	config: &Config,
-	settlement: &dyn SettlementInterface,
+	_settlement: &dyn SettlementInterface, // Kept for potential future use
+	selected_oracle: solver_types::Address,
 ) -> Result<(B256, serde_json::Value), QuoteError> {
 	// TODO: Implement support for multi-input/outputs
 	let input = &request.available_inputs[0];
@@ -92,16 +93,8 @@ pub fn build_permit2_batch_witness_digest(
 			QuoteError::InvalidRequest(format!("Permit2 not deployed on chain {}", origin_chain_id))
 		})?;
 
-	// Oracle address (per origin chain) from the settlement implementation
-	let input_oracle = settlement
-		.get_oracle_address(origin_chain_id)
-		.ok_or_else(|| {
-			QuoteError::InvalidRequest(format!(
-				"No oracle configured for chain {}",
-				origin_chain_id
-			))
-		})?;
-	let input_oracle = bytes20_to_alloy_address(&input_oracle.0)
+	// Use the pre-selected oracle address
+	let input_oracle = bytes20_to_alloy_address(&selected_oracle.0)
 		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid oracle address: {}", e)))?;
 
 	// Nonce and deadlines

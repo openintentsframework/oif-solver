@@ -107,7 +107,7 @@ deploy_permit2() {
     local permit2_code=$(cast code $permit2_address --rpc-url $rpc_url 2>&1)
     if [ "$permit2_code" = "0x" ] || [ -z "$permit2_code" ]; then
         # Get Permit2 bytecode from mainnet
-        local mainnet_permit2_code=$(cast code $permit2_address --rpc-url https://eth.llamarpc.com 2>/dev/null | grep "^0x" | head -n1)
+        local mainnet_permit2_code=$(cast code $permit2_address --rpc-url https://ethereum-rpc.publicnode.com 2>/dev/null | grep "^0x" | head -n1)
         
         if [ ! -z "$mainnet_permit2_code" ] && [ "$mainnet_permit2_code" != "0x" ]; then
             # Deploy using mainnet bytecode
@@ -452,16 +452,16 @@ monitoring_timeout_minutes = 5
 # ============================================================================
 [storage]
 primary = "file"
-cleanup_interval_seconds = 3600
+cleanup_interval_seconds = 60
 
 [storage.implementations.memory]
 # Memory storage has no configuration
 
 [storage.implementations.file]
 storage_path = "./data/storage"
-ttl_orders = 0                  # Permanent
-ttl_intents = 86400             # 24 hours
-ttl_order_by_tx_hash = 86400    # 24 hours
+ttl_orders = 300                  # 5 minutes
+ttl_intents = 120                 # 2 minutes
+ttl_order_by_tx_hash = 300        # 5 minutes
 
 # ============================================================================
 # ACCOUNT
@@ -520,8 +520,21 @@ address = "$INPUT_SETTLER"
 [settlement.implementations.direct]
 order = "eip7683"
 network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]
-oracle_addresses = { $ORIGIN_CHAIN_ID = "$ORACLE", $DEST_CHAIN_ID = "$ORACLE" }
 dispute_period_seconds = 1
+# Oracle selection strategy when multiple oracles are available (First, RoundRobin, Random)
+oracle_selection_strategy = "First"
+
+# Oracle configuration with multiple oracle support
+[settlement.implementations.direct.oracles]
+# Input oracles (on origin chains)
+input = { $ORIGIN_CHAIN_ID = ["$ORACLE"], $DEST_CHAIN_ID = ["$ORACLE"] }
+# Output oracles (on destination chains)
+output = { $ORIGIN_CHAIN_ID = ["$ORACLE"], $DEST_CHAIN_ID = ["$ORACLE"] }
+
+# Valid routes: from origin chain -> to destination chains
+[settlement.implementations.direct.routes]
+$ORIGIN_CHAIN_ID = [$DEST_CHAIN_ID]  # Can go from origin to destination
+$DEST_CHAIN_ID = [$ORIGIN_CHAIN_ID]  # Can go from destination to origin
 
 
 # ============================================================================
