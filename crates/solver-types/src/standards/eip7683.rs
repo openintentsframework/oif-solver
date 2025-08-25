@@ -7,6 +7,54 @@
 use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 
+/// Lock type for cross-chain orders, determining the custody mechanism used.
+///
+/// This enum represents the different ways user funds can be locked/held
+/// during the cross-chain order lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LockType {
+	/// Permit2-based escrow mechanism
+	/// Uses Permit2 signatures for gasless token approvals
+	#[serde(rename = "permit2_escrow")]
+	#[default]
+	Permit2Escrow = 1,
+	/// EIP-3009 based escrow mechanism  
+	/// Uses transferWithAuthorization for gasless transfers
+	#[serde(rename = "eip3009_escrow")]
+	Eip3009Escrow = 2,
+	/// Resource lock mechanism (The Compact)
+	/// Uses TheCompact protocol for resource locking
+	#[serde(rename = "resource_lock")]
+	ResourceLock = 3,
+}
+
+impl LockType {
+	/// Convert from u8 representation for backward compatibility
+	pub fn from_u8(value: u8) -> Option<Self> {
+		match value {
+			1 => Some(LockType::Permit2Escrow),
+			2 => Some(LockType::Eip3009Escrow),
+			3 => Some(LockType::ResourceLock),
+			_ => None,
+		}
+	}
+
+	/// Convert to u8 representation for backward compatibility
+	pub fn to_u8(self) -> u8 {
+		self as u8
+	}
+
+	/// Returns true if this lock type uses compact settlement
+	pub fn is_compact(&self) -> bool {
+		matches!(self, LockType::ResourceLock)
+	}
+
+	/// Returns true if this lock type uses escrow settlement
+	pub fn is_escrow(&self) -> bool {
+		matches!(self, LockType::Permit2Escrow | LockType::Eip3009Escrow)
+	}
+}
 /// Gas limit overrides for various transaction types
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct GasLimitOverrides {
@@ -57,6 +105,9 @@ pub struct Eip7683OrderData {
 	/// Optional sponsor address for off-chain orders
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub sponsor: Option<String>,
+	/// Optional lock type determining the custody mechanism
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub lock_type: Option<LockType>,
 }
 
 /// Represents a MandateOutput of the OIF contracts.

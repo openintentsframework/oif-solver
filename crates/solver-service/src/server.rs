@@ -206,7 +206,7 @@ async fn handle_order(
 					(
 						StatusCode::BAD_GATEWAY,
 						Json(serde_json::json!({
-							"error": "Invalid response from discovery service"
+							"error": "Failed to read response from discovery service"
 						})),
 					)
 						.into_response()

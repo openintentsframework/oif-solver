@@ -55,10 +55,12 @@ use axum::{
 	routing::post,
 	Router,
 };
+use hex;
 use serde::{Deserialize, Serialize};
+use serde_json;
 use solver_types::{
-	current_timestamp,
-	standards::eip7683::{GasLimitOverrides, MandateOutput},
+	current_timestamp, normalize_bytes32_address,
+	standards::eip7683::{GasLimitOverrides, LockType, MandateOutput},
 	with_0x_prefix, ConfigSchema, Eip7683OrderData, Field, FieldType, ImplementationRegistry,
 	Intent, IntentMetadata, NetworksConfig, Schema,
 };
@@ -75,6 +77,11 @@ sol! {
 	interface IInputSettlerEscrow {
 		function orderIdentifier(bytes calldata order) external view returns (bytes32);
 		function openFor(bytes calldata order, address sponsor, bytes calldata signature) external;
+	}
+
+	#[sol(rpc)]
+	interface IInputSettlerCompact {
+		function orderIdentifier(StandardOrder calldata order) external view returns (bytes32);
 	}
 
 	struct StandardOrder {
@@ -179,6 +186,45 @@ where
 	Ok(bytes)
 }
 
+/// Flexible deserializer for LockType that accepts numbers, strings, or enum names.
+fn deserialize_lock_type_flexible<'de, D>(deserializer: D) -> Result<LockType, D::Error>
+where
+	D: serde::Deserializer<'de>,
+{
+	use serde::de::Error;
+	let v = serde_json::Value::deserialize(deserializer)?;
+	match v {
+		serde_json::Value::Number(n) => {
+			let num = n
+				.as_u64()
+				.ok_or_else(|| Error::custom("Invalid number for LockType"))?;
+			if num <= u8::MAX as u64 {
+				LockType::from_u8(num as u8).ok_or_else(|| Error::custom("Invalid LockType value"))
+			} else {
+				Err(Error::custom("LockType value out of range"))
+			}
+		},
+		serde_json::Value::String(s) => {
+			// Try parsing as number first, then as enum name
+			if let Ok(num) = s.parse::<u8>() {
+				LockType::from_u8(num).ok_or_else(|| Error::custom("Invalid LockType value"))
+			} else {
+				// Try parsing as enum variant name
+				match s.as_str() {
+					"permit2_escrow" | "Permit2Escrow" => Ok(LockType::Permit2Escrow),
+					"eip3009_escrow" | "Eip3009Escrow" => Ok(LockType::Eip3009Escrow),
+					"resource_lock" | "ResourceLock" => Ok(LockType::ResourceLock),
+					_ => Err(Error::custom("Invalid LockType string")),
+				}
+			}
+		},
+		serde_json::Value::Null => Ok(default_lock_type()),
+		_ => Err(Error::custom(
+			"expected number, string, or null for LockType",
+		)),
+	}
+}
+
 /// API request wrapper for intent submission.
 ///
 /// This is the top-level structure for POST /intent requests with the OIF format.
@@ -188,11 +234,21 @@ where
 /// * `order` - The StandardOrder encoded as hex bytes
 /// * `sponsor` - The address sponsoring the order (usually the user)
 /// * `signature` - The Permit2Witness signature
+/// * `lock_type` - The custody mechanism type
 #[derive(Debug, Deserialize)]
 struct IntentRequest {
 	order: Bytes,
 	sponsor: Address,
 	signature: Bytes,
+	#[serde(
+		default = "default_lock_type",
+		deserialize_with = "deserialize_lock_type_flexible"
+	)]
+	lock_type: LockType,
+}
+
+fn default_lock_type() -> LockType {
+	LockType::Permit2Escrow
 }
 
 /// API response for intent submission.
@@ -201,15 +257,18 @@ struct IntentRequest {
 ///
 /// # Fields
 ///
-/// * `order_id` - The computed order ID (hex encoded)
-/// * `status` - Either "success" or "error"
-/// * `message` - Optional error message when status is "error"
+/// * `order_id` - The assigned order identifier if accepted (optional)
+/// * `status` - Human/machine readable status string
+/// * `message` - Optional message for additional details on status
+/// * `order` - The submitted EIP-712 typed data order (optional)
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct IntentResponse {
-	order_id: String,
-	status: String, // error | success
+	#[serde(rename = "orderId")]
+	order_id: Option<String>,
+	status: String,
 	message: Option<String>,
+	order: Option<serde_json::Value>,
 }
 
 /// Shared state for the API server.
@@ -438,6 +497,7 @@ impl Eip7683OffchainDiscovery {
 		order_bytes: &Bytes,
 		sponsor: &Address,
 		signature: &Bytes,
+		lock_type: LockType,
 		providers: &HashMap<u64, RootProvider<Http<reqwest::Client>>>,
 		networks: &NetworksConfig,
 	) -> Result<Intent, DiscoveryError> {
@@ -458,7 +518,19 @@ impl Eip7683OffchainDiscovery {
 				"Invalid settler address length".to_string(),
 			));
 		}
-		let settler_address = Address::from_slice(&network.input_settler_address.0);
+		// Choose settler based on lock_type
+		let settler_address = match lock_type {
+			LockType::ResourceLock => {
+				let addr = network
+					.input_settler_compact_address
+					.clone()
+					.unwrap();
+				Address::from_slice(&addr.0)
+			},
+			LockType::Permit2Escrow | LockType::Eip3009Escrow => {
+				Address::from_slice(&network.input_settler_address.0)
+			},
+		};
 
 		// Get provider for the origin chain
 		let provider = providers.get(&origin_chain_id).ok_or_else(|| {
@@ -469,7 +541,8 @@ impl Eip7683OffchainDiscovery {
 		})?;
 
 		// Generate order ID from order data
-		let order_id = Self::compute_order_id(order_bytes, provider, settler_address).await?;
+		let order_id =
+			Self::compute_order_id(order_bytes, provider, settler_address, lock_type).await?;
 
 		// Validate that order has outputs
 		if order.outputs.is_empty() {
@@ -492,15 +565,20 @@ impl Eip7683OffchainDiscovery {
 			outputs: order
 				.outputs
 				.iter()
-				.map(|output| MandateOutput {
-					oracle: output.oracle.0,
-					settler: output.settler.0,
-					chain_id: output.chainId,
-					token: output.token.0,
-					amount: output.amount,
-					recipient: output.recipient.0,
-					call: output.call.clone().into(),
-					context: output.context.clone().into(),
+				.map(|output| {
+					let settler = normalize_bytes32_address(output.settler.0);
+					let token = normalize_bytes32_address(output.token.0);
+					let recipient = normalize_bytes32_address(output.recipient.0);
+					MandateOutput {
+						oracle: output.oracle.0,
+						settler,
+						chain_id: output.chainId,
+						token,
+						amount: output.amount,
+						recipient,
+						call: output.call.clone().into(),
+						context: output.context.clone().into(),
+					}
 				})
 				.collect(),
 			// Include raw order data for openFor
@@ -508,6 +586,7 @@ impl Eip7683OffchainDiscovery {
 			// Include signature and sponsor
 			signature: Some(with_0x_prefix(&hex::encode(signature))),
 			sponsor: Some(sponsor.to_string()),
+			lock_type: Some(lock_type),
 		};
 
 		Ok(Intent {
@@ -528,13 +607,22 @@ impl Eip7683OffchainDiscovery {
 
 	/// Computes order ID from order data.
 	///
-	/// Calls the `orderIdentifier` function on the origin settler contract
-	/// to compute the canonical order ID for the given order.
+	/// Determines which settler interface to use based on the lock_type and calls
+	/// the appropriate `orderIdentifier` function to compute the canonical order ID.
+	///
+	/// # Lock Types
+	///
+	/// * 1 = permit2-escrow (uses IInputSettlerEscrow)
+	/// * 2 = 3009-escrow (uses IInputSettlerEscrow)
+	/// * 3 = resource-lock/TheCompact (uses IInputSettlerCompact)
+	/// * Other values default to IInputSettlerEscrow
 	///
 	/// # Arguments
 	///
-	/// * `order` - The order to compute ID for
+	/// * `order_bytes` - The encoded order bytes to compute ID for
 	/// * `provider` - RPC provider for calling the settler contract
+	/// * `settler_address` - Address of the appropriate settler contract
+	/// * `lock_type` - The custody/lock type determining which interface to use
 	///
 	/// # Returns
 	///
@@ -542,23 +630,51 @@ impl Eip7683OffchainDiscovery {
 	///
 	/// # Errors
 	///
-	/// Returns `DiscoveryError::Connection` if the contract call fails.
+	/// Returns `DiscoveryError::Connection` if the contract call fails or
+	/// `DiscoveryError::ParseError` if order decoding fails for compact orders.
 	async fn compute_order_id(
 		order_bytes: &Bytes,
 		provider: &RootProvider<Http<reqwest::Client>>,
 		settler_address: Address,
+		lock_type: LockType,
 	) -> Result<[u8; 32], DiscoveryError> {
-		let settler = IInputSettlerEscrow::new(settler_address, provider);
+		use alloy_sol_types::SolValue;
 
-		let order_id = settler
-			.orderIdentifier(order_bytes.clone())
-			.call()
-			.await
-			.map_err(|e| {
-				DiscoveryError::Connection(format!("Failed to get order ID from contract: {}", e))
-			})?;
-
-		Ok(order_id._0.0)
+		match lock_type {
+			LockType::ResourceLock => {
+				// Resource Lock (TheCompact) - use IInputSettlerCompact
+				let std_order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+					DiscoveryError::ParseError(format!("Failed to decode StandardOrder: {}", e))
+				})?;
+				let compact = IInputSettlerCompact::new(settler_address, provider);
+				let resp = compact
+					.orderIdentifier(std_order)
+					.call()
+					.await
+					.map_err(|e| {
+						DiscoveryError::Connection(format!(
+							"Failed to get order ID from compact contract: {}",
+							e
+						))
+					})?;
+				Ok(resp._0.0)
+			},
+			LockType::Permit2Escrow | LockType::Eip3009Escrow => {
+				// Escrow types - use IInputSettlerEscrow
+				let escrow = IInputSettlerEscrow::new(settler_address, provider);
+				let resp = escrow
+					.orderIdentifier(order_bytes.clone())
+					.call()
+					.await
+					.map_err(|e| {
+						DiscoveryError::Connection(format!(
+							"Failed to get order ID from escrow contract: {}",
+							e
+						))
+					})?;
+				Ok(resp._0.0)
+			},
+		}
 	}
 
 	/// Main API server task.
@@ -665,12 +781,17 @@ async fn handle_intent_submission(
 	let order = match Eip7683OffchainDiscovery::parse_standard_order(&request.order) {
 		Ok(order) => order,
 		Err(e) => {
+			tracing::warn!(error = %e, "Failed to parse StandardOrder from request");
 			return (
 				StatusCode::BAD_REQUEST,
 				Json(IntentResponse {
-					order_id: String::new(),
+					order_id: None,
 					status: "error".to_string(),
 					message: Some(format!("Failed to parse order: {}", e)),
+					order: Some(serde_json::Value::String(format!(
+						"0x{}",
+						hex::encode(&request.order)
+					))),
 				}),
 			)
 				.into_response();
@@ -681,12 +802,17 @@ async fn handle_intent_submission(
 	if let Err(e) =
 		Eip7683OffchainDiscovery::validate_order(&order, &request.sponsor, &request.signature).await
 	{
+		tracing::warn!(error = %e, "Order validation failed");
 		return (
 			StatusCode::BAD_REQUEST,
 			Json(IntentResponse {
-				order_id: String::new(),
+				order_id: None,
 				status: "error".to_string(),
 				message: Some(e.to_string()),
+				order: Some(serde_json::Value::String(format!(
+					"0x{}",
+					hex::encode(&request.order)
+				))),
 			}),
 		)
 			.into_response();
@@ -697,6 +823,7 @@ async fn handle_intent_submission(
 		&request.order,
 		&request.sponsor,
 		&request.signature,
+		request.lock_type,
 		&state.providers,
 		&state.networks,
 	)
@@ -707,36 +834,53 @@ async fn handle_intent_submission(
 
 			// Send intent through channel
 			if let Err(e) = state.intent_sender.send(intent) {
+				tracing::warn!(error = %e, "Failed to send intent to solver channel");
 				return (
 					StatusCode::INTERNAL_SERVER_ERROR,
 					Json(IntentResponse {
-						order_id,
+						order_id: Some(order_id),
 						status: "error".to_string(),
 						message: Some(format!("Failed to process intent: {}", e)),
+						order: Some(serde_json::Value::String(format!(
+							"0x{}",
+							hex::encode(&request.order)
+						))),
 					}),
 				)
 					.into_response();
 			}
 
+			tracing::info!(%order_id, "Intent accepted and forwarded to solver");
 			(
 				StatusCode::OK,
 				Json(IntentResponse {
-					order_id,
+					order_id: Some(order_id),
 					status: "success".to_string(),
 					message: None,
+					order: Some(serde_json::Value::String(format!(
+						"0x{}",
+						hex::encode(&request.order)
+					))),
 				}),
 			)
 				.into_response()
 		},
-		Err(e) => (
-			StatusCode::BAD_REQUEST,
-			Json(IntentResponse {
-				order_id: String::new(),
-				status: "error".to_string(),
-				message: Some(e.to_string()),
-			}),
-		)
-			.into_response(),
+		Err(e) => {
+			tracing::warn!(error = %e, "Failed to convert order to intent");
+			(
+				StatusCode::BAD_REQUEST,
+				Json(IntentResponse {
+					order_id: None,
+					status: "error".to_string(),
+					message: Some(e.to_string()),
+					order: Some(serde_json::Value::String(format!(
+						"0x{}",
+						hex::encode(&request.order)
+					))),
+				}),
+			)
+				.into_response()
+		},
 	}
 }
 

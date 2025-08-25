@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use solver_types::current_timestamp;
 use solver_types::{
-	standards::eip7683::{GasLimitOverrides, MandateOutput},
+	standards::eip7683::{GasLimitOverrides, LockType, MandateOutput},
 	with_0x_prefix, ConfigSchema, Eip7683OrderData, Field, FieldType, Intent, IntentMetadata,
 	NetworksConfig, Schema,
 };
@@ -257,6 +257,7 @@ impl Eip7683Discovery {
 			raw_order_data: Some(with_0x_prefix(&hex::encode(order_bytes))),
 			signature: None,
 			sponsor: None,
+			lock_type: Some(LockType::Permit2Escrow),
 		};
 
 		Ok(Intent {

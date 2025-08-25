@@ -206,8 +206,8 @@ build_intent_data() {
     RECIPIENT_BYTES32="0x000000000000000000000000$(echo $RECIPIENT_ADDR | cut -c3-)"
     
     # Encode StandardOrder
-    ORDER_DATA=$(cast abi-encode "f((address,uint256,uint256,uint32,uint32,address,(uint256,uint256)[],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))" \
-        "($USER_ADDR,$NONCE,$ORIGIN_CHAIN_ID,$EXPIRY,$FILL_DEADLINE,$ORACLE_ADDRESS,[($ORIGIN_TOKEN_ADDRESS,$AMOUNT)],[($ORACLE_BYTES32,$SETTLER_BYTES32,$DEST_CHAIN_ID,$TOKEN_BYTES32,$AMOUNT,$RECIPIENT_BYTES32,0x,0x)])")
+    ORDER_DATA=$(cast abi-encode "f((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))" \
+        "($USER_ADDR,$NONCE,$ORIGIN_CHAIN_ID,$EXPIRY,$FILL_DEADLINE,$ORACLE_ADDRESS,[[$ORIGIN_TOKEN_ADDRESS,$AMOUNT]],[($ORACLE_BYTES32,$SETTLER_BYTES32,$DEST_CHAIN_ID,$TOKEN_BYTES32,$AMOUNT,$RECIPIENT_BYTES32,0x,0x)])")
     
     echo -e "${GREEN}✅ StandardOrder data built${NC}"
 }
