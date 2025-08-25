@@ -524,7 +524,7 @@ impl Eip7683OffchainDiscovery {
 				let addr = network
 					.input_settler_compact_address
 					.clone()
-					.unwrap_or_else(|| network.input_settler_address.clone());
+					.unwrap();
 				Address::from_slice(&addr.0)
 			},
 			LockType::Permit2Escrow | LockType::Eip3009Escrow => {

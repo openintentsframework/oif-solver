@@ -339,9 +339,52 @@ if [ "$INPUT_SETTLER" != "$INPUT_SETTLER_DEST_CHECK" ]; then
 fi
 echo -e "${GREEN}✓${NC} $INPUT_SETTLER"
 
+echo -n "  Deploying OutputSettler on both chains... "
+OUTPUT_SETTLER_OUTPUT=$(~/.foundry/bin/forge create src/output/coin/OutputSettler7683.sol:OutputInputSettlerEscrow \
+    --rpc-url http://localhost:$ORIGIN_PORT \
+    --private-key $PRIVATE_KEY \
+    --broadcast 2>&1)
+OUTPUT_SETTLER=$(echo "$OUTPUT_SETTLER_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
+if [ -z "$OUTPUT_SETTLER" ]; then
+    echo -e "${RED}Failed on origin${NC}"
+    exit 1
+fi
 
+OUTPUT_SETTLER_DEST_OUTPUT=$(~/.foundry/bin/forge create src/output/coin/OutputSettler7683.sol:OutputInputSettlerEscrow \
+    --rpc-url http://localhost:$DEST_PORT \
+    --private-key $PRIVATE_KEY \
+    --broadcast 2>&1)
+OUTPUT_SETTLER_DEST_CHECK=$(echo "$OUTPUT_SETTLER_DEST_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
+if [ "$OUTPUT_SETTLER" != "$OUTPUT_SETTLER_DEST_CHECK" ]; then
+    echo -e "${RED}Address mismatch!${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓${NC} $OUTPUT_SETTLER"
 
-# Deploy TheCompact (Contract #3 - same address on both chains)
+# Deploy Oracle on both chains (Contract #4 - same address on both chains)
+echo -n "  Deploying AlwaysYesOracle on both chains... "
+ORACLE_OUTPUT=$(~/.foundry/bin/forge create test/mocks/AlwaysYesOracle.sol:AlwaysYesOracle \
+    --rpc-url http://localhost:$ORIGIN_PORT \
+    --private-key $PRIVATE_KEY \
+    --broadcast 2>&1)
+ORACLE=$(echo "$ORACLE_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
+if [ -z "$ORACLE" ]; then
+    echo -e "${RED}Failed on origin${NC}"
+    exit 1
+fi
+
+ORACLE_DEST_OUTPUT=$(~/.foundry/bin/forge create test/mocks/AlwaysYesOracle.sol:AlwaysYesOracle \
+    --rpc-url http://localhost:$DEST_PORT \
+    --private-key $PRIVATE_KEY \
+    --broadcast 2>&1)
+ORACLE_DEST_CHECK=$(echo "$ORACLE_DEST_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
+if [ "$ORACLE" != "$ORACLE_DEST_CHECK" ]; then
+    echo -e "${RED}Address mismatch!${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓${NC} $ORACLE"
+
+# Deploy TheCompact (Contract #5 - same address on both chains)
 echo -n "  Deploying TheCompact on both chains... "
 COMPACT_OUTPUT=$(~/.foundry/bin/forge create lib/the-compact/src/TheCompact.sol:TheCompact \
     --rpc-url http://localhost:$ORIGIN_PORT \
@@ -369,7 +412,6 @@ if [ "$THE_COMPACT" != "$COMPACT_DEST_CHECK" ]; then
     exit 1
 fi
 echo -e "${GREEN}✓${NC} $THE_COMPACT"
-
 
 echo -n "  Deploying AlwaysOKAllocator on both chains... "
 # Deploy AlwaysOKAllocator via forge 
@@ -436,7 +478,7 @@ cast send $THE_COMPACT "__registerAllocator(address,bytes)" $ALLOCATOR_ADDR "0x"
 
 # Note: Token deposit into TheCompact will happen after token minting
 
-# Deploy InputSettlerCompact (Contract #5 - same address on both chains)
+# Deploy InputSettlerCompact (Contract #6 - same address on both chains)
 INPUT_SETTLER_COMPACT_OUTPUT=$(env -u ETH_FROM ~/.foundry/bin/forge create src/input/compact/InputSettlerCompact.sol:InputSettlerCompact \
     --constructor-args $THE_COMPACT \
     --rpc-url http://localhost:$ORIGIN_PORT \
@@ -509,52 +551,6 @@ if [ "$INPUT_SETTLER_COMPACT" != "$INPUT_SETTLER_COMPACT_DEST_CHECK" ]; then
     exit 1
 fi
 echo -e "${GREEN}✓${NC} $INPUT_SETTLER_COMPACT"
-
-# Deploy OutputSettler (Contract #6 - same address on both chains)
-echo -n "  Deploying OutputSettler on both chains... "
-OUTPUT_SETTLER_OUTPUT=$(~/.foundry/bin/forge create src/output/coin/OutputSettler7683.sol:OutputInputSettlerEscrow \
-    --rpc-url http://localhost:$ORIGIN_PORT \
-    --private-key $PRIVATE_KEY \
-    --broadcast 2>&1)
-OUTPUT_SETTLER=$(echo "$OUTPUT_SETTLER_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
-if [ -z "$OUTPUT_SETTLER" ]; then
-    echo -e "${RED}Failed on origin${NC}"
-    exit 1
-fi
-
-OUTPUT_SETTLER_DEST_OUTPUT=$(~/.foundry/bin/forge create src/output/coin/OutputSettler7683.sol:OutputInputSettlerEscrow \
-    --rpc-url http://localhost:$DEST_PORT \
-    --private-key $PRIVATE_KEY \
-    --broadcast 2>&1)
-OUTPUT_SETTLER_DEST_CHECK=$(echo "$OUTPUT_SETTLER_DEST_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
-if [ "$OUTPUT_SETTLER" != "$OUTPUT_SETTLER_DEST_CHECK" ]; then
-    echo -e "${RED}Address mismatch!${NC}"
-    exit 1
-fi
-echo -e "${GREEN}✓${NC} $OUTPUT_SETTLER"
-
-# Deploy Oracle on both chains (Contract #7 - same address on both chains)
-echo -n "  Deploying AlwaysYesOracle on both chains... "
-ORACLE_OUTPUT=$(~/.foundry/bin/forge create test/mocks/AlwaysYesOracle.sol:AlwaysYesOracle \
-    --rpc-url http://localhost:$ORIGIN_PORT \
-    --private-key $PRIVATE_KEY \
-    --broadcast 2>&1)
-ORACLE=$(echo "$ORACLE_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
-if [ -z "$ORACLE" ]; then
-    echo -e "${RED}Failed on origin${NC}"
-    exit 1
-fi
-
-ORACLE_DEST_OUTPUT=$(~/.foundry/bin/forge create test/mocks/AlwaysYesOracle.sol:AlwaysYesOracle \
-    --rpc-url http://localhost:$DEST_PORT \
-    --private-key $PRIVATE_KEY \
-    --broadcast 2>&1)
-ORACLE_DEST_CHECK=$(echo "$ORACLE_DEST_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
-if [ "$ORACLE" != "$ORACLE_DEST_CHECK" ]; then
-    echo -e "${RED}Address mismatch!${NC}"
-    exit 1
-fi
-echo -e "${GREEN}✓${NC} $ORACLE"
 
 cd ..
 

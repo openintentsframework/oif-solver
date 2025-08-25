@@ -89,9 +89,9 @@ oracle_selection_strategy = "First"
 # Oracle configuration with multiple oracle support
 [settlement.implementations.direct.oracles]
 # Input oracles (on origin chains)
-input = { 31337 = ["0x2279B7A0a67DB372996a5FaB50D91eAA73d2eBe6"], 31338 = ["0x2279B7A0a67DB372996a5FaB50D91eAA73d2eBe6"] }
+input = { 31337 = ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"], 31338 = ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"] }
 # Output oracles (on destination chains)
-output = { 31337 = ["0x2279B7A0a67DB372996a5FaB50D91eAA73d2eBe6"], 31338 = ["0x2279B7A0a67DB372996a5FaB50D91eAA73d2eBe6"] }
+output = { 31337 = ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"], 31338 = ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"] }
 
 # Valid routes: from origin chain -> to destination chains
 [settlement.implementations.direct.routes]
