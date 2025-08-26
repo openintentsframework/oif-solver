@@ -1,0 +1,9 @@
+[api]
+enabled = true
+host = "127.0.0.1"
+port = 3000
+timeout_seconds = 30
+max_request_size = 1048576  # 1MB
+
+[api.implementations]
+discovery = "offchain_eip7683"

@@ -10,7 +10,10 @@
 //! - Use `include = ["file1.toml", "file2.toml"]` to include other config files
 //! - Each top-level section must be unique across all files (no duplicates allowed)
 
+pub mod builders;
 mod loader;
+
+pub use builders::config::ConfigBuilder;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
