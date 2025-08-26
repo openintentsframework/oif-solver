@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use solver_types::current_timestamp;
 use solver_types::{
-	standards::eip7683::{GasLimitOverrides, MandateOutput},
+	standards::eip7683::{GasLimitOverrides, LockType, MandateOutput},
 	with_0x_prefix, ConfigSchema, Eip7683OrderData, Field, FieldType, Intent, IntentMetadata,
 	NetworksConfig, Schema,
 };
@@ -257,6 +257,7 @@ impl Eip7683Discovery {
 			raw_order_data: Some(with_0x_prefix(&hex::encode(order_bytes))),
 			signature: None,
 			sponsor: None,
+			lock_type: Some(LockType::Permit2Escrow),
 		};
 
 		Ok(Intent {
@@ -400,11 +401,11 @@ impl Eip7683Discovery {
 					return;
 				}
 				AlloyAddress::from_slice(&network.input_settler_address.0)
-			}
+			},
 			None => {
 				tracing::error!("Chain ID {} not found in networks config", chain_id);
 				return;
-			}
+			},
 		};
 
 		// Create filter for Open events
@@ -419,7 +420,7 @@ impl Eip7683Discovery {
 			Err(e) => {
 				tracing::error!(chain = chain_id, "Failed to subscribe to logs: {}", e);
 				return;
-			}
+			},
 		};
 
 		let mut stream = subscription.into_stream();
@@ -538,7 +539,7 @@ impl DiscoveryInterface for Eip7683Discovery {
 						)
 						.await;
 					})
-				}
+				},
 				ProviderType::WebSocket(ws_provider) => {
 					let provider = ws_provider.clone();
 					tokio::spawn(async move {
@@ -547,7 +548,7 @@ impl DiscoveryInterface for Eip7683Discovery {
 						)
 						.await;
 					})
-				}
+				},
 			};
 
 			handles.push(handle);

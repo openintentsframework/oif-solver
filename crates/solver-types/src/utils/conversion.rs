@@ -3,8 +3,29 @@
 //! This module provides utility functions for converting between different
 //! data formats commonly used in the solver system.
 
+use crate::Address;
+
 use super::formatting::without_0x_prefix;
 use alloy_primitives::{hex, Address as AlloyAddress};
+
+/// Normalize a bytes32 that is expected to embed an `address` into
+/// a canonical left-padded form: 12 zero bytes followed by 20 address bytes.
+///
+/// If the input looks right-padded (address in the first 20 bytes and 12 zero
+/// bytes at the end), it will be converted to left-padded. Otherwise it is
+/// returned unchanged.
+pub fn normalize_bytes32_address(bytes32_value: [u8; 32]) -> [u8; 32] {
+	// Detect right-padded shape: [address(20)][zeros(12)]
+	let is_trailing_zeros = bytes32_value[20..32].iter().all(|&b| b == 0);
+	let has_nonzero_prefix = bytes32_value[0..20].iter().any(|&b| b != 0);
+	if is_trailing_zeros && has_nonzero_prefix {
+		let mut normalized = [0u8; 32];
+		normalized[12..32].copy_from_slice(&bytes32_value[0..20]);
+		normalized
+	} else {
+		bytes32_value
+	}
+}
 
 /// Converts a bytes32 value to an Ethereum address string without "0x" prefix.
 ///
@@ -43,6 +64,33 @@ pub fn bytes20_to_alloy_address(bytes: &[u8]) -> Result<AlloyAddress, String> {
 	let mut arr = [0u8; 20];
 	arr.copy_from_slice(bytes);
 	Ok(AlloyAddress::from(arr))
+}
+
+/// Parse a hex string address to solver Address type.
+///
+/// This function parses a hex string (with or without "0x" prefix) into
+/// a 20-byte Address type used throughout the solver system.
+///
+/// # Arguments
+/// * `hex_str` - A hex string representing an Ethereum address
+///
+/// # Returns
+/// * `Ok(Address)` if the string is a valid 20-byte address
+/// * `Err(String)` with error description if parsing fails
+pub fn parse_address(hex_str: &str) -> Result<Address, String> {
+	let hex = without_0x_prefix(hex_str);
+	hex::decode(hex)
+		.map_err(|e| format!("Invalid hex: {}", e))
+		.and_then(|bytes| {
+			if bytes.len() != 20 {
+				Err(format!(
+					"Invalid address length: expected 20 bytes, got {}",
+					bytes.len()
+				))
+			} else {
+				Ok(Address(bytes))
+			}
+		})
 }
 
 #[cfg(test)]

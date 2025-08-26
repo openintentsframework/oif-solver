@@ -112,10 +112,10 @@ impl QuoteGenerator {
 		let order = match custody_decision {
 			CustodyDecision::ResourceLock { kind } => {
 				self.generate_resource_lock_order(request, config, kind)?
-			}
+			},
 			CustodyDecision::Escrow { kind } => {
 				self.generate_escrow_order(request, config, kind)?
-			}
+			},
 		};
 		let details = QuoteDetails {
 			requested_outputs: request.requested_outputs.clone(),
@@ -162,7 +162,7 @@ impl QuoteGenerator {
 	) -> Result<QuoteOrder, QuoteError> {
 		// Standard determined by business logic context
 		// Currently we only support EIP7683
-		let standard = "eip7683";
+		let _standard = "eip7683"; // Currently only supporting eip7683
 
 		// Extract chain from first output to find appropriate settlement
 		// TODO: Implement support for multiple destination chains
@@ -174,14 +174,21 @@ impl QuoteGenerator {
 			.ethereum_chain_id()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chain ID: {}", e)))?;
 
-		// Lookup settlement for exact standard and network
-		let settlement = self
+		// Get settlement AND selected oracle for consistency
+		let (settlement, selected_oracle) = self
 			.settlement_service
-			.find_settlement_for_standard_and_network(standard, chain_id)
-			.map_err(|e| QuoteError::InvalidRequest(e.to_string()))?;
+			.get_any_settlement_for_chain(chain_id)
+			.ok_or_else(|| {
+				QuoteError::InvalidRequest(format!(
+					"No settlement available for chain {}",
+					chain_id
+				))
+			})?;
 
 		match escrow_kind {
-			EscrowKind::Permit2 => self.generate_permit2_order(request, config, settlement),
+			EscrowKind::Permit2 => {
+				self.generate_permit2_order(request, config, settlement, selected_oracle)
+			},
 			EscrowKind::Erc3009 => self.generate_erc3009_order(request, config),
 		}
 	}
@@ -191,6 +198,7 @@ impl QuoteGenerator {
 		request: &GetQuoteRequest,
 		config: &Config,
 		settlement: &dyn SettlementInterface,
+		selected_oracle: solver_types::Address,
 	) -> Result<QuoteOrder, QuoteError> {
 		use crate::apis::quote::eip712;
 
@@ -205,7 +213,7 @@ impl QuoteGenerator {
 			})?;
 		let domain_address = permit2_domain_address_from_config(config, chain_id)?;
 		let (final_digest, message_obj) =
-			build_permit2_batch_witness_digest(request, config, settlement)?;
+			build_permit2_batch_witness_digest(request, config, settlement, selected_oracle)?;
 		let message = serde_json::json!({ "digest": with_0x_prefix(&hex::encode(final_digest)), "eip712": message_obj });
 		Ok(QuoteOrder {
 			signature_type: SignatureType::Eip712,
@@ -266,7 +274,7 @@ impl QuoteGenerator {
 					domain_config.chain_id,
 					address,
 				))
-			}
+			},
 			None => Err(QuoteError::InvalidRequest(format!(
 				"Domain configuration required for lock type: {:?}",
 				lock_kind
@@ -307,8 +315,8 @@ impl QuoteGenerator {
 				(None, Some(_)) => std::cmp::Ordering::Greater,
 				(None, None) => std::cmp::Ordering::Equal,
 			}),
-			Some(QuotePreference::InputPriority) => {}
-			Some(QuotePreference::Price) | Some(QuotePreference::TrustMinimization) | None => {}
+			Some(QuotePreference::InputPriority) => {},
+			Some(QuotePreference::Price) | Some(QuotePreference::TrustMinimization) | None => {},
 		}
 	}
 }

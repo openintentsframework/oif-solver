@@ -9,8 +9,8 @@ use alloy_primitives::{Address as AlloyAddress, FixedBytes, U256};
 use alloy_sol_types::{sol, SolCall, SolValue};
 use async_trait::async_trait;
 use solver_types::{
-	Address, ConfigSchema, Eip7683OrderData, ExecutionParams, FillProof, Intent, NetworksConfig,
-	Order, OrderStatus, Schema, Transaction,
+	oracle::OracleRoutes, standards::eip7683::LockType, Address, ConfigSchema, Eip7683OrderData,
+	ExecutionParams, FillProof, Intent, NetworksConfig, Order, OrderStatus, Schema, Transaction,
 };
 
 // Solidity type definitions for EIP-7683 contract interactions.
@@ -63,6 +63,12 @@ sol! {
 		function open(bytes calldata order) external;
 		function openFor(bytes calldata order, address sponsor, bytes calldata signature) external;
 	}
+
+	/// IInputSettlerCompact interface for Compact-based settlement.
+	interface IInputSettlerCompact {
+		function finalise(OrderStruct order, bytes signatures, uint32[] timestamps, bytes32[] solvers, bytes32 destination, bytes call) external;
+		function finaliseWithSignature(OrderStruct order, bytes signatures, uint32[] timestamps, bytes32[] solvers, bytes32 destination, bytes call, bytes signature) external;
+	}
 }
 
 /// EIP-7683 order implementation.
@@ -82,9 +88,12 @@ sol! {
 /// # Fields
 ///
 /// * `networks` - Networks configuration containing settler addresses for each chain
+/// * `oracle_routes` - Oracle routes for validation of input/output oracle compatibility
 pub struct Eip7683OrderImpl {
 	/// Networks configuration for dynamic settler address lookups.
 	networks: NetworksConfig,
+	/// Oracle routes for validation of input/output oracle compatibility.
+	oracle_routes: OracleRoutes,
 }
 
 impl Eip7683OrderImpl {
@@ -93,7 +102,8 @@ impl Eip7683OrderImpl {
 	/// # Arguments
 	///
 	/// * `networks` - Networks configuration with settler addresses
-	pub fn new(networks: NetworksConfig) -> Result<Self, OrderError> {
+	/// * `oracle_routes` - Oracle routes for validation
+	pub fn new(networks: NetworksConfig, oracle_routes: OracleRoutes) -> Result<Self, OrderError> {
 		// Validate that networks config has at least 2 networks
 		if networks.len() < 2 {
 			return Err(OrderError::ValidationFailed(
@@ -101,7 +111,10 @@ impl Eip7683OrderImpl {
 			));
 		}
 
-		Ok(Self { networks })
+		Ok(Self {
+			networks,
+			oracle_routes,
+		})
 	}
 }
 
@@ -197,8 +210,101 @@ impl OrderInterface for Eip7683OrderImpl {
 			return Err(OrderError::ValidationFailed("Order expired".to_string()));
 		}
 
+		// Validate oracle routes
+		let origin_chain = order_data.origin_chain_id.to::<u64>();
+		let input_oracle = solver_types::utils::parse_address(&order_data.input_oracle)
+			.map_err(|e| OrderError::ValidationFailed(format!("Invalid input oracle: {}", e)))?;
+
+		let input_info = solver_types::oracle::OracleInfo {
+			chain_id: origin_chain,
+			oracle: input_oracle,
+		};
+
+		// Check if the input oracle is supported
+		if !self
+			.oracle_routes
+			.supported_routes
+			.contains_key(&input_info)
+		{
+			return Err(OrderError::ValidationFailed(format!(
+				"Input oracle {} on chain {} is not supported",
+				order_data.input_oracle, origin_chain
+			)));
+		}
+
+		// Get supported output oracles for this input oracle
+		let supported_outputs = self
+			.oracle_routes
+			.supported_routes
+			.get(&input_info)
+			.ok_or_else(|| {
+				OrderError::ValidationFailed(format!(
+					"No routes configured for input oracle {} on chain {}",
+					order_data.input_oracle, origin_chain
+				))
+			})?;
+
+		// Early validation: Check if the specific routes exist
+		let supported_destinations: std::collections::HashSet<u64> =
+			supported_outputs.iter().map(|info| info.chain_id).collect();
+
+		for output in &order_data.outputs {
+			let dest_chain = output.chain_id.to::<u64>();
+
+			// Skip same-chain outputs as they don't need cross-chain routes
+			if dest_chain == origin_chain {
+				continue;
+			}
+
+			if !supported_destinations.contains(&dest_chain) {
+				return Err(OrderError::ValidationFailed(format!(
+					"Route from chain {} to chain {} is not supported (oracle {} has no route to destination)",
+					origin_chain, dest_chain, order_data.input_oracle
+				)));
+			}
+		}
+
+		// Validate each output oracle
+		for output in &order_data.outputs {
+			let dest_chain = output.chain_id.to::<u64>();
+
+			// If output oracle is zero (0x00...), it means use any compatible oracle
+			// Otherwise, validate the specific oracle
+			if output.oracle != [0u8; 32] {
+				// Parse the oracle address from bytes32 (take first 20 bytes)
+				let output_oracle_bytes = &output.oracle[12..32]; // Last 20 bytes for address
+				let output_oracle = Address(output_oracle_bytes.into());
+
+				let output_info = solver_types::oracle::OracleInfo {
+					chain_id: dest_chain,
+					oracle: output_oracle,
+				};
+
+				// Check if this output oracle is in the supported list
+				if !supported_outputs.contains(&output_info) {
+					return Err(OrderError::ValidationFailed(format!(
+						"Output oracle {:?} on chain {} is not compatible with input oracle {} on chain {}",
+						output.oracle, dest_chain, order_data.input_oracle, origin_chain
+					)));
+				}
+			} else {
+				// Zero oracle means any oracle on the destination chain is acceptable
+				// Just verify that there's at least one oracle for this destination
+				let has_route_to_dest = supported_outputs
+					.iter()
+					.any(|info| info.chain_id == dest_chain);
+
+				if !has_route_to_dest {
+					return Err(OrderError::ValidationFailed(format!(
+						"No route available from chain {} to chain {}",
+						origin_chain, dest_chain
+					)));
+				}
+			}
+		}
+
 		// Extract chain IDs
-		let input_chain_ids = vec![order_data.origin_chain_id.to::<u64>()];
+		let input_chain_ids = vec![origin_chain];
 		let output_chain_ids = order_data
 			.outputs
 			.iter()
@@ -266,7 +372,10 @@ impl OrderInterface for Eip7683OrderImpl {
 			serde_json::from_value(order.data.clone()).map_err(|e| {
 				OrderError::ValidationFailed(format!("Failed to parse order data: {}", e))
 			})?;
-
+		// Skip prepare for Compact (resource lock) flows
+		if matches!(order_data.lock_type, Some(LockType::ResourceLock)) {
+			return Ok(None);
+		}
 		let raw_order_data = order_data.raw_order_data.as_ref().ok_or_else(|| {
 			OrderError::ValidationFailed("Missing raw order data for off-chain order".to_string())
 		})?;
@@ -558,32 +667,74 @@ impl OrderInterface for Eip7683OrderImpl {
 		// Empty call data for simple finalisation
 		let call = vec![];
 
-		// Encode the finalise call
-		let call_data = IInputSettlerEscrow::finaliseCall {
-			order: order_struct,
-			timestamps,
-			solvers,
-			destination,
-			call: call.into(),
-		}
-		.abi_encode();
+		// Encode the finalise call. If Compact flow, include signatures argument.
+		let call_data = {
+			let parsed =
+				serde_json::from_value::<Eip7683OrderData>(order.data.clone()).map_err(|e| {
+					OrderError::ValidationFailed(format!("Failed to parse order data: {}", e))
+				})?;
+			match parsed.lock_type {
+				Some(LockType::ResourceLock) => {
+					tracing::info!("Processing Compact claim for order {}", order.id);
+
+					let sig_hex = parsed.signature.as_deref().ok_or_else(|| {
+						OrderError::ValidationFailed(
+							"Missing signatures for compact flow".to_string(),
+						)
+					})?;
+
+					// Expect full signature payload already without any type prefix
+					let sig_str = sig_hex.trim_start_matches("0x");
+					let compact_sig_bytes = hex::decode(sig_str).map_err(|e| {
+						OrderError::ValidationFailed(format!("Invalid compact signatures: {}", e))
+					})?;
+
+					IInputSettlerCompact::finaliseCall {
+						order: order_struct,
+						signatures: compact_sig_bytes.into(),
+						timestamps,
+						solvers,
+						destination,
+						call: call.into(),
+					}
+					.abi_encode()
+				},
+				_ => IInputSettlerEscrow::finaliseCall {
+					order: order_struct,
+					timestamps,
+					solvers,
+					destination,
+					call: call.into(),
+				}
+				.abi_encode(),
+			}
+		};
 
 		// Get the input settler address for the order's origin chain
 		let origin_chain_id = *order
 			.input_chain_ids
 			.first()
 			.ok_or_else(|| OrderError::ValidationFailed("No input chains in order".into()))?;
-		let input_settler_address = self
-			.networks
-			.get(&origin_chain_id)
-			.ok_or_else(|| {
-				OrderError::ValidationFailed(format!(
-					"Chain ID {} not found in networks configuration",
-					order_data.origin_chain_id
-				))
-			})?
-			.input_settler_address
-			.clone();
+		let network_cfg = self.networks.get(&origin_chain_id).ok_or_else(|| {
+			OrderError::ValidationFailed(format!(
+				"Chain ID {} not found in networks configuration",
+				order_data.origin_chain_id
+			))
+		})?;
+		let is_compact = serde_json::from_value::<Eip7683OrderData>(order.data.clone())
+			.ok()
+			.and_then(|d| d.lock_type)
+			.map(|lt| lt == LockType::ResourceLock)
+			.unwrap_or(false);
+		let input_settler_address = if is_compact {
+			// Prefer compact-specific address if provided
+			network_cfg
+				.input_settler_compact_address
+				.clone()
+				.unwrap_or_else(|| network_cfg.input_settler_address.clone())
+		} else {
+			network_cfg.input_settler_address.clone()
+		};
 
 		Ok(Transaction {
 			to: Some(input_settler_address),
@@ -623,12 +774,13 @@ impl OrderInterface for Eip7683OrderImpl {
 pub fn create_order_impl(
 	config: &toml::Value,
 	networks: &NetworksConfig,
+	oracle_routes: &solver_types::oracle::OracleRoutes,
 ) -> Result<Box<dyn OrderInterface>, OrderError> {
 	// Validate configuration first
 	Eip7683OrderSchema::validate_config(config)
 		.map_err(|e| OrderError::InvalidOrder(format!("Invalid configuration: {}", e)))?;
 
-	let order_impl = Eip7683OrderImpl::new(networks.clone())?;
+	let order_impl = Eip7683OrderImpl::new(networks.clone(), oracle_routes.clone())?;
 	Ok(Box::new(order_impl))
 }
 

@@ -10,7 +10,10 @@
 //! - Use `include = ["file1.toml", "file2.toml"]` to include other config files
 //! - Each top-level section must be unique across all files (no duplicates allowed)
 
+pub mod builders;
 mod loader;
+
+pub use builders::config::ConfigBuilder;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -306,7 +309,7 @@ pub(crate) fn resolve_env_vars(input: &str) -> Result<String, ConfigError> {
 						var_name
 					)));
 				}
-			}
+			},
 		};
 
 		replacements.push((full_match.start(), full_match.end(), value));
@@ -643,18 +646,20 @@ id = "${TEST_SOLVER_ID}"
 monitoring_timeout_minutes = 5
 
 [networks.1]
-rpc_url = "http://localhost:8545"
 input_settler_address = "0x1234567890123456789012345678901234567890"
 output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.1.rpc_urls]]
+http = "http://localhost:8545"
 [[networks.1.tokens]]
 address = "0xabcdef1234567890abcdef1234567890abcdef12"
 symbol = "TEST"
 decimals = 18
 
 [networks.2]
-rpc_url = "http://localhost:8546"
 input_settler_address = "0x1234567890123456789012345678901234567890"
 output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.2.rpc_urls]]
+http = "http://localhost:8546"
 [[networks.2.tokens]]
 address = "0xabcdef1234567890abcdef1234567890abcdef12"
 symbol = "TEST"
@@ -703,27 +708,30 @@ id = "test"
 monitoring_timeout_minutes = 5
 
 [networks.1]
-rpc_url = "http://localhost:8545"
 input_settler_address = "0x1234567890123456789012345678901234567890"
 output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.1.rpc_urls]]
+http = "http://localhost:8545"
 [[networks.1.tokens]]
 address = "0xabcdef1234567890abcdef1234567890abcdef12"
 symbol = "TEST"
 decimals = 18
 
 [networks.2]
-rpc_url = "http://localhost:8546"
 input_settler_address = "0x1234567890123456789012345678901234567890"
 output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.2.rpc_urls]]
+http = "http://localhost:8546"
 [[networks.2.tokens]]
 address = "0xabcdef1234567890abcdef1234567890abcdef12"
 symbol = "TEST"
 decimals = 18
 
 [networks.3]
-rpc_url = "http://localhost:8547"
 input_settler_address = "0x1234567890123456789012345678901234567890"
 output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.3.rpc_urls]]
+http = "http://localhost:8547"
 [[networks.3.tokens]]
 address = "0xabcdef1234567890abcdef1234567890abcdef12"
 symbol = "TEST"
@@ -783,18 +791,20 @@ id = "test"
 monitoring_timeout_minutes = 5
 
 [networks.1]
-rpc_url = "http://localhost:8545"
 input_settler_address = "0x1234567890123456789012345678901234567890"
 output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.1.rpc_urls]]
+http = "http://localhost:8545"
 [[networks.1.tokens]]
 address = "0xabcdef1234567890abcdef1234567890abcdef12"
 symbol = "TEST"
 decimals = 18
 
 [networks.2]
-rpc_url = "http://localhost:8546"
 input_settler_address = "0x1234567890123456789012345678901234567890"
 output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.2.rpc_urls]]
+http = "http://localhost:8546"
 [[networks.2.tokens]]
 address = "0xabcdef1234567890abcdef1234567890abcdef12"
 symbol = "TEST"
@@ -830,7 +840,7 @@ network_ids = [1, 2]
 		let result = Config::from_str(config_str);
 		assert!(result.is_err());
 		let err = result.unwrap_err();
-		assert!(err.to_string().contains("missing 'standard' field"));
+		assert!(err.to_string().contains("missing 'order' field"));
 	}
 
 	#[test]
@@ -841,18 +851,20 @@ id = "test"
 monitoring_timeout_minutes = 5
 
 [networks.1]
-rpc_url = "http://localhost:8545"
 input_settler_address = "0x1234567890123456789012345678901234567890"
 output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.1.rpc_urls]]
+http = "http://localhost:8545"
 [[networks.1.tokens]]
 address = "0xabcdef1234567890abcdef1234567890abcdef12"
 symbol = "TEST"
 decimals = 18
 
 [networks.2]
-rpc_url = "http://localhost:8546"
 input_settler_address = "0x1234567890123456789012345678901234567890"
 output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.2.rpc_urls]]
+http = "http://localhost:8546"
 [[networks.2.tokens]]
 address = "0xabcdef1234567890abcdef1234567890abcdef12"
 symbol = "TEST"
@@ -888,7 +900,9 @@ network_ids = [1, 2, 999]  # Network 999 doesn't exist
 		let result = Config::from_str(config_str);
 		assert!(result.is_err());
 		let err = result.unwrap_err();
-		assert!(err.to_string().contains("references network 999"));
+		assert!(err
+			.to_string()
+			.contains("references network 999 which doesn't exist"));
 	}
 
 	#[test]
@@ -899,18 +913,20 @@ id = "test"
 monitoring_timeout_minutes = 5
 
 [networks.1]
-rpc_url = "http://localhost:8545"
 input_settler_address = "0x1234567890123456789012345678901234567890"
 output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.1.rpc_urls]]
+http = "http://localhost:8545"
 [[networks.1.tokens]]
 address = "0xabcdef1234567890abcdef1234567890abcdef12"
 symbol = "TEST"
 decimals = 18
 
 [networks.2]
-rpc_url = "http://localhost:8546"
 input_settler_address = "0x1234567890123456789012345678901234567890"
 output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.2.rpc_urls]]
+http = "http://localhost:8546"
 [[networks.2.tokens]]
 address = "0xabcdef1234567890abcdef1234567890abcdef12"
 symbol = "TEST"
@@ -949,6 +965,6 @@ network_ids = [1, 2]
 		let err = result.unwrap_err();
 		assert!(err
 			.to_string()
-			.contains("Order standard 'eip9999' has no settlement"));
+			.contains("Order standard 'eip9999' has no settlement implementations"));
 	}
 }

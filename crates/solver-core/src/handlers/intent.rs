@@ -146,7 +146,7 @@ impl IntentHandler {
 								params,
 							}))
 							.ok();
-					}
+					},
 					ExecutionDecision::Skip(reason) => {
 						self.event_bus
 							.publish(SolverEvent::Order(OrderEvent::Skipped {
@@ -154,7 +154,7 @@ impl IntentHandler {
 								reason,
 							}))
 							.ok();
-					}
+					},
 					ExecutionDecision::Defer(duration) => {
 						self.event_bus
 							.publish(SolverEvent::Order(OrderEvent::Deferred {
@@ -162,17 +162,21 @@ impl IntentHandler {
 								retry_after: duration,
 							}))
 							.ok();
-					}
+					},
 				}
-			}
+			},
 			Err(e) => {
+				tracing::warn!(
+					reason = %e,
+					"Intent rejected during validation"
+				);
 				self.event_bus
 					.publish(SolverEvent::Discovery(DiscoveryEvent::IntentRejected {
 						intent_id: intent.id,
 						reason: e.to_string(),
 					}))
 					.ok();
-			}
+			},
 		}
 
 		Ok(())

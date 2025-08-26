@@ -16,6 +16,8 @@ pub mod discovery;
 pub mod events;
 /// Network and token configuration types.
 pub mod networks;
+/// Oracle-related types for settlement validation and routing.
+pub mod oracle;
 /// Order processing types including intents, orders, and execution contexts.
 pub mod order;
 /// Registry trait for self-registering implementations.
@@ -47,7 +49,7 @@ pub use standards::{
 };
 pub use storage::*;
 pub use utils::{
-	bytes32_to_address, current_timestamp, format_token_amount, truncate_id, with_0x_prefix,
-	without_0x_prefix,
+	bytes32_to_address, current_timestamp, format_token_amount, normalize_bytes32_address,
+	truncate_id, with_0x_prefix, without_0x_prefix,
 };
 pub use validation::*;

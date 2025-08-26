@@ -1,0 +1,31 @@
+---
+version: 2
+# opt in to updates for ecosystems that are not yet GA.
+enable-beta-ecosystems: true
+updates:
+  # Maintain dependencies for GitHub Actions
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      # Prefix all commit messages with "chore(deps): "
+      prefix: 'chore(deps): '
+
+  # Maintain dependencies for cargo
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    ignore:
+      - dependency-name: '*'
+        update-types:
+          - version-update:semver-major
+    commit-message:
+      # Prefix all commit messages
+      prefix: 'chore(deps): '
+    labels:
+      - dependabot
+      - dependencies
+    # Allow up to 10 open pull requests for testing
+    open-pull-requests-limit: 5

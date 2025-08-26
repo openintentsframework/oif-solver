@@ -113,13 +113,13 @@ impl TransactionHandler {
 		match tx_type {
 			TransactionType::Prepare => {
 				self.handle_prepare_confirmed(tx_hash).await?;
-			}
+			},
 			TransactionType::Fill => {
 				self.handle_fill_confirmed(tx_hash, receipt).await?;
-			}
+			},
 			TransactionType::Claim => {
 				self.handle_claim_confirmed(tx_hash, receipt).await?;
-			}
+			},
 		}
 
 		Ok(())

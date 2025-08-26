@@ -252,13 +252,13 @@ impl DeliveryInterface for AlloyDelivery {
 					// Transaction not yet mined, wait and retry
 					tokio::time::sleep(poll_interval).await;
 					continue;
-				}
+				},
 				Err(e) => {
 					return Err(DeliveryError::Network(format!(
 						"Failed to get receipt: {}",
 						e
 					)));
-				}
+				},
 			};
 
 			// Get current block number
@@ -347,7 +347,7 @@ impl DeliveryInterface for AlloyDelivery {
 					.map_err(|e| DeliveryError::Network(format!("Failed to get balance: {}", e)))?;
 
 				Ok(balance.to_string())
-			}
+			},
 			Some(token_address) => {
 				// Get ERC-20 token balance
 				let token_addr: Address = token_address
@@ -381,7 +381,7 @@ impl DeliveryInterface for AlloyDelivery {
 
 				let balance = U256::from_be_slice(&call_result[..32]);
 				Ok(balance.to_string())
-			}
+			},
 		}
 	}
 

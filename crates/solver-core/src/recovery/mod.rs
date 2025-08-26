@@ -131,10 +131,10 @@ impl RecoveryService {
 				Ok(result) => {
 					self.publish_recovery_event(order, result).await;
 					report.reconciled_orders += 1;
-				}
+				},
 				Err(e) => {
 					tracing::warn!("Failed to reconcile order {}: {}", order.id, e);
-				}
+				},
 			}
 		}
 
@@ -266,12 +266,12 @@ impl RecoveryService {
 				Ok(true) => {
 					// Transaction succeeded
 					return Ok(ReconcileResult::Finalized);
-				}
+				},
 				Ok(false) => {
 					// Transaction failed/reverted
 					tracing::warn!("Claim transaction {:?} failed/reverted", claim_tx);
 					return Ok(ReconcileResult::Failed(TransactionType::Claim));
-				}
+				},
 				Err(e) => {
 					// Could not get status - network issue, node problem, etc.
 					// Fail the transaction since we can't determine its state
@@ -280,7 +280,7 @@ impl RecoveryService {
 						e
 					);
 					return Ok(ReconcileResult::Failed(TransactionType::Claim));
-				}
+				},
 			}
 		}
 
@@ -297,12 +297,12 @@ impl RecoveryService {
 					return Ok(ReconcileResult::NeedsClaim {
 						fill_proof: order.fill_proof.clone(),
 					});
-				}
+				},
 				Ok(false) => {
 					// Transaction failed/reverted
 					tracing::warn!("Fill transaction {:?} failed/reverted", fill_tx);
 					return Ok(ReconcileResult::Failed(TransactionType::Fill));
-				}
+				},
 				Err(e) => {
 					// Could not get status - network issue, node problem, etc.
 					// Fail the transaction since we can't determine its state
@@ -311,7 +311,7 @@ impl RecoveryService {
 						e
 					);
 					return Ok(ReconcileResult::Failed(TransactionType::Fill));
-				}
+				},
 			}
 		}
 
@@ -326,12 +326,12 @@ impl RecoveryService {
 				Ok(true) => {
 					// Transaction succeeded, prepare confirmed
 					return Ok(ReconcileResult::NeedsFill);
-				}
+				},
 				Ok(false) => {
 					// Transaction failed/reverted
 					tracing::warn!("Prepare transaction {:?} failed/reverted", prepare_tx);
 					return Ok(ReconcileResult::Failed(TransactionType::Prepare));
-				}
+				},
 				Err(e) => {
 					// Could not get status - network issue, node problem, etc.
 					// Fail the transaction since we can't determine its state
@@ -340,7 +340,7 @@ impl RecoveryService {
 						e
 					);
 					return Ok(ReconcileResult::Failed(TransactionType::Prepare));
-				}
+				},
 			}
 		}
 
@@ -370,7 +370,7 @@ impl RecoveryService {
 				} else {
 					tracing::error!("Order {} missing execution params, cannot resume", order.id);
 				}
-			}
+			},
 
 			ReconcileResult::NeedsFill => {
 				// Prepare confirmed, need to execute fill transaction
@@ -389,7 +389,7 @@ impl RecoveryService {
 						order.id
 					);
 				}
-			}
+			},
 
 			ReconcileResult::NeedsClaim { fill_proof } => {
 				// Fill confirmed, check if ready to claim
@@ -410,7 +410,7 @@ impl RecoveryService {
 					// No proof yet, spawn monitor to get it
 					self.spawn_settlement_monitor(order).await;
 				}
-			}
+			},
 
 			ReconcileResult::Failed(tx_type) => {
 				tracing::warn!("Order {} failed at {:?} stage", order.id, tx_type);
@@ -422,7 +422,7 @@ impl RecoveryService {
 				{
 					tracing::error!("Failed to update order {} status: {}", order.id, e);
 				}
-			}
+			},
 
 			ReconcileResult::Finalized => {
 				tracing::info!("Order {} already finalized", order.id);
@@ -449,7 +449,7 @@ impl RecoveryService {
 									e
 								);
 							}
-						}
+						},
 						OrderStatus::Executed => {
 							// Need to go: Executed -> Settled -> Finalized
 							if let Err(e) = self
@@ -465,7 +465,7 @@ impl RecoveryService {
 									e
 								);
 							}
-						}
+						},
 						OrderStatus::Settled => {
 							// Just need: Settled -> Finalized
 							if let Err(e) = self
@@ -479,17 +479,17 @@ impl RecoveryService {
 									e
 								);
 							}
-						}
+						},
 						OrderStatus::Finalized => {
 							// Already finalized, nothing to do
-						}
+						},
 						OrderStatus::Failed(_) => {
 							// Order is failed, don't transition to finalized
 							tracing::warn!("Order {} is in failed state but blockchain shows finalized - data inconsistency", order.id);
-						}
+						},
 					}
 				}
-			}
+			},
 		}
 	}
 

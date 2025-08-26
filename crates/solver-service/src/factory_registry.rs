@@ -26,8 +26,11 @@ pub type DeliveryFactory = fn(
 ) -> Result<Box<dyn DeliveryInterface>, DeliveryError>;
 pub type DiscoveryFactory =
 	fn(&toml::Value, &NetworksConfig) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError>;
-pub type OrderFactory =
-	fn(&toml::Value, &NetworksConfig) -> Result<Box<dyn OrderInterface>, OrderError>;
+pub type OrderFactory = fn(
+	&toml::Value,
+	&NetworksConfig,
+	&solver_types::oracle::OracleRoutes,
+) -> Result<Box<dyn OrderInterface>, OrderError>;
 pub type SettlementFactory =
 	fn(&toml::Value, &NetworksConfig) -> Result<Box<dyn SettlementInterface>, SettlementError>;
 pub type StrategyFactory = fn(&toml::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError>;

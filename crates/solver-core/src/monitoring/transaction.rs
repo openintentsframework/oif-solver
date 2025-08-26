@@ -78,7 +78,7 @@ impl TransactionMonitor {
 									},
 								))
 								.ok();
-						}
+						},
 						Err(e) => {
 							tracing::error!(
 								order_id = %truncate_id(&order_id),
@@ -87,10 +87,10 @@ impl TransactionMonitor {
 								error = %e,
 								"Failed to wait for confirmations"
 							);
-						}
+						},
 					}
 					break;
-				}
+				},
 				Ok(false) => {
 					// Transaction failed
 					self.event_bus
@@ -102,18 +102,18 @@ impl TransactionMonitor {
 						}))
 						.ok();
 					break;
-				}
+				},
 				Err(e) => {
 					// Transaction not yet confirmed or error
 					let message = match &e {
 						DeliveryError::NoImplementationAvailable => {
 							"Waiting for transaction to be mined"
-						}
+						},
 						_ => "Checking transaction status",
 					};
 
 					tracing::info!(elapsed_secs = start_time.elapsed().as_secs(), "{}", message);
-				}
+				},
 			}
 
 			tokio::time::sleep(poll_interval).await;

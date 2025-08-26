@@ -234,7 +234,7 @@ fn validate_field_type(
 					actual: value.type_str().to_string(),
 				});
 			}
-		}
+		},
 		FieldType::Integer { min, max } => {
 			let int_val = value
 				.as_integer()
@@ -261,7 +261,7 @@ fn validate_field_type(
 					});
 				}
 			}
-		}
+		},
 		FieldType::Boolean => {
 			if !value.is_bool() {
 				return Err(ValidationError::TypeMismatch {
@@ -270,7 +270,7 @@ fn validate_field_type(
 					actual: value.type_str().to_string(),
 				});
 			}
-		}
+		},
 		FieldType::Array(inner_type) => {
 			let array = value
 				.as_array()
@@ -283,12 +283,12 @@ fn validate_field_type(
 			for (i, item) in array.iter().enumerate() {
 				validate_field_type(&format!("{}[{}]", field_name, i), item, inner_type)?;
 			}
-		}
+		},
 		FieldType::Table(schema) => {
 			schema.validate(value).map_err(|e| match e {
 				ValidationError::MissingField(f) => {
 					ValidationError::MissingField(format!("{}.{}", field_name, f))
-				}
+				},
 				ValidationError::InvalidValue { field, message } => ValidationError::InvalidValue {
 					field: format!("{}.{}", field_name, field),
 					message,
@@ -304,7 +304,7 @@ fn validate_field_type(
 				},
 				other => other,
 			})?;
-		}
+		},
 	}
 
 	Ok(())

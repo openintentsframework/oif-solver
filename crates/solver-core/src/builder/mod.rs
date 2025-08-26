@@ -76,6 +76,7 @@ impl SolverBuilder {
 		OF: Fn(
 			&toml::Value,
 			&solver_types::NetworksConfig,
+			&solver_types::oracle::OracleRoutes,
 		) -> Result<Box<dyn OrderInterface>, OrderError>,
 		SEF: Fn(
 			&toml::Value,
@@ -93,7 +94,7 @@ impl SolverBuilder {
 						storage_impls.insert(name.clone(), implementation);
 						let is_primary = &self.config.storage.primary == name;
 						tracing::info!(component = "storage", implementation = %name, enabled = %is_primary, "Loaded");
-					}
+					},
 					Err(e) => {
 						tracing::error!(
 							component = "storage",
@@ -105,7 +106,7 @@ impl SolverBuilder {
 							"Failed to create storage implementation '{}': {}",
 							name, e
 						)));
-					}
+					},
 				}
 			}
 		}
@@ -136,7 +137,7 @@ impl SolverBuilder {
 						account_impls.insert(name.clone(), implementation);
 						let is_primary = &self.config.account.primary == name;
 						tracing::info!(component = "account", implementation = %name, enabled = %is_primary, "Loaded");
-					}
+					},
 					Err(e) => {
 						tracing::error!(
 							component = "account",
@@ -148,7 +149,7 @@ impl SolverBuilder {
 							"Failed to create account implementation '{}': {}",
 							name, e
 						)));
-					}
+					},
 				}
 			}
 		}
@@ -190,7 +191,7 @@ impl SolverBuilder {
 					"Failed to get solver address: {}",
 					e
 				)));
-			}
+			},
 		};
 
 		// Create delivery implementations
@@ -253,7 +254,7 @@ impl SolverBuilder {
 								name
 							)));
 						}
-					}
+					},
 					Err(e) => {
 						tracing::error!(
 							component = "delivery",
@@ -265,7 +266,7 @@ impl SolverBuilder {
 							"Failed to create delivery implementation '{}': {}",
 							name, e
 						)));
-					}
+					},
 				}
 			}
 		}
@@ -288,7 +289,7 @@ impl SolverBuilder {
 						// Validation already happened in the factory
 						discovery_implementations.insert(name.clone(), implementation);
 						tracing::info!(component = "discovery", implementation = %name, "Loaded");
-					}
+					},
 					Err(e) => {
 						tracing::error!(
 							component = "discovery",
@@ -300,7 +301,7 @@ impl SolverBuilder {
 							"Failed to create discovery implementation '{}': {}",
 							name, e
 						)));
-					}
+					},
 				}
 			}
 		}
@@ -313,16 +314,55 @@ impl SolverBuilder {
 
 		let discovery = Arc::new(DiscoveryService::new(discovery_implementations));
 
-		// Create order implementations
+		// Create settlement implementations first (needed for oracle routes)
+		let mut settlement_impls = HashMap::new();
+		for (name, config) in &self.config.settlement.implementations {
+			if let Some(factory) = factories.settlement_factories.get(name) {
+				match factory(config, &self.config.networks) {
+					Ok(implementation) => {
+						// Validation already happened in the factory
+						settlement_impls.insert(name.clone(), implementation);
+						tracing::info!(component = "settlement", implementation = %name, "Loaded");
+					},
+					Err(e) => {
+						tracing::error!(
+							component = "settlement",
+							implementation = %name,
+							error = %e,
+							"Failed to create settlement implementation"
+						);
+						return Err(BuilderError::Config(format!(
+							"Failed to create settlement implementation '{}': {}",
+							name, e
+						)));
+					},
+				}
+			}
+		}
+
+		if settlement_impls.is_empty() {
+			tracing::warn!("No settlement implementations available - solver will not be able to monitor and claim settlements");
+		}
+
+		let settlement = Arc::new(SettlementService::new(settlement_impls));
+
+		// Build oracle routes from settlement implementations
+		let oracle_routes = settlement.build_oracle_routes();
+		tracing::info!(
+			oracle_routes = %oracle_routes.supported_routes.len(),
+			"Built oracle routes from settlement implementations"
+		);
+
+		// Create order implementations (now with oracle routes)
 		let mut order_impls = HashMap::new();
 		for (name, config) in &self.config.order.implementations {
 			if let Some(factory) = factories.order_factories.get(name) {
-				match factory(config, &self.config.networks) {
+				match factory(config, &self.config.networks, &oracle_routes) {
 					Ok(implementation) => {
 						// Validation already happened in the factory
 						order_impls.insert(name.clone(), implementation);
 						tracing::info!(component = "order", implementation = %name, "Loaded");
-					}
+					},
 					Err(e) => {
 						tracing::error!(
 							component = "order",
@@ -334,7 +374,7 @@ impl SolverBuilder {
 							"Failed to create order implementation '{}': {}",
 							name, e
 						)));
-					}
+					},
 				}
 			}
 		}
@@ -352,7 +392,7 @@ impl SolverBuilder {
 						strategy_impls.insert(name.clone(), implementation);
 						let is_primary = &self.config.order.strategy.primary == name;
 						tracing::info!(component = "strategy", implementation = %name, enabled = %is_primary, "Loaded");
-					}
+					},
 					Err(e) => {
 						tracing::error!(
 							component = "strategy",
@@ -364,7 +404,7 @@ impl SolverBuilder {
 							"Failed to create strategy implementation '{}': {}",
 							name, e
 						)));
-					}
+					},
 				}
 			}
 		}
@@ -386,38 +426,6 @@ impl SolverBuilder {
 
 		let order = Arc::new(OrderService::new(order_impls, strategy));
 
-		// Create settlement implementations
-		let mut settlement_impls = HashMap::new();
-		for (name, config) in &self.config.settlement.implementations {
-			if let Some(factory) = factories.settlement_factories.get(name) {
-				match factory(config, &self.config.networks) {
-					Ok(implementation) => {
-						// Validation already happened in the factory
-						settlement_impls.insert(name.clone(), implementation);
-						tracing::info!(component = "settlement", implementation = %name, "Loaded");
-					}
-					Err(e) => {
-						tracing::error!(
-							component = "settlement",
-							implementation = %name,
-							error = %e,
-							"Failed to create settlement implementation"
-						);
-						return Err(BuilderError::Config(format!(
-							"Failed to create settlement implementation '{}': {}",
-							name, e
-						)));
-					}
-				}
-			}
-		}
-
-		if settlement_impls.is_empty() {
-			tracing::warn!("No settlement implementations available - solver will not be able to monitor and claim settlements");
-		}
-
-		let settlement = Arc::new(SettlementService::new(settlement_impls));
-
 		// Create and initialize the TokenManager
 		let token_manager = Arc::new(crate::engine::token_manager::TokenManager::new(
 			self.config.networks.clone(),
@@ -433,7 +441,7 @@ impl SolverBuilder {
 					networks = self.config.networks.len(),
 					"Token manager initialized with approvals"
 				);
-			}
+			},
 			Err(e) => {
 				tracing::error!(
 					component = "token_manager",
@@ -444,7 +452,7 @@ impl SolverBuilder {
 					"Failed to ensure token approvals: {}",
 					e
 				)));
-			}
+			},
 		}
 
 		// Log initial balances for monitoring
@@ -464,13 +472,13 @@ impl SolverBuilder {
 						"Initial solver balance"
 					);
 				}
-			}
+			},
 			Err(e) => {
 				tracing::warn!(
 					error = %e,
 					"Failed to check initial balances"
 				);
-			}
+			},
 		}
 
 		Ok(SolverEngine::new(

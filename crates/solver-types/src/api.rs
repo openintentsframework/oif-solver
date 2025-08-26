@@ -297,13 +297,13 @@ impl fmt::Display for APIError {
 			APIError::BadRequest { message, .. } => write!(f, "Bad Request: {}", message),
 			APIError::UnprocessableEntity { message, .. } => {
 				write!(f, "Unprocessable Entity: {}", message)
-			}
+			},
 			APIError::ServiceUnavailable { message, .. } => {
 				write!(f, "Service Unavailable: {}", message)
-			}
+			},
 			APIError::InternalServerError { message, .. } => {
 				write!(f, "Internal Server Error: {}", message)
-			}
+			},
 		}
 	}
 }

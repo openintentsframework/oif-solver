@@ -45,8 +45,8 @@ INPUT_SETTLER_ADDRESS_DEST=$(grep -A 5 '\[networks.31338\]' $NETWORKS_CONFIG | g
 OUTPUT_SETTLER_ADDRESS=$(grep -A 5 '\[networks.31338\]' $NETWORKS_CONFIG | grep 'output_settler_address = ' | cut -d'"' -f2)
 
 # Get oracle address from settlement section in main config
-# Extract oracle address for origin chain (31337)
-ORACLE_ADDRESS=$(grep 'oracle_addresses = ' $MAIN_CONFIG | sed 's/.*31337 = "\([^"]*\)".*/\1/')
+# Extract oracle address for origin chain (31337) from the new format: input = { 31337 = ["0x..."] }
+ORACLE_ADDRESS=$(grep -A5 '\[settlement.implementations.direct.oracles\]' $MAIN_CONFIG | grep 'input = ' | sed 's/.*31337 = \["\([^"]*\)".*/\1/')
 
 # Parse token addresses from networks config
 # For origin chain tokens (31337)
@@ -455,13 +455,23 @@ else
     echo -e "${GREEN}✅ EIP-712 signature generated: $SIGNATURE${NC}"
 fi
 
+# Lock type constants - these correspond to the LockType enum in the solver
+LOCK_TYPE_PERMIT2_ESCROW=1      # Permit2-based escrow mechanism
+LOCK_TYPE_EIP3009_ESCROW=2      # EIP-3009 based escrow mechanism  
+LOCK_TYPE_RESOURCE_LOCK=3       # Resource lock mechanism (The Compact)
+
+# Set the lock type to use for this intent
+LOCK_TYPE=$LOCK_TYPE_PERMIT2_ESCROW
+
 # Create the final JSON payload with signature
 # The API expects the StandardOrder in bytes format along with the signature
 # The signature needs to be prefixed with 0x00 for SIGNATURE_TYPE_PERMIT2
+# lock_type values: 1=permit2-escrow, 2=eip3009-escrow, 3=resource-lock
 PREFIXED_SIGNATURE="0x00${SIGNATURE:2}"
 JSON_PAYLOAD=$(cat <<EOF
 {
   "order": "$ORDER_DATA",
+  "lock_type": "$LOCK_TYPE",
   "sponsor": "$USER_ADDR",
   "signature": "$PREFIXED_SIGNATURE"
 }

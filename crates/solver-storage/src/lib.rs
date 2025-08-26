@@ -320,7 +320,7 @@ impl StorageService {
 				Err(e) => {
 					tracing::warn!("Failed to deserialize item {}: {}", key, e);
 					// Continue with other items rather than failing entirely
-				}
+				},
 			}
 		}
 

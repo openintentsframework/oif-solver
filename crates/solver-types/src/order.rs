@@ -157,6 +157,7 @@ pub struct OrderResponse {
 
 /// Status of an order in the solver system.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub enum OrderStatus {
 	/// Order has been created but not yet prepared.
 	Created,

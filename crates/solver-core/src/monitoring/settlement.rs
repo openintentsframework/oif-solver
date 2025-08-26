@@ -50,7 +50,7 @@ impl SettlementMonitor {
 					"Failed to get attestation for fill transaction"
 				);
 				return;
-			}
+			},
 		};
 
 		// Store the fill proof

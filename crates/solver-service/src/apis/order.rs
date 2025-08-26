@@ -44,18 +44,18 @@ async fn process_order_request(
 		Ok(order) => {
 			// Order found in storage, convert to OrderResponse
 			convert_order_to_response(order).await
-		}
+		},
 		Err(solver_storage::StorageError::NotFound) => {
 			// Order not found in storage
 			Err(GetOrderError::NotFound(format!(
 				"Order not found: {}",
 				order_id
 			)))
-		}
+		},
 		Err(e) => {
 			// Other storage error
 			Err(GetOrderError::Internal(format!("Storage error: {}", e)))
-		}
+		},
 	}
 }
 
@@ -82,7 +82,7 @@ async fn convert_order_to_response(order: Order) -> Result<OrderResponse, GetOrd
 				"Unsupported order standard: {}",
 				order.standard
 			)))
-		}
+		},
 	}
 }
 
@@ -203,7 +203,7 @@ async fn convert_eip7683_order_to_response(
 					"Unexpected fill_tx_hash in pre-execution state"
 				);
 				"pending"
-			}
+			},
 			// Fill transaction failed
 			OrderStatus::Failed(TransactionType::Fill) => "failed",
 			// Prepare failed - shouldn't have fill_tx_hash
@@ -213,7 +213,7 @@ async fn convert_eip7683_order_to_response(
 					"Unexpected fill_tx_hash when prepare transaction failed"
 				);
 				"failed"
-			}
+			},
 			// Fill succeeded but claim failed
 			OrderStatus::Failed(TransactionType::Claim) => "executed",
 		};
@@ -241,4 +241,259 @@ async fn convert_eip7683_order_to_response(
 	};
 
 	Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use alloy_primitives::{hex, U256};
+	use mockall::{mock, predicate::eq};
+	use serde_json::json;
+	use solver_account::{implementations::local::LocalWallet, AccountService};
+	use solver_config::{Config, ConfigBuilder};
+	use solver_core::{engine::token_manager::TokenManager, EventBus, SolverEngine};
+	use solver_delivery::DeliveryService;
+	use solver_discovery::DiscoveryService;
+	use solver_order::{implementations::strategies::simple::create_strategy, OrderService};
+	use solver_settlement::SettlementService;
+	use solver_storage::{StorageError, StorageInterface};
+	use solver_types::{order::Order, validation::ConfigSchema, OrderStatus, TransactionHash};
+	use std::{collections::HashMap, sync::Arc, time::Duration};
+	use toml::Value;
+
+	mock! {
+		pub Backend {}
+
+		#[async_trait::async_trait]
+		impl StorageInterface for Backend {
+			async fn get_bytes(&self, key: &str) -> Result<Vec<u8>, StorageError>;
+			async fn set_bytes(&self, key: &str, value: Vec<u8>, indexes: Option<solver_storage::StorageIndexes>, ttl: Option<Duration>) -> Result<(), StorageError>;
+			async fn delete(&self, key: &str) -> Result<(), StorageError>;
+			async fn exists(&self, key: &str) -> Result<bool, StorageError>;
+			async fn query(&self, namespace: &str, filter: solver_storage::QueryFilter) -> Result<Vec<String>, StorageError>;
+			async fn get_batch(&self, keys: &[String]) -> Result<Vec<(String, Vec<u8>)>, StorageError>;
+			fn config_schema(&self) -> Box<dyn ConfigSchema>;
+			async fn cleanup_expired(&self) -> Result<usize, StorageError>;
+		}
+	}
+
+	const TEST_PK: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+	const TEST_ADDR: &str = "0x1234567890123456789012345678901234567890";
+
+	fn test_cfg() -> Config {
+		ConfigBuilder::new().build()
+	}
+
+	fn addr() -> solver_types::Address {
+		let bytes = alloy_primitives::hex::decode(TEST_ADDR.trim_start_matches("0x")).unwrap();
+		solver_types::Address(bytes)
+	}
+
+	fn test_account() -> Arc<AccountService> {
+		Arc::new(AccountService::new(Box::new(
+			LocalWallet::new(TEST_PK).unwrap(),
+		)))
+	}
+
+	async fn create_test_solver_engine(storage_mock: MockBackend) -> SolverEngine {
+		let cfg = test_cfg();
+		let storage = Arc::new(solver_storage::StorageService::new(Box::new(storage_mock)));
+		let account = test_account();
+		let providers: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> = HashMap::new();
+		let delivery = Arc::new(DeliveryService::new(providers, 1));
+		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
+		let strategy = create_strategy(&Value::Table(toml::map::Map::new())).unwrap();
+		let order = Arc::new(OrderService::new(HashMap::new(), strategy));
+		let settlement = Arc::new(SettlementService::new(HashMap::new()));
+		let event_bus = EventBus::new(64);
+		let networks: solver_types::NetworksConfig = HashMap::new();
+		let token_manager = Arc::new(TokenManager::new(
+			networks,
+			delivery.clone(),
+			account.clone(),
+		));
+		let solver_address = addr();
+
+		SolverEngine::new(
+			cfg,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			event_bus,
+			token_manager,
+		)
+	}
+
+	fn create_test_eip7683_order(id: &str, status: OrderStatus) -> Order {
+		Order {
+			id: id.into(),
+			standard: "eip7683".into(),
+			created_at: 1640995200,
+			updated_at: 1640995200,
+			status,
+			data: json!({
+				"inputs": [[TEST_ADDR, "1000000000000000000"]],
+				"outputs": [{ "token": [18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52], "amount": "2000000000000000000" }],
+				"raw_order_data": {"some":"data"},
+				"signature": "0xsignature",
+				"nonce": "42",
+				"expires": "1640995800"
+			}),
+			solver_address: addr(),
+			quote_id: Some("quote-test".into()),
+			input_chain_ids: vec![1],
+			output_chain_ids: vec![2],
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: Some(TransactionHash(hex::decode(TEST_ADDR).unwrap())),
+			claim_tx_hash: None,
+			fill_proof: None,
+		}
+	}
+
+	#[tokio::test]
+	async fn test_get_order_by_id_success() {
+		let mut backend = MockBackend::new();
+		let order = create_test_eip7683_order("order-test", OrderStatus::Executed);
+
+		let bytes = serde_json::to_vec(&order).unwrap();
+
+		backend
+			.expect_get_bytes()
+			.with(eq("orders:order-test"))
+			.returning(move |_| Ok(bytes.clone()));
+
+		let solver = create_test_solver_engine(backend).await;
+
+		// Test the endpoint
+		let result = get_order_by_id(Path("order-test".to_string()), &solver).await;
+
+		assert!(result.is_ok());
+		let response = result.unwrap();
+		assert_eq!(response.order.id, "order-test");
+		assert_eq!(response.order.status, OrderStatus::Executed);
+		assert_eq!(response.order.quote_id, Some("quote-test".to_string()));
+	}
+
+	#[tokio::test]
+	async fn test_process_order_request_success() {
+		let mut backend = MockBackend::new();
+		let order = create_test_eip7683_order("order-proc", OrderStatus::Executed);
+		let bytes = serde_json::to_vec(&order).unwrap();
+
+		backend
+			.expect_get_bytes()
+			.with(eq("orders:order-proc"))
+			.returning(move |_| Ok(bytes.clone()));
+
+		let solver = create_test_solver_engine(backend).await;
+
+		let res = process_order_request("order-proc", &solver).await;
+		assert!(res.is_ok());
+		let resp = res.unwrap();
+		assert_eq!(resp.id, "order-proc");
+		assert_eq!(resp.status, OrderStatus::Executed);
+	}
+
+	#[tokio::test]
+	async fn test_process_order_request_not_found() {
+		let mut backend = MockBackend::new();
+		backend
+			.expect_get_bytes()
+			.with(eq("orders:missing"))
+			.returning(|_| Err(StorageError::NotFound));
+
+		let solver = create_test_solver_engine(backend).await;
+
+		let res = process_order_request("missing", &solver).await;
+		match res {
+			Err(GetOrderError::NotFound(msg)) => assert!(msg.contains("missing")),
+			other => panic!("expected NotFound, got {:?}", other),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_eip7683_ok() {
+		let order = create_test_eip7683_order("order-ok", OrderStatus::Executed);
+		let resp = convert_order_to_response(order).await.expect("ok");
+
+		assert_eq!(resp.id, "order-ok");
+		assert_eq!(resp.status, OrderStatus::Executed);
+		assert_eq!(resp.quote_id, Some("quote-test".to_string()));
+
+		// input
+		assert_eq!(
+			resp.input_amount.asset,
+			"0x1234567890123456789012345678901234567890"
+		);
+		assert_eq!(
+			resp.input_amount.amount,
+			"1000000000000000000".parse::<U256>().unwrap()
+		);
+
+		// output
+		assert!(resp.output_amount.asset.starts_with("0x"));
+		assert_eq!(
+			resp.output_amount.amount,
+			"2000000000000000000".parse::<U256>().unwrap()
+		);
+
+		// settlement
+		assert!(matches!(
+			resp.settlement.settlement_type,
+			SettlementType::Escrow
+		));
+
+		// fill tx
+		let fill_tx = resp.fill_transaction.expect("has fill tx");
+		assert_eq!(
+			fill_tx.get("status").and_then(|v| v.as_str()),
+			Some("executed")
+		);
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_unsupported_standard() {
+		let mut order = create_test_eip7683_order("order-unsupported", OrderStatus::Executed);
+		order.standard = "unsupported".to_string();
+
+		let err = convert_order_to_response(order).await.expect_err("err");
+		match err {
+			GetOrderError::Internal(msg) => assert!(msg.contains("Unsupported order standard")),
+			_ => panic!("expected Internal"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_missing_inputs() {
+		let mut order = create_test_eip7683_order("order-missing-inputs", OrderStatus::Executed);
+		order.data = json!({
+			"outputs": [{
+				"token": [18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52],
+				"amount": "2000000000000000000"
+			}]
+		});
+
+		let err = convert_order_to_response(order).await.expect_err("err");
+		match err {
+			GetOrderError::Internal(msg) => assert!(msg.contains("Missing inputs field")),
+			_ => panic!("expected Internal"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_pre_execution_pending_fill_status() {
+		let order = create_test_eip7683_order("order-pending", OrderStatus::Created);
+		// Keep a fill_tx_hash
+		let resp = convert_order_to_response(order).await.expect("ok");
+		let fill_tx = resp.fill_transaction.expect("has fill tx");
+		assert_eq!(
+			fill_tx.get("status").and_then(|v| v.as_str()),
+			Some("pending")
+		);
+	}
 }

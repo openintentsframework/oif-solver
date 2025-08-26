@@ -203,18 +203,20 @@ id = "test-solver"
 monitoring_timeout_minutes = 5
 
 [networks.1]
-rpc_url = "http://localhost:8545"
 input_settler_address = "0x1234567890123456789012345678901234567890"
 output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.1.rpc_urls]]
+http = "http://localhost:8545"
 [[networks.1.tokens]]
 address = "0xabcdef1234567890abcdef1234567890abcdef12"
 symbol = "TEST"
 decimals = 18
 
 [networks.2]
-rpc_url = "http://localhost:8546"
 input_settler_address = "0x1234567890123456789012345678901234567890"
 output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.2.rpc_urls]]
+http = "http://localhost:8546"
 [[networks.2.tokens]]
 address = "0xabcdef1234567890abcdef1234567890abcdef12"
 symbol = "TEST"
@@ -271,18 +273,20 @@ monitoring_timeout_minutes = 5
 		// Networks config
 		let networks_config = r#"
 [networks.1]
-rpc_url = "http://localhost:8545"
 input_settler_address = "0x1234567890123456789012345678901234567890"
 output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.1.rpc_urls]]
+http = "http://localhost:8545"
 [[networks.1.tokens]]
 address = "0xabcdef1234567890abcdef1234567890abcdef12"
 symbol = "TEST"
 decimals = 18
 
 [networks.2]
-rpc_url = "http://localhost:8546"
 input_settler_address = "0x1234567890123456789012345678901234567890"
 output_settler_address = "0x0987654321098765432109876543210987654321"
+[[networks.2.rpc_urls]]
+http = "http://localhost:8546"
 [[networks.2.tokens]]
 address = "0xabcdef1234567890abcdef1234567890abcdef12"
 symbol = "TEST"

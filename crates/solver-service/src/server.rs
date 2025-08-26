@@ -8,7 +8,7 @@ use axum::{
 	http::StatusCode,
 	response::{IntoResponse, Json},
 	routing::{get, post},
-	Router,
+	Router, ServiceExt,
 };
 use serde_json::Value;
 use solver_config::{ApiConfig, Config};
@@ -18,6 +18,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
+use tower_http::normalize_path::NormalizePath;
 
 /// Shared application state for the API server.
 #[derive(Clone)]
@@ -94,7 +95,11 @@ pub async fn start_server(
 
 	tracing::info!("OIF Solver API server starting on {}", bind_address);
 
-	axum::serve(listener, app).await?;
+	// Wrap the entire app with NormalizePath to handle trailing slashes
+	let app = NormalizePath::trim_trailing_slash(app);
+	let service = ServiceExt::<axum::http::Request<axum::body::Body>>::into_make_service(app);
+
+	axum::serve(listener, service).await?;
 
 	Ok(())
 }
@@ -112,7 +117,7 @@ async fn handle_quote(
 		Err(e) => {
 			tracing::warn!("Quote request failed: {}", e);
 			Err(APIError::from(e))
-		}
+		},
 	}
 }
 
@@ -129,7 +134,7 @@ async fn handle_get_order_by_id(
 		Err(e) => {
 			tracing::warn!("Order retrieval failed: {}", e);
 			Err(APIError::from(e))
-		}
+		},
 	}
 }
 
@@ -173,7 +178,7 @@ async fn handle_order(
 				})),
 			)
 				.into_response();
-		}
+		},
 	};
 
 	tracing::debug!("Forwarding order submission to: {}", forward_url);
@@ -195,19 +200,19 @@ async fn handle_order(
 					let axum_status = StatusCode::from_u16(status.as_u16())
 						.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 					(axum_status, Json(body)).into_response()
-				}
+				},
 				Err(e) => {
 					tracing::warn!("Failed to parse response from discovery API: {}", e);
 					(
 						StatusCode::BAD_GATEWAY,
 						Json(serde_json::json!({
-							"error": "Invalid response from discovery service"
+							"error": "Failed to read response from discovery service"
 						})),
 					)
 						.into_response()
-				}
+				},
 			}
-		}
+		},
 		Err(e) => {
 			tracing::warn!("Failed to forward request to discovery API: {}", e);
 			(
@@ -217,6 +222,6 @@ async fn handle_order(
 				})),
 			)
 				.into_response()
-		}
+		},
 	}
 }

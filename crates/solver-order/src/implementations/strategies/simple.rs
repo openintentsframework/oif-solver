@@ -133,7 +133,7 @@ impl ExecutionStrategy for SimpleStrategy {
 						"Failed to parse EIP-7683 order data"
 					);
 				}
-			}
+			},
 			_ => {
 				// For unknown standards, skip balance checks
 				tracing::debug!(
@@ -141,7 +141,7 @@ impl ExecutionStrategy for SimpleStrategy {
 					standard = %order.standard,
 					"Skipping balance check for unknown order standard"
 				);
-			}
+			},
 		}
 
 		// Use the maximum gas price for execution (could be made more sophisticated)
