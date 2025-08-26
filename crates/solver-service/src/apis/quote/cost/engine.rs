@@ -2,9 +2,12 @@ use alloy_primitives::U256;
 use solver_config::Config;
 use solver_core::SolverEngine;
 use solver_types::{
+	costs::{CostComponent, QuoteCost},
+	Quote, QuoteError, QuoteOrder, SignatureType,
+};
+use solver_types::{
 	Address, ExecutionParams, FillProof, Order, OrderStatus, Transaction, TransactionHash,
 };
-use solver_types::{costs::{CostComponent, QuoteCost}, Quote, QuoteError, QuoteOrder, SignatureType};
 
 #[derive(Debug, Clone)]
 struct PricingConfig {

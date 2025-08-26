@@ -56,4 +56,3 @@ pub use utils::{
 	truncate_id, with_0x_prefix, without_0x_prefix,
 };
 pub use validation::*;
-

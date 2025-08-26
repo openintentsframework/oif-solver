@@ -446,7 +446,7 @@ impl SolverEngine {
 		&self.discovery
 	}
 
-		/// Returns a reference to the delivery service.
+	/// Returns a reference to the delivery service.
 	pub fn delivery(&self) -> &Arc<DeliveryService> {
 		&self.delivery
 	}
