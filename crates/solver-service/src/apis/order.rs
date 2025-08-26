@@ -129,12 +129,13 @@ async fn convert_eip7683_order_to_response(
 		.map_err(|e| GetOrderError::Internal(format!("Invalid input amount: {}", e)))?;
 
 	// Convert input token to interop address using first input chain ID
-	let input_chain_id = order.input_chain_ids.first().cloned().ok_or_else(|| {
-		GetOrderError::Internal("No input chain IDs found in order".to_string())
-	})?;
+	let input_chain_id =
+		order.input_chain_ids.first().cloned().ok_or_else(|| {
+			GetOrderError::Internal("No input chain IDs found in order".to_string())
+		})?;
 	let input_address_bytes = hex::decode(input_token.trim_start_matches("0x"))
 		.map_err(|e| GetOrderError::Internal(format!("Invalid input token hex: {}", e)))?;
-	
+
 	// Handle different address lengths - extract last 20 bytes for Ethereum address
 	let eth_address_bytes = if input_address_bytes.len() >= 20 {
 		// Take the last 20 bytes (similar to bytes32_to_address logic)
@@ -145,7 +146,7 @@ async fn convert_eip7683_order_to_response(
 			input_address_bytes.len()
 		)));
 	};
-	
+
 	let input_alloy_address = alloy_primitives::Address::from_slice(eth_address_bytes);
 	let input_interop_address = InteropAddress::new_ethereum(input_chain_id, input_alloy_address);
 
@@ -196,12 +197,13 @@ async fn convert_eip7683_order_to_response(
 		.map_err(|e| GetOrderError::Internal(format!("Invalid output amount: {}", e)))?;
 
 	// Convert output token to interop address using first output chain ID
-	let output_chain_id = order.output_chain_ids.first().cloned().ok_or_else(|| {
-		GetOrderError::Internal("No output chain IDs found in order".to_string())
-	})?;
+	let output_chain_id =
+		order.output_chain_ids.first().cloned().ok_or_else(|| {
+			GetOrderError::Internal("No output chain IDs found in order".to_string())
+		})?;
 	let output_address_bytes = hex::decode(&output_token_hex)
 		.map_err(|e| GetOrderError::Internal(format!("Invalid output token hex: {}", e)))?;
-	
+
 	// Handle different address lengths - extract last 20 bytes for Ethereum address
 	let eth_output_address_bytes = if output_address_bytes.len() >= 20 {
 		// Take the last 20 bytes (consistent with input address handling)
@@ -212,7 +214,7 @@ async fn convert_eip7683_order_to_response(
 			output_address_bytes.len()
 		)));
 	};
-	
+
 	let output_alloy_address = alloy_primitives::Address::from_slice(eth_output_address_bytes);
 	let output_interop_address =
 		InteropAddress::new_ethereum(output_chain_id, output_alloy_address);
