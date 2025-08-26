@@ -25,7 +25,7 @@ use solver_config::Config;
 use solver_settlement::SettlementInterface;
 use solver_types::utils::{
 	bytes20_to_alloy_address, DOMAIN_TYPE, MANDATE_OUTPUT_TYPE, NAME_PERMIT2, PERMIT2_WITNESS_TYPE,
-	PERMIT_BATCH_WITNESS_TYPE, TOKEN_PERMISSIONS_TYPE,
+	PERMIT_BATCH_WITNESS_TYPE, TOKEN_PERMISSIONS_TYPE, ZERO_BYTES32,
 };
 use solver_types::{
 	utils::{compute_final_digest, Eip712AbiEncoder},
@@ -127,11 +127,11 @@ pub fn build_permit2_batch_witness_digest(
 	let mut enc = Eip712AbiEncoder::new();
 	enc.push_b256(&mandate_output_type_hash);
 	enc.push_b256(&B256::ZERO);
-	enc.push_address32(&output_settler);
+	enc.push_address(&output_settler);
 	enc.push_u256(U256::from(dest_chain_id));
-	enc.push_address32(&dest_token);
+	enc.push_address(&dest_token);
 	enc.push_u256(amount);
-	enc.push_address32(&recipient);
+	enc.push_address(&recipient);
 	enc.push_b256(&empty_bytes_hash);
 	enc.push_b256(&empty_bytes_hash);
 	let mandate_output_hash = keccak256(enc.finish());
@@ -198,7 +198,7 @@ pub fn build_permit2_batch_witness_digest(
 			"expires": expires_u32,
 			"inputOracle": format!("0x{:x}", input_oracle),
 			"outputs": [{
-				"oracle": format!("0x{:064x}", 0),
+				"oracle": ZERO_BYTES32,
 				"settler": format!("0x{}{:x}", "0".repeat(24), output_settler),
 				"chainId": dest_chain_id,
 				"token": format!("0x{}{:x}", "0".repeat(24), dest_token),
