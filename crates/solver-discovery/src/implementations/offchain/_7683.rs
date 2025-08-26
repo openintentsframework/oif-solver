@@ -594,12 +594,12 @@ impl Eip7683OffchainDiscovery {
 				let addr = network
 					.input_settler_compact_address
 					.clone()
-					.unwrap_or_else(|| {
-						panic!(
-							"No input settler compact address found for chain ID {}",
-							origin_chain_id
-						);
-					});
+					.ok_or_else(|| {
+                        DiscoveryError::ValidationError(format!(
+                            "No input settler compact address found for chain ID {}",
+                            origin_chain_id
+                        ))
+                    })?;
 				Address::from_slice(&addr.0)
 			},
 			LockType::Permit2Escrow | LockType::Eip3009Escrow => {
