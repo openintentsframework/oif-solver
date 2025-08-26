@@ -65,12 +65,6 @@ impl Eip712AbiEncoder {
 		self.buf.extend_from_slice(&word);
 	}
 
-	pub fn push_address32(&mut self, addr: &AlloyAddress) {
-		let mut word = [0u8; 32];
-		word[12..].copy_from_slice(addr.as_slice());
-		self.buf.extend_from_slice(&word);
-	}
-
 	pub fn push_u256(&mut self, v: U256) {
 		let word: [u8; 32] = v.to_be_bytes::<32>();
 		self.buf.extend_from_slice(&word);

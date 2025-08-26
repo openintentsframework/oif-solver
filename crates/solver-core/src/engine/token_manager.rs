@@ -121,8 +121,8 @@ impl TokenManager {
 					.get_allowance(
 						*chain_id,
 						&solver_address_str,
-						&hex::encode(&network.input_settler_address.0),
-						&hex::encode(&token.address.0),
+						&with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
+						&with_0x_prefix(&hex::encode(&token.address.0)),
 					)
 					.await?;
 
@@ -147,8 +147,8 @@ impl TokenManager {
 					.get_allowance(
 						*chain_id,
 						&solver_address_str,
-						&hex::encode(&network.output_settler_address.0),
-						&hex::encode(&token.address.0),
+						&with_0x_prefix(&hex::encode(&network.output_settler_address.0)),
+						&with_0x_prefix(&hex::encode(&token.address.0)),
 					)
 					.await?;
 
