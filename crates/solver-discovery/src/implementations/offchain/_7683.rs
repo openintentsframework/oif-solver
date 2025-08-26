@@ -525,7 +525,10 @@ impl Eip7683OffchainDiscovery {
 					.input_settler_compact_address
 					.clone()
 					.unwrap_or_else(|| {
-						panic!("No input settler compact address found for chain ID {}", origin_chain_id);
+						panic!(
+							"No input settler compact address found for chain ID {}",
+							origin_chain_id
+						);
 					});
 				Address::from_slice(&addr.0)
 			},
@@ -833,7 +836,6 @@ async fn handle_intent_submission(
 	{
 		Ok(intent) => {
 			let order_id = intent.id.clone();
-			let intent_data = intent.data.clone();
 
 			// Send intent through channel
 			if let Err(e) = state.intent_sender.send(intent) {
