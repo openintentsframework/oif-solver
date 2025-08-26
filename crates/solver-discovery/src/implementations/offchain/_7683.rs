@@ -59,7 +59,7 @@ use hex;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use solver_types::{
-	current_timestamp, normalize_bytes32_address,
+	bytes32_to_address, current_timestamp, normalize_bytes32_address,
 	standards::eip7683::{GasLimitOverrides, LockType, MandateOutput},
 	with_0x_prefix, ConfigSchema, Eip7683OrderData, Field, FieldType, ImplementationRegistry,
 	Intent, IntentMetadata, NetworksConfig, Schema,
@@ -139,18 +139,72 @@ struct ApiStandardOrder {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiMandateOutput {
-	#[serde(deserialize_with = "deserialize_bytes32")]
+	#[serde(
+		deserialize_with = "deserialize_bytes32",
+		serialize_with = "serialize_bytes32"
+	)]
 	oracle: [u8; 32],
-	#[serde(deserialize_with = "deserialize_bytes32")]
+	#[serde(
+		deserialize_with = "deserialize_bytes32",
+		serialize_with = "serialize_bytes32"
+	)]
 	settler: [u8; 32],
 	chain_id: U256,
-	#[serde(deserialize_with = "deserialize_bytes32")]
+	#[serde(
+		deserialize_with = "deserialize_bytes32",
+		serialize_with = "serialize_bytes32"
+	)]
 	token: [u8; 32],
 	amount: U256,
-	#[serde(deserialize_with = "deserialize_bytes32")]
+	#[serde(
+		deserialize_with = "deserialize_bytes32",
+		serialize_with = "serialize_bytes32"
+	)]
 	recipient: [u8; 32],
 	call: Bytes,
 	context: Bytes,
+}
+
+/// Custom serializer for bytes32 to hex strings
+/// Converts to address format (20 bytes) when it's an address, otherwise full bytes32
+fn serialize_bytes32<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+where
+	S: serde::Serializer,
+{
+	// Use the bytes32_to_address helper which extracts last 20 bytes
+	// and returns them as a hex string without 0x prefix
+	let address = bytes32_to_address(bytes);
+	serializer.serialize_str(&with_0x_prefix(&address))
+}
+
+impl From<&SolMandateOutput> for ApiMandateOutput {
+	fn from(output: &SolMandateOutput) -> Self {
+		Self {
+			oracle: output.oracle.0,
+			settler: output.settler.0,
+			chain_id: output.chainId,
+			token: output.token.0,
+			amount: output.amount,
+			recipient: output.recipient.0,
+			call: output.call.clone(),
+			context: output.context.clone(),
+		}
+	}
+}
+
+impl From<&StandardOrder> for ApiStandardOrder {
+	fn from(order: &StandardOrder) -> Self {
+		Self {
+			user: order.user,
+			nonce: order.nonce,
+			origin_chain_id: order.originChainId,
+			expires: order.expires,
+			fill_deadline: order.fillDeadline,
+			input_oracle: order.inputOracle,
+			inputs: order.inputs.clone(),
+			outputs: order.outputs.iter().map(ApiMandateOutput::from).collect(),
+		}
+	}
 }
 
 /// Custom deserializer for bytes32 that accepts hex strings.
@@ -251,22 +305,37 @@ fn default_lock_type() -> LockType {
 	LockType::Permit2Escrow
 }
 
+/// Status enum for intent submission responses.
+///
+/// Distinguishes between successful receipt and validation failures at the discovery stage.
+/// Note: Full validation (oracle routes, etc.) happens asynchronously after receipt.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum IntentResponseStatus {
+	/// Intent received and passed basic validation, queued for full validation
+	Received,
+	/// Intent rejected due to validation failure
+	Rejected,
+	/// Intent processing encountered an error
+	Error,
+}
+
 /// API response for intent submission.
 ///
 /// Returned by the POST /intent endpoint to indicate submission status.
 ///
 /// # Fields
 ///
-/// * `order_id` - The assigned order identifier if accepted (optional)
-/// * `status` - Human/machine readable status string
+/// * `order_id` - The assigned order identifier if received (optional)
+/// * `status` - Status enum indicating if intent was received or rejected
 /// * `message` - Optional message for additional details on status
-/// * `order` - The submitted EIP-712 typed data order (optional)
+/// * `order` - The submitted EIP-712 typed data order (parsed StandardOrder as JSON)
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct IntentResponse {
 	#[serde(rename = "orderId")]
 	order_id: Option<String>,
-	status: String,
+	status: IntentResponseStatus,
 	message: Option<String>,
 	order: Option<serde_json::Value>,
 }
@@ -468,19 +537,22 @@ impl Eip7683OffchainDiscovery {
 		Ok(())
 	}
 
-	/// Converts GaslessCrossChainOrder to Intent.
+	/// Converts StandardOrder to Intent.
 	///
-	/// Transforms an API order into the internal Intent format used by
+	/// Transforms a parsed StandardOrder into the internal Intent format used by
 	/// the solver system. This includes:
 	/// - Computing the order ID via the settler contract
-	/// - Parsing order data to extract inputs/outputs
+	/// - Extracting inputs/outputs from the parsed order
 	/// - Creating metadata for the intent
 	///
 	/// # Arguments
 	///
-	/// * `order` - The API order to convert
-	/// * `provider` - RPC provider for calling contracts
-	/// * `signature` - Optional order signature
+	/// * `order` - The parsed StandardOrder to convert
+	/// * `order_bytes` - The raw encoded order bytes (needed for order ID computation)
+	/// * `sponsor` - The address sponsoring the order
+	/// * `signature` - The Permit2Witness signature
+	/// * `lock_type` - The custody mechanism type (Permit2Escrow, Eip3009Escrow, or ResourceLock)
+	/// * `providers` - RPC providers for each supported network
 	/// * `networks` - Networks configuration for settler lookups
 	///
 	/// # Returns
@@ -491,9 +563,10 @@ impl Eip7683OffchainDiscovery {
 	///
 	/// Returns an error if:
 	/// - Order ID computation fails
-	/// - Order data parsing fails
 	/// - No outputs are present in the order
+	/// - Network configuration is missing for the origin chain
 	async fn order_to_intent(
+		order: &StandardOrder,
 		order_bytes: &Bytes,
 		sponsor: &Address,
 		signature: &Bytes,
@@ -501,9 +574,6 @@ impl Eip7683OffchainDiscovery {
 		providers: &HashMap<u64, RootProvider<Http<reqwest::Client>>>,
 		networks: &NetworksConfig,
 	) -> Result<Intent, DiscoveryError> {
-		// Parse the StandardOrder
-		let order = Self::parse_standard_order(order_bytes)?;
-
 		// Get the input settler address for the order's origin chain
 		let origin_chain_id = order.originChainId.to::<u64>();
 		let network = networks.get(&origin_chain_id).ok_or_else(|| {
@@ -791,15 +861,21 @@ async fn handle_intent_submission(
 				StatusCode::BAD_REQUEST,
 				Json(IntentResponse {
 					order_id: None,
-					status: "error".to_string(),
+					status: IntentResponseStatus::Rejected,
 					message: Some(format!("Failed to parse order: {}", e)),
-					order: Some(serde_json::Value::String(format!(
-						"0x{}",
-						hex::encode(&request.order)
-					))),
+					order: None,
 				}),
 			)
 				.into_response();
+		},
+	};
+
+	// Serialize the parsed order once for all responses
+	let order_json = match serde_json::to_value(ApiStandardOrder::from(&order)) {
+		Ok(json) => Some(json),
+		Err(e) => {
+			tracing::warn!(error = %e, "Failed to serialize order");
+			None
 		},
 	};
 
@@ -812,12 +888,9 @@ async fn handle_intent_submission(
 			StatusCode::BAD_REQUEST,
 			Json(IntentResponse {
 				order_id: None,
-				status: "error".to_string(),
+				status: IntentResponseStatus::Rejected,
 				message: Some(e.to_string()),
-				order: Some(serde_json::Value::String(format!(
-					"0x{}",
-					hex::encode(&request.order)
-				))),
+				order: order_json.clone(),
 			}),
 		)
 			.into_response();
@@ -825,6 +898,7 @@ async fn handle_intent_submission(
 
 	// Convert to intent
 	match Eip7683OffchainDiscovery::order_to_intent(
+		&order,
 		&request.order,
 		&request.sponsor,
 		&request.signature,
@@ -844,28 +918,24 @@ async fn handle_intent_submission(
 					StatusCode::INTERNAL_SERVER_ERROR,
 					Json(IntentResponse {
 						order_id: Some(order_id),
-						status: "error".to_string(),
+						status: IntentResponseStatus::Error,
 						message: Some(format!("Failed to process intent: {}", e)),
-						order: Some(serde_json::Value::String(format!(
-							"0x{}",
-							hex::encode(&request.order)
-						))),
+						order: order_json.clone(),
 					}),
 				)
 					.into_response();
 			}
 
-			tracing::info!(%order_id, "Intent accepted and forwarded to solver");
+			tracing::info!(%order_id, "Intent received and queued for full validation");
 			(
 				StatusCode::OK,
 				Json(IntentResponse {
 					order_id: Some(order_id),
-					status: "success".to_string(),
-					message: None,
-					order: Some(serde_json::Value::String(format!(
-						"0x{}",
-						hex::encode(&request.order)
-					))),
+					status: IntentResponseStatus::Received,
+					message: Some(
+						"Basic validation passed, pending oracle route validation".to_string(),
+					),
+					order: order_json,
 				}),
 			)
 				.into_response()
@@ -876,12 +946,9 @@ async fn handle_intent_submission(
 				StatusCode::BAD_REQUEST,
 				Json(IntentResponse {
 					order_id: None,
-					status: "error".to_string(),
+					status: IntentResponseStatus::Rejected,
 					message: Some(e.to_string()),
-					order: Some(serde_json::Value::String(format!(
-						"0x{}",
-						hex::encode(&request.order)
-					))),
+					order: order_json,
 				}),
 			)
 				.into_response()
