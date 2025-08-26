@@ -108,11 +108,11 @@ pub fn build_permit2_batch_witness_digest(
 	let mut enc = Eip712AbiEncoder::new();
 	enc.push_b256(&mandate_output_type_hash);
 	enc.push_b256(&B256::ZERO);
-	enc.push_address32(&output_settler);
+	enc.push_address(&output_settler);
 	enc.push_u256(U256::from(dest_chain_id));
-	enc.push_address32(&dest_token);
+	enc.push_address(&dest_token);
 	enc.push_u256(amount);
-	enc.push_address32(&recipient);
+	enc.push_address(&recipient);
 	enc.push_b256(&empty_bytes_hash);
 	enc.push_b256(&empty_bytes_hash);
 	let mandate_output_hash = keccak256(enc.finish());
@@ -244,7 +244,6 @@ pub fn resolve_permit2_address(config: &Config, chain_id: u64) -> Result<AlloyAd
 	addr_bytes.copy_from_slice(&solver_address.0);
 	Ok(AlloyAddress::from(addr_bytes))
 }
-
 fn bytes20_to_address(bytes: &[u8]) -> Result<AlloyAddress, QuoteError> {
 	if bytes.len() != 20 {
 		return Err(QuoteError::InvalidRequest(format!(

@@ -200,8 +200,6 @@ impl QuoteGenerator {
 		settlement: &dyn SettlementInterface,
 		selected_oracle: solver_types::Address,
 	) -> Result<QuoteOrder, QuoteError> {
-		use crate::apis::quote::eip712;
-
 		// Origin chain (Permit2 domain)
 		use alloy_primitives::hex;
 

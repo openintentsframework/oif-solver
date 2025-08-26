@@ -26,6 +26,7 @@ impl PricingConfig {
 			.implementations
 			.get(strategy_name)
 			.unwrap_or(&default_table);
+		tracing::info!("Pricing config: {:?}", table);
 		Self {
 			currency: table
 				.get("pricing_currency")
@@ -75,11 +76,11 @@ impl CostEngine {
 
 		// Try live estimate for fill on destination chain
 		if pricing.enable_live_gas_estimate {
+			tracing::info!("Estimating fill gas on destination chain");
 			if let Ok(tx) = self
 				.build_fill_tx_for_estimation(quote, dest_chain_id, solver)
 				.await
 			{
-				tracing::info!("Estimating fill gas on destination chain");
 				match solver
 					.delivery()
 					.estimate_gas(dest_chain_id, tx.clone())
@@ -88,7 +89,7 @@ impl CostEngine {
 					Ok(g) => {
 						tracing::info!("Fill gas units: {}", g);
 						fill_units = g;
-					}
+					},
 					Err(e) => {
 						tracing::warn!(
 							error = %e,
@@ -96,8 +97,10 @@ impl CostEngine {
 							to = %tx.to.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "<none>".into()),
 							"estimate_gas(fill) failed; using heuristic"
 						);
-					}
+					},
 				}
+			} else {
+				tracing::warn!("Failed to build fill transaction for estimation");
 			}
 		}
 
@@ -124,7 +127,7 @@ impl CostEngine {
 					Ok(g) => {
 						tracing::info!("Claim gas units: {}", g);
 						claim_units = g;
-					}
+					},
 					Err(e) => {
 						tracing::warn!(
 							error = %e,
@@ -132,7 +135,7 @@ impl CostEngine {
 							to = %tx.to.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "<none>".into()),
 							"estimate_gas(finalise) failed; using heuristic"
 						);
-					}
+					},
 				}
 			}
 		}
@@ -229,11 +232,11 @@ impl CostEngine {
 				SignatureType::Eip712 => {
 					open = open.max(100_000);
 					fill = fill.saturating_add(30_000);
-				}
+				},
 				SignatureType::Erc3009 => {
 					open = open.max(90_000);
 					fill = fill.saturating_add(20_000);
-				}
+				},
 			}
 			if order.primary_type.contains("Lock") || order.primary_type.contains("Compact") {
 				fill = fill.saturating_add(25_000);
