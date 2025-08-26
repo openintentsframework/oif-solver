@@ -4,11 +4,13 @@
 //! order retrieval functionality for cross-chain intents. Users can query the
 //! status and details of their submitted orders using the order ID.
 
+use alloy_primitives::hex;
 use axum::extract::Path;
 use solver_core::SolverEngine;
 use solver_types::{
-	bytes32_to_address, with_0x_prefix, AssetAmount, GetOrderError, GetOrderResponse, Order,
-	OrderResponse, OrderStatus, Settlement, SettlementType, TransactionType,
+	bytes32_to_address, standards::eip7930::InteropAddress, with_0x_prefix, AssetAmount,
+	GetOrderError, GetOrderResponse, Order, OrderResponse, OrderStatus, Settlement, SettlementType,
+	TransactionType,
 };
 use tracing::info;
 
@@ -126,8 +128,29 @@ async fn convert_eip7683_order_to_response(
 		.parse::<alloy_primitives::U256>()
 		.map_err(|e| GetOrderError::Internal(format!("Invalid input amount: {}", e)))?;
 
+	// Convert input token to interop address using first input chain ID
+	let input_chain_id = order.input_chain_ids.first().cloned().ok_or_else(|| {
+		GetOrderError::Internal("No input chain IDs found in order".to_string())
+	})?;
+	let input_address_bytes = hex::decode(input_token.trim_start_matches("0x"))
+		.map_err(|e| GetOrderError::Internal(format!("Invalid input token hex: {}", e)))?;
+	
+	// Handle different address lengths - extract last 20 bytes for Ethereum address
+	let eth_address_bytes = if input_address_bytes.len() >= 20 {
+		// Take the last 20 bytes (similar to bytes32_to_address logic)
+		&input_address_bytes[input_address_bytes.len() - 20..]
+	} else {
+		return Err(GetOrderError::Internal(format!(
+			"Invalid input token address length: expected at least 20 bytes, got {}",
+			input_address_bytes.len()
+		)));
+	};
+	
+	let input_alloy_address = alloy_primitives::Address::from_slice(eth_address_bytes);
+	let input_interop_address = InteropAddress::new_ethereum(input_chain_id, input_alloy_address);
+
 	let input_amount = AssetAmount {
-		asset: input_token.to_string(),
+		asset: input_interop_address.to_hex(),
 		amount: input_amount_u256,
 	};
 
@@ -159,7 +182,7 @@ async fn convert_eip7683_order_to_response(
 	for (i, byte_val) in token_array.iter().take(32).enumerate() {
 		token_bytes32[i] = byte_val.as_u64().unwrap_or(0) as u8;
 	}
-	let output_token = with_0x_prefix(&bytes32_to_address(&token_bytes32));
+	let output_token_hex = bytes32_to_address(&token_bytes32);
 
 	let output_amount_str = first_output
 		.get("amount")
@@ -172,8 +195,30 @@ async fn convert_eip7683_order_to_response(
 		.parse::<alloy_primitives::U256>()
 		.map_err(|e| GetOrderError::Internal(format!("Invalid output amount: {}", e)))?;
 
+	// Convert output token to interop address using first output chain ID
+	let output_chain_id = order.output_chain_ids.first().cloned().ok_or_else(|| {
+		GetOrderError::Internal("No output chain IDs found in order".to_string())
+	})?;
+	let output_address_bytes = hex::decode(&output_token_hex)
+		.map_err(|e| GetOrderError::Internal(format!("Invalid output token hex: {}", e)))?;
+	
+	// Handle different address lengths - extract last 20 bytes for Ethereum address
+	let eth_output_address_bytes = if output_address_bytes.len() >= 20 {
+		// Take the last 20 bytes (consistent with input address handling)
+		&output_address_bytes[output_address_bytes.len() - 20..]
+	} else {
+		return Err(GetOrderError::Internal(format!(
+			"Invalid output token address length: expected at least 20 bytes, got {}",
+			output_address_bytes.len()
+		)));
+	};
+	
+	let output_alloy_address = alloy_primitives::Address::from_slice(eth_output_address_bytes);
+	let output_interop_address =
+		InteropAddress::new_ethereum(output_chain_id, output_alloy_address);
+
 	let output_amount = AssetAmount {
-		asset: output_token,
+		asset: output_interop_address.to_hex(),
 		amount: output_amount_u256,
 	};
 
@@ -425,18 +470,25 @@ mod tests {
 		assert_eq!(resp.status, OrderStatus::Executed);
 		assert_eq!(resp.quote_id, Some("quote-test".to_string()));
 
-		// input
-		assert_eq!(
-			resp.input_amount.asset,
-			"0x1234567890123456789012345678901234567890"
-		);
+		// input - should be interop address for chain 1
+		// Create expected interop address for TEST_ADDR on chain 1
+		let input_addr = alloy_primitives::Address::from_slice(&hex::decode(TEST_ADDR).unwrap());
+		let expected_input_interop = InteropAddress::new_ethereum(1, input_addr);
+		assert_eq!(resp.input_amount.asset, expected_input_interop.to_hex());
 		assert_eq!(
 			resp.input_amount.amount,
 			"1000000000000000000".parse::<U256>().unwrap()
 		);
 
-		// output
+		// output - should be interop address for chain 2
+		// The output token bytes from the test data should create a valid interop address
 		assert!(resp.output_amount.asset.starts_with("0x"));
+		assert!(resp.output_amount.asset.len() > 42); // Interop addresses are longer than regular addresses
+
+		// Verify it's a valid interop address for chain 2
+		let parsed_interop =
+			InteropAddress::from_hex(&resp.output_amount.asset).expect("valid interop address");
+		assert_eq!(parsed_interop.ethereum_chain_id().unwrap(), 2);
 		assert_eq!(
 			resp.output_amount.amount,
 			"2000000000000000000".parse::<U256>().unwrap()
