@@ -69,6 +69,7 @@ primary = "simple"
 
 [order.strategy.implementations.simple]
 max_gas_price_gwei = 100
+enable_live_gas_estimate = true
 
 # ============================================================================
 # SETTLEMENT

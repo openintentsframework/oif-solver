@@ -446,6 +446,16 @@ impl SolverEngine {
 		&self.discovery
 	}
 
+		/// Returns a reference to the delivery service.
+	pub fn delivery(&self) -> &Arc<DeliveryService> {
+		&self.delivery
+	}
+
+	/// Returns a reference to the order service.
+	pub fn order(&self) -> &Arc<OrderService> {
+		&self.order
+	}
+
 	/// Helper method to spawn handler tasks with semaphore-based concurrency control.
 	///
 	/// This method:

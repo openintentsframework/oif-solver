@@ -33,6 +33,9 @@ pub mod utils;
 /// Configuration validation types for ensuring type-safe configurations.
 pub mod validation;
 
+// Cost types
+pub mod costs;
+
 // Re-export all types for convenient access
 pub use account::*;
 pub use api::*;
@@ -53,3 +56,4 @@ pub use utils::{
 	truncate_id, with_0x_prefix, without_0x_prefix,
 };
 pub use validation::*;
+
