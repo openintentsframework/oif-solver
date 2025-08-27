@@ -244,21 +244,21 @@ pub struct CorsConfig {
 /// Gas unit overrides for a specific flow.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GasFlowUnits {
-    /// Optional override for open/prepare step gas units
-    pub open: Option<u64>,
-    /// Optional override for fill step gas units
-    pub fill: Option<u64>,
-    /// Optional override for claim/finalize step gas units
-    #[serde(alias = "finalize")] // allow "finalize" as an alias in config
-    pub claim: Option<u64>,
+	/// Optional override for open/prepare step gas units
+	pub open: Option<u64>,
+	/// Optional override for fill step gas units
+	pub fill: Option<u64>,
+	/// Optional override for claim/finalize step gas units
+	#[serde(alias = "finalize")] // allow "finalize" as an alias in config
+	pub claim: Option<u64>,
 }
 
 /// Gas configuration mapping flow identifiers to gas unit overrides.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GasConfig {
-    /// Map of flow key -> GasFlowUnits
-    /// Example keys: "permit2_escrow", "compact_resource_lock"
-    pub flows: HashMap<String, GasFlowUnits>,
+	/// Map of flow key -> GasFlowUnits
+	/// Example keys: "permit2_escrow", "compact_resource_lock"
+	pub flows: HashMap<String, GasFlowUnits>,
 }
 
 /// Returns the default API host.
