@@ -1,6 +1,7 @@
 use alloy_primitives::U256;
 use solver_config::Config;
 use solver_core::SolverEngine;
+use solver_pricing::PricingService;
 use solver_types::{
 	costs::{CostComponent, QuoteCost},
 	Quote, QuoteError, QuoteOrder, SignatureType,
@@ -21,7 +22,7 @@ pub struct PricingConfig {
 impl PricingConfig {
 	pub fn default_values() -> Self {
 		Self {
-			currency: "USDC".to_string(),
+			currency: "USD".to_string(),
 			commission_bps: 20,
 			gas_buffer_bps: 1000,
 			rate_buffer_bps: 14,
@@ -56,20 +57,6 @@ impl PricingConfig {
 				.unwrap_or(defaults.enable_live_gas_estimate),
 		}
 	}
-
-	fn from_config(config: &Config) -> Self {
-		// Try to get the config table from the primary strategy implementation
-		let strategy_name = &config.order.strategy.primary;
-		let default_table = toml::Value::Table(toml::map::Map::new());
-		let table = config
-			.order
-			.strategy
-			.implementations
-			.get(strategy_name)
-			.unwrap_or(&default_table);
-		tracing::info!("Pricing config: {:?}", table);
-		Self::from_table(table)
-	}
 }
 
 pub struct CostEngine;
@@ -85,6 +72,7 @@ impl CostEngine {
 		solver: &SolverEngine,
 		config: &Config,
 		pricing: &PricingConfig,
+		pricing_service: &PricingService,
 	) -> Result<QuoteCost, QuoteError> {
 		let (origin_chain_id, dest_chain_id) = self.extract_origin_dest_chain_ids(quote)?;
 
@@ -185,12 +173,30 @@ impl CostEngine {
 		let fill_cost_wei_str = fill_cost_wei_uint.to_string();
 		let claim_cost_wei_str = claim_cost_wei_uint.to_string();
 
+		// Convert wei amounts to display currency
+		let open_cost_currency = pricing_service
+			.wei_to_currency(&open_cost_wei_str, &pricing.currency)
+			.await
+			.unwrap_or_else(|_| "0".to_string());
+		let fill_cost_currency = pricing_service
+			.wei_to_currency(&fill_cost_wei_str, &pricing.currency)
+			.await
+			.unwrap_or_else(|_| "0".to_string());
+		let claim_cost_currency = pricing_service
+			.wei_to_currency(&claim_cost_wei_str, &pricing.currency)
+			.await
+			.unwrap_or_else(|_| "0".to_string());
+
 		let gas_subtotal_w = add_many(&[
 			open_cost_wei_str.clone(),
 			fill_cost_wei_str.clone(),
 			claim_cost_wei_str.clone(),
 		]);
 		let buffer_gas = apply_bps(&gas_subtotal_w, pricing.gas_buffer_bps);
+		let buffer_gas_currency = pricing_service
+			.wei_to_currency(&buffer_gas, &pricing.currency)
+			.await
+			.unwrap_or_else(|_| "0".to_string());
 
 		let base_price = "0".to_string();
 		let buffer_rates = apply_bps(&base_price, pricing.rate_buffer_bps);
@@ -201,9 +207,23 @@ impl CostEngine {
 			buffer_gas.clone(),
 			buffer_rates.clone(),
 		]);
+		let subtotal_currency = pricing_service
+			.wei_to_currency(&subtotal, &pricing.currency)
+			.await
+			.unwrap_or_else(|_| "0".to_string());
+
 		let commission_amount = apply_bps(&subtotal, pricing.commission_bps);
+		let commission_amount_currency = pricing_service
+			.wei_to_currency(&commission_amount, &pricing.currency)
+			.await
+			.unwrap_or_else(|_| "0".to_string());
+
 		let total = add_decimals(&subtotal, &commission_amount);
-		// all values are in wei
+		let total_currency = pricing_service
+			.wei_to_currency(&total, &pricing.currency)
+			.await
+			.unwrap_or_else(|_| "0".to_string());
+
 		Ok(QuoteCost {
 			currency: pricing.currency.clone(),
 			components: vec![
@@ -214,22 +234,22 @@ impl CostEngine {
 				},
 				CostComponent {
 					name: "gas-open".into(),
-					amount: open_cost_wei_str.clone(),
+					amount: open_cost_currency,
 					amount_wei: Some(open_cost_wei_str),
 				},
 				CostComponent {
 					name: "gas-fill".into(),
-					amount: fill_cost_wei_str.clone(),
+					amount: fill_cost_currency,
 					amount_wei: Some(fill_cost_wei_str),
 				},
 				CostComponent {
 					name: "gas-claim".into(),
-					amount: claim_cost_wei_str.clone(),
+					amount: claim_cost_currency,
 					amount_wei: Some(claim_cost_wei_str),
 				},
 				CostComponent {
 					name: "buffer-gas".into(),
-					amount: buffer_gas.clone(),
+					amount: buffer_gas_currency,
 					amount_wei: Some(buffer_gas),
 				},
 				CostComponent {
@@ -239,9 +259,9 @@ impl CostEngine {
 				},
 			],
 			commission_bps: pricing.commission_bps,
-			commission_amount,
-			subtotal,
-			total,
+			commission_amount: commission_amount_currency,
+			subtotal: subtotal_currency,
+			total: total_currency,
 		})
 	}
 

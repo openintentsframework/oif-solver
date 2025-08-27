@@ -15,6 +15,7 @@ solver-core = { path = "../solver-core" }
 solver-delivery = { path = "../solver-delivery" }
 solver-discovery = { path = "../solver-discovery" }
 solver-order = { path = "../solver-order" }
+solver-pricing = { path = "../solver-pricing" }
 solver-settlement = { path = "../solver-settlement" }
 solver-storage = { path = "../solver-storage" }
 solver-types = { path = "../solver-types" }

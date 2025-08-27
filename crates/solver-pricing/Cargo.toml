@@ -1,0 +1,12 @@
+[package]
+name = "solver-pricing"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+solver-types = { path = "../solver-types" }
+async-trait = "0.1.73"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+toml = { workspace = true }
+alloy-primitives = "0.8.0"
