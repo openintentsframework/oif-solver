@@ -5,15 +5,15 @@
 //! transactions and coordinates with settlement monitoring.
 
 use crate::engine::event_bus::EventBus;
-use crate::monitoring::TransactionMonitor;
+use crate::monitoring::{SettlementMonitor, TransactionMonitor};
 use crate::state::OrderStateMachine;
 use alloy_primitives::hex;
 use solver_delivery::DeliveryService;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
 use solver_types::{
-	truncate_id, DeliveryEvent, Order, OrderEvent, OrderStatus, SolverEvent, StorageKey,
-	TransactionHash, TransactionReceipt, TransactionType,
+	truncate_id, DeliveryEvent, Order, OrderEvent, OrderStatus, SettlementEvent, SolverEvent,
+	StorageKey, TransactionHash, TransactionReceipt, TransactionType,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -117,6 +117,12 @@ impl TransactionHandler {
 			TransactionType::Fill => {
 				self.handle_fill_confirmed(tx_hash, receipt).await?;
 			},
+			TransactionType::PostFill => {
+				self.handle_post_fill_confirmed(tx_hash, receipt).await?;
+			},
+			TransactionType::PreClaim => {
+				self.handle_pre_claim_confirmed(tx_hash).await?;
+			},
 			TransactionType::Claim => {
 				self.handle_claim_confirmed(tx_hash, receipt).await?;
 			},
@@ -183,8 +189,59 @@ impl TransactionHandler {
 		Ok(())
 	}
 
+	/// Helper method to spawn settlement monitoring task
+	pub fn spawn_settlement_monitor(&self, order: Order, fill_tx_hash: TransactionHash) {
+		let monitor = SettlementMonitor::new(
+			self.settlement.clone(),
+			self.state_machine.clone(),
+			self.event_bus.clone(),
+			self.monitoring_timeout_minutes,
+		);
+
+		tokio::spawn(async move {
+			monitor.monitor_claim_readiness(order, fill_tx_hash).await;
+		});
+	}
+
 	/// Handles confirmed fill transactions.
 	async fn handle_fill_confirmed(
+		&self,
+		tx_hash: TransactionHash,
+		receipt: TransactionReceipt,
+	) -> Result<(), TransactionError> {
+		// Look up the order ID from the transaction hash
+		let order_id = self
+			.storage
+			.retrieve::<String>(StorageKey::OrderByTxHash.as_str(), &hex::encode(&tx_hash.0))
+			.await
+			.map_err(|e| TransactionError::Storage(e.to_string()))?;
+
+		// Retrieve the order
+		let order: Order = self
+			.storage
+			.retrieve(StorageKey::Orders.as_str(), &order_id)
+			.await
+			.map_err(|e| TransactionError::Storage(e.to_string()))?;
+
+		// Always emit PostFillReady with optional transaction
+		let post_fill_tx = self
+			.settlement
+			.generate_post_fill_transaction(&order, &tx_hash, &receipt)
+			.await
+			.map_err(|e| TransactionError::Service(e.to_string()))?;
+
+		self.event_bus
+			.publish(SolverEvent::Settlement(SettlementEvent::PostFillReady {
+				order_id,
+				transaction: post_fill_tx,
+			}))
+			.ok();
+
+		Ok(())
+	}
+
+	/// Handles confirmed post-fill transactions.
+	async fn handle_post_fill_confirmed(
 		&self,
 		tx_hash: TransactionHash,
 		_receipt: TransactionReceipt,
@@ -203,19 +260,46 @@ impl TransactionHandler {
 			.await
 			.map_err(|e| TransactionError::Storage(e.to_string()))?;
 
-		// Spawn monitoring for settlement
-		let settlement_monitor = crate::monitoring::SettlementMonitor::new(
-			self.settlement.clone(),
-			self.state_machine.clone(),
-			self.event_bus.clone(),
-			self.monitoring_timeout_minutes,
-		);
+		// Update status to PostFilled
+		self.state_machine
+			.transition_order_status(&order.id, OrderStatus::PostFilled)
+			.await
+			.map_err(|e| TransactionError::State(e.to_string()))?;
 
-		tokio::spawn(async move {
-			settlement_monitor
-				.monitor_claim_readiness(order, tx_hash)
-				.await;
-		});
+		// Spawn monitor for claim readiness
+		let fill_tx_hash = order
+			.fill_tx_hash
+			.clone()
+			.ok_or_else(|| TransactionError::Service("Missing fill tx hash".into()))?;
+		self.spawn_settlement_monitor(order, fill_tx_hash);
+
+		Ok(())
+	}
+
+	/// Handles confirmed pre-claim transactions.
+	async fn handle_pre_claim_confirmed(
+		&self,
+		tx_hash: TransactionHash,
+	) -> Result<(), TransactionError> {
+		// Look up the order ID from the transaction hash
+		let order_id = self
+			.storage
+			.retrieve::<String>(StorageKey::OrderByTxHash.as_str(), &hex::encode(&tx_hash.0))
+			.await
+			.map_err(|e| TransactionError::Storage(e.to_string()))?;
+
+		// Update status from Settled to PreClaimed
+		self.state_machine
+			.transition_order_status(&order_id, OrderStatus::PreClaimed)
+			.await
+			.map_err(|e| TransactionError::State(e.to_string()))?;
+
+		// PreClaim confirmed, emit ClaimReady
+		self.event_bus
+			.publish(SolverEvent::Settlement(SettlementEvent::ClaimReady {
+				order_id,
+			}))
+			.ok();
 
 		Ok(())
 	}

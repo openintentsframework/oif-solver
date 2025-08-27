@@ -6,7 +6,9 @@
 use crate::engine::event_bus::EventBus;
 use crate::state::OrderStateMachine;
 use solver_settlement::SettlementService;
-use solver_types::{truncate_id, Order, SettlementEvent, SolverEvent, TransactionHash};
+use solver_types::{
+	truncate_id, Order, OrderStatus, SettlementEvent, SolverEvent, TransactionHash,
+};
 use std::sync::Arc;
 
 /// Monitor for tracking settlement readiness of filled orders.
@@ -85,9 +87,32 @@ impl SettlementMonitor {
 
 			// Check if we can claim
 			if settlement.can_claim(&order, &fill_proof).await {
+				// Update status to Settled
+				self.state_machine
+					.transition_order_status(&order.id, OrderStatus::Settled)
+					.await
+					.ok();
+
+				// Always emit PreClaimReady with optional transaction
+				let pre_claim_tx = match settlement
+					.generate_pre_claim_transaction(&order, &fill_proof)
+					.await
+				{
+					Ok(tx) => tx,
+					Err(e) => {
+						tracing::error!(
+							order_id = %truncate_id(&order.id),
+							error = %e,
+							"Failed to generate pre-claim transaction, proceeding without it"
+						);
+						None
+					},
+				};
+
 				self.event_bus
-					.publish(SolverEvent::Settlement(SettlementEvent::ClaimReady {
+					.publish(SolverEvent::Settlement(SettlementEvent::PreClaimReady {
 						order_id: order.id,
+						transaction: pre_claim_tx,
 					}))
 					.ok();
 				break;

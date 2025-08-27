@@ -38,6 +38,8 @@ enum ReconcileResult {
 	NeedsExecution,
 	/// Prepare confirmed, needs fill transaction
 	NeedsFill,
+	/// Needs attestation monitoring
+	NeedsMonitoring,
 	/// Fill confirmed, needs claim
 	NeedsClaim {
 		fill_proof: Option<solver_types::FillProof>,
@@ -168,6 +170,10 @@ impl RecoveryService {
 				.expect("OrderStatus::Failed(Fill) serialization should not fail"),
 			serde_json::to_value(OrderStatus::Failed(TransactionType::Claim))
 				.expect("OrderStatus::Failed(Claim) serialization should not fail"),
+			serde_json::to_value(OrderStatus::Failed(TransactionType::PostFill))
+				.expect("OrderStatus::Failed(PostFill) serialization should not fail"),
+			serde_json::to_value(OrderStatus::Failed(TransactionType::PreClaim))
+				.expect("OrderStatus::Failed(PreClaim) serialization should not fail"),
 		];
 
 		// Query for all non-terminal orders
@@ -235,11 +241,25 @@ impl RecoveryService {
 		Ok(orphaned)
 	}
 
+	/// Helper method to spawn settlement monitoring task
+	fn spawn_settlement_monitor(&self, order: Order, fill_tx_hash: solver_types::TransactionHash) {
+		let monitor = SettlementMonitor::new(
+			self.settlement.clone(),
+			self.state_machine.clone(),
+			self.event_bus.clone(),
+			self.monitoring_timeout_minutes,
+		);
+
+		tokio::spawn(async move {
+			monitor.monitor_claim_readiness(order, fill_tx_hash).await;
+		});
+	}
+
 	/// Reconciles an order with blockchain state.
 	///
 	/// This method checks the actual status of transactions on the blockchain
 	/// to determine what action should be taken to resume processing the order.
-	/// It checks transactions in reverse order (claim -> fill -> prepare) to
+	/// It checks transactions in reverse order (claim -> pre-claim -> post-fill -> fill -> prepare) to
 	/// find the most advanced state.
 	///
 	/// # Arguments
@@ -284,6 +304,38 @@ impl RecoveryService {
 			}
 		}
 
+		// Check pre-claim transaction
+		if let Some(ref pre_claim_tx) = order.pre_claim_tx_hash {
+			// PreClaim happens on origin chain (same as claim)
+			let chain_id = *order
+				.input_chain_ids
+				.first()
+				.ok_or_else(|| RecoveryError::Storage("No input chains in order".into()))?;
+			match self.delivery.get_status(pre_claim_tx, chain_id).await {
+				Ok(true) => {
+					return Ok(ReconcileResult::NeedsClaim {
+						fill_proof: order.fill_proof.clone(),
+					})
+				},
+				Ok(false) => return Ok(ReconcileResult::Failed(TransactionType::PreClaim)),
+				Err(_) => return Ok(ReconcileResult::Failed(TransactionType::PreClaim)),
+			}
+		}
+
+		// Check post-fill transaction
+		if let Some(ref post_fill_tx) = order.post_fill_tx_hash {
+			// PostFill happens on destination chain (same as fill)
+			let chain_id = *order
+				.output_chain_ids
+				.first()
+				.ok_or_else(|| RecoveryError::Storage("No output chains in order".into()))?;
+			match self.delivery.get_status(post_fill_tx, chain_id).await {
+				Ok(true) => return Ok(ReconcileResult::NeedsMonitoring),
+				Ok(false) => return Ok(ReconcileResult::Failed(TransactionType::PostFill)),
+				Err(_) => return Ok(ReconcileResult::Failed(TransactionType::PostFill)),
+			}
+		}
+
 		// Check fill transaction
 		if let Some(ref fill_tx) = order.fill_tx_hash {
 			let chain_id = *order
@@ -293,10 +345,14 @@ impl RecoveryService {
 
 			match self.delivery.get_status(fill_tx, chain_id).await {
 				Ok(true) => {
-					// Transaction succeeded, fill confirmed
-					return Ok(ReconcileResult::NeedsClaim {
-						fill_proof: order.fill_proof.clone(),
-					});
+					// Check if we already have a post-fill transaction
+					// If not, we need monitoring (the settlement monitor will handle post-fill if needed)
+					if order.post_fill_tx_hash.is_none() {
+						return Ok(ReconcileResult::NeedsMonitoring);
+					} else {
+						// PostFill exists but not confirmed, needs monitoring
+						return Ok(ReconcileResult::NeedsMonitoring);
+					}
 				},
 				Ok(false) => {
 					// Transaction failed/reverted
@@ -391,6 +447,13 @@ impl RecoveryService {
 				}
 			},
 
+			ReconcileResult::NeedsMonitoring => {
+				// Spawn settlement monitor
+				if let Some(fill_tx_hash) = order.fill_tx_hash.clone() {
+					self.spawn_settlement_monitor(order.clone(), fill_tx_hash);
+				}
+			},
+
 			ReconcileResult::NeedsClaim { fill_proof } => {
 				// Fill confirmed, check if ready to claim
 				if let Some(proof) = fill_proof {
@@ -404,11 +467,15 @@ impl RecoveryService {
 							.ok();
 					} else {
 						// Not ready to claim yet, spawn monitor
-						self.spawn_settlement_monitor(order).await;
+						if let Some(fill_tx_hash) = order.fill_tx_hash.clone() {
+							self.spawn_settlement_monitor(order, fill_tx_hash);
+						}
 					}
 				} else {
 					// No proof yet, spawn monitor to get it
-					self.spawn_settlement_monitor(order).await;
+					if let Some(fill_tx_hash) = order.fill_tx_hash.clone() {
+						self.spawn_settlement_monitor(order, fill_tx_hash);
+					}
 				}
 			},
 
@@ -450,8 +517,10 @@ impl RecoveryService {
 								);
 							}
 						},
-						OrderStatus::Executed => {
-							// Need to go: Executed -> Settled -> Finalized
+						OrderStatus::Executed
+						| OrderStatus::PostFilled
+						| OrderStatus::PreClaimed => {
+							// Need to go through remaining states to Finalized
 							if let Err(e) = self
 								.transition_through_states(
 									&order.id,
@@ -520,32 +589,5 @@ impl RecoveryService {
 			}
 		}
 		Ok(())
-	}
-
-	/// Spawns a settlement monitor for an order with confirmed fill.
-	///
-	/// This method creates and spawns a monitoring task that will watch for
-	/// the order to become ready for claiming based on settlement conditions.
-	///
-	/// # Arguments
-	///
-	/// * `order` - The order with confirmed fill transaction to monitor
-	async fn spawn_settlement_monitor(&self, order: Order) {
-		if let Some(fill_tx) = order.fill_tx_hash.clone() {
-			tracing::info!("Spawning settlement monitor for order {}", order.id);
-
-			let settlement_monitor = SettlementMonitor::new(
-				self.settlement.clone(),
-				self.state_machine.clone(),
-				self.event_bus.clone(),
-				self.monitoring_timeout_minutes,
-			);
-
-			tokio::spawn(async move {
-				settlement_monitor
-					.monitor_claim_readiness(order, fill_tx)
-					.await;
-			});
-		}
 	}
 }

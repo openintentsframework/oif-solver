@@ -50,6 +50,12 @@ pub struct Order {
 	/// Transaction hash of the fill transaction.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub fill_tx_hash: Option<TransactionHash>,
+	/// Transaction hash of the post-fill transaction (if applicable).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub post_fill_tx_hash: Option<TransactionHash>,
+	/// Transaction hash of the pre-claim transaction (if applicable).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub pre_claim_tx_hash: Option<TransactionHash>,
 	/// Transaction hash of the claim transaction.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub claim_tx_hash: Option<TransactionHash>,
@@ -165,6 +171,10 @@ pub enum OrderStatus {
 	Pending,
 	/// Order has been executed.
 	Executed,
+	/// Post-fill transaction completed.
+	PostFilled,
+	/// Pre-claim transaction completed.
+	PreClaimed,
 	/// Order has been settled and is ready to be claimed.
 	Settled,
 	/// Order is finalized and complete (after claim confirmation).
@@ -179,6 +189,8 @@ impl fmt::Display for OrderStatus {
 			OrderStatus::Created => write!(f, "Created"),
 			OrderStatus::Pending => write!(f, "Pending"),
 			OrderStatus::Executed => write!(f, "Executed"),
+			OrderStatus::PostFilled => write!(f, "PostFilled"),
+			OrderStatus::PreClaimed => write!(f, "PreClaimed"),
 			OrderStatus::Settled => write!(f, "Settled"),
 			OrderStatus::Finalized => write!(f, "Finalized"),
 			OrderStatus::Failed(_) => write!(f, "Failed"),

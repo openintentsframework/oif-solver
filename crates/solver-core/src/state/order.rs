@@ -106,6 +106,8 @@ impl OrderStateMachine {
 			Created,
 			Pending,
 			Executed,
+			PostFilled,
+			PreClaimed,
 			Settled,
 			Finalized,
 			Failed,
@@ -125,11 +127,27 @@ impl OrderStateMachine {
 				);
 				m.insert(
 					OrderStatusKind::Executed,
+					HashSet::from([
+						OrderStatusKind::PostFilled,
+						OrderStatusKind::Settled,
+						OrderStatusKind::Failed,
+					]),
+				);
+				m.insert(
+					OrderStatusKind::PostFilled,
 					HashSet::from([OrderStatusKind::Settled, OrderStatusKind::Failed]),
 				);
 				m.insert(
-					OrderStatusKind::Settled,
+					OrderStatusKind::PreClaimed,
 					HashSet::from([OrderStatusKind::Finalized, OrderStatusKind::Failed]),
+				);
+				m.insert(
+					OrderStatusKind::Settled,
+					HashSet::from([
+						OrderStatusKind::PreClaimed,
+						OrderStatusKind::Finalized,
+						OrderStatusKind::Failed,
+					]),
 				);
 				m.insert(OrderStatusKind::Failed, HashSet::new()); // terminal
 				m.insert(OrderStatusKind::Finalized, HashSet::new()); // terminal
@@ -142,6 +160,8 @@ impl OrderStateMachine {
 				OrderStatus::Created => OrderStatusKind::Created,
 				OrderStatus::Pending => OrderStatusKind::Pending,
 				OrderStatus::Executed => OrderStatusKind::Executed,
+				OrderStatus::PostFilled => OrderStatusKind::PostFilled,
+				OrderStatus::PreClaimed => OrderStatusKind::PreClaimed,
 				OrderStatus::Settled => OrderStatusKind::Settled,
 				OrderStatus::Finalized => OrderStatusKind::Finalized,
 				OrderStatus::Failed(_) => OrderStatusKind::Failed,
@@ -184,6 +204,8 @@ impl OrderStateMachine {
 		self.update_order_with(order_id, |order| match tx_type {
 			TransactionType::Prepare => order.prepare_tx_hash = Some(tx_hash),
 			TransactionType::Fill => order.fill_tx_hash = Some(tx_hash),
+			TransactionType::PostFill => order.post_fill_tx_hash = Some(tx_hash),
+			TransactionType::PreClaim => order.pre_claim_tx_hash = Some(tx_hash),
 			TransactionType::Claim => order.claim_tx_hash = Some(tx_hash),
 		})
 		.await
