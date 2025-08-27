@@ -4,9 +4,7 @@
 //! communication between different components. Events flow through an event bus
 //! allowing services to react to state changes in other parts of the system.
 
-use crate::{
-	ExecutionParams, FillProof, Intent, Order, Transaction, TransactionHash, TransactionReceipt,
-};
+use crate::{ExecutionParams, FillProof, Intent, Order, TransactionHash, TransactionReceipt};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -96,15 +94,14 @@ pub enum SettlementEvent {
 	},
 	/// Fill proof has been generated and is ready.
 	ProofReady { order_id: String, proof: FillProof },
-	/// Emitted after Fill confirmation, may contain PostFill transaction.
-	PostFillReady {
+	/// Emitted after Fill confirmation to trigger post-fill processing.
+	PostFillReady { order_id: String },
+	/// Emitted when ready for pre-claim processing.
+	PreClaimReady { order_id: String },
+	/// Start monitoring for settlement readiness.
+	StartMonitoring {
 		order_id: String,
-		transaction: Option<Transaction>,
-	},
-	/// Emitted after attestation ready, may contain PreClaim transaction.
-	PreClaimReady {
-		order_id: String,
-		transaction: Option<Transaction>,
+		fill_tx_hash: TransactionHash,
 	},
 	/// Order is ready to be claimed.
 	ClaimReady { order_id: String },

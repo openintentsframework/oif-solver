@@ -235,6 +235,8 @@ async fn convert_eip7683_order_to_response(
 			| OrderStatus::PreClaimed
 			| OrderStatus::Settled
 			| OrderStatus::Finalized => "executed",
+			// Fill transaction is in progress
+			OrderStatus::Executing => "pending",
 			// These states shouldn't have a fill_tx_hash, but if they do, log warning
 			OrderStatus::Created | OrderStatus::Pending => {
 				tracing::warn!(
