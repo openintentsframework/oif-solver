@@ -7,6 +7,9 @@ pub struct CostComponent {
 	pub name: String,
 	/// Amount as a decimal string in the chosen currency units (e.g., USDC). String avoids precision loss across differing decimals.
 	pub amount: String,
+	/// Amount as a wei string. (if Apply)
+	#[serde(rename = "amountWei")]
+	pub amount_wei: Option<String>,
 }
 
 /// Cost breakdown attached to a quote.

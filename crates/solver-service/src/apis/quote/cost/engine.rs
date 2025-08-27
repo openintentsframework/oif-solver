@@ -162,11 +162,6 @@ impl CostEngine {
 			10,
 		)
 		.unwrap_or(U256::from(1_000_000_000u64));
-		tracing::info!("Origin gas price: {}", origin_gp);
-		tracing::info!("Dest gas price: {}", dest_gp);
-		tracing::info!("Open units: {}", open_units);
-		tracing::info!("Fill units: {}", fill_units);
-		tracing::info!("Claim units: {}", claim_units);
 		// Costs: open+claim on origin, fill on dest
 		let open_cost_wei_uint = origin_gp.saturating_mul(U256::from(open_units));
 		let fill_cost_wei_uint = dest_gp.saturating_mul(U256::from(fill_units));
@@ -200,27 +195,33 @@ impl CostEngine {
 			components: vec![
 				CostComponent {
 					name: "base-price".into(),
-					amount: base_price,
+					amount: base_price.clone(),
+					amount_wei: Some(base_price),
 				},
 				CostComponent {
 					name: "gas-open".into(),
-					amount: open_cost_wei_str,
+					amount: open_cost_wei_str.clone(),
+					amount_wei: Some(open_cost_wei_str),
 				},
 				CostComponent {
 					name: "gas-fill".into(),
-					amount: fill_cost_wei_str,
+					amount: fill_cost_wei_str.clone(),
+					amount_wei: Some(fill_cost_wei_str),
 				},
 				CostComponent {
 					name: "gas-claim".into(),
-					amount: claim_cost_wei_str,
+					amount: claim_cost_wei_str.clone(),
+					amount_wei: Some(claim_cost_wei_str),
 				},
 				CostComponent {
 					name: "buffer-gas".into(),
-					amount: buffer_gas,
+					amount: buffer_gas.clone(),
+					amount_wei: Some(buffer_gas),
 				},
 				CostComponent {
 					name: "buffer-rates".into(),
-					amount: buffer_rates,
+					amount: buffer_rates.clone(),
+					amount_wei: Some(buffer_rates),
 				},
 			],
 			commission_bps: pricing.commission_bps,
@@ -238,9 +239,6 @@ impl CostEngine {
 		// Detect flow type and try to get from config first
 		let flow_key = self.determine_flow_key(orders);
 
-		// Debug logging to see what we have
-		tracing::debug!("Flow key detected: {:?}", flow_key);
-		tracing::debug!("Gas config present: {}", config.gas.is_some());
 		if let Some(gcfg) = config.gas.as_ref() {
 			tracing::debug!(
 				"Available gas flows: {:?}",
@@ -253,30 +251,20 @@ impl CostEngine {
 			if let Some(units) = gcfg.flows.get(flow) {
 				// Use configured values directly when available
 				let open = units.open.unwrap_or(0);
-				let fill = units.fill.unwrap_or(0); // minimal fallback
-				let claim = units.claim.unwrap_or(0); // minimal fallback
-				tracing::info!(
-					"Using configured gas units for flow '{}': open={}, fill={}, claim={}",
-					flow,
-					open,
-					fill,
-					claim
-				);
+				let fill = units.fill.unwrap_or(0); 
+				let claim = units.claim.unwrap_or(0); 
 				return (open, fill, claim);
 			} else {
 				tracing::warn!("Flow '{}' not found in gas config flows", flow);
 			}
 		}
-
-		// Fallback to minimal defaults only when no config is available
-		// These should be replaced with real measurements via config
 		tracing::warn!(
 			"No gas config found for flow {:?}, using minimal fallbacks",
 			flow_key
 		);
 		let open = 0; // Compact flows have no open step
-		let fill = 120_000; // Conservative estimate - should be replaced with real data
-		let claim = 90_000; // Conservative estimate - should be replaced with real data
+		let fill = 0; // Conservative estimate - should be replaced with real data
+		let claim = 0; // Conservative estimate - should be replaced with real data
 
 		(open, fill, claim)
 	}
