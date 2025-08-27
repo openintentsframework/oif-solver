@@ -64,7 +64,10 @@ pub fn build_permit2_batch_witness_digest(
 		.ethereum_address()
 		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid recipient address: {}", e)))?;
 
-	let amount: U256 = input.amount;
+	let amount: U256 = input
+		.amount
+		.parse()
+		.map_err(|_| QuoteError::InvalidRequest("Invalid input amount format".to_string()))?;
 
 	// Spender = INPUT settler on origin chain
 	let origin_net = config.networks.get(&origin_chain_id).ok_or_else(|| {

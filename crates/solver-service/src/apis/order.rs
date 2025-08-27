@@ -7,9 +7,9 @@
 use axum::extract::Path;
 use solver_core::SolverEngine;
 use solver_types::{
-	bytes32_to_address, parse_address, with_0x_prefix, AssetAmount, GetOrderError,
-	GetOrderResponse, InteropAddress, Order, OrderResponse, OrderStatus, Settlement,
-	SettlementType, TransactionType,
+	bytes32_to_address, parse_address, with_0x_prefix, ApiOrderStatus, ApiSettlement, AssetAmount,
+	GetOrderError, GetOrderResponse, InteropAddress, Order, OrderStatus, SettlementType,
+	TransactionType,
 };
 use tracing::info;
 
@@ -23,16 +23,16 @@ pub async fn get_order_by_id(
 ) -> Result<GetOrderResponse, GetOrderError> {
 	info!("Retrieving order with ID: {}", id);
 
-	let order = process_order_request(&id, _solver).await?;
+	let response = process_order_request(&id, _solver).await?;
 
-	Ok(GetOrderResponse { order })
+	Ok(response)
 }
 
 /// Processes an order retrieval request.
 async fn process_order_request(
 	order_id: &str,
 	solver: &SolverEngine,
-) -> Result<OrderResponse, GetOrderError> {
+) -> Result<GetOrderResponse, GetOrderError> {
 	// Validate order ID format
 	validate_order_id(order_id)?;
 
@@ -73,7 +73,7 @@ fn validate_order_id(order_id: &str) -> Result<(), GetOrderError> {
 }
 
 /// Converts a storage Order to an API OrderResponse.
-async fn convert_order_to_response(order: Order) -> Result<OrderResponse, GetOrderError> {
+async fn convert_order_to_response(order: Order) -> Result<GetOrderResponse, GetOrderError> {
 	// Handle different order standards
 	match order.standard.as_str() {
 		"eip7683" => convert_eip7683_order_to_response(order).await,
@@ -101,10 +101,10 @@ fn create_interop_address_string(token: &str, chain_id: u64) -> Result<String, G
 	Ok(interop_address.to_hex())
 }
 
-/// Converts an EIP-7683 order to API OrderResponse format.
+/// Converts an EIP-7683 order to API GetOrderResponse format.
 async fn convert_eip7683_order_to_response(
 	order: solver_types::Order,
-) -> Result<OrderResponse, GetOrderError> {
+) -> Result<GetOrderResponse, GetOrderError> {
 	// Extract input amount from EIP-7683 "inputs" field
 	let inputs = order.data.get("inputs").ok_or_else(|| {
 		GetOrderError::Internal("Missing inputs field in EIP-7683 order data".to_string())
@@ -152,8 +152,9 @@ async fn convert_eip7683_order_to_response(
 	let input_interop_address = create_interop_address_string(input_token, input_chain_id)?;
 
 	let input_amount = AssetAmount {
-		asset: input_interop_address,
-		amount: input_amount_u256,
+		asset: InteropAddress::from_hex(&input_interop_address)
+			.map_err(|e| GetOrderError::Internal(format!("Invalid input address: {}", e)))?,
+		amount: input_amount_u256.to_string(),
 	};
 
 	// Extract output amount from EIP-7683 "outputs" field
@@ -209,8 +210,9 @@ async fn convert_eip7683_order_to_response(
 		create_interop_address_string(&output_token_address, output_chain_id)?;
 
 	let output_amount = AssetAmount {
-		asset: output_interop_address,
-		amount: output_amount_u256,
+		asset: InteropAddress::from_hex(&output_interop_address)
+			.map_err(|e| GetOrderError::Internal(format!("Invalid output address: {}", e)))?,
+		amount: output_amount_u256.to_string(),
 	};
 
 	// For EIP-7683, we can infer settlement type (default to Escrow for now)
@@ -261,15 +263,25 @@ async fn convert_eip7683_order_to_response(
 		})
 	});
 
-	let response = OrderResponse {
+	// Convert internal OrderStatus to API status
+	let api_status = match order.status {
+		OrderStatus::Created => ApiOrderStatus::Created,
+		OrderStatus::Pending => ApiOrderStatus::Pending,
+		OrderStatus::Executed => ApiOrderStatus::Executed,
+		OrderStatus::Settled => ApiOrderStatus::Settled,
+		OrderStatus::Finalized => ApiOrderStatus::Finalized,
+		OrderStatus::Failed(_) => ApiOrderStatus::Failed,
+	};
+
+	let response = GetOrderResponse {
 		id: order.id,
-		status: order.status,
+		status: api_status,
 		created_at: order.created_at,
 		updated_at: order.updated_at,
 		quote_id: order.quote_id,
 		input_amount,
 		output_amount,
-		settlement: Settlement {
+		settlement: ApiSettlement {
 			settlement_type,
 			data: settlement_data,
 		},
