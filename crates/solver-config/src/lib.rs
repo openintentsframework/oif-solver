@@ -71,6 +71,9 @@ pub struct Config {
 	pub settlement: SettlementConfig,
 	/// Configuration for the HTTP API server.
 	pub api: Option<ApiConfig>,
+	/// Optional gas configuration for precomputed/overridden gas units by flow.
+	#[serde(default)]
+	pub gas: Option<GasConfig>,
 }
 
 /// Domain configuration for EIP-712 signatures in quotes.
@@ -236,6 +239,26 @@ pub struct CorsConfig {
 	pub allowed_headers: Vec<String>,
 	/// Allowed methods for CORS.
 	pub allowed_methods: Vec<String>,
+}
+
+/// Gas unit overrides for a specific flow.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GasFlowUnits {
+    /// Optional override for open/prepare step gas units
+    pub open: Option<u64>,
+    /// Optional override for fill step gas units
+    pub fill: Option<u64>,
+    /// Optional override for claim/finalize step gas units
+    #[serde(alias = "finalize")] // allow "finalize" as an alias in config
+    pub claim: Option<u64>,
+}
+
+/// Gas configuration mapping flow identifiers to gas unit overrides.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GasConfig {
+    /// Map of flow key -> GasFlowUnits
+    /// Example keys: "permit2_escrow", "compact_resource_lock"
+    pub flows: HashMap<String, GasFlowUnits>,
 }
 
 /// Returns the default API host.

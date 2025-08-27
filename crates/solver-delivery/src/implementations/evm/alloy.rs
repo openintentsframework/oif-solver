@@ -315,6 +315,9 @@ impl DeliveryInterface for AlloyDelivery {
 		}
 	}
 
+	/// Gets the current gas price for the network.
+	///
+	/// Returns the recommended gas price in wei as a decimal string.
 	async fn get_gas_price(&self, chain_id: u64) -> Result<String, DeliveryError> {
 		let provider = self.get_provider(chain_id)?;
 

@@ -73,11 +73,10 @@ impl CostEngine {
 
 		let (origin_chain_id, dest_chain_id) = self.extract_origin_dest_chain_ids(quote)?;
 
-		// Base gas unit heuristics
+		// Get gas units from config (preferred) or fallback to minimal defaults
 		let (open_units, mut fill_units, mut claim_units) =
-			self.estimate_gas_units_for_orders(&quote.orders);
+			self.estimate_gas_units_for_orders(&quote.orders, config);
 
-		// Try live estimate for fill on destination chain
 		if pricing.enable_live_gas_estimate {
 			tracing::info!("Estimating fill gas on destination chain");
 			if let Ok(tx) = self
@@ -107,7 +106,6 @@ impl CostEngine {
 			}
 		}
 
-		// Try live estimate for claim (finalise) on origin chain
 		if pricing.enable_live_gas_estimate {
 			if let Ok(tx) = self
 				.build_claim_tx_for_estimation(quote, origin_chain_id, solver)
@@ -164,31 +162,39 @@ impl CostEngine {
 			10,
 		)
 		.unwrap_or(U256::from(1_000_000_000u64));
-
+		tracing::info!("Origin gas price: {}", origin_gp);
+		tracing::info!("Dest gas price: {}", dest_gp);
+		tracing::info!("Open units: {}", open_units);
+		tracing::info!("Fill units: {}", fill_units);
+		tracing::info!("Claim units: {}", claim_units);
 		// Costs: open+claim on origin, fill on dest
-		let open_cost_wei = origin_gp.saturating_mul(U256::from(open_units));
-		let fill_cost_wei = dest_gp.saturating_mul(U256::from(fill_units));
-		let claim_cost_wei = origin_gp.saturating_mul(U256::from(claim_units));
+		let open_cost_wei_uint = origin_gp.saturating_mul(U256::from(open_units));
+		let fill_cost_wei_uint = dest_gp.saturating_mul(U256::from(fill_units));
+		let claim_cost_wei_uint = origin_gp.saturating_mul(U256::from(claim_units));
 
-		let open_cost = open_cost_wei.to_string();
-		let fill_cost = fill_cost_wei.to_string();
-		let claim_cost = claim_cost_wei.to_string();
+		let open_cost_wei_str = open_cost_wei_uint.to_string();
+		let fill_cost_wei_str = fill_cost_wei_uint.to_string();
+		let claim_cost_wei_str = claim_cost_wei_uint.to_string();
 
-		let gas_subtotal = add_many(&[open_cost.clone(), fill_cost.clone(), claim_cost.clone()]);
-		let buffer_gas = apply_bps(&gas_subtotal, pricing.gas_buffer_bps);
+		let gas_subtotal_w = add_many(&[
+			open_cost_wei_str.clone(),
+			fill_cost_wei_str.clone(),
+			claim_cost_wei_str.clone(),
+		]);
+		let buffer_gas = apply_bps(&gas_subtotal_w, pricing.gas_buffer_bps);
 
 		let base_price = "0".to_string();
 		let buffer_rates = apply_bps(&base_price, pricing.rate_buffer_bps);
 
 		let subtotal = add_many(&[
 			base_price.clone(),
-			gas_subtotal.clone(),
+			gas_subtotal_w.clone(),
 			buffer_gas.clone(),
 			buffer_rates.clone(),
 		]);
 		let commission_amount = apply_bps(&subtotal, pricing.commission_bps);
 		let total = add_decimals(&subtotal, &commission_amount);
-
+		// all values are in wei
 		Ok(QuoteCost {
 			currency: pricing.currency,
 			components: vec![
@@ -198,15 +204,15 @@ impl CostEngine {
 				},
 				CostComponent {
 					name: "gas-open".into(),
-					amount: open_cost,
+					amount: open_cost_wei_str,
 				},
 				CostComponent {
 					name: "gas-fill".into(),
-					amount: fill_cost,
+					amount: fill_cost_wei_str,
 				},
 				CostComponent {
 					name: "gas-claim".into(),
-					amount: claim_cost,
+					amount: claim_cost_wei_str,
 				},
 				CostComponent {
 					name: "buffer-gas".into(),
@@ -224,29 +230,73 @@ impl CostEngine {
 		})
 	}
 
-	fn estimate_gas_units_for_orders(&self, orders: &[QuoteOrder]) -> (u64, u64, u64) {
-		// Heuristic baselines
-		let mut open: u64 = 0; // 0 unless escrow path
-		let mut fill: u64 = 120_000; // dest chain fill
-		let mut claim: u64 = 90_000; // origin chain finalise
-		for order in orders {
-			match order.signature_type {
-				// Escrow paths imply an origin-chain open step before fill
-				SignatureType::Eip712 => {
-					open = open.max(100_000);
-					fill = fill.saturating_add(30_000);
-				},
-				SignatureType::Erc3009 => {
-					open = open.max(90_000);
-					fill = fill.saturating_add(20_000);
-				},
-			}
-			if order.primary_type.contains("Lock") || order.primary_type.contains("Compact") {
-				fill = fill.saturating_add(25_000);
-				claim = claim.saturating_add(25_000);
+	fn estimate_gas_units_for_orders(
+		&self,
+		orders: &[QuoteOrder],
+		config: &Config,
+	) -> (u64, u64, u64) {
+		// Detect flow type and try to get from config first
+		let flow_key = self.determine_flow_key(orders);
+
+		// Debug logging to see what we have
+		tracing::debug!("Flow key detected: {:?}", flow_key);
+		tracing::debug!("Gas config present: {}", config.gas.is_some());
+		if let Some(gcfg) = config.gas.as_ref() {
+			tracing::debug!(
+				"Available gas flows: {:?}",
+				gcfg.flows.keys().collect::<Vec<_>>()
+			);
+		}
+
+		// Try to get configured values for the detected flow
+		if let (Some(flow), Some(gcfg)) = (flow_key.as_deref(), config.gas.as_ref()) {
+			if let Some(units) = gcfg.flows.get(flow) {
+				// Use configured values directly when available
+				let open = units.open.unwrap_or(0);
+				let fill = units.fill.unwrap_or(0); // minimal fallback
+				let claim = units.claim.unwrap_or(0); // minimal fallback
+				tracing::info!(
+					"Using configured gas units for flow '{}': open={}, fill={}, claim={}",
+					flow,
+					open,
+					fill,
+					claim
+				);
+				return (open, fill, claim);
+			} else {
+				tracing::warn!("Flow '{}' not found in gas config flows", flow);
 			}
 		}
+
+		// Fallback to minimal defaults only when no config is available
+		// These should be replaced with real measurements via config
+		tracing::warn!(
+			"No gas config found for flow {:?}, using minimal fallbacks",
+			flow_key
+		);
+		let open = 0; // Compact flows have no open step
+		let fill = 120_000; // Conservative estimate - should be replaced with real data
+		let claim = 90_000; // Conservative estimate - should be replaced with real data
+
 		(open, fill, claim)
+	}
+
+	/// Detect a coarse flow type for selecting config overrides
+	fn determine_flow_key(&self, orders: &[QuoteOrder]) -> Option<String> {
+		if orders
+			.iter()
+			.any(|o| o.primary_type.contains("Lock") || o.primary_type.contains("Compact"))
+		{
+			return Some("compact_resource_lock".to_string());
+		}
+		// Default to permit2-based escrow if using EIP-712 style signatures
+		if orders
+			.iter()
+			.any(|o| matches!(o.signature_type, SignatureType::Eip712))
+		{
+			return Some("permit2_escrow".to_string());
+		}
+		None
 	}
 
 	fn extract_origin_dest_chain_ids(&self, quote: &Quote) -> Result<(u64, u64), QuoteError> {
