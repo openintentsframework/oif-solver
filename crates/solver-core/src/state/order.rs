@@ -105,6 +105,7 @@ impl OrderStateMachine {
 		enum OrderStatusKind {
 			Created,
 			Pending,
+			Executing,
 			Executed,
 			PostFilled,
 			PreClaimed,
@@ -119,10 +120,18 @@ impl OrderStateMachine {
 				let mut m = HashMap::new();
 				m.insert(
 					OrderStatusKind::Created,
-					HashSet::from([OrderStatusKind::Pending, OrderStatusKind::Failed]),
+					HashSet::from([
+						OrderStatusKind::Pending,
+						OrderStatusKind::Executing,
+						OrderStatusKind::Failed,
+					]),
 				);
 				m.insert(
 					OrderStatusKind::Pending,
+					HashSet::from([OrderStatusKind::Executing, OrderStatusKind::Failed]),
+				);
+				m.insert(
+					OrderStatusKind::Executing,
 					HashSet::from([OrderStatusKind::Executed, OrderStatusKind::Failed]),
 				);
 				m.insert(
@@ -159,6 +168,7 @@ impl OrderStateMachine {
 			match status {
 				OrderStatus::Created => OrderStatusKind::Created,
 				OrderStatus::Pending => OrderStatusKind::Pending,
+				OrderStatus::Executing => OrderStatusKind::Executing,
 				OrderStatus::Executed => OrderStatusKind::Executed,
 				OrderStatus::PostFilled => OrderStatusKind::PostFilled,
 				OrderStatus::PreClaimed => OrderStatusKind::PreClaimed,
@@ -170,6 +180,7 @@ impl OrderStateMachine {
 
 		let from_kind = status_kind(from);
 		let to_kind = status_kind(to);
+
 		TRANSITIONS
 			.get(&from_kind)
 			.is_some_and(|set| set.contains(&to_kind))

@@ -1,7 +1,8 @@
 //! Settlement monitoring for filled orders.
 //!
-//! Monitors orders after fill confirmation to determine when they are ready
-//! for claiming, retrieving attestations and checking claim conditions.
+//! Monitors orders after fill confirmation (and optional post-fill transaction)
+//! to determine when they are ready for claiming, retrieving attestations and
+//! checking claim conditions before initiating the claim process.
 
 use crate::engine::event_bus::EventBus;
 use crate::state::OrderStateMachine;
@@ -93,26 +94,10 @@ impl SettlementMonitor {
 					.await
 					.ok();
 
-				// Always emit PreClaimReady with optional transaction
-				let pre_claim_tx = match settlement
-					.generate_pre_claim_transaction(&order, &fill_proof)
-					.await
-				{
-					Ok(tx) => tx,
-					Err(e) => {
-						tracing::error!(
-							order_id = %truncate_id(&order.id),
-							error = %e,
-							"Failed to generate pre-claim transaction, will proceed directly without the pre-claim transaction"
-						);
-						None
-					},
-				};
-
+				// Emit PreClaimReady event - handler will generate transaction if needed
 				self.event_bus
 					.publish(SolverEvent::Settlement(SettlementEvent::PreClaimReady {
 						order_id: order.id,
-						transaction: pre_claim_tx,
 					}))
 					.ok();
 				break;

@@ -113,11 +113,11 @@ impl OrderHandler {
 				.await
 				.map_err(|e| OrderError::State(e.to_string()))?;
 		} else {
-			// No preparation needed, set execution params and proceed
+			// No preparation needed (on-chain intent), go directly to Executing
 			self.state_machine
 				.update_order_with(&order.id, |o| {
 					o.execution_params = Some(params.clone());
-					o.status = OrderStatus::Pending;
+					o.status = OrderStatus::Executing;
 				})
 				.await
 				.map_err(|e| OrderError::State(e.to_string()))?;

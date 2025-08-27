@@ -1,8 +1,9 @@
 //! Settlement module for the OIF solver system.
 //!
-//! This module handles the validation of filled orders and manages the claiming
-//! process for solver rewards. It supports different settlement mechanisms
-//! for various order standards.
+//! This module handles the complete settlement lifecycle including validation of
+//! filled orders, optional post-fill and pre-claim transactions for oracle interactions,
+//! and the final claiming process for solver rewards. It supports different
+//! settlement mechanisms for various order standards.
 
 use async_trait::async_trait;
 use solver_types::{
@@ -196,7 +197,6 @@ pub trait SettlementInterface: Send + Sync {
 	async fn generate_post_fill_transaction(
 		&self,
 		_order: &Order,
-		_fill_tx_hash: &TransactionHash,
 		_fill_receipt: &TransactionReceipt,
 	) -> Result<Option<Transaction>, SettlementError> {
 		// Default: no post-fill transaction needed
@@ -431,12 +431,11 @@ impl SettlementService {
 	pub async fn generate_post_fill_transaction(
 		&self,
 		order: &Order,
-		fill_tx_hash: &TransactionHash,
 		fill_receipt: &TransactionReceipt,
 	) -> Result<Option<Transaction>, SettlementError> {
 		let implementation = self.find_settlement_for_order(order)?;
 		implementation
-			.generate_post_fill_transaction(order, fill_tx_hash, fill_receipt)
+			.generate_post_fill_transaction(order, fill_receipt)
 			.await
 	}
 

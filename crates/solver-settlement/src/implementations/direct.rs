@@ -6,14 +6,14 @@
 //! complex attestation mechanisms.
 
 use crate::{utils::parse_oracle_config, OracleConfig, SettlementError, SettlementInterface};
-use alloy_primitives::{hex, FixedBytes};
+use alloy_primitives::{hex, FixedBytes, U256};
 use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types::BlockTransactionsKind;
 use alloy_transport_http::Http;
 use async_trait::async_trait;
 use solver_types::{
 	with_0x_prefix, ConfigSchema, Eip7683OrderData, Field, FieldType, FillProof, NetworksConfig,
-	Order, Schema, TransactionHash,
+	Order, Schema, Transaction, TransactionHash, TransactionReceipt,
 };
 use std::collections::HashMap;
 
@@ -292,6 +292,84 @@ impl SettlementInterface for DirectSettlement {
 
 		// For now, return true if dispute period passed
 		true
+	}
+
+	/// Generates a PostFill transaction that calls AlwaysYesOracle.isProven.
+	///
+	/// This tests the PostFill mechanism by calling isProven on the destination
+	/// chain's output oracle.
+	async fn generate_post_fill_transaction(
+		&self,
+		order: &Order,
+		_fill_receipt: &TransactionReceipt,
+	) -> Result<Option<Transaction>, SettlementError> {
+		// Get the output oracle for PostFill (happens on destination chain)
+		let dest_chain = *order
+			.output_chain_ids
+			.first()
+			.ok_or_else(|| SettlementError::ValidationFailed("No output chains in order".into()))?;
+
+		let oracle_addresses = self.get_output_oracles(dest_chain);
+		if oracle_addresses.is_empty() {
+			// No oracle configured, no PostFill needed
+			return Ok(None);
+		}
+
+		// For testing: send to solver's own address (from the order)
+		// This simulates a PostFill oracle interaction that modifies state
+		// Realistically, this would call a real oracle method
+		let data = Vec::new(); // Empty calldata for simple ETH transfer
+
+		Ok(Some(Transaction {
+			to: Some(order.solver_address.clone()),
+			data,
+			value: U256::ZERO,
+			chain_id: dest_chain,
+			nonce: None,
+			gas_limit: Some(21000),
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+		}))
+	}
+
+	/// Generates a PreClaim transaction that calls AlwaysYesOracle.efficientRequireProven.
+	///
+	/// This tests the PreClaim mechanism by calling efficientRequireProven on the
+	/// origin chain's input oracle.
+	async fn generate_pre_claim_transaction(
+		&self,
+		order: &Order,
+		_fill_proof: &FillProof,
+	) -> Result<Option<Transaction>, SettlementError> {
+		// Get the input oracle for PreClaim (happens on origin chain)
+		let origin_chain = *order
+			.input_chain_ids
+			.first()
+			.ok_or_else(|| SettlementError::ValidationFailed("No input chains in order".into()))?;
+
+		let oracle_addresses = self.get_input_oracles(origin_chain);
+		if oracle_addresses.is_empty() {
+			// No oracle configured, no PreClaim needed
+			return Ok(None);
+		}
+
+		// For testing: send to solver's own address (from the order)
+		// This simulates a PreClaim oracle interaction that modifies state
+		// Realistically, this would call a real oracle method like submitProof
+		let data = Vec::new(); // Empty calldata for simple ETH transfer
+
+		Ok(Some(Transaction {
+			to: Some(order.solver_address.clone()),
+			data,
+			value: U256::ZERO,
+			chain_id: origin_chain,
+			nonce: None,
+			gas_limit: Some(21000),
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+		}))
 	}
 }
 

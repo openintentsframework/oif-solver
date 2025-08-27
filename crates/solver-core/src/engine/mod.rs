@@ -13,7 +13,6 @@ use self::token_manager::TokenManager;
 use crate::handlers::{IntentHandler, OrderHandler, SettlementHandler, TransactionHandler};
 use crate::recovery::RecoveryService;
 use crate::state::OrderStateMachine;
-use alloy_primitives::hex;
 use solver_account::AccountService;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
@@ -23,7 +22,6 @@ use solver_settlement::SettlementService;
 use solver_storage::StorageService;
 use solver_types::{
 	Address, DeliveryEvent, Intent, Order, OrderEvent, SettlementEvent, SolverEvent, StorageKey,
-	TransactionType,
 };
 use std::future::Future;
 use std::sync::Arc;
@@ -146,7 +144,6 @@ impl SolverEngine {
 
 		let transaction_handler = Arc::new(TransactionHandler::new(
 			delivery.clone(),
-			settlement.clone(),
 			storage.clone(),
 			state_machine.clone(),
 			event_bus.clone(),
@@ -160,6 +157,7 @@ impl SolverEngine {
 			storage.clone(),
 			state_machine.clone(),
 			event_bus.clone(),
+			config.solver.monitoring_timeout_minutes,
 		));
 
 		Self {
@@ -202,7 +200,6 @@ impl SolverEngine {
 			self.delivery.clone(),
 			self.settlement.clone(),
 			self.event_bus.clone(),
-			self.config.solver.monitoring_timeout_minutes,
 		);
 
 		// Perform recovery
@@ -370,116 +367,42 @@ impl SolverEngine {
 							.await;
 						}
 
-						// Handle PostFillReady - either submit transaction or start monitoring
-						SolverEvent::Settlement(SettlementEvent::PostFillReady { order_id, transaction }) => {
-							match transaction {
-								Some(post_fill_tx) => {
-									// Submit PostFill transaction
-									self.spawn_handler(&transaction_semaphore, move |engine| async move {
-										let tx_hash = engine.delivery
-											.deliver(post_fill_tx.clone())
-											.await
-											.map_err(|e| EngineError::Service(e.to_string()))?;
-
-										// Store tx hash
-										engine.state_machine
-											.set_transaction_hash(&order_id, tx_hash.clone(), TransactionType::PostFill)
-											.await
-											.map_err(|e| EngineError::Service(e.to_string()))?;
-
-										// Store reverse mapping
-										engine.storage
-											.store(
-												StorageKey::OrderByTxHash.as_str(),
-												&hex::encode(&tx_hash.0),
-												&order_id,
-												None,
-											)
-											.await
-											.map_err(|e| EngineError::Service(e.to_string()))?;
-
-										// Publish pending event
-										engine.event_bus.publish(SolverEvent::Delivery(DeliveryEvent::TransactionPending {
-											order_id,
-											tx_hash,
-											tx_type: TransactionType::PostFill,
-											tx_chain_id: post_fill_tx.chain_id,
-										})).ok();
-
-										Ok(())
-									})
-									.await;
-								},
-								None => {
-									// No PostFill needed, start monitoring immediately
-									self.spawn_handler(&general_semaphore, move |engine| async move {
-										// Retrieve order
-										let order: Order = engine.storage
-											.retrieve(StorageKey::Orders.as_str(), &order_id)
-											.await
-											.map_err(|e| EngineError::Service(e.to_string()))?;
-
-										let fill_tx_hash = order.fill_tx_hash
-											.clone()
-											.ok_or_else(|| EngineError::Service("Missing fill transaction hash: required for post-fill transaction processing and settlement monitoring".into()))?;
-
-										// Spawn monitor using helper from TransactionHandler
-										engine.transaction_handler.spawn_settlement_monitor(order, fill_tx_hash);
-
-										Ok(())
-									})
-									.await;
+						// Handle PostFillReady - use settlement handler
+						SolverEvent::Settlement(SettlementEvent::PostFillReady { order_id }) => {
+							self.spawn_handler(&transaction_semaphore, move |engine| async move {
+								if let Err(e) = engine.settlement_handler.handle_post_fill_ready(order_id).await {
+									return Err(EngineError::Service(format!("Failed to handle PostFillReady: {}", e)));
 								}
-							}
+								Ok(())
+							})
+							.await;
 						}
 
-						// Handle PreClaimReady - either submit transaction or proceed to claim
-						SolverEvent::Settlement(SettlementEvent::PreClaimReady { order_id, transaction }) => {
-							match transaction {
-								Some(pre_claim_tx) => {
-									// Submit PreClaim transaction
-									self.spawn_handler(&transaction_semaphore, move |engine| async move {
-										let tx_hash = engine.delivery
-											.deliver(pre_claim_tx.clone())
-											.await
-											.map_err(|e| EngineError::Service(e.to_string()))?;
-
-										// Store tx hash
-										engine.state_machine
-											.set_transaction_hash(&order_id, tx_hash.clone(), TransactionType::PreClaim)
-											.await
-											.map_err(|e| EngineError::Service(e.to_string()))?;
-
-										// Store reverse mapping
-										engine.storage
-											.store(
-												StorageKey::OrderByTxHash.as_str(),
-												&hex::encode(&tx_hash.0),
-												&order_id,
-												None,
-											)
-											.await
-											.map_err(|e| EngineError::Service(e.to_string()))?;
-
-										// Publish pending event
-										engine.event_bus.publish(SolverEvent::Delivery(DeliveryEvent::TransactionPending {
-											order_id,
-											tx_hash,
-											tx_type: TransactionType::PreClaim,
-											tx_chain_id: pre_claim_tx.chain_id,
-										})).ok();
-
-										Ok(())
-									})
-									.await;
-								},
-								None => {
-									// No PreClaim needed, emit ClaimReady
-									self.event_bus.publish(SolverEvent::Settlement(SettlementEvent::ClaimReady {
-										order_id,
-									})).ok();
+						// Handle PreClaimReady - use settlement handler
+						SolverEvent::Settlement(SettlementEvent::PreClaimReady { order_id }) => {
+							self.spawn_handler(&transaction_semaphore, move |engine| async move {
+								if let Err(e) = engine.settlement_handler.handle_pre_claim_ready(order_id).await {
+									return Err(EngineError::Service(format!("Failed to handle PreClaimReady: {}", e)));
 								}
-							}
+								Ok(())
+							})
+							.await;
+						}
+
+						// Handle StartMonitoring - spawn settlement monitor
+						SolverEvent::Settlement(SettlementEvent::StartMonitoring { order_id, fill_tx_hash }) => {
+							self.spawn_handler(&general_semaphore, move |engine| async move {
+								// Retrieve order
+								let order: Order = engine.storage
+									.retrieve(StorageKey::Orders.as_str(), &order_id)
+									.await
+									.map_err(|e| EngineError::Service(e.to_string()))?;
+
+								// Spawn monitor using helper from SettlementHandler
+								engine.settlement_handler.spawn_settlement_monitor(order, fill_tx_hash);
+								Ok(())
+							})
+							.await;
 						}
 
 						SolverEvent::Settlement(SettlementEvent::ClaimReady { order_id }) => {
