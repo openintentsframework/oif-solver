@@ -1,3 +1,3 @@
 pub mod engine;
 
-pub use engine::CostEngine;
+pub use engine::{CostEngine, PricingConfig};

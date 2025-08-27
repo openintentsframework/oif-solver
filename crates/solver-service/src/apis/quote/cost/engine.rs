@@ -10,7 +10,7 @@ use solver_types::{
 };
 
 #[derive(Debug, Clone)]
-struct PricingConfig {
+pub struct PricingConfig {
 	currency: String,
 	commission_bps: u32,
 	gas_buffer_bps: u32,
@@ -19,6 +19,44 @@ struct PricingConfig {
 }
 
 impl PricingConfig {
+	pub fn default_values() -> Self {
+		Self {
+			currency: "USDC".to_string(),
+			commission_bps: 20,
+			gas_buffer_bps: 1000,
+			rate_buffer_bps: 14,
+			enable_live_gas_estimate: false,
+		}
+	}
+
+	/// Builds pricing config from a TOML table (e.g. strategy implementation table)
+	pub fn from_table(table: &toml::Value) -> Self {
+		let defaults = Self::default_values();
+		Self {
+			currency: table
+				.get("pricing_currency")
+				.and_then(|v| v.as_str())
+				.unwrap_or(&defaults.currency)
+				.to_string(),
+			commission_bps: table
+				.get("commission_bps")
+				.and_then(|v| v.as_integer())
+				.unwrap_or(defaults.commission_bps as i64) as u32,
+			gas_buffer_bps: table
+				.get("gas_buffer_bps")
+				.and_then(|v| v.as_integer())
+				.unwrap_or(defaults.gas_buffer_bps as i64) as u32,
+			rate_buffer_bps: table
+				.get("rate_buffer_bps")
+				.and_then(|v| v.as_integer())
+				.unwrap_or(defaults.rate_buffer_bps as i64) as u32,
+			enable_live_gas_estimate: table
+				.get("enable_live_gas_estimate")
+				.and_then(|v| v.as_bool())
+				.unwrap_or(defaults.enable_live_gas_estimate),
+		}
+	}
+
 	fn from_config(config: &Config) -> Self {
 		// Try to get the config table from the primary strategy implementation
 		let strategy_name = &config.order.strategy.primary;
@@ -30,29 +68,7 @@ impl PricingConfig {
 			.get(strategy_name)
 			.unwrap_or(&default_table);
 		tracing::info!("Pricing config: {:?}", table);
-		Self {
-			currency: table
-				.get("pricing_currency")
-				.and_then(|v| v.as_str())
-				.unwrap_or("USDC")
-				.to_string(),
-			commission_bps: table
-				.get("commission_bps")
-				.and_then(|v| v.as_integer())
-				.unwrap_or(20) as u32,
-			gas_buffer_bps: table
-				.get("gas_buffer_bps")
-				.and_then(|v| v.as_integer())
-				.unwrap_or(1000) as u32,
-			rate_buffer_bps: table
-				.get("rate_buffer_bps")
-				.and_then(|v| v.as_integer())
-				.unwrap_or(14) as u32,
-			enable_live_gas_estimate: table
-				.get("enable_live_gas_estimate")
-				.and_then(|v| v.as_bool())
-				.unwrap_or(false),
-		}
+		Self::from_table(table)
 	}
 }
 
@@ -68,9 +84,8 @@ impl CostEngine {
 		quote: &Quote,
 		solver: &SolverEngine,
 		config: &Config,
+		pricing: &PricingConfig,
 	) -> Result<QuoteCost, QuoteError> {
-		let pricing = PricingConfig::from_config(config);
-
 		let (origin_chain_id, dest_chain_id) = self.extract_origin_dest_chain_ids(quote)?;
 
 		// Get gas units from config (preferred) or fallback to minimal defaults
@@ -111,7 +126,6 @@ impl CostEngine {
 				.build_claim_tx_for_estimation(quote, origin_chain_id, solver)
 				.await
 			{
-				tracing::info!("Estimating claim gas on origin chain");
 				tracing::debug!(
 					"finalise tx bytes_len={} to={}",
 					tx.data.len(),
@@ -126,7 +140,7 @@ impl CostEngine {
 					.await
 				{
 					Ok(g) => {
-						tracing::info!("Claim gas units: {}", g);
+						tracing::debug!("Claim gas units: {}", g);
 						claim_units = g;
 					},
 					Err(e) => {
@@ -191,7 +205,7 @@ impl CostEngine {
 		let total = add_decimals(&subtotal, &commission_amount);
 		// all values are in wei
 		Ok(QuoteCost {
-			currency: pricing.currency,
+			currency: pricing.currency.clone(),
 			components: vec![
 				CostComponent {
 					name: "base-price".into(),
@@ -251,8 +265,8 @@ impl CostEngine {
 			if let Some(units) = gcfg.flows.get(flow) {
 				// Use configured values directly when available
 				let open = units.open.unwrap_or(0);
-				let fill = units.fill.unwrap_or(0); 
-				let claim = units.claim.unwrap_or(0); 
+				let fill = units.fill.unwrap_or(0);
+				let claim = units.claim.unwrap_or(0);
 				return (open, fill, claim);
 			} else {
 				tracing::warn!("Flow '{}' not found in gas config flows", flow);
