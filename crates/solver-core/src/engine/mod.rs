@@ -421,7 +421,7 @@ impl SolverEngine {
 
 										let fill_tx_hash = order.fill_tx_hash
 											.clone()
-											.ok_or_else(|| EngineError::Service("Missing fill tx hash".into()))?;
+											.ok_or_else(|| EngineError::Service("Missing fill transaction hash: required for post-fill transaction processing and settlement monitoring".into()))?;
 
 										// Spawn monitor using helper from TransactionHandler
 										engine.transaction_handler.spawn_settlement_monitor(order, fill_tx_hash);

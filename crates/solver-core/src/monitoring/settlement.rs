@@ -103,7 +103,7 @@ impl SettlementMonitor {
 						tracing::error!(
 							order_id = %truncate_id(&order.id),
 							error = %e,
-							"Failed to generate pre-claim transaction, proceeding without it"
+							"Failed to generate pre-claim transaction, will proceed directly without the pre-claim transaction"
 						);
 						None
 					},

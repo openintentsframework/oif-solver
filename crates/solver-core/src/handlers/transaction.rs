@@ -270,7 +270,7 @@ impl TransactionHandler {
 		let fill_tx_hash = order
 			.fill_tx_hash
 			.clone()
-			.ok_or_else(|| TransactionError::Service("Missing fill tx hash".into()))?;
+			.ok_or_else(|| TransactionError::Service("Missing fill transaction hash: required for post-fill transaction processing and settlement monitoring".into()))?;
 		self.spawn_settlement_monitor(order, fill_tx_hash);
 
 		Ok(())
