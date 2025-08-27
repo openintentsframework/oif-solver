@@ -7,8 +7,9 @@
 use axum::extract::Path;
 use solver_core::SolverEngine;
 use solver_types::{
-	bytes32_to_address, with_0x_prefix, AssetAmount, GetOrderError, GetOrderResponse, Order,
-	OrderResponse, OrderStatus, Settlement, SettlementType, TransactionType,
+	bytes32_to_address, parse_address, with_0x_prefix, AssetAmount, GetOrderError,
+	GetOrderResponse, InteropAddress, Order, OrderResponse, OrderStatus, Settlement,
+	SettlementType, TransactionType,
 };
 use tracing::info;
 
@@ -86,6 +87,20 @@ async fn convert_order_to_response(order: Order) -> Result<OrderResponse, GetOrd
 	}
 }
 
+/// Creates an ERC-7930 interoperable address string from a token address and chain ID.
+fn create_interop_address_string(token: &str, chain_id: u64) -> Result<String, GetOrderError> {
+	// Parse the token address (with or without 0x prefix)
+	let address = parse_address(token)
+		.map_err(|e| GetOrderError::Internal(format!("Invalid token address: {}", e)))?;
+
+	// Convert to alloy Address type
+	let alloy_address = alloy_primitives::Address::from_slice(&address.0);
+
+	// Create InteropAddress and return as hex string
+	let interop_address = InteropAddress::new_ethereum(chain_id, alloy_address);
+	Ok(interop_address.to_hex())
+}
+
 /// Converts an EIP-7683 order to API OrderResponse format.
 async fn convert_eip7683_order_to_response(
 	order: solver_types::Order,
@@ -126,8 +141,18 @@ async fn convert_eip7683_order_to_response(
 		.parse::<alloy_primitives::U256>()
 		.map_err(|e| GetOrderError::Internal(format!("Invalid input amount: {}", e)))?;
 
+	// Get the input chain ID (use first one if multiple)
+	let input_chain_id = order
+		.input_chain_ids
+		.first()
+		.copied()
+		.ok_or_else(|| GetOrderError::Internal("No input chain ID found".to_string()))?;
+
+	// Convert input token to InteropAddress format
+	let input_interop_address = create_interop_address_string(input_token, input_chain_id)?;
+
 	let input_amount = AssetAmount {
-		asset: input_token.to_string(),
+		asset: input_interop_address,
 		amount: input_amount_u256,
 	};
 
@@ -159,7 +184,7 @@ async fn convert_eip7683_order_to_response(
 	for (i, byte_val) in token_array.iter().take(32).enumerate() {
 		token_bytes32[i] = byte_val.as_u64().unwrap_or(0) as u8;
 	}
-	let output_token = with_0x_prefix(&bytes32_to_address(&token_bytes32));
+	let output_token_address = with_0x_prefix(&bytes32_to_address(&token_bytes32));
 
 	let output_amount_str = first_output
 		.get("amount")
@@ -172,8 +197,19 @@ async fn convert_eip7683_order_to_response(
 		.parse::<alloy_primitives::U256>()
 		.map_err(|e| GetOrderError::Internal(format!("Invalid output amount: {}", e)))?;
 
+	// Get the output chain ID (use first one if multiple)
+	let output_chain_id = order
+		.output_chain_ids
+		.first()
+		.copied()
+		.ok_or_else(|| GetOrderError::Internal("No output chain ID found".to_string()))?;
+
+	// Convert output token to InteropAddress format
+	let output_interop_address =
+		create_interop_address_string(&output_token_address, output_chain_id)?;
+
 	let output_amount = AssetAmount {
-		asset: output_token,
+		asset: output_interop_address,
 		amount: output_amount_u256,
 	};
 
@@ -425,18 +461,21 @@ mod tests {
 		assert_eq!(resp.status, OrderStatus::Executed);
 		assert_eq!(resp.quote_id, Some("quote-test".to_string()));
 
-		// input
-		assert_eq!(
-			resp.input_amount.asset,
-			"0x1234567890123456789012345678901234567890"
-		);
+		// input - should be an interop address with chain ID 1
+		// Format: 0x01000001011234567890123456789012345678901234567890
+		// Version: 01, ChainType: 0000, ChainRefLen: 01, ChainRef: 01, AddrLen: 14, Address: 20 bytes
+		assert!(resp.input_amount.asset.starts_with("0x01000001"));
+		assert!(resp
+			.input_amount
+			.asset
+			.contains("1234567890123456789012345678901234567890"));
 		assert_eq!(
 			resp.input_amount.amount,
 			"1000000000000000000".parse::<U256>().unwrap()
 		);
 
-		// output
-		assert!(resp.output_amount.asset.starts_with("0x"));
+		// output - should be an interop address with chain ID 2
+		assert!(resp.output_amount.asset.starts_with("0x01000001"));
 		assert_eq!(
 			resp.output_amount.amount,
 			"2000000000000000000".parse::<U256>().unwrap()
