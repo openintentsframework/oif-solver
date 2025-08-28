@@ -94,6 +94,15 @@ pub enum SettlementEvent {
 	},
 	/// Fill proof has been generated and is ready.
 	ProofReady { order_id: String, proof: FillProof },
+	/// Emitted after Fill confirmation to trigger post-fill processing.
+	PostFillReady { order_id: String },
+	/// Emitted when ready for pre-claim processing.
+	PreClaimReady { order_id: String },
+	/// Start monitoring for settlement readiness.
+	StartMonitoring {
+		order_id: String,
+		fill_tx_hash: TransactionHash,
+	},
 	/// Order is ready to be claimed.
 	ClaimReady { order_id: String },
 	/// Order settlement has been completed.
@@ -107,6 +116,10 @@ pub enum TransactionType {
 	Prepare,
 	/// Transaction that fills an order on the destination chain.
 	Fill,
+	/// Transaction that executes after fill confirmation (optional).
+	PostFill,
+	/// Transaction that executes before claiming (optional).
+	PreClaim,
 	/// Transaction that claims rewards on the origin chain.
 	Claim,
 }
