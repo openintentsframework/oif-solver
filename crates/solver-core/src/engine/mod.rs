@@ -20,7 +20,9 @@ use solver_discovery::DiscoveryService;
 use solver_order::OrderService;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
-use solver_types::{Address, DeliveryEvent, Intent, OrderEvent, SettlementEvent, SolverEvent};
+use solver_types::{
+	Address, DeliveryEvent, Intent, Order, OrderEvent, SettlementEvent, SolverEvent, StorageKey,
+};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -142,7 +144,6 @@ impl SolverEngine {
 
 		let transaction_handler = Arc::new(TransactionHandler::new(
 			delivery.clone(),
-			settlement.clone(),
 			storage.clone(),
 			state_machine.clone(),
 			event_bus.clone(),
@@ -156,6 +157,7 @@ impl SolverEngine {
 			storage.clone(),
 			state_machine.clone(),
 			event_bus.clone(),
+			config.solver.monitoring_timeout_minutes,
 		));
 
 		Self {
@@ -198,7 +200,6 @@ impl SolverEngine {
 			self.delivery.clone(),
 			self.settlement.clone(),
 			self.event_bus.clone(),
-			self.config.solver.monitoring_timeout_minutes,
 		);
 
 		// Perform recovery
@@ -364,6 +365,47 @@ impl SolverEngine {
 								Ok(())
 							})
 							.await;
+						}
+
+						// Handle PostFillReady - use settlement handler
+						SolverEvent::Settlement(SettlementEvent::PostFillReady { order_id }) => {
+							self.spawn_handler(&transaction_semaphore, move |engine| async move {
+								if let Err(e) = engine.settlement_handler.handle_post_fill_ready(order_id).await {
+									return Err(EngineError::Service(format!("Failed to handle PostFillReady: {}", e)));
+								}
+								Ok(())
+							})
+							.await;
+						}
+
+						// Handle PreClaimReady - use settlement handler
+						SolverEvent::Settlement(SettlementEvent::PreClaimReady { order_id }) => {
+							self.spawn_handler(&transaction_semaphore, move |engine| async move {
+								if let Err(e) = engine.settlement_handler.handle_pre_claim_ready(order_id).await {
+									return Err(EngineError::Service(format!("Failed to handle PreClaimReady: {}", e)));
+								}
+								Ok(())
+							})
+							.await;
+						}
+
+						// Handle StartMonitoring - spawn settlement monitor
+						SolverEvent::Settlement(SettlementEvent::StartMonitoring { order_id, fill_tx_hash }) => {
+							// Retrieve order
+							let order: Order = match self.storage
+								.retrieve(StorageKey::Orders.as_str(), &order_id)
+								.await
+							{
+								Ok(order) => order,
+								Err(e) => {
+									tracing::error!("Failed to retrieve order {}: {}", order_id, e);
+									EngineError::Service(format!("Failed to retrieve order {}: {}", order_id, e));
+									continue;
+								}
+							};
+
+							// Spawn monitor directly (it handles its own tokio::spawn internally)
+							self.settlement_handler.spawn_settlement_monitor(order, fill_tx_hash);
 						}
 
 						SolverEvent::Settlement(SettlementEvent::ClaimReady { order_id }) => {

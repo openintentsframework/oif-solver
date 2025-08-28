@@ -80,7 +80,7 @@ impl From<PrimitiveSignature> for Signature {
 ///
 /// Contains all fields necessary for constructing and submitting transactions
 /// to various blockchain networks.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
 	/// Recipient address (None for contract creation).
 	pub to: Option<Address>,

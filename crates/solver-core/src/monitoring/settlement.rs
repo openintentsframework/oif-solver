@@ -1,12 +1,15 @@
 //! Settlement monitoring for filled orders.
 //!
-//! Monitors orders after fill confirmation to determine when they are ready
-//! for claiming, retrieving attestations and checking claim conditions.
+//! Monitors orders after fill confirmation (and optional post-fill transaction)
+//! to determine when they are ready for claiming, retrieving attestations and
+//! checking claim conditions before initiating the claim process.
 
 use crate::engine::event_bus::EventBus;
 use crate::state::OrderStateMachine;
 use solver_settlement::SettlementService;
-use solver_types::{truncate_id, Order, SettlementEvent, SolverEvent, TransactionHash};
+use solver_types::{
+	truncate_id, Order, OrderStatus, SettlementEvent, SolverEvent, TransactionHash,
+};
 use std::sync::Arc;
 
 /// Monitor for tracking settlement readiness of filled orders.
@@ -85,8 +88,15 @@ impl SettlementMonitor {
 
 			// Check if we can claim
 			if settlement.can_claim(&order, &fill_proof).await {
+				// Update status to Settled
+				self.state_machine
+					.transition_order_status(&order.id, OrderStatus::Settled)
+					.await
+					.ok();
+
+				// Emit PreClaimReady event - handler will generate transaction if needed
 				self.event_bus
-					.publish(SolverEvent::Settlement(SettlementEvent::ClaimReady {
+					.publish(SolverEvent::Settlement(SettlementEvent::PreClaimReady {
 						order_id: order.id,
 					}))
 					.ok();

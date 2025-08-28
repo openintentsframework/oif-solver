@@ -217,6 +217,22 @@ impl DeliveryService {
 		self.confirm(hash, chain_id, self.min_confirmations).await
 	}
 
+	/// Gets the transaction receipt for a given transaction hash.
+	///
+	/// Returns the full transaction receipt including status, block number, logs, etc.
+	pub async fn get_receipt(
+		&self,
+		hash: &TransactionHash,
+		chain_id: u64,
+	) -> Result<TransactionReceipt, DeliveryError> {
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
+
+		implementation.get_receipt(hash, chain_id).await
+	}
+
 	/// Checks the current status of a transaction on a specific chain.
 	///
 	/// Returns true if the transaction was successful, false if it failed.
@@ -225,12 +241,7 @@ impl DeliveryService {
 		hash: &TransactionHash,
 		chain_id: u64,
 	) -> Result<bool, DeliveryError> {
-		let implementation = self
-			.implementations
-			.get(&chain_id)
-			.ok_or(DeliveryError::NoImplementationAvailable)?;
-
-		let receipt = implementation.get_receipt(hash, chain_id).await?;
+		let receipt = self.get_receipt(hash, chain_id).await?;
 		Ok(receipt.success)
 	}
 
