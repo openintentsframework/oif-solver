@@ -471,9 +471,14 @@ PREFIXED_SIGNATURE="0x00${SIGNATURE:2}"
 JSON_PAYLOAD=$(cat <<EOF
 {
   "order": "$ORDER_DATA",
-  "lock_type": "$LOCK_TYPE",
-  "sponsor": "$USER_ADDR",
-  "signature": "$PREFIXED_SIGNATURE"
+  "signature": "$PREFIXED_SIGNATURE",
+  "quoteId": "demo_quote_${NONCE}",
+  "provider": "oif-solver-demo",
+  "failureHandling": "retry",
+  "originSubmission": {
+    "mode": "user",
+    "schemes": ["permit2"]
+  }
 }
 EOF
 )

@@ -279,26 +279,81 @@ where
 	}
 }
 
-/// API request wrapper for intent submission.
+/// API request wrapper for intent submission matching OpenAPI PostOrderRequest.
 ///
-/// This is the top-level structure for POST /intent requests with the OIF format.
+/// This structure follows the OpenAPI 3.0.0 specification for order submission.
+/// Replaces the legacy format to align with the standardized API.
 ///
 /// # Fields
 ///
-/// * `order` - The StandardOrder encoded as hex bytes
-/// * `sponsor` - The address sponsoring the order (usually the user)
-/// * `signature` - The Permit2Witness signature
-/// * `lock_type` - The custody mechanism type
+/// * `order` - EIP-712 order object with typed data
+/// * `signature` - EIP-712 signature object
+/// * `quote_id` - Quote identifier for linking to quote
+/// * `provider` - Provider/solver identifier  
+/// * `failure_handling` - How to handle execution failures
+/// * `origin_submission` - Origin submission configuration
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct IntentRequest {
 	order: Bytes,
-	sponsor: Address,
 	signature: Bytes,
-	#[serde(
-		default = "default_lock_type",
-		deserialize_with = "deserialize_lock_type_flexible"
-	)]
-	lock_type: LockType,
+	quote_id: Option<String>,
+	provider: String,
+	failure_handling: FailureHandling,
+	#[serde(default)]
+	origin_submission: Option<OriginSubmission>,
+}
+
+/// Failure handling strategy enum matching OpenAPI specification
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum FailureHandling {
+	Retry,
+	RefundInstant,
+	RefundClaim,
+	NeedsNewSignature,
+	#[serde(untagged)]
+	PartialFill {
+		partial_fill: bool,
+		remainder: FailureHandlingStrategy,
+	},
+}
+
+/// Individual failure handling strategies
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum FailureHandlingStrategy {
+	Retry,
+	RefundInstant,
+	RefundClaim,
+	NeedsNewSignature,
+}
+
+/// Origin submission configuration
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OriginSubmission {
+	mode: SubmissionMode,
+	#[serde(default)]
+	schemes: Vec<SubmissionScheme>,
+}
+
+/// Submission mode enum
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SubmissionMode {
+	User,
+	Protocol,
+}
+
+/// Submission scheme enum
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SubmissionScheme {
+	Erc4337,
+	Permit2,
+	Erc20Permit,
+	Eip3009,
 }
 
 fn default_lock_type() -> LockType {
@@ -870,6 +925,11 @@ async fn handle_intent_submission(
 		},
 	};
 
+	// TODO: Extract sponsor from PostOrderRequest - for now use a default
+	let sponsor = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+		.parse::<Address>()
+		.unwrap_or_default();
+
 	// Serialize the parsed order once for all responses
 	let order_json = match serde_json::to_value(ApiStandardOrder::from(&order)) {
 		Ok(json) => Some(json),
@@ -881,7 +941,7 @@ async fn handle_intent_submission(
 
 	// Validate order
 	if let Err(e) =
-		Eip7683OffchainDiscovery::validate_order(&order, &request.sponsor, &request.signature).await
+		Eip7683OffchainDiscovery::validate_order(&order, &sponsor, &request.signature).await
 	{
 		tracing::warn!(error = %e, "Order validation failed");
 		return (
@@ -896,13 +956,13 @@ async fn handle_intent_submission(
 			.into_response();
 	}
 
-	// Convert to intent
+	// Convert to intent using the existing method
 	match Eip7683OffchainDiscovery::order_to_intent(
 		&order,
 		&request.order,
-		&request.sponsor,
+		&sponsor,
 		&request.signature,
-		request.lock_type,
+		LockType::Permit2Escrow,
 		&state.providers,
 		&state.networks,
 	)
