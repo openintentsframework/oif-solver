@@ -392,16 +392,20 @@ impl SolverEngine {
 						// Handle StartMonitoring - spawn settlement monitor
 						SolverEvent::Settlement(SettlementEvent::StartMonitoring { order_id, fill_tx_hash }) => {
 							// Retrieve order
-							let order: Order = self.engine.storage
+							let order: Order = match self.storage
 								.retrieve(StorageKey::Orders.as_str(), &order_id)
 								.await
-								.map_err(|e| error!("Failed to retrieve order {}: {}", order_id, e))
-								.ok();
-							
-							if let Some(order) = order {
-								// Spawn monitor directly (it handles its own tokio::spawn internally)
-								self.engine.settlement_handler.spawn_settlement_monitor(order, fill_tx_hash);
-							}
+							{
+								Ok(order) => order,
+								Err(e) => {
+									tracing::error!("Failed to retrieve order {}: {}", order_id, e);
+									EngineError::Service(format!("Failed to retrieve order {}: {}", order_id, e));
+									continue;
+								}
+							};
+
+							// Spawn monitor directly (it handles its own tokio::spawn internally)
+							self.settlement_handler.spawn_settlement_monitor(order, fill_tx_hash);
 						}
 
 						SolverEvent::Settlement(SettlementEvent::ClaimReady { order_id }) => {
