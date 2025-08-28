@@ -433,7 +433,7 @@ mod tests {
 		assert!(res.is_ok());
 		let resp = res.unwrap();
 		assert_eq!(resp.id, "order-proc");
-		assert!(matches!(resp.status, ApiOrderStatus::Executed));
+		assert!(matches!(resp.status, OrderStatus::Executed));
 	}
 
 	#[tokio::test]
@@ -459,7 +459,7 @@ mod tests {
 		let resp = convert_order_to_response(order).await.expect("ok");
 
 		assert_eq!(resp.id, "order-ok");
-		assert!(matches!(resp.status, ApiOrderStatus::Executed));
+		assert!(matches!(resp.status, OrderStatus::Executed));
 		assert_eq!(resp.quote_id, Some("quote-test".to_string()));
 
 		// input - should be an interop address with chain ID 1
