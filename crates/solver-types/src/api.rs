@@ -2,7 +2,7 @@
 //!
 //! This module defines the request and response types for the OIF Solver API
 //! endpoints, following the ERC-7683 Cross-Chain Intents Standard.
-use crate::standards::eip7930::InteropAddress;
+use crate::{standards::eip7930::InteropAddress, OrderStatus};
 use alloy_primitives::Bytes;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -272,18 +272,6 @@ pub enum FailureHandlingStrategy {
 	NeedsNewSignature,
 }
 
-/// Order status values for API responses
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ApiOrderStatus {
-	Created,
-	Pending,
-	Executed,
-	Settled,
-	Finalized,
-	Failed,
-}
-
 /// Post order response status
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -330,7 +318,7 @@ pub struct GetOrderResponse {
 	/// Order ID
 	pub id: String,
 	/// Order status
-	pub status: ApiOrderStatus,
+	pub status: OrderStatus,
 	/// Creation timestamp
 	#[serde(rename = "createdAt")]
 	pub created_at: u64,

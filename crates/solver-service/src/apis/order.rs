@@ -7,9 +7,8 @@
 use axum::extract::Path;
 use solver_core::SolverEngine;
 use solver_types::{
-	bytes32_to_address, parse_address, with_0x_prefix, ApiOrderStatus, ApiSettlement, AssetAmount,
-	GetOrderError, GetOrderResponse, InteropAddress, Order, OrderStatus, SettlementType,
-	TransactionType,
+	bytes32_to_address, parse_address, with_0x_prefix, ApiSettlement, AssetAmount, GetOrderError,
+	GetOrderResponse, InteropAddress, Order, OrderStatus, SettlementType, TransactionType,
 };
 use tracing::info;
 
@@ -263,19 +262,9 @@ async fn convert_eip7683_order_to_response(
 		})
 	});
 
-	// Convert internal OrderStatus to API status
-	let api_status = match order.status {
-		OrderStatus::Created => ApiOrderStatus::Created,
-		OrderStatus::Pending => ApiOrderStatus::Pending,
-		OrderStatus::Executed => ApiOrderStatus::Executed,
-		OrderStatus::Settled => ApiOrderStatus::Settled,
-		OrderStatus::Finalized => ApiOrderStatus::Finalized,
-		OrderStatus::Failed(_) => ApiOrderStatus::Failed,
-	};
-
 	let response = GetOrderResponse {
 		id: order.id,
-		status: api_status,
+		status: order.status,
 		created_at: order.created_at,
 		updated_at: order.updated_at,
 		quote_id: order.quote_id,
@@ -423,7 +412,7 @@ mod tests {
 		assert!(result.is_ok());
 		let response = result.unwrap();
 		assert_eq!(response.id, "order-test");
-		assert!(matches!(response.status, ApiOrderStatus::Executed));
+		assert_eq!(response.status, OrderStatus::Executed);
 		assert_eq!(response.quote_id, Some("quote-test".to_string()));
 	}
 
@@ -476,16 +465,14 @@ mod tests {
 		// input - should be an interop address with chain ID 1
 		// Format: 0x01000001011234567890123456789012345678901234567890
 		// Version: 01, ChainType: 0000, ChainRefLen: 01, ChainRef: 01, AddrLen: 14, Address: 20 bytes
-		assert!(resp.input_amount.asset.to_hex().starts_with("0x01000001"));
-		assert!(resp
-			.input_amount
-			.asset
-			.to_hex()
-			.contains("1234567890123456789012345678901234567890"));
+		let input_asset_hex = resp.input_amount.asset.to_hex();
+		assert!(input_asset_hex.starts_with("0x01000001"));
+		assert!(input_asset_hex.contains("1234567890123456789012345678901234567890"));
 		assert_eq!(resp.input_amount.amount, "1000000000000000000");
 
 		// output - should be an interop address with chain ID 2
-		assert!(resp.output_amount.asset.to_hex().starts_with("0x01000001"));
+		let output_asset_hex = resp.output_amount.asset.to_hex();
+		assert!(output_asset_hex.starts_with("0x01000001"));
 		assert_eq!(resp.output_amount.amount, "2000000000000000000");
 
 		// settlement
