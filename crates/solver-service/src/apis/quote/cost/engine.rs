@@ -1,63 +1,15 @@
 use alloy_primitives::U256;
 use solver_config::Config;
 use solver_core::SolverEngine;
-use solver_pricing::PricingService;
+use solver_pricing::{PricingConfig, PricingService};
 use solver_types::{
 	costs::{CostComponent, QuoteCost},
-	Quote, QuoteError, QuoteOrder, SignatureType,
+	Quote, QuoteError, QuoteOrder, SignatureType, TradingPair,
 };
 use solver_types::{
 	Address, ExecutionParams, FillProof, Order, OrderStatus, Transaction, TransactionHash,
 };
 
-#[derive(Debug, Clone)]
-pub struct PricingConfig {
-	currency: String,
-	commission_bps: u32,
-	gas_buffer_bps: u32,
-	rate_buffer_bps: u32,
-	enable_live_gas_estimate: bool,
-}
-
-impl PricingConfig {
-	pub fn default_values() -> Self {
-		Self {
-			currency: "USD".to_string(),
-			commission_bps: 20,
-			gas_buffer_bps: 1000,
-			rate_buffer_bps: 14,
-			enable_live_gas_estimate: false,
-		}
-	}
-
-	/// Builds pricing config from a TOML table (e.g. strategy implementation table)
-	pub fn from_table(table: &toml::Value) -> Self {
-		let defaults = Self::default_values();
-		Self {
-			currency: table
-				.get("pricing_currency")
-				.and_then(|v| v.as_str())
-				.unwrap_or(&defaults.currency)
-				.to_string(),
-			commission_bps: table
-				.get("commission_bps")
-				.and_then(|v| v.as_integer())
-				.unwrap_or(defaults.commission_bps as i64) as u32,
-			gas_buffer_bps: table
-				.get("gas_buffer_bps")
-				.and_then(|v| v.as_integer())
-				.unwrap_or(defaults.gas_buffer_bps as i64) as u32,
-			rate_buffer_bps: table
-				.get("rate_buffer_bps")
-				.and_then(|v| v.as_integer())
-				.unwrap_or(defaults.rate_buffer_bps as i64) as u32,
-			enable_live_gas_estimate: table
-				.get("enable_live_gas_estimate")
-				.and_then(|v| v.as_bool())
-				.unwrap_or(defaults.enable_live_gas_estimate),
-		}
-	}
-}
 
 pub struct CostEngine;
 
@@ -66,14 +18,91 @@ impl CostEngine {
 		Self
 	}
 
+	/// Converts asset value from one currency to another using pricing service.
+	pub async fn convert_asset_value(
+		&self,
+		from_asset: &str,
+		to_asset: &str,
+		amount: &str,
+		pricing_service: &PricingService,
+	) -> Result<String, QuoteError> {
+		pricing_service
+			.convert_asset(from_asset, to_asset, amount)
+			.await
+			.map_err(|e| QuoteError::Internal(format!("Asset conversion failed: {}", e)))
+	}
+
+	/// Gets the exchange rate between two assets.
+	pub async fn get_exchange_rate(
+		&self,
+		from_asset: &str,
+		to_asset: &str,
+		pricing_service: &PricingService,
+	) -> Result<String, QuoteError> {
+		let pair = TradingPair::new(from_asset, to_asset);
+		let price_result = pricing_service
+			.get_pair_price(&pair)
+			.await
+			.map_err(|e| QuoteError::Internal(format!("Failed to get exchange rate: {}", e)))?;
+
+		Ok(price_result.price)
+	}
+
+	/// Validates that the pricing service supports the required pairs for cross-chain operations.
+	pub async fn validate_pricing_support(
+		&self,
+		quote: &Quote,
+		pricing_service: &PricingService,
+	) -> Result<(), QuoteError> {
+		let supported_pairs = pricing_service.get_supported_pairs().await;
+
+		// Extract origin and destination assets from quote for validation
+		let _input = quote
+			.details
+			.available_inputs
+			.get(0)
+			.ok_or_else(|| QuoteError::InvalidRequest("missing input".to_string()))?;
+		let _output = quote
+			.details
+			.requested_outputs
+			.get(0)
+			.ok_or_else(|| QuoteError::InvalidRequest("missing output".to_string()))?;
+
+		// For now, we primarily care about ETH/USD support for gas cost calculations
+		let required_pairs = vec![
+			TradingPair::new("ETH", "USD"),
+			TradingPair::new("USD", "ETH"),
+		];
+
+		for required_pair in &required_pairs {
+			let has_direct_support = supported_pairs.iter().any(|p| {
+				(p.base == required_pair.base && p.quote == required_pair.quote)
+					|| (p.base == required_pair.quote && p.quote == required_pair.base)
+			});
+
+			if !has_direct_support {
+				tracing::warn!(
+					"Pricing service may not support required pair: {}",
+					required_pair.to_string()
+				);
+			}
+		}
+
+		Ok(())
+	}
+
 	pub async fn estimate_cost(
 		&self,
 		quote: &Quote,
 		solver: &SolverEngine,
 		config: &Config,
-		pricing: &PricingConfig,
 		pricing_service: &PricingService,
 	) -> Result<QuoteCost, QuoteError> {
+		// Validate pricing support for this quote
+		self.validate_pricing_support(quote, pricing_service)
+			.await?;
+		
+		let pricing = pricing_service.config();
 		let (origin_chain_id, dest_chain_id) = self.extract_origin_dest_chain_ids(quote)?;
 
 		// Get gas units from config (preferred) or fallback to minimal defaults

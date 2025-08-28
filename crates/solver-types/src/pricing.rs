@@ -24,15 +24,51 @@ pub enum PricingError {
 	InvalidData(String),
 }
 
+/// Represents a trading pair for price queries.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TradingPair {
+	/// The base asset (e.g., "ETH", "SOL").
+	pub base: String,
+	/// The quote asset (e.g., "USD", "SOL").
+	pub quote: String,
+}
+
+impl TradingPair {
+	/// Creates a new trading pair.
+	pub fn new(base: &str, quote: &str) -> Self {
+		Self {
+			base: base.to_uppercase(),
+			quote: quote.to_uppercase(),
+		}
+	}
+
+	/// Returns the pair as a string in format "BASE/QUOTE".
+	pub fn to_string(&self) -> String {
+		format!("{}/{}", self.base, self.quote)
+	}
+
+	/// Creates a trading pair from a string like "ETH/USD".
+	pub fn from_string(pair_str: &str) -> Result<Self, PricingError> {
+		let parts: Vec<&str> = pair_str.split('/').collect();
+		if parts.len() != 2 {
+			return Err(PricingError::InvalidData(format!(
+				"Invalid pair format: {}",
+				pair_str
+			)));
+		}
+		Ok(Self::new(parts[0], parts[1]))
+	}
+}
+
 /// Represents a price quote for an asset in a specific currency.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetPrice {
-	/// The asset symbol or identifier (e.g., "ETH", "BTC").
-	pub asset: String,
-	/// The price in the target currency (e.g., USD).
+	/// The trading pair this price represents.
+	pub pair: TradingPair,
+	/// The price of the base asset in terms of the quote asset.
 	pub price: String,
-	/// The currency this price is denominated in (e.g., "USD").
-	pub currency: String,
+	/// Timestamp when this price was retrieved (Unix timestamp).
+	pub timestamp: u64,
 }
 
 /// Trait defining the interface for pricing oracle implementations.
@@ -45,14 +81,33 @@ pub trait PricingInterface: Send + Sync {
 	/// Returns the configuration schema for this pricing implementation.
 	fn config_schema(&self) -> Box<dyn ConfigSchema>;
 
-	/// Gets the current price for an asset in the specified currency.
+	/// Gets the current price for a trading pair.
 	///
 	/// Returns the price as a decimal string to avoid precision loss.
+	async fn get_pair_price(&self, pair: &TradingPair) -> Result<AssetPrice, PricingError>;
+
+	/// Gets all supported trading pairs by this implementation.
+	async fn get_supported_pairs(&self) -> Vec<TradingPair>;
+
+	/// Gets the current price for an asset in the specified currency.
+	/// This is a convenience method that creates a TradingPair internally.
 	async fn get_asset_price(
 		&self,
 		asset: &str,
 		currency: &str,
-	) -> Result<AssetPrice, PricingError>;
+	) -> Result<AssetPrice, PricingError> {
+		let pair = TradingPair::new(asset, currency);
+		self.get_pair_price(&pair).await
+	}
+
+	/// Converts between two assets using available pricing data.
+	/// This may involve multiple hops (e.g., ETH -> USD -> SOL).
+	async fn convert_asset(
+		&self,
+		from_asset: &str,
+		to_asset: &str,
+		amount: &str,
+	) -> Result<String, PricingError>;
 
 	/// Converts a wei amount to the specified currency using current ETH price.
 	///

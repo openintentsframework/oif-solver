@@ -4,34 +4,137 @@
 //! wei amounts and fiat currencies. Currently supports mock pricing for development.
 
 use solver_types::{
-	AssetPrice, ImplementationRegistry, PricingError, PricingFactory, PricingInterface,
+	AssetPrice, ImplementationRegistry, PricingError, PricingFactory, PricingInterface, TradingPair,
 };
 
 /// Re-export implementations
 pub mod implementations {
 	pub mod mock;
+	// pub mod coingecko;
+	// pub mod chainlink;
+	// pub mod composite;
 }
 
 /// Get all registered pricing implementations.
 pub fn get_all_implementations() -> Vec<(&'static str, PricingFactory)> {
+	// use implementations::{chainlink, coingecko, composite, mock};
 	use implementations::mock;
+	vec![
+		(
+			mock::MockPricingRegistry::NAME,
+			mock::MockPricingRegistry::factory(),
+		),
+		// (
+		// 	coingecko::CoinGeckoPricingRegistry::NAME,
+		// 	coingecko::CoinGeckoPricingRegistry::factory(),
+		// ),
+		// (
+		// 	chainlink::ChainlinkPricingRegistry::NAME,
+		// 	chainlink::ChainlinkPricingRegistry::factory(),
+		// ),
+		// (
+		// 	composite::CompositePricingRegistry::NAME,
+		// 	composite::CompositePricingRegistry::factory(),
+		// ),
+	]
+}
 
-	vec![(
-		mock::MockPricingRegistry::NAME,
-		mock::MockPricingRegistry::factory(),
-	)]
+/// Configuration for pricing operations.
+#[derive(Debug, Clone)]
+pub struct PricingConfig {
+	/// Target currency for price display.
+	pub currency: String,
+	/// Commission in basis points.
+	pub commission_bps: u32,
+	/// Gas buffer in basis points.
+	pub gas_buffer_bps: u32,
+	/// Rate buffer in basis points.
+	pub rate_buffer_bps: u32,
+	/// Whether to use live gas estimation.
+	pub enable_live_gas_estimate: bool,
+}
+
+impl PricingConfig {
+	pub fn default_values() -> Self {
+		Self {
+			currency: "USD".to_string(),
+			commission_bps: 20,
+			gas_buffer_bps: 1000,
+			rate_buffer_bps: 14,
+			enable_live_gas_estimate: false,
+		}
+	}
+
+	/// Builds pricing config from a TOML table (e.g. strategy implementation table)
+	pub fn from_table(table: &toml::Value) -> Self {
+		let defaults = Self::default_values();
+		Self {
+			currency: table
+				.get("pricing_currency")
+				.and_then(|v| v.as_str())
+				.unwrap_or(&defaults.currency)
+				.to_string(),
+			commission_bps: table
+				.get("commission_bps")
+				.and_then(|v| v.as_integer())
+				.unwrap_or(defaults.commission_bps as i64) as u32,
+			gas_buffer_bps: table
+				.get("gas_buffer_bps")
+				.and_then(|v| v.as_integer())
+				.unwrap_or(defaults.gas_buffer_bps as i64) as u32,
+			rate_buffer_bps: table
+				.get("rate_buffer_bps")
+				.and_then(|v| v.as_integer())
+				.unwrap_or(defaults.rate_buffer_bps as i64) as u32,
+			enable_live_gas_estimate: table
+				.get("enable_live_gas_estimate")
+				.and_then(|v| v.as_bool())
+				.unwrap_or(defaults.enable_live_gas_estimate),
+		}
+	}
 }
 
 /// Service that manages asset pricing across the solver system.
 pub struct PricingService {
 	/// The primary pricing implementation.
 	implementation: Box<dyn PricingInterface>,
+	/// Pricing configuration.
+	config: PricingConfig,
 }
 
 impl PricingService {
-	/// Creates a new PricingService with the specified implementation.
+	/// Creates a new PricingService with the specified implementation and default config.
 	pub fn new(implementation: Box<dyn PricingInterface>) -> Self {
-		Self { implementation }
+		Self {
+			implementation,
+			config: PricingConfig::default_values(),
+		}
+	}
+
+	/// Creates a new PricingService with the specified implementation and config.
+	pub fn new_with_config(
+		implementation: Box<dyn PricingInterface>,
+		config: PricingConfig,
+	) -> Self {
+		Self {
+			implementation,
+			config,
+		}
+	}
+
+	/// Gets the current pricing configuration.
+	pub fn config(&self) -> &PricingConfig {
+		&self.config
+	}
+
+	/// Gets the current price for a trading pair.
+	pub async fn get_pair_price(&self, pair: &TradingPair) -> Result<AssetPrice, PricingError> {
+		self.implementation.get_pair_price(pair).await
+	}
+
+	/// Gets all supported trading pairs.
+	pub async fn get_supported_pairs(&self) -> Vec<TradingPair> {
+		self.implementation.get_supported_pairs().await
 	}
 
 	/// Gets the current price for an asset in the specified currency.
@@ -41,6 +144,18 @@ impl PricingService {
 		currency: &str,
 	) -> Result<AssetPrice, PricingError> {
 		self.implementation.get_asset_price(asset, currency).await
+	}
+
+	/// Converts between two assets using available pricing data.
+	pub async fn convert_asset(
+		&self,
+		from_asset: &str,
+		to_asset: &str,
+		amount: &str,
+	) -> Result<String, PricingError> {
+		self.implementation
+			.convert_asset(from_asset, to_asset, amount)
+			.await
 	}
 
 	/// Converts a wei amount to the specified currency using current ETH price.

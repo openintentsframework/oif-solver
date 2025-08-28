@@ -3575,10 +3575,13 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "async-trait",
+ "reqwest",
  "serde",
  "solver-types",
  "thiserror 1.0.69",
+ "tokio",
  "toml",
+ "tracing",
 ]
 
 [[package]]
