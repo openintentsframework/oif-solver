@@ -549,3 +549,556 @@ impl RecoveryService {
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use mockall::predicate::*;
+	use solver_delivery::MockDeliveryInterface;
+	use solver_storage::MockStorageInterface;
+	use solver_types::{Address, ExecutionParams, FillProof, TransactionHash};
+	use std::collections::HashMap;
+
+	// Helper functions to create test data
+	fn create_test_order_with_status(status: OrderStatus) -> Order {
+		Order {
+			id: "test_order_123".to_string(),
+			standard: "eip7683".to_string(),
+			status,
+			solver_address: Address(vec![0x12; 20]),
+			created_at: 1234567890,
+			updated_at: 1234567890,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			claim_tx_hash: None,
+			execution_params: Some(ExecutionParams {
+				gas_price: alloy_primitives::U256::from(1000000000u64),
+				priority_fee: Some(alloy_primitives::U256::from(1000000u64)),
+			}),
+			fill_proof: None,
+			data: serde_json::json!({
+				"input_oracle": "0x1234567890123456789012345678901234567890",
+				"output_oracle": "0x3456789012345678901234567890123456789012"
+			}),
+			quote_id: None,
+			input_chain_ids: vec![1],
+			output_chain_ids: vec![137],
+		}
+	}
+
+	fn create_test_intent() -> Intent {
+		Intent {
+			id: "test_intent_456".to_string(),
+			standard: "eip7683".to_string(),
+			data: serde_json::json!({
+				"origin_chain_id": 1,
+				"outputs": [
+					{
+						"chain_id": 137,
+						"token": "0x0000000000000000000000000000000000000000",
+						"amount": "1000000000000000000"
+					}
+				]
+			}),
+			source: "test".to_string(),
+			metadata: solver_types::IntentMetadata {
+				requires_auction: false,
+				exclusive_until: None,
+				discovered_at: 1234567890,
+			},
+			quote_id: None,
+		}
+	}
+
+	fn create_test_fill_proof() -> FillProof {
+		FillProof {
+			tx_hash: TransactionHash(vec![0xbb; 32]),
+			block_number: 12345,
+			attestation_data: Some(vec![0x01, 0x02, 0x03]),
+			filled_timestamp: 1234567890,
+			oracle_address: "0x1234567890123456789012345678901234567890".to_string(),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_recover_state_no_orders() {
+		let mut mock_storage = MockStorageInterface::new();
+
+		// Setup expectations for no orders
+		mock_storage
+			.expect_query()
+			.times(1)
+			.returning(|_, _| Box::pin(async move { Ok(Vec::new()) }));
+
+		// When query returns empty, get_batch is still called with empty keys
+		mock_storage
+			.expect_get_batch()
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(Vec::new()) }));
+
+		// Create services
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
+			HashMap::new();
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::new();
+		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let event_bus = EventBus::new(100);
+
+		let recovery_service =
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+
+		// Test recovery with no orders
+		let result = recovery_service.recover_state().await;
+		assert!(result.is_ok());
+
+		let (report, orphaned_intents) = result.unwrap();
+		assert_eq!(report.total_orders, 0);
+		assert_eq!(report.orphaned_intents, 0);
+		assert_eq!(report.reconciled_orders, 0);
+		assert!(orphaned_intents.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_load_active_orders_success() {
+		let mut mock_storage = MockStorageInterface::new();
+		let order = create_test_order_with_status(OrderStatus::Pending);
+
+		// Serialize order for storage mock
+		let order_bytes = serde_json::to_vec(&order).unwrap();
+		let order_key = format!("orders:{}", order.id);
+		let order_key_clone = order_key.clone();
+
+		mock_storage.expect_query().times(1).returning(move |_, _| {
+			let key = order_key_clone.clone();
+			Box::pin(async move { Ok(vec![key]) })
+		});
+
+		mock_storage
+			.expect_get_batch()
+			.times(1)
+			.returning(move |_| {
+				let key = order_key.clone();
+				let bytes = order_bytes.clone();
+				Box::pin(async move { Ok(vec![(key, bytes)]) })
+			});
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
+			HashMap::new();
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::new();
+		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let event_bus = EventBus::new(100);
+
+		let recovery_service =
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+
+		let result = recovery_service.load_active_orders().await;
+		assert!(result.is_ok());
+
+		let orders = result.unwrap();
+		assert_eq!(orders.len(), 1);
+		assert_eq!(orders[0].id, "test_order_123");
+		assert_eq!(orders[0].status, OrderStatus::Pending);
+	}
+
+	#[tokio::test]
+	async fn test_recover_orphaned_intents() {
+		let mut mock_storage = MockStorageInterface::new();
+		let intent = create_test_intent();
+
+		// Serialize intent for storage mock
+		let intent_bytes = serde_json::to_vec(&intent).unwrap();
+		let intent_key = format!("intents:{}", intent.id);
+		let intent_key_clone = intent_key.clone();
+
+		// Mock retrieve_all for intents
+		mock_storage
+			.expect_query()
+			.with(eq("intents"), always())
+			.times(1)
+			.returning({
+				let intent_key_clone = intent_key_clone.clone();
+				move |_, _| {
+					let key = intent_key_clone.clone();
+					Box::pin(async move { Ok(vec![key]) })
+				}
+			});
+
+		mock_storage.expect_get_batch().times(1).returning({
+			let intent_key = intent_key.clone();
+			let intent_bytes = intent_bytes.clone();
+			move |_| {
+				let key = intent_key.clone();
+				let bytes = intent_bytes.clone();
+				Box::pin(async move { Ok(vec![(key, bytes)]) })
+			}
+		});
+
+		// Mock exists check for corresponding order (returns false = orphaned)
+		mock_storage
+			.expect_exists()
+			.with(eq("orders:test_intent_456"))
+			.times(1)
+			.returning(|_| Box::pin(async { Ok(false) }));
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
+			HashMap::new();
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::new();
+		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let event_bus = EventBus::new(100);
+
+		let recovery_service =
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+
+		let result = recovery_service.recover_orphaned_intents().await;
+		assert!(result.is_ok());
+
+		let orphaned = result.unwrap();
+		assert_eq!(orphaned.len(), 1);
+		assert_eq!(orphaned[0].id, "test_intent_456");
+	}
+
+	#[tokio::test]
+	async fn test_reconcile_with_blockchain_needs_execution() {
+		let order = create_test_order_with_status(OrderStatus::Created);
+
+		let mock_storage = MockStorageInterface::new();
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
+			HashMap::new();
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::new();
+		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let event_bus = EventBus::new(100);
+
+		let recovery_service =
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+
+		let result = recovery_service.reconcile_with_blockchain(&order).await;
+		assert!(result.is_ok());
+
+		match result.unwrap() {
+			ReconcileResult::NeedsExecution => {},
+			_ => panic!("Expected NeedsExecution"),
+		}
+	}
+
+	// For tests that need to mock delivery status, create a mock implementation and add it to the DeliveryService
+	#[tokio::test]
+	async fn test_reconcile_with_blockchain_needs_fill() {
+		let mut mock_delivery = MockDeliveryInterface::new();
+		let mut order = create_test_order_with_status(OrderStatus::Executed);
+		order.prepare_tx_hash = Some(TransactionHash(vec![0xaa; 32]));
+
+		// Mock successful prepare transaction
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(TransactionHash(vec![0xaa; 32])), eq(1u64))
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async {
+					Ok(solver_types::TransactionReceipt {
+						hash: TransactionHash(vec![0xaa; 32]),
+						block_number: 12345,
+						success: true,
+					})
+				})
+			});
+
+		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
+			HashMap::from([(
+				1u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]);
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+
+		let mock_storage = MockStorageInterface::new();
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::new();
+		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let event_bus = EventBus::new(100);
+
+		let recovery_service =
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+
+		let result = recovery_service.reconcile_with_blockchain(&order).await;
+		assert!(result.is_ok());
+
+		match result.unwrap() {
+			ReconcileResult::NeedsFill => {},
+			_ => panic!("Expected NeedsFill"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_reconcile_with_blockchain_needs_claim() {
+		let mut mock_delivery = MockDeliveryInterface::new();
+		let mut order = create_test_order_with_status(OrderStatus::Executed);
+		order.fill_tx_hash = Some(TransactionHash(vec![0xbb; 32]));
+		order.fill_proof = Some(create_test_fill_proof());
+
+		// Mock successful fill transaction
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(TransactionHash(vec![0xbb; 32])), eq(137u64))
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async {
+					Ok(solver_types::TransactionReceipt {
+						hash: TransactionHash(vec![0xbb; 32]),
+						block_number: 12345,
+						success: true,
+					})
+				})
+			});
+
+		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
+			HashMap::from([(
+				137u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]);
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+
+		let mock_storage = MockStorageInterface::new();
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::new();
+		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let event_bus = EventBus::new(100);
+
+		let recovery_service =
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+
+		let result = recovery_service.reconcile_with_blockchain(&order).await;
+		assert!(result.is_ok());
+
+		match result.unwrap() {
+			ReconcileResult::NeedsClaim { fill_proof } => {
+				assert!(fill_proof.is_some());
+			},
+			_ => panic!("Expected NeedsClaim"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_reconcile_with_blockchain_finalized() {
+		let mut mock_delivery = MockDeliveryInterface::new();
+		let mut order = create_test_order_with_status(OrderStatus::Settled);
+		order.claim_tx_hash = Some(TransactionHash(vec![0xcc; 32]));
+
+		// Mock successful claim transaction
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(TransactionHash(vec![0xcc; 32])), eq(1u64))
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async {
+					Ok(solver_types::TransactionReceipt {
+						hash: TransactionHash(vec![0xcc; 32]),
+						block_number: 12345,
+						success: true,
+					})
+				})
+			});
+
+		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
+			HashMap::from([(
+				1u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]);
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+
+		let mock_storage = MockStorageInterface::new();
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::new();
+		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let event_bus = EventBus::new(100);
+
+		let recovery_service =
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+
+		let result = recovery_service.reconcile_with_blockchain(&order).await;
+		assert!(result.is_ok());
+
+		match result.unwrap() {
+			ReconcileResult::Finalized => {},
+			_ => panic!("Expected Finalized"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_reconcile_with_blockchain_failed_transaction() {
+		let mut mock_delivery = MockDeliveryInterface::new();
+		let mut order = create_test_order_with_status(OrderStatus::Executed);
+		order.prepare_tx_hash = Some(TransactionHash(vec![0xaa; 32]));
+
+		// Mock failed prepare transaction
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(TransactionHash(vec![0xaa; 32])), eq(1u64))
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async {
+					Ok(solver_types::TransactionReceipt {
+						hash: TransactionHash(vec![0xaa; 32]),
+						block_number: 12345,
+						success: false,
+					})
+				})
+			});
+
+		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
+			HashMap::from([(
+				1u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]);
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+
+		let mock_storage = MockStorageInterface::new();
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::new();
+		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let event_bus = EventBus::new(100);
+
+		let recovery_service =
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+
+		let result = recovery_service.reconcile_with_blockchain(&order).await;
+		assert!(result.is_ok());
+
+		match result.unwrap() {
+			ReconcileResult::Failed(TransactionType::Prepare) => {},
+			_ => panic!("Expected Failed(Prepare)"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_publish_recovery_event_needs_claim_ready() {
+		let mock_storage = MockStorageInterface::new();
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
+			HashMap::new();
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+
+		// Create empty settlement service - this will cause can_claim to return false,
+		// which should trigger spawn_settlement_monitor instead of publishing ClaimReady
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::new();
+		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let event_bus = EventBus::new(100);
+
+		// Subscribe to events
+		let mut receiver = event_bus.subscribe();
+
+		let recovery_service =
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+
+		let order = create_test_order_with_status(OrderStatus::Executed);
+		recovery_service
+			.publish_recovery_event(
+				order.clone(),
+				ReconcileResult::NeedsClaim {
+					fill_proof: Some(create_test_fill_proof()),
+				},
+			)
+			.await;
+
+		// Since can_claim will return false (no settlement impl found),
+		// no ClaimReady event should be published, so receiver should be empty
+		assert!(
+			receiver.try_recv().is_err(),
+			"Expected no event to be published when can_claim returns false"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_publish_recovery_event_needs_execution() {
+		let mock_storage = MockStorageInterface::new();
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
+			HashMap::new();
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::new();
+		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let event_bus = EventBus::new(100);
+
+		// Subscribe to events
+		let mut receiver = event_bus.subscribe();
+
+		let recovery_service =
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+
+		let order = create_test_order_with_status(OrderStatus::Created);
+		recovery_service
+			.publish_recovery_event(order.clone(), ReconcileResult::NeedsExecution)
+			.await;
+
+		// Check that the correct event was published
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Executing {
+				order: event_order,
+				params: _,
+			}) => {
+				assert_eq!(event_order.id, order.id);
+			},
+			_ => panic!("Expected Order::Executing event"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_recovery_report_structure() {
+		let report = RecoveryReport {
+			total_orders: 5,
+			orphaned_intents: 2,
+			reconciled_orders: 4,
+		};
+
+		assert_eq!(report.total_orders, 5);
+		assert_eq!(report.orphaned_intents, 2);
+		assert_eq!(report.reconciled_orders, 4);
+
+		// Test default
+		let default_report = RecoveryReport::default();
+		assert_eq!(default_report.total_orders, 0);
+		assert_eq!(default_report.orphaned_intents, 0);
+		assert_eq!(default_report.reconciled_orders, 0);
+	}
+
+	#[tokio::test]
+	async fn test_recovery_error_types() {
+		let storage_error = RecoveryError::Storage("test storage error".to_string());
+		assert!(storage_error.to_string().contains("Storage error"));
+
+		let state_error = RecoveryError::StateMachine("test state error".to_string());
+		assert!(state_error.to_string().contains("State machine error"));
+
+		let delivery_error = RecoveryError::Delivery("test delivery error".to_string());
+		assert!(delivery_error.to_string().contains("Delivery error"));
+
+		let settlement_error = RecoveryError::Settlement("test settlement error".to_string());
+		assert!(settlement_error.to_string().contains("Settlement error"));
+	}
+}
