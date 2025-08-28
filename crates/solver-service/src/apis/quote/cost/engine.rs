@@ -10,7 +10,6 @@ use solver_types::{
 	Address, ExecutionParams, FillProof, Order, OrderStatus, Transaction, TransactionHash,
 };
 
-
 pub struct CostEngine;
 
 impl CostEngine {
@@ -101,7 +100,7 @@ impl CostEngine {
 		// Validate pricing support for this quote
 		self.validate_pricing_support(quote, pricing_service)
 			.await?;
-		
+
 		let pricing = pricing_service.config();
 		let (origin_chain_id, dest_chain_id) = self.extract_origin_dest_chain_ids(quote)?;
 

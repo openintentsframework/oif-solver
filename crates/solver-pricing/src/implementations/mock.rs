@@ -172,10 +172,7 @@ impl PricingInterface for MockPricing {
 			let result = eth_amount_f64 * price_f64;
 			Ok(format!("{:.2}", result))
 		} else {
-			Err(PricingError::PriceNotAvailable(format!(
-				"ETH/{}",
-				currency
-			)))
+			Err(PricingError::PriceNotAvailable(format!("ETH/{}", currency)))
 		}
 	}
 
@@ -196,7 +193,9 @@ impl PricingInterface for MockPricing {
 				.map_err(|e| PricingError::InvalidData(format!("Invalid ETH price: {}", e)))?;
 
 			if eth_price_f64 == 0.0 {
-				return Err(PricingError::InvalidData("ETH price cannot be zero".to_string()));
+				return Err(PricingError::InvalidData(
+					"ETH price cannot be zero".to_string(),
+				));
 			}
 
 			// Convert currency to ETH, then to wei
@@ -205,10 +204,7 @@ impl PricingInterface for MockPricing {
 
 			Ok(format!("{:.0}", wei_amount))
 		} else {
-			Err(PricingError::PriceNotAvailable(format!(
-				"ETH/{}",
-				currency
-			)))
+			Err(PricingError::PriceNotAvailable(format!("ETH/{}", currency)))
 		}
 	}
 }
