@@ -140,8 +140,8 @@ impl SettlementInterface for DirectSettlement {
 
 	/// Gets attestation data for a filled order and generates a fill proof.
 	///
-	/// Since the transaction is already confirmed by the delivery service,
-	/// this method just extracts necessary data for claim generation.
+	/// Retrieves transaction receipt and block data from the destination chain
+	/// to construct proof of fill execution.
 	async fn get_attestation(
 		&self,
 		order: &Order,
@@ -294,10 +294,10 @@ impl SettlementInterface for DirectSettlement {
 		true
 	}
 
-	/// Generates a PostFill transaction that calls AlwaysYesOracle.isProven.
+	/// Generates a PostFill transaction for oracle interaction.
 	///
-	/// This tests the PostFill mechanism by calling isProven on the destination
-	/// chain's output oracle.
+	/// Creates a transaction that would interact with the output oracle
+	/// on the destination chain after fill execution.
 	async fn generate_post_fill_transaction(
 		&self,
 		order: &Order,
@@ -333,10 +333,10 @@ impl SettlementInterface for DirectSettlement {
 		}))
 	}
 
-	/// Generates a PreClaim transaction that calls AlwaysYesOracle.efficientRequireProven.
+	/// Generates a PreClaim transaction for oracle interaction.
 	///
-	/// This tests the PreClaim mechanism by calling efficientRequireProven on the
-	/// origin chain's input oracle.
+	/// Creates a transaction that would interact with the input oracle
+	/// on the origin chain before claiming rewards.
 	async fn generate_pre_claim_transaction(
 		&self,
 		order: &Order,
@@ -376,12 +376,12 @@ impl SettlementInterface for DirectSettlement {
 /// Factory function to create a settlement provider from configuration.
 ///
 /// Required configuration parameters:
-/// - `order`: The order type this implementation handles (e.g., "eip7683")
-/// - `network_ids`: Array of network IDs to monitor
-/// - `oracle_addresses`: Table mapping network_id -> oracle address
+/// - `oracles`: Table with input and output oracle configurations
+/// - `routes`: Table mapping oracle routes for different chains
+/// - `dispute_period_seconds`: Dispute period duration (0-86400 seconds)
 ///
 /// Optional configuration parameters:
-/// - `dispute_period_seconds`: Dispute period duration (default: 300)
+/// - `oracle_selection_strategy`: Strategy for oracle selection (default: round-robin)
 pub fn create_settlement(
 	config: &toml::Value,
 	networks: &NetworksConfig,
