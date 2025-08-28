@@ -776,6 +776,8 @@ mod tests {
 			solver_address: Address(vec![0x12; 20]),
 			created_at: 1234567890,
 			updated_at: 1234567890,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
 			prepare_tx_hash: None,
 			fill_tx_hash: None,
 			claim_tx_hash: None,
@@ -856,7 +858,7 @@ mod tests {
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
 
 		// Test recovery with no orders
 		let result = recovery_service.recover_state().await;
@@ -904,7 +906,7 @@ mod tests {
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
 
 		let result = recovery_service.load_active_orders().await;
 		assert!(result.is_ok());
@@ -966,7 +968,7 @@ mod tests {
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
 
 		let result = recovery_service.recover_orphaned_intents().await;
 		assert!(result.is_ok());
@@ -992,7 +994,7 @@ mod tests {
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
 		assert!(result.is_ok());
@@ -1041,7 +1043,7 @@ mod tests {
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
 		assert!(result.is_ok());
@@ -1058,17 +1060,19 @@ mod tests {
 		let mut order = create_test_order_with_status(OrderStatus::Executed);
 		order.fill_tx_hash = Some(TransactionHash(vec![0xbb; 32]));
 		order.fill_proof = Some(create_test_fill_proof());
+		// Add pre_claim_tx_hash to trigger the NeedsClaim path
+		order.pre_claim_tx_hash = Some(TransactionHash(vec![0xcc; 32]));
 
-		// Mock successful fill transaction
+		// Mock successful pre-claim transaction status - this will trigger NeedsClaim
 		mock_delivery
 			.expect_get_receipt()
-			.with(eq(TransactionHash(vec![0xbb; 32])), eq(137u64))
+			.with(eq(TransactionHash(vec![0xcc; 32])), eq(1u64)) // input chain
 			.times(1)
 			.returning(|_, _| {
 				Box::pin(async {
 					Ok(solver_types::TransactionReceipt {
-						hash: TransactionHash(vec![0xbb; 32]),
-						block_number: 12345,
+						hash: TransactionHash(vec![0xcc; 32]),
+						block_number: 12344,
 						success: true,
 					})
 				})
@@ -1076,7 +1080,7 @@ mod tests {
 
 		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
 			HashMap::from([(
-				137u64,
+				1u64, // Use chain 1 for pre-claim transaction
 				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 			)]);
 		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
@@ -1090,7 +1094,7 @@ mod tests {
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
 		assert!(result.is_ok());
@@ -1140,7 +1144,7 @@ mod tests {
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
 		assert!(result.is_ok());
@@ -1188,7 +1192,7 @@ mod tests {
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
 		assert!(result.is_ok());
@@ -1201,7 +1205,30 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_publish_recovery_event_needs_claim_ready() {
-		let mock_storage = MockStorageInterface::new();
+		let mut mock_storage = MockStorageInterface::new();
+
+		// Mock the exists call first
+		mock_storage
+			.expect_exists()
+			.with(eq("orders:test_order_123"))
+			.returning(|_| Box::pin(async { Ok(true) }));
+
+		// Mock the get_bytes call that happens when retrieving the order
+		let order = create_test_order_with_status(OrderStatus::Executed);
+		let order_bytes = serde_json::to_vec(&order).unwrap();
+		mock_storage
+			.expect_get_bytes()
+			.with(eq("orders:test_order_123"))
+			.returning(move |_| {
+				let order_bytes = order_bytes.clone();
+				Box::pin(async move { Ok(order_bytes) })
+			});
+
+		// Mock the set_bytes call that happens when updating the order
+		mock_storage
+			.expect_set_bytes()
+			.returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
@@ -1219,9 +1246,8 @@ mod tests {
 		let mut receiver = event_bus.subscribe();
 
 		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
 
-		let order = create_test_order_with_status(OrderStatus::Executed);
 		recovery_service
 			.publish_recovery_event(
 				order.clone(),
@@ -1241,7 +1267,30 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_publish_recovery_event_needs_execution() {
-		let mock_storage = MockStorageInterface::new();
+		let mut mock_storage = MockStorageInterface::new();
+
+		// Mock the exists call first
+		mock_storage
+			.expect_exists()
+			.with(eq("orders:test_order_123"))
+			.returning(|_| Box::pin(async { Ok(true) }));
+
+		// Mock the get_bytes call that happens when retrieving the order
+		let order = create_test_order_with_status(OrderStatus::Created);
+		let order_bytes = serde_json::to_vec(&order).unwrap();
+		mock_storage
+			.expect_get_bytes()
+			.with(eq("orders:test_order_123"))
+			.returning(move |_| {
+				let order_bytes = order_bytes.clone();
+				Box::pin(async move { Ok(order_bytes) })
+			});
+
+		// Mock the set_bytes call that happens when updating the order
+		mock_storage
+			.expect_set_bytes()
+			.returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
@@ -1256,7 +1305,7 @@ mod tests {
 		let mut receiver = event_bus.subscribe();
 
 		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus, 10);
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
 
 		let order = create_test_order_with_status(OrderStatus::Created);
 		recovery_service

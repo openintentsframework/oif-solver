@@ -269,6 +269,8 @@ mod tests {
 			created_at: 1000000,
 			updated_at: 1000000,
 			status: OrderStatus::Created,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
 			data: serde_json::json!({}),
 			solver_address: parse_address("1234567890123456789012345678901234567890").unwrap(),
 			quote_id: Some("quote_1".to_string()),

@@ -2332,6 +2332,21 @@ dependencies = [
 
 [[package]]
 name = "mockall"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43766c2b5203b10de348ffe19f7e54564b64f3d6018ff7648d1e2d6d3a0f0a48"
+dependencies = [
+ "cfg-if",
+ "downcast",
+ "fragile",
+ "lazy_static",
+ "mockall_derive 0.12.1",
+ "predicates",
+ "predicates-tree",
+]
+
+[[package]]
+name = "mockall"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39a6bfcc6c8c7eed5ee98b9c3e33adc726054389233e201c95dab2d41a3839d2"
@@ -2339,9 +2354,21 @@ dependencies = [
  "cfg-if",
  "downcast",
  "fragile",
- "mockall_derive",
+ "mockall_derive 0.13.1",
  "predicates",
  "predicates-tree",
+]
+
+[[package]]
+name = "mockall_derive"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af7cbce79ec385a1d4f54baa90a76401eb15d9cab93685f62e7e9f942aa00ae2"
+dependencies = [
+ "cfg-if",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -3452,9 +3479,10 @@ dependencies = [
  "alloy-signer-local",
  "async-trait",
  "hex",
- "mockall",
+ "mockall 0.13.1",
  "solver-types",
  "thiserror 1.0.69",
+ "tokio",
  "toml",
 ]
 
@@ -3478,7 +3506,7 @@ dependencies = [
  "alloy-primitives",
  "async-trait",
  "chrono",
- "mockall",
+ "mockall 0.13.1",
  "once_cell",
  "serde",
  "serde_json",
@@ -3512,7 +3540,7 @@ dependencies = [
  "alloy-transport-http",
  "async-trait",
  "hex",
- "mockall",
+ "mockall 0.13.1",
  "reqwest",
  "serde",
  "serde_json",
@@ -3541,7 +3569,6 @@ dependencies = [
  "axum",
  "futures",
  "hex",
- "mockall",
  "reqwest",
  "serde",
  "serde_json",
@@ -3564,7 +3591,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "hex",
- "mockall",
+ "mockall 0.13.1",
  "serde",
  "serde_json",
  "solver-types",
@@ -3586,7 +3613,7 @@ dependencies = [
  "clap",
  "env_logger",
  "futures",
- "mockall",
+ "mockall 0.12.1",
  "once_cell",
  "reqwest",
  "serde",
@@ -3640,7 +3667,7 @@ dependencies = [
  "async-trait",
  "fs2",
  "futures",
- "mockall",
+ "mockall 0.13.1",
  "serde",
  "serde_json",
  "solver-types",
