@@ -343,3 +343,561 @@ impl solver_types::ImplementationRegistry for Registry {
 }
 
 impl crate::SettlementRegistry for Registry {}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{OracleSelectionStrategy, SettlementInterface};
+	use serde_json::json;
+	use solver_types::ImplementationRegistry;
+	use solver_types::{
+		networks::{NetworkConfig, RpcEndpoint},
+		Address, OrderStatus, TransactionHash,
+	};
+	use std::collections::HashMap;
+
+	// Helper function to create Address from hex string
+	fn addr(hex: &str) -> Address {
+		let hex_str = hex::decode(hex.trim_start_matches("0x")).unwrap();
+		Address(hex_str)
+	}
+
+	fn create_test_networks() -> NetworksConfig {
+		let mut networks = HashMap::new();
+		networks.insert(
+			1,
+			NetworkConfig {
+				rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
+				input_settler_address: addr("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9"),
+				output_settler_address: addr("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
+				tokens: vec![],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+			},
+		);
+		networks.insert(
+			2,
+			NetworkConfig {
+				rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8546".to_string())],
+				input_settler_address: addr("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9"),
+				output_settler_address: addr("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
+				tokens: vec![],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+			},
+		);
+		networks
+	}
+
+	// Fix the create_test_oracle_config function
+	fn create_test_oracle_config() -> OracleConfig {
+		let mut input_oracles = HashMap::new();
+		input_oracles.insert(1, vec![addr("1111111111111111111111111111111111111111")]);
+
+		let mut output_oracles = HashMap::new();
+		output_oracles.insert(2, vec![addr("2222222222222222222222222222222222222222")]);
+
+		// Fix: routes should map u64 -> Vec<u64>, not (u64, u64) -> Address
+		let mut routes = HashMap::new();
+		routes.insert(1, vec![2]); // Network 1 can route to network 2
+
+		OracleConfig {
+			input_oracles,
+			output_oracles,
+			routes,
+			selection_strategy: OracleSelectionStrategy::RoundRobin,
+		}
+	}
+
+	fn create_test_order() -> Order {
+		Order {
+			id: "test-order".to_string(),
+			standard: "eip7683".to_string(),
+			created_at: 1640995200,
+			updated_at: 1640995200,
+			status: OrderStatus::Executed,
+			data: json!({
+				"order_id": "0x1234567890123456789012345678901234567890123456789012345678901234",
+				"nonce": "42",
+				"expires": "1640995800"
+			}),
+			solver_address: addr("1234567890123456789012345678901234567890"),
+			quote_id: Some("quote-test".to_string()),
+			input_chain_ids: vec![1],
+			output_chain_ids: vec![2],
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: Some(TransactionHash(vec![0u8; 32])),
+			claim_tx_hash: None,
+			fill_proof: None,
+		}
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_direct_settlement_new_success() {
+		let networks = create_test_networks();
+		let oracle_config = create_test_oracle_config();
+
+		let result = DirectSettlement::new(&networks, oracle_config, 300).await;
+		assert!(result.is_ok());
+
+		let settlement = result.unwrap();
+		assert_eq!(settlement.dispute_period_seconds, 300);
+		assert!(settlement.providers.contains_key(&1));
+		assert!(settlement.providers.contains_key(&2));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_direct_settlement_new_missing_network() {
+		let mut networks = create_test_networks();
+		networks.remove(&1); // Remove network 1
+		let oracle_config = create_test_oracle_config();
+
+		let result = DirectSettlement::new(&networks, oracle_config, 300).await;
+		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
+		if let Err(SettlementError::ValidationFailed(msg)) = result {
+			assert!(msg.contains("Network 1 not found"));
+		}
+	}
+
+	#[test]
+	fn test_config_schema_validation_valid() {
+		let schema = DirectSettlementSchema;
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"dispute_period_seconds".to_string(),
+				toml::Value::Integer(300),
+			);
+			table.insert(
+				"oracles".to_string(),
+				toml::Value::Table({
+					let mut oracles = toml::map::Map::new();
+					oracles.insert(
+						"input".to_string(),
+						toml::Value::Table(toml::map::Map::new()),
+					);
+					oracles.insert(
+						"output".to_string(),
+						toml::Value::Table(toml::map::Map::new()),
+					);
+					oracles
+				}),
+			);
+			table.insert(
+				"routes".to_string(),
+				toml::Value::Table(toml::map::Map::new()),
+			);
+			table
+		});
+
+		let result = schema.validate(&config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_config_schema_validation_missing_required_field() {
+		let schema = DirectSettlementSchema;
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			// Missing dispute_period_seconds
+			table.insert(
+				"oracles".to_string(),
+				toml::Value::Table({
+					let mut oracles = toml::map::Map::new();
+					oracles.insert(
+						"input".to_string(),
+						toml::Value::Table(toml::map::Map::new()),
+					);
+					oracles.insert(
+						"output".to_string(),
+						toml::Value::Table(toml::map::Map::new()),
+					);
+					oracles
+				}),
+			);
+			table.insert(
+				"routes".to_string(),
+				toml::Value::Table(toml::map::Map::new()),
+			);
+			table
+		});
+
+		let result = schema.validate(&config);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_config_schema_validation_invalid_dispute_period() {
+		let schema = DirectSettlementSchema;
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"dispute_period_seconds".to_string(),
+				toml::Value::Integer(100000), // Too large
+			);
+			table.insert(
+				"oracles".to_string(),
+				toml::Value::Table({
+					let mut oracles = toml::map::Map::new();
+					oracles.insert(
+						"input".to_string(),
+						toml::Value::Table(toml::map::Map::new()),
+					);
+					oracles.insert(
+						"output".to_string(),
+						toml::Value::Table(toml::map::Map::new()),
+					);
+					oracles
+				}),
+			);
+			table.insert(
+				"routes".to_string(),
+				toml::Value::Table(toml::map::Map::new()),
+			);
+			table
+		});
+
+		let result = schema.validate(&config);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_static_config_validation() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"dispute_period_seconds".to_string(),
+				toml::Value::Integer(300),
+			);
+			table.insert(
+				"oracles".to_string(),
+				toml::Value::Table({
+					let mut oracles = toml::map::Map::new();
+					oracles.insert(
+						"input".to_string(),
+						toml::Value::Table(toml::map::Map::new()),
+					);
+					oracles.insert(
+						"output".to_string(),
+						toml::Value::Table(toml::map::Map::new()),
+					);
+					oracles
+				}),
+			);
+			table.insert(
+				"routes".to_string(),
+				toml::Value::Table(toml::map::Map::new()),
+			);
+			table
+		});
+
+		let result = DirectSettlementSchema::validate_config(&config);
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_create_settlement_success() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"dispute_period_seconds".to_string(),
+				toml::Value::Integer(300),
+			);
+			table.insert(
+				"oracles".to_string(),
+				toml::Value::Table({
+					let mut oracles = toml::map::Map::new();
+					oracles.insert(
+						"input".to_string(),
+						toml::Value::Table({
+							let mut input = toml::map::Map::new();
+							input.insert(
+								"1".to_string(),
+								toml::Value::Array(vec![toml::Value::String(
+									"0x1111111111111111111111111111111111111111".to_string(),
+								)]),
+							);
+							input
+						}),
+					);
+					oracles.insert(
+						"output".to_string(),
+						toml::Value::Table({
+							let mut output = toml::map::Map::new();
+							output.insert(
+								"2".to_string(),
+								toml::Value::Array(vec![toml::Value::String(
+									"0x2222222222222222222222222222222222222222".to_string(),
+								)]),
+							);
+							output
+						}),
+					);
+					oracles
+				}),
+			);
+			table.insert(
+				"routes".to_string(),
+				toml::Value::Table({
+					let mut routes = toml::map::Map::new();
+					// Fix: Use correct routes format - chain_id -> [destination_chain_ids]
+					routes.insert(
+						"1".to_string(),
+						toml::Value::Array(vec![toml::Value::Integer(2)]),
+					);
+					routes
+				}),
+			);
+			table
+		});
+
+		let networks = create_test_networks();
+		let result = create_settlement(&config, &networks);
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_create_settlement_invalid_config() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			// Missing required fields
+			table.insert(
+				"dispute_period_seconds".to_string(),
+				toml::Value::Integer(300),
+			);
+			table
+		});
+
+		let networks = create_test_networks();
+		let result = create_settlement(&config, &networks);
+		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_settlement_interface_oracle_config() {
+		let networks = create_test_networks();
+		let oracle_config = create_test_oracle_config();
+
+		let settlement = DirectSettlement::new(&networks, oracle_config.clone(), 300)
+			.await
+			.unwrap();
+
+		let returned_config = settlement.oracle_config();
+		assert_eq!(
+			returned_config.input_oracles.len(),
+			oracle_config.input_oracles.len()
+		);
+		assert_eq!(
+			returned_config.output_oracles.len(),
+			oracle_config.output_oracles.len()
+		);
+		assert_eq!(returned_config.routes.len(), oracle_config.routes.len());
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_settlement_interface_config_schema() {
+		let networks = create_test_networks();
+		let oracle_config = create_test_oracle_config();
+
+		let settlement = DirectSettlement::new(&networks, oracle_config, 300)
+			.await
+			.unwrap();
+
+		let schema = settlement.config_schema();
+
+		// Test valid config
+		let valid_config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"dispute_period_seconds".to_string(),
+				toml::Value::Integer(300),
+			);
+			table.insert(
+				"oracles".to_string(),
+				toml::Value::Table({
+					let mut oracles = toml::map::Map::new();
+					oracles.insert(
+						"input".to_string(),
+						toml::Value::Table(toml::map::Map::new()),
+					);
+					oracles.insert(
+						"output".to_string(),
+						toml::Value::Table(toml::map::Map::new()),
+					);
+					oracles
+				}),
+			);
+			table.insert(
+				"routes".to_string(),
+				toml::Value::Table(toml::map::Map::new()),
+			);
+			table
+		});
+		assert!(schema.validate(&valid_config).is_ok());
+	}
+
+	#[test]
+	fn test_registry_name() {
+		assert_eq!(
+			<Registry as solver_types::ImplementationRegistry>::NAME,
+			"direct"
+		);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_registry_factory() {
+		let factory = Registry::factory();
+
+		// Test that factory function exists and has correct type
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"dispute_period_seconds".to_string(),
+				toml::Value::Integer(300),
+			);
+			table.insert(
+				"oracles".to_string(),
+				toml::Value::Table({
+					let mut oracles = toml::map::Map::new();
+					oracles.insert(
+						"input".to_string(),
+						toml::Value::Table({
+							let mut input = toml::map::Map::new();
+							input.insert(
+								"1".to_string(),
+								toml::Value::Array(vec![toml::Value::String(
+									"0x1111111111111111111111111111111111111111".to_string(),
+								)]),
+							);
+							input
+						}),
+					);
+					oracles.insert(
+						"output".to_string(),
+						toml::Value::Table({
+							let mut output = toml::map::Map::new();
+							output.insert(
+								"2".to_string(),
+								toml::Value::Array(vec![toml::Value::String(
+									"0x2222222222222222222222222222222222222222".to_string(),
+								)]),
+							);
+							output
+						}),
+					);
+					oracles
+				}),
+			);
+			table.insert(
+				"routes".to_string(),
+				toml::Value::Table({
+					let mut routes = toml::map::Map::new();
+					// Fix: routes expects chain_id -> [destination_chain_ids]
+					routes.insert(
+						"1".to_string(),
+						toml::Value::Array(vec![toml::Value::Integer(2)]),
+					);
+					routes
+				}),
+			);
+			table
+		});
+
+		let networks = create_test_networks();
+		let result = factory(&config, &networks);
+		assert!(result.is_ok());
+	}
+
+	// Helper function tests
+	#[test]
+	fn test_create_test_networks() {
+		let networks = create_test_networks();
+		assert!(networks.contains_key(&1));
+		assert!(networks.contains_key(&2));
+		assert_eq!(
+			networks.get(&1).unwrap().get_http_url(),
+			Some("http://localhost:8545")
+		);
+		assert_eq!(
+			networks.get(&2).unwrap().get_http_url(),
+			Some("http://localhost:8546")
+		);
+	}
+
+	#[test]
+	fn test_create_test_oracle_config() {
+		let config = create_test_oracle_config();
+		assert!(config.input_oracles.contains_key(&1));
+		assert!(config.output_oracles.contains_key(&2));
+		assert!(config.routes.contains_key(&1)); // Changed from &(1, 2) to &1
+		assert!(matches!(
+			config.selection_strategy,
+			OracleSelectionStrategy::RoundRobin
+		));
+	}
+
+	#[test]
+	fn test_create_test_order() {
+		let order = create_test_order();
+		assert_eq!(order.id, "test-order");
+		assert_eq!(order.standard, "eip7683");
+		assert_eq!(order.input_chain_ids, vec![1]);
+		assert_eq!(order.output_chain_ids, vec![2]);
+		assert!(matches!(order.status, OrderStatus::Executed));
+	}
+
+	// Integration-style tests for error cases
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_direct_settlement_no_http_url() {
+		let mut networks = create_test_networks();
+		// Remove HTTP URL from network 1
+		networks.get_mut(&1).unwrap().rpc_urls.clear();
+		let oracle_config = create_test_oracle_config();
+
+		let result = DirectSettlement::new(&networks, oracle_config, 300).await;
+		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
+		if let Err(SettlementError::ValidationFailed(msg)) = result {
+			assert!(msg.contains("No HTTP RPC URL configured"));
+		}
+	}
+
+	#[test]
+	fn test_config_with_optional_fields() {
+		let schema = DirectSettlementSchema;
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"dispute_period_seconds".to_string(),
+				toml::Value::Integer(300),
+			);
+			table.insert(
+				"oracles".to_string(),
+				toml::Value::Table({
+					let mut oracles = toml::map::Map::new();
+					oracles.insert(
+						"input".to_string(),
+						toml::Value::Table(toml::map::Map::new()),
+					);
+					oracles.insert(
+						"output".to_string(),
+						toml::Value::Table(toml::map::Map::new()),
+					);
+					oracles
+				}),
+			);
+			table.insert(
+				"routes".to_string(),
+				toml::Value::Table(toml::map::Map::new()),
+			);
+			table.insert(
+				"oracle_selection_strategy".to_string(),
+				toml::Value::String("round_robin".to_string()),
+			);
+			table
+		});
+
+		let result = schema.validate(&config);
+		assert!(result.is_ok());
+	}
+}
