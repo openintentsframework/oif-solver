@@ -45,6 +45,7 @@ use super::registry::PROTOCOL_REGISTRY;
 #[derive(Debug, Clone)]
 pub enum LockKind {
 	TheCompact { params: serde_json::Value },
+	Rhinestone { params: serde_json::Value },
 }
 
 /// Types of escrow mechanisms
@@ -81,10 +82,13 @@ impl CustodyStrategy {
 
 	fn handle_resource_lock(
 		&self,
-		lock: &solver_types::Lock,
+		lock: &solver_types::AssetLockReference,
 	) -> Result<CustodyDecision, QuoteError> {
 		let lock_kind = match lock.kind {
 			ApiLockKind::TheCompact => LockKind::TheCompact {
+				params: lock.params.clone().unwrap_or_default(),
+			},
+			ApiLockKind::Rhinestone => LockKind::Rhinestone {
 				params: lock.params.clone().unwrap_or_default(),
 			},
 		};

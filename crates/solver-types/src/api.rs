@@ -3,7 +3,7 @@
 //! This module defines the request and response types for the OIF Solver API
 //! endpoints, following the ERC-7683 Cross-Chain Intents Standard.
 use crate::standards::eip7930::InteropAddress;
-use alloy_primitives::U256;
+use alloy_primitives::Bytes;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -11,15 +11,14 @@ use std::fmt;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetAmount {
 	/// Asset address in ERC-7930 interoperable format
-	pub asset: String,
-	/// Amount as a big integer
-	#[serde(with = "u256_serde")]
-	pub amount: U256,
+	pub asset: InteropAddress,
+	/// Amount as a string to preserve precision (e.g., uint256)
+	pub amount: String,
 }
 
-/// Lock information for inputs that are already locked
+/// Asset lock reference for inputs that are already locked
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Lock {
+pub struct AssetLockReference {
 	/// Type of lock mechanism
 	pub kind: LockKind,
 	/// Lock-specific parameters
@@ -31,6 +30,7 @@ pub struct Lock {
 #[serde(rename_all = "kebab-case")]
 pub enum LockKind {
 	TheCompact,
+	Rhinestone,
 }
 
 /// Available input with lock information and user
@@ -40,11 +40,10 @@ pub struct AvailableInput {
 	pub user: InteropAddress,
 	/// Asset address in ERC-7930 interoperable format
 	pub asset: InteropAddress,
-	/// Amount as a big integer
-	#[serde(with = "u256_serde")]
-	pub amount: U256,
+	/// Amount as a string to preserve precision (e.g., uint256)
+	pub amount: String,
 	/// Lock information if asset is already locked
-	pub lock: Option<Lock>,
+	pub lock: Option<AssetLockReference>,
 }
 
 /// Requested output with receiver and optional calldata
@@ -54,11 +53,93 @@ pub struct RequestedOutput {
 	pub receiver: InteropAddress,
 	/// Asset address in ERC-7930 interoperable format
 	pub asset: InteropAddress,
-	/// Amount as a big integer
-	#[serde(with = "u256_serde")]
-	pub amount: U256,
+	/// Amount as a string to preserve precision (e.g., uint256)
+	pub amount: String,
 	/// Optional calldata for the output
 	pub calldata: Option<String>,
+}
+
+/// Requested output details with user field (used in quote responses)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestedOutputDetails {
+	/// User address in ERC-7930 interoperable format
+	pub user: InteropAddress,
+	/// Asset address in ERC-7930 interoperable format
+	pub asset: InteropAddress,
+	/// Amount as a string to preserve precision (e.g., uint256)
+	pub amount: String,
+	/// Optional calldata for the output
+	pub calldata: Option<String>,
+}
+
+/// Order type defining how providers must interpret amounts for swaps
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OrderType {
+	/// Exact-input (spend exactly the input amounts)
+	SwapSell,
+	/// Exact-output (receive exactly the output amounts)
+	SwapBuy,
+}
+
+/// Origin submission mode
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubmissionMode {
+	User,
+	Protocol,
+}
+
+/// Origin submission schemes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubmissionScheme {
+	Erc4337,
+	Permit2,
+	Erc20Permit,
+	Eip3009,
+}
+
+/// Origin submission configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OriginSubmission {
+	/// Submission mode
+	pub mode: SubmissionMode,
+	/// Supported schemes
+	#[serde(default)]
+	pub schemes: Vec<SubmissionScheme>,
+}
+
+/// API request for order submission matching OpenAPI PostOrderRequest.
+///
+/// This structure follows the OpenAPI 3.0.0 specification for order submission.
+/// Used by the discovery service to accept orders from users or other systems.
+///
+/// # Fields
+///
+/// * `order` - EIP-712 order data as encoded bytes
+/// * `signature` - EIP-712 signature as encoded bytes
+/// * `quote_id` - Quote identifier for linking to quote
+/// * `provider` - Provider/solver identifier  
+/// * `failure_handling` - How to handle execution failures
+/// * `origin_submission` - Origin submission configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostOrderRequest {
+	/// Order data as encoded bytes
+	pub order: Bytes,
+	/// Signature as encoded bytes
+	pub signature: Bytes,
+	/// Optional quote identifier
+	pub quote_id: Option<String>,
+	/// Provider identifier
+	pub provider: String,
+	/// Failure handling strategy
+	pub failure_handling: FailureHandling,
+	/// Origin submission configuration
+	#[serde(default)]
+	pub origin_submission: Option<OriginSubmission>,
 }
 
 /// Request for getting price quotes following UII standard
@@ -72,11 +153,17 @@ pub struct GetQuoteRequest {
 	/// Requested outputs
 	#[serde(rename = "requestedOutputs")]
 	pub requested_outputs: Vec<RequestedOutput>,
+	/// Order type defining how providers interpret amounts
+	#[serde(rename = "orderType")]
+	pub order_type: Option<OrderType>,
 	/// Minimum quote validity duration in seconds
 	#[serde(rename = "minValidUntil")]
 	pub min_valid_until: Option<u64>,
 	/// User preference for optimization
 	pub preference: Option<QuotePreference>,
+	/// Origin submission configuration
+	#[serde(rename = "originSubmission")]
+	pub origin_submission: Option<OriginSubmission>,
 }
 
 /// Quote optimization preferences following UII standard
@@ -92,9 +179,6 @@ pub enum QuotePreference {
 /// EIP-712 compliant order structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuoteOrder {
-	/// Signature type (eip-712 or erc-3009)
-	#[serde(rename = "signatureType")]
-	pub signature_type: SignatureType,
 	/// ERC-7930 interoperable address of the domain
 	pub domain: InteropAddress,
 	/// Primary type for EIP-712 signing
@@ -104,12 +188,18 @@ pub struct QuoteOrder {
 	pub message: serde_json::Value,
 }
 
-/// Supported signature types
+/// Available input for quote details (includes lockType instead of full lock)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SignatureType {
-	Eip712,
-	Erc3009,
+pub struct AvailableInputDetails {
+	/// User address in ERC-7930 interoperable format
+	pub user: InteropAddress,
+	/// Asset address in ERC-7930 interoperable format
+	pub asset: InteropAddress,
+	/// Amount as a string to preserve precision (e.g., uint256)
+	pub amount: String,
+	/// Lock type if asset is already locked
+	#[serde(rename = "lockType")]
+	pub lock_type: Option<LockKind>,
 }
 
 /// Quote details matching the request structure
@@ -117,10 +207,10 @@ pub enum SignatureType {
 pub struct QuoteDetails {
 	/// Requested outputs for this quote
 	#[serde(rename = "requestedOutputs")]
-	pub requested_outputs: Vec<RequestedOutput>,
+	pub requested_outputs: Vec<RequestedOutputDetails>,
 	/// Available inputs for this quote
 	#[serde(rename = "availableInputs")]
-	pub available_inputs: Vec<AvailableInput>,
+	pub available_inputs: Vec<AvailableInputDetails>,
 }
 
 /// A quote option following UII standard
@@ -157,11 +247,110 @@ pub struct GetQuoteResponse {
 	pub quotes: Vec<Quote>,
 }
 
+/// Failure handling strategies for order execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FailureHandling {
+	Retry,
+	RefundInstant,
+	RefundClaim,
+	NeedsNewSignature,
+	#[serde(untagged)]
+	PartialFill {
+		partial_fill: bool,
+		remainder: FailureHandlingStrategy,
+	},
+}
+
+/// Basic failure handling strategies
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FailureHandlingStrategy {
+	Retry,
+	RefundInstant,
+	RefundClaim,
+	NeedsNewSignature,
+}
+
+/// Order status values for API responses
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiOrderStatus {
+	Created,
+	Pending,
+	Executed,
+	Settled,
+	Finalized,
+	Failed,
+}
+
+/// Post order response status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PostOrderResponseStatus {
+	Received,
+	Rejected,
+	Error,
+}
+
+/// Response for posting an order
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostOrderResponse {
+	/// Assigned order ID
+	#[serde(rename = "orderId")]
+	pub order_id: Option<String>,
+	/// Response status
+	pub status: PostOrderResponseStatus,
+	/// Status message
+	pub message: Option<String>,
+	/// Order data (if applicable)
+	pub order: Option<serde_json::Value>,
+}
+
+/// Settlement information for API responses
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiSettlement {
+	/// Settlement mechanism type
+	#[serde(rename = "type")]
+	pub settlement_type: SettlementType,
+	/// Settlement-specific data
+	pub data: serde_json::Value,
+}
+
+/// Request for getting order details
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetOrderRequest {
+	/// Order ID to retrieve
+	pub id: String,
+}
+
 /// Response containing order details.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetOrderResponse {
-	/// Order details
-	pub order: crate::order::OrderResponse,
+	/// Order ID
+	pub id: String,
+	/// Order status
+	pub status: ApiOrderStatus,
+	/// Creation timestamp
+	#[serde(rename = "createdAt")]
+	pub created_at: u64,
+	/// Last update timestamp
+	#[serde(rename = "updatedAt")]
+	pub updated_at: u64,
+	/// Associated quote ID
+	#[serde(rename = "quoteId")]
+	pub quote_id: Option<String>,
+	/// Input amount
+	#[serde(rename = "inputAmount")]
+	pub input_amount: AssetAmount,
+	/// Output amount
+	#[serde(rename = "outputAmount")]
+	pub output_amount: AssetAmount,
+	/// Settlement information
+	pub settlement: ApiSettlement,
+	/// Fill transaction details
+	#[serde(rename = "fillTransaction")]
+	pub fill_transaction: Option<serde_json::Value>,
 }
 
 /// API error response.
@@ -293,27 +482,6 @@ impl axum::response::IntoResponse for APIError {
 
 		let error_response = self.to_error_response();
 		(status, Json(error_response)).into_response()
-	}
-}
-
-/// Serde module for U256 serialization/deserialization.
-pub mod u256_serde {
-	use alloy_primitives::U256;
-	use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
-
-	pub fn serialize<S>(value: &U256, serializer: S) -> Result<S::Ok, S::Error>
-	where
-		S: Serializer,
-	{
-		value.to_string().serialize(serializer)
-	}
-
-	pub fn deserialize<'de, D>(deserializer: D) -> Result<U256, D::Error>
-	where
-		D: Deserializer<'de>,
-	{
-		let s = String::deserialize(deserializer)?;
-		U256::from_str_radix(&s, 10).map_err(D::Error::custom)
 	}
 }
 

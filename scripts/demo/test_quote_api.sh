@@ -1,6 +1,9 @@
 #!/bin/bash
 
 # Human-friendly Quote API test runner with balances and scenario coverage
+# Usage: 
+#   ./scripts/demo/test_quote_api.sh              # Normal mode
+#   DEBUG_REQUESTS=1 ./scripts/demo/test_quote_api.sh  # Show request payloads
 
 set -e
 
@@ -41,18 +44,18 @@ fi
 ORIGIN_CHAIN_ID=31337
 DEST_CHAIN_ID=31338
 
-ORIGIN_RPC_URL=$(grep -A 2 '\[networks.31337\]' config/demo.toml | grep 'rpc_url = ' | cut -d'"' -f2)
-DEST_RPC_URL=$(grep -A 2 '\[networks.31338\]' config/demo.toml | grep 'rpc_url = ' | cut -d'"' -f2)
+ORIGIN_RPC_URL=$(awk '/\[\[networks\.31337\.rpc_urls\]\]/{f=1;next} f && /http *=/{gsub(/"/, "", $3); print $3; exit}' config/demo/networks.toml)
+DEST_RPC_URL=$(awk '/\[\[networks\.31338\.rpc_urls\]\]/{f=1;next} f && /http *=/{gsub(/"/, "", $3); print $3; exit}' config/demo/networks.toml)
 
 SOLVER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'solver = ' | cut -d'"' -f2)
 USER_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'user = ' | cut -d'"' -f2)
 RECIPIENT_ADDR=$(grep -A 4 '\[accounts\]' config/demo.toml | grep 'recipient = ' | cut -d'"' -f2)
 
-# Token addresses
-TOKENA_ORIGIN=$(awk '/\[\[networks.31337.tokens\]\]/{f=1} f && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
-TOKENB_ORIGIN=$(awk '/\[\[networks.31337.tokens\]\]/{c++} c==2 && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
-TOKENA_DEST=$(awk '/\[\[networks.31338.tokens\]\]/{f=1} f && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
-TOKENB_DEST=$(awk '/\[\[networks.31338.tokens\]\]/{c++} c==2 && /address =/{gsub(/"/, "", $3); print $3; exit}' config/demo.toml)
+# Token addresses (from networks config)
+TOKENA_ORIGIN=$(awk '/\[\[networks\.31337\.tokens\]\]/{f=1} f && /address *=/{gsub(/"/, "", $3); print $3; exit}' config/demo/networks.toml)
+TOKENB_ORIGIN=$(awk '/\[\[networks\.31337\.tokens\]\]/{c++} c==2 && /address *=/{gsub(/"/, "", $3); print $3; exit}' config/demo/networks.toml)
+TOKENA_DEST=$(awk '/\[\[networks\.31338\.tokens\]\]/{f=1} f && /address *=/{gsub(/"/, "", $3); print $3; exit}' config/demo/networks.toml)
+TOKENB_DEST=$(awk '/\[\[networks\.31338\.tokens\]\]/{c++} c==2 && /address *=/{gsub(/"/, "", $3); print $3; exit}' config/demo/networks.toml)
 
 # ERC-7930 UII builder (demo networks chainRef mapping)
 to_uii() {
@@ -70,6 +73,15 @@ TOKENA_UII_ORIGIN=$(to_uii $ORIGIN_CHAIN_ID $TOKENA_ORIGIN)
 TOKENA_UII_DEST=$(to_uii $DEST_CHAIN_ID $TOKENA_DEST)
 TOKENB_UII_ORIGIN=$(to_uii $ORIGIN_CHAIN_ID $TOKENB_ORIGIN)
 TOKENB_UII_DEST=$(to_uii $DEST_CHAIN_ID $TOKENB_DEST)
+
+# Validate derived values to avoid malformed interop addresses
+validate_non_empty() { if [ -z "$2" ]; then echo -e "${RED}$CROSS $1 is empty. Check config parsing.${NC}"; exit 1; fi }
+validate_non_empty "ORIGIN_RPC_URL" "$ORIGIN_RPC_URL"
+validate_non_empty "DEST_RPC_URL" "$DEST_RPC_URL"
+validate_non_empty "TOKENA_ORIGIN" "$TOKENA_ORIGIN"
+validate_non_empty "TOKENA_DEST" "$TOKENA_DEST"
+validate_non_empty "USER_ADDR" "$USER_ADDR"
+validate_non_empty "RECIPIENT_ADDR" "$RECIPIENT_ADDR"
 
 # Balance helpers
 check_balance() {
@@ -102,23 +114,28 @@ show_balances() {
 print_success_quote_summary() {
   local resp="$1"
   local count=$(echo "$resp" | jq '.quotes | length')
-  local provider=$(echo "$resp" | jq -r '.quotes[0].provider')
-  local quote_id=$(echo "$resp" | jq -r '.quotes[0].quoteId')
-  local eta=$(echo "$resp" | jq -r '.quotes[0].eta')
-  local valid_until=$(echo "$resp" | jq -r '.quotes[0].validUntil')
+  local provider=$(echo "$resp" | jq -r '.quotes[0].provider // "unknown"')
+  local quote_id=$(echo "$resp" | jq -r '.quotes[0].quoteId // "unknown"')
+  local eta=$(echo "$resp" | jq -r '.quotes[0].eta // "null"')
+  local valid_until=$(echo "$resp" | jq -r '.quotes[0].validUntil // "null"')
 
   echo -e "${GREEN}$CHECK Quote received${NC}"
   echo -e "  Provider: $provider"
   echo -e "  QuoteId:  $quote_id"
   echo -e "  ETA:      ${eta}s"
   echo -e "  ValidUntil: $valid_until"
-  echo -e "  Orders:   ${count} (objects in array)"
+  echo -e "  Orders:   ${count} quotes"
 
   # Print requested outputs and available inputs briefly
-  echo -e "  RequestedOutputs:"
-  echo "$resp" | jq -r '.quotes[0].details.requestedOutputs[] | "    - amount: \(.amount), asset: \(.asset), receiver: \(.receiver)"'
-  echo -e "  AvailableInputs:"
-  echo "$resp" | jq -r '.quotes[0].details.availableInputs[] | "    - amount: \(.amount), asset: \(.asset), user: \(.user)"'
+  if echo "$resp" | jq -e '.quotes[0].details.requestedOutputs' >/dev/null 2>&1; then
+    echo -e "  RequestedOutputs:"
+    echo "$resp" | jq -r '.quotes[0].details.requestedOutputs[] | "    - amount: \(.amount), asset: \(.asset), user: \(.user // .receiver)"'
+  fi
+  
+  if echo "$resp" | jq -e '.quotes[0].details.availableInputs' >/dev/null 2>&1; then
+    echo -e "  AvailableInputs:"
+    echo "$resp" | jq -r '.quotes[0].details.availableInputs[] | "    - amount: \(.amount), asset: \(.asset), user: \(.user), lockType: \(.lockType // "none")"'
+  fi
 }
 
 print_error_summary() {
@@ -138,7 +155,8 @@ send_quote() {
   local payload="$1"
   curl -s -X POST "$QUOTE_ENDPOINT" \
     -H "Content-Type: application/json" \
-    -d "$payload"
+    -d "$payload" \
+    -w "\n%{http_code}"
 }
 
 run_scenario() {
@@ -147,7 +165,32 @@ run_scenario() {
   local expect_success="$1"; shift || true
 
   echo -e "${YELLOW}$TESTTUBE $title${NC}"
-  local resp=$(send_quote "$payload")
+  
+  # Optional: Show request payload for debugging
+  if [ "${DEBUG_REQUESTS:-}" = "1" ]; then
+    echo -e "  Request payload:"
+    echo "$payload" | jq '.' 2>/dev/null || echo "$payload"
+  fi
+  
+  local full_resp=$(send_quote "$payload")
+  
+  # Extract HTTP status code from the last line
+  local status_code=$(echo "$full_resp" | tail -n 1)
+  # macOS/BSD head doesn't support -n -1; use sed to drop the last line
+  local resp=$(echo "$full_resp" | sed '$d')
+  
+  echo -e "  HTTP Status: $status_code"
+  
+  # Check if response is valid JSON first
+  if ! echo "$resp" | jq . >/dev/null 2>&1; then
+    echo -e "${RED}$CROSS Invalid JSON response${NC}"
+    echo -e "  Raw response:"
+    echo "$resp" | head -c 500  # Show first 500 chars to avoid spam
+    if [ ${#resp} -gt 500 ]; then echo "..."; fi
+    echo ""
+    return
+  fi
+  
   local is_success=$(echo "$resp" | jq -e '.quotes' >/dev/null 2>&1 && echo yes || echo no)
 
   if [ "$is_success" = "yes" ]; then
@@ -166,6 +209,21 @@ run_scenario() {
 
 echo -e "${BLUE}$BOX Testing OIF Solver Quote API at ${QUOTE_ENDPOINT}${NC}"
 echo "================================================="
+
+# 0) Check if API is reachable
+echo -e "${INFO} Checking API connectivity..."
+if ! curl -s --connect-timeout 5 "${API_URL}/health" >/dev/null 2>&1; then
+  if ! curl -s --connect-timeout 5 "${API_URL}/" >/dev/null 2>&1; then
+    echo -e "${WARN} API not reachable at ${API_URL}"
+    echo -e "${INFO} Make sure the solver service is running: 'cargo run --bin solver -- --config config/demo.toml'"
+    echo ""
+  else
+    echo -e "${INFO} API base URL reachable, but /health endpoint not found"
+  fi
+else
+  echo -e "${CHECK} API is reachable"
+fi
+echo ""
 
 # 1) Show balances first
 show_balances
@@ -187,8 +245,13 @@ PAYLOAD_VALID=$(cat << EOF
   "requestedOutputs": [
     { "receiver": "$RECIPIENT_UII_DEST", "asset": "$TOKENA_UII_DEST", "amount": "$ONE" }
   ],
+  "orderType": "swap-sell",
   "preference": "price",
-  "minValidUntil": 600
+  "minValidUntil": 600,
+  "originSubmission": {
+    "mode": "user",
+    "schemes": ["permit2"]
+  }
 }
 EOF
 )
@@ -207,6 +270,7 @@ PAYLOAD_UNSUPPORTED_CHAIN=$(cat << EOF
   "requestedOutputs": [
     { "receiver": "$RECIPIENT_UII_UNSUPPORTED_CHAIN", "asset": "$TOKENA_UII_UNSUPPORTED_CHAIN", "amount": "$ONE" }
   ],
+  "orderType": "swap-buy",
   "preference": "speed"
 }
 EOF
@@ -224,7 +288,9 @@ PAYLOAD_UNSUPPORTED_TOKEN=$(cat << EOF
   ],
   "requestedOutputs": [
     { "receiver": "$RECIPIENT_UII_DEST", "asset": "$TOKEN_UII_RANDOM_DEST", "amount": "$ONE" }
-  ]
+  ],
+  "orderType": "swap-sell",
+  "preference": "trust-minimization"
 }
 EOF
 )
@@ -239,7 +305,9 @@ PAYLOAD_INSUFF_BAL=$(cat << EOF
   ],
   "requestedOutputs": [
     { "receiver": "$RECIPIENT_UII_DEST", "asset": "$TOKENA_UII_DEST", "amount": "$FIVE_HUNDRED" }
-  ]
+  ],
+  "orderType": "swap-sell",
+  "preference": "input-priority"
 }
 EOF
 )
@@ -252,7 +320,8 @@ PAYLOAD_INVALID=$(cat << EOF
   "availableInputs": [],
   "requestedOutputs": [
     { "receiver": "$RECIPIENT_UII_DEST", "asset": "$TOKENA_UII_DEST", "amount": "$ONE" }
-  ]
+  ],
+  "orderType": "swap-sell"
 }
 EOF
 )

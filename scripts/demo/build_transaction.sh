@@ -41,7 +41,6 @@ else
 fi
 
 # Defaults
-API_URL="${API_URL:-http://localhost:3000/api/orders}"
 
 echo -e "${YELLOW}Reading quote from:${NC} ${QUOTE_SRC}"
 echo -e "${YELLOW}POST endpoint:${NC} ${API_URL}"
@@ -123,7 +122,26 @@ fi
 
 echo -e "${GREEN}✅ Order encoded${NC}"
 echo -e "${BLUE}📦 Payload preview:${NC}"
-PAYLOAD=$(jq -n --arg order "$ORDER_DATA" --arg sponsor "$USER_ADDR" --arg sig "$PREFIXED_SIGNATURE" '{order:$order, sponsor:$sponsor, signature:$sig}')
+
+# Generate unique quote ID
+NONCE_FOR_QUOTE=$(perl -MTime::HiRes=time -e 'printf "%.0f\n", time * 1000')
+
+PAYLOAD=$(jq -n \
+  --arg order "$ORDER_DATA" \
+  --arg sig "$PREFIXED_SIGNATURE" \
+  --arg quote_id "quote_intent_${NONCE_FOR_QUOTE}" \
+  --arg provider "oif-solver-quote" \
+  '{
+    order: $order, 
+    signature: $sig,
+    quoteId: $quote_id,
+    provider: $provider,
+    failureHandling: "retry",
+    originSubmission: {
+      mode: "user",
+      schemes: ["permit2"]
+    }
+  }')
 echo "$PAYLOAD" | jq .
 
 echo -e "${YELLOW}🚀 Posting to solver...${NC}"
@@ -134,7 +152,7 @@ BODY=$(echo "$RESPONSE" | sed '$d')
 if [ "$HTTP_CODE" = "200" ]; then
   echo -e "${GREEN}✅ Submitted successfully${NC}"
   echo "$BODY" | jq .
-  ORDER_ID=$(echo "$BODY" | jq -r '.order_id // empty')
+  ORDER_ID=$(echo "$BODY" | jq -r '.orderId // empty')
   if [ -n "$ORDER_ID" ]; then
     echo -e "${BLUE}Order ID:${NC} $ORDER_ID"
   fi

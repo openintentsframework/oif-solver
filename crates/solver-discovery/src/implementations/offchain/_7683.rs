@@ -59,6 +59,7 @@ use hex;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use solver_types::{
+	api::{PostOrderRequest, SubmissionScheme},
 	bytes32_to_address, current_timestamp, normalize_bytes32_address,
 	standards::eip7683::{GasLimitOverrides, LockType, MandateOutput},
 	with_0x_prefix, ConfigSchema, Eip7683OrderData, Field, FieldType, ImplementationRegistry,
@@ -238,71 +239,6 @@ where
 		.map_err(|e| Error::custom(format!("Invalid hex: {}", e)))?;
 
 	Ok(bytes)
-}
-
-/// Flexible deserializer for LockType that accepts numbers, strings, or enum names.
-fn deserialize_lock_type_flexible<'de, D>(deserializer: D) -> Result<LockType, D::Error>
-where
-	D: serde::Deserializer<'de>,
-{
-	use serde::de::Error;
-	let v = serde_json::Value::deserialize(deserializer)?;
-	match v {
-		serde_json::Value::Number(n) => {
-			let num = n
-				.as_u64()
-				.ok_or_else(|| Error::custom("Invalid number for LockType"))?;
-			if num <= u8::MAX as u64 {
-				LockType::from_u8(num as u8).ok_or_else(|| Error::custom("Invalid LockType value"))
-			} else {
-				Err(Error::custom("LockType value out of range"))
-			}
-		},
-		serde_json::Value::String(s) => {
-			// Try parsing as number first, then as enum name
-			if let Ok(num) = s.parse::<u8>() {
-				LockType::from_u8(num).ok_or_else(|| Error::custom("Invalid LockType value"))
-			} else {
-				// Try parsing as enum variant name
-				match s.as_str() {
-					"permit2_escrow" | "Permit2Escrow" => Ok(LockType::Permit2Escrow),
-					"eip3009_escrow" | "Eip3009Escrow" => Ok(LockType::Eip3009Escrow),
-					"resource_lock" | "ResourceLock" => Ok(LockType::ResourceLock),
-					_ => Err(Error::custom("Invalid LockType string")),
-				}
-			}
-		},
-		serde_json::Value::Null => Ok(default_lock_type()),
-		_ => Err(Error::custom(
-			"expected number, string, or null for LockType",
-		)),
-	}
-}
-
-/// API request wrapper for intent submission.
-///
-/// This is the top-level structure for POST /intent requests with the OIF format.
-///
-/// # Fields
-///
-/// * `order` - The StandardOrder encoded as hex bytes
-/// * `sponsor` - The address sponsoring the order (usually the user)
-/// * `signature` - The Permit2Witness signature
-/// * `lock_type` - The custody mechanism type
-#[derive(Debug, Deserialize)]
-struct IntentRequest {
-	order: Bytes,
-	sponsor: Address,
-	signature: Bytes,
-	#[serde(
-		default = "default_lock_type",
-		deserialize_with = "deserialize_lock_type_flexible"
-	)]
-	lock_type: LockType,
-}
-
-fn default_lock_type() -> LockType {
-	LockType::Permit2Escrow
 }
 
 /// Status enum for intent submission responses.
@@ -845,7 +781,7 @@ impl Eip7683OffchainDiscovery {
 /// ```
 async fn handle_intent_submission(
 	State(state): State<ApiState>,
-	Json(request): Json<IntentRequest>,
+	Json(request): Json<PostOrderRequest>,
 ) -> impl IntoResponse {
 	// TODO: Implement authentication
 	// if let Some(token) = &state.auth_token {
@@ -870,6 +806,11 @@ async fn handle_intent_submission(
 		},
 	};
 
+	// TODO: Extract sponsor from PostOrderRequest - for now use a default
+	let sponsor = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+		.parse::<Address>()
+		.unwrap_or_default();
+
 	// Serialize the parsed order once for all responses
 	let order_json = match serde_json::to_value(ApiStandardOrder::from(&order)) {
 		Ok(json) => Some(json),
@@ -881,7 +822,7 @@ async fn handle_intent_submission(
 
 	// Validate order
 	if let Err(e) =
-		Eip7683OffchainDiscovery::validate_order(&order, &request.sponsor, &request.signature).await
+		Eip7683OffchainDiscovery::validate_order(&order, &sponsor, &request.signature).await
 	{
 		tracing::warn!(error = %e, "Order validation failed");
 		return (
@@ -896,13 +837,32 @@ async fn handle_intent_submission(
 			.into_response();
 	}
 
-	// Convert to intent
+	// Determine lock type from origin submission schemes
+	let lock_type = if let Some(origin_submission) = &request.origin_submission {
+		// Use the first scheme to determine lock type
+		if let Some(first_scheme) = origin_submission.schemes.first() {
+			match first_scheme {
+				SubmissionScheme::Permit2 => LockType::Permit2Escrow,
+				SubmissionScheme::Eip3009 => LockType::Eip3009Escrow,
+				SubmissionScheme::Erc4337 => LockType::ResourceLock, // TheCompact
+				SubmissionScheme::Erc20Permit => LockType::Permit2Escrow, // Default to Permit2
+			}
+		} else {
+			LockType::Permit2Escrow // Default if no schemes provided
+		}
+	} else {
+		LockType::Permit2Escrow // Default if origin_submission is None
+	};
+
+	tracing::debug!(?lock_type, "Determined lock type from origin submission");
+
+	// Convert to intent using the existing method
 	match Eip7683OffchainDiscovery::order_to_intent(
 		&order,
 		&request.order,
-		&request.sponsor,
+		&sponsor,
 		&request.signature,
-		request.lock_type,
+		lock_type,
 		&state.providers,
 		&state.networks,
 	)
