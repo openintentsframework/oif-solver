@@ -543,3 +543,149 @@ impl solver_types::ImplementationRegistry for Registry {
 }
 
 impl crate::DeliveryRegistry for Registry {}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use alloy_primitives::U256;
+	use solver_types::{networks::RpcEndpoint, Address, NetworkConfig, SecretString};
+	use std::collections::HashMap;
+
+	// Helper function to create Address from hex string
+	fn addr(hex: &str) -> Address {
+		let hex_str = hex::decode(hex.trim_start_matches("0x")).unwrap();
+		Address(hex_str)
+	}
+
+	fn create_test_networks() -> NetworksConfig {
+		let mut networks = HashMap::new();
+		networks.insert(
+			1,
+			NetworkConfig {
+				rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
+				input_settler_address: addr("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9"),
+				output_settler_address: addr("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
+				tokens: vec![],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+			},
+		);
+		networks
+	}
+
+	fn create_test_signer() -> PrivateKeySigner {
+		"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+			.parse()
+			.unwrap()
+	}
+
+	fn create_test_transaction() -> SolverTransaction {
+		SolverTransaction {
+			chain_id: 1,
+			to: Some(addr("1234567890123456789012345678901234567890")),
+			value: U256::from(1000000000000000000u64), // 1 ETH
+			gas_limit: Some(21000),
+			gas_price: Some(20000000000u128), // 20 gwei
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+			data: vec![],
+			nonce: Some(1),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_alloy_delivery_new_success() {
+		let networks = create_test_networks();
+		let signer = create_test_signer();
+
+		let result = AlloyDelivery::new(vec![1], &networks, HashMap::new(), signer).await;
+
+		assert!(result.is_ok());
+		let delivery = result.unwrap();
+		assert!(delivery.providers.contains_key(&1));
+	}
+
+	#[tokio::test]
+	async fn test_alloy_delivery_new_empty_networks() {
+		let networks = create_test_networks();
+		let signer = create_test_signer();
+
+		let result = AlloyDelivery::new(vec![], &networks, HashMap::new(), signer).await;
+
+		assert!(matches!(result, Err(DeliveryError::Network(_))));
+		if let Err(DeliveryError::Network(msg)) = result {
+			assert!(msg.contains("At least one network_id must be specified"));
+		}
+	}
+
+	#[test]
+	fn test_config_schema_validation_valid() {
+		let schema = AlloyDeliverySchema;
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"network_ids".to_string(),
+				toml::Value::Array(vec![toml::Value::Integer(1)]),
+			);
+			table
+		});
+
+		let result = schema.validate(&config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_config_schema_validation_empty_network_ids() {
+		let schema = AlloyDeliverySchema;
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert("network_ids".to_string(), toml::Value::Array(vec![]));
+			table
+		});
+
+		let result = schema.validate(&config);
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("network_ids cannot be empty"));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_create_http_delivery_success() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"network_ids".to_string(),
+				toml::Value::Array(vec![toml::Value::Integer(1)]),
+			);
+			table
+		});
+
+		let networks = create_test_networks();
+		let default_key = SecretString::from(
+			"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+		);
+		let network_keys = HashMap::new();
+
+		let result = create_http_delivery(&config, &networks, &default_key, &network_keys);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_registry_name() {
+		assert_eq!(
+			<Registry as solver_types::ImplementationRegistry>::NAME,
+			"evm_alloy"
+		);
+	}
+
+	#[test]
+	fn test_create_test_transaction() {
+		let tx = create_test_transaction();
+		assert_eq!(tx.chain_id, 1);
+		assert_eq!(tx.value, U256::from(1000000000000000000u64));
+		assert_eq!(tx.gas_limit, Some(21000));
+		assert_eq!(tx.nonce, Some(1));
+	}
+}
