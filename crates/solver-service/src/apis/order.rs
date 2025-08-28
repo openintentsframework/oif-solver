@@ -294,7 +294,7 @@ async fn convert_eip7683_order_to_response(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use alloy_primitives::{hex, U256};
+	use alloy_primitives::hex;
 	use mockall::{mock, predicate::eq};
 	use serde_json::json;
 	use solver_account::{implementations::local::LocalWallet, AccountService};
@@ -422,9 +422,9 @@ mod tests {
 
 		assert!(result.is_ok());
 		let response = result.unwrap();
-		assert_eq!(response.order.id, "order-test");
-		assert_eq!(response.order.status, OrderStatus::Executed);
-		assert_eq!(response.order.quote_id, Some("quote-test".to_string()));
+		assert_eq!(response.id, "order-test");
+		assert!(matches!(response.status, ApiOrderStatus::Executed));
+		assert_eq!(response.quote_id, Some("quote-test".to_string()));
 	}
 
 	#[tokio::test]
@@ -444,7 +444,7 @@ mod tests {
 		assert!(res.is_ok());
 		let resp = res.unwrap();
 		assert_eq!(resp.id, "order-proc");
-		assert_eq!(resp.status, OrderStatus::Executed);
+		assert!(matches!(resp.status, ApiOrderStatus::Executed));
 	}
 
 	#[tokio::test]
@@ -470,28 +470,23 @@ mod tests {
 		let resp = convert_order_to_response(order).await.expect("ok");
 
 		assert_eq!(resp.id, "order-ok");
-		assert_eq!(resp.status, OrderStatus::Executed);
+		assert!(matches!(resp.status, ApiOrderStatus::Executed));
 		assert_eq!(resp.quote_id, Some("quote-test".to_string()));
 
 		// input - should be an interop address with chain ID 1
 		// Format: 0x01000001011234567890123456789012345678901234567890
 		// Version: 01, ChainType: 0000, ChainRefLen: 01, ChainRef: 01, AddrLen: 14, Address: 20 bytes
-		assert!(resp.input_amount.asset.starts_with("0x01000001"));
+		assert!(resp.input_amount.asset.to_hex().starts_with("0x01000001"));
 		assert!(resp
 			.input_amount
 			.asset
+			.to_hex()
 			.contains("1234567890123456789012345678901234567890"));
-		assert_eq!(
-			resp.input_amount.amount,
-			"1000000000000000000".parse::<U256>().unwrap()
-		);
+		assert_eq!(resp.input_amount.amount, "1000000000000000000");
 
 		// output - should be an interop address with chain ID 2
-		assert!(resp.output_amount.asset.starts_with("0x01000001"));
-		assert_eq!(
-			resp.output_amount.amount,
-			"2000000000000000000".parse::<U256>().unwrap()
-		);
+		assert!(resp.output_amount.asset.to_hex().starts_with("0x01000001"));
+		assert_eq!(resp.output_amount.amount, "2000000000000000000");
 
 		// settlement
 		assert!(matches!(
