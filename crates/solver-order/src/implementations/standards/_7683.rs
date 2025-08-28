@@ -89,6 +89,7 @@ sol! {
 ///
 /// * `networks` - Networks configuration containing settler addresses for each chain
 /// * `oracle_routes` - Oracle routes for validation of input/output oracle compatibility
+#[derive(Debug)]
 pub struct Eip7683OrderImpl {
 	/// Networks configuration for dynamic settler address lookups.
 	networks: NetworksConfig,
@@ -797,3 +798,508 @@ impl solver_types::ImplementationRegistry for Registry {
 }
 
 impl crate::OrderRegistry for Registry {}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use alloy_primitives::U256;
+	use solver_types::{
+		networks::RpcEndpoint,
+		oracle::{OracleInfo, OracleRoutes},
+		standards::eip7683::{Eip7683OrderData, GasLimitOverrides, LockType, MandateOutput},
+		Address, ExecutionParams, FillProof, Intent, IntentMetadata, NetworkConfig, NetworksConfig,
+		OrderStatus, TransactionHash,
+	};
+	use std::collections::HashMap;
+
+	fn create_test_networks() -> NetworksConfig {
+		let mut networks = HashMap::new();
+
+		networks.insert(
+			1u64,
+			NetworkConfig {
+				rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
+				input_settler_address: Address(vec![1u8; 20]),
+				output_settler_address: Address(vec![2u8; 20]),
+				input_settler_compact_address: Some(Address(vec![3u8; 20])),
+				the_compact_address: None,
+				tokens: vec![],
+			},
+		);
+
+		networks.insert(
+			137u64,
+			NetworkConfig {
+				rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8546".to_string())],
+				input_settler_address: Address(vec![4u8; 20]),
+				output_settler_address: Address(vec![5u8; 20]),
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				tokens: vec![],
+			},
+		);
+
+		networks
+	}
+
+	fn create_test_oracle_routes() -> OracleRoutes {
+		let mut supported_routes = HashMap::new();
+
+		let input_oracle = OracleInfo {
+			chain_id: 1,
+			oracle: Address(vec![10u8; 20]),
+		};
+
+		let output_oracle = OracleInfo {
+			chain_id: 137,
+			oracle: Address(vec![11u8; 20]),
+		};
+
+		supported_routes.insert(input_oracle, vec![output_oracle]);
+
+		OracleRoutes { supported_routes }
+	}
+
+	fn create_test_order_data() -> Eip7683OrderData {
+		Eip7683OrderData {
+			user: "0x1234567890123456789012345678901234567890".to_string(),
+			nonce: U256::from(1),
+			origin_chain_id: U256::from(1),
+			expires: (std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_secs() + 3600) as u32,
+			fill_deadline: (std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_secs() + 1800) as u32,
+			input_oracle: "0x0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A".to_string(),
+			inputs: vec![[U256::from(1000), U256::from(100)]],
+			order_id: [1u8; 32],
+			gas_limit_overrides: GasLimitOverrides::default(),
+			outputs: vec![MandateOutput {
+				oracle: [0u8; 32],
+				settler: [0u8; 32],
+				chain_id: U256::from(137),
+				token: [2u8; 32],
+				amount: U256::from(95),
+				recipient: [3u8; 32],
+				call: vec![],
+				context: vec![],
+			}],
+			raw_order_data: None,
+			signature: None,
+			sponsor: None,
+			lock_type: None,
+		}
+	}
+
+	fn create_test_intent(order_data: Eip7683OrderData, source: &str) -> Intent {
+		Intent {
+			id: "test-intent-id".to_string(),
+			standard: "eip7683".to_string(),
+			source: source.to_string(),
+			data: serde_json::to_value(&order_data).unwrap(),
+			quote_id: Some("test-quote-id".to_string()),
+			metadata: IntentMetadata {
+				requires_auction: false,
+				exclusive_until: None,
+				discovered_at: std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.unwrap()
+					.as_secs(),
+			},
+		}
+	}
+
+	#[test]
+	fn test_new_eip7683_order_impl() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+
+		let result = Eip7683OrderImpl::new(networks, oracle_routes);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_new_with_insufficient_networks() {
+		let mut networks = HashMap::new();
+		networks.insert(
+			1u64,
+			NetworkConfig {
+				rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
+				input_settler_address: Address(vec![1u8; 20]),
+				output_settler_address: Address(vec![2u8; 20]),
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				tokens: vec![],
+			},
+		);
+
+		let oracle_routes = create_test_oracle_routes();
+
+		let result = Eip7683OrderImpl::new(networks, oracle_routes);
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("At least 2 networks"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_intent_success() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let order_data = create_test_order_data();
+		let intent = create_test_intent(order_data, "on-chain");
+		let solver_address = Address(vec![99u8; 20]);
+
+		let result = order_impl.validate_intent(&intent, &solver_address).await;
+		assert!(result.is_ok());
+
+		let order = result.unwrap();
+		assert_eq!(order.id, "test-intent-id");
+		assert_eq!(order.standard, "eip7683");
+		assert_eq!(order.solver_address, solver_address);
+		assert_eq!(order.status, OrderStatus::Created);
+	}
+
+	#[tokio::test]
+	async fn test_validate_intent_wrong_standard() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut intent = create_test_intent(create_test_order_data(), "on-chain");
+		intent.standard = "eip7230".to_string();
+		let solver_address = Address(vec![99u8; 20]);
+
+		let result = order_impl.validate_intent(&intent, &solver_address).await;
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Not an EIP-7683 order"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_intent_expired_order() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut order_data = create_test_order_data();
+		order_data.expires = 100; // Set to past timestamp
+		let intent = create_test_intent(order_data, "on-chain");
+		let solver_address = Address(vec![99u8; 20]);
+
+		let result = order_impl.validate_intent(&intent, &solver_address).await;
+		assert!(result.is_err());
+		assert!(result.unwrap_err().to_string().contains("Order expired"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_intent_unsupported_oracle() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut order_data = create_test_order_data();
+		order_data.input_oracle = "0x9999999999999999999999999999999999999999".to_string();
+		let intent = create_test_intent(order_data, "on-chain");
+		let solver_address = Address(vec![99u8; 20]);
+
+		let result = order_impl.validate_intent(&intent, &solver_address).await;
+		assert!(result.is_err());
+		assert!(result.unwrap_err().to_string().contains("is not supported"));
+	}
+
+	#[tokio::test]
+	async fn test_generate_prepare_transaction_onchain_order() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let order_data = create_test_order_data();
+		let intent = create_test_intent(order_data.clone(), "on-chain");
+		let order = Order {
+			id: "test-order".to_string(),
+			standard: "eip7683".to_string(),
+			created_at: 123456789,
+			data: serde_json::to_value(&order_data).unwrap(),
+			solver_address: Address(vec![99u8; 20]),
+			quote_id: Some("test-quote".to_string()),
+			input_chain_ids: vec![1],
+			output_chain_ids: vec![137],
+			updated_at: 123456789,
+			status: OrderStatus::Created,
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			claim_tx_hash: None,
+			fill_proof: None,
+		};
+		let params = ExecutionParams {
+			gas_price: U256::ZERO,
+			priority_fee: None,
+		};
+
+		let result = order_impl
+			.generate_prepare_transaction(&intent, &order, &params)
+			.await;
+		assert!(result.is_ok());
+		assert!(result.unwrap().is_none()); // On-chain orders don't need preparation
+	}
+
+	#[tokio::test]
+	async fn test_generate_prepare_transaction_offchain_order() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut order_data = create_test_order_data();
+		order_data.raw_order_data = Some("0xabcdef".to_string());
+		order_data.sponsor = Some("0x1111111111111111111111111111111111111111".to_string());
+		order_data.signature = Some("0x22222222".to_string());
+
+		let intent = create_test_intent(order_data.clone(), "off-chain");
+		let order = Order {
+			id: "test-order".to_string(),
+			standard: "eip7683".to_string(),
+			created_at: 123456789,
+			data: serde_json::to_value(&order_data).unwrap(),
+			solver_address: Address(vec![99u8; 20]),
+			quote_id: Some("test-quote".to_string()),
+			input_chain_ids: vec![1],
+			output_chain_ids: vec![137],
+			updated_at: 123456789,
+			status: OrderStatus::Created,
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			claim_tx_hash: None,
+			fill_proof: None,
+		};
+		let params = ExecutionParams {
+			gas_price: U256::ZERO,
+			priority_fee: None,
+		};
+
+		let result = order_impl
+			.generate_prepare_transaction(&intent, &order, &params)
+			.await;
+		assert!(result.is_ok());
+
+		let tx = result.unwrap().unwrap();
+		assert_eq!(tx.chain_id, 1);
+		assert_eq!(tx.to, Some(Address(vec![1u8; 20]))); // input_settler_address for chain 1
+		assert!(!tx.data.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_generate_fill_transaction() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let order_data = create_test_order_data();
+		let order = Order {
+			id: "test-order".to_string(),
+			standard: "eip7683".to_string(),
+			created_at: 123456789,
+			data: serde_json::to_value(&order_data).unwrap(),
+			solver_address: Address(vec![99u8; 20]),
+			quote_id: Some("test-quote".to_string()),
+			input_chain_ids: vec![1],
+			output_chain_ids: vec![137],
+			updated_at: 123456789,
+			status: OrderStatus::Created,
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			claim_tx_hash: None,
+			fill_proof: None,
+		};
+		let params = ExecutionParams {
+			gas_price: U256::ZERO,
+			priority_fee: None,
+		};
+
+		let result = order_impl.generate_fill_transaction(&order, &params).await;
+		assert!(result.is_ok());
+
+		let tx = result.unwrap();
+		assert_eq!(tx.chain_id, 137); // destination chain
+		assert_eq!(tx.to, Some(Address(vec![5u8; 20]))); // output_settler_address for chain 137
+		assert!(!tx.data.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_generate_claim_transaction_escrow() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let order_data = create_test_order_data();
+		let order = Order {
+			id: "test-order".to_string(),
+			standard: "eip7683".to_string(),
+			created_at: 123456789,
+			data: serde_json::to_value(&order_data).unwrap(),
+			solver_address: Address(vec![99u8; 20]),
+			quote_id: Some("test-quote".to_string()),
+			input_chain_ids: vec![1],
+			output_chain_ids: vec![137],
+			updated_at: 123456789,
+			status: OrderStatus::Created,
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			claim_tx_hash: None,
+			fill_proof: None,
+		};
+
+		let fill_proof = FillProof {
+			tx_hash: TransactionHash(hex::decode("abcd").unwrap()),
+			block_number: 12345,
+			attestation_data: Some(b"proof".to_vec()),
+			filled_timestamp: 123456789,
+			oracle_address: "0x0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B".to_string(),
+		};
+
+		let result = order_impl
+			.generate_claim_transaction(&order, &fill_proof)
+			.await;
+		assert!(result.is_ok());
+
+		let tx = result.unwrap();
+		assert_eq!(tx.chain_id, 1); // origin chain
+		assert_eq!(tx.to, Some(Address(vec![1u8; 20]))); // input_settler_address for chain 1
+		assert!(!tx.data.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_generate_claim_transaction_compact() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut order_data = create_test_order_data();
+		order_data.lock_type = Some(LockType::ResourceLock);
+		order_data.signature = Some("0x123456789abcdef0".to_string());
+
+		let order = Order {
+			id: "test-order".to_string(),
+			standard: "eip7683".to_string(),
+			created_at: 123456789,
+			data: serde_json::to_value(&order_data).unwrap(),
+			solver_address: Address(vec![99u8; 20]),
+			quote_id: Some("test-quote".to_string()),
+			input_chain_ids: vec![1],
+			output_chain_ids: vec![137],
+			updated_at: 123456789,
+			status: OrderStatus::Created,
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			claim_tx_hash: None,
+			fill_proof: None,
+		};
+
+		let fill_proof = FillProof {
+			tx_hash: TransactionHash(hex::decode("abcd").unwrap()),
+			block_number: 12345,
+			attestation_data: Some(b"proof".to_vec()),
+			filled_timestamp: 123456789,
+			oracle_address: "0x0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B".to_string(),
+		};
+
+		let result = order_impl
+			.generate_claim_transaction(&order, &fill_proof)
+			.await;
+		assert!(result.is_ok());
+
+		let tx = result.unwrap();
+		assert_eq!(tx.chain_id, 1); // origin chain
+		assert_eq!(tx.to, Some(Address(vec![3u8; 20]))); // compact address for chain 1
+		assert!(!tx.data.is_empty());
+	}
+
+	#[test]
+	fn test_config_schema_validation() {
+		let schema = Eip7683OrderSchema;
+		let valid_config = toml::Value::Table(toml::map::Map::new());
+
+		let result = schema.validate(&valid_config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_create_order_impl_factory() {
+		let config = toml::Value::Table(toml::map::Map::new());
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+
+		let result = create_order_impl(&config, &networks, &oracle_routes);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_lock_type_enum() {
+		assert_eq!(LockType::from_u8(1), Some(LockType::Permit2Escrow));
+		assert_eq!(LockType::from_u8(2), Some(LockType::Eip3009Escrow));
+		assert_eq!(LockType::from_u8(3), Some(LockType::ResourceLock));
+		assert_eq!(LockType::from_u8(99), None);
+
+		assert_eq!(LockType::Permit2Escrow.to_u8(), 1);
+		assert_eq!(LockType::ResourceLock.to_u8(), 3);
+
+		assert!(LockType::ResourceLock.is_compact());
+		assert!(!LockType::Permit2Escrow.is_compact());
+
+		assert!(LockType::Permit2Escrow.is_escrow());
+		assert!(!LockType::ResourceLock.is_escrow());
+	}
+
+	#[tokio::test]
+	async fn test_generate_fill_transaction_no_cross_chain_output() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut order_data = create_test_order_data();
+		// Make the output same-chain
+		order_data.outputs[0].chain_id = U256::from(1);
+
+		let order = Order {
+			id: "test-order".to_string(),
+			standard: "eip7683".to_string(),
+			created_at: 123456789,
+			data: serde_json::to_value(&order_data).unwrap(),
+			solver_address: Address(vec![99u8; 20]),
+			quote_id: Some("test-quote".to_string()),
+			input_chain_ids: vec![1],
+			output_chain_ids: vec![1],
+			updated_at: 123456789,
+			status: OrderStatus::Created,
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			claim_tx_hash: None,
+			fill_proof: None,
+		};
+		let params = ExecutionParams {
+			gas_price: U256::ZERO,
+			priority_fee: None,
+		};
+
+		let result = order_impl.generate_fill_transaction(&order, &params).await;
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("No cross-chain output found"));
+	}
+}
