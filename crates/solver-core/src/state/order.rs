@@ -246,3 +246,118 @@ impl OrderStateMachine {
 		.await
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use solver_storage::StorageService;
+	use solver_types::{OrderStatus, TransactionType};
+	use std::sync::Arc;
+	use tokio;
+
+	fn create_test_storage() -> Arc<StorageService> {
+		let backend = Box::new(solver_storage::implementations::memory::MemoryStorage::new());
+		Arc::new(StorageService::new(backend))
+	}
+
+	fn create_test_order() -> Order {
+		use solver_types::parse_address;
+
+		Order {
+			id: "test_order_1".to_string(),
+			standard: "eip7683".to_string(),
+			created_at: 1000000,
+			updated_at: 1000000,
+			status: OrderStatus::Created,
+			data: serde_json::json!({}),
+			solver_address: parse_address("1234567890123456789012345678901234567890").unwrap(),
+			quote_id: Some("quote_1".to_string()),
+			input_chain_ids: vec![1],
+			output_chain_ids: vec![137],
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			claim_tx_hash: None,
+			fill_proof: None,
+		}
+	}
+
+	#[tokio::test]
+	async fn test_store_and_retrieve_order() {
+		let storage = create_test_storage();
+		let state_machine = OrderStateMachine::new(storage);
+		let order = create_test_order();
+
+		// Store order
+		state_machine.store_order(&order).await.unwrap();
+
+		// Retrieve order
+		let retrieved = state_machine.get_order("test_order_1").await.unwrap();
+		assert_eq!(retrieved.id, order.id);
+		assert_eq!(retrieved.status, order.status);
+	}
+
+	#[tokio::test]
+	async fn test_order_state_transitions() {
+		let storage = create_test_storage();
+		let state_machine = OrderStateMachine::new(storage);
+		let order = create_test_order();
+
+		// Store initial order
+		state_machine.store_order(&order).await.unwrap();
+
+		// Test valid transition
+		let updated = state_machine
+			.transition_order_status("test_order_1", OrderStatus::Pending)
+			.await
+			.unwrap();
+		assert_eq!(updated.status, OrderStatus::Pending);
+
+		// Test invalid transition
+		let result = state_machine
+			.transition_order_status("test_order_1", OrderStatus::Finalized)
+			.await;
+		assert!(result.is_err());
+	}
+
+	#[tokio::test]
+	async fn test_set_transaction_hashes() {
+		let storage = create_test_storage();
+		let state_machine = OrderStateMachine::new(storage);
+		let order = create_test_order();
+
+		state_machine.store_order(&order).await.unwrap();
+
+		// Test setting different transaction types
+		let tx_hash = solver_types::TransactionHash("0xprepare".as_bytes().to_vec());
+		let updated = state_machine
+			.set_transaction_hash("test_order_1", tx_hash.clone(), TransactionType::Prepare)
+			.await
+			.unwrap();
+		assert_eq!(updated.prepare_tx_hash, Some(tx_hash));
+
+		let tx_hash = solver_types::TransactionHash("0xfill".as_bytes().to_vec());
+		let updated = state_machine
+			.set_transaction_hash("test_order_1", tx_hash.clone(), TransactionType::Fill)
+			.await
+			.unwrap();
+		assert_eq!(updated.fill_tx_hash, Some(tx_hash));
+	}
+
+	#[test]
+	fn test_state_transition_validation() {
+		// Test transition logic without storage
+		assert!(OrderStateMachine::is_valid_transition(
+			&OrderStatus::Created,
+			&OrderStatus::Pending
+		));
+		assert!(!OrderStateMachine::is_valid_transition(
+			&OrderStatus::Created,
+			&OrderStatus::Executed
+		));
+		assert!(!OrderStateMachine::is_valid_transition(
+			&OrderStatus::Finalized,
+			&OrderStatus::Pending
+		));
+	}
+}
