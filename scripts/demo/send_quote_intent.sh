@@ -11,7 +11,7 @@ NC='\033[0m'
 
 API_BASE="${1:-http://127.0.0.1:3000}"
 QUOTE_ENDPOINT="$API_BASE/api/quotes"
-DISCOVERY_ENDPOINT="http://localhost:8081/intent"
+ORDERS_ENDPOINT="$API_BASE/api/orders"
 
 echo -e "${BLUE}🎯 Requesting quote and submitting signed intent${NC}"
 echo -e "${YELLOW}API:${NC} $API_BASE"
@@ -83,7 +83,7 @@ TMP_QUOTE_JSON="/tmp/quote_$$.json"
 echo "$QUOTE_RESP" > "$TMP_QUOTE_JSON"
 
 echo -e "${YELLOW}✍️  Signing and submitting intent via build_transaction.sh...${NC}"
-scripts/demo/build_transaction.sh "$TMP_QUOTE_JSON" "$DISCOVERY_ENDPOINT"
+scripts/demo/build_transaction.sh "$TMP_QUOTE_JSON" "$ORDERS_ENDPOINT"
 
 echo -e "${GREEN}🎉 Intent Submitted${NC}"
 

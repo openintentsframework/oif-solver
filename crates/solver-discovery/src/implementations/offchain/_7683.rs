@@ -806,10 +806,7 @@ async fn handle_intent_submission(
 		},
 	};
 
-	// TODO: Extract sponsor from PostOrderRequest - for now use a default
-	let sponsor = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
-		.parse::<Address>()
-		.unwrap_or_default();
+	let sponsor = order.user;
 
 	// Serialize the parsed order once for all responses
 	let order_json = match serde_json::to_value(ApiStandardOrder::from(&order)) {
