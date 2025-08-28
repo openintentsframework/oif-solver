@@ -241,10 +241,6 @@ where
 	Ok(bytes)
 }
 
-
-
-
-
 /// Status enum for intent submission responses.
 ///
 /// Distinguishes between successful receipt and validation failures at the discovery stage.
