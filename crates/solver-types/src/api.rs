@@ -3,6 +3,7 @@
 //! This module defines the request and response types for the OIF Solver API
 //! endpoints, following the ERC-7683 Cross-Chain Intents Standard.
 use crate::standards::eip7930::InteropAddress;
+use alloy_primitives::Bytes;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -101,11 +102,44 @@ pub enum SubmissionScheme {
 
 /// Origin submission configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OriginSubmission {
 	/// Submission mode
 	pub mode: SubmissionMode,
 	/// Supported schemes
-	pub schemes: Option<Vec<SubmissionScheme>>,
+	#[serde(default)]
+	pub schemes: Vec<SubmissionScheme>,
+}
+
+/// API request for order submission matching OpenAPI PostOrderRequest.
+///
+/// This structure follows the OpenAPI 3.0.0 specification for order submission.
+/// Used by the discovery service to accept orders from users or other systems.
+///
+/// # Fields
+///
+/// * `order` - EIP-712 order data as encoded bytes
+/// * `signature` - EIP-712 signature as encoded bytes
+/// * `quote_id` - Quote identifier for linking to quote
+/// * `provider` - Provider/solver identifier  
+/// * `failure_handling` - How to handle execution failures
+/// * `origin_submission` - Origin submission configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostOrderRequest {
+	/// Order data as encoded bytes
+	pub order: Bytes,
+	/// Signature as encoded bytes
+	pub signature: Bytes,
+	/// Optional quote identifier
+	pub quote_id: Option<String>,
+	/// Provider identifier
+	pub provider: String,
+	/// Failure handling strategy
+	pub failure_handling: FailureHandling,
+	/// Origin submission configuration
+	#[serde(default)]
+	pub origin_submission: Option<OriginSubmission>,
 }
 
 /// Request for getting price quotes following UII standard
@@ -215,16 +249,15 @@ pub struct GetQuoteResponse {
 
 /// Failure handling strategies for order execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(rename_all = "kebab-case")]
 pub enum FailureHandling {
-	/// Simple failure handling strategy
-	Simple(FailureHandlingStrategy),
-	/// Partial fill handling with remainder strategy
+	Retry,
+	RefundInstant,
+	RefundClaim,
+	NeedsNewSignature,
+	#[serde(untagged)]
 	PartialFill {
-		/// Whether partial fills are allowed
-		#[serde(rename = "partialFill")]
 		partial_fill: bool,
-		/// Strategy for handling remainder
 		remainder: FailureHandlingStrategy,
 	},
 }
@@ -237,26 +270,6 @@ pub enum FailureHandlingStrategy {
 	RefundInstant,
 	RefundClaim,
 	NeedsNewSignature,
-}
-
-/// Request for posting an order
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PostOrderRequest {
-	/// Order data to be executed
-	pub order: serde_json::Value,
-	/// Signature for the order
-	pub signature: serde_json::Value,
-	/// Associated quote ID
-	#[serde(rename = "quoteId")]
-	pub quote_id: Option<String>,
-	/// Provider identifier
-	pub provider: String,
-	/// Failure handling strategy
-	#[serde(rename = "failureHandling")]
-	pub failure_handling: FailureHandling,
-	/// Origin submission configuration
-	#[serde(rename = "originSubmission")]
-	pub origin_submission: Option<OriginSubmission>,
 }
 
 /// Order status values for API responses

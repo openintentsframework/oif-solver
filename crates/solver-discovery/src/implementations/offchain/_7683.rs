@@ -59,6 +59,7 @@ use hex;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use solver_types::{
+	api::{PostOrderRequest, SubmissionScheme},
 	bytes32_to_address, current_timestamp, normalize_bytes32_address,
 	standards::eip7683::{GasLimitOverrides, LockType, MandateOutput},
 	with_0x_prefix, ConfigSchema, Eip7683OrderData, Field, FieldType, ImplementationRegistry,
@@ -240,82 +241,9 @@ where
 	Ok(bytes)
 }
 
-/// API request wrapper for intent submission matching OpenAPI PostOrderRequest.
-///
-/// This structure follows the OpenAPI 3.0.0 specification for order submission.
-/// Replaces the legacy format to align with the standardized API.
-///
-/// # Fields
-///
-/// * `order` - EIP-712 order object with typed data
-/// * `signature` - EIP-712 signature object
-/// * `quote_id` - Quote identifier for linking to quote
-/// * `provider` - Provider/solver identifier  
-/// * `failure_handling` - How to handle execution failures
-/// * `origin_submission` - Origin submission configuration
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct IntentRequest {
-	order: Bytes,
-	signature: Bytes,
-	quote_id: Option<String>,
-	provider: String,
-	failure_handling: FailureHandling,
-	#[serde(default)]
-	origin_submission: Option<OriginSubmission>,
-}
 
-/// Failure handling strategy enum matching OpenAPI specification
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum FailureHandling {
-	Retry,
-	RefundInstant,
-	RefundClaim,
-	NeedsNewSignature,
-	#[serde(untagged)]
-	PartialFill {
-		partial_fill: bool,
-		remainder: FailureHandlingStrategy,
-	},
-}
 
-/// Individual failure handling strategies
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum FailureHandlingStrategy {
-	Retry,
-	RefundInstant,
-	RefundClaim,
-	NeedsNewSignature,
-}
 
-/// Origin submission configuration
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OriginSubmission {
-	mode: SubmissionMode,
-	#[serde(default)]
-	schemes: Vec<SubmissionScheme>,
-}
-
-/// Submission mode enum
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum SubmissionMode {
-	User,
-	Protocol,
-}
-
-/// Submission scheme enum
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum SubmissionScheme {
-	Erc4337,
-	Permit2,
-	Erc20Permit,
-	Eip3009,
-}
 
 /// Status enum for intent submission responses.
 ///
@@ -857,7 +785,7 @@ impl Eip7683OffchainDiscovery {
 /// ```
 async fn handle_intent_submission(
 	State(state): State<ApiState>,
-	Json(request): Json<IntentRequest>,
+	Json(request): Json<PostOrderRequest>,
 ) -> impl IntoResponse {
 	// TODO: Implement authentication
 	// if let Some(token) = &state.auth_token {
