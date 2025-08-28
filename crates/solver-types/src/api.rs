@@ -167,7 +167,7 @@ pub struct GetQuoteRequest {
 }
 
 /// Quote optimization preferences following UII standard
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum QuotePreference {
 	Price,
@@ -233,7 +233,7 @@ pub struct Quote {
 }
 
 /// Settlement mechanism types.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum SettlementType {
 	Escrow,
@@ -576,14 +576,16 @@ mod tests {
 	use super::*;
 	use crate::standards::eip7930::InteropAddress;
 	use alloy_primitives::address;
-	use alloy_primitives::U256;
 	use serde_json;
 
 	#[test]
 	fn test_asset_amount_serialization() {
 		let asset_amount = AssetAmount {
-			asset: "0x1234567890123456789012345678901234567890".to_string(),
-			amount: U256::from(1000),
+			asset: InteropAddress::new_ethereum(
+				1,
+				address!("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B"),
+			),
+			amount: "1000".to_string(),
 		};
 
 		let json = serde_json::to_string(&asset_amount).unwrap();
@@ -607,13 +609,13 @@ mod tests {
 
 	#[test]
 	fn test_lock_serialization() {
-		let lock = Lock {
+		let lock = AssetLockReference {
 			kind: LockKind::TheCompact,
 			params: Some(serde_json::json!({"resource_id": "0x123"})),
 		};
 
 		let json = serde_json::to_string(&lock).unwrap();
-		let deserialized: Lock = serde_json::from_str(&json).unwrap();
+		let deserialized: AssetLockReference = serde_json::from_str(&json).unwrap();
 
 		assert!(matches!(deserialized.kind, LockKind::TheCompact));
 		assert!(deserialized.params.is_some());
@@ -624,14 +626,14 @@ mod tests {
 		let input = AvailableInput {
 			user: InteropAddress::new_ethereum(
 				1,
-				address!("1111111111111111111111111111111111111111"),
+				address!("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B"),
 			),
 			asset: InteropAddress::new_ethereum(
 				1,
-				address!("2222222222222222222222222222222222222222"),
+				address!("6B175474E89094C44Da98b954EedeAC495271d0F"),
 			),
-			amount: U256::from(5000),
-			lock: Some(Lock {
+			amount: "5000".to_string(),
+			lock: Some(AssetLockReference {
 				kind: LockKind::TheCompact,
 				params: None,
 			}),
@@ -640,7 +642,7 @@ mod tests {
 		let json = serde_json::to_string(&input).unwrap();
 		let deserialized: AvailableInput = serde_json::from_str(&json).unwrap();
 
-		assert_eq!(deserialized.amount, U256::from(5000));
+		assert_eq!(deserialized.amount, "5000".to_string());
 		assert!(deserialized.lock.is_some());
 	}
 
@@ -649,20 +651,20 @@ mod tests {
 		let output = RequestedOutput {
 			receiver: InteropAddress::new_ethereum(
 				1,
-				address!("3333333333333333333333333333333333333333"),
+				address!("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B"),
 			),
 			asset: InteropAddress::new_ethereum(
 				1,
-				address!("4444444444444444444444444444444444444444"),
+				address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
 			),
-			amount: U256::from(2000),
+			amount: "2000".to_string(),
 			calldata: Some("0xdeadbeef".to_string()),
 		};
 
 		let json = serde_json::to_string(&output).unwrap();
 		let deserialized: RequestedOutput = serde_json::from_str(&json).unwrap();
 
-		assert_eq!(deserialized.amount, U256::from(2000));
+		assert_eq!(deserialized.amount, "2000".to_string());
 		assert_eq!(deserialized.calldata, Some("0xdeadbeef".to_string()));
 	}
 
@@ -687,7 +689,7 @@ mod tests {
 			assert_eq!(json, *expected);
 
 			let deserialized: QuotePreference = serde_json::from_str(&json).unwrap();
-			assert!(matches!(deserialized, preference));
+			assert_eq!(deserialized, *preference); // Change from matches! to assert_eq!
 		}
 	}
 
@@ -696,34 +698,36 @@ mod tests {
 		let request = GetQuoteRequest {
 			user: InteropAddress::new_ethereum(
 				1,
-				address!("1111111111111111111111111111111111111111"),
+				address!("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B"),
 			),
 			available_inputs: vec![AvailableInput {
 				user: InteropAddress::new_ethereum(
 					1,
-					address!("1111111111111111111111111111111111111111"),
+					address!("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B"),
 				),
 				asset: InteropAddress::new_ethereum(
 					1,
-					address!("2222222222222222222222222222222222222222"),
+					address!("6B175474E89094C44Da98b954EedeAC495271d0F"),
 				),
-				amount: U256::from(1000),
+				amount: "1000".to_string(),
 				lock: None,
 			}],
 			requested_outputs: vec![RequestedOutput {
 				receiver: InteropAddress::new_ethereum(
 					1,
-					address!("3333333333333333333333333333333333333333"),
+					address!("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B"),
 				),
 				asset: InteropAddress::new_ethereum(
 					1,
-					address!("4444444444444444444444444444444444444444"),
+					address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
 				),
-				amount: U256::from(900),
+				amount: "900".to_string(),
 				calldata: None,
 			}],
 			min_valid_until: Some(1234567890),
 			preference: Some(QuotePreference::Price),
+			order_type: None,
+			origin_submission: None,
 		};
 
 		let json = serde_json::to_string(&request).unwrap();
@@ -738,26 +742,11 @@ mod tests {
 	}
 
 	#[test]
-	fn test_signature_type_serialization() {
-		let sig_types = [SignatureType::Eip712, SignatureType::Erc3009];
-		let expected_values = ["\"eip712\"", "\"erc3009\""];
-
-		for (sig_type, expected) in sig_types.iter().zip(expected_values.iter()) {
-			let json = serde_json::to_string(sig_type).unwrap();
-			assert_eq!(json, *expected);
-
-			let deserialized: SignatureType = serde_json::from_str(&json).unwrap();
-			assert!(matches!(deserialized, sig_type));
-		}
-	}
-
-	#[test]
 	fn test_quote_order_serialization() {
 		let order = QuoteOrder {
-			signature_type: SignatureType::Eip712,
 			domain: InteropAddress::new_ethereum(
 				1,
-				address!("5555555555555555555555555555555555555555"),
+				address!("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9"),
 			),
 			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
 			message: serde_json::json!({
@@ -769,12 +758,10 @@ mod tests {
 		};
 
 		let json = serde_json::to_string(&order).unwrap();
-		assert!(json.contains("\"signatureType\":\"eip712\""));
 		assert!(json.contains("\"primaryType\""));
 		assert!(json.contains("\"message\""));
 
 		let deserialized: QuoteOrder = serde_json::from_str(&json).unwrap();
-		assert!(matches!(deserialized.signature_type, SignatureType::Eip712));
 		assert_eq!(deserialized.primary_type, "PermitBatchWitnessTransferFrom");
 	}
 
@@ -788,7 +775,7 @@ mod tests {
 			assert_eq!(json, *expected);
 
 			let deserialized: SettlementType = serde_json::from_str(&json).unwrap();
-			assert!(matches!(deserialized, settlement_type));
+			assert_eq!(deserialized, *settlement_type);
 		}
 	}
 
@@ -796,7 +783,6 @@ mod tests {
 	fn test_quote_serialization() {
 		let quote = Quote {
 			orders: vec![QuoteOrder {
-				signature_type: SignatureType::Eip712,
 				domain: InteropAddress::new_ethereum(
 					1,
 					address!("5555555555555555555555555555555555555555"),
@@ -962,61 +948,6 @@ mod tests {
 	}
 
 	#[test]
-	fn test_u256_serde_serialize() {
-		#[derive(Serialize)]
-		struct TestStruct {
-			#[serde(with = "u256_serde")]
-			amount: U256,
-		}
-
-		let test_struct = TestStruct {
-			amount: U256::from(12345),
-		};
-		let json = serde_json::to_string(&test_struct).unwrap();
-		assert!(json.contains("\"12345\""));
-	}
-
-	#[test]
-	fn test_u256_serde_deserialize() {
-		let json = r#"{"amount": "98765"}"#;
-		#[derive(Deserialize)]
-		struct TestStruct {
-			#[serde(with = "u256_serde")]
-			amount: U256,
-		}
-
-		let deserialized: TestStruct = serde_json::from_str(json).unwrap();
-		assert_eq!(deserialized.amount, U256::from(98765));
-
-		// Test invalid input
-		let invalid_json = r#"{"amount": "not_a_number"}"#;
-		let result: Result<TestStruct, _> = serde_json::from_str(invalid_json);
-		assert!(result.is_err());
-	}
-
-	#[test]
-	fn test_u256_serde_large_numbers() {
-		#[derive(Serialize, Deserialize)]
-		struct TestStruct {
-			#[serde(with = "u256_serde")]
-			amount: U256,
-		}
-
-		let large_value = U256::from_str_radix(
-			"115792089237316195423570985008687907853269984665640564039457584007913129639935",
-			10,
-		)
-		.unwrap();
-		let test_struct = TestStruct {
-			amount: large_value,
-		};
-
-		let json = serde_json::to_string(&test_struct).unwrap();
-		let deserialized: TestStruct = serde_json::from_str(&json).unwrap();
-		assert_eq!(deserialized.amount, large_value);
-	}
-
-	#[test]
 	fn test_quote_error_display() {
 		let errors = [
 			(
@@ -1113,12 +1044,22 @@ mod tests {
 	#[test]
 	fn test_debug_implementations() {
 		let asset_amount = AssetAmount {
-			asset: "test_asset".to_string(),
-			amount: U256::from(100),
+			asset: InteropAddress::new_ethereum(
+				1,
+				address!("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B"),
+			),
+			amount: "100".to_string(),
 		};
 		let debug_str = format!("{:?}", asset_amount);
+
 		assert!(debug_str.contains("AssetAmount"));
-		assert!(debug_str.contains("test_asset"));
+		assert!(debug_str.contains("asset:"));
+		assert!(debug_str.contains("InteropAddress"));
+		assert!(debug_str.contains("version: 1"));
+		assert!(debug_str.contains("chain_type:"));
+		assert!(debug_str.contains("chain_reference:"));
+		assert!(debug_str.contains("address:"));
+		assert!(debug_str.contains("amount: \"100\""));
 
 		let lock_kind = LockKind::TheCompact;
 		let debug_str = format!("{:?}", lock_kind);
@@ -1131,13 +1072,19 @@ mod tests {
 		};
 		let debug_str = format!("{:?}", api_error);
 		assert!(debug_str.contains("BadRequest"));
+		assert!(debug_str.contains("error_type: \"TEST\""));
+		assert!(debug_str.contains("message: \"Test message\""));
+		assert!(debug_str.contains("details: None"));
 	}
 
 	#[test]
 	fn test_clone_implementations() {
 		let asset_amount = AssetAmount {
-			asset: "test_asset".to_string(),
-			amount: U256::from(100),
+			asset: InteropAddress::new_ethereum(
+				1,
+				address!("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B"),
+			),
+			amount: "100".to_string(),
 		};
 		let cloned = asset_amount.clone();
 		assert_eq!(cloned.asset, asset_amount.asset);
@@ -1154,12 +1101,14 @@ mod tests {
 		let request = GetQuoteRequest {
 			user: InteropAddress::new_ethereum(
 				1,
-				address!("1111111111111111111111111111111111111111"),
+				address!("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B"),
 			),
 			available_inputs: vec![],
 			requested_outputs: vec![],
 			min_valid_until: None,
 			preference: None,
+			order_type: None,
+			origin_submission: None,
 		};
 
 		let json = serde_json::to_string(&request).unwrap();
@@ -1169,12 +1118,15 @@ mod tests {
 
 		// Test zero amounts
 		let asset_amount = AssetAmount {
-			asset: "test".to_string(),
-			amount: U256::ZERO,
+			asset: InteropAddress::new_ethereum(
+				1,
+				address!("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B"),
+			),
+			amount: "0".to_string(),
 		};
 
 		let json = serde_json::to_string(&asset_amount).unwrap();
 		let deserialized: AssetAmount = serde_json::from_str(&json).unwrap();
-		assert_eq!(deserialized.amount, U256::ZERO);
+		assert_eq!(deserialized.amount, "0".to_string());
 	}
 }
