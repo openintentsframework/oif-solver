@@ -105,7 +105,10 @@ impl OrderStateMachine {
 		enum OrderStatusKind {
 			Created,
 			Pending,
+			Executing,
 			Executed,
+			PostFilled,
+			PreClaimed,
 			Settled,
 			Finalized,
 			Failed,
@@ -117,19 +120,43 @@ impl OrderStateMachine {
 				let mut m = HashMap::new();
 				m.insert(
 					OrderStatusKind::Created,
-					HashSet::from([OrderStatusKind::Pending, OrderStatusKind::Failed]),
+					HashSet::from([
+						OrderStatusKind::Pending,
+						OrderStatusKind::Executing,
+						OrderStatusKind::Failed,
+					]),
 				);
 				m.insert(
 					OrderStatusKind::Pending,
+					HashSet::from([OrderStatusKind::Executing, OrderStatusKind::Failed]),
+				);
+				m.insert(
+					OrderStatusKind::Executing,
 					HashSet::from([OrderStatusKind::Executed, OrderStatusKind::Failed]),
 				);
 				m.insert(
 					OrderStatusKind::Executed,
+					HashSet::from([
+						OrderStatusKind::PostFilled,
+						OrderStatusKind::Settled,
+						OrderStatusKind::Failed,
+					]),
+				);
+				m.insert(
+					OrderStatusKind::PostFilled,
 					HashSet::from([OrderStatusKind::Settled, OrderStatusKind::Failed]),
 				);
 				m.insert(
-					OrderStatusKind::Settled,
+					OrderStatusKind::PreClaimed,
 					HashSet::from([OrderStatusKind::Finalized, OrderStatusKind::Failed]),
+				);
+				m.insert(
+					OrderStatusKind::Settled,
+					HashSet::from([
+						OrderStatusKind::PreClaimed,
+						OrderStatusKind::Finalized,
+						OrderStatusKind::Failed,
+					]),
 				);
 				m.insert(OrderStatusKind::Failed, HashSet::new()); // terminal
 				m.insert(OrderStatusKind::Finalized, HashSet::new()); // terminal
@@ -141,7 +168,10 @@ impl OrderStateMachine {
 			match status {
 				OrderStatus::Created => OrderStatusKind::Created,
 				OrderStatus::Pending => OrderStatusKind::Pending,
+				OrderStatus::Executing => OrderStatusKind::Executing,
 				OrderStatus::Executed => OrderStatusKind::Executed,
+				OrderStatus::PostFilled => OrderStatusKind::PostFilled,
+				OrderStatus::PreClaimed => OrderStatusKind::PreClaimed,
 				OrderStatus::Settled => OrderStatusKind::Settled,
 				OrderStatus::Finalized => OrderStatusKind::Finalized,
 				OrderStatus::Failed(_) => OrderStatusKind::Failed,
@@ -150,6 +180,7 @@ impl OrderStateMachine {
 
 		let from_kind = status_kind(from);
 		let to_kind = status_kind(to);
+
 		TRANSITIONS
 			.get(&from_kind)
 			.is_some_and(|set| set.contains(&to_kind))
@@ -184,6 +215,8 @@ impl OrderStateMachine {
 		self.update_order_with(order_id, |order| match tx_type {
 			TransactionType::Prepare => order.prepare_tx_hash = Some(tx_hash),
 			TransactionType::Fill => order.fill_tx_hash = Some(tx_hash),
+			TransactionType::PostFill => order.post_fill_tx_hash = Some(tx_hash),
+			TransactionType::PreClaim => order.pre_claim_tx_hash = Some(tx_hash),
 			TransactionType::Claim => order.claim_tx_hash = Some(tx_hash),
 		})
 		.await

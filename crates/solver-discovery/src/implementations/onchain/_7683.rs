@@ -282,11 +282,10 @@ impl Eip7683Discovery {
 	fn process_discovered_logs(
 		logs: Vec<Log>,
 		sender: &mpsc::UnboundedSender<Intent>,
-		chain_id: u64,
+		_chain_id: u64,
 	) {
 		for log in logs {
 			if let Ok(intent) = Self::parse_open_event(&log) {
-				tracing::info!(chain = chain_id, "Discovered intent: {}", intent.id);
 				let _ = sender.send(intent);
 			}
 		}

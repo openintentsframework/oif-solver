@@ -1,14 +1,15 @@
 //! Settlement module for the OIF solver system.
 //!
-//! This module handles the validation of filled orders and manages the claiming
-//! process for solver rewards. It supports different settlement mechanisms
-//! for various order standards.
+//! This module handles the complete settlement lifecycle including validation of
+//! filled orders, optional post-fill and pre-claim transactions for oracle interactions,
+//! and the final claiming process for solver rewards. It supports different
+//! settlement mechanisms for various order standards.
 
 use async_trait::async_trait;
 use solver_types::{
 	oracle::{OracleInfo, OracleRoutes},
-	Address, ConfigSchema, FillProof, ImplementationRegistry, NetworksConfig, Order,
-	TransactionHash,
+	Address, ConfigSchema, FillProof, ImplementationRegistry, NetworksConfig, Order, Transaction,
+	TransactionHash, TransactionReceipt,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -185,6 +186,38 @@ pub trait SettlementInterface: Send + Sync {
 	/// - Solver permissions
 	/// - Reward availability
 	async fn can_claim(&self, order: &Order, fill_proof: &FillProof) -> bool;
+
+	/// Generates a transaction to execute after fill confirmation (optional).
+	///
+	/// This transaction might:
+	/// - Request attestation from an oracle
+	/// - Submit proof to a bridge
+	/// - Initiate oracle delegation
+	/// - Prepare settlement data
+	async fn generate_post_fill_transaction(
+		&self,
+		_order: &Order,
+		_fill_receipt: &TransactionReceipt,
+	) -> Result<Option<Transaction>, SettlementError> {
+		// Default: no post-fill transaction needed
+		Ok(None)
+	}
+
+	/// Generates a transaction to execute before claiming (optional).
+	///
+	/// This transaction might:
+	/// - Submit oracle signatures
+	/// - Finalize attestations
+	/// - Prepare claim proofs
+	/// - Unlock settlement funds
+	async fn generate_pre_claim_transaction(
+		&self,
+		_order: &Order,
+		_fill_proof: &FillProof,
+	) -> Result<Option<Transaction>, SettlementError> {
+		// Default: no pre-claim transaction needed
+		Ok(None)
+	}
 }
 
 /// Type alias for settlement factory functions.
@@ -392,5 +425,29 @@ impl SettlementService {
 		} else {
 			false
 		}
+	}
+
+	/// Generates a post-fill transaction if needed by the settlement implementation.
+	pub async fn generate_post_fill_transaction(
+		&self,
+		order: &Order,
+		fill_receipt: &TransactionReceipt,
+	) -> Result<Option<Transaction>, SettlementError> {
+		let implementation = self.find_settlement_for_order(order)?;
+		implementation
+			.generate_post_fill_transaction(order, fill_receipt)
+			.await
+	}
+
+	/// Generates a pre-claim transaction if needed by the settlement implementation.
+	pub async fn generate_pre_claim_transaction(
+		&self,
+		order: &Order,
+		fill_proof: &FillProof,
+	) -> Result<Option<Transaction>, SettlementError> {
+		let implementation = self.find_settlement_for_order(order)?;
+		implementation
+			.generate_pre_claim_transaction(order, fill_proof)
+			.await
 	}
 }

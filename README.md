@@ -33,23 +33,47 @@ sequenceDiagram
     Order->>Core: Validated Order
     Core->>Storage: Store Order
 
-    Note over Core,Settlement: Intent Processing
+    Note over Core,Settlement: Intent Execution (Prepare → Fill)
     Core->>Order: Check Execution Strategy
-    Order->>Core: Execute Decision
+    Order->>Core: Execute Decision (Status: Executing)
     Core->>Order: Generate Fill Transaction
-    Order->>Core: Transaction Ready
-    Core->>Delivery: Submit Transaction
-    Delivery->>Core: Transaction Submitted
+    Order->>Core: Fill Transaction Ready
+    Core->>Delivery: Submit Fill Transaction
+    Delivery->>Core: Fill Confirmed (Status: Executed)
 
-    Note over Core,Settlement: Settlement Processing
-    Core->>Delivery: Monitor Transaction
-    Delivery->>Core: Transaction Confirmed
-    Core->>Settlement: Validate Fill
-    Settlement->>Core: Fill Validated
-    Core->>Order: Generate Claim
+    Note over Core,Settlement: Post-Fill Processing
+    Core->>Settlement: Generate PostFill Transaction
+    Settlement->>Core: PostFill Transaction (if needed)
+    Core->>Delivery: Submit PostFill
+    Delivery->>Core: PostFill Confirmed (Status: PostFilled)
+    
+    Note over Core,Settlement: Settlement Monitoring
+    Core->>Settlement: Start Monitoring for Claim Readiness
+    Settlement->>Core: Monitor Fill Proof
+    Settlement->>Core: Dispute Period Passed
+    
+    Note over Core,Settlement: Pre-Claim & Claim
+    Core->>Settlement: Generate PreClaim Transaction
+    Settlement->>Core: PreClaim Transaction (if needed)
+    Core->>Delivery: Submit PreClaim
+    Delivery->>Core: PreClaim Confirmed (Status: PreClaimed)
+    Core->>Order: Generate Claim Transaction
+    Order->>Core: Claim Transaction Ready
     Core->>Delivery: Submit Claim
-    Delivery->>Core: Claim Confirmed
+    Delivery->>Core: Claim Confirmed (Status: Finalized)
 ```
+
+### Transaction State Transitions
+
+The solver manages orders through distinct transaction states with the following progression:
+
+1. **Prepare** → Status: `Executing` (emits `OrderEvent::Executing`)
+2. **Fill** → Status: `Executed` (emits `SettlementEvent::PostFillReady`)
+3. **PostFill** → Status: `PostFilled` (emits `SettlementEvent::StartMonitoring`)
+4. **PreClaim** → Status: `PreClaimed` (emits `SettlementEvent::ClaimReady`)
+5. **Claim** → Status: `Finalized` (emits `SettlementEvent::Completed`)
+
+Each transition updates the order status in storage and triggers appropriate events for downstream processing.
 
 ## Architecture
 
