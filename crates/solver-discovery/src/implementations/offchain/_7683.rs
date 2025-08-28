@@ -240,45 +240,6 @@ where
 	Ok(bytes)
 }
 
-/// Flexible deserializer for LockType that accepts numbers, strings, or enum names.
-fn deserialize_lock_type_flexible<'de, D>(deserializer: D) -> Result<LockType, D::Error>
-where
-	D: serde::Deserializer<'de>,
-{
-	use serde::de::Error;
-	let v = serde_json::Value::deserialize(deserializer)?;
-	match v {
-		serde_json::Value::Number(n) => {
-			let num = n
-				.as_u64()
-				.ok_or_else(|| Error::custom("Invalid number for LockType"))?;
-			if num <= u8::MAX as u64 {
-				LockType::from_u8(num as u8).ok_or_else(|| Error::custom("Invalid LockType value"))
-			} else {
-				Err(Error::custom("LockType value out of range"))
-			}
-		},
-		serde_json::Value::String(s) => {
-			// Try parsing as number first, then as enum name
-			if let Ok(num) = s.parse::<u8>() {
-				LockType::from_u8(num).ok_or_else(|| Error::custom("Invalid LockType value"))
-			} else {
-				// Try parsing as enum variant name
-				match s.as_str() {
-					"permit2_escrow" | "Permit2Escrow" => Ok(LockType::Permit2Escrow),
-					"eip3009_escrow" | "Eip3009Escrow" => Ok(LockType::Eip3009Escrow),
-					"resource_lock" | "ResourceLock" => Ok(LockType::ResourceLock),
-					_ => Err(Error::custom("Invalid LockType string")),
-				}
-			}
-		},
-		serde_json::Value::Null => Ok(default_lock_type()),
-		_ => Err(Error::custom(
-			"expected number, string, or null for LockType",
-		)),
-	}
-}
-
 /// API request wrapper for intent submission matching OpenAPI PostOrderRequest.
 ///
 /// This structure follows the OpenAPI 3.0.0 specification for order submission.
@@ -354,10 +315,6 @@ enum SubmissionScheme {
 	Permit2,
 	Erc20Permit,
 	Eip3009,
-}
-
-fn default_lock_type() -> LockType {
-	LockType::Permit2Escrow
 }
 
 /// Status enum for intent submission responses.
@@ -956,13 +913,32 @@ async fn handle_intent_submission(
 			.into_response();
 	}
 
+	// Determine lock type from origin submission schemes
+	let lock_type = if let Some(origin_submission) = &request.origin_submission {
+		// Use the first scheme to determine lock type
+		if let Some(first_scheme) = origin_submission.schemes.first() {
+			match first_scheme {
+				SubmissionScheme::Permit2 => LockType::Permit2Escrow,
+				SubmissionScheme::Eip3009 => LockType::Eip3009Escrow,
+				SubmissionScheme::Erc4337 => LockType::ResourceLock, // TheCompact
+				SubmissionScheme::Erc20Permit => LockType::Permit2Escrow, // Default to Permit2
+			}
+		} else {
+			LockType::Permit2Escrow // Default if no schemes provided
+		}
+	} else {
+		LockType::Permit2Escrow // Default if origin_submission is None
+	};
+
+	tracing::debug!(?lock_type, "Determined lock type from origin submission");
+
 	// Convert to intent using the existing method
 	match Eip7683OffchainDiscovery::order_to_intent(
 		&order,
 		&request.order,
 		&sponsor,
 		&request.signature,
-		LockType::Permit2Escrow,
+		lock_type,
 		&state.providers,
 		&state.networks,
 	)

@@ -455,18 +455,13 @@ else
     echo -e "${GREEN}✅ EIP-712 signature generated: $SIGNATURE${NC}"
 fi
 
-# Lock type constants - these correspond to the LockType enum in the solver
-LOCK_TYPE_PERMIT2_ESCROW=1      # Permit2-based escrow mechanism
-LOCK_TYPE_EIP3009_ESCROW=2      # EIP-3009 based escrow mechanism  
-LOCK_TYPE_RESOURCE_LOCK=3       # Resource lock mechanism (The Compact)
-
-# Set the lock type to use for this intent
-LOCK_TYPE=$LOCK_TYPE_PERMIT2_ESCROW
+# Lock type is now determined by originSubmission.schemes in the JSON payload
+# No need for lock_type constants since we use the OpenAPI standard approach
 
 # Create the final JSON payload with signature
 # The API expects the StandardOrder in bytes format along with the signature
 # The signature needs to be prefixed with 0x00 for SIGNATURE_TYPE_PERMIT2
-# lock_type values: 1=permit2-escrow, 2=eip3009-escrow, 3=resource-lock
+# Lock type is determined by originSubmission.schemes: permit2, eip-3009, erc-4337
 PREFIXED_SIGNATURE="0x00${SIGNATURE:2}"
 JSON_PAYLOAD=$(cat <<EOF
 {
