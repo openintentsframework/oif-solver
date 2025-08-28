@@ -494,6 +494,8 @@ mod tests {
 			created_at: 1640995200,
 			updated_at: 1640995200,
 			status: OrderStatus::Executed,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
 			data: json!({
 				"order_id": "0x1234567890123456789012345678901234567890123456789012345678901234",
 				"nonce": "42",

@@ -239,6 +239,8 @@ mod tests {
 			id: "test-order".to_string(),
 			standard: "eip7683".to_string(),
 			created_at: 123456789,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
 			data: serde_json::to_value(&order_data).unwrap(),
 			solver_address: solver_types::Address(vec![99u8; 20]),
 			quote_id: Some("test-quote".to_string()),

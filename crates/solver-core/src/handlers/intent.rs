@@ -231,6 +231,8 @@ mod tests {
 			solver_address: Address(vec![0x12; 20]),
 			created_at: 1234567890,
 			updated_at: 1234567890,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
 			prepare_tx_hash: None,
 			fill_tx_hash: None,
 			claim_tx_hash: None,
