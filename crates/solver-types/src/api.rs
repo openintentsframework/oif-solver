@@ -2,7 +2,7 @@
 //!
 //! This module defines the request and response types for the OIF Solver API
 //! endpoints, following the ERC-7683 Cross-Chain Intents Standard.
-use crate::standards::eip7930::InteropAddress;
+use crate::{costs::QuoteCost, standards::eip7930::InteropAddress};
 use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -140,6 +140,9 @@ pub struct Quote {
 	pub quote_id: String,
 	/// Provider identifier
 	pub provider: String, // not used by the solver, only relevant for the aggregator
+	/// Cost breakdown
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub cost: Option<QuoteCost>,
 }
 
 /// Settlement mechanism types.

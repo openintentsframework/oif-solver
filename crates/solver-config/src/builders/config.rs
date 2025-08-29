@@ -4,7 +4,7 @@
 //! sensible defaults, particularly useful for testing scenarios.
 
 use crate::{
-	AccountConfig, ApiConfig, Config, DeliveryConfig, DiscoveryConfig, OrderConfig,
+	AccountConfig, ApiConfig, Config, DeliveryConfig, DiscoveryConfig, GasConfig, OrderConfig,
 	SettlementConfig, SolverConfig, StorageConfig, StrategyConfig,
 };
 use std::collections::HashMap;
@@ -128,7 +128,11 @@ impl ConfigBuilder {
 				implementations: HashMap::new(),
 				domain: None,
 			},
+			pricing: None,
 			api: self.api,
+			gas: Some(GasConfig {
+				flows: HashMap::new(),
+			}),
 		}
 	}
 }
