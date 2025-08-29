@@ -56,7 +56,7 @@ use solver_config::Config;
 use solver_settlement::{SettlementInterface, SettlementService};
 use solver_types::{
 	with_0x_prefix, GetQuoteRequest, InteropAddress, Quote, QuoteDetails, QuoteError, QuoteOrder,
-	QuotePreference, SignatureType,
+	QuotePreference,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -118,8 +118,28 @@ impl QuoteGenerator {
 			},
 		};
 		let details = QuoteDetails {
-			requested_outputs: request.requested_outputs.clone(),
-			available_inputs: request.available_inputs.clone(),
+			requested_outputs: request
+				.requested_outputs
+				.iter()
+				.map(|output| {
+					solver_types::RequestedOutputDetails {
+						user: request.user.clone(), // Use the main user from the request
+						asset: output.asset.clone(),
+						amount: output.amount.clone(),
+						calldata: output.calldata.clone(),
+					}
+				})
+				.collect(),
+			available_inputs: request
+				.available_inputs
+				.iter()
+				.map(|input| solver_types::AvailableInputDetails {
+					user: input.user.clone(),
+					asset: input.asset.clone(),
+					amount: input.amount.clone(),
+					lock_type: input.lock.as_ref().map(|lock| lock.kind.clone()),
+				})
+				.collect(),
 		};
 		let eta = self.calculate_eta(&request.preference);
 		Ok(Quote {
@@ -144,9 +164,12 @@ impl QuoteGenerator {
 				"CompactLock".to_string(),
 				self.build_compact_message(request, params)?,
 			),
+			LockKind::Rhinestone { params } => (
+				"RhinestoneLock".to_string(),
+				self.build_rhinestone_message(request, params)?,
+			),
 		};
 		Ok(QuoteOrder {
-			signature_type: SignatureType::Eip712,
 			domain: domain_address,
 			primary_type,
 			message,
@@ -212,7 +235,6 @@ impl QuoteGenerator {
 			build_permit2_batch_witness_digest(request, config, settlement, selected_oracle)?;
 		let message = serde_json::json!({ "digest": with_0x_prefix(&hex::encode(final_digest)), "eip712": message_obj });
 		Ok(QuoteOrder {
-			signature_type: SignatureType::Eip712,
 			domain: domain_address,
 			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
 			message,
@@ -235,7 +257,6 @@ impl QuoteGenerator {
 			"nonce": format!("0x{:064x}", chrono::Utc::now().timestamp() as u64)
 		});
 		Ok(QuoteOrder {
-			signature_type: SignatureType::Erc3009,
 			domain: domain_address,
 			primary_type: "ReceiveWithAuthorization".to_string(),
 			message,
@@ -253,6 +274,22 @@ impl QuoteGenerator {
 			"outputs": request.requested_outputs,
 			"nonce": chrono::Utc::now().timestamp(),
 			"deadline": chrono::Utc::now().timestamp() + 300
+		}))
+	}
+
+	fn build_rhinestone_message(
+		&self,
+		request: &GetQuoteRequest,
+		_params: &serde_json::Value,
+	) -> Result<serde_json::Value, QuoteError> {
+		// TODO: Implement proper Rhinestone message format
+		Ok(serde_json::json!({
+			"user": request.user,
+			"inputs": request.available_inputs,
+			"outputs": request.requested_outputs,
+			"nonce": chrono::Utc::now().timestamp(),
+			"deadline": chrono::Utc::now().timestamp() + 300,
+			"lock_type": "rhinestone"
 		}))
 	}
 

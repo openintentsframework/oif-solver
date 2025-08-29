@@ -183,7 +183,13 @@ impl QuoteValidator {
 			Self::validate_interop_address(&input.asset)?;
 
 			// Check that amount is positive
-			if input.amount == U256::ZERO {
+			let amount = input
+				.amount
+				.parse::<alloy_primitives::U256>()
+				.map_err(|_| {
+					QuoteError::InvalidRequest("Invalid input amount format".to_string())
+				})?;
+			if amount == alloy_primitives::U256::ZERO {
 				return Err(QuoteError::InvalidRequest(
 					"Input amount must be greater than zero".to_string(),
 				));
@@ -207,7 +213,13 @@ impl QuoteValidator {
 			Self::validate_interop_address(&output.receiver)?;
 			Self::validate_interop_address(&output.asset)?;
 
-			if output.amount == U256::ZERO {
+			let amount = output
+				.amount
+				.parse::<alloy_primitives::U256>()
+				.map_err(|_| {
+					QuoteError::InvalidRequest("Invalid output amount format".to_string())
+				})?;
+			if amount == alloy_primitives::U256::ZERO {
 				return Err(QuoteError::InvalidRequest(
 					"Output amount must be greater than zero".to_string(),
 				));
@@ -291,9 +303,12 @@ impl QuoteValidator {
 			let (chain_id, evm_addr) = Self::extract_chain_and_address(&input.asset)?;
 
 			if Self::is_token_supported(solver, chain_id, &evm_addr) {
+				let amount = input.amount.parse::<U256>().map_err(|_| {
+					QuoteError::InvalidRequest("Invalid input amount format".to_string())
+				})?;
 				supported_assets.push(SupportedAsset {
 					asset: input.asset.clone(),
-					amount: input.amount,
+					amount,
 				});
 			}
 		}
@@ -341,9 +356,12 @@ impl QuoteValidator {
 				)));
 			}
 
+			let amount = output.amount.parse::<U256>().map_err(|_| {
+				QuoteError::InvalidRequest("Invalid output amount format".to_string())
+			})?;
 			supported_outputs.push(SupportedAsset {
 				asset: output.asset.clone(),
-				amount: output.amount,
+				amount,
 			});
 		}
 

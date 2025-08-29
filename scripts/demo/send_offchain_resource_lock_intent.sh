@@ -195,26 +195,35 @@ echo -e "${GREEN}✅ Sponsor signature: $SPONSOR_SIG${NC}"
 # For demo, no allocat0xd93f642f64180aor data (empty bytes)
 ALLOCATOR_DATA="0x"
 
-# Lock type constants - these correspond to the LockType enum in the solver
-LOCK_TYPE_PERMIT2_ESCROW=1      # Permit2-based escrow mechanism
-LOCK_TYPE_EIP3009_ESCROW=2      # EIP-3009 based escrow mechanism  
-LOCK_TYPE_RESOURCE_LOCK=3       # Resource lock mechanism (The Compact)
+# Lock type is now determined by originSubmission.schemes in the JSON payload
+# For Resource Lock (The Compact), we use "erc-4337" scheme
 
 # Prefix signatures: for Compact we send abi.encode(sponsorSig, allocatorData) as-is (no type prefix)
 SIG_BYTES=$(cast abi-encode "f(bytes,bytes)" "$SPONSOR_SIG" "$ALLOCATOR_DATA")
 COMPACT_SIGNATURE="$SIG_BYTES"
 
+# Generate unique quote ID
+NONCE_FOR_QUOTE=$(perl -MTime::HiRes=time -e 'printf "%.0f\n", time * 1000')
+
 JSON_PAYLOAD=$(cat <<EOF
 {
   "order": "$ORDER_DATA",
-  "sponsor": "$USER_ADDR",
   "signature": "$COMPACT_SIGNATURE",
-  "lock_type": $LOCK_TYPE_RESOURCE_LOCK
+  "quoteId": "resource_lock_quote_${NONCE_FOR_QUOTE}",
+  "provider": "oif-solver-resource-lock",
+  "failureHandling": "retry",
+  "originSubmission": {
+    "mode": "user",
+    "schemes": [
+      "erc4337"
+    ]
+  }
 }
 EOF
 )
 
-echo -e "${YELLOW}🚀 Sending order to API...${NC}"
+echo -e "${YELLOW}🚀 Sending order to discovery API...${NC}"
+echo -e "   Endpoint: $API_URL"
 RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$API_URL" -H "Content-Type: application/json" -d "$JSON_PAYLOAD")
 HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
 RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
@@ -222,6 +231,17 @@ RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
 if [ "$HTTP_CODE" = "200" ]; then
   echo -e "${GREEN}✅ Order submitted successfully!${NC}"
   echo -e "   Response: $RESPONSE_BODY"
+  
+  # Extract order ID from response
+  ORDER_ID=$(echo "$RESPONSE_BODY" | jq -r '.orderId // empty')
+  if [ -n "$ORDER_ID" ]; then
+    echo -e "${GREEN}📋 Order ID: $ORDER_ID${NC}"
+  fi
+  
+  echo -e ""
+  echo -e "${GREEN}🎉 Resource Lock Intent Submitted!${NC}"
+  echo -e "${BLUE}📡 The solver should discover this intent via the API${NC}"
+  echo -e "   Route: TOKA → TOKA (via The Compact)"
 else
   echo -e "${RED}❌ Failed to submit order${NC}"
   echo -e "   HTTP Status: $HTTP_CODE"

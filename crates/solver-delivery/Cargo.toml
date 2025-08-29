@@ -26,3 +26,7 @@ alloy-signer = "0.8"
 alloy-signer-local = "0.8"
 alloy-transport = "0.8"
 alloy-transport-http = "0.8"
+mockall = { version = "0.13", optional = true }
+
+[features]
+testing = ["mockall"]

@@ -220,6 +220,13 @@ fn validate_routes(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use solver_types::Address;
+
+	// Helper function to create Address from hex string
+	fn addr(hex: &str) -> Address {
+		let hex_str = alloy_primitives::hex::decode(hex.trim_start_matches("0x")).unwrap();
+		Address(hex_str)
+	}
 
 	#[test]
 	fn test_parse_selection_strategy() {
@@ -242,6 +249,520 @@ mod tests {
 		assert_eq!(
 			parse_selection_strategy(None),
 			OracleSelectionStrategy::First
+		);
+	}
+
+	#[test]
+	fn test_parse_oracle_table_success() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"1".to_string(),
+				toml::Value::Array(vec![
+					toml::Value::String("0x1111111111111111111111111111111111111111".to_string()),
+					toml::Value::String("0x2222222222222222222222222222222222222222".to_string()),
+				]),
+			);
+			table.insert(
+				"2".to_string(),
+				toml::Value::Array(vec![toml::Value::String(
+					"0x3333333333333333333333333333333333333333".to_string(),
+				)]),
+			);
+			table
+		});
+
+		let result = parse_oracle_table(&config).unwrap();
+		assert_eq!(result.len(), 2);
+		assert!(result.contains_key(&1));
+		assert!(result.contains_key(&2));
+		assert_eq!(result[&1].len(), 2);
+		assert_eq!(result[&2].len(), 1);
+		assert_eq!(
+			result[&1][0],
+			addr("1111111111111111111111111111111111111111")
+		);
+		assert_eq!(
+			result[&2][0],
+			addr("3333333333333333333333333333333333333333")
+		);
+	}
+
+	#[test]
+	fn test_parse_oracle_table_invalid_chain_id() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"invalid".to_string(),
+				toml::Value::Array(vec![toml::Value::String(
+					"0x1111111111111111111111111111111111111111".to_string(),
+				)]),
+			);
+			table
+		});
+
+		let result = parse_oracle_table(&config);
+		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
+		if let Err(SettlementError::ValidationFailed(msg)) = result {
+			assert!(msg.contains("Invalid chain ID 'invalid'"));
+		}
+	}
+
+	#[test]
+	fn test_parse_oracle_table_not_array() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"1".to_string(),
+				toml::Value::String("not_array".to_string()),
+			);
+			table
+		});
+
+		let result = parse_oracle_table(&config);
+		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
+		if let Err(SettlementError::ValidationFailed(msg)) = result {
+			assert!(msg.contains("Oracles for chain 1 must be an array"));
+		}
+	}
+
+	#[test]
+	fn test_parse_oracle_table_empty_array() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert("1".to_string(), toml::Value::Array(vec![]));
+			table
+		});
+
+		let result = parse_oracle_table(&config);
+		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
+		if let Err(SettlementError::ValidationFailed(msg)) = result {
+			assert!(msg.contains("At least one oracle address required for chain 1"));
+		}
+	}
+
+	#[test]
+	fn test_parse_oracle_table_non_string_address() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"1".to_string(),
+				toml::Value::Array(vec![toml::Value::Integer(123)]),
+			);
+			table
+		});
+
+		let result = parse_oracle_table(&config);
+		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
+		if let Err(SettlementError::ValidationFailed(msg)) = result {
+			assert!(msg.contains("Oracle address must be string for chain 1"));
+		}
+	}
+
+	#[test]
+	fn test_parse_oracle_table_invalid_address() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"1".to_string(),
+				toml::Value::Array(vec![toml::Value::String("invalid_address".to_string())]),
+			);
+			table
+		});
+
+		let result = parse_oracle_table(&config);
+		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
+		if let Err(SettlementError::ValidationFailed(msg)) = result {
+			assert!(msg.contains("Invalid oracle address for chain 1"));
+		}
+	}
+
+	#[test]
+	fn test_parse_routes_table_success() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"1".to_string(),
+				toml::Value::Array(vec![toml::Value::Integer(2), toml::Value::Integer(3)]),
+			);
+			table.insert(
+				"2".to_string(),
+				toml::Value::Array(vec![toml::Value::Integer(1)]),
+			);
+			table
+		});
+
+		let result = parse_routes_table(&config).unwrap();
+		assert_eq!(result.len(), 2);
+		assert!(result.contains_key(&1));
+		assert!(result.contains_key(&2));
+		assert_eq!(result[&1], vec![2, 3]);
+		assert_eq!(result[&2], vec![1]);
+	}
+
+	#[test]
+	fn test_parse_routes_table_invalid_chain_id() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"invalid".to_string(),
+				toml::Value::Array(vec![toml::Value::Integer(2)]),
+			);
+			table
+		});
+
+		let result = parse_routes_table(&config);
+		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
+		if let Err(SettlementError::ValidationFailed(msg)) = result {
+			assert!(msg.contains("Invalid chain ID 'invalid'"));
+		}
+	}
+
+	#[test]
+	fn test_parse_routes_table_not_array() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert("1".to_string(), toml::Value::Integer(2));
+			table
+		});
+
+		let result = parse_routes_table(&config);
+		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
+		if let Err(SettlementError::ValidationFailed(msg)) = result {
+			assert!(msg.contains("Destinations for chain 1 must be an array"));
+		}
+	}
+
+	#[test]
+	fn test_parse_routes_table_empty_array() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert("1".to_string(), toml::Value::Array(vec![]));
+			table
+		});
+
+		let result = parse_routes_table(&config);
+		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
+		if let Err(SettlementError::ValidationFailed(msg)) = result {
+			assert!(msg.contains("At least one destination required for route from chain 1"));
+		}
+	}
+
+	#[test]
+	fn test_parse_routes_table_non_integer_destination() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"1".to_string(),
+				toml::Value::Array(vec![toml::Value::String("invalid".to_string())]),
+			);
+			table
+		});
+
+		let result = parse_routes_table(&config);
+		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
+		if let Err(SettlementError::ValidationFailed(msg)) = result {
+			assert!(msg.contains("Destination chain ID must be integer for route from chain 1"));
+		}
+	}
+
+	#[test]
+	fn test_validate_routes_success() {
+		let mut input_oracles = HashMap::new();
+		input_oracles.insert(1, vec![addr("1111111111111111111111111111111111111111")]);
+
+		let mut output_oracles = HashMap::new();
+		output_oracles.insert(2, vec![addr("2222222222222222222222222222222222222222")]);
+		output_oracles.insert(3, vec![addr("3333333333333333333333333333333333333333")]);
+
+		let mut routes = HashMap::new();
+		routes.insert(1, vec![2, 3]);
+
+		let result = validate_routes(&input_oracles, &output_oracles, &routes);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_validate_routes_missing_input_oracle() {
+		let input_oracles = HashMap::new(); // Empty - no input oracle for chain 1
+
+		let mut output_oracles = HashMap::new();
+		output_oracles.insert(2, vec![addr("2222222222222222222222222222222222222222")]);
+
+		let mut routes = HashMap::new();
+		routes.insert(1, vec![2]);
+
+		let result = validate_routes(&input_oracles, &output_oracles, &routes);
+		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
+		if let Err(SettlementError::ValidationFailed(msg)) = result {
+			assert!(msg.contains("Route from chain 1 has no input oracle configured"));
+		}
+	}
+
+	#[test]
+	fn test_validate_routes_missing_output_oracle() {
+		let mut input_oracles = HashMap::new();
+		input_oracles.insert(1, vec![addr("1111111111111111111111111111111111111111")]);
+
+		let output_oracles = HashMap::new(); // Empty - no output oracle for chain 2
+
+		let mut routes = HashMap::new();
+		routes.insert(1, vec![2]);
+
+		let result = validate_routes(&input_oracles, &output_oracles, &routes);
+		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
+		if let Err(SettlementError::ValidationFailed(msg)) = result {
+			assert!(msg.contains("Route from chain 1 to chain 2 has no output oracle configured"));
+		}
+	}
+
+	#[test]
+	fn test_parse_oracle_config_success() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"oracles".to_string(),
+				toml::Value::Table({
+					let mut oracles = toml::map::Map::new();
+					oracles.insert(
+						"input".to_string(),
+						toml::Value::Table({
+							let mut input = toml::map::Map::new();
+							input.insert(
+								"1".to_string(),
+								toml::Value::Array(vec![toml::Value::String(
+									"0x1111111111111111111111111111111111111111".to_string(),
+								)]),
+							);
+							input
+						}),
+					);
+					oracles.insert(
+						"output".to_string(),
+						toml::Value::Table({
+							let mut output = toml::map::Map::new();
+							output.insert(
+								"2".to_string(),
+								toml::Value::Array(vec![toml::Value::String(
+									"0x2222222222222222222222222222222222222222".to_string(),
+								)]),
+							);
+							output
+						}),
+					);
+					oracles
+				}),
+			);
+			table.insert(
+				"routes".to_string(),
+				toml::Value::Table({
+					let mut routes = toml::map::Map::new();
+					routes.insert(
+						"1".to_string(),
+						toml::Value::Array(vec![toml::Value::Integer(2)]),
+					);
+					routes
+				}),
+			);
+			table.insert(
+				"oracle_selection_strategy".to_string(),
+				toml::Value::String("RoundRobin".to_string()),
+			);
+			table
+		});
+
+		let result = parse_oracle_config(&config).unwrap();
+		assert_eq!(result.input_oracles.len(), 1);
+		assert_eq!(result.output_oracles.len(), 1);
+		assert_eq!(result.routes.len(), 1);
+		assert!(matches!(
+			result.selection_strategy,
+			OracleSelectionStrategy::RoundRobin
+		));
+	}
+
+	#[test]
+	fn test_parse_oracle_config_missing_oracles_section() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"routes".to_string(),
+				toml::Value::Table(toml::map::Map::new()),
+			);
+			table
+		});
+
+		let result = parse_oracle_config(&config);
+		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
+		if let Err(SettlementError::ValidationFailed(msg)) = result {
+			assert!(msg.contains("Missing 'oracles' section"));
+		}
+	}
+
+	#[test]
+	fn test_parse_oracle_config_missing_input_oracles() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"oracles".to_string(),
+				toml::Value::Table({
+					let mut oracles = toml::map::Map::new();
+					oracles.insert(
+						"output".to_string(),
+						toml::Value::Table(toml::map::Map::new()),
+					);
+					oracles
+				}),
+			);
+			table.insert(
+				"routes".to_string(),
+				toml::Value::Table(toml::map::Map::new()),
+			);
+			table
+		});
+
+		let result = parse_oracle_config(&config);
+		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
+		if let Err(SettlementError::ValidationFailed(msg)) = result {
+			assert!(msg.contains("Missing 'oracles.input'"));
+		}
+	}
+
+	#[test]
+	fn test_parse_oracle_config_missing_output_oracles() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"oracles".to_string(),
+				toml::Value::Table({
+					let mut oracles = toml::map::Map::new();
+					oracles.insert(
+						"input".to_string(),
+						toml::Value::Table(toml::map::Map::new()),
+					);
+					oracles
+				}),
+			);
+			table.insert(
+				"routes".to_string(),
+				toml::Value::Table(toml::map::Map::new()),
+			);
+			table
+		});
+
+		let result = parse_oracle_config(&config);
+		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
+		if let Err(SettlementError::ValidationFailed(msg)) = result {
+			assert!(msg.contains("Missing 'oracles.output'"));
+		}
+	}
+
+	#[test]
+	fn test_parse_oracle_config_missing_routes() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"oracles".to_string(),
+				toml::Value::Table({
+					let mut oracles = toml::map::Map::new();
+					oracles.insert(
+						"input".to_string(),
+						toml::Value::Table(toml::map::Map::new()),
+					);
+					oracles.insert(
+						"output".to_string(),
+						toml::Value::Table(toml::map::Map::new()),
+					);
+					oracles
+				}),
+			);
+			table
+		});
+
+		let result = parse_oracle_config(&config);
+		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
+		if let Err(SettlementError::ValidationFailed(msg)) = result {
+			assert!(msg.contains("Missing 'routes' section"));
+		}
+	}
+
+	#[test]
+	fn test_parse_oracle_config_default_strategy() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"oracles".to_string(),
+				toml::Value::Table({
+					let mut oracles = toml::map::Map::new();
+					oracles.insert(
+						"input".to_string(),
+						toml::Value::Table({
+							let mut input = toml::map::Map::new();
+							input.insert(
+								"1".to_string(),
+								toml::Value::Array(vec![toml::Value::String(
+									"0x1111111111111111111111111111111111111111".to_string(),
+								)]),
+							);
+							input
+						}),
+					);
+					oracles.insert(
+						"output".to_string(),
+						toml::Value::Table({
+							let mut output = toml::map::Map::new();
+							output.insert(
+								"2".to_string(),
+								toml::Value::Array(vec![toml::Value::String(
+									"0x2222222222222222222222222222222222222222".to_string(),
+								)]),
+							);
+							output
+						}),
+					);
+					oracles
+				}),
+			);
+			table.insert(
+				"routes".to_string(),
+				toml::Value::Table({
+					let mut routes = toml::map::Map::new();
+					routes.insert(
+						"1".to_string(),
+						toml::Value::Array(vec![toml::Value::Integer(2)]),
+					);
+					routes
+				}),
+			);
+			// No oracle_selection_strategy - should default to First
+			table
+		});
+
+		let result = parse_oracle_config(&config).unwrap();
+		assert!(matches!(
+			result.selection_strategy,
+			OracleSelectionStrategy::First
+		));
+	}
+
+	// Helper function tests
+	#[test]
+	fn test_addr_helper() {
+		let address = addr("1234567890123456789012345678901234567890");
+		assert_eq!(address.0.len(), 20);
+		assert_eq!(
+			alloy_primitives::hex::encode(&address.0),
+			"1234567890123456789012345678901234567890"
+		);
+	}
+
+	#[test]
+	fn test_addr_helper_with_0x_prefix() {
+		let address = addr("0x1234567890123456789012345678901234567890");
+		assert_eq!(address.0.len(), 20);
+		assert_eq!(
+			alloy_primitives::hex::encode(&address.0),
+			"1234567890123456789012345678901234567890"
 		);
 	}
 }
