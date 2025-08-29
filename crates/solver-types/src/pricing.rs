@@ -45,8 +45,6 @@ impl TradingPair {
 			quote: quote.to_uppercase(),
 		}
 	}
-
-
 }
 
 impl fmt::Display for TradingPair {
@@ -103,7 +101,8 @@ pub trait PricingInterface: Send + Sync {
 		asset: &str,
 		currency: &str,
 	) -> Result<AssetPrice, PricingError> {
-		self.get_pair_price(&TradingPair::new(asset, currency)).await
+		self.get_pair_price(&TradingPair::new(asset, currency))
+			.await
 	}
 
 	/// Converts between two assets using available pricing data.

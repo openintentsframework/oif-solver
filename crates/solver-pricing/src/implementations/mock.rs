@@ -92,7 +92,7 @@ impl PricingInterface for MockPricing {
 	async fn get_supported_pairs(&self) -> Vec<TradingPair> {
 		let mut pairs = Vec::new();
 		for pair_str in self.pair_prices.keys() {
-			if let Ok(pair) = TradingPair::from_string(pair_str) {
+			if let Ok(pair) = pair_str.parse::<TradingPair>() {
 				pairs.push(pair);
 			}
 		}
