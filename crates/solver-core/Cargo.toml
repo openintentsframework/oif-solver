@@ -31,3 +31,4 @@ solver-delivery = { path = "../solver-delivery", features = ["testing"] }
 solver-storage = { path = "../solver-storage", features = ["testing"] }
 solver-order = { path = "../solver-order", features = ["testing"] }
 solver-account = { path = "../solver-account", features = ["testing"] }
+solver-settlement = { path = "../solver-settlement", features = ["testing"] }
