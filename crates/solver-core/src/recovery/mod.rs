@@ -764,63 +764,29 @@ mod tests {
 	use mockall::predicate::*;
 	use solver_delivery::MockDeliveryInterface;
 	use solver_storage::MockStorageInterface;
-	use solver_types::{Address, ExecutionParams, FillProof, TransactionHash};
+	use solver_types::{
+		utils::builders::{IntentBuilder, OrderBuilder},
+		ExecutionParams, FillProof, TransactionHash,
+	};
 	use std::collections::HashMap;
 
 	// Helper functions to create test data
 	fn create_test_order_with_status(status: OrderStatus) -> Order {
-		Order {
-			id: "test_order_123".to_string(),
-			standard: "eip7683".to_string(),
-			status,
-			solver_address: Address(vec![0x12; 20]),
-			created_at: 1234567890,
-			updated_at: 1234567890,
-			post_fill_tx_hash: None,
-			pre_claim_tx_hash: None,
-			prepare_tx_hash: None,
-			fill_tx_hash: None,
-			claim_tx_hash: None,
-			execution_params: Some(ExecutionParams {
+		OrderBuilder::new()
+			.with_status(status)
+			.with_execution_params(Some(ExecutionParams {
 				gas_price: alloy_primitives::U256::from(1000000000u64),
 				priority_fee: Some(alloy_primitives::U256::from(1000000u64)),
-			}),
-			fill_proof: None,
-			data: serde_json::json!({
-				"input_oracle": "0x1234567890123456789012345678901234567890",
-				"output_oracle": "0x3456789012345678901234567890123456789012"
-			}),
-			quote_id: None,
-			input_chain_ids: vec![1],
-			output_chain_ids: vec![137],
-		}
+			}))
+			.build()
 	}
 
 	fn create_test_intent() -> Intent {
-		Intent {
-			id: "test_intent_456".to_string(),
-			standard: "eip7683".to_string(),
-			data: serde_json::json!({
-				"origin_chain_id": 1,
-				"outputs": [
-					{
-						"chain_id": 137,
-						"token": "0x0000000000000000000000000000000000000000",
-						"amount": "1000000000000000000"
-					}
-				]
-			}),
-			source: "test".to_string(),
-			metadata: solver_types::IntentMetadata {
-				requires_auction: false,
-				exclusive_until: None,
-				discovered_at: 1234567890,
-			},
-			quote_id: None,
-		}
+		IntentBuilder::new().build()
 	}
 
 	fn create_test_fill_proof() -> FillProof {
+		// TODO: use builder!
 		FillProof {
 			tx_hash: TransactionHash(vec![0xbb; 32]),
 			block_number: 12345,
@@ -953,7 +919,7 @@ mod tests {
 		// Mock exists check for corresponding order (returns false = orphaned)
 		mock_storage
 			.expect_exists()
-			.with(eq("orders:test_intent_456"))
+			.with(eq("orders:test_intent_123"))
 			.times(1)
 			.returning(|_| Box::pin(async { Ok(false) }));
 
@@ -975,7 +941,7 @@ mod tests {
 
 		let orphaned = result.unwrap();
 		assert_eq!(orphaned.len(), 1);
-		assert_eq!(orphaned[0].id, "test_intent_456");
+		assert_eq!(orphaned[0].id, "test_intent_123");
 	}
 
 	#[tokio::test]

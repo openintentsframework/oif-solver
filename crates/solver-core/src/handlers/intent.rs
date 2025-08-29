@@ -194,33 +194,14 @@ mod tests {
 	use solver_delivery::DeliveryService;
 	use solver_order::{MockExecutionStrategy, MockOrderInterface};
 	use solver_storage::{MockStorageInterface, StorageError};
+	use solver_types::utils::builders::IntentBuilder;
 	use solver_types::{Address, ExecutionParams, Intent, Order, OrderStatus, SolverEvent};
 	use std::collections::HashMap;
 	use std::sync::Arc;
 	use std::time::Duration;
 
 	fn create_test_intent() -> Intent {
-		Intent {
-			id: "test_intent_123".to_string(),
-			standard: "eip7683".to_string(),
-			data: serde_json::json!({
-				"origin_chain_id": 1,
-				"outputs": [
-					{
-						"chain_id": 137,
-						"token": "0x0000000000000000000000000000000000000000",
-						"amount": "950000000000000000"
-					}
-				]
-			}),
-			source: "test".to_string(),
-			metadata: solver_types::IntentMetadata {
-				requires_auction: false,
-				exclusive_until: None,
-				discovered_at: 1234567890,
-			},
-			quote_id: None,
-		}
+		IntentBuilder::new().build()
 	}
 
 	fn create_test_order() -> Order {

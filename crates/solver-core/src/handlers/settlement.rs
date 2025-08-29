@@ -325,3 +325,330 @@ impl SettlementHandler {
 		Ok(())
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use mockall::predicate::*;
+	use solver_delivery::{DeliveryService, MockDeliveryInterface};
+	use solver_order::{MockOrderInterface, OrderService};
+	use solver_settlement::{MockSettlementInterface, SettlementService};
+	use solver_storage::{MockStorageInterface, StorageError, StorageService};
+	use solver_types::utils::builders::{
+		OrderBuilder, TransactionBuilder, TransactionReceiptBuilder,
+	};
+	use solver_types::{Order, Transaction, TransactionHash, TransactionReceipt};
+	use std::collections::HashMap;
+	use std::sync::Arc;
+	use tokio::sync::mpsc;
+
+	fn create_test_order() -> Order {
+		OrderBuilder::new().build()
+	}
+
+	fn create_test_receipt() -> TransactionReceipt {
+		TransactionReceiptBuilder::new().build()
+	}
+
+	fn create_test_transaction() -> Transaction {
+		TransactionBuilder::new()
+			.chain_id(137)
+			.gas_limit(21000)
+			.gas_price_gwei(20)
+			.build()
+	}
+
+	async fn create_test_handler_with_mocks<F1, F2, F3, F4>(
+		setup_storage: F1,
+		setup_settlement: F2,
+		setup_delivery: F3,
+		setup_order: F4,
+	) -> (SettlementHandler, mpsc::UnboundedReceiver<SolverEvent>)
+	where
+		F1: FnOnce(&mut MockStorageInterface),
+		F2: FnOnce(&mut MockSettlementInterface),
+		F3: FnOnce(&mut MockDeliveryInterface),
+		F4: FnOnce(&mut MockOrderInterface),
+	{
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_settlement = MockSettlementInterface::new();
+		let mut mock_delivery = MockDeliveryInterface::new();
+		let mut mock_order = MockOrderInterface::new();
+
+		// Set up expectations using the provided closures
+		setup_storage(&mut mock_storage);
+		setup_settlement(&mut mock_settlement);
+		setup_delivery(&mut mock_delivery);
+		setup_order(&mut mock_order);
+
+		// Create services with configured mocks
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let settlement = Arc::new(SettlementService::new(HashMap::from([(
+			"eip7683".to_string(),
+			Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+		)])));
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				137u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+		));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(solver_order::MockExecutionStrategy::new()),
+		));
+
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let (_, event_rx) = mpsc::unbounded_channel();
+		let event_bus = EventBus::new(100);
+
+		let handler = SettlementHandler::new(
+			settlement,
+			order_service,
+			delivery,
+			storage,
+			state_machine,
+			event_bus,
+			30,
+		);
+
+		(handler, event_rx)
+	}
+
+	#[tokio::test]
+	async fn test_handle_post_fill_ready_storage_error() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.returning(|_| Box::pin(async move { Err(StorageError::NotFound) }));
+			},
+			|_| {}, // No settlement expectations
+			|_| {}, // No delivery expectations
+			|_| {}, // No order expectations
+		)
+		.await;
+
+		let result = handler
+			.handle_post_fill_ready("test_order_123".to_string())
+			.await;
+		assert!(result.is_err());
+		assert!(matches!(result.unwrap_err(), SettlementError::Storage(_)));
+	}
+
+	#[tokio::test]
+	async fn test_handle_pre_claim_ready_missing_fill_proof() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.returning(|_| Box::pin(async move { Err(StorageError::NotFound) }));
+			},
+			|_| {},
+			|_| {},
+			|_| {},
+		)
+		.await;
+
+		let result = handler
+			.handle_pre_claim_ready("test_order_123".to_string())
+			.await;
+		assert!(result.is_err());
+		assert!(matches!(result.unwrap_err(), SettlementError::Storage(_)));
+	}
+
+	#[tokio::test]
+	async fn test_process_claim_batch_storage_error() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:nonexistent_order"))
+					.times(1)
+					.returning(|_| Box::pin(async move { Err(StorageError::NotFound) }));
+			},
+			|_| {}, // No settlement expectations
+			|_| {}, // No delivery expectations
+			|_| {}, // No order expectations
+		)
+		.await;
+
+		let mut batch = vec!["nonexistent_order".to_string()];
+		let result = handler.process_claim_batch(&mut batch).await;
+		assert!(result.is_err());
+		assert!(matches!(result.unwrap_err(), SettlementError::Storage(_)));
+	}
+
+	#[tokio::test]
+	async fn test_handle_post_fill_ready_with_transaction() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				// Check if order exists
+				mock_storage
+					.expect_exists()
+					.with(eq("orders:test_order_123"))
+					.times(1)
+					.returning(|_| Box::pin(async move { Ok(true) }));
+				// Called multiple times: initial retrieval and potentially again
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(2)
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_standard("eip7683")
+							.with_fill_tx_hash(Some(TransactionHash(vec![0x11; 32])))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+				// Second call: store tx hash mapping
+				mock_storage
+					.expect_set_bytes()
+					.times(2)
+					.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+			},
+			|mock_settlement| {
+				mock_settlement
+					.expect_is_input_oracle_supported()
+					.times(1)
+					.returning(|_, _| true);
+				mock_settlement
+					.expect_generate_post_fill_transaction()
+					.times(1)
+					.returning(|_, _| {
+						let tx = create_test_transaction();
+						Box::pin(async move { Ok(Some(tx)) })
+					});
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_receipt()
+					.with(eq(TransactionHash(vec![0x11; 32])), eq(137u64))
+					.times(1)
+					.returning(|_, _| {
+						let receipt = create_test_receipt();
+						Box::pin(async move { Ok(receipt) })
+					});
+				mock_delivery.expect_submit().times(1).returning(|_| {
+					let hash = TransactionHash(vec![0x33; 32]);
+					Box::pin(async move { Ok(hash) })
+				});
+			},
+			|_| {}, // No order expectations
+		)
+		.await;
+
+		let result = handler
+			.handle_post_fill_ready("test_order_123".to_string())
+			.await;
+
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_handle_post_fill_ready_no_transaction_needed() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				// Called twice: initial retrieval + when no PostFill needed
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(2)
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_standard("eip7683")
+							.with_fill_tx_hash(Some(TransactionHash(vec![0x11; 32])))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+			},
+			|mock_settlement| {
+				mock_settlement
+					.expect_is_input_oracle_supported()
+					.times(1)
+					.returning(|_, _| true);
+				mock_settlement
+					.expect_generate_post_fill_transaction()
+					.times(1)
+					// Return None to indicate no transaction needed
+					.returning(|_, _| Box::pin(async move { Ok(None) }));
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_receipt()
+					.with(eq(TransactionHash(vec![0x11; 32])), eq(137u64))
+					.times(1)
+					.returning(|_, _| {
+						let receipt = create_test_receipt();
+						Box::pin(async move { Ok(receipt) })
+					});
+			},
+			|_| {}, // No order expectations
+		)
+		.await;
+
+		let result = handler
+			.handle_post_fill_ready("test_order_123".to_string())
+			.await;
+
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_handle_post_fill_ready_missing_fill_tx_hash() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(1)
+					.returning(|_| {
+						let mut order = create_test_order();
+						order.fill_tx_hash = None; // Missing fill tx hash
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+			},
+			|_| {},
+			|_| {},
+			|_| {}, // No other expectations needed
+		)
+		.await;
+
+		let result = handler
+			.handle_post_fill_ready("test_order_123".to_string())
+			.await;
+		assert!(result.is_err());
+		assert!(matches!(result.unwrap_err(), SettlementError::Service(_)));
+	}
+
+	#[tokio::test]
+	async fn test_handle_post_fill_ready_no_output_chains() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(1)
+					.returning(|_| {
+						let mut order = create_test_order();
+						order.output_chain_ids = vec![]; // No output chains
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+			},
+			|_| {},
+			|_| {},
+			|_| {}, // No other expectations needed
+		)
+		.await;
+
+		let result = handler
+			.handle_post_fill_ready("test_order_123".to_string())
+			.await;
+		assert!(result.is_err());
+		assert!(matches!(result.unwrap_err(), SettlementError::Service(_)));
+	}
+}
