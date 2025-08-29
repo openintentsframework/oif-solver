@@ -233,9 +233,7 @@ impl NetworkConfigBuilder {
 	/// Creates a new `NetworkConfigBuilder` with default values.
 	pub fn new() -> Self {
 		Self {
-			rpc_urls: vec![RpcEndpointBuilder::new()
-				.http(Some("https://eth.llamarpc.com".to_string()))
-				.build()],
+			rpc_urls: vec![RpcEndpointBuilder::new().build()],
 			input_settler_address: Some(
 				parse_address("0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
 					.expect("Invalid mock address"),
