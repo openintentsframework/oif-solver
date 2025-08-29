@@ -1,76 +1,14 @@
 use alloy_primitives::U256;
 use solver_config::Config;
 use solver_core::SolverEngine;
+use solver_pricing::PricingService;
 use solver_types::{
 	costs::{CostComponent, QuoteCost},
-	Quote, QuoteError, QuoteOrder, SignatureType,
+	Quote, QuoteError, QuoteOrder, SignatureType, TradingPair,
 };
 use solver_types::{
 	Address, ExecutionParams, FillProof, Order, OrderStatus, Transaction, TransactionHash,
 };
-
-#[derive(Debug, Clone)]
-pub struct PricingConfig {
-	currency: String,
-	commission_bps: u32,
-	gas_buffer_bps: u32,
-	rate_buffer_bps: u32,
-	enable_live_gas_estimate: bool,
-}
-
-impl PricingConfig {
-	pub fn default_values() -> Self {
-		Self {
-			currency: "USDC".to_string(),
-			commission_bps: 20,
-			gas_buffer_bps: 1000,
-			rate_buffer_bps: 14,
-			enable_live_gas_estimate: false,
-		}
-	}
-
-	/// Builds pricing config from a TOML table (e.g. strategy implementation table)
-	pub fn from_table(table: &toml::Value) -> Self {
-		let defaults = Self::default_values();
-		Self {
-			currency: table
-				.get("pricing_currency")
-				.and_then(|v| v.as_str())
-				.unwrap_or(&defaults.currency)
-				.to_string(),
-			commission_bps: table
-				.get("commission_bps")
-				.and_then(|v| v.as_integer())
-				.unwrap_or(defaults.commission_bps as i64) as u32,
-			gas_buffer_bps: table
-				.get("gas_buffer_bps")
-				.and_then(|v| v.as_integer())
-				.unwrap_or(defaults.gas_buffer_bps as i64) as u32,
-			rate_buffer_bps: table
-				.get("rate_buffer_bps")
-				.and_then(|v| v.as_integer())
-				.unwrap_or(defaults.rate_buffer_bps as i64) as u32,
-			enable_live_gas_estimate: table
-				.get("enable_live_gas_estimate")
-				.and_then(|v| v.as_bool())
-				.unwrap_or(defaults.enable_live_gas_estimate),
-		}
-	}
-
-	fn from_config(config: &Config) -> Self {
-		// Try to get the config table from the primary strategy implementation
-		let strategy_name = &config.order.strategy.primary;
-		let default_table = toml::Value::Table(toml::map::Map::new());
-		let table = config
-			.order
-			.strategy
-			.implementations
-			.get(strategy_name)
-			.unwrap_or(&default_table);
-		tracing::info!("Pricing config: {:?}", table);
-		Self::from_table(table)
-	}
-}
 
 pub struct CostEngine;
 
@@ -79,13 +17,61 @@ impl CostEngine {
 		Self
 	}
 
+	/// Validates that the pricing service supports the required pairs for cross-chain operations.
+	pub async fn validate_pricing_support(
+		&self,
+		quote: &Quote,
+		pricing_service: &PricingService,
+	) -> Result<(), QuoteError> {
+		let supported_pairs = pricing_service.get_supported_pairs().await;
+
+		// Extract origin and destination assets from quote for validation
+		let _input = quote
+			.details
+			.available_inputs
+			.get(0)
+			.ok_or_else(|| QuoteError::InvalidRequest("missing input".to_string()))?;
+		let _output = quote
+			.details
+			.requested_outputs
+			.get(0)
+			.ok_or_else(|| QuoteError::InvalidRequest("missing output".to_string()))?;
+
+		// For now, we primarily care about ETH/USD support for gas cost calculations
+		let required_pairs = vec![
+			TradingPair::new("ETH", "USD"),
+			TradingPair::new("USD", "ETH"),
+		];
+
+		for required_pair in &required_pairs {
+			let has_direct_support = supported_pairs.iter().any(|p| {
+				(p.base == required_pair.base && p.quote == required_pair.quote)
+					|| (p.base == required_pair.quote && p.quote == required_pair.base)
+			});
+
+			if !has_direct_support {
+				tracing::warn!(
+					"Pricing service may not support required pair: {}",
+					required_pair.to_string()
+				);
+			}
+		}
+
+		Ok(())
+	}
+
 	pub async fn estimate_cost(
 		&self,
 		quote: &Quote,
 		solver: &SolverEngine,
 		config: &Config,
-		pricing: &PricingConfig,
+		pricing_service: &PricingService,
 	) -> Result<QuoteCost, QuoteError> {
+		// Validate pricing support for this quote
+		self.validate_pricing_support(quote, pricing_service)
+			.await?;
+
+		let pricing = pricing_service.config();
 		let (origin_chain_id, dest_chain_id) = self.extract_origin_dest_chain_ids(quote)?;
 
 		// Get gas units from config (preferred) or fallback to minimal defaults
@@ -185,12 +171,30 @@ impl CostEngine {
 		let fill_cost_wei_str = fill_cost_wei_uint.to_string();
 		let claim_cost_wei_str = claim_cost_wei_uint.to_string();
 
+		// Convert wei amounts to display currency
+		let open_cost_currency = pricing_service
+			.wei_to_currency(&open_cost_wei_str, &pricing.currency)
+			.await
+			.unwrap_or_else(|_| "0".to_string());
+		let fill_cost_currency = pricing_service
+			.wei_to_currency(&fill_cost_wei_str, &pricing.currency)
+			.await
+			.unwrap_or_else(|_| "0".to_string());
+		let claim_cost_currency = pricing_service
+			.wei_to_currency(&claim_cost_wei_str, &pricing.currency)
+			.await
+			.unwrap_or_else(|_| "0".to_string());
+
 		let gas_subtotal_w = add_many(&[
 			open_cost_wei_str.clone(),
 			fill_cost_wei_str.clone(),
 			claim_cost_wei_str.clone(),
 		]);
 		let buffer_gas = apply_bps(&gas_subtotal_w, pricing.gas_buffer_bps);
+		let buffer_gas_currency = pricing_service
+			.wei_to_currency(&buffer_gas, &pricing.currency)
+			.await
+			.unwrap_or_else(|_| "0".to_string());
 
 		let base_price = "0".to_string();
 		let buffer_rates = apply_bps(&base_price, pricing.rate_buffer_bps);
@@ -201,9 +205,23 @@ impl CostEngine {
 			buffer_gas.clone(),
 			buffer_rates.clone(),
 		]);
+		let subtotal_currency = pricing_service
+			.wei_to_currency(&subtotal, &pricing.currency)
+			.await
+			.unwrap_or_else(|_| "0".to_string());
+
 		let commission_amount = apply_bps(&subtotal, pricing.commission_bps);
+		let commission_amount_currency = pricing_service
+			.wei_to_currency(&commission_amount, &pricing.currency)
+			.await
+			.unwrap_or_else(|_| "0".to_string());
+
 		let total = add_decimals(&subtotal, &commission_amount);
-		// all values are in wei
+		let total_currency = pricing_service
+			.wei_to_currency(&total, &pricing.currency)
+			.await
+			.unwrap_or_else(|_| "0".to_string());
+
 		Ok(QuoteCost {
 			currency: pricing.currency.clone(),
 			components: vec![
@@ -214,22 +232,22 @@ impl CostEngine {
 				},
 				CostComponent {
 					name: "gas-open".into(),
-					amount: open_cost_wei_str.clone(),
+					amount: open_cost_currency,
 					amount_wei: Some(open_cost_wei_str),
 				},
 				CostComponent {
 					name: "gas-fill".into(),
-					amount: fill_cost_wei_str.clone(),
+					amount: fill_cost_currency,
 					amount_wei: Some(fill_cost_wei_str),
 				},
 				CostComponent {
 					name: "gas-claim".into(),
-					amount: claim_cost_wei_str.clone(),
+					amount: claim_cost_currency,
 					amount_wei: Some(claim_cost_wei_str),
 				},
 				CostComponent {
 					name: "buffer-gas".into(),
-					amount: buffer_gas.clone(),
+					amount: buffer_gas_currency,
 					amount_wei: Some(buffer_gas),
 				},
 				CostComponent {
@@ -239,9 +257,9 @@ impl CostEngine {
 				},
 			],
 			commission_bps: pricing.commission_bps,
-			commission_amount,
-			subtotal,
-			total,
+			commission_amount: commission_amount_currency,
+			subtotal: subtotal_currency,
+			total: total_currency,
 		})
 	}
 

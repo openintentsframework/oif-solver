@@ -69,6 +69,9 @@ pub struct Config {
 	pub order: OrderConfig,
 	/// Configuration for settlement operations.
 	pub settlement: SettlementConfig,
+	/// Configuration for pricing services.
+	#[serde(default)]
+	pub pricing: Option<PricingConfig>,
 	/// Configuration for the HTTP API server.
 	pub api: Option<ApiConfig>,
 	/// Optional gas configuration for precomputed/overridden gas units by flow.
@@ -251,6 +254,15 @@ pub struct GasFlowUnits {
 	/// Optional override for claim/finalize step gas units
 	#[serde(alias = "finalize")] // allow "finalize" as an alias in config
 	pub claim: Option<u64>,
+}
+
+/// Configuration for pricing services.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PricingConfig {
+	/// Which implementation to use as primary.
+	pub primary: String,
+	/// Map of pricing implementation names to their configurations.
+	pub implementations: HashMap<String, toml::Value>,
 }
 
 /// Gas configuration mapping flow identifiers to gas unit overrides.

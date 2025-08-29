@@ -128,6 +128,7 @@ impl ConfigBuilder {
 				implementations: HashMap::new(),
 				domain: None,
 			},
+			pricing: None,
 			api: self.api,
 			gas: Some(GasConfig {
 				flows: HashMap::new(),

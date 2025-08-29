@@ -35,6 +35,8 @@ pub mod validation;
 
 // Cost types
 pub mod costs;
+/// Pricing oracle types for currency conversion.
+pub mod pricing;
 
 // Re-export all types for convenient access
 pub use account::*;
@@ -44,6 +46,7 @@ pub use discovery::*;
 pub use events::*;
 pub use networks::{NetworkConfig, NetworksConfig, TokenConfig};
 pub use order::*;
+pub use pricing::*;
 pub use registry::ImplementationRegistry;
 pub use secret_string::SecretString;
 pub use standards::{

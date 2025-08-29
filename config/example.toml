@@ -110,6 +110,17 @@ primary = "simple"
 max_gas_price_gwei = 100
 
 # ============================================================================
+# PRICING
+# ============================================================================
+[pricing]
+primary = "mock"
+
+[pricing.implementations.mock]
+# Uses default ETH/USD price of $4615.16
+# You can override prices like this:
+# pair_prices = { "ETH/USD" = "3000.00", "SOL/USD" = "200.00" }
+
+# ============================================================================
 # SETTLEMENT
 # ============================================================================
 [settlement]
@@ -137,6 +148,15 @@ output = { 31337 = ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"], 31338 = ["0xD
 [settlement.implementations.direct.routes]
 31337 = [31338]  # Can go from chain 31337 to chain 31338
 31338 = [31337]  # Can go from chain 31338 to chain 31337
+
+# ============================================================================
+# PRICING
+# ============================================================================
+[pricing]
+primary = "mock"
+
+[pricing.implementations.mock]
+eth_price_usd = "4615.16"
 
 # ============================================================================
 # API SERVER

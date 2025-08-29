@@ -117,19 +117,11 @@ pub async fn process_quote_request(
 
 	// 5. Enrich quotes with a preliminary cost breakdown
 	let cost_engine = cost::CostEngine::new();
-	// Build pricing config from the selected strategy table (with defaults)
-	let strategy_name = &config.order.strategy.primary;
-	let default_table = toml::Value::Table(toml::map::Map::new());
-	let strategy_table = config
-		.order
-		.strategy
-		.implementations
-		.get(strategy_name)
-		.unwrap_or(&default_table);
-	let pricing = cost::PricingConfig::from_table(strategy_table);
+	let pricing_service = solver.pricing();
+
 	for quote in &mut quotes {
 		if let Ok(cost) = cost_engine
-			.estimate_cost(quote, solver, config, &pricing)
+			.estimate_cost(quote, solver, config, pricing_service)
 			.await
 		{
 			quote.cost = Some(cost);
