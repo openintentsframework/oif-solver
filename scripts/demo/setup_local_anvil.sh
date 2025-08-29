@@ -66,7 +66,7 @@ RECIPIENT_ADDR="0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
 ORIGIN_COMPACT_ADDRESS=""
 ORIGIN_PERMIT2_ADDRESS="0x000000000022D473030F116dDEE9F6B43aC78BA3"
 DEST_PERMIT2_ADDRESS="0x000000000022D473030F116dDEE9F6B43aC78BA3"
-OIF_PINNED_COMMIT="f2a9e8ab9d652894a090814421a7acb9a0547737"
+OIF_PINNED_COMMIT="3d1399025b9daa8ab6f0666f11b741d3b5c5fafa"
 
 echo -e "${BLUE}🔧 Simple Dual-Chain Anvil Setup${NC}"
 echo "======================================"
@@ -340,7 +340,7 @@ fi
 echo -e "${GREEN}✓${NC} $INPUT_SETTLER"
 
 echo -n "  Deploying OutputSettler on both chains... "
-OUTPUT_SETTLER_OUTPUT=$(~/.foundry/bin/forge create src/output/coin/OutputSettler7683.sol:OutputInputSettlerEscrow \
+OUTPUT_SETTLER_OUTPUT=$(~/.foundry/bin/forge create src/output/simple/OutputSettlerSimple.sol:OutputSettlerSimple \
     --rpc-url http://localhost:$ORIGIN_PORT \
     --private-key $PRIVATE_KEY \
     --broadcast 2>&1)
@@ -350,7 +350,7 @@ if [ -z "$OUTPUT_SETTLER" ]; then
     exit 1
 fi
 
-OUTPUT_SETTLER_DEST_OUTPUT=$(~/.foundry/bin/forge create src/output/coin/OutputSettler7683.sol:OutputInputSettlerEscrow \
+OUTPUT_SETTLER_DEST_OUTPUT=$(~/.foundry/bin/forge create src/output/simple/OutputSettlerSimple.sol:OutputSettlerSimple \
     --rpc-url http://localhost:$DEST_PORT \
     --private-key $PRIVATE_KEY \
     --broadcast 2>&1)
@@ -479,75 +479,36 @@ cast send $THE_COMPACT "__registerAllocator(address,bytes)" $ALLOCATOR_ADDR "0x"
 # Note: Token deposit into TheCompact will happen after token minting
 
 # Deploy InputSettlerCompact (Contract #6 - same address on both chains)
-INPUT_SETTLER_COMPACT_OUTPUT=$(env -u ETH_FROM ~/.foundry/bin/forge create src/input/compact/InputSettlerCompact.sol:InputSettlerCompact \
-    --constructor-args $THE_COMPACT \
-    --rpc-url http://localhost:$ORIGIN_PORT \
-    --private-key $PRIVATE_KEY \
-    --broadcast 2>&1 || true)
-INPUT_SETTLER_COMPACT=$(deployed_addr_from_output "$INPUT_SETTLER_COMPACT_OUTPUT")
-if [ -z "$INPUT_SETTLER_COMPACT" ]; then
-    echo -e "${YELLOW}Forge create failed; retrying via cast...${NC}"
-    ORIG_BYTECODE=$(~/.foundry/bin/forge inspect src/input/compact/InputSettlerCompact.sol:InputSettlerCompact bytecode)
-    ORIG_ARGS=$(cast abi-encode "constructor(address)" "$THE_COMPACT" | cut -c3-)
-    # Use unlocked account and capture tx hash, then receipt to get contract address
-    TX_HASH=$(cast send --create "${ORIG_BYTECODE}${ORIG_ARGS}" --rpc-url http://localhost:$ORIGIN_PORT --unlocked --from $SOLVER_ADDRESS 2>&1 | grep -Eo '0x[0-9a-fA-F]{64}' | head -n1)
-    if [ -n "$TX_HASH" ]; then
-        RECEIPT_JSON=$(cast receipt $TX_HASH --rpc-url http://localhost:$ORIGIN_PORT --json 2>/dev/null)
-        INPUT_SETTLER_COMPACT=$(echo "$RECEIPT_JSON" | jq -r '.contractAddress' 2>/dev/null)
-    fi
+echo -n "  Deploying InputSettlerCompact on both chains... "
+# Use raw eth_sendTransaction which is the only method that works
+ORIG_BYTECODE=$(~/.foundry/bin/forge inspect src/input/compact/InputSettlerCompact.sol:InputSettlerCompact bytecode)
+ORIG_ARGS=$(cast abi-encode "constructor(address)" "$THE_COMPACT" | cut -c3-)
+INITCODE="${ORIG_BYTECODE}${ORIG_ARGS}"
+
+# Deploy on origin chain
+TX_HASH=$(cast rpc --rpc-url http://localhost:$ORIGIN_PORT eth_sendTransaction "{\"from\":\"$SOLVER_ADDRESS\",\"data\":\"$INITCODE\"}" 2>&1 | grep -Eo '0x[0-9a-fA-F]{64}' | head -n1)
+if [ -n "$TX_HASH" ]; then
+    RECEIPT_JSON=$(cast receipt $TX_HASH --rpc-url http://localhost:$ORIGIN_PORT --json 2>/dev/null)
+    INPUT_SETTLER_COMPACT=$(echo "$RECEIPT_JSON" | jq -r '.contractAddress' 2>/dev/null)
 fi
-if [ -z "$INPUT_SETTLER_COMPACT" ] || [ "$INPUT_SETTLER_COMPACT" = "null" ]; then
-    echo -e "${YELLOW}Cast send failed; retrying via raw eth_sendTransaction...${NC}"
-    ORIG_BYTECODE=$(~/.foundry/bin/forge inspect src/input/compact/InputSettlerCompact.sol:InputSettlerCompact bytecode)
-    ORIG_ARGS=$(cast abi-encode "constructor(address)" "$THE_COMPACT" | cut -c3-)
-    INITCODE="${ORIG_BYTECODE}${ORIG_ARGS}"
-    TX_HASH=$(cast rpc --rpc-url http://localhost:$ORIGIN_PORT eth_sendTransaction "{\"from\":\"$SOLVER_ADDRESS\",\"data\":\"$INITCODE\"}" 2>&1 | grep -Eo '0x[0-9a-fA-F]{64}' | head -n1)
-    if [ -n "$TX_HASH" ]; then
-        RECEIPT_JSON=$(cast receipt $TX_HASH --rpc-url http://localhost:$ORIGIN_PORT --json 2>/dev/null)
-        INPUT_SETTLER_COMPACT=$(echo "$RECEIPT_JSON" | jq -r '.contractAddress' 2>/dev/null)
-    fi
-fi
+
 if [ -z "$INPUT_SETTLER_COMPACT" ] || [ "$INPUT_SETTLER_COMPACT" = "null" ]; then
     echo -e "${RED}Failed on origin${NC}"
-    echo "---- forge/cast output ----"
-    echo "$INPUT_SETTLER_COMPACT_OUTPUT"
     echo "TX: $TX_HASH"
-    echo "---------------------------"
     exit 1
 fi
 
-INPUT_SETTLER_COMPACT_DEST_OUTPUT=$(env -u ETH_FROM ~/.foundry/bin/forge create src/input/compact/InputSettlerCompact.sol:InputSettlerCompact \
-    --constructor-args $THE_COMPACT \
-    --rpc-url http://localhost:$DEST_PORT \
-    --private-key $PRIVATE_KEY \
-    --broadcast 2>&1 || true)
-INPUT_SETTLER_COMPACT_DEST_CHECK=$(deployed_addr_from_output "$INPUT_SETTLER_COMPACT_DEST_OUTPUT")
-if [ -z "$INPUT_SETTLER_COMPACT_DEST_CHECK" ]; then
-    echo -e "${YELLOW}Forge create (dest) failed; retrying via cast...${NC}"
-    DEST_BYTECODE=$(~/.foundry/bin/forge inspect src/input/compact/InputSettlerCompact.sol:InputSettlerCompact bytecode)
-    DEST_ARGS=$(cast abi-encode "constructor(address)" "$THE_COMPACT" | cut -c3-)
-    TX_HASH_DEST=$(cast send --create "${DEST_BYTECODE}${DEST_ARGS}" --rpc-url http://localhost:$DEST_PORT --unlocked --from $SOLVER_ADDRESS 2>&1 | grep -Eo '0x[0-9a-fA-F]{64}' | head -n1)
-    if [ -n "$TX_HASH_DEST" ]; then
-        RECEIPT_JSON_DEST=$(cast receipt $TX_HASH_DEST --rpc-url http://localhost:$DEST_PORT --json 2>/dev/null)
-        INPUT_SETTLER_COMPACT_DEST_CHECK=$(echo "$RECEIPT_JSON_DEST" | jq -r '.contractAddress' 2>/dev/null)
-    fi
+# Deploy on destination chain
+TX_HASH_DEST=$(cast rpc --rpc-url http://localhost:$DEST_PORT eth_sendTransaction "{\"from\":\"$SOLVER_ADDRESS\",\"data\":\"$INITCODE\"}" 2>&1 | grep -Eo '0x[0-9a-fA-F]{64}' | head -n1)
+if [ -n "$TX_HASH_DEST" ]; then
+    RECEIPT_JSON_DEST=$(cast receipt $TX_HASH_DEST --rpc-url http://localhost:$DEST_PORT --json 2>/dev/null)
+    INPUT_SETTLER_COMPACT_DEST_CHECK=$(echo "$RECEIPT_JSON_DEST" | jq -r '.contractAddress' 2>/dev/null)
 fi
-if [ -z "$INPUT_SETTLER_COMPACT_DEST_CHECK" ] || [ "$INPUT_SETTLER_COMPACT_DEST_CHECK" = "null" ]; then
-    echo -e "${YELLOW}Cast send (dest) failed; retrying via raw eth_sendTransaction...${NC}"
-    DEST_BYTECODE=$(~/.foundry/bin/forge inspect src/input/compact/InputSettlerCompact.sol:InputSettlerCompact bytecode)
-    DEST_ARGS=$(cast abi-encode "constructor(address)" "$THE_COMPACT" | cut -c3-)
-    INITCODE_DEST="${DEST_BYTECODE}${DEST_ARGS}"
-    TX_HASH_DEST=$(cast rpc --rpc-url http://localhost:$DEST_PORT eth_sendTransaction "{\"from\":\"$SOLVER_ADDRESS\",\"data\":\"$INITCODE_DEST\"}" 2>&1 | grep -Eo '0x[0-9a-fA-F]{64}' | head -n1)
-    if [ -n "$TX_HASH_DEST" ]; then
-        RECEIPT_JSON_DEST=$(cast receipt $TX_HASH_DEST --rpc-url http://localhost:$DEST_PORT --json 2>/dev/null)
-        INPUT_SETTLER_COMPACT_DEST_CHECK=$(echo "$RECEIPT_JSON_DEST" | jq -r '.contractAddress' 2>/dev/null)
-    fi
-fi
+
 if [ "$INPUT_SETTLER_COMPACT" != "$INPUT_SETTLER_COMPACT_DEST_CHECK" ]; then
     echo -e "${RED}Address mismatch!${NC}"
-    echo "---- forge output (dest) ----"
-    echo "$INPUT_SETTLER_COMPACT_DEST_OUTPUT"
-    echo "-----------------------------"
+    echo "Origin: $INPUT_SETTLER_COMPACT"
+    echo "Destination: $INPUT_SETTLER_COMPACT_DEST_CHECK"
     exit 1
 fi
 echo -e "${GREEN}✓${NC} $INPUT_SETTLER_COMPACT"

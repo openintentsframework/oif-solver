@@ -6,7 +6,7 @@
 
 use crate::{OrderError, OrderInterface};
 use alloy_primitives::{Address as AlloyAddress, FixedBytes, U256};
-use alloy_sol_types::{sol, SolCall, SolValue};
+use alloy_sol_types::{sol, SolCall};
 use async_trait::async_trait;
 use solver_types::{
 	oracle::OracleRoutes, standards::eip7683::LockType, Address, ConfigSchema, Eip7683OrderData,
@@ -39,9 +39,24 @@ sol! {
 		bytes context;
 	}
 
-	/// IDestinationSettler interface for filling orders.
-	interface IDestinationSettler {
-		function fill(bytes32 orderId, bytes originData, bytes fillerData) external;
+	/// Structure that matches OutputFillLib's expected packed encoding format.
+	/// This struct represents the exact byte layout expected by OutputSettlerSimple.
+	struct PackedMandateOutput {
+		uint48 fillDeadline;    // 6 bytes at offset 0
+		bytes32 oracle;          // 32 bytes at offset 6
+		bytes32 settler;         // 32 bytes at offset 38
+		uint256 chainId;         // 32 bytes at offset 70
+		bytes32 token;           // 32 bytes at offset 102
+		uint256 amount;          // 32 bytes at offset 134
+		bytes32 recipient;       // 32 bytes at offset 166
+		// Note: call and context need special handling due to their variable length
+		// and 2-byte length prefixes which ABI encoding doesn't naturally provide
+	}
+
+	/// OutputSettlerSimple interface for filling orders.
+	interface IOutputSettlerSimple {
+		function fill(bytes32 orderId, bytes originData, bytes fillerData) external returns (bytes32);
+		function fillOrderOutputs(bytes32 orderId, bytes[] outputs, bytes fillerData) external;
 	}
 
 	/// Order structure for finaliseSelf.
@@ -496,26 +511,56 @@ impl OrderInterface for Eip7683OrderImpl {
 			.output_settler_address
 			.clone();
 
-		// Create the MandateOutput struct for the fill operation
-		let mandate_output = MandateOutput {
-			oracle: FixedBytes::<32>::from([0u8; 32]), // No oracle for direct fills
-			settler: {
-				let mut bytes32 = [0u8; 32];
-				bytes32[12..32].copy_from_slice(&output_settler_address.0);
-				FixedBytes::<32>::from(bytes32)
-			},
-			chainId: output.chain_id,
-			token: FixedBytes::<32>::from(output.token),
-			amount: output.amount,
-			recipient: FixedBytes::<32>::from(output.recipient),
-			call: vec![].into(),    // Empty for direct transfers
-			context: vec![].into(), // Empty context
-		};
-
-		// Encode fill data
-		let fill_data = IDestinationSettler::fillCall {
+		// Encode fill data for OutputSettlerSimple using packed encoding
+		let fill_data = IOutputSettlerSimple::fillCall {
 			orderId: FixedBytes::<32>::from(order_data.order_id),
-			originData: mandate_output.abi_encode().into(),
+			originData: {
+				// Use abi.encodePacked equivalent for the exact byte layout expected by OutputFillLib
+				let packed_output = PackedMandateOutput {
+					fillDeadline: alloy_primitives::Uint::<48, 1>::from(
+						order_data.fill_deadline as u64,
+					),
+					oracle: FixedBytes::<32>::from(output.oracle),
+					settler: {
+						let mut bytes32 = [0u8; 32];
+						bytes32[12..32].copy_from_slice(&output_settler_address.0);
+						FixedBytes::<32>::from(bytes32)
+					},
+					chainId: output.chain_id,
+					token: FixedBytes::<32>::from(output.token),
+					amount: output.amount,
+					recipient: FixedBytes::<32>::from(output.recipient),
+				};
+
+				// Build the packed bytes manually since we need special handling for call/context
+				let mut origin_data = Vec::new();
+
+				// Add the fixed-size fields using packed encoding (no offsets/padding)
+				// fillDeadline as 6 bytes
+				let fill_deadline_bytes = packed_output.fillDeadline.to_be_bytes_vec();
+				// The Uint<48, 1> will produce exactly 6 bytes
+				origin_data.extend_from_slice(&fill_deadline_bytes);
+
+				// oracle, settler, chainId, token, amount, recipient as 32 bytes each
+				origin_data.extend_from_slice(packed_output.oracle.as_slice());
+				origin_data.extend_from_slice(packed_output.settler.as_slice());
+				origin_data.extend_from_slice(&packed_output.chainId.to_be_bytes_vec());
+				origin_data.extend_from_slice(packed_output.token.as_slice());
+				origin_data.extend_from_slice(&packed_output.amount.to_be_bytes_vec());
+				origin_data.extend_from_slice(packed_output.recipient.as_slice());
+
+				// Add call length (2 bytes) and call data
+				let call_data = vec![]; // Empty for direct transfers
+				origin_data.extend_from_slice(&(call_data.len() as u16).to_be_bytes());
+				origin_data.extend_from_slice(&call_data);
+
+				// Add context length (2 bytes) and context data
+				let context_data = vec![]; // Empty context
+				origin_data.extend_from_slice(&(context_data.len() as u16).to_be_bytes());
+				origin_data.extend_from_slice(&context_data);
+
+				origin_data.into()
+			},
 			fillerData: {
 				// FillerData should contain the solver address as bytes32
 				let mut solver_bytes32 = [0u8; 32];
@@ -677,8 +722,6 @@ impl OrderInterface for Eip7683OrderImpl {
 				})?;
 			match parsed.lock_type {
 				Some(LockType::ResourceLock) => {
-					tracing::info!("Processing Compact claim for order {}", order.id);
-
 					let sig_hex = parsed.signature.as_deref().ok_or_else(|| {
 						OrderError::ValidationFailed(
 							"Missing signatures for compact flow".to_string(),
