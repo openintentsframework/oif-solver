@@ -291,7 +291,8 @@ async fn convert_eip7683_order_to_response(
 mod tests {
 	use super::*;
 	use alloy_primitives::hex;
-	use mockall::{mock, predicate::eq};
+	use alloy_primitives::U256;
+	use mockall::predicate::eq;
 	use serde_json::json;
 	use solver_account::{implementations::local::LocalWallet, AccountService};
 	use solver_config::{Config, ConfigBuilder};
@@ -300,26 +301,10 @@ mod tests {
 	use solver_discovery::DiscoveryService;
 	use solver_order::{implementations::strategies::simple::create_strategy, OrderService};
 	use solver_settlement::SettlementService;
-	use solver_storage::{StorageError, StorageInterface};
-	use solver_types::{order::Order, validation::ConfigSchema, OrderStatus, TransactionHash};
-	use std::{collections::HashMap, sync::Arc, time::Duration};
+	use solver_storage::{MockStorageInterface, StorageError};
+	use solver_types::{order::Order, OrderStatus, TransactionHash};
+	use std::{collections::HashMap, sync::Arc};
 	use toml::Value;
-
-	mock! {
-		pub Backend {}
-
-		#[async_trait::async_trait]
-		impl StorageInterface for Backend {
-			async fn get_bytes(&self, key: &str) -> Result<Vec<u8>, StorageError>;
-			async fn set_bytes(&self, key: &str, value: Vec<u8>, indexes: Option<solver_storage::StorageIndexes>, ttl: Option<Duration>) -> Result<(), StorageError>;
-			async fn delete(&self, key: &str) -> Result<(), StorageError>;
-			async fn exists(&self, key: &str) -> Result<bool, StorageError>;
-			async fn query(&self, namespace: &str, filter: solver_storage::QueryFilter) -> Result<Vec<String>, StorageError>;
-			async fn get_batch(&self, keys: &[String]) -> Result<Vec<(String, Vec<u8>)>, StorageError>;
-			fn config_schema(&self) -> Box<dyn ConfigSchema>;
-			async fn cleanup_expired(&self) -> Result<usize, StorageError>;
-		}
-	}
 
 	const TEST_PK: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 	const TEST_ADDR: &str = "0x1234567890123456789012345678901234567890";
@@ -339,7 +324,7 @@ mod tests {
 		)))
 	}
 
-	async fn create_test_solver_engine(storage_mock: MockBackend) -> SolverEngine {
+	async fn create_test_solver_engine(storage_mock: MockStorageInterface) -> SolverEngine {
 		let cfg = test_cfg();
 		let storage = Arc::new(solver_storage::StorageService::new(Box::new(storage_mock)));
 		let account = test_account();
@@ -403,15 +388,21 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_get_order_by_id_success() {
-		let mut backend = MockBackend::new();
+		let mut backend = MockStorageInterface::new();
 		let order = create_test_eip7683_order("order-test", OrderStatus::Executed);
 
 		let bytes = serde_json::to_vec(&order).unwrap();
-
+		let bytes = std::sync::Arc::new(bytes);
 		backend
 			.expect_get_bytes()
 			.with(eq("orders:order-test"))
-			.returning(move |_| Ok(bytes.clone()));
+			.returning({
+				let bytes = bytes.clone();
+				move |_| {
+					let bytes = bytes.clone();
+					Box::pin(async move { Ok((*bytes).to_vec()) })
+				}
+			});
 
 		let solver = create_test_solver_engine(backend).await;
 
@@ -420,21 +411,27 @@ mod tests {
 
 		assert!(result.is_ok());
 		let response = result.unwrap();
-		assert_eq!(response.id, "order-test");
-		assert!(matches!(response.status, ApiOrderStatus::Executed));
-		assert_eq!(response.quote_id, Some("quote-test".to_string()));
+		assert_eq!(response.order.id, "order-test");
+		assert!(matches!(response.order.status, OrderStatus::Executed));
+		assert_eq!(response.order.quote_id, Some("quote-test".to_string()));
 	}
 
 	#[tokio::test]
 	async fn test_process_order_request_success() {
-		let mut backend = MockBackend::new();
+		let mut backend = MockStorageInterface::new();
 		let order = create_test_eip7683_order("order-proc", OrderStatus::Executed);
 		let bytes = serde_json::to_vec(&order).unwrap();
 
 		backend
 			.expect_get_bytes()
 			.with(eq("orders:order-proc"))
-			.returning(move |_| Ok(bytes.clone()));
+			.returning({
+				let bytes = bytes.clone();
+				move |_| {
+					let bytes = bytes.clone();
+					Box::pin(async move { Ok((*bytes).to_vec()) })
+				}
+			});
 
 		let solver = create_test_solver_engine(backend).await;
 
@@ -442,16 +439,16 @@ mod tests {
 		assert!(res.is_ok());
 		let resp = res.unwrap();
 		assert_eq!(resp.id, "order-proc");
-		assert!(matches!(resp.status, ApiOrderStatus::Executed));
+		assert!(matches!(resp.status, OrderStatus::Executed));
 	}
 
 	#[tokio::test]
 	async fn test_process_order_request_not_found() {
-		let mut backend = MockBackend::new();
+		let mut backend = MockStorageInterface::new();
 		backend
 			.expect_get_bytes()
 			.with(eq("orders:missing"))
-			.returning(|_| Err(StorageError::NotFound));
+			.returning(|_| Box::pin(async move { Err(StorageError::NotFound) }));
 
 		let solver = create_test_solver_engine(backend).await;
 
@@ -468,23 +465,28 @@ mod tests {
 		let resp = convert_order_to_response(order).await.expect("ok");
 
 		assert_eq!(resp.id, "order-ok");
-		assert!(matches!(resp.status, ApiOrderStatus::Executed));
+		assert!(matches!(resp.status, OrderStatus::Executed));
 		assert_eq!(resp.quote_id, Some("quote-test".to_string()));
 
 		// input - should be an interop address with chain ID 1
 		// Format: 0x01000001011234567890123456789012345678901234567890
 		// Version: 01, ChainType: 0000, ChainRefLen: 01, ChainRef: 01, AddrLen: 14, Address: 20 bytes
-		assert!(resp.input_amount.asset.to_hex().starts_with("0x01000001"));
+		assert!(resp.input_amount.asset.starts_with("0x01000001"));
 		assert!(resp
 			.input_amount
 			.asset
-			.to_hex()
 			.contains("1234567890123456789012345678901234567890"));
-		assert_eq!(resp.input_amount.amount, "1000000000000000000");
+		assert_eq!(
+			resp.input_amount.amount,
+			U256::from_str_radix("1000000000000000000", 10).unwrap()
+		);
 
 		// output - should be an interop address with chain ID 2
-		assert!(resp.output_amount.asset.to_hex().starts_with("0x01000001"));
-		assert_eq!(resp.output_amount.amount, "2000000000000000000");
+		assert!(resp.output_amount.asset.starts_with("0x01000001"));
+		assert_eq!(
+			resp.output_amount.amount,
+			U256::from_str_radix("2000000000000000000", 10).unwrap()
+		);
 
 		// settlement
 		assert!(matches!(
