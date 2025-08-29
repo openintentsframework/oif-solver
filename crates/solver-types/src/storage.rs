@@ -60,3 +60,98 @@ impl From<StorageKey> for &'static str {
 		key.as_str()
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_storage_key_as_str() {
+		assert_eq!(StorageKey::Orders.as_str(), "orders");
+		assert_eq!(StorageKey::Intents.as_str(), "intents");
+		assert_eq!(StorageKey::OrderByTxHash.as_str(), "order_by_tx_hash");
+		assert_eq!(StorageKey::Quotes.as_str(), "quotes");
+	}
+
+	#[test]
+	fn test_storage_key_from_str() {
+		// Valid cases
+		assert_eq!("orders".parse::<StorageKey>().unwrap(), StorageKey::Orders);
+		assert_eq!(
+			"intents".parse::<StorageKey>().unwrap(),
+			StorageKey::Intents
+		);
+		assert_eq!(
+			"order_by_tx_hash".parse::<StorageKey>().unwrap(),
+			StorageKey::OrderByTxHash
+		);
+		assert_eq!("quotes".parse::<StorageKey>().unwrap(), StorageKey::Quotes);
+
+		// Invalid cases
+		assert!("invalid".parse::<StorageKey>().is_err());
+		assert!("".parse::<StorageKey>().is_err());
+		assert!("Orders".parse::<StorageKey>().is_err()); // Case sensitive
+		assert!(" orders ".parse::<StorageKey>().is_err()); // Whitespace
+	}
+
+	#[test]
+	fn test_storage_key_all_iterator() {
+		let all_keys: Vec<StorageKey> = StorageKey::all().collect();
+		let expected = vec![
+			StorageKey::Orders,
+			StorageKey::Intents,
+			StorageKey::OrderByTxHash,
+			StorageKey::Quotes,
+		];
+
+		assert_eq!(all_keys, expected);
+	}
+
+	#[test]
+	fn test_from_storage_key_to_str() {
+		// Test all variants
+		let orders_str: &'static str = StorageKey::Orders.into();
+		assert_eq!(orders_str, "orders");
+
+		let intents_str: &'static str = StorageKey::Intents.into();
+		assert_eq!(intents_str, "intents");
+
+		let order_by_tx_str: &'static str = StorageKey::OrderByTxHash.into();
+		assert_eq!(order_by_tx_str, "order_by_tx_hash");
+
+		let quotes_str: &'static str = StorageKey::Quotes.into();
+		assert_eq!(quotes_str, "quotes");
+	}
+
+	#[test]
+	fn test_round_trip_conversion() {
+		for key in StorageKey::all() {
+			let str_repr = key.as_str();
+			let parsed_key = str_repr.parse::<StorageKey>().unwrap();
+			assert_eq!(key, parsed_key);
+		}
+	}
+
+	#[test]
+	fn test_string_uniqueness() {
+		use std::collections::HashSet;
+
+		let strings: HashSet<&str> = StorageKey::all().map(|k| k.as_str()).collect();
+		assert_eq!(strings.len(), 4, "String representations should be unique");
+	}
+
+	#[test]
+	fn test_hash_and_equality() {
+		use std::collections::HashSet;
+
+		let mut set = HashSet::new();
+		for key in StorageKey::all() {
+			assert!(set.insert(key)); // Should be unique
+		}
+		assert_eq!(set.len(), 4);
+
+		// Test equality
+		assert_eq!(StorageKey::Orders, StorageKey::Orders);
+		assert_ne!(StorageKey::Orders, StorageKey::Intents);
+	}
+}

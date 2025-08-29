@@ -161,3 +161,347 @@ mod hex_string {
 		hex::decode(s).map_err(serde::de::Error::custom)
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::utils::builders::{Eip7683OrderDataBuilder, MandateOutputBuilder};
+	use alloy_primitives::U256;
+	use serde_json;
+
+	#[test]
+	fn test_lock_type_default() {
+		let lock_type = LockType::default();
+		assert_eq!(lock_type, LockType::Permit2Escrow);
+	}
+
+	#[test]
+	fn test_lock_type_from_u8() {
+		assert_eq!(LockType::from_u8(1), Some(LockType::Permit2Escrow));
+		assert_eq!(LockType::from_u8(2), Some(LockType::Eip3009Escrow));
+		assert_eq!(LockType::from_u8(3), Some(LockType::ResourceLock));
+		assert_eq!(LockType::from_u8(0), None);
+		assert_eq!(LockType::from_u8(4), None);
+		assert_eq!(LockType::from_u8(255), None);
+	}
+
+	#[test]
+	fn test_lock_type_to_u8() {
+		assert_eq!(LockType::Permit2Escrow.to_u8(), 1);
+		assert_eq!(LockType::Eip3009Escrow.to_u8(), 2);
+		assert_eq!(LockType::ResourceLock.to_u8(), 3);
+	}
+
+	#[test]
+	fn test_lock_type_is_compact() {
+		assert!(!LockType::Permit2Escrow.is_compact());
+		assert!(!LockType::Eip3009Escrow.is_compact());
+		assert!(LockType::ResourceLock.is_compact());
+	}
+
+	#[test]
+	fn test_lock_type_is_escrow() {
+		assert!(LockType::Permit2Escrow.is_escrow());
+		assert!(LockType::Eip3009Escrow.is_escrow());
+		assert!(!LockType::ResourceLock.is_escrow());
+	}
+
+	#[test]
+	fn test_lock_type_serialization() {
+		let permit2 = LockType::Permit2Escrow;
+		let json = serde_json::to_string(&permit2).unwrap();
+		assert_eq!(json, "\"permit2_escrow\"");
+
+		let eip3009 = LockType::Eip3009Escrow;
+		let json = serde_json::to_string(&eip3009).unwrap();
+		assert_eq!(json, "\"eip3009_escrow\"");
+
+		let resource_lock = LockType::ResourceLock;
+		let json = serde_json::to_string(&resource_lock).unwrap();
+		assert_eq!(json, "\"resource_lock\"");
+	}
+
+	#[test]
+	fn test_lock_type_deserialization() {
+		let permit2: LockType = serde_json::from_str("\"permit2_escrow\"").unwrap();
+		assert_eq!(permit2, LockType::Permit2Escrow);
+
+		let eip3009: LockType = serde_json::from_str("\"eip3009_escrow\"").unwrap();
+		assert_eq!(eip3009, LockType::Eip3009Escrow);
+
+		let resource_lock: LockType = serde_json::from_str("\"resource_lock\"").unwrap();
+		assert_eq!(resource_lock, LockType::ResourceLock);
+	}
+
+	#[test]
+	fn test_gas_limit_overrides_default() {
+		let overrides = GasLimitOverrides::default();
+		assert_eq!(overrides.settle_gas_limit, None);
+		assert_eq!(overrides.fill_gas_limit, None);
+		assert_eq!(overrides.prepare_gas_limit, None);
+	}
+
+	#[test]
+	fn test_gas_limit_overrides_serialization_empty() {
+		let overrides = GasLimitOverrides::default();
+		let json = serde_json::to_string(&overrides).unwrap();
+		assert_eq!(json, "{}");
+	}
+
+	#[test]
+	fn test_gas_limit_overrides_serialization_with_values() {
+		let overrides = GasLimitOverrides {
+			settle_gas_limit: Some(100000),
+			fill_gas_limit: Some(200000),
+			prepare_gas_limit: None,
+		};
+		let json = serde_json::to_string(&overrides).unwrap();
+		let expected = r#"{"settle_gas_limit":100000,"fill_gas_limit":200000}"#;
+		assert_eq!(json, expected);
+	}
+
+	#[test]
+	fn test_gas_limit_overrides_deserialization() {
+		let json = r#"{"settle_gas_limit":100000,"fill_gas_limit":200000}"#;
+		let overrides: GasLimitOverrides = serde_json::from_str(json).unwrap();
+		assert_eq!(overrides.settle_gas_limit, Some(100000));
+		assert_eq!(overrides.fill_gas_limit, Some(200000));
+		assert_eq!(overrides.prepare_gas_limit, None);
+	}
+
+	#[test]
+	fn test_mandate_output_serialization() {
+		let output = MandateOutputBuilder::new()
+			.oracle([1u8; 32])
+			.settler([2u8; 32])
+			.chain_id(U256::from(1))
+			.token([3u8; 32])
+			.amount(U256::from(1000))
+			.recipient([4u8; 32])
+			.call(vec![0xab, 0xcd])
+			.context(vec![0x12, 0x34])
+			.build();
+
+		let json = serde_json::to_string(&output).unwrap();
+		assert!(json.contains("\"call\":\"0xabcd\""));
+		assert!(json.contains("\"context\":\"0x1234\""));
+	}
+
+	#[test]
+	fn test_mandate_output_deserialization_with_0x_prefix() {
+		let json = r#"{
+			"oracle": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+			"settler": [2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],
+			"chain_id": "1",
+			"token": [3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],
+			"amount": "1000",
+			"recipient": [4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4],
+			"call": "0xabcd",
+			"context": "0x1234"
+		}"#;
+
+		let output: MandateOutput = serde_json::from_str(json).unwrap();
+		assert_eq!(output.call, vec![0xab, 0xcd]);
+		assert_eq!(output.context, vec![0x12, 0x34]);
+	}
+
+	#[test]
+	fn test_mandate_output_deserialization_without_0x_prefix() {
+		let json = r#"{
+			"oracle": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+			"settler": [2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],
+			"chain_id": "1",
+			"token": [3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],
+			"amount": "1000",
+			"recipient": [4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4],
+			"call": "abcd",
+			"context": "1234"
+		}"#;
+
+		let output: MandateOutput = serde_json::from_str(json).unwrap();
+		assert_eq!(output.call, vec![0xab, 0xcd]);
+		assert_eq!(output.context, vec![0x12, 0x34]);
+	}
+
+	#[test]
+	fn test_mandate_output_empty_hex_fields() {
+		let output = MandateOutputBuilder::new()
+			.oracle([0u8; 32])
+			.settler([0u8; 32])
+			.chain_id(U256::from(1))
+			.token([0u8; 32])
+			.amount(U256::from(0))
+			.recipient([0u8; 32])
+			.build();
+
+		let json = serde_json::to_string(&output).unwrap();
+		assert!(json.contains("\"call\":\"0x\""));
+		assert!(json.contains("\"context\":\"0x\""));
+
+		// Test round-trip
+		let deserialized: MandateOutput = serde_json::from_str(&json).unwrap();
+		assert_eq!(deserialized.call, Vec::<u8>::new());
+		assert_eq!(deserialized.context, Vec::<u8>::new());
+	}
+
+	#[test]
+	fn test_eip7683_order_data_serialization() {
+		let output = MandateOutputBuilder::new()
+			.oracle([1u8; 32])
+			.settler([2u8; 32])
+			.chain_id(U256::from(1))
+			.token([3u8; 32])
+			.amount(U256::from(1000))
+			.recipient([4u8; 32])
+			.call(vec![0xab, 0xcd])
+			.context(vec![0x12, 0x34])
+			.build();
+
+		let order = Eip7683OrderDataBuilder::new()
+			.user("0x1234567890123456789012345678901234567890")
+			.nonce(U256::from(123))
+			.origin_chain_id(U256::from(1))
+			.expires(1234567890)
+			.fill_deadline(1234567900)
+			.input_oracle("0xoracle123")
+			.add_input(U256::from(1), U256::from(1000))
+			.order_id([5u8; 32])
+			.add_output(output)
+			.raw_order_data("0xrawdata")
+			.signature("0xsignature")
+			.lock_type(LockType::Permit2Escrow)
+			.build();
+
+		let json = serde_json::to_string(&order).unwrap();
+		assert!(json.contains("\"user\":"));
+		assert!(json.contains("\"raw_order_data\":\"0xrawdata\""));
+		assert!(json.contains("\"signature\":\"0xsignature\""));
+		assert!(json.contains("\"lock_type\":\"permit2_escrow\""));
+		assert!(!json.contains("\"sponsor\":")); // Should be omitted when None
+	}
+
+	#[test]
+	fn test_eip7683_order_data_deserialization() {
+		let json = r#"{
+			"user": "0x1234567890123456789012345678901234567890",
+			"nonce": "123",
+			"origin_chain_id": "1",
+			"expires": 1234567890,
+			"fill_deadline": 1234567900,
+			"input_oracle": "0xoracle123",
+			"inputs": [["1", "1000"]],
+			"order_id": [5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5],
+			"gas_limit_overrides": {},
+			"outputs": [{
+				"oracle": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+				"settler": [2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],
+				"chain_id": "1",
+				"token": [3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],
+				"amount": "1000",
+				"recipient": [4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4],
+				"call": "0xabcd",
+				"context": "0x1234"
+			}]
+		}"#;
+
+		let order: Eip7683OrderData = serde_json::from_str(json).unwrap();
+		assert_eq!(order.user, "0x1234567890123456789012345678901234567890");
+		assert_eq!(order.nonce, U256::from(123));
+		assert_eq!(order.inputs.len(), 1);
+		assert_eq!(order.inputs[0], [U256::from(1), U256::from(1000)]);
+		assert_eq!(order.outputs.len(), 1);
+		assert_eq!(order.raw_order_data, None);
+		assert_eq!(order.signature, None);
+		assert_eq!(order.sponsor, None);
+		assert_eq!(order.lock_type, None);
+	}
+
+	#[test]
+	fn test_output_type_alias() {
+		// Test that Output is indeed an alias for MandateOutput
+		let output: Output = MandateOutputBuilder::new()
+			.oracle([1u8; 32])
+			.settler([2u8; 32])
+			.chain_id(U256::from(1))
+			.token([3u8; 32])
+			.amount(U256::from(1000))
+			.recipient([4u8; 32])
+			.call(vec![0xab, 0xcd])
+			.context(vec![0x12, 0x34])
+			.build();
+
+		assert_eq!(output.amount, U256::from(1000));
+		assert_eq!(output.call, vec![0xab, 0xcd]);
+	}
+
+	#[test]
+	fn test_hex_string_serialization_empty() {
+		use super::hex_string;
+		use serde_json;
+
+		#[derive(Serialize)]
+		struct TestStruct {
+			#[serde(with = "hex_string")]
+			data: Vec<u8>,
+		}
+
+		let test = TestStruct { data: vec![] };
+		let json = serde_json::to_string(&test).unwrap();
+		assert_eq!(json, r#"{"data":"0x"}"#);
+	}
+
+	#[test]
+	fn test_clone_and_debug() {
+		let lock_type = LockType::Permit2Escrow;
+		let cloned = lock_type.clone();
+		assert_eq!(lock_type, cloned);
+
+		let debug_str = format!("{:?}", lock_type);
+		assert!(debug_str.contains("Permit2Escrow"));
+
+		let overrides = GasLimitOverrides::default();
+		let cloned_overrides = overrides.clone();
+		assert_eq!(
+			overrides.settle_gas_limit,
+			cloned_overrides.settle_gas_limit
+		);
+
+		let output = MandateOutputBuilder::new()
+			.oracle([1u8; 32])
+			.settler([2u8; 32])
+			.chain_id(U256::from(1))
+			.token([3u8; 32])
+			.amount(U256::from(1000))
+			.recipient([4u8; 32])
+			.call(vec![0xab, 0xcd])
+			.context(vec![0x12, 0x34])
+			.build();
+		let cloned_output = output.clone();
+		assert_eq!(output.amount, cloned_output.amount);
+		assert_eq!(output.call, cloned_output.call);
+	}
+
+	#[test]
+	fn test_large_values() {
+		let large_u256 = U256::MAX;
+		let output = MandateOutputBuilder::new()
+			.oracle([255u8; 32])
+			.settler([0u8; 32])
+			.chain_id(large_u256)
+			.token([128u8; 32])
+			.amount(large_u256)
+			.recipient([64u8; 32])
+			.call(vec![0; 1000])     // Large call data
+			.context(vec![255; 500]) // Large context
+			.build();
+
+		// Test serialization/deserialization with large values
+		let json = serde_json::to_string(&output).unwrap();
+		let deserialized: MandateOutput = serde_json::from_str(&json).unwrap();
+
+		assert_eq!(deserialized.chain_id, large_u256);
+		assert_eq!(deserialized.amount, large_u256);
+		assert_eq!(deserialized.call.len(), 1000);
+		assert_eq!(deserialized.context.len(), 500);
+	}
+}
