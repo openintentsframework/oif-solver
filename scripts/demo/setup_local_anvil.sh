@@ -670,7 +670,8 @@ cat > config/demo.toml << EOF
 
 include = [
     "demo/networks.toml",
-    "demo/api.toml"
+    "demo/api.toml",
+    "demo/gas.toml"
 ]
 
 [solver]
@@ -737,6 +738,15 @@ primary = "simple"
 
 [order.strategy.implementations.simple]
 max_gas_price_gwei = 100
+
+# ============================================================================
+# PRICING
+# ============================================================================
+[pricing]
+primary = "mock"
+
+[pricing.implementations.mock]
+# Uses default ETH/USD price of $4615.16
 
 # ============================================================================
 # SETTLEMENT

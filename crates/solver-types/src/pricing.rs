@@ -86,24 +86,8 @@ pub trait PricingInterface: Send + Sync {
 	/// Returns the configuration schema for this pricing implementation.
 	fn config_schema(&self) -> Box<dyn ConfigSchema>;
 
-	/// Gets the current price for a trading pair.
-	///
-	/// Returns the price as a decimal string to avoid precision loss.
-	async fn get_pair_price(&self, pair: &TradingPair) -> Result<AssetPrice, PricingError>;
-
 	/// Gets all supported trading pairs by this implementation.
 	async fn get_supported_pairs(&self) -> Vec<TradingPair>;
-
-	/// Gets the current price for an asset in the specified currency.
-	/// This is a convenience method that creates a TradingPair internally.
-	async fn get_asset_price(
-		&self,
-		asset: &str,
-		currency: &str,
-	) -> Result<AssetPrice, PricingError> {
-		self.get_pair_price(&TradingPair::new(asset, currency))
-			.await
-	}
 
 	/// Converts between two assets using available pricing data.
 	/// This may involve multiple hops (e.g., ETH -> USD -> SOL).

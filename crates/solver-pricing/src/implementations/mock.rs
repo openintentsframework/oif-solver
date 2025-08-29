@@ -77,18 +77,6 @@ impl PricingInterface for MockPricing {
 		Box::new(MockPricingSchema)
 	}
 
-	async fn get_pair_price(&self, pair: &TradingPair) -> Result<AssetPrice, PricingError> {
-		if let Some((price, _)) = self.get_pair_price_internal(pair) {
-			Ok(AssetPrice {
-				pair: pair.clone(),
-				price,
-				timestamp: solver_types::current_timestamp(),
-			})
-		} else {
-			Err(PricingError::PriceNotAvailable(pair.to_string()))
-		}
-	}
-
 	async fn get_supported_pairs(&self) -> Vec<TradingPair> {
 		let mut pairs = Vec::new();
 		for pair_str in self.pair_prices.keys() {

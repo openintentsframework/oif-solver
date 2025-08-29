@@ -126,24 +126,9 @@ impl PricingService {
 	pub fn config(&self) -> &PricingConfig {
 		&self.config
 	}
-
-	/// Gets the current price for a trading pair.
-	pub async fn get_pair_price(&self, pair: &TradingPair) -> Result<AssetPrice, PricingError> {
-		self.implementation.get_pair_price(pair).await
-	}
-
 	/// Gets all supported trading pairs.
 	pub async fn get_supported_pairs(&self) -> Vec<TradingPair> {
 		self.implementation.get_supported_pairs().await
-	}
-
-	/// Gets the current price for an asset in the specified currency.
-	pub async fn get_asset_price(
-		&self,
-		asset: &str,
-		currency: &str,
-	) -> Result<AssetPrice, PricingError> {
-		self.implementation.get_asset_price(asset, currency).await
 	}
 
 	/// Converts between two assets using available pricing data.
