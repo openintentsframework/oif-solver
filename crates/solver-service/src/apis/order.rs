@@ -255,10 +255,10 @@ mod tests {
 	use solver_delivery::DeliveryService;
 	use solver_discovery::DiscoveryService;
 	use solver_order::{implementations::strategies::simple::create_strategy, OrderService};
+	use solver_pricing::{implementations::mock, PricingService};
 	use solver_settlement::SettlementService;
 	use solver_storage::{StorageError, StorageInterface};
 	use solver_types::{order::Order, validation::ConfigSchema, OrderStatus, TransactionHash};
-	use solver_pricing::{implementations::mock, PricingService};
 	use std::{collections::HashMap, sync::Arc, time::Duration};
 	use toml::Value;
 

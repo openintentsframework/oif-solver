@@ -146,8 +146,8 @@ impl PricingInterface for MockPricing {
 		currency: &str,
 	) -> Result<String, PricingError> {
 		// Convert wei to ETH using utility function
-		let eth_amount_str = wei_string_to_eth_string(wei_amount)
-			.map_err(PricingError::InvalidData)?;
+		let eth_amount_str =
+			wei_string_to_eth_string(wei_amount).map_err(PricingError::InvalidData)?;
 
 		let eth_amount_f64 = eth_amount_str
 			.parse::<f64>()
