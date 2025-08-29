@@ -1179,7 +1179,6 @@ mod tests {
 	use alloy_primitives::{hex, Address, Bytes, U256};
 	use serde_json::json;
 	use solver_types::{
-		api::{FailureHandling, PostOrderRequest},
 		networks::{NetworkConfig, RpcEndpoint},
 		Address as SolverAddress, NetworksConfig,
 	};
@@ -1618,13 +1617,11 @@ mod tests {
 		};
 
 		// Create invalid request with malformed order data
-		let invalid_request = PostOrderRequest {
+		let invalid_request = IntentRequest {
 			order: Bytes::from_static(b"invalid_order_data"),
 			signature: Bytes::from_static(b"signature"),
-			quote_id: None,
-			provider: "test_provider".to_string(),
-			failure_handling: FailureHandling::Retry,
-			origin_submission: None,
+			sponsor: Address::from_slice(&[0xabu8; 20]),
+			lock_type: LockType::Permit2Escrow,
 		};
 
 		let response = handle_intent_submission(State(state), Json(invalid_request)).await;
