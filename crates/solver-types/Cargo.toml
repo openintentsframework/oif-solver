@@ -6,7 +6,7 @@ rust-version = "1.86.0"
 
 [dependencies]
 alloy-primitives = { version = "0.8", features = ["std", "serde"] }
-alloy-rpc-types = { version = "0.8" }
+alloy-rpc-types = { version = "0.12" }
 async-trait = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
