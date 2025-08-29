@@ -139,7 +139,7 @@ deploy_permit2() {
     fi
 }
 
-# Prepare contract sources for TokenA and TokenB
+# Prepare contract sources for TokenA and TokenB with EIP-3009 support
 cat > /tmp/TokenA.sol << 'EOF'
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
@@ -147,14 +147,32 @@ pragma solidity ^0.8.0;
 contract TokenA {
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
+    mapping(bytes32 => bool) public authorizationState;
     
     string public name = "Token A";
     string public symbol = "TOKA";
     uint8 public decimals = 18;
     uint256 public totalSupply;
     
+    // EIP-712 Domain Separator
+    bytes32 public DOMAIN_SEPARATOR;
+    
+    // EIP-3009 type hashes
+    bytes32 public constant RECEIVE_WITH_AUTHORIZATION_TYPEHASH = 
+        keccak256("ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)");
+    
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Approval(address indexed owner, address indexed spender, uint256 value);
+    event AuthorizationUsed(address indexed authorizer, bytes32 indexed nonce);
+    
+    constructor() {
+        DOMAIN_SEPARATOR = keccak256(abi.encode(
+            keccak256("EIP712Domain(string name,uint256 chainId,address verifyingContract)"),
+            keccak256(bytes(name)),
+            block.chainid,
+            address(this)
+        ));
+    }
     
     function mint(address to, uint256 amount) public {
         balanceOf[to] += amount;
@@ -184,6 +202,63 @@ contract TokenA {
         allowance[from][msg.sender] -= amount;
         emit Transfer(from, to, amount);
         return true;
+    }
+    
+    // EIP-3009: receiveWithAuthorization
+    function receiveWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        bytes calldata signature
+    ) external {
+        require(block.timestamp > validAfter, "Authorization not yet valid");
+        require(block.timestamp < validBefore, "Authorization expired");
+        require(!authorizationState[nonce], "Authorization already used");
+        require(signature.length == 65, "Invalid signature length");
+        
+        // Extract v, r, s from signature
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly {
+            r := calldataload(signature.offset)
+            s := calldataload(add(signature.offset, 0x20))
+            v := byte(0, calldataload(add(signature.offset, 0x40)))
+        }
+        
+        bytes32 digest = keccak256(abi.encodePacked(
+            "\x19\x01",
+            DOMAIN_SEPARATOR,
+            keccak256(abi.encode(
+                RECEIVE_WITH_AUTHORIZATION_TYPEHASH,
+                from,
+                to,
+                value,
+                validAfter,
+                validBefore,
+                nonce
+            ))
+        ));
+        
+        address recoveredAddress = ecrecover(digest, v, r, s);
+        require(recoveredAddress == from, "Invalid signature");
+        
+        authorizationState[nonce] = true;
+        require(balanceOf[from] >= value, "Insufficient balance");
+        
+        balanceOf[from] -= value;
+        balanceOf[to] += value;
+        
+        emit Transfer(from, to, value);
+        emit AuthorizationUsed(from, nonce);
+    }
+    
+    // EIP-165: Interface detection
+    function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
+        return interfaceId == 0xef55bec6; // receiveWithAuthorization selector
     }
 }
 EOF
@@ -195,14 +270,32 @@ pragma solidity ^0.8.0;
 contract TokenB {
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
+    mapping(bytes32 => bool) public authorizationState;
     
     string public name = "Token B";
     string public symbol = "TOKB";
     uint8 public decimals = 18;
     uint256 public totalSupply;
     
+    // EIP-712 Domain Separator
+    bytes32 public DOMAIN_SEPARATOR;
+    
+    // EIP-3009 type hashes
+    bytes32 public constant RECEIVE_WITH_AUTHORIZATION_TYPEHASH = 
+        keccak256("ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)");
+    
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Approval(address indexed owner, address indexed spender, uint256 value);
+    event AuthorizationUsed(address indexed authorizer, bytes32 indexed nonce);
+    
+    constructor() {
+        DOMAIN_SEPARATOR = keccak256(abi.encode(
+            keccak256("EIP712Domain(string name,uint256 chainId,address verifyingContract)"),
+            keccak256(bytes(name)),
+            block.chainid,
+            address(this)
+        ));
+    }
     
     function mint(address to, uint256 amount) public {
         balanceOf[to] += amount;
@@ -232,6 +325,63 @@ contract TokenB {
         allowance[from][msg.sender] -= amount;
         emit Transfer(from, to, amount);
         return true;
+    }
+    
+    // EIP-3009: receiveWithAuthorization
+    function receiveWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        bytes calldata signature
+    ) external {
+        require(block.timestamp > validAfter, "Authorization not yet valid");
+        require(block.timestamp < validBefore, "Authorization expired");
+        require(!authorizationState[nonce], "Authorization already used");
+        require(signature.length == 65, "Invalid signature length");
+        
+        // Extract v, r, s from signature
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly {
+            r := calldataload(signature.offset)
+            s := calldataload(add(signature.offset, 0x20))
+            v := byte(0, calldataload(add(signature.offset, 0x40)))
+        }
+        
+        bytes32 digest = keccak256(abi.encodePacked(
+            "\x19\x01",
+            DOMAIN_SEPARATOR,
+            keccak256(abi.encode(
+                RECEIVE_WITH_AUTHORIZATION_TYPEHASH,
+                from,
+                to,
+                value,
+                validAfter,
+                validBefore,
+                nonce
+            ))
+        ));
+        
+        address recoveredAddress = ecrecover(digest, v, r, s);
+        require(recoveredAddress == from, "Invalid signature");
+        
+        authorizationState[nonce] = true;
+        require(balanceOf[from] >= value, "Insufficient balance");
+        
+        balanceOf[from] -= value;
+        balanceOf[to] += value;
+        
+        emit Transfer(from, to, value);
+        emit AuthorizationUsed(from, nonce);
+    }
+    
+    // EIP-165: Interface detection
+    function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
+        return interfaceId == 0xef55bec6; // receiveWithAuthorization selector
     }
 }
 EOF
@@ -670,7 +820,8 @@ cat > config/demo.toml << EOF
 
 include = [
     "demo/networks.toml",
-    "demo/api.toml"
+    "demo/api.toml",
+    "demo/gas.toml"
 ]
 
 [solver]
