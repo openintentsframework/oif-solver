@@ -11,6 +11,7 @@ use solver_config::Config;
 use solver_delivery::{DeliveryError, DeliveryInterface, DeliveryService};
 use solver_discovery::{DiscoveryError, DiscoveryInterface, DiscoveryService};
 use solver_order::{ExecutionStrategy, OrderError, OrderInterface, OrderService, StrategyError};
+use solver_pricing::PricingService;
 use solver_settlement::{SettlementError, SettlementInterface, SettlementService};
 use solver_storage::{StorageError, StorageInterface, StorageService};
 use std::collections::HashMap;
@@ -34,12 +35,13 @@ pub enum BuilderError {
 /// This struct holds factory functions for creating implementations of each
 /// service type required by the solver engine. Each factory function takes
 /// a TOML configuration value and returns the corresponding service implementation.
-pub struct SolverFactories<SF, AF, DF, DIF, OF, SEF, STF> {
+pub struct SolverFactories<SF, AF, DF, DIF, OF, PF, SEF, STF> {
 	pub storage_factories: HashMap<String, SF>,
 	pub account_factories: HashMap<String, AF>,
 	pub delivery_factories: HashMap<String, DF>,
 	pub discovery_factories: HashMap<String, DIF>,
 	pub order_factories: HashMap<String, OF>,
+	pub pricing_factories: HashMap<String, PF>,
 	pub settlement_factories: HashMap<String, SEF>,
 	pub strategy_factories: HashMap<String, STF>,
 }
@@ -56,9 +58,9 @@ impl SolverBuilder {
 	}
 
 	/// Builds the SolverEngine using factories for each component type.
-	pub async fn build<SF, AF, DF, DIF, OF, SEF, STF>(
+	pub async fn build<SF, AF, DF, DIF, OF, PF, SEF, STF>(
 		self,
-		factories: SolverFactories<SF, AF, DF, DIF, OF, SEF, STF>,
+		factories: SolverFactories<SF, AF, DF, DIF, OF, PF, SEF, STF>,
 	) -> Result<SolverEngine, BuilderError>
 	where
 		SF: Fn(&toml::Value) -> Result<Box<dyn StorageInterface>, StorageError>,
@@ -78,6 +80,9 @@ impl SolverBuilder {
 			&solver_types::NetworksConfig,
 			&solver_types::oracle::OracleRoutes,
 		) -> Result<Box<dyn OrderInterface>, OrderError>,
+		PF: Fn(
+			&toml::Value,
+		) -> Result<Box<dyn solver_types::PricingInterface>, solver_types::PricingError>,
 		SEF: Fn(
 			&toml::Value,
 			&solver_types::NetworksConfig,
@@ -346,6 +351,47 @@ impl SolverBuilder {
 
 		let settlement = Arc::new(SettlementService::new(settlement_impls));
 
+		// Create pricing service
+		let pricing_config =
+			self.config.pricing.as_ref().ok_or_else(|| {
+				BuilderError::Config("Pricing configuration is required".to_string())
+			})?;
+
+		let mut pricing_impls = HashMap::new();
+		for (name, config) in &pricing_config.implementations {
+			if let Some(factory) = factories.pricing_factories.get(name) {
+				match factory(config) {
+					Ok(implementation) => {
+						pricing_impls.insert(name.clone(), implementation);
+						let is_primary = &pricing_config.primary == name;
+						tracing::info!(component = "pricing", implementation = %name, enabled = %is_primary, "Loaded");
+					},
+					Err(e) => {
+						tracing::error!(
+							component = "pricing",
+							implementation = %name,
+							error = %e,
+							"Failed to create pricing implementation"
+						);
+						return Err(BuilderError::Config(format!(
+							"Failed to create pricing implementation '{}': {}",
+							name, e
+						)));
+					},
+				}
+			}
+		}
+
+		// Use the primary pricing implementation
+		let primary_pricing = pricing_config.primary.as_str();
+		let pricing_impl = pricing_impls.remove(primary_pricing).ok_or_else(|| {
+			BuilderError::Config(format!(
+				"Primary pricing '{}' failed to load or has invalid configuration",
+				primary_pricing
+			))
+		})?;
+		let pricing = Arc::new(PricingService::new(pricing_impl));
+
 		// Build oracle routes from settlement implementations
 		let oracle_routes = settlement.build_oracle_routes();
 		tracing::info!(
@@ -490,6 +536,7 @@ impl SolverBuilder {
 			discovery,
 			order,
 			settlement,
+			pricing,
 			EventBus::new(1000),
 			token_manager,
 		))
