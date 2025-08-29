@@ -50,6 +50,12 @@ pub struct Order {
 	/// Transaction hash of the fill transaction.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub fill_tx_hash: Option<TransactionHash>,
+	/// Transaction hash of the post-fill transaction (if applicable).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub post_fill_tx_hash: Option<TransactionHash>,
+	/// Transaction hash of the pre-claim transaction (if applicable).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub pre_claim_tx_hash: Option<TransactionHash>,
 	/// Transaction hash of the claim transaction.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub claim_tx_hash: Option<TransactionHash>,
@@ -160,16 +166,31 @@ pub struct OrderResponse {
 #[serde(rename_all = "camelCase")]
 pub enum OrderStatus {
 	/// Order has been created but not yet prepared.
+	/// Next: Prepare transaction will be sent, moving to Pending.
 	Created,
-	/// Order is pending execution.
+	/// Order has a pending prepare transaction.
+	/// Next: When prepare confirms, moves to Executing.
 	Pending,
-	/// Order has been executed.
+	/// Order is currently executing - prepare confirmed, fill transaction in progress.
+	/// Next: When fill confirms, moves to Executed.
+	Executing,
+	/// Order has been executed - fill transaction confirmed.
+	/// Next: Either PostFilled (if post-fill tx needed) or Settled (if no post-fill).
 	Executed,
+	/// Post-fill transaction completed (optional state).
+	/// Next: Moves to Settled when ready for claiming.
+	PostFilled,
+	/// Pre-claim transaction completed (optional state).
+	/// Next: Moves to Finalized after claim confirms.
+	PreClaimed,
 	/// Order has been settled and is ready to be claimed.
+	/// Next: Either PreClaimed (if pre-claim tx needed) or Finalized (after claim).
 	Settled,
-	/// Order is finalized and complete (after claim confirmation).
+	/// Order is finalized and complete - claim transaction confirmed.
+	/// Terminal state: No further transitions.
 	Finalized,
 	/// Order execution failed with specific transaction type.
+	/// Terminal state: No further transitions.
 	Failed(TransactionType),
 }
 
@@ -178,7 +199,10 @@ impl fmt::Display for OrderStatus {
 		match self {
 			OrderStatus::Created => write!(f, "Created"),
 			OrderStatus::Pending => write!(f, "Pending"),
+			OrderStatus::Executing => write!(f, "Executing"),
 			OrderStatus::Executed => write!(f, "Executed"),
+			OrderStatus::PostFilled => write!(f, "PostFilled"),
+			OrderStatus::PreClaimed => write!(f, "PreClaimed"),
 			OrderStatus::Settled => write!(f, "Settled"),
 			OrderStatus::Finalized => write!(f, "Finalized"),
 			OrderStatus::Failed(_) => write!(f, "Failed"),

@@ -9,7 +9,7 @@
 # 1. Uses SOLVER_ADDRESS and USER_ADDRESS defined below
 # 2. Deploys smart contracts on both testnets:
 #    - InputSettlerEscrow on origin chain
-#    - OutputSettler7683 on destination chain
+#    - OutputSettlerSimple on destination chain
 #    - Mock Oracle contract for intent validation
 #
 # 3. Configures the test environment for USDC transfers:
@@ -277,7 +277,7 @@ DEST_TOKEN="$DEST_USDC_ADDRESS"
 ORIGIN_COMPACT_ADDRESS=""
 ORIGIN_PERMIT2_ADDRESS="0x000000000022D473030F116dDEE9F6B43aC78BA3"
 DEST_PERMIT2_ADDRESS="0x000000000022D473030F116dDEE9F6B43aC78BA3"
-OIF_PINNED_COMMIT="f2a9e8ab9d652894a090814421a7acb9a0547737"
+OIF_PINNED_COMMIT="3d1399025b9daa8ab6f0666f11b741d3b5c5fafa"
 
 echo
 echo -e "${GREEN}✅ Configuration validated${NC}"
@@ -417,7 +417,7 @@ echo
 echo -e "${BLUE}=== $DEST_CHAIN_NAME Deployments ===${NC}"
 
 echo -n "  Deploying OutputSettler... "
-OUTPUT_SETTLER_OUTPUT=$(~/.foundry/bin/forge create src/output/coin/OutputSettler7683.sol:OutputInputSettlerEscrow \
+OUTPUT_SETTLER_OUTPUT=$(~/.foundry/bin/forge create src/output/simple/OutputSettlerSimple.sol:OutputSettlerSimple \
     --rpc-url "$DEST_RPC_URL" \
     --private-key $DEPLOYMENT_KEY \
     --broadcast 2>&1)

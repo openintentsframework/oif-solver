@@ -926,7 +926,6 @@ async fn handle_intent_submission(
 					.into_response();
 			}
 
-			tracing::info!(%order_id, "Intent received and queued for full validation");
 			(
 				StatusCode::OK,
 				Json(IntentResponse {
