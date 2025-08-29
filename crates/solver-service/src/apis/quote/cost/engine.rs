@@ -8,6 +8,7 @@ use solver_types::{
 };
 use solver_types::{
 	Address, ExecutionParams, FillProof, Order, OrderStatus, Transaction, TransactionHash,
+	DEFAULT_GAS_PRICE_WEI,
 };
 
 pub struct CostEngine;
@@ -151,7 +152,7 @@ impl CostEngine {
 				.gas_price,
 			10,
 		)
-		.unwrap_or(U256::from(1_000_000_000u64));
+		.unwrap_or(U256::from(DEFAULT_GAS_PRICE_WEI));
 		let dest_gp = U256::from_str_radix(
 			&solver
 				.delivery()
@@ -161,7 +162,7 @@ impl CostEngine {
 				.gas_price,
 			10,
 		)
-		.unwrap_or(U256::from(1_000_000_000u64));
+		.unwrap_or(U256::from(DEFAULT_GAS_PRICE_WEI));
 		// Costs: open+claim on origin, fill on dest
 		let open_cost_wei_uint = origin_gp.saturating_mul(U256::from(open_units));
 		let fill_cost_wei_uint = dest_gp.saturating_mul(U256::from(fill_units));
@@ -393,7 +394,7 @@ impl CostEngine {
 		let order = self.create_order_for_estimation(quote, solver).await?;
 		// Create minimal execution params for estimation
 		let params = ExecutionParams {
-			gas_price: U256::from(1_000_000_000u64), // 1 gwei default
+			gas_price: U256::from(DEFAULT_GAS_PRICE_WEI), // 1 gwei default
 			priority_fee: None,
 		};
 

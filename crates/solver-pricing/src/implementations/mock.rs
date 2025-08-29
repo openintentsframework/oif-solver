@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use solver_types::utils::wei_string_to_eth_string;
 use solver_types::{
 	ConfigSchema, ImplementationRegistry, PricingError, PricingFactory, PricingInterface,
-	PricingRegistry, TradingPair, ValidationError,
+	PricingRegistry, TradingPair, ValidationError, MOCK_ETH_USD_PRICE, MOCK_SOL_USD_PRICE,
+	MOCK_ETH_SOL_PRICE,
 };
 use std::collections::HashMap;
 use toml;
@@ -25,9 +26,9 @@ impl MockPricing {
 		let mut pair_prices = HashMap::new();
 
 		// Default prices
-		pair_prices.insert("ETH/USD".to_string(), "4615.16".to_string());
-		pair_prices.insert("SOL/USD".to_string(), "240.50".to_string());
-		pair_prices.insert("ETH/SOL".to_string(), "19.20".to_string()); // ETH price / SOL price
+		pair_prices.insert("ETH/USD".to_string(), MOCK_ETH_USD_PRICE.to_string());
+		pair_prices.insert("SOL/USD".to_string(), MOCK_SOL_USD_PRICE.to_string());
+		pair_prices.insert("ETH/SOL".to_string(), MOCK_ETH_SOL_PRICE.to_string()); // ETH price / SOL price
 
 		// Allow configuration overrides
 		if let Some(prices) = config.get("pair_prices").and_then(|v| v.as_table()) {
