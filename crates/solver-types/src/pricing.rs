@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::{fmt, str::FromStr};
 use thiserror::Error;
 use toml;
 
@@ -22,6 +23,9 @@ pub enum PricingError {
 	/// Error when price data is invalid or corrupted.
 	#[error("Invalid price data: {0}")]
 	InvalidData(String),
+	/// Error when parsing a trading pair from string format.
+	#[error("Invalid pair format: {0}")]
+	InvalidPairFormat(String),
 }
 
 /// Represents a trading pair for price queries.
@@ -42,19 +46,22 @@ impl TradingPair {
 		}
 	}
 
-	/// Returns the pair as a string in format "BASE/QUOTE".
-	pub fn to_string(&self) -> String {
-		format!("{}/{}", self.base, self.quote)
-	}
 
-	/// Creates a trading pair from a string like "ETH/USD".
-	pub fn from_string(pair_str: &str) -> Result<Self, PricingError> {
-		let parts: Vec<&str> = pair_str.split('/').collect();
+}
+
+impl fmt::Display for TradingPair {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "{}/{}", self.base, self.quote)
+	}
+}
+
+impl FromStr for TradingPair {
+	type Err = PricingError;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		let parts: Vec<&str> = s.split('/').collect();
 		if parts.len() != 2 {
-			return Err(PricingError::InvalidData(format!(
-				"Invalid pair format: {}",
-				pair_str
-			)));
+			return Err(PricingError::InvalidPairFormat(s.to_string()));
 		}
 		Ok(Self::new(parts[0], parts[1]))
 	}
@@ -96,8 +103,7 @@ pub trait PricingInterface: Send + Sync {
 		asset: &str,
 		currency: &str,
 	) -> Result<AssetPrice, PricingError> {
-		let pair = TradingPair::new(asset, currency);
-		self.get_pair_price(&pair).await
+		self.get_pair_price(&TradingPair::new(asset, currency)).await
 	}
 
 	/// Converts between two assets using available pricing data.
