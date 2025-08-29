@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use solver_types::utils::wei_string_to_eth_string;
 use solver_types::{
 	ConfigSchema, ImplementationRegistry, PricingError, PricingFactory, PricingInterface,
-	PricingRegistry, TradingPair, ValidationError, MOCK_ETH_USD_PRICE, MOCK_SOL_USD_PRICE,
-	MOCK_ETH_SOL_PRICE,
+	PricingRegistry, TradingPair, ValidationError, MOCK_ETH_SOL_PRICE, MOCK_ETH_USD_PRICE,
+	MOCK_SOL_USD_PRICE,
 };
 use std::collections::HashMap;
 use toml;
