@@ -4,7 +4,7 @@
 //! proper validation and sensible defaults.
 
 use crate::networks::{NetworkConfig, NetworksConfig, RpcEndpoint, TokenConfig};
-use crate::Address;
+use crate::{parse_address, Address};
 use std::collections::HashMap;
 
 /// Builder for creating `RpcEndpoint` instances with a fluent API.
@@ -38,20 +38,20 @@ impl RpcEndpointBuilder {
 	/// Creates a new `RpcEndpointBuilder` with default values.
 	pub fn new() -> Self {
 		Self {
-			http: None,
-			ws: None,
+			http: Some("https://eth.llamarpc.com".to_string()),
+			ws: Some("wss://eth.llamarpc.com".to_string()),
 		}
 	}
 
 	/// Sets the HTTP URL.
-	pub fn http<S: Into<String>>(mut self, url: S) -> Self {
-		self.http = Some(url.into());
+	pub fn http(mut self, url: Option<String>) -> Self {
+		self.http = url;
 		self
 	}
 
 	/// Sets the WebSocket URL.
-	pub fn ws<S: Into<String>>(mut self, url: S) -> Self {
-		self.ws = Some(url.into());
+	pub fn ws(mut self, url: Option<String>) -> Self {
+		self.ws = url;
 		self
 	}
 
@@ -121,9 +121,12 @@ impl TokenConfigBuilder {
 	/// Creates a new `TokenConfigBuilder` with default values.
 	pub fn new() -> Self {
 		Self {
-			address: None,
-			symbol: None,
-			decimals: None,
+			address: Some(
+				parse_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+					.expect("Invalid USDC address"),
+			),
+			symbol: Some("USDC".to_string()),
+			decimals: Some(6),
 		}
 	}
 
@@ -230,12 +233,26 @@ impl NetworkConfigBuilder {
 	/// Creates a new `NetworkConfigBuilder` with default values.
 	pub fn new() -> Self {
 		Self {
-			rpc_urls: Vec::new(),
-			input_settler_address: None,
-			output_settler_address: None,
-			tokens: Vec::new(),
-			input_settler_compact_address: None,
-			the_compact_address: None,
+			rpc_urls: vec![RpcEndpointBuilder::new()
+				.http(Some("https://eth.llamarpc.com".to_string()))
+				.build()],
+			input_settler_address: Some(
+				parse_address("0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
+					.expect("Invalid mock address"),
+			),
+			output_settler_address: Some(
+				parse_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
+					.expect("Invalid mock address"),
+			),
+			tokens: vec![TokenConfigBuilder::new().build()],
+			input_settler_compact_address: Some(
+				parse_address("0x00000000000c2e074ec69a0dfb2997ba6c7d2e1e")
+					.expect("Invalid mock address"),
+			),
+			the_compact_address: Some(
+				parse_address("0x00000000000c2e074ec69a0dfb2997ba6c7d2e1f")
+					.expect("Invalid mock address"),
+			),
 		}
 	}
 

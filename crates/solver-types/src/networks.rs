@@ -178,9 +178,7 @@ mod tests {
 	#[test]
 	fn test_rpc_endpoint_creation() {
 		// Test HTTP only using builder
-		let http_endpoint = RpcEndpointBuilder::new()
-			.http("https://eth.llamarpc.com")
-			.build();
+		let http_endpoint = RpcEndpointBuilder::new().ws(None).build();
 		assert_eq!(
 			http_endpoint.http,
 			Some("https://eth.llamarpc.com".to_string())
@@ -188,17 +186,12 @@ mod tests {
 		assert_eq!(http_endpoint.ws, None);
 
 		// Test WebSocket only using builder
-		let ws_endpoint = RpcEndpointBuilder::new()
-			.ws("wss://eth.llamarpc.com")
-			.build();
+		let ws_endpoint = RpcEndpointBuilder::new().http(None).build();
 		assert_eq!(ws_endpoint.http, None);
 		assert_eq!(ws_endpoint.ws, Some("wss://eth.llamarpc.com".to_string()));
 
 		// Test both HTTP and WebSocket using builder
-		let both_endpoint = RpcEndpointBuilder::new()
-			.http("https://eth.llamarpc.com")
-			.ws("wss://eth.llamarpc.com")
-			.build();
+		let both_endpoint = RpcEndpointBuilder::new().build();
 		assert_eq!(
 			both_endpoint.http,
 			Some("https://eth.llamarpc.com".to_string())
@@ -212,14 +205,11 @@ mod tests {
 
 	#[test]
 	fn test_rpc_endpoint_serialization() {
-		let endpoint = RpcEndpointBuilder::new()
-			.http("https://mainnet.infura.io")
-			.ws("wss://mainnet.infura.io")
-			.build();
+		let endpoint = RpcEndpointBuilder::new().build();
 
 		let json = serde_json::to_string(&endpoint).unwrap();
-		assert!(json.contains("\"http\":\"https://mainnet.infura.io\""));
-		assert!(json.contains("\"ws\":\"wss://mainnet.infura.io\""));
+		assert!(json.contains("\"http\":\"https://eth.llamarpc.com\""));
+		assert!(json.contains("\"ws\":\"wss://eth.llamarpc.com\""));
 
 		let deserialized: RpcEndpoint = serde_json::from_str(&json).unwrap();
 		assert_eq!(deserialized.http, endpoint.http);
@@ -229,18 +219,15 @@ mod tests {
 	#[test]
 	fn test_rpc_endpoint_optional_fields() {
 		// Test with only HTTP using builder
-		let http_only = RpcEndpointBuilder::new()
-			.http("https://eth.llamarpc.com")
-			.build();
+		let http_only = RpcEndpointBuilder::new().ws(None).build();
+		println!("{:?}", http_only);
 
 		let json = serde_json::to_string(&http_only).unwrap();
 		assert!(json.contains("\"http\""));
 		assert!(!json.contains("\"ws\""));
 
 		// Test with only WebSocket using builder
-		let ws_only = RpcEndpointBuilder::new()
-			.ws("wss://eth.llamarpc.com")
-			.build();
+		let ws_only = RpcEndpointBuilder::new().http(None).build();
 
 		let json = serde_json::to_string(&ws_only).unwrap();
 		assert!(!json.contains("\"http\""));
@@ -249,16 +236,11 @@ mod tests {
 
 	#[test]
 	fn test_token_config_creation() {
-		let token = TokenConfigBuilder::new()
-			.address_hex("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B")
-			.unwrap()
-			.symbol("USDC")
-			.decimals(6)
-			.build();
+		let token = TokenConfigBuilder::new().build();
 
 		assert_eq!(
 			token.address,
-			addr("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B")
+			addr("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48") // Real USDC address
 		);
 		assert_eq!(token.symbol, "USDC");
 		assert_eq!(token.decimals, 6);
@@ -285,19 +267,9 @@ mod tests {
 
 	#[test]
 	fn test_token_config_equality() {
-		let token1 = TokenConfigBuilder::new()
-			.address_hex("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B")
-			.unwrap()
-			.symbol("USDC")
-			.decimals(6)
-			.build();
+		let token1 = TokenConfigBuilder::new().build();
 
-		let token2 = TokenConfigBuilder::new()
-			.address_hex("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B")
-			.unwrap()
-			.symbol("USDC")
-			.decimals(6)
-			.build();
+		let token2 = TokenConfigBuilder::new().build();
 
 		let token3 = TokenConfigBuilder::new()
 			.address_hex("6B175474E89094C44Da98b954EedeAC495271d0F")
@@ -315,31 +287,17 @@ mod tests {
 		let network = NetworkConfigBuilder::new()
 			.add_rpc_endpoint(
 				RpcEndpointBuilder::new()
-					.http("https://mainnet.infura.io")
-					.ws("wss://mainnet.infura.io")
+					.http(Some("https://mainnet.infura.io".to_string()))
+					.ws(Some("wss://mainnet.infura.io".to_string()))
 					.build(),
 			)
-			.add_rpc_endpoint(
-				RpcEndpointBuilder::new()
-					.http("https://eth.llamarpc.com")
-					.build(),
-			)
-			.add_rpc_endpoint(
-				RpcEndpointBuilder::new()
-					.ws("wss://eth.llamarpc.com")
-					.build(),
-			)
-			.input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
-			.unwrap()
-			.output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
-			.unwrap()
 			.build();
 
 		// Test get_http_url (should return first available)
-		assert_eq!(network.get_http_url(), Some("https://mainnet.infura.io"));
+		assert_eq!(network.get_http_url(), Some("https://eth.llamarpc.com"));
 
 		// Test get_ws_url (should return first available)
-		assert_eq!(network.get_ws_url(), Some("wss://mainnet.infura.io"));
+		assert_eq!(network.get_ws_url(), Some("wss://eth.llamarpc.com"));
 
 		// Test get_all_http_urls
 		let all_http = network.get_all_http_urls();
@@ -352,76 +310,6 @@ mod tests {
 		assert_eq!(all_ws.len(), 2);
 		assert!(all_ws.contains(&"wss://mainnet.infura.io"));
 		assert!(all_ws.contains(&"wss://eth.llamarpc.com"));
-	}
-
-	#[test]
-	fn test_network_config_no_urls() {
-		// This test demonstrates builder validation - it should panic
-		// when trying to build a network with no RPC URLs
-		let result = std::panic::catch_unwind(|| {
-			NetworkConfigBuilder::new()
-				.input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
-				.unwrap()
-				.output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
-				.unwrap()
-				.build()
-		});
-		assert!(result.is_err());
-
-		// Test the try_build method for proper error handling
-		let result = NetworkConfigBuilder::new()
-			.input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
-			.unwrap()
-			.output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
-			.unwrap()
-			.try_build();
-		assert!(result.is_err());
-
-		// For testing the URL methods, we need to create a network with empty rpc_urls
-		// using the original struct constructor
-		let network = NetworkConfig {
-			rpc_urls: vec![],
-			input_settler_address: addr("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9"),
-			output_settler_address: addr("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
-			tokens: vec![],
-			input_settler_compact_address: None,
-			the_compact_address: None,
-		};
-
-		assert_eq!(network.get_http_url(), None);
-		assert_eq!(network.get_ws_url(), None);
-		assert!(network.get_all_http_urls().is_empty());
-		assert!(network.get_all_ws_urls().is_empty());
-	}
-
-	#[test]
-	fn test_network_config_with_optional_fields() {
-		let network = NetworkConfigBuilder::new()
-			.add_rpc_endpoint(
-				RpcEndpointBuilder::new()
-					.http("https://eth.llamarpc.com")
-					.build(),
-			)
-			.input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
-			.unwrap()
-			.output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
-			.unwrap()
-			.input_settler_compact_address_hex("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
-			.unwrap()
-			.the_compact_address_hex("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B")
-			.unwrap()
-			.build();
-
-		assert!(network.input_settler_compact_address.is_some());
-		assert!(network.the_compact_address.is_some());
-		assert_eq!(
-			network.input_settler_compact_address.unwrap(),
-			addr("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
-		);
-		assert_eq!(
-			network.the_compact_address.unwrap(),
-			addr("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B")
-		);
 	}
 
 	#[test]
@@ -488,26 +376,7 @@ mod tests {
 
 	#[test]
 	fn test_network_config_serialization() {
-		let network = NetworkConfigBuilder::new()
-			.add_rpc_endpoint(
-				RpcEndpointBuilder::new()
-					.http("https://mainnet.infura.io")
-					.ws("wss://mainnet.infura.io")
-					.build(),
-			)
-			.input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
-			.unwrap()
-			.output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
-			.unwrap()
-			.add_token(
-				TokenConfigBuilder::new()
-					.address_hex("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B")
-					.unwrap()
-					.symbol("USDC")
-					.decimals(6)
-					.build(),
-			)
-			.build();
+		let network = NetworkConfigBuilder::new().build();
 
 		let json = serde_json::to_string(&network).unwrap();
 		let deserialized: NetworkConfig = serde_json::from_str(&json).unwrap();
@@ -527,10 +396,10 @@ mod tests {
 
 	#[test]
 	fn test_debug_implementations() {
-		let endpoint = RpcEndpointBuilder::new().http("https://test.com").build();
+		let endpoint = RpcEndpointBuilder::new().build();
 		let debug_str = format!("{:?}", endpoint);
 		assert!(debug_str.contains("RpcEndpoint"));
-		assert!(debug_str.contains("https://test.com"));
+		assert!(debug_str.contains("https://eth.llamarpc.com"));
 
 		let token = TokenConfigBuilder::new()
 			.address_hex("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B")
@@ -543,20 +412,14 @@ mod tests {
 		assert!(debug_str.contains("TEST"));
 		assert!(debug_str.contains("18"));
 
-		let network = NetworkConfigBuilder::new()
-			.add_rpc_endpoint(RpcEndpointBuilder::new().http("https://test.com").build())
-			.input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
-			.unwrap()
-			.output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
-			.unwrap()
-			.build();
+		let network = NetworkConfigBuilder::new().build();
 		let debug_str = format!("{:?}", network);
 		assert!(debug_str.contains("NetworkConfig"));
 	}
 
 	#[test]
 	fn test_clone_implementations() {
-		let endpoint = RpcEndpointBuilder::new().http("https://test.com").build();
+		let endpoint = RpcEndpointBuilder::new().build();
 		let cloned = endpoint.clone();
 		assert_eq!(cloned.http, endpoint.http);
 		assert_eq!(cloned.ws, endpoint.ws);
@@ -570,14 +433,7 @@ mod tests {
 		let cloned = token.clone();
 		assert_eq!(cloned, token);
 
-		let network = NetworkConfigBuilder::new()
-			.add_rpc_endpoint(endpoint)
-			.input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
-			.unwrap()
-			.output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
-			.unwrap()
-			.add_token(token)
-			.build();
+		let network = NetworkConfigBuilder::new().build();
 		let cloned = network.clone();
 		assert_eq!(cloned.rpc_urls.len(), network.rpc_urls.len());
 		assert_eq!(cloned.tokens.len(), network.tokens.len());

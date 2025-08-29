@@ -3,7 +3,10 @@
 //! Provides a fluent API for constructing Transaction instances with
 //! proper validation and sensible defaults.
 
-use crate::account::{Address, Transaction};
+use crate::{
+	account::{Address, Transaction},
+	parse_address,
+};
 use alloy_primitives::U256;
 
 /// Builder for creating `Transaction` instances with a fluent API.
@@ -48,10 +51,13 @@ impl TransactionBuilder {
 	/// Creates a new `TransactionBuilder` with default values.
 	pub fn new() -> Self {
 		Self {
-			to: None,
+			to: Some(
+				parse_address("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+					.expect("Invalid mock address"),
+			),
 			data: Vec::new(),
 			value: U256::ZERO,
-			chain_id: None,
+			chain_id: Some(1), // Default to Ethereum mainnet
 			nonce: None,
 			gas_limit: None,
 			gas_price: None,
@@ -61,8 +67,8 @@ impl TransactionBuilder {
 	}
 
 	/// Sets the recipient address (None for contract creation).
-	pub fn to(mut self, to: Address) -> Self {
-		self.to = Some(to);
+	pub fn to(mut self, to: Option<Address>) -> Self {
+		self.to = to;
 		self
 	}
 

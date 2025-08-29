@@ -324,10 +324,8 @@ mod tests {
 	#[test]
 	fn test_transaction_creation_with_builder() {
 		let tx = TransactionBuilder::new()
-			.to(test_address("0x1111111111111111111111111111111111111111"))
 			.data(vec![0x12, 0x34])
 			.value_u64(1000)
-			.chain_id(1)
 			.nonce(42)
 			.gas_limit(21000)
 			.gas_price_gwei(20)
@@ -392,12 +390,9 @@ mod tests {
 	#[test]
 	fn test_transaction_to_alloy_request_with_builder() {
 		let tx = TransactionBuilder::new()
-			.to_hex("0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b")
-			.unwrap()
 			.data_hex("0xffee")
 			.unwrap()
 			.value_u64(750)
-			.chain_id(42)
 			.nonce(15)
 			.gas_limit(30000)
 			.gas_price_gwei(30)
@@ -409,7 +404,7 @@ mod tests {
 
 		assert!(req.to.is_some());
 		assert_eq!(req.value, Some(U256::from(750)));
-		assert_eq!(req.chain_id, Some(42));
+		assert_eq!(req.chain_id, Some(1));
 		assert_eq!(req.nonce, Some(15));
 		assert_eq!(req.gas, Some(30000));
 		assert_eq!(req.gas_price, Some(30_000_000_000));
@@ -421,7 +416,7 @@ mod tests {
 	#[test]
 	fn test_transaction_to_alloy_request_no_to() {
 		let tx = TransactionBuilder::new()
-			.chain_id(1)
+			.to(None)
 			.gas_price_gwei(20)
 			.build();
 
@@ -482,7 +477,6 @@ mod tests {
 	#[test]
 	fn test_transaction_clone() {
 		let original = TransactionBuilder::new()
-			.to(test_address_bytes(&[1u8; 20]))
 			.data(vec![0x11, 0x22])
 			.value_u64(500)
 			.chain_id(10)
