@@ -78,7 +78,7 @@ max_gas_price_gwei = 100
 primary = "mock"
 
 [pricing.implementations.mock]
-# Uses default ETH/USD price of $4615.16
+# Uses default ETH/USD price of 615.16
 
 # ============================================================================
 # SETTLEMENT

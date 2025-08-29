@@ -379,6 +379,8 @@ impl CostEngine {
 			execution_params: None,
 			prepare_tx_hash: None,
 			fill_tx_hash: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
 			claim_tx_hash: None,
 			fill_proof: None,
 		})

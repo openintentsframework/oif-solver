@@ -56,7 +56,7 @@ pub use standards::{
 pub use storage::*;
 pub use utils::{
 	bytes32_to_address, current_timestamp, format_token_amount, normalize_bytes32_address,
-	truncate_id, with_0x_prefix, without_0x_prefix, DEFAULT_GAS_PRICE_WEI, MOCK_ETH_SOL_PRICE,
-	MOCK_ETH_USD_PRICE, MOCK_SOL_USD_PRICE, parse_address, wei_string_to_eth_string,
+	parse_address, truncate_id, wei_string_to_eth_string, with_0x_prefix, without_0x_prefix,
+	DEFAULT_GAS_PRICE_WEI, MOCK_ETH_SOL_PRICE, MOCK_ETH_USD_PRICE, MOCK_SOL_USD_PRICE,
 };
 pub use validation::*;
