@@ -80,7 +80,7 @@ pub struct GetQuoteRequest {
 }
 
 /// Quote optimization preferences following UII standard
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum QuotePreference {
 	Price,
@@ -105,7 +105,7 @@ pub struct QuoteOrder {
 }
 
 /// Supported signature types
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum SignatureType {
 	Eip712,
@@ -143,7 +143,7 @@ pub struct Quote {
 }
 
 /// Settlement mechanism types.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum SettlementType {
 	Escrow,
@@ -519,7 +519,7 @@ mod tests {
 			assert_eq!(json, *expected);
 
 			let deserialized: QuotePreference = serde_json::from_str(&json).unwrap();
-			assert!(matches!(deserialized, preference));
+			assert_eq!(deserialized, *preference);
 		}
 	}
 
@@ -579,7 +579,7 @@ mod tests {
 			assert_eq!(json, *expected);
 
 			let deserialized: SignatureType = serde_json::from_str(&json).unwrap();
-			assert!(matches!(deserialized, sig_type));
+			assert_eq!(deserialized, *sig_type);
 		}
 	}
 
@@ -620,7 +620,7 @@ mod tests {
 			assert_eq!(json, *expected);
 
 			let deserialized: SettlementType = serde_json::from_str(&json).unwrap();
-			assert!(matches!(deserialized, settlement_type));
+			assert_eq!(deserialized, *settlement_type);
 		}
 	}
 
