@@ -165,10 +165,8 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::utils::builders::{
-		NetworkConfigBuilder, NetworksConfigBuilder, RpcEndpointBuilder, TokenConfigBuilder,
-	};
-	use crate::Address; // Use the custom Address type
+	use crate::utils::builders::{NetworkConfigBuilder, RpcEndpointBuilder, TokenConfigBuilder};
+	use crate::Address;
 	use serde_json;
 
 	// Helper function to create Address from hex string
