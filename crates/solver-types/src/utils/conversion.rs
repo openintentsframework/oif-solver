@@ -6,7 +6,11 @@
 use crate::Address;
 
 use super::formatting::without_0x_prefix;
-use alloy_primitives::{hex, utils::{format_ether, parse_ether}, Address as AlloyAddress, U256};
+use alloy_primitives::{
+	hex,
+	utils::{format_ether, parse_ether},
+	Address as AlloyAddress, U256,
+};
 
 /// Normalize a bytes32 that is expected to embed an `address` into
 /// a canonical left-padded form: 12 zero bytes followed by 20 address bytes.
@@ -137,7 +141,8 @@ pub fn wei_to_eth_string(wei_amount: U256) -> String {
 /// assert_eq!(wei.to_string(), "1500000000000000000");
 /// ```
 pub fn eth_string_to_wei(eth_amount: &str) -> Result<U256, String> {
-	parse_ether(eth_amount).map_err(|e| format!("Failed to parse ETH amount '{}': {}", eth_amount, e))
+	parse_ether(eth_amount)
+		.map_err(|e| format!("Failed to parse ETH amount '{}': {}", eth_amount, e))
 }
 
 /// Convert wei string to ETH string using Alloy utilities.
@@ -303,7 +308,10 @@ mod tests {
 
 		// Test 1.5 ETH
 		let one_and_half_eth_wei = U256::from(1_500_000_000_000_000_000u64);
-		assert_eq!(wei_to_eth_string(one_and_half_eth_wei), "1.500000000000000000");
+		assert_eq!(
+			wei_to_eth_string(one_and_half_eth_wei),
+			"1.500000000000000000"
+		);
 
 		// Test 0.1 ETH
 		let tenth_eth_wei = U256::from(100_000_000_000_000_000u64);

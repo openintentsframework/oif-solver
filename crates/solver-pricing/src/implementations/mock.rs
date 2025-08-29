@@ -4,8 +4,8 @@
 //! Supports ETH/USD, ETH/SOL, SOL/USD pairs as requested.
 
 use alloy_primitives::utils::parse_ether;
-use solver_types::utils::conversion::wei_string_to_eth_string;
 use async_trait::async_trait;
+use solver_types::utils::conversion::wei_string_to_eth_string;
 use solver_types::{
 	AssetPrice, ConfigSchema, ImplementationRegistry, PricingError, PricingFactory,
 	PricingInterface, PricingRegistry, TradingPair, ValidationError,
@@ -158,9 +158,9 @@ impl PricingInterface for MockPricing {
 		currency: &str,
 	) -> Result<String, PricingError> {
 		// Convert wei to ETH using utility function
-		let eth_amount_str = wei_string_to_eth_string(wei_amount)
-			.map_err(|e| PricingError::InvalidData(e))?;
-		
+		let eth_amount_str =
+			wei_string_to_eth_string(wei_amount).map_err(|e| PricingError::InvalidData(e))?;
+
 		let eth_amount_f64 = eth_amount_str
 			.parse::<f64>()
 			.map_err(|e| PricingError::InvalidData(format!("Invalid ETH amount: {}", e)))?;
@@ -203,8 +203,9 @@ impl PricingInterface for MockPricing {
 			// Convert currency to ETH, then to wei using Alloy's parse_ether helper
 			let eth_amount = currency_amount_f64 / eth_price_f64;
 			let eth_amount_str = format!("{:.18}", eth_amount); // Use high precision for ETH
-			let wei_amount = parse_ether(&eth_amount_str)
-				.map_err(|e| PricingError::InvalidData(format!("Failed to convert ETH to wei: {}", e)))?;
+			let wei_amount = parse_ether(&eth_amount_str).map_err(|e| {
+				PricingError::InvalidData(format!("Failed to convert ETH to wei: {}", e))
+			})?;
 
 			Ok(wei_amount.to_string())
 		} else {
@@ -218,7 +219,6 @@ pub struct MockPricingSchema;
 
 impl ConfigSchema for MockPricingSchema {
 	fn validate(&self, config: &toml::Value) -> Result<(), ValidationError> {
-
 		// Optional pair_prices validation
 		if let Some(pair_prices) = config.get("pair_prices") {
 			if let Some(table) = pair_prices.as_table() {

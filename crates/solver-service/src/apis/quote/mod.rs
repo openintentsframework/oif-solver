@@ -119,18 +119,6 @@ pub async fn process_quote_request(
 
 	// 5. Enrich quotes with a preliminary cost breakdown
 	let cost_engine = cost::CostEngine::new();
-	// Build pricing config from the selected strategy table (with defaults)
-	let strategy_name = &config.order.strategy.primary;
-	let default_table = toml::Value::Table(toml::map::Map::new());
-	let strategy_table = config
-		.order
-		.strategy
-		.implementations
-		.get(strategy_name)
-		.unwrap_or(&default_table);
-	let pricing = cost::PricingConfig::from_table(strategy_table);
-
-	// Create a mock pricing service for now
 	// TODO: This should be properly injected or configured
 	let mock_pricing = solver_pricing::implementations::mock::create_mock_pricing(
 		&toml::Value::Table(toml::Table::new()),
