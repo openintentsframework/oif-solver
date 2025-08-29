@@ -4,7 +4,7 @@
 //! wei amounts and fiat currencies. Currently supports mock pricing for development.
 
 use solver_types::{
-	AssetPrice, ImplementationRegistry, PricingError, PricingFactory, PricingInterface, TradingPair,
+	ImplementationRegistry, PricingError, PricingFactory, PricingInterface, TradingPair,
 };
 
 /// Re-export implementations

@@ -5,10 +5,10 @@
 
 use alloy_primitives::utils::parse_ether;
 use async_trait::async_trait;
-use solver_types::utils::conversion::wei_string_to_eth_string;
+use solver_types::utils::wei_string_to_eth_string;
 use solver_types::{
-	AssetPrice, ConfigSchema, ImplementationRegistry, PricingError, PricingFactory,
-	PricingInterface, PricingRegistry, TradingPair, ValidationError,
+	ConfigSchema, ImplementationRegistry, PricingError, PricingFactory, PricingInterface,
+	PricingRegistry, TradingPair, ValidationError,
 };
 use std::collections::HashMap;
 use toml;
@@ -146,8 +146,8 @@ impl PricingInterface for MockPricing {
 		currency: &str,
 	) -> Result<String, PricingError> {
 		// Convert wei to ETH using utility function
-		let eth_amount_str =
-			wei_string_to_eth_string(wei_amount).map_err(|e| PricingError::InvalidData(e))?;
+		let eth_amount_str = wei_string_to_eth_string(wei_amount)
+			.map_err(PricingError::InvalidData)?;
 
 		let eth_amount_f64 = eth_amount_str
 			.parse::<f64>()

@@ -29,12 +29,12 @@ impl CostEngine {
 		let _input = quote
 			.details
 			.available_inputs
-			.get(0)
+			.first()
 			.ok_or_else(|| QuoteError::InvalidRequest("missing input".to_string()))?;
 		let _output = quote
 			.details
 			.requested_outputs
-			.get(0)
+			.first()
 			.ok_or_else(|| QuoteError::InvalidRequest("missing output".to_string()))?;
 
 		// For now, we primarily care about ETH/USD support for gas cost calculations
@@ -323,12 +323,12 @@ impl CostEngine {
 		let input = quote
 			.details
 			.available_inputs
-			.get(0)
+			.first()
 			.ok_or_else(|| QuoteError::InvalidRequest("missing input".to_string()))?;
 		let output = quote
 			.details
 			.requested_outputs
-			.get(0)
+			.first()
 			.ok_or_else(|| QuoteError::InvalidRequest("missing output".to_string()))?;
 		let origin = input
 			.asset
@@ -362,7 +362,7 @@ impl CostEngine {
 			input_chain_ids: vec![quote
 				.details
 				.available_inputs
-				.get(0)
+				.first()
 				.ok_or_else(|| QuoteError::InvalidRequest("missing input".to_string()))?
 				.asset
 				.ethereum_chain_id()
@@ -370,7 +370,7 @@ impl CostEngine {
 			output_chain_ids: vec![quote
 				.details
 				.requested_outputs
-				.get(0)
+				.first()
 				.ok_or_else(|| QuoteError::InvalidRequest("missing output".to_string()))?
 				.asset
 				.ethereum_chain_id()
