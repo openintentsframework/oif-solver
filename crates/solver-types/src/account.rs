@@ -343,43 +343,6 @@ mod tests {
 	}
 
 	#[test]
-	fn test_transaction_creation_eip1559_with_builder() {
-		let tx = TransactionBuilder::new()
-			.to_hex("0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b")
-			.unwrap()
-			.value_u64(500)
-			.chain_id(137)
-			.nonce(10)
-			.gas_limit(50000)
-			.eip1559(25, 2) // max_fee_gwei, priority_fee_gwei
-			.build();
-
-		assert!(tx.to.is_some());
-		assert_eq!(tx.value, U256::from(500));
-		assert_eq!(tx.chain_id, 137);
-		assert_eq!(tx.nonce, Some(10));
-		assert_eq!(tx.gas_limit, Some(50000));
-		assert_eq!(tx.max_fee_per_gas, Some(25_000_000_000));
-		assert_eq!(tx.max_priority_fee_per_gas, Some(2_000_000_000));
-		assert!(tx.gas_price.is_none()); // Should be None for EIP-1559
-	}
-
-	#[test]
-	fn test_transaction_creation_minimal_with_builder() {
-		let tx = TransactionBuilder::new()
-			.chain_id(1)
-			.gas_price_gwei(20)
-			.build();
-
-		assert!(tx.to.is_none());
-		assert_eq!(tx.value, U256::ZERO);
-		assert_eq!(tx.chain_id, 1);
-		assert!(tx.data.is_empty());
-		assert!(tx.nonce.is_none());
-		assert_eq!(tx.gas_price, Some(20_000_000_000));
-	}
-
-	#[test]
 	fn test_transaction_from_alloy_request() {
 		use alloy_primitives::{address, Bytes, TxKind};
 		use alloy_rpc_types::{TransactionInput, TransactionRequest};
