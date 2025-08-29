@@ -3564,6 +3564,7 @@ dependencies = [
  "serde_json",
  "solver-types",
  "thiserror 1.0.69",
+ "tokio",
  "toml",
  "tracing",
  "uuid",
