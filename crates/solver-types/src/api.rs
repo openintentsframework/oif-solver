@@ -407,16 +407,19 @@ impl From<GetOrderError> for APIError {
 mod tests {
 	use super::*;
 	use crate::standards::eip7930::InteropAddress;
+	use crate::utils::builders::{
+		AssetAmountBuilder, AvailableInputBuilder, GetQuoteRequestBuilder, RequestedOutputBuilder,
+	};
 	use alloy_primitives::address;
 	use alloy_primitives::U256;
 	use serde_json;
 
 	#[test]
 	fn test_asset_amount_serialization() {
-		let asset_amount = AssetAmount {
-			asset: "0x1234567890123456789012345678901234567890".to_string(),
-			amount: U256::from(1000),
-		};
+		let asset_amount = AssetAmountBuilder::new()
+			.asset("0x1234567890123456789012345678901234567890")
+			.amount_u64(1000)
+			.build();
 
 		let json = serde_json::to_string(&asset_amount).unwrap();
 		assert!(json.contains("\"asset\":"));
@@ -453,21 +456,15 @@ mod tests {
 
 	#[test]
 	fn test_available_input_serialization() {
-		let input = AvailableInput {
-			user: InteropAddress::new_ethereum(
-				1,
-				address!("1111111111111111111111111111111111111111"),
-			),
-			asset: InteropAddress::new_ethereum(
-				1,
-				address!("2222222222222222222222222222222222222222"),
-			),
-			amount: U256::from(5000),
-			lock: Some(Lock {
+		let input = AvailableInputBuilder::new()
+			.user_ethereum(1, address!("1111111111111111111111111111111111111111"))
+			.asset_ethereum(1, address!("2222222222222222222222222222222222222222"))
+			.amount_u64(5000)
+			.lock(Lock {
 				kind: LockKind::TheCompact,
 				params: None,
-			}),
-		};
+			})
+			.build();
 
 		let json = serde_json::to_string(&input).unwrap();
 		let deserialized: AvailableInput = serde_json::from_str(&json).unwrap();
@@ -478,18 +475,12 @@ mod tests {
 
 	#[test]
 	fn test_requested_output_serialization() {
-		let output = RequestedOutput {
-			receiver: InteropAddress::new_ethereum(
-				1,
-				address!("3333333333333333333333333333333333333333"),
-			),
-			asset: InteropAddress::new_ethereum(
-				1,
-				address!("4444444444444444444444444444444444444444"),
-			),
-			amount: U256::from(2000),
-			calldata: Some("0xdeadbeef".to_string()),
-		};
+		let output = RequestedOutputBuilder::new()
+			.receiver_ethereum(1, address!("3333333333333333333333333333333333333333"))
+			.asset_ethereum(1, address!("4444444444444444444444444444444444444444"))
+			.amount_u64(2000)
+			.calldata("0xdeadbeef")
+			.build();
 
 		let json = serde_json::to_string(&output).unwrap();
 		let deserialized: RequestedOutput = serde_json::from_str(&json).unwrap();
@@ -525,38 +516,25 @@ mod tests {
 
 	#[test]
 	fn test_get_quote_request_serialization() {
-		let request = GetQuoteRequest {
-			user: InteropAddress::new_ethereum(
-				1,
-				address!("1111111111111111111111111111111111111111"),
-			),
-			available_inputs: vec![AvailableInput {
-				user: InteropAddress::new_ethereum(
-					1,
-					address!("1111111111111111111111111111111111111111"),
-				),
-				asset: InteropAddress::new_ethereum(
-					1,
-					address!("2222222222222222222222222222222222222222"),
-				),
-				amount: U256::from(1000),
-				lock: None,
-			}],
-			requested_outputs: vec![RequestedOutput {
-				receiver: InteropAddress::new_ethereum(
-					1,
-					address!("3333333333333333333333333333333333333333"),
-				),
-				asset: InteropAddress::new_ethereum(
-					1,
-					address!("4444444444444444444444444444444444444444"),
-				),
-				amount: U256::from(900),
-				calldata: None,
-			}],
-			min_valid_until: Some(1234567890),
-			preference: Some(QuotePreference::Price),
-		};
+		let input = AvailableInputBuilder::new()
+			.user_ethereum(1, address!("1111111111111111111111111111111111111111"))
+			.asset_ethereum(1, address!("2222222222222222222222222222222222222222"))
+			.amount_u64(1000)
+			.build();
+
+		let output = RequestedOutputBuilder::new()
+			.receiver_ethereum(1, address!("3333333333333333333333333333333333333333"))
+			.asset_ethereum(1, address!("4444444444444444444444444444444444444444"))
+			.amount_u64(900)
+			.build();
+
+		let request = GetQuoteRequestBuilder::new()
+			.user_ethereum(1, address!("1111111111111111111111111111111111111111"))
+			.add_available_input(input)
+			.add_requested_output(output)
+			.min_valid_until(1234567890)
+			.preference(QuotePreference::Price)
+			.build();
 
 		let json = serde_json::to_string(&request).unwrap();
 		assert!(json.contains("\"availableInputs\""));

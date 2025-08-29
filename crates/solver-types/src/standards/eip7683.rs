@@ -165,6 +165,7 @@ mod hex_string {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::utils::builders::{Eip7683OrderDataBuilder, MandateOutputBuilder};
 	use alloy_primitives::U256;
 	use serde_json;
 
@@ -270,16 +271,16 @@ mod tests {
 
 	#[test]
 	fn test_mandate_output_serialization() {
-		let output = MandateOutput {
-			oracle: [1u8; 32],
-			settler: [2u8; 32],
-			chain_id: U256::from(1),
-			token: [3u8; 32],
-			amount: U256::from(1000),
-			recipient: [4u8; 32],
-			call: vec![0xab, 0xcd],
-			context: vec![0x12, 0x34],
-		};
+		let output = MandateOutputBuilder::new()
+			.oracle([1u8; 32])
+			.settler([2u8; 32])
+			.chain_id(U256::from(1))
+			.token([3u8; 32])
+			.amount(U256::from(1000))
+			.recipient([4u8; 32])
+			.call(vec![0xab, 0xcd])
+			.context(vec![0x12, 0x34])
+			.build();
 
 		let json = serde_json::to_string(&output).unwrap();
 		assert!(json.contains("\"call\":\"0xabcd\""));
@@ -324,16 +325,14 @@ mod tests {
 
 	#[test]
 	fn test_mandate_output_empty_hex_fields() {
-		let output = MandateOutput {
-			oracle: [0u8; 32],
-			settler: [0u8; 32],
-			chain_id: U256::from(1),
-			token: [0u8; 32],
-			amount: U256::from(0),
-			recipient: [0u8; 32],
-			call: vec![],
-			context: vec![],
-		};
+		let output = MandateOutputBuilder::new()
+			.oracle([0u8; 32])
+			.settler([0u8; 32])
+			.chain_id(U256::from(1))
+			.token([0u8; 32])
+			.amount(U256::from(0))
+			.recipient([0u8; 32])
+			.build();
 
 		let json = serde_json::to_string(&output).unwrap();
 		assert!(json.contains("\"call\":\"0x\""));
@@ -347,31 +346,31 @@ mod tests {
 
 	#[test]
 	fn test_eip7683_order_data_serialization() {
-		let order = Eip7683OrderData {
-			user: "0x1234567890123456789012345678901234567890".to_string(),
-			nonce: U256::from(123),
-			origin_chain_id: U256::from(1),
-			expires: 1234567890,
-			fill_deadline: 1234567900,
-			input_oracle: "0xoracle123".to_string(),
-			inputs: vec![[U256::from(1), U256::from(1000)]],
-			order_id: [5u8; 32],
-			gas_limit_overrides: GasLimitOverrides::default(),
-			outputs: vec![MandateOutput {
-				oracle: [1u8; 32],
-				settler: [2u8; 32],
-				chain_id: U256::from(1),
-				token: [3u8; 32],
-				amount: U256::from(1000),
-				recipient: [4u8; 32],
-				call: vec![0xab, 0xcd],
-				context: vec![0x12, 0x34],
-			}],
-			raw_order_data: Some("0xrawdata".to_string()),
-			signature: Some("0xsignature".to_string()),
-			sponsor: None,
-			lock_type: Some(LockType::Permit2Escrow),
-		};
+		let output = MandateOutputBuilder::new()
+			.oracle([1u8; 32])
+			.settler([2u8; 32])
+			.chain_id(U256::from(1))
+			.token([3u8; 32])
+			.amount(U256::from(1000))
+			.recipient([4u8; 32])
+			.call(vec![0xab, 0xcd])
+			.context(vec![0x12, 0x34])
+			.build();
+
+		let order = Eip7683OrderDataBuilder::new()
+			.user("0x1234567890123456789012345678901234567890")
+			.nonce(U256::from(123))
+			.origin_chain_id(U256::from(1))
+			.expires(1234567890)
+			.fill_deadline(1234567900)
+			.input_oracle("0xoracle123")
+			.add_input(U256::from(1), U256::from(1000))
+			.order_id([5u8; 32])
+			.add_output(output)
+			.raw_order_data("0xrawdata")
+			.signature("0xsignature")
+			.lock_type(LockType::Permit2Escrow)
+			.build();
 
 		let json = serde_json::to_string(&order).unwrap();
 		assert!(json.contains("\"user\":"));
@@ -420,16 +419,16 @@ mod tests {
 	#[test]
 	fn test_output_type_alias() {
 		// Test that Output is indeed an alias for MandateOutput
-		let output: Output = MandateOutput {
-			oracle: [1u8; 32],
-			settler: [2u8; 32],
-			chain_id: U256::from(1),
-			token: [3u8; 32],
-			amount: U256::from(1000),
-			recipient: [4u8; 32],
-			call: vec![0xab, 0xcd],
-			context: vec![0x12, 0x34],
-		};
+		let output: Output = MandateOutputBuilder::new()
+			.oracle([1u8; 32])
+			.settler([2u8; 32])
+			.chain_id(U256::from(1))
+			.token([3u8; 32])
+			.amount(U256::from(1000))
+			.recipient([4u8; 32])
+			.call(vec![0xab, 0xcd])
+			.context(vec![0x12, 0x34])
+			.build();
 
 		assert_eq!(output.amount, U256::from(1000));
 		assert_eq!(output.call, vec![0xab, 0xcd]);
@@ -467,16 +466,16 @@ mod tests {
 			cloned_overrides.settle_gas_limit
 		);
 
-		let output = MandateOutput {
-			oracle: [1u8; 32],
-			settler: [2u8; 32],
-			chain_id: U256::from(1),
-			token: [3u8; 32],
-			amount: U256::from(1000),
-			recipient: [4u8; 32],
-			call: vec![0xab, 0xcd],
-			context: vec![0x12, 0x34],
-		};
+		let output = MandateOutputBuilder::new()
+			.oracle([1u8; 32])
+			.settler([2u8; 32])
+			.chain_id(U256::from(1))
+			.token([3u8; 32])
+			.amount(U256::from(1000))
+			.recipient([4u8; 32])
+			.call(vec![0xab, 0xcd])
+			.context(vec![0x12, 0x34])
+			.build();
 		let cloned_output = output.clone();
 		assert_eq!(output.amount, cloned_output.amount);
 		assert_eq!(output.call, cloned_output.call);
@@ -485,16 +484,16 @@ mod tests {
 	#[test]
 	fn test_large_values() {
 		let large_u256 = U256::MAX;
-		let output = MandateOutput {
-			oracle: [255u8; 32],
-			settler: [0u8; 32],
-			chain_id: large_u256,
-			token: [128u8; 32],
-			amount: large_u256,
-			recipient: [64u8; 32],
-			call: vec![0; 1000],     // Large call data
-			context: vec![255; 500], // Large context
-		};
+		let output = MandateOutputBuilder::new()
+			.oracle([255u8; 32])
+			.settler([0u8; 32])
+			.chain_id(large_u256)
+			.token([128u8; 32])
+			.amount(large_u256)
+			.recipient([64u8; 32])
+			.call(vec![0; 1000])     // Large call data
+			.context(vec![255; 500]) // Large context
+			.build();
 
 		// Test serialization/deserialization with large values
 		let json = serde_json::to_string(&output).unwrap();

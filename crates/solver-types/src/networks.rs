@@ -165,6 +165,9 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::utils::builders::{
+		NetworkConfigBuilder, NetworksConfigBuilder, RpcEndpointBuilder, TokenConfigBuilder,
+	};
 	use crate::Address; // Use the custom Address type
 	use serde_json;
 
@@ -176,37 +179,45 @@ mod tests {
 
 	#[test]
 	fn test_rpc_endpoint_creation() {
-		// Test HTTP only
-		let http_endpoint = RpcEndpoint::http_only("https://eth.llamarpc.com".to_string());
+		// Test HTTP only using builder
+		let http_endpoint = RpcEndpointBuilder::new()
+			.http("https://eth.llamarpc.com")
+			.build();
 		assert_eq!(
 			http_endpoint.http,
 			Some("https://eth.llamarpc.com".to_string())
 		);
 		assert_eq!(http_endpoint.ws, None);
 
-		// Test WebSocket only
-		let ws_endpoint = RpcEndpoint::ws_only("wss://eth.llamarpc.com".to_string());
+		// Test WebSocket only using builder
+		let ws_endpoint = RpcEndpointBuilder::new()
+			.ws("wss://eth.llamarpc.com")
+			.build();
 		assert_eq!(ws_endpoint.http, None);
 		assert_eq!(ws_endpoint.ws, Some("wss://eth.llamarpc.com".to_string()));
 
-		// Test both HTTP and WebSocket
-		let both_endpoint = RpcEndpoint::both(
-			"https://eth.llamarpc.com".to_string(),
-			"wss://eth.llamarpc.com".to_string(),
-		);
+		// Test both HTTP and WebSocket using builder
+		let both_endpoint = RpcEndpointBuilder::new()
+			.http("https://eth.llamarpc.com")
+			.ws("wss://eth.llamarpc.com")
+			.build();
 		assert_eq!(
 			both_endpoint.http,
 			Some("https://eth.llamarpc.com".to_string())
 		);
 		assert_eq!(both_endpoint.ws, Some("wss://eth.llamarpc.com".to_string()));
+
+		// Test original static methods still work
+		let static_endpoint = RpcEndpoint::http_only("https://eth.llamarpc.com".to_string());
+		assert_eq!(static_endpoint.http, http_endpoint.http);
 	}
 
 	#[test]
 	fn test_rpc_endpoint_serialization() {
-		let endpoint = RpcEndpoint {
-			http: Some("https://mainnet.infura.io".to_string()),
-			ws: Some("wss://mainnet.infura.io".to_string()),
-		};
+		let endpoint = RpcEndpointBuilder::new()
+			.http("https://mainnet.infura.io")
+			.ws("wss://mainnet.infura.io")
+			.build();
 
 		let json = serde_json::to_string(&endpoint).unwrap();
 		assert!(json.contains("\"http\":\"https://mainnet.infura.io\""));
@@ -219,21 +230,19 @@ mod tests {
 
 	#[test]
 	fn test_rpc_endpoint_optional_fields() {
-		// Test with only HTTP
-		let http_only = RpcEndpoint {
-			http: Some("https://eth.llamarpc.com".to_string()),
-			ws: None,
-		};
+		// Test with only HTTP using builder
+		let http_only = RpcEndpointBuilder::new()
+			.http("https://eth.llamarpc.com")
+			.build();
 
 		let json = serde_json::to_string(&http_only).unwrap();
 		assert!(json.contains("\"http\""));
 		assert!(!json.contains("\"ws\""));
 
-		// Test with only WebSocket
-		let ws_only = RpcEndpoint {
-			http: None,
-			ws: Some("wss://eth.llamarpc.com".to_string()),
-		};
+		// Test with only WebSocket using builder
+		let ws_only = RpcEndpointBuilder::new()
+			.ws("wss://eth.llamarpc.com")
+			.build();
 
 		let json = serde_json::to_string(&ws_only).unwrap();
 		assert!(!json.contains("\"http\""));
@@ -242,11 +251,12 @@ mod tests {
 
 	#[test]
 	fn test_token_config_creation() {
-		let token = TokenConfig {
-			address: addr("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B"),
-			symbol: "USDC".to_string(),
-			decimals: 6,
-		};
+		let token = TokenConfigBuilder::new()
+			.address_hex("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B")
+			.unwrap()
+			.symbol("USDC")
+			.decimals(6)
+			.build();
 
 		assert_eq!(
 			token.address,
@@ -258,11 +268,12 @@ mod tests {
 
 	#[test]
 	fn test_token_config_serialization() {
-		let token = TokenConfig {
-			address: addr("6B175474E89094C44Da98b954EedeAC495271d0F"),
-			symbol: "DAI".to_string(),
-			decimals: 18,
-		};
+		let token = TokenConfigBuilder::new()
+			.address_hex("6B175474E89094C44Da98b954EedeAC495271d0F")
+			.unwrap()
+			.symbol("DAI")
+			.decimals(18)
+			.build();
 
 		let json = serde_json::to_string(&token).unwrap();
 		assert!(json.contains("\"symbol\":\"DAI\""));
@@ -276,23 +287,26 @@ mod tests {
 
 	#[test]
 	fn test_token_config_equality() {
-		let token1 = TokenConfig {
-			address: addr("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B"),
-			symbol: "USDC".to_string(),
-			decimals: 6,
-		};
+		let token1 = TokenConfigBuilder::new()
+			.address_hex("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B")
+			.unwrap()
+			.symbol("USDC")
+			.decimals(6)
+			.build();
 
-		let token2 = TokenConfig {
-			address: addr("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B"),
-			symbol: "USDC".to_string(),
-			decimals: 6,
-		};
+		let token2 = TokenConfigBuilder::new()
+			.address_hex("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B")
+			.unwrap()
+			.symbol("USDC")
+			.decimals(6)
+			.build();
 
-		let token3 = TokenConfig {
-			address: addr("6B175474E89094C44Da98b954EedeAC495271d0F"),
-			symbol: "DAI".to_string(),
-			decimals: 18,
-		};
+		let token3 = TokenConfigBuilder::new()
+			.address_hex("6B175474E89094C44Da98b954EedeAC495271d0F")
+			.unwrap()
+			.symbol("DAI")
+			.decimals(18)
+			.build();
 
 		assert_eq!(token1, token2);
 		assert_ne!(token1, token3);
@@ -300,27 +314,28 @@ mod tests {
 
 	#[test]
 	fn test_network_config_url_methods() {
-		let network = NetworkConfig {
-			rpc_urls: vec![
-				RpcEndpoint {
-					http: Some("https://mainnet.infura.io".to_string()),
-					ws: Some("wss://mainnet.infura.io".to_string()),
-				},
-				RpcEndpoint {
-					http: Some("https://eth.llamarpc.com".to_string()),
-					ws: None,
-				},
-				RpcEndpoint {
-					http: None,
-					ws: Some("wss://eth.llamarpc.com".to_string()),
-				},
-			],
-			input_settler_address: addr("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9"),
-			output_settler_address: addr("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
-			tokens: vec![],
-			input_settler_compact_address: None,
-			the_compact_address: None,
-		};
+		let network = NetworkConfigBuilder::new()
+			.add_rpc_endpoint(
+				RpcEndpointBuilder::new()
+					.http("https://mainnet.infura.io")
+					.ws("wss://mainnet.infura.io")
+					.build(),
+			)
+			.add_rpc_endpoint(
+				RpcEndpointBuilder::new()
+					.http("https://eth.llamarpc.com")
+					.build(),
+			)
+			.add_rpc_endpoint(
+				RpcEndpointBuilder::new()
+					.ws("wss://eth.llamarpc.com")
+					.build(),
+			)
+			.input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
+			.unwrap()
+			.output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
+			.unwrap()
+			.build();
 
 		// Test get_http_url (should return first available)
 		assert_eq!(network.get_http_url(), Some("https://mainnet.infura.io"));
@@ -343,6 +358,29 @@ mod tests {
 
 	#[test]
 	fn test_network_config_no_urls() {
+		// This test demonstrates builder validation - it should panic
+		// when trying to build a network with no RPC URLs
+		let result = std::panic::catch_unwind(|| {
+			NetworkConfigBuilder::new()
+				.input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
+				.unwrap()
+				.output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
+				.unwrap()
+				.build()
+		});
+		assert!(result.is_err());
+
+		// Test the try_build method for proper error handling
+		let result = NetworkConfigBuilder::new()
+			.input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
+			.unwrap()
+			.output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
+			.unwrap()
+			.try_build();
+		assert!(result.is_err());
+
+		// For testing the URL methods, we need to create a network with empty rpc_urls
+		// using the original struct constructor
 		let network = NetworkConfig {
 			rpc_urls: vec![],
 			input_settler_address: addr("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9"),
@@ -360,16 +398,21 @@ mod tests {
 
 	#[test]
 	fn test_network_config_with_optional_fields() {
-		let network = NetworkConfig {
-			rpc_urls: vec![RpcEndpoint::http_only(
-				"https://eth.llamarpc.com".to_string(),
-			)],
-			input_settler_address: addr("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9"),
-			output_settler_address: addr("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
-			tokens: vec![],
-			input_settler_compact_address: Some(addr("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")),
-			the_compact_address: Some(addr("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B")),
-		};
+		let network = NetworkConfigBuilder::new()
+			.add_rpc_endpoint(
+				RpcEndpointBuilder::new()
+					.http("https://eth.llamarpc.com")
+					.build(),
+			)
+			.input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
+			.unwrap()
+			.output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
+			.unwrap()
+			.input_settler_compact_address_hex("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
+			.unwrap()
+			.the_compact_address_hex("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B")
+			.unwrap()
+			.build();
 
 		assert!(network.input_settler_compact_address.is_some());
 		assert!(network.the_compact_address.is_some());
@@ -447,21 +490,26 @@ mod tests {
 
 	#[test]
 	fn test_network_config_serialization() {
-		let network = NetworkConfig {
-			rpc_urls: vec![RpcEndpoint {
-				http: Some("https://mainnet.infura.io".to_string()),
-				ws: Some("wss://mainnet.infura.io".to_string()),
-			}],
-			input_settler_address: addr("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9"),
-			output_settler_address: addr("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
-			tokens: vec![TokenConfig {
-				address: addr("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B"),
-				symbol: "USDC".to_string(),
-				decimals: 6,
-			}],
-			input_settler_compact_address: None,
-			the_compact_address: None,
-		};
+		let network = NetworkConfigBuilder::new()
+			.add_rpc_endpoint(
+				RpcEndpointBuilder::new()
+					.http("https://mainnet.infura.io")
+					.ws("wss://mainnet.infura.io")
+					.build(),
+			)
+			.input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
+			.unwrap()
+			.output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
+			.unwrap()
+			.add_token(
+				TokenConfigBuilder::new()
+					.address_hex("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B")
+					.unwrap()
+					.symbol("USDC")
+					.decimals(6)
+					.build(),
+			)
+			.build();
 
 		let json = serde_json::to_string(&network).unwrap();
 		let deserialized: NetworkConfig = serde_json::from_str(&json).unwrap();
@@ -481,56 +529,57 @@ mod tests {
 
 	#[test]
 	fn test_debug_implementations() {
-		let endpoint = RpcEndpoint::http_only("https://test.com".to_string());
+		let endpoint = RpcEndpointBuilder::new().http("https://test.com").build();
 		let debug_str = format!("{:?}", endpoint);
 		assert!(debug_str.contains("RpcEndpoint"));
 		assert!(debug_str.contains("https://test.com"));
 
-		let token = TokenConfig {
-			address: addr("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B"),
-			symbol: "TEST".to_string(),
-			decimals: 18,
-		};
+		let token = TokenConfigBuilder::new()
+			.address_hex("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B")
+			.unwrap()
+			.symbol("TEST")
+			.decimals(18)
+			.build();
 		let debug_str = format!("{:?}", token);
 		assert!(debug_str.contains("TokenConfig"));
 		assert!(debug_str.contains("TEST"));
 		assert!(debug_str.contains("18"));
 
-		let network = NetworkConfig {
-			rpc_urls: vec![],
-			input_settler_address: addr("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9"),
-			output_settler_address: addr("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
-			tokens: vec![],
-			input_settler_compact_address: None,
-			the_compact_address: None,
-		};
+		let network = NetworkConfigBuilder::new()
+			.add_rpc_endpoint(RpcEndpointBuilder::new().http("https://test.com").build())
+			.input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
+			.unwrap()
+			.output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
+			.unwrap()
+			.build();
 		let debug_str = format!("{:?}", network);
 		assert!(debug_str.contains("NetworkConfig"));
 	}
 
 	#[test]
 	fn test_clone_implementations() {
-		let endpoint = RpcEndpoint::http_only("https://test.com".to_string());
+		let endpoint = RpcEndpointBuilder::new().http("https://test.com").build();
 		let cloned = endpoint.clone();
 		assert_eq!(cloned.http, endpoint.http);
 		assert_eq!(cloned.ws, endpoint.ws);
 
-		let token = TokenConfig {
-			address: addr("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B"),
-			symbol: "TEST".to_string(),
-			decimals: 18,
-		};
+		let token = TokenConfigBuilder::new()
+			.address_hex("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B")
+			.unwrap()
+			.symbol("TEST")
+			.decimals(18)
+			.build();
 		let cloned = token.clone();
 		assert_eq!(cloned, token);
 
-		let network = NetworkConfig {
-			rpc_urls: vec![endpoint],
-			input_settler_address: addr("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9"),
-			output_settler_address: addr("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
-			tokens: vec![token],
-			input_settler_compact_address: None,
-			the_compact_address: None,
-		};
+		let network = NetworkConfigBuilder::new()
+			.add_rpc_endpoint(endpoint)
+			.input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
+			.unwrap()
+			.output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
+			.unwrap()
+			.add_token(token)
+			.build();
 		let cloned = network.clone();
 		assert_eq!(cloned.rpc_urls.len(), network.rpc_urls.len());
 		assert_eq!(cloned.tokens.len(), network.tokens.len());

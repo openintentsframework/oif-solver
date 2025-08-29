@@ -152,8 +152,19 @@ impl From<Transaction> for TransactionRequest {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::utils::{builders::TransactionBuilder, conversion::parse_address};
 	use alloy_primitives::{address, U256};
 	use serde_json;
+
+	// Helper function to create a test address from hex string
+	fn test_address(hex: &str) -> Address {
+		parse_address(hex).expect("Invalid test address")
+	}
+
+	// Helper function to create a test address from bytes
+	fn test_address_bytes(bytes: &[u8]) -> Address {
+		Address(bytes.to_vec())
+	}
 
 	#[test]
 	fn test_address_creation() {
@@ -167,22 +178,14 @@ mod tests {
 
 	#[test]
 	fn test_address_display() {
-		let addr_bytes = vec![
-			0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x77, 0x6F, 0xb7, 0x8B, 0x3e, 0x1E, 0x6B, 0x2D, 0x0d,
-			0x2E, 0x8F, 0x0C, 0x1D, 0x2A, 0x3B,
-		];
-		let address = Address(addr_bytes);
+		let address = test_address("0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b");
 		let display_str = format!("{}", address);
 		assert_eq!(display_str, "0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b");
 	}
 
 	#[test]
 	fn test_address_serialization() {
-		let addr_bytes = vec![
-			0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x77, 0x6F, 0xb7, 0x8B, 0x3e, 0x1E, 0x6B, 0x2D, 0x0d,
-			0x2E, 0x8F, 0x0C, 0x1D, 0x2A, 0x3B,
-		];
-		let address = Address(addr_bytes);
+		let address = test_address("0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b");
 
 		let json = serde_json::to_string(&address).unwrap();
 		assert_eq!(json, "\"0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b\"");
@@ -194,16 +197,13 @@ mod tests {
 		let json = "\"0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b\"";
 		let address: Address = serde_json::from_str(json).unwrap();
 
-		let expected_bytes = vec![
-			0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x77, 0x6F, 0xb7, 0x8B, 0x3e, 0x1E, 0x6B, 0x2D, 0x0d,
-			0x2E, 0x8F, 0x0C, 0x1D, 0x2A, 0x3B,
-		];
-		assert_eq!(address.0, expected_bytes);
+		let expected = test_address("0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b");
+		assert_eq!(address, expected);
 
 		// Test without 0x prefix
 		let json_no_prefix = "\"a0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b\"";
 		let address_no_prefix: Address = serde_json::from_str(json_no_prefix).unwrap();
-		assert_eq!(address_no_prefix.0, expected_bytes);
+		assert_eq!(address_no_prefix, expected);
 	}
 
 	#[test]
@@ -240,11 +240,7 @@ mod tests {
 
 	#[test]
 	fn test_address_round_trip_serialization() {
-		let addr_bytes = vec![
-			0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
-			0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
-		];
-		let original = Address(addr_bytes);
+		let original = test_address("0x123456789abcdef0112233445566778899aabbcc");
 
 		let json = serde_json::to_string(&original).unwrap();
 		let deserialized: Address = serde_json::from_str(&json).unwrap();
@@ -256,9 +252,9 @@ mod tests {
 	fn test_address_equality_and_hash() {
 		use std::collections::HashSet;
 
-		let addr1 = Address(vec![1; 20]);
-		let addr2 = Address(vec![1; 20]);
-		let addr3 = Address(vec![2; 20]);
+		let addr1 = test_address_bytes(&[1; 20]);
+		let addr2 = test_address_bytes(&[1; 20]);
+		let addr3 = test_address_bytes(&[2; 20]);
 
 		assert_eq!(addr1, addr2);
 		assert_ne!(addr1, addr3);
@@ -326,24 +322,61 @@ mod tests {
 	}
 
 	#[test]
-	fn test_transaction_creation() {
-		let tx = Transaction {
-			to: Some(Address(vec![1u8; 20])),
-			data: vec![0x12, 0x34],
-			value: U256::from(1000),
-			chain_id: 1,
-			nonce: Some(42),
-			gas_limit: Some(21000),
-			gas_price: Some(20_000_000_000),
-			max_fee_per_gas: None,
-			max_priority_fee_per_gas: None,
-		};
+	fn test_transaction_creation_with_builder() {
+		let tx = TransactionBuilder::new()
+			.to(test_address("0x1111111111111111111111111111111111111111"))
+			.data(vec![0x12, 0x34])
+			.value_u64(1000)
+			.chain_id(1)
+			.nonce(42)
+			.gas_limit(21000)
+			.gas_price_gwei(20)
+			.build();
 
 		assert!(tx.to.is_some());
 		assert_eq!(tx.data, vec![0x12, 0x34]);
 		assert_eq!(tx.value, U256::from(1000));
 		assert_eq!(tx.chain_id, 1);
 		assert_eq!(tx.nonce, Some(42));
+		assert_eq!(tx.gas_limit, Some(21000));
+		assert_eq!(tx.gas_price, Some(20_000_000_000));
+	}
+
+	#[test]
+	fn test_transaction_creation_eip1559_with_builder() {
+		let tx = TransactionBuilder::new()
+			.to_hex("0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b")
+			.unwrap()
+			.value_u64(500)
+			.chain_id(137)
+			.nonce(10)
+			.gas_limit(50000)
+			.eip1559(25, 2) // max_fee_gwei, priority_fee_gwei
+			.build();
+
+		assert!(tx.to.is_some());
+		assert_eq!(tx.value, U256::from(500));
+		assert_eq!(tx.chain_id, 137);
+		assert_eq!(tx.nonce, Some(10));
+		assert_eq!(tx.gas_limit, Some(50000));
+		assert_eq!(tx.max_fee_per_gas, Some(25_000_000_000));
+		assert_eq!(tx.max_priority_fee_per_gas, Some(2_000_000_000));
+		assert!(tx.gas_price.is_none()); // Should be None for EIP-1559
+	}
+
+	#[test]
+	fn test_transaction_creation_minimal_with_builder() {
+		let tx = TransactionBuilder::new()
+			.chain_id(1)
+			.gas_price_gwei(20)
+			.build();
+
+		assert!(tx.to.is_none());
+		assert_eq!(tx.value, U256::ZERO);
+		assert_eq!(tx.chain_id, 1);
+		assert!(tx.data.is_empty());
+		assert!(tx.nonce.is_none());
+		assert_eq!(tx.gas_price, Some(20_000_000_000));
 	}
 
 	#[test]
@@ -394,23 +427,20 @@ mod tests {
 	}
 
 	#[test]
-	fn test_transaction_to_alloy_request() {
-		let addr_bytes = vec![
-			0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x77, 0x6F, 0xb7, 0x8B, 0x3e, 0x1E, 0x6B, 0x2D, 0x0d,
-			0x2E, 0x8F, 0x0C, 0x1D, 0x2A, 0x3B,
-		];
-
-		let tx = Transaction {
-			to: Some(Address(addr_bytes)),
-			data: vec![0xff, 0xee],
-			value: U256::from(750),
-			chain_id: 42,
-			nonce: Some(15),
-			gas_limit: Some(30000),
-			gas_price: Some(30_000_000_000),
-			max_fee_per_gas: Some(40_000_000_000),
-			max_priority_fee_per_gas: Some(2_000_000_000),
-		};
+	fn test_transaction_to_alloy_request_with_builder() {
+		let tx = TransactionBuilder::new()
+			.to_hex("0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b")
+			.unwrap()
+			.data_hex("0xffee")
+			.unwrap()
+			.value_u64(750)
+			.chain_id(42)
+			.nonce(15)
+			.gas_limit(30000)
+			.gas_price_gwei(30)
+			.max_fee_per_gas_gwei(40)
+			.max_priority_fee_per_gas_gwei(2)
+			.build();
 
 		let req: TransactionRequest = tx.into();
 
@@ -427,17 +457,10 @@ mod tests {
 
 	#[test]
 	fn test_transaction_to_alloy_request_no_to() {
-		let tx = Transaction {
-			to: None,
-			data: vec![],
-			value: U256::ZERO,
-			chain_id: 1,
-			nonce: None,
-			gas_limit: None,
-			gas_price: None,
-			max_fee_per_gas: None,
-			max_priority_fee_per_gas: None,
-		};
+		let tx = TransactionBuilder::new()
+			.chain_id(1)
+			.gas_price_gwei(20)
+			.build();
 
 		let req: TransactionRequest = tx.into();
 
@@ -483,17 +506,10 @@ mod tests {
 
 	#[test]
 	fn test_transaction_debug() {
-		let tx = Transaction {
-			to: None,
-			data: vec![],
-			value: U256::ZERO,
-			chain_id: 1,
-			nonce: None,
-			gas_limit: None,
-			gas_price: None,
-			max_fee_per_gas: None,
-			max_priority_fee_per_gas: None,
-		};
+		let tx = TransactionBuilder::new()
+			.chain_id(1)
+			.gas_price_gwei(20)
+			.build();
 
 		let debug_str = format!("{:?}", tx);
 		assert!(debug_str.contains("Transaction"));
@@ -502,17 +518,15 @@ mod tests {
 
 	#[test]
 	fn test_transaction_clone() {
-		let original = Transaction {
-			to: Some(Address(vec![1u8; 20])),
-			data: vec![0x11, 0x22],
-			value: U256::from(500),
-			chain_id: 10,
-			nonce: Some(5),
-			gas_limit: Some(25000),
-			gas_price: Some(20_000_000_000),
-			max_fee_per_gas: None,
-			max_priority_fee_per_gas: None,
-		};
+		let original = TransactionBuilder::new()
+			.to(test_address_bytes(&[1u8; 20]))
+			.data(vec![0x11, 0x22])
+			.value_u64(500)
+			.chain_id(10)
+			.nonce(5)
+			.gas_limit(25000)
+			.gas_price_gwei(20)
+			.build();
 
 		let cloned = original.clone();
 
