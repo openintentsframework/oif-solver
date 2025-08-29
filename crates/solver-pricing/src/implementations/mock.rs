@@ -3,7 +3,8 @@
 //! This implementation provides fixed asset prices for development purposes.
 //! Supports ETH/USD, ETH/SOL, SOL/USD pairs as requested.
 
-use alloy_primitives::U256;
+use alloy_primitives::utils::parse_ether;
+use solver_types::utils::conversion::wei_string_to_eth_string;
 use async_trait::async_trait;
 use solver_types::{
 	AssetPrice, ConfigSchema, ImplementationRegistry, PricingError, PricingFactory,
@@ -156,12 +157,13 @@ impl PricingInterface for MockPricing {
 		wei_amount: &str,
 		currency: &str,
 	) -> Result<String, PricingError> {
-		let wei = U256::from_str_radix(wei_amount, 10)
-			.map_err(|e| PricingError::InvalidData(format!("Invalid wei amount: {}", e)))?;
-
-		// Convert wei to ETH (1 ETH = 10^18 wei)
-		let eth_decimals = U256::from(10_u64.pow(18));
-		let eth_amount_f64 = wei.as_limbs()[0] as f64 / (eth_decimals.as_limbs()[0] as f64);
+		// Convert wei to ETH using utility function
+		let eth_amount_str = wei_string_to_eth_string(wei_amount)
+			.map_err(|e| PricingError::InvalidData(e))?;
+		
+		let eth_amount_f64 = eth_amount_str
+			.parse::<f64>()
+			.map_err(|e| PricingError::InvalidData(format!("Invalid ETH amount: {}", e)))?;
 
 		// Convert ETH to target currency
 		let eth_pair = TradingPair::new("ETH", currency);
@@ -198,11 +200,13 @@ impl PricingInterface for MockPricing {
 				));
 			}
 
-			// Convert currency to ETH, then to wei
+			// Convert currency to ETH, then to wei using Alloy's parse_ether helper
 			let eth_amount = currency_amount_f64 / eth_price_f64;
-			let wei_amount = eth_amount * 10_f64.powi(18);
+			let eth_amount_str = format!("{:.18}", eth_amount); // Use high precision for ETH
+			let wei_amount = parse_ether(&eth_amount_str)
+				.map_err(|e| PricingError::InvalidData(format!("Failed to convert ETH to wei: {}", e)))?;
 
-			Ok(format!("{:.0}", wei_amount))
+			Ok(wei_amount.to_string())
 		} else {
 			Err(PricingError::PriceNotAvailable(format!("ETH/{}", currency)))
 		}
@@ -214,16 +218,6 @@ pub struct MockPricingSchema;
 
 impl ConfigSchema for MockPricingSchema {
 	fn validate(&self, config: &toml::Value) -> Result<(), ValidationError> {
-		// Optional eth_price_usd field validation (legacy)
-		if let Some(price_value) = config.get("eth_price_usd") {
-			if price_value.as_str().is_none() {
-				return Err(ValidationError::TypeMismatch {
-					field: "eth_price_usd".to_string(),
-					expected: "string".to_string(),
-					actual: format!("{:?}", price_value),
-				});
-			}
-		}
 
 		// Optional pair_prices validation
 		if let Some(pair_prices) = config.get("pair_prices") {

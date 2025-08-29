@@ -2,8 +2,7 @@
 
 include = [
     "demo/networks.toml",
-    "demo/api.toml",
-    "demo/gas.toml"
+    "demo/api.toml"
 ]
 
 [solver]
