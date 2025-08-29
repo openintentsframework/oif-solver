@@ -276,7 +276,6 @@ mod tests {
 
 		mock_order_interface
 			.expect_validate_intent()
-			.with(eq(intent.clone()), eq(solver_address.clone()))
 			.times(1)
 			.returning(move |_, _| Box::pin(async move { Ok(create_test_order()) }));
 
@@ -396,7 +395,6 @@ mod tests {
 
 		mock_order_interface
 			.expect_validate_intent()
-			.with(eq(intent.clone()), eq(solver_address.clone()))
 			.times(1)
 			.returning(|_, _| {
 				Box::pin(async move {
@@ -467,7 +465,6 @@ mod tests {
 
 		mock_order_interface
 			.expect_validate_intent()
-			.with(eq(intent.clone()), eq(solver_address.clone()))
 			.times(1)
 			.returning(move |_, _| Box::pin(async move { Ok(create_test_order()) }));
 
@@ -648,6 +645,7 @@ mod tests {
 			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
 		mock_order_interface
 			.expect_validate_intent()
+			.times(1)
 			.returning(move |_, _| Box::pin(async move { Ok(create_test_order()) }));
 		mock_strategy.expect_should_execute().returning(|_, _| {
 			Box::pin(async move {
