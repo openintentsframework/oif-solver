@@ -1085,6 +1085,8 @@ mod tests {
 			fill_tx_hash: None,
 			claim_tx_hash: None,
 			fill_proof: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
 		};
 		let params = ExecutionParams {
 			gas_price: U256::ZERO,
@@ -1126,6 +1128,8 @@ mod tests {
 			fill_tx_hash: None,
 			claim_tx_hash: None,
 			fill_proof: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
 		};
 		let params = ExecutionParams {
 			gas_price: U256::ZERO,
@@ -1166,6 +1170,8 @@ mod tests {
 			fill_tx_hash: None,
 			claim_tx_hash: None,
 			fill_proof: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
 		};
 		let params = ExecutionParams {
 			gas_price: U256::ZERO,
@@ -1204,6 +1210,8 @@ mod tests {
 			fill_tx_hash: None,
 			claim_tx_hash: None,
 			fill_proof: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
 		};
 
 		let fill_proof = FillProof {
@@ -1251,6 +1259,8 @@ mod tests {
 			fill_tx_hash: None,
 			claim_tx_hash: None,
 			fill_proof: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
 		};
 
 		let fill_proof = FillProof {
@@ -1334,6 +1344,8 @@ mod tests {
 			fill_tx_hash: None,
 			claim_tx_hash: None,
 			fill_proof: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
 		};
 		let params = ExecutionParams {
 			gas_price: U256::ZERO,

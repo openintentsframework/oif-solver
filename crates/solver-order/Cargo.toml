@@ -20,4 +20,4 @@ uuid = { version = "1.8", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
-tokio = "1.0"
+tokio = { workspace = true }
