@@ -1,7 +1,7 @@
 use alloy_primitives::U256;
 use solver_config::Config;
 use solver_core::SolverEngine;
-use solver_pricing::{PricingConfig, PricingService};
+use solver_pricing::PricingService;
 use solver_types::{
 	costs::{CostComponent, QuoteCost},
 	Quote, QuoteError, QuoteOrder, SignatureType, TradingPair,
@@ -15,36 +15,6 @@ pub struct CostEngine;
 impl CostEngine {
 	pub fn new() -> Self {
 		Self
-	}
-
-	/// Converts asset value from one currency to another using pricing service.
-	pub async fn convert_asset_value(
-		&self,
-		from_asset: &str,
-		to_asset: &str,
-		amount: &str,
-		pricing_service: &PricingService,
-	) -> Result<String, QuoteError> {
-		pricing_service
-			.convert_asset(from_asset, to_asset, amount)
-			.await
-			.map_err(|e| QuoteError::Internal(format!("Asset conversion failed: {}", e)))
-	}
-
-	/// Gets the exchange rate between two assets.
-	pub async fn get_exchange_rate(
-		&self,
-		from_asset: &str,
-		to_asset: &str,
-		pricing_service: &PricingService,
-	) -> Result<String, QuoteError> {
-		let pair = TradingPair::new(from_asset, to_asset);
-		let price_result = pricing_service
-			.get_pair_price(&pair)
-			.await
-			.map_err(|e| QuoteError::Internal(format!("Failed to get exchange rate: {}", e)))?;
-
-		Ok(price_result.price)
 	}
 
 	/// Validates that the pricing service supports the required pairs for cross-chain operations.

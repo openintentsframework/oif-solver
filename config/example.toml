@@ -110,6 +110,17 @@ primary = "simple"
 max_gas_price_gwei = 100
 
 # ============================================================================
+# PRICING
+# ============================================================================
+[pricing]
+primary = "mock"
+
+[pricing.implementations.mock]
+# Uses default ETH/USD price of $4615.16
+# You can override prices like this:
+# pair_prices = { "ETH/USD" = "3000.00", "SOL/USD" = "200.00" }
+
+# ============================================================================
 # SETTLEMENT
 # ============================================================================
 [settlement]

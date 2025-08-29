@@ -3485,6 +3485,7 @@ dependencies = [
  "solver-delivery",
  "solver-discovery",
  "solver-order",
+ "solver-pricing",
  "solver-settlement",
  "solver-storage",
  "solver-types",

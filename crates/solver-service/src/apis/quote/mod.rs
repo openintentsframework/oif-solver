@@ -76,11 +76,9 @@ pub use validation::QuoteValidator;
 
 use solver_config::Config;
 use solver_core::SolverEngine;
-use solver_pricing::PricingService;
 use solver_types::{GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, StorageKey};
 
 use std::time::Duration;
-use toml;
 use tracing::info;
 
 /// Processes a quote request and returns available quote options.
@@ -119,16 +117,11 @@ pub async fn process_quote_request(
 
 	// 5. Enrich quotes with a preliminary cost breakdown
 	let cost_engine = cost::CostEngine::new();
-	// TODO: This should be properly injected or configured
-	let mock_pricing = solver_pricing::implementations::mock::create_mock_pricing(
-		&toml::Value::Table(toml::Table::new()),
-	)
-	.map_err(|e| QuoteError::Internal(format!("Failed to create pricing service: {}", e)))?;
-	let pricing_service = PricingService::new(mock_pricing);
+	let pricing_service = solver.pricing();
 
 	for quote in &mut quotes {
 		if let Ok(cost) = cost_engine
-			.estimate_cost(quote, solver, config, &pricing_service)
+			.estimate_cost(quote, solver, config, pricing_service)
 			.await
 		{
 			quote.cost = Some(cost);
