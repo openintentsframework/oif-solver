@@ -15,3 +15,6 @@ hex = "0.4"
 solver-types = { path = "../solver-types" }
 thiserror = "1.0"
 toml = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
