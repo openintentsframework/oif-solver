@@ -220,7 +220,6 @@ mod tests {
 	fn test_rpc_endpoint_optional_fields() {
 		// Test with only HTTP using builder
 		let http_only = RpcEndpointBuilder::new().ws(None).build();
-		println!("{:?}", http_only);
 
 		let json = serde_json::to_string(&http_only).unwrap();
 		assert!(json.contains("\"http\""));
