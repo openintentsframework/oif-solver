@@ -24,5 +24,5 @@ toml = { workspace = true }
 tokio = { version = "1.0", features = ["rt-multi-thread"] }
 alloy-signer = "0.8"
 alloy-signer-local = "0.8"
-alloy-transport = "0.8"
+alloy-transport = "0.15"
 alloy-transport-http = "0.8"

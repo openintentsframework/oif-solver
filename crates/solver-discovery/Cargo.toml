@@ -21,7 +21,7 @@ thiserror = "1.0"
 tokio = { version = "1.0", features = ["sync", "rt-multi-thread"] }
 toml = { workspace = true }
 tracing = "0.1"
-alloy-transport = "0.8"
+alloy-transport = "0.15"
 alloy-transport-http = "0.8"
 alloy-transport-ws = "0.8"
 futures = "0.3"
