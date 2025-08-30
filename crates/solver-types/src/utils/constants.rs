@@ -14,3 +14,19 @@
 /// - Placeholder values in structured data
 /// - Default values for bytes32 fields
 pub const ZERO_BYTES32: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Default gas price in wei (1 gwei).
+///
+/// This is used as a fallback when gas price cannot be retrieved from the network
+/// or as a default value for gas estimation calculations.
+pub const DEFAULT_GAS_PRICE_WEI: u64 = 1_000_000_000;
+
+// Mock pricing constants
+/// Default ETH/USD price used in mock pricing implementation.
+pub const MOCK_ETH_USD_PRICE: &str = "4615.16";
+
+/// Default SOL/USD price used in mock pricing implementation.
+pub const MOCK_SOL_USD_PRICE: &str = "240.50";
+
+/// Default ETH/SOL price used in mock pricing implementation.
+pub const MOCK_ETH_SOL_PRICE: &str = "19.20";

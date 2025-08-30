@@ -62,7 +62,7 @@
 //! - `InsufficientLiquidity`: Solver lacks required tokens
 //! - `UnsupportedChain`: Chain not configured
 //! - `Internal`: System errors
-
+pub mod cost;
 pub mod custody;
 pub mod generation;
 pub mod registry;
@@ -113,7 +113,20 @@ pub async fn process_quote_request(
 	// 4. Generate quotes using the business logic layer
 	let settlement_service = solver.settlement();
 	let quote_generator = QuoteGenerator::new(settlement_service.clone());
-	let quotes = quote_generator.generate_quotes(&request, config).await?;
+	let mut quotes = quote_generator.generate_quotes(&request, config).await?;
+
+	// 5. Enrich quotes with a preliminary cost breakdown
+	let cost_engine = cost::CostEngine::new();
+	let pricing_service = solver.pricing();
+
+	for quote in &mut quotes {
+		if let Ok(cost) = cost_engine
+			.estimate_cost(quote, solver, config, pricing_service)
+			.await
+		{
+			quote.cost = Some(cost);
+		}
+	}
 
 	// 5. Persist quotes
 	let quote_ttl = Duration::from_secs(300);

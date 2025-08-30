@@ -1082,7 +1082,8 @@ generate_demo_config_from_deployment() {
 include = [
     "demo/networks.toml",
     "demo/api.toml",
-    "demo/cli.toml"
+    "demo/cli.toml",
+    "demo/gas.toml"
 ]
 
 [solver]
@@ -1149,6 +1150,15 @@ primary = "simple"
 
 [order.strategy.implementations.simple]
 max_gas_price_gwei = 100
+
+# ============================================================================
+# PRICING
+# ============================================================================
+[pricing]
+primary = "mock"
+
+[pricing.implementations.mock]
+# Uses default ETH/USD price of 4615.16
 
 # ============================================================================
 # SETTLEMENT
@@ -1263,11 +1273,29 @@ solver_address = "$SOLVER_ADDRESS"
 recipient_address = "$RECIPIENT_ADDR"
 EOF
     
+    # Create gas.toml
+    cat > "$CONFIG_DIR/demo/gas.toml" <<'EOF'
+[gas]
+
+[gas.flows.compact_resource_lock]
+# Gas units captured by scripts/e2e/estimate_gas_compact.sh on local anvil
+open = 0
+fill = 76068
+claim = 121995
+
+[gas.flows.permit2_escrow]
+# Gas units captured by scripts/e2e/estimate_gas_permit2_escrow.sh on local anvil
+open = 143116
+fill = 76068 
+claim = 59953
+EOF
+    
     print_success "Configuration files generated:"
     print_info "  - $CONFIG_DIR/demo.toml"
     print_info "  - $CONFIG_DIR/demo/networks.toml"
     print_info "  - $CONFIG_DIR/demo/api.toml"
     print_info "  - $CONFIG_DIR/demo/cli.toml"
+    print_info "  - $CONFIG_DIR/demo/gas.toml"
 }
 
 # Environment management functions for CLI

@@ -9,9 +9,10 @@ use solver_core::{SolverBuilder, SolverEngine, SolverFactories};
 use solver_delivery::{DeliveryError, DeliveryInterface};
 use solver_discovery::{DiscoveryError, DiscoveryInterface};
 use solver_order::{ExecutionStrategy, OrderError, OrderInterface, StrategyError};
+
 use solver_settlement::{SettlementError, SettlementInterface};
 use solver_storage::{StorageError, StorageInterface};
-use solver_types::NetworksConfig;
+use solver_types::{NetworksConfig, PricingError, PricingInterface};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -31,6 +32,7 @@ pub type OrderFactory = fn(
 	&NetworksConfig,
 	&solver_types::oracle::OracleRoutes,
 ) -> Result<Box<dyn OrderInterface>, OrderError>;
+pub type PricingFactory = fn(&toml::Value) -> Result<Box<dyn PricingInterface>, PricingError>;
 pub type SettlementFactory =
 	fn(&toml::Value, &NetworksConfig) -> Result<Box<dyn SettlementInterface>, SettlementError>;
 pub type StrategyFactory = fn(&toml::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError>;
@@ -42,6 +44,7 @@ pub struct FactoryRegistry {
 	pub delivery: HashMap<String, DeliveryFactory>,
 	pub discovery: HashMap<String, DiscoveryFactory>,
 	pub order: HashMap<String, OrderFactory>,
+	pub pricing: HashMap<String, PricingFactory>,
 	pub settlement: HashMap<String, SettlementFactory>,
 	pub strategy: HashMap<String, StrategyFactory>,
 }
@@ -55,6 +58,7 @@ impl FactoryRegistry {
 			delivery: HashMap::new(),
 			discovery: HashMap::new(),
 			order: HashMap::new(),
+			pricing: HashMap::new(),
 			settlement: HashMap::new(),
 			strategy: HashMap::new(),
 		}
@@ -88,6 +92,11 @@ impl FactoryRegistry {
 	/// Register a settlement implementation
 	pub fn register_settlement(&mut self, name: impl Into<String>, factory: SettlementFactory) {
 		self.settlement.insert(name.into(), factory);
+	}
+
+	/// Register a pricing implementation
+	pub fn register_pricing(&mut self, name: impl Into<String>, factory: PricingFactory) {
+		self.pricing.insert(name.into(), factory);
 	}
 
 	/// Register a strategy implementation
@@ -132,6 +141,12 @@ pub fn initialize_registry() -> &'static FactoryRegistry {
 		for (name, factory) in solver_order::get_all_order_implementations() {
 			tracing::debug!("Registering order implementation: {}", name);
 			registry.register_order(name, factory);
+		}
+
+		// Auto-register all pricing implementations
+		for (name, factory) in solver_pricing::get_all_implementations() {
+			tracing::debug!("Registering pricing implementation: {}", name);
+			registry.register_pricing(name, factory);
 		}
 
 		// Auto-register all settlement implementations
@@ -199,6 +214,11 @@ pub async fn build_solver_from_config(
 		"discovery"
 	);
 	let order_factories = build_factories!(registry, config.order.implementations, order, "order");
+	let pricing_factories = if let Some(pricing_config) = &config.pricing {
+		build_factories!(registry, pricing_config.implementations, pricing, "pricing")
+	} else {
+		HashMap::new()
+	};
 	let settlement_factories = build_factories!(
 		registry,
 		config.settlement.implementations,
@@ -220,6 +240,7 @@ pub async fn build_solver_from_config(
 		delivery_factories,
 		discovery_factories,
 		order_factories,
+		pricing_factories,
 		settlement_factories,
 		strategy_factories,
 	};
