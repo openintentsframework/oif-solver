@@ -2,7 +2,8 @@
 
 include = [
     "demo/networks.toml",
-    "demo/api.toml"
+    "demo/api.toml",
+    "demo/cli.toml"
 ]
 
 [solver]
@@ -32,7 +33,7 @@ ttl_order_by_tx_hash = 300        # 5 minutes
 primary = "local"
 
 [account.implementations.local]
-private_key = "${ETH_PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
+private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 
 # ============================================================================
 # DELIVERY
@@ -97,29 +98,3 @@ output = { 31337 = ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"], 31338 = ["0xD
 [settlement.implementations.direct.routes]
 31337 = [31338]  # Can go from origin to destination
 31338 = [31337]  # Can go from destination to origin
-
-
-# ============================================================================
-# DEMO SCRIPT CONFIGURATION
-# The following sections are used by demo scripts (send_onchain_intent.sh, etc.)
-# and are NOT required by the solver itself. The solver only needs the
-# configurations above.
-# ============================================================================
-
-# Contract addresses for testing (used by demo scripts)
-[contracts.origin]
-tokenA = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
-tokenB = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
-permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
-
-[contracts.destination]
-tokenA = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
-tokenB = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
-permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
-
-# Test accounts (used by demo scripts)
-[accounts]
-solver = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
-user = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
-user_private_key = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
-recipient = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"

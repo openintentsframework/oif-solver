@@ -28,6 +28,11 @@ out/
 cache/
 data/
 
+# Demo output
+.pids/
+.logs/
+demo-output/
+
 # Contracts
 oif-contracts/
 
