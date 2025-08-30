@@ -11,7 +11,6 @@ use solver_types::{
 	GetOrderResponse, InteropAddress, Order, OrderResponse, OrderStatus, Settlement,
 	SettlementType, TransactionType,
 };
-use tracing::info;
 
 /// Handles GET /orders/{id} requests.
 ///
@@ -21,8 +20,6 @@ pub async fn get_order_by_id(
 	Path(id): Path<String>,
 	_solver: &SolverEngine,
 ) -> Result<GetOrderResponse, GetOrderError> {
-	info!("Retrieving order with ID: {}", id);
-
 	let order = process_order_request(&id, _solver).await?;
 
 	Ok(GetOrderResponse { order })

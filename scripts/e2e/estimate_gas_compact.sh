@@ -51,9 +51,9 @@ dest_before_dec=$(cast to-dec "$dest_nonce_before")
 echo "  Origin: $origin_before_dec"
 echo "  Dest: $dest_before_dec"
 
-# Send compact intent
+# Send compact intent using oif-demo
 echo "📤 Sending Compact Resource Lock intent..."
-./scripts/demo/send_offchain_resource_lock_intent.sh > /dev/null 2>&1
+./oif-demo intent test compact permit2 A2B > /dev/null 2>&1
 
 echo "⏳ Waiting for transaction processing..."
 sleep 22

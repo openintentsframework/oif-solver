@@ -66,9 +66,9 @@ dest_before_dec=$(cast to-dec "$dest_nonce_before")
 echo "  Origin: $origin_before_dec"
 echo "  Dest: $dest_before_dec"
 
-# Send intent
+# Send intent using oif-demo
 echo "📤 Sending Permit2 intent..."
-./scripts/demo/send_offchain_intent.sh > /dev/null 2>&1
+./oif-demo intent test escrow permit2 A2B > /dev/null 2>&1
 
 echo "⏳ Waiting for transaction processing..."
 sleep 22  # Wait longer for complete processing
