@@ -442,14 +442,6 @@ impl NetworksConfigBuilder {
 		self
 	}
 
-	/// Validates the builder state and returns an error if no networks are configured.
-	pub fn validate(&self) -> Result<(), NetworksConfigBuilderError> {
-		if self.networks.is_empty() {
-			return Err(NetworksConfigBuilderError::NoNetworksConfigured);
-		}
-		Ok(())
-	}
-
 	/// Builds the `NetworksConfig` with the configured values.
 	///
 	/// # Panics
@@ -465,7 +457,6 @@ impl NetworksConfigBuilder {
 	///
 	/// Returns an error if no networks are configured.
 	pub fn try_build(self) -> Result<NetworksConfig, NetworksConfigBuilderError> {
-		self.validate()?;
 		Ok(self.networks)
 	}
 }
