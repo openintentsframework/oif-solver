@@ -462,6 +462,8 @@ cargo run --bin solver -- --config config/demo.toml
 ./oif-demo quote test escrow permit2 A2B   # Using Permit2 authorization
 # OR
 ./oif-demo quote test escrow eip3009 A2B   # Using EIP-3009 authorization
+# OR for onchain submission (direct to blockchain):
+./oif-demo intent test --onchain escrow A2B  # Submit directly to InputSettler
 
 # 4. Monitor balances in real-time
 ./oif-demo monitor 3 all
@@ -493,26 +495,58 @@ cargo run --bin solver -- --config config/demo.toml
 
 #### Intent Operations
 
+The demo supports two submission modes:
+- **Offchain**: Intents are submitted to the solver API (default)
+- **Onchain**: Intents are submitted directly to the blockchain via InputSettler.open()
+
+##### Offchain Intent Submission (via Solver API)
+
 ```bash
-# Build various types of intents
+# Build various types of intents for offchain submission
 # Format: intent build <lock_type> <auth_type> <origin_chain> <dest_chain> <from_token> <to_token>
 ./oif-demo intent build escrow permit2 31337 31338 TokenA TokenB   # Escrow with Permit2
 ./oif-demo intent build escrow eip3009 31337 31338 TokenA TokenB   # Escrow with EIP-3009
 ./oif-demo intent build compact permit2 31337 31338 TokenB TokenA  # Compact with Permit2 (EIP-3009 not supported)
+
+# Submit intent to solver API
+./oif-demo intent submit demo-output/post_intent.req.json
 
 # Test command - builds and submits in one step
 # Format: intent test <lock_type> <auth_type> <token_pair>
 ./oif-demo intent test escrow permit2 A2B   # Escrow lock with Permit2 auth
 ./oif-demo intent test escrow eip3009 A2B   # Escrow lock with EIP-3009 auth
 ./oif-demo intent test compact permit2 B2A  # Compact lock with Permit2 auth (EIP-3009 not supported)
+```
 
-# Token formats supported:
+##### Onchain Intent Submission (Direct to Blockchain)
+
+```bash
+# Build intent for onchain submission (no auth_type needed)
+# Format: intent build --onchain escrow <origin_chain> <dest_chain> <from_token> <to_token>
+./oif-demo intent build --onchain escrow 31337 31338 TokenA TokenB
+
+# Submit intent directly to blockchain
+./oif-demo intent submit --onchain demo-output/post_intent.req.json
+
+# Test command - builds and submits onchain in one step
+# Format: intent test --onchain escrow <token_pair>
+./oif-demo intent test --onchain escrow A2B   # Submit directly to InputSettler
+./oif-demo intent test --onchain escrow B2A   # TokenB → TokenA onchain
+
+# Note: Onchain submission:
+# - Only supports escrow intents (not compact/resource locks)
+# - Requires token approval before submission
+# - Submits directly to InputSettler.open() on the blockchain
+# - Does not require permit2/eip3009 signatures
+```
+
+##### Token Formats Supported
+
+```bash
+# Token formats:
 # - Symbol names: TokenA, TokenB
 # - Direct addresses: 0x5FbDB2315678afecb367f032d93F642f64180aa3
 # - Token pairs for test: A2A, A2B, B2A, B2B
-
-# Submit intent from file
-./oif-demo intent submit demo-output/post_intent.req.json
 ```
 
 #### Quote Operations

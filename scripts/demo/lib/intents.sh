@@ -551,6 +551,296 @@ create_compact_intent() {
     return 0
 }
 
+# Create onchain intent (direct blockchain submission)
+create_onchain_intent() {
+    local user_addr="$1"
+    local user_private_key="$2"
+    local origin_chain_id="$3"
+    local dest_chain_id="$4"
+    local input_token="$5"
+    local input_amount="$6"
+    local output_token="$7"
+    local output_amount="$8"
+    local recipient="$9"
+    local input_settler="${10}"
+    local output_settler="${11}"
+    local input_oracle="${12}"
+    
+    print_info "Creating onchain intent" >&2
+    print_debug "User: $user_addr" >&2
+    print_debug "Input: $input_amount tokens of $input_token on chain $origin_chain_id" >&2
+    print_debug "Output: $output_amount tokens of $output_token on chain $dest_chain_id" >&2
+    print_debug "Recipient: $recipient" >&2
+    
+    # Generate unique nonce
+    local nonce
+    if [ -n "${NONCE:-}" ]; then
+        nonce="$NONCE"
+        print_debug "Using provided NONCE: $nonce" >&2
+    else
+        nonce=$(generate_nonce)
+    fi
+    
+    # Calculate deadlines
+    local current_time=$(get_timestamp)
+    local expiry
+    local fill_deadline
+    
+    if [ -n "${EXPIRY:-}" ]; then
+        expiry="$EXPIRY"
+        print_debug "Using provided EXPIRY: $expiry" >&2
+    else
+        expiry=$((current_time + EXPIRY_OFFSET))
+    fi
+    
+    if [ -n "${FILL_DEADLINE:-}" ]; then
+        fill_deadline="$FILL_DEADLINE"
+        print_debug "Using provided FILL_DEADLINE: $fill_deadline" >&2
+    else
+        fill_deadline=$((current_time + FILL_DEADLINE_OFFSET))
+    fi
+    
+    print_debug "Nonce: $nonce" >&2
+    print_debug "Expiry: $expiry" >&2
+    print_debug "Fill deadline: $fill_deadline" >&2
+    
+    # Build input tokens array
+    local input_tokens=$(build_input_tokens "$input_token" "$input_amount")
+    
+    # Build outputs array
+    local zero_bytes32="0x0000000000000000000000000000000000000000000000000000000000000000"
+    local output_settler_bytes32="0x000000000000000000000000${output_settler#0x}"
+    local output_token_bytes32="0x000000000000000000000000${output_token#0x}"
+    local recipient_bytes32="0x000000000000000000000000${recipient#0x}"
+    
+    local outputs_array="[($zero_bytes32,$output_settler_bytes32,$dest_chain_id,$output_token_bytes32,$output_amount,$recipient_bytes32,0x,0x)]"
+    
+    # Build StandardOrder
+    local order_struct=$(build_standard_order_struct \
+        "$user_addr" "$nonce" "$origin_chain_id" "$expiry" "$fill_deadline" \
+        "$input_oracle" "$input_tokens" "$outputs_array")
+    
+    local abi_type='f((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))'
+    local order_data=$(cast_abi_encode "$abi_type" "$order_struct")
+    
+    if [ -z "$order_data" ]; then
+        print_error "Failed to encode StandardOrder" >&2
+        return 1
+    fi
+    
+    print_success "Onchain intent created" >&2
+    print_debug "Order data: $order_data" >&2
+    
+    # Return order data for onchain submission
+    echo "{\"order\":\"$order_data\",\"sponsor\":\"$user_addr\",\"input_settler\":\"$input_settler\",\"input_token\":\"$input_token\",\"input_amount\":\"$input_amount\"}"
+    return 0
+}
+
+# Submit intent onchain (direct blockchain call)
+submit_intent_onchain() {
+    local intent_json="$1"
+    local user_private_key="$2"
+    local origin_chain_id="$3"
+    
+    print_info "Submitting intent onchain"
+    
+    # Parse intent JSON to extract required fields
+    local order_data=$(echo "$intent_json" | jq -r '.order')
+    local input_settler=$(echo "$intent_json" | jq -r '.input_settler')
+    local input_token=$(echo "$intent_json" | jq -r '.input_token')
+    local input_amount=$(echo "$intent_json" | jq -r '.input_amount')
+    local sponsor=$(echo "$intent_json" | jq -r '.sponsor')
+    
+    if [ -z "$order_data" ] || [ "$order_data" = "null" ]; then
+        print_error "Missing order data in intent JSON"
+        return 1
+    fi
+    
+    # Get RPC URL for origin chain
+    local origin_rpc=$(config_get_network "$origin_chain_id" "rpc_url")
+    if [ -z "$origin_rpc" ]; then
+        origin_rpc="http://localhost:8545"
+    fi
+    
+    print_step "Approving tokens for InputSettler"
+    
+    # Check user's token balance first
+    local user_balance=$(cast call "$input_token" "balanceOf(address)" "$sponsor" --rpc-url "$origin_rpc")
+    local user_balance_dec=$(cast to-dec "$user_balance" 2>/dev/null || echo "0")
+    
+    if [ $(echo "$user_balance_dec < $input_amount" | bc) -eq 1 ]; then
+        print_error "Insufficient token balance"
+        print_info "User balance: $user_balance_dec"
+        print_info "Required: $input_amount"
+        return 1
+    fi
+    
+    # Approve InputSettler to spend tokens
+    print_debug "Approving InputSettler at $input_settler to spend $input_amount tokens"
+    local approve_tx=$(cast send "$input_token" "approve(address,uint256)" "$input_settler" "$input_amount" \
+        --rpc-url "$origin_rpc" \
+        --private-key "$user_private_key" --json 2>&1)
+    
+    if [ $? -ne 0 ]; then
+        print_error "Failed to approve tokens"
+        print_debug "Error: $approve_tx"
+        return 1
+    fi
+    
+    # Extract approval tx hash from JSON output
+    local approve_hash=""
+    approve_hash=$(echo "$approve_tx" | jq -r '.transactionHash // empty' 2>/dev/null)
+    
+    if [ -n "$approve_hash" ] && [ "$approve_hash" != "null" ]; then
+        print_success "Token approval submitted (tx: ${approve_hash:0:10}...)"
+    else
+        print_warning "Could not extract approval transaction hash"
+    fi
+    
+    print_step "Submitting intent to InputSettler"
+    
+    # Call InputSettler.open() with the order data
+    print_debug "Calling InputSettler.open() with order data"
+    
+    # Use cast send with --json flag to ensure consistent output
+    local submit_tx=$(cast send "$input_settler" "open(bytes)" "$order_data" \
+        --rpc-url "$origin_rpc" \
+        --private-key "$user_private_key" \
+        --json 2>&1)
+    
+    if [ $? -ne 0 ]; then
+        print_error "Failed to submit intent onchain"
+        print_debug "Error: $submit_tx"
+        return 1
+    fi
+    
+    # Extract transaction hash from JSON output
+    local tx_hash=""
+    tx_hash=$(echo "$submit_tx" | jq -r '.transactionHash // empty' 2>/dev/null)
+    
+    if [ -z "$tx_hash" ] || [ "$tx_hash" = "null" ]; then
+        print_error "Could not extract transaction hash from response"
+        print_debug "Response: $submit_tx"
+        return 1
+    fi
+    if [ -n "$tx_hash" ]; then
+        print_success "Intent submitted onchain successfully"
+        print_info "Transaction hash: $tx_hash"
+        set_intent_status "last_tx_hash" "$tx_hash"
+        
+        # Wait for transaction to be mined with timeout and progress
+        print_info "Waiting for transaction to be mined..."
+        local max_wait=30  # 30 seconds timeout
+        local elapsed=0
+        local mined=false
+        
+        # First, let's try a different approach - use eth_getTransactionByHash directly
+        while [ $elapsed -lt $max_wait ]; do
+            # Show progress every 3 seconds
+            if [ $((elapsed % 3)) -eq 0 ] && [ $elapsed -gt 0 ]; then
+                print_info "Waiting for transaction to be mined... (${elapsed}s)"
+            fi
+            
+            # Use eth_getTransactionByHash RPC call directly to check if tx is mined
+            local tx_json=$(cast rpc eth_getTransactionByHash "$tx_hash" --rpc-url "$origin_rpc" 2>/dev/null || echo "null")
+            
+            if [ "$tx_json" != "null" ] && [ -n "$tx_json" ]; then
+                # Check if transaction has a blockNumber (indicates it's mined)
+                local block_number=$(echo "$tx_json" | jq -r '.blockNumber // "null"' 2>/dev/null || echo "null")
+                
+                if [ "$block_number" != "null" ] && [ "$block_number" != "" ]; then
+                    # Convert hex block number to decimal for display
+                    local block_dec=$(cast to-dec "$block_number" 2>/dev/null || echo "$block_number")
+                    mined=true
+                    print_success "Transaction mined in block $block_dec"
+                    break
+                fi
+            fi
+            
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        
+        if [ "$mined" = false ]; then
+            print_warning "Transaction mining timeout after ${max_wait}s"
+            print_info "Transaction may still be pending: $tx_hash"
+            print_info "Check manually with: cast receipt $tx_hash --rpc-url $origin_rpc"
+            return 1
+        fi
+        
+        print_success "Transaction mined successfully (took ${elapsed}s)"
+        
+        # Try to extract the order ID from the transaction receipt
+        print_debug "Fetching transaction receipt for order ID"
+        local order_id=""
+        local receipt=$(cast rpc eth_getTransactionReceipt "$tx_hash" --rpc-url "$origin_rpc" 2>/dev/null || echo "null")
+        if [ "$receipt" != "null" ] && [ -n "$receipt" ]; then
+            # The Open event signature: Open(bytes32 indexed,address)
+            # The correct topic hash is for the event with the order ID as first indexed parameter
+            # Let's look for the InputSettler's Open event
+            # Event: Open(bytes32 indexed orderId, address indexed sender)
+            local open_event_topic="0xf04c8c2bbc4615307a4fd1bb1348feffc61a6407b1342c86f80c0ceeffd352eb"
+            
+            # Extract order ID from the second topic (first indexed parameter)
+            order_id=$(echo "$receipt" | jq -r ".logs[] | select(.topics[0] == \"$open_event_topic\") | .topics[1]" 2>/dev/null | head -n1)
+            
+            if [ -n "$order_id" ] && [ "$order_id" != "null" ]; then
+                print_info "Order ID: $order_id"
+                set_intent_status "last_order_id" "$order_id"
+            else
+                print_debug "Could not find order ID in transaction logs"
+            fi
+        fi
+        
+        # Determine status based on what we found
+        local status="submitted"
+        if [ -n "$order_id" ] && [ "$order_id" != "null" ]; then
+            # If we got an order ID, the intent was accepted by the contract
+            status="accepted"
+        elif [ "$mined" = true ]; then
+            # Transaction was mined but we couldn't extract order ID
+            status="mined"
+        fi
+        
+        # Build response object
+        local response_json=$(jq -n \
+            --arg tx_hash "$tx_hash" \
+            --arg order_id "${order_id:-}" \
+            --arg block_number "${block_dec:-}" \
+            --arg timestamp "$(get_timestamp)" \
+            --arg status "$status" \
+            '{
+                transaction_hash: $tx_hash,
+                order_id: (if $order_id == "" then null else $order_id end),
+                block_number: (if $block_number == "" then null else $block_number end),
+                timestamp: ($timestamp | tonumber),
+                status: $status,
+                status_description: (
+                    if $status == "accepted" then "Intent accepted by contract and assigned order ID"
+                    elif $status == "mined" then "Transaction mined but order ID not found"
+                    else "Transaction submitted to blockchain"
+                    end
+                )
+            }')
+        
+        # Save transaction details to file
+        local response_file="${OUTPUT_DIR:-./demo-output}/onchain_intent.tx.json"
+        echo "$response_json" > "$response_file"
+        print_info "Transaction details saved to: $response_file"
+        
+        # Print formatted response
+        print_separator
+        print_info "Onchain Submission Result:"
+        echo "$response_json" | jq '.'
+        print_separator
+    else
+        print_error "Failed to extract transaction hash"
+        return 1
+    fi
+    
+    return 0
+}
+
 # Submit intent to solver API
 submit_intent() {
     local intent_json="$1"
@@ -798,18 +1088,67 @@ show_intent_summary() {
 
 # Command line interface functions
 intent_build() {
-    local intent_type="${1:-escrow}"
-    local lock_type="${2:-permit2}" 
-    local origin_chain="${3:-31337}"
-    local dest_chain="${4:-31338}"
-    local token_in="${5:-}"
-    local token_out="${6:-}"
-    local amount_in="${7:-1000000000000000000}" # 1 token
-    local amount_out="${8:-1000000000000000000}" # 1 token
+    local onchain_mode=false
+    local intent_type=""
+    local lock_type=""
+    local origin_chain=""
+    local dest_chain=""
+    local token_in=""
+    local token_out=""
+    local amount_in="1000000000000000000" # 1 token default
+    local amount_out="1000000000000000000" # 1 token default
+    
+    # Parse arguments to detect --onchain flag
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --onchain)
+                onchain_mode=true
+                shift
+                ;;
+            *)
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+    
+    # Now parse positional arguments from args array
+    if [ "$onchain_mode" = true ]; then
+        # For onchain: <intent_type> <origin_chain> <dest_chain> <token_in> <token_out> [amount_in] [amount_out]
+        intent_type="${args[0]:-escrow}"
+        origin_chain="${args[1]:-31337}"
+        dest_chain="${args[2]:-31338}"
+        token_in="${args[3]:-}"
+        token_out="${args[4]:-}"
+        [ ${#args[@]} -gt 5 ] && amount_in="${args[5]}"
+        [ ${#args[@]} -gt 6 ] && amount_out="${args[6]}"
+        
+        # Validate onchain only works with escrow
+        if [ "$intent_type" != "escrow" ]; then
+            print_error "Onchain submission only supports escrow intent type"
+            print_info "Usage: intent_build --onchain escrow <origin_chain> <dest_chain> <token_in> <token_out> [amount_in] [amount_out]"
+            return 1
+        fi
+    else
+        # For offchain: <intent_type> <lock_type> <origin_chain> <dest_chain> <token_in> <token_out> [amount_in] [amount_out]
+        intent_type="${args[0]:-escrow}"
+        lock_type="${args[1]:-permit2}"
+        origin_chain="${args[2]:-31337}"
+        dest_chain="${args[3]:-31338}"
+        token_in="${args[4]:-}"
+        token_out="${args[5]:-}"
+        [ ${#args[@]} -gt 6 ] && amount_in="${args[6]}"
+        [ ${#args[@]} -gt 7 ] && amount_out="${args[7]}"
+    fi
     
     # Validate required parameters
     if [ -z "$token_in" ] || [ -z "$token_out" ]; then
-        print_error "Usage: intent_build <escrow|compact> <permit2|3009> <origin_chain> <dest_chain> <token_in> <token_out> [amount_in] [amount_out]"
+        if [ "$onchain_mode" = true ]; then
+            print_error "Usage: intent_build --onchain escrow <origin_chain> <dest_chain> <token_in> <token_out> [amount_in] [amount_out]"
+        else
+            print_error "Usage: intent_build <escrow|compact> <permit2|eip3009> <origin_chain> <dest_chain> <token_in> <token_out> [amount_in] [amount_out]"
+        fi
         return 1
     fi
     
@@ -879,7 +1218,11 @@ intent_build() {
         return 1
     fi
     
-    print_info "Building $intent_type intent with $lock_type lock type"
+    if [ "$onchain_mode" = true ]; then
+        print_info "Building $intent_type intent for onchain submission"
+    else
+        print_info "Building $intent_type intent with $lock_type auth type"
+    fi
     print_info "From chain $origin_chain to chain $dest_chain"
     print_info "Input: $amount_in wei of $token_in"
     print_info "Output: $amount_out wei of $token_out"
@@ -890,9 +1233,29 @@ intent_build() {
     local input_settler=$(config_get_network "$origin_chain" "input_settler_address")
     local output_settler=$(config_get_network "$dest_chain" "output_settler_address")
     
-    case "$intent_type" in
-        escrow)
-            case "$lock_type" in
+    # Handle onchain mode separately
+    if [ "$onchain_mode" = true ]; then
+        # Validate required contract addresses for onchain
+        if [ -z "$input_settler" ]; then
+            print_error "Input settler address not configured for chain $origin_chain"
+            print_info "Run 'oif-demo env up' to deploy contracts and generate config"
+            return 1
+        fi
+        if [ -z "$output_settler" ]; then
+            print_error "Output settler address not configured for chain $dest_chain"
+            print_info "Run 'oif-demo env up' to deploy contracts and generate config"
+            return 1
+        fi
+        
+        # Get oracle address from settlement configuration
+        local oracle=$(config_get_oracle "$origin_chain" "input")
+        intent_json=$(create_onchain_intent "$user_addr" "$user_key" "$origin_chain" "$dest_chain" \
+                           "$token_in" "$amount_in" "$token_out" "$amount_out" \
+                           "$recipient_addr" "$input_settler" "$output_settler" "$oracle")
+    else
+        case "$intent_type" in
+            escrow)
+                case "$lock_type" in
                 permit2)
                     # Validate required contract addresses for escrow
                     if [ -z "$input_settler" ]; then
@@ -1057,6 +1420,7 @@ intent_build() {
             return 1
             ;;
     esac
+    fi  # End of onchain_mode check
     
     # Save intent to file
     if [ -n "$intent_json" ]; then
@@ -1115,14 +1479,32 @@ intent_build() {
 }
 
 intent_submit() {
-    local intent_file="${1:-${OUTPUT_DIR:-./demo-output}/post_intent.req.json}"
+    local onchain_mode=false
+    local intent_file=""
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --onchain)
+                onchain_mode=true
+                shift
+                ;;
+            *)
+                intent_file="$1"
+                shift
+                ;;
+        esac
+    done
+    
+    # Use default file if not specified
+    if [ -z "$intent_file" ]; then
+        intent_file="${OUTPUT_DIR:-./demo-output}/post_intent.req.json"
+    fi
     
     if [ ! -f "$intent_file" ]; then
         print_error "Intent file not found: $intent_file"
         return 1
     fi
-    
-    print_info "Submitting intent from: $intent_file"
     
     # Read the JSON content from the file
     local intent_json=$(cat "$intent_file")
@@ -1132,34 +1514,102 @@ intent_submit() {
         return 1
     fi
     
-    submit_intent "$intent_json"
+    if [ "$onchain_mode" = true ]; then
+        print_info "Submitting intent onchain from: $intent_file"
+        
+        # For onchain submission, we need user private key and chain info
+        local user_key=$(config_get_account "user" "private_key")
+        if [ -z "$user_key" ] && [ -n "${USER_PRIVATE_KEY:-}" ]; then
+            user_key="$USER_PRIVATE_KEY"
+        fi
+        
+        if [ -z "$user_key" ]; then
+            print_error "User private key not configured for onchain submission"
+            print_info "Set USER_PRIVATE_KEY environment variable or run 'oif-demo init <config-file>'"
+            return 1
+        fi
+        
+        # Default to origin chain 31337 if not specified
+        local origin_chain="${ORIGIN_CHAIN_ID:-31337}"
+        
+        submit_intent_onchain "$intent_json" "$user_key" "$origin_chain"
+    else
+        print_info "Submitting intent offchain from: $intent_file"
+        submit_intent "$intent_json"
+    fi
 }
 
 intent_test() {
-    local lock_type="${1:-escrow}"
-    local auth_type="${2:-permit2}"
-    local token_pair="${3:-A2B}"
+    local onchain_mode=false
+    local lock_type=""
+    local auth_type=""
+    local token_pair=""
     
-    # Validate lock type
-    if [[ "$lock_type" != "escrow" && "$lock_type" != "compact" ]]; then
-        print_error "Invalid lock type: $lock_type"
-        print_info "Usage: intent test <escrow|compact> <permit2|eip3009> <A2A|A2B|B2A|B2B>"
-        return 1
-    fi
+    # Parse arguments to detect --onchain flag
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --onchain)
+                onchain_mode=true
+                shift
+                ;;
+            *)
+                if [ -z "$lock_type" ]; then
+                    lock_type="$1"
+                elif [ -z "$auth_type" ] && [ "$onchain_mode" = false ]; then
+                    auth_type="$1"
+                elif [ -z "$token_pair" ]; then
+                    token_pair="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
     
-    # Validate auth type and combinations
-    if [[ "$lock_type" == "compact" && "$auth_type" == "eip3009" ]]; then
-        print_error "Compact lock type does not support EIP-3009 auth"
-        print_info "Compact only supports permit2 auth"
-        print_info "Usage: intent test compact permit2 <A2A|A2B|B2A|B2B>"
-        return 1
-    fi
+    # Set defaults
+    lock_type="${lock_type:-escrow}"
+    token_pair="${token_pair:-A2B}"
     
-    if [[ "$auth_type" != "permit2" && "$auth_type" != "eip3009" ]]; then
-        print_error "Invalid auth type: $auth_type"
-        print_info "Supported auth types: permit2, eip3009 (eip3009 only for escrow)"
-        print_info "Usage: intent test <escrow|compact> <permit2|eip3009> <A2A|A2B|B2A|B2B>"
-        return 1
+    # For onchain mode, auth_type is not needed
+    if [ "$onchain_mode" = true ]; then
+        if [ -n "$auth_type" ] && [ "$auth_type" != "" ]; then
+            # If auth_type was provided with --onchain, treat it as token_pair
+            if [ -z "$token_pair" ] || [ "$token_pair" = "A2B" ]; then
+                token_pair="$auth_type"
+            fi
+            auth_type=""
+        fi
+        
+        # Validate that onchain only works with escrow
+        if [ "$lock_type" != "escrow" ]; then
+            print_error "Onchain submission only supports escrow lock type"
+            print_info "Usage: intent test --onchain escrow <A2A|A2B|B2A|B2B>"
+            return 1
+        fi
+    else
+        # Offchain mode - auth_type is required
+        auth_type="${auth_type:-permit2}"
+        
+        # Validate lock type
+        if [[ "$lock_type" != "escrow" && "$lock_type" != "compact" ]]; then
+            print_error "Invalid lock type: $lock_type"
+            print_info "Usage: intent test <escrow|compact> <permit2|eip3009> <A2A|A2B|B2A|B2B>"
+            return 1
+        fi
+        
+        # Validate auth type and combinations
+        if [[ "$lock_type" == "compact" && "$auth_type" == "eip3009" ]]; then
+            print_error "Compact lock type does not support EIP-3009 auth"
+            print_info "Compact only supports permit2 auth"
+            print_info "Usage: intent test compact permit2 <A2A|A2B|B2A|B2B>"
+            return 1
+        fi
+        
+        if [[ "$auth_type" != "permit2" && "$auth_type" != "eip3009" ]]; then
+            print_error "Invalid auth type: $auth_type"
+            print_info "Supported auth types: permit2, eip3009 (eip3009 only for escrow)"
+            print_info "Usage: intent test <escrow|compact> <permit2|eip3009> <A2A|A2B|B2A|B2B>"
+            return 1
+        fi
     fi
     
     # Parse token pair
@@ -1200,33 +1650,63 @@ intent_test() {
             ;;
     esac
     
-    print_header "Testing ${lock_type} intent with ${auth_type} auth: ${from_token} → ${to_token}"
-    
-    # Step 1: Build intent
-    print_step "Building ${lock_type} intent with ${auth_type} auth"
-    
-    if ! intent_build "$lock_type" "$auth_type" "$origin_chain" "$dest_chain" "$from_token" "$to_token"; then
-        print_error "Failed to build ${lock_type} intent with ${auth_type} auth"
-        return 1
+    if [ "$onchain_mode" = true ]; then
+        print_header "Testing ${lock_type} intent with onchain submission: ${from_token} → ${to_token}"
+        
+        # Step 1: Build onchain intent
+        print_step "Building ${lock_type} intent for onchain submission"
+        
+        if ! intent_build --onchain "$lock_type" "$origin_chain" "$dest_chain" "$from_token" "$to_token"; then
+            print_error "Failed to build ${lock_type} intent for onchain submission"
+            return 1
+        fi
+        
+        print_success "Intent built successfully"
+        
+        # Step 2: Submit intent onchain
+        print_step "Submitting intent onchain"
+        local intent_file="${OUTPUT_DIR:-./demo-output}/post_intent.req.json"
+        
+        if [ ! -f "$intent_file" ]; then
+            print_error "Intent file not found: $intent_file"
+            return 1
+        fi
+        
+        if ! intent_submit --onchain "$intent_file"; then
+            print_error "Failed to submit intent onchain"
+            return 1
+        fi
+        
+        print_success "Onchain intent test completed: ${lock_type} ${token_pair}"
+    else
+        print_header "Testing ${lock_type} intent with ${auth_type} auth: ${from_token} → ${to_token}"
+        
+        # Step 1: Build intent
+        print_step "Building ${lock_type} intent with ${auth_type} auth"
+        
+        if ! intent_build "$lock_type" "$auth_type" "$origin_chain" "$dest_chain" "$from_token" "$to_token"; then
+            print_error "Failed to build ${lock_type} intent with ${auth_type} auth"
+            return 1
+        fi
+        
+        print_success "Intent built successfully"
+        
+        # Step 2: Submit intent
+        print_step "Submitting intent"
+        local intent_file="${OUTPUT_DIR:-./demo-output}/post_intent.req.json"
+        
+        if [ ! -f "$intent_file" ]; then
+            print_error "Intent file not found: $intent_file"
+            return 1
+        fi
+        
+        if ! intent_submit "$intent_file"; then
+            print_error "Failed to submit intent"
+            return 1
+        fi
+        
+        print_success "Intent test completed: ${lock_type} ${token_pair}"
     fi
-    
-    print_success "Intent built successfully"
-    
-    # Step 2: Submit intent
-    print_step "Submitting intent"
-    local intent_file="${OUTPUT_DIR:-./demo-output}/post_intent.req.json"
-    
-    if [ ! -f "$intent_file" ]; then
-        print_error "Intent file not found: $intent_file"
-        return 1
-    fi
-    
-    if ! intent_submit "$intent_file"; then
-        print_error "Failed to submit intent"
-        return 1
-    fi
-    
-    print_success "Intent test completed: ${lock_type} ${token_pair}"
     
     # Show summary
     local order_id=$(get_intent_status "last_order_id")
