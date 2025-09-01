@@ -85,6 +85,7 @@ pub enum StorageError {
 /// integrate with the solver system. It provides basic key-value operations
 /// with optional TTL support and querying capabilities.
 #[async_trait]
+#[cfg_attr(feature = "testing", mockall::automock)]
 pub trait StorageInterface: Send + Sync {
 	/// Retrieves raw bytes for the given key.
 	async fn get_bytes(&self, key: &str) -> Result<Vec<u8>, StorageError>;

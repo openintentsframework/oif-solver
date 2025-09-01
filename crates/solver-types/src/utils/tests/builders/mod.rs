@@ -9,6 +9,7 @@ pub mod eip7683_order_data;
 pub mod get_quote_request;
 pub mod mandate_output;
 pub mod networks;
+pub mod order;
 pub mod requested_output;
 pub mod transaction;
 
@@ -23,5 +24,6 @@ pub use networks::{
 	NetworksConfigBuilderError, RpcEndpointBuilder, RpcEndpointBuilderError, TokenConfigBuilder,
 	TokenConfigBuilderError,
 };
+pub use order::OrderBuilder;
 pub use requested_output::{RequestedOutputBuilder, RequestedOutputBuilderError};
 pub use transaction::{TransactionBuilder, TransactionBuilderError};
