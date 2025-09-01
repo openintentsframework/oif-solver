@@ -10,6 +10,7 @@ members = [
     "crates/solver-discovery",
     "crates/solver-order",
     "crates/solver-settlement",
+    "crates/solver-pricing",
     "crates/solver-service",
 ]
 default-members = ["crates/solver-service"]

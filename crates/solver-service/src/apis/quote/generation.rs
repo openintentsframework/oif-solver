@@ -129,6 +129,7 @@ impl QuoteGenerator {
 			eta: Some(eta),
 			quote_id,
 			provider: "oif-solver".to_string(),
+			cost: None,
 		})
 	}
 

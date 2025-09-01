@@ -6,7 +6,11 @@
 use crate::Address;
 
 use super::formatting::without_0x_prefix;
-use alloy_primitives::{hex, Address as AlloyAddress};
+use alloy_primitives::{
+	hex,
+	utils::{format_ether, parse_ether},
+	Address as AlloyAddress, U256,
+};
 
 /// Normalize a bytes32 that is expected to embed an `address` into
 /// a canonical left-padded form: 12 zero bytes followed by 20 address bytes.
@@ -91,6 +95,79 @@ pub fn parse_address(hex_str: &str) -> Result<Address, String> {
 				Ok(Address(bytes))
 			}
 		})
+}
+
+/// Convert wei (U256) to ETH string using Alloy's format_ether helper.
+///
+/// This function provides a convenient wrapper around Alloy's format_ether
+/// utility for converting wei amounts to human-readable ETH strings.
+///
+/// # Arguments
+/// * `wei_amount` - The amount in wei as a U256
+///
+/// # Returns
+/// A string representation of the ETH amount (e.g., "1.5" for 1.5 ETH)
+///
+/// # Example
+/// ```
+/// use alloy_primitives::U256;
+/// use solver_types::utils::conversion::wei_to_eth_string;
+///
+/// let wei = U256::from(1500000000000000000u64); // 1.5 ETH in wei
+/// let eth_str = wei_to_eth_string(wei);
+/// assert_eq!(eth_str, "1.5");
+/// ```
+pub fn wei_to_eth_string(wei_amount: U256) -> String {
+	format_ether(wei_amount)
+}
+
+/// Convert ETH string to wei (U256) using Alloy's parse_ether helper.
+///
+/// This function provides a convenient wrapper around Alloy's parse_ether
+/// utility for converting ETH amounts to wei.
+///
+/// # Arguments
+/// * `eth_amount` - The ETH amount as a string (e.g., "1.5")
+///
+/// # Returns
+/// * `Ok(U256)` - The amount in wei
+/// * `Err(String)` - Error message if parsing fails
+///
+/// # Example
+/// ```
+/// use solver_types::utils::conversion::eth_string_to_wei;
+///
+/// let wei = eth_string_to_wei("1.5").unwrap();
+/// assert_eq!(wei.to_string(), "1500000000000000000");
+/// ```
+pub fn eth_string_to_wei(eth_amount: &str) -> Result<U256, String> {
+	parse_ether(eth_amount)
+		.map_err(|e| format!("Failed to parse ETH amount '{}': {}", eth_amount, e))
+}
+
+/// Convert wei string to ETH string using Alloy utilities.
+///
+/// This function combines string parsing with Alloy's format_ether for
+/// convenient conversion from wei strings to ETH strings.
+///
+/// # Arguments
+/// * `wei_string` - The wei amount as a decimal string
+///
+/// # Returns
+/// * `Ok(String)` - The ETH amount as a string
+/// * `Err(String)` - Error message if parsing fails
+///
+/// # Example
+/// ```
+/// use solver_types::utils::conversion::wei_string_to_eth_string;
+///
+/// let eth_str = wei_string_to_eth_string("1500000000000000000").unwrap();
+/// assert_eq!(eth_str, "1.5");
+/// ```
+pub fn wei_string_to_eth_string(wei_string: &str) -> Result<String, String> {
+	let wei = U256::from_str_radix(wei_string, 10)
+		.map_err(|e| format!("Invalid wei amount '{}': {}", wei_string, e))?;
+	Ok(format_ether(wei))
 }
 
 #[cfg(test)]
@@ -221,5 +298,97 @@ mod tests {
 		let bytes_from_address: [u8; 20] = address.into();
 
 		assert_eq!(original_bytes, bytes_from_address);
+	}
+
+	#[test]
+	fn test_wei_to_eth_string() {
+		// Test 1 ETH
+		let one_eth_wei = U256::from(1_000_000_000_000_000_000u64);
+		assert_eq!(wei_to_eth_string(one_eth_wei), "1.000000000000000000");
+
+		// Test 1.5 ETH
+		let one_and_half_eth_wei = U256::from(1_500_000_000_000_000_000u64);
+		assert_eq!(
+			wei_to_eth_string(one_and_half_eth_wei),
+			"1.500000000000000000"
+		);
+
+		// Test 0.1 ETH
+		let tenth_eth_wei = U256::from(100_000_000_000_000_000u64);
+		assert_eq!(wei_to_eth_string(tenth_eth_wei), "0.100000000000000000");
+
+		// Test 0 ETH
+		let zero_wei = U256::ZERO;
+		assert_eq!(wei_to_eth_string(zero_wei), "0.000000000000000000");
+	}
+
+	#[test]
+	fn test_eth_string_to_wei() {
+		// Test 1 ETH
+		let wei = eth_string_to_wei("1.0").unwrap();
+		assert_eq!(wei, U256::from(1_000_000_000_000_000_000u64));
+
+		// Test 1.5 ETH
+		let wei = eth_string_to_wei("1.5").unwrap();
+		assert_eq!(wei, U256::from(1_500_000_000_000_000_000u64));
+
+		// Test 0.1 ETH
+		let wei = eth_string_to_wei("0.1").unwrap();
+		assert_eq!(wei, U256::from(100_000_000_000_000_000u64));
+
+		// Test 0 ETH
+		let wei = eth_string_to_wei("0").unwrap();
+		assert_eq!(wei, U256::ZERO);
+
+		// Test invalid input
+		let result = eth_string_to_wei("invalid");
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_wei_string_to_eth_string() {
+		// Test 1 ETH
+		let eth_str = wei_string_to_eth_string("1000000000000000000").unwrap();
+		assert_eq!(eth_str, "1.000000000000000000");
+
+		// Test 1.5 ETH
+		let eth_str = wei_string_to_eth_string("1500000000000000000").unwrap();
+		assert_eq!(eth_str, "1.500000000000000000");
+
+		// Test 0.1 ETH
+		let eth_str = wei_string_to_eth_string("100000000000000000").unwrap();
+		assert_eq!(eth_str, "0.100000000000000000");
+
+		// Test 0 ETH
+		let eth_str = wei_string_to_eth_string("0").unwrap();
+		assert_eq!(eth_str, "0.000000000000000000");
+
+		// Test invalid input
+		let result = wei_string_to_eth_string("invalid");
+		assert!(result.is_err());
+
+		let result = wei_string_to_eth_string("123.456");
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_roundtrip_conversions() {
+		// Test roundtrip: ETH -> wei -> ETH (note: format_ether returns full precision)
+		let original_eth = "2.5";
+		let wei = eth_string_to_wei(original_eth).unwrap();
+		let converted_eth = wei_to_eth_string(wei);
+		assert_eq!(converted_eth, "2.500000000000000000");
+
+		// Test roundtrip: wei string -> ETH -> wei
+		let original_wei_str = "2500000000000000000";
+		let eth_str = wei_string_to_eth_string(original_wei_str).unwrap();
+		let wei = eth_string_to_wei(&eth_str).unwrap();
+		assert_eq!(wei.to_string(), original_wei_str);
+
+		// Test that wei -> ETH -> wei maintains precision
+		let original_wei = U256::from(1_234_567_890_123_456_789u64);
+		let eth_str = wei_to_eth_string(original_wei);
+		let converted_wei = eth_string_to_wei(&eth_str).unwrap();
+		assert_eq!(converted_wei, original_wei);
 	}
 }
