@@ -165,7 +165,7 @@ mod hex_string {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::utils::builders::{Eip7683OrderDataBuilder, MandateOutputBuilder};
+	use crate::utils::tests::builders::{Eip7683OrderDataBuilder, MandateOutputBuilder};
 	use alloy_primitives::U256;
 	use serde_json;
 
