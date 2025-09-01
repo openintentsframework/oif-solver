@@ -744,25 +744,4 @@ mod tests {
 			OracleSelectionStrategy::First
 		));
 	}
-
-	// Helper function tests
-	#[test]
-	fn test_addr_helper() {
-		let address = addr("1234567890123456789012345678901234567890");
-		assert_eq!(address.0.len(), 20);
-		assert_eq!(
-			alloy_primitives::hex::encode(&address.0),
-			"1234567890123456789012345678901234567890"
-		);
-	}
-
-	#[test]
-	fn test_addr_helper_with_0x_prefix() {
-		let address = addr("0x1234567890123456789012345678901234567890");
-		assert_eq!(address.0.len(), 20);
-		assert_eq!(
-			alloy_primitives::hex::encode(&address.0),
-			"1234567890123456789012345678901234567890"
-		);
-	}
 }

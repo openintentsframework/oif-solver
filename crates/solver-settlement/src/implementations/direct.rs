@@ -426,12 +426,11 @@ impl crate::SettlementRegistry for Registry {}
 mod tests {
 	use super::*;
 	use crate::{OracleSelectionStrategy, SettlementInterface};
-	use serde_json::json;
-	use solver_types::ImplementationRegistry;
-	use solver_types::{
-		networks::{NetworkConfig, RpcEndpoint},
-		Address, OrderStatus, TransactionHash,
+	use solver_types::utils::tests::builders::{
+		NetworkConfigBuilder, NetworksConfigBuilder, RpcEndpointBuilder,
 	};
+	use solver_types::Address;
+	use solver_types::ImplementationRegistry;
 	use std::collections::HashMap;
 
 	// Helper function to create Address from hex string
@@ -441,30 +440,25 @@ mod tests {
 	}
 
 	fn create_test_networks() -> NetworksConfig {
-		let mut networks = HashMap::new();
-		networks.insert(
-			1,
-			NetworkConfig {
-				rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
-				input_settler_address: addr("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9"),
-				output_settler_address: addr("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
-				tokens: vec![],
-				input_settler_compact_address: None,
-				the_compact_address: None,
-			},
-		);
-		networks.insert(
-			2,
-			NetworkConfig {
-				rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8546".to_string())],
-				input_settler_address: addr("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9"),
-				output_settler_address: addr("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
-				tokens: vec![],
-				input_settler_compact_address: None,
-				the_compact_address: None,
-			},
-		);
-		networks
+		NetworksConfigBuilder::new()
+			.add_network(
+				1,
+				NetworkConfigBuilder::new()
+					.add_rpc_endpoint(RpcEndpointBuilder::new().build())
+					.build(),
+			)
+			.add_network(
+				2,
+				NetworkConfigBuilder::new()
+					.add_rpc_endpoint(
+						RpcEndpointBuilder::new()
+							.http(Some("https://eth.drpc.org".to_string()))
+							.ws(None)
+							.build(),
+					)
+					.build(),
+			)
+			.build()
 	}
 
 	// Fix the create_test_oracle_config function
@@ -484,32 +478,6 @@ mod tests {
 			output_oracles,
 			routes,
 			selection_strategy: OracleSelectionStrategy::RoundRobin,
-		}
-	}
-
-	fn create_test_order() -> Order {
-		Order {
-			id: "test-order".to_string(),
-			standard: "eip7683".to_string(),
-			created_at: 1640995200,
-			updated_at: 1640995200,
-			status: OrderStatus::Executed,
-			data: json!({
-				"order_id": "0x1234567890123456789012345678901234567890123456789012345678901234",
-				"nonce": "42",
-				"expires": "1640995800"
-			}),
-			solver_address: addr("1234567890123456789012345678901234567890"),
-			quote_id: Some("quote-test".to_string()),
-			input_chain_ids: vec![1],
-			output_chain_ids: vec![2],
-			execution_params: None,
-			prepare_tx_hash: None,
-			fill_tx_hash: Some(TransactionHash(vec![0u8; 32])),
-			claim_tx_hash: None,
-			fill_proof: None,
-			post_fill_tx_hash: None,
-			pre_claim_tx_hash: None,
 		}
 	}
 
@@ -887,44 +855,6 @@ mod tests {
 		let networks = create_test_networks();
 		let result = factory(&config, &networks);
 		assert!(result.is_ok());
-	}
-
-	// Helper function tests
-	#[test]
-	fn test_create_test_networks() {
-		let networks = create_test_networks();
-		assert!(networks.contains_key(&1));
-		assert!(networks.contains_key(&2));
-		assert_eq!(
-			networks.get(&1).unwrap().get_http_url(),
-			Some("http://localhost:8545")
-		);
-		assert_eq!(
-			networks.get(&2).unwrap().get_http_url(),
-			Some("http://localhost:8546")
-		);
-	}
-
-	#[test]
-	fn test_create_test_oracle_config() {
-		let config = create_test_oracle_config();
-		assert!(config.input_oracles.contains_key(&1));
-		assert!(config.output_oracles.contains_key(&2));
-		assert!(config.routes.contains_key(&1)); // Changed from &(1, 2) to &1
-		assert!(matches!(
-			config.selection_strategy,
-			OracleSelectionStrategy::RoundRobin
-		));
-	}
-
-	#[test]
-	fn test_create_test_order() {
-		let order = create_test_order();
-		assert_eq!(order.id, "test-order");
-		assert_eq!(order.standard, "eip7683");
-		assert_eq!(order.input_chain_ids, vec![1]);
-		assert_eq!(order.output_chain_ids, vec![2]);
-		assert!(matches!(order.status, OrderStatus::Executed));
 	}
 
 	// Integration-style tests for error cases
