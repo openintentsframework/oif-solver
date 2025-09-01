@@ -3511,6 +3511,7 @@ dependencies = [
  "solver-delivery",
  "solver-discovery",
  "solver-order",
+ "solver-pricing",
  "solver-settlement",
  "solver-storage",
  "solver-types",
@@ -3597,6 +3598,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "solver-pricing"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "async-trait",
+ "reqwest",
+ "serde",
+ "solver-types",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "solver-service"
 version = "0.1.0"
 dependencies = [
@@ -3618,6 +3634,7 @@ dependencies = [
  "solver-delivery",
  "solver-discovery",
  "solver-order",
+ "solver-pricing",
  "solver-settlement",
  "solver-storage",
  "solver-types",

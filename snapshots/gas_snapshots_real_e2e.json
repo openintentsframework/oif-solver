@@ -1,0 +1,28 @@
+{
+  "version": "1.0.0", 
+  "snapshots": {
+    "permit2-escrow_31337": [
+      {
+        "flow": "permit2-escrow",
+        "chain_id": 31337,
+        "open_gas": 143116,
+        "fill_gas": 76068,
+        "finalize_gas": 59953,
+        "created_at": 1756254010,
+        "metadata": {
+          "capture_method": "systematic_solver_execution",
+          "description": "Gas captured systematically from actual solver transactions",
+          "validation": "All transactions found via nonce tracking and receipt extraction",
+          "nonce_ranges": "Origin †’48, Dest †’32",
+          "transaction_counts": "Origin: 2, Dest: 1"
+        }
+      }
+    ]
+  },
+  "last_updated": 1756254010,
+  "metadata": {
+    "source": "Systematic Solver Execution",
+    "methodology": "Gas extracted from solver transactions found via systematic nonce-based discovery",
+    "guarantee": "All gas values are from actual on-chain transaction receipts - NO estimates or fallbacks"
+  }
+}
