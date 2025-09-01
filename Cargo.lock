@@ -2332,21 +2332,6 @@ dependencies = [
 
 [[package]]
 name = "mockall"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43766c2b5203b10de348ffe19f7e54564b64f3d6018ff7648d1e2d6d3a0f0a48"
-dependencies = [
- "cfg-if",
- "downcast",
- "fragile",
- "lazy_static",
- "mockall_derive 0.12.1",
- "predicates",
- "predicates-tree",
-]
-
-[[package]]
-name = "mockall"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39a6bfcc6c8c7eed5ee98b9c3e33adc726054389233e201c95dab2d41a3839d2"
@@ -2354,21 +2339,9 @@ dependencies = [
  "cfg-if",
  "downcast",
  "fragile",
- "mockall_derive 0.13.1",
+ "mockall_derive",
  "predicates",
  "predicates-tree",
-]
-
-[[package]]
-name = "mockall_derive"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af7cbce79ec385a1d4f54baa90a76401eb15d9cab93685f62e7e9f942aa00ae2"
-dependencies = [
- "cfg-if",
- "proc-macro2",
- "quote",
- "syn 2.0.106",
 ]
 
 [[package]]
@@ -3515,6 +3488,7 @@ dependencies = [
  "solver-delivery",
  "solver-discovery",
  "solver-order",
+ "solver-pricing",
  "solver-settlement",
  "solver-storage",
  "solver-types",
@@ -3603,6 +3577,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "solver-pricing"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "async-trait",
+ "reqwest",
+ "serde",
+ "solver-types",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "solver-service"
 version = "0.1.0"
 dependencies = [
@@ -3624,13 +3613,13 @@ dependencies = [
  "solver-delivery",
  "solver-discovery",
  "solver-order",
+ "solver-pricing",
  "solver-settlement",
  "solver-storage",
  "solver-types",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "tokio-test",
  "toml",
  "tower",
  "tower-http",
@@ -3667,8 +3656,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "fs2",
- "futures",
- "mockall 0.13.1",
+ "mockall",
  "serde",
  "serde_json",
  "solver-types",
@@ -4043,19 +4031,6 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tokio-util",
-]
-
-[[package]]
-name = "tokio-test"
-version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2468baabc3311435b55dd935f702f42cd1b8abb7e754fb7dfb16bd36aa88f9f7"
-dependencies = [
- "async-stream",
- "bytes",
- "futures-core",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]

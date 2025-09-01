@@ -91,10 +91,7 @@ impl IntentHandler {
 				IntentError::Storage(format!("Failed to check intent existence: {}", e))
 			})?;
 		if exists {
-			tracing::debug!(
-				"Intent ({}) already exists, skipping duplicate processing",
-				truncate_id(&intent.id)
-			);
+			tracing::debug!("Duplicate intent detected, already being processed or completed");
 			return Ok(());
 		}
 

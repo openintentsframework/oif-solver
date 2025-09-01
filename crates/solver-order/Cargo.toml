@@ -2,14 +2,16 @@
 name = "solver-order"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.86.0"
+rust-version.workspace = true
 
 [dependencies]
-alloy-primitives = "0.8"
 alloy-dyn-abi = "0.8"
+alloy-primitives = "0.8"
 alloy-sol-types = "0.8"
 async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
+mockall = { version = "0.13", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 solver-types = { path = "../solver-types" }
@@ -17,11 +19,9 @@ thiserror = "1.0"
 toml = { workspace = true }
 tracing = "0.1"
 uuid = { version = "1.8", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-mockall = { version = "0.13", optional = true }
 
 [features]
 testing = ["mockall"]
 
 [dev-dependencies]
-tokio = "1.0"
+tokio = { workspace = true }

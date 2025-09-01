@@ -165,7 +165,12 @@ async fn handle_get_tokens_for_chain(
 async fn handle_order(
 	State(state): State<AppState>,
 	Json(payload): Json<Value>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+	// Check if this is a committed order (quote acceptance)
+	if let Some(response) = handle_committed_order(payload.clone()).await {
+		return response.into_response();
+	}
+
 	// Check if discovery URL is configured
 	let forward_url = match &state.discovery_url {
 		Some(url) => url,
@@ -224,4 +229,34 @@ async fn handle_order(
 				.into_response()
 		},
 	}
+}
+
+async fn handle_committed_order(payload: Value) -> Option<impl IntoResponse> {
+	// Check if this is a quote acceptance submission (contains quoteId)
+	if let Some(quote_id) = payload.get("quoteId").and_then(|v| v.as_str()) {
+		tracing::info!("Received quote acceptance for quote ID: {}", quote_id);
+
+		// Extract signature if present
+		let signature = payload.get("signature").and_then(|v| v.as_str());
+
+		if let Some(sig) = signature {
+			tracing::debug!("Quote acceptance signature: {}", sig);
+		}
+
+		// Return placeholder response for quote acceptance
+		// TODO: Implement actual quote acceptance logic once quote storage is in place
+		return Some(
+			(
+				StatusCode::NOT_IMPLEMENTED,
+				Json(serde_json::json!({
+					"error": "Quote acceptance not yet implemented",
+					"message": "Quote ID submission is recognized but not yet supported",
+					"quoteId": quote_id,
+					"status": "pending_implementation"
+				})),
+			)
+				.into_response(),
+		);
+	}
+	None
 }

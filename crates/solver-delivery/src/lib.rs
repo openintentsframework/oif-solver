@@ -114,6 +114,10 @@ pub trait DeliveryInterface: Send + Sync {
 	///
 	/// Returns the latest block number on the network.
 	async fn get_block_number(&self, chain_id: u64) -> Result<u64, DeliveryError>;
+
+	/// Estimates gas units for a transaction without submitting it.
+	/// Implementations should call the chain's estimateGas RPC with the provided transaction.
+	async fn estimate_gas(&self, tx: Transaction) -> Result<u64, DeliveryError>;
 }
 
 /// Type alias for delivery factory functions.
@@ -339,5 +343,15 @@ impl DeliveryService {
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
 		implementation.get_block_number(chain_id).await
+	}
+
+	/// Estimates gas for a transaction on the specified chain.
+	pub async fn estimate_gas(&self, chain_id: u64, tx: Transaction) -> Result<u64, DeliveryError> {
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
+
+		implementation.estimate_gas(tx).await
 	}
 }
