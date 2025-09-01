@@ -261,22 +261,16 @@ mod tests {
 	use serde_json::json;
 	use solver_account::MockAccountInterface;
 	use solver_delivery::MockDeliveryInterface;
-	use solver_types::{Address, Intent, IntentMetadata, NetworksConfig, TokenConfig};
+	use solver_types::{
+		utils::builders::IntentBuilder, Address, Intent, NetworksConfig, TokenConfig,
+	};
 	use std::collections::HashMap;
 
 	fn create_test_intent(standard: &str, data: serde_json::Value) -> Intent {
-		Intent {
-			id: "test-intent-123".to_string(),
-			standard: standard.to_string(),
-			data,
-			source: "test".to_string(),
-			metadata: IntentMetadata {
-				requires_auction: false,
-				exclusive_until: None,
-				discovered_at: 1234567890,
-			},
-			quote_id: Some("test-quote-123".to_string()),
-		}
+		IntentBuilder::new()
+			.with_standard(standard)
+			.with_data(data)
+			.build()
 	}
 
 	fn create_mock_delivery_service() -> Arc<DeliveryService> {
