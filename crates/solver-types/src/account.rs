@@ -148,3 +148,348 @@ impl From<Transaction> for TransactionRequest {
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::utils::{builders::TransactionBuilder, conversion::parse_address};
+	use alloy_primitives::{address, U256};
+	use serde_json;
+
+	// Helper function to create a test address from hex string
+	fn test_address(hex: &str) -> Address {
+		parse_address(hex).expect("Invalid test address")
+	}
+
+	// Helper function to create a test address from bytes
+	fn test_address_bytes(bytes: &[u8]) -> Address {
+		Address(bytes.to_vec())
+	}
+
+	#[test]
+	fn test_address_creation() {
+		let addr_bytes = vec![
+			0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x77, 0x6F, 0xb7, 0x8B, 0x3e, 0x1E, 0x6B, 0x2D, 0x0d,
+			0x2E, 0x8F, 0x0C, 0x1D, 0x2A, 0x3B,
+		];
+		let address = Address(addr_bytes.clone());
+		assert_eq!(address.0, addr_bytes);
+	}
+
+	#[test]
+	fn test_address_display() {
+		let address = test_address("0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b");
+		let display_str = format!("{}", address);
+		assert_eq!(display_str, "0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b");
+	}
+
+	#[test]
+	fn test_address_serialization() {
+		let address = test_address("0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b");
+
+		let json = serde_json::to_string(&address).unwrap();
+		assert_eq!(json, "\"0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b\"");
+	}
+
+	#[test]
+	fn test_address_deserialization_valid() {
+		// Test with 0x prefix
+		let json = "\"0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b\"";
+		let address: Address = serde_json::from_str(json).unwrap();
+
+		let expected = test_address("0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b");
+		assert_eq!(address, expected);
+
+		// Test without 0x prefix
+		let json_no_prefix = "\"a0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b\"";
+		let address_no_prefix: Address = serde_json::from_str(json_no_prefix).unwrap();
+		assert_eq!(address_no_prefix, expected);
+	}
+
+	#[test]
+	fn test_address_deserialization_invalid_hex() {
+		let invalid_hex = "\"0xzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"";
+		let result: Result<Address, _> = serde_json::from_str(invalid_hex);
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Invalid hex address"));
+	}
+
+	#[test]
+	fn test_address_deserialization_invalid_length() {
+		// Too short (19 bytes)
+		let too_short = "\"0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a\"";
+		let result: Result<Address, _> = serde_json::from_str(too_short);
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Invalid address length"));
+
+		// Too long (21 bytes)
+		let too_long = "\"0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3bff\"";
+		let result: Result<Address, _> = serde_json::from_str(too_long);
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Invalid address length"));
+	}
+
+	#[test]
+	fn test_address_round_trip_serialization() {
+		let original = test_address("0x123456789abcdef0112233445566778899aabbcc");
+
+		let json = serde_json::to_string(&original).unwrap();
+		let deserialized: Address = serde_json::from_str(&json).unwrap();
+
+		assert_eq!(original, deserialized);
+	}
+
+	#[test]
+	fn test_address_equality_and_hash() {
+		use std::collections::HashSet;
+
+		let addr1 = test_address_bytes(&[1; 20]);
+		let addr2 = test_address_bytes(&[1; 20]);
+		let addr3 = test_address_bytes(&[2; 20]);
+
+		assert_eq!(addr1, addr2);
+		assert_ne!(addr1, addr3);
+
+		let mut set = HashSet::new();
+		assert!(set.insert(addr1.clone()));
+		assert!(!set.insert(addr2)); // Should not insert duplicate
+		assert!(set.insert(addr3));
+		assert_eq!(set.len(), 2);
+	}
+
+	#[test]
+	fn test_signature_creation() {
+		let sig_bytes = vec![1u8; 65]; // 65 bytes for r + s + v
+		let signature = Signature(sig_bytes.clone());
+		assert_eq!(signature.0, sig_bytes);
+	}
+
+	#[test]
+	fn test_signature_from_primitive_signature() {
+		use alloy_primitives::{PrimitiveSignature, U256};
+
+		let r = U256::from(1);
+		let s = U256::from(2);
+		let y_parity = false; // v = 27
+
+		let primitive_sig = PrimitiveSignature::new(r, s, y_parity);
+		let signature = Signature::from(primitive_sig);
+
+		assert_eq!(signature.0.len(), 65);
+		// Check v value (should be 27 for y_parity = false)
+		assert_eq!(signature.0[64], 27);
+	}
+
+	#[test]
+	fn test_signature_from_primitive_signature_odd_parity() {
+		use alloy_primitives::{PrimitiveSignature, U256};
+
+		let r = U256::from(1);
+		let s = U256::from(2);
+		let y_parity = true; // v = 28
+
+		let primitive_sig = PrimitiveSignature::new(r, s, y_parity);
+		let signature = Signature::from(primitive_sig);
+
+		assert_eq!(signature.0.len(), 65);
+		// Check v value (should be 28 for y_parity = true)
+		assert_eq!(signature.0[64], 28);
+	}
+
+	#[test]
+	fn test_signature_debug() {
+		let sig_bytes = vec![0xde, 0xad, 0xbe, 0xef];
+		let signature = Signature(sig_bytes);
+		let debug_str = format!("{:?}", signature);
+		assert!(debug_str.contains("Signature"));
+	}
+
+	#[test]
+	fn test_signature_clone() {
+		let sig_bytes = vec![1u8; 65];
+		let original = Signature(sig_bytes.clone());
+		let cloned = original.clone();
+		assert_eq!(original.0, cloned.0);
+	}
+
+	#[test]
+	fn test_transaction_creation_with_builder() {
+		let tx = TransactionBuilder::new()
+			.data(vec![0x12, 0x34])
+			.value_u64(1000)
+			.nonce(42)
+			.gas_limit(21000)
+			.gas_price_gwei(20)
+			.build();
+
+		assert!(tx.to.is_some());
+		assert_eq!(tx.data, vec![0x12, 0x34]);
+		assert_eq!(tx.value, U256::from(1000));
+		assert_eq!(tx.chain_id, 1);
+		assert_eq!(tx.nonce, Some(42));
+		assert_eq!(tx.gas_limit, Some(21000));
+		assert_eq!(tx.gas_price, Some(20_000_000_000));
+	}
+
+	#[test]
+	fn test_transaction_from_alloy_request() {
+		use alloy_primitives::{address, Bytes, TxKind};
+		use alloy_rpc_types::{TransactionInput, TransactionRequest};
+
+		let alloy_addr = address!("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B");
+		let req = TransactionRequest {
+			to: Some(TxKind::Call(alloy_addr)),
+			value: Some(U256::from(500)),
+			chain_id: Some(137),
+			nonce: Some(10),
+			gas: Some(50000),
+			gas_price: Some(25_000_000_000),
+			input: TransactionInput {
+				input: Some(Bytes::from(vec![0xab, 0xcd])),
+				data: None,
+			},
+			..Default::default()
+		};
+
+		let tx = Transaction::from(req);
+
+		assert!(tx.to.is_some());
+		assert_eq!(tx.to.unwrap().0, alloy_addr.as_slice());
+		assert_eq!(tx.value, U256::from(500));
+		assert_eq!(tx.chain_id, 137);
+		assert_eq!(tx.nonce, Some(10));
+		assert_eq!(tx.gas_limit, Some(50000));
+		assert_eq!(tx.gas_price, Some(25_000_000_000));
+		assert_eq!(tx.data, vec![0xab, 0xcd]);
+	}
+
+	#[test]
+	fn test_transaction_from_alloy_request_minimal() {
+		use alloy_rpc_types::TransactionRequest;
+
+		// Minimal request with defaults
+		let req = TransactionRequest::default();
+		let tx = Transaction::from(req);
+
+		assert!(tx.to.is_none());
+		assert_eq!(tx.value, U256::ZERO);
+		assert_eq!(tx.chain_id, 1); // Default chain_id
+		assert!(tx.data.is_empty());
+		assert!(tx.nonce.is_none());
+	}
+
+	#[test]
+	fn test_transaction_to_alloy_request_with_builder() {
+		let tx = TransactionBuilder::new()
+			.data_hex("0xffee")
+			.unwrap()
+			.value_u64(750)
+			.nonce(15)
+			.gas_limit(30000)
+			.gas_price_gwei(30)
+			.max_fee_per_gas_gwei(40)
+			.max_priority_fee_per_gas_gwei(2)
+			.build();
+
+		let req: TransactionRequest = tx.into();
+
+		assert!(req.to.is_some());
+		assert_eq!(req.value, Some(U256::from(750)));
+		assert_eq!(req.chain_id, Some(1));
+		assert_eq!(req.nonce, Some(15));
+		assert_eq!(req.gas, Some(30000));
+		assert_eq!(req.gas_price, Some(30_000_000_000));
+		assert_eq!(req.max_fee_per_gas, Some(40_000_000_000));
+		assert_eq!(req.max_priority_fee_per_gas, Some(2_000_000_000));
+		assert_eq!(req.input.input.unwrap().to_vec(), vec![0xff, 0xee]);
+	}
+
+	#[test]
+	fn test_transaction_to_alloy_request_no_to() {
+		let tx = TransactionBuilder::new()
+			.to(None)
+			.gas_price_gwei(20)
+			.build();
+
+		let req: TransactionRequest = tx.into();
+
+		assert!(req.to.is_none());
+		assert_eq!(req.value, Some(U256::ZERO));
+		assert_eq!(req.chain_id, Some(1));
+		assert!(req.nonce.is_none());
+		assert!(req.gas.is_none());
+	}
+
+	#[test]
+	fn test_transaction_round_trip_conversion() {
+		use alloy_primitives::{address, Bytes, TxKind};
+		use alloy_rpc_types::{TransactionInput, TransactionRequest};
+
+		let original_req = TransactionRequest {
+			to: Some(TxKind::Call(address!(
+				"A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B"
+			))),
+			value: Some(U256::from(1234)),
+			chain_id: Some(5),
+			nonce: Some(99),
+			gas: Some(60000),
+			gas_price: Some(35_000_000_000),
+			input: TransactionInput {
+				input: Some(Bytes::from(vec![0x12, 0x34, 0x56])),
+				data: None,
+			},
+			..Default::default()
+		};
+
+		let tx = Transaction::from(original_req.clone());
+		let converted_req: TransactionRequest = tx.into();
+
+		assert_eq!(converted_req.to, original_req.to);
+		assert_eq!(converted_req.value, original_req.value);
+		assert_eq!(converted_req.chain_id, original_req.chain_id);
+		assert_eq!(converted_req.nonce, original_req.nonce);
+		assert_eq!(converted_req.gas, original_req.gas);
+		assert_eq!(converted_req.gas_price, original_req.gas_price);
+		assert_eq!(converted_req.input.input, original_req.input.input);
+	}
+
+	#[test]
+	fn test_transaction_debug() {
+		let tx = TransactionBuilder::new()
+			.chain_id(1)
+			.gas_price_gwei(20)
+			.build();
+
+		let debug_str = format!("{:?}", tx);
+		assert!(debug_str.contains("Transaction"));
+		assert!(debug_str.contains("chain_id: 1"));
+	}
+
+	#[test]
+	fn test_transaction_clone() {
+		let original = TransactionBuilder::new()
+			.data(vec![0x11, 0x22])
+			.value_u64(500)
+			.chain_id(10)
+			.nonce(5)
+			.gas_limit(25000)
+			.gas_price_gwei(20)
+			.build();
+
+		let cloned = original.clone();
+
+		assert_eq!(cloned.to, original.to);
+		assert_eq!(cloned.data, original.data);
+		assert_eq!(cloned.value, original.value);
+		assert_eq!(cloned.chain_id, original.chain_id);
+	}
+}

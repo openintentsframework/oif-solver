@@ -12,6 +12,7 @@ solver-delivery = { path = "../solver-delivery" }
 solver-account = { path = "../solver-account" }
 solver-discovery = { path = "../solver-discovery" }
 solver-order = { path = "../solver-order" }
+solver-pricing = { path = "../solver-pricing" }
 solver-settlement = { path = "../solver-settlement" }
 tokio = { version = "1.0", features = ["full"] }
 thiserror = "1.0"

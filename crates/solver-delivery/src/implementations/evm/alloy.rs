@@ -315,6 +315,9 @@ impl DeliveryInterface for AlloyDelivery {
 		}
 	}
 
+	/// Gets the current gas price for the network.
+	///
+	/// Returns the recommended gas price in wei as a decimal string.
 	async fn get_gas_price(&self, chain_id: u64) -> Result<String, DeliveryError> {
 		let provider = self.get_provider(chain_id)?;
 
@@ -455,6 +458,24 @@ impl DeliveryInterface for AlloyDelivery {
 			.get_block_number()
 			.await
 			.map_err(|e| DeliveryError::Network(format!("Failed to get block number: {}", e)))
+	}
+	async fn estimate_gas(&self, tx: SolverTransaction) -> Result<u64, DeliveryError> {
+		// Get the chain ID from the transaction
+		let chain_id = tx.chain_id;
+
+		// Get the appropriate provider for this chain
+		let provider = self.get_provider(chain_id)?;
+
+		// Convert to TransactionRequest
+		let request: TransactionRequest = tx.into();
+
+		// The provider with wallet will automatically handle setting the `from` field
+		// when needed for gas estimation
+		let gas = provider
+			.estimate_gas(&request)
+			.await
+			.map_err(|e| DeliveryError::Network(format!("Failed to estimate gas: {}", e)))?;
+		Ok(gas)
 	}
 }
 
