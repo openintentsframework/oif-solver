@@ -315,6 +315,9 @@ impl DeliveryInterface for AlloyDelivery {
 		}
 	}
 
+	/// Gets the current gas price for the network.
+	///
+	/// Returns the recommended gas price in wei as a decimal string.
 	async fn get_gas_price(&self, chain_id: u64) -> Result<String, DeliveryError> {
 		let provider = self.get_provider(chain_id)?;
 
@@ -456,6 +459,24 @@ impl DeliveryInterface for AlloyDelivery {
 			.await
 			.map_err(|e| DeliveryError::Network(format!("Failed to get block number: {}", e)))
 	}
+	async fn estimate_gas(&self, tx: SolverTransaction) -> Result<u64, DeliveryError> {
+		// Get the chain ID from the transaction
+		let chain_id = tx.chain_id;
+
+		// Get the appropriate provider for this chain
+		let provider = self.get_provider(chain_id)?;
+
+		// Convert to TransactionRequest
+		let request: TransactionRequest = tx.into();
+
+		// The provider with wallet will automatically handle setting the `from` field
+		// when needed for gas estimation
+		let gas = provider
+			.estimate_gas(&request)
+			.await
+			.map_err(|e| DeliveryError::Network(format!("Failed to estimate gas: {}", e)))?;
+		Ok(gas)
+	}
 }
 
 /// Factory function to create an HTTP-based delivery provider from configuration.
@@ -543,3 +564,117 @@ impl solver_types::ImplementationRegistry for Registry {
 }
 
 impl crate::DeliveryRegistry for Registry {}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use solver_types::{
+		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder, RpcEndpointBuilder},
+		SecretString,
+	};
+	use std::collections::HashMap;
+
+	fn create_test_networks() -> NetworksConfig {
+		NetworksConfigBuilder::new()
+			.add_network(
+				1,
+				NetworkConfigBuilder::new()
+					.add_rpc_endpoint(RpcEndpointBuilder::new().build())
+					.build(),
+			)
+			.build()
+	}
+
+	fn create_test_signer() -> PrivateKeySigner {
+		"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+			.parse()
+			.unwrap()
+	}
+
+	#[tokio::test]
+	async fn test_alloy_delivery_new_success() {
+		let networks = create_test_networks();
+		let signer = create_test_signer();
+
+		let result = AlloyDelivery::new(vec![1], &networks, HashMap::new(), signer).await;
+
+		assert!(result.is_ok());
+		let delivery = result.unwrap();
+		assert!(delivery.providers.contains_key(&1));
+	}
+
+	#[tokio::test]
+	async fn test_alloy_delivery_new_empty_networks() {
+		let networks = NetworksConfigBuilder::new().build();
+		let signer = create_test_signer();
+
+		let result = AlloyDelivery::new(vec![], &networks, HashMap::new(), signer).await;
+
+		assert!(matches!(result, Err(DeliveryError::Network(_))));
+		if let Err(DeliveryError::Network(msg)) = result {
+			assert!(msg.contains("At least one network_id must be specified"));
+		}
+	}
+
+	#[test]
+	fn test_config_schema_validation_valid() {
+		let schema = AlloyDeliverySchema;
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"network_ids".to_string(),
+				toml::Value::Array(vec![toml::Value::Integer(1)]),
+			);
+			table
+		});
+
+		let result = schema.validate(&config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_config_schema_validation_empty_network_ids() {
+		let schema = AlloyDeliverySchema;
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert("network_ids".to_string(), toml::Value::Array(vec![]));
+			table
+		});
+
+		let result = schema.validate(&config);
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("network_ids cannot be empty"));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_create_http_delivery_success() {
+		let config = toml::Value::Table({
+			let mut table = toml::map::Map::new();
+			table.insert(
+				"network_ids".to_string(),
+				toml::Value::Array(vec![toml::Value::Integer(1)]),
+			);
+			table
+		});
+
+		let networks = create_test_networks();
+		let default_key = SecretString::from(
+			"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+		);
+		let network_keys = HashMap::new();
+
+		let result = create_http_delivery(&config, &networks, &default_key, &network_keys);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_registry_name() {
+		assert_eq!(
+			<Registry as solver_types::ImplementationRegistry>::NAME,
+			"evm_alloy"
+		);
+	}
+}

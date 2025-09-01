@@ -20,6 +20,7 @@ use solver_types::{
 /// This implementation manages a private key locally and uses it to sign
 /// transactions and messages. It's suitable for development and testing
 /// environments where key management simplicity is preferred.
+#[derive(Debug)]
 pub struct LocalWallet {
 	/// The underlying Alloy signer that handles cryptographic operations.
 	signer: PrivateKeySigner,
@@ -188,3 +189,185 @@ impl solver_types::ImplementationRegistry for Registry {
 }
 
 impl crate::AccountRegistry for Registry {}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use solver_types::{
+		utils::tests::builders::TransactionBuilder, Address, ImplementationRegistry, Transaction,
+	};
+	use std::collections::HashMap;
+
+	// Test private key (FOR TESTING ONLY!)
+	const TEST_PRIVATE_KEY: &str =
+		"ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+	const TEST_PRIVATE_KEY_WITH_PREFIX: &str =
+		"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+	const INVALID_PRIVATE_KEY: &str = "invalid_key";
+	const SHORT_PRIVATE_KEY: &str = "1234";
+
+	fn create_test_config(private_key: &str) -> toml::Value {
+		let mut config = HashMap::new();
+		config.insert(
+			"private_key".to_string(),
+			toml::Value::String(private_key.to_string()),
+		);
+		toml::Value::Table(config.into_iter().collect())
+	}
+
+	fn create_test_transaction() -> Transaction {
+		TransactionBuilder::new().gas_price_gwei(21).build()
+	}
+
+	#[test]
+	fn test_local_wallet_new_valid_key() {
+		let wallet = LocalWallet::new(TEST_PRIVATE_KEY).unwrap();
+		assert!(wallet.signer.to_bytes().len() == 32);
+	}
+
+	#[test]
+	fn test_local_wallet_new_valid_key_with_prefix() {
+		let wallet = LocalWallet::new(TEST_PRIVATE_KEY_WITH_PREFIX).unwrap();
+		assert!(wallet.signer.to_bytes().len() == 32);
+	}
+
+	#[test]
+	fn test_local_wallet_new_invalid_key() {
+		let result = LocalWallet::new(INVALID_PRIVATE_KEY);
+		assert!(result.is_err());
+		assert!(matches!(result.unwrap_err(), AccountError::InvalidKey(_)));
+	}
+
+	#[test]
+	fn test_local_wallet_get_private_key() {
+		let wallet = LocalWallet::new(TEST_PRIVATE_KEY).unwrap();
+		let private_key = wallet.get_private_key();
+		let private_key_str = private_key.with_exposed(|s| s.to_string());
+		assert!(private_key_str.starts_with("0x"));
+		assert_eq!(private_key_str.len(), 66); // 0x + 64 hex chars
+	}
+
+	#[test]
+	fn test_schema_validation_valid_config() {
+		let config = create_test_config(TEST_PRIVATE_KEY);
+		let result = LocalWalletSchema::validate_config(&config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_schema_validation_valid_config_with_prefix() {
+		let config = create_test_config(TEST_PRIVATE_KEY_WITH_PREFIX);
+		let result = LocalWalletSchema::validate_config(&config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_schema_validation_invalid_hex() {
+		let config = create_test_config(INVALID_PRIVATE_KEY);
+		let result = LocalWalletSchema::validate_config(&config);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_schema_validation_short_key() {
+		let config = create_test_config(SHORT_PRIVATE_KEY);
+		let result = LocalWalletSchema::validate_config(&config);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_schema_validation_missing_private_key() {
+		let config = toml::Value::Table(HashMap::new().into_iter().collect());
+		let result = LocalWalletSchema::validate_config(&config);
+		assert!(result.is_err());
+	}
+
+	#[tokio::test]
+	async fn test_account_interface_address() {
+		let wallet = LocalWallet::new(TEST_PRIVATE_KEY).unwrap();
+		let address = wallet.address().await.unwrap();
+		assert_eq!(address.0.len(), 20);
+	}
+
+	#[tokio::test]
+	async fn test_account_interface_sign_transaction() {
+		let wallet = LocalWallet::new(TEST_PRIVATE_KEY).unwrap();
+		let tx = create_test_transaction();
+		let signature = wallet.sign_transaction(&tx).await.unwrap();
+		assert!(!signature.0.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_account_interface_sign_transaction_invalid_address() {
+		let wallet = LocalWallet::new(TEST_PRIVATE_KEY).unwrap();
+		let mut tx = create_test_transaction();
+		tx.to = Some(Address(vec![0u8; 19])); // Invalid address length
+
+		let result = wallet.sign_transaction(&tx).await;
+		assert!(result.is_err());
+		assert!(matches!(
+			result.unwrap_err(),
+			AccountError::SigningFailed(_)
+		));
+	}
+
+	#[tokio::test]
+	async fn test_account_interface_sign_transaction_contract_creation() {
+		let wallet = LocalWallet::new(TEST_PRIVATE_KEY).unwrap();
+		let mut tx = create_test_transaction();
+		tx.to = None; // Contract creation
+
+		let signature = wallet.sign_transaction(&tx).await.unwrap();
+		assert!(!signature.0.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_account_interface_sign_message() {
+		let wallet = LocalWallet::new(TEST_PRIVATE_KEY).unwrap();
+		let message = b"Hello, World!";
+		let signature = wallet.sign_message(message).await.unwrap();
+		assert!(!signature.0.is_empty());
+	}
+
+	#[test]
+	fn test_create_account_valid_config() {
+		let config = create_test_config(TEST_PRIVATE_KEY);
+		let account = create_account(&config).unwrap();
+		assert!(!account.get_private_key().with_exposed(|s| s.is_empty()));
+	}
+
+	#[test]
+	fn test_create_account_invalid_config() {
+		let config = create_test_config(INVALID_PRIVATE_KEY);
+		let result = create_account(&config);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_create_account_missing_private_key() {
+		let config = toml::Value::Table(HashMap::new().into_iter().collect());
+		let result = create_account(&config);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_registry_name() {
+		assert_eq!(Registry::NAME, "local");
+	}
+
+	#[test]
+	fn test_registry_factory() {
+		let factory = Registry::factory();
+		let config = create_test_config(TEST_PRIVATE_KEY);
+		let account = factory(&config).unwrap();
+		assert!(!account.get_private_key().with_exposed(|s| s.is_empty()));
+	}
+
+	#[test]
+	fn test_config_schema_interface() {
+		let wallet = LocalWallet::new(TEST_PRIVATE_KEY).unwrap();
+		let schema = wallet.config_schema();
+		let config = create_test_config(TEST_PRIVATE_KEY);
+		assert!(schema.validate(&config).is_ok());
+	}
+}

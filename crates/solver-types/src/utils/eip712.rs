@@ -80,3 +80,192 @@ impl Eip712AbiEncoder {
 		self.buf
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use alloy_primitives::{address, b256, U256};
+
+	#[test]
+	fn test_compute_domain_hash() {
+		let name = "TestDomain";
+		let chain_id = 1u64;
+		let verifying_contract = address!("1234567890123456789012345678901234567890");
+
+		let result = compute_domain_hash(name, chain_id, &verifying_contract);
+
+		// Verify it produces a valid 32-byte hash
+		assert_eq!(result.len(), 32);
+
+		// Test deterministic behavior
+		let result2 = compute_domain_hash(name, chain_id, &verifying_contract);
+		assert_eq!(result, result2);
+
+		// Test different inputs produce different results
+		let different_name = compute_domain_hash("DifferentName", chain_id, &verifying_contract);
+		assert_ne!(result, different_name);
+
+		let different_chain = compute_domain_hash(name, 42u64, &verifying_contract);
+		assert_ne!(result, different_chain);
+	}
+
+	#[test]
+	fn test_compute_domain_hash_permit2() {
+		// Test with Permit2 name specifically
+		let chain_id = 1u64;
+		let verifying_contract = address!("000000000022D473030F116dDEE9F6B43aC78BA3");
+
+		let result = compute_domain_hash(NAME_PERMIT2, chain_id, &verifying_contract);
+		assert_eq!(result.len(), 32);
+
+		// Should be deterministic
+		let result2 = compute_domain_hash(NAME_PERMIT2, chain_id, &verifying_contract);
+		assert_eq!(result, result2);
+	}
+
+	#[test]
+	fn test_compute_final_digest() {
+		let domain_hash = b256!("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
+		let struct_hash = b256!("fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321");
+
+		let result = compute_final_digest(&domain_hash, &struct_hash);
+
+		// Verify it produces a valid 32-byte hash
+		assert_eq!(result.len(), 32);
+
+		// Test deterministic behavior
+		let result2 = compute_final_digest(&domain_hash, &struct_hash);
+		assert_eq!(result, result2);
+
+		// Test different inputs produce different results
+		let different_domain =
+			b256!("0000000000000000000000000000000000000000000000000000000000000000");
+		let different_result = compute_final_digest(&different_domain, &struct_hash);
+		assert_ne!(result, different_result);
+	}
+
+	#[test]
+	fn test_eip712_abi_encoder_new() {
+		let encoder = Eip712AbiEncoder::new();
+		assert_eq!(encoder.buf.len(), 0);
+
+		// Test default implementation
+		let encoder_default = Eip712AbiEncoder::default();
+		assert_eq!(encoder_default.buf.len(), 0);
+	}
+
+	#[test]
+	fn test_eip712_abi_encoder_push_b256() {
+		let mut encoder = Eip712AbiEncoder::new();
+		let test_hash = b256!("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
+
+		encoder.push_b256(&test_hash);
+
+		let result = encoder.finish();
+		assert_eq!(result.len(), 32);
+		assert_eq!(result, test_hash.as_slice());
+	}
+
+	#[test]
+	fn test_eip712_abi_encoder_push_address() {
+		let mut encoder = Eip712AbiEncoder::new();
+		let test_address = address!("1234567890123456789012345678901234567890");
+
+		encoder.push_address(&test_address);
+
+		let result = encoder.finish();
+		assert_eq!(result.len(), 32);
+
+		// Address should be right-aligned in 32-byte word (12 zero bytes + 20 address bytes)
+		assert_eq!(&result[0..12], &[0u8; 12]);
+		assert_eq!(&result[12..32], test_address.as_slice());
+	}
+
+	#[test]
+	fn test_eip712_abi_encoder_push_u256() {
+		let mut encoder = Eip712AbiEncoder::new();
+		let test_value = U256::from(0x123456789abcdefu64);
+
+		encoder.push_u256(test_value);
+
+		let result = encoder.finish();
+		assert_eq!(result.len(), 32);
+
+		// Verify big-endian encoding
+		let expected = test_value.to_be_bytes::<32>();
+		assert_eq!(result, expected);
+	}
+
+	#[test]
+	fn test_eip712_abi_encoder_push_u32() {
+		let mut encoder = Eip712AbiEncoder::new();
+		let test_value = 0x12345678u32;
+
+		encoder.push_u32(test_value);
+
+		let result = encoder.finish();
+		assert_eq!(result.len(), 32);
+
+		// u32 should be right-aligned in 32-byte word
+		assert_eq!(&result[0..28], &[0u8; 28]);
+		assert_eq!(&result[28..32], &test_value.to_be_bytes());
+	}
+
+	#[test]
+	fn test_eip712_abi_encoder_multiple_pushes() {
+		let mut encoder = Eip712AbiEncoder::new();
+
+		let test_hash = b256!("1111111111111111111111111111111111111111111111111111111111111111");
+		let test_address = address!("2222222222222222222222222222222222222222");
+		let test_u256 = U256::from(0x3333u64);
+		let test_u32 = 0x4444u32;
+
+		encoder.push_b256(&test_hash);
+		encoder.push_address(&test_address);
+		encoder.push_u256(test_u256);
+		encoder.push_u32(test_u32);
+
+		let result = encoder.finish();
+		assert_eq!(result.len(), 32 * 4); // 4 × 32-byte words
+
+		// Verify each section
+		assert_eq!(&result[0..32], test_hash.as_slice());
+
+		// Address section (12 zero bytes + 20 address bytes)
+		assert_eq!(&result[32..44], &[0u8; 12]);
+		assert_eq!(&result[44..64], test_address.as_slice());
+
+		// U256 section
+		assert_eq!(&result[64..96], &test_u256.to_be_bytes::<32>());
+
+		// U32 section (28 zero bytes + 4 value bytes)
+		assert_eq!(&result[96..124], &[0u8; 28]);
+		assert_eq!(&result[124..128], &test_u32.to_be_bytes());
+	}
+
+	#[test]
+	fn test_eip712_abi_encoder_empty() {
+		let encoder = Eip712AbiEncoder::new();
+		let result = encoder.finish();
+		assert_eq!(result.len(), 0);
+	}
+
+	#[test]
+	fn test_final_digest_matches_eip712_spec() {
+		// Test that the final digest follows EIP-712 specification: 0x1901 || domainHash || structHash
+		let domain_hash = b256!("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
+		let struct_hash = b256!("fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321");
+
+		let result = compute_final_digest(&domain_hash, &struct_hash);
+
+		// Manually construct what the result should be
+		let mut expected_input = Vec::new();
+		expected_input.push(0x19);
+		expected_input.push(0x01);
+		expected_input.extend_from_slice(domain_hash.as_slice());
+		expected_input.extend_from_slice(struct_hash.as_slice());
+		let expected = keccak256(expected_input);
+
+		assert_eq!(result, expected);
+	}
+}
