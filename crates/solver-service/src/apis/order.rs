@@ -9,7 +9,7 @@ use solver_core::SolverEngine;
 use solver_types::{
 	bytes32_to_address, parse_address, with_0x_prefix, AssetAmount, GetOrderError,
 	GetOrderResponse, InteropAddress, Order, OrderResponse, OrderStatus, Settlement,
-	SettlementType, TransactionType,
+	SettlementType, StorageKey, TransactionType,
 };
 
 /// Handles GET /orders/{id} requests.
@@ -36,7 +36,7 @@ async fn process_order_request(
 	// Try to retrieve the order from storage
 	match solver
 		.storage()
-		.retrieve::<solver_types::Order>("orders", order_id)
+		.retrieve::<Order>(StorageKey::Orders.as_str(), order_id)
 		.await
 	{
 		Ok(order) => {
