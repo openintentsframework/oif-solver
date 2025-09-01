@@ -63,7 +63,7 @@ impl Clone for EventBus {
 mod tests {
 	use super::*;
 	use solver_types::{
-		utils::builders::{IntentBuilder, OrderBuilder},
+		utils::tests::builders::{IntentBuilder, OrderBuilder},
 		DeliveryEvent, ExecutionParams, OrderEvent, SolverEvent,
 	};
 

@@ -251,7 +251,7 @@ impl OrderStateMachine {
 mod tests {
 	use super::*;
 	use solver_storage::StorageService;
-	use solver_types::{utils::builders::OrderBuilder, OrderStatus, TransactionType};
+	use solver_types::{utils::tests::builders::OrderBuilder, OrderStatus, TransactionType};
 	use std::sync::Arc;
 	use tokio;
 

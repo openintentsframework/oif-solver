@@ -3,7 +3,6 @@
 //! This module provides helper functions for converting between different
 //! data formats and string formatting commonly used throughout the solver system.
 
-pub mod builders;
 pub mod constants;
 pub mod conversion;
 pub mod eip712;

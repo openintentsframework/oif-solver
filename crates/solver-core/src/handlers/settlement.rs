@@ -334,7 +334,7 @@ mod tests {
 	use solver_order::{MockOrderInterface, OrderService};
 	use solver_settlement::{MockSettlementInterface, SettlementService};
 	use solver_storage::{MockStorageInterface, StorageError, StorageService};
-	use solver_types::utils::builders::{
+	use solver_types::utils::tests::builders::{
 		OrderBuilder, TransactionBuilder, TransactionReceiptBuilder,
 	};
 	use solver_types::{Order, Transaction, TransactionHash, TransactionReceipt};

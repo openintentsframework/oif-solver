@@ -765,7 +765,7 @@ mod tests {
 	use solver_delivery::MockDeliveryInterface;
 	use solver_storage::MockStorageInterface;
 	use solver_types::{
-		utils::builders::{IntentBuilder, OrderBuilder},
+		utils::tests::builders::{IntentBuilder, OrderBuilder},
 		ExecutionParams, FillProof, TransactionHash,
 	};
 	use std::collections::HashMap;

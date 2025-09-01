@@ -193,7 +193,7 @@ mod tests {
 	use solver_delivery::{DeliveryService, MockDeliveryInterface};
 	use solver_order::{MockOrderInterface, OrderService};
 	use solver_storage::{MockStorageInterface, StorageService};
-	use solver_types::utils::builders::{IntentBuilder, OrderBuilder, TransactionBuilder};
+	use solver_types::utils::tests::builders::{IntentBuilder, OrderBuilder, TransactionBuilder};
 	use solver_types::{
 		ExecutionParams, Intent, Order, SolverEvent, Transaction, TransactionHash, TransactionType,
 	};

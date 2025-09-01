@@ -191,7 +191,7 @@ mod tests {
 	use solver_delivery::DeliveryService;
 	use solver_order::{MockExecutionStrategy, MockOrderInterface};
 	use solver_storage::{MockStorageInterface, StorageError};
-	use solver_types::utils::builders::{IntentBuilder, OrderBuilder};
+	use solver_types::utils::tests::builders::{IntentBuilder, OrderBuilder};
 	use solver_types::{Address, ExecutionParams, Intent, Order, SolverEvent};
 	use std::collections::HashMap;
 	use std::sync::Arc;

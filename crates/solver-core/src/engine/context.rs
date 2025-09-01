@@ -262,7 +262,7 @@ mod tests {
 	use solver_account::MockAccountInterface;
 	use solver_delivery::MockDeliveryInterface;
 	use solver_types::{
-		utils::builders::IntentBuilder, Address, Intent, NetworksConfig, TokenConfig,
+		utils::tests::builders::IntentBuilder, Address, Intent, NetworksConfig, TokenConfig,
 	};
 	use std::collections::HashMap;
 

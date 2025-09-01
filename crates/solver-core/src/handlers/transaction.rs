@@ -357,7 +357,7 @@ mod tests {
 	use mockall::predicate::*;
 	use solver_delivery::{DeliveryService, MockDeliveryInterface};
 	use solver_storage::{MockStorageInterface, StorageService};
-	use solver_types::utils::builders::{OrderBuilder, TransactionReceiptBuilder};
+	use solver_types::utils::tests::builders::{OrderBuilder, TransactionReceiptBuilder};
 	use solver_types::{
 		ExecutionParams, Order, OrderStatus, SolverEvent, StorageKey, TransactionHash,
 		TransactionReceipt, TransactionType,

@@ -563,6 +563,7 @@ mod tests {
 		Arc<DiscoveryService>,
 		Arc<OrderService>,
 		Arc<SettlementService>,
+		Arc<PricingService>,
 		EventBus,
 		Arc<TokenManager>,
 	) {
@@ -659,6 +660,13 @@ mod tests {
 		// Create settlement service - using empty implementations map for testing
 		let settlement = Arc::new(SettlementService::new(std::collections::HashMap::new()));
 
+		// Create pricing service with mock implementation
+		let pricing_config = toml::Value::Table(toml::value::Table::new());
+		let pricing_impl =
+			solver_pricing::implementations::mock::create_mock_pricing(&pricing_config)
+				.expect("Failed to create mock pricing");
+		let pricing = Arc::new(solver_pricing::PricingService::new(pricing_impl));
+
 		let event_bus = EventBus::new(100);
 
 		// Create token manager with empty networks config
@@ -678,6 +686,7 @@ mod tests {
 			discovery,
 			order,
 			settlement,
+			pricing,
 			event_bus,
 			token_manager,
 		)
@@ -694,6 +703,7 @@ mod tests {
 			discovery,
 			order,
 			settlement,
+			pricing,
 			event_bus,
 			token_manager,
 		) = create_mock_services();
@@ -707,6 +717,7 @@ mod tests {
 			discovery.clone(),
 			order.clone(),
 			settlement.clone(),
+			pricing.clone(),
 			event_bus.clone(),
 			token_manager.clone(),
 		);
@@ -736,6 +747,7 @@ mod tests {
 			discovery,
 			order,
 			settlement,
+			pricing,
 			event_bus,
 			token_manager,
 		) = create_mock_services();
@@ -749,6 +761,7 @@ mod tests {
 			discovery,
 			order,
 			settlement,
+			pricing,
 			event_bus,
 			token_manager,
 		);
@@ -771,6 +784,7 @@ mod tests {
 			discovery,
 			order,
 			settlement,
+			pricing,
 			event_bus,
 			token_manager,
 		) = create_mock_services();
@@ -784,6 +798,7 @@ mod tests {
 			discovery,
 			order,
 			settlement,
+			pricing,
 			event_bus,
 			token_manager,
 		);
@@ -805,6 +820,7 @@ mod tests {
 			discovery,
 			order,
 			settlement,
+			pricing,
 			event_bus,
 			token_manager,
 		) = create_mock_services();
@@ -818,6 +834,7 @@ mod tests {
 			discovery,
 			order,
 			settlement,
+			pricing,
 			event_bus,
 			token_manager,
 		);
