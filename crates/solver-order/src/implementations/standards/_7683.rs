@@ -849,42 +849,31 @@ mod tests {
 	use super::*;
 	use alloy_primitives::U256;
 	use solver_types::{
-		networks::RpcEndpoint,
 		oracle::{OracleInfo, OracleRoutes},
 		standards::eip7683::{Eip7683OrderData, GasLimitOverrides, LockType, MandateOutput},
-		Address, ExecutionParams, FillProof, Intent, IntentMetadata, NetworkConfig, NetworksConfig,
-		OrderStatus, TransactionHash,
+		utils::builders::{
+			IntentBuilder, NetworkConfigBuilder, NetworksConfigBuilder, OrderBuilder,
+			RpcEndpointBuilder,
+		},
+		Address, ExecutionParams, FillProof, Intent, NetworksConfig, OrderStatus, TransactionHash,
 	};
 	use std::collections::HashMap;
 
 	fn create_test_networks() -> NetworksConfig {
-		let mut networks = HashMap::new();
-
-		networks.insert(
-			1u64,
-			NetworkConfig {
-				rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
-				input_settler_address: Address(vec![1u8; 20]),
-				output_settler_address: Address(vec![2u8; 20]),
-				input_settler_compact_address: Some(Address(vec![3u8; 20])),
-				the_compact_address: None,
-				tokens: vec![],
-			},
-		);
-
-		networks.insert(
-			137u64,
-			NetworkConfig {
-				rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8546".to_string())],
-				input_settler_address: Address(vec![4u8; 20]),
-				output_settler_address: Address(vec![5u8; 20]),
-				input_settler_compact_address: None,
-				the_compact_address: None,
-				tokens: vec![],
-			},
-		);
-
-		networks
+		NetworksConfigBuilder::new()
+			.add_network(
+				1,
+				NetworkConfigBuilder::new()
+					.add_rpc_endpoint(RpcEndpointBuilder::new().build())
+					.build(),
+			)
+			.add_network(
+				137,
+				NetworkConfigBuilder::new()
+					.add_rpc_endpoint(RpcEndpointBuilder::new().build())
+					.build(),
+			)
+			.build()
 	}
 
 	fn create_test_oracle_routes() -> OracleRoutes {
@@ -940,21 +929,12 @@ mod tests {
 	}
 
 	fn create_test_intent(order_data: Eip7683OrderData, source: &str) -> Intent {
-		Intent {
-			id: "test-intent-id".to_string(),
-			standard: "eip7683".to_string(),
-			source: source.to_string(),
-			data: serde_json::to_value(&order_data).unwrap(),
-			quote_id: Some("test-quote-id".to_string()),
-			metadata: IntentMetadata {
-				requires_auction: false,
-				exclusive_until: None,
-				discovered_at: std::time::SystemTime::now()
-					.duration_since(std::time::UNIX_EPOCH)
-					.unwrap()
-					.as_secs(),
-			},
-		}
+		IntentBuilder::new()
+			.with_id("test-intent-id".to_string())
+			.with_source(source.to_string())
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_quote_id(Some("test-quote-id".to_string()))
+			.build()
 	}
 
 	#[test]
@@ -968,18 +948,14 @@ mod tests {
 
 	#[test]
 	fn test_new_with_insufficient_networks() {
-		let mut networks = HashMap::new();
-		networks.insert(
-			1u64,
-			NetworkConfig {
-				rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
-				input_settler_address: Address(vec![1u8; 20]),
-				output_settler_address: Address(vec![2u8; 20]),
-				input_settler_compact_address: None,
-				the_compact_address: None,
-				tokens: vec![],
-			},
-		);
+		let networks = NetworksConfigBuilder::new()
+			.add_network(
+				1,
+				NetworkConfigBuilder::new()
+					.add_rpc_endpoint(RpcEndpointBuilder::new().build())
+					.build(),
+			)
+			.build();
 
 		let oracle_routes = create_test_oracle_routes();
 
@@ -1069,25 +1045,13 @@ mod tests {
 
 		let order_data = create_test_order_data();
 		let intent = create_test_intent(order_data.clone(), "on-chain");
-		let order = Order {
-			id: "test-order".to_string(),
-			standard: "eip7683".to_string(),
-			created_at: 123456789,
-			data: serde_json::to_value(&order_data).unwrap(),
-			solver_address: Address(vec![99u8; 20]),
-			quote_id: Some("test-quote".to_string()),
-			input_chain_ids: vec![1],
-			output_chain_ids: vec![137],
-			updated_at: 123456789,
-			status: OrderStatus::Created,
-			execution_params: None,
-			prepare_tx_hash: None,
-			fill_tx_hash: None,
-			claim_tx_hash: None,
-			fill_proof: None,
-			post_fill_tx_hash: None,
-			pre_claim_tx_hash: None,
-		};
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_solver_address(Address(vec![99u8; 20]))
+			.with_quote_id(Some("test-quote".to_string()))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![137])
+			.build();
 		let params = ExecutionParams {
 			gas_price: U256::ZERO,
 			priority_fee: None,
@@ -1112,25 +1076,13 @@ mod tests {
 		order_data.signature = Some("0x22222222".to_string());
 
 		let intent = create_test_intent(order_data.clone(), "off-chain");
-		let order = Order {
-			id: "test-order".to_string(),
-			standard: "eip7683".to_string(),
-			created_at: 123456789,
-			data: serde_json::to_value(&order_data).unwrap(),
-			solver_address: Address(vec![99u8; 20]),
-			quote_id: Some("test-quote".to_string()),
-			input_chain_ids: vec![1],
-			output_chain_ids: vec![137],
-			updated_at: 123456789,
-			status: OrderStatus::Created,
-			execution_params: None,
-			prepare_tx_hash: None,
-			fill_tx_hash: None,
-			claim_tx_hash: None,
-			fill_proof: None,
-			post_fill_tx_hash: None,
-			pre_claim_tx_hash: None,
-		};
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_solver_address(Address(vec![99u8; 20]))
+			.with_quote_id(Some("test-quote".to_string()))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![137])
+			.build();
 		let params = ExecutionParams {
 			gas_price: U256::ZERO,
 			priority_fee: None,
@@ -1143,7 +1095,12 @@ mod tests {
 
 		let tx = result.unwrap().unwrap();
 		assert_eq!(tx.chain_id, 1);
-		assert_eq!(tx.to, Some(Address(vec![1u8; 20]))); // input_settler_address for chain 1
+		assert_eq!(
+			tx.to,
+			Some(Address(
+				hex::decode("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9").unwrap()
+			))
+		); // input_settler_address for chain 1
 		assert!(!tx.data.is_empty());
 	}
 
@@ -1154,25 +1111,13 @@ mod tests {
 		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let order_data = create_test_order_data();
-		let order = Order {
-			id: "test-order".to_string(),
-			standard: "eip7683".to_string(),
-			created_at: 123456789,
-			data: serde_json::to_value(&order_data).unwrap(),
-			solver_address: Address(vec![99u8; 20]),
-			quote_id: Some("test-quote".to_string()),
-			input_chain_ids: vec![1],
-			output_chain_ids: vec![137],
-			updated_at: 123456789,
-			status: OrderStatus::Created,
-			execution_params: None,
-			prepare_tx_hash: None,
-			fill_tx_hash: None,
-			claim_tx_hash: None,
-			fill_proof: None,
-			post_fill_tx_hash: None,
-			pre_claim_tx_hash: None,
-		};
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_solver_address(Address(vec![99u8; 20]))
+			.with_quote_id(Some("test-quote".to_string()))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![137])
+			.build();
 		let params = ExecutionParams {
 			gas_price: U256::ZERO,
 			priority_fee: None,
@@ -1183,7 +1128,12 @@ mod tests {
 
 		let tx = result.unwrap();
 		assert_eq!(tx.chain_id, 137); // destination chain
-		assert_eq!(tx.to, Some(Address(vec![5u8; 20]))); // output_settler_address for chain 137
+		assert_eq!(
+			tx.to,
+			Some(Address(
+				hex::decode("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f").unwrap()
+			))
+		); // output_settler_address for chain 137
 		assert!(!tx.data.is_empty());
 	}
 
@@ -1194,26 +1144,13 @@ mod tests {
 		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let order_data = create_test_order_data();
-		let order = Order {
-			id: "test-order".to_string(),
-			standard: "eip7683".to_string(),
-			created_at: 123456789,
-			data: serde_json::to_value(&order_data).unwrap(),
-			solver_address: Address(vec![99u8; 20]),
-			quote_id: Some("test-quote".to_string()),
-			input_chain_ids: vec![1],
-			output_chain_ids: vec![137],
-			updated_at: 123456789,
-			status: OrderStatus::Created,
-			execution_params: None,
-			prepare_tx_hash: None,
-			fill_tx_hash: None,
-			claim_tx_hash: None,
-			fill_proof: None,
-			post_fill_tx_hash: None,
-			pre_claim_tx_hash: None,
-		};
-
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_solver_address(Address(vec![99u8; 20]))
+			.with_quote_id(Some("test-quote".to_string()))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![137])
+			.build();
 		let fill_proof = FillProof {
 			tx_hash: TransactionHash(hex::decode("abcd").unwrap()),
 			block_number: 12345,
@@ -1229,7 +1166,12 @@ mod tests {
 
 		let tx = result.unwrap();
 		assert_eq!(tx.chain_id, 1); // origin chain
-		assert_eq!(tx.to, Some(Address(vec![1u8; 20]))); // input_settler_address for chain 1
+		assert_eq!(
+			tx.to,
+			Some(Address(
+				hex::decode("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9").unwrap()
+			))
+		); // input_settler_address for chain 1
 		assert!(!tx.data.is_empty());
 	}
 
@@ -1243,25 +1185,14 @@ mod tests {
 		order_data.lock_type = Some(LockType::ResourceLock);
 		order_data.signature = Some("0x123456789abcdef0".to_string());
 
-		let order = Order {
-			id: "test-order".to_string(),
-			standard: "eip7683".to_string(),
-			created_at: 123456789,
-			data: serde_json::to_value(&order_data).unwrap(),
-			solver_address: Address(vec![99u8; 20]),
-			quote_id: Some("test-quote".to_string()),
-			input_chain_ids: vec![1],
-			output_chain_ids: vec![137],
-			updated_at: 123456789,
-			status: OrderStatus::Created,
-			execution_params: None,
-			prepare_tx_hash: None,
-			fill_tx_hash: None,
-			claim_tx_hash: None,
-			fill_proof: None,
-			post_fill_tx_hash: None,
-			pre_claim_tx_hash: None,
-		};
+		let order = OrderBuilder::new()
+			.with_id("test-order".to_string())
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_solver_address(Address(vec![99u8; 20]))
+			.with_quote_id(Some("test-quote".to_string()))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![137])
+			.build();
 
 		let fill_proof = FillProof {
 			tx_hash: TransactionHash(hex::decode("abcd").unwrap()),
@@ -1278,7 +1209,12 @@ mod tests {
 
 		let tx = result.unwrap();
 		assert_eq!(tx.chain_id, 1); // origin chain
-		assert_eq!(tx.to, Some(Address(vec![3u8; 20]))); // compact address for chain 1
+		assert_eq!(
+			tx.to,
+			Some(Address(
+				hex::decode("00000000000c2e074ec69a0dfb2997ba6c7d2e1e").unwrap()
+			))
+		); // compact address for chain 1
 		assert!(!tx.data.is_empty());
 	}
 
@@ -1327,26 +1263,13 @@ mod tests {
 		let mut order_data = create_test_order_data();
 		// Make the output same-chain
 		order_data.outputs[0].chain_id = U256::from(1);
-
-		let order = Order {
-			id: "test-order".to_string(),
-			standard: "eip7683".to_string(),
-			created_at: 123456789,
-			data: serde_json::to_value(&order_data).unwrap(),
-			solver_address: Address(vec![99u8; 20]),
-			quote_id: Some("test-quote".to_string()),
-			input_chain_ids: vec![1],
-			output_chain_ids: vec![1],
-			updated_at: 123456789,
-			status: OrderStatus::Created,
-			execution_params: None,
-			prepare_tx_hash: None,
-			fill_tx_hash: None,
-			claim_tx_hash: None,
-			fill_proof: None,
-			post_fill_tx_hash: None,
-			pre_claim_tx_hash: None,
-		};
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_solver_address(Address(vec![99u8; 20]))
+			.with_quote_id(Some("test-quote".to_string()))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![1])
+			.build();
 		let params = ExecutionParams {
 			gas_price: U256::ZERO,
 			priority_fee: None,

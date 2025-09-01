@@ -191,7 +191,8 @@ mod tests {
 	use alloy_primitives::U256;
 	use solver_types::{
 		standards::eip7683::{Eip7683OrderData, GasLimitOverrides, MandateOutput},
-		ChainData, ExecutionContext, Order, OrderStatus,
+		utils::builders::OrderBuilder,
+		ChainData, ExecutionContext, Order,
 	};
 	use std::collections::HashMap;
 
@@ -235,25 +236,13 @@ mod tests {
 	}
 
 	fn create_test_order(order_data: Eip7683OrderData) -> Order {
-		Order {
-			id: "test-order".to_string(),
-			standard: "eip7683".to_string(),
-			created_at: 123456789,
-			data: serde_json::to_value(&order_data).unwrap(),
-			solver_address: solver_types::Address(vec![99u8; 20]),
-			quote_id: Some("test-quote".to_string()),
-			input_chain_ids: vec![1],
-			output_chain_ids: vec![137],
-			updated_at: 123456789,
-			status: OrderStatus::Created,
-			execution_params: None,
-			prepare_tx_hash: None,
-			fill_tx_hash: None,
-			claim_tx_hash: None,
-			fill_proof: None,
-			post_fill_tx_hash: None,
-			pre_claim_tx_hash: None,
-		}
+		OrderBuilder::new()
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_solver_address(solver_types::Address(vec![99u8; 20]))
+			.with_quote_id(Some("test-quote".to_string()))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![137])
+			.build()
 	}
 
 	fn create_test_context(
@@ -489,9 +478,6 @@ mod tests {
 		);
 
 		let decision = strategy.should_execute(&order, &context).await;
-
-		// Debug output
-		println!("Decision: {:?}", decision);
 
 		match decision {
 			ExecutionDecision::Execute(params) => {
