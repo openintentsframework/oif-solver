@@ -2,7 +2,7 @@
 name = "solver-config"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.86.0"
+rust-version.workspace = true
 
 [dependencies]
 regex = "1.10"

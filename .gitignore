@@ -14,7 +14,6 @@ Thumbs.db
 # Environment
 .env
 .env.local
-compact.env
 
 # Logs
 *.log
@@ -27,6 +26,12 @@ config.toml
 out/
 cache/
 data/
+
+# Demo output
+.pids/
+.logs/
+demo-output/
+snapshots/
 
 # Contracts
 oif-contracts/
