@@ -10,6 +10,7 @@ members = [
     "crates/solver-discovery",
     "crates/solver-order",
     "crates/solver-settlement",
+    "crates/solver-pricing",
     "crates/solver-service",
 ]
 default-members = ["crates/solver-service"]
@@ -17,7 +18,8 @@ default-members = ["crates/solver-service"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["nahim.terrazas@openzeppelin.com", "nami@openzeppelin.com"]
+rust-version = "1.86.0"
+authors = ["nahim.terrazas@openzeppelin.com", "nami@openzeppelin.com", "nicolas.molina@openzeppelin.com"]
 license = "MIT"
 repository = "https://github.com/openintentsframework/oif-solver"
 

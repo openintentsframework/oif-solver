@@ -2,7 +2,7 @@
 name = "solver-types"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.86.0"
+rust-version.workspace = true
 
 [dependencies]
 alloy-primitives = { version = "0.8", features = ["std", "serde"] }
@@ -17,5 +17,3 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 toml = { workspace = true }
 zeroize = { version = "1.8", features = ["derive"] }
-
-
