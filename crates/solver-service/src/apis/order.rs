@@ -300,6 +300,7 @@ mod tests {
 	use solver_delivery::DeliveryService;
 	use solver_discovery::DiscoveryService;
 	use solver_order::{implementations::strategies::simple::create_strategy, OrderService};
+	use solver_pricing::{implementations::mock, PricingService};
 	use solver_settlement::SettlementService;
 	use solver_storage::{MockStorageInterface, StorageError};
 	use solver_types::{order::Order, OrderStatus, TransactionHash};
@@ -343,6 +344,11 @@ mod tests {
 		));
 		let solver_address = addr();
 
+		// Create a mock pricing service for tests
+		let pricing_config = toml::Value::Table(toml::map::Map::new());
+		let pricing_impl = mock::create_mock_pricing(&pricing_config).unwrap();
+		let pricing = Arc::new(PricingService::new(pricing_impl));
+
 		SolverEngine::new(
 			cfg,
 			storage,
@@ -352,6 +358,7 @@ mod tests {
 			discovery,
 			order,
 			settlement,
+			pricing,
 			event_bus,
 			token_manager,
 		)
