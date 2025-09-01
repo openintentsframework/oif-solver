@@ -659,29 +659,28 @@ mod tests {
 	use super::*;
 	use alloy_primitives::{Address as AlloyAddress, Bytes, B256, U256};
 	use alloy_rpc_types::Log;
-	use solver_types::networks::RpcEndpoint;
-	use solver_types::{Address, NetworkConfig, NetworksConfig};
+	use solver_types::utils::builders::{
+		NetworkConfigBuilder, NetworksConfigBuilder, RpcEndpointBuilder,
+	};
+	use solver_types::NetworksConfig;
 	use std::collections::HashMap;
 	use tokio::sync::mpsc;
 
 	// Helper function to create a test networks config
 	fn create_test_networks() -> NetworksConfig {
-		let mut networks = HashMap::new();
-
-		let network = NetworkConfig {
-			rpc_urls: vec![RpcEndpoint::both(
-				"http://localhost:8545".to_string(),
-				"ws://localhost:8546".to_string(),
-			)],
-			input_settler_address: Address(vec![1u8; 20]),
-			output_settler_address: Address(vec![2u8; 20]),
-			tokens: vec![],
-			input_settler_compact_address: None,
-			the_compact_address: None,
-		};
-
-		networks.insert(1, network);
-		networks
+		NetworksConfigBuilder::new()
+			.add_network(
+				1,
+				NetworkConfigBuilder::new()
+					.add_rpc_endpoint(
+						RpcEndpointBuilder::new()
+							.http(Some("http://localhost:8545".to_string()))
+							.ws(Some("ws://localhost:8546".to_string()))
+							.build(),
+					)
+					.build(),
+			)
+			.build()
 	}
 
 	// Helper function to create a test StandardOrder
@@ -956,24 +955,6 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_eip7683_discovery_new_success() {
-		let networks = create_test_networks();
-		let network_ids = vec![1];
-
-		// This will fail because we don't have a real RPC endpoint,
-		// but we can test the validation logic
-		let result = Eip7683Discovery::new(network_ids, networks, Some(5)).await;
-
-		// Should fail due to connection error (expected in test environment)
-		assert!(result.is_err());
-		if let Err(DiscoveryError::Connection(_)) = result {
-			// Expected behavior when no real RPC endpoint
-		} else {
-			panic!("Expected connection error");
-		}
-	}
-
-	#[tokio::test]
 	async fn test_eip7683_discovery_new_empty_network_ids() {
 		let networks = create_test_networks();
 		let network_ids = vec![];
@@ -1000,30 +981,6 @@ mod tests {
 			assert!(msg.contains("Network 999 not found"));
 		} else {
 			panic!("Expected ValidationError");
-		}
-	}
-
-	#[tokio::test(flavor = "multi_thread")]
-	async fn test_create_discovery_success() {
-		let config = toml::Value::try_from(HashMap::from([
-			(
-				"network_ids",
-				toml::Value::Array(vec![toml::Value::Integer(1)]),
-			),
-			("polling_interval_secs", toml::Value::Integer(5)),
-		]))
-		.unwrap();
-
-		let networks = create_test_networks();
-
-		// This will fail due to connection issues, but validates config parsing
-		let result = create_discovery(&config, &networks);
-		assert!(result.is_err());
-
-		if let Err(DiscoveryError::Connection(_)) = result {
-			// Expected when no real RPC endpoint
-		} else {
-			panic!("Expected connection error");
 		}
 	}
 

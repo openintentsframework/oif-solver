@@ -1176,37 +1176,24 @@ impl crate::DiscoveryRegistry for Registry {}
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use alloy_primitives::{hex, Address, Bytes, U256};
+	use alloy_primitives::{Address, Bytes, U256};
 	use serde_json::json;
 	use solver_types::{
-		networks::{NetworkConfig, RpcEndpoint},
-		Address as SolverAddress, NetworksConfig,
+		utils::builders::{NetworkConfigBuilder, NetworksConfigBuilder, RpcEndpointBuilder},
+		NetworksConfig,
 	};
 	use std::collections::HashMap;
 	use tokio::sync::mpsc;
 
-	// Helper functions to create test data
-	fn addr(hex: &str) -> SolverAddress {
-		let hex_str = hex::decode(hex.trim_start_matches("0x")).unwrap();
-		SolverAddress(hex_str)
-	}
-
 	fn create_test_networks_config() -> NetworksConfig {
-		let mut networks = HashMap::new();
-
-		let network_config = NetworkConfig {
-			rpc_urls: vec![RpcEndpoint::http_only(
-				"https://eth.llamarpc.com".to_string(),
-			)],
-			input_settler_address: addr("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9"),
-			input_settler_compact_address: Some(addr("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")),
-			output_settler_address: addr("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
-			tokens: vec![],
-			the_compact_address: None,
-		};
-
-		networks.insert(1, network_config);
-		networks
+		NetworksConfigBuilder::new()
+			.add_network(
+				1,
+				NetworkConfigBuilder::new()
+					.add_rpc_endpoint(RpcEndpointBuilder::new().build())
+					.build(),
+			)
+			.build()
 	}
 
 	fn create_test_standard_order() -> StandardOrder {
