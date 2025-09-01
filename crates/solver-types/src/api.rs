@@ -625,6 +625,7 @@ mod tests {
 			eta: Some(300),
 			quote_id: "quote_123".to_string(),
 			provider: "test_solver".to_string(),
+			cost: None,
 		};
 
 		let json = serde_json::to_string(&quote).unwrap();
@@ -651,6 +652,7 @@ mod tests {
 				eta: None,
 				quote_id: "test_quote".to_string(),
 				provider: "test_provider".to_string(),
+				cost: None,
 			}],
 		};
 
