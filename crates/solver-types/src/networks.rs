@@ -165,7 +165,9 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::utils::builders::{NetworkConfigBuilder, RpcEndpointBuilder, TokenConfigBuilder};
+	use crate::utils::tests::builders::{
+		NetworkConfigBuilder, RpcEndpointBuilder, TokenConfigBuilder,
+	};
 	use crate::Address;
 	use serde_json;
 

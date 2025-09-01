@@ -410,7 +410,7 @@ impl From<GetOrderError> for APIError {
 mod tests {
 	use super::*;
 	use crate::standards::eip7930::InteropAddress;
-	use crate::utils::builders::{
+	use crate::utils::tests::builders::{
 		AssetAmountBuilder, AvailableInputBuilder, GetQuoteRequestBuilder, RequestedOutputBuilder,
 	};
 	use alloy_primitives::address;

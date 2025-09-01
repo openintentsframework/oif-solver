@@ -569,7 +569,7 @@ impl crate::DeliveryRegistry for Registry {}
 mod tests {
 	use super::*;
 	use solver_types::{
-		utils::builders::{NetworkConfigBuilder, NetworksConfigBuilder, RpcEndpointBuilder},
+		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder, RpcEndpointBuilder},
 		SecretString,
 	};
 	use std::collections::HashMap;

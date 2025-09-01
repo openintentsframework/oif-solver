@@ -194,7 +194,7 @@ impl crate::AccountRegistry for Registry {}
 mod tests {
 	use super::*;
 	use solver_types::{
-		utils::builders::TransactionBuilder, Address, ImplementationRegistry, Transaction,
+		utils::tests::builders::TransactionBuilder, Address, ImplementationRegistry, Transaction,
 	};
 	use std::collections::HashMap;
 

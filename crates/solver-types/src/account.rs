@@ -152,7 +152,7 @@ impl From<Transaction> for TransactionRequest {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::utils::{builders::TransactionBuilder, conversion::parse_address};
+	use crate::utils::{conversion::parse_address, tests::builders::TransactionBuilder};
 	use alloy_primitives::{address, U256};
 	use serde_json;
 

@@ -303,7 +303,7 @@ mod tests {
 	use solver_pricing::{implementations::mock, PricingService};
 	use solver_settlement::SettlementService;
 	use solver_storage::{MockStorageInterface, StorageError};
-	use solver_types::utils::builders::OrderBuilder;
+	use solver_types::utils::tests::builders::OrderBuilder;
 	use solver_types::{order::Order, OrderStatus, TransactionHash};
 	use std::{collections::HashMap, sync::Arc};
 	use toml::Value;
