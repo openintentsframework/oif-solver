@@ -314,9 +314,6 @@ jwt_test() {
                 [ -n "$body" ] && echo "$body"
             fi
             
-            # Clean up
-            rm -f "$token_file"
-            
             print_success "JWT authentication test completed"
             ;;
             
@@ -435,9 +432,15 @@ jwt_ensure_token() {
     local max_attempts=2
     
     while [ $attempts -lt $max_attempts ]; do
+        # Build scopes array properly
+        local scopes_json="[]"
+        if [ -n "$scopes" ]; then
+            scopes_json="[\"$(echo "$scopes" | sed 's/,/","/g')\"]"
+        fi
+        
         local response=$(curl -s -X POST "${api_url}/api/register" \
             -H "Content-Type: application/json" \
-            -d "{\"client_id\": \"$client_id\", \"scopes\": [$(echo "$scopes" | sed 's/,/","/g' | sed 's/^/"/;s/$/"/')]}" 2>/dev/null || true)
+            -d "{\"client_id\": \"$client_id\", \"scopes\": $scopes_json}" 2>/dev/null || true)
         
         if [ -n "$response" ]; then
             token=$(echo "$response" | jq -r '.token' 2>/dev/null)

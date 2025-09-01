@@ -120,9 +120,15 @@ pub async fn register_client(
 		},
 	};
 
-	// Calculate expiry timestamp
-	let expiry_hours = request.expiry_hours.unwrap_or(24); // Default 24 hours
-	let expires_at = chrono::Utc::now().timestamp() + (expiry_hours as i64 * 3600);
+	// Decode the token to get the actual expiry from the claims
+	let expires_at = match jwt_service.validate_token(&token) {
+		Ok(claims) => claims.exp,
+		Err(_) => {
+			// Fallback: calculate based on config if we can't decode our own token
+			let expiry_hours = request.expiry_hours.unwrap_or(24);
+			chrono::Utc::now().timestamp() + (expiry_hours as i64 * 3600)
+		}
+	};
 
 	// Log successful registration
 	tracing::info!(
