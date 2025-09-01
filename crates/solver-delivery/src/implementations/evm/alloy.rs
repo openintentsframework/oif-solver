@@ -605,7 +605,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_alloy_delivery_new_empty_networks() {
-		let networks = NetworksConfigBuilder::new().build_empty_for_testing();
+		let networks = NetworksConfigBuilder::new().build();
 		let signer = create_test_signer();
 
 		let result = AlloyDelivery::new(vec![], &networks, HashMap::new(), signer).await;
