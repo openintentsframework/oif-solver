@@ -33,6 +33,7 @@ declare -gA CONFIG_CONTRACTS
 declare -gA CONFIG_ACCOUNTS
 declare -gA CONFIG_COMPACT
 declare -gA CONFIG_API
+declare -gA CONFIG_GAS
 
 # Array to store discovered chain IDs
 declare -ga CHAIN_IDS=()
@@ -148,6 +149,9 @@ config_load_include() {
         cli.toml)
             config_load_accounts "$include_file"
             ;;
+        gas.toml)
+            config_load_gas "$include_file"
+            ;;
         *)
             print_warning "Unknown include file: $filename"
             ;;
@@ -258,6 +262,22 @@ config_load_accounts() {
         fi
         CONFIG_ACCOUNTS[solver_private_key]="$solver_private_key"
     fi
+}
+
+# Load gas configuration
+config_load_gas() {
+    local file="$1"
+    
+    # Gas config is primarily for reference/documentation
+    # Store values if needed for display purposes
+    CONFIG_GAS["permit2_open"]=$(parse_toml_value "$file" "gas.flows.permit2_escrow" "open")
+    CONFIG_GAS["permit2_fill"]=$(parse_toml_value "$file" "gas.flows.permit2_escrow" "fill")
+    CONFIG_GAS["permit2_claim"]=$(parse_toml_value "$file" "gas.flows.permit2_escrow" "claim")
+    CONFIG_GAS["compact_open"]=$(parse_toml_value "$file" "gas.flows.compact_resource_lock" "open")
+    CONFIG_GAS["compact_fill"]=$(parse_toml_value "$file" "gas.flows.compact_resource_lock" "fill")
+    CONFIG_GAS["compact_claim"]=$(parse_toml_value "$file" "gas.flows.compact_resource_lock" "claim")
+    
+    print_debug "Loaded gas configuration from $file"
 }
 
 # Load environment variables

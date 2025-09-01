@@ -29,8 +29,8 @@
 # - config.sh: For network configuration
 #
 # Usage:
-#   quote_get demo-output/intent-quote.json
-#   quote_accept demo-output/quote.json
+#   quote_get demo-output/get_quote.req.json
+#   quote_accept demo-output/get_quote.res.json
 #   quote_test escrow permit2 A2B
 #
 # ==============================================================================
@@ -529,7 +529,7 @@ compare_quotes() {
 quote_get() {
     local intent_file="${1:-}"
     local api_url="${2:-http://localhost:3000/api/quotes}"
-    local save_to="${3:-${OUTPUT_DIR:-./demo-output}/quote.json}"  # Default to OUTPUT_DIR/quote.json
+    local save_to="${3:-${OUTPUT_DIR:-./demo-output}/get_quote.res.json}"  # Default to OUTPUT_DIR/get_quote.res.json
     
     # Check if intent file provided
     if [ -z "$intent_file" ]; then
@@ -657,7 +657,7 @@ quote_get() {
 }
 
 quote_accept() {
-    local quote_file="${1:-${OUTPUT_DIR:-./demo-output}/quote.json}"  # Default to OUTPUT_DIR/quote.json
+    local quote_file="${1:-${OUTPUT_DIR:-./demo-output}/get_quote.res.json}"  # Default to OUTPUT_DIR/get_quote.res.json
     local quote_index="${2:-0}"
     local execute="${3:-false}"  # Auto-execute flag
     
@@ -812,6 +812,11 @@ quote_accept() {
                 signature: $signature
             }')
         
+        # Save request to file
+        local request_file="${OUTPUT_DIR:-./demo-output}/post_quote.req.json"
+        echo "$submission_json" | jq '.' > "$request_file"
+        print_info "Request saved to: $request_file"
+        
         # Submit to solver
         local api_url="${SOLVER_API_URL:-http://localhost:3000/api/orders}"
         print_info "Submitting signed order with quote ID to solver..."
@@ -838,7 +843,7 @@ quote_accept() {
             fi
             
             # Save submission response
-            local output_file="${OUTPUT_DIR:-./demo-output}/quote-submission.json"
+            local output_file="${OUTPUT_DIR:-./demo-output}/post_quote.res.json"
             echo "$response_body" | jq '.' > "$output_file" 2>/dev/null || echo "$response_body" > "$output_file"
             print_info "Submission response saved to: $output_file"
             
@@ -872,7 +877,7 @@ quote_accept() {
                     print_info "This feature is pending implementation on the solver side"
                     
                     # Save the placeholder response
-                    local output_file="${OUTPUT_DIR:-./demo-output}/quote-submission.json"
+                    local output_file="${OUTPUT_DIR:-./demo-output}/post_quote.res.json"
                     echo "$response_body" | jq '.' > "$output_file" 2>/dev/null || echo "$response_body" > "$output_file"
                     print_info "Response saved to: $output_file"
                     
@@ -975,7 +980,7 @@ quote_test() {
     
     # Step 2: Get quote
     print_step "Getting quote"
-    local intent_file="${OUTPUT_DIR:-./demo-output}/intent-quote.json"
+    local intent_file="${OUTPUT_DIR:-./demo-output}/get_quote.req.json"
     
     if [ ! -f "$intent_file" ]; then
         print_error "Intent quote file not found: $intent_file"
@@ -991,7 +996,7 @@ quote_test() {
     
     # Step 3: Accept quote
     print_step "Accepting quote"
-    local quote_file="${OUTPUT_DIR:-./demo-output}/quote.json"
+    local quote_file="${OUTPUT_DIR:-./demo-output}/get_quote.res.json"
     
     if [ ! -f "$quote_file" ]; then
         print_error "Quote file not found: $quote_file"

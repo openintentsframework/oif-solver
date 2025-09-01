@@ -1033,9 +1033,20 @@ deploy_and_setup_contracts() {
     fi
     
     # Deploy OIF contracts (requires oif-contracts repo)
+    # Use specific commit from common.sh for consistency
+    
     if [ ! -d "oif-contracts" ]; then
         print_info "Cloning oif-contracts..."
         git clone https://github.com/openintentsframework/oif-contracts.git > /dev/null 2>&1
+        cd oif-contracts
+        git checkout "$OIF_CONTRACTS_COMMIT" > /dev/null 2>&1
+        cd ..
+    else
+        print_info "Updating oif-contracts to commit $OIF_CONTRACTS_COMMIT..."
+        cd oif-contracts
+        git fetch origin > /dev/null 2>&1
+        git checkout "$OIF_CONTRACTS_COMMIT" > /dev/null 2>&1
+        cd ..
     fi
     
     if ! deploy_oif_contracts "$origin_rpc" "$dest_rpc" "$PRIVATE_KEY" "oif-contracts"; then

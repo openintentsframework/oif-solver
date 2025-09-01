@@ -14,7 +14,6 @@ Thumbs.db
 # Environment
 .env
 .env.local
-compact.env
 
 # Logs
 *.log
@@ -32,6 +31,7 @@ data/
 .pids/
 .logs/
 demo-output/
+snapshots/
 
 # Contracts
 oif-contracts/

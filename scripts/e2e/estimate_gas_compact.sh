@@ -165,7 +165,7 @@ cat > snapshots/gas_snapshots_compact_e2e.json << EOF
         "metadata": {
           "capture_method": "systematic_solver_execution",
           "description": "Gas captured systematically from actual solver transactions (compact)",
-          "nonce_ranges": "Origin $origin_before_dec→$origin_after_dec, Dest $dest_before_dec→$dest_after_dec",
+          "nonce_ranges": "Origin $origin_before_dec -> $origin_after_dec, Dest $dest_before_dec -> $dest_after_dec",
           "transaction_counts": "Origin: $origin_tx_count, Dest: $dest_tx_count"
         }
       }

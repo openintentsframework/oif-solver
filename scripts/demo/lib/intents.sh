@@ -27,18 +27,10 @@
 #
 # Usage:
 #   intent_build escrow permit2 31337 31338 TokenA TokenB
-#   intent_submit demo-output/intent.json
+#   intent_submit demo-output/post_intent.req.json
 #   intent_test escrow permit2 A2B
 #
 # ==============================================================================
-
-# -----------------------------------------------------------------------------
-# Constants and Configuration
-# -----------------------------------------------------------------------------
-# Lock type constants matching the solver
-LOCK_TYPE_PERMIT2_ESCROW=1
-LOCK_TYPE_EIP3009_ESCROW=2
-LOCK_TYPE_RESOURCE_LOCK=3
 
 # -----------------------------------------------------------------------------
 # Global State Management
@@ -582,6 +574,11 @@ submit_intent() {
         
         print_success "Intent submitted successfully (HTTP $status_code)"
         
+        # Save response to file
+        local response_file="${OUTPUT_DIR:-./demo-output}/post_intent.res.json"
+        echo "$response_body" | jq '.' > "$response_file" 2>/dev/null || echo "$response_body" > "$response_file"
+        print_info "Response saved to: $response_file"
+        
         # Extract order ID if available
         local order_id=$(parse_json_response '.order_id // .id // empty')
         if [ -n "$order_id" ] && [ "$order_id" != "null" ]; then
@@ -684,53 +681,6 @@ submit_compact_intent() {
     
     # Submit intent
     submit_intent "$intent_json" "$api_url"
-}
-
-# Quick escrow intent with defaults
-quick_escrow_intent() {
-    local amount="${1:-1000000000000000000}"  # 1 token
-    local api_url="${2:-http://localhost:3000/api/orders}"
-    
-    # Get config values
-    local user_addr=$(config_get_account "user" "address")
-    local user_key=$(config_get_account "user" "private_key")
-    local recipient=$(config_get_account "recipient" "address")
-    local tokena_origin=$(config_get_token "31337" "tokena")
-    local tokena_dest=$(config_get_token "31338" "tokena")
-    
-    submit_escrow_intent \
-        "$user_addr" "$user_key" "31337" "31338" \
-        "$tokena_origin" "$amount" "$tokena_dest" "$amount" "$recipient" "$api_url"
-}
-
-# Quick compact intent with defaults
-quick_compact_intent() {
-    local amount="${1:-1000000000000000000}"  # 1 token
-    local api_url="${2:-http://localhost:3000/api/orders}"
-    
-    # Load compact environment
-    if [ -f "./compact.env" ]; then
-        source "./compact.env"
-    else
-        print_error "compact.env not found. Run setup script first."
-        return 1
-    fi
-    
-    # Get config values
-    local user_addr=$(config_get_account "user" "address")
-    local user_key=$(config_get_account "user" "private_key")
-    local recipient=$(config_get_account "recipient" "address")
-    local tokena_dest=$(config_get_token "31338" "tokena")
-    
-    # Use values from compact.env
-    # TOKEN_ID_HEX should be the full TOKEN_ID (lock_tag + token_address)
-    # ALWAYS_OK_ALLOCATOR_LOCK_TAG should be the 12-byte lock tag
-    local token_id_dec=$(cast_to_dec "$TOKEN_ID_HEX")
-    
-    submit_compact_intent \
-        "$user_addr" "$user_key" "31337" "31338" \
-        "$token_id_dec" "$ALWAYS_OK_ALLOCATOR_LOCK_TAG" "$amount" \
-        "$tokena_dest" "$amount" "$recipient" "$api_url"
 }
 
 # Monitor intent status
@@ -1111,12 +1061,12 @@ intent_build() {
     # Save intent to file
     if [ -n "$intent_json" ]; then
         # Save submission format
-        local output_file="${OUTPUT_DIR:-./demo-output}/intent.json"
+        local output_file="${OUTPUT_DIR:-./demo-output}/post_intent.req.json"
         echo "$intent_json" > "$output_file"
         print_success "Intent saved to: $output_file (for submission)"
         
         # Also create quote request format
-        local quote_file="${OUTPUT_DIR:-./demo-output}/intent-quote.json"
+        local quote_file="${OUTPUT_DIR:-./demo-output}/get_quote.req.json"
         
         # Build UII addresses for quote format (using to_uii_address function)
         local user_uii=$(to_uii_address "$origin_chain" "$user_addr")
@@ -1165,7 +1115,7 @@ intent_build() {
 }
 
 intent_submit() {
-    local intent_file="${1:-${OUTPUT_DIR:-./demo-output}/intent.json}"
+    local intent_file="${1:-${OUTPUT_DIR:-./demo-output}/post_intent.req.json}"
     
     if [ ! -f "$intent_file" ]; then
         print_error "Intent file not found: $intent_file"
@@ -1264,7 +1214,7 @@ intent_test() {
     
     # Step 2: Submit intent
     print_step "Submitting intent"
-    local intent_file="${OUTPUT_DIR:-./demo-output}/intent.json"
+    local intent_file="${OUTPUT_DIR:-./demo-output}/post_intent.req.json"
     
     if [ ! -f "$intent_file" ]; then
         print_error "Intent file not found: $intent_file"
@@ -1300,8 +1250,6 @@ export -f create_compact_intent
 export -f submit_intent
 export -f submit_escrow_intent
 export -f submit_compact_intent
-export -f quick_escrow_intent
-export -f quick_compact_intent
 export -f monitor_intent
 export -f show_intent_summary
 export -f intent_build
