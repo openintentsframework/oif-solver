@@ -659,7 +659,7 @@ mod tests {
 	use super::*;
 	use alloy_primitives::{Address as AlloyAddress, Bytes, B256, U256};
 	use alloy_rpc_types::Log;
-	use solver_types::utils::builders::{
+	use solver_types::utils::tests::builders::{
 		NetworkConfigBuilder, NetworksConfigBuilder, RpcEndpointBuilder,
 	};
 	use solver_types::NetworksConfig;

@@ -1179,7 +1179,7 @@ mod tests {
 	use alloy_primitives::{Address, Bytes, U256};
 	use serde_json::json;
 	use solver_types::{
-		utils::builders::{NetworkConfigBuilder, NetworksConfigBuilder, RpcEndpointBuilder},
+		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder, RpcEndpointBuilder},
 		NetworksConfig,
 	};
 	use std::collections::HashMap;
