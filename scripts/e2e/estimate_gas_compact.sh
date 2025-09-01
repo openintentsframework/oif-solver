@@ -51,9 +51,9 @@ dest_before_dec=$(cast to-dec "$dest_nonce_before")
 echo "  Origin: $origin_before_dec"
 echo "  Dest: $dest_before_dec"
 
-# Send compact intent
+# Send compact intent using oif-demo
 echo "📤 Sending Compact Resource Lock intent..."
-./scripts/demo/send_offchain_resource_lock_intent.sh > /dev/null 2>&1
+./oif-demo intent test compact permit2 A2B > /dev/null 2>&1
 
 echo "⏳ Waiting for transaction processing..."
 sleep 22
@@ -165,7 +165,7 @@ cat > snapshots/gas_snapshots_compact_e2e.json << EOF
         "metadata": {
           "capture_method": "systematic_solver_execution",
           "description": "Gas captured systematically from actual solver transactions (compact)",
-          "nonce_ranges": "Origin $origin_before_dec→$origin_after_dec, Dest $dest_before_dec→$dest_after_dec",
+          "nonce_ranges": "Origin $origin_before_dec -> $origin_after_dec, Dest $dest_before_dec -> $dest_after_dec",
           "transaction_counts": "Origin: $origin_tx_count, Dest: $dest_tx_count"
         }
       }
