@@ -127,7 +127,7 @@ pub async fn register_client(
 			// Fallback: calculate based on config if we can't decode our own token
 			let expiry_hours = request.expiry_hours.unwrap_or(24);
 			chrono::Utc::now().timestamp() + (expiry_hours as i64 * 3600)
-		}
+		},
 	};
 
 	// Log successful registration
