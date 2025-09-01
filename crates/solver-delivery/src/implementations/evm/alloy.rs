@@ -568,50 +568,27 @@ impl crate::DeliveryRegistry for Registry {}
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use alloy_primitives::U256;
-	use solver_types::{networks::RpcEndpoint, Address, NetworkConfig, SecretString};
+	use solver_types::{
+		utils::builders::{NetworkConfigBuilder, NetworksConfigBuilder, RpcEndpointBuilder},
+		SecretString,
+	};
 	use std::collections::HashMap;
 
-	// Helper function to create Address from hex string
-	fn addr(hex: &str) -> Address {
-		let hex_str = hex::decode(hex.trim_start_matches("0x")).unwrap();
-		Address(hex_str)
-	}
-
 	fn create_test_networks() -> NetworksConfig {
-		let mut networks = HashMap::new();
-		networks.insert(
-			1,
-			NetworkConfig {
-				rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
-				input_settler_address: addr("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9"),
-				output_settler_address: addr("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
-				tokens: vec![],
-				input_settler_compact_address: None,
-				the_compact_address: None,
-			},
-		);
-		networks
+		NetworksConfigBuilder::new()
+			.add_network(
+				1,
+				NetworkConfigBuilder::new()
+					.add_rpc_endpoint(RpcEndpointBuilder::new().build())
+					.build(),
+			)
+			.build()
 	}
 
 	fn create_test_signer() -> PrivateKeySigner {
 		"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 			.parse()
 			.unwrap()
-	}
-
-	fn create_test_transaction() -> SolverTransaction {
-		SolverTransaction {
-			chain_id: 1,
-			to: Some(addr("1234567890123456789012345678901234567890")),
-			value: U256::from(1000000000000000000u64), // 1 ETH
-			gas_limit: Some(21000),
-			gas_price: Some(20000000000u128), // 20 gwei
-			max_fee_per_gas: None,
-			max_priority_fee_per_gas: None,
-			data: vec![],
-			nonce: Some(1),
-		}
 	}
 
 	#[tokio::test]
@@ -628,7 +605,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_alloy_delivery_new_empty_networks() {
-		let networks = create_test_networks();
+		let networks = NetworksConfigBuilder::new().build_empty_for_testing();
 		let signer = create_test_signer();
 
 		let result = AlloyDelivery::new(vec![], &networks, HashMap::new(), signer).await;
@@ -699,14 +676,5 @@ mod tests {
 			<Registry as solver_types::ImplementationRegistry>::NAME,
 			"evm_alloy"
 		);
-	}
-
-	#[test]
-	fn test_create_test_transaction() {
-		let tx = create_test_transaction();
-		assert_eq!(tx.chain_id, 1);
-		assert_eq!(tx.value, U256::from(1000000000000000000u64));
-		assert_eq!(tx.gas_limit, Some(21000));
-		assert_eq!(tx.nonce, Some(1));
 	}
 }

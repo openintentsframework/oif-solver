@@ -193,8 +193,9 @@ impl crate::AccountRegistry for Registry {}
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use alloy_primitives::U256;
-	use solver_types::{Address, ImplementationRegistry, Transaction};
+	use solver_types::{
+		utils::builders::TransactionBuilder, Address, ImplementationRegistry, Transaction,
+	};
 	use std::collections::HashMap;
 
 	// Test private key (FOR TESTING ONLY!)
@@ -215,17 +216,7 @@ mod tests {
 	}
 
 	fn create_test_transaction() -> Transaction {
-		Transaction {
-			to: Some(Address(vec![0u8; 20])),
-			data: vec![1, 2, 3],
-			value: U256::from(100000000),
-			chain_id: 1,
-			nonce: Some(42),
-			gas_limit: Some(21000),
-			gas_price: Some(20_000_000_000),
-			max_fee_per_gas: None,
-			max_priority_fee_per_gas: None,
-		}
+		TransactionBuilder::new().gas_price_gwei(21).build()
 	}
 
 	#[test]

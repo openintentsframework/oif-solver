@@ -303,6 +303,7 @@ mod tests {
 	use solver_pricing::{implementations::mock, PricingService};
 	use solver_settlement::SettlementService;
 	use solver_storage::{MockStorageInterface, StorageError};
+	use solver_types::utils::builders::OrderBuilder;
 	use solver_types::{order::Order, OrderStatus, TransactionHash};
 	use std::{collections::HashMap, sync::Arc};
 	use toml::Value;
@@ -365,32 +366,26 @@ mod tests {
 	}
 
 	fn create_test_eip7683_order(id: &str, status: OrderStatus) -> Order {
-		Order {
-			id: id.into(),
-			standard: "eip7683".into(),
-			created_at: 1640995200,
-			updated_at: 1640995200,
-			status,
-			data: json!({
+		OrderBuilder::new()
+			.with_id(id)
+			.with_status(status)
+			.with_solver_address(addr())
+			.with_quote_id(Some("quote-test"))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![2])
+			.with_data(json!({
 				"inputs": [[TEST_ADDR, "1000000000000000000"]],
-				"outputs": [{ "token": [18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52], "amount": "2000000000000000000" }],
+				"outputs": [{ 
+					"token": [18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52], 
+					"amount": "2000000000000000000" 
+				}],
 				"raw_order_data": {"some":"data"},
 				"signature": "0xsignature",
 				"nonce": "42",
 				"expires": "1640995800"
-			}),
-			solver_address: addr(),
-			quote_id: Some("quote-test".into()),
-			input_chain_ids: vec![1],
-			output_chain_ids: vec![2],
-			execution_params: None,
-			prepare_tx_hash: None,
-			fill_tx_hash: Some(TransactionHash(hex::decode(TEST_ADDR).unwrap())),
-			post_fill_tx_hash: None,
-			pre_claim_tx_hash: None,
-			claim_tx_hash: None,
-			fill_proof: None,
-		}
+			}))
+			.with_fill_tx_hash(Some(TransactionHash(hex::decode(TEST_ADDR).unwrap())))
+			.build()
 	}
 
 	#[tokio::test]
