@@ -191,7 +191,7 @@ mod tests {
 	use alloy_primitives::U256;
 	use solver_types::{
 		standards::eip7683::{Eip7683OrderData, GasLimitOverrides, MandateOutput},
-		utils::builders::OrderBuilder,
+		utils::tests::builders::OrderBuilder,
 		ChainData, ExecutionContext, Order,
 	};
 	use std::collections::HashMap;

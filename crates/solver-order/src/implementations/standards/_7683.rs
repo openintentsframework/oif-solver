@@ -851,7 +851,7 @@ mod tests {
 	use solver_types::{
 		oracle::{OracleInfo, OracleRoutes},
 		standards::eip7683::{Eip7683OrderData, GasLimitOverrides, LockType, MandateOutput},
-		utils::builders::{
+		utils::tests::builders::{
 			IntentBuilder, NetworkConfigBuilder, NetworksConfigBuilder, OrderBuilder,
 			RpcEndpointBuilder,
 		},
