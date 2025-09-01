@@ -62,7 +62,10 @@ impl Clone for EventBus {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use solver_types::{DeliveryEvent, OrderEvent, SolverEvent};
+	use solver_types::{
+		utils::builders::{IntentBuilder, OrderBuilder},
+		DeliveryEvent, ExecutionParams, OrderEvent, SolverEvent,
+	};
 
 	#[test]
 	fn test_new_event_bus() {
@@ -100,41 +103,9 @@ mod tests {
 		let mut receiver = event_bus.subscribe();
 
 		let test_event = SolverEvent::Order(OrderEvent::Preparing {
-			intent: solver_types::Intent {
-				id: "test-intent".to_string(),
-				standard: "eip7683".to_string(),
-				data: serde_json::json!({}),
-				source: "test".to_string(),
-				metadata: solver_types::IntentMetadata {
-					requires_auction: false,
-					exclusive_until: None,
-					discovered_at: 1234567890,
-				},
-				quote_id: Some("test-quote".to_string()),
-			},
-			order: solver_types::Order {
-				id: "test-order".to_string(),
-				standard: "eip7683".to_string(),
-				created_at: 1234567890,
-				updated_at: 1234567890,
-				status: solver_types::OrderStatus::Created,
-				data: serde_json::json!({}),
-				solver_address: solver_types::Address(vec![0x12; 20]),
-				quote_id: Some("test-quote".to_string()),
-				input_chain_ids: vec![1],
-				output_chain_ids: vec![137],
-				execution_params: Some(solver_types::ExecutionParams {
-					gas_price: alloy_primitives::U256::from(20_000_000_000u64),
-					priority_fee: None,
-				}),
-				prepare_tx_hash: None,
-				fill_tx_hash: None,
-				post_fill_tx_hash: None,
-				pre_claim_tx_hash: None,
-				claim_tx_hash: None,
-				fill_proof: None,
-			},
-			params: solver_types::ExecutionParams {
+			intent: IntentBuilder::new().with_id("test-intent").build(),
+			order: OrderBuilder::new().with_id("test-order").build(),
+			params: ExecutionParams {
 				gas_price: alloy_primitives::U256::from(20_000_000_000u64),
 				priority_fee: None,
 			},

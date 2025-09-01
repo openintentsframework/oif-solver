@@ -194,8 +194,8 @@ mod tests {
 	use solver_delivery::DeliveryService;
 	use solver_order::{MockExecutionStrategy, MockOrderInterface};
 	use solver_storage::{MockStorageInterface, StorageError};
-	use solver_types::utils::builders::IntentBuilder;
-	use solver_types::{Address, ExecutionParams, Intent, Order, OrderStatus, SolverEvent};
+	use solver_types::utils::builders::{IntentBuilder, OrderBuilder};
+	use solver_types::{Address, ExecutionParams, Intent, Order, SolverEvent};
 	use std::collections::HashMap;
 	use std::sync::Arc;
 	use std::time::Duration;
@@ -205,25 +205,7 @@ mod tests {
 	}
 
 	fn create_test_order() -> Order {
-		Order {
-			id: "test_order_123".to_string(),
-			standard: "7683".to_string(),
-			status: OrderStatus::Created,
-			solver_address: Address(vec![0x12; 20]),
-			created_at: 1234567890,
-			updated_at: 1234567890,
-			post_fill_tx_hash: None,
-			pre_claim_tx_hash: None,
-			prepare_tx_hash: None,
-			fill_tx_hash: None,
-			claim_tx_hash: None,
-			execution_params: None,
-			fill_proof: None,
-			data: serde_json::json!({"test": "order_data"}),
-			quote_id: None,
-			input_chain_ids: vec![1],
-			output_chain_ids: vec![137],
-		}
+		OrderBuilder::new().build()
 	}
 
 	fn create_test_address() -> Address {

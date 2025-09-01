@@ -251,7 +251,7 @@ impl OrderStateMachine {
 mod tests {
 	use super::*;
 	use solver_storage::StorageService;
-	use solver_types::{OrderStatus, TransactionType};
+	use solver_types::{utils::builders::OrderBuilder, OrderStatus, TransactionType};
 	use std::sync::Arc;
 	use tokio;
 
@@ -261,27 +261,7 @@ mod tests {
 	}
 
 	fn create_test_order() -> Order {
-		use solver_types::parse_address;
-
-		Order {
-			id: "test_order_1".to_string(),
-			standard: "eip7683".to_string(),
-			created_at: 1000000,
-			updated_at: 1000000,
-			status: OrderStatus::Created,
-			post_fill_tx_hash: None,
-			pre_claim_tx_hash: None,
-			data: serde_json::json!({}),
-			solver_address: parse_address("1234567890123456789012345678901234567890").unwrap(),
-			quote_id: Some("quote_1".to_string()),
-			input_chain_ids: vec![1],
-			output_chain_ids: vec![137],
-			execution_params: None,
-			prepare_tx_hash: None,
-			fill_tx_hash: None,
-			claim_tx_hash: None,
-			fill_proof: None,
-		}
+		OrderBuilder::new().with_id("test_order_1").build()
 	}
 
 	#[tokio::test]
