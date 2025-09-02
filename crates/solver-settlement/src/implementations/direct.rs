@@ -426,11 +426,11 @@ impl crate::SettlementRegistry for Registry {}
 mod tests {
 	use super::*;
 	use crate::{OracleSelectionStrategy, SettlementInterface};
-	use solver_types::parse_address;
-	use solver_types::utils::tests::builders::{
-		NetworkConfigBuilder, NetworksConfigBuilder, RpcEndpointBuilder,
+	use solver_types::{
+		parse_address,
+		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder, RpcEndpointBuilder},
+		ImplementationRegistry,
 	};
-	use solver_types::ImplementationRegistry;
 	use std::collections::HashMap;
 
 	fn create_test_networks() -> NetworksConfig {
