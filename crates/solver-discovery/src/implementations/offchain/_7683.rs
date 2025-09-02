@@ -1180,19 +1180,13 @@ mod tests {
 		let networks = create_test_networks_config();
 		let network_ids = vec![1];
 
-		let discovery = Eip7683OffchainDiscovery::new(
-			"127.0.0.1".to_string(),
-			8080,
-			Some("test_token".to_string()),
-			network_ids,
-			&networks,
-		);
+		let discovery =
+			Eip7683OffchainDiscovery::new("127.0.0.1".to_string(), 8080, network_ids, &networks);
 
 		assert!(discovery.is_ok());
 		let discovery = discovery.unwrap();
 		assert_eq!(discovery.api_host, "127.0.0.1");
 		assert_eq!(discovery.api_port, 8080);
-		assert_eq!(discovery.auth_token, Some("test_token".to_string()));
 	}
 
 	#[test]
@@ -1200,13 +1194,8 @@ mod tests {
 		let networks = HashMap::new(); // Empty networks
 		let network_ids = vec![1];
 
-		let result = Eip7683OffchainDiscovery::new(
-			"127.0.0.1".to_string(),
-			8080,
-			None,
-			network_ids,
-			&networks,
-		);
+		let result =
+			Eip7683OffchainDiscovery::new("127.0.0.1".to_string(), 8080, network_ids, &networks);
 
 		assert!(result.is_err());
 		matches!(result.unwrap_err(), DiscoveryError::ValidationError(_));
@@ -1484,7 +1473,6 @@ mod tests {
 		let discovery = Eip7683OffchainDiscovery::new(
 			"127.0.0.1".to_string(),
 			0, // Use port 0 to let OS assign a free port
-			None,
 			vec![1],
 			&networks,
 		)
@@ -1507,8 +1495,7 @@ mod tests {
 	async fn test_discovery_interface_already_monitoring() {
 		let networks = create_test_networks_config();
 		let discovery =
-			Eip7683OffchainDiscovery::new("127.0.0.1".to_string(), 0, None, vec![1], &networks)
-				.unwrap();
+			Eip7683OffchainDiscovery::new("127.0.0.1".to_string(), 0, vec![1], &networks).unwrap();
 
 		let (tx1, _rx1) = mpsc::unbounded_channel();
 		let (tx2, _rx2) = mpsc::unbounded_channel();
@@ -1529,7 +1516,7 @@ mod tests {
 	fn test_get_url() {
 		let networks = create_test_networks_config();
 		let discovery =
-			Eip7683OffchainDiscovery::new("127.0.0.1".to_string(), 8080, None, vec![1], &networks)
+			Eip7683OffchainDiscovery::new("127.0.0.1".to_string(), 8080, vec![1], &networks)
 				.unwrap();
 
 		let url = discovery.get_url();
@@ -1544,7 +1531,6 @@ mod tests {
 		let (tx, _rx) = mpsc::unbounded_channel();
 		let state = ApiState {
 			intent_sender: tx,
-			auth_token: None,
 			providers: HashMap::new(),
 			networks: create_test_networks_config(),
 		};
