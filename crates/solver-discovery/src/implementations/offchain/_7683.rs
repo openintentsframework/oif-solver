@@ -1015,7 +1015,14 @@ async fn handle_quote_acceptance(
 	};
 
 	// Convert quote to intent using the existing conversion logic from solver-service
-	let intent = match quote_to_intent(&quote, &request.signature, &state.providers, &state.networks).await {
+	let intent = match quote_to_intent(
+		&quote,
+		&request.signature,
+		&state.providers,
+		&state.networks,
+	)
+	.await
+	{
 		Ok(intent) => intent,
 		Err(e) => {
 			tracing::warn!(error = %e, "Failed to convert quote to intent");
@@ -1330,7 +1337,8 @@ async fn quote_to_intent(
 		provider,
 		settler_address,
 		LockType::Permit2Escrow,
-	).await?;
+	)
+	.await?;
 
 	// Create a properly structured order data
 	let order_data = Eip7683OrderData {
@@ -1353,7 +1361,7 @@ async fn quote_to_intent(
 	tracing::info!("Order data: {:?}", order_data);
 
 	Ok(Intent {
-		id: hex::encode(order_id), // Use the computed order ID, not quote ID
+		id: hex::encode(order_id),       // Use the computed order ID, not quote ID
 		source: "off-chain".to_string(), // Must be "off-chain" to trigger openFor
 		standard: "eip7683".to_string(),
 		metadata: IntentMetadata {
