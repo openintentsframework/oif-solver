@@ -9,6 +9,8 @@ name = "solver"
 path = "src/main.rs"
 
 [dependencies]
+alloy-sol-types = "0.8"
+hex = "0.4"
 alloy-primitives = { version = "0.8", features = ["std", "serde"] }
 async-trait = "0.1"
 axum = "0.8"

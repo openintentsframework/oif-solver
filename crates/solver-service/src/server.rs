@@ -316,26 +316,20 @@ async fn submit_quote_acceptance(
 	signature: &str,
 	state: &AppState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-	// Get the discovery service base URL and construct the quote acceptance endpoint
-	let discovery_base_url = state
+	// Get the discovery service URL (should already point to /intent endpoint)
+	let intent_url = state
 		.discovery_url
 		.as_ref()
-		.ok_or("Discovery service URL not configured")?
-		.trim_end_matches("/intent"); // Remove /intent to get base URL
+		.ok_or("Discovery service URL not configured")?;
 
-	let quote_accept_url = format!("{}/quote/accept", discovery_base_url);
-
-	// Create the quote acceptance request
-	let quote_request = serde_json::json!({
-		"quote": quote,
-		"signature": signature
-	});
+	// Convert quote to IntentRequest format with encoded StandardOrder
+	let intent_request = quote_to_intent_request(quote, signature)?;
 
 	// Submit to discovery service using the shared HTTP client
 	let response = state
 		.http_client
-		.post(&quote_accept_url)
-		.json(&quote_request)
+		.post(intent_url)
+		.json(&intent_request)
 		.send()
 		.await?;
 
@@ -348,4 +342,231 @@ async fn submit_quote_acceptance(
 			.unwrap_or_else(|_| "Unknown error".to_string());
 		Err(format!("Discovery service returned error: {}", error_text).into())
 	}
+}
+
+/// Convert quote and signature to IntentRequest format
+fn quote_to_intent_request(
+	quote: &solver_types::api::Quote,
+	signature: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+	use alloy_primitives::{Address, U256};
+	use alloy_sol_types::SolType;
+	use solver_types::standards::eip7930::InteropAddress;
+
+	// Extract user address from the first available input
+	let user_str = &quote
+		.details
+		.available_inputs
+		.first()
+		.ok_or("Quote must have at least one available input")?
+		.user;
+	let interop_address = InteropAddress::from_hex(&user_str.to_string())?;
+	let user_address = interop_address.ethereum_address()?;
+
+	// Extract order data from quote
+	let quote_order = quote
+		.orders
+		.first()
+		.ok_or("Quote must contain at least one order")?;
+	let message_data = quote_order
+		.message
+		.as_object()
+		.ok_or("Invalid EIP-712 message structure")?;
+	let eip712_data = message_data
+		.get("eip712")
+		.and_then(|e| e.as_object())
+		.ok_or("Missing 'eip712' object in message")?;
+
+	// Extract nonce
+	let nonce_str = eip712_data
+		.get("nonce")
+		.and_then(|n| n.as_str())
+		.ok_or("Missing nonce in EIP-712 data")?;
+	let nonce = U256::from_str_radix(nonce_str, 10)?;
+
+	// Extract witness data
+	let witness = eip712_data
+		.get("witness")
+		.and_then(|w| w.as_object())
+		.ok_or("Missing 'witness' object in EIP-712 message")?;
+
+	// Get origin chain ID
+	let origin_chain_id = U256::from(interop_address.ethereum_chain_id()?);
+
+	// Extract timing data
+	let expires = witness
+		.get("expires")
+		.and_then(|e| e.as_u64())
+		.unwrap_or(quote.valid_until.unwrap_or(0)) as u32;
+	let fill_deadline = expires;
+
+	// Extract input oracle
+	let input_oracle_str = witness
+		.get("inputOracle")
+		.and_then(|o| o.as_str())
+		.unwrap_or("0x0000000000000000000000000000000000000000");
+	let input_oracle =
+		Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
+
+	// Extract input data from permitted array
+	let permitted = eip712_data
+		.get("permitted")
+		.and_then(|p| p.as_array())
+		.ok_or("Missing permitted array in EIP-712 data")?;
+	let first_permitted = permitted
+		.first()
+		.ok_or("Empty permitted array in EIP-712 data")?;
+
+	let input_amount_str = first_permitted
+		.get("amount")
+		.and_then(|a| a.as_str())
+		.ok_or("Missing amount in permitted token")?;
+	let input_amount = U256::from_str_radix(input_amount_str, 10)?;
+
+	let input_token_str = first_permitted
+		.get("token")
+		.and_then(|t| t.as_str())
+		.ok_or("Missing token in permitted array")?;
+	let input_token = Address::from_slice(&hex::decode(input_token_str.trim_start_matches("0x"))?);
+
+	// Convert input token address to U256
+	let mut token_bytes = [0u8; 32];
+	token_bytes[12..32].copy_from_slice(&input_token.0 .0);
+	let input_token_u256 = U256::from_be_bytes(token_bytes);
+	let inputs = vec![[input_token_u256, input_amount]];
+
+	// Extract outputs from witness
+	let default_outputs = Vec::new();
+	let witness_outputs = witness
+		.get("outputs")
+		.and_then(|o| o.as_array())
+		.unwrap_or(&default_outputs);
+
+	// Parse outputs with proper helper function for hex parsing
+	fn parse_bytes32_from_hex(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+		let hex_clean = hex_str.trim_start_matches("0x");
+		if hex_clean.len() != 64 {
+			return Err("Hex string must be exactly 64 characters (32 bytes)".into());
+		}
+		let mut bytes = [0u8; 32];
+		hex::decode_to_slice(hex_clean, &mut bytes)?;
+		Ok(bytes)
+	}
+
+	let mut sol_outputs = Vec::new();
+	for output_item in witness_outputs {
+		if let Some(output_obj) = output_item.as_object() {
+			let chain_id = output_obj
+				.get("chainId")
+				.and_then(|c| c.as_u64())
+				.unwrap_or(0);
+			let amount_str = output_obj
+				.get("amount")
+				.and_then(|a| a.as_str())
+				.unwrap_or("0");
+			let token_str = output_obj
+				.get("token")
+				.and_then(|t| t.as_str())
+				.unwrap_or("0x0000000000000000000000000000000000000000000000000000000000000000");
+			let recipient_str = output_obj
+				.get("recipient")
+				.and_then(|r| r.as_str())
+				.unwrap_or("0x0000000000000000000000000000000000000000000000000000000000000000");
+			let oracle_str = output_obj
+				.get("oracle")
+				.and_then(|o| o.as_str())
+				.unwrap_or("0x0000000000000000000000000000000000000000000000000000000000000000");
+			let settler_str = output_obj
+				.get("settler")
+				.and_then(|s| s.as_str())
+				.unwrap_or("0x0000000000000000000000000000000000000000000000000000000000000000");
+
+			if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
+				let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
+				let recipient_bytes = parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
+				let oracle_bytes = parse_bytes32_from_hex(oracle_str).unwrap_or([0u8; 32]);
+				let settler_bytes = parse_bytes32_from_hex(settler_str).unwrap_or([0u8; 32]);
+
+				// Import the SolMandateOutput type from the discovery module
+				use solver_discovery::implementations::offchain::_7683::SolMandateOutput;
+
+				sol_outputs.push(SolMandateOutput {
+					oracle: oracle_bytes.into(),
+					settler: settler_bytes.into(),
+					chainId: U256::from(chain_id),
+					token: token_bytes.into(),
+					amount,
+					recipient: recipient_bytes.into(),
+					call: Vec::new().into(),
+					context: Vec::new().into(),
+				});
+			}
+		}
+	}
+
+	// Create and encode the StandardOrder
+	use solver_discovery::implementations::offchain::_7683::StandardOrder;
+	let sol_order = StandardOrder {
+		user: user_address,
+		nonce,
+		originChainId: origin_chain_id,
+		expires,
+		fillDeadline: fill_deadline,
+		inputOracle: input_oracle,
+		inputs,
+		outputs: sol_outputs,
+	};
+
+	// ABI encode the StandardOrder
+	let encoded_order = StandardOrder::abi_encode(&sol_order);
+
+	// Parse signature to bytes
+	// let signature_bytes = Bytes::from_hex(signature)?;
+
+	// Extract lock type from quote data or default to permit2_escrow
+	let lock_type = extract_lock_type_from_quote(quote).unwrap_or("permit2_escrow".to_string());
+
+	// Create IntentRequest
+	let intent_request = serde_json::json!({
+		"order": format!("0x{}", hex::encode(&encoded_order)),
+		"sponsor": format!("{:#x}", user_address),
+		"signature": signature,
+		"lockType": lock_type
+	});
+
+	Ok(intent_request)
+}
+
+/// Extract lock type from quote data
+fn extract_lock_type_from_quote(quote: &solver_types::api::Quote) -> Option<String> {
+	// First check the direct lock_type field on the quote
+	if !quote.lock_type.is_empty() {
+		return Some(quote.lock_type.clone());
+	}
+
+	// Check if the quote contains lock type information in order data or witness data
+	if let Some(quote_order) = quote.orders.first() {
+		if let Some(message_data) = quote_order.message.as_object() {
+			// Check for lock type in the main message data
+			if let Some(lock_type) = message_data.get("lockType").and_then(|v| v.as_str()) {
+				return Some(lock_type.to_string());
+			}
+
+			// Check for lock type in EIP-712 data
+			if let Some(eip712_data) = message_data.get("eip712").and_then(|e| e.as_object()) {
+				if let Some(lock_type) = eip712_data.get("lockType").and_then(|v| v.as_str()) {
+					return Some(lock_type.to_string());
+				}
+
+				// Check witness data for lock type
+				if let Some(witness) = eip712_data.get("witness").and_then(|w| w.as_object()) {
+					if let Some(lock_type) = witness.get("lockType").and_then(|v| v.as_str()) {
+						return Some(lock_type.to_string());
+					}
+				}
+			}
+		}
+	}
+
+	None
 }

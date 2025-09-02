@@ -143,6 +143,8 @@ pub struct Quote {
 	/// Cost breakdown
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub cost: Option<QuoteCost>,
+	// Using LockType
+	pub lock_type: String,
 }
 
 /// Settlement mechanism types.
@@ -626,6 +628,7 @@ mod tests {
 			quote_id: "quote_123".to_string(),
 			provider: "test_solver".to_string(),
 			cost: None,
+			lock_type: "escrow".to_string(),
 		};
 
 		let json = serde_json::to_string(&quote).unwrap();
@@ -653,6 +656,7 @@ mod tests {
 				quote_id: "test_quote".to_string(),
 				provider: "test_provider".to_string(),
 				cost: None,
+				lock_type: "permit2_escrow".to_string(),
 			}],
 		};
 

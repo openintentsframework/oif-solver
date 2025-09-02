@@ -71,7 +71,6 @@ pub mod signing;
 pub mod validation;
 
 // Re-export main functionality
-// Note: quote_to_intent is now handled by the discovery service
 pub use generation::QuoteGenerator;
 pub use signing::payloads::permit2;
 pub use validation::QuoteValidator;

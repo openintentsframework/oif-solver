@@ -405,9 +405,6 @@ impl OrderInterface for Eip7683OrderImpl {
 		let signature = order_data.signature.as_ref().ok_or_else(|| {
 			OrderError::ValidationFailed("Missing signature for off-chain order".to_string())
 		})?;
-		tracing::info!("Sponsor: {}", sponsor);
-		tracing::info!("Signature: {}", signature);
-		tracing::info!("Raw order data: {}", raw_order_data);
 		// For the OIF contracts, we need to use the StandardOrder openFor
 		// The raw_order_data contains the encoded StandardOrder
 		// We just need to pass the order bytes, sponsor, and signature
