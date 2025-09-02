@@ -26,6 +26,7 @@ source "${LIB_DIR}/config.sh"
 source "${LIB_DIR}/blockchain.sh"
 source "${LIB_DIR}/forge.sh"
 source "${LIB_DIR}/signature.sh"
+source "${LIB_DIR}/jwt.sh"
 source "${LIB_DIR}/api.sh"
 source "${LIB_DIR}/deployment.sh"
 source "${LIB_DIR}/intents.sh"
@@ -42,6 +43,7 @@ show_help() {
     echo "  init    <config-file>                                                   Load existing configuration"
     echo "  intent  {build|submit|test} [--onchain]                                 Intent operations"
     echo "  quote   {get|accept|test}                                               Quote operations"
+    echo "  jwt     {register|validate|test}                                        JWT authentication operations"
     echo "  balance [target]                                                        Check balances"
     echo "  monitor [interval] [target]                                             Monitor balances with auto-refresh"
     echo "  help                                                                    Show this help message"
@@ -79,6 +81,11 @@ show_help() {
     echo "  # Quote operations:"
     echo "  oif-demo quote get demo-output/get_quote.req.json                       Request quote for intent"
     echo "  oif-demo quote test escrow permit2 A2B                                  Build intent, get quote, and accept"
+    echo "  "
+    echo "  # JWT authentication:"
+    echo "  oif-demo jwt register my-client read-orders,create-orders               Register client and get JWT token"
+    echo "  oif-demo jwt validate eyJhbGciOiJIUzI1NiIs...                           Validate JWT token"
+    echo "  oif-demo jwt test                                                       Test JWT authentication flow"
     echo "  "
     echo "  # Balance monitoring:"
     echo "  oif-demo balance all                                                    Check all account balances"
@@ -286,6 +293,31 @@ handle_balance() {
     esac
 }
 
+handle_jwt() {
+    local action="${1:-}"
+    shift || true
+    
+    case "$action" in
+        register)
+            jwt_register "$@"
+            ;;
+        validate)
+            jwt_validate "$@"
+            ;;
+        test)
+            jwt_test "$@"
+            ;;
+        *)
+            print_error "Unknown JWT action: $action"
+            print_info "Usage: oif-demo jwt {register|validate|test}"
+            print_info "  jwt register <client> [scopes] [expiry_hours]    - Register client and get token"
+            print_info "  jwt validate <token>                             - Validate a token"
+            print_info "  jwt test [basic|full]                            - Test JWT flow"
+            exit 1
+            ;;
+    esac
+}
+
 handle_monitor() {
     local interval="${1:-5}"
     local target="${2:-all}"
@@ -344,6 +376,10 @@ main() {
         quote)
             shift
             handle_quote "$@"
+            ;;
+        jwt)
+            shift
+            handle_jwt "$@"
             ;;
         balance)
             handle_balance "${2:-}"
