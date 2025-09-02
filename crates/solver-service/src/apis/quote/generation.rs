@@ -122,10 +122,11 @@ impl QuoteGenerator {
 			available_inputs: request.available_inputs.clone(),
 		};
 		let eta = self.calculate_eta(&request.preference);
+		let validity_seconds = self.get_quote_validity_seconds(config);
 		Ok(Quote {
 			orders: vec![order],
 			details,
-			valid_until: Some(chrono::Utc::now().timestamp() as u64 + 300),
+			valid_until: Some(chrono::Utc::now().timestamp() as u64 + validity_seconds),
 			eta: Some(eta),
 			quote_id,
 			provider: "oif-solver".to_string(),
@@ -143,7 +144,7 @@ impl QuoteGenerator {
 		let (primary_type, message) = match lock_kind {
 			LockKind::TheCompact { params } => (
 				"CompactLock".to_string(),
-				self.build_compact_message(request, params)?,
+				self.build_compact_message(request, config, params)?,
 			),
 		};
 		Ok(QuoteOrder {
@@ -227,12 +228,13 @@ impl QuoteGenerator {
 	) -> Result<QuoteOrder, QuoteError> {
 		let input = &request.available_inputs[0];
 		let domain_address = input.asset.clone();
+		let validity_seconds = self.get_quote_validity_seconds(config);
 		let message = serde_json::json!({
 			"from": input.user.ethereum_address().map_err(|e| QuoteError::InvalidRequest(format!("Invalid Ethereum address: {}", e)))?,
 			"to": self.get_escrow_address(config)?,
 			"value": input.amount.to_string(),
 			"validAfter": 0,
-			"validBefore": chrono::Utc::now().timestamp() + 300,
+			"validBefore": chrono::Utc::now().timestamp() + validity_seconds as i64,
 			"nonce": format!("0x{:064x}", chrono::Utc::now().timestamp() as u64)
 		});
 		Ok(QuoteOrder {
@@ -246,14 +248,16 @@ impl QuoteGenerator {
 	fn build_compact_message(
 		&self,
 		request: &GetQuoteRequest,
+		config: &Config,
 		_params: &serde_json::Value,
 	) -> Result<serde_json::Value, QuoteError> {
+		let validity_seconds = self.get_quote_validity_seconds(config);
 		Ok(serde_json::json!({
 			"user": request.user,
 			"inputs": request.available_inputs,
 			"outputs": request.requested_outputs,
 			"nonce": chrono::Utc::now().timestamp(),
-			"deadline": chrono::Utc::now().timestamp() + 300
+			"deadline": chrono::Utc::now().timestamp() + validity_seconds as i64
 		}))
 	}
 
@@ -315,5 +319,16 @@ impl QuoteGenerator {
 			Some(QuotePreference::InputPriority) => {},
 			Some(QuotePreference::Price) | Some(QuotePreference::TrustMinimization) | None => {},
 		}
+	}
+
+	/// Gets the quote validity duration from configuration.
+	///
+	/// Returns the configured validity seconds from the quote config.
+	fn get_quote_validity_seconds(&self, config: &Config) -> u64 {
+		config
+			.quote
+			.as_ref()
+			.unwrap_or(&Default::default())
+			.validity_seconds
 	}
 }

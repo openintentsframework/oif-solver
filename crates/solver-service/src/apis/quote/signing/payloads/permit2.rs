@@ -100,8 +100,13 @@ pub fn build_permit2_batch_witness_digest(
 	// Nonce and deadlines
 	let now_secs = chrono::Utc::now().timestamp() as u64;
 	let nonce_ms: U256 = U256::from((chrono::Utc::now().timestamp_millis()) as u128);
-	let deadline_secs: U256 = U256::from(now_secs + 300);
-	let expires_u32: u32 = (now_secs + 300) as u32;
+	let validity_seconds = config
+		.quote
+		.as_ref()
+		.unwrap_or(&Default::default())
+		.validity_seconds;
+	let deadline_secs: U256 = U256::from(now_secs + validity_seconds);
+	let expires_u32: u32 = (now_secs + validity_seconds) as u32;
 
 	// Type hashes
 	let domain_type_hash = keccak256(DOMAIN_TYPE.as_bytes());

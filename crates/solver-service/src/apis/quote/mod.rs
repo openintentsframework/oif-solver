@@ -129,7 +129,12 @@ pub async fn process_quote_request(
 	}
 
 	// 5. Persist quotes
-	let quote_ttl = Duration::from_secs(300);
+	let validity_seconds = config
+		.quote
+		.as_ref()
+		.unwrap_or(&Default::default())
+		.validity_seconds;
+	let quote_ttl = Duration::from_secs(validity_seconds);
 	store_quotes(solver, &quotes, quote_ttl).await;
 
 	info!("Generated and stored {} quote options", quotes.len());
