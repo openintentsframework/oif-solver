@@ -402,8 +402,7 @@ mod tests {
 			.add_network(
 				137,
 				NetworkConfigBuilder::new()
-					.tokens(vec![
-						TokenConfigBuilder::new().build(), // USDC (default)
+					.add_token(
 						TokenConfigBuilder::new()
 							.address(
 								parse_address("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")
@@ -412,7 +411,7 @@ mod tests {
 							.symbol("WETH")
 							.decimals(18)
 							.build(),
-					])
+					)
 					.build(),
 			)
 			.build()
