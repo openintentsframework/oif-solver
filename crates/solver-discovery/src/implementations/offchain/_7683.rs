@@ -1015,7 +1015,7 @@ async fn handle_quote_acceptance(
 	};
 
 	// Convert quote to intent using the existing conversion logic from solver-service
-	let intent = match quote_to_intent(&quote, &request.signature) {
+	let intent = match quote_to_intent(&quote, &request.signature, &state.providers, &state.networks).await {
 		Ok(intent) => intent,
 		Err(e) => {
 			tracing::warn!(error = %e, "Failed to convert quote to intent");
@@ -1108,9 +1108,11 @@ fn encode_standard_order(
 }
 
 /// Convert a quote and signature to an intent
-fn quote_to_intent(
+async fn quote_to_intent(
 	quote: &solver_types::api::Quote,
 	signature: &str,
+	providers: &HashMap<u64, RootProvider<Http<reqwest::Client>>>,
+	networks: &NetworksConfig,
 ) -> Result<Intent, DiscoveryError> {
 	use solver_types::{
 		current_timestamp,
@@ -1188,15 +1190,25 @@ fn quote_to_intent(
 				.get("recipient")
 				.and_then(|r| r.as_str())
 				.unwrap_or("0x0000000000000000000000000000000000000000000000000000000000000000");
+			let oracle_str = output_obj
+				.get("oracle")
+				.and_then(|o| o.as_str())
+				.unwrap_or("0x0000000000000000000000000000000000000000000000000000000000000000");
+			let settler_str = output_obj
+				.get("settler")
+				.and_then(|s| s.as_str())
+				.unwrap_or("0x0000000000000000000000000000000000000000000000000000000000000000");
 
 			if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
-				// Parse the token and recipient addresses from hex strings
+				// Parse the token, recipient, oracle, and settler addresses from hex strings
 				let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
 				let recipient_bytes = parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
+				let oracle_bytes = parse_bytes32_from_hex(oracle_str).unwrap_or([0u8; 32]);
+				let settler_bytes = parse_bytes32_from_hex(settler_str).unwrap_or([0u8; 32]);
 
 				outputs.push(solver_types::standards::eip7683::MandateOutput {
-					oracle: [0u8; 32],  // Simplified for now
-					settler: [0u8; 32], // Simplified for now
+					oracle: oracle_bytes,
+					settler: settler_bytes,
 					chain_id: U256::from(chain_id),
 					token: token_bytes,
 					amount,
@@ -1291,6 +1303,35 @@ fn quote_to_intent(
 		&outputs,
 	)?;
 
+	// Get the network configuration for the origin chain
+	let origin_chain_id_u64 = origin_chain_id.to::<u64>();
+	let network = networks.get(&origin_chain_id_u64).ok_or_else(|| {
+		DiscoveryError::ValidationError(format!(
+			"Chain ID {} not found in networks configuration",
+			origin_chain_id
+		))
+	})?;
+
+	// Get the input settler address for permit2 escrow
+	let settler_address = Address::from_slice(&network.input_settler_address.0);
+
+	// Get provider for the origin chain
+	let provider = providers.get(&origin_chain_id_u64).ok_or_else(|| {
+		DiscoveryError::ValidationError(format!(
+			"No RPC provider configured for chain ID {}",
+			origin_chain_id
+		))
+	})?;
+
+	// Compute the order ID using the same logic as direct intent submission
+	let order_bytes_raw = alloy_primitives::Bytes::from(order_bytes.clone());
+	let order_id = Eip7683OffchainDiscovery::compute_order_id(
+		&order_bytes_raw,
+		provider,
+		settler_address,
+		LockType::Permit2Escrow,
+	).await?;
+
 	// Create a properly structured order data
 	let order_data = Eip7683OrderData {
 		user: format!("0x{}", hex::encode(user_address)),
@@ -1300,7 +1341,7 @@ fn quote_to_intent(
 		fill_deadline,
 		input_oracle: input_oracle_str.to_string(),
 		inputs,
-		order_id: [0u8; 32], // Will be computed later
+		order_id,
 		gas_limit_overrides: GasLimitOverrides::default(),
 		outputs,
 		raw_order_data: Some(with_0x_prefix(&hex::encode(&order_bytes))), // Properly encoded StandardOrder
@@ -1312,7 +1353,7 @@ fn quote_to_intent(
 	tracing::info!("Order data: {:?}", order_data);
 
 	Ok(Intent {
-		id: quote.quote_id.clone(),
+		id: hex::encode(order_id), // Use the computed order ID, not quote ID
 		source: "off-chain".to_string(), // Must be "off-chain" to trigger openFor
 		standard: "eip7683".to_string(),
 		metadata: IntentMetadata {
