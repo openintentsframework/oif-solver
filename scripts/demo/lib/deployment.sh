@@ -1172,6 +1172,14 @@ primary = "mock"
 # Uses default ETH/USD price of 4615.16
 
 # ============================================================================
+# QUOTE CONFIGURATION
+# ============================================================================
+[quote]
+# Quote validity duration in seconds
+# Default is 20 seconds. Customize as needed:
+validity_seconds = 60  # 1 minute validity
+
+# ============================================================================
 # SETTLEMENT
 # ============================================================================
 [settlement]
