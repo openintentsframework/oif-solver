@@ -5,4 +5,5 @@
 
 pub mod order;
 pub mod quote;
+pub mod register;
 pub mod tokens;

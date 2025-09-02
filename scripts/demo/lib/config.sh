@@ -231,6 +231,12 @@ config_load_api() {
     CONFIG_API[host]=$(parse_toml_value "$file" "api" "host")
     CONFIG_API[port]=$(parse_toml_value "$file" "api" "port")
     
+    # Load JWT auth configuration
+    CONFIG_API[auth_enabled]=$(parse_toml_value "$file" "api.auth" "enabled")
+    CONFIG_API[auth_jwt_secret]=$(parse_toml_value "$file" "api.auth" "jwt_secret")
+    CONFIG_API[auth_token_expiry_hours]=$(parse_toml_value "$file" "api.auth" "token_expiry_hours")
+    CONFIG_API[auth_issuer]=$(parse_toml_value "$file" "api.auth" "issuer")
+    
     if [ -n "${CONFIG_API[host]}" ] && [ -n "${CONFIG_API[port]}" ]; then
         CONFIG_API[url]="http://${CONFIG_API[host]}:${CONFIG_API[port]}"
     fi
@@ -310,8 +316,14 @@ config_get() {
         network|networks)
             echo "${CONFIG_NETWORKS[$full_key]:-$default}"
             ;;
-        api)
-            echo "${CONFIG_API[$key]:-$default}"
+        api | api.auth)
+            # Handle both api and api.auth sections
+            if [ "$section" = "api.auth" ]; then
+                # For api.auth, prefix the key with auth_
+                echo "${CONFIG_API[auth_${key}]:-$default}"
+            else
+                echo "${CONFIG_API[$key]:-$default}"
+            fi
             ;;
         account|accounts)
             echo "${CONFIG_ACCOUNTS[$key]:-$default}"
