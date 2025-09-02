@@ -394,14 +394,6 @@ impl OrderInterface for Eip7683OrderImpl {
 			return Ok(None);
 		}
 
-		// Skip prepare for Permit2 orders from quote acceptance
-		// These orders use Permit2 signatures which are not compatible with openFor
-		if intent.quote_id.is_some() {
-			tracing::info!(
-				"Skipping preparation for quote-derived order - using direct Permit2 flow"
-			);
-			return Ok(None);
-		}
 		let raw_order_data = order_data.raw_order_data.as_ref().ok_or_else(|| {
 			OrderError::ValidationFailed("Missing raw order data for off-chain order".to_string())
 		})?;
@@ -413,7 +405,9 @@ impl OrderInterface for Eip7683OrderImpl {
 		let signature = order_data.signature.as_ref().ok_or_else(|| {
 			OrderError::ValidationFailed("Missing signature for off-chain order".to_string())
 		})?;
-
+		tracing::info!("Sponsor: {}", sponsor);
+		tracing::info!("Signature: {}", signature);
+		tracing::info!("Raw order data: {}", raw_order_data);
 		// For the OIF contracts, we need to use the StandardOrder openFor
 		// The raw_order_data contains the encoded StandardOrder
 		// We just need to pass the order bytes, sponsor, and signature

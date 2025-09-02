@@ -1309,6 +1309,8 @@ fn quote_to_intent(
 		lock_type: Some(LockType::Permit2Escrow),
 	};
 
+	tracing::info!("Order data: {:?}", order_data);
+
 	Ok(Intent {
 		id: quote.quote_id.clone(),
 		source: "off-chain".to_string(), // Must be "off-chain" to trigger openFor
