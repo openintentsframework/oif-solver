@@ -4,7 +4,7 @@
 //! order retrieval functionality for cross-chain intents. Users can query the
 //! status and details of their submitted orders using the order ID.
 
-use axum::extract::Path;
+use axum::extract::{Extension, Path};
 use solver_core::SolverEngine;
 use solver_types::{
 	bytes32_to_address, parse_address, with_0x_prefix, AssetAmount, GetOrderError,
@@ -19,7 +19,17 @@ use solver_types::{
 pub async fn get_order_by_id(
 	Path(id): Path<String>,
 	_solver: &SolverEngine,
+	claims: Option<Extension<solver_types::JwtClaims>>,
 ) -> Result<GetOrderResponse, GetOrderError> {
+	// Log authenticated access if JWT claims are present
+	if let Some(Extension(claims)) = &claims {
+		tracing::debug!(
+			client_id = %claims.sub,
+			order_id = %id,
+			"Processing authenticated order retrieval"
+		);
+	}
+
 	let order = process_order_request(&id, _solver).await?;
 
 	Ok(GetOrderResponse { order })
@@ -406,7 +416,7 @@ mod tests {
 		let solver = create_test_solver_engine(backend).await;
 
 		// Test the endpoint
-		let result = get_order_by_id(Path("order-test".to_string()), &solver).await;
+		let result = get_order_by_id(Path("order-test".to_string()), &solver, None).await;
 
 		assert!(result.is_ok());
 		let response = result.unwrap();

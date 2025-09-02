@@ -32,7 +32,6 @@
 //! - `api_host` - The host address to bind the API server (default: "0.0.0.0")
 //! - `api_port` - The port to listen on (default: 8080)
 //! - `rpc_url` - Ethereum RPC URL for calling settler contracts
-//! - `auth_token` - Optional authentication token for API access
 //!
 //! ## Order Flow
 //!
@@ -350,16 +349,12 @@ struct IntentResponse {
 /// # Fields
 ///
 /// * `intent_sender` - Channel to broadcast discovered intents to the solver system
-/// * `auth_token` - Optional authentication token for API access control
-/// * `provider` - RPC provider for interacting with on-chain contracts
+/// * `providers` - RPC providers for interacting with on-chain contracts
 /// * `networks` - Networks configuration for settler lookups
 #[derive(Clone)]
 struct ApiState {
 	/// Channel to send discovered intents
 	intent_sender: mpsc::UnboundedSender<Intent>,
-	/// Optional authentication token
-	#[allow(dead_code)]
-	auth_token: Option<String>,
 	/// RPC providers for each supported network
 	providers: HashMap<u64, RootProvider<Http<reqwest::Client>>>,
 	/// Networks configuration for settler lookups
@@ -377,7 +372,6 @@ pub struct Eip7683OffchainDiscovery {
 	/// API server configuration
 	api_host: String,
 	api_port: u16,
-	auth_token: Option<String>,
 	/// RPC providers for each supported network
 	providers: HashMap<u64, RootProvider<Http<reqwest::Client>>>,
 	/// Networks configuration for settler lookups
@@ -395,7 +389,6 @@ impl Eip7683OffchainDiscovery {
 	///
 	/// * `api_host` - The host address to bind the API server
 	/// * `api_port` - The port number to listen on
-	/// * `auth_token` - Optional authentication token for API access
 	/// * `network_ids` - List of network IDs this discovery source supports
 	/// * `networks` - Networks configuration with RPC URLs
 	///
@@ -410,7 +403,6 @@ impl Eip7683OffchainDiscovery {
 	pub fn new(
 		api_host: String,
 		api_port: u16,
-		auth_token: Option<String>,
 		network_ids: Vec<u64>,
 		networks: &NetworksConfig,
 	) -> Result<Self, DiscoveryError> {
@@ -455,7 +447,6 @@ impl Eip7683OffchainDiscovery {
 		Ok(Self {
 			api_host,
 			api_port,
-			auth_token,
 			providers,
 			networks: networks.clone(),
 			is_running: Arc::new(AtomicBool::new(false)),
@@ -765,8 +756,7 @@ impl Eip7683OffchainDiscovery {
 	/// * `api_host` - Host address to bind to
 	/// * `api_port` - Port number to listen on
 	/// * `intent_sender` - Channel to send discovered intents
-	/// * `auth_token` - Optional authentication token
-	/// * `provider` - RPC provider for contract calls
+	/// * `providers` - RPC providers for contract calls
 	/// * `networks` - Networks configuration for settler lookups
 	/// * `shutdown_rx` - Channel to receive shutdown signal
 	///
@@ -780,14 +770,12 @@ impl Eip7683OffchainDiscovery {
 		api_host: String,
 		api_port: u16,
 		intent_sender: mpsc::UnboundedSender<Intent>,
-		auth_token: Option<String>,
 		providers: HashMap<u64, RootProvider<Http<reqwest::Client>>>,
 		networks: NetworksConfig,
 		mut shutdown_rx: mpsc::Receiver<()>,
 	) -> Result<(), String> {
 		let state = ApiState {
 			intent_sender,
-			auth_token,
 			providers,
 			networks,
 		};
@@ -850,11 +838,6 @@ async fn handle_intent_submission(
 	State(state): State<ApiState>,
 	Json(request): Json<IntentRequest>,
 ) -> impl IntoResponse {
-	// TODO: Implement authentication
-	// if let Some(token) = &state.auth_token {
-	//     // Check Authorization header
-	// }
-
 	// Parse the StandardOrder from bytes
 	let order = match Eip7683OffchainDiscovery::parse_standard_order(&request.order) {
 		Ok(order) => order,
@@ -968,10 +951,6 @@ async fn handle_intent_submission(
 /// - `api_host` - Host address for the API server (e.g., "127.0.0.1" or "0.0.0.0")
 /// - `api_port` - Port number for the API server (1-65535)
 /// - `network_ids` - List of network IDs this discovery service monitors
-///
-/// # Optional Fields
-///
-/// - `auth_token` - Authentication token string for API access
 pub struct Eip7683OffchainDiscoverySchema;
 
 impl Eip7683OffchainDiscoverySchema {
@@ -1003,17 +982,7 @@ impl ConfigSchema for Eip7683OffchainDiscoverySchema {
 					})),
 				),
 			],
-			// Optional fields
-			vec![
-				Field::new("auth_token", FieldType::String),
-				Field::new(
-					"rate_limit",
-					FieldType::Integer {
-						min: Some(1),
-						max: Some(10000),
-					},
-				),
-			],
+			vec![],
 		);
 
 		schema.validate(config)
@@ -1040,21 +1009,12 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 		// Spawn API server task
 		let api_host = self.api_host.clone();
 		let api_port = self.api_port;
-		let auth_token = self.auth_token.clone();
 		let providers = self.providers.clone();
 		let networks = self.networks.clone();
 
 		tokio::spawn(async move {
-			if let Err(e) = Self::run_server(
-				api_host,
-				api_port,
-				sender,
-				auth_token,
-				providers,
-				networks,
-				shutdown_rx,
-			)
-			.await
+			if let Err(e) =
+				Self::run_server(api_host, api_port, sender, providers, networks, shutdown_rx).await
 			{
 				tracing::error!("API server error: {}", e);
 			}
@@ -1103,7 +1063,6 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 /// ```toml
 /// api_host = "0.0.0.0"         # optional, defaults to "0.0.0.0"
 /// api_port = 8081              # optional, defaults to 8081
-/// auth_token = "secret"        # optional
 /// network_ids = [1, 10, 137]  # optional, defaults to all networks
 /// ```
 ///
@@ -1131,11 +1090,6 @@ pub fn create_discovery(
 		.and_then(|v| v.as_integer())
 		.unwrap_or(8081) as u16;
 
-	let auth_token = config
-		.get("auth_token")
-		.and_then(|v| v.as_str())
-		.map(String::from);
-
 	// Get network_ids from config, or default to all networks
 	let network_ids = config
 		.get("network_ids")
@@ -1147,14 +1101,13 @@ pub fn create_discovery(
 		})
 		.unwrap_or_else(|| networks.keys().cloned().collect());
 
-	let discovery =
-		Eip7683OffchainDiscovery::new(api_host, api_port, auth_token, network_ids, networks)
-			.map_err(|e| {
-				DiscoveryError::Connection(format!(
-					"Failed to create offchain discovery service: {}",
-					e
-				))
-			})?;
+	let discovery = Eip7683OffchainDiscovery::new(api_host, api_port, network_ids, networks)
+		.map_err(|e| {
+			DiscoveryError::Connection(format!(
+				"Failed to create offchain discovery service: {}",
+				e
+			))
+		})?;
 
 	Ok(Box::new(discovery))
 }
