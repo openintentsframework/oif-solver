@@ -373,54 +373,56 @@ impl TokenManager {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use alloy_primitives::hex;
 	use mockall::predicate::*;
 	use solver_account::{AccountService, MockAccountInterface};
 	use solver_delivery::{DeliveryService, MockDeliveryInterface};
-	use solver_types::networks::{NetworkConfig, RpcEndpoint};
+	use solver_types::{
+		parse_address,
+		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder, TokenConfigBuilder},
+	};
 	use std::collections::HashMap;
 
-	fn create_test_address(hex_str: &str) -> Address {
-		let bytes = hex::decode(hex_str).expect("Invalid hex");
-		Address(bytes)
-	}
-
-	fn create_test_token_config(symbol: &str, address_hex: &str, decimals: u8) -> TokenConfig {
-		TokenConfig {
-			address: create_test_address(address_hex),
-			symbol: symbol.to_string(),
-			decimals,
-		}
-	}
-
-	fn create_test_network_config() -> NetworkConfig {
-		NetworkConfig {
-			rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
-			input_settler_address: create_test_address("742d35Cc6634C0532925a3b8D400E4C3f432C6e6"),
-			output_settler_address: create_test_address("8ba1f109551bD432803012645aac136c22C501e5"),
-			tokens: vec![
-				create_test_token_config("USDC", "a0b86991c431e69f7f3aa4ce5a9b9a8ce3606eb4", 6),
-				create_test_token_config("WETH", "c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", 18),
-			],
-			input_settler_compact_address: None,
-			the_compact_address: None,
-		}
-	}
-
 	fn create_test_networks_config() -> NetworksConfig {
-		let mut networks = HashMap::new();
-		networks.insert(1, create_test_network_config());
-		networks.insert(137, create_test_network_config());
-		networks
+		NetworksConfigBuilder::new()
+			.add_network(
+				1,
+				NetworkConfigBuilder::new()
+					.add_token(
+						TokenConfigBuilder::new()
+							.address(
+								parse_address("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")
+									.unwrap(),
+							)
+							.symbol("WETH")
+							.decimals(18)
+							.build(),
+					)
+					.build(),
+			)
+			.add_network(
+				137,
+				NetworkConfigBuilder::new()
+					.tokens(vec![
+						TokenConfigBuilder::new().build(), // USDC (default)
+						TokenConfigBuilder::new()
+							.address(
+								parse_address("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")
+									.unwrap(),
+							)
+							.symbol("WETH")
+							.decimals(18)
+							.build(),
+					])
+					.build(),
+			)
+			.build()
 	}
 
 	fn create_mock_account_service() -> Arc<AccountService> {
 		let mut mock_account = MockAccountInterface::new();
 		mock_account.expect_address().returning(|| {
 			Box::pin(async move {
-				Ok(create_test_address(
-					"3333333333333333333333333333333333333333",
-				))
+				Ok(parse_address("3333333333333333333333333333333333333333").unwrap())
 			})
 		});
 		mock_account
@@ -481,7 +483,9 @@ mod tests {
 		)));
 
 		let token_manager = TokenManager::new(networks, mock_delivery, mock_account);
-		let usdc_address = create_test_address("a0b86991c431e69f7f3aa4ce5a9b9a8ce3606eb4");
+		let usdc_address =
+			solver_types::parse_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+				.expect("Invalid USDC address");
 
 		assert!(token_manager.is_supported(1, &usdc_address));
 		assert!(token_manager.is_supported(137, &usdc_address));
@@ -494,7 +498,7 @@ mod tests {
 		let account = create_mock_account_service();
 		let token_manager = TokenManager::new(networks, delivery, account);
 
-		let unknown_address = create_test_address("1111111111111111111111111111111111111111");
+		let unknown_address = parse_address("1111111111111111111111111111111111111111").unwrap();
 
 		assert!(!token_manager.is_supported(1, &unknown_address));
 		assert!(!token_manager.is_supported(137, &unknown_address));
@@ -507,7 +511,9 @@ mod tests {
 		let account = create_mock_account_service();
 		let token_manager = TokenManager::new(networks, delivery, account);
 
-		let usdc_address = create_test_address("a0b86991c431e69f7f3aa4ce5a9b9a8ce3606eb4");
+		let usdc_address =
+			solver_types::parse_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+				.expect("Invalid USDC address");
 
 		let result = token_manager.get_token_info(1, &usdc_address);
 		assert!(result.is_ok());
@@ -525,7 +531,9 @@ mod tests {
 		let account = create_mock_account_service();
 		let token_manager = TokenManager::new(networks, delivery, account);
 
-		let usdc_address = create_test_address("a0b86991c431e69f7f3aa4ce5a9b9a8ce3606eb4");
+		let usdc_address =
+			solver_types::parse_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+				.expect("Invalid USDC address");
 
 		let result = token_manager.get_token_info(999, &usdc_address);
 		assert!(result.is_err());
@@ -558,7 +566,7 @@ mod tests {
 		let mock_account = create_mock_account_service();
 		let token_manager = TokenManager::new(networks, mock_delivery, mock_account);
 
-		let token_address = create_test_address("a0b86991c431e69f7f3aa4ce5a9b9a8ce3606eb4");
+		let token_address = parse_address("a0b86991c431e69f7f3aa4ce5a9b9a8ce3606eb4").unwrap();
 		let result = token_manager.check_balance(1, &token_address).await;
 
 		assert!(result.is_ok());

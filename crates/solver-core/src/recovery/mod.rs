@@ -786,7 +786,6 @@ mod tests {
 	}
 
 	fn create_test_fill_proof() -> FillProof {
-		// TODO: use builder!
 		FillProof {
 			tx_hash: TransactionHash(vec![0xbb; 32]),
 			block_number: 12345,

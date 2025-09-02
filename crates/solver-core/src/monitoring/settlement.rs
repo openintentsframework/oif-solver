@@ -124,7 +124,7 @@ mod tests {
 	use tokio::sync::broadcast;
 
 	fn create_test_order() -> Order {
-		OrderBuilder::new().with_id("test_order_123").build()
+		OrderBuilder::new().build()
 	}
 
 	fn create_test_tx_hash() -> TransactionHash {
