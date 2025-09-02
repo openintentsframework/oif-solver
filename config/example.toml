@@ -94,7 +94,6 @@ network_ids = [31337, 31338]
 api_host = "127.0.0.1"
 api_port = 8081
 network_ids = [31337]
-# auth_token = "your-secret-token"
 
 # ============================================================================
 # ORDER

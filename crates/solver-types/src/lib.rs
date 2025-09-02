@@ -8,6 +8,8 @@
 pub mod account;
 /// API types for HTTP endpoints and request/response structures.
 pub mod api;
+/// Authentication and authorization types.
+pub mod auth;
 /// Transaction delivery types for blockchain interactions.
 pub mod delivery;
 /// Intent discovery types for finding and processing new orders.
@@ -41,6 +43,7 @@ pub mod pricing;
 // Re-export all types for convenient access
 pub use account::*;
 pub use api::*;
+pub use auth::{AuthConfig, AuthScope, JwtClaims};
 pub use delivery::*;
 pub use discovery::*;
 pub use events::*;

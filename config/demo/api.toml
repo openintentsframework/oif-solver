@@ -10,3 +10,10 @@ max_request_size = 1048576  # 1MB
 
 [api.implementations]
 discovery = "offchain_eip7683"
+
+# JWT Authentication Configuration
+[api.auth]
+enabled = true
+jwt_secret = "${JWT_SECRET:-MySuperDuperSecureSecret123!}"
+token_expiry_hours = 24
+issuer = "oif-solver-demo"

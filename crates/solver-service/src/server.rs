@@ -3,9 +3,14 @@
 //! This module provides a minimal HTTP server infrastructure
 //! for the OIF Solver API.
 
+use crate::{
+	apis::order::get_order_by_id,
+	auth::{auth_middleware, AuthState, JwtService},
+};
 use axum::{
-	extract::{Path, State},
+	extract::{Extension, Path, State},
 	http::StatusCode,
+	middleware,
 	response::{IntoResponse, Json},
 	routing::{get, post},
 	Router, ServiceExt,
@@ -31,6 +36,8 @@ pub struct AppState {
 	pub http_client: reqwest::Client,
 	/// Discovery service URL for forwarding orders (if configured).
 	pub discovery_url: Option<String>,
+	/// JWT service for authentication (if configured).
+	pub jwt_service: Option<Arc<JwtService>>,
 }
 
 /// Starts the HTTP server for the API.
@@ -69,24 +76,79 @@ pub async fn start_server(
 		tracing::warn!("No offchain_eip7683 discovery source configured - /orders endpoint will not be available");
 	}
 
+	// Initialize JWT service if auth is enabled
+	let jwt_service = match &api_config.auth {
+		Some(auth_config) if auth_config.enabled => match JwtService::new(auth_config.clone()) {
+			Ok(service) => {
+				tracing::info!(
+					"API authentication enabled with issuer: {}",
+					auth_config.issuer
+				);
+				Some(Arc::new(service))
+			},
+			Err(e) => {
+				tracing::error!("Failed to initialize JWT service: {}", e);
+				return Err(e.into());
+			},
+		},
+		_ => {
+			tracing::info!("API authentication disabled");
+			None
+		},
+	};
+
 	let app_state = AppState {
 		solver,
 		config,
 		http_client,
 		discovery_url,
+		jwt_service: jwt_service.clone(),
 	};
 
 	// Build the router with /api base path and quote endpoint
+	let mut api_routes = Router::new()
+		.route("/register", post(handle_register))
+		.route("/quotes", post(handle_quote))
+		.route("/tokens", get(handle_get_tokens))
+		.route("/tokens/{chain_id}", get(handle_get_tokens_for_chain));
+
+	// Create order routes with optional auth
+	let mut order_routes = Router::new()
+		.route("/orders", post(handle_order))
+		.route("/orders/{id}", get(handle_get_order_by_id));
+
+	// Apply auth middleware to order routes if enabled
+	if let Some(jwt) = &jwt_service {
+		// POST /orders requires CreateOrders scope
+		let order_post_route = Router::new().route("/orders", post(handle_order)).layer(
+			middleware::from_fn_with_state(
+				AuthState {
+					jwt_service: jwt.clone(),
+					required_scope: solver_types::AuthScope::CreateOrders,
+				},
+				auth_middleware,
+			),
+		);
+
+		// GET /orders/{id} requires ReadOrders scope
+		let order_get_route = Router::new()
+			.route("/orders/{id}", get(handle_get_order_by_id))
+			.layer(middleware::from_fn_with_state(
+				AuthState {
+					jwt_service: jwt.clone(),
+					required_scope: solver_types::AuthScope::ReadOrders,
+				},
+				auth_middleware,
+			));
+
+		order_routes = order_post_route.merge(order_get_route);
+	}
+
+	// Combine all routes
+	api_routes = api_routes.merge(order_routes);
+
 	let app = Router::new()
-		.nest(
-			"/api",
-			Router::new()
-				.route("/quotes", post(handle_quote))
-				.route("/orders", post(handle_order))
-				.route("/orders/{id}", get(handle_get_order_by_id))
-				.route("/tokens", get(handle_get_tokens))
-				.route("/tokens/{chain_id}", get(handle_get_tokens_for_chain)),
-		)
+		.nest("/api", api_routes)
 		.layer(ServiceBuilder::new().layer(CorsLayer::permissive()))
 		.with_state(app_state);
 
@@ -128,8 +190,17 @@ async fn handle_quote(
 async fn handle_get_order_by_id(
 	Path(id): Path<String>,
 	State(state): State<AppState>,
+	claims: Option<Extension<solver_types::JwtClaims>>,
 ) -> Result<Json<GetOrderResponse>, APIError> {
-	match crate::apis::order::get_order_by_id(Path(id), &state.solver).await {
+	// Log authenticated access if JWT claims are present
+	if let Some(Extension(claims)) = &claims {
+		tracing::info!(
+			client_id = %claims.sub,
+			order_id = %id,
+			"Authenticated order retrieval"
+		);
+	}
+	match get_order_by_id(Path(id), &state.solver, claims).await {
 		Ok(response) => Ok(Json(response)),
 		Err(e) => {
 			tracing::warn!("Order retrieval failed: {}", e);
@@ -157,6 +228,17 @@ async fn handle_get_tokens_for_chain(
 	crate::apis::tokens::get_tokens_for_chain(Path(chain_id), State(state.solver)).await
 }
 
+/// Handles POST /api/register requests.
+///
+/// This endpoint allows clients to self-register and receive JWT tokens
+/// for API authentication.
+async fn handle_register(
+	State(state): State<AppState>,
+	Json(payload): Json<crate::apis::register::RegisterRequest>,
+) -> impl IntoResponse {
+	crate::apis::register::register_client(State(state.jwt_service), Json(payload)).await
+}
+
 /// Handles POST /api/orders requests.
 ///
 /// This endpoint forwards intent submission requests to the 7683 discovery API.
@@ -164,8 +246,16 @@ async fn handle_get_tokens_for_chain(
 /// is the standard endpoint for intent submission across different solver implementations.
 async fn handle_order(
 	State(state): State<AppState>,
+	claims: Option<Extension<solver_types::JwtClaims>>,
 	Json(payload): Json<Value>,
 ) -> axum::response::Response {
+	// Log authenticated access if JWT claims are present
+	if let Some(Extension(claims)) = &claims {
+		tracing::info!(
+			client_id = %claims.sub,
+			"Authenticated order submission"
+		);
+	}
 	// Check if this is a committed order (quote acceptance)
 	if let Some(response) = handle_committed_order(payload.clone()).await {
 		return response.into_response();
