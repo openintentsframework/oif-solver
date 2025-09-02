@@ -23,8 +23,7 @@ pub use intent::IntentBuilder;
 pub use mandate_output::{MandateOutputBuilder, MandateOutputBuilderError};
 pub use networks::{
 	NetworkConfigBuilder, NetworkConfigBuilderError, NetworksConfigBuilder,
-	NetworksConfigBuilderError, RpcEndpointBuilder, RpcEndpointBuilderError, TokenConfigBuilder,
-	TokenConfigBuilderError,
+	NetworksConfigBuilderError, TokenConfigBuilder, TokenConfigBuilderError,
 };
 pub use order::OrderBuilder;
 pub use requested_output::{RequestedOutputBuilder, RequestedOutputBuilderError};
