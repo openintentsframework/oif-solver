@@ -220,13 +220,6 @@ fn validate_routes(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use solver_types::Address;
-
-	// Helper function to create Address from hex string
-	fn addr(hex: &str) -> Address {
-		let hex_str = alloy_primitives::hex::decode(hex.trim_start_matches("0x")).unwrap();
-		Address(hex_str)
-	}
 
 	#[test]
 	fn test_parse_selection_strategy() {
@@ -280,11 +273,11 @@ mod tests {
 		assert_eq!(result[&2].len(), 1);
 		assert_eq!(
 			result[&1][0],
-			addr("1111111111111111111111111111111111111111")
+			parse_address("0x1111111111111111111111111111111111111111").unwrap()
 		);
 		assert_eq!(
 			result[&2][0],
-			addr("3333333333333333333333333333333333333333")
+			parse_address("0x3333333333333333333333333333333333333333").unwrap()
 		);
 	}
 
@@ -469,11 +462,20 @@ mod tests {
 	#[test]
 	fn test_validate_routes_success() {
 		let mut input_oracles = HashMap::new();
-		input_oracles.insert(1, vec![addr("1111111111111111111111111111111111111111")]);
+		input_oracles.insert(
+			1,
+			vec![parse_address("0x1111111111111111111111111111111111111111").unwrap()],
+		);
 
 		let mut output_oracles = HashMap::new();
-		output_oracles.insert(2, vec![addr("2222222222222222222222222222222222222222")]);
-		output_oracles.insert(3, vec![addr("3333333333333333333333333333333333333333")]);
+		output_oracles.insert(
+			2,
+			vec![parse_address("0x2222222222222222222222222222222222222222").unwrap()],
+		);
+		output_oracles.insert(
+			3,
+			vec![parse_address("0x3333333333333333333333333333333333333333").unwrap()],
+		);
 
 		let mut routes = HashMap::new();
 		routes.insert(1, vec![2, 3]);
@@ -487,7 +489,10 @@ mod tests {
 		let input_oracles = HashMap::new(); // Empty - no input oracle for chain 1
 
 		let mut output_oracles = HashMap::new();
-		output_oracles.insert(2, vec![addr("2222222222222222222222222222222222222222")]);
+		output_oracles.insert(
+			2,
+			vec![parse_address("0x2222222222222222222222222222222222222222").unwrap()],
+		);
 
 		let mut routes = HashMap::new();
 		routes.insert(1, vec![2]);
@@ -502,7 +507,10 @@ mod tests {
 	#[test]
 	fn test_validate_routes_missing_output_oracle() {
 		let mut input_oracles = HashMap::new();
-		input_oracles.insert(1, vec![addr("1111111111111111111111111111111111111111")]);
+		input_oracles.insert(
+			1,
+			vec![parse_address("0x1111111111111111111111111111111111111111").unwrap()],
+		);
 
 		let output_oracles = HashMap::new(); // Empty - no output oracle for chain 2
 

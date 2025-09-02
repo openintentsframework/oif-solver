@@ -426,18 +426,12 @@ impl crate::SettlementRegistry for Registry {}
 mod tests {
 	use super::*;
 	use crate::{OracleSelectionStrategy, SettlementInterface};
+	use solver_types::parse_address;
 	use solver_types::utils::tests::builders::{
 		NetworkConfigBuilder, NetworksConfigBuilder, RpcEndpointBuilder,
 	};
-	use solver_types::Address;
 	use solver_types::ImplementationRegistry;
 	use std::collections::HashMap;
-
-	// Helper function to create Address from hex string
-	fn addr(hex: &str) -> Address {
-		let hex_str = hex::decode(hex.trim_start_matches("0x")).unwrap();
-		Address(hex_str)
-	}
 
 	fn create_test_networks() -> NetworksConfig {
 		NetworksConfigBuilder::new()
@@ -464,10 +458,16 @@ mod tests {
 	// Fix the create_test_oracle_config function
 	fn create_test_oracle_config() -> OracleConfig {
 		let mut input_oracles = HashMap::new();
-		input_oracles.insert(1, vec![addr("1111111111111111111111111111111111111111")]);
+		input_oracles.insert(
+			1,
+			vec![parse_address("0x1111111111111111111111111111111111111111").unwrap()],
+		);
 
 		let mut output_oracles = HashMap::new();
-		output_oracles.insert(2, vec![addr("2222222222222222222222222222222222222222")]);
+		output_oracles.insert(
+			2,
+			vec![parse_address("0x2222222222222222222222222222222222222222").unwrap()],
+		);
 
 		// Fix: routes should map u64 -> Vec<u64>, not (u64, u64) -> Address
 		let mut routes = HashMap::new();
