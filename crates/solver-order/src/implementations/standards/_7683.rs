@@ -850,10 +850,10 @@ mod tests {
 	use alloy_primitives::U256;
 	use solver_types::{
 		oracle::{OracleInfo, OracleRoutes},
-		standards::eip7683::{Eip7683OrderData, GasLimitOverrides, LockType, MandateOutput},
+		standards::eip7683::{Eip7683OrderData, LockType},
 		utils::tests::builders::{
-			IntentBuilder, NetworkConfigBuilder, NetworksConfigBuilder, OrderBuilder,
-			RpcEndpointBuilder,
+			Eip7683OrderDataBuilder, IntentBuilder, NetworkConfigBuilder, NetworksConfigBuilder,
+			OrderBuilder,
 		},
 		Address, ExecutionParams, FillProof, Intent, NetworksConfig, OrderStatus, TransactionHash,
 	};
@@ -861,18 +861,8 @@ mod tests {
 
 	fn create_test_networks() -> NetworksConfig {
 		NetworksConfigBuilder::new()
-			.add_network(
-				1,
-				NetworkConfigBuilder::new()
-					.add_rpc_endpoint(RpcEndpointBuilder::new().build())
-					.build(),
-			)
-			.add_network(
-				137,
-				NetworkConfigBuilder::new()
-					.add_rpc_endpoint(RpcEndpointBuilder::new().build())
-					.build(),
-			)
+			.add_network(1, NetworkConfigBuilder::new().build())
+			.add_network(137, NetworkConfigBuilder::new().build())
 			.build()
 	}
 
@@ -895,37 +885,7 @@ mod tests {
 	}
 
 	fn create_test_order_data() -> Eip7683OrderData {
-		Eip7683OrderData {
-			user: "0x1234567890123456789012345678901234567890".to_string(),
-			nonce: U256::from(1),
-			origin_chain_id: U256::from(1),
-			expires: (std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.unwrap()
-				.as_secs() + 3600) as u32,
-			fill_deadline: (std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.unwrap()
-				.as_secs() + 1800) as u32,
-			input_oracle: "0x0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A".to_string(),
-			inputs: vec![[U256::from(1000), U256::from(100)]],
-			order_id: [1u8; 32],
-			gas_limit_overrides: GasLimitOverrides::default(),
-			outputs: vec![MandateOutput {
-				oracle: [0u8; 32],
-				settler: [0u8; 32],
-				chain_id: U256::from(137),
-				token: [2u8; 32],
-				amount: U256::from(95),
-				recipient: [3u8; 32],
-				call: vec![],
-				context: vec![],
-			}],
-			raw_order_data: None,
-			signature: None,
-			sponsor: None,
-			lock_type: None,
-		}
+		Eip7683OrderDataBuilder::new().build()
 	}
 
 	fn create_test_intent(order_data: Eip7683OrderData, source: &str) -> Intent {
@@ -949,12 +909,7 @@ mod tests {
 	#[test]
 	fn test_new_with_insufficient_networks() {
 		let networks = NetworksConfigBuilder::new()
-			.add_network(
-				1,
-				NetworkConfigBuilder::new()
-					.add_rpc_endpoint(RpcEndpointBuilder::new().build())
-					.build(),
-			)
+			.add_network(1, NetworkConfigBuilder::new().build())
 			.build();
 
 		let oracle_routes = create_test_oracle_routes();
