@@ -569,19 +569,14 @@ impl crate::DeliveryRegistry for Registry {}
 mod tests {
 	use super::*;
 	use solver_types::{
-		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder, RpcEndpointBuilder},
+		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
 		SecretString,
 	};
 	use std::collections::HashMap;
 
 	fn create_test_networks() -> NetworksConfig {
 		NetworksConfigBuilder::new()
-			.add_network(
-				1,
-				NetworkConfigBuilder::new()
-					.add_rpc_endpoint(RpcEndpointBuilder::new().build())
-					.build(),
-			)
+			.add_network(1, NetworkConfigBuilder::new().build())
 			.build()
 	}
 

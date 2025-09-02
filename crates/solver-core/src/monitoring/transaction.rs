@@ -120,3 +120,252 @@ impl TransactionMonitor {
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use mockall::predicate::*;
+	use solver_delivery::MockDeliveryInterface;
+	use solver_types::{TransactionReceipt, TransactionType};
+	use std::{collections::HashMap, time::Duration};
+	use tokio::sync::broadcast;
+
+	fn create_test_tx_hash() -> TransactionHash {
+		TransactionHash(vec![0xab; 32])
+	}
+
+	fn create_test_receipt(success: bool) -> TransactionReceipt {
+		TransactionReceipt {
+			hash: create_test_tx_hash(),
+			block_number: 12345,
+			success,
+		}
+	}
+
+	async fn create_test_monitor_with_mock<F>(
+		setup_delivery: F,
+		timeout_minutes: u64,
+	) -> (TransactionMonitor, broadcast::Receiver<SolverEvent>)
+	where
+		F: FnOnce(&mut MockDeliveryInterface),
+	{
+		let mut mock_delivery = MockDeliveryInterface::new();
+		setup_delivery(&mut mock_delivery);
+
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				137u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+		));
+
+		let event_bus = EventBus::new(100);
+		let receiver = event_bus.subscribe();
+
+		let monitor = TransactionMonitor::new(delivery, event_bus, timeout_minutes);
+
+		(monitor, receiver)
+	}
+
+	#[test]
+	fn test_new_transaction_monitor() {
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1));
+		let event_bus = EventBus::new(100);
+		let timeout_minutes = 30;
+
+		let monitor = TransactionMonitor::new(delivery, event_bus, timeout_minutes);
+
+		assert_eq!(monitor.timeout_minutes, 30);
+	}
+
+	#[tokio::test]
+	async fn test_monitor_transaction_confirmed_success() {
+		let order_id = "test_order_123".to_string();
+		let tx_hash = create_test_tx_hash();
+		let tx_type = TransactionType::Fill;
+		let tx_chain_id = 137u64;
+
+		let (monitor, mut event_rx) = create_test_monitor_with_mock(
+			|mock_delivery| {
+				// First call returns true (transaction confirmed)
+				mock_delivery
+					.expect_get_receipt()
+					.with(eq(tx_hash.clone()), eq(tx_chain_id))
+					.times(1)
+					.returning(move |_, _| Box::pin(async move { Ok(create_test_receipt(true)) }));
+
+				// Then confirm_with_default is called
+				mock_delivery
+					.expect_wait_for_confirmation()
+					.with(eq(tx_hash.clone()), eq(tx_chain_id), eq(1u64))
+					.times(1)
+					.returning(move |_, _, _| {
+						Box::pin(async move { Ok(create_test_receipt(true)) })
+					});
+			},
+			30,
+		)
+		.await;
+
+		let order_id_clone = order_id.clone();
+		let tx_hash_clone = tx_hash.clone();
+
+		// Start monitoring in a separate task
+		let monitor_task = tokio::spawn(async move {
+			monitor
+				.monitor(order_id_clone, tx_hash_clone, tx_type, tx_chain_id)
+				.await;
+		});
+
+		// Wait for the event
+		let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+			.await
+			.expect("Should receive event within timeout")
+			.expect("Should receive valid event");
+
+		// Verify the event
+		match event {
+			SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
+				order_id: event_order_id,
+				tx_hash: event_tx_hash,
+				tx_type: event_tx_type,
+				receipt: event_receipt,
+			}) => {
+				assert_eq!(event_order_id, order_id);
+				assert_eq!(event_tx_hash, tx_hash);
+				assert_eq!(event_tx_type, tx_type);
+				assert!(event_receipt.success);
+			},
+			_ => panic!("Expected TransactionConfirmed event"),
+		}
+
+		// Wait for the monitor task to complete
+		monitor_task.await.expect("Monitor task should complete");
+	}
+
+	#[tokio::test]
+	async fn test_monitor_transaction_failed() {
+		let order_id = "test_order_123".to_string();
+		let tx_hash = create_test_tx_hash();
+		let tx_type = TransactionType::Fill;
+		let tx_chain_id = 137u64;
+
+		let (monitor, mut event_rx) = create_test_monitor_with_mock(
+			|mock_delivery| {
+				// Return false (transaction failed)
+				mock_delivery
+					.expect_get_receipt()
+					.with(eq(tx_hash.clone()), eq(tx_chain_id))
+					.times(1)
+					.returning(move |_, _| Box::pin(async move { Ok(create_test_receipt(false)) }));
+			},
+			30,
+		)
+		.await;
+
+		let order_id_clone = order_id.clone();
+		let tx_hash_clone = tx_hash.clone();
+
+		// Start monitoring in a separate task
+		let monitor_task = tokio::spawn(async move {
+			monitor
+				.monitor(order_id_clone, tx_hash_clone, tx_type, tx_chain_id)
+				.await;
+		});
+
+		// Wait for the event
+		let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+			.await
+			.expect("Should receive event within timeout")
+			.expect("Should receive valid event");
+
+		// Verify the event
+		match event {
+			SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+				order_id: event_order_id,
+				tx_hash: event_tx_hash,
+				tx_type: event_tx_type,
+				error,
+			}) => {
+				assert_eq!(event_order_id, order_id);
+				assert_eq!(event_tx_hash, tx_hash);
+				assert_eq!(event_tx_type, tx_type);
+				assert_eq!(error, "Transaction reverted");
+			},
+			_ => panic!("Expected TransactionFailed event"),
+		}
+
+		// Wait for the monitor task to complete
+		monitor_task.await.expect("Monitor task should complete");
+	}
+
+	#[tokio::test]
+	async fn test_monitor_different_transaction_types() {
+		let test_cases = vec![
+			TransactionType::Prepare,
+			TransactionType::Fill,
+			TransactionType::PostFill,
+			TransactionType::PreClaim,
+			TransactionType::Claim,
+		];
+
+		for tx_type in test_cases {
+			let order_id = format!("test_order_{:?}", tx_type);
+			let tx_hash = create_test_tx_hash();
+			let tx_chain_id = 137u64;
+
+			let (monitor, mut event_rx) = create_test_monitor_with_mock(
+				|mock_delivery| {
+					mock_delivery
+						.expect_get_receipt()
+						.with(eq(tx_hash.clone()), eq(tx_chain_id))
+						.times(1)
+						.returning(move |_, _| {
+							Box::pin(async move { Ok(create_test_receipt(true)) })
+						});
+
+					mock_delivery
+						.expect_wait_for_confirmation()
+						.with(eq(tx_hash.clone()), eq(tx_chain_id), eq(1u64))
+						.times(1)
+						.returning(move |_, _, _| {
+							Box::pin(async move { Ok(create_test_receipt(true)) })
+						});
+				},
+				30,
+			)
+			.await;
+
+			let order_id_clone = order_id.clone();
+			let tx_hash_clone = tx_hash.clone();
+
+			// Start monitoring in a separate task
+			let monitor_task = tokio::spawn(async move {
+				monitor
+					.monitor(order_id_clone, tx_hash_clone, tx_type, tx_chain_id)
+					.await;
+			});
+
+			// Wait for the event
+			let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+				.await
+				.expect("Should receive event within timeout")
+				.expect("Should receive valid event");
+
+			// Verify the event has the correct transaction type
+			match event {
+				SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
+					tx_type: event_tx_type,
+					..
+				}) => {
+					assert_eq!(event_tx_type, tx_type);
+				},
+				_ => panic!("Expected TransactionConfirmed event for {:?}", tx_type),
+			}
+
+			// Wait for the monitor task to complete
+			monitor_task.await.expect("Monitor task should complete");
+		}
+	}
+}
