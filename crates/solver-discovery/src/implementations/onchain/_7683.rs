@@ -779,7 +779,10 @@ mod tests {
 				"network_ids",
 				toml::Value::Array(vec![toml::Value::Integer(1)]),
 			),
-			("polling_interval_secs", toml::Value::Integer(400)), // > MAX_POLLING_INTERVAL_SECS
+			(
+				"polling_interval_secs",
+				toml::Value::Integer((MAX_POLLING_INTERVAL_SECS + 100) as i64),
+			),
 		]))
 		.unwrap();
 
@@ -996,8 +999,8 @@ mod tests {
 		let result = create_discovery(&config, &networks);
 		assert!(result.is_err());
 
-		if let Err(DiscoveryError::ValidationError(_)) = result {
-			// Expected
+		if let Err(DiscoveryError::ValidationError(msg)) = result {
+			assert!(msg.contains("required field: network_ids"));
 		} else {
 			panic!("Expected ValidationError");
 		}

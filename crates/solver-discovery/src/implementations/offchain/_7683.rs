@@ -1583,38 +1583,30 @@ mod tests {
 		assert_eq!(url, Some("127.0.0.1:8080".to_string()));
 	}
 
-	// Integration test for the complete flow (requires more setup)
 	#[tokio::test]
 	async fn test_handle_intent_submission_invalid_order() {
 		use axum::extract::State;
 		use axum::Json;
 
-		// Create test state
-		let networks = create_test_networks_config();
 		let (tx, _rx) = mpsc::unbounded_channel();
-
-		// Create providers map (empty for this test)
-		let providers = HashMap::new();
-
 		let state = ApiState {
 			intent_sender: tx,
 			auth_token: None,
-			providers,
-			networks,
+			providers: HashMap::new(),
+			networks: create_test_networks_config(),
 		};
 
 		// Create invalid request with malformed order data
 		let invalid_request = IntentRequest {
 			order: Bytes::from_static(b"invalid_order_data"),
 			signature: Bytes::from_static(b"signature"),
-			sponsor: Address::from_slice(&[0xabu8; 20]),
+			sponsor: Address::from_slice(&[0xab; 20]),
 			lock_type: LockType::Permit2Escrow,
 		};
 
 		let response = handle_intent_submission(State(state), Json(invalid_request)).await;
 
-		// The response should be a bad request
-		// Note: This is a simplified test - full integration would require more setup
-		assert!(!response.into_response().status().is_success());
+		// Should return BAD_REQUEST status due to parsing failure
+		assert_eq!(response.into_response().status(), StatusCode::BAD_REQUEST);
 	}
 }
