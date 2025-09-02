@@ -167,7 +167,7 @@ async fn handle_order(
 	Json(payload): Json<Value>,
 ) -> axum::response::Response {
 	// Check if this is a committed order (quote acceptance)
-	if let Some(response) = handle_committed_order(payload.clone()).await {
+	if let Some(response) = handle_committed_order(payload.clone(), &state).await {
 		return response.into_response();
 	}
 
@@ -231,7 +231,7 @@ async fn handle_order(
 	}
 }
 
-async fn handle_committed_order(payload: Value) -> Option<impl IntoResponse> {
+async fn handle_committed_order(payload: Value, state: &AppState) -> Option<impl IntoResponse> {
 	// Check if this is a quote acceptance submission (contains quoteId)
 	if let Some(quote_id) = payload.get("quoteId").and_then(|v| v.as_str()) {
 		tracing::info!("Received quote acceptance for quote ID: {}", quote_id);
@@ -240,23 +240,112 @@ async fn handle_committed_order(payload: Value) -> Option<impl IntoResponse> {
 		let signature = payload.get("signature").and_then(|v| v.as_str());
 
 		if let Some(sig) = signature {
-			tracing::debug!("Quote acceptance signature: {}", sig);
-		}
+			tracing::debug!(
+				"Quote acceptance detected, retrieving quote from storage and converting to intent"
+			);
 
-		// Return placeholder response for quote acceptance
-		// TODO: Implement actual quote acceptance logic once quote storage is in place
-		return Some(
-			(
-				StatusCode::NOT_IMPLEMENTED,
-				Json(serde_json::json!({
-					"error": "Quote acceptance not yet implemented",
-					"message": "Quote ID submission is recognized but not yet supported",
-					"quoteId": quote_id,
-					"status": "pending_implementation"
-				})),
-			)
-				.into_response(),
-		);
+			// Retrieve the quote from storage using the existing get_quote_by_id function
+			match crate::apis::quote::get_quote_by_id(quote_id, &state.solver).await {
+				Ok(quote) => {
+					// Submit quote to the discovery service for processing
+					// This is much simpler than ABI encoding and avoids duplication
+					match submit_quote_acceptance(&quote, sig, &state).await {
+						Ok(()) => {
+							tracing::info!("Quote acceptance processed successfully, intent sent to solver pipeline");
+							return Some(
+								(
+									StatusCode::OK,
+									Json(serde_json::json!({
+										"message": "Quote accepted and intent submitted to solver pipeline",
+										"quoteId": quote_id,
+										"status": "received"
+									})),
+								)
+									.into_response(),
+							);
+						},
+						Err(e) => {
+							tracing::warn!("Failed to submit quote to discovery service: {}", e);
+							return Some(
+								(
+									StatusCode::INTERNAL_SERVER_ERROR,
+									Json(serde_json::json!({
+										"error": format!("Failed to process quote: {}", e),
+										"quoteId": quote_id
+									})),
+								)
+									.into_response(),
+							);
+						},
+					}
+				},
+				Err(e) => {
+					tracing::warn!("Failed to retrieve quote {}: {}", quote_id, e);
+					return Some(
+						(
+							StatusCode::NOT_FOUND,
+							Json(serde_json::json!({
+								"error": format!("Quote not found: {}", e),
+								"quoteId": quote_id
+							})),
+						)
+							.into_response(),
+					);
+				},
+			}
+		} else {
+			tracing::warn!("Quote acceptance missing signature");
+			return Some(
+				(
+					StatusCode::BAD_REQUEST,
+					Json(serde_json::json!({
+						"error": "Signature required for quote acceptance",
+						"quoteId": quote_id
+					})),
+				)
+					.into_response(),
+			);
+		}
 	}
 	None
+}
+
+/// Submit quote acceptance to the discovery service via HTTP request
+async fn submit_quote_acceptance(
+	quote: &solver_types::api::Quote,
+	signature: &str,
+	state: &AppState,
+) -> Result<(), Box<dyn std::error::Error>> {
+	// Get the discovery service base URL and construct the quote acceptance endpoint
+	let discovery_base_url = state
+		.discovery_url
+		.as_ref()
+		.ok_or("Discovery service URL not configured")?
+		.trim_end_matches("/intent"); // Remove /intent to get base URL
+
+	let quote_accept_url = format!("{}/quote/accept", discovery_base_url);
+
+	// Create the quote acceptance request
+	let quote_request = serde_json::json!({
+		"quote": quote,
+		"signature": signature
+	});
+
+	// Submit to discovery service using the shared HTTP client
+	let response = state
+		.http_client
+		.post(&quote_accept_url)
+		.json(&quote_request)
+		.send()
+		.await?;
+
+	if response.status().is_success() {
+		Ok(())
+	} else {
+		let error_text = response
+			.text()
+			.await
+			.unwrap_or_else(|_| "Unknown error".to_string());
+		Err(format!("Discovery service returned error: {}", error_text).into())
+	}
 }

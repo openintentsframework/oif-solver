@@ -84,6 +84,7 @@ sol! {
 		function orderIdentifier(StandardOrder calldata order) external view returns (bytes32);
 	}
 
+	/// StandardOrder for the OIF contracts (used for ABI encoding)
 	struct StandardOrder {
 		address user;
 		uint256 nonce;
@@ -95,6 +96,7 @@ sol! {
 		SolMandateOutput[] outputs;
 	}
 
+	/// MandateOutput structure for ABI encoding
 	struct SolMandateOutput {
 		bytes32 oracle;
 		bytes32 settler;
@@ -299,6 +301,17 @@ struct IntentRequest {
 		deserialize_with = "deserialize_lock_type_flexible"
 	)]
 	lock_type: LockType,
+}
+
+/// Request structure for quote acceptance.
+///
+/// Contains the quote data and signature needed to create an intent:
+/// * `quote` - The full quote data retrieved from storage
+/// * `signature` - The user's signature for the quote
+#[derive(Debug, Deserialize)]
+struct QuoteAcceptanceRequest {
+	quote: serde_json::Value,
+	signature: String,
 }
 
 fn default_lock_type() -> LockType {
@@ -791,6 +804,7 @@ impl Eip7683OffchainDiscovery {
 
 		let app = Router::new()
 			.route("/intent", post(handle_intent_submission))
+			.route("/quote/accept", post(handle_quote_acceptance))
 			.layer(CorsLayer::permissive())
 			.with_state(state);
 
@@ -815,7 +829,6 @@ impl Eip7683OffchainDiscovery {
 		Ok(())
 	}
 }
-
 /// Handles intent submission requests.
 ///
 /// This is the main request handler for the POST /intent endpoint.
@@ -952,6 +965,387 @@ async fn handle_intent_submission(
 			)
 				.into_response()
 		},
+	}
+}
+
+/// Handle quote acceptance requests.
+///
+/// This endpoint accepts a quote ID and signature, retrieves the stored quote,
+/// converts it to an intent, and sends it to the solver pipeline.
+///
+/// # Request Format
+/// ```json
+/// {
+///   "quote_id": "uuid-string",
+///   "signature": "0x..."
+/// }
+/// ```
+///
+/// # Response Format
+/// ```json
+/// {
+///   "order_id": "0x...",
+///   "status": "received" | "rejected",
+///   "message": "optional message",
+///   "quote_id": "uuid-string"
+/// }
+/// ```
+async fn handle_quote_acceptance(
+	State(state): State<ApiState>,
+	Json(request): Json<QuoteAcceptanceRequest>,
+) -> impl IntoResponse {
+	tracing::info!("Received quote acceptance request");
+
+	// Parse the quote data
+	let quote: solver_types::api::Quote = match serde_json::from_value(request.quote) {
+		Ok(quote) => quote,
+		Err(e) => {
+			tracing::warn!(error = %e, "Failed to parse quote data");
+			return (
+				StatusCode::BAD_REQUEST,
+				Json(IntentResponse {
+					order_id: None,
+					status: IntentResponseStatus::Rejected,
+					message: Some(format!("Invalid quote data: {}", e)),
+					order: None,
+				}),
+			)
+				.into_response();
+		},
+	};
+
+	// Convert quote to intent using the existing conversion logic from solver-service
+	let intent = match quote_to_intent(&quote, &request.signature) {
+		Ok(intent) => intent,
+		Err(e) => {
+			tracing::warn!(error = %e, "Failed to convert quote to intent");
+			return (
+				StatusCode::BAD_REQUEST,
+				Json(IntentResponse {
+					order_id: None,
+					status: IntentResponseStatus::Rejected,
+					message: Some(format!("Quote conversion failed: {}", e)),
+					order: None,
+				}),
+			)
+				.into_response();
+		},
+	};
+	tracing::info!("Converted quote to intent: {:?}", intent);
+	let intent_id = intent.id.clone();
+
+	// Send intent through channel
+	if let Err(e) = state.intent_sender.send(intent) {
+		tracing::warn!(error = %e, "Failed to send intent to solver channel");
+		return (
+			StatusCode::INTERNAL_SERVER_ERROR,
+			Json(IntentResponse {
+				order_id: Some(intent_id),
+				status: IntentResponseStatus::Rejected,
+				message: Some(format!("Failed to process intent: {}", e)),
+				order: None,
+			}),
+		)
+			.into_response();
+	}
+
+	(
+		StatusCode::OK,
+		Json(IntentResponse {
+			order_id: Some(intent_id),
+			status: IntentResponseStatus::Received,
+			message: Some("Quote accepted and intent submitted to solver pipeline".to_string()),
+			order: None,
+		}),
+	)
+		.into_response()
+}
+
+/// Encode StandardOrder to bytes using alloy_sol_types
+fn encode_standard_order(
+	user: Address,
+	nonce: U256,
+	origin_chain_id: U256,
+	expires: u32,
+	fill_deadline: u32,
+	input_oracle: Address,
+	inputs: Vec<[U256; 2]>,
+	outputs: &[MandateOutput],
+) -> Result<Vec<u8>, DiscoveryError> {
+	// Convert MandateOutput to SolMandateOutput for ABI encoding
+	let sol_outputs: Vec<SolMandateOutput> = outputs
+		.iter()
+		.map(|output| {
+			use alloy_primitives::FixedBytes;
+			SolMandateOutput {
+				oracle: FixedBytes::from(output.oracle),
+				settler: FixedBytes::from(output.settler),
+				chainId: U256::from(output.chain_id),
+				token: FixedBytes::from(output.token),
+				amount: U256::from(output.amount),
+				recipient: FixedBytes::from(output.recipient),
+				call: output.call.clone().into(),
+				context: output.context.clone().into(),
+			}
+		})
+		.collect();
+
+	// Create the Solidity StandardOrder struct
+	let sol_order = StandardOrder {
+		user,
+		nonce,
+		originChainId: origin_chain_id,
+		expires,
+		fillDeadline: fill_deadline,
+		inputOracle: input_oracle,
+		inputs,
+		outputs: sol_outputs,
+	};
+
+	// ABI encode the StandardOrder
+	use alloy_sol_types::SolType;
+	Ok(StandardOrder::abi_encode(&sol_order))
+}
+
+/// Convert a quote and signature to an intent
+fn quote_to_intent(
+	quote: &solver_types::api::Quote,
+	signature: &str,
+) -> Result<Intent, DiscoveryError> {
+	use solver_types::{
+		current_timestamp,
+		standards::eip7683::{GasLimitOverrides, LockType},
+		standards::eip7930::InteropAddress,
+		Eip7683OrderData, IntentMetadata,
+	};
+
+	// Extract user address from the first available input
+	let user_str = &quote
+		.details
+		.available_inputs
+		.first()
+		.ok_or_else(|| {
+			DiscoveryError::ParseError("Quote must have at least one available input".to_string())
+		})?
+		.user;
+	let interop_address = InteropAddress::from_hex(&user_str.to_string())
+		.map_err(|e| DiscoveryError::ParseError(format!("Invalid interop address: {}", e)))?;
+	let user_address = interop_address
+		.ethereum_address()
+		.map_err(|e| DiscoveryError::ParseError(format!("Failed to extract address: {}", e)))?;
+
+	// Extract input oracle from the quote data
+	let quote_order = quote.orders.first().ok_or_else(|| {
+		DiscoveryError::ParseError("Quote must contain at least one order".to_string())
+	})?;
+
+	let message_data = quote_order.message.as_object().ok_or_else(|| {
+		DiscoveryError::ParseError("Invalid EIP-712 message structure".to_string())
+	})?;
+
+	let eip712_data = message_data
+		.get("eip712")
+		.and_then(|e| e.as_object())
+		.ok_or_else(|| {
+			DiscoveryError::ParseError("Missing 'eip712' object in message".to_string())
+		})?;
+
+	let witness = eip712_data
+		.get("witness")
+		.and_then(|w| w.as_object())
+		.ok_or_else(|| {
+			DiscoveryError::ParseError("Missing 'witness' object in EIP-712 message".to_string())
+		})?;
+
+	let input_oracle_str = witness
+		.get("inputOracle")
+		.and_then(|o| o.as_str())
+		.unwrap_or("0x0000000000000000000000000000000000000000");
+
+	// Extract outputs from witness
+	let default_outputs = Vec::new();
+	let witness_outputs = witness
+		.get("outputs")
+		.and_then(|o| o.as_array())
+		.unwrap_or(&default_outputs);
+
+	let mut outputs = Vec::new();
+	for output_item in witness_outputs {
+		if let Some(output_obj) = output_item.as_object() {
+			let chain_id = output_obj
+				.get("chainId")
+				.and_then(|c| c.as_u64())
+				.unwrap_or(0);
+			let token_str = output_obj
+				.get("token")
+				.and_then(|t| t.as_str())
+				.unwrap_or("0x0000000000000000000000000000000000000000000000000000000000000000");
+			let amount_str = output_obj
+				.get("amount")
+				.and_then(|a| a.as_str())
+				.unwrap_or("0");
+			let recipient_str = output_obj
+				.get("recipient")
+				.and_then(|r| r.as_str())
+				.unwrap_or("0x0000000000000000000000000000000000000000000000000000000000000000");
+
+			if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
+				// Parse the token and recipient addresses from hex strings
+				let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
+				let recipient_bytes = parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
+
+				outputs.push(solver_types::standards::eip7683::MandateOutput {
+					oracle: [0u8; 32],  // Simplified for now
+					settler: [0u8; 32], // Simplified for now
+					chain_id: U256::from(chain_id),
+					token: token_bytes,
+					amount,
+					recipient: recipient_bytes,
+					call: Vec::new(),
+					context: Vec::new(),
+				});
+			}
+		}
+	}
+
+	// Parse input oracle address
+	let input_oracle_address = Address::from_slice(
+		&hex::decode(input_oracle_str.trim_start_matches("0x")).map_err(|e| {
+			DiscoveryError::ParseError(format!("Invalid input oracle address: {}", e))
+		})?,
+	);
+
+	// Extract original signing parameters from the quote
+	let nonce_str = eip712_data
+		.get("nonce")
+		.and_then(|n| n.as_str())
+		.ok_or_else(|| DiscoveryError::ParseError("Missing nonce in EIP-712 data".to_string()))?;
+	let nonce = U256::from_str_radix(nonce_str, 10)
+		.map_err(|e| DiscoveryError::ParseError(format!("Invalid nonce format: {}", e)))?;
+
+	// Note: The Permit2 deadline is different from the StandardOrder expires/fillDeadline
+	// The signature verification uses the Permit2 deadline, but the StandardOrder uses expires
+
+	// Extract input amount and token from the permitted array
+	let permitted = eip712_data
+		.get("permitted")
+		.and_then(|p| p.as_array())
+		.ok_or_else(|| {
+			DiscoveryError::ParseError("Missing permitted array in EIP-712 data".to_string())
+		})?;
+
+	let first_permitted = permitted.first().ok_or_else(|| {
+		DiscoveryError::ParseError("Empty permitted array in EIP-712 data".to_string())
+	})?;
+
+	let input_amount_str = first_permitted
+		.get("amount")
+		.and_then(|a| a.as_str())
+		.ok_or_else(|| {
+			DiscoveryError::ParseError("Missing amount in permitted token".to_string())
+		})?;
+	let input_amount = U256::from_str_radix(input_amount_str, 10)
+		.map_err(|e| DiscoveryError::ParseError(format!("Invalid input amount format: {}", e)))?;
+
+	let input_token_str = first_permitted
+		.get("token")
+		.and_then(|t| t.as_str())
+		.ok_or_else(|| {
+			DiscoveryError::ParseError("Missing token in permitted array".to_string())
+		})?;
+	let input_token = Address::from_slice(
+		&hex::decode(input_token_str.trim_start_matches("0x")).map_err(|e| {
+			DiscoveryError::ParseError(format!("Invalid input token address: {}", e))
+		})?,
+	);
+
+	// Prepare values for StandardOrder encoding
+	let origin_chain_id =
+		U256::from(interop_address.ethereum_chain_id().map_err(|e| {
+			DiscoveryError::ParseError(format!("Failed to extract chain ID: {}", e))
+		})?);
+
+	// Extract expires from witness data (this is different from Permit2 deadline)
+	let expires = witness
+		.get("expires")
+		.and_then(|e| e.as_u64())
+		.unwrap_or(quote.valid_until.unwrap_or(0)) as u32;
+
+	// For StandardOrder, fill_deadline should match expires (based on quote generation logic)
+	let fill_deadline = expires;
+	// Convert 20-byte address to 32-byte U256 by padding with zeros
+	let mut token_bytes = [0u8; 32];
+	token_bytes[12..32].copy_from_slice(&input_token.0 .0); // Address goes in the last 20 bytes
+	let input_token_u256 = U256::from_be_bytes(token_bytes);
+	let inputs = vec![[input_token_u256, input_amount]]; // Use the actual input from the quote
+
+	// Encode the StandardOrder to bytes
+	let order_bytes = encode_standard_order(
+		user_address,
+		nonce,
+		origin_chain_id,
+		expires,
+		fill_deadline,
+		input_oracle_address,
+		inputs.clone(),
+		&outputs,
+	)?;
+
+	// Create a properly structured order data
+	let order_data = Eip7683OrderData {
+		user: format!("0x{}", hex::encode(user_address)),
+		nonce,
+		origin_chain_id,
+		expires,
+		fill_deadline,
+		input_oracle: input_oracle_str.to_string(),
+		inputs,
+		order_id: [0u8; 32], // Will be computed later
+		gas_limit_overrides: GasLimitOverrides::default(),
+		outputs,
+		raw_order_data: Some(with_0x_prefix(&hex::encode(&order_bytes))), // Properly encoded StandardOrder
+		signature: Some(signature.to_string()),
+		sponsor: Some(format!("0x{}", hex::encode(user_address))),
+		lock_type: Some(LockType::Permit2Escrow),
+	};
+
+	Ok(Intent {
+		id: quote.quote_id.clone(),
+		source: "off-chain".to_string(), // Must be "off-chain" to trigger openFor
+		standard: "eip7683".to_string(),
+		metadata: IntentMetadata {
+			requires_auction: false,
+			exclusive_until: None,
+			discovered_at: current_timestamp(),
+		},
+		data: serde_json::to_value(&order_data).map_err(|e| {
+			DiscoveryError::ParseError(format!("Failed to serialize order data: {}", e))
+		})?,
+		quote_id: Some(quote.quote_id.clone()),
+	})
+}
+
+/// Parse bytes32 from hex string (handles both 20-byte addresses and 32-byte values)
+fn parse_bytes32_from_hex(hex_str: &str) -> Result<[u8; 32], DiscoveryError> {
+	let s = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+
+	if s.len() == 40 {
+		// 20-byte address - pad to 32 bytes
+		let mut bytes = [0u8; 32];
+		hex::decode_to_slice(s, &mut bytes[12..])
+			.map_err(|e| DiscoveryError::ParseError(format!("Invalid hex in address: {}", e)))?;
+		Ok(bytes)
+	} else if s.len() == 64 {
+		// 32-byte value
+		let mut bytes = [0u8; 32];
+		hex::decode_to_slice(s, &mut bytes)
+			.map_err(|e| DiscoveryError::ParseError(format!("Invalid hex in bytes32: {}", e)))?;
+		Ok(bytes)
+	} else {
+		Err(DiscoveryError::ParseError(format!(
+			"Invalid hex length: expected 40 or 64 chars, got {}",
+			s.len()
+		)))
 	}
 }
 

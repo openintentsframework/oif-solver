@@ -393,6 +393,15 @@ impl OrderInterface for Eip7683OrderImpl {
 		if matches!(order_data.lock_type, Some(LockType::ResourceLock)) {
 			return Ok(None);
 		}
+
+		// Skip prepare for Permit2 orders from quote acceptance
+		// These orders use Permit2 signatures which are not compatible with openFor
+		if intent.quote_id.is_some() {
+			tracing::info!(
+				"Skipping preparation for quote-derived order - using direct Permit2 flow"
+			);
+			return Ok(None);
+		}
 		let raw_order_data = order_data.raw_order_data.as_ref().ok_or_else(|| {
 			OrderError::ValidationFailed("Missing raw order data for off-chain order".to_string())
 		})?;
