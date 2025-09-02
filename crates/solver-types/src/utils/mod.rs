@@ -8,6 +8,7 @@ pub mod conversion;
 pub mod eip712;
 pub mod formatting;
 pub mod helpers;
+pub mod tests;
 
 pub use constants::{
 	DEFAULT_GAS_PRICE_WEI, MOCK_ETH_SOL_PRICE, MOCK_ETH_USD_PRICE, MOCK_SOL_USD_PRICE, ZERO_BYTES32,
