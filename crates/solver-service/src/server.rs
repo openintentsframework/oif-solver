@@ -339,7 +339,7 @@ async fn handle_committed_order(payload: Value, state: &AppState) -> Option<impl
 				Ok(quote) => {
 					// Submit quote to the discovery service for processing
 					// This is much simpler than ABI encoding and avoids duplication
-					match submit_quote_acceptance(&quote, sig, &state).await {
+					match submit_quote_acceptance(&quote, sig, state).await {
 						Ok(()) => {
 							tracing::info!("Quote acceptance processed successfully, intent sent to solver pipeline");
 							return Some(
@@ -413,7 +413,8 @@ async fn submit_quote_acceptance(
 		.ok_or("Discovery service URL not configured")?;
 
 	// Convert quote to IntentRequest format with encoded StandardOrder
-	let intent_request = quote.to_intent_request(signature)?;
+	let intent_request: serde_json::Value =
+		solver_types::api::QuoteWithSignature::from((quote, signature)).try_into()?;
 
 	// Submit to discovery service using the shared HTTP client
 	let response = state

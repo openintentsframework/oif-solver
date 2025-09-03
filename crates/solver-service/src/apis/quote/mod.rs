@@ -62,7 +62,6 @@
 //! - `InsufficientLiquidity`: Solver lacks required tokens
 //! - `UnsupportedChain`: Chain not configured
 //! - `Internal`: System errors
-// pub mod conversion; // Moved to discovery service
 pub mod cost;
 pub mod custody;
 pub mod generation;

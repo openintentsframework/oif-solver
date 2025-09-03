@@ -408,20 +408,33 @@ impl From<GetOrderError> for APIError {
 	}
 }
 
-impl Quote {
-	/// Convert quote and signature to IntentRequest format with encoded StandardOrder
-	#[cfg(feature = "abi")]
-	pub fn to_intent_request(
-		&self,
-		signature: &str,
-	) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-		use crate::standards::eip7683::abi::{SolMandateOutput, StandardOrder};
+/// A tuple combining Quote and signature for intent request conversion
+#[cfg(feature = "standard")]
+pub struct QuoteWithSignature<'a> {
+	pub quote: &'a Quote,
+	pub signature: &'a str,
+}
+
+#[cfg(feature = "standard")]
+impl<'a> From<(&'a Quote, &'a str)> for QuoteWithSignature<'a> {
+	fn from((quote, signature): (&'a Quote, &'a str)) -> Self {
+		Self { quote, signature }
+	}
+}
+
+#[cfg(feature = "standard")]
+impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
+	type Error = Box<dyn std::error::Error>;
+
+	fn try_from(quote_with_sig: QuoteWithSignature<'_>) -> Result<Self, Self::Error> {
+		use crate::standards::eip7683::standard::{SolMandateOutput, StandardOrder};
 		use crate::standards::eip7930::InteropAddress;
 		use alloy_primitives::{Address, U256};
 		use alloy_sol_types::SolType;
 
 		// Extract user address from the first available input
-		let user_str = &self
+		let user_str = &quote_with_sig
+			.quote
 			.details
 			.available_inputs
 			.first()
@@ -431,7 +444,8 @@ impl Quote {
 		let user_address = interop_address.ethereum_address()?;
 
 		// Extract order data from quote
-		let quote_order = self
+		let quote_order = quote_with_sig
+			.quote
 			.orders
 			.first()
 			.ok_or("Quote must contain at least one order")?;
@@ -464,7 +478,7 @@ impl Quote {
 		let expires = witness
 			.get("expires")
 			.and_then(|e| e.as_u64())
-			.unwrap_or(self.valid_until.unwrap_or(0)) as u32;
+			.unwrap_or(quote_with_sig.quote.valid_until.unwrap_or(0)) as u32;
 		let fill_deadline = expires;
 
 		// Extract input oracle
@@ -532,24 +546,13 @@ impl Quote {
 					.get("amount")
 					.and_then(|a| a.as_str())
 					.unwrap_or("0");
-				let token_str = output_obj.get("token").and_then(|t| t.as_str()).unwrap_or(
-					"0x0000000000000000000000000000000000000000000000000000000000000000",
-				);
+				let token_str = output_obj.get("token").and_then(|t| t.as_str()).unwrap();
 				let recipient_str = output_obj
 					.get("recipient")
 					.and_then(|r| r.as_str())
-					.unwrap_or(
-						"0x0000000000000000000000000000000000000000000000000000000000000000",
-					);
-				let oracle_str = output_obj.get("oracle").and_then(|o| o.as_str()).unwrap_or(
-					"0x0000000000000000000000000000000000000000000000000000000000000000",
-				);
-				let settler_str = output_obj
-					.get("settler")
-					.and_then(|s| s.as_str())
-					.unwrap_or(
-						"0x0000000000000000000000000000000000000000000000000000000000000000",
-					);
+					.unwrap();
+				let oracle_str = output_obj.get("oracle").and_then(|o| o.as_str()).unwrap();
+				let settler_str = output_obj.get("settler").and_then(|s| s.as_str()).unwrap();
 
 				if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
 					let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
@@ -591,13 +594,15 @@ impl Quote {
 		let intent_request = serde_json::json!({
 			"order": format!("0x{}", hex::encode(&encoded_order)),
 			"sponsor": format!("{:#x}", user_address),
-			"signature": signature,
-			"lockType": self.lock_type.clone()
+			"signature": quote_with_sig.signature,
+			"lockType": quote_with_sig.quote.lock_type.clone()
 		});
 
 		Ok(intent_request)
 	}
+}
 
+impl Quote {
 	/// Extract lock type from quote data with fallback logic
 	pub fn extract_lock_type(&self) -> String {
 		// First check the direct lock_type field on the quote
@@ -854,7 +859,7 @@ mod tests {
 			quote_id: "quote_123".to_string(),
 			provider: "test_solver".to_string(),
 			cost: None,
-			lock_type: "escrow".to_string(),
+			lock_type: "permit2_escrow".to_string(),
 		};
 
 		let json = serde_json::to_string(&quote).unwrap();

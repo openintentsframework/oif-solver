@@ -507,8 +507,8 @@ mod tests {
 }
 
 // Solidity struct definitions for ABI encoding with OIF contracts
-#[cfg(feature = "abi")]
-pub mod abi {
+#[cfg(feature = "standard")]
+pub mod standard {
 	use alloy_sol_types::sol;
 
 	sol! {
@@ -536,6 +536,18 @@ pub mod abi {
 			bytes32 recipient;
 			bytes call;
 			bytes context;
+		}
+
+		/// Input Settler interfaces for interacting with OIF contracts
+		#[sol(rpc)]
+		interface IInputSettlerEscrow {
+			function orderIdentifier(bytes calldata order) external view returns (bytes32);
+			function openFor(bytes calldata order, address sponsor, bytes calldata signature) external;
+		}
+
+		#[sol(rpc)]
+		interface IInputSettlerCompact {
+			function orderIdentifier(StandardOrder calldata order) external view returns (bytes32);
 		}
 	}
 }

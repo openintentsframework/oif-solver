@@ -44,7 +44,7 @@
 use crate::{DiscoveryError, DiscoveryInterface};
 use alloy_primitives::{Address, Bytes, U256};
 use alloy_provider::RootProvider;
-use alloy_sol_types::sol;
+use alloy_sol_types::SolType;
 use alloy_transport_http::Http;
 use async_trait::async_trait;
 use axum::{
@@ -57,6 +57,9 @@ use axum::{
 use hex;
 use serde::{Deserialize, Serialize};
 use serde_json;
+use solver_types::standards::eip7683::standard::{
+	IInputSettlerCompact, IInputSettlerEscrow, StandardOrder,
+};
 use solver_types::{
 	bytes32_to_address, current_timestamp, normalize_bytes32_address,
 	standards::eip7683::{GasLimitOverrides, LockType, MandateOutput},
@@ -71,21 +74,7 @@ use tokio::sync::{mpsc, Mutex};
 use tower_http::cors::CorsLayer;
 
 // Import the centralized types for conversion logic
-use solver_types::standards::eip7683::abi::{SolMandateOutput, StandardOrder};
-
-// Simplified interfaces - both use bytes to avoid struct duplication
-sol! {
-	#[sol(rpc)]
-	interface IInputSettlerEscrow {
-		function orderIdentifier(bytes calldata order) external view returns (bytes32);
-		function openFor(bytes calldata order, address sponsor, bytes calldata signature) external;
-	}
-
-	#[sol(rpc)]
-	interface IInputSettlerCompact {
-		function orderIdentifier(bytes calldata order) external view returns (bytes32);
-	}
-}
+use solver_types::standards::eip7683::standard::SolMandateOutput;
 
 /// API representation of StandardOrder for JSON deserialization.
 ///
@@ -449,10 +438,8 @@ impl Eip7683OffchainDiscovery {
 	///
 	/// Returns `DiscoveryError::ParseError` if the order data cannot be decoded.
 	fn parse_standard_order(order_bytes: &Bytes) -> Result<StandardOrder, DiscoveryError> {
-		use alloy_sol_types::SolValue;
-
 		// Decode the StandardOrder struct from the order data
-		let order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+		let order = <StandardOrder as SolType>::abi_decode(order_bytes, true).map_err(|e| {
 			DiscoveryError::ParseError(format!("Failed to decode StandardOrder: {}", e))
 		})?;
 
@@ -687,10 +674,14 @@ impl Eip7683OffchainDiscovery {
 	) -> Result<[u8; 32], DiscoveryError> {
 		match lock_type {
 			LockType::ResourceLock => {
-				// Resource Lock (TheCompact) - use IInputSettlerCompact with bytes
+				// Resource Lock (TheCompact) - use IInputSettlerCompact
+				let std_order =
+					<StandardOrder as SolType>::abi_decode(order_bytes, true).map_err(|e| {
+						DiscoveryError::ParseError(format!("Failed to decode StandardOrder: {}", e))
+					})?;
 				let compact = IInputSettlerCompact::new(settler_address, provider);
 				let resp = compact
-					.orderIdentifier(order_bytes.clone())
+					.orderIdentifier(std_order)
 					.call()
 					.await
 					.map_err(|e| {
