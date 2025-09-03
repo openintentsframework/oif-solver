@@ -3667,6 +3667,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "alloy-rpc-types",
+ "alloy-sol-types",
  "async-trait",
  "axum",
  "bytes",

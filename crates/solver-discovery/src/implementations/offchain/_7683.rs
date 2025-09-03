@@ -71,7 +71,10 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tower_http::cors::CorsLayer;
 
-// Import the Solidity types for the OIF contracts
+// Import the centralized types for conversion logic
+use solver_types::standards::eip7683::abi::{SolMandateOutput, StandardOrder};
+
+// Simplified interfaces - both use bytes to avoid struct duplication
 sol! {
 	#[sol(rpc)]
 	interface IInputSettlerEscrow {
@@ -81,31 +84,7 @@ sol! {
 
 	#[sol(rpc)]
 	interface IInputSettlerCompact {
-		function orderIdentifier(StandardOrder calldata order) external view returns (bytes32);
-	}
-
-	/// StandardOrder for the OIF contracts (used for ABI encoding)
-	struct StandardOrder {
-		address user;
-		uint256 nonce;
-		uint256 originChainId;
-		uint32 expires;
-		uint32 fillDeadline;
-		address inputOracle;
-		uint256[2][] inputs;
-		SolMandateOutput[] outputs;
-	}
-
-	/// MandateOutput structure for ABI encoding
-	struct SolMandateOutput {
-		bytes32 oracle;
-		bytes32 settler;
-		uint256 chainId;
-		bytes32 token;
-		uint256 amount;
-		bytes32 recipient;
-		bytes call;
-		bytes context;
+		function orderIdentifier(bytes calldata order) external view returns (bytes32);
 	}
 }
 
@@ -715,17 +694,12 @@ impl Eip7683OffchainDiscovery {
 		settler_address: Address,
 		lock_type: LockType,
 	) -> Result<[u8; 32], DiscoveryError> {
-		use alloy_sol_types::SolValue;
-
 		match lock_type {
 			LockType::ResourceLock => {
-				// Resource Lock (TheCompact) - use IInputSettlerCompact
-				let std_order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
-					DiscoveryError::ParseError(format!("Failed to decode StandardOrder: {}", e))
-				})?;
+				// Resource Lock (TheCompact) - use IInputSettlerCompact with bytes
 				let compact = IInputSettlerCompact::new(settler_address, provider);
 				let resp = compact
-					.orderIdentifier(std_order)
+					.orderIdentifier(order_bytes.clone())
 					.call()
 					.await
 					.map_err(|e| {

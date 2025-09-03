@@ -4,9 +4,14 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 
+[features]
+default = ["abi"]
+abi = ["alloy-sol-types"]
+
 [dependencies]
 alloy-primitives = { version = "0.8", features = ["std", "serde"] }
 alloy-rpc-types = { version = "0.8" }
+alloy-sol-types = { version = "0.8", features = ["std"], optional = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
