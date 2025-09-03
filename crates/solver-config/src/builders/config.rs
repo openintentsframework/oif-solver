@@ -116,7 +116,7 @@ impl ConfigBuilder {
 				id: self.solver_id,
 				monitoring_timeout_minutes: self.monitoring_timeout_minutes,
 			},
-			networks: self.networks.unwrap_or_else(HashMap::new),
+			networks: self.networks.unwrap_or_default(),
 			storage: StorageConfig {
 				primary: self.storage_primary,
 				implementations: HashMap::new(),

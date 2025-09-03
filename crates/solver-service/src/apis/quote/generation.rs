@@ -329,8 +329,8 @@ impl QuoteGenerator {
 			.api
 			.as_ref()
 			.and_then(|api| api.quote.as_ref())
-			.unwrap_or(&Default::default())
-			.validity_seconds
+			.map(|quote| quote.validity_seconds)
+			.unwrap_or_default()
 	}
 }
 

@@ -104,8 +104,8 @@ pub fn build_permit2_batch_witness_digest(
 		.api
 		.as_ref()
 		.and_then(|api| api.quote.as_ref())
-		.unwrap_or(&Default::default())
-		.validity_seconds;
+		.map(|quote| quote.validity_seconds)
+		.unwrap_or_default();
 	let deadline_secs: U256 = U256::from(now_secs + validity_seconds);
 	let expires_secs: u32 = (now_secs + validity_seconds) as u32;
 
