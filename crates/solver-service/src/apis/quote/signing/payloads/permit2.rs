@@ -101,8 +101,9 @@ pub fn build_permit2_batch_witness_digest(
 	let now_secs = chrono::Utc::now().timestamp() as u64;
 	let nonce_ms: U256 = U256::from((chrono::Utc::now().timestamp_millis()) as u128);
 	let validity_seconds = config
-		.quote
+		.api
 		.as_ref()
+		.and_then(|api| api.quote.as_ref())
 		.unwrap_or(&Default::default())
 		.validity_seconds;
 	let deadline_secs: U256 = U256::from(now_secs + validity_seconds);

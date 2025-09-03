@@ -130,8 +130,9 @@ pub async fn process_quote_request(
 
 	// 5. Persist quotes
 	let validity_seconds = config
-		.quote
+		.api
 		.as_ref()
+		.and_then(|api| api.quote.as_ref())
 		.unwrap_or(&Default::default())
 		.validity_seconds;
 	let quote_ttl = Duration::from_secs(validity_seconds);

@@ -227,6 +227,8 @@ pub struct ApiConfig {
 	pub cors: Option<CorsConfig>,
 	/// Authentication configuration.
 	pub auth: Option<solver_types::AuthConfig>,
+	/// Quote generation configuration.
+	pub quote: Option<QuoteConfig>,
 }
 
 /// Rate limiting configuration.

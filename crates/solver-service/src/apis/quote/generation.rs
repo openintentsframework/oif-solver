@@ -323,11 +323,12 @@ impl QuoteGenerator {
 
 	/// Gets the quote validity duration from configuration.
 	///
-	/// Returns the configured validity seconds from the quote config.
+	/// Returns the configured validity seconds from api.quote config or default.
 	fn get_quote_validity_seconds(&self, config: &Config) -> u64 {
 		config
-			.quote
+			.api
 			.as_ref()
+			.and_then(|api| api.quote.as_ref())
 			.unwrap_or(&Default::default())
 			.validity_seconds
 	}
