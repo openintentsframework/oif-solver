@@ -77,9 +77,6 @@ pub struct Config {
 	/// Optional gas configuration for precomputed/overridden gas units by flow.
 	#[serde(default)]
 	pub gas: Option<GasConfig>,
-	/// Configuration for quote generation parameters.
-	#[serde(default)]
-	pub quote: Option<QuoteConfig>,
 }
 
 /// Domain configuration for EIP-712 signatures in quotes.

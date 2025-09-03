@@ -133,7 +133,6 @@ impl ConfigBuilder {
 			gas: Some(GasConfig {
 				flows: HashMap::new(),
 			}),
-			quote: None,
 		}
 	}
 }
