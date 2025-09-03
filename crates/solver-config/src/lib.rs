@@ -222,6 +222,8 @@ pub struct ApiConfig {
 	pub rate_limiting: Option<RateLimitConfig>,
 	/// CORS configuration.
 	pub cors: Option<CorsConfig>,
+	/// Authentication configuration.
+	pub auth: Option<solver_types::AuthConfig>,
 }
 
 /// Rate limiting configuration.

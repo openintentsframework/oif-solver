@@ -166,6 +166,17 @@ http_request() {
     curl_args+=("-H" "User-Agent: $DEFAULT_USER_AGENT")
     curl_args+=("-H" "Accept: application/json")
     
+    # Add JWT authentication if available
+    if [ -z "$headers" ] || ! echo "$headers" | grep -q "Authorization:"; then
+        # Only add JWT if no Authorization header is already present
+        if command -v jwt_ensure_token >/dev/null 2>&1; then
+            local jwt_token=$(jwt_ensure_token 2>/dev/null)
+            if [ -n "$jwt_token" ]; then
+                curl_args+=("-H" "Authorization: Bearer $jwt_token")
+            fi
+        fi
+    fi
+    
     # Add custom headers
     if [ -n "$headers" ]; then
         while IFS= read -r header; do

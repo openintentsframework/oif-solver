@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 mod apis;
+mod auth;
 mod factory_registry;
 mod server;
 
