@@ -4,8 +4,8 @@
 //! sensible defaults, particularly useful for testing scenarios.
 
 use crate::{
-	AccountConfig, ApiConfig, Config, DeliveryConfig, DiscoveryConfig, GasConfig, OrderConfig,
-	SettlementConfig, SolverConfig, StorageConfig, StrategyConfig,
+	AccountConfig, ApiConfig, Config, DeliveryConfig, DiscoveryConfig, GasConfig, NetworksConfig,
+	OrderConfig, SettlementConfig, SolverConfig, StorageConfig, StrategyConfig,
 };
 use std::collections::HashMap;
 
@@ -22,6 +22,8 @@ pub struct ConfigBuilder {
 	account_primary: String,
 	strategy_primary: String,
 	api: Option<ApiConfig>,
+	settlement: Option<SettlementConfig>,
+	networks: Option<NetworksConfig>,
 }
 
 impl Default for ConfigBuilder {
@@ -42,6 +44,8 @@ impl ConfigBuilder {
 			account_primary: "local".to_string(),
 			strategy_primary: "simple".to_string(),
 			api: None,
+			settlement: None,
+			networks: None,
 		}
 	}
 
@@ -93,6 +97,18 @@ impl ConfigBuilder {
 		self
 	}
 
+	/// Sets the settlement configuration.
+	pub fn settlement(mut self, settlement: SettlementConfig) -> Self {
+		self.settlement = Some(settlement);
+		self
+	}
+
+	/// Sets the networks configuration.
+	pub fn networks(mut self, networks: NetworksConfig) -> Self {
+		self.networks = Some(networks);
+		self
+	}
+
 	/// Builds the `Config` with the configured values.
 	pub fn build(self) -> Config {
 		Config {
@@ -100,7 +116,7 @@ impl ConfigBuilder {
 				id: self.solver_id,
 				monitoring_timeout_minutes: self.monitoring_timeout_minutes,
 			},
-			networks: HashMap::new(),
+			networks: self.networks.unwrap_or_default(),
 			storage: StorageConfig {
 				primary: self.storage_primary,
 				implementations: HashMap::new(),
@@ -124,10 +140,10 @@ impl ConfigBuilder {
 					implementations: HashMap::new(),
 				},
 			},
-			settlement: SettlementConfig {
+			settlement: self.settlement.unwrap_or_else(|| SettlementConfig {
 				implementations: HashMap::new(),
 				domain: None,
-			},
+			}),
 			pricing: None,
 			api: self.api,
 			gas: Some(GasConfig {
