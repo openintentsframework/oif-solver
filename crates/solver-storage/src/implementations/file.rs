@@ -806,3 +806,387 @@ impl solver_types::ImplementationRegistry for Registry {
 }
 
 impl crate::StorageRegistry for Registry {}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::time::Duration;
+	use tempfile::TempDir;
+	use tokio::time::sleep;
+
+	fn create_test_storage() -> (FileStorage, TempDir) {
+		let temp_dir = TempDir::new().unwrap();
+		let ttl_config = TtlConfig {
+			ttls: HashMap::new(),
+		};
+		let storage = FileStorage::new(temp_dir.path().to_path_buf(), ttl_config);
+		(storage, temp_dir)
+	}
+
+	fn create_test_storage_with_ttl() -> (FileStorage, TempDir) {
+		let temp_dir = TempDir::new().unwrap();
+		let mut ttls = HashMap::new();
+		ttls.insert(StorageKey::Orders, Duration::from_secs(1));
+		ttls.insert(StorageKey::Intents, Duration::from_secs(2));
+		let ttl_config = TtlConfig { ttls };
+		let storage = FileStorage::new(temp_dir.path().to_path_buf(), ttl_config);
+		(storage, temp_dir)
+	}
+
+	#[tokio::test]
+	async fn test_basic_operations() {
+		let (storage, _temp_dir) = create_test_storage();
+
+		let key = "test_key";
+		let value = b"test_value".to_vec();
+
+		// Test set and get
+		storage
+			.set_bytes(key, value.clone(), None, None)
+			.await
+			.unwrap();
+		let retrieved = storage.get_bytes(key).await.unwrap();
+		assert_eq!(retrieved, value);
+
+		// Test exists
+		assert!(storage.exists(key).await.unwrap());
+
+		// Test delete
+		storage.delete(key).await.unwrap();
+		assert!(!storage.exists(key).await.unwrap());
+
+		// Test get after delete
+		let result = storage.get_bytes(key).await;
+		assert!(matches!(result, Err(StorageError::NotFound)));
+	}
+
+	#[tokio::test]
+	async fn test_ttl_functionality() {
+		let (storage, _temp_dir) = create_test_storage_with_ttl();
+
+		let key = "orders:test_order";
+		let value = b"test_value".to_vec();
+
+		// Store with TTL from config (1 second for orders)
+		storage
+			.set_bytes(key, value.clone(), None, None)
+			.await
+			.unwrap();
+
+		// Should be available immediately
+		let retrieved = storage.get_bytes(key).await.unwrap();
+		assert_eq!(retrieved, value);
+
+		// Wait for expiration
+		sleep(Duration::from_millis(1100)).await;
+
+		// Should be expired now
+		let result = storage.get_bytes(key).await;
+		assert!(matches!(result, Err(StorageError::NotFound)));
+	}
+
+	#[tokio::test]
+	async fn test_ttl_override() {
+		let (storage, _temp_dir) = create_test_storage();
+
+		let key = "orders:test_key"; // Use a namespace to make it clear
+		let value = b"test_value".to_vec();
+		let custom_ttl = Some(Duration::from_millis(100));
+
+		// Store with custom TTL
+		storage
+			.set_bytes(key, value.clone(), None, custom_ttl)
+			.await
+			.unwrap();
+
+		// Wait for expiration
+		sleep(Duration::from_millis(200)).await;
+
+		// Should be expired now
+		let result = storage.get_bytes(key).await;
+		assert!(matches!(result, Err(StorageError::NotFound)));
+	}
+
+	#[tokio::test]
+	async fn test_indexing_operations() {
+		let (storage, _temp_dir) = create_test_storage_with_ttl();
+
+		let namespace = "orders";
+		let key1 = "orders:order1";
+		let key2 = "orders:order2";
+		let key3 = "orders:order3";
+
+		let indexes1 = StorageIndexes::new()
+			.with_field("status", "pending")
+			.with_field("amount", 100);
+		let indexes2 = StorageIndexes::new()
+			.with_field("status", "completed")
+			.with_field("amount", 200);
+		let indexes3 = StorageIndexes::new()
+			.with_field("status", "pending")
+			.with_field("amount", 150);
+
+		// Store with indexes
+		storage
+			.set_bytes(key1, b"data1".to_vec(), Some(indexes1), None)
+			.await
+			.unwrap();
+		storage
+			.set_bytes(key2, b"data2".to_vec(), Some(indexes2), None)
+			.await
+			.unwrap();
+		storage
+			.set_bytes(key3, b"data3".to_vec(), Some(indexes3), None)
+			.await
+			.unwrap();
+
+		// Query by status
+		let pending_orders = storage
+			.query(
+				namespace,
+				QueryFilter::Equals(
+					"status".to_string(),
+					serde_json::Value::String("pending".to_string()),
+				),
+			)
+			.await
+			.unwrap();
+		assert_eq!(pending_orders.len(), 2);
+		assert!(pending_orders.contains(&key1.to_string()));
+		assert!(pending_orders.contains(&key3.to_string()));
+
+		// Query by amount range using In filter
+		let amounts = vec![
+			serde_json::Value::String("100".to_string()),
+			serde_json::Value::String("150".to_string()),
+		];
+		let filtered_orders = storage
+			.query(namespace, QueryFilter::In("amount".to_string(), amounts))
+			.await
+			.unwrap();
+		assert_eq!(filtered_orders.len(), 2);
+		assert!(filtered_orders.contains(&key1.to_string()));
+		assert!(filtered_orders.contains(&key3.to_string()));
+
+		// Query all
+		let all_orders = storage.query(namespace, QueryFilter::All).await.unwrap();
+		assert_eq!(all_orders.len(), 3);
+	}
+
+	#[tokio::test]
+	async fn test_index_cleanup_on_delete() {
+		let (storage, _temp_dir) = create_test_storage();
+
+		let namespace = "orders";
+		let key = "orders:order1";
+
+		let indexes = StorageIndexes::new().with_field("status", "pending");
+
+		// Store with indexes
+		storage
+			.set_bytes(key, b"data".to_vec(), Some(indexes), None)
+			.await
+			.unwrap();
+
+		// Verify it's indexed
+		let results = storage
+			.query(
+				namespace,
+				QueryFilter::Equals(
+					"status".to_string(),
+					serde_json::Value::String("pending".to_string()),
+				),
+			)
+			.await
+			.unwrap();
+		assert_eq!(results.len(), 1);
+
+		// Delete the item
+		storage.delete(key).await.unwrap();
+
+		// Verify it's removed from index
+		let results = storage
+			.query(
+				namespace,
+				QueryFilter::Equals(
+					"status".to_string(),
+					serde_json::Value::String("pending".to_string()),
+				),
+			)
+			.await
+			.unwrap();
+		assert_eq!(results.len(), 0);
+	}
+
+	#[tokio::test]
+	async fn test_batch_operations() {
+		let (storage, _temp_dir) = create_test_storage();
+
+		let keys = vec!["key1".to_string(), "key2".to_string(), "key3".to_string()];
+		let values = vec![b"value1".to_vec(), b"value2".to_vec(), b"value3".to_vec()];
+
+		// Store multiple items
+		for (key, value) in keys.iter().zip(values.iter()) {
+			storage
+				.set_bytes(key, value.clone(), None, None)
+				.await
+				.unwrap();
+		}
+
+		// Batch retrieve
+		let results = storage.get_batch(&keys).await.unwrap();
+		assert_eq!(results.len(), 3);
+
+		for (key, value) in results {
+			let index = keys.iter().position(|k| k == &key).unwrap();
+			assert_eq!(value, values[index]);
+		}
+
+		// Test batch with missing keys
+		let keys_with_missing = vec![
+			"key1".to_string(),
+			"missing_key".to_string(),
+			"key3".to_string(),
+		];
+		let results = storage.get_batch(&keys_with_missing).await.unwrap();
+		assert_eq!(results.len(), 2); // Only existing keys
+	}
+
+	#[tokio::test]
+	async fn test_legacy_file_support() {
+		let (storage, temp_dir) = create_test_storage();
+
+		// Create a legacy file (without header)
+		let key = "legacy_key";
+		let legacy_data = b"legacy_data";
+		let file_path = temp_dir.path().join("legacy_key.bin");
+		tokio::fs::write(&file_path, legacy_data).await.unwrap();
+
+		// Should be able to read legacy files
+		let retrieved = storage.get_bytes(key).await.unwrap();
+		assert_eq!(retrieved, legacy_data);
+	}
+
+	#[tokio::test]
+	async fn test_file_header_serialization() {
+		let header = FileHeader::new(Duration::from_secs(3600));
+		let serialized = header.serialize();
+		let deserialized = FileHeader::deserialize(&serialized).unwrap();
+
+		assert_eq!(header.magic, deserialized.magic);
+		assert_eq!(header.version, deserialized.version);
+		assert_eq!(header.expires_at, deserialized.expires_at);
+	}
+
+	#[tokio::test]
+	async fn test_file_header_expiration() {
+		// Test permanent storage (TTL = 0)
+		let permanent_header = FileHeader::new(Duration::ZERO);
+		assert!(!permanent_header.is_expired());
+
+		// Test expired header
+		let expired_header = FileHeader {
+			magic: *FileHeader::MAGIC,
+			version: FileHeader::VERSION,
+			expires_at: 1, // Very old timestamp
+			padding: [0; 50],
+		};
+		assert!(expired_header.is_expired());
+	}
+
+	#[tokio::test]
+	async fn test_config_schema_validation() {
+		let schema = FileStorageSchema;
+
+		// Valid config
+		let valid_config = toml::Value::Table(toml::toml! {
+			storage_path = "/tmp/test"
+			ttl_orders = 3600
+			ttl_intents = 7200
+		});
+		assert!(schema.validate(&valid_config).is_ok());
+
+		// Invalid TTL (negative)
+		let invalid_config = toml::Value::Table(toml::toml! {
+			ttl_orders = -1
+		});
+		assert!(schema.validate(&invalid_config).is_err());
+	}
+
+	#[tokio::test]
+	async fn test_ttl_config_from_toml() {
+		let config = toml::Value::Table(toml::toml! {
+			ttl_orders = 3600
+			ttl_intents = 7200
+			ttl_quotes = 1800
+		});
+
+		let ttl_config = TtlConfig::from_config(&config);
+
+		assert_eq!(
+			ttl_config.get_ttl(StorageKey::Orders),
+			Duration::from_secs(3600)
+		);
+		assert_eq!(
+			ttl_config.get_ttl(StorageKey::Intents),
+			Duration::from_secs(7200)
+		);
+		assert_eq!(
+			ttl_config.get_ttl(StorageKey::Quotes),
+			Duration::from_secs(1800)
+		);
+		assert_eq!(
+			ttl_config.get_ttl(StorageKey::OrderByTxHash),
+			Duration::ZERO
+		); // Not configured
+	}
+
+	#[tokio::test]
+	async fn test_factory_function() {
+		let config = toml::Value::Table(toml::toml! {
+			storage_path = "/tmp/test_storage"
+			ttl_orders = 3600
+		});
+
+		let storage = create_storage(&config).unwrap();
+		assert!(storage.config_schema().validate(&config).is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_concurrent_index_operations() {
+		let (storage, _temp_dir) = create_test_storage();
+
+		let namespace = "orders";
+		let tasks = (0..10).map(|i| {
+			let storage = &storage;
+			async move {
+				let key = format!("orders:order{}", i);
+				let indexes = StorageIndexes::new().with_field("batch", "test");
+				storage
+					.set_bytes(&key, format!("data{}", i).into_bytes(), Some(indexes), None)
+					.await
+			}
+		});
+
+		// Execute all operations concurrently
+		let results: Vec<_> = futures::future::join_all(tasks).await;
+
+		// All should succeed
+		for result in results {
+			assert!(result.is_ok());
+		}
+
+		// Query should find all items
+		let all_items = storage
+			.query(
+				namespace,
+				QueryFilter::Equals(
+					"batch".to_string(),
+					serde_json::Value::String("test".to_string()),
+				),
+			)
+			.await
+			.unwrap();
+		assert_eq!(all_items.len(), 10);
+	}
+}
