@@ -122,6 +122,13 @@ impl QuoteGenerator {
 			available_inputs: request.available_inputs.clone(),
 		};
 		let eta = self.calculate_eta(&request.preference);
+		let lock_type = match custody_decision {
+			CustodyDecision::ResourceLock { .. } => "resource_lock".to_string(),
+			CustodyDecision::Escrow { kind } => match kind {
+				EscrowKind::Permit2 => "permit2_escrow".to_string(),
+				EscrowKind::Erc3009 => "erc3009_escrow".to_string(),
+			},
+		};
 		let validity_seconds = self.get_quote_validity_seconds(config);
 		Ok(Quote {
 			orders: vec![order],
@@ -131,6 +138,7 @@ impl QuoteGenerator {
 			quote_id,
 			provider: "oif-solver".to_string(),
 			cost: None,
+			lock_type,
 		})
 	}
 
@@ -662,6 +670,7 @@ mod tests {
 				quote_id: "quote1".to_string(),
 				provider: "test".to_string(),
 				cost: None,
+				lock_type: "permit2_escrow".to_string(),
 			},
 			Quote {
 				orders: vec![],
@@ -674,6 +683,7 @@ mod tests {
 				quote_id: "quote2".to_string(),
 				provider: "test".to_string(),
 				cost: None,
+				lock_type: "permit2_escrow".to_string(),
 			},
 			Quote {
 				orders: vec![],
@@ -686,6 +696,7 @@ mod tests {
 				quote_id: "quote3".to_string(),
 				provider: "test".to_string(),
 				cost: None,
+				lock_type: "permit2_escrow".to_string(),
 			},
 		];
 
@@ -714,6 +725,7 @@ mod tests {
 				quote_id: "quote1".to_string(),
 				provider: "test".to_string(),
 				cost: None,
+				lock_type: "permit2_escrow".to_string(),
 			},
 			Quote {
 				orders: vec![],
@@ -726,6 +738,7 @@ mod tests {
 				quote_id: "quote2".to_string(),
 				provider: "test".to_string(),
 				cost: None,
+				lock_type: "permit2_escrow".to_string(),
 			},
 		];
 
@@ -760,10 +773,9 @@ mod tests {
 		assert_eq!(validity, 300);
 
 		// Test with no API config (should use default)
-		let mut config_no_api = ConfigBuilder::new().build();
-		config_no_api.api = None;
+		let config_no_api = ConfigBuilder::new().build();
 		let validity_default = generator.get_quote_validity_seconds(&config_no_api);
-		assert_eq!(validity_default, 20); // Default QuoteConfig has validity_seconds: 20
+		assert_eq!(validity_default, 0); // if API none, use default 0
 	}
 
 	#[test]

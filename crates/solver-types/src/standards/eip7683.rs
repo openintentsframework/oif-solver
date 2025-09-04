@@ -505,3 +505,49 @@ mod tests {
 		assert_eq!(deserialized.context.len(), 500);
 	}
 }
+
+// Solidity struct definitions for ABI encoding with OIF contracts
+#[cfg(feature = "oif-interfaces")]
+pub mod interfaces {
+	use alloy_sol_types::sol;
+
+	sol! {
+		/// StandardOrder for the OIF contracts (used for ABI encoding)
+		#[derive(Debug)]
+		struct StandardOrder {
+			address user;
+			uint256 nonce;
+			uint256 originChainId;
+			uint32 expires;
+			uint32 fillDeadline;
+			address inputOracle;
+			uint256[2][] inputs;
+			SolMandateOutput[] outputs;
+		}
+
+		/// MandateOutput for the OIF contracts (used for ABI encoding)
+		#[derive(Debug)]
+		struct SolMandateOutput {
+			bytes32 oracle;
+			bytes32 settler;
+			uint256 chainId;
+			bytes32 token;
+			uint256 amount;
+			bytes32 recipient;
+			bytes call;
+			bytes context;
+		}
+
+		/// Input Settler interfaces for interacting with OIF contracts
+		#[sol(rpc)]
+		interface IInputSettlerEscrow {
+			function orderIdentifier(bytes calldata order) external view returns (bytes32);
+			function openFor(bytes calldata order, address sponsor, bytes calldata signature) external;
+		}
+
+		#[sol(rpc)]
+		interface IInputSettlerCompact {
+			function orderIdentifier(StandardOrder calldata order) external view returns (bytes32);
+		}
+	}
+}
