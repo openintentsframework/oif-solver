@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// An intent is a raw expression of desire to perform a cross-chain operation,
 /// discovered from various sources like on-chain events or off-chain APIs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Intent {
 	/// Unique identifier for this intent.
 	pub id: String,
@@ -29,7 +29,7 @@ pub struct Intent {
 ///
 /// Contains information about how the intent was discovered and any
 /// special requirements for processing it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IntentMetadata {
 	/// Whether this intent requires an auction process.
 	pub requires_auction: bool,
