@@ -338,7 +338,7 @@ impl QuoteGenerator {
 			.as_ref()
 			.and_then(|api| api.quote.as_ref())
 			.map(|quote| quote.validity_seconds)
-			.unwrap_or_default()
+			.unwrap_or(20) // Default QuoteConfig validity_seconds
 	}
 }
 
@@ -641,6 +641,7 @@ mod tests {
 				quote_id: "quote1".to_string(),
 				provider: "test".to_string(),
 				cost: None,
+				lock_type: "permit2_escrow".to_string(),
 			},
 			Quote {
 				orders: vec![],
@@ -653,6 +654,7 @@ mod tests {
 				quote_id: "quote2".to_string(),
 				provider: "test".to_string(),
 				cost: None,
+				lock_type: "permit2_escrow".to_string(),
 			},
 			Quote {
 				orders: vec![],
@@ -665,6 +667,7 @@ mod tests {
 				quote_id: "quote3".to_string(),
 				provider: "test".to_string(),
 				cost: None,
+				lock_type: "permit2_escrow".to_string(),
 			},
 		];
 
@@ -693,6 +696,7 @@ mod tests {
 				quote_id: "quote1".to_string(),
 				provider: "test".to_string(),
 				cost: None,
+				lock_type: "permit2_escrow".to_string(),
 			},
 			Quote {
 				orders: vec![],
@@ -705,6 +709,7 @@ mod tests {
 				quote_id: "quote2".to_string(),
 				provider: "test".to_string(),
 				cost: None,
+				lock_type: "permit2_escrow".to_string(),
 			},
 		];
 
