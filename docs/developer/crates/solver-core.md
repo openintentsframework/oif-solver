@@ -38,8 +38,8 @@ graph TB
             Recovery[recovery/mod.rs<br/>Error Recovery Logic]
         end
 
-        subgraph "Builder"
-            Builder[builder/mod.rs<br/>Solver Configuration]
+        subgraph "Configuration Builder"
+            SolverBuilder[builder/mod.rs<br/>Solver Configuration]
         end
     end
 
@@ -59,10 +59,6 @@ graph TB
     SettlementMonitor --> EventBus
     TransactionMonitor --> EventBus
 ```
-
-## Key APIs
-
-### Main Engine Interface
 
 ## Event Flow Architecture
 

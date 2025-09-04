@@ -21,7 +21,6 @@ graph TB
             KeyManagement[Key Management<br/>Secure Storage & Access]
             TransactionSigning[Transaction Signing<br/>Multi-Chain Support]
             AccountMapping[Account Mapping<br/>Network-Specific Addresses]
-            SecurityLayer[Security Layer<br/>Access Control & Validation]
         end
     end
 
@@ -29,7 +28,6 @@ graph TB
     LocalAccount --> KeyManagement
     LocalAccount --> TransactionSigning
     LocalAccount --> AccountMapping
-    LocalAccount --> SecurityLayer
 
     FutureImpls -.-> AccountService
 ```
@@ -42,7 +40,6 @@ sequenceDiagram
     participant Account as Account Service
     participant KeyStore as Key Storage
     participant Signer as Transaction Signer
-    participant Network as Blockchain Network
 
     Config->>Account: Load Account Configuration
     Account->>KeyStore: Initialize Key Storage
@@ -67,8 +64,7 @@ sequenceDiagram
 ### Custom Account Implementations
 
 1. Implement the `AccountService` trait for new account types
-2. Add support for hardware wallets (Ledger, Trezor, etc.)
-3. Integrate with enterprise key management systems
-4. Add support for multi-signature accounts
+2. Integrate with enterprise key management systems
+3. Add support for multi-signature accounts
 
 The solver-account crate provides secure, flexible account management with strong cryptographic foundations while supporting multiple blockchain networks and various key storage mechanisms.

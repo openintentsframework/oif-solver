@@ -24,13 +24,11 @@ graph TB
         subgraph "Discovery Sources (External)"
             BlockchainEvents[Blockchain Events<br/>Intent Submissions]
             RESTAPIs[REST API Calls<br/>Off-chain Intent Submission]
-            Webhooks[Future: Webhooks<br/>Push Notifications]
         end
     end
 
     BlockchainEvents --> OnChain7683
     RESTAPIs --> OffChain7683
-    Webhooks -.-> OffChain7683
 
     OnChain7683 --> DiscoveryService
     OffChain7683 --> DiscoveryService
@@ -74,11 +72,10 @@ sequenceDiagram
 
 - **Concurrent Monitoring**: Each network is monitored in parallel to avoid blocking
 - **Event Processing**: High-frequency events require efficient batching and processing
-- **Memory Usage**: Long-running processes must manage memory for event history
 
 ## Configuration Examples
 
-### Off-Chain API Configuration
+### Off-Chain and On-Chain discovery API Configuration example
 
 ```toml
 [discovery]

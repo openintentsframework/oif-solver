@@ -82,7 +82,7 @@ sequenceDiagram
 
 - **Multi-Protocol Support**: Different intent standards have varying validation requirements
 - **Asset Verification**: Must verify asset existence, decimals, and contract validity across chains
-- **Signature Validation**: EIP712 signature verification requires careful message reconstruction
+- **Signature Validation**: EIP-712 signature verification requires careful message reconstruction
 - **Cross-Chain State**: Validating cross-chain asset balances and allowances is inherently slow
 
 The solver-order crate provides sophisticated intent processing capabilities while maintaining flexibility for different protocols and execution strategies.

@@ -81,7 +81,7 @@ sequenceDiagram
 
 ### ⛽ Gas Management Complexity
 
-- **EIP-1559 vs Legacy**: Different networks support different gas fee mechanisms
+- **EIP-1559**
 - **Network Congestion**: Gas prices can spike rapidly during network congestion
 - **Priority Fee Optimization**: Balancing cost vs confirmation speed requires careful tuning
 - **Gas Limit Estimation**: Contract interactions may require complex gas limit calculations

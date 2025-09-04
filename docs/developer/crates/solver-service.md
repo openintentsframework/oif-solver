@@ -93,14 +93,7 @@ sequenceDiagram
 
 - **JWT Token Management**: Secure token generation, validation, and refresh
 - **Role-Based Access**: Different API endpoints may require different permissions
-- **API Key Management**: Support for API key-based authentication
 - **Audit Logging**: Log all authenticated operations for security analysis
-
-### 📋 Logging and Observability
-
-- **Structured Logging**: Consistent log format across all components
-- **Log Level Management**: Dynamic log level adjustment without restart
-- **Performance Metrics**: Application and business metrics collection
 
 ## Configuration Examples
 
@@ -130,60 +123,6 @@ type = "jwt"
 jwt_secret = "${JWT_SECRET}"
 jwt_expiry_seconds = 3600
 require_auth = true
-
-# Rate limiting
-[api.rate_limit]
-enabled = true
-requests_per_minute = 100
-burst_size = 20
-
-# Logging configuration
-[logging]
-level = "info"
-format = "json"
-output = "stdout"
-file_path = "/var/log/solver/application.log"
-rotate_size_mb = 100
-keep_files = 5
-
-# Metrics and monitoring
-[monitoring]
-enabled = true
-metrics_port = 9090
-health_check_interval_seconds = 30
-performance_metrics = true
-```
-
-### Production Deployment Configuration
-
-```toml
-# Production-specific settings
-[app]
-log_level = "warn"
-log_format = "json"
-performance_monitoring = true
-
-[api]
-bind_address = "0.0.0.0:8080"
-max_connections = 1000
-keepalive_timeout_seconds = 60
-enable_compression = true
-
-[api.security]
-enable_https = true
-cert_file = "/etc/ssl/certs/solver.crt"
-key_file = "/etc/ssl/private/solver.key"
-hsts_max_age = 31536000
-
-[resources]
-max_memory_mb = 2048
-max_file_descriptors = 4096
-thread_pool_size = 100
-
-[monitoring]
-prometheus_endpoint = "/metrics"
-jaeger_endpoint = "http://jaeger:14268/api/traces"
-log_sampling_rate = 0.1  # Sample 10% of logs
 ```
 
 The solver-service crate provides a robust, production-ready application framework that integrates all solver components while maintaining operational excellence through comprehensive monitoring, logging, and configuration management.

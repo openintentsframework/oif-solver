@@ -15,7 +15,6 @@ graph TB
 
         subgraph "Storage Backends"
             FileStorage[implementations/file.rs<br/>File-based Storage]
-            MemoryStorage[implementations/memory.rs<br/>In-memory Storage]
             FutureBackends[Future: Database Backends<br/>PostgreSQL, Redis, etc.]
         end
 
@@ -44,20 +43,18 @@ graph TB
 ```mermaid
 graph LR
     subgraph "Stored Data Categories"
-        OrderData[Order State<br/>Lifecycle Tracking]
-        IntentData[Intent Cache<br/>Discovery Results]
-        ProofData[Settlement Proofs<br/>Verification Evidence]
-        ConfigData[Configuration<br/>Runtime Settings]
-        MetricsData[Performance Metrics<br/>Historical Data]
-        TempData[Temporary Data<br/>Short-lived Cache]
+        OrderData[Orders<br/>Order Lifecycle & State]
+        IntentData[Intents<br/>Cross-chain Intent Data]
+        TxHashData[Order by TX Hash<br/>Transaction Hash Mapping]
+        QuoteData[Quotes<br/>Generated Price Quotes]
     end
 
-    OrderData --> |7 days TTL| TTLManager
-    IntentData --> |24 hours TTL| TTLManager
-    ProofData --> |30 days TTL| TTLManager
-    ConfigData --> |No TTL| TTLManager
-    MetricsData --> |90 days TTL| TTLManager
-    TempData --> |1 hour TTL| TTLManager
+    OrderData --> |Configurable TTL| TTLManager[TTL Manager<br/>File Header Based]
+    IntentData --> |Configurable TTL| TTLManager
+    TxHashData --> |Configurable TTL| TTLManager
+    QuoteData --> |Configurable TTL| TTLManager
+
+    TTLManager --> |Default: No Expiration| Storage[File/Memory Storage]
 ```
 
 ## Configuration Examples
@@ -65,21 +62,16 @@ graph LR
 ### Storage Backend Configuration
 
 ```toml
+# Storage configuration with TTL management
 [storage]
-backend = "file"
-data_dir = "/var/lib/solver/data"
-default_ttl_seconds = 86400  # 24 hours
-cleanup_interval_seconds = 3600  # 1 hour
-max_key_size = 256
-max_value_size = 1048576  # 1MB
+primary = "file"
+cleanup_interval_seconds = 3600
 
-[storage.ttl]
-order_state_seconds = 604800      # 7 days
-intent_cache_seconds = 86400      # 24 hours
-settlement_proof_seconds = 2592000 # 30 days
-configuration_seconds = 0         # No expiration
-metrics_seconds = 7776000         # 90 days
-temporary_seconds = 3600          # 1 hour
+[storage.implementations.file]
+storage_path = "./data/storage"
+ttl_orders = 0                  # Permanent
+ttl_intents = 86400             # 24 hours
+ttl_order_by_tx_hash = 86400    # 24 hours
 ```
 
 ## Extension Points

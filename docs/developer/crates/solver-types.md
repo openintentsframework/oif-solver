@@ -51,7 +51,6 @@ graph TB
 
 ## Dependencies
 
-- **Minimal External**: Only essential dependencies (serde, chrono, alloy primitives)
 - **No Business Logic**: Pure data types and utilities only
 - **Workspace Consistency**: Uses workspace-level dependency versions
 
