@@ -775,7 +775,7 @@ mod tests {
 		// Test with no API config (should use default)
 		let config_no_api = ConfigBuilder::new().build();
 		let validity_default = generator.get_quote_validity_seconds(&config_no_api);
-		assert_eq!(validity_default, 0); // if API none, use default 0
+		assert_eq!(validity_default, 20); // if API none, use default 20
 	}
 
 	#[test]
