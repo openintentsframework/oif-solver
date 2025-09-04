@@ -21,7 +21,7 @@
 use crate::apis::quote::registry::PROTOCOL_REGISTRY;
 use alloy_primitives::{keccak256, B256, U256};
 use serde_json::json;
-use solver_config::Config;
+use solver_config::{Config, QuoteConfig};
 use solver_settlement::SettlementInterface;
 use solver_types::utils::{
 	bytes20_to_alloy_address, DOMAIN_TYPE, MANDATE_OUTPUT_TYPE, NAME_PERMIT2, PERMIT2_WITNESS_TYPE,
@@ -105,7 +105,7 @@ pub fn build_permit2_batch_witness_digest(
 		.as_ref()
 		.and_then(|api| api.quote.as_ref())
 		.map(|quote| quote.validity_seconds)
-		.unwrap_or_default();
+		.unwrap_or_else(|| QuoteConfig::default().validity_seconds);
 	let deadline_secs: U256 = U256::from(now_secs + validity_seconds);
 	let expires_secs: u32 = (now_secs + validity_seconds) as u32;
 
