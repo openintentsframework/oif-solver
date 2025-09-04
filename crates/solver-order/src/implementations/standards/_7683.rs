@@ -394,6 +394,7 @@ impl OrderInterface for Eip7683OrderImpl {
 		if matches!(order_data.lock_type, Some(LockType::ResourceLock)) {
 			return Ok(None);
 		}
+
 		let raw_order_data = order_data.raw_order_data.as_ref().ok_or_else(|| {
 			OrderError::ValidationFailed("Missing raw order data for off-chain order".to_string())
 		})?;
@@ -405,7 +406,6 @@ impl OrderInterface for Eip7683OrderImpl {
 		let signature = order_data.signature.as_ref().ok_or_else(|| {
 			OrderError::ValidationFailed("Missing signature for off-chain order".to_string())
 		})?;
-
 		// For the OIF contracts, we need to use the StandardOrder openFor
 		// The raw_order_data contains the encoded StandardOrder
 		// We just need to pass the order bytes, sponsor, and signature
