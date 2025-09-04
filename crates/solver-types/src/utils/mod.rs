@@ -15,7 +15,7 @@ pub use constants::{
 };
 pub use conversion::{
 	bytes20_to_alloy_address, bytes32_to_address, normalize_bytes32_address, parse_address,
-	wei_string_to_eth_string,
+	parse_bytes32_from_hex, wei_string_to_eth_string,
 };
 pub use eip712::{
 	compute_domain_hash, compute_final_digest, Eip712AbiEncoder, DOMAIN_TYPE, MANDATE_OUTPUT_TYPE,

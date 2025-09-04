@@ -2,7 +2,7 @@
 //!
 //! This module defines the request and response types for the OIF Solver API
 //! endpoints, following the ERC-7683 Cross-Chain Intents Standard.
-use crate::{costs::QuoteCost, standards::eip7930::InteropAddress};
+use crate::{costs::QuoteCost, standards::eip7930::InteropAddress, utils::parse_bytes32_from_hex};
 use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -525,15 +525,6 @@ impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
 			.unwrap_or(&default_outputs);
 
 		// Parse outputs with proper helper function for hex parsing
-		fn parse_bytes32_from_hex(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-			let hex_clean = hex_str.trim_start_matches("0x");
-			if hex_clean.len() != 64 {
-				return Err("Hex string must be exactly 64 characters (32 bytes)".into());
-			}
-			let mut bytes = [0u8; 32];
-			hex::decode_to_slice(hex_clean, &mut bytes)?;
-			Ok(bytes)
-		}
 
 		let mut sol_outputs = Vec::new();
 		for output_item in witness_outputs {
