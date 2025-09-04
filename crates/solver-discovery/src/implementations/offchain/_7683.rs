@@ -83,6 +83,7 @@ sol! {
 		function orderIdentifier(StandardOrder calldata order) external view returns (bytes32);
 	}
 
+	#[derive(Debug)]
 	struct StandardOrder {
 		address user;
 		uint256 nonce;
@@ -94,6 +95,7 @@ sol! {
 		SolMandateOutput[] outputs;
 	}
 
+	#[derive(Debug)]
 	struct SolMandateOutput {
 		bytes32 oracle;
 		bytes32 settler;
@@ -365,6 +367,7 @@ struct ApiState {
 /// off-chain intent discovery through an HTTP API server. It listens
 /// for incoming EIP-7683 orders and converts them to the internal
 /// Intent format for processing by the solver system.
+#[derive(Debug)]
 pub struct Eip7683OffchainDiscovery {
 	/// API server configuration
 	api_host: String,
@@ -1122,3 +1125,422 @@ impl ImplementationRegistry for Registry {
 }
 
 impl crate::DiscoveryRegistry for Registry {}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use alloy_primitives::{Address, Bytes, U256};
+	use serde_json::json;
+	use solver_types::{
+		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
+		NetworksConfig,
+	};
+	use std::collections::HashMap;
+	use tokio::sync::mpsc;
+
+	fn create_test_networks_config() -> NetworksConfig {
+		NetworksConfigBuilder::new()
+			.add_network(1, NetworkConfigBuilder::new().build())
+			.build()
+	}
+
+	fn create_test_standard_order() -> StandardOrder {
+		StandardOrder {
+			user: Address::from_slice(&[0x12u8; 20]),
+			nonce: U256::from(1),
+			originChainId: U256::from(1),
+			expires: (current_timestamp() + 3600) as u32, // 1 hour from now
+			fillDeadline: (current_timestamp() + 1800) as u32, // 30 min from now
+			inputOracle: Address::from_slice(&[0x34u8; 20]),
+			inputs: vec![[U256::from(1000), U256::from(100)]],
+			outputs: vec![create_test_mandate_output()],
+		}
+	}
+
+	fn create_test_mandate_output() -> SolMandateOutput {
+		SolMandateOutput {
+			oracle: alloy_primitives::FixedBytes::from([0x56u8; 32]),
+			settler: alloy_primitives::FixedBytes::from([0x78u8; 32]),
+			chainId: U256::from(137),
+			token: alloy_primitives::FixedBytes::from([0x9au8; 32]),
+			amount: U256::from(500),
+			recipient: alloy_primitives::FixedBytes::from([0xbcu8; 32]),
+			call: Bytes::new(),
+			context: Bytes::new(),
+		}
+	}
+
+	#[test]
+	fn test_new_discovery_service() {
+		let networks = create_test_networks_config();
+		let network_ids = vec![1];
+
+		let discovery =
+			Eip7683OffchainDiscovery::new("127.0.0.1".to_string(), 8080, network_ids, &networks);
+
+		assert!(discovery.is_ok());
+		let discovery = discovery.unwrap();
+		assert_eq!(discovery.api_host, "127.0.0.1");
+		assert_eq!(discovery.api_port, 8080);
+	}
+
+	#[test]
+	fn test_new_discovery_service_invalid_networks() {
+		let networks = HashMap::new(); // Empty networks
+		let network_ids = vec![1];
+
+		let result =
+			Eip7683OffchainDiscovery::new("127.0.0.1".to_string(), 8080, network_ids, &networks);
+
+		assert!(result.is_err());
+		matches!(result.unwrap_err(), DiscoveryError::ValidationError(_));
+	}
+
+	#[test]
+	fn test_parse_standard_order_success() {
+		use alloy_sol_types::SolValue;
+
+		let order = create_test_standard_order();
+		let order_bytes = Bytes::from(order.abi_encode());
+
+		let parsed = Eip7683OffchainDiscovery::parse_standard_order(&order_bytes);
+		assert!(parsed.is_ok());
+
+		let parsed_order = parsed.unwrap();
+		assert_eq!(parsed_order.user, order.user);
+		assert_eq!(parsed_order.nonce, order.nonce);
+		assert_eq!(parsed_order.originChainId, order.originChainId);
+	}
+
+	#[test]
+	fn test_parse_standard_order_invalid_data() {
+		let invalid_bytes = Bytes::from_static(b"invalid_data");
+
+		let result = Eip7683OffchainDiscovery::parse_standard_order(&invalid_bytes);
+		assert!(result.is_err());
+
+		match result.unwrap_err() {
+			DiscoveryError::ParseError(msg) => {
+				assert!(msg.contains("Failed to decode StandardOrder"));
+			},
+			_ => panic!("Expected ParseError"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_success() {
+		let order = create_test_standard_order();
+		let sponsor = Address::from_slice(&[0xabu8; 20]);
+		let signature = Bytes::from_static(b"valid_signature");
+
+		let result = Eip7683OffchainDiscovery::validate_order(&order, &sponsor, &signature).await;
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_expired() {
+		let mut order = create_test_standard_order();
+		order.expires = (current_timestamp() - 3600) as u32; // 1 hour ago
+
+		let sponsor = Address::from_slice(&[0xabu8; 20]);
+		let signature = Bytes::from_static(b"valid_signature");
+
+		let result = Eip7683OffchainDiscovery::validate_order(&order, &sponsor, &signature).await;
+		assert!(result.is_err());
+
+		match result.unwrap_err() {
+			DiscoveryError::ValidationError(msg) => {
+				assert_eq!(msg, "Order has expired");
+			},
+			_ => panic!("Expected ValidationError for expired order"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_fill_deadline_passed() {
+		let mut order = create_test_standard_order();
+		order.fillDeadline = (current_timestamp() - 1800) as u32; // 30 min ago
+
+		let sponsor = Address::from_slice(&[0xabu8; 20]);
+		let signature = Bytes::from_static(b"valid_signature");
+
+		let result = Eip7683OffchainDiscovery::validate_order(&order, &sponsor, &signature).await;
+		assert!(result.is_err());
+
+		match result.unwrap_err() {
+			DiscoveryError::ValidationError(msg) => {
+				assert_eq!(msg, "Order fill deadline has passed");
+			},
+			_ => panic!("Expected ValidationError for passed deadline"),
+		}
+	}
+
+	#[test]
+	fn test_deserialize_bytes32_valid() {
+		let json_data = json!({
+			"oracle": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+			"settler": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+			"chainId": "137",
+			"token": "9999999999999999999999999999999999999999999999999999999999999999",
+			"amount": "500",
+			"recipient": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+			"call": "0x",
+			"context": "0x"
+		});
+		let result: Result<ApiMandateOutput, _> = serde_json::from_value(json_data);
+		assert!(result.is_ok());
+
+		let output = result.unwrap();
+		assert_eq!(output.oracle[0], 0x12);
+		assert_eq!(output.oracle[31], 0xef);
+	}
+
+	#[test]
+	fn test_deserialize_bytes32_no_prefix() {
+		let json_data = json!({
+			"oracle": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+			"settler": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+			"chainId": "137",
+			"token": "9999999999999999999999999999999999999999999999999999999999999999",
+			"amount": "500",
+			"recipient": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+			"call": "0x",
+			"context": "0x"
+		});
+		let result: Result<ApiMandateOutput, _> = serde_json::from_value(json_data);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_deserialize_bytes32_invalid_length() {
+		let json_data = json!("0x1234"); // Too short
+		let result: Result<[u8; 32], _> = serde_json::from_value(json_data);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_api_standard_order_conversion() {
+		let sol_order = create_test_standard_order();
+		let api_order = ApiStandardOrder::from(&sol_order);
+
+		assert_eq!(api_order.user, sol_order.user);
+		assert_eq!(api_order.nonce, sol_order.nonce);
+		assert_eq!(api_order.origin_chain_id, sol_order.originChainId);
+		assert_eq!(api_order.expires, sol_order.expires);
+		assert_eq!(api_order.fill_deadline, sol_order.fillDeadline);
+		assert_eq!(api_order.inputs, sol_order.inputs);
+		assert_eq!(api_order.outputs.len(), sol_order.outputs.len());
+	}
+
+	#[test]
+	fn test_mandate_output_conversion() {
+		let sol_output = create_test_mandate_output();
+		let api_output = ApiMandateOutput::from(&sol_output);
+
+		assert_eq!(api_output.oracle, sol_output.oracle.0);
+		assert_eq!(api_output.settler, sol_output.settler.0);
+		assert_eq!(api_output.chain_id, sol_output.chainId);
+		assert_eq!(api_output.token, sol_output.token.0);
+		assert_eq!(api_output.amount, sol_output.amount);
+		assert_eq!(api_output.recipient, sol_output.recipient.0);
+	}
+
+	#[test]
+	fn test_intent_response_serialization() {
+		let response = IntentResponse {
+			order_id: Some("0x123".to_string()),
+			status: IntentResponseStatus::Received,
+			message: Some("Success".to_string()),
+			order: Some(json!({"test": "data"})),
+		};
+
+		let serialized = serde_json::to_string(&response);
+		assert!(serialized.is_ok());
+
+		let json_str = serialized.unwrap();
+		assert!(json_str.contains("orderId"));
+		assert!(json_str.contains("received"));
+	}
+
+	#[test]
+	fn test_config_schema_validation_success() {
+		let config = toml::Value::Table({
+			let mut table = toml::value::Table::new();
+			table.insert(
+				"api_host".to_string(),
+				toml::Value::String("127.0.0.1".to_string()),
+			);
+			table.insert("api_port".to_string(), toml::Value::Integer(8080));
+			table.insert(
+				"network_ids".to_string(),
+				toml::Value::Array(vec![toml::Value::Integer(1)]),
+			);
+			table
+		});
+
+		let result = Eip7683OffchainDiscoverySchema::validate_config(&config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_config_schema_validation_missing_required() {
+		let config = toml::Value::Table({
+			let mut table = toml::value::Table::new();
+			table.insert(
+				"api_host".to_string(),
+				toml::Value::String("127.0.0.1".to_string()),
+			);
+			// Missing api_port and network_ids
+			table
+		});
+
+		let result = Eip7683OffchainDiscoverySchema::validate_config(&config);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_config_schema_validation_invalid_port() {
+		let config = toml::Value::Table({
+			let mut table = toml::value::Table::new();
+			table.insert(
+				"api_host".to_string(),
+				toml::Value::String("127.0.0.1".to_string()),
+			);
+			table.insert("api_port".to_string(), toml::Value::Integer(70000)); // Invalid port > 65535
+			table.insert(
+				"network_ids".to_string(),
+				toml::Value::Array(vec![toml::Value::Integer(1)]),
+			);
+			table
+		});
+
+		let result = Eip7683OffchainDiscoverySchema::validate_config(&config);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_create_discovery_factory_success() {
+		let config = toml::Value::Table({
+			let mut table = toml::value::Table::new();
+			table.insert(
+				"api_host".to_string(),
+				toml::Value::String("127.0.0.1".to_string()),
+			);
+			table.insert("api_port".to_string(), toml::Value::Integer(8080));
+			table.insert(
+				"network_ids".to_string(),
+				toml::Value::Array(vec![toml::Value::Integer(1)]),
+			);
+			table
+		});
+
+		let networks = create_test_networks_config();
+		let result = create_discovery(&config, &networks);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_create_discovery_factory_defaults() {
+		let config = toml::Value::Table({
+			let mut table = toml::value::Table::new();
+			// Provide required fields but use values that will trigger defaults
+			table.insert(
+				"api_host".to_string(),
+				toml::Value::String("0.0.0.0".to_string()),
+			);
+			table.insert("api_port".to_string(), toml::Value::Integer(8081));
+			table.insert(
+				"network_ids".to_string(),
+				toml::Value::Array(vec![toml::Value::Integer(1)]),
+			);
+			// Don't include auth_token to test that default (None) works
+			table
+		});
+
+		let networks = create_test_networks_config();
+		let result = create_discovery(&config, &networks);
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_discovery_interface_start_stop() {
+		let networks = create_test_networks_config();
+		let discovery = Eip7683OffchainDiscovery::new(
+			"127.0.0.1".to_string(),
+			0, // Use port 0 to let OS assign a free port
+			vec![1],
+			&networks,
+		)
+		.unwrap();
+
+		let (tx, _rx) = mpsc::unbounded_channel();
+
+		// Test start monitoring
+		let start_result = discovery.start_monitoring(tx).await;
+		assert!(start_result.is_ok());
+		assert!(discovery.is_running.load(Ordering::SeqCst));
+
+		// Test stop monitoring
+		let stop_result = discovery.stop_monitoring().await;
+		assert!(stop_result.is_ok());
+		assert!(!discovery.is_running.load(Ordering::SeqCst));
+	}
+
+	#[tokio::test]
+	async fn test_discovery_interface_already_monitoring() {
+		let networks = create_test_networks_config();
+		let discovery =
+			Eip7683OffchainDiscovery::new("127.0.0.1".to_string(), 0, vec![1], &networks).unwrap();
+
+		let (tx1, _rx1) = mpsc::unbounded_channel();
+		let (tx2, _rx2) = mpsc::unbounded_channel();
+
+		// Start monitoring
+		discovery.start_monitoring(tx1).await.unwrap();
+
+		// Try to start again - should fail
+		let result = discovery.start_monitoring(tx2).await;
+		assert!(result.is_err());
+		matches!(result.unwrap_err(), DiscoveryError::AlreadyMonitoring);
+
+		// Cleanup
+		discovery.stop_monitoring().await.unwrap();
+	}
+
+	#[test]
+	fn test_get_url() {
+		let networks = create_test_networks_config();
+		let discovery =
+			Eip7683OffchainDiscovery::new("127.0.0.1".to_string(), 8080, vec![1], &networks)
+				.unwrap();
+
+		let url = discovery.get_url();
+		assert_eq!(url, Some("127.0.0.1:8080".to_string()));
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_submission_invalid_order() {
+		use axum::extract::State;
+		use axum::Json;
+
+		let (tx, _rx) = mpsc::unbounded_channel();
+		let state = ApiState {
+			intent_sender: tx,
+			providers: HashMap::new(),
+			networks: create_test_networks_config(),
+		};
+
+		// Create invalid request with malformed order data
+		let invalid_request = IntentRequest {
+			order: Bytes::from_static(b"invalid_order_data"),
+			signature: Bytes::from_static(b"signature"),
+			sponsor: Address::from_slice(&[0xab; 20]),
+			lock_type: LockType::Permit2Escrow,
+		};
+
+		let response = handle_intent_submission(State(state), Json(invalid_request)).await;
+
+		// Should return BAD_REQUEST status due to parsing failure
+		assert_eq!(response.into_response().status(), StatusCode::BAD_REQUEST);
+	}
+}
