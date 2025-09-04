@@ -592,44 +592,6 @@ impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
 		Ok(intent_request)
 	}
 }
-
-impl Quote {
-	/// Extract lock type from quote data with fallback logic
-	pub fn extract_lock_type(&self) -> String {
-		// First check the direct lock_type field on the quote
-		if !self.lock_type.is_empty() {
-			return self.lock_type.clone();
-		}
-
-		// Check if the quote contains lock type information in order data or witness data
-		if let Some(quote_order) = self.orders.first() {
-			if let Some(message_data) = quote_order.message.as_object() {
-				// Check for lock type in the main message data
-				if let Some(lock_type) = message_data.get("lockType").and_then(|v| v.as_str()) {
-					return lock_type.to_string();
-				}
-
-				// Check for lock type in EIP-712 data
-				if let Some(eip712_data) = message_data.get("eip712").and_then(|e| e.as_object()) {
-					if let Some(lock_type) = eip712_data.get("lockType").and_then(|v| v.as_str()) {
-						return lock_type.to_string();
-					}
-
-					// Check witness data for lock type
-					if let Some(witness) = eip712_data.get("witness").and_then(|w| w.as_object()) {
-						if let Some(lock_type) = witness.get("lockType").and_then(|v| v.as_str()) {
-							return lock_type.to_string();
-						}
-					}
-				}
-			}
-		}
-
-		// Default fallback
-		"permit2_escrow".to_string()
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
