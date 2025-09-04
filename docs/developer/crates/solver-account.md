@@ -15,7 +15,6 @@ graph TB
 
         subgraph "Account Implementations"
             LocalAccount[implementations/local.rs<br/>Local Private Key Storage]
-            FutureImpls[Future: Hardware Wallets<br/>HSM, Ledger, etc.]
         end
 
         subgraph "Core Components"
@@ -55,7 +54,6 @@ sequenceDiagram
     KeyStore->>Signer: Private Key (Secure)
     Signer->>Signer: Generate Signature
     Signer->>Account: Signed Transaction
-    Account->>Network: Submit Signed Transaction
 ```
 
 ## Implementation Caveats
