@@ -35,7 +35,7 @@ graph TB
         end
 
         subgraph "Recovery"
-            Recovery[recovery/mod.rs<br/>Error Recovery Logic]
+            RecoveryMechanism[recovery/mod.rs<br/>Error Recovery Logic]
         end
 
         subgraph "Configuration Builder"
