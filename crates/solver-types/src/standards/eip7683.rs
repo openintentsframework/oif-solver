@@ -507,8 +507,8 @@ mod tests {
 }
 
 // Solidity struct definitions for ABI encoding with OIF contracts
-#[cfg(feature = "standard")]
-pub mod standard {
+#[cfg(feature = "oif-interfaces")]
+pub mod interfaces {
 	use alloy_sol_types::sol;
 
 	sol! {

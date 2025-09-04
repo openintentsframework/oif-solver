@@ -257,8 +257,11 @@ async fn handle_order(
 		);
 	}
 	// Check if this is a committed order (quote acceptance)
-	if let Some(response) = handle_committed_order(payload.clone(), &state).await {
-		return response.into_response();
+	if let Some(result) = handle_committed_order(payload.clone(), &state).await {
+		return match result {
+			Ok(result) => result.into_response(),
+			Err(api_error) => api_error.into_response(),
+		};
 	}
 
 	// Check if discovery URL is configured
@@ -321,7 +324,10 @@ async fn handle_order(
 	}
 }
 
-async fn handle_committed_order(payload: Value, state: &AppState) -> Option<impl IntoResponse> {
+async fn handle_committed_order(
+	payload: Value,
+	state: &AppState,
+) -> Option<Result<impl IntoResponse, APIError>> {
 	// Check if this is a quote acceptance submission (contains quoteId)
 	if let Some(quote_id) = payload.get("quoteId").and_then(|v| v.as_str()) {
 		tracing::info!("Received quote acceptance for quote ID: {}", quote_id);
@@ -335,69 +341,48 @@ async fn handle_committed_order(payload: Value, state: &AppState) -> Option<impl
 			);
 
 			// Retrieve the quote from storage using the existing get_quote_by_id function
-			match crate::apis::quote::get_quote_by_id(quote_id, &state.solver).await {
-				Ok(quote) => {
-					// Submit quote to the discovery service for processing
-					// This is much simpler than ABI encoding and avoids duplication
-					match submit_quote_acceptance(&quote, sig, state).await {
-						Ok(()) => {
-							tracing::info!("Quote acceptance processed successfully, intent sent to solver pipeline");
-							return Some(
-								(
-									StatusCode::OK,
-									Json(serde_json::json!({
-										"message": "Quote accepted and intent submitted to solver pipeline",
-										"quoteId": quote_id,
-										"status": "received"
-									})),
-								)
-									.into_response(),
-							);
-						},
-						Err(e) => {
-							tracing::warn!("Failed to submit quote to discovery service: {}", e);
-							return Some(
-								(
-									StatusCode::INTERNAL_SERVER_ERROR,
-									Json(serde_json::json!({
-										"error": format!("Failed to process quote: {}", e),
-										"quoteId": quote_id
-									})),
-								)
-									.into_response(),
-							);
-						},
-					}
-				},
+			let quote = match crate::apis::quote::get_quote_by_id(quote_id, &state.solver).await {
+				Ok(quote) => quote,
 				Err(e) => {
 					tracing::warn!("Failed to retrieve quote {}: {}", quote_id, e);
-					return Some(
-						(
-							StatusCode::NOT_FOUND,
-							Json(serde_json::json!({
-								"error": format!("Quote not found: {}", e),
-								"quoteId": quote_id
-							})),
-						)
-							.into_response(),
-					);
+					return Some(Err(APIError::BadRequest {
+						error_type: "QUOTE_NOT_FOUND".to_string(),
+						message: format!("Quote not found: {}", e),
+						details: Some(serde_json::json!({"quoteId": quote_id})),
+					}));
 				},
+			};
+
+			// Submit quote to the discovery service for processing
+			if let Err(e) = submit_quote_acceptance(&quote, sig, state).await {
+				tracing::warn!("Failed to submit quote to discovery service: {}", e);
+				return Some(Err(APIError::InternalServerError {
+					error_type: "QUOTE_PROCESSING_FAILED".to_string(),
+					message: format!("Failed to process quote: {}", e),
+				}));
 			}
+
+			tracing::info!(
+				"Quote acceptance processed successfully, intent sent to solver pipeline"
+			);
+			Some(Ok(Json(serde_json::json!({
+				"message": "Quote accepted and intent submitted to solver pipeline",
+				"quoteId": quote_id,
+				"status": "received"
+			}))
+			.into_response()))
 		} else {
 			tracing::warn!("Quote acceptance missing signature");
-			return Some(
-				(
-					StatusCode::BAD_REQUEST,
-					Json(serde_json::json!({
-						"error": "Signature required for quote acceptance",
-						"quoteId": quote_id
-					})),
-				)
-					.into_response(),
-			);
+			Some(Err(APIError::BadRequest {
+				error_type: "MISSING_SIGNATURE".to_string(),
+				message: "Signature required for quote acceptance".to_string(),
+				details: Some(serde_json::json!({"quoteId": quote_id})),
+			}))
 		}
+	} else {
+		// Not a committed order, return None to indicate no handling needed
+		None
 	}
-	None
 }
 
 /// Submit quote acceptance to the discovery service via HTTP request
@@ -405,16 +390,24 @@ async fn submit_quote_acceptance(
 	quote: &solver_types::api::Quote,
 	signature: &str,
 	state: &AppState,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), APIError> {
 	// Get the discovery service URL (should already point to /intent endpoint)
 	let intent_url = state
 		.discovery_url
 		.as_ref()
-		.ok_or("Discovery service URL not configured")?;
+		.ok_or_else(|| APIError::InternalServerError {
+			error_type: "DISCOVERY_SERVICE_NOT_CONFIGURED".to_string(),
+			message: "Discovery service URL not configured".to_string(),
+		})?;
 
 	// Convert quote to IntentRequest format with encoded StandardOrder
 	let intent_request: serde_json::Value =
-		solver_types::api::QuoteWithSignature::from((quote, signature)).try_into()?;
+		solver_types::api::QuoteWithSignature::from((quote, signature))
+			.try_into()
+			.map_err(|e| APIError::InternalServerError {
+				error_type: "QUOTE_CONVERSION_FAILED".to_string(),
+				message: format!("Failed to convert quote to intent format: {}", e),
+			})?;
 
 	// Submit to discovery service using the shared HTTP client
 	let response = state
@@ -422,7 +415,12 @@ async fn submit_quote_acceptance(
 		.post(intent_url)
 		.json(&intent_request)
 		.send()
-		.await?;
+		.await
+		.map_err(|e| APIError::ServiceUnavailable {
+			error_type: "DISCOVERY_SERVICE_UNAVAILABLE".to_string(),
+			message: format!("Failed to submit to discovery service: {}", e),
+			retry_after: Some(30),
+		})?;
 
 	if response.status().is_success() {
 		Ok(())
@@ -431,6 +429,10 @@ async fn submit_quote_acceptance(
 			.text()
 			.await
 			.unwrap_or_else(|_| "Unknown error".to_string());
-		Err(format!("Discovery service returned error: {}", error_text).into())
+		Err(APIError::ServiceUnavailable {
+			error_type: "DISCOVERY_SERVICE_ERROR".to_string(),
+			message: format!("Discovery service returned error: {}", error_text),
+			retry_after: Some(30),
+		})
 	}
 }

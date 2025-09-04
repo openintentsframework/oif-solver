@@ -57,12 +57,12 @@ use axum::{
 use hex;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use solver_types::standards::eip7683::standard::{
-	IInputSettlerCompact, IInputSettlerEscrow, StandardOrder,
-};
 use solver_types::{
 	bytes32_to_address, current_timestamp, normalize_bytes32_address,
-	standards::eip7683::{GasLimitOverrides, LockType, MandateOutput},
+	standards::eip7683::{
+		interfaces::{IInputSettlerCompact, IInputSettlerEscrow, SolMandateOutput, StandardOrder},
+		GasLimitOverrides, LockType, MandateOutput,
+	},
 	with_0x_prefix, ConfigSchema, Eip7683OrderData, Field, FieldType, ImplementationRegistry,
 	Intent, IntentMetadata, NetworksConfig, Schema,
 };
@@ -72,9 +72,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tower_http::cors::CorsLayer;
-
-// Import the centralized types for conversion logic
-use solver_types::standards::eip7683::standard::SolMandateOutput;
 
 /// API representation of StandardOrder for JSON deserialization.
 ///

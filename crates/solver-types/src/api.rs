@@ -409,25 +409,25 @@ impl From<GetOrderError> for APIError {
 }
 
 /// A tuple combining Quote and signature for intent request conversion
-#[cfg(feature = "standard")]
+#[cfg(feature = "oif-interfaces")]
 pub struct QuoteWithSignature<'a> {
 	pub quote: &'a Quote,
 	pub signature: &'a str,
 }
 
-#[cfg(feature = "standard")]
+#[cfg(feature = "oif-interfaces")]
 impl<'a> From<(&'a Quote, &'a str)> for QuoteWithSignature<'a> {
 	fn from((quote, signature): (&'a Quote, &'a str)) -> Self {
 		Self { quote, signature }
 	}
 }
 
-#[cfg(feature = "standard")]
+#[cfg(feature = "oif-interfaces")]
 impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
 	type Error = Box<dyn std::error::Error>;
 
 	fn try_from(quote_with_sig: QuoteWithSignature<'_>) -> Result<Self, Self::Error> {
-		use crate::standards::eip7683::standard::{SolMandateOutput, StandardOrder};
+		use crate::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
 		use crate::standards::eip7930::InteropAddress;
 		use alloy_primitives::{Address, U256};
 		use alloy_sol_types::SolType;
@@ -485,7 +485,7 @@ impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
 		let input_oracle_str = witness
 			.get("inputOracle")
 			.and_then(|o| o.as_str())
-			.unwrap_or("0x0000000000000000000000000000000000000000");
+			.ok_or("Missing 'inputOracle' in witness data")?;
 		let input_oracle =
 			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
 
