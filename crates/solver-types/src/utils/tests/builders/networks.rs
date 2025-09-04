@@ -14,7 +14,7 @@ use std::collections::HashMap;
 ///
 /// # Examples
 ///
-/// ```
+/// ```text
 /// use solver_types::utils::builders::TokenConfigBuilder;
 /// use solver_types::Address;
 ///
@@ -120,19 +120,6 @@ impl TokenConfigBuilder {
 ///
 /// Provides an easy way to construct network configurations with proper validation
 /// and sensible defaults for blockchain networks.
-///
-/// # Examples
-///
-/// ```
-/// use solver_types::utils::builders::NetworkConfigBuilder;
-/// use solver_types::networks::RpcEndpoint;
-///
-/// let network = NetworkConfigBuilder::new()
-///     .add_rpc_endpoint(RpcEndpoint::http_only("https://mainnet.infura.io".to_string()))
-///     .input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
-///     .output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
-///     .build();
-/// ```
 #[derive(Debug, Clone)]
 pub struct NetworkConfigBuilder {
 	rpc_urls: Vec<RpcEndpoint>,
@@ -320,21 +307,6 @@ impl NetworkConfigBuilder {
 ///
 /// Provides an easy way to construct networks configuration mappings with proper validation
 /// and sensible defaults for multi-chain configurations.
-///
-/// # Examples
-///
-/// ```
-/// use solver_types::utils::builders::{NetworksConfigBuilder, NetworkConfigBuilder};
-/// use solver_types::networks::RpcEndpoint;
-///
-/// let networks = NetworksConfigBuilder::new()
-///     .add_network(1, NetworkConfigBuilder::new()
-///         .add_rpc_endpoint(RpcEndpointBuilder::new().http("https://mainnet.infura.io").build())
-///         .input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
-///         .output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
-///         .build())
-///     .build();
-/// ```
 #[derive(Debug, Clone)]
 pub struct NetworksConfigBuilder {
 	networks: HashMap<u64, NetworkConfig>,
