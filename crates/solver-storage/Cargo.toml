@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 async-trait = "0.1"
 fs2 = "0.4"
+mockall = { version = "0.13", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 solver-types = { path = "../solver-types" }
@@ -14,7 +15,10 @@ thiserror = "2.0"
 tokio = { version = "1.0", features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
 toml = { workspace = true }
 tracing = { workspace = true }
-mockall = { version = "0.13", optional = true }
 
 [features]
 testing = ["mockall"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+futures = { workspace = true }
