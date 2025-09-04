@@ -742,8 +742,21 @@ quote_accept() {
         fi
         print_debug "User key found, extracting EIP-712 message..."
         
-        # Extract EIP-712 message for signing
-        local eip712_message=$(echo "$order_data" | jq -r '.message.eip712 // empty')
+        # Extract EIP-712 message for signing - handle both escrow and compact structures
+        local primary_type=$(echo "$order_data" | jq -r '.primaryType // empty')
+        local eip712_message
+        
+        if [ "$primary_type" = "PermitBatchWitnessTransferFrom" ]; then
+            # Escrow (Permit2) structure: message.eip712
+            eip712_message=$(echo "$order_data" | jq -r '.message.eip712 // empty')
+        elif [ "$primary_type" = "CompactLock" ]; then
+            # Compact structure: message directly contains EIP-712 data
+            eip712_message=$(echo "$order_data" | jq -r '.message // empty')
+        else
+            print_error "Unsupported primary type: $primary_type"
+            return 1
+        fi
+        
         if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ]; then
             print_error "No EIP-712 message found in order"
             return 1
@@ -751,49 +764,194 @@ quote_accept() {
         
         print_info "Signing EIP-712 order..."
         
-        # Extract witness data first (needed for signing)
-        local witness=$(echo "$eip712_message" | jq -r '.witness // empty')
-        local witness_expires=$(echo "$witness" | jq -r '.expires // 0')
-        local input_oracle=$(echo "$witness" | jq -r '.inputOracle // "0x0000000000000000000000000000000000000000"')
+        local signature
         
-        # Sign the EIP-712 message
-        local domain=$(echo "$eip712_message" | jq -r '.signing.domain // empty')
-        local primary_type=$(echo "$eip712_message" | jq -r '.signing.primaryType // "PermitBatchWitnessTransferFrom"')
-        local deadline=$(echo "$eip712_message" | jq -r '.deadline // empty')
-        local nonce=$(echo "$eip712_message" | jq -r '.nonce // empty')
-        local spender=$(echo "$eip712_message" | jq -r '.spender // empty')
-        
-        # Extract the required fields for Permit2 signing
-        local permitted_token=$(echo "$eip712_message" | jq -r '.permitted[0].token // empty')
-        local permitted_amount=$(echo "$eip712_message" | jq -r '.permitted[0].amount // empty')
-        
-        # Convert interop address to standard Ethereum address if needed for signing
-        local standard_permitted_token="$permitted_token"
-        # Interop addresses are longer than standard addresses (42 chars)
-        if [[ ${#permitted_token} -gt 42 ]]; then
-            # This is likely an interop address, convert to standard
-            standard_permitted_token=$(from_uii_address "$permitted_token")
-            print_debug "Converted permitted token from interop to standard: $permitted_token -> $standard_permitted_token"
+        if [ "$primary_type" = "CompactLock" ]; then
+            # For CompactLock, we need to generate a BatchWitness signature, not sign the CompactLock message
+            print_debug "Generating BatchWitness signature for compact flow"
+            
+            # Extract data from the CompactLock message to build BatchWitness signature
+            local nonce=$(echo "$eip712_message" | jq -r '.nonce // 0')
+            local deadline=$(echo "$eip712_message" | jq -r '.deadline // 0')
+            local user=$(echo "$eip712_message" | jq -r '.user // empty')
+            
+            # Extract input data
+            local first_input=$(echo "$eip712_message" | jq -r '.inputs[0] // empty')
+            local input_amount=$(echo "$first_input" | jq -r '.amount // empty')
+            local input_asset=$(echo "$first_input" | jq -r '.asset // empty')
+            
+            # Extract output data  
+            local first_output=$(echo "$eip712_message" | jq -r '.outputs[0] // empty')
+            local output_amount=$(echo "$first_output" | jq -r '.amount // empty')
+            local output_asset=$(echo "$first_output" | jq -r '.asset // empty')
+            local output_receiver=$(echo "$first_output" | jq -r '.receiver // empty')
+            
+            # Convert interop addresses to standard addresses
+            local user_address=$(from_uii_address "$user")
+            local input_token=$(from_uii_address "$input_asset")
+            local output_token=$(from_uii_address "$output_asset")
+            local recipient_address=$(from_uii_address "$output_receiver")
+            
+            # Get chain IDs from interop addresses
+            local origin_chain_id=$(get_chain_id_from_uii "$input_asset")
+            local dest_chain_id=$(get_chain_id_from_uii "$output_asset")
+            
+            # Load contract addresses
+            local the_compact_addr=$(get_network_config "$origin_chain_id" "the_compact_address")
+            local input_settler_compact=$(get_network_config "$origin_chain_id" "input_settler_compact_address")
+            local output_settler=$(get_network_config "$dest_chain_id" "output_settler_address")
+            local input_oracle=$(get_network_config "$origin_chain_id" "input_oracle_address")
+            
+            # Use the same token ID and allocator lock tag as direct intent
+            local token_id="0x008adfa4d48449f69242eb8fe7f1725e7734ce288f8367e1bb143e90bb3f0512"  
+            local allocator_lock_tag="0xface00000000000000000000"
+            
+            # Generate witness hash from the order data that will be created
+            # For now, use a placeholder - we'll need to implement proper witness hash generation
+            local witness_hash="0x0000000000000000000000000000000000000000000000000000000000000000"
+            
+            # Generate BatchWitness signature
+            signature=$(sign_compact_order \
+                "$USER_PRIVATE_KEY" "$the_compact_addr" "$origin_chain_id" \
+                "$input_token" "$allocator_lock_tag" "$input_amount" "$nonce" "$deadline" "$user_address" \
+                "$input_settler_compact" "$deadline" "$input_oracle" "$witness_hash")
+                
+            if [ -z "$signature" ]; then
+                print_error "Failed to generate BatchWitness signature for compact flow"
+                return 1
+            fi
+            
+            print_debug "Generated BatchWitness signature: ${signature:0:50}..."
+            
+        elif [ "$primary_type" = "PermitBatchWitnessTransferFrom" ]; then
+            # Permit2/Escrow signing logic
+            print_debug "Using Permit2 signing for escrow flow"
+            
+            # Extract witness data first (needed for signing)
+            local witness=$(echo "$eip712_message" | jq -r '.witness // empty')
+            local witness_expires=$(echo "$witness" | jq -r '.expires // 0')
+            local input_oracle=$(echo "$witness" | jq -r '.inputOracle // "0x0000000000000000000000000000000000000000"')
+            
+            # Sign the EIP-712 message
+            local domain=$(echo "$eip712_message" | jq -r '.signing.domain // empty')
+            local permit_primary_type=$(echo "$eip712_message" | jq -r '.signing.primaryType // "PermitBatchWitnessTransferFrom"')
+            local deadline=$(echo "$eip712_message" | jq -r '.deadline // empty')
+            local nonce=$(echo "$eip712_message" | jq -r '.nonce // empty')
+            local spender=$(echo "$eip712_message" | jq -r '.spender // empty')
+            
+            # Extract the required fields for Permit2 signing
+            local permitted_token=$(echo "$eip712_message" | jq -r '.permitted[0].token // empty')
+            local permitted_amount=$(echo "$eip712_message" | jq -r '.permitted[0].amount // empty')
+            
+            # Convert interop address to standard Ethereum address if needed for signing
+            local standard_permitted_token="$permitted_token"
+            # Interop addresses are longer than standard addresses (42 chars)
+            if [[ ${#permitted_token} -gt 42 ]]; then
+                # This is likely an interop address, convert to standard
+                standard_permitted_token=$(from_uii_address "$permitted_token")
+                print_debug "Converted permitted token from interop to standard: $permitted_token -> $standard_permitted_token"
+            fi
+            
+            # Get origin chain ID from the domain
+            local origin_chain_id=$(echo "$domain" | jq -r '.chainId // 31337')
+            
+            # Build mandate outputs array from witness outputs
+            local mandate_outputs_json=$(echo "$witness" | jq -c '.outputs')
+            
+            # Use the sign_standard_intent function which handles Permit2 properly
+            signature=$(sign_standard_intent \
+                "$user_key" \
+                "$origin_chain_id" \
+                "$standard_permitted_token" \
+                "$permitted_amount" \
+                "$spender" \
+                "$nonce" \
+                "$deadline" \
+                "$witness_expires" \
+                "$input_oracle" \
+                "$mandate_outputs_json")
+            
+        elif [ "$primary_type" = "CompactLock" ]; then
+            # Compact flows use a completely different approach
+            print_debug "Detected CompactLock - using compact order submission flow"
+            
+            # For compact flows, we need to:
+            # 1. Extract the compact intent data that was already created
+            # 2. Submit directly to /api/orders (not /api/quotes)
+            # 3. Use the signature from create_compact_intent
+            
+            # Get the compact intent data from the intent file
+            local intent_file="${OUTPUT_DIR:-./demo-output}/post_intent.req.json"
+            if [ ! -f "$intent_file" ]; then
+                print_error "Compact intent file not found: $intent_file"
+                print_error "Make sure the compact intent was created properly"
+                return 1
+            fi
+            
+            local intent_data=$(cat "$intent_file")
+            local order_data_hex=$(echo "$intent_data" | jq -r '.order // empty')
+            local sponsor=$(echo "$intent_data" | jq -r '.sponsor // empty')  
+            local compact_signature=$(echo "$intent_data" | jq -r '.signature // empty')
+            local lock_type=$(echo "$intent_data" | jq -r '.lock_type // empty')
+            
+            if [ -z "$order_data_hex" ] || [ -z "$compact_signature" ]; then
+                print_error "Invalid compact intent data"
+                return 1
+            fi
+            
+            print_debug "Using compact intent data:"
+            print_debug "  Order: ${order_data_hex:0:50}..."
+            print_debug "  Sponsor: $sponsor"  
+            print_debug "  Signature: ${compact_signature:0:50}..."
+            print_debug "  Lock type: $lock_type"
+            
+            # For compact flows, use the BatchWitness signature we generated earlier
+            print_debug "Using BatchWitness signature: ${signature:0:50}..."
+            
+            # Create submission payload like regular quote acceptance but with BatchWitness signature
+            local submission_json=$(jq -n \
+                --arg quoteId "$quote_id" \
+                --arg signature "$signature" \
+                '{
+                    quoteId: $quoteId,
+                    signature: $signature
+                }')
+            
+            # Save request to file
+            local request_file="${OUTPUT_DIR:-./demo-output}/post_quote.req.json"
+            echo "$submission_json" | jq '.' > "$request_file"
+            print_info "Request saved to: $request_file"
+            
+            # Submit to solver using api_post (handles auth automatically)
+            local api_url="${SOLVER_API_URL:-http://localhost:3000/api/orders}"
+            print_info "Submitting signed compact order with quote ID to solver..."
+            print_debug "API URL: $api_url"
+            
+            if api_post "$api_url" "$submission_json"; then
+                local status_code=$(get_api_response "status_code")
+                local response_body=$(get_api_response "body")
+                
+                print_success "Compact order submitted successfully (HTTP $status_code)"
+                print_debug "API Response body: $response_body"
+                
+                # Save submission response
+                local output_file="${OUTPUT_DIR:-./demo-output}/post_quote.res.json"
+                echo "$response_body" | jq '.' > "$output_file" 2>/dev/null || echo "$response_body" > "$output_file"
+                print_info "Submission response saved to: $output_file"
+                
+                return 0
+            else
+                local status_code=$(get_api_response "status_code")
+                local response_body=$(get_api_response "body")
+                print_error "Failed to submit compact order: HTTP $status_code"
+                print_error "Response: $response_body"
+                return 1
+            fi
+            
+        else
+            print_error "Unsupported primary type for signing: $primary_type"
+            return 1
         fi
-        
-        # Get origin chain ID from the domain
-        local origin_chain_id=$(echo "$domain" | jq -r '.chainId // 31337')
-        
-        # Build mandate outputs array from witness outputs
-        local mandate_outputs_json=$(echo "$witness" | jq -c '.outputs')
-        
-        # Use the sign_standard_intent function which handles Permit2 properly
-        local signature=$(sign_standard_intent \
-            "$user_key" \
-            "$origin_chain_id" \
-            "$standard_permitted_token" \
-            "$permitted_amount" \
-            "$spender" \
-            "$nonce" \
-            "$deadline" \
-            "$witness_expires" \
-            "$input_oracle" \
-            "$mandate_outputs_json")
         
         if [ -z "$signature" ]; then
             print_error "Failed to sign EIP-712 order"

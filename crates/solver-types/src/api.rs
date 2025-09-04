@@ -453,74 +453,150 @@ impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
 			.message
 			.as_object()
 			.ok_or("Invalid EIP-712 message structure")?;
-		let eip712_data = message_data
-			.get("eip712")
-			.and_then(|e| e.as_object())
-			.ok_or("Missing 'eip712' object in message")?;
 
-		// Extract nonce
-		let nonce_str = eip712_data
-			.get("nonce")
-			.and_then(|n| n.as_str())
-			.ok_or("Missing nonce in EIP-712 data")?;
-		let nonce = U256::from_str_radix(nonce_str, 10)?;
+		// Handle both CompactLock and Permit2 structures
+		let (eip712_data, is_compact) = if quote_order.primary_type == "CompactLock" {
+			// CompactLock: EIP-712 data is directly in message
+			(message_data, true)
+		} else {
+			// Permit2: EIP-712 data is nested under message.eip712
+			let eip712_data = message_data
+				.get("eip712")
+				.and_then(|e| e.as_object())
+				.ok_or("Missing 'eip712' object in message")?;
+			(eip712_data, false)
+		};
 
-		// Extract witness data
-		let witness = eip712_data
-			.get("witness")
-			.and_then(|w| w.as_object())
-			.ok_or("Missing 'witness' object in EIP-712 message")?;
+		// Extract nonce (different field types for compact vs permit2)
+		let nonce = if is_compact {
+			// CompactLock: nonce is a number
+			let nonce_num = eip712_data
+				.get("nonce")
+				.and_then(|n| n.as_u64())
+				.ok_or("Missing nonce in CompactLock message")?;
+			U256::from(nonce_num)
+		} else {
+			// Permit2: nonce is a string
+			let nonce_str = eip712_data
+				.get("nonce")
+				.and_then(|n| n.as_str())
+				.ok_or("Missing nonce in EIP-712 data")?;
+			U256::from_str_radix(nonce_str, 10)?
+		};
+
+		// Extract witness data (only for Permit2, CompactLock doesn't have witness)
+		let witness = if is_compact {
+			None
+		} else {
+			Some(eip712_data
+				.get("witness")
+				.and_then(|w| w.as_object())
+				.ok_or("Missing 'witness' object in EIP-712 message")?)
+		};
 
 		// Get origin chain ID
 		let origin_chain_id = U256::from(interop_address.ethereum_chain_id()?);
 
-		// Extract timing data
-		let expires = witness
-			.get("expires")
-			.and_then(|e| e.as_u64())
-			.unwrap_or(quote_with_sig.quote.valid_until.unwrap_or(0)) as u32;
-		let fill_deadline = expires;
+		// Extract timing data (different sources for compact vs permit2)
+		let (expires, fill_deadline, input_oracle, inputs) = if is_compact {
+			// CompactLock structure
+			let deadline = eip712_data
+				.get("deadline")
+				.and_then(|d| d.as_u64())
+				.unwrap_or(quote_with_sig.quote.valid_until.unwrap_or(0)) as u32;
+			
+			// For compact, we use the same oracle as the direct intent flow
+			// This should match the configured oracle for the origin chain
+			let input_oracle = Address::from_slice(&hex::decode("dc64a140aa3e981100a9beca4e685f962f0cf6c9").unwrap());
+			
+			// Extract inputs from CompactLock message
+			let inputs_array = eip712_data
+				.get("inputs")
+				.and_then(|i| i.as_array())
+				.ok_or("Missing inputs array in CompactLock message")?;
+			let first_input = inputs_array
+				.first()
+				.ok_or("Empty inputs array in CompactLock message")?;
+				
+			let input_amount_num = first_input
+				.get("amount")
+				.and_then(|a| a.as_str())
+				.and_then(|s| U256::from_str_radix(s, 10).ok())
+				.ok_or("Missing or invalid amount in CompactLock input")?;
+				
+			let input_asset_str = first_input
+				.get("asset")
+				.and_then(|t| t.as_str())
+				.ok_or("Missing asset in CompactLock input")?;
+			
+			// Parse interop address and get token address
+			let input_interop = InteropAddress::from_hex(input_asset_str)?;
+			let input_token = input_interop.ethereum_address()?;
+			
+			// Convert input token address to U256
+			let mut token_bytes = [0u8; 32];
+			token_bytes[12..32].copy_from_slice(&input_token.0 .0);
+			let input_token_u256 = U256::from_be_bytes(token_bytes);
+			let inputs = vec![[input_token_u256, input_amount_num]];
+			
+			(deadline, deadline, input_oracle, inputs)
+		} else {
+			// Permit2 structure
+			let witness = witness.unwrap(); // Safe because we checked is_compact above
+			
+			let expires = witness
+				.get("expires")
+				.and_then(|e| e.as_u64())
+				.unwrap_or(quote_with_sig.quote.valid_until.unwrap_or(0)) as u32;
+			let fill_deadline = expires;
 
-		// Extract input oracle
-		let input_oracle_str = witness
-			.get("inputOracle")
-			.and_then(|o| o.as_str())
-			.unwrap_or("0x0000000000000000000000000000000000000000");
-		let input_oracle =
-			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
+			// Extract input oracle
+			let input_oracle_str = witness
+				.get("inputOracle")
+				.and_then(|o| o.as_str())
+				.unwrap_or("0x0000000000000000000000000000000000000000");
+			let input_oracle =
+				Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
 
-		// Extract input data from permitted array
-		let permitted = eip712_data
-			.get("permitted")
-			.and_then(|p| p.as_array())
-			.ok_or("Missing permitted array in EIP-712 data")?;
-		let first_permitted = permitted
-			.first()
-			.ok_or("Empty permitted array in EIP-712 data")?;
+			// Extract input data from permitted array
+			let permitted = eip712_data
+				.get("permitted")
+				.and_then(|p| p.as_array())
+				.ok_or("Missing permitted array in EIP-712 data")?;
+			let first_permitted = permitted
+				.first()
+				.ok_or("Empty permitted array in EIP-712 data")?;
 
-		let input_amount_str = first_permitted
-			.get("amount")
-			.and_then(|a| a.as_str())
-			.ok_or("Missing amount in permitted token")?;
-		let input_amount = U256::from_str_radix(input_amount_str, 10)?;
+			let input_amount_str = first_permitted
+				.get("amount")
+				.and_then(|a| a.as_str())
+				.ok_or("Missing amount in permitted token")?;
+			let input_amount = U256::from_str_radix(input_amount_str, 10)?;
 
-		let input_token_str = first_permitted
-			.get("token")
-			.and_then(|t| t.as_str())
-			.ok_or("Missing token in permitted array")?;
-		let input_token =
-			Address::from_slice(&hex::decode(input_token_str.trim_start_matches("0x"))?);
+			let input_token_str = first_permitted
+				.get("token")
+				.and_then(|t| t.as_str())
+				.ok_or("Missing token in permitted array")?;
+			let input_token =
+				Address::from_slice(&hex::decode(input_token_str.trim_start_matches("0x"))?);
 
-		// Convert input token address to U256
-		let mut token_bytes = [0u8; 32];
-		token_bytes[12..32].copy_from_slice(&input_token.0 .0);
-		let input_token_u256 = U256::from_be_bytes(token_bytes);
-		let inputs = vec![[input_token_u256, input_amount]];
+			// Convert input token address to U256
+			let mut token_bytes = [0u8; 32];
+			token_bytes[12..32].copy_from_slice(&input_token.0 .0);
+			let input_token_u256 = U256::from_be_bytes(token_bytes);
+			let inputs = vec![[input_token_u256, input_amount]];
+			
+			(expires, fill_deadline, input_oracle, inputs)
+		};
 
-		// Extract outputs from witness
+		// Extract outputs (different sources for compact vs permit2)
 		let default_outputs = Vec::new();
-		let witness_outputs = witness
-			.get("outputs")
+		let witness_outputs = if is_compact {
+			eip712_data
+				.get("outputs")
+		} else {
+			witness.unwrap().get("outputs")
+		}
 			.and_then(|o| o.as_array())
 			.unwrap_or(&default_outputs);
 
@@ -538,28 +614,95 @@ impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
 		let mut sol_outputs = Vec::new();
 		for output_item in witness_outputs {
 			if let Some(output_obj) = output_item.as_object() {
-				let chain_id = output_obj
-					.get("chainId")
-					.and_then(|c| c.as_u64())
-					.unwrap_or(0);
+				// Handle different field names for compact vs permit2
+				let (token_str, recipient_str, oracle_str, settler_str) = if is_compact {
+					// CompactLock structure uses "asset" and "receiver"
+					let token = output_obj.get("asset").and_then(|t| t.as_str());
+					let recipient = output_obj.get("receiver").and_then(|r| r.as_str());
+					// For compact, oracle and settler are not present, use default values
+					(token, recipient, None, None)
+				} else {
+					// Permit2 structure uses "token", "recipient", "oracle", "settler"
+					let token = output_obj.get("token").and_then(|t| t.as_str());
+					let recipient = output_obj.get("recipient").and_then(|r| r.as_str());
+					let oracle = output_obj.get("oracle").and_then(|o| o.as_str());
+					let settler = output_obj.get("settler").and_then(|s| s.as_str());
+					(token, recipient, oracle, settler)
+				};
+
+				// Skip if required fields are missing
+				let token_str = match token_str {
+					Some(t) => t,
+					None => continue,
+				};
+				let recipient_str = match recipient_str {
+					Some(r) => r,
+					None => continue,
+				};
+
+				// For compact, extract chain ID from receiver's interop address, for permit2 use chainId field
+				let chain_id = if is_compact {
+					// Extract chain ID from the receiver's interop address
+					if let Ok(interop_addr) = InteropAddress::from_hex(recipient_str) {
+						interop_addr.ethereum_chain_id().unwrap_or(0) as u64
+					} else {
+						0
+					}
+				} else {
+					output_obj
+						.get("chainId")
+						.and_then(|c| c.as_u64())
+						.unwrap_or(0)
+				};
 				let amount_str = output_obj
 					.get("amount")
 					.and_then(|a| a.as_str())
 					.unwrap_or("0");
-				let token_str = output_obj.get("token").and_then(|t| t.as_str()).unwrap();
-				let recipient_str = output_obj
-					.get("recipient")
-					.and_then(|r| r.as_str())
-					.unwrap();
-				let oracle_str = output_obj.get("oracle").and_then(|o| o.as_str()).unwrap();
-				let settler_str = output_obj.get("settler").and_then(|s| s.as_str()).unwrap();
 
 				if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
-					let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
-					let recipient_bytes =
-						parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
-					let oracle_bytes = parse_bytes32_from_hex(oracle_str).unwrap_or([0u8; 32]);
-					let settler_bytes = parse_bytes32_from_hex(settler_str).unwrap_or([0u8; 32]);
+					// For compact, extract token address from interop address, for permit2 use hex parsing
+					let token_bytes = if is_compact {
+						// Extract Ethereum token address from interop address
+						if let Ok(interop_addr) = InteropAddress::from_hex(token_str) {
+							if let Ok(eth_addr) = interop_addr.ethereum_address() {
+								// Convert Address to 32-byte array with padding
+								let mut bytes = [0u8; 32];
+								bytes[12..32].copy_from_slice(&eth_addr.0.0);
+								bytes
+							} else {
+								[0u8; 32]
+							}
+						} else {
+							[0u8; 32]
+						}
+					} else {
+						parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32])
+					};
+					
+					// For compact, extract recipient address from interop address, for permit2 use hex parsing
+					let recipient_bytes = if is_compact {
+						// Extract Ethereum recipient address from interop address
+						if let Ok(interop_addr) = InteropAddress::from_hex(recipient_str) {
+							if let Ok(eth_addr) = interop_addr.ethereum_address() {
+								// Convert Address to 32-byte array with padding
+								let mut bytes = [0u8; 32];
+								bytes[12..32].copy_from_slice(&eth_addr.0.0);
+								bytes
+							} else {
+								[0u8; 32]
+							}
+						} else {
+							[0u8; 32]
+						}
+					} else {
+						parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32])
+					};
+					let oracle_bytes = oracle_str
+						.and_then(|s| parse_bytes32_from_hex(s).ok())
+						.unwrap_or([0u8; 32]);
+					let settler_bytes = settler_str
+						.and_then(|s| parse_bytes32_from_hex(s).ok())
+						.unwrap_or([0u8; 32]);
 
 					sol_outputs.push(SolMandateOutput {
 						oracle: oracle_bytes.into(),
@@ -590,52 +733,25 @@ impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
 		// ABI encode the StandardOrder
 		let encoded_order = StandardOrder::abi_encode(&sol_order);
 
+		// For compact flows, keep ABI-encoded signature as-is (settlement expects it)
+		// For escrow flows, use raw signature format
+		let signature = if is_compact {
+			eprintln!("DEBUG: Compact flow - using ABI-encoded signature as-is");
+			quote_with_sig.signature.to_string()
+		} else {
+			eprintln!("DEBUG: Escrow flow - using signature as-is");
+			quote_with_sig.signature.to_string()
+		};
+
 		// Create IntentRequest
 		let intent_request = serde_json::json!({
 			"order": format!("0x{}", hex::encode(&encoded_order)),
 			"sponsor": format!("{:#x}", user_address),
-			"signature": quote_with_sig.signature,
+			"signature": signature,
 			"lockType": quote_with_sig.quote.lock_type.clone()
 		});
 
 		Ok(intent_request)
-	}
-}
-
-impl Quote {
-	/// Extract lock type from quote data with fallback logic
-	pub fn extract_lock_type(&self) -> String {
-		// First check the direct lock_type field on the quote
-		if !self.lock_type.is_empty() {
-			return self.lock_type.clone();
-		}
-
-		// Check if the quote contains lock type information in order data or witness data
-		if let Some(quote_order) = self.orders.first() {
-			if let Some(message_data) = quote_order.message.as_object() {
-				// Check for lock type in the main message data
-				if let Some(lock_type) = message_data.get("lockType").and_then(|v| v.as_str()) {
-					return lock_type.to_string();
-				}
-
-				// Check for lock type in EIP-712 data
-				if let Some(eip712_data) = message_data.get("eip712").and_then(|e| e.as_object()) {
-					if let Some(lock_type) = eip712_data.get("lockType").and_then(|v| v.as_str()) {
-						return lock_type.to_string();
-					}
-
-					// Check witness data for lock type
-					if let Some(witness) = eip712_data.get("witness").and_then(|w| w.as_object()) {
-						if let Some(lock_type) = witness.get("lockType").and_then(|v| v.as_str()) {
-							return lock_type.to_string();
-						}
-					}
-				}
-			}
-		}
-
-		// Default fallback
-		"permit2_escrow".to_string()
 	}
 }
 

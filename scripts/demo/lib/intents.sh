@@ -1439,31 +1439,65 @@ intent_build() {
         local recipient_uii=$(to_uii_address "$dest_chain" "$recipient_addr")
         
         # Create quote request JSON (matching API expected format)
-        local quote_request=$(jq -n \
-            --arg user "$user_uii" \
-            --arg input_user "$user_uii" \
-            --arg input_asset "$input_asset_uii" \
-            --arg input_amount "$amount_in" \
-            --arg output_receiver "$recipient_uii" \
-            --arg output_asset "$output_asset_uii" \
-            --arg output_amount "$amount_out" \
-            '{
-                user: $user,
-                availableInputs: [
-                    {
-                        user: $input_user,
-                        asset: $input_asset,
-                        amount: $input_amount
-                    }
-                ],
-                requestedOutputs: [
-                    {
-                        receiver: $output_receiver,
-                        asset: $output_asset,
-                        amount: $output_amount
-                    }
-                ]
-            }')
+        if [ "$intent_type" = "compact" ]; then
+            # For compact intents, include lock information
+            local quote_request=$(jq -n \
+                --arg user "$user_uii" \
+                --arg input_user "$user_uii" \
+                --arg input_asset "$input_asset_uii" \
+                --arg input_amount "$amount_in" \
+                --arg output_receiver "$recipient_uii" \
+                --arg output_asset "$output_asset_uii" \
+                --arg output_amount "$amount_out" \
+                '{
+                    user: $user,
+                    availableInputs: [
+                        {
+                            user: $input_user,
+                            asset: $input_asset,
+                            amount: $input_amount,
+                            lock: {
+                                kind: "the-compact",
+                                params: {}
+                            }
+                        }
+                    ],
+                    requestedOutputs: [
+                        {
+                            receiver: $output_receiver,
+                            asset: $output_asset,
+                            amount: $output_amount
+                        }
+                    ]
+                }')
+        else
+            # For escrow intents, no lock field needed
+            local quote_request=$(jq -n \
+                --arg user "$user_uii" \
+                --arg input_user "$user_uii" \
+                --arg input_asset "$input_asset_uii" \
+                --arg input_amount "$amount_in" \
+                --arg output_receiver "$recipient_uii" \
+                --arg output_asset "$output_asset_uii" \
+                --arg output_amount "$amount_out" \
+                '{
+                    user: $user,
+                    availableInputs: [
+                        {
+                            user: $input_user,
+                            asset: $input_asset,
+                            amount: $input_amount
+                        }
+                    ],
+                    requestedOutputs: [
+                        {
+                            receiver: $output_receiver,
+                            asset: $output_asset,
+                            amount: $output_amount
+                        }
+                    ]
+                }')
+        fi
         
         echo "$quote_request" | jq '.' > "$quote_file"
         print_success "Quote request saved to: $quote_file (for quotes)"
