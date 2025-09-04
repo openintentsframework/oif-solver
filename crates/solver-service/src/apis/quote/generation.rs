@@ -338,7 +338,7 @@ impl QuoteGenerator {
 			.as_ref()
 			.and_then(|api| api.quote.as_ref())
 			.map(|quote| quote.validity_seconds)
-			.unwrap_or(20) // Default QuoteConfig validity_seconds
+			.unwrap_or_default() // Default QuoteConfig validity_seconds
 	}
 }
 
@@ -747,7 +747,7 @@ mod tests {
 		let mut config_no_api = ConfigBuilder::new().build();
 		config_no_api.api = None;
 		let validity_default = generator.get_quote_validity_seconds(&config_no_api);
-		assert_eq!(validity_default, 20); // Default QuoteConfig has validity_seconds: 20
+		assert_eq!(validity_default, 0); // if API none, use default 0
 	}
 
 	#[test]
