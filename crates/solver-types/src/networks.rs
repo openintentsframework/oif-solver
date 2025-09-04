@@ -165,9 +165,7 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::utils::tests::builders::{
-		NetworkConfigBuilder, RpcEndpointBuilder, TokenConfigBuilder,
-	};
+	use crate::utils::tests::builders::{NetworkConfigBuilder, TokenConfigBuilder};
 	use crate::Address;
 	use serde_json;
 
@@ -179,35 +177,37 @@ mod tests {
 
 	#[test]
 	fn test_rpc_endpoint_creation() {
-		// Test HTTP only using builder
-		let http_endpoint = RpcEndpointBuilder::new().ws(None).build();
+		// Test HTTP only using static method
+		let http_endpoint = RpcEndpoint::http_only("https://eth.llamarpc.com".to_string());
 		assert_eq!(
 			http_endpoint.http,
 			Some("https://eth.llamarpc.com".to_string())
 		);
 		assert_eq!(http_endpoint.ws, None);
 
-		// Test WebSocket only using builder
-		let ws_endpoint = RpcEndpointBuilder::new().http(None).build();
+		// Test WebSocket only using static method
+		let ws_endpoint = RpcEndpoint::ws_only("wss://eth.llamarpc.com".to_string());
 		assert_eq!(ws_endpoint.http, None);
 		assert_eq!(ws_endpoint.ws, Some("wss://eth.llamarpc.com".to_string()));
 
-		// Test both HTTP and WebSocket using builder
-		let both_endpoint = RpcEndpointBuilder::new().build();
+		// Test both HTTP and WebSocket using static method
+		let both_endpoint = RpcEndpoint::both(
+			"https://eth.llamarpc.com".to_string(),
+			"wss://eth.llamarpc.com".to_string(),
+		);
 		assert_eq!(
 			both_endpoint.http,
 			Some("https://eth.llamarpc.com".to_string())
 		);
 		assert_eq!(both_endpoint.ws, Some("wss://eth.llamarpc.com".to_string()));
-
-		// Test original static methods still work
-		let static_endpoint = RpcEndpoint::http_only("https://eth.llamarpc.com".to_string());
-		assert_eq!(static_endpoint.http, http_endpoint.http);
 	}
 
 	#[test]
 	fn test_rpc_endpoint_serialization() {
-		let endpoint = RpcEndpointBuilder::new().build();
+		let endpoint = RpcEndpoint::both(
+			"https://eth.llamarpc.com".to_string(),
+			"wss://eth.llamarpc.com".to_string(),
+		);
 
 		let json = serde_json::to_string(&endpoint).unwrap();
 		assert!(json.contains("\"http\":\"https://eth.llamarpc.com\""));
@@ -220,15 +220,15 @@ mod tests {
 
 	#[test]
 	fn test_rpc_endpoint_optional_fields() {
-		// Test with only HTTP using builder
-		let http_only = RpcEndpointBuilder::new().ws(None).build();
+		// Test with only HTTP
+		let http_only = RpcEndpoint::http_only("https://eth.llamarpc.com".to_string());
 
 		let json = serde_json::to_string(&http_only).unwrap();
 		assert!(json.contains("\"http\""));
 		assert!(!json.contains("\"ws\""));
 
-		// Test with only WebSocket using builder
-		let ws_only = RpcEndpointBuilder::new().http(None).build();
+		// Test with only WebSocket
+		let ws_only = RpcEndpoint::ws_only("wss://eth.llamarpc.com".to_string());
 
 		let json = serde_json::to_string(&ws_only).unwrap();
 		assert!(!json.contains("\"http\""));
@@ -286,12 +286,10 @@ mod tests {
 	#[test]
 	fn test_network_config_url_methods() {
 		let network = NetworkConfigBuilder::new()
-			.add_rpc_endpoint(
-				RpcEndpointBuilder::new()
-					.http(Some("https://mainnet.infura.io".to_string()))
-					.ws(Some("wss://mainnet.infura.io".to_string()))
-					.build(),
-			)
+			.add_rpc_endpoint(RpcEndpoint::both(
+				"https://mainnet.infura.io".to_string(),
+				"wss://mainnet.infura.io".to_string(),
+			))
 			.build();
 
 		// Test get_http_url (should return first available)
@@ -397,7 +395,10 @@ mod tests {
 
 	#[test]
 	fn test_debug_implementations() {
-		let endpoint = RpcEndpointBuilder::new().build();
+		let endpoint = RpcEndpoint::both(
+			"https://eth.llamarpc.com".to_string(),
+			"wss://eth.llamarpc.com".to_string(),
+		);
 		let debug_str = format!("{:?}", endpoint);
 		assert!(debug_str.contains("RpcEndpoint"));
 		assert!(debug_str.contains("https://eth.llamarpc.com"));
@@ -420,7 +421,10 @@ mod tests {
 
 	#[test]
 	fn test_clone_implementations() {
-		let endpoint = RpcEndpointBuilder::new().build();
+		let endpoint = RpcEndpoint::both(
+			"https://eth.llamarpc.com".to_string(),
+			"wss://eth.llamarpc.com".to_string(),
+		);
 		let cloned = endpoint.clone();
 		assert_eq!(cloned.http, endpoint.http);
 		assert_eq!(cloned.ws, endpoint.ws);

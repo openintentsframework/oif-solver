@@ -243,10 +243,8 @@ mod tests {
 	use solver_types::{
 		parse_address,
 		standards::eip7930::InteropAddress,
-		utils::tests::builders::{
-			AvailableInputBuilder, GetQuoteRequestBuilder, NetworkConfigBuilder,
-			NetworksConfigBuilder, RequestedOutputBuilder,
-		},
+		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
+		AvailableInput, RequestedOutput,
 	};
 	use std::collections::HashMap;
 
@@ -305,23 +303,27 @@ mod tests {
 			address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
 		);
 
-		let available_input = AvailableInputBuilder::new()
-			.user(user_address.clone())
-			.asset(eth_usdc)
-			.amount(uint!(1000_000000_U256)) // 1000 USDC (6 decimals)
-			.build();
+		let available_input = AvailableInput {
+			user: user_address.clone(),
+			asset: eth_usdc,
+			amount: uint!(1000_000000_U256), // 1000 USDC (6 decimals)
+			lock: None,
+		};
 
-		let requested_output = RequestedOutputBuilder::new()
-			.asset(polygon_usdc)
-			.amount(uint!(995_000000_U256)) // 995 USDC after fees
-			.receiver(user_address.clone())
-			.build();
+		let requested_output = RequestedOutput {
+			receiver: user_address.clone(),
+			asset: polygon_usdc,
+			amount: uint!(995_000000_U256), // 995 USDC after fees
+			calldata: None,
+		};
 
-		GetQuoteRequestBuilder::new()
-			.user(user_address)
-			.available_inputs(vec![available_input])
-			.requested_outputs(vec![requested_output])
-			.build()
+		GetQuoteRequest {
+			user: user_address,
+			available_inputs: vec![available_input],
+			requested_outputs: vec![requested_output],
+			min_valid_until: None,
+			preference: None,
+		}
 	}
 
 	#[test]

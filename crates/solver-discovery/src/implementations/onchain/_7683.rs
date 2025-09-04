@@ -659,9 +659,7 @@ mod tests {
 	use super::*;
 	use alloy_primitives::{Address as AlloyAddress, Bytes, B256, U256};
 	use alloy_rpc_types::Log;
-	use solver_types::utils::tests::builders::{
-		NetworkConfigBuilder, NetworksConfigBuilder, RpcEndpointBuilder,
-	};
+	use solver_types::utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder};
 	use solver_types::NetworksConfig;
 	use std::collections::HashMap;
 	use tokio::sync::mpsc;
@@ -669,17 +667,7 @@ mod tests {
 	// Helper function to create a test networks config
 	fn create_test_networks() -> NetworksConfig {
 		NetworksConfigBuilder::new()
-			.add_network(
-				1,
-				NetworkConfigBuilder::new()
-					.add_rpc_endpoint(
-						RpcEndpointBuilder::new()
-							.http(Some("http://localhost:8545".to_string()))
-							.ws(Some("ws://localhost:8546".to_string()))
-							.build(),
-					)
-					.build(),
-			)
+			.add_network(1, NetworkConfigBuilder::new().build())
 			.build()
 	}
 

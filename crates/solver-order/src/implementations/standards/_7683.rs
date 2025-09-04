@@ -104,6 +104,7 @@ sol! {
 ///
 /// * `networks` - Networks configuration containing settler addresses for each chain
 /// * `oracle_routes` - Oracle routes for validation of input/output oracle compatibility
+#[derive(Debug)]
 pub struct Eip7683OrderImpl {
 	/// Networks configuration for dynamic settler address lookups.
 	networks: NetworksConfig,
@@ -842,3 +843,398 @@ impl solver_types::ImplementationRegistry for Registry {
 }
 
 impl crate::OrderRegistry for Registry {}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use alloy_primitives::U256;
+	use solver_types::{
+		oracle::{OracleInfo, OracleRoutes},
+		standards::eip7683::{Eip7683OrderData, LockType},
+		utils::tests::builders::{
+			Eip7683OrderDataBuilder, IntentBuilder, NetworkConfigBuilder, NetworksConfigBuilder,
+			OrderBuilder,
+		},
+		Address, ExecutionParams, FillProof, Intent, NetworksConfig, OrderStatus, TransactionHash,
+	};
+	use std::collections::HashMap;
+
+	fn create_test_networks() -> NetworksConfig {
+		NetworksConfigBuilder::new()
+			.add_network(1, NetworkConfigBuilder::new().build())
+			.add_network(137, NetworkConfigBuilder::new().build())
+			.build()
+	}
+
+	fn create_test_oracle_routes() -> OracleRoutes {
+		let mut supported_routes = HashMap::new();
+
+		let input_oracle = OracleInfo {
+			chain_id: 1,
+			oracle: Address(vec![10u8; 20]),
+		};
+
+		let output_oracle = OracleInfo {
+			chain_id: 137,
+			oracle: Address(vec![11u8; 20]),
+		};
+
+		supported_routes.insert(input_oracle, vec![output_oracle]);
+
+		OracleRoutes { supported_routes }
+	}
+
+	fn create_test_order_data() -> Eip7683OrderData {
+		Eip7683OrderDataBuilder::new().build()
+	}
+
+	fn create_test_intent(order_data: Eip7683OrderData, source: &str) -> Intent {
+		IntentBuilder::new()
+			.with_id("test-intent-id".to_string())
+			.with_source(source.to_string())
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_quote_id(Some("test-quote-id".to_string()))
+			.build()
+	}
+
+	#[test]
+	fn test_new_eip7683_order_impl() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+
+		let result = Eip7683OrderImpl::new(networks, oracle_routes);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_new_with_insufficient_networks() {
+		let networks = NetworksConfigBuilder::new()
+			.add_network(1, NetworkConfigBuilder::new().build())
+			.build();
+
+		let oracle_routes = create_test_oracle_routes();
+
+		let result = Eip7683OrderImpl::new(networks, oracle_routes);
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("At least 2 networks"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_intent_success() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let order_data = create_test_order_data();
+		let intent = create_test_intent(order_data, "on-chain");
+		let solver_address = Address(vec![99u8; 20]);
+
+		let result = order_impl.validate_intent(&intent, &solver_address).await;
+		assert!(result.is_ok());
+
+		let order = result.unwrap();
+		assert_eq!(order.id, "test-intent-id");
+		assert_eq!(order.standard, "eip7683");
+		assert_eq!(order.solver_address, solver_address);
+		assert_eq!(order.status, OrderStatus::Created);
+	}
+
+	#[tokio::test]
+	async fn test_validate_intent_wrong_standard() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut intent = create_test_intent(create_test_order_data(), "on-chain");
+		intent.standard = "eip7230".to_string();
+		let solver_address = Address(vec![99u8; 20]);
+
+		let result = order_impl.validate_intent(&intent, &solver_address).await;
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Not an EIP-7683 order"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_intent_expired_order() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut order_data = create_test_order_data();
+		order_data.expires = 100; // Set to past timestamp
+		let intent = create_test_intent(order_data, "on-chain");
+		let solver_address = Address(vec![99u8; 20]);
+
+		let result = order_impl.validate_intent(&intent, &solver_address).await;
+		assert!(result.is_err());
+		assert!(result.unwrap_err().to_string().contains("Order expired"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_intent_unsupported_oracle() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut order_data = create_test_order_data();
+		order_data.input_oracle = "0x9999999999999999999999999999999999999999".to_string();
+		let intent = create_test_intent(order_data, "on-chain");
+		let solver_address = Address(vec![99u8; 20]);
+
+		let result = order_impl.validate_intent(&intent, &solver_address).await;
+		assert!(result.is_err());
+		assert!(result.unwrap_err().to_string().contains("is not supported"));
+	}
+
+	#[tokio::test]
+	async fn test_generate_prepare_transaction_onchain_order() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let order_data = create_test_order_data();
+		let intent = create_test_intent(order_data.clone(), "on-chain");
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_solver_address(Address(vec![99u8; 20]))
+			.with_quote_id(Some("test-quote".to_string()))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![137])
+			.build();
+		let params = ExecutionParams {
+			gas_price: U256::ZERO,
+			priority_fee: None,
+		};
+
+		let result = order_impl
+			.generate_prepare_transaction(&intent, &order, &params)
+			.await;
+		assert!(result.is_ok());
+		assert!(result.unwrap().is_none()); // On-chain orders don't need preparation
+	}
+
+	#[tokio::test]
+	async fn test_generate_prepare_transaction_offchain_order() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut order_data = create_test_order_data();
+		order_data.raw_order_data = Some("0xabcdef".to_string());
+		order_data.sponsor = Some("0x1111111111111111111111111111111111111111".to_string());
+		order_data.signature = Some("0x22222222".to_string());
+
+		let intent = create_test_intent(order_data.clone(), "off-chain");
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_solver_address(Address(vec![99u8; 20]))
+			.with_quote_id(Some("test-quote".to_string()))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![137])
+			.build();
+		let params = ExecutionParams {
+			gas_price: U256::ZERO,
+			priority_fee: None,
+		};
+
+		let result = order_impl
+			.generate_prepare_transaction(&intent, &order, &params)
+			.await;
+		assert!(result.is_ok());
+
+		let tx = result.unwrap().unwrap();
+		assert_eq!(tx.chain_id, 1);
+		assert_eq!(
+			tx.to,
+			Some(Address(
+				hex::decode("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9").unwrap()
+			))
+		); // input_settler_address for chain 1
+		assert!(!tx.data.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_generate_fill_transaction() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let order_data = create_test_order_data();
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_solver_address(Address(vec![99u8; 20]))
+			.with_quote_id(Some("test-quote".to_string()))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![137])
+			.build();
+		let params = ExecutionParams {
+			gas_price: U256::ZERO,
+			priority_fee: None,
+		};
+
+		let result = order_impl.generate_fill_transaction(&order, &params).await;
+		assert!(result.is_ok());
+
+		let tx = result.unwrap();
+		assert_eq!(tx.chain_id, 137); // destination chain
+		assert_eq!(
+			tx.to,
+			Some(Address(
+				hex::decode("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f").unwrap()
+			))
+		); // output_settler_address for chain 137
+		assert!(!tx.data.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_generate_claim_transaction_escrow() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let order_data = create_test_order_data();
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_solver_address(Address(vec![99u8; 20]))
+			.with_quote_id(Some("test-quote".to_string()))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![137])
+			.build();
+		let fill_proof = FillProof {
+			tx_hash: TransactionHash(hex::decode("abcd").unwrap()),
+			block_number: 12345,
+			attestation_data: Some(b"proof".to_vec()),
+			filled_timestamp: 123456789,
+			oracle_address: "0x0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B".to_string(),
+		};
+
+		let result = order_impl
+			.generate_claim_transaction(&order, &fill_proof)
+			.await;
+		assert!(result.is_ok());
+
+		let tx = result.unwrap();
+		assert_eq!(tx.chain_id, 1); // origin chain
+		assert_eq!(
+			tx.to,
+			Some(Address(
+				hex::decode("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9").unwrap()
+			))
+		); // input_settler_address for chain 1
+		assert!(!tx.data.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_generate_claim_transaction_compact() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut order_data = create_test_order_data();
+		order_data.lock_type = Some(LockType::ResourceLock);
+		order_data.signature = Some("0x123456789abcdef0".to_string());
+
+		let order = OrderBuilder::new()
+			.with_id("test-order".to_string())
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_solver_address(Address(vec![99u8; 20]))
+			.with_quote_id(Some("test-quote".to_string()))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![137])
+			.build();
+
+		let fill_proof = FillProof {
+			tx_hash: TransactionHash(hex::decode("abcd").unwrap()),
+			block_number: 12345,
+			attestation_data: Some(b"proof".to_vec()),
+			filled_timestamp: 123456789,
+			oracle_address: "0x0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B".to_string(),
+		};
+
+		let result = order_impl
+			.generate_claim_transaction(&order, &fill_proof)
+			.await;
+		assert!(result.is_ok());
+
+		let tx = result.unwrap();
+		assert_eq!(tx.chain_id, 1); // origin chain
+		assert_eq!(
+			tx.to,
+			Some(Address(
+				hex::decode("00000000000c2e074ec69a0dfb2997ba6c7d2e1e").unwrap()
+			))
+		); // compact address for chain 1
+		assert!(!tx.data.is_empty());
+	}
+
+	#[test]
+	fn test_config_schema_validation() {
+		let schema = Eip7683OrderSchema;
+		let valid_config = toml::Value::Table(toml::map::Map::new());
+
+		let result = schema.validate(&valid_config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_create_order_impl_factory() {
+		let config = toml::Value::Table(toml::map::Map::new());
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+
+		let result = create_order_impl(&config, &networks, &oracle_routes);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_lock_type_enum() {
+		assert_eq!(LockType::from_u8(1), Some(LockType::Permit2Escrow));
+		assert_eq!(LockType::from_u8(2), Some(LockType::Eip3009Escrow));
+		assert_eq!(LockType::from_u8(3), Some(LockType::ResourceLock));
+		assert_eq!(LockType::from_u8(99), None);
+
+		assert_eq!(LockType::Permit2Escrow.to_u8(), 1);
+		assert_eq!(LockType::ResourceLock.to_u8(), 3);
+
+		assert!(LockType::ResourceLock.is_compact());
+		assert!(!LockType::Permit2Escrow.is_compact());
+
+		assert!(LockType::Permit2Escrow.is_escrow());
+		assert!(!LockType::ResourceLock.is_escrow());
+	}
+
+	#[tokio::test]
+	async fn test_generate_fill_transaction_no_cross_chain_output() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut order_data = create_test_order_data();
+		// Make the output same-chain
+		order_data.outputs[0].chain_id = U256::from(1);
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_solver_address(Address(vec![99u8; 20]))
+			.with_quote_id(Some("test-quote".to_string()))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![1])
+			.build();
+		let params = ExecutionParams {
+			gas_price: U256::ZERO,
+			priority_fee: None,
+		};
+
+		let result = order_impl.generate_fill_transaction(&order, &params).await;
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("No cross-chain output found"));
+	}
+}

@@ -347,16 +347,14 @@ mod tests {
 	use super::*;
 	use crate::apis::quote::custody::{CustodyDecision, EscrowKind, LockKind};
 	use alloy_primitives::address;
+	use alloy_primitives::U256;
 	use solver_config::{
 		ApiConfig, Config, ConfigBuilder, DomainConfig, QuoteConfig, SettlementConfig,
 	};
 	use solver_settlement::{MockSettlementInterface, SettlementInterface};
 	use solver_types::{
-		utils::tests::builders::{
-			AvailableInputBuilder, GetQuoteRequestBuilder, NetworkConfigBuilder,
-			NetworksConfigBuilder, RequestedOutputBuilder,
-		},
-		QuotePreference, SignatureType,
+		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
+		AvailableInput, QuotePreference, RequestedOutput, SignatureType,
 	};
 	use std::collections::HashMap;
 
@@ -401,20 +399,38 @@ mod tests {
 	}
 
 	fn create_test_request() -> GetQuoteRequest {
-		GetQuoteRequestBuilder::new()
-			.user_ethereum(1, address!("1111111111111111111111111111111111111111"))
-			.available_inputs(vec![AvailableInputBuilder::new()
-				.user_ethereum(1, address!("1111111111111111111111111111111111111111"))
-				.asset_ethereum(1, address!("A0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"))
-				.amount_u64(1000)
-				.build()])
-			.requested_outputs(vec![RequestedOutputBuilder::new()
-				.receiver_ethereum(137, address!("2222222222222222222222222222222222222222"))
-				.asset_ethereum(137, address!("B0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"))
-				.amount_u64(950)
-				.build()])
-			.preference(QuotePreference::Speed)
-			.build()
+		GetQuoteRequest {
+			user: InteropAddress::new_ethereum(
+				1,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			available_inputs: vec![AvailableInput {
+				user: InteropAddress::new_ethereum(
+					1,
+					address!("1111111111111111111111111111111111111111"),
+				),
+				asset: InteropAddress::new_ethereum(
+					1,
+					address!("A0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
+				),
+				amount: U256::from(1000),
+				lock: None,
+			}],
+			requested_outputs: vec![RequestedOutput {
+				receiver: InteropAddress::new_ethereum(
+					137,
+					address!("2222222222222222222222222222222222222222"),
+				),
+				asset: InteropAddress::new_ethereum(
+					137,
+					address!("B0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
+				),
+				amount: U256::from(950),
+				calldata: None,
+			}],
+			min_valid_until: None,
+			preference: Some(QuotePreference::Speed),
+		}
 	}
 
 	fn create_test_settlement_service(with_oracles: bool) -> Arc<SettlementService> {
@@ -506,14 +522,27 @@ mod tests {
 		let config = create_test_config();
 
 		// Create request with no available inputs
-		let request = GetQuoteRequestBuilder::new()
-			.user_ethereum(1, address!("1111111111111111111111111111111111111111"))
-			.requested_outputs(vec![RequestedOutputBuilder::new()
-				.receiver_ethereum(137, address!("2222222222222222222222222222222222222222"))
-				.asset_ethereum(137, address!("B0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"))
-				.amount_u64(950)
-				.build()])
-			.build();
+		let request = GetQuoteRequest {
+			user: InteropAddress::new_ethereum(
+				1,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			available_inputs: vec![],
+			requested_outputs: vec![RequestedOutput {
+				receiver: InteropAddress::new_ethereum(
+					137,
+					address!("2222222222222222222222222222222222222222"),
+				),
+				asset: InteropAddress::new_ethereum(
+					137,
+					address!("B0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
+				),
+				amount: U256::from(950),
+				calldata: None,
+			}],
+			min_valid_until: None,
+			preference: Some(QuotePreference::Speed),
+		};
 
 		let result = generator.generate_quotes(&request, &config).await;
 		assert!(matches!(result, Err(QuoteError::InsufficientLiquidity)));
