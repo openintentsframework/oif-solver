@@ -488,10 +488,12 @@ impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
 		let witness = if is_compact {
 			None
 		} else {
-			Some(eip712_data
-				.get("witness")
-				.and_then(|w| w.as_object())
-				.ok_or("Missing 'witness' object in EIP-712 message")?)
+			Some(
+				eip712_data
+					.get("witness")
+					.and_then(|w| w.as_object())
+					.ok_or("Missing 'witness' object in EIP-712 message")?,
+			)
 		};
 
 		// Get origin chain ID
@@ -504,11 +506,13 @@ impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
 				.get("deadline")
 				.and_then(|d| d.as_u64())
 				.unwrap_or(quote_with_sig.quote.valid_until.unwrap_or(0)) as u32;
-			
+
 			// For compact, we use the same oracle as the direct intent flow
 			// This should match the configured oracle for the origin chain
-			let input_oracle = Address::from_slice(&hex::decode("dc64a140aa3e981100a9beca4e685f962f0cf6c9").unwrap());
-			
+			let input_oracle = Address::from_slice(
+				&hex::decode("dc64a140aa3e981100a9beca4e685f962f0cf6c9").unwrap(),
+			);
+
 			// Extract inputs from CompactLock message
 			let inputs_array = eip712_data
 				.get("inputs")
@@ -517,33 +521,33 @@ impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
 			let first_input = inputs_array
 				.first()
 				.ok_or("Empty inputs array in CompactLock message")?;
-				
+
 			let input_amount_num = first_input
 				.get("amount")
 				.and_then(|a| a.as_str())
 				.and_then(|s| U256::from_str_radix(s, 10).ok())
 				.ok_or("Missing or invalid amount in CompactLock input")?;
-				
+
 			let input_asset_str = first_input
 				.get("asset")
 				.and_then(|t| t.as_str())
 				.ok_or("Missing asset in CompactLock input")?;
-			
+
 			// Parse interop address and get token address
 			let input_interop = InteropAddress::from_hex(input_asset_str)?;
 			let input_token = input_interop.ethereum_address()?;
-			
+
 			// Convert input token address to U256
 			let mut token_bytes = [0u8; 32];
 			token_bytes[12..32].copy_from_slice(&input_token.0 .0);
 			let input_token_u256 = U256::from_be_bytes(token_bytes);
 			let inputs = vec![[input_token_u256, input_amount_num]];
-			
+
 			(deadline, deadline, input_oracle, inputs)
 		} else {
 			// Permit2 structure
 			let witness = witness.unwrap(); // Safe because we checked is_compact above
-			
+
 			let expires = witness
 				.get("expires")
 				.and_then(|e| e.as_u64())
@@ -585,20 +589,19 @@ impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
 			token_bytes[12..32].copy_from_slice(&input_token.0 .0);
 			let input_token_u256 = U256::from_be_bytes(token_bytes);
 			let inputs = vec![[input_token_u256, input_amount]];
-			
+
 			(expires, fill_deadline, input_oracle, inputs)
 		};
 
 		// Extract outputs (different sources for compact vs permit2)
 		let default_outputs = Vec::new();
 		let witness_outputs = if is_compact {
-			eip712_data
-				.get("outputs")
+			eip712_data.get("outputs")
 		} else {
 			witness.unwrap().get("outputs")
 		}
-			.and_then(|o| o.as_array())
-			.unwrap_or(&default_outputs);
+		.and_then(|o| o.as_array())
+		.unwrap_or(&default_outputs);
 
 		// Parse outputs with proper helper function for hex parsing
 		fn parse_bytes32_from_hex(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
@@ -667,7 +670,7 @@ impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
 							if let Ok(eth_addr) = interop_addr.ethereum_address() {
 								// Convert Address to 32-byte array with padding
 								let mut bytes = [0u8; 32];
-								bytes[12..32].copy_from_slice(&eth_addr.0.0);
+								bytes[12..32].copy_from_slice(&eth_addr.0 .0);
 								bytes
 							} else {
 								[0u8; 32]
@@ -678,7 +681,7 @@ impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
 					} else {
 						parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32])
 					};
-					
+
 					// For compact, extract recipient address from interop address, for permit2 use hex parsing
 					let recipient_bytes = if is_compact {
 						// Extract Ethereum recipient address from interop address
@@ -686,7 +689,7 @@ impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
 							if let Ok(eth_addr) = interop_addr.ethereum_address() {
 								// Convert Address to 32-byte array with padding
 								let mut bytes = [0u8; 32];
-								bytes[12..32].copy_from_slice(&eth_addr.0.0);
+								bytes[12..32].copy_from_slice(&eth_addr.0 .0);
 								bytes
 							} else {
 								[0u8; 32]
