@@ -7,86 +7,6 @@ use crate::networks::{NetworkConfig, NetworksConfig, RpcEndpoint, TokenConfig};
 use crate::{parse_address, Address};
 use std::collections::HashMap;
 
-/// Builder for creating `RpcEndpoint` instances with a fluent API.
-///
-/// Provides an easy way to construct RPC endpoints with proper validation
-/// and sensible defaults for network connections.
-///
-/// # Examples
-///
-/// ```
-/// use solver_types::utils::builders::RpcEndpointBuilder;
-///
-/// let endpoint = RpcEndpointBuilder::new()
-///     .http("https://mainnet.infura.io")
-///     .ws("wss://mainnet.infura.io")
-///     .build();
-/// ```
-#[derive(Debug, Clone)]
-pub struct RpcEndpointBuilder {
-	http: Option<String>,
-	ws: Option<String>,
-}
-
-impl Default for RpcEndpointBuilder {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
-impl RpcEndpointBuilder {
-	/// Creates a new `RpcEndpointBuilder` with default values.
-	pub fn new() -> Self {
-		Self {
-			http: Some("https://eth.llamarpc.com".to_string()),
-			ws: Some("wss://eth.llamarpc.com".to_string()),
-		}
-	}
-
-	/// Sets the HTTP URL.
-	pub fn http(mut self, url: Option<String>) -> Self {
-		self.http = url;
-		self
-	}
-
-	/// Sets the WebSocket URL.
-	pub fn ws(mut self, url: Option<String>) -> Self {
-		self.ws = url;
-		self
-	}
-
-	/// Validates the builder state and returns an error if no URLs are provided.
-	pub fn validate(&self) -> Result<(), RpcEndpointBuilderError> {
-		if self.http.is_none() && self.ws.is_none() {
-			return Err(RpcEndpointBuilderError::NoUrlsProvided);
-		}
-		Ok(())
-	}
-
-	/// Builds the `RpcEndpoint` with the configured values.
-	///
-	/// # Panics
-	///
-	/// Panics if no URLs are provided.
-	/// Use `try_build()` for error handling instead of panicking.
-	pub fn build(self) -> RpcEndpoint {
-		self.try_build()
-			.expect("At least one URL (HTTP or WebSocket) must be provided")
-	}
-
-	/// Tries to build the `RpcEndpoint` with the configured values.
-	///
-	/// Returns an error if no URLs are provided.
-	pub fn try_build(self) -> Result<RpcEndpoint, RpcEndpointBuilderError> {
-		self.validate()?;
-
-		Ok(RpcEndpoint {
-			http: self.http,
-			ws: self.ws,
-		})
-	}
-}
-
 /// Builder for creating `TokenConfig` instances with a fluent API.
 ///
 /// Provides an easy way to construct token configurations with proper validation
@@ -204,11 +124,11 @@ impl TokenConfigBuilder {
 /// # Examples
 ///
 /// ```
-/// use solver_types::utils::builders::{NetworkConfigBuilder, RpcEndpointBuilder};
-/// use solver_types::Address;
+/// use solver_types::utils::builders::NetworkConfigBuilder;
+/// use solver_types::networks::RpcEndpoint;
 ///
 /// let network = NetworkConfigBuilder::new()
-///     .add_rpc_endpoint(RpcEndpointBuilder::new().http("https://mainnet.infura.io").build())
+///     .add_rpc_endpoint(RpcEndpoint::http_only("https://mainnet.infura.io".to_string()))
 ///     .input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
 ///     .output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
 ///     .build();
@@ -233,7 +153,10 @@ impl NetworkConfigBuilder {
 	/// Creates a new `NetworkConfigBuilder` with default values.
 	pub fn new() -> Self {
 		Self {
-			rpc_urls: vec![RpcEndpointBuilder::new().build()],
+			rpc_urls: vec![RpcEndpoint::both(
+				"https://eth.llamarpc.com".to_string(),
+				"wss://eth.llamarpc.com".to_string(),
+			)],
 			input_settler_address: Some(
 				parse_address("0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
 					.expect("Invalid mock address"),
@@ -401,7 +324,8 @@ impl NetworkConfigBuilder {
 /// # Examples
 ///
 /// ```
-/// use solver_types::utils::builders::{NetworksConfigBuilder, NetworkConfigBuilder, RpcEndpointBuilder};
+/// use solver_types::utils::builders::{NetworksConfigBuilder, NetworkConfigBuilder};
+/// use solver_types::networks::RpcEndpoint;
 ///
 /// let networks = NetworksConfigBuilder::new()
 ///     .add_network(1, NetworkConfigBuilder::new()
@@ -459,13 +383,6 @@ impl NetworksConfigBuilder {
 	pub fn try_build(self) -> Result<NetworksConfig, NetworksConfigBuilderError> {
 		Ok(self.networks)
 	}
-}
-
-/// Errors that can occur when building an RpcEndpoint.
-#[derive(Debug, thiserror::Error)]
-pub enum RpcEndpointBuilderError {
-	#[error("At least one URL (HTTP or WebSocket) must be provided")]
-	NoUrlsProvided,
 }
 
 /// Errors that can occur when building a TokenConfig.
