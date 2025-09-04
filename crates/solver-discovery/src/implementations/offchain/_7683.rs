@@ -1132,7 +1132,7 @@ mod tests {
 	use alloy_primitives::{Address, Bytes, U256};
 	use serde_json::json;
 	use solver_types::{
-		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder, RpcEndpointBuilder},
+		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
 		NetworksConfig,
 	};
 	use std::collections::HashMap;
@@ -1140,12 +1140,7 @@ mod tests {
 
 	fn create_test_networks_config() -> NetworksConfig {
 		NetworksConfigBuilder::new()
-			.add_network(
-				1,
-				NetworkConfigBuilder::new()
-					.add_rpc_endpoint(RpcEndpointBuilder::new().build())
-					.build(),
-			)
+			.add_network(1, NetworkConfigBuilder::new().build())
 			.build()
 	}
 
