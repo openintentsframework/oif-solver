@@ -3621,6 +3621,7 @@ dependencies = [
  "alloy-transport",
  "alloy-transport-http",
  "async-trait",
+ "mockall",
  "reqwest",
  "serde",
  "serde_json",
