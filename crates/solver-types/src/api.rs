@@ -2,7 +2,7 @@
 //!
 //! This module defines the request and response types for the OIF Solver API
 //! endpoints, following the ERC-7683 Cross-Chain Intents Standard.
-use crate::{costs::QuoteCost, standards::eip7930::InteropAddress};
+use crate::{costs::QuoteCost, standards::eip7930::InteropAddress, utils::parse_bytes32_from_hex};
 use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -143,6 +143,8 @@ pub struct Quote {
 	/// Cost breakdown
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub cost: Option<QuoteCost>,
+	// Using LockType
+	pub lock_type: String,
 }
 
 /// Settlement mechanism types.
@@ -406,13 +408,195 @@ impl From<GetOrderError> for APIError {
 	}
 }
 
+/// A tuple combining Quote and signature for intent request conversion
+#[cfg(feature = "oif-interfaces")]
+pub struct QuoteWithSignature<'a> {
+	pub quote: &'a Quote,
+	pub signature: &'a str,
+}
+
+#[cfg(feature = "oif-interfaces")]
+impl<'a> From<(&'a Quote, &'a str)> for QuoteWithSignature<'a> {
+	fn from((quote, signature): (&'a Quote, &'a str)) -> Self {
+		Self { quote, signature }
+	}
+}
+
+#[cfg(feature = "oif-interfaces")]
+impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
+	type Error = Box<dyn std::error::Error>;
+
+	fn try_from(quote_with_sig: QuoteWithSignature<'_>) -> Result<Self, Self::Error> {
+		use crate::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
+		use crate::standards::eip7930::InteropAddress;
+		use alloy_primitives::{Address, U256};
+		use alloy_sol_types::SolType;
+
+		// Extract user address from the first available input
+		let user_str = &quote_with_sig
+			.quote
+			.details
+			.available_inputs
+			.first()
+			.ok_or("Quote must have at least one available input")?
+			.user;
+		let interop_address = InteropAddress::from_hex(&user_str.to_string())?;
+		let user_address = interop_address.ethereum_address()?;
+
+		// Extract order data from quote
+		let quote_order = quote_with_sig
+			.quote
+			.orders
+			.first()
+			.ok_or("Quote must contain at least one order")?;
+		let message_data = quote_order
+			.message
+			.as_object()
+			.ok_or("Invalid EIP-712 message structure")?;
+		let eip712_data = message_data
+			.get("eip712")
+			.and_then(|e| e.as_object())
+			.ok_or("Missing 'eip712' object in message")?;
+
+		// Extract nonce
+		let nonce_str = eip712_data
+			.get("nonce")
+			.and_then(|n| n.as_str())
+			.ok_or("Missing nonce in EIP-712 data")?;
+		let nonce = U256::from_str_radix(nonce_str, 10)?;
+
+		// Extract witness data
+		let witness = eip712_data
+			.get("witness")
+			.and_then(|w| w.as_object())
+			.ok_or("Missing 'witness' object in EIP-712 message")?;
+
+		// Get origin chain ID
+		let origin_chain_id = U256::from(interop_address.ethereum_chain_id()?);
+
+		// Extract timing data
+		let expires = witness
+			.get("expires")
+			.and_then(|e| e.as_u64())
+			.unwrap_or(quote_with_sig.quote.valid_until.unwrap_or(0)) as u32;
+		let fill_deadline = expires;
+
+		// Extract input oracle
+		let input_oracle_str = witness
+			.get("inputOracle")
+			.and_then(|o| o.as_str())
+			.ok_or("Missing 'inputOracle' in witness data")?;
+		let input_oracle =
+			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
+
+		// Extract input data from permitted array
+		let permitted = eip712_data
+			.get("permitted")
+			.and_then(|p| p.as_array())
+			.ok_or("Missing permitted array in EIP-712 data")?;
+		let first_permitted = permitted
+			.first()
+			.ok_or("Empty permitted array in EIP-712 data")?;
+
+		let input_amount_str = first_permitted
+			.get("amount")
+			.and_then(|a| a.as_str())
+			.ok_or("Missing amount in permitted token")?;
+		let input_amount = U256::from_str_radix(input_amount_str, 10)?;
+
+		let input_token_str = first_permitted
+			.get("token")
+			.and_then(|t| t.as_str())
+			.ok_or("Missing token in permitted array")?;
+		let input_token =
+			Address::from_slice(&hex::decode(input_token_str.trim_start_matches("0x"))?);
+
+		// Convert input token address to U256
+		let mut token_bytes = [0u8; 32];
+		token_bytes[12..32].copy_from_slice(&input_token.0 .0);
+		let input_token_u256 = U256::from_be_bytes(token_bytes);
+		let inputs = vec![[input_token_u256, input_amount]];
+
+		// Extract outputs from witness
+		let default_outputs = Vec::new();
+		let witness_outputs = witness
+			.get("outputs")
+			.and_then(|o| o.as_array())
+			.unwrap_or(&default_outputs);
+
+		// Parse outputs with proper helper function for hex parsing
+
+		let mut sol_outputs = Vec::new();
+		for output_item in witness_outputs {
+			if let Some(output_obj) = output_item.as_object() {
+				let chain_id = output_obj
+					.get("chainId")
+					.and_then(|c| c.as_u64())
+					.unwrap_or(0);
+				let amount_str = output_obj
+					.get("amount")
+					.and_then(|a| a.as_str())
+					.unwrap_or("0");
+				let token_str = output_obj.get("token").and_then(|t| t.as_str()).unwrap();
+				let recipient_str = output_obj
+					.get("recipient")
+					.and_then(|r| r.as_str())
+					.unwrap();
+				let oracle_str = output_obj.get("oracle").and_then(|o| o.as_str()).unwrap();
+				let settler_str = output_obj.get("settler").and_then(|s| s.as_str()).unwrap();
+
+				if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
+					let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
+					let recipient_bytes =
+						parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
+					let oracle_bytes = parse_bytes32_from_hex(oracle_str).unwrap_or([0u8; 32]);
+					let settler_bytes = parse_bytes32_from_hex(settler_str).unwrap_or([0u8; 32]);
+
+					sol_outputs.push(SolMandateOutput {
+						oracle: oracle_bytes.into(),
+						settler: settler_bytes.into(),
+						chainId: U256::from(chain_id),
+						token: token_bytes.into(),
+						amount,
+						recipient: recipient_bytes.into(),
+						call: Vec::new().into(),
+						context: Vec::new().into(),
+					});
+				}
+			}
+		}
+
+		// Create and encode the StandardOrder
+		let sol_order = StandardOrder {
+			user: user_address,
+			nonce,
+			originChainId: origin_chain_id,
+			expires,
+			fillDeadline: fill_deadline,
+			inputOracle: input_oracle,
+			inputs,
+			outputs: sol_outputs,
+		};
+
+		// ABI encode the StandardOrder
+		let encoded_order = StandardOrder::abi_encode(&sol_order);
+
+		// Create IntentRequest
+		let intent_request = serde_json::json!({
+			"order": format!("0x{}", hex::encode(&encoded_order)),
+			"sponsor": format!("{:#x}", user_address),
+			"signature": quote_with_sig.signature,
+			"lockType": quote_with_sig.quote.lock_type.clone()
+		});
+
+		Ok(intent_request)
+	}
+}
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::standards::eip7930::InteropAddress;
-	use crate::utils::tests::builders::{
-		AssetAmountBuilder, AvailableInputBuilder, GetQuoteRequestBuilder, RequestedOutputBuilder,
-	};
+	use crate::utils::tests::builders::AssetAmountBuilder;
 	use alloy_primitives::address;
 	use alloy_primitives::U256;
 	use serde_json;
@@ -459,15 +643,21 @@ mod tests {
 
 	#[test]
 	fn test_available_input_serialization() {
-		let input = AvailableInputBuilder::new()
-			.user_ethereum(1, address!("1111111111111111111111111111111111111111"))
-			.asset_ethereum(1, address!("2222222222222222222222222222222222222222"))
-			.amount_u64(5000)
-			.lock(Lock {
+		let input = AvailableInput {
+			user: InteropAddress::new_ethereum(
+				1,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			asset: InteropAddress::new_ethereum(
+				1,
+				address!("2222222222222222222222222222222222222222"),
+			),
+			amount: U256::from(5000),
+			lock: Some(Lock {
 				kind: LockKind::TheCompact,
 				params: None,
-			})
-			.build();
+			}),
+		};
 
 		let json = serde_json::to_string(&input).unwrap();
 		let deserialized: AvailableInput = serde_json::from_str(&json).unwrap();
@@ -478,12 +668,18 @@ mod tests {
 
 	#[test]
 	fn test_requested_output_serialization() {
-		let output = RequestedOutputBuilder::new()
-			.receiver_ethereum(1, address!("3333333333333333333333333333333333333333"))
-			.asset_ethereum(1, address!("4444444444444444444444444444444444444444"))
-			.amount_u64(2000)
-			.calldata("0xdeadbeef")
-			.build();
+		let output = RequestedOutput {
+			receiver: InteropAddress::new_ethereum(
+				1,
+				address!("3333333333333333333333333333333333333333"),
+			),
+			asset: InteropAddress::new_ethereum(
+				1,
+				address!("4444444444444444444444444444444444444444"),
+			),
+			amount: U256::from(2000),
+			calldata: Some("0xdeadbeef".to_string()),
+		};
 
 		let json = serde_json::to_string(&output).unwrap();
 		let deserialized: RequestedOutput = serde_json::from_str(&json).unwrap();
@@ -519,25 +715,42 @@ mod tests {
 
 	#[test]
 	fn test_get_quote_request_serialization() {
-		let input = AvailableInputBuilder::new()
-			.user_ethereum(1, address!("1111111111111111111111111111111111111111"))
-			.asset_ethereum(1, address!("2222222222222222222222222222222222222222"))
-			.amount_u64(1000)
-			.build();
+		let input = AvailableInput {
+			user: InteropAddress::new_ethereum(
+				1,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			asset: InteropAddress::new_ethereum(
+				1,
+				address!("2222222222222222222222222222222222222222"),
+			),
+			amount: U256::from(1000),
+			lock: None,
+		};
 
-		let output = RequestedOutputBuilder::new()
-			.receiver_ethereum(1, address!("3333333333333333333333333333333333333333"))
-			.asset_ethereum(1, address!("4444444444444444444444444444444444444444"))
-			.amount_u64(900)
-			.build();
+		let output = RequestedOutput {
+			receiver: InteropAddress::new_ethereum(
+				1,
+				address!("3333333333333333333333333333333333333333"),
+			),
+			asset: InteropAddress::new_ethereum(
+				1,
+				address!("4444444444444444444444444444444444444444"),
+			),
+			amount: U256::from(900),
+			calldata: None,
+		};
 
-		let request = GetQuoteRequestBuilder::new()
-			.user_ethereum(1, address!("1111111111111111111111111111111111111111"))
-			.add_available_input(input)
-			.add_requested_output(output)
-			.min_valid_until(1234567890)
-			.preference(QuotePreference::Price)
-			.build();
+		let request = GetQuoteRequest {
+			user: InteropAddress::new_ethereum(
+				1,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			available_inputs: vec![input],
+			requested_outputs: vec![output],
+			min_valid_until: Some(1234567890),
+			preference: Some(QuotePreference::Price),
+		};
 
 		let json = serde_json::to_string(&request).unwrap();
 		assert!(json.contains("\"availableInputs\""));
@@ -626,6 +839,7 @@ mod tests {
 			quote_id: "quote_123".to_string(),
 			provider: "test_solver".to_string(),
 			cost: None,
+			lock_type: "permit2_escrow".to_string(),
 		};
 
 		let json = serde_json::to_string(&quote).unwrap();
@@ -653,6 +867,7 @@ mod tests {
 				quote_id: "test_quote".to_string(),
 				provider: "test_provider".to_string(),
 				cost: None,
+				lock_type: "permit2_escrow".to_string(),
 			}],
 		};
 
