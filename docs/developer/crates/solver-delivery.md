@@ -32,9 +32,6 @@ graph TB
     AlloyImpl --> GasOptimization
     AlloyImpl --> RetryLogic
     AlloyImpl --> StateTracking
-
-    SolanaImpl -.-> DeliveryService
-    CosmosImpl -.-> DeliveryService
 ```
 
 ## Transaction Delivery Flow

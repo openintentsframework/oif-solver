@@ -22,13 +22,11 @@ graph TB
             TTLManager[TTL Management<br/>Automatic Expiration]
             Serialization[Data Serialization<br/>JSON/Binary Formats]
             AtomicOps[Atomic Operations<br/>Consistent Updates]
-            Migration[Schema Migration<br/>Version Management]
             Cleanup[Background Cleanup<br/>Expired Data Removal]
         end
     end
 
     StorageService --> FileStorage
-    StorageService --> MemoryStorage
     StorageService --> TTLManager
     StorageService --> Serialization
     StorageService --> AtomicOps
