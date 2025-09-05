@@ -213,7 +213,9 @@ where
 {
 	use serde::de::Error;
 	let v = serde_json::Value::deserialize(deserializer)?;
-	match v {
+	tracing::debug!("Deserializing lock_type from JSON value: {:?}", v);
+	
+	let result = match v {
 		serde_json::Value::Number(n) => {
 			let num = n
 				.as_u64()
@@ -225,6 +227,7 @@ where
 			}
 		},
 		serde_json::Value::String(s) => {
+			tracing::debug!("Processing lock_type string: '{}'", s);
 			// Try parsing as number first, then as enum name
 			if let Ok(num) = s.parse::<u8>() {
 				LockType::from_u8(num).ok_or_else(|| Error::custom("Invalid LockType value"))
@@ -242,7 +245,10 @@ where
 		_ => Err(Error::custom(
 			"expected number, string, or null for LockType",
 		)),
-	}
+	};
+	
+	tracing::debug!("Deserialized lock_type result: {:?}", result);
+	result
 }
 
 /// API request wrapper for intent submission.
@@ -262,7 +268,8 @@ struct IntentRequest {
 	signature: Bytes,
 	#[serde(
 		default = "default_lock_type",
-		deserialize_with = "deserialize_lock_type_flexible"
+		deserialize_with = "deserialize_lock_type_flexible",
+		rename = "lockType"
 	)]
 	lock_type: LockType,
 }
@@ -584,6 +591,12 @@ impl Eip7683OffchainDiscovery {
 		}
 
 		// Convert to intent format
+		tracing::debug!(
+			order_id = %hex::encode(order_id),
+			lock_type = ?lock_type,
+			"Creating intent with lock_type"
+		);
+		
 		let order_data = Eip7683OrderData {
 			user: with_0x_prefix(&hex::encode(order.user)),
 			nonce: order.nonce,

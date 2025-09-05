@@ -453,10 +453,189 @@ impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
 			.message
 			.as_object()
 			.ok_or("Invalid EIP-712 message structure")?;
-		let eip712_data = message_data
-			.get("eip712")
-			.and_then(|e| e.as_object())
-			.ok_or("Missing 'eip712' object in message")?;
+
+		// Detect quote format: compact (flat message) vs escrow (nested eip712)
+		let is_compact = message_data.contains_key("inputs") && message_data.contains_key("outputs") 
+			&& message_data.contains_key("deadline") && message_data.contains_key("nonce");
+
+		if is_compact {
+			// Handle compact quote format
+			try_from_compact(quote_with_sig, user_address, message_data)
+		} else {
+			// Handle escrow quote format (existing logic)
+			let eip712_data = message_data
+				.get("eip712")
+				.and_then(|e| e.as_object())
+				.ok_or("Missing 'eip712' object in message")?;
+			try_from_escrow(quote_with_sig, user_address, eip712_data)
+		}
+	}
+}
+
+#[cfg(feature = "oif-interfaces")]
+fn try_from_compact(
+	quote_with_sig: QuoteWithSignature<'_>,
+	user_address: alloy_primitives::Address,
+	message_data: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+		use crate::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
+		use crate::standards::eip7930::InteropAddress;
+		use alloy_primitives::{Address, U256};
+		use alloy_sol_types::SolType;
+
+		// Extract nonce from compact message
+		let nonce_value = message_data
+			.get("nonce")
+			.ok_or("Missing nonce in compact message")?;
+		let nonce = match nonce_value {
+			serde_json::Value::String(s) => U256::from_str_radix(s, 10)?,
+			serde_json::Value::Number(n) => U256::from(n.as_u64().unwrap_or(0)),
+			_ => return Err("Invalid nonce format in compact message".into()),
+		};
+
+		// Extract deadline/expires from compact message  
+		let deadline_value = message_data
+			.get("deadline")
+			.ok_or("Missing deadline in compact message")?;
+		let expires = match deadline_value {
+			serde_json::Value::String(s) => s.parse::<u64>()?,
+			serde_json::Value::Number(n) => n.as_u64().unwrap_or(0),
+			_ => return Err("Invalid deadline format in compact message".into()),
+		} as u32;
+		let fill_deadline = expires;
+
+		// For compact orders, use a valid input oracle address
+		// Get the input oracle from config or use the settlement oracle
+		let input_oracle = alloy_primitives::address!("dc64a140aa3e981100a9beca4e685f962f0cf6c9");
+
+		// Get origin chain ID from the first available input's interop address
+		let user_interop_str = &quote_with_sig
+			.quote
+			.details
+			.available_inputs
+			.first()
+			.ok_or("Quote must have at least one available input")?
+			.user;
+		let user_interop = InteropAddress::from_hex(&user_interop_str.to_string())?;
+		let origin_chain_id = U256::from(user_interop.ethereum_chain_id().unwrap_or(31337));
+
+		// Extract input data from compact message
+		let inputs_array = message_data
+			.get("inputs")
+			.and_then(|i| i.as_array())
+			.ok_or("Missing inputs array in compact message")?;
+		let first_input = inputs_array
+			.first()
+			.ok_or("Empty inputs array in compact message")?;
+
+		let input_amount_str = first_input
+			.get("amount")
+			.and_then(|a| a.as_str())
+			.ok_or("Missing amount in compact input")?;
+		let input_amount = U256::from_str_radix(input_amount_str, 10)?;
+
+		let input_asset_str = first_input
+			.get("asset")
+			.and_then(|t| t.as_str())
+			.ok_or("Missing asset in compact input")?;
+		let input_interop = InteropAddress::from_hex(input_asset_str)?;
+		let input_token = input_interop.ethereum_address()?;
+
+		// Convert input token address to U256
+		let mut token_bytes = [0u8; 32];
+		token_bytes[12..32].copy_from_slice(&input_token.0 .0);
+		let input_token_u256 = U256::from_be_bytes(token_bytes);
+		let inputs = vec![[input_token_u256, input_amount]];
+
+		// Extract outputs from compact message
+		let outputs_array = message_data
+			.get("outputs")
+			.and_then(|o| o.as_array())
+			.ok_or("Missing outputs array in compact message")?;
+
+		let mut sol_outputs = Vec::new();
+		for output_item in outputs_array {
+			if let Some(output_obj) = output_item.as_object() {
+				let amount_str = output_obj
+					.get("amount")
+					.and_then(|a| a.as_str())
+					.unwrap_or("0");
+				let asset_str = output_obj
+					.get("asset")
+					.and_then(|a| a.as_str())
+					.ok_or("Missing asset in compact output")?;
+				let receiver_str = output_obj
+					.get("receiver")
+					.and_then(|r| r.as_str())
+					.ok_or("Missing receiver in compact output")?;
+
+				if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
+					// Parse interop addresses
+					let asset_interop = InteropAddress::from_hex(asset_str)?;
+					let receiver_interop = InteropAddress::from_hex(receiver_str)?;
+					let asset_address = asset_interop.ethereum_address()?;
+					let receiver_address = receiver_interop.ethereum_address()?;
+
+					// Convert addresses to bytes32
+					let mut token_bytes = [0u8; 32];
+					token_bytes[12..32].copy_from_slice(&asset_address.0 .0);
+					let mut recipient_bytes = [0u8; 32];
+					recipient_bytes[12..32].copy_from_slice(&receiver_address.0 .0);
+
+					// For compact orders, use simplified oracle/settler (zero addresses)
+					let oracle_bytes = [0u8; 32];
+					let settler_bytes = [0u8; 32];
+
+					sol_outputs.push(SolMandateOutput {
+						oracle: oracle_bytes.into(),
+						settler: settler_bytes.into(),
+						chainId: U256::from(asset_interop.ethereum_chain_id().unwrap_or(31338)),
+						token: token_bytes.into(),
+						amount,
+						recipient: recipient_bytes.into(),
+						call: Vec::new().into(),
+						context: Vec::new().into(),
+					});
+				}
+			}
+		}
+
+		// Create and encode the StandardOrder for compact format
+		let sol_order = StandardOrder {
+			user: user_address,
+			nonce,
+			originChainId: origin_chain_id,
+			expires,
+			fillDeadline: fill_deadline,
+			inputOracle: input_oracle,
+			inputs,
+			outputs: sol_outputs,
+		};
+
+		// ABI encode the StandardOrder
+		let encoded_order = StandardOrder::abi_encode(&sol_order);
+
+		// Create IntentRequest
+		let intent_request = serde_json::json!({
+			"order": format!("0x{}", hex::encode(&encoded_order)),
+			"sponsor": format!("{:#x}", user_address),
+			"signature": quote_with_sig.signature,
+			"lockType": quote_with_sig.quote.lock_type.clone()
+		});
+
+		Ok(intent_request)
+	}
+
+#[cfg(feature = "oif-interfaces")]
+fn try_from_escrow(
+	quote_with_sig: QuoteWithSignature<'_>,
+	user_address: alloy_primitives::Address,
+	eip712_data: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+		use crate::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
+		use crate::standards::eip7930::InteropAddress;
+		use alloy_primitives::{Address, U256};
+		use alloy_sol_types::SolType;
 
 		// Extract nonce
 		let nonce_str = eip712_data
@@ -471,8 +650,16 @@ impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
 			.and_then(|w| w.as_object())
 			.ok_or("Missing 'witness' object in EIP-712 message")?;
 
-		// Get origin chain ID
-		let origin_chain_id = U256::from(interop_address.ethereum_chain_id()?);
+		// Get origin chain ID from the first available input's interop address
+		let user_interop_str = &quote_with_sig
+			.quote
+			.details
+			.available_inputs
+			.first()
+			.ok_or("Quote must have at least one available input")?
+			.user;
+		let user_interop = InteropAddress::from_hex(&user_interop_str.to_string())?;
+		let origin_chain_id = U256::from(user_interop.ethereum_chain_id().unwrap_or(31337));
 
 		// Extract timing data
 		let expires = witness
@@ -590,7 +777,6 @@ impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
 		});
 
 		Ok(intent_request)
-	}
 }
 #[cfg(test)]
 mod tests {

@@ -383,6 +383,11 @@ impl OrderInterface for Eip7683OrderImpl {
 	) -> Result<Option<Transaction>, OrderError> {
 		// Only off-chain orders need preparation
 		if intent.source != "off-chain" {
+			tracing::debug!(
+				order_id = %order.id,
+				source = %intent.source,
+				"Skipping preparation: not an off-chain order"
+			);
 			return Ok(None);
 		}
 
@@ -390,8 +395,19 @@ impl OrderInterface for Eip7683OrderImpl {
 			serde_json::from_value(order.data.clone()).map_err(|e| {
 				OrderError::ValidationFailed(format!("Failed to parse order data: {}", e))
 			})?;
+		
+		tracing::debug!(
+			order_id = %order.id,
+			lock_type = ?order_data.lock_type,
+			"Checking lock type for preparation decision"
+		);
+		
 		// Skip prepare for Compact (resource lock) flows
 		if matches!(order_data.lock_type, Some(LockType::ResourceLock)) {
+			tracing::info!(
+				order_id = %order.id,
+				"Skipping preparation: ResourceLock order detected"
+			);
 			return Ok(None);
 		}
 
