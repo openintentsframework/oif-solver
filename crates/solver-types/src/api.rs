@@ -455,8 +455,10 @@ impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
 			.ok_or("Invalid EIP-712 message structure")?;
 
 		// Detect quote format: compact (flat message) vs escrow (nested eip712)
-		let is_compact = message_data.contains_key("inputs") && message_data.contains_key("outputs") 
-			&& message_data.contains_key("deadline") && message_data.contains_key("nonce");
+		let is_compact = message_data.contains_key("inputs")
+			&& message_data.contains_key("outputs")
+			&& message_data.contains_key("deadline")
+			&& message_data.contains_key("nonce");
 
 		if is_compact {
 			// Handle compact quote format
@@ -478,153 +480,153 @@ fn try_from_compact(
 	user_address: alloy_primitives::Address,
 	message_data: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-		use crate::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
-		use crate::standards::eip7930::InteropAddress;
-		use alloy_primitives::{Address, U256};
-		use alloy_sol_types::SolType;
+	use crate::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
+	use crate::standards::eip7930::InteropAddress;
+	use alloy_primitives::{Address, U256};
+	use alloy_sol_types::SolType;
 
-		// Extract nonce from compact message
-		let nonce_value = message_data
-			.get("nonce")
-			.ok_or("Missing nonce in compact message")?;
-		let nonce = match nonce_value {
-			serde_json::Value::String(s) => U256::from_str_radix(s, 10)?,
-			serde_json::Value::Number(n) => U256::from(n.as_u64().unwrap_or(0)),
-			_ => return Err("Invalid nonce format in compact message".into()),
-		};
+	// Extract nonce from compact message
+	let nonce_value = message_data
+		.get("nonce")
+		.ok_or("Missing nonce in compact message")?;
+	let nonce = match nonce_value {
+		serde_json::Value::String(s) => U256::from_str_radix(s, 10)?,
+		serde_json::Value::Number(n) => U256::from(n.as_u64().unwrap_or(0)),
+		_ => return Err("Invalid nonce format in compact message".into()),
+	};
 
-		// Extract deadline/expires from compact message  
-		let deadline_value = message_data
-			.get("deadline")
-			.ok_or("Missing deadline in compact message")?;
-		let expires = match deadline_value {
-			serde_json::Value::String(s) => s.parse::<u64>()?,
-			serde_json::Value::Number(n) => n.as_u64().unwrap_or(0),
-			_ => return Err("Invalid deadline format in compact message".into()),
-		} as u32;
-		let fill_deadline = expires;
+	// Extract deadline/expires from compact message
+	let deadline_value = message_data
+		.get("deadline")
+		.ok_or("Missing deadline in compact message")?;
+	let expires = match deadline_value {
+		serde_json::Value::String(s) => s.parse::<u64>()?,
+		serde_json::Value::Number(n) => n.as_u64().unwrap_or(0),
+		_ => return Err("Invalid deadline format in compact message".into()),
+	} as u32;
+	let fill_deadline = expires;
 
-		// For compact orders, use a valid input oracle address
-		// Get the input oracle from config or use the settlement oracle
-		let input_oracle = alloy_primitives::address!("dc64a140aa3e981100a9beca4e685f962f0cf6c9");
+	// For compact orders, use a valid input oracle address
+	// Get the input oracle from config or use the settlement oracle
+	let input_oracle = alloy_primitives::address!("dc64a140aa3e981100a9beca4e685f962f0cf6c9");
 
-		// Get origin chain ID from the first available input's interop address
-		let user_interop_str = &quote_with_sig
-			.quote
-			.details
-			.available_inputs
-			.first()
-			.ok_or("Quote must have at least one available input")?
-			.user;
-		let user_interop = InteropAddress::from_hex(&user_interop_str.to_string())?;
-		let origin_chain_id = U256::from(user_interop.ethereum_chain_id().unwrap_or(31337));
+	// Get origin chain ID from the first available input's interop address
+	let user_interop_str = &quote_with_sig
+		.quote
+		.details
+		.available_inputs
+		.first()
+		.ok_or("Quote must have at least one available input")?
+		.user;
+	let user_interop = InteropAddress::from_hex(&user_interop_str.to_string())?;
+	let origin_chain_id = U256::from(user_interop.ethereum_chain_id().unwrap_or(31337));
 
-		// Extract input data from compact message
-		let inputs_array = message_data
-			.get("inputs")
-			.and_then(|i| i.as_array())
-			.ok_or("Missing inputs array in compact message")?;
-		let first_input = inputs_array
-			.first()
-			.ok_or("Empty inputs array in compact message")?;
+	// Extract input data from compact message
+	let inputs_array = message_data
+		.get("inputs")
+		.and_then(|i| i.as_array())
+		.ok_or("Missing inputs array in compact message")?;
+	let first_input = inputs_array
+		.first()
+		.ok_or("Empty inputs array in compact message")?;
 
-		let input_amount_str = first_input
-			.get("amount")
-			.and_then(|a| a.as_str())
-			.ok_or("Missing amount in compact input")?;
-		let input_amount = U256::from_str_radix(input_amount_str, 10)?;
+	let input_amount_str = first_input
+		.get("amount")
+		.and_then(|a| a.as_str())
+		.ok_or("Missing amount in compact input")?;
+	let input_amount = U256::from_str_radix(input_amount_str, 10)?;
 
-		let input_asset_str = first_input
-			.get("asset")
-			.and_then(|t| t.as_str())
-			.ok_or("Missing asset in compact input")?;
-		let input_interop = InteropAddress::from_hex(input_asset_str)?;
-		let input_token = input_interop.ethereum_address()?;
+	let input_asset_str = first_input
+		.get("asset")
+		.and_then(|t| t.as_str())
+		.ok_or("Missing asset in compact input")?;
+	let input_interop = InteropAddress::from_hex(input_asset_str)?;
+	let input_token = input_interop.ethereum_address()?;
 
-		// Convert input token address to U256
-		let mut token_bytes = [0u8; 32];
-		token_bytes[12..32].copy_from_slice(&input_token.0 .0);
-		let input_token_u256 = U256::from_be_bytes(token_bytes);
-		let inputs = vec![[input_token_u256, input_amount]];
+	// Convert input token address to U256
+	let mut token_bytes = [0u8; 32];
+	token_bytes[12..32].copy_from_slice(&input_token.0 .0);
+	let input_token_u256 = U256::from_be_bytes(token_bytes);
+	let inputs = vec![[input_token_u256, input_amount]];
 
-		// Extract outputs from compact message
-		let outputs_array = message_data
-			.get("outputs")
-			.and_then(|o| o.as_array())
-			.ok_or("Missing outputs array in compact message")?;
+	// Extract outputs from compact message
+	let outputs_array = message_data
+		.get("outputs")
+		.and_then(|o| o.as_array())
+		.ok_or("Missing outputs array in compact message")?;
 
-		let mut sol_outputs = Vec::new();
-		for output_item in outputs_array {
-			if let Some(output_obj) = output_item.as_object() {
-				let amount_str = output_obj
-					.get("amount")
-					.and_then(|a| a.as_str())
-					.unwrap_or("0");
-				let asset_str = output_obj
-					.get("asset")
-					.and_then(|a| a.as_str())
-					.ok_or("Missing asset in compact output")?;
-				let receiver_str = output_obj
-					.get("receiver")
-					.and_then(|r| r.as_str())
-					.ok_or("Missing receiver in compact output")?;
+	let mut sol_outputs = Vec::new();
+	for output_item in outputs_array {
+		if let Some(output_obj) = output_item.as_object() {
+			let amount_str = output_obj
+				.get("amount")
+				.and_then(|a| a.as_str())
+				.unwrap_or("0");
+			let asset_str = output_obj
+				.get("asset")
+				.and_then(|a| a.as_str())
+				.ok_or("Missing asset in compact output")?;
+			let receiver_str = output_obj
+				.get("receiver")
+				.and_then(|r| r.as_str())
+				.ok_or("Missing receiver in compact output")?;
 
-				if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
-					// Parse interop addresses
-					let asset_interop = InteropAddress::from_hex(asset_str)?;
-					let receiver_interop = InteropAddress::from_hex(receiver_str)?;
-					let asset_address = asset_interop.ethereum_address()?;
-					let receiver_address = receiver_interop.ethereum_address()?;
+			if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
+				// Parse interop addresses
+				let asset_interop = InteropAddress::from_hex(asset_str)?;
+				let receiver_interop = InteropAddress::from_hex(receiver_str)?;
+				let asset_address = asset_interop.ethereum_address()?;
+				let receiver_address = receiver_interop.ethereum_address()?;
 
-					// Convert addresses to bytes32
-					let mut token_bytes = [0u8; 32];
-					token_bytes[12..32].copy_from_slice(&asset_address.0 .0);
-					let mut recipient_bytes = [0u8; 32];
-					recipient_bytes[12..32].copy_from_slice(&receiver_address.0 .0);
+				// Convert addresses to bytes32
+				let mut token_bytes = [0u8; 32];
+				token_bytes[12..32].copy_from_slice(&asset_address.0 .0);
+				let mut recipient_bytes = [0u8; 32];
+				recipient_bytes[12..32].copy_from_slice(&receiver_address.0 .0);
 
-					// For compact orders, use simplified oracle/settler (zero addresses)
-					let oracle_bytes = [0u8; 32];
-					let settler_bytes = [0u8; 32];
+				// For compact orders, use simplified oracle/settler (zero addresses)
+				let oracle_bytes = [0u8; 32];
+				let settler_bytes = [0u8; 32];
 
-					sol_outputs.push(SolMandateOutput {
-						oracle: oracle_bytes.into(),
-						settler: settler_bytes.into(),
-						chainId: U256::from(asset_interop.ethereum_chain_id().unwrap_or(31338)),
-						token: token_bytes.into(),
-						amount,
-						recipient: recipient_bytes.into(),
-						call: Vec::new().into(),
-						context: Vec::new().into(),
-					});
-				}
+				sol_outputs.push(SolMandateOutput {
+					oracle: oracle_bytes.into(),
+					settler: settler_bytes.into(),
+					chainId: U256::from(asset_interop.ethereum_chain_id().unwrap_or(31338)),
+					token: token_bytes.into(),
+					amount,
+					recipient: recipient_bytes.into(),
+					call: Vec::new().into(),
+					context: Vec::new().into(),
+				});
 			}
 		}
-
-		// Create and encode the StandardOrder for compact format
-		let sol_order = StandardOrder {
-			user: user_address,
-			nonce,
-			originChainId: origin_chain_id,
-			expires,
-			fillDeadline: fill_deadline,
-			inputOracle: input_oracle,
-			inputs,
-			outputs: sol_outputs,
-		};
-
-		// ABI encode the StandardOrder
-		let encoded_order = StandardOrder::abi_encode(&sol_order);
-
-		// Create IntentRequest
-		let intent_request = serde_json::json!({
-			"order": format!("0x{}", hex::encode(&encoded_order)),
-			"sponsor": format!("{:#x}", user_address),
-			"signature": quote_with_sig.signature,
-			"lockType": quote_with_sig.quote.lock_type.clone()
-		});
-
-		Ok(intent_request)
 	}
+
+	// Create and encode the StandardOrder for compact format
+	let sol_order = StandardOrder {
+		user: user_address,
+		nonce,
+		originChainId: origin_chain_id,
+		expires,
+		fillDeadline: fill_deadline,
+		inputOracle: input_oracle,
+		inputs,
+		outputs: sol_outputs,
+	};
+
+	// ABI encode the StandardOrder
+	let encoded_order = StandardOrder::abi_encode(&sol_order);
+
+	// Create IntentRequest
+	let intent_request = serde_json::json!({
+		"order": format!("0x{}", hex::encode(&encoded_order)),
+		"sponsor": format!("{:#x}", user_address),
+		"signature": quote_with_sig.signature,
+		"lockType": quote_with_sig.quote.lock_type.clone()
+	});
+
+	Ok(intent_request)
+}
 
 #[cfg(feature = "oif-interfaces")]
 fn try_from_escrow(
@@ -632,151 +634,149 @@ fn try_from_escrow(
 	user_address: alloy_primitives::Address,
 	eip712_data: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-		use crate::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
-		use crate::standards::eip7930::InteropAddress;
-		use alloy_primitives::{Address, U256};
-		use alloy_sol_types::SolType;
+	use crate::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
+	use crate::standards::eip7930::InteropAddress;
+	use alloy_primitives::{Address, U256};
+	use alloy_sol_types::SolType;
 
-		// Extract nonce
-		let nonce_str = eip712_data
-			.get("nonce")
-			.and_then(|n| n.as_str())
-			.ok_or("Missing nonce in EIP-712 data")?;
-		let nonce = U256::from_str_radix(nonce_str, 10)?;
+	// Extract nonce
+	let nonce_str = eip712_data
+		.get("nonce")
+		.and_then(|n| n.as_str())
+		.ok_or("Missing nonce in EIP-712 data")?;
+	let nonce = U256::from_str_radix(nonce_str, 10)?;
 
-		// Extract witness data
-		let witness = eip712_data
-			.get("witness")
-			.and_then(|w| w.as_object())
-			.ok_or("Missing 'witness' object in EIP-712 message")?;
+	// Extract witness data
+	let witness = eip712_data
+		.get("witness")
+		.and_then(|w| w.as_object())
+		.ok_or("Missing 'witness' object in EIP-712 message")?;
 
-		// Get origin chain ID from the first available input's interop address
-		let user_interop_str = &quote_with_sig
-			.quote
-			.details
-			.available_inputs
-			.first()
-			.ok_or("Quote must have at least one available input")?
-			.user;
-		let user_interop = InteropAddress::from_hex(&user_interop_str.to_string())?;
-		let origin_chain_id = U256::from(user_interop.ethereum_chain_id().unwrap_or(31337));
+	// Get origin chain ID from the first available input's interop address
+	let user_interop_str = &quote_with_sig
+		.quote
+		.details
+		.available_inputs
+		.first()
+		.ok_or("Quote must have at least one available input")?
+		.user;
+	let user_interop = InteropAddress::from_hex(&user_interop_str.to_string())?;
+	let origin_chain_id = U256::from(user_interop.ethereum_chain_id().unwrap_or(31337));
 
-		// Extract timing data
-		let expires = witness
-			.get("expires")
-			.and_then(|e| e.as_u64())
-			.unwrap_or(quote_with_sig.quote.valid_until.unwrap_or(0)) as u32;
-		let fill_deadline = expires;
+	// Extract timing data
+	let expires = witness
+		.get("expires")
+		.and_then(|e| e.as_u64())
+		.unwrap_or(quote_with_sig.quote.valid_until.unwrap_or(0)) as u32;
+	let fill_deadline = expires;
 
-		// Extract input oracle
-		let input_oracle_str = witness
-			.get("inputOracle")
-			.and_then(|o| o.as_str())
-			.ok_or("Missing 'inputOracle' in witness data")?;
-		let input_oracle =
-			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
+	// Extract input oracle
+	let input_oracle_str = witness
+		.get("inputOracle")
+		.and_then(|o| o.as_str())
+		.ok_or("Missing 'inputOracle' in witness data")?;
+	let input_oracle =
+		Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
 
-		// Extract input data from permitted array
-		let permitted = eip712_data
-			.get("permitted")
-			.and_then(|p| p.as_array())
-			.ok_or("Missing permitted array in EIP-712 data")?;
-		let first_permitted = permitted
-			.first()
-			.ok_or("Empty permitted array in EIP-712 data")?;
+	// Extract input data from permitted array
+	let permitted = eip712_data
+		.get("permitted")
+		.and_then(|p| p.as_array())
+		.ok_or("Missing permitted array in EIP-712 data")?;
+	let first_permitted = permitted
+		.first()
+		.ok_or("Empty permitted array in EIP-712 data")?;
 
-		let input_amount_str = first_permitted
-			.get("amount")
-			.and_then(|a| a.as_str())
-			.ok_or("Missing amount in permitted token")?;
-		let input_amount = U256::from_str_radix(input_amount_str, 10)?;
+	let input_amount_str = first_permitted
+		.get("amount")
+		.and_then(|a| a.as_str())
+		.ok_or("Missing amount in permitted token")?;
+	let input_amount = U256::from_str_radix(input_amount_str, 10)?;
 
-		let input_token_str = first_permitted
-			.get("token")
-			.and_then(|t| t.as_str())
-			.ok_or("Missing token in permitted array")?;
-		let input_token =
-			Address::from_slice(&hex::decode(input_token_str.trim_start_matches("0x"))?);
+	let input_token_str = first_permitted
+		.get("token")
+		.and_then(|t| t.as_str())
+		.ok_or("Missing token in permitted array")?;
+	let input_token = Address::from_slice(&hex::decode(input_token_str.trim_start_matches("0x"))?);
 
-		// Convert input token address to U256
-		let mut token_bytes = [0u8; 32];
-		token_bytes[12..32].copy_from_slice(&input_token.0 .0);
-		let input_token_u256 = U256::from_be_bytes(token_bytes);
-		let inputs = vec![[input_token_u256, input_amount]];
+	// Convert input token address to U256
+	let mut token_bytes = [0u8; 32];
+	token_bytes[12..32].copy_from_slice(&input_token.0 .0);
+	let input_token_u256 = U256::from_be_bytes(token_bytes);
+	let inputs = vec![[input_token_u256, input_amount]];
 
-		// Extract outputs from witness
-		let default_outputs = Vec::new();
-		let witness_outputs = witness
-			.get("outputs")
-			.and_then(|o| o.as_array())
-			.unwrap_or(&default_outputs);
+	// Extract outputs from witness
+	let default_outputs = Vec::new();
+	let witness_outputs = witness
+		.get("outputs")
+		.and_then(|o| o.as_array())
+		.unwrap_or(&default_outputs);
 
-		// Parse outputs with proper helper function for hex parsing
+	// Parse outputs with proper helper function for hex parsing
 
-		let mut sol_outputs = Vec::new();
-		for output_item in witness_outputs {
-			if let Some(output_obj) = output_item.as_object() {
-				let chain_id = output_obj
-					.get("chainId")
-					.and_then(|c| c.as_u64())
-					.unwrap_or(0);
-				let amount_str = output_obj
-					.get("amount")
-					.and_then(|a| a.as_str())
-					.unwrap_or("0");
-				let token_str = output_obj.get("token").and_then(|t| t.as_str()).unwrap();
-				let recipient_str = output_obj
-					.get("recipient")
-					.and_then(|r| r.as_str())
-					.unwrap();
-				let oracle_str = output_obj.get("oracle").and_then(|o| o.as_str()).unwrap();
-				let settler_str = output_obj.get("settler").and_then(|s| s.as_str()).unwrap();
+	let mut sol_outputs = Vec::new();
+	for output_item in witness_outputs {
+		if let Some(output_obj) = output_item.as_object() {
+			let chain_id = output_obj
+				.get("chainId")
+				.and_then(|c| c.as_u64())
+				.unwrap_or(0);
+			let amount_str = output_obj
+				.get("amount")
+				.and_then(|a| a.as_str())
+				.unwrap_or("0");
+			let token_str = output_obj.get("token").and_then(|t| t.as_str()).unwrap();
+			let recipient_str = output_obj
+				.get("recipient")
+				.and_then(|r| r.as_str())
+				.unwrap();
+			let oracle_str = output_obj.get("oracle").and_then(|o| o.as_str()).unwrap();
+			let settler_str = output_obj.get("settler").and_then(|s| s.as_str()).unwrap();
 
-				if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
-					let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
-					let recipient_bytes =
-						parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
-					let oracle_bytes = parse_bytes32_from_hex(oracle_str).unwrap_or([0u8; 32]);
-					let settler_bytes = parse_bytes32_from_hex(settler_str).unwrap_or([0u8; 32]);
+			if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
+				let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
+				let recipient_bytes = parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
+				let oracle_bytes = parse_bytes32_from_hex(oracle_str).unwrap_or([0u8; 32]);
+				let settler_bytes = parse_bytes32_from_hex(settler_str).unwrap_or([0u8; 32]);
 
-					sol_outputs.push(SolMandateOutput {
-						oracle: oracle_bytes.into(),
-						settler: settler_bytes.into(),
-						chainId: U256::from(chain_id),
-						token: token_bytes.into(),
-						amount,
-						recipient: recipient_bytes.into(),
-						call: Vec::new().into(),
-						context: Vec::new().into(),
-					});
-				}
+				sol_outputs.push(SolMandateOutput {
+					oracle: oracle_bytes.into(),
+					settler: settler_bytes.into(),
+					chainId: U256::from(chain_id),
+					token: token_bytes.into(),
+					amount,
+					recipient: recipient_bytes.into(),
+					call: Vec::new().into(),
+					context: Vec::new().into(),
+				});
 			}
 		}
+	}
 
-		// Create and encode the StandardOrder
-		let sol_order = StandardOrder {
-			user: user_address,
-			nonce,
-			originChainId: origin_chain_id,
-			expires,
-			fillDeadline: fill_deadline,
-			inputOracle: input_oracle,
-			inputs,
-			outputs: sol_outputs,
-		};
+	// Create and encode the StandardOrder
+	let sol_order = StandardOrder {
+		user: user_address,
+		nonce,
+		originChainId: origin_chain_id,
+		expires,
+		fillDeadline: fill_deadline,
+		inputOracle: input_oracle,
+		inputs,
+		outputs: sol_outputs,
+	};
 
-		// ABI encode the StandardOrder
-		let encoded_order = StandardOrder::abi_encode(&sol_order);
+	// ABI encode the StandardOrder
+	let encoded_order = StandardOrder::abi_encode(&sol_order);
 
-		// Create IntentRequest
-		let intent_request = serde_json::json!({
-			"order": format!("0x{}", hex::encode(&encoded_order)),
-			"sponsor": format!("{:#x}", user_address),
-			"signature": quote_with_sig.signature,
-			"lockType": quote_with_sig.quote.lock_type.clone()
-		});
+	// Create IntentRequest
+	let intent_request = serde_json::json!({
+		"order": format!("0x{}", hex::encode(&encoded_order)),
+		"sponsor": format!("{:#x}", user_address),
+		"signature": quote_with_sig.signature,
+		"lockType": quote_with_sig.quote.lock_type.clone()
+	});
 
-		Ok(intent_request)
+	Ok(intent_request)
 }
 #[cfg(test)]
 mod tests {

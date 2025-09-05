@@ -214,7 +214,7 @@ where
 	use serde::de::Error;
 	let v = serde_json::Value::deserialize(deserializer)?;
 	tracing::debug!("Deserializing lock_type from JSON value: {:?}", v);
-	
+
 	let result = match v {
 		serde_json::Value::Number(n) => {
 			let num = n
@@ -246,7 +246,7 @@ where
 			"expected number, string, or null for LockType",
 		)),
 	};
-	
+
 	tracing::debug!("Deserialized lock_type result: {:?}", result);
 	result
 }
@@ -596,7 +596,7 @@ impl Eip7683OffchainDiscovery {
 			lock_type = ?lock_type,
 			"Creating intent with lock_type"
 		);
-		
+
 		let order_data = Eip7683OrderData {
 			user: with_0x_prefix(&hex::encode(order.user)),
 			nonce: order.nonce,
