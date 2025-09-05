@@ -52,8 +52,9 @@ graph TB
 
         subgraph "External Files"
             NetworksToml[networks.toml<br/>Chain Definitions]
-            AccountsToml[accounts.toml<br/>Key Configuration]
+            CLIToml[cli.toml<br/>CLI Settings]
             APIToml[api.toml<br/>Server Settings]
+            GasToml[gas.toml<br/>Gas Configuration]
         end
     end
 

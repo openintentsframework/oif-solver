@@ -369,15 +369,12 @@ Contains configuration examples and templates:
 ```
 config/
 ├── example.toml                # Complete single-file example
-├── demo.toml                  # Generated demo configuration
-└── demo/                      # Modular demo configuration
-    ├── main.toml              # Main configuration with includes
-    ├── networks.toml          # Network definitions
+├── demo.toml                  # Main demo configuration with includes
+└── demo/                      # Modular demo configuration files
+    ├── networks.toml          # Network definitions and tokens
     ├── api.toml               # API server settings
-    ├── storage.toml           # Storage configuration
-    ├── accounts.toml          # Account management
-    ├── discovery.toml         # Discovery sources
-    └── delivery.toml          # Delivery settings
+    ├── cli.toml               # CLI-specific configuration
+    └── gas.toml               # Gas pricing settings
 ```
 
 ## API Specifications

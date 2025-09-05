@@ -9,18 +9,16 @@ The OIF Solver uses TOML configuration files with support for modular configurat
 Split your configuration into multiple files for better organization and maintainability:
 
 ```toml
-# config/main.toml - Main configuration file
+# config/demo.toml - Main configuration file
 include = [
-    "networks.toml",  # Network and token configurations
-    "api.toml",       # API server settings
-    "storage.toml",   # Storage backend configuration
-    "accounts.toml",  # Account management
-    "discovery.toml", # Intent discovery sources
-    "delivery.toml",  # Transaction delivery settings
+    "demo/networks.toml",  # Network and token configurations
+    "demo/api.toml",       # API server settings
+    "demo/cli.toml",       # CLI-specific settings
+    "demo/gas.toml",       # Gas pricing configuration
 ]
 
 [solver]
-id = "oif-solver-production"
+id = "oif-solver-demo"
 monitoring_timeout_minutes = 5
 ```
 
