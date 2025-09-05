@@ -384,38 +384,6 @@ Demo processes create log files for debugging:
 - `destination_anvil.log` - Destination chain logs
 - Process ID files: `*.pid`
 
-## Advanced Usage
-
-### Custom Token Amounts
-
-Modify the demo scripts to test different amounts:
-
-```bash
-# Edit the demo script to change default amounts
-vim oif-demo  # Look for AMOUNT variables
-```
-
-### Different Network IDs
-
-Test with custom network configurations:
-
-```bash
-# Modify the demo configuration
-vim config/demo.toml
-```
-
-### Performance Testing
-
-Test multiple concurrent intents:
-
-```bash
-# Run multiple quote tests in parallel
-for i in {1..5}; do
-  ./oif-demo quote test escrow permit2 A2B &
-done
-wait
-```
-
 ## Next Steps
 
 - Learn about production configuration in [Configuration Guide](configuration.md)
