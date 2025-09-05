@@ -70,6 +70,27 @@ pub fn bytes20_to_alloy_address(bytes: &[u8]) -> Result<AlloyAddress, String> {
 	Ok(AlloyAddress::from(arr))
 }
 
+/// Parse a hex string to a 32-byte array.
+///
+/// This function parses a hex string (with or without "0x" prefix) into
+/// a 32-byte array, commonly used for bytes32 values in Ethereum.
+///
+/// # Arguments
+/// * `hex_str` - A hex string representing a 32-byte value (64 hex characters)
+///
+/// # Returns
+/// * `Ok([u8; 32])` if the string is a valid 32-byte hex string
+/// * `Err(Box<dyn std::error::Error>)` with error description if parsing fails
+pub fn parse_bytes32_from_hex(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+	let hex_clean = hex_str.trim_start_matches("0x");
+	if hex_clean.len() != 64 {
+		return Err("Hex string must be exactly 64 characters (32 bytes)".into());
+	}
+	let mut bytes = [0u8; 32];
+	hex::decode_to_slice(hex_clean, &mut bytes)?;
+	Ok(bytes)
+}
+
 /// Parse a hex string address to solver Address type.
 ///
 /// This function parses a hex string (with or without "0x" prefix) into
@@ -342,6 +363,51 @@ mod tests {
 
 		// Test invalid input
 		let result = eth_string_to_wei("invalid");
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_parse_bytes32_from_hex() {
+		// Test with 0x prefix
+		let hex_str = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+		let result = parse_bytes32_from_hex(hex_str).unwrap();
+		let expected = [
+			0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab,
+			0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78,
+			0x90, 0xab, 0xcd, 0xef,
+		];
+		assert_eq!(result, expected);
+
+		// Test without 0x prefix
+		let hex_str = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+		let result = parse_bytes32_from_hex(hex_str).unwrap();
+		assert_eq!(result, expected);
+
+		// Test all zeros
+		let hex_str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+		let result = parse_bytes32_from_hex(hex_str).unwrap();
+		assert_eq!(result, [0u8; 32]);
+
+		// Test all ones
+		let hex_str = "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+		let result = parse_bytes32_from_hex(hex_str).unwrap();
+		assert_eq!(result, [0xff; 32]);
+
+		// Test invalid length (too short)
+		let hex_str = "0x1234567890abcdef";
+		let result = parse_bytes32_from_hex(hex_str);
+		assert!(result.is_err());
+		assert!(result.unwrap_err().to_string().contains("64 characters"));
+
+		// Test invalid length (too long)
+		let hex_str = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12";
+		let result = parse_bytes32_from_hex(hex_str);
+		assert!(result.is_err());
+		assert!(result.unwrap_err().to_string().contains("64 characters"));
+
+		// Test invalid hex characters
+		let hex_str = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdeg";
+		let result = parse_bytes32_from_hex(hex_str);
 		assert!(result.is_err());
 	}
 

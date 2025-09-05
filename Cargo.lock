@@ -3577,12 +3577,14 @@ name = "solver-service"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "alloy-sol-types",
  "async-trait",
  "axum",
  "chrono",
  "clap",
  "env_logger",
  "futures",
+ "hex",
  "jsonwebtoken",
  "mockall",
  "once_cell",
@@ -3639,10 +3641,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "fs2",
+ "futures",
  "mockall",
  "serde",
  "serde_json",
  "solver-types",
+ "tempfile",
  "thiserror 2.0.16",
  "tokio",
  "toml",
@@ -3653,8 +3657,10 @@ dependencies = [
 name = "solver-types"
 version = "0.1.0"
 dependencies = [
+ "alloy-contract",
  "alloy-primitives",
  "alloy-rpc-types",
+ "alloy-sol-types",
  "async-trait",
  "axum",
  "bytes",
