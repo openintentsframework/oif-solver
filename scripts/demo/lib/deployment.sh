@@ -1161,6 +1161,7 @@ primary = "simple"
 
 [order.strategy.implementations.simple]
 max_gas_price_gwei = 100
+max_execution_cost_gwei = 60000000000 # Maximum gwei value total execution cost
 
 # ============================================================================
 # PRICING
