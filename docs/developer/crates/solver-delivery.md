@@ -2,7 +2,7 @@
 
 ## Purpose & Scope
 
-The `solver-delivery` crate manages reliable transaction submission and monitoring across multiple blockchain networks. It handles gas optimization, confirmation tracking, retry logic, and provides a unified interface for multi-chain transaction delivery regardless of the underlying blockchain implementation.
+The `solver-delivery` crate manages reliable transaction submission and monitoring across multiple blockchain networks. It handles gas optimization, confirmation tracking, and provides a unified interface for multi-chain transaction delivery regardless of the underlying blockchain implementation.
 
 ## Internal Architecture
 
@@ -29,7 +29,6 @@ graph TB
     AlloyImpl --> TxSubmission
     AlloyImpl --> ConfirmationMonitor
     AlloyImpl --> GasOptimization
-    AlloyImpl --> RetryLogic
     AlloyImpl --> StateTracking
 ```
 
@@ -60,10 +59,8 @@ sequenceDiagram
         else Sufficient Confirmations
             Monitor->>Core: Transaction Confirmed Event
         else Transaction Failed
-            Monitor->>Delivery: Retry Transaction
             Delivery->>GasEst: Re-estimate Gas
             GasEst->>Delivery: Updated Gas Parameters
-            Delivery->>Blockchain: Broadcast Retry
         end
     end
 ```
@@ -93,4 +90,4 @@ sequenceDiagram
 3. Add network-specific gas estimation and confirmation logic
 4. Handle network-specific transaction formats and requirements
 
-The solver-delivery crate provides robust, multi-chain transaction delivery with sophisticated gas management and retry mechanisms while maintaining flexibility for different blockchain networks and use cases.
+The solver-delivery crate provides robust, multi-chain transaction delivery with sophisticated gas management.
