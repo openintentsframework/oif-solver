@@ -6,7 +6,7 @@
 //! ## Address Format
 //!
 //! An ERC-7930 interoperable address has the following structure:
-//! ```
+//! ```text
 //! 0x00010000010114D8DA6BF26964AF9D7EED9E03E53415D37AA96045
 //!   ^^^^-------------------------------------------------- Version:              decimal 1
 //!       ^^^^---------------------------------------------- ChainType:            2 bytes of CAIP namespace

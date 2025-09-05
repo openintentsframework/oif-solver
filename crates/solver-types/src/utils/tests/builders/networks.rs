@@ -14,7 +14,7 @@ use std::collections::HashMap;
 ///
 /// # Examples
 ///
-/// ```
+/// ```text
 /// use solver_types::utils::builders::TokenConfigBuilder;
 /// use solver_types::Address;
 ///
@@ -123,7 +123,7 @@ impl TokenConfigBuilder {
 ///
 /// # Examples
 ///
-/// ```
+/// ```text
 /// use solver_types::utils::builders::NetworkConfigBuilder;
 /// use solver_types::networks::RpcEndpoint;
 ///
@@ -323,7 +323,7 @@ impl NetworkConfigBuilder {
 ///
 /// # Examples
 ///
-/// ```
+/// ```text
 /// use solver_types::utils::builders::{NetworksConfigBuilder, NetworkConfigBuilder};
 /// use solver_types::networks::RpcEndpoint;
 ///
