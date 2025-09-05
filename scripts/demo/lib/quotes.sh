@@ -358,11 +358,24 @@ show_quote_summary() {
     echo ""
     print_info "Trade details:"
     
-    # Parse first order for trade details
-    local input_token=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.eip712.permitted[0].token // "N/A"')
-    local input_amount=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.eip712.permitted[0].amount // "N/A"')
-    local output_token=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.eip712.witness.outputs[0].token // "N/A"')
-    local output_amount=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.eip712.witness.outputs[0].amount // "N/A"')
+    # Parse first order for trade details - handle both compact and escrow formats
+    local input_token output_amount input_amount output_token
+    
+    # Check if this is a compact order (flat message structure)
+    local has_compact_fields=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message | has("inputs") and has("outputs")' 2>/dev/null)
+    if [ "$has_compact_fields" = "true" ]; then
+        # Compact order format
+        input_token=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.inputs[0].asset // "N/A"')
+        input_amount=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.inputs[0].amount // "N/A"')
+        output_token=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.outputs[0].asset // "N/A"')
+        output_amount=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.outputs[0].amount // "N/A"')
+    else
+        # Escrow order format (original logic)
+        input_token=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.eip712.permitted[0].token // "N/A"')
+        input_amount=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.eip712.permitted[0].amount // "N/A"')
+        output_token=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.eip712.witness.outputs[0].token // "N/A"')
+        output_amount=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.eip712.witness.outputs[0].amount // "N/A"')
+    fi
     
     if [ "$input_amount" != "N/A" ]; then
         local input_formatted=$(format_balance "$input_amount")
@@ -742,58 +755,128 @@ quote_accept() {
         fi
         print_debug "User key found, extracting EIP-712 message..."
         
-        # Extract EIP-712 message for signing
+        # Extract EIP-712 message for signing - handle both compact and escrow formats
         local eip712_message=$(echo "$order_data" | jq -r '.message.eip712 // empty')
+        local is_compact=false
+        
+        # If no nested eip712, check if this is a compact order (flat message structure)
         if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ]; then
-            print_error "No EIP-712 message found in order"
-            return 1
+            # Check if message has compact fields (inputs, outputs, deadline, etc.)
+            local has_compact_fields=$(echo "$order_data" | jq -r '.message | has("inputs") and has("outputs") and has("deadline")' 2>/dev/null)
+            if [ "$has_compact_fields" = "true" ]; then
+                # This is a compact order with flat message structure
+                eip712_message=$(echo "$order_data" | jq -c '.message')
+                is_compact=true
+                print_debug "Detected compact order format"
+            else
+                print_error "No EIP-712 message found in order"
+                return 1
+            fi
+        else
+            print_debug "Detected escrow order format"
         fi
         
         print_info "Signing EIP-712 order..."
         
-        # Extract witness data first (needed for signing)
-        local witness=$(echo "$eip712_message" | jq -r '.witness // empty')
-        local witness_expires=$(echo "$witness" | jq -r '.expires // 0')
-        local input_oracle=$(echo "$witness" | jq -r '.inputOracle // "0x0000000000000000000000000000000000000000"')
+        local signature=""
         
-        # Sign the EIP-712 message
-        local domain=$(echo "$eip712_message" | jq -r '.signing.domain // empty')
-        local primary_type=$(echo "$eip712_message" | jq -r '.signing.primaryType // "PermitBatchWitnessTransferFrom"')
-        local deadline=$(echo "$eip712_message" | jq -r '.deadline // empty')
-        local nonce=$(echo "$eip712_message" | jq -r '.nonce // empty')
-        local spender=$(echo "$eip712_message" | jq -r '.spender // empty')
-        
-        # Extract the required fields for Permit2 signing
-        local permitted_token=$(echo "$eip712_message" | jq -r '.permitted[0].token // empty')
-        local permitted_amount=$(echo "$eip712_message" | jq -r '.permitted[0].amount // empty')
-        
-        # Convert interop address to standard Ethereum address if needed for signing
-        local standard_permitted_token="$permitted_token"
-        # Interop addresses are longer than standard addresses (42 chars)
-        if [[ ${#permitted_token} -gt 42 ]]; then
-            # This is likely an interop address, convert to standard
-            standard_permitted_token=$(from_uii_address "$permitted_token")
-            print_debug "Converted permitted token from interop to standard: $permitted_token -> $standard_permitted_token"
+        if [ "$is_compact" = "true" ]; then
+            # Handle compact order signing
+            print_debug "Using compact signing for BatchCompact order"
+            
+            # Extract compact order fields
+            local deadline=$(echo "$eip712_message" | jq -r '.deadline')
+            local nonce=$(echo "$eip712_message" | jq -r '.nonce')
+            local user=$(echo "$eip712_message" | jq -r '.user')
+            
+            # Extract input information
+            local input_asset=$(echo "$eip712_message" | jq -r '.inputs[0].asset')
+            local input_amount=$(echo "$eip712_message" | jq -r '.inputs[0].amount')
+            local lock_params=$(echo "$eip712_message" | jq -c '.inputs[0].lock.params')
+            local token_id=$(echo "$lock_params" | jq -r '.tokenId')
+            local lock_tag=$(echo "$lock_params" | jq -r '.lockTag')
+            
+            # Convert interop addresses to standard addresses
+            local standard_user=$(from_uii_address "$user")
+            local standard_input_asset=$(from_uii_address "$input_asset")
+            
+            # Extract domain and primary type from order data
+            local domain=$(echo "$order_data" | jq -r '.domain')
+            local primary_type=$(echo "$order_data" | jq -r '.primaryType // "BatchCompact"')
+            
+            # Get chain ID from domain
+            local origin_chain_id=$(echo "$domain" | jq -r '.chainId // 31337')
+            
+            # Get contract addresses from config
+            local compact_address=$(config_get_network "$origin_chain_id" "the_compact_address")
+            local input_settler_compact=$(config_get_network "$origin_chain_id" "input_settler_compact_address")
+            
+            # Compute witness hash (simplified for now)
+            local witness_hash="0x0000000000000000000000000000000000000000000000000000000000000000"
+            
+            # Sign using compact signing function
+            signature=$(sign_compact_order \
+                "$user_key" \
+                "$compact_address" \
+                "$origin_chain_id" \
+                "$standard_input_asset" \
+                "$lock_tag" \
+                "$input_amount" \
+                "$nonce" \
+                "$deadline" \
+                "$standard_user" \
+                "$input_settler_compact" \
+                "$deadline" \
+                "0x0000000000000000000000000000000000000000" \
+                "$witness_hash")
+        else
+            # Handle escrow order signing (existing permit2 logic)
+            print_debug "Using escrow signing for PermitBatchWitnessTransferFrom order"
+            
+            # Extract witness data first (needed for signing)
+            local witness=$(echo "$eip712_message" | jq -r '.witness // empty')
+            local witness_expires=$(echo "$witness" | jq -r '.expires // 0')
+            local input_oracle=$(echo "$witness" | jq -r '.inputOracle // "0x0000000000000000000000000000000000000000"')
+            
+            # Sign the EIP-712 message
+            local domain=$(echo "$eip712_message" | jq -r '.signing.domain // empty')
+            local primary_type=$(echo "$eip712_message" | jq -r '.signing.primaryType // "PermitBatchWitnessTransferFrom"')
+            local deadline=$(echo "$eip712_message" | jq -r '.deadline // empty')
+            local nonce=$(echo "$eip712_message" | jq -r '.nonce // empty')
+            local spender=$(echo "$eip712_message" | jq -r '.spender // empty')
+            
+            # Extract the required fields for Permit2 signing
+            local permitted_token=$(echo "$eip712_message" | jq -r '.permitted[0].token // empty')
+            local permitted_amount=$(echo "$eip712_message" | jq -r '.permitted[0].amount // empty')
+            
+            # Convert interop address to standard Ethereum address if needed for signing
+            local standard_permitted_token="$permitted_token"
+            # Interop addresses are longer than standard addresses (42 chars)
+            if [[ ${#permitted_token} -gt 42 ]]; then
+                # This is likely an interop address, convert to standard
+                standard_permitted_token=$(from_uii_address "$permitted_token")
+                print_debug "Converted permitted token from interop to standard: $permitted_token -> $standard_permitted_token"
+            fi
+            
+            # Get origin chain ID from the domain
+            local origin_chain_id=$(echo "$domain" | jq -r '.chainId // 31337')
+            
+            # Build mandate outputs array from witness outputs
+            local mandate_outputs_json=$(echo "$witness" | jq -c '.outputs')
+            
+            # Use the sign_standard_intent function which handles Permit2 properly
+            signature=$(sign_standard_intent \
+                "$user_key" \
+                "$origin_chain_id" \
+                "$standard_permitted_token" \
+                "$permitted_amount" \
+                "$spender" \
+                "$nonce" \
+                "$deadline" \
+                "$witness_expires" \
+                "$input_oracle" \
+                "$mandate_outputs_json")
         fi
-        
-        # Get origin chain ID from the domain
-        local origin_chain_id=$(echo "$domain" | jq -r '.chainId // 31337')
-        
-        # Build mandate outputs array from witness outputs
-        local mandate_outputs_json=$(echo "$witness" | jq -c '.outputs')
-        
-        # Use the sign_standard_intent function which handles Permit2 properly
-        local signature=$(sign_standard_intent \
-            "$user_key" \
-            "$origin_chain_id" \
-            "$standard_permitted_token" \
-            "$permitted_amount" \
-            "$spender" \
-            "$nonce" \
-            "$deadline" \
-            "$witness_expires" \
-            "$input_oracle" \
-            "$mandate_outputs_json")
         
         if [ -z "$signature" ]; then
             print_error "Failed to sign EIP-712 order"
