@@ -14,6 +14,8 @@ Complete OpenAPI specifications are available in the `api-spec/` directory:
 
 - **[Orders API](../../api-spec/orders-api.yaml)** - Submit and track cross-chain intent orders
 - **[Tokens API](../../api-spec/tokens-api.yaml)** - Query supported tokens and networks
+- **Quotes API** (`/api/quotes`) - Generate price quotes for cross-chain token transfers
+- **Authentication API** (`/api/register`) - Register clients and manage JWT authentication
 
 ## Authentication
 
