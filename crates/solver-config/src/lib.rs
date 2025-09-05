@@ -278,12 +278,20 @@ pub struct GasConfig {
 }
 
 /// Configuration for quote generation parameters.
-#[derive(Default, Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct QuoteConfig {
 	/// Quote validity duration in seconds.
 	/// Defaults to 20 seconds if not specified.
 	#[serde(default = "default_quote_validity_seconds")]
 	pub validity_seconds: u64,
+}
+
+impl Default for QuoteConfig {
+	fn default() -> Self {
+		Self {
+			validity_seconds: default_quote_validity_seconds(),
+		}
+	}
 }
 
 /// Returns the default quote validity duration in seconds.

@@ -52,7 +52,7 @@ use super::custody::{CustodyDecision, CustodyStrategy, EscrowKind, LockKind};
 use crate::apis::quote::permit2::{
 	build_permit2_batch_witness_digest, permit2_domain_address_from_config,
 };
-use solver_config::Config;
+use solver_config::{Config, QuoteConfig};
 use solver_settlement::{SettlementInterface, SettlementService};
 use solver_types::{
 	with_0x_prefix, GetQuoteRequest, InteropAddress, Quote, QuoteDetails, QuoteError, QuoteOrder,
@@ -338,7 +338,7 @@ impl QuoteGenerator {
 			.as_ref()
 			.and_then(|api| api.quote.as_ref())
 			.map(|quote| quote.validity_seconds)
-			.unwrap_or_default() // Default QuoteConfig validity_seconds
+			.unwrap_or_else(|| QuoteConfig::default().validity_seconds)
 	}
 }
 
@@ -773,10 +773,9 @@ mod tests {
 		assert_eq!(validity, 300);
 
 		// Test with no API config (should use default)
-		let mut config_no_api = ConfigBuilder::new().build();
-		config_no_api.api = None;
+		let config_no_api = ConfigBuilder::new().build();
 		let validity_default = generator.get_quote_validity_seconds(&config_no_api);
-		assert_eq!(validity_default, 0); // if API none, use default 0
+		assert_eq!(validity_default, 20); // if API none, use default 20
 	}
 
 	#[test]

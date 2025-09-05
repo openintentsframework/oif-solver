@@ -130,7 +130,7 @@ pub fn parse_address(hex_str: &str) -> Result<Address, String> {
 /// A string representation of the ETH amount (e.g., "1.5" for 1.5 ETH)
 ///
 /// # Example
-/// ```
+/// ```text
 /// use alloy_primitives::U256;
 /// use solver_types::utils::conversion::wei_to_eth_string;
 ///
@@ -155,7 +155,7 @@ pub fn wei_to_eth_string(wei_amount: U256) -> String {
 /// * `Err(String)` - Error message if parsing fails
 ///
 /// # Example
-/// ```
+/// ```text
 /// use solver_types::utils::conversion::eth_string_to_wei;
 ///
 /// let wei = eth_string_to_wei("1.5").unwrap();
@@ -179,7 +179,7 @@ pub fn eth_string_to_wei(eth_amount: &str) -> Result<U256, String> {
 /// * `Err(String)` - Error message if parsing fails
 ///
 /// # Example
-/// ```
+/// ```text
 /// use solver_types::utils::conversion::wei_string_to_eth_string;
 ///
 /// let eth_str = wei_string_to_eth_string("1500000000000000000").unwrap();

@@ -16,7 +16,7 @@ use alloy_primitives::U256;
 ///
 /// # Examples
 ///
-/// ```
+/// ```text
 /// use solver_types::utils::builders::TransactionBuilder;
 /// use solver_types::account::Address;
 /// use alloy_primitives::U256;

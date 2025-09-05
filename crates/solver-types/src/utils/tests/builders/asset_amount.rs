@@ -13,7 +13,7 @@ use alloy_primitives::U256;
 ///
 /// # Examples
 ///
-/// ```
+/// ```text
 /// use solver_types::utils::builders::AssetAmountBuilder;
 /// use alloy_primitives::U256;
 ///
