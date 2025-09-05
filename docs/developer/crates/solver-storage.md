@@ -54,7 +54,7 @@ graph LR
     TxHashData --> |Configurable TTL| TTLManager
     QuoteData --> |Configurable TTL| TTLManager
 
-    TTLManager --> |Default: No Expiration| Storage[File/Memory Storage]
+    TTLManager --> |Default: No Expiration| Storage[File]
 ```
 
 ## Configuration Examples

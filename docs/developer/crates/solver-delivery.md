@@ -17,11 +17,6 @@ graph TB
             AlloyImpl[implementations/evm/alloy.rs<br/>Alloy-based EVM Delivery]
         end
 
-        subgraph "Future Implementations"
-            SolanaImpl[Future: Solana<br/>Non-EVM Blockchain Support]
-            CosmosImpl[Future: Cosmos<br/>IBC-enabled Chains]
-        end
-
         subgraph "Core Components"
             TxSubmission[Transaction Submission<br/>Broadcast & Nonce Management]
             ConfirmationMonitor[Confirmation Monitoring<br/>Block Depth Tracking]

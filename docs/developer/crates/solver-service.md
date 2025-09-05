@@ -100,14 +100,6 @@ sequenceDiagram
 ### Application Configuration
 
 ```toml
-# Application-level settings
-[app]
-name = "OIF Solver Production"
-version = "1.0.0"
-log_level = "info"
-log_format = "json"
-shutdown_timeout_seconds = 30
-
 # HTTP API configuration
 [api]
 enabled = true

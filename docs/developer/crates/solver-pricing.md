@@ -14,8 +14,7 @@ graph TB
         end
 
         subgraph "Pricing Implementations"
-            MockPricing[implementations/mock.rs<br/>Mock Pricing for Testing]
-            FuturePricing[Future: Advanced Pricing<br/>Real-time Market Data]
+            FuturePricing[Pricing<br/>Real-time Market Data]
         end
 
         subgraph "Core Components"
@@ -26,9 +25,9 @@ graph TB
         end
     end
 
-    PricingService --> MockPricing
-    MockPricing --> CostCalculation
-    MockPricing --> ProfitAnalysis
+    PricingService --> FuturePricing
+    FuturePricing --> CostCalculation
+    FuturePricing --> ProfitAnalysis
 
     FuturePricing -.-> MarketData
     FuturePricing -.-> FeeOptimization

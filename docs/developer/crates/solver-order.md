@@ -20,7 +20,6 @@ graph TB
 
         subgraph "Execution Strategies"
             SimpleStrategy[implementations/strategies/simple.rs<br/>Basic Execution Strategy]
-            AdvancedStrategy[Future: Advanced Strategies<br/>ML-based, MEV-aware, etc.]
         end
 
         subgraph "Processing Pipeline"
