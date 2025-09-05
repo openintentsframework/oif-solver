@@ -32,7 +32,6 @@ graph TB
     StorageService --> AtomicOps
 
     TTLManager --> Cleanup
-    FileStorage --> Migration
     FutureBackends -.-> StorageService
 ```
 

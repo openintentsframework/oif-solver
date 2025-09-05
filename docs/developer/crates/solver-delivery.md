@@ -21,7 +21,6 @@ graph TB
             TxSubmission[Transaction Submission<br/>Broadcast & Nonce Management]
             ConfirmationMonitor[Confirmation Monitoring<br/>Block Depth Tracking]
             GasOptimization[Gas Management<br/>Price Estimation & Optimization]
-            RetryLogic[Retry Mechanisms<br/>Failed Transaction Recovery]
             StateTracking[Status Tracking<br/>Transaction Lifecycle]
         end
     end
