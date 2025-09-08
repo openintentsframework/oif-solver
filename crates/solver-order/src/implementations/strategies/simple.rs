@@ -101,17 +101,8 @@ impl SimpleStrategy {
 				}
 			},
 			_ => {
-				// For unknown standards, use basic estimation
-				let max_gas_price = context
-					.chain_data
-					.values()
-					.map(|chain_data| chain_data.gas_price.parse::<U256>().unwrap_or(U256::ZERO))
-					.max()
-					.unwrap_or(U256::ZERO);
-
-				// Basic estimate: 500k gas at max gas price
-				let estimated_gas = 500_000u64;
-				return Some(max_gas_price * U256::from(estimated_gas));
+				// For unknown standards, we cannot estimate execution cost
+				return None;
 			},
 		}
 
@@ -257,12 +248,16 @@ impl ExecutionStrategy for SimpleStrategy {
 				}
 			},
 			_ => {
-				// For unknown standards, skip balance checks
-				tracing::debug!(
+				// For unknown standards, skip execution entirely
+				tracing::warn!(
 					order_id = %order.id,
 					standard = %order.standard,
-					"Skipping balance check for unknown order standard"
+					"Skipping execution for unsupported order standard"
 				);
+				return ExecutionDecision::Skip(format!(
+					"Unsupported order standard: {}",
+					order.standard
+				));
 			},
 		}
 
@@ -696,18 +691,18 @@ mod tests {
 		// Create context with good conditions
 		let context = create_test_context(
 			vec![(1, "50000000000")], // 50 gwei
-			vec![],                   // No balance info needed for unknown standard
+			vec![],                   // No balance info needed since we skip unknown standards
 		);
 
 		let decision = strategy.should_execute(&order, &context).await;
 
-		// Should execute without balance checks for unknown standards
+		// Should skip execution for unknown standards
 		match decision {
-			ExecutionDecision::Execute(params) => {
-				assert_eq!(params.gas_price, U256::from(50000000000u64));
-				assert_eq!(params.priority_fee, Some(U256::from(2000000000u64)));
+			ExecutionDecision::Skip(reason) => {
+				assert!(reason.contains("Unsupported order standard"));
+				assert!(reason.contains("unknown-standard"));
 			},
-			_ => panic!("Expected Execute decision for unknown standard"),
+			_ => panic!("Expected Skip decision for unknown standard"),
 		}
 	}
 
