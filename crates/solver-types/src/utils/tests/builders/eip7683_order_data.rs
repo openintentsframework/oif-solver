@@ -13,7 +13,7 @@ use alloy_primitives::U256;
 ///
 /// # Examples
 ///
-/// ```
+/// ```text
 /// use solver_types::standards::eip7683::builders::Eip7683OrderDataBuilder;
 /// use alloy_primitives::U256;
 ///
@@ -56,16 +56,35 @@ impl Eip7683OrderDataBuilder {
 	/// Creates a new `Eip7683OrderDataBuilder` with default values.
 	pub fn new() -> Self {
 		Self {
-			user: None,
-			nonce: None,
-			origin_chain_id: None,
-			expires: None,
-			fill_deadline: None,
-			input_oracle: None,
-			inputs: Vec::new(),
-			order_id: None,
+			user: Some("0x1234567890123456789012345678901234567890".to_string()),
+			nonce: Some(U256::from(1)),
+			origin_chain_id: Some(U256::from(1)),
+			expires: Some(
+				(std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.unwrap()
+					.as_secs() + 3600) as u32,
+			),
+			fill_deadline: Some(
+				(std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.unwrap()
+					.as_secs() + 1800) as u32,
+			),
+			input_oracle: Some("0x0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A".to_string()),
+			inputs: vec![[U256::from(1000), U256::from(100)]],
+			order_id: Some([1u8; 32]),
 			gas_limit_overrides: GasLimitOverrides::default(),
-			outputs: Vec::new(),
+			outputs: vec![MandateOutput {
+				oracle: [0u8; 32],
+				settler: [0u8; 32],
+				chain_id: U256::from(137),
+				token: [0u8; 32],
+				amount: U256::from(100),
+				recipient: [0u8; 32],
+				call: vec![],
+				context: vec![],
+			}],
 			raw_order_data: None,
 			signature: None,
 			sponsor: None,

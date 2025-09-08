@@ -577,6 +577,7 @@ mod tests {
 	fn create_test_networks() -> NetworksConfig {
 		NetworksConfigBuilder::new()
 			.add_network(1, NetworkConfigBuilder::new().build())
+			.add_network(137, NetworkConfigBuilder::new().build())
 			.build()
 	}
 

@@ -224,6 +224,8 @@ pub struct ApiConfig {
 	pub cors: Option<CorsConfig>,
 	/// Authentication configuration.
 	pub auth: Option<solver_types::AuthConfig>,
+	/// Quote generation configuration.
+	pub quote: Option<QuoteConfig>,
 }
 
 /// Rate limiting configuration.
@@ -273,6 +275,31 @@ pub struct GasConfig {
 	/// Map of flow key -> GasFlowUnits
 	/// Example keys: "permit2_escrow", "compact_resource_lock"
 	pub flows: HashMap<String, GasFlowUnits>,
+}
+
+/// Configuration for quote generation parameters.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct QuoteConfig {
+	/// Quote validity duration in seconds.
+	/// Defaults to 20 seconds if not specified.
+	#[serde(default = "default_quote_validity_seconds")]
+	pub validity_seconds: u64,
+}
+
+impl Default for QuoteConfig {
+	fn default() -> Self {
+		Self {
+			validity_seconds: default_quote_validity_seconds(),
+		}
+	}
+}
+
+/// Returns the default quote validity duration in seconds.
+///
+/// This provides a default value of 20 seconds for quote validity
+/// when no explicit duration is configured.
+fn default_quote_validity_seconds() -> u64 {
+	20 // Default to 20 seconds
 }
 
 /// Returns the default API host.

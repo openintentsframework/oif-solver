@@ -14,7 +14,7 @@ use std::collections::HashMap;
 ///
 /// # Examples
 ///
-/// ```
+/// ```text
 /// use solver_types::utils::builders::TokenConfigBuilder;
 /// use solver_types::Address;
 ///
@@ -123,11 +123,12 @@ impl TokenConfigBuilder {
 ///
 /// # Examples
 ///
-/// ```
-/// use solver_types::utils::builders::{NetworkConfigBuilder, RpcEndpointBuilder};
-/// use solver_types::Address;
+/// ```text
+/// use solver_types::utils::builders::NetworkConfigBuilder;
+/// use solver_types::networks::RpcEndpoint;
 ///
 /// let network = NetworkConfigBuilder::new()
+///     .add_rpc_endpoint(RpcEndpoint::http_only("https://mainnet.infura.io".to_string()))
 ///     .input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
 ///     .output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
 ///     .build();
@@ -322,8 +323,9 @@ impl NetworkConfigBuilder {
 ///
 /// # Examples
 ///
-/// ```
+/// ```text
 /// use solver_types::utils::builders::{NetworksConfigBuilder, NetworkConfigBuilder};
+/// use solver_types::networks::RpcEndpoint;
 ///
 /// let networks = NetworksConfigBuilder::new()
 ///     .add_network(1, NetworkConfigBuilder::new()

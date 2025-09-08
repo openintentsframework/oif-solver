@@ -74,7 +74,7 @@ pub use generation::QuoteGenerator;
 pub use signing::payloads::permit2;
 pub use validation::QuoteValidator;
 
-use solver_config::Config;
+use solver_config::{Config, QuoteConfig};
 use solver_core::SolverEngine;
 use solver_types::{GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, StorageKey};
 
@@ -129,7 +129,13 @@ pub async fn process_quote_request(
 	}
 
 	// 5. Persist quotes
-	let quote_ttl = Duration::from_secs(300);
+	let validity_seconds = config
+		.api
+		.as_ref()
+		.and_then(|api| api.quote.as_ref())
+		.map(|quote| quote.validity_seconds)
+		.unwrap_or_else(|| QuoteConfig::default().validity_seconds);
+	let quote_ttl = Duration::from_secs(validity_seconds);
 	store_quotes(solver, &quotes, quote_ttl).await;
 
 	info!("Generated and stored {} quote options", quotes.len());

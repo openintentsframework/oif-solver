@@ -185,12 +185,12 @@ mod tests {
 		);
 		assert_eq!(http_endpoint.ws, None);
 
-		// Test WebSocket only using builder
+		// Test WebSocket only using static method
 		let ws_endpoint = RpcEndpoint::ws_only("wss://eth.llamarpc.com".to_string());
 		assert_eq!(ws_endpoint.http, None);
 		assert_eq!(ws_endpoint.ws, Some("wss://eth.llamarpc.com".to_string()));
 
-		// Test both HTTP and WebSocket using builder
+		// Test both HTTP and WebSocket using static method
 		let both_endpoint = RpcEndpoint::both(
 			"https://eth.llamarpc.com".to_string(),
 			"wss://eth.llamarpc.com".to_string(),
@@ -200,10 +200,6 @@ mod tests {
 			Some("https://eth.llamarpc.com".to_string())
 		);
 		assert_eq!(both_endpoint.ws, Some("wss://eth.llamarpc.com".to_string()));
-
-		// Test original static methods still work
-		let static_endpoint = RpcEndpoint::http_only("https://eth.llamarpc.com".to_string());
-		assert_eq!(static_endpoint.http, http_endpoint.http);
 	}
 
 	#[test]

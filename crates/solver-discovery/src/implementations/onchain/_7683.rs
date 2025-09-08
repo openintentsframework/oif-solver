@@ -653,3 +653,447 @@ impl solver_types::ImplementationRegistry for Registry {
 }
 
 impl crate::DiscoveryRegistry for Registry {}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use alloy_primitives::{Address as AlloyAddress, Bytes, B256, U256};
+	use alloy_rpc_types::Log;
+	use solver_types::utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder};
+	use solver_types::NetworksConfig;
+	use std::collections::HashMap;
+	use tokio::sync::mpsc;
+
+	// Helper function to create a test networks config
+	fn create_test_networks() -> NetworksConfig {
+		NetworksConfigBuilder::new()
+			.add_network(1, NetworkConfigBuilder::new().build())
+			.build()
+	}
+
+	// Helper function to create a test StandardOrder
+	fn create_test_standard_order() -> StandardOrder {
+		StandardOrder {
+			user: AlloyAddress::from([3u8; 20]),
+			nonce: U256::from(123),
+			originChainId: U256::from(1),
+			expires: 1000000000,
+			fillDeadline: 1000000100,
+			inputOracle: AlloyAddress::from([4u8; 20]),
+			inputs: vec![[U256::from(100), U256::from(200)]],
+			outputs: vec![SolMandateOutput {
+				oracle: B256::from([5u8; 32]),
+				settler: B256::from([6u8; 32]),
+				chainId: U256::from(2),
+				token: B256::from([7u8; 32]),
+				amount: U256::from(1000),
+				recipient: B256::from([8u8; 32]),
+				call: vec![1, 2, 3].into(),
+				context: vec![4, 5, 6].into(),
+			}],
+		}
+	}
+
+	// Helper function to create a test Open event log
+	fn create_test_open_log() -> Log {
+		let order = create_test_standard_order();
+		let order_id = B256::from([9u8; 32]);
+		let order_bytes = order.abi_encode();
+
+		// For the Open event: only orderId is indexed, order bytes go in data
+		// The data should be ABI-encoded as a single bytes parameter
+		use alloy_sol_types::SolType;
+		let event_data = alloy_sol_types::sol_data::Bytes::abi_encode(&order_bytes);
+
+		Log {
+			inner: alloy_primitives::Log {
+				address: AlloyAddress::from([1u8; 20]),
+				data: LogData::new_unchecked(
+					vec![Open::SIGNATURE_HASH, order_id],
+					event_data.into(),
+				),
+			},
+			block_hash: Some(B256::from([10u8; 32])),
+			block_number: Some(100),
+			block_timestamp: Some(1000000000),
+			transaction_hash: Some(B256::from([11u8; 32])),
+			transaction_index: Some(0),
+			log_index: Some(0),
+			removed: false,
+		}
+	}
+
+	#[test]
+	fn test_config_schema_validation_valid() {
+		let config = toml::Value::try_from(HashMap::from([
+			(
+				"network_ids",
+				toml::Value::Array(vec![toml::Value::Integer(1)]),
+			),
+			("polling_interval_secs", toml::Value::Integer(5)),
+		]))
+		.unwrap();
+
+		let result = Eip7683DiscoverySchema::validate_config(&config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_config_schema_validation_missing_network_ids() {
+		let config = toml::Value::try_from(HashMap::from([(
+			"polling_interval_secs",
+			toml::Value::Integer(5),
+		)]))
+		.unwrap();
+
+		let result = Eip7683DiscoverySchema::validate_config(&config);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_config_schema_validation_empty_network_ids() {
+		let config =
+			toml::Value::try_from(HashMap::from([("network_ids", toml::Value::Array(vec![]))]))
+				.unwrap();
+
+		let result = Eip7683DiscoverySchema::validate_config(&config);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_config_schema_validation_invalid_polling_interval() {
+		let config = toml::Value::try_from(HashMap::from([
+			(
+				"network_ids",
+				toml::Value::Array(vec![toml::Value::Integer(1)]),
+			),
+			(
+				"polling_interval_secs",
+				toml::Value::Integer((MAX_POLLING_INTERVAL_SECS + 100) as i64),
+			),
+		]))
+		.unwrap();
+
+		let result = Eip7683DiscoverySchema::validate_config(&config);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_config_schema_validation_websocket_mode() {
+		let config = toml::Value::try_from(HashMap::from([
+			(
+				"network_ids",
+				toml::Value::Array(vec![toml::Value::Integer(1)]),
+			),
+			("polling_interval_secs", toml::Value::Integer(0)), // WebSocket mode
+		]))
+		.unwrap();
+
+		let result = Eip7683DiscoverySchema::validate_config(&config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_parse_open_event_success() {
+		let log = create_test_open_log();
+		let result = Eip7683Discovery::parse_open_event(&log);
+
+		assert!(result.is_ok());
+		let intent = result.unwrap();
+
+		// Verify intent structure
+		assert_eq!(intent.source, "on-chain");
+		assert_eq!(intent.standard, "eip7683");
+		assert!(!intent.metadata.requires_auction);
+		assert!(intent.metadata.exclusive_until.is_none());
+		assert!(intent.quote_id.is_none());
+
+		// Verify the intent data can be deserialized
+		let order_data: Eip7683OrderData = serde_json::from_value(intent.data).unwrap();
+		assert_eq!(order_data.nonce, U256::from(123));
+		assert_eq!(order_data.origin_chain_id, U256::from(1));
+		assert_eq!(order_data.outputs.len(), 1);
+		assert_eq!(order_data.outputs[0].chain_id, U256::from(2));
+		assert_eq!(order_data.outputs[0].amount, U256::from(1000));
+	}
+
+	#[test]
+	fn test_parse_open_event_no_outputs() {
+		// Create order with no outputs
+		let mut order = create_test_standard_order();
+		order.outputs = vec![];
+
+		let order_id = B256::from([9u8; 32]);
+		let order_bytes = order.abi_encode();
+
+		// Use proper ABI encoding for the event data (same as create_test_open_log)
+		use alloy_sol_types::SolType;
+		let event_data = alloy_sol_types::sol_data::Bytes::abi_encode(&order_bytes);
+
+		let log = Log {
+			inner: alloy_primitives::Log {
+				address: AlloyAddress::from([1u8; 20]),
+				data: LogData::new_unchecked(
+					vec![Open::SIGNATURE_HASH, order_id],
+					event_data.into(),
+				),
+			},
+			block_hash: Some(B256::from([10u8; 32])),
+			block_number: Some(100),
+			block_timestamp: Some(1000000000),
+			transaction_hash: Some(B256::from([11u8; 32])),
+			transaction_index: Some(0),
+			log_index: Some(0),
+			removed: false,
+		};
+
+		let result = Eip7683Discovery::parse_open_event(&log);
+		assert!(result.is_err());
+
+		if let Err(DiscoveryError::ValidationError(msg)) = result {
+			assert!(msg.contains("at least one output"));
+		} else {
+			panic!("Expected ValidationError");
+		}
+	}
+
+	#[test]
+	fn test_parse_open_event_invalid_log_data() {
+		let log = Log {
+			inner: alloy_primitives::Log {
+				address: AlloyAddress::from([1u8; 20]),
+				data: LogData::new_unchecked(
+					vec![Open::SIGNATURE_HASH],
+					Bytes::from(vec![1, 2, 3]), // Invalid order data
+				),
+			},
+			block_hash: Some(B256::from([10u8; 32])),
+			block_number: Some(100),
+			block_timestamp: Some(1000000000),
+			transaction_hash: Some(B256::from([11u8; 32])),
+			transaction_index: Some(0),
+			log_index: Some(0),
+			removed: false,
+		};
+
+		let result = Eip7683Discovery::parse_open_event(&log);
+		assert!(result.is_err());
+
+		if let Err(DiscoveryError::ParseError(_)) = result {
+			// Expected
+		} else {
+			panic!("Expected ParseError");
+		}
+	}
+
+	#[test]
+	fn test_process_discovered_logs() {
+		let (sender, mut receiver) = mpsc::unbounded_channel();
+
+		// First, let's test if we can parse the log directly
+		let log = create_test_open_log();
+		match Eip7683Discovery::parse_open_event(&log) {
+			Ok(intent) => println!("Direct parse succeeded: {}", intent.id),
+			Err(e) => println!("Direct parse failed: {:?}", e),
+		}
+
+		let logs = vec![log];
+		Eip7683Discovery::process_discovered_logs(logs, &sender, 1);
+
+		// Should receive one intent
+		match receiver.try_recv() {
+			Ok(intent) => {
+				assert_eq!(intent.source, "on-chain");
+				assert_eq!(intent.standard, "eip7683");
+			},
+			Err(_) => {
+				// If no intent received, the parsing failed silently
+				panic!("No intent received - parsing likely failed");
+			},
+		}
+
+		// Should not receive any more intents
+		assert!(receiver.try_recv().is_err());
+	}
+
+	#[test]
+	fn test_process_discovered_logs_invalid_log() {
+		let (sender, mut receiver) = mpsc::unbounded_channel();
+
+		// Create invalid log
+		let invalid_log = Log {
+			inner: alloy_primitives::Log {
+				address: AlloyAddress::from([1u8; 20]),
+				data: LogData::new_unchecked(
+					vec![Open::SIGNATURE_HASH],
+					Bytes::from(vec![1, 2, 3]), // Invalid data
+				),
+			},
+			block_hash: Some(B256::from([10u8; 32])),
+			block_number: Some(100),
+			block_timestamp: Some(1000000000),
+			transaction_hash: Some(B256::from([11u8; 32])),
+			transaction_index: Some(0),
+			log_index: Some(0),
+			removed: false,
+		};
+
+		let logs = vec![invalid_log];
+		Eip7683Discovery::process_discovered_logs(logs, &sender, 1);
+
+		// Should not receive any intents due to invalid log
+		assert!(receiver.try_recv().is_err());
+	}
+
+	#[tokio::test]
+	async fn test_eip7683_discovery_new_empty_network_ids() {
+		let networks = create_test_networks();
+		let network_ids = vec![];
+
+		let result = Eip7683Discovery::new(network_ids, networks, Some(5)).await;
+		assert!(result.is_err());
+
+		if let Err(DiscoveryError::ValidationError(msg)) = result {
+			assert!(msg.contains("At least one network_id"));
+		} else {
+			panic!("Expected ValidationError");
+		}
+	}
+
+	#[tokio::test]
+	async fn test_eip7683_discovery_new_unknown_network() {
+		let networks = create_test_networks();
+		let network_ids = vec![999]; // Unknown network
+
+		let result = Eip7683Discovery::new(network_ids, networks, Some(5)).await;
+		assert!(result.is_err());
+
+		if let Err(DiscoveryError::ValidationError(msg)) = result {
+			assert!(msg.contains("Network 999 not found"));
+		} else {
+			panic!("Expected ValidationError");
+		}
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_create_discovery_invalid_config() {
+		let config = toml::Value::try_from(HashMap::from([
+			("polling_interval_secs", toml::Value::Integer(5)),
+			// Missing network_ids
+		]))
+		.unwrap();
+
+		let networks = create_test_networks();
+		let result = create_discovery(&config, &networks);
+		assert!(result.is_err());
+
+		if let Err(DiscoveryError::ValidationError(msg)) = result {
+			assert!(msg.contains("required field: network_ids"));
+		} else {
+			panic!("Expected ValidationError");
+		}
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_create_discovery_empty_network_ids() {
+		let config =
+			toml::Value::try_from(HashMap::from([("network_ids", toml::Value::Array(vec![]))]))
+				.unwrap();
+
+		let networks = create_test_networks();
+		let result = create_discovery(&config, &networks);
+		assert!(result.is_err());
+
+		if let Err(DiscoveryError::ValidationError(msg)) = result {
+			assert!(msg.contains("cannot be empty"));
+		} else {
+			panic!("Expected ValidationError");
+		}
+	}
+
+	#[test]
+	fn test_registry_name() {
+		assert_eq!(
+			<Registry as solver_types::ImplementationRegistry>::NAME,
+			"onchain_eip7683"
+		);
+	}
+
+	#[test]
+	fn test_order_data_serialization() {
+		let order_data = Eip7683OrderData {
+			user: with_0x_prefix(&hex::encode([3u8; 20])),
+			nonce: U256::from(123),
+			origin_chain_id: U256::from(1),
+			expires: 1000000000,
+			fill_deadline: 1000000100,
+			input_oracle: with_0x_prefix(&hex::encode([4u8; 20])),
+			inputs: vec![[U256::from(100), U256::from(200)]],
+			order_id: [9u8; 32],
+			gas_limit_overrides: GasLimitOverrides::default(),
+			outputs: vec![MandateOutput {
+				oracle: [5u8; 32],
+				settler: [6u8; 32],
+				chain_id: U256::from(2),
+				token: [7u8; 32],
+				amount: U256::from(1000),
+				recipient: [8u8; 32],
+				call: vec![1, 2, 3],
+				context: vec![4, 5, 6],
+			}],
+			raw_order_data: Some(with_0x_prefix("deadbeef")),
+			signature: None,
+			sponsor: None,
+			lock_type: Some(LockType::Permit2Escrow),
+		};
+
+		// Test serialization to JSON
+		let json_value = serde_json::to_value(&order_data).unwrap();
+		assert!(json_value.is_object());
+
+		// Test deserialization from JSON
+		let deserialized: Eip7683OrderData = serde_json::from_value(json_value).unwrap();
+		assert_eq!(deserialized.nonce, order_data.nonce);
+		assert_eq!(deserialized.outputs.len(), order_data.outputs.len());
+	}
+
+	#[test]
+	fn test_constants() {
+		assert_eq!(DEFAULT_POLLING_INTERVAL_SECS, 3);
+		assert_eq!(MAX_POLLING_INTERVAL_SECS, 300);
+	}
+
+	#[test]
+	fn test_sol_types_compilation() {
+		// Verify that the sol! macro generated types correctly
+		let mandate_output = SolMandateOutput {
+			oracle: B256::from([1u8; 32]),
+			settler: B256::from([2u8; 32]),
+			chainId: U256::from(1),
+			token: B256::from([3u8; 32]),
+			amount: U256::from(1000),
+			recipient: B256::from([4u8; 32]),
+			call: vec![1, 2, 3].into(),
+			context: vec![4, 5, 6].into(),
+		};
+
+		let standard_order = StandardOrder {
+			user: AlloyAddress::from([5u8; 20]),
+			nonce: U256::from(123),
+			originChainId: U256::from(1),
+			expires: 1000000000,
+			fillDeadline: 1000000100,
+			inputOracle: AlloyAddress::from([6u8; 20]),
+			inputs: vec![[U256::from(100), U256::from(200)]],
+			outputs: vec![mandate_output],
+		};
+
+		// Test ABI encoding/decoding
+		let encoded = standard_order.abi_encode();
+		assert!(!encoded.is_empty());
+
+		let decoded = StandardOrder::abi_decode(&encoded, true).unwrap();
+		assert_eq!(decoded.nonce, standard_order.nonce);
+		assert_eq!(decoded.outputs.len(), standard_order.outputs.len());
+	}
+}
