@@ -87,7 +87,10 @@ impl SolverBuilder {
 			&toml::Value,
 			&solver_types::NetworksConfig,
 		) -> Result<Box<dyn SettlementInterface>, SettlementError>,
-		STF: Fn(&toml::Value, Option<solver_config::GasConfig>) -> Result<Box<dyn ExecutionStrategy>, StrategyError>,
+		STF: Fn(
+			&toml::Value,
+			Option<solver_config::GasConfig>,
+		) -> Result<Box<dyn ExecutionStrategy>, StrategyError>,
 	{
 		// Create storage implementations
 		let mut storage_impls = HashMap::new();
