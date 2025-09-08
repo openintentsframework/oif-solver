@@ -155,7 +155,7 @@ pub type OrderFactory = fn(
 ///
 /// This is the function signature that all strategy implementations must provide
 /// to create instances of their execution strategy.
-pub type StrategyFactory = fn(&toml::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError>;
+pub type StrategyFactory = fn(&toml::Value, Option<solver_config::GasConfig>) -> Result<Box<dyn ExecutionStrategy>, StrategyError>;
 
 /// Registry trait for order implementations.
 ///

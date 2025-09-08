@@ -35,7 +35,7 @@ pub type OrderFactory = fn(
 pub type PricingFactory = fn(&toml::Value) -> Result<Box<dyn PricingInterface>, PricingError>;
 pub type SettlementFactory =
 	fn(&toml::Value, &NetworksConfig) -> Result<Box<dyn SettlementInterface>, SettlementError>;
-pub type StrategyFactory = fn(&toml::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError>;
+pub type StrategyFactory = fn(&toml::Value, Option<solver_config::GasConfig>) -> Result<Box<dyn ExecutionStrategy>, StrategyError>;
 
 /// Global registry for all implementation factories
 pub struct FactoryRegistry {

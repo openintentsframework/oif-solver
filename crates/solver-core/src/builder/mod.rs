@@ -87,7 +87,7 @@ impl SolverBuilder {
 			&toml::Value,
 			&solver_types::NetworksConfig,
 		) -> Result<Box<dyn SettlementInterface>, SettlementError>,
-		STF: Fn(&toml::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError>,
+		STF: Fn(&toml::Value, Option<solver_config::GasConfig>) -> Result<Box<dyn ExecutionStrategy>, StrategyError>,
 	{
 		// Create storage implementations
 		let mut storage_impls = HashMap::new();
@@ -433,7 +433,7 @@ impl SolverBuilder {
 		let mut strategy_impls = HashMap::new();
 		for (name, config) in &self.config.order.strategy.implementations {
 			if let Some(factory) = factories.strategy_factories.get(name) {
-				match factory(config) {
+				match factory(config, self.config.gas.clone()) {
 					Ok(implementation) => {
 						strategy_impls.insert(name.clone(), implementation);
 						let is_primary = &self.config.order.strategy.primary == name;
