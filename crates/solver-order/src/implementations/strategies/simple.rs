@@ -12,6 +12,10 @@ use solver_types::{
 
 use crate::{ExecutionStrategy, StrategyError};
 
+const DEFAULT_OPEN_GAS: u64 = 100_000;
+const DEFAULT_FILL_GAS: u64 = 200_000;
+const DEFAULT_CLAIM_GAS: u64 = 150_000;
+
 /// Simple execution strategy that considers gas price limits and cost estimation.
 ///
 /// This strategy executes orders when gas prices are below a configured
@@ -45,14 +49,14 @@ impl SimpleStrategy {
 	fn get_gas_units_for_flow(&self, flow_key: &str) -> (u64, u64, u64) {
 		if let Some(ref gas_config) = self.gas_config {
 			if let Some(flow_units) = gas_config.flows.get(flow_key) {
-				let open_gas = flow_units.open.unwrap_or(100_000);
-				let fill_gas = flow_units.fill.unwrap_or(200_000);
-				let claim_gas = flow_units.claim.unwrap_or(150_000);
+				let open_gas = flow_units.open.unwrap_or(DEFAULT_OPEN_GAS);
+				let fill_gas = flow_units.fill.unwrap_or(DEFAULT_FILL_GAS);
+				let claim_gas = flow_units.claim.unwrap_or(DEFAULT_CLAIM_GAS);
 				return (open_gas, fill_gas, claim_gas);
 			}
 		}
 		// Default values if no config or flow not found
-		(100_000, 200_000, 150_000)
+		(DEFAULT_OPEN_GAS, DEFAULT_FILL_GAS, DEFAULT_CLAIM_GAS)
 	}
 
 	/// Estimates the total execution cost for an order based on execution context
