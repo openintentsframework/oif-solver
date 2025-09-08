@@ -5,7 +5,6 @@
 
 pub mod asset_amount;
 pub mod eip7683_order_data;
-pub mod get_quote_request;
 pub mod intent;
 pub mod mandate_output;
 pub mod networks;
@@ -16,7 +15,6 @@ pub mod transaction_receipt;
 // Re-export builders for convenience
 pub use asset_amount::{AssetAmountBuilder, AssetAmountBuilderError};
 pub use eip7683_order_data::{Eip7683OrderDataBuilder, Eip7683OrderDataBuilderError};
-pub use get_quote_request::{GetQuoteRequestBuilder, GetQuoteRequestBuilderError};
 pub use intent::IntentBuilder;
 pub use mandate_output::{MandateOutputBuilder, MandateOutputBuilderError};
 pub use networks::{
