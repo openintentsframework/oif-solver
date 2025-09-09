@@ -1,10 +1,14 @@
+use crate::apis::cost::{
+	add_decimals, add_many, apply_bps, determine_flow_key_from_quote_orders,
+	estimate_gas_units_from_config, get_chain_gas_price_as_u256,
+};
 use alloy_primitives::U256;
 use solver_config::Config;
 use solver_core::SolverEngine;
 use solver_pricing::PricingService;
 use solver_types::{
 	costs::{CostComponent, QuoteCost},
-	Quote, QuoteError, QuoteOrder, SignatureType, TradingPair,
+	Quote, QuoteError, TradingPair,
 };
 use solver_types::{
 	Address, ExecutionParams, FillProof, Order, OrderStatus, Transaction, TransactionHash,
@@ -75,9 +79,13 @@ impl CostEngine {
 		let pricing = pricing_service.config();
 		let (origin_chain_id, dest_chain_id) = self.extract_origin_dest_chain_ids(quote)?;
 
-		// Get gas units from config (preferred) or fallback to minimal defaults
-		let (open_units, mut fill_units, mut claim_units) =
-			self.estimate_gas_units_for_orders(&quote.orders, config);
+		// Get gas units from config using shared utility
+		let flow_key = determine_flow_key_from_quote_orders(&quote.orders);
+		let (open_units, mut fill_units, mut claim_units) = estimate_gas_units_from_config(
+			&flow_key, config, 0, // fallback open - CostEngine uses minimal defaults
+			0, // fallback fill - will be replaced with live estimate if enabled
+			0, // fallback claim - will be replaced with live estimate if enabled
+		);
 
 		if pricing.enable_live_gas_estimate {
 			tracing::info!("Estimating fill gas on destination chain");
@@ -142,27 +150,9 @@ impl CostEngine {
 			}
 		}
 
-		// Gas prices
-		let origin_gp = U256::from_str_radix(
-			&solver
-				.delivery()
-				.get_chain_data(origin_chain_id)
-				.await
-				.map_err(|e| QuoteError::Internal(e.to_string()))?
-				.gas_price,
-			10,
-		)
-		.unwrap_or(U256::from(DEFAULT_GAS_PRICE_WEI));
-		let dest_gp = U256::from_str_radix(
-			&solver
-				.delivery()
-				.get_chain_data(dest_chain_id)
-				.await
-				.map_err(|e| QuoteError::Internal(e.to_string()))?
-				.gas_price,
-			10,
-		)
-		.unwrap_or(U256::from(DEFAULT_GAS_PRICE_WEI));
+		// Gas prices using shared utility
+		let origin_gp = get_chain_gas_price_as_u256(solver, origin_chain_id).await?;
+		let dest_gp = get_chain_gas_price_as_u256(solver, dest_chain_id).await?;
 		// Costs: open+claim on origin, fill on dest
 		let open_cost_wei_uint = origin_gp.saturating_mul(U256::from(open_units));
 		let fill_cost_wei_uint = dest_gp.saturating_mul(U256::from(fill_units));
@@ -262,62 +252,6 @@ impl CostEngine {
 			subtotal: subtotal_currency,
 			total: total_currency,
 		})
-	}
-
-	fn estimate_gas_units_for_orders(
-		&self,
-		orders: &[QuoteOrder],
-		config: &Config,
-	) -> (u64, u64, u64) {
-		// Detect flow type and try to get from config first
-		let flow_key = self.determine_flow_key(orders);
-
-		if let Some(gcfg) = config.gas.as_ref() {
-			tracing::debug!(
-				"Available gas flows: {:?}",
-				gcfg.flows.keys().collect::<Vec<_>>()
-			);
-		}
-
-		// Try to get configured values for the detected flow
-		if let (Some(flow), Some(gcfg)) = (flow_key.as_deref(), config.gas.as_ref()) {
-			if let Some(units) = gcfg.flows.get(flow) {
-				// Use configured values directly when available
-				let open = units.open.unwrap_or(0);
-				let fill = units.fill.unwrap_or(0);
-				let claim = units.claim.unwrap_or(0);
-				return (open, fill, claim);
-			} else {
-				tracing::warn!("Flow '{}' not found in gas config flows", flow);
-			}
-		}
-		tracing::warn!(
-			"No gas config found for flow {:?}, using minimal fallbacks",
-			flow_key
-		);
-		let open = 0; // Compact flows have no open step
-		let fill = 0; // Conservative estimate - should be replaced with real data
-		let claim = 0; // Conservative estimate - should be replaced with real data
-
-		(open, fill, claim)
-	}
-
-	/// Detect a coarse flow type for selecting config overrides
-	fn determine_flow_key(&self, orders: &[QuoteOrder]) -> Option<String> {
-		if orders
-			.iter()
-			.any(|o| o.primary_type.contains("Lock") || o.primary_type.contains("Compact"))
-		{
-			return Some("compact_resource_lock".to_string());
-		}
-		// Default to permit2-based escrow if using EIP-712 style signatures
-		if orders
-			.iter()
-			.any(|o| matches!(o.signature_type, SignatureType::Eip712))
-		{
-			return Some("permit2_escrow".to_string());
-		}
-		None
 	}
 
 	fn extract_origin_dest_chain_ids(&self, quote: &Quote) -> Result<(u64, u64), QuoteError> {
@@ -431,24 +365,4 @@ impl CostEngine {
 			.await
 			.map_err(|e| QuoteError::Internal(e.to_string()))
 	}
-}
-
-// helpers
-fn add_decimals(a: &str, b: &str) -> String {
-	add_many(&[a.to_string(), b.to_string()])
-}
-
-fn add_many(values: &[String]) -> String {
-	let mut sum = U256::ZERO;
-	for v in values {
-		if let Ok(n) = U256::from_str_radix(v, 10) {
-			sum = sum.saturating_add(n);
-		}
-	}
-	sum.to_string()
-}
-
-fn apply_bps(value: &str, bps: u32) -> String {
-	let v = U256::from_str_radix(value, 10).unwrap_or(U256::ZERO);
-	(v.saturating_mul(U256::from(bps as u64)) / U256::from(10_000u64)).to_string()
 }
