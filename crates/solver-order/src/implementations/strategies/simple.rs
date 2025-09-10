@@ -11,96 +11,28 @@ use solver_types::{
 
 use crate::{ExecutionStrategy, StrategyError};
 
-/// Simple execution strategy that considers gas price limits and cost estimation.
+/// Simple execution strategy that considers gas price limits.
 ///
 /// This strategy executes orders when gas prices are below a configured
-/// maximum and the estimated execution cost is acceptable, deferring execution when prices are too high
-/// or costs exceed configured thresholds.
+/// maximum, deferring execution when prices are too high.
 pub struct SimpleStrategy {
 	/// Maximum gas price the solver is willing to pay.
 	max_gas_price: U256,
-	/// Maximum acceptable execution cost in wei (None means no cost limit)
-	max_execution_cost: Option<U256>,
 }
 
 impl SimpleStrategy {
-	/// Creates a new SimpleStrategy with the specified maximum gas price and optional cost limit.
-	pub fn new(max_gas_price_gwei: u64, max_execution_cost_gwei: Option<u64>) -> Self {
+	/// Creates a new SimpleStrategy with the specified maximum gas price in gwei.
+	pub fn new(max_gas_price_gwei: u64) -> Self {
 		Self {
 			max_gas_price: U256::from(max_gas_price_gwei) * U256::from(10u64.pow(9)),
-			max_execution_cost: max_execution_cost_gwei
-				.map(|cost| U256::from(cost) * U256::from(10u64.pow(9))),
 		}
-	}
-
-	/// Estimates the total execution cost for an order based on execution context
-	fn estimate_execution_cost(&self, order: &Order, context: &ExecutionContext) -> Option<U256> {
-		println!(
-			"Estimating execution cost for order: {:?}",
-			order.standard.as_str()
-		);
-		// Extract gas estimates from order data if available
-		match order.standard.as_str() {
-			"eip7683" => {
-				if let Ok(order_data) =
-					serde_json::from_value::<Eip7683OrderData>(order.data.clone())
-				{
-					// Get gas prices for origin and destination chains
-					let origin_gas_price = context
-						.chain_data
-						.get(&order_data.origin_chain_id.to::<u64>())
-						.and_then(|data| data.gas_price.parse::<U256>().ok())
-						.unwrap_or(U256::ZERO);
-
-					let mut total_cost = U256::ZERO;
-
-					// Add cost for opening the order (if needed) - origin chain
-					let open_gas = 100_000u64; // Conservative estimate
-					total_cost += origin_gas_price * U256::from(open_gas);
-
-					// Add cost for each output (fill operations) - destination chains
-					for output in &order_data.outputs {
-						let dest_chain_id = output.chain_id.to::<u64>();
-						let dest_gas_price = context
-							.chain_data
-							.get(&dest_chain_id)
-							.and_then(|data| data.gas_price.parse::<U256>().ok())
-							.unwrap_or(U256::ZERO);
-
-						let fill_gas = 200_000u64; // Conservative estimate
-						total_cost += dest_gas_price * U256::from(fill_gas);
-					}
-
-					// Add cost for claim transaction - origin chain
-					let claim_gas = 150_000u64; // Conservative estimate
-					total_cost += origin_gas_price * U256::from(claim_gas);
-
-					return Some(total_cost);
-				}
-			},
-			_ => {
-				// For unknown standards, use basic estimation
-				let max_gas_price = context
-					.chain_data
-					.values()
-					.map(|chain_data| chain_data.gas_price.parse::<U256>().unwrap_or(U256::ZERO))
-					.max()
-					.unwrap_or(U256::ZERO);
-
-				// Basic estimate: 500k gas at max gas price
-				let estimated_gas = 500_000u64;
-				return Some(max_gas_price * U256::from(estimated_gas));
-			},
-		}
-
-		None
 	}
 }
 
 /// Configuration schema for SimpleStrategy.
 ///
 /// This schema validates the configuration for the simple execution strategy,
-/// ensuring the optional maximum gas price and cost limit parameters are valid if provided.
+/// ensuring the optional maximum gas price parameter is valid if provided.
 pub struct SimpleStrategySchema;
 
 impl ConfigSchema for SimpleStrategySchema {
@@ -109,22 +41,13 @@ impl ConfigSchema for SimpleStrategySchema {
 			// Required fields
 			vec![],
 			// Optional fields
-			vec![
-				Field::new(
-					"max_gas_price_gwei",
-					FieldType::Integer {
-						min: Some(1),
-						max: None,
-					},
-				),
-				Field::new(
-					"max_execution_cost_gwei",
-					FieldType::Integer {
-						min: Some(1),
-						max: None,
-					},
-				),
-			],
+			vec![Field::new(
+				"max_gas_price_gwei",
+				FieldType::Integer {
+					min: Some(1),
+					max: None,
+				},
+			)],
 		);
 
 		schema.validate(config)
@@ -149,29 +72,6 @@ impl ExecutionStrategy for SimpleStrategy {
 		// Check if any chain has gas price above our limit
 		if max_gas_price > self.max_gas_price {
 			return ExecutionDecision::Defer(std::time::Duration::from_secs(60));
-		}
-
-		// Estimate execution cost and check against limit if configured
-		if let Some(max_cost) = self.max_execution_cost {
-			if let Some(estimated_cost) = self.estimate_execution_cost(order, context) {
-				if estimated_cost > max_cost {
-					tracing::warn!(
-						order_id = %order.id,
-						estimated_cost = %estimated_cost,
-						max_cost = %max_cost,
-						"Skipping execution due to cost exceeding configured limit"
-					);
-					return ExecutionDecision::Skip(format!(
-						"Estimated execution cost {} wei exceeds maximum allowed cost {} wei",
-						estimated_cost, max_cost
-					));
-				}
-			} else {
-				tracing::warn!(
-					order_id = %order.id,
-					"Could not estimate execution cost, proceeding with caution"
-				);
-			}
 		}
 
 		// Check token balances based on order standard
@@ -256,7 +156,6 @@ impl ExecutionStrategy for SimpleStrategy {
 ///
 /// Configuration parameters:
 /// - `max_gas_price_gwei`: Maximum gas price in gwei (default: 100)
-/// - `max_execution_cost_gwei`: Maximum execution cost in gwei (optional, no limit if not provided)
 pub fn create_strategy(config: &toml::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError> {
 	// Validate configuration using the schema
 	let schema = SimpleStrategySchema;
@@ -269,15 +168,7 @@ pub fn create_strategy(config: &toml::Value) -> Result<Box<dyn ExecutionStrategy
 		.and_then(|v| v.as_integer())
 		.unwrap_or(100) as u64;
 
-	let max_execution_cost = config
-		.get("max_execution_cost_gwei")
-		.and_then(|v| v.as_integer())
-		.map(|v| v as u64);
-
-	Ok(Box::new(SimpleStrategy::new(
-		max_gas_price,
-		max_execution_cost,
-	)))
+	Ok(Box::new(SimpleStrategy::new(max_gas_price)))
 }
 
 /// Registry for the simple strategy implementation.
@@ -391,28 +282,11 @@ mod tests {
 
 	#[test]
 	fn test_simple_strategy_new() {
-		let strategy = SimpleStrategy::new(50, None); // 50 gwei, no cost limit
+		let strategy = SimpleStrategy::new(50); // 50 gwei
 		assert_eq!(
 			strategy.max_gas_price,
 			U256::from(50) * U256::from(10u64.pow(9))
 		);
-		assert_eq!(strategy.max_execution_cost, None);
-	}
-
-	#[test]
-	fn test_simple_strategy_new_with_cost_limit() {
-		let strategy = SimpleStrategy::new(50, Some(1000)); // 50 gwei max gas, 1000 gwei max cost
-		assert_eq!(
-			strategy.max_gas_price,
-			U256::from(50) * U256::from(10u64.pow(9))
-		);
-		assert_eq!(
-			strategy.max_execution_cost,
-			Some(U256::from(1000) * U256::from(10u64.pow(9)))
-		);
-
-		let strategy_no_cost_limit = SimpleStrategy::new(50, None);
-		assert_eq!(strategy_no_cost_limit.max_execution_cost, None);
 	}
 
 	#[test]
@@ -429,44 +303,16 @@ mod tests {
 		let valid_config = toml::Value::Table(config_map);
 		assert!(schema.validate(&valid_config).is_ok());
 
-		// Valid config with max_execution_cost_gwei
-		let mut config_map = toml::map::Map::new();
-		config_map.insert(
-			"max_execution_cost_gwei".to_string(),
-			toml::Value::Integer(500),
-		);
-		let valid_config = toml::Value::Table(config_map);
-		assert!(schema.validate(&valid_config).is_ok());
-
-		// Valid config with both parameters
-		let mut config_map = toml::map::Map::new();
-		config_map.insert("max_gas_price_gwei".to_string(), toml::Value::Integer(100));
-		config_map.insert(
-			"max_execution_cost_gwei".to_string(),
-			toml::Value::Integer(500),
-		);
-		let valid_config = toml::Value::Table(config_map);
-		assert!(schema.validate(&valid_config).is_ok());
-
 		// Invalid config with zero gas price
 		let mut config_map = toml::map::Map::new();
 		config_map.insert("max_gas_price_gwei".to_string(), toml::Value::Integer(0));
-		let invalid_config = toml::Value::Table(config_map);
-		assert!(schema.validate(&invalid_config).is_err());
-
-		// Invalid config with zero execution cost
-		let mut config_map = toml::map::Map::new();
-		config_map.insert(
-			"max_execution_cost_gwei".to_string(),
-			toml::Value::Integer(0),
-		);
 		let invalid_config = toml::Value::Table(config_map);
 		assert!(schema.validate(&invalid_config).is_err());
 	}
 
 	#[tokio::test]
 	async fn test_should_execute_gas_price_too_high() {
-		let strategy = SimpleStrategy::new(50, None); // 50 gwei max
+		let strategy = SimpleStrategy::new(50); // 50 gwei max
 		let order_data = create_test_order_data();
 		let order = create_test_order(order_data);
 
@@ -492,7 +338,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_should_execute_insufficient_balance() {
-		let strategy = SimpleStrategy::new(100, None); // 100 gwei max
+		let strategy = SimpleStrategy::new(100); // 100 gwei max
 		let order_data = create_test_order_data();
 		let order = create_test_order(order_data);
 
@@ -520,7 +366,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_should_execute_no_balance_info() {
-		let strategy = SimpleStrategy::new(100, None); // 100 gwei max
+		let strategy = SimpleStrategy::new(100); // 100 gwei max
 		let order_data = create_test_order_data();
 		let order = create_test_order(order_data);
 
@@ -543,7 +389,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_should_execute_success() {
-		let strategy = SimpleStrategy::new(100, None); // 100 gwei max
+		let strategy = SimpleStrategy::new(100); // 100 gwei max
 		let order_data = create_test_order_data();
 		let order = create_test_order(order_data);
 
@@ -576,92 +422,8 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_should_execute_cost_too_high() {
-		// Set a very low cost limit (1 gwei total) to ensure it gets exceeded
-		let strategy = SimpleStrategy::new(100, Some(1)); // 100 gwei max gas, 1 gwei max cost
-		let order_data = create_test_order_data();
-		let order = create_test_order(order_data);
-
-		// Create context with good gas price and sufficient balance
-		let context = create_test_context(
-			vec![(1, "50000000000"), (137, "30000000000")], // 50 gwei, 30 gwei
-			vec![(137, "0202020202020202020202020202020202020202", "200")],
-		);
-
-		let decision = strategy.should_execute(&order, &context).await;
-
-		match decision {
-			ExecutionDecision::Skip(reason) => {
-				assert!(reason.contains("Estimated execution cost"));
-				assert!(reason.contains("exceeds maximum allowed cost"));
-			},
-			ExecutionDecision::Execute(_) => {
-				panic!("Expected Skip decision for high execution cost");
-			},
-			ExecutionDecision::Defer(_) => {
-				panic!("Expected Skip decision for high execution cost");
-			},
-		}
-	}
-
-	#[tokio::test]
-	async fn test_should_execute_cost_within_limit() {
-		// Set a very high cost limit to ensure it doesn't get exceeded
-		// Our estimated cost is ~18.5e15 wei, so set limit to 20000000000 gwei (20 billion gwei)
-		let strategy = SimpleStrategy::new(100, Some(20000000000)); // 100 gwei max gas, 20B gwei max cost
-		let order_data = create_test_order_data();
-		let order = create_test_order(order_data);
-
-		// Create context with good gas price and sufficient balance
-		let context = create_test_context(
-			vec![(1, "50000000000"), (137, "30000000000")], // 50 gwei, 30 gwei
-			vec![(137, "0202020202020202020202020202020202020202", "200")],
-		);
-
-		let decision = strategy.should_execute(&order, &context).await;
-
-		match decision {
-			ExecutionDecision::Execute(params) => {
-				assert_eq!(params.gas_price, U256::from(50000000000u64));
-				assert_eq!(params.priority_fee, Some(U256::from(2000000000u64)));
-			},
-			ExecutionDecision::Skip(reason) => {
-				panic!("Expected Execute but got Skip: {}", reason);
-			},
-			ExecutionDecision::Defer(_) => {
-				panic!("Expected Execute but got Defer");
-			},
-		}
-	}
-
-	#[test]
-	fn test_estimate_execution_cost() {
-		let strategy = SimpleStrategy::new(100, Some(500));
-		let order_data = create_test_order_data();
-		let order = create_test_order(order_data);
-
-		let context = create_test_context(
-			vec![(1, "50000000000"), (137, "30000000000")], // 50 gwei, 30 gwei
-			vec![],
-		);
-
-		let estimated_cost = strategy.estimate_execution_cost(&order, &context);
-		assert!(estimated_cost.is_some());
-
-		// With our test data (origin chain 1 @ 50 gwei, dest chain 137 @ 30 gwei):
-		// - open: 100k gas * 50 gwei = 5e15 wei
-		// - fill: 200k gas * 30 gwei = 6e15 wei
-		// - claim: 150k gas * 50 gwei = 7.5e15 wei
-		// Total: 18.5e15 wei
-		let expected_cost = U256::from(50000000000u64) * U256::from(100000u64) + // open
-							U256::from(30000000000u64) * U256::from(200000u64) + // fill
-							U256::from(50000000000u64) * U256::from(150000u64); // claim
-		assert_eq!(estimated_cost.unwrap(), expected_cost);
-	}
-
-	#[tokio::test]
 	async fn test_should_execute_unknown_standard() {
-		let strategy = SimpleStrategy::new(100, None); // 100 gwei max
+		let strategy = SimpleStrategy::new(100); // 100 gwei max
 		let mut order = create_test_order(create_test_order_data());
 		order.standard = "unknown-standard".to_string();
 
@@ -685,7 +447,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_should_execute_multiple_outputs() {
-		let strategy = SimpleStrategy::new(100, None); // 100 gwei max
+		let strategy = SimpleStrategy::new(100); // 100 gwei max
 		let mut order_data = create_test_order_data();
 
 		// Add another output on different chain
@@ -734,7 +496,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_should_execute_multiple_outputs_one_insufficient() {
-		let strategy = SimpleStrategy::new(100, None); // 100 gwei max
+		let strategy = SimpleStrategy::new(100); // 100 gwei max
 		let mut order_data = create_test_order_data();
 
 		// Add another output on different chain
@@ -789,40 +551,9 @@ mod tests {
 		let result = create_strategy(&config);
 		assert!(result.is_ok());
 
-		// Test with custom execution cost limit
-		let mut config_map = toml::map::Map::new();
-		config_map.insert(
-			"max_execution_cost_gwei".to_string(),
-			toml::Value::Integer(500),
-		);
-		let config = toml::Value::Table(config_map);
-		let result = create_strategy(&config);
-		assert!(result.is_ok());
-
-		// Test with both parameters
-		let mut config_map = toml::map::Map::new();
-		config_map.insert("max_gas_price_gwei".to_string(), toml::Value::Integer(75));
-		config_map.insert(
-			"max_execution_cost_gwei".to_string(),
-			toml::Value::Integer(500),
-		);
-		let config = toml::Value::Table(config_map);
-		let result = create_strategy(&config);
-		assert!(result.is_ok());
-
-		// Test with invalid gas price config
+		// Test with invalid config
 		let mut config_map = toml::map::Map::new();
 		config_map.insert("max_gas_price_gwei".to_string(), toml::Value::Integer(0));
-		let config = toml::Value::Table(config_map);
-		let result = create_strategy(&config);
-		assert!(result.is_err());
-
-		// Test with invalid execution cost config
-		let mut config_map = toml::map::Map::new();
-		config_map.insert(
-			"max_execution_cost_gwei".to_string(),
-			toml::Value::Integer(0),
-		);
 		let config = toml::Value::Table(config_map);
 		let result = create_strategy(&config);
 		assert!(result.is_err());
