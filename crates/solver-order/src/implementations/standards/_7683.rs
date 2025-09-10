@@ -9,9 +9,11 @@ use alloy_primitives::{Address as AlloyAddress, Bytes, FixedBytes, U256};
 use alloy_sol_types::{sol, SolCall, SolType};
 use async_trait::async_trait;
 use solver_types::{
-	current_timestamp, oracle::OracleRoutes, standards::eip7683::LockType, Address, ConfigSchema,
-	Eip7683OrderData, ExecutionParams, FillProof, Intent, NetworksConfig, Order, OrderStatus,
-	Schema, Transaction,
+	current_timestamp,
+	oracle::OracleRoutes,
+	standards::eip7683::{interfaces::StandardOrder as OifStandardOrder, LockType},
+	Address, ConfigSchema, Eip7683OrderData, ExecutionParams, FillProof, Intent, NetworksConfig,
+	Order, OrderStatus, Schema, Transaction,
 };
 
 // Solidity type definitions for EIP-7683 contract interactions.
@@ -797,12 +799,9 @@ impl OrderInterface for Eip7683OrderImpl {
 	}
 
 	/// Validates EIP-7683 order bytes by decoding to StandardOrder and validating.
-	async fn validate_order(
-		&self,
-		order_bytes: &Bytes,
-	) -> Result<solver_types::standards::eip7683::interfaces::StandardOrder, OrderError> {
-		// Decode the StandardOrder from bytes
-		let standard_order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+	async fn validate_order(&self, order_bytes: &Bytes) -> Result<OifStandardOrder, OrderError> {
+		// Decode using the StandardOrder from types module
+		let standard_order = OifStandardOrder::abi_decode(order_bytes, true).map_err(|e| {
 			OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
 		})?;
 
@@ -822,34 +821,8 @@ impl OrderInterface for Eip7683OrderImpl {
 
 		// TODO: validate oracle routes and signatures
 
-		// Convert local StandardOrder to the solver_types version
-		Ok(
-			solver_types::standards::eip7683::interfaces::StandardOrder {
-				user: standard_order.user,
-				nonce: standard_order.nonce,
-				originChainId: standard_order.originChainId,
-				expires: standard_order.expires,
-				fillDeadline: standard_order.fillDeadline,
-				inputOracle: standard_order.inputOracle,
-				inputs: standard_order.inputs,
-				outputs: standard_order
-					.outputs
-					.into_iter()
-					.map(
-						|o| solver_types::standards::eip7683::interfaces::SolMandateOutput {
-							oracle: o.oracle,
-							settler: o.settler,
-							chainId: o.chainId,
-							token: o.token,
-							amount: o.amount,
-							recipient: o.recipient,
-							call: o.call,
-							context: o.context,
-						},
-					)
-					.collect(),
-			},
-		)
+		// Return the decoded StandardOrder directly since it's already the right type
+		Ok(standard_order)
 	}
 }
 
