@@ -151,7 +151,7 @@ impl QuoteGenerator {
 		let domain_address = self.get_lock_domain_address(config, lock_kind)?;
 		let (primary_type, message) = match lock_kind {
 			LockKind::TheCompact { params } => (
-				"CompactLock".to_string(),
+				"BatchCompact".to_string(),
 				self.build_compact_message(request, config, params)?,
 			),
 		};
@@ -564,7 +564,7 @@ mod tests {
 		match result {
 			Ok(order) => {
 				assert_eq!(order.signature_type, SignatureType::Eip712);
-				assert_eq!(order.primary_type, "CompactLock");
+				assert_eq!(order.primary_type, "BatchCompact");
 				assert!(order.message.is_object());
 			},
 			Err(e) => {
