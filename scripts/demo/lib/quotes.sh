@@ -883,6 +883,15 @@ quote_accept() {
             return 1
         fi
         
+        # For compact orders, encode signature with allocator data like intent flow does
+        if [ "$is_compact" = "true" ]; then
+            print_debug "Encoding compact signature with allocator data"
+            local allocator_data="0x"  # Empty allocator data for demo
+            local encoded_signature=$(cast abi-encode "f(bytes,bytes)" "$signature" "$allocator_data")
+            signature="$encoded_signature"
+            print_debug "Compact signature encoded with allocator data"
+        fi
+        
         print_success "EIP-712 order signed"
         print_debug "Signature: $signature"
         

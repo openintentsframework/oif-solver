@@ -211,6 +211,12 @@ impl OrderInterface for Eip7683OrderImpl {
 		}
 
 		// Parse order data
+		tracing::info!(
+			order_id = %intent.id,
+			intent_data = ?intent.data,
+			"Raw intent data before parsing"
+		);
+		
 		let order_data: Eip7683OrderData =
 			serde_json::from_value(intent.data.clone()).map_err(|e| {
 				OrderError::ValidationFailed(format!("Failed to parse order data: {}", e))
@@ -327,6 +333,12 @@ impl OrderInterface for Eip7683OrderImpl {
 			.map(|output| output.chain_id.to::<u64>())
 			.collect::<Vec<_>>();
 
+		tracing::info!(
+			order_id = %intent.id,
+			lock_type = ?order_data.lock_type,
+			"Creating order from intent with lock_type"
+		);
+
 		// Create order
 		Ok(Order {
 			id: intent.id.clone(),
@@ -396,12 +408,13 @@ impl OrderInterface for Eip7683OrderImpl {
 				OrderError::ValidationFailed(format!("Failed to parse order data: {}", e))
 			})?;
 
-		tracing::debug!(
+		tracing::info!(
 			order_id = %order.id,
 			lock_type = ?order_data.lock_type,
+			source = %intent.source,
 			"Checking lock type for preparation decision"
 		);
-
+		
 		// Skip prepare for Compact (resource lock) flows
 		if matches!(order_data.lock_type, Some(LockType::ResourceLock)) {
 			tracing::info!(
@@ -745,15 +758,23 @@ impl OrderInterface for Eip7683OrderImpl {
 						)
 					})?;
 
-					// Expect full signature payload already without any type prefix
+					tracing::info!(
+						order_id = %order.id,
+						signature_hex = %sig_hex,
+						signature_length = sig_hex.len(),
+						"Processing ResourceLock claim with signature"
+					);
+
+					// The signature for resource locks should already be encoded as (bytes, bytes) tuple
+					// from the quote acceptance flow, similar to how intent flow works
 					let sig_str = sig_hex.trim_start_matches("0x");
-					let compact_sig_bytes = hex::decode(sig_str).map_err(|e| {
+					let signature_bytes = hex::decode(sig_str).map_err(|e| {
 						OrderError::ValidationFailed(format!("Invalid compact signatures: {}", e))
 					})?;
 
 					IInputSettlerCompact::finaliseCall {
 						order: order_struct,
-						signatures: compact_sig_bytes.into(),
+						signatures: signature_bytes.into(),
 						timestamps,
 						solvers,
 						destination,

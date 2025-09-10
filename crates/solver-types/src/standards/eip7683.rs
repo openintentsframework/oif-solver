@@ -11,13 +11,12 @@ use serde::{Deserialize, Serialize};
 ///
 /// This enum represents the different ways user funds can be locked/held
 /// during the cross-chain order lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LockType {
 	/// Permit2-based escrow mechanism
 	/// Uses Permit2 signatures for gasless token approvals
 	#[serde(rename = "permit2_escrow")]
-	#[default]
 	Permit2Escrow = 1,
 	/// EIP-3009 based escrow mechanism  
 	/// Uses transferWithAuthorization for gasless transfers
