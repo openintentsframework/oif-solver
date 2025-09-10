@@ -444,56 +444,6 @@ impl Eip7683OffchainDiscovery {
 		Ok(order)
 	}
 
-	/// Validates the incoming StandardOrder.
-	///
-	/// Performs validation checks on order deadlines to ensure
-	/// the order is still valid and can be processed.
-	///
-	/// # Arguments
-	///
-	/// * `order` - The StandardOrder to validate
-	/// * `sponsor` - The sponsor address
-	/// * `signature` - The Permit2Witness signature
-	///
-	/// # Returns
-	///
-	/// Returns `Ok(())` if the order is valid.
-	///
-	/// # Errors
-	///
-	/// Returns `DiscoveryError::ValidationError` if:
-	/// - The expiry has passed
-	/// - The fill deadline has passed
-	///
-	/// # TODO
-	///
-	/// - Implement Permit2Witness signature validation
-	async fn validate_order(
-		order: &StandardOrder,
-		_sponsor: &Address,
-		_signature: &Bytes,
-	) -> Result<(), DiscoveryError> {
-		// Check if deadlines are still valid
-		let current_time = current_timestamp() as u32;
-
-		if order.expires < current_time {
-			return Err(DiscoveryError::ValidationError(
-				"Order has expired".to_string(),
-			));
-		}
-
-		if order.fillDeadline < current_time {
-			return Err(DiscoveryError::ValidationError(
-				"Order fill deadline has passed".to_string(),
-			));
-		}
-
-		// TODO: Implement Permit2Witness signature validation
-		// The signature should be validated against the Permit2 contract
-
-		Ok(())
-	}
-
 	/// Converts StandardOrder to Intent.
 	///
 	/// Transforms a parsed StandardOrder into the internal Intent format used by
@@ -825,23 +775,6 @@ async fn handle_intent_submission(
 			None
 		},
 	};
-
-	// Validate order
-	if let Err(e) =
-		Eip7683OffchainDiscovery::validate_order(&order, &request.sponsor, &request.signature).await
-	{
-		tracing::warn!(error = %e, "Order validation failed");
-		return (
-			StatusCode::BAD_REQUEST,
-			Json(IntentResponse {
-				order_id: None,
-				status: IntentResponseStatus::Rejected,
-				message: Some(e.to_string()),
-				order: order_json.clone(),
-			}),
-		)
-			.into_response();
-	}
 
 	// Convert to intent
 	match Eip7683OffchainDiscovery::order_to_intent(
@@ -1185,54 +1118,6 @@ mod tests {
 				assert!(msg.contains("Failed to decode StandardOrder"));
 			},
 			_ => panic!("Expected ParseError"),
-		}
-	}
-
-	#[tokio::test]
-	async fn test_validate_order_success() {
-		let order = create_test_standard_order();
-		let sponsor = Address::from_slice(&[0xabu8; 20]);
-		let signature = Bytes::from_static(b"valid_signature");
-
-		let result = Eip7683OffchainDiscovery::validate_order(&order, &sponsor, &signature).await;
-		assert!(result.is_ok());
-	}
-
-	#[tokio::test]
-	async fn test_validate_order_expired() {
-		let mut order = create_test_standard_order();
-		order.expires = (current_timestamp() - 3600) as u32; // 1 hour ago
-
-		let sponsor = Address::from_slice(&[0xabu8; 20]);
-		let signature = Bytes::from_static(b"valid_signature");
-
-		let result = Eip7683OffchainDiscovery::validate_order(&order, &sponsor, &signature).await;
-		assert!(result.is_err());
-
-		match result.unwrap_err() {
-			DiscoveryError::ValidationError(msg) => {
-				assert_eq!(msg, "Order has expired");
-			},
-			_ => panic!("Expected ValidationError for expired order"),
-		}
-	}
-
-	#[tokio::test]
-	async fn test_validate_order_fill_deadline_passed() {
-		let mut order = create_test_standard_order();
-		order.fillDeadline = (current_timestamp() - 1800) as u32; // 30 min ago
-
-		let sponsor = Address::from_slice(&[0xabu8; 20]);
-		let signature = Bytes::from_static(b"valid_signature");
-
-		let result = Eip7683OffchainDiscovery::validate_order(&order, &sponsor, &signature).await;
-		assert!(result.is_err());
-
-		match result.unwrap_err() {
-			DiscoveryError::ValidationError(msg) => {
-				assert_eq!(msg, "Order fill deadline has passed");
-			},
-			_ => panic!("Expected ValidationError for passed deadline"),
 		}
 	}
 
