@@ -289,10 +289,9 @@ async fn handle_order(
 
 	// Use CostEngine for order cost estimation
 	let cost_engine = CostEngine::new();
-	let order_cost = cost_engine
+	let _order_cost = cost_engine
 		.estimate_order_cost(&validated_order, lock_type, &state.solver, &state.config)
 		.await;
-	println!("order_cost: ==> {:?}", order_cost);
 
 	// Check if discovery URL is configured
 	let forward_url = match &state.discovery_url {
@@ -357,7 +356,6 @@ async fn validate_order_submission(
 	state: &AppState,
 ) -> Result<StandardOrder, APIError> {
 	// Extract order bytes from payload
-	println!("validate_order_submission - payload: {:?}", payload);
 	let order_bytes_hex = payload
 		.get("order")
 		.and_then(|b| b.as_str())

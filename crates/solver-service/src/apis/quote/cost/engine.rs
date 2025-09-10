@@ -34,6 +34,19 @@ struct CostCalculationResult {
 	total: String,
 }
 
+/// Parameters for chain-related information
+struct ChainParams {
+	origin_chain_id: u64,
+	dest_chain_id: u64,
+}
+
+/// Parameters for gas unit calculations
+struct GasUnits {
+	open_units: u64,
+	fill_units: u64,
+	claim_units: u64,
+}
+
 pub struct CostEngine;
 
 impl CostEngine {
@@ -115,11 +128,15 @@ impl CostEngine {
 			.calculate_cost_components(
 				solver,
 				pricing_service,
-				origin_chain_id,
-				dest_chain_id,
-				open_units,
-				fill_units,
-				claim_units,
+				ChainParams {
+					origin_chain_id,
+					dest_chain_id,
+				},
+				GasUnits {
+					open_units,
+					fill_units,
+					claim_units,
+				},
 			)
 			.await?;
 
@@ -176,12 +193,16 @@ impl CostEngine {
 		let cost_result = self
 			.calculate_cost_components(
 				solver,
-				&pricing_service,
-				origin_chain_id,
-				dest_chain_id,
-				open_units,
-				fill_units,
-				claim_units,
+				pricing_service,
+				ChainParams {
+					origin_chain_id,
+					dest_chain_id,
+				},
+				GasUnits {
+					open_units,
+					fill_units,
+					claim_units,
+				},
 			)
 			.await
 			.map_err(|e| APIError::InternalServerError {
@@ -515,22 +536,19 @@ impl CostEngine {
 		&self,
 		solver: &SolverEngine,
 		pricing_service: &PricingService,
-		origin_chain_id: u64,
-		dest_chain_id: u64,
-		open_units: u64,
-		fill_units: u64,
-		claim_units: u64,
+		chain_params: ChainParams,
+		gas_units: GasUnits,
 	) -> Result<CostCalculationResult, QuoteError> {
 		let pricing = pricing_service.config();
 
 		// Gas prices using shared utility
-		let origin_gp = get_chain_gas_price_as_u256(solver, origin_chain_id).await?;
-		let dest_gp = get_chain_gas_price_as_u256(solver, dest_chain_id).await?;
+		let origin_gp = get_chain_gas_price_as_u256(solver, chain_params.origin_chain_id).await?;
+		let dest_gp = get_chain_gas_price_as_u256(solver, chain_params.dest_chain_id).await?;
 
 		// Costs: open+claim on origin, fill on dest
-		let open_cost_wei_uint = origin_gp.saturating_mul(U256::from(open_units));
-		let fill_cost_wei_uint = dest_gp.saturating_mul(U256::from(fill_units));
-		let claim_cost_wei_uint = origin_gp.saturating_mul(U256::from(claim_units));
+		let open_cost_wei_uint = origin_gp.saturating_mul(U256::from(gas_units.open_units));
+		let fill_cost_wei_uint = dest_gp.saturating_mul(U256::from(gas_units.fill_units));
+		let claim_cost_wei_uint = origin_gp.saturating_mul(U256::from(gas_units.claim_units));
 
 		let open_cost_wei_str = open_cost_wei_uint.to_string();
 		let fill_cost_wei_str = fill_cost_wei_uint.to_string();
@@ -621,7 +639,7 @@ impl CostEngine {
 					amount_wei: Some(buffer_rates),
 				},
 			],
-			commission_bps: pricing.commission_bps as u32,
+			commission_bps: pricing.commission_bps,
 			commission_amount: commission_amount_currency,
 			subtotal: subtotal_currency,
 			total: total_currency,
