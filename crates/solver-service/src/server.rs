@@ -4,7 +4,7 @@
 //! for the OIF Solver API.
 
 use crate::{
-	apis::order::get_order_by_id,
+	apis::{order::get_order_by_id, quote::cost::engine::CostEngine},
 	auth::{auth_middleware, AuthState, JwtService},
 };
 use axum::{
@@ -18,7 +18,10 @@ use axum::{
 use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
-use solver_types::{APIError, GetOrderResponse, GetQuoteRequest, GetQuoteResponse};
+use solver_types::{
+	standards::eip7683::interfaces::StandardOrder, APIError, GetOrderResponse, GetQuoteRequest,
+	GetQuoteResponse,
+};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower::ServiceBuilder;
@@ -256,6 +259,7 @@ async fn handle_order(
 			"Authenticated order submission"
 		);
 	}
+
 	// Check if this is a committed order (quote acceptance)
 	if let Some(result) = handle_committed_order(payload.clone(), &state).await {
 		return match result {
@@ -263,6 +267,32 @@ async fn handle_order(
 			Err(api_error) => api_error.into_response(),
 		};
 	}
+
+	// Validate order before forwarding
+	let validated_order = match validate_order_submission(&payload, &state).await {
+		Ok(order) => order,
+		Err(validation_error) => {
+			return validation_error.into_response();
+		},
+	};
+
+	let lock_type = payload
+		.get("lock_type")
+		.and_then(|b| b.as_str())
+		.and_then(|s| match s {
+			"1" => Some("permit2_escrow"),
+			"2" => Some("eip3009_escrow"),
+			"3" => Some("resource_lock"),
+			_ => None,
+		})
+		.unwrap_or("permit2_escrow"); // TODO: should we default to permit2_escrow?
+
+	// Use CostEngine for order cost estimation
+	let cost_engine = CostEngine::new();
+	let order_cost = cost_engine
+		.estimate_order_cost(&validated_order, lock_type, &state.solver, &state.config)
+		.await;
+	println!("order_cost: ==> {:?}", order_cost);
 
 	// Check if discovery URL is configured
 	let forward_url = match &state.discovery_url {
@@ -279,10 +309,7 @@ async fn handle_order(
 		},
 	};
 
-	tracing::debug!("Forwarding order submission to: {}", forward_url);
-
-	// Use the shared HTTP client from app state
-	// Forward the request
+	// Forward the request (existing logic)
 	match state
 		.http_client
 		.post(forward_url)
@@ -322,6 +349,47 @@ async fn handle_order(
 				.into_response()
 		},
 	}
+}
+
+/// Validates order submission and estimates cost
+async fn validate_order_submission(
+	payload: &Value,
+	state: &AppState,
+) -> Result<StandardOrder, APIError> {
+	// Extract order bytes from payload
+	println!("validate_order_submission - payload: {:?}", payload);
+	let order_bytes_hex = payload
+		.get("order")
+		.and_then(|b| b.as_str())
+		.ok_or_else(|| APIError::BadRequest {
+			error_type: "MISSING_ORDER_BYTES".to_string(),
+			message: "Missing order field in request".to_string(),
+			details: None,
+		})?;
+
+	// Decode hex to bytes
+	let order_bytes = hex::decode(order_bytes_hex.trim_start_matches("0x")).map_err(|_| {
+		APIError::BadRequest {
+			error_type: "INVALID_HEX_ENCODING".to_string(),
+			message: "Invalid hex encoding in orderBytes".to_string(),
+			details: None,
+		}
+	})?;
+
+	// Validate order using OrderService
+	let standard = "eip7683"; // Default to EIP-7683
+	let order = state
+		.solver
+		.order()
+		.validate_order(standard, &order_bytes.into())
+		.await
+		.map_err(|e| APIError::BadRequest {
+			error_type: "ORDER_VALIDATION_FAILED".to_string(),
+			message: format!("Order validation failed: {}", e),
+			details: None,
+		})?;
+
+	Ok(order)
 }
 
 async fn handle_committed_order(

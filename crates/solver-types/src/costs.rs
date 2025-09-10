@@ -30,3 +30,22 @@ pub struct QuoteCost {
 	/// Total price including commission, as a decimal string.
 	pub total: String,
 }
+
+/// Cost breakdown for order execution (similar to QuoteCost but for direct orders).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderCost {
+	/// Display currency for cost components (e.g., "USDC", "USD").
+	pub currency: String,
+	/// Individual components that sum to the subtotal.
+	pub components: Vec<CostComponent>,
+	/// Commission fee in basis points applied over subtotal.
+	#[serde(rename = "commissionBps")]
+	pub commission_bps: u32,
+	/// Commission amount as a decimal string in the same currency.
+	#[serde(rename = "commissionAmount")]
+	pub commission_amount: String,
+	/// Subtotal before commission, as a decimal string.
+	pub subtotal: String,
+	/// Total price including commission, as a decimal string.
+	pub total: String,
+}

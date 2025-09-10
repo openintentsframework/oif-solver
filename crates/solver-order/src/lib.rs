@@ -4,10 +4,12 @@
 //! generation for filling and claiming orders. It supports multiple order
 //! standards and pluggable execution strategies.
 
+use alloy_primitives::Bytes;
 use async_trait::async_trait;
 use solver_types::{
-	Address, ConfigSchema, ExecutionContext, ExecutionDecision, ExecutionParams, FillProof,
-	ImplementationRegistry, Intent, NetworksConfig, Order, Transaction,
+	standards::eip7683::interfaces::StandardOrder, Address, ConfigSchema, ExecutionContext,
+	ExecutionDecision, ExecutionParams, FillProof, ImplementationRegistry, Intent, NetworksConfig,
+	Order, Transaction,
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -119,6 +121,14 @@ pub trait OrderInterface: Send + Sync {
 		order: &Order,
 		fill_proof: &FillProof,
 	) -> Result<Transaction, OrderError>;
+
+	/// Validates raw order bytes for this standard.
+	async fn validate_order(&self, _order_bytes: &Bytes) -> Result<StandardOrder, OrderError> {
+		// Default implementation: not supported
+		Err(OrderError::ValidationFailed(
+			"Order bytes validation not implemented for this standard".to_string(),
+		))
+	}
 }
 
 /// Trait defining the interface for execution strategies.
@@ -155,10 +165,7 @@ pub type OrderFactory = fn(
 ///
 /// This is the function signature that all strategy implementations must provide
 /// to create instances of their execution strategy.
-pub type StrategyFactory = fn(
-	&toml::Value,
-	Option<solver_config::GasConfig>,
-) -> Result<Box<dyn ExecutionStrategy>, StrategyError>;
+pub type StrategyFactory = fn(&toml::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError>;
 
 /// Registry trait for order implementations.
 ///
@@ -299,5 +306,18 @@ impl OrderService {
 		implementation
 			.generate_claim_transaction(order, proof)
 			.await
+	}
+
+	/// Validates raw order bytes using the appropriate standard implementation.
+	pub async fn validate_order(
+		&self,
+		standard: &str,
+		order_bytes: &Bytes,
+	) -> Result<StandardOrder, OrderError> {
+		let implementation = self.implementations.get(standard).ok_or_else(|| {
+			OrderError::ValidationFailed(format!("Unknown standard: {}", standard))
+		})?;
+
+		implementation.validate_order(order_bytes).await
 	}
 }
