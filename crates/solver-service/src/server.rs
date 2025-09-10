@@ -384,7 +384,7 @@ async fn validate_order_submission(
 		.map_err(|e| APIError::BadRequest {
 			error_type: "ORDER_VALIDATION_FAILED".to_string(),
 			message: format!("Order validation failed: {}", e),
-			details: None,
+			details: Some(payload.clone()),
 		})?;
 
 	Ok(order)
