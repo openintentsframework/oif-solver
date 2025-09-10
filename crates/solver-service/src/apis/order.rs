@@ -340,7 +340,7 @@ mod tests {
 		let providers: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> = HashMap::new();
 		let delivery = Arc::new(DeliveryService::new(providers, 1));
 		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
-		let strategy = create_strategy(&Value::Table(toml::map::Map::new()), None).unwrap();
+		let strategy = create_strategy(&Value::Table(toml::map::Map::new())).unwrap();
 		let order = Arc::new(OrderService::new(HashMap::new(), strategy));
 		let settlement = Arc::new(SettlementService::new(HashMap::new()));
 		let event_bus = EventBus::new(64);

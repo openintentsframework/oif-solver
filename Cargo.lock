@@ -3549,7 +3549,6 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
- "solver-config",
  "solver-types",
  "thiserror 1.0.69",
  "tokio",
