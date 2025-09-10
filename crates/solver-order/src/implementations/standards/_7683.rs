@@ -216,7 +216,7 @@ impl OrderInterface for Eip7683OrderImpl {
 			intent_data = ?intent.data,
 			"Raw intent data before parsing"
 		);
-		
+
 		let order_data: Eip7683OrderData =
 			serde_json::from_value(intent.data.clone()).map_err(|e| {
 				OrderError::ValidationFailed(format!("Failed to parse order data: {}", e))
@@ -414,7 +414,7 @@ impl OrderInterface for Eip7683OrderImpl {
 			source = %intent.source,
 			"Checking lock type for preparation decision"
 		);
-		
+
 		// Skip prepare for Compact (resource lock) flows
 		if matches!(order_data.lock_type, Some(LockType::ResourceLock)) {
 			tracing::info!(
