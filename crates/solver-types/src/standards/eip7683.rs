@@ -450,6 +450,7 @@ mod tests {
 		assert_eq!(json, r#"{"data":"0x"}"#);
 	}
 
+	#[allow(clippy::clone_on_copy)]
 	#[test]
 	fn test_clone_and_debug() {
 		let lock_type = LockType::Permit2Escrow;

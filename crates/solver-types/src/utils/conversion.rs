@@ -195,6 +195,7 @@ pub fn wei_string_to_eth_string(wei_string: &str) -> Result<String, String> {
 mod tests {
 	use super::*;
 
+	#[allow(clippy::mixed_case_hex_literals)]
 	#[test]
 	fn test_bytes32_to_address() {
 		// Test with a typical bytes32 value (address padded with zeros)
@@ -209,6 +210,7 @@ mod tests {
 		assert_eq!(address, "5fbdb2315678afecb367f032d93f642f64180aa3");
 	}
 
+	#[allow(clippy::mixed_case_hex_literals)]
 	#[test]
 	fn test_bytes20_to_alloy_address_valid() {
 		// Test with a valid 20-byte address
@@ -243,6 +245,7 @@ mod tests {
 		);
 	}
 
+	#[allow(clippy::mixed_case_hex_literals)]
 	#[test]
 	fn test_bytes20_to_alloy_address_too_short() {
 		// Test with less than 20 bytes
@@ -253,6 +256,7 @@ mod tests {
 		assert_eq!(result.unwrap_err(), "Expected 20-byte address, got 5");
 	}
 
+	#[allow(clippy::mixed_case_hex_literals)]
 	#[test]
 	fn test_bytes20_to_alloy_address_too_long() {
 		// Test with more than 20 bytes
@@ -276,6 +280,7 @@ mod tests {
 		assert_eq!(result.unwrap_err(), "Expected 20-byte address, got 0");
 	}
 
+	#[allow(clippy::mixed_case_hex_literals)]
 	#[test]
 	fn test_bytes20_to_alloy_address_common_addresses() {
 		// Test with common known addresses
