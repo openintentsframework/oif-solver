@@ -7,7 +7,7 @@ use crate::auth::JwtService;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use solver_types::{AuthScope, TokenType};
+use solver_types::AuthScope;
 use std::sync::Arc;
 
 /// Request payload for client registration
@@ -19,8 +19,6 @@ pub struct RegisterRequest {
 	pub client_name: Option<String>,
 	/// Requested scopes (if not provided, defaults to basic read permissions)
 	pub scopes: Option<Vec<String>>,
-	/// Optional custom access token expiry in hours
-	pub access_token_expiry_hours: Option<u32>,
 }
 
 /// Response payload for successful registration
@@ -47,22 +45,6 @@ pub struct RegisterResponse {
 pub struct RefreshRequest {
 	/// The refresh token to exchange for new tokens
 	pub refresh_token: String,
-}
-
-/// Response payload for successful token refresh
-#[derive(Debug, Serialize)]
-pub struct RefreshResponse {
-	/// The new access token
-	pub access_token: String,
-	/// The new refresh token
-	pub refresh_token: String,
-	/// Access token expiry time in Unix timestamp
-	pub access_token_expires_at: i64,
-	/// Refresh token expiry time in Unix timestamp  
-	pub refresh_token_expires_at: i64,
-	pub token_type: TokenType,
-	/// Token type (always "Bearer")
-	pub token_auth_type: String,
 }
 
 /// Handles POST /api/auth/register requests.
@@ -125,27 +107,24 @@ pub async fn register_client(
 	};
 
 	// Generate access token
-	let access_token = match jwt_service.generate_access_token(
-		&request.client_id,
-		scopes.clone(),
-		request.access_token_expiry_hours,
-	) {
-		Ok(token) => token,
-		Err(e) => {
-			tracing::error!(
-				"Failed to generate access token for client {}: {}",
-				request.client_id,
-				e
-			);
-			return (
-				StatusCode::INTERNAL_SERVER_ERROR,
-				Json(json!({
-					"error": "Failed to generate access token"
-				})),
-			)
-				.into_response();
-		},
-	};
+	let access_token =
+		match jwt_service.generate_access_token(&request.client_id, scopes.clone(), None) {
+			Ok(token) => token,
+			Err(e) => {
+				tracing::error!(
+					"Failed to generate access token for client {}: {}",
+					request.client_id,
+					e
+				);
+				return (
+					StatusCode::INTERNAL_SERVER_ERROR,
+					Json(json!({
+						"error": "Failed to generate access token"
+					})),
+				)
+					.into_response();
+			},
+		};
 
 	// Generate refresh token
 	let refresh_token = match jwt_service
@@ -174,7 +153,7 @@ pub async fn register_client(
 		Ok(claims) => claims.exp,
 		Err(_) => {
 			// Fallback calculation if we can't decode our own token
-			let expiry_hours = request.access_token_expiry_hours.unwrap_or(1);
+			let expiry_hours = jwt_service.config().access_token_expiry_hours;
 			chrono::Utc::now().timestamp() + (expiry_hours as i64 * 3600)
 		},
 	};
@@ -238,6 +217,21 @@ pub async fn refresh_token(
 			.into_response();
 	}
 
+	// First validate the refresh token to extract claims for response
+	let refresh_claims = match jwt_service.validate_token(&request.refresh_token) {
+		Ok(claims) => claims,
+		Err(e) => {
+			tracing::warn!("Invalid refresh token: {}", e);
+			return (
+				StatusCode::UNAUTHORIZED,
+				Json(json!({
+					"error": "Invalid or expired refresh token"
+				})),
+			)
+				.into_response();
+		},
+	};
+
 	// Exchange refresh token for new tokens
 	let (new_access_token, new_refresh_token) = match jwt_service
 		.refresh_access_token(&request.refresh_token)
@@ -272,13 +266,14 @@ pub async fn refresh_token(
 	tracing::info!("Token refreshed successfully");
 
 	// Return success response
-	let response = RefreshResponse {
+	let response = RegisterResponse {
 		access_token: new_access_token,
 		refresh_token: new_refresh_token,
+		client_id: refresh_claims.sub,
 		access_token_expires_at,
 		refresh_token_expires_at,
-		token_type: TokenType::Access,
-		token_auth_type: "Bearer".to_string(),
+		scopes: refresh_claims.scope.iter().map(|s| s.to_string()).collect(),
+		token_type: "Bearer".to_string(),
 	};
 
 	(StatusCode::OK, Json(response)).into_response()

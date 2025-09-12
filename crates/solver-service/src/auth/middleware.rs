@@ -126,7 +126,6 @@ mod tests {
 		routing::get,
 		Router,
 	};
-	use solver_storage::{implementations::memory::MemoryStorage, StorageService};
 	use solver_types::{AuthConfig, SecretString};
 	use tower::ServiceExt;
 
@@ -155,8 +154,7 @@ mod tests {
 			issuer: "test".to_string(),
 		};
 
-		let storage = Arc::new(StorageService::new(Box::new(MemoryStorage::new())));
-		let jwt_service = Arc::new(JwtService::new(config, storage).unwrap());
+		let jwt_service = Arc::new(JwtService::new(config).unwrap());
 		let token = jwt_service
 			.generate_access_token("test-client", vec![AuthScope::ReadOrders], None)
 			.unwrap();
@@ -187,8 +185,7 @@ mod tests {
 			issuer: "test".to_string(),
 		};
 
-		let storage = Arc::new(StorageService::new(Box::new(MemoryStorage::new())));
-		let jwt_service = Arc::new(JwtService::new(config, storage).unwrap());
+		let jwt_service = Arc::new(JwtService::new(config).unwrap());
 		let app = create_test_app(jwt_service);
 
 		let response = app
@@ -214,8 +211,7 @@ mod tests {
 			issuer: "test".to_string(),
 		};
 
-		let storage = Arc::new(StorageService::new(Box::new(MemoryStorage::new())));
-		let jwt_service = Arc::new(JwtService::new(config, storage).unwrap());
+		let jwt_service = Arc::new(JwtService::new(config).unwrap());
 		let token = jwt_service
 			.generate_access_token("test-client", vec![AuthScope::CreateQuotes], None)
 			.unwrap();

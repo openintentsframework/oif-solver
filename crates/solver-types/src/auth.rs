@@ -78,18 +78,6 @@ pub struct JwtClaims {
 	pub scope: Vec<AuthScope>,
 	/// Optional nonce for one-time tokens
 	pub nonce: Option<String>,
-	/// Token type (access or refresh)
-	pub token_type: TokenType,
-}
-
-/// Token type enumeration
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TokenType {
-	/// Access token for API calls
-	Access,
-	/// Refresh token for obtaining new access tokens
-	Refresh,
 }
 
 /// Refresh token data stored persistently

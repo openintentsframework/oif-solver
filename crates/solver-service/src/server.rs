@@ -78,20 +78,18 @@ pub async fn start_server(
 
 	// Initialize JWT service if auth is enabled
 	let jwt_service = match &api_config.auth {
-		Some(auth_config) if auth_config.enabled => {
-			match JwtService::new(auth_config.clone(), solver.storage().clone()) {
-				Ok(service) => {
-					tracing::info!(
-						"API authentication enabled with issuer: {}",
-						auth_config.issuer
-					);
-					Some(Arc::new(service))
-				},
-				Err(e) => {
-					tracing::error!("Failed to initialize JWT service: {}", e);
-					return Err(e.into());
-				},
-			}
+		Some(auth_config) if auth_config.enabled => match JwtService::new(auth_config.clone()) {
+			Ok(service) => {
+				tracing::info!(
+					"API authentication enabled with issuer: {}",
+					auth_config.issuer
+				);
+				Some(Arc::new(service))
+			},
+			Err(e) => {
+				tracing::error!("Failed to initialize JWT service: {}", e);
+				return Err(e.into());
+			},
 		},
 		_ => {
 			tracing::info!("API authentication disabled");
