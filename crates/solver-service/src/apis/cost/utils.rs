@@ -7,7 +7,7 @@
 use alloy_primitives::U256;
 use solver_config::Config;
 use solver_core::SolverEngine;
-use solver_types::{QuoteError, QuoteOrder, SignatureType, DEFAULT_GAS_PRICE_WEI};
+use solver_types::{QuoteError, DEFAULT_GAS_PRICE_WEI};
 
 /// Gets the gas price for a specific chain from the solver's delivery service.
 ///
@@ -68,28 +68,6 @@ pub fn estimate_gas_units_from_config(
 	);
 
 	(fallback_open, fallback_fill, fallback_claim)
-}
-
-/// Determines the flow key from QuoteOrder data (for CostEngine).
-///
-/// This detects the flow type based on order signatures and types:
-/// - "compact_resource_lock" for orders containing "Lock" or "Compact"  
-/// - "permit2_escrow" for EIP-712 signature orders
-pub fn determine_flow_key_from_quote_orders(orders: &[QuoteOrder]) -> Option<String> {
-	if orders
-		.iter()
-		.any(|o| o.primary_type.contains("Lock") || o.primary_type.contains("Compact"))
-	{
-		return Some("compact_resource_lock".to_string());
-	}
-	// Default to permit2-based escrow if using EIP-712 style signatures
-	if orders
-		.iter()
-		.any(|o| matches!(o.signature_type, SignatureType::Eip712))
-	{
-		return Some("permit2_escrow".to_string());
-	}
-	None
 }
 
 /// Adds two decimal string values and returns the sum as a string.

@@ -58,6 +58,7 @@ use hex;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use solver_types::{
+	api::IntentRequest,
 	bytes32_to_address, current_timestamp, normalize_bytes32_address,
 	standards::eip7683::{
 		interfaces::{IInputSettlerCompact, IInputSettlerEscrow, SolMandateOutput, StandardOrder},
@@ -204,71 +205,6 @@ where
 		.map_err(|e| Error::custom(format!("Invalid hex: {}", e)))?;
 
 	Ok(bytes)
-}
-
-/// Flexible deserializer for LockType that accepts numbers, strings, or enum names.
-fn deserialize_lock_type_flexible<'de, D>(deserializer: D) -> Result<LockType, D::Error>
-where
-	D: serde::Deserializer<'de>,
-{
-	use serde::de::Error;
-	let v = serde_json::Value::deserialize(deserializer)?;
-	match v {
-		serde_json::Value::Number(n) => {
-			let num = n
-				.as_u64()
-				.ok_or_else(|| Error::custom("Invalid number for LockType"))?;
-			if num <= u8::MAX as u64 {
-				LockType::from_u8(num as u8).ok_or_else(|| Error::custom("Invalid LockType value"))
-			} else {
-				Err(Error::custom("LockType value out of range"))
-			}
-		},
-		serde_json::Value::String(s) => {
-			// Try parsing as number first, then as enum name
-			if let Ok(num) = s.parse::<u8>() {
-				LockType::from_u8(num).ok_or_else(|| Error::custom("Invalid LockType value"))
-			} else {
-				// Try parsing as enum variant name
-				match s.as_str() {
-					"permit2_escrow" | "Permit2Escrow" => Ok(LockType::Permit2Escrow),
-					"eip3009_escrow" | "Eip3009Escrow" => Ok(LockType::Eip3009Escrow),
-					"resource_lock" | "ResourceLock" => Ok(LockType::ResourceLock),
-					_ => Err(Error::custom("Invalid LockType string")),
-				}
-			}
-		},
-		serde_json::Value::Null => Ok(default_lock_type()),
-		_ => Err(Error::custom(
-			"expected number, string, or null for LockType",
-		)),
-	}
-}
-
-/// API request wrapper for intent submission.
-///
-/// This is the top-level structure for POST /intent requests with the OIF format.
-///
-/// # Fields
-///
-/// * `order` - The StandardOrder encoded as hex bytes
-/// * `sponsor` - The address sponsoring the order (usually the user)
-/// * `signature` - The Permit2Witness signature
-/// * `lock_type` - The custody mechanism type
-#[derive(Debug, Deserialize)]
-struct IntentRequest {
-	order: Bytes,
-	sponsor: Address,
-	signature: Bytes,
-	#[serde(
-		default = "default_lock_type",
-		deserialize_with = "deserialize_lock_type_flexible"
-	)]
-	lock_type: LockType,
-}
-
-fn default_lock_type() -> LockType {
-	LockType::Permit2Escrow
 }
 
 /// Status enum for intent submission responses.

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use solver_types::{
 	standards::eip7683::interfaces::StandardOrder, Address, ConfigSchema, ExecutionContext,
 	ExecutionDecision, ExecutionParams, FillProof, ImplementationRegistry, Intent, NetworksConfig,
-	Order, Transaction,
+	Order, OrderIdCallback, Transaction,
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -129,6 +129,25 @@ pub trait OrderInterface: Send + Sync {
 			"Order bytes validation not implemented for this standard".to_string(),
 		))
 	}
+
+	/// Validates order bytes and creates a generic Order with computed order ID.
+	///
+	/// This method performs validation, computes the order ID using the provided callback,
+	/// and returns a generic Order that can be used throughout the system.
+	///
+	/// # Arguments
+	///
+	/// * `order_bytes` - The raw order bytes to validate
+	/// * `lock_type` - The lock type for the order ("permit2_escrow", "eip3009_escrow", etc.)
+	/// * `order_id_callback` - Callback function to compute the order ID
+	/// * `solver_address` - The solver's address for reward attribution
+	async fn validate_and_create_order(
+		&self,
+		order_bytes: &Bytes,
+		lock_type: &str,
+		order_id_callback: OrderIdCallback,
+		solver_address: &Address,
+	) -> Result<Order, OrderError>;
 }
 
 /// Trait defining the interface for execution strategies.
@@ -319,5 +338,26 @@ impl OrderService {
 		})?;
 
 		implementation.validate_order(order_bytes).await
+	}
+
+	/// Validates order bytes and creates a generic Order with computed order ID.
+	///
+	/// This method delegates to the appropriate standard implementation to validate
+	/// the order and compute its ID using the provided callback.
+	pub async fn validate_and_create_order(
+		&self,
+		standard: &str,
+		order_bytes: &Bytes,
+		lock_type: &str,
+		order_id_callback: OrderIdCallback,
+		solver_address: &Address,
+	) -> Result<Order, OrderError> {
+		let implementation = self.implementations.get(standard).ok_or_else(|| {
+			OrderError::ValidationFailed(format!("Unknown standard: {}", standard))
+		})?;
+
+		implementation
+			.validate_and_create_order(order_bytes, lock_type, order_id_callback, solver_address)
+			.await
 	}
 }
