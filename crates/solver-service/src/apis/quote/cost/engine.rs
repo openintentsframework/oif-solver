@@ -13,7 +13,7 @@ use solver_types::{
 use solver_types::{
 	current_timestamp,
 	standards::eip7683::{interfaces::StandardOrder, Eip7683OrderData, MandateOutput},
-	APIError, Address, ExecutionParams, FillProof, Order, OrderStatus, Transaction,
+	APIError, Address, ApiErrorType, ExecutionParams, FillProof, Order, OrderStatus, Transaction,
 	TransactionHash, DEFAULT_GAS_PRICE_WEI,
 };
 
@@ -164,7 +164,7 @@ impl CostEngine {
 			.outputs
 			.first()
 			.ok_or_else(|| APIError::BadRequest {
-				error_type: "NO_OUTPUTS".to_string(),
+				error_type: ApiErrorType::NoOutputs,
 				message: "Order must have at least one output".to_string(),
 				details: None,
 			})?
@@ -183,7 +183,7 @@ impl CostEngine {
 			)
 			.await
 			.map_err(|e| APIError::InternalServerError {
-				error_type: "GAS_ESTIMATION_FAILED".to_string(),
+				error_type: ApiErrorType::GasEstimationFailed,
 				message: format!("Gas estimation failed: {}", e),
 			})?;
 
@@ -206,7 +206,7 @@ impl CostEngine {
 			)
 			.await
 			.map_err(|e| APIError::InternalServerError {
-				error_type: "COST_CALCULATION_FAILED".to_string(),
+				error_type: ApiErrorType::CostCalculationFailed,
 				message: format!("Cost calculation failed: {}", e),
 			})?;
 
@@ -375,7 +375,7 @@ impl CostEngine {
 			updated_at: current_timestamp(),
 			status: OrderStatus::Created,
 			data: serde_json::to_value(&order_data).map_err(|e| APIError::InternalServerError {
-				error_type: "SERIALIZATION_FAILED".to_string(),
+				error_type: ApiErrorType::SerializationFailed,
 				message: format!("Failed to serialize order data: {}", e),
 			})?,
 			solver_address: Address(vec![0u8; 20]), // Dummy solver address for estimation
@@ -415,7 +415,7 @@ impl CostEngine {
 			.generate_fill_transaction(&order, &params)
 			.await
 			.map_err(|e| APIError::InternalServerError {
-				error_type: "FILL_TX_GENERATION_FAILED".to_string(),
+				error_type: ApiErrorType::FillTxGenerationFailed,
 				message: format!("Failed to generate fill transaction: {}", e),
 			})
 	}
@@ -442,7 +442,7 @@ impl CostEngine {
 			.generate_claim_transaction(&order, &fill_proof)
 			.await
 			.map_err(|e| APIError::InternalServerError {
-				error_type: "CLAIM_TX_GENERATION_FAILED".to_string(),
+				error_type: ApiErrorType::ClaimTxGenerationFailed,
 				message: format!("Failed to generate claim transaction: {}", e),
 			})
 	}

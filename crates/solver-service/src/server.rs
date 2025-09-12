@@ -19,8 +19,8 @@ use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
 use solver_types::{
-	standards::eip7683::interfaces::StandardOrder, APIError, GetOrderResponse, GetQuoteRequest,
-	GetQuoteResponse,
+	standards::eip7683::interfaces::StandardOrder, APIError, ApiErrorType, GetOrderResponse,
+	GetQuoteRequest, GetQuoteResponse,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -360,7 +360,7 @@ async fn validate_order_submission(
 		.get("order")
 		.and_then(|b| b.as_str())
 		.ok_or_else(|| APIError::BadRequest {
-			error_type: "MISSING_ORDER_BYTES".to_string(),
+			error_type: ApiErrorType::MissingOrderBytes,
 			message: "Missing order field in request".to_string(),
 			details: None,
 		})?;
@@ -368,7 +368,7 @@ async fn validate_order_submission(
 	// Decode hex to bytes
 	let order_bytes = hex::decode(order_bytes_hex.trim_start_matches("0x")).map_err(|_| {
 		APIError::BadRequest {
-			error_type: "INVALID_HEX_ENCODING".to_string(),
+			error_type: ApiErrorType::InvalidHexEncoding,
 			message: "Invalid hex encoding in orderBytes".to_string(),
 			details: None,
 		}
@@ -382,7 +382,7 @@ async fn validate_order_submission(
 		.validate_order(standard, &order_bytes.into())
 		.await
 		.map_err(|e| APIError::BadRequest {
-			error_type: "ORDER_VALIDATION_FAILED".to_string(),
+			error_type: ApiErrorType::OrderValidationFailed,
 			message: format!("Order validation failed: {}", e),
 			details: Some(payload.clone()),
 		})?;
@@ -412,7 +412,7 @@ async fn handle_committed_order(
 				Err(e) => {
 					tracing::warn!("Failed to retrieve quote {}: {}", quote_id, e);
 					return Some(Err(APIError::BadRequest {
-						error_type: "QUOTE_NOT_FOUND".to_string(),
+						error_type: ApiErrorType::QuoteNotFound,
 						message: format!("Quote not found: {}", e),
 						details: Some(serde_json::json!({"quoteId": quote_id})),
 					}));
@@ -423,7 +423,7 @@ async fn handle_committed_order(
 			if let Err(e) = submit_quote_acceptance(&quote, sig, state).await {
 				tracing::warn!("Failed to submit quote to discovery service: {}", e);
 				return Some(Err(APIError::InternalServerError {
-					error_type: "QUOTE_PROCESSING_FAILED".to_string(),
+					error_type: ApiErrorType::QuoteProcessingFailed,
 					message: format!("Failed to process quote: {}", e),
 				}));
 			}
@@ -440,7 +440,7 @@ async fn handle_committed_order(
 		} else {
 			tracing::warn!("Quote acceptance missing signature");
 			Some(Err(APIError::BadRequest {
-				error_type: "MISSING_SIGNATURE".to_string(),
+				error_type: ApiErrorType::MissingSignature,
 				message: "Signature required for quote acceptance".to_string(),
 				details: Some(serde_json::json!({"quoteId": quote_id})),
 			}))
@@ -462,7 +462,7 @@ async fn submit_quote_acceptance(
 		.discovery_url
 		.as_ref()
 		.ok_or_else(|| APIError::InternalServerError {
-			error_type: "DISCOVERY_SERVICE_NOT_CONFIGURED".to_string(),
+			error_type: ApiErrorType::DiscoveryServiceNotConfigured,
 			message: "Discovery service URL not configured".to_string(),
 		})?;
 
@@ -471,7 +471,7 @@ async fn submit_quote_acceptance(
 		solver_types::api::QuoteWithSignature::from((quote, signature))
 			.try_into()
 			.map_err(|e| APIError::InternalServerError {
-				error_type: "QUOTE_CONVERSION_FAILED".to_string(),
+				error_type: ApiErrorType::QuoteConversionFailed,
 				message: format!("Failed to convert quote to intent format: {}", e),
 			})?;
 
@@ -483,7 +483,7 @@ async fn submit_quote_acceptance(
 		.send()
 		.await
 		.map_err(|e| APIError::ServiceUnavailable {
-			error_type: "DISCOVERY_SERVICE_UNAVAILABLE".to_string(),
+			error_type: ApiErrorType::DiscoveryServiceUnavailable,
 			message: format!("Failed to submit to discovery service: {}", e),
 			retry_after: Some(30),
 		})?;
@@ -496,7 +496,7 @@ async fn submit_quote_acceptance(
 			.await
 			.unwrap_or_else(|_| "Unknown error".to_string());
 		Err(APIError::ServiceUnavailable {
-			error_type: "DISCOVERY_SERVICE_ERROR".to_string(),
+			error_type: ApiErrorType::DiscoveryServiceError,
 			message: format!("Discovery service returned error: {}", error_text),
 			retry_after: Some(30),
 		})

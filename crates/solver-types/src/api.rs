@@ -7,6 +7,62 @@ use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// API error types as an enum for compile-time safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ApiErrorType {
+	// Order validation errors
+	MissingOrderBytes,
+	InvalidHexEncoding,
+	OrderValidationFailed,
+
+	// Quote errors
+	QuoteNotFound,
+	QuoteProcessingFailed,
+	QuoteConversionFailed,
+	MissingSignature,
+	InvalidRequest,
+	UnsupportedAsset,
+	UnsupportedSettlement,
+	InsufficientLiquidity,
+	SolverCapacityExceeded,
+
+	// Order retrieval errors
+	OrderNotFound,
+	InvalidOrderId,
+
+	// Discovery service errors
+	DiscoveryServiceNotConfigured,
+	DiscoveryServiceUnavailable,
+	DiscoveryServiceError,
+
+	// Cost estimation errors
+	NoOutputs,
+	GasEstimationFailed,
+	CostCalculationFailed,
+
+	// Transaction generation errors
+	SerializationFailed,
+	FillTxGenerationFailed,
+	ClaimTxGenerationFailed,
+
+	// Generic errors for extensibility
+	ValidationError,
+	ProcessingError,
+	ServiceError,
+	InternalError,
+	Unknown,
+}
+
+impl fmt::Display for ApiErrorType {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		// Use serde to get the SCREAMING_SNAKE_CASE representation
+		let json_str = serde_json::to_string(self).map_err(|_| fmt::Error)?;
+		// Remove quotes from JSON string
+		write!(f, "{}", json_str.trim_matches('"'))
+	}
+}
+
 /// Asset amount representation using ERC-7930 interoperable address format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetAmount {
@@ -188,24 +244,27 @@ pub struct ErrorResponse {
 pub enum APIError {
 	/// Bad request with validation errors (400)
 	BadRequest {
-		error_type: String,
+		error_type: ApiErrorType,
 		message: String,
 		details: Option<serde_json::Value>,
 	},
 	/// Unprocessable entity for business logic failures (422)
 	UnprocessableEntity {
-		error_type: String,
+		error_type: ApiErrorType,
 		message: String,
 		details: Option<serde_json::Value>,
 	},
 	/// Service unavailable with optional retry information (503)
 	ServiceUnavailable {
-		error_type: String,
+		error_type: ApiErrorType,
 		message: String,
 		retry_after: Option<u64>,
 	},
 	/// Internal server error (500)
-	InternalServerError { error_type: String, message: String },
+	InternalServerError {
+		error_type: ApiErrorType,
+		message: String,
+	},
 }
 
 impl APIError {
@@ -227,7 +286,7 @@ impl APIError {
 				message,
 				details,
 			} => ErrorResponse {
-				error: error_type.clone(),
+				error: error_type.to_string(),
 				message: message.clone(),
 				details: details.clone(),
 				retry_after: None,
@@ -237,7 +296,7 @@ impl APIError {
 				message,
 				details,
 			} => ErrorResponse {
-				error: error_type.clone(),
+				error: error_type.to_string(),
 				message: message.clone(),
 				details: details.clone(),
 				retry_after: None,
@@ -247,7 +306,7 @@ impl APIError {
 				message,
 				retry_after,
 			} => ErrorResponse {
-				error: error_type.clone(),
+				error: error_type.to_string(),
 				message: message.clone(),
 				details: None,
 				retry_after: *retry_after,
@@ -256,7 +315,7 @@ impl APIError {
 				error_type,
 				message,
 			} => ErrorResponse {
-				error: error_type.clone(),
+				error: error_type.to_string(),
 				message: message.clone(),
 				details: None,
 				retry_after: None,
@@ -343,32 +402,32 @@ impl From<QuoteError> for APIError {
 	fn from(quote_error: QuoteError) -> Self {
 		match quote_error {
 			QuoteError::InvalidRequest(msg) => APIError::BadRequest {
-				error_type: "INVALID_REQUEST".to_string(),
+				error_type: ApiErrorType::InvalidRequest,
 				message: msg,
 				details: None,
 			},
 			QuoteError::UnsupportedAsset(asset) => APIError::UnprocessableEntity {
-				error_type: "UNSUPPORTED_ASSET".to_string(),
+				error_type: ApiErrorType::UnsupportedAsset,
 				message: format!("Asset not supported by solver: {}", asset),
 				details: Some(serde_json::json!({ "asset": asset })),
 			},
 			QuoteError::UnsupportedSettlement(msg) => APIError::UnprocessableEntity {
-				error_type: "UNSUPPORTED_SETTLEMENT".to_string(),
+				error_type: ApiErrorType::UnsupportedSettlement,
 				message: msg,
 				details: None,
 			},
 			QuoteError::InsufficientLiquidity => APIError::UnprocessableEntity {
-				error_type: "INSUFFICIENT_LIQUIDITY".to_string(),
+				error_type: ApiErrorType::InsufficientLiquidity,
 				message: "Insufficient liquidity available for the requested amount".to_string(),
 				details: None,
 			},
 			QuoteError::SolverCapacityExceeded => APIError::ServiceUnavailable {
-				error_type: "SOLVER_CAPACITY_EXCEEDED".to_string(),
+				error_type: ApiErrorType::SolverCapacityExceeded,
 				message: "Solver capacity exceeded, please try again later".to_string(),
 				retry_after: Some(60), // Suggest retry after 60 seconds
 			},
 			QuoteError::Internal(msg) => APIError::InternalServerError {
-				error_type: "INTERNAL_ERROR".to_string(),
+				error_type: ApiErrorType::InternalError,
 				message: format!("An internal error occurred: {}", msg),
 			},
 		}
@@ -391,17 +450,17 @@ impl From<GetOrderError> for APIError {
 	fn from(order_error: GetOrderError) -> Self {
 		match order_error {
 			GetOrderError::NotFound(id) => APIError::BadRequest {
-				error_type: "ORDER_NOT_FOUND".to_string(),
+				error_type: ApiErrorType::OrderNotFound,
 				message: format!("Order not found: {}", id),
 				details: Some(serde_json::json!({ "order_id": id })),
 			},
 			GetOrderError::InvalidId(id) => APIError::BadRequest {
-				error_type: "INVALID_ORDER_ID".to_string(),
+				error_type: ApiErrorType::InvalidOrderId,
 				message: format!("Invalid order ID format: {}", id),
 				details: Some(serde_json::json!({ "provided_id": id })),
 			},
 			GetOrderError::Internal(msg) => APIError::InternalServerError {
-				error_type: "INTERNAL_ERROR".to_string(),
+				error_type: ApiErrorType::InternalError,
 				message: format!("An internal error occurred: {}", msg),
 			},
 		}
