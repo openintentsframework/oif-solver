@@ -851,6 +851,18 @@ impl OrderInterface for Eip7683OrderImpl {
 			OrderError::ValidationFailed(format!("Failed to compute order ID: {}", e))
 		})?;
 
+		// Ensure order ID is exactly 32 bytes
+		if order_id_bytes.len() != 32 {
+			return Err(OrderError::ValidationFailed(format!(
+				"Invalid order ID length: expected 32 bytes, got {}",
+				order_id_bytes.len()
+			)));
+		}
+
+		// Convert order ID bytes to fixed array
+		let mut order_id_array = [0u8; 32];
+		order_id_array.copy_from_slice(&order_id_bytes);
+
 		// Convert order ID bytes to hex string
 		let order_id = alloy_primitives::hex::encode_prefixed(&order_id_bytes);
 
@@ -863,7 +875,8 @@ impl OrderInterface for Eip7683OrderImpl {
 			.collect();
 
 		// Convert StandardOrder to Eip7683OrderData for serialization
-		let order_data = Eip7683OrderData::from(standard_order.clone());
+		let mut order_data = Eip7683OrderData::from(standard_order.clone());
+		order_data.order_id = order_id_array;
 
 		// Create generic Order
 		Ok(Order {
