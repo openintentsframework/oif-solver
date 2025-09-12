@@ -627,6 +627,7 @@ pub mod interfaces {
 }
 
 /// Implement conversion from StandardOrder to Eip7683OrderData
+#[cfg(feature = "oif-interfaces")]
 impl From<interfaces::StandardOrder> for Eip7683OrderData {
 	fn from(order: interfaces::StandardOrder) -> Self {
 		use crate::utils::with_0x_prefix;

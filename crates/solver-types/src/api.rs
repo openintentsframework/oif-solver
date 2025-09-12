@@ -5,7 +5,6 @@
 use crate::{
 	costs::CostEstimate,
 	standards::{eip7683::LockType, eip7930::InteropAddress},
-	utils::parse_bytes32_from_hex,
 };
 use alloy_primitives::{Address, Bytes, U256};
 use serde::de::Error;
@@ -308,6 +307,7 @@ impl IntentRequest {
 	) -> Result<Self, Box<dyn std::error::Error>> {
 		use crate::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
 		use crate::standards::eip7930::InteropAddress;
+		use crate::utils::parse_bytes32_from_hex;
 		use alloy_primitives::{Address, Bytes, U256};
 		use alloy_sol_types::SolType;
 
