@@ -78,7 +78,7 @@ pub async fn start_server(
 
 	// Initialize JWT service if auth is enabled
 	let jwt_service = match &api_config.auth {
-		Some(auth_config) if auth_config.enabled => match JwtService::new(auth_config.clone()) {
+		Some(auth_config) if auth_config.enabled => match JwtService::new(auth_config.clone(), solver.storage().clone()) {
 			Ok(service) => {
 				tracing::info!(
 					"API authentication enabled with issuer: {}",
@@ -107,10 +107,16 @@ pub async fn start_server(
 
 	// Build the router with /api base path and quote endpoint
 	let mut api_routes = Router::new()
-		.route("/register", post(handle_register))
 		.route("/quotes", post(handle_quote))
 		.route("/tokens", get(handle_get_tokens))
 		.route("/tokens/{chain_id}", get(handle_get_tokens_for_chain));
+
+	// Add auth subroutes
+	let auth_routes = Router::new()
+		.route("/register", post(handle_auth_register))
+		.route("/refresh", post(handle_auth_refresh));
+
+	api_routes = api_routes.nest("/auth", auth_routes);
 
 	// Create order routes with optional auth
 	let mut order_routes = Router::new()
@@ -228,15 +234,24 @@ async fn handle_get_tokens_for_chain(
 	crate::apis::tokens::get_tokens_for_chain(Path(chain_id), State(state.solver)).await
 }
 
-/// Handles POST /api/register requests.
+/// Handles POST /api/auth/register requests.
 ///
-/// This endpoint allows clients to self-register and receive JWT tokens
-/// for API authentication.
-async fn handle_register(
+/// Auth endpoint that provides both access and refresh tokens.
+async fn handle_auth_register(
 	State(state): State<AppState>,
-	Json(payload): Json<crate::apis::register::RegisterRequest>,
+	Json(payload): Json<crate::apis::auth::RegisterRequest>,
 ) -> impl IntoResponse {
-	crate::apis::register::register_client(State(state.jwt_service), Json(payload)).await
+	crate::apis::auth::register_client(State(state.jwt_service), Json(payload)).await
+}
+
+/// Handles POST /api/auth/refresh requests.
+///
+/// Endpoint exchanges refresh tokens for new access and refresh tokens.
+async fn handle_auth_refresh(
+	State(state): State<AppState>,
+	Json(payload): Json<crate::apis::auth::RefreshRequest>,
+) -> impl IntoResponse {
+	crate::apis::auth::refresh_token(State(state.jwt_service), Json(payload)).await
 }
 
 /// Handles POST /api/orders requests.

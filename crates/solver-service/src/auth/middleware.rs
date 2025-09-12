@@ -126,6 +126,7 @@ mod tests {
 		routing::get,
 		Router,
 	};
+	use solver_storage::{implementations::memory::MemoryStorage, StorageService};
 	use solver_types::{AuthConfig, SecretString};
 	use tower::ServiceExt;
 
@@ -149,13 +150,15 @@ mod tests {
 		let config = AuthConfig {
 			enabled: true,
 			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars"),
-			token_expiry_hours: 1,
+			access_token_expiry_hours: 1,
+			refresh_token_expiry_hours: 720,
 			issuer: "test".to_string(),
 		};
 
-		let jwt_service = Arc::new(JwtService::new(config).unwrap());
+		let storage = Arc::new(StorageService::new(Box::new(MemoryStorage::new())));
+		let jwt_service = Arc::new(JwtService::new(config, storage).unwrap());
 		let token = jwt_service
-			.generate_token("test-client", vec![AuthScope::ReadOrders], None)
+			.generate_access_token("test-client", vec![AuthScope::ReadOrders], None)
 			.unwrap();
 
 		let app = create_test_app(jwt_service);
@@ -179,11 +182,13 @@ mod tests {
 		let config = AuthConfig {
 			enabled: true,
 			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars"),
-			token_expiry_hours: 1,
+			access_token_expiry_hours: 1,
+			refresh_token_expiry_hours: 720,
 			issuer: "test".to_string(),
 		};
 
-		let jwt_service = Arc::new(JwtService::new(config).unwrap());
+		let storage = Arc::new(StorageService::new(Box::new(MemoryStorage::new())));
+		let jwt_service = Arc::new(JwtService::new(config, storage).unwrap());
 		let app = create_test_app(jwt_service);
 
 		let response = app
@@ -204,13 +209,15 @@ mod tests {
 		let config = AuthConfig {
 			enabled: true,
 			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars"),
-			token_expiry_hours: 1,
+			access_token_expiry_hours: 1,
+			refresh_token_expiry_hours: 720,
 			issuer: "test".to_string(),
 		};
 
-		let jwt_service = Arc::new(JwtService::new(config).unwrap());
+		let storage = Arc::new(StorageService::new(Box::new(MemoryStorage::new())));
+		let jwt_service = Arc::new(JwtService::new(config, storage).unwrap());
 		let token = jwt_service
-			.generate_token("test-client", vec![AuthScope::CreateQuotes], None)
+			.generate_access_token("test-client", vec![AuthScope::CreateQuotes], None)
 			.unwrap();
 
 		let app = create_test_app(jwt_service);

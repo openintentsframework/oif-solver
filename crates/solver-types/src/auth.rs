@@ -78,6 +78,31 @@ pub struct JwtClaims {
 	pub scope: Vec<AuthScope>,
 	/// Optional nonce for one-time tokens
 	pub nonce: Option<String>,
+	/// Token type (access or refresh)
+	pub token_type: TokenType,
+}
+
+/// Token type enumeration
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenType {
+	/// Access token for API calls
+	Access,
+	/// Refresh token for obtaining new access tokens
+	Refresh,
+}
+
+/// Refresh token data stored persistently
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshTokenData {
+	/// Client identifier
+	pub client_id: String,
+	/// Granted scopes
+	pub scopes: Vec<AuthScope>,
+	/// Token expiration timestamp
+	pub expires_at: i64,
+	/// When the token was issued
+	pub issued_at: i64,
 }
 
 /// Authentication configuration for the API service
@@ -87,8 +112,10 @@ pub struct AuthConfig {
 	pub enabled: bool,
 	/// JWT signing secret
 	pub jwt_secret: SecretString,
-	/// Token expiry in hours
-	pub token_expiry_hours: u32,
+	/// Access token expiry in hours
+	pub access_token_expiry_hours: u32,
+	/// Refresh token expiry in hours
+	pub refresh_token_expiry_hours: u32,
 	/// JWT issuer identifier
 	pub issuer: String,
 }
