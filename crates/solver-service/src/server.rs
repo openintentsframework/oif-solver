@@ -583,7 +583,7 @@ async fn calculate_order_profitability(
 			.get_token_info(order_data.origin_chain_id.to::<u64>(), &token_address)
 			.map_err(|e| format!("Failed to get token info: {}", e))?;
 
-		// Convert raw amount to USD using pricing service, then normalize
+		// Convert raw amount to USD using pricing service
 		let usd_amount = convert_raw_token_to_usd(
 			&amount_u256,
 			&token_info.symbol,
@@ -609,7 +609,7 @@ async fn calculate_order_profitability(
 			.get_token_info(output.chain_id.to::<u64>(), &token_address)
 			.map_err(|e| format!("Failed to get token info: {}", e))?;
 
-		// Convert raw amount to USD using pricing service, then normalize
+		// Convert raw amount to USD using pricing service
 		let usd_amount = convert_raw_token_to_usd(
 			&output.amount,
 			&token_info.symbol,
