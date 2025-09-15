@@ -940,7 +940,7 @@ mod tests {
 	use alloy_primitives::U256;
 	use solver_types::{
 		oracle::{OracleInfo, OracleRoutes},
-		standards::eip7683::{Eip7683OrderData, LockType},
+		standards::eip7683::{interfaces, Eip7683OrderData, LockType},
 		utils::tests::builders::{
 			Eip7683OrderDataBuilder, IntentBuilder, NetworkConfigBuilder, NetworksConfigBuilder,
 			OrderBuilder,
@@ -1116,7 +1116,29 @@ mod tests {
 		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let mut order_data = create_test_order_data();
-		order_data.raw_order_data = Some("0xabcdef".to_string());
+		// Create a valid StandardOrder and encode it for raw_order_data
+		use alloy_primitives::{Address as AlloyAddress, B256};
+		use alloy_sol_types::SolValue;
+		let test_order = interfaces::StandardOrder {
+			user: AlloyAddress::from([0x11; 20]),
+			nonce: U256::from(123),
+			originChainId: U256::from(1),
+			expires: 1000000000,
+			fillDeadline: 1000000100,
+			inputOracle: AlloyAddress::from([0x22; 20]),
+			inputs: vec![[U256::from(100), U256::from(200)]],
+			outputs: vec![interfaces::SolMandateOutput {
+				oracle: B256::from([0x33; 32]),
+				settler: B256::from([0x44; 32]),
+				chainId: U256::from(137),
+				token: B256::from([0x55; 32]),
+				amount: U256::from(1000),
+				recipient: B256::from([0x66; 32]),
+				call: vec![].into(),
+				context: vec![].into(),
+			}],
+		};
+		order_data.raw_order_data = Some(format!("0x{}", hex::encode(test_order.abi_encode())));
 		order_data.sponsor = Some("0x1111111111111111111111111111111111111111".to_string());
 		order_data.signature = Some("0x22222222".to_string());
 
