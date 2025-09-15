@@ -327,8 +327,9 @@ create_eip3009_intent() {
     fi
     
     # Pass the StandardOrder struct directly to orderIdentifier
+    local order_identifier_sig="orderIdentifier((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))"
     local order_id=$(cast call "$input_settler" \
-        "orderIdentifier((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))" \
+        "$order_identifier_sig" \
         "$order_struct" --rpc-url "$origin_rpc")
     
     if [ -z "$order_id" ] || [ "$order_id" = "0x0000000000000000000000000000000000000000000000000000000000000000" ]; then
