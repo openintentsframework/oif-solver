@@ -130,7 +130,7 @@ pub fn parse_address(hex_str: &str) -> Result<Address, String> {
 /// A string representation of the ETH amount (e.g., "1.5" for 1.5 ETH)
 ///
 /// # Example
-/// ```
+/// ```text
 /// use alloy_primitives::U256;
 /// use solver_types::utils::conversion::wei_to_eth_string;
 ///
@@ -155,7 +155,7 @@ pub fn wei_to_eth_string(wei_amount: U256) -> String {
 /// * `Err(String)` - Error message if parsing fails
 ///
 /// # Example
-/// ```
+/// ```text
 /// use solver_types::utils::conversion::eth_string_to_wei;
 ///
 /// let wei = eth_string_to_wei("1.5").unwrap();
@@ -179,7 +179,7 @@ pub fn eth_string_to_wei(eth_amount: &str) -> Result<U256, String> {
 /// * `Err(String)` - Error message if parsing fails
 ///
 /// # Example
-/// ```
+/// ```text
 /// use solver_types::utils::conversion::wei_string_to_eth_string;
 ///
 /// let eth_str = wei_string_to_eth_string("1500000000000000000").unwrap();
@@ -195,6 +195,7 @@ pub fn wei_string_to_eth_string(wei_string: &str) -> Result<String, String> {
 mod tests {
 	use super::*;
 
+	#[allow(clippy::mixed_case_hex_literals)]
 	#[test]
 	fn test_bytes32_to_address() {
 		// Test with a typical bytes32 value (address padded with zeros)
@@ -209,6 +210,7 @@ mod tests {
 		assert_eq!(address, "5fbdb2315678afecb367f032d93f642f64180aa3");
 	}
 
+	#[allow(clippy::mixed_case_hex_literals)]
 	#[test]
 	fn test_bytes20_to_alloy_address_valid() {
 		// Test with a valid 20-byte address
@@ -243,6 +245,7 @@ mod tests {
 		);
 	}
 
+	#[allow(clippy::mixed_case_hex_literals)]
 	#[test]
 	fn test_bytes20_to_alloy_address_too_short() {
 		// Test with less than 20 bytes
@@ -253,6 +256,7 @@ mod tests {
 		assert_eq!(result.unwrap_err(), "Expected 20-byte address, got 5");
 	}
 
+	#[allow(clippy::mixed_case_hex_literals)]
 	#[test]
 	fn test_bytes20_to_alloy_address_too_long() {
 		// Test with more than 20 bytes
@@ -276,6 +280,7 @@ mod tests {
 		assert_eq!(result.unwrap_err(), "Expected 20-byte address, got 0");
 	}
 
+	#[allow(clippy::mixed_case_hex_literals)]
 	#[test]
 	fn test_bytes20_to_alloy_address_common_addresses() {
 		// Test with common known addresses

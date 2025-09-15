@@ -25,18 +25,32 @@
 
 # Configuration module - manages TOML configuration dynamically
 
-# Global associative arrays for config storage
-declare -gA CONFIG_MAIN
-declare -gA CONFIG_NETWORKS
-declare -gA CONFIG_TOKENS
-declare -gA CONFIG_CONTRACTS
-declare -gA CONFIG_ACCOUNTS
-declare -gA CONFIG_COMPACT
-declare -gA CONFIG_API
-declare -gA CONFIG_GAS
+# Configuration storage using regular variables
 
 # Array to store discovered chain IDs
-declare -ga CHAIN_IDS=()
+CHAIN_IDS=()
+
+# Helper functions for config storage (simulating associative arrays)
+config_set() {
+    local category="$1"
+    local key="$2"
+    local value="$3"
+    # Convert to uppercase using tr
+    local category_upper=$(echo "$category" | tr '[:lower:]' '[:upper:]')
+    local var_name="CONFIG_${category_upper}_${key}"
+    # Use eval to set the variable dynamically
+    eval "${var_name}='${value}'"
+}
+
+config_get_var() {
+    local category="$1"
+    local key="$2"
+    # Convert to uppercase using tr
+    local category_upper=$(echo "$category" | tr '[:lower:]' '[:upper:]')
+    local var_name="CONFIG_${category_upper}_${key}"
+    # Use eval to get the variable value
+    eval "echo \"\$${var_name}\""
+}
 
 # Configuration file paths
 CONFIG_DIR="${SCRIPT_DIR}/config"
@@ -98,10 +112,10 @@ config_load() {
     print_debug "Loading configuration from: $config_file"
     
     # Load main config values
-    CONFIG_MAIN[solver_id]=$(parse_toml_value "$config_file" "solver" "id")
-    CONFIG_MAIN[monitoring_timeout]=$(parse_toml_value "$config_file" "solver" "monitoring_timeout_minutes")
-    CONFIG_MAIN[storage_primary]=$(parse_toml_value "$config_file" "storage" "primary")
-    CONFIG_MAIN[storage_path]=$(parse_toml_value "$config_file" "storage.implementations.file" "storage_path")
+    config_set "main" "solver_id" "$(parse_toml_value "$config_file" "solver" "id")"
+    config_set "main" "monitoring_timeout" "$(parse_toml_value "$config_file" "solver" "monitoring_timeout_minutes")"
+    config_set "main" "storage_primary" "$(parse_toml_value "$config_file" "storage" "primary")"
+    config_set "main" "storage_path" "$(parse_toml_value "$config_file" "storage.implementations.file" "storage_path")"
     
     # Process includes
     local includes=$(parse_toml_array "$config_file" "" "include")
@@ -170,7 +184,7 @@ config_load_networks() {
         return 1
     fi
     
-    print_debug "Found chains: ${CHAIN_IDS[*]}"
+    print_debug "Found chains: ${CHAIN_IDS[*]:-}"
     
     # Load each network's configuration
     for chain_id in "${CHAIN_IDS[@]}"; do
@@ -180,8 +194,8 @@ config_load_networks() {
         local rpc_http=$(grep -A2 "\[\[$section.rpc_urls\]\]" "$file" | grep "http =" | head -n1 | sed 's/.*= *//' | tr -d '"')
         local rpc_ws=$(grep -A2 "\[\[$section.rpc_urls\]\]" "$file" | grep "ws =" | head -n1 | sed 's/.*= *//' | tr -d '"')
         
-        CONFIG_NETWORKS[${chain_id}_rpc_url]="${rpc_http:-http://localhost:8545}"
-        CONFIG_NETWORKS[${chain_id}_ws_url]="${rpc_ws:-ws://localhost:8545}"
+        config_set "networks" "${chain_id}_rpc_url" "${rpc_http:-http://localhost:8545}"
+        config_set "networks" "${chain_id}_ws_url" "${rpc_ws:-ws://localhost:8545}"
         
         # Load contract addresses dynamically
         local contracts=(
@@ -197,7 +211,7 @@ config_load_networks() {
         for contract in "${contracts[@]}"; do
             local value=$(parse_toml_value "$file" "$section" "$contract")
             if [ -n "$value" ]; then
-                CONFIG_NETWORKS[${chain_id}_${contract}]="$value"
+                config_set "networks" "${chain_id}_${contract}" "$value"
             fi
         done
         
@@ -211,14 +225,14 @@ config_load_networks() {
             local token_decimals=($(grep -A3 "\[\[$section.tokens\]\]" "$file" | grep "decimals =" | sed 's/.*= *//' | tr -d '"'))
             
             for i in "${!token_addresses[@]}"; do
-                CONFIG_TOKENS[${chain_id}_token_${i}_address]="${token_addresses[$i]}"
-                CONFIG_TOKENS[${chain_id}_token_${i}_symbol]="${token_symbols[$i]:-TOKEN$i}"
-                CONFIG_TOKENS[${chain_id}_token_${i}_decimals]="${token_decimals[$i]:-18}"
+                config_set "tokens" "${chain_id}_token_${i}_address" "${token_addresses[$i]}"
+                config_set "tokens" "${chain_id}_token_${i}_symbol" "${token_symbols[$i]:-TOKEN$i}"
+                config_set "tokens" "${chain_id}_token_${i}_decimals" "${token_decimals[$i]:-18}"
                 token_count=$((token_count + 1))
             done
         fi
         
-        CONFIG_NETWORKS[${chain_id}_token_count]="$token_count"
+        config_set "networks" "${chain_id}_token_count" "$token_count"
         
         print_debug "Loaded chain $chain_id with $token_count tokens"
     done
@@ -228,17 +242,20 @@ config_load_networks() {
 config_load_api() {
     local file="$1"
     
-    CONFIG_API[host]=$(parse_toml_value "$file" "api" "host")
-    CONFIG_API[port]=$(parse_toml_value "$file" "api" "port")
+    config_set "api" "host" "$(parse_toml_value "$file" "api" "host")"
+    config_set "api" "port" "$(parse_toml_value "$file" "api" "port")"
     
     # Load JWT auth configuration
-    CONFIG_API[auth_enabled]=$(parse_toml_value "$file" "api.auth" "enabled")
-    CONFIG_API[auth_jwt_secret]=$(parse_toml_value "$file" "api.auth" "jwt_secret")
-    CONFIG_API[auth_token_expiry_hours]=$(parse_toml_value "$file" "api.auth" "token_expiry_hours")
-    CONFIG_API[auth_issuer]=$(parse_toml_value "$file" "api.auth" "issuer")
+    config_set "api" "auth_enabled" "$(parse_toml_value "$file" "api.auth" "enabled")"
+    config_set "api" "auth_jwt_secret" "$(parse_toml_value "$file" "api.auth" "jwt_secret")"
+    config_set "api" "auth_token_expiry_hours" "$(parse_toml_value "$file" "api.auth" "access_token_expiry_hours")"
+    config_set "api" "auth_refresh_token_expiry_hours" "$(parse_toml_value "$file" "api.auth" "refresh_token_expiry_hours")"
+    config_set "api" "auth_issuer" "$(parse_toml_value "$file" "api.auth" "issuer")"
     
-    if [ -n "${CONFIG_API[host]}" ] && [ -n "${CONFIG_API[port]}" ]; then
-        CONFIG_API[url]="http://${CONFIG_API[host]}:${CONFIG_API[port]}"
+    local host=$(config_get_var "api" "host")
+    local port=$(config_get_var "api" "port")
+    if [ -n "$host" ] && [ -n "$port" ]; then
+        config_set "api" "url" "http://${host}:${port}"
     fi
 }
 
@@ -247,10 +264,10 @@ config_load_accounts() {
     local file="$1"
     
     # Load all account-related keys from cli.toml
-    CONFIG_ACCOUNTS[user_address]=$(parse_toml_value "$file" "accounts" "user_address")
-    CONFIG_ACCOUNTS[user_private_key]=$(parse_toml_value "$file" "accounts" "user_private_key")
-    CONFIG_ACCOUNTS[solver_address]=$(parse_toml_value "$file" "accounts" "solver_address")
-    CONFIG_ACCOUNTS[recipient_address]=$(parse_toml_value "$file" "accounts" "recipient_address")
+    config_set "accounts" "user_address" "$(parse_toml_value "$file" "accounts" "user_address")"
+    config_set "accounts" "user_private_key" "$(parse_toml_value "$file" "accounts" "user_private_key")"
+    config_set "accounts" "solver_address" "$(parse_toml_value "$file" "accounts" "solver_address")"
+    config_set "accounts" "recipient_address" "$(parse_toml_value "$file" "accounts" "recipient_address")"
     
     # Get solver private key from the main config's account.implementations.local section
     if [ -n "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ]; then
@@ -266,7 +283,7 @@ config_load_accounts() {
                 solver_private_key="${!env_expr:-}"
             fi
         fi
-        CONFIG_ACCOUNTS[solver_private_key]="$solver_private_key"
+        config_set "accounts" "solver_private_key" "$solver_private_key"
     fi
 }
 
@@ -276,12 +293,12 @@ config_load_gas() {
     
     # Gas config is primarily for reference/documentation
     # Store values if needed for display purposes
-    CONFIG_GAS["permit2_open"]=$(parse_toml_value "$file" "gas.flows.permit2_escrow" "open")
-    CONFIG_GAS["permit2_fill"]=$(parse_toml_value "$file" "gas.flows.permit2_escrow" "fill")
-    CONFIG_GAS["permit2_claim"]=$(parse_toml_value "$file" "gas.flows.permit2_escrow" "claim")
-    CONFIG_GAS["compact_open"]=$(parse_toml_value "$file" "gas.flows.compact_resource_lock" "open")
-    CONFIG_GAS["compact_fill"]=$(parse_toml_value "$file" "gas.flows.compact_resource_lock" "fill")
-    CONFIG_GAS["compact_claim"]=$(parse_toml_value "$file" "gas.flows.compact_resource_lock" "claim")
+    config_set "gas" "permit2_open" "$(parse_toml_value "$file" "gas.flows.permit2_escrow" "open")"
+    config_set "gas" "permit2_fill" "$(parse_toml_value "$file" "gas.flows.permit2_escrow" "fill")"
+    config_set "gas" "permit2_claim" "$(parse_toml_value "$file" "gas.flows.permit2_escrow" "claim")"
+    config_set "gas" "compact_open" "$(parse_toml_value "$file" "gas.flows.compact_resource_lock" "open")"
+    config_set "gas" "compact_fill" "$(parse_toml_value "$file" "gas.flows.compact_resource_lock" "fill")"
+    config_set "gas" "compact_claim" "$(parse_toml_value "$file" "gas.flows.compact_resource_lock" "claim")"
     
     print_debug "Loaded gas configuration from $file"
 }
@@ -289,12 +306,12 @@ config_load_gas() {
 # Load environment variables
 config_load_env() {
     # Override with environment variables if set
-    [ -n "${USER_ADDRESS:-}" ] && CONFIG_ACCOUNTS[user_address]="$USER_ADDRESS"
-    [ -n "${USER_PRIVATE_KEY:-}" ] && CONFIG_ACCOUNTS[user_private_key]="$USER_PRIVATE_KEY"
-    [ -n "${SOLVER_ADDRESS:-}" ] && CONFIG_ACCOUNTS[solver_address]="$SOLVER_ADDRESS"
-    [ -n "${SOLVER_PRIVATE_KEY:-}" ] && CONFIG_ACCOUNTS[solver_private_key]="$SOLVER_PRIVATE_KEY"
-    [ -n "${RECIPIENT_ADDRESS:-}" ] && CONFIG_ACCOUNTS[recipient_address]="$RECIPIENT_ADDRESS"
-    [ -n "${ETH_PRIVATE_KEY:-}" ] && CONFIG_ACCOUNTS[solver_private_key]="$ETH_PRIVATE_KEY"
+    [ -n "${USER_ADDRESS:-}" ] && config_set "accounts" "user_address" "$USER_ADDRESS"
+    [ -n "${USER_PRIVATE_KEY:-}" ] && config_set "accounts" "user_private_key" "$USER_PRIVATE_KEY"
+    [ -n "${SOLVER_ADDRESS:-}" ] && config_set "accounts" "solver_address" "$SOLVER_ADDRESS"
+    [ -n "${SOLVER_PRIVATE_KEY:-}" ] && config_set "accounts" "solver_private_key" "$SOLVER_PRIVATE_KEY"
+    [ -n "${RECIPIENT_ADDRESS:-}" ] && config_set "accounts" "recipient_address" "$RECIPIENT_ADDRESS"
+    [ -n "${ETH_PRIVATE_KEY:-}" ] && config_set "accounts" "solver_private_key" "$ETH_PRIVATE_KEY"
 }
 
 # Get specific config value
@@ -307,26 +324,29 @@ config_get() {
         config_load
     fi
     
-    local full_key="${section}_${key}"
-    
     case "$section" in
         main|solver|storage)
-            echo "${CONFIG_MAIN[$full_key]:-$default}"
+            local value=$(config_get_var "main" "$key")
+            echo "${value:-$default}"
             ;;
         network|networks)
-            echo "${CONFIG_NETWORKS[$full_key]:-$default}"
+            local value=$(config_get_var "networks" "$key")
+            echo "${value:-$default}"
             ;;
         api | api.auth)
             # Handle both api and api.auth sections
             if [ "$section" = "api.auth" ]; then
                 # For api.auth, prefix the key with auth_
-                echo "${CONFIG_API[auth_${key}]:-$default}"
+                local value=$(config_get_var "api" "auth_${key}")
+                echo "${value:-$default}"
             else
-                echo "${CONFIG_API[$key]:-$default}"
+                local value=$(config_get_var "api" "$key")
+                echo "${value:-$default}"
             fi
             ;;
         account|accounts)
-            echo "${CONFIG_ACCOUNTS[$key]:-$default}"
+            local value=$(config_get_var "accounts" "$key")
+            echo "${value:-$default}"
             ;;
         *)
             echo "$default"
@@ -347,7 +367,8 @@ config_get_network() {
     fi
     
     local key="${chain_id}_${property}"
-    echo "${CONFIG_NETWORKS[$key]:-$default}"
+    local value=$(config_get_var "networks" "$key")
+    echo "${value:-$default}"
 }
 
 # Get all configured network IDs
@@ -366,7 +387,7 @@ config_get_token() {
     fi
     
     local key="${chain_id}_token_${token_index}_${property}"
-    echo "${CONFIG_TOKENS[$key]:-}"
+    config_get_var "tokens" "$key"
 }
 
 # Get token by symbol
@@ -378,9 +399,9 @@ config_get_token_by_symbol() {
     local token_count=$(config_get_network "$chain_id" "token_count" 0)
     
     for ((i=0; i<token_count; i++)); do
-        local token_symbol="${CONFIG_TOKENS[${chain_id}_token_${i}_symbol]:-}"
+        local token_symbol=$(config_get_var "tokens" "${chain_id}_token_${i}_symbol")
         if [ "$token_symbol" = "$symbol" ]; then
-            echo "${CONFIG_TOKENS[${chain_id}_token_${i}_${property}]:-}"
+            config_get_var "tokens" "${chain_id}_token_${i}_${property}"
             return 0
         fi
     done
@@ -399,7 +420,7 @@ config_get_account() {
     fi
     
     local key="${account_type}_${property}"
-    echo "${CONFIG_ACCOUNTS[$key]:-}"
+    config_get_var "accounts" "$key"
 }
 
 # Get list of configured chains
@@ -418,7 +439,7 @@ config_get_tokens() {
     local token_count=$(config_get_network "$chain_id" "token_count" 0)
     
     for ((i=0; i<token_count; i++)); do
-        echo "${CONFIG_TOKENS[${chain_id}_token_${i}_address]:-}"
+        config_get_var "tokens" "${chain_id}_token_${i}_address"
     done
 }
 
@@ -430,7 +451,7 @@ config_get_compact() {
         return 1
     fi
     
-    echo "${CONFIG_COMPACT[$property]:-}"
+    config_get_var "compact" "$property"
 }
 
 config_get_oracle() {
@@ -471,7 +492,7 @@ config_validate() {
     local valid=true
     
     # Check required main config
-    if [ -z "${CONFIG_MAIN[solver_id]:-}" ]; then
+    if [ -z "$(config_get_var "main" "solver_id")" ]; then
         print_error "Missing required config: solver.id"
         valid=false
     fi
@@ -484,7 +505,7 @@ config_validate() {
     
     # Check each configured network
     for chain_id in "${CHAIN_IDS[@]}"; do
-        local rpc_url="${CONFIG_NETWORKS[${chain_id}_rpc_url]:-}"
+        local rpc_url=$(config_get_var "networks" "${chain_id}_rpc_url")
         if [ -z "$rpc_url" ]; then
             print_error "Missing RPC URL for chain $chain_id"
             valid=false
@@ -493,7 +514,8 @@ config_validate() {
         # Check for at least one settler contract
         local has_settler=false
         for settler in input_settler_address output_settler_address input_settler_compact_address; do
-            if [ -n "${CONFIG_NETWORKS[${chain_id}_${settler}]:-}" ]; then
+            local settler_addr=$(config_get_var "networks" "${chain_id}_${settler}")
+            if [ -n "$settler_addr" ]; then
                 has_settler=true
                 break
             fi
@@ -504,24 +526,28 @@ config_validate() {
         fi
         
         # Check for tokens
-        local token_count="${CONFIG_NETWORKS[${chain_id}_token_count]:-0}"
-        if [ "$token_count" -eq 0 ]; then
+        local token_count=$(config_get_var "networks" "${chain_id}_token_count")
+        if [ "${token_count:-0}" -eq 0 ]; then
             print_warning "No tokens configured for chain $chain_id"
         fi
     done
     
     # Check API config
-    if [ -z "${CONFIG_API[host]:-}" ] || [ -z "${CONFIG_API[port]:-}" ]; then
+    local api_host=$(config_get_var "api" "host")
+    local api_port=$(config_get_var "api" "port")
+    if [ -z "$api_host" ] || [ -z "$api_port" ]; then
         print_error "Missing API configuration (host/port)"
         valid=false
     fi
     
     # Check for at least basic accounts from env if not in config
-    if [ -z "${CONFIG_ACCOUNTS[user_address]:-}" ] && [ -z "${USER_ADDRESS:-}" ]; then
+    local user_address=$(config_get_var "accounts" "user_address")
+    if [ -z "$user_address" ] && [ -z "${USER_ADDRESS:-}" ]; then
         print_warning "No user account configured (set USER_ADDRESS env var)"
     fi
     
-    if [ -z "${CONFIG_ACCOUNTS[solver_address]:-}" ] && [ -z "${SOLVER_ADDRESS:-}" ]; then
+    local solver_address=$(config_get_var "accounts" "solver_address")
+    if [ -z "$solver_address" ] && [ -z "${SOLVER_ADDRESS:-}" ]; then
         print_warning "No solver account configured (set SOLVER_ADDRESS env var)"
     fi
     
@@ -537,7 +563,8 @@ config_validate() {
 config_show_summary() {
     print_header "Configuration Summary"
     
-    echo "Solver ID: ${CONFIG_MAIN[solver_id]:-N/A}"
+    local solver_id=$(config_get_var "main" "solver_id")
+    echo "Solver ID: ${solver_id:-N/A}"
     echo ""
     
     echo "Networks:"
@@ -550,7 +577,10 @@ config_show_summary() {
             local addr=$(config_get_network $chain_id $contract)
             if [ -n "$addr" ]; then
                 local name=$(echo $contract | sed 's/_address$//' | sed 's/_/ /g')
-                echo "    ${name^}: $addr"
+                # Replace ${name^} with manual capitalization
+                local first_char=$(echo "$name" | cut -c1 | tr '[:lower:]' '[:upper:]')
+                local rest_chars=$(echo "$name" | cut -c2-)
+                echo "    ${first_char}${rest_chars}: $addr"
             fi
         done
         
@@ -559,8 +589,8 @@ config_show_summary() {
         if [ "$token_count" -gt 0 ]; then
             echo "    Tokens:"
             for ((i=0; i<token_count; i++)); do
-                local symbol="${CONFIG_TOKENS[${chain_id}_token_${i}_symbol]:-}"
-                local addr="${CONFIG_TOKENS[${chain_id}_token_${i}_address]:-}"
+                local symbol=$(config_get_var "tokens" "${chain_id}_token_${i}_symbol")
+                local addr=$(config_get_var "tokens" "${chain_id}_token_${i}_address")
                 echo "      $symbol: $addr"
             done
         fi
@@ -568,35 +598,47 @@ config_show_summary() {
     done
     
     echo "Accounts:"
-    # Show all configured accounts
-    local account_names=($(echo "${!CONFIG_ACCOUNTS[@]}" | tr ' ' '\n' | sed 's/_address$//' | sed 's/_private_key$//' | sort -u))
-    for account in "${account_names[@]}"; do
-        local addr="${CONFIG_ACCOUNTS[${account}_address]:-}"
+    # Show all configured accounts (hardcoded list since we don't have associative arrays)
+    local account_types="user solver recipient"
+    for account in $account_types; do
+        local addr=$(config_get_var "accounts" "${account}_address")
         if [ -n "$addr" ]; then
-            echo "  ${account^}: $addr"
+            # Replace ${account^} with manual capitalization
+            local first_char=$(echo "$account" | cut -c1 | tr '[:lower:]' '[:upper:]')
+            local rest_chars=$(echo "$account" | cut -c2-)
+            echo "  ${first_char}${rest_chars}: $addr"
         fi
     done
     
     # Show env var accounts if not in config
-    if [ -z "${CONFIG_ACCOUNTS[user_address]:-}" ] && [ -n "${USER_ADDRESS:-}" ]; then
+    local user_addr=$(config_get_var "accounts" "user_address")
+    if [ -z "$user_addr" ] && [ -n "${USER_ADDRESS:-}" ]; then
         echo "  User (env): $USER_ADDRESS"
     fi
-    if [ -z "${CONFIG_ACCOUNTS[solver_address]:-}" ] && [ -n "${SOLVER_ADDRESS:-}" ]; then
+    local solver_addr=$(config_get_var "accounts" "solver_address")
+    if [ -z "$solver_addr" ] && [ -n "${SOLVER_ADDRESS:-}" ]; then
         echo "  Solver (env): $SOLVER_ADDRESS"
     fi
     echo ""
     
     echo "API:"
-    echo "  URL: ${CONFIG_API[url]:-N/A}"
+    local api_url=$(config_get_var "api" "url")
+    echo "  URL: ${api_url:-N/A}"
     
     print_separator
 }
 
 # Export configuration to environment variables
 config_export() {
-    # Export accounts
-    for key in "${!CONFIG_ACCOUNTS[@]}"; do
-        export "${key^^}=${CONFIG_ACCOUNTS[$key]}"
+    # Export accounts (hardcoded list since we don't have associative arrays)
+    local account_vars="user_address user_private_key solver_address solver_private_key recipient_address"
+    for key in $account_vars; do
+        local value=$(config_get_var "accounts" "$key")
+        if [ -n "$value" ]; then
+            # Replace ${key^^} with tr for
+            local key_upper=$(echo "$key" | tr '[:lower:]' '[:upper:]')
+            export "${key_upper}=${value}"
+        fi
     done
     
     # Export commonly used addresses for first two chains (origin/dest pattern)
@@ -616,7 +658,8 @@ config_export() {
     fi
     
     # Export API config
-    export API_URL="${CONFIG_API[url]:-}"
+    local api_url=$(config_get_var "api" "url")
+    export API_URL="${api_url:-}"
 }
 
 # Export functions

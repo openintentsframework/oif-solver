@@ -13,7 +13,7 @@ use alloy_primitives::U256;
 ///
 /// # Examples
 ///
-/// ```
+/// ```text
 /// use solver_types::standards::eip7683::builders::Eip7683OrderDataBuilder;
 /// use alloy_primitives::U256;
 ///

@@ -44,31 +44,41 @@ PREFERENCE_COST="cost"
 PREFERENCE_BALANCED="balanced"
 
 # Quote status tracking
-declare -gA QUOTE_STATUS=()
-QUOTE_STATUS[last_quote_id]=""
-QUOTE_STATUS[last_quote_json]=""
-QUOTE_STATUS[last_request_json]=""
-QUOTE_STATUS[last_order_id]=""
+QUOTE_STATUS_last_quote_id=""
+QUOTE_STATUS_last_quote_json=""
+QUOTE_STATUS_last_request_json=""
+QUOTE_STATUS_last_order_id=""
 
 # Clear quote status
 clear_quote_status() {
-    QUOTE_STATUS[last_quote_id]=""
-    QUOTE_STATUS[last_quote_json]=""
-    QUOTE_STATUS[last_request_json]=""
-    QUOTE_STATUS[last_order_id]=""
+    QUOTE_STATUS_last_quote_id=""
+    QUOTE_STATUS_last_quote_json=""
+    QUOTE_STATUS_last_request_json=""
+    QUOTE_STATUS_last_order_id=""
 }
 
 # Get quote status field
 get_quote_status() {
     local field="$1"
-    echo "${QUOTE_STATUS[$field]:-}"
+    case "$field" in
+        last_quote_id) echo "$QUOTE_STATUS_last_quote_id" ;;
+        last_quote_json) echo "$QUOTE_STATUS_last_quote_json" ;;
+        last_request_json) echo "$QUOTE_STATUS_last_request_json" ;;
+        last_order_id) echo "$QUOTE_STATUS_last_order_id" ;;
+        *) echo "" ;;
+    esac
 }
 
 # Set quote status field
 set_quote_status() {
     local field="$1"
     local value="$2"
-    QUOTE_STATUS[$field]="$value"
+    case "$field" in
+        last_quote_id) QUOTE_STATUS_last_quote_id="$value" ;;
+        last_quote_json) QUOTE_STATUS_last_quote_json="$value" ;;
+        last_request_json) QUOTE_STATUS_last_request_json="$value" ;;
+        last_order_id) QUOTE_STATUS_last_order_id="$value" ;;
+    esac
 }
 
 # Build UII address (ERC-7930 format)
@@ -297,23 +307,6 @@ request_token_swap_quote() {
     fi
 }
 
-# Quick quote request with defaults
-quick_quote_request() {
-    local amount="${1:-1000000000000000000}"  # 1 token
-    local api_url="${2:-http://localhost:3000/api/quotes}"
-    
-    # Get config values
-    local user_addr=$(config_get_account "user" "address")
-    local user_key=$(config_get_account "user" "private_key")
-    local recipient=$(config_get_account "recipient" "address")
-    local tokena_origin=$(config_get_token "31337" "tokena")
-    local tokena_dest=$(config_get_token "31338" "tokena")
-    
-    request_token_swap_quote \
-        "$user_addr" "$user_key" "31337" "$tokena_origin" "$amount" \
-        "31338" "$tokena_dest" "$amount" "$recipient" "$api_url"
-}
-
 # Show quote summary
 show_quote_summary() {
     local quote_json="${1:-$(get_quote_status last_quote_json)}"
@@ -533,20 +526,8 @@ quote_get() {
     
     # Check if intent file provided
     if [ -z "$intent_file" ]; then
-        # Try quick quote with defaults
-        print_info "No intent file provided, using default test values"
-        if quick_quote_request; then
-            local quote_json=$(get_quote_status "last_quote_json")
-            
-            # Always save to file
-            echo "$quote_json" | jq '.' > "$save_to"
-            print_success "Quote saved to: $save_to"
-            print_info "Use 'oif-demo quote accept $save_to' to accept the quote"
-            
-            return 0
-        else
-            return 1
-        fi
+        print_info "No intent file provided"
+        return 1
     fi
     
     # Check for --intent flag
@@ -1035,7 +1016,6 @@ export -f build_quote_request
 export -f request_quote
 export -f accept_quote
 export -f request_token_swap_quote
-export -f quick_quote_request
 export -f show_quote_summary
 export -f show_quote_details
 export -f list_quotes

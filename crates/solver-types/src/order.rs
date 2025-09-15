@@ -7,8 +7,21 @@ use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 
-use crate::{Address, AssetAmount, ChainData, SettlementType, TransactionHash, TransactionType};
+use crate::{
+	Address, AssetAmount, ChainData, CostEstimatable, SettlementType, TransactionHash,
+	TransactionType,
+};
+
+/// Callback function type for computing order IDs.
+/// Takes chain_id and transaction data (settler_address + calldata), returns the order ID bytes.
+pub type OrderIdCallback = Box<
+	dyn Fn(u64, Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>>
+		+ Send
+		+ Sync,
+>;
 
 /// Represents a validated cross-chain order with execution state.
 ///
@@ -207,5 +220,25 @@ impl fmt::Display for OrderStatus {
 			OrderStatus::Finalized => write!(f, "Finalized"),
 			OrderStatus::Failed(_) => write!(f, "Failed"),
 		}
+	}
+}
+
+/// Implementation of CostEstimatable for Order
+impl CostEstimatable for Order {
+	fn input_chain_ids(&self) -> Vec<u64> {
+		self.input_chain_ids.clone()
+	}
+
+	fn output_chain_ids(&self) -> Vec<u64> {
+		self.output_chain_ids.clone()
+	}
+
+	fn lock_type(&self) -> Option<&str> {
+		self.data.get("lock_type").and_then(|v| v.as_str())
+	}
+
+	fn as_order_for_estimation(&self) -> Order {
+		// For a real Order, just return a clone
+		self.clone()
 	}
 }
