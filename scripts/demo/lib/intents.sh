@@ -36,34 +36,63 @@
 # Global State Management
 # -----------------------------------------------------------------------------
 # Intent status tracking - stores state from last intent operation
-declare -gA INTENT_STATUS
-INTENT_STATUS[last_order_id]=""
-INTENT_STATUS[last_tx_hash]=""
-INTENT_STATUS[last_signature]=""
-INTENT_STATUS[last_lock_type]=""
+# Using regular variables
+INTENT_STATUS_last_order_id=""
+INTENT_STATUS_last_tx_hash=""
+INTENT_STATUS_last_signature=""
+INTENT_STATUS_last_lock_type=""
 
 # -----------------------------------------------------------------------------
 # Status Management Functions
 # -----------------------------------------------------------------------------
 # Clear intent status
 clear_intent_status() {
-    INTENT_STATUS[last_order_id]=""
-    INTENT_STATUS[last_tx_hash]=""
-    INTENT_STATUS[last_signature]=""
-    INTENT_STATUS[last_lock_type]=""
+    INTENT_STATUS_last_order_id=""
+    INTENT_STATUS_last_tx_hash=""
+    INTENT_STATUS_last_signature=""
+    INTENT_STATUS_last_lock_type=""
 }
 
 # Get intent status field
 get_intent_status() {
     local field="$1"
-    echo "${INTENT_STATUS[$field]}"
+    case "$field" in
+        "last_order_id")
+            echo "$INTENT_STATUS_last_order_id"
+            ;;
+        "last_tx_hash")
+            echo "$INTENT_STATUS_last_tx_hash"
+            ;;
+        "last_signature")
+            echo "$INTENT_STATUS_last_signature"
+            ;;
+        "last_lock_type")
+            echo "$INTENT_STATUS_last_lock_type"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
 }
 
 # Set intent status field
 set_intent_status() {
     local field="$1"
     local value="$2"
-    INTENT_STATUS[$field]="$value"
+    case "$field" in
+        "last_order_id")
+            INTENT_STATUS_last_order_id="$value"
+            ;;
+        "last_tx_hash")
+            INTENT_STATUS_last_tx_hash="$value"
+            ;;
+        "last_signature")
+            INTENT_STATUS_last_signature="$value"
+            ;;
+        "last_lock_type")
+            INTENT_STATUS_last_lock_type="$value"
+            ;;
+    esac
 }
 
 # Build mandate output structure
@@ -326,7 +355,11 @@ create_eip3009_intent() {
         origin_rpc="http://localhost:8545"
     fi
     
-    local order_id=$(cast call "$input_settler" "orderIdentifier(bytes)" "$order_data" --rpc-url "$origin_rpc")
+    # Pass the StandardOrder struct directly to orderIdentifier
+    local order_identifier_sig="orderIdentifier((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))"
+    local order_id=$(cast call "$input_settler" \
+        "$order_identifier_sig" \
+        "$order_struct" --rpc-url "$origin_rpc")
     
     if [ -z "$order_id" ] || [ "$order_id" = "0x0000000000000000000000000000000000000000000000000000000000000000" ]; then
         print_error "Failed to compute order ID from contract" >&2
@@ -630,9 +663,11 @@ create_onchain_intent() {
     
     print_success "Onchain intent created" >&2
     print_debug "Order data: $order_data" >&2
-    
-    # Return order data for onchain submission
-    echo "{\"order\":\"$order_data\",\"sponsor\":\"$user_addr\",\"input_settler\":\"$input_settler\",\"input_token\":\"$input_token\",\"input_amount\":\"$input_amount\"}"
+    print_debug "Order struct: $order_struct" >&2
+
+    # Return order data for onchain submission (signature will be generated at submission time)
+    # Include the order_struct so we don't have to decode it later
+    echo "{\"order\":\"$order_data\",\"order_struct\":\"$order_struct\",\"sponsor\":\"$user_addr\",\"input_settler\":\"$input_settler\",\"input_token\":\"$input_token\",\"input_amount\":\"$input_amount\"}"
     return 0
 }
 
@@ -646,6 +681,7 @@ submit_intent_onchain() {
     
     # Parse intent JSON to extract required fields
     local order_data=$(echo "$intent_json" | jq -r '.order')
+    local order_struct=$(echo "$intent_json" | jq -r '.order_struct // empty')
     local input_settler=$(echo "$intent_json" | jq -r '.input_settler')
     local input_token=$(echo "$intent_json" | jq -r '.input_token')
     local input_amount=$(echo "$intent_json" | jq -r '.input_amount')
@@ -701,9 +737,23 @@ submit_intent_onchain() {
     
     # Call InputSettler.open() with the order data
     print_debug "Calling InputSettler.open() with order data"
-    
-    # Use cast send with --json flag to ensure consistent output
-    local submit_tx=$(cast send "$input_settler" "open(bytes)" "$order_data" \
+
+    # Check if we have the order_struct from the JSON (for new format)
+    if [ -n "$order_struct" ] && [ "$order_struct" != "null" ] && [ "$order_struct" != "empty" ]; then
+        print_debug "Using saved order struct from intent JSON"
+        print_debug "Order struct: $order_struct"
+    else
+        # Fallback: try to decode from order_data (for backward compatibility)
+        print_error "Order struct not found in intent JSON"
+        print_info "Please rebuild the intent using the appropriate build command for your intent type."
+        return 1
+    fi
+
+    # Pass the StandardOrder struct to open
+    local open_signature="open((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))"
+    local submit_tx=$(cast send "$input_settler" \
+        "$open_signature" \
+        "$order_struct" \
         --rpc-url "$origin_rpc" \
         --private-key "$user_private_key" \
         --json 2>&1)
@@ -775,11 +825,9 @@ submit_intent_onchain() {
         local order_id=""
         local receipt=$(cast rpc eth_getTransactionReceipt "$tx_hash" --rpc-url "$origin_rpc" 2>/dev/null || echo "null")
         if [ "$receipt" != "null" ] && [ -n "$receipt" ]; then
-            # The Open event signature: Open(bytes32 indexed,address)
-            # The correct topic hash is for the event with the order ID as first indexed parameter
-            # Let's look for the InputSettler's Open event
-            # Event: Open(bytes32 indexed orderId, address indexed sender)
-            local open_event_topic="0xf04c8c2bbc4615307a4fd1bb1348feffc61a6407b1342c86f80c0ceeffd352eb"
+            # The Open event signature for new contracts: Open(bytes32 indexed orderId, StandardOrder order)
+            # Note: The StandardOrder is not indexed, so it's in the data field, not topics
+            local open_event_topic="0x9ff74bd56d00785b881ef9fa3f03d7b598686a39a9bcff89a6008db588b18a7b"
             
             # Extract order ID from the second topic (first indexed parameter)
             order_id=$(echo "$receipt" | jq -r ".logs[] | select(.topics[0] == \"$open_event_topic\") | .topics[1]" 2>/dev/null | head -n1)

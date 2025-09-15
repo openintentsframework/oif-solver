@@ -44,31 +44,41 @@ PREFERENCE_COST="cost"
 PREFERENCE_BALANCED="balanced"
 
 # Quote status tracking
-declare -gA QUOTE_STATUS=()
-QUOTE_STATUS[last_quote_id]=""
-QUOTE_STATUS[last_quote_json]=""
-QUOTE_STATUS[last_request_json]=""
-QUOTE_STATUS[last_order_id]=""
+QUOTE_STATUS_last_quote_id=""
+QUOTE_STATUS_last_quote_json=""
+QUOTE_STATUS_last_request_json=""
+QUOTE_STATUS_last_order_id=""
 
 # Clear quote status
 clear_quote_status() {
-    QUOTE_STATUS[last_quote_id]=""
-    QUOTE_STATUS[last_quote_json]=""
-    QUOTE_STATUS[last_request_json]=""
-    QUOTE_STATUS[last_order_id]=""
+    QUOTE_STATUS_last_quote_id=""
+    QUOTE_STATUS_last_quote_json=""
+    QUOTE_STATUS_last_request_json=""
+    QUOTE_STATUS_last_order_id=""
 }
 
 # Get quote status field
 get_quote_status() {
     local field="$1"
-    echo "${QUOTE_STATUS[$field]:-}"
+    case "$field" in
+        last_quote_id) echo "$QUOTE_STATUS_last_quote_id" ;;
+        last_quote_json) echo "$QUOTE_STATUS_last_quote_json" ;;
+        last_request_json) echo "$QUOTE_STATUS_last_request_json" ;;
+        last_order_id) echo "$QUOTE_STATUS_last_order_id" ;;
+        *) echo "" ;;
+    esac
 }
 
 # Set quote status field
 set_quote_status() {
     local field="$1"
     local value="$2"
-    QUOTE_STATUS[$field]="$value"
+    case "$field" in
+        last_quote_id) QUOTE_STATUS_last_quote_id="$value" ;;
+        last_quote_json) QUOTE_STATUS_last_quote_json="$value" ;;
+        last_request_json) QUOTE_STATUS_last_request_json="$value" ;;
+        last_order_id) QUOTE_STATUS_last_order_id="$value" ;;
+    esac
 }
 
 # Build UII address (ERC-7930 format)

@@ -25,7 +25,7 @@
 #   api_post "https://api.example.com/submit" "$json_payload"
 #   
 # Global State:
-#   API_RESPONSE[] - Associative array storing last response details
+#   API_RESPONSE_* - Variables storing last response details
 #
 # ==============================================================================
 
@@ -42,11 +42,11 @@ DEFAULT_USER_AGENT="OIF-Demo-CLI/1.0"
 # Global State Management
 # -----------------------------------------------------------------------------
 # API response structure - stores the last API call's response details
-declare -gA API_RESPONSE
-API_RESPONSE[status_code]=""
-API_RESPONSE[body]=""
-API_RESPONSE[headers]=""
-API_RESPONSE[error]=""
+# Using regular variables
+API_RESPONSE_status_code=""
+API_RESPONSE_body=""
+API_RESPONSE_headers=""
+API_RESPONSE_error=""
 
 # -----------------------------------------------------------------------------
 # Dependency Checking Functions
@@ -104,10 +104,10 @@ validate_json() {
 # -----------------------------------------------------------------------------
 # Clear API response - resets all response fields
 clear_api_response() {
-    API_RESPONSE[status_code]=""
-    API_RESPONSE[body]=""
-    API_RESPONSE[headers]=""
-    API_RESPONSE[error]=""
+    API_RESPONSE_status_code=""
+    API_RESPONSE_body=""
+    API_RESPONSE_headers=""
+    API_RESPONSE_error=""
 }
 
 # Set API response
@@ -117,16 +117,32 @@ set_api_response() {
     local headers="$3"
     local error="$4"
     
-    API_RESPONSE[status_code]="$status_code"
-    API_RESPONSE[body]="$body"
-    API_RESPONSE[headers]="$headers"
-    API_RESPONSE[error]="$error"
+    API_RESPONSE_status_code="$status_code"
+    API_RESPONSE_body="$body"
+    API_RESPONSE_headers="$headers"
+    API_RESPONSE_error="$error"
 }
 
 # Get API response field
 get_api_response() {
     local field="$1"
-    echo "${API_RESPONSE[$field]}"
+    case "$field" in
+        "status_code")
+            echo "$API_RESPONSE_status_code"
+            ;;
+        "body")
+            echo "$API_RESPONSE_body"
+            ;;
+        "headers")
+            echo "$API_RESPONSE_headers"
+            ;;
+        "error")
+            echo "$API_RESPONSE_error"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
 }
 
 # -----------------------------------------------------------------------------

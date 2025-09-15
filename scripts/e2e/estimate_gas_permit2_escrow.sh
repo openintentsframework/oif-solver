@@ -141,8 +141,8 @@ dest_array=($dest_txs)
 
 echo
 echo "📊 Systematic discovery results:"
-echo "  Origin: ${origin_array[*]} (${#origin_array[@]} transactions)"
-echo "  Dest: ${dest_array[*]} (${#dest_array[@]} transactions)"
+echo "  Origin: ${origin_array[*]:-} (${#origin_array[@]} transactions)"
+echo "  Dest: ${dest_array[*]:-} (${#dest_array[@]} transactions)"
 
 # STRICT validation - ALL transactions must be found
 if [ "$all_found" = false ] || [ ${#origin_array[@]} -ne $origin_tx_count ] || [ ${#dest_array[@]} -ne $dest_tx_count ]; then
