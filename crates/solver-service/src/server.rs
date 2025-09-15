@@ -19,7 +19,8 @@ use axum::{
 use rust_decimal::Decimal;
 use serde_json::Value;
 use solver_config::{ApiConfig, Config};
-use solver_core::{engine::token_manager::TokenManager, SolverEngine};
+use solver_core::SolverEngine;
+use solver_pricing;
 use solver_types::{
 	api::IntentRequest, APIError, Address, ApiErrorType, CostEstimate, GetOrderResponse,
 	GetQuoteRequest, GetQuoteResponse, Order, OrderIdCallback, Transaction,
@@ -288,7 +289,7 @@ async fn handle_order(
 
 	// Check profitability if cost estimation succeeded
 	if let Ok(cost_estimate) = &order_cost {
-		match calculate_order_profitability(&validated_order, cost_estimate, &state.solver) {
+		match calculate_order_profitability(&validated_order, cost_estimate, &state.solver).await {
 			Ok(profit_margin) => {
 				if profit_margin < state.config.solver.min_profitability_pct {
 					return APIError::UnprocessableEntity {
@@ -542,12 +543,12 @@ async fn forward_to_discovery_service(
 /// Calculates the profit margin percentage for an order.
 ///
 /// The profit margin is calculated as:
-/// Profit = Total Input Amount - Total Output Amount - Execution Costs
-/// Profit Margin = (Profit / Total Input Amount) * 100
+/// Profit = Total Input Amount (USD) - Total Output Amount (USD) - Execution Costs (USD)
+/// Profit Margin = (Profit / Total Input Amount (USD)) * 100
 ///
 /// This represents the percentage profit the solver makes on the input amount.
-/// All amounts are normalized based on token decimals for accurate comparison.
-fn calculate_order_profitability(
+/// All amounts are converted to USD using the pricing service for accurate comparison.
+async fn calculate_order_profitability(
 	order: &Order,
 	cost_estimate: &CostEstimate,
 	solver: &SolverEngine,
@@ -557,9 +558,10 @@ fn calculate_order_profitability(
 		.map_err(|e| format!("Failed to parse order data: {}", e))?;
 
 	let token_manager = solver.token_manager();
+	let pricing_service = solver.pricing();
 
-	// Calculate total input amount (sum of all inputs, normalized by decimals)
-	let mut total_input_amount = Decimal::ZERO;
+	// Calculate total input amount in USD (sum of all inputs converted to USD)
+	let mut total_input_amount_usd = Decimal::ZERO;
 	for input in &order_data.inputs {
 		// input is [token_address, amount] - extract both
 		let token_address_u256 = input[0];
@@ -572,78 +574,90 @@ fn calculate_order_profitability(
 		token_bytes.copy_from_slice(&token_u256_bytes[12..32]);
 		let token_address = solver_types::Address(token_bytes.to_vec());
 
-		// For inputs:
-		let normalized_amount = normalize_token_amount(
+		// Get token info
+		let token_info = token_manager
+			.get_token_info(order_data.origin_chain_id.to::<u64>(), &token_address)
+			.map_err(|e| format!("Failed to get token info: {}", e))?;
+
+		// Convert raw amount to USD using pricing service, then normalize
+		let usd_amount = convert_raw_token_to_usd(
 			&amount_u256,
-			order_data.origin_chain_id.to::<u64>(),
-			&token_address,
-			token_manager,
-		)?;
-		total_input_amount += normalized_amount;
+			&token_info.symbol,
+			token_info.decimals,
+			pricing_service,
+		)
+		.await?;
+
+		total_input_amount_usd += Decimal::from_str(&usd_amount)
+			.map_err(|e| format!("Failed to parse input USD amount: {}", e))?;
 	}
 
-	// Calculate total output amount (sum of all outputs, normalized by decimals)
-	let mut total_output_amount = Decimal::ZERO;
+	// Calculate total output amount in USD (sum of all outputs converted to USD)
+	let mut total_output_amount_usd = Decimal::ZERO;
 	for output in &order_data.outputs {
 		// Extract token address from the last 20 bytes of the bytes32 token field
 		let mut token_bytes = [0u8; 20];
 		token_bytes.copy_from_slice(&output.token[12..32]);
 		let token_address = solver_types::Address(token_bytes.to_vec());
 
-		// For outputs:
-		let normalized_amount = normalize_token_amount(
+		// Get token info
+		let token_info = token_manager
+			.get_token_info(output.chain_id.to::<u64>(), &token_address)
+			.map_err(|e| format!("Failed to get token info: {}", e))?;
+
+		// Convert raw amount to USD using pricing service, then normalize
+		let usd_amount = convert_raw_token_to_usd(
 			&output.amount,
-			output.chain_id.to::<u64>(),
-			&token_address,
-			token_manager,
-		)?;
-		total_output_amount += normalized_amount;
+			&token_info.symbol,
+			token_info.decimals,
+			pricing_service,
+		)
+		.await?;
+
+		total_output_amount_usd += Decimal::from_str(&usd_amount)
+			.map_err(|e| format!("Failed to parse output USD amount: {}", e))?;
 	}
 
-	// Parse execution costs from cost estimate (already in normalized currency units)
-	let execution_cost = Decimal::from_str(&cost_estimate.total)
+	// Parse execution costs from cost estimate (already in USD)
+	let execution_cost_usd = Decimal::from_str(&cost_estimate.total)
 		.map_err(|e| format!("Failed to parse execution cost: {}", e))?;
 
-	// Calculate profit: Input - Output - Costs
-	let profit = total_input_amount - total_output_amount - execution_cost;
+	// Calculate profit: Input (USD) - Output (USD) - Costs (USD)
+	let profit_usd = total_input_amount_usd - total_output_amount_usd - execution_cost_usd;
 
 	let hundred = Decimal::new(100_i64, 0);
-	let profit_margin_decimal = (profit / total_input_amount) * hundred;
+	let profit_margin_decimal = (profit_usd / total_input_amount_usd) * hundred;
 
 	tracing::debug!(
-		"Profitability calculation: input={} (normalized), output={} (normalized), cost={}, profit={}, margin={}%",
-		total_input_amount,
-		total_output_amount,
-		execution_cost,
-		profit,
+		"Profitability calculation: input=${} (USD), output=${} (USD), cost=${} (USD), profit=${} (USD), margin={}%",
+		total_input_amount_usd,
+		total_output_amount_usd,
+		execution_cost_usd,
+		profit_usd,
 		profit_margin_decimal
 	);
 
 	Ok(profit_margin_decimal)
 }
 
-/// Normalizes a token amount by dividing by 10^decimals
-fn normalize_token_amount(
+/// Converts a raw token amount to USD, handling decimals normalization.
+async fn convert_raw_token_to_usd(
 	raw_amount: &U256,
-	chain_id: u64,
-	token_address: &solver_types::Address,
-	token_manager: &TokenManager,
-) -> Result<Decimal, Box<dyn std::error::Error>> {
+	token_symbol: &str,
+	token_decimals: u8,
+	pricing_service: &solver_pricing::PricingService,
+) -> Result<String, Box<dyn std::error::Error>> {
+	// First normalize the token amount by dividing by 10^decimals
 	let raw_amount_str = raw_amount.to_string();
-	let raw_amount_decimal =
-		Decimal::from_str(&raw_amount_str).map_err(|e| format!("Failed to parse amount: {}", e))?;
+	let raw_amount_decimal = Decimal::from_str(&raw_amount_str)
+		.map_err(|e| format!("Failed to parse raw amount: {}", e))?;
 
-	let decimals = match token_manager.get_token_info(chain_id, token_address) {
-		Ok(token_config) => token_config.decimals,
-		Err(e) => {
-			return Err(format!(
-				"Failed to get token info for token {:?} on chain {}: {}",
-				token_address, chain_id, e
-			)
-			.into());
-		},
-	};
+	let divisor = Decimal::new(10_i64.pow(token_decimals as u32), 0);
+	let normalized_amount = raw_amount_decimal / divisor;
 
-	let divisor = Decimal::new(10_i64.pow(decimals as u32), 0);
-	Ok(raw_amount_decimal / divisor)
+	// Then convert the normalized token amount to USD using the pricing service
+	pricing_service
+		.convert_asset(token_symbol, "USD", &normalized_amount.to_string())
+		.await
+		.map_err(|e| format!("Failed to convert {} to USD: {}", token_symbol, e).into())
 }
