@@ -5,7 +5,7 @@
 
 use crate::{DeliveryError, DeliveryInterface};
 use alloy_network::EthereumWallet;
-use alloy_primitives::{Address, FixedBytes, U256};
+use alloy_primitives::{Address, Bytes, FixedBytes, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::TransactionRequest;
 use alloy_signer::Signer;
@@ -476,6 +476,25 @@ impl DeliveryInterface for AlloyDelivery {
 			.await
 			.map_err(|e| DeliveryError::Network(format!("Failed to estimate gas: {}", e)))?;
 		Ok(gas)
+	}
+
+	async fn eth_call(&self, tx: SolverTransaction) -> Result<Bytes, DeliveryError> {
+		// Get the chain ID from the transaction
+		let chain_id = tx.chain_id;
+
+		// Get the appropriate provider for this chain
+		let provider = self.get_provider(chain_id)?;
+
+		// Convert to TransactionRequest
+		let request: TransactionRequest = tx.into();
+
+		// Execute the call without submitting a transaction
+		let result = provider
+			.call(&request)
+			.await
+			.map_err(|e| DeliveryError::Network(format!("Failed to execute eth_call: {}", e)))?;
+
+		Ok(result)
 	}
 }
 

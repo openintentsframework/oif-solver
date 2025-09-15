@@ -6,6 +6,7 @@
 
 use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 /// Lock type for cross-chain orders, determining the custody mechanism used.
 ///
@@ -53,6 +54,39 @@ impl LockType {
 	/// Returns true if this lock type uses escrow settlement
 	pub fn is_escrow(&self) -> bool {
 		matches!(self, LockType::Permit2Escrow | LockType::Eip3009Escrow)
+	}
+
+	/// Get the string representation for this lock type
+	pub fn as_str(&self) -> &'static str {
+		match self {
+			LockType::Permit2Escrow => "permit2_escrow",
+			LockType::Eip3009Escrow => "eip3009_escrow",
+			LockType::ResourceLock => "resource_lock",
+		}
+	}
+}
+
+impl FromStr for LockType {
+	type Err = String;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		match s {
+			// String representations
+			"permit2_escrow" => Ok(LockType::Permit2Escrow),
+			"eip3009_escrow" => Ok(LockType::Eip3009Escrow),
+			"resource_lock" => Ok(LockType::ResourceLock),
+			// Numeric string representations
+			"1" => Ok(LockType::Permit2Escrow),
+			"2" => Ok(LockType::Eip3009Escrow),
+			"3" => Ok(LockType::ResourceLock),
+			_ => Err(format!("Invalid lock type: {}", s)),
+		}
+	}
+}
+
+impl std::fmt::Display for LockType {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.as_str())
 	}
 }
 /// Gas limit overrides for various transaction types
@@ -450,6 +484,7 @@ mod tests {
 		assert_eq!(json, r#"{"data":"0x"}"#);
 	}
 
+	#[allow(clippy::clone_on_copy)]
 	#[test]
 	fn test_clone_and_debug() {
 		let lock_type = LockType::Permit2Escrow;
@@ -508,6 +543,7 @@ mod tests {
 
 // Solidity struct definitions for ABI encoding with OIF contracts
 #[cfg(feature = "oif-interfaces")]
+#[allow(clippy::too_many_arguments)]
 pub mod interfaces {
 	use alloy_sol_types::sol;
 
@@ -538,16 +574,96 @@ pub mod interfaces {
 			bytes context;
 		}
 
-		/// Input Settler interfaces for interacting with OIF contracts
-		#[sol(rpc)]
-		interface IInputSettlerEscrow {
-			function orderIdentifier(bytes calldata order) external view returns (bytes32);
-			function openFor(bytes calldata order, address sponsor, bytes calldata signature) external;
+		/// Structure that matches OutputFillLib's expected packed encoding format.
+		/// This struct represents the exact byte layout expected by OutputSettlerSimple.
+		struct PackedMandateOutput {
+			uint48 fillDeadline;    // 6 bytes at offset 0
+			bytes32 oracle;          // 32 bytes at offset 6
+			bytes32 settler;         // 32 bytes at offset 38
+			uint256 chainId;         // 32 bytes at offset 70
+			bytes32 token;           // 32 bytes at offset 102
+			uint256 amount;          // 32 bytes at offset 134
+			bytes32 recipient;       // 32 bytes at offset 166
+			// Note: call and context need special handling due to their variable length
+			// and 2-byte length prefixes which ABI encoding doesn't naturally provide
 		}
 
+		/// Order structure for finaliseSelf.
+		struct OrderStruct {
+			address user;
+			uint256 nonce;
+			uint256 originChainId;
+			uint32 expires;
+			uint32 fillDeadline;
+			address oracle;
+			uint256[2][] inputs;
+			SolMandateOutput[] outputs;
+		}
+
+		/// IInputSettlerEscrow interface for the OIF contracts.
+		#[sol(rpc)]
+		interface IInputSettlerEscrow {
+			function finalise(OrderStruct order, uint32[] timestamps, bytes32[] solvers, bytes32 destination, bytes call) external;
+			function finaliseWithSignature(OrderStruct order, uint32[] timestamps, bytes32[] solvers, bytes32 destination, bytes call, bytes signature) external;
+			function open(bytes calldata order) external;
+			function openFor(bytes calldata order, address sponsor, bytes calldata signature) external;
+			function orderIdentifier(bytes calldata order) external view returns (bytes32);
+		}
+
+		/// IInputSettlerCompact interface for Compact-based settlement.
 		#[sol(rpc)]
 		interface IInputSettlerCompact {
+			function finalise(OrderStruct order, bytes signatures, uint32[] timestamps, bytes32[] solvers, bytes32 destination, bytes call) external;
+			function finaliseWithSignature(OrderStruct order, bytes signatures, uint32[] timestamps, bytes32[] solvers, bytes32 destination, bytes call, bytes signature) external;
 			function orderIdentifier(StandardOrder calldata order) external view returns (bytes32);
+		}
+
+		/// OutputSettlerSimple interface for filling orders.
+		interface IOutputSettlerSimple {
+			function fill(bytes32 orderId, bytes originData, bytes fillerData) external returns (bytes32);
+			function fillOrderOutputs(bytes32 orderId, bytes[] outputs, bytes fillerData) external;
+		}
+	}
+}
+
+/// Implement conversion from StandardOrder to Eip7683OrderData
+#[cfg(feature = "oif-interfaces")]
+impl From<interfaces::StandardOrder> for Eip7683OrderData {
+	fn from(order: interfaces::StandardOrder) -> Self {
+		use crate::utils::with_0x_prefix;
+		use alloy_primitives::hex;
+
+		// Convert outputs from SolMandateOutput to MandateOutput
+		let outputs: Vec<MandateOutput> = order
+			.outputs
+			.into_iter()
+			.map(|output| MandateOutput {
+				oracle: output.oracle.0,
+				settler: output.settler.0,
+				chain_id: output.chainId,
+				token: output.token.0,
+				amount: output.amount,
+				recipient: output.recipient.0,
+				call: output.call.to_vec(),
+				context: output.context.to_vec(),
+			})
+			.collect();
+
+		Eip7683OrderData {
+			user: with_0x_prefix(&hex::encode(order.user)),
+			nonce: order.nonce,
+			origin_chain_id: order.originChainId,
+			expires: order.expires,
+			fill_deadline: order.fillDeadline,
+			input_oracle: with_0x_prefix(&hex::encode(order.inputOracle)),
+			inputs: order.inputs,
+			order_id: [0u8; 32], // Will be computed separately
+			gas_limit_overrides: GasLimitOverrides::default(),
+			outputs,
+			raw_order_data: None,
+			signature: None,
+			sponsor: None,
+			lock_type: None,
 		}
 	}
 }
