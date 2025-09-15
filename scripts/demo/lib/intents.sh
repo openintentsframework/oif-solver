@@ -716,7 +716,7 @@ submit_intent_onchain() {
     else
         # Fallback: try to decode from order_data (for backward compatibility)
         print_error "Order struct not found in intent JSON"
-        print_info "Please rebuild the intent with: oif-demo intent build --onchain escrow ..."
+        print_info "Please rebuild the intent using the appropriate build command for your intent type."
         return 1
     fi
 
