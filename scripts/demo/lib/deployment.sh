@@ -1100,6 +1100,7 @@ include = [
 [solver]
 id = "oif-solver-demo"
 monitoring_timeout_minutes = 5
+min_profitability_pct = 1.0
 
 # ============================================================================
 # STORAGE

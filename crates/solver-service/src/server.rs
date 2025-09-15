@@ -16,13 +16,15 @@ use axum::{
 	routing::{get, post},
 	Router, ServiceExt,
 };
+use rust_decimal::Decimal;
 use serde_json::Value;
 use solver_config::{ApiConfig, Config};
-use solver_core::SolverEngine;
+use solver_core::{engine::token_manager::TokenManager, SolverEngine};
 use solver_types::{
-	api::IntentRequest, APIError, Address, ApiErrorType, GetOrderResponse, GetQuoteRequest,
-	GetQuoteResponse, Order, OrderIdCallback, Transaction,
+	api::IntentRequest, APIError, Address, ApiErrorType, CostEstimate, GetOrderResponse,
+	GetQuoteRequest, GetQuoteResponse, Order, OrderIdCallback, Transaction,
 };
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower::ServiceBuilder;
@@ -280,11 +282,40 @@ async fn handle_order(
 
 	// Estimate costs
 	let cost_engine = CostEngine::new();
-	let _order_cost = cost_engine
+	let order_cost = cost_engine
 		.estimate_cost(&validated_order, &state.solver, &state.config)
 		.await;
 
-	// TODO: Do something with _order_cost
+	// Check profitability if cost estimation succeeded
+	if let Ok(cost_estimate) = &order_cost {
+		match calculate_order_profitability(&validated_order, cost_estimate, &state.solver) {
+			Ok(profit_margin) => {
+				if profit_margin < state.config.solver.min_profitability_pct {
+					return APIError::UnprocessableEntity {
+						error_type: ApiErrorType::InsufficientProfitability,
+						message: format!(
+							"Order profit margin {:.2}% below minimum required {:.2}%",
+							profit_margin, state.config.solver.min_profitability_pct
+						),
+						details: Some(serde_json::json!({
+							"profit_margin": profit_margin,
+							"min_required": state.config.solver.min_profitability_pct,
+							"total_cost": cost_estimate.total
+						})),
+					}
+					.into_response();
+				}
+			},
+			Err(e) => {
+				tracing::warn!("Failed to calculate profitability: {}", e);
+				return APIError::InternalServerError {
+					error_type: ApiErrorType::InternalError,
+					message: format!("Failed to calculate profitability: {}", e),
+				}
+				.into_response();
+			},
+		}
+	}
 
 	forward_to_discovery_service(&state, &intent_request).await
 }
@@ -506,4 +537,113 @@ async fn forward_to_discovery_service(
 				.into_response()
 		},
 	}
+}
+
+/// Calculates the profit margin percentage for an order.
+///
+/// The profit margin is calculated as:
+/// Profit = Total Input Amount - Total Output Amount - Execution Costs
+/// Profit Margin = (Profit / Total Input Amount) * 100
+///
+/// This represents the percentage profit the solver makes on the input amount.
+/// All amounts are normalized based on token decimals for accurate comparison.
+fn calculate_order_profitability(
+	order: &Order,
+	cost_estimate: &CostEstimate,
+	solver: &SolverEngine,
+) -> Result<Decimal, Box<dyn std::error::Error>> {
+	// Parse the order data as Eip7683OrderData
+	let order_data: solver_types::Eip7683OrderData = serde_json::from_value(order.data.clone())
+		.map_err(|e| format!("Failed to parse order data: {}", e))?;
+
+	let token_manager = solver.token_manager();
+
+	// Calculate total input amount (sum of all inputs, normalized by decimals)
+	let mut total_input_amount = Decimal::ZERO;
+	for input in &order_data.inputs {
+		// input is [token_address, amount] - extract both
+		let token_address_u256 = input[0];
+		let amount_u256 = input[1];
+
+		// Convert token address from U256 to Address
+		// Token address is stored in the last 20 bytes of the U256
+		let mut token_bytes = [0u8; 20];
+		let token_u256_bytes = token_address_u256.to_be_bytes::<32>();
+		token_bytes.copy_from_slice(&token_u256_bytes[12..32]);
+		let token_address = solver_types::Address(token_bytes.to_vec());
+
+		// For inputs:
+		let normalized_amount = normalize_token_amount(
+			&amount_u256,
+			order_data.origin_chain_id.to::<u64>(),
+			&token_address,
+			token_manager,
+		)?;
+		total_input_amount += normalized_amount;
+	}
+
+	// Calculate total output amount (sum of all outputs, normalized by decimals)
+	let mut total_output_amount = Decimal::ZERO;
+	for output in &order_data.outputs {
+		// Extract token address from the last 20 bytes of the bytes32 token field
+		let mut token_bytes = [0u8; 20];
+		token_bytes.copy_from_slice(&output.token[12..32]);
+		let token_address = solver_types::Address(token_bytes.to_vec());
+
+		// For outputs:
+		let normalized_amount = normalize_token_amount(
+			&output.amount,
+			output.chain_id.to::<u64>(),
+			&token_address,
+			token_manager,
+		)?;
+		total_output_amount += normalized_amount;
+	}
+
+	// Parse execution costs from cost estimate (already in normalized currency units)
+	let execution_cost = Decimal::from_str(&cost_estimate.total)
+		.map_err(|e| format!("Failed to parse execution cost: {}", e))?;
+
+	// Calculate profit: Input - Output - Costs
+	let profit = total_input_amount - total_output_amount - execution_cost;
+
+	let hundred = Decimal::new(100_i64, 0);
+	let profit_margin_decimal = (profit / total_input_amount) * hundred;
+
+	tracing::debug!(
+		"Profitability calculation: input={} (normalized), output={} (normalized), cost={}, profit={}, margin={}%",
+		total_input_amount,
+		total_output_amount,
+		execution_cost,
+		profit,
+		profit_margin_decimal
+	);
+
+	Ok(profit_margin_decimal)
+}
+
+/// Normalizes a token amount by dividing by 10^decimals
+fn normalize_token_amount(
+	raw_amount: &U256,
+	chain_id: u64,
+	token_address: &solver_types::Address,
+	token_manager: &TokenManager,
+) -> Result<Decimal, Box<dyn std::error::Error>> {
+	let raw_amount_str = raw_amount.to_string();
+	let raw_amount_decimal =
+		Decimal::from_str(&raw_amount_str).map_err(|e| format!("Failed to parse amount: {}", e))?;
+
+	let decimals = match token_manager.get_token_info(chain_id, token_address) {
+		Ok(token_config) => token_config.decimals,
+		Err(e) => {
+			return Err(format!(
+				"Failed to get token info for token {:?} on chain {}: {}",
+				token_address, chain_id, e
+			)
+			.into());
+		},
+	};
+
+	let divisor = Decimal::new(10_i64.pow(decimals as u32), 0);
+	Ok(raw_amount_decimal / divisor)
 }

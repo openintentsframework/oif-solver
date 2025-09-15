@@ -123,6 +123,7 @@ pub enum ApiErrorType {
 	MissingChainId,
 	GasEstimationFailed,
 	CostCalculationFailed,
+	InsufficientProfitability,
 
 	// Transaction generation errors
 	SerializationFailed,
