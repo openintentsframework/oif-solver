@@ -13,9 +13,8 @@ use solver_types::{
 	oracle::OracleRoutes,
 	standards::eip7683::{
 		interfaces::{
-			IInputSettlerCompact, IInputSettlerEscrow, IOutputSettlerSimple, OrderStruct,
-			PackedMandateOutput, SolMandateOutput as MandateOutput,
-			StandardOrder as OifStandardOrder,
+			IInputSettlerCompact, IInputSettlerEscrow, IOutputSettlerSimple,
+			SolMandateOutput as MandateOutput, SolveParams, StandardOrder as OifStandardOrder,
 		},
 		LockType,
 	},
@@ -67,10 +66,12 @@ impl Eip7683OrderImpl {
 				Ok(Bytes::from(call.abi_encode()))
 			},
 			LockType::Permit2Escrow | LockType::Eip3009Escrow => {
-				// Use raw bytes for Escrow contracts
-				let call = IInputSettlerEscrow::orderIdentifierCall {
-					order: order_bytes.clone(),
-				};
+				// Decode to StandardOrder for Escrow contracts
+				let std_order = OifStandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+					OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
+				})?;
+
+				let call = IInputSettlerEscrow::orderIdentifierCall { order: std_order };
 				Ok(Bytes::from(call.abi_encode()))
 			},
 		}
@@ -121,6 +122,17 @@ impl Eip7683OrderImpl {
 		Ok(Self {
 			networks,
 			oracle_routes,
+		})
+	}
+
+	/// Decode raw order bytes into StandardOrder struct.
+	fn decode_standard_order(order_bytes: &str) -> Result<OifStandardOrder, OrderError> {
+		let bytes = hex::decode(order_bytes.trim_start_matches("0x"))
+			.map_err(|e| OrderError::ValidationFailed(format!("Invalid hex: {}", e)))?;
+
+		// Decode using alloy's ABI decoder
+		OifStandardOrder::abi_decode(&bytes, true).map_err(|e| {
+			OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
 		})
 	}
 }
@@ -405,11 +417,12 @@ impl OrderInterface for Eip7683OrderImpl {
 				|e| OrderError::ValidationFailed(format!("Invalid sponsor address: {}", e)),
 			)?);
 
-		// Use the InputSettlerEscrow openFor call
+		// Decode the raw order bytes into StandardOrder struct
+		let order_struct = Self::decode_standard_order(raw_order_data)?;
+
+		// Use the InputSettlerEscrow openFor call with StandardOrder struct
 		let open_for_data = IInputSettlerEscrow::openForCall {
-			order: hex::decode(raw_order_data.trim_start_matches("0x"))
-				.map_err(|e| OrderError::ValidationFailed(format!("Invalid order data: {}", e)))?
-				.into(),
+			order: order_struct,
 			sponsor: sponsor_address,
 			signature: hex::decode(signature.trim_start_matches("0x"))
 				.map_err(|e| OrderError::ValidationFailed(format!("Invalid signature: {}", e)))?
@@ -503,56 +516,31 @@ impl OrderInterface for Eip7683OrderImpl {
 			.output_settler_address
 			.clone();
 
-		// Encode fill data for OutputSettlerSimple using packed encoding
+		// Create the MandateOutput struct for the fill call
+		let output_struct = MandateOutput {
+			oracle: FixedBytes::<32>::from(output.oracle),
+			settler: {
+				let mut bytes32 = [0u8; 32];
+				bytes32[12..32].copy_from_slice(&output_settler_address.0);
+				FixedBytes::<32>::from(bytes32)
+			},
+			chainId: output.chain_id,
+			token: FixedBytes::<32>::from(output.token),
+			amount: output.amount,
+			recipient: FixedBytes::<32>::from(output.recipient),
+			// For direct transfers, no additional call data is required, so this field is left empty.
+			// If the output settlement requires invoking a contract with specific calldata, populate this field accordingly.
+			call: vec![].into(),
+			// Context is also left empty for direct transfers, as no extra execution context is needed.
+			// This field may be populated for advanced settlement scenarios (e.g., meta-transactions, custom logic).
+			context: vec![].into(),
+		};
+
+		// Encode fill data for OutputSettlerSimple using the new signature
 		let fill_data = IOutputSettlerSimple::fillCall {
 			orderId: FixedBytes::<32>::from(order_data.order_id),
-			originData: {
-				// Use abi.encodePacked equivalent for the exact byte layout expected by OutputFillLib
-				let packed_output = PackedMandateOutput {
-					fillDeadline: alloy_primitives::Uint::<48, 1>::from(
-						order_data.fill_deadline as u64,
-					),
-					oracle: FixedBytes::<32>::from(output.oracle),
-					settler: {
-						let mut bytes32 = [0u8; 32];
-						bytes32[12..32].copy_from_slice(&output_settler_address.0);
-						FixedBytes::<32>::from(bytes32)
-					},
-					chainId: output.chain_id,
-					token: FixedBytes::<32>::from(output.token),
-					amount: output.amount,
-					recipient: FixedBytes::<32>::from(output.recipient),
-				};
-
-				// Build the packed bytes manually since we need special handling for call/context
-				let mut origin_data = Vec::new();
-
-				// Add the fixed-size fields using packed encoding (no offsets/padding)
-				// fillDeadline as 6 bytes
-				let fill_deadline_bytes = packed_output.fillDeadline.to_be_bytes_vec();
-				// The Uint<48, 1> will produce exactly 6 bytes
-				origin_data.extend_from_slice(&fill_deadline_bytes);
-
-				// oracle, settler, chainId, token, amount, recipient as 32 bytes each
-				origin_data.extend_from_slice(packed_output.oracle.as_slice());
-				origin_data.extend_from_slice(packed_output.settler.as_slice());
-				origin_data.extend_from_slice(&packed_output.chainId.to_be_bytes_vec());
-				origin_data.extend_from_slice(packed_output.token.as_slice());
-				origin_data.extend_from_slice(&packed_output.amount.to_be_bytes_vec());
-				origin_data.extend_from_slice(packed_output.recipient.as_slice());
-
-				// Add call length (2 bytes) and call data
-				let call_data = vec![]; // Empty for direct transfers
-				origin_data.extend_from_slice(&(call_data.len() as u16).to_be_bytes());
-				origin_data.extend_from_slice(&call_data);
-
-				// Add context length (2 bytes) and context data
-				let context_data = vec![]; // Empty context
-				origin_data.extend_from_slice(&(context_data.len() as u16).to_be_bytes());
-				origin_data.extend_from_slice(&context_data);
-
-				origin_data.into()
-			},
+			output: output_struct,
+			fillDeadline: alloy_primitives::Uint::<48, 1>::from(order_data.fill_deadline as u64),
 			fillerData: {
 				// FillerData should contain the solver address as bytes32
 				let mut solver_bytes32 = [0u8; 32];
@@ -679,24 +667,25 @@ impl OrderInterface for Eip7683OrderImpl {
 			.collect::<Result<Vec<_>, _>>()?;
 
 		// Build the order struct
-		let order_struct = OrderStruct {
+		let order_struct = OifStandardOrder {
 			user: user_address,
 			nonce: order_data.nonce,
 			originChainId: order_data.origin_chain_id,
 			expires: order_data.expires,
 			fillDeadline: order_data.fill_deadline,
-			oracle: oracle_address,
+			inputOracle: oracle_address,
 			inputs,
 			outputs,
 		};
 
-		// Create timestamps array - use timestamp from fill proof
-		let timestamps = vec![fill_proof.filled_timestamp as u32];
-
-		// Create solver bytes32 array (single solver in this case)
+		// Create SolveParams struct with timestamp and solver
 		let mut solver_bytes32 = [0u8; 32];
 		solver_bytes32[12..32].copy_from_slice(&order.solver_address.0);
-		let solvers = vec![FixedBytes::<32>::from(solver_bytes32)];
+
+		let solve_params = vec![SolveParams {
+			timestamp: fill_proof.filled_timestamp as u32,
+			solver: FixedBytes::<32>::from(solver_bytes32),
+		}];
 
 		// Create destination bytes32 (solver address for self-finalisation)
 		let mut destination_bytes32 = [0u8; 32];
@@ -727,10 +716,9 @@ impl OrderInterface for Eip7683OrderImpl {
 					})?;
 
 					IInputSettlerCompact::finaliseCall {
-						order: order_struct,
+						order: order_struct.clone(),
 						signatures: compact_sig_bytes.into(),
-						timestamps,
-						solvers,
+						solveParams: solve_params.clone(),
 						destination,
 						call: call.into(),
 					}
@@ -738,8 +726,7 @@ impl OrderInterface for Eip7683OrderImpl {
 				},
 				_ => IInputSettlerEscrow::finaliseCall {
 					order: order_struct,
-					timestamps,
-					solvers,
+					solveParams: solve_params,
 					destination,
 					call: call.into(),
 				}
@@ -957,7 +944,7 @@ mod tests {
 	use alloy_primitives::U256;
 	use solver_types::{
 		oracle::{OracleInfo, OracleRoutes},
-		standards::eip7683::{Eip7683OrderData, LockType},
+		standards::eip7683::{interfaces, Eip7683OrderData, LockType},
 		utils::tests::builders::{
 			Eip7683OrderDataBuilder, IntentBuilder, NetworkConfigBuilder, NetworksConfigBuilder,
 			OrderBuilder,
@@ -1133,7 +1120,29 @@ mod tests {
 		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let mut order_data = create_test_order_data();
-		order_data.raw_order_data = Some("0xabcdef".to_string());
+		// Create a valid StandardOrder and encode it for raw_order_data
+		use alloy_primitives::{Address as AlloyAddress, B256};
+		use alloy_sol_types::SolValue;
+		let test_order = interfaces::StandardOrder {
+			user: AlloyAddress::from([0x11; 20]),
+			nonce: U256::from(123),
+			originChainId: U256::from(1),
+			expires: 1000000000,
+			fillDeadline: 1000000100,
+			inputOracle: AlloyAddress::from([0x22; 20]),
+			inputs: vec![[U256::from(100), U256::from(200)]],
+			outputs: vec![interfaces::SolMandateOutput {
+				oracle: B256::from([0x33; 32]),
+				settler: B256::from([0x44; 32]),
+				chainId: U256::from(137),
+				token: B256::from([0x55; 32]),
+				amount: U256::from(1000),
+				recipient: B256::from([0x66; 32]),
+				call: vec![].into(),
+				context: vec![].into(),
+			}],
+		};
+		order_data.raw_order_data = Some(format!("0x{}", hex::encode(test_order.abi_encode())));
 		order_data.sponsor = Some("0x1111111111111111111111111111111111111111".to_string());
 		order_data.signature = Some("0x22222222".to_string());
 
