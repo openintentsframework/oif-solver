@@ -248,7 +248,8 @@ config_load_api() {
     # Load JWT auth configuration
     config_set "api" "auth_enabled" "$(parse_toml_value "$file" "api.auth" "enabled")"
     config_set "api" "auth_jwt_secret" "$(parse_toml_value "$file" "api.auth" "jwt_secret")"
-    config_set "api" "auth_token_expiry_hours" "$(parse_toml_value "$file" "api.auth" "token_expiry_hours")"
+    config_set "api" "auth_token_expiry_hours" "$(parse_toml_value "$file" "api.auth" "access_token_expiry_hours")"
+    config_set "api" "auth_refresh_token_expiry_hours" "$(parse_toml_value "$file" "api.auth" "refresh_token_expiry_hours")"
     config_set "api" "auth_issuer" "$(parse_toml_value "$file" "api.auth" "issuer")"
     
     local host=$(config_get_var "api" "host")

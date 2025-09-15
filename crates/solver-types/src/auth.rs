@@ -80,6 +80,19 @@ pub struct JwtClaims {
 	pub nonce: Option<String>,
 }
 
+/// Refresh token data stored persistently
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshTokenData {
+	/// Client identifier
+	pub client_id: String,
+	/// Granted scopes
+	pub scopes: Vec<AuthScope>,
+	/// Token expiration timestamp
+	pub expires_at: i64,
+	/// When the token was issued
+	pub issued_at: i64,
+}
+
 /// Authentication configuration for the API service
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
@@ -87,8 +100,10 @@ pub struct AuthConfig {
 	pub enabled: bool,
 	/// JWT signing secret
 	pub jwt_secret: SecretString,
-	/// Token expiry in hours
-	pub token_expiry_hours: u32,
+	/// Access token expiry in hours
+	pub access_token_expiry_hours: u32,
+	/// Refresh token expiry in hours
+	pub refresh_token_expiry_hours: u32,
 	/// JWT issuer identifier
 	pub issuer: String,
 }
