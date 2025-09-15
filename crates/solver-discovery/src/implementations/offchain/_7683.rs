@@ -559,10 +559,9 @@ impl Eip7683OffchainDiscovery {
 		match lock_type {
 			LockType::ResourceLock => {
 				// Resource Lock (TheCompact) - use IInputSettlerCompact
-				let std_order =
-					<StandardOrder as SolType>::abi_decode(order_bytes, true).map_err(|e| {
-						DiscoveryError::ParseError(format!("Failed to decode StandardOrder: {}", e))
-					})?;
+				let std_order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+					DiscoveryError::ParseError(format!("Failed to decode StandardOrder: {}", e))
+				})?;
 				let compact = IInputSettlerCompact::new(settler_address, provider);
 				let resp = compact
 					.orderIdentifier(std_order)
@@ -578,9 +577,13 @@ impl Eip7683OffchainDiscovery {
 			},
 			LockType::Permit2Escrow | LockType::Eip3009Escrow => {
 				// Escrow types - use IInputSettlerEscrow
+				// Decode the order bytes to StandardOrder
+				let std_order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+					DiscoveryError::ParseError(format!("Failed to decode StandardOrder: {}", e))
+				})?;
 				let escrow = IInputSettlerEscrow::new(settler_address, provider);
 				let resp = escrow
-					.orderIdentifier(order_bytes.clone())
+					.orderIdentifier(std_order)
 					.call()
 					.await
 					.map_err(|e| {

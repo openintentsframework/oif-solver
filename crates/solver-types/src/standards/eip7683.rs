@@ -574,54 +574,34 @@ pub mod interfaces {
 			bytes context;
 		}
 
-		/// Structure that matches OutputFillLib's expected packed encoding format.
-		/// This struct represents the exact byte layout expected by OutputSettlerSimple.
-		struct PackedMandateOutput {
-			uint48 fillDeadline;    // 6 bytes at offset 0
-			bytes32 oracle;          // 32 bytes at offset 6
-			bytes32 settler;         // 32 bytes at offset 38
-			uint256 chainId;         // 32 bytes at offset 70
-			bytes32 token;           // 32 bytes at offset 102
-			uint256 amount;          // 32 bytes at offset 134
-			bytes32 recipient;       // 32 bytes at offset 166
-			// Note: call and context need special handling due to their variable length
-			// and 2-byte length prefixes which ABI encoding doesn't naturally provide
-		}
-
-		/// Order structure for finaliseSelf.
-		struct OrderStruct {
-			address user;
-			uint256 nonce;
-			uint256 originChainId;
-			uint32 expires;
-			uint32 fillDeadline;
-			address oracle;
-			uint256[2][] inputs;
-			SolMandateOutput[] outputs;
+		/// Solve parameters combining timestamp and solver.
+		struct SolveParams {
+			uint32 timestamp;
+			bytes32 solver;
 		}
 
 		/// IInputSettlerEscrow interface for the OIF contracts.
 		#[sol(rpc)]
 		interface IInputSettlerEscrow {
-			function finalise(OrderStruct order, uint32[] timestamps, bytes32[] solvers, bytes32 destination, bytes call) external;
-			function finaliseWithSignature(OrderStruct order, uint32[] timestamps, bytes32[] solvers, bytes32 destination, bytes call, bytes signature) external;
-			function open(bytes calldata order) external;
-			function openFor(bytes calldata order, address sponsor, bytes calldata signature) external;
-			function orderIdentifier(bytes calldata order) external view returns (bytes32);
+			function finalise(StandardOrder calldata order, SolveParams[] calldata solveParams, bytes32 destination, bytes calldata call) external;
+			function finaliseWithSignature(StandardOrder calldata order, SolveParams[] calldata solveParams, bytes32 destination, bytes calldata call, bytes calldata signature) external;
+			function open(StandardOrder calldata order) external;
+			function openFor(StandardOrder calldata order, address sponsor, bytes calldata signature) external;
+			function orderIdentifier(StandardOrder calldata order) external view returns (bytes32);
 		}
 
 		/// IInputSettlerCompact interface for Compact-based settlement.
 		#[sol(rpc)]
 		interface IInputSettlerCompact {
-			function finalise(OrderStruct order, bytes signatures, uint32[] timestamps, bytes32[] solvers, bytes32 destination, bytes call) external;
-			function finaliseWithSignature(OrderStruct order, bytes signatures, uint32[] timestamps, bytes32[] solvers, bytes32 destination, bytes call, bytes signature) external;
+			function finalise(StandardOrder calldata order, bytes calldata signatures, SolveParams[] calldata solveParams, bytes32 destination, bytes calldata call) external;
+			function finaliseWithSignature(StandardOrder calldata order, bytes calldata signatures, SolveParams[] calldata solveParams, bytes32 destination, bytes calldata call, bytes calldata orderOwnerSignature) external;
 			function orderIdentifier(StandardOrder calldata order) external view returns (bytes32);
 		}
 
 		/// OutputSettlerSimple interface for filling orders.
 		interface IOutputSettlerSimple {
-			function fill(bytes32 orderId, bytes originData, bytes fillerData) external returns (bytes32);
-			function fillOrderOutputs(bytes32 orderId, bytes[] outputs, bytes fillerData) external;
+			function fill(bytes32 orderId, SolMandateOutput calldata output, uint48 fillDeadline, bytes calldata fillerData) external returns (bytes32);
+			function fillOrderOutputs(bytes32 orderId, SolMandateOutput[] calldata outputs, bytes calldata fillerData) external;
 		}
 	}
 }
