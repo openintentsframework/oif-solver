@@ -721,8 +721,9 @@ submit_intent_onchain() {
     fi
 
     # Pass the StandardOrder struct to open
+    local open_signature="open((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))"
     local submit_tx=$(cast send "$input_settler" \
-        "open((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))" \
+        "$open_signature" \
         "$order_struct" \
         --rpc-url "$origin_rpc" \
         --private-key "$user_private_key" \
