@@ -5,86 +5,23 @@
 //! filling and claiming orders.
 
 use crate::{OrderError, OrderInterface};
-use alloy_primitives::{Address as AlloyAddress, FixedBytes, U256};
-use alloy_sol_types::{sol, SolCall};
+use alloy_primitives::{Address as AlloyAddress, Bytes, FixedBytes, U256};
+use alloy_sol_types::{SolCall, SolType};
 use async_trait::async_trait;
 use solver_types::{
-	oracle::OracleRoutes, standards::eip7683::LockType, Address, ConfigSchema, Eip7683OrderData,
-	ExecutionParams, FillProof, Intent, NetworksConfig, Order, OrderStatus, Schema, Transaction,
+	current_timestamp,
+	oracle::OracleRoutes,
+	standards::eip7683::{
+		interfaces::{
+			IInputSettlerCompact, IInputSettlerEscrow, IOutputSettlerSimple, OrderStruct,
+			PackedMandateOutput, SolMandateOutput as MandateOutput,
+			StandardOrder as OifStandardOrder,
+		},
+		LockType,
+	},
+	Address, ConfigSchema, Eip7683OrderData, ExecutionParams, FillProof, Intent, NetworksConfig,
+	Order, OrderStatus, Schema, Transaction,
 };
-
-// Solidity type definitions for EIP-7683 contract interactions.
-sol! {
-	/// StandardOrder for the OIF contracts (used in openFor)
-	struct StandardOrder {
-		address user;
-		uint256 nonce;
-		uint256 originChainId;
-		uint32 expires;
-		uint32 fillDeadline;
-		address inputOracle;
-		uint256[2][] inputs;
-		MandateOutput[] outputs;
-	}
-
-	/// MandateOutput structure used in fill operations.
-	struct MandateOutput {
-		bytes32 oracle;
-		bytes32 settler;
-		uint256 chainId;
-		bytes32 token;
-		uint256 amount;
-		bytes32 recipient;
-		bytes call;
-		bytes context;
-	}
-
-	/// Structure that matches OutputFillLib's expected packed encoding format.
-	/// This struct represents the exact byte layout expected by OutputSettlerSimple.
-	struct PackedMandateOutput {
-		uint48 fillDeadline;    // 6 bytes at offset 0
-		bytes32 oracle;          // 32 bytes at offset 6
-		bytes32 settler;         // 32 bytes at offset 38
-		uint256 chainId;         // 32 bytes at offset 70
-		bytes32 token;           // 32 bytes at offset 102
-		uint256 amount;          // 32 bytes at offset 134
-		bytes32 recipient;       // 32 bytes at offset 166
-		// Note: call and context need special handling due to their variable length
-		// and 2-byte length prefixes which ABI encoding doesn't naturally provide
-	}
-
-	/// OutputSettlerSimple interface for filling orders.
-	interface IOutputSettlerSimple {
-		function fill(bytes32 orderId, bytes originData, bytes fillerData) external returns (bytes32);
-		function fillOrderOutputs(bytes32 orderId, bytes[] outputs, bytes fillerData) external;
-	}
-
-	/// Order structure for finaliseSelf.
-	struct OrderStruct {
-		address user;
-		uint256 nonce;
-		uint256 originChainId;
-		uint32 expires;
-		uint32 fillDeadline;
-		address oracle;
-		uint256[2][] inputs;
-		MandateOutput[] outputs;
-	}
-
-	/// IInputSettlerEscrow interface for the OIF contracts.
-	interface IInputSettlerEscrow {
-		function finalise(OrderStruct order, uint32[] timestamps, bytes32[] solvers, bytes32 destination, bytes call) external;
-		function finaliseWithSignature(OrderStruct order, uint32[] timestamps, bytes32[] solvers, bytes32 destination, bytes call, bytes signature) external;
-		function open(bytes calldata order) external;
-		function openFor(bytes calldata order, address sponsor, bytes calldata signature) external;
-	}
-
-	/// IInputSettlerCompact interface for Compact-based settlement.
-	interface IInputSettlerCompact {
-		function finalise(OrderStruct order, bytes signatures, uint32[] timestamps, bytes32[] solvers, bytes32 destination, bytes call) external;
-		function finaliseWithSignature(OrderStruct order, bytes signatures, uint32[] timestamps, bytes32[] solvers, bytes32 destination, bytes call, bytes signature) external;
-	}
-}
 
 /// EIP-7683 order implementation.
 ///
@@ -113,6 +50,60 @@ pub struct Eip7683OrderImpl {
 }
 
 impl Eip7683OrderImpl {
+	/// Build contract call for order ID based on lock type
+	pub fn build_order_id_call(
+		&self,
+		order_bytes: &Bytes,
+		lock_type: LockType,
+	) -> Result<Bytes, OrderError> {
+		match lock_type {
+			LockType::ResourceLock => {
+				// Decode to StandardOrder for Compact
+				let std_order = OifStandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+					OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
+				})?;
+
+				let call = IInputSettlerCompact::orderIdentifierCall { order: std_order };
+				Ok(Bytes::from(call.abi_encode()))
+			},
+			LockType::Permit2Escrow | LockType::Eip3009Escrow => {
+				// Use raw bytes for Escrow contracts
+				let call = IInputSettlerEscrow::orderIdentifierCall {
+					order: order_bytes.clone(),
+				};
+				Ok(Bytes::from(call.abi_encode()))
+			},
+		}
+	}
+
+	/// Get settler address for a specific chain and lock type
+	pub fn get_settler_address(
+		&self,
+		chain_id: u64,
+		lock_type: LockType,
+	) -> Result<Address, OrderError> {
+		let network = self.networks.get(&chain_id).ok_or_else(|| {
+			OrderError::InvalidOrder(format!("No network config for chain {}", chain_id))
+		})?;
+
+		match lock_type {
+			LockType::ResourceLock => {
+				network
+					.input_settler_compact_address
+					.clone()
+					.ok_or_else(|| {
+						OrderError::InvalidOrder(format!(
+							"No compact settler configured for chain {}",
+							chain_id
+						))
+					})
+			},
+			LockType::Permit2Escrow | LockType::Eip3009Escrow => {
+				Ok(network.input_settler_address.clone())
+			},
+		}
+	}
+
 	/// Creates a new EIP-7683 order implementation.
 	///
 	/// # Arguments
@@ -792,6 +783,122 @@ impl OrderInterface for Eip7683OrderImpl {
 			gas_price: None,
 			max_fee_per_gas: None,
 			max_priority_fee_per_gas: None,
+		})
+	}
+
+	/// Validates EIP-7683 order bytes by decoding to StandardOrder and validating.
+	async fn validate_order(&self, order_bytes: &Bytes) -> Result<OifStandardOrder, OrderError> {
+		// Decode using the StandardOrder from types module
+		let standard_order = OifStandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+			OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
+		})?;
+
+		let current_time = current_timestamp() as u32;
+
+		if standard_order.expires < current_time {
+			return Err(OrderError::ValidationFailed(
+				"Order has expired".to_string(),
+			));
+		}
+
+		if standard_order.fillDeadline < current_time {
+			return Err(OrderError::ValidationFailed(
+				"Order fill deadline has passed".to_string(),
+			));
+		}
+
+		// TODO: validate oracle routes and signatures
+
+		// Return the decoded StandardOrder directly since it's already the right type
+		Ok(standard_order)
+	}
+
+	/// Validates order bytes and creates a generic Order with computed order ID.
+	///
+	/// This override ensures the standard name is correctly set to "eip7683".
+	async fn validate_and_create_order(
+		&self,
+		order_bytes: &Bytes,
+		lock_type: &str,
+		order_id_callback: solver_types::OrderIdCallback,
+		solver_address: &Address,
+	) -> Result<Order, OrderError> {
+		// First validate the order
+		let standard_order = self.validate_order(order_bytes).await?;
+
+		// Build tx_data for order ID computation
+		let chain_id = standard_order.originChainId.to::<u64>();
+
+		// Parse lock type
+		let lock_type = lock_type
+			.parse::<LockType>()
+			.map_err(|e| OrderError::ValidationFailed(format!("Invalid lock type: {}", e)))?;
+
+		// Get settler address and build calldata
+		let settler_address = self.get_settler_address(chain_id, lock_type).map_err(|e| {
+			OrderError::ValidationFailed(format!("Failed to get settler address: {}", e))
+		})?;
+
+		let calldata = self.build_order_id_call(order_bytes, lock_type)?;
+
+		// Build tx_data as [settler_address][calldata]
+		let mut tx_data = Vec::with_capacity(20 + calldata.len());
+		tx_data.extend_from_slice(&settler_address.0);
+		tx_data.extend_from_slice(&calldata);
+
+		// Compute order ID using the callback
+		let order_id_bytes = order_id_callback(chain_id, tx_data).await.map_err(|e| {
+			OrderError::ValidationFailed(format!("Failed to compute order ID: {}", e))
+		})?;
+
+		// Ensure order ID is exactly 32 bytes
+		if order_id_bytes.len() != 32 {
+			return Err(OrderError::ValidationFailed(format!(
+				"Invalid order ID length: expected 32 bytes, got {}",
+				order_id_bytes.len()
+			)));
+		}
+
+		// Convert order ID bytes to fixed array
+		let mut order_id_array = [0u8; 32];
+		order_id_array.copy_from_slice(&order_id_bytes);
+
+		// Convert order ID bytes to hex string
+		let order_id = alloy_primitives::hex::encode_prefixed(&order_id_bytes);
+
+		// Extract chain IDs from the order
+		let input_chain_ids = vec![standard_order.originChainId.to::<u64>()];
+		let output_chain_ids: Vec<u64> = standard_order
+			.outputs
+			.iter()
+			.map(|output| output.chainId.to::<u64>())
+			.collect();
+
+		// Convert StandardOrder to Eip7683OrderData for serialization
+		let mut order_data = Eip7683OrderData::from(standard_order.clone());
+		order_data.order_id = order_id_array;
+
+		// Create generic Order
+		Ok(Order {
+			id: order_id,
+			standard: "eip7683".to_string(),
+			created_at: current_timestamp(),
+			updated_at: current_timestamp(),
+			status: OrderStatus::Pending,
+			data: serde_json::to_value(&order_data).map_err(|e| {
+				OrderError::ValidationFailed(format!("Failed to serialize order: {}", e))
+			})?,
+			solver_address: solver_address.clone(),
+			quote_id: None,
+			input_chain_ids,
+			output_chain_ids,
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			claim_tx_hash: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
+			fill_proof: None,
 		})
 	}
 }

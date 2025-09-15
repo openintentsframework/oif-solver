@@ -4,6 +4,7 @@
 //! It provides abstractions for different delivery mechanisms across multiple
 //! blockchain networks, managing transaction signing, submission, and confirmation.
 
+use alloy_primitives::Bytes;
 use async_trait::async_trait;
 use solver_types::{
 	ChainData, ConfigSchema, ImplementationRegistry, NetworksConfig, Transaction, TransactionHash,
@@ -117,6 +118,12 @@ pub trait DeliveryInterface: Send + Sync {
 	/// Estimates gas units for a transaction without submitting it.
 	/// Implementations should call the chain's estimateGas RPC with the provided transaction.
 	async fn estimate_gas(&self, tx: Transaction) -> Result<u64, DeliveryError>;
+
+	/// Executes a contract call without sending a transaction.
+	///
+	/// This performs an eth_call RPC to read data from smart contracts
+	/// or simulate transaction execution without submitting to the blockchain.
+	async fn eth_call(&self, tx: Transaction) -> Result<Bytes, DeliveryError>;
 }
 
 /// Type alias for delivery factory functions.
@@ -352,5 +359,23 @@ impl DeliveryService {
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
 		implementation.estimate_gas(tx).await
+	}
+
+	/// Executes a contract call (eth_call) without sending a transaction.
+	///
+	/// This method is used to read data from smart contracts or simulate
+	/// transaction execution without actually submitting to the blockchain.
+	/// Returns the raw bytes returned by the contract call.
+	pub async fn contract_call(
+		&self,
+		chain_id: u64,
+		tx: Transaction,
+	) -> Result<alloy_primitives::Bytes, DeliveryError> {
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
+
+		implementation.eth_call(tx).await
 	}
 }
