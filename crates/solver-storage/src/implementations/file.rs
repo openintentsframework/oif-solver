@@ -1023,7 +1023,7 @@ mod tests {
 		let (storage, _temp_dir) = create_test_storage();
 
 		let keys = vec!["key1".to_string(), "key2".to_string(), "key3".to_string()];
-		let values = vec![b"value1".to_vec(), b"value2".to_vec(), b"value3".to_vec()];
+		let values = [b"value1".to_vec(), b"value2".to_vec(), b"value3".to_vec()];
 
 		// Store multiple items
 		for (key, value) in keys.iter().zip(values.iter()) {

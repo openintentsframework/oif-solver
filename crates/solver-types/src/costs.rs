@@ -1,4 +1,22 @@
+use crate::Order;
 use serde::{Deserialize, Serialize};
+
+/// Trait for types that can have their execution costs estimated
+pub trait CostEstimatable {
+	/// Get the origin chain ID(s) where assets will be sourced
+	fn input_chain_ids(&self) -> Vec<u64>;
+
+	/// Get the destination chain ID(s) where assets will be delivered
+	fn output_chain_ids(&self) -> Vec<u64>;
+
+	/// Get the lock type for gas configuration lookup
+	/// Returns None if no specific lock type is defined
+	fn lock_type(&self) -> Option<&str>;
+
+	/// Convert to an Order for transaction generation
+	/// This is needed for gas estimation via transaction simulation
+	fn as_order_for_estimation(&self) -> Order;
+}
 
 /// Named amount used for cost components.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,9 +30,9 @@ pub struct CostComponent {
 	pub amount_wei: Option<String>,
 }
 
-/// Cost breakdown attached to a quote.
+/// Unified cost estimate for any order type (standard-agnostic).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QuoteCost {
+pub struct CostEstimate {
 	/// Display currency for cost components (e.g., "USDC", "USD").
 	pub currency: String,
 	/// Individual components that sum to the subtotal.
