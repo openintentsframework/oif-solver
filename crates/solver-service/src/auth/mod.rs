@@ -72,9 +72,8 @@ impl JwtService {
 		&self,
 		client_id: &str,
 		scopes: Vec<AuthScope>,
-		custom_expiry_hours: Option<u32>,
 	) -> Result<String, AuthError> {
-		let expiry_hours = custom_expiry_hours.unwrap_or(self.config.access_token_expiry_hours);
+		let expiry_hours = self.config.access_token_expiry_hours;
 
 		let claims = JwtClaims {
 			sub: client_id.to_string(),
@@ -138,7 +137,7 @@ impl JwtService {
 			nonce: Some(Uuid::new_v4().to_string()), // Unique nonce for each refresh token
 		};
 
-		// Generate and return the JWT refresh token (no storage needed)
+		// Generate and return the JWT refresh token
 		encode(&Header::default(), &claims, &self.encoding_key)
 			.map_err(|e| AuthError::TokenGeneration(e.to_string()))
 	}
@@ -169,7 +168,7 @@ impl JwtService {
 		}
 
 		// Generate new access token using the claims from the refresh token
-		let access_token = self.generate_access_token(&claims.sub, claims.scope.clone(), None)?;
+		let access_token = self.generate_access_token(&claims.sub, claims.scope.clone())?;
 
 		// Generate new refresh token (token rotation for security)
 		let new_refresh_token = self

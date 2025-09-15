@@ -107,24 +107,23 @@ pub async fn register_client(
 	};
 
 	// Generate access token
-	let access_token =
-		match jwt_service.generate_access_token(&request.client_id, scopes.clone(), None) {
-			Ok(token) => token,
-			Err(e) => {
-				tracing::error!(
-					"Failed to generate access token for client {}: {}",
-					request.client_id,
-					e
-				);
-				return (
-					StatusCode::INTERNAL_SERVER_ERROR,
-					Json(json!({
-						"error": "Failed to generate access token"
-					})),
-				)
-					.into_response();
-			},
-		};
+	let access_token = match jwt_service.generate_access_token(&request.client_id, scopes.clone()) {
+		Ok(token) => token,
+		Err(e) => {
+			tracing::error!(
+				"Failed to generate access token for client {}: {}",
+				request.client_id,
+				e
+			);
+			return (
+				StatusCode::INTERNAL_SERVER_ERROR,
+				Json(json!({
+					"error": "Failed to generate access token"
+				})),
+			)
+				.into_response();
+		},
+	};
 
 	// Generate refresh token
 	let refresh_token = match jwt_service
@@ -254,8 +253,9 @@ pub async fn refresh_token(
 	let access_token_expires_at = match jwt_service.validate_token(&new_access_token) {
 		Ok(claims) => claims.exp,
 		Err(_) => {
-			// Fallback calculation
-			chrono::Utc::now().timestamp() + 3600 // 1 hour
+			// Fallback calculation if we can't decode our own token
+			let expiry_hours = jwt_service.config().access_token_expiry_hours;
+			chrono::Utc::now().timestamp() + (expiry_hours as i64 * 3600)
 		},
 	};
 

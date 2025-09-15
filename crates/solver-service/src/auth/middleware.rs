@@ -156,7 +156,7 @@ mod tests {
 
 		let jwt_service = Arc::new(JwtService::new(config).unwrap());
 		let token = jwt_service
-			.generate_access_token("test-client", vec![AuthScope::ReadOrders], None)
+			.generate_access_token("test-client", vec![AuthScope::ReadOrders])
 			.unwrap();
 
 		let app = create_test_app(jwt_service);
@@ -213,7 +213,7 @@ mod tests {
 
 		let jwt_service = Arc::new(JwtService::new(config).unwrap());
 		let token = jwt_service
-			.generate_access_token("test-client", vec![AuthScope::CreateQuotes], None)
+			.generate_access_token("test-client", vec![AuthScope::CreateQuotes])
 			.unwrap();
 
 		let app = create_test_app(jwt_service);

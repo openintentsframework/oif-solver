@@ -234,7 +234,8 @@ config_load_api() {
     # Load JWT auth configuration
     CONFIG_API[auth_enabled]=$(parse_toml_value "$file" "api.auth" "enabled")
     CONFIG_API[auth_jwt_secret]=$(parse_toml_value "$file" "api.auth" "jwt_secret")
-    CONFIG_API[auth_token_expiry_hours]=$(parse_toml_value "$file" "api.auth" "token_expiry_hours")
+    CONFIG_API[auth_access_token_expiry_hours]=$(parse_toml_value "$file" "api.auth" "access_token_expiry_hours")
+    CONFIG_API[auth_refresh_token_expiry_hours]=$(parse_toml_value "$file" "api.auth" "refresh_token_expiry_hours")
     CONFIG_API[auth_issuer]=$(parse_toml_value "$file" "api.auth" "issuer")
     
     if [ -n "${CONFIG_API[host]}" ] && [ -n "${CONFIG_API[port]}" ]; then
