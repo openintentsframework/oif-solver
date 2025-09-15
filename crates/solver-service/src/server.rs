@@ -283,39 +283,44 @@ async fn handle_order(
 
 	// Estimate costs
 	let cost_engine = CostEngine::new();
-	let order_cost = cost_engine
+	let cost_estimate = match cost_engine
 		.estimate_cost(&validated_order, &state.solver, &state.config)
-		.await;
+		.await
+	{
+		Ok(estimation) => estimation,
+		Err(api_error) => {
+			tracing::warn!("Cost estimation failed: {}", api_error);
+			return api_error.into_response();
+		},
+	};
 
-	// Check profitability if cost estimation succeeded
-	if let Ok(cost_estimate) = &order_cost {
-		match calculate_order_profitability(&validated_order, cost_estimate, &state.solver).await {
-			Ok(profit_margin) => {
-				if profit_margin < state.config.solver.min_profitability_pct {
-					return APIError::UnprocessableEntity {
-						error_type: ApiErrorType::InsufficientProfitability,
-						message: format!(
-							"Order profit margin {:.2}% below minimum required {:.2}%",
-							profit_margin, state.config.solver.min_profitability_pct
-						),
-						details: Some(serde_json::json!({
-							"profit_margin": profit_margin,
-							"min_required": state.config.solver.min_profitability_pct,
-							"total_cost": cost_estimate.total
-						})),
-					}
-					.into_response();
-				}
-			},
-			Err(e) => {
-				tracing::warn!("Failed to calculate profitability: {}", e);
-				return APIError::InternalServerError {
-					error_type: ApiErrorType::InternalError,
-					message: format!("Failed to calculate profitability: {}", e),
+	// Check profitability now that we have a valid cost estimate
+	match calculate_order_profitability(&validated_order, &cost_estimate, &state.solver).await {
+		Ok(profit_margin) => {
+			if profit_margin < state.config.solver.min_profitability_pct {
+				return APIError::UnprocessableEntity {
+					error_type: ApiErrorType::InsufficientProfitability,
+					message: format!(
+						"Order profit margin {:.2}% below minimum required {:.2}%",
+						profit_margin, state.config.solver.min_profitability_pct
+					),
+					details: Some(serde_json::json!({
+						"profit_margin": profit_margin,
+						"min_required": state.config.solver.min_profitability_pct,
+						"total_cost": cost_estimate.total
+					})),
 				}
 				.into_response();
-			},
-		}
+			}
+		},
+		Err(e) => {
+			tracing::warn!("Failed to calculate profitability: {}", e);
+			return APIError::InternalServerError {
+				error_type: ApiErrorType::InternalError,
+				message: format!("Failed to calculate profitability: {}", e),
+			}
+			.into_response();
+		},
 	}
 
 	forward_to_discovery_service(&state, &intent_request).await
