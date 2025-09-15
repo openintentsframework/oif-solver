@@ -201,6 +201,7 @@ mod tests {
 [solver]
 id = "test-solver"
 monitoring_timeout_minutes = 5
+min_profitability_pct = 1.0
 
 [networks.1]
 input_settler_address = "0x1234567890123456789012345678901234567890"
@@ -268,6 +269,7 @@ include = ["networks.toml", "storage.toml"]
 [solver]
 id = "test-solver"
 monitoring_timeout_minutes = 5
+min_profitability_pct = 1.0
 "#;
 
 		// Networks config

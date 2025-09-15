@@ -711,7 +711,7 @@ mod tests {
 [solver]
 id = "${TEST_SOLVER_ID}"
 monitoring_timeout_minutes = 5
-min_profitability_pct = 5.0  # Minimum profitability percentage required to execute orders
+min_profitability_pct = 1.0
 
 [networks.1]
 input_settler_address = "0x1234567890123456789012345678901234567890"
@@ -763,7 +763,10 @@ network_ids = [1, 2]
 
 		let config: Config = config_str.parse().unwrap();
 		assert_eq!(config.solver.id, "test-solver");
-		assert_eq!(config.solver.min_profitability_pct, Decimal::from(5.0));
+		assert_eq!(
+			config.solver.min_profitability_pct,
+			Decimal::from_str("1.0").unwrap()
+		);
 
 		// Clean up
 		std::env::remove_var("TEST_SOLVER_ID");
