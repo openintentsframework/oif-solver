@@ -360,11 +360,18 @@ The solver provides a REST API for interacting with the system and submitting of
 
 ### Available Endpoints
 
+#### Quotes
+
+- **POST `/api/quotes`** - Get a price quote for a cross-chain swap
+  - Request body: `{ originChainId, outputChainId, inputToken, outputToken, inputAmount }`
+  - Returns: Quote with `quoteId`, amounts, and cost breakdown
+
 #### Orders
 
-- **POST `/api/orders`** - Submit a new EIP-7683 intent order
+- **POST `/api/orders`** - Submit a new order (direct or from quote)
 
-  - Request body: `{ order: "0x...", sponsor: "0x...", signature: "0x00..." }`
+  - Direct submission: `{ order: "0x...", sponsor: "0x...", signature: "0x00...", lock_type: "..." }`
+  - Quote acceptance: `{ quoteId: "...", signature: "0x..." }`
   - Returns: `{ status: "success", order_id: "...", message: null }`
 
 - **GET `/api/orders/{id}`** - Get order status and details
