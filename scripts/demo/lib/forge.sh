@@ -162,7 +162,7 @@ forge_deploy() {
     print_info "Deploying $contract_name..." >&2
     print_debug "Contract: $contract_path" >&2
     print_debug "RPC: $rpc_url" >&2
-    print_debug "Args: ${constructor_args[*]}" >&2
+    print_debug "Args: ${constructor_args[*]:-}" >&2
     
     local forge_args=("create" "$contract_path:$contract_name")
     forge_args+=("--rpc-url" "$rpc_url")
