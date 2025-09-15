@@ -77,7 +77,7 @@ sequenceDiagram
 
 ## Implementation Caveats
 
-### 🔍 Intent Validation Complexity
+### Intent Validation Complexity
 
 - **Multi-Protocol Support**: Different intent standards have varying validation requirements
 - **Asset Verification**: Must verify asset existence, decimals, and contract validity across chains

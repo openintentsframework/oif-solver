@@ -89,7 +89,7 @@ sequenceDiagram
 
 ## Implementation Caveats
 
-### 🔐 Authentication and Authorization
+### Authentication and Authorization
 
 - **JWT Token Management**: Secure token generation, validation, and refresh
 - **Role-Based Access**: Different API endpoints may require different permissions

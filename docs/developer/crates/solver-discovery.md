@@ -62,7 +62,7 @@ sequenceDiagram
 
 ## Implementation Caveats
 
-### 📡 Off-Chain Discovery Considerations
+### Off-Chain Discovery Considerations
 
 - **API Security**: Must validate and authenticate incoming intent submissions
 - **Data Validation**: Thorough validation of intent structure before processing

@@ -55,7 +55,7 @@ sequenceDiagram
 
 ## Implementation Caveats
 
-### 🔒 Security Considerations
+### Security Considerations
 
 - **Private Key Storage**: Keys must be encrypted at rest and never logged
 

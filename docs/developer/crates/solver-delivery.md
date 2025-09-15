@@ -67,14 +67,14 @@ sequenceDiagram
 
 ## Implementation Caveats
 
-### ⛽ Gas Management Complexity
+### Gas Management Complexity
 
 - **EIP-1559**
 - **Network Congestion**: Gas prices can spike rapidly during network congestion
 - **Priority Fee Optimization**: Balancing cost vs confirmation speed requires careful tuning
 - **Gas Limit Estimation**: Contract interactions may require complex gas limit calculations
 
-### 🔍 Monitoring and Observability
+### Monitoring and Observability
 
 - **Transaction Tracing**: Complete audit trail for all transaction attempts
 - **Performance Metrics**: Gas efficiency, confirmation times, and success rates

@@ -71,7 +71,7 @@ sequenceDiagram
 
 ## Implementation Caveats
 
-### ⏰ Timing Complexity
+### Timing Complexity
 
 - **Dispute Periods**: Different protocols have varying dispute/challenge periods
 - **Block Finality**: Must wait for sufficient finality before extracting proofs
