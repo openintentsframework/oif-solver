@@ -20,7 +20,6 @@ use rust_decimal::Decimal;
 use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
-use solver_pricing;
 use solver_types::{
 	api::IntentRequest, APIError, Address, ApiErrorType, CostEstimate, GetOrderResponse,
 	GetQuoteRequest, GetQuoteResponse, Order, OrderIdCallback, Transaction,
