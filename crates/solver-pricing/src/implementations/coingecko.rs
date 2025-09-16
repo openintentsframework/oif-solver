@@ -6,7 +6,7 @@
 use alloy_primitives::utils::parse_ether;
 use async_trait::async_trait;
 use reqwest::{
-	header::{HeaderMap, HeaderValue},
+	header::{HeaderMap, HeaderValue, ACCEPT},
 	Client,
 };
 use serde::Deserialize;
@@ -19,8 +19,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use toml;
 use tracing::debug;
+
+/// Precision for price formatting (decimal places)
+const PRICE_PRECISION: usize = 8;
 
 /// Cache entry for price data
 #[derive(Debug, Clone)]
@@ -130,7 +132,7 @@ impl CoinGeckoPricing {
 				})?,
 			);
 		}
-		headers.insert("accept", HeaderValue::from_static("application/json"));
+		headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
 
 		let client = Client::builder()
 			.default_headers(headers)
@@ -277,7 +279,7 @@ impl CoinGeckoPricing {
 			.and_then(|prices| prices.get("usd"))
 			.ok_or_else(|| PricingError::PriceNotAvailable(format!("{}/USD", token)))?;
 
-		let price_str = format!("{:.8}", price);
+		let price_str = format!("{:.prec$}", price, prec = PRICE_PRECISION);
 
 		// Update cache
 		{
@@ -304,7 +306,7 @@ impl CoinGeckoPricing {
 		let quote = &pair.quote;
 
 		// If both are the same, price is 1
-		if base.to_uppercase() == quote.to_uppercase() {
+		if base.eq_ignore_ascii_case(quote) {
 			return Ok("1.0".to_string());
 		}
 
@@ -324,7 +326,7 @@ impl CoinGeckoPricing {
 				return Err(PricingError::InvalidData("Price is zero".to_string()));
 			}
 
-			return Ok(format!("{:.8}", 1.0 / price));
+			return Ok(format!("{:.prec$}", 1.0 / price, prec = PRICE_PRECISION));
 		}
 
 		// For non-USD pairs, we could support crypto-to-crypto through USD
@@ -356,12 +358,12 @@ impl PricingInterface for CoinGeckoPricing {
 		to_asset: &str,
 		amount: &str,
 	) -> Result<String, PricingError> {
-		let from_upper = from_asset.to_uppercase();
-		let to_upper = to_asset.to_uppercase();
-
-		if from_upper == to_upper {
+		if from_asset.eq_ignore_ascii_case(to_asset) {
 			return Ok(amount.to_string());
 		}
+
+		let from_upper = from_asset.to_uppercase();
+		let to_upper = to_asset.to_uppercase();
 
 		let amount_f64 = amount
 			.parse::<f64>()
@@ -374,7 +376,7 @@ impl PricingInterface for CoinGeckoPricing {
 			.map_err(|e| PricingError::InvalidData(format!("Invalid rate: {}", e)))?;
 
 		let result = amount_f64 * rate_f64;
-		Ok(format!("{:.8}", result))
+		Ok(format!("{:.prec$}", result, prec = PRICE_PRECISION))
 	}
 
 	async fn wei_to_currency(
