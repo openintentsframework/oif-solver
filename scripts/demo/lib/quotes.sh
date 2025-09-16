@@ -802,17 +802,18 @@ quote_accept() {
         local api_url="${SOLVER_API_URL:-http://localhost:3000/api/orders}"
         print_info "Submitting signed order with quote ID to solver..."
         print_debug "API URL: $api_url"
-        
+
         # Debug: Show what we're submitting
         print_debug "Submission payload:"
         if [ "${DEBUG:-0}" = "1" ]; then
             echo "$submission_json" | jq '.' >&2
         fi
-        
+
         print_debug "Quote ID: $quote_id"
         print_debug "Signature: $signature"
         print_debug "Submitting to API URL: $api_url"
-        
+
+        # api_post will automatically handle JWT authentication via jwt_ensure_token
         if api_post "$api_url" "$submission_json"; then
             local status_code=$(get_api_response "status_code")
             local response_body=$(get_api_response "body")
