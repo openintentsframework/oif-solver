@@ -13,7 +13,7 @@ discovery = "offchain_eip7683"
 
 # JWT Authentication Configuration
 [api.auth]
-enabled = true
+enabled = false
 jwt_secret = "${JWT_SECRET:-MySuperDuperSecureSecret123!}"
 access_token_expiry_hours = 1
 refresh_token_expiry_hours = 720  # 30 days

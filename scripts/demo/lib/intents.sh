@@ -576,7 +576,7 @@ create_compact_intent() {
         local final_digest=$(cast keccak "0x1901${domain_separator:2}${inner_struct_hash:2}")
         
         # Return with debug info
-        echo "{\"order\":\"$order_data\",\"signature\":\"$encoded_signature\",\"lock_type\":$LOCK_TYPE_RESOURCE_LOCK,\"sponsor\":\"$user_addr\",\"_debug\":{\"witness_hash\":\"$witness_hash\",\"commitments_hash\":\"$commitments_hash_debug\",\"final_digest\":\"$final_digest\",\"sponsor_sig\":\"$compact_signature\"}}"
+        echo "{\"order\":\"$order_data\",\"signature\":\"$encoded_signature\",\"lock_type\":$LOCK_TYPE_RESOURCE_LOCK,\"sponsor\":\"$user_addr\",\"_debug\":{\"witness_hash\":\"$witness_hash\",\"commitments_hash\":\"$commitments_hash_debug\",\"final_digest\":\"$final_digest\",\"sponsor_sig\":\"$compact_signature\",\"domain_separator\":\"$domain_separator\"}}"
     else
         # Return order data and signature as JSON (normal mode)
         echo "{\"order\":\"$order_data\",\"signature\":\"$encoded_signature\",\"lock_type\":$LOCK_TYPE_RESOURCE_LOCK,\"sponsor\":\"$user_addr\"}"

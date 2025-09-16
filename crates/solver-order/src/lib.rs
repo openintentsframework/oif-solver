@@ -18,6 +18,7 @@ use thiserror::Error;
 pub mod implementations {
 	pub mod standards {
 		pub mod _7683;
+		pub mod compact_signature_validator;
 	}
 	pub mod strategies {
 		pub mod simple;

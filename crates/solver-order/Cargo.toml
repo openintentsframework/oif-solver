@@ -11,6 +11,7 @@ alloy-sol-types = "0.8"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
+secp256k1 = { version = "0.30", features = ["recovery"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 solver-types = { path = "../solver-types" }
