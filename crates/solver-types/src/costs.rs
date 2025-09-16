@@ -4,7 +4,9 @@ use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 
 // Type aliases to reduce complexity
+/// Represents an asset as a tuple of (token_address, amount, chain_id)
 type AssetTuple = (Address, U256, u64);
+/// Result type for asset extraction operations
 type AssetResult = Result<Vec<AssetTuple>, Box<dyn std::error::Error>>;
 
 /// Trait for types that can have their execution costs estimated
@@ -24,11 +26,11 @@ pub trait CostEstimatable {
 	fn as_order_for_estimation(&self) -> Order;
 }
 
-/// Trait for types that can have their profitability calculated
+/// Trait for types that represent the trade aspect of an order
 ///
 /// This trait is designed to work with trait objects, allowing different
-/// order standards to have their own profitability calculation logic.
-pub trait ProfitabilityCalculatable: Send + Sync {
+/// order standards to have their own trade data extraction logic.
+pub trait OrderTradable: Send + Sync {
 	/// Get input assets as tuples of (token_address, amount, chain_id)
 	fn input_assets(&self) -> AssetResult;
 

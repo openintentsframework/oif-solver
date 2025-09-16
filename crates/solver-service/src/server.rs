@@ -572,14 +572,14 @@ async fn calculate_order_profitability(
 	cost_estimate: &CostEstimate,
 	solver: &SolverEngine,
 ) -> Result<Decimal, Box<dyn std::error::Error>> {
-	// Get the appropriate profitability calculator for this order
-	let calculator = order.profitability_calculator()?;
+	// Get the trade data for this order
+	let trade = order.as_trade()?;
 
-	// Get input and output assets using the calculator
-	let input_assets = calculator
+	// Get input and output assets from the trade
+	let input_assets = trade
 		.input_assets()
 		.map_err(|e| format!("Failed to get input assets: {}", e))?;
-	let output_assets = calculator
+	let output_assets = trade
 		.output_assets()
 		.map_err(|e| format!("Failed to get output assets: {}", e))?;
 
@@ -643,14 +643,6 @@ async fn calculate_order_profitability(
 
 	tracing::debug!(
 		"Profitability calculation: input=${} (USD), output=${} (USD), cost=${} (USD), profit=${} (USD), margin={}%",
-		total_input_amount_usd,
-		total_output_amount_usd,
-		execution_cost_usd,
-		profit_usd,
-		profit_margin_decimal
-	);
-
-	println!("Profitability calculation: input=${} (USD), output=${} (USD), cost=${} (USD), profit=${} (USD), margin={}%",
 		total_input_amount_usd,
 		total_output_amount_usd,
 		execution_cost_usd,

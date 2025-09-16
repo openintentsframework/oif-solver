@@ -11,7 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::{
-	Address, AssetAmount, ChainData, CostEstimatable, Eip7683OrderData, ProfitabilityCalculatable,
+	Address, AssetAmount, ChainData, CostEstimatable, Eip7683OrderData, OrderTradable,
 	SettlementType, TransactionHash, TransactionType,
 };
 
@@ -78,17 +78,13 @@ pub struct Order {
 }
 
 impl Order {
-	/// Get a profitability calculator for this order based on its standard
-	pub fn profitability_calculator(
-		&self,
-	) -> Result<Box<dyn ProfitabilityCalculatable>, Box<dyn std::error::Error>> {
+	/// Get the trade data for this order based on its standard
+	pub fn as_trade(&self) -> Result<Box<dyn OrderTradable>, Box<dyn std::error::Error>> {
 		match self.standard.as_str() {
 			"eip7683" => {
 				let order_data: Eip7683OrderData = serde_json::from_value(self.data.clone())
 					.map_err(|e| format!("Failed to parse EIP-7683 order data: {}", e))?;
-				Ok(Box::new(
-					crate::standards::profitability_calculators::Eip7683Calculator { order_data },
-				))
+				Ok(Box::new(order_data))
 			},
 			_ => Err(format!("Unsupported order standard: {}", self.standard).into()),
 		}
