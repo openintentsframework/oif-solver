@@ -22,7 +22,8 @@ use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
 use solver_types::{
 	api::IntentRequest, APIError, Address, ApiErrorType, CostEstimate, GetOrderResponse,
-	GetQuoteRequest, GetQuoteResponse, Order, OrderIdCallback, Transaction,
+	GetQuoteRequest, GetQuoteResponse, Order, OrderIdCallback, ProfitabilityCalculatable,
+	Transaction,
 };
 use std::str::FromStr;
 use std::sync::Arc;
@@ -544,7 +545,7 @@ async fn forward_to_discovery_service(
 	}
 }
 
-/// Calculates the profit margin percentage for an order.
+/// Calculates the profit margin percentage for any profitability calculatable type.
 ///
 /// The profit margin is calculated as:
 /// Profit = Total Input Amount (USD) - Total Output Amount (USD) - Execution Costs (USD)
@@ -552,40 +553,33 @@ async fn forward_to_discovery_service(
 ///
 /// This represents the percentage profit the solver makes on the input amount.
 /// All amounts are converted to USD using the pricing service for accurate comparison.
-async fn calculate_order_profitability(
-	order: &Order,
+async fn calculate_order_profitability<T: ProfitabilityCalculatable>(
+	calculatable: &T,
 	cost_estimate: &CostEstimate,
 	solver: &SolverEngine,
 ) -> Result<Decimal, Box<dyn std::error::Error>> {
-	// Parse the order data as Eip7683OrderData
-	let order_data: solver_types::Eip7683OrderData = serde_json::from_value(order.data.clone())
-		.map_err(|e| format!("Failed to parse order data: {}", e))?;
+	// Get input and output assets using the simplified trait
+	let input_assets = calculatable
+		.input_assets()
+		.map_err(|e| format!("Failed to get input assets: {}", e))?;
+	let output_assets = calculatable
+		.output_assets()
+		.map_err(|e| format!("Failed to get output assets: {}", e))?;
 
 	let token_manager = solver.token_manager();
 	let pricing_service = solver.pricing();
 
 	// Calculate total input amount in USD (sum of all inputs converted to USD)
 	let mut total_input_amount_usd = Decimal::ZERO;
-	for input in &order_data.inputs {
-		// input is [token_address, amount] - extract both
-		let token_address_u256 = input[0];
-		let amount_u256 = input[1];
-
-		// Convert token address from U256 to Address
-		// Token address is stored in the last 20 bytes of the U256
-		let mut token_bytes = [0u8; 20];
-		let token_u256_bytes = token_address_u256.to_be_bytes::<32>();
-		token_bytes.copy_from_slice(&token_u256_bytes[12..32]);
-		let token_address = solver_types::Address(token_bytes.to_vec());
-
+	for (token_address, amount, chain_id) in input_assets {
 		// Get token info
 		let token_info = token_manager
-			.get_token_info(order_data.origin_chain_id.to::<u64>(), &token_address)
+			.get_token_info(chain_id, &token_address)
 			.map_err(|e| format!("Failed to get token info: {}", e))?;
 
 		// Convert raw amount to USD using pricing service
 		let usd_amount = convert_raw_token_to_usd(
-			&amount_u256,
+			&amount,
 			&token_info.symbol,
 			token_info.decimals,
 			pricing_service,
@@ -598,20 +592,15 @@ async fn calculate_order_profitability(
 
 	// Calculate total output amount in USD (sum of all outputs converted to USD)
 	let mut total_output_amount_usd = Decimal::ZERO;
-	for output in &order_data.outputs {
-		// Extract token address from the last 20 bytes of the bytes32 token field
-		let mut token_bytes = [0u8; 20];
-		token_bytes.copy_from_slice(&output.token[12..32]);
-		let token_address = solver_types::Address(token_bytes.to_vec());
-
+	for (token_address, amount, chain_id) in output_assets {
 		// Get token info
 		let token_info = token_manager
-			.get_token_info(output.chain_id.to::<u64>(), &token_address)
+			.get_token_info(chain_id, &token_address)
 			.map_err(|e| format!("Failed to get token info: {}", e))?;
 
 		// Convert raw amount to USD using pricing service
 		let usd_amount = convert_raw_token_to_usd(
-			&output.amount,
+			&amount,
 			&token_info.symbol,
 			token_info.decimals,
 			pricing_service,
@@ -634,6 +623,14 @@ async fn calculate_order_profitability(
 
 	tracing::debug!(
 		"Profitability calculation: input=${} (USD), output=${} (USD), cost=${} (USD), profit=${} (USD), margin={}%",
+		total_input_amount_usd,
+		total_output_amount_usd,
+		execution_cost_usd,
+		profit_usd,
+		profit_margin_decimal
+	);
+
+	println!("Profitability calculation: input=${} (USD), output=${} (USD), cost=${} (USD), profit=${} (USD), margin={}%",
 		total_input_amount_usd,
 		total_output_amount_usd,
 		execution_cost_usd,

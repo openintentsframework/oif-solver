@@ -44,7 +44,7 @@ pub mod pricing;
 pub use account::*;
 pub use api::*;
 pub use auth::{AuthConfig, AuthScope, JwtClaims};
-pub use costs::{CostComponent, CostEstimatable, CostEstimate};
+pub use costs::{CostComponent, CostEstimatable, CostEstimate, ProfitabilityCalculatable};
 pub use delivery::*;
 pub use discovery::*;
 pub use events::*;

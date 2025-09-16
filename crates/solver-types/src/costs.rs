@@ -18,6 +18,25 @@ pub trait CostEstimatable {
 	fn as_order_for_estimation(&self) -> Order;
 }
 
+/// Trait for types that can have their profitability calculated
+pub trait ProfitabilityCalculatable {
+	/// The specific order data type this implementation works with
+	type OrderData: serde::de::DeserializeOwned;
+
+	/// Get the order data for profitability calculation
+	fn get_order_data(&self) -> Result<Self::OrderData, Box<dyn std::error::Error>>;
+
+	/// Get input assets as tuples of (token_address, amount, chain_id)
+	fn input_assets(
+		&self,
+	) -> Result<Vec<(crate::Address, alloy_primitives::U256, u64)>, Box<dyn std::error::Error>>;
+
+	/// Get output assets as tuples of (token_address, amount, chain_id)
+	fn output_assets(
+		&self,
+	) -> Result<Vec<(crate::Address, alloy_primitives::U256, u64)>, Box<dyn std::error::Error>>;
+}
+
 /// Named amount used for cost components.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostComponent {

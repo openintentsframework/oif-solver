@@ -11,8 +11,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::{
-	Address, AssetAmount, ChainData, CostEstimatable, SettlementType, TransactionHash,
-	TransactionType,
+	bytes32_to_address, parse_address, Address, AssetAmount, ChainData, CostEstimatable,
+	Eip7683OrderData, ProfitabilityCalculatable, SettlementType, TransactionHash, TransactionType,
 };
 
 /// Callback function type for computing order IDs.
@@ -240,5 +240,49 @@ impl CostEstimatable for Order {
 	fn as_order_for_estimation(&self) -> Order {
 		// For a real Order, just return a clone
 		self.clone()
+	}
+}
+
+impl ProfitabilityCalculatable for Order {
+	type OrderData = Eip7683OrderData;
+
+	fn get_order_data(&self) -> Result<Self::OrderData, Box<dyn std::error::Error>> {
+		serde_json::from_value(self.data.clone())
+			.map_err(|e| format!("Failed to parse order data: {}", e).into())
+	}
+
+	fn input_assets(&self) -> Result<Vec<(Address, U256, u64)>, Box<dyn std::error::Error>> {
+		let order_data = self.get_order_data()?;
+		let origin_chain_id = order_data.origin_chain_id.to::<u64>();
+		let mut assets = Vec::new();
+
+		for input in &order_data.inputs {
+			let token_address_u256 = input[0];
+			let amount = input[1];
+			let token_u256_bytes = token_address_u256.to_be_bytes::<32>();
+			let address_hex = bytes32_to_address(&token_u256_bytes);
+			let token_address = parse_address(&address_hex)
+				.map_err(|e| format!("Failed to parse input token address: {}", e))?;
+
+			assets.push((token_address, amount, origin_chain_id));
+		}
+
+		Ok(assets)
+	}
+
+	fn output_assets(&self) -> Result<Vec<(Address, U256, u64)>, Box<dyn std::error::Error>> {
+		let order_data = self.get_order_data()?;
+		let mut assets = Vec::new();
+
+		for output in &order_data.outputs {
+			let address_hex = bytes32_to_address(&output.token);
+			let token_address = parse_address(&address_hex)
+				.map_err(|e| format!("Failed to parse output token address: {}", e))?;
+			let chain_id = output.chain_id.to::<u64>();
+
+			assets.push((token_address, output.amount, chain_id));
+		}
+
+		Ok(assets)
 	}
 }
