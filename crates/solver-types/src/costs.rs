@@ -1,5 +1,11 @@
+use crate::Address;
 use crate::Order;
+use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
+
+// Type aliases to reduce complexity
+type AssetTuple = (Address, U256, u64);
+type AssetResult = Result<Vec<AssetTuple>, Box<dyn std::error::Error>>;
 
 /// Trait for types that can have their execution costs estimated
 pub trait CostEstimatable {
@@ -24,14 +30,10 @@ pub trait CostEstimatable {
 /// order standards to have their own profitability calculation logic.
 pub trait ProfitabilityCalculatable: Send + Sync {
 	/// Get input assets as tuples of (token_address, amount, chain_id)
-	fn input_assets(
-		&self,
-	) -> Result<Vec<(crate::Address, alloy_primitives::U256, u64)>, Box<dyn std::error::Error>>;
+	fn input_assets(&self) -> AssetResult;
 
 	/// Get output assets as tuples of (token_address, amount, chain_id)
-	fn output_assets(
-		&self,
-	) -> Result<Vec<(crate::Address, alloy_primitives::U256, u64)>, Box<dyn std::error::Error>>;
+	fn output_assets(&self) -> AssetResult;
 }
 
 /// Named amount used for cost components.
