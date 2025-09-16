@@ -299,7 +299,7 @@ async fn handle_order(
 	// Estimate costs
 	let cost_engine = CostEngine::new();
 	let cost_estimate = match cost_engine
-		.estimate_cost(&validated_order, &vec![], &state.solver, &state.config)
+		.estimate_cost(&validated_order, &[], &state.solver, &state.config)
 		.await
 	{
 		Ok(estimation) => estimation,
@@ -311,8 +311,8 @@ async fn handle_order(
 
 	// Check profitability now that we have a valid cost estimate
 	match calculate_order_profitability(&validated_order, &cost_estimate, &state.solver).await {
-		Ok(profit_margin) => match profit_margin < state.config.solver.min_profitability_pct {
-			true => {
+		Ok(profit_margin) => {
+			if profit_margin < state.config.solver.min_profitability_pct {
 				return APIError::UnprocessableEntity {
 					error_type: ApiErrorType::InsufficientProfitability,
 					message: format!(
@@ -326,8 +326,7 @@ async fn handle_order(
 					})),
 				}
 				.into_response();
-			},
-			false => {},
+			}
 		},
 		Err(e) => {
 			tracing::warn!("Failed to calculate profitability: {}", e);

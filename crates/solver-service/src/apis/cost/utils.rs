@@ -72,15 +72,6 @@ pub fn estimate_gas_units_from_config(
 	(fallback_open, fallback_fill, fallback_claim)
 }
 
-/// Adds two decimal string values and returns the sum as a string.
-///
-/// # Returns
-///
-/// A string representing the sum of the two input values.
-pub fn add_decimals(a: &str, b: &str) -> String {
-	add_many(&[a.to_string(), b.to_string()])
-}
-
 /// Adds multiple decimal string values and returns the sum as a string.
 ///
 /// # Returns
@@ -133,8 +124,7 @@ pub async fn convert_raw_token_to_usd(
 		0 => raw_amount_decimal,
 		decimals => {
 			let divisor = Decimal::new(10_i64.pow(decimals as u32), 0);
-			let normalized_amount = raw_amount_decimal / divisor;
-			normalized_amount
+			raw_amount_decimal / divisor
 		},
 	};
 

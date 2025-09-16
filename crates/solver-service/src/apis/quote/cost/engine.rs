@@ -1,6 +1,6 @@
 use crate::apis::cost::convert_raw_token_to_usd;
 use crate::apis::cost::{
-	add_decimals, add_many, apply_bps, estimate_gas_units_from_config, get_chain_gas_price_as_u256,
+	add_many, apply_bps, estimate_gas_units_from_config, get_chain_gas_price_as_u256,
 };
 use alloy_primitives::U256;
 use rust_decimal::Decimal;
@@ -12,6 +12,7 @@ use solver_types::{
 	current_timestamp, APIError, ApiErrorType, AvailableInput, ExecutionParams, FillProof, Order,
 	Transaction, TransactionHash, DEFAULT_GAS_PRICE_WEI,
 };
+use std::str::FromStr;
 
 /// Parameters for chain-related information
 struct ChainParams {
@@ -37,7 +38,7 @@ impl CostEngine {
 	pub async fn estimate_cost<T: CostEstimatable>(
 		&self,
 		estimatable: &T,
-		available_inputs: &Vec<AvailableInput>,
+		available_inputs: &[AvailableInput],
 		solver: &SolverEngine,
 		config: &Config,
 	) -> Result<CostEstimate, APIError> {
@@ -224,7 +225,7 @@ impl CostEngine {
 		solver: &SolverEngine,
 		chain_params: ChainParams,
 		gas_units: GasUnits,
-		available_inputs: &Vec<AvailableInput>,
+		available_inputs: &[AvailableInput],
 		config: &Config,
 	) -> Result<CostEstimate, APIError> {
 		let pricing_service = solver.pricing();
@@ -308,7 +309,8 @@ impl CostEngine {
 			.unwrap_or_else(|_| "0".to_string());
 
 		// Add minimum profit to subtotal in currency terms
-		let subtotal_with_profit = add_decimals(&subtotal_currency, &min_profit_usd);
+		let subtotal_with_profit = Decimal::from_str(&subtotal_currency).unwrap_or(Decimal::ZERO)
+			+ Decimal::from_str(&min_profit_usd).unwrap_or(Decimal::ZERO);
 
 		let commission_amount = apply_bps(&subtotal, pricing.commission_bps);
 		let commission_amount_currency = pricing_service
@@ -317,7 +319,8 @@ impl CostEngine {
 			.unwrap_or_else(|_| "0".to_string());
 
 		// Calculate total including minimum profit
-		let total = add_decimals(&subtotal_with_profit, &commission_amount_currency);
+		let total = subtotal_with_profit
+			+ Decimal::from_str(&commission_amount_currency).unwrap_or(Decimal::ZERO);
 
 		Ok(CostEstimate {
 			currency: pricing.currency.clone(),
@@ -360,8 +363,8 @@ impl CostEngine {
 			],
 			commission_bps: pricing.commission_bps,
 			commission_amount: commission_amount_currency,
-			subtotal: subtotal_with_profit,
-			total,
+			subtotal: subtotal_with_profit.to_string(),
+			total: total.to_string(),
 		})
 	}
 
@@ -370,7 +373,7 @@ impl CostEngine {
 		&self,
 		solver: &SolverEngine,
 		pricing_service: &PricingService,
-		available_inputs: &Vec<AvailableInput>,
+		available_inputs: &[AvailableInput],
 		origin_chain_id: u64,
 		config: &Config,
 	) -> Result<String, Box<dyn std::error::Error>> {
