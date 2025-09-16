@@ -16,3 +16,6 @@ pub mod eip7930;
 
 // Re-export commonly used types for convenience
 pub use eip7683::{Eip7683OrderData, Output as Eip7683Output};
+
+/// Profitability calculators for different standards
+pub mod profitability_calculators;

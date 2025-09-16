@@ -19,13 +19,10 @@ pub trait CostEstimatable {
 }
 
 /// Trait for types that can have their profitability calculated
-pub trait ProfitabilityCalculatable {
-	/// The specific order data type this implementation works with
-	type OrderData: serde::de::DeserializeOwned;
-
-	/// Get the order data for profitability calculation
-	fn get_order_data(&self) -> Result<Self::OrderData, Box<dyn std::error::Error>>;
-
+///
+/// This trait is designed to work with trait objects, allowing different
+/// order standards to have their own profitability calculation logic.
+pub trait ProfitabilityCalculatable: Send + Sync {
 	/// Get input assets as tuples of (token_address, amount, chain_id)
 	fn input_assets(
 		&self,

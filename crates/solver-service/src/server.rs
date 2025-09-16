@@ -22,8 +22,7 @@ use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
 use solver_types::{
 	api::IntentRequest, APIError, Address, ApiErrorType, CostEstimate, GetOrderResponse,
-	GetQuoteRequest, GetQuoteResponse, Order, OrderIdCallback, ProfitabilityCalculatable,
-	Transaction,
+	GetQuoteRequest, GetQuoteResponse, Order, OrderIdCallback, Transaction,
 };
 use std::str::FromStr;
 use std::sync::Arc;
@@ -568,16 +567,19 @@ async fn forward_to_discovery_service(
 ///
 /// This represents the percentage profit the solver makes on the input amount.
 /// All amounts are converted to USD using the pricing service for accurate comparison.
-async fn calculate_order_profitability<T: ProfitabilityCalculatable>(
-	calculatable: &T,
+async fn calculate_order_profitability(
+	order: &Order,
 	cost_estimate: &CostEstimate,
 	solver: &SolverEngine,
 ) -> Result<Decimal, Box<dyn std::error::Error>> {
-	// Get input and output assets using the simplified trait
-	let input_assets = calculatable
+	// Get the appropriate profitability calculator for this order
+	let calculator = order.profitability_calculator()?;
+
+	// Get input and output assets using the calculator
+	let input_assets = calculator
 		.input_assets()
 		.map_err(|e| format!("Failed to get input assets: {}", e))?;
-	let output_assets = calculatable
+	let output_assets = calculator
 		.output_assets()
 		.map_err(|e| format!("Failed to get output assets: {}", e))?;
 
