@@ -152,7 +152,7 @@ impl Eip7683OrderImpl {
 	/// Validate compact signature for ResourceLock orders
 	async fn validate_compact_signature(
 		&self,
-		order_data: &Eip7683OrderData
+		order_data: &Eip7683OrderData,
 	) -> Result<(), OrderError> {
 		// Get the signature from the order data
 		let signature_hex = order_data.signature.as_ref().ok_or_else(|| {
