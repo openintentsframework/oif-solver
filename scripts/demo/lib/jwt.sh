@@ -60,7 +60,7 @@ jwt_register() {
     local api_url="${API_URL:-http://localhost:3000}"
     
     print_step "Calling registration endpoint..."
-    local response=$(curl -s -X POST "${api_url}/api/register" \
+    local response=$(curl -s -X POST "${api_url}/api/auth/register" \
         -H "Content-Type: application/json" \
         -d "$request_json" 2>/dev/null || true)
     
@@ -78,7 +78,7 @@ jwt_register() {
     fi
     
     # Extract token from response
-    local token=$(echo "$response" | jq -r '.token' 2>/dev/null)
+    local token=$(echo "$response" | jq -r '.access_token' 2>/dev/null)
     if [ -z "$token" ] || [ "$token" = "null" ]; then
         print_error "No token in response"
         echo "$response" | jq . 2>/dev/null || echo "$response"
@@ -261,7 +261,7 @@ jwt_test() {
             local client="test-client-$$"
             # Register client via API
             local api_url="${API_URL:-http://localhost:3000}"
-            local response=$(curl -s -X POST "${api_url}/api/register" \
+            local response=$(curl -s -X POST "${api_url}/api/auth/register" \
                 -H "Content-Type: application/json" \
                 -d "{\"client_id\": \"$client\", \"scopes\": [\"read-orders\"]}" 2>/dev/null || true)
             
@@ -270,7 +270,7 @@ jwt_test() {
                 exit 1
             fi
             
-            local token=$(echo "$response" | jq -r '.token' 2>/dev/null)
+            local token=$(echo "$response" | jq -r '.access_token' 2>/dev/null)
             if [ -z "$token" ] || [ "$token" = "null" ]; then
                 print_error "Failed to register client"
                 echo "$response" | jq . 2>/dev/null || echo "$response"
@@ -329,12 +329,12 @@ jwt_test() {
                 local client="test-${scope}-$$"
                 
                 # Register client
-                local response=$(curl -s -X POST "${api_url}/api/register" \
+                local response=$(curl -s -X POST "${api_url}/api/auth/register" \
                     -H "Content-Type: application/json" \
                     -d "{\"client_id\": \"$client\", \"scopes\": [\"$scope\"]}" 2>/dev/null || true)
                 
                 if [ -n "$response" ]; then
-                    local token=$(echo "$response" | jq -r '.token' 2>/dev/null)
+                    local token=$(echo "$response" | jq -r '.access_token' 2>/dev/null)
                     
                     if [ -n "$token" ] && [ "$token" != "null" ]; then
                         # Validate token
@@ -438,12 +438,12 @@ jwt_ensure_token() {
             scopes_json="[\"$(echo "$scopes" | sed 's/,/","/g')\"]"
         fi
         
-        local response=$(curl -s -X POST "${api_url}/api/register" \
+        local response=$(curl -s -X POST "${api_url}/api/auth/register" \
             -H "Content-Type: application/json" \
             -d "{\"client_id\": \"$client_id\", \"scopes\": $scopes_json}" 2>/dev/null || true)
         
         if [ -n "$response" ]; then
-            token=$(echo "$response" | jq -r '.token' 2>/dev/null)
+            token=$(echo "$response" | jq -r '.access_token' 2>/dev/null)
             if [ -n "$token" ] && [ "$token" != "null" ]; then
                 # Success! Store the token and return it
                 jwt_store_token "$token" "$client_id"
