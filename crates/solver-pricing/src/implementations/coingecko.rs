@@ -9,6 +9,7 @@ use reqwest::{
 	header::{HeaderMap, HeaderValue, ACCEPT},
 	Client,
 };
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use solver_types::utils::wei_string_to_eth_string;
 use solver_types::{
@@ -20,9 +21,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::debug;
-
-/// Precision for price formatting (decimal places)
-const PRICE_PRECISION: usize = 8;
 
 /// Cache entry for price data
 #[derive(Debug, Clone)]
@@ -56,7 +54,7 @@ pub struct CoinGeckoPricing {
 #[derive(Debug, Deserialize)]
 struct SimplePriceResponse {
 	#[serde(flatten)]
-	prices: HashMap<String, HashMap<String, f64>>,
+	prices: HashMap<String, HashMap<String, Decimal>>,
 }
 
 impl CoinGeckoPricing {
@@ -279,7 +277,7 @@ impl CoinGeckoPricing {
 			.and_then(|prices| prices.get("usd"))
 			.ok_or_else(|| PricingError::PriceNotAvailable(format!("{}/USD", token)))?;
 
-		let price_str = format!("{:.prec$}", price, prec = PRICE_PRECISION);
+		let price_str = price.to_string();
 
 		// Update cache
 		{
@@ -318,15 +316,16 @@ impl CoinGeckoPricing {
 		// If base is USD but quote isn't, get inverse
 		if self.is_usd(base) {
 			let crypto_price = self.get_price(quote, "USD").await?;
-			let price = crypto_price
-				.parse::<f64>()
+			let price: Decimal = crypto_price
+				.parse()
 				.map_err(|e| PricingError::InvalidData(format!("Invalid price: {}", e)))?;
 
-			if price == 0.0 {
+			if price.is_zero() {
 				return Err(PricingError::InvalidData("Price is zero".to_string()));
 			}
 
-			return Ok(format!("{:.prec$}", 1.0 / price, prec = PRICE_PRECISION));
+			let one = Decimal::ONE;
+			return Ok((one / price).to_string());
 		}
 
 		// For non-USD pairs, we could support crypto-to-crypto through USD
@@ -365,18 +364,18 @@ impl PricingInterface for CoinGeckoPricing {
 		let from_upper = from_asset.to_uppercase();
 		let to_upper = to_asset.to_uppercase();
 
-		let amount_f64 = amount
-			.parse::<f64>()
+		let amount_decimal: Decimal = amount
+			.parse()
 			.map_err(|e| PricingError::InvalidData(format!("Invalid amount: {}", e)))?;
 
 		let pair = TradingPair::new(&from_upper, &to_upper);
 		let rate = self.get_pair_price(&pair).await?;
-		let rate_f64 = rate
-			.parse::<f64>()
+		let rate_decimal: Decimal = rate
+			.parse()
 			.map_err(|e| PricingError::InvalidData(format!("Invalid rate: {}", e)))?;
 
-		let result = amount_f64 * rate_f64;
-		Ok(format!("{:.prec$}", result, prec = PRICE_PRECISION))
+		let result = amount_decimal * rate_decimal;
+		Ok(result.to_string())
 	}
 
 	async fn wei_to_currency(
@@ -396,22 +395,25 @@ impl PricingInterface for CoinGeckoPricing {
 		let eth_amount_str =
 			wei_string_to_eth_string(wei_amount).map_err(PricingError::InvalidData)?;
 
-		let eth_amount_f64 = eth_amount_str
-			.parse::<f64>()
+		let eth_amount: Decimal = eth_amount_str
+			.parse()
 			.map_err(|e| PricingError::InvalidData(format!("Invalid ETH amount: {}", e)))?;
 
 		// Get ETH price in USD
 		let eth_price = self.get_price("ETH", "USD").await?;
-		let price_f64 = eth_price
-			.parse::<f64>()
+		let price_decimal: Decimal = eth_price
+			.parse()
 			.map_err(|e| PricingError::InvalidData(format!("Invalid price: {}", e)))?;
 
-		let result = eth_amount_f64 * price_f64;
+		let result = eth_amount * price_decimal;
 		debug!(
-			"Converted gas cost: {} wei = {} ETH = ${:.2} USD (ETH price: ${})",
-			wei_amount, eth_amount_str, result, eth_price
+			"Converted gas cost: {} wei = {} ETH = ${} USD (ETH price: ${})",
+			wei_amount,
+			eth_amount_str,
+			result.round_dp(2),
+			eth_price
 		);
-		Ok(format!("{:.2}", result))
+		Ok(result.round_dp(2).to_string())
 	}
 
 	async fn currency_to_wei(
@@ -427,25 +429,25 @@ impl PricingInterface for CoinGeckoPricing {
 			)));
 		}
 
-		let currency_amount_f64 = currency_amount
-			.parse::<f64>()
+		let currency_amount_decimal: Decimal = currency_amount
+			.parse()
 			.map_err(|e| PricingError::InvalidData(format!("Invalid currency amount: {}", e)))?;
 
 		// Get ETH price in USD
 		let eth_price = self.get_price("ETH", "USD").await?;
-		let eth_price_f64 = eth_price
-			.parse::<f64>()
+		let eth_price_decimal: Decimal = eth_price
+			.parse()
 			.map_err(|e| PricingError::InvalidData(format!("Invalid ETH price: {}", e)))?;
 
-		if eth_price_f64 == 0.0 {
+		if eth_price_decimal.is_zero() {
 			return Err(PricingError::InvalidData(
 				"ETH price cannot be zero".to_string(),
 			));
 		}
 
 		// Convert currency to ETH, then to wei
-		let eth_amount = currency_amount_f64 / eth_price_f64;
-		let eth_amount_str = format!("{:.18}", eth_amount);
+		let eth_amount = currency_amount_decimal / eth_price_decimal;
+		let eth_amount_str = eth_amount.to_string();
 		let wei_amount = parse_ether(&eth_amount_str).map_err(|e| {
 			PricingError::InvalidData(format!("Failed to convert ETH to wei: {}", e))
 		})?;
