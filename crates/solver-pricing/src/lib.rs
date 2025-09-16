@@ -9,33 +9,22 @@ use solver_types::{
 
 /// Re-export implementations
 pub mod implementations {
+	pub mod coingecko;
 	pub mod mock;
-	// pub mod coingecko;
-	// pub mod chainlink;
-	// pub mod composite;
 }
 
 /// Get all registered pricing implementations.
 pub fn get_all_implementations() -> Vec<(&'static str, PricingFactory)> {
-	// use implementations::{chainlink, coingecko, composite, mock};
-	use implementations::mock;
+	use implementations::{coingecko, mock};
 	vec![
 		(
 			mock::MockPricingRegistry::NAME,
 			mock::MockPricingRegistry::factory(),
 		),
-		// (
-		// 	coingecko::CoinGeckoPricingRegistry::NAME,
-		// 	coingecko::CoinGeckoPricingRegistry::factory(),
-		// ),
-		// (
-		// 	chainlink::ChainlinkPricingRegistry::NAME,
-		// 	chainlink::ChainlinkPricingRegistry::factory(),
-		// ),
-		// (
-		// 	composite::CompositePricingRegistry::NAME,
-		// 	composite::CompositePricingRegistry::factory(),
-		// ),
+		(
+			coingecko::CoinGeckoPricingRegistry::NAME,
+			coingecko::CoinGeckoPricingRegistry::factory(),
+		),
 	]
 }
 

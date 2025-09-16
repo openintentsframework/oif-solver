@@ -299,6 +299,7 @@ async fn handle_order(
 		.estimate_cost(&validated_order, &state.solver, &state.config)
 		.await;
 
+	// println!("{:#?}", _order_cost);
 	// TODO: Do something with _order_cost
 
 	forward_to_discovery_service(&state, &intent_request).await

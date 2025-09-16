@@ -204,8 +204,6 @@ config_load_networks() {
             "the_compact_address"
             "allocator_address"
             "output_settler_address"
-            "input_oracle_address"
-            "output_oracle_address"
         )
         
         for contract in "${contracts[@]}"; do
@@ -457,21 +455,27 @@ config_get_compact() {
 config_get_oracle() {
     local chain_id="$1"
     local oracle_type="${2:-input}"  # input or output
-    
+
     if [ ! "$CONFIG_LOADED" = true ]; then
         return 1
     fi
-    
+
     # Parse the oracle configuration from the main config file
     # Format: input = { 31337 = ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"], ... }
     if [ -n "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ]; then
-        local oracle_line=$(grep -A10 "\\[settlement.implementations.direct.oracles\\]" "$CONFIG_FILE" | \
-                           grep "^${oracle_type} = " | head -n1)
-        
-        if [ -n "$oracle_line" ]; then
+        # Get the oracle section and look for the chain ID within the input/output block
+        # Handle multi-line format - extract between input/output sections
+        local oracle_block
+        if [ "$oracle_type" = "input" ]; then
+            oracle_block=$(awk '/^input = /{flag=1} flag && /^output = /{exit} flag' "$CONFIG_FILE")
+        else
+            oracle_block=$(awk '/^output = /{flag=1} flag && /^# Valid routes:/{exit} flag' "$CONFIG_FILE")
+        fi
+
+        if [ -n "$oracle_block" ]; then
             # Extract the first oracle address for the specified chain
-            # This is a simplified parser - assumes format: chain = ["address"]
-            echo "$oracle_line" | sed -n "s/.*${chain_id} = \\[\"\\([^\"]*\\)\".*/\\1/p"
+            # Look for pattern: chain_id = [ "address", ]
+            echo "$oracle_block" | grep -A1 "${chain_id} = \[" | grep -o '"0x[^"]*"' | head -n1 | tr -d '"'
         fi
     fi
 }

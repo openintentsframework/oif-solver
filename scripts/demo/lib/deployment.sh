@@ -1195,6 +1195,12 @@ primary = "mock"
 [pricing.implementations.mock]
 # Uses default ETH/USD price of 4615.16
 
+[pricing.implementations.coingecko]
+# Free tier configuration (no API key required)
+# api_key = "CG-YOUR-API-KEY-HERE"
+cache_duration_seconds = 60
+rate_limit_delay_ms = 1200
+
 # ============================================================================
 # SETTLEMENT
 # ============================================================================
