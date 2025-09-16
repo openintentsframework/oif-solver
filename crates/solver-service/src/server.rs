@@ -3,6 +3,7 @@
 //! This module provides a minimal HTTP server infrastructure
 //! for the OIF Solver API.
 
+use crate::apis::cost::convert_raw_token_to_usd;
 use crate::{
 	apis::{order::get_order_by_id, quote::cost::CostEngine},
 	auth::{auth_middleware, AuthState, JwtService},
@@ -298,7 +299,7 @@ async fn handle_order(
 	// Estimate costs
 	let cost_engine = CostEngine::new();
 	let cost_estimate = match cost_engine
-		.estimate_cost(&validated_order, &state.solver, &state.config)
+		.estimate_cost(&validated_order, &vec![], &state.solver, &state.config)
 		.await
 	{
 		Ok(estimation) => estimation,
@@ -650,46 +651,4 @@ async fn calculate_order_profitability(
 	);
 
 	Ok(profit_margin_decimal)
-}
-
-/// Converts a raw token amount to USD, handling decimals normalization.
-async fn convert_raw_token_to_usd(
-	raw_amount: &U256,
-	token_symbol: &str,
-	token_decimals: u8,
-	pricing_service: &solver_pricing::PricingService,
-) -> Result<Decimal, Box<dyn std::error::Error>> {
-	// Handle potential overflow for large decimals (tokens normally uses max 18 decimals)
-	if token_decimals > 28 {
-		// Decimal max precision is 28
-		return Err(format!(
-			"Token decimals {} exceeds maximum supported precision",
-			token_decimals
-		)
-		.into());
-	}
-
-	// Convert U256 to string and then to Decimal
-	let raw_amount_str = raw_amount.to_string();
-	let raw_amount_decimal = Decimal::from_str(&raw_amount_str)
-		.map_err(|e| format!("Failed to parse raw amount {}: {}", raw_amount_str, e))?;
-
-	// Use match for token_decimals normalization
-	let normalized_amount = match token_decimals {
-		0 => raw_amount_decimal,
-		decimals => {
-			let divisor = Decimal::new(10_i64.pow(decimals as u32), 0);
-			let normalized_amount = raw_amount_decimal / divisor;
-			normalized_amount
-		},
-	};
-
-	// Convert to USD and return as Decimal
-	let usd_amount_str = pricing_service
-		.convert_asset(token_symbol, "USD", &normalized_amount.to_string())
-		.await
-		.map_err(|e| format!("Failed to convert {} to USD: {}", token_symbol, e))?;
-
-	Decimal::from_str(&usd_amount_str)
-		.map_err(|e| format!("Failed to parse USD amount {}: {}", usd_amount_str, e).into())
 }
