@@ -36,34 +36,63 @@
 # Global State Management
 # -----------------------------------------------------------------------------
 # Intent status tracking - stores state from last intent operation
-declare -gA INTENT_STATUS
-INTENT_STATUS[last_order_id]=""
-INTENT_STATUS[last_tx_hash]=""
-INTENT_STATUS[last_signature]=""
-INTENT_STATUS[last_lock_type]=""
+# Using regular variables
+INTENT_STATUS_last_order_id=""
+INTENT_STATUS_last_tx_hash=""
+INTENT_STATUS_last_signature=""
+INTENT_STATUS_last_lock_type=""
 
 # -----------------------------------------------------------------------------
 # Status Management Functions
 # -----------------------------------------------------------------------------
 # Clear intent status
 clear_intent_status() {
-    INTENT_STATUS[last_order_id]=""
-    INTENT_STATUS[last_tx_hash]=""
-    INTENT_STATUS[last_signature]=""
-    INTENT_STATUS[last_lock_type]=""
+    INTENT_STATUS_last_order_id=""
+    INTENT_STATUS_last_tx_hash=""
+    INTENT_STATUS_last_signature=""
+    INTENT_STATUS_last_lock_type=""
 }
 
 # Get intent status field
 get_intent_status() {
     local field="$1"
-    echo "${INTENT_STATUS[$field]}"
+    case "$field" in
+        "last_order_id")
+            echo "$INTENT_STATUS_last_order_id"
+            ;;
+        "last_tx_hash")
+            echo "$INTENT_STATUS_last_tx_hash"
+            ;;
+        "last_signature")
+            echo "$INTENT_STATUS_last_signature"
+            ;;
+        "last_lock_type")
+            echo "$INTENT_STATUS_last_lock_type"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
 }
 
 # Set intent status field
 set_intent_status() {
     local field="$1"
     local value="$2"
-    INTENT_STATUS[$field]="$value"
+    case "$field" in
+        "last_order_id")
+            INTENT_STATUS_last_order_id="$value"
+            ;;
+        "last_tx_hash")
+            INTENT_STATUS_last_tx_hash="$value"
+            ;;
+        "last_signature")
+            INTENT_STATUS_last_signature="$value"
+            ;;
+        "last_lock_type")
+            INTENT_STATUS_last_lock_type="$value"
+            ;;
+    esac
 }
 
 # Build mandate output structure

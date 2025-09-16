@@ -122,8 +122,8 @@ dest_array=($dest_txs)
 
 echo
 echo "📊 Systematic discovery results (compact):"
-echo "  Origin (finalize): ${origin_array[*]} (${#origin_array[@]} transactions)"
-echo "  Dest (fill): ${dest_array[*]} (${#dest_array[@]} transactions)"
+echo "  Origin (finalize): ${origin_array[*]:-} (${#origin_array[@]} transactions)"
+echo "  Dest (fill): ${dest_array[*]:-} (${#dest_array[@]} transactions)"
 
 # STRICT validation - ALL observed txs must be found
 if [ "$all_found" = false ] || [ ${#origin_array[@]} -ne $origin_tx_count ] || [ ${#dest_array[@]} -ne $dest_tx_count ]; then

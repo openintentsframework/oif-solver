@@ -15,7 +15,8 @@ discovery = "offchain_eip7683"
 [api.auth]
 enabled = true
 jwt_secret = "${JWT_SECRET:-MySuperDuperSecureSecret123!}"
-token_expiry_hours = 24
+access_token_expiry_hours = 1
+refresh_token_expiry_hours = 720  # 30 days
 issuer = "oif-solver-demo"
 
 # Quote Configuration
