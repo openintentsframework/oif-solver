@@ -4,7 +4,7 @@ include = [
     "demo/networks.toml",
     "demo/api.toml",
     "demo/cli.toml",
-    "demo/gas.toml"
+    "demo/gas.toml",
 ]
 
 [solver]
@@ -23,9 +23,9 @@ cleanup_interval_seconds = 60
 
 [storage.implementations.file]
 storage_path = "./data/storage"
-ttl_orders = 300                  # 5 minutes
-ttl_intents = 120                 # 2 minutes
-ttl_order_by_tx_hash = 300        # 5 minutes
+ttl_orders = 300                # 5 minutes
+ttl_intents = 120               # 2 minutes
+ttl_order_by_tx_hash = 300      # 5 minutes
 
 # ============================================================================
 # ACCOUNT
@@ -52,7 +52,7 @@ network_ids = [31337, 31338]
 
 [discovery.implementations.onchain_eip7683]
 network_ids = [31337, 31338]
-polling_interval_secs = 0  # Use WebSocket subscriptions instead of polling
+polling_interval_secs = 0    # Use WebSocket subscriptions instead of polling
 
 [discovery.implementations.offchain_eip7683]
 api_host = "127.0.0.1"
@@ -81,6 +81,12 @@ primary = "mock"
 [pricing.implementations.mock]
 # Uses default ETH/USD price of 4615.16
 
+[pricing.implementations.coingecko]
+# Free tier configuration (no API key required)
+# api_key = "CG-YOUR-API-KEY-HERE"
+cache_duration_seconds = 60
+rate_limit_delay_ms = 1200
+
 # ============================================================================
 # SETTLEMENT
 # ============================================================================
@@ -100,11 +106,19 @@ oracle_selection_strategy = "First"
 # Oracle configuration with multiple oracle support
 [settlement.implementations.direct.oracles]
 # Input oracles (on origin chains)
-input = { 31337 = ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"], 31338 = ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"] }
+input = { 31337 = [
+    "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
+], 31338 = [
+    "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
+] }
 # Output oracles (on destination chains)
-output = { 31337 = ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"], 31338 = ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"] }
+output = { 31337 = [
+    "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
+], 31338 = [
+    "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
+] }
 
 # Valid routes: from origin chain -> to destination chains
 [settlement.implementations.direct.routes]
-31337 = [31338]  # Can go from origin to destination
-31338 = [31337]  # Can go from destination to origin
+31337 = [31338] # Can go from origin to destination
+31338 = [31337] # Can go from destination to origin

@@ -894,18 +894,18 @@ submit_intent() {
     local intent_json="$1"
     local api_url="${2:-http://localhost:3000/api/orders}"
     local max_retries="${3:-3}"
-    
+
     print_info "Submitting intent to solver API"
     print_debug "API URL: $api_url"
     print_debug "Intent JSON: $intent_json"
-    
+
     # Validate intent JSON
     if ! validate_json "$intent_json"; then
         print_error "Invalid intent JSON"
         return 1
     fi
-    
-    # Submit with retry
+
+    # Submit with retry - api_post_retry will automatically handle JWT authentication via jwt_ensure_token
     if api_post_retry "$api_url" "$intent_json" "" "$max_retries"; then
         local status_code=$(get_api_response "status_code")
         local response_body=$(get_api_response "body")
@@ -956,7 +956,7 @@ submit_escrow_intent() {
     # Get contract addresses from config
     local input_settler=$(config_get_network "$origin_chain_id" "input_settler_address")
     local output_settler=$(config_get_network "$dest_chain_id" "output_settler_address")
-    local input_oracle=$(config_get_network "$origin_chain_id" "input_oracle_address")
+    local input_oracle=$(config_get_oracle "$origin_chain_id" "input")
     
     if [ -z "$input_settler" ] || [ -z "$output_settler" ]; then
         print_error "Required contract addresses not found in config"
@@ -997,7 +997,7 @@ submit_compact_intent() {
     local input_settler_compact=$(config_get_network "$origin_chain_id" "input_settler_compact_address")
     local output_settler=$(config_get_network "$dest_chain_id" "output_settler_address")
     local the_compact_addr=$(config_get_network "$origin_chain_id" "the_compact_address")
-    local input_oracle=$(config_get_network "$origin_chain_id" "input_oracle_address")
+    local input_oracle=$(config_get_oracle "$origin_chain_id" "input")
     
     if [ -z "$input_settler_compact" ] || [ -z "$output_settler" ] || [ -z "$the_compact_addr" ]; then
         print_error "Required contract addresses not found in config"
@@ -1455,9 +1455,6 @@ intent_build() {
             print_debug "TOKEN_ID (hex): $token_id_hex"
             print_debug "TOKEN_ID (uint256): $token_id_u256"
             
-            # create_compact_intent(user_addr, user_private_key, origin_chain_id, dest_chain_id,
-            #                      token_id, resource_lock_id, lock_amount, output_token, output_amount,
-            #                      recipient, input_settler_compact, output_settler, the_compact_addr, input_oracle)
             intent_json=$(create_compact_intent "$user_addr" "$user_key" "$origin_chain" "$dest_chain" \
                                "$token_id_u256" "$allocator_lock_tag" "$amount_in" "$token_out" "$amount_out" \
                                "$recipient_addr" "$input_settler_compact" "$output_settler" "$the_compact" "$oracle")

@@ -1043,6 +1043,7 @@ impl OrderInterface for Eip7683OrderImpl {
 		// Convert StandardOrder to Eip7683OrderData for serialization
 		let mut order_data = Eip7683OrderData::from(standard_order.clone());
 		order_data.order_id = order_id_array;
+		order_data.lock_type = Some(lock_type);
 
 		// Create generic Order
 		Ok(Order {
