@@ -310,8 +310,8 @@ async fn handle_order(
 
 	// Check profitability now that we have a valid cost estimate
 	match calculate_order_profitability(&validated_order, &cost_estimate, &state.solver).await {
-		Ok(profit_margin) => {
-			if profit_margin < state.config.solver.min_profitability_pct {
+		Ok(profit_margin) => match profit_margin < state.config.solver.min_profitability_pct {
+			true => {
 				return APIError::UnprocessableEntity {
 					error_type: ApiErrorType::InsufficientProfitability,
 					message: format!(
@@ -325,7 +325,8 @@ async fn handle_order(
 					})),
 				}
 				.into_response();
-			}
+			},
+			false => {},
 		},
 		Err(e) => {
 			tracing::warn!("Failed to calculate profitability: {}", e);
@@ -603,8 +604,7 @@ async fn calculate_order_profitability(
 		)
 		.await?;
 
-		total_input_amount_usd += Decimal::from_str(&usd_amount)
-			.map_err(|e| format!("Failed to parse input USD amount: {}", e))?;
+		total_input_amount_usd += usd_amount;
 	}
 
 	// Calculate total output amount in USD (sum of all outputs converted to USD)
@@ -624,8 +624,7 @@ async fn calculate_order_profitability(
 		)
 		.await?;
 
-		total_output_amount_usd += Decimal::from_str(&usd_amount)
-			.map_err(|e| format!("Failed to parse output USD amount: {}", e))?;
+		total_output_amount_usd += usd_amount;
 	}
 
 	// Parse execution costs from cost estimate (already in USD)
@@ -659,18 +658,38 @@ async fn convert_raw_token_to_usd(
 	token_symbol: &str,
 	token_decimals: u8,
 	pricing_service: &solver_pricing::PricingService,
-) -> Result<String, Box<dyn std::error::Error>> {
-	// First normalize the token amount by dividing by 10^decimals
+) -> Result<Decimal, Box<dyn std::error::Error>> {
+	// Handle potential overflow for large decimals (tokens normally uses max 18 decimals)
+	if token_decimals > 28 {
+		// Decimal max precision is 28
+		return Err(format!(
+			"Token decimals {} exceeds maximum supported precision",
+			token_decimals
+		)
+		.into());
+	}
+
+	// Convert U256 to string and then to Decimal
 	let raw_amount_str = raw_amount.to_string();
 	let raw_amount_decimal = Decimal::from_str(&raw_amount_str)
-		.map_err(|e| format!("Failed to parse raw amount: {}", e))?;
+		.map_err(|e| format!("Failed to parse raw amount {}: {}", raw_amount_str, e))?;
 
-	let divisor = Decimal::new(10_i64.pow(token_decimals as u32), 0);
-	let normalized_amount = raw_amount_decimal / divisor;
+	// Use match for token_decimals normalization
+	let normalized_amount = match token_decimals {
+		0 => raw_amount_decimal,
+		decimals => {
+			let divisor = Decimal::new(10_i64.pow(decimals as u32), 0);
+			let normalized_amount = raw_amount_decimal / divisor;
+			normalized_amount
+		},
+	};
 
-	// Then convert the normalized token amount to USD using the pricing service
-	pricing_service
+	// Convert to USD and return as Decimal
+	let usd_amount_str = pricing_service
 		.convert_asset(token_symbol, "USD", &normalized_amount.to_string())
 		.await
-		.map_err(|e| format!("Failed to convert {} to USD: {}", token_symbol, e).into())
+		.map_err(|e| format!("Failed to convert {} to USD: {}", token_symbol, e))?;
+
+	Decimal::from_str(&usd_amount_str)
+		.map_err(|e| format!("Failed to parse USD amount {}: {}", usd_amount_str, e).into())
 }
