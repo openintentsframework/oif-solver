@@ -633,6 +633,9 @@ async fn calculate_order_profitability(
 		.map_err(|e| format!("Failed to parse execution cost: {}", e))?;
 
 	// Calculate profit: Input (USD) - Output (USD) - Costs (USD)
+	if total_input_amount_usd.is_zero() {
+		return Err("Division by zero: total_input_amount_usd is zero".into());
+	}
 	let profit_usd = total_input_amount_usd - total_output_amount_usd - execution_cost_usd;
 
 	let hundred = Decimal::new(100_i64, 0);
