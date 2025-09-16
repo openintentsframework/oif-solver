@@ -13,6 +13,8 @@ use solver_types::standards::eip7683::interfaces::{
 	SolMandateOutput as MandateOutput, StandardOrder as OifStandardOrder,
 };
 
+// TheCompact contract interface is defined in solver-types
+
 /// Validation result for compact signature validation
 #[derive(Debug)]
 pub struct ValidationResult {
@@ -48,24 +50,11 @@ impl CompactSignatureValidator {
 		// 1. Compute the message hash that was signed
 		let message_hash = self.compute_batch_compact_message_hash(order)?;
 
-		tracing::info!(
-			"Validation - computed message hash: {:?}",
-			hex::encode(message_hash)
-		);
-		tracing::info!(
-			"Validation - signature bytes: {:?}",
-			hex::encode(&signature)
-		);
-		tracing::info!("Validation - expected signer: {:?}", expected_signer);
-
 		// 2. Recover the signer from the signature
 		let recovered_signer = self.recover_signer(message_hash, signature)?;
 
-		tracing::info!("Validation - recovered signer: {:?}", recovered_signer);
-
 		// 3. Check if the recovered signer matches the expected signer
 		let is_valid = recovered_signer == expected_signer;
-		tracing::info!("Validation - signature valid: {}", is_valid);
 
 		Ok(is_valid)
 	}
@@ -77,33 +66,14 @@ impl CompactSignatureValidator {
 	) -> Result<FixedBytes<32>, String> {
 		// 1. Compute witness hash
 		let witness_hash = self.compute_witness_hash(order)?;
-		tracing::info!(
-			"Rust computed witness hash: {:?}",
-			hex::encode(witness_hash)
-		);
 
 		// 2. Prepare idsAndAmounts from order.inputs
 		let ids_and_amounts = self.prepare_ids_and_amounts(&order.inputs);
 
 		// 3. Compute lock hash
 		let lock_hash = self.compute_lock_hash(&ids_and_amounts)?;
-		tracing::info!(
-			"Rust computed commitments hash: {:?}",
-			hex::encode(lock_hash)
-		);
 
 		// 4. Compute the EIP-712 message hash
-		tracing::info!("BatchCompact computation - sponsor: {:?}", order.user);
-		tracing::info!("BatchCompact computation - nonce: {}", order.nonce);
-		tracing::info!("BatchCompact computation - expires: {}", order.expires);
-		tracing::info!(
-			"BatchCompact computation - lock_hash: {:?}",
-			hex::encode(lock_hash)
-		);
-		tracing::info!(
-			"BatchCompact computation - witness_hash: {:?}",
-			hex::encode(witness_hash)
-		);
 
 		let message_hash = self.compute_batch_compact_message_hash_internal(
 			order.user,
@@ -112,12 +82,6 @@ impl CompactSignatureValidator {
 			lock_hash,
 			witness_hash,
 		)?;
-
-		tracing::info!(
-			"Rust domain separator: {:?}",
-			hex::encode(self.domain_separator)
-		);
-		tracing::info!("Rust final message hash: {:?}", hex::encode(message_hash));
 
 		Ok(message_hash)
 	}
@@ -128,28 +92,7 @@ impl CompactSignatureValidator {
             b"Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
         );
 
-		tracing::info!(
-			"Witness hash computation - fillDeadline: {}",
-			order.fillDeadline
-		);
-		tracing::info!(
-			"Witness hash computation - inputOracle: {:?}",
-			order.inputOracle
-		);
-		tracing::info!(
-			"Witness hash computation - outputs count: {}",
-			order.outputs.len()
-		);
-		for (i, output) in order.outputs.iter().enumerate() {
-			tracing::info!("Witness hash computation - output[{}]: oracle={:?}, settler={:?}, chainId={}, token={:?}, amount={}, recipient={:?}",
-                i, output.oracle, output.settler, output.chainId, output.token, output.amount, output.recipient);
-		}
-
 		let outputs_hash = self.compute_outputs_hash(&order.outputs)?;
-		tracing::info!(
-			"Witness hash computation - outputs_hash: {:?}",
-			hex::encode(outputs_hash)
-		);
 
 		// Use proper ABI encoding like the shell script: f(bytes32,uint32,address,bytes32)
 		let mut data = Vec::new();
@@ -166,23 +109,6 @@ impl CompactSignatureValidator {
 		data.extend_from_slice(&oracle_bytes); // address encoded as 32 bytes
 
 		data.extend_from_slice(&outputs_hash.as_slice()); // bytes32
-
-		tracing::info!(
-			"Witness hash computation - mandate_type_hash: {:?}",
-			hex::encode(mandate_type_hash)
-		);
-		tracing::info!(
-			"Witness hash computation - fillDeadline bytes (as uint32): {:?}",
-			hex::encode(&fill_deadline_bytes)
-		);
-		tracing::info!(
-			"Witness hash computation - inputOracle bytes (ABI-encoded): {:?}",
-			hex::encode(&oracle_bytes)
-		);
-		tracing::info!(
-			"Witness hash computation - full data: {:?}",
-			hex::encode(&data)
-		);
 
 		Ok(keccak256(data))
 	}
@@ -250,13 +176,6 @@ impl CompactSignatureValidator {
 			token_address_bytes.copy_from_slice(&token_id_bytes[12..32]);
 			let token_address = AlloyAddress::from(token_address_bytes);
 
-			tracing::info!(
-				"Extracted from token ID {:?}: lock_tag={:?}, token_address={:?}",
-				hex::encode(token_id_bytes),
-				hex::encode(lock_tag),
-				hex::encode(token_address)
-			);
-
 			let lock_type_hash = keccak256(b"Lock(bytes12 lockTag,address token,uint256 amount)");
 
 			// Use proper ABI encoding like the shell script: f(bytes32,bytes12,address,uint256)
@@ -275,32 +194,7 @@ impl CompactSignatureValidator {
 
 			lock_data.extend_from_slice(&amount.to_be_bytes::<32>()); // uint256
 
-			tracing::info!(
-				"Lock hash computation - type_hash: {:?}",
-				hex::encode(lock_type_hash)
-			);
-			tracing::info!(
-				"Lock hash computation - lock_tag (bytes12 ABI-encoded): {:?}",
-				hex::encode(&lock_tag_bytes)
-			);
-			tracing::info!(
-				"Lock hash computation - token_address (address ABI-encoded): {:?}",
-				hex::encode(&token_address_bytes)
-			);
-			tracing::info!(
-				"Lock hash computation - amount: {:?}",
-				hex::encode(amount.to_be_bytes::<32>())
-			);
-			tracing::info!(
-				"Lock hash computation - full data: {:?}",
-				hex::encode(&lock_data)
-			);
-
 			let lock_hash = keccak256(lock_data);
-			tracing::info!(
-				"Lock hash computation - result: {:?}",
-				hex::encode(lock_hash)
-			);
 			lock_hashes.extend_from_slice(&lock_hash.as_slice());
 		}
 
@@ -413,9 +307,6 @@ impl CompactSignatureValidator {
 			return Err("Invalid signature - signer does not match expected user".to_string());
 		}
 
-		// 3. Additional validations
-		self.validate_order_additional(order)?;
-
 		Ok(ValidationResult {
 			valid: true,
 			order_id: self.compute_order_id(order),
@@ -474,20 +365,6 @@ impl CompactSignatureValidator {
 
 		// TODO: Check chain ID against domain separator once we have proper domain separator computation
 		// For now, skip chain validation since we're using hardcoded domain separator
-
-		Ok(())
-	}
-
-	fn validate_order_additional(&self, order: &OifStandardOrder) -> Result<(), String> {
-		// Validate outputs
-		for output in &order.outputs {
-			if output.oracle.is_zero() {
-				return Err("Invalid oracle".to_string());
-			}
-			if output.settler.is_zero() {
-				return Err("Invalid settler".to_string());
-			}
-		}
 
 		Ok(())
 	}

@@ -603,6 +603,12 @@ pub mod interfaces {
 			function fill(bytes32 orderId, SolMandateOutput calldata output, uint48 fillDeadline, bytes calldata fillerData) external returns (bytes32);
 			function fillOrderOutputs(bytes32 orderId, SolMandateOutput[] calldata outputs, bytes calldata fillerData) external;
 		}
+
+		/// TheCompact contract interface for domain separator fetching.
+		#[sol(rpc)]
+		interface ITheCompact {
+			function DOMAIN_SEPARATOR() external view returns (bytes32);
+		}
 	}
 }
 

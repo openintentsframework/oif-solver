@@ -79,6 +79,7 @@ impl SolverBuilder {
 			&toml::Value,
 			&solver_types::NetworksConfig,
 			&solver_types::oracle::OracleRoutes,
+			std::sync::Arc<DeliveryService>,
 		) -> Result<Box<dyn OrderInterface>, OrderError>,
 		PF: Fn(
 			&toml::Value,
@@ -403,7 +404,12 @@ impl SolverBuilder {
 		let mut order_impls = HashMap::new();
 		for (name, config) in &self.config.order.implementations {
 			if let Some(factory) = factories.order_factories.get(name) {
-				match factory(config, &self.config.networks, &oracle_routes) {
+				match factory(
+					config,
+					&self.config.networks,
+					&oracle_routes,
+					delivery.clone(),
+				) {
 					Ok(implementation) => {
 						// Validation already happened in the factory
 						order_impls.insert(name.clone(), implementation);

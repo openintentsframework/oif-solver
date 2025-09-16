@@ -8,12 +8,14 @@ use crate::{OrderError, OrderInterface};
 use alloy_primitives::{Address as AlloyAddress, Bytes, FixedBytes, U256};
 use alloy_sol_types::{SolCall, SolType};
 use async_trait::async_trait;
+use solver_delivery::DeliveryService;
 use solver_types::{
 	current_timestamp,
+	networks::NetworkConfig,
 	oracle::OracleRoutes,
 	standards::eip7683::{
 		interfaces::{
-			IInputSettlerCompact, IInputSettlerEscrow, IOutputSettlerSimple,
+			IInputSettlerCompact, IInputSettlerEscrow, IOutputSettlerSimple, ITheCompact,
 			SolMandateOutput as MandateOutput, SolveParams, StandardOrder as OifStandardOrder,
 		},
 		LockType,
@@ -21,6 +23,7 @@ use solver_types::{
 	Address, ConfigSchema, Eip7683OrderData, ExecutionParams, FillProof, Intent, NetworksConfig,
 	Order, OrderStatus, Schema, Transaction,
 };
+use std::sync::Arc;
 
 use super::compact_signature_validator::CompactSignatureValidator;
 
@@ -42,12 +45,14 @@ use super::compact_signature_validator::CompactSignatureValidator;
 ///
 /// * `networks` - Networks configuration containing settler addresses for each chain
 /// * `oracle_routes` - Oracle routes for validation of input/output oracle compatibility
-#[derive(Debug)]
+/// * `delivery` - Delivery service for making contract calls
 pub struct Eip7683OrderImpl {
 	/// Networks configuration for dynamic settler address lookups.
 	networks: NetworksConfig,
 	/// Oracle routes for validation of input/output oracle compatibility.
 	oracle_routes: OracleRoutes,
+	/// Delivery service for blockchain interactions.
+	delivery: Arc<DeliveryService>,
 }
 
 impl Eip7683OrderImpl {
@@ -113,7 +118,12 @@ impl Eip7683OrderImpl {
 	///
 	/// * `networks` - Networks configuration with settler addresses
 	/// * `oracle_routes` - Oracle routes for validation
-	pub fn new(networks: NetworksConfig, oracle_routes: OracleRoutes) -> Result<Self, OrderError> {
+	/// * `delivery` - Delivery service for blockchain interactions
+	pub fn new(
+		networks: NetworksConfig,
+		oracle_routes: OracleRoutes,
+		delivery: Arc<DeliveryService>,
+	) -> Result<Self, OrderError> {
 		// Validate that networks config has at least 2 networks
 		if networks.len() < 2 {
 			return Err(OrderError::ValidationFailed(
@@ -124,6 +134,7 @@ impl Eip7683OrderImpl {
 		Ok(Self {
 			networks,
 			oracle_routes,
+			delivery,
 		})
 	}
 
@@ -139,17 +150,14 @@ impl Eip7683OrderImpl {
 	}
 
 	/// Validate compact signature for ResourceLock orders
-	fn validate_compact_signature(
+	async fn validate_compact_signature(
 		&self,
-		order_data: &Eip7683OrderData,
-		order: &Order,
+		order_data: &Eip7683OrderData
 	) -> Result<(), OrderError> {
 		// Get the signature from the order data
 		let signature_hex = order_data.signature.as_ref().ok_or_else(|| {
 			OrderError::ValidationFailed("Missing signature for ResourceLock order".to_string())
 		})?;
-
-		tracing::info!("Signature hex: {}", signature_hex);
 
 		// Parse the signature bytes - this should be abi.encode(sponsorSig, allocatorSig)
 		let signature_bytes = hex::decode(signature_hex.trim_start_matches("0x"))
@@ -196,8 +204,6 @@ impl Eip7683OrderImpl {
 			signature
 		};
 
-		tracing::info!("Using signature: {:?}", hex::encode(&signature));
-
 		// Parse the user address
 		let user_address = AlloyAddress::from_slice(
 			&hex::decode(order_data.user.trim_start_matches("0x")).map_err(|e| {
@@ -226,14 +232,11 @@ impl Eip7683OrderImpl {
 			AlloyAddress::from_slice(&addr.0)
 		};
 
-		// Create domain separator (this should match the TheCompact contract's domain separator)
-		// The shell script uses TheCompact contract domain separator for BatchCompact signatures
-		let domain_separator = FixedBytes::from_slice(
-			&hex::decode("330989378c39c177ab3877ced96ca0cdb60d7a6489567b993185beff161d80d7")
-				.map_err(|e| {
-					OrderError::ValidationFailed(format!("Invalid domain separator hex: {}", e))
-				})?,
-		); // TODO: Call DOMAIN_SEPARATOR() on the_compact_address to get dynamic domain separator
+		// Get domain separator from TheCompact contract dynamically
+		let domain_separator = self
+			.fetch_domain_separator(network, origin_chain_id)
+			.await
+			.unwrap();
 
 		// Create the signature validator
 		let validator = CompactSignatureValidator::new(domain_separator, contract_address);
@@ -250,13 +253,6 @@ impl Eip7683OrderImpl {
 				"Invalid signature for ResourceLock order".to_string(),
 			));
 		}
-
-		// Log successful validation
-		tracing::info!(
-			"Compact signature validation successful for order {}: recovered signer {:?}",
-			order.id,
-			validation_result.recovered_signer
-		);
 
 		Ok(())
 	}
@@ -305,6 +301,59 @@ impl Eip7683OrderImpl {
 			inputs: order_data.inputs.clone(),
 			outputs,
 		})
+	}
+
+	/// Fetch domain separator from TheCompact contract dynamically
+	async fn fetch_domain_separator(
+		&self,
+		network: &NetworkConfig,
+		chain_id: u64,
+	) -> Result<FixedBytes<32>, OrderError> {
+		// Get TheCompact contract address from network config
+		let the_compact_address = network.the_compact_address.as_ref().ok_or_else(|| {
+			OrderError::ValidationFailed(
+				"TheCompact contract address not configured for this network".to_string(),
+			)
+		})?;
+
+		// Create contract call
+		let call = ITheCompact::DOMAIN_SEPARATORCall {};
+		let call_data = call.abi_encode();
+
+		// Create a transaction for the contract call
+		let tx = Transaction {
+			to: Some(the_compact_address.clone()),
+			data: call_data,
+			value: alloy_primitives::U256::ZERO,
+			chain_id,
+			nonce: None,
+			gas_limit: None,
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+		};
+
+		// Use DeliveryService to make the contract call
+		let result = self
+			.delivery
+			.contract_call(chain_id, tx)
+			.await
+			.map_err(|e| {
+				OrderError::ValidationFailed(format!("Failed to call DOMAIN_SEPARATOR(): {}", e))
+			})?;
+
+		// Decode the result
+		let domain_separator =
+			ITheCompact::DOMAIN_SEPARATORCall::abi_decode_returns(&result, false)
+				.map_err(|e| {
+					OrderError::ValidationFailed(format!(
+						"Failed to decode DOMAIN_SEPARATOR result: {}",
+						e
+					))
+				})?
+				._0;
+
+		Ok(domain_separator)
 	}
 }
 
@@ -667,7 +716,7 @@ impl OrderInterface for Eip7683OrderImpl {
 
 		// Validate signature for ResourceLock orders before generating fill transaction
 		if matches!(order_data.lock_type, Some(LockType::ResourceLock)) {
-			self.validate_compact_signature(&order_data, &order)?;
+			self.validate_compact_signature(&order_data).await?;
 		}
 
 		// For multi-output orders, we need to handle each output separately
@@ -1079,6 +1128,8 @@ impl OrderInterface for Eip7683OrderImpl {
 ///
 /// * `config` - TOML configuration value (may be empty)
 /// * `networks` - Networks configuration with settler addresses
+/// * `oracle_routes` - Oracle routes for validation
+/// * `delivery` - Delivery service for blockchain interactions
 ///
 /// # Returns
 ///
@@ -1095,12 +1146,13 @@ pub fn create_order_impl(
 	config: &toml::Value,
 	networks: &NetworksConfig,
 	oracle_routes: &solver_types::oracle::OracleRoutes,
+	delivery: Arc<DeliveryService>,
 ) -> Result<Box<dyn OrderInterface>, OrderError> {
 	// Validate configuration first
 	Eip7683OrderSchema::validate_config(config)
 		.map_err(|e| OrderError::InvalidOrder(format!("Invalid configuration: {}", e)))?;
 
-	let order_impl = Eip7683OrderImpl::new(networks.clone(), oracle_routes.clone())?;
+	let order_impl = Eip7683OrderImpl::new(networks.clone(), oracle_routes.clone(), delivery)?;
 	Ok(Box::new(order_impl))
 }
 
@@ -1171,12 +1223,110 @@ mod tests {
 			.build()
 	}
 
+	fn create_test_delivery_service() -> Arc<DeliveryService> {
+		// Create a mock delivery implementation for testing
+		struct MockDeliveryImpl;
+
+		#[async_trait::async_trait]
+		impl solver_delivery::DeliveryInterface for MockDeliveryImpl {
+			fn config_schema(&self) -> Box<dyn solver_types::ConfigSchema> {
+				Box::new(solver_types::Schema::new(vec![], vec![]))
+			}
+
+			async fn submit(
+				&self,
+				_tx: solver_types::Transaction,
+			) -> Result<solver_types::TransactionHash, solver_delivery::DeliveryError> {
+				Ok(solver_types::TransactionHash(vec![0; 32]))
+			}
+
+			async fn wait_for_confirmation(
+				&self,
+				_hash: &solver_types::TransactionHash,
+				_chain_id: u64,
+				_confirmations: u64,
+			) -> Result<solver_types::TransactionReceipt, solver_delivery::DeliveryError> {
+				Ok(solver_types::TransactionReceipt {
+					transaction_hash: solver_types::TransactionHash(vec![0; 32]),
+					block_number: 1,
+					block_hash: "0x0".to_string(),
+					gas_used: alloy_primitives::U256::ZERO,
+					status: true,
+				})
+			}
+
+			async fn get_receipt(
+				&self,
+				_hash: &solver_types::TransactionHash,
+				_chain_id: u64,
+			) -> Result<Option<solver_types::TransactionReceipt>, solver_delivery::DeliveryError>
+			{
+				Ok(None)
+			}
+
+			async fn get_balance(
+				&self,
+				_address: &str,
+				_chain_id: u64,
+			) -> Result<String, solver_delivery::DeliveryError> {
+				Ok("1000000000000000000".to_string())
+			}
+
+			async fn get_nonce(
+				&self,
+				_address: &str,
+				_chain_id: u64,
+			) -> Result<u64, solver_delivery::DeliveryError> {
+				Ok(0)
+			}
+
+			async fn get_gas_price(
+				&self,
+				_chain_id: u64,
+			) -> Result<String, solver_delivery::DeliveryError> {
+				Ok("20000000000".to_string())
+			}
+
+			async fn estimate_gas(
+				&self,
+				_tx: solver_types::Transaction,
+				_chain_id: u64,
+			) -> Result<u64, solver_delivery::DeliveryError> {
+				Ok(21000)
+			}
+
+			async fn eth_call(
+				&self,
+				tx: solver_types::Transaction,
+			) -> Result<alloy_primitives::Bytes, solver_delivery::DeliveryError> {
+				// Mock response for DOMAIN_SEPARATOR() call - return the expected hardcoded domain separator
+				let domain_separator =
+					hex::decode("330989378c39c177ab3877ced96ca0cdb60d7a6489567b993185beff161d80d7")
+						.expect("Invalid hardcoded domain separator hex");
+				Ok(alloy_primitives::Bytes::from(domain_separator))
+			}
+		}
+
+		let mut delivery_impls = std::collections::HashMap::new();
+		delivery_impls.insert(
+			1u64,
+			Box::new(MockDeliveryImpl) as Box<dyn solver_delivery::DeliveryInterface>,
+		);
+		delivery_impls.insert(
+			137u64,
+			Box::new(MockDeliveryImpl) as Box<dyn solver_delivery::DeliveryInterface>,
+		);
+
+		Arc::new(DeliveryService::new(delivery_impls, 1))
+	}
+
 	#[test]
 	fn test_new_eip7683_order_impl() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
+		let delivery = create_test_delivery_service();
 
-		let result = Eip7683OrderImpl::new(networks, oracle_routes);
+		let result = Eip7683OrderImpl::new(networks, oracle_routes, delivery);
 		assert!(result.is_ok());
 	}
 
@@ -1188,7 +1338,8 @@ mod tests {
 
 		let oracle_routes = create_test_oracle_routes();
 
-		let result = Eip7683OrderImpl::new(networks, oracle_routes);
+		let delivery = create_test_delivery_service();
+		let result = Eip7683OrderImpl::new(networks, oracle_routes, delivery);
 		assert!(result.is_err());
 		assert!(result
 			.unwrap_err()
@@ -1200,7 +1351,8 @@ mod tests {
 	async fn test_validate_intent_success() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+		let delivery = create_test_delivery_service();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
 
 		let order_data = create_test_order_data();
 		let intent = create_test_intent(order_data, "on-chain");
@@ -1220,7 +1372,8 @@ mod tests {
 	async fn test_validate_intent_wrong_standard() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+		let delivery = create_test_delivery_service();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
 
 		let mut intent = create_test_intent(create_test_order_data(), "on-chain");
 		intent.standard = "eip7230".to_string();
@@ -1238,7 +1391,8 @@ mod tests {
 	async fn test_validate_intent_expired_order() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+		let delivery = create_test_delivery_service();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
 
 		let mut order_data = create_test_order_data();
 		order_data.expires = 100; // Set to past timestamp
@@ -1254,7 +1408,8 @@ mod tests {
 	async fn test_validate_intent_unsupported_oracle() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+		let delivery = create_test_delivery_service();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
 
 		let mut order_data = create_test_order_data();
 		order_data.input_oracle = "0x9999999999999999999999999999999999999999".to_string();
@@ -1270,7 +1425,8 @@ mod tests {
 	async fn test_generate_prepare_transaction_onchain_order() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+		let delivery = create_test_delivery_service();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
 
 		let order_data = create_test_order_data();
 		let intent = create_test_intent(order_data.clone(), "on-chain");
@@ -1297,7 +1453,8 @@ mod tests {
 	async fn test_generate_prepare_transaction_offchain_order() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+		let delivery = create_test_delivery_service();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
 
 		let mut order_data = create_test_order_data();
 		// Create a valid StandardOrder and encode it for raw_order_data
@@ -1359,7 +1516,8 @@ mod tests {
 	async fn test_generate_fill_transaction() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+		let delivery = create_test_delivery_service();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
 
 		let order_data = create_test_order_data();
 		let order = OrderBuilder::new()
@@ -1392,7 +1550,8 @@ mod tests {
 	async fn test_generate_claim_transaction_escrow() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+		let delivery = create_test_delivery_service();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
 
 		let order_data = create_test_order_data();
 		let order = OrderBuilder::new()
@@ -1430,7 +1589,8 @@ mod tests {
 	async fn test_generate_claim_transaction_compact() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+		let delivery = create_test_delivery_service();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
 
 		let mut order_data = create_test_order_data();
 		order_data.lock_type = Some(LockType::ResourceLock);
@@ -1484,7 +1644,9 @@ mod tests {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
 
-		let result = create_order_impl(&config, &networks, &oracle_routes);
+		let delivery = create_test_delivery_service();
+
+		let result = create_order_impl(&config, &networks, &oracle_routes, delivery);
 		assert!(result.is_ok());
 	}
 
@@ -1509,7 +1671,8 @@ mod tests {
 	async fn test_generate_fill_transaction_no_cross_chain_output() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+		let delivery = create_test_delivery_service();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
 
 		let mut order_data = create_test_order_data();
 		// Make the output same-chain
@@ -1538,7 +1701,8 @@ mod tests {
 	async fn test_generate_fill_transaction_resource_lock_missing_signature() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+		let delivery = create_test_delivery_service();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
 
 		let mut order_data = create_test_order_data();
 		order_data.lock_type = Some(LockType::ResourceLock);
@@ -1569,7 +1733,8 @@ mod tests {
 	async fn test_generate_fill_transaction_resource_lock_invalid_signature() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+		let delivery = create_test_delivery_service();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
 
 		let mut order_data = create_test_order_data();
 		order_data.lock_type = Some(LockType::ResourceLock);
