@@ -3795,6 +3795,7 @@ dependencies = [
  "mockall",
  "once_cell",
  "reqwest",
+ "secp256k1",
  "serde",
  "serde_json",
  "solver-account",
