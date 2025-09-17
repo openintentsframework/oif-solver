@@ -449,6 +449,7 @@ include = [
 [solver]
 id = "oif-solver-testnet-usdc"
 monitoring_timeout_minutes = 5
+min_profitability_pct = 1.0
 
 # ============================================================================
 # STORAGE
@@ -491,11 +492,12 @@ network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]
 
 [discovery.implementations.onchain_eip7683]
 network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]
+polling_interval_secs = 0  # Use WebSocket subscriptions instead of polling
 
 [discovery.implementations.offchain_eip7683]
 api_host = "127.0.0.1"
 api_port = 8081
-network_ids = [$ORIGIN_CHAIN_ID]
+network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]
 
 # ============================================================================
 # ORDER
@@ -511,6 +513,21 @@ primary = "simple"
 max_gas_price_gwei = 100
 
 # ============================================================================
+# PRICING
+# ============================================================================
+[pricing]
+primary = "coingecko"
+
+[pricing.implementations.mock]
+# Uses default ETH/USD price of 4615.16
+
+[pricing.implementations.coingecko]
+# Free tier configuration (no API key required)
+# api_key = "CG-YOUR-API-KEY-HERE"
+cache_duration_seconds = 60
+rate_limit_delay_ms = 1200
+
+# ============================================================================
 # SETTLEMENT
 # ============================================================================
 [settlement]
@@ -519,11 +536,24 @@ max_gas_price_gwei = 100
 chain_id = 1
 address = "$INPUT_SETTLER"
 
-[settlement.implementations.eip7683]
+[settlement.implementations.direct]
+order = "eip7683"
 network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]
-oracle_addresses = { $ORIGIN_CHAIN_ID = "$ORACLE", $DEST_CHAIN_ID = "$ORACLE" }
 dispute_period_seconds = 60
+# Oracle selection strategy when multiple oracles are available (First, RoundRobin, Random)
+oracle_selection_strategy = "First"
 
+# Oracle configuration with multiple oracle support
+[settlement.implementations.direct.oracles]
+# Input oracles (on origin chains)
+input = { $ORIGIN_CHAIN_ID = ["$ORACLE"], $DEST_CHAIN_ID = ["$ORACLE"] }
+# Output oracles (on destination chains)
+output = { $ORIGIN_CHAIN_ID = ["$ORACLE"], $DEST_CHAIN_ID = ["$ORACLE"] }
+
+# Valid routes: from origin chain -> to destination chains
+[settlement.implementations.direct.routes]
+$ORIGIN_CHAIN_ID = [$DEST_CHAIN_ID]  # Can go from origin to destination
+$DEST_CHAIN_ID = [$ORIGIN_CHAIN_ID]  # Can go from destination to origin
 
 # ============================================================================
 # DEMO SCRIPT CONFIGURATION

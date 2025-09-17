@@ -8,6 +8,7 @@ include = [
 [solver]
 id = "oif-solver-testnet-usdc"
 monitoring_timeout_minutes = 5
+min_profitability_pct = 1.0
 
 # ============================================================================
 # STORAGE
@@ -32,7 +33,7 @@ ttl_order_by_tx_hash = 86400    # 24 hours
 primary = "local"
 
 [account.implementations.local]
-private_key = "solver_private_key"
+private_key = "0x5581f30e27236e3081742158a522194101de955481498401af66713e8bf8c468"
 
 # ============================================================================
 # DELIVERY
@@ -41,7 +42,7 @@ private_key = "solver_private_key"
 min_confirmations = 3  # Higher confirmations for testnets
 
 [delivery.implementations.evm_alloy]
-network_ids = [84532, 11155420, 421614, 11155111]
+network_ids = [84532, 11155420]
 
 # ============================================================================
 # DISCOVERY
@@ -49,12 +50,13 @@ network_ids = [84532, 11155420, 421614, 11155111]
 [discovery]
 
 [discovery.implementations.onchain_eip7683]
-network_ids = [84532, 11155420, 421614, 11155111]
+network_ids = [84532, 11155420]
+polling_interval_secs = 30  # Use WebSocket subscriptions instead of polling
 
 [discovery.implementations.offchain_eip7683]
 api_host = "127.0.0.1"
 api_port = 8081
-network_ids = [84532, 11155420, 421614, 11155111]
+network_ids = [84532, 11155420]
 
 # ============================================================================
 # ORDER
@@ -70,17 +72,32 @@ primary = "simple"
 max_gas_price_gwei = 100
 
 # ============================================================================
+# PRICING
+# ============================================================================
+[pricing]
+primary = "coingecko"
+
+[pricing.implementations.mock]
+# Uses default ETH/USD price of 4615.16
+
+[pricing.implementations.coingecko]
+# Free tier configuration (no API key required)
+# api_key = "CG-YOUR-API-KEY-HERE"
+cache_duration_seconds = 60
+rate_limit_delay_ms = 1200
+
+# ============================================================================
 # SETTLEMENT
 # ============================================================================
 [settlement]
 
 [settlement.domain]
 chain_id = 1
-address = "0xB686e4A97821E259d1BB15c5bf13ec96553176d7"
+address = "0x557d6E91bAC4b2D36fB66f0231fF93db9810e203"
 
 [settlement.implementations.direct]
 order = "eip7683"
-network_ids = [84532, 11155420, 421614, 11155111]
+network_ids = [84532, 11155420]
 dispute_period_seconds = 60
 # Oracle selection strategy when multiple oracles are available (First, RoundRobin, Random)
 oracle_selection_strategy = "First"
@@ -88,16 +105,14 @@ oracle_selection_strategy = "First"
 # Oracle configuration with multiple oracle support
 [settlement.implementations.direct.oracles]
 # Input oracles (on origin chains)
-input = { 84532 = ["0xDD40C9a79D813e4200795014b8E9e575317596F6"], 11155420 = ["0x6dc56CB6C61f3c5a9148cE1fD1AF7a13B8903980"], 421614 = ["0xedF6cd53008C3EA43e976214F5f6a1A8dBDc6460"], 11155111 = ["0xc04c8A84295F36B53AC109d47C041a258B788268"] }
+input = { 84532 = ["0xF92e489E524B19744DbB14f8e8daAdc43c50234d"], 11155420 = ["0xF92e489E524B19744DbB14f8e8daAdc43c50234d"] }
 # Output oracles (on destination chains)
-output = { 84532 = ["0xDD40C9a79D813e4200795014b8E9e575317596F6"], 11155420 = ["0x6dc56CB6C61f3c5a9148cE1fD1AF7a13B8903980"], 421614 = ["0xedF6cd53008C3EA43e976214F5f6a1A8dBDc6460"], 11155111 = ["0xc04c8A84295F36B53AC109d47C041a258B788268"] }
+output = { 84532 = ["0xF92e489E524B19744DbB14f8e8daAdc43c50234d"], 11155420 = ["0xF92e489E524B19744DbB14f8e8daAdc43c50234d"] }
 
 # Valid routes: from origin chain -> to destination chains
 [settlement.implementations.direct.routes]
-84532 = [11155420, 421614, 11155111]     # Base Sepolia can go to all other networks
-11155420 = [84532, 421614, 11155111]    # Optimism Sepolia can go to all other networks
-421614 = [84532, 11155420, 11155111]    # Arbitrum Sepolia can go to all other networks
-11155111 = [84532, 11155420, 421614]    # Ethereum Sepolia can go to all other networks
+84532 = [11155420]  # Can go from origin to destination
+11155420 = [84532]  # Can go from destination to origin
 
 # ============================================================================
 # DEMO SCRIPT CONFIGURATION
