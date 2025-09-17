@@ -120,7 +120,7 @@ pub async fn process_quote_request(
 
 	for quote in &mut quotes {
 		if let Ok(cost) = cost_engine
-			.estimate_cost(quote, &request.available_inputs, solver, config)
+			.estimate_cost_for_quote(quote, solver, config)
 			.await
 		{
 			quote.cost = Some(cost);

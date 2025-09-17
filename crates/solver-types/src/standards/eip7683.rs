@@ -174,42 +174,92 @@ pub struct MandateOutput {
 /// Alias for backward compatibility
 pub type Output = MandateOutput;
 
-use crate::costs::OrderTradable;
-use crate::{bytes32_to_address, parse_address, Address};
+use crate::api::{Quote, QuoteParsable};
+use crate::order::OrderParsable;
+use crate::standards::eip7930::InteropAddress;
+use crate::{
+	bytes32_to_address, parse_address, with_0x_prefix, Address, AvailableInput, Order, OrderStatus,
+	RequestedOutput,
+};
 
-/// Implementation of OrderTradable for EIP-7683 orders
-impl OrderTradable for Eip7683OrderData {
-	fn input_assets(&self) -> Result<Vec<(Address, U256, u64)>, Box<dyn std::error::Error>> {
-		let origin_chain_id = self.origin_chain_id.to::<u64>();
-		let mut assets = Vec::new();
+/// Implementation of OrderParsable for EIP-7683 orders
+impl OrderParsable for Eip7683OrderData {
+	fn parse_available_inputs(&self) -> Vec<AvailableInput> {
+		let origin_chain = self.origin_chain_id.try_into().unwrap_or(1);
 
-		for input in &self.inputs {
-			let token_address_u256 = input[0];
-			let amount = input[1];
-			let token_u256_bytes = token_address_u256.to_be_bytes::<32>();
-			let address_hex = bytes32_to_address(&token_u256_bytes);
-			let token_address = parse_address(&address_hex)
-				.map_err(|e| format!("Failed to parse input token address: {}", e))?;
+		self.inputs
+			.iter()
+			.map(|input| {
+				// input is [token_address, amount] as [U256; 2]
+				let token_u256_bytes = input[0].to_be_bytes::<32>();
+				let token_address_hex = bytes32_to_address(&token_u256_bytes);
+				let token_addr =
+					parse_address(&token_address_hex).unwrap_or(Address(vec![0u8; 20]));
 
-			assets.push((token_address, amount, origin_chain_id));
-		}
+				// Create interop addresses
+				let asset = InteropAddress::from((origin_chain, token_addr));
 
-		Ok(assets)
+				let user_addr = parse_address(&self.user).unwrap_or(Address(vec![0u8; 20]));
+				let user = InteropAddress::from((origin_chain, user_addr));
+
+				AvailableInput {
+					user,
+					asset,
+					amount: input[1],
+					lock: None, // EIP-7683 doesn't specify lock info in inputs
+				}
+			})
+			.collect()
 	}
 
-	fn output_assets(&self) -> Result<Vec<(Address, U256, u64)>, Box<dyn std::error::Error>> {
-		let mut assets = Vec::new();
+	fn parse_requested_outputs(&self) -> Vec<RequestedOutput> {
+		self.outputs
+			.iter()
+			.map(|output| {
+				// Get chain ID from the output
+				let chain_id = output.chain_id.try_into().unwrap_or(1);
 
-		for output in &self.outputs {
-			let address_hex = bytes32_to_address(&output.token);
-			let token_address = parse_address(&address_hex)
-				.map_err(|e| format!("Failed to parse output token address: {}", e))?;
-			let chain_id = output.chain_id.to::<u64>();
+				// Convert bytes32 token address to hex string and then Address
+				let token_address_hex = bytes32_to_address(&output.token);
+				let token_addr =
+					parse_address(&token_address_hex).unwrap_or(Address(vec![0u8; 20]));
 
-			assets.push((token_address, output.amount, chain_id));
-		}
+				// Convert bytes32 recipient address to hex string and then Address
+				let recipient_address_hex = bytes32_to_address(&output.recipient);
+				let recipient_addr =
+					parse_address(&recipient_address_hex).unwrap_or(Address(vec![0u8; 20]));
 
-		Ok(assets)
+				// Create interop addresses
+				let asset = InteropAddress::from((chain_id, token_addr));
+				let receiver = InteropAddress::from((chain_id, recipient_addr));
+
+				RequestedOutput {
+					receiver,
+					asset,
+					amount: output.amount,
+					calldata: if output.call.is_empty() {
+						None
+					} else {
+						Some(with_0x_prefix(&hex::encode(&output.call)))
+					},
+				}
+			})
+			.collect()
+	}
+
+	fn parse_lock_type(&self) -> Option<String> {
+		self.lock_type.map(|lt| lt.as_str().to_string())
+	}
+
+	fn origin_chain_id(&self) -> u64 {
+		self.origin_chain_id.try_into().unwrap_or(1)
+	}
+
+	fn destination_chain_ids(&self) -> Vec<u64> {
+		self.outputs
+			.iter()
+			.map(|output| output.chain_id.try_into().unwrap_or(1))
+			.collect()
 	}
 }
 
@@ -232,6 +282,339 @@ mod hex_string {
 		let s = String::deserialize(deserializer)?;
 		let s = s.strip_prefix("0x").unwrap_or(&s);
 		hex::decode(s).map_err(serde::de::Error::custom)
+	}
+}
+
+// Solidity struct definitions for ABI encoding with OIF contracts
+#[cfg(feature = "oif-interfaces")]
+#[allow(clippy::too_many_arguments)]
+pub mod interfaces {
+	use alloy_sol_types::sol;
+
+	sol! {
+		/// StandardOrder for the OIF contracts (used for ABI encoding)
+		#[derive(Debug)]
+		struct StandardOrder {
+			address user;
+			uint256 nonce;
+			uint256 originChainId;
+			uint32 expires;
+			uint32 fillDeadline;
+			address inputOracle;
+			uint256[2][] inputs;
+			SolMandateOutput[] outputs;
+		}
+
+		/// MandateOutput for the OIF contracts (used for ABI encoding)
+		#[derive(Debug)]
+		struct SolMandateOutput {
+			bytes32 oracle;
+			bytes32 settler;
+			uint256 chainId;
+			bytes32 token;
+			uint256 amount;
+			bytes32 recipient;
+			bytes call;
+			bytes context;
+		}
+
+		/// Solve parameters combining timestamp and solver.
+		struct SolveParams {
+			uint32 timestamp;
+			bytes32 solver;
+		}
+
+		/// IInputSettlerEscrow interface for the OIF contracts.
+		#[sol(rpc)]
+		interface IInputSettlerEscrow {
+			function finalise(StandardOrder calldata order, SolveParams[] calldata solveParams, bytes32 destination, bytes calldata call) external;
+			function finaliseWithSignature(StandardOrder calldata order, SolveParams[] calldata solveParams, bytes32 destination, bytes calldata call, bytes calldata signature) external;
+			function open(StandardOrder calldata order) external;
+			function openFor(StandardOrder calldata order, address sponsor, bytes calldata signature) external;
+			function orderIdentifier(StandardOrder calldata order) external view returns (bytes32);
+		}
+
+		/// IInputSettlerCompact interface for Compact-based settlement.
+		#[sol(rpc)]
+		interface IInputSettlerCompact {
+			function finalise(StandardOrder calldata order, bytes calldata signatures, SolveParams[] calldata solveParams, bytes32 destination, bytes calldata call) external;
+			function finaliseWithSignature(StandardOrder calldata order, bytes calldata signatures, SolveParams[] calldata solveParams, bytes32 destination, bytes calldata call, bytes calldata orderOwnerSignature) external;
+			function orderIdentifier(StandardOrder calldata order) external view returns (bytes32);
+		}
+
+		/// OutputSettlerSimple interface for filling orders.
+		interface IOutputSettlerSimple {
+			function fill(bytes32 orderId, SolMandateOutput calldata output, uint48 fillDeadline, bytes calldata fillerData) external returns (bytes32);
+			function fillOrderOutputs(bytes32 orderId, SolMandateOutput[] calldata outputs, bytes calldata fillerData) external;
+		}
+	}
+}
+
+/// Convert Quote to StandardOrder
+impl TryFrom<&Quote> for interfaces::StandardOrder {
+	type Error = Box<dyn std::error::Error>;
+
+	fn try_from(quote: &Quote) -> Result<Self, Self::Error> {
+		use crate::standards::eip7930::InteropAddress;
+		use crate::utils::parse_bytes32_from_hex;
+		use alloy_primitives::{Address, U256};
+		use interfaces::SolMandateOutput;
+
+		// Extract user address from the first available input
+		let user_str = &quote
+			.details
+			.available_inputs
+			.first()
+			.ok_or("Quote must have at least one available input")?
+			.user;
+		let interop_address = InteropAddress::from_hex(&user_str.to_string())?;
+		let user_address = interop_address.ethereum_address()?;
+
+		// Extract order data from quote
+		let quote_order = quote
+			.orders
+			.first()
+			.ok_or("Quote must contain at least one order")?;
+		let message_data = quote_order
+			.message
+			.as_object()
+			.ok_or("Invalid EIP-712 message structure")?;
+		let eip712_data = message_data
+			.get("eip712")
+			.and_then(|e| e.as_object())
+			.ok_or("Missing 'eip712' object in message")?;
+
+		// Extract nonce
+		let nonce_str = eip712_data
+			.get("nonce")
+			.and_then(|n| n.as_str())
+			.ok_or("Missing nonce in EIP-712 data")?;
+		let nonce = U256::from_str_radix(nonce_str, 10)?;
+
+		// Extract witness data
+		let witness = eip712_data
+			.get("witness")
+			.and_then(|w| w.as_object())
+			.ok_or("Missing 'witness' object in EIP-712 message")?;
+
+		// Get origin chain ID
+		let origin_chain_id = U256::from(interop_address.ethereum_chain_id()?);
+
+		// Extract timing data
+		let expires = witness
+			.get("expires")
+			.and_then(|e| e.as_u64())
+			.unwrap_or(quote.valid_until.unwrap_or(0)) as u32;
+		let fill_deadline = expires;
+
+		// Extract input oracle
+		let input_oracle_str = witness
+			.get("inputOracle")
+			.and_then(|o| o.as_str())
+			.ok_or("Missing 'inputOracle' in witness data")?;
+		let input_oracle =
+			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
+
+		// Extract input data from permitted array
+		let permitted = eip712_data
+			.get("permitted")
+			.and_then(|p| p.as_array())
+			.ok_or("Missing permitted array in EIP-712 data")?;
+		let first_permitted = permitted
+			.first()
+			.ok_or("Empty permitted array in EIP-712 data")?;
+
+		let input_amount_str = first_permitted
+			.get("amount")
+			.and_then(|a| a.as_str())
+			.ok_or("Missing amount in permitted token")?;
+		let input_amount = U256::from_str_radix(input_amount_str, 10)?;
+
+		let input_token_str = first_permitted
+			.get("token")
+			.and_then(|t| t.as_str())
+			.ok_or("Missing token in permitted array")?;
+		let input_token =
+			Address::from_slice(&hex::decode(input_token_str.trim_start_matches("0x"))?);
+
+		// Convert input token address to U256
+		let mut token_bytes = [0u8; 32];
+		token_bytes[12..32].copy_from_slice(&input_token.0 .0);
+		let input_token_u256 = U256::from_be_bytes(token_bytes);
+		let inputs = vec![[input_token_u256, input_amount]];
+
+		// Extract outputs from witness
+		let default_outputs = Vec::new();
+		let witness_outputs = witness
+			.get("outputs")
+			.and_then(|o| o.as_array())
+			.unwrap_or(&default_outputs);
+
+		// Parse outputs
+		let mut sol_outputs = Vec::new();
+		for output_item in witness_outputs {
+			if let Some(output_obj) = output_item.as_object() {
+				let chain_id = output_obj
+					.get("chainId")
+					.and_then(|c| c.as_u64())
+					.unwrap_or(0);
+				let amount_str = output_obj
+					.get("amount")
+					.and_then(|a| a.as_str())
+					.unwrap_or("0");
+				let token_str = output_obj.get("token").and_then(|t| t.as_str()).unwrap();
+				let recipient_str = output_obj
+					.get("recipient")
+					.and_then(|r| r.as_str())
+					.unwrap();
+				let oracle_str = output_obj.get("oracle").and_then(|o| o.as_str()).unwrap();
+				let settler_str = output_obj.get("settler").and_then(|s| s.as_str()).unwrap();
+
+				if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
+					let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
+					let recipient_bytes =
+						parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
+					let oracle_bytes = parse_bytes32_from_hex(oracle_str).unwrap_or([0u8; 32]);
+					let settler_bytes = parse_bytes32_from_hex(settler_str).unwrap_or([0u8; 32]);
+
+					sol_outputs.push(SolMandateOutput {
+						oracle: oracle_bytes.into(),
+						settler: settler_bytes.into(),
+						chainId: U256::from(chain_id),
+						token: token_bytes.into(),
+						amount,
+						recipient: recipient_bytes.into(),
+						call: Vec::new().into(),
+						context: Vec::new().into(),
+					});
+				}
+			}
+		}
+
+		// Create the StandardOrder
+		Ok(interfaces::StandardOrder {
+			user: user_address,
+			nonce,
+			originChainId: origin_chain_id,
+			expires,
+			fillDeadline: fill_deadline,
+			inputOracle: input_oracle,
+			inputs,
+			outputs: sol_outputs,
+		})
+	}
+}
+
+/// Implementation of QuoteParsable for EIP-7683 orders
+impl QuoteParsable for Eip7683OrderData {
+	fn quote_to_order_for_estimation(quote: &Quote) -> Order {
+		use std::convert::TryFrom;
+
+		let standard_order = interfaces::StandardOrder::try_from(quote)
+			.expect("Failed to convert quote to StandardOrder");
+
+		// Convert StandardOrder to Eip7683OrderData
+		let mut order_data = Eip7683OrderData::from(standard_order.clone());
+
+		// Add the lock type from the quote
+		let lock_type = quote
+			.lock_type
+			.parse::<LockType>()
+			.unwrap_or_else(|_| LockType::default());
+		order_data.lock_type = Some(lock_type);
+
+		// Extract chain IDs for the Order
+		let input_chain_ids = vec![order_data.origin_chain_id.try_into().unwrap_or(1)];
+		let output_chain_ids: Vec<u64> = order_data
+			.outputs
+			.iter()
+			.map(|output| output.chain_id.try_into().unwrap_or(1))
+			.collect();
+
+		Order {
+			// Use a clearly marked estimation-only ID
+			id: format!("ESTIMATION_ONLY_quote_{}", quote.quote_id),
+			standard: "eip7683".to_string(), // Use real standard for proper processing
+			created_at: crate::current_timestamp(),
+			updated_at: crate::current_timestamp(),
+			status: OrderStatus::Created,
+			data: serde_json::to_value(&order_data).unwrap_or(serde_json::Value::Null),
+			solver_address: Address(vec![0u8; 20]), // Dummy address
+			quote_id: Some(quote.quote_id.clone()),
+			input_chain_ids,
+			output_chain_ids,
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
+			claim_tx_hash: None,
+			fill_proof: None,
+		}
+	}
+}
+
+/// Convert SolMandateOutput to MandateOutput
+#[cfg(feature = "oif-interfaces")]
+impl From<interfaces::SolMandateOutput> for MandateOutput {
+	fn from(output: interfaces::SolMandateOutput) -> Self {
+		MandateOutput {
+			oracle: output.oracle.0,
+			settler: output.settler.0,
+			chain_id: output.chainId,
+			token: output.token.0,
+			amount: output.amount,
+			recipient: output.recipient.0,
+			call: output.call.to_vec(),
+			context: output.context.to_vec(),
+		}
+	}
+}
+
+/// Convert MandateOutput to SolMandateOutput
+#[cfg(feature = "oif-interfaces")]
+impl From<MandateOutput> for interfaces::SolMandateOutput {
+	fn from(output: MandateOutput) -> Self {
+		use alloy_primitives::FixedBytes;
+		interfaces::SolMandateOutput {
+			oracle: FixedBytes::<32>::from(output.oracle),
+			settler: FixedBytes::<32>::from(output.settler),
+			chainId: output.chain_id,
+			token: FixedBytes::<32>::from(output.token),
+			amount: output.amount,
+			recipient: FixedBytes::<32>::from(output.recipient),
+			call: output.call.into(),
+			context: output.context.into(),
+		}
+	}
+}
+
+/// Implement conversion from StandardOrder to Eip7683OrderData
+#[cfg(feature = "oif-interfaces")]
+impl From<interfaces::StandardOrder> for Eip7683OrderData {
+	fn from(order: interfaces::StandardOrder) -> Self {
+		use crate::utils::with_0x_prefix;
+		use alloy_primitives::hex;
+
+		// Convert outputs from SolMandateOutput to MandateOutput using From trait
+		let outputs = order.outputs.into_iter().map(MandateOutput::from).collect();
+
+		Eip7683OrderData {
+			user: with_0x_prefix(&hex::encode(order.user)),
+			nonce: order.nonce,
+			origin_chain_id: order.originChainId,
+			expires: order.expires,
+			fill_deadline: order.fillDeadline,
+			input_oracle: with_0x_prefix(&hex::encode(order.inputOracle)),
+			inputs: order.inputs,
+			order_id: [0u8; 32], // Will be computed separately
+			gas_limit_overrides: GasLimitOverrides::default(),
+			outputs,
+			raw_order_data: None,
+			signature: None,
+			sponsor: None,
+			lock_type: None,
+		}
 	}
 }
 
@@ -577,112 +960,5 @@ mod tests {
 		assert_eq!(deserialized.amount, large_u256);
 		assert_eq!(deserialized.call.len(), 1000);
 		assert_eq!(deserialized.context.len(), 500);
-	}
-}
-
-// Solidity struct definitions for ABI encoding with OIF contracts
-#[cfg(feature = "oif-interfaces")]
-#[allow(clippy::too_many_arguments)]
-pub mod interfaces {
-	use alloy_sol_types::sol;
-
-	sol! {
-		/// StandardOrder for the OIF contracts (used for ABI encoding)
-		#[derive(Debug)]
-		struct StandardOrder {
-			address user;
-			uint256 nonce;
-			uint256 originChainId;
-			uint32 expires;
-			uint32 fillDeadline;
-			address inputOracle;
-			uint256[2][] inputs;
-			SolMandateOutput[] outputs;
-		}
-
-		/// MandateOutput for the OIF contracts (used for ABI encoding)
-		#[derive(Debug)]
-		struct SolMandateOutput {
-			bytes32 oracle;
-			bytes32 settler;
-			uint256 chainId;
-			bytes32 token;
-			uint256 amount;
-			bytes32 recipient;
-			bytes call;
-			bytes context;
-		}
-
-		/// Solve parameters combining timestamp and solver.
-		struct SolveParams {
-			uint32 timestamp;
-			bytes32 solver;
-		}
-
-		/// IInputSettlerEscrow interface for the OIF contracts.
-		#[sol(rpc)]
-		interface IInputSettlerEscrow {
-			function finalise(StandardOrder calldata order, SolveParams[] calldata solveParams, bytes32 destination, bytes calldata call) external;
-			function finaliseWithSignature(StandardOrder calldata order, SolveParams[] calldata solveParams, bytes32 destination, bytes calldata call, bytes calldata signature) external;
-			function open(StandardOrder calldata order) external;
-			function openFor(StandardOrder calldata order, address sponsor, bytes calldata signature) external;
-			function orderIdentifier(StandardOrder calldata order) external view returns (bytes32);
-		}
-
-		/// IInputSettlerCompact interface for Compact-based settlement.
-		#[sol(rpc)]
-		interface IInputSettlerCompact {
-			function finalise(StandardOrder calldata order, bytes calldata signatures, SolveParams[] calldata solveParams, bytes32 destination, bytes calldata call) external;
-			function finaliseWithSignature(StandardOrder calldata order, bytes calldata signatures, SolveParams[] calldata solveParams, bytes32 destination, bytes calldata call, bytes calldata orderOwnerSignature) external;
-			function orderIdentifier(StandardOrder calldata order) external view returns (bytes32);
-		}
-
-		/// OutputSettlerSimple interface for filling orders.
-		interface IOutputSettlerSimple {
-			function fill(bytes32 orderId, SolMandateOutput calldata output, uint48 fillDeadline, bytes calldata fillerData) external returns (bytes32);
-			function fillOrderOutputs(bytes32 orderId, SolMandateOutput[] calldata outputs, bytes calldata fillerData) external;
-		}
-	}
-}
-
-/// Implement conversion from StandardOrder to Eip7683OrderData
-#[cfg(feature = "oif-interfaces")]
-impl From<interfaces::StandardOrder> for Eip7683OrderData {
-	fn from(order: interfaces::StandardOrder) -> Self {
-		use crate::utils::with_0x_prefix;
-		use alloy_primitives::hex;
-
-		// Convert outputs from SolMandateOutput to MandateOutput
-		let outputs: Vec<MandateOutput> = order
-			.outputs
-			.into_iter()
-			.map(|output| MandateOutput {
-				oracle: output.oracle.0,
-				settler: output.settler.0,
-				chain_id: output.chainId,
-				token: output.token.0,
-				amount: output.amount,
-				recipient: output.recipient.0,
-				call: output.call.to_vec(),
-				context: output.context.to_vec(),
-			})
-			.collect();
-
-		Eip7683OrderData {
-			user: with_0x_prefix(&hex::encode(order.user)),
-			nonce: order.nonce,
-			origin_chain_id: order.originChainId,
-			expires: order.expires,
-			fill_deadline: order.fillDeadline,
-			input_oracle: with_0x_prefix(&hex::encode(order.inputOracle)),
-			inputs: order.inputs,
-			order_id: [0u8; 32], // Will be computed separately
-			gas_limit_overrides: GasLimitOverrides::default(),
-			outputs,
-			raw_order_data: None,
-			signature: None,
-			sponsor: None,
-			lock_type: None,
-		}
 	}
 }

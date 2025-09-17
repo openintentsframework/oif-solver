@@ -1,52 +1,14 @@
-use crate::Address;
-use crate::Order;
-use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
-
-// Type aliases to reduce complexity
-/// Represents an asset as a tuple of (token_address, amount, chain_id)
-type AssetTuple = (Address, U256, u64);
-/// Result type for asset extraction operations
-type AssetResult = Result<Vec<AssetTuple>, Box<dyn std::error::Error>>;
-
-/// Trait for types that can have their execution costs estimated
-pub trait CostEstimatable {
-	/// Get the origin chain ID(s) where assets will be sourced
-	fn input_chain_ids(&self) -> Vec<u64>;
-
-	/// Get the destination chain ID(s) where assets will be delivered
-	fn output_chain_ids(&self) -> Vec<u64>;
-
-	/// Get the lock type for gas configuration lookup
-	/// Returns None if no specific lock type is defined
-	fn lock_type(&self) -> Option<&str>;
-
-	/// Convert to an Order for transaction generation
-	/// This is needed for gas estimation via transaction simulation
-	fn as_order_for_estimation(&self) -> Order;
-}
-
-/// Trait for types that represent the trade aspect of an order
-///
-/// This trait is designed to work with trait objects, allowing different
-/// order standards to have their own trade data extraction logic.
-pub trait OrderTradable: Send + Sync {
-	/// Get input assets as tuples of (token_address, amount, chain_id)
-	fn input_assets(&self) -> AssetResult;
-
-	/// Get output assets as tuples of (token_address, amount, chain_id)
-	fn output_assets(&self) -> AssetResult;
-}
 
 /// Named amount used for cost components.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostComponent {
 	/// Human-readable component name (e.g., "base-price", "gas-fill", "gas-claim", "buffer-gas", "buffer-rates", "commission")
 	pub name: String,
-	/// Amount as a decimal string in the chosen currency units (e.g., USDC). String avoids precision loss across differing decimals.
+	/// Amount as a decimal string in the display currency (matches CostEstimate.currency)
 	pub amount: String,
-	/// Amount as a wei string. (if Apply)
-	#[serde(rename = "amountWei")]
+	/// Amount as a wei string for gas-related costs (optional)
+	#[serde(rename = "amountWei", skip_serializing_if = "Option::is_none")]
 	pub amount_wei: Option<String>,
 }
 

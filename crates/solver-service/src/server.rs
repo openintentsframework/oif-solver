@@ -299,7 +299,7 @@ async fn handle_order(
 	// Estimate costs
 	let cost_engine = CostEngine::new();
 	let cost_estimate = match cost_engine
-		.estimate_cost(&validated_order, &[], &state.solver, &state.config)
+		.estimate_cost_for_order(&validated_order, &state.solver, &state.config)
 		.await
 	{
 		Ok(estimation) => estimation,
@@ -309,25 +309,15 @@ async fn handle_order(
 		},
 	};
 
-	// Check profitability now that we have a valid cost estimate
-	match calculate_order_profitability(&validated_order, &cost_estimate, &state.solver).await {
-		Ok(profit_margin) => {
-			if profit_margin < state.config.solver.min_profitability_pct {
-				return APIError::UnprocessableEntity {
-					error_type: ApiErrorType::InsufficientProfitability,
-					message: format!(
-						"Order profit margin {:.2}% below minimum required {:.2}%",
-						profit_margin, state.config.solver.min_profitability_pct
-					),
-					details: Some(serde_json::json!({
-						"profit_margin": profit_margin,
-						"min_required": state.config.solver.min_profitability_pct,
-						"total_cost": cost_estimate.total
-					})),
-				}
-				.into_response();
-			}
-		},
+	// Always calculate the actual profit margin to validate against config
+	let actual_profit_margin = match calculate_order_profitability(
+		&validated_order,
+		&cost_estimate,
+		&state.solver,
+	)
+	.await
+	{
+		Ok(margin) => margin,
 		Err(e) => {
 			tracing::warn!("Failed to calculate profitability: {}", e);
 			return APIError::InternalServerError {
@@ -336,7 +326,40 @@ async fn handle_order(
 			}
 			.into_response();
 		},
+	};
+
+	// Check if the actual profit margin meets the minimum requirement
+	// This handles both positive requirements (e.g., 2%) and negative tolerances (e.g., -1%)
+	if actual_profit_margin < state.config.solver.min_profitability_pct {
+		tracing::warn!(
+			"Order rejected: profit margin ({:.2}%) below minimum ({:.2}%)",
+			actual_profit_margin,
+			state.config.solver.min_profitability_pct
+		);
+
+		return APIError::UnprocessableEntity {
+			error_type: ApiErrorType::InsufficientProfitability,
+			message: format!(
+				"Insufficient profit margin: {:.2}% (minimum required: {:.2}%)",
+				actual_profit_margin, state.config.solver.min_profitability_pct
+			),
+			details: Some(serde_json::json!({
+				"actual_profit_margin": actual_profit_margin,
+				"min_required": state.config.solver.min_profitability_pct,
+				"total_cost": cost_estimate.total,
+				"cost_components": cost_estimate.components,
+			})),
+		}
+		.into_response();
 	}
+
+	// Order meets profitability requirements
+	tracing::info!(
+		"Order profitability validated: margin={:.2}% (min={:.2}%), total_cost=${}",
+		actual_profit_margin,
+		state.config.solver.min_profitability_pct,
+		cost_estimate.total
+	);
 
 	forward_to_discovery_service(&state, &intent_request).await
 }
@@ -573,23 +596,29 @@ async fn calculate_order_profitability(
 	cost_estimate: &CostEstimate,
 	solver: &SolverEngine,
 ) -> Result<Decimal, Box<dyn std::error::Error>> {
-	// Get the trade data for this order
-	let trade = order.as_trade()?;
+	// Parse the order data
+	let parsed_order = order.parse_order_data()?;
 
-	// Get input and output assets from the trade
-	let input_assets = trade
-		.input_assets()
-		.map_err(|e| format!("Failed to get input assets: {}", e))?;
-	let output_assets = trade
-		.output_assets()
-		.map_err(|e| format!("Failed to get output assets: {}", e))?;
+	// Get input and output assets from the parsed order
+	let available_inputs = parsed_order.parse_available_inputs();
+	let requested_outputs = parsed_order.parse_requested_outputs();
 
 	let token_manager = solver.token_manager();
 	let pricing_service = solver.pricing();
 
 	// Calculate total input amount in USD (sum of all inputs converted to USD)
 	let mut total_input_amount_usd = Decimal::ZERO;
-	for (token_address, amount, chain_id) in input_assets {
+	for input in available_inputs {
+		// Extract chain_id and ethereum address from InteropAddress
+		let chain_id = input
+			.asset
+			.ethereum_chain_id()
+			.map_err(|e| format!("Failed to get chain ID from asset: {}", e))?;
+		let ethereum_addr = input
+			.asset
+			.ethereum_address()
+			.map_err(|e| format!("Failed to get ethereum address from asset: {}", e))?;
+		let token_address = solver_types::Address(ethereum_addr.0.to_vec());
 		// Get token info
 		let token_info = token_manager
 			.get_token_info(chain_id, &token_address)
@@ -597,7 +626,7 @@ async fn calculate_order_profitability(
 
 		// Convert raw amount to USD using pricing service
 		let usd_amount = convert_raw_token_to_usd(
-			&amount,
+			&input.amount,
 			&token_info.symbol,
 			token_info.decimals,
 			pricing_service,
@@ -609,7 +638,18 @@ async fn calculate_order_profitability(
 
 	// Calculate total output amount in USD (sum of all outputs converted to USD)
 	let mut total_output_amount_usd = Decimal::ZERO;
-	for (token_address, amount, chain_id) in output_assets {
+	for output in requested_outputs {
+		// Extract chain_id and ethereum address from InteropAddress
+		let chain_id = output
+			.asset
+			.ethereum_chain_id()
+			.map_err(|e| format!("Failed to get chain ID from asset: {}", e))?;
+		let ethereum_addr = output
+			.asset
+			.ethereum_address()
+			.map_err(|e| format!("Failed to get ethereum address from asset: {}", e))?;
+		let token_address = solver_types::Address(ethereum_addr.0.to_vec());
+
 		// Get token info
 		let token_info = token_manager
 			.get_token_info(chain_id, &token_address)
@@ -617,7 +657,7 @@ async fn calculate_order_profitability(
 
 		// Convert raw amount to USD using pricing service
 		let usd_amount = convert_raw_token_to_usd(
-			&amount,
+			&output.amount,
 			&token_info.symbol,
 			token_info.decimals,
 			pricing_service,
@@ -627,24 +667,30 @@ async fn calculate_order_profitability(
 		total_output_amount_usd += usd_amount;
 	}
 
-	// Parse execution costs from cost estimate (already in USD)
-	let execution_cost_usd = Decimal::from_str(&cost_estimate.total)
-		.map_err(|e| format!("Failed to parse execution cost: {}", e))?;
+	// Extract operational cost from the components
+	let operational_cost_usd = cost_estimate
+		.components
+		.iter()
+		.find(|c| c.name == "operational-cost")
+		.and_then(|c| Decimal::from_str(&c.amount).ok())
+		.ok_or_else(|| "Operational cost component not found in cost estimate".to_string())?;
 
-	// Calculate profit: Input (USD) - Output (USD) - Costs (USD)
+	// Calculate the solver's actual profit margin
+	// Profit = Input Value - Output Value - Operational Costs
+	// Margin = Profit / Input Value * 100
 	if total_input_amount_usd.is_zero() {
 		return Err("Division by zero: total_input_amount_usd is zero".into());
 	}
-	let profit_usd = total_input_amount_usd - total_output_amount_usd - execution_cost_usd;
 
+	let profit_usd = total_input_amount_usd - total_output_amount_usd - operational_cost_usd;
 	let hundred = Decimal::new(100_i64, 0);
 	let profit_margin_decimal = (profit_usd / total_input_amount_usd) * hundred;
 
 	tracing::debug!(
-		"Profitability calculation: input=${} (USD), output=${} (USD), cost=${} (USD), profit=${} (USD), margin={}%",
+		"Profitability calculation: input=${} (USD), output=${} (USD), operational_cost=${} (USD), profit=${} (USD), margin={}%",
 		total_input_amount_usd,
 		total_output_amount_usd,
-		execution_cost_usd,
+		operational_cost_usd,
 		profit_usd,
 		profit_margin_decimal
 	);

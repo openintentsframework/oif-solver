@@ -7,10 +7,11 @@ use rust_decimal::Decimal;
 use solver_config::Config;
 use solver_core::SolverEngine;
 use solver_pricing::PricingService;
+use solver_types::RequestedOutput;
 use solver_types::{
-	costs::{CostComponent, CostEstimatable, CostEstimate},
+	costs::{CostComponent, CostEstimate},
 	current_timestamp, APIError, ApiErrorType, AvailableInput, ExecutionParams, FillProof, Order,
-	Transaction, TransactionHash, DEFAULT_GAS_PRICE_WEI,
+	Quote, Transaction, TransactionHash, DEFAULT_GAS_PRICE_WEI,
 };
 use std::str::FromStr;
 
@@ -34,29 +35,32 @@ impl CostEngine {
 		Self
 	}
 
-	/// Unified cost estimation for any CostEstimatable type
-	pub async fn estimate_cost<T: CostEstimatable>(
+	/// Estimate cost for a Quote
+	pub async fn estimate_cost_for_quote(
 		&self,
-		estimatable: &T,
-		available_inputs: &[AvailableInput],
+		quote: &Quote,
 		solver: &SolverEngine,
 		config: &Config,
 	) -> Result<CostEstimate, APIError> {
-		// Extract chain parameters
-		let origin_chain_id = estimatable
-			.input_chain_ids()
-			.first()
-			.copied()
+		// Extract chain parameters from quote
+		let origin_chain_id = quote
+			.details
+			.available_inputs
+			.iter()
+			.filter_map(|input| input.asset.ethereum_chain_id().ok())
+			.next()
 			.ok_or_else(|| APIError::BadRequest {
 				error_type: ApiErrorType::MissingChainId,
 				message: "No input chain ID found".to_string(),
 				details: None,
 			})?;
 
-		let dest_chain_id = estimatable
-			.output_chain_ids()
-			.first()
-			.copied()
+		let dest_chain_id = quote
+			.details
+			.requested_outputs
+			.iter()
+			.filter_map(|output| output.asset.ethereum_chain_id().ok())
+			.next()
 			.ok_or_else(|| APIError::BadRequest {
 				error_type: ApiErrorType::MissingChainId,
 				message: "No output chain ID found".to_string(),
@@ -69,10 +73,18 @@ impl CostEngine {
 		};
 
 		// Extract flow key (lock_type) for gas config lookup
-		let flow_key = estimatable.lock_type().map(String::from);
+		let flow_key = Some(quote.lock_type.clone());
 
-		// Get Order for transaction generation (only if needed)
-		let order = estimatable.as_order_for_estimation();
+		// Determine the standard - for quotes, we default to eip7683
+		// TODO: In the future, this should be determined from the quote
+		let standard = "eip7683";
+		let order = quote
+			.to_order_for_estimation(standard)
+			.map_err(|e| APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: format!("Failed to convert quote to order: {}", e),
+				details: None,
+			})?;
 
 		// Estimate gas units
 		let gas_units = self
@@ -87,8 +99,77 @@ impl CostEngine {
 			.await?;
 
 		// Calculate cost components
-		self.calculate_cost_components(solver, chain_params, gas_units, available_inputs, config)
-			.await
+		self.calculate_cost_components(
+			solver,
+			chain_params,
+			gas_units,
+			&quote.details.available_inputs,
+			&quote.details.requested_outputs,
+			config,
+		)
+		.await
+	}
+
+	/// Estimate cost for an Order using its OrderParsable implementation
+	pub async fn estimate_cost_for_order(
+		&self,
+		order: &Order,
+		solver: &SolverEngine,
+		config: &Config,
+	) -> Result<CostEstimate, APIError> {
+		// Parse the order data based on its standard
+		let parsable = order.parse_order_data().map_err(|e| APIError::BadRequest {
+			error_type: ApiErrorType::InvalidRequest,
+			message: format!("Failed to parse order data: {}", e),
+			details: None,
+		})?;
+
+		// Extract chain parameters
+		let origin_chain_id = parsable.origin_chain_id();
+		let dest_chain_ids = parsable.destination_chain_ids();
+
+		let dest_chain_id =
+			dest_chain_ids
+				.first()
+				.copied()
+				.ok_or_else(|| APIError::BadRequest {
+					error_type: ApiErrorType::MissingChainId,
+					message: "No destination chain ID found".to_string(),
+					details: None,
+				})?;
+
+		let chain_params = ChainParams {
+			origin_chain_id,
+			dest_chain_id,
+		};
+
+		// Extract flow key (lock_type) for gas config lookup
+		let flow_key = parsable.parse_lock_type();
+
+		// Estimate gas units
+		let gas_units = self
+			.estimate_gas_units(
+				order,
+				&flow_key,
+				config,
+				solver,
+				chain_params.origin_chain_id,
+				chain_params.dest_chain_id,
+			)
+			.await?;
+
+		// Calculate cost components
+		let available_inputs = parsable.parse_available_inputs();
+		let requested_outputs = parsable.parse_requested_outputs();
+		self.calculate_cost_components(
+			solver,
+			chain_params,
+			gas_units,
+			&available_inputs,
+			&requested_outputs,
+			config,
+		)
+		.await
 	}
 
 	/// Estimate gas units with optional live estimation
@@ -226,6 +307,7 @@ impl CostEngine {
 		chain_params: ChainParams,
 		gas_units: GasUnits,
 		available_inputs: &[AvailableInput],
+		requested_outputs: &[RequestedOutput],
 		config: &Config,
 	) -> Result<CostEstimate, APIError> {
 		let pricing_service = solver.pricing();
@@ -279,56 +361,57 @@ impl CostEngine {
 			.await
 			.unwrap_or_else(|_| "0".to_string());
 
-		let base_price = "0".to_string();
-		let buffer_rates = apply_bps(&base_price, pricing.rate_buffer_bps);
-
-		// Calculate minimum profit requirement in USD
-		let min_profit_usd = self
-			.calculate_minimum_profit_usd(
+		// Calculate base price and minimum profit requirement in USD
+		let (base_price_usd, min_profit_usd) = self
+			.calculate_pricing_components(
 				solver,
 				pricing_service,
 				available_inputs,
-				chain_params.origin_chain_id,
+				requested_outputs,
+				&chain_params,
 				config,
 			)
 			.await
 			.unwrap_or_else(|e| {
-				tracing::warn!("Failed to calculate minimum profit: {}", e);
-				"0".to_string()
+				tracing::warn!("Failed to calculate pricing components: {}", e);
+				("0".to_string(), "0".to_string())
 			});
 
-		let subtotal = add_many(&[
-			base_price.clone(),
-			gas_subtotal_w.clone(),
-			buffer_gas.clone(),
-			buffer_rates.clone(),
-		]);
-		let subtotal_currency = pricing_service
-			.wei_to_currency(&subtotal, &pricing.currency)
-			.await
-			.unwrap_or_else(|_| "0".to_string());
+		// Calculate buffer rates (currently 0 since we don't have rate buffers implemented)
+		let buffer_rates = "0".to_string();
 
-		// Add minimum profit to subtotal in currency terms
-		let subtotal_with_profit = Decimal::from_str(&subtotal_currency).unwrap_or(Decimal::ZERO)
+		// Calculate operational costs (gas + buffers only) in USD
+		let operational_cost_usd = Decimal::from_str(&open_cost_currency).unwrap_or(Decimal::ZERO)
+			+ Decimal::from_str(&fill_cost_currency).unwrap_or(Decimal::ZERO)
+			+ Decimal::from_str(&claim_cost_currency).unwrap_or(Decimal::ZERO)
+			+ Decimal::from_str(&buffer_gas_currency).unwrap_or(Decimal::ZERO);
+
+		// Calculate subtotal: all cost components before commission
+		// subtotal = operational costs + base price + min profit
+		let subtotal_usd = operational_cost_usd
+			+ Decimal::from_str(&base_price_usd).unwrap_or(Decimal::ZERO)
 			+ Decimal::from_str(&min_profit_usd).unwrap_or(Decimal::ZERO);
 
-		let commission_amount = apply_bps(&subtotal, pricing.commission_bps);
-		let commission_amount_currency = pricing_service
-			.wei_to_currency(&commission_amount, &pricing.currency)
-			.await
-			.unwrap_or_else(|_| "0".to_string());
+		// Calculate commission on the subtotal
+		let commission_amount_usd = if pricing.commission_bps > 0 {
+			let bps_divisor = Decimal::new(10000, 0);
+			let commission_rate = Decimal::new(pricing.commission_bps as i64, 0) / bps_divisor;
+			(subtotal_usd * commission_rate).to_string()
+		} else {
+			"0".to_string()
+		};
 
-		// Calculate total including minimum profit
-		let total = subtotal_with_profit
-			+ Decimal::from_str(&commission_amount_currency).unwrap_or(Decimal::ZERO);
+		// Calculate total: subtotal + commission
+		let total_usd =
+			subtotal_usd + Decimal::from_str(&commission_amount_usd).unwrap_or(Decimal::ZERO);
 
 		Ok(CostEstimate {
 			currency: pricing.currency.clone(),
 			components: vec![
 				CostComponent {
 					name: "base-price".into(),
-					amount: base_price.clone(),
-					amount_wei: Some(base_price),
+					amount: base_price_usd.clone(),
+					amount_wei: None,
 				},
 				CostComponent {
 					name: "gas-open".into(),
@@ -360,60 +443,122 @@ impl CostEngine {
 					amount: min_profit_usd,
 					amount_wei: None, // No wei equivalent needed
 				},
+				CostComponent {
+					name: "operational-cost".into(),
+					amount: operational_cost_usd.to_string(),
+					amount_wei: None, // This is a calculated summary, not a wei value
+				},
 			],
 			commission_bps: pricing.commission_bps,
-			commission_amount: commission_amount_currency,
-			subtotal: subtotal_with_profit.to_string(),
-			total: total.to_string(),
+			commission_amount: commission_amount_usd.clone(),
+			subtotal: subtotal_usd.to_string(),
+			total: total_usd.to_string(),
 		})
 	}
 
-	/// Calculate the minimum profit requirement in USD
-	async fn calculate_minimum_profit_usd(
+	/// Calculate the base price and minimum profit requirement in USD
+	/// This considers the spread between input and output values
+	async fn calculate_pricing_components(
 		&self,
 		solver: &SolverEngine,
 		pricing_service: &PricingService,
 		available_inputs: &[AvailableInput],
-		origin_chain_id: u64,
+		requested_outputs: &[RequestedOutput],
+		chain_params: &ChainParams,
 		config: &Config,
-	) -> Result<String, Box<dyn std::error::Error>> {
-		// Get input assets from the available inputs
-		let input_assets = available_inputs
-			.iter()
-			.map(|input| (input.asset.clone(), input.amount, origin_chain_id))
-			.collect::<Vec<_>>();
-
+	) -> Result<(String, String), Box<dyn std::error::Error>> {
 		let token_manager = solver.token_manager();
 
-		// Calculate total input amount in USD
-		let mut total_input_amount_usd = Decimal::ZERO;
-		for (token_address, amount, chain_id) in input_assets {
+		// Calculate total input value in USD
+		let mut total_input_value_usd = Decimal::ZERO;
+		for input in available_inputs {
+			// Get the chain ID from the input asset, fallback to origin_chain_id
+			let chain_id = input
+				.asset
+				.ethereum_chain_id()
+				.unwrap_or(chain_params.origin_chain_id);
+
 			// Get token info
-			let ethereum_addr = token_address
+			let ethereum_addr = input
+				.asset
 				.ethereum_address()
-				.map_err(|e| format!("Failed to extract ethereum address: {}", e))?;
+				.map_err(|e| format!("Failed to extract input ethereum address: {}", e))?;
 			let solver_addr = solver_types::Address(ethereum_addr.0.to_vec());
 			let token_info = token_manager
 				.get_token_info(chain_id, &solver_addr)
-				.map_err(|e| format!("Failed to get token info: {}", e))?;
+				.map_err(|e| format!("Failed to get input token info: {}", e))?;
 
 			// Convert raw amount to USD using pricing service
 			let usd_amount = convert_raw_token_to_usd(
-				&amount,
+				&input.amount,
 				&token_info.symbol,
 				token_info.decimals,
 				pricing_service,
 			)
 			.await?;
 
-			total_input_amount_usd += usd_amount;
+			total_input_value_usd += usd_amount;
 		}
 
-		// Calculate minimum profit in USD: (input_amount * min_profitability_pct) / 100
-		let hundred = Decimal::new(100_i64, 0);
-		let min_profit_usd =
-			(total_input_amount_usd * config.solver.min_profitability_pct) / hundred;
+		// Calculate total output value in USD
+		let mut total_output_value_usd = Decimal::ZERO;
+		for output in requested_outputs {
+			// Get the chain ID from the output asset, fallback to dest_chain_id
+			let chain_id = output
+				.asset
+				.ethereum_chain_id()
+				.unwrap_or(chain_params.dest_chain_id);
 
-		Ok(min_profit_usd.to_string())
+			// Get token info
+			let ethereum_addr = output
+				.asset
+				.ethereum_address()
+				.map_err(|e| format!("Failed to extract output ethereum address: {}", e))?;
+			let solver_addr = solver_types::Address(ethereum_addr.0.to_vec());
+			let token_info = token_manager
+				.get_token_info(chain_id, &solver_addr)
+				.map_err(|e| format!("Failed to get output token info: {}", e))?;
+
+			// Convert raw amount to USD using pricing service
+			let usd_amount = convert_raw_token_to_usd(
+				&output.amount,
+				&token_info.symbol,
+				token_info.decimals,
+				pricing_service,
+			)
+			.await?;
+
+			total_output_value_usd += usd_amount;
+		}
+
+		// Calculate the spread (can be negative if solver provides more value than received)
+		let spread = total_input_value_usd - total_output_value_usd;
+
+		// Calculate base price needed to cover any negative spread
+		// If outputs > inputs, solver needs to charge at least the difference
+		let base_price_usd = if spread < Decimal::ZERO {
+			spread.abs() // Convert negative spread to positive base price
+		} else {
+			Decimal::ZERO // No base price needed if there's natural profit
+		};
+
+		// Calculate minimum required profit based on the transaction size
+		// Use the larger value to ensure profitability scales with transaction size
+		let transaction_value = total_input_value_usd.max(total_output_value_usd);
+		let hundred = Decimal::new(100_i64, 0);
+		let min_required_profit =
+			(transaction_value * config.solver.min_profitability_pct) / hundred;
+
+		tracing::info!(
+			"Pricing components: input_value={}, output_value={}, spread={}, base_price={}, min_profit={}",
+			total_input_value_usd,
+			total_output_value_usd,
+			spread,
+			base_price_usd,
+			min_required_profit
+		);
+
+		// Return both base price and minimum profit separately
+		Ok((base_price_usd.to_string(), min_required_profit.to_string()))
 	}
 }
