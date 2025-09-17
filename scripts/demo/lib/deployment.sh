@@ -1202,6 +1202,11 @@ primary = "mock"
 cache_duration_seconds = 60
 rate_limit_delay_ms = 1200
 
+# Custom prices for demo/test tokens (in USD)
+[pricing.implementations.coingecko.custom_prices]
+TOKA = "200.00"
+TOKB = "195.00"
+
 # ============================================================================
 # SETTLEMENT
 # ============================================================================
