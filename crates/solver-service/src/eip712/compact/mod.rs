@@ -14,7 +14,7 @@ use solver_types::{
 };
 
 /// TheCompact implementation of EIP-712 message hash computation
-pub struct CompactMessageHasher;
+struct CompactMessageHasher;
 
 impl MessageHashComputer for CompactMessageHasher {
 	/// Compute BatchCompact struct hash for TheCompact protocol
@@ -28,7 +28,7 @@ impl MessageHashComputer for CompactMessageHasher {
 }
 
 /// TheCompact implementation of EIP-712 signature validation
-pub struct CompactSignatureValidator;
+struct CompactSignatureValidator;
 
 impl SignatureValidator for CompactSignatureValidator {
 	/// Validate EIP-712 signature against expected signer
@@ -46,6 +46,16 @@ impl SignatureValidator for CompactSignatureValidator {
 	fn extract_signature(&self, signature: &Bytes) -> Bytes {
 		extract_sponsor_signature(signature)
 	}
+}
+
+/// Create a new message hasher for TheCompact protocol
+pub fn create_message_hasher() -> impl MessageHashComputer {
+	CompactMessageHasher
+}
+
+/// Create a new signature validator for TheCompact protocol
+pub fn create_signature_validator() -> impl SignatureValidator {
+	CompactSignatureValidator
 }
 
 /// Extract sponsor signature from ABI-encoded signature bytes

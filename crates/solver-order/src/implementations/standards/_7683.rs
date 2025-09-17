@@ -8,6 +8,8 @@ use crate::{OrderError, OrderInterface};
 use alloy_primitives::{Address as AlloyAddress, Bytes, FixedBytes, U256};
 use alloy_sol_types::{SolCall, SolType};
 use async_trait::async_trait;
+use solver_delivery::DeliveryService;
+use std::sync::Arc;
 use solver_types::{
 	current_timestamp,
 	oracle::OracleRoutes,
@@ -1126,9 +1128,9 @@ mod tests {
 	fn test_new_eip7683_order_impl() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let delivery = create_test_delivery_service();
+		let _delivery = create_test_delivery_service();
 
-		let result = Eip7683OrderImpl::new(networks, oracle_routes, delivery);
+		let result = Eip7683OrderImpl::new(networks, oracle_routes);
 		assert!(result.is_ok());
 	}
 
@@ -1140,8 +1142,8 @@ mod tests {
 
 		let oracle_routes = create_test_oracle_routes();
 
-		let delivery = create_test_delivery_service();
-		let result = Eip7683OrderImpl::new(networks, oracle_routes, delivery);
+		let _delivery = create_test_delivery_service();
+		let result = Eip7683OrderImpl::new(networks, oracle_routes);
 		assert!(result.is_err());
 		if let Err(e) = result {
 			assert!(e.to_string().contains("At least 2 networks"));
@@ -1172,8 +1174,8 @@ mod tests {
 	async fn test_validate_intent_wrong_standard() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let delivery = create_test_delivery_service();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
+		let _delivery = create_test_delivery_service();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let mut intent = create_test_intent(create_test_order_data(), "on-chain");
 		intent.standard = "eip7230".to_string();
@@ -1383,8 +1385,8 @@ mod tests {
 	async fn test_generate_claim_transaction_compact() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let delivery = create_test_delivery_service();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
+		let _delivery = create_test_delivery_service();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let mut order_data = create_test_order_data();
 		order_data.lock_type = Some(LockType::ResourceLock);

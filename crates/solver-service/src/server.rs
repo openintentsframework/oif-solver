@@ -6,10 +6,7 @@
 use crate::{
 	apis::{order::get_order_by_id, quote::cost::CostEngine},
 	auth::{auth_middleware, AuthState, JwtService},
-	eip712::{
-		compact::{CompactMessageHasher, CompactSignatureValidator},
-		get_domain_separator, MessageHashComputer, SignatureValidator,
-	},
+	eip712::{compact, get_domain_separator, MessageHashComputer, SignatureValidator},
 };
 use alloy_primitives::{Address as AlloyAddress, U256};
 use alloy_sol_types::SolType;
@@ -434,9 +431,9 @@ async fn validate_signature(intent: &IntentRequest, state: &AppState) -> Result<
 		AlloyAddress::from_slice(&addr.0)
 	};
 
-	// Create compact-specific implementations
-	let message_hasher = CompactMessageHasher;
-	let signature_validator = CompactSignatureValidator;
+	// Create compact-specific implementations using factory functions
+	let message_hasher = compact::create_message_hasher();
+	let signature_validator = compact::create_signature_validator();
 
 	// 1. Get domain separator from TheCompact contract
 	let domain_separator = get_domain_separator(
