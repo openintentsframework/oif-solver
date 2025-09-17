@@ -1,0 +1,13 @@
+[gas]
+
+[gas.flows.compact_resource_lock]
+# Gas units captured by scripts/e2e/estimate_gas_compact.sh
+open = 0
+fill = 76068
+claim = 121995
+
+[gas.flows.permit2_escrow]
+# Gas units captured by scripts/e2e/estimate_gas_permit2_escrow.sh
+open = 143116
+fill = 76068 
+claim = 59953

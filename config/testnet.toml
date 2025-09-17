@@ -2,7 +2,8 @@
 
 include = [
     "testnet/networks.toml",
-    "testnet/api.toml"
+    "testnet/api.toml",
+    "testnet/gas.toml"
 ]
 
 [solver]
@@ -33,7 +34,7 @@ ttl_order_by_tx_hash = 86400    # 24 hours
 primary = "local"
 
 [account.implementations.local]
-private_key = "0x5581f30e27236e3081742158a522194101de955481498401af66713e8bf8c468"
+private_key = "solver_private_key"
 
 # ============================================================================
 # DELIVERY
@@ -42,7 +43,7 @@ private_key = "0x5581f30e27236e3081742158a522194101de955481498401af66713e8bf8c46
 min_confirmations = 3  # Higher confirmations for testnets
 
 [delivery.implementations.evm_alloy]
-network_ids = [84532, 11155420]
+network_ids = [84532, 11155420, 11155111, 421614]  # Include all configured networks
 
 # ============================================================================
 # DISCOVERY
