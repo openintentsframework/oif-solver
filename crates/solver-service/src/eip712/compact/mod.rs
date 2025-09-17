@@ -39,7 +39,12 @@ impl SignatureValidator for CompactSignatureValidator {
 		signature: &Bytes,
 		expected_signer: AlloyAddress,
 	) -> Result<bool, APIError> {
-		crate::eip712::validate_eip712_signature(domain_separator, struct_hash, signature, expected_signer)
+		crate::eip712::validate_eip712_signature(
+			domain_separator,
+			struct_hash,
+			signature,
+			expected_signer,
+		)
 	}
 
 	/// Extract sponsor signature from ABI-encoded signature bytes
@@ -251,4 +256,3 @@ pub fn compute_batch_compact_struct_hash(
 
 	Ok(keccak256(struct_data))
 }
-
