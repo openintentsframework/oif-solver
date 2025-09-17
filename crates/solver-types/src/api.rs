@@ -617,6 +617,7 @@ impl Quote {
 		standard: &str,
 	) -> Result<crate::Order, Box<dyn std::error::Error>> {
 		match standard {
+			#[cfg(feature = "oif-interfaces")]
 			"eip7683" => {
 				// Use the EIP-7683 implementation of QuoteParsable
 				Ok(crate::Eip7683OrderData::quote_to_order_for_estimation(self))

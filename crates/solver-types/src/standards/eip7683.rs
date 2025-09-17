@@ -174,13 +174,16 @@ pub struct MandateOutput {
 /// Alias for backward compatibility
 pub type Output = MandateOutput;
 
+#[cfg(feature = "oif-interfaces")]
 use crate::api::{Quote, QuoteParsable};
 use crate::order::OrderParsable;
 use crate::standards::eip7930::InteropAddress;
 use crate::{
-	bytes32_to_address, parse_address, with_0x_prefix, Address, AvailableInput, Order, OrderStatus,
-	RequestedOutput,
+	bytes32_to_address, parse_address, with_0x_prefix, Address, AvailableInput, RequestedOutput,
 };
+
+#[cfg(feature = "oif-interfaces")]
+use crate::{Order, OrderStatus};
 
 /// Implementation of OrderParsable for EIP-7683 orders
 impl OrderParsable for Eip7683OrderData {
@@ -351,6 +354,7 @@ pub mod interfaces {
 }
 
 /// Convert Quote to StandardOrder
+#[cfg(feature = "oif-interfaces")]
 impl TryFrom<&Quote> for interfaces::StandardOrder {
 	type Error = Box<dyn std::error::Error>;
 
@@ -506,6 +510,7 @@ impl TryFrom<&Quote> for interfaces::StandardOrder {
 }
 
 /// Implementation of QuoteParsable for EIP-7683 orders
+#[cfg(feature = "oif-interfaces")]
 impl QuoteParsable for Eip7683OrderData {
 	fn quote_to_order_for_estimation(quote: &Quote) -> Order {
 		use std::convert::TryFrom;
