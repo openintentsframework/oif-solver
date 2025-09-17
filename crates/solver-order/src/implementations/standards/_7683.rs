@@ -9,7 +9,6 @@ use alloy_primitives::{Address as AlloyAddress, Bytes, FixedBytes, U256};
 use alloy_sol_types::{SolCall, SolType};
 use async_trait::async_trait;
 use solver_delivery::DeliveryService;
-use std::sync::Arc;
 use solver_types::{
 	current_timestamp,
 	oracle::OracleRoutes,
@@ -23,6 +22,7 @@ use solver_types::{
 	Address, ConfigSchema, Eip7683OrderData, ExecutionParams, FillProof, Intent, NetworksConfig,
 	Order, OrderStatus, Schema, Transaction,
 };
+use std::sync::Arc;
 
 /// EIP-7683 order implementation.
 ///
