@@ -467,6 +467,8 @@ async fn validate_signature(intent: &IntentRequest, state: &AppState) -> Result<
 			message: "Invalid EIP-712 signature".to_string(),
 			details: None,
 		});
+	} else {
+		tracing::info!("EIP-712 signature is valid");
 	}
 
 	Ok(())

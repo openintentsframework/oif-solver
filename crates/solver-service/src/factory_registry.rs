@@ -31,7 +31,6 @@ pub type OrderFactory = fn(
 	&toml::Value,
 	&NetworksConfig,
 	&solver_types::oracle::OracleRoutes,
-	std::sync::Arc<solver_delivery::DeliveryService>,
 ) -> Result<Box<dyn OrderInterface>, OrderError>;
 pub type PricingFactory = fn(&toml::Value) -> Result<Box<dyn PricingInterface>, PricingError>;
 pub type SettlementFactory =

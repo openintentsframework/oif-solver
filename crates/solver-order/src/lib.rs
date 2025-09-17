@@ -18,7 +18,6 @@ use thiserror::Error;
 pub mod implementations {
 	pub mod standards {
 		pub mod _7683;
-		pub mod compact_signature_validator;
 	}
 	pub mod strategies {
 		pub mod simple;
@@ -179,7 +178,6 @@ pub type OrderFactory = fn(
 	&toml::Value,
 	&NetworksConfig,
 	&solver_types::oracle::OracleRoutes,
-	std::sync::Arc<solver_delivery::DeliveryService>,
 ) -> Result<Box<dyn OrderInterface>, OrderError>;
 
 /// Type alias for strategy factory functions.

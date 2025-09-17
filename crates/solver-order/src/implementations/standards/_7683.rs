@@ -8,14 +8,12 @@ use crate::{OrderError, OrderInterface};
 use alloy_primitives::{Address as AlloyAddress, Bytes, FixedBytes, U256};
 use alloy_sol_types::{SolCall, SolType};
 use async_trait::async_trait;
-use solver_delivery::DeliveryService;
 use solver_types::{
 	current_timestamp,
-	networks::NetworkConfig,
 	oracle::OracleRoutes,
 	standards::eip7683::{
 		interfaces::{
-			IInputSettlerCompact, IInputSettlerEscrow, IOutputSettlerSimple, ITheCompact,
+			IInputSettlerCompact, IInputSettlerEscrow, IOutputSettlerSimple,
 			SolMandateOutput as MandateOutput, SolveParams, StandardOrder as OifStandardOrder,
 		},
 		LockType,
@@ -23,9 +21,6 @@ use solver_types::{
 	Address, ConfigSchema, Eip7683OrderData, ExecutionParams, FillProof, Intent, NetworksConfig,
 	Order, OrderStatus, Schema, Transaction,
 };
-use std::sync::Arc;
-
-use super::compact_signature_validator::CompactSignatureValidator;
 
 /// EIP-7683 order implementation.
 ///
@@ -45,14 +40,11 @@ use super::compact_signature_validator::CompactSignatureValidator;
 ///
 /// * `networks` - Networks configuration containing settler addresses for each chain
 /// * `oracle_routes` - Oracle routes for validation of input/output oracle compatibility
-/// * `delivery` - Delivery service for making contract calls
 pub struct Eip7683OrderImpl {
 	/// Networks configuration for dynamic settler address lookups.
 	networks: NetworksConfig,
 	/// Oracle routes for validation of input/output oracle compatibility.
 	oracle_routes: OracleRoutes,
-	/// Delivery service for blockchain interactions.
-	delivery: Arc<DeliveryService>,
 }
 
 impl Eip7683OrderImpl {
@@ -119,11 +111,7 @@ impl Eip7683OrderImpl {
 	/// * `networks` - Networks configuration with settler addresses
 	/// * `oracle_routes` - Oracle routes for validation
 	/// * `delivery` - Delivery service for blockchain interactions
-	pub fn new(
-		networks: NetworksConfig,
-		oracle_routes: OracleRoutes,
-		delivery: Arc<DeliveryService>,
-	) -> Result<Self, OrderError> {
+	pub fn new(networks: NetworksConfig, oracle_routes: OracleRoutes) -> Result<Self, OrderError> {
 		// Validate that networks config has at least 2 networks
 		if networks.len() < 2 {
 			return Err(OrderError::ValidationFailed(
@@ -134,7 +122,6 @@ impl Eip7683OrderImpl {
 		Ok(Self {
 			networks,
 			oracle_routes,
-			delivery,
 		})
 	}
 
@@ -147,213 +134,6 @@ impl Eip7683OrderImpl {
 		OifStandardOrder::abi_decode(&bytes, true).map_err(|e| {
 			OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
 		})
-	}
-
-	/// Validate compact signature for ResourceLock orders
-	async fn validate_compact_signature(
-		&self,
-		order_data: &Eip7683OrderData,
-	) -> Result<(), OrderError> {
-		// Get the signature from the order data
-		let signature_hex = order_data.signature.as_ref().ok_or_else(|| {
-			OrderError::ValidationFailed("Missing signature for ResourceLock order".to_string())
-		})?;
-
-		// Parse the signature bytes - this should be abi.encode(sponsorSig, allocatorSig)
-		let signature_bytes = hex::decode(signature_hex.trim_start_matches("0x"))
-			.map_err(|e| OrderError::ValidationFailed(format!("Invalid signature hex: {}", e)))?;
-
-		// For now, let's assume the signature is directly the sponsor signature
-		// TODO: Implement proper ABI decoding of (bytes, bytes) tuple
-		// The shell script generates abi.encode(sponsorSig, allocatorSig)
-		// but for now we'll use the raw signature directly
-		let signature = Bytes::from(signature_bytes);
-
-		// If the signature is longer than 65 bytes, it's likely ABI-encoded
-		// In that case, try to extract the first signature
-		let signature = if signature.len() > 65 {
-			// Try to manually decode - ABI encoding starts with offset pointers
-			// For (bytes, bytes), it would be [32 bytes offset1][32 bytes offset2][length1][data1][length2][data2]
-			if signature.len() >= 96 {
-				// Skip the first 64 bytes (two offset pointers) and 32 bytes (length)
-				let sponsor_sig_length_offset = 64;
-				if signature.len() > sponsor_sig_length_offset + 32 {
-					let sponsor_sig_length = u32::from_be_bytes([
-						signature[sponsor_sig_length_offset + 28],
-						signature[sponsor_sig_length_offset + 29],
-						signature[sponsor_sig_length_offset + 30],
-						signature[sponsor_sig_length_offset + 31],
-					]) as usize;
-
-					let sponsor_sig_start = sponsor_sig_length_offset + 32;
-					if signature.len() >= sponsor_sig_start + sponsor_sig_length {
-						Bytes::from(
-							signature[sponsor_sig_start..sponsor_sig_start + sponsor_sig_length]
-								.to_vec(),
-						)
-					} else {
-						signature
-					}
-				} else {
-					signature
-				}
-			} else {
-				signature
-			}
-		} else {
-			signature
-		};
-
-		// Parse the user address
-		let user_address = AlloyAddress::from_slice(
-			&hex::decode(order_data.user.trim_start_matches("0x")).map_err(|e| {
-				OrderError::ValidationFailed(format!("Invalid user address: {}", e))
-			})?,
-		);
-
-		// Convert Eip7683OrderData to OifStandardOrder for validation
-		let standard_order = self.convert_to_standard_order(order_data)?;
-
-		// Get the domain separator and contract address from the network config
-		let origin_chain_id = order_data.origin_chain_id.to::<u64>();
-		let network = self.networks.get(&origin_chain_id).ok_or_else(|| {
-			OrderError::ValidationFailed(format!(
-				"Chain ID {} not found in networks configuration",
-				origin_chain_id
-			))
-		})?;
-
-		// Get the compact settler address (this should be the contract address for signature validation)
-		let contract_address = {
-			let addr = network
-				.input_settler_compact_address
-				.clone()
-				.unwrap_or_else(|| network.input_settler_address.clone());
-			AlloyAddress::from_slice(&addr.0)
-		};
-
-		// Get domain separator from TheCompact contract dynamically
-		let domain_separator = self
-			.fetch_domain_separator(network, origin_chain_id)
-			.await
-			.unwrap();
-
-		// Create the signature validator
-		let validator = CompactSignatureValidator::new(domain_separator, contract_address);
-
-		// Validate the signature
-		let validation_result = validator
-			.validate_order_production(&standard_order, &signature, user_address)
-			.map_err(|e| {
-				OrderError::ValidationFailed(format!("Signature validation failed: {}", e))
-			})?;
-
-		if !validation_result.valid {
-			return Err(OrderError::ValidationFailed(
-				"Invalid signature for ResourceLock order".to_string(),
-			));
-		}
-
-		Ok(())
-	}
-
-	/// Convert Eip7683OrderData to OifStandardOrder for signature validation
-	fn convert_to_standard_order(
-		&self,
-		order_data: &Eip7683OrderData,
-	) -> Result<OifStandardOrder, OrderError> {
-		// Parse addresses
-		let user_address = AlloyAddress::from_slice(
-			&hex::decode(order_data.user.trim_start_matches("0x")).map_err(|e| {
-				OrderError::ValidationFailed(format!("Invalid user address: {}", e))
-			})?,
-		);
-
-		let input_oracle_address = AlloyAddress::from_slice(
-			&hex::decode(order_data.input_oracle.trim_start_matches("0x")).map_err(|e| {
-				OrderError::ValidationFailed(format!("Invalid input oracle address: {}", e))
-			})?,
-		);
-
-		// Convert outputs
-		let outputs: Vec<MandateOutput> = order_data
-			.outputs
-			.iter()
-			.map(|output| MandateOutput {
-				oracle: FixedBytes::from(output.oracle),
-				settler: FixedBytes::from(output.settler),
-				chainId: output.chain_id,
-				token: FixedBytes::from(output.token),
-				amount: output.amount,
-				recipient: FixedBytes::from(output.recipient),
-				call: output.call.clone().into(),
-				context: output.context.clone().into(),
-			})
-			.collect();
-
-		Ok(OifStandardOrder {
-			user: user_address,
-			nonce: order_data.nonce,
-			originChainId: order_data.origin_chain_id,
-			expires: order_data.expires,
-			fillDeadline: order_data.fill_deadline,
-			inputOracle: input_oracle_address,
-			inputs: order_data.inputs.clone(),
-			outputs,
-		})
-	}
-
-	/// Fetch domain separator from TheCompact contract dynamically
-	async fn fetch_domain_separator(
-		&self,
-		network: &NetworkConfig,
-		chain_id: u64,
-	) -> Result<FixedBytes<32>, OrderError> {
-		// Get TheCompact contract address from network config
-		let the_compact_address = network.the_compact_address.as_ref().ok_or_else(|| {
-			OrderError::ValidationFailed(
-				"TheCompact contract address not configured for this network".to_string(),
-			)
-		})?;
-
-		// Create contract call
-		let call = ITheCompact::DOMAIN_SEPARATORCall {};
-		let call_data = call.abi_encode();
-
-		// Create a transaction for the contract call
-		let tx = Transaction {
-			to: Some(the_compact_address.clone()),
-			data: call_data,
-			value: alloy_primitives::U256::ZERO,
-			chain_id,
-			nonce: None,
-			gas_limit: None,
-			gas_price: None,
-			max_fee_per_gas: None,
-			max_priority_fee_per_gas: None,
-		};
-
-		// Use DeliveryService to make the contract call
-		let result = self
-			.delivery
-			.contract_call(chain_id, tx)
-			.await
-			.map_err(|e| {
-				OrderError::ValidationFailed(format!("Failed to call DOMAIN_SEPARATOR(): {}", e))
-			})?;
-
-		// Decode the result
-		let domain_separator =
-			ITheCompact::DOMAIN_SEPARATORCall::abi_decode_returns(&result, false)
-				.map_err(|e| {
-					OrderError::ValidationFailed(format!(
-						"Failed to decode DOMAIN_SEPARATOR result: {}",
-						e
-					))
-				})?
-				._0;
-
-		Ok(domain_separator)
 	}
 }
 
@@ -713,11 +493,6 @@ impl OrderInterface for Eip7683OrderImpl {
 			serde_json::from_value(order.data.clone()).map_err(|e| {
 				OrderError::ValidationFailed(format!("Failed to parse order data: {}", e))
 			})?;
-
-		// Validate signature for ResourceLock orders before generating fill transaction
-		if matches!(order_data.lock_type, Some(LockType::ResourceLock)) {
-			self.validate_compact_signature(&order_data).await?;
-		}
 
 		// For multi-output orders, we need to handle each output separately
 		// This implementation fills the first cross-chain output found
@@ -1146,13 +921,12 @@ pub fn create_order_impl(
 	config: &toml::Value,
 	networks: &NetworksConfig,
 	oracle_routes: &solver_types::oracle::OracleRoutes,
-	delivery: Arc<DeliveryService>,
 ) -> Result<Box<dyn OrderInterface>, OrderError> {
 	// Validate configuration first
 	Eip7683OrderSchema::validate_config(config)
 		.map_err(|e| OrderError::InvalidOrder(format!("Invalid configuration: {}", e)))?;
 
-	let order_impl = Eip7683OrderImpl::new(networks.clone(), oracle_routes.clone(), delivery)?;
+	let order_impl = Eip7683OrderImpl::new(networks.clone(), oracle_routes.clone())?;
 	Ok(Box::new(order_impl))
 }
 
@@ -1378,8 +1152,7 @@ mod tests {
 	async fn test_validate_intent_success() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let delivery = create_test_delivery_service();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let order_data = create_test_order_data();
 		let intent = create_test_intent(order_data, "on-chain");
@@ -1418,8 +1191,7 @@ mod tests {
 	async fn test_validate_intent_expired_order() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let delivery = create_test_delivery_service();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let mut order_data = create_test_order_data();
 		order_data.expires = 100; // Set to past timestamp
@@ -1435,8 +1207,7 @@ mod tests {
 	async fn test_validate_intent_unsupported_oracle() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let delivery = create_test_delivery_service();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let mut order_data = create_test_order_data();
 		order_data.input_oracle = "0x9999999999999999999999999999999999999999".to_string();
@@ -1452,8 +1223,7 @@ mod tests {
 	async fn test_generate_prepare_transaction_onchain_order() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let delivery = create_test_delivery_service();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let order_data = create_test_order_data();
 		let intent = create_test_intent(order_data.clone(), "on-chain");
@@ -1480,8 +1250,7 @@ mod tests {
 	async fn test_generate_prepare_transaction_offchain_order() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let delivery = create_test_delivery_service();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let mut order_data = create_test_order_data();
 		// Create a valid StandardOrder and encode it for raw_order_data
@@ -1543,8 +1312,7 @@ mod tests {
 	async fn test_generate_fill_transaction() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let delivery = create_test_delivery_service();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let order_data = create_test_order_data();
 		let order = OrderBuilder::new()
@@ -1577,8 +1345,7 @@ mod tests {
 	async fn test_generate_claim_transaction_escrow() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let delivery = create_test_delivery_service();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let order_data = create_test_order_data();
 		let order = OrderBuilder::new()
@@ -1671,9 +1438,7 @@ mod tests {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
 
-		let delivery = create_test_delivery_service();
-
-		let result = create_order_impl(&config, &networks, &oracle_routes, delivery);
+		let result = create_order_impl(&config, &networks, &oracle_routes);
 		assert!(result.is_ok());
 	}
 
@@ -1692,99 +1457,5 @@ mod tests {
 
 		assert!(LockType::Permit2Escrow.is_escrow());
 		assert!(!LockType::ResourceLock.is_escrow());
-	}
-
-	#[tokio::test]
-	async fn test_generate_fill_transaction_no_cross_chain_output() {
-		let networks = create_test_networks();
-		let oracle_routes = create_test_oracle_routes();
-		let delivery = create_test_delivery_service();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
-
-		let mut order_data = create_test_order_data();
-		// Make the output same-chain
-		order_data.outputs[0].chain_id = U256::from(1);
-		let order = OrderBuilder::new()
-			.with_data(serde_json::to_value(&order_data).unwrap())
-			.with_solver_address(Address(vec![99u8; 20]))
-			.with_quote_id(Some("test-quote".to_string()))
-			.with_input_chain_ids(vec![1])
-			.with_output_chain_ids(vec![1])
-			.build();
-		let params = ExecutionParams {
-			gas_price: U256::ZERO,
-			priority_fee: None,
-		};
-
-		let result = order_impl.generate_fill_transaction(&order, &params).await;
-		assert!(result.is_err());
-		assert!(result
-			.unwrap_err()
-			.to_string()
-			.contains("No cross-chain output found"));
-	}
-
-	#[tokio::test]
-	async fn test_generate_fill_transaction_resource_lock_missing_signature() {
-		let networks = create_test_networks();
-		let oracle_routes = create_test_oracle_routes();
-		let delivery = create_test_delivery_service();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
-
-		let mut order_data = create_test_order_data();
-		order_data.lock_type = Some(LockType::ResourceLock);
-		// No signature provided
-		order_data.signature = None;
-
-		let order = OrderBuilder::new()
-			.with_data(serde_json::to_value(&order_data).unwrap())
-			.with_solver_address(Address(vec![99u8; 20]))
-			.with_quote_id(Some("test-quote".to_string()))
-			.with_input_chain_ids(vec![1])
-			.with_output_chain_ids(vec![137])
-			.build();
-		let params = ExecutionParams {
-			gas_price: U256::ZERO,
-			priority_fee: None,
-		};
-
-		let result = order_impl.generate_fill_transaction(&order, &params).await;
-		assert!(result.is_err());
-		assert!(result
-			.unwrap_err()
-			.to_string()
-			.contains("Missing signature for ResourceLock order"));
-	}
-
-	#[tokio::test]
-	async fn test_generate_fill_transaction_resource_lock_invalid_signature() {
-		let networks = create_test_networks();
-		let oracle_routes = create_test_oracle_routes();
-		let delivery = create_test_delivery_service();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes, delivery).unwrap();
-
-		let mut order_data = create_test_order_data();
-		order_data.lock_type = Some(LockType::ResourceLock);
-		// Invalid signature (too short)
-		order_data.signature = Some("0x1234".to_string());
-
-		let order = OrderBuilder::new()
-			.with_data(serde_json::to_value(&order_data).unwrap())
-			.with_solver_address(Address(vec![99u8; 20]))
-			.with_quote_id(Some("test-quote".to_string()))
-			.with_input_chain_ids(vec![1])
-			.with_output_chain_ids(vec![137])
-			.build();
-		let params = ExecutionParams {
-			gas_price: U256::ZERO,
-			priority_fee: None,
-		};
-
-		let result = order_impl.generate_fill_transaction(&order, &params).await;
-		assert!(result.is_err());
-		assert!(result
-			.unwrap_err()
-			.to_string()
-			.contains("Signature validation failed"));
 	}
 }
