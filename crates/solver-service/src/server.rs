@@ -21,9 +21,8 @@ use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
 use solver_types::{
-	api::IntentRequest,
-	APIError, Address, ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse, Order,
-	OrderIdCallback, Transaction,
+	api::IntentRequest, APIError, Address, ApiErrorType, GetOrderResponse, GetQuoteRequest,
+	GetQuoteResponse, Order, OrderIdCallback, Transaction,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -392,7 +391,6 @@ fn create_intent_from_payload(payload: Value) -> Result<IntentRequest, APIError>
 		details: None,
 	})
 }
-
 
 /// Validates an IntentRequest and creates an Order.
 async fn validate_intent_request(

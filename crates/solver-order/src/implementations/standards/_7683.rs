@@ -892,7 +892,6 @@ impl OrderInterface for Eip7683OrderImpl {
 			fill_proof: None,
 		})
 	}
-
 }
 
 /// Factory function to create an EIP-7683 order implementation from configuration.

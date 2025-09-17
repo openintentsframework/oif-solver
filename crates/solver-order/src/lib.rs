@@ -130,7 +130,6 @@ pub trait OrderInterface: Send + Sync {
 		))
 	}
 
-
 	/// Validates order bytes and creates a generic Order with computed order ID.
 	///
 	/// This method performs validation, computes the order ID using the provided callback,
@@ -340,7 +339,6 @@ impl OrderService {
 
 		implementation.validate_order(order_bytes).await
 	}
-
 
 	/// Validates order bytes and creates a generic Order with computed order ID.
 	///
