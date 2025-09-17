@@ -997,136 +997,10 @@ mod tests {
 			.build()
 	}
 
-	fn create_test_delivery_service() -> Arc<DeliveryService> {
-		// Create a mock delivery implementation for testing
-		struct MockDeliveryImpl;
-
-		#[async_trait::async_trait]
-		impl solver_delivery::DeliveryInterface for MockDeliveryImpl {
-			fn config_schema(&self) -> Box<dyn solver_types::ConfigSchema> {
-				// Create a simple schema implementation for testing
-				struct MockSchema;
-				impl solver_types::ConfigSchema for MockSchema {
-					fn validate(
-						&self,
-						_config: &toml::Value,
-					) -> Result<(), solver_types::ValidationError> {
-						Ok(())
-					}
-				}
-				Box::new(MockSchema)
-			}
-
-			async fn submit(
-				&self,
-				_tx: solver_types::Transaction,
-			) -> Result<solver_types::TransactionHash, solver_delivery::DeliveryError> {
-				Ok(solver_types::TransactionHash(vec![0; 32]))
-			}
-
-			async fn wait_for_confirmation(
-				&self,
-				_hash: &solver_types::TransactionHash,
-				_chain_id: u64,
-				_confirmations: u64,
-			) -> Result<solver_types::TransactionReceipt, solver_delivery::DeliveryError> {
-				Ok(solver_types::TransactionReceipt {
-					hash: solver_types::TransactionHash(vec![0; 32]),
-					block_number: 1,
-					success: true,
-				})
-			}
-
-			async fn get_receipt(
-				&self,
-				_hash: &solver_types::TransactionHash,
-				_chain_id: u64,
-			) -> Result<solver_types::TransactionReceipt, solver_delivery::DeliveryError> {
-				Ok(solver_types::TransactionReceipt {
-					hash: solver_types::TransactionHash(vec![0; 32]),
-					block_number: 1,
-					success: true,
-				})
-			}
-
-			async fn get_balance(
-				&self,
-				_address: &str,
-				_token: Option<&str>,
-				_chain_id: u64,
-			) -> Result<String, solver_delivery::DeliveryError> {
-				Ok("1000000000000000000".to_string())
-			}
-
-			async fn get_nonce(
-				&self,
-				_address: &str,
-				_chain_id: u64,
-			) -> Result<u64, solver_delivery::DeliveryError> {
-				Ok(0)
-			}
-
-			async fn get_gas_price(
-				&self,
-				_chain_id: u64,
-			) -> Result<String, solver_delivery::DeliveryError> {
-				Ok("20000000000".to_string())
-			}
-
-			async fn get_allowance(
-				&self,
-				_owner: &str,
-				_spender: &str,
-				_token_address: &str,
-				_chain_id: u64,
-			) -> Result<String, solver_delivery::DeliveryError> {
-				Ok("1000000000000000000".to_string())
-			}
-
-			async fn get_block_number(
-				&self,
-				_chain_id: u64,
-			) -> Result<u64, solver_delivery::DeliveryError> {
-				Ok(12345)
-			}
-
-			async fn estimate_gas(
-				&self,
-				_tx: solver_types::Transaction,
-			) -> Result<u64, solver_delivery::DeliveryError> {
-				Ok(21000)
-			}
-
-			async fn eth_call(
-				&self,
-				_tx: solver_types::Transaction,
-			) -> Result<alloy_primitives::Bytes, solver_delivery::DeliveryError> {
-				// Mock response for DOMAIN_SEPARATOR() call - return the expected hardcoded domain separator
-				let domain_separator =
-					hex::decode("330989378c39c177ab3877ced96ca0cdb60d7a6489567b993185beff161d80d7")
-						.expect("Invalid hardcoded domain separator hex");
-				Ok(alloy_primitives::Bytes::from(domain_separator))
-			}
-		}
-
-		let mut delivery_impls = std::collections::HashMap::new();
-		delivery_impls.insert(
-			1u64,
-			Arc::new(MockDeliveryImpl) as Arc<dyn solver_delivery::DeliveryInterface>,
-		);
-		delivery_impls.insert(
-			137u64,
-			Arc::new(MockDeliveryImpl) as Arc<dyn solver_delivery::DeliveryInterface>,
-		);
-
-		Arc::new(DeliveryService::new(delivery_impls, 1))
-	}
-
 	#[test]
 	fn test_new_eip7683_order_impl() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let _delivery = create_test_delivery_service();
 
 		let result = Eip7683OrderImpl::new(networks, oracle_routes);
 		assert!(result.is_ok());
@@ -1140,7 +1014,6 @@ mod tests {
 
 		let oracle_routes = create_test_oracle_routes();
 
-		let _delivery = create_test_delivery_service();
 		let result = Eip7683OrderImpl::new(networks, oracle_routes);
 		assert!(result.is_err());
 		if let Err(e) = result {
@@ -1172,7 +1045,6 @@ mod tests {
 	async fn test_validate_intent_wrong_standard() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let _delivery = create_test_delivery_service();
 		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let mut intent = create_test_intent(create_test_order_data(), "on-chain");
@@ -1383,7 +1255,6 @@ mod tests {
 	async fn test_generate_claim_transaction_compact() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
-		let _delivery = create_test_delivery_service();
 		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let mut order_data = create_test_order_data();
