@@ -437,7 +437,7 @@ async fn validate_signature(intent: &IntentRequest, state: &AppState) -> Result<
 
 	// 1. Get domain separator from TheCompact contract
 	let domain_separator = get_domain_separator(
-		&state.solver.delivery(),
+		state.solver.delivery(),
 		the_compact_address,
 		origin_chain_id,
 	)
@@ -464,10 +464,7 @@ async fn validate_signature(intent: &IntentRequest, state: &AppState) -> Result<
 			message: "Invalid EIP-712 signature".to_string(),
 			details: None,
 		});
-	} else {
-		tracing::info!("EIP-712 signature is valid");
 	}
-
 	Ok(())
 }
 

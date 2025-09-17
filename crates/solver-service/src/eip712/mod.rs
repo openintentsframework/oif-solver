@@ -2,7 +2,7 @@
 //!
 //! This module provides generic EIP-712 interfaces and TheCompact protocol-specific implementations.
 
-use alloy_primitives::{Address as AlloyAddress, Bytes, FixedBytes};
+use alloy_primitives::{keccak256, Address as AlloyAddress, Bytes, FixedBytes};
 use alloy_sol_types::SolCall;
 use solver_delivery::DeliveryService;
 use solver_types::{APIError, Address, ApiErrorType, Transaction};
@@ -82,4 +82,89 @@ pub async fn get_domain_separator(
 		._0;
 
 	Ok(domain_separator)
+}
+
+// Generic EIP-712 signature validation
+
+/// Validate EIP-712 signature against expected signer
+pub fn validate_eip712_signature(
+	domain_separator: FixedBytes<32>,
+	struct_hash: FixedBytes<32>,
+	signature: &Bytes,
+	expected_signer: AlloyAddress,
+) -> Result<bool, APIError> {
+	// Compute EIP-712 message hash
+	let message_hash = keccak256(
+		[
+			&[0x19, 0x01][..],
+			domain_separator.as_slice(),
+			struct_hash.as_slice(),
+		]
+		.concat(),
+	);
+
+	// Recover signer from signature
+	let recovered_signer = recover_signer(message_hash, signature)?;
+
+	Ok(recovered_signer == expected_signer)
+}
+
+/// Recover signer address from signature and message hash
+fn recover_signer(
+	message_hash: FixedBytes<32>,
+	signature: &Bytes,
+) -> Result<AlloyAddress, APIError> {
+	if signature.len() != 65 {
+		return Err(APIError::BadRequest {
+			error_type: ApiErrorType::OrderValidationFailed,
+			message: "Invalid signature length".to_string(),
+			details: None,
+		});
+	}
+
+	let recovery_id = signature[64];
+	let recovery_id = if recovery_id >= 27 {
+		recovery_id - 27
+	} else {
+		recovery_id
+	};
+
+	let signature_bytes = &signature[0..64];
+
+	use secp256k1::{ecdsa::RecoverableSignature, All, Message, Secp256k1};
+
+	let secp = Secp256k1::<All>::new();
+
+	// Create recoverable signature
+	let recovery_id = secp256k1::ecdsa::RecoveryId::try_from(recovery_id as i32).unwrap();
+	let recoverable_sig = RecoverableSignature::from_compact(signature_bytes, recovery_id)
+		.map_err(|_| APIError::BadRequest {
+			error_type: ApiErrorType::OrderValidationFailed,
+			message: "Invalid signature format".to_string(),
+			details: None,
+		})?;
+
+	// Create message from hash
+	let message =
+		Message::from_digest_slice(message_hash.as_slice()).map_err(|_| APIError::BadRequest {
+			error_type: ApiErrorType::OrderValidationFailed,
+			message: "Invalid message hash".to_string(),
+			details: None,
+		})?;
+
+	// Recover public key
+	let public_key = secp
+		.recover_ecdsa(&message, &recoverable_sig)
+		.map_err(|_| APIError::BadRequest {
+			error_type: ApiErrorType::OrderValidationFailed,
+			message: "Failed to recover public key".to_string(),
+			details: None,
+		})?;
+
+	// Get address from public key
+	let public_key_bytes = public_key.serialize_uncompressed();
+	let public_key_hash = keccak256(&public_key_bytes[1..]);
+	let address_bytes = &public_key_hash.as_slice()[12..];
+
+	Ok(AlloyAddress::from_slice(address_bytes))
 }
