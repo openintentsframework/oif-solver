@@ -119,7 +119,6 @@ pub async fn convert_raw_token_to_usd(
 	let raw_amount_decimal = Decimal::from_str(&raw_amount_str)
 		.map_err(|e| format!("Failed to parse raw amount {}: {}", raw_amount_str, e))?;
 
-	// Use match for token_decimals normalization
 	let normalized_amount = match token_decimals {
 		0 => raw_amount_decimal,
 		decimals => {
