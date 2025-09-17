@@ -15,6 +15,8 @@ use solver_types::{
 };
 use std::str::FromStr;
 
+const HUNDRED: i64 = 10000;
+
 /// Parameters for chain-related information
 struct ChainParams {
 	origin_chain_id: u64,
@@ -394,7 +396,7 @@ impl CostEngine {
 
 		// Calculate commission on the subtotal
 		let commission_amount_usd = if pricing.commission_bps > 0 {
-			let bps_divisor = Decimal::new(10000, 0);
+			let bps_divisor = Decimal::new(HUNDRED, 0);
 			let commission_rate = Decimal::new(pricing.commission_bps as i64, 0) / bps_divisor;
 			(subtotal_usd * commission_rate).to_string()
 		} else {

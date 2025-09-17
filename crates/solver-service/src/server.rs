@@ -684,9 +684,6 @@ async fn calculate_order_profitability(
 
 	let profit_usd = total_input_amount_usd - total_output_amount_usd - operational_cost_usd;
 	let hundred = Decimal::new(100_i64, 0);
-	if total_input_amount_usd.is_zero() {
-		return Err("Division by zero: total_input_amount_usd is zero".into());
-	}
 
 	let profit_margin_decimal = (profit_usd / total_input_amount_usd) * hundred;
 

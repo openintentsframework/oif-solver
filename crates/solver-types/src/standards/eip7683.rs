@@ -602,7 +602,7 @@ impl From<interfaces::StandardOrder> for Eip7683OrderData {
 		use alloy_primitives::hex;
 
 		// Convert outputs from SolMandateOutput to MandateOutput using From trait
-		let outputs = order.outputs.into_iter().map(MandateOutput::from).collect();
+		let outputs = order.outputs.into_iter().map(Into::into).collect();
 
 		Eip7683OrderData {
 			user: with_0x_prefix(&hex::encode(order.user)),
