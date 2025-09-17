@@ -1230,7 +1230,17 @@ mod tests {
 		#[async_trait::async_trait]
 		impl solver_delivery::DeliveryInterface for MockDeliveryImpl {
 			fn config_schema(&self) -> Box<dyn solver_types::ConfigSchema> {
-				Box::new(solver_types::Schema::new(vec![], vec![]))
+				// Create a simple schema implementation for testing
+				struct MockSchema;
+				impl solver_types::ConfigSchema for MockSchema {
+					fn validate(
+						&self,
+						_config: &toml::Value,
+					) -> Result<(), solver_types::ValidationError> {
+						Ok(())
+					}
+				}
+				Box::new(MockSchema)
 			}
 
 			async fn submit(
@@ -1247,11 +1257,9 @@ mod tests {
 				_confirmations: u64,
 			) -> Result<solver_types::TransactionReceipt, solver_delivery::DeliveryError> {
 				Ok(solver_types::TransactionReceipt {
-					transaction_hash: solver_types::TransactionHash(vec![0; 32]),
+					hash: solver_types::TransactionHash(vec![0; 32]),
 					block_number: 1,
-					block_hash: "0x0".to_string(),
-					gas_used: alloy_primitives::U256::ZERO,
-					status: true,
+					success: true,
 				})
 			}
 
@@ -1259,14 +1267,18 @@ mod tests {
 				&self,
 				_hash: &solver_types::TransactionHash,
 				_chain_id: u64,
-			) -> Result<Option<solver_types::TransactionReceipt>, solver_delivery::DeliveryError>
-			{
-				Ok(None)
+			) -> Result<solver_types::TransactionReceipt, solver_delivery::DeliveryError> {
+				Ok(solver_types::TransactionReceipt {
+					hash: solver_types::TransactionHash(vec![0; 32]),
+					block_number: 1,
+					success: true,
+				})
 			}
 
 			async fn get_balance(
 				&self,
 				_address: &str,
+				_token: Option<&str>,
 				_chain_id: u64,
 			) -> Result<String, solver_delivery::DeliveryError> {
 				Ok("1000000000000000000".to_string())
@@ -1287,17 +1299,33 @@ mod tests {
 				Ok("20000000000".to_string())
 			}
 
+			async fn get_allowance(
+				&self,
+				_owner: &str,
+				_spender: &str,
+				_token_address: &str,
+				_chain_id: u64,
+			) -> Result<String, solver_delivery::DeliveryError> {
+				Ok("1000000000000000000".to_string())
+			}
+
+			async fn get_block_number(
+				&self,
+				_chain_id: u64,
+			) -> Result<u64, solver_delivery::DeliveryError> {
+				Ok(12345)
+			}
+
 			async fn estimate_gas(
 				&self,
 				_tx: solver_types::Transaction,
-				_chain_id: u64,
 			) -> Result<u64, solver_delivery::DeliveryError> {
 				Ok(21000)
 			}
 
 			async fn eth_call(
 				&self,
-				tx: solver_types::Transaction,
+				_tx: solver_types::Transaction,
 			) -> Result<alloy_primitives::Bytes, solver_delivery::DeliveryError> {
 				// Mock response for DOMAIN_SEPARATOR() call - return the expected hardcoded domain separator
 				let domain_separator =
@@ -1310,11 +1338,11 @@ mod tests {
 		let mut delivery_impls = std::collections::HashMap::new();
 		delivery_impls.insert(
 			1u64,
-			Box::new(MockDeliveryImpl) as Box<dyn solver_delivery::DeliveryInterface>,
+			Arc::new(MockDeliveryImpl) as Arc<dyn solver_delivery::DeliveryInterface>,
 		);
 		delivery_impls.insert(
 			137u64,
-			Box::new(MockDeliveryImpl) as Box<dyn solver_delivery::DeliveryInterface>,
+			Arc::new(MockDeliveryImpl) as Arc<dyn solver_delivery::DeliveryInterface>,
 		);
 
 		Arc::new(DeliveryService::new(delivery_impls, 1))
@@ -1341,10 +1369,9 @@ mod tests {
 		let delivery = create_test_delivery_service();
 		let result = Eip7683OrderImpl::new(networks, oracle_routes, delivery);
 		assert!(result.is_err());
-		assert!(result
-			.unwrap_err()
-			.to_string()
-			.contains("At least 2 networks"));
+		if let Err(e) = result {
+			assert!(e.to_string().contains("At least 2 networks"));
+		}
 	}
 
 	#[tokio::test]

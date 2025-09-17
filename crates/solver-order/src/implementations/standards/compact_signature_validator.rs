@@ -96,19 +96,19 @@ impl CompactSignatureValidator {
 
 		// Use proper ABI encoding like the shell script: f(bytes32,uint32,address,bytes32)
 		let mut data = Vec::new();
-		data.extend_from_slice(&mandate_type_hash.as_slice()); // bytes32
+		data.extend_from_slice(mandate_type_hash.as_slice()); // bytes32
 
 		// fillDeadline as uint32 with proper ABI padding (leading zeros)
 		let mut fill_deadline_bytes = [0u8; 32];
-		fill_deadline_bytes[28..32].copy_from_slice(&(order.fillDeadline as u32).to_be_bytes());
+		fill_deadline_bytes[28..32].copy_from_slice(&order.fillDeadline.to_be_bytes());
 		data.extend_from_slice(&fill_deadline_bytes); // uint32 encoded as 32 bytes
 
 		// inputOracle as address with proper ABI padding (12 leading zero bytes + 20 address bytes)
 		let mut oracle_bytes = [0u8; 32];
-		oracle_bytes[12..32].copy_from_slice(&order.inputOracle.as_slice());
+		oracle_bytes[12..32].copy_from_slice(order.inputOracle.as_slice());
 		data.extend_from_slice(&oracle_bytes); // address encoded as 32 bytes
 
-		data.extend_from_slice(&outputs_hash.as_slice()); // bytes32
+		data.extend_from_slice(outputs_hash.as_slice()); // bytes32
 
 		Ok(keccak256(data))
 	}
@@ -119,7 +119,7 @@ impl CompactSignatureValidator {
 
 		for output in outputs {
 			let output_hash = self.compute_single_output_hash(output)?;
-			hashes.extend_from_slice(&output_hash.as_slice());
+			hashes.extend_from_slice(output_hash.as_slice());
 		}
 
 		Ok(keccak256(hashes))
@@ -132,15 +132,15 @@ impl CompactSignatureValidator {
         );
 
 		let mut data = Vec::new();
-		data.extend_from_slice(&output_type_hash.as_slice());
-		data.extend_from_slice(&output.oracle.as_slice());
-		data.extend_from_slice(&output.settler.as_slice());
+		data.extend_from_slice(output_type_hash.as_slice());
+		data.extend_from_slice(output.oracle.as_slice());
+		data.extend_from_slice(output.settler.as_slice());
 		data.extend_from_slice(&output.chainId.to_be_bytes::<32>());
-		data.extend_from_slice(&output.token.as_slice());
+		data.extend_from_slice(output.token.as_slice());
 		data.extend_from_slice(&output.amount.to_be_bytes::<32>());
-		data.extend_from_slice(&output.recipient.as_slice());
-		data.extend_from_slice(&keccak256(&output.call).as_slice());
-		data.extend_from_slice(&keccak256(&output.context).as_slice());
+		data.extend_from_slice(output.recipient.as_slice());
+		data.extend_from_slice(keccak256(&output.call).as_slice());
+		data.extend_from_slice(keccak256(&output.context).as_slice());
 
 		Ok(keccak256(data))
 	}
@@ -180,22 +180,22 @@ impl CompactSignatureValidator {
 
 			// Use proper ABI encoding like the shell script: f(bytes32,bytes12,address,uint256)
 			let mut lock_data = Vec::new();
-			lock_data.extend_from_slice(&lock_type_hash.as_slice()); // bytes32
+			lock_data.extend_from_slice(lock_type_hash.as_slice()); // bytes32
 
 			// lock_tag as bytes12 with proper ABI padding (12 lock tag bytes + 20 trailing zero bytes)
 			let mut lock_tag_bytes = [0u8; 32];
-			lock_tag_bytes[0..12].copy_from_slice(&lock_tag.as_slice());
+			lock_tag_bytes[0..12].copy_from_slice(lock_tag.as_slice());
 			lock_data.extend_from_slice(&lock_tag_bytes); // bytes12 encoded as 32 bytes
 
 			// token_address as address with proper ABI padding (12 leading zero bytes + 20 address bytes)
 			let mut token_address_bytes = [0u8; 32];
-			token_address_bytes[12..32].copy_from_slice(&token_address.as_slice());
+			token_address_bytes[12..32].copy_from_slice(token_address.as_slice());
 			lock_data.extend_from_slice(&token_address_bytes); // address encoded as 32 bytes
 
 			lock_data.extend_from_slice(&amount.to_be_bytes::<32>()); // uint256
 
 			let lock_hash = keccak256(lock_data);
-			lock_hashes.extend_from_slice(&lock_hash.as_slice());
+			lock_hashes.extend_from_slice(lock_hash.as_slice());
 		}
 
 		Ok(keccak256(lock_hashes))
@@ -216,29 +216,29 @@ impl CompactSignatureValidator {
 
 		// Use proper ABI encoding like the shell script: f(bytes32,address,address,uint256,uint256,bytes32,bytes32)
 		let mut struct_data = Vec::new();
-		struct_data.extend_from_slice(&batch_compact_type_hash.as_slice()); // bytes32
+		struct_data.extend_from_slice(batch_compact_type_hash.as_slice()); // bytes32
 
 		// contract_address as address with proper ABI padding (12 leading zero bytes + 20 address bytes)
 		let mut arbiter_bytes = [0u8; 32];
-		arbiter_bytes[12..32].copy_from_slice(&self.contract_address.as_slice());
+		arbiter_bytes[12..32].copy_from_slice(self.contract_address.as_slice());
 		struct_data.extend_from_slice(&arbiter_bytes); // address encoded as 32 bytes
 
 		// sponsor as address with proper ABI padding (12 leading zero bytes + 20 address bytes)
 		let mut sponsor_bytes = [0u8; 32];
-		sponsor_bytes[12..32].copy_from_slice(&sponsor.as_slice());
+		sponsor_bytes[12..32].copy_from_slice(sponsor.as_slice());
 		struct_data.extend_from_slice(&sponsor_bytes); // address encoded as 32 bytes
 
 		struct_data.extend_from_slice(&nonce.to_be_bytes::<32>()); // uint256
 		struct_data.extend_from_slice(&expires.to_be_bytes::<32>()); // uint256
-		struct_data.extend_from_slice(&lock_hash.as_slice()); // bytes32
-		struct_data.extend_from_slice(&witness.as_slice()); // bytes32
+		struct_data.extend_from_slice(lock_hash.as_slice()); // bytes32
+		struct_data.extend_from_slice(witness.as_slice()); // bytes32
 
 		let struct_hash = keccak256(struct_data);
 
 		let mut data = Vec::new();
 		data.extend_from_slice(b"\x19\x01");
-		data.extend_from_slice(&self.domain_separator.as_slice());
-		data.extend_from_slice(&struct_hash.as_slice());
+		data.extend_from_slice(self.domain_separator.as_slice());
+		data.extend_from_slice(struct_hash.as_slice());
 
 		Ok(keccak256(data))
 	}
@@ -320,12 +320,12 @@ impl CompactSignatureValidator {
 		// This should match the contract's orderIdentifier function
 		// For now, using a simplified version
 		let mut data = Vec::new();
-		data.extend_from_slice(&order.user.as_slice());
+		data.extend_from_slice(order.user.as_slice());
 		data.extend_from_slice(&order.nonce.to_be_bytes::<32>());
 		data.extend_from_slice(&order.originChainId.to_be_bytes::<32>());
 		data.extend_from_slice(&order.expires.to_be_bytes());
 		data.extend_from_slice(&order.fillDeadline.to_be_bytes());
-		data.extend_from_slice(&order.inputOracle.as_slice());
+		data.extend_from_slice(order.inputOracle.as_slice());
 
 		// Add inputs
 		for input in &order.inputs {
@@ -335,14 +335,14 @@ impl CompactSignatureValidator {
 
 		// Add outputs
 		for output in &order.outputs {
-			data.extend_from_slice(&output.oracle.as_slice());
-			data.extend_from_slice(&output.settler.as_slice());
+			data.extend_from_slice(output.oracle.as_slice());
+			data.extend_from_slice(output.settler.as_slice());
 			data.extend_from_slice(&output.chainId.to_be_bytes::<32>());
-			data.extend_from_slice(&output.token.as_slice());
+			data.extend_from_slice(output.token.as_slice());
 			data.extend_from_slice(&output.amount.to_be_bytes::<32>());
-			data.extend_from_slice(&output.recipient.as_slice());
-			data.extend_from_slice(&keccak256(&output.call).as_slice());
-			data.extend_from_slice(&keccak256(&output.context).as_slice());
+			data.extend_from_slice(output.recipient.as_slice());
+			data.extend_from_slice(keccak256(&output.call).as_slice());
+			data.extend_from_slice(keccak256(&output.context).as_slice());
 		}
 
 		keccak256(data)
