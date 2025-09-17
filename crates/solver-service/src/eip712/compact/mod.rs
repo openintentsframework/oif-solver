@@ -81,8 +81,8 @@ pub fn compute_batch_compact_hash(
 	contract_address: AlloyAddress,
 ) -> Result<FixedBytes<32>, APIError> {
 	// Parse order
-	let order = OifStandardOrder::abi_decode(order_bytes, true)
-		.map_err(|e| APIError::BadRequest {
+	let order =
+		OifStandardOrder::abi_decode(order_bytes, true).map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
 			message: format!("Failed to decode order: {}", e),
 			details: None,
@@ -163,7 +163,9 @@ pub fn compute_single_output_hash(output: &MandateOutput) -> Result<FixedBytes<3
 }
 
 /// Compute hash of all locks in the compact
-pub fn compute_lock_hash(ids_and_amounts: &[[Uint<256, 4>; 2]]) -> Result<FixedBytes<32>, APIError> {
+pub fn compute_lock_hash(
+	ids_and_amounts: &[[Uint<256, 4>; 2]],
+) -> Result<FixedBytes<32>, APIError> {
 	let mut lock_hashes = Vec::new();
 
 	for id_amount in ids_and_amounts {
@@ -248,11 +250,14 @@ pub fn validate_eip712_signature(
 	expected_signer: AlloyAddress,
 ) -> Result<bool, APIError> {
 	// Compute EIP-712 message hash
-	let message_hash = keccak256([
-		&[0x19, 0x01][..],
-		domain_separator.as_slice(),
-		struct_hash.as_slice(),
-	].concat());
+	let message_hash = keccak256(
+		[
+			&[0x19, 0x01][..],
+			domain_separator.as_slice(),
+			struct_hash.as_slice(),
+		]
+		.concat(),
+	);
 
 	// Recover signer from signature
 	let recovered_signer = recover_signer(message_hash, signature)?;
@@ -261,7 +266,10 @@ pub fn validate_eip712_signature(
 }
 
 /// Recover signer address from signature and message hash
-fn recover_signer(message_hash: FixedBytes<32>, signature: &Bytes) -> Result<AlloyAddress, APIError> {
+fn recover_signer(
+	message_hash: FixedBytes<32>,
+	signature: &Bytes,
+) -> Result<AlloyAddress, APIError> {
 	if signature.len() != 65 {
 		return Err(APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
@@ -271,11 +279,15 @@ fn recover_signer(message_hash: FixedBytes<32>, signature: &Bytes) -> Result<All
 	}
 
 	let recovery_id = signature[64];
-	let recovery_id = if recovery_id >= 27 { recovery_id - 27 } else { recovery_id };
+	let recovery_id = if recovery_id >= 27 {
+		recovery_id - 27
+	} else {
+		recovery_id
+	};
 
 	let signature_bytes = &signature[0..64];
 
-	use secp256k1::{ecdsa::RecoverableSignature, Message, Secp256k1, All};
+	use secp256k1::{ecdsa::RecoverableSignature, All, Message, Secp256k1};
 
 	let secp = Secp256k1::<All>::new();
 
@@ -289,15 +301,16 @@ fn recover_signer(message_hash: FixedBytes<32>, signature: &Bytes) -> Result<All
 		})?;
 
 	// Create message from hash
-	let message = Message::from_digest_slice(message_hash.as_slice())
-		.map_err(|_| APIError::BadRequest {
+	let message =
+		Message::from_digest_slice(message_hash.as_slice()).map_err(|_| APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
 			message: "Invalid message hash".to_string(),
 			details: None,
 		})?;
 
 	// Recover public key
-	let public_key = secp.recover_ecdsa(&message, &recoverable_sig)
+	let public_key = secp
+		.recover_ecdsa(&message, &recoverable_sig)
 		.map_err(|_| APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
 			message: "Failed to recover public key".to_string(),

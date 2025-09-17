@@ -6,7 +6,10 @@
 use crate::{
 	apis::{order::get_order_by_id, quote::cost::CostEngine},
 	auth::{auth_middleware, AuthState, JwtService},
-	eip712::{compact::{CompactMessageHasher, CompactSignatureValidator}, get_domain_separator, MessageHashComputer, SignatureValidator},
+	eip712::{
+		compact::{CompactMessageHasher, CompactSignatureValidator},
+		get_domain_separator, MessageHashComputer, SignatureValidator,
+	},
 };
 use alloy_primitives::{Address as AlloyAddress, U256};
 use alloy_sol_types::SolType;
@@ -22,9 +25,10 @@ use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
 use solver_types::{
-	api::IntentRequest, standards::eip7683::{interfaces::StandardOrder as OifStandardOrder, LockType},
-	APIError, Address, ApiErrorType, GetOrderResponse, GetQuoteRequest,
-	GetQuoteResponse, Order, OrderIdCallback, Transaction,
+	api::IntentRequest,
+	standards::eip7683::{interfaces::StandardOrder as OifStandardOrder, LockType},
+	APIError, Address, ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse, Order,
+	OrderIdCallback, Transaction,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -389,20 +393,21 @@ fn create_intent_from_payload(payload: Value) -> Result<IntentRequest, APIError>
 }
 
 /// Validates EIP-712 signature using TheCompact protocol.
-async fn validate_signature(
-	intent: &IntentRequest,
-	state: &AppState,
-) -> Result<(), APIError> {
+async fn validate_signature(intent: &IntentRequest, state: &AppState) -> Result<(), APIError> {
 	// Parse order to get chain info
-	let standard_order = OifStandardOrder::abi_decode(&intent.order, true)
-		.map_err(|e| APIError::BadRequest {
+	let standard_order =
+		OifStandardOrder::abi_decode(&intent.order, true).map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
 			message: format!("Failed to decode order: {}", e),
 			details: None,
 		})?;
 
 	let origin_chain_id = standard_order.originChainId.to::<u64>();
-	let network = state.solver.config().networks.get(&origin_chain_id)
+	let network = state
+		.solver
+		.config()
+		.networks
+		.get(&origin_chain_id)
 		.ok_or_else(|| APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
 			message: format!("Network {} not configured", origin_chain_id),
@@ -410,13 +415,15 @@ async fn validate_signature(
 		})?;
 
 	// Get TheCompact contract address for domain separator
-	let the_compact_address = network.the_compact_address.as_ref().ok_or_else(|| {
-		APIError::BadRequest {
-			error_type: ApiErrorType::OrderValidationFailed,
-			message: "TheCompact contract not configured".to_string(),
-			details: None,
-		}
-	})?;
+	let the_compact_address =
+		network
+			.the_compact_address
+			.as_ref()
+			.ok_or_else(|| APIError::BadRequest {
+				error_type: ApiErrorType::OrderValidationFailed,
+				message: "TheCompact contract not configured".to_string(),
+				details: None,
+			})?;
 
 	// Get contract address for signature validation
 	let contract_address = {
@@ -432,7 +439,12 @@ async fn validate_signature(
 	let signature_validator = CompactSignatureValidator;
 
 	// 1. Get domain separator from TheCompact contract
-	let domain_separator = get_domain_separator(&state.solver.delivery(), the_compact_address, origin_chain_id).await?;
+	let domain_separator = get_domain_separator(
+		&state.solver.delivery(),
+		the_compact_address,
+		origin_chain_id,
+	)
+	.await?;
 
 	// 2. Compute message hash using interface
 	let struct_hash = message_hasher.compute_message_hash(&intent.order, contract_address)?;
@@ -442,7 +454,12 @@ async fn validate_signature(
 
 	// 4. Validate EIP-712 signature using interface
 	let expected_signer = standard_order.user;
-	let is_valid = signature_validator.validate_signature(domain_separator, struct_hash, &signature, expected_signer)?;
+	let is_valid = signature_validator.validate_signature(
+		domain_separator,
+		struct_hash,
+		&signature,
+		expected_signer,
+	)?;
 
 	if !is_valid {
 		return Err(APIError::BadRequest {
@@ -598,5 +615,3 @@ async fn forward_to_discovery_service(
 		},
 	}
 }
-
-
