@@ -14,6 +14,7 @@ mod auth;
 mod eip712;
 mod factory_registry;
 mod server;
+mod signature_validation;
 
 use factory_registry::build_solver_from_config;
 
