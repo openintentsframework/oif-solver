@@ -6,10 +6,9 @@
 use crate::{
 	apis::{order::get_order_by_id, quote::cost::CostEngine},
 	auth::{auth_middleware, AuthState, JwtService},
-	eip712::{compact, get_domain_separator, MessageHashComputer, SignatureValidator},
+	signature_validation::SignatureValidationService,
 };
-use alloy_primitives::{Address as AlloyAddress, U256};
-use alloy_sol_types::SolType;
+use alloy_primitives::U256;
 use axum::{
 	extract::{Extension, Path, State},
 	http::StatusCode,
@@ -22,10 +21,8 @@ use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
 use solver_types::{
-	api::IntentRequest,
-	standards::eip7683::{interfaces::StandardOrder as OifStandardOrder, LockType},
-	APIError, Address, ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse, Order,
-	OrderIdCallback, Transaction,
+	api::IntentRequest, APIError, Address, ApiErrorType, GetOrderResponse, GetQuoteRequest,
+	GetQuoteResponse, Order, OrderIdCallback, Transaction,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -46,6 +43,8 @@ pub struct AppState {
 	pub discovery_url: Option<String>,
 	/// JWT service for authentication (if configured).
 	pub jwt_service: Option<Arc<JwtService>>,
+	/// Signature validation service for different order standards.
+	pub signature_validation: Arc<SignatureValidationService>,
 }
 
 /// Starts the HTTP server for the API.
@@ -105,12 +104,16 @@ pub async fn start_server(
 		},
 	};
 
+	// Initialize signature validation service
+	let signature_validation = Arc::new(SignatureValidationService::new());
+
 	let app_state = AppState {
 		solver,
 		config,
 		http_client,
 		discovery_url,
 		jwt_service: jwt_service.clone(),
+		signature_validation,
 	};
 
 	// Build the router with /api base path and quote endpoint
@@ -389,85 +392,6 @@ fn create_intent_from_payload(payload: Value) -> Result<IntentRequest, APIError>
 	})
 }
 
-/// Validates EIP-712 signature using TheCompact protocol.
-async fn validate_signature(intent: &IntentRequest, state: &AppState) -> Result<(), APIError> {
-	// Parse order to get chain info
-	let standard_order =
-		OifStandardOrder::abi_decode(&intent.order, true).map_err(|e| APIError::BadRequest {
-			error_type: ApiErrorType::OrderValidationFailed,
-			message: format!("Failed to decode order: {}", e),
-			details: None,
-		})?;
-
-	let origin_chain_id = standard_order.originChainId.to::<u64>();
-	let network = state
-		.solver
-		.config()
-		.networks
-		.get(&origin_chain_id)
-		.ok_or_else(|| APIError::BadRequest {
-			error_type: ApiErrorType::OrderValidationFailed,
-			message: format!("Network {} not configured", origin_chain_id),
-			details: None,
-		})?;
-
-	// Get TheCompact contract address for domain separator
-	let the_compact_address =
-		network
-			.the_compact_address
-			.as_ref()
-			.ok_or_else(|| APIError::BadRequest {
-				error_type: ApiErrorType::OrderValidationFailed,
-				message: "TheCompact contract not configured".to_string(),
-				details: None,
-			})?;
-
-	// Get contract address for signature validation
-	let contract_address = {
-		let addr = network
-			.input_settler_compact_address
-			.clone()
-			.unwrap_or_else(|| network.input_settler_address.clone());
-		AlloyAddress::from_slice(&addr.0)
-	};
-
-	// Create compact-specific implementations using factory functions
-	let message_hasher = compact::create_message_hasher();
-	let signature_validator = compact::create_signature_validator();
-
-	// 1. Get domain separator from TheCompact contract
-	let domain_separator = get_domain_separator(
-		state.solver.delivery(),
-		the_compact_address,
-		origin_chain_id,
-	)
-	.await?;
-
-	// 2. Compute message hash using interface
-	let struct_hash = message_hasher.compute_message_hash(&intent.order, contract_address)?;
-
-	// 3. Extract signature using interface
-	let signature = signature_validator.extract_signature(&intent.signature);
-
-	// 4. Validate EIP-712 signature using interface
-	let expected_signer = standard_order.user;
-	let is_valid = signature_validator.validate_signature(
-		domain_separator,
-		struct_hash,
-		&signature,
-		expected_signer,
-	)?;
-
-	if !is_valid {
-		return Err(APIError::BadRequest {
-			error_type: ApiErrorType::OrderValidationFailed,
-			message: "Invalid EIP-712 signature".to_string(),
-			details: None,
-		});
-	}
-	Ok(())
-}
-
 /// Validates an IntentRequest and creates an Order.
 async fn validate_intent_request(
 	intent: &IntentRequest,
@@ -527,8 +451,19 @@ async fn validate_intent_request(
 	});
 
 	// EIP-712 signature validation for ResourceLock orders
-	if matches!(intent.lock_type, LockType::ResourceLock) {
-		validate_signature(intent, state).await?;
+	if state
+		.signature_validation
+		.requires_signature_validation(standard, &intent.lock_type)
+	{
+		state
+			.signature_validation
+			.validate_signature(
+				standard,
+				intent,
+				&state.solver.config().networks,
+				&state.solver.delivery(),
+			)
+			.await?;
 	}
 
 	// Process the order through the OrderService
