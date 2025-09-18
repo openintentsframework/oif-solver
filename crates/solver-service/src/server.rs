@@ -461,7 +461,7 @@ async fn validate_intent_request(
 				standard,
 				intent,
 				&state.solver.config().networks,
-				&state.solver.delivery(),
+				state.solver.delivery(),
 			)
 			.await?;
 	}
