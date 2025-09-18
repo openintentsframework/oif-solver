@@ -6,6 +6,7 @@
 use crate::{
 	apis::{order::get_order_by_id, quote::cost::CostEngine},
 	auth::{auth_middleware, AuthState, JwtService},
+	signature_validator::SignatureValidationService,
 };
 use alloy_primitives::U256;
 use axum::{
@@ -42,6 +43,8 @@ pub struct AppState {
 	pub discovery_url: Option<String>,
 	/// JWT service for authentication (if configured).
 	pub jwt_service: Option<Arc<JwtService>>,
+	/// Signature validation service for different order standards.
+	pub signature_validation: Arc<SignatureValidationService>,
 }
 
 /// Starts the HTTP server for the API.
@@ -101,12 +104,16 @@ pub async fn start_server(
 		},
 	};
 
+	// Initialize signature validation service
+	let signature_validation = Arc::new(SignatureValidationService::new());
+
 	let app_state = AppState {
 		solver,
 		config,
 		http_client,
 		discovery_url,
 		jwt_service: jwt_service.clone(),
+		signature_validation,
 	};
 
 	// Build the router with /api base path and quote endpoint
@@ -442,6 +449,22 @@ async fn validate_intent_request(
 				.map_err(|e| format!("Contract call failed: {}", e))
 		})
 	});
+
+	// EIP-712 signature validation for ResourceLock orders
+	if state
+		.signature_validation
+		.requires_signature_validation(standard, &intent.lock_type)
+	{
+		state
+			.signature_validation
+			.validate_signature(
+				standard,
+				intent,
+				&state.solver.config().networks,
+				state.solver.delivery(),
+			)
+			.await?;
+	}
 
 	// Process the order through the OrderService
 	// This validates the order based on the standard and returns a validated Order
