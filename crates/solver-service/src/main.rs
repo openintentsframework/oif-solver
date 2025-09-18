@@ -11,8 +11,10 @@ use std::sync::Arc;
 
 mod apis;
 mod auth;
+mod eip712;
 mod factory_registry;
 mod server;
+mod signature_validator;
 
 use factory_registry::build_solver_from_config;
 
