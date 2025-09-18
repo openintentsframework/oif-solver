@@ -443,7 +443,8 @@ cat > config/testnet.toml << EOF
 
 include = [
     "testnet/networks.toml",
-    "testnet/api.toml"
+    "testnet/api.toml",
+    "testnet/gas.toml"
 ]
 
 [solver]
@@ -618,6 +619,32 @@ timeout_seconds = 30
 max_request_size = 1048576  # 1MB
 EOF
 
+# Create gas.toml
+cat > config/testnet/gas.toml << EOF
+# Gas Configuration - Testnet Setup
+# Defines gas estimates for different transaction flows
+
+[gas]
+
+[gas.flows.compact_resource_lock]
+# Gas units captured by scripts/e2e/estimate_gas_compact.sh
+open = 0
+fill = 76068
+claim = 121995
+
+[gas.flows.permit2_escrow]
+# Gas units captured by cast estimate command
+open = 141899
+fill = 90027 
+claim = 75573
+
+[gas.flows.eip3009_escrow]
+# Gas units for EIP-3009 escrow flows on testnet
+open = 130254
+fill = 77298 
+claim = 60084
+EOF
+
 # Done!
 echo
 echo -e "${GREEN}✅ Setup complete!${NC}"
@@ -662,8 +689,9 @@ echo "  Solver $DEST_CHAIN_NAME USDC:  ${SOLVER_DEST_USDC} USDC"
 echo
 echo -e "${BLUE}📋 Files Created:${NC}"
 echo "  Main Config:    config/testnet.toml"
-echo "  Networks:       config/testnet/networks.toml" 
+echo "  Networks:       config/testnet/networks.toml"
 echo "  API:            config/testnet/api.toml"
+echo "  Gas:            config/testnet/gas.toml"
 echo
 
 echo -e "${YELLOW}To start the solver:${NC}"

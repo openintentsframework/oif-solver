@@ -1347,8 +1347,14 @@ claim = 121995
 [gas.flows.permit2_escrow]
 # Gas units captured by scripts/e2e/estimate_gas_permit2_escrow.sh on local anvil
 open = 143116
-fill = 76068 
+fill = 76068
 claim = 59953
+
+[gas.flows.eip3009_escrow]
+# Gas units for EIP-3009 escrow flows on local anvil
+open = 130254
+fill = 77298 
+claim = 60084
 EOF
     
     print_success "Configuration files generated:"
