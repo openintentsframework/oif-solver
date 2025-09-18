@@ -515,60 +515,6 @@ impl SolverEngine {
 		&self.pricing
 	}
 
-	/// Calculate profit margin for an order using the integrated profitability service.
-	///
-	/// This method provides a convenient way to calculate profit margins for orders
-	/// using the solver engine's token manager and pricing service.
-	///
-	/// # Arguments
-	/// * `order` - The order to calculate profitability for
-	/// * `cost_estimate` - Pre-calculated cost estimate for the order
-	///
-	/// # Returns
-	/// * `Ok(Decimal)` - The profit margin as a percentage (e.g., 2.5 for 2.5%)
-	/// * `Err(Box<dyn std::error::Error>)` - If calculation fails
-	pub async fn calculate_order_profitability(
-		&self,
-		order: &Order,
-		cost_estimate: &solver_types::CostEstimate,
-	) -> Result<rust_decimal::Decimal, Box<dyn std::error::Error>> {
-		crate::cost::profitability::ProfitabilityService::calculate_profit_margin(
-			order,
-			cost_estimate,
-			&self.token_manager,
-			&self.pricing,
-		)
-		.await
-	}
-
-	/// Validate that an order meets the minimum profitability threshold.
-	///
-	/// This method calculates the profit margin and validates it against the provided
-	/// minimum threshold, returning an appropriate error if the order is not profitable enough.
-	///
-	/// # Arguments
-	/// * `order` - The order to validate
-	/// * `cost_estimate` - Pre-calculated cost estimate for the order
-	/// * `min_profitability_pct` - Minimum required profit margin percentage
-	///
-	/// # Returns
-	/// * `Ok(Decimal)` - The actual profit margin if it meets the threshold
-	/// * `Err(APIError)` - If profitability is insufficient or calculation fails
-	pub async fn validate_order_profitability(
-		&self,
-		order: &Order,
-		cost_estimate: &solver_types::CostEstimate,
-		min_profitability_pct: rust_decimal::Decimal,
-	) -> Result<rust_decimal::Decimal, solver_types::APIError> {
-		crate::cost::profitability::ProfitabilityService::validate_profitability(
-			order,
-			cost_estimate,
-			min_profitability_pct,
-			&self.token_manager,
-			&self.pricing,
-		)
-		.await
-	}
 
 	/// Helper method to spawn handler tasks with semaphore-based concurrency control.
 	///

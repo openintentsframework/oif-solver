@@ -19,7 +19,7 @@ use axum::{
 };
 use serde_json::Value;
 use solver_config::{ApiConfig, Config};
-use solver_core::SolverEngine;
+use solver_core::{cost::ProfitabilityService, SolverEngine};
 use solver_types::{
 	api::IntentRequest, APIError, Address, ApiErrorType, GetOrderResponse,
 	GetQuoteRequest, GetQuoteResponse, Order, OrderIdCallback, Transaction,
@@ -313,15 +313,15 @@ async fn handle_order(
 		},
 	};
 
-	// Validate profitability using the solver engine's integrated service
-	let actual_profit_margin = match state
-		.solver
-		.validate_order_profitability(
-			&validated_order,
-			&cost_estimate,
-			state.config.solver.min_profitability_pct,
-		)
-		.await
+	// Validate profitability using ProfitabilityService directly
+	let actual_profit_margin = match ProfitabilityService::validate_profitability(
+		&validated_order,
+		&cost_estimate,
+		state.config.solver.min_profitability_pct,
+		state.solver.token_manager(),
+		state.solver.pricing(),
+	)
+	.await
 	{
 		Ok(margin) => margin,
 		Err(api_error) => {
