@@ -110,6 +110,7 @@ pub struct MessageTracker {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct SubmittedMessage {
 	message_id: [u8; 32],
 	origin_chain: u64,
@@ -120,6 +121,7 @@ struct SubmittedMessage {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct DeliveredMessage {
 	message_id: [u8; 32],
 	delivery_tx_hash: TransactionHash,
@@ -216,6 +218,7 @@ impl MessageTracker {
 }
 
 /// Hyperlane settlement implementation
+#[allow(dead_code)]
 pub struct HyperlaneSettlement {
 	providers: HashMap<u64, RootProvider<Http<reqwest::Client>>>,
 	oracle_config: OracleConfig,
@@ -248,7 +251,7 @@ impl HyperlaneSettlement {
 		all_network_ids.dedup();
 
 		for network_id in &all_network_ids {
-			let network = networks.get(&network_id).ok_or_else(|| {
+			let network = networks.get(network_id).ok_or_else(|| {
 				SettlementError::ValidationFailed(format!(
 					"Network {} not found in configuration",
 					network_id

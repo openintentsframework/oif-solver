@@ -189,7 +189,7 @@ impl SettlementInterface for DirectSettlement {
 		let order_id_bytes = order.id.as_bytes();
 		let mut hasher = std::collections::hash_map::DefaultHasher::new();
 		std::hash::Hasher::write(&mut hasher, order_id_bytes);
-		let selection_context = std::hash::Hasher::finish(&mut hasher);
+		let selection_context = std::hash::Hasher::finish(&hasher);
 		let oracle_address = self
 			.select_oracle(&oracle_addresses, Some(selection_context))
 			.ok_or_else(|| {
