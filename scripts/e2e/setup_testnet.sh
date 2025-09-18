@@ -277,7 +277,7 @@ DEST_TOKEN="$DEST_USDC_ADDRESS"
 ORIGIN_COMPACT_ADDRESS=""
 ORIGIN_PERMIT2_ADDRESS="0x000000000022D473030F116dDEE9F6B43aC78BA3"
 DEST_PERMIT2_ADDRESS="0x000000000022D473030F116dDEE9F6B43aC78BA3"
-OIF_PINNED_COMMIT="82f11e5"  # release-v0.1-rc.0: updates for release candidate
+OIF_PINNED_COMMIT="eafdaa8"  # release-v0.1-rc.0: updates for release candidate
 
 echo
 echo -e "${GREEN}✅ Configuration validated${NC}"
