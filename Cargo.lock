@@ -3749,7 +3749,6 @@ dependencies = [
  "async-trait",
  "chrono",
  "hex",
- "secp256k1",
  "serde",
  "serde_json",
  "solver-types",
