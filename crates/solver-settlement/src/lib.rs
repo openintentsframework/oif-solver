@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use solver_types::{
 	oracle::{OracleInfo, OracleRoutes},
 	Address, ConfigSchema, FillProof, ImplementationRegistry, NetworksConfig, Order, Transaction,
-	TransactionHash, TransactionReceipt,
+	TransactionHash, TransactionReceipt, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +19,7 @@ use thiserror::Error;
 /// Re-export implementations
 pub mod implementations {
 	pub mod direct;
+	pub mod hyperlane;
 }
 
 /// Common utilities for settlement implementations
@@ -219,6 +220,18 @@ pub trait SettlementInterface: Send + Sync {
 		// Default: no pre-claim transaction needed
 		Ok(None)
 	}
+
+	/// Called after certain transaction types are confirmed on-chain.
+	/// Allows settlements to handle transaction receipts for protocol-specific needs.
+	/// For Hyperlane: extracts message IDs from PostFill transaction receipts.
+	async fn handle_transaction_confirmed(
+		&self,
+		_order: &Order,
+		_tx_type: TransactionType,
+		_receipt: &TransactionReceipt,
+	) -> Result<(), SettlementError> {
+		Ok(()) // Default: no-op for settlements that don't need this
+	}
 }
 
 /// Type alias for settlement factory functions.
@@ -239,9 +252,12 @@ pub trait SettlementRegistry: ImplementationRegistry<Factory = SettlementFactory
 /// Returns a vector of (name, factory) tuples for all available settlement implementations.
 /// This is used by the factory registry to automatically register all implementations.
 pub fn get_all_implementations() -> Vec<(&'static str, SettlementFactory)> {
-	use implementations::direct;
+	use implementations::{direct, hyperlane};
 
-	vec![(direct::Registry::NAME, direct::Registry::factory())]
+	vec![
+		(direct::Registry::NAME, direct::Registry::factory()),
+		(hyperlane::Registry::NAME, hyperlane::Registry::factory()),
+	]
 }
 
 /// Service managing settlement implementations.
@@ -349,6 +365,8 @@ impl SettlementService {
 		order: &Order,
 	) -> Result<&dyn SettlementInterface, SettlementError> {
 		// Parse order data to get input oracle
+		// TODO: Once we merge https://github.com/openintentsframework/oif-solver/pull/155
+		// 		 we should use `order.parse_order_data()` and add input oracle fetching
 		let order_data: solver_types::Eip7683OrderData =
 			serde_json::from_value(order.data.to_owned()).map_err(|e| {
 				SettlementError::ValidationFailed(format!("Invalid order data: {}", e))

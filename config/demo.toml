@@ -122,3 +122,39 @@ output = { 31337 = [
 [settlement.implementations.direct.routes]
 31337 = [31338] # Can go from origin to destination
 31338 = [31337] # Can go from destination to origin
+
+# ============================================================================
+# HYPERLANE SETTLEMENT (For cross-chain messaging)
+# ============================================================================
+[settlement.implementations.hyperlane]
+# Default gas limit for Hyperlane messages
+default_gas_limit = 500000
+message_timeout_seconds = 600
+finalization_required = false # For local testing
+
+# Oracle addresses (same as direct for local demo)
+[settlement.implementations.hyperlane.oracles]
+input = { 31337 = [
+    "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
+], 31338 = [
+    "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
+] }
+output = { 31337 = [
+    "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
+], 31338 = [
+    "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
+] }
+
+[settlement.implementations.hyperlane.routes]
+31337 = [31338]
+31338 = [31337]
+
+# Mailbox addresses (mock for local testing)
+[settlement.implementations.hyperlane.mailboxes]
+31337 = "0x0000000000000000000000000000000000000001" # Mock mailbox for local
+31338 = "0x0000000000000000000000000000000000000001" # Mock mailbox for local
+
+# IGP addresses (mock for local testing)  
+[settlement.implementations.hyperlane.igp_addresses]
+31337 = "0x0000000000000000000000000000000000000002" # Mock IGP for local
+31338 = "0x0000000000000000000000000000000000000002" # Mock IGP for local

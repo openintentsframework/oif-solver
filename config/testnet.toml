@@ -32,7 +32,7 @@ ttl_order_by_tx_hash = 86400    # 24 hours
 primary = "local"
 
 [account.implementations.local]
-private_key = "solver_private_key"
+private_key = "${SOLVER_PRIVATE_KEY}"  # Set via environment variable
 
 # ============================================================================
 # DELIVERY
@@ -41,7 +41,7 @@ private_key = "solver_private_key"
 min_confirmations = 3  # Higher confirmations for testnets
 
 [delivery.implementations.evm_alloy]
-network_ids = [84532, 11155420, 421614, 11155111]
+network_ids = [17000, 11155420]
 
 # ============================================================================
 # DISCOVERY
@@ -49,12 +49,12 @@ network_ids = [84532, 11155420, 421614, 11155111]
 [discovery]
 
 [discovery.implementations.onchain_eip7683]
-network_ids = [84532, 11155420, 421614, 11155111]
+network_ids = [17000, 11155420]
 
 [discovery.implementations.offchain_eip7683]
 api_host = "127.0.0.1"
 api_port = 8081
-network_ids = [84532, 11155420, 421614, 11155111]
+network_ids = [17000]
 
 # ============================================================================
 # ORDER
@@ -70,34 +70,66 @@ primary = "simple"
 max_gas_price_gwei = 100
 
 # ============================================================================
+# PRICING
+# ============================================================================
+[pricing]
+primary = "coingecko"
+
+[pricing.implementations.coingecko]
+cache_duration_seconds = 60
+rate_limit_delay_ms = 1200
+
+# ============================================================================
 # SETTLEMENT
 # ============================================================================
 [settlement]
 
 [settlement.domain]
 chain_id = 1
-address = "0xB686e4A97821E259d1BB15c5bf13ec96553176d7"
+address = "0xaD4874B89BD461685a56013109D3599feCB6B9A0"
 
 [settlement.implementations.direct]
-order = "eip7683"
-network_ids = [84532, 11155420, 421614, 11155111]
+order = "eipXXXX"
+network_ids = [17000, 11155420]
 dispute_period_seconds = 60
-# Oracle selection strategy when multiple oracles are available (First, RoundRobin, Random)
 oracle_selection_strategy = "First"
 
-# Oracle configuration with multiple oracle support
 [settlement.implementations.direct.oracles]
-# Input oracles (on origin chains)
-input = { 84532 = ["0xDD40C9a79D813e4200795014b8E9e575317596F6"], 11155420 = ["0x6dc56CB6C61f3c5a9148cE1fD1AF7a13B8903980"], 421614 = ["0xedF6cd53008C3EA43e976214F5f6a1A8dBDc6460"], 11155111 = ["0xc04c8A84295F36B53AC109d47C041a258B788268"] }
-# Output oracles (on destination chains)
-output = { 84532 = ["0xDD40C9a79D813e4200795014b8E9e575317596F6"], 11155420 = ["0x6dc56CB6C61f3c5a9148cE1fD1AF7a13B8903980"], 421614 = ["0xedF6cd53008C3EA43e976214F5f6a1A8dBDc6460"], 11155111 = ["0xc04c8A84295F36B53AC109d47C041a258B788268"] }
+input = { 17000 = ["0x46E105e5D62385CF5ec1723fcF5ad58008A8810a"], 11155420 = ["0x46E105e5D62385CF5ec1723fcF5ad58008A8810a"] }
+output = { 17000 = ["0x46E105e5D62385CF5ec1723fcF5ad58008A8810a"], 11155420 = ["0x46E105e5D62385CF5ec1723fcF5ad58008A8810a"] }
 
-# Valid routes: from origin chain -> to destination chains
 [settlement.implementations.direct.routes]
-84532 = [11155420, 421614, 11155111]     # Base Sepolia can go to all other networks
-11155420 = [84532, 421614, 11155111]    # Optimism Sepolia can go to all other networks
-421614 = [84532, 11155420, 11155111]    # Arbitrum Sepolia can go to all other networks
-11155111 = [84532, 11155420, 421614]    # Ethereum Sepolia can go to all other networks
+17000 = [11155420]
+11155420 = [17000]
+
+# ============================================================================
+# HYPERLANE SETTLEMENT (For Holesky <-> Optimism Sepolia)
+# ============================================================================
+[settlement.implementations.hyperlane]
+order = "eip7683"
+network_ids = [17000, 11155420]
+default_gas_limit = 500000
+message_timeout_seconds = 600
+finalization_required = true
+
+# Oracle addresses - YOU MUST DEPLOY these HyperlaneOracle contracts
+[settlement.implementations.hyperlane.oracles]
+input = { 17000 = ["0x0b88D54A39F330Dd7e773af4806BDC490c79cAB6"],  11155420 = ["0x0b88D54A39F330Dd7e773af4806BDC490c79cAB6"] }
+output = { 17000 = ["0x0b88D54A39F330Dd7e773af4806BDC490c79cAB6"],  11155420 = ["0x0b88D54A39F330Dd7e773af4806BDC490c79cAB6"] }
+
+[settlement.implementations.hyperlane.routes]
+17000 = [11155420]
+# 11155420 = [17000]
+
+# Official Hyperlane Mailbox addresses
+[settlement.implementations.hyperlane.mailboxes]
+17000 = "0x46f7C5D896bbeC89bE1B19e4485e59b4Be49e9Cc"
+11155420 = "0x6966b0E55883d49BFB24539356a2f8A673E02039"
+
+# Official Hyperlane IGP addresses
+[settlement.implementations.hyperlane.igp_addresses]
+17000 = "0x5CBf4e70448Ed46c2616b04e9ebc72D29FF0cfA9"
+11155420 = "0x28B02B97a850872C4D33C3E024fab6499ad96564"
 
 # ============================================================================
 # DEMO SCRIPT CONFIGURATION
@@ -108,16 +140,16 @@ output = { 84532 = ["0xDD40C9a79D813e4200795014b8E9e575317596F6"], 11155420 = ["
 
 # Contract addresses for testing (used by demo scripts)
 [contracts.origin]
-USDC = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+USDC = "0x7dfFC9e7db5a96887666c1a6D215E5d3Fb306d69"
 permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 
 [contracts.destination]
-USDC = " 0x5fd84259d66Cd46123540766Be93DFE6D43130D7"
+USDC = "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"
 permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 
 # Test accounts (used by demo scripts)
 [accounts]
-solver = "0xbe2D5EBF89baD8f8c92ED2382c16ECB90DD37be2"
-user = "0xf1828Ea4C9480F87620E538c80b6134A2e611ea9"
-user_private_key = "user_private_key"
-recipient = "0x40C93020a2964dc79456443B938D0cA556117317"
+solver = "0xdf2ef67c96DdC136A8447F9eca1959B85C210218"
+user = "0x487C810990E17594A2Caa022a1E132c7B94F832f"
+user_private_key = "${USER_PRIVATE_KEY}"  # Set via environment variable for demo scripts only
+recipient = "0x487C810990E17594A2Caa022a1E132c7B94F832f"

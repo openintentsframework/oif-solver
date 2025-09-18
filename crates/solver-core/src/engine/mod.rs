@@ -152,6 +152,7 @@ impl SolverEngine {
 			delivery.clone(),
 			storage.clone(),
 			state_machine.clone(),
+			settlement.clone(),
 			event_bus.clone(),
 			config.solver.monitoring_timeout_minutes,
 		));

@@ -3787,6 +3787,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha3",
  "solver-types",
  "thiserror 1.0.69",
  "tokio",

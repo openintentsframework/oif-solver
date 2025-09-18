@@ -25,7 +25,7 @@
 #     ./setup_testnet.sh --help
 #
 # After running this script, you can:
-# - Start the solver with: cargo run --bin solver-service -- --config config/testnet.toml
+# - Start the solver with: cargo run --bin solver -- --config config/testnet.toml
 # - Send onchain test intents using: ./scripts/demo/send_onchain_intent.sh
 # - Send offchain test intents using: ./scripts/demo/send_offchain_intent.sh
 
@@ -135,11 +135,11 @@ validate_chain_exists() {
 # ============================================================================
 # ADDRESSES - PASTE YOUR ADDRESSES HERE
 # ============================================================================
-SOLVER_ADDRESS=""  # Your solver address here
-SOLVER_PRIVATE_KEY="" # Your solver private key here
-USER_ADDRESS=""    # Your user address here
-USER_PRIVATE_KEY="" # Your user private key here
-DEST_RECIPIENT_ADDR="" # address of the destination recipient where the tokens will be sent to
+SOLVER_ADDRESS="0xdf2ef67c96DdC136A8447F9eca1959B85C210218"  # Your solver address here
+SOLVER_PRIVATE_KEY="${SOLVER_PRIVATE_KEY}" # Set via environment variable
+USER_ADDRESS="0x487C810990E17594A2Caa022a1E132c7B94F832f"    # Your user address here
+USER_PRIVATE_KEY="${USER_PRIVATE_KEY}" # Set via environment variable
+DEST_RECIPIENT_ADDR="0x487C810990E17594A2Caa022a1E132c7B94F832f" # address of the destination recipient where the tokens will be sent to
 
 # Load environment variables from .env file
 load_env_file() {
@@ -330,8 +330,10 @@ DEPLOYER_ORIGIN_BALANCE=$(cast balance $DEPLOYER_ADDRESS --rpc-url "$ORIGIN_RPC_
 DEPLOYER_DEST_BALANCE=$(cast balance $DEPLOYER_ADDRESS --rpc-url "$DEST_RPC_URL" --ether 2>/dev/null || echo "0")
 
 # Check USDC balances
-DEPLOYER_ORIGIN_USDC=$(cast call $ORIGIN_USDC_ADDRESS "balanceOf(address)(uint256)" $DEPLOYER_ADDRESS --rpc-url "$ORIGIN_RPC_URL" 2>/dev/null | xargs -I {} cast --to-unit {} 6 2>/dev/null || echo "0")
-DEPLOYER_DEST_USDC=$(cast call $DEST_USDC_ADDRESS "balanceOf(address)(uint256)" $DEPLOYER_ADDRESS --rpc-url "$DEST_RPC_URL" 2>/dev/null | xargs -I {} cast --to-unit {} 6 2>/dev/null || echo "0")
+DEPLOYER_ORIGIN_USDC_RAW=$(cast call $ORIGIN_USDC_ADDRESS "balanceOf(address)(uint256)" $DEPLOYER_ADDRESS --rpc-url "$ORIGIN_RPC_URL" 2>/dev/null || echo "0")
+DEPLOYER_ORIGIN_USDC=$(echo "scale=2; $DEPLOYER_ORIGIN_USDC_RAW / 1000000" | bc 2>/dev/null || echo "0")
+DEPLOYER_DEST_USDC_RAW=$(cast call $DEST_USDC_ADDRESS "balanceOf(address)(uint256)" $DEPLOYER_ADDRESS --rpc-url "$DEST_RPC_URL" 2>/dev/null || echo "0")
+DEPLOYER_DEST_USDC=$(echo "scale=2; $DEPLOYER_DEST_USDC_RAW / 1000000" | bc 2>/dev/null || echo "0")
 
 echo "  Deployer $ORIGIN_CHAIN_NAME ETH:     ${DEPLOYER_ORIGIN_BALANCE} ETH"
 echo "  Deployer $DEST_CHAIN_NAME ETH: ${DEPLOYER_DEST_BALANCE} ETH"
@@ -344,8 +346,10 @@ SOLVER_ORIGIN_BALANCE=$(cast balance $SOLVER_ADDRESS --rpc-url "$ORIGIN_RPC_URL"
 SOLVER_DEST_BALANCE=$(cast balance $SOLVER_ADDRESS --rpc-url "$DEST_RPC_URL" --ether 2>/dev/null || echo "0")
 
 # Check solver USDC balances
-SOLVER_ORIGIN_USDC=$(cast call $ORIGIN_USDC_ADDRESS "balanceOf(address)(uint256)" $SOLVER_ADDRESS --rpc-url "$ORIGIN_RPC_URL" 2>/dev/null | xargs -I {} cast --to-unit {} 6 2>/dev/null || echo "0")
-SOLVER_DEST_USDC=$(cast call $DEST_USDC_ADDRESS "balanceOf(address)(uint256)" $SOLVER_ADDRESS --rpc-url "$DEST_RPC_URL" 2>/dev/null | xargs -I {} cast --to-unit {} 6 2>/dev/null || echo "0")
+SOLVER_ORIGIN_USDC_RAW=$(cast call $ORIGIN_USDC_ADDRESS "balanceOf(address)(uint256)" $SOLVER_ADDRESS --rpc-url "$ORIGIN_RPC_URL" 2>/dev/null || echo "0")
+SOLVER_ORIGIN_USDC=$(echo "scale=2; $SOLVER_ORIGIN_USDC_RAW / 1000000" | bc 2>/dev/null || echo "0")
+SOLVER_DEST_USDC_RAW=$(cast call $DEST_USDC_ADDRESS "balanceOf(address)(uint256)" $SOLVER_ADDRESS --rpc-url "$DEST_RPC_URL" 2>/dev/null || echo "0")
+SOLVER_DEST_USDC=$(echo "scale=2; $SOLVER_DEST_USDC_RAW / 1000000" | bc 2>/dev/null || echo "0")
 
 echo "  Solver $ORIGIN_CHAIN_NAME ETH:       ${SOLVER_ORIGIN_BALANCE} ETH"
 echo "  Solver $DEST_CHAIN_NAME ETH:   ${SOLVER_DEST_BALANCE} ETH"
@@ -511,6 +515,16 @@ primary = "simple"
 max_gas_price_gwei = 100
 
 # ============================================================================
+# PRICING
+# ============================================================================
+[pricing]
+primary = "coingecko"
+
+[pricing.implementations.coingecko]
+cache_duration_seconds = 60
+rate_limit_delay_ms = 1200
+
+# ============================================================================
 # SETTLEMENT
 # ============================================================================
 [settlement]
@@ -519,11 +533,58 @@ max_gas_price_gwei = 100
 chain_id = 1
 address = "$INPUT_SETTLER"
 
-[settlement.implementations.eip7683]
+[settlement.implementations.direct]
+order = "eipXXXX"
 network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]
-oracle_addresses = { $ORIGIN_CHAIN_ID = "$ORACLE", $DEST_CHAIN_ID = "$ORACLE" }
 dispute_period_seconds = 60
+oracle_selection_strategy = "First"
 
+[settlement.implementations.direct.oracles]
+input = { $ORIGIN_CHAIN_ID = ["$ORACLE"], $DEST_CHAIN_ID = ["$ORACLE"] }
+output = { $ORIGIN_CHAIN_ID = ["$ORACLE"], $DEST_CHAIN_ID = ["$ORACLE"] }
+
+[settlement.implementations.direct.routes]
+$ORIGIN_CHAIN_ID = [$DEST_CHAIN_ID]
+$DEST_CHAIN_ID = [$ORIGIN_CHAIN_ID]
+EOF
+
+cat >> config/testnet.toml << EOF
+
+# ============================================================================
+# HYPERLANE SETTLEMENT (For Holesky <-> Optimism Sepolia)
+# ============================================================================
+[settlement.implementations.hyperlane]
+order = "eip7683"
+network_ids = [17000, 11155420]
+default_gas_limit = 500000
+message_timeout_seconds = 600
+finalization_required = true
+
+# Oracle addresses - YOU MUST DEPLOY these HyperlaneOracle contracts
+[settlement.implementations.hyperlane.oracles]
+EOF
+
+echo "input = { 17000 = [\"0x0b88D54A39F330Dd7e773af4806BDC490c79cAB6\"],  11155420 = [\"0x0b88D54A39F330Dd7e773af4806BDC490c79cAB6\"] }" >> config/testnet.toml
+echo "output = { 17000 = [\"0x0b88D54A39F330Dd7e773af4806BDC490c79cAB6\"],  11155420 = [\"0x0b88D54A39F330Dd7e773af4806BDC490c79cAB6\"] }" >> config/testnet.toml
+
+cat >> config/testnet.toml << EOF
+
+[settlement.implementations.hyperlane.routes]
+17000 = [11155420]
+# 11155420 = [17000]
+
+# Official Hyperlane Mailbox addresses
+[settlement.implementations.hyperlane.mailboxes]
+17000 = "0x46f7C5D896bbeC89bE1B19e4485e59b4Be49e9Cc"
+11155420 = "0x6966b0E55883d49BFB24539356a2f8A673E02039"
+
+# Official Hyperlane IGP addresses
+[settlement.implementations.hyperlane.igp_addresses]
+17000 = "0x5CBf4e70448Ed46c2616b04e9ebc72D29FF0cfA9"
+11155420 = "0x28B02B97a850872C4D33C3E024fab6499ad96564"
+EOF
+
+cat >> config/testnet.toml << EOF
 
 # ============================================================================
 # DEMO SCRIPT CONFIGURATION
@@ -555,9 +616,12 @@ cat > config/testnet/networks.toml << EOF
 # Defines all supported blockchain networks and their tokens
 
 [networks.$ORIGIN_CHAIN_ID]
-rpc_url = "$ORIGIN_RPC_URL"
 input_settler_address = "$INPUT_SETTLER"
-output_settler_address = "$OUTPUT_SETTLER"
+output_settler_address = "0x0000000000000000000000000000000000000000"
+
+# RPC endpoints with both HTTP and WebSocket URLs for each network
+[[networks.$ORIGIN_CHAIN_ID.rpc_urls]]
+http = "$ORIGIN_RPC_URL"
 
 [[networks.$ORIGIN_CHAIN_ID.tokens]]
 address = "$ORIGIN_USDC_ADDRESS"
@@ -565,9 +629,12 @@ symbol = "USDC"
 decimals = 6
 
 [networks.$DEST_CHAIN_ID]
-rpc_url = "$DEST_RPC_URL"
-input_settler_address = "$INPUT_SETTLER"
+input_settler_address = "0x0000000000000000000000000000000000000000"
 output_settler_address = "$OUTPUT_SETTLER"
+
+# RPC endpoints with both HTTP and WebSocket URLs for each network
+[[networks.$DEST_CHAIN_ID.rpc_urls]]
+http = "$DEST_RPC_URL"
 
 [[networks.$DEST_CHAIN_ID.tokens]]
 address = "$DEST_USDC_ADDRESS"
@@ -585,7 +652,25 @@ enabled = true
 host = "127.0.0.1"
 port = 3000
 timeout_seconds = 30
-max_request_size = 1048576  # 1MB
+max_request_size = 1048576 # 1MB
+
+[api.implementations]
+discovery = "offchain_eip7683"
+
+# JWT Authentication Configuration
+[api.auth]
+enabled = false
+jwt_secret = "${JWT_SECRET:-MySuperDuperSecureSecret123!}"
+access_token_expiry_hours = 1
+refresh_token_expiry_hours = 720                           # 30 days
+issuer = "oif-solver-testnet"
+
+# Quote Configuration
+[api.quote]
+# Quote validity duration in seconds
+# Default is 20 seconds. Customize as needed:
+validity_seconds = 60 # 1 minute validity
+
 EOF
 
 # Done!
@@ -637,7 +722,7 @@ echo "  API:            config/testnet/api.toml"
 echo
 
 echo -e "${YELLOW}To start the solver:${NC}"
-echo "  cargo run --bin solver-service -- --config config/testnet.toml"
+echo "  cargo run --bin solver -- --config config/testnet.toml"
 echo
 
 echo -e "${BLUE}💡 Next Steps:${NC}"
@@ -647,6 +732,20 @@ echo "     Recommended: at least $MIN_SOLVER_USDC USDC for testing"
 echo "  2. Ensure you have USDC on $ORIGIN_CHAIN_NAME for test transactions (need >1 USDC)"
 echo "  3. VERIFY the USDC token addresses on both chains"
 echo "     Check $ORIGIN_EXPLORER_URL and $DEST_EXPLORER_URL"
+
+# Add Hyperlane-specific instructions if applicable
+if [[ "$ORIGIN_CHAIN_ID" == "17000" || "$DEST_CHAIN_ID" == "17000" || "$ORIGIN_CHAIN_ID" == "11155420" || "$DEST_CHAIN_ID" == "11155420" ]]; then
+    echo
+    echo -e "${YELLOW}⚠️  Hyperlane Settlement Available:${NC}"
+    echo "  For Holesky <-> Optimism Sepolia routes, you can use Hyperlane cross-chain messaging!"
+    echo "  To enable it, you must:"
+    echo "  1. Deploy HyperlaneOracle contracts on both chains"
+    echo "     Contract: oif-contracts/src/integrations/oracles/hyperlane/HyperlaneOracle.sol"
+    echo "  2. Update the oracle addresses in config/testnet.toml"
+    echo "     Replace 0xYourHyperlaneOracleHolesky and 0xYourHyperlaneOracleOpSepolia"
+    echo "  3. Ensure solver has ETH on destination chain for IGP payments"
+fi
+
 echo "  4. Start the solver service"
 echo
 echo -e "${GREEN}🎉 Testnet setup completed!${NC}"

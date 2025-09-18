@@ -103,7 +103,7 @@ NETWORKS_CONFIG="config/testnet/networks.toml"
 # Load account info
 SOLVER_ADDR=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'solver = ' | cut -d'"' -f2)
 USER_ADDR=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'user = ' | cut -d'"' -f2)
-USER_PRIVATE_KEY=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'user_private_key = ' | cut -d'"' -f2)
+USER_PRIVATE_KEY=${USER_PRIVATE_KEY:-$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'user_private_key = ' | cut -d'"' -f2)}
 RECIPIENT_ADDR=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'recipient = ' | cut -d'"' -f2)
 
 # Dynamic config functions
@@ -122,7 +122,14 @@ get_network_config() {
             awk "/\[\[networks\.${chain_id}\.rpc_urls\]\]/{f=1} f && /^http = /{print; exit}" $NETWORKS_CONFIG | cut -d'"' -f2
             ;;
         "oracle")
-            grep -A5 '\[settlement.implementations.direct.oracles\]' $MAIN_CONFIG | grep 'input = ' | sed "s/.*${chain_id} = \[\"\([^\"]*\)\".*/\1/"
+            # Check if we should use Hyperlane oracle for this route
+            if [[ "$chain_id" == "17000" ]] || [[ "$chain_id" == "11155420" ]]; then
+                # Use Hyperlane oracle for Holesky <-> Optimism Sepolia
+                grep -A5 '\[settlement.implementations.hyperlane.oracles\]' $MAIN_CONFIG | grep 'input = ' | sed "s/.*${chain_id} = \[\"\([^\"]*\)\".*/\1/"
+            else
+                # Use direct settlement oracle for other chains
+                grep -A5 '\[settlement.implementations.direct.oracles\]' $MAIN_CONFIG | grep 'input = ' | sed "s/.*${chain_id} = \[\"\([^\"]*\)\".*/\1/"
+            fi
             ;;
     esac
 }
