@@ -12,9 +12,13 @@ alloy-signer = "0.8"
 alloy-signer-local = "0.8"
 async-trait = "0.1"
 hex = "0.4"
+mockall = { version = "0.13", optional = true }
 solver-types = { path = "../solver-types" }
 thiserror = "1.0"
 toml = { workspace = true }
+
+[features]
+testing = ["mockall"]
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -10,6 +10,7 @@ pub mod mandate_output;
 pub mod networks;
 pub mod order;
 pub mod transaction;
+pub mod transaction_receipt;
 
 // Re-export builders for convenience
 pub use asset_amount::{AssetAmountBuilder, AssetAmountBuilderError};
@@ -22,3 +23,4 @@ pub use networks::{
 };
 pub use order::OrderBuilder;
 pub use transaction::{TransactionBuilder, TransactionBuilderError};
+pub use transaction_receipt::TransactionReceiptBuilder;

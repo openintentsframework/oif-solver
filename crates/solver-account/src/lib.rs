@@ -35,6 +35,7 @@ pub enum AccountError {
 /// with the solver system. It provides methods for retrieving account addresses
 /// and signing transactions and messages.
 #[async_trait]
+#[cfg_attr(feature = "testing", mockall::automock)]
 pub trait AccountInterface: Send + Sync {
 	/// Returns the configuration schema for this account implementation.
 	///
