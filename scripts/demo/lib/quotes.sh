@@ -730,56 +730,76 @@ quote_accept() {
             print_error "No EIP-712 message found in order"
             return 1
         fi
-        
+
         print_info "Signing EIP-712 order..."
-        
-        # Extract witness data first (needed for signing)
-        local witness=$(echo "$eip712_message" | jq -r '.witness // empty')
-        local witness_expires=$(echo "$witness" | jq -r '.expires // 0')
-        local input_oracle=$(echo "$witness" | jq -r '.inputOracle // "0x0000000000000000000000000000000000000000"')
-        
-        # Sign the EIP-712 message
-        local domain=$(echo "$eip712_message" | jq -r '.signing.domain // empty')
-        local primary_type=$(echo "$eip712_message" | jq -r '.signing.primaryType // "PermitBatchWitnessTransferFrom"')
-        local deadline=$(echo "$eip712_message" | jq -r '.deadline // empty')
-        local nonce=$(echo "$eip712_message" | jq -r '.nonce // empty')
-        local spender=$(echo "$eip712_message" | jq -r '.spender // empty')
-        
-        # Extract the required fields for Permit2 signing
-        local permitted_token=$(echo "$eip712_message" | jq -r '.permitted[0].token // empty')
-        local permitted_amount=$(echo "$eip712_message" | jq -r '.permitted[0].amount // empty')
-        
-        # Convert interop address to standard Ethereum address if needed for signing
-        local standard_permitted_token="$permitted_token"
-        # Interop addresses are longer than standard addresses (42 chars)
-        if [[ ${#permitted_token} -gt 42 ]]; then
-            # This is likely an interop address, convert to standard
-            standard_permitted_token=$(from_uii_address "$permitted_token")
-            print_debug "Converted permitted token from interop to standard: $permitted_token -> $standard_permitted_token"
-        fi
-        
-        # Get origin chain ID from the domain
-        local origin_chain_id=$(echo "$domain" | jq -r '.chainId // 31337')
-        
-        # Build mandate outputs array from witness outputs
-        local mandate_outputs_json=$(echo "$witness" | jq -c '.outputs')
-        
-        # Use the sign_standard_intent function which handles Permit2 properly
-        local signature=$(sign_standard_intent \
-            "$user_key" \
-            "$origin_chain_id" \
-            "$standard_permitted_token" \
-            "$permitted_amount" \
-            "$spender" \
-            "$nonce" \
-            "$deadline" \
-            "$witness_expires" \
-            "$input_oracle" \
-            "$mandate_outputs_json")
-        
-        if [ -z "$signature" ]; then
-            print_error "Failed to sign EIP-712 order"
-            return 1
+
+        # Determine the order type based on primaryType
+        local primary_type=$(echo "$eip712_message" | jq -r '.primaryType // "PermitBatchWitnessTransferFrom"')
+        print_debug "Primary type: $primary_type"
+
+        local signature=""
+
+        if [ "$primary_type" = "BatchCompact" ]; then
+            print_info "Detected BatchCompact order, using compact signing..."
+
+            # Use the new compact signing function
+            signature=$(sign_compact_digest_from_quote "$user_key" "$eip712_message")
+
+            if [ -z "$signature" ]; then
+                print_error "Failed to sign BatchCompact order"
+                return 1
+            fi
+
+        else
+            print_info "Detected Permit2 order, using standard signing..."
+
+            # Extract witness data first (needed for signing)
+            local witness=$(echo "$eip712_message" | jq -r '.witness // empty')
+            local witness_expires=$(echo "$witness" | jq -r '.expires // 0')
+            local input_oracle=$(echo "$witness" | jq -r '.inputOracle // "0x0000000000000000000000000000000000000000"')
+
+            # Sign the EIP-712 message
+            local domain=$(echo "$eip712_message" | jq -r '.signing.domain // empty')
+            local deadline=$(echo "$eip712_message" | jq -r '.deadline // empty')
+            local nonce=$(echo "$eip712_message" | jq -r '.nonce // empty')
+            local spender=$(echo "$eip712_message" | jq -r '.spender // empty')
+
+            # Extract the required fields for Permit2 signing
+            local permitted_token=$(echo "$eip712_message" | jq -r '.permitted[0].token // empty')
+            local permitted_amount=$(echo "$eip712_message" | jq -r '.permitted[0].amount // empty')
+
+            # Convert interop address to standard Ethereum address if needed for signing
+            local standard_permitted_token="$permitted_token"
+            # Interop addresses are longer than standard addresses (42 chars)
+            if [[ ${#permitted_token} -gt 42 ]]; then
+                # This is likely an interop address, convert to standard
+                standard_permitted_token=$(from_uii_address "$permitted_token")
+                print_debug "Converted permitted token from interop to standard: $permitted_token -> $standard_permitted_token"
+            fi
+
+            # Get origin chain ID from the domain
+            local origin_chain_id=$(echo "$domain" | jq -r '.chainId // 31337')
+
+            # Build mandate outputs array from witness outputs
+            local mandate_outputs_json=$(echo "$witness" | jq -c '.outputs')
+
+            # Use the sign_standard_intent function which handles Permit2 properly
+            signature=$(sign_standard_intent \
+                "$user_key" \
+                "$origin_chain_id" \
+                "$standard_permitted_token" \
+                "$permitted_amount" \
+                "$spender" \
+                "$nonce" \
+                "$deadline" \
+                "$witness_expires" \
+                "$input_oracle" \
+                "$mandate_outputs_json")
+
+            if [ -z "$signature" ]; then
+                print_error "Failed to sign EIP-712 order"
+                return 1
+            fi
         fi
         
         print_success "EIP-712 order signed"
