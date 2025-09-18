@@ -259,13 +259,213 @@ impl QuoteGenerator {
 		config: &Config,
 		_params: &serde_json::Value,
 	) -> Result<serde_json::Value, QuoteError> {
+		use alloy_primitives::{hex, U256};
+		use solver_types::utils::bytes20_to_alloy_address;
+		use std::str::FromStr;
+
 		let validity_seconds = self.get_quote_validity_seconds(config);
+		let current_time = chrono::Utc::now().timestamp() as u64;
+		let expires = current_time + validity_seconds;
+		let nonce = current_time; // Use timestamp as nonce for uniqueness
+
+		// Get user address
+		let user_address = request
+			.user
+			.ethereum_address()
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid user address: {}", e)))?;
+
+		// Get TheCompact domain address (arbiter)
+		let domain_address = self.get_lock_domain_address(
+			config,
+			&super::custody::LockKind::TheCompact {
+				params: serde_json::json!({}),
+			},
+		)?;
+		let arbiter_address = domain_address
+			.ethereum_address()
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid domain address: {}", e)))?;
+
+		// Get input chain ID from first available input
+		let input_chain_id = request
+			.available_inputs
+			.first()
+			.ok_or_else(|| QuoteError::InvalidRequest("No available inputs".to_string()))?
+			.asset
+			.ethereum_chain_id()
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input chain ID: {}", e)))?;
+
+		// Get settlement and selected oracle for input chain (similar to permit2 flow)
+		let (_input_settlement, input_selected_oracle) = self
+			.settlement_service
+			.get_any_settlement_for_chain(input_chain_id)
+			.ok_or_else(|| {
+				QuoteError::InvalidRequest(format!(
+					"No settlement available for input chain {}",
+					input_chain_id
+				))
+			})?;
+
+		// Convert inputs to the format expected by TheCompact
+		// For ResourceLock orders, we need to build the proper token IDs and amounts
+		let mut inputs_array = Vec::new();
+		for input in &request.available_inputs {
+			let token_address = input.asset.ethereum_address().map_err(|e| {
+				QuoteError::InvalidRequest(format!("Invalid input token address: {}", e))
+			})?;
+
+			// For now, use a simple allocator tag (12 bytes of zeros)
+			// In a real implementation, this should come from the custody decision
+			let allocator_tag = "0x000000000000000000000000";
+
+			// Build token ID by concatenating allocator tag (12 bytes) + token address (20 bytes)
+			let token_id_hex = format!("{}{:040x}", allocator_tag, token_address);
+			let token_id = U256::from_str(&token_id_hex).map_err(|e| {
+				QuoteError::InvalidRequest(format!("Failed to create token ID: {}", e))
+			})?;
+
+			inputs_array.push(serde_json::json!([
+				token_id.to_string(),
+				input.amount.to_string()
+			]));
+		}
+
+		// Convert outputs to MandateOutput format
+		let mut outputs_array = Vec::new();
+		for output in &request.requested_outputs {
+			let output_token_address = output.asset.ethereum_address().map_err(|e| {
+				QuoteError::InvalidRequest(format!("Invalid output token address: {}", e))
+			})?;
+			let recipient_address = output.receiver.ethereum_address().map_err(|e| {
+				QuoteError::InvalidRequest(format!("Invalid recipient address: {}", e))
+			})?;
+			let output_chain_id = output.asset.ethereum_chain_id().map_err(|e| {
+				QuoteError::InvalidRequest(format!("Invalid output chain ID: {}", e))
+			})?;
+
+			// Get settlement and selected oracle for the output chain (like permit2 flow)
+			let (_output_settlement, output_selected_oracle) = self
+				.settlement_service
+				.get_any_settlement_for_chain(output_chain_id)
+				.ok_or_else(|| {
+					QuoteError::InvalidRequest(format!(
+						"No settlement available for output chain {}",
+						output_chain_id
+					))
+				})?;
+
+			// Get output settler from config (like permit2 flow)
+			let dest_net = config.networks.get(&output_chain_id).ok_or_else(|| {
+				QuoteError::InvalidRequest(format!(
+					"Destination chain {} missing from networks config",
+					output_chain_id
+				))
+			})?;
+			let output_settler = bytes20_to_alloy_address(&dest_net.output_settler_address.0)
+				.map_err(QuoteError::InvalidRequest)?;
+
+			// Convert oracle address (like permit2 flow)
+			let output_oracle =
+				bytes20_to_alloy_address(&output_selected_oracle.0).map_err(|e| {
+					QuoteError::InvalidRequest(format!("Invalid output oracle address: {}", e))
+				})?;
+
+			// Build MandateOutput with proper oracle and settler addresses
+			outputs_array.push(serde_json::json!({
+				"oracle": format!("0x000000000000000000000000{:040x}", output_oracle),
+				"settler": format!("0x000000000000000000000000{:040x}", output_settler),
+				"chainId": output_chain_id.to_string(),
+				"token": format!("0x000000000000000000000000{:040x}", output_token_address),
+				"amount": output.amount.to_string(),
+				"recipient": format!("0x000000000000000000000000{:040x}", recipient_address),
+				"call": output.calldata.as_ref().map(|cd| format!("0x{}", hex::encode(cd))).unwrap_or_else(|| "0x".to_string()),
+				"context": "0x" // Context is typically empty for standard flows
+			}));
+		}
+
+		// Use the selected oracle for input chain as the inputOracle (like permit2 flow)
+		let input_oracle = bytes20_to_alloy_address(&input_selected_oracle.0).map_err(|e| {
+			QuoteError::InvalidRequest(format!("Invalid input oracle address: {}", e))
+		})?;
+
+		// Build the EIP-712 message structure (like permit2 flow)
+		// The scripts will compute the digest from this data
+		let eip712_message = serde_json::json!({
+			"types": {
+				"EIP712Domain": [
+					{"name": "name", "type": "string"},
+					{"name": "version", "type": "string"},
+					{"name": "chainId", "type": "uint256"},
+					{"name": "verifyingContract", "type": "address"}
+				],
+				"BatchCompact": [
+					{"name": "arbiter", "type": "address"},
+					{"name": "sponsor", "type": "address"},
+					{"name": "nonce", "type": "uint256"},
+					{"name": "expires", "type": "uint256"},
+					{"name": "commitments", "type": "Lock[]"},
+					{"name": "mandate", "type": "Mandate"}
+				],
+				"Lock": [
+					{"name": "lockTag", "type": "bytes12"},
+					{"name": "token", "type": "address"},
+					{"name": "amount", "type": "uint256"}
+				],
+				"Mandate": [
+					{"name": "fillDeadline", "type": "uint32"},
+					{"name": "inputOracle", "type": "address"},
+					{"name": "outputs", "type": "MandateOutput[]"}
+				],
+				"MandateOutput": [
+					{"name": "oracle", "type": "bytes32"},
+					{"name": "settler", "type": "bytes32"},
+					{"name": "chainId", "type": "uint256"},
+					{"name": "token", "type": "bytes32"},
+					{"name": "amount", "type": "uint256"},
+					{"name": "recipient", "type": "bytes32"},
+					{"name": "call", "type": "bytes"},
+					{"name": "context", "type": "bytes"}
+				]
+			},
+			"domain": {
+				"name": "TheCompact",
+				"version": "1",
+				"chainId": input_chain_id.to_string(),
+				"verifyingContract": format!("0x{:040x}", arbiter_address)
+			},
+			"primaryType": "BatchCompact",
+			"message": {
+				"arbiter": format!("0x{:040x}", arbiter_address),
+				"sponsor": format!("0x{:040x}", user_address),
+				"nonce": nonce.to_string(),
+				"expires": expires.to_string(),
+				"commitments": inputs_array.iter().map(|input| {
+					let input_array = input.as_array().unwrap();
+					let token_id_str = input_array[0].as_str().unwrap();
+					let amount_str = input_array[1].as_str().unwrap();
+
+					// Extract allocator tag (first 12 bytes) and token address (last 20 bytes) from token ID
+					let token_id = U256::from_str(token_id_str).unwrap();
+					let token_id_bytes = token_id.to_be_bytes::<32>();
+					let lock_tag_hex = format!("0x{}", hex::encode(&token_id_bytes[0..12]));
+					let token_addr_hex = format!("0x{}", hex::encode(&token_id_bytes[12..32]));
+
+					serde_json::json!({
+						"lockTag": lock_tag_hex,
+						"token": token_addr_hex,
+						"amount": amount_str
+					})
+				}).collect::<Vec<_>>(),
+				"mandate": {
+					"fillDeadline": (current_time + validity_seconds).to_string(),
+					"inputOracle": format!("0x{:040x}", input_oracle),
+					"outputs": outputs_array
+				}
+			}
+		});
+
+		// Return message in the same format as permit2 (with eip712 field, scripts will add digest)
 		Ok(serde_json::json!({
-			"user": request.user,
-			"inputs": request.available_inputs,
-			"outputs": request.requested_outputs,
-			"nonce": chrono::Utc::now().timestamp(),
-			"deadline": chrono::Utc::now().timestamp() + validity_seconds as i64
+			"eip712": eip712_message
 		}))
 	}
 
