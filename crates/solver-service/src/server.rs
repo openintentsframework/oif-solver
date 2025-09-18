@@ -451,7 +451,10 @@ async fn validate_intent_request(
 	});
 
 	// EIP-712 signature validation for ResourceLock orders
-	if state.signature_validation.requires_signature_validation(standard, &intent.lock_type) {
+	if state
+		.signature_validation
+		.requires_signature_validation(standard, &intent.lock_type)
+	{
 		state
 			.signature_validation
 			.validate_signature(
