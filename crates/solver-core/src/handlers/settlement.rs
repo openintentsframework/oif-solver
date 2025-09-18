@@ -102,9 +102,10 @@ impl SettlementHandler {
 		})?;
 
 		// Get the destination chain for the fill
-		let chain_id = *order
-			.output_chain_ids
+		let chain_id = order
+			.output_chains
 			.first()
+			.map(|c| c.chain_id)
 			.ok_or_else(|| SettlementError::Service("No output chains in order".to_string()))?;
 
 		// Get the fill receipt

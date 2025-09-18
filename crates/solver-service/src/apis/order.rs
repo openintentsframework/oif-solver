@@ -150,9 +150,9 @@ async fn convert_eip7683_order_to_response(
 
 	// Get the input chain ID (use first one if multiple)
 	let input_chain_id = order
-		.input_chain_ids
+		.input_chains
 		.first()
-		.copied()
+		.map(|c| c.chain_id)
 		.ok_or_else(|| GetOrderError::Internal("No input chain ID found".to_string()))?;
 
 	// Convert input token to InteropAddress format
@@ -206,9 +206,9 @@ async fn convert_eip7683_order_to_response(
 
 	// Get the output chain ID (use first one if multiple)
 	let output_chain_id = order
-		.output_chain_ids
+		.output_chains
 		.first()
-		.copied()
+		.map(|c| c.chain_id)
 		.ok_or_else(|| GetOrderError::Internal("No output chain ID found".to_string()))?;
 
 	// Convert output token to InteropAddress format

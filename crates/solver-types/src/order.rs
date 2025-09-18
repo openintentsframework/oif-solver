@@ -15,6 +15,15 @@ use crate::{
 	TransactionType,
 };
 
+/// Information about a chain and its associated settler contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainSettlerInfo {
+	/// The chain ID
+	pub chain_id: u64,
+	/// The settler contract address on this chain
+	pub settler_address: Address,
+}
+
 /// Callback function type for computing order IDs.
 /// Takes chain_id and transaction data (settler_address + calldata), returns the order ID bytes.
 pub type OrderIdCallback = Box<
@@ -46,14 +55,14 @@ pub struct Order {
 	/// Quote ID associated with this order.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub quote_id: Option<String>,
-	/// Chain IDs where input assets are located.
+	/// Input chains with their associated settler contracts.
 	/// For most orders this will be a single chain, but could be multiple for complex orders.
 	#[serde(default)]
-	pub input_chain_ids: Vec<u64>,
-	/// Chain IDs where output assets will be delivered.
+	pub input_chains: Vec<ChainSettlerInfo>,
+	/// Output chains with their associated settler contracts.
 	/// Can be multiple chains for orders that split outputs across chains.
 	#[serde(default)]
-	pub output_chain_ids: Vec<u64>,
+	pub output_chains: Vec<ChainSettlerInfo>,
 	/// Execution parameters when order is ready for execution.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub execution_params: Option<ExecutionParams>,
@@ -226,11 +235,11 @@ impl fmt::Display for OrderStatus {
 /// Implementation of CostEstimatable for Order
 impl CostEstimatable for Order {
 	fn input_chain_ids(&self) -> Vec<u64> {
-		self.input_chain_ids.clone()
+		self.input_chains.iter().map(|c| c.chain_id).collect()
 	}
 
 	fn output_chain_ids(&self) -> Vec<u64> {
-		self.output_chain_ids.clone()
+		self.output_chains.iter().map(|c| c.chain_id).collect()
 	}
 
 	fn lock_type(&self) -> Option<&str> {

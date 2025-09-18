@@ -771,6 +771,25 @@ impl crate::CostEstimatable for Quote {
 			"estimation_only": true,
 		});
 
+		// Create ChainSettlerInfo for inputs and outputs with dummy addresses
+		let input_chains: Vec<crate::order::ChainSettlerInfo> = self
+			.input_chain_ids()
+			.into_iter()
+			.map(|chain_id| crate::order::ChainSettlerInfo {
+				chain_id,
+				settler_address: crate::Address(vec![0u8; 20]), // Dummy address for estimation
+			})
+			.collect();
+
+		let output_chains: Vec<crate::order::ChainSettlerInfo> = self
+			.output_chain_ids()
+			.into_iter()
+			.map(|chain_id| crate::order::ChainSettlerInfo {
+				chain_id,
+				settler_address: crate::Address(vec![0u8; 20]), // Dummy address for estimation
+			})
+			.collect();
+
 		crate::Order {
 			// Use a clearly marked estimation-only ID
 			id: format!("ESTIMATION_ONLY_quote_{}", self.quote_id),
@@ -781,8 +800,8 @@ impl crate::CostEstimatable for Quote {
 			data,
 			solver_address: crate::Address(vec![0u8; 20]), // Dummy address
 			quote_id: Some(self.quote_id.clone()),
-			input_chain_ids: self.input_chain_ids(),
-			output_chain_ids: self.output_chain_ids(),
+			input_chains,
+			output_chains,
 			execution_params: None,
 			prepare_tx_hash: None,
 			fill_tx_hash: None,

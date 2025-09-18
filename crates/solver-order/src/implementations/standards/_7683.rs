@@ -207,6 +207,7 @@ impl OrderInterface for Eip7683OrderImpl {
 		intent: &Intent,
 		solver_address: &Address,
 	) -> Result<Order, OrderError> {
+		// TODO: See if we can somehow re-use logic from `validate_and_create_order`
 		if intent.standard != "eip7683" {
 			return Err(OrderError::ValidationFailed(
 				"Not an EIP-7683 order".to_string(),
@@ -322,13 +323,46 @@ impl OrderInterface for Eip7683OrderImpl {
 			}
 		}
 
-		// Extract chain IDs
-		let input_chain_ids = vec![origin_chain];
-		let output_chain_ids = order_data
-			.outputs
-			.iter()
-			.map(|output| output.chain_id.to::<u64>())
-			.collect::<Vec<_>>();
+		// Get input settler address for the origin chain
+		let input_network = self.networks.get(&origin_chain).ok_or_else(|| {
+			OrderError::ValidationFailed(format!("Chain {} not configured", origin_chain))
+		})?;
+
+		// Determine the correct input settler address based on lock type
+		let is_compact = order_data
+			.lock_type
+			.as_ref()
+			.map(|lt| *lt == LockType::ResourceLock)
+			.unwrap_or(false);
+
+		let input_settler_address = if is_compact {
+			// Use compact-specific address if available, otherwise fall back to regular address
+			input_network
+				.input_settler_compact_address
+				.clone()
+				.unwrap_or_else(|| input_network.input_settler_address.clone())
+		} else {
+			input_network.input_settler_address.clone()
+		};
+
+		let input_chains = vec![solver_types::order::ChainSettlerInfo {
+			chain_id: origin_chain,
+			settler_address: input_settler_address,
+		}];
+
+		// Get output settler addresses for each output chain
+		let mut output_chains = Vec::new();
+		for output in &order_data.outputs {
+			let output_chain = output.chain_id.to::<u64>();
+			let output_network = self.networks.get(&output_chain).ok_or_else(|| {
+				OrderError::ValidationFailed(format!("Chain {} not configured", output_chain))
+			})?;
+
+			output_chains.push(solver_types::order::ChainSettlerInfo {
+				chain_id: output_chain,
+				settler_address: output_network.output_settler_address.clone(),
+			});
+		}
 
 		// Create order
 		Ok(Order {
@@ -339,8 +373,8 @@ impl OrderInterface for Eip7683OrderImpl {
 				.map_err(|e| OrderError::ValidationFailed(format!("Failed to serialize: {}", e)))?,
 			solver_address: solver_address.clone(),
 			quote_id: intent.quote_id.clone(),
-			input_chain_ids,
-			output_chain_ids,
+			input_chains,
+			output_chains,
 			updated_at: std::time::SystemTime::now()
 				.duration_since(std::time::UNIX_EPOCH)
 				.map(|d| d.as_secs())
@@ -430,28 +464,16 @@ impl OrderInterface for Eip7683OrderImpl {
 		}
 		.abi_encode();
 
-		// Get the input settler address for the order's origin chain
-		let origin_chain_id = *order
-			.input_chain_ids
+		let input_chain = order
+			.input_chains
 			.first()
 			.ok_or_else(|| OrderError::ValidationFailed("No input chains in order".into()))?;
-		let input_settler_address = self
-			.networks
-			.get(&origin_chain_id)
-			.ok_or_else(|| {
-				OrderError::ValidationFailed(format!(
-					"Chain ID {} not found in networks configuration",
-					order_data.origin_chain_id
-				))
-			})?
-			.input_settler_address
-			.clone();
 
 		Ok(Some(Transaction {
-			to: Some(input_settler_address),
+			to: Some(input_chain.settler_address.clone()),
 			data: open_for_data,
 			value: U256::ZERO,
-			chain_id: origin_chain_id,
+			chain_id: input_chain.chain_id,
 			nonce: None,
 			gas_limit: order_data.gas_limit_overrides.prepare_gas_limit,
 			gas_price: None,
@@ -486,6 +508,8 @@ impl OrderInterface for Eip7683OrderImpl {
 		order: &Order,
 		_params: &ExecutionParams,
 	) -> Result<Transaction, OrderError> {
+		// TODO: Once we merge https://github.com/openintentsframework/oif-solver/pull/155
+		// 		 we should use `order.parse_order_data()`
 		let order_data: Eip7683OrderData =
 			serde_json::from_value(order.data.clone()).map_err(|e| {
 				OrderError::ValidationFailed(format!("Failed to parse order data: {}", e))
@@ -502,19 +526,19 @@ impl OrderInterface for Eip7683OrderImpl {
 				OrderError::ValidationFailed("No cross-chain output found".to_string())
 			})?;
 
-		// Get the output settler address for the destination chain
+		// Get the output settler address from the order
 		let dest_chain_id = output.chain_id.to::<u64>();
-		let output_settler_address = self
-			.networks
-			.get(&dest_chain_id)
+		let output_chain = order
+			.output_chains
+			.iter()
+			.find(|c| c.chain_id == dest_chain_id)
 			.ok_or_else(|| {
 				OrderError::ValidationFailed(format!(
-					"Chain ID {} not found in networks configuration",
+					"Chain ID {} not found in order output chains",
 					dest_chain_id
 				))
-			})?
-			.output_settler_address
-			.clone();
+			})?;
+		let output_settler_address = output_chain.settler_address.clone();
 
 		// Create the MandateOutput struct for the fill call
 		let output_struct = MandateOutput {
@@ -588,6 +612,8 @@ impl OrderInterface for Eip7683OrderImpl {
 		order: &Order,
 		fill_proof: &FillProof,
 	) -> Result<Transaction, OrderError> {
+		// TODO: Once we merge https://github.com/openintentsframework/oif-solver/pull/155
+		// 		 we should use `order.parse_order_data()`
 		let order_data: Eip7683OrderData =
 			serde_json::from_value(order.data.clone()).map_err(|e| {
 				OrderError::ValidationFailed(format!("Failed to parse order data: {}", e))
@@ -630,19 +656,30 @@ impl OrderInterface for Eip7683OrderImpl {
 				let settler_bytes32 = {
 					let mut bytes32 = [0u8; 32];
 					let output_chain_id = output.chain_id.to::<u64>();
-					let network = self.networks.get(&output_chain_id).ok_or_else(|| {
-						OrderError::ValidationFailed(format!(
-							"Chain ID {} not found in networks configuration",
-							output.chain_id
-						))
-					})?;
 
+					// Get settler address from the order
 					let settler_address = if output.chain_id == order_data.origin_chain_id {
 						// Use input settler for origin chain
-						&network.input_settler_address
+						order
+							.input_chains
+							.first()
+							.map(|c| &c.settler_address)
+							.ok_or_else(|| {
+								OrderError::ValidationFailed("No input chains in order".to_string())
+							})?
 					} else {
-						// Use output settler for other chains
-						&network.output_settler_address
+						// Use output settler for the specific output chain
+						order
+							.output_chains
+							.iter()
+							.find(|c| c.chain_id == output_chain_id)
+							.map(|c| &c.settler_address)
+							.ok_or_else(|| {
+								OrderError::ValidationFailed(format!(
+									"Chain ID {} not found in order output chains",
+									output_chain_id
+								))
+							})?
 					};
 
 					bytes32[12..32].copy_from_slice(&settler_address.0);
@@ -734,37 +771,17 @@ impl OrderInterface for Eip7683OrderImpl {
 			}
 		};
 
-		// Get the input settler address for the order's origin chain
-		let origin_chain_id = *order
-			.input_chain_ids
+		// Get the input chain info directly from the order (already has the correct settler address)
+		let input_chain = order
+			.input_chains
 			.first()
 			.ok_or_else(|| OrderError::ValidationFailed("No input chains in order".into()))?;
-		let network_cfg = self.networks.get(&origin_chain_id).ok_or_else(|| {
-			OrderError::ValidationFailed(format!(
-				"Chain ID {} not found in networks configuration",
-				order_data.origin_chain_id
-			))
-		})?;
-		let is_compact = serde_json::from_value::<Eip7683OrderData>(order.data.clone())
-			.ok()
-			.and_then(|d| d.lock_type)
-			.map(|lt| lt == LockType::ResourceLock)
-			.unwrap_or(false);
-		let input_settler_address = if is_compact {
-			// Prefer compact-specific address if provided
-			network_cfg
-				.input_settler_compact_address
-				.clone()
-				.unwrap_or_else(|| network_cfg.input_settler_address.clone())
-		} else {
-			network_cfg.input_settler_address.clone()
-		};
 
 		Ok(Transaction {
-			to: Some(input_settler_address),
+			to: Some(input_chain.settler_address.clone()),
 			data: call_data,
 			value: U256::ZERO,
-			chain_id: origin_chain_id,
+			chain_id: input_chain.chain_id,
 			nonce: None,
 			gas_limit: order_data.gas_limit_overrides.settle_gas_limit,
 			gas_price: None,
@@ -853,13 +870,42 @@ impl OrderInterface for Eip7683OrderImpl {
 		// Convert order ID bytes to hex string
 		let order_id = alloy_primitives::hex::encode_prefixed(&order_id_bytes);
 
-		// Extract chain IDs from the order
-		let input_chain_ids = vec![standard_order.originChainId.to::<u64>()];
-		let output_chain_ids: Vec<u64> = standard_order
-			.outputs
-			.iter()
-			.map(|output| output.chainId.to::<u64>())
-			.collect();
+		// Extract chain info from the order
+		let origin_chain_id = standard_order.originChainId.to::<u64>();
+
+		// Get input network and determine settler address based on lock type
+		let input_network = self.networks.get(&origin_chain_id).ok_or_else(|| {
+			OrderError::ValidationFailed(format!("Chain {} not configured", origin_chain_id))
+		})?;
+
+		let is_compact = lock_type == LockType::ResourceLock;
+		let input_settler_address = if is_compact {
+			input_network
+				.input_settler_compact_address
+				.clone()
+				.unwrap_or_else(|| input_network.input_settler_address.clone())
+		} else {
+			input_network.input_settler_address.clone()
+		};
+
+		let input_chains = vec![solver_types::order::ChainSettlerInfo {
+			chain_id: origin_chain_id,
+			settler_address: input_settler_address,
+		}];
+
+		// Build output chains with settler addresses
+		let mut output_chains = Vec::new();
+		for output in &standard_order.outputs {
+			let output_chain_id = output.chainId.to::<u64>();
+			let output_network = self.networks.get(&output_chain_id).ok_or_else(|| {
+				OrderError::ValidationFailed(format!("Chain {} not configured", output_chain_id))
+			})?;
+
+			output_chains.push(solver_types::order::ChainSettlerInfo {
+				chain_id: output_chain_id,
+				settler_address: output_network.output_settler_address.clone(),
+			});
+		}
 
 		// Convert StandardOrder to Eip7683OrderData for serialization
 		let mut order_data = Eip7683OrderData::from(standard_order.clone());
@@ -878,8 +924,8 @@ impl OrderInterface for Eip7683OrderImpl {
 			})?,
 			solver_address: solver_address.clone(),
 			quote_id: None,
-			input_chain_ids,
-			output_chain_ids,
+			input_chains,
+			output_chains,
 			execution_params: None,
 			prepare_tx_hash: None,
 			fill_tx_hash: None,
