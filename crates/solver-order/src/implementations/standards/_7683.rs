@@ -40,6 +40,7 @@ use solver_types::{
 ///
 /// * `networks` - Networks configuration containing settler addresses for each chain
 /// * `oracle_routes` - Oracle routes for validation of input/output oracle compatibility
+#[derive(Debug)]
 pub struct Eip7683OrderImpl {
 	/// Networks configuration for dynamic settler address lookups.
 	networks: NetworksConfig,
@@ -110,7 +111,6 @@ impl Eip7683OrderImpl {
 	///
 	/// * `networks` - Networks configuration with settler addresses
 	/// * `oracle_routes` - Oracle routes for validation
-	/// * `delivery` - Delivery service for blockchain interactions
 	pub fn new(networks: NetworksConfig, oracle_routes: OracleRoutes) -> Result<Self, OrderError> {
 		// Validate that networks config has at least 2 networks
 		if networks.len() < 2 {
@@ -465,8 +465,6 @@ impl OrderInterface for Eip7683OrderImpl {
 	/// Creates a transaction that calls the destination settler's `fill()` function
 	/// with the appropriate order data and solver information.
 	///
-	/// For ResourceLock orders, validates the signature before generating the fill transaction.
-	///
 	/// # Arguments
 	///
 	/// * `order` - The order to fill
@@ -483,7 +481,6 @@ impl OrderInterface for Eip7683OrderImpl {
 	/// - Order is a same-chain order (not supported)
 	/// - No output exists for the destination chain
 	/// - Address parsing fails
-	/// - Signature validation fails for ResourceLock orders
 	async fn generate_fill_transaction(
 		&self,
 		order: &Order,
@@ -903,8 +900,6 @@ impl OrderInterface for Eip7683OrderImpl {
 ///
 /// * `config` - TOML configuration value (may be empty)
 /// * `networks` - Networks configuration with settler addresses
-/// * `oracle_routes` - Oracle routes for validation
-/// * `delivery` - Delivery service for blockchain interactions
 ///
 /// # Returns
 ///
@@ -1016,9 +1011,10 @@ mod tests {
 
 		let result = Eip7683OrderImpl::new(networks, oracle_routes);
 		assert!(result.is_err());
-		if let Err(e) = result {
-			assert!(e.to_string().contains("At least 2 networks"));
-		}
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("At least 2 networks"));
 	}
 
 	#[tokio::test]
@@ -1328,5 +1324,34 @@ mod tests {
 
 		assert!(LockType::Permit2Escrow.is_escrow());
 		assert!(!LockType::ResourceLock.is_escrow());
+	}
+
+	#[tokio::test]
+	async fn test_generate_fill_transaction_no_cross_chain_output() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut order_data = create_test_order_data();
+		// Make the output same-chain
+		order_data.outputs[0].chain_id = U256::from(1);
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_solver_address(Address(vec![99u8; 20]))
+			.with_quote_id(Some("test-quote".to_string()))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![1])
+			.build();
+		let params = ExecutionParams {
+			gas_price: U256::ZERO,
+			priority_fee: None,
+		};
+
+		let result = order_impl.generate_fill_transaction(&order, &params).await;
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("No cross-chain output found"));
 	}
 }
