@@ -26,7 +26,7 @@ pub enum LockType {
 	Eip3009Escrow = 2,
 	/// Resource lock mechanism (The Compact)
 	/// Uses TheCompact protocol for resource locking
-	#[serde(rename = "resource_lock")]
+	#[serde(rename = "compact_resource_lock")]
 	ResourceLock = 3,
 }
 
@@ -61,7 +61,7 @@ impl LockType {
 		match self {
 			LockType::Permit2Escrow => "permit2_escrow",
 			LockType::Eip3009Escrow => "eip3009_escrow",
-			LockType::ResourceLock => "resource_lock",
+			LockType::ResourceLock => "compact_resource_lock",
 		}
 	}
 }
@@ -74,7 +74,7 @@ impl FromStr for LockType {
 			// String representations
 			"permit2_escrow" => Ok(LockType::Permit2Escrow),
 			"eip3009_escrow" => Ok(LockType::Eip3009Escrow),
-			"resource_lock" => Ok(LockType::ResourceLock),
+			"compact_resource_lock" => Ok(LockType::ResourceLock),
 			// Numeric string representations
 			"1" => Ok(LockType::Permit2Escrow),
 			"2" => Ok(LockType::Eip3009Escrow),
@@ -252,7 +252,7 @@ mod tests {
 
 		let resource_lock = LockType::ResourceLock;
 		let json = serde_json::to_string(&resource_lock).unwrap();
-		assert_eq!(json, "\"resource_lock\"");
+		assert_eq!(json, "\"compact_resource_lock\"");
 	}
 
 	#[test]
@@ -263,7 +263,7 @@ mod tests {
 		let eip3009: LockType = serde_json::from_str("\"eip3009_escrow\"").unwrap();
 		assert_eq!(eip3009, LockType::Eip3009Escrow);
 
-		let resource_lock: LockType = serde_json::from_str("\"resource_lock\"").unwrap();
+		let resource_lock: LockType = serde_json::from_str("\"compact_resource_lock\"").unwrap();
 		assert_eq!(resource_lock, LockType::ResourceLock);
 	}
 
