@@ -69,9 +69,11 @@ show_help() {
     echo "  "
     echo "  # Offchain intent submission (via solver API):"
     echo "  oif-demo intent build escrow permit2 31337 31338 TokenA TokenB          Build escrow intent with TokenA→TokenB"
+    echo "  oif-demo intent build compact 31337 31338 TokenA TokenB                 Build compact intent with TokenA→TokenB"
     echo "  oif-demo intent submit demo-output/post_intent.req.json                 Submit intent to solver API"
     echo "  oif-demo intent test escrow permit2 A2B                                 Build and submit escrow intent TokenA→TokenB"
     echo "  oif-demo intent test escrow eip3009 A2B                                 Build and submit EIP-3009 intent TokenA→TokenB"
+    echo "  oif-demo intent test compact A2B                                        Build and submit compact intent TokenA→TokenB"
     echo "  "
     echo "  # Onchain intent submission (direct to blockchain):"
     echo "  oif-demo intent build --onchain escrow 31337 31338 TokenA TokenB        Build intent for onchain submission"
@@ -80,7 +82,8 @@ show_help() {
     echo "  "
     echo "  # Quote operations:"
     echo "  oif-demo quote get demo-output/get_quote.req.json                       Request quote for intent"
-    echo "  oif-demo quote test escrow permit2 A2B                                  Build intent, get quote, and accept"
+    echo "  oif-demo quote test escrow permit2 A2B                                  Build escrow intent, get quote, and accept"
+    echo "  oif-demo quote test compact A2B                                         Build compact intent, get quote, and accept"
     echo "  "
     echo "  # JWT authentication:"
     echo "  oif-demo jwt register my-client read-orders,create-orders               Register client and get JWT token"
@@ -195,7 +198,8 @@ handle_intent() {
         *)
             print_error "Unknown intent action: $action"
             print_info "Usage: oif-demo intent {build|submit|test}"
-            print_info "  intent test <escrow|compact> <permit2> <A2A|A2B|B2A|B2B>"
+            print_info "  intent test escrow <permit2|eip3009> <A2A|A2B|B2A|B2B>"
+            print_info "  intent test compact <A2A|A2B|B2A|B2B>"
             exit 1
             ;;
     esac
@@ -236,7 +240,8 @@ handle_quote() {
         *)
             print_error "Unknown quote action: $action"
             print_info "Usage: oif-demo quote {get|accept|test}"
-            print_info "  quote test <escrow|compact> <permit2> <A2A|A2B|B2A|B2B>"
+            print_info "  quote test escrow <permit2|eip3009> <A2A|A2B|B2A|B2B>"
+            print_info "  quote test compact <A2A|A2B|B2A|B2B>"
             exit 1
             ;;
     esac

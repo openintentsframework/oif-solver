@@ -123,7 +123,7 @@ impl QuoteGenerator {
 		};
 		let eta = self.calculate_eta(&request.preference);
 		let lock_type = match custody_decision {
-			CustodyDecision::ResourceLock { .. } => "resource_lock".to_string(),
+			CustodyDecision::ResourceLock { .. } => "compact_resource_lock".to_string(),
 			CustodyDecision::Escrow { kind } => match kind {
 				EscrowKind::Permit2 => "permit2_escrow".to_string(),
 				EscrowKind::Erc3009 => "erc3009_escrow".to_string(),

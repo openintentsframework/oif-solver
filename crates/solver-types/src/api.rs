@@ -69,7 +69,7 @@ where
 				match value {
 					"permit2_escrow" | "Permit2Escrow" => Ok(LockType::Permit2Escrow),
 					"eip3009_escrow" | "Eip3009Escrow" => Ok(LockType::Eip3009Escrow),
-					"resource_lock" | "ResourceLock" => Ok(LockType::ResourceLock),
+					"compact_resource_lock" | "ResourceLock" => Ok(LockType::ResourceLock),
 					_ => Err(Error::custom("Invalid LockType string")),
 				}
 			}
@@ -170,6 +170,7 @@ pub struct Lock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LockKind {
+	#[serde(alias = "TheCompact", alias = "the_compact")]
 	TheCompact,
 }
 
