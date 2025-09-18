@@ -361,7 +361,7 @@ async fn handle_order(
 	}
 
 	// Order meets profitability requirements
-	tracing::info!(
+	tracing::debug!(
 		"Order profitability validated: margin={:.2}% (min={:.2}%), total_cost=${}",
 		actual_profit_margin,
 		state.config.solver.min_profitability_pct,
