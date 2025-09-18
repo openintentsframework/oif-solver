@@ -11,3 +11,9 @@ claim = 121995
 open = 141899
 fill = 90027 
 claim = 75573
+
+[gas.flows.eip3009_escrow]
+# Gas units captured
+open = 130254
+fill = 77298 
+claim = 21000

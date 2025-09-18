@@ -11,3 +11,9 @@ claim = 121995
 open = 143116
 fill = 76068 
 claim = 59953
+
+[gas.flows.eip3009_escrow]
+# Gas units captured by scripts/e2e/estimate_gas_eip3009_escrow.sh on local anvil
+open = 130254
+fill = 77298 
+claim = 21000
