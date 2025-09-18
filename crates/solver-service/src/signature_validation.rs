@@ -21,6 +21,9 @@ use std::sync::Arc;
 /// Trait for validating signatures for specific order standards.
 #[async_trait]
 pub trait OrderSignatureValidator: Send + Sync {
+	/// Checks if signature validation is required for the given lock type.
+	fn requires_signature_validation(&self, lock_type: &LockType) -> bool;
+
 	/// Validates an EIP-712 signature for this standard.
 	async fn validate_signature(
 		&self,
@@ -35,6 +38,11 @@ pub struct Eip7683SignatureValidator;
 
 #[async_trait]
 impl OrderSignatureValidator for Eip7683SignatureValidator {
+	/// For EIP-7683, signature validation is required only for ResourceLock orders.
+	fn requires_signature_validation(&self, lock_type: &LockType) -> bool {
+		matches!(lock_type, LockType::ResourceLock)
+	}
+
 	async fn validate_signature(
 		&self,
 		intent: &IntentRequest,
@@ -152,9 +160,13 @@ impl SignatureValidationService {
 			.await
 	}
 
-	/// Checks if signature validation is required for the given lock type.
-	pub fn requires_signature_validation(lock_type: &LockType) -> bool {
-		matches!(lock_type, LockType::ResourceLock)
+	/// Checks if signature validation is required for the given standard and lock type.
+	pub fn requires_signature_validation(&self, standard: &str, lock_type: &LockType) -> bool {
+		if let Some(validator) = self.validators.get(standard) {
+			validator.requires_signature_validation(lock_type)
+		} else {
+			false
+		}
 	}
 }
 
