@@ -6,6 +6,7 @@
 //! and modular design for building solver instances.
 
 pub mod builder;
+pub mod cost;
 pub mod engine;
 pub mod handlers;
 pub mod monitoring;
@@ -14,6 +15,7 @@ pub mod state;
 
 // Re-export main types
 pub use builder::{BuilderError, SolverBuilder, SolverFactories};
+pub use cost::profitability::ProfitabilityService;
 pub use engine::event_bus::EventBus;
 pub use engine::{EngineError, SolverEngine};
 
