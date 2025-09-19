@@ -172,7 +172,6 @@ impl TokenManager {
 		Ok(())
 	}
 
-	/// Submits an ERC20 approval transaction.
 	///
 	/// Creates and submits a transaction to approve the specified spender to transfer
 	/// the given amount of tokens on behalf of the solver.

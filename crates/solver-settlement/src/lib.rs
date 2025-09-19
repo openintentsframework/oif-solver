@@ -364,17 +364,13 @@ impl SettlementService {
 		&self,
 		order: &Order,
 	) -> Result<&dyn SettlementInterface, SettlementError> {
-		// Parse order data to get input oracle
-		// TODO: Once we merge https://github.com/openintentsframework/oif-solver/pull/155
-		// 		 we should use `order.parse_order_data()` and add input oracle fetching
-		let order_data: solver_types::Eip7683OrderData =
-			serde_json::from_value(order.data.to_owned()).map_err(|e| {
-				SettlementError::ValidationFailed(format!("Invalid order data: {}", e))
-			})?;
-
-		let input_oracle = solver_types::utils::parse_address(&order_data.input_oracle)
+		let order_data = order
+			.parse_order_data()
+			.map_err(|e| SettlementError::ValidationFailed(e.to_string()))?;
+		let input_oracle_str = order_data.input_oracle();
+		let input_oracle = solver_types::utils::parse_address(&input_oracle_str)
 			.map_err(SettlementError::ValidationFailed)?;
-		let origin_chain = order_data.origin_chain_id.to::<u64>();
+		let origin_chain = order_data.origin_chain_id();
 
 		// Find settlement by input oracle
 		self.get_settlement_for_oracle(origin_chain, &input_oracle, true)
