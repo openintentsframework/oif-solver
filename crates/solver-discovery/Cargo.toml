@@ -19,8 +19,10 @@ axum = "0.8"
 futures = "0.3"
 hex = "0.4"
 reqwest = "0.12"
+rust_decimal = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+solver-pricing = { path = "../solver-pricing" }
 solver-types = { path = "../solver-types", features = ["oif-interfaces"] }
 thiserror = "1.0"
 tokio = { version = "1.0", features = ["sync", "rt-multi-thread"] }

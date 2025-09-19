@@ -515,6 +515,7 @@ impl SolverEngine {
 		&self.pricing
 	}
 
+
 	/// Helper method to spawn handler tasks with semaphore-based concurrency control.
 	///
 	/// This method:
