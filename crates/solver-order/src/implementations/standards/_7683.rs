@@ -903,7 +903,7 @@ mod tests {
 			Eip7683OrderDataBuilder, IntentBuilder, NetworkConfigBuilder, NetworksConfigBuilder,
 			OrderBuilder,
 		},
-		Address, ExecutionParams, FillProof, Intent, NetworksConfig, OrderStatus, TransactionHash,
+		Address, ExecutionParams, FillProof, Intent, NetworksConfig, TransactionHash,
 	};
 	use std::collections::HashMap;
 
