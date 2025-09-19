@@ -301,8 +301,6 @@ impl OrderInterface for Eip7683OrderImpl {
 		order: &Order,
 		_params: &ExecutionParams,
 	) -> Result<Transaction, OrderError> {
-		// TODO: Once we merge https://github.com/openintentsframework/oif-solver/pull/155
-		// 		 we should use `order.parse_order_data()`
 		let order_data: Eip7683OrderData =
 			serde_json::from_value(order.data.clone()).map_err(|e| {
 				OrderError::ValidationFailed(format!("Failed to parse order data: {}", e))
@@ -562,7 +560,7 @@ impl OrderInterface for Eip7683OrderImpl {
 			}
 		};
 
-		// Get the input chain info directly from the order (already has the correct settler address)
+		// Get the input chain info directly from the order
 		let input_chain = order
 			.input_chains
 			.first()
