@@ -123,6 +123,7 @@ pub enum ApiErrorType {
 	MissingChainId,
 	GasEstimationFailed,
 	CostCalculationFailed,
+	InsufficientProfitability,
 
 	// Transaction generation errors
 	SerializationFailed,
@@ -306,154 +307,15 @@ impl IntentRequest {
 		quote: &Quote,
 		signature: &str,
 	) -> Result<Self, Box<dyn std::error::Error>> {
-		use crate::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
-		use crate::standards::eip7930::InteropAddress;
-		use crate::utils::parse_bytes32_from_hex;
-		use alloy_primitives::{Address, Bytes, U256};
+		use crate::standards::eip7683::interfaces::StandardOrder;
+		use alloy_primitives::Bytes;
 		use alloy_sol_types::SolType;
+		use std::convert::TryFrom;
 
-		// Extract user address from the first available input
-		let user_str = &quote
-			.details
-			.available_inputs
-			.first()
-			.ok_or("Quote must have at least one available input")?
-			.user;
-		let interop_address = InteropAddress::from_hex(&user_str.to_string())?;
-		let user_address = interop_address.ethereum_address()?;
+		let sol_order = StandardOrder::try_from(quote)?;
 
-		// Extract order data from quote
-		let quote_order = quote
-			.orders
-			.first()
-			.ok_or("Quote must contain at least one order")?;
-		let message_data = quote_order
-			.message
-			.as_object()
-			.ok_or("Invalid EIP-712 message structure")?;
-		let eip712_data = message_data
-			.get("eip712")
-			.and_then(|e| e.as_object())
-			.ok_or("Missing 'eip712' object in message")?;
-
-		// Extract nonce
-		let nonce_str = eip712_data
-			.get("nonce")
-			.and_then(|n| n.as_str())
-			.ok_or("Missing nonce in EIP-712 data")?;
-		let nonce = U256::from_str_radix(nonce_str, 10)?;
-
-		// Extract witness data
-		let witness = eip712_data
-			.get("witness")
-			.and_then(|w| w.as_object())
-			.ok_or("Missing 'witness' object in EIP-712 message")?;
-
-		// Get origin chain ID
-		let origin_chain_id = U256::from(interop_address.ethereum_chain_id()?);
-
-		// Extract timing data
-		let expires = witness
-			.get("expires")
-			.and_then(|e| e.as_u64())
-			.unwrap_or(quote.valid_until.unwrap_or(0)) as u32;
-		let fill_deadline = expires;
-
-		// Extract input oracle
-		let input_oracle_str = witness
-			.get("inputOracle")
-			.and_then(|o| o.as_str())
-			.ok_or("Missing 'inputOracle' in witness data")?;
-		let input_oracle =
-			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
-
-		// Extract input data from permitted array
-		let permitted = eip712_data
-			.get("permitted")
-			.and_then(|p| p.as_array())
-			.ok_or("Missing permitted array in EIP-712 data")?;
-		let first_permitted = permitted
-			.first()
-			.ok_or("Empty permitted array in EIP-712 data")?;
-
-		let input_amount_str = first_permitted
-			.get("amount")
-			.and_then(|a| a.as_str())
-			.ok_or("Missing amount in permitted token")?;
-		let input_amount = U256::from_str_radix(input_amount_str, 10)?;
-
-		let input_token_str = first_permitted
-			.get("token")
-			.and_then(|t| t.as_str())
-			.ok_or("Missing token in permitted array")?;
-		let input_token =
-			Address::from_slice(&hex::decode(input_token_str.trim_start_matches("0x"))?);
-
-		// Convert input token address to U256
-		let mut token_bytes = [0u8; 32];
-		token_bytes[12..32].copy_from_slice(&input_token.0 .0);
-		let input_token_u256 = U256::from_be_bytes(token_bytes);
-		let inputs = vec![[input_token_u256, input_amount]];
-
-		// Extract outputs from witness
-		let default_outputs = Vec::new();
-		let witness_outputs = witness
-			.get("outputs")
-			.and_then(|o| o.as_array())
-			.unwrap_or(&default_outputs);
-
-		// Parse outputs
-		let mut sol_outputs = Vec::new();
-		for output_item in witness_outputs {
-			if let Some(output_obj) = output_item.as_object() {
-				let chain_id = output_obj
-					.get("chainId")
-					.and_then(|c| c.as_u64())
-					.unwrap_or(0);
-				let amount_str = output_obj
-					.get("amount")
-					.and_then(|a| a.as_str())
-					.unwrap_or("0");
-				let token_str = output_obj.get("token").and_then(|t| t.as_str()).unwrap();
-				let recipient_str = output_obj
-					.get("recipient")
-					.and_then(|r| r.as_str())
-					.unwrap();
-				let oracle_str = output_obj.get("oracle").and_then(|o| o.as_str()).unwrap();
-				let settler_str = output_obj.get("settler").and_then(|s| s.as_str()).unwrap();
-
-				if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
-					let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
-					let recipient_bytes =
-						parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
-					let oracle_bytes = parse_bytes32_from_hex(oracle_str).unwrap_or([0u8; 32]);
-					let settler_bytes = parse_bytes32_from_hex(settler_str).unwrap_or([0u8; 32]);
-
-					sol_outputs.push(SolMandateOutput {
-						oracle: oracle_bytes.into(),
-						settler: settler_bytes.into(),
-						chainId: U256::from(chain_id),
-						token: token_bytes.into(),
-						amount,
-						recipient: recipient_bytes.into(),
-						call: Vec::new().into(),
-						context: Vec::new().into(),
-					});
-				}
-			}
-		}
-
-		// Create and encode the StandardOrder
-		let sol_order = StandardOrder {
-			user: user_address,
-			nonce,
-			originChainId: origin_chain_id,
-			expires,
-			fillDeadline: fill_deadline,
-			inputOracle: input_oracle,
-			inputs,
-			outputs: sol_outputs,
-		};
+		// Extract the user address from the order
+		let user_address = sol_order.user;
 
 		// ABI encode the StandardOrder
 		let encoded_order = StandardOrder::abi_encode(&sol_order);
@@ -738,59 +600,34 @@ impl From<GetOrderError> for APIError {
 	}
 }
 
-/// Implementation of CostEstimatable for Quote
-impl crate::CostEstimatable for Quote {
-	fn input_chain_ids(&self) -> Vec<u64> {
-		self.details
-			.available_inputs
-			.iter()
-			.filter_map(|input| input.asset.ethereum_chain_id().ok())
-			.collect()
-	}
+/// Trait for converting quotes to orders for gas estimation.
+/// Each order standard should implement this trait to provide
+/// accurate gas estimation based on its specific data structures.
+pub trait QuoteParsable {
+	/// Convert a Quote to an Order suitable for gas estimation.
+	/// The returned Order should have the proper standard-specific
+	/// data structure to enable accurate transaction generation.
+	fn quote_to_order_for_estimation(quote: &Quote) -> crate::Order;
+}
 
-	fn output_chain_ids(&self) -> Vec<u64> {
-		self.details
-			.requested_outputs
-			.iter()
-			.filter_map(|output| output.asset.ethereum_chain_id().ok())
-			.collect()
-	}
-
-	fn lock_type(&self) -> Option<&str> {
-		Some(&self.lock_type)
-	}
-
-	fn as_order_for_estimation(&self) -> crate::Order {
-		// Create a minimal Order just for transaction generation
-		// This Order is NOT valid for execution, only for gas estimation
-
-		// Create minimal data structure with lock_type for gas config
-		let data = serde_json::json!({
-			"lock_type": &self.lock_type,
-			// Add minimal fields needed for transaction generation
-			"quote_id": &self.quote_id,
-			"estimation_only": true,
-		});
-
-		crate::Order {
-			// Use a clearly marked estimation-only ID
-			id: format!("ESTIMATION_ONLY_quote_{}", self.quote_id),
-			standard: "estimation_only".to_string(), // Clearly not a real standard
-			created_at: crate::current_timestamp(),
-			updated_at: crate::current_timestamp(),
-			status: crate::OrderStatus::Created,
-			data,
-			solver_address: crate::Address(vec![0u8; 20]), // Dummy address
-			quote_id: Some(self.quote_id.clone()),
-			input_chain_ids: self.input_chain_ids(),
-			output_chain_ids: self.output_chain_ids(),
-			execution_params: None,
-			prepare_tx_hash: None,
-			fill_tx_hash: None,
-			post_fill_tx_hash: None,
-			pre_claim_tx_hash: None,
-			claim_tx_hash: None,
-			fill_proof: None,
+impl Quote {
+	/// Convert the quote to an order for gas estimation based on the standard.
+	/// This method dispatches to the appropriate standard-specific implementation.
+	pub fn to_order_for_estimation(
+		&self,
+		standard: &str,
+	) -> Result<crate::Order, Box<dyn std::error::Error>> {
+		match standard {
+			#[cfg(feature = "oif-interfaces")]
+			"eip7683" => {
+				// Use the EIP-7683 implementation of QuoteParsable
+				Ok(crate::Eip7683OrderData::quote_to_order_for_estimation(self))
+			},
+			_ => Err(format!(
+				"Unsupported order standard for quote conversion: {}",
+				standard
+			)
+			.into()),
 		}
 	}
 }

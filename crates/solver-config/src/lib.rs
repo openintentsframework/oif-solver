@@ -16,6 +16,7 @@ mod loader;
 pub use builders::config::ConfigBuilder;
 
 use regex::Regex;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use solver_types::{networks::deserialize_networks, NetworksConfig};
 use std::collections::HashMap;
@@ -97,6 +98,8 @@ pub struct SolverConfig {
 	/// Defaults to 480 minutes (8 hours) if not specified.
 	#[serde(default = "default_monitoring_timeout_minutes")]
 	pub monitoring_timeout_minutes: u64,
+	/// Minimum profitability percentage required to execute orders.
+	pub min_profitability_pct: Decimal,
 }
 
 /// Returns the default monitoring timeout in minutes.
@@ -708,6 +711,7 @@ mod tests {
 [solver]
 id = "${TEST_SOLVER_ID}"
 monitoring_timeout_minutes = 5
+min_profitability_pct = 1.0
 
 [networks.1]
 input_settler_address = "0x1234567890123456789012345678901234567890"
@@ -759,6 +763,10 @@ network_ids = [1, 2]
 
 		let config: Config = config_str.parse().unwrap();
 		assert_eq!(config.solver.id, "test-solver");
+		assert_eq!(
+			config.solver.min_profitability_pct,
+			Decimal::from_str("1.0").unwrap()
+		);
 
 		// Clean up
 		std::env::remove_var("TEST_SOLVER_ID");
@@ -770,6 +778,7 @@ network_ids = [1, 2]
 [solver]
 id = "test"
 monitoring_timeout_minutes = 5
+min_profitability_pct = 5.0  # Minimum profitability percentage required to execute orders
 
 [networks.1]
 input_settler_address = "0x1234567890123456789012345678901234567890"
@@ -853,6 +862,7 @@ network_ids = [2, 3]  # Network 2 overlaps with impl1
 [solver]
 id = "test"
 monitoring_timeout_minutes = 5
+min_profitability_pct = 5.0  # Minimum profitability percentage required to execute orders
 
 [networks.1]
 input_settler_address = "0x1234567890123456789012345678901234567890"
@@ -913,6 +923,7 @@ network_ids = [1, 2]
 [solver]
 id = "test"
 monitoring_timeout_minutes = 5
+min_profitability_pct = 5.0  # Minimum profitability percentage required to execute orders
 
 [networks.1]
 input_settler_address = "0x1234567890123456789012345678901234567890"
@@ -975,6 +986,7 @@ network_ids = [1, 2, 999]  # Network 999 doesn't exist
 [solver]
 id = "test"
 monitoring_timeout_minutes = 5
+min_profitability_pct = 5.0  # Minimum profitability percentage required to execute orders
 
 [networks.1]
 input_settler_address = "0x1234567890123456789012345678901234567890"

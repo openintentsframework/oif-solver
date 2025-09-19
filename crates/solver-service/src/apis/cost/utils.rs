@@ -5,9 +5,11 @@
 //! flow detection, and cost calculation logic.
 
 use alloy_primitives::U256;
+use rust_decimal::Decimal;
 use solver_config::Config;
 use solver_core::SolverEngine;
 use solver_types::{QuoteError, DEFAULT_GAS_PRICE_WEI};
+use std::str::FromStr;
 
 /// Gets the gas price for a specific chain from the solver's delivery service.
 ///
@@ -70,15 +72,6 @@ pub fn estimate_gas_units_from_config(
 	(fallback_open, fallback_fill, fallback_claim)
 }
 
-/// Adds two decimal string values and returns the sum as a string.
-///
-/// # Returns
-///
-/// A string representing the sum of the two input values.
-pub fn add_decimals(a: &str, b: &str) -> String {
-	add_many(&[a.to_string(), b.to_string()])
-}
-
 /// Adds multiple decimal string values and returns the sum as a string.
 ///
 /// # Returns
@@ -102,4 +95,44 @@ pub fn add_many(values: &[String]) -> String {
 pub fn apply_bps(value: &str, bps: u32) -> String {
 	let v = U256::from_str_radix(value, 10).unwrap_or(U256::ZERO);
 	(v.saturating_mul(U256::from(bps as u64)) / U256::from(10_000u64)).to_string()
+}
+
+/// Converts a raw token amount to USD, handling decimals normalization.
+pub async fn convert_raw_token_to_usd(
+	raw_amount: &U256,
+	token_symbol: &str,
+	token_decimals: u8,
+	pricing_service: &solver_pricing::PricingService,
+) -> Result<Decimal, Box<dyn std::error::Error>> {
+	// Handle potential overflow for large decimals (tokens normally uses max 18 decimals)
+	if token_decimals > 28 {
+		// Decimal max precision is 28
+		return Err(format!(
+			"Token decimals {} exceeds maximum supported precision",
+			token_decimals
+		)
+		.into());
+	}
+
+	// Convert U256 to string and then to Decimal
+	let raw_amount_str = raw_amount.to_string();
+	let raw_amount_decimal = Decimal::from_str(&raw_amount_str)
+		.map_err(|e| format!("Failed to parse raw amount {}: {}", raw_amount_str, e))?;
+
+	let normalized_amount = match token_decimals {
+		0 => raw_amount_decimal,
+		decimals => {
+			let divisor = Decimal::new(10_i64.pow(decimals as u32), 0);
+			raw_amount_decimal / divisor
+		},
+	};
+
+	// Convert to USD and return as Decimal
+	let usd_amount_str = pricing_service
+		.convert_asset(token_symbol, "USD", &normalized_amount.to_string())
+		.await
+		.map_err(|e| format!("Failed to convert {} to USD: {}", token_symbol, e))?;
+
+	Decimal::from_str(&usd_amount_str)
+		.map_err(|e| format!("Failed to parse USD amount {}: {}", usd_amount_str, e).into())
 }

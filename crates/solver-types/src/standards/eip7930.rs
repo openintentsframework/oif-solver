@@ -282,6 +282,14 @@ pub mod utils {
 	}
 }
 
+/// Convenient conversion from (chain_id, custom_address) tuple to InteropAddress
+impl From<(u64, crate::Address)> for InteropAddress {
+	fn from((chain_id, custom_address): (u64, crate::Address)) -> Self {
+		let alloy_address = Address::from_slice(&custom_address.0);
+		InteropAddress::new_ethereum(chain_id, alloy_address)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

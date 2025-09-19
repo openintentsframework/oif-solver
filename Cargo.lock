@@ -3650,6 +3650,7 @@ name = "solver-config"
 version = "0.1.0"
 dependencies = [
  "regex",
+ "rust_decimal",
  "serde",
  "solver-types",
  "tempfile",
@@ -3793,6 +3794,7 @@ dependencies = [
  "mockall",
  "once_cell",
  "reqwest",
+ "rust_decimal",
  "secp256k1",
  "serde",
  "serde_json",

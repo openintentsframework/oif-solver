@@ -10,6 +10,7 @@ include = [
 [solver]
 id = "oif-solver-demo"
 monitoring_timeout_minutes = 5
+min_profitability_pct = 1.0
 
 # ============================================================================
 # STORAGE
@@ -76,7 +77,7 @@ max_gas_price_gwei = 100
 # PRICING
 # ============================================================================
 [pricing]
-primary = "mock"
+primary = "coingecko"
 
 [pricing.implementations.mock]
 # Uses default ETH/USD price of 4615.16
@@ -86,6 +87,11 @@ primary = "mock"
 # api_key = "CG-YOUR-API-KEY-HERE"
 cache_duration_seconds = 60
 rate_limit_delay_ms = 1200
+
+# Custom prices for demo/test tokens (in USD)
+[pricing.implementations.coingecko.custom_prices]
+TOKA = "200.00"
+TOKB = "195.00"
 
 # ============================================================================
 # SETTLEMENT
