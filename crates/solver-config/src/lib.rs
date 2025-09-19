@@ -397,11 +397,15 @@ impl Config {
 	/// - `include = ["file1.toml", "file2.toml"]` - Include specific files
 	///
 	/// Each top-level section must be unique across all configuration files.
+	///
+	/// Environment variables are loaded from .env files in the current working directory.
 	pub async fn from_file(path: &str) -> Result<Self, ConfigError> {
 		let path_buf = Path::new(path);
 		let base_dir = path_buf.parent().unwrap_or_else(|| Path::new("."));
 
+		// Create loader with config file's base directory for includes
 		let mut loader = loader::ConfigLoader::new(base_dir);
+
 		let file_name = path_buf
 			.file_name()
 			.ok_or_else(|| ConfigError::Validation(format!("Invalid path: {}", path)))?;
