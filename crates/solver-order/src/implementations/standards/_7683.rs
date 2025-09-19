@@ -13,8 +13,8 @@ use solver_types::{
 	oracle::OracleRoutes,
 	standards::eip7683::{
 		interfaces::{
-			IInputSettlerCompact, IInputSettlerEscrow, IOutputSettlerSimple,
-			SolMandateOutput as MandateOutput, SolveParams, StandardOrder as OifStandardOrder,
+			IInputSettlerCompact, IInputSettlerEscrow, IOutputSettlerSimple, SolMandateOutput,
+			SolveParams, StandardOrder,
 		},
 		LockType,
 	},
@@ -58,7 +58,7 @@ impl Eip7683OrderImpl {
 		match lock_type {
 			LockType::ResourceLock => {
 				// Decode to StandardOrder for Compact
-				let std_order = OifStandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+				let std_order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
 					OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
 				})?;
 
@@ -67,7 +67,7 @@ impl Eip7683OrderImpl {
 			},
 			LockType::Permit2Escrow | LockType::Eip3009Escrow => {
 				// Decode to StandardOrder for Escrow contracts
-				let std_order = OifStandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+				let std_order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
 					OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
 				})?;
 
@@ -126,12 +126,12 @@ impl Eip7683OrderImpl {
 	}
 
 	/// Decode raw order bytes into StandardOrder struct.
-	fn decode_standard_order(order_bytes: &str) -> Result<OifStandardOrder, OrderError> {
+	fn decode_standard_order(order_bytes: &str) -> Result<StandardOrder, OrderError> {
 		let bytes = hex::decode(order_bytes.trim_start_matches("0x"))
 			.map_err(|e| OrderError::ValidationFailed(format!("Invalid hex: {}", e)))?;
 
 		// Decode using alloy's ABI decoder
-		OifStandardOrder::abi_decode(&bytes, true).map_err(|e| {
+		StandardOrder::abi_decode(&bytes, true).map_err(|e| {
 			OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
 		})
 	}
@@ -421,12 +421,13 @@ impl OrderInterface for Eip7683OrderImpl {
 		let order_struct = Self::decode_standard_order(raw_order_data)?;
 
 		// Use the InputSettlerEscrow openFor call with StandardOrder struct
+		let signature_bytes = hex::decode(signature.trim_start_matches("0x"))
+			.map_err(|e| OrderError::ValidationFailed(format!("Invalid signature: {}", e)))?;
+
 		let open_for_data = IInputSettlerEscrow::openForCall {
 			order: order_struct,
 			sponsor: sponsor_address,
-			signature: hex::decode(signature.trim_start_matches("0x"))
-				.map_err(|e| OrderError::ValidationFailed(format!("Invalid signature: {}", e)))?
-				.into(),
+			signature: signature_bytes.into(),
 		}
 		.abi_encode();
 
@@ -516,8 +517,8 @@ impl OrderInterface for Eip7683OrderImpl {
 			.output_settler_address
 			.clone();
 
-		// Create the MandateOutput struct for the fill call
-		let output_struct = MandateOutput {
+		// Create the SolMandateOutput struct for the fill call
+		let output_struct = SolMandateOutput {
 			oracle: FixedBytes::<32>::from(output.oracle),
 			settler: {
 				let mut bytes32 = [0u8; 32];
@@ -619,11 +620,11 @@ impl OrderInterface for Eip7683OrderImpl {
 		// Create inputs array from order data
 		let inputs: Vec<[U256; 2]> = order_data.inputs.clone();
 
-		// Create outputs array (MandateOutput structs)
-		let outputs: Vec<MandateOutput> = order_data
+		// Create outputs array (SolMandateOutput structs)
+		let outputs: Vec<SolMandateOutput> = order_data
 			.outputs
 			.iter()
-			.map(|output| -> Result<MandateOutput, OrderError> {
+			.map(|output| -> Result<SolMandateOutput, OrderError> {
 				// Use the oracle value from the original order
 				let oracle_bytes32 = FixedBytes::<32>::from(output.oracle);
 
@@ -653,7 +654,7 @@ impl OrderInterface for Eip7683OrderImpl {
 
 				let recipient_bytes32 = FixedBytes::<32>::from(output.recipient);
 
-				Ok(MandateOutput {
+				Ok(SolMandateOutput {
 					oracle: oracle_bytes32,
 					settler: settler_bytes32,
 					chainId: output.chain_id,
@@ -667,7 +668,7 @@ impl OrderInterface for Eip7683OrderImpl {
 			.collect::<Result<Vec<_>, _>>()?;
 
 		// Build the order struct
-		let order_struct = OifStandardOrder {
+		let order_struct = StandardOrder {
 			user: user_address,
 			nonce: order_data.nonce,
 			originChainId: order_data.origin_chain_id,
@@ -774,9 +775,9 @@ impl OrderInterface for Eip7683OrderImpl {
 	}
 
 	/// Validates EIP-7683 order bytes by decoding to StandardOrder and validating.
-	async fn validate_order(&self, order_bytes: &Bytes) -> Result<OifStandardOrder, OrderError> {
+	async fn validate_order(&self, order_bytes: &Bytes) -> Result<StandardOrder, OrderError> {
 		// Decode using the StandardOrder from types module
-		let standard_order = OifStandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+		let standard_order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
 			OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
 		})?;
 
