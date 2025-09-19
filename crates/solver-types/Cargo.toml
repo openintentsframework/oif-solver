@@ -10,7 +10,7 @@ oif-interfaces = ["alloy-sol-types", "alloy-contract"]
 
 [dependencies]
 alloy-primitives = { version = "0.8", features = ["std", "serde"] }
-alloy-rpc-types = { version = "0.8" }
+alloy-rpc-types = { version = "0.12" }
 alloy-sol-types = { version = "0.8", features = ["std"], optional = true }
 alloy-contract = { version = "0.8", optional = true }
 async-trait = { workspace = true }
