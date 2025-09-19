@@ -21,8 +21,8 @@ use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::{cost::ProfitabilityService, SolverEngine};
 use solver_types::{
-	api::IntentRequest, APIError, Address, ApiErrorType, GetOrderResponse,
-	GetQuoteRequest, GetQuoteResponse, Order, OrderIdCallback, Transaction,
+	api::IntentRequest, APIError, Address, ApiErrorType, GetOrderResponse, GetQuoteRequest,
+	GetQuoteResponse, Order, OrderIdCallback, Transaction,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -575,4 +575,3 @@ async fn forward_to_discovery_service(
 		},
 	}
 }
-

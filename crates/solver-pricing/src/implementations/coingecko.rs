@@ -126,28 +126,35 @@ impl CoinGeckoPricing {
 		let mut custom_prices = HashMap::new();
 		if let Some(prices_config) = config.get("custom_prices").and_then(|v| v.as_table()) {
 			for (symbol, price) in prices_config {
-				if let Some(price_str) = price.as_str() {
-					custom_prices.insert(symbol.to_uppercase(), price_str.to_string());
-					debug!(
-						"Added custom price for {}: ${}",
-						symbol.to_uppercase(),
-						price_str
-					);
+				let price_decimal = if let Some(price_str) = price.as_str() {
+					price_str.parse::<Decimal>().map_err(|e| {
+						PricingError::InvalidData(format!(
+							"Invalid custom price for {}: {}",
+							symbol, e
+						))
+					})?
 				} else if let Some(price_num) = price.as_float() {
-					custom_prices.insert(symbol.to_uppercase(), price_num.to_string());
-					debug!(
-						"Added custom price for {}: ${}",
-						symbol.to_uppercase(),
-						price_num
-					);
+					Decimal::try_from(price_num).map_err(|e| {
+						PricingError::InvalidData(format!(
+							"Invalid custom price for {}: {}",
+							symbol, e
+						))
+					})?
 				} else if let Some(price_int) = price.as_integer() {
-					custom_prices.insert(symbol.to_uppercase(), price_int.to_string());
-					debug!(
-						"Added custom price for {}: ${}",
-						symbol.to_uppercase(),
-						price_int
-					);
-				}
+					Decimal::from(price_int)
+				} else {
+					return Err(PricingError::InvalidData(format!(
+						"Custom price for {} must be a number or numeric string",
+						symbol
+					)));
+				};
+
+				custom_prices.insert(symbol.to_uppercase(), price_decimal.to_string());
+				debug!(
+					"Added custom price for {}: ${}",
+					symbol.to_uppercase(),
+					price_decimal
+				);
 			}
 		}
 
@@ -302,17 +309,19 @@ impl CoinGeckoPricing {
 				token_upper, custom_price
 			);
 			// Update cache
-			let mut cache = self.price_cache.write().await;
-			cache.insert(
-				cache_key,
-				PriceCacheEntry {
-					price: custom_price.clone(),
-					timestamp: SystemTime::now()
-						.duration_since(UNIX_EPOCH)
-						.unwrap()
-						.as_secs(),
-				},
-			);
+			{
+				let mut cache = self.price_cache.write().await;
+				cache.insert(
+					cache_key.clone(),
+					PriceCacheEntry {
+						price: custom_price.clone(),
+						timestamp: SystemTime::now()
+							.duration_since(UNIX_EPOCH)
+							.unwrap()
+							.as_secs(),
+					},
+				);
+			}
 			return Ok(custom_price.clone());
 		}
 
@@ -584,14 +593,19 @@ impl ConfigSchema for CoinGeckoConfigSchema {
 		if let Some(custom_prices) = config.get("custom_prices") {
 			if let Some(table) = custom_prices.as_table() {
 				for (symbol, price) in table {
-					// Price can be string, float, or integer
-					if price.as_str().is_none()
-						&& price.as_float().is_none()
-						&& price.as_integer().is_none()
-					{
+					// Price can be string (parseable as Decimal), float, or integer
+					let is_valid = if let Some(price_str) = price.as_str() {
+						price_str.parse::<Decimal>().is_ok()
+					} else if let Some(price_num) = price.as_float() {
+						Decimal::try_from(price_num).is_ok()
+					} else {
+						price.as_integer().is_some()
+					};
+
+					if !is_valid {
 						return Err(ValidationError::TypeMismatch {
 							field: format!("custom_prices.{}", symbol),
-							expected: "string, float, or integer".to_string(),
+							expected: "valid decimal string, float, or integer".to_string(),
 							actual: format!("{:?}", price),
 						});
 					}

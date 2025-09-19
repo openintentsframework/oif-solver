@@ -120,15 +120,15 @@ impl CostEngine {
 		config: &Config,
 	) -> Result<CostEstimate, APIError> {
 		// Parse the order data based on its standard
-		let parsable = order.parse_order_data().map_err(|e| APIError::BadRequest {
+		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::InvalidRequest,
 			message: format!("Failed to parse order data: {}", e),
 			details: None,
 		})?;
 
 		// Extract chain parameters
-		let origin_chain_id = parsable.origin_chain_id();
-		let dest_chain_ids = parsable.destination_chain_ids();
+		let origin_chain_id = order_parsed.origin_chain_id();
+		let dest_chain_ids = order_parsed.destination_chain_ids();
 
 		let dest_chain_id =
 			dest_chain_ids
@@ -146,7 +146,7 @@ impl CostEngine {
 		};
 
 		// Extract flow key (lock_type) for gas config lookup
-		let flow_key = parsable.parse_lock_type();
+		let flow_key = order_parsed.parse_lock_type();
 
 		// Estimate gas units
 		let gas_units = self
@@ -161,8 +161,8 @@ impl CostEngine {
 			.await?;
 
 		// Calculate cost components
-		let available_inputs = parsable.parse_available_inputs();
-		let requested_outputs = parsable.parse_requested_outputs();
+		let available_inputs = order_parsed.parse_available_inputs();
+		let requested_outputs = order_parsed.parse_requested_outputs();
 		self.calculate_cost_components(
 			solver,
 			chain_params,
