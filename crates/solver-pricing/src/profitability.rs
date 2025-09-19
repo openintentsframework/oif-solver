@@ -6,13 +6,30 @@
 
 use alloy_primitives::U256;
 use rust_decimal::Decimal;
-use solver_types::{APIError, ApiErrorType, CostEstimate, Order};
-use std::str::FromStr;
+use solver_types::{APIError, ApiErrorType, CostEstimate, Order, TokenConfig, NetworksConfig, Address};
+use std::{str::FromStr, sync::Arc};
 
 /// Service for calculating order profitability within the solver engine context.
-pub struct ProfitabilityService;
+pub struct ProfitabilityService {
+	/// Pricing service for USD conversions
+	pricing_service: Arc<crate::PricingService>,
+}
+
+/// Container for token configurations needed for profitability calculations.
+#[derive(Debug, Clone)]
+pub struct OrderTokenConfigs {
+	/// Token configurations for input assets
+	pub input_tokens: Vec<TokenConfig>,
+	/// Token configurations for output assets  
+	pub output_tokens: Vec<TokenConfig>,
+}
 
 impl ProfitabilityService {
+	/// Creates a new ProfitabilityService with the given pricing service.
+	pub fn new(pricing_service: Arc<crate::PricingService>) -> Self {
+		Self { pricing_service }
+	}
+
 	/// Calculates the profit margin percentage for an order.
 	///
 	/// The profit margin is calculated as:
@@ -25,81 +42,54 @@ impl ProfitabilityService {
 	/// # Arguments
 	/// * `order` - The order to calculate profitability for
 	/// * `cost_estimate` - Pre-calculated cost estimate for the order
-	/// * `token_manager` - Token manager for getting token info
-	/// * `pricing_service` - Pricing service for USD conversions
+	/// * `token_configs` - Pre-fetched token configurations for input and output assets
 	///
 	/// # Returns
 	/// * `Ok(Decimal)` - The profit margin as a percentage (e.g., 2.5 for 2.5%)
 	/// * `Err(Box<dyn std::error::Error>)` - If calculation fails
 	pub async fn calculate_profit_margin(
+		&self,
 		order: &Order,
 		cost_estimate: &CostEstimate,
-		token_manager: &crate::engine::token_manager::TokenManager,
-		pricing_service: &solver_pricing::PricingService,
+		token_configs: &OrderTokenConfigs,
 	) -> Result<Decimal, Box<dyn std::error::Error>> {
-		// Parse the order data
+		// Parse the order data to get amounts
 		let parsed_order = order.parse_order_data()?;
-
-		// Get input and output assets from the parsed order
 		let available_inputs = parsed_order.parse_available_inputs();
 		let requested_outputs = parsed_order.parse_requested_outputs();
 
-		// Calculate total input amount in USD (sum of all inputs converted to USD)
+		// Calculate total input amount in USD using pre-fetched token configs
 		let mut total_input_amount_usd = Decimal::ZERO;
-		for input in available_inputs {
-			// Extract chain_id and ethereum address from InteropAddress
-			let chain_id = input
-				.asset
-				.ethereum_chain_id()
-				.map_err(|e| format!("Failed to get chain ID from asset: {}", e))?;
-			let ethereum_addr = input
-				.asset
-				.ethereum_address()
-				.map_err(|e| format!("Failed to get ethereum address from asset: {}", e))?;
-			let token_address = solver_types::Address(ethereum_addr.0.to_vec());
+		for (i, input) in available_inputs.iter().enumerate() {
+			let token_info = token_configs
+				.input_tokens
+				.get(i)
+				.ok_or_else(|| format!("Missing token config for input asset {}", i))?;
 
-			// Get token info
-			let token_info = token_manager
-				.get_token_info(chain_id, &token_address)
-				.map_err(|e| format!("Failed to get token info: {}", e))?;
-
-			// Convert raw amount to USD using pricing service
 			let usd_amount = Self::convert_raw_token_to_usd(
 				&input.amount,
 				&token_info.symbol,
 				token_info.decimals,
-				pricing_service,
+				&self.pricing_service,
 			)
 			.await?;
 
 			total_input_amount_usd += usd_amount;
 		}
 
-		// Calculate total output amount in USD (sum of all outputs converted to USD)
+		// Calculate total output amount in USD using pre-fetched token configs
 		let mut total_output_amount_usd = Decimal::ZERO;
-		for output in requested_outputs {
-			// Extract chain_id and ethereum address from InteropAddress
-			let chain_id = output
-				.asset
-				.ethereum_chain_id()
-				.map_err(|e| format!("Failed to get chain ID from asset: {}", e))?;
-			let ethereum_addr = output
-				.asset
-				.ethereum_address()
-				.map_err(|e| format!("Failed to get ethereum address from asset: {}", e))?;
-			let token_address = solver_types::Address(ethereum_addr.0.to_vec());
+		for (i, output) in requested_outputs.iter().enumerate() {
+			let token_info = token_configs
+				.output_tokens
+				.get(i)
+				.ok_or_else(|| format!("Missing token config for output asset {}", i))?;
 
-			// Get token info
-			let token_info = token_manager
-				.get_token_info(chain_id, &token_address)
-				.map_err(|e| format!("Failed to get token info: {}", e))?;
-
-			// Convert raw amount to USD using pricing service
 			let usd_amount = Self::convert_raw_token_to_usd(
 				&output.amount,
 				&token_info.symbol,
 				token_info.decimals,
-				pricing_service,
+				&self.pricing_service,
 			)
 			.await?;
 
@@ -144,27 +134,26 @@ impl ProfitabilityService {
 	/// * `order` - The order to validate
 	/// * `cost_estimate` - Pre-calculated cost estimate for the order
 	/// * `min_profitability_pct` - Minimum required profit margin percentage
-	/// * `token_manager` - Token manager for getting token info
-	/// * `pricing_service` - Pricing service for USD conversions
+	/// * `token_configs` - Pre-fetched token configurations for input and output assets
 	///
 	/// # Returns
 	/// * `Ok(Decimal)` - The actual profit margin if it meets the threshold
 	/// * `Err(APIError)` - If profitability is insufficient or calculation fails
 	pub async fn validate_profitability(
+		&self,
 		order: &Order,
 		cost_estimate: &CostEstimate,
 		min_profitability_pct: Decimal,
-		token_manager: &crate::engine::token_manager::TokenManager,
-		pricing_service: &solver_pricing::PricingService,
+		token_configs: &OrderTokenConfigs,
 	) -> Result<Decimal, APIError> {
 		// Calculate profit margin
-		let actual_profit_margin =
-			Self::calculate_profit_margin(order, cost_estimate, token_manager, pricing_service)
-				.await
-				.map_err(|e| APIError::InternalServerError {
-					error_type: ApiErrorType::InternalError,
-					message: format!("Failed to calculate profitability: {}", e),
-				})?;
+		let actual_profit_margin = self
+			.calculate_profit_margin(order, cost_estimate, token_configs)
+			.await
+			.map_err(|e| APIError::InternalServerError {
+				error_type: ApiErrorType::InternalError,
+				message: format!("Failed to calculate profitability: {}", e),
+			})?;
 
 		// Check if the actual profit margin meets the minimum requirement
 		if actual_profit_margin < min_profitability_pct {
@@ -193,7 +182,7 @@ impl ProfitabilityService {
 		raw_amount: &U256,
 		token_symbol: &str,
 		token_decimals: u8,
-		pricing_service: &solver_pricing::PricingService,
+		pricing_service: &crate::PricingService,
 	) -> Result<Decimal, Box<dyn std::error::Error>> {
 		// Handle potential overflow for large decimals (tokens normally uses max 18 decimals)
 		if token_decimals > 28 {
@@ -227,4 +216,105 @@ impl ProfitabilityService {
 		Decimal::from_str(&usd_amount_str)
 			.map_err(|e| format!("Failed to parse USD amount {}: {}", usd_amount_str, e).into())
 	}
+}
+
+/// Helper function to extract token configurations from an order using NetworksConfig.
+///
+/// This function parses the order data and retrieves the corresponding token configurations
+/// for all input and output assets using the networks configuration.
+///
+/// # Arguments
+/// * `order` - The order to extract token configs from
+/// * `networks` - Networks configuration containing token information for each chain
+///
+/// # Returns
+/// * `Ok(OrderTokenConfigs)` - Container with input and output token configurations
+/// * `Err(Box<dyn std::error::Error>)` - If token lookup fails
+pub fn extract_token_configs_from_order(
+	order: &Order,
+	networks: &NetworksConfig,
+) -> Result<OrderTokenConfigs, Box<dyn std::error::Error>> {
+	// Parse the order data
+	let parsed_order = order.parse_order_data()?;
+
+	// Get input and output assets from the parsed order
+	let available_inputs = parsed_order.parse_available_inputs();
+	let requested_outputs = parsed_order.parse_requested_outputs();
+
+	// Extract input token configs
+	let mut input_tokens = Vec::new();
+	for input in available_inputs {
+		// Extract chain_id and ethereum address from InteropAddress
+		let chain_id = input
+			.asset
+			.ethereum_chain_id()
+			.map_err(|e| format!("Failed to get chain ID from input asset: {}", e))?;
+		let ethereum_addr = input
+			.asset
+			.ethereum_address()
+			.map_err(|e| format!("Failed to get ethereum address from input asset: {}", e))?;
+		let token_address = Address(ethereum_addr.0.to_vec());
+
+		// Get network config for this chain
+		let network = networks
+			.get(&chain_id)
+			.ok_or_else(|| format!("Network {} not found in configuration", chain_id))?;
+
+		// Find token in network's token list
+		let token_info = network
+			.tokens
+			.iter()
+			.find(|t| t.address == token_address)
+			.cloned()
+			.ok_or_else(|| {
+				format!(
+					"Token {} not found in network {} configuration",
+					hex::encode(&token_address.0),
+					chain_id
+				)
+			})?;
+
+		input_tokens.push(token_info);
+	}
+
+	// Extract output token configs
+	let mut output_tokens = Vec::new();
+	for output in requested_outputs {
+		// Extract chain_id and ethereum address from InteropAddress
+		let chain_id = output
+			.asset
+			.ethereum_chain_id()
+			.map_err(|e| format!("Failed to get chain ID from output asset: {}", e))?;
+		let ethereum_addr = output
+			.asset
+			.ethereum_address()
+			.map_err(|e| format!("Failed to get ethereum address from output asset: {}", e))?;
+		let token_address = Address(ethereum_addr.0.to_vec());
+
+		// Get network config for this chain
+		let network = networks
+			.get(&chain_id)
+			.ok_or_else(|| format!("Network {} not found in configuration", chain_id))?;
+
+		// Find token in network's token list
+		let token_info = network
+			.tokens
+			.iter()
+			.find(|t| t.address == token_address)
+			.cloned()
+			.ok_or_else(|| {
+				format!(
+					"Token {} not found in network {} configuration",
+					hex::encode(&token_address.0),
+					chain_id
+				)
+			})?;
+
+		output_tokens.push(token_info);
+	}
+
+	Ok(OrderTokenConfigs {
+		input_tokens,
+		output_tokens,
+	})
 }
