@@ -6,7 +6,10 @@
 use crate::{DeliveryError, DeliveryInterface};
 use alloy_network::EthereumWallet;
 use alloy_primitives::{Address, Bytes, FixedBytes, U256};
-use alloy_provider::{Provider, ProviderBuilder};
+use alloy_provider::{
+	fillers::{CachedNonceManager, ChainIdFiller, GasFiller, NonceFiller},
+	Provider, ProviderBuilder,
+};
 use alloy_rpc_types::TransactionRequest;
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
@@ -76,9 +79,11 @@ impl AlloyDelivery {
 			let chain_signer = signer.clone().with_chain_id(Some(*network_id));
 			let wallet = EthereumWallet::from(chain_signer);
 
-			// Create provider
+			// Create provider with explicit cached nonce management to avoid race conditions
 			let provider = ProviderBuilder::new()
-				.with_recommended_fillers()
+				.filler(NonceFiller::new(CachedNonceManager::default()))
+				.filler(GasFiller)
+				.filler(ChainIdFiller::default())
 				.wallet(wallet)
 				.on_http(url);
 

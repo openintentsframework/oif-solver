@@ -17,7 +17,7 @@
     "chain_id": 11155420,
     "name": "Optimism Sepolia",
     "rpc_url": "https://sepolia.optimism.io",
-    "usdc_address": "0x5fd84259d66Cd46123540766Be93DFE6D43130D7",
+    "usdc_address": "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6",
     "explorer_url": "https://sepolia-optimism.etherscan.io"
   },
   "ethereum-sepolia": {
@@ -26,5 +26,12 @@
     "rpc_url": "https://sepolia.drpc.org",
     "usdc_address": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
     "explorer_url": "https://sepolia.etherscan.io"
+  },
+  "ethereum-holesky": {
+    "chain_id": 17000,
+    "name": "Ethereum Holesky",
+    "rpc_url": "https://holesky.drpc.org",
+    "usdc_address": "0x7dfFC9e7db5a96887666c1a6D215E5d3Fb306d69",
+    "explorer_url": "https://holesky.etherscan.io"
   }
 }

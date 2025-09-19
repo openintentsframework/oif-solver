@@ -1,5 +1,6 @@
 //! Order builder utilities for creating test and production Order instances.
 
+use crate::order::ChainSettlerInfo;
 use crate::{Address, FillProof, Order, OrderStatus, TransactionHash};
 
 /// Builder for creating Order instances with sensible defaults.
@@ -16,8 +17,8 @@ pub struct OrderBuilder {
 	updated_at: u64,
 	data: serde_json::Value,
 	quote_id: Option<String>,
-	input_chain_ids: Vec<u64>,
-	output_chain_ids: Vec<u64>,
+	input_chains: Vec<ChainSettlerInfo>,
+	output_chains: Vec<ChainSettlerInfo>,
 	execution_params: Option<crate::ExecutionParams>,
 	prepare_tx_hash: Option<TransactionHash>,
 	fill_tx_hash: Option<TransactionHash>,
@@ -51,8 +52,14 @@ impl Default for OrderBuilder {
 				"gas_limit_overrides": {}
 			}),
 			quote_id: None,
-			input_chain_ids: vec![1],
-			output_chain_ids: vec![137],
+			input_chains: vec![ChainSettlerInfo {
+				chain_id: 1,
+				settler_address: Address(vec![0x00; 20]),
+			}],
+			output_chains: vec![ChainSettlerInfo {
+				chain_id: 137,
+				settler_address: Address(vec![0x00; 20]),
+			}],
 			execution_params: None,
 			prepare_tx_hash: None,
 			fill_tx_hash: None,
@@ -125,15 +132,39 @@ impl OrderBuilder {
 		self
 	}
 
-	/// Sets the input chain IDs.
-	pub fn with_input_chain_ids(mut self, chain_ids: Vec<u64>) -> Self {
-		self.input_chain_ids = chain_ids;
+	/// Sets the input chains with settler info.
+	pub fn with_input_chains(mut self, chains: Vec<ChainSettlerInfo>) -> Self {
+		self.input_chains = chains;
 		self
 	}
 
-	/// Sets the output chain IDs.
+	/// Sets the output chains with settler info.
+	pub fn with_output_chains(mut self, chains: Vec<ChainSettlerInfo>) -> Self {
+		self.output_chains = chains;
+		self
+	}
+
+	/// Convenience method to set input chain IDs with dummy settler addresses.
+	pub fn with_input_chain_ids(mut self, chain_ids: Vec<u64>) -> Self {
+		self.input_chains = chain_ids
+			.into_iter()
+			.map(|chain_id| ChainSettlerInfo {
+				chain_id,
+				settler_address: Address(vec![0x00; 20]),
+			})
+			.collect();
+		self
+	}
+
+	/// Convenience method to set output chain IDs with dummy settler addresses.
 	pub fn with_output_chain_ids(mut self, chain_ids: Vec<u64>) -> Self {
-		self.output_chain_ids = chain_ids;
+		self.output_chains = chain_ids
+			.into_iter()
+			.map(|chain_id| ChainSettlerInfo {
+				chain_id,
+				settler_address: Address(vec![0x00; 20]),
+			})
+			.collect();
 		self
 	}
 
@@ -211,8 +242,8 @@ impl OrderBuilder {
 			data: self.data,
 			solver_address: self.solver_address,
 			quote_id: self.quote_id,
-			input_chain_ids: self.input_chain_ids,
-			output_chain_ids: self.output_chain_ids,
+			input_chains: self.input_chains,
+			output_chains: self.output_chains,
 			execution_params: self.execution_params,
 			prepare_tx_hash: self.prepare_tx_hash,
 			fill_tx_hash: self.fill_tx_hash,

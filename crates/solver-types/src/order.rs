@@ -15,6 +15,15 @@ use crate::{
 	SettlementType, TransactionHash, TransactionType,
 };
 
+/// Information about a chain and its associated settler contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainSettlerInfo {
+	/// The chain ID
+	pub chain_id: u64,
+	/// The settler contract address on this chain
+	pub settler_address: Address,
+}
+
 /// Trait for parsing order data from different standards into common structures.
 ///
 /// This trait provides a unified interface for extracting order information
@@ -99,6 +108,18 @@ pub trait OrderParsable: Send + Sync {
 	/// - Configuring transaction parameters
 	fn parse_lock_type(&self) -> Option<String>;
 
+	/// Get the input oracle address from the order data.
+	///
+	/// The input oracle is responsible for attesting to order fills on the origin chain.
+	/// This oracle validates that the solver has properly filled the order according
+	/// to its requirements.
+	///
+	/// # Returns
+	///
+	/// The oracle address as a string. For standards that don't use oracles,
+	/// this should return a zero address or empty string.
+	fn input_oracle(&self) -> String;
+
 	/// Get the origin chain ID where the order originates.
 	///
 	/// This represents the primary chain where the order was created and
@@ -172,14 +193,14 @@ pub struct Order {
 	/// Quote ID associated with this order.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub quote_id: Option<String>,
-	/// Chain IDs where input assets are located.
+	/// Input chains with their associated settler contracts.
 	/// For most orders this will be a single chain, but could be multiple for complex orders.
 	#[serde(default)]
-	pub input_chain_ids: Vec<u64>,
-	/// Chain IDs where output assets will be delivered.
+	pub input_chains: Vec<ChainSettlerInfo>,
+	/// Output chains with their associated settler contracts.
 	/// Can be multiple chains for orders that split outputs across chains.
 	#[serde(default)]
-	pub output_chain_ids: Vec<u64>,
+	pub output_chains: Vec<ChainSettlerInfo>,
 	/// Execution parameters when order is ready for execution.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub execution_params: Option<ExecutionParams>,

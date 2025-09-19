@@ -3,6 +3,7 @@
 //! This module defines types related to discovering and representing
 //! cross-chain intents before they are validated into orders.
 
+use alloy_primitives::Bytes;
 use serde::{Deserialize, Serialize};
 
 /// Represents a discovered cross-chain intent.
@@ -21,8 +22,14 @@ pub struct Intent {
 	pub metadata: IntentMetadata,
 	/// Raw intent data in JSON format, structure depends on the standard.
 	pub data: serde_json::Value,
+	/// ABI-encoded order bytes for validation and processing.
+	/// This contains the actual order data that will be validated by the order service.
+	pub order_bytes: Bytes,
 	/// Quote ID associated with this intent.
 	pub quote_id: Option<String>,
+	/// Lock type for the intent (e.g., "permit2_escrow", "resource_lock").
+	/// This determines how funds are secured during execution.
+	pub lock_type: String,
 }
 
 /// Metadata associated with a discovered intent.

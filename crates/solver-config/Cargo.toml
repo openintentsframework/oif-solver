@@ -5,6 +5,7 @@ edition = "2021"
 rust-version.workspace = true
 
 [dependencies]
+dotenvy = "0.15"
 regex = "1.10"
 rust_decimal = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }

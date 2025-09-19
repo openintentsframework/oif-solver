@@ -10,8 +10,8 @@ use solver_delivery::DeliveryService;
 use solver_order::OrderService;
 use solver_storage::StorageService;
 use solver_types::{
-	truncate_id, DeliveryEvent, ExecutionParams, Intent, Order, OrderEvent, OrderStatus,
-	SolverEvent, StorageKey, TransactionType,
+	truncate_id, DeliveryEvent, ExecutionParams, Order, OrderEvent, OrderStatus, SolverEvent,
+	StorageKey, TransactionType,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -65,14 +65,14 @@ impl OrderHandler {
 	#[instrument(skip_all, fields(order_id = %truncate_id(&order.id)))]
 	pub async fn handle_preparation(
 		&self,
-		intent: Intent,
+		source: String,
 		order: Order,
 		params: ExecutionParams,
 	) -> Result<(), OrderError> {
 		// Generate prepare transaction
 		if let Some(prepare_tx) = self
 			.order_service
-			.generate_prepare_transaction(&intent, &order, &params)
+			.generate_prepare_transaction(&source, &order, &params)
 			.await
 			.map_err(|e| OrderError::Service(e.to_string()))?
 		{

@@ -9,6 +9,7 @@ use crate::monitoring::TransactionMonitor;
 use crate::state::OrderStateMachine;
 use alloy_primitives::hex;
 use solver_delivery::DeliveryService;
+use solver_settlement::SettlementService;
 use solver_storage::StorageService;
 use solver_types::{
 	truncate_id, DeliveryEvent, Order, OrderEvent, OrderStatus, SettlementEvent, SolverEvent,
@@ -43,6 +44,7 @@ pub struct TransactionHandler {
 	delivery: Arc<DeliveryService>,
 	storage: Arc<StorageService>,
 	state_machine: Arc<OrderStateMachine>,
+	settlement: Arc<SettlementService>,
 	event_bus: EventBus,
 	monitoring_timeout_minutes: u64,
 }
@@ -52,6 +54,7 @@ impl TransactionHandler {
 		delivery: Arc<DeliveryService>,
 		storage: Arc<StorageService>,
 		state_machine: Arc<OrderStateMachine>,
+		settlement: Arc<SettlementService>,
 		event_bus: EventBus,
 		monitoring_timeout_minutes: u64,
 	) -> Self {
@@ -59,6 +62,7 @@ impl TransactionHandler {
 			delivery,
 			storage,
 			state_machine,
+			settlement,
 			event_bus,
 			monitoring_timeout_minutes,
 		}
@@ -114,13 +118,37 @@ impl TransactionHandler {
 			return Ok(());
 		}
 
+		// For PostFill and PreClaim, call settlement callback BEFORE other processing
+		// This allows Hyperlane to extract and store message IDs from receipts
+		if matches!(
+			tx_type,
+			TransactionType::PostFill | TransactionType::PreClaim
+		) {
+			// Retrieve the order for settlement callback
+			let order: Order = self
+				.storage
+				.retrieve(StorageKey::Orders.as_str(), &order_id)
+				.await
+				.map_err(|e| TransactionError::Storage(e.to_string()))?;
+
+			// Call settlement-specific handler
+			if let Ok(settlement) = self.settlement.find_settlement_for_order(&order) {
+				settlement
+					.handle_transaction_confirmed(&order, tx_type, &receipt)
+					.await
+					.map_err(|e| {
+						TransactionError::Service(format!("Settlement callback failed: {}", e))
+					})?;
+			}
+		}
+
 		// Handle based on transaction type
 		match tx_type {
 			TransactionType::Prepare => {
 				self.handle_prepare_confirmed(tx_hash).await?;
 			},
 			TransactionType::Fill => {
-				self.handle_fill_confirmed(receipt).await?;
+				self.handle_fill_confirmed(tx_hash).await?;
 			},
 			TransactionType::PostFill => {
 				self.handle_post_fill_confirmed(tx_hash).await?;
@@ -203,15 +231,12 @@ impl TransactionHandler {
 	/// post-fill transaction generation if needed.
 	async fn handle_fill_confirmed(
 		&self,
-		receipt: TransactionReceipt,
+		tx_hash: TransactionHash,
 	) -> Result<(), TransactionError> {
 		// Look up the order ID from the transaction hash
 		let order_id = self
 			.storage
-			.retrieve::<String>(
-				StorageKey::OrderByTxHash.as_str(),
-				&hex::encode(&receipt.hash.0),
-			)
+			.retrieve::<String>(StorageKey::OrderByTxHash.as_str(), &hex::encode(&tx_hash.0))
 			.await
 			.map_err(|e| TransactionError::Storage(e.to_string()))?;
 

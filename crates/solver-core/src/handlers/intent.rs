@@ -95,12 +95,45 @@ impl IntentHandler {
 			return Ok(());
 		}
 
+		// Store intent immediately to prevent race conditions with duplicate discovery
+		// This claims the intent ID slot before we start the potentially slow validation process
+		self.storage
+			.store(StorageKey::Intents.as_str(), &intent.id, &intent, None)
+			.await
+			.map_err(|e| {
+				IntentError::Storage(format!("Failed to store intent for deduplication: {}", e))
+			})?;
+
 		tracing::info!("Discovered intent");
 
-		// Validate intent
+		// Use the order_bytes field directly from the intent
+		let order_bytes = &intent.order_bytes;
+
+		// For on-chain discovered intents, we use a simple callback that returns the intent ID
+		// since the order ID was already computed during discovery
+		let intent_id = intent.id.clone();
+		let order_id_callback: solver_types::OrderIdCallback =
+			Box::new(move |_chain_id, _tx_data| {
+				let id = intent_id.clone();
+				Box::pin(async move {
+					// Return the intent ID as bytes (it's already a hex string)
+					alloy_primitives::hex::decode(&id)
+						.map_err(|e| format!("Failed to decode intent ID: {}", e))
+				})
+			});
+
+		// Validate and create order using the unified method
+		let intent_data = Some(intent.data.clone());
 		match self
 			.order_service
-			.validate_intent(&intent, &self.solver_address)
+			.validate_and_create_order(
+				&intent.standard,
+				order_bytes,
+				&intent_data,
+				&intent.lock_type,
+				order_id_callback,
+				&self.solver_address,
+			)
 			.await
 		{
 			Ok(order) => {
@@ -110,12 +143,6 @@ impl IntentHandler {
 						order: order.clone(),
 					}))
 					.ok();
-
-				// Store intent for deduplication
-				self.storage
-					.store(StorageKey::Intents.as_str(), &order.id, &intent, None)
-					.await
-					.map_err(|e| IntentError::Storage(e.to_string()))?;
 
 				// Store order
 				self.state_machine
