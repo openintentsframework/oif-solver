@@ -9,7 +9,7 @@ alloy-primitives = "0.8"
 alloy-provider = "0.8"
 alloy-rpc-types = "0.8"
 alloy-sol-types = "0.8"
-alloy-transport = "0.8"
+alloy-transport = "0.15"
 alloy-transport-http = "0.8"
 async-trait = "0.1"
 mockall = { version = "0.13", optional = true }
