@@ -1,7 +1,7 @@
 //! Pricing oracle implementations for the OIF solver system.
 //!
 //! This module provides pricing oracle implementations for converting between
-//! wei amounts and fiat currencies. Currently supports mock pricing for development.
+//! wei amounts and fiat currencies, as well as profitability calculation utilities.
 
 use solver_types::{
 	ImplementationRegistry, PricingError, PricingFactory, PricingInterface, TradingPair,
@@ -12,6 +12,12 @@ pub mod implementations {
 	pub mod coingecko;
 	pub mod mock;
 }
+
+/// Profitability calculation utilities
+pub mod profitability;
+
+// Re-export the profitability service for easy access
+pub use profitability::{extract_token_configs_from_order, OrderTokenConfigs, ProfitabilityService};
 
 /// Get all registered pricing implementations.
 pub fn get_all_implementations() -> Vec<(&'static str, PricingFactory)> {

@@ -19,7 +19,7 @@ use axum::{
 };
 use serde_json::Value;
 use solver_config::{ApiConfig, Config};
-use solver_core::{cost::ProfitabilityService, SolverEngine};
+use solver_core::SolverEngine;
 use solver_types::{
 	api::IntentRequest, APIError, Address, ApiErrorType, GetOrderResponse, GetQuoteRequest,
 	GetQuoteResponse, Order, OrderIdCallback, Transaction,
@@ -313,15 +313,36 @@ async fn handle_order(
 		},
 	};
 
-	// Validate profitability using ProfitabilityService directly
-	let actual_profit_margin = match ProfitabilityService::validate_profitability(
+	// Validate profitability using ProfitabilityService with pre-fetched token configs
+	let profitability_service =
+		solver_pricing::ProfitabilityService::new(state.solver.pricing().clone());
+
+	// Extract token configs from the order using NetworksConfig
+	let token_configs = match solver_pricing::extract_token_configs_from_order(
 		&validated_order,
-		&cost_estimate,
-		state.config.solver.min_profitability_pct,
-		state.solver.token_manager(),
-		state.solver.pricing(),
-	)
-	.await
+		&state.config.networks,
+	) {
+		Ok(configs) => configs,
+		Err(e) => {
+			tracing::warn!("Failed to extract token configs: {}", e);
+			return APIError::InternalServerError {
+				error_type: ApiErrorType::InternalError,
+				message: format!("Failed to extract token configurations: {}", e),
+			}
+			.into_response();
+		},
+	};
+
+	print!("token_configs: {:?}", token_configs);
+
+	let actual_profit_margin = match profitability_service
+		.validate_profitability(
+			&validated_order,
+			&cost_estimate,
+			state.config.solver.min_profitability_pct,
+			&token_configs,
+		)
+		.await
 	{
 		Ok(margin) => margin,
 		Err(api_error) => {

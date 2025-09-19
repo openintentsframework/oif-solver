@@ -25,8 +25,12 @@ pub type DeliveryFactory = fn(
 	&solver_types::SecretString,
 	&std::collections::HashMap<u64, solver_types::SecretString>,
 ) -> Result<Box<dyn DeliveryInterface>, DeliveryError>;
-pub type DiscoveryFactory =
-	fn(&toml::Value, &NetworksConfig) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError>;
+pub type DiscoveryFactory = fn(
+	&toml::Value,
+	&NetworksConfig,
+	std::sync::Arc<solver_pricing::PricingService>,
+	rust_decimal::Decimal,
+) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError>;
 pub type OrderFactory = fn(
 	&toml::Value,
 	&NetworksConfig,
