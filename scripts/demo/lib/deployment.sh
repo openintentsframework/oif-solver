@@ -1124,6 +1124,7 @@ include = [
 [solver]
 id = "oif-solver-demo"
 monitoring_timeout_minutes = 5
+min_profitability_pct = 1.0
 
 # ============================================================================
 # STORAGE
@@ -1201,6 +1202,11 @@ primary = "mock"
 cache_duration_seconds = 60
 rate_limit_delay_ms = 1200
 
+# Custom prices for demo/test tokens (in USD)
+[pricing.implementations.coingecko.custom_prices]
+TOKA = "200.00"
+TOKB = "195.00"
+
 # ============================================================================
 # SETTLEMENT
 # ============================================================================
@@ -1239,15 +1245,18 @@ output = { 31337 = ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"], 31338 = ["0xD
 # HYPERLANE SETTLEMENT (For cross-chain messaging)
 # ============================================================================
 [settlement.implementations.hyperlane]
+order = "eipXXXX"
+network_ids = [31337, 31338]
 # Default gas limit for Hyperlane messages
 default_gas_limit = 500000
 message_timeout_seconds = 600
 finalization_required = false  # For local testing
 
-# Oracle addresses (same as direct for local demo)
+# Oracle addresses for Hyperlane (different from direct to avoid conflicts)
+# Use a different oracle address to ensure Direct settlement is used for local demo
 [settlement.implementations.hyperlane.oracles]
-input = { 31337 = ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"], 31338 = ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"] }
-output = { 31337 = ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"], 31338 = ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"] }
+input = { 31337 = ["0x0000000000000000000000000000000000000999"], 31338 = ["0x0000000000000000000000000000000000000999"] }
+output = { 31337 = ["0x0000000000000000000000000000000000000999"], 31338 = ["0x0000000000000000000000000000000000000999"] }
 
 [settlement.implementations.hyperlane.routes]
 31337 = [31338]
@@ -1361,16 +1370,22 @@ EOF
 [gas]
 
 [gas.flows.compact_resource_lock]
-# Gas units captured by scripts/e2e/estimate_gas_compact.sh on local anvil
+# Gas units captured by scripts/e2e/estimate_gas.sh on local anvil
 open = 0
-fill = 76068
-claim = 121995
+fill = 77298
+claim = 122793
 
 [gas.flows.permit2_escrow]
-# Gas units captured by scripts/e2e/estimate_gas_permit2_escrow.sh on local anvil
-open = 143116
-fill = 76068 
-claim = 59953
+# Gas units captured by scripts/e2e/estimate_gas.sh on local anvil
+open = 146306
+fill = 77298
+claim = 60084
+
+[gas.flows.eip3009_escrow]
+# Gas units captured by scripts/e2e/estimate_gas.sh on local anvil
+open = 130254
+fill = 77298
+claim = 60084
 EOF
     
     print_success "Configuration files generated:"

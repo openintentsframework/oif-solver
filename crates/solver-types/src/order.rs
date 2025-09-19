@@ -11,8 +11,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::{
-	Address, AssetAmount, ChainData, CostEstimatable, SettlementType, TransactionHash,
-	TransactionType,
+	Address, AssetAmount, AvailableInput, ChainData, Eip7683OrderData, RequestedOutput,
+	SettlementType, TransactionHash, TransactionType,
 };
 
 /// Information about a chain and its associated settler contract.
@@ -22,6 +22,144 @@ pub struct ChainSettlerInfo {
 	pub chain_id: u64,
 	/// The settler contract address on this chain
 	pub settler_address: Address,
+}
+
+/// Trait for parsing order data from different standards into common structures.
+///
+/// This trait provides a unified interface for extracting order information
+/// from various cross-chain order standards (e.g., EIP-7683, etc.). It enables
+/// the solver to work with different order formats through a consistent API,
+/// abstracting away the implementation details of each standard.
+///
+/// # Purpose
+///
+/// Different cross-chain protocols may represent orders in various formats, but
+/// they all share common concepts like inputs (what the user provides) and outputs
+/// (what the user receives). This trait standardizes access to these common elements,
+/// allowing the solver's core logic to remain agnostic to the specific order standard.
+///
+/// # Implementation Guidelines
+///
+/// When implementing this trait for a new order standard:
+/// - Ensure all conversions are deterministic and consistent
+/// - Handle missing or invalid data gracefully with sensible defaults
+/// - Preserve all precision when converting amounts (use U256)
+/// - Use InteropAddress for cross-chain compatible addressing
+pub trait OrderParsable: Send + Sync {
+	/// Extract available inputs from the order data.
+	///
+	/// Available inputs represent the assets that the order maker is willing
+	/// to provide as part of the transaction. Each input includes:
+	/// - The user who owns the assets
+	/// - The asset details (token address and chain)
+	/// - The amount being offered
+	/// - Optional lock information if assets are pre-locked
+	///
+	/// # Returns
+	///
+	/// A vector of `AvailableInput` instances. May be empty for orders
+	/// that don't require specific inputs (e.g., native currency payments).
+	///
+	/// # Implementation Note
+	///
+	/// Implementations should handle token address formats appropriate to
+	/// their standard and convert them to InteropAddress format.
+	fn parse_available_inputs(&self) -> Vec<AvailableInput>;
+
+	/// Extract requested outputs from the order data.
+	///
+	/// Requested outputs represent the assets that the order maker expects
+	/// to receive upon successful execution. Each output includes:
+	/// - The receiver address (who gets the assets)
+	/// - The asset details (token address and chain)
+	/// - The amount to be received
+	/// - Optional calldata for contract interactions
+	///
+	/// # Returns
+	///
+	/// A vector of `RequestedOutput` instances. May be empty for orders
+	/// that don't specify explicit outputs (though this is unusual).
+	///
+	/// # Implementation Note
+	///
+	/// Implementations should ensure that recipient addresses are properly
+	/// formatted as InteropAddress instances with correct chain IDs.
+	fn parse_requested_outputs(&self) -> Vec<RequestedOutput>;
+
+	/// Extract the lock type from the order data, if applicable.
+	///
+	/// The lock type indicates the mechanism used to secure user funds
+	/// during order execution. Common lock types include:
+	/// - `"permit2_escrow"` - Uses Permit2 for gasless approvals
+	/// - `"eip3009_escrow"` - Uses EIP-3009 for gasless transfers
+	/// - `"resource_lock"` - Uses resource locking (e.g., The Compact)
+	///
+	/// # Returns
+	///
+	/// - `Some(String)` - The lock type identifier if the order specifies one
+	/// - `None` - If the order doesn't specify a lock type or the standard
+	///   doesn't support lock types
+	///
+	/// # Usage
+	///
+	/// The lock type is primarily used for:
+	/// - Determining gas costs (different lock types have different gas requirements)
+	/// - Selecting the appropriate settlement contract
+	/// - Configuring transaction parameters
+	fn parse_lock_type(&self) -> Option<String>;
+
+	/// Get the input oracle address from the order data.
+	///
+	/// The input oracle is responsible for attesting to order fills on the origin chain.
+	/// This oracle validates that the solver has properly filled the order according
+	/// to its requirements.
+	///
+	/// # Returns
+	///
+	/// The oracle address as a string. For standards that don't use oracles,
+	/// this should return a zero address or empty string.
+	fn input_oracle(&self) -> String;
+
+	/// Get the origin chain ID where the order originates.
+	///
+	/// This represents the primary chain where the order was created and
+	/// where the input assets are typically located. For single-chain orders,
+	/// this is simply the chain of execution. For cross-chain orders, this
+	/// is the source chain.
+	///
+	/// # Returns
+	///
+	/// The chain ID as a `u64`. Common values include:
+	/// - 1 for Ethereum Mainnet
+	/// - 137 for Polygon
+	/// - 42161 for Arbitrum One
+	/// - etc.
+	///
+	/// # Default Behavior
+	///
+	/// If the chain ID cannot be determined, implementations should return
+	/// a sensible default (typically 1 for Ethereum Mainnet) rather than panic.
+	fn origin_chain_id(&self) -> u64;
+
+	/// Get the destination chain IDs where outputs will be delivered.
+	///
+	/// For cross-chain orders, outputs may be delivered to multiple chains.
+	/// This method returns all unique chain IDs where the order expects to
+	/// receive assets.
+	///
+	/// # Returns
+	///
+	/// A vector of chain IDs. May contain duplicates if multiple outputs
+	/// go to the same chain. May be empty if no outputs are specified.
+	///
+	/// # Usage
+	///
+	/// This information is used for:
+	/// - Calculating cross-chain routing costs
+	/// - Determining which bridges/protocols to use
+	/// - Estimating gas costs on destination chains
+	/// - Validating order feasibility
+	fn destination_chain_ids(&self) -> Vec<u64>;
 }
 
 /// Callback function type for computing order IDs.
@@ -84,6 +222,20 @@ pub struct Order {
 	/// Fill proof data when available.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub fill_proof: Option<FillProof>,
+}
+
+impl Order {
+	/// Parse the order data based on its standard
+	pub fn parse_order_data(&self) -> Result<Box<dyn OrderParsable>, Box<dyn std::error::Error>> {
+		match self.standard.as_str() {
+			"eip7683" => {
+				let order_data: Eip7683OrderData = serde_json::from_value(self.data.clone())
+					.map_err(|e| format!("Failed to parse EIP-7683 order data: {}", e))?;
+				Ok(Box::new(order_data))
+			},
+			_ => Err(format!("Unsupported order standard: {}", self.standard).into()),
+		}
+	}
 }
 
 /// Parameters for executing an order.
@@ -229,25 +381,5 @@ impl fmt::Display for OrderStatus {
 			OrderStatus::Finalized => write!(f, "Finalized"),
 			OrderStatus::Failed(_) => write!(f, "Failed"),
 		}
-	}
-}
-
-/// Implementation of CostEstimatable for Order
-impl CostEstimatable for Order {
-	fn input_chain_ids(&self) -> Vec<u64> {
-		self.input_chains.iter().map(|c| c.chain_id).collect()
-	}
-
-	fn output_chain_ids(&self) -> Vec<u64> {
-		self.output_chains.iter().map(|c| c.chain_id).collect()
-	}
-
-	fn lock_type(&self) -> Option<&str> {
-		self.data.get("lock_type").and_then(|v| v.as_str())
-	}
-
-	fn as_order_for_estimation(&self) -> Order {
-		// For a real Order, just return a clone
-		self.clone()
 	}
 }

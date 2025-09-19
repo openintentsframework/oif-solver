@@ -99,12 +99,43 @@ fi
 # Configuration
 MAIN_CONFIG="config/testnet.toml"
 NETWORKS_CONFIG="config/testnet/networks.toml"
+TESTNET_CONFIG="scripts/e2e/testnet-config.json"
 
-# Load account info
-SOLVER_ADDR=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'solver = ' | cut -d'"' -f2)
-USER_ADDR=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'user = ' | cut -d'"' -f2)
-USER_PRIVATE_KEY=${USER_PRIVATE_KEY:-$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'user_private_key = ' | cut -d'"' -f2)}
-RECIPIENT_ADDR=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'recipient = ' | cut -d'"' -f2)
+# Load environment variables from .env file if it exists
+if [ -f ".env" ]; then
+    set -a  # automatically export all variables
+    source .env
+    set +a  # disable automatic export
+fi
+
+# Load account configuration
+source scripts/e2e/lib/accounts.sh
+load_account_config
+
+# Use the loaded values
+SOLVER_ADDR=$SOLVER_ADDRESS
+USER_ADDR=$USER_ADDRESS
+RECIPIENT_ADDR=$RECIPIENT_ADDRESS
+
+# Validate demo environment
+if ! validate_demo_environment; then
+    exit 1
+fi
+
+# Helper functions for testnet config
+get_oracle_for_chain() {
+    local chain_id=$1
+    
+    # Iterate through all settlement implementations and find oracle for this chain
+    jq -r --arg chain_id "$chain_id" '
+        .settlement.implementations[] | 
+        select(.enabled == true) |
+        .chains | 
+        to_entries[] | 
+        select(.value.chain_id == ($chain_id | tonumber)) | 
+        .value.oracle
+    ' "$TESTNET_CONFIG" | head -1
+}
 
 # Dynamic config functions
 get_network_config() {
@@ -122,14 +153,8 @@ get_network_config() {
             awk "/\[\[networks\.${chain_id}\.rpc_urls\]\]/{f=1} f && /^http = /{print; exit}" $NETWORKS_CONFIG | cut -d'"' -f2
             ;;
         "oracle")
-            # Check if we should use Hyperlane oracle for this route
-            if [[ "$chain_id" == "17000" ]] || [[ "$chain_id" == "11155420" ]]; then
-                # Use Hyperlane oracle for Holesky <-> Optimism Sepolia
-                grep -A5 '\[settlement.implementations.hyperlane.oracles\]' $MAIN_CONFIG | grep 'input = ' | sed "s/.*${chain_id} = \[\"\([^\"]*\)\".*/\1/"
-            else
-                # Use direct settlement oracle for other chains
-                grep -A5 '\[settlement.implementations.direct.oracles\]' $MAIN_CONFIG | grep 'input = ' | sed "s/.*${chain_id} = \[\"\([^\"]*\)\".*/\1/"
-            fi
+            # Get oracle from any settlement configuration that supports this chain
+            get_oracle_for_chain "$chain_id"
             ;;
     esac
 }

@@ -3,6 +3,8 @@
 //! This module provides utilities for constructing Config instances with
 //! sensible defaults, particularly useful for testing scenarios.
 
+use rust_decimal::Decimal;
+
 use crate::{
 	AccountConfig, ApiConfig, Config, DeliveryConfig, DiscoveryConfig, GasConfig, NetworksConfig,
 	OrderConfig, SettlementConfig, SolverConfig, StorageConfig, StrategyConfig,
@@ -16,6 +18,7 @@ use std::collections::HashMap;
 pub struct ConfigBuilder {
 	solver_id: String,
 	monitoring_timeout_minutes: u64,
+	min_profitability_pct: Decimal,
 	storage_primary: String,
 	storage_cleanup_interval_seconds: u64,
 	min_confirmations: u64,
@@ -38,6 +41,7 @@ impl ConfigBuilder {
 		Self {
 			solver_id: "test-solver".to_string(),
 			monitoring_timeout_minutes: 1,
+			min_profitability_pct: Decimal::ZERO,
 			storage_primary: "memory".to_string(),
 			storage_cleanup_interval_seconds: 60,
 			min_confirmations: 1,
@@ -109,12 +113,19 @@ impl ConfigBuilder {
 		self
 	}
 
+	/// Sets the minimum profitability percentage.
+	pub fn with_min_profitability_pct(mut self, min_profitability_pct: Decimal) -> Self {
+		self.min_profitability_pct = min_profitability_pct;
+		self
+	}
+
 	/// Builds the `Config` with the configured values.
 	pub fn build(self) -> Config {
 		Config {
 			solver: SolverConfig {
 				id: self.solver_id,
 				monitoring_timeout_minutes: self.monitoring_timeout_minutes,
+				min_profitability_pct: self.min_profitability_pct,
 			},
 			networks: self.networks.unwrap_or_default(),
 			storage: StorageConfig {
