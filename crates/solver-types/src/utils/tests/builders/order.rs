@@ -150,7 +150,7 @@ impl OrderBuilder {
 			.into_iter()
 			.map(|chain_id| ChainSettlerInfo {
 				chain_id,
-				settler_address: Address(vec![0x00; 20]),
+				settler_address: Address(vec![0x11; 20]), // Default input settler address
 			})
 			.collect();
 		self
@@ -162,7 +162,7 @@ impl OrderBuilder {
 			.into_iter()
 			.map(|chain_id| ChainSettlerInfo {
 				chain_id,
-				settler_address: Address(vec![0x00; 20]),
+				settler_address: Address(vec![0x22; 20]), // Default output settler address
 			})
 			.collect();
 		self

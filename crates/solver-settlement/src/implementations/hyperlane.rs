@@ -229,6 +229,48 @@ pub struct HyperlaneSettlement {
 }
 
 impl HyperlaneSettlement {
+	/// Extract message ID from Dispatch event logs
+	fn extract_message_id_from_logs(
+		&self,
+		logs: &[solver_types::Log],
+	) -> Result<[u8; 32], SettlementError> {
+		println!("Logs: {:#?}", logs);
+
+		// Dispatch event signature: Dispatch(address,uint32,bytes32,bytes32)
+		// Topic0 is the event signature hash
+		let dispatch_signature = keccak256("Dispatch(address,uint32,bytes32,bytes32)");
+
+		// DispatchId event signature: DispatchId(bytes32)
+		let dispatch_id_signature = keccak256("DispatchId(bytes32)");
+
+		// First try to find Dispatch event
+		for log in logs {
+			if log.topics.is_empty() {
+				continue;
+			}
+
+			// Check for Dispatch event
+			if log.topics[0].0 == dispatch_signature.0 {
+				// Message ID is the 4th indexed parameter (topics[3])
+				if log.topics.len() > 3 {
+					return Ok(log.topics[3].0);
+				}
+			}
+
+			// Check for DispatchId event
+			if log.topics[0].0 == dispatch_id_signature.0 {
+				// Message ID is the 1st indexed parameter (topics[1])
+				if log.topics.len() > 1 {
+					return Ok(log.topics[1].0);
+				}
+			}
+		}
+
+		Err(SettlementError::ValidationFailed(
+			"No Dispatch or DispatchId event found in transaction logs".to_string(),
+		))
+	}
+
 	/// Creates a new HyperlaneSettlement instance
 	pub async fn new(
 		networks: &NetworksConfig,
@@ -659,7 +701,7 @@ impl SettlementInterface for HyperlaneSettlement {
 
 		// Get the OutputSettler address from the order
 		// The OutputSettler is the contract that attested the payloads during fill
-		let output_chain = order.input_chains.first().ok_or_else(|| {
+		let output_chain = order.output_chains.first().ok_or_else(|| {
 			SettlementError::ValidationFailed("No output settler in order".into())
 		})?;
 
@@ -786,15 +828,8 @@ impl SettlementInterface for HyperlaneSettlement {
 				.map(|c| c.chain_id)
 				.ok_or_else(|| SettlementError::ValidationFailed("No output chains".into()))?;
 
-			// Create a deterministic message ID from the transaction hash
-			// TODO: this would be extracted from Dispatch event logs
-			let mut message_id = [0u8; 32];
-			if receipt.hash.0.len() >= 32 {
-				message_id.copy_from_slice(&receipt.hash.0[0..32]);
-			} else {
-				// Pad with zeros if hash is shorter
-				message_id[..receipt.hash.0.len()].copy_from_slice(&receipt.hash.0);
-			}
+			// Extract message ID from Dispatch event logs
+			let message_id = self.extract_message_id_from_logs(&receipt.logs)?;
 
 			// Store in message tracker for later use in can_claim and pre_claim
 			self.message_tracker.write().await.track_submission(

@@ -603,26 +603,12 @@ impl OrderInterface for Eip7683OrderImpl {
 		// Validate oracle routes
 		let origin_chain = standard_order.originChainId.to::<u64>();
 		let input_oracle = standard_order.inputOracle;
-		// Extract the 20-byte address from the AlloyAddress
-		let input_oracle_bytes = input_oracle.as_slice();
-		let input_oracle_address = Address(input_oracle_bytes.to_vec());
+		let input_oracle_address = Address(input_oracle.as_slice().to_vec());
 
 		let input_info = solver_types::oracle::OracleInfo {
 			chain_id: origin_chain,
-			oracle: input_oracle_address.clone(),
+			oracle: input_oracle_address,
 		};
-
-		// Check if the input oracle is supported
-		if !self
-			.oracle_routes
-			.supported_routes
-			.contains_key(&input_info)
-		{
-			return Err(OrderError::ValidationFailed(format!(
-				"Input oracle {:?} on chain {} is not supported",
-				input_oracle, origin_chain
-			)));
-		}
 
 		// Get supported output oracles for this input oracle
 		let supported_outputs = self
@@ -631,15 +617,16 @@ impl OrderInterface for Eip7683OrderImpl {
 			.get(&input_info)
 			.ok_or_else(|| {
 				OrderError::ValidationFailed(format!(
-					"No routes configured for input oracle {:?} on chain {}",
+					"Input oracle {:?} on chain {} is not supported",
 					input_oracle, origin_chain
 				))
 			})?;
 
-		// Early validation: Check if the specific routes exist
+		// Build a set of supported destinations for efficient lookups
 		let supported_destinations: std::collections::HashSet<u64> =
 			supported_outputs.iter().map(|info| info.chain_id).collect();
 
+		// Single pass validation for all outputs
 		for output in &standard_order.outputs {
 			let dest_chain = output.chainId.to::<u64>();
 
@@ -648,48 +635,29 @@ impl OrderInterface for Eip7683OrderImpl {
 				continue;
 			}
 
+			// First check if destination chain is supported at all
 			if !supported_destinations.contains(&dest_chain) {
 				return Err(OrderError::ValidationFailed(format!(
 					"Route from chain {} to chain {} is not supported (oracle {:?} has no route to destination)",
 					origin_chain, dest_chain, input_oracle
 				)));
 			}
-		}
 
-		// Validate each output oracle
-		for output in &standard_order.outputs {
-			let dest_chain = output.chainId.to::<u64>();
-
-			// If output oracle is zero (0x00...), it means use any compatible oracle
-			// Otherwise, validate the specific oracle
+			// If a specific output oracle is specified, validate it
 			if output.oracle != [0u8; 32] {
-				// Parse the oracle address from bytes32 (take last 20 bytes)
-				let output_oracle_bytes = &output.oracle[12..32];
-				let output_oracle = Address(output_oracle_bytes.to_vec());
+				// Parse the oracle address from bytes32 (last 20 bytes)
+				let output_oracle = Address(output.oracle[12..32].to_vec());
 
 				let output_info = solver_types::oracle::OracleInfo {
 					chain_id: dest_chain,
 					oracle: output_oracle,
 				};
 
-				// Check if this output oracle is in the supported list
+				// Check if this specific output oracle is in the supported list
 				if !supported_outputs.contains(&output_info) {
 					return Err(OrderError::ValidationFailed(format!(
 						"Output oracle {:?} on chain {} is not compatible with input oracle {:?} on chain {}",
 						output.oracle, dest_chain, input_oracle, origin_chain
-					)));
-				}
-			} else {
-				// Zero oracle means any oracle on the destination chain is acceptable
-				// Just verify that there's at least one oracle for this destination
-				let has_route_to_dest = supported_outputs
-					.iter()
-					.any(|info| info.chain_id == dest_chain);
-
-				if !has_route_to_dest {
-					return Err(OrderError::ValidationFailed(format!(
-						"No route available from chain {} to chain {}",
-						origin_chain, dest_chain
 					)));
 				}
 			}
@@ -1048,12 +1016,7 @@ mod tests {
 
 		let tx = result.unwrap().unwrap();
 		assert_eq!(tx.chain_id, 1);
-		assert_eq!(
-			tx.to,
-			Some(Address(
-				hex::decode("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9").unwrap()
-			))
-		); // input_settler_address for chain 1
+		assert_eq!(tx.to, Some(Address(vec![0x11; 20])));
 		assert!(!tx.data.is_empty());
 	}
 
@@ -1081,12 +1044,7 @@ mod tests {
 
 		let tx = result.unwrap();
 		assert_eq!(tx.chain_id, 137); // destination chain
-		assert_eq!(
-			tx.to,
-			Some(Address(
-				hex::decode("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f").unwrap()
-			))
-		); // output_settler_address for chain 137
+		assert_eq!(tx.to, Some(Address(vec![0x22; 20])));
 		assert!(!tx.data.is_empty());
 	}
 
@@ -1119,12 +1077,7 @@ mod tests {
 
 		let tx = result.unwrap();
 		assert_eq!(tx.chain_id, 1); // origin chain
-		assert_eq!(
-			tx.to,
-			Some(Address(
-				hex::decode("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9").unwrap()
-			))
-		); // input_settler_address for chain 1
+		assert_eq!(tx.to, Some(Address(vec![0x11; 20])));
 		assert!(!tx.data.is_empty());
 	}
 
@@ -1162,12 +1115,7 @@ mod tests {
 
 		let tx = result.unwrap();
 		assert_eq!(tx.chain_id, 1); // origin chain
-		assert_eq!(
-			tx.to,
-			Some(Address(
-				hex::decode("00000000000c2e074ec69a0dfb2997ba6c7d2e1e").unwrap()
-			))
-		); // compact address for chain 1
+		assert_eq!(tx.to, Some(Address(vec![0x11; 20])));
 		assert!(!tx.data.is_empty());
 	}
 

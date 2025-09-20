@@ -276,10 +276,27 @@ impl DeliveryInterface for AlloyDelivery {
 
 			// Check if we have enough confirmations
 			if current_confirmations >= confirmations {
+				// Convert alloy logs to our Log type
+				let logs = receipt
+					.inner
+					.logs()
+					.iter()
+					.map(|log| solver_types::Log {
+						address: solver_types::Address(log.address().0.to_vec()),
+						topics: log
+							.topics()
+							.iter()
+							.map(|topic| solver_types::H256(topic.0))
+							.collect(),
+						data: log.inner.data.data.to_vec(),
+					})
+					.collect();
+
 				return Ok(TransactionReceipt {
 					hash: TransactionHash(receipt.transaction_hash.0.to_vec()),
 					block_number: tx_block,
 					success: receipt.status(),
+					logs,
 				});
 			}
 
@@ -304,11 +321,30 @@ impl DeliveryInterface for AlloyDelivery {
 		let provider = self.get_provider(chain_id)?;
 
 		match provider.get_transaction_receipt(tx_hash).await {
-			Ok(Some(receipt)) => Ok(TransactionReceipt {
-				hash: TransactionHash(receipt.transaction_hash.0.to_vec()),
-				block_number: receipt.block_number.unwrap_or(0),
-				success: receipt.status(),
-			}),
+			Ok(Some(receipt)) => {
+				// Convert alloy logs to our Log type
+				let logs = receipt
+					.inner
+					.logs()
+					.iter()
+					.map(|log| solver_types::Log {
+						address: solver_types::Address(log.address().0.to_vec()),
+						topics: log
+							.topics()
+							.iter()
+							.map(|topic| solver_types::H256(topic.0))
+							.collect(),
+						data: log.inner.data.data.to_vec(),
+					})
+					.collect();
+
+				Ok(TransactionReceipt {
+					hash: TransactionHash(receipt.transaction_hash.0.to_vec()),
+					block_number: receipt.block_number.unwrap_or(0),
+					success: receipt.status(),
+					logs,
+				})
+			},
 			Ok(None) => Err(DeliveryError::Network(format!(
 				"Transaction not found on chain {}",
 				chain_id
