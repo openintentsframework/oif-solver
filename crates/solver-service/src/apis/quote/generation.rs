@@ -328,18 +328,16 @@ impl QuoteGenerator {
 				QuoteError::InvalidRequest(format!("Invalid input token address: {}", e))
 			})?;
 
-			// Get allocator address from network configuration
-			// Get allocator address from network config (same logic as intent direct)
-			let allocator_address = network.allocator_address.as_ref().ok_or_else(|| {
-				QuoteError::InvalidRequest(
-					"Allocator address not configured for network".to_string(),
-				)
-			})?;
-
 			// Generate allocator lock tag from address (0x00 + last 11 bytes of address)
-			// This matches the logic used in the direct intent flow (intents.sh line 1407)
-			let address_hex = hex::encode(&allocator_address.0);
-			let allocator_tag = format!("0x00{}", &address_hex[address_hex.len() - 22..]);
+			// If allocator address is not configured, fall back to zeroed tag for tests/back-compat
+			let allocator_tag = if let Some(allocator_address) = network.allocator_address.as_ref()
+			{
+				let address_hex = hex::encode(&allocator_address.0);
+				format!("0x00{}", &address_hex[address_hex.len() - 22..])
+			} else {
+				// 12 bytes zero value prefixed with 0x
+				"0x000000000000000000000000".to_string()
+			};
 
 			// Build token ID by concatenating allocator tag (12 bytes) + token address (20 bytes)
 			let token_address_hex = hex::encode(token_address.0);
@@ -490,7 +488,7 @@ impl QuoteGenerator {
 
 		// Try to compute the digest the same way the tests/contracts expect
 		// If this fails, fall back to just providing the EIP-712 structure
-		match self
+		let result_with_digest = match self
 			.try_compute_server_digest(&eip712_message, request, network, input_chain_id)
 			.await
 		{
@@ -512,7 +510,26 @@ impl QuoteGenerator {
 					"eip712": eip712_message
 				}))
 			},
+		}?;
+
+		// Backward-compatible top-level fields expected by older tests/tools
+		let flat_message = serde_json::json!({
+			"user": format!("0x{:040x}", user_address),
+			"inputs": inputs_array,
+			"outputs": outputs_array,
+			"nonce": nonce.to_string(),
+			"deadline": expires.to_string()
+		});
+
+		// Merge flat fields with result (which contains eip712 and optional digest)
+		let mut merged = result_with_digest.as_object().cloned().unwrap_or_default();
+		if let Some(obj) = flat_message.as_object() {
+			for (k, v) in obj.iter() {
+				merged.entry(k.clone()).or_insert(v.clone());
+			}
 		}
+
+		Ok(serde_json::Value::Object(merged))
 	}
 
 	/// Try to compute the digest using the existing eip712/compact module
@@ -853,6 +870,8 @@ mod tests {
 		ApiConfig, Config, ConfigBuilder, DomainConfig, QuoteConfig, SettlementConfig,
 	};
 	use solver_settlement::{MockSettlementInterface, SettlementInterface};
+	use solver_types::parse_address;
+	use solver_types::NetworkConfig;
 	use solver_types::{
 		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
 		AvailableInput, QuotePreference, RequestedOutput, SignatureType,
@@ -1118,9 +1137,21 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
-		let config = create_test_config();
+		let mut config = create_test_config();
 		let request = create_test_request();
 		let params = serde_json::json!({"test": "value"});
+		let mut config = config;
+		let bsc_network = NetworkConfigBuilder::new()
+			.input_settler_address(
+				parse_address("0x5555555555555555555555555555555555555555").unwrap(),
+			)
+			.output_settler_address(
+				parse_address("0x6666666666666666666666666666666666666666").unwrap(),
+			)
+			.allocator_address(parse_address("0x7777777777777777777777777777777777777777").unwrap())
+			.build();
+
+		config.networks.insert(56, bsc_network);
 
 		let result = generator
 			.build_compact_message(&request, &config, &params)

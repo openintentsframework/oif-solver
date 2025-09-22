@@ -141,6 +141,7 @@ pub struct NetworkConfigBuilder {
 	tokens: Vec<TokenConfig>,
 	input_settler_compact_address: Option<Address>,
 	the_compact_address: Option<Address>,
+	allocator_address: Option<Address>,
 }
 
 impl Default for NetworkConfigBuilder {
@@ -174,6 +175,7 @@ impl NetworkConfigBuilder {
 				parse_address("0x00000000000c2e074ec69a0dfb2997ba6c7d2e1f")
 					.expect("Invalid mock address"),
 			),
+			allocator_address: None,
 		}
 	}
 
@@ -210,6 +212,12 @@ impl NetworkConfigBuilder {
 	/// Sets the output settler address.
 	pub fn output_settler_address(mut self, address: Address) -> Self {
 		self.output_settler_address = Some(address);
+		self
+	}
+
+	/// Sets the allocator address.
+	pub fn allocator_address(mut self, address: Address) -> Self {
+		self.allocator_address = Some(address);
 		self
 	}
 
