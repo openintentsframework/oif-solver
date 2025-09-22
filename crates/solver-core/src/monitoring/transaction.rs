@@ -112,7 +112,12 @@ impl TransactionMonitor {
 						_ => "Checking transaction status",
 					};
 
-					tracing::info!(elapsed_secs = start_time.elapsed().as_secs(), "{}", message);
+					tracing::info!(
+						elapsed_secs = start_time.elapsed().as_secs(),
+						reason = e.to_string(),
+						"{}",
+						message
+					);
 				},
 			}
 

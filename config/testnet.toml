@@ -2,11 +2,7 @@
 # Origin Chain ID: 17000
 # Destination Chain ID: 11155420
 
-include = [
-    "testnet/networks.toml",
-    "testnet/api.toml",
-    "testnet/gas.toml"
-]
+include = ["testnet/networks.toml", "testnet/api.toml", "testnet/gas.toml"]
 
 [solver]
 id = "oif-solver-testnet"
@@ -42,7 +38,7 @@ private_key = "${SOLVER_PRIVATE_KEY}"
 # DELIVERY
 # ============================================================================
 [delivery]
-min_confirmations = 3
+min_confirmations = 1
 
 [delivery.implementations.evm_alloy]
 network_ids = [17000, 11155420]
@@ -100,8 +96,16 @@ dispute_period_seconds = 60
 oracle_selection_strategy = "First"
 
 [settlement.implementations.direct.oracles]
-input = { 17000 = ["0x177c8FD27aB605b34cbF9215497990B4902330Ab"], 11155420 = ["0x177c8FD27aB605b34cbF9215497990B4902330Ab"] }
-output = { 17000 = ["0x177c8FD27aB605b34cbF9215497990B4902330Ab"], 11155420 = ["0x177c8FD27aB605b34cbF9215497990B4902330Ab"] }
+input = { 17000 = [
+    "0x177c8FD27aB605b34cbF9215497990B4902330Ab",
+], 11155420 = [
+    "0x177c8FD27aB605b34cbF9215497990B4902330Ab",
+] }
+output = { 17000 = [
+    "0x177c8FD27aB605b34cbF9215497990B4902330Ab",
+], 11155420 = [
+    "0x177c8FD27aB605b34cbF9215497990B4902330Ab",
+] }
 
 [settlement.implementations.direct.routes]
 17000 = [11155420]
@@ -118,8 +122,16 @@ message_timeout_seconds = 600
 finalization_required = true
 
 [settlement.implementations.hyperlane.oracles]
-input = { 17000 = ["0x0b88D54A39F330Dd7e773af4806BDC490c79cAB6"], 11155420 = ["0x0b88D54A39F330Dd7e773af4806BDC490c79cAB6"] }
-output = { 17000 = ["0x0b88D54A39F330Dd7e773af4806BDC490c79cAB6"], 11155420 = ["0x0b88D54A39F330Dd7e773af4806BDC490c79cAB6"] }
+input = { 17000 = [
+    "0x0b88D54A39F330Dd7e773af4806BDC490c79cAB6",
+], 11155420 = [
+    "0x0b88D54A39F330Dd7e773af4806BDC490c79cAB6",
+] }
+output = { 17000 = [
+    "0x0b88D54A39F330Dd7e773af4806BDC490c79cAB6",
+], 11155420 = [
+    "0x0b88D54A39F330Dd7e773af4806BDC490c79cAB6",
+] }
 
 [settlement.implementations.hyperlane.routes]
 17000 = [11155420]

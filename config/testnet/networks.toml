@@ -5,7 +5,7 @@ input_settler_address = "0xf5Cc8e52FD781Dd2Af9D55c19ACe5f8521319AFF"
 output_settler_address = "0x0000000000000000000000000000000000000000"
 
 [[networks.17000.rpc_urls]]
-http = "https://holesky.drpc.org"
+http = "https://lb.drpc.org/holesky/${DRPC_API_KEY}"
 
 [[networks.17000.tokens]]
 address = "0x7dfFC9e7db5a96887666c1a6D215E5d3Fb306d69"
@@ -17,7 +17,7 @@ input_settler_address = "0x0000000000000000000000000000000000000000"
 output_settler_address = "0xAa3Cb09604B9B6e84C69bEA77D61d067CCef7293"
 
 [[networks.11155420.rpc_urls]]
-http = "https://sepolia.optimism.io"
+http = "https://lb.drpc.org/optimism-sepolia/${DRPC_API_KEY}"
 
 [[networks.11155420.tokens]]
 address = "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"
