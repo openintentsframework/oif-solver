@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 /// Type alias for EIP-712 data extraction result
-type Eip712ExtractionResult<'a> = Result<(&'a serde_json::Map<String, serde_json::Value>, &'a str), Box<dyn std::error::Error>>;
+type Eip712ExtractionResult<'a> =
+	Result<(&'a serde_json::Map<String, serde_json::Value>, &'a str), Box<dyn std::error::Error>>;
 
 /// Lock type for cross-chain orders, determining the custody mechanism used.
 ///
@@ -522,9 +523,7 @@ impl TryFrom<&Quote> for interfaces::StandardOrder {
 #[cfg(feature = "oif-interfaces")]
 impl Eip7683OrderData {
 	/// Extract and validate EIP-712 data from quote to detect order type
-	fn extract_eip712_data(
-		quote: &Quote,
-	) -> Eip712ExtractionResult<'_> {
+	fn extract_eip712_data(quote: &Quote) -> Eip712ExtractionResult<'_> {
 		let quote_order = quote
 			.orders
 			.first()

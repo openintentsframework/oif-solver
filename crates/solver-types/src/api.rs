@@ -12,7 +12,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 
 /// Type alias for EIP-712 data extraction result
-type Eip712ExtractionResult<'a> = Result<(&'a serde_json::Map<String, serde_json::Value>, &'a str), Box<dyn std::error::Error>>;
+type Eip712ExtractionResult<'a> =
+	Result<(&'a serde_json::Map<String, serde_json::Value>, &'a str), Box<dyn std::error::Error>>;
 
 /// Intent request that unifies both quote acceptances and direct order submissions.
 /// Used as the common type for order validation and forwarding to discovery service.
@@ -307,9 +308,7 @@ impl TryFrom<(&Quote, &str, &str)> for IntentRequest {
 #[cfg(feature = "oif-interfaces")]
 impl IntentRequest {
 	/// Extract and validate EIP-712 data from quote
-	fn extract_eip712_data(
-		quote: &Quote,
-	) -> Eip712ExtractionResult<'_> {
+	fn extract_eip712_data(quote: &Quote) -> Eip712ExtractionResult<'_> {
 		let quote_order = quote
 			.orders
 			.first()
