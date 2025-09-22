@@ -769,11 +769,58 @@ quote_accept() {
         else
             print_info "Detected Permit2 order, using standard signing..."
 
-            # Use client-side digest computation like compact flow
-            signature=$(sign_permit2_digest_from_quote "$user_key" "$full_message")
+            # Extract witness data first (needed for signing)
+            local witness=$(echo "$eip712_message" | jq -r '.witness // empty')
+            local witness_expires=$(echo "$witness" | jq -r '.expires // 0')
+            local input_oracle=$(echo "$witness" | jq -r '.inputOracle // "0x0000000000000000000000000000000000000000"')
+
+            # Sign the EIP-712 message
+            local domain=$(echo "$eip712_message" | jq -r '.signing.domain // empty')
+            local deadline=$(echo "$eip712_message" | jq -r '.deadline // empty')
+            local nonce=$(echo "$eip712_message" | jq -r '.nonce // empty')
+            local spender=$(echo "$eip712_message" | jq -r '.spender // empty')
+
+            # Extract the required fields for Permit2 signing
+            local permitted_token=$(echo "$eip712_message" | jq -r '.permitted[0].token // empty')
+            local permitted_amount=$(echo "$eip712_message" | jq -r '.permitted[0].amount // empty')
+
+            # Convert interop address to standard Ethereum address if needed for signing
+            local standard_permitted_token="$permitted_token"
+            # Interop addresses are longer than standard addresses (42 chars)
+            if [[ ${#permitted_token} -gt 42 ]]; then
+                # This is likely an interop address, convert to standard
+                standard_permitted_token=$(from_uii_address "$permitted_token")
+                print_debug "Converted permitted token from interop to standard: $permitted_token -> $standard_permitted_token"
+            fi
+
+            # Get origin chain ID from the domain
+            local origin_chain_id=$(echo "$domain" | jq -r '.chainId // 31337')
+
+            # Build mandate outputs array from witness outputs
+            local mandate_outputs_json=$(echo "$witness" | jq -c '.outputs')
+
+            # Use client-side digest computation but with proper signature formatting
+            print_info "Computing client-side digest..."
+            local client_digest=$(compute_permit2_digest_from_quote "$eip712_message")
+            if [ $? -ne 0 ] || [ -z "$client_digest" ]; then
+                print_error "Failed to compute client-side digest"
+                return 1
+            fi
+            print_debug "Client computed digest: $client_digest"
+            print_info "Signing with client-computed digest: $client_digest"
+
+            # Sign the digest directly and add proper permit2 prefix
+            local raw_signature=$(cast wallet sign --no-hash --private-key "$user_key" "$client_digest")
+            if [ $? -ne 0 ] || [ -z "$raw_signature" ]; then
+                print_error "Failed to sign digest"
+                return 1
+            fi
+
+            # Create prefixed signature for permit2
+            signature=$(create_prefixed_signature "$raw_signature" "permit2")
 
             if [ -z "$signature" ]; then
-                print_error "Failed to sign Permit2 order"
+                print_error "Failed to sign EIP-712 order"
                 return 1
             fi
 
