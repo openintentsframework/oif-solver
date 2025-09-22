@@ -301,7 +301,6 @@ impl TryFrom<(&Quote, &str, &str)> for IntentRequest {
 	}
 }
 
-
 #[cfg(feature = "oif-interfaces")]
 impl IntentRequest {
 	/// Extract and validate EIP-712 data from quote
@@ -334,13 +333,13 @@ impl IntentRequest {
 		quote: &Quote,
 		eip712_data: &serde_json::Map<String, serde_json::Value>,
 	) -> Result<crate::standards::eip7683::interfaces::StandardOrder, Box<dyn std::error::Error>> {
+		use crate::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
 		use crate::standards::eip7930::InteropAddress;
-		use crate::standards::eip7683::interfaces::{StandardOrder, SolMandateOutput};
 		use crate::utils::parse_bytes32_from_hex;
 		use alloy_primitives::{Address, U256};
 
 		tracing::info!("Processing BatchCompact order data");
-		
+
 		// Extract user address from quote
 		let user_str = &quote
 			.details
@@ -430,7 +429,7 @@ impl IntentRequest {
 		// Extract outputs from mandate
 		let outputs_value = mandate.get("outputs").ok_or("Missing outputs in mandate")?;
 		let mut sol_outputs = Vec::new();
-		
+
 		if let Some(outputs_array) = outputs_value.as_array() {
 			for output_item in outputs_array {
 				if let Some(output_obj) = output_item.as_object() {

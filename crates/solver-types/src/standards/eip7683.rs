@@ -548,8 +548,8 @@ impl Eip7683OrderData {
 		quote: &Quote,
 		eip712_data: &serde_json::Map<String, serde_json::Value>,
 	) -> Result<interfaces::StandardOrder, Box<dyn std::error::Error>> {
+		use crate::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
 		use crate::standards::eip7930::InteropAddress;
-		use crate::standards::eip7683::interfaces::{StandardOrder, SolMandateOutput};
 		use crate::utils::parse_bytes32_from_hex;
 		use alloy_primitives::{Address, U256};
 
@@ -642,7 +642,7 @@ impl Eip7683OrderData {
 		// Extract outputs from mandate
 		let outputs_value = mandate.get("outputs").ok_or("Missing outputs in mandate")?;
 		let mut sol_outputs = Vec::new();
-		
+
 		if let Some(outputs_array) = outputs_value.as_array() {
 			for output_item in outputs_array {
 				if let Some(output_obj) = output_item.as_object() {
@@ -711,21 +711,22 @@ impl QuoteParsable for Eip7683OrderData {
 		use std::convert::TryFrom;
 
 		// Detect order type from EIP-712 data to handle BatchCompact properly
-		let standard_order = if let Ok((eip712_data, primary_type)) = Eip7683OrderData::extract_eip712_data(quote) {
-			if primary_type == "BatchCompact" {
-				// Handle BatchCompact orders using specialized parsing
-				Eip7683OrderData::handle_batch_compact_quote_conversion(quote, eip712_data)
-					.expect("Failed to convert BatchCompact quote to StandardOrder")
+		let standard_order =
+			if let Ok((eip712_data, primary_type)) = Eip7683OrderData::extract_eip712_data(quote) {
+				if primary_type == "BatchCompact" {
+					// Handle BatchCompact orders using specialized parsing
+					Eip7683OrderData::handle_batch_compact_quote_conversion(quote, eip712_data)
+						.expect("Failed to convert BatchCompact quote to StandardOrder")
+				} else {
+					// Handle Permit2/EIP3009 orders using existing implementation
+					interfaces::StandardOrder::try_from(quote)
+						.expect("Failed to convert quote to StandardOrder")
+				}
 			} else {
-				// Handle Permit2/EIP3009 orders using existing implementation
+				// Fallback to existing implementation if detection fails
 				interfaces::StandardOrder::try_from(quote)
 					.expect("Failed to convert quote to StandardOrder")
-			}
-		} else {
-			// Fallback to existing implementation if detection fails
-			interfaces::StandardOrder::try_from(quote)
-				.expect("Failed to convert quote to StandardOrder")
-		};
+			};
 
 		// Convert StandardOrder to Eip7683OrderData
 		let mut order_data = Eip7683OrderData::from(standard_order.clone());
