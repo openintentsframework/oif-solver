@@ -109,7 +109,7 @@ impl CostProfitService {
 		// Extract flow key (lock_type) for gas config lookup
 		let flow_key = Some(quote.lock_type.clone());
 
-		// Determine the standard - for quotes, we default to eip7683
+		// TODO: pass standard as part of quote request
 		let standard = "eip7683";
 		let order = quote
 			.to_order_for_estimation(standard)
@@ -379,24 +379,20 @@ impl CostProfitService {
 		use solver_types::truncate_id;
 
 		// Calculate cost estimation
-		let cost_estimate = self
-			.estimate_cost_for_order(order, config)
-			.await
-			.map_err(|e| match e {
-				CostProfitError::Api(api_error) => api_error,
-				other => APIError::InternalServerError {
-					error_type: ApiErrorType::InternalError,
-					message: format!("Cost estimation failed: {}", other),
-				},
-			})?;
+		let cost_estimate =
+			self.estimate_cost_for_order(order, config)
+				.await
+				.map_err(|e| match e {
+					CostProfitError::Api(api_error) => api_error,
+					other => APIError::InternalServerError {
+						error_type: ApiErrorType::InternalError,
+						message: format!("Cost estimation failed: {}", other),
+					},
+				})?;
 
 		// Validate profitability
 		let actual_profit_margin = self
-			.validate_profitability(
-				order,
-				&cost_estimate,
-				config.solver.min_profitability_pct,
-			)
+			.validate_profitability(order, &cost_estimate, config.solver.min_profitability_pct)
 			.await?;
 
 		tracing::info!(
@@ -418,7 +414,8 @@ impl CostProfitService {
 		origin_chain_id: u64,
 		dest_chain_id: u64,
 	) -> Result<GasUnits, CostProfitError> {
-		// For now, we'll use a simple check for live gas estimation
+		// TODO: For now, we'll use a simple check for live gas estimation and pass it as a parameter
+		// in the future we should use the config.gas.enable_live_gas_estimate
 		let enable_live_gas_estimate = false;
 
 		// Get base units from config
