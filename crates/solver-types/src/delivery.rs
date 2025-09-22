@@ -43,6 +43,9 @@ pub struct TransactionReceipt {
 	pub success: bool,
 	/// Event logs emitted during transaction execution.
 	pub logs: Vec<Log>,
+	/// Block timestamp (Unix timestamp) - extracted from logs if available
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub block_timestamp: Option<u64>,
 }
 
 /// Chain data structure containing current blockchain state information.

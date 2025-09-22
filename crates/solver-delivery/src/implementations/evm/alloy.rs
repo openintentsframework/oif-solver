@@ -196,18 +196,43 @@ impl DeliveryInterface for AlloyDelivery {
 		let provider = self.get_provider(chain_id)?;
 
 		// Convert solver transaction to alloy transaction request
-		let request: TransactionRequest = tx.into();
+		let request: TransactionRequest = tx.clone().into();
+
+		// Log request details for debugging
+		tracing::debug!(
+			"Sending transaction on chain {}: to={:?}, value={:?}, data_len={}, gas_limit={:?}",
+			chain_id,
+			request.to,
+			request.value,
+			request.input.input().map(|d| d.len()).unwrap_or(0),
+			request.gas
+		);
 
 		// Send transaction - the provider's wallet will handle signing
-		let pending_tx = provider
-			.send_transaction(request)
-			.await
-			.map_err(|e| DeliveryError::Network(format!("Failed to send transaction: {}", e)))?;
+		let pending_tx = provider.send_transaction(request).await.map_err(|e| {
+			tracing::error!("Transaction submission failed on chain {}: {}", chain_id, e);
+			DeliveryError::Network(format!("Failed to send transaction: {}", e))
+		})?;
 
 		// Get the transaction hash
 		let tx_hash = *pending_tx.tx_hash();
 		let hash_str = with_0x_prefix(&hex::encode(tx_hash.0));
-		tracing::info!(tx_hash = %hash_str, chain_id = chain_id, "Submitted transaction");
+
+		// Wait briefly to ensure transaction is in mempool
+		tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+		// Verify the transaction exists
+		match provider.get_transaction_by_hash(tx_hash).await {
+			Ok(Some(_)) => {
+				tracing::info!(tx_hash = %hash_str, chain_id = chain_id, "Transaction confirmed in mempool");
+			},
+			Ok(None) => {
+				tracing::warn!(tx_hash = %hash_str, chain_id = chain_id, "Transaction not found in mempool after submission");
+			},
+			Err(e) => {
+				tracing::warn!(tx_hash = %hash_str, chain_id = chain_id, "Could not verify transaction in mempool: {}", e);
+			},
+		}
 
 		Ok(TransactionHash(tx_hash.0.to_vec()))
 	}
@@ -220,10 +245,10 @@ impl DeliveryInterface for AlloyDelivery {
 	) -> Result<TransactionReceipt, DeliveryError> {
 		let tx_hash = FixedBytes::<32>::from_slice(&hash.0);
 
-		// Poll interval for checking confirmations
-		let poll_interval = tokio::time::Duration::from_secs(10);
-		// Allow ~15 seconds per confirmation (typical block time) plus some buffer
-		let seconds_per_confirmation = 20;
+		// Poll interval for checking confirmations - aligned with monitor's 3-second interval
+		let poll_interval = tokio::time::Duration::from_secs(3);
+		// Allow 3x ~15 seconds per confirmation (typical block time)
+		let seconds_per_confirmation = 45;
 		let max_timeout = 3600; // Cap at 1 hour
 		let timeout_seconds = (confirmations * seconds_per_confirmation)
 			.max(seconds_per_confirmation)
@@ -276,6 +301,13 @@ impl DeliveryInterface for AlloyDelivery {
 
 			// Check if we have enough confirmations
 			if current_confirmations >= confirmations {
+				// Extract block timestamp from the first log that has it
+				let block_timestamp = receipt
+					.inner
+					.logs()
+					.iter()
+					.find_map(|log| log.block_timestamp);
+
 				// Convert alloy logs to our Log type
 				let logs = receipt
 					.inner
@@ -297,6 +329,7 @@ impl DeliveryInterface for AlloyDelivery {
 					block_number: tx_block,
 					success: receipt.status(),
 					logs,
+					block_timestamp,
 				});
 			}
 
@@ -322,6 +355,13 @@ impl DeliveryInterface for AlloyDelivery {
 
 		match provider.get_transaction_receipt(tx_hash).await {
 			Ok(Some(receipt)) => {
+				// Extract block timestamp from the first log that has it
+				let block_timestamp = receipt
+					.inner
+					.logs()
+					.iter()
+					.find_map(|log| log.block_timestamp);
+
 				// Convert alloy logs to our Log type
 				let logs = receipt
 					.inner
@@ -343,6 +383,7 @@ impl DeliveryInterface for AlloyDelivery {
 					block_number: receipt.block_number.unwrap_or(0),
 					success: receipt.status(),
 					logs,
+					block_timestamp,
 				})
 			},
 			Ok(None) => Err(DeliveryError::Network(format!(
