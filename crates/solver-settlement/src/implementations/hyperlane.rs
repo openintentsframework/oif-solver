@@ -10,15 +10,39 @@ use alloy_rpc_types::BlockTransactionsKind;
 use alloy_sol_types::{sol, SolCall};
 use alloy_transport_http::Http;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
+use solver_storage::StorageService;
 use solver_types::{
 	standards::eip7683::{Eip7683OrderData, MandateOutput},
 	with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, NetworksConfig, Order, Schema,
-	Transaction, TransactionHash, TransactionReceipt, TransactionType,
+	StorageKey, Transaction, TransactionHash, TransactionReceipt, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Custom serialization for U256
+mod u256_serde {
+	use alloy_primitives::U256;
+	use serde::{Deserialize, Deserializer, Serializer};
+
+	pub fn serialize<S>(value: &U256, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		serializer.serialize_str(&value.to_string())
+	}
+
+	pub fn deserialize<'de, D>(deserializer: D) -> Result<U256, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		let s = String::deserialize(deserializer)?;
+		s.parse::<U256>()
+			.map_err(|_| serde::de::Error::custom("Failed to parse U256"))
+	}
+}
 
 /// Helper to compute keccak256 hash
 fn keccak256(data: &str) -> FixedBytes<32> {
@@ -252,49 +276,128 @@ sol! {
 	event DispatchId(bytes32 indexed messageId);
 }
 
-/// Message tracker for managing Hyperlane messages
-#[derive(Debug, Clone, Default)]
-pub struct MessageTracker {
-	submitted_messages: HashMap<String, SubmittedMessage>,
-	delivered_messages: HashMap<String, DeliveredMessage>,
+/// Message state for a single order
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HyperlaneMessageState {
+	submitted: Option<SubmittedMessage>,
+	delivered: Option<DeliveredMessage>,
 }
 
-#[derive(Debug, Clone)]
+/// Message tracker for managing Hyperlane messages with automatic persistence
+#[derive(Clone)]
+pub struct MessageTracker {
+	storage: Arc<StorageService>,
+	/// Cache of recently accessed messages (order_id -> state)
+	cache: Arc<RwLock<HashMap<String, HyperlaneMessageState>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 struct SubmittedMessage {
+	#[serde(with = "hex::serde")]
 	message_id: [u8; 32],
 	origin_chain: u64,
 	destination_chain: u64,
 	submission_tx_hash: TransactionHash,
 	submission_timestamp: u64,
+	#[serde(with = "u256_serde")]
 	gas_payment: U256,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 struct DeliveredMessage {
+	#[serde(with = "hex::serde")]
 	message_id: [u8; 32],
 	delivery_tx_hash: TransactionHash,
 	delivery_timestamp: u64,
 }
 
 impl MessageTracker {
-	pub fn new() -> Self {
+	/// Create a new MessageTracker with storage support
+	pub async fn new(storage: Arc<StorageService>) -> Self {
 		Self {
-			submitted_messages: HashMap::new(),
-			delivered_messages: HashMap::new(),
+			storage,
+			cache: Arc::new(RwLock::new(HashMap::new())),
 		}
 	}
 
-	pub fn track_submission(
-		&mut self,
+	/// Generate storage key for a specific order
+	fn storage_key(order_id: &str) -> String {
+		format!("hyperlane:{}", order_id)
+	}
+
+	/// Load message state for a specific order
+	async fn load_message(&self, order_id: &str) -> Option<HyperlaneMessageState> {
+		// Check cache first
+		{
+			let cache = self.cache.read().await;
+			if let Some(state) = cache.get(order_id) {
+				return Some(state.clone());
+			}
+		}
+
+		// Try to load from storage
+		let key = Self::storage_key(order_id);
+		match self
+			.storage
+			.retrieve::<HyperlaneMessageState>(StorageKey::SettlementMessages.as_str(), &key)
+			.await
+		{
+			Ok(state) => {
+				// Update cache
+				let mut cache = self.cache.write().await;
+				cache.insert(order_id.to_string(), state.clone());
+				Some(state)
+			},
+			Err(_) => None,
+		}
+	}
+
+	/// Save message state for a specific order
+	async fn save_message(
+		&self,
+		order_id: &str,
+		state: &HyperlaneMessageState,
+	) -> Result<(), SettlementError> {
+		let key = Self::storage_key(order_id);
+
+		// Save to storage with TTL (7 days after message is delivered)
+		let ttl = if state.delivered.is_some() {
+			Some(std::time::Duration::from_secs(7 * 24 * 60 * 60))
+		} else {
+			None // No TTL for pending messages
+		};
+
+		self.storage
+			.store_with_ttl(
+				StorageKey::SettlementMessages.as_str(),
+				&key,
+				state,
+				None, // No indexes needed
+				ttl,
+			)
+			.await
+			.map_err(|e| {
+				SettlementError::ValidationFailed(format!("Failed to persist message state: {}", e))
+			})?;
+
+		// Update cache
+		let mut cache = self.cache.write().await;
+		cache.insert(order_id.to_string(), state.clone());
+
+		Ok(())
+	}
+
+	pub async fn track_submission(
+		&self,
 		order_id: String,
 		message_id: [u8; 32],
 		origin_chain: u64,
 		destination_chain: u64,
 		tx_hash: TransactionHash,
 		gas_payment: U256,
-	) {
+	) -> Result<(), SettlementError> {
 		let submission = SubmittedMessage {
 			message_id,
 			origin_chain,
@@ -306,7 +409,20 @@ impl MessageTracker {
 				.as_secs(),
 			gas_payment,
 		};
-		self.submitted_messages.insert(order_id, submission);
+
+		// Load existing state or create new
+		let mut state = self
+			.load_message(&order_id)
+			.await
+			.unwrap_or(HyperlaneMessageState {
+				submitted: None,
+				delivered: None,
+			});
+
+		state.submitted = Some(submission);
+
+		// Save to storage
+		self.save_message(&order_id, &state).await
 	}
 
 	pub async fn check_finalization_required(
@@ -317,8 +433,12 @@ impl MessageTracker {
 	) -> Result<bool, SettlementError> {
 		println!("Checking for finalization...");
 		// Get the submitted message
-		let message = self.submitted_messages.get(order_id).ok_or_else(|| {
+		let state = self.load_message(order_id).await.ok_or_else(|| {
 			SettlementError::ValidationFailed("Message not found in tracker".to_string())
+		})?;
+
+		let message = state.submitted.as_ref().ok_or_else(|| {
+			SettlementError::ValidationFailed("No submitted message found".to_string())
 		})?;
 
 		// Build requiresFinalization call
@@ -348,10 +468,19 @@ impl MessageTracker {
 		Ok(!result.is_empty() && result[31] == 1)
 	}
 
-	pub fn mark_delivered(&mut self, order_id: String, delivery_tx_hash: TransactionHash) {
+	pub async fn mark_delivered(
+		&self,
+		order_id: String,
+		delivery_tx_hash: TransactionHash,
+	) -> Result<(), SettlementError> {
 		println!("Marking as delivered...");
 
-		if let Some(submission) = self.submitted_messages.get(&order_id) {
+		// Load existing state
+		let mut state = self.load_message(&order_id).await.ok_or_else(|| {
+			SettlementError::ValidationFailed("Message not found in tracker".to_string())
+		})?;
+
+		if let Some(submission) = &state.submitted {
 			let delivery = DeliveredMessage {
 				message_id: submission.message_id,
 				delivery_tx_hash,
@@ -360,12 +489,18 @@ impl MessageTracker {
 					.unwrap()
 					.as_secs(),
 			};
-			self.delivered_messages.insert(order_id, delivery);
+			state.delivered = Some(delivery);
+
+			// Save updated state with TTL
+			self.save_message(&order_id, &state).await?
 		}
+
+		Ok(())
 	}
 
-	pub fn get_message_id(&self, order_id: &str) -> Option<[u8; 32]> {
-		self.submitted_messages.get(order_id).map(|m| m.message_id)
+	pub async fn get_message_id(&self, order_id: &str) -> Option<[u8; 32]> {
+		let state = self.load_message(order_id).await?;
+		state.submitted.map(|m| m.message_id)
 	}
 }
 
@@ -376,7 +511,7 @@ pub struct HyperlaneSettlement {
 	oracle_config: OracleConfig,
 	mailbox_addresses: HashMap<u64, solver_types::Address>,
 	igp_addresses: HashMap<u64, solver_types::Address>,
-	message_tracker: Arc<RwLock<MessageTracker>>,
+	message_tracker: Arc<MessageTracker>,
 	default_gas_limit: u64,
 }
 
@@ -428,6 +563,7 @@ impl HyperlaneSettlement {
 		mailbox_addresses: HashMap<u64, solver_types::Address>,
 		igp_addresses: HashMap<u64, solver_types::Address>,
 		default_gas_limit: u64,
+		storage: Arc<StorageService>,
 	) -> Result<Self, SettlementError> {
 		// Create RPC providers for each network that has oracles configured
 		let mut providers = HashMap::new();
@@ -477,12 +613,15 @@ impl HyperlaneSettlement {
 			}
 		}
 
+		// Create message tracker with storage
+		let message_tracker = MessageTracker::new(storage).await;
+
 		Ok(Self {
 			providers,
 			oracle_config,
 			mailbox_addresses,
 			igp_addresses,
-			message_tracker: Arc::new(RwLock::new(MessageTracker::new())),
+			message_tracker: Arc::new(message_tracker),
 			default_gas_limit,
 		})
 	}
@@ -723,9 +862,8 @@ impl SettlementInterface for HyperlaneSettlement {
 		// Check if we have a tracked message for this order
 		let message_id = self
 			.message_tracker
-			.read()
-			.await
 			.get_message_id(&order.id)
+			.await
 			.map(hex::encode);
 
 		Ok(FillProof {
@@ -781,8 +919,8 @@ impl SettlementInterface for HyperlaneSettlement {
 		}
 
 		// Check if finalization is required
-		let tracker = self.message_tracker.read().await;
-		match tracker
+		match self
+			.message_tracker
 			.check_finalization_required(&order.id, oracle_address, provider)
 			.await
 		{
@@ -948,8 +1086,8 @@ impl SettlementInterface for HyperlaneSettlement {
 			.get(&origin_chain)
 			.ok_or_else(|| SettlementError::ValidationFailed("No provider".into()))?;
 
-		let tracker = self.message_tracker.read().await;
-		if !tracker
+		if !self
+			.message_tracker
 			.check_finalization_required(&order.id, oracle_address.clone(), provider)
 			.await?
 		{
@@ -997,14 +1135,16 @@ impl SettlementInterface for HyperlaneSettlement {
 			let message_id = self.extract_message_id_from_logs(&receipt.logs)?;
 
 			// Store in message tracker for later use in can_claim and pre_claim
-			self.message_tracker.write().await.track_submission(
-				order.id.clone(),
-				message_id,
-				dest_chain,
-				origin_chain,
-				receipt.hash.clone(),
-				U256::ZERO, // Gas payment would be calculated from actual receipt
-			);
+			self.message_tracker
+				.track_submission(
+					order.id.clone(),
+					message_id,
+					dest_chain,
+					origin_chain,
+					receipt.hash.clone(),
+					U256::ZERO, // Gas payment would be calculated from actual receipt
+				)
+				.await?;
 
 			tracing::info!(
 				"Hyperlane message tracked for order {} with message_id {}",
@@ -1056,6 +1196,7 @@ fn parse_address_table(
 pub fn create_settlement(
 	config: &toml::Value,
 	networks: &NetworksConfig,
+	storage: Arc<StorageService>,
 ) -> Result<Box<dyn SettlementInterface>, SettlementError> {
 	// Validate configuration first
 	HyperlaneSettlementSchema::validate_config(config)
@@ -1091,6 +1232,7 @@ pub fn create_settlement(
 				mailbox_addresses,
 				igp_addresses,
 				default_gas_limit,
+				storage,
 			)
 			.await
 		})

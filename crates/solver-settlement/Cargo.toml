@@ -17,6 +17,7 @@ reqwest = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha3 = { workspace = true }
+solver-storage = { path = "../solver-storage" }
 solver-types = { path = "../solver-types" }
 thiserror = "1.0"
 tokio = { version = "1.0", features = ["rt-multi-thread", "sync"] }

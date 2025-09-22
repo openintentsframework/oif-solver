@@ -86,6 +86,7 @@ impl SolverBuilder {
 		SEF: Fn(
 			&toml::Value,
 			&solver_types::NetworksConfig,
+			Arc<StorageService>,
 		) -> Result<Box<dyn SettlementInterface>, SettlementError>,
 		STF: Fn(&toml::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError>,
 	{
@@ -323,7 +324,7 @@ impl SolverBuilder {
 		let mut settlement_impls = HashMap::new();
 		for (name, config) in &self.config.settlement.implementations {
 			if let Some(factory) = factories.settlement_factories.get(name) {
-				match factory(config, &self.config.networks) {
+				match factory(config, &self.config.networks, storage.clone()) {
 					Ok(implementation) => {
 						// Validation already happened in the factory
 						settlement_impls.insert(name.clone(), implementation);

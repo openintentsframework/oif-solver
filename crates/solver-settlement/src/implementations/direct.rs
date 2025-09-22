@@ -381,6 +381,7 @@ impl SettlementInterface for DirectSettlement {
 pub fn create_settlement(
 	config: &toml::Value,
 	networks: &NetworksConfig,
+	_storage: std::sync::Arc<solver_storage::StorageService>,
 ) -> Result<Box<dyn SettlementInterface>, SettlementError> {
 	// Validate configuration first
 	DirectSettlementSchema::validate_config(config)
@@ -428,6 +429,13 @@ mod tests {
 		ImplementationRegistry,
 	};
 	use std::collections::HashMap;
+	use std::sync::Arc;
+
+	fn create_mock_storage() -> Arc<solver_storage::StorageService> {
+		let storage_backend =
+			Box::new(solver_storage::implementations::memory::MemoryStorage::new());
+		Arc::new(solver_storage::StorageService::new(storage_backend))
+	}
 
 	fn create_test_networks() -> NetworksConfig {
 		NetworksConfigBuilder::new()
@@ -682,7 +690,8 @@ mod tests {
 		});
 
 		let networks = create_test_networks();
-		let result = create_settlement(&config, &networks);
+		let storage = create_mock_storage();
+		let result = create_settlement(&config, &networks, storage);
 		assert!(result.is_ok());
 	}
 
@@ -699,7 +708,8 @@ mod tests {
 		});
 
 		let networks = create_test_networks();
-		let result = create_settlement(&config, &networks);
+		let storage = create_mock_storage();
+		let result = create_settlement(&config, &networks, storage);
 		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
 	}
 
@@ -834,7 +844,8 @@ mod tests {
 		});
 
 		let networks = create_test_networks();
-		let result = factory(&config, &networks);
+		let storage = create_mock_storage();
+		let result = factory(&config, &networks, storage);
 		assert!(result.is_ok());
 	}
 

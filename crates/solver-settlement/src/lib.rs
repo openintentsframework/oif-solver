@@ -238,8 +238,14 @@ pub trait SettlementInterface: Send + Sync {
 ///
 /// This is the function signature that all settlement implementations must provide
 /// to create instances of their settlement interface.
-pub type SettlementFactory =
-	fn(&toml::Value, &NetworksConfig) -> Result<Box<dyn SettlementInterface>, SettlementError>;
+///
+/// Storage is required for Hyperlane implementation to persist message tracker state
+/// across restarts. Other implementations may not require storage.
+pub type SettlementFactory = fn(
+	&toml::Value,
+	&NetworksConfig,
+	Arc<solver_storage::StorageService>,
+) -> Result<Box<dyn SettlementInterface>, SettlementError>;
 
 /// Registry trait for settlement implementations.
 ///
