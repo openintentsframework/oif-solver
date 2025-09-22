@@ -337,7 +337,7 @@ impl IntentRequest {
 			.ok_or("Missing 'eip712' object in message")?;
 
 		// Determine order type based on primaryType
-		let primary_type = eip712_data
+		let primary_type: &str = eip712_data
 			.get("primaryType")
 			.and_then(|p| p.as_str())
 			.unwrap_or("PermitBatchWitnessTransferFrom");
@@ -364,143 +364,169 @@ impl IntentRequest {
 		};
 
 		// Extract witness/mandate data based on order type
-		let (expires, fill_deadline, input_oracle, input_amount, input_token, outputs) =
-			if primary_type == "BatchCompact" {
-				// Handle BatchCompact orders
-				let message = eip712_data
-					.get("message")
-					.and_then(|m| m.as_object())
-					.ok_or("Missing 'message' object in BatchCompact EIP-712 data")?;
+		let (
+			expires,
+			fill_deadline,
+			input_oracle,
+			input_amount,
+			input_token,
+			outputs,
+			lock_tag_opt,
+		) = if primary_type == "BatchCompact" {
+			tracing::info!("Processing BatchCompact order data");
+			// Handle BatchCompact orders
+			let message = eip712_data
+				.get("message")
+				.and_then(|m| m.as_object())
+				.ok_or("Missing 'message' object in BatchCompact EIP-712 data")?;
 
-				let mandate = message
-					.get("mandate")
-					.and_then(|m| m.as_object())
-					.ok_or("Missing 'mandate' object in BatchCompact message")?;
+			let mandate = message
+				.get("mandate")
+				.and_then(|m| m.as_object())
+				.ok_or("Missing 'mandate' object in BatchCompact message")?;
 
-				let expires_str = message
-					.get("expires")
-					.and_then(|e| e.as_str())
-					.ok_or("Missing 'expires' in BatchCompact message")?;
-				let expires = expires_str
-					.parse::<u64>()
-					.map_err(|e| format!("Invalid expires: {}", e))? as u32;
+			let expires_str = message
+				.get("expires")
+				.and_then(|e| e.as_str())
+				.ok_or("Missing 'expires' in BatchCompact message")?;
+			let expires = expires_str
+				.parse::<u64>()
+				.map_err(|e| format!("Invalid expires: {}", e))? as u32;
 
-				let fill_deadline_str = mandate
-					.get("fillDeadline")
-					.and_then(|f| f.as_str())
-					.ok_or("Missing 'fillDeadline' in mandate")?;
-				let fill_deadline = fill_deadline_str
-					.parse::<u64>()
-					.map_err(|e| format!("Invalid fillDeadline: {}", e))?
-					as u32;
+			let fill_deadline_str = mandate
+				.get("fillDeadline")
+				.and_then(|f| f.as_str())
+				.ok_or("Missing 'fillDeadline' in mandate")?;
+			let fill_deadline = fill_deadline_str
+				.parse::<u64>()
+				.map_err(|e| format!("Invalid fillDeadline: {}", e))? as u32;
 
-				let input_oracle_str = mandate
-					.get("inputOracle")
-					.and_then(|o| o.as_str())
-					.ok_or("Missing 'inputOracle' in mandate")?;
-				let input_oracle =
-					Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
+			let input_oracle_str = mandate
+				.get("inputOracle")
+				.and_then(|o| o.as_str())
+				.ok_or("Missing 'inputOracle' in mandate")?;
+			let input_oracle =
+				Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
 
-				// Extract from commitments array
-				let commitments = message
-					.get("commitments")
-					.and_then(|c| c.as_array())
-					.ok_or("Missing commitments array in BatchCompact message")?;
-				let first_commitment = commitments
-					.first()
-					.ok_or("Empty commitments array in BatchCompact message")?;
+			// Extract from commitments array
+			let commitments = message
+				.get("commitments")
+				.and_then(|c| c.as_array())
+				.ok_or("Missing commitments array in BatchCompact message")?;
+			let first_commitment = commitments
+				.first()
+				.ok_or("Empty commitments array in BatchCompact message")?;
 
-				let input_amount_str = first_commitment
-					.get("amount")
-					.and_then(|a| a.as_str())
-					.ok_or("Missing amount in commitment")?;
-				let input_amount = U256::from_str_radix(input_amount_str, 10)?;
+			let input_amount_str = first_commitment
+				.get("amount")
+				.and_then(|a| a.as_str())
+				.ok_or("Missing amount in commitment")?;
+			let input_amount = U256::from_str_radix(input_amount_str, 10)?;
 
-				let input_token_str = first_commitment
-					.get("token")
-					.and_then(|t| t.as_str())
-					.ok_or("Missing token in commitment")?;
-				let input_token =
-					Address::from_slice(&hex::decode(input_token_str.trim_start_matches("0x"))?);
+			let input_token_str = first_commitment
+				.get("token")
+				.and_then(|t| t.as_str())
+				.ok_or("Missing token in commitment")?;
+			let input_token =
+				Address::from_slice(&hex::decode(input_token_str.trim_start_matches("0x"))?);
 
-				// Extract outputs from mandate
-				let outputs_array = mandate
-					.get("outputs")
-					.and_then(|o| o.as_array())
-					.ok_or("Missing outputs array in mandate")?;
+			// For BatchCompact, get the lockTag to build TOKEN_ID
+			let lock_tag_str = first_commitment
+				.get("lockTag")
+				.and_then(|t| t.as_str())
+				.ok_or("Missing lockTag in commitment")?;
 
-				(
-					expires,
-					fill_deadline,
-					input_oracle,
-					input_amount,
-					input_token,
-					outputs_array,
-				)
-			} else {
-				// Handle Permit2 orders (existing logic)
-				let witness = eip712_data
-					.get("witness")
-					.and_then(|w| w.as_object())
-					.ok_or("Missing 'witness' object in EIP-712 message")?;
+			// Extract outputs from mandate
+			let outputs_array = mandate
+				.get("outputs")
+				.and_then(|o| o.as_array())
+				.ok_or("Missing outputs array in mandate")?;
 
-				let expires = witness
-					.get("expires")
-					.and_then(|e| e.as_u64())
-					.unwrap_or(quote.valid_until.unwrap_or(0)) as u32;
-				let fill_deadline = expires;
+			(
+				expires,
+				fill_deadline,
+				input_oracle,
+				input_amount,
+				input_token,
+				outputs_array,
+				Some(lock_tag_str), // Pass lockTag for TOKEN_ID construction
+			)
+		} else {
+			tracing::info!("Processing Permit2 order data");
+			// Handle Permit2 orders (existing logic)
+			let witness = eip712_data
+				.get("witness")
+				.and_then(|w| w.as_object())
+				.ok_or("Missing 'witness' object in EIP-712 message")?;
 
-				let input_oracle_str = witness
-					.get("inputOracle")
-					.and_then(|o| o.as_str())
-					.ok_or("Missing 'inputOracle' in witness data")?;
-				let input_oracle =
-					Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
+			let expires = witness
+				.get("expires")
+				.and_then(|e| e.as_u64())
+				.unwrap_or(quote.valid_until.unwrap_or(0)) as u32;
+			let fill_deadline = expires;
 
-				// Extract input data from permitted array
-				let permitted = eip712_data
-					.get("permitted")
-					.and_then(|p| p.as_array())
-					.ok_or("Missing permitted array in EIP-712 data")?;
-				let first_permitted = permitted
-					.first()
-					.ok_or("Empty permitted array in EIP-712 data")?;
+			let input_oracle_str = witness
+				.get("inputOracle")
+				.and_then(|o| o.as_str())
+				.ok_or("Missing 'inputOracle' in witness data")?;
+			let input_oracle =
+				Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
 
-				let input_amount_str = first_permitted
-					.get("amount")
-					.and_then(|a| a.as_str())
-					.ok_or("Missing amount in permitted token")?;
-				let input_amount = U256::from_str_radix(input_amount_str, 10)?;
+			// Extract input data from permitted array
+			let permitted = eip712_data
+				.get("permitted")
+				.and_then(|p| p.as_array())
+				.ok_or("Missing permitted array in EIP-712 data")?;
+			let first_permitted = permitted
+				.first()
+				.ok_or("Empty permitted array in EIP-712 data")?;
 
-				let input_token_str = first_permitted
-					.get("token")
-					.and_then(|t| t.as_str())
-					.ok_or("Missing token in permitted data")?;
-				let input_token =
-					Address::from_slice(&hex::decode(input_token_str.trim_start_matches("0x"))?);
+			let input_amount_str = first_permitted
+				.get("amount")
+				.and_then(|a| a.as_str())
+				.ok_or("Missing amount in permitted token")?;
+			let input_amount = U256::from_str_radix(input_amount_str, 10)?;
 
-				let outputs_array = witness
-					.get("outputs")
-					.and_then(|o| o.as_array())
-					.ok_or("Missing outputs array in witness data")?;
+			let input_token_str = first_permitted
+				.get("token")
+				.and_then(|t| t.as_str())
+				.ok_or("Missing token in permitted data")?;
+			let input_token =
+				Address::from_slice(&hex::decode(input_token_str.trim_start_matches("0x"))?);
 
-				(
-					expires,
-					fill_deadline,
-					input_oracle,
-					input_amount,
-					input_token,
-					outputs_array,
-				)
-			};
+			let outputs_array = witness
+				.get("outputs")
+				.and_then(|o| o.as_array())
+				.ok_or("Missing outputs array in witness data")?;
+
+			(
+				expires,
+				fill_deadline,
+				input_oracle,
+				input_amount,
+				input_token,
+				outputs_array,
+				None, // No lockTag for Permit2 orders
+			)
+		};
 
 		// Get origin chain ID
 		let origin_chain_id = U256::from(interop_address.ethereum_chain_id()?);
 
-		// Convert input token address to U256
-		let mut token_bytes = [0u8; 32];
-		token_bytes[12..32].copy_from_slice(&input_token.0 .0);
-		let input_token_u256 = U256::from_be_bytes(token_bytes);
+		// For BatchCompact orders, build TOKEN_ID; for others use token address
+		let input_token_u256 = if let Some(lock_tag) = lock_tag_opt {
+			// BatchCompact: TOKEN_ID = lockTag (12 bytes) + token address (20 bytes)
+			let lock_tag_hex = lock_tag.trim_start_matches("0x");
+			let token_hex = hex::encode(&input_token.0 .0);
+			let token_id_hex = format!("{}{}", lock_tag_hex, token_hex);
+			U256::from_str_radix(&token_id_hex, 16)
+				.map_err(|e| format!("Failed to parse TOKEN_ID: {}", e))?
+		} else {
+			// Permit2/other: use token address
+			let mut token_bytes = [0u8; 32];
+			token_bytes[12..32].copy_from_slice(&input_token.0 .0);
+			U256::from_be_bytes(token_bytes)
+		};
 		let inputs = vec![[input_token_u256, input_amount]];
 
 		// Parse outputs
@@ -509,7 +535,14 @@ impl IntentRequest {
 			if let Some(output_obj) = output_item.as_object() {
 				let chain_id = output_obj
 					.get("chainId")
-					.and_then(|c| c.as_u64())
+					.and_then(|c| {
+						// Handle both string and number formats
+						if let Some(s) = c.as_str() {
+							s.parse::<u64>().ok()
+						} else {
+							c.as_u64()
+						}
+					})
 					.unwrap_or(0);
 				let amount_str = output_obj
 					.get("amount")
@@ -545,6 +578,11 @@ impl IntentRequest {
 		}
 
 		// Create and encode the StandardOrder
+		tracing::debug!(
+			"Creating StandardOrder with {} inputs and {} outputs",
+			inputs.len(),
+			sol_outputs.len()
+		);
 		let sol_order = StandardOrder {
 			user: user_address,
 			nonce,
@@ -557,7 +595,12 @@ impl IntentRequest {
 		};
 
 		// ABI encode the StandardOrder
+		tracing::debug!("ABI encoding StandardOrder");
 		let encoded_order = StandardOrder::abi_encode(&sol_order);
+		tracing::debug!(
+			"StandardOrder encoded successfully, length: {}",
+			encoded_order.len()
+		);
 
 		// Parse lock_type using FromStr implementation
 		let lock_type = quote
@@ -566,12 +609,21 @@ impl IntentRequest {
 			.unwrap_or_else(|_| LockType::default());
 
 		// Create IntentRequest
-		Ok(IntentRequest {
+		tracing::debug!("Creating IntentRequest with lock_type: {:?}", lock_type);
+		tracing::debug!("Processing signature: {}", signature);
+		let signature_bytes = Bytes::from(hex::decode(signature.trim_start_matches("0x"))?);
+		tracing::debug!(
+			"Signature decoded successfully, length: {}",
+			signature_bytes.len()
+		);
+		let intent = IntentRequest {
 			order: Bytes::from(encoded_order),
 			sponsor: user_address,
-			signature: Bytes::from(hex::decode(signature.trim_start_matches("0x"))?),
+			signature: signature_bytes,
 			lock_type,
-		})
+		};
+		tracing::debug!("IntentRequest created successfully");
+		Ok(intent)
 	}
 }
 

@@ -724,8 +724,15 @@ quote_accept() {
         fi
         print_debug "User key found, extracting EIP-712 message..."
 
-        # Extract EIP-712 message for signing
-        local eip712_message=$(echo "$order_data" | jq -r '.message.eip712 // empty')
+        # Extract the full message object (contains both digest and eip712)
+        local full_message=$(echo "$order_data" | jq -r '.message // empty')
+        if [ -z "$full_message" ] || [ "$full_message" = "null" ]; then
+            print_error "No message found in order"
+            return 1
+        fi
+
+        # Extract EIP-712 message for signing (for compatibility with existing code)
+        local eip712_message=$(echo "$full_message" | jq -r '.eip712 // empty')
         if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ]; then
             print_error "No EIP-712 message found in order"
             return 1
@@ -742,13 +749,20 @@ quote_accept() {
         if [ "$primary_type" = "BatchCompact" ]; then
             print_info "Detected BatchCompact order, using compact signing..."
 
-            # Use the new compact signing function
-            signature=$(sign_compact_digest_from_quote "$user_key" "$eip712_message")
+            # Use the new compact signing function - pass full message that contains digest
+            signature=$(sign_compact_digest_from_quote "$user_key" "$full_message")
 
             if [ -z "$signature" ]; then
                 print_error "Failed to sign BatchCompact order"
                 return 1
             fi
+
+            # For compact/resource lock, we need to ABI-encode the signature with allocator data
+            # This matches what the working direct intent flow does in intents.sh
+            local allocator_data="0x"  # Empty allocator data for demo
+            signature=$(cast abi-encode "f(bytes,bytes)" "$signature" "$allocator_data")
+
+            print_debug "ABI-encoded signature: $signature"
 
         else
             print_info "Detected Permit2 order, using standard signing..."

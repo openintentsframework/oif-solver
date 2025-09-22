@@ -558,14 +558,19 @@ compute_compact_digest_from_quote() {
 
     print_debug "Domain: name=$name, version=$version, chainId=$chain_id, contract=$verifying_contract" >&2
 
-    # Compute domain separator
-    local domain_type_hash=$(compute_type_hash "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
-    local name_hash=$(cast_keccak "$name")
-    local version_hash=$(cast_keccak "$version")
+    # Get domain separator from TheCompact contract instead of computing manually
+    local domain_separator=$(cast call "$verifying_contract" "DOMAIN_SEPARATOR()" --rpc-url "http://localhost:8545" 2>/dev/null || echo "")
+    
+    if [ -z "$domain_separator" ] || [ "$domain_separator" = "null" ]; then
+        # Fallback to computed domain separator if contract call fails
+        local domain_type_hash=$(compute_type_hash "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
+        local name_hash=$(cast_keccak "$name")
+        local version_hash=$(cast_keccak "$version")
 
-    local domain_separator=$(cast_abi_encode "f(bytes32,bytes32,bytes32,uint256,address)" \
-        "$domain_type_hash" "$name_hash" "$version_hash" "$chain_id" "$verifying_contract")
-    domain_separator=$(cast_keccak "$domain_separator")
+        domain_separator=$(cast_abi_encode "f(bytes32,bytes32,bytes32,uint256,address)" \
+            "$domain_type_hash" "$name_hash" "$version_hash" "$chain_id" "$verifying_contract")
+        domain_separator=$(cast_keccak "$domain_separator")
+    fi
 
     print_debug "Domain separator: $domain_separator" >&2
 
@@ -671,12 +676,29 @@ compute_compact_digest_from_quote() {
 # Sign BatchCompact digest from quote
 sign_compact_digest_from_quote() {
     local user_private_key="$1"
-    local eip712_message="$2"
+    local full_message="$2"
 
-    print_info "Computing BatchCompact digest..." >&2
-
-    # Compute the digest
-    local digest=$(compute_compact_digest_from_quote "$eip712_message")
+    # Check if a pre-computed digest is provided
+    local pre_computed_digest=$(echo "$full_message" | jq -r '.digest // empty' 2>/dev/null)
+    
+    local digest=""
+    if [ -n "$pre_computed_digest" ] && [ "$pre_computed_digest" != "null" ] && [ "$pre_computed_digest" != "empty" ]; then
+        print_info "Using pre-computed digest from quote..." >&2
+        digest="$pre_computed_digest"
+        print_debug "Pre-computed digest: $digest" >&2
+    else
+        print_info "Computing BatchCompact digest..." >&2
+        
+        # Extract EIP-712 message for computation
+        local eip712_message=$(echo "$full_message" | jq -r '.eip712 // empty' 2>/dev/null)
+        if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ]; then
+            print_error "No EIP-712 message found for digest computation" >&2
+            return 1
+        fi
+        
+        # Compute the digest
+        digest=$(compute_compact_digest_from_quote "$eip712_message")
+    fi
 
     if [ -z "$digest" ]; then
         print_error "Failed to compute BatchCompact digest" >&2

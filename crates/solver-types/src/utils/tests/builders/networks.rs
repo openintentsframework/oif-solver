@@ -312,6 +312,7 @@ impl NetworkConfigBuilder {
 			tokens: self.tokens,
 			input_settler_compact_address: self.input_settler_compact_address,
 			the_compact_address: self.the_compact_address,
+			allocator_address: None, // Default to None for tests
 		})
 	}
 }

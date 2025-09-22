@@ -93,23 +93,56 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 		let signature_validator = compact::create_signature_validator();
 
 		// 1. Get domain separator from TheCompact contract
+		tracing::debug!(
+			"EIP7683 signature validation: Getting domain separator from TheCompact contract"
+		);
 		let domain_separator =
 			get_domain_separator(delivery_service, the_compact_address, origin_chain_id).await?;
+		tracing::debug!(
+			"EIP7683 signature validation: Domain separator: {:?}",
+			domain_separator
+		);
 
 		// 2. Compute message hash using interface
+		tracing::debug!(
+			"EIP7683 signature validation: Computing message hash with contract_address: {:?}",
+			contract_address
+		);
+		tracing::debug!(
+			"EIP7683 signature validation: Order bytes length: {}",
+			intent.order.len()
+		);
 		let struct_hash = message_hasher.compute_message_hash(&intent.order, contract_address)?;
+		tracing::debug!(
+			"EIP7683 signature validation: Message hash computed: {:?}",
+			struct_hash
+		);
 
 		// 3. Extract signature using interface
+		tracing::debug!("EIP7683 signature validation: Extracting signature from intent");
 		let signature = signature_validator.extract_signature(&intent.signature);
+		tracing::debug!(
+			"EIP7683 signature validation: Signature extracted: {:?}",
+			signature
+		);
 
 		// 4. Validate EIP-712 signature using interface
 		let expected_signer = standard_order.user;
+		tracing::debug!(
+			"EIP7683 signature validation: Expected signer: {:?}",
+			expected_signer
+		);
+		tracing::debug!("EIP7683 signature validation: Validating signature...");
 		let is_valid = signature_validator.validate_signature(
 			domain_separator,
 			struct_hash,
 			&signature,
 			expected_signer,
 		)?;
+		tracing::debug!(
+			"EIP7683 signature validation: Signature validation result: {}",
+			is_valid
+		);
 
 		if !is_valid {
 			return Err(APIError::BadRequest {
