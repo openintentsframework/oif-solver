@@ -588,12 +588,7 @@ impl DiscoveryInterface for Eip7683Discovery {
 /// - `network_ids`: Array of chain IDs to monitor
 ///
 /// Optional configuration parameters:
-/// - `polling_interval_secs`: Polling interval in seconds (defaults to 3, 0 = WebSocket mode)
-///
-/// # Arguments
-///
-/// * `config` - The discovery implementation configuration
-/// * `networks` - The networks configuration
+/// - `polling_interval_secs`: Polling interval in seconds (defaults to 3)
 ///
 /// # Errors
 ///
@@ -660,17 +655,17 @@ mod tests {
 	use super::*;
 	use alloy_primitives::{Address as AlloyAddress, Bytes, B256, U256};
 	use alloy_rpc_types::Log;
-	// use solver_types::utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder};
-	// use solver_types::NetworksConfig;
+	use solver_types::utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder};
+	use solver_types::NetworksConfig;
 	use std::collections::HashMap;
-	// use tokio::sync::mpsc;
+	use tokio::sync::mpsc;
 
 	// Helper function to create a test networks config
-	// fn create_test_networks() -> NetworksConfig {
-	// 	NetworksConfigBuilder::new()
-	// 		.add_network(1, NetworkConfigBuilder::new().build())
-	// 		.build()
-	// }
+	fn create_test_networks() -> NetworksConfig {
+		NetworksConfigBuilder::new()
+			.add_network(1, NetworkConfigBuilder::new().build())
+			.build()
+	}
 
 	// Helper function to create a test StandardOrder
 	fn create_test_standard_order() -> StandardOrder {
@@ -894,53 +889,130 @@ mod tests {
 		}
 	}
 
-	// TODO: This test needs to be updated to work with async dependencies
-	// Disabled for now to avoid compilation errors
-	// #[test]
-	// fn test_process_discovered_logs() {
-	//     // Test disabled - requires async dependencies (token_manager, pricing_service)
-	//     // that are complex to mock in unit tests
-	// }
+	#[test]
+	fn test_process_discovered_logs() {
+		let (sender, mut receiver) = mpsc::unbounded_channel();
 
-	// TODO: This test needs to be updated to work with async dependencies
-	// Disabled for now to avoid compilation errors
-	// #[test]
-	// fn test_process_discovered_logs_invalid_log() {
-	//     // Test disabled - requires async dependencies (token_manager, pricing_service)
-	//     // that are complex to mock in unit tests
-	// }
+		// First, let's test if we can parse the log directly
+		let log = create_test_open_log();
+		match Eip7683Discovery::parse_open_event(&log) {
+			Ok(intent) => println!("Direct parse succeeded: {}", intent.id),
+			Err(e) => println!("Direct parse failed: {:?}", e),
+		}
 
-	// TODO: This test needs to be updated to work with new constructor signature
-	// Disabled for now to avoid compilation errors
-	// #[tokio::test]
-	// async fn test_eip7683_discovery_new_empty_network_ids() {
-	//     // Test disabled - requires mock dependencies (token_manager, pricing_service)
-	//     // that are complex to create in unit tests
-	// }
+		let logs = vec![log];
+		Eip7683Discovery::process_discovered_logs(logs, &sender, 1);
 
-	// TODO: This test needs to be updated to work with new constructor signature
-	// Disabled for now to avoid compilation errors
-	// #[tokio::test]
-	// async fn test_eip7683_discovery_new_unknown_network() {
-	//     // Test disabled - requires mock dependencies (token_manager, pricing_service)
-	//     // that are complex to create in unit tests
-	// }
+		// Should receive one intent
+		match receiver.try_recv() {
+			Ok(intent) => {
+				assert_eq!(intent.source, "on-chain");
+				assert_eq!(intent.standard, "eip7683");
+			},
+			Err(_) => {
+				// If no intent received, the parsing failed silently
+				panic!("No intent received - parsing likely failed");
+			},
+		}
 
-	// TODO: This test needs to be updated to work with new factory signature
-	// Disabled for now to avoid compilation errors
-	// #[tokio::test(flavor = "multi_thread")]
-	// async fn test_create_discovery_invalid_config() {
-	//     // Test disabled - requires mock dependencies (token_manager, pricing_service)
-	//     // that are complex to create in unit tests
-	// }
+		// Should not receive any more intents
+		assert!(receiver.try_recv().is_err());
+	}
 
-	// TODO: This test needs to be updated to work with new factory signature
-	// Disabled for now to avoid compilation errors
-	// #[tokio::test(flavor = "multi_thread")]
-	// async fn test_create_discovery_empty_network_ids() {
-	//     // Test disabled - requires mock dependencies (token_manager, pricing_service)
-	//     // that are complex to create in unit tests
-	// }
+	#[test]
+	fn test_process_discovered_logs_invalid_log() {
+		let (sender, mut receiver) = mpsc::unbounded_channel();
+
+		// Create invalid log
+		let invalid_log = Log {
+			inner: alloy_primitives::Log {
+				address: AlloyAddress::from([1u8; 20]),
+				data: LogData::new_unchecked(
+					vec![Open::SIGNATURE_HASH],
+					Bytes::from(vec![1, 2, 3]), // Invalid data
+				),
+			},
+			block_hash: Some(B256::from([10u8; 32])),
+			block_number: Some(100),
+			block_timestamp: Some(1000000000),
+			transaction_hash: Some(B256::from([11u8; 32])),
+			transaction_index: Some(0),
+			log_index: Some(0),
+			removed: false,
+		};
+
+		let logs = vec![invalid_log];
+		Eip7683Discovery::process_discovered_logs(logs, &sender, 1);
+
+		// Should not receive any intents due to invalid log
+		assert!(receiver.try_recv().is_err());
+	}
+
+	#[tokio::test]
+	async fn test_eip7683_discovery_new_empty_network_ids() {
+		let networks = create_test_networks();
+		let network_ids = vec![];
+
+		let result = Eip7683Discovery::new(network_ids, networks, Some(5)).await;
+		assert!(result.is_err());
+
+		if let Err(DiscoveryError::ValidationError(msg)) = result {
+			assert!(msg.contains("At least one network_id"));
+		} else {
+			panic!("Expected ValidationError");
+		}
+	}
+
+	#[tokio::test]
+	async fn test_eip7683_discovery_new_unknown_network() {
+		let networks = create_test_networks();
+		let network_ids = vec![999]; // Unknown network
+
+		let result = Eip7683Discovery::new(network_ids, networks, Some(5)).await;
+		assert!(result.is_err());
+
+		if let Err(DiscoveryError::ValidationError(msg)) = result {
+			assert!(msg.contains("Network 999 not found"));
+		} else {
+			panic!("Expected ValidationError");
+		}
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_create_discovery_invalid_config() {
+		let config = toml::Value::try_from(HashMap::from([
+			("polling_interval_secs", toml::Value::Integer(5)),
+			// Missing network_ids
+		]))
+		.unwrap();
+
+		let networks = create_test_networks();
+		let result = create_discovery(&config, &networks);
+		assert!(result.is_err());
+
+		if let Err(DiscoveryError::ValidationError(msg)) = result {
+			assert!(msg.contains("required field: network_ids"));
+		} else {
+			panic!("Expected ValidationError");
+		}
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_create_discovery_empty_network_ids() {
+		let config =
+			toml::Value::try_from(HashMap::from([("network_ids", toml::Value::Array(vec![]))]))
+				.unwrap();
+
+		let networks = create_test_networks();
+		let result = create_discovery(&config, &networks);
+		assert!(result.is_err());
+
+		if let Err(DiscoveryError::ValidationError(msg)) = result {
+			assert!(msg.contains("cannot be empty"));
+		} else {
+			panic!("Expected ValidationError");
+		}
+	}
 
 	#[test]
 	fn test_registry_name() {
