@@ -342,7 +342,7 @@ impl QuoteGenerator {
 			let allocator_tag = format!("0x00{}", &address_hex[address_hex.len() - 22..]);
 
 			// Build token ID by concatenating allocator tag (12 bytes) + token address (20 bytes)
-			let token_address_hex = hex::encode(&token_address.0);
+			let token_address_hex = hex::encode(token_address.0);
 			let token_id_hex = format!("{}{}", allocator_tag, token_address_hex);
 			let token_id = U256::from_str(&token_id_hex).map_err(|e| {
 				QuoteError::InvalidRequest(format!("Failed to create token ID: {}", e))
@@ -459,7 +459,7 @@ impl QuoteGenerator {
 			},
 			"primaryType": "BatchCompact",
 			"message": {
-				"arbiter": format!("0x{:040x}", alloy_primitives::Address::from_slice(&network.input_settler_compact_address.as_ref().unwrap_or_else(|| &network.input_settler_address).0)),
+				"arbiter": format!("0x{:040x}", alloy_primitives::Address::from_slice(&network.input_settler_compact_address.as_ref().unwrap_or(&network.input_settler_address).0)),
 				"sponsor": format!("0x{:040x}", user_address),
 				"nonce": nonce.to_string(),
 				"expires": expires.to_string(),
@@ -491,7 +491,7 @@ impl QuoteGenerator {
 		// Try to compute the digest the same way the tests/contracts expect
 		// If this fails, fall back to just providing the EIP-712 structure
 		match self
-			.try_compute_server_digest(&eip712_message, request, &network, input_chain_id)
+			.try_compute_server_digest(&eip712_message, request, network, input_chain_id)
 			.await
 		{
 			Ok(digest) => {

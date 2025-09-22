@@ -8,6 +8,9 @@ use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+/// Type alias for EIP-712 data extraction result
+type Eip712ExtractionResult<'a> = Result<(&'a serde_json::Map<String, serde_json::Value>, &'a str), Box<dyn std::error::Error>>;
+
 /// Lock type for cross-chain orders, determining the custody mechanism used.
 ///
 /// This enum represents the different ways user funds can be locked/held
@@ -521,7 +524,7 @@ impl Eip7683OrderData {
 	/// Extract and validate EIP-712 data from quote to detect order type
 	fn extract_eip712_data(
 		quote: &Quote,
-	) -> Result<(&serde_json::Map<String, serde_json::Value>, &str), Box<dyn std::error::Error>> {
+	) -> Eip712ExtractionResult<'_> {
 		let quote_order = quote
 			.orders
 			.first()
@@ -632,7 +635,7 @@ impl Eip7683OrderData {
 			.and_then(|t| t.as_str())
 			.ok_or("Missing lockTag in commitment")?;
 		let lock_tag_hex = lock_tag_str.trim_start_matches("0x");
-		let token_hex = hex::encode(&input_token.0 .0);
+		let token_hex = hex::encode(input_token.0 .0);
 		let token_id_hex = format!("{}{}", lock_tag_hex, token_hex);
 		let input_token_u256 = U256::from_str_radix(&token_id_hex, 16)
 			.map_err(|e| format!("Failed to parse TOKEN_ID: {}", e))?;
