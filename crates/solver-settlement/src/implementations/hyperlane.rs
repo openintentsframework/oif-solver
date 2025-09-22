@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use solver_storage::StorageService;
 use solver_types::{
-	standards::eip7683::{Eip7683OrderData, MandateOutput},
-	with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, NetworksConfig, Order, Schema,
-	StorageKey, Transaction, TransactionHash, TransactionReceipt, TransactionType,
+	with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, InteropAddress, NetworksConfig,
+	Order, RequestedOutput, Schema, StorageKey, Transaction, TransactionHash, TransactionReceipt,
+	TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -72,29 +72,67 @@ fn order_id_to_bytes32(order_id: &str) -> [u8; 32] {
 	}
 }
 
-/// Extract MandateOutput from order data
-fn extract_mandate_output(order: &Order) -> Result<MandateOutput, SettlementError> {
-	// Hyperlane settlement requires EIP-7683 orders
-	if order.standard != "eip7683" {
-		return Err(SettlementError::ValidationFailed(format!(
-			"Hyperlane settlement requires EIP-7683 orders, got: {}",
-			order.standard
-		)));
+/// Hyperlane-compatible output representation
+struct HyperlaneOutput {
+	token: [u8; 32],
+	amount: U256,
+	recipient: [u8; 32],
+	call: Vec<u8>,
+	context: Vec<u8>,
+}
+
+/// Convert InteropAddress to bytes32 for Hyperlane
+fn interop_address_to_bytes32(addr: &InteropAddress) -> [u8; 32] {
+	let mut bytes32 = [0u8; 32];
+
+	// Get the raw bytes from the InteropAddress
+	let raw_bytes = addr.to_bytes();
+
+	// For Ethereum addresses (20 bytes), right-align in 32 bytes
+	if let Ok(eth_addr) = addr.ethereum_address() {
+		// Put the 20-byte Ethereum address in the last 20 bytes of the 32-byte array
+		bytes32[12..].copy_from_slice(eth_addr.as_slice());
+	} else {
+		// For other address formats, use the raw bytes right-aligned
+		let len = raw_bytes.len().min(32);
+		bytes32[32 - len..].copy_from_slice(&raw_bytes[..len]);
 	}
 
-	// Deserialize order.data as Eip7683OrderData
-	let order_data: Eip7683OrderData = serde_json::from_value(order.data.clone()).map_err(|e| {
-		SettlementError::ValidationFailed(format!("Failed to parse EIP-7683 order data: {}", e))
+	bytes32
+}
+
+/// Convert a RequestedOutput to Hyperlane-compatible format
+fn requested_output_to_hyperlane(output: &RequestedOutput) -> HyperlaneOutput {
+	HyperlaneOutput {
+		token: interop_address_to_bytes32(&output.asset),
+		amount: output.amount,
+		recipient: interop_address_to_bytes32(&output.receiver),
+		call: output
+			.calldata
+			.as_ref()
+			.and_then(|s| hex::decode(s.trim_start_matches("0x")).ok())
+			.unwrap_or_default(),
+		context: vec![], // Empty context for generic orders
+	}
+}
+
+/// Extract output details from order data using OrderParsable
+fn extract_output_details(order: &Order) -> Result<HyperlaneOutput, SettlementError> {
+	// Parse order data using the OrderParsable trait
+	let parsed_order = order.parse_order_data().map_err(|e| {
+		SettlementError::ValidationFailed(format!("Failed to parse order data: {}", e))
 	})?;
 
-	// Get the first output
-	let first_output = order_data
-		.outputs
-		.first()
-		.ok_or_else(|| SettlementError::ValidationFailed("Empty outputs array".into()))?;
+	// Get requested outputs
+	let outputs = parsed_order.parse_requested_outputs();
 
-	// Return the first output directly (it's already a MandateOutput)
-	Ok(first_output.clone())
+	// Get the first output
+	let first_output = outputs
+		.first()
+		.ok_or_else(|| SettlementError::ValidationFailed("No outputs found in order".into()))?;
+
+	// Convert to Hyperlane format
+	Ok(requested_output_to_hyperlane(first_output))
 }
 
 /// Extract fill details from OutputFilled event in logs
@@ -972,7 +1010,7 @@ impl SettlementInterface for HyperlaneSettlement {
 		})?;
 
 		// Extract fill details from order
-		let mandate_output = extract_mandate_output(order)?;
+		let output = extract_output_details(order)?;
 
 		// Convert order ID to bytes32
 		let order_id_bytes = order_id_to_bytes32(&order.id);
@@ -992,11 +1030,11 @@ impl SettlementInterface for HyperlaneSettlement {
 			solver_identifier,
 			order_id_bytes,
 			fill_timestamp, // Using timestamp from OutputFilled event
-			mandate_output.token,
-			mandate_output.amount,
-			mandate_output.recipient,
-			mandate_output.call,
-			mandate_output.context,
+			output.token,
+			output.amount,
+			output.recipient,
+			output.call,
+			output.context,
 		)?;
 
 		// Create payloads array with single FillDescription
