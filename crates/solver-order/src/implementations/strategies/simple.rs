@@ -2,11 +2,11 @@
 //!
 //! This module provides concrete implementations of the ExecutionStrategy trait
 
-use alloy_primitives::U256;
+use alloy_primitives::{hex, U256};
 use async_trait::async_trait;
 use solver_types::{
-	bytes32_to_address, with_0x_prefix, ConfigSchema, Eip7683OrderData, ExecutionContext,
-	ExecutionDecision, ExecutionParams, Field, FieldType, Order, Schema,
+	with_0x_prefix, ConfigSchema, ExecutionContext, ExecutionDecision, ExecutionParams, Field,
+	FieldType, Order, Schema,
 };
 
 use crate::{ExecutionStrategy, StrategyError};
@@ -74,72 +74,90 @@ impl ExecutionStrategy for SimpleStrategy {
 			return ExecutionDecision::Defer(std::time::Duration::from_secs(60));
 		}
 
-		// Check token balances based on order standard
-		match order.standard.as_str() {
-			"eip7683" => {
-				if let Ok(order_data) =
-					serde_json::from_value::<Eip7683OrderData>(order.data.clone())
-				{
-					// Check each output to ensure we have sufficient balance
-					for output in &order_data.outputs {
-						let chain_id = output.chain_id.to::<u64>();
-						// Convert bytes32 token to address format (without "0x" for balance lookup)
-						let token_address = bytes32_to_address(&output.token);
+		// Parse order using OrderParsable trait for balance checking
+		match order.parse_order_data() {
+			Ok(parsed_order) => {
+				// Get requested outputs for balance checking
+				let outputs = parsed_order.parse_requested_outputs();
 
-						// Build the balance key (chain_id, Some(token_address))
-						let balance_key = (chain_id, Some(token_address.clone()));
+				// Check each output to ensure we have sufficient balance
+				for output in &outputs {
+					// Get chain ID from the asset's InteropAddress
+					let chain_id = output.asset.ethereum_chain_id().unwrap_or_else(|_| {
+						tracing::warn!(
+							order_id = %order.id,
+							"Failed to get chain ID from asset, defaulting to 1"
+						);
+						1u64
+					});
 
-						// Check if we have the balance for this token
-						if let Some(balance_str) = context.solver_balances.get(&balance_key) {
-							// Parse balance and required amount
-							let balance = balance_str.parse::<U256>().unwrap_or(U256::ZERO);
-							let required = output.amount;
+					// Get token address from the asset's InteropAddress
+					let token_address = output
+						.asset
+						.ethereum_address()
+						.map(|addr| hex::encode(addr.as_slice()))
+						.unwrap_or_else(|e| {
+							tracing::warn!(
+								order_id = %order.id,
+								error = %e,
+								"Failed to get token address from asset"
+							);
+							String::new()
+						});
 
-							if balance < required {
-								tracing::warn!(
-									order_id = %order.id,
-									chain_id = chain_id,
-									token = %with_0x_prefix(&token_address),
-									balance = ?balance,
-									required = ?required,
-									"Insufficient token balance for order"
-								);
-								return ExecutionDecision::Skip(format!(
-									"Insufficient balance on chain {}: have {} need {} of token {}",
-									chain_id,
-									balance,
-									required,
-									with_0x_prefix(&token_address)
-								));
-							}
-						} else {
-							// No balance info available for this token
+					// Build the balance key (chain_id, Some(token_address))
+					let balance_key = (chain_id, Some(token_address.clone()));
+
+					// Check if we have the balance for this token
+					if let Some(balance_str) = context.solver_balances.get(&balance_key) {
+						// Parse balance and required amount
+						let balance = balance_str.parse::<U256>().unwrap_or(U256::ZERO);
+						let required = output.amount;
+
+						if balance < required {
 							tracing::warn!(
 								order_id = %order.id,
 								chain_id = chain_id,
 								token = %with_0x_prefix(&token_address),
-								"No balance information available for token"
+								balance = ?balance,
+								required = ?required,
+								"Insufficient token balance for order"
 							);
 							return ExecutionDecision::Skip(format!(
-								"No balance information for token {} on chain {}",
-								with_0x_prefix(&token_address),
-								chain_id
+								"Insufficient balance on chain {}: have {} need {} of token {}",
+								chain_id,
+								balance,
+								required,
+								with_0x_prefix(&token_address)
 							));
 						}
+					} else {
+						// No balance info available for this token
+						tracing::warn!(
+							order_id = %order.id,
+							chain_id = chain_id,
+							token = %with_0x_prefix(&token_address),
+							"No balance information available for token"
+						);
+						return ExecutionDecision::Skip(format!(
+							"No balance information for token {} on chain {}",
+							with_0x_prefix(&token_address),
+							chain_id
+						));
 					}
-				} else {
-					tracing::error!(
-						order_id = %order.id,
-						"Failed to parse EIP-7683 order data"
-					);
 				}
 			},
-			_ => {
-				// For unknown standards, skip balance checks
+			Err(e) => {
+				// Failed to parse order data
+				tracing::error!(
+					order_id = %order.id,
+					error = %e,
+					"Failed to parse order data"
+				);
+				// Continue without balance checks if parsing fails
 				tracing::debug!(
 					order_id = %order.id,
-					standard = %order.standard,
-					"Skipping balance check for unknown order standard"
+					"Continuing without balance checks due to parsing failure"
 				);
 			},
 		}
