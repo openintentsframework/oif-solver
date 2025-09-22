@@ -28,8 +28,6 @@ pub type DeliveryFactory = fn(
 pub type DiscoveryFactory = fn(
 	&toml::Value,
 	&NetworksConfig,
-	std::sync::Arc<solver_pricing::PricingService>,
-	rust_decimal::Decimal,
 ) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError>;
 pub type OrderFactory = fn(
 	&toml::Value,

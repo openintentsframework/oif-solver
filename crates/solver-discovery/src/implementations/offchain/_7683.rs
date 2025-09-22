@@ -908,8 +908,6 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 pub fn create_discovery(
 	config: &toml::Value,
 	networks: &NetworksConfig,
-	_pricing_service: std::sync::Arc<solver_pricing::PricingService>,
-	_min_profitability_pct: rust_decimal::Decimal,
 ) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError> {
 	// Validate configuration first
 	Eip7683OffchainDiscoverySchema::validate_config(config)

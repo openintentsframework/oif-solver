@@ -14,13 +14,11 @@ use alloy_transport_http::Http;
 use alloy_transport_ws::WsConnect;
 use async_trait::async_trait;
 use futures::StreamExt;
-use rust_decimal::Decimal;
-use solver_pricing::{extract_token_configs_from_order, profitability::ProfitabilityService};
 use solver_types::current_timestamp;
 use solver_types::{
 	standards::eip7683::{GasLimitOverrides, LockType, MandateOutput},
-	with_0x_prefix, Address, ConfigSchema, CostComponent, CostEstimate, Eip7683OrderData, Field,
-	FieldType, Intent, IntentMetadata, NetworksConfig, Order, OrderStatus, Schema,
+	with_0x_prefix, ConfigSchema, Eip7683OrderData, Field, FieldType, Intent, IntentMetadata,
+	NetworksConfig, Schema,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,10 +94,6 @@ pub struct Eip7683Discovery {
 	stop_signal: Arc<Mutex<Option<broadcast::Sender<()>>>>,
 	/// Polling interval for monitoring loop in seconds (0 = WebSocket mode).
 	polling_interval_secs: u64,
-	/// Minimum profitability percentage threshold for filtering intents.
-	min_profitability_pct: Decimal,
-	/// Profitability service for validating discovered orders.
-	profitability_service: Arc<ProfitabilityService>,
 }
 
 impl Eip7683Discovery {
@@ -111,8 +105,6 @@ impl Eip7683Discovery {
 		network_ids: Vec<u64>,
 		networks: NetworksConfig,
 		polling_interval_secs: Option<u64>,
-		min_profitability_pct: Decimal,
-		profitability_service: Arc<ProfitabilityService>,
 	) -> Result<Self, DiscoveryError> {
 		// Validate at least one network
 		if network_ids.is_empty() {
@@ -203,17 +195,14 @@ impl Eip7683Discovery {
 			monitoring_handles: Arc::new(Mutex::new(Vec::new())),
 			stop_signal: Arc::new(Mutex::new(None)),
 			polling_interval_secs: interval,
-			min_profitability_pct,
-			profitability_service,
 		})
 	}
 
-	/// Parses an Open event log into an Order and Intent.
+	/// Parses an Open event log into an Intent.
 	///
-	/// Decodes the EIP-7683 event data and converts it into both Order and Intent
-	/// formats used by the solver. Creates the order first from parsed data,
-	/// then the intent, avoiding redundant serialization/deserialization.
-	fn parse_open_event(log: &Log) -> Result<(Order, Intent), DiscoveryError> {
+	/// Decodes the EIP-7683 event data and converts it into the internal
+	/// Intent format used by the solver.
+	fn parse_open_event(log: &Log) -> Result<Intent, DiscoveryError> {
 		// Convert RPC log to primitives log for decoding
 		let prim_log = PrimLog {
 			address: log.address(),
@@ -267,131 +256,33 @@ impl Eip7683Discovery {
 			lock_type: Some(LockType::Permit2Escrow),
 		};
 
-		let intent_id = hex::encode(order_id);
-		let discovery_timestamp = current_timestamp();
-
-		// Extract chain IDs from the order data
-		let input_chain_ids = vec![order_data.origin_chain_id.to::<u64>()];
-		let output_chain_ids = order_data
-			.outputs
-			.iter()
-			.map(|output| output.chain_id.to::<u64>())
-			.collect::<Vec<_>>();
-
-		// Create Order first (from parsed data)
-		let order = Order {
-			id: intent_id.clone(),
-			standard: "eip7683".to_string(),
-			created_at: discovery_timestamp,
-			updated_at: discovery_timestamp,
-			status: OrderStatus::Created,
-			data: serde_json::to_value(&order_data).map_err(|e| {
-				DiscoveryError::ParseError(format!("Failed to serialize order data: {}", e))
-			})?,
-			// Use a mock address for now (all zeros)
-			solver_address: Address(vec![0u8; 20]),
-			quote_id: None,
-			input_chain_ids,
-			output_chain_ids,
-			execution_params: None,
-			prepare_tx_hash: None,
-			fill_tx_hash: None,
-			post_fill_tx_hash: None,
-			pre_claim_tx_hash: None,
-			claim_tx_hash: None,
-			fill_proof: None,
-		};
-
-		// Create Intent (using same serialized data)
-		let intent = Intent {
-			id: intent_id,
+		Ok(Intent {
+			id: hex::encode(order_id),
 			source: "on-chain".to_string(),
 			standard: "eip7683".to_string(),
 			metadata: IntentMetadata {
 				requires_auction: false,
 				exclusive_until: None,
-				discovered_at: discovery_timestamp,
+				discovered_at: current_timestamp(),
 			},
-			data: order.data.clone(), // Reuse already serialized data
+			data: serde_json::to_value(&order_data).map_err(|e| {
+				DiscoveryError::ParseError(format!("Failed to serialize order data: {}", e))
+			})?,
 			quote_id: None,
-		};
-
-		Ok((order, intent))
+		})
 	}
 
 	/// Process discovered logs into intents and send them.
 	///
 	/// Common logic for both polling and subscription modes.
-	/// Includes profitability validation to filter out unprofitable orders.
-	async fn process_discovered_logs(
+	fn process_discovered_logs(
 		logs: Vec<Log>,
 		sender: &mpsc::UnboundedSender<Intent>,
-		chain_id: u64,
-		min_profitability_pct: Decimal,
-		profitability_service: &Arc<ProfitabilityService>,
-		networks: &NetworksConfig,
+		_chain_id: u64,
 	) {
 		for log in logs {
-			let (order, intent) = match Self::parse_open_event(&log) {
-				Ok((order, intent)) => (order, intent),
-				Err(e) => {
-					tracing::warn!(chain = chain_id, "Failed to parse Open event: {:?}", e);
-					continue;
-				},
-			};
-
-			// TODO: MOCK COST ESTIMATE
-			// Create mock cost estimate for profitability validation
-			let cost_estimate = CostEstimate {
-				currency: "USD".to_string(),
-				components: vec![CostComponent {
-					name: "operational-cost".to_string(),
-					amount: "0.01".to_string(),
-					amount_wei: None,
-				}],
-				commission_bps: 0,
-				commission_amount: "0.00".to_string(),
-				subtotal: "0.01".to_string(),
-				total: "0.01".to_string(),
-			};
-			let token_configs = match extract_token_configs_from_order(&order, networks) {
-				Ok(configs) => configs,
-				Err(e) => {
-					tracing::warn!(
-						chain = chain_id,
-						order_id = %intent.id,
-						"Failed to extract token configs: {}", e
-					);
-					continue;
-				},
-			};
-
-			match profitability_service
-				.validate_profitability(
-					&order,
-					&cost_estimate,
-					min_profitability_pct,
-					&token_configs,
-				)
-				.await
-			{
-				Ok(profit_margin) => {
-					print!("profit_margin ONCHAIN: {:?}", profit_margin);
-					tracing::info!(
-						chain = chain_id,
-						order_id = %intent.id,
-						profit_margin = %profit_margin,
-						"Order meets profitability threshold, sending intent ONCHAIN"
-					);
-					let _ = sender.send(intent);
-				},
-				Err(e) => {
-					tracing::debug!(
-						chain = chain_id,
-						order_id = %intent.id,
-						"Order filtered due to insufficient profitability onchain: {}", e
-					);
-				},
+			if let Ok(intent) = Self::parse_open_event(&log) {
+				let _ = sender.send(intent);
 			}
 		}
 	}
@@ -408,8 +299,6 @@ impl Eip7683Discovery {
 		sender: mpsc::UnboundedSender<Intent>,
 		mut stop_rx: broadcast::Receiver<()>,
 		polling_interval_secs: u64,
-		min_profitability_pct: Decimal,
-		profitability_service: Arc<ProfitabilityService>,
 	) {
 		let mut interval =
 			tokio::time::interval(std::time::Duration::from_secs(polling_interval_secs));
@@ -475,14 +364,7 @@ impl Eip7683Discovery {
 					};
 
 					// Process discovered logs
-					Self::process_discovered_logs(
-						logs,
-						&sender,
-						chain_id,
-						min_profitability_pct,
-						&profitability_service,
-						&networks,
-					).await;
+					Self::process_discovered_logs(logs, &sender, chain_id);
 
 					// Update last block for this chain
 					last_blocks.lock().await.insert(chain_id, current_block);
@@ -505,8 +387,6 @@ impl Eip7683Discovery {
 		networks: NetworksConfig,
 		sender: mpsc::UnboundedSender<Intent>,
 		mut stop_rx: broadcast::Receiver<()>,
-		min_profitability_pct: Decimal,
-		profitability_service: Arc<ProfitabilityService>,
 	) {
 		// Get the input settler address for this chain
 		let settler_address = match networks.get(&chain_id) {
@@ -549,14 +429,7 @@ impl Eip7683Discovery {
 			tokio::select! {
 				Some(log) = stream.next() => {
 					// Process single log as it arrives
-					Self::process_discovered_logs(
-						vec![log],
-						&sender,
-						chain_id,
-						min_profitability_pct,
-						&profitability_service,
-						&networks,
-					).await;
+					Self::process_discovered_logs(vec![log], &sender, chain_id);
 				}
 				_ = stop_rx.recv() => {
 					tracing::info!(chain = chain_id, "Stopping WebSocket monitor");
@@ -643,8 +516,6 @@ impl DiscoveryInterface for Eip7683Discovery {
 			let sender = sender.clone();
 			let stop_rx = stop_tx.subscribe();
 			let chain_id = *network_id;
-			let min_profitability_pct = self.min_profitability_pct;
-			let profitability_service = self.profitability_service.clone();
 
 			let handle = match provider {
 				ProviderType::Http(http_provider) => {
@@ -660,8 +531,6 @@ impl DiscoveryInterface for Eip7683Discovery {
 							sender,
 							stop_rx,
 							polling_interval_secs,
-							min_profitability_pct,
-							profitability_service,
 						)
 						.await;
 					})
@@ -670,13 +539,7 @@ impl DiscoveryInterface for Eip7683Discovery {
 					let provider = ws_provider.clone();
 					tokio::spawn(async move {
 						Self::monitor_chain_subscription(
-							provider,
-							chain_id,
-							networks,
-							sender,
-							stop_rx,
-							min_profitability_pct,
-							profitability_service,
+							provider, chain_id, networks, sender, stop_rx,
 						)
 						.await;
 					})
@@ -731,8 +594,6 @@ impl DiscoveryInterface for Eip7683Discovery {
 ///
 /// * `config` - The discovery implementation configuration
 /// * `networks` - The networks configuration
-/// * `pricing_service` - The pricing service for profitability calculations
-/// * `min_profitability_pct` - Minimum profitability percentage threshold from solver config
 ///
 /// # Errors
 ///
@@ -743,8 +604,6 @@ impl DiscoveryInterface for Eip7683Discovery {
 pub fn create_discovery(
 	config: &toml::Value,
 	networks: &NetworksConfig,
-	pricing_service: Arc<solver_pricing::PricingService>,
-	min_profitability_pct: Decimal,
 ) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError> {
 	// Validate configuration first
 	Eip7683DiscoverySchema::validate_config(config)
@@ -775,17 +634,7 @@ pub fn create_discovery(
 	// Create discovery service synchronously
 	let discovery = tokio::task::block_in_place(|| {
 		tokio::runtime::Handle::current().block_on(async {
-			// Create profitability service using the passed pricing service
-			let profitability_service = Arc::new(ProfitabilityService::new(pricing_service));
-
-			Eip7683Discovery::new(
-				network_ids,
-				networks.clone(),
-				polling_interval_secs,
-				min_profitability_pct,
-				profitability_service,
-			)
-			.await
+			Eip7683Discovery::new(network_ids, networks.clone(), polling_interval_secs).await
 		})
 	})?;
 
@@ -954,7 +803,7 @@ mod tests {
 		let result = Eip7683Discovery::parse_open_event(&log);
 
 		assert!(result.is_ok());
-		let (_, intent) = result.unwrap();
+		let intent = result.unwrap();
 
 		// Verify intent structure
 		assert_eq!(intent.source, "on-chain");

@@ -74,8 +74,6 @@ impl SolverBuilder {
 		DIF: Fn(
 			&toml::Value,
 			&solver_types::NetworksConfig,
-			std::sync::Arc<PricingService>,
-			rust_decimal::Decimal,
 		) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError>,
 		OF: Fn(
 			&toml::Value,
@@ -332,7 +330,7 @@ impl SolverBuilder {
 		let mut discovery_implementations = HashMap::new();
 		for (name, config) in &self.config.discovery.implementations {
 			if let Some(factory) = factories.discovery_factories.get(name) {
-				match factory(config, &self.config.networks, pricing.clone(), self.config.solver.min_profitability_pct) {
+				match factory(config, &self.config.networks) {
 					Ok(implementation) => {
 						// Validation already happened in the factory
 						discovery_implementations.insert(name.clone(), implementation);
