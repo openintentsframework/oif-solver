@@ -283,15 +283,18 @@ sol! {
 			bytes[] calldata payloads
 		) external view returns (uint256);
 
-		// Check if finalization is required for a message
-		function requiresFinalization(
-			bytes32 messageId
+		// Check if data has been proven (from BaseInputOracle)
+		function isProven(
+			uint256 remoteChainId,
+			bytes32 remoteOracle,
+			bytes32 application,
+			bytes32 dataHash
 		) external view returns (bool);
 
-		// Finalize a delivered message
-		function finalize(
-			bytes32 messageId
-		) external;
+		// Efficiently check multiple proofs (from BaseInputOracle)
+		function efficientRequireProven(
+			bytes calldata proofSeries
+		) external view;
 	}
 
 	// Event emitted when output is proven
@@ -465,45 +468,14 @@ impl MessageTracker {
 
 	pub async fn check_finalization_required(
 		&self,
-		order_id: &str,
-		oracle_address: solver_types::Address,
-		provider: &RootProvider<Http<reqwest::Client>>,
+		_order_id: &str,
+		_oracle_address: solver_types::Address,
+		_provider: &RootProvider<Http<reqwest::Client>>,
 	) -> Result<bool, SettlementError> {
-		println!("Checking for finalization...");
-		// Get the submitted message
-		let state = self.load_message(order_id).await.ok_or_else(|| {
-			SettlementError::ValidationFailed("Message not found in tracker".to_string())
-		})?;
-
-		let message = state.submitted.as_ref().ok_or_else(|| {
-			SettlementError::ValidationFailed("No submitted message found".to_string())
-		})?;
-
-		// Build requiresFinalization call
-		let call_data = IHyperlaneOracle::requiresFinalizationCall {
-			messageId: FixedBytes::<32>::from_slice(&message.message_id),
-		};
-
-		let call_request = alloy_rpc_types::eth::transaction::TransactionRequest {
-			to: Some(alloy_primitives::TxKind::Call(
-				alloy_primitives::Address::from_slice(&oracle_address.0),
-			)),
-			input: call_data.abi_encode().into(),
-			..Default::default()
-		};
-
-		// Make the call
-		let result = provider.call(&call_request).await.map_err(|e| {
-			SettlementError::ValidationFailed(format!(
-				"Failed to check finalization requirement: {}",
-				e
-			))
-		})?;
-
-		println!("requiresFinalizationCall: {:?}", result);
-
-		// Decode bool result
-		Ok(!result.is_empty() && result[31] == 1)
+		// Hyperlane doesn't require explicit finalization
+		// Messages are automatically processed when they arrive at the destination
+		// The oracle will automatically attest to the message when it's received
+		Ok(false)
 	}
 
 	pub async fn mark_delivered(
@@ -1088,66 +1060,12 @@ impl SettlementInterface for HyperlaneSettlement {
 
 	async fn generate_pre_claim_transaction(
 		&self,
-		order: &Order,
-		fill_proof: &FillProof,
+		_order: &Order,
+		_fill_proof: &FillProof,
 	) -> Result<Option<Transaction>, SettlementError> {
-		let origin_chain = order
-			.input_chains
-			.first()
-			.map(|c| c.chain_id)
-			.ok_or_else(|| SettlementError::ValidationFailed("No input chains".into()))?;
-
-		// Get input oracle on origin chain
-		let oracle_addresses = self.get_input_oracles(origin_chain);
-		if oracle_addresses.is_empty() {
-			return Ok(None);
-		}
-
-		let oracle_address = self
-			.select_oracle(&oracle_addresses, None)
-			.ok_or_else(|| SettlementError::ValidationFailed("Failed to select oracle".into()))?;
-
-		// Get message ID from attestation data
-		let message_id = match &fill_proof.attestation_data {
-			Some(data) if data.len() == 64 => {
-				let mut id = [0u8; 32];
-				hex::decode_to_slice(data, &mut id)
-					.map_err(|_| SettlementError::ValidationFailed("Invalid message ID".into()))?;
-				FixedBytes::<32>::from_slice(&id)
-			},
-			_ => return Ok(None), // No message to finalize
-		};
-
-		// Check if finalization is required
-		let provider = self
-			.providers
-			.get(&origin_chain)
-			.ok_or_else(|| SettlementError::ValidationFailed("No provider".into()))?;
-
-		if !self
-			.message_tracker
-			.check_finalization_required(&order.id, oracle_address.clone(), provider)
-			.await?
-		{
-			return Ok(None); // No finalization needed
-		}
-
-		// Build finalize call
-		let call_data = IHyperlaneOracle::finalizeCall {
-			messageId: message_id,
-		};
-
-		Ok(Some(Transaction {
-			to: Some(oracle_address),
-			data: call_data.abi_encode(),
-			value: U256::ZERO,
-			chain_id: origin_chain,
-			nonce: None,
-			gas_limit: Some(100000),
-			gas_price: None,
-			max_fee_per_gas: None,
-			max_priority_fee_per_gas: None,
-		}))
+		// Hyperlane doesn't require finalization
+		// Messages are automatically processed when they arrive
+		Ok(None)
 	}
 
 	async fn handle_transaction_confirmed(
