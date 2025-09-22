@@ -130,7 +130,11 @@ pub async fn process_quote_request(
 				quote.cost = Some(cost);
 			},
 			Err(e) => {
-				tracing::warn!("Failed to estimate cost for quote {}: {}", quote.quote_id, e);
+				tracing::warn!(
+					"Failed to estimate cost for quote {}: {}",
+					quote.quote_id,
+					e
+				);
 			},
 		}
 	}
