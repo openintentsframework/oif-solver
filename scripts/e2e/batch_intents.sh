@@ -32,6 +32,9 @@ BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 NC='\033[0m' # No Color
 
+# Order type configuration - set to eip7683 for Hyperlane or eipXXXX for direct
+ORDER_TYPE="eip7683"
+
 echo -e "${BLUE}🔄 Sequential Batch Intent Processor${NC}"
 echo "====================================="
 
@@ -126,10 +129,10 @@ fi
 get_oracle_for_chain() {
     local chain_id=$1
     
-    # Iterate through all settlement implementations and find oracle for this chain
-    jq -r --arg chain_id "$chain_id" '
+    # Get the implementation that matches ORDER_TYPE and has this chain
+    jq -r --arg chain_id "$chain_id" --arg order_type "$ORDER_TYPE" '
         .settlement.implementations[] | 
-        select(.enabled == true) |
+        select(.enabled == true and .order_type == $order_type) |
         .chains | 
         to_entries[] | 
         select(.value.chain_id == ($chain_id | tonumber)) | 
@@ -204,6 +207,7 @@ process_intent() {
     echo "   Input Settler: $origin_input_settler"
     echo "   Output Settler: $dest_output_settler"
     echo "   Oracle: $oracle"
+    echo "   Order Type: $ORDER_TYPE"
     
     # Validate configuration
     if [[ -z "$origin_input_settler" || -z "$dest_output_settler" || -z "$origin_rpc" || -z "$oracle" ]]; then

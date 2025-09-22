@@ -3,7 +3,7 @@
     "chain_id": 84532,
     "name": "Base Sepolia",
     "rpc_url": "https://sepolia.base.org",
-    "usdc_address": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+    "usdc_address": "0x73c83DAcc74bB8a704717AC09703b959E74b9705",
     "explorer_url": "https://sepolia.basescan.org"
   },
   "arbitrum-sepolia": {

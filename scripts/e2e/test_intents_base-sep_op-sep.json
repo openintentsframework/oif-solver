@@ -1,12 +1,12 @@
 {
   "intents": [
     {
-      "description": "Test USDC transfer from Holesky to Optimism Sepolia",
+      "description": "Test USDC transfer from Base Sepolia to Optimism Sepolia",
       "enabled": true,
-      "origin_chain_id": 17000,
+      "origin_chain_id": 84532,
       "dest_chain_id": 11155420,
       "origin_token": {
-        "address": "0x7dfFC9e7db5a96887666c1a6D215E5d3Fb306d69",
+        "address": "0x73c83DAcc74bB8a704717AC09703b959E74b9705",
         "symbol": "USDC",
         "decimals": 6
       },
