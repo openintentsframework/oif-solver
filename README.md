@@ -569,7 +569,7 @@ The demo supports two submission modes:
 # Format: quote test <lock_type> <auth_type> <token_pair>
 ./oif-demo quote test escrow permit2 A2B   # Full flow with escrow lock and Permit2
 ./oif-demo quote test escrow eip3009 A2B   # Full flow with escrow lock and EIP-3009
-./oif-demo quote test compact B2A  # Full flow with compact lock and Permit2 (EIP-3009 not supported)
+./oif-demo quote test compact B2A  # Full flow with the-compact
 ```
 
 #### Balance Monitoring

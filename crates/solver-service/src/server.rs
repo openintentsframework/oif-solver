@@ -451,14 +451,11 @@ async fn validate_intent_request(
 	});
 
 	// EIP-712 signature validation for ResourceLock orders
-	tracing::debug!("Checking if signature validation is required");
 	let requires_validation = state
 		.signature_validation
 		.requires_signature_validation(standard, &intent.lock_type);
-	tracing::debug!("Signature validation required: {}", requires_validation);
 
 	if requires_validation {
-		tracing::debug!("Starting signature validation");
 		state
 			.signature_validation
 			.validate_signature(
@@ -472,7 +469,6 @@ async fn validate_intent_request(
 
 	// Process the order through the OrderService
 	// This validates the order based on the standard and returns a validated Order
-	tracing::debug!("Starting order validation and creation");
 	let result = state
 		.solver
 		.order()
