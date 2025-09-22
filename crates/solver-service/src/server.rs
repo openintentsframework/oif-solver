@@ -19,7 +19,7 @@ use axum::{
 };
 use serde_json::Value;
 use solver_config::{ApiConfig, Config};
-use solver_core::{engine::cost_profit::CostProfitService, SolverEngine};
+use solver_core::SolverEngine;
 use solver_types::{
 	api::IntentRequest, APIError, Address, ApiErrorType, GetOrderResponse, GetQuoteRequest,
 	GetQuoteResponse, Order, OrderIdCallback, Transaction,
@@ -295,24 +295,10 @@ async fn handle_order(
 	};
 
 	// Validate the IntentRequest
-	let validated_order = match validate_intent_request(&intent_request, &state, standard).await {
+	match validate_intent_request(&intent_request, &state, standard).await {
 		Ok(order) => order,
 		Err(api_error) => return api_error.into_response(),
 	};
-
-	// Validate cost estimation and profitability for API requests
-	let cost_profit_service = CostProfitService::new(
-		state.solver.pricing().clone(),
-		state.solver.delivery().clone(),
-		state.solver.token_manager().clone(),
-	);
-	if let Err(api_error) = cost_profit_service
-		.validate_order_profitability_for_api(&validated_order, &state.config)
-		.await
-	{
-		tracing::warn!("Order profitability validation failed: {}", api_error);
-		return api_error.into_response();
-	}
 
 	forward_to_discovery_service(&state, &intent_request).await
 }
