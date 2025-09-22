@@ -13,12 +13,6 @@ pub mod implementations {
 	pub mod mock;
 }
 
-/// Profitability calculation utilities
-pub mod profitability;
-
-// Re-export the profitability service for easy access
-pub use profitability::{extract_token_configs_from_order, OrderTokenConfigs, ProfitabilityService};
-
 /// Get all registered pricing implementations.
 pub fn get_all_implementations() -> Vec<(&'static str, PricingFactory)> {
 	use implementations::{coingecko, mock};

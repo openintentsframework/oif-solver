@@ -4,7 +4,7 @@
 //! for the OIF Solver API.
 
 use crate::{
-	apis::{order::get_order_by_id, quote::cost::CostEngine},
+	apis::order::get_order_by_id,
 	auth::{auth_middleware, AuthState, JwtService},
 	signature_validator::SignatureValidationService,
 };
@@ -19,7 +19,7 @@ use axum::{
 };
 use serde_json::Value;
 use solver_config::{ApiConfig, Config};
-use solver_core::SolverEngine;
+use solver_core::{engine::cost_profit::CostProfitService, SolverEngine};
 use solver_types::{
 	api::IntentRequest, APIError, Address, ApiErrorType, GetOrderResponse, GetQuoteRequest,
 	GetQuoteResponse, Order, OrderIdCallback, Transaction,
@@ -300,64 +300,19 @@ async fn handle_order(
 		Err(api_error) => return api_error.into_response(),
 	};
 
-	// Estimate costs
-	let cost_engine = CostEngine::new();
-	let cost_estimate = match cost_engine
-		.estimate_cost_for_order(&validated_order, &state.solver, &state.config)
-		.await
-	{
-		Ok(estimation) => estimation,
-		Err(api_error) => {
-			tracing::warn!("Cost estimation failed: {}", api_error);
-			return api_error.into_response();
-		},
-	};
-
-	// Validate profitability using ProfitabilityService with pre-fetched token configs
-	let profitability_service =
-		solver_pricing::ProfitabilityService::new(state.solver.pricing().clone());
-
-	// Extract token configs from the order using NetworksConfig
-	let token_configs = match solver_pricing::extract_token_configs_from_order(
-		&validated_order,
-		&state.config.networks,
-	) {
-		Ok(configs) => configs,
-		Err(e) => {
-			tracing::warn!("Failed to extract token configs: {}", e);
-			return APIError::InternalServerError {
-				error_type: ApiErrorType::InternalError,
-				message: format!("Failed to extract token configurations: {}", e),
-			}
-			.into_response();
-		},
-	};
-
-	print!("token_configs: {:?}", token_configs);
-
-	let actual_profit_margin = match profitability_service
-		.validate_profitability(
-			&validated_order,
-			&cost_estimate,
-			state.config.solver.min_profitability_pct,
-			&token_configs,
-		)
-		.await
-	{
-		Ok(margin) => margin,
-		Err(api_error) => {
-			tracing::warn!("Order profitability validation failed: {}", api_error);
-			return api_error.into_response();
-		},
-	};
-
-	// Order meets profitability requirements
-	tracing::info!(
-		"Order profitability validated: margin={:.2}% (min={:.2}%), total_cost=${}",
-		actual_profit_margin,
-		state.config.solver.min_profitability_pct,
-		cost_estimate.total
+	// Validate cost estimation and profitability for API requests
+	let cost_profit_service = CostProfitService::new(
+		state.solver.pricing().clone(),
+		state.solver.delivery().clone(),
+		state.solver.token_manager().clone(),
 	);
+	if let Err(api_error) = cost_profit_service
+		.validate_order_profitability_for_api(&validated_order, &state.config)
+		.await
+	{
+		tracing::warn!("Order profitability validation failed: {}", api_error);
+		return api_error.into_response();
+	}
 
 	forward_to_discovery_service(&state, &intent_request).await
 }

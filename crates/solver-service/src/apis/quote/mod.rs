@@ -62,7 +62,6 @@
 //! - `InsufficientLiquidity`: Solver lacks required tokens
 //! - `UnsupportedChain`: Chain not configured
 //! - `Internal`: System errors
-pub mod cost;
 pub mod custody;
 pub mod generation;
 pub mod registry;
@@ -115,15 +114,24 @@ pub async fn process_quote_request(
 	let quote_generator = QuoteGenerator::new(settlement_service.clone());
 	let mut quotes = quote_generator.generate_quotes(&request, config).await?;
 
-	// Enrich quotes with a preliminary cost breakdown
-	let cost_engine = cost::CostEngine::new();
+	// Enrich quotes with a preliminary cost breakdown using CostProfitService
+	let cost_profit_service = solver_core::engine::cost_profit::CostProfitService::new(
+		solver.pricing().clone(),
+		solver.delivery().clone(),
+		solver.token_manager().clone(),
+	);
 
 	for quote in &mut quotes {
-		if let Ok(cost) = cost_engine
-			.estimate_cost_for_quote(quote, solver, config)
+		match cost_profit_service
+			.estimate_cost_for_quote(quote, config)
 			.await
 		{
-			quote.cost = Some(cost);
+			Ok(cost) => {
+				quote.cost = Some(cost);
+			},
+			Err(e) => {
+				tracing::warn!("Failed to estimate cost for quote {}: {}", quote.quote_id, e);
+			},
 		}
 	}
 
