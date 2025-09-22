@@ -13,8 +13,8 @@ use solver_delivery::DeliveryService;
 use solver_pricing::PricingService;
 use solver_types::{
 	costs::{CostComponent, CostEstimate},
-	current_timestamp, Address, AvailableInput, ExecutionParams, FillProof, Order, Quote,
-	RequestedOutput, Transaction, TransactionHash, DEFAULT_GAS_PRICE_WEI,
+	current_timestamp, APIError, Address, ApiErrorType, AvailableInput, ExecutionParams, FillProof,
+	Order, Quote, RequestedOutput, Transaction, TransactionHash, DEFAULT_GAS_PRICE_WEI,
 };
 use std::{str::FromStr, sync::Arc};
 use thiserror::Error;
@@ -23,6 +23,8 @@ const HUNDRED: i64 = 10000;
 
 #[derive(Debug, Error)]
 pub enum CostProfitError {
+	#[error("API error: {0}")]
+	Api(#[from] APIError),
 	#[error("Calculation error: {0}")]
 	Calculation(String),
 	#[error("Configuration error: {0}")]
@@ -81,7 +83,11 @@ impl CostProfitService {
 			.iter()
 			.filter_map(|input| input.asset.ethereum_chain_id().ok())
 			.next()
-			.ok_or_else(|| CostProfitError::Calculation("No input chain ID found".to_string()))?;
+			.ok_or_else(|| APIError::BadRequest {
+				error_type: ApiErrorType::MissingChainId,
+				message: "No input chain ID found".to_string(),
+				details: None,
+			})?;
 
 		let dest_chain_id = quote
 			.details
@@ -89,7 +95,11 @@ impl CostProfitService {
 			.iter()
 			.filter_map(|output| output.asset.ethereum_chain_id().ok())
 			.next()
-			.ok_or_else(|| CostProfitError::Calculation("No output chain ID found".to_string()))?;
+			.ok_or_else(|| APIError::BadRequest {
+				error_type: ApiErrorType::MissingChainId,
+				message: "No output chain ID found".to_string(),
+				details: None,
+			})?;
 
 		let chain_params = ChainParams {
 			origin_chain_id,
@@ -101,9 +111,13 @@ impl CostProfitService {
 
 		// TODO: pass standard as part of quote request
 		let standard = "eip7683";
-		let order = quote.to_order_for_estimation(standard).map_err(|e| {
-			CostProfitError::Calculation(format!("Failed to convert quote to order: {}", e))
-		})?;
+		let order = quote
+			.to_order_for_estimation(standard)
+			.map_err(|e| APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: format!("Failed to convert quote to order: {}", e),
+				details: None,
+			})?;
 
 		// Estimate gas units
 		let gas_units = self
@@ -134,17 +148,25 @@ impl CostProfitService {
 		config: &Config,
 	) -> Result<CostEstimate, CostProfitError> {
 		// Parse the order data based on its standard
-		let order_parsed = order.parse_order_data().map_err(|e| {
-			CostProfitError::Calculation(format!("Failed to parse order data: {}", e))
+		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
+			error_type: ApiErrorType::InvalidRequest,
+			message: format!("Failed to parse order data: {}", e),
+			details: None,
 		})?;
 
 		// Extract chain parameters
 		let origin_chain_id = order_parsed.origin_chain_id();
 		let dest_chain_ids = order_parsed.destination_chain_ids();
 
-		let dest_chain_id = dest_chain_ids.first().copied().ok_or_else(|| {
-			CostProfitError::Calculation("No destination chain ID found".to_string())
-		})?;
+		let dest_chain_id =
+			dest_chain_ids
+				.first()
+				.copied()
+				.ok_or_else(|| APIError::BadRequest {
+					error_type: ApiErrorType::MissingChainId,
+					message: "No destination chain ID found".to_string(),
+					details: None,
+				})?;
 
 		let chain_params = ChainParams {
 			origin_chain_id,
@@ -314,19 +336,73 @@ impl CostProfitService {
 		order: &Order,
 		cost_estimate: &CostEstimate,
 		min_profitability_pct: Decimal,
-	) -> Result<Decimal, CostProfitError> {
+	) -> Result<Decimal, APIError> {
 		// Calculate profit margin
-		let actual_profit_margin = self.calculate_profit_margin(order, cost_estimate).await?;
+		let actual_profit_margin = self
+			.calculate_profit_margin(order, cost_estimate)
+			.await
+			.map_err(|e| APIError::InternalServerError {
+				error_type: ApiErrorType::InternalError,
+				message: format!("Failed to calculate profitability: {}", e),
+			})?;
 
 		// Check if the actual profit margin meets the minimum requirement
 		if actual_profit_margin < min_profitability_pct {
-			return Err(CostProfitError::Calculation(format!(
-				"Insufficient profit margin: {:.2}% (minimum required: {:.2}%)",
-				actual_profit_margin, min_profitability_pct
-			)));
+			return Err(APIError::UnprocessableEntity {
+				error_type: ApiErrorType::InsufficientProfitability,
+				message: format!(
+					"Insufficient profit margin: {:.2}% (minimum required: {:.2}%)",
+					actual_profit_margin, min_profitability_pct
+				),
+				details: Some(serde_json::json!({
+					"actual_profit_margin": actual_profit_margin,
+					"min_required": min_profitability_pct,
+					"total_cost": cost_estimate.total,
+					"cost_components": cost_estimate.components,
+				})),
+			});
 		}
 
 		Ok(actual_profit_margin)
+	}
+
+	/// Validates cost estimation and profitability for an already-validated order from API requests.
+	///
+	/// This method combines cost estimation and profitability validation specifically for API-originated orders,
+	/// returning APIError types that can be properly handled by the HTTP layer.
+	/// For internally discovered intents, use the individual methods or IntentHandler directly.
+	pub async fn validate_order_profitability_for_api(
+		&self,
+		order: &Order,
+		config: &Config,
+	) -> Result<(), APIError> {
+		use solver_types::truncate_id;
+
+		// Calculate cost estimation
+		let cost_estimate =
+			self.estimate_cost_for_order(order, config)
+				.await
+				.map_err(|e| match e {
+					CostProfitError::Api(api_error) => api_error,
+					other => APIError::InternalServerError {
+						error_type: ApiErrorType::InternalError,
+						message: format!("Cost estimation failed: {}", other),
+					},
+				})?;
+
+		// Validate profitability
+		let actual_profit_margin = self
+			.validate_profitability(order, &cost_estimate, config.solver.min_profitability_pct)
+			.await?;
+
+		tracing::info!(
+			order_id = %truncate_id(&order.id),
+			margin = %actual_profit_margin,
+			cost = %cost_estimate.total,
+			"Order profitability validation successful for API request"
+		);
+
+		Ok(())
 	}
 
 	/// Estimate gas units with optional live estimation
@@ -411,10 +487,7 @@ impl CostProfitService {
 	}
 
 	/// Build fill transaction for gas estimation
-	async fn build_fill_tx_for_estimation(
-		&self,
-		order: &Order,
-	) -> Result<Transaction, CostProfitError> {
+	async fn build_fill_tx_for_estimation(&self, order: &Order) -> Result<Transaction, APIError> {
 		// Create execution params for estimation
 		let params = ExecutionParams {
 			gas_price: U256::from(DEFAULT_GAS_PRICE_WEI),
@@ -422,8 +495,10 @@ impl CostProfitService {
 		};
 
 		// Parse the order to get the destination chain ID
-		let order_parsed = order.parse_order_data().map_err(|e| {
-			CostProfitError::Calculation(format!("Failed to parse order data for fill tx: {}", e))
+		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
+			error_type: ApiErrorType::InvalidRequest,
+			message: format!("Failed to parse order data for fill tx: {}", e),
+			details: None,
 		})?;
 		let dest_chain_ids = order_parsed.destination_chain_ids();
 		let chain_id = dest_chain_ids.first().copied().unwrap_or(1);
@@ -444,10 +519,7 @@ impl CostProfitService {
 	}
 
 	/// Build claim transaction for gas estimation
-	async fn build_claim_tx_for_estimation(
-		&self,
-		order: &Order,
-	) -> Result<Transaction, CostProfitError> {
+	async fn build_claim_tx_for_estimation(&self, order: &Order) -> Result<Transaction, APIError> {
 		// Create minimal fill proof for estimation
 		let _fill_proof = FillProof {
 			oracle_address: "0x0000000000000000000000000000000000000000".to_string(),
@@ -458,8 +530,10 @@ impl CostProfitService {
 		};
 
 		// Parse the order to get the origin chain ID
-		let order_parsed = order.parse_order_data().map_err(|e| {
-			CostProfitError::Calculation(format!("Failed to parse order data for claim tx: {}", e))
+		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
+			error_type: ApiErrorType::InvalidRequest,
+			message: format!("Failed to parse order data for claim tx: {}", e),
+			details: None,
 		})?;
 		let chain_id = order_parsed.origin_chain_id();
 
@@ -711,13 +785,14 @@ impl CostProfitService {
 	}
 
 	/// Gets the gas price for a specific chain
-	async fn get_chain_gas_price(&self, chain_id: u64) -> Result<U256, CostProfitError> {
+	async fn get_chain_gas_price(&self, chain_id: u64) -> Result<U256, APIError> {
 		let chain_data = self
 			.delivery_service
 			.get_chain_data(chain_id)
 			.await
-			.map_err(|e| {
-				CostProfitError::Calculation(format!("Failed to get chain data: {}", e))
+			.map_err(|e| APIError::InternalServerError {
+				error_type: ApiErrorType::ServiceError,
+				message: format!("Failed to get chain data: {}", e),
 			})?;
 
 		match U256::from_str_radix(&chain_data.gas_price, 10) {

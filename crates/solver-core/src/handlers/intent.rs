@@ -110,56 +110,61 @@ impl IntentHandler {
 			.await
 		{
 			Ok(order) => {
-				// Calculate cost estimation and validate profitability
-				let cost_estimate = match self
-					.cost_profit_service
-					.estimate_cost_for_order(&order, &self.config)
-					.await
-				{
-					Ok(estimate) => {
-						tracing::info!(
-							"Cost estimate calculated: total={} {}",
-							estimate.total,
-							estimate.currency
-						);
-						estimate
-					},
-					Err(e) => {
-						tracing::warn!("Failed to calculate cost estimate: {}", e);
-						return Err(IntentError::Service(format!(
-							"Cost estimation failed: {}",
-							e
-						)));
-					},
-				};
+				// Only calculate cost estimation and validate profitability for on-chain intents
+				// Off-chain intents already have the cost estimation and profitability calculated during the api request
+				if intent.source == "on-chain" {
+					let cost_estimate = match self
+						.cost_profit_service
+						.estimate_cost_for_order(&order, &self.config)
+						.await
+					{
+						Ok(estimate) => {
+							tracing::info!(
+								"Cost estimate calculated: total={} {}",
+								estimate.total,
+								estimate.currency
+							);
+							estimate
+						},
+						Err(e) => {
+							tracing::warn!("Failed to calculate cost estimate: {}", e);
+							return Err(IntentError::Service(format!(
+								"Cost estimation failed: {}",
+								e
+							)));
+						},
+					};
 
-				// Validate profitability
-				match self
-					.cost_profit_service
-					.validate_profitability(
-						&order,
-						&cost_estimate,
-						self.config.solver.min_profitability_pct,
-					)
-					.await
-				{
-					Ok(actual_profit_margin) => {
-						tracing::info!(
-							"Order passed profitability validation: {:.2}% (min required: {:.2}%)",
-							actual_profit_margin,
-							self.config.solver.min_profitability_pct
-						);
-					},
-					Err(e) => {
-						tracing::warn!("Order failed profitability validation: {}", e);
-						self.event_bus
-							.publish(SolverEvent::Order(OrderEvent::Skipped {
-								order_id: order.id.clone(),
-								reason: format!("Insufficient profitability: {}", e),
-							}))
-							.ok();
-						return Ok(());
-					},
+					// Validate profitability
+					match self
+						.cost_profit_service
+						.validate_profitability(
+							&order,
+							&cost_estimate,
+							self.config.solver.min_profitability_pct,
+						)
+						.await
+					{
+						Ok(actual_profit_margin) => {
+							tracing::info!(
+								"Order passed profitability validation: {:.2}% (min required: {:.2}%)",
+								actual_profit_margin,
+								self.config.solver.min_profitability_pct
+							);
+						},
+						Err(e) => {
+							tracing::warn!("Order failed profitability validation: {}", e);
+							self.event_bus
+								.publish(SolverEvent::Order(OrderEvent::Skipped {
+									order_id: order.id.clone(),
+									reason: format!("Insufficient profitability: {}", e),
+								}))
+								.ok();
+							return Ok(());
+						},
+					}
+				} else {
+					tracing::info!("Skipping cost/profit calculation for off-chain intent. Already calculated during api request");
 				}
 
 				self.event_bus
