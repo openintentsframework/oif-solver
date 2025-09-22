@@ -5,11 +5,12 @@
 //! the main event loop for processing intents and orders.
 
 pub mod context;
+pub mod cost_profit;
 pub mod event_bus;
 pub mod lifecycle;
 pub mod token_manager;
 
-use self::token_manager::TokenManager;
+use self::{cost_profit::CostProfitService, token_manager::TokenManager};
 use crate::handlers::{IntentHandler, OrderHandler, SettlementHandler, TransactionHandler};
 use crate::recovery::RecoveryService;
 use crate::state::OrderStateMachine;
@@ -129,6 +130,13 @@ impl SolverEngine {
 	) -> Self {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 
+		// Create CostProfitService for cost estimation and profitability validation
+		let cost_profit_service = Arc::new(CostProfitService::new(
+			pricing.clone(),
+			delivery.clone(),
+			token_manager.clone(),
+		));
+
 		let intent_handler = Arc::new(IntentHandler::new(
 			order.clone(),
 			storage.clone(),
@@ -137,6 +145,7 @@ impl SolverEngine {
 			delivery.clone(),
 			solver_address,
 			token_manager.clone(),
+			cost_profit_service,
 			config.clone(),
 		));
 
@@ -514,7 +523,6 @@ impl SolverEngine {
 	pub fn pricing(&self) -> &Arc<PricingService> {
 		&self.pricing
 	}
-
 
 	/// Helper method to spawn handler tasks with semaphore-based concurrency control.
 	///
