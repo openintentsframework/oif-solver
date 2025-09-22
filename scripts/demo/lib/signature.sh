@@ -673,49 +673,41 @@ compute_compact_digest_from_quote() {
     echo "$final_digest"
 }
 
-# Sign BatchCompact digest from quote
+# Sign BatchCompact digest from quote using client-side computation
 sign_compact_digest_from_quote() {
     local user_private_key="$1"
     local full_message="$2"
 
-    # Check if a pre-computed digest is provided
-    local pre_computed_digest=$(echo "$full_message" | jq -r '.digest // empty' 2>/dev/null)
-    
-    local digest=""
-    if [ -n "$pre_computed_digest" ] && [ "$pre_computed_digest" != "null" ] && [ "$pre_computed_digest" != "empty" ]; then
-        print_info "Using pre-computed digest from quote..." >&2
-        digest="$pre_computed_digest"
-        print_debug "Pre-computed digest: $digest" >&2
-    else
-        print_info "Computing BatchCompact digest..." >&2
-        
-        # Extract EIP-712 message for computation
-        local eip712_message=$(echo "$full_message" | jq -r '.eip712 // empty' 2>/dev/null)
-        if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ]; then
-            print_error "No EIP-712 message found for digest computation" >&2
-            return 1
-        fi
-        
-        # Compute the digest
-        digest=$(compute_compact_digest_from_quote "$eip712_message")
-    fi
+    print_debug "Starting BatchCompact signing with client-side digest computation" >&2
 
-    if [ -z "$digest" ]; then
-        print_error "Failed to compute BatchCompact digest" >&2
+    # Extract EIP-712 message for client computation
+    local eip712_message=$(echo "$full_message" | jq -r '.eip712 // empty' 2>/dev/null)
+    if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ] || [ "$eip712_message" = "empty" ]; then
+        print_error "No EIP-712 message found for digest computation" >&2
         return 1
     fi
 
-    print_debug "Digest to sign: $digest" >&2
+    # Always compute client-side digest
+    print_info "Computing client-side digest..." >&2
+    local client_digest=$(compute_compact_digest_from_quote "$eip712_message")
+    if [ $? -ne 0 ] || [ -z "$client_digest" ]; then
+        print_error "Failed to compute client-side digest" >&2
+        return 1
+    fi
+    print_debug "Client computed digest: $client_digest" >&2
+
+    # Use client-computed digest for signing
+    print_info "Signing with client-computed digest: $client_digest" >&2
 
     # Sign the digest (no-hash since we already have the digest)
-    local signature=$(cast wallet sign --no-hash --private-key "$user_private_key" "$digest")
-
-    if [ -z "$signature" ]; then
-        print_error "Failed to sign BatchCompact digest" >&2
+    local signature=$(cast wallet sign --no-hash --private-key "$user_private_key" "$client_digest")
+    if [ $? -ne 0 ] || [ -z "$signature" ]; then
+        print_error "Failed to sign digest" >&2
         return 1
     fi
 
-    print_success "BatchCompact signature generated" >&2
+    print_debug "Raw signature: $signature" >&2
+    print_success "BatchCompact signature generated with client-side digest" >&2
     echo "$signature"
 }
 

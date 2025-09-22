@@ -749,13 +749,15 @@ quote_accept() {
         if [ "$primary_type" = "BatchCompact" ]; then
             print_info "Detected BatchCompact order, using compact signing..."
 
-            # Use the new compact signing function - pass full message that contains digest
+            # Use client-side digest computation
             signature=$(sign_compact_digest_from_quote "$user_key" "$full_message")
 
             if [ -z "$signature" ]; then
                 print_error "Failed to sign BatchCompact order"
                 return 1
             fi
+
+            print_success "BatchCompact order signed successfully"
 
             # For compact/resource lock, we need to ABI-encode the signature with allocator data
             # This matches what the working direct intent flow does in intents.sh
