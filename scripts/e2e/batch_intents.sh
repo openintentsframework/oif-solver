@@ -262,10 +262,14 @@ process_intent() {
     local recipient_bytes32="0x000000000000000000000000${RECIPIENT_ADDR#0x}"
     local zero_bytes32="0x0000000000000000000000000000000000000000000000000000000000000000"
     
+    # Get the oracle address for the destination chain (where the fill will happen)
+    local dest_oracle=$(get_network_config "$dest_chain" "oracle")
+    local oracle_bytes32="0x000000000000000000000000${dest_oracle#0x}"
+    
     # Build StandardOrder
     local standard_order_abi_type='f((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))'
     local order_data=$(cast abi-encode "$standard_order_abi_type" \
-        "(${USER_ADDR},${nonce},${origin_chain},${expiry},${fill_deadline},${oracle},[[$origin_token_addr,$input_amount]],[($zero_bytes32,$output_settler_bytes32,${dest_chain},$dest_token_bytes32,$output_amount,$recipient_bytes32,0x,0x)])")
+        "(${USER_ADDR},${nonce},${origin_chain},${expiry},${fill_deadline},${oracle},[[$origin_token_addr,$input_amount]],[($oracle_bytes32,$output_settler_bytes32,${dest_chain},$dest_token_bytes32,$output_amount,$recipient_bytes32,0x,0x)])")
     
     # Generate EIP-712 signature
     echo -e "${YELLOW}🔏 Generating EIP-712 signature...${NC}"
@@ -289,7 +293,7 @@ process_intent() {
     # Build hashes
     local mandate_output_encoded=$(cast abi-encode "f(bytes32,bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes32,bytes32)" \
         "$mandate_output_type_hash" \
-        "$zero_bytes32" \
+        "$oracle_bytes32" \
         "$output_settler_bytes32" \
         "$dest_chain" \
         "$dest_token_bytes32" \

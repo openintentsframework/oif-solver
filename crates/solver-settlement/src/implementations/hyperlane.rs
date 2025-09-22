@@ -12,6 +12,7 @@ use alloy_transport_http::Http;
 use async_trait::async_trait;
 use sha3::{Digest, Keccak256};
 use solver_types::{
+	standards::eip7683::{Eip7683OrderData, MandateOutput},
 	with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, NetworksConfig, Order, Schema,
 	Transaction, TransactionHash, TransactionReceipt, TransactionType,
 };
@@ -25,6 +26,155 @@ fn keccak256(data: &str) -> FixedBytes<32> {
 	hasher.update(data.as_bytes());
 	let result = hasher.finalize();
 	FixedBytes::<32>::from_slice(&result)
+}
+
+/// Convert order ID string to bytes32
+fn order_id_to_bytes32(order_id: &str) -> [u8; 32] {
+	// If order_id starts with 0x, treat as hex
+	if let Some(hex_str) = order_id.strip_prefix("0x") {
+		let mut bytes = [0u8; 32];
+		if let Ok(decoded) = hex::decode(hex_str) {
+			let len = decoded.len().min(32);
+			bytes[32 - len..].copy_from_slice(&decoded[..len]);
+		}
+		bytes
+	} else {
+		// Otherwise, encode as UTF-8 bytes, right-align and left-pad with zeros
+		let raw = order_id.as_bytes();
+		let mut bytes = [0u8; 32];
+		let len = raw.len().min(32);
+		bytes[32 - len..].copy_from_slice(&raw[..len]);
+		bytes
+	}
+}
+
+/// Extract MandateOutput from order data
+fn extract_mandate_output(order: &Order) -> Result<MandateOutput, SettlementError> {
+	// Hyperlane settlement requires EIP-7683 orders
+	if order.standard != "eip7683" {
+		return Err(SettlementError::ValidationFailed(format!(
+			"Hyperlane settlement requires EIP-7683 orders, got: {}",
+			order.standard
+		)));
+	}
+
+	// Deserialize order.data as Eip7683OrderData
+	let order_data: Eip7683OrderData = serde_json::from_value(order.data.clone()).map_err(|e| {
+		SettlementError::ValidationFailed(format!("Failed to parse EIP-7683 order data: {}", e))
+	})?;
+
+	// Get the first output
+	let first_output = order_data
+		.outputs
+		.first()
+		.ok_or_else(|| SettlementError::ValidationFailed("Empty outputs array".into()))?;
+
+	// Return the first output directly (it's already a MandateOutput)
+	Ok(first_output.clone())
+}
+
+/// Extract fill details from OutputFilled event in logs
+fn extract_fill_details_from_logs(
+	logs: &[solver_types::Log],
+	order_id: &[u8; 32],
+) -> Result<(Vec<u8>, u32), SettlementError> {
+	// OutputFilled event signature: OutputFilled(bytes32,bytes32,uint32,MandateOutput,uint256)
+	let output_filled_signature = keccak256("OutputFilled(bytes32,bytes32,uint32,(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes),uint256)");
+
+	for log in logs {
+		// Check if this is an OutputFilled event
+		if log.topics.len() >= 2 && log.topics[0].0 == output_filled_signature.0 {
+			// Topic[1] is indexed orderId
+			if log.topics[1].0 == *order_id {
+				// The data contains: solver (bytes32), timestamp (uint32), MandateOutput, finalAmount
+				// First 32 bytes: solver
+				// Next 32 bytes: timestamp (padded)
+				if log.data.len() >= 64 {
+					let solver = log.data[0..32].to_vec();
+					let timestamp_bytes = &log.data[32..64];
+					// Timestamp is uint32, stored in the last 4 bytes of the 32-byte slot
+					let timestamp = u32::from_be_bytes([
+						timestamp_bytes[28],
+						timestamp_bytes[29],
+						timestamp_bytes[30],
+						timestamp_bytes[31],
+					]);
+
+					return Ok((solver, timestamp));
+				}
+			}
+		}
+	}
+
+	Err(SettlementError::ValidationFailed(
+		"OutputFilled event not found in logs".into(),
+	))
+}
+
+/// Encode FillDescription according to MandateOutputEncodingLib
+/// Layout:
+/// - solver (32 bytes)
+/// - orderId (32 bytes)
+/// - timestamp (4 bytes)
+/// - token (32 bytes)
+/// - amount (32 bytes)
+/// - recipient (32 bytes)
+/// - call length (2 bytes) + call data
+/// - context length (2 bytes) + context data
+#[allow(clippy::too_many_arguments)]
+fn encode_fill_description(
+	solver_identifier: [u8; 32],
+	order_id: [u8; 32],
+	timestamp: u32,
+	token: [u8; 32],
+	amount: U256,
+	recipient: [u8; 32],
+	call_data: Vec<u8>,
+	context: Vec<u8>,
+) -> Result<Vec<u8>, SettlementError> {
+	// Check length constraints
+	if call_data.len() > u16::MAX as usize {
+		return Err(SettlementError::ValidationFailed(
+			"Call data too large".into(),
+		));
+	}
+	if context.len() > u16::MAX as usize {
+		return Err(SettlementError::ValidationFailed(
+			"Context data too large".into(),
+		));
+	}
+
+	let mut payload =
+		Vec::with_capacity(32 + 32 + 4 + 32 + 32 + 32 + 2 + call_data.len() + 2 + context.len());
+
+	// Solver identifier (32 bytes)
+	payload.extend_from_slice(&solver_identifier);
+
+	// Order ID (32 bytes)
+	payload.extend_from_slice(&order_id);
+
+	// Timestamp (4 bytes) - uint32 big endian
+	payload.extend_from_slice(&timestamp.to_be_bytes());
+
+	// Token (32 bytes)
+	payload.extend_from_slice(&token);
+
+	// Amount (32 bytes) - big endian
+	let amount_bytes = amount.to_be_bytes::<32>();
+	payload.extend_from_slice(&amount_bytes);
+
+	// Recipient (32 bytes)
+	payload.extend_from_slice(&recipient);
+
+	// Call length (2 bytes) and call data
+	payload.extend_from_slice(&(call_data.len() as u16).to_be_bytes());
+	payload.extend_from_slice(&call_data);
+
+	// Context length (2 bytes) and context
+	payload.extend_from_slice(&(context.len() as u16).to_be_bytes());
+	payload.extend_from_slice(&context);
+
+	Ok(payload)
 }
 
 sol! {
@@ -192,6 +342,8 @@ impl MessageTracker {
 			))
 		})?;
 
+		println!("requiresFinalizationCall: {:?}", result);
+
 		// Decode bool result
 		Ok(!result.is_empty() && result[31] == 1)
 	}
@@ -234,8 +386,6 @@ impl HyperlaneSettlement {
 		&self,
 		logs: &[solver_types::Log],
 	) -> Result<[u8; 32], SettlementError> {
-		println!("Logs: {:#?}", logs);
-
 		// Dispatch event signature: Dispatch(address,uint32,bytes32,bytes32)
 		// Topic0 is the event signature hash
 		let dispatch_signature = keccak256("Dispatch(address,uint32,bytes32,bytes32)");
@@ -355,22 +505,20 @@ impl HyperlaneSettlement {
 	#[allow(clippy::too_many_arguments)]
 	async fn estimate_gas_payment(
 		&self,
-		origin_chain: u64,
-		destination_chain: u32,
+		oracle_chain: u64, // Chain where the oracle is deployed (where we're calling from)
+		destination_chain: u32, // Chain where the message is going
 		recipient_oracle: solver_types::Address,
 		gas_limit: U256,
 		custom_metadata: Vec<u8>,
 		source: solver_types::Address,
 		payloads: Vec<Vec<u8>>,
 	) -> Result<U256, SettlementError> {
-		println!("Estimating gas payment...");
-
-		// Get the output oracle address for the origin chain
-		let oracle_addresses = self.get_output_oracles(origin_chain);
+		// Get the output oracle address for the oracle chain (where we're calling from)
+		let oracle_addresses = self.get_output_oracles(oracle_chain);
 		if oracle_addresses.is_empty() {
 			return Err(SettlementError::ValidationFailed(format!(
 				"No output oracle configured for chain {}",
-				origin_chain
+				oracle_chain
 			)));
 		}
 
@@ -379,9 +527,9 @@ impl HyperlaneSettlement {
 			SettlementError::ValidationFailed("Failed to select oracle".to_string())
 		})?;
 
-		// Get provider for the origin chain
-		let provider = self.providers.get(&origin_chain).ok_or_else(|| {
-			SettlementError::ValidationFailed(format!("No provider for chain {}", origin_chain))
+		// Get provider for the oracle chain
+		let provider = self.providers.get(&oracle_chain).ok_or_else(|| {
+			SettlementError::ValidationFailed(format!("No provider for chain {}", oracle_chain))
 		})?;
 
 		// Build the quoteGasPayment call
@@ -411,9 +559,7 @@ impl HyperlaneSettlement {
 		// Decode the result
 		let quote = U256::from_be_slice(&result);
 
-		// TODO: Estimate is quite high here (e.g. 24656950763914024 wei (0.02 ETH))
-		// 		 we should make sure this calculation is included in our initial acceptance criteria
-		println!("QUOTE: {}", quote);
+		// Return quote without buffer for now - the quote already includes IGP overhead
 		Ok(quote)
 	}
 }
@@ -655,8 +801,6 @@ impl SettlementInterface for HyperlaneSettlement {
 		order: &Order,
 		fill_receipt: &TransactionReceipt,
 	) -> Result<Option<Transaction>, SettlementError> {
-		println!("Generating post_fill transaction...");
-
 		// Get chains
 		let dest_chain = order
 			.output_chains
@@ -689,43 +833,68 @@ impl SettlementInterface for HyperlaneSettlement {
 			SettlementError::ValidationFailed("Failed to select recipient".into())
 		})?;
 
-		// Calculate gas limit for message
-		let payload_size = 256; // Estimate for order attestation
-		let gas_limit = self.calculate_message_gas_limit(payload_size);
+		// Extract fill details from order
+		let mandate_output = extract_mandate_output(order)?;
 
-		// Build attestation payload using order ID and fill transaction hash
-		let attestation_payload = vec![
-			order.id.as_bytes().to_vec(), // Use order.id directly
-			fill_receipt.hash.0.to_vec(),
-		];
+		// Convert order ID to bytes32
+		let order_id_bytes = order_id_to_bytes32(&order.id);
 
-		// Get the OutputSettler address from the order
-		// The OutputSettler is the contract that attested the payloads during fill
-		let output_chain = order.output_chains.first().ok_or_else(|| {
-			SettlementError::ValidationFailed("No output settler in order".into())
-		})?;
+		// Extract solver and timestamp from OutputFilled event
+		let (solver_bytes, fill_timestamp) =
+			extract_fill_details_from_logs(&fill_receipt.logs, &order_id_bytes)?;
 
-		// Quote gas payment - use OutputSettler as source
+		// Convert solver bytes to bytes32 array
+		let mut solver_identifier = [0u8; 32];
+		solver_identifier.copy_from_slice(&solver_bytes);
+
+		// Create FillDescription payload
+		// Note: The oracle and settler are NOT part of the FillDescription.
+		// They are reconstructed by the contract from msg.sender and address(this)
+		let fill_description = encode_fill_description(
+			solver_identifier,
+			order_id_bytes,
+			fill_timestamp, // Using timestamp from OutputFilled event
+			mandate_output.token,
+			mandate_output.amount,
+			mandate_output.recipient,
+			mandate_output.call,
+			mandate_output.context,
+		)?;
+
+		// Create payloads array with single FillDescription
+		let payloads = vec![fill_description];
+
+		// Get OutputSettler address (source that can attest)
+		let output_settler = order
+			.output_chains
+			.first()
+			.ok_or_else(|| SettlementError::ValidationFailed("No output chain".into()))?;
+
+		// Calculate gas limit based on actual payload size
+		let total_payload_size: usize = payloads.iter().map(|p| p.len()).sum();
+		let gas_limit = self.calculate_message_gas_limit(total_payload_size);
+
+		// Estimate gas payment with correct payloads
 		let gas_payment = self
 			.estimate_gas_payment(
 				dest_chain,
 				origin_chain as u32,
 				recipient_oracle.clone(),
 				gas_limit,
-				vec![],                               // No custom metadata
-				output_chain.settler_address.clone(), // Use OutputSettler address as source
-				attestation_payload.clone(),
+				vec![], // No custom metadata
+				output_settler.settler_address.clone(),
+				payloads.clone(),
 			)
 			.await?;
 
-		// Build submit call - use OutputSettler as source
+		// Build submit call with correct payloads
 		let call_data = IHyperlaneOracle::submit_0Call {
 			destinationDomain: origin_chain as u32,
 			recipientOracle: alloy_primitives::Address::from_slice(&recipient_oracle.0),
 			gasLimit: gas_limit,
 			customMetadata: vec![].into(),
-			source: alloy_primitives::Address::from_slice(&output_chain.settler_address.0), // Use OutputSettler address as source
-			payloads: attestation_payload.into_iter().map(Into::into).collect(),
+			source: alloy_primitives::Address::from_slice(&output_settler.settler_address.0),
+			payloads: payloads.into_iter().map(Into::into).collect(),
 		};
 
 		Ok(Some(Transaction {
@@ -734,7 +903,7 @@ impl SettlementInterface for HyperlaneSettlement {
 			value: gas_payment,
 			chain_id: dest_chain,
 			nonce: None,
-			gas_limit: Some(300000),
+			gas_limit: None,
 			gas_price: None,
 			max_fee_per_gas: None,
 			max_priority_fee_per_gas: None,
@@ -746,8 +915,6 @@ impl SettlementInterface for HyperlaneSettlement {
 		order: &Order,
 		fill_proof: &FillProof,
 	) -> Result<Option<Transaction>, SettlementError> {
-		println!("Generating pre_claim transaction...");
-
 		let origin_chain = order
 			.input_chains
 			.first()
@@ -813,8 +980,6 @@ impl SettlementInterface for HyperlaneSettlement {
 		tx_type: TransactionType,
 		receipt: &TransactionReceipt,
 	) -> Result<(), SettlementError> {
-		println!("Checking transaction status...");
-
 		// Only handle PostFill transactions for Hyperlane message tracking
 		if matches!(tx_type, TransactionType::PostFill) {
 			let origin_chain = order
