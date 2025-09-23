@@ -543,6 +543,316 @@ sign_standard_intent() {
     create_prefixed_signature "$signature" "permit2"
 }
 
+# Compute EIP-712 digest for BatchCompact from quote JSON
+compute_compact_digest_from_quote() {
+    local eip712_message="$1"
+
+    print_debug "Computing BatchCompact digest from EIP-712 message" >&2
+
+    # Extract domain information
+    local domain=$(echo "$eip712_message" | jq -r '.domain')
+    local name=$(echo "$domain" | jq -r '.name')
+    local version=$(echo "$domain" | jq -r '.version')
+    local chain_id=$(echo "$domain" | jq -r '.chainId')
+    local verifying_contract=$(echo "$domain" | jq -r '.verifyingContract')
+
+    print_debug "Domain: name=$name, version=$version, chainId=$chain_id, contract=$verifying_contract" >&2
+
+    # Get domain separator from TheCompact contract instead of computing manually
+    local domain_separator=$(cast call "$verifying_contract" "DOMAIN_SEPARATOR()" --rpc-url "http://localhost:8545" 2>/dev/null || echo "")
+    
+    if [ -z "$domain_separator" ] || [ "$domain_separator" = "null" ]; then
+        # Fallback to computed domain separator if contract call fails
+        local domain_type_hash=$(compute_type_hash "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
+        local name_hash=$(cast_keccak "$name")
+        local version_hash=$(cast_keccak "$version")
+
+        domain_separator=$(cast_abi_encode "f(bytes32,bytes32,bytes32,uint256,address)" \
+            "$domain_type_hash" "$name_hash" "$version_hash" "$chain_id" "$verifying_contract")
+        domain_separator=$(cast_keccak "$domain_separator")
+    fi
+
+    print_debug "Domain separator: $domain_separator" >&2
+
+    # Extract message fields
+    local message=$(echo "$eip712_message" | jq -r '.message')
+    local arbiter=$(echo "$message" | jq -r '.arbiter')
+    local sponsor=$(echo "$message" | jq -r '.sponsor')
+    local nonce=$(echo "$message" | jq -r '.nonce')
+    local expires=$(echo "$message" | jq -r '.expires')
+    local commitments=$(echo "$message" | jq -c '.commitments')
+    local mandate=$(echo "$message" | jq -c '.mandate')
+
+    print_debug "Message: arbiter=$arbiter, sponsor=$sponsor, nonce=$nonce, expires=$expires" >&2
+
+    # Compute BatchCompact type hash
+    local batch_compact_type_string="BatchCompact(address arbiter,address sponsor,uint256 nonce,uint256 expires,Lock[] commitments,Mandate mandate)Lock(bytes12 lockTag,address token,uint256 amount)Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
+    local batch_compact_type_hash=$(compute_type_hash "$batch_compact_type_string")
+
+    print_debug "BatchCompact type hash: $batch_compact_type_hash" >&2
+
+    # Compute commitments hash
+    local lock_type_hash=$(compute_type_hash "Lock(bytes12 lockTag,address token,uint256 amount)")
+    local commitments_count=$(echo "$commitments" | jq '. | length')
+
+    local lock_hashes=""
+    for ((i=0; i<commitments_count; i++)); do
+        local commitment=$(echo "$commitments" | jq -r ".[$i]")
+        local lock_tag=$(echo "$commitment" | jq -r '.lockTag')
+        local token=$(echo "$commitment" | jq -r '.token')
+        local amount=$(echo "$commitment" | jq -r '.amount')
+
+        print_debug "Lock $i: tag=$lock_tag, token=$token, amount=$amount" >&2
+
+        local lock_hash=$(cast_keccak $(cast_abi_encode "f(bytes32,bytes12,address,uint256)" \
+            "$lock_type_hash" "$lock_tag" "$token" "$amount"))
+        lock_hashes="${lock_hashes}${lock_hash#0x}"
+
+        print_debug "Lock hash $i: $lock_hash" >&2
+    done
+
+    local commitments_hash=$(cast_keccak "0x$lock_hashes")
+    print_debug "Commitments hash: $commitments_hash" >&2
+
+    # Compute mandate (witness) hash
+    local fill_deadline=$(echo "$mandate" | jq -r '.fillDeadline')
+    local input_oracle=$(echo "$mandate" | jq -r '.inputOracle')
+    local outputs=$(echo "$mandate" | jq -c '.outputs')
+
+    print_debug "Mandate: fillDeadline=$fill_deadline, inputOracle=$input_oracle" >&2
+
+    # Compute outputs hash
+    local outputs_count=$(echo "$outputs" | jq '. | length')
+    local output_hashes=""
+
+    local mandate_output_type_hash=$(compute_type_hash "MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)")
+    local empty_bytes_hash="0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"  # keccak256("")
+
+    for ((i=0; i<outputs_count; i++)); do
+        local output=$(echo "$outputs" | jq -r ".[$i]")
+        local oracle=$(echo "$output" | jq -r '.oracle')
+        local settler=$(echo "$output" | jq -r '.settler')
+        local output_chain_id=$(echo "$output" | jq -r '.chainId')
+        local token=$(echo "$output" | jq -r '.token')
+        local amount=$(echo "$output" | jq -r '.amount')
+        local recipient=$(echo "$output" | jq -r '.recipient')
+
+        print_debug "Output $i: oracle=$oracle, settler=$settler, chain=$output_chain_id, token=$token, amount=$amount, recipient=$recipient" >&2
+
+        local output_hash=$(cast_keccak $(cast_abi_encode "f(bytes32,bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes32,bytes32)" \
+            "$mandate_output_type_hash" "$oracle" "$settler" "$output_chain_id" "$token" "$amount" "$recipient" "$empty_bytes_hash" "$empty_bytes_hash"))
+        output_hashes="${output_hashes}${output_hash#0x}"
+
+        print_debug "Output hash $i: $output_hash" >&2
+    done
+
+    local outputs_hash=$(cast_keccak "0x$output_hashes")
+    print_debug "Outputs hash: $outputs_hash" >&2
+
+    # Compute mandate hash
+    local mandate_type_hash=$(compute_type_hash "Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)")
+
+    local mandate_hash=$(cast_keccak $(cast_abi_encode "f(bytes32,uint32,address,bytes32)" \
+        "$mandate_type_hash" "$fill_deadline" "$input_oracle" "$outputs_hash"))
+
+    print_debug "Mandate hash: $mandate_hash" >&2
+
+    # Build final struct hash
+    local struct_hash=$(cast_keccak $(cast_abi_encode "f(bytes32,address,address,uint256,uint256,bytes32,bytes32)" \
+        "$batch_compact_type_hash" "$arbiter" "$sponsor" "$nonce" "$expires" "$commitments_hash" "$mandate_hash"))
+
+    print_debug "Struct hash: $struct_hash" >&2
+
+    # Create final EIP-712 digest
+    local digest_prefix="0x1901"
+    local digest="${digest_prefix}${domain_separator#0x}${struct_hash#0x}"
+    local final_digest=$(cast_keccak "$digest")
+
+    print_debug "Final digest: $final_digest" >&2
+
+    echo "$final_digest"
+}
+
+# Sign BatchCompact digest from quote using client-side computation
+sign_compact_digest_from_quote() {
+    local user_private_key="$1"
+    local full_message="$2"
+
+    print_debug "Starting BatchCompact signing with client-side digest computation" >&2
+
+    # Extract EIP-712 message for client computation
+    local eip712_message=$(echo "$full_message" | jq -r '.eip712 // empty' 2>/dev/null)
+    if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ] || [ "$eip712_message" = "empty" ]; then
+        print_error "No EIP-712 message found for digest computation" >&2
+        return 1
+    fi
+
+    # Always compute client-side digest
+    print_info "Computing client-side digest..." >&2
+    local client_digest=$(compute_compact_digest_from_quote "$eip712_message")
+    if [ $? -ne 0 ] || [ -z "$client_digest" ]; then
+        print_error "Failed to compute client-side digest" >&2
+        return 1
+    fi
+    print_debug "Client computed digest: $client_digest" >&2
+
+    # Use client-computed digest for signing
+    print_info "Signing with client-computed digest: $client_digest" >&2
+
+    # Sign the digest (no-hash since we already have the digest)
+    local signature=$(cast wallet sign --no-hash --private-key "$user_private_key" "$client_digest")
+    if [ $? -ne 0 ] || [ -z "$signature" ]; then
+        print_error "Failed to sign digest" >&2
+        return 1
+    fi
+
+    print_debug "Raw signature: $signature" >&2
+    print_success "BatchCompact signature generated with client-side digest" >&2
+    echo "$signature"
+}
+
+# Compute EIP-712 digest for PermitBatchWitnessTransferFrom from quote JSON
+compute_permit2_digest_from_quote() {
+    local eip712_message="$1"
+
+    print_debug "Computing PermitBatchWitnessTransferFrom digest from EIP-712 message" >&2
+
+    # Extract domain information
+    local domain=$(echo "$eip712_message" | jq -r '.signing.domain // .domain')
+    local name=$(echo "$domain" | jq -r '.name')
+    local chain_id=$(echo "$domain" | jq -r '.chainId')
+    local verifying_contract=$(echo "$domain" | jq -r '.verifyingContract')
+
+    print_debug "Domain: name=$name, chainId=$chain_id, contract=$verifying_contract" >&2
+
+    # Get Permit2 domain separator
+    local domain_separator=$(get_permit2_domain_separator "$chain_id" "$verifying_contract")
+    print_debug "Domain separator: $domain_separator" >&2
+
+    # Extract message fields
+    local spender=$(echo "$eip712_message" | jq -r '.spender')
+    local nonce=$(echo "$eip712_message" | jq -r '.nonce')
+    local deadline=$(echo "$eip712_message" | jq -r '.deadline')
+    local permitted=$(echo "$eip712_message" | jq -c '.permitted')
+    local witness=$(echo "$eip712_message" | jq -c '.witness')
+
+    print_debug "Message: spender=$spender, nonce=$nonce, deadline=$deadline" >&2
+
+    # Compute TokenPermissions hashes
+    local permitted_count=$(echo "$permitted" | jq '. | length')
+    local token_hashes=""
+
+    for ((i=0; i<permitted_count; i++)); do
+        local permission=$(echo "$permitted" | jq -r ".[$i]")
+        local token=$(echo "$permission" | jq -r '.token')
+        local amount=$(echo "$permission" | jq -r '.amount')
+
+        print_debug "Permission $i: token=$token, amount=$amount" >&2
+
+        local token_hash=$(compute_token_permissions_hash "$token" "$amount")
+        token_hashes="${token_hashes}${token_hash#0x}"
+
+        print_debug "Token permissions hash $i: $token_hash" >&2
+    done
+
+    local permitted_array_hash=$(cast_keccak "0x$token_hashes")
+    print_debug "Permitted array hash: $permitted_array_hash" >&2
+
+    # Compute witness hash
+    local expires=$(echo "$witness" | jq -r '.expires')
+    local input_oracle=$(echo "$witness" | jq -r '.inputOracle')
+    local outputs=$(echo "$witness" | jq -c '.outputs')
+
+    print_debug "Witness: expires=$expires, inputOracle=$input_oracle" >&2
+
+    # Compute MandateOutput hashes for witness
+    local outputs_count=$(echo "$outputs" | jq '. | length')
+    local output_hashes=()
+
+    for ((i=0; i<outputs_count; i++)); do
+        local output=$(echo "$outputs" | jq -r ".[$i]")
+        local oracle=$(echo "$output" | jq -r '.oracle // "0x0000000000000000000000000000000000000000000000000000000000000000"')
+        local settler=$(echo "$output" | jq -r '.settler')
+        local output_chain_id=$(echo "$output" | jq -r '.chainId')
+        local token=$(echo "$output" | jq -r '.token')
+        local amount=$(echo "$output" | jq -r '.amount')
+        local recipient=$(echo "$output" | jq -r '.recipient')
+
+        print_debug "Output $i: oracle=$oracle, settler=$settler, chain=$output_chain_id, token=$token, amount=$amount, recipient=$recipient" >&2
+
+        local output_hash=$(compute_mandate_output_hash "$oracle" "$settler" "$output_chain_id" "$token" "$amount" "$recipient")
+        output_hashes+=("$output_hash")
+
+        print_debug "Output hash $i: $output_hash" >&2
+    done
+
+    local witness_hash=$(compute_permit2_witness_hash "$expires" "$input_oracle" "${output_hashes[@]}")
+    print_debug "Witness hash: $witness_hash" >&2
+
+    # Build the main struct hash for PermitBatchWitnessTransferFrom
+    local mandate_output_type="MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
+    local token_permissions_type="TokenPermissions(address token,uint256 amount)"
+    local witness_type_string="Permit2Witness witness)${mandate_output_type}${token_permissions_type}Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)"
+    local permit_batch_witness_string="PermitBatchWitnessTransferFrom(TokenPermissions[] permitted,address spender,uint256 nonce,uint256 deadline,${witness_type_string}"
+
+    local permit_batch_type_hash=$(compute_type_hash "$permit_batch_witness_string")
+    print_debug "Permit batch type string: $permit_batch_witness_string" >&2
+    print_debug "Permit batch type hash: $permit_batch_type_hash" >&2
+
+    # Build final struct hash
+    local struct_hash=$(cast_keccak $(cast_abi_encode "f(bytes32,bytes32,address,uint256,uint256,bytes32)" \
+        "$permit_batch_type_hash" "$permitted_array_hash" "$spender" "$nonce" "$deadline" "$witness_hash"))
+
+    print_debug "Struct hash: $struct_hash" >&2
+
+    # Create final EIP-712 digest
+    local digest_prefix="0x1901"
+    local digest="${digest_prefix}${domain_separator#0x}${struct_hash#0x}"
+    local final_digest=$(cast_keccak "$digest")
+
+    print_debug "Final digest: $final_digest" >&2
+
+    echo "$final_digest"
+}
+
+# Sign PermitBatchWitnessTransferFrom digest from quote using client-side computation
+sign_permit2_digest_from_quote() {
+    local user_private_key="$1"
+    local full_message="$2"
+
+    print_debug "Starting PermitBatchWitnessTransferFrom signing with client-side digest computation" >&2
+
+    # Extract EIP-712 message for client computation
+    local eip712_message=$(echo "$full_message" | jq -r '.eip712 // empty' 2>/dev/null)
+    if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ] || [ "$eip712_message" = "empty" ]; then
+        print_error "No EIP-712 message found for digest computation" >&2
+        return 1
+    fi
+
+    # Always compute client-side digest
+    print_info "Computing client-side digest..." >&2
+    local client_digest=$(compute_permit2_digest_from_quote "$eip712_message")
+    if [ $? -ne 0 ] || [ -z "$client_digest" ]; then
+        print_error "Failed to compute client-side digest" >&2
+        return 1
+    fi
+    print_debug "Client computed digest: $client_digest" >&2
+
+    # Use client-computed digest for signing
+    print_info "Signing with client-computed digest: $client_digest" >&2
+
+    # Sign the digest (no-hash since we already have the digest)
+    local signature=$(cast wallet sign --no-hash --private-key "$user_private_key" "$client_digest")
+    if [ $? -ne 0 ] || [ -z "$signature" ]; then
+        print_error "Failed to sign digest" >&2
+        return 1
+    fi
+
+    print_debug "Raw signature: $signature" >&2
+    print_success "PermitBatchWitnessTransferFrom signature generated with client-side digest" >&2
+    echo "$signature"
+}
+
 # Export functions
 export -f compute_domain_separator
 export -f get_permit2_domain_separator
@@ -559,3 +869,7 @@ export -f create_prefixed_signature
 export -f build_standard_order
 export -f extract_digest_from_quote
 export -f sign_standard_intent
+export -f compute_compact_digest_from_quote
+export -f sign_compact_digest_from_quote
+export -f compute_permit2_digest_from_quote
+export -f sign_permit2_digest_from_quote
