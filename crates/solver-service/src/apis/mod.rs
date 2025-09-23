@@ -4,7 +4,6 @@
 //! for the OIF Solver.
 
 pub mod auth;
-pub mod cost;
 pub mod order;
 pub mod quote;
 pub mod tokens;
