@@ -72,7 +72,10 @@ impl Eip7683OrderDataBuilder {
 					.as_secs() + 1800) as u32,
 			),
 			input_oracle: Some("0x0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A".to_string()),
-			inputs: vec![[U256::from(1000), U256::from(100)]],
+			inputs: vec![[
+				U256::from(1000),
+				U256::from(100_000_000_000_000_000_000u128), // 100 tokens with 18 decimals
+			]],
 			order_id: Some([1u8; 32]),
 			gas_limit_overrides: GasLimitOverrides::default(),
 			outputs: vec![MandateOutput {
@@ -80,7 +83,7 @@ impl Eip7683OrderDataBuilder {
 				settler: [0u8; 32],
 				chain_id: U256::from(137),
 				token: [0u8; 32],
-				amount: U256::from(100),
+				amount: U256::from(95_000_000_000_000_000_000u128), // 95 tokens with 18 decimals
 				recipient: [0u8; 32],
 				call: vec![],
 				context: vec![],

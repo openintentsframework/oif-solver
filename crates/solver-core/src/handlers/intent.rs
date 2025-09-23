@@ -248,8 +248,11 @@ mod tests {
 	use solver_config::ConfigBuilder;
 	use solver_delivery::DeliveryService;
 	use solver_order::{MockExecutionStrategy, MockOrderInterface};
+	use solver_pricing::{MockPricingInterface, PricingService};
 	use solver_storage::{MockStorageInterface, StorageError};
-	use solver_types::utils::tests::builders::{IntentBuilder, OrderBuilder};
+	use solver_types::utils::tests::builders::{
+		Eip7683OrderDataBuilder, IntentBuilder, OrderBuilder,
+	};
 	use solver_types::{Address, ExecutionParams, Intent, Order, SolverEvent};
 	use std::collections::HashMap;
 	use std::sync::Arc;
@@ -260,7 +263,11 @@ mod tests {
 	}
 
 	fn create_test_order() -> Order {
-		OrderBuilder::new().build()
+		let order_data = Eip7683OrderDataBuilder::new().build();
+		OrderBuilder::new()
+			.with_id("test_intent_123".to_string())
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.build()
 	}
 
 	fn create_test_address() -> Address {
@@ -269,6 +276,131 @@ mod tests {
 
 	fn create_test_config() -> Config {
 		ConfigBuilder::new().build()
+	}
+
+	fn create_mock_cost_profit_service() -> Arc<CostProfitService> {
+		// Create mock pricing service with expected method responses
+		let mut mock_pricing = MockPricingInterface::new();
+
+		mock_pricing
+			.expect_wei_to_currency()
+			.returning(|_, _| Box::pin(async move { Ok("0.01".to_string()) }));
+
+		// Mock convert_asset calls - return different prices for input vs output tokens
+		mock_pricing
+			.expect_convert_asset()
+			.returning(|token_symbol, _, amount| {
+				let token_symbol = token_symbol.to_string();
+				let amount_str = amount.to_string();
+				Box::pin(async move {
+					// Parse the amount and multiply by token price
+					let amount_decimal = amount_str.parse::<f64>().unwrap_or(0.0);
+					let price_per_token = match token_symbol.as_str() {
+						"INPUT" => 1.0,  // $1 per INPUT token
+						"OUTPUT" => 1.0, // $1 per OUTPUT token
+						_ => 1.0,
+					};
+					let total_usd = amount_decimal * price_per_token;
+					Ok(total_usd.to_string())
+				})
+			});
+
+		// Mock get_supported_pairs - return the token pairs we support
+		mock_pricing.expect_get_supported_pairs().returning(|| {
+			Box::pin(async move {
+				vec![
+					solver_types::TradingPair {
+						base: "INPUT".to_string(),
+						quote: "USD".to_string(),
+					},
+					solver_types::TradingPair {
+						base: "OUTPUT".to_string(),
+						quote: "USD".to_string(),
+					},
+				]
+			})
+		});
+
+		let pricing_service = Arc::new(PricingService::new(Box::new(mock_pricing)));
+
+		// Create mock delivery service with chain implementations
+		let mut delivery_impls = HashMap::new();
+
+		let mut mock_delivery_1 = solver_delivery::MockDeliveryInterface::new();
+		mock_delivery_1
+			.expect_get_gas_price()
+			.returning(|_| Box::pin(async move { Ok("20000".to_string()) }));
+		mock_delivery_1
+			.expect_get_block_number()
+			.returning(|_| Box::pin(async move { Ok(1000000u64) }));
+
+		let mut mock_delivery_137 = solver_delivery::MockDeliveryInterface::new();
+		mock_delivery_137
+			.expect_get_gas_price()
+			.returning(|_| Box::pin(async move { Ok("20000".to_string()) }));
+		mock_delivery_137
+			.expect_get_block_number()
+			.returning(|_| Box::pin(async move { Ok(1000000u64) }));
+
+		delivery_impls.insert(
+			1u64,
+			Arc::new(mock_delivery_1) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		delivery_impls.insert(
+			137u64,
+			Arc::new(mock_delivery_137) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+
+		let delivery_service = Arc::new(DeliveryService::new(delivery_impls, 1));
+
+		// Create tokens that match the test order data exactly
+		let input_token = solver_types::utils::tests::builders::TokenConfigBuilder::new()
+			.address({
+				// Convert U256::from(1000) to Address - token 1000 = 0x3e8
+				let mut addr_bytes = [0u8; 20];
+				addr_bytes[18] = 0x03; // 0x03e8 = 1000
+				addr_bytes[19] = 0xe8;
+				solver_types::Address(addr_bytes.to_vec())
+			})
+			.symbol("INPUT".to_string())
+			.decimals(18)
+			.build();
+
+		let output_token = solver_types::utils::tests::builders::TokenConfigBuilder::new()
+			.address(solver_types::Address(vec![0u8; 20])) // Zero address for output
+			.symbol("OUTPUT".to_string())
+			.decimals(18)
+			.build();
+
+		// Create networks config with matching token addresses
+		let networks_config = solver_types::utils::tests::builders::NetworksConfigBuilder::new()
+			.add_network(
+				1,
+				solver_types::utils::tests::builders::NetworkConfigBuilder::new()
+					.tokens(vec![input_token])
+					.build(),
+			)
+			.add_network(
+				137,
+				solver_types::utils::tests::builders::NetworkConfigBuilder::new()
+					.tokens(vec![output_token])
+					.build(),
+			)
+			.build();
+
+		let token_manager = Arc::new(TokenManager::new(
+			networks_config,
+			delivery_service.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+
+		Arc::new(CostProfitService::new(
+			pricing_service,
+			delivery_service,
+			token_manager,
+		))
 	}
 
 	#[tokio::test]
@@ -311,6 +443,7 @@ mod tests {
 
 		// Create services
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+
 		let order_service = Arc::new(OrderService::new(
 			HashMap::from([(
 				"eip7683".to_string(),
@@ -330,6 +463,7 @@ mod tests {
 				MockAccountInterface::new(),
 			))),
 		));
+		let cost_profit_service = create_mock_cost_profit_service();
 		let config = create_test_config();
 
 		let handler = IntentHandler::new(
@@ -340,6 +474,7 @@ mod tests {
 			delivery,
 			solver_address.clone(),
 			token_manager,
+			cost_profit_service,
 			config,
 		);
 
@@ -379,6 +514,7 @@ mod tests {
 				MockAccountInterface::new(),
 			))),
 		));
+		let cost_profit_service = create_mock_cost_profit_service();
 		let config = create_test_config();
 
 		let handler = IntentHandler::new(
@@ -389,6 +525,7 @@ mod tests {
 			delivery,
 			solver_address,
 			token_manager,
+			cost_profit_service,
 			config,
 		);
 
@@ -445,6 +582,8 @@ mod tests {
 		));
 		let config = create_test_config();
 
+		let cost_profit_service = create_mock_cost_profit_service();
+
 		let handler = IntentHandler::new(
 			order_service,
 			storage,
@@ -453,6 +592,7 @@ mod tests {
 			delivery,
 			solver_address,
 			token_manager,
+			cost_profit_service,
 			config,
 		);
 
@@ -513,6 +653,8 @@ mod tests {
 		));
 		let config = create_test_config();
 
+		let cost_profit_service = create_mock_cost_profit_service();
+
 		let handler = IntentHandler::new(
 			order_service,
 			storage,
@@ -521,6 +663,7 @@ mod tests {
 			delivery,
 			solver_address,
 			token_manager,
+			cost_profit_service,
 			config,
 		);
 
@@ -581,6 +724,8 @@ mod tests {
 		));
 		let config = create_test_config();
 
+		let cost_profit_service = create_mock_cost_profit_service();
+
 		let handler = IntentHandler::new(
 			order_service,
 			storage,
@@ -589,6 +734,7 @@ mod tests {
 			delivery,
 			solver_address,
 			token_manager,
+			cost_profit_service,
 			config,
 		);
 
@@ -629,6 +775,8 @@ mod tests {
 		));
 		let config = create_test_config();
 
+		let cost_profit_service = create_mock_cost_profit_service();
+
 		let handler = IntentHandler::new(
 			order_service,
 			storage,
@@ -637,6 +785,7 @@ mod tests {
 			delivery,
 			solver_address,
 			token_manager,
+			cost_profit_service,
 			config,
 		);
 
@@ -697,6 +846,8 @@ mod tests {
 		// Subscribe to events before creating handler
 		let mut receiver = event_bus.subscribe();
 
+		let cost_profit_service = create_mock_cost_profit_service();
+
 		let handler = IntentHandler::new(
 			order_service,
 			storage,
@@ -705,6 +856,7 @@ mod tests {
 			delivery,
 			solver_address,
 			token_manager,
+			cost_profit_service,
 			config,
 		);
 
