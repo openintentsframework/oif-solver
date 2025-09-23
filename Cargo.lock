@@ -3669,6 +3669,7 @@ dependencies = [
  "chrono",
  "mockall",
  "once_cell",
+ "rust_decimal",
  "serde",
  "serde_json",
  "solver-account",
