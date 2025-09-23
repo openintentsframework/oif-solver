@@ -8,10 +8,6 @@ use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
-/// Type alias for EIP-712 data extraction result
-type Eip712ExtractionResult<'a> =
-	Result<(&'a serde_json::Map<String, serde_json::Value>, &'a str), Box<dyn std::error::Error>>;
-
 /// Lock type for cross-chain orders, determining the custody mechanism used.
 ///
 /// This enum represents the different ways user funds can be locked/held
@@ -182,6 +178,8 @@ pub type Output = MandateOutput;
 use crate::api::{Quote, QuoteParsable};
 use crate::order::OrderParsable;
 use crate::standards::eip7930::InteropAddress;
+#[cfg(feature = "oif-interfaces")]
+use crate::utils::eip712::Eip712ExtractionResult;
 use crate::{
 	bytes32_to_address, parse_address, with_0x_prefix, Address, AvailableInput, RequestedOutput,
 };
@@ -363,12 +361,56 @@ pub mod interfaces {
 	}
 }
 
-/// Convert Quote to StandardOrder
+/// Convert Quote to StandardOrder with automatic order type detection
 #[cfg(feature = "oif-interfaces")]
 impl TryFrom<&Quote> for interfaces::StandardOrder {
 	type Error = Box<dyn std::error::Error>;
 
 	fn try_from(quote: &Quote) -> Result<Self, Self::Error> {
+		// Extract and validate EIP-712 data from quote to detect order type
+		let (eip712_data, primary_type) = Self::extract_eip712_data_from_quote(quote)?;
+
+		// Determine processing approach based on order type
+		if primary_type == "BatchCompact" {
+			// Handle BatchCompact (ResourceLock) orders
+			Self::handle_batch_compact_quote_conversion(quote, eip712_data)
+		} else {
+			// Handle Permit2/EIP3009 orders using existing implementation
+			Self::handle_permit2_eip3009_quote_conversion(quote, eip712_data)
+		}
+	}
+}
+
+#[cfg(feature = "oif-interfaces")]
+impl interfaces::StandardOrder {
+	/// Extract and validate EIP-712 data from quote
+	fn extract_eip712_data_from_quote(quote: &Quote) -> Eip712ExtractionResult<'_> {
+		let quote_order = quote
+			.orders
+			.first()
+			.ok_or("Quote must contain at least one order")?;
+		let message_data = quote_order
+			.message
+			.as_object()
+			.ok_or("Invalid EIP-712 message structure")?;
+		let eip712_data = message_data
+			.get("eip712")
+			.and_then(|e| e.as_object())
+			.ok_or("Missing 'eip712' object in message")?;
+
+		let primary_type = eip712_data
+			.get("primaryType")
+			.and_then(|p| p.as_str())
+			.unwrap_or("PermitBatchWitnessTransferFrom");
+
+		Ok((eip712_data, primary_type))
+	}
+
+	/// Handle Permit2/EIP3009 order conversion (original logic)
+	fn handle_permit2_eip3009_quote_conversion(
+		quote: &Quote,
+		eip712_data: &serde_json::Map<String, serde_json::Value>,
+	) -> Result<Self, Box<dyn std::error::Error>> {
 		use crate::standards::eip7930::InteropAddress;
 		use crate::utils::parse_bytes32_from_hex;
 		use alloy_primitives::{Address, U256};
@@ -383,20 +425,6 @@ impl TryFrom<&Quote> for interfaces::StandardOrder {
 			.user;
 		let interop_address = InteropAddress::from_hex(&user_str.to_string())?;
 		let user_address = interop_address.ethereum_address()?;
-
-		// Extract order data from quote
-		let quote_order = quote
-			.orders
-			.first()
-			.ok_or("Quote must contain at least one order")?;
-		let message_data = quote_order
-			.message
-			.as_object()
-			.ok_or("Invalid EIP-712 message structure")?;
-		let eip712_data = message_data
-			.get("eip712")
-			.and_then(|e| e.as_object())
-			.ok_or("Missing 'eip712' object in message")?;
 
 		// Extract nonce
 		let nonce_str = eip712_data
@@ -517,43 +545,16 @@ impl TryFrom<&Quote> for interfaces::StandardOrder {
 			outputs: sol_outputs,
 		})
 	}
-}
 
-/// Helper functions for BatchCompact quote processing
-#[cfg(feature = "oif-interfaces")]
-impl Eip7683OrderData {
-	/// Extract and validate EIP-712 data from quote to detect order type
-	fn extract_eip712_data(quote: &Quote) -> Eip712ExtractionResult<'_> {
-		let quote_order = quote
-			.orders
-			.first()
-			.ok_or("Quote must contain at least one order")?;
-		let message_data = quote_order
-			.message
-			.as_object()
-			.ok_or("Invalid EIP-712 message structure")?;
-		let eip712_data = message_data
-			.get("eip712")
-			.and_then(|e| e.as_object())
-			.ok_or("Missing 'eip712' object in message")?;
-
-		let primary_type = eip712_data
-			.get("primaryType")
-			.and_then(|p| p.as_str())
-			.unwrap_or("PermitBatchWitnessTransferFrom");
-
-		Ok((eip712_data, primary_type))
-	}
-
-	/// Handle BatchCompact order conversion for cost estimation
+	/// Handle BatchCompact order conversion for ResourceLock (moved from existing function)
 	fn handle_batch_compact_quote_conversion(
 		quote: &Quote,
 		eip712_data: &serde_json::Map<String, serde_json::Value>,
-	) -> Result<interfaces::StandardOrder, Box<dyn std::error::Error>> {
-		use crate::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
+	) -> Result<Self, Box<dyn std::error::Error>> {
 		use crate::standards::eip7930::InteropAddress;
 		use crate::utils::parse_bytes32_from_hex;
 		use alloy_primitives::{Address, U256};
+		use interfaces::SolMandateOutput;
 
 		// Extract user address from quote
 		let user_str = &quote
@@ -693,7 +694,7 @@ impl Eip7683OrderData {
 			}
 		}
 
-		Ok(StandardOrder {
+		Ok(interfaces::StandardOrder {
 			user: user_address,
 			nonce,
 			originChainId: origin_chain_id,
@@ -712,23 +713,9 @@ impl QuoteParsable for Eip7683OrderData {
 	fn quote_to_order_for_estimation(quote: &Quote) -> Order {
 		use std::convert::TryFrom;
 
-		// Detect order type from EIP-712 data to handle BatchCompact properly
-		let standard_order =
-			if let Ok((eip712_data, primary_type)) = Eip7683OrderData::extract_eip712_data(quote) {
-				if primary_type == "BatchCompact" {
-					// Handle BatchCompact orders using specialized parsing
-					Eip7683OrderData::handle_batch_compact_quote_conversion(quote, eip712_data)
-						.expect("Failed to convert BatchCompact quote to StandardOrder")
-				} else {
-					// Handle Permit2/EIP3009 orders using existing implementation
-					interfaces::StandardOrder::try_from(quote)
-						.expect("Failed to convert quote to StandardOrder")
-				}
-			} else {
-				// Fallback to existing implementation if detection fails
-				interfaces::StandardOrder::try_from(quote)
-					.expect("Failed to convert quote to StandardOrder")
-			};
+		// Use the unified TryFrom implementation that handles all order types automatically
+		let standard_order = interfaces::StandardOrder::try_from(quote)
+			.expect("Failed to convert quote to StandardOrder");
 
 		// Convert StandardOrder to Eip7683OrderData
 		let mut order_data = Eip7683OrderData::from(standard_order.clone());
