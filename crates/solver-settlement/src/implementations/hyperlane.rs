@@ -1006,7 +1006,10 @@ impl SettlementInterface for HyperlaneSettlement {
 
 		// Use order ID hash for deterministic oracle selection
 		let order_id_hash = keccak256(&order.id);
-		let selection_context = u64::from_be_bytes(order_id_hash[0..8].try_into().unwrap());
+		let selection_context =
+			u64::from_be_bytes(order_id_hash[0..8].try_into().map_err(|_| {
+				SettlementError::ValidationFailed("Failed to convert hash bytes".to_string())
+			})?);
 		let oracle_address = self
 			.select_oracle(&oracle_addresses, Some(selection_context))
 			.ok_or_else(|| {
