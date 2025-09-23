@@ -273,6 +273,7 @@ mod tests {
 				chain_id: 1,
 				address: "0x1234567890123456789012345678901234567890".to_string(),
 			}),
+			settlement_poll_interval_seconds: 3,
 		};
 
 		let networks = NetworksConfigBuilder::new()

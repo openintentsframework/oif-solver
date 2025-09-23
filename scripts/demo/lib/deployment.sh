@@ -1156,6 +1156,7 @@ private_key = "$PRIVATE_KEY"
 # ============================================================================
 [delivery]
 min_confirmations = 1
+transaction_poll_interval_seconds = 3
 
 [delivery.implementations.evm_alloy]
 network_ids = [31337, 31338]
@@ -1211,6 +1212,7 @@ TOKB = "195.00"
 # SETTLEMENT
 # ============================================================================
 [settlement]
+settlement_poll_interval_seconds = 3
 
 [settlement.domain]
 chain_id = 1

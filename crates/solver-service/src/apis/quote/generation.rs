@@ -382,6 +382,7 @@ mod tests {
 				chain_id: 1,
 				address: "0x1234567890123456789012345678901234567890".to_string(),
 			}),
+			settlement_poll_interval_seconds: 3,
 		};
 
 		// Build network configurations using builder pattern
@@ -472,7 +473,7 @@ mod tests {
 		let mut implementations: HashMap<String, Box<dyn SettlementInterface>> = HashMap::new();
 		implementations.insert("test".to_string(), Box::new(mock_settlement));
 
-		Arc::new(SettlementService::new(implementations))
+		Arc::new(SettlementService::new(implementations, 3))
 	}
 
 	#[tokio::test]

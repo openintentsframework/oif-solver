@@ -273,6 +273,8 @@ pub struct SettlementService {
 	implementations: HashMap<String, Box<dyn SettlementInterface>>,
 	/// Track order count for round-robin selection
 	selection_counter: Arc<AtomicU64>,
+	/// Poll interval for settlement monitoring in seconds
+	poll_interval_seconds: u64,
 }
 
 impl SettlementService {
@@ -280,10 +282,15 @@ impl SettlementService {
 	///
 	/// # Arguments
 	/// * `implementations` - Map of implementation name to instance
-	pub fn new(implementations: HashMap<String, Box<dyn SettlementInterface>>) -> Self {
+	/// * `poll_interval_seconds` - Poll interval for settlement monitoring
+	pub fn new(
+		implementations: HashMap<String, Box<dyn SettlementInterface>>,
+		poll_interval_seconds: u64,
+	) -> Self {
 		Self {
 			implementations,
 			selection_counter: Arc::new(AtomicU64::new(0)),
+			poll_interval_seconds,
 		}
 	}
 
@@ -292,6 +299,11 @@ impl SettlementService {
 	/// Returns None if the implementation doesn't exist.
 	pub fn get(&self, name: &str) -> Option<&dyn SettlementInterface> {
 		self.implementations.get(name).map(|b| b.as_ref())
+	}
+
+	/// Get the configured poll interval for settlement monitoring
+	pub fn poll_interval_seconds(&self) -> u64 {
+		self.poll_interval_seconds
 	}
 
 	/// Build oracle routes from all settlement implementations.

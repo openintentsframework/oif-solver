@@ -258,6 +258,7 @@ private_key = "\${SOLVER_PRIVATE_KEY}"
 # ============================================================================
 [delivery]
 min_confirmations = $(get_config ".solver_parameters.min_confirmations" "3")
+transaction_poll_interval_seconds = 3
 
 [delivery.implementations.evm_alloy]
 network_ids = [$origin_id, $dest_id]
@@ -303,6 +304,7 @@ rate_limit_delay_ms = $(get_config ".pricing.coingecko.rate_limit_delay_ms" "120
 # SETTLEMENT
 # ============================================================================
 [settlement]
+settlement_poll_interval_seconds = 3
 
 [settlement.domain]
 chain_id = $origin_id
