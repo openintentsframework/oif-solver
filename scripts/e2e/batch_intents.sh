@@ -409,17 +409,17 @@ process_batch_sequential() {
     
     # Show detailed results with IDs (comma-separated)
     if [[ ${#successful_ids[@]} -gt 0 ]]; then
-        local successful_list=$(IFS=,; echo "${successful_ids[*]}")
+        local successful_list=$(IFS=,; echo "${successful_ids[*]:-}")
         echo -e "${GREEN}✅ Successful Intents: ${successful_list}${NC}"
     fi
     
     if [[ ${#failed_ids[@]} -gt 0 ]]; then
-        local failed_list=$(IFS=,; echo "${failed_ids[*]}")
+        local failed_list=$(IFS=,; echo "${failed_ids[*]:-}")
         echo -e "${RED}❌ Failed Intents: ${failed_list}${NC}"
     fi
     
     if [[ ${#skipped_ids[@]} -gt 0 ]]; then
-        local skipped_list=$(IFS=,; echo "${skipped_ids[*]}")
+        local skipped_list=$(IFS=,; echo "${skipped_ids[*]:-}")
         echo -e "${YELLOW}⏭️  Skipped Intents: ${skipped_list}${NC}"
     fi
     

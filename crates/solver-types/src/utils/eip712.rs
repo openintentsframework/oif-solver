@@ -17,6 +17,10 @@ pub const TOKEN_PERMISSIONS_TYPE: &str = "TokenPermissions(address token,uint256
 pub const PERMIT_BATCH_WITNESS_TYPE: &str =
 	"PermitBatchWitnessTransferFrom(TokenPermissions[] permitted,address spender,uint256 nonce,uint256 deadline,Permit2Witness witness)";
 
+/// Type alias for EIP-712 data extraction result
+pub type Eip712ExtractionResult<'a> =
+	Result<(&'a serde_json::Map<String, serde_json::Value>, &'a str), Box<dyn std::error::Error>>;
+
 /// Compute EIP-712 domain hash (keccak256(abi.encode(typeHash, nameHash, chainId, verifyingContract))).
 pub fn compute_domain_hash(name: &str, chain_id: u64, verifying_contract: &AlloyAddress) -> B256 {
 	let domain_type_hash = keccak256(DOMAIN_TYPE.as_bytes());

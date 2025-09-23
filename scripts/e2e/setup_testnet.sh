@@ -277,7 +277,7 @@ DEST_TOKEN="$DEST_USDC_ADDRESS"
 ORIGIN_COMPACT_ADDRESS=""
 ORIGIN_PERMIT2_ADDRESS="0x000000000022D473030F116dDEE9F6B43aC78BA3"
 DEST_PERMIT2_ADDRESS="0x000000000022D473030F116dDEE9F6B43aC78BA3"
-OIF_PINNED_COMMIT="3d1399025b9daa8ab6f0666f11b741d3b5c5fafa"
+OIF_PINNED_COMMIT="eafdaa8"  # release-v0.1-rc.0: updates for release candidate
 
 echo
 echo -e "${GREEN}✅ Configuration validated${NC}"
@@ -443,12 +443,14 @@ cat > config/testnet.toml << EOF
 
 include = [
     "testnet/networks.toml",
-    "testnet/api.toml"
+    "testnet/api.toml",
+    "testnet/gas.toml"
 ]
 
 [solver]
 id = "oif-solver-testnet-usdc"
 monitoring_timeout_minutes = 5
+min_profitability_pct = 1.0
 
 # ============================================================================
 # STORAGE
@@ -491,11 +493,12 @@ network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]
 
 [discovery.implementations.onchain_eip7683]
 network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]
+polling_interval_secs = 0  # Use WebSocket subscriptions instead of polling
 
 [discovery.implementations.offchain_eip7683]
 api_host = "127.0.0.1"
 api_port = 8081
-network_ids = [$ORIGIN_CHAIN_ID]
+network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]
 
 # ============================================================================
 # ORDER
@@ -511,6 +514,21 @@ primary = "simple"
 max_gas_price_gwei = 100
 
 # ============================================================================
+# PRICING
+# ============================================================================
+[pricing]
+primary = "coingecko"
+
+[pricing.implementations.mock]
+# Uses default ETH/USD price of 4615.16
+
+[pricing.implementations.coingecko]
+# Free tier configuration (no API key required)
+# api_key = "CG-YOUR-API-KEY-HERE"
+cache_duration_seconds = 60
+rate_limit_delay_ms = 1200
+
+# ============================================================================
 # SETTLEMENT
 # ============================================================================
 [settlement]
@@ -519,11 +537,24 @@ max_gas_price_gwei = 100
 chain_id = 1
 address = "$INPUT_SETTLER"
 
-[settlement.implementations.eip7683]
+[settlement.implementations.direct]
+order = "eip7683"
 network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]
-oracle_addresses = { $ORIGIN_CHAIN_ID = "$ORACLE", $DEST_CHAIN_ID = "$ORACLE" }
 dispute_period_seconds = 60
+# Oracle selection strategy when multiple oracles are available (First, RoundRobin, Random)
+oracle_selection_strategy = "First"
 
+# Oracle configuration with multiple oracle support
+[settlement.implementations.direct.oracles]
+# Input oracles (on origin chains)
+input = { $ORIGIN_CHAIN_ID = ["$ORACLE"], $DEST_CHAIN_ID = ["$ORACLE"] }
+# Output oracles (on destination chains)
+output = { $ORIGIN_CHAIN_ID = ["$ORACLE"], $DEST_CHAIN_ID = ["$ORACLE"] }
+
+# Valid routes: from origin chain -> to destination chains
+[settlement.implementations.direct.routes]
+$ORIGIN_CHAIN_ID = [$DEST_CHAIN_ID]  # Can go from origin to destination
+$DEST_CHAIN_ID = [$ORIGIN_CHAIN_ID]  # Can go from destination to origin
 
 # ============================================================================
 # DEMO SCRIPT CONFIGURATION
@@ -588,6 +619,32 @@ timeout_seconds = 30
 max_request_size = 1048576  # 1MB
 EOF
 
+# Create gas.toml
+cat > config/testnet/gas.toml << EOF
+# Gas Configuration - Testnet Setup
+# Defines gas estimates for different transaction flows
+
+[gas]
+
+[gas.flows.compact_resource_lock]
+# Gas units captured by scripts/e2e/estimate_gas_compact.sh
+open = 0
+fill = 76068
+claim = 121995
+
+[gas.flows.permit2_escrow]
+# Gas units captured by cast estimate command
+open = 141899
+fill = 90027 
+claim = 75573
+
+[gas.flows.eip3009_escrow]
+# Gas units for EIP-3009 escrow flows on testnet
+open = 130254
+fill = 77298 
+claim = 60084
+EOF
+
 # Done!
 echo
 echo -e "${GREEN}✅ Setup complete!${NC}"
@@ -632,8 +689,9 @@ echo "  Solver $DEST_CHAIN_NAME USDC:  ${SOLVER_DEST_USDC} USDC"
 echo
 echo -e "${BLUE}📋 Files Created:${NC}"
 echo "  Main Config:    config/testnet.toml"
-echo "  Networks:       config/testnet/networks.toml" 
+echo "  Networks:       config/testnet/networks.toml"
 echo "  API:            config/testnet/api.toml"
+echo "  Gas:            config/testnet/gas.toml"
 echo
 
 echo -e "${YELLOW}To start the solver:${NC}"

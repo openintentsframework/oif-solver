@@ -1,11 +1,11 @@
 #!/bin/bash
 # Final gas capture - systematically get real gas from solver transactions
-# This script captures REAL gas values by tracking nonce changes
+# This script captures REAL gas values by tracking nonce changes for EIP-3009 escrow
 
 SOLVER_ADDR="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 
-echo "🚀 Systematic Gas Capture"
-echo "========================="
+echo "🚀 Systematic Gas Capture (EIP-3009 Escrow)"
+echo "============================================"
 echo "🔧 Solver address: $SOLVER_ADDR"
 echo "🔧 Normalized: $(echo "$SOLVER_ADDR" | tr '[:upper:]' '[:lower:]')"
 
@@ -14,18 +14,18 @@ find_tx_by_nonce() {
     local target_nonce=$1
     local rpc_url=$2
     local chain_name=$3
-    
+
     echo "    🔍 Searching for $chain_name nonce $target_nonce..." >&2
-    
+
     # Get current block and search backwards more efficiently
     local current_block=$(cast block-number --rpc-url "$rpc_url")
     local search_blocks=800  # broader window (~26 min @ 2s)
     local start_block=$((current_block - search_blocks))
-    
+
     if [ $start_block -lt 0 ]; then
         start_block=0
     fi
-    
+
     echo "    📋 Scanning recent blocks $start_block to $current_block..." >&2
 
     # Precompute lowercase solver and hex nonce
@@ -52,7 +52,7 @@ find_tx_by_nonce() {
             echo "      ... searching block $block" >&2
         fi
     done
-    
+
     echo "    ❌ Could not find transaction with nonce $target_nonce in recent $search_blocks blocks" >&2
     return 1
 }
@@ -66,9 +66,9 @@ dest_before_dec=$(cast to-dec "$dest_nonce_before")
 echo "  Origin: $origin_before_dec"
 echo "  Dest: $dest_before_dec"
 
-# Send intent using oif-demo
-echo "📤 Sending Permit2 intent..."
-./oif-demo intent test escrow permit2 A2B > /dev/null 2>&1
+# Send intent using oif-demo with EIP-3009
+echo "📤 Sending EIP-3009 intent..."
+./oif-demo intent test escrow eip3009 A2B > /dev/null 2>&1
 
 echo "⏳ Waiting for transaction processing..."
 sleep 22  # Wait longer for complete processing
@@ -184,13 +184,13 @@ echo "  Total: $total_gas gas"
 mkdir -p snapshots
 timestamp=$(date +%s)
 
-cat > snapshots/gas_snapshots_real_e2e.json << EOF
+cat > snapshots/gas_snapshots_real_eip3009_e2e.json << EOF
 {
-  "version": "1.0.0", 
+  "version": "1.0.0",
   "snapshots": {
-    "permit2-escrow_31337": [
+    "eip3009-escrow_31337": [
       {
-        "flow": "permit2-escrow",
+        "flow": "eip3009-escrow",
         "chain_id": 31337,
         "open_gas": $prepare_gas,
         "fill_gas": $fill_gas,
@@ -198,7 +198,7 @@ cat > snapshots/gas_snapshots_real_e2e.json << EOF
         "created_at": $timestamp,
         "metadata": {
           "capture_method": "systematic_solver_execution",
-          "description": "Gas captured systematically from actual solver transactions",
+          "description": "Gas captured systematically from actual solver transactions using EIP-3009",
           "validation": "All transactions found via nonce tracking and receipt extraction",
           "nonce_ranges": "Origin $origin_before_dec -> $origin_after_dec, Dest $dest_before_dec -> $dest_after_dec",
           "transaction_counts": "Origin: $origin_tx_count, Dest: $dest_tx_count"
@@ -209,25 +209,26 @@ cat > snapshots/gas_snapshots_real_e2e.json << EOF
   "last_updated": $timestamp,
   "metadata": {
     "source": "Systematic Solver Execution",
-    "methodology": "Gas extracted from solver transactions found via systematic nonce-based discovery",
+    "methodology": "Gas extracted from solver transactions found via systematic nonce-based discovery for EIP-3009 escrow",
     "guarantee": "All gas values are from actual on-chain transaction receipts - NO estimates or fallbacks"
   }
 }
 EOF
 
 echo
-echo "✅ SYSTEMATIC gas snapshot created: snapshots/gas_snapshots_real_e2e.json"
+echo "✅ SYSTEMATIC gas snapshot created: snapshots/gas_snapshots_real_eip3009_e2e.json"
 
-echo "🎉 SUCCESS! You now have REAL gas measurements from systematic solver transaction discovery!"
+echo "🎉 SUCCESS! You now have REAL gas measurements from systematic solver transaction discovery for EIP-3009!"
 
 echo "💡 Integration:"
-echo '  let cost_engine = CostEngine::new_with_snapshots("snapshots/gas_snapshots_real_e2e.json");'
+echo '  let cost_engine = CostEngine::new_with_snapshots("snapshots/gas_snapshots_real_eip3009_e2e.json");'
 
 echo "🔧 Systematic approach summary:"
-echo "  • Tracked solver nonces before/after intent submission"
+echo "  • Tracked solver nonces before/after EIP-3009 intent submission"
 echo "  • Found ALL transactions by their specific nonce values"
 echo "  • Extracted gas from actual transaction receipts"
 echo "  • NO fallbacks or estimates used"
 
-echo "📋 To capture Compact Resource Lock gas systematically:"
-echo "  Run this script again with send_offchain_resource_lock_intent.sh"
+echo "📋 To capture gas for other flows:"
+echo "  Run estimate_gas_permit2_escrow.sh for Permit2 escrow gas"
+echo "  Run estimate_gas_compact_resource_lock.sh for Compact Resource Lock gas"

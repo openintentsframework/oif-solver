@@ -1,15 +1,34 @@
+use crate::apis::cost::convert_raw_token_to_usd;
+use crate::apis::cost::{
+	add_many, apply_bps, estimate_gas_units_from_config, get_chain_gas_price_as_u256,
+};
 use alloy_primitives::U256;
+use rust_decimal::Decimal;
 use solver_config::Config;
 use solver_core::SolverEngine;
 use solver_pricing::PricingService;
+use solver_types::RequestedOutput;
 use solver_types::{
-	costs::{CostComponent, QuoteCost},
-	Quote, QuoteError, QuoteOrder, SignatureType, TradingPair,
+	costs::{CostComponent, CostEstimate},
+	current_timestamp, APIError, ApiErrorType, AvailableInput, ExecutionParams, FillProof, Order,
+	Quote, Transaction, TransactionHash, DEFAULT_GAS_PRICE_WEI,
 };
-use solver_types::{
-	Address, ExecutionParams, FillProof, Order, OrderStatus, Transaction, TransactionHash,
-	DEFAULT_GAS_PRICE_WEI,
-};
+use std::str::FromStr;
+
+const HUNDRED: i64 = 10000;
+
+/// Parameters for chain-related information
+struct ChainParams {
+	origin_chain_id: u64,
+	dest_chain_id: u64,
+}
+
+/// Parameters for gas unit calculations
+struct GasUnits {
+	open_units: u64,
+	fill_units: u64,
+	claim_units: u64,
+}
 
 pub struct CostEngine;
 
@@ -18,123 +37,209 @@ impl CostEngine {
 		Self
 	}
 
-	/// Validates that the pricing service supports the required pairs for cross-chain operations.
-	pub async fn validate_pricing_support(
-		&self,
-		quote: &Quote,
-		pricing_service: &PricingService,
-	) -> Result<(), QuoteError> {
-		let supported_pairs = pricing_service.get_supported_pairs().await;
-
-		// Extract origin and destination assets from quote for validation
-		let _input = quote
-			.details
-			.available_inputs
-			.first()
-			.ok_or_else(|| QuoteError::InvalidRequest("missing input".to_string()))?;
-		let _output = quote
-			.details
-			.requested_outputs
-			.first()
-			.ok_or_else(|| QuoteError::InvalidRequest("missing output".to_string()))?;
-
-		// For now, we primarily care about ETH/USD support for gas cost calculations
-		let required_pairs = vec![
-			TradingPair::new("ETH", "USD"),
-			TradingPair::new("USD", "ETH"),
-		];
-
-		for required_pair in &required_pairs {
-			let has_direct_support = supported_pairs.iter().any(|p| {
-				(p.base == required_pair.base && p.quote == required_pair.quote)
-					|| (p.base == required_pair.quote && p.quote == required_pair.base)
-			});
-
-			if !has_direct_support {
-				tracing::warn!(
-					"Pricing service may not support required pair: {}",
-					required_pair.to_string()
-				);
-			}
-		}
-
-		Ok(())
-	}
-
-	pub async fn estimate_cost(
+	/// Estimate cost for a Quote
+	pub async fn estimate_cost_for_quote(
 		&self,
 		quote: &Quote,
 		solver: &SolverEngine,
 		config: &Config,
-		pricing_service: &PricingService,
-	) -> Result<QuoteCost, QuoteError> {
-		// Validate pricing support for this quote
-		self.validate_pricing_support(quote, pricing_service)
+	) -> Result<CostEstimate, APIError> {
+		// Extract chain parameters from quote
+		let origin_chain_id = quote
+			.details
+			.available_inputs
+			.iter()
+			.filter_map(|input| input.asset.ethereum_chain_id().ok())
+			.next()
+			.ok_or_else(|| APIError::BadRequest {
+				error_type: ApiErrorType::MissingChainId,
+				message: "No input chain ID found".to_string(),
+				details: None,
+			})?;
+
+		let dest_chain_id = quote
+			.details
+			.requested_outputs
+			.iter()
+			.filter_map(|output| output.asset.ethereum_chain_id().ok())
+			.next()
+			.ok_or_else(|| APIError::BadRequest {
+				error_type: ApiErrorType::MissingChainId,
+				message: "No output chain ID found".to_string(),
+				details: None,
+			})?;
+
+		let chain_params = ChainParams {
+			origin_chain_id,
+			dest_chain_id,
+		};
+
+		// Extract flow key (lock_type) for gas config lookup
+		let flow_key = Some(quote.lock_type.clone());
+
+		// Determine the standard - for quotes, we default to eip7683
+		// TODO: In the future, this should be determined from the quote
+		let standard = "eip7683";
+		let order = quote
+			.to_order_for_estimation(standard)
+			.map_err(|e| APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: format!("Failed to convert quote to order: {}", e),
+				details: None,
+			})?;
+
+		// Estimate gas units
+		let gas_units = self
+			.estimate_gas_units(
+				&order,
+				&flow_key,
+				config,
+				solver,
+				chain_params.origin_chain_id,
+				chain_params.dest_chain_id,
+			)
 			.await?;
 
-		let pricing = pricing_service.config();
-		let (origin_chain_id, dest_chain_id) = self.extract_origin_dest_chain_ids(quote)?;
+		// Calculate cost components
+		self.calculate_cost_components(
+			solver,
+			chain_params,
+			gas_units,
+			&quote.details.available_inputs,
+			&quote.details.requested_outputs,
+			config,
+		)
+		.await
+	}
 
-		// Get gas units from config (preferred) or fallback to minimal defaults
+	/// Estimate cost for an Order using its OrderParsable implementation
+	pub async fn estimate_cost_for_order(
+		&self,
+		order: &Order,
+		solver: &SolverEngine,
+		config: &Config,
+	) -> Result<CostEstimate, APIError> {
+		// Parse the order data based on its standard
+		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
+			error_type: ApiErrorType::InvalidRequest,
+			message: format!("Failed to parse order data: {}", e),
+			details: None,
+		})?;
+
+		// Extract chain parameters
+		let origin_chain_id = order_parsed.origin_chain_id();
+		let dest_chain_ids = order_parsed.destination_chain_ids();
+
+		let dest_chain_id =
+			dest_chain_ids
+				.first()
+				.copied()
+				.ok_or_else(|| APIError::BadRequest {
+					error_type: ApiErrorType::MissingChainId,
+					message: "No destination chain ID found".to_string(),
+					details: None,
+				})?;
+
+		let chain_params = ChainParams {
+			origin_chain_id,
+			dest_chain_id,
+		};
+
+		// Extract flow key (lock_type) for gas config lookup
+		let flow_key = order_parsed.parse_lock_type();
+
+		// Estimate gas units
+		let gas_units = self
+			.estimate_gas_units(
+				order,
+				&flow_key,
+				config,
+				solver,
+				chain_params.origin_chain_id,
+				chain_params.dest_chain_id,
+			)
+			.await?;
+
+		// Calculate cost components
+		let available_inputs = order_parsed.parse_available_inputs();
+		let requested_outputs = order_parsed.parse_requested_outputs();
+		self.calculate_cost_components(
+			solver,
+			chain_params,
+			gas_units,
+			&available_inputs,
+			&requested_outputs,
+			config,
+		)
+		.await
+	}
+
+	/// Estimate gas units with optional live estimation
+	async fn estimate_gas_units(
+		&self,
+		order: &Order,
+		flow_key: &Option<String>,
+		config: &Config,
+		solver: &SolverEngine,
+		origin_chain_id: u64,
+		dest_chain_id: u64,
+	) -> Result<GasUnits, APIError> {
+		let pricing = solver.pricing().config();
+
+		// Get base units from config
 		let (open_units, mut fill_units, mut claim_units) =
-			self.estimate_gas_units_for_orders(&quote.orders, config);
+			estimate_gas_units_from_config(flow_key, config, 0, 0, 0);
 
+		// Live estimation if enabled
 		if pricing.enable_live_gas_estimate {
+			// Estimate fill gas
 			tracing::info!("Estimating fill gas on destination chain");
-			if let Ok(tx) = self
-				.build_fill_tx_for_estimation(quote, dest_chain_id, solver)
-				.await
-			{
+			if let Ok(fill_tx) = self.build_fill_tx_for_estimation(order, solver).await {
 				match solver
 					.delivery()
-					.estimate_gas(dest_chain_id, tx.clone())
+					.estimate_gas(dest_chain_id, fill_tx.clone())
 					.await
 				{
-					Ok(g) => {
-						tracing::info!("Fill gas units: {}", g);
-						fill_units = g;
+					Ok(units) => {
+						tracing::info!("Fill gas units: {}", units);
+						fill_units = units;
 					},
 					Err(e) => {
 						tracing::warn!(
 							error = %e,
 							chain = dest_chain_id,
-							to = %tx.to.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "<none>".into()),
+							to = %fill_tx.to.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "<none>".into()),
 							"estimate_gas(fill) failed; using heuristic"
 						);
 					},
 				}
-			} else {
-				tracing::warn!("Failed to build fill transaction for estimation");
 			}
-		}
 
-		if pricing.enable_live_gas_estimate {
-			if let Ok(tx) = self
-				.build_claim_tx_for_estimation(quote, origin_chain_id, solver)
-				.await
-			{
+			// Estimate claim gas
+			if let Ok(claim_tx) = self.build_claim_tx_for_estimation(order, solver).await {
 				tracing::debug!(
 					"finalise tx bytes_len={} to={}",
-					tx.data.len(),
-					tx.to
+					claim_tx.data.len(),
+					claim_tx
+						.to
 						.as_ref()
 						.map(|a| a.to_string())
 						.unwrap_or_else(|| "<none>".into())
 				);
 				match solver
 					.delivery()
-					.estimate_gas(origin_chain_id, tx.clone())
+					.estimate_gas(origin_chain_id, claim_tx.clone())
 					.await
 				{
-					Ok(g) => {
-						tracing::debug!("Claim gas units: {}", g);
-						claim_units = g;
+					Ok(units) => {
+						tracing::debug!("Claim gas units: {}", units);
+						claim_units = units;
 					},
 					Err(e) => {
 						tracing::warn!(
 							error = %e,
 							chain = origin_chain_id,
-							to = %tx.to.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "<none>".into()),
+							to = %claim_tx.to.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "<none>".into()),
 							"estimate_gas(finalise) failed; using heuristic"
 						);
 					},
@@ -142,31 +247,92 @@ impl CostEngine {
 			}
 		}
 
-		// Gas prices
-		let origin_gp = U256::from_str_radix(
-			&solver
-				.delivery()
-				.get_chain_data(origin_chain_id)
-				.await
-				.map_err(|e| QuoteError::Internal(e.to_string()))?
-				.gas_price,
-			10,
-		)
-		.unwrap_or(U256::from(DEFAULT_GAS_PRICE_WEI));
-		let dest_gp = U256::from_str_radix(
-			&solver
-				.delivery()
-				.get_chain_data(dest_chain_id)
-				.await
-				.map_err(|e| QuoteError::Internal(e.to_string()))?
-				.gas_price,
-			10,
-		)
-		.unwrap_or(U256::from(DEFAULT_GAS_PRICE_WEI));
+		Ok(GasUnits {
+			open_units,
+			fill_units,
+			claim_units,
+		})
+	}
+
+	/// Build fill transaction for gas estimation
+	async fn build_fill_tx_for_estimation(
+		&self,
+		order: &Order,
+		solver: &SolverEngine,
+	) -> Result<Transaction, APIError> {
+		// Create execution params for estimation
+		let params = ExecutionParams {
+			gas_price: U256::from(DEFAULT_GAS_PRICE_WEI),
+			priority_fee: None,
+		};
+
+		// Use OrderService to generate transaction
+		solver
+			.order()
+			.generate_fill_transaction(order, &params)
+			.await
+			.map_err(|e| APIError::InternalServerError {
+				error_type: ApiErrorType::FillTxGenerationFailed,
+				message: format!("Failed to generate fill transaction: {}", e),
+			})
+	}
+
+	/// Build claim transaction for gas estimation
+	async fn build_claim_tx_for_estimation(
+		&self,
+		order: &Order,
+		solver: &SolverEngine,
+	) -> Result<Transaction, APIError> {
+		// Create minimal fill proof for estimation
+		let fill_proof = FillProof {
+			oracle_address: "0x0000000000000000000000000000000000000000".to_string(),
+			filled_timestamp: current_timestamp(),
+			block_number: 1,
+			tx_hash: TransactionHash(vec![0u8; 32]),
+			attestation_data: Some(vec![]),
+		};
+
+		solver
+			.order()
+			.generate_claim_transaction(order, &fill_proof)
+			.await
+			.map_err(|e| APIError::InternalServerError {
+				error_type: ApiErrorType::ClaimTxGenerationFailed,
+				message: format!("Failed to generate claim transaction: {}", e),
+			})
+	}
+
+	/// Calculate cost components for the order
+	async fn calculate_cost_components(
+		&self,
+		solver: &SolverEngine,
+		chain_params: ChainParams,
+		gas_units: GasUnits,
+		available_inputs: &[AvailableInput],
+		requested_outputs: &[RequestedOutput],
+		config: &Config,
+	) -> Result<CostEstimate, APIError> {
+		let pricing_service = solver.pricing();
+		let pricing = pricing_service.config();
+
+		// Gas prices using shared utility
+		let origin_gp = get_chain_gas_price_as_u256(solver, chain_params.origin_chain_id)
+			.await
+			.map_err(|e| APIError::InternalServerError {
+				error_type: ApiErrorType::GasEstimationFailed,
+				message: format!("Failed to get origin chain gas price: {}", e),
+			})?;
+		let dest_gp = get_chain_gas_price_as_u256(solver, chain_params.dest_chain_id)
+			.await
+			.map_err(|e| APIError::InternalServerError {
+				error_type: ApiErrorType::GasEstimationFailed,
+				message: format!("Failed to get destination chain gas price: {}", e),
+			})?;
+
 		// Costs: open+claim on origin, fill on dest
-		let open_cost_wei_uint = origin_gp.saturating_mul(U256::from(open_units));
-		let fill_cost_wei_uint = dest_gp.saturating_mul(U256::from(fill_units));
-		let claim_cost_wei_uint = origin_gp.saturating_mul(U256::from(claim_units));
+		let open_cost_wei_uint = origin_gp.saturating_mul(U256::from(gas_units.open_units));
+		let fill_cost_wei_uint = dest_gp.saturating_mul(U256::from(gas_units.fill_units));
+		let claim_cost_wei_uint = origin_gp.saturating_mul(U256::from(gas_units.claim_units));
 
 		let open_cost_wei_str = open_cost_wei_uint.to_string();
 		let fill_cost_wei_str = fill_cost_wei_uint.to_string();
@@ -197,39 +363,57 @@ impl CostEngine {
 			.await
 			.unwrap_or_else(|_| "0".to_string());
 
-		let base_price = "0".to_string();
-		let buffer_rates = apply_bps(&base_price, pricing.rate_buffer_bps);
-
-		let subtotal = add_many(&[
-			base_price.clone(),
-			gas_subtotal_w.clone(),
-			buffer_gas.clone(),
-			buffer_rates.clone(),
-		]);
-		let subtotal_currency = pricing_service
-			.wei_to_currency(&subtotal, &pricing.currency)
+		// Calculate base price and minimum profit requirement in USD
+		let (base_price_usd, min_profit_usd) = self
+			.calculate_pricing_components(
+				solver,
+				pricing_service,
+				available_inputs,
+				requested_outputs,
+				&chain_params,
+				config,
+			)
 			.await
-			.unwrap_or_else(|_| "0".to_string());
+			.unwrap_or_else(|e| {
+				tracing::warn!("Failed to calculate pricing components: {}", e);
+				("0".to_string(), "0".to_string())
+			});
 
-		let commission_amount = apply_bps(&subtotal, pricing.commission_bps);
-		let commission_amount_currency = pricing_service
-			.wei_to_currency(&commission_amount, &pricing.currency)
-			.await
-			.unwrap_or_else(|_| "0".to_string());
+		// Calculate buffer rates (currently 0 since we don't have rate buffers implemented)
+		let buffer_rates = "0".to_string();
 
-		let total = add_decimals(&subtotal, &commission_amount);
-		let total_currency = pricing_service
-			.wei_to_currency(&total, &pricing.currency)
-			.await
-			.unwrap_or_else(|_| "0".to_string());
+		// Calculate operational costs (gas + buffers only) in USD
+		let operational_cost_usd = Decimal::from_str(&open_cost_currency).unwrap_or(Decimal::ZERO)
+			+ Decimal::from_str(&fill_cost_currency).unwrap_or(Decimal::ZERO)
+			+ Decimal::from_str(&claim_cost_currency).unwrap_or(Decimal::ZERO)
+			+ Decimal::from_str(&buffer_gas_currency).unwrap_or(Decimal::ZERO);
 
-		Ok(QuoteCost {
+		// Calculate subtotal: all cost components before commission
+		// subtotal = operational costs + base price + min profit
+		let subtotal_usd = operational_cost_usd
+			+ Decimal::from_str(&base_price_usd).unwrap_or(Decimal::ZERO)
+			+ Decimal::from_str(&min_profit_usd).unwrap_or(Decimal::ZERO);
+
+		// Calculate commission on the subtotal
+		let commission_amount_usd = if pricing.commission_bps > 0 {
+			let bps_divisor = Decimal::new(HUNDRED, 0);
+			let commission_rate = Decimal::new(pricing.commission_bps as i64, 0) / bps_divisor;
+			(subtotal_usd * commission_rate).to_string()
+		} else {
+			"0".to_string()
+		};
+
+		// Calculate total: subtotal + commission
+		let total_usd =
+			subtotal_usd + Decimal::from_str(&commission_amount_usd).unwrap_or(Decimal::ZERO);
+
+		Ok(CostEstimate {
 			currency: pricing.currency.clone(),
 			components: vec![
 				CostComponent {
 					name: "base-price".into(),
-					amount: base_price.clone(),
-					amount_wei: Some(base_price),
+					amount: base_price_usd.clone(),
+					amount_wei: None,
 				},
 				CostComponent {
 					name: "gas-open".into(),
@@ -256,199 +440,127 @@ impl CostEngine {
 					amount: buffer_rates.clone(),
 					amount_wei: Some(buffer_rates),
 				},
+				CostComponent {
+					name: "min-profit".into(),
+					amount: min_profit_usd,
+					amount_wei: None, // No wei equivalent needed
+				},
+				CostComponent {
+					name: "operational-cost".into(),
+					amount: operational_cost_usd.to_string(),
+					amount_wei: None, // This is a calculated summary, not a wei value
+				},
 			],
 			commission_bps: pricing.commission_bps,
-			commission_amount: commission_amount_currency,
-			subtotal: subtotal_currency,
-			total: total_currency,
+			commission_amount: commission_amount_usd.clone(),
+			subtotal: subtotal_usd.to_string(),
+			total: total_usd.to_string(),
 		})
 	}
 
-	fn estimate_gas_units_for_orders(
+	/// Calculate the base price and minimum profit requirement in USD
+	/// This considers the spread between input and output values
+	async fn calculate_pricing_components(
 		&self,
-		orders: &[QuoteOrder],
+		solver: &SolverEngine,
+		pricing_service: &PricingService,
+		available_inputs: &[AvailableInput],
+		requested_outputs: &[RequestedOutput],
+		chain_params: &ChainParams,
 		config: &Config,
-	) -> (u64, u64, u64) {
-		// Detect flow type and try to get from config first
-		let flow_key = self.determine_flow_key(orders);
+	) -> Result<(String, String), Box<dyn std::error::Error>> {
+		let token_manager = solver.token_manager();
 
-		if let Some(gcfg) = config.gas.as_ref() {
-			tracing::debug!(
-				"Available gas flows: {:?}",
-				gcfg.flows.keys().collect::<Vec<_>>()
-			);
+		// Calculate total input value in USD
+		let mut total_input_value_usd = Decimal::ZERO;
+		for input in available_inputs {
+			// Get the chain ID from the input asset, fallback to origin_chain_id
+			let chain_id = input
+				.asset
+				.ethereum_chain_id()
+				.unwrap_or(chain_params.origin_chain_id);
+
+			// Get token info
+			let ethereum_addr = input
+				.asset
+				.ethereum_address()
+				.map_err(|e| format!("Failed to extract input ethereum address: {}", e))?;
+			let solver_addr = solver_types::Address(ethereum_addr.0.to_vec());
+			let token_info = token_manager
+				.get_token_info(chain_id, &solver_addr)
+				.map_err(|e| format!("Failed to get input token info: {}", e))?;
+
+			// Convert raw amount to USD using pricing service
+			let usd_amount = convert_raw_token_to_usd(
+				&input.amount,
+				&token_info.symbol,
+				token_info.decimals,
+				pricing_service,
+			)
+			.await?;
+
+			total_input_value_usd += usd_amount;
 		}
 
-		// Try to get configured values for the detected flow
-		if let (Some(flow), Some(gcfg)) = (flow_key.as_deref(), config.gas.as_ref()) {
-			if let Some(units) = gcfg.flows.get(flow) {
-				// Use configured values directly when available
-				let open = units.open.unwrap_or(0);
-				let fill = units.fill.unwrap_or(0);
-				let claim = units.claim.unwrap_or(0);
-				return (open, fill, claim);
-			} else {
-				tracing::warn!("Flow '{}' not found in gas config flows", flow);
-			}
+		// Calculate total output value in USD
+		let mut total_output_value_usd = Decimal::ZERO;
+		for output in requested_outputs {
+			// Get the chain ID from the output asset, fallback to dest_chain_id
+			let chain_id = output
+				.asset
+				.ethereum_chain_id()
+				.unwrap_or(chain_params.dest_chain_id);
+
+			// Get token info
+			let ethereum_addr = output
+				.asset
+				.ethereum_address()
+				.map_err(|e| format!("Failed to extract output ethereum address: {}", e))?;
+			let solver_addr = solver_types::Address(ethereum_addr.0.to_vec());
+			let token_info = token_manager
+				.get_token_info(chain_id, &solver_addr)
+				.map_err(|e| format!("Failed to get output token info: {}", e))?;
+
+			// Convert raw amount to USD using pricing service
+			let usd_amount = convert_raw_token_to_usd(
+				&output.amount,
+				&token_info.symbol,
+				token_info.decimals,
+				pricing_service,
+			)
+			.await?;
+
+			total_output_value_usd += usd_amount;
 		}
-		tracing::warn!(
-			"No gas config found for flow {:?}, using minimal fallbacks",
-			flow_key
+
+		// Calculate the spread (can be negative if solver provides more value than received)
+		let spread = total_input_value_usd - total_output_value_usd;
+
+		// Calculate base price needed to cover any negative spread
+		// If outputs > inputs, solver needs to charge at least the difference
+		let base_price_usd = if spread < Decimal::ZERO {
+			spread.abs() // Convert negative spread to positive base price
+		} else {
+			Decimal::ZERO // No base price needed if there's natural profit
+		};
+
+		// Calculate minimum required profit based on the transaction size
+		// Use the larger value to ensure profitability scales with transaction size
+		let transaction_value = total_input_value_usd.max(total_output_value_usd);
+		let hundred = Decimal::new(100_i64, 0);
+		let min_required_profit =
+			(transaction_value * config.solver.min_profitability_pct) / hundred;
+
+		tracing::info!(
+			"Pricing components: input_value={}, output_value={}, spread={}, base_price={}, min_profit={}",
+			total_input_value_usd,
+			total_output_value_usd,
+			spread,
+			base_price_usd,
+			min_required_profit
 		);
-		let open = 0; // Compact flows have no open step
-		let fill = 0; // Conservative estimate - should be replaced with real data
-		let claim = 0; // Conservative estimate - should be replaced with real data
 
-		(open, fill, claim)
+		// Return both base price and minimum profit separately
+		Ok((base_price_usd.to_string(), min_required_profit.to_string()))
 	}
-
-	/// Detect a coarse flow type for selecting config overrides
-	fn determine_flow_key(&self, orders: &[QuoteOrder]) -> Option<String> {
-		if orders
-			.iter()
-			.any(|o| o.primary_type.contains("Lock") || o.primary_type.contains("Compact"))
-		{
-			return Some("compact_resource_lock".to_string());
-		}
-		// Default to permit2-based escrow if using EIP-712 style signatures
-		if orders
-			.iter()
-			.any(|o| matches!(o.signature_type, SignatureType::Eip712))
-		{
-			return Some("permit2_escrow".to_string());
-		}
-		None
-	}
-
-	fn extract_origin_dest_chain_ids(&self, quote: &Quote) -> Result<(u64, u64), QuoteError> {
-		let input = quote
-			.details
-			.available_inputs
-			.first()
-			.ok_or_else(|| QuoteError::InvalidRequest("missing input".to_string()))?;
-		let output = quote
-			.details
-			.requested_outputs
-			.first()
-			.ok_or_else(|| QuoteError::InvalidRequest("missing output".to_string()))?;
-		let origin = input
-			.asset
-			.ethereum_chain_id()
-			.map_err(|e| QuoteError::InvalidRequest(e.to_string()))?;
-		let dest = output
-			.asset
-			.ethereum_chain_id()
-			.map_err(|e| QuoteError::InvalidRequest(e.to_string()))?;
-		Ok((origin, dest))
-	}
-
-	/// Create a minimal Order for gas estimation from a Quote
-	async fn create_order_for_estimation(
-		&self,
-		quote: &Quote,
-		_solver: &SolverEngine,
-	) -> Result<Order, QuoteError> {
-		// Create a minimal order for gas estimation purposes
-		// This is safe because we only use it for transaction generation, not actual execution
-		Ok(Order {
-			id: format!("estimate-{}", quote.quote_id),
-			standard: "eip7683".to_string(),
-			created_at: solver_types::current_timestamp(),
-			updated_at: solver_types::current_timestamp(),
-			status: OrderStatus::Created,
-			data: serde_json::to_value(&quote.details)
-				.map_err(|e| QuoteError::Internal(e.to_string()))?, // Convert QuoteDetails to serde_json::Value
-			solver_address: Address(vec![0u8; 20]), // Dummy solver address for estimation
-			quote_id: Some(quote.quote_id.clone()),
-			input_chain_ids: vec![quote
-				.details
-				.available_inputs
-				.first()
-				.ok_or_else(|| QuoteError::InvalidRequest("missing input".to_string()))?
-				.asset
-				.ethereum_chain_id()
-				.map_err(|e| QuoteError::InvalidRequest(e.to_string()))?],
-			output_chain_ids: vec![quote
-				.details
-				.requested_outputs
-				.first()
-				.ok_or_else(|| QuoteError::InvalidRequest("missing output".to_string()))?
-				.asset
-				.ethereum_chain_id()
-				.map_err(|e| QuoteError::InvalidRequest(e.to_string()))?],
-			execution_params: None,
-			prepare_tx_hash: None,
-			fill_tx_hash: None,
-			post_fill_tx_hash: None,
-			pre_claim_tx_hash: None,
-			claim_tx_hash: None,
-			fill_proof: None,
-		})
-	}
-
-	/// Build fill transaction using the proper order implementation
-	async fn build_fill_tx_for_estimation(
-		&self,
-		quote: &Quote,
-		_dest_chain_id: u64,
-		solver: &SolverEngine,
-	) -> Result<Transaction, QuoteError> {
-		let order = self.create_order_for_estimation(quote, solver).await?;
-		// Create minimal execution params for estimation
-		let params = ExecutionParams {
-			gas_price: U256::from(DEFAULT_GAS_PRICE_WEI), // 1 gwei default
-			priority_fee: None,
-		};
-
-		solver
-			.order()
-			.generate_fill_transaction(&order, &params)
-			.await
-			.map_err(|e| QuoteError::Internal(e.to_string()))
-	}
-
-	/// Build claim transaction using the proper order implementation
-	async fn build_claim_tx_for_estimation(
-		&self,
-		quote: &Quote,
-		_origin_chain_id: u64,
-		solver: &SolverEngine,
-	) -> Result<Transaction, QuoteError> {
-		let order = self.create_order_for_estimation(quote, solver).await?;
-
-		// Create minimal fill proof for estimation
-		let fill_proof = FillProof {
-			oracle_address: "0x0000000000000000000000000000000000000000".to_string(),
-			filled_timestamp: solver_types::current_timestamp(),
-			block_number: 1,
-			tx_hash: TransactionHash(vec![0u8; 32]),
-			attestation_data: Some(vec![]),
-		};
-
-		solver
-			.order()
-			.generate_claim_transaction(&order, &fill_proof)
-			.await
-			.map_err(|e| QuoteError::Internal(e.to_string()))
-	}
-}
-
-// helpers
-fn add_decimals(a: &str, b: &str) -> String {
-	add_many(&[a.to_string(), b.to_string()])
-}
-
-fn add_many(values: &[String]) -> String {
-	let mut sum = U256::ZERO;
-	for v in values {
-		if let Ok(n) = U256::from_str_radix(v, 10) {
-			sum = sum.saturating_add(n);
-		}
-	}
-	sum.to_string()
-}
-
-fn apply_bps(value: &str, bps: u32) -> String {
-	let v = U256::from_str_radix(value, 10).unwrap_or(U256::ZERO);
-	(v.saturating_mul(U256::from(bps as u64)) / U256::from(10_000u64)).to_string()
 }

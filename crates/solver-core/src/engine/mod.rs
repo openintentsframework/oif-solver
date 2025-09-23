@@ -500,6 +500,11 @@ impl SolverEngine {
 		&self.delivery
 	}
 
+	/// Returns a reference to the account service.
+	pub fn account(&self) -> &Arc<AccountService> {
+		&self.account
+	}
+
 	/// Returns a reference to the order service.
 	pub fn order(&self) -> &Arc<OrderService> {
 		&self.order

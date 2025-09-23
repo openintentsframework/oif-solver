@@ -95,13 +95,13 @@ pub async fn process_quote_request(
 		request.available_inputs.len()
 	);
 
-	// 1. Validate the request
+	// Validate the request
 	QuoteValidator::validate_request(&request)?;
 
-	// 2. Check solver capabilities: networks only (token support is enforced during collection below)
+	// Check solver capabilities: networks only (token support is enforced during collection below)
 	QuoteValidator::validate_supported_networks(&request, solver)?;
 
-	// 3. Collect supported assets for this request (for later use: balances/custody/pricing)
+	// Collect supported assets for this request (for later use: balances/custody/pricing)
 	let (_supported_inputs, supported_outputs) = (
 		QuoteValidator::collect_supported_available_inputs(&request, solver)?,
 		QuoteValidator::validate_and_collect_requested_outputs(&request, solver)?,
@@ -110,25 +110,25 @@ pub async fn process_quote_request(
 	// Check destination balances for required outputs
 	QuoteValidator::ensure_destination_balances(solver, &supported_outputs).await?;
 
-	// 4. Generate quotes using the business logic layer
+	// Generate quotes using the business logic layer
 	let settlement_service = solver.settlement();
-	let quote_generator = QuoteGenerator::new(settlement_service.clone());
+	let delivery_service = solver.delivery();
+	let quote_generator = QuoteGenerator::new(settlement_service.clone(), delivery_service.clone());
 	let mut quotes = quote_generator.generate_quotes(&request, config).await?;
 
-	// 5. Enrich quotes with a preliminary cost breakdown
+	// Enrich quotes with a preliminary cost breakdown
 	let cost_engine = cost::CostEngine::new();
-	let pricing_service = solver.pricing();
 
 	for quote in &mut quotes {
 		if let Ok(cost) = cost_engine
-			.estimate_cost(quote, solver, config, pricing_service)
+			.estimate_cost_for_quote(quote, solver, config)
 			.await
 		{
 			quote.cost = Some(cost);
 		}
 	}
 
-	// 5. Persist quotes
+	// Persist quotes
 	let validity_seconds = config
 		.api
 		.as_ref()

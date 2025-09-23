@@ -4,10 +4,12 @@
 //! generation for filling and claiming orders. It supports multiple order
 //! standards and pluggable execution strategies.
 
+use alloy_primitives::Bytes;
 use async_trait::async_trait;
 use solver_types::{
-	Address, ConfigSchema, ExecutionContext, ExecutionDecision, ExecutionParams, FillProof,
-	ImplementationRegistry, Intent, NetworksConfig, Order, Transaction,
+	standards::eip7683::interfaces::StandardOrder, Address, ConfigSchema, ExecutionContext,
+	ExecutionDecision, ExecutionParams, FillProof, ImplementationRegistry, Intent, NetworksConfig,
+	Order, OrderIdCallback, Transaction,
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -120,6 +122,33 @@ pub trait OrderInterface: Send + Sync {
 		order: &Order,
 		fill_proof: &FillProof,
 	) -> Result<Transaction, OrderError>;
+
+	/// Validates raw order bytes for this standard.
+	async fn validate_order(&self, _order_bytes: &Bytes) -> Result<StandardOrder, OrderError> {
+		// Default implementation: not supported
+		Err(OrderError::ValidationFailed(
+			"Order bytes validation not implemented for this standard".to_string(),
+		))
+	}
+
+	/// Validates order bytes and creates a generic Order with computed order ID.
+	///
+	/// This method performs validation, computes the order ID using the provided callback,
+	/// and returns a generic Order that can be used throughout the system.
+	///
+	/// # Arguments
+	///
+	/// * `order_bytes` - The raw order bytes to validate
+	/// * `lock_type` - The lock type for the order ("permit2_escrow", "eip3009_escrow", etc.)
+	/// * `order_id_callback` - Callback function to compute the order ID
+	/// * `solver_address` - The solver's address for reward attribution
+	async fn validate_and_create_order(
+		&self,
+		order_bytes: &Bytes,
+		lock_type: &str,
+		order_id_callback: OrderIdCallback,
+		solver_address: &Address,
+	) -> Result<Order, OrderError>;
 }
 
 /// Trait defining the interface for execution strategies.
@@ -297,6 +326,40 @@ impl OrderService {
 
 		implementation
 			.generate_claim_transaction(order, proof)
+			.await
+	}
+
+	/// Validates raw order bytes using the appropriate standard implementation.
+	pub async fn validate_order(
+		&self,
+		standard: &str,
+		order_bytes: &Bytes,
+	) -> Result<StandardOrder, OrderError> {
+		let implementation = self.implementations.get(standard).ok_or_else(|| {
+			OrderError::ValidationFailed(format!("Unknown standard: {}", standard))
+		})?;
+
+		implementation.validate_order(order_bytes).await
+	}
+
+	/// Validates order bytes and creates a generic Order with computed order ID.
+	///
+	/// This method delegates to the appropriate standard implementation to validate
+	/// the order and compute its ID using the provided callback.
+	pub async fn validate_and_create_order(
+		&self,
+		standard: &str,
+		order_bytes: &Bytes,
+		lock_type: &str,
+		order_id_callback: OrderIdCallback,
+		solver_address: &Address,
+	) -> Result<Order, OrderError> {
+		let implementation = self.implementations.get(standard).ok_or_else(|| {
+			OrderError::ValidationFailed(format!("Unknown standard: {}", standard))
+		})?;
+
+		implementation
+			.validate_and_create_order(order_bytes, lock_type, order_id_callback, solver_address)
 			.await
 	}
 }

@@ -2,10 +2,150 @@
 //!
 //! This module defines the request and response types for the OIF Solver API
 //! endpoints, following the ERC-7683 Cross-Chain Intents Standard.
-use crate::{costs::QuoteCost, standards::eip7930::InteropAddress, utils::parse_bytes32_from_hex};
-use alloy_primitives::U256;
-use serde::{Deserialize, Serialize};
+use crate::{
+	costs::CostEstimate,
+	standards::{eip7683::LockType, eip7930::InteropAddress},
+};
+use alloy_primitives::{Address, Bytes, U256};
+use serde::de::Error;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
+
+/// Intent request that unifies both quote acceptances and direct order submissions.
+/// Used as the common type for order validation and forwarding to discovery service.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct IntentRequest {
+	pub order: Bytes,
+	pub sponsor: Address,
+	pub signature: Bytes,
+	#[serde(
+		default = "default_lock_type",
+		deserialize_with = "deserialize_lock_type_flexible"
+	)]
+	pub lock_type: LockType,
+}
+
+/// Default lock type for IntentRequest
+fn default_lock_type() -> LockType {
+	LockType::Permit2Escrow
+}
+
+/// Flexible deserializer for LockType that accepts numbers, strings, or enum names.
+fn deserialize_lock_type_flexible<'de, D>(deserializer: D) -> Result<LockType, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	use serde::de::Visitor;
+
+	struct LockTypeVisitor;
+
+	impl Visitor<'_> for LockTypeVisitor {
+		type Value = LockType;
+
+		fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+			formatter.write_str("a number, string, or null for LockType")
+		}
+
+		fn visit_u64<E>(self, value: u64) -> Result<LockType, E>
+		where
+			E: Error,
+		{
+			if value <= 255 {
+				LockType::from_u8(value as u8)
+					.ok_or_else(|| Error::custom("Invalid LockType value"))
+			} else {
+				Err(Error::custom("LockType value out of range"))
+			}
+		}
+
+		fn visit_str<E>(self, value: &str) -> Result<LockType, E>
+		where
+			E: Error,
+		{
+			if let Ok(num) = value.parse::<u8>() {
+				LockType::from_u8(num).ok_or_else(|| Error::custom("Invalid LockType value"))
+			} else {
+				// Try parsing as enum variant name
+				match value {
+					"permit2_escrow" | "Permit2Escrow" => Ok(LockType::Permit2Escrow),
+					"eip3009_escrow" | "Eip3009Escrow" => Ok(LockType::Eip3009Escrow),
+					"compact_resource_lock" | "ResourceLock" => Ok(LockType::ResourceLock),
+					_ => Err(Error::custom("Invalid LockType string")),
+				}
+			}
+		}
+
+		fn visit_none<E>(self) -> Result<LockType, E>
+		where
+			E: Error,
+		{
+			Ok(default_lock_type())
+		}
+	}
+
+	deserializer.deserialize_any(LockTypeVisitor)
+}
+
+/// API error types as an enum for compile-time safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ApiErrorType {
+	// Order validation errors
+	MissingOrderBytes,
+	InvalidHexEncoding,
+	OrderValidationFailed,
+
+	// Quote errors
+	QuoteNotFound,
+	QuoteProcessingFailed,
+	QuoteConversionFailed,
+	MissingSignature,
+	InvalidRequest,
+	UnsupportedAsset,
+	UnsupportedSettlement,
+	InsufficientLiquidity,
+	SolverCapacityExceeded,
+
+	// Order retrieval errors
+	OrderNotFound,
+	InvalidOrderId,
+
+	// Discovery service errors
+	DiscoveryServiceNotConfigured,
+	DiscoveryServiceUnavailable,
+	DiscoveryServiceError,
+
+	// Solver address errors
+	SolverAddressError,
+
+	// Cost estimation errors
+	NoOutputs,
+	MissingChainId,
+	GasEstimationFailed,
+	CostCalculationFailed,
+	InsufficientProfitability,
+
+	// Transaction generation errors
+	SerializationFailed,
+	FillTxGenerationFailed,
+	ClaimTxGenerationFailed,
+
+	// Generic errors for extensibility
+	ValidationError,
+	ProcessingError,
+	ServiceError,
+	InternalError,
+	Unknown,
+}
+
+impl fmt::Display for ApiErrorType {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		// Use serde to get the SCREAMING_SNAKE_CASE representation
+		let json_str = serde_json::to_string(self).map_err(|_| fmt::Error)?;
+		// Remove quotes from JSON string
+		write!(f, "{}", json_str.trim_matches('"'))
+	}
+}
 
 /// Asset amount representation using ERC-7930 interoperable address format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +170,7 @@ pub struct Lock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LockKind {
+	#[serde(alias = "TheCompact", alias = "the_compact")]
 	TheCompact,
 }
 
@@ -142,9 +283,60 @@ pub struct Quote {
 	pub provider: String, // not used by the solver, only relevant for the aggregator
 	/// Cost breakdown
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub cost: Option<QuoteCost>,
+	pub cost: Option<CostEstimate>,
 	// Using LockType
 	pub lock_type: String,
+}
+
+/// Implementation to convert Quote with signature and standard to IntentRequest
+#[cfg(feature = "oif-interfaces")]
+impl TryFrom<(&Quote, &str, &str)> for IntentRequest {
+	type Error = Box<dyn std::error::Error>;
+
+	fn try_from((quote, signature, standard): (&Quote, &str, &str)) -> Result<Self, Self::Error> {
+		match standard {
+			"eip7683" => Self::from_eip7683_quote(quote, signature),
+			_ => Err(format!("Unsupported standard: {}", standard).into()),
+		}
+	}
+}
+
+#[cfg(feature = "oif-interfaces")]
+impl IntentRequest {
+	/// Main conversion function from EIP-7683 quote to IntentRequest
+	fn from_eip7683_quote(
+		quote: &Quote,
+		signature: &str,
+	) -> Result<Self, Box<dyn std::error::Error>> {
+		use crate::standards::eip7683::interfaces::StandardOrder;
+		use alloy_primitives::Bytes;
+		use alloy_sol_types::SolType;
+
+		// Use the unified TryFrom implementation that handles all order types automatically
+		let sol_order = StandardOrder::try_from(quote)?;
+
+		// Extract the user address from the order
+		let user_address = sol_order.user;
+
+		// Encode the order
+		let encoded_order = StandardOrder::abi_encode(&sol_order);
+
+		// Parse lock_type
+		let lock_type = quote
+			.lock_type
+			.parse::<LockType>()
+			.unwrap_or_else(|_| LockType::default());
+
+		// Create final IntentRequest
+		tracing::debug!("Creating IntentRequest with lock_type: {:?}", lock_type);
+		let signature_bytes = Bytes::from(hex::decode(signature.trim_start_matches("0x"))?);
+		Ok(IntentRequest {
+			order: Bytes::from(encoded_order),
+			sponsor: user_address,
+			signature: signature_bytes,
+			lock_type,
+		})
+	}
 }
 
 /// Settlement mechanism types.
@@ -188,24 +380,27 @@ pub struct ErrorResponse {
 pub enum APIError {
 	/// Bad request with validation errors (400)
 	BadRequest {
-		error_type: String,
+		error_type: ApiErrorType,
 		message: String,
 		details: Option<serde_json::Value>,
 	},
 	/// Unprocessable entity for business logic failures (422)
 	UnprocessableEntity {
-		error_type: String,
+		error_type: ApiErrorType,
 		message: String,
 		details: Option<serde_json::Value>,
 	},
 	/// Service unavailable with optional retry information (503)
 	ServiceUnavailable {
-		error_type: String,
+		error_type: ApiErrorType,
 		message: String,
 		retry_after: Option<u64>,
 	},
 	/// Internal server error (500)
-	InternalServerError { error_type: String, message: String },
+	InternalServerError {
+		error_type: ApiErrorType,
+		message: String,
+	},
 }
 
 impl APIError {
@@ -227,7 +422,7 @@ impl APIError {
 				message,
 				details,
 			} => ErrorResponse {
-				error: error_type.clone(),
+				error: error_type.to_string(),
 				message: message.clone(),
 				details: details.clone(),
 				retry_after: None,
@@ -237,7 +432,7 @@ impl APIError {
 				message,
 				details,
 			} => ErrorResponse {
-				error: error_type.clone(),
+				error: error_type.to_string(),
 				message: message.clone(),
 				details: details.clone(),
 				retry_after: None,
@@ -247,7 +442,7 @@ impl APIError {
 				message,
 				retry_after,
 			} => ErrorResponse {
-				error: error_type.clone(),
+				error: error_type.to_string(),
 				message: message.clone(),
 				details: None,
 				retry_after: *retry_after,
@@ -256,7 +451,7 @@ impl APIError {
 				error_type,
 				message,
 			} => ErrorResponse {
-				error: error_type.clone(),
+				error: error_type.to_string(),
 				message: message.clone(),
 				details: None,
 				retry_after: None,
@@ -343,32 +538,32 @@ impl From<QuoteError> for APIError {
 	fn from(quote_error: QuoteError) -> Self {
 		match quote_error {
 			QuoteError::InvalidRequest(msg) => APIError::BadRequest {
-				error_type: "INVALID_REQUEST".to_string(),
+				error_type: ApiErrorType::InvalidRequest,
 				message: msg,
 				details: None,
 			},
 			QuoteError::UnsupportedAsset(asset) => APIError::UnprocessableEntity {
-				error_type: "UNSUPPORTED_ASSET".to_string(),
+				error_type: ApiErrorType::UnsupportedAsset,
 				message: format!("Asset not supported by solver: {}", asset),
 				details: Some(serde_json::json!({ "asset": asset })),
 			},
 			QuoteError::UnsupportedSettlement(msg) => APIError::UnprocessableEntity {
-				error_type: "UNSUPPORTED_SETTLEMENT".to_string(),
+				error_type: ApiErrorType::UnsupportedSettlement,
 				message: msg,
 				details: None,
 			},
 			QuoteError::InsufficientLiquidity => APIError::UnprocessableEntity {
-				error_type: "INSUFFICIENT_LIQUIDITY".to_string(),
+				error_type: ApiErrorType::InsufficientLiquidity,
 				message: "Insufficient liquidity available for the requested amount".to_string(),
 				details: None,
 			},
 			QuoteError::SolverCapacityExceeded => APIError::ServiceUnavailable {
-				error_type: "SOLVER_CAPACITY_EXCEEDED".to_string(),
+				error_type: ApiErrorType::SolverCapacityExceeded,
 				message: "Solver capacity exceeded, please try again later".to_string(),
 				retry_after: Some(60), // Suggest retry after 60 seconds
 			},
 			QuoteError::Internal(msg) => APIError::InternalServerError {
-				error_type: "INTERNAL_ERROR".to_string(),
+				error_type: ApiErrorType::InternalError,
 				message: format!("An internal error occurred: {}", msg),
 			},
 		}
@@ -391,207 +586,55 @@ impl From<GetOrderError> for APIError {
 	fn from(order_error: GetOrderError) -> Self {
 		match order_error {
 			GetOrderError::NotFound(id) => APIError::BadRequest {
-				error_type: "ORDER_NOT_FOUND".to_string(),
+				error_type: ApiErrorType::OrderNotFound,
 				message: format!("Order not found: {}", id),
 				details: Some(serde_json::json!({ "order_id": id })),
 			},
 			GetOrderError::InvalidId(id) => APIError::BadRequest {
-				error_type: "INVALID_ORDER_ID".to_string(),
+				error_type: ApiErrorType::InvalidOrderId,
 				message: format!("Invalid order ID format: {}", id),
 				details: Some(serde_json::json!({ "provided_id": id })),
 			},
 			GetOrderError::Internal(msg) => APIError::InternalServerError {
-				error_type: "INTERNAL_ERROR".to_string(),
+				error_type: ApiErrorType::InternalError,
 				message: format!("An internal error occurred: {}", msg),
 			},
 		}
 	}
 }
 
-/// A tuple combining Quote and signature for intent request conversion
-#[cfg(feature = "oif-interfaces")]
-pub struct QuoteWithSignature<'a> {
-	pub quote: &'a Quote,
-	pub signature: &'a str,
+/// Trait for converting quotes to orders for gas estimation.
+/// Each order standard should implement this trait to provide
+/// accurate gas estimation based on its specific data structures.
+pub trait QuoteParsable {
+	/// Convert a Quote to an Order suitable for gas estimation.
+	/// The returned Order should have the proper standard-specific
+	/// data structure to enable accurate transaction generation.
+	fn quote_to_order_for_estimation(quote: &Quote) -> crate::Order;
 }
 
-#[cfg(feature = "oif-interfaces")]
-impl<'a> From<(&'a Quote, &'a str)> for QuoteWithSignature<'a> {
-	fn from((quote, signature): (&'a Quote, &'a str)) -> Self {
-		Self { quote, signature }
-	}
-}
-
-#[cfg(feature = "oif-interfaces")]
-impl TryFrom<QuoteWithSignature<'_>> for serde_json::Value {
-	type Error = Box<dyn std::error::Error>;
-
-	fn try_from(quote_with_sig: QuoteWithSignature<'_>) -> Result<Self, Self::Error> {
-		use crate::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
-		use crate::standards::eip7930::InteropAddress;
-		use alloy_primitives::{Address, U256};
-		use alloy_sol_types::SolType;
-
-		// Extract user address from the first available input
-		let user_str = &quote_with_sig
-			.quote
-			.details
-			.available_inputs
-			.first()
-			.ok_or("Quote must have at least one available input")?
-			.user;
-		let interop_address = InteropAddress::from_hex(&user_str.to_string())?;
-		let user_address = interop_address.ethereum_address()?;
-
-		// Extract order data from quote
-		let quote_order = quote_with_sig
-			.quote
-			.orders
-			.first()
-			.ok_or("Quote must contain at least one order")?;
-		let message_data = quote_order
-			.message
-			.as_object()
-			.ok_or("Invalid EIP-712 message structure")?;
-		let eip712_data = message_data
-			.get("eip712")
-			.and_then(|e| e.as_object())
-			.ok_or("Missing 'eip712' object in message")?;
-
-		// Extract nonce
-		let nonce_str = eip712_data
-			.get("nonce")
-			.and_then(|n| n.as_str())
-			.ok_or("Missing nonce in EIP-712 data")?;
-		let nonce = U256::from_str_radix(nonce_str, 10)?;
-
-		// Extract witness data
-		let witness = eip712_data
-			.get("witness")
-			.and_then(|w| w.as_object())
-			.ok_or("Missing 'witness' object in EIP-712 message")?;
-
-		// Get origin chain ID
-		let origin_chain_id = U256::from(interop_address.ethereum_chain_id()?);
-
-		// Extract timing data
-		let expires = witness
-			.get("expires")
-			.and_then(|e| e.as_u64())
-			.unwrap_or(quote_with_sig.quote.valid_until.unwrap_or(0)) as u32;
-		let fill_deadline = expires;
-
-		// Extract input oracle
-		let input_oracle_str = witness
-			.get("inputOracle")
-			.and_then(|o| o.as_str())
-			.ok_or("Missing 'inputOracle' in witness data")?;
-		let input_oracle =
-			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
-
-		// Extract input data from permitted array
-		let permitted = eip712_data
-			.get("permitted")
-			.and_then(|p| p.as_array())
-			.ok_or("Missing permitted array in EIP-712 data")?;
-		let first_permitted = permitted
-			.first()
-			.ok_or("Empty permitted array in EIP-712 data")?;
-
-		let input_amount_str = first_permitted
-			.get("amount")
-			.and_then(|a| a.as_str())
-			.ok_or("Missing amount in permitted token")?;
-		let input_amount = U256::from_str_radix(input_amount_str, 10)?;
-
-		let input_token_str = first_permitted
-			.get("token")
-			.and_then(|t| t.as_str())
-			.ok_or("Missing token in permitted array")?;
-		let input_token =
-			Address::from_slice(&hex::decode(input_token_str.trim_start_matches("0x"))?);
-
-		// Convert input token address to U256
-		let mut token_bytes = [0u8; 32];
-		token_bytes[12..32].copy_from_slice(&input_token.0 .0);
-		let input_token_u256 = U256::from_be_bytes(token_bytes);
-		let inputs = vec![[input_token_u256, input_amount]];
-
-		// Extract outputs from witness
-		let default_outputs = Vec::new();
-		let witness_outputs = witness
-			.get("outputs")
-			.and_then(|o| o.as_array())
-			.unwrap_or(&default_outputs);
-
-		// Parse outputs with proper helper function for hex parsing
-
-		let mut sol_outputs = Vec::new();
-		for output_item in witness_outputs {
-			if let Some(output_obj) = output_item.as_object() {
-				let chain_id = output_obj
-					.get("chainId")
-					.and_then(|c| c.as_u64())
-					.unwrap_or(0);
-				let amount_str = output_obj
-					.get("amount")
-					.and_then(|a| a.as_str())
-					.unwrap_or("0");
-				let token_str = output_obj.get("token").and_then(|t| t.as_str()).unwrap();
-				let recipient_str = output_obj
-					.get("recipient")
-					.and_then(|r| r.as_str())
-					.unwrap();
-				let oracle_str = output_obj.get("oracle").and_then(|o| o.as_str()).unwrap();
-				let settler_str = output_obj.get("settler").and_then(|s| s.as_str()).unwrap();
-
-				if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
-					let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
-					let recipient_bytes =
-						parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
-					let oracle_bytes = parse_bytes32_from_hex(oracle_str).unwrap_or([0u8; 32]);
-					let settler_bytes = parse_bytes32_from_hex(settler_str).unwrap_or([0u8; 32]);
-
-					sol_outputs.push(SolMandateOutput {
-						oracle: oracle_bytes.into(),
-						settler: settler_bytes.into(),
-						chainId: U256::from(chain_id),
-						token: token_bytes.into(),
-						amount,
-						recipient: recipient_bytes.into(),
-						call: Vec::new().into(),
-						context: Vec::new().into(),
-					});
-				}
-			}
+impl Quote {
+	/// Convert the quote to an order for gas estimation based on the standard.
+	/// This method dispatches to the appropriate standard-specific implementation.
+	pub fn to_order_for_estimation(
+		&self,
+		standard: &str,
+	) -> Result<crate::Order, Box<dyn std::error::Error>> {
+		match standard {
+			#[cfg(feature = "oif-interfaces")]
+			"eip7683" => {
+				// Use the EIP-7683 implementation of QuoteParsable
+				Ok(crate::Eip7683OrderData::quote_to_order_for_estimation(self))
+			},
+			_ => Err(format!(
+				"Unsupported order standard for quote conversion: {}",
+				standard
+			)
+			.into()),
 		}
-
-		// Create and encode the StandardOrder
-		let sol_order = StandardOrder {
-			user: user_address,
-			nonce,
-			originChainId: origin_chain_id,
-			expires,
-			fillDeadline: fill_deadline,
-			inputOracle: input_oracle,
-			inputs,
-			outputs: sol_outputs,
-		};
-
-		// ABI encode the StandardOrder
-		let encoded_order = StandardOrder::abi_encode(&sol_order);
-
-		// Create IntentRequest
-		let intent_request = serde_json::json!({
-			"order": format!("0x{}", hex::encode(&encoded_order)),
-			"sponsor": format!("{:#x}", user_address),
-			"signature": quote_with_sig.signature,
-			"lockType": quote_with_sig.quote.lock_type.clone()
-		});
-
-		Ok(intent_request)
 	}
 }
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -898,28 +941,28 @@ mod tests {
 	#[test]
 	fn test_api_error_status_codes() {
 		let bad_request = APIError::BadRequest {
-			error_type: "TEST_ERROR".to_string(),
+			error_type: ApiErrorType::ValidationError,
 			message: "Test message".to_string(),
 			details: None,
 		};
 		assert_eq!(bad_request.status_code(), 400);
 
 		let unprocessable = APIError::UnprocessableEntity {
-			error_type: "TEST_ERROR".to_string(),
+			error_type: ApiErrorType::ProcessingError,
 			message: "Test message".to_string(),
 			details: None,
 		};
 		assert_eq!(unprocessable.status_code(), 422);
 
 		let unavailable = APIError::ServiceUnavailable {
-			error_type: "TEST_ERROR".to_string(),
+			error_type: ApiErrorType::ServiceError,
 			message: "Test message".to_string(),
 			retry_after: Some(30),
 		};
 		assert_eq!(unavailable.status_code(), 503);
 
 		let internal_error = APIError::InternalServerError {
-			error_type: "TEST_ERROR".to_string(),
+			error_type: ApiErrorType::InternalError,
 			message: "Test message".to_string(),
 		};
 		assert_eq!(internal_error.status_code(), 500);
@@ -928,7 +971,7 @@ mod tests {
 	#[test]
 	fn test_api_error_to_error_response() {
 		let api_error = APIError::BadRequest {
-			error_type: "VALIDATION_ERROR".to_string(),
+			error_type: ApiErrorType::ValidationError,
 			message: "Invalid input".to_string(),
 			details: Some(serde_json::json!({"field": "amount"})),
 		};
@@ -940,7 +983,7 @@ mod tests {
 		assert_eq!(error_response.retry_after, None);
 
 		let service_unavailable = APIError::ServiceUnavailable {
-			error_type: "RATE_LIMITED".to_string(),
+			error_type: ApiErrorType::ServiceError,
 			message: "Too many requests".to_string(),
 			retry_after: Some(120),
 		};
@@ -955,7 +998,7 @@ mod tests {
 		let errors = [
 			(
 				APIError::BadRequest {
-					error_type: "TEST".to_string(),
+					error_type: ApiErrorType::ValidationError,
 					message: "Bad request message".to_string(),
 					details: None,
 				},
@@ -963,7 +1006,7 @@ mod tests {
 			),
 			(
 				APIError::UnprocessableEntity {
-					error_type: "TEST".to_string(),
+					error_type: ApiErrorType::ProcessingError,
 					message: "Unprocessable message".to_string(),
 					details: None,
 				},
@@ -971,7 +1014,7 @@ mod tests {
 			),
 			(
 				APIError::ServiceUnavailable {
-					error_type: "TEST".to_string(),
+					error_type: ApiErrorType::ServiceError,
 					message: "Service unavailable message".to_string(),
 					retry_after: None,
 				},
@@ -979,7 +1022,7 @@ mod tests {
 			),
 			(
 				APIError::InternalServerError {
-					error_type: "TEST".to_string(),
+					error_type: ApiErrorType::InternalError,
 					message: "Internal error message".to_string(),
 				},
 				"Internal Server Error: Internal error message",
@@ -1155,7 +1198,7 @@ mod tests {
 		assert!(debug_str.contains("TheCompact"));
 
 		let api_error = APIError::BadRequest {
-			error_type: "TEST".to_string(),
+			error_type: ApiErrorType::ValidationError,
 			message: "Test message".to_string(),
 			details: None,
 		};

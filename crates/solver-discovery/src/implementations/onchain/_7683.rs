@@ -8,7 +8,8 @@ use alloy_primitives::{Address as AlloyAddress, Log as PrimLog, LogData};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_pubsub::PubSubFrontend;
 use alloy_rpc_types::{Filter, Log};
-use alloy_sol_types::{sol, SolEvent, SolValue};
+use alloy_sol_types::sol;
+use alloy_sol_types::{SolEvent, SolValue};
 use alloy_transport_http::Http;
 use alloy_transport_ws::WsConnect;
 use async_trait::async_trait;
@@ -25,9 +26,10 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
 
-// Solidity type definitions for the OIF contracts.
+// Event definition for the OIF contracts.
 //
-// These types match the on-chain contract ABI for proper event decoding.
+// We need to redefine the types here because sol! macro doesn't support external type references.
+// These match the types in solver_types::standards::eip7683::interfaces.
 sol! {
 	/// MandateOutput specification for cross-chain orders.
 	struct SolMandateOutput {
@@ -54,8 +56,8 @@ sol! {
 	}
 
 	/// Event emitted when a new order is opened.
-	/// The order parameter contains the encoded StandardOrder.
-	event Open(bytes32 indexed orderId, bytes order);
+	/// The order parameter is the StandardOrder struct (not indexed).
+	event Open(bytes32 indexed orderId, StandardOrder order);
 }
 
 const DEFAULT_POLLING_INTERVAL_SECS: u64 = 3;
@@ -213,12 +215,7 @@ impl Eip7683Discovery {
 		})?;
 
 		let order_id = open_event.orderId;
-		let order_bytes = &open_event.order;
-
-		// Decode the StandardOrder from bytes
-		let order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
-			DiscoveryError::ParseError(format!("Failed to decode StandardOrder: {}", e))
-		})?;
+		let order = open_event.order.clone();
 
 		// Validate that order has outputs
 		if order.outputs.is_empty() {
@@ -253,8 +250,7 @@ impl Eip7683Discovery {
 					context: output.context.clone().into(),
 				})
 				.collect::<Vec<_>>(),
-			// Store the raw order data for reference
-			raw_order_data: Some(with_0x_prefix(&hex::encode(order_bytes))),
+			raw_order_data: Some(with_0x_prefix(&hex::encode(order.abi_encode()))),
 			signature: None,
 			sponsor: None,
 			lock_type: Some(LockType::Permit2Escrow),
@@ -698,12 +694,15 @@ mod tests {
 	fn create_test_open_log() -> Log {
 		let order = create_test_standard_order();
 		let order_id = B256::from([9u8; 32]);
-		let order_bytes = order.abi_encode();
 
-		// For the Open event: only orderId is indexed, order bytes go in data
-		// The data should be ABI-encoded as a single bytes parameter
-		use alloy_sol_types::SolType;
-		let event_data = alloy_sol_types::sol_data::Bytes::abi_encode(&order_bytes);
+		let open_event = Open {
+			orderId: order_id,
+			order,
+		};
+
+		// Encode the event data (only non-indexed parameters)
+		use alloy_sol_types::SolEvent;
+		let event_data = open_event.encode_data();
 
 		Log {
 			inner: alloy_primitives::Log {
@@ -824,11 +823,15 @@ mod tests {
 		order.outputs = vec![];
 
 		let order_id = B256::from([9u8; 32]);
-		let order_bytes = order.abi_encode();
 
-		// Use proper ABI encoding for the event data (same as create_test_open_log)
-		use alloy_sol_types::SolType;
-		let event_data = alloy_sol_types::sol_data::Bytes::abi_encode(&order_bytes);
+		let open_event = Open {
+			orderId: order_id,
+			order,
+		};
+
+		// Encode the event data (only non-indexed parameters)
+		use alloy_sol_types::SolEvent;
+		let event_data = open_event.encode_data();
 
 		let log = Log {
 			inner: alloy_primitives::Log {

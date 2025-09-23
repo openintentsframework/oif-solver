@@ -43,7 +43,8 @@ pub mod pricing;
 // Re-export all types for convenient access
 pub use account::*;
 pub use api::*;
-pub use auth::{AuthConfig, AuthScope, JwtClaims};
+pub use auth::{AuthConfig, AuthScope, JwtClaims, RefreshTokenData};
+pub use costs::{CostComponent, CostEstimate};
 pub use delivery::*;
 pub use discovery::*;
 pub use events::*;
@@ -61,5 +62,6 @@ pub use utils::{
 	bytes32_to_address, current_timestamp, format_token_amount, normalize_bytes32_address,
 	parse_address, truncate_id, wei_string_to_eth_string, with_0x_prefix, without_0x_prefix,
 	DEFAULT_GAS_PRICE_WEI, MOCK_ETH_SOL_PRICE, MOCK_ETH_USD_PRICE, MOCK_SOL_USD_PRICE,
+	MOCK_TOKA_USD_PRICE, MOCK_TOKB_USD_PRICE,
 };
 pub use validation::*;

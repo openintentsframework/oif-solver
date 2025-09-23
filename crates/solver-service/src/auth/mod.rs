@@ -9,6 +9,7 @@ use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use solver_types::{AuthConfig, AuthScope, JwtClaims};
 use thiserror::Error;
+use uuid::Uuid;
 
 pub use middleware::{auth_middleware, AuthState};
 
@@ -20,8 +21,12 @@ pub enum AuthError {
 	TokenGeneration(String),
 
 	/// The provided token is invalid
-	#[error("Invalid token: {0}")]
-	InvalidToken(String),
+	#[error("Invalid access token: {0}")]
+	InvalidAccessToken(String),
+
+	/// The provided refresh token is invalid or expired
+	#[error("Invalid refresh token: {0}")]
+	InvalidRefreshToken(String),
 }
 
 /// Service for handling JWT token generation and validation.
@@ -54,7 +59,7 @@ impl JwtService {
 		})
 	}
 
-	/// Generates a new JWT token for a client with specified scopes.
+	/// Generates a new access token for a client with specified scopes.
 	///
 	/// # Arguments
 	/// * `client_id` - Unique identifier for the client
@@ -62,14 +67,13 @@ impl JwtService {
 	/// * `custom_expiry_hours` - Optional custom expiry time in hours
 	///
 	/// # Returns
-	/// A signed JWT token string or an error
-	pub fn generate_token(
+	/// A signed JWT access token string or an error
+	pub fn generate_access_token(
 		&self,
 		client_id: &str,
 		scopes: Vec<AuthScope>,
-		custom_expiry_hours: Option<u32>,
 	) -> Result<String, AuthError> {
-		let expiry_hours = custom_expiry_hours.unwrap_or(self.config.token_expiry_hours);
+		let expiry_hours = self.config.access_token_expiry_hours;
 
 		let claims = JwtClaims {
 			sub: client_id.to_string(),
@@ -94,17 +98,89 @@ impl JwtService {
 	pub fn validate_token(&self, token: &str) -> Result<JwtClaims, AuthError> {
 		// Decode and validate the token
 		let token_data = decode::<JwtClaims>(token, &self.decoding_key, &self.validation)
-			.map_err(|e| AuthError::InvalidToken(e.to_string()))?;
+			.map_err(|e| AuthError::InvalidAccessToken(e.to_string()))?;
 
 		let claims = token_data.claims;
 
 		// Check if token is expired (jsonwebtoken handles this, but we can double-check)
 		let now = Utc::now().timestamp();
 		if claims.exp < now {
-			return Err(AuthError::InvalidToken("Token expired".to_string()));
+			return Err(AuthError::InvalidAccessToken("Token expired".to_string()));
 		}
 
 		Ok(claims)
+	}
+
+	/// Generates a JWT refresh token
+	///
+	/// # Arguments
+	/// * `client_id` - Unique identifier for the client
+	/// * `scopes` - List of permissions to grant
+	///
+	/// # Returns
+	/// A JWT refresh token string or an error
+	pub async fn generate_refresh_token(
+		&self,
+		client_id: &str,
+		scopes: Vec<AuthScope>,
+	) -> Result<String, AuthError> {
+		let now = Utc::now().timestamp();
+		let expires_at = now + (self.config.refresh_token_expiry_hours as i64 * 3600);
+
+		// Create JWT refresh token with all necessary claims
+		let claims = JwtClaims {
+			sub: client_id.to_string(),
+			exp: expires_at,
+			iat: now,
+			iss: self.config.issuer.clone(),
+			scope: scopes,
+			nonce: Some(Uuid::new_v4().to_string()), // Unique nonce for each refresh token
+		};
+
+		// Generate and return the JWT refresh token
+		encode(&Header::default(), &claims, &self.encoding_key)
+			.map_err(|e| AuthError::TokenGeneration(e.to_string()))
+	}
+
+	/// Validates a JWT refresh token and returns new access and refresh tokens.
+	///
+	/// # Arguments
+	/// * `refresh_token` - The JWT refresh token to validate
+	///
+	/// # Returns
+	/// A tuple of (access_token, new_refresh_token) or an error
+	pub async fn refresh_access_token(
+		&self,
+		refresh_token: &str,
+	) -> Result<(String, String), AuthError> {
+		// Decode and validate the JWT refresh token
+		let token_data = decode::<JwtClaims>(refresh_token, &self.decoding_key, &self.validation)
+			.map_err(|e| AuthError::InvalidRefreshToken(e.to_string()))?;
+
+		let claims = token_data.claims;
+
+		// Check if token is expired
+		let now = Utc::now().timestamp();
+		if claims.exp <= now {
+			return Err(AuthError::InvalidRefreshToken(
+				"Refresh token expired".to_string(),
+			));
+		}
+
+		// Generate new access token using the claims from the refresh token
+		let access_token = self.generate_access_token(&claims.sub, claims.scope.clone())?;
+
+		// Generate new refresh token (token rotation for security)
+		let new_refresh_token = self
+			.generate_refresh_token(&claims.sub, claims.scope)
+			.await?;
+
+		Ok((access_token, new_refresh_token))
+	}
+
+	/// Returns a reference to the auth configuration.
+	pub fn config(&self) -> &AuthConfig {
+		&self.config
 	}
 
 	/// Checks if the provided claims have the required scope.
@@ -129,32 +205,10 @@ mod tests {
 		AuthConfig {
 			enabled: true,
 			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars-long"),
-			token_expiry_hours: 24,
+			access_token_expiry_hours: 1,
+			refresh_token_expiry_hours: 720,
 			issuer: "test-issuer".to_string(),
 		}
-	}
-
-	#[test]
-	fn test_jwt_generation_and_validation() {
-		let service = JwtService::new(test_config()).unwrap();
-
-		// Generate token
-		let token = service
-			.generate_token(
-				"test-client",
-				vec![AuthScope::ReadOrders, AuthScope::CreateQuotes],
-				None,
-			)
-			.unwrap();
-
-		// Validate token
-		let claims = service.validate_token(&token).unwrap();
-
-		assert_eq!(claims.sub, "test-client");
-		assert_eq!(claims.iss, "test-issuer");
-		assert_eq!(claims.scope.len(), 2);
-		assert!(claims.scope.contains(&AuthScope::ReadOrders));
-		assert!(claims.scope.contains(&AuthScope::CreateQuotes));
 	}
 
 	#[test]
@@ -195,24 +249,88 @@ mod tests {
 		));
 	}
 
-	#[test]
-	fn test_expired_token() {
+	#[tokio::test]
+	async fn test_refresh_token_generation_and_validation() {
 		let service = JwtService::new(test_config()).unwrap();
 
-		// Generate token with 0 hours expiry
-		let token = service
-			.generate_token(
-				"test-client",
-				vec![AuthScope::ReadOrders],
-				Some(0), // Expires immediately
-			)
+		// Generate refresh token
+		let refresh_token = service
+			.generate_refresh_token("test-client", vec![AuthScope::ReadOrders])
+			.await
 			.unwrap();
 
-		// Sleep for a moment to ensure expiry
-		std::thread::sleep(std::time::Duration::from_secs(2));
+		// Verify the refresh token is a valid JWT
+		let refresh_claims = service.validate_token(&refresh_token).unwrap();
+		assert_eq!(refresh_claims.sub, "test-client");
+		assert_eq!(refresh_claims.scope, vec![AuthScope::ReadOrders]);
 
-		let result = service.validate_token(&token);
+		// Refresh the access token
+		let (access_token, new_refresh_token) =
+			service.refresh_access_token(&refresh_token).await.unwrap();
+
+		// Validate the new access token
+		let access_claims = service.validate_token(&access_token).unwrap();
+		assert_eq!(access_claims.sub, "test-client");
+		assert_eq!(access_claims.scope, vec![AuthScope::ReadOrders]);
+
+		// Ensure refresh tokens are different (token rotation)
+		assert_ne!(refresh_token, new_refresh_token);
+
+		// Verify old refresh token can still be used (JWT-based, no single-use restriction)
+		let result = service.refresh_access_token(&refresh_token).await;
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_refresh_token_expiry() {
+		let mut config = test_config();
+		config.refresh_token_expiry_hours = 0; // Expired immediately for testing
+		let service = JwtService::new(config).unwrap();
+
+		let refresh_token = service
+			.generate_refresh_token("test-client", vec![AuthScope::ReadOrders])
+			.await
+			.unwrap();
+
+		// Wait a moment to ensure expiry
+		tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+		let result = service.refresh_access_token(&refresh_token).await;
 		assert!(result.is_err());
 		assert!(result.unwrap_err().to_string().contains("expired"));
+	}
+
+	#[tokio::test]
+	async fn test_refresh_token_rotation() {
+		let service = JwtService::new(test_config()).unwrap();
+
+		// Generate initial refresh token
+		let initial_token = service
+			.generate_refresh_token("client1", vec![AuthScope::ReadOrders])
+			.await
+			.unwrap();
+
+		// First refresh - get new tokens
+		let (access_token1, refresh_token1) =
+			service.refresh_access_token(&initial_token).await.unwrap();
+
+		// Add small delay to ensure different timestamps
+		tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+		// Second refresh - get different tokens (token rotation)
+		let (access_token2, refresh_token2) =
+			service.refresh_access_token(&refresh_token1).await.unwrap();
+
+		// Verify refresh tokens are different (rotation working)
+		assert_ne!(initial_token, refresh_token1);
+		assert_ne!(refresh_token1, refresh_token2);
+
+		// Access tokens should also be different due to different timestamps
+		assert_ne!(access_token1, access_token2);
+
+		// Verify all refresh tokens still work (JWT-based, stateless)
+		assert!(service.refresh_access_token(&initial_token).await.is_ok());
+		assert!(service.refresh_access_token(&refresh_token1).await.is_ok());
+		assert!(service.refresh_access_token(&refresh_token2).await.is_ok());
 	}
 }

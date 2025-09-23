@@ -36,34 +36,63 @@
 # Global State Management
 # -----------------------------------------------------------------------------
 # Intent status tracking - stores state from last intent operation
-declare -gA INTENT_STATUS
-INTENT_STATUS[last_order_id]=""
-INTENT_STATUS[last_tx_hash]=""
-INTENT_STATUS[last_signature]=""
-INTENT_STATUS[last_lock_type]=""
+# Using regular variables
+INTENT_STATUS_last_order_id=""
+INTENT_STATUS_last_tx_hash=""
+INTENT_STATUS_last_signature=""
+INTENT_STATUS_last_lock_type=""
 
 # -----------------------------------------------------------------------------
 # Status Management Functions
 # -----------------------------------------------------------------------------
 # Clear intent status
 clear_intent_status() {
-    INTENT_STATUS[last_order_id]=""
-    INTENT_STATUS[last_tx_hash]=""
-    INTENT_STATUS[last_signature]=""
-    INTENT_STATUS[last_lock_type]=""
+    INTENT_STATUS_last_order_id=""
+    INTENT_STATUS_last_tx_hash=""
+    INTENT_STATUS_last_signature=""
+    INTENT_STATUS_last_lock_type=""
 }
 
 # Get intent status field
 get_intent_status() {
     local field="$1"
-    echo "${INTENT_STATUS[$field]}"
+    case "$field" in
+        "last_order_id")
+            echo "$INTENT_STATUS_last_order_id"
+            ;;
+        "last_tx_hash")
+            echo "$INTENT_STATUS_last_tx_hash"
+            ;;
+        "last_signature")
+            echo "$INTENT_STATUS_last_signature"
+            ;;
+        "last_lock_type")
+            echo "$INTENT_STATUS_last_lock_type"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
 }
 
 # Set intent status field
 set_intent_status() {
     local field="$1"
     local value="$2"
-    INTENT_STATUS[$field]="$value"
+    case "$field" in
+        "last_order_id")
+            INTENT_STATUS_last_order_id="$value"
+            ;;
+        "last_tx_hash")
+            INTENT_STATUS_last_tx_hash="$value"
+            ;;
+        "last_signature")
+            INTENT_STATUS_last_signature="$value"
+            ;;
+        "last_lock_type")
+            INTENT_STATUS_last_lock_type="$value"
+            ;;
+    esac
 }
 
 # Build mandate output structure
@@ -326,7 +355,11 @@ create_eip3009_intent() {
         origin_rpc="http://localhost:8545"
     fi
     
-    local order_id=$(cast call "$input_settler" "orderIdentifier(bytes)" "$order_data" --rpc-url "$origin_rpc")
+    # Pass the StandardOrder struct directly to orderIdentifier
+    local order_identifier_sig="orderIdentifier((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))"
+    local order_id=$(cast call "$input_settler" \
+        "$order_identifier_sig" \
+        "$order_struct" --rpc-url "$origin_rpc")
     
     if [ -z "$order_id" ] || [ "$order_id" = "0x0000000000000000000000000000000000000000000000000000000000000000" ]; then
         print_error "Failed to compute order ID from contract" >&2
@@ -543,7 +576,7 @@ create_compact_intent() {
         local final_digest=$(cast keccak "0x1901${domain_separator:2}${inner_struct_hash:2}")
         
         # Return with debug info
-        echo "{\"order\":\"$order_data\",\"signature\":\"$encoded_signature\",\"lock_type\":$LOCK_TYPE_RESOURCE_LOCK,\"sponsor\":\"$user_addr\",\"_debug\":{\"witness_hash\":\"$witness_hash\",\"commitments_hash\":\"$commitments_hash_debug\",\"final_digest\":\"$final_digest\",\"sponsor_sig\":\"$compact_signature\"}}"
+        echo "{\"order\":\"$order_data\",\"signature\":\"$encoded_signature\",\"lock_type\":$LOCK_TYPE_RESOURCE_LOCK,\"sponsor\":\"$user_addr\",\"_debug\":{\"witness_hash\":\"$witness_hash\",\"commitments_hash\":\"$commitments_hash_debug\",\"final_digest\":\"$final_digest\",\"sponsor_sig\":\"$compact_signature\",\"domain_separator\":\"$domain_separator\"}}"
     else
         # Return order data and signature as JSON (normal mode)
         echo "{\"order\":\"$order_data\",\"signature\":\"$encoded_signature\",\"lock_type\":$LOCK_TYPE_RESOURCE_LOCK,\"sponsor\":\"$user_addr\"}"
@@ -630,9 +663,11 @@ create_onchain_intent() {
     
     print_success "Onchain intent created" >&2
     print_debug "Order data: $order_data" >&2
-    
-    # Return order data for onchain submission
-    echo "{\"order\":\"$order_data\",\"sponsor\":\"$user_addr\",\"input_settler\":\"$input_settler\",\"input_token\":\"$input_token\",\"input_amount\":\"$input_amount\"}"
+    print_debug "Order struct: $order_struct" >&2
+
+    # Return order data for onchain submission (signature will be generated at submission time)
+    # Include the order_struct so we don't have to decode it later
+    echo "{\"order\":\"$order_data\",\"order_struct\":\"$order_struct\",\"sponsor\":\"$user_addr\",\"input_settler\":\"$input_settler\",\"input_token\":\"$input_token\",\"input_amount\":\"$input_amount\"}"
     return 0
 }
 
@@ -646,6 +681,7 @@ submit_intent_onchain() {
     
     # Parse intent JSON to extract required fields
     local order_data=$(echo "$intent_json" | jq -r '.order')
+    local order_struct=$(echo "$intent_json" | jq -r '.order_struct // empty')
     local input_settler=$(echo "$intent_json" | jq -r '.input_settler')
     local input_token=$(echo "$intent_json" | jq -r '.input_token')
     local input_amount=$(echo "$intent_json" | jq -r '.input_amount')
@@ -701,9 +737,23 @@ submit_intent_onchain() {
     
     # Call InputSettler.open() with the order data
     print_debug "Calling InputSettler.open() with order data"
-    
-    # Use cast send with --json flag to ensure consistent output
-    local submit_tx=$(cast send "$input_settler" "open(bytes)" "$order_data" \
+
+    # Check if we have the order_struct from the JSON (for new format)
+    if [ -n "$order_struct" ] && [ "$order_struct" != "null" ] && [ "$order_struct" != "empty" ]; then
+        print_debug "Using saved order struct from intent JSON"
+        print_debug "Order struct: $order_struct"
+    else
+        # Fallback: try to decode from order_data (for backward compatibility)
+        print_error "Order struct not found in intent JSON"
+        print_info "Please rebuild the intent using the appropriate build command for your intent type."
+        return 1
+    fi
+
+    # Pass the StandardOrder struct to open
+    local open_signature="open((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))"
+    local submit_tx=$(cast send "$input_settler" \
+        "$open_signature" \
+        "$order_struct" \
         --rpc-url "$origin_rpc" \
         --private-key "$user_private_key" \
         --json 2>&1)
@@ -775,11 +825,9 @@ submit_intent_onchain() {
         local order_id=""
         local receipt=$(cast rpc eth_getTransactionReceipt "$tx_hash" --rpc-url "$origin_rpc" 2>/dev/null || echo "null")
         if [ "$receipt" != "null" ] && [ -n "$receipt" ]; then
-            # The Open event signature: Open(bytes32 indexed,address)
-            # The correct topic hash is for the event with the order ID as first indexed parameter
-            # Let's look for the InputSettler's Open event
-            # Event: Open(bytes32 indexed orderId, address indexed sender)
-            local open_event_topic="0xf04c8c2bbc4615307a4fd1bb1348feffc61a6407b1342c86f80c0ceeffd352eb"
+            # The Open event signature for new contracts: Open(bytes32 indexed orderId, StandardOrder order)
+            # Note: The StandardOrder is not indexed, so it's in the data field, not topics
+            local open_event_topic="0x9ff74bd56d00785b881ef9fa3f03d7b598686a39a9bcff89a6008db588b18a7b"
             
             # Extract order ID from the second topic (first indexed parameter)
             order_id=$(echo "$receipt" | jq -r ".logs[] | select(.topics[0] == \"$open_event_topic\") | .topics[1]" 2>/dev/null | head -n1)
@@ -846,18 +894,18 @@ submit_intent() {
     local intent_json="$1"
     local api_url="${2:-http://localhost:3000/api/orders}"
     local max_retries="${3:-3}"
-    
+
     print_info "Submitting intent to solver API"
     print_debug "API URL: $api_url"
     print_debug "Intent JSON: $intent_json"
-    
+
     # Validate intent JSON
     if ! validate_json "$intent_json"; then
         print_error "Invalid intent JSON"
         return 1
     fi
-    
-    # Submit with retry
+
+    # Submit with retry - api_post_retry will automatically handle JWT authentication via jwt_ensure_token
     if api_post_retry "$api_url" "$intent_json" "" "$max_retries"; then
         local status_code=$(get_api_response "status_code")
         local response_body=$(get_api_response "body")
@@ -908,7 +956,7 @@ submit_escrow_intent() {
     # Get contract addresses from config
     local input_settler=$(config_get_network "$origin_chain_id" "input_settler_address")
     local output_settler=$(config_get_network "$dest_chain_id" "output_settler_address")
-    local input_oracle=$(config_get_network "$origin_chain_id" "input_oracle_address")
+    local input_oracle=$(config_get_oracle "$origin_chain_id" "input")
     
     if [ -z "$input_settler" ] || [ -z "$output_settler" ]; then
         print_error "Required contract addresses not found in config"
@@ -949,7 +997,7 @@ submit_compact_intent() {
     local input_settler_compact=$(config_get_network "$origin_chain_id" "input_settler_compact_address")
     local output_settler=$(config_get_network "$dest_chain_id" "output_settler_address")
     local the_compact_addr=$(config_get_network "$origin_chain_id" "the_compact_address")
-    local input_oracle=$(config_get_network "$origin_chain_id" "input_oracle_address")
+    local input_oracle=$(config_get_oracle "$origin_chain_id" "input")
     
     if [ -z "$input_settler_compact" ] || [ -z "$output_settler" ] || [ -z "$the_compact_addr" ]; then
         print_error "Required contract addresses not found in config"
@@ -1131,23 +1179,38 @@ intent_build() {
             return 1
         fi
     else
-        # For offchain: <intent_type> <lock_type> <origin_chain> <dest_chain> <token_in> <token_out> [amount_in] [amount_out]
+        # For offchain, parse based on intent type
         intent_type="${args[0]:-escrow}"
-        lock_type="${args[1]:-permit2}"
-        origin_chain="${args[2]:-31337}"
-        dest_chain="${args[3]:-31338}"
-        token_in="${args[4]:-}"
-        token_out="${args[5]:-}"
-        [ ${#args[@]} -gt 6 ] && amount_in="${args[6]}"
-        [ ${#args[@]} -gt 7 ] && amount_out="${args[7]}"
+        
+        if [ "$intent_type" = "compact" ]; then
+            # For compact: <intent_type> <origin_chain> <dest_chain> <token_in> <token_out> [amount_in] [amount_out]
+            origin_chain="${args[1]:-31337}"
+            dest_chain="${args[2]:-31338}"
+            token_in="${args[3]:-}"
+            token_out="${args[4]:-}"
+            [ ${#args[@]} -gt 5 ] && amount_in="${args[5]}"
+            [ ${#args[@]} -gt 6 ] && amount_out="${args[6]}"
+            # Compact doesn't use lock_type
+        else
+            # For escrow: <intent_type> <lock_type> <origin_chain> <dest_chain> <token_in> <token_out> [amount_in] [amount_out]
+            lock_type="${args[1]:-permit2}"
+            origin_chain="${args[2]:-31337}"
+            dest_chain="${args[3]:-31338}"
+            token_in="${args[4]:-}"
+            token_out="${args[5]:-}"
+            [ ${#args[@]} -gt 6 ] && amount_in="${args[6]}"
+            [ ${#args[@]} -gt 7 ] && amount_out="${args[7]}"
+        fi
     fi
     
     # Validate required parameters
     if [ -z "$token_in" ] || [ -z "$token_out" ]; then
         if [ "$onchain_mode" = true ]; then
             print_error "Usage: intent_build --onchain escrow <origin_chain> <dest_chain> <token_in> <token_out> [amount_in] [amount_out]"
+        elif [ "$intent_type" = "compact" ]; then
+            print_error "Usage: intent_build compact <origin_chain> <dest_chain> <token_in> <token_out> [amount_in] [amount_out]"
         else
-            print_error "Usage: intent_build <escrow|compact> <permit2|eip3009> <origin_chain> <dest_chain> <token_in> <token_out> [amount_in] [amount_out]"
+            print_error "Usage: intent_build escrow <permit2|eip3009> <origin_chain> <dest_chain> <token_in> <token_out> [amount_in] [amount_out]"
         fi
         return 1
     fi
@@ -1220,6 +1283,8 @@ intent_build() {
     
     if [ "$onchain_mode" = true ]; then
         print_info "Building $intent_type intent for onchain submission"
+    elif [ "$intent_type" = "compact" ]; then
+        print_info "Building compact intent (BatchCompact signature)"
     else
         print_info "Building $intent_type intent with $lock_type auth type"
     fi
@@ -1302,14 +1367,7 @@ intent_build() {
             esac
             ;;
         compact)
-            # Validate lock_type for compact - only permit2 is supported
-            if [ "$lock_type" != "permit2" ]; then
-                print_error "Compact does not support $lock_type lock type"
-                print_info "Compact only supports permit2 for resource locks"
-                print_info "EIP-3009 is only supported with escrow intents"
-                return 1
-            fi
-            
+            # Compact uses BatchCompact signatures, no lock_type validation needed
             # Get compact-specific addresses
             local the_compact=$(config_get_network "$origin_chain" "the_compact_address")
             local input_settler_compact=$(config_get_network "$origin_chain" "input_settler_compact_address")
@@ -1407,9 +1465,6 @@ intent_build() {
             print_debug "TOKEN_ID (hex): $token_id_hex"
             print_debug "TOKEN_ID (uint256): $token_id_u256"
             
-            # create_compact_intent(user_addr, user_private_key, origin_chain_id, dest_chain_id,
-            #                      token_id, resource_lock_id, lock_amount, output_token, output_amount,
-            #                      recipient, input_settler_compact, output_settler, the_compact_addr, input_oracle)
             intent_json=$(create_compact_intent "$user_addr" "$user_key" "$origin_chain" "$dest_chain" \
                                "$token_id_u256" "$allocator_lock_tag" "$amount_in" "$token_out" "$amount_out" \
                                "$recipient_addr" "$input_settler_compact" "$output_settler" "$the_compact" "$oracle")
@@ -1439,31 +1494,64 @@ intent_build() {
         local recipient_uii=$(to_uii_address "$dest_chain" "$recipient_addr")
         
         # Create quote request JSON (matching API expected format)
-        local quote_request=$(jq -n \
-            --arg user "$user_uii" \
-            --arg input_user "$user_uii" \
-            --arg input_asset "$input_asset_uii" \
-            --arg input_amount "$amount_in" \
-            --arg output_receiver "$recipient_uii" \
-            --arg output_asset "$output_asset_uii" \
-            --arg output_amount "$amount_out" \
-            '{
-                user: $user,
-                availableInputs: [
-                    {
-                        user: $input_user,
-                        asset: $input_asset,
-                        amount: $input_amount
-                    }
-                ],
-                requestedOutputs: [
-                    {
-                        receiver: $output_receiver,
-                        asset: $output_asset,
-                        amount: $output_amount
-                    }
-                ]
-            }')
+        # For compact intents, add lock field to indicate resource lock
+        if [ "$intent_type" = "compact" ]; then
+            local quote_request=$(jq -n \
+                --arg user "$user_uii" \
+                --arg input_user "$user_uii" \
+                --arg input_asset "$input_asset_uii" \
+                --arg input_amount "$amount_in" \
+                --arg output_receiver "$recipient_uii" \
+                --arg output_asset "$output_asset_uii" \
+                --arg output_amount "$amount_out" \
+                '{
+                    user: $user,
+                    availableInputs: [
+                        {
+                            user: $input_user,
+                            asset: $input_asset,
+                            amount: $input_amount,
+                            lock: {
+                                kind: "TheCompact"
+                            }
+                        }
+                    ],
+                    requestedOutputs: [
+                        {
+                            receiver: $output_receiver,
+                            asset: $output_asset,
+                            amount: $output_amount
+                        }
+                    ]
+                }')
+        else
+            # For escrow intents, no lock field needed
+            local quote_request=$(jq -n \
+                --arg user "$user_uii" \
+                --arg input_user "$user_uii" \
+                --arg input_asset "$input_asset_uii" \
+                --arg input_amount "$amount_in" \
+                --arg output_receiver "$recipient_uii" \
+                --arg output_asset "$output_asset_uii" \
+                --arg output_amount "$amount_out" \
+                '{
+                    user: $user,
+                    availableInputs: [
+                        {
+                            user: $input_user,
+                            asset: $input_asset,
+                            amount: $input_amount
+                        }
+                    ],
+                    requestedOutputs: [
+                        {
+                            receiver: $output_receiver,
+                            asset: $output_asset,
+                            amount: $output_amount
+                        }
+                    ]
+                }')
+        fi
         
         echo "$quote_request" | jq '.' > "$quote_file"
         print_success "Quote request saved to: $quote_file (for quotes)"
@@ -1541,7 +1629,7 @@ intent_submit() {
 
 intent_test() {
     local onchain_mode=false
-    local lock_type=""
+    local intent_type=""
     local auth_type=""
     local token_pair=""
     
@@ -1553,10 +1641,16 @@ intent_test() {
                 shift
                 ;;
             *)
-                if [ -z "$lock_type" ]; then
-                    lock_type="$1"
+                if [ -z "$intent_type" ]; then
+                    intent_type="$1"
                 elif [ -z "$auth_type" ] && [ "$onchain_mode" = false ]; then
-                    auth_type="$1"
+                    # Only capture auth_type if not compact
+                    if [ "$intent_type" != "compact" ]; then
+                        auth_type="$1"
+                    else
+                        # For compact, this is the token_pair
+                        token_pair="$1"
+                    fi
                 elif [ -z "$token_pair" ]; then
                     token_pair="$1"
                 fi
@@ -1566,7 +1660,7 @@ intent_test() {
     done
     
     # Set defaults
-    lock_type="${lock_type:-escrow}"
+    intent_type="${intent_type:-escrow}"
     token_pair="${token_pair:-A2B}"
     
     # For onchain mode, auth_type is not needed
@@ -1580,35 +1674,41 @@ intent_test() {
         fi
         
         # Validate that onchain only works with escrow
-        if [ "$lock_type" != "escrow" ]; then
-            print_error "Onchain submission only supports escrow lock type"
+        if [ "$intent_type" != "escrow" ]; then
+            print_error "Onchain submission only supports escrow intent type"
             print_info "Usage: intent test --onchain escrow <A2A|A2B|B2A|B2B>"
             return 1
         fi
     else
-        # Offchain mode - auth_type is required
-        auth_type="${auth_type:-permit2}"
-        
-        # Validate lock type
-        if [[ "$lock_type" != "escrow" && "$lock_type" != "compact" ]]; then
-            print_error "Invalid lock type: $lock_type"
-            print_info "Usage: intent test <escrow|compact> <permit2|eip3009> <A2A|A2B|B2A|B2B>"
-            return 1
-        fi
-        
-        # Validate auth type and combinations
-        if [[ "$lock_type" == "compact" && "$auth_type" == "eip3009" ]]; then
-            print_error "Compact lock type does not support EIP-3009 auth"
-            print_info "Compact only supports permit2 auth"
-            print_info "Usage: intent test compact permit2 <A2A|A2B|B2A|B2B>"
-            return 1
-        fi
-        
-        if [[ "$auth_type" != "permit2" && "$auth_type" != "eip3009" ]]; then
-            print_error "Invalid auth type: $auth_type"
-            print_info "Supported auth types: permit2, eip3009 (eip3009 only for escrow)"
-            print_info "Usage: intent test <escrow|compact> <permit2|eip3009> <A2A|A2B|B2A|B2B>"
-            return 1
+        # Offchain mode - handle based on intent type
+        if [ "$intent_type" = "compact" ]; then
+            # Compact doesn't need auth_type
+            if [ -n "$auth_type" ]; then
+                # User provided extra arg thinking it's needed
+                print_error "Compact intents do not require an auth type parameter"
+                print_info "Usage: intent test compact <A2A|A2B|B2A|B2B>"
+                print_info "Compact uses BatchCompact signatures, not Permit2 or EIP-3009"
+                return 1
+            fi
+        else
+            # Escrow needs auth_type
+            auth_type="${auth_type:-permit2}"
+            
+            # Validate intent type
+            if [ "$intent_type" != "escrow" ]; then
+                print_error "Invalid intent type: $intent_type"
+                print_info "Usage: intent test escrow <permit2|eip3009> <A2A|A2B|B2A|B2B>"
+                print_info "Usage: intent test compact <A2A|A2B|B2A|B2B>"
+                return 1
+            fi
+            
+            # Validate auth type for escrow
+            if [[ "$auth_type" != "permit2" && "$auth_type" != "eip3009" ]]; then
+                print_error "Invalid auth type for escrow: $auth_type"
+                print_info "Supported auth types for escrow: permit2, eip3009"
+                print_info "Usage: intent test escrow <permit2|eip3009> <A2A|A2B|B2A|B2B>"
+                return 1
+            fi
         fi
     fi
     
@@ -1651,13 +1751,13 @@ intent_test() {
     esac
     
     if [ "$onchain_mode" = true ]; then
-        print_header "Testing ${lock_type} intent with onchain submission: ${from_token} → ${to_token}"
+        print_header "Testing ${intent_type} intent with onchain submission: ${from_token} → ${to_token}"
         
         # Step 1: Build onchain intent
-        print_step "Building ${lock_type} intent for onchain submission"
+        print_step "Building ${intent_type} intent for onchain submission"
         
-        if ! intent_build --onchain "$lock_type" "$origin_chain" "$dest_chain" "$from_token" "$to_token"; then
-            print_error "Failed to build ${lock_type} intent for onchain submission"
+        if ! intent_build --onchain "$intent_type" "$origin_chain" "$dest_chain" "$from_token" "$to_token"; then
+            print_error "Failed to build ${intent_type} intent for onchain submission"
             return 1
         fi
         
@@ -1677,16 +1777,29 @@ intent_test() {
             return 1
         fi
         
-        print_success "Onchain intent test completed: ${lock_type} ${token_pair}"
+        print_success "Onchain intent test completed: ${intent_type} ${token_pair}"
     else
-        print_header "Testing ${lock_type} intent with ${auth_type} auth: ${from_token} → ${to_token}"
-        
-        # Step 1: Build intent
-        print_step "Building ${lock_type} intent with ${auth_type} auth"
-        
-        if ! intent_build "$lock_type" "$auth_type" "$origin_chain" "$dest_chain" "$from_token" "$to_token"; then
-            print_error "Failed to build ${lock_type} intent with ${auth_type} auth"
-            return 1
+        # Offchain mode
+        if [ "$intent_type" = "compact" ]; then
+            print_header "Testing compact intent (BatchCompact): ${from_token} → ${to_token}"
+            
+            # Step 1: Build compact intent
+            print_step "Building compact intent"
+            
+            if ! intent_build "compact" "$origin_chain" "$dest_chain" "$from_token" "$to_token"; then
+                print_error "Failed to build compact intent"
+                return 1
+            fi
+        else
+            print_header "Testing ${intent_type} intent with ${auth_type} auth: ${from_token} → ${to_token}"
+            
+            # Step 1: Build escrow intent
+            print_step "Building ${intent_type} intent with ${auth_type} auth"
+            
+            if ! intent_build "$intent_type" "$auth_type" "$origin_chain" "$dest_chain" "$from_token" "$to_token"; then
+                print_error "Failed to build ${intent_type} intent with ${auth_type} auth"
+                return 1
+            fi
         fi
         
         print_success "Intent built successfully"
@@ -1705,7 +1818,7 @@ intent_test() {
             return 1
         fi
         
-        print_success "Intent test completed: ${lock_type} ${token_pair}"
+        print_success "Intent test completed: ${intent_type} ${token_pair}"
     fi
     
     # Show summary

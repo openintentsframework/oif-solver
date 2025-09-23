@@ -5,16 +5,16 @@ use serde::{Deserialize, Serialize};
 pub struct CostComponent {
 	/// Human-readable component name (e.g., "base-price", "gas-fill", "gas-claim", "buffer-gas", "buffer-rates", "commission")
 	pub name: String,
-	/// Amount as a decimal string in the chosen currency units (e.g., USDC). String avoids precision loss across differing decimals.
+	/// Amount as a decimal string in the display currency (matches CostEstimate.currency)
 	pub amount: String,
-	/// Amount as a wei string. (if Apply)
-	#[serde(rename = "amountWei")]
+	/// Amount as a wei string for gas-related costs (optional)
+	#[serde(rename = "amountWei", skip_serializing_if = "Option::is_none")]
 	pub amount_wei: Option<String>,
 }
 
-/// Cost breakdown attached to a quote.
+/// Unified cost estimate for any order type (standard-agnostic).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QuoteCost {
+pub struct CostEstimate {
 	/// Display currency for cost components (e.g., "USDC", "USD").
 	pub currency: String,
 	/// Individual components that sum to the subtotal.

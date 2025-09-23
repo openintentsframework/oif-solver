@@ -57,17 +57,16 @@ ANVIL_PIDS_DIR="${SCRIPT_DIR}/.pids"
 ANVIL_LOGS_DIR="${SCRIPT_DIR}/.logs"
 
 # Contract addresses (filled during deployment)
-declare -gA DEPLOYED_CONTRACTS
-DEPLOYED_CONTRACTS[origin_tokena]=""
-DEPLOYED_CONTRACTS[origin_tokenb]=""
-DEPLOYED_CONTRACTS[dest_tokena]=""
-DEPLOYED_CONTRACTS[dest_tokenb]=""
-DEPLOYED_CONTRACTS[input_settler_escrow]=""
-DEPLOYED_CONTRACTS[input_settler_compact]=""
-DEPLOYED_CONTRACTS[output_settler]=""
-DEPLOYED_CONTRACTS[oracle]=""
-DEPLOYED_CONTRACTS[the_compact]=""
-DEPLOYED_CONTRACTS[allocator]=""
+DEPLOYED_CONTRACTS_origin_tokena=""
+DEPLOYED_CONTRACTS_origin_tokenb=""
+DEPLOYED_CONTRACTS_dest_tokena=""
+DEPLOYED_CONTRACTS_dest_tokenb=""
+DEPLOYED_CONTRACTS_input_settler_escrow=""
+DEPLOYED_CONTRACTS_input_settler_compact=""
+DEPLOYED_CONTRACTS_output_settler=""
+DEPLOYED_CONTRACTS_oracle=""
+DEPLOYED_CONTRACTS_the_compact=""
+DEPLOYED_CONTRACTS_allocator=""
 
 # Fixed addresses
 PERMIT2_ADDRESS="0x000000000022D473030F116dDEE9F6B43aC78BA3"
@@ -400,32 +399,46 @@ deploy_permit2() {
     local chain_name="$1"
     local rpc_url="$2"
     local private_key="${3:-$(config_get_account solver private_key)}"
-    
+
     print_info "Deploying Permit2 on $chain_name..."
-    
+
     # Check if already deployed
-    local existing_code=$(cast_code "$PERMIT2_ADDRESS" "$rpc_url" 2>/dev/null || echo "0x")
+    local existing_code=$(cast code "$PERMIT2_ADDRESS" --rpc-url "$rpc_url" 2>/dev/null || echo "0x")
     if [ "$existing_code" != "0x" ]; then
         print_success "Permit2 already deployed at $PERMIT2_ADDRESS"
         return 0
     fi
-    
+
     # Get Permit2 bytecode from mainnet
     print_debug "Fetching Permit2 bytecode from mainnet..."
     local permit2_code
-    permit2_code=$(cast_code "$PERMIT2_ADDRESS" "https://ethereum-rpc.publicnode.com" 2>/dev/null || echo "")
-    
+    permit2_code=$(cast code "$PERMIT2_ADDRESS" --rpc-url "https://ethereum-rpc.publicnode.com" 2>/dev/null || echo "")
+
     if [ -z "$permit2_code" ] || [ "$permit2_code" = "0x" ]; then
         print_error "Failed to fetch Permit2 bytecode from mainnet"
         return 1
     fi
-    
-    # Deploy using anvil_setCode
-    if cast_rpc "anvil_setCode" "$rpc_url" "$PERMIT2_ADDRESS" "$permit2_code" > /dev/null; then
-        print_success "Permit2 deployed at $PERMIT2_ADDRESS"
+
+    print_debug "Permit2 bytecode length: ${#permit2_code} characters"
+
+    # Deploy using anvil_setCode RPC call
+    print_debug "Deploying Permit2 via anvil_setCode..."
+    local deploy_result
+    deploy_result=$(cast rpc anvil_setCode "$PERMIT2_ADDRESS" "$permit2_code" --rpc-url "$rpc_url" 2>/dev/null)
+
+    if [ $? -ne 0 ]; then
+        print_error "Failed to call anvil_setCode"
+        return 1
+    fi
+
+    # Verify deployment
+    local deployed_code=$(cast code "$PERMIT2_ADDRESS" --rpc-url "$rpc_url" 2>/dev/null || echo "0x")
+    if [ "$deployed_code" != "0x" ] && [ ${#deployed_code} -gt 2 ]; then
+        print_success "Permit2 deployed at $PERMIT2_ADDRESS (${#deployed_code} bytes)"
         return 0
     else
-        print_error "Failed to deploy Permit2"
+        print_error "Failed to deploy Permit2 - verification failed"
+        print_debug "Deployed code: $deployed_code"
         return 1
     fi
 }
@@ -588,9 +601,9 @@ deploy_tokens() {
         return 1
     fi
     
-    DEPLOYED_CONTRACTS[origin_tokena]="$tokena_origin"
-    DEPLOYED_CONTRACTS[dest_tokena]="$tokena_dest"
-    print_debug "Stored TokenA in DEPLOYED_CONTRACTS: origin=${DEPLOYED_CONTRACTS[origin_tokena]}, dest=${DEPLOYED_CONTRACTS[dest_tokena]}"
+    DEPLOYED_CONTRACTS_origin_tokena="$tokena_origin"
+    DEPLOYED_CONTRACTS_dest_tokena="$tokena_dest"
+    print_debug "Stored TokenA in DEPLOYED_CONTRACTS: origin=${DEPLOYED_CONTRACTS_origin_tokena}, dest=${DEPLOYED_CONTRACTS_dest_tokena}"
     
     # Deploy TokenB on both chains (same address)
     print_debug "Deploying TokenB..."
@@ -605,9 +618,9 @@ deploy_tokens() {
         return 1
     fi
     
-    DEPLOYED_CONTRACTS[origin_tokenb]="$tokenb_origin"
-    DEPLOYED_CONTRACTS[dest_tokenb]="$tokenb_dest"
-    print_debug "Stored TokenB in DEPLOYED_CONTRACTS: origin=${DEPLOYED_CONTRACTS[origin_tokenb]}, dest=${DEPLOYED_CONTRACTS[dest_tokenb]}"
+    DEPLOYED_CONTRACTS_origin_tokenb="$tokenb_origin"
+    DEPLOYED_CONTRACTS_dest_tokenb="$tokenb_dest"
+    print_debug "Stored TokenB in DEPLOYED_CONTRACTS: origin=${DEPLOYED_CONTRACTS_origin_tokenb}, dest=${DEPLOYED_CONTRACTS_dest_tokenb}"
     
     # Cleanup temp files
     rm -f "$tokena_file" "$tokenb_file"
@@ -649,7 +662,7 @@ deploy_oif_contracts() {
     if [ -z "$input_settler" ]; then
         return 1
     fi
-    DEPLOYED_CONTRACTS[input_settler_escrow]="$input_settler"
+    DEPLOYED_CONTRACTS_input_settler_escrow="$input_settler"
     
     # Deploy on dest chain for deterministic address
     forge_deploy "src/input/escrow/InputSettlerEscrow.sol" \
@@ -662,7 +675,7 @@ deploy_oif_contracts() {
     if [ -z "$output_settler" ]; then
         return 1
     fi
-    DEPLOYED_CONTRACTS[output_settler]="$output_settler"
+    DEPLOYED_CONTRACTS_output_settler="$output_settler"
     
     # Deploy on dest chain for deterministic address
     forge_deploy "src/output/simple/OutputSettlerSimple.sol" \
@@ -675,7 +688,7 @@ deploy_oif_contracts() {
     if [ -z "$oracle" ]; then
         return 1
     fi
-    DEPLOYED_CONTRACTS[oracle]="$oracle"
+    DEPLOYED_CONTRACTS_oracle="$oracle"
     
     # Deploy on dest chain for deterministic address
     forge_deploy "test/mocks/AlwaysYesOracle.sol" \
@@ -688,7 +701,7 @@ deploy_oif_contracts() {
     if [ -z "$the_compact" ]; then
         return 1
     fi
-    DEPLOYED_CONTRACTS[the_compact]="$the_compact"
+    DEPLOYED_CONTRACTS_the_compact="$the_compact"
     
     # Deploy on dest chain for deterministic address
     forge_deploy "lib/the-compact/src/TheCompact.sol" \
@@ -701,7 +714,7 @@ deploy_oif_contracts() {
     if [ -z "$allocator" ]; then
         return 1
     fi
-    DEPLOYED_CONTRACTS[allocator]="$allocator"
+    DEPLOYED_CONTRACTS_allocator="$allocator"
     
     # Deploy on dest chain for deterministic address
     forge_deploy "lib/the-compact/src/test/AlwaysOKAllocator.sol" \
@@ -735,15 +748,15 @@ deploy_oif_contracts() {
     local input_settler_compact_origin=$(forge_deploy "src/input/compact/InputSettlerCompact.sol" "InputSettlerCompact" "$origin_rpc" "$private_key" "$the_compact")
     if [ -z "$input_settler_compact_origin" ]; then
         print_warning "Failed to deploy InputSettlerCompact on origin"
-        DEPLOYED_CONTRACTS[input_settler_compact]=""
+        DEPLOYED_CONTRACTS_input_settler_compact=""
     else
         print_info "Deploying InputSettlerCompact..."
         local input_settler_compact_dest=$(forge_deploy "src/input/compact/InputSettlerCompact.sol" "InputSettlerCompact" "$dest_rpc" "$private_key" "$the_compact")
         if [ "$input_settler_compact_origin" != "$input_settler_compact_dest" ]; then
             print_warning "InputSettlerCompact address mismatch between chains"
-            DEPLOYED_CONTRACTS[input_settler_compact]=""
+            DEPLOYED_CONTRACTS_input_settler_compact=""
         else
-            DEPLOYED_CONTRACTS[input_settler_compact]="$input_settler_compact_origin"
+            DEPLOYED_CONTRACTS_input_settler_compact="$input_settler_compact_origin"
         fi
     fi
     
@@ -763,8 +776,8 @@ setup_tokens() {
     local solver_key="${6:-$(config_get_account solver private_key)}"
     
     print_info "Setting up token balances and approvals..."
-    print_debug "setup_tokens: DEPLOYED_CONTRACTS keys: ${!DEPLOYED_CONTRACTS[@]}"
-    print_debug "setup_tokens: DEPLOYED_CONTRACTS values: ${DEPLOYED_CONTRACTS[@]}"
+    print_debug "setup_tokens: DEPLOYED_CONTRACTS keys: origin_tokena origin_tokenb dest_tokena dest_tokenb input_settler_escrow input_settler_compact output_settler oracle the_compact allocator"
+    print_debug "setup_tokens: DEPLOYED_CONTRACTS values: $DEPLOYED_CONTRACTS_origin_tokena $DEPLOYED_CONTRACTS_origin_tokenb $DEPLOYED_CONTRACTS_dest_tokena $DEPLOYED_CONTRACTS_dest_tokenb $DEPLOYED_CONTRACTS_input_settler_escrow $DEPLOYED_CONTRACTS_input_settler_compact $DEPLOYED_CONTRACTS_output_settler $DEPLOYED_CONTRACTS_oracle $DEPLOYED_CONTRACTS_the_compact $DEPLOYED_CONTRACTS_allocator"
     
     # Validate required parameters are provided
     if [ -z "$user_addr" ]; then
@@ -784,8 +797,8 @@ setup_tokens() {
         return 1
     fi
     
-    local tokena="${DEPLOYED_CONTRACTS[origin_tokena]}"
-    local tokenb="${DEPLOYED_CONTRACTS[origin_tokenb]}"
+    local tokena="${DEPLOYED_CONTRACTS_origin_tokena}"
+    local tokenb="${DEPLOYED_CONTRACTS_origin_tokenb}"
     local amount="100000000000000000000"  # 100 tokens
     
     print_debug "TokenA address: $tokena"
@@ -793,8 +806,8 @@ setup_tokens() {
     
     if [ -z "$tokena" ] || [ -z "$tokenb" ]; then
         print_error "Token addresses not found in DEPLOYED_CONTRACTS"
-        print_debug "DEPLOYED_CONTRACTS keys: ${!DEPLOYED_CONTRACTS[@]}"
-        print_debug "DEPLOYED_CONTRACTS values: ${DEPLOYED_CONTRACTS[@]}"
+        print_debug "DEPLOYED_CONTRACTS keys: origin_tokena origin_tokenb dest_tokena dest_tokenb input_settler_escrow input_settler_compact output_settler oracle the_compact allocator"
+        print_debug "DEPLOYED_CONTRACTS values: $DEPLOYED_CONTRACTS_origin_tokena $DEPLOYED_CONTRACTS_origin_tokenb $DEPLOYED_CONTRACTS_dest_tokena $DEPLOYED_CONTRACTS_dest_tokenb $DEPLOYED_CONTRACTS_input_settler_escrow $DEPLOYED_CONTRACTS_input_settler_compact $DEPLOYED_CONTRACTS_output_settler $DEPLOYED_CONTRACTS_oracle $DEPLOYED_CONTRACTS_the_compact $DEPLOYED_CONTRACTS_allocator"
         return 1
     fi
     
@@ -822,8 +835,8 @@ setup_tokens() {
               "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" > /dev/null
     
     # Setup compact resource locks if TheCompact is deployed
-    local the_compact="${DEPLOYED_CONTRACTS[the_compact]}"
-    local allocator="${DEPLOYED_CONTRACTS[allocator]}"
+    local the_compact="${DEPLOYED_CONTRACTS_the_compact}"
+    local allocator="${DEPLOYED_CONTRACTS_allocator}"
     
     if [ -n "$the_compact" ] && [ -n "$allocator" ]; then
         print_debug "Setting up compact resource locks..."
@@ -926,10 +939,16 @@ deploy_full_environment() {
 
 # Export deployed contract addresses to environment
 export_contract_addresses() {
-    for contract in "${!DEPLOYED_CONTRACTS[@]}"; do
-        local env_var="$(echo $contract | tr '[:lower:]' '[:upper:]')_ADDRESS"
-        export "$env_var"="${DEPLOYED_CONTRACTS[$contract]}"
-    done
+    export ORIGIN_TOKENA_ADDRESS="${DEPLOYED_CONTRACTS_origin_tokena}"
+    export ORIGIN_TOKENB_ADDRESS="${DEPLOYED_CONTRACTS_origin_tokenb}"
+    export DEST_TOKENA_ADDRESS="${DEPLOYED_CONTRACTS_dest_tokena}"
+    export DEST_TOKENB_ADDRESS="${DEPLOYED_CONTRACTS_dest_tokenb}"
+    export INPUT_SETTLER_ESCROW_ADDRESS="${DEPLOYED_CONTRACTS_input_settler_escrow}"
+    export INPUT_SETTLER_COMPACT_ADDRESS="${DEPLOYED_CONTRACTS_input_settler_compact}"
+    export OUTPUT_SETTLER_ADDRESS="${DEPLOYED_CONTRACTS_output_settler}"
+    export ORACLE_ADDRESS="${DEPLOYED_CONTRACTS_oracle}"
+    export THE_COMPACT_ADDRESS="${DEPLOYED_CONTRACTS_the_compact}"
+    export ALLOCATOR_ADDRESS="${DEPLOYED_CONTRACTS_allocator}"
     
     export PERMIT2_ADDRESS="$PERMIT2_ADDRESS"
 }
@@ -937,7 +956,19 @@ export_contract_addresses() {
 # Get deployed contract address
 get_contract_address() {
     local contract_name="$1"
-    echo "${DEPLOYED_CONTRACTS[$contract_name]}"
+    case "$contract_name" in
+        "origin_tokena") echo "${DEPLOYED_CONTRACTS_origin_tokena}" ;;
+        "origin_tokenb") echo "${DEPLOYED_CONTRACTS_origin_tokenb}" ;;
+        "dest_tokena") echo "${DEPLOYED_CONTRACTS_dest_tokena}" ;;
+        "dest_tokenb") echo "${DEPLOYED_CONTRACTS_dest_tokenb}" ;;
+        "input_settler_escrow") echo "${DEPLOYED_CONTRACTS_input_settler_escrow}" ;;
+        "input_settler_compact") echo "${DEPLOYED_CONTRACTS_input_settler_compact}" ;;
+        "output_settler") echo "${DEPLOYED_CONTRACTS_output_settler}" ;;
+        "oracle") echo "${DEPLOYED_CONTRACTS_oracle}" ;;
+        "the_compact") echo "${DEPLOYED_CONTRACTS_the_compact}" ;;
+        "allocator") echo "${DEPLOYED_CONTRACTS_allocator}" ;;
+        *) echo "" ;;
+    esac
 }
 
 # Show deployment summary
@@ -957,15 +988,15 @@ show_deployment_summary() {
     done
     
     print_info "Contracts:"
-    print_info "  TokenA: ${DEPLOYED_CONTRACTS[origin_tokena]}"
-    print_info "  TokenB: ${DEPLOYED_CONTRACTS[origin_tokenb]}"
+    print_info "  TokenA: ${DEPLOYED_CONTRACTS_origin_tokena}"
+    print_info "  TokenB: ${DEPLOYED_CONTRACTS_origin_tokenb}"
     print_info "  Permit2: $PERMIT2_ADDRESS"
-    print_info "  InputSettlerEscrow: ${DEPLOYED_CONTRACTS[input_settler_escrow]}"
-    print_info "  InputSettlerCompact: ${DEPLOYED_CONTRACTS[input_settler_compact]}"
-    print_info "  OutputSettler: ${DEPLOYED_CONTRACTS[output_settler]}"
-    print_info "  Oracle: ${DEPLOYED_CONTRACTS[oracle]}"
-    print_info "  TheCompact: ${DEPLOYED_CONTRACTS[the_compact]}"
-    print_info "  Allocator: ${DEPLOYED_CONTRACTS[allocator]}"
+    print_info "  InputSettlerEscrow: ${DEPLOYED_CONTRACTS_input_settler_escrow}"
+    print_info "  InputSettlerCompact: ${DEPLOYED_CONTRACTS_input_settler_compact}"
+    print_info "  OutputSettler: ${DEPLOYED_CONTRACTS_output_settler}"
+    print_info "  Oracle: ${DEPLOYED_CONTRACTS_oracle}"
+    print_info "  TheCompact: ${DEPLOYED_CONTRACTS_the_compact}"
+    print_info "  Allocator: ${DEPLOYED_CONTRACTS_allocator}"
     
     print_separator
 }
@@ -980,9 +1011,16 @@ cleanup_deployment() {
     rm -rf "$ANVIL_PIDS_DIR" "$ANVIL_LOGS_DIR"
     
     # Clear contract addresses
-    for contract in "${!DEPLOYED_CONTRACTS[@]}"; do
-        DEPLOYED_CONTRACTS[$contract]=""
-    done
+    DEPLOYED_CONTRACTS_origin_tokena=""
+    DEPLOYED_CONTRACTS_origin_tokenb=""
+    DEPLOYED_CONTRACTS_dest_tokena=""
+    DEPLOYED_CONTRACTS_dest_tokenb=""
+    DEPLOYED_CONTRACTS_input_settler_escrow=""
+    DEPLOYED_CONTRACTS_input_settler_compact=""
+    DEPLOYED_CONTRACTS_output_settler=""
+    DEPLOYED_CONTRACTS_oracle=""
+    DEPLOYED_CONTRACTS_the_compact=""
+    DEPLOYED_CONTRACTS_allocator=""
     
     print_success "Deployment cleanup completed"
 }
@@ -1078,13 +1116,13 @@ generate_demo_config_from_deployment() {
     local RECIPIENT_ADDR="0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"                         # anvil account 2
     
     # Use the deployed contract addresses
-    local TOKENA="${DEPLOYED_CONTRACTS[origin_tokena]}"
-    local TOKENB="${DEPLOYED_CONTRACTS[origin_tokenb]}"
-    local INPUT_SETTLER="${DEPLOYED_CONTRACTS[input_settler_escrow]}"
-    local INPUT_SETTLER_COMPACT="${DEPLOYED_CONTRACTS[input_settler_compact]}"
-    local OUTPUT_SETTLER="${DEPLOYED_CONTRACTS[output_settler]}"
-    local THE_COMPACT="${DEPLOYED_CONTRACTS[the_compact]}"
-    local ALLOCATOR="${DEPLOYED_CONTRACTS[allocator]}"
+    local TOKENA="${DEPLOYED_CONTRACTS_origin_tokena}"
+    local TOKENB="${DEPLOYED_CONTRACTS_origin_tokenb}"
+    local INPUT_SETTLER="${DEPLOYED_CONTRACTS_input_settler_escrow}"
+    local INPUT_SETTLER_COMPACT="${DEPLOYED_CONTRACTS_input_settler_compact}"
+    local OUTPUT_SETTLER="${DEPLOYED_CONTRACTS_output_settler}"
+    local THE_COMPACT="${DEPLOYED_CONTRACTS_the_compact}"
+    local ALLOCATOR="${DEPLOYED_CONTRACTS_allocator}"
     
     # Create main config file - EXACTLY matching original
     cat > "$CONFIG_DIR/demo.toml" <<EOF
@@ -1100,6 +1138,7 @@ include = [
 [solver]
 id = "oif-solver-demo"
 monitoring_timeout_minutes = 5
+min_profitability_pct = 1.0
 
 # ============================================================================
 # STORAGE
@@ -1170,6 +1209,17 @@ primary = "mock"
 
 [pricing.implementations.mock]
 # Uses default ETH/USD price of 4615.16
+
+[pricing.implementations.coingecko]
+# Free tier configuration (no API key required)
+# api_key = "CG-YOUR-API-KEY-HERE"
+cache_duration_seconds = 60
+rate_limit_delay_ms = 1200
+
+# Custom prices for demo/test tokens (in USD)
+[pricing.implementations.coingecko.custom_prices]
+TOKA = "200.00"
+TOKB = "195.00"
 
 # ============================================================================
 # SETTLEMENT
@@ -1275,7 +1325,8 @@ discovery = "offchain_eip7683"
 [api.auth]
 enabled = true
 jwt_secret = "${JWT_SECRET:-MySuperDuperSecureSecret123!}"
-token_expiry_hours = 24
+access_token_expiry_hours = 1
+refresh_token_expiry_hours = 720  # 30 days
 issuer = "oif-solver-demo"
 
 # Quote Configuration
@@ -1310,8 +1361,14 @@ claim = 121995
 [gas.flows.permit2_escrow]
 # Gas units captured by scripts/e2e/estimate_gas_permit2_escrow.sh on local anvil
 open = 143116
-fill = 76068 
+fill = 76068
 claim = 59953
+
+[gas.flows.eip3009_escrow]
+# Gas units for EIP-3009 escrow flows on local anvil
+open = 130254
+fill = 77298 
+claim = 60084
 EOF
     
     print_success "Configuration files generated:"

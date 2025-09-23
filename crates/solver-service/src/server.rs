@@ -3,10 +3,13 @@
 //! This module provides a minimal HTTP server infrastructure
 //! for the OIF Solver API.
 
+use crate::apis::cost::convert_raw_token_to_usd;
 use crate::{
-	apis::order::get_order_by_id,
+	apis::{order::get_order_by_id, quote::cost::CostEngine},
 	auth::{auth_middleware, AuthState, JwtService},
+	signature_validator::SignatureValidationService,
 };
+use alloy_primitives::U256;
 use axum::{
 	extract::{Extension, Path, State},
 	http::StatusCode,
@@ -15,10 +18,15 @@ use axum::{
 	routing::{get, post},
 	Router, ServiceExt,
 };
+use rust_decimal::Decimal;
 use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
-use solver_types::{APIError, GetOrderResponse, GetQuoteRequest, GetQuoteResponse};
+use solver_types::{
+	api::IntentRequest, APIError, Address, ApiErrorType, CostEstimate, GetOrderResponse,
+	GetQuoteRequest, GetQuoteResponse, Order, OrderIdCallback, Transaction,
+};
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower::ServiceBuilder;
@@ -38,6 +46,8 @@ pub struct AppState {
 	pub discovery_url: Option<String>,
 	/// JWT service for authentication (if configured).
 	pub jwt_service: Option<Arc<JwtService>>,
+	/// Signature validation service for different order standards.
+	pub signature_validation: Arc<SignatureValidationService>,
 }
 
 /// Starts the HTTP server for the API.
@@ -97,20 +107,30 @@ pub async fn start_server(
 		},
 	};
 
+	// Initialize signature validation service
+	let signature_validation = Arc::new(SignatureValidationService::new());
+
 	let app_state = AppState {
 		solver,
 		config,
 		http_client,
 		discovery_url,
 		jwt_service: jwt_service.clone(),
+		signature_validation,
 	};
 
 	// Build the router with /api base path and quote endpoint
 	let mut api_routes = Router::new()
-		.route("/register", post(handle_register))
 		.route("/quotes", post(handle_quote))
 		.route("/tokens", get(handle_get_tokens))
 		.route("/tokens/{chain_id}", get(handle_get_tokens_for_chain));
+
+	// Add auth subroutes
+	let auth_routes = Router::new()
+		.route("/register", post(handle_auth_register))
+		.route("/refresh", post(handle_auth_refresh));
+
+	api_routes = api_routes.nest("/auth", auth_routes);
 
 	// Create order routes with optional auth
 	let mut order_routes = Router::new()
@@ -228,22 +248,30 @@ async fn handle_get_tokens_for_chain(
 	crate::apis::tokens::get_tokens_for_chain(Path(chain_id), State(state.solver)).await
 }
 
-/// Handles POST /api/register requests.
+/// Handles POST /api/auth/register requests.
 ///
-/// This endpoint allows clients to self-register and receive JWT tokens
-/// for API authentication.
-async fn handle_register(
+/// Auth endpoint that provides both access and refresh tokens.
+async fn handle_auth_register(
 	State(state): State<AppState>,
-	Json(payload): Json<crate::apis::register::RegisterRequest>,
+	Json(payload): Json<crate::apis::auth::RegisterRequest>,
 ) -> impl IntoResponse {
-	crate::apis::register::register_client(State(state.jwt_service), Json(payload)).await
+	crate::apis::auth::register_client(State(state.jwt_service), Json(payload)).await
+}
+
+/// Handles POST /api/auth/refresh requests.
+///
+/// Endpoint exchanges refresh tokens for new access and refresh tokens.
+async fn handle_auth_refresh(
+	State(state): State<AppState>,
+	Json(payload): Json<crate::apis::auth::RefreshRequest>,
+) -> impl IntoResponse {
+	crate::apis::auth::refresh_token(State(state.jwt_service), Json(payload)).await
 }
 
 /// Handles POST /api/orders requests.
 ///
-/// This endpoint forwards intent submission requests to the 7683 discovery API.
-/// It acts as a proxy to maintain a consistent API surface where /orders
-/// is the standard endpoint for intent submission across different solver implementations.
+/// This endpoint processes both quote acceptances and direct order submissions
+/// through a unified validation pipeline before forwarding to the discovery service.
 async fn handle_order(
 	State(state): State<AppState>,
 	claims: Option<Extension<solver_types::JwtClaims>>,
@@ -256,14 +284,282 @@ async fn handle_order(
 			"Authenticated order submission"
 		);
 	}
-	// Check if this is a committed order (quote acceptance)
-	if let Some(result) = handle_committed_order(payload.clone(), &state).await {
-		return match result {
-			Ok(result) => result.into_response(),
-			Err(api_error) => api_error.into_response(),
-		};
+
+	// Extract standard, default to eip7683
+	let standard = payload
+		.get("standard")
+		.and_then(|s| s.as_str())
+		.unwrap_or("eip7683");
+
+	// Convert payload to IntentRequest
+	let intent_request = match extract_intent_request(payload.clone(), &state, standard).await {
+		Ok(intent) => intent,
+		Err(api_error) => return api_error.into_response(),
+	};
+
+	// Validate the IntentRequest
+	let validated_order = match validate_intent_request(&intent_request, &state, standard).await {
+		Ok(order) => order,
+		Err(api_error) => return api_error.into_response(),
+	};
+
+	// Estimate costs
+	let cost_engine = CostEngine::new();
+	let cost_estimate = match cost_engine
+		.estimate_cost_for_order(&validated_order, &state.solver, &state.config)
+		.await
+	{
+		Ok(estimation) => estimation,
+		Err(api_error) => {
+			tracing::warn!("Cost estimation failed: {}", api_error);
+			return api_error.into_response();
+		},
+	};
+
+	// Always calculate the actual profit margin to validate against config
+	let actual_profit_margin = match calculate_order_profitability(
+		&validated_order,
+		&cost_estimate,
+		&state.solver,
+	)
+	.await
+	{
+		Ok(margin) => margin,
+		Err(e) => {
+			tracing::warn!("Failed to calculate profitability: {}", e);
+			return APIError::InternalServerError {
+				error_type: ApiErrorType::InternalError,
+				message: format!("Failed to calculate profitability: {}", e),
+			}
+			.into_response();
+		},
+	};
+
+	// Check if the actual profit margin meets the minimum requirement
+	// This handles both positive requirements (e.g., 2%) and negative tolerances (e.g., -1%)
+	if actual_profit_margin < state.config.solver.min_profitability_pct {
+		tracing::warn!(
+			"Order rejected: profit margin ({:.2}%) below minimum ({:.2}%)",
+			actual_profit_margin,
+			state.config.solver.min_profitability_pct
+		);
+
+		return APIError::UnprocessableEntity {
+			error_type: ApiErrorType::InsufficientProfitability,
+			message: format!(
+				"Insufficient profit margin: {:.2}% (minimum required: {:.2}%)",
+				actual_profit_margin, state.config.solver.min_profitability_pct
+			),
+			details: Some(serde_json::json!({
+				"actual_profit_margin": actual_profit_margin,
+				"min_required": state.config.solver.min_profitability_pct,
+				"total_cost": cost_estimate.total,
+				"cost_components": cost_estimate.components,
+			})),
+		}
+		.into_response();
 	}
 
+	// Order meets profitability requirements
+	tracing::debug!(
+		"Order profitability validated: margin={:.2}% (min={:.2}%), total_cost=${}",
+		actual_profit_margin,
+		state.config.solver.min_profitability_pct,
+		cost_estimate.total
+	);
+
+	forward_to_discovery_service(&state, &intent_request).await
+}
+
+/// Extracts an IntentRequest from the incoming payload.
+/// Handles both quote acceptances (with quoteId) and direct submissions.
+async fn extract_intent_request(
+	payload: Value,
+	state: &AppState,
+	standard: &str,
+) -> Result<IntentRequest, APIError> {
+	// Check if this is a quote acceptance (has quoteId)
+	if payload.get("quoteId").and_then(|v| v.as_str()).is_some() {
+		// Quote acceptance path
+		create_intent_from_quote(payload, state, standard).await
+	} else {
+		// Direct submission path
+		create_intent_from_payload(payload)
+	}
+}
+
+/// Creates an IntentRequest from a quote acceptance.
+async fn create_intent_from_quote(
+	payload: Value,
+	state: &AppState,
+	standard: &str,
+) -> Result<IntentRequest, APIError> {
+	// Extract required fields
+	let quote_id = payload
+		.get("quoteId")
+		.and_then(|v| v.as_str())
+		.ok_or_else(|| APIError::BadRequest {
+			error_type: ApiErrorType::MissingSignature,
+			message: "Missing quoteId in request".to_string(),
+			details: None,
+		})?;
+
+	let signature = payload
+		.get("signature")
+		.and_then(|v| v.as_str())
+		.ok_or_else(|| APIError::BadRequest {
+			error_type: ApiErrorType::MissingSignature,
+			message: "Missing signature for quote acceptance".to_string(),
+			details: None,
+		})?;
+
+	tracing::info!(
+		"Quote acceptance for quote_id: {}, standard: {}",
+		quote_id,
+		standard
+	);
+
+	// Retrieve the quote from storage
+	let quote = crate::apis::quote::get_quote_by_id(quote_id, &state.solver)
+		.await
+		.map_err(|e| {
+			tracing::warn!("Failed to retrieve quote {}: {}", quote_id, e);
+			APIError::BadRequest {
+				error_type: ApiErrorType::QuoteNotFound,
+				message: format!("Quote not found: {}", e),
+				details: Some(serde_json::json!({"quoteId": quote_id})),
+			}
+		})?;
+
+	// Convert Quote to IntentRequest using the TryFrom implementation
+	(&quote, signature, standard)
+		.try_into()
+		.map_err(|e| APIError::InternalServerError {
+			error_type: ApiErrorType::QuoteConversionFailed,
+			message: format!("Failed to convert quote to intent format: {}", e),
+		})
+}
+
+/// Creates an IntentRequest from a direct payload submission.
+fn create_intent_from_payload(payload: Value) -> Result<IntentRequest, APIError> {
+	// The payload should already be in IntentRequest format
+	// {order: Bytes, sponsor: Address, signature: Bytes, lock_type: LockType}
+	serde_json::from_value::<IntentRequest>(payload).map_err(|e| APIError::BadRequest {
+		error_type: ApiErrorType::InvalidRequest,
+		message: format!("Invalid intent request format: {}", e),
+		details: None,
+	})
+}
+
+/// Validates an IntentRequest and creates an Order.
+async fn validate_intent_request(
+	intent: &IntentRequest,
+	state: &AppState,
+	standard: &str,
+) -> Result<Order, APIError> {
+	// Get the order bytes (already in Bytes format from IntentRequest)
+	let order_bytes = &intent.order;
+
+	// Get lock_type as string
+	let lock_type = intent.lock_type.as_str();
+
+	// Get solver address from primary account
+	let solver_address =
+		state
+			.solver
+			.account()
+			.get_address()
+			.await
+			.map_err(|e| APIError::InternalServerError {
+				error_type: ApiErrorType::SolverAddressError,
+				message: format!("Failed to get solver address: {}", e),
+			})?;
+
+	// Create callback that captures DeliveryService
+	let delivery = state.solver.delivery().clone();
+	let compute_order_id: OrderIdCallback = Box::new(move |chain_id, tx_data| {
+		let delivery = delivery.clone();
+		Box::pin(async move {
+			// Extract settler address and calldata from tx_data
+			if tx_data.len() < 20 {
+				return Err("Invalid transaction data: too short".to_string());
+			}
+
+			let settler_address = Address(tx_data[0..20].to_vec());
+			let calldata = &tx_data[20..];
+
+			let tx = Transaction {
+				to: Some(settler_address),
+				data: calldata.to_vec(),
+				value: U256::ZERO,
+				gas_limit: None, // Will be estimated
+				gas_price: None, // Will be set by delivery
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+				nonce: None, // Will be set by delivery
+				chain_id,
+			};
+
+			// Execute via DeliveryService
+			delivery
+				.contract_call(chain_id, tx)
+				.await
+				.map(|bytes| bytes.to_vec())
+				.map_err(|e| format!("Contract call failed: {}", e))
+		})
+	});
+
+	// EIP-712 signature validation for ResourceLock orders
+	let requires_validation = state
+		.signature_validation
+		.requires_signature_validation(standard, &intent.lock_type);
+
+	if requires_validation {
+		state
+			.signature_validation
+			.validate_signature(
+				standard,
+				intent,
+				&state.solver.config().networks,
+				state.solver.delivery(),
+			)
+			.await?;
+	}
+
+	// Process the order through the OrderService
+	// This validates the order based on the standard and returns a validated Order
+	let result = state
+		.solver
+		.order()
+		.validate_and_create_order(
+			standard,
+			order_bytes,
+			lock_type,
+			compute_order_id,
+			&solver_address,
+		)
+		.await
+		.map_err(|e| {
+			tracing::error!("Order validation failed with error: {}", e);
+			APIError::BadRequest {
+				error_type: ApiErrorType::OrderValidationFailed,
+				message: format!("Order validation failed: {}", e),
+				details: None,
+			}
+		});
+
+	match &result {
+		Ok(_) => tracing::debug!("Order validation completed successfully"),
+		Err(e) => tracing::error!("Order validation failed: {:?}", e),
+	}
+
+	result
+}
+
+async fn forward_to_discovery_service(
+	state: &AppState,
+	intent: &IntentRequest,
+) -> axum::response::Response {
 	// Check if discovery URL is configured
 	let forward_url = match &state.discovery_url {
 		Some(url) => url,
@@ -279,14 +575,11 @@ async fn handle_order(
 		},
 	};
 
-	tracing::debug!("Forwarding order submission to: {}", forward_url);
-
-	// Use the shared HTTP client from app state
 	// Forward the request
 	match state
 		.http_client
 		.post(forward_url)
-		.json(&payload)
+		.json(intent)
 		.send()
 		.await
 	{
@@ -324,115 +617,118 @@ async fn handle_order(
 	}
 }
 
-async fn handle_committed_order(
-	payload: Value,
-	state: &AppState,
-) -> Option<Result<impl IntoResponse, APIError>> {
-	// Check if this is a quote acceptance submission (contains quoteId)
-	if let Some(quote_id) = payload.get("quoteId").and_then(|v| v.as_str()) {
-		tracing::info!("Received quote acceptance for quote ID: {}", quote_id);
+/// Calculates the profit margin percentage for any profitability calculatable type.
+///
+/// The profit margin is calculated as:
+/// Profit = Total Input Amount (USD) - Total Output Amount (USD) - Execution Costs (USD)
+/// Profit Margin = (Profit / Total Input Amount (USD)) * 100
+///
+/// This represents the percentage profit the solver makes on the input amount.
+/// All amounts are converted to USD using the pricing service for accurate comparison.
+async fn calculate_order_profitability(
+	order: &Order,
+	cost_estimate: &CostEstimate,
+	solver: &SolverEngine,
+) -> Result<Decimal, Box<dyn std::error::Error>> {
+	// Parse the order data
+	let parsed_order = order.parse_order_data()?;
 
-		// Extract signature if present
-		let signature = payload.get("signature").and_then(|v| v.as_str());
+	// Get input and output assets from the parsed order
+	let available_inputs = parsed_order.parse_available_inputs();
+	let requested_outputs = parsed_order.parse_requested_outputs();
 
-		if let Some(sig) = signature {
-			tracing::debug!(
-				"Quote acceptance detected, retrieving quote from storage and converting to intent"
-			);
+	let token_manager = solver.token_manager();
+	let pricing_service = solver.pricing();
 
-			// Retrieve the quote from storage using the existing get_quote_by_id function
-			let quote = match crate::apis::quote::get_quote_by_id(quote_id, &state.solver).await {
-				Ok(quote) => quote,
-				Err(e) => {
-					tracing::warn!("Failed to retrieve quote {}: {}", quote_id, e);
-					return Some(Err(APIError::BadRequest {
-						error_type: "QUOTE_NOT_FOUND".to_string(),
-						message: format!("Quote not found: {}", e),
-						details: Some(serde_json::json!({"quoteId": quote_id})),
-					}));
-				},
-			};
+	// Calculate total input amount in USD (sum of all inputs converted to USD)
+	let mut total_input_amount_usd = Decimal::ZERO;
+	for input in available_inputs {
+		// Extract chain_id and ethereum address from InteropAddress
+		let chain_id = input
+			.asset
+			.ethereum_chain_id()
+			.map_err(|e| format!("Failed to get chain ID from asset: {}", e))?;
+		let ethereum_addr = input
+			.asset
+			.ethereum_address()
+			.map_err(|e| format!("Failed to get ethereum address from asset: {}", e))?;
+		let token_address = solver_types::Address(ethereum_addr.0.to_vec());
+		// Get token info
+		let token_info = token_manager
+			.get_token_info(chain_id, &token_address)
+			.map_err(|e| format!("Failed to get token info: {}", e))?;
 
-			// Submit quote to the discovery service for processing
-			if let Err(e) = submit_quote_acceptance(&quote, sig, state).await {
-				tracing::warn!("Failed to submit quote to discovery service: {}", e);
-				return Some(Err(APIError::InternalServerError {
-					error_type: "QUOTE_PROCESSING_FAILED".to_string(),
-					message: format!("Failed to process quote: {}", e),
-				}));
-			}
+		// Convert raw amount to USD using pricing service
+		let usd_amount = convert_raw_token_to_usd(
+			&input.amount,
+			&token_info.symbol,
+			token_info.decimals,
+			pricing_service,
+		)
+		.await?;
 
-			tracing::info!(
-				"Quote acceptance processed successfully, intent sent to solver pipeline"
-			);
-			Some(Ok(Json(serde_json::json!({
-				"message": "Quote accepted and intent submitted to solver pipeline",
-				"quoteId": quote_id,
-				"status": "received"
-			}))
-			.into_response()))
-		} else {
-			tracing::warn!("Quote acceptance missing signature");
-			Some(Err(APIError::BadRequest {
-				error_type: "MISSING_SIGNATURE".to_string(),
-				message: "Signature required for quote acceptance".to_string(),
-				details: Some(serde_json::json!({"quoteId": quote_id})),
-			}))
-		}
-	} else {
-		// Not a committed order, return None to indicate no handling needed
-		None
+		total_input_amount_usd += usd_amount;
 	}
-}
 
-/// Submit quote acceptance to the discovery service via HTTP request
-async fn submit_quote_acceptance(
-	quote: &solver_types::api::Quote,
-	signature: &str,
-	state: &AppState,
-) -> Result<(), APIError> {
-	// Get the discovery service URL (should already point to /intent endpoint)
-	let intent_url = state
-		.discovery_url
-		.as_ref()
-		.ok_or_else(|| APIError::InternalServerError {
-			error_type: "DISCOVERY_SERVICE_NOT_CONFIGURED".to_string(),
-			message: "Discovery service URL not configured".to_string(),
-		})?;
+	// Calculate total output amount in USD (sum of all outputs converted to USD)
+	let mut total_output_amount_usd = Decimal::ZERO;
+	for output in requested_outputs {
+		// Extract chain_id and ethereum address from InteropAddress
+		let chain_id = output
+			.asset
+			.ethereum_chain_id()
+			.map_err(|e| format!("Failed to get chain ID from asset: {}", e))?;
+		let ethereum_addr = output
+			.asset
+			.ethereum_address()
+			.map_err(|e| format!("Failed to get ethereum address from asset: {}", e))?;
+		let token_address = solver_types::Address(ethereum_addr.0.to_vec());
 
-	// Convert quote to IntentRequest format with encoded StandardOrder
-	let intent_request: serde_json::Value =
-		solver_types::api::QuoteWithSignature::from((quote, signature))
-			.try_into()
-			.map_err(|e| APIError::InternalServerError {
-				error_type: "QUOTE_CONVERSION_FAILED".to_string(),
-				message: format!("Failed to convert quote to intent format: {}", e),
-			})?;
+		// Get token info
+		let token_info = token_manager
+			.get_token_info(chain_id, &token_address)
+			.map_err(|e| format!("Failed to get token info: {}", e))?;
 
-	// Submit to discovery service using the shared HTTP client
-	let response = state
-		.http_client
-		.post(intent_url)
-		.json(&intent_request)
-		.send()
-		.await
-		.map_err(|e| APIError::ServiceUnavailable {
-			error_type: "DISCOVERY_SERVICE_UNAVAILABLE".to_string(),
-			message: format!("Failed to submit to discovery service: {}", e),
-			retry_after: Some(30),
-		})?;
+		// Convert raw amount to USD using pricing service
+		let usd_amount = convert_raw_token_to_usd(
+			&output.amount,
+			&token_info.symbol,
+			token_info.decimals,
+			pricing_service,
+		)
+		.await?;
 
-	if response.status().is_success() {
-		Ok(())
-	} else {
-		let error_text = response
-			.text()
-			.await
-			.unwrap_or_else(|_| "Unknown error".to_string());
-		Err(APIError::ServiceUnavailable {
-			error_type: "DISCOVERY_SERVICE_ERROR".to_string(),
-			message: format!("Discovery service returned error: {}", error_text),
-			retry_after: Some(30),
-		})
+		total_output_amount_usd += usd_amount;
 	}
+
+	// Extract operational cost from the components
+	let operational_cost_usd = cost_estimate
+		.components
+		.iter()
+		.find(|c| c.name == "operational-cost")
+		.and_then(|c| Decimal::from_str(&c.amount).ok())
+		.ok_or_else(|| "Operational cost component not found in cost estimate".to_string())?;
+
+	// Calculate the solver's actual profit margin
+	// Profit = Input Value - Output Value - Operational Costs
+	// Margin = Profit / Input Value * 100
+	if total_input_amount_usd.is_zero() {
+		return Err("Division by zero: total_input_amount_usd is zero".into());
+	}
+
+	let profit_usd = total_input_amount_usd - total_output_amount_usd - operational_cost_usd;
+	let hundred = Decimal::new(100_i64, 0);
+
+	let profit_margin_decimal = (profit_usd / total_input_amount_usd) * hundred;
+
+	tracing::debug!(
+		"Profitability calculation: input=${} (USD), output=${} (USD), operational_cost=${} (USD), profit=${} (USD), margin={}%",
+		total_input_amount_usd,
+		total_output_amount_usd,
+		operational_cost_usd,
+		profit_usd,
+		profit_margin_decimal
+	);
+
+	Ok(profit_margin_decimal)
 }
