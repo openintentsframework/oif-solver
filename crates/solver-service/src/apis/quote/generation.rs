@@ -871,7 +871,6 @@ mod tests {
 	};
 	use solver_settlement::{MockSettlementInterface, SettlementInterface};
 	use solver_types::parse_address;
-	use solver_types::NetworkConfig;
 	use solver_types::{
 		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
 		AvailableInput, QuotePreference, RequestedOutput, SignatureType,
@@ -1137,10 +1136,9 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
-		let mut config = create_test_config();
 		let request = create_test_request();
 		let params = serde_json::json!({"test": "value"});
-		let mut config = config;
+		let mut config = create_test_config();
 		let bsc_network = NetworkConfigBuilder::new()
 			.input_settler_address(
 				parse_address("0x5555555555555555555555555555555555555555").unwrap(),
