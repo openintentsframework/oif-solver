@@ -510,10 +510,11 @@ async fn validate_intent_request(
 	});
 
 	// EIP-712 signature validation for ResourceLock orders
-	if state
+	let requires_validation = state
 		.signature_validation
-		.requires_signature_validation(standard, &intent.lock_type)
-	{
+		.requires_signature_validation(standard, &intent.lock_type);
+
+	if requires_validation {
 		state
 			.signature_validation
 			.validate_signature(
@@ -527,7 +528,7 @@ async fn validate_intent_request(
 
 	// Process the order through the OrderService
 	// This validates the order based on the standard and returns a validated Order
-	state
+	let result = state
 		.solver
 		.order()
 		.validate_and_create_order(
@@ -538,11 +539,21 @@ async fn validate_intent_request(
 			&solver_address,
 		)
 		.await
-		.map_err(|e| APIError::BadRequest {
-			error_type: ApiErrorType::OrderValidationFailed,
-			message: format!("Order validation failed: {}", e),
-			details: None,
-		})
+		.map_err(|e| {
+			tracing::error!("Order validation failed with error: {}", e);
+			APIError::BadRequest {
+				error_type: ApiErrorType::OrderValidationFailed,
+				message: format!("Order validation failed: {}", e),
+				details: None,
+			}
+		});
+
+	match &result {
+		Ok(_) => tracing::debug!("Order validation completed successfully"),
+		Err(e) => tracing::error!("Order validation failed: {:?}", e),
+	}
+
+	result
 }
 
 async fn forward_to_discovery_service(

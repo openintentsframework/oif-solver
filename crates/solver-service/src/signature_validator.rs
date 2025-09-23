@@ -97,6 +97,7 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 			get_domain_separator(delivery_service, the_compact_address, origin_chain_id).await?;
 
 		// 2. Compute message hash using interface
+
 		let struct_hash = message_hasher.compute_message_hash(&intent.order, contract_address)?;
 
 		// 3. Extract signature using interface
@@ -104,6 +105,7 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 
 		// 4. Validate EIP-712 signature using interface
 		let expected_signer = standard_order.user;
+
 		let is_valid = signature_validator.validate_signature(
 			domain_separator,
 			struct_hash,
