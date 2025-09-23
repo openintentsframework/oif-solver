@@ -746,12 +746,12 @@ async fn handle_intent_submission(
 			}
 
 			(
-				StatusCode::OK,
+				StatusCode::ACCEPTED,
 				Json(IntentResponse {
 					order_id: Some(order_id),
 					status: IntentResponseStatus::Received,
 					message: Some(
-						"Basic validation passed, pending oracle route validation".to_string(),
+						"Basic validation passed, pending profitability validation and oracle route validation".to_string(),
 					),
 					order: order_json,
 				}),
