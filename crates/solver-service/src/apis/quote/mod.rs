@@ -112,7 +112,8 @@ pub async fn process_quote_request(
 
 	// Generate quotes using the business logic layer
 	let settlement_service = solver.settlement();
-	let quote_generator = QuoteGenerator::new(settlement_service.clone());
+	let delivery_service = solver.delivery();
+	let quote_generator = QuoteGenerator::new(settlement_service.clone(), delivery_service.clone());
 	let mut quotes = quote_generator.generate_quotes(&request, config).await?;
 
 	// Enrich quotes with a preliminary cost breakdown

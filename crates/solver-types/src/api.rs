@@ -303,6 +303,7 @@ impl TryFrom<(&Quote, &str, &str)> for IntentRequest {
 
 #[cfg(feature = "oif-interfaces")]
 impl IntentRequest {
+	/// Main conversion function from EIP-7683 quote to IntentRequest
 	fn from_eip7683_quote(
 		quote: &Quote,
 		signature: &str,
@@ -310,27 +311,29 @@ impl IntentRequest {
 		use crate::standards::eip7683::interfaces::StandardOrder;
 		use alloy_primitives::Bytes;
 		use alloy_sol_types::SolType;
-		use std::convert::TryFrom;
 
+		// Use the unified TryFrom implementation that handles all order types automatically
 		let sol_order = StandardOrder::try_from(quote)?;
 
 		// Extract the user address from the order
 		let user_address = sol_order.user;
 
-		// ABI encode the StandardOrder
+		// Encode the order
 		let encoded_order = StandardOrder::abi_encode(&sol_order);
 
-		// Parse lock_type using FromStr implementation
+		// Parse lock_type
 		let lock_type = quote
 			.lock_type
 			.parse::<LockType>()
 			.unwrap_or_else(|_| LockType::default());
 
-		// Create IntentRequest
+		// Create final IntentRequest
+		tracing::debug!("Creating IntentRequest with lock_type: {:?}", lock_type);
+		let signature_bytes = Bytes::from(hex::decode(signature.trim_start_matches("0x"))?);
 		Ok(IntentRequest {
 			order: Bytes::from(encoded_order),
 			sponsor: user_address,
-			signature: Bytes::from(hex::decode(signature.trim_start_matches("0x"))?),
+			signature: signature_bytes,
 			lock_type,
 		})
 	}

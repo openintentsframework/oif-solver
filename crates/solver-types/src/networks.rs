@@ -92,6 +92,9 @@ pub struct NetworkConfig {
 	/// Optional TheCompact contract address (for demos/tools)
 	#[serde(default)]
 	pub the_compact_address: Option<Address>,
+	/// Optional allocator address for TheCompact resource locks
+	#[serde(default)]
+	pub allocator_address: Option<Address>,
 }
 
 impl NetworkConfig {
