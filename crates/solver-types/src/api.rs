@@ -2,7 +2,6 @@
 //!
 //! This module defines the request and response types for the OIF Solver API
 //! endpoints, following the ERC-7683 Cross-Chain Intents Standard.
-#[cfg(feature = "oif-interfaces")]
 use crate::{
 	costs::CostEstimate,
 	standards::{eip7683::LockType, eip7930::InteropAddress},
