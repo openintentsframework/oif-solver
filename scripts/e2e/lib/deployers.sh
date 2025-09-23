@@ -84,12 +84,15 @@ deploy_all_contracts() {
     fi
     
     # Clear any existing address variables to ensure clean state
-    unset ORACLE_ADDRESS INPUT_SETTLER_ADDRESS OUTPUT_SETTLER_ADDRESS
+    unset ORACLE_ADDRESS_ORIGIN ORACLE_ADDRESS_DEST INPUT_SETTLER_ADDRESS_ORIGIN INPUT_SETTLER_ADDRESS_DEST OUTPUT_SETTLER_ADDRESS_ORIGIN OUTPUT_SETTLER_ADDRESS_DEST
     
-    # Track deployed addresses
-    local oracle_address=""
-    local input_settler_address=""
-    local output_settler_address=""
+    # Track deployed addresses for both chains
+    local oracle_address_origin=""
+    local oracle_address_dest=""
+    local input_settler_address_origin=""
+    local input_settler_address_dest=""
+    local output_settler_address_origin=""
+    local output_settler_address_dest=""
     
     # Deploy contracts based on configuration
     local num_contracts=$(get_config ".deployment.contracts | length" "0")
@@ -117,17 +120,29 @@ deploy_all_contracts() {
             # Store addresses for later use (from LAST_DEPLOYED_ADDRESS variable)
             local address="$LAST_DEPLOYED_ADDRESS"
             case "$name" in
-                "AlwaysYesOracle")
-                    oracle_address="$address"
-                    export ORACLE_ADDRESS="$address"
+                "AlwaysYesOracle_Origin")
+                    oracle_address_origin="$address"
+                    export ORACLE_ADDRESS_ORIGIN="$address"
                     ;;
-                "InputSettlerEscrow")
-                    input_settler_address="$address"
-                    export INPUT_SETTLER_ADDRESS="$address"
+                "AlwaysYesOracle_Destination")
+                    oracle_address_dest="$address"
+                    export ORACLE_ADDRESS_DEST="$address"
                     ;;
-                "OutputSettlerSimple")
-                    output_settler_address="$address"
-                    export OUTPUT_SETTLER_ADDRESS="$address"
+                "InputSettlerEscrow_Origin")
+                    input_settler_address_origin="$address"
+                    export INPUT_SETTLER_ADDRESS_ORIGIN="$address"
+                    ;;
+                "InputSettlerEscrow_Destination")
+                    input_settler_address_dest="$address"
+                    export INPUT_SETTLER_ADDRESS_DEST="$address"
+                    ;;
+                "OutputSettlerSimple_Origin")
+                    output_settler_address_origin="$address"
+                    export OUTPUT_SETTLER_ADDRESS_ORIGIN="$address"
+                    ;;
+                "OutputSettlerSimple_Destination")
+                    output_settler_address_dest="$address"
+                    export OUTPUT_SETTLER_ADDRESS_DEST="$address"
                     ;;
             esac
         else
@@ -183,10 +198,11 @@ verify_contracts() {
     
     local all_valid=true
     
-    # Check Oracle on origin
-    if [ -n "$ORACLE_ADDRESS" ]; then
-        echo -n "  Checking Oracle... "
-        if cast code "$ORACLE_ADDRESS" --rpc-url "$origin_rpc" 2>/dev/null | grep -q "0x"; then
+    # Check contracts on origin chain
+    echo "  Origin chain contracts:"
+    if [ -n "$ORACLE_ADDRESS_ORIGIN" ]; then
+        echo -n "    Oracle... "
+        if cast code "$ORACLE_ADDRESS_ORIGIN" --rpc-url "$origin_rpc" 2>/dev/null | grep -q "0x"; then
             echo -e "${GREEN}✓${NC}"
         else
             echo -e "${RED}Not found${NC}"
@@ -194,10 +210,9 @@ verify_contracts() {
         fi
     fi
     
-    # Check InputSettler on origin
-    if [ -n "$INPUT_SETTLER_ADDRESS" ]; then
-        echo -n "  Checking InputSettler... "
-        if cast code "$INPUT_SETTLER_ADDRESS" --rpc-url "$origin_rpc" 2>/dev/null | grep -q "0x"; then
+    if [ -n "$INPUT_SETTLER_ADDRESS_ORIGIN" ]; then
+        echo -n "    InputSettler... "
+        if cast code "$INPUT_SETTLER_ADDRESS_ORIGIN" --rpc-url "$origin_rpc" 2>/dev/null | grep -q "0x"; then
             echo -e "${GREEN}✓${NC}"
         else
             echo -e "${RED}Not found${NC}"
@@ -205,10 +220,41 @@ verify_contracts() {
         fi
     fi
     
-    # Check OutputSettler on destination
-    if [ -n "$OUTPUT_SETTLER_ADDRESS" ]; then
-        echo -n "  Checking OutputSettler... "
-        if cast code "$OUTPUT_SETTLER_ADDRESS" --rpc-url "$dest_rpc" 2>/dev/null | grep -q "0x"; then
+    if [ -n "$OUTPUT_SETTLER_ADDRESS_ORIGIN" ]; then
+        echo -n "    OutputSettler... "
+        if cast code "$OUTPUT_SETTLER_ADDRESS_ORIGIN" --rpc-url "$origin_rpc" 2>/dev/null | grep -q "0x"; then
+            echo -e "${GREEN}✓${NC}"
+        else
+            echo -e "${RED}Not found${NC}"
+            all_valid=false
+        fi
+    fi
+    
+    # Check contracts on destination chain
+    echo "  Destination chain contracts:"
+    if [ -n "$ORACLE_ADDRESS_DEST" ]; then
+        echo -n "    Oracle... "
+        if cast code "$ORACLE_ADDRESS_DEST" --rpc-url "$dest_rpc" 2>/dev/null | grep -q "0x"; then
+            echo -e "${GREEN}✓${NC}"
+        else
+            echo -e "${RED}Not found${NC}"
+            all_valid=false
+        fi
+    fi
+    
+    if [ -n "$INPUT_SETTLER_ADDRESS_DEST" ]; then
+        echo -n "    InputSettler... "
+        if cast code "$INPUT_SETTLER_ADDRESS_DEST" --rpc-url "$dest_rpc" 2>/dev/null | grep -q "0x"; then
+            echo -e "${GREEN}✓${NC}"
+        else
+            echo -e "${RED}Not found${NC}"
+            all_valid=false
+        fi
+    fi
+    
+    if [ -n "$OUTPUT_SETTLER_ADDRESS_DEST" ]; then
+        echo -n "    OutputSettler... "
+        if cast code "$OUTPUT_SETTLER_ADDRESS_DEST" --rpc-url "$dest_rpc" 2>/dev/null | grep -q "0x"; then
             echo -e "${GREEN}✓${NC}"
         else
             echo -e "${RED}Not found${NC}"

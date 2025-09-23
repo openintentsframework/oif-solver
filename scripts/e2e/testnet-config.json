@@ -103,14 +103,14 @@
         "chains": {
           "base-sepolia": {
             "chain_id": 84532,
-            "oracle": "0x0b88D54A39F330Dd7e773af4806BDC490c79cAB6",
+            "oracle": "0x378220D6De1301c9FbCe19f1860459CE84D4bBe7",
             "mailbox": "0x6966b0E55883d49BFB24539356a2f8A673E02039",
             "igp": "0x28B02B97a850872C4D33C3E024fab6499ad96564",
             "oracle_deployed": true
           },
           "optimism-sepolia": {
             "chain_id": 11155420,
-            "oracle": "0x0b88D54A39F330Dd7e773af4806BDC490c79cAB6",
+            "oracle": "0xc8604e4aBC757C5C1990BAe679A7b219808EDc9c",
             "mailbox": "0x6966b0E55883d49BFB24539356a2f8A673E02039",
             "igp": "0x28B02B97a850872C4D33C3E024fab6499ad96564",
             "oracle_deployed": true
@@ -171,17 +171,32 @@
     "deploy_contracts": true,
     "contracts": [
       {
-        "name": "AlwaysYesOracle",
+        "name": "AlwaysYesOracle_Origin",
         "contract": "test/mocks/AlwaysYesOracle.sol:AlwaysYesOracle",
         "chain": "origin"
       },
       {
-        "name": "InputSettlerEscrow",
+        "name": "AlwaysYesOracle_Destination",
+        "contract": "test/mocks/AlwaysYesOracle.sol:AlwaysYesOracle",
+        "chain": "destination"
+      },
+      {
+        "name": "InputSettlerEscrow_Origin",
         "contract": "src/input/escrow/InputSettlerEscrow.sol:InputSettlerEscrow",
         "chain": "origin"
       },
       {
-        "name": "OutputSettlerSimple",
+        "name": "InputSettlerEscrow_Destination",
+        "contract": "src/input/escrow/InputSettlerEscrow.sol:InputSettlerEscrow",
+        "chain": "destination"
+      },
+      {
+        "name": "OutputSettlerSimple_Origin",
+        "contract": "src/output/simple/OutputSettlerSimple.sol:OutputSettlerSimple",
+        "chain": "origin"
+      },
+      {
+        "name": "OutputSettlerSimple_Destination",
         "contract": "src/output/simple/OutputSettlerSimple.sol:OutputSettlerSimple",
         "chain": "destination"
       }
