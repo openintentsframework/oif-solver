@@ -85,7 +85,7 @@ rate_limit_delay_ms = 1200
 # SETTLEMENT
 # ============================================================================
 [settlement]
-settlement_poll_interval_seconds = 3 # How often to check can_claim
+settlement_poll_interval_seconds = 10 # How often to check can_claim
 
 [settlement.domain]
 chain_id = 11155420
@@ -128,12 +128,12 @@ finalization_required = true
 input = { 11155420 = [
     "0xc8604e4aBC757C5C1990BAe679A7b219808EDc9c",
 ], 84532 = [
-    "0x378220D6De1301c9FbCe19f1860459CE84D4bBe7",
+    "0xf79350C014e8669f2CE1dB928977a4f8E744f42B",
 ] }
 output = { 11155420 = [
     "0xc8604e4aBC757C5C1990BAe679A7b219808EDc9c",
 ], 84532 = [
-    "0x378220D6De1301c9FbCe19f1860459CE84D4bBe7",
+    "0xf79350C014e8669f2CE1dB928977a4f8E744f42B",
 ] }
 
 [settlement.implementations.hyperlane.routes]

@@ -343,6 +343,13 @@ struct SubmittedMessage {
 	submission_timestamp: u64,
 	#[serde(with = "u256_serde")]
 	gas_payment: U256,
+	// Store computed payload hash to avoid recomputing
+	#[serde(with = "hex::serde")]
+	payload_hash: [u8; 32],
+	// Store fill details for later use
+	#[serde(with = "hex::serde")]
+	solver_identifier: [u8; 32],
+	fill_timestamp: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,8 +357,9 @@ struct SubmittedMessage {
 struct DeliveredMessage {
 	#[serde(with = "hex::serde")]
 	message_id: [u8; 32],
-	delivery_tx_hash: TransactionHash,
 	delivery_timestamp: u64,
+	#[serde(with = "hex::serde")]
+	payload_hash: [u8; 32],
 }
 
 impl MessageTracker {
@@ -430,6 +438,7 @@ impl MessageTracker {
 		Ok(())
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	pub async fn track_submission(
 		&self,
 		order_id: String,
@@ -438,6 +447,9 @@ impl MessageTracker {
 		destination_chain: u64,
 		tx_hash: TransactionHash,
 		gas_payment: U256,
+		payload_hash: [u8; 32],
+		solver_identifier: [u8; 32],
+		fill_timestamp: u32,
 	) -> Result<(), SettlementError> {
 		let submission = SubmittedMessage {
 			message_id,
@@ -449,6 +461,9 @@ impl MessageTracker {
 				.unwrap()
 				.as_secs(),
 			gas_payment,
+			payload_hash,
+			solver_identifier,
+			fill_timestamp,
 		};
 
 		// Load existing state or create new
@@ -481,10 +496,8 @@ impl MessageTracker {
 	pub async fn mark_delivered(
 		&self,
 		order_id: String,
-		delivery_tx_hash: TransactionHash,
+		payload_hash: [u8; 32],
 	) -> Result<(), SettlementError> {
-		println!("Marking as delivered...");
-
 		// Load existing state
 		let mut state = self.load_message(&order_id).await.ok_or_else(|| {
 			SettlementError::ValidationFailed("Message not found in tracker".to_string())
@@ -493,11 +506,11 @@ impl MessageTracker {
 		if let Some(submission) = &state.submitted {
 			let delivery = DeliveredMessage {
 				message_id: submission.message_id,
-				delivery_tx_hash,
 				delivery_timestamp: std::time::SystemTime::now()
 					.duration_since(std::time::UNIX_EPOCH)
 					.unwrap()
 					.as_secs(),
+				payload_hash,
 			};
 			state.delivered = Some(delivery);
 
@@ -526,6 +539,178 @@ pub struct HyperlaneSettlement {
 }
 
 impl HyperlaneSettlement {
+	/// Compute the payload hash that will be checked with isProven
+	fn compute_payload_hash(
+		&self,
+		order: &Order,
+		solver_identifier: [u8; 32],
+		timestamp: u32,
+	) -> Result<[u8; 32], SettlementError> {
+		// Extract output details from order
+		let output = extract_output_details(order)?;
+		let order_id_bytes = order_id_to_bytes32(&order.id);
+
+		// Encode the FillDescription payload
+		let payload = encode_fill_description(
+			solver_identifier,
+			order_id_bytes,
+			timestamp,
+			output.token,
+			output.amount,
+			output.recipient,
+			output.call,
+			output.context,
+		)?;
+
+		// Hash the payload (matches oracle's storage)
+		let mut hasher = Keccak256::new();
+		hasher.update(&payload);
+		let hash = hasher.finalize();
+
+		let mut result = [0u8; 32];
+		result.copy_from_slice(&hash);
+		Ok(result)
+	}
+
+	/// Check if a payload has been proven on the oracle
+	async fn is_payload_proven(
+		&self,
+		oracle_chain: u64,
+		oracle_address: solver_types::Address,
+		remote_chain: u64,
+		remote_oracle: [u8; 32],
+		application: [u8; 32],
+		payload_hash: [u8; 32],
+	) -> Result<bool, SettlementError> {
+		let provider = self.providers.get(&oracle_chain).ok_or_else(|| {
+			SettlementError::ValidationFailed(format!("No provider for chain {}", oracle_chain))
+		})?;
+
+		// Build the call
+		let call_data = IHyperlaneOracle::isProvenCall {
+			remoteChainId: U256::from(remote_chain),
+			remoteOracle: FixedBytes::<32>::from(remote_oracle),
+			application: FixedBytes::<32>::from(application),
+			dataHash: FixedBytes::<32>::from(payload_hash),
+		};
+
+		// Execute eth_call
+		let request = alloy_rpc_types::eth::transaction::TransactionRequest {
+			to: Some(alloy_primitives::TxKind::Call(
+				alloy_primitives::Address::from_slice(&oracle_address.0),
+			)),
+			input: call_data.abi_encode().into(),
+			..Default::default()
+		};
+
+		let result = provider.call(&request).await.map_err(|e| {
+			SettlementError::ValidationFailed(format!("Failed to call isProven: {}", e))
+		})?;
+
+		// Decode boolean (last byte of 32-byte result)
+		let is_proven = result.len() >= 32 && result[31] != 0;
+		Ok(is_proven)
+	}
+
+	/// Check if a Hyperlane message has been delivered
+	async fn check_delivery(
+		&self,
+		order: &Order,
+		message_id: [u8; 32],
+	) -> Result<bool, SettlementError> {
+		let order_id = &order.id;
+
+		// Load message state
+		let mut state =
+			self.message_tracker
+				.load_message(order_id)
+				.await
+				.unwrap_or(HyperlaneMessageState {
+					submitted: None,
+					delivered: None,
+				});
+
+		// Already delivered?
+		if state.delivered.is_some() {
+			return Ok(true);
+		}
+
+		// Get submission info with pre-computed payload hash
+		let submission = match state.submitted.as_ref() {
+			Some(s) => s,
+			None => {
+				return Err(SettlementError::ValidationFailed(
+					"No submission info".to_string(),
+				));
+			},
+		};
+
+		// Use stored chains and payload hash
+		let origin_chain = submission.origin_chain;
+		let dest_chain = submission.destination_chain;
+		let payload_hash = submission.payload_hash;
+
+		// Select oracles
+		// We need the input oracle on the destination chain (where we check isProven)
+		let input_oracle = self
+			.select_oracle(&self.get_input_oracles(dest_chain), None)
+			.ok_or_else(|| SettlementError::ValidationFailed("No input oracle".to_string()))?;
+
+		// We need the output oracle on the origin chain (the remote oracle)
+		let output_oracle = self
+			.select_oracle(&self.get_output_oracles(origin_chain), None)
+			.ok_or_else(|| SettlementError::ValidationFailed("No output oracle".to_string()))?;
+
+		// Get application address (OutputSettler)
+		let application = order
+			.output_chains
+			.first()
+			.ok_or_else(|| SettlementError::ValidationFailed("No output settler".into()))?
+			.settler_address
+			.clone();
+
+		// Convert to bytes32 format
+		let mut remote_oracle_bytes = [0u8; 32];
+		remote_oracle_bytes[12..].copy_from_slice(&output_oracle.0);
+
+		let mut application_bytes = [0u8; 32];
+		application_bytes[12..].copy_from_slice(&application.0);
+
+		let is_proven = self
+			.is_payload_proven(
+				dest_chain,          // Chain where we call isProven (destination of message)
+				input_oracle,        // Input oracle on destination chain
+				origin_chain,        // Remote chain (origin of message)
+				remote_oracle_bytes, // Output oracle on origin chain
+				application_bytes,
+				payload_hash,
+			)
+			.await?;
+
+		if is_proven {
+			let now = std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_secs();
+
+			state.delivered = Some(DeliveredMessage {
+				message_id,
+				delivery_timestamp: now,
+				payload_hash,
+			});
+
+			self.message_tracker.save_message(order_id, &state).await?;
+
+			tracing::debug!(
+				order_id = %solver_types::utils::formatting::truncate_id(order_id),
+				message_id = %hex::encode(message_id),
+				"Hyperlane message proven"
+			);
+		}
+
+		Ok(is_proven)
+	}
+
 	/// Extract message ID from Dispatch event logs
 	fn extract_message_id_from_logs(
 		&self,
@@ -785,8 +970,6 @@ impl SettlementInterface for HyperlaneSettlement {
 		order: &Order,
 		tx_hash: &TransactionHash,
 	) -> Result<FillProof, SettlementError> {
-		println!("Getting attestation...");
-
 		let origin_chain_id = order
 			.input_chains
 			.first()
@@ -886,33 +1069,14 @@ impl SettlementInterface for HyperlaneSettlement {
 	}
 
 	async fn can_claim(&self, order: &Order, fill_proof: &FillProof) -> bool {
-		println!("Checking if can_claim...");
+		tracing::debug!(
+			order_id = %solver_types::utils::formatting::truncate_id(&order.id),
+			"Checking Hyperlane claim readiness"
+		);
 
-		let origin_chain_id = match order.input_chains.first() {
-			Some(chain) => chain.chain_id,
-			None => return false,
-		};
-
-		// Get the input oracle for checking finalization
-		let oracle_addresses = self.get_input_oracles(origin_chain_id);
-		if oracle_addresses.is_empty() {
-			return false;
-		}
-
-		let oracle_address = match self.select_oracle(&oracle_addresses, None) {
-			Some(addr) => addr,
-			None => return false,
-		};
-
-		let provider = match self.providers.get(&origin_chain_id) {
-			Some(p) => p,
-			None => return false,
-		};
-
-		// Check if we have a message ID in the attestation data
+		// Extract message ID from attestation data
 		let message_id = match &fill_proof.attestation_data {
 			Some(data) if data.len() == 64 => {
-				// Hex encoded 32 bytes
 				let mut id = [0u8; 32];
 				if hex::decode_to_slice(data, &mut id).is_ok() {
 					Some(id)
@@ -923,24 +1087,34 @@ impl SettlementInterface for HyperlaneSettlement {
 			_ => None,
 		};
 
+		// No message = can claim immediately
 		if message_id.is_none() {
-			// No Hyperlane message was submitted, can claim immediately
+			tracing::debug!(
+				order_id = %solver_types::utils::formatting::truncate_id(&order.id),
+				"No Hyperlane message, claim ready"
+			);
 			return true;
 		}
 
-		// Check if finalization is required
-		match self
-			.message_tracker
-			.check_finalization_required(&order.id, oracle_address, provider)
-			.await
-		{
-			Ok(false) => true, // No finalization required, can claim
-			Ok(true) => {
-				// Check if already finalized by querying the oracle
-				// This would require another contract call to check finalization status
+		// Check if message has been delivered
+		match self.check_delivery(order, message_id.unwrap()).await {
+			Ok(delivered) => {
+				if delivered {
+					tracing::debug!(
+						order_id = %solver_types::utils::formatting::truncate_id(&order.id),
+						"Hyperlane message delivered, claim ready"
+					);
+				}
+				delivered
+			},
+			Err(e) => {
+				tracing::error!(
+					order_id = %solver_types::utils::formatting::truncate_id(&order.id),
+					error = %e,
+					"Error checking Hyperlane delivery"
+				);
 				false
 			},
-			Err(_) => false,
 		}
 	}
 
@@ -1090,22 +1264,67 @@ impl SettlementInterface for HyperlaneSettlement {
 			// Extract message ID from Dispatch event logs
 			let message_id = self.extract_message_id_from_logs(&receipt.logs)?;
 
-			// Store in message tracker for later use in can_claim and pre_claim
+			// Need to get the fill transaction to extract solver and timestamp
+			let dest_provider = self.providers.get(&dest_chain).ok_or_else(|| {
+				SettlementError::ValidationFailed(format!("No provider for chain {}", dest_chain))
+			})?;
+
+			let fill_receipt = dest_provider
+				.get_transaction_receipt(FixedBytes::<32>::from_slice(
+					&order.fill_tx_hash.as_ref().unwrap().0,
+				))
+				.await
+				.map_err(|e| {
+					SettlementError::ValidationFailed(format!("Failed to get fill receipt: {}", e))
+				})?
+				.ok_or_else(|| {
+					SettlementError::ValidationFailed("Fill transaction not found".to_string())
+				})?;
+
+			// Extract solver and timestamp from fill logs
+			let logs: Vec<solver_types::Log> = fill_receipt
+				.inner
+				.logs()
+				.iter()
+				.map(|log| solver_types::Log {
+					address: solver_types::Address(log.address().0 .0.to_vec()),
+					topics: log
+						.topics()
+						.iter()
+						.map(|t| solver_types::H256(t.0))
+						.collect(),
+					data: log.data().data.to_vec(),
+				})
+				.collect();
+
+			let order_id_bytes = order_id_to_bytes32(&order.id);
+			let (solver_bytes, timestamp) = extract_fill_details_from_logs(&logs, &order_id_bytes)?;
+
+			let mut solver_id = [0u8; 32];
+			solver_id.copy_from_slice(&solver_bytes);
+
+			// Compute payload hash once and store it
+			let payload_hash = self.compute_payload_hash(order, solver_id, timestamp)?;
+
+			// Store in message tracker with all details for later use
+			// PostFill happens on dest_chain, message goes from dest_chain to origin_chain
 			self.message_tracker
 				.track_submission(
 					order.id.clone(),
 					message_id,
-					dest_chain,
-					origin_chain,
+					dest_chain,   // origin_chain in submission = where message originates from
+					origin_chain, // destination_chain in submission = where message goes to
 					receipt.hash.clone(),
-					U256::ZERO, // Gas payment would be calculated from actual receipt
+					U256::ZERO, // TODO: Gas payment would be calculated from actual receipt
+					payload_hash,
+					solver_id,
+					timestamp,
 				)
 				.await?;
 
 			tracing::info!(
-				"Hyperlane message tracked for order {} with message_id {}",
-				order.id,
-				hex::encode(message_id)
+				message_id = %hex::encode(message_id),
+				"Hyperlane message tracked"
 			);
 		}
 		Ok(())
