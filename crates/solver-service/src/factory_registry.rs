@@ -12,7 +12,8 @@ use solver_order::{ExecutionStrategy, OrderError, OrderInterface, StrategyError}
 
 use solver_settlement::{SettlementError, SettlementInterface};
 use solver_storage::{StorageError, StorageInterface};
-use solver_types::{NetworksConfig, PricingError, PricingInterface};
+use solver_pricing::PricingInterface;
+use solver_types::{NetworksConfig, PricingError};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 

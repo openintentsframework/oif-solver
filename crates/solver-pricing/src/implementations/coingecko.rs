@@ -12,9 +12,9 @@ use reqwest::{
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use solver_types::utils::wei_string_to_eth_string;
+use crate::{PricingFactory, PricingInterface, PricingRegistry};
 use solver_types::{
-	ConfigSchema, ImplementationRegistry, PricingError, PricingFactory, PricingInterface,
-	PricingRegistry, TradingPair, ValidationError,
+	ConfigSchema, ImplementationRegistry, PricingError, TradingPair, ValidationError,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
