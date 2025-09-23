@@ -71,4 +71,3 @@ pub struct AssetPrice {
 	/// Timestamp when this price was retrieved (Unix timestamp).
 	pub timestamp: u64,
 }
-

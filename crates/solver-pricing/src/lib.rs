@@ -4,9 +4,7 @@
 //! wei amounts and fiat currencies. Currently supports mock pricing for development.
 
 use async_trait::async_trait;
-use solver_types::{
-	ConfigSchema, ImplementationRegistry, PricingError, TradingPair,
-};
+use solver_types::{ConfigSchema, ImplementationRegistry, PricingError, TradingPair};
 
 /// Trait defining the interface for pricing oracle implementations.
 ///

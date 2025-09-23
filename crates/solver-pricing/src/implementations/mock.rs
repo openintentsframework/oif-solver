@@ -3,13 +3,14 @@
 //! This implementation provides fixed asset prices for development purposes.
 //! Supports ETH/USD, ETH/SOL, SOL/USD pairs as requested.
 
+use crate::{PricingFactory, PricingInterface, PricingRegistry};
 use alloy_primitives::utils::parse_ether;
 use async_trait::async_trait;
 use solver_types::utils::wei_string_to_eth_string;
-use crate::{PricingFactory, PricingInterface, PricingRegistry};
 use solver_types::{
 	ConfigSchema, ImplementationRegistry, PricingError, TradingPair, ValidationError,
-	MOCK_ETH_SOL_PRICE, MOCK_ETH_USD_PRICE, MOCK_SOL_USD_PRICE, MOCK_TOKA_USD_PRICE, MOCK_TOKB_USD_PRICE,
+	MOCK_ETH_SOL_PRICE, MOCK_ETH_USD_PRICE, MOCK_SOL_USD_PRICE, MOCK_TOKA_USD_PRICE,
+	MOCK_TOKB_USD_PRICE,
 };
 use std::collections::HashMap;
 use toml;
