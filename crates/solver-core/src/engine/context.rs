@@ -262,7 +262,8 @@ mod tests {
 	use solver_account::MockAccountInterface;
 	use solver_delivery::MockDeliveryInterface;
 	use solver_types::{
-		utils::tests::builders::IntentBuilder, Address, Intent, NetworksConfig, TokenConfig,
+		networks::RpcEndpoint, utils::tests::builders::IntentBuilder, Address, Intent,
+		NetworkConfig, NetworksConfig, TokenConfig,
 	};
 	use std::collections::HashMap;
 
@@ -322,10 +323,8 @@ mod tests {
 		let mut networks = NetworksConfig::new();
 
 		// Add test network with some tokens
-		let network_config = solver_types::NetworkConfig {
-			rpc_urls: vec![solver_types::networks::RpcEndpoint::http_only(
-				"http://localhost:8545".to_string(),
-			)],
+		let network_config = NetworkConfig {
+			rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
 			input_settler_address: Address([0x11; 20].to_vec()),
 			output_settler_address: Address([0x22; 20].to_vec()),
 			tokens: vec![
@@ -342,6 +341,7 @@ mod tests {
 			],
 			input_settler_compact_address: None,
 			the_compact_address: None,
+			allocator_address: None,
 		};
 
 		networks.insert(1, network_config);

@@ -577,6 +577,7 @@ mod tests {
 			[solver]
 			id = "test-solver"
 			monitoring_timeout_minutes = 30
+			min_profitability_pct = 1.0
 			
 			[storage]
 			primary = "memory"
