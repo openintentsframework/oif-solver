@@ -74,21 +74,30 @@ impl CustodyStrategy {
 		input: &AvailableInput,
 	) -> Result<CustodyDecision, QuoteError> {
 		if let Some(lock) = &input.lock {
-			return self.handle_resource_lock(lock);
+			return self.handle_explicit_lock(lock);
 		}
 		self.decide_escrow_strategy(input).await
 	}
 
-	fn handle_resource_lock(
+	fn handle_explicit_lock(
 		&self,
 		lock: &solver_types::Lock,
 	) -> Result<CustodyDecision, QuoteError> {
-		let lock_kind = match lock.kind {
-			ApiLockKind::TheCompact => LockKind::TheCompact {
-				params: lock.params.clone().unwrap_or_default(),
+		match lock.kind {
+			ApiLockKind::TheCompact => {
+				let lock_kind = LockKind::TheCompact {
+					params: lock.params.clone().unwrap_or_default(),
+				};
+				Ok(CustodyDecision::ResourceLock { kind: lock_kind })
 			},
-		};
-		Ok(CustodyDecision::ResourceLock { kind: lock_kind })
+			// Permit2 and EIP3009 are escrow mechanisms, not resource locks
+			ApiLockKind::Permit2 => Ok(CustodyDecision::Escrow {
+				kind: EscrowKind::Permit2,
+			}),
+			ApiLockKind::Eip3009 => Ok(CustodyDecision::Escrow {
+				kind: EscrowKind::Erc3009,
+			}),
+		}
 	}
 
 	async fn decide_escrow_strategy(

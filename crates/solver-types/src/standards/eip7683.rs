@@ -60,7 +60,7 @@ impl LockType {
 	pub fn as_str(&self) -> &'static str {
 		match self {
 			LockType::Permit2Escrow => "permit2_escrow",
-			LockType::Eip3009Escrow => "eip3009_escrow",
+			LockType::Eip3009Escrow => "eip3009_escrow", // Use standardized eip3009 prefix
 			LockType::ResourceLock => "compact_resource_lock",
 		}
 	}
@@ -73,7 +73,7 @@ impl FromStr for LockType {
 		match s {
 			// String representations
 			"permit2_escrow" => Ok(LockType::Permit2Escrow),
-			"eip3009_escrow" => Ok(LockType::Eip3009Escrow),
+			"eip3009_escrow" | "erc3009_escrow" => Ok(LockType::Eip3009Escrow), // Accept both variants for compatibility
 			"compact_resource_lock" => Ok(LockType::ResourceLock),
 			// Numeric string representations
 			"1" => Ok(LockType::Permit2Escrow),
@@ -367,16 +367,31 @@ impl TryFrom<&Quote> for interfaces::StandardOrder {
 	type Error = Box<dyn std::error::Error>;
 
 	fn try_from(quote: &Quote) -> Result<Self, Self::Error> {
-		// Extract and validate EIP-712 data from quote to detect order type
-		let (eip712_data, primary_type) = Self::extract_eip712_data_from_quote(quote)?;
+		// Get the first order to determine the signature type
+		let quote_order = quote
+			.orders
+			.first()
+			.ok_or("Quote must contain at least one order")?;
 
-		// Determine processing approach based on order type
-		if primary_type == "BatchCompact" {
-			// Handle BatchCompact (ResourceLock) orders
-			Self::handle_batch_compact_quote_conversion(quote, eip712_data)
-		} else {
-			// Handle Permit2/EIP3009 orders using existing implementation
-			Self::handle_permit2_eip3009_quote_conversion(quote, eip712_data)
+		// Handle different order types based on signature type
+		match quote_order.signature_type {
+			crate::SignatureType::Erc3009 => {
+				// Handle ERC-3009 orders directly without looking for eip712 object
+				Self::handle_erc3009_quote_conversion(quote)
+			},
+			crate::SignatureType::Eip712 => {
+				// Extract and validate EIP-712 data from quote to detect order type
+				let (eip712_data, primary_type) = Self::extract_eip712_data_from_quote(quote)?;
+
+				// Determine processing approach based on order type
+				if primary_type == "BatchCompact" {
+					// Handle BatchCompact (ResourceLock) orders
+					Self::handle_batch_compact_quote_conversion(quote, eip712_data)
+				} else {
+					// Handle Permit2 orders using existing implementation
+					Self::handle_permit2_quote_conversion(quote, eip712_data)
+				}
+			},
 		}
 	}
 }
@@ -406,8 +421,8 @@ impl interfaces::StandardOrder {
 		Ok((eip712_data, primary_type))
 	}
 
-	/// Handle Permit2/EIP3009 order conversion (original logic)
-	fn handle_permit2_eip3009_quote_conversion(
+	/// Handle Permit2 order conversion (original logic)
+	fn handle_permit2_quote_conversion(
 		quote: &Quote,
 		eip712_data: &serde_json::Map<String, serde_json::Value>,
 	) -> Result<Self, Box<dyn std::error::Error>> {
@@ -544,6 +559,154 @@ impl interfaces::StandardOrder {
 			inputs,
 			outputs: sol_outputs,
 		})
+	}
+
+	/// Handle ERC-3009 order conversion
+	fn handle_erc3009_quote_conversion(quote: &Quote) -> Result<Self, Box<dyn std::error::Error>> {
+		use crate::standards::eip7930::InteropAddress;
+		use alloy_primitives::{Address, U256};
+		use interfaces::SolMandateOutput;
+
+		// Extract message data from ERC-3009 order
+		let quote_order = quote
+			.orders
+			.first()
+			.ok_or("Quote must contain at least one order")?;
+		let message_data = quote_order
+			.message
+			.as_object()
+			.ok_or("Invalid ERC-3009 message structure")?;
+
+		// Extract user address from message 'from' field
+		let from_str = message_data
+			.get("from")
+			.and_then(|f| f.as_str())
+			.ok_or("Missing 'from' field in ERC-3009 message")?;
+		let user_address = Address::from_slice(&hex::decode(from_str.trim_start_matches("0x"))?);
+
+		// For ERC-3009, the nonce from the message is temporary
+		// The real nonce should be the orderIdentifier calculated from the final StandardOrder
+		// We'll calculate this after building the StandardOrder structure
+
+		// Get origin chain ID from available inputs
+		let origin_chain_id = {
+			let input = quote
+				.details
+				.available_inputs
+				.first()
+				.ok_or("Quote must have at least one available input")?;
+			let interop_address = InteropAddress::from_hex(&input.asset.to_string())?;
+			U256::from(interop_address.ethereum_chain_id()?)
+		};
+
+		// Extract timing from 'validBefore' field
+		let valid_before = message_data
+			.get("validBefore")
+			.and_then(|v| v.as_i64())
+			.unwrap_or(0) as u32;
+		let expires = valid_before;
+		let fill_deadline = valid_before;
+
+		// For ERC-3009 orders, extract inputOracle from the message
+		let input_oracle_str = message_data
+			.get("inputOracle")
+			.and_then(|o| o.as_str())
+			.ok_or("Missing 'inputOracle' in ERC-3009 message")?;
+		let input_oracle =
+			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
+
+		// Build inputs from available inputs in quote details
+		let inputs = quote
+			.details
+			.available_inputs
+			.iter()
+			.map(|input| {
+				let interop_address = InteropAddress::from_hex(&input.asset.to_string())
+					.map_err(|e| format!("Invalid asset address: {}", e))?;
+				let token_address = interop_address
+					.ethereum_address()
+					.map_err(|e| format!("Invalid Ethereum address: {}", e))?;
+
+				// Convert token address to U256 (padded to 32 bytes)
+				let mut token_bytes = [0u8; 32];
+				token_bytes[12..32].copy_from_slice(&token_address.0 .0);
+				let token_u256 = U256::from_be_bytes(token_bytes);
+
+				Ok([token_u256, input.amount])
+			})
+			.collect::<Result<Vec<_>, String>>()?;
+
+		// Build outputs from requested outputs in quote details (same as other flows)
+		let mut sol_outputs = Vec::new();
+		for output in &quote.details.requested_outputs {
+			let output_interop = InteropAddress::from_hex(&output.asset.to_string())?;
+			let receiver_interop = InteropAddress::from_hex(&output.receiver.to_string())?;
+
+			let chain_id = output_interop.ethereum_chain_id()?;
+			let token_address = output_interop.ethereum_address()?;
+			let recipient_address = receiver_interop.ethereum_address()?;
+
+			// Convert addresses to bytes32 format
+			let mut token_bytes = [0u8; 32];
+			token_bytes[12..32].copy_from_slice(&token_address.0 .0);
+
+			let mut recipient_bytes = [0u8; 32];
+			recipient_bytes[12..32].copy_from_slice(&recipient_address.0 .0);
+
+			// Use the correct output_settler address (same as direct intent)
+			// TODO: Get this from config properly instead of hardcoding
+			let output_settler_hex = "0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9";
+			let output_settler_bytes = hex::decode(output_settler_hex.trim_start_matches("0x"))
+				.map_err(|e| format!("Invalid output settler address: {}", e))?;
+			let mut settler_bytes32 = [0u8; 32];
+			settler_bytes32[12..32].copy_from_slice(&output_settler_bytes);
+
+			sol_outputs.push(SolMandateOutput {
+				oracle: [0u8; 32].into(),        // Zero oracle for ERC-3009
+				settler: settler_bytes32.into(), // Use correct output settler
+				chainId: U256::from(chain_id),
+				token: token_bytes.into(),
+				amount: output.amount,
+				recipient: recipient_bytes.into(),
+				call: Vec::new().into(),
+				context: Vec::new().into(),
+			});
+		}
+
+		// For ERC-3009, use the realNonce (original microseconds) for StandardOrder construction
+		// The 'nonce' field contains the order_identifier used for signature, 'realNonce' contains the actual nonce
+		let nonce_str = message_data
+			.get("realNonce")
+			.and_then(|n| n.as_str())
+			.or_else(|| message_data.get("nonce").and_then(|n| n.as_str())) // Fallback for compatibility
+			.ok_or("Missing 'realNonce' or 'nonce' field in ERC-3009 message")?;
+		let nonce = U256::from_str_radix(nonce_str.trim_start_matches("0x"), 16)
+			.map_err(|e| format!("Invalid nonce format: {}", e))?;
+
+		let standard_order = interfaces::StandardOrder {
+			user: user_address,
+			nonce,
+			originChainId: origin_chain_id,
+			expires,
+			fillDeadline: fill_deadline,
+			inputOracle: input_oracle,
+			inputs,
+			outputs: sol_outputs,
+		};
+
+		// Debug log the reconstructed StandardOrder for ERC-3009
+		tracing::info!("=== ERC-3009 QUOTE CONVERSION DEBUG ===");
+		tracing::info!("Reconstructed StandardOrder:");
+		tracing::info!("  user: {:?}", standard_order.user);
+		tracing::info!("  nonce: {:#x}", standard_order.nonce);
+		tracing::info!("  originChainId: {}", standard_order.originChainId);
+		tracing::info!("  expires: {}", standard_order.expires);
+		tracing::info!("  fillDeadline: {}", standard_order.fillDeadline);
+		tracing::info!("  inputOracle: {:?}", standard_order.inputOracle);
+		tracing::info!("  inputs.len(): {}", standard_order.inputs.len());
+		tracing::info!("  outputs.len(): {}", standard_order.outputs.len());
+
+		Ok(standard_order)
 	}
 
 	/// Handle BatchCompact order conversion for ResourceLock (moved from existing function)
@@ -721,10 +884,19 @@ impl QuoteParsable for Eip7683OrderData {
 		let mut order_data = Eip7683OrderData::from(standard_order.clone());
 
 		// Add the lock type from the quote
-		let lock_type = quote
-			.lock_type
-			.parse::<LockType>()
-			.unwrap_or_else(|_| LockType::default());
+		let lock_type = quote.lock_type.parse::<LockType>().unwrap_or_else(|e| {
+			tracing::warn!(
+				"Failed to parse lock_type '{}': {}, using default",
+				quote.lock_type,
+				e
+			);
+			LockType::default()
+		});
+		tracing::debug!(
+			"Converting quote with lock_type '{}' -> {:?}",
+			quote.lock_type,
+			lock_type
+		);
 		order_data.lock_type = Some(lock_type);
 
 		// Extract chain IDs for the Order

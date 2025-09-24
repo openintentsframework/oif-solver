@@ -44,6 +44,12 @@ impl Default for ProtocolRegistry {
 		registry.add_erc3009_token(42161, "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"); // Arbitrum native USDC
 		registry.add_erc3009_token(10, "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"); // Optimism native USDC
 		registry.add_erc3009_token(8453, "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"); // Base USDC
+
+		// Configure test tokens for demo/development (both chains 31337 and 31338)
+		registry.add_erc3009_token(31337, "0x5FbDB2315678afecb367f032d93F642f64180aa3"); // Demo TOKA chain 31337
+		registry.add_erc3009_token(31337, "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"); // Demo TOKB chain 31337
+		registry.add_erc3009_token(31338, "0x5FbDB2315678afecb367f032d93F642f64180aa3"); // Demo TOKA chain 31338
+		registry.add_erc3009_token(31338, "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"); // Demo TOKB chain 31338
 		registry
 	}
 }
@@ -137,10 +143,24 @@ mod tests {
 			.unwrap();
 		assert!(registry.supports_erc3009(1, usdc_mainnet));
 
+		// Test demo tokens (TOKA and TOKB) on test chains
+		let demo_toka: Address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+			.parse()
+			.unwrap();
+		let demo_tokb: Address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+			.parse()
+			.unwrap();
+
+		assert!(registry.supports_erc3009(31337, demo_toka)); // TOKA on chain 31337
+		assert!(registry.supports_erc3009(31337, demo_tokb)); // TOKB on chain 31337
+		assert!(registry.supports_erc3009(31338, demo_toka)); // TOKA on chain 31338
+		assert!(registry.supports_erc3009(31338, demo_tokb)); // TOKB on chain 31338
+
 		// Test random token
 		let random_token: Address = "0x0000000000000000000000000000000000000000"
 			.parse()
 			.unwrap();
 		assert!(!registry.supports_erc3009(1, random_token));
+		assert!(!registry.supports_erc3009(31337, random_token)); // Random token shouldn't be supported
 	}
 }

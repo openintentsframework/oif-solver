@@ -722,52 +722,241 @@ quote_accept() {
             print_error "User private key not configured"
             return 1
         fi
-        print_debug "User key found, extracting EIP-712 message..."
+        print_debug "User key found, determining order type..."
 
-        # Extract the full message object (contains both digest and eip712)
+        # Extract the full message object and signature type
         local full_message=$(echo "$order_data" | jq -r '.message // empty')
+        local signature_type=$(echo "$order_data" | jq -r '.signatureType // empty')
+        local primary_type=$(echo "$order_data" | jq -r '.primaryType // empty')
+        
         if [ -z "$full_message" ] || [ "$full_message" = "null" ]; then
             print_error "No message found in order"
             return 1
         fi
 
-        # Extract EIP-712 message for signing (for compatibility with existing code)
-        local eip712_message=$(echo "$full_message" | jq -r '.eip712 // empty')
-        if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ]; then
-            print_error "No EIP-712 message found in order"
-            return 1
-        fi
-
-        print_info "Signing EIP-712 order..."
-
-        # Determine the order type based on primaryType
-        local primary_type=$(echo "$eip712_message" | jq -r '.primaryType // "PermitBatchWitnessTransferFrom"')
-        print_debug "Primary type: $primary_type"
-
+        print_debug "Signature type: $signature_type, Primary type: $primary_type"
         local signature=""
 
-        if [ "$primary_type" = "BatchCompact" ]; then
-            print_info "Detected BatchCompact order, using compact signing..."
+        if [ "$signature_type" = "erc3009" ]; then
+            print_info "Signing ERC-3009 order..."
 
-            # Use client-side digest computation
-            signature=$(sign_compact_digest_from_quote "$user_key" "$full_message")
+            # Check if this is a multi-signature order (new format)
+            local signatures_array=$(echo "$full_message" | jq -r '.signatures // empty')
 
-            if [ -z "$signature" ]; then
-                print_error "Failed to sign BatchCompact order"
+            if [ -n "$signatures_array" ] && [ "$signatures_array" != "null" ] && [ "$signatures_array" != "empty" ]; then
+                # Handle multiple signatures (new format from quote generator)
+                print_info "Processing multiple ERC-3009 signatures..."
+
+                local signature_count=$(echo "$signatures_array" | jq '. | length')
+                print_debug "Number of signatures required: $signature_count"
+
+                local signatures_bytes_array=""
+                local i=0
+
+                # Process each signature in the array
+                while [ $i -lt "$signature_count" ]; do
+                    local sig_message=$(echo "$signatures_array" | jq -r ".[$i]")
+
+                    # Parse individual signature message
+                    local domain_address=$(echo "$order_data" | jq -r '.domain // empty')
+                    local uii_parsed=$(from_uii_address "$domain_address")
+                    local origin_chain_id=$(echo "$uii_parsed" | cut -d' ' -f1)
+                    local token_contract=$(echo "$uii_parsed" | cut -d' ' -f2)
+
+                    local from_address=$(echo "$sig_message" | jq -r '.from // empty')
+                    local to_address=$(echo "$sig_message" | jq -r '.to // empty')
+                    local value=$(echo "$sig_message" | jq -r '.value // empty')
+                    local valid_after=$(echo "$sig_message" | jq -r '.validAfter // 0')
+                    local valid_before=$(echo "$sig_message" | jq -r '.validBefore // 0')
+                    local nonce=$(echo "$sig_message" | jq -r '.nonce // empty')
+
+                    print_debug "Signature $((i+1)): token=$token_contract, value=$value, nonce=$nonce"
+
+                    # Sign this individual ERC-3009 authorization
+                    local individual_signature=$(sign_erc3009_authorization \
+                        "$user_key" "$origin_chain_id" "$token_contract" \
+                        "$from_address" "$to_address" "$value" \
+                        "$valid_after" "$valid_before" "$nonce")
+
+                    if [ -z "$individual_signature" ]; then
+                        print_error "Failed to sign ERC-3009 order $((i+1))"
+                        return 1
+                    fi
+
+                    # Add this signature to the array (no prefix for individual signatures)
+                    if [ -z "$signatures_bytes_array" ]; then
+                        signatures_bytes_array="$individual_signature"
+                    else
+                        signatures_bytes_array="$signatures_bytes_array,$individual_signature"
+                    fi
+
+                    i=$((i+1))
+                done
+
+                # Encode the signatures array and add ERC-3009 prefix
+                local encoded_signatures=$(cast abi-encode "f(bytes[])" "[$signatures_bytes_array]")
+                signature=$(create_prefixed_signature "$encoded_signatures" "eip3009")
+
+                print_success "Multiple ERC-3009 orders signed successfully ($signature_count signatures)"
+
+            else
+                # Handle single signature (backwards compatibility)
+                print_info "Processing single ERC-3009 signature..."
+
+                # For ERC-3009, we use the domain address as the token contract address
+                local domain_address=$(echo "$order_data" | jq -r '.domain // empty')
+
+                # Parse UII address to get chain ID and token address
+                print_debug "Domain address (UII): $domain_address"
+                local uii_parsed=$(from_uii_address "$domain_address")
+                print_debug "UII parsed result: '$uii_parsed'"
+                local origin_chain_id=$(echo "$uii_parsed" | cut -d' ' -f1)
+                local token_contract=$(echo "$uii_parsed" | cut -d' ' -f2)
+
+                # Extract ERC-3009 fields directly from message
+                local from_address=$(echo "$full_message" | jq -r '.from // empty')
+                local to_address=$(echo "$full_message" | jq -r '.to // empty')
+                local value=$(echo "$full_message" | jq -r '.value // empty')
+                local valid_after=$(echo "$full_message" | jq -r '.validAfter // 0')
+                local valid_before=$(echo "$full_message" | jq -r '.validBefore // 0')
+                local nonce=$(echo "$full_message" | jq -r '.nonce // empty')
+
+                print_debug "ERC-3009 params: chain_id=$origin_chain_id, token=$token_contract"
+                print_debug "ERC-3009 params: from=$from_address, to=$to_address, value=$value, nonce=$nonce"
+
+                # For ERC-3009, we need to calculate the correct orderIdentifier from the contract
+                # because the quote nonce is temporary. Use same approach as working direct intent.
+                print_debug "Computing orderIdentifier from contract for ERC-3009 nonce (same method as direct intent)..."
+
+                # Get RPC URL for the chain
+                local rpc_url="http://localhost:8545"
+                if [ "$origin_chain_id" = "31338" ]; then
+                    rpc_url="http://localhost:8546"
+                fi
+
+                # Get input settler address for the chain
+                local input_settler_address
+                if [ "$origin_chain_id" = "31337" ]; then
+                    input_settler_address="0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+                else
+                    input_settler_address="0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+                fi
+
+                # Build StandardOrder struct using the same approach as intents script
+                # Use valid_before as both fill_deadline and expiry (this is the key fix)
+                local fill_deadline="$valid_before"
+                local expiry="$valid_before"
+                local input_oracle="0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"
+
+                # Build input tokens array: [[token, amount]]
+                local input_tokens="[[$token_contract,$value]]"
+
+                # Build outputs array (empty for ERC-3009 order ID calculation)
+                local outputs_array="[]"
+
+                # Build StandardOrder struct (same format as intents script)
+                local order_struct="($from_address,0,$origin_chain_id,$expiry,$fill_deadline,$input_oracle,$input_tokens,$outputs_array)"
+
+                # Use same orderIdentifier signature as working intents script
+                local order_identifier_sig="orderIdentifier((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))"
+                print_debug "Calling contract to get order identifier with order_struct: $order_struct"
+                print_debug "Input settler address: $input_settler_address"
+                print_debug "RPC URL: $rpc_url"
+                
+                # Capture cast call output and filter out any debug logs
+                # We need to suppress RUST_LOG temporarily to avoid contamination
+                local old_rust_log="${RUST_LOG:-}"
+                export RUST_LOG=""
+                
+                local cast_output=$(cast call "$input_settler_address" \
+                    "$order_identifier_sig" \
+                    "$order_struct" \
+                    --rpc-url "$rpc_url" 2>/dev/null)
+                local cast_exit_code=$?
+                
+                # Restore original RUST_LOG
+                if [ -n "$old_rust_log" ]; then
+                    export RUST_LOG="$old_rust_log"
+                else
+                    unset RUST_LOG
+                fi
+                
+                print_debug "Cast exit code: $cast_exit_code"
+                print_debug "Cast output: '$cast_output'"
+                
+                local contract_nonce=""
+                if [ $cast_exit_code -eq 0 ] && [ -n "$cast_output" ]; then
+                    # Filter out any remaining ANSI codes or debug text, keep only the hex result
+                    contract_nonce=$(echo "$cast_output" | grep -o "0x[0-9a-fA-F]\{64\}" | head -1)
+                    print_debug "Filtered contract nonce: '$contract_nonce'"
+                else
+                    print_error "Cast call failed with exit code $cast_exit_code: $cast_output"
+                fi
+
+                print_debug "Contract returned nonce: '$contract_nonce'"
+                print_debug "Original quote nonce: '$nonce'"
+
+                # Use the contract-calculated nonce if available, otherwise fallback to quote nonce
+                local final_nonce="${contract_nonce:-$nonce}"
+                print_debug "Final nonce for ERC-3009: $final_nonce"
+                
+                if [ -z "$contract_nonce" ] || [ "$contract_nonce" = "" ]; then
+                    print_warning "Failed to get order ID from contract, using quote nonce. This may cause signature verification to fail."
+                fi
+
+                # Sign ERC-3009 authorization with the correct nonce
+                signature=$(sign_erc3009_authorization \
+                    "$user_key" "$origin_chain_id" "$token_contract" \
+                    "$from_address" "$to_address" "$value" \
+                    "$valid_after" "$valid_before" "$final_nonce")
+
+                if [ -z "$signature" ]; then
+                    print_error "Failed to sign ERC-3009 order"
+                    return 1
+                fi
+
+                # Add ERC-3009 prefix to signature (like in intent flow)
+                signature=$(create_prefixed_signature "$signature" "eip3009")
+
+                print_success "ERC-3009 order signed successfully"
+            fi
+            
+        elif [ "$signature_type" = "eip712" ]; then
+            print_info "Signing EIP-712 order..."
+
+            # Extract EIP-712 message for signing (for compatibility with existing code)
+            local eip712_message=$(echo "$full_message" | jq -r '.eip712 // empty')
+            if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ]; then
+                print_error "No EIP-712 message found in EIP-712 order"
                 return 1
             fi
 
-            print_success "BatchCompact order signed successfully"
+            # Determine the order type based on primaryType
+            local eip712_primary_type=$(echo "$eip712_message" | jq -r '.primaryType // "PermitBatchWitnessTransferFrom"')
+            print_debug "EIP-712 Primary type: $eip712_primary_type"
 
-            # For compact/resource lock, we need to ABI-encode the signature with allocator data
-            # This matches what the working direct intent flow does in intents.sh
-            local allocator_data="0x"  # Empty allocator data for demo
-            signature=$(cast abi-encode "f(bytes,bytes)" "$signature" "$allocator_data")
+            if [ "$eip712_primary_type" = "BatchCompact" ]; then
+                print_info "Detected BatchCompact order, using compact signing..."
 
-            print_debug "ABI-encoded signature: $signature"
+                # Use client-side digest computation
+                signature=$(sign_compact_digest_from_quote "$user_key" "$full_message")
 
-        else
-            print_info "Detected Permit2 order, using standard signing..."
+                if [ -z "$signature" ]; then
+                    print_error "Failed to sign BatchCompact order"
+                    return 1
+                fi
+
+                print_success "BatchCompact order signed successfully"
+
+                # For compact/resource lock, we need to ABI-encode the signature with allocator data
+                # This matches what the working direct intent flow does in intents.sh
+                local allocator_data="0x"  # Empty allocator data for demo
+                signature=$(cast abi-encode "f(bytes,bytes)" "$signature" "$allocator_data")
+
+                print_debug "ABI-encoded signature: $signature"
+
+            else
+                print_info "Detected Permit2 order, using standard signing..."
 
             # Extract witness data first (needed for signing)
             local witness=$(echo "$eip712_message" | jq -r '.witness // empty')
@@ -816,18 +1005,23 @@ quote_accept() {
                 return 1
             fi
 
-            # Create prefixed signature for permit2
-            signature=$(create_prefixed_signature "$raw_signature" "permit2")
+                # Create prefixed signature for permit2
+                signature=$(create_prefixed_signature "$raw_signature" "permit2")
 
-            if [ -z "$signature" ]; then
-                print_error "Failed to sign EIP-712 order"
-                return 1
+                if [ -z "$signature" ]; then
+                    print_error "Failed to sign EIP-712 order"
+                    return 1
+                fi
+
+                print_success "Permit2 signature generated with client-side digest"
             fi
-
-            print_success "Permit2 signature generated with client-side digest"
+            
+            print_success "EIP-712 order signed"
+        else
+            print_error "Unsupported signature type: $signature_type"
+            return 1
         fi
         
-        print_success "EIP-712 order signed"
         print_debug "Signature: $signature"
         
         # Create submission payload with quoteId

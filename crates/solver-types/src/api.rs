@@ -68,7 +68,9 @@ where
 				// Try parsing as enum variant name
 				match value {
 					"permit2_escrow" | "Permit2Escrow" => Ok(LockType::Permit2Escrow),
-					"eip3009_escrow" | "Eip3009Escrow" => Ok(LockType::Eip3009Escrow),
+					"eip3009_escrow" | "erc3009_escrow" | "Eip3009Escrow" => {
+						Ok(LockType::Eip3009Escrow)
+					}, // Accept both variants for compatibility
 					"compact_resource_lock" | "ResourceLock" => Ok(LockType::ResourceLock),
 					_ => Err(Error::custom("Invalid LockType string")),
 				}
@@ -172,6 +174,10 @@ pub struct Lock {
 pub enum LockKind {
 	#[serde(alias = "TheCompact", alias = "the_compact")]
 	TheCompact,
+	#[serde(alias = "Permit2", alias = "permit2")]
+	Permit2,
+	#[serde(alias = "EIP3009", alias = "eip3009", alias = "Erc3009")]
+	Eip3009,
 }
 
 /// Available input with lock information and user

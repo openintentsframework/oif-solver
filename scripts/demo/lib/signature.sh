@@ -292,7 +292,7 @@ sign_compact_order() {
     print_debug "Input settler compact: $input_settler_compact"
     
     # Get TheCompact domain separator from chain
-    local domain_separator=$(cast call "$compact_address" "DOMAIN_SEPARATOR()" --rpc-url "http://localhost:8545" 2>/dev/null || echo "")
+    local domain_separator=$(cast_cmd "call" "$compact_address" "DOMAIN_SEPARATOR()" --rpc-url "http://localhost:8545" 2>/dev/null || echo "")
     
     if [ -z "$domain_separator" ] || [ "$domain_separator" = "null" ]; then
         # Fallback to computed domain separator
@@ -457,7 +457,7 @@ sign_eip3009_order() {
     
     # Get token domain separator for EIP-3009
     print_debug "Getting DOMAIN_SEPARATOR from token at $token_address via $rpc_url" >&2
-    local domain_separator=$(cast call "$token_address" "DOMAIN_SEPARATOR()" --rpc-url "$rpc_url" 2>/dev/null || echo "")
+    local domain_separator=$(cast_cmd "call" "$token_address" "DOMAIN_SEPARATOR()" --rpc-url "$rpc_url" 2>/dev/null || echo "")
     
     if [ -z "$domain_separator" ] || [ "$domain_separator" = "null" ] || [ "$domain_separator" = "0x" ]; then
         print_error "Token at $token_address does not support EIP-712 domain separator" >&2
@@ -512,6 +512,84 @@ sign_eip3009_order() {
     echo "$signature"
 }
 
+# Generate ERC-3009 authorization signature for quote acceptance
+sign_erc3009_authorization() {
+    local user_private_key="$1"
+    local origin_chain_id="$2"
+    local token_contract="$3"
+    local from_address="$4"
+    local to_address="$5"
+    local value="$6"
+    local valid_after="$7"
+    local valid_before="$8"
+    local nonce="$9"
+    
+    print_debug "Signing ERC-3009 authorization for quote acceptance" >&2
+    print_debug "Token: $token_contract" >&2
+    print_debug "From: $from_address, To: $to_address" >&2
+    print_debug "Value: $value, Nonce: $nonce" >&2
+    
+    # Get RPC URL based on chain ID
+    local rpc_url="http://localhost:8545"  # Default for chain 31337
+    if [ "$origin_chain_id" = "31338" ]; then
+        rpc_url="http://localhost:8546"
+    fi
+    
+    # Get token domain separator for EIP-3009
+    print_debug "Getting DOMAIN_SEPARATOR from token at $token_contract via $rpc_url" >&2
+    local domain_separator=$(cast_cmd "call" "$token_contract" "DOMAIN_SEPARATOR()" --rpc-url "$rpc_url" 2>/dev/null || echo "")
+    
+    if [ -z "$domain_separator" ] || [ "$domain_separator" = "null" ] || [ "$domain_separator" = "0x" ]; then
+        print_error "Token at $token_contract does not support EIP-712 domain separator" >&2
+        print_debug "Domain separator result: '$domain_separator'" >&2
+        return 1
+    fi
+    
+    print_debug "Token domain separator: $domain_separator" >&2
+    
+    # Build EIP-3009 signature for receiveWithAuthorization
+    local eip3009_type_hash=$(cast_keccak "ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)")
+    
+    # Convert nonce from hex string to bytes32 if needed
+    local nonce_bytes32="$nonce"
+    if [[ ! "$nonce" =~ ^0x[0-9a-fA-F]{64}$ ]]; then
+        # If nonce is not already a 64-char hex string, pad it
+        nonce_bytes32=$(printf "0x%064s" "${nonce#0x}" | tr ' ' '0')
+    fi
+    
+    # Encode the struct hash
+    local struct_encoded=$(cast_abi_encode "f(bytes32,address,address,uint256,uint256,uint256,bytes32)" \
+        "$eip3009_type_hash" \
+        "$from_address" \
+        "$to_address" \
+        "$value" \
+        "$valid_after" \
+        "$valid_before" \
+        "$nonce_bytes32")
+    
+    local struct_hash=$(cast_keccak "$struct_encoded")
+    
+    print_debug "ERC-3009 struct hash: $struct_hash" >&2
+    
+    # Create EIP-712 digest
+    local digest_prefix="0x1901"
+    local digest="${digest_prefix}${domain_separator#0x}${struct_hash#0x}"
+    local final_digest=$(cast_keccak "$digest")
+    
+    print_debug "ERC-3009 final digest: $final_digest" >&2
+    
+    # Sign the digest using --no-hash flag for EIP-712 signatures
+    local signature=$(cast wallet sign --no-hash --private-key "$user_private_key" "$final_digest")
+    
+    if [ -z "$signature" ]; then
+        print_error "Failed to generate ERC-3009 authorization signature" >&2
+        return 1
+    fi
+    
+    print_success "ERC-3009 authorization signature generated" >&2
+    echo "$signature"
+}
+
 # Simple signature workflow for standard intents
 sign_standard_intent() {
     local user_private_key="$1"
@@ -559,7 +637,7 @@ compute_compact_digest_from_quote() {
     print_debug "Domain: name=$name, version=$version, chainId=$chain_id, contract=$verifying_contract" >&2
 
     # Get domain separator from TheCompact contract instead of computing manually
-    local domain_separator=$(cast call "$verifying_contract" "DOMAIN_SEPARATOR()" --rpc-url "http://localhost:8545" 2>/dev/null || echo "")
+    local domain_separator=$(cast_cmd "call" "$verifying_contract" "DOMAIN_SEPARATOR()" --rpc-url "http://localhost:8545" 2>/dev/null || echo "")
     
     if [ -z "$domain_separator" ] || [ "$domain_separator" = "null" ]; then
         # Fallback to computed domain separator if contract call fails
