@@ -1170,6 +1170,7 @@ private_key = "$PRIVATE_KEY"
 # ============================================================================
 [delivery]
 min_confirmations = 1
+transaction_poll_interval_seconds = 3
 
 [delivery.implementations.evm_alloy]
 network_ids = [31337, 31338]
@@ -1225,6 +1226,7 @@ TOKB = "195.00"
 # SETTLEMENT
 # ============================================================================
 [settlement]
+settlement_poll_interval_seconds = 3
 
 [settlement.domain]
 chain_id = 1
@@ -1254,6 +1256,37 @@ output = { 31337 = ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"], 31338 = ["0xD
 [settlement.implementations.direct.routes]
 31337 = [31338]  # Can go from origin to destination
 31338 = [31337]  # Can go from destination to origin
+
+# ============================================================================
+# HYPERLANE SETTLEMENT (For cross-chain messaging)
+# ============================================================================
+[settlement.implementations.hyperlane]
+order = "eipXXXX"
+network_ids = [31337, 31338]
+# Default gas limit for Hyperlane messages
+default_gas_limit = 500000
+message_timeout_seconds = 600
+finalization_required = false  # For local testing
+
+# Oracle addresses for Hyperlane (different from direct to avoid conflicts)
+# Use a different oracle address to ensure Direct settlement is used for local demo
+[settlement.implementations.hyperlane.oracles]
+input = { 31337 = ["0x0000000000000000000000000000000000000999"], 31338 = ["0x0000000000000000000000000000000000000999"] }
+output = { 31337 = ["0x0000000000000000000000000000000000000999"], 31338 = ["0x0000000000000000000000000000000000000999"] }
+
+[settlement.implementations.hyperlane.routes]
+31337 = [31338]
+31338 = [31337]
+
+# Mailbox addresses (mock for local testing)
+[settlement.implementations.hyperlane.mailboxes]
+31337 = "0x0000000000000000000000000000000000000001"  # Mock mailbox for local
+31338 = "0x0000000000000000000000000000000000000001"  # Mock mailbox for local
+
+# IGP addresses (mock for local testing)
+[settlement.implementations.hyperlane.igp_addresses]
+31337 = "0x0000000000000000000000000000000000000002"  # Mock IGP for local
+31338 = "0x0000000000000000000000000000000000000002"  # Mock IGP for local
 EOF
     
     # Create networks.toml with deployed addresses
@@ -1353,21 +1386,21 @@ EOF
 [gas]
 
 [gas.flows.compact_resource_lock]
-# Gas units captured by scripts/e2e/estimate_gas_compact.sh on local anvil
+# Gas units captured by scripts/e2e/estimate_gas.sh on local anvil
 open = 0
-fill = 76068
-claim = 121995
+fill = 77298
+claim = 122793
 
 [gas.flows.permit2_escrow]
-# Gas units captured by scripts/e2e/estimate_gas_permit2_escrow.sh on local anvil
-open = 143116
-fill = 76068
-claim = 59953
+# Gas units captured by scripts/e2e/estimate_gas.sh on local anvil
+open = 146306
+fill = 77298
+claim = 60084
 
 [gas.flows.eip3009_escrow]
-# Gas units for EIP-3009 escrow flows on local anvil
+# Gas units captured by scripts/e2e/estimate_gas.sh on local anvil
 open = 130254
-fill = 77298 
+fill = 77298
 claim = 60084
 EOF
     

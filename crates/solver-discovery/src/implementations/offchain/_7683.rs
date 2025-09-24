@@ -519,7 +519,9 @@ impl Eip7683OffchainDiscovery {
 			data: serde_json::to_value(&order_data).map_err(|e| {
 				DiscoveryError::ParseError(format!("Failed to serialize order data: {}", e))
 			})?,
+			order_bytes: order_bytes.clone(),
 			quote_id: None, // TODO: add quote id to the intent
+			lock_type: lock_type.to_string(),
 		})
 	}
 

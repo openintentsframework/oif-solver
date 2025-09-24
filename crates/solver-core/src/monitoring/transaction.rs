@@ -40,9 +40,18 @@ impl TransactionMonitor {
 		tx_chain_id: u64,
 	) {
 		let monitoring_timeout = tokio::time::Duration::from_secs(self.timeout_minutes * 60);
-		let poll_interval = tokio::time::Duration::from_secs(3);
+		// Get poll interval from delivery service
+		let poll_interval_seconds = self.delivery.poll_interval_seconds();
+		let poll_interval = tokio::time::Duration::from_secs(poll_interval_seconds);
 
 		let start_time = tokio::time::Instant::now();
+
+		tracing::debug!(
+			order_id = %truncate_id(&order_id),
+			poll_interval_secs = poll_interval_seconds,
+			timeout_minutes = self.timeout_minutes,
+			"Starting transaction monitoring"
+		);
 
 		loop {
 			// Check if we've exceeded the timeout
@@ -112,7 +121,12 @@ impl TransactionMonitor {
 						_ => "Checking transaction status",
 					};
 
-					tracing::info!(elapsed_secs = start_time.elapsed().as_secs(), "{}", message);
+					tracing::info!(
+						elapsed_secs = start_time.elapsed().as_secs(),
+						reason = e.to_string(),
+						"{}",
+						message
+					);
 				},
 			}
 
