@@ -170,6 +170,18 @@ impl AssetLockReference {
 	pub fn infer_current_order_type(&self) -> String {
 		self.infer_order_type(oif_versions::CURRENT)
 	}
+
+	/// Convert to EIP-7683 LockType for protocol-level usage
+	pub fn to_lock_type(&self) -> LockType {
+		match self.kind {
+			LockKind::TheCompact | LockKind::Rhinestone => LockType::ResourceLock,
+		}
+	}
+
+	/// Check if this is a resource lock (vs escrow)
+	pub fn is_resource_lock(&self) -> bool {
+		matches!(self.kind, LockKind::TheCompact | LockKind::Rhinestone)
+	}
 }
 
 /// Post order request that unifies both quote acceptances and direct order submissions.
@@ -318,28 +330,8 @@ pub struct AssetAmount {
 	pub amount: U256,
 }
 
-/// Lock information for inputs that are already locked
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Lock {
-	/// Type of lock mechanism
-	pub kind: LockKind,
-	/// Lock-specific parameters
-	pub params: Option<serde_json::Value>,
-}
-
-impl Lock {
-	/// Convert to EIP-7683 LockType for protocol-level usage
-	pub fn to_lock_type(&self) -> LockType {
-		match self.kind {
-			LockKind::TheCompact | LockKind::Rhinestone => LockType::ResourceLock,
-		}
-	}
-
-	/// Check if this is a resource lock (vs escrow)
-	pub fn is_resource_lock(&self) -> bool {
-		matches!(self.kind, LockKind::TheCompact | LockKind::Rhinestone)
-	}
-}
+// TODO: Remove this alias and update all code to use AssetLockReference directly
+pub type Lock = AssetLockReference;
 
 /// Supported lock mechanisms
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,33 +342,10 @@ pub enum LockKind {
 	Rhinestone,
 }
 
-/// Available input with lock information and user
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AvailableInput {
-	/// User address in ERC-7930 interoperable format
-	pub user: InteropAddress,
-	/// Asset address in ERC-7930 interoperable format
-	pub asset: InteropAddress,
-	/// Amount as a big integer
-	#[serde(with = "u256_serde")]
-	pub amount: U256,
-	/// Lock information if asset is already locked
-	pub lock: Option<Lock>,
-}
-
-/// Requested output with receiver and optional calldata
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RequestedOutput {
-	/// Receiver address in ERC-7930 interoperable format
-	pub receiver: InteropAddress,
-	/// Asset address in ERC-7930 interoperable format
-	pub asset: InteropAddress,
-	/// Amount as a big integer
-	#[serde(with = "u256_serde")]
-	pub amount: U256,
-	/// Optional calldata for the output
-	pub calldata: Option<String>,
-}
+// TODO: Remove these aliases entirely and update all code to use OrderInput/OrderOutput directly
+// These are temporary aliases for migration purposes
+pub type AvailableInput = OrderInput;
+pub type RequestedOutput = OrderOutput;
 
 /// Quote input from a user (amounts optional for quote requests)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,11 +381,12 @@ pub struct QuoteOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderInput {
 	/// User address in EIP-7930 Address format
-	pub user: String,
+	pub user: InteropAddress,
 	/// Asset address in EIP-7930 Address format
-	pub asset: String,
-	/// Required Amount as string
-	pub amount: String,
+	pub asset: InteropAddress,
+	/// Required Amount as U256
+	#[serde(with = "u256_serde")]
+	pub amount: U256,
 	/// Lock information if asset is already locked
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub lock: Option<AssetLockReference>,
@@ -426,11 +396,12 @@ pub struct OrderInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderOutput {
 	/// Receiver address in EIP-7930 Address format
-	pub receiver: String,
+	pub receiver: InteropAddress,
 	/// Asset address in EIP-7930 Address format
-	pub asset: String,
-	/// Required Amount as string
-	pub amount: String,
+	pub asset: InteropAddress,
+	/// Required Amount as U256
+	#[serde(with = "u256_serde")]
+	pub amount: U256,
 	/// Optional calldata for the output
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub calldata: Option<String>,
@@ -489,34 +460,27 @@ impl QuoteOutput {
 	}
 }
 
-impl OrderInput {
-	/// Convert string address to InteropAddress for internal use
-	pub fn user_as_interop_address(&self) -> Result<InteropAddress, String> {
-		InteropAddress::from_hex(&self.user).map_err(|e| e.to_string())
-	}
-
-	pub fn asset_as_interop_address(&self) -> Result<InteropAddress, String> {
-		InteropAddress::from_hex(&self.asset).map_err(|e| e.to_string())
-	}
-
-	/// Convert required string amount to U256 for internal use
-	pub fn amount_as_u256(&self) -> Result<U256, String> {
-		U256::from_str_radix(&self.amount, 10).map_err(|e| e.to_string())
+/// Conversion from OrderInput to QuoteInput
+impl From<OrderInput> for QuoteInput {
+	fn from(order_input: OrderInput) -> Self {
+		QuoteInput {
+			user: order_input.user.to_string(),
+			asset: order_input.asset.to_string(),
+			amount: Some(order_input.amount.to_string()), // OrderInput has required amount, QuoteInput has optional
+			lock: order_input.lock,
+		}
 	}
 }
 
-impl OrderOutput {
-	pub fn receiver_as_interop_address(&self) -> Result<InteropAddress, String> {
-		InteropAddress::from_hex(&self.receiver).map_err(|e| e.to_string())
-	}
-
-	pub fn asset_as_interop_address(&self) -> Result<InteropAddress, String> {
-		InteropAddress::from_hex(&self.asset).map_err(|e| e.to_string())
-	}
-
-	/// Convert required string amount to U256 for internal use
-	pub fn amount_as_u256(&self) -> Result<U256, String> {
-		U256::from_str_radix(&self.amount, 10).map_err(|e| e.to_string())
+/// Conversion from OrderOutput to QuoteOutput
+impl From<OrderOutput> for QuoteOutput {
+	fn from(order_output: OrderOutput) -> Self {
+		QuoteOutput {
+			receiver: order_output.receiver.to_string(),
+			asset: order_output.asset.to_string(),
+			amount: Some(order_output.amount.to_string()), // OrderOutput has required amount, QuoteOutput has optional
+			calldata: order_output.calldata,
+		}
 	}
 }
 
@@ -1108,7 +1072,7 @@ mod tests {
 		let json = serde_json::to_string(&input).unwrap();
 		let deserialized: AvailableInput = serde_json::from_str(&json).unwrap();
 
-		assert_eq!(deserialized.amount, U256::from(5000));
+		assert_eq!(deserialized.amount, 5000);
 		assert!(deserialized.lock.is_some());
 	}
 
@@ -1130,7 +1094,7 @@ mod tests {
 		let json = serde_json::to_string(&output).unwrap();
 		let deserialized: RequestedOutput = serde_json::from_str(&json).unwrap();
 
-		assert_eq!(deserialized.amount, U256::from(2000));
+		assert_eq!(deserialized.amount, 2000);
 		assert_eq!(deserialized.calldata, Some("0xdeadbeef".to_string()));
 	}
 

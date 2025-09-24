@@ -310,10 +310,11 @@ impl QuoteGenerator {
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid domain address: {}", e)))?;
 
 		// Get input chain ID from first available input
-		let input_chain_id = request
+		let first_input = request
 			.available_inputs
 			.first()
-			.ok_or_else(|| QuoteError::InvalidRequest("No available inputs".to_string()))?
+			.ok_or_else(|| QuoteError::InvalidRequest("No available inputs".to_string()))?;
+		let input_chain_id = first_input
 			.asset
 			.ethereum_chain_id()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input chain ID: {}", e)))?;
@@ -414,7 +415,7 @@ impl QuoteGenerator {
 				"token": format!("0x000000000000000000000000{:040x}", output_token_address),
 				"amount": output.amount.to_string(),
 				"recipient": format!("0x000000000000000000000000{:040x}", recipient_address),
-				"call": output.calldata.as_ref().map(|cd| format!("0x{}", hex::encode(cd))).unwrap_or_else(|| "0x".to_string()),
+				"call": output.calldata.clone(),
 				"context": "0x" // Context is typically empty for standard flows
 			}));
 		}

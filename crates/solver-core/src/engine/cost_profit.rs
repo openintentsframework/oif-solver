@@ -244,8 +244,10 @@ impl CostProfitService {
 					CostProfitError::Calculation(format!("Failed to get input token info: {}", e))
 				})?;
 
+			let amount = input.amount;
+
 			let usd_amount = Self::convert_raw_token_to_usd(
-				&input.amount,
+				&amount,
 				&token_info.symbol,
 				token_info.decimals,
 				&self.pricing_service,
@@ -280,8 +282,10 @@ impl CostProfitService {
 					CostProfitError::Calculation(format!("Failed to get output token info: {}", e))
 				})?;
 
+			let amount = output.amount;
+
 			let usd_amount = Self::convert_raw_token_to_usd(
-				&output.amount,
+				&amount,
 				&token_info.symbol,
 				token_info.decimals,
 				&self.pricing_service,
@@ -716,8 +720,10 @@ impl CostProfitService {
 				.get_token_info(chain_id, &token_address)
 				.map_err(|e| format!("Failed to get input token info: {}", e))?;
 
+			let amount = input.amount;
+
 			let usd_amount = Self::convert_raw_token_to_usd(
-				&input.amount,
+				&amount,
 				&token_info.symbol,
 				token_info.decimals,
 				&self.pricing_service,
@@ -745,8 +751,10 @@ impl CostProfitService {
 				.get_token_info(chain_id, &token_address)
 				.map_err(|e| format!("Failed to get output token info: {}", e))?;
 
+			let amount = output.amount;
+
 			let usd_amount = Self::convert_raw_token_to_usd(
-				&output.amount,
+				&amount,
 				&token_info.symbol,
 				token_info.decimals,
 				&self.pricing_service,

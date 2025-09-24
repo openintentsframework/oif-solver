@@ -180,16 +180,14 @@ use crate::order::OrderParsable;
 use crate::standards::eip7930::InteropAddress;
 #[cfg(feature = "oif-interfaces")]
 use crate::utils::eip712::Eip712ExtractionResult;
-use crate::{
-	bytes32_to_address, parse_address, with_0x_prefix, Address, AvailableInput, RequestedOutput,
-};
+use crate::{bytes32_to_address, parse_address, with_0x_prefix, Address, OrderInput, OrderOutput};
 
 #[cfg(feature = "oif-interfaces")]
 use crate::{Order, OrderStatus};
 
 /// Implementation of OrderParsable for EIP-7683 orders
 impl OrderParsable for Eip7683OrderData {
-	fn parse_available_inputs(&self) -> Vec<AvailableInput> {
+	fn parse_available_inputs(&self) -> Vec<OrderInput> {
 		let origin_chain = self.origin_chain_id.try_into().unwrap_or(1);
 
 		self.inputs
@@ -207,7 +205,7 @@ impl OrderParsable for Eip7683OrderData {
 				let user_addr = parse_address(&self.user).unwrap_or(Address(vec![0u8; 20]));
 				let user = InteropAddress::from((origin_chain, user_addr));
 
-				AvailableInput {
+				OrderInput {
 					user,
 					asset,
 					amount: input[1],
@@ -217,7 +215,7 @@ impl OrderParsable for Eip7683OrderData {
 			.collect()
 	}
 
-	fn parse_requested_outputs(&self) -> Vec<RequestedOutput> {
+	fn parse_requested_outputs(&self) -> Vec<OrderOutput> {
 		self.outputs
 			.iter()
 			.map(|output| {
@@ -238,7 +236,7 @@ impl OrderParsable for Eip7683OrderData {
 				let asset = InteropAddress::from((chain_id, token_addr));
 				let receiver = InteropAddress::from((chain_id, recipient_addr));
 
-				RequestedOutput {
+				OrderOutput {
 					receiver,
 					asset,
 					amount: output.amount,
@@ -415,20 +413,17 @@ impl interfaces::StandardOrder {
 		quote: &Quote,
 		eip712_data: &serde_json::Map<String, serde_json::Value>,
 	) -> Result<Self, Box<dyn std::error::Error>> {
-		use crate::standards::eip7930::InteropAddress;
 		use crate::utils::parse_bytes32_from_hex;
 		use alloy_primitives::{Address, U256};
 		use interfaces::SolMandateOutput;
 
 		// Extract user address from the first available input
-		let user_str = &quote
+		let first_input = quote
 			.details
 			.available_inputs
 			.first()
-			.ok_or("Quote must have at least one available input")?
-			.user;
-		let interop_address = InteropAddress::from_hex(&user_str.to_string())?;
-		let user_address = interop_address.ethereum_address()?;
+			.ok_or("Quote must have at least one available input")?;
+		let user_address = first_input.user.ethereum_address()?;
 
 		// Extract nonce
 		let nonce_str = eip712_data
@@ -444,7 +439,7 @@ impl interfaces::StandardOrder {
 			.ok_or("Missing 'witness' object in EIP-712 message")?;
 
 		// Get origin chain ID
-		let origin_chain_id = U256::from(interop_address.ethereum_chain_id()?);
+		let origin_chain_id = U256::from(first_input.user.ethereum_chain_id()?);
 
 		// Extract timing data
 		let expires = witness
@@ -555,21 +550,18 @@ impl interfaces::StandardOrder {
 		quote: &Quote,
 		eip712_data: &serde_json::Map<String, serde_json::Value>,
 	) -> Result<Self, Box<dyn std::error::Error>> {
-		use crate::standards::eip7930::InteropAddress;
 		use crate::utils::parse_bytes32_from_hex;
 		use alloy_primitives::{Address, U256};
 		use interfaces::SolMandateOutput;
 
 		// Extract user address from quote
-		let user_str = &quote
+		let first_input = quote
 			.details
 			.available_inputs
 			.first()
-			.ok_or("Quote must have at least one available input")?
-			.user;
-		let interop_address = InteropAddress::from_hex(&user_str.to_string())?;
-		let user_address = interop_address.ethereum_address()?;
-		let origin_chain_id = U256::from(interop_address.ethereum_chain_id()?);
+			.ok_or("Quote must have at least one available input")?;
+		let user_address = first_input.user.ethereum_address()?;
+		let origin_chain_id = U256::from(first_input.user.ethereum_chain_id()?);
 
 		let message = eip712_data
 			.get("message")
