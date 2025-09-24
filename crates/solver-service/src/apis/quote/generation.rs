@@ -49,9 +49,6 @@
 //! - **Input Priority**: Preference for specific input tokens
 
 use super::custody::{CustodyDecision, CustodyStrategy, EscrowKind, LockKind};
-use crate::apis::quote::permit2::{
-	build_permit2_batch_witness_digest, permit2_domain_address_from_config,
-};
 use crate::eip712::{compact, get_domain_separator};
 use solver_config::{Config, QuoteConfig};
 use solver_delivery::DeliveryService;
@@ -124,7 +121,7 @@ impl QuoteGenerator {
 					.await?
 			},
 			CustodyDecision::Escrow { kind } => {
-				self.generate_escrow_order(request, config, kind)?
+				self.generate_escrow_order(request, config, kind).await?
 			},
 		};
 		let details = QuoteDetails {
@@ -167,13 +164,13 @@ impl QuoteGenerator {
 		};
 		Ok(QuoteOrder {
 			signature_type: SignatureType::Eip712,
-			domain: domain_address,
+			domain: serde_json::to_value(domain_address).unwrap_or(serde_json::Value::Null),
 			primary_type,
 			message,
 		})
 	}
 
-	fn generate_escrow_order(
+	async fn generate_escrow_order(
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
@@ -193,55 +190,55 @@ impl QuoteGenerator {
 			.ethereum_chain_id()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chain ID: {}", e)))?;
 
-		// Get settlement AND selected oracle for consistency
+		// For escrow orders, prefer Direct settlement over other implementations
 		let (settlement, selected_oracle) = self
-			.settlement_service
-			.get_any_settlement_for_chain(chain_id)
+			.get_preferred_settlement_for_escrow(chain_id)
 			.ok_or_else(|| {
 				QuoteError::InvalidRequest(format!(
-					"No settlement available for chain {}",
+					"No suitable settlement available for escrow on chain {}",
 					chain_id
 				))
 			})?;
 
 		match escrow_kind {
 			EscrowKind::Permit2 => {
-				self.generate_permit2_order(request, config, settlement, selected_oracle)
+				self.generate_permit2_order(request, config, settlement, selected_oracle).await
 			},
 			EscrowKind::Erc3009 => {
-				self.generate_erc3009_order(request, config, settlement, selected_oracle)
+				self.generate_erc3009_order(request, config, settlement, selected_oracle).await
 			},
 		}
 	}
 
-	fn generate_permit2_order(
+	async fn generate_permit2_order(
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
 		settlement: &dyn SettlementInterface,
 		selected_oracle: solver_types::Address,
 	) -> Result<QuoteOrder, QuoteError> {
-		use alloy_primitives::hex;
-
 		let chain_id = request.available_inputs[0]
 			.asset
 			.ethereum_chain_id()
 			.map_err(|e| {
 				QuoteError::InvalidRequest(format!("Invalid chain ID in asset address: {}", e))
 			})?;
-		let domain_address = permit2_domain_address_from_config(config, chain_id)?;
-		let (final_digest, message_obj) =
-			build_permit2_batch_witness_digest(request, config, settlement, selected_oracle)?;
-		let message = serde_json::json!({ "digest": with_0x_prefix(&hex::encode(final_digest)), "eip712": message_obj });
+
+		// Build structured domain object for Permit2
+		let domain_object = self.build_permit2_domain_object(config, chain_id).await?;
+
+		// Generate the message object without pre-computed digest
+		let message_obj = self.build_permit2_message_object(request, config, settlement, selected_oracle)?;
+
 		Ok(QuoteOrder {
 			signature_type: SignatureType::Eip712,
-			domain: domain_address,
+			domain: domain_object,
 			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
-			message,
+			message: message_obj,
 		})
 	}
 
-	fn generate_erc3009_order(
+	async fn generate_erc3009_order(
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
@@ -273,6 +270,17 @@ impl QuoteGenerator {
 			fill_deadline,
 		)?;
 
+		// Get token address for domain information
+		let token_address = first_input.asset.ethereum_address().map_err(|e| {
+			QuoteError::InvalidRequest(format!("Invalid token address: {}", e))
+		})?;
+
+		// Build structured domain object for EIP-3009 token
+		let domain_object = self.build_erc3009_domain_object(
+			&token_address,
+			input_chain_id,
+		).await?;
+
 		// For ERC-3009, we need to generate signature templates for each input
 		// since the contract expects one signature per input
 		let mut signatures_array = Vec::new();
@@ -290,10 +298,8 @@ impl QuoteGenerator {
 			signatures_array.push(input_message);
 		}
 
-		// For quotes, return the domain of the first input and include all signature templates
-		let domain_address = first_input.asset.clone();
 		let message = if signatures_array.len() == 1 {
-			// Single input - return the message directly (backwards compatibility)
+			// Single input - return the message directly
 			signatures_array.into_iter().next().unwrap()
 		} else {
 			// Multiple inputs - return array of messages for multiple signatures
@@ -304,7 +310,7 @@ impl QuoteGenerator {
 
 		Ok(QuoteOrder {
 			signature_type: SignatureType::Erc3009,
-			domain: domain_address,
+			domain: domain_object, // Use structured domain object for EIP-3009
 			primary_type: "ReceiveWithAuthorization".to_string(),
 			message,
 		})
@@ -766,6 +772,151 @@ impl QuoteGenerator {
 		}
 
 		Ok(serde_json::Value::Object(merged))
+	}
+
+	/// Build structured domain object for EIP-3009 token
+	async fn build_erc3009_domain_object(
+		&self,
+		token_address: &[u8; 20],
+		chain_id: u64,
+	) -> Result<serde_json::Value, QuoteError> {
+
+		let alloy_token_address = alloy_primitives::Address::from_slice(token_address);
+
+		// Try to get token name
+		let token_name = self.get_token_name(&alloy_token_address, chain_id).await
+			.unwrap_or_else(|_| "Unknown Token".to_string());
+
+		// Build domain object similar to TheCompact structure (without pre-computed domainSeparator)
+		// The client will compute the domainSeparator using these fields
+		Ok(serde_json::json!({
+			"name": token_name,
+			"chainId": chain_id.to_string(),
+			"verifyingContract": format!("0x{:040x}", alloy_token_address)
+		}))
+	}
+
+	/// Get token name from contract
+	async fn get_token_name(
+		&self,
+		token_address: &alloy_primitives::Address,
+		chain_id: u64,
+	) -> Result<String, QuoteError> {
+		use alloy_sol_types::{sol, SolCall};
+
+		// Define the name() function call
+		sol! {
+			function name() external view returns (string);
+		}
+
+		let call = nameCall {};
+		let encoded = call.abi_encode();
+
+		let tx = solver_types::Transaction {
+			to: Some(solver_types::Address(token_address.0.to_vec())),
+			data: encoded,
+			value: alloy_primitives::U256::ZERO,
+			chain_id,
+			nonce: None,
+			gas_limit: None,
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+		};
+
+		let result = self.delivery_service
+			.contract_call(chain_id, tx)
+			.await
+			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to get token name: {}", e)))?;
+
+		let name = nameCall::abi_decode_returns(&result, false)
+			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to decode token name: {}", e)))?
+			._0;
+
+		Ok(name)
+	}
+
+
+	/// Get preferred settlement for escrow orders (prioritizes Direct settlement)
+	fn get_preferred_settlement_for_escrow(
+		&self,
+		chain_id: u64,
+	) -> Option<(&dyn SettlementInterface, solver_types::Address)> {
+		// First, try to get Direct settlement specifically
+		if let Some(direct_settlement) = self.settlement_service.get("direct") {
+			if let Some(oracles) = direct_settlement.oracle_config().input_oracles.get(&chain_id) {
+				if !oracles.is_empty() {
+					let selected_oracle = direct_settlement.select_oracle(oracles, None)?;
+					return Some((direct_settlement, selected_oracle));
+				}
+			}
+		}
+
+		// Fallback to any available settlement if Direct is not available
+		self.settlement_service.get_any_settlement_for_chain(chain_id)
+	}
+
+	/// Build structured domain object for Permit2
+	async fn build_permit2_domain_object(
+		&self,
+		_config: &Config,
+		chain_id: u64,
+	) -> Result<serde_json::Value, QuoteError> {
+		use crate::apis::quote::registry::PROTOCOL_REGISTRY;
+
+		// Get Permit2 contract address for this chain
+		let permit2_address = PROTOCOL_REGISTRY
+			.get_permit2_address(chain_id)
+			.ok_or_else(|| {
+				QuoteError::InvalidRequest(format!("Permit2 not deployed on chain {}", chain_id))
+			})?;
+
+		// Get the actual name from Permit2 contract (like we do for EIP-3009 tokens)
+		let permit2_name = self.get_token_name(&permit2_address, chain_id).await
+			.unwrap_or_else(|_| "Permit2".to_string()); // Fallback to constant if contract call fails
+
+		// Build domain object similar to TheCompact and EIP-3009 structure
+		Ok(serde_json::json!({
+			"name": permit2_name,
+			"chainId": chain_id.to_string(),
+			"verifyingContract": format!("0x{:040x}", permit2_address)
+		}))
+	}
+
+	/// Build Permit2 message object (clean EIP-712 message without metadata)
+	fn build_permit2_message_object(
+		&self,
+		request: &GetQuoteRequest,
+		config: &Config,
+		settlement: &dyn SettlementInterface,
+		selected_oracle: solver_types::Address,
+	) -> Result<serde_json::Value, QuoteError> {
+		use crate::apis::quote::permit2::build_permit2_batch_witness_digest;
+
+		// Generate the complete message structure
+		let (_final_digest, message_obj) = 
+			build_permit2_batch_witness_digest(request, config, settlement, selected_oracle)?;
+
+		// Extract only the EIP-712 message fields (no metadata like "signing", "digest")
+		let permitted = message_obj.get("permitted").cloned().unwrap_or(serde_json::Value::Null);
+		let spender = message_obj.get("spender").cloned().unwrap_or(serde_json::Value::Null);
+		let nonce = message_obj.get("nonce").cloned().unwrap_or(serde_json::Value::Null);
+		let deadline = message_obj.get("deadline").cloned().unwrap_or(serde_json::Value::Null);
+		let witness = message_obj.get("witness").cloned().unwrap_or(serde_json::Value::Null);
+
+		// Build clean message with only EIP-712 fields
+		let clean_message = serde_json::json!({
+			"permitted": permitted,
+			"spender": spender,
+			"nonce": nonce,
+			"deadline": deadline,
+			"witness": witness
+		});
+
+		// Wrap in eip712 object to maintain compatibility with conversion code
+		Ok(serde_json::json!({
+			"eip712": clean_message
+		}))
 	}
 
 	/// Try to compute the digest using the existing eip712/compact module
@@ -1340,22 +1491,23 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn test_generate_erc3009_order() {
+	#[tokio::test]
+	async fn test_generate_erc3009_order() {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
-		let config = create_test_config();
-		let request = create_test_request();
-
+		
 		// Get settlement and oracle like in real usage
 		let (settlement, selected_oracle) = settlement_service
 			.get_any_settlement_for_chain(137)
 			.expect("Should have settlement for test chain");
 
+		let generator = QuoteGenerator::new(settlement_service.clone(), delivery_service);
+		let config = create_test_config();
+		let request = create_test_request();
+
 		let result =
-			generator.generate_erc3009_order(&request, &config, settlement, selected_oracle);
+			generator.generate_erc3009_order(&request, &config, settlement, selected_oracle).await;
 
 		match result {
 			Ok(order) => {
@@ -1363,18 +1515,29 @@ mod tests {
 				assert_eq!(order.primary_type, "ReceiveWithAuthorization");
 				assert!(order.message.is_object());
 
+				// Verify new message structure with domain and message fields
+				let message_obj = order.message.as_object().unwrap();
+				assert!(message_obj.contains_key("domain"));
+				assert!(message_obj.contains_key("message"));
+
+				// Verify domain structure
+				let domain = &message_obj["domain"];
+				assert!(domain["name"].is_string());
+				assert!(domain["chainId"].is_string());
+				assert!(domain["verifyingContract"].is_string());
+
 				// Verify message structure
-				let message = order.message.as_object().unwrap();
-				assert!(message.contains_key("from"));
-				assert!(message.contains_key("to"));
-				assert!(message.contains_key("value"));
-				assert!(message.contains_key("validAfter"));
-				assert!(message.contains_key("validBefore"));
-				assert!(message.contains_key("nonce"));
-				assert!(message.contains_key("inputOracle"));
+				let inner_message = &message_obj["message"];
+				assert!(inner_message["from"].is_string());
+				assert!(inner_message["to"].is_string());
+				assert!(inner_message["value"].is_string());
+				assert!(inner_message["validAfter"].is_number());
+				assert!(inner_message["validBefore"].is_number());
+				assert!(inner_message["nonce"].is_string());
+				assert!(inner_message["inputOracle"].is_string());
 			},
 			Err(e) => {
-				// Expected if escrow address configuration is missing
+				// Expected if token contract calls fail or configuration is missing
 				assert!(matches!(e, QuoteError::InvalidRequest(_)));
 			},
 		}

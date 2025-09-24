@@ -512,6 +512,68 @@ sign_eip3009_order() {
     echo "$signature"
 }
 
+# Generate ERC-3009 authorization signature with pre-computed domain separator
+sign_erc3009_authorization_with_domain() {
+    local user_private_key="$1"
+    local origin_chain_id="$2"
+    local token_contract="$3"
+    local from_address="$4"
+    local to_address="$5"
+    local value="$6"
+    local valid_after="$7"
+    local valid_before="$8"
+    local nonce="$9"
+    local domain_separator="${10}"  # Pre-computed domain separator
+    
+    print_debug "Signing ERC-3009 authorization with pre-computed domain separator" >&2
+    print_debug "Token: $token_contract" >&2
+    print_debug "From: $from_address, To: $to_address" >&2
+    print_debug "Value: $value, Nonce: $nonce" >&2
+    print_debug "Using domain separator: $domain_separator" >&2
+    
+    # Build EIP-3009 signature for receiveWithAuthorization
+    local eip3009_type_hash=$(cast_keccak "ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)")
+    
+    # Convert nonce from hex string to bytes32 if needed
+    local nonce_bytes32="$nonce"
+    if [[ ! "$nonce" =~ ^0x[0-9a-fA-F]{64}$ ]]; then
+        # If nonce is not already a 64-char hex string, pad it
+        nonce_bytes32=$(printf "0x%064s" "${nonce#0x}" | tr ' ' '0')
+    fi
+    
+    # Encode the struct hash
+    local struct_encoded=$(cast_abi_encode "f(bytes32,address,address,uint256,uint256,uint256,bytes32)" \
+        "$eip3009_type_hash" \
+        "$from_address" \
+        "$to_address" \
+        "$value" \
+        "$valid_after" \
+        "$valid_before" \
+        "$nonce_bytes32")
+    
+    local struct_hash=$(cast_keccak "$struct_encoded")
+    
+    print_debug "ERC-3009 struct hash: $struct_hash" >&2
+    
+    # Create EIP-712 digest
+    local digest_prefix="0x1901"
+    local digest="${digest_prefix}${domain_separator#0x}${struct_hash#0x}"
+    local final_digest=$(cast_keccak "$digest")
+    
+    print_debug "ERC-3009 final digest: $final_digest" >&2
+    
+    # Sign the digest using --no-hash flag for EIP-712 signatures
+    local signature=$(cast wallet sign --no-hash --private-key "$user_private_key" "$final_digest")
+    
+    if [ -z "$signature" ]; then
+        print_error "Failed to generate ERC-3009 authorization signature" >&2
+        return 1
+    fi
+    
+    print_success "ERC-3009 authorization signature generated" >&2
+    echo "$signature"
+}
+
 # Generate ERC-3009 authorization signature for quote acceptance
 sign_erc3009_authorization() {
     local user_private_key="$1"
@@ -931,6 +993,122 @@ sign_permit2_digest_from_quote() {
     echo "$signature"
 }
 
+# Compute EIP-712 digest for PermitBatchWitnessTransferFrom from quote JSON (with domain object support)
+compute_permit2_digest_from_quote() {
+    local eip712_message="$1"
+    local quote_domain="${2:-}" # Optional: domain object from quote level
+
+    print_debug "Computing PermitBatchWitnessTransferFrom digest from EIP-712 message" >&2
+
+    # Try to get domain from quote level first, then fall back to message level
+    local domain=""
+    if [ -n "$quote_domain" ] && echo "$quote_domain" | jq -e 'type == "object"' > /dev/null 2>&1; then
+        # New structured domain format
+        domain="$quote_domain"
+        print_debug "Using domain from quote level (new format)" >&2
+    else
+        # Legacy format - extract from signing.domain
+        domain=$(echo "$eip712_message" | jq -r '.signing.domain // .domain')
+        print_debug "Using domain from message level (legacy format)" >&2
+    fi
+
+    # Extract domain information
+    local name=$(echo "$domain" | jq -r '.name')
+    local chain_id=$(echo "$domain" | jq -r '.chainId')
+    local verifying_contract=$(echo "$domain" | jq -r '.verifyingContract')
+
+    print_debug "Domain: name=$name, chainId=$chain_id, contract=$verifying_contract" >&2
+
+    # Get Permit2 domain separator (compute it or use existing function)
+    local domain_separator=$(get_permit2_domain_separator "$chain_id" "$verifying_contract")
+    print_debug "Domain separator: $domain_separator" >&2
+
+    # Extract message fields
+    local spender=$(echo "$eip712_message" | jq -r '.spender')
+    local nonce=$(echo "$eip712_message" | jq -r '.nonce')
+    local deadline=$(echo "$eip712_message" | jq -r '.deadline')
+    local permitted=$(echo "$eip712_message" | jq -c '.permitted')
+    local witness=$(echo "$eip712_message" | jq -c '.witness')
+
+    print_debug "Message: spender=$spender, nonce=$nonce, deadline=$deadline" >&2
+
+    # Compute TokenPermissions hashes
+    local permitted_count=$(echo "$permitted" | jq '. | length')
+    local token_hashes=""
+
+    for ((i=0; i<permitted_count; i++)); do
+        local permission=$(echo "$permitted" | jq -r ".[$i]")
+        local token=$(echo "$permission" | jq -r '.token')
+        local amount=$(echo "$permission" | jq -r '.amount')
+
+        print_debug "Permission $i: token=$token, amount=$amount" >&2
+
+        local token_hash=$(compute_token_permissions_hash "$token" "$amount")
+        token_hashes="${token_hashes}${token_hash#0x}"
+
+        print_debug "Token permissions hash $i: $token_hash" >&2
+    done
+
+    local permitted_array_hash=$(cast_keccak "0x$token_hashes")
+    print_debug "Permitted array hash: $permitted_array_hash" >&2
+
+    # Compute witness hash
+    local expires=$(echo "$witness" | jq -r '.expires')
+    local input_oracle=$(echo "$witness" | jq -r '.inputOracle')
+    local outputs=$(echo "$witness" | jq -c '.outputs')
+
+    print_debug "Witness: expires=$expires, inputOracle=$input_oracle" >&2
+
+    # Compute MandateOutput hashes for witness
+    local outputs_count=$(echo "$outputs" | jq '. | length')
+    local output_hashes=()
+
+    for ((i=0; i<outputs_count; i++)); do
+        local output=$(echo "$outputs" | jq -r ".[$i]")
+        local oracle=$(echo "$output" | jq -r '.oracle // "0x0000000000000000000000000000000000000000000000000000000000000000"')
+        local settler=$(echo "$output" | jq -r '.settler')
+        local output_chain_id=$(echo "$output" | jq -r '.chainId')
+        local token=$(echo "$output" | jq -r '.token')
+        local amount=$(echo "$output" | jq -r '.amount')
+        local recipient=$(echo "$output" | jq -r '.recipient')
+
+        print_debug "Output $i: oracle=$oracle, settler=$settler, chain=$output_chain_id, token=$token, amount=$amount, recipient=$recipient" >&2
+
+        local output_hash=$(compute_mandate_output_hash "$oracle" "$settler" "$output_chain_id" "$token" "$amount" "$recipient")
+        output_hashes+=("$output_hash")
+
+        print_debug "Output hash $i: $output_hash" >&2
+    done
+
+    local witness_hash=$(compute_permit2_witness_hash "$expires" "$input_oracle" "${output_hashes[@]}")
+    print_debug "Witness hash: $witness_hash" >&2
+
+    # Build the main struct hash for PermitBatchWitnessTransferFrom
+    local mandate_output_type="MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
+    local token_permissions_type="TokenPermissions(address token,uint256 amount)"
+    local witness_type_string="Permit2Witness witness)${mandate_output_type}${token_permissions_type}Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)"
+    local permit_batch_witness_string="PermitBatchWitnessTransferFrom(TokenPermissions[] permitted,address spender,uint256 nonce,uint256 deadline,${witness_type_string}"
+
+    local permit_batch_type_hash=$(compute_type_hash "$permit_batch_witness_string")
+    print_debug "Permit batch type string: $permit_batch_witness_string" >&2
+    print_debug "Permit batch type hash: $permit_batch_type_hash" >&2
+
+    # Build final struct hash
+    local struct_hash=$(cast_keccak $(cast_abi_encode "f(bytes32,bytes32,address,uint256,uint256,bytes32)" \
+        "$permit_batch_type_hash" "$permitted_array_hash" "$spender" "$nonce" "$deadline" "$witness_hash"))
+
+    print_debug "Struct hash: $struct_hash" >&2
+
+    # Create final EIP-712 digest
+    local digest_prefix="0x1901"
+    local digest="${digest_prefix}${domain_separator#0x}${struct_hash#0x}"
+    local final_digest=$(cast_keccak "$digest")
+
+    print_debug "Final digest: $final_digest" >&2
+
+    echo "$final_digest"
+}
+
 # Export functions
 export -f compute_domain_separator
 export -f get_permit2_domain_separator
@@ -941,6 +1119,7 @@ export -f compute_token_permissions_hash
 export -f sign_permit2_order
 export -f sign_compact_order
 export -f sign_eip3009_order
+export -f sign_erc3009_authorization_with_domain
 export -f sign_personal_message
 export -f verify_signature
 export -f create_prefixed_signature

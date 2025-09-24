@@ -757,11 +757,21 @@ quote_accept() {
                 while [ $i -lt "$signature_count" ]; do
                     local sig_message=$(echo "$signatures_array" | jq -r ".[$i]")
 
-                    # Parse individual signature message
-                    local domain_address=$(echo "$order_data" | jq -r '.domain // empty')
-                    local uii_parsed=$(from_uii_address "$domain_address")
-                    local origin_chain_id=$(echo "$uii_parsed" | cut -d' ' -f1)
-                    local token_contract=$(echo "$uii_parsed" | cut -d' ' -f2)
+                    # Parse domain - handle both new structured format and legacy UII format
+                    local domain_data=$(echo "$order_data" | jq -r '.domain // empty')
+                    local origin_chain_id=""
+                    local token_contract=""
+                    
+                    if echo "$domain_data" | jq -e 'type == "object"' > /dev/null 2>&1; then
+                        # New structured domain format
+                        origin_chain_id=$(echo "$domain_data" | jq -r '.chainId')
+                        token_contract=$(echo "$domain_data" | jq -r '.verifyingContract')
+                    else
+                        # Legacy UII format
+                        local uii_parsed=$(from_uii_address "$domain_data")
+                        origin_chain_id=$(echo "$uii_parsed" | cut -d' ' -f1)
+                        token_contract=$(echo "$uii_parsed" | cut -d' ' -f2)
+                    fi
 
                     local from_address=$(echo "$sig_message" | jq -r '.from // empty')
                     local to_address=$(echo "$sig_message" | jq -r '.to // empty')
@@ -772,11 +782,41 @@ quote_accept() {
 
                     print_debug "Signature $((i+1)): token=$token_contract, value=$value, nonce=$nonce"
 
+                    # Compute domain separator from domain object fields (if available)
+                    local domain_separator=""
+                    if echo "$domain_data" | jq -e 'type == "object"' > /dev/null 2>&1; then
+                        # Extract domain fields
+                        local domain_name=$(echo "$domain_data" | jq -r '.name // empty')
+                        local domain_chain_id=$(echo "$domain_data" | jq -r '.chainId // empty')
+                        local domain_contract=$(echo "$domain_data" | jq -r '.verifyingContract // empty')
+                        
+                        if [ -n "$domain_name" ] && [ "$domain_name" != "empty" ] && \
+                           [ -n "$domain_chain_id" ] && [ "$domain_chain_id" != "empty" ] && \
+                           [ -n "$domain_contract" ] && [ "$domain_contract" != "empty" ]; then
+                            # Compute domain separator from domain fields (like signature.sh compute_domain_separator)
+                            local domain_type_hash=$(cast_keccak "EIP712Domain(string name,uint256 chainId,address verifyingContract)")
+                            local name_hash=$(cast_keccak "$domain_name")
+                            domain_separator=$(cast_abi_encode "f(bytes32,bytes32,uint256,address)" \
+                                "$domain_type_hash" "$name_hash" "$domain_chain_id" "$domain_contract")
+                            domain_separator=$(cast_keccak "$domain_separator")
+                            print_debug "Computed domain separator from domain object: $domain_separator"
+                        fi
+                    fi
+
                     # Sign this individual ERC-3009 authorization
-                    local individual_signature=$(sign_erc3009_authorization \
-                        "$user_key" "$origin_chain_id" "$token_contract" \
-                        "$from_address" "$to_address" "$value" \
-                        "$valid_after" "$valid_before" "$nonce")
+                    if [ -n "$domain_separator" ] && [ "$domain_separator" != "empty" ]; then
+                        # Use new function with computed domain separator
+                        local individual_signature=$(sign_erc3009_authorization_with_domain \
+                            "$user_key" "$origin_chain_id" "$token_contract" \
+                            "$from_address" "$to_address" "$value" \
+                            "$valid_after" "$valid_before" "$nonce" "$domain_separator")
+                    else
+                        # Fallback to old function that queries the contract
+                        local individual_signature=$(sign_erc3009_authorization \
+                            "$user_key" "$origin_chain_id" "$token_contract" \
+                            "$from_address" "$to_address" "$value" \
+                            "$valid_after" "$valid_before" "$nonce")
+                    fi
 
                     if [ -z "$individual_signature" ]; then
                         print_error "Failed to sign ERC-3009 order $((i+1))"
@@ -803,15 +843,25 @@ quote_accept() {
                 # Handle single signature (backwards compatibility)
                 print_info "Processing single ERC-3009 signature..."
 
-                # For ERC-3009, we use the domain address as the token contract address
-                local domain_address=$(echo "$order_data" | jq -r '.domain // empty')
-
-                # Parse UII address to get chain ID and token address
-                print_debug "Domain address (UII): $domain_address"
-                local uii_parsed=$(from_uii_address "$domain_address")
-                print_debug "UII parsed result: '$uii_parsed'"
-                local origin_chain_id=$(echo "$uii_parsed" | cut -d' ' -f1)
-                local token_contract=$(echo "$uii_parsed" | cut -d' ' -f2)
+                # Check if domain is the new structured format (object) or old UII format (string)
+                local domain_data=$(echo "$order_data" | jq -r '.domain // empty')
+                local origin_chain_id=""
+                local token_contract=""
+                
+                if echo "$domain_data" | jq -e 'type == "object"' > /dev/null 2>&1; then
+                    # New structured domain format
+                    print_debug "Using new structured domain format"
+                    origin_chain_id=$(echo "$domain_data" | jq -r '.chainId')
+                    token_contract=$(echo "$domain_data" | jq -r '.verifyingContract')
+                    print_debug "Extracted from domain object: chain_id=$origin_chain_id, token=$token_contract"
+                else
+                    # Legacy UII format - parse as before
+                    print_debug "Using legacy UII domain format: $domain_data"
+                    local uii_parsed=$(from_uii_address "$domain_data")
+                    print_debug "UII parsed result: '$uii_parsed'"
+                    origin_chain_id=$(echo "$uii_parsed" | cut -d' ' -f1)
+                    token_contract=$(echo "$uii_parsed" | cut -d' ' -f2)
+                fi
 
                 # Extract ERC-3009 fields directly from message
                 local from_address=$(echo "$full_message" | jq -r '.from // empty')
@@ -885,11 +935,41 @@ quote_accept() {
                 # The quote was generated with a specific order_identifier that was calculated by the solver
                 local final_nonce="$nonce"
 
+                # Compute domain separator from domain object fields (if available)
+                local domain_separator=""
+                if echo "$domain_data" | jq -e 'type == "object"' > /dev/null 2>&1; then
+                    # Extract domain fields
+                    local domain_name=$(echo "$domain_data" | jq -r '.name // empty')
+                    local domain_chain_id=$(echo "$domain_data" | jq -r '.chainId // empty')
+                    local domain_contract=$(echo "$domain_data" | jq -r '.verifyingContract // empty')
+                    
+                    if [ -n "$domain_name" ] && [ "$domain_name" != "empty" ] && \
+                       [ -n "$domain_chain_id" ] && [ "$domain_chain_id" != "empty" ] && \
+                       [ -n "$domain_contract" ] && [ "$domain_contract" != "empty" ]; then
+                        # Compute domain separator from domain fields (like signature.sh compute_domain_separator)
+                        local domain_type_hash=$(cast_keccak "EIP712Domain(string name,uint256 chainId,address verifyingContract)")
+                        local name_hash=$(cast_keccak "$domain_name")
+                        domain_separator=$(cast_abi_encode "f(bytes32,bytes32,uint256,address)" \
+                            "$domain_type_hash" "$name_hash" "$domain_chain_id" "$domain_contract")
+                        domain_separator=$(cast_keccak "$domain_separator")
+                        print_debug "Computed domain separator from domain object: $domain_separator"
+                    fi
+                fi
+
                 # Sign ERC-3009 authorization with the correct nonce
-                signature=$(sign_erc3009_authorization \
-                    "$user_key" "$origin_chain_id" "$token_contract" \
-                    "$from_address" "$to_address" "$value" \
-                    "$valid_after" "$valid_before" "$final_nonce")
+                if [ -n "$domain_separator" ] && [ "$domain_separator" != "empty" ]; then
+                    # Use new function with computed domain separator
+                    signature=$(sign_erc3009_authorization_with_domain \
+                        "$user_key" "$origin_chain_id" "$token_contract" \
+                        "$from_address" "$to_address" "$value" \
+                        "$valid_after" "$valid_before" "$final_nonce" "$domain_separator")
+                else
+                    # Fallback to old function that queries the contract
+                    signature=$(sign_erc3009_authorization \
+                        "$user_key" "$origin_chain_id" "$token_contract" \
+                        "$from_address" "$to_address" "$value" \
+                        "$valid_after" "$valid_before" "$final_nonce")
+                fi
 
                 if [ -z "$signature" ]; then
                     print_error "Failed to sign ERC-3009 order"
@@ -945,7 +1025,19 @@ quote_accept() {
             local input_oracle=$(echo "$witness" | jq -r '.inputOracle // "0x0000000000000000000000000000000000000000"')
 
             # Sign the EIP-712 message
-            local domain=$(echo "$eip712_message" | jq -r '.signing.domain // empty')
+            # Check for domain info in new structure (order.domain) or legacy structure (eip712.signing.domain)
+            local domain=""
+            local order_domain=$(echo "$order_data" | jq -r '.domain // empty')
+            if echo "$order_domain" | jq -e 'type == "object"' > /dev/null 2>&1; then
+                # New structured domain format (same as EIP-3009)
+                domain="$order_domain"
+                print_debug "Using new structured domain format for Permit2"
+            else
+                # Legacy format - extract from signing.domain
+                domain=$(echo "$eip712_message" | jq -r '.signing.domain // empty')
+                print_debug "Using legacy signing.domain format for Permit2"
+            fi
+            
             local deadline=$(echo "$eip712_message" | jq -r '.deadline // empty')
             local nonce=$(echo "$eip712_message" | jq -r '.nonce // empty')
             local spender=$(echo "$eip712_message" | jq -r '.spender // empty')
@@ -965,13 +1057,17 @@ quote_accept() {
 
             # Get origin chain ID from the domain
             local origin_chain_id=$(echo "$domain" | jq -r '.chainId // 31337')
+            
+            # For new structured domain format, we have all the domain info already
+            # For legacy format, domain info is embedded in the message
+            print_debug "Domain object: $domain"
 
             # Build mandate outputs array from witness outputs
             local mandate_outputs_json=$(echo "$witness" | jq -c '.outputs')
 
             # Use client-side digest computation but with proper signature formatting
             print_info "Computing client-side digest..."
-            local client_digest=$(compute_permit2_digest_from_quote "$eip712_message")
+            local client_digest=$(compute_permit2_digest_from_quote "$eip712_message" "$domain")
             if [ $? -ne 0 ] || [ -z "$client_digest" ]; then
                 print_error "Failed to compute client-side digest"
                 return 1

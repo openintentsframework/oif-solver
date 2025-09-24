@@ -245,41 +245,6 @@ impl OrderInterface for Eip7683OrderImpl {
 
 		// Decode the raw order bytes into StandardOrder struct
 		let order_struct = Self::decode_standard_order(raw_order_data)?;
-		// logs debug for ERC-3009 debugging
-		tracing::debug!("=== ERC-3009 PREPARE TRANSACTION DEBUG ===");
-		tracing::debug!("Lock type: {:?}", order_data.lock_type);
-		tracing::debug!("Sponsor address: {:?}", sponsor_address);
-		tracing::debug!("Signature length: {} bytes", signature.len());
-		tracing::debug!("Raw order data length: {}", raw_order_data.len());
-
-		// Log the inputs from the StandardOrder to verify structure
-		tracing::debug!("Number of inputs: {}", order_struct.inputs.len());
-		for (i, input) in order_struct.inputs.iter().enumerate() {
-			tracing::debug!("Input {}: token={:?}, amount={}", i, input[0], input[1]);
-		}
-
-		// Log signature breakdown for ERC-3009
-		if signature.starts_with("0x01") {
-			tracing::info!("ERC-3009 signature detected (prefix: 0x01)");
-			let sig_without_prefix = &signature[4..]; // Skip "0x01"
-			tracing::debug!(
-				"Signature without prefix length: {} chars",
-				sig_without_prefix.len()
-			);
-		}
-		// Use the InputSettlerEscrow openFor call with StandardOrder struct
-		tracing::info!("=== CONTRACT CALL PARAMETERS ===");
-		tracing::info!("InputSettlerEscrow contract will call receiveWithAuthorization with:");
-		tracing::info!("  from (sponsor): {:?}", sponsor_address);
-		tracing::info!("  to (contract): should be input settler address");
-		tracing::info!("  value: {} (from input[1])", order_struct.inputs[0][1]);
-		tracing::info!("  validAfter: 0");
-		tracing::info!(
-			"  validBefore: {} (fillDeadline)",
-			order_struct.fillDeadline
-		);
-		tracing::info!("  nonce: should be order_identifier");
-		tracing::info!("============================");
 
 		let signature_bytes = hex::decode(signature.trim_start_matches("0x"))
 			.map_err(|e| OrderError::ValidationFailed(format!("Invalid signature: {}", e)))?;
@@ -741,26 +706,14 @@ impl OrderInterface for Eip7683OrderImpl {
 			lock_type,
 			alloy_primitives::hex::encode(standard_order.nonce.to_be_bytes::<32>())
 		);
-		let order_id_bytes = if matches!(lock_type, LockType::Eip3009Escrow) {
-			// For ERC-3009, we need to use the order identifier calculated by the contract
-			// This ensures the order ID matches what was used for the ERC-3009 signature
-			tracing::info!("Computing order ID from contract for ERC-3009");
-			order_id_callback(chain_id, tx_data).await.map_err(|e| {
-				OrderError::ValidationFailed(format!(
-					"Failed to compute order ID for ERC-3009: {}",
-					e
-				))
-			})?
-		} else {
-			// For other lock types, use the callback to compute order ID from contract
-			tracing::info!(
-				"Using callback to compute order ID for lock type: {:?}",
-				lock_type
-			);
-			order_id_callback(chain_id, tx_data).await.map_err(|e| {
-				OrderError::ValidationFailed(format!("Failed to compute order ID: {}", e))
-			})?
-		};
+		// Compute order ID from contract using callback
+		tracing::info!(
+			"Computing order ID from contract for lock type: {:?}",
+			lock_type
+		);
+		let order_id_bytes = order_id_callback(chain_id, tx_data).await.map_err(|e| {
+			OrderError::ValidationFailed(format!("Failed to compute order ID: {}", e))
+		})?;
 
 		// Ensure order ID is exactly 32 bytes
 		if order_id_bytes.len() != 32 {

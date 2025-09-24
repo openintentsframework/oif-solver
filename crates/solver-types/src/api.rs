@@ -242,8 +242,8 @@ pub struct QuoteOrder {
 	/// Signature type (eip-712 or erc-3009)
 	#[serde(rename = "signatureType")]
 	pub signature_type: SignatureType,
-	/// ERC-7930 interoperable address of the domain
-	pub domain: InteropAddress,
+	/// ERC-7930 interoperable address of the domain (or domain object for structured domains)
+	pub domain: serde_json::Value,
 	/// Primary type for EIP-712 signing
 	#[serde(rename = "primaryType")]
 	pub primary_type: String,

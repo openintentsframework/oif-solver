@@ -576,10 +576,22 @@ impl interfaces::StandardOrder {
 			.orders
 			.first()
 			.ok_or("Quote must contain at least one order")?;
-		let message_data = quote_order
+		let message_root = quote_order
 			.message
 			.as_object()
 			.ok_or("Invalid ERC-3009 message structure")?;
+
+		// Check if this is the new nested structure (with domain and message fields)
+		let message_data = if message_root.contains_key("message") {
+			// New structure: extract the nested message object
+			message_root
+				.get("message")
+				.and_then(|m| m.as_object())
+				.ok_or("Missing nested 'message' field in ERC-3009 structure")?
+		} else {
+			// Old structure: use the root object directly (backwards compatibility)
+			message_root
+		};
 
 		// Extract user address from message 'from' field
 		let from_str = message_data
