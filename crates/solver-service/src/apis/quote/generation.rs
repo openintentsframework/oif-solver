@@ -455,7 +455,6 @@ impl QuoteGenerator {
 		}
 
 		let raw_output = String::from_utf8_lossy(&output.stdout);
-		tracing::debug!("Raw cast output for order identifier: {}", raw_output);
 
 		// Extract only the 64-character hex string (order ID), filtering out any debug logs
 		let order_id = raw_output

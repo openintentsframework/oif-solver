@@ -859,12 +859,7 @@ quote_accept() {
 
                 # Use same orderIdentifier signature as working intents script
                 local order_identifier_sig="orderIdentifier((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))"
-                print_debug "Calling contract to get order identifier with order_struct: $order_struct"
-                print_debug "Input settler address: $input_settler_address"
-                print_debug "RPC URL: $rpc_url"
-                
                 # Capture cast call output and filter out any debug logs
-                # We need to suppress RUST_LOG temporarily to avoid contamination
                 local old_rust_log="${RUST_LOG:-}"
                 export RUST_LOG=""
                 
@@ -881,43 +876,14 @@ quote_accept() {
                     unset RUST_LOG
                 fi
                 
-                print_debug "Cast exit code: $cast_exit_code"
-                print_debug "Cast output: '$cast_output'"
-                
                 local contract_nonce=""
                 if [ $cast_exit_code -eq 0 ] && [ -n "$cast_output" ]; then
-                    # Filter out any remaining ANSI codes or debug text, keep only the hex result
                     contract_nonce=$(echo "$cast_output" | grep -o "0x[0-9a-fA-F]\{64\}" | head -1)
-                    print_debug "Filtered contract nonce: '$contract_nonce'"
-                else
-                    print_error "Cast call failed with exit code $cast_exit_code: $cast_output"
                 fi
 
-                print_debug "Contract returned nonce: '$contract_nonce'"
-                print_debug "Original quote nonce: '$nonce'"
-
-                # For ERC-3009 quotes, ALWAYS use the original quote nonce (order_identifier)
+                # For ERC-3009 quotes, use the original quote nonce (order_identifier)
                 # The quote was generated with a specific order_identifier that was calculated by the solver
-                # Recalculating with a different structure will give a different order_identifier
                 local final_nonce="$nonce"
-                print_debug "Final nonce for ERC-3009: $final_nonce (using original quote nonce)"
-                
-                if [ -n "$contract_nonce" ] && [ "$contract_nonce" != "" ] && [ "$contract_nonce" != "$nonce" ]; then
-                    print_warning "Contract calculated different nonce ($contract_nonce) vs quote nonce ($nonce). Using quote nonce to maintain signature consistency."
-                fi
-
-                # Debug: Show exactly what parameters are being used for signing
-                print_debug "=== ERC-3009 SIGNING PARAMETERS ==="
-                print_debug "user_key: ${#user_key} chars"
-                print_debug "origin_chain_id: $origin_chain_id"
-                print_debug "token_contract: $token_contract"
-                print_debug "from_address: $from_address"
-                print_debug "to_address: $to_address"
-                print_debug "value: $value"
-                print_debug "valid_after: $valid_after"
-                print_debug "valid_before: $valid_before"
-                print_debug "final_nonce: $final_nonce"
-                print_debug "=================================="
 
                 # Sign ERC-3009 authorization with the correct nonce
                 signature=$(sign_erc3009_authorization \
