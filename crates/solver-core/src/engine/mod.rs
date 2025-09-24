@@ -161,6 +161,7 @@ impl SolverEngine {
 			delivery.clone(),
 			storage.clone(),
 			state_machine.clone(),
+			settlement.clone(),
 			event_bus.clone(),
 			config.solver.monitoring_timeout_minutes,
 		));
@@ -333,7 +334,7 @@ impl SolverEngine {
 						SolverEvent::Order(OrderEvent::Preparing { intent, order, params }) => {
 							// Preparing sends a prepare transaction - use transaction semaphore
 							self.spawn_handler(&transaction_semaphore, move |engine| async move {
-								if let Err(e) = engine.order_handler.handle_preparation(intent, order, params).await {
+								if let Err(e) = engine.order_handler.handle_preparation(intent.source, order, params).await {
 									return Err(EngineError::Service(format!("Failed to handle order preparation: {}", e)));
 								}
 								Ok(())

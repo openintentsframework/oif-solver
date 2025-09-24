@@ -163,6 +163,8 @@ pub struct DeliveryService {
 	implementations: std::collections::HashMap<u64, Arc<dyn DeliveryInterface>>,
 	/// Default number of confirmations required for transactions.
 	min_confirmations: u64,
+	/// Poll interval for transaction monitoring in seconds.
+	poll_interval_seconds: u64,
 }
 
 impl DeliveryService {
@@ -173,10 +175,12 @@ impl DeliveryService {
 	pub fn new(
 		implementations: std::collections::HashMap<u64, Arc<dyn DeliveryInterface>>,
 		min_confirmations: u64,
+		poll_interval_seconds: u64,
 	) -> Self {
 		Self {
 			implementations,
 			min_confirmations,
+			poll_interval_seconds,
 		}
 	}
 
@@ -378,5 +382,10 @@ impl DeliveryService {
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
 		implementation.eth_call(tx).await
+	}
+
+	/// Get the configured poll interval for transaction monitoring
+	pub fn poll_interval_seconds(&self) -> u64 {
+		self.poll_interval_seconds
 	}
 }

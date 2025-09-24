@@ -136,6 +136,7 @@ impl ConfigBuilder {
 			delivery: DeliveryConfig {
 				implementations: HashMap::new(),
 				min_confirmations: self.min_confirmations,
+				transaction_poll_interval_seconds: 3,
 			},
 			account: AccountConfig {
 				primary: self.account_primary,
@@ -154,6 +155,7 @@ impl ConfigBuilder {
 			settlement: self.settlement.unwrap_or_else(|| SettlementConfig {
 				implementations: HashMap::new(),
 				domain: None,
+				settlement_poll_interval_seconds: 3,
 			}),
 			pricing: None,
 			api: self.api,

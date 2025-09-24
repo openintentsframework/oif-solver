@@ -32,6 +32,9 @@ BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 NC='\033[0m' # No Color
 
+# Order type configuration - set to eip7683 for Hyperlane or eipXXXX for direct
+ORDER_TYPE="eip7683"
+
 echo -e "${BLUE}🔄 Sequential Batch Intent Processor${NC}"
 echo "====================================="
 
@@ -99,12 +102,43 @@ fi
 # Configuration
 MAIN_CONFIG="config/testnet.toml"
 NETWORKS_CONFIG="config/testnet/networks.toml"
+TESTNET_CONFIG="scripts/e2e/testnet-config.json"
 
-# Load account info
-SOLVER_ADDR=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'solver = ' | cut -d'"' -f2)
-USER_ADDR=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'user = ' | cut -d'"' -f2)
-USER_PRIVATE_KEY=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'user_private_key = ' | cut -d'"' -f2)
-RECIPIENT_ADDR=$(grep -A 4 '\[accounts\]' $MAIN_CONFIG | grep 'recipient = ' | cut -d'"' -f2)
+# Load environment variables from .env file if it exists
+if [ -f ".env" ]; then
+    set -a  # automatically export all variables
+    source .env
+    set +a  # disable automatic export
+fi
+
+# Load account configuration
+source scripts/e2e/lib/accounts.sh
+load_account_config
+
+# Use the loaded values
+SOLVER_ADDR=$SOLVER_ADDRESS
+USER_ADDR=$USER_ADDRESS
+RECIPIENT_ADDR=$RECIPIENT_ADDRESS
+
+# Validate demo environment
+if ! validate_demo_environment; then
+    exit 1
+fi
+
+# Helper functions for testnet config
+get_oracle_for_chain() {
+    local chain_id=$1
+    
+    # Get the implementation that matches ORDER_TYPE and has this chain
+    jq -r --arg chain_id "$chain_id" --arg order_type "$ORDER_TYPE" '
+        .settlement.implementations[] | 
+        select(.enabled == true and .order_type == $order_type) |
+        .chains | 
+        to_entries[] | 
+        select(.value.chain_id == ($chain_id | tonumber)) | 
+        .value.oracle
+    ' "$TESTNET_CONFIG" | head -1
+}
 
 # Dynamic config functions
 get_network_config() {
@@ -122,7 +156,8 @@ get_network_config() {
             awk "/\[\[networks\.${chain_id}\.rpc_urls\]\]/{f=1} f && /^http = /{print; exit}" $NETWORKS_CONFIG | cut -d'"' -f2
             ;;
         "oracle")
-            grep -A5 '\[settlement.implementations.direct.oracles\]' $MAIN_CONFIG | grep 'input = ' | sed "s/.*${chain_id} = \[\"\([^\"]*\)\".*/\1/"
+            # Get oracle from any settlement configuration that supports this chain
+            get_oracle_for_chain "$chain_id"
             ;;
     esac
 }
@@ -172,6 +207,7 @@ process_intent() {
     echo "   Input Settler: $origin_input_settler"
     echo "   Output Settler: $dest_output_settler"
     echo "   Oracle: $oracle"
+    echo "   Order Type: $ORDER_TYPE"
     
     # Validate configuration
     if [[ -z "$origin_input_settler" || -z "$dest_output_settler" || -z "$origin_rpc" || -z "$oracle" ]]; then
@@ -230,10 +266,14 @@ process_intent() {
     local recipient_bytes32="0x000000000000000000000000${RECIPIENT_ADDR#0x}"
     local zero_bytes32="0x0000000000000000000000000000000000000000000000000000000000000000"
     
+    # Get the oracle address for the destination chain (where the fill will happen)
+    local dest_oracle=$(get_network_config "$dest_chain" "oracle")
+    local oracle_bytes32="0x000000000000000000000000${dest_oracle#0x}"
+    
     # Build StandardOrder
     local standard_order_abi_type='f((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))'
     local order_data=$(cast abi-encode "$standard_order_abi_type" \
-        "(${USER_ADDR},${nonce},${origin_chain},${expiry},${fill_deadline},${oracle},[[$origin_token_addr,$input_amount]],[($zero_bytes32,$output_settler_bytes32,${dest_chain},$dest_token_bytes32,$output_amount,$recipient_bytes32,0x,0x)])")
+        "(${USER_ADDR},${nonce},${origin_chain},${expiry},${fill_deadline},${oracle},[[$origin_token_addr,$input_amount]],[($oracle_bytes32,$output_settler_bytes32,${dest_chain},$dest_token_bytes32,$output_amount,$recipient_bytes32,0x,0x)])")
     
     # Generate EIP-712 signature
     echo -e "${YELLOW}🔏 Generating EIP-712 signature...${NC}"
@@ -257,7 +297,7 @@ process_intent() {
     # Build hashes
     local mandate_output_encoded=$(cast abi-encode "f(bytes32,bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes32,bytes32)" \
         "$mandate_output_type_hash" \
-        "$zero_bytes32" \
+        "$oracle_bytes32" \
         "$output_settler_bytes32" \
         "$dest_chain" \
         "$dest_token_bytes32" \

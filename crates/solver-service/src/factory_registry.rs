@@ -34,8 +34,11 @@ pub type OrderFactory = fn(
 	&solver_types::oracle::OracleRoutes,
 ) -> Result<Box<dyn OrderInterface>, OrderError>;
 pub type PricingFactory = fn(&toml::Value) -> Result<Box<dyn PricingInterface>, PricingError>;
-pub type SettlementFactory =
-	fn(&toml::Value, &NetworksConfig) -> Result<Box<dyn SettlementInterface>, SettlementError>;
+pub type SettlementFactory = fn(
+	&toml::Value,
+	&NetworksConfig,
+	std::sync::Arc<solver_storage::StorageService>,
+) -> Result<Box<dyn SettlementInterface>, SettlementError>;
 pub type StrategyFactory = fn(&toml::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError>;
 
 /// Global registry for all implementation factories

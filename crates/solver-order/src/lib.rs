@@ -8,8 +8,8 @@ use alloy_primitives::Bytes;
 use async_trait::async_trait;
 use solver_types::{
 	standards::eip7683::interfaces::StandardOrder, Address, ConfigSchema, ExecutionContext,
-	ExecutionDecision, ExecutionParams, FillProof, ImplementationRegistry, Intent, NetworksConfig,
-	Order, OrderIdCallback, Transaction,
+	ExecutionDecision, ExecutionParams, FillProof, ImplementationRegistry, NetworksConfig, Order,
+	OrderIdCallback, Transaction,
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -73,29 +73,13 @@ pub trait OrderInterface: Send + Sync {
 	/// before initializing the order processor.
 	fn config_schema(&self) -> Box<dyn ConfigSchema>;
 
-	/// Validates an intent and converts it to a standard order format.
-	///
-	/// This method performs standard-specific validation to ensure the intent
-	/// is well-formed and can be processed by the solver. The solver address
-	/// is included in the resulting order for reward attribution.
-	///
-	/// # Arguments
-	///
-	/// * `intent` - The intent to validate
-	/// * `solver_address` - The solver's address for reward attribution
-	async fn validate_intent(
-		&self,
-		intent: &Intent,
-		solver_address: &Address,
-	) -> Result<Order, OrderError>;
-
 	/// Generates a transaction to prepare an order for filling (if needed).
 	///
 	/// For off-chain orders, this might involve calling openFor() to create
 	/// the order on-chain. Returns None if no preparation is needed.
 	async fn generate_prepare_transaction(
 		&self,
-		_intent: &Intent,
+		_source: &str,
 		_order: &Order,
 		_params: &ExecutionParams,
 	) -> Result<Option<Transaction>, OrderError> {
@@ -145,6 +129,7 @@ pub trait OrderInterface: Send + Sync {
 	async fn validate_and_create_order(
 		&self,
 		order_bytes: &Bytes,
+		intent_data: &Option<serde_json::Value>,
 		lock_type: &str,
 		order_id_callback: OrderIdCallback,
 		solver_address: &Address,
@@ -243,28 +228,6 @@ impl OrderService {
 		}
 	}
 
-	/// Validates an intent using the appropriate standard implementation.
-	///
-	/// Selects the implementation based on the intent's standard field
-	/// and delegates validation to that implementation. The solver address
-	/// is included in the resulting order for reward attribution.
-	///
-	/// # Arguments
-	///
-	/// * `intent` - The intent to validate
-	/// * `solver_address` - The solver's address for reward attribution
-	pub async fn validate_intent(
-		&self,
-		intent: &Intent,
-		solver_address: &Address,
-	) -> Result<Order, OrderError> {
-		let implementation = self.implementations.get(&intent.standard).ok_or_else(|| {
-			OrderError::ValidationFailed(format!("Unknown standard: {}", intent.standard))
-		})?;
-
-		implementation.validate_intent(intent, solver_address).await
-	}
-
 	/// Determines whether an order should be executed using the configured strategy.
 	pub async fn should_execute(
 		&self,
@@ -279,7 +242,7 @@ impl OrderService {
 	/// Uses the appropriate standard implementation to create the transaction.
 	pub async fn generate_prepare_transaction(
 		&self,
-		intent: &Intent,
+		source: &str,
 		order: &Order,
 		params: &ExecutionParams,
 	) -> Result<Option<Transaction>, OrderError> {
@@ -289,7 +252,7 @@ impl OrderService {
 			.ok_or_else(|| OrderError::ValidationFailed("Unknown standard".into()))?;
 
 		implementation
-			.generate_prepare_transaction(intent, order, params)
+			.generate_prepare_transaction(source, order, params)
 			.await
 	}
 
@@ -350,6 +313,7 @@ impl OrderService {
 		&self,
 		standard: &str,
 		order_bytes: &Bytes,
+		intent_data: &Option<serde_json::Value>,
 		lock_type: &str,
 		order_id_callback: OrderIdCallback,
 		solver_address: &Address,
@@ -359,7 +323,13 @@ impl OrderService {
 		})?;
 
 		implementation
-			.validate_and_create_order(order_bytes, lock_type, order_id_callback, solver_address)
+			.validate_and_create_order(
+				order_bytes,
+				intent_data,
+				lock_type,
+				order_id_callback,
+				solver_address,
+			)
 			.await
 	}
 }
