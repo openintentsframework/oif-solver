@@ -29,7 +29,7 @@ use solver_types::utils::{
 };
 use solver_types::{
 	utils::{compute_final_digest, Eip712AbiEncoder},
-	GetQuoteRequest, InteropAddress, QuoteError,
+	GetQuoteRequestV1 as GetQuoteRequest, InteropAddress, QuoteError,
 };
 
 pub fn build_permit2_batch_witness_digest(

@@ -16,7 +16,7 @@
 use alloy_primitives::{Address as AlloyAddress, U256};
 use futures::future::try_join_all;
 use solver_core::SolverEngine;
-use solver_types::{GetQuoteRequest, InteropAddress, QuoteError};
+use solver_types::{GetQuoteRequestV1 as GetQuoteRequest, InteropAddress, QuoteError};
 
 /// Main validator for quote requests.
 ///

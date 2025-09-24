@@ -57,8 +57,8 @@ use solver_config::{Config, QuoteConfig};
 use solver_delivery::DeliveryService;
 use solver_settlement::{SettlementInterface, SettlementService};
 use solver_types::{
-	with_0x_prefix, GetQuoteRequest, InteropAddress, Quote, QuoteDetails, QuoteError, QuoteOrder,
-	QuotePreference, SignatureType,
+	with_0x_prefix, GetQuoteRequestV1 as GetQuoteRequest, InteropAddress, Quote, QuoteDetails,
+	QuoteError, QuoteOrder, QuotePreference, SignatureType,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -163,6 +163,11 @@ impl QuoteGenerator {
 			LockKind::TheCompact { params } => (
 				"CompactLock".to_string(),
 				self.build_compact_message(request, config, params).await?,
+			),
+			LockKind::Rhinestone { params } => (
+				"RhinestoneLock".to_string(),
+				self.build_rhinestone_message(request, config, params)
+					.await?,
 			),
 		};
 		Ok(QuoteOrder {
@@ -530,6 +535,17 @@ impl QuoteGenerator {
 		}
 
 		Ok(serde_json::Value::Object(merged))
+	}
+
+	async fn build_rhinestone_message(
+		&self,
+		_request: &GetQuoteRequest,
+		_config: &Config,
+		_params: &serde_json::Value,
+	) -> Result<serde_json::Value, QuoteError> {
+		Err(QuoteError::UnsupportedSettlement(
+			"Rhinestone resource locks are not yet supported".to_string(),
+		))
 	}
 
 	/// Try to compute the digest using the existing eip712/compact module

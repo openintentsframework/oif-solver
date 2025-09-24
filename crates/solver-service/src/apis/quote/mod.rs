@@ -75,7 +75,9 @@ pub use validation::QuoteValidator;
 
 use solver_config::{Config, QuoteConfig};
 use solver_core::SolverEngine;
-use solver_types::{GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, StorageKey};
+use solver_types::{
+	GetQuoteRequestV1 as GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, StorageKey,
+};
 
 use std::time::Duration;
 use tracing::info;

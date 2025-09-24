@@ -21,8 +21,8 @@ use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
 use solver_types::{
-	api::IntentRequest, APIError, Address, ApiErrorType, GetOrderResponse, GetQuoteRequest,
-	GetQuoteResponse, Order, OrderIdCallback, Transaction,
+	api::PostOrderRequest, APIError, Address, ApiErrorType, GetOrderResponse,
+	GetQuoteRequestV1 as GetQuoteRequest, GetQuoteResponse, Order, OrderIdCallback, Transaction,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -288,13 +288,13 @@ async fn handle_order(
 		.and_then(|s| s.as_str())
 		.unwrap_or("eip7683");
 
-	// Convert payload to IntentRequest
+	// Convert payload to PostOrderRequest
 	let intent_request = match extract_intent_request(payload.clone(), &state, standard).await {
 		Ok(intent) => intent,
 		Err(api_error) => return api_error.into_response(),
 	};
 
-	// Validate the IntentRequest
+	// Validate the PostOrderRequest
 	match validate_intent_request(&intent_request, &state, standard).await {
 		Ok(order) => order,
 		Err(api_error) => return api_error.into_response(),
@@ -303,13 +303,13 @@ async fn handle_order(
 	forward_to_discovery_service(&state, &intent_request).await
 }
 
-/// Extracts an IntentRequest from the incoming payload.
+/// Extracts a PostOrderRequest from the incoming payload.
 /// Handles both quote acceptances (with quoteId) and direct submissions.
 async fn extract_intent_request(
 	payload: Value,
 	state: &AppState,
 	standard: &str,
-) -> Result<IntentRequest, APIError> {
+) -> Result<PostOrderRequest, APIError> {
 	// Check if this is a quote acceptance (has quoteId)
 	if payload.get("quoteId").and_then(|v| v.as_str()).is_some() {
 		// Quote acceptance path
@@ -320,12 +320,12 @@ async fn extract_intent_request(
 	}
 }
 
-/// Creates an IntentRequest from a quote acceptance.
+/// Creates a PostOrderRequest from a quote acceptance.
 async fn create_intent_from_quote(
 	payload: Value,
 	state: &AppState,
 	standard: &str,
-) -> Result<IntentRequest, APIError> {
+) -> Result<PostOrderRequest, APIError> {
 	// Extract required fields
 	let quote_id = payload
 		.get("quoteId")
@@ -363,7 +363,7 @@ async fn create_intent_from_quote(
 			}
 		})?;
 
-	// Convert Quote to IntentRequest using the TryFrom implementation
+	// Convert Quote to PostOrderRequest using the TryFrom implementation
 	(&quote, signature, standard)
 		.try_into()
 		.map_err(|e| APIError::InternalServerError {
@@ -372,24 +372,24 @@ async fn create_intent_from_quote(
 		})
 }
 
-/// Creates an IntentRequest from a direct payload submission.
-fn create_intent_from_payload(payload: Value) -> Result<IntentRequest, APIError> {
-	// The payload should already be in IntentRequest format
+/// Creates a PostOrderRequest from a direct payload submission.
+fn create_intent_from_payload(payload: Value) -> Result<PostOrderRequest, APIError> {
+	// The payload should already be in PostOrderRequest format
 	// {order: Bytes, sponsor: Address, signature: Bytes, lock_type: LockType}
-	serde_json::from_value::<IntentRequest>(payload).map_err(|e| APIError::BadRequest {
+	serde_json::from_value::<PostOrderRequest>(payload).map_err(|e| APIError::BadRequest {
 		error_type: ApiErrorType::InvalidRequest,
 		message: format!("Invalid intent request format: {}", e),
 		details: None,
 	})
 }
 
-/// Validates an IntentRequest and creates an Order.
+/// Validates a PostOrderRequest and creates an Order.
 async fn validate_intent_request(
-	intent: &IntentRequest,
+	intent: &PostOrderRequest,
 	state: &AppState,
 	standard: &str,
 ) -> Result<Order, APIError> {
-	// Get the order bytes (already in Bytes format from IntentRequest)
+	// Get the order bytes (already in Bytes format from PostOrderRequest)
 	let order_bytes = &intent.order;
 
 	// Get lock_type as string
@@ -491,7 +491,7 @@ async fn validate_intent_request(
 
 async fn forward_to_discovery_service(
 	state: &AppState,
-	intent: &IntentRequest,
+	intent: &PostOrderRequest,
 ) -> axum::response::Response {
 	// Check if discovery URL is configured
 	let forward_url = match &state.discovery_url {
