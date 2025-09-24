@@ -901,6 +901,7 @@ mod tests {
 				chain_id: 1,
 				address: "0x1234567890123456789012345678901234567890".to_string(),
 			}),
+			settlement_poll_interval_seconds: 3,
 		};
 
 		// Build network configurations using builder pattern
@@ -991,13 +992,14 @@ mod tests {
 		let mut implementations: HashMap<String, Box<dyn SettlementInterface>> = HashMap::new();
 		implementations.insert("test".to_string(), Box::new(mock_settlement));
 
-		Arc::new(SettlementService::new(implementations))
+		Arc::new(SettlementService::new(implementations, 3))
 	}
 
 	#[tokio::test]
 	async fn test_generate_quotes_success() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
@@ -1025,7 +1027,8 @@ mod tests {
 	#[tokio::test]
 	async fn test_generate_quotes_no_oracles_configured() {
 		let settlement_service = create_test_settlement_service(false);
-		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
@@ -1039,7 +1042,8 @@ mod tests {
 	#[tokio::test]
 	async fn test_generate_quotes_insufficient_liquidity() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 
@@ -1073,7 +1077,8 @@ mod tests {
 	#[tokio::test]
 	async fn test_generate_resource_lock_order_the_compact() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
@@ -1102,7 +1107,8 @@ mod tests {
 	#[test]
 	fn test_generate_erc3009_order() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
@@ -1134,7 +1140,8 @@ mod tests {
 	#[tokio::test]
 	async fn test_build_compact_message() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let request = create_test_request();
 		let params = serde_json::json!({"test": "value"});
@@ -1170,7 +1177,8 @@ mod tests {
 	#[test]
 	fn test_calculate_eta_with_preferences() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 
 		// Test speed preference
@@ -1197,7 +1205,8 @@ mod tests {
 	#[test]
 	fn test_sort_quotes_by_preference_speed() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 
 		let mut quotes = vec![
@@ -1253,7 +1262,8 @@ mod tests {
 	#[test]
 	fn test_sort_quotes_by_preference_other() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 
 		let mut quotes = vec![
@@ -1308,7 +1318,8 @@ mod tests {
 	#[test]
 	fn test_get_quote_validity_seconds() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 
 		// Test with configured validity
@@ -1325,7 +1336,8 @@ mod tests {
 	#[test]
 	fn test_get_lock_domain_address_success() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let lock_kind = LockKind::TheCompact {
@@ -1342,7 +1354,8 @@ mod tests {
 	#[test]
 	fn test_get_lock_domain_address_missing_config() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let mut config = create_test_config();
 		config.settlement.domain = None;
@@ -1358,7 +1371,8 @@ mod tests {
 	#[test]
 	fn test_get_escrow_address_success() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 
@@ -1369,7 +1383,8 @@ mod tests {
 	#[test]
 	fn test_get_escrow_address_missing_config() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let mut config = create_test_config();
 		config.settlement.domain = None;
@@ -1381,7 +1396,8 @@ mod tests {
 	#[test]
 	fn test_get_escrow_address_invalid_address() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let mut config = create_test_config();
 		config.settlement.domain.as_mut().unwrap().address = "invalid_address".to_string();
@@ -1393,7 +1409,8 @@ mod tests {
 	#[tokio::test]
 	async fn test_generate_quote_for_settlement_resource_lock() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
@@ -1427,7 +1444,8 @@ mod tests {
 	#[tokio::test]
 	async fn test_generate_quote_for_settlement_escrow() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();

@@ -12,8 +12,8 @@ use alloy_rpc_types::BlockTransactionsKind;
 use alloy_transport_http::Http;
 use async_trait::async_trait;
 use solver_types::{
-	with_0x_prefix, ConfigSchema, Eip7683OrderData, Field, FieldType, FillProof, NetworksConfig,
-	Order, Schema, Transaction, TransactionHash, TransactionReceipt,
+	with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, NetworksConfig, Order, Schema,
+	Transaction, TransactionHash, TransactionReceipt,
 };
 use std::collections::HashMap;
 
@@ -149,20 +149,23 @@ impl SettlementInterface for DirectSettlement {
 	) -> Result<FillProof, SettlementError> {
 		// Get the origin chain ID from the order
 		// Note: For now we assume all inputs are on the same chain
-		let origin_chain_id = *order.input_chain_ids.first().ok_or_else(|| {
-			SettlementError::ValidationFailed("No input chains in order".to_string())
-		})?;
+		let origin_chain_id = order
+			.input_chains
+			.first()
+			.map(|c| c.chain_id)
+			.ok_or_else(|| {
+				SettlementError::ValidationFailed("No input chains in order".to_string())
+			})?;
 		// Get the destination chain ID from the order
 		// Note: For now we assume all outputs are on the same chain
-		let destination_chain_id = *order.output_chain_ids.first().ok_or_else(|| {
-			SettlementError::ValidationFailed("No output chains in order".to_string())
-		})?;
-
-		// Parse order data for other fields we need
-		let order_data: Eip7683OrderData =
-			serde_json::from_value(order.data.clone()).map_err(|e| {
-				SettlementError::ValidationFailed(format!("Failed to parse order data: {}", e))
-			})?;
+		let destination_chain_id =
+			order
+				.output_chains
+				.first()
+				.map(|c| c.chain_id)
+				.ok_or_else(|| {
+					SettlementError::ValidationFailed("No output chains in order".to_string())
+				})?;
 
 		// Get the appropriate provider for this chain
 		let provider = self.providers.get(&destination_chain_id).ok_or_else(|| {
@@ -181,8 +184,12 @@ impl SettlementInterface for DirectSettlement {
 			)));
 		}
 
-		// Use selection strategy with order nonce as context for deterministic selection
-		let selection_context = order_data.nonce.to::<u64>();
+		// Use order ID hash as selection context for deterministic oracle selection
+		// This ensures the same oracle is consistently selected for a given order
+		let order_id_bytes = order.id.as_bytes();
+		let mut hasher = std::collections::hash_map::DefaultHasher::new();
+		std::hash::Hasher::write(&mut hasher, order_id_bytes);
+		let selection_context = std::hash::Hasher::finish(&hasher);
 		let oracle_address = self
 			.select_oracle(&oracle_addresses, Some(selection_context))
 			.ok_or_else(|| {
@@ -235,7 +242,7 @@ impl SettlementInterface for DirectSettlement {
 			tx_hash: tx_hash.clone(),
 			block_number: tx_block,
 			oracle_address: with_0x_prefix(&hex::encode(&oracle_address.0)),
-			attestation_data: Some(order_data.order_id.to_vec()),
+			attestation_data: Some(order.id.as_bytes().to_vec()),
 			filled_timestamp: block_timestamp,
 		})
 	}
@@ -246,16 +253,10 @@ impl SettlementInterface for DirectSettlement {
 	/// requirements are met.
 	async fn can_claim(&self, order: &Order, fill_proof: &FillProof) -> bool {
 		// Get the destination chain ID from the order
-		let destination_chain_id = match order.output_chain_ids.first() {
-			Some(&chain_id) => chain_id,
+		let destination_chain_id = match order.output_chains.first() {
+			Some(chain) => chain.chain_id,
 			None => return false,
 		};
-
-		// TODO: Parse order data if needed for dispute deadline check
-		// let order_data: Eip7683OrderData = match serde_json::from_value(order.data.clone()) {
-		//     Ok(data) => data,
-		//     Err(_) => return false,
-		// };
 
 		// Get the appropriate provider for this chain
 		let provider = match self.providers.get(&destination_chain_id) {
@@ -284,13 +285,6 @@ impl SettlementInterface for DirectSettlement {
 			return false; // Still in dispute period
 		}
 
-		// TODO check:
-		// 1. Oracle attestation exists
-		// 2. No disputes were raised
-		// 3. Claim window hasn't expired
-		// 4. Rewards haven't been claimed yet
-
-		// For now, return true if dispute period passed
 		true
 	}
 
@@ -304,9 +298,10 @@ impl SettlementInterface for DirectSettlement {
 		_fill_receipt: &TransactionReceipt,
 	) -> Result<Option<Transaction>, SettlementError> {
 		// Get the output oracle for PostFill (happens on destination chain)
-		let dest_chain = *order
-			.output_chain_ids
+		let dest_chain = order
+			.output_chains
 			.first()
+			.map(|c| c.chain_id)
 			.ok_or_else(|| SettlementError::ValidationFailed("No output chains in order".into()))?;
 
 		let oracle_addresses = self.get_output_oracles(dest_chain);
@@ -343,9 +338,10 @@ impl SettlementInterface for DirectSettlement {
 		_fill_proof: &FillProof,
 	) -> Result<Option<Transaction>, SettlementError> {
 		// Get the input oracle for PreClaim (happens on origin chain)
-		let origin_chain = *order
-			.input_chain_ids
+		let origin_chain = order
+			.input_chains
 			.first()
+			.map(|c| c.chain_id)
 			.ok_or_else(|| SettlementError::ValidationFailed("No input chains in order".into()))?;
 
 		let oracle_addresses = self.get_input_oracles(origin_chain);
@@ -385,6 +381,7 @@ impl SettlementInterface for DirectSettlement {
 pub fn create_settlement(
 	config: &toml::Value,
 	networks: &NetworksConfig,
+	_storage: std::sync::Arc<solver_storage::StorageService>,
 ) -> Result<Box<dyn SettlementInterface>, SettlementError> {
 	// Validate configuration first
 	DirectSettlementSchema::validate_config(config)
@@ -432,6 +429,13 @@ mod tests {
 		ImplementationRegistry,
 	};
 	use std::collections::HashMap;
+	use std::sync::Arc;
+
+	fn create_mock_storage() -> Arc<solver_storage::StorageService> {
+		let storage_backend =
+			Box::new(solver_storage::implementations::memory::MemoryStorage::new());
+		Arc::new(solver_storage::StorageService::new(storage_backend))
+	}
 
 	fn create_test_networks() -> NetworksConfig {
 		NetworksConfigBuilder::new()
@@ -686,7 +690,8 @@ mod tests {
 		});
 
 		let networks = create_test_networks();
-		let result = create_settlement(&config, &networks);
+		let storage = create_mock_storage();
+		let result = create_settlement(&config, &networks, storage);
 		assert!(result.is_ok());
 	}
 
@@ -703,7 +708,8 @@ mod tests {
 		});
 
 		let networks = create_test_networks();
-		let result = create_settlement(&config, &networks);
+		let storage = create_mock_storage();
+		let result = create_settlement(&config, &networks, storage);
 		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
 	}
 
@@ -838,7 +844,8 @@ mod tests {
 		});
 
 		let networks = create_test_networks();
-		let result = factory(&config, &networks);
+		let storage = create_mock_storage();
+		let result = factory(&config, &networks, storage);
 		assert!(result.is_ok());
 	}
 

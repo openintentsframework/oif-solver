@@ -150,9 +150,9 @@ async fn convert_eip7683_order_to_response(
 
 	// Get the input chain ID (use first one if multiple)
 	let input_chain_id = order
-		.input_chain_ids
+		.input_chains
 		.first()
-		.copied()
+		.map(|c| c.chain_id)
 		.ok_or_else(|| GetOrderError::Internal("No input chain ID found".to_string()))?;
 
 	// Convert input token to InteropAddress format
@@ -206,9 +206,9 @@ async fn convert_eip7683_order_to_response(
 
 	// Get the output chain ID (use first one if multiple)
 	let output_chain_id = order
-		.output_chain_ids
+		.output_chains
 		.first()
-		.copied()
+		.map(|c| c.chain_id)
 		.ok_or_else(|| GetOrderError::Internal("No output chain ID found".to_string()))?;
 
 	// Convert output token to InteropAddress format
@@ -338,11 +338,11 @@ mod tests {
 		let storage = Arc::new(solver_storage::StorageService::new(Box::new(storage_mock)));
 		let account = test_account();
 		let providers: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> = HashMap::new();
-		let delivery = Arc::new(DeliveryService::new(providers, 1));
+		let delivery = Arc::new(DeliveryService::new(providers, 1, 3));
 		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
 		let strategy = create_strategy(&Value::Table(toml::map::Map::new())).unwrap();
 		let order = Arc::new(OrderService::new(HashMap::new(), strategy));
-		let settlement = Arc::new(SettlementService::new(HashMap::new()));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), 3));
 		let event_bus = EventBus::new(64);
 		let networks: solver_types::NetworksConfig = HashMap::new();
 		let token_manager = Arc::new(TokenManager::new(

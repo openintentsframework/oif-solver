@@ -466,6 +466,7 @@ async fn validate_intent_request(
 		.validate_and_create_order(
 			standard,
 			order_bytes,
+			&None,
 			lock_type,
 			compute_order_id,
 			&solver_address,

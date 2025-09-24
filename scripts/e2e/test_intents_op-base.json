@@ -1,0 +1,24 @@
+{
+  "intents": [
+    {
+      "description": "Test USDC transfer from Base Sepolia to Optimism Sepolia",
+      "enabled": true,
+      "origin_chain_id": 11155420,
+      "dest_chain_id": 84532,
+      "origin_token": {
+        "address": "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6",
+        "symbol": "USDC",
+        "decimals": 6
+      },
+      "dest_token": {
+        "address": "0x73c83DAcc74bB8a704717AC09703b959E74b9705",
+        "symbol": "USDC",
+        "decimals": 6
+      },
+      "amounts": {
+        "input": "1000000",
+        "output": "990000"
+      }
+    }
+  ]
+}

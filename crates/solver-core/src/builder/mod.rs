@@ -86,6 +86,7 @@ impl SolverBuilder {
 		SEF: Fn(
 			&toml::Value,
 			&solver_types::NetworksConfig,
+			Arc<StorageService>,
 		) -> Result<Box<dyn SettlementInterface>, SettlementError>,
 		STF: Fn(&toml::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError>,
 	{
@@ -283,6 +284,7 @@ impl SolverBuilder {
 		let delivery = Arc::new(DeliveryService::new(
 			delivery_implementations,
 			self.config.delivery.min_confirmations,
+			self.config.delivery.transaction_poll_interval_seconds,
 		));
 
 		// Create discovery implementations
@@ -323,7 +325,7 @@ impl SolverBuilder {
 		let mut settlement_impls = HashMap::new();
 		for (name, config) in &self.config.settlement.implementations {
 			if let Some(factory) = factories.settlement_factories.get(name) {
-				match factory(config, &self.config.networks) {
+				match factory(config, &self.config.networks, storage.clone()) {
 					Ok(implementation) => {
 						// Validation already happened in the factory
 						settlement_impls.insert(name.clone(), implementation);
@@ -349,7 +351,10 @@ impl SolverBuilder {
 			tracing::warn!("No settlement implementations available - solver will not be able to monitor and claim settlements");
 		}
 
-		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let settlement = Arc::new(SettlementService::new(
+			settlement_impls,
+			self.config.settlement.settlement_poll_interval_seconds,
+		));
 
 		// Create pricing service
 		let pricing_config =

@@ -1,0 +1,211 @@
+{
+  "version": "1.0.0",
+  "description": "E2E testnet configuration for OIF solver",
+  "accounts": {
+    "_comment": "Wallet addresses used in the system. Private keys must be in .env file",
+    "solver": {
+      "address": "0xdf2ef67c96DdC136A8447F9eca1959B85C210218",
+      "private_key_env": "SOLVER_PRIVATE_KEY",
+      "required": true
+    },
+    "user": {
+      "address": "0x487C810990E17594A2Caa022a1E132c7B94F832f",
+      "private_key_env": "USER_PRIVATE_KEY",
+      "required": false,
+      "_comment": "Used for demo scripts to send test transactions"
+    },
+    "recipient": {
+      "address": "0x487C810990E17594A2Caa022a1E132c7B94F832f",
+      "required": false,
+      "_comment": "Destination address for test transfers"
+    }
+  },
+  "infrastructure": {
+    "permit2_address": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+    "oif_contracts_commit": "eafdaa8",
+    "oif_contracts_repo": "https://github.com/openintentsframework/oif-contracts.git"
+  },
+  "solver_parameters": {
+    "id": "oif-solver-testnet",
+    "min_profitability_pct": 1.0,
+    "monitoring_timeout_minutes": 5,
+    "max_gas_price_gwei": 100,
+    "cleanup_interval_seconds": 3600,
+    "min_confirmations": 3
+  },
+  "api": {
+    "solver_api": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 3000,
+      "timeout_seconds": 30,
+      "max_request_size": 1048576
+    },
+    "discovery_api": {
+      "host": "127.0.0.1",
+      "port": 8081
+    },
+    "auth": {
+      "enabled": false,
+      "jwt_secret_env": "JWT_SECRET",
+      "access_token_expiry_hours": 1,
+      "refresh_token_expiry_hours": 720,
+      "issuer": "oif-solver-testnet"
+    },
+    "quote": {
+      "validity_seconds": 60
+    }
+  },
+  "settlement": {
+    "implementations": [
+      {
+        "type": "direct",
+        "enabled": true,
+        "order_type": "eipXXXX",
+        "_comment": "Direct settlement using eipXXXX for same-chain or simple cross-chain",
+        "parameters": {
+          "oracle_selection_strategy": "First",
+          "dispute_period_seconds": 60
+        },
+        "chains": {
+          "base-sepolia": {
+            "chain_id": 84532,
+            "oracle": "0x95663EFa88cae75A6bC146c56E19035Cc70fEA15"
+          },
+          "arbitrum-sepolia": {
+            "chain_id": 421614,
+            "oracle": "0x95663EFa88cae75A6bC146c56E19035Cc70fEA15"
+          },
+          "ethereum-sepolia": {
+            "chain_id": 11155111,
+            "oracle": "0x95663EFa88cae75A6bC146c56E19035Cc70fEA15"
+          },
+          "polygon-amoy": {
+            "chain_id": 80002,
+            "oracle": "0x95663EFa88cae75A6bC146c56E19035Cc70fEA15"
+          }
+        },
+        "routes": {
+          "_comment": "All chains can route to all other chains in direct settlement",
+          "all_to_all": true
+        }
+      },
+      {
+        "type": "hyperlane",
+        "enabled": true,
+        "order_type": "eip7683",
+        "_comment": "Hyperlane settlement for cross-chain messaging",
+        "parameters": {
+          "default_gas_limit": 500000,
+          "message_timeout_seconds": 600,
+          "finalization_required": true
+        },
+        "chains": {
+          "base-sepolia": {
+            "chain_id": 84532,
+            "oracle": "0xf79350C014e8669f2CE1dB928977a4f8E744f42B",
+            "mailbox": "0x6966b0E55883d49BFB24539356a2f8A673E02039",
+            "igp": "0x28B02B97a850872C4D33C3E024fab6499ad96564",
+            "oracle_deployed": true
+          },
+          "optimism-sepolia": {
+            "chain_id": 11155420,
+            "oracle": "0xc8604e4aBC757C5C1990BAe679A7b219808EDc9c",
+            "mailbox": "0x6966b0E55883d49BFB24539356a2f8A673E02039",
+            "igp": "0x28B02B97a850872C4D33C3E024fab6499ad96564",
+            "oracle_deployed": true
+          }
+        },
+        "routes": {
+          "_comment": "Specific chain pairs that are configured for Hyperlane",
+          "pairs": [
+            [
+              "base-sepolia",
+              "optimism-sepolia"
+            ],
+            [
+              "optimism-sepolia",
+              "base-sepolia"
+            ]
+          ]
+        }
+      }
+    ]
+  },
+  "gas_estimates": {
+    "_comment": "Gas consumption in units, measured from testnet",
+    "compact_resource_lock": {
+      "open": 0,
+      "fill": 77298,
+      "claim": 122793
+    },
+    "permit2_escrow": {
+      "open": 146306,
+      "fill": 77298,
+      "claim": 60084
+    },
+    "eip3009_escrow": {
+      "open": 130254,
+      "fill": 77298,
+      "claim": 60084
+    }
+  },
+  "storage": {
+    "primary": "file",
+    "file": {
+      "storage_path": "./data/storage",
+      "ttl_orders": 0,
+      "ttl_intents": 86400,
+      "ttl_order_by_tx_hash": 86400
+    }
+  },
+  "pricing": {
+    "primary": "coingecko",
+    "coingecko": {
+      "cache_duration_seconds": 60,
+      "rate_limit_delay_ms": 1200,
+      "api_key_env": "COINGECKO_API_KEY"
+    }
+  },
+  "deployment": {
+    "deploy_contracts": true,
+    "contracts": [
+      {
+        "name": "AlwaysYesOracle_Origin",
+        "contract": "test/mocks/AlwaysYesOracle.sol:AlwaysYesOracle",
+        "chain": "origin"
+      },
+      {
+        "name": "AlwaysYesOracle_Destination",
+        "contract": "test/mocks/AlwaysYesOracle.sol:AlwaysYesOracle",
+        "chain": "destination"
+      },
+      {
+        "name": "InputSettlerEscrow_Origin",
+        "contract": "src/input/escrow/InputSettlerEscrow.sol:InputSettlerEscrow",
+        "chain": "origin"
+      },
+      {
+        "name": "InputSettlerEscrow_Destination",
+        "contract": "src/input/escrow/InputSettlerEscrow.sol:InputSettlerEscrow",
+        "chain": "destination"
+      },
+      {
+        "name": "OutputSettlerSimple_Origin",
+        "contract": "src/output/simple/OutputSettlerSimple.sol:OutputSettlerSimple",
+        "chain": "origin"
+      },
+      {
+        "name": "OutputSettlerSimple_Destination",
+        "contract": "src/output/simple/OutputSettlerSimple.sol:OutputSettlerSimple",
+        "chain": "destination"
+      }
+    ]
+  },
+  "discovery": {
+    "onchain": {
+      "polling_interval_secs": 5,
+      "_comment": "0 means use WebSocket subscriptions"
+    }
+  }
+}
