@@ -442,6 +442,16 @@ impl OrderInterface for Eip7683OrderImpl {
 			);
 		}
 		// Use the InputSettlerEscrow openFor call with StandardOrder struct
+		tracing::info!("=== CONTRACT CALL PARAMETERS ===");
+		tracing::info!("InputSettlerEscrow contract will call receiveWithAuthorization with:");
+		tracing::info!("  from (sponsor): {:?}", sponsor_address);
+		tracing::info!("  to (contract): should be input settler address");
+		tracing::info!("  value: {} (from input[1])", order_struct.inputs[0][1]);
+		tracing::info!("  validAfter: 0");
+		tracing::info!("  validBefore: {} (fillDeadline)", order_struct.fillDeadline);
+		tracing::info!("  nonce: should be order_identifier");
+		tracing::info!("============================");
+
 		let signature_bytes = hex::decode(signature.trim_start_matches("0x"))
 			.map_err(|e| OrderError::ValidationFailed(format!("Invalid signature: {}", e)))?;
 
@@ -862,10 +872,12 @@ impl OrderInterface for Eip7683OrderImpl {
 			alloy_primitives::hex::encode(standard_order.nonce.to_be_bytes::<32>())
 		);
 		let order_id_bytes = if matches!(lock_type, LockType::Eip3009Escrow) {
-			// For ERC-3009, the order ID must match the nonce used in the signature
-			// Use the nonce from the StandardOrder directly
-			tracing::info!("Using nonce as order ID for ERC-3009");
-			standard_order.nonce.to_be_bytes::<32>().to_vec()
+			// For ERC-3009, we need to use the order identifier calculated by the contract
+			// This ensures the order ID matches what was used for the ERC-3009 signature
+			tracing::info!("Computing order ID from contract for ERC-3009");
+			order_id_callback(chain_id, tx_data).await.map_err(|e| {
+				OrderError::ValidationFailed(format!("Failed to compute order ID for ERC-3009: {}", e))
+			})?
 		} else {
 			// For other lock types, use the callback to compute order ID from contract
 			tracing::info!(

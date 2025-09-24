@@ -896,13 +896,28 @@ quote_accept() {
                 print_debug "Contract returned nonce: '$contract_nonce'"
                 print_debug "Original quote nonce: '$nonce'"
 
-                # Use the contract-calculated nonce if available, otherwise fallback to quote nonce
-                local final_nonce="${contract_nonce:-$nonce}"
-                print_debug "Final nonce for ERC-3009: $final_nonce"
+                # For ERC-3009 quotes, ALWAYS use the original quote nonce (order_identifier)
+                # The quote was generated with a specific order_identifier that was calculated by the solver
+                # Recalculating with a different structure will give a different order_identifier
+                local final_nonce="$nonce"
+                print_debug "Final nonce for ERC-3009: $final_nonce (using original quote nonce)"
                 
-                if [ -z "$contract_nonce" ] || [ "$contract_nonce" = "" ]; then
-                    print_warning "Failed to get order ID from contract, using quote nonce. This may cause signature verification to fail."
+                if [ -n "$contract_nonce" ] && [ "$contract_nonce" != "" ] && [ "$contract_nonce" != "$nonce" ]; then
+                    print_warning "Contract calculated different nonce ($contract_nonce) vs quote nonce ($nonce). Using quote nonce to maintain signature consistency."
                 fi
+
+                # Debug: Show exactly what parameters are being used for signing
+                print_debug "=== ERC-3009 SIGNING PARAMETERS ==="
+                print_debug "user_key: ${#user_key} chars"
+                print_debug "origin_chain_id: $origin_chain_id"
+                print_debug "token_contract: $token_contract"
+                print_debug "from_address: $from_address"
+                print_debug "to_address: $to_address"
+                print_debug "value: $value"
+                print_debug "valid_after: $valid_after"
+                print_debug "valid_before: $valid_before"
+                print_debug "final_nonce: $final_nonce"
+                print_debug "=================================="
 
                 # Sign ERC-3009 authorization with the correct nonce
                 signature=$(sign_erc3009_authorization \
