@@ -5,7 +5,7 @@ edition = "2021"
 rust-version.workspace = true
 
 [dependencies]
-alloy-consensus = "0.8"
+alloy-consensus = "0.12"
 alloy-network = "0.8"
 alloy-primitives = "0.8"
 alloy-signer = "0.8"
