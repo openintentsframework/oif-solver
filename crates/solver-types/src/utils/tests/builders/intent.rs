@@ -1,6 +1,7 @@
 //! Intent builder utilities for creating test and production Intent instances.
 
 use crate::{Intent, IntentMetadata};
+use alloy_primitives::Bytes;
 
 /// Builder for creating Intent instances with sensible defaults.
 ///
@@ -13,7 +14,9 @@ pub struct IntentBuilder {
 	standard: String,
 	metadata: IntentMetadata,
 	data: serde_json::Value,
+	order_bytes: Bytes,
 	quote_id: Option<String>,
+	lock_type: String,
 }
 
 impl Default for IntentBuilder {
@@ -38,7 +41,9 @@ impl Default for IntentBuilder {
 					}
 				]
 			}),
+			order_bytes: Bytes::default(), // Empty bytes for test data
 			quote_id: None,
+			lock_type: "permit2_escrow".to_string(),
 		}
 	}
 }
@@ -139,6 +144,18 @@ impl IntentBuilder {
 		self
 	}
 
+	/// Sets the lock type.
+	pub fn with_lock_type<S: Into<String>>(mut self, lock_type: S) -> Self {
+		self.lock_type = lock_type.into();
+		self
+	}
+
+	/// Sets the order bytes.
+	pub fn with_order_bytes(mut self, bytes: Bytes) -> Self {
+		self.order_bytes = bytes;
+		self
+	}
+
 	/// Builds the Intent instance.
 	pub fn build(self) -> Intent {
 		Intent {
@@ -147,7 +164,9 @@ impl IntentBuilder {
 			standard: self.standard,
 			metadata: self.metadata,
 			data: self.data,
+			order_bytes: self.order_bytes,
 			quote_id: self.quote_id,
+			lock_type: self.lock_type,
 		}
 	}
 }

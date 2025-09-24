@@ -253,7 +253,11 @@ impl OrderParsable for Eip7683OrderData {
 	}
 
 	fn parse_lock_type(&self) -> Option<String> {
-		self.lock_type.map(|lt| lt.as_str().to_string())
+		self.lock_type.map(|lt| lt.to_string())
+	}
+
+	fn input_oracle(&self) -> String {
+		self.input_oracle.clone()
 	}
 
 	fn origin_chain_id(&self) -> u64 {
@@ -899,12 +903,20 @@ impl QuoteParsable for Eip7683OrderData {
 		);
 		order_data.lock_type = Some(lock_type);
 
-		// Extract chain IDs for the Order
-		let input_chain_ids = vec![order_data.origin_chain_id.try_into().unwrap_or(1)];
-		let output_chain_ids: Vec<u64> = order_data
+		// Create ChainSettlerInfo for the Order
+		// For estimation, we use dummy settler addresses
+		let input_chains = vec![crate::order::ChainSettlerInfo {
+			chain_id: order_data.origin_chain_id.try_into().unwrap_or(1),
+			settler_address: Address(vec![0u8; 20]), // Dummy address for estimation
+		}];
+
+		let output_chains: Vec<crate::order::ChainSettlerInfo> = order_data
 			.outputs
 			.iter()
-			.map(|output| output.chain_id.try_into().unwrap_or(1))
+			.map(|output| crate::order::ChainSettlerInfo {
+				chain_id: output.chain_id.try_into().unwrap_or(1),
+				settler_address: Address(output.settler.to_vec()), // Use settler from output
+			})
 			.collect();
 
 		Order {
@@ -917,8 +929,8 @@ impl QuoteParsable for Eip7683OrderData {
 			data: serde_json::to_value(&order_data).unwrap_or(serde_json::Value::Null),
 			solver_address: Address(vec![0u8; 20]), // Dummy address
 			quote_id: Some(quote.quote_id.clone()),
-			input_chain_ids,
-			output_chain_ids,
+			input_chains,
+			output_chains,
 			execution_params: None,
 			prepare_tx_hash: None,
 			fill_tx_hash: None,
@@ -991,6 +1003,16 @@ impl From<interfaces::StandardOrder> for Eip7683OrderData {
 			sponsor: None,
 			lock_type: None,
 		}
+	}
+}
+
+/// Implement TryFrom for converting serde_json::Value to Eip7683OrderData
+/// This allows us to parse intent data that may contain additional fields like sponsor/signature
+impl TryFrom<&serde_json::Value> for Eip7683OrderData {
+	type Error = serde_json::Error;
+
+	fn try_from(value: &serde_json::Value) -> Result<Self, Self::Error> {
+		serde_json::from_value(value.to_owned())
 	}
 }
 

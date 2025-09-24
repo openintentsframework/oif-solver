@@ -131,6 +131,10 @@ pub struct DeliveryConfig {
 	/// Defaults to 12 confirmations if not specified.
 	#[serde(default = "default_confirmations")]
 	pub min_confirmations: u64,
+	/// Poll interval in seconds for transaction status monitoring.
+	/// Defaults to 3 seconds if not specified.
+	#[serde(default = "default_transaction_poll_interval_seconds")]
+	pub transaction_poll_interval_seconds: u64,
 }
 
 /// Returns the default number of confirmations required.
@@ -139,6 +143,11 @@ pub struct DeliveryConfig {
 /// when no explicit confirmation count is configured.
 fn default_confirmations() -> u64 {
 	12 // Default to 12 confirmations
+}
+
+/// Returns the default transaction poll interval in seconds.
+fn default_transaction_poll_interval_seconds() -> u64 {
+	3 // Default to 3 seconds
 }
 
 /// Configuration for account management.
@@ -185,6 +194,15 @@ pub struct SettlementConfig {
 	pub implementations: HashMap<String, toml::Value>,
 	/// Domain configuration for EIP-712 signatures in quotes.
 	pub domain: Option<DomainConfig>,
+	/// Poll interval in seconds for settlement readiness monitoring.
+	/// Defaults to 3 seconds if not specified.
+	#[serde(default = "default_settlement_poll_interval_seconds")]
+	pub settlement_poll_interval_seconds: u64,
+}
+
+/// Returns the default settlement poll interval in seconds.
+fn default_settlement_poll_interval_seconds() -> u64 {
+	3 // Default to 3 seconds
 }
 
 /// Implementation references for API functionality.
@@ -397,11 +415,15 @@ impl Config {
 	/// - `include = ["file1.toml", "file2.toml"]` - Include specific files
 	///
 	/// Each top-level section must be unique across all configuration files.
+	///
+	/// Environment variables are loaded from .env files in the current working directory.
 	pub async fn from_file(path: &str) -> Result<Self, ConfigError> {
 		let path_buf = Path::new(path);
 		let base_dir = path_buf.parent().unwrap_or_else(|| Path::new("."));
 
+		// Create loader with config file's base directory for includes
 		let mut loader = loader::ConfigLoader::new(base_dir);
+
 		let file_name = path_buf
 			.file_name()
 			.ok_or_else(|| ConfigError::Validation(format!("Invalid path: {}", path)))?;
@@ -508,6 +530,17 @@ impl Config {
 			));
 		}
 
+		let monitoring_timeout_in_seconds = self.solver.monitoring_timeout_minutes * 60;
+
+		if self.delivery.transaction_poll_interval_seconds < 1
+			|| self.delivery.transaction_poll_interval_seconds > monitoring_timeout_in_seconds
+		{
+			return Err(ConfigError::Validation(format!(
+				"transaction_poll_interval_seconds must be between 1 and {}",
+				monitoring_timeout_in_seconds
+			)));
+		}
+
 		// Validate account config
 		if self.account.implementations.is_empty() {
 			return Err(ConfigError::Validation(
@@ -544,6 +577,17 @@ impl Config {
 			return Err(ConfigError::Validation(
 				"At least one settlement implementation required".into(),
 			));
+		}
+
+		// Validate settlement poll interval (1-monitoring_timeout_in_seconds)
+		// Settlement can be slower, especially for cross-chain
+		if self.settlement.settlement_poll_interval_seconds < 1
+			|| self.settlement.settlement_poll_interval_seconds > monitoring_timeout_in_seconds
+		{
+			return Err(ConfigError::Validation(format!(
+				"settlement_poll_interval_seconds must be between 1 and {}",
+				monitoring_timeout_in_seconds
+			)));
 		}
 
 		// Validate API config if enabled

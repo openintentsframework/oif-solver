@@ -266,9 +266,10 @@ impl RecoveryService {
 
 		// Check claim transaction
 		if let Some(ref claim_tx) = order.claim_tx_hash {
-			let chain_id = *order
-				.input_chain_ids
+			let chain_id = order
+				.input_chains
 				.first()
+				.map(|c| c.chain_id)
 				.ok_or_else(|| RecoveryError::Storage("No input chains in order".into()))?;
 
 			match self.delivery.get_status(claim_tx, chain_id).await {
@@ -296,10 +297,12 @@ impl RecoveryService {
 		// Check pre-claim transaction
 		if let Some(ref pre_claim_tx) = order.pre_claim_tx_hash {
 			// PreClaim happens on origin chain (same as claim)
-			let chain_id = *order
-				.input_chain_ids
+			let chain_id = order
+				.input_chains
 				.first()
+				.map(|c| c.chain_id)
 				.ok_or_else(|| RecoveryError::Storage("No input chains in order".into()))?;
+
 			match self.delivery.get_status(pre_claim_tx, chain_id).await {
 				Ok(true) => {
 					// Pre-claim confirmed, ready for claim
@@ -315,10 +318,12 @@ impl RecoveryService {
 		// Check post-fill transaction
 		if let Some(ref post_fill_tx) = order.post_fill_tx_hash {
 			// PostFill happens on destination chain (same as fill)
-			let chain_id = *order
-				.output_chain_ids
+			let chain_id = order
+				.output_chains
 				.first()
+				.map(|c| c.chain_id)
 				.ok_or_else(|| RecoveryError::Storage("No output chains in order".into()))?;
+
 			match self.delivery.get_status(post_fill_tx, chain_id).await {
 				Ok(true) => {
 					// Post-fill confirmed, needs monitoring for settlement
@@ -331,9 +336,10 @@ impl RecoveryService {
 
 		// Check fill transaction
 		if let Some(ref fill_tx) = order.fill_tx_hash {
-			let chain_id = *order
-				.output_chain_ids
+			let chain_id = order
+				.output_chains
 				.first()
+				.map(|c| c.chain_id)
 				.ok_or_else(|| RecoveryError::Storage("No output chains in order".into()))?;
 
 			match self.delivery.get_status(fill_tx, chain_id).await {
@@ -368,9 +374,10 @@ impl RecoveryService {
 
 		// Check prepare transaction
 		if let Some(ref prepare_tx) = order.prepare_tx_hash {
-			let chain_id = *order
-				.input_chain_ids
+			let chain_id = order
+				.input_chains
 				.first()
+				.map(|c| c.chain_id)
 				.ok_or_else(|| RecoveryError::Storage("No input chains in order".into()))?;
 
 			match self.delivery.get_status(prepare_tx, chain_id).await {

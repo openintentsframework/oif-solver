@@ -115,56 +115,62 @@ impl TokenManager {
 
 		for (chain_id, network) in &self.networks {
 			for token in &network.tokens {
-				// Check allowance for input settler
-				let current_allowance_input = self
-					.delivery
-					.get_allowance(
-						*chain_id,
-						&solver_address_str,
-						&with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
-						&with_0x_prefix(&hex::encode(&token.address.0)),
-					)
-					.await?;
+				// Process input settler if not zero address
+				if network.input_settler_address.0 != [0u8; 20] {
+					// Check allowance for input settler
+					let current_allowance_input = self
+						.delivery
+						.get_allowance(
+							*chain_id,
+							&solver_address_str,
+							&with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
+							&with_0x_prefix(&hex::encode(&token.address.0)),
+						)
+						.await?;
 
-				if current_allowance_input != max_uint256_str {
-					tracing::info!(
-						"Setting approval for token {} on chain {} for input settler",
-						token.symbol,
-						chain_id
-					);
-					self.submit_approval(
-						*chain_id,
-						&token.address,
-						&network.input_settler_address,
-						max_uint256,
-					)
-					.await?;
+					if current_allowance_input != max_uint256_str {
+						tracing::info!(
+							"Setting approval for token {} on chain {} for input settler",
+							token.symbol,
+							chain_id
+						);
+						self.submit_approval(
+							*chain_id,
+							&token.address,
+							&network.input_settler_address,
+							max_uint256,
+						)
+						.await?;
+					}
 				}
 
-				// Check allowance for output settler
-				let current_allowance_output = self
-					.delivery
-					.get_allowance(
-						*chain_id,
-						&solver_address_str,
-						&with_0x_prefix(&hex::encode(&network.output_settler_address.0)),
-						&with_0x_prefix(&hex::encode(&token.address.0)),
-					)
-					.await?;
+				// Process output settler if not zero address
+				if network.output_settler_address.0 != [0u8; 20] {
+					// Check allowance for output settler
+					let current_allowance_output = self
+						.delivery
+						.get_allowance(
+							*chain_id,
+							&solver_address_str,
+							&with_0x_prefix(&hex::encode(&network.output_settler_address.0)),
+							&with_0x_prefix(&hex::encode(&token.address.0)),
+						)
+						.await?;
 
-				if current_allowance_output != max_uint256_str {
-					tracing::info!(
-						"Setting approval for token {} on chain {} for output settler",
-						token.symbol,
-						chain_id
-					);
-					self.submit_approval(
-						*chain_id,
-						&token.address,
-						&network.output_settler_address,
-						max_uint256,
-					)
-					.await?;
+					if current_allowance_output != max_uint256_str {
+						tracing::info!(
+							"Setting approval for token {} on chain {} for output settler",
+							token.symbol,
+							chain_id
+						);
+						self.submit_approval(
+							*chain_id,
+							&token.address,
+							&network.output_settler_address,
+							max_uint256,
+						)
+						.await?;
+					}
 				}
 			}
 		}

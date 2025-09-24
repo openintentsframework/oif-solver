@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use solver_types::{
 	oracle::{OracleInfo, OracleRoutes},
 	Address, ConfigSchema, FillProof, ImplementationRegistry, NetworksConfig, Order, Transaction,
-	TransactionHash, TransactionReceipt,
+	TransactionHash, TransactionReceipt, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +19,7 @@ use thiserror::Error;
 /// Re-export implementations
 pub mod implementations {
 	pub mod direct;
+	pub mod hyperlane;
 }
 
 /// Common utilities for settlement implementations
@@ -219,14 +220,32 @@ pub trait SettlementInterface: Send + Sync {
 		// Default: no pre-claim transaction needed
 		Ok(None)
 	}
+
+	/// Called after certain transaction types are confirmed on-chain.
+	/// Allows settlements to handle transaction receipts for protocol-specific needs.
+	/// For Hyperlane: extracts message IDs from PostFill transaction receipts.
+	async fn handle_transaction_confirmed(
+		&self,
+		_order: &Order,
+		_tx_type: TransactionType,
+		_receipt: &TransactionReceipt,
+	) -> Result<(), SettlementError> {
+		Ok(()) // Default: no-op for settlements that don't need this
+	}
 }
 
 /// Type alias for settlement factory functions.
 ///
 /// This is the function signature that all settlement implementations must provide
 /// to create instances of their settlement interface.
-pub type SettlementFactory =
-	fn(&toml::Value, &NetworksConfig) -> Result<Box<dyn SettlementInterface>, SettlementError>;
+///
+/// Storage is required for Hyperlane implementation to persist message tracker state
+/// across restarts. Other implementations may not require storage.
+pub type SettlementFactory = fn(
+	&toml::Value,
+	&NetworksConfig,
+	Arc<solver_storage::StorageService>,
+) -> Result<Box<dyn SettlementInterface>, SettlementError>;
 
 /// Registry trait for settlement implementations.
 ///
@@ -239,9 +258,12 @@ pub trait SettlementRegistry: ImplementationRegistry<Factory = SettlementFactory
 /// Returns a vector of (name, factory) tuples for all available settlement implementations.
 /// This is used by the factory registry to automatically register all implementations.
 pub fn get_all_implementations() -> Vec<(&'static str, SettlementFactory)> {
-	use implementations::direct;
+	use implementations::{direct, hyperlane};
 
-	vec![(direct::Registry::NAME, direct::Registry::factory())]
+	vec![
+		(direct::Registry::NAME, direct::Registry::factory()),
+		(hyperlane::Registry::NAME, hyperlane::Registry::factory()),
+	]
 }
 
 /// Service managing settlement implementations.
@@ -251,6 +273,8 @@ pub struct SettlementService {
 	implementations: HashMap<String, Box<dyn SettlementInterface>>,
 	/// Track order count for round-robin selection
 	selection_counter: Arc<AtomicU64>,
+	/// Poll interval for settlement monitoring in seconds
+	poll_interval_seconds: u64,
 }
 
 impl SettlementService {
@@ -258,10 +282,15 @@ impl SettlementService {
 	///
 	/// # Arguments
 	/// * `implementations` - Map of implementation name to instance
-	pub fn new(implementations: HashMap<String, Box<dyn SettlementInterface>>) -> Self {
+	/// * `poll_interval_seconds` - Poll interval for settlement monitoring
+	pub fn new(
+		implementations: HashMap<String, Box<dyn SettlementInterface>>,
+		poll_interval_seconds: u64,
+	) -> Self {
 		Self {
 			implementations,
 			selection_counter: Arc::new(AtomicU64::new(0)),
+			poll_interval_seconds,
 		}
 	}
 
@@ -270,6 +299,11 @@ impl SettlementService {
 	/// Returns None if the implementation doesn't exist.
 	pub fn get(&self, name: &str) -> Option<&dyn SettlementInterface> {
 		self.implementations.get(name).map(|b| b.as_ref())
+	}
+
+	/// Get the configured poll interval for settlement monitoring
+	pub fn poll_interval_seconds(&self) -> u64 {
+		self.poll_interval_seconds
 	}
 
 	/// Build oracle routes from all settlement implementations.
@@ -348,15 +382,13 @@ impl SettlementService {
 		&self,
 		order: &Order,
 	) -> Result<&dyn SettlementInterface, SettlementError> {
-		// Parse order data to get input oracle
-		let order_data: solver_types::Eip7683OrderData =
-			serde_json::from_value(order.data.to_owned()).map_err(|e| {
-				SettlementError::ValidationFailed(format!("Invalid order data: {}", e))
-			})?;
-
-		let input_oracle = solver_types::utils::parse_address(&order_data.input_oracle)
+		let order_data = order
+			.parse_order_data()
+			.map_err(|e| SettlementError::ValidationFailed(e.to_string()))?;
+		let input_oracle_str = order_data.input_oracle();
+		let input_oracle = solver_types::utils::parse_address(&input_oracle_str)
 			.map_err(SettlementError::ValidationFailed)?;
-		let origin_chain = order_data.origin_chain_id.to::<u64>();
+		let origin_chain = order_data.origin_chain_id();
 
 		// Find settlement by input oracle
 		self.get_settlement_for_oracle(origin_chain, &input_oracle, true)
