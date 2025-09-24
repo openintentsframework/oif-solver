@@ -448,7 +448,10 @@ impl OrderInterface for Eip7683OrderImpl {
 		tracing::info!("  to (contract): should be input settler address");
 		tracing::info!("  value: {} (from input[1])", order_struct.inputs[0][1]);
 		tracing::info!("  validAfter: 0");
-		tracing::info!("  validBefore: {} (fillDeadline)", order_struct.fillDeadline);
+		tracing::info!(
+			"  validBefore: {} (fillDeadline)",
+			order_struct.fillDeadline
+		);
 		tracing::info!("  nonce: should be order_identifier");
 		tracing::info!("============================");
 
@@ -876,7 +879,10 @@ impl OrderInterface for Eip7683OrderImpl {
 			// This ensures the order ID matches what was used for the ERC-3009 signature
 			tracing::info!("Computing order ID from contract for ERC-3009");
 			order_id_callback(chain_id, tx_data).await.map_err(|e| {
-				OrderError::ValidationFailed(format!("Failed to compute order ID for ERC-3009: {}", e))
+				OrderError::ValidationFailed(format!(
+					"Failed to compute order ID for ERC-3009: {}",
+					e
+				))
 			})?
 		} else {
 			// For other lock types, use the callback to compute order ID from contract
