@@ -37,29 +37,16 @@
 //! - Permit2 availability (universal but requires deployment)
 //! - Custom protocol support (token-specific features)
 
-use solver_types::{AvailableInput, LockKind as ApiLockKind, QuoteError};
+use solver_types::standards::eip7683::LockType;
+use solver_types::{AvailableInput, Lock, QuoteError};
 
 use super::registry::PROTOCOL_REGISTRY;
-
-/// Types of resource locks supported
-#[derive(Debug, Clone)]
-pub enum LockKind {
-	TheCompact { params: serde_json::Value },
-	Rhinestone { params: serde_json::Value },
-}
-
-/// Types of escrow mechanisms
-#[derive(Debug, Clone)]
-pub enum EscrowKind {
-	Permit2,
-	Erc3009,
-}
 
 /// Custody strategy decision
 #[derive(Debug, Clone)]
 pub enum CustodyDecision {
-	ResourceLock { kind: LockKind },
-	Escrow { kind: EscrowKind },
+	ResourceLock { lock: Lock },
+	Escrow { lock_type: LockType },
 }
 
 /// Custody strategy decision engine
@@ -80,19 +67,9 @@ impl CustodyStrategy {
 		self.decide_escrow_strategy(input).await
 	}
 
-	fn handle_resource_lock(
-		&self,
-		lock: &solver_types::Lock,
-	) -> Result<CustodyDecision, QuoteError> {
-		let lock_kind = match lock.kind {
-			ApiLockKind::TheCompact => LockKind::TheCompact {
-				params: lock.params.clone().unwrap_or_default(),
-			},
-			ApiLockKind::Rhinestone => LockKind::Rhinestone {
-				params: lock.params.clone().unwrap_or_default(),
-			},
-		};
-		Ok(CustodyDecision::ResourceLock { kind: lock_kind })
+	fn handle_resource_lock(&self, lock: &Lock) -> Result<CustodyDecision, QuoteError> {
+		// Pass through the Lock directly with its params
+		Ok(CustodyDecision::ResourceLock { lock: lock.clone() })
 	}
 
 	async fn decide_escrow_strategy(
@@ -112,11 +89,11 @@ impl CustodyStrategy {
 
 		if capabilities.supports_erc3009 {
 			Ok(CustodyDecision::Escrow {
-				kind: EscrowKind::Erc3009,
+				lock_type: LockType::Eip3009Escrow,
 			})
 		} else if capabilities.permit2_available {
 			Ok(CustodyDecision::Escrow {
-				kind: EscrowKind::Permit2,
+				lock_type: LockType::Permit2Escrow,
 			})
 		} else {
 			Err(QuoteError::UnsupportedSettlement(

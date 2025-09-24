@@ -230,7 +230,7 @@ where
 				match value {
 					"permit2_escrow" | "Permit2Escrow" => Ok(LockType::Permit2Escrow),
 					"eip3009_escrow" | "Eip3009Escrow" => Ok(LockType::Eip3009Escrow),
-					"compact_resource_lock" | "ResourceLock" => Ok(LockType::ResourceLock),
+					"resource_lock" | "ResourceLock" => Ok(LockType::ResourceLock),
 					_ => Err(Error::custom("Invalid LockType string")),
 				}
 			}
@@ -325,6 +325,20 @@ pub struct Lock {
 	pub kind: LockKind,
 	/// Lock-specific parameters
 	pub params: Option<serde_json::Value>,
+}
+
+impl Lock {
+	/// Convert to EIP-7683 LockType for protocol-level usage
+	pub fn to_lock_type(&self) -> LockType {
+		match self.kind {
+			LockKind::TheCompact | LockKind::Rhinestone => LockType::ResourceLock,
+		}
+	}
+
+	/// Check if this is a resource lock (vs escrow)
+	pub fn is_resource_lock(&self) -> bool {
+		matches!(self.kind, LockKind::TheCompact | LockKind::Rhinestone)
+	}
 }
 
 /// Supported lock mechanisms

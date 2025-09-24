@@ -48,7 +48,7 @@
 //! - **Trust**: Minimal trust assumptions
 //! - **Input Priority**: Preference for specific input tokens
 
-use super::custody::{CustodyDecision, CustodyStrategy, EscrowKind, LockKind};
+use super::custody::{CustodyDecision, CustodyStrategy};
 use crate::apis::quote::permit2::{
 	build_permit2_batch_witness_digest, permit2_domain_address_from_config,
 };
@@ -56,6 +56,7 @@ use crate::eip712::{compact, get_domain_separator};
 use solver_config::{Config, QuoteConfig};
 use solver_delivery::DeliveryService;
 use solver_settlement::{SettlementInterface, SettlementService};
+use solver_types::standards::eip7683::LockType;
 use solver_types::{
 	with_0x_prefix, GetQuoteRequestV1 as GetQuoteRequest, InteropAddress, Quote, QuoteDetails,
 	QuoteError, QuoteOrder, QuotePreference, SignatureType,
@@ -119,12 +120,12 @@ impl QuoteGenerator {
 	) -> Result<Quote, QuoteError> {
 		let quote_id = Uuid::new_v4().to_string();
 		let order = match custody_decision {
-			CustodyDecision::ResourceLock { kind } => {
-				self.generate_resource_lock_order(request, config, kind)
+			CustodyDecision::ResourceLock { lock } => {
+				self.generate_resource_lock_order(request, config, lock)
 					.await?
 			},
-			CustodyDecision::Escrow { kind } => {
-				self.generate_escrow_order(request, config, kind)?
+			CustodyDecision::Escrow { lock_type } => {
+				self.generate_escrow_order(request, config, lock_type)?
 			},
 		};
 		let details = QuoteDetails {
@@ -133,10 +134,11 @@ impl QuoteGenerator {
 		};
 		let eta = self.calculate_eta(&request.preference);
 		let lock_type = match custody_decision {
-			CustodyDecision::ResourceLock { .. } => "compact_resource_lock".to_string(),
-			CustodyDecision::Escrow { kind } => match kind {
-				EscrowKind::Permit2 => "permit2_escrow".to_string(),
-				EscrowKind::Erc3009 => "erc3009_escrow".to_string(),
+			CustodyDecision::ResourceLock { .. } => "resource_lock".to_string(),
+			CustodyDecision::Escrow { lock_type } => match lock_type {
+				LockType::Permit2Escrow => "permit2_escrow".to_string(),
+				LockType::Eip3009Escrow => "eip3009_escrow".to_string(),
+				_ => "unknown".to_string(),
 			},
 		};
 		let validity_seconds = self.get_quote_validity_seconds(config);
@@ -156,15 +158,19 @@ impl QuoteGenerator {
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
-		lock_kind: &LockKind,
+		lock: &solver_types::Lock,
 	) -> Result<QuoteOrder, QuoteError> {
-		let domain_address = self.get_lock_domain_address(config, lock_kind)?;
-		let (primary_type, message) = match lock_kind {
-			LockKind::TheCompact { params } => (
+		use solver_types::LockKind;
+
+		let domain_address = self.get_lock_domain_address(config, lock)?;
+		let default_params = serde_json::json!({});
+		let params = lock.params.as_ref().unwrap_or(&default_params);
+		let (primary_type, message) = match &lock.kind {
+			LockKind::TheCompact => (
 				"CompactLock".to_string(),
 				self.build_compact_message(request, config, params).await?,
 			),
-			LockKind::Rhinestone { params } => (
+			LockKind::Rhinestone => (
 				"RhinestoneLock".to_string(),
 				self.build_rhinestone_message(request, config, params)
 					.await?,
@@ -182,7 +188,7 @@ impl QuoteGenerator {
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
-		escrow_kind: &EscrowKind,
+		lock_type: &LockType,
 	) -> Result<QuoteOrder, QuoteError> {
 		// Standard determined by business logic context
 		// Currently we only support EIP7683
@@ -209,11 +215,15 @@ impl QuoteGenerator {
 				))
 			})?;
 
-		match escrow_kind {
-			EscrowKind::Permit2 => {
+		match lock_type {
+			LockType::Permit2Escrow => {
 				self.generate_permit2_order(request, config, settlement, selected_oracle)
 			},
-			EscrowKind::Erc3009 => self.generate_erc3009_order(request, config),
+			LockType::Eip3009Escrow => self.generate_erc3009_order(request, config),
+			_ => Err(QuoteError::UnsupportedSettlement(format!(
+				"Unsupported escrow type: {:?}",
+				lock_type
+			))),
 		}
 	}
 
@@ -290,12 +300,11 @@ impl QuoteGenerator {
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid user address: {}", e)))?;
 
 		// Get TheCompact domain address (arbiter)
-		let domain_address = self.get_lock_domain_address(
-			config,
-			&super::custody::LockKind::TheCompact {
-				params: serde_json::json!({}),
-			},
-		)?;
+		let the_compact_lock = solver_types::Lock {
+			kind: solver_types::LockKind::TheCompact,
+			params: Some(serde_json::json!({})),
+		};
+		let domain_address = self.get_lock_domain_address(config, &the_compact_lock)?;
 		let _arbiter_address = domain_address
 			.ethereum_address()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid domain address: {}", e)))?;
@@ -806,7 +815,7 @@ impl QuoteGenerator {
 	fn get_lock_domain_address(
 		&self,
 		config: &Config,
-		lock_kind: &LockKind,
+		lock: &solver_types::Lock,
 	) -> Result<InteropAddress, QuoteError> {
 		match &config.settlement.domain {
 			Some(domain_config) => {
@@ -820,7 +829,7 @@ impl QuoteGenerator {
 			},
 			None => Err(QuoteError::InvalidRequest(format!(
 				"Domain configuration required for lock type: {:?}",
-				lock_kind
+				lock.kind
 			))),
 		}
 	}
@@ -879,7 +888,7 @@ impl QuoteGenerator {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::apis::quote::custody::{CustodyDecision, EscrowKind, LockKind};
+	use crate::apis::quote::custody::CustodyDecision;
 	use alloy_primitives::address;
 	use alloy_primitives::U256;
 	use solver_config::{
@@ -1099,12 +1108,13 @@ mod tests {
 		let config = create_test_config();
 		let request = create_test_request();
 
-		let lock_kind = LockKind::TheCompact {
-			params: serde_json::json!({"test": "value"}),
+		let lock = solver_types::Lock {
+			kind: solver_types::LockKind::TheCompact,
+			params: Some(serde_json::json!({"test": "value"})),
 		};
 
 		let result = generator
-			.generate_resource_lock_order(&request, &config, &lock_kind)
+			.generate_resource_lock_order(&request, &config, &lock)
 			.await;
 
 		match result {
@@ -1356,11 +1366,12 @@ mod tests {
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
-		let lock_kind = LockKind::TheCompact {
-			params: serde_json::json!({}),
+		let lock = solver_types::Lock {
+			kind: solver_types::LockKind::TheCompact,
+			params: Some(serde_json::json!({})),
 		};
 
-		let result = generator.get_lock_domain_address(&config, &lock_kind);
+		let result = generator.get_lock_domain_address(&config, &lock);
 		assert!(result.is_ok());
 
 		let domain = result.unwrap();
@@ -1376,11 +1387,12 @@ mod tests {
 		let mut config = create_test_config();
 		config.settlement.domain = None;
 
-		let lock_kind = LockKind::TheCompact {
-			params: serde_json::json!({}),
+		let lock = solver_types::Lock {
+			kind: solver_types::LockKind::TheCompact,
+			params: Some(serde_json::json!({})),
 		};
 
-		let result = generator.get_lock_domain_address(&config, &lock_kind);
+		let result = generator.get_lock_domain_address(&config, &lock);
 		assert!(matches!(result, Err(QuoteError::InvalidRequest(_))));
 	}
 
@@ -1432,8 +1444,9 @@ mod tests {
 		let request = create_test_request();
 
 		let custody_decision = CustodyDecision::ResourceLock {
-			kind: LockKind::TheCompact {
-				params: serde_json::json!({}),
+			lock: solver_types::Lock {
+				kind: solver_types::LockKind::TheCompact,
+				params: Some(serde_json::json!({})),
 			},
 		};
 
@@ -1467,7 +1480,7 @@ mod tests {
 		let request = create_test_request();
 
 		let custody_decision = CustodyDecision::Escrow {
-			kind: EscrowKind::Erc3009,
+			lock_type: solver_types::standards::eip7683::LockType::Eip3009Escrow,
 		};
 
 		let result = generator

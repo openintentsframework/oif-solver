@@ -400,10 +400,10 @@ generate_gas_config() {
 
 [gas]
 
-[gas.flows.compact_resource_lock]
-open = $(get_config ".gas_estimates.compact_resource_lock.open" "0")
-fill = $(get_config ".gas_estimates.compact_resource_lock.fill" "77298")
-claim = $(get_config ".gas_estimates.compact_resource_lock.claim" "122793")
+[gas.flows.resource_lock]
+open = $(get_config ".gas_estimates.resource_lock.open" "0")
+fill = $(get_config ".gas_estimates.resource_lock.fill" "77298")
+claim = $(get_config ".gas_estimates.resource_lock.claim" "122793")
 
 [gas.flows.permit2_escrow]
 open = $(get_config ".gas_estimates.permit2_escrow.open" "146306")
