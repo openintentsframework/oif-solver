@@ -110,8 +110,18 @@ src/
     ├── eip712.rs              # EIP-712 signing utilities
     ├── formatting.rs          # Formatting utilities
     ├── helpers.rs             # General helper functions
-    ├── tests/                 # Test builders and utilities
-    └── mod.rs
+    ├── mod.rs
+    └── tests/                 # Test builders and utilities
+        ├── mod.rs
+        └── builders/          # Test data builders
+            ├── asset_amount.rs    # Asset amount test builders
+            ├── eip7683_order_data.rs # EIP-7683 order data builders
+            ├── intent.rs          # Intent test builders
+            ├── mandate_output.rs  # Mandate output builders
+            ├── mod.rs
+            ├── networks.rs        # Network configuration builders
+            ├── order.rs           # Order test builders
+            └── transaction.rs     # Transaction test builders
 ```
 
 **Dependencies**: Minimal - only serialization, basic utilities, and blockchain types.
@@ -274,8 +284,15 @@ src/
 ├── lib.rs                      # Pricing service interface
 └── implementations/            # Pricing strategy implementations
     ├── mock.rs                # Mock pricing for testing
+    ├── coingecko.rs           # CoinGecko pricing for production
     └── mod.rs                 # Implementation module organization
 ```
+
+**Features:**
+
+- Multiple pricing implementations (mock, CoinGecko)
+- Configurable pricing parameters (commission, gas buffer, rate buffer)
+- Wei to currency conversion utilities
 
 ### Orchestration Layer
 
@@ -292,6 +309,7 @@ src/
 │   └── mod.rs
 ├── engine/                     # Core engine components
 │   ├── context.rs             # Execution context management
+│   ├── cost_profit.rs         # Cost and profit calculation logic
 │   ├── event_bus.rs           # Event routing and distribution
 │   ├── lifecycle.rs           # Component lifecycle management
 │   ├── token_manager.rs       # Token management utilities
@@ -320,6 +338,7 @@ src/
 - Component lifecycle coordination
 - Error handling and recovery
 - Graceful shutdown management
+- Cost and profit calculation logic
 
 ### Binary Layer
 
@@ -334,22 +353,29 @@ src/
 ├── main.rs                     # Application entry point
 ├── factory_registry.rs         # Component factory registry
 ├── server.rs                  # HTTP API server implementation
+├── signature_validator.rs      # Signature validation utilities
 ├── apis/                      # API endpoint implementations
 │   ├── mod.rs                 # API module organization
+│   ├── auth.rs                # Authentication API endpoints
 │   ├── order.rs               # Order API endpoints
 │   ├── tokens.rs              # Token information endpoints
-│   ├── register.rs            # API registration utilities
 │   └── quote/                 # Quote-related endpoints
-│       ├── cost/              # Cost calculation for quotes
 │       ├── custody.rs         # Asset custody management
 │       ├── generation.rs      # Quote generation logic
 │       ├── registry.rs        # Quote registry management
 │       ├── signing/           # Quote signing utilities
+│       │   ├── mod.rs
+│       │   └── payloads/      # Signing payload implementations
+│       │       └── permit2.rs # Permit2 payload handling
 │       ├── validation.rs      # Quote validation
 │       └── mod.rs
-└── auth/                      # Authentication and authorization
-    ├── middleware.rs          # Auth middleware implementation
-    └── mod.rs
+├── auth/                      # Authentication and authorization
+│   ├── middleware.rs          # Auth middleware implementation
+│   └── mod.rs
+└── eip712/                    # EIP-712 signing utilities
+    ├── mod.rs
+    └── compact/               # Compact order EIP-712 implementation
+        └── mod.rs
 ```
 
 **Features:**
@@ -397,24 +423,32 @@ Utility scripts for demo and end-to-end testing:
 
 ```
 scripts/
-├── demo/                      # Demo-related scripts and libraries
-│   └── lib/                   # Demo utility libraries
-│       ├── api.sh             # API interaction utilities
-│       ├── blockchain.sh      # Blockchain interaction utilities
-│       ├── common.sh          # Common utility functions
-│       ├── config.sh          # Configuration utilities
-│       ├── deployment.sh      # Contract deployment utilities
-│       ├── forge.sh           # Foundry/Forge utilities
-│       ├── intents.sh         # Intent handling utilities
-│       ├── jwt.sh             # JWT authentication utilities
-│       ├── quotes.sh          # Quote handling utilities
-│       ├── signature.sh       # Signature utilities
-│       └── ui.sh              # User interface utilities
-└── e2e/                       # End-to-end testing scripts
+├── demo/
+│   └── lib/
+│       ├── api.sh
+│       ├── blockchain.sh
+│       ├── common.sh
+│       ├── config.sh
+│       ├── deployment.sh
+│       ├── forge.sh
+│       ├── intents.sh
+│       ├── jwt.sh
+│       ├── quotes.sh
+│       ├── signature.sh
+│       └── ui.sh
+└── e2e/
     ├── batch_intents.sh       # Batch intent testing
-    ├── estimate_gas_compact.sh # Gas estimation for compact orders
-    ├── estimate_gas_permit2_escrow.sh # Gas estimation for permit2 escrow
-    └── setup_testnet.sh       # Testnet environment setup
+    ├── estimate_gas.sh        # Single gas estimation script
+    ├── lib/                   # E2E utility libraries
+    │   ├── accounts.sh        # Account management utilities
+    │   ├── config_loader.sh   # Configuration loading utilities
+    │   ├── deployers.sh       # Deployment utilities
+    │   └── validators.sh      # Validation utilities
+    ├── setup_testnet.sh
+    ├── test_intents_op-base.json
+    ├── test_intents.json
+    ├── testnet_chains.json
+    └── testnet-config.json    # Testnet environment setup
 ```
 
 ## Build and Development

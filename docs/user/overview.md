@@ -47,7 +47,39 @@ Once an intent is discovered, the solver:
 - Checks for sufficient liquidity and feasibility
 - Converts valid intents into executable orders
 
-### 3. Execution Strategy
+### 3. Profitability Analysis
+
+Before accepting any intent, the solver performs a comprehensive profitability analysis to ensure execution will be financially viable:
+
+#### Cost Calculation
+
+The solver calculates all operational costs involved in executing the cross-chain intent:
+
+- **Gas Costs**: Estimates gas fees for all required transactions:
+  - **Open transaction**: On the origin chain to initiate the intent
+  - **Fill transaction**: On the destination chain to fulfill the user's request
+  - **Claim transaction**: On the origin chain to complete settlement
+- **Gas Buffer**: Adds a configurable buffer (in basis points) to account for gas price volatility
+- **Base Price**: Covers any negative spread when output value exceeds input value
+- **Commission**: Optional percentage fee on the total transaction value
+
+#### Profit Margin Calculation
+
+The solver calculates profit margin using this formula:
+
+All token amounts are converted to USD using real-time pricing data to ensure accurate cross-token comparisons.
+
+#### Profitability Validation
+
+Each intent must meet the configured minimum profitability threshold (`min_profitability_pct`) before execution:
+
+- **Threshold Check**: The calculated profit margin must exceed the minimum required percentage
+- **Automatic Rejection**: Intents failing profitability validation are automatically skipped
+- **Configurable Minimum**: Operators can set their desired minimum profit margin (e.g., 1.0% in demo configurations)
+
+This ensures the solver only executes intents that provide adequate compensation for the operational costs and risks involved.
+
+### 4. Execution Strategy
 
 The solver evaluates when and how to execute orders based on:
 
@@ -55,7 +87,7 @@ The solver evaluates when and how to execute orders based on:
 - **Execution strategies**: Configurable logic for optimal execution timing
 - **Risk assessment**: Safety checks and validation before execution
 
-### 4. Transaction Execution
+### 5. Transaction Execution
 
 When ready to execute:
 
@@ -64,7 +96,7 @@ When ready to execute:
 - Monitors transaction confirmation and status
 - Handles retries and error recovery
 
-### 5. Settlement Processing
+### 6. Settlement Processing
 
 After successful execution:
 

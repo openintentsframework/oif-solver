@@ -252,18 +252,16 @@ curl -X POST http://localhost:3000/api/quotes \
 
 #### Register Client
 
-**POST** `/api/register`
+**POST** `/api/auth/register`
 
-Register a new client and receive a JWT token for API authentication. This endpoint allows self-service registration for API access.
+Register a new client and receive both access and refresh tokens for API authentication. This endpoint allows self-service registration for API access with dual-token authentication.
 
 **Request Body:**
 
 ```json
 {
   "client_id": "my-app-v1.0",
-  "client_name": "My Trading Application",
-  "scopes": ["read-orders", "create-orders"],
-  "expiry_hours": 24
+  "client_name": "My Trading Application"
 }
 ```
 
@@ -272,7 +270,6 @@ Register a new client and receive a JWT token for API authentication. This endpo
 - `client_id` (string, required): Unique identifier for your client (3-100 characters)
 - `client_name` (string, optional): Display name for your application
 - `scopes` (array, optional): Requested permissions (defaults to ["read-orders"])
-- `expiry_hours` (number, optional): Token expiry in hours (defaults to 24)
 
 **Available Scopes:**
 
@@ -284,9 +281,11 @@ Register a new client and receive a JWT token for API authentication. This endpo
 
 ```json
 {
-  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   "client_id": "my-app-v1.0",
-  "expires_at": 1234567890,
+  "access_token_expires_at": 1234567890,
+  "refresh_token_expires_at": 1234567890,
   "scopes": ["read-orders", "create-orders"],
   "token_type": "Bearer"
 }
@@ -294,28 +293,29 @@ Register a new client and receive a JWT token for API authentication. This endpo
 
 **Response Fields:**
 
-- `token`: JWT authentication token
+- `access_token`: JWT access token for API requests (short-lived, typically 1 hour)
+- `refresh_token`: JWT refresh token for obtaining new access tokens (long-lived, typically 30 days)
 - `client_id`: Your client identifier
-- `expires_at`: Unix timestamp when token expires
+- `access_token_expires_at`: Unix timestamp when access token expires
+- `refresh_token_expires_at`: Unix timestamp when refresh token expires
 - `scopes`: Granted permissions
 - `token_type`: Always "Bearer"
 
 **Example:**
 
 ```bash
-curl -X POST http://localhost:3000/api/register \
+curl -X POST http://localhost:3000/api/auth/register \
   -H "Content-Type: application/json" \
   -d '{
     "client_id": "my-trading-bot",
     "client_name": "Advanced Trading Bot",
-    "scopes": ["read-orders", "create-orders"],
-    "expiry_hours": 168
+    "scopes": ["read-orders", "create-orders"]
   }'
 ```
 
-**Using the Token:**
+**Using the Access Token:**
 
-Include the JWT token in subsequent API requests:
+Include the access token in subsequent API requests:
 
 ```bash
 curl -X POST http://localhost:3000/api/orders \
@@ -323,6 +323,72 @@ curl -X POST http://localhost:3000/api/orders \
   -H "Content-Type: application/json" \
   -d '{"order_data": "..."}'
 ```
+
+#### Refresh Token
+
+**POST** `/api/auth/refresh`
+
+Exchange a valid refresh token for new access and refresh tokens. This endpoint allows you to obtain fresh tokens without re-authentication. The old refresh token is invalidated and cannot be reused.
+
+**Request Body:**
+
+```json
+{
+  "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+}
+```
+
+**Parameters:**
+
+- `refresh_token` (string, required): The refresh token obtained from registration or previous refresh
+
+**Response:**
+
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "client_id": "my-app-v1.0",
+  "access_token_expires_at": 1234567890,
+  "refresh_token_expires_at": 1234567890,
+  "scopes": ["read-orders", "create-orders"],
+  "token_type": "Bearer"
+}
+```
+
+**Response Fields:**
+
+- `access_token`: New JWT access token for API requests
+- `refresh_token`: New JWT refresh token (the old one is invalidated)
+- `client_id`: Your client identifier
+- `access_token_expires_at`: Unix timestamp when new access token expires
+- `refresh_token_expires_at`: Unix timestamp when new refresh token expires
+- `scopes`: Your granted permissions (same as original registration)
+- `token_type`: Always "Bearer"
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:3000/api/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d '{
+    "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+  }'
+```
+
+**Token Lifecycle:**
+
+1. **Register**: Get initial access + refresh tokens via `/api/auth/register`
+2. **Use Access Token**: Make API calls with the access token in Authorization header
+3. **Refresh**: Before access token expires, use `/api/auth/refresh` to get new tokens
+4. **Repeat**: Continue using the refresh cycle to maintain authentication
+
+**Security Notes:**
+
+- Access tokens are short-lived (typically 1 hour) for security
+- Refresh tokens are long-lived (typically 30 days) but are invalidated after use
+- Store refresh tokens securely and never expose them in client-side code
+- Token expiry times are configured server-side and cannot be modified via API
 
 ### Orders
 

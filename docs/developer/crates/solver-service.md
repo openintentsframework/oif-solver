@@ -27,7 +27,7 @@ graph TB
             QuoteValidation[apis/quote/validation.rs<br/>Quote Validation]
             QuoteCustody[apis/quote/custody.rs<br/>Asset Custody]
             QuoteSigning[apis/quote/signing/<br/>Quote Signing Utilities]
-            QuoteCost[apis/quote/cost/<br/>Cost Calculation]
+            QuoteCostIntegration[Quote Cost Integration<br/>Uses solver-core::CostProfitService]
         end
 
         subgraph "Authentication"
@@ -48,7 +48,7 @@ graph TB
     QuoteGen --> QuoteValidation
     QuoteGen --> QuoteCustody
     QuoteGen --> QuoteSigning
-    QuoteGen --> QuoteCost
+    QuoteGen --> QuoteCostIntegration
 ```
 
 ## Application Lifecycle

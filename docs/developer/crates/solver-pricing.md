@@ -58,37 +58,47 @@ sequenceDiagram
     Strategy->>Order: Execution Decision
 ```
 
-## Configuration Examples (TBD)
+## Configuration Example
 
-### Pricing Service Configuration (TBD)
+### Pricing Service Configuration
 
 ```toml
 [pricing]
-default_price_source = "coingecko"
-price_cache_ttl_seconds = 60
-gas_price_cache_ttl_seconds = 30
-min_profit_threshold_usd = 5.0
-max_slippage_bps = 100  # 1%
+primary = "coingecko"
 
-[pricing.sources.coingecko]
-api_key = "${COINGECKO_API_KEY}"
-base_url = "https://api.coingecko.com/api/v3"
-rate_limit_per_minute = 50
+[pricing.implementations.mock]
+# Uses default ETH/USD price of 4615.16
+# Optional: override specific pair prices
+# [pricing.implementations.mock.pair_prices]
+# "ETH/USD" = "4615.16"
+# "SOL/USD" = "240.50"
 
-[pricing.sources.chainlink]
-enabled = true
-fallback_priority = 2
+[pricing.implementations.coingecko]
+# Optional API key for higher rate limits
+# api_key = "CG-YOUR-API-KEY-HERE"
+cache_duration_seconds = 60
+rate_limit_delay_ms = 1200  # Free tier: 1200ms, Pro tier: 100ms
 
-[pricing.gas_oracles]
-[pricing.gas_oracles.ethereum]
-source = "ethgasstation"
-api_key = "${ETH_GAS_API_KEY}"
-fallback_multiplier = 1.2
+# Custom prices for demo/test tokens (in USD)
+[pricing.implementations.coingecko.custom_prices]
+TOKA = "200.00"
+TOKB = "195.00"
 
-[pricing.gas_oracles.polygon]
-source = "polygonscan"
-api_key = "${POLYGON_API_KEY}"
-fallback_multiplier = 1.1
+# Optional: custom token ID mappings for CoinGecko
+# [pricing.implementations.coingecko.token_id_map]
+# "CUSTOM" = "custom-token-id"
+
+# Gas configuration (separate from pricing service)
+[gas]
+[gas.flows.compact_resource_lock]
+open = 0
+fill = 76068
+claim = 121995
+
+[gas.flows.permit2_escrow]
+open = 143116
+fill = 76068
+claim = 59953
 ```
 
 The solver-pricing crate provides comprehensive pricing and cost analysis capabilities while maintaining flexibility for different market data sources and pricing strategies across multiple blockchain networks.

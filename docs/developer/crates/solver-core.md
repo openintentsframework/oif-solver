@@ -15,6 +15,7 @@ graph TB
             EventBus[engine/event_bus.rs<br/>Event Distribution]
             Lifecycle[engine/lifecycle.rs<br/>Component Management]
             TokenManager[engine/token_manager.rs<br/>Token Utilities]
+            CostProfit[engine/cost_profit.rs<br/>Cost Estimation & Profitability]
         end
 
         subgraph "Event Handlers"
@@ -51,10 +52,15 @@ graph TB
 
     IntentHandler --> OrderState
     OrderHandler --> OrderState
+    IntentHandler --> CostProfit
+    OrderHandler --> CostProfit
 
     Engine --> Context
     Engine --> Lifecycle
     Engine --> TokenManager
+    Engine --> CostProfit
+
+    CostProfit --> TokenManager
 
     SettlementMonitor --> EventBus
     TransactionMonitor --> EventBus
@@ -80,6 +86,42 @@ sequenceDiagram
     Handler->>EventBus: Emit Follow-up Events
     EventBus->>Engine: Event Processed
 ```
+
+## Cost & Profitability Logic
+
+The `CostProfitService` is a critical component that ensures orders are economically viable before execution. It provides comprehensive cost estimation and profitability validation across multiple blockchain networks.
+
+### Cost Estimation Process
+
+The service calculates execution costs through several components:
+
+**1. Gas Cost Estimation**
+
+- **Open Transaction**: Cost to initiate the order on the origin chain
+- **Fill Transaction**: Cost to fulfill the order on the destination chain
+- **Claim Transaction**: Cost to claim rewards/settle on the origin chain
+- Uses configurable gas units per transaction type with fallback estimates
+- Converts gas costs to USD using current gas prices and ETH/USD rates
+
+**2. Operational Cost Calculation**
+
+- Commission fees (configurable basis points)
+- Gas buffer (safety margin for gas price volatility)
+- Rate buffer (protection against price fluctuations)
+- All costs normalized to USD for consistent comparison
+
+### Profitability Validation
+
+The profit margin calculation follows this formula:
+
+**Validation Process:**
+
+1. Parse order data to extract input/output amounts and token addresses
+2. Use `TokenManager` to get token metadata (symbol, decimals)
+3. Convert all token amounts to USD using `PricingService`
+4. Calculate total execution costs from `CostEstimate`
+5. Compute profit margin percentage
+6. Validate against configurable solver's minimum profitability threshold
 
 ## Extension Points
 
