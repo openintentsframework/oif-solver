@@ -19,7 +19,7 @@
 # Common utilities module - shared functions used across all modules
 
 # Global constants
-OIF_CONTRACTS_COMMIT="82f11e5"  # release-v0.1-rc.0: updates for release candidate
+OIF_CONTRACTS_COMMIT="eafdaa8"  # release-v0.1-rc.0: updates for release candidate
 
 # Address manipulation functions
 address_to_bytes32() {

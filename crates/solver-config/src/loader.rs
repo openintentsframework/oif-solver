@@ -27,8 +27,47 @@ impl ConfigLoader {
 		}
 	}
 
-	/// Loads a configuration file and all its includes.
+	/// Loads environment variables from .env files in the current working directory.
+	///
+	/// This method attempts to load .env files in the following order:
+	/// 1. .env.local (highest priority)
+	/// 2. .env
+	///
+	/// Later files override earlier ones.
+	fn load_env_files_from_cwd(&self) -> Result<(), ConfigError> {
+		let env_files = [".env", ".env.local"];
+
+		for env_file in &env_files {
+			let env_path = PathBuf::from(env_file);
+			if env_path.exists() {
+				dotenvy::from_path(&env_path).map_err(|e| {
+					ConfigError::Validation(format!(
+						"Failed to load environment file {}: {}",
+						env_path.display(),
+						e
+					))
+				})?;
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Loads a configuration file and all its includes, loading .env files first.
 	pub async fn load_config(
+		&mut self,
+		config_path: impl AsRef<Path>,
+	) -> Result<Config, ConfigError> {
+		// Load environment variables first
+		self.load_env_files_from_cwd()?;
+
+		// Then load the config
+		self.load_config_without_env(config_path).await
+	}
+
+	/// Loads a configuration file and all its includes without loading .env files.
+	/// Assumes environment variables have already been loaded.
+	async fn load_config_without_env(
 		&mut self,
 		config_path: impl AsRef<Path>,
 	) -> Result<Config, ConfigError> {
@@ -201,6 +240,7 @@ mod tests {
 [solver]
 id = "test-solver"
 monitoring_timeout_minutes = 5
+min_profitability_pct = 1.0
 
 [networks.1]
 input_settler_address = "0x1234567890123456789012345678901234567890"
@@ -268,6 +308,7 @@ include = ["networks.toml", "storage.toml"]
 [solver]
 id = "test-solver"
 monitoring_timeout_minutes = 5
+min_profitability_pct = 1.0
 "#;
 
 		// Networks config

@@ -13,13 +13,13 @@ use solver_types::{
 	oracle::OracleRoutes,
 	standards::eip7683::{
 		interfaces::{
-			IInputSettlerCompact, IInputSettlerEscrow, IOutputSettlerSimple,
-			SolMandateOutput as MandateOutput, SolveParams, StandardOrder as OifStandardOrder,
+			IInputSettlerCompact, IInputSettlerEscrow, IOutputSettlerSimple, SolMandateOutput,
+			SolveParams, StandardOrder,
 		},
 		LockType,
 	},
-	Address, ConfigSchema, Eip7683OrderData, ExecutionParams, FillProof, Intent, NetworksConfig,
-	Order, OrderStatus, Schema, Transaction,
+	Address, ConfigSchema, Eip7683OrderData, ExecutionParams, FillProof, NetworksConfig, Order,
+	OrderStatus, Schema, Transaction,
 };
 
 /// EIP-7683 order implementation.
@@ -58,7 +58,7 @@ impl Eip7683OrderImpl {
 		match lock_type {
 			LockType::ResourceLock => {
 				// Decode to StandardOrder for Compact
-				let std_order = OifStandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+				let std_order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
 					OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
 				})?;
 
@@ -67,7 +67,7 @@ impl Eip7683OrderImpl {
 			},
 			LockType::Permit2Escrow | LockType::Eip3009Escrow => {
 				// Decode to StandardOrder for Escrow contracts
-				let std_order = OifStandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+				let std_order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
 					OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
 				})?;
 
@@ -126,12 +126,12 @@ impl Eip7683OrderImpl {
 	}
 
 	/// Decode raw order bytes into StandardOrder struct.
-	fn decode_standard_order(order_bytes: &str) -> Result<OifStandardOrder, OrderError> {
+	fn decode_standard_order(order_bytes: &str) -> Result<StandardOrder, OrderError> {
 		let bytes = hex::decode(order_bytes.trim_start_matches("0x"))
 			.map_err(|e| OrderError::ValidationFailed(format!("Invalid hex: {}", e)))?;
 
 		// Decode using alloy's ABI decoder
-		OifStandardOrder::abi_decode(&bytes, true).map_err(|e| {
+		StandardOrder::abi_decode(&bytes, true).map_err(|e| {
 			OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
 		})
 	}
@@ -182,180 +182,6 @@ impl OrderInterface for Eip7683OrderImpl {
 		Box::new(Eip7683OrderSchema)
 	}
 
-	/// Validates an EIP-7683 intent and converts it to an order.
-	///
-	/// Performs validation checks to ensure the intent is a valid EIP-7683 order
-	/// that hasn't expired. Extracts and validates the order data structure.
-	///
-	/// # Arguments
-	///
-	/// * `intent` - The intent to validate
-	/// * `solver_address` - The solver's address for reward attribution
-	///
-	/// # Returns
-	///
-	/// Returns a validated `Order` ready for processing with the solver address included.
-	///
-	/// # Errors
-	///
-	/// Returns `OrderError::ValidationFailed` if:
-	/// - The intent is not an EIP-7683 order
-	/// - The order data cannot be parsed
-	/// - The order has expired
-	async fn validate_intent(
-		&self,
-		intent: &Intent,
-		solver_address: &Address,
-	) -> Result<Order, OrderError> {
-		if intent.standard != "eip7683" {
-			return Err(OrderError::ValidationFailed(
-				"Not an EIP-7683 order".to_string(),
-			));
-		}
-
-		// Parse order data
-		let order_data: Eip7683OrderData =
-			serde_json::from_value(intent.data.clone()).map_err(|e| {
-				OrderError::ValidationFailed(format!("Failed to parse order data: {}", e))
-			})?;
-
-		// Validate deadlines
-		let now = std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.map(|d| d.as_secs() as u32)
-			.unwrap_or(0);
-
-		if now > order_data.expires {
-			return Err(OrderError::ValidationFailed("Order expired".to_string()));
-		}
-
-		// Validate oracle routes
-		let origin_chain = order_data.origin_chain_id.to::<u64>();
-		let input_oracle = solver_types::utils::parse_address(&order_data.input_oracle)
-			.map_err(|e| OrderError::ValidationFailed(format!("Invalid input oracle: {}", e)))?;
-
-		let input_info = solver_types::oracle::OracleInfo {
-			chain_id: origin_chain,
-			oracle: input_oracle,
-		};
-
-		// Check if the input oracle is supported
-		if !self
-			.oracle_routes
-			.supported_routes
-			.contains_key(&input_info)
-		{
-			return Err(OrderError::ValidationFailed(format!(
-				"Input oracle {} on chain {} is not supported",
-				order_data.input_oracle, origin_chain
-			)));
-		}
-
-		// Get supported output oracles for this input oracle
-		let supported_outputs = self
-			.oracle_routes
-			.supported_routes
-			.get(&input_info)
-			.ok_or_else(|| {
-				OrderError::ValidationFailed(format!(
-					"No routes configured for input oracle {} on chain {}",
-					order_data.input_oracle, origin_chain
-				))
-			})?;
-
-		// Early validation: Check if the specific routes exist
-		let supported_destinations: std::collections::HashSet<u64> =
-			supported_outputs.iter().map(|info| info.chain_id).collect();
-
-		for output in &order_data.outputs {
-			let dest_chain = output.chain_id.to::<u64>();
-
-			// Skip same-chain outputs as they don't need cross-chain routes
-			if dest_chain == origin_chain {
-				continue;
-			}
-
-			if !supported_destinations.contains(&dest_chain) {
-				return Err(OrderError::ValidationFailed(format!(
-					"Route from chain {} to chain {} is not supported (oracle {} has no route to destination)",
-					origin_chain, dest_chain, order_data.input_oracle
-				)));
-			}
-		}
-
-		// Validate each output oracle
-		for output in &order_data.outputs {
-			let dest_chain = output.chain_id.to::<u64>();
-
-			// If output oracle is zero (0x00...), it means use any compatible oracle
-			// Otherwise, validate the specific oracle
-			if output.oracle != [0u8; 32] {
-				// Parse the oracle address from bytes32 (take first 20 bytes)
-				let output_oracle_bytes = &output.oracle[12..32]; // Last 20 bytes for address
-				let output_oracle = Address(output_oracle_bytes.into());
-
-				let output_info = solver_types::oracle::OracleInfo {
-					chain_id: dest_chain,
-					oracle: output_oracle,
-				};
-
-				// Check if this output oracle is in the supported list
-				if !supported_outputs.contains(&output_info) {
-					return Err(OrderError::ValidationFailed(format!(
-						"Output oracle {:?} on chain {} is not compatible with input oracle {} on chain {}",
-						output.oracle, dest_chain, order_data.input_oracle, origin_chain
-					)));
-				}
-			} else {
-				// Zero oracle means any oracle on the destination chain is acceptable
-				// Just verify that there's at least one oracle for this destination
-				let has_route_to_dest = supported_outputs
-					.iter()
-					.any(|info| info.chain_id == dest_chain);
-
-				if !has_route_to_dest {
-					return Err(OrderError::ValidationFailed(format!(
-						"No route available from chain {} to chain {}",
-						origin_chain, dest_chain
-					)));
-				}
-			}
-		}
-
-		// Extract chain IDs
-		let input_chain_ids = vec![origin_chain];
-		let output_chain_ids = order_data
-			.outputs
-			.iter()
-			.map(|output| output.chain_id.to::<u64>())
-			.collect::<Vec<_>>();
-
-		// Create order
-		Ok(Order {
-			id: intent.id.clone(),
-			standard: intent.standard.clone(),
-			created_at: intent.metadata.discovered_at,
-			data: serde_json::to_value(&order_data)
-				.map_err(|e| OrderError::ValidationFailed(format!("Failed to serialize: {}", e)))?,
-			solver_address: solver_address.clone(),
-			quote_id: intent.quote_id.clone(),
-			input_chain_ids,
-			output_chain_ids,
-			updated_at: std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.map(|d| d.as_secs())
-				.unwrap_or(0),
-			status: OrderStatus::Created,
-			execution_params: None,
-			prepare_tx_hash: None,
-			fill_tx_hash: None,
-			post_fill_tx_hash: None,
-			pre_claim_tx_hash: None,
-			claim_tx_hash: None,
-			fill_proof: None,
-		})
-	}
-
 	/// Generates a transaction to prepare an order for filling (if needed).
 	///
 	/// For off-chain orders, this calls `openFor()` to create the order on-chain.
@@ -363,7 +189,7 @@ impl OrderInterface for Eip7683OrderImpl {
 	///
 	/// # Arguments
 	///
-	/// * `intent` - The original intent (used to check if off-chain)
+	/// * `source` - The original intent source (used to check if off-chain)
 	/// * `order` - The validated order
 	/// * `_params` - Execution parameters (currently unused)
 	///
@@ -380,12 +206,12 @@ impl OrderInterface for Eip7683OrderImpl {
 	/// - Hex decoding fails
 	async fn generate_prepare_transaction(
 		&self,
-		intent: &Intent,
+		source: &str,
 		order: &Order,
 		_params: &ExecutionParams,
 	) -> Result<Option<Transaction>, OrderError> {
 		// Only off-chain orders need preparation
-		if intent.source != "off-chain" {
+		if source != "off-chain" {
 			return Ok(None);
 		}
 
@@ -421,37 +247,26 @@ impl OrderInterface for Eip7683OrderImpl {
 		let order_struct = Self::decode_standard_order(raw_order_data)?;
 
 		// Use the InputSettlerEscrow openFor call with StandardOrder struct
+		let signature_bytes = hex::decode(signature.trim_start_matches("0x"))
+			.map_err(|e| OrderError::ValidationFailed(format!("Invalid signature: {}", e)))?;
+
 		let open_for_data = IInputSettlerEscrow::openForCall {
 			order: order_struct,
 			sponsor: sponsor_address,
-			signature: hex::decode(signature.trim_start_matches("0x"))
-				.map_err(|e| OrderError::ValidationFailed(format!("Invalid signature: {}", e)))?
-				.into(),
+			signature: signature_bytes.into(),
 		}
 		.abi_encode();
 
-		// Get the input settler address for the order's origin chain
-		let origin_chain_id = *order
-			.input_chain_ids
+		let input_chain = order
+			.input_chains
 			.first()
 			.ok_or_else(|| OrderError::ValidationFailed("No input chains in order".into()))?;
-		let input_settler_address = self
-			.networks
-			.get(&origin_chain_id)
-			.ok_or_else(|| {
-				OrderError::ValidationFailed(format!(
-					"Chain ID {} not found in networks configuration",
-					order_data.origin_chain_id
-				))
-			})?
-			.input_settler_address
-			.clone();
 
 		Ok(Some(Transaction {
-			to: Some(input_settler_address),
+			to: Some(input_chain.settler_address.clone()),
 			data: open_for_data,
 			value: U256::ZERO,
-			chain_id: origin_chain_id,
+			chain_id: input_chain.chain_id,
 			nonce: None,
 			gas_limit: order_data.gas_limit_overrides.prepare_gas_limit,
 			gas_price: None,
@@ -502,22 +317,22 @@ impl OrderInterface for Eip7683OrderImpl {
 				OrderError::ValidationFailed("No cross-chain output found".to_string())
 			})?;
 
-		// Get the output settler address for the destination chain
+		// Get the output settler address from the order
 		let dest_chain_id = output.chain_id.to::<u64>();
-		let output_settler_address = self
-			.networks
-			.get(&dest_chain_id)
+		let output_chain = order
+			.output_chains
+			.iter()
+			.find(|c| c.chain_id == dest_chain_id)
 			.ok_or_else(|| {
 				OrderError::ValidationFailed(format!(
-					"Chain ID {} not found in networks configuration",
+					"Chain ID {} not found in order output chains",
 					dest_chain_id
 				))
-			})?
-			.output_settler_address
-			.clone();
+			})?;
+		let output_settler_address = output_chain.settler_address.clone();
 
-		// Create the MandateOutput struct for the fill call
-		let output_struct = MandateOutput {
+		// Create the SolMandateOutput struct for the fill call
+		let output_struct = SolMandateOutput {
 			oracle: FixedBytes::<32>::from(output.oracle),
 			settler: {
 				let mut bytes32 = [0u8; 32];
@@ -619,30 +434,41 @@ impl OrderInterface for Eip7683OrderImpl {
 		// Create inputs array from order data
 		let inputs: Vec<[U256; 2]> = order_data.inputs.clone();
 
-		// Create outputs array (MandateOutput structs)
-		let outputs: Vec<MandateOutput> = order_data
+		// Create outputs array (SolMandateOutput structs)
+		let outputs: Vec<SolMandateOutput> = order_data
 			.outputs
 			.iter()
-			.map(|output| -> Result<MandateOutput, OrderError> {
+			.map(|output| -> Result<SolMandateOutput, OrderError> {
 				// Use the oracle value from the original order
 				let oracle_bytes32 = FixedBytes::<32>::from(output.oracle);
 
 				let settler_bytes32 = {
 					let mut bytes32 = [0u8; 32];
 					let output_chain_id = output.chain_id.to::<u64>();
-					let network = self.networks.get(&output_chain_id).ok_or_else(|| {
-						OrderError::ValidationFailed(format!(
-							"Chain ID {} not found in networks configuration",
-							output.chain_id
-						))
-					})?;
 
+					// Get settler address from the order
 					let settler_address = if output.chain_id == order_data.origin_chain_id {
 						// Use input settler for origin chain
-						&network.input_settler_address
+						order
+							.input_chains
+							.first()
+							.map(|c| &c.settler_address)
+							.ok_or_else(|| {
+								OrderError::ValidationFailed("No input chains in order".to_string())
+							})?
 					} else {
-						// Use output settler for other chains
-						&network.output_settler_address
+						// Use output settler for the specific output chain
+						order
+							.output_chains
+							.iter()
+							.find(|c| c.chain_id == output_chain_id)
+							.map(|c| &c.settler_address)
+							.ok_or_else(|| {
+								OrderError::ValidationFailed(format!(
+									"Chain ID {} not found in order output chains",
+									output_chain_id
+								))
+							})?
 					};
 
 					bytes32[12..32].copy_from_slice(&settler_address.0);
@@ -653,7 +479,7 @@ impl OrderInterface for Eip7683OrderImpl {
 
 				let recipient_bytes32 = FixedBytes::<32>::from(output.recipient);
 
-				Ok(MandateOutput {
+				Ok(SolMandateOutput {
 					oracle: oracle_bytes32,
 					settler: settler_bytes32,
 					chainId: output.chain_id,
@@ -667,7 +493,7 @@ impl OrderInterface for Eip7683OrderImpl {
 			.collect::<Result<Vec<_>, _>>()?;
 
 		// Build the order struct
-		let order_struct = OifStandardOrder {
+		let order_struct = StandardOrder {
 			user: user_address,
 			nonce: order_data.nonce,
 			originChainId: order_data.origin_chain_id,
@@ -734,37 +560,17 @@ impl OrderInterface for Eip7683OrderImpl {
 			}
 		};
 
-		// Get the input settler address for the order's origin chain
-		let origin_chain_id = *order
-			.input_chain_ids
+		// Get the input chain info directly from the order
+		let input_chain = order
+			.input_chains
 			.first()
 			.ok_or_else(|| OrderError::ValidationFailed("No input chains in order".into()))?;
-		let network_cfg = self.networks.get(&origin_chain_id).ok_or_else(|| {
-			OrderError::ValidationFailed(format!(
-				"Chain ID {} not found in networks configuration",
-				order_data.origin_chain_id
-			))
-		})?;
-		let is_compact = serde_json::from_value::<Eip7683OrderData>(order.data.clone())
-			.ok()
-			.and_then(|d| d.lock_type)
-			.map(|lt| lt == LockType::ResourceLock)
-			.unwrap_or(false);
-		let input_settler_address = if is_compact {
-			// Prefer compact-specific address if provided
-			network_cfg
-				.input_settler_compact_address
-				.clone()
-				.unwrap_or_else(|| network_cfg.input_settler_address.clone())
-		} else {
-			network_cfg.input_settler_address.clone()
-		};
 
 		Ok(Transaction {
-			to: Some(input_settler_address),
+			to: Some(input_chain.settler_address.clone()),
 			data: call_data,
 			value: U256::ZERO,
-			chain_id: origin_chain_id,
+			chain_id: input_chain.chain_id,
 			nonce: None,
 			gas_limit: order_data.gas_limit_overrides.settle_gas_limit,
 			gas_price: None,
@@ -774,9 +580,9 @@ impl OrderInterface for Eip7683OrderImpl {
 	}
 
 	/// Validates EIP-7683 order bytes by decoding to StandardOrder and validating.
-	async fn validate_order(&self, order_bytes: &Bytes) -> Result<OifStandardOrder, OrderError> {
+	async fn validate_order(&self, order_bytes: &Bytes) -> Result<StandardOrder, OrderError> {
 		// Decode using the StandardOrder from types module
-		let standard_order = OifStandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+		let standard_order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
 			OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
 		})?;
 
@@ -794,7 +600,68 @@ impl OrderInterface for Eip7683OrderImpl {
 			));
 		}
 
-		// TODO: validate oracle routes and signatures
+		// Validate oracle routes
+		let origin_chain = standard_order.originChainId.to::<u64>();
+		let input_oracle = standard_order.inputOracle;
+		let input_oracle_address = Address(input_oracle.as_slice().to_vec());
+
+		let input_info = solver_types::oracle::OracleInfo {
+			chain_id: origin_chain,
+			oracle: input_oracle_address,
+		};
+
+		// Get supported output oracles for this input oracle
+		let supported_outputs = self
+			.oracle_routes
+			.supported_routes
+			.get(&input_info)
+			.ok_or_else(|| {
+				OrderError::ValidationFailed(format!(
+					"Input oracle {:?} on chain {} is not supported",
+					input_oracle, origin_chain
+				))
+			})?;
+
+		// Build a set of supported destinations for efficient lookups
+		let supported_destinations: std::collections::HashSet<u64> =
+			supported_outputs.iter().map(|info| info.chain_id).collect();
+
+		// Single pass validation for all outputs
+		for output in &standard_order.outputs {
+			let dest_chain = output.chainId.to::<u64>();
+
+			// Skip same-chain outputs as they don't need cross-chain routes
+			if dest_chain == origin_chain {
+				continue;
+			}
+
+			// First check if destination chain is supported at all
+			if !supported_destinations.contains(&dest_chain) {
+				return Err(OrderError::ValidationFailed(format!(
+					"Route from chain {} to chain {} is not supported (oracle {:?} has no route to destination)",
+					origin_chain, dest_chain, input_oracle
+				)));
+			}
+
+			// If a specific output oracle is specified, validate it
+			if output.oracle != [0u8; 32] {
+				// Parse the oracle address from bytes32 (last 20 bytes)
+				let output_oracle = Address(output.oracle[12..32].to_vec());
+
+				let output_info = solver_types::oracle::OracleInfo {
+					chain_id: dest_chain,
+					oracle: output_oracle,
+				};
+
+				// Check if this specific output oracle is in the supported list
+				if !supported_outputs.contains(&output_info) {
+					return Err(OrderError::ValidationFailed(format!(
+						"Output oracle {:?} on chain {} is not compatible with input oracle {:?} on chain {}",
+						output.oracle, dest_chain, input_oracle, origin_chain
+					)));
+				}
+			}
+		}
 
 		// Return the decoded StandardOrder directly since it's already the right type
 		Ok(standard_order)
@@ -806,6 +673,7 @@ impl OrderInterface for Eip7683OrderImpl {
 	async fn validate_and_create_order(
 		&self,
 		order_bytes: &Bytes,
+		intent_data: &Option<serde_json::Value>,
 		lock_type: &str,
 		order_id_callback: solver_types::OrderIdCallback,
 		solver_address: &Address,
@@ -853,17 +721,69 @@ impl OrderInterface for Eip7683OrderImpl {
 		// Convert order ID bytes to hex string
 		let order_id = alloy_primitives::hex::encode_prefixed(&order_id_bytes);
 
-		// Extract chain IDs from the order
-		let input_chain_ids = vec![standard_order.originChainId.to::<u64>()];
-		let output_chain_ids: Vec<u64> = standard_order
-			.outputs
-			.iter()
-			.map(|output| output.chainId.to::<u64>())
-			.collect();
+		// Extract chain info from the order
+		let origin_chain_id = standard_order.originChainId.to::<u64>();
 
-		// Convert StandardOrder to Eip7683OrderData for serialization
-		let mut order_data = Eip7683OrderData::from(standard_order.clone());
+		// Get input network and determine settler address based on lock type
+		let input_network = self.networks.get(&origin_chain_id).ok_or_else(|| {
+			OrderError::ValidationFailed(format!("Chain {} not configured", origin_chain_id))
+		})?;
+
+		let is_compact = lock_type == LockType::ResourceLock;
+		let input_settler_address = if is_compact {
+			input_network
+				.input_settler_compact_address
+				.clone()
+				.unwrap_or_else(|| input_network.input_settler_address.clone())
+		} else {
+			input_network.input_settler_address.clone()
+		};
+
+		let input_chains = vec![solver_types::order::ChainSettlerInfo {
+			chain_id: origin_chain_id,
+			settler_address: input_settler_address,
+		}];
+
+		// Build output chains with settler addresses
+		let mut output_chains = Vec::new();
+		for output in &standard_order.outputs {
+			let output_chain_id = output.chainId.to::<u64>();
+			let output_network = self.networks.get(&output_chain_id).ok_or_else(|| {
+				OrderError::ValidationFailed(format!("Chain {} not configured", output_chain_id))
+			})?;
+
+			output_chains.push(solver_types::order::ChainSettlerInfo {
+				chain_id: output_chain_id,
+				settler_address: output_network.output_settler_address.clone(),
+			});
+		}
+
+		// Try to use existing Eip7683OrderData from intent_data if available,
+		// otherwise create from StandardOrder
+		use std::convert::TryFrom;
+		let mut order_data = match intent_data {
+			Some(data) => {
+				// Try to parse the intent data as Eip7683OrderData
+				match Eip7683OrderData::try_from(data) {
+					Ok(parsed_data) => {
+						// Successfully parsed - use the existing data (preserves sponsor/signature)
+						parsed_data
+					},
+					Err(_) => {
+						// Failed to parse - create fresh from StandardOrder
+						Eip7683OrderData::from(standard_order.clone())
+					},
+				}
+			},
+			None => {
+				// No intent data provided - create fresh from StandardOrder
+				Eip7683OrderData::from(standard_order.clone())
+			},
+		};
+
 		order_data.order_id = order_id_array;
+		order_data.lock_type = Some(lock_type);
+		order_data.raw_order_data = Some(alloy_primitives::hex::encode_prefixed(order_bytes));
 
 		// Create generic Order
 		Ok(Order {
@@ -877,8 +797,8 @@ impl OrderInterface for Eip7683OrderImpl {
 			})?,
 			solver_address: solver_address.clone(),
 			quote_id: None,
-			input_chain_ids,
-			output_chain_ids,
+			input_chains,
+			output_chains,
 			execution_params: None,
 			prepare_tx_hash: None,
 			fill_tx_hash: None,
@@ -949,7 +869,7 @@ mod tests {
 			Eip7683OrderDataBuilder, IntentBuilder, NetworkConfigBuilder, NetworksConfigBuilder,
 			OrderBuilder,
 		},
-		Address, ExecutionParams, FillProof, Intent, NetworksConfig, OrderStatus, TransactionHash,
+		Address, ExecutionParams, FillProof, Intent, NetworksConfig, TransactionHash,
 	};
 	use std::collections::HashMap;
 
@@ -1017,76 +937,6 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_validate_intent_success() {
-		let networks = create_test_networks();
-		let oracle_routes = create_test_oracle_routes();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
-
-		let order_data = create_test_order_data();
-		let intent = create_test_intent(order_data, "on-chain");
-		let solver_address = Address(vec![99u8; 20]);
-
-		let result = order_impl.validate_intent(&intent, &solver_address).await;
-		assert!(result.is_ok());
-
-		let order = result.unwrap();
-		assert_eq!(order.id, "test-intent-id");
-		assert_eq!(order.standard, "eip7683");
-		assert_eq!(order.solver_address, solver_address);
-		assert_eq!(order.status, OrderStatus::Created);
-	}
-
-	#[tokio::test]
-	async fn test_validate_intent_wrong_standard() {
-		let networks = create_test_networks();
-		let oracle_routes = create_test_oracle_routes();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
-
-		let mut intent = create_test_intent(create_test_order_data(), "on-chain");
-		intent.standard = "eip7230".to_string();
-		let solver_address = Address(vec![99u8; 20]);
-
-		let result = order_impl.validate_intent(&intent, &solver_address).await;
-		assert!(result.is_err());
-		assert!(result
-			.unwrap_err()
-			.to_string()
-			.contains("Not an EIP-7683 order"));
-	}
-
-	#[tokio::test]
-	async fn test_validate_intent_expired_order() {
-		let networks = create_test_networks();
-		let oracle_routes = create_test_oracle_routes();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
-
-		let mut order_data = create_test_order_data();
-		order_data.expires = 100; // Set to past timestamp
-		let intent = create_test_intent(order_data, "on-chain");
-		let solver_address = Address(vec![99u8; 20]);
-
-		let result = order_impl.validate_intent(&intent, &solver_address).await;
-		assert!(result.is_err());
-		assert!(result.unwrap_err().to_string().contains("Order expired"));
-	}
-
-	#[tokio::test]
-	async fn test_validate_intent_unsupported_oracle() {
-		let networks = create_test_networks();
-		let oracle_routes = create_test_oracle_routes();
-		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
-
-		let mut order_data = create_test_order_data();
-		order_data.input_oracle = "0x9999999999999999999999999999999999999999".to_string();
-		let intent = create_test_intent(order_data, "on-chain");
-		let solver_address = Address(vec![99u8; 20]);
-
-		let result = order_impl.validate_intent(&intent, &solver_address).await;
-		assert!(result.is_err());
-		assert!(result.unwrap_err().to_string().contains("is not supported"));
-	}
-
-	#[tokio::test]
 	async fn test_generate_prepare_transaction_onchain_order() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
@@ -1107,7 +957,7 @@ mod tests {
 		};
 
 		let result = order_impl
-			.generate_prepare_transaction(&intent, &order, &params)
+			.generate_prepare_transaction(&intent.source, &order, &params)
 			.await;
 		assert!(result.is_ok());
 		assert!(result.unwrap().is_none()); // On-chain orders don't need preparation
@@ -1160,18 +1010,13 @@ mod tests {
 		};
 
 		let result = order_impl
-			.generate_prepare_transaction(&intent, &order, &params)
+			.generate_prepare_transaction(&intent.source, &order, &params)
 			.await;
 		assert!(result.is_ok());
 
 		let tx = result.unwrap().unwrap();
 		assert_eq!(tx.chain_id, 1);
-		assert_eq!(
-			tx.to,
-			Some(Address(
-				hex::decode("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9").unwrap()
-			))
-		); // input_settler_address for chain 1
+		assert_eq!(tx.to, Some(Address(vec![0x11; 20])));
 		assert!(!tx.data.is_empty());
 	}
 
@@ -1199,12 +1044,7 @@ mod tests {
 
 		let tx = result.unwrap();
 		assert_eq!(tx.chain_id, 137); // destination chain
-		assert_eq!(
-			tx.to,
-			Some(Address(
-				hex::decode("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f").unwrap()
-			))
-		); // output_settler_address for chain 137
+		assert_eq!(tx.to, Some(Address(vec![0x22; 20])));
 		assert!(!tx.data.is_empty());
 	}
 
@@ -1237,12 +1077,7 @@ mod tests {
 
 		let tx = result.unwrap();
 		assert_eq!(tx.chain_id, 1); // origin chain
-		assert_eq!(
-			tx.to,
-			Some(Address(
-				hex::decode("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9").unwrap()
-			))
-		); // input_settler_address for chain 1
+		assert_eq!(tx.to, Some(Address(vec![0x11; 20])));
 		assert!(!tx.data.is_empty());
 	}
 
@@ -1280,12 +1115,7 @@ mod tests {
 
 		let tx = result.unwrap();
 		assert_eq!(tx.chain_id, 1); // origin chain
-		assert_eq!(
-			tx.to,
-			Some(Address(
-				hex::decode("00000000000c2e074ec69a0dfb2997ba6c7d2e1e").unwrap()
-			))
-		); // compact address for chain 1
+		assert_eq!(tx.to, Some(Address(vec![0x11; 20])));
 		assert!(!tx.data.is_empty());
 	}
 

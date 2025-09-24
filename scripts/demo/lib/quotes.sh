@@ -32,6 +32,7 @@
 #   quote_get demo-output/get_quote.req.json
 #   quote_accept demo-output/get_quote.res.json
 #   quote_test escrow permit2 A2B
+#   quote_test compact A2B
 #
 # ==============================================================================
 
@@ -722,63 +723,108 @@ quote_accept() {
             return 1
         fi
         print_debug "User key found, extracting EIP-712 message..."
-        
-        # Extract EIP-712 message for signing
-        local eip712_message=$(echo "$order_data" | jq -r '.message.eip712 // empty')
+
+        # Extract the full message object (contains both digest and eip712)
+        local full_message=$(echo "$order_data" | jq -r '.message // empty')
+        if [ -z "$full_message" ] || [ "$full_message" = "null" ]; then
+            print_error "No message found in order"
+            return 1
+        fi
+
+        # Extract EIP-712 message for signing (for compatibility with existing code)
+        local eip712_message=$(echo "$full_message" | jq -r '.eip712 // empty')
         if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ]; then
             print_error "No EIP-712 message found in order"
             return 1
         fi
-        
+
         print_info "Signing EIP-712 order..."
-        
-        # Extract witness data first (needed for signing)
-        local witness=$(echo "$eip712_message" | jq -r '.witness // empty')
-        local witness_expires=$(echo "$witness" | jq -r '.expires // 0')
-        local input_oracle=$(echo "$witness" | jq -r '.inputOracle // "0x0000000000000000000000000000000000000000"')
-        
-        # Sign the EIP-712 message
-        local domain=$(echo "$eip712_message" | jq -r '.signing.domain // empty')
-        local primary_type=$(echo "$eip712_message" | jq -r '.signing.primaryType // "PermitBatchWitnessTransferFrom"')
-        local deadline=$(echo "$eip712_message" | jq -r '.deadline // empty')
-        local nonce=$(echo "$eip712_message" | jq -r '.nonce // empty')
-        local spender=$(echo "$eip712_message" | jq -r '.spender // empty')
-        
-        # Extract the required fields for Permit2 signing
-        local permitted_token=$(echo "$eip712_message" | jq -r '.permitted[0].token // empty')
-        local permitted_amount=$(echo "$eip712_message" | jq -r '.permitted[0].amount // empty')
-        
-        # Convert interop address to standard Ethereum address if needed for signing
-        local standard_permitted_token="$permitted_token"
-        # Interop addresses are longer than standard addresses (42 chars)
-        if [[ ${#permitted_token} -gt 42 ]]; then
-            # This is likely an interop address, convert to standard
-            standard_permitted_token=$(from_uii_address "$permitted_token")
-            print_debug "Converted permitted token from interop to standard: $permitted_token -> $standard_permitted_token"
-        fi
-        
-        # Get origin chain ID from the domain
-        local origin_chain_id=$(echo "$domain" | jq -r '.chainId // 31337')
-        
-        # Build mandate outputs array from witness outputs
-        local mandate_outputs_json=$(echo "$witness" | jq -c '.outputs')
-        
-        # Use the sign_standard_intent function which handles Permit2 properly
-        local signature=$(sign_standard_intent \
-            "$user_key" \
-            "$origin_chain_id" \
-            "$standard_permitted_token" \
-            "$permitted_amount" \
-            "$spender" \
-            "$nonce" \
-            "$deadline" \
-            "$witness_expires" \
-            "$input_oracle" \
-            "$mandate_outputs_json")
-        
-        if [ -z "$signature" ]; then
-            print_error "Failed to sign EIP-712 order"
-            return 1
+
+        # Determine the order type based on primaryType
+        local primary_type=$(echo "$eip712_message" | jq -r '.primaryType // "PermitBatchWitnessTransferFrom"')
+        print_debug "Primary type: $primary_type"
+
+        local signature=""
+
+        if [ "$primary_type" = "BatchCompact" ]; then
+            print_info "Detected BatchCompact order, using compact signing..."
+
+            # Use client-side digest computation
+            signature=$(sign_compact_digest_from_quote "$user_key" "$full_message")
+
+            if [ -z "$signature" ]; then
+                print_error "Failed to sign BatchCompact order"
+                return 1
+            fi
+
+            print_success "BatchCompact order signed successfully"
+
+            # For compact/resource lock, we need to ABI-encode the signature with allocator data
+            # This matches what the working direct intent flow does in intents.sh
+            local allocator_data="0x"  # Empty allocator data for demo
+            signature=$(cast abi-encode "f(bytes,bytes)" "$signature" "$allocator_data")
+
+            print_debug "ABI-encoded signature: $signature"
+
+        else
+            print_info "Detected Permit2 order, using standard signing..."
+
+            # Extract witness data first (needed for signing)
+            local witness=$(echo "$eip712_message" | jq -r '.witness // empty')
+            local witness_expires=$(echo "$witness" | jq -r '.expires // 0')
+            local input_oracle=$(echo "$witness" | jq -r '.inputOracle // "0x0000000000000000000000000000000000000000"')
+
+            # Sign the EIP-712 message
+            local domain=$(echo "$eip712_message" | jq -r '.signing.domain // empty')
+            local deadline=$(echo "$eip712_message" | jq -r '.deadline // empty')
+            local nonce=$(echo "$eip712_message" | jq -r '.nonce // empty')
+            local spender=$(echo "$eip712_message" | jq -r '.spender // empty')
+
+            # Extract the required fields for Permit2 signing
+            local permitted_token=$(echo "$eip712_message" | jq -r '.permitted[0].token // empty')
+            local permitted_amount=$(echo "$eip712_message" | jq -r '.permitted[0].amount // empty')
+
+            # Convert interop address to standard Ethereum address if needed for signing
+            local standard_permitted_token="$permitted_token"
+            # Interop addresses are longer than standard addresses (42 chars)
+            if [[ ${#permitted_token} -gt 42 ]]; then
+                # This is likely an interop address, convert to standard
+                standard_permitted_token=$(from_uii_address "$permitted_token")
+                print_debug "Converted permitted token from interop to standard: $permitted_token -> $standard_permitted_token"
+            fi
+
+            # Get origin chain ID from the domain
+            local origin_chain_id=$(echo "$domain" | jq -r '.chainId // 31337')
+
+            # Build mandate outputs array from witness outputs
+            local mandate_outputs_json=$(echo "$witness" | jq -c '.outputs')
+
+            # Use client-side digest computation but with proper signature formatting
+            print_info "Computing client-side digest..."
+            local client_digest=$(compute_permit2_digest_from_quote "$eip712_message")
+            if [ $? -ne 0 ] || [ -z "$client_digest" ]; then
+                print_error "Failed to compute client-side digest"
+                return 1
+            fi
+            print_debug "Client computed digest: $client_digest"
+            print_info "Signing with client-computed digest: $client_digest"
+
+            # Sign the digest directly and add proper permit2 prefix
+            local raw_signature=$(cast wallet sign --no-hash --private-key "$user_key" "$client_digest")
+            if [ $? -ne 0 ] || [ -z "$raw_signature" ]; then
+                print_error "Failed to sign digest"
+                return 1
+            fi
+
+            # Create prefixed signature for permit2
+            signature=$(create_prefixed_signature "$raw_signature" "permit2")
+
+            if [ -z "$signature" ]; then
+                print_error "Failed to sign EIP-712 order"
+                return 1
+            fi
+
+            print_success "Permit2 signature generated with client-side digest"
         fi
         
         print_success "EIP-712 order signed"
@@ -802,17 +848,18 @@ quote_accept() {
         local api_url="${SOLVER_API_URL:-http://localhost:3000/api/orders}"
         print_info "Submitting signed order with quote ID to solver..."
         print_debug "API URL: $api_url"
-        
+
         # Debug: Show what we're submitting
         print_debug "Submission payload:"
         if [ "${DEBUG:-0}" = "1" ]; then
             echo "$submission_json" | jq '.' >&2
         fi
-        
+
         print_debug "Quote ID: $quote_id"
         print_debug "Signature: $signature"
         print_debug "Submitting to API URL: $api_url"
-        
+
+        # api_post will automatically handle JWT authentication via jwt_ensure_token
         if api_post "$api_url" "$submission_json"; then
             local status_code=$(get_api_response "status_code")
             local response_body=$(get_api_response "body")
@@ -884,28 +931,33 @@ quote_accept() {
 }
 
 quote_test() {
-    local lock_type="${1:-escrow}"
-    local auth_type="${2:-permit2}"
-    local token_pair="${3:-A2B}"
+    local intent_type="${1:-escrow}"
+    local auth_type=""
+    local token_pair=""
     
-    # Validate lock type
-    if [[ "$lock_type" != "escrow" && "$lock_type" != "compact" ]]; then
-        print_error "Invalid lock type: $lock_type"
-        print_info "Usage: quote test <escrow|compact> <permit2|eip3009> <A2A|A2B|B2A|B2B>"
-        return 1
+    # Parse arguments based on intent type
+    if [ "$intent_type" = "compact" ]; then
+        # Compact: no auth type needed
+        token_pair="${2:-A2B}"
+    else
+        # Escrow: auth type required
+        auth_type="${2:-permit2}"
+        token_pair="${3:-A2B}"
+        
+        # Validate auth type for escrow
+        if [[ "$auth_type" != "permit2" && "$auth_type" != "eip3009" ]]; then
+            print_error "Invalid auth type for escrow: $auth_type"
+            print_info "Supported auth types for escrow: permit2, eip3009"
+            print_info "Usage: quote test escrow <permit2|eip3009> <A2A|A2B|B2A|B2B>"
+            return 1
+        fi
     fi
     
-    # Validate auth type
-    if [ "$lock_type" = "compact" ] && [ "$auth_type" != "permit2" ]; then
-        print_error "Compact only supports permit2 auth"
-        print_info "Usage: quote test compact permit2 <A2A|A2B|B2A|B2B>"
-        return 1
-    fi
-    
-    if [[ "$auth_type" != "permit2" && "$auth_type" != "eip3009" ]]; then
-        print_error "Invalid auth type: $auth_type"
-        print_info "Supported auth types: permit2, eip3009 (eip3009 only for escrow)"
-        print_info "Usage: quote test <escrow|compact> <permit2|eip3009> <A2A|A2B|B2A|B2B>"
+    # Validate intent type
+    if [[ "$intent_type" != "escrow" && "$intent_type" != "compact" ]]; then
+        print_error "Invalid intent type: $intent_type"
+        print_info "Usage: quote test escrow <permit2|eip3009> <A2A|A2B|B2A|B2B>"
+        print_info "Usage: quote test compact <A2A|A2B|B2A|B2B>"
         return 1
     fi
     
@@ -947,14 +999,28 @@ quote_test() {
             ;;
     esac
     
-    print_header "Testing quote flow: ${lock_type} with ${auth_type} auth, ${from_token} → ${to_token}"
+    # Build header based on intent type
+    if [ "$intent_type" = "compact" ]; then
+        print_header "Testing quote flow: compact (BatchCompact), ${from_token} → ${to_token}"
+    else
+        print_header "Testing quote flow: ${intent_type} with ${auth_type} auth, ${from_token} → ${to_token}"
+    fi
     
     # Step 1: Build intent
-    print_step "Building ${lock_type} intent with ${auth_type} auth"
-    
-    if ! intent_build "$lock_type" "$auth_type" "$origin_chain" "$dest_chain" "$from_token" "$to_token"; then
-        print_error "Failed to build ${lock_type} intent with ${auth_type} auth"
-        return 1
+    if [ "$intent_type" = "compact" ]; then
+        print_step "Building compact intent"
+        
+        if ! intent_build "compact" "$origin_chain" "$dest_chain" "$from_token" "$to_token"; then
+            print_error "Failed to build compact intent"
+            return 1
+        fi
+    else
+        print_step "Building ${intent_type} intent with ${auth_type} auth"
+        
+        if ! intent_build "$intent_type" "$auth_type" "$origin_chain" "$dest_chain" "$from_token" "$to_token"; then
+            print_error "Failed to build ${intent_type} intent with ${auth_type} auth"
+            return 1
+        fi
     fi
     
     print_success "Intent built successfully"
@@ -990,7 +1056,7 @@ quote_test() {
         return 1
     fi
     
-    print_success "Quote test completed: ${lock_type} ${token_pair}"
+    print_success "Quote test completed: ${intent_type} ${token_pair}"
     
     # Show summary
     local quote_id=$(get_quote_status "last_quote_id")

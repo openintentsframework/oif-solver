@@ -25,6 +25,12 @@ pub const DEFAULT_GAS_PRICE_WEI: u64 = 1_000_000_000;
 /// Default ETH/USD price used in mock pricing implementation.
 pub const MOCK_ETH_USD_PRICE: &str = "4615.16";
 
+/// Default TOKA/USD price used in mock pricing implementation.
+pub const MOCK_TOKA_USD_PRICE: &str = "1.0";
+
+/// Default TOKB/USD price used in mock pricing implementation.
+pub const MOCK_TOKB_USD_PRICE: &str = "1.0";
+
 /// Default SOL/USD price used in mock pricing implementation.
 pub const MOCK_SOL_USD_PRICE: &str = "240.50";
 

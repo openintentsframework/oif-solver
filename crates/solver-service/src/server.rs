@@ -4,8 +4,9 @@
 //! for the OIF Solver API.
 
 use crate::{
-	apis::{order::get_order_by_id, quote::cost::CostEngine},
+	apis::order::get_order_by_id,
 	auth::{auth_middleware, AuthState, JwtService},
+	signature_validator::SignatureValidationService,
 };
 use alloy_primitives::U256;
 use axum::{
@@ -42,6 +43,8 @@ pub struct AppState {
 	pub discovery_url: Option<String>,
 	/// JWT service for authentication (if configured).
 	pub jwt_service: Option<Arc<JwtService>>,
+	/// Signature validation service for different order standards.
+	pub signature_validation: Arc<SignatureValidationService>,
 }
 
 /// Starts the HTTP server for the API.
@@ -101,12 +104,16 @@ pub async fn start_server(
 		},
 	};
 
+	// Initialize signature validation service
+	let signature_validation = Arc::new(SignatureValidationService::new());
+
 	let app_state = AppState {
 		solver,
 		config,
 		http_client,
 		discovery_url,
 		jwt_service: jwt_service.clone(),
+		signature_validation,
 	};
 
 	// Build the router with /api base path and quote endpoint
@@ -288,18 +295,10 @@ async fn handle_order(
 	};
 
 	// Validate the IntentRequest
-	let validated_order = match validate_intent_request(&intent_request, &state, standard).await {
+	match validate_intent_request(&intent_request, &state, standard).await {
 		Ok(order) => order,
 		Err(api_error) => return api_error.into_response(),
 	};
-
-	// Estimate costs
-	let cost_engine = CostEngine::new();
-	let _order_cost = cost_engine
-		.estimate_cost(&validated_order, &state.solver, &state.config)
-		.await;
-
-	// TODO: Do something with _order_cost
 
 	forward_to_discovery_service(&state, &intent_request).await
 }
@@ -442,24 +441,52 @@ async fn validate_intent_request(
 		})
 	});
 
+	// EIP-712 signature validation for ResourceLock orders
+	let requires_validation = state
+		.signature_validation
+		.requires_signature_validation(standard, &intent.lock_type);
+
+	if requires_validation {
+		state
+			.signature_validation
+			.validate_signature(
+				standard,
+				intent,
+				&state.solver.config().networks,
+				state.solver.delivery(),
+			)
+			.await?;
+	}
+
 	// Process the order through the OrderService
 	// This validates the order based on the standard and returns a validated Order
-	state
+	let result = state
 		.solver
 		.order()
 		.validate_and_create_order(
 			standard,
 			order_bytes,
+			&None,
 			lock_type,
 			compute_order_id,
 			&solver_address,
 		)
 		.await
-		.map_err(|e| APIError::BadRequest {
-			error_type: ApiErrorType::OrderValidationFailed,
-			message: format!("Order validation failed: {}", e),
-			details: None,
-		})
+		.map_err(|e| {
+			tracing::error!("Order validation failed with error: {}", e);
+			APIError::BadRequest {
+				error_type: ApiErrorType::OrderValidationFailed,
+				message: format!("Order validation failed: {}", e),
+				details: None,
+			}
+		});
+
+	match &result {
+		Ok(_) => tracing::debug!("Order validation completed successfully"),
+		Err(e) => tracing::error!("Order validation failed: {:?}", e),
+	}
+
+	result
 }
 
 async fn forward_to_discovery_service(

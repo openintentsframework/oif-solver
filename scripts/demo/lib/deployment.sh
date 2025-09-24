@@ -399,32 +399,46 @@ deploy_permit2() {
     local chain_name="$1"
     local rpc_url="$2"
     local private_key="${3:-$(config_get_account solver private_key)}"
-    
+
     print_info "Deploying Permit2 on $chain_name..."
-    
+
     # Check if already deployed
-    local existing_code=$(cast_code "$PERMIT2_ADDRESS" "$rpc_url" 2>/dev/null || echo "0x")
+    local existing_code=$(cast code "$PERMIT2_ADDRESS" --rpc-url "$rpc_url" 2>/dev/null || echo "0x")
     if [ "$existing_code" != "0x" ]; then
         print_success "Permit2 already deployed at $PERMIT2_ADDRESS"
         return 0
     fi
-    
+
     # Get Permit2 bytecode from mainnet
     print_debug "Fetching Permit2 bytecode from mainnet..."
     local permit2_code
-    permit2_code=$(cast_code "$PERMIT2_ADDRESS" "https://ethereum-rpc.publicnode.com" 2>/dev/null || echo "")
-    
+    permit2_code=$(cast code "$PERMIT2_ADDRESS" --rpc-url "https://ethereum-rpc.publicnode.com" 2>/dev/null || echo "")
+
     if [ -z "$permit2_code" ] || [ "$permit2_code" = "0x" ]; then
         print_error "Failed to fetch Permit2 bytecode from mainnet"
         return 1
     fi
-    
-    # Deploy using anvil_setCode
-    if cast_rpc "anvil_setCode" "$rpc_url" "$PERMIT2_ADDRESS" "$permit2_code" > /dev/null; then
-        print_success "Permit2 deployed at $PERMIT2_ADDRESS"
+
+    print_debug "Permit2 bytecode length: ${#permit2_code} characters"
+
+    # Deploy using anvil_setCode RPC call
+    print_debug "Deploying Permit2 via anvil_setCode..."
+    local deploy_result
+    deploy_result=$(cast rpc anvil_setCode "$PERMIT2_ADDRESS" "$permit2_code" --rpc-url "$rpc_url" 2>/dev/null)
+
+    if [ $? -ne 0 ]; then
+        print_error "Failed to call anvil_setCode"
+        return 1
+    fi
+
+    # Verify deployment
+    local deployed_code=$(cast code "$PERMIT2_ADDRESS" --rpc-url "$rpc_url" 2>/dev/null || echo "0x")
+    if [ "$deployed_code" != "0x" ] && [ ${#deployed_code} -gt 2 ]; then
+        print_success "Permit2 deployed at $PERMIT2_ADDRESS (${#deployed_code} bytes)"
         return 0
     else
-        print_error "Failed to deploy Permit2"
+        print_error "Failed to deploy Permit2 - verification failed"
+        print_debug "Deployed code: $deployed_code"
         return 1
     fi
 }
@@ -1124,6 +1138,7 @@ include = [
 [solver]
 id = "oif-solver-demo"
 monitoring_timeout_minutes = 5
+min_profitability_pct = 1.0
 
 # ============================================================================
 # STORAGE
@@ -1155,6 +1170,7 @@ private_key = "$PRIVATE_KEY"
 # ============================================================================
 [delivery]
 min_confirmations = 1
+transaction_poll_interval_seconds = 3
 
 [delivery.implementations.evm_alloy]
 network_ids = [31337, 31338]
@@ -1195,10 +1211,22 @@ primary = "mock"
 [pricing.implementations.mock]
 # Uses default ETH/USD price of 4615.16
 
+[pricing.implementations.coingecko]
+# Free tier configuration (no API key required)
+# api_key = "CG-YOUR-API-KEY-HERE"
+cache_duration_seconds = 60
+rate_limit_delay_ms = 1200
+
+# Custom prices for demo/test tokens (in USD)
+[pricing.implementations.coingecko.custom_prices]
+TOKA = "200.00"
+TOKB = "195.00"
+
 # ============================================================================
 # SETTLEMENT
 # ============================================================================
 [settlement]
+settlement_poll_interval_seconds = 3
 
 [settlement.domain]
 chain_id = 1
@@ -1228,6 +1256,37 @@ output = { 31337 = ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"], 31338 = ["0xD
 [settlement.implementations.direct.routes]
 31337 = [31338]  # Can go from origin to destination
 31338 = [31337]  # Can go from destination to origin
+
+# ============================================================================
+# HYPERLANE SETTLEMENT (For cross-chain messaging)
+# ============================================================================
+[settlement.implementations.hyperlane]
+order = "eipXXXX"
+network_ids = [31337, 31338]
+# Default gas limit for Hyperlane messages
+default_gas_limit = 500000
+message_timeout_seconds = 600
+finalization_required = false  # For local testing
+
+# Oracle addresses for Hyperlane (different from direct to avoid conflicts)
+# Use a different oracle address to ensure Direct settlement is used for local demo
+[settlement.implementations.hyperlane.oracles]
+input = { 31337 = ["0x0000000000000000000000000000000000000999"], 31338 = ["0x0000000000000000000000000000000000000999"] }
+output = { 31337 = ["0x0000000000000000000000000000000000000999"], 31338 = ["0x0000000000000000000000000000000000000999"] }
+
+[settlement.implementations.hyperlane.routes]
+31337 = [31338]
+31338 = [31337]
+
+# Mailbox addresses (mock for local testing)
+[settlement.implementations.hyperlane.mailboxes]
+31337 = "0x0000000000000000000000000000000000000001"  # Mock mailbox for local
+31338 = "0x0000000000000000000000000000000000000001"  # Mock mailbox for local
+
+# IGP addresses (mock for local testing)
+[settlement.implementations.hyperlane.igp_addresses]
+31337 = "0x0000000000000000000000000000000000000002"  # Mock IGP for local
+31338 = "0x0000000000000000000000000000000000000002"  # Mock IGP for local
 EOF
     
     # Create networks.toml with deployed addresses
@@ -1327,16 +1386,22 @@ EOF
 [gas]
 
 [gas.flows.compact_resource_lock]
-# Gas units captured by scripts/e2e/estimate_gas_compact.sh on local anvil
+# Gas units captured by scripts/e2e/estimate_gas.sh on local anvil
 open = 0
-fill = 76068
-claim = 121995
+fill = 77298
+claim = 122793
 
 [gas.flows.permit2_escrow]
-# Gas units captured by scripts/e2e/estimate_gas_permit2_escrow.sh on local anvil
-open = 143116
-fill = 76068 
-claim = 59953
+# Gas units captured by scripts/e2e/estimate_gas.sh on local anvil
+open = 146306
+fill = 77298
+claim = 60084
+
+[gas.flows.eip3009_escrow]
+# Gas units captured by scripts/e2e/estimate_gas.sh on local anvil
+open = 130254
+fill = 77298
+claim = 60084
 EOF
     
     print_success "Configuration files generated:"

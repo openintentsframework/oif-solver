@@ -1,33 +1,17 @@
 #!/bin/bash
 
-# OIF Solver Testnet Environment Setup Script
-# ===========================================
-#
-# This script sets up a complete testnet testing environment for the OIF cross-chain solver.
-# It performs the following operations:
-#
-# 1. Uses SOLVER_ADDRESS and USER_ADDRESS defined below
-# 2. Deploys smart contracts on both testnets:
-#    - InputSettlerEscrow on origin chain
-#    - OutputSettlerSimple on destination chain
-#    - Mock Oracle contract for intent validation
-#
-# 3. Configures the test environment for USDC transfers:
-#    - Uses USDC on both chains (requires token balances)
-#    - Generates modular configuration files for the solver
+# OIF Solver Testnet Setup Script (v2)
+# =====================================
+# Refactored version using JSON configuration and modular design
 #
 # Usage: ./setup_testnet.sh --origin <chain> --dest <chain> [options]
-#   Available chains: base-sepolia, arbitrum-sepolia, optimism-sepolia, ethereum-sepolia
-#   
-#   Examples:
-#     ./setup_testnet.sh --origin base-sepolia --dest arbitrum-sepolia
-#     ./setup_testnet.sh --origin ethereum-sepolia --dest optimism-sepolia
-#     ./setup_testnet.sh --help
-#
-# After running this script, you can:
-# - Start the solver with: cargo run --bin solver-service -- --config config/testnet.toml
-# - Send onchain test intents using: ./scripts/demo/send_onchain_intent.sh
-# - Send offchain test intents using: ./scripts/demo/send_offchain_intent.sh
+#   --origin <chain>     Origin chain for cross-chain transfers
+#   --dest <chain>       Destination chain for cross-chain transfers
+#   --config <file>      Custom configuration file (default: testnet-config.json)
+#   --no-deploy          Skip contract deployment
+#   --dry-run            Show what would be done without making changes
+#   --init               Generate example configuration files
+#   --help               Show this help message
 
 # Colors
 RED='\033[0;31m'
@@ -36,14 +20,23 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+# Script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Load library functions
+source "$SCRIPT_DIR/lib/config_loader.sh"
+source "$SCRIPT_DIR/lib/validators.sh"
+source "$SCRIPT_DIR/lib/deployers.sh"
+
 # Default values
 ORIGIN_CHAIN=""
 DEST_CHAIN=""
-CHAINS_CONFIG="$(dirname "$0")/testnet_chains.json"
+CONFIG_FILE="$SCRIPT_DIR/testnet-config.json"
+DEPLOY_CONTRACTS=true
+DRY_RUN=false
 
-# ============================================================================
-# COMMAND LINE ARGUMENT PARSING
-# ============================================================================
+# Parse command line arguments
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -55,12 +48,28 @@ parse_args() {
                 DEST_CHAIN="$2"
                 shift 2
                 ;;
+            --config)
+                CONFIG_FILE="$2"
+                shift 2
+                ;;
+            --no-deploy)
+                DEPLOY_CONTRACTS=false
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --init)
+                init_config_files
+                exit 0
+                ;;
             --help|-h)
                 show_help
                 exit 0
                 ;;
             --list-chains)
-                list_available_chains
+                list_available_chains_cmd
                 exit 0
                 ;;
             *)
@@ -72,9 +81,10 @@ parse_args() {
     done
 }
 
+# Show help message
 show_help() {
-    echo -e "${BLUE}OIF Solver Testnet Setup Script${NC}"
-    echo "===================================="
+    echo -e "${BLUE}OIF Solver Testnet Setup Script (v2)${NC}"
+    echo "====================================="
     echo
     echo "Usage: $0 --origin <chain> --dest <chain> [options]"
     echo
@@ -83,388 +93,156 @@ show_help() {
     echo "  --dest <chain>       Destination chain for cross-chain transfers"
     echo
     echo "Options:"
-    echo "  --help, -h           Show this help message"
+    echo "  --config <file>      Use custom configuration file"
+    echo "  --no-deploy          Skip contract deployment"
+    echo "  --dry-run            Show what would be done without making changes"
+    echo "  --init               Generate example configuration files"
     echo "  --list-chains        List all available testnet chains"
+    echo "  --help, -h           Show this help message"
     echo
     echo "Examples:"
     echo "  $0 --origin base-sepolia --dest arbitrum-sepolia"
-    echo "  $0 --origin ethereum-sepolia --dest optimism-sepolia"
-    echo "  $0 --list-chains"
+    echo "  $0 --origin ethereum-holesky --dest optimism-sepolia"
+    echo "  $0 --init  # Generate example config files"
     echo
+    echo "Configuration:"
+    echo "  1. Copy .env.example to .env and add your private keys"
+    echo "  2. Edit testnet-config.json to customize settings"
+    echo "  3. Run this script with your chosen chains"
 }
 
-list_available_chains() {
+# Initialize configuration files
+init_config_files() {
+    echo -e "${YELLOW}Initializing configuration files...${NC}"
+    
+    # Check if .env exists
+    if [ ! -f "$PROJECT_ROOT/.env" ]; then
+        if [ -f "$PROJECT_ROOT/.env.example" ]; then
+            cp "$PROJECT_ROOT/.env.example" "$PROJECT_ROOT/.env"
+            echo -e "${GREEN}✓${NC} Created .env from .env.example"
+            echo -e "${YELLOW}  ⚠️  Please edit .env and add your private keys${NC}"
+        fi
+    else
+        echo -e "${BLUE}ℹ${NC} .env already exists"
+    fi
+    
+    # Check if testnet-config.json exists
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${RED}❌ testnet-config.json not found${NC}"
+        echo "  Please ensure testnet-config.json exists in $SCRIPT_DIR"
+    else
+        echo -e "${BLUE}ℹ${NC} testnet-config.json exists"
+    fi
+    
+    echo
+    echo -e "${GREEN}Next steps:${NC}"
+    echo "  1. Edit .env and add your private keys"
+    echo "  2. Review and customize testnet-config.json"
+    echo "  3. Run: $0 --origin <chain> --dest <chain>"
+}
+
+# List available chains (now uses library function)
+list_available_chains_cmd() {
+    load_chains_config >/dev/null 2>&1
     echo -e "${BLUE}Available Testnet Chains:${NC}"
     echo "========================"
-    jq -r 'keys[] as $k | "\($k): \(.[$k].name) (Chain ID: \(.[$k].chain_id))"' "$CHAINS_CONFIG"
-}
-
-# ============================================================================
-# CHAIN CONFIGURATION FUNCTIONS
-# ============================================================================
-get_chain_config() {
-    local chain_name=$1
-    local config_key=$2
     
-    if [ ! -f "$CHAINS_CONFIG" ]; then
-        echo -e "${RED}❌ Chain configuration file not found: $CHAINS_CONFIG${NC}"
-        exit 1
-    fi
-    
-    local result=$(jq -r ".\"$chain_name\".\"$config_key\" // empty" "$CHAINS_CONFIG" 2>/dev/null)
-    
-    if [ -z "$result" ] || [ "$result" = "null" ]; then
-        echo -e "${RED}❌ Configuration not found for chain '$chain_name' key '$config_key'${NC}"
-        exit 1
-    fi
-    
-    echo "$result"
-}
-
-validate_chain_exists() {
-    local chain_name=$1
-    
-    if ! jq -e ".\"$chain_name\"" "$CHAINS_CONFIG" >/dev/null 2>&1; then
-        echo -e "${RED}❌ Unknown chain: $chain_name${NC}"
-        echo "Available chains:"
-        jq -r 'keys[]' "$CHAINS_CONFIG" | sed 's/^/  - /'
-        exit 1
-    fi
-}
-
-# ============================================================================
-# ADDRESSES - PASTE YOUR ADDRESSES HERE
-# ============================================================================
-SOLVER_ADDRESS=""  # Your solver address here
-SOLVER_PRIVATE_KEY="" # Your solver private key here
-USER_ADDRESS=""    # Your user address here
-USER_PRIVATE_KEY="" # Your user private key here
-DEST_RECIPIENT_ADDR="" # address of the destination recipient where the tokens will be sent to
-
-# Load environment variables from .env file
-load_env_file() {
-    local env_file=".env"
-    
-    if [ ! -f "$env_file" ]; then
-        echo -e "${RED}❌ Error: .env file not found${NC}"
-        echo
-        echo -e "${YELLOW}Please create a .env file with your deployment private key:${NC}"
-        echo "  DEPLOYMENT_PRIVATE_KEY=0x_your_64_character_hex_key_here"
-        echo
-        echo -e "${YELLOW}Get your private key from :${NC}"
-        echo "  Account Details > Export Private Key"
-        echo "  WARNING: Only use testnet accounts, NEVER mainnet keys!"
-        exit 1
-    fi
-    
-    # Load only DEPLOYMENT_PRIVATE_KEY from .env file
-    DEPLOYMENT_PRIVATE_KEY=$(grep "^DEPLOYMENT_PRIVATE_KEY=" "$env_file" | cut -d'=' -f2- | sed 's/^["'\'']//' | sed 's/["'\'']$//')
-    
-    if [ -z "$DEPLOYMENT_PRIVATE_KEY" ]; then
-        echo -e "${RED}❌ Error: DEPLOYMENT_PRIVATE_KEY not found in .env file${NC}"
-        exit 1
-    fi
-    
-    echo -e "${GREEN}✓${NC} Loaded DEPLOYMENT_PRIVATE_KEY from .env"
-}
-
-# Validate addresses
-validate_addresses() {
-    local errors=()
-    
-    # Check if SOLVER_ADDRESS is set
-    if [ -z "$SOLVER_ADDRESS" ]; then
-        errors+=("SOLVER_ADDRESS not set - please paste your solver address at the top of this script")
-    elif [[ ! "$SOLVER_ADDRESS" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
-        errors+=("SOLVER_ADDRESS has invalid format - should be 0x followed by 40 hex characters")
-    fi
-    
-    # Check if USER_ADDRESS is set
-    if [ -z "$USER_ADDRESS" ]; then
-        errors+=("USER_ADDRESS not set - please paste your user address at the top of this script")
-    elif [[ ! "$USER_ADDRESS" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
-        errors+=("USER_ADDRESS has invalid format - should be 0x followed by 40 hex characters")
-    fi
-    
-    if [ ${#errors[@]} -ne 0 ]; then
-        echo -e "${RED}Configuration errors found:${NC}"
-        for error in "${errors[@]}"; do
-            echo "  ❌ $error"
+    local chains=$(list_available_chains)
+    if [ $? -eq 0 ]; then
+        for chain in $chains; do
+            local name=$(get_chain_data "$chain" "name")
+            local chain_id=$(get_chain_data "$chain" "chain_id")
+            echo "$chain: $name (Chain ID: $chain_id)"
         done
-        echo
-        echo -e "${YELLOW}Please update the addresses at the top of this script:${NC}"
-        echo "  SOLVER_ADDRESS=\"0x...\""
-        echo "  USER_ADDRESS=\"0x...\""
-        exit 1
-    fi
-    
-    echo -e "${GREEN}✓${NC} Addresses validated"
-}
-
-# Validate configuration
-validate_config() {
-    local errors=()
-    
-    # Check if DEPLOYMENT_PRIVATE_KEY is set
-    if [ -z "$DEPLOYMENT_PRIVATE_KEY" ]; then
-        errors+=("DEPLOYMENT_PRIVATE_KEY not found - please add it to your .env file")
-    elif [[ ! "$DEPLOYMENT_PRIVATE_KEY" =~ ^0x[0-9a-fA-F]{64}$ ]]; then
-        errors+=("DEPLOYMENT_PRIVATE_KEY has invalid format - should be 0x followed by 64 hex characters")
-    fi
-    
-    if [ ${#errors[@]} -ne 0 ]; then
-        echo -e "${RED}Configuration errors found:${NC}"
-        for error in "${errors[@]}"; do
-            echo "  ❌ $error"
-        done
-        echo
-        echo -e "${YELLOW}Please update your .env file with the correct values.${NC}"
-        exit 1
+    else
+        echo -e "${RED}Could not load chain data${NC}"
     fi
 }
 
-# Parse command line arguments
-parse_args "$@"
+# Prepare private keys (ensure 0x prefix for forge)
+prepare_private_keys() {
+    # Add 0x prefix if not present
+    if [[ ! "$DEPLOYMENT_PRIVATE_KEY" =~ ^0x ]]; then
+        export DEPLOYMENT_PRIVATE_KEY="0x$DEPLOYMENT_PRIVATE_KEY"
+    fi
+    if [[ ! "$SOLVER_PRIVATE_KEY" =~ ^0x ]]; then
+        export SOLVER_PRIVATE_KEY="0x$SOLVER_PRIVATE_KEY"
+    fi
+    if [ -n "$USER_PRIVATE_KEY" ] && [[ ! "$USER_PRIVATE_KEY" =~ ^0x ]]; then
+        export USER_PRIVATE_KEY="0x$USER_PRIVATE_KEY"
+    fi
+}
 
-# Validate required arguments
-if [ -z "$ORIGIN_CHAIN" ] || [ -z "$DEST_CHAIN" ]; then
-    echo -e "${RED}❌ Missing required arguments${NC}"
-    echo "Usage: $0 --origin <chain> --dest <chain>"
-    echo "Use --help for more information"
-    exit 1
-fi
+# Generate solver configuration files
+generate_solver_configs() {
+    local origin_id="$1"
+    local dest_id="$2"
+    local origin_rpc="$3"
+    local dest_rpc="$4"
+    
+    echo -e "${YELLOW}Generating solver configuration files...${NC}"
+    
+    if [ "$DRY_RUN" = true ]; then
+        echo "  [DRY RUN] Would create config/testnet.toml"
+        echo "  [DRY RUN] Would create config/testnet/networks.toml"
+        echo "  [DRY RUN] Would create config/testnet/api.toml"
+        echo "  [DRY RUN] Would create config/testnet/gas.toml"
+        return 0
+    fi
+    
+    mkdir -p "$PROJECT_ROOT/config/testnet"
+    
+    # Generate main config file
+    generate_main_config "$origin_id" "$dest_id"
+    
+    # Generate networks config
+    generate_networks_config "$origin_id" "$dest_id" "$origin_rpc" "$dest_rpc"
+    
+    # Generate API config
+    generate_api_config
+    
+    # Generate gas config
+    generate_gas_config
+    
+    echo -e "${GREEN}✅ Configuration files generated${NC}"
+}
 
-# Validate chains exist in configuration
-validate_chain_exists "$ORIGIN_CHAIN"
-validate_chain_exists "$DEST_CHAIN"
-
-# Load chain configurations
-ORIGIN_CHAIN_ID=$(get_chain_config "$ORIGIN_CHAIN" "chain_id")
-ORIGIN_CHAIN_NAME=$(get_chain_config "$ORIGIN_CHAIN" "name")
-ORIGIN_RPC_URL=$(get_chain_config "$ORIGIN_CHAIN" "rpc_url")
-ORIGIN_USDC_ADDRESS=$(get_chain_config "$ORIGIN_CHAIN" "usdc_address")
-ORIGIN_EXPLORER_URL=$(get_chain_config "$ORIGIN_CHAIN" "explorer_url")
-ORIGIN_BRIDGE_INFO=$(get_chain_config "$ORIGIN_CHAIN" "bridge_info")
-
-DEST_CHAIN_ID=$(get_chain_config "$DEST_CHAIN" "chain_id")
-DEST_CHAIN_NAME=$(get_chain_config "$DEST_CHAIN" "name")
-DEST_RPC_URL=$(get_chain_config "$DEST_CHAIN" "rpc_url")
-DEST_USDC_ADDRESS=$(get_chain_config "$DEST_CHAIN" "usdc_address")
-DEST_EXPLORER_URL=$(get_chain_config "$DEST_CHAIN" "explorer_url")
-DEST_BRIDGE_INFO=$(get_chain_config "$DEST_CHAIN" "bridge_info")
-
-echo -e "${BLUE}🔧 Testnet USDC Setup ($ORIGIN_CHAIN_NAME → $DEST_CHAIN_NAME)${NC}"
-echo "======================================================="
-
-# Validate addresses first
-validate_addresses
-
-# Load environment variables from .env file
-load_env_file
-
-# Validate configuration
-validate_config
-
-# Account configuration
-DEPLOYMENT_KEY="$DEPLOYMENT_PRIVATE_KEY"
-DEPLOYER_ADDRESS=$(cast wallet address --private-key $DEPLOYMENT_KEY)
-
-# USDC Token addresses
-ORIGIN_TOKEN="$ORIGIN_USDC_ADDRESS"
-DEST_TOKEN="$DEST_USDC_ADDRESS"
-
-# Contract addresses
-ORIGIN_COMPACT_ADDRESS=""
-ORIGIN_PERMIT2_ADDRESS="0x000000000022D473030F116dDEE9F6B43aC78BA3"
-DEST_PERMIT2_ADDRESS="0x000000000022D473030F116dDEE9F6B43aC78BA3"
-OIF_PINNED_COMMIT="82f11e5"  # release-v0.1-rc.0: updates for release candidate
-
-echo
-echo -e "${GREEN}✅ Configuration validated${NC}"
-echo "  Origin Chain:      $ORIGIN_CHAIN_NAME (Chain ID: $ORIGIN_CHAIN_ID)"
-echo "  Destination Chain: $DEST_CHAIN_NAME (Chain ID: $DEST_CHAIN_ID)"
-echo "  Deployer Address:  $DEPLOYER_ADDRESS"
-echo "  Solver Address:    $SOLVER_ADDRESS"
-echo "  Asset:             USDC on both chains"
-echo "  Origin USDC:       $ORIGIN_USDC_ADDRESS"
-echo "  Destination USDC:  $DEST_USDC_ADDRESS"
-echo
-
-# Verify network connectivity
-echo -e "${YELLOW}1. Verifying network connectivity...${NC}"
-echo "  Debug: ORIGIN_RPC_URL = $ORIGIN_RPC_URL"
-echo "  Debug: DEST_RPC_URL = $DEST_RPC_URL"
-echo -n "  Testing $ORIGIN_CHAIN_NAME RPC... "
-
-# Test if cast command exists
-if ! command -v cast &> /dev/null; then
-    echo -e "${RED}Failed${NC}"
-    echo "Error: 'cast' command not found. Please install Foundry: https://getfoundry.sh/"
-    exit 1
-fi
-
-# Test the RPC connection with more verbose output
-if cast chain-id --rpc-url "$ORIGIN_RPC_URL" > /dev/null 2>&1; then
-    echo -e "${GREEN}✓${NC}"
-else
-    echo -e "${RED}Failed${NC}"
-    echo "Debug: Trying to connect to: $ORIGIN_RPC_URL"
-    echo "Debug: Cast command output:"
-    cast chain-id --rpc-url "$ORIGIN_RPC_URL" 2>&1 || true
-    echo "Please check your $ORIGIN_CHAIN_NAME RPC URL configuration"
-    exit 1
-fi
-
-echo -n "  Testing $DEST_CHAIN_NAME RPC... "
-if cast chain-id --rpc-url "$DEST_RPC_URL" > /dev/null 2>&1; then
-    echo -e "${GREEN}✓${NC}"
-else
-    echo -e "${RED}Failed${NC}"
-    echo "Please check your $DEST_CHAIN_NAME RPC URL configuration"
-    exit 1
-fi
-
-# Check deployer balances (ETH for gas + USDC for testing)
-echo -e "${YELLOW}2. Checking deployer balances...${NC}"
-DEPLOYER_ORIGIN_BALANCE=$(cast balance $DEPLOYER_ADDRESS --rpc-url "$ORIGIN_RPC_URL" --ether 2>/dev/null || echo "0")
-DEPLOYER_DEST_BALANCE=$(cast balance $DEPLOYER_ADDRESS --rpc-url "$DEST_RPC_URL" --ether 2>/dev/null || echo "0")
-
-# Check USDC balances
-DEPLOYER_ORIGIN_USDC=$(cast call $ORIGIN_USDC_ADDRESS "balanceOf(address)(uint256)" $DEPLOYER_ADDRESS --rpc-url "$ORIGIN_RPC_URL" 2>/dev/null | xargs -I {} cast --to-unit {} 6 2>/dev/null || echo "0")
-DEPLOYER_DEST_USDC=$(cast call $DEST_USDC_ADDRESS "balanceOf(address)(uint256)" $DEPLOYER_ADDRESS --rpc-url "$DEST_RPC_URL" 2>/dev/null | xargs -I {} cast --to-unit {} 6 2>/dev/null || echo "0")
-
-echo "  Deployer $ORIGIN_CHAIN_NAME ETH:     ${DEPLOYER_ORIGIN_BALANCE} ETH"
-echo "  Deployer $DEST_CHAIN_NAME ETH: ${DEPLOYER_DEST_BALANCE} ETH"
-echo "  Deployer $ORIGIN_CHAIN_NAME USDC:    ${DEPLOYER_ORIGIN_USDC} USDC"
-echo "  Deployer $DEST_CHAIN_NAME USDC: ${DEPLOYER_DEST_USDC} USDC"
-
-# Check solver balances
-echo -e "${YELLOW}3. Checking solver balances...${NC}"
-SOLVER_ORIGIN_BALANCE=$(cast balance $SOLVER_ADDRESS --rpc-url "$ORIGIN_RPC_URL" --ether 2>/dev/null || echo "0")
-SOLVER_DEST_BALANCE=$(cast balance $SOLVER_ADDRESS --rpc-url "$DEST_RPC_URL" --ether 2>/dev/null || echo "0")
-
-# Check solver USDC balances
-SOLVER_ORIGIN_USDC=$(cast call $ORIGIN_USDC_ADDRESS "balanceOf(address)(uint256)" $SOLVER_ADDRESS --rpc-url "$ORIGIN_RPC_URL" 2>/dev/null | xargs -I {} cast --to-unit {} 6 2>/dev/null || echo "0")
-SOLVER_DEST_USDC=$(cast call $DEST_USDC_ADDRESS "balanceOf(address)(uint256)" $SOLVER_ADDRESS --rpc-url "$DEST_RPC_URL" 2>/dev/null | xargs -I {} cast --to-unit {} 6 2>/dev/null || echo "0")
-
-echo "  Solver $ORIGIN_CHAIN_NAME ETH:       ${SOLVER_ORIGIN_BALANCE} ETH"
-echo "  Solver $DEST_CHAIN_NAME ETH:   ${SOLVER_DEST_BALANCE} ETH"
-echo "  Solver $ORIGIN_CHAIN_NAME USDC:      ${SOLVER_ORIGIN_USDC} USDC"
-echo "  Solver $DEST_CHAIN_NAME USDC:  ${SOLVER_DEST_USDC} USDC"
-
-# Check if solver has sufficient balances for operation
-MIN_SOLVER_USDC="1"  # Reduced from 10 to 1 since we're only sending 1 USDC
-if (( $(echo "$SOLVER_DEST_USDC < $MIN_SOLVER_USDC" | bc -l) )); then
-    echo -e "${YELLOW}⚠️  Solver needs USDC on $DEST_CHAIN_NAME to fulfill orders!${NC}"
-    echo "   Solver address: $SOLVER_ADDRESS"
-    echo "   Recommended: at least $MIN_SOLVER_USDC USDC for testing"
-    echo "   Send USDC to this address before starting the solver"
-    echo
-fi
-
-echo -e "${GREEN}✓${NC} Sufficient deployer balances for deployment"
-
-# Step 4: Deploy contracts
-echo
-echo -e "${YELLOW}4. Deploying contracts...${NC}"
-
-# Clone or update oif-contracts to specific commit
-if [ ! -d "oif-contracts" ]; then
-    echo -n "  Cloning oif-contracts... "
-    git clone https://github.com/openintentsframework/oif-contracts.git > /dev/null 2>&1
-    echo -e "${GREEN}✓${NC}"
-fi
-
-cd oif-contracts
-echo -n "  Checking out oif-contracts commit ${OIF_PINNED_COMMIT}... "
-git fetch origin > /dev/null 2>&1
-git checkout ${OIF_PINNED_COMMIT} > /dev/null 2>&1
-echo -e "${GREEN}✓${NC}"
-
-# Deploy contracts on origin chain using deployer key
-echo -e "${BLUE}=== $ORIGIN_CHAIN_NAME Deployments ===${NC}"
-
-# Deploy Oracle from actual contract
-echo -n "  Deploying AlwaysYesOracle... "
-ORACLE_OUTPUT=$(~/.foundry/bin/forge create test/mocks/AlwaysYesOracle.sol:AlwaysYesOracle \
-    --rpc-url "$ORIGIN_RPC_URL" \
-    --private-key $DEPLOYMENT_KEY \
-    --broadcast 2>&1)
-ORACLE=$(echo "$ORACLE_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
-if [ -z "$ORACLE" ]; then
-    echo -e "${RED}Failed to deploy oracle${NC}"
-    echo "Oracle output: $ORACLE_OUTPUT"
-    exit 1
-fi
-echo -e "${GREEN}✓${NC} $ORACLE"
-
-# Deploy InputSettlerEscrow
-echo -n "  Deploying InputSettlerEscrow... "
-INPUT_SETTLER_OUTPUT=$(~/.foundry/bin/forge create src/input/escrow/InputSettlerEscrow.sol:InputSettlerEscrow \
-    --rpc-url "$ORIGIN_RPC_URL" \
-    --private-key $DEPLOYMENT_KEY \
-    --broadcast 2>&1)
-INPUT_SETTLER=$(echo "$INPUT_SETTLER_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
-if [ -z "$INPUT_SETTLER" ]; then
-    echo -e "${RED}Failed to deploy InputSettler${NC}"
-    echo "InputSettler output: $INPUT_SETTLER_OUTPUT"
-    exit 1
-fi
-echo -e "${GREEN}✓${NC} $INPUT_SETTLER"
-
-# Deploy OutputSettler on destination chain using deployer key
-echo
-echo -e "${BLUE}=== $DEST_CHAIN_NAME Deployments ===${NC}"
-
-echo -n "  Deploying OutputSettler... "
-OUTPUT_SETTLER_OUTPUT=$(~/.foundry/bin/forge create src/output/simple/OutputSettlerSimple.sol:OutputSettlerSimple \
-    --rpc-url "$DEST_RPC_URL" \
-    --private-key $DEPLOYMENT_KEY \
-    --broadcast 2>&1)
-OUTPUT_SETTLER=$(echo "$OUTPUT_SETTLER_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
-if [ -z "$OUTPUT_SETTLER" ]; then
-    echo -e "${RED}Failed to deploy OutputSettler${NC}"
-    echo "OutputSettler output: $OUTPUT_SETTLER_OUTPUT"
-    exit 1
-fi
-echo -e "${GREEN}✓${NC} $OUTPUT_SETTLER"
-
-cd ..
-
-# Step 5: Create modular config files
-echo
-echo -e "${YELLOW}5. Creating modular config files...${NC}"
-
-mkdir -p config/testnet
-
-# Create main config file with includes
-cat > config/testnet.toml << EOF
-# OIF Solver Configuration - Testnet USDC Setup
+# Generate main config file
+generate_main_config() {
+    local origin_id="$1"
+    local dest_id="$2"
+    
+    cat > "$PROJECT_ROOT/config/testnet.toml" << EOF
+# OIF Solver Configuration - Generated by setup_testnet.sh
+# Origin Chain ID: $origin_id
+# Destination Chain ID: $dest_id
 
 include = [
     "testnet/networks.toml",
-    "testnet/api.toml"
+    "testnet/api.toml",
+    "testnet/gas.toml"
 ]
 
 [solver]
-id = "oif-solver-testnet-usdc"
-monitoring_timeout_minutes = 5
+id = "$(get_config ".solver_parameters.id" "oif-solver-testnet")"
+monitoring_timeout_minutes = $(get_config ".solver_parameters.monitoring_timeout_minutes" "5")
+min_profitability_pct = $(get_config ".solver_parameters.min_profitability_pct" "1.0")
 
 # ============================================================================
 # STORAGE
 # ============================================================================
 [storage]
-primary = "file"
-cleanup_interval_seconds = 3600
+primary = "$(get_config ".storage.primary" "file")"
+cleanup_interval_seconds = $(get_config ".solver_parameters.cleanup_interval_seconds" "3600")
 
 [storage.implementations.memory]
 # Memory storage has no configuration
 
 [storage.implementations.file]
-storage_path = "./data/storage"
-ttl_orders = 0                  # Permanent
-ttl_intents = 86400             # 24 hours
-ttl_order_by_tx_hash = 86400    # 24 hours
+storage_path = "$(get_config ".storage.file.storage_path" "./data/storage")"
+ttl_orders = $(get_config ".storage.file.ttl_orders" "0")
+ttl_intents = $(get_config ".storage.file.ttl_intents" "86400")
+ttl_order_by_tx_hash = $(get_config ".storage.file.ttl_order_by_tx_hash" "86400")
 
 # ============================================================================
 # ACCOUNT
@@ -473,16 +251,17 @@ ttl_order_by_tx_hash = 86400    # 24 hours
 primary = "local"
 
 [account.implementations.local]
-private_key = "$SOLVER_PRIVATE_KEY"
+private_key = "\${SOLVER_PRIVATE_KEY}"
 
 # ============================================================================
 # DELIVERY
 # ============================================================================
 [delivery]
-min_confirmations = 3  # Higher confirmations for testnets
+min_confirmations = $(get_config ".solver_parameters.min_confirmations" "3")
+transaction_poll_interval_seconds = 3
 
 [delivery.implementations.evm_alloy]
-network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]
+network_ids = [$origin_id, $dest_id]
 
 # ============================================================================
 # DISCOVERY
@@ -490,12 +269,13 @@ network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]
 [discovery]
 
 [discovery.implementations.onchain_eip7683]
-network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]
+network_ids = [$origin_id, $dest_id]
+polling_interval_secs = $(get_config ".discovery.onchain.polling_interval_secs" "0")
 
 [discovery.implementations.offchain_eip7683]
-api_host = "127.0.0.1"
-api_port = 8081
-network_ids = [$ORIGIN_CHAIN_ID]
+api_host = "$(get_config ".api.discovery_api.host" "127.0.0.1")"
+api_port = $(get_config ".api.discovery_api.port" "8081")
+network_ids = [$origin_id, $dest_id]
 
 # ============================================================================
 # ORDER
@@ -508,145 +288,438 @@ network_ids = [$ORIGIN_CHAIN_ID]
 primary = "simple"
 
 [order.strategy.implementations.simple]
-max_gas_price_gwei = 100
+max_gas_price_gwei = $(get_config ".solver_parameters.max_gas_price_gwei" "100")
+
+# ============================================================================
+# PRICING
+# ============================================================================
+[pricing]
+primary = "$(get_config ".pricing.primary" "coingecko")"
+
+[pricing.implementations.coingecko]
+cache_duration_seconds = $(get_config ".pricing.coingecko.cache_duration_seconds" "60")
+rate_limit_delay_ms = $(get_config ".pricing.coingecko.rate_limit_delay_ms" "1200")
 
 # ============================================================================
 # SETTLEMENT
 # ============================================================================
 [settlement]
+settlement_poll_interval_seconds = 3
 
 [settlement.domain]
-chain_id = 1
-address = "$INPUT_SETTLER"
+chain_id = $origin_id
+address = "${INPUT_SETTLER_ADDRESS_ORIGIN:-0x0000000000000000000000000000000000000000}"
 
-[settlement.implementations.eip7683]
-network_ids = [$ORIGIN_CHAIN_ID, $DEST_CHAIN_ID]
-oracle_addresses = { $ORIGIN_CHAIN_ID = "$ORACLE", $DEST_CHAIN_ID = "$ORACLE" }
-dispute_period_seconds = 60
+[settlement.implementations.direct]
+order = "$(get_config ".settlement.direct.order_type" "eipXXXX")"
+network_ids = [$origin_id, $dest_id]
+dispute_period_seconds = $(get_config ".settlement.direct.dispute_period_seconds" "60")
+oracle_selection_strategy = "$(get_config ".settlement.direct.oracle_selection_strategy" "First")"
 
+[settlement.implementations.direct.oracles]
+input = { $origin_id = ["${ORACLE_ADDRESS_ORIGIN:-0x0}"], $dest_id = ["${ORACLE_ADDRESS_DEST:-0x0}"] }
+output = { $origin_id = ["${ORACLE_ADDRESS_ORIGIN:-0x0}"], $dest_id = ["${ORACLE_ADDRESS_DEST:-0x0}"] }
 
-# ============================================================================
-# DEMO SCRIPT CONFIGURATION
-# The following sections are used by demo scripts (send_onchain_intent.sh, etc.)
-# and are NOT required by the solver itself. The solver only needs the
-# configurations above.
-# ============================================================================
-
-# Contract addresses for testing (used by demo scripts)
-[contracts.origin]
-USDC = "$ORIGIN_USDC_ADDRESS"
-permit2 = "$ORIGIN_PERMIT2_ADDRESS"
-
-[contracts.destination]
-USDC = "$DEST_USDC_ADDRESS"
-permit2 = "$DEST_PERMIT2_ADDRESS"
-
-# Test accounts (used by demo scripts)
-[accounts]
-solver = "$SOLVER_ADDRESS"
-user = "$USER_ADDRESS"
-user_private_key = "$USER_PRIVATE_KEY"
-recipient = "$DEST_RECIPIENT_ADDR"
+[settlement.implementations.direct.routes]
+# Bidirectional routes - both chains can send to each other
+$origin_id = [$dest_id]
+$dest_id = [$origin_id]
 EOF
 
-# Create networks.toml
-cat > config/testnet/networks.toml << EOF
-# Network Configuration - Testnet Setup
-# Defines all supported blockchain networks and their tokens
+    # Add configurations for all enabled settlement methods
+    append_enabled_settlements "$origin_id" "$dest_id"
+}
 
-[networks.$ORIGIN_CHAIN_ID]
-rpc_url = "$ORIGIN_RPC_URL"
-input_settler_address = "$INPUT_SETTLER"
-output_settler_address = "$OUTPUT_SETTLER"
+# Generate networks configuration
+generate_networks_config() {
+    local origin_id="$1"
+    local dest_id="$2"
+    local origin_rpc="$3"
+    local dest_rpc="$4"
+    
+    cat > "$PROJECT_ROOT/config/testnet/networks.toml" << EOF
+# Network Configuration - Generated by setup_testnet.sh
 
-[[networks.$ORIGIN_CHAIN_ID.tokens]]
-address = "$ORIGIN_USDC_ADDRESS"
+[networks.$origin_id]
+input_settler_address = "${INPUT_SETTLER_ADDRESS_ORIGIN:-0x0000000000000000000000000000000000000000}"
+output_settler_address = "${OUTPUT_SETTLER_ADDRESS_ORIGIN:-0x0000000000000000000000000000000000000000}"
+
+[[networks.$origin_id.rpc_urls]]
+http = "$origin_rpc"
+
+[[networks.$origin_id.tokens]]
+address = "$(get_chain_data "$ORIGIN_CHAIN" "usdc_address")"
 symbol = "USDC"
 decimals = 6
 
-[networks.$DEST_CHAIN_ID]
-rpc_url = "$DEST_RPC_URL"
-input_settler_address = "$INPUT_SETTLER"
-output_settler_address = "$OUTPUT_SETTLER"
+[networks.$dest_id]
+input_settler_address = "${INPUT_SETTLER_ADDRESS_DEST:-0x0000000000000000000000000000000000000000}"
+output_settler_address = "${OUTPUT_SETTLER_ADDRESS_DEST:-0x0000000000000000000000000000000000000000}"
 
-[[networks.$DEST_CHAIN_ID.tokens]]
-address = "$DEST_USDC_ADDRESS"
+[[networks.$dest_id.rpc_urls]]
+http = "$dest_rpc"
+
+[[networks.$dest_id.tokens]]
+address = "$(get_chain_data "$DEST_CHAIN" "usdc_address")"
 symbol = "USDC"
 decimals = 6
 EOF
+}
 
-# Create api.toml
-cat > config/testnet/api.toml << EOF
-# API Server Configuration - Testnet Setup
-# Configures the HTTP API for receiving off-chain intents
+# Generate API configuration
+generate_api_config() {
+    cat > "$PROJECT_ROOT/config/testnet/api.toml" << EOF
+# API Configuration - Generated by setup_testnet.sh
 
 [api]
-enabled = true
-host = "127.0.0.1"
-port = 3000
-timeout_seconds = 30
-max_request_size = 1048576  # 1MB
+enabled = $(get_config ".api.solver_api.enabled" "true")
+host = "$(get_config ".api.solver_api.host" "127.0.0.1")"
+port = $(get_config ".api.solver_api.port" "3000")
+timeout_seconds = $(get_config ".api.solver_api.timeout_seconds" "30")
+max_request_size = $(get_config ".api.solver_api.max_request_size" "1048576")
+
+[api.implementations]
+discovery = "offchain_eip7683"
+
+[api.auth]
+enabled = $(get_config ".api.auth.enabled" "false")
+jwt_secret = "\${JWT_SECRET:-$(get_config ".api.auth.jwt_secret_env" "DefaultSecret123")}"
+access_token_expiry_hours = $(get_config ".api.auth.access_token_expiry_hours" "1")
+refresh_token_expiry_hours = $(get_config ".api.auth.refresh_token_expiry_hours" "720")
+issuer = "$(get_config ".api.auth.issuer" "oif-solver-testnet")"
+
+[api.quote]
+validity_seconds = $(get_config ".api.quote.validity_seconds" "60")
 EOF
+}
 
-# Done!
-echo
-echo -e "${GREEN}✅ Setup complete!${NC}"
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo
-echo -e "${BLUE}🔗 Networks:${NC}"
-echo "  Origin:      $ORIGIN_CHAIN_NAME (Chain ID: $ORIGIN_CHAIN_ID)"
-echo "  Destination: $DEST_CHAIN_NAME (Chain ID: $DEST_CHAIN_ID)"
-echo
-echo -e "${BLUE}🌐 RPC Endpoints:${NC}"
-echo "  $ORIGIN_CHAIN_NAME:     $ORIGIN_RPC_URL"
-echo "  $DEST_CHAIN_NAME: $DEST_RPC_URL"
-echo
-echo -e "${BLUE}💎 Asset:${NC}"
-echo "  USDC on both chains"
-echo "  Origin USDC:      $ORIGIN_USDC_ADDRESS"
-echo "  Destination USDC: $DEST_USDC_ADDRESS"
-echo
-echo -e "${BLUE}📋 Contracts:${NC}"
-echo "  $ORIGIN_CHAIN_NAME:"
-echo "    InputSettler: $INPUT_SETTLER"
-echo "    Oracle:       $ORACLE"
-echo "    USDC Token:   $ORIGIN_USDC_ADDRESS"
-echo "  $DEST_CHAIN_NAME:"
-echo "    OutputSettler: $OUTPUT_SETTLER"
-echo "    USDC Token:    $DEST_USDC_ADDRESS"
-echo
-echo -e "${BLUE}👥 Addresses:${NC}"
-echo "  Deployer: $DEPLOYER_ADDRESS"
-echo "  Solver (Defined):  $SOLVER_ADDRESS"
-echo "  User (Defined):   $USER_ADDRESS"
-echo
-echo -e "${BLUE}💰 Current Balances:${NC}"
-echo "  Deployer $ORIGIN_CHAIN_NAME ETH:     ${DEPLOYER_ORIGIN_BALANCE} ETH"
-echo "  Deployer $DEST_CHAIN_NAME ETH: ${DEPLOYER_DEST_BALANCE} ETH"
-echo "  Deployer $ORIGIN_CHAIN_NAME USDC:    ${DEPLOYER_ORIGIN_USDC} USDC"
-echo "  Deployer $DEST_CHAIN_NAME USDC: ${DEPLOYER_DEST_USDC} USDC"
-echo "  Solver $ORIGIN_CHAIN_NAME ETH:       ${SOLVER_ORIGIN_BALANCE} ETH"
-echo "  Solver $DEST_CHAIN_NAME ETH:   ${SOLVER_DEST_BALANCE} ETH"
-echo "  Solver $ORIGIN_CHAIN_NAME USDC:      ${SOLVER_ORIGIN_USDC} USDC"
-echo "  Solver $DEST_CHAIN_NAME USDC:  ${SOLVER_DEST_USDC} USDC"
-echo
-echo -e "${BLUE}📋 Files Created:${NC}"
-echo "  Main Config:    config/testnet.toml"
-echo "  Networks:       config/testnet/networks.toml" 
-echo "  API:            config/testnet/api.toml"
-echo
+# Generate gas configuration
+generate_gas_config() {
+    cat > "$PROJECT_ROOT/config/testnet/gas.toml" << EOF
+# Gas Configuration - Generated by setup_testnet.sh
 
-echo -e "${YELLOW}To start the solver:${NC}"
-echo "  cargo run --bin solver-service -- --config config/testnet.toml"
-echo
+[gas]
 
-echo -e "${BLUE}💡 Next Steps:${NC}"
-echo "  1. Fund the solver address with USDC on $DEST_CHAIN_NAME:"
-echo "     Address: $SOLVER_ADDRESS"
-echo "     Recommended: at least $MIN_SOLVER_USDC USDC for testing"
-echo "  2. Ensure you have USDC on $ORIGIN_CHAIN_NAME for test transactions (need >1 USDC)"
-echo "  3. VERIFY the USDC token addresses on both chains"
-echo "     Check $ORIGIN_EXPLORER_URL and $DEST_EXPLORER_URL"
-echo "  4. Start the solver service"
-echo
-echo -e "${GREEN}🎉 Testnet setup completed!${NC}"
+[gas.flows.compact_resource_lock]
+open = $(get_config ".gas_estimates.compact_resource_lock.open" "0")
+fill = $(get_config ".gas_estimates.compact_resource_lock.fill" "77298")
+claim = $(get_config ".gas_estimates.compact_resource_lock.claim" "122793")
+
+[gas.flows.permit2_escrow]
+open = $(get_config ".gas_estimates.permit2_escrow.open" "146306")
+fill = $(get_config ".gas_estimates.permit2_escrow.fill" "77298")
+claim = $(get_config ".gas_estimates.permit2_escrow.claim" "60084")
+
+[gas.flows.eip3009_escrow]
+open = $(get_config ".gas_estimates.eip3009_escrow.open" "130254")
+fill = $(get_config ".gas_estimates.eip3009_escrow.fill" "77298")
+claim = $(get_config ".gas_estimates.eip3009_escrow.claim" "60084")
+EOF
+}
+
+# Append all enabled settlement configurations
+append_enabled_settlements() {
+    local origin_id="$1"
+    local dest_id="$2"
+    
+    # Iterate through all settlement implementations
+    local num_implementations=$(get_config ".settlement.implementations | length" "0")
+    
+    for ((i=0; i<$num_implementations; i++)); do
+        local enabled=$(get_config ".settlement.implementations[$i].enabled" "false")
+        local type=$(get_config ".settlement.implementations[$i].type" "unknown")
+        
+        if [ "$enabled" != "true" ]; then
+            continue
+        fi
+        
+        # Check if this implementation supports the chain pair
+        if is_route_supported "$i" "$ORIGIN_CHAIN" "$DEST_CHAIN"; then
+            echo "  Adding $type settlement configuration..."
+            append_settlement_config "$i" "$type" "$origin_id" "$dest_id"
+        fi
+    done
+}
+
+# Check if a specific implementation supports a route
+is_route_supported() {
+    local impl_index="$1"
+    local origin="$2"
+    local dest="$3"
+    
+    local origin_chain_id=$(get_chain_data "$origin" "chain_id")
+    local dest_chain_id=$(get_chain_data "$dest" "chain_id")
+    
+    # Check if both chains exist in this implementation
+    local origin_exists=$(jq -r --arg chain_id "$origin_chain_id" \
+        ".settlement.implementations[$impl_index].chains | to_entries[] | select(.value.chain_id == (\$chain_id | tonumber)) | .key" \
+        "$CONFIG_FILE" 2>/dev/null)
+    
+    local dest_exists=$(jq -r --arg chain_id "$dest_chain_id" \
+        ".settlement.implementations[$impl_index].chains | to_entries[] | select(.value.chain_id == (\$chain_id | tonumber)) | .key" \
+        "$CONFIG_FILE" 2>/dev/null)
+    
+    if [ -n "$origin_exists" ] && [ -n "$dest_exists" ]; then
+        # Check routes configuration
+        local all_to_all=$(get_config ".settlement.implementations[$impl_index].routes.all_to_all" "false")
+        
+        if [ "$all_to_all" = "true" ]; then
+            return 0
+        fi
+        
+        # Check specific pairs
+        local num_pairs=$(get_config ".settlement.implementations[$impl_index].routes.pairs | length" "0")
+        for ((j=0; j<$num_pairs; j++)); do
+            local pair_origin=$(get_config ".settlement.implementations[$impl_index].routes.pairs[$j][0]")
+            local pair_dest=$(get_config ".settlement.implementations[$impl_index].routes.pairs[$j][1]")
+            
+            if [ "$origin" = "$pair_origin" ] && [ "$dest" = "$pair_dest" ]; then
+                return 0
+            fi
+        done
+    fi
+    
+    return 1
+}
+
+
+# Append configuration for a specific settlement method
+append_settlement_config() {
+    local impl_index="$1"
+    local type="$2"
+    local origin_id="$3"
+    local dest_id="$4"
+    
+    # Handle each settlement type
+    case "$type" in
+        "hyperlane")
+            append_hyperlane_settlement "$impl_index" "$origin_id" "$dest_id"
+            ;;
+        "direct")
+            # Direct settlement is already added in the base config
+            echo "    Direct settlement already configured"
+            ;;
+        *)
+            echo "    Warning: Unknown settlement type '$type', skipping..."
+            ;;
+    esac
+}
+
+# Append Hyperlane settlement configuration
+append_hyperlane_settlement() {
+    local impl_index="$1"
+    local origin_id="$2"
+    local dest_id="$3"
+    
+    # Get oracle addresses from the generalized config
+    local origin_oracle=$(jq -r --arg chain_id "$origin_id" \
+        ".settlement.implementations[$impl_index].chains | to_entries[] | select(.value.chain_id == (\$chain_id | tonumber)) | .value.oracle" \
+        "$CONFIG_FILE")
+    
+    local dest_oracle=$(jq -r --arg chain_id "$dest_id" \
+        ".settlement.implementations[$impl_index].chains | to_entries[] | select(.value.chain_id == (\$chain_id | tonumber)) | .value.oracle" \
+        "$CONFIG_FILE")
+    
+    # Get Hyperlane-specific config
+    local origin_mailbox=$(jq -r --arg chain_id "$origin_id" \
+        ".settlement.implementations[$impl_index].chains | to_entries[] | select(.value.chain_id == (\$chain_id | tonumber)) | .value.mailbox" \
+        "$CONFIG_FILE")
+    
+    local dest_mailbox=$(jq -r --arg chain_id "$dest_id" \
+        ".settlement.implementations[$impl_index].chains | to_entries[] | select(.value.chain_id == (\$chain_id | tonumber)) | .value.mailbox" \
+        "$CONFIG_FILE")
+    
+    local origin_igp=$(jq -r --arg chain_id "$origin_id" \
+        ".settlement.implementations[$impl_index].chains | to_entries[] | select(.value.chain_id == (\$chain_id | tonumber)) | .value.igp" \
+        "$CONFIG_FILE")
+    
+    local dest_igp=$(jq -r --arg chain_id "$dest_id" \
+        ".settlement.implementations[$impl_index].chains | to_entries[] | select(.value.chain_id == (\$chain_id | tonumber)) | .value.igp" \
+        "$CONFIG_FILE")
+    
+    cat >> "$PROJECT_ROOT/config/testnet.toml" << EOF
+
+# ============================================================================
+# HYPERLANE SETTLEMENT
+# ============================================================================
+[settlement.implementations.hyperlane]
+order = "$(get_config ".settlement.implementations[$impl_index].order_type" "eip7683")"
+network_ids = [$origin_id, $dest_id]
+default_gas_limit = $(get_config ".settlement.implementations[$impl_index].parameters.default_gas_limit" "500000")
+message_timeout_seconds = $(get_config ".settlement.implementations[$impl_index].parameters.message_timeout_seconds" "600")
+finalization_required = $(get_config ".settlement.implementations[$impl_index].parameters.finalization_required" "true")
+
+[settlement.implementations.hyperlane.oracles]
+input = { $origin_id = ["$origin_oracle"], $dest_id = ["$dest_oracle"] }
+output = { $origin_id = ["$origin_oracle"], $dest_id = ["$dest_oracle"] }
+
+[settlement.implementations.hyperlane.routes]
+# Bidirectional routes - both chains can send to each other
+$origin_id = [$dest_id]
+$dest_id = [$origin_id]
+
+[settlement.implementations.hyperlane.mailboxes]
+$origin_id = "$origin_mailbox"
+$dest_id = "$dest_mailbox"
+
+[settlement.implementations.hyperlane.igp_addresses]
+$origin_id = "$origin_igp"
+$dest_id = "$dest_igp"
+EOF
+}
+
+# Show summary
+show_summary() {
+    local origin_id="$1"
+    local dest_id="$2"
+    local origin_name="$3"
+    local dest_name="$4"
+    
+    echo
+    echo -e "${GREEN}✅ Setup complete!${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo
+    
+    echo -e "${BLUE}🔗 Networks:${NC}"
+    echo "  Origin:      $origin_name (Chain ID: $origin_id)"
+    echo "  Destination: $dest_name (Chain ID: $dest_id)"
+    echo
+    
+    if [ "$DEPLOY_CONTRACTS" = true ] && [ "$DRY_RUN" = false ]; then
+        echo -e "${BLUE}📋 Deployed Contracts:${NC}"
+        echo "  Origin Chain:"
+        echo "    Oracle:        ${ORACLE_ADDRESS_ORIGIN:-Not deployed}"
+        echo "    InputSettler:  ${INPUT_SETTLER_ADDRESS_ORIGIN:-Not deployed}"
+        echo "    OutputSettler: ${OUTPUT_SETTLER_ADDRESS_ORIGIN:-Not deployed}"
+        echo "  Destination Chain:"
+        echo "    Oracle:        ${ORACLE_ADDRESS_DEST:-Not deployed}"
+        echo "    InputSettler:  ${INPUT_SETTLER_ADDRESS_DEST:-Not deployed}"
+        echo "    OutputSettler: ${OUTPUT_SETTLER_ADDRESS_DEST:-Not deployed}"
+        echo
+    fi
+    
+    echo -e "${BLUE}📋 Configuration Files:${NC}"
+    echo "  Main:     config/testnet.toml"
+    echo "  Networks: config/testnet/networks.toml"
+    echo "  API:      config/testnet/api.toml"
+    echo "  Gas:      config/testnet/gas.toml"
+    echo
+    
+    echo -e "${YELLOW}To start the solver:${NC}"
+    echo "  1. Ensure environment variables are loaded:"
+    echo "     source .env"
+    echo "  2. Run the solver:"
+    echo "     cargo run --bin solver -- --config config/testnet.toml"
+    echo
+    
+    # Show enabled settlement methods
+    local enabled_settlements=$(get_enabled_settlements "$ORIGIN_CHAIN" "$DEST_CHAIN")
+    if [ -n "$enabled_settlements" ]; then
+        echo -e "${BLUE}🔄 Enabled Settlement Methods:${NC}"
+        for method in $enabled_settlements; do
+            echo "  - $method"
+        done
+        echo
+    fi
+}
+
+# Main function
+main() {
+    echo -e "${BLUE}🔧 OIF Solver Testnet Setup (v2)${NC}"
+    echo "========================================"
+    echo
+    
+    # Parse arguments
+    parse_args "$@"
+    
+    # Validate required arguments
+    if [ -z "$ORIGIN_CHAIN" ] || [ -z "$DEST_CHAIN" ]; then
+        echo -e "${RED}❌ Missing required arguments${NC}"
+        echo "Usage: $0 --origin <chain> --dest <chain>"
+        echo "Use --help for more information"
+        exit 1
+    fi
+    
+    # Change to project root
+    cd "$PROJECT_ROOT"
+    
+    # Load environment and configuration
+    echo -e "${YELLOW}Loading configuration...${NC}"
+    if ! load_env_file; then
+        exit 1
+    fi
+    
+    if ! load_json_config "$CONFIG_FILE"; then
+        exit 1
+    fi
+    
+    if ! load_chains_config; then
+        exit 1
+    fi
+    
+    # Load configuration values
+    load_addresses
+    load_solver_params
+    load_infrastructure
+    
+    # Prepare private keys
+    prepare_private_keys
+    
+    # Validate setup
+    if ! validate_setup; then
+        exit 1
+    fi
+    
+    # Get chain configurations
+    ORIGIN_CHAIN_ID=$(get_chain_data "$ORIGIN_CHAIN" "chain_id")
+    ORIGIN_CHAIN_NAME=$(get_chain_data "$ORIGIN_CHAIN" "name")
+    ORIGIN_RPC_URL=$(get_chain_data "$ORIGIN_CHAIN" "rpc_url")
+    
+    DEST_CHAIN_ID=$(get_chain_data "$DEST_CHAIN" "chain_id")
+    DEST_CHAIN_NAME=$(get_chain_data "$DEST_CHAIN" "name")
+    DEST_RPC_URL=$(get_chain_data "$DEST_CHAIN" "rpc_url")
+    
+    echo
+    echo "  Origin:      $ORIGIN_CHAIN_NAME (ID: $ORIGIN_CHAIN_ID)"
+    echo "  Destination: $DEST_CHAIN_NAME (ID: $DEST_CHAIN_ID)"
+    echo
+    
+    # Validate RPC connections
+    echo -e "${YELLOW}Validating network connectivity...${NC}"
+    if ! validate_rpc_connection "$ORIGIN_RPC_URL" "$ORIGIN_CHAIN_NAME"; then
+        exit 1
+    fi
+    if ! validate_rpc_connection "$DEST_RPC_URL" "$DEST_CHAIN_NAME"; then
+        exit 1
+    fi
+    
+    # Get deployer address
+    DEPLOYER_ADDRESS=$(cast wallet address --private-key "$DEPLOYMENT_PRIVATE_KEY" 2>/dev/null)
+    echo
+    echo "  Deployer: $DEPLOYER_ADDRESS"
+    echo "  Solver:   $SOLVER_ADDRESS"
+    echo
+    
+    # Deploy contracts if enabled
+    if [ "$DEPLOY_CONTRACTS" = true ]; then
+        if [ "$DRY_RUN" = true ]; then
+            echo -e "${YELLOW}[DRY RUN] Would deploy contracts${NC}"
+        else
+            if ! deploy_all_contracts "$ORIGIN_RPC_URL" "$DEST_RPC_URL" "$DEPLOYMENT_PRIVATE_KEY"; then
+                echo -e "${RED}Contract deployment failed${NC}"
+                exit 1
+            fi
+        fi
+    else
+        echo -e "${YELLOW}Skipping contract deployment (--no-deploy)${NC}"
+    fi
+    
+    # Generate configuration files
+    generate_solver_configs "$ORIGIN_CHAIN_ID" "$DEST_CHAIN_ID" "$ORIGIN_RPC_URL" "$DEST_RPC_URL"
+    
+    # Show summary
+    show_summary "$ORIGIN_CHAIN_ID" "$DEST_CHAIN_ID" "$ORIGIN_CHAIN_NAME" "$DEST_CHAIN_NAME"
+}
+
+# Run main function
+main "$@"

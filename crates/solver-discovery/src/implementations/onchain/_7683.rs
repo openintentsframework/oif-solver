@@ -224,6 +224,9 @@ impl Eip7683Discovery {
 			));
 		}
 
+		// Get the ABI-encoded bytes
+		let abi_encoded_bytes = alloy_primitives::Bytes::from(order.abi_encode());
+
 		// Convert to the format expected by the order implementation
 		// The order implementation expects Eip7683OrderData with specific fields
 		let order_data = Eip7683OrderData {
@@ -250,7 +253,8 @@ impl Eip7683Discovery {
 					context: output.context.clone().into(),
 				})
 				.collect::<Vec<_>>(),
-			raw_order_data: Some(with_0x_prefix(&hex::encode(order.abi_encode()))),
+			// Use consistent hex encoding with 0x prefix
+			raw_order_data: Some(with_0x_prefix(&hex::encode(&abi_encoded_bytes))),
 			signature: None,
 			sponsor: None,
 			lock_type: Some(LockType::Permit2Escrow),
@@ -268,7 +272,9 @@ impl Eip7683Discovery {
 			data: serde_json::to_value(&order_data).map_err(|e| {
 				DiscoveryError::ParseError(format!("Failed to serialize order data: {}", e))
 			})?,
+			order_bytes: abi_encoded_bytes,
 			quote_id: None,
+			lock_type: LockType::Permit2Escrow.to_string(),
 		})
 	}
 

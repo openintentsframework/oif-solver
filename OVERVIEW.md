@@ -121,7 +121,7 @@ sequenceDiagram
     participant Strategy as Execution Strategy
     participant Implementation as Order Implementation
 
-    Core->>Order: validate_intent(intent)
+    Core->>Order: validate_and_create_order(order_bytes)
     Order->>Implementation: Parse & Validate
     Implementation->>Order: Return Order
     Core->>Order: should_execute(order)

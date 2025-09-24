@@ -52,7 +52,9 @@ use super::custody::{CustodyDecision, CustodyStrategy, EscrowKind, LockKind};
 use crate::apis::quote::permit2::{
 	build_permit2_batch_witness_digest, permit2_domain_address_from_config,
 };
+use crate::eip712::{compact, get_domain_separator};
 use solver_config::{Config, QuoteConfig};
+use solver_delivery::DeliveryService;
 use solver_settlement::{SettlementInterface, SettlementService};
 use solver_types::{
 	with_0x_prefix, GetQuoteRequest, InteropAddress, Quote, QuoteDetails, QuoteError, QuoteOrder,
@@ -66,6 +68,8 @@ pub struct QuoteGenerator {
 	custody_strategy: CustodyStrategy,
 	/// Reference to settlement service for implementation lookup.
 	settlement_service: Arc<SettlementService>,
+	/// Reference to delivery service for contract calls.
+	delivery_service: Arc<DeliveryService>,
 }
 
 impl QuoteGenerator {
@@ -73,10 +77,15 @@ impl QuoteGenerator {
 	///
 	/// # Arguments
 	/// * `settlement_service` - Service managing settlement implementations
-	pub fn new(settlement_service: Arc<SettlementService>) -> Self {
+	/// * `delivery_service` - Service for making contract calls
+	pub fn new(
+		settlement_service: Arc<SettlementService>,
+		delivery_service: Arc<DeliveryService>,
+	) -> Self {
 		Self {
 			custody_strategy: CustodyStrategy::new(),
 			settlement_service,
+			delivery_service,
 		}
 	}
 
@@ -111,7 +120,8 @@ impl QuoteGenerator {
 		let quote_id = Uuid::new_v4().to_string();
 		let order = match custody_decision {
 			CustodyDecision::ResourceLock { kind } => {
-				self.generate_resource_lock_order(request, config, kind)?
+				self.generate_resource_lock_order(request, config, kind)
+					.await?
 			},
 			CustodyDecision::Escrow { kind } => {
 				self.generate_escrow_order(request, config, kind)?
@@ -123,7 +133,7 @@ impl QuoteGenerator {
 		};
 		let eta = self.calculate_eta(&request.preference);
 		let lock_type = match custody_decision {
-			CustodyDecision::ResourceLock { .. } => "resource_lock".to_string(),
+			CustodyDecision::ResourceLock { .. } => "compact_resource_lock".to_string(),
 			CustodyDecision::Escrow { kind } => match kind {
 				EscrowKind::Permit2 => "permit2_escrow".to_string(),
 				EscrowKind::Erc3009 => "erc3009_escrow".to_string(),
@@ -142,7 +152,7 @@ impl QuoteGenerator {
 		})
 	}
 
-	fn generate_resource_lock_order(
+	async fn generate_resource_lock_order(
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
@@ -152,7 +162,7 @@ impl QuoteGenerator {
 		let (primary_type, message) = match lock_kind {
 			LockKind::TheCompact { params } => (
 				"CompactLock".to_string(),
-				self.build_compact_message(request, config, params)?,
+				self.build_compact_message(request, config, params).await?,
 			),
 		};
 		Ok(QuoteOrder {
@@ -253,20 +263,528 @@ impl QuoteGenerator {
 		})
 	}
 
-	fn build_compact_message(
+	async fn build_compact_message(
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
 		_params: &serde_json::Value,
 	) -> Result<serde_json::Value, QuoteError> {
+		use alloy_primitives::{hex, U256};
+		use solver_types::utils::bytes20_to_alloy_address;
+		use std::str::FromStr;
+
 		let validity_seconds = self.get_quote_validity_seconds(config);
-		Ok(serde_json::json!({
-			"user": request.user,
-			"inputs": request.available_inputs,
-			"outputs": request.requested_outputs,
-			"nonce": chrono::Utc::now().timestamp(),
-			"deadline": chrono::Utc::now().timestamp() + validity_seconds as i64
-		}))
+		let current_time = chrono::Utc::now().timestamp() as u64;
+		let expires = current_time + validity_seconds;
+		let nonce = chrono::Utc::now().timestamp_millis() as u64; // Use milliseconds timestamp as nonce for uniqueness (matching direct intent flow)
+
+		// Get user address
+		let user_address = request
+			.user
+			.ethereum_address()
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid user address: {}", e)))?;
+
+		// Get TheCompact domain address (arbiter)
+		let domain_address = self.get_lock_domain_address(
+			config,
+			&super::custody::LockKind::TheCompact {
+				params: serde_json::json!({}),
+			},
+		)?;
+		let _arbiter_address = domain_address
+			.ethereum_address()
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid domain address: {}", e)))?;
+
+		// Get input chain ID from first available input
+		let input_chain_id = request
+			.available_inputs
+			.first()
+			.ok_or_else(|| QuoteError::InvalidRequest("No available inputs".to_string()))?
+			.asset
+			.ethereum_chain_id()
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input chain ID: {}", e)))?;
+
+		// Get addresses from network configuration
+		let network = config.networks.get(&input_chain_id).ok_or_else(|| {
+			QuoteError::InvalidRequest(format!("Network {} not found in config", input_chain_id))
+		})?;
+
+		// Get settlement and selected oracle for input chain (similar to permit2 flow)
+		let (_input_settlement, input_selected_oracle) = self
+			.settlement_service
+			.get_any_settlement_for_chain(input_chain_id)
+			.ok_or_else(|| {
+				QuoteError::InvalidRequest(format!(
+					"No settlement available for input chain {}",
+					input_chain_id
+				))
+			})?;
+
+		// Convert inputs to the format expected by TheCompact
+		// For ResourceLock orders, we need to build the proper token IDs and amounts
+		let mut inputs_array = Vec::new();
+		for input in &request.available_inputs {
+			let token_address = input.asset.ethereum_address().map_err(|e| {
+				QuoteError::InvalidRequest(format!("Invalid input token address: {}", e))
+			})?;
+
+			// Generate allocator lock tag from address (0x00 + last 11 bytes of address)
+			// If allocator address is not configured, fall back to zeroed tag for tests/back-compat
+			let allocator_tag = if let Some(allocator_address) = network.allocator_address.as_ref()
+			{
+				let address_hex = hex::encode(&allocator_address.0);
+				format!("0x00{}", &address_hex[address_hex.len() - 22..])
+			} else {
+				// 12 bytes zero value prefixed with 0x
+				"0x000000000000000000000000".to_string()
+			};
+
+			// Build token ID by concatenating allocator tag (12 bytes) + token address (20 bytes)
+			let token_address_hex = hex::encode(token_address.0);
+			let token_id_hex = format!("{}{}", allocator_tag, token_address_hex);
+			let token_id = U256::from_str(&token_id_hex).map_err(|e| {
+				QuoteError::InvalidRequest(format!("Failed to create token ID: {}", e))
+			})?;
+
+			inputs_array.push(serde_json::json!([
+				token_id.to_string(),
+				input.amount.to_string()
+			]));
+		}
+
+		// Convert outputs to MandateOutput format
+		let mut outputs_array = Vec::new();
+		for output in &request.requested_outputs {
+			let output_token_address = output.asset.ethereum_address().map_err(|e| {
+				QuoteError::InvalidRequest(format!("Invalid output token address: {}", e))
+			})?;
+			let recipient_address = output.receiver.ethereum_address().map_err(|e| {
+				QuoteError::InvalidRequest(format!("Invalid recipient address: {}", e))
+			})?;
+			let output_chain_id = output.asset.ethereum_chain_id().map_err(|e| {
+				QuoteError::InvalidRequest(format!("Invalid output chain ID: {}", e))
+			})?;
+
+			// Get settlement and selected oracle for the output chain (like permit2 flow)
+			let (_output_settlement, output_selected_oracle) = self
+				.settlement_service
+				.get_any_settlement_for_chain(output_chain_id)
+				.ok_or_else(|| {
+					QuoteError::InvalidRequest(format!(
+						"No settlement available for output chain {}",
+						output_chain_id
+					))
+				})?;
+
+			// Get output settler from config (like permit2 flow)
+			let dest_net = config.networks.get(&output_chain_id).ok_or_else(|| {
+				QuoteError::InvalidRequest(format!(
+					"Destination chain {} missing from networks config",
+					output_chain_id
+				))
+			})?;
+			let output_settler = bytes20_to_alloy_address(&dest_net.output_settler_address.0)
+				.map_err(QuoteError::InvalidRequest)?;
+
+			// Convert oracle address (like permit2 flow)
+			let output_oracle =
+				bytes20_to_alloy_address(&output_selected_oracle.0).map_err(|e| {
+					QuoteError::InvalidRequest(format!("Invalid output oracle address: {}", e))
+				})?;
+
+			// Build MandateOutput with proper oracle and settler addresses
+			outputs_array.push(serde_json::json!({
+				"oracle": format!("0x000000000000000000000000{:040x}", output_oracle),
+				"settler": format!("0x000000000000000000000000{:040x}", output_settler),
+				"chainId": output_chain_id.to_string(),
+				"token": format!("0x000000000000000000000000{:040x}", output_token_address),
+				"amount": output.amount.to_string(),
+				"recipient": format!("0x000000000000000000000000{:040x}", recipient_address),
+				"call": output.calldata.as_ref().map(|cd| format!("0x{}", hex::encode(cd))).unwrap_or_else(|| "0x".to_string()),
+				"context": "0x" // Context is typically empty for standard flows
+			}));
+		}
+
+		// Use the selected oracle for input chain as the inputOracle (like permit2 flow)
+		let input_oracle = bytes20_to_alloy_address(&input_selected_oracle.0).map_err(|e| {
+			QuoteError::InvalidRequest(format!("Invalid input oracle address: {}", e))
+		})?;
+
+		// Build the EIP-712 message structure (like permit2 flow)
+		// The scripts will compute the digest from this data
+		let eip712_message = serde_json::json!({
+			"types": {
+				"EIP712Domain": [
+					{"name": "name", "type": "string"},
+					{"name": "version", "type": "string"},
+					{"name": "chainId", "type": "uint256"},
+					{"name": "verifyingContract", "type": "address"}
+				],
+				"BatchCompact": [
+					{"name": "arbiter", "type": "address"},
+					{"name": "sponsor", "type": "address"},
+					{"name": "nonce", "type": "uint256"},
+					{"name": "expires", "type": "uint256"},
+					{"name": "commitments", "type": "Lock[]"},
+					{"name": "mandate", "type": "Mandate"}
+				],
+				"Lock": [
+					{"name": "lockTag", "type": "bytes12"},
+					{"name": "token", "type": "address"},
+					{"name": "amount", "type": "uint256"}
+				],
+				"Mandate": [
+					{"name": "fillDeadline", "type": "uint32"},
+					{"name": "inputOracle", "type": "address"},
+					{"name": "outputs", "type": "MandateOutput[]"}
+				],
+				"MandateOutput": [
+					{"name": "oracle", "type": "bytes32"},
+					{"name": "settler", "type": "bytes32"},
+					{"name": "chainId", "type": "uint256"},
+					{"name": "token", "type": "bytes32"},
+					{"name": "amount", "type": "uint256"},
+					{"name": "recipient", "type": "bytes32"},
+					{"name": "call", "type": "bytes"},
+					{"name": "context", "type": "bytes"}
+				]
+			},
+			"domain": {
+				"name": "TheCompact",
+				"version": "1",
+				"chainId": input_chain_id.to_string(),
+				"verifyingContract": format!("0x{:040x}", alloy_primitives::Address::from_slice(&network.the_compact_address.as_ref().unwrap().0))
+			},
+			"primaryType": "BatchCompact",
+			"message": {
+				"arbiter": format!("0x{:040x}", alloy_primitives::Address::from_slice(&network.input_settler_compact_address.as_ref().unwrap_or(&network.input_settler_address).0)),
+				"sponsor": format!("0x{:040x}", user_address),
+				"nonce": nonce.to_string(),
+				"expires": expires.to_string(),
+				"commitments": inputs_array.iter().map(|input| {
+					let input_array = input.as_array().unwrap();
+					let token_id_str = input_array[0].as_str().unwrap();
+					let amount_str = input_array[1].as_str().unwrap();
+
+					// Extract allocator tag (first 12 bytes) and token address (last 20 bytes) from token ID
+					let token_id = U256::from_str(token_id_str).unwrap();
+					let token_id_bytes = token_id.to_be_bytes::<32>();
+					let lock_tag_hex = format!("0x{}", hex::encode(&token_id_bytes[0..12]));
+					let token_addr_hex = format!("0x{}", hex::encode(&token_id_bytes[12..32]));
+
+					serde_json::json!({
+						"lockTag": lock_tag_hex,
+						"token": token_addr_hex,
+						"amount": amount_str
+					})
+				}).collect::<Vec<_>>(),
+				"mandate": {
+					"fillDeadline": (current_time + validity_seconds).to_string(),
+					"inputOracle": format!("0x{:040x}", input_oracle),
+					"outputs": outputs_array
+				}
+			}
+		});
+
+		// Try to compute the digest the same way the tests/contracts expect
+		// If this fails, fall back to just providing the EIP-712 structure
+		let result_with_digest = match self
+			.try_compute_server_digest(&eip712_message, request, network, input_chain_id)
+			.await
+		{
+			Ok(digest) => {
+				tracing::debug!(
+					"Quote generation: Successfully computed BatchCompact digest: 0x{}",
+					alloy_primitives::hex::encode(digest)
+				);
+				// Return message with both EIP-712 structure and pre-computed digest (like permit2)
+				Ok(serde_json::json!({
+					"digest": with_0x_prefix(&alloy_primitives::hex::encode(digest)),
+					"eip712": eip712_message
+				}))
+			},
+			Err(e) => {
+				tracing::warn!("Quote generation: Failed to compute BatchCompact digest, falling back to EIP-712 only: {}", e);
+				// Return message in the same format as before (with eip712 field, scripts will compute digest)
+				Ok(serde_json::json!({
+					"eip712": eip712_message
+				}))
+			},
+		}?;
+
+		// Backward-compatible top-level fields expected by older tests/tools
+		let flat_message = serde_json::json!({
+			"user": format!("0x{:040x}", user_address),
+			"inputs": inputs_array,
+			"outputs": outputs_array,
+			"nonce": nonce.to_string(),
+			"deadline": expires.to_string()
+		});
+
+		// Merge flat fields with result (which contains eip712 and optional digest)
+		let mut merged = result_with_digest.as_object().cloned().unwrap_or_default();
+		if let Some(obj) = flat_message.as_object() {
+			for (k, v) in obj.iter() {
+				merged.entry(k.clone()).or_insert(v.clone());
+			}
+		}
+
+		Ok(serde_json::Value::Object(merged))
+	}
+
+	/// Try to compute the digest using the existing eip712/compact module
+	async fn try_compute_server_digest(
+		&self,
+		eip712_message: &serde_json::Value,
+		_request: &GetQuoteRequest,
+		network: &solver_types::NetworkConfig,
+		input_chain_id: u64,
+	) -> Result<[u8; 32], QuoteError> {
+		use alloy_primitives::{keccak256, Address as AlloyAddress, FixedBytes, Uint};
+		use alloy_sol_types::SolType;
+		use solver_types::standards::eip7683::interfaces::StandardOrder as OifStandardOrder;
+		use std::str::FromStr;
+
+		// Build a StandardOrder from the EIP-712 message to use with the compact module
+		let message = eip712_message.get("message").ok_or_else(|| {
+			QuoteError::InvalidRequest("Missing message in EIP-712 structure".to_string())
+		})?;
+
+		// Extract basic fields
+		let sponsor_str = message
+			.get("sponsor")
+			.and_then(|v| v.as_str())
+			.ok_or_else(|| QuoteError::InvalidRequest("Missing sponsor in message".to_string()))?;
+		let sponsor = AlloyAddress::from_str(&sponsor_str[2..])
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid sponsor address: {}", e)))?;
+
+		let nonce_str = message
+			.get("nonce")
+			.and_then(|v| v.as_str())
+			.ok_or_else(|| QuoteError::InvalidRequest("Missing nonce in message".to_string()))?;
+		let nonce = Uint::<256, 4>::from_str(nonce_str)
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid nonce: {}", e)))?;
+
+		let expires_str = message
+			.get("expires")
+			.and_then(|v| v.as_str())
+			.ok_or_else(|| QuoteError::InvalidRequest("Missing expires in message".to_string()))?;
+		let expires = u32::from_str(expires_str)
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid expires: {}", e)))?;
+
+		// Extract mandate fields
+		let mandate = message
+			.get("mandate")
+			.ok_or_else(|| QuoteError::InvalidRequest("Missing mandate in message".to_string()))?;
+		let fill_deadline_str = mandate
+			.get("fillDeadline")
+			.and_then(|v| v.as_str())
+			.ok_or_else(|| {
+				QuoteError::InvalidRequest("Missing fillDeadline in mandate".to_string())
+			})?;
+		let fill_deadline = u32::from_str(fill_deadline_str)
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid fillDeadline: {}", e)))?;
+
+		let input_oracle_str = mandate
+			.get("inputOracle")
+			.and_then(|v| v.as_str())
+			.ok_or_else(|| {
+				QuoteError::InvalidRequest("Missing inputOracle in mandate".to_string())
+			})?;
+		let input_oracle = AlloyAddress::from_str(&input_oracle_str[2..])
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid inputOracle: {}", e)))?;
+
+		// Extract inputs from commitments
+		let commitments = message
+			.get("commitments")
+			.and_then(|v| v.as_array())
+			.ok_or_else(|| {
+				QuoteError::InvalidRequest("Missing commitments in message".to_string())
+			})?;
+
+		let mut inputs = Vec::new();
+		for commitment in commitments {
+			let lock_tag_str = commitment
+				.get("lockTag")
+				.and_then(|v| v.as_str())
+				.ok_or_else(|| {
+					QuoteError::InvalidRequest("Missing lockTag in commitment".to_string())
+				})?;
+			let token_str = commitment
+				.get("token")
+				.and_then(|v| v.as_str())
+				.ok_or_else(|| {
+					QuoteError::InvalidRequest("Missing token in commitment".to_string())
+				})?;
+			let amount_str = commitment
+				.get("amount")
+				.and_then(|v| v.as_str())
+				.ok_or_else(|| {
+					QuoteError::InvalidRequest("Missing amount in commitment".to_string())
+				})?;
+
+			// Reconstruct token ID from lock_tag + token_address
+			let lock_tag_bytes = alloy_primitives::hex::decode(&lock_tag_str[2..])
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid lockTag hex: {}", e)))?;
+			let token_bytes = alloy_primitives::hex::decode(&token_str[2..])
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid token hex: {}", e)))?;
+
+			// Combine lock_tag (12 bytes) + token_address (20 bytes) to form token_id (32 bytes)
+			let mut token_id_bytes = [0u8; 32];
+			token_id_bytes[0..12].copy_from_slice(&lock_tag_bytes);
+			token_id_bytes[12..32].copy_from_slice(&token_bytes);
+			let token_id = Uint::<256, 4>::from_be_bytes(token_id_bytes);
+
+			let amount = Uint::<256, 4>::from_str(amount_str)
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {}", e)))?;
+
+			inputs.push([token_id, amount]);
+		}
+
+		// Extract outputs
+		let outputs_array = mandate
+			.get("outputs")
+			.and_then(|v| v.as_array())
+			.ok_or_else(|| QuoteError::InvalidRequest("Missing outputs in mandate".to_string()))?;
+
+		use solver_types::standards::eip7683::interfaces::SolMandateOutput as MandateOutput;
+		let mut outputs = Vec::new();
+		for output in outputs_array {
+			let oracle_str = output
+				.get("oracle")
+				.and_then(|v| v.as_str())
+				.ok_or_else(|| {
+					QuoteError::InvalidRequest("Missing oracle in output".to_string())
+				})?;
+			let oracle = FixedBytes::<32>::from_str(oracle_str)
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid oracle: {}", e)))?;
+
+			let settler_str = output
+				.get("settler")
+				.and_then(|v| v.as_str())
+				.ok_or_else(|| {
+					QuoteError::InvalidRequest("Missing settler in output".to_string())
+				})?;
+			let settler = FixedBytes::<32>::from_str(settler_str)
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid settler: {}", e)))?;
+
+			let chain_id_str = output
+				.get("chainId")
+				.and_then(|v| v.as_str())
+				.ok_or_else(|| {
+					QuoteError::InvalidRequest("Missing chainId in output".to_string())
+				})?;
+			let chain_id = Uint::<256, 4>::from_str(chain_id_str)
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chainId: {}", e)))?;
+
+			let token_str = output
+				.get("token")
+				.and_then(|v| v.as_str())
+				.ok_or_else(|| QuoteError::InvalidRequest("Missing token in output".to_string()))?;
+			let token = FixedBytes::<32>::from_str(token_str)
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid token: {}", e)))?;
+
+			let amount_str = output
+				.get("amount")
+				.and_then(|v| v.as_str())
+				.ok_or_else(|| {
+					QuoteError::InvalidRequest("Missing amount in output".to_string())
+				})?;
+			let amount = Uint::<256, 4>::from_str(amount_str)
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {}", e)))?;
+
+			let recipient_str = output
+				.get("recipient")
+				.and_then(|v| v.as_str())
+				.ok_or_else(|| {
+					QuoteError::InvalidRequest("Missing recipient in output".to_string())
+				})?;
+			let recipient = FixedBytes::<32>::from_str(recipient_str)
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid recipient: {}", e)))?;
+
+			let call_str = output.get("call").and_then(|v| v.as_str()).unwrap_or("0x");
+			let call = if call_str == "0x" {
+				alloy_primitives::Bytes::new()
+			} else {
+				alloy_primitives::Bytes::from(
+					alloy_primitives::hex::decode(&call_str[2..]).map_err(|e| {
+						QuoteError::InvalidRequest(format!("Invalid call data: {}", e))
+					})?,
+				)
+			};
+
+			let context_str = output
+				.get("context")
+				.and_then(|v| v.as_str())
+				.unwrap_or("0x");
+			let context = if context_str == "0x" {
+				alloy_primitives::Bytes::new()
+			} else {
+				alloy_primitives::Bytes::from(
+					alloy_primitives::hex::decode(&context_str[2..]).map_err(|e| {
+						QuoteError::InvalidRequest(format!("Invalid context data: {}", e))
+					})?,
+				)
+			};
+
+			outputs.push(MandateOutput {
+				oracle,
+				settler,
+				chainId: chain_id,
+				token,
+				amount,
+				recipient,
+				call,
+				context,
+			});
+		}
+
+		// Build the StandardOrder
+		let standard_order = OifStandardOrder {
+			user: sponsor,
+			nonce,
+			originChainId: Uint::<256, 4>::from(input_chain_id),
+			expires,
+			fillDeadline: fill_deadline,
+			inputOracle: input_oracle,
+			inputs,
+			outputs,
+		};
+
+		// Encode the order to use with the compact module
+		let order_bytes = OifStandardOrder::abi_encode(&standard_order);
+
+		// Use the same contract address logic as the signature validator
+		let contract_address = {
+			let addr = network
+				.input_settler_compact_address
+				.clone()
+				.unwrap_or_else(|| network.input_settler_address.clone());
+			AlloyAddress::from_slice(&addr.0)
+		};
+
+		// Use the existing compact module to compute the message hash
+		let struct_hash = compact::compute_batch_compact_hash(&order_bytes, contract_address)
+			.map_err(|e| {
+				QuoteError::InvalidRequest(format!("Failed to compute batch compact hash: {}", e))
+			})?;
+
+		// Get domain separator from TheCompact contract
+		let the_compact_address = network.the_compact_address.as_ref().ok_or_else(|| {
+			QuoteError::InvalidRequest("TheCompact address not configured".to_string())
+		})?;
+		let domain_separator =
+			get_domain_separator(&self.delivery_service, the_compact_address, input_chain_id)
+				.await
+				.map_err(|e| {
+					QuoteError::InvalidRequest(format!("Failed to get domain separator: {}", e))
+				})?;
+
+		// Compute final EIP-712 digest
+		let digest_data = [&[0x19, 0x01][..], &domain_separator[..], &struct_hash[..]].concat();
+		let final_digest = keccak256(&digest_data);
+
+		Ok(final_digest.into())
 	}
 
 	fn get_lock_domain_address(
@@ -352,6 +870,7 @@ mod tests {
 		ApiConfig, Config, ConfigBuilder, DomainConfig, QuoteConfig, SettlementConfig,
 	};
 	use solver_settlement::{MockSettlementInterface, SettlementInterface};
+	use solver_types::parse_address;
 	use solver_types::{
 		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
 		AvailableInput, QuotePreference, RequestedOutput, SignatureType,
@@ -382,6 +901,7 @@ mod tests {
 				chain_id: 1,
 				address: "0x1234567890123456789012345678901234567890".to_string(),
 			}),
+			settlement_poll_interval_seconds: 3,
 		};
 
 		// Build network configurations using builder pattern
@@ -472,13 +992,15 @@ mod tests {
 		let mut implementations: HashMap<String, Box<dyn SettlementInterface>> = HashMap::new();
 		implementations.insert("test".to_string(), Box::new(mock_settlement));
 
-		Arc::new(SettlementService::new(implementations))
+		Arc::new(SettlementService::new(implementations, 3))
 	}
 
 	#[tokio::test]
 	async fn test_generate_quotes_success() {
 		let settlement_service = create_test_settlement_service(true);
-		let generator = QuoteGenerator::new(settlement_service);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
 
@@ -505,7 +1027,9 @@ mod tests {
 	#[tokio::test]
 	async fn test_generate_quotes_no_oracles_configured() {
 		let settlement_service = create_test_settlement_service(false);
-		let generator = QuoteGenerator::new(settlement_service);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
 
@@ -518,7 +1042,9 @@ mod tests {
 	#[tokio::test]
 	async fn test_generate_quotes_insufficient_liquidity() {
 		let settlement_service = create_test_settlement_service(true);
-		let generator = QuoteGenerator::new(settlement_service);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 
 		// Create request with no available inputs
@@ -548,10 +1074,12 @@ mod tests {
 		assert!(matches!(result, Err(QuoteError::InsufficientLiquidity)));
 	}
 
-	#[test]
-	fn test_generate_resource_lock_order_the_compact() {
+	#[tokio::test]
+	async fn test_generate_resource_lock_order_the_compact() {
 		let settlement_service = create_test_settlement_service(true);
-		let generator = QuoteGenerator::new(settlement_service);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
 
@@ -559,7 +1087,9 @@ mod tests {
 			params: serde_json::json!({"test": "value"}),
 		};
 
-		let result = generator.generate_resource_lock_order(&request, &config, &lock_kind);
+		let result = generator
+			.generate_resource_lock_order(&request, &config, &lock_kind)
+			.await;
 
 		match result {
 			Ok(order) => {
@@ -577,7 +1107,9 @@ mod tests {
 	#[test]
 	fn test_generate_erc3009_order() {
 		let settlement_service = create_test_settlement_service(true);
-		let generator = QuoteGenerator::new(settlement_service);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
 
@@ -605,15 +1137,30 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn test_build_compact_message() {
+	#[tokio::test]
+	async fn test_build_compact_message() {
 		let settlement_service = create_test_settlement_service(true);
-		let generator = QuoteGenerator::new(settlement_service);
-		let config = create_test_config();
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let request = create_test_request();
 		let params = serde_json::json!({"test": "value"});
+		let mut config = create_test_config();
+		let bsc_network = NetworkConfigBuilder::new()
+			.input_settler_address(
+				parse_address("0x5555555555555555555555555555555555555555").unwrap(),
+			)
+			.output_settler_address(
+				parse_address("0x6666666666666666666666666666666666666666").unwrap(),
+			)
+			.allocator_address(parse_address("0x7777777777777777777777777777777777777777").unwrap())
+			.build();
 
-		let result = generator.build_compact_message(&request, &config, &params);
+		config.networks.insert(56, bsc_network);
+
+		let result = generator
+			.build_compact_message(&request, &config, &params)
+			.await;
 
 		assert!(result.is_ok());
 		let message = result.unwrap();
@@ -630,7 +1177,9 @@ mod tests {
 	#[test]
 	fn test_calculate_eta_with_preferences() {
 		let settlement_service = create_test_settlement_service(true);
-		let generator = QuoteGenerator::new(settlement_service);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 
 		// Test speed preference
 		let speed_eta = generator.calculate_eta(&Some(QuotePreference::Speed));
@@ -656,7 +1205,9 @@ mod tests {
 	#[test]
 	fn test_sort_quotes_by_preference_speed() {
 		let settlement_service = create_test_settlement_service(true);
-		let generator = QuoteGenerator::new(settlement_service);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 
 		let mut quotes = vec![
 			Quote {
@@ -711,7 +1262,9 @@ mod tests {
 	#[test]
 	fn test_sort_quotes_by_preference_other() {
 		let settlement_service = create_test_settlement_service(true);
-		let generator = QuoteGenerator::new(settlement_service);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 
 		let mut quotes = vec![
 			Quote {
@@ -765,7 +1318,9 @@ mod tests {
 	#[test]
 	fn test_get_quote_validity_seconds() {
 		let settlement_service = create_test_settlement_service(true);
-		let generator = QuoteGenerator::new(settlement_service);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 
 		// Test with configured validity
 		let config = create_test_config();
@@ -781,7 +1336,9 @@ mod tests {
 	#[test]
 	fn test_get_lock_domain_address_success() {
 		let settlement_service = create_test_settlement_service(true);
-		let generator = QuoteGenerator::new(settlement_service);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let lock_kind = LockKind::TheCompact {
 			params: serde_json::json!({}),
@@ -797,7 +1354,9 @@ mod tests {
 	#[test]
 	fn test_get_lock_domain_address_missing_config() {
 		let settlement_service = create_test_settlement_service(true);
-		let generator = QuoteGenerator::new(settlement_service);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let mut config = create_test_config();
 		config.settlement.domain = None;
 
@@ -812,7 +1371,9 @@ mod tests {
 	#[test]
 	fn test_get_escrow_address_success() {
 		let settlement_service = create_test_settlement_service(true);
-		let generator = QuoteGenerator::new(settlement_service);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 
 		let result = generator.get_escrow_address(&config);
@@ -822,7 +1383,9 @@ mod tests {
 	#[test]
 	fn test_get_escrow_address_missing_config() {
 		let settlement_service = create_test_settlement_service(true);
-		let generator = QuoteGenerator::new(settlement_service);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let mut config = create_test_config();
 		config.settlement.domain = None;
 
@@ -833,7 +1396,9 @@ mod tests {
 	#[test]
 	fn test_get_escrow_address_invalid_address() {
 		let settlement_service = create_test_settlement_service(true);
-		let generator = QuoteGenerator::new(settlement_service);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let mut config = create_test_config();
 		config.settlement.domain.as_mut().unwrap().address = "invalid_address".to_string();
 
@@ -844,7 +1409,9 @@ mod tests {
 	#[tokio::test]
 	async fn test_generate_quote_for_settlement_resource_lock() {
 		let settlement_service = create_test_settlement_service(true);
-		let generator = QuoteGenerator::new(settlement_service);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
 
@@ -877,7 +1444,9 @@ mod tests {
 	#[tokio::test]
 	async fn test_generate_quote_for_settlement_escrow() {
 		let settlement_service = create_test_settlement_service(true);
-		let generator = QuoteGenerator::new(settlement_service);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
 

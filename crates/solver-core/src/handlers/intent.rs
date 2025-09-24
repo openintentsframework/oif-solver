@@ -3,7 +3,10 @@
 //! Responsible for validating intents, creating orders, storing them,
 //! and determining execution strategy through the order service.
 
-use crate::engine::{context::ContextBuilder, event_bus::EventBus, token_manager::TokenManager};
+use crate::engine::{
+	context::ContextBuilder, cost_profit::CostProfitService, event_bus::EventBus,
+	token_manager::TokenManager,
+};
 use crate::state::OrderStateMachine;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
@@ -44,6 +47,7 @@ pub struct IntentHandler {
 	delivery: Arc<DeliveryService>,
 	solver_address: Address,
 	token_manager: Arc<TokenManager>,
+	cost_profit_service: Arc<CostProfitService>,
 	config: Config,
 }
 
@@ -57,6 +61,7 @@ impl IntentHandler {
 		delivery: Arc<DeliveryService>,
 		solver_address: Address,
 		token_manager: Arc<TokenManager>,
+		cost_profit_service: Arc<CostProfitService>,
 		config: Config,
 	) -> Self {
 		Self {
@@ -67,6 +72,7 @@ impl IntentHandler {
 			delivery,
 			solver_address,
 			token_manager,
+			cost_profit_service,
 			config,
 		}
 	}
@@ -95,27 +101,106 @@ impl IntentHandler {
 			return Ok(());
 		}
 
+		// Store intent immediately to prevent race conditions with duplicate discovery
+		// This claims the intent ID slot before we start the potentially slow validation process
+		self.storage
+			.store(StorageKey::Intents.as_str(), &intent.id, &intent, None)
+			.await
+			.map_err(|e| {
+				IntentError::Storage(format!("Failed to store intent for deduplication: {}", e))
+			})?;
+
 		tracing::info!("Discovered intent");
 
-		// Validate intent
+		// Use the order_bytes field directly from the intent
+		let order_bytes = &intent.order_bytes;
+
+		// For on-chain discovered intents, we use a simple callback that returns the intent ID
+		// since the order ID was already computed during discovery
+		let intent_id = intent.id.clone();
+		let order_id_callback: solver_types::OrderIdCallback =
+			Box::new(move |_chain_id, _tx_data| {
+				let id = intent_id.clone();
+				Box::pin(async move {
+					// Return the intent ID as bytes (it's already a hex string)
+					alloy_primitives::hex::decode(&id)
+						.map_err(|e| format!("Failed to decode intent ID: {}", e))
+				})
+			});
+
+		// Validate and create order using the unified method
+		let intent_data = Some(intent.data.clone());
 		match self
 			.order_service
-			.validate_intent(&intent, &self.solver_address)
+			.validate_and_create_order(
+				&intent.standard,
+				order_bytes,
+				&intent_data,
+				&intent.lock_type,
+				order_id_callback,
+				&self.solver_address,
+			)
 			.await
 		{
 			Ok(order) => {
+				// Calculate cost estimation and validate profitability
+				let cost_estimate = match self
+					.cost_profit_service
+					.estimate_cost_for_order(&order, &self.config)
+					.await
+				{
+					Ok(estimate) => {
+						tracing::info!(
+							"Cost estimate calculated: total={} {}",
+							estimate.total,
+							estimate.currency
+						);
+						estimate
+					},
+					Err(e) => {
+						tracing::warn!("Failed to calculate cost estimate: {}", e);
+						return Err(IntentError::Service(format!(
+							"Cost estimation failed: {}",
+							e
+						)));
+					},
+				};
+
+				// Validate profitability
+				match self
+					.cost_profit_service
+					.validate_profitability(
+						&order,
+						&cost_estimate,
+						self.config.solver.min_profitability_pct,
+					)
+					.await
+				{
+					Ok(actual_profit_margin) => {
+						tracing::info!(
+							"Order passed profitability validation: {:.2}% (min required: {:.2}%)",
+							actual_profit_margin,
+							self.config.solver.min_profitability_pct
+						);
+					},
+					Err(e) => {
+						tracing::warn!("Order failed profitability validation: {}", e);
+						self.event_bus
+							.publish(SolverEvent::Order(OrderEvent::Skipped {
+								order_id: order.id.clone(),
+								reason: format!("Insufficient profitability: {}", e),
+							}))
+							.ok();
+						return Ok(());
+					},
+				}
+
 				self.event_bus
 					.publish(SolverEvent::Discovery(DiscoveryEvent::IntentValidated {
 						intent_id: intent.id.clone(),
 						order: order.clone(),
 					}))
 					.ok();
-
-				// Store intent for deduplication
-				self.storage
-					.store(StorageKey::Intents.as_str(), &order.id, &intent, None)
-					.await
-					.map_err(|e| IntentError::Storage(e.to_string()))?;
 
 				// Store order
 				self.state_machine
