@@ -458,7 +458,7 @@ mod tests {
 			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 		);
 
-		Arc::new(DeliveryService::new(implementations, 1))
+		Arc::new(DeliveryService::new(implementations, 1, 20))
 	}
 
 	#[test]
@@ -479,7 +479,7 @@ mod tests {
 		let networks = create_test_networks_config();
 
 		// Create simple mocks without complex setup since is_supported doesn't use them
-		let mock_delivery = Arc::new(DeliveryService::new(HashMap::new(), 1));
+		let mock_delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
 		let mock_account = Arc::new(AccountService::new(Box::new(
 			solver_account::implementations::local::LocalWallet::new(
 				"0x1234567890123456789012345678901234567890123456789012345678901234",

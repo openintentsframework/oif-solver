@@ -658,7 +658,11 @@ mod tests {
 		let solver_address = Address(vec![1u8; 20]);
 
 		// Create delivery service - using empty implementations map for testing
-		let delivery = Arc::new(DeliveryService::new(std::collections::HashMap::new(), 1));
+		let delivery = Arc::new(DeliveryService::new(
+			std::collections::HashMap::new(),
+			1,
+			20,
+		));
 
 		// Create discovery service - using empty implementations map for testing
 		let discovery = Arc::new(DiscoveryService::new(std::collections::HashMap::new()));
@@ -674,7 +678,7 @@ mod tests {
 		));
 
 		// Create settlement service - using empty implementations map for testing
-		let settlement = Arc::new(SettlementService::new(std::collections::HashMap::new()));
+		let settlement = Arc::new(SettlementService::new(std::collections::HashMap::new(), 20));
 
 		// Create pricing service with mock implementation
 		let pricing_config = toml::Value::Table(toml::value::Table::new());

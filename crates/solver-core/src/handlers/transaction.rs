@@ -438,6 +438,7 @@ mod tests {
 				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 			)]),
 			1,
+			20,
 		));
 
 		// Create state machine with memory storage for testing
@@ -454,6 +455,10 @@ mod tests {
 			delivery,
 			storage,
 			state_machine,
+			Arc::new(solver_settlement::SettlementService::new(
+				HashMap::new(),
+				20,
+			)), // Add settlement service
 			event_bus,
 			30, // 30 minute timeout
 		);
@@ -761,13 +766,15 @@ mod tests {
 						Box::pin(async { Ok(serde_json::to_vec("test_order_123").unwrap()) })
 					});
 
-				// Mock get_bytes for order retrieval
+				// Mock get_bytes for order retrieval - called twice:
+				// 1. For settlement callback (line 130 in handle_confirmed)
+				// 2. For handle_post_fill_confirmed (line 284)
 				let order_key = format!("{}:test_order_123", StorageKey::Orders.as_str());
 				let order_bytes = serde_json::to_vec(&order).unwrap();
 				storage
 					.expect_get_bytes()
 					.with(eq(order_key))
-					.times(1)
+					.times(2) // Changed from times(1) to times(2)
 					.returning(move |_| {
 						let bytes = order_bytes.clone();
 						Box::pin(async move { Ok(bytes) })
@@ -843,13 +850,15 @@ mod tests {
 						Box::pin(async { Ok(serde_json::to_vec("test_order_123").unwrap()) })
 					});
 
-				// Mock get_bytes for order retrieval
+				// Mock get_bytes for order retrieval - called twice:
+				// 1. For settlement callback (line 130 in handle_confirmed)
+				// 2. For handle_post_fill_confirmed (line 284)
 				let order_key = format!("{}:test_order_123", StorageKey::Orders.as_str());
 				let order_bytes = serde_json::to_vec(&order).unwrap();
 				storage
 					.expect_get_bytes()
 					.with(eq(order_key))
-					.times(1)
+					.times(2) // Changed from times(1) to times(2)
 					.returning(move |_| {
 						let bytes = order_bytes.clone();
 						Box::pin(async move { Ok(bytes) })
@@ -906,6 +915,20 @@ mod tests {
 					.times(1)
 					.returning(|_| {
 						Box::pin(async { Ok(serde_json::to_vec("test_order_123").unwrap()) })
+					});
+
+				// Mock get_bytes for order retrieval for settlement callback
+				// (line 130 in handle_confirmed for PreClaim transactions)
+				let order = create_test_order(true);
+				let order_key = format!("{}:test_order_123", StorageKey::Orders.as_str());
+				let order_bytes = serde_json::to_vec(&order).unwrap();
+				storage
+					.expect_get_bytes()
+					.with(eq(order_key))
+					.times(1)
+					.returning(move |_| {
+						let bytes = order_bytes.clone();
+						Box::pin(async move { Ok(bytes) })
 					});
 			},
 			|_delivery| {}, // No delivery expectations needed

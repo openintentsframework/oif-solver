@@ -823,10 +823,10 @@ mod tests {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
 			HashMap::new();
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
@@ -871,10 +871,10 @@ mod tests {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
 			HashMap::new();
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
@@ -933,10 +933,10 @@ mod tests {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
 			HashMap::new();
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
@@ -959,10 +959,10 @@ mod tests {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
 			HashMap::new();
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
@@ -995,6 +995,8 @@ mod tests {
 						hash: TransactionHash(vec![0xaa; 32]),
 						block_number: 12345,
 						success: true,
+						block_timestamp: None,
+						logs: vec![],
 					})
 				})
 			});
@@ -1004,14 +1006,14 @@ mod tests {
 				1u64,
 				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 			)]);
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
 
 		let mock_storage = MockStorageInterface::new();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
@@ -1046,6 +1048,8 @@ mod tests {
 						hash: TransactionHash(vec![0xcc; 32]),
 						block_number: 12344,
 						success: true,
+						block_timestamp: None,
+						logs: vec![],
 					})
 				})
 			});
@@ -1055,14 +1059,14 @@ mod tests {
 				1u64, // Use chain 1 for pre-claim transaction
 				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 			)]);
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
 
 		let mock_storage = MockStorageInterface::new();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
@@ -1096,6 +1100,8 @@ mod tests {
 						hash: TransactionHash(vec![0xcc; 32]),
 						block_number: 12345,
 						success: true,
+						block_timestamp: None,
+						logs: vec![],
 					})
 				})
 			});
@@ -1105,14 +1111,14 @@ mod tests {
 				1u64,
 				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 			)]);
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
 
 		let mock_storage = MockStorageInterface::new();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
@@ -1144,6 +1150,8 @@ mod tests {
 						hash: TransactionHash(vec![0xaa; 32]),
 						block_number: 12345,
 						success: false,
+						block_timestamp: None,
+						logs: vec![],
 					})
 				})
 			});
@@ -1153,14 +1161,14 @@ mod tests {
 				1u64,
 				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 			)]);
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
 
 		let mock_storage = MockStorageInterface::new();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
@@ -1205,13 +1213,13 @@ mod tests {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
 			HashMap::new();
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
 
 		// Create empty settlement service - this will cause can_claim to return false,
 		// which should trigger spawn_settlement_monitor instead of publishing ClaimReady
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
 		let event_bus = EventBus::new(100);
 
 		// Subscribe to events
@@ -1267,10 +1275,10 @@ mod tests {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
 			HashMap::new();
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
 		let event_bus = EventBus::new(100);
 
 		// Subscribe to events

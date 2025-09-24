@@ -167,10 +167,13 @@ mod tests {
 		setup_storage(&mut mock_storage);
 
 		// Create services with configured mocks
-		let settlement = Arc::new(SettlementService::new(HashMap::from([(
-			"eip7683".to_string(),
-			Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
-		)])));
+		let settlement = Arc::new(SettlementService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]),
+			20,
+		));
 
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
@@ -184,7 +187,7 @@ mod tests {
 
 	#[test]
 	fn test_new_settlement_monitor() {
-		let settlement = Arc::new(SettlementService::new(HashMap::new()));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), 20));
 		let storage = Arc::new(StorageService::new(Box::new(
 			solver_storage::implementations::memory::MemoryStorage::new(),
 		)));

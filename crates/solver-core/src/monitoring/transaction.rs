@@ -153,6 +153,8 @@ mod tests {
 			hash: create_test_tx_hash(),
 			block_number: 12345,
 			success,
+			block_timestamp: None,
+			logs: vec![],
 		}
 	}
 
@@ -172,6 +174,7 @@ mod tests {
 				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 			)]),
 			1,
+			20,
 		));
 
 		let event_bus = EventBus::new(100);
@@ -184,7 +187,7 @@ mod tests {
 
 	#[test]
 	fn test_new_transaction_monitor() {
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
 		let event_bus = EventBus::new(100);
 		let timeout_minutes = 30;
 

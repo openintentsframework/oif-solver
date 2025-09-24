@@ -193,17 +193,13 @@ mod tests {
 	use solver_delivery::{DeliveryService, MockDeliveryInterface};
 	use solver_order::{MockOrderInterface, OrderService};
 	use solver_storage::{MockStorageInterface, StorageService};
-	use solver_types::utils::tests::builders::{IntentBuilder, OrderBuilder, TransactionBuilder};
+	use solver_types::utils::tests::builders::{OrderBuilder, TransactionBuilder};
 	use solver_types::{
-		ExecutionParams, Intent, Order, SolverEvent, Transaction, TransactionHash, TransactionType,
+		ExecutionParams, Order, SolverEvent, Transaction, TransactionHash, TransactionType,
 	};
 	use std::collections::HashMap;
 	use std::sync::Arc;
 	use tokio::sync::broadcast;
-
-	fn create_test_intent() -> Intent {
-		IntentBuilder::new().build()
-	}
 
 	fn create_test_order() -> Order {
 		OrderBuilder::new().build()
@@ -262,6 +258,7 @@ mod tests {
 				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 			)]),
 			1,
+			20,
 		));
 
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
@@ -276,7 +273,6 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_handle_preparation_with_prepare_transaction_success() {
-		let intent = create_test_intent();
 		let order = create_test_order();
 		let params = create_test_execution_params();
 		let prepare_tx = create_test_transaction();
@@ -330,7 +326,7 @@ mod tests {
 		.await;
 
 		let result = handler
-			.handle_preparation(intent, order.clone(), params.clone())
+			.handle_preparation("test_source".to_string(), order.clone(), params.clone())
 			.await;
 
 		assert!(result.is_ok());
@@ -359,7 +355,6 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_handle_preparation_without_prepare_transaction() {
-		let intent = create_test_intent();
 		let order = create_test_order();
 		let params = create_test_execution_params();
 
@@ -396,7 +391,7 @@ mod tests {
 		.await;
 
 		let result = handler
-			.handle_preparation(intent, order.clone(), params.clone())
+			.handle_preparation("test_source".to_string(), order.clone(), params.clone())
 			.await;
 
 		assert!(result.is_ok());
@@ -420,7 +415,6 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_handle_preparation_order_service_error() {
-		let intent = create_test_intent();
 		let order = create_test_order();
 		let params = create_test_execution_params();
 
@@ -442,7 +436,9 @@ mod tests {
 		)
 		.await;
 
-		let result = handler.handle_preparation(intent, order, params).await;
+		let result = handler
+			.handle_preparation("test_source".to_string(), order, params)
+			.await;
 
 		assert!(result.is_err());
 		match result.unwrap_err() {
@@ -453,7 +449,6 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_handle_preparation_delivery_error() {
-		let intent = create_test_intent();
 		let order = create_test_order();
 		let params = create_test_execution_params();
 		let prepare_tx = create_test_transaction();
@@ -481,7 +476,9 @@ mod tests {
 		)
 		.await;
 
-		let result = handler.handle_preparation(intent, order, params).await;
+		let result = handler
+			.handle_preparation("test_source".to_string(), order, params)
+			.await;
 
 		assert!(result.is_err());
 		match result.unwrap_err() {
@@ -492,7 +489,6 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_handle_preparation_storage_error() {
-		let intent = create_test_intent();
 		let order = create_test_order();
 		let params = create_test_execution_params();
 		let prepare_tx = create_test_transaction();
@@ -529,7 +525,9 @@ mod tests {
 		)
 		.await;
 
-		let result = handler.handle_preparation(intent, order, params).await;
+		let result = handler
+			.handle_preparation("test_source".to_string(), order, params)
+			.await;
 
 		assert!(result.is_err());
 		match result.unwrap_err() {

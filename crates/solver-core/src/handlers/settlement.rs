@@ -384,16 +384,20 @@ mod tests {
 
 		// Create services with configured mocks
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
-		let settlement = Arc::new(SettlementService::new(HashMap::from([(
-			"eip7683".to_string(),
-			Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
-		)])));
+		let settlement = Arc::new(SettlementService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]),
+			20,
+		));
 		let delivery = Arc::new(DeliveryService::new(
 			HashMap::from([(
 				137u64,
 				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 			)]),
 			1,
+			20,
 		));
 		let order_service = Arc::new(OrderService::new(
 			HashMap::from([(
@@ -636,7 +640,7 @@ mod tests {
 					.times(1)
 					.returning(|_| {
 						let mut order = create_test_order();
-						order.output_chain_ids = vec![]; // No output chains
+						order.output_chains = vec![]; // No output chains
 						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
 					});
 			},

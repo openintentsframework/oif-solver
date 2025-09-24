@@ -300,7 +300,7 @@ mod tests {
 			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 		);
 
-		Arc::new(DeliveryService::new(implementations, 1))
+		Arc::new(DeliveryService::new(implementations, 1, 20))
 	}
 
 	fn create_mock_account_service() -> Arc<solver_account::AccountService> {
@@ -609,7 +609,7 @@ mod tests {
 			Arc::new(mock_delivery_137) as Arc<dyn solver_delivery::DeliveryInterface>,
 		);
 
-		let delivery = Arc::new(DeliveryService::new(implementations, 1));
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 20));
 		let account = create_mock_account_service();
 		let networks = create_test_networks_config();
 		let token_manager = Arc::new(TokenManager::new(networks, delivery.clone(), account));

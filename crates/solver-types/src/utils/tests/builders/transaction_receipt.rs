@@ -65,6 +65,8 @@ impl TransactionReceiptBuilder {
 			hash: self.hash,
 			block_number: self.block_number,
 			success: self.success,
+			block_timestamp: None,
+			logs: vec![],
 		}
 	}
 }

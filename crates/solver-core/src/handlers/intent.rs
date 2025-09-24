@@ -378,7 +378,7 @@ mod tests {
 			Arc::new(mock_delivery_137) as Arc<dyn solver_delivery::DeliveryInterface>,
 		);
 
-		let delivery_service = Arc::new(DeliveryService::new(delivery_impls, 1));
+		let delivery_service = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
 
 		// Create tokens that match the test order data exactly
 		let input_token = solver_types::utils::tests::builders::TokenConfigBuilder::new()
@@ -452,9 +452,9 @@ mod tests {
 			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
 
 		mock_order_interface
-			.expect_validate_intent()
+			.expect_validate_and_create_order()
 			.times(1)
-			.returning(move |_, _| Box::pin(async move { Ok(create_test_order()) }));
+			.returning(move |_, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
 
 		mock_strategy
 			.expect_should_execute()
@@ -482,7 +482,7 @@ mod tests {
 		let event_bus = EventBus::new(100);
 
 		// Create mock delivery service and token manager
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(), // empty networks config
 			delivery.clone(),
@@ -533,7 +533,7 @@ mod tests {
 		));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let event_bus = EventBus::new(100);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(),
 			delivery.clone(),
@@ -576,9 +576,9 @@ mod tests {
 			.returning(|_| Box::pin(async move { Ok(false) }));
 
 		mock_order_interface
-			.expect_validate_intent()
+			.expect_validate_and_create_order()
 			.times(1)
-			.returning(|_, _| {
+			.returning(|_, _, _, _, _| {
 				Box::pin(async move {
 					Err(solver_order::OrderError::ValidationFailed(
 						"Invalid intent".to_string(),
@@ -586,8 +586,11 @@ mod tests {
 				})
 			});
 
-		// Should not store anything since validation failed
-		mock_storage.expect_set_bytes().times(0);
+		// Intent is always stored first for deduplication, even if validation fails later
+		mock_storage
+			.expect_set_bytes()
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
 
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let order_service = Arc::new(OrderService::new(
@@ -599,7 +602,7 @@ mod tests {
 		));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let event_bus = EventBus::new(100);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(),
 			delivery.clone(),
@@ -649,9 +652,9 @@ mod tests {
 			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
 
 		mock_order_interface
-			.expect_validate_intent()
+			.expect_validate_and_create_order()
 			.times(1)
-			.returning(move |_, _| Box::pin(async move { Ok(create_test_order()) }));
+			.returning(move |_, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
 
 		mock_strategy
 			.expect_should_execute()
@@ -670,7 +673,7 @@ mod tests {
 		));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let event_bus = EventBus::new(100);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(),
 			delivery.clone(),
@@ -720,9 +723,9 @@ mod tests {
 			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
 
 		mock_order_interface
-			.expect_validate_intent()
+			.expect_validate_and_create_order()
 			.times(1)
-			.returning(move |_, _| Box::pin(async move { Ok(create_test_order()) }));
+			.returning(move |_, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
 
 		mock_strategy
 			.expect_should_execute()
@@ -741,7 +744,7 @@ mod tests {
 		));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let event_bus = EventBus::new(100);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(),
 			delivery.clone(),
@@ -792,7 +795,7 @@ mod tests {
 		));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let event_bus = EventBus::new(100);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(),
 			delivery.clone(),
@@ -838,9 +841,9 @@ mod tests {
 			.expect_set_bytes()
 			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
 		mock_order_interface
-			.expect_validate_intent()
+			.expect_validate_and_create_order()
 			.times(1)
-			.returning(move |_, _| Box::pin(async move { Ok(create_test_order()) }));
+			.returning(move |_, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
 		mock_strategy.expect_should_execute().returning(|_, _| {
 			Box::pin(async move {
 				ExecutionDecision::Execute(ExecutionParams {
@@ -860,7 +863,7 @@ mod tests {
 		));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let event_bus = EventBus::new(100);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(),
 			delivery.clone(),
