@@ -3,6 +3,7 @@
 //! This implementation provides real-time asset prices from CoinGecko API.
 //! Supports ETH and other major cryptocurrencies against USD.
 
+use crate::{PricingFactory, PricingInterface, PricingRegistry};
 use alloy_primitives::utils::parse_ether;
 use async_trait::async_trait;
 use reqwest::{
@@ -13,8 +14,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use solver_types::utils::wei_string_to_eth_string;
 use solver_types::{
-	ConfigSchema, ImplementationRegistry, PricingError, PricingFactory, PricingInterface,
-	PricingRegistry, TradingPair, ValidationError,
+	ConfigSchema, ImplementationRegistry, PricingError, TradingPair, ValidationError,
 };
 use std::collections::HashMap;
 use std::sync::Arc;

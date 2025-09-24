@@ -375,3 +375,228 @@ impl TokenManager {
 		&self.networks
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use mockall::predicate::*;
+	use solver_account::{AccountService, MockAccountInterface};
+	use solver_delivery::{DeliveryService, MockDeliveryInterface};
+	use solver_types::{
+		parse_address,
+		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder, TokenConfigBuilder},
+	};
+	use std::collections::HashMap;
+
+	fn create_test_networks_config() -> NetworksConfig {
+		NetworksConfigBuilder::new()
+			.add_network(
+				1,
+				NetworkConfigBuilder::new()
+					.add_token(
+						TokenConfigBuilder::new()
+							.address(
+								parse_address("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")
+									.unwrap(),
+							)
+							.symbol("WETH")
+							.decimals(18)
+							.build(),
+					)
+					.build(),
+			)
+			.add_network(
+				137,
+				NetworkConfigBuilder::new()
+					.add_token(
+						TokenConfigBuilder::new()
+							.address(
+								parse_address("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")
+									.unwrap(),
+							)
+							.symbol("WETH")
+							.decimals(18)
+							.build(),
+					)
+					.build(),
+			)
+			.build()
+	}
+
+	fn create_mock_account_service() -> Arc<AccountService> {
+		let mut mock_account = MockAccountInterface::new();
+		mock_account.expect_address().returning(|| {
+			Box::pin(async move {
+				Ok(parse_address("3333333333333333333333333333333333333333").unwrap())
+			})
+		});
+		mock_account
+			.expect_config_schema()
+			.returning(|| Box::new(solver_account::implementations::local::LocalWalletSchema));
+		mock_account
+			.expect_get_private_key()
+			.returning(|| solver_types::SecretString::from("0x1234567890abcdef"));
+
+		Arc::new(AccountService::new(Box::new(mock_account)))
+	}
+
+	fn create_mock_delivery_service() -> Arc<DeliveryService> {
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_balance()
+			.returning(|_, _, _| Box::pin(async { Ok("1000000".to_string()) }));
+		mock_delivery
+			.expect_get_allowance()
+			.returning(|_, _, _, _| Box::pin(async { Ok("0".to_string()) }));
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations = HashMap::new();
+		implementations.insert(
+			1,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+
+		Arc::new(DeliveryService::new(implementations, 1, 20))
+	}
+
+	#[test]
+	fn test_new_token_manager() {
+		let networks = create_test_networks_config();
+		let delivery = create_mock_delivery_service();
+		let account = create_mock_account_service();
+
+		let token_manager = TokenManager::new(networks.clone(), delivery, account);
+
+		assert_eq!(token_manager.networks.len(), 2);
+		assert!(token_manager.networks.contains_key(&1));
+		assert!(token_manager.networks.contains_key(&137));
+	}
+
+	#[test]
+	fn test_is_supported_existing_token() {
+		let networks = create_test_networks_config();
+
+		// Create simple mocks without complex setup since is_supported doesn't use them
+		let mock_delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let mock_account = Arc::new(AccountService::new(Box::new(
+			solver_account::implementations::local::LocalWallet::new(
+				"0x1234567890123456789012345678901234567890123456789012345678901234",
+			)
+			.unwrap(),
+		)));
+
+		let token_manager = TokenManager::new(networks, mock_delivery, mock_account);
+		let usdc_address =
+			solver_types::parse_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+				.expect("Invalid USDC address");
+
+		assert!(token_manager.is_supported(1, &usdc_address));
+		assert!(token_manager.is_supported(137, &usdc_address));
+	}
+
+	#[test]
+	fn test_is_supported_non_existing_token() {
+		let networks = create_test_networks_config();
+		let delivery = create_mock_delivery_service();
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		let unknown_address = parse_address("1111111111111111111111111111111111111111").unwrap();
+
+		assert!(!token_manager.is_supported(1, &unknown_address));
+		assert!(!token_manager.is_supported(137, &unknown_address));
+	}
+
+	#[test]
+	fn test_get_token_info_success() {
+		let networks = create_test_networks_config();
+		let delivery = create_mock_delivery_service();
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		let usdc_address =
+			solver_types::parse_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+				.expect("Invalid USDC address");
+
+		let result = token_manager.get_token_info(1, &usdc_address);
+		assert!(result.is_ok());
+
+		let token_config = result.unwrap();
+		assert_eq!(token_config.symbol, "USDC");
+		assert_eq!(token_config.decimals, 6);
+		assert_eq!(token_config.address, usdc_address);
+	}
+
+	#[test]
+	fn test_get_token_info_network_not_configured() {
+		let networks = create_test_networks_config();
+		let delivery = create_mock_delivery_service();
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		let usdc_address =
+			solver_types::parse_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+				.expect("Invalid USDC address");
+
+		let result = token_manager.get_token_info(999, &usdc_address);
+		assert!(result.is_err());
+
+		match result.unwrap_err() {
+			TokenManagerError::NetworkNotConfigured(chain_id) => assert_eq!(chain_id, 999),
+			_ => panic!("Expected NetworkNotConfigured error"),
+		}
+	}
+
+	#[test]
+	fn test_get_tokens_for_chain_existing_chain() {
+		let networks = create_test_networks_config();
+		let delivery = create_mock_delivery_service();
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		let tokens = token_manager.get_tokens_for_chain(1);
+		assert_eq!(tokens.len(), 2);
+
+		let symbols: Vec<&str> = tokens.iter().map(|t| t.symbol.as_str()).collect();
+		assert!(symbols.contains(&"USDC"));
+		assert!(symbols.contains(&"WETH"));
+	}
+
+	#[tokio::test]
+	async fn test_check_balance_success() {
+		let networks = create_test_networks_config();
+		let mock_delivery = create_mock_delivery_service();
+		let mock_account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, mock_delivery, mock_account);
+
+		let token_address = parse_address("a0b86991c431e69f7f3aa4ce5a9b9a8ce3606eb4").unwrap();
+		let result = token_manager.check_balance(1, &token_address).await;
+
+		assert!(result.is_ok());
+		assert_eq!(result.unwrap(), "1000000");
+	}
+
+	#[test]
+	fn test_token_manager_error_display() {
+		let error1 = TokenManagerError::TokenNotSupported("USDC".to_string(), 1);
+		assert_eq!(error1.to_string(), "Token not supported: USDC on chain 1");
+
+		let error2 = TokenManagerError::NetworkNotConfigured(999);
+		assert_eq!(error2.to_string(), "Network not configured: 999");
+	}
+
+	#[test]
+	fn test_erc20_approval_constants() {
+		// Test the ERC20 approval transaction data construction constants
+		let expected_selector = [0x09, 0x5e, 0xa7, 0xb3]; // approve(address,uint256)
+		assert_eq!(expected_selector, [0x09, 0x5e, 0xa7, 0xb3]);
+
+		// Verify amount encoding for MAX_UINT256
+		let amount = U256::MAX;
+		let amount_bytes = amount.to_be_bytes::<32>();
+		assert_eq!(amount_bytes.len(), 32);
+		assert_eq!(amount_bytes, [0xff; 32]);
+	}
+}

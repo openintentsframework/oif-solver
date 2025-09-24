@@ -41,7 +41,7 @@ impl ConfigBuilder {
 		Self {
 			solver_id: "test-solver".to_string(),
 			monitoring_timeout_minutes: 1,
-			min_profitability_pct: Decimal::ZERO,
+			min_profitability_pct: Decimal::from(1),
 			storage_primary: "memory".to_string(),
 			storage_cleanup_interval_seconds: 60,
 			min_confirmations: 1,
