@@ -737,15 +737,15 @@ quote_accept() {
         print_debug "Signature type: $signature_type, Primary type: $primary_type"
         local signature=""
 
-        if [ "$signature_type" = "erc3009" ]; then
-            print_info "Signing ERC-3009 order..."
+        if [ "$signature_type" = "eip3009" ]; then
+            print_info "Signing EIP-3009 order..."
 
             # Check if this is a multi-signature order (new format)
             local signatures_array=$(echo "$full_message" | jq -r '.signatures // empty')
 
             if [ -n "$signatures_array" ] && [ "$signatures_array" != "null" ] && [ "$signatures_array" != "empty" ]; then
                 # Handle multiple signatures (new format from quote generator)
-                print_info "Processing multiple ERC-3009 signatures..."
+                print_info "Processing multiple EIP-3009 signatures..."
 
                 local signature_count=$(echo "$signatures_array" | jq '. | length')
                 print_debug "Number of signatures required: $signature_count"
@@ -803,23 +803,23 @@ quote_accept() {
                         fi
                     fi
 
-                    # Sign this individual ERC-3009 authorization
+                    # Sign this individual EIP-3009 authorization
                     if [ -n "$domain_separator" ] && [ "$domain_separator" != "empty" ]; then
                         # Use new function with computed domain separator
-                        local individual_signature=$(sign_erc3009_authorization_with_domain \
+                        local individual_signature=$(sign_eip3009_authorization_with_domain \
                             "$user_key" "$origin_chain_id" "$token_contract" \
                             "$from_address" "$to_address" "$value" \
                             "$valid_after" "$valid_before" "$nonce" "$domain_separator")
                     else
                         # Fallback to old function that queries the contract
-                        local individual_signature=$(sign_erc3009_authorization \
+                        local individual_signature=$(sign_eip3009_authorization \
                             "$user_key" "$origin_chain_id" "$token_contract" \
                             "$from_address" "$to_address" "$value" \
                             "$valid_after" "$valid_before" "$nonce")
                     fi
 
                     if [ -z "$individual_signature" ]; then
-                        print_error "Failed to sign ERC-3009 order $((i+1))"
+                        print_error "Failed to sign EIP-3009 order $((i+1))"
                         return 1
                     fi
 
@@ -833,15 +833,15 @@ quote_accept() {
                     i=$((i+1))
                 done
 
-                # Encode the signatures array and add ERC-3009 prefix
+                # Encode the signatures array and add EIP-3009 prefix
                 local encoded_signatures=$(cast abi-encode "f(bytes[])" "[$signatures_bytes_array]")
                 signature=$(create_prefixed_signature "$encoded_signatures" "eip3009")
 
-                print_success "Multiple ERC-3009 orders signed successfully ($signature_count signatures)"
+                print_success "Multiple EIP-3009 orders signed successfully ($signature_count signatures)"
 
             else
                 # Handle single signature (backwards compatibility)
-                print_info "Processing single ERC-3009 signature..."
+                print_info "Processing single EIP-3009 signature..."
 
                 # Check if domain is the new structured format (object) or old UII format (string)
                 local domain_data=$(echo "$order_data" | jq -r '.domain // empty')
@@ -863,7 +863,7 @@ quote_accept() {
                     token_contract=$(echo "$uii_parsed" | cut -d' ' -f2)
                 fi
 
-                # Extract ERC-3009 fields directly from message
+                # Extract EIP-3009 fields directly from message
                 local from_address=$(echo "$full_message" | jq -r '.from // empty')
                 local to_address=$(echo "$full_message" | jq -r '.to // empty')
                 local value=$(echo "$full_message" | jq -r '.value // empty')
@@ -871,12 +871,12 @@ quote_accept() {
                 local valid_before=$(echo "$full_message" | jq -r '.validBefore // 0')
                 local nonce=$(echo "$full_message" | jq -r '.nonce // empty')
 
-                print_debug "ERC-3009 params: chain_id=$origin_chain_id, token=$token_contract"
-                print_debug "ERC-3009 params: from=$from_address, to=$to_address, value=$value, nonce=$nonce"
+                print_debug "EIP-3009 params: chain_id=$origin_chain_id, token=$token_contract"
+                print_debug "EIP-3009 params: from=$from_address, to=$to_address, value=$value, nonce=$nonce"
 
-                # For ERC-3009, we need to calculate the correct orderIdentifier from the contract
+                # For EIP-3009, we need to calculate the correct orderIdentifier from the contract
                 # because the quote nonce is temporary. Use same approach as working direct intent.
-                print_debug "Computing orderIdentifier from contract for ERC-3009 nonce (same method as direct intent)..."
+                print_debug "Computing orderIdentifier from contract for EIP-3009 nonce (same method as direct intent)..."
 
                 # Get RPC URL for the chain
                 local rpc_url="http://localhost:8545"
@@ -901,7 +901,7 @@ quote_accept() {
                 # Build input tokens array: [[token, amount]]
                 local input_tokens="[[$token_contract,$value]]"
 
-                # Build outputs array (empty for ERC-3009 order ID calculation)
+                # Build outputs array (empty for EIP-3009 order ID calculation)
                 local outputs_array="[]"
 
                 # Build StandardOrder struct (same format as intents script)
@@ -931,7 +931,7 @@ quote_accept() {
                     contract_nonce=$(echo "$cast_output" | grep -o "0x[0-9a-fA-F]\{64\}" | head -1)
                 fi
 
-                # For ERC-3009 quotes, use the original quote nonce (order_identifier)
+                # For EIP-3009 quotes, use the original quote nonce (order_identifier)
                 # The quote was generated with a specific order_identifier that was calculated by the solver
                 local final_nonce="$nonce"
 
@@ -956,30 +956,30 @@ quote_accept() {
                     fi
                 fi
 
-                # Sign ERC-3009 authorization with the correct nonce
+                # Sign EIP-3009 authorization with the correct nonce
                 if [ -n "$domain_separator" ] && [ "$domain_separator" != "empty" ]; then
                     # Use new function with computed domain separator
-                    signature=$(sign_erc3009_authorization_with_domain \
+                    signature=$(sign_eip3009_authorization_with_domain \
                         "$user_key" "$origin_chain_id" "$token_contract" \
                         "$from_address" "$to_address" "$value" \
                         "$valid_after" "$valid_before" "$final_nonce" "$domain_separator")
                 else
                     # Fallback to old function that queries the contract
-                    signature=$(sign_erc3009_authorization \
+                    signature=$(sign_eip3009_authorization \
                         "$user_key" "$origin_chain_id" "$token_contract" \
                         "$from_address" "$to_address" "$value" \
                         "$valid_after" "$valid_before" "$final_nonce")
                 fi
 
                 if [ -z "$signature" ]; then
-                    print_error "Failed to sign ERC-3009 order"
+                    print_error "Failed to sign EIP-3009 order"
                     return 1
                 fi
 
-                # Add ERC-3009 prefix to signature (like in intent flow)
+                # Add EIP-3009 prefix to signature (like in intent flow)
                 signature=$(create_prefixed_signature "$signature" "eip3009")
 
-                print_success "ERC-3009 order signed successfully"
+                print_success "EIP-3009 order signed successfully"
             fi
             
         elif [ "$signature_type" = "eip712" ]; then

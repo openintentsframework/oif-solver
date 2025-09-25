@@ -512,8 +512,8 @@ sign_eip3009_order() {
     echo "$signature"
 }
 
-# Generate ERC-3009 authorization signature with pre-computed domain separator
-sign_erc3009_authorization_with_domain() {
+# Generate EIP-3009 authorization signature with pre-computed domain separator
+sign_eip3009_authorization_with_domain() {
     local user_private_key="$1"
     local origin_chain_id="$2"
     local token_contract="$3"
@@ -525,7 +525,7 @@ sign_erc3009_authorization_with_domain() {
     local nonce="$9"
     local domain_separator="${10}"  # Pre-computed domain separator
     
-    print_debug "Signing ERC-3009 authorization with pre-computed domain separator" >&2
+    print_debug "Signing EIP-3009 authorization with pre-computed domain separator" >&2
     print_debug "Token: $token_contract" >&2
     print_debug "From: $from_address, To: $to_address" >&2
     print_debug "Value: $value, Nonce: $nonce" >&2
@@ -553,24 +553,24 @@ sign_erc3009_authorization_with_domain() {
     
     local struct_hash=$(cast_keccak "$struct_encoded")
     
-    print_debug "ERC-3009 struct hash: $struct_hash" >&2
+    print_debug "EIP-3009 struct hash: $struct_hash" >&2
     
     # Create EIP-712 digest
     local digest_prefix="0x1901"
     local digest="${digest_prefix}${domain_separator#0x}${struct_hash#0x}"
     local final_digest=$(cast_keccak "$digest")
     
-    print_debug "ERC-3009 final digest: $final_digest" >&2
+    print_debug "EIP-3009 final digest: $final_digest" >&2
     
     # Sign the digest using --no-hash flag for EIP-712 signatures
     local signature=$(cast wallet sign --no-hash --private-key "$user_private_key" "$final_digest")
     
     if [ -z "$signature" ]; then
-        print_error "Failed to generate ERC-3009 authorization signature" >&2
+        print_error "Failed to generate EIP-3009 authorization signature" >&2
         return 1
     fi
     
-    print_success "ERC-3009 authorization signature generated" >&2
+    print_success "EIP-3009 authorization signature generated" >&2
     echo "$signature"
 }
 
@@ -1042,7 +1042,7 @@ export -f compute_token_permissions_hash
 export -f sign_permit2_order
 export -f sign_compact_order
 export -f sign_eip3009_order
-export -f sign_erc3009_authorization_with_domain
+export -f sign_eip3009_authorization_with_domain
 export -f sign_personal_message
 export -f verify_signature
 export -f create_prefixed_signature

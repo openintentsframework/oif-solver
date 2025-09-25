@@ -16,7 +16,7 @@
 //! ## Quote Structure
 //!
 //! Each generated quote contains:
-//! - **Orders**: Signature requirements (EIP-712, ERC-3009, etc.)
+//! - **Orders**: Signature requirements (EIP-712, EIP-3009, etc.)
 //! - **Details**: Input/output specifications
 //! - **Validity**: Expiry times and execution windows
 //! - **ETA**: Estimated completion time based on chain characteristics
@@ -38,7 +38,7 @@
 //!
 //! ### Escrow Orders
 //! - Permit2 batch witness transfers
-//! - ERC-3009 authorization transfers
+//! - EIP-3009 authorization transfers
 //!
 //! ## Optimization Strategies
 //!
@@ -133,7 +133,7 @@ impl QuoteGenerator {
 			CustodyDecision::ResourceLock { .. } => "compact_resource_lock".to_string(),
 			CustodyDecision::Escrow { kind } => match kind {
 				EscrowKind::Permit2 => "permit2_escrow".to_string(),
-				EscrowKind::Erc3009 => "eip3009_escrow".to_string(),
+				EscrowKind::Eip3009 => "eip3009_escrow".to_string(),
 			},
 		};
 		let validity_seconds = self.get_quote_validity_seconds(config);
@@ -205,8 +205,8 @@ impl QuoteGenerator {
 				self.generate_permit2_order(request, config, settlement, selected_oracle)
 					.await
 			},
-			EscrowKind::Erc3009 => {
-				self.generate_erc3009_order(request, config, settlement, selected_oracle)
+			EscrowKind::Eip3009 => {
+				self.generate_eip3009_order(request, config, settlement, selected_oracle)
 					.await
 			},
 		}
@@ -241,7 +241,7 @@ impl QuoteGenerator {
 		})
 	}
 
-	async fn generate_erc3009_order(
+	async fn generate_eip3009_order(
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
@@ -266,7 +266,7 @@ impl QuoteGenerator {
 		let fill_deadline = chrono::Utc::now().timestamp() as u32 + validity_seconds as u32;
 
 		// Calculate the correct orderIdentifier using the contract (same method as intents script)
-		let (nonce_u64, order_identifier) = self.compute_erc3009_order_identifier(
+		let (nonce_u64, order_identifier) = self.compute_eip3009_order_identifier(
 			request,
 			config,
 			&selected_oracle,
@@ -281,10 +281,10 @@ impl QuoteGenerator {
 
 		// Build structured domain object for EIP-3009 token
 		let domain_object = self
-			.build_erc3009_domain_object(&token_address, input_chain_id)
+			.build_eip3009_domain_object(&token_address, input_chain_id)
 			.await?;
 
-		// For ERC-3009, we need to generate signature templates for each input
+		// For EIP-3009, we need to generate signature templates for each input
 		// since the contract expects one signature per input
 		let mut signatures_array = Vec::new();
 		for input in &request.available_inputs {
@@ -312,17 +312,17 @@ impl QuoteGenerator {
 		};
 
 		Ok(QuoteOrder {
-			signature_type: SignatureType::Erc3009,
+			signature_type: SignatureType::Eip3009,
 			domain: domain_object, // Use structured domain object for EIP-3009
 			primary_type: "ReceiveWithAuthorization".to_string(),
 			message,
 		})
 	}
 
-	/// Compute the orderIdentifier for an ERC-3009 order by building a StandardOrder
+	/// Compute the orderIdentifier for an EIP-3009 order by building a StandardOrder
 	/// and calling the contract's orderIdentifier function - same as the intents script
 	/// Returns (nonce, order_identifier)
-	fn compute_erc3009_order_identifier(
+	fn compute_eip3009_order_identifier(
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
@@ -499,7 +499,7 @@ impl QuoteGenerator {
 		tracing::debug!("Successfully extracted clean order ID: {}", order_id);
 
 		// Debug log the original StandardOrder structure used for quote generation
-		tracing::info!("=== ERC-3009 QUOTE GENERATION DEBUG ===");
+		tracing::info!("=== EIP-3009 QUOTE GENERATION DEBUG ===");
 		tracing::info!("Original StandardOrder for order_identifier calculation:");
 		tracing::info!("  order_struct: {}", order_struct);
 		tracing::info!("  nonce (microseconds): {}", nonce);
@@ -778,7 +778,7 @@ impl QuoteGenerator {
 	}
 
 	/// Build structured domain object for EIP-3009 token
-	async fn build_erc3009_domain_object(
+	async fn build_eip3009_domain_object(
 		&self,
 		token_address: &[u8; 20],
 		chain_id: u64,
@@ -1502,7 +1502,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_generate_erc3009_order() {
+	async fn test_generate_eip3009_order() {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
@@ -1517,12 +1517,12 @@ mod tests {
 		let request = create_test_request();
 
 		let result = generator
-			.generate_erc3009_order(&request, &config, settlement, selected_oracle)
+			.generate_eip3009_order(&request, &config, settlement, selected_oracle)
 			.await;
 
 		match result {
 			Ok(order) => {
-				assert_eq!(order.signature_type, SignatureType::Erc3009);
+				assert_eq!(order.signature_type, SignatureType::Eip3009);
 				assert_eq!(order.primary_type, "ReceiveWithAuthorization");
 				assert!(order.message.is_object());
 
@@ -1826,7 +1826,7 @@ mod tests {
 		let request = create_test_request();
 
 		let custody_decision = CustodyDecision::Escrow {
-			kind: EscrowKind::Erc3009,
+			kind: EscrowKind::Eip3009,
 		};
 
 		let result = generator
@@ -1840,7 +1840,7 @@ mod tests {
 				assert!(quote.valid_until.is_some());
 				assert!(quote.eta.is_some());
 				assert_eq!(quote.orders.len(), 1);
-				assert_eq!(quote.orders[0].signature_type, SignatureType::Erc3009);
+				assert_eq!(quote.orders[0].signature_type, SignatureType::Eip3009);
 			},
 			Err(e) => {
 				// Expected due to missing settlement service setup or invalid request

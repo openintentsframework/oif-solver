@@ -73,7 +73,7 @@ impl FromStr for LockType {
 		match s {
 			// String representations
 			"permit2_escrow" => Ok(LockType::Permit2Escrow),
-			"eip3009_escrow" | "erc3009_escrow" => Ok(LockType::Eip3009Escrow), // Accept both variants for compatibility
+			"eip3009_escrow" | "eip3009_escrow" => Ok(LockType::Eip3009Escrow), // Accept both variants for compatibility
 			"compact_resource_lock" => Ok(LockType::ResourceLock),
 			// Numeric string representations
 			"1" => Ok(LockType::Permit2Escrow),
@@ -379,9 +379,9 @@ impl TryFrom<&Quote> for interfaces::StandardOrder {
 
 		// Handle different order types based on signature type
 		match quote_order.signature_type {
-			crate::SignatureType::Erc3009 => {
-				// Handle ERC-3009 orders directly without looking for eip712 object
-				Self::handle_erc3009_quote_conversion(quote)
+			crate::SignatureType::Eip3009 => {
+				// Handle EIP-3009 orders directly without looking for eip712 object
+				Self::handle_eip3009_quote_conversion(quote)
 			},
 			crate::SignatureType::Eip712 => {
 				// Extract and validate EIP-712 data from quote to detect order type
@@ -580,13 +580,13 @@ impl interfaces::StandardOrder {
 		})
 	}
 
-	/// Handle ERC-3009 order conversion
-	fn handle_erc3009_quote_conversion(quote: &Quote) -> Result<Self, Box<dyn std::error::Error>> {
+	/// Handle EIP-3009 order conversion
+	fn handle_eip3009_quote_conversion(quote: &Quote) -> Result<Self, Box<dyn std::error::Error>> {
 		use crate::standards::eip7930::InteropAddress;
 		use alloy_primitives::{Address, U256};
 		use interfaces::SolMandateOutput;
 
-		// Extract message data from ERC-3009 order
+		// Extract message data from EIP-3009 order
 		let quote_order = quote
 			.orders
 			.first()
@@ -594,7 +594,7 @@ impl interfaces::StandardOrder {
 		let message_root = quote_order
 			.message
 			.as_object()
-			.ok_or("Invalid ERC-3009 message structure")?;
+			.ok_or("Invalid EIP-3009 message structure")?;
 
 		// Check if this is the new nested structure (with domain and message fields)
 		let message_data = if message_root.contains_key("message") {
@@ -602,7 +602,7 @@ impl interfaces::StandardOrder {
 			message_root
 				.get("message")
 				.and_then(|m| m.as_object())
-				.ok_or("Missing nested 'message' field in ERC-3009 structure")?
+				.ok_or("Missing nested 'message' field in EIP-3009 structure")?
 		} else {
 			// Old structure: use the root object directly (backwards compatibility)
 			message_root
@@ -612,10 +612,10 @@ impl interfaces::StandardOrder {
 		let from_str = message_data
 			.get("from")
 			.and_then(|f| f.as_str())
-			.ok_or("Missing 'from' field in ERC-3009 message")?;
+			.ok_or("Missing 'from' field in EIP-3009 message")?;
 		let user_address = Address::from_slice(&hex::decode(from_str.trim_start_matches("0x"))?);
 
-		// For ERC-3009, the nonce from the message is temporary
+		// For EIP-3009, the nonce from the message is temporary
 		// The real nonce should be the orderIdentifier calculated from the final StandardOrder
 		// We'll calculate this after building the StandardOrder structure
 
@@ -638,11 +638,11 @@ impl interfaces::StandardOrder {
 		let expires = valid_before;
 		let fill_deadline = valid_before;
 
-		// For ERC-3009 orders, extract inputOracle from the message
+		// For EIP-3009 orders, extract inputOracle from the message
 		let input_oracle_str = message_data
 			.get("inputOracle")
 			.and_then(|o| o.as_str())
-			.ok_or("Missing 'inputOracle' in ERC-3009 message")?;
+			.ok_or("Missing 'inputOracle' in EIP-3009 message")?;
 		let input_oracle =
 			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
 
@@ -693,7 +693,7 @@ impl interfaces::StandardOrder {
 			settler_bytes32[12..32].copy_from_slice(&output_settler_bytes);
 
 			sol_outputs.push(SolMandateOutput {
-				oracle: [0u8; 32].into(),        // Zero oracle for ERC-3009
+				oracle: [0u8; 32].into(),        // Zero oracle for EIP-3009
 				settler: settler_bytes32.into(), // Use correct output settler
 				chainId: U256::from(chain_id),
 				token: token_bytes.into(),
@@ -704,13 +704,13 @@ impl interfaces::StandardOrder {
 			});
 		}
 
-		// For ERC-3009, use the realNonce (original microseconds) for StandardOrder construction
+		// For EIP-3009, use the realNonce (original microseconds) for StandardOrder construction
 		// The 'nonce' field contains the order_identifier used for signature, 'realNonce' contains the actual nonce
 		let nonce_str = message_data
 			.get("realNonce")
 			.and_then(|n| n.as_str())
 			.or_else(|| message_data.get("nonce").and_then(|n| n.as_str())) // Fallback for compatibility
-			.ok_or("Missing 'realNonce' or 'nonce' field in ERC-3009 message")?;
+			.ok_or("Missing 'realNonce' or 'nonce' field in EIP-3009 message")?;
 		let nonce = U256::from_str_radix(nonce_str.trim_start_matches("0x"), 16)
 			.map_err(|e| format!("Invalid nonce format: {}", e))?;
 
@@ -725,8 +725,8 @@ impl interfaces::StandardOrder {
 			outputs: sol_outputs,
 		};
 
-		// Debug log the reconstructed StandardOrder for ERC-3009
-		tracing::info!("=== ERC-3009 QUOTE CONVERSION DEBUG ===");
+		// Debug log the reconstructed StandardOrder for EIP-3009
+		tracing::info!("=== EIP-3009 QUOTE CONVERSION DEBUG ===");
 		tracing::info!("Reconstructed StandardOrder:");
 		tracing::info!("  user: {:?}", standard_order.user);
 		tracing::info!("  nonce: {:#x}", standard_order.nonce);
