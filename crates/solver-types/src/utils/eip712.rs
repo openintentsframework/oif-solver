@@ -105,29 +105,42 @@ pub fn ecrecover_user_from_signature(
 	}
 
 	// Handle different signature formats
-	tracing::info!("Signature length: {} bytes, first 4 bytes: 0x{}", 
-		sig_bytes.len(), 
+	tracing::info!(
+		"Signature length: {} bytes, first 4 bytes: 0x{}",
+		sig_bytes.len(),
 		hex::encode(&sig_bytes[..4.min(sig_bytes.len())])
 	);
-	
+
 	let (r, s, v) = if sig_bytes.len() == 66 {
 		// 66-byte format: [type][r][s][v] where type=1 byte
-		let v = if sig_bytes[65] >= 27 { sig_bytes[65] - 27 } else { sig_bytes[65] };
+		let v = if sig_bytes[65] >= 27 {
+			sig_bytes[65] - 27
+		} else {
+			sig_bytes[65]
+		};
 		let r: [u8; 32] = sig_bytes[1..33].try_into()?;
 		let s: [u8; 32] = sig_bytes[33..65].try_into()?;
 		(r, s, v)
 	} else if sig_bytes.len() == 65 {
 		// Standard 65-byte format: [r][s][v]
-		let v = if sig_bytes[64] >= 27 { sig_bytes[64] - 27 } else { sig_bytes[64] };
+		let v = if sig_bytes[64] >= 27 {
+			sig_bytes[64] - 27
+		} else {
+			sig_bytes[64]
+		};
 		let r: [u8; 32] = sig_bytes[0..32].try_into()?;
 		let s: [u8; 32] = sig_bytes[32..64].try_into()?;
 		(r, s, v)
 	} else {
 		return Err(format!("Unsupported signature length: {} bytes", sig_bytes.len()).into());
 	};
-	
-	tracing::info!("Parsed signature - r: 0x{}, s: 0x{}, v: {}", 
-		hex::encode(&r), hex::encode(&s), v);
+
+	tracing::info!(
+		"Parsed signature - r: 0x{}, s: 0x{}, v: {}",
+		hex::encode(&r),
+		hex::encode(&s),
+		v
+	);
 
 	let sig = PrimitiveSignature::from_scalars_and_parity(B256::from(r), B256::from(s), v != 0);
 

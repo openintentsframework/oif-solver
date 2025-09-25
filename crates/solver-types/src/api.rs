@@ -769,21 +769,25 @@ impl PostOrderRequest {
 
 		// 1. Reconstruct the EIP-712 digest based on order type
 		let digest = Self::reconstruct_digest_for_order_type(quote)?;
-		
+
 		// 2. Recover the real user address from the signature
-		let recovered_user = crate::utils::eip712::ecrecover_user_from_signature(&digest, signature)?;
+		let recovered_user =
+			crate::utils::eip712::ecrecover_user_from_signature(&digest, signature)?;
 		tracing::info!("Recovered user address from signature: {}", recovered_user);
-		
+
 		// 3. Clone quote to make it mutable and inject recovered user
 		let mut quote_clone = quote.clone();
 		if let OifOrder::OifEscrowV0 { payload } = &mut quote_clone.order {
 			if let Some(message_obj) = payload.message.as_object_mut() {
-				message_obj.insert("user".to_string(), serde_json::Value::String(recovered_user.to_string())); // workaround because StandardOrder::try_from does not handle the user field
+				message_obj.insert(
+					"user".to_string(),
+					serde_json::Value::String(recovered_user.to_string()),
+				); // workaround because StandardOrder::try_from does not handle the user field
 			}
 		}
 		// 4. Use the unified TryFrom implementation with the modified quote
 		let sol_order = StandardOrder::try_from(&quote_clone)?;
-		
+
 		// Encode the order
 		let encoded_order = StandardOrder::abi_encode(&sol_order);
 
@@ -802,10 +806,12 @@ impl PostOrderRequest {
 	}
 
 	/// Reconstructs the EIP-712 digest based on the order type.
-	/// 
+	///
 	/// This function dispatches to the appropriate digest reconstruction method
 	/// based on the OifOrder variant type.
-	fn reconstruct_digest_for_order_type(quote: &Quote) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+	fn reconstruct_digest_for_order_type(
+		quote: &Quote,
+	) -> Result<[u8; 32], Box<dyn std::error::Error>> {
 		match &quote.order {
 			OifOrder::OifEscrowV0 { .. } => {
 				// Permit2 escrow orders
