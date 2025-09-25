@@ -55,8 +55,8 @@ use solver_delivery::DeliveryService;
 use solver_settlement::{SettlementInterface, SettlementService};
 use solver_types::standards::eip7683::LockType;
 use solver_types::{
-	with_0x_prefix, GetQuoteRequestV1 as GetQuoteRequest, InteropAddress, Quote, QuoteDetails,
-	QuoteError, QuoteOrder, QuotePreference, SignatureType,
+	oif_versions, with_0x_prefix, FailureHandlingMode, GetQuoteRequest, InteropAddress,
+	NewSignatureType, OifOrder, OrderPayload, Quote, QuoteError, QuotePreference,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -90,13 +90,14 @@ impl QuoteGenerator {
 	pub async fn generate_quotes(
 		&self,
 		request: &GetQuoteRequest,
+		context: &crate::apis::quote::validation::ValidatedQuoteContext,
 		config: &Config,
 	) -> Result<Vec<Quote>, QuoteError> {
 		let mut quotes = Vec::new();
-		for input in &request.available_inputs {
+		for input in &request.intent.inputs {
 			let custody_decision = self.custody_strategy.decide_custody(input).await?;
 			if let Ok(quote) = self
-				.generate_quote_for_settlement(request, config, &custody_decision)
+				.generate_quote_for_settlement(request, context, config, &custody_decision)
 				.await
 			{
 				quotes.push(quote);
@@ -112,52 +113,55 @@ impl QuoteGenerator {
 	async fn generate_quote_for_settlement(
 		&self,
 		request: &GetQuoteRequest,
+		context: &crate::apis::quote::validation::ValidatedQuoteContext,
 		config: &Config,
 		custody_decision: &CustodyDecision,
 	) -> Result<Quote, QuoteError> {
 		let quote_id = Uuid::new_v4().to_string();
 		let order = match custody_decision {
 			CustodyDecision::ResourceLock { lock } => {
-				self.generate_resource_lock_order(request, config, lock)
+				self.generate_resource_lock_order(request, context, config, lock)
 					.await?
 			},
 			CustodyDecision::Escrow { lock_type } => {
-				self.generate_escrow_order(request, config, lock_type)
+				self.generate_escrow_order(request, context, config, lock_type)
 					.await?
 			},
 		};
-		let details = QuoteDetails {
-			requested_outputs: request.requested_outputs.clone(),
-			available_inputs: request.available_inputs.clone(),
-		};
-		let eta = self.calculate_eta(&request.preference);
-		let lock_type = match custody_decision {
-			CustodyDecision::ResourceLock { .. } => "resource_lock".to_string(),
-			CustodyDecision::Escrow { lock_type } => match lock_type {
-				LockType::Permit2Escrow => "permit2_escrow".to_string(),
-				LockType::Eip3009Escrow => "eip3009_escrow".to_string(),
-				_ => "unknown".to_string(),
-			},
-		};
+
+		let eta = self.calculate_eta(&request.intent.preference);
 		let validity_seconds = self.get_quote_validity_seconds(config);
+
+		// Get failure handling from request or use default
+		let failure_handling = request
+			.intent
+			.failure_handling
+			.as_ref()
+			.and_then(|modes| modes.first())
+			.cloned()
+			.unwrap_or(FailureHandlingMode::RefundAutomatic);
+
+		// Get partial fill preference from request or default to false
+		let partial_fill = request.intent.partial_fill.unwrap_or(false);
+
 		Ok(Quote {
-			orders: vec![order],
-			details,
-			valid_until: Some(chrono::Utc::now().timestamp() as u64 + validity_seconds),
+			order,
+			failure_handling,
+			partial_fill,
+			valid_until: chrono::Utc::now().timestamp() as u64 + validity_seconds,
 			eta: Some(eta),
 			quote_id,
-			provider: "oif-solver".to_string(),
-			cost: None,
-			lock_type,
+			provider: Some("oif-solver".to_string()),
 		})
 	}
 
 	async fn generate_resource_lock_order(
 		&self,
 		request: &GetQuoteRequest,
+		_context: &crate::apis::quote::validation::ValidatedQuoteContext,
 		config: &Config,
 		lock: &solver_types::AssetLockReference,
-	) -> Result<QuoteOrder, QuoteError> {
+	) -> Result<OifOrder, QuoteError> {
 		use solver_types::LockKind;
 
 		let domain_address = self.get_lock_domain_address(config, lock)?;
@@ -177,28 +181,32 @@ impl QuoteGenerator {
 				"Unsupported lock kind".to_string(),
 			)),
 		}?;
-		Ok(QuoteOrder {
-			signature_type: SignatureType::Eip712,
-			domain: serde_json::to_value(domain_address).unwrap_or(serde_json::Value::Null),
-			primary_type,
-			message,
-		})
+
+		// Create OifOrder based on lock kind
+		let order = OifOrder::OifResourceLockV0 {
+			payload: OrderPayload {
+				signature_type: SignatureType::Eip712,
+				domain: serde_json::to_value(domain_address).unwrap_or(serde_json::Value::Null),
+				primary_type,
+				message,
+			},
+		};
+
+		Ok(order)
 	}
 
 	async fn generate_escrow_order(
 		&self,
 		request: &GetQuoteRequest,
+		_context: &crate::apis::quote::validation::ValidatedQuoteContext,
 		config: &Config,
 		lock_type: &LockType,
-	) -> Result<QuoteOrder, QuoteError> {
-		// Standard determined by business logic context
-		// Currently we only support EIP7683
-		let _standard = "eip7683"; // Currently only supporting eip7683
-
+	) -> Result<OifOrder, QuoteError> {
 		// Extract chain from first output to find appropriate settlement
 		// TODO: Implement support for multiple destination chains
 		let chain_id = request
-			.requested_outputs
+			.intent
+			.outputs
 			.first()
 			.ok_or_else(|| QuoteError::InvalidRequest("No requested outputs".to_string()))?
 			.asset
@@ -237,8 +245,8 @@ impl QuoteGenerator {
 		config: &Config,
 		settlement: &dyn SettlementInterface,
 		selected_oracle: solver_types::Address,
-	) -> Result<QuoteOrder, QuoteError> {
-		let chain_id = request.available_inputs[0]
+	) -> Result<OifOrder, QuoteError> {
+		let chain_id = request.intent.inputs[0]
 			.asset
 			.ethereum_chain_id()
 			.map_err(|e| {
@@ -252,12 +260,16 @@ impl QuoteGenerator {
 		let message_obj =
 			self.build_permit2_message_object(request, config, settlement, selected_oracle)?;
 
-		Ok(QuoteOrder {
-			signature_type: SignatureType::Eip712,
-			domain: domain_object,
-			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
-			message: message_obj,
-		})
+		let order = OifOrder::OifEscrowV0 {
+			payload: OrderPayload {
+				signature_type: SignatureType::Eip712,
+				domain: serde_json::to_value(domain_object).unwrap_or(serde_json::Value::Null),
+				primary_type: "PermitBatchWitnessTransferFrom".to_string(),
+				message: message_obj,
+			},
+		};
+
+		Ok(order)
 	}
 
 	async fn generate_eip3009_order(
@@ -266,11 +278,11 @@ impl QuoteGenerator {
 		config: &Config,
 		_settlement: &dyn SettlementInterface,
 		selected_oracle: solver_types::Address,
-	) -> Result<QuoteOrder, QuoteError> {
+	) -> Result<OifOrder, QuoteError> {
 		let validity_seconds = self.get_quote_validity_seconds(config);
 
 		// Get input chain to find the input settler address (the 'to' field)
-		let first_input = &request.available_inputs[0];
+		let first_input = &request.intent.inputs[0];
 		let input_chain_id = first_input
 			.asset
 			.ethereum_chain_id()
@@ -279,7 +291,7 @@ impl QuoteGenerator {
 			QuoteError::InvalidRequest(format!("Network {} not found in config", input_chain_id))
 		})?;
 		let input_settler = network.input_settler_address.clone();
-		let input_settler_address = alloy_primitives::Address::from_slice(&input_settler.0);
+		let output_settler = network.output_settler_address.clone();
 
 		// Calculate fillDeadline (should match fillDeadline in StandardOrder)
 		let fill_deadline = chrono::Utc::now().timestamp() as u32 + validity_seconds as u32;
@@ -306,10 +318,10 @@ impl QuoteGenerator {
 		// For EIP-3009, we need to generate signature templates for each input
 		// since the contract expects one signature per input
 		let mut signatures_array = Vec::new();
-		for input in &request.available_inputs {
+		for input in &request.intent.inputs {
 			let input_message = serde_json::json!({
 				"from": input.user.ethereum_address().map_err(|e| QuoteError::InvalidRequest(format!("Invalid Ethereum address: {}", e)))?,
-				"to": format!("0x{:040x}", input_settler_address),
+				"to": format!("0x{:040x}", input_settler),
 				"value": input.amount.to_string(),
 				"validAfter": 0,
 				"validBefore": fill_deadline,
@@ -330,12 +342,41 @@ impl QuoteGenerator {
 			})
 		};
 
-		Ok(QuoteOrder {
-			signature_type: SignatureType::Eip3009,
-			domain: domain_object, // Use structured domain object for EIP-3009
-			primary_type: "ReceiveWithAuthorization".to_string(),
-			message,
-		})
+		// Build metadata with full intent information (inputs and outputs)
+		// This is needed for conversion back to StandardOrder
+		let metadata = serde_json::json!({
+			"user": request.user.to_string(),
+			"inputs": request.intent.inputs.iter().map(|input| {
+				serde_json::json!({
+					"chainId": input.asset.ethereum_chain_id().unwrap_or(1),
+					"asset": input.asset.to_string(),
+					"amount": input.amount.to_string(),
+					"user": input.user.to_string()
+				})
+			}).collect::<Vec<_>>(),
+			"outputs": request.intent.outputs.iter().map(|output| {
+				serde_json::json!({
+					"chainId": output.asset.ethereum_chain_id().unwrap_or(1),
+					"asset": output.asset.to_string(),
+					"amount": output.amount.to_string(),
+					"receiver": output.receiver.to_string(),
+					"oracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&selected_oracle.0)),
+					"settler":  format!("0x{:040x}", output_settler),
+				})
+			}).collect::<Vec<_>>()
+		});
+
+		let order = OifOrder::Oif3009V0 {
+			payload: OrderPayload {
+				signature_type: SignatureType::Eip3009,
+				domain: serde_json::to_value(domain_object).unwrap_or(serde_json::Value::Null),
+				primary_type: "ReceiveWithAuthorization".to_string(),
+				message,
+			},
+			metadata,
+		};
+
+		Ok(order)
 	}
 
 	/// Compute the orderIdentifier for an EIP-3009 order by building a StandardOrder
@@ -348,7 +389,7 @@ impl QuoteGenerator {
 		selected_oracle: &solver_types::Address,
 		fill_deadline: u32,
 	) -> Result<(u64, String), QuoteError> {
-		let input = &request.available_inputs[0];
+		let input = &request.intent.inputs[0];
 
 		// Get input chain info
 		let input_chain_id = input
@@ -553,7 +594,8 @@ impl QuoteGenerator {
 
 		// Get input chain ID from first available input
 		let first_input = request
-			.available_inputs
+			.intent
+			.inputs
 			.first()
 			.ok_or_else(|| QuoteError::InvalidRequest("No available inputs".to_string()))?;
 		let input_chain_id = first_input
@@ -580,7 +622,7 @@ impl QuoteGenerator {
 		// Convert inputs to the format expected by TheCompact
 		// For ResourceLock orders, we need to build the proper token IDs and amounts
 		let mut inputs_array = Vec::new();
-		for input in &request.available_inputs {
+		for input in &request.intent.inputs {
 			let token_address = input.asset.ethereum_address().map_err(|e| {
 				QuoteError::InvalidRequest(format!("Invalid input token address: {}", e))
 			})?;
@@ -611,7 +653,7 @@ impl QuoteGenerator {
 
 		// Convert outputs to MandateOutput format
 		let mut outputs_array = Vec::new();
-		for output in &request.requested_outputs {
+		for output in &request.intent.outputs {
 			let output_token_address = output.asset.ethereum_address().map_err(|e| {
 				QuoteError::InvalidRequest(format!("Invalid output token address: {}", e))
 			})?;
@@ -768,25 +810,6 @@ impl QuoteGenerator {
 				}))
 			},
 		}?;
-
-		// Backward-compatible top-level fields expected by older tests/tools
-		let flat_message = serde_json::json!({
-			"user": format!("0x{:040x}", user_address),
-			"inputs": inputs_array,
-			"outputs": outputs_array,
-			"nonce": nonce.to_string(),
-			"deadline": expires.to_string()
-		});
-
-		// Merge flat fields with result (which contains eip712 and optional digest)
-		let mut merged = result_with_digest.as_object().cloned().unwrap_or_default();
-		if let Some(obj) = flat_message.as_object() {
-			for (k, v) in obj.iter() {
-				merged.entry(k.clone()).or_insert(v.clone());
-			}
-		}
-
-		Ok(serde_json::Value::Object(merged))
 	}
 
 	async fn build_rhinestone_message(
@@ -1284,6 +1307,7 @@ impl QuoteGenerator {
 mod tests {
 	use super::*;
 	use crate::apis::quote::custody::CustodyDecision;
+	use crate::apis::quote::validation::ValidatedQuoteContext;
 	use alloy_primitives::address;
 	use alloy_primitives::U256;
 	use solver_config::{
@@ -1293,7 +1317,9 @@ mod tests {
 	use solver_types::parse_address;
 	use solver_types::{
 		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
-		AvailableInput, QuotePreference, RequestedOutput, SignatureType,
+		AuthScheme, AvailableInput, FailureHandlingMode, IntentRequest, IntentType, OifOrder,
+		OrderPayload, QuoteInput, QuoteOutput, QuotePreference, RequestedOutput, SignatureType,
+		SwapType,
 	};
 	use std::collections::HashMap;
 
@@ -1338,38 +1364,61 @@ mod tests {
 			.build()
 	}
 
+	fn create_test_context() -> ValidatedQuoteContext {
+		ValidatedQuoteContext {
+			swap_type: SwapType::ExactInput,
+			known_inputs: None,
+			known_outputs: None,
+			constraint_inputs: None,
+			constraint_outputs: None,
+			inferred_order_types: vec![],
+			compatible_auth_schemes: vec![],
+			inputs_for_balance_check: vec![],
+			outputs_for_balance_check: vec![],
+		}
+	}
+
 	fn create_test_request() -> GetQuoteRequest {
 		GetQuoteRequest {
 			user: InteropAddress::new_ethereum(
 				1,
 				address!("1111111111111111111111111111111111111111"),
 			),
-			available_inputs: vec![AvailableInput {
-				user: InteropAddress::new_ethereum(
-					1,
-					address!("1111111111111111111111111111111111111111"),
-				),
-				asset: InteropAddress::new_ethereum(
-					1,
-					address!("A0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
-				),
-				amount: U256::from(1000),
-				lock: None,
-			}],
-			requested_outputs: vec![RequestedOutput {
-				receiver: InteropAddress::new_ethereum(
-					137,
-					address!("2222222222222222222222222222222222222222"),
-				),
-				asset: InteropAddress::new_ethereum(
-					137,
-					address!("B0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
-				),
-				amount: U256::from(950),
-				calldata: None,
-			}],
-			min_valid_until: None,
-			preference: Some(QuotePreference::Speed),
+			intent: IntentRequest {
+				intent_type: IntentType::OifSwap,
+				inputs: vec![QuoteInput {
+					user: InteropAddress::new_ethereum(
+						1,
+						address!("1111111111111111111111111111111111111111"),
+					),
+					asset: InteropAddress::new_ethereum(
+						1,
+						address!("A0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
+					),
+					amount: Some(U256::from(1000).to_string()),
+					lock: None,
+				}],
+				outputs: vec![QuoteOutput {
+					receiver: InteropAddress::new_ethereum(
+						137,
+						address!("2222222222222222222222222222222222222222"),
+					),
+					asset: InteropAddress::new_ethereum(
+						137,
+						address!("B0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C5C5C5"),
+					),
+					amount: Some(U256::from(950).to_string()),
+					calldata: None,
+				}],
+				swap_type: None,
+				min_valid_until: None,
+				preference: Some(QuotePreference::Speed),
+				origin_submission: None,
+				failure_handling: None,
+				partial_fill: None,
+				metadata: None,
+			},
+			supported_types: vec![oif_versions::oif_swap_v0()],
 		}
 	}
 
@@ -1423,8 +1472,9 @@ mod tests {
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
+		let context = create_test_context();
 
-		let result = generator.generate_quotes(&request, &config).await;
+		let result = generator.generate_quotes(&request, &context, &config).await;
 
 		// Should succeed since we have properly configured oracles
 		assert!(result.is_ok());
@@ -1452,8 +1502,9 @@ mod tests {
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
+		let context = create_test_context();
 
-		let result = generator.generate_quotes(&request, &config).await;
+		let result = generator.generate_quotes(&request, &context, &config).await;
 
 		// Should fail with insufficient liquidity since our mock settlement has no oracles configured
 		assert!(matches!(result, Err(QuoteError::InsufficientLiquidity)));
@@ -1466,6 +1517,7 @@ mod tests {
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
+		let context = create_test_context();
 
 		// Create request with no available inputs
 		let request = GetQuoteRequest {
@@ -1473,24 +1525,33 @@ mod tests {
 				1,
 				address!("1111111111111111111111111111111111111111"),
 			),
-			available_inputs: vec![],
-			requested_outputs: vec![RequestedOutput {
-				receiver: InteropAddress::new_ethereum(
-					137,
-					address!("2222222222222222222222222222222222222222"),
-				),
-				asset: InteropAddress::new_ethereum(
-					137,
-					address!("B0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
-				),
-				amount: U256::from(950),
-				calldata: None,
-			}],
-			min_valid_until: None,
-			preference: Some(QuotePreference::Speed),
+			intent: IntentRequest {
+				intent_type: IntentType::OifSwap,
+				inputs: vec![],
+				outputs: vec![QuoteOutput {
+					receiver: InteropAddress::new_ethereum(
+						137,
+						address!("2222222222222222222222222222222222222222"),
+					),
+					asset: InteropAddress::new_ethereum(
+						137,
+						address!("B0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
+					),
+					amount: Some(U256::from(950).to_string()),
+					calldata: None,
+				}],
+				swap_type: None,
+				min_valid_until: None,
+				preference: Some(QuotePreference::Speed),
+				origin_submission: None,
+				failure_handling: None,
+				partial_fill: None,
+				metadata: None,
+			},
+			supported_types: vec![oif_versions::oif_swap_v0()],
 		};
 
-		let result = generator.generate_quotes(&request, &config).await;
+		let result = generator.generate_quotes(&request, &context, &config).await;
 		assert!(matches!(result, Err(QuoteError::InsufficientLiquidity)));
 	}
 
@@ -1508,15 +1569,19 @@ mod tests {
 			params: Some(serde_json::json!({"test": "value"})),
 		};
 
+		let context = create_test_context();
 		let result = generator
-			.generate_resource_lock_order(&request, &config, &lock)
+			.generate_resource_lock_order(&request, &context, &config, &lock)
 			.await;
 
 		match result {
-			Ok(order) => {
-				assert_eq!(order.signature_type, SignatureType::Eip712);
-				assert_eq!(order.primary_type, "CompactLock");
-				assert!(order.message.is_object());
+			Ok(order) => match order {
+				OifOrder::OifResourceLockV0 { payload } => {
+					assert_eq!(payload.signature_type, SignatureType::Eip712);
+					assert_eq!(payload.primary_type, "CompactLock");
+					assert!(payload.message.is_object());
+				},
+				_ => panic!("Expected OifResourceLockV0 order"),
 			},
 			Err(e) => {
 				// Expected if domain configuration is missing
@@ -1546,26 +1611,31 @@ mod tests {
 
 		match result {
 			Ok(order) => {
-				assert_eq!(order.signature_type, SignatureType::Eip3009);
-				assert_eq!(order.primary_type, "ReceiveWithAuthorization");
-				assert!(order.message.is_object());
+				match order {
+					OifOrder::Oif3009V0 { payload, .. } => {
+						assert_eq!(payload.signature_type, SignatureType::Eip3009);
+						assert_eq!(payload.primary_type, "ReceiveWithAuthorization");
+						assert!(payload.message.is_object());
 
-				// Verify domain is at the order level (new structure)
-				assert!(order.domain.is_object());
-				let domain = order.domain.as_object().unwrap();
-				assert!(domain.contains_key("name"));
-				assert!(domain.contains_key("chainId"));
-				assert!(domain.contains_key("verifyingContract"));
+						// Verify domain is at the order level (new structure)
+						assert!(payload.domain.is_object());
+						let domain = payload.domain.as_object().unwrap();
+						assert!(domain.contains_key("name"));
+						assert!(domain.contains_key("chainId"));
+						assert!(domain.contains_key("verifyingContract"));
 
-				// Verify message structure (EIP-3009 fields)
-				let message_obj = order.message.as_object().unwrap();
-				assert!(message_obj["from"].is_string());
-				assert!(message_obj["to"].is_string());
-				assert!(message_obj["value"].is_string());
-				assert!(message_obj["validAfter"].is_number());
-				assert!(message_obj["validBefore"].is_number());
-				assert!(message_obj["nonce"].is_string());
-				assert!(message_obj["inputOracle"].is_string());
+						// Verify message structure (EIP-3009 fields)
+						let message_obj = payload.message.as_object().unwrap();
+						assert!(message_obj["from"].is_string());
+						assert!(message_obj["to"].is_string());
+						assert!(message_obj["value"].is_string());
+						assert!(message_obj["validAfter"].is_number());
+						assert!(message_obj["validBefore"].is_number());
+						assert!(message_obj["nonce"].is_string());
+						assert!(message_obj["inputOracle"].is_string());
+					},
+					_ => panic!("Expected Oif3009V0 order"),
+				}
 			},
 			Err(e) => {
 				// Expected if token contract calls fail or configuration is missing
@@ -1648,43 +1718,52 @@ mod tests {
 
 		let mut quotes = vec![
 			Quote {
-				orders: vec![],
-				details: QuoteDetails {
-					requested_outputs: vec![],
-					available_inputs: vec![],
+				order: OifOrder::OifEscrowV0 {
+					payload: OrderPayload {
+						signature_type: SignatureType::Eip712,
+						domain: serde_json::json!({}),
+						primary_type: "TestType".to_string(),
+						message: serde_json::json!({}),
+					},
 				},
-				valid_until: None,
+				failure_handling: FailureHandlingMode::RefundAutomatic,
+				partial_fill: false,
+				valid_until: 1234567890,
 				eta: Some(200),
 				quote_id: "quote1".to_string(),
-				provider: "test".to_string(),
-				cost: None,
-				lock_type: "permit2_escrow".to_string(),
+				provider: Some("test".to_string()),
 			},
 			Quote {
-				orders: vec![],
-				details: QuoteDetails {
-					requested_outputs: vec![],
-					available_inputs: vec![],
+				order: OifOrder::OifEscrowV0 {
+					payload: OrderPayload {
+						signature_type: SignatureType::Eip712,
+						domain: serde_json::json!({}),
+						primary_type: "TestType".to_string(),
+						message: serde_json::json!({}),
+					},
 				},
-				valid_until: None,
+				failure_handling: FailureHandlingMode::RefundAutomatic,
+				partial_fill: false,
+				valid_until: 1234567890,
 				eta: Some(100),
 				quote_id: "quote2".to_string(),
-				provider: "test".to_string(),
-				cost: None,
-				lock_type: "permit2_escrow".to_string(),
+				provider: Some("test".to_string()),
 			},
 			Quote {
-				orders: vec![],
-				details: QuoteDetails {
-					requested_outputs: vec![],
-					available_inputs: vec![],
+				order: OifOrder::OifEscrowV0 {
+					payload: OrderPayload {
+						signature_type: SignatureType::Eip712,
+						domain: serde_json::json!({}),
+						primary_type: "TestType".to_string(),
+						message: serde_json::json!({}),
+					},
 				},
-				valid_until: None,
+				failure_handling: FailureHandlingMode::RefundAutomatic,
+				partial_fill: false,
+				valid_until: 1234567890,
 				eta: None,
 				quote_id: "quote3".to_string(),
-				provider: "test".to_string(),
-				cost: None,
-				lock_type: "permit2_escrow".to_string(),
+				provider: Some("test".to_string()),
 			},
 		];
 
@@ -1705,30 +1784,36 @@ mod tests {
 
 		let mut quotes = vec![
 			Quote {
-				orders: vec![],
-				details: QuoteDetails {
-					requested_outputs: vec![],
-					available_inputs: vec![],
+				order: OifOrder::OifEscrowV0 {
+					payload: OrderPayload {
+						signature_type: SignatureType::Eip712,
+						domain: serde_json::json!({}),
+						primary_type: "TestType".to_string(),
+						message: serde_json::json!({}),
+					},
 				},
-				valid_until: None,
+				failure_handling: FailureHandlingMode::RefundAutomatic,
+				partial_fill: false,
+				valid_until: 1234567890,
 				eta: Some(200),
 				quote_id: "quote1".to_string(),
-				provider: "test".to_string(),
-				cost: None,
-				lock_type: "permit2_escrow".to_string(),
+				provider: Some("test".to_string()),
 			},
 			Quote {
-				orders: vec![],
-				details: QuoteDetails {
-					requested_outputs: vec![],
-					available_inputs: vec![],
+				order: OifOrder::OifEscrowV0 {
+					payload: OrderPayload {
+						signature_type: SignatureType::Eip712,
+						domain: serde_json::json!({}),
+						primary_type: "TestType".to_string(),
+						message: serde_json::json!({}),
+					},
 				},
-				valid_until: None,
+				failure_handling: FailureHandlingMode::RefundAutomatic,
+				partial_fill: false,
+				valid_until: 1234567890,
 				eta: Some(100),
 				quote_id: "quote2".to_string(),
-				provider: "test".to_string(),
-				cost: None,
-				lock_type: "permit2_escrow".to_string(),
+				provider: Some("test".to_string()),
 			},
 		];
 
@@ -1823,18 +1908,24 @@ mod tests {
 			},
 		};
 
+		let context = create_test_context();
 		let result = generator
-			.generate_quote_for_settlement(&request, &config, &custody_decision)
+			.generate_quote_for_settlement(&request, &context, &config, &custody_decision)
 			.await;
 
 		match result {
 			Ok(quote) => {
 				assert!(!quote.quote_id.is_empty());
-				assert_eq!(quote.provider, "oif-solver");
-				assert!(quote.valid_until.is_some());
+				assert_eq!(quote.provider, Some("oif-solver".to_string()));
+				assert!(quote.valid_until > 0);
 				assert!(quote.eta.is_some());
-				assert_eq!(quote.orders.len(), 1);
-				assert_eq!(quote.orders[0].signature_type, SignatureType::Eip712);
+				// Check that the order is ResourceLock based on the custody decision
+				match &quote.order {
+					OifOrder::OifResourceLockV0 { payload } => {
+						assert_eq!(payload.signature_type, SignatureType::Eip712);
+					},
+					_ => panic!("Expected OifResourceLockV0 order"),
+				}
 			},
 			Err(e) => {
 				// Expected if domain configuration is incomplete
@@ -1856,18 +1947,24 @@ mod tests {
 			lock_type: solver_types::standards::eip7683::LockType::Eip3009Escrow,
 		};
 
+		let context = create_test_context();
 		let result = generator
-			.generate_quote_for_settlement(&request, &config, &custody_decision)
+			.generate_quote_for_settlement(&request, &context, &config, &custody_decision)
 			.await;
 
 		match result {
 			Ok(quote) => {
 				assert!(!quote.quote_id.is_empty());
-				assert_eq!(quote.provider, "oif-solver");
-				assert!(quote.valid_until.is_some());
+				assert_eq!(quote.provider, Some("oif-solver".to_string()));
+				assert!(quote.valid_until > 0);
 				assert!(quote.eta.is_some());
-				assert_eq!(quote.orders.len(), 1);
-				assert_eq!(quote.orders[0].signature_type, SignatureType::Eip3009);
+				// Check that the order is EIP-3009 based on the custody decision
+				match &quote.order {
+					OifOrder::Oif3009V0 { payload, .. } => {
+						assert_eq!(payload.signature_type, SignatureType::Eip3009);
+					},
+					_ => panic!("Expected Oif3009V0 order"),
+				}
 			},
 			Err(e) => {
 				// Expected due to missing settlement service setup or invalid request

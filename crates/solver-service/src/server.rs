@@ -21,8 +21,8 @@ use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
 use solver_types::{
-	api::PostOrderRequest, APIError, Address, ApiErrorType, GetOrderResponse,
-	GetQuoteRequestV1 as GetQuoteRequest, GetQuoteResponse, Order, OrderIdCallback, Transaction,
+	api::PostOrderRequest, APIError, Address, ApiErrorType, GetOrderResponse, GetQuoteRequest,
+	GetQuoteResponse, Order, OrderIdCallback, Transaction,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;

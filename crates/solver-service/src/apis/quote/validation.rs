@@ -16,7 +16,10 @@
 use alloy_primitives::{Address as AlloyAddress, U256};
 use futures::future::try_join_all;
 use solver_core::SolverEngine;
-use solver_types::{GetQuoteRequestV1 as GetQuoteRequest, InteropAddress, QuoteError};
+use solver_types::{
+	AuthScheme, GetQuoteRequest, IntentRequest, IntentType, InteropAddress, QuoteError, QuoteInput,
+	QuoteOutput, SwapType,
+};
 
 /// Main validator for quote requests.
 ///
@@ -34,7 +37,225 @@ pub struct SupportedAsset {
 	pub amount: U256,
 }
 
+/// Rich validation context that replaces simple SupportedAsset lists
+#[derive(Debug, Clone)]
+pub struct ValidatedQuoteContext {
+	pub swap_type: SwapType,
+	pub known_inputs: Option<Vec<(QuoteInput, U256)>>,
+	pub known_outputs: Option<Vec<(QuoteOutput, U256)>>,
+	pub constraint_inputs: Option<Vec<(QuoteInput, Option<U256>)>>,
+	pub constraint_outputs: Option<Vec<(QuoteOutput, Option<U256>)>>,
+	pub inferred_order_types: Vec<String>,
+	pub compatible_auth_schemes: Vec<AuthScheme>,
+	pub inputs_for_balance_check: Vec<QuoteInput>,
+	pub outputs_for_balance_check: Vec<QuoteOutput>,
+}
+
 impl QuoteValidator {
+	pub fn validate_quote_request(
+		request: &GetQuoteRequest,
+		solver: &SolverEngine,
+	) -> Result<ValidatedQuoteContext, QuoteError> {
+		// 1. Intent structure validation
+		Self::validate_intent_structure(&request.intent)?;
+
+		// 2. supportedTypes validation
+		Self::validate_supported_types(&request.supported_types, solver)?;
+
+		// 3. SwapType-aware input/output validation
+		let context = Self::validate_swap_type_logic(&request.intent)?;
+
+		// 4. Lock and auth scheme validation
+		Self::validate_capabilities(request, solver, &context)?;
+
+		Ok(context)
+	}
+
+	fn validate_intent_structure(intent: &IntentRequest) -> Result<(), QuoteError> {
+		// Validate intentType
+		if intent.intent_type != IntentType::OifSwap {
+			return Err(QuoteError::UnsupportedIntentType(format!(
+				"Unsupported intent type: {:?}",
+				intent.intent_type
+			)));
+		}
+
+		// Validate required arrays
+		if intent.inputs.is_empty() || intent.outputs.is_empty() {
+			return Err(QuoteError::InvalidRequest(
+				"inputs and outputs are required".to_string(),
+			));
+		}
+
+		for input in &intent.inputs {
+			Self::validate_interop_address(&input.user)?;
+			Self::validate_interop_address(&input.asset)?;
+		}
+
+		for output in &intent.outputs {
+			Self::validate_interop_address(&output.receiver)?;
+			Self::validate_interop_address(&output.asset)?;
+		}
+
+		Ok(())
+	}
+
+	fn validate_supported_types(
+		supported_types: &[String],
+		_solver: &SolverEngine,
+	) -> Result<(), QuoteError> {
+		if supported_types.is_empty() {
+			return Err(QuoteError::InvalidRequest(
+				"supportedTypes cannot be empty".to_string(),
+			));
+		}
+
+		// Validate that order types follow the OIF versioning pattern
+		for order_type in supported_types {
+			if !order_type.starts_with("oif-") || !order_type.contains("-v") {
+				return Err(QuoteError::InvalidRequest(format!(
+					"Invalid order type format: {}",
+					order_type
+				)));
+			}
+		}
+
+		Ok(())
+	}
+
+	fn validate_swap_type_logic(
+		intent: &IntentRequest,
+	) -> Result<ValidatedQuoteContext, QuoteError> {
+		let swap_type = intent.swap_type.as_ref().unwrap_or(&SwapType::ExactInput);
+
+		match swap_type {
+			SwapType::ExactInput => {
+				// Input amounts must be provided
+				let mut known_inputs = Vec::new();
+				for input in &intent.inputs {
+					let amount_u256 = input.amount_as_u256().map_err(|e| {
+						QuoteError::InvalidRequest(format!("Invalid amount: {}", e))
+					})?;
+
+					if amount_u256.is_none() {
+						return Err(QuoteError::MissingInputAmount);
+					}
+
+					known_inputs.push((input.clone(), amount_u256.unwrap()));
+				}
+
+				// Output amounts are optional constraints
+				let mut constraint_outputs = Vec::new();
+				for output in &intent.outputs {
+					let amount_u256 = output.amount_as_u256().map_err(|e| {
+						QuoteError::InvalidRequest(format!("Invalid amount: {}", e))
+					})?;
+					constraint_outputs.push((output.clone(), amount_u256));
+				}
+
+				Ok(ValidatedQuoteContext {
+					swap_type: SwapType::ExactInput,
+					known_inputs: Some(known_inputs),
+					known_outputs: None,
+					constraint_inputs: None,
+					constraint_outputs: Some(constraint_outputs),
+					inferred_order_types: Vec::new(),
+					compatible_auth_schemes: Vec::new(),
+					inputs_for_balance_check: intent.inputs.clone(),
+					outputs_for_balance_check: vec![], // Can't pre-validate - amounts unknown
+				})
+			},
+			SwapType::ExactOutput => {
+				// Output amounts must be provided
+				let mut known_outputs = Vec::new();
+				for output in &intent.outputs {
+					let amount_u256 = output.amount_as_u256().map_err(|e| {
+						QuoteError::InvalidRequest(format!("Invalid amount: {}", e))
+					})?;
+
+					if amount_u256.is_none() {
+						return Err(QuoteError::MissingOutputAmount);
+					}
+
+					known_outputs.push((output.clone(), amount_u256.unwrap()));
+				}
+
+				// Input amounts are optional constraints
+				let mut constraint_inputs = Vec::new();
+				for input in &intent.inputs {
+					let amount_u256 = input.amount_as_u256().map_err(|e| {
+						QuoteError::InvalidRequest(format!("Invalid amount: {}", e))
+					})?;
+					constraint_inputs.push((input.clone(), amount_u256));
+				}
+
+				Ok(ValidatedQuoteContext {
+					swap_type: SwapType::ExactOutput,
+					known_inputs: None,
+					known_outputs: Some(known_outputs),
+					constraint_inputs: Some(constraint_inputs),
+					constraint_outputs: None,
+					inferred_order_types: Vec::new(),
+					compatible_auth_schemes: Vec::new(),
+					inputs_for_balance_check: vec![], // Can't pre-validate - amounts unknown
+					outputs_for_balance_check: intent.outputs.clone(),
+				})
+			},
+		}
+	}
+
+	fn validate_capabilities(
+		request: &GetQuoteRequest,
+		_solver: &SolverEngine,
+		context: &ValidatedQuoteContext,
+	) -> Result<(), QuoteError> {
+		// Validate inferred order types match supported types
+		Self::validate_order_type_compatibility(request, context)?;
+
+		// Validate auth schemes if specified
+		if let Some(origin) = &request.intent.origin_submission {
+			Self::validate_auth_schemes(&origin.schemes)?;
+		}
+
+		Ok(())
+	}
+
+	fn validate_order_type_compatibility(
+		request: &GetQuoteRequest,
+		_context: &ValidatedQuoteContext,
+	) -> Result<(), QuoteError> {
+		use solver_types::oif_versions;
+
+		// Check that each input's inferred order type is compatible with supportedTypes
+		for input in &request.intent.inputs {
+			// Infer the order type with the current version
+			let inferred_order_type = input.infer_order_type(oif_versions::CURRENT);
+
+			// Check if the inferred type (with version) is in the supported types list
+			if !request.supported_types.contains(&inferred_order_type) {
+				return Err(QuoteError::NoMatchingOrderType(format!(
+					"Inferred order type '{}' not found in supported types: {:?}",
+					inferred_order_type, request.supported_types
+				)));
+			}
+		}
+
+		Ok(())
+	}
+
+	fn validate_auth_schemes(schemes: &Option<Vec<AuthScheme>>) -> Result<(), QuoteError> {
+		if let Some(schemes) = schemes {
+			if schemes.is_empty() {
+				return Err(QuoteError::InvalidRequest(
+					"Auth schemes cannot be empty if specified".to_string(),
+				));
+			}
+			// TODO: Check if solver supports these auth schemes
+		}
+		Ok(())
+	}
+
+	// Keep old validation methods for V1 compatibility
 	/// Validates the basic structure and content of a quote request.
 	///
 	/// This performs initial validation including:
@@ -82,7 +303,7 @@ impl QuoteValidator {
 		let networks = solver.token_manager().get_networks();
 
 		// Check if any input is on a supported origin chain
-		let has_valid_input = request.available_inputs.iter().any(|input| {
+		let has_valid_input = request.intent.inputs.iter().any(|input| {
 			Self::chain_id_from_interop(&input.asset)
 				.ok()
 				.and_then(|id| {
@@ -99,7 +320,7 @@ impl QuoteValidator {
 		}
 
 		// Validate all outputs are on supported destination chains
-		for output in &request.requested_outputs {
+		for output in &request.intent.outputs {
 			let chain_id = Self::chain_id_from_interop(&output.asset)?;
 			let is_dest = networks
 				.get(&chain_id)
@@ -143,16 +364,16 @@ impl QuoteValidator {
 	/// Returns `QuoteError::InvalidRequest` if inputs or outputs are empty
 	fn validate_basic_structure(request: &GetQuoteRequest) -> Result<(), QuoteError> {
 		// Check that we have at least one input
-		if request.available_inputs.is_empty() {
+		if request.intent.inputs.is_empty() {
 			return Err(QuoteError::InvalidRequest(
-				"At least one available input is required".to_string(),
+				"At least one input is required".to_string(),
 			));
 		}
 
 		// Check that we have at least one requested output
-		if request.requested_outputs.is_empty() {
+		if request.intent.outputs.is_empty() {
 			return Err(QuoteError::InvalidRequest(
-				"At least one requested output is required".to_string(),
+				"At least one output is required".to_string(),
 			));
 		}
 
@@ -178,15 +399,17 @@ impl QuoteValidator {
 	///
 	/// Returns `QuoteError::InvalidRequest` if any input is invalid
 	fn validate_inputs(request: &GetQuoteRequest) -> Result<(), QuoteError> {
-		for input in &request.available_inputs {
+		for input in &request.intent.inputs {
 			Self::validate_interop_address(&input.user)?;
 			Self::validate_interop_address(&input.asset)?;
 
-			// Check that amount is positive
-			if input.amount == U256::ZERO {
-				return Err(QuoteError::InvalidRequest(
-					"Input amount must be greater than zero".to_string(),
-				));
+			// Check that amount is positive if provided
+			if let Ok(Some(amount)) = input.amount_as_u256() {
+				if amount == U256::ZERO {
+					return Err(QuoteError::InvalidRequest(
+						"Input amount must be greater than zero".to_string(),
+					));
+				}
 			}
 		}
 		Ok(())
@@ -203,14 +426,17 @@ impl QuoteValidator {
 	///
 	/// Returns `QuoteError::InvalidRequest` if any output is invalid
 	fn validate_outputs(request: &GetQuoteRequest) -> Result<(), QuoteError> {
-		for output in &request.requested_outputs {
+		for output in &request.intent.outputs {
 			Self::validate_interop_address(&output.receiver)?;
 			Self::validate_interop_address(&output.asset)?;
 
-			if output.amount == U256::ZERO {
-				return Err(QuoteError::InvalidRequest(
-					"Output amount must be greater than zero".to_string(),
-				));
+			// Check that amount is positive if provided
+			if let Ok(Some(amount)) = output.amount_as_u256() {
+				if amount == U256::ZERO {
+					return Err(QuoteError::InvalidRequest(
+						"Output amount must be greater than zero".to_string(),
+					));
+				}
 			}
 		}
 		Ok(())
@@ -232,11 +458,6 @@ impl QuoteValidator {
 		address.validate().map_err(|e| {
 			QuoteError::InvalidRequest(format!("Invalid interoperable address: {}", e))
 		})?;
-
-		// Additional validation could include:
-		// - Chain-specific address validation
-		// - Token contract existence checks
-		// - Supported chain verification
 
 		Ok(())
 	}
@@ -287,13 +508,17 @@ impl QuoteValidator {
 	) -> Result<Vec<SupportedAsset>, QuoteError> {
 		let mut supported_assets = Vec::new();
 
-		for input in &request.available_inputs {
+		for input in &request.intent.inputs {
 			let (chain_id, evm_addr) = Self::extract_chain_and_address(&input.asset)?;
+
+			let amount_u256 = input
+				.amount_as_u256()
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {}", e)))?;
 
 			if Self::is_token_supported(solver, chain_id, &evm_addr) {
 				supported_assets.push(SupportedAsset {
 					asset: input.asset.clone(),
-					amount: input.amount,
+					amount: amount_u256.unwrap_or_default(),
 				});
 			}
 		}
@@ -331,7 +556,7 @@ impl QuoteValidator {
 	) -> Result<Vec<SupportedAsset>, QuoteError> {
 		let mut supported_outputs = Vec::new();
 
-		for output in &request.requested_outputs {
+		for output in &request.intent.outputs {
 			let (chain_id, evm_addr) = Self::extract_chain_and_address(&output.asset)?;
 
 			if !Self::is_token_supported(solver, chain_id, &evm_addr) {
@@ -341,9 +566,13 @@ impl QuoteValidator {
 				)));
 			}
 
+			let amount_u256 = output
+				.amount_as_u256()
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {}", e)))?;
+
 			supported_outputs.push(SupportedAsset {
 				asset: output.asset.clone(),
-				amount: output.amount,
+				amount: amount_u256.unwrap_or_default(),
 			});
 		}
 

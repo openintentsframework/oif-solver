@@ -2,10 +2,7 @@
 //!
 //! This module defines the request and response types for the OIF Solver API
 //! endpoints, following the ERC-7683 Cross-Chain Intents Standard.
-use crate::{
-	costs::CostEstimate,
-	standards::{eip7683::LockType, eip7930::InteropAddress},
-};
+use crate::standards::{eip7683::LockType, eip7930::InteropAddress};
 use alloy_primitives::{Address, Bytes, U256};
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -106,18 +103,22 @@ pub enum OifOrder {
 #[serde(rename_all = "camelCase")]
 pub struct OrderPayload {
 	#[serde(rename = "signatureType")]
-	pub signature_type: NewSignatureType,
+	pub signature_type: SignatureType,
 	pub domain: serde_json::Value,
 	#[serde(rename = "primaryType")]
 	pub primary_type: String,
 	pub message: serde_json::Value,
 }
 
-/// New signature types for OIF orders
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum NewSignatureType {
-	Eip712,
+impl From<&Quote> for Option<OrderPayload> {
+	fn from(quote: &Quote) -> Self {
+		match &quote.order {
+			OifOrder::OifEscrowV0 { payload } => Some(payload.clone()),
+			OifOrder::OifResourceLockV0 { payload } => Some(payload.clone()),
+			OifOrder::Oif3009V0 { payload, .. } => Some(payload.clone()),
+			OifOrder::OifGenericV0 { .. } => None, // Generic orders don't have OrderPayload
+		}
+	}
 }
 
 impl OifOrder {
@@ -333,7 +334,6 @@ pub struct AssetAmount {
 	pub amount: U256,
 }
 
-
 /// Supported lock mechanisms
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -357,9 +357,9 @@ pub type RequestedOutput = OrderOutput;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuoteInput {
 	/// User address in EIP-7930 Address format
-	pub user: String,
+	pub user: InteropAddress,
 	/// Asset address in EIP-7930 Address format
-	pub asset: String,
+	pub asset: InteropAddress,
 	/// Optional Amount as string - depends on SwapType
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub amount: Option<String>,
@@ -372,9 +372,9 @@ pub struct QuoteInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuoteOutput {
 	/// Receiver address in EIP-7930 Address format
-	pub receiver: String,
+	pub receiver: InteropAddress,
 	/// Asset address in EIP-7930 Address format
-	pub asset: String,
+	pub asset: InteropAddress,
 	/// Optional Amount as string - depends on SwapType
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub amount: Option<String>,
@@ -414,15 +414,6 @@ pub struct OrderOutput {
 }
 
 impl QuoteInput {
-	/// Convert string address to InteropAddress for internal use
-	pub fn user_as_interop_address(&self) -> Result<InteropAddress, String> {
-		InteropAddress::from_hex(&self.user).map_err(|e| e.to_string())
-	}
-
-	pub fn asset_as_interop_address(&self) -> Result<InteropAddress, String> {
-		InteropAddress::from_hex(&self.asset).map_err(|e| e.to_string())
-	}
-
 	/// Convert optional string amount to U256 for internal use
 	pub fn amount_as_u256(&self) -> Result<Option<U256>, String> {
 		match &self.amount {
@@ -448,14 +439,6 @@ impl QuoteInput {
 }
 
 impl QuoteOutput {
-	pub fn receiver_as_interop_address(&self) -> Result<InteropAddress, String> {
-		InteropAddress::from_hex(&self.receiver).map_err(|e| e.to_string())
-	}
-
-	pub fn asset_as_interop_address(&self) -> Result<InteropAddress, String> {
-		InteropAddress::from_hex(&self.asset).map_err(|e| e.to_string())
-	}
-
 	pub fn amount_as_u256(&self) -> Result<Option<U256>, String> {
 		match &self.amount {
 			Some(amt_str) => Ok(Some(
@@ -470,8 +453,8 @@ impl QuoteOutput {
 impl From<OrderInput> for QuoteInput {
 	fn from(order_input: OrderInput) -> Self {
 		QuoteInput {
-			user: order_input.user.to_string(),
-			asset: order_input.asset.to_string(),
+			user: order_input.user,
+			asset: order_input.asset,
 			amount: Some(order_input.amount.to_string()), // OrderInput has required amount, QuoteInput has optional
 			lock: order_input.lock,
 		}
@@ -482,8 +465,8 @@ impl From<OrderInput> for QuoteInput {
 impl From<OrderOutput> for QuoteOutput {
 	fn from(order_output: OrderOutput) -> Self {
 		QuoteOutput {
-			receiver: order_output.receiver.to_string(),
-			asset: order_output.asset.to_string(),
+			receiver: order_output.receiver,
+			asset: order_output.asset,
 			amount: Some(order_output.amount.to_string()), // OrderOutput has required amount, QuoteOutput has optional
 			calldata: order_output.calldata,
 		}
@@ -518,7 +501,7 @@ pub struct IntentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetQuoteRequest {
 	/// User address in EIP-7930 Address format
-	pub user: String,
+	pub user: InteropAddress,
 	/// Intent request structure
 	pub intent: IntentRequest,
 	/// Supported order types
@@ -588,28 +571,29 @@ pub struct QuoteDetails {
 	pub available_inputs: Vec<AvailableInput>,
 }
 
-/// A quote option following UII standard
+/// A quote option following the new OIF standard
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Quote {
-	/// Array of EIP-712 compliant orders
-	pub orders: Vec<QuoteOrder>,
-	/// Quote details matching request structure
-	pub details: QuoteDetails,
+	/// Single versioned Order union type
+	pub order: OifOrder,
+	/// Failure handling policy
+	#[serde(rename = "failureHandling")]
+	pub failure_handling: FailureHandlingMode,
+	/// Whether partial fills are allowed
+	#[serde(rename = "partialFill")]
+	pub partial_fill: bool,
 	/// Quote validity timestamp
 	#[serde(rename = "validUntil")]
-	pub valid_until: Option<u64>,
+	pub valid_until: u64,
 	/// Estimated time to completion in seconds
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub eta: Option<u64>,
 	/// Unique quote identifier
 	#[serde(rename = "quoteId")]
 	pub quote_id: String,
 	/// Provider identifier
-	pub provider: String, // not used by the solver, only relevant for the aggregator
-	/// Cost breakdown
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub cost: Option<CostEstimate>,
-	// Using LockType
-	pub lock_type: String,
+	pub provider: Option<String>,
 }
 
 /// Implementation to convert Quote with signature and standard to PostOrderRequest
@@ -645,11 +629,8 @@ impl PostOrderRequest {
 		// Encode the order
 		let encoded_order = StandardOrder::abi_encode(&sol_order);
 
-		// Parse lock_type
-		let lock_type = quote
-			.lock_type
-			.parse::<LockType>()
-			.unwrap_or_else(|_| LockType::default());
+		// Derive lock_type from the OifOrder variant
+		let lock_type = LockType::from(&quote.order);
 
 		// Create final PostOrderRequest
 		tracing::debug!("Creating PostOrderRequest with lock_type: {:?}", lock_type);
@@ -1045,13 +1026,13 @@ mod tests {
 
 	#[test]
 	fn test_lock_serialization() {
-		let lock = Lock {
+		let lock = AssetLockReference {
 			kind: LockKind::TheCompact,
 			params: Some(serde_json::json!({"resource_id": "0x123"})),
 		};
 
 		let json = serde_json::to_string(&lock).unwrap();
-		let deserialized: Lock = serde_json::from_str(&json).unwrap();
+		let deserialized: AssetLockReference = serde_json::from_str(&json).unwrap();
 
 		assert!(matches!(deserialized.kind, LockKind::TheCompact));
 		assert!(deserialized.params.is_some());
@@ -1069,7 +1050,7 @@ mod tests {
 				address!("2222222222222222222222222222222222222222"),
 			),
 			amount: U256::from(5000),
-			lock: Some(Lock {
+			lock: Some(AssetLockReference {
 				kind: LockKind::TheCompact,
 				params: None,
 			}),
@@ -1238,26 +1219,24 @@ mod tests {
 	#[test]
 	fn test_quote_serialization() {
 		let quote = Quote {
-			orders: vec![QuoteOrder {
-				signature_type: SignatureType::Eip712,
-				domain: serde_json::to_value(InteropAddress::new_ethereum(
-					1,
-					address!("5555555555555555555555555555555555555555"),
-				))
-				.unwrap(),
-				primary_type: "TestType".to_string(),
-				message: serde_json::json!({"test": "value"}),
-			}],
-			details: QuoteDetails {
-				requested_outputs: vec![],
-				available_inputs: vec![],
+			order: OifOrder::OifEscrowV0 {
+				payload: OrderPayload {
+					signature_type: SignatureType::Eip712,
+					domain: serde_json::to_value(InteropAddress::new_ethereum(
+						1,
+						address!("5555555555555555555555555555555555555555"),
+					))
+					.unwrap(),
+					primary_type: "TestType".to_string(),
+					message: serde_json::json!({"test": "value"}),
+				},
 			},
-			valid_until: Some(1234567890),
+			failure_handling: FailureHandlingMode::RefundAutomatic,
+			partial_fill: false,
+			valid_until: 1234567890,
 			eta: Some(300),
 			quote_id: "quote_123".to_string(),
-			provider: "test_solver".to_string(),
-			cost: None,
-			lock_type: "permit2_escrow".to_string(),
+			provider: Some("test_solver".to_string()),
 		};
 
 		let json = serde_json::to_string(&quote).unwrap();
@@ -1267,7 +1246,7 @@ mod tests {
 
 		let deserialized: Quote = serde_json::from_str(&json).unwrap();
 		assert_eq!(deserialized.quote_id, "quote_123");
-		assert_eq!(deserialized.valid_until, Some(1234567890));
+		assert_eq!(deserialized.valid_until, 1234567890);
 		assert_eq!(deserialized.eta, Some(300));
 	}
 
@@ -1275,17 +1254,20 @@ mod tests {
 	fn test_get_quote_response_serialization() {
 		let response = GetQuoteResponse {
 			quotes: vec![Quote {
-				orders: vec![],
-				details: QuoteDetails {
-					requested_outputs: vec![],
-					available_inputs: vec![],
+				order: OifOrder::OifEscrowV0 {
+					payload: OrderPayload {
+						signature_type: SignatureType::Eip712,
+						domain: serde_json::json!({"chain": 1, "address": "0x0000000000000000000000000000000000000000"}),
+						primary_type: "TestType".to_string(),
+						message: serde_json::json!({"test": "value"}),
+					},
 				},
-				valid_until: None,
+				failure_handling: FailureHandlingMode::RefundAutomatic,
+				partial_fill: false,
+				valid_until: 1234567890,
 				eta: None,
 				quote_id: "test_quote".to_string(),
-				provider: "test_provider".to_string(),
-				cost: None,
-				lock_type: "permit2_escrow".to_string(),
+				provider: Some("test_provider".to_string()),
 			}],
 		};
 
