@@ -31,7 +31,7 @@ pub enum OriginMode {
 	Protocol,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthScheme {
 	Erc4337,
@@ -176,7 +176,6 @@ impl AssetLockReference {
 		match self.kind {
 			LockKind::TheCompact => resource_lock_order_type(version),
 			LockKind::Rhinestone => resource_lock_order_type(version),
-			_ => "unknown".to_string(),
 		}
 	}
 
@@ -189,8 +188,6 @@ impl AssetLockReference {
 	pub fn to_lock_type(&self) -> LockType {
 		match self.kind {
 			LockKind::TheCompact | LockKind::Rhinestone => LockType::ResourceLock,
-			// TODO: remove this once we align with new oif-spec
-			_ => LockType::Permit2Escrow,
 		}
 	}
 
@@ -353,11 +350,6 @@ pub enum LockKind {
 	#[serde(alias = "TheCompact", alias = "the_compact")]
 	TheCompact,
 	Rhinestone,
-	// TODO: Remove this once we align with new oif-spec
-	#[serde(alias = "Permit2", alias = "permit2")]
-	Permit2,
-	#[serde(alias = "EIP3009", alias = "eip3009", alias = "Eip3009")]
-	Eip3009,
 }
 
 // TODO: Remove these aliases entirely and update all code to use OrderInput/OrderOutput directly
@@ -442,6 +434,37 @@ impl QuoteInput {
 			Some(lock) => lock.infer_order_type(version),
 			None => oif_versions::escrow_order_type(version), // Default to escrow
 		}
+	}
+
+	/// Infer order type considering both lock and origin submission schemes
+	pub fn infer_order_type_with_origin(
+		&self,
+		version: &str,
+		origin_submission: Option<&OriginSubmission>,
+	) -> String {
+		// If there's a lock, use resource lock order type
+		if let Some(lock) = &self.lock {
+			return lock.infer_order_type(version);
+		}
+
+		// No lock - determine order type based on origin submission schemes
+		if let Some(origin) = origin_submission {
+			if let Some(schemes) = &origin.schemes {
+				// Check for EIP-3009 scheme
+				if schemes.contains(&AuthScheme::Eip3009) {
+					return oif_versions::eip3009_order_type(version);
+				}
+				// For Permit2 and other schemes, use escrow
+				if schemes.contains(&AuthScheme::Permit2)
+					|| schemes.contains(&AuthScheme::Erc20Permit)
+				{
+					return oif_versions::escrow_order_type(version);
+				}
+			}
+		}
+
+		// Default to escrow if no specific scheme is specified
+		oif_versions::escrow_order_type(version)
 	}
 
 	/// Infer order type using current version
@@ -605,7 +628,7 @@ pub struct IntentRequest {
 	pub intent_type: IntentType,
 	pub inputs: Vec<QuoteInput>,
 	pub outputs: Vec<QuoteOutput>,
-	#[serde(skip_serializing_if = "Option::is_none")]
+	#[serde(rename = "swapType", skip_serializing_if = "Option::is_none")]
 	pub swap_type: Option<SwapType>,
 	#[serde(rename = "minValidUntil", skip_serializing_if = "Option::is_none")]
 	pub min_valid_until: Option<u64>,

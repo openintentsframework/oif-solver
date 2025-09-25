@@ -229,8 +229,11 @@ impl QuoteValidator {
 
 		// Check that each input's inferred order type is compatible with supportedTypes
 		for input in &request.intent.inputs {
-			// Infer the order type with the current version
-			let inferred_order_type = input.infer_order_type(oif_versions::CURRENT);
+			// Infer the order type with the current version, considering origin submission schemes
+			let inferred_order_type = input.infer_order_type_with_origin(
+				oif_versions::CURRENT,
+				request.intent.origin_submission.as_ref(),
+			);
 
 			// Check if the inferred type (with version) is in the supported types list
 			if !request.supported_types.contains(&inferred_order_type) {
@@ -526,7 +529,7 @@ impl QuoteValidator {
 
 		if supported_assets.is_empty() {
 			return Err(QuoteError::UnsupportedAsset(
-				"None of the provided availableInputs are supported".to_string(),
+				"None of the provided inputs are supported".to_string(),
 			));
 		}
 

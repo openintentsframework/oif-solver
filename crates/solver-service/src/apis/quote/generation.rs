@@ -96,7 +96,10 @@ impl QuoteGenerator {
 		let mut quotes = Vec::new();
 		for input in &request.intent.inputs {
 			let order_input: OrderInput = input.try_into()?;
-			let custody_decision = self.custody_strategy.decide_custody(&order_input).await?;
+			let custody_decision = self
+				.custody_strategy
+				.decide_custody(&order_input, request.intent.origin_submission.as_ref())
+				.await?;
 			if let Ok(quote) = self
 				.generate_quote_for_settlement(request, context, config, &custody_decision)
 				.await
@@ -177,9 +180,6 @@ impl QuoteGenerator {
 				"RhinestoneLock".to_string(),
 				self.build_rhinestone_message(request, config, params)
 					.await?,
-			)),
-			_ => Err(QuoteError::UnsupportedIntentType(
-				"Unsupported lock kind".to_string(),
 			)),
 		}?;
 
@@ -1513,7 +1513,7 @@ mod tests {
 			_ => panic!("Expected escrow order type"),
 		}
 
-		// Verify failure handling and partial fill fields (new structure)
+		// Verify failure handling and partial fill fields
 		assert_eq!(quote.failure_handling, FailureHandlingMode::RefundAutomatic);
 		assert_eq!(quote.partial_fill, false);
 	}

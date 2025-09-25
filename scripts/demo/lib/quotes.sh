@@ -107,15 +107,17 @@ build_quote_request() {
     local output_token="$6"
     local output_amount="$7"
     local recipient="${8:-$user_address}"
-    local preference="${9:-$PREFERENCE_SPEED}"
+    local preference="${9:-speed}"
     local min_valid_until="${10:-600}"  # 10 minutes
+    local supported_types="${11:-[\"oif-escrow-v0\", \"oif-resource-lock-v0\", \"oif-3009-v0\"]}"
     
-    print_debug "Building quote request"
+    print_debug "Building quote request (new OIF spec)"
     print_debug "User: $user_address"
     print_debug "Input: $input_amount of $input_token on chain $input_chain_id"
     print_debug "Output: $output_amount of $output_token on chain $output_chain_id"
     print_debug "Recipient: $recipient"
     print_debug "Preference: $preference"
+    print_debug "Supported types: $supported_types"
     
     # Build UII addresses
     local user_uii=$(build_uii_address "$input_chain_id" "$user_address")
@@ -128,7 +130,7 @@ build_quote_request() {
     print_debug "Output token UII: $output_token_uii"
     print_debug "Recipient UII: $recipient_uii"
     
-    # Build quote request JSON
+    # Build quote request JSON with new OIF spec structure
     local quote_request=$(jq -n \
         --arg user "$user_uii" \
         --arg input_user "$user_uii" \
@@ -139,24 +141,30 @@ build_quote_request() {
         --arg output_amount "$output_amount" \
         --arg preference "$preference" \
         --argjson min_valid_until "$min_valid_until" \
+        --argjson supported_types "$supported_types" \
         '{
             user: $user,
-            availableInputs: [
-                {
-                    user: $input_user,
-                    asset: $input_asset,
-                    amount: $input_amount
-                }
-            ],
-            requestedOutputs: [
-                {
-                    receiver: $output_receiver,
-                    asset: $output_asset,
-                    amount: $output_amount
-                }
-            ],
-            preference: $preference,
-            minValidUntil: $min_valid_until
+            intent: {
+                intentType: "oif-swap",
+                inputs: [
+                    {
+                        user: $input_user,
+                        asset: $input_asset,
+                        amount: $input_amount
+                    }
+                ],
+                outputs: [
+                    {
+                        receiver: $output_receiver,
+                        asset: $output_asset,
+                        amount: $output_amount
+                    }
+                ],
+                swapType: "exact-input",
+                preference: $preference,
+                minValidUntil: $min_valid_until
+            },
+            supportedTypes: $supported_types
         }')
     
     echo "$quote_request"
@@ -279,13 +287,14 @@ request_token_swap_quote() {
     local output_amount="$8"
     local recipient="${9:-$user_address}"
     local api_url="${10:-http://localhost:3000/api/quotes}"
+    local supported_types="${11:-[\"oif-escrow-v0\", \"oif-resource-lock-v0\", \"oif-3009-v0\"]}"
     
     print_header "Requesting Token Swap Quote"
     
-    # Build quote request
+    # Build quote request (with configurable supported types)
     local quote_request=$(build_quote_request \
         "$user_address" "$input_chain_id" "$input_token" "$input_amount" \
-        "$output_chain_id" "$output_token" "$output_amount" "$recipient")
+        "$output_chain_id" "$output_token" "$output_amount" "$recipient" "speed" 600 "$supported_types")
     
     if [ -z "$quote_request" ]; then
         print_error "Failed to build quote request"
@@ -568,20 +577,24 @@ quote_get() {
         print_info "A quote request intent should have the following structure:"
         print_info '  {
     "user": "chain_id:user_address",
-    "inputs": [
-      {
-        "user": "chain_id:user_address",
-        "asset": "chain_id:token_address",
-        "amount": "amount_in_wei"
-      }
-    ],
-    "outputs": [
-      {
-        "receiver": "chain_id:recipient_address",
-        "asset": "chain_id:token_address",
-        "amount": "amount_in_wei"
-      }
-    ]
+    "intent": {
+      "intentType": "oif-swap",
+      "inputs": [
+        {
+          "user": "chain_id:user_address",
+          "asset": "chain_id:token_address",
+          "amount": "amount_in_wei"
+        }
+      ],
+      "outputs": [
+        {
+          "receiver": "chain_id:recipient_address",
+          "asset": "chain_id:token_address",
+          "amount": "amount_in_wei"
+        }
+      ]
+    },
+    "supportedTypes": ["oif-escrow-v0"]
   }'
         print_info ""
         print_info "Example: Create a quote request for swapping 1 TokenA on chain 31337 to 1 TokenA on chain 31338"
@@ -592,8 +605,13 @@ quote_get() {
     # Convert intent to quote request format
     # Extract key fields from intent for quote request
     local user=$(echo "$intent_json" | jq -r '.user // empty')
-    local inputs=$(echo "$intent_json" | jq -c '.inputs // .availableInputs // []')
-    local outputs=$(echo "$intent_json" | jq -c '.outputs // .requestedOutputs // []')
+    local inputs=$(echo "$intent_json" | jq -c '.intent.inputs // []')
+    local outputs=$(echo "$intent_json" | jq -c '.intent.outputs // []')
+    local swap_type=$(echo "$intent_json" | jq -r '.intent.swapType // "exact-input"')
+    local preference=$(echo "$intent_json" | jq -r '.intent.preference // "speed"')
+    local min_valid_until=$(echo "$intent_json" | jq -r '.intent.minValidUntil // 600')
+    local origin_submission=$(echo "$intent_json" | jq -c '.intent.originSubmission // null')
+    local supported_types=$(echo "$intent_json" | jq -c '.supportedTypes // ["oif-escrow-v0", "oif-resource-lock-v0", "oif-3009-v0"]')
     
     if [ -z "$user" ] || [ "$user" = "null" ]; then
         # Try to extract from sponsor field if present
@@ -610,18 +628,47 @@ quote_get() {
         fi
     fi
     
-    # Build quote request from intent
+    # Build quote request from intent (preserving all original fields)
+    local quote_request_template='{
+        user: $user,
+        intent: {
+            intentType: "oif-swap",
+            inputs: $inputs,
+            outputs: $outputs,
+            swapType: $swap_type,
+            preference: $preference,
+            minValidUntil: ($min_valid_until | tonumber)
+        },
+        supportedTypes: $supported_types
+    }'
+    
+    # Add originSubmission if it exists
+    if [ "$origin_submission" != "null" ]; then
+        quote_request_template='{
+            user: $user,
+            intent: {
+                intentType: "oif-swap",
+                inputs: $inputs,
+                outputs: $outputs,
+                swapType: $swap_type,
+                preference: $preference,
+                minValidUntil: ($min_valid_until | tonumber),
+                originSubmission: $origin_submission
+            },
+            supportedTypes: $supported_types
+        }'
+    fi
+    
     local quote_request=$(jq -n \
         --arg user "$user" \
         --argjson inputs "$inputs" \
         --argjson outputs "$outputs" \
-        '{
-            user: $user,
-            availableInputs: $inputs,
-            requestedOutputs: $outputs,
-            preference: "speed",
-            minValidUntil: 600
-        }')
+        --arg swap_type "$swap_type" \
+        --arg preference "$preference" \
+        --arg min_valid_until "$min_valid_until" \
+        --argjson origin_submission "$origin_submission" \
+        --argjson supported_types "$supported_types" \
+        "$quote_request_template")
     
     # Request quote
     if request_quote "$quote_request" "$api_url"; then
