@@ -7,19 +7,31 @@
 
 use crate::engine::token_manager::{TokenManager, TokenManagerError};
 use alloy_primitives::U256;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
 use solver_pricing::PricingService;
 use solver_types::{
 	costs::{CostComponent, CostEstimate},
-	current_timestamp, APIError, Address, ApiErrorType, AvailableInput, ExecutionParams, FillProof,
-	Order, Quote, RequestedOutput, Transaction, TransactionHash, DEFAULT_GAS_PRICE_WEI,
+	current_timestamp, APIError, Address, ApiErrorType, ExecutionParams, FillProof, Order,
+	OrderInput, OrderOutput, Quote, QuoteInput, QuoteOutput, Transaction, TransactionHash,
+	DEFAULT_GAS_PRICE_WEI,
 };
 use std::{str::FromStr, sync::Arc};
 use thiserror::Error;
 
 const HUNDRED: i64 = 10000;
+
+/// Cost context for quote generation with pre-calculated costs
+#[derive(Debug, Clone)]
+pub struct CostContext {
+	pub total_gas_cost_usd: Decimal,
+	pub solver_margin_bps: u32,
+	pub execution_costs_by_chain: std::collections::HashMap<u64, Decimal>,
+	pub liquidity_cost_adjustment: Decimal,
+	pub protocol_fees: std::collections::HashMap<String, Decimal>,
+}
 
 #[derive(Debug, Error)]
 pub enum CostProfitError {
@@ -70,16 +82,15 @@ impl CostProfitService {
 		}
 	}
 
-	/// Estimate cost for a Quote
-	pub async fn estimate_cost_for_quote(
+	/// Calculate cost context before quote generation
+	pub async fn calculate_cost_context(
 		&self,
-		quote: &Quote,
+		inputs: &[QuoteInput],
+		outputs: &[QuoteOutput],
 		config: &Config,
-	) -> Result<CostEstimate, CostProfitError> {
-		// Extract chain parameters from quote
-		let origin_chain_id = quote
-			.details
-			.available_inputs
+	) -> Result<CostContext, CostProfitError> {
+		// Extract chain IDs
+		let origin_chain_id = inputs
 			.iter()
 			.filter_map(|input| input.asset.ethereum_chain_id().ok())
 			.next()
@@ -89,9 +100,7 @@ impl CostProfitService {
 				details: None,
 			})?;
 
-		let dest_chain_id = quote
-			.details
-			.requested_outputs
+		let dest_chain_id = outputs
 			.iter()
 			.filter_map(|output| output.asset.ethereum_chain_id().ok())
 			.next()
@@ -101,44 +110,109 @@ impl CostProfitService {
 				details: None,
 			})?;
 
-		let chain_params = ChainParams {
+		// Get gas prices
+		let origin_gp = self.get_chain_gas_price(origin_chain_id).await?;
+		let dest_gp = self.get_chain_gas_price(dest_chain_id).await?;
+
+		// Use config gas units for now
+		let flow_key = None; // Will be determined from lock type later
+		let (open_units, fill_units, claim_units) =
+			estimate_gas_units_from_config(&flow_key, config, 200000, 150000, 100000);
+
+		// Calculate gas costs
+		let open_cost_wei = origin_gp.saturating_mul(U256::from(open_units));
+		let fill_cost_wei = dest_gp.saturating_mul(U256::from(fill_units));
+		let claim_cost_wei = origin_gp.saturating_mul(U256::from(claim_units));
+		let total_gas_wei = open_cost_wei + fill_cost_wei + claim_cost_wei;
+
+		// Convert to USD
+		let total_gas_usd_str = self
+			.pricing_service
+			.wei_to_currency(&total_gas_wei.to_string(), "USD")
+			.await
+			.unwrap_or_else(|_| "0".to_string());
+		let total_gas_cost_usd = Decimal::from_str(&total_gas_usd_str).unwrap_or(Decimal::ZERO);
+
+		// Build execution costs by chain
+		let mut execution_costs_by_chain = std::collections::HashMap::new();
+		execution_costs_by_chain.insert(
 			origin_chain_id,
-			dest_chain_id,
-		};
-
-		// Extract flow key (lock_type) for gas config lookup
-		let flow_key = Some(quote.lock_type.clone());
-
-		// TODO: pass standard as part of quote request
-		let standard = "eip7683";
-		let order = quote
-			.to_order_for_estimation(standard)
-			.map_err(|e| APIError::BadRequest {
-				error_type: ApiErrorType::InvalidRequest,
-				message: format!("Failed to convert quote to order: {}", e),
-				details: None,
-			})?;
-
-		// Estimate gas units
-		let gas_units = self
-			.estimate_gas_units(
-				&order,
-				&flow_key,
-				config,
-				chain_params.origin_chain_id,
-				chain_params.dest_chain_id,
+			Decimal::from_str(
+				&self
+					.pricing_service
+					.wei_to_currency(&(open_cost_wei + claim_cost_wei).to_string(), "USD")
+					.await
+					.unwrap_or_else(|_| "0".to_string()),
 			)
-			.await?;
+			.unwrap_or(Decimal::ZERO),
+		);
+		execution_costs_by_chain.insert(
+			dest_chain_id,
+			Decimal::from_str(
+				&self
+					.pricing_service
+					.wei_to_currency(&fill_cost_wei.to_string(), "USD")
+					.await
+					.unwrap_or_else(|_| "0".to_string()),
+			)
+			.unwrap_or(Decimal::ZERO),
+		);
 
-		// Calculate cost components
-		self.calculate_cost_components(
-			chain_params,
-			gas_units,
-			&quote.details.available_inputs,
-			&quote.details.requested_outputs,
-			config,
-		)
-		.await
+		Ok(CostContext {
+			total_gas_cost_usd,
+			solver_margin_bps: (config.solver.min_profitability_pct * Decimal::new(100, 0))
+				.to_u32()
+				.unwrap_or(50), // Convert percentage to basis points
+			execution_costs_by_chain,
+			liquidity_cost_adjustment: Decimal::ZERO,
+			protocol_fees: std::collections::HashMap::new(),
+		})
+	}
+
+	/// Estimate cost for a Quote
+	pub async fn estimate_cost_for_quote(
+		&self,
+		_quote: &Quote,
+		_config: &Config,
+	) -> Result<CostEstimate, CostProfitError> {
+		Err(CostProfitError::Calculation(
+			"Quote cost estimation not yet implemented for new OIF structure".to_string(),
+		))
+
+		// let (origin_chain_id, dest_chain_id) = self.extract_chain_ids_from_quote(quote)?;
+
+		// let chain_params = ChainParams {
+		// 	origin_chain_id,
+		// 	dest_chain_id,
+		// };
+
+		// // Extract flow key from order type using helper method
+		// let flow_key = quote.order.flow_key();
+
+		// // TODO: pass standard as part of quote request
+		// let standard = "eip7683";
+		// let order = quote
+		// 	.to_order_for_estimation(standard)
+		// 	.map_err(|e| APIError::BadRequest {
+		// 		error_type: ApiErrorType::InvalidRequest,
+		// 		message: format!("Failed to convert quote to order: {}", e),
+		// 		details: None,
+		// 	})?;
+
+		// // Estimate gas units
+		// let gas_units = self
+		// 	.estimate_gas_units(
+		// 		&order,
+		// 		&flow_key,
+		// 		config,
+		// 		chain_params.origin_chain_id,
+		// 		chain_params.dest_chain_id,
+		// 	)
+		// 	.await?;
+
+		// // Calculate cost components
+		// self.calculate_cost_components(chain_params, gas_units, &inputs, &outputs, config)
+		// 	.await
 	}
 
 	/// Estimate cost for an Order using its OrderParsable implementation
@@ -559,8 +633,8 @@ impl CostProfitService {
 		&self,
 		chain_params: ChainParams,
 		gas_units: GasUnits,
-		available_inputs: &[AvailableInput],
-		requested_outputs: &[RequestedOutput],
+		available_inputs: &[OrderInput],
+		requested_outputs: &[OrderOutput],
 		config: &Config,
 	) -> Result<CostEstimate, CostProfitError> {
 		let pricing = self.pricing_service.config();
@@ -698,8 +772,8 @@ impl CostProfitService {
 	/// Calculate the base price and minimum profit requirement in USD
 	async fn calculate_pricing_components(
 		&self,
-		available_inputs: &[AvailableInput],
-		requested_outputs: &[RequestedOutput],
+		available_inputs: &[OrderInput],
+		requested_outputs: &[OrderOutput],
 		config: &Config,
 	) -> Result<(String, String), Box<dyn std::error::Error>> {
 		// Calculate total input value in USD

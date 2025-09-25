@@ -75,9 +75,7 @@ pub use validation::QuoteValidator;
 
 use solver_config::{Config, QuoteConfig};
 use solver_core::SolverEngine;
-use solver_types::{
-	GetQuoteRequestV1 as GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, StorageKey,
-};
+use solver_types::{GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, StorageKey};
 
 use std::time::Duration;
 use tracing::info;
@@ -93,11 +91,11 @@ pub async fn process_quote_request(
 ) -> Result<GetQuoteResponse, QuoteError> {
 	info!(
 		"Processing quote request with {} inputs",
-		request.available_inputs.len()
+		request.intent.inputs.len()
 	);
 
-	// Validate the request
-	QuoteValidator::validate_request(&request)?;
+	// Use the new validation architecture to get ValidatedQuoteContext
+	let validated_context = QuoteValidator::validate_quote_request(&request, solver)?;
 
 	// Check solver capabilities: networks only (token support is enforced during collection below)
 	QuoteValidator::validate_supported_networks(&request, solver)?;
@@ -115,7 +113,9 @@ pub async fn process_quote_request(
 	let settlement_service = solver.settlement();
 	let delivery_service = solver.delivery();
 	let quote_generator = QuoteGenerator::new(settlement_service.clone(), delivery_service.clone());
-	let mut quotes = quote_generator.generate_quotes(&request, config).await?;
+	let mut quotes = quote_generator
+		.generate_quotes(&request, &validated_context, config)
+		.await?;
 
 	// Enrich quotes with a preliminary cost breakdown using CostProfitService
 	let cost_profit_service = solver_core::engine::cost_profit::CostProfitService::new(
@@ -130,7 +130,8 @@ pub async fn process_quote_request(
 			.await
 		{
 			Ok(cost) => {
-				quote.cost = Some(cost);
+				// quote.cost = Some(cost);
+				println!("cost: {:#?}", cost);
 			},
 			Err(e) => {
 				tracing::warn!(

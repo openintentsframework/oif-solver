@@ -38,14 +38,14 @@
 //! - Custom protocol support (token-specific features)
 
 use solver_types::standards::eip7683::LockType;
-use solver_types::{AvailableInput, Lock, LockKind, QuoteError};
+use solver_types::{AssetLockReference, AvailableInput, LockKind, QuoteError};
 
 use super::registry::PROTOCOL_REGISTRY;
 
 /// Custody strategy decision
 #[derive(Debug, Clone)]
 pub enum CustodyDecision {
-	ResourceLock { lock: Lock },
+	ResourceLock { lock: AssetLockReference },
 	Escrow { lock_type: LockType },
 }
 
@@ -69,7 +69,7 @@ impl CustodyStrategy {
 
 	fn handle_explicit_lock(
 		&self,
-		lock: &solver_types::Lock,
+		lock: &solver_types::AssetLockReference,
 	) -> Result<CustodyDecision, QuoteError> {
 		match lock.kind {
 			LockKind::TheCompact => Ok(CustodyDecision::ResourceLock { lock: lock.clone() }),
