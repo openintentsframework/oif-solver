@@ -295,8 +295,8 @@ sign_compact_order() {
     local domain_separator=$(cast_cmd "call" "$compact_address" "DOMAIN_SEPARATOR()" --rpc-url "http://localhost:8545" 2>/dev/null || echo "")
     
     if [ -z "$domain_separator" ] || [ "$domain_separator" = "null" ]; then
-        # Fallback to computed domain separator
-        domain_separator=$(compute_domain_separator "TheCompact" "1" "$chain_id" "$compact_address")
+        print_error "Failed to get DOMAIN_SEPARATOR from contract at $compact_address"
+        return 1
     fi
     print_debug "Domain separator: $domain_separator"
     
@@ -621,18 +621,12 @@ compute_compact_digest_from_quote() {
 
     print_debug "Domain: name=$name, version=$version, chainId=$chain_id, contract=$verifying_contract" >&2
 
-    # Get domain separator from TheCompact contract instead of computing manually
+    # Get domain separator from TheCompact contract
     local domain_separator=$(cast_cmd "call" "$verifying_contract" "DOMAIN_SEPARATOR()" --rpc-url "http://localhost:8545" 2>/dev/null || echo "")
     
     if [ -z "$domain_separator" ] || [ "$domain_separator" = "null" ]; then
-        # Fallback to computed domain separator if contract call fails
-        local domain_type_hash=$(compute_type_hash "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
-        local name_hash=$(cast_keccak "$name")
-        local version_hash=$(cast_keccak "$version")
-
-        domain_separator=$(cast_abi_encode "f(bytes32,bytes32,bytes32,uint256,address)" \
-            "$domain_type_hash" "$name_hash" "$version_hash" "$chain_id" "$verifying_contract")
-        domain_separator=$(cast_keccak "$domain_separator")
+        print_error "Failed to get DOMAIN_SEPARATOR from contract at $verifying_contract" >&2
+        return 1
     fi
 
     print_debug "Domain separator: $domain_separator" >&2

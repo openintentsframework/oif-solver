@@ -802,19 +802,15 @@ quote_accept() {
                     fi
 
                     # Sign this individual EIP-3009 authorization
-                    if [ -n "$domain_separator" ] && [ "$domain_separator" != "empty" ]; then
-                        # Use new function with computed domain separator
-                        local individual_signature=$(sign_eip3009_authorization_with_domain \
-                            "$user_key" "$origin_chain_id" "$token_contract" \
-                            "$from_address" "$to_address" "$value" \
-                            "$valid_after" "$valid_before" "$nonce" "$domain_separator")
-                    else
-                        # Fallback to old function that queries the contract
-                        local individual_signature=$(sign_eip3009_authorization \
-                            "$user_key" "$origin_chain_id" "$token_contract" \
-                            "$from_address" "$to_address" "$value" \
-                            "$valid_after" "$valid_before" "$nonce")
+                    if [ -z "$domain_separator" ] || [ "$domain_separator" = "empty" ]; then
+                        print_error "No domain separator available for EIP-3009 signing"
+                        return 1
                     fi
+                    
+                    local individual_signature=$(sign_eip3009_authorization_with_domain \
+                        "$user_key" "$origin_chain_id" "$token_contract" \
+                        "$from_address" "$to_address" "$value" \
+                        "$valid_after" "$valid_before" "$nonce" "$domain_separator")
 
                     if [ -z "$individual_signature" ]; then
                         print_error "Failed to sign EIP-3009 order $((i+1))"
@@ -951,19 +947,15 @@ quote_accept() {
                 fi
 
                 # Sign EIP-3009 authorization with the correct nonce
-                if [ -n "$domain_separator" ] && [ "$domain_separator" != "empty" ]; then
-                    # Use new function with computed domain separator
-                    signature=$(sign_eip3009_authorization_with_domain \
-                        "$user_key" "$origin_chain_id" "$token_contract" \
-                        "$from_address" "$to_address" "$value" \
-                        "$valid_after" "$valid_before" "$final_nonce" "$domain_separator")
-                else
-                    # Fallback to old function that queries the contract
-                    signature=$(sign_eip3009_authorization \
-                        "$user_key" "$origin_chain_id" "$token_contract" \
-                        "$from_address" "$to_address" "$value" \
-                        "$valid_after" "$valid_before" "$final_nonce")
+                if [ -z "$domain_separator" ] || [ "$domain_separator" = "empty" ]; then
+                    print_error "No domain separator available for EIP-3009 signing"
+                    return 1
                 fi
+                
+                signature=$(sign_eip3009_authorization_with_domain \
+                    "$user_key" "$origin_chain_id" "$token_contract" \
+                    "$from_address" "$to_address" "$value" \
+                    "$valid_after" "$valid_before" "$final_nonce" "$domain_separator")
 
                 if [ -z "$signature" ]; then
                     print_error "Failed to sign EIP-3009 order"
