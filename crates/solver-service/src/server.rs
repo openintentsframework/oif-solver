@@ -284,10 +284,10 @@ async fn handle_order(
 
 	// Extract standard, default to eip7683
 	let standard = "eip7683"; // TODO: define properly.
-	// let standard = payload
-	// 	.get("standard")
-	// 	.and_then(|s| s.as_str())
-	// 	.unwrap_or("eip7683");
+						   // let standard = payload
+						   // 	.get("standard")
+						   // 	.and_then(|s| s.as_str())
+						   // 	.unwrap_or("eip7683");
 
 	// Convert payload to PostOrderRequest
 	let intent_request = match extract_intent_request(payload.clone(), &state, standard).await {
@@ -337,7 +337,7 @@ async fn create_intent_from_quote(
 			message: "Missing quoteId in request".to_string(),
 			details: None,
 		})?;
-	
+
 	let signature = payload
 		.get("signature")
 		.and_then(|v| {
@@ -376,19 +376,17 @@ async fn create_intent_from_quote(
 				details: Some(serde_json::json!({"quoteId": quote_id})),
 			}
 		})?;
-	
+
 	tracing::info!("Successfully retrieved quote, attempting conversion to PostOrderRequest");
 	// Convert Quote to PostOrderRequest using the TryFrom implementation
-	let result = (&quote, signature, standard)
-		.try_into()
-		.map_err(|e| {
-			tracing::error!("Quote conversion failed: {}", e);
-			APIError::InternalServerError {
-				error_type: ApiErrorType::QuoteConversionFailed,
-				message: format!("Failed to convert quote to intent format: {}", e),
-			}
-		})?;
-	
+	let result = (&quote, signature, standard).try_into().map_err(|e| {
+		tracing::error!("Quote conversion failed: {}", e);
+		APIError::InternalServerError {
+			error_type: ApiErrorType::QuoteConversionFailed,
+			message: format!("Failed to convert quote to intent format: {}", e),
+		}
+	})?;
+
 	tracing::info!("Quote conversion successful, PostOrderRequest created");
 	Ok(result)
 }

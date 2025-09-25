@@ -430,7 +430,7 @@ impl interfaces::StandardOrder {
 				.domain
 				.as_object()
 				.ok_or("Missing 'domain' object in payload")?;
-			
+
 			domain
 				.get("chainId")
 				.and_then(|c| c.as_str().and_then(|s| s.parse::<u64>().ok()))
@@ -448,7 +448,8 @@ impl interfaces::StandardOrder {
 		// 	.ok_or("Missing spender in EIP-712 data")?;
 		// TODO we have to ecrecover the user address from the signature
 		let user_address_str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8".to_string();
-		let user_address = Address::from_slice(&hex::decode(user_address_str.trim_start_matches("0x"))?);
+		let user_address =
+			Address::from_slice(&hex::decode(user_address_str.trim_start_matches("0x"))?);
 		// Extract nonce - directly in message now
 		let nonce_str = eip712_data
 			.get("nonce")
@@ -570,9 +571,12 @@ impl interfaces::StandardOrder {
 			inputs,
 			outputs: sol_outputs,
 		};
-		
-		tracing::info!("Successfully created StandardOrder with {} inputs and {} outputs", 
-			standard_order.inputs.len(), standard_order.outputs.len());
+
+		tracing::info!(
+			"Successfully created StandardOrder with {} inputs and {} outputs",
+			standard_order.inputs.len(),
+			standard_order.outputs.len()
+		);
 		Ok(standard_order)
 	}
 
