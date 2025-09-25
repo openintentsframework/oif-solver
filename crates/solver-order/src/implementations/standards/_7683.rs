@@ -246,7 +246,6 @@ impl OrderInterface for Eip7683OrderImpl {
 		// Decode the raw order bytes into StandardOrder struct
 		let order_struct = Self::decode_standard_order(raw_order_data)?;
 
-		// Use the InputSettlerEscrow openFor call with StandardOrder struct
 		let signature_bytes = hex::decode(signature.trim_start_matches("0x"))
 			.map_err(|e| OrderError::ValidationFailed(format!("Invalid signature: {}", e)))?;
 
@@ -701,7 +700,6 @@ impl OrderInterface for Eip7683OrderImpl {
 		tx_data.extend_from_slice(&settler_address.0);
 		tx_data.extend_from_slice(&calldata);
 
-		// Compute order ID using the callback
 		let order_id_bytes = order_id_callback(chain_id, tx_data).await.map_err(|e| {
 			OrderError::ValidationFailed(format!("Failed to compute order ID: {}", e))
 		})?;

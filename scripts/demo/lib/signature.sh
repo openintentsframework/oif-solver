@@ -292,11 +292,11 @@ sign_compact_order() {
     print_debug "Input settler compact: $input_settler_compact"
     
     # Get TheCompact domain separator from chain
-    local domain_separator=$(cast call "$compact_address" "DOMAIN_SEPARATOR()" --rpc-url "http://localhost:8545" 2>/dev/null || echo "")
+    local domain_separator=$(cast_cmd "call" "$compact_address" "DOMAIN_SEPARATOR()" --rpc-url "http://localhost:8545" 2>/dev/null || echo "")
     
     if [ -z "$domain_separator" ] || [ "$domain_separator" = "null" ]; then
-        # Fallback to computed domain separator
-        domain_separator=$(compute_domain_separator "TheCompact" "1" "$chain_id" "$compact_address")
+        print_error "Failed to get DOMAIN_SEPARATOR from contract at $compact_address"
+        return 1
     fi
     print_debug "Domain separator: $domain_separator"
     
@@ -457,7 +457,7 @@ sign_eip3009_order() {
     
     # Get token domain separator for EIP-3009
     print_debug "Getting DOMAIN_SEPARATOR from token at $token_address via $rpc_url" >&2
-    local domain_separator=$(cast call "$token_address" "DOMAIN_SEPARATOR()" --rpc-url "$rpc_url" 2>/dev/null || echo "")
+    local domain_separator=$(cast_cmd "call" "$token_address" "DOMAIN_SEPARATOR()" --rpc-url "$rpc_url" 2>/dev/null || echo "")
     
     if [ -z "$domain_separator" ] || [ "$domain_separator" = "null" ] || [ "$domain_separator" = "0x" ]; then
         print_error "Token at $token_address does not support EIP-712 domain separator" >&2
@@ -512,6 +512,69 @@ sign_eip3009_order() {
     echo "$signature"
 }
 
+# Generate EIP-3009 authorization signature with pre-computed domain separator
+sign_eip3009_authorization_with_domain() {
+    local user_private_key="$1"
+    local origin_chain_id="$2"
+    local token_contract="$3"
+    local from_address="$4"
+    local to_address="$5"
+    local value="$6"
+    local valid_after="$7"
+    local valid_before="$8"
+    local nonce="$9"
+    local domain_separator="${10}"  # Pre-computed domain separator
+    
+    print_debug "Signing EIP-3009 authorization with pre-computed domain separator" >&2
+    print_debug "Token: $token_contract" >&2
+    print_debug "From: $from_address, To: $to_address" >&2
+    print_debug "Value: $value, Nonce: $nonce" >&2
+    print_debug "Using domain separator: $domain_separator" >&2
+    
+    # Build EIP-3009 signature for receiveWithAuthorization
+    local eip3009_type_hash=$(cast_keccak "ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)")
+    
+    # Convert nonce from hex string to bytes32 if needed
+    local nonce_bytes32="$nonce"
+    if [[ ! "$nonce" =~ ^0x[0-9a-fA-F]{64}$ ]]; then
+        # If nonce is not already a 64-char hex string, pad it
+        nonce_bytes32=$(printf "0x%064s" "${nonce#0x}" | tr ' ' '0')
+    fi
+    
+    # Encode the struct hash
+    local struct_encoded=$(cast_abi_encode "f(bytes32,address,address,uint256,uint256,uint256,bytes32)" \
+        "$eip3009_type_hash" \
+        "$from_address" \
+        "$to_address" \
+        "$value" \
+        "$valid_after" \
+        "$valid_before" \
+        "$nonce_bytes32")
+    
+    local struct_hash=$(cast_keccak "$struct_encoded")
+    
+    print_debug "EIP-3009 struct hash: $struct_hash" >&2
+    
+    # Create EIP-712 digest
+    local digest_prefix="0x1901"
+    local digest="${digest_prefix}${domain_separator#0x}${struct_hash#0x}"
+    local final_digest=$(cast_keccak "$digest")
+    
+    print_debug "EIP-3009 final digest: $final_digest" >&2
+    
+    # Sign the digest using --no-hash flag for EIP-712 signatures
+    local signature=$(cast wallet sign --no-hash --private-key "$user_private_key" "$final_digest")
+    
+    if [ -z "$signature" ]; then
+        print_error "Failed to generate EIP-3009 authorization signature" >&2
+        return 1
+    fi
+    
+    print_success "EIP-3009 authorization signature generated" >&2
+    echo "$signature"
+}
+
+
 # Simple signature workflow for standard intents
 sign_standard_intent() {
     local user_private_key="$1"
@@ -558,18 +621,12 @@ compute_compact_digest_from_quote() {
 
     print_debug "Domain: name=$name, version=$version, chainId=$chain_id, contract=$verifying_contract" >&2
 
-    # Get domain separator from TheCompact contract instead of computing manually
-    local domain_separator=$(cast call "$verifying_contract" "DOMAIN_SEPARATOR()" --rpc-url "http://localhost:8545" 2>/dev/null || echo "")
+    # Get domain separator from TheCompact contract
+    local domain_separator=$(cast_cmd "call" "$verifying_contract" "DOMAIN_SEPARATOR()" --rpc-url "http://localhost:8545" 2>/dev/null || echo "")
     
     if [ -z "$domain_separator" ] || [ "$domain_separator" = "null" ]; then
-        # Fallback to computed domain separator if contract call fails
-        local domain_type_hash=$(compute_type_hash "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
-        local name_hash=$(cast_keccak "$name")
-        local version_hash=$(cast_keccak "$version")
-
-        domain_separator=$(cast_abi_encode "f(bytes32,bytes32,bytes32,uint256,address)" \
-            "$domain_type_hash" "$name_hash" "$version_hash" "$chain_id" "$verifying_contract")
-        domain_separator=$(cast_keccak "$domain_separator")
+        print_error "Failed to get DOMAIN_SEPARATOR from contract at $verifying_contract" >&2
+        return 1
     fi
 
     print_debug "Domain separator: $domain_separator" >&2
@@ -680,10 +737,15 @@ sign_compact_digest_from_quote() {
 
     print_debug "Starting BatchCompact signing with client-side digest computation" >&2
 
-    # Extract EIP-712 message for client computation
+    # For compact orders, the message contains an .eip712 field with the actual EIP-712 message
     local eip712_message=$(echo "$full_message" | jq -r '.eip712 // empty' 2>/dev/null)
     if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ] || [ "$eip712_message" = "empty" ]; then
-        print_error "No EIP-712 message found for digest computation" >&2
+        # If no .eip712 field, use message directly
+        eip712_message="$full_message"
+    fi
+    
+    if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ]; then
+        print_error "No message found for digest computation" >&2
         return 1
     fi
 
@@ -711,21 +773,70 @@ sign_compact_digest_from_quote() {
     echo "$signature"
 }
 
-# Compute EIP-712 digest for PermitBatchWitnessTransferFrom from quote JSON
+# Sign PermitBatchWitnessTransferFrom digest from quote using client-side computation
+sign_permit2_digest_from_quote() {
+    local user_private_key="$1"
+    local full_message="$2"
+
+    print_debug "Starting PermitBatchWitnessTransferFrom signing with client-side digest computation" >&2
+
+    # Use message directly for client computation
+    local eip712_message="$full_message"
+    if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ]; then
+        print_error "No message found for digest computation" >&2
+        return 1
+    fi
+
+    # Always compute client-side digest
+    print_info "Computing client-side digest..." >&2
+    local client_digest=$(compute_permit2_digest_from_quote "$eip712_message")
+    if [ $? -ne 0 ] || [ -z "$client_digest" ]; then
+        print_error "Failed to compute client-side digest" >&2
+        return 1
+    fi
+    print_debug "Client computed digest: $client_digest" >&2
+
+    # Use client-computed digest for signing
+    print_info "Signing with client-computed digest: $client_digest" >&2
+
+    # Sign the digest (no-hash since we already have the digest)
+    local signature=$(cast wallet sign --no-hash --private-key "$user_private_key" "$client_digest")
+    if [ $? -ne 0 ] || [ -z "$signature" ]; then
+        print_error "Failed to sign digest" >&2
+        return 1
+    fi
+
+    print_debug "Raw signature: $signature" >&2
+    print_success "PermitBatchWitnessTransferFrom signature generated with client-side digest" >&2
+    echo "$signature"
+}
+
+# Compute EIP-712 digest for PermitBatchWitnessTransferFrom from quote JSON (with domain object support)
 compute_permit2_digest_from_quote() {
     local eip712_message="$1"
+    local quote_domain="${2:-}" # Optional: domain object from quote level
 
     print_debug "Computing PermitBatchWitnessTransferFrom digest from EIP-712 message" >&2
 
+    # Get domain from quote level if provided, otherwise error
+    local domain=""
+    if [ -n "$quote_domain" ] && echo "$quote_domain" | jq -e 'type == "object"' > /dev/null 2>&1; then
+        # Structured domain format from quote level
+        domain="$quote_domain"
+        print_debug "Using domain from quote level" >&2
+    else
+        print_error "No valid domain provided" >&2
+        return 1
+    fi
+
     # Extract domain information
-    local domain=$(echo "$eip712_message" | jq -r '.signing.domain // .domain')
     local name=$(echo "$domain" | jq -r '.name')
     local chain_id=$(echo "$domain" | jq -r '.chainId')
     local verifying_contract=$(echo "$domain" | jq -r '.verifyingContract')
 
     print_debug "Domain: name=$name, chainId=$chain_id, contract=$verifying_contract" >&2
 
-    # Get Permit2 domain separator
+    # Get Permit2 domain separator (compute it or use existing function)
     local domain_separator=$(get_permit2_domain_separator "$chain_id" "$verifying_contract")
     print_debug "Domain separator: $domain_separator" >&2
 
@@ -815,44 +926,6 @@ compute_permit2_digest_from_quote() {
     echo "$final_digest"
 }
 
-# Sign PermitBatchWitnessTransferFrom digest from quote using client-side computation
-sign_permit2_digest_from_quote() {
-    local user_private_key="$1"
-    local full_message="$2"
-
-    print_debug "Starting PermitBatchWitnessTransferFrom signing with client-side digest computation" >&2
-
-    # Extract EIP-712 message for client computation
-    local eip712_message=$(echo "$full_message" | jq -r '.eip712 // empty' 2>/dev/null)
-    if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ] || [ "$eip712_message" = "empty" ]; then
-        print_error "No EIP-712 message found for digest computation" >&2
-        return 1
-    fi
-
-    # Always compute client-side digest
-    print_info "Computing client-side digest..." >&2
-    local client_digest=$(compute_permit2_digest_from_quote "$eip712_message")
-    if [ $? -ne 0 ] || [ -z "$client_digest" ]; then
-        print_error "Failed to compute client-side digest" >&2
-        return 1
-    fi
-    print_debug "Client computed digest: $client_digest" >&2
-
-    # Use client-computed digest for signing
-    print_info "Signing with client-computed digest: $client_digest" >&2
-
-    # Sign the digest (no-hash since we already have the digest)
-    local signature=$(cast wallet sign --no-hash --private-key "$user_private_key" "$client_digest")
-    if [ $? -ne 0 ] || [ -z "$signature" ]; then
-        print_error "Failed to sign digest" >&2
-        return 1
-    fi
-
-    print_debug "Raw signature: $signature" >&2
-    print_success "PermitBatchWitnessTransferFrom signature generated with client-side digest" >&2
-    echo "$signature"
-}
-
 # Export functions
 export -f compute_domain_separator
 export -f get_permit2_domain_separator
@@ -863,6 +936,7 @@ export -f compute_token_permissions_hash
 export -f sign_permit2_order
 export -f sign_compact_order
 export -f sign_eip3009_order
+export -f sign_eip3009_authorization_with_domain
 export -f sign_personal_message
 export -f verify_signature
 export -f create_prefixed_signature
@@ -872,4 +946,3 @@ export -f sign_standard_intent
 export -f compute_compact_digest_from_quote
 export -f sign_compact_digest_from_quote
 export -f compute_permit2_digest_from_quote
-export -f sign_permit2_digest_from_quote
