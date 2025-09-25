@@ -68,9 +68,7 @@ where
 				// Try parsing as enum variant name
 				match value {
 					"permit2_escrow" | "Permit2Escrow" => Ok(LockType::Permit2Escrow),
-					"eip3009_escrow" | "eip3009_escrow" | "Eip3009Escrow" => {
-						Ok(LockType::Eip3009Escrow)
-					}, // Accept both variants for compatibility
+					"eip3009_escrow" | "Eip3009Escrow" => Ok(LockType::Eip3009Escrow), // Accept both variants for compatibility
 					"compact_resource_lock" | "ResourceLock" => Ok(LockType::ResourceLock),
 					_ => Err(Error::custom("Invalid LockType string")),
 				}

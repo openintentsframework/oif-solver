@@ -73,7 +73,7 @@ impl FromStr for LockType {
 		match s {
 			// String representations
 			"permit2_escrow" => Ok(LockType::Permit2Escrow),
-			"eip3009_escrow" | "eip3009_escrow" => Ok(LockType::Eip3009Escrow), // Accept both variants for compatibility
+			"eip3009_escrow" => Ok(LockType::Eip3009Escrow), // Accept both variants for compatibility
 			"compact_resource_lock" => Ok(LockType::ResourceLock),
 			// Numeric string representations
 			"1" => Ok(LockType::Permit2Escrow),
