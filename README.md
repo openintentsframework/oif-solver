@@ -526,7 +526,7 @@ The demo supports two submission modes:
 # Format: intent test <lock_type> <auth_type> <token_pair>
 ./oif-demo intent test escrow permit2 A2B   # Escrow lock with Permit2 auth
 ./oif-demo intent test escrow eip3009 A2B   # Escrow lock with EIP-3009 auth
-./oif-demo intent test compact permit2 B2A  # Compact lock with Permit2 auth (EIP-3009 not supported)
+./oif-demo intent test compact A2B  # Compact lock with Permit2 auth (EIP-3009 not supported)
 ```
 
 ##### Onchain Intent Submission (Direct to Blockchain)

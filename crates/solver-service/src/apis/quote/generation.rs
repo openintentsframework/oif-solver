@@ -202,10 +202,12 @@ impl QuoteGenerator {
 
 		match escrow_kind {
 			EscrowKind::Permit2 => {
-				self.generate_permit2_order(request, config, settlement, selected_oracle).await
+				self.generate_permit2_order(request, config, settlement, selected_oracle)
+					.await
 			},
 			EscrowKind::Erc3009 => {
-				self.generate_erc3009_order(request, config, settlement, selected_oracle).await
+				self.generate_erc3009_order(request, config, settlement, selected_oracle)
+					.await
 			},
 		}
 	}
@@ -228,7 +230,8 @@ impl QuoteGenerator {
 		let domain_object = self.build_permit2_domain_object(config, chain_id).await?;
 
 		// Generate the message object without pre-computed digest
-		let message_obj = self.build_permit2_message_object(request, config, settlement, selected_oracle)?;
+		let message_obj =
+			self.build_permit2_message_object(request, config, settlement, selected_oracle)?;
 
 		Ok(QuoteOrder {
 			signature_type: SignatureType::Eip712,
@@ -271,15 +274,15 @@ impl QuoteGenerator {
 		)?;
 
 		// Get token address for domain information
-		let token_address = first_input.asset.ethereum_address().map_err(|e| {
-			QuoteError::InvalidRequest(format!("Invalid token address: {}", e))
-		})?;
+		let token_address = first_input
+			.asset
+			.ethereum_address()
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid token address: {}", e)))?;
 
 		// Build structured domain object for EIP-3009 token
-		let domain_object = self.build_erc3009_domain_object(
-			&token_address,
-			input_chain_id,
-		).await?;
+		let domain_object = self
+			.build_erc3009_domain_object(&token_address, input_chain_id)
+			.await?;
 
 		// For ERC-3009, we need to generate signature templates for each input
 		// since the contract expects one signature per input
@@ -780,11 +783,12 @@ impl QuoteGenerator {
 		token_address: &[u8; 20],
 		chain_id: u64,
 	) -> Result<serde_json::Value, QuoteError> {
-
 		let alloy_token_address = alloy_primitives::Address::from_slice(token_address);
 
 		// Try to get token name
-		let token_name = self.get_token_name(&alloy_token_address, chain_id).await
+		let token_name = self
+			.get_token_name(&alloy_token_address, chain_id)
+			.await
 			.unwrap_or_else(|_| "Unknown Token".to_string());
 
 		// Build domain object similar to TheCompact structure (without pre-computed domainSeparator)
@@ -824,7 +828,8 @@ impl QuoteGenerator {
 			max_priority_fee_per_gas: None,
 		};
 
-		let result = self.delivery_service
+		let result = self
+			.delivery_service
 			.contract_call(chain_id, tx)
 			.await
 			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to get token name: {}", e)))?;
@@ -836,7 +841,6 @@ impl QuoteGenerator {
 		Ok(name)
 	}
 
-
 	/// Get preferred settlement for escrow orders (prioritizes Direct settlement)
 	fn get_preferred_settlement_for_escrow(
 		&self,
@@ -844,7 +848,11 @@ impl QuoteGenerator {
 	) -> Option<(&dyn SettlementInterface, solver_types::Address)> {
 		// First, try to get Direct settlement specifically
 		if let Some(direct_settlement) = self.settlement_service.get("direct") {
-			if let Some(oracles) = direct_settlement.oracle_config().input_oracles.get(&chain_id) {
+			if let Some(oracles) = direct_settlement
+				.oracle_config()
+				.input_oracles
+				.get(&chain_id)
+			{
 				if !oracles.is_empty() {
 					let selected_oracle = direct_settlement.select_oracle(oracles, None)?;
 					return Some((direct_settlement, selected_oracle));
@@ -853,7 +861,8 @@ impl QuoteGenerator {
 		}
 
 		// Fallback to any available settlement if Direct is not available
-		self.settlement_service.get_any_settlement_for_chain(chain_id)
+		self.settlement_service
+			.get_any_settlement_for_chain(chain_id)
 	}
 
 	/// Build structured domain object for Permit2
@@ -872,7 +881,9 @@ impl QuoteGenerator {
 			})?;
 
 		// Get the actual name from Permit2 contract (like we do for EIP-3009 tokens)
-		let permit2_name = self.get_token_name(&permit2_address, chain_id).await
+		let permit2_name = self
+			.get_token_name(&permit2_address, chain_id)
+			.await
 			.unwrap_or_else(|_| "Permit2".to_string()); // Fallback to constant if contract call fails
 
 		// Build domain object similar to TheCompact and EIP-3009 structure
@@ -894,28 +905,38 @@ impl QuoteGenerator {
 		use crate::apis::quote::permit2::build_permit2_batch_witness_digest;
 
 		// Generate the complete message structure
-		let (_final_digest, message_obj) = 
+		let (_final_digest, message_obj) =
 			build_permit2_batch_witness_digest(request, config, settlement, selected_oracle)?;
 
 		// Extract only the EIP-712 message fields (no metadata like "signing", "digest")
-		let permitted = message_obj.get("permitted").cloned().unwrap_or(serde_json::Value::Null);
-		let spender = message_obj.get("spender").cloned().unwrap_or(serde_json::Value::Null);
-		let nonce = message_obj.get("nonce").cloned().unwrap_or(serde_json::Value::Null);
-		let deadline = message_obj.get("deadline").cloned().unwrap_or(serde_json::Value::Null);
-		let witness = message_obj.get("witness").cloned().unwrap_or(serde_json::Value::Null);
+		let permitted = message_obj
+			.get("permitted")
+			.cloned()
+			.unwrap_or(serde_json::Value::Null);
+		let spender = message_obj
+			.get("spender")
+			.cloned()
+			.unwrap_or(serde_json::Value::Null);
+		let nonce = message_obj
+			.get("nonce")
+			.cloned()
+			.unwrap_or(serde_json::Value::Null);
+		let deadline = message_obj
+			.get("deadline")
+			.cloned()
+			.unwrap_or(serde_json::Value::Null);
+		let witness = message_obj
+			.get("witness")
+			.cloned()
+			.unwrap_or(serde_json::Value::Null);
 
-		// Build clean message with only EIP-712 fields
-		let clean_message = serde_json::json!({
+		// Return clean message with only EIP-712 fields (no wrapper)
+		Ok(serde_json::json!({
 			"permitted": permitted,
 			"spender": spender,
 			"nonce": nonce,
 			"deadline": deadline,
 			"witness": witness
-		});
-
-		// Wrap in eip712 object to maintain compatibility with conversion code
-		Ok(serde_json::json!({
-			"eip712": clean_message
 		}))
 	}
 
@@ -1496,7 +1517,7 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		
+
 		// Get settlement and oracle like in real usage
 		let (settlement, selected_oracle) = settlement_service
 			.get_any_settlement_for_chain(137)
@@ -1506,8 +1527,9 @@ mod tests {
 		let config = create_test_config();
 		let request = create_test_request();
 
-		let result =
-			generator.generate_erc3009_order(&request, &config, settlement, selected_oracle).await;
+		let result = generator
+			.generate_erc3009_order(&request, &config, settlement, selected_oracle)
+			.await;
 
 		match result {
 			Ok(order) => {

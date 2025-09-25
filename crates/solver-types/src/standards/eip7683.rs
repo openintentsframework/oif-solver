@@ -412,15 +412,30 @@ impl interfaces::StandardOrder {
 			.message
 			.as_object()
 			.ok_or("Invalid EIP-712 message structure")?;
-		let eip712_data = message_data
-			.get("eip712")
-			.and_then(|e| e.as_object())
-			.ok_or("Missing 'eip712' object in message")?;
 
-		let primary_type = eip712_data
-			.get("primaryType")
-			.and_then(|p| p.as_str())
-			.unwrap_or("PermitBatchWitnessTransferFrom");
+		// Check if this is the new clean format or legacy format with eip712 wrapper
+		let eip712_data = if message_data.contains_key("eip712") {
+			// Legacy format: extract nested eip712 object
+			message_data
+				.get("eip712")
+				.and_then(|e| e.as_object())
+				.ok_or("Missing 'eip712' object in message")?
+		} else {
+			// New clean format: use message_data directly
+			message_data
+		};
+
+		// Primary type comes from quote order level for new format, or from eip712 data for legacy
+		let primary_type = if message_data.contains_key("eip712") {
+			// Legacy format: get from eip712 data
+			eip712_data
+				.get("primaryType")
+				.and_then(|p| p.as_str())
+				.unwrap_or("PermitBatchWitnessTransferFrom")
+		} else {
+			// New format: get from quote order level
+			&quote_order.primary_type
+		};
 
 		Ok((eip712_data, primary_type))
 	}

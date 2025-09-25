@@ -985,15 +985,23 @@ quote_accept() {
         elif [ "$signature_type" = "eip712" ]; then
             print_info "Signing EIP-712 order..."
 
-            # Extract EIP-712 message for signing (for compatibility with existing code)
-            local eip712_message=$(echo "$full_message" | jq -r '.eip712 // empty')
+            # Check if message has eip712 wrapper (legacy) or is clean (new format)
+            local eip712_message=""
+            if echo "$full_message" | jq -e 'has("eip712")' > /dev/null 2>&1; then
+                # Legacy format: extract eip712 wrapper
+                eip712_message=$(echo "$full_message" | jq -r '.eip712')
+                local eip712_primary_type=$(echo "$eip712_message" | jq -r '.primaryType // "PermitBatchWitnessTransferFrom"')
+            else
+                # New clean format: use full_message directly
+                eip712_message="$full_message"
+                local eip712_primary_type=$(echo "$order_data" | jq -r '.primaryType // "PermitBatchWitnessTransferFrom"')
+            fi
+
             if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ]; then
                 print_error "No EIP-712 message found in EIP-712 order"
                 return 1
             fi
 
-            # Determine the order type based on primaryType
-            local eip712_primary_type=$(echo "$eip712_message" | jq -r '.primaryType // "PermitBatchWitnessTransferFrom"')
             print_debug "EIP-712 Primary type: $eip712_primary_type"
 
             if [ "$eip712_primary_type" = "BatchCompact" ]; then
@@ -1019,13 +1027,12 @@ quote_accept() {
             else
                 print_info "Detected Permit2 order, using standard signing..."
 
-            # Extract witness data first (needed for signing)
+            # For new clean format, extract witness data directly from message
             local witness=$(echo "$eip712_message" | jq -r '.witness // empty')
             local witness_expires=$(echo "$witness" | jq -r '.expires // 0')
             local input_oracle=$(echo "$witness" | jq -r '.inputOracle // "0x0000000000000000000000000000000000000000"')
 
-            # Sign the EIP-712 message
-            # Check for domain info in new structure (order.domain) or legacy structure (eip712.signing.domain)
+            # Get domain from order level (new format) or legacy location
             local domain=""
             local order_domain=$(echo "$order_data" | jq -r '.domain // empty')
             if echo "$order_domain" | jq -e 'type == "object"' > /dev/null 2>&1; then
@@ -1033,11 +1040,16 @@ quote_accept() {
                 domain="$order_domain"
                 print_debug "Using new structured domain format for Permit2"
             else
-                # Legacy format - extract from signing.domain
+                # Legacy format - extract from signing.domain (if it exists)
                 domain=$(echo "$eip712_message" | jq -r '.signing.domain // empty')
                 print_debug "Using legacy signing.domain format for Permit2"
+                if [ -z "$domain" ] || [ "$domain" = "empty" ] || [ "$domain" = "null" ]; then
+                    print_error "No domain information found in Permit2 order"
+                    return 1
+                fi
             fi
             
+            # Extract message fields directly
             local deadline=$(echo "$eip712_message" | jq -r '.deadline // empty')
             local nonce=$(echo "$eip712_message" | jq -r '.nonce // empty')
             local spender=$(echo "$eip712_message" | jq -r '.spender // empty')
