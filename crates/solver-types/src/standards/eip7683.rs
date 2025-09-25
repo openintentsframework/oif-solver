@@ -670,8 +670,8 @@ impl interfaces::StandardOrder {
 			settler_bytes32[12..32].copy_from_slice(&output_settler_bytes);
 
 			sol_outputs.push(SolMandateOutput {
-				oracle: [0u8; 32].into(),        // Zero oracle for EIP-3009
-				settler: settler_bytes32.into(), // Use correct output settler
+				oracle: [0u8; 32].into(), // TODO: Update from signature metadata object once available.
+				settler: settler_bytes32.into(), // TODO: Use correct output settler
 				chainId: U256::from(chain_id),
 				token: token_bytes.into(),
 				amount: output.amount,
