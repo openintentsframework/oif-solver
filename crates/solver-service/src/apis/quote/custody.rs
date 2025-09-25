@@ -8,7 +8,7 @@
 //!
 //! The custody module makes intelligent decisions about:
 //! - Whether to use resource locks (pre-authorized funds) or escrow mechanisms
-//! - Which specific protocol to use (Permit2, ERC-3009, TheCompact, etc.)
+//! - Which specific protocol to use (Permit2, EIP-3009, TheCompact, etc.)
 //! - How to optimize for gas costs, security, and user experience
 //!
 //! ## Custody Mechanisms
@@ -21,7 +21,7 @@
 //! ### Escrow Mechanisms
 //! Traditional token custody through smart contracts:
 //! - **Permit2**: Universal approval system with signature-based transfers
-//! - **ERC-3009**: Native gasless transfers for supported tokens (USDC, etc.)
+//! - **EIP-3009**: Native gasless transfers for supported tokens (USDC, etc.)
 //!
 //! ## Decision Process
 //!
@@ -33,7 +33,7 @@
 //! ## Token Analysis
 //!
 //! The module maintains knowledge about token capabilities:
-//! - ERC-3009 support (primarily USDC and similar tokens)
+//! - EIP-3009 support (primarily USDC and similar tokens)
 //! - Permit2 availability (universal but requires deployment)
 //! - Custom protocol support (token-specific features)
 
@@ -51,7 +51,7 @@ pub enum LockKind {
 #[derive(Debug, Clone)]
 pub enum EscrowKind {
 	Permit2,
-	Erc3009,
+	Eip3009,
 }
 
 /// Custody strategy decision
@@ -74,21 +74,30 @@ impl CustodyStrategy {
 		input: &AvailableInput,
 	) -> Result<CustodyDecision, QuoteError> {
 		if let Some(lock) = &input.lock {
-			return self.handle_resource_lock(lock);
+			return self.handle_explicit_lock(lock);
 		}
 		self.decide_escrow_strategy(input).await
 	}
 
-	fn handle_resource_lock(
+	fn handle_explicit_lock(
 		&self,
 		lock: &solver_types::Lock,
 	) -> Result<CustodyDecision, QuoteError> {
-		let lock_kind = match lock.kind {
-			ApiLockKind::TheCompact => LockKind::TheCompact {
-				params: lock.params.clone().unwrap_or_default(),
+		match lock.kind {
+			ApiLockKind::TheCompact => {
+				let lock_kind = LockKind::TheCompact {
+					params: lock.params.clone().unwrap_or_default(),
+				};
+				Ok(CustodyDecision::ResourceLock { kind: lock_kind })
 			},
-		};
-		Ok(CustodyDecision::ResourceLock { kind: lock_kind })
+			// Permit2 and EIP3009 are escrow mechanisms, not resource locks
+			ApiLockKind::Permit2 => Ok(CustodyDecision::Escrow {
+				kind: EscrowKind::Permit2,
+			}),
+			ApiLockKind::Eip3009 => Ok(CustodyDecision::Escrow {
+				kind: EscrowKind::Eip3009,
+			}),
+		}
 	}
 
 	async fn decide_escrow_strategy(
@@ -106,9 +115,9 @@ impl CustodyStrategy {
 
 		let capabilities = PROTOCOL_REGISTRY.get_token_capabilities(chain_id, token_address);
 
-		if capabilities.supports_erc3009 {
+		if capabilities.supports_eip3009 {
 			Ok(CustodyDecision::Escrow {
-				kind: EscrowKind::Erc3009,
+				kind: EscrowKind::Eip3009,
 			})
 		} else if capabilities.permit2_available {
 			Ok(CustodyDecision::Escrow {

@@ -16,7 +16,7 @@
 //! ## Quote Structure
 //!
 //! Each generated quote contains:
-//! - **Orders**: Signature requirements (EIP-712, ERC-3009, etc.)
+//! - **Orders**: Signature requirements (EIP-712, EIP-3009, etc.)
 //! - **Details**: Input/output specifications
 //! - **Validity**: Expiry times and execution windows
 //! - **ETA**: Estimated completion time based on chain characteristics
@@ -38,7 +38,7 @@
 //!
 //! ### Escrow Orders
 //! - Permit2 batch witness transfers
-//! - ERC-3009 authorization transfers
+//! - EIP-3009 authorization transfers
 //!
 //! ## Optimization Strategies
 //!
@@ -49,9 +49,6 @@
 //! - **Input Priority**: Preference for specific input tokens
 
 use super::custody::{CustodyDecision, CustodyStrategy, EscrowKind, LockKind};
-use crate::apis::quote::permit2::{
-	build_permit2_batch_witness_digest, permit2_domain_address_from_config,
-};
 use crate::eip712::{compact, get_domain_separator};
 use solver_config::{Config, QuoteConfig};
 use solver_delivery::DeliveryService;
@@ -124,7 +121,7 @@ impl QuoteGenerator {
 					.await?
 			},
 			CustodyDecision::Escrow { kind } => {
-				self.generate_escrow_order(request, config, kind)?
+				self.generate_escrow_order(request, config, kind).await?
 			},
 		};
 		let details = QuoteDetails {
@@ -136,7 +133,7 @@ impl QuoteGenerator {
 			CustodyDecision::ResourceLock { .. } => "compact_resource_lock".to_string(),
 			CustodyDecision::Escrow { kind } => match kind {
 				EscrowKind::Permit2 => "permit2_escrow".to_string(),
-				EscrowKind::Erc3009 => "erc3009_escrow".to_string(),
+				EscrowKind::Eip3009 => "eip3009_escrow".to_string(),
 			},
 		};
 		let validity_seconds = self.get_quote_validity_seconds(config);
@@ -167,13 +164,13 @@ impl QuoteGenerator {
 		};
 		Ok(QuoteOrder {
 			signature_type: SignatureType::Eip712,
-			domain: domain_address,
+			domain: serde_json::to_value(domain_address).unwrap_or(serde_json::Value::Null),
 			primary_type,
 			message,
 		})
 	}
 
-	fn generate_escrow_order(
+	async fn generate_escrow_order(
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
@@ -193,13 +190,12 @@ impl QuoteGenerator {
 			.ethereum_chain_id()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chain ID: {}", e)))?;
 
-		// Get settlement AND selected oracle for consistency
+		// For escrow orders, prefer Direct settlement over other implementations
 		let (settlement, selected_oracle) = self
-			.settlement_service
-			.get_any_settlement_for_chain(chain_id)
+			.get_preferred_settlement_for_escrow(chain_id)
 			.ok_or_else(|| {
 				QuoteError::InvalidRequest(format!(
-					"No settlement available for chain {}",
+					"No suitable settlement available for escrow on chain {}",
 					chain_id
 				))
 			})?;
@@ -207,60 +203,302 @@ impl QuoteGenerator {
 		match escrow_kind {
 			EscrowKind::Permit2 => {
 				self.generate_permit2_order(request, config, settlement, selected_oracle)
+					.await
 			},
-			EscrowKind::Erc3009 => self.generate_erc3009_order(request, config),
+			EscrowKind::Eip3009 => {
+				self.generate_eip3009_order(request, config, settlement, selected_oracle)
+					.await
+			},
 		}
 	}
 
-	fn generate_permit2_order(
+	async fn generate_permit2_order(
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
 		settlement: &dyn SettlementInterface,
 		selected_oracle: solver_types::Address,
 	) -> Result<QuoteOrder, QuoteError> {
-		use alloy_primitives::hex;
-
 		let chain_id = request.available_inputs[0]
 			.asset
 			.ethereum_chain_id()
 			.map_err(|e| {
 				QuoteError::InvalidRequest(format!("Invalid chain ID in asset address: {}", e))
 			})?;
-		let domain_address = permit2_domain_address_from_config(config, chain_id)?;
-		let (final_digest, message_obj) =
-			build_permit2_batch_witness_digest(request, config, settlement, selected_oracle)?;
-		let message = serde_json::json!({ "digest": with_0x_prefix(&hex::encode(final_digest)), "eip712": message_obj });
+
+		// Build structured domain object for Permit2
+		let domain_object = self.build_permit2_domain_object(config, chain_id).await?;
+
+		// Generate the message object without pre-computed digest
+		let message_obj =
+			self.build_permit2_message_object(request, config, settlement, selected_oracle)?;
+
 		Ok(QuoteOrder {
 			signature_type: SignatureType::Eip712,
-			domain: domain_address,
+			domain: domain_object,
 			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
+			message: message_obj,
+		})
+	}
+
+	async fn generate_eip3009_order(
+		&self,
+		request: &GetQuoteRequest,
+		config: &Config,
+		#[allow(unused_variables)] settlement: &dyn SettlementInterface,
+		selected_oracle: solver_types::Address,
+	) -> Result<QuoteOrder, QuoteError> {
+		let validity_seconds = self.get_quote_validity_seconds(config);
+
+		// Get input chain to find the input settler address (the 'to' field)
+		let first_input = &request.available_inputs[0];
+		let input_chain_id = first_input
+			.asset
+			.ethereum_chain_id()
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input chain ID: {}", e)))?;
+		let network = config.networks.get(&input_chain_id).ok_or_else(|| {
+			QuoteError::InvalidRequest(format!("Network {} not found in config", input_chain_id))
+		})?;
+		let input_settler = network.input_settler_address.clone();
+		let input_settler_address = alloy_primitives::Address::from_slice(&input_settler.0);
+
+		// Calculate fillDeadline (should match fillDeadline in StandardOrder)
+		let fill_deadline = chrono::Utc::now().timestamp() as u32 + validity_seconds as u32;
+
+		// Calculate the correct orderIdentifier using the contract (same method as intents script)
+		let (nonce_u64, order_identifier) = self.compute_eip3009_order_identifier(
+			request,
+			config,
+			&selected_oracle,
+			fill_deadline,
+		)?;
+
+		// Get token address for domain information
+		let token_address = first_input
+			.asset
+			.ethereum_address()
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid token address: {}", e)))?;
+
+		// Build structured domain object for EIP-3009 token
+		let domain_object = self
+			.build_eip3009_domain_object(&token_address, input_chain_id)
+			.await?;
+
+		// For EIP-3009, we need to generate signature templates for each input
+		// since the contract expects one signature per input
+		let mut signatures_array = Vec::new();
+		for input in &request.available_inputs {
+			let input_message = serde_json::json!({
+				"from": input.user.ethereum_address().map_err(|e| QuoteError::InvalidRequest(format!("Invalid Ethereum address: {}", e)))?,
+				"to": format!("0x{:040x}", input_settler_address),
+				"value": input.amount.to_string(),
+				"validAfter": 0,
+				"validBefore": fill_deadline,
+				"nonce": order_identifier,  // Use order_identifier for signature
+				"realNonce": format!("0x{:x}", nonce_u64),  // Include real nonce for StandardOrder
+				"inputOracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&selected_oracle.0))
+			});
+			signatures_array.push(input_message);
+		}
+
+		let message = if signatures_array.len() == 1 {
+			// Single input - return the message directly
+			signatures_array.into_iter().next().unwrap()
+		} else {
+			// Multiple inputs - return array of messages for multiple signatures
+			serde_json::json!({
+				"signatures": signatures_array
+			})
+		};
+
+		Ok(QuoteOrder {
+			signature_type: SignatureType::Eip3009,
+			domain: domain_object, // Use structured domain object for EIP-3009
+			primary_type: "ReceiveWithAuthorization".to_string(),
 			message,
 		})
 	}
 
-	fn generate_erc3009_order(
+	/// Compute the orderIdentifier for an EIP-3009 order by building a StandardOrder
+	/// and calling the contract's orderIdentifier function - same as the intents script
+	/// Returns (nonce, order_identifier)
+	fn compute_eip3009_order_identifier(
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
-	) -> Result<QuoteOrder, QuoteError> {
+		selected_oracle: &solver_types::Address,
+		fill_deadline: u32,
+	) -> Result<(u64, String), QuoteError> {
 		let input = &request.available_inputs[0];
-		let domain_address = input.asset.clone();
-		let validity_seconds = self.get_quote_validity_seconds(config);
-		let message = serde_json::json!({
-			"from": input.user.ethereum_address().map_err(|e| QuoteError::InvalidRequest(format!("Invalid Ethereum address: {}", e)))?,
-			"to": self.get_escrow_address(config)?,
-			"value": input.amount.to_string(),
-			"validAfter": 0,
-			"validBefore": chrono::Utc::now().timestamp() + validity_seconds as i64,
-			"nonce": format!("0x{:064x}", chrono::Utc::now().timestamp() as u64)
-		});
-		Ok(QuoteOrder {
-			signature_type: SignatureType::Erc3009,
-			domain: domain_address,
-			primary_type: "ReceiveWithAuthorization".to_string(),
-			message,
-		})
+
+		// Get input chain info
+		let input_chain_id = input
+			.asset
+			.ethereum_chain_id()
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input chain ID: {}", e)))?;
+		let input_network = config.networks.get(&input_chain_id).ok_or_else(|| {
+			QuoteError::InvalidRequest(format!("Network {} not found", input_chain_id))
+		})?;
+
+		// Note: We don't need output network info for orderIdentifier calculation
+
+		// Build StandardOrder struct (same approach as intents script)
+		let user_addr = input
+			.user
+			.ethereum_address()
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid user address: {}", e)))?;
+		// Generate incremental nonce like direct intent (current timestamp in microseconds)
+		let nonce = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|d| d.as_micros() as u64)
+			.unwrap_or(0u64);
+		let expiry = fill_deadline; // Use same value
+		let input_oracle = format!(
+			"0x{:040x}",
+			alloy_primitives::Address::from_slice(&selected_oracle.0)
+		);
+
+		// Build input tokens array: [[token, amount]]
+		let input_token = input
+			.asset
+			.ethereum_address()
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input token: {}", e)))?;
+		let input_amount = input.amount.to_string();
+
+		// Use std::process::Command to call cast (same as scripts)
+		let rpc_url = if input_chain_id == 31337 {
+			"http://localhost:8545"
+		} else {
+			"http://localhost:8546"
+		};
+
+		let input_settler_address = format!(
+			"0x{:040x}",
+			alloy_primitives::Address::from_slice(&input_network.input_settler_address.0)
+		);
+
+		// Get output information for the outputs array (same as direct intent)
+		let output_info = request
+			.requested_outputs
+			.first()
+			.ok_or_else(|| QuoteError::InvalidRequest("No requested outputs found".to_string()))?;
+
+		// Extract output chain and token from InteropAddress
+		let output_interop = output_info.asset.clone();
+		let output_chain_id = output_interop
+			.ethereum_chain_id()
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output chain ID: {}", e)))?;
+		let output_token = output_interop
+			.ethereum_address()
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output token: {}", e)))?;
+		let output_amount = output_info.amount.to_string();
+
+		// Extract recipient from InteropAddress
+		let recipient_interop = output_info.receiver.clone();
+		let recipient_addr = recipient_interop
+			.ethereum_address()
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid recipient address: {}", e)))?;
+
+		// Get output settler from config (same as direct intent)
+		let output_network = config.networks.get(&output_chain_id).ok_or_else(|| {
+			QuoteError::InvalidRequest(format!(
+				"Output network {} not found in config",
+				output_chain_id
+			))
+		})?;
+		let output_settler = output_network.output_settler_address.clone();
+		let output_settler_address = alloy_primitives::Address::from_slice(&output_settler.0);
+
+		// Build outputs array (same format as direct intent)
+		let zero_bytes32 = "0x0000000000000000000000000000000000000000000000000000000000000000";
+		let output_settler_bytes32 =
+			format!("0x000000000000000000000000{:040x}", output_settler_address);
+		let output_token_bytes32 = format!("0x000000000000000000000000{:040x}", output_token);
+		let recipient_bytes32 = format!("0x000000000000000000000000{:040x}", recipient_addr);
+
+		let outputs_array = format!(
+			"[({},{},{},{},{},{},0x,0x)]",
+			zero_bytes32,
+			output_settler_bytes32,
+			output_chain_id,
+			output_token_bytes32,
+			output_amount,
+			recipient_bytes32
+		);
+
+		// Build the order struct string (same format as intents script with real outputs)
+		let order_struct = format!(
+			"({},{},{},{},{},{},[[{},{}]],{})",
+			user_addr,      // user
+			nonce,          // nonce (microseconds)
+			input_chain_id, // originChainId
+			expiry,         // expires
+			fill_deadline,  // fillDeadline
+			input_oracle,   // inputOracle
+			input_token,    // input token
+			input_amount,   // input amount
+			outputs_array   // outputs (with real data)
+		);
+
+		// Call contract orderIdentifier function (same as intents script)
+		let order_identifier_sig = "orderIdentifier((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))";
+
+		// Execute cast call in a clean environment without RUST_LOG to avoid contamination
+		let output = std::process::Command::new("cast")
+			.arg("call")
+			.arg(&input_settler_address)
+			.arg(order_identifier_sig)
+			.arg(&order_struct)
+			.arg("--rpc-url")
+			.arg(rpc_url)
+			.env_remove("RUST_LOG")  // Explicitly remove RUST_LOG for this process
+			.output()
+			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to call cast: {}", e)))?;
+
+		if !output.status.success() {
+			let stderr = String::from_utf8_lossy(&output.stderr);
+			return Err(QuoteError::InvalidRequest(format!(
+				"Cast call failed: {}",
+				stderr
+			)));
+		}
+
+		let raw_output = String::from_utf8_lossy(&output.stdout);
+
+		// Extract only the 64-character hex string (order ID), filtering out any debug logs
+		let order_id = raw_output
+			.lines()
+			.find_map(|line| {
+				// Look for a line that contains a 66-character hex string (0x + 64 hex chars)
+				if let Some(start) = line.find("0x") {
+					let hex_part = &line[start..];
+					if hex_part.len() >= 66 {
+						let candidate = &hex_part[..66];
+						// Validate it's actually a hex string
+						if candidate.chars().skip(2).all(|c| c.is_ascii_hexdigit()) {
+							return Some(candidate.to_string());
+						}
+					}
+				}
+				None
+			})
+			.unwrap_or_else(|| raw_output.trim().to_string());
+
+		if order_id.is_empty()
+			|| order_id == "0x0000000000000000000000000000000000000000000000000000000000000000"
+		{
+			tracing::warn!(
+				"Failed to extract valid order ID from cast output: {}",
+				raw_output
+			);
+			return Err(QuoteError::InvalidRequest(
+				"Failed to compute order ID from contract".to_string(),
+			));
+		}
+
+		tracing::debug!("Successfully extracted clean order ID: {}", order_id);
+
+		Ok((nonce, order_id))
 	}
 
 	async fn build_compact_message(
@@ -530,6 +768,169 @@ impl QuoteGenerator {
 		}
 
 		Ok(serde_json::Value::Object(merged))
+	}
+
+	/// Build structured domain object for EIP-3009 token
+	async fn build_eip3009_domain_object(
+		&self,
+		token_address: &[u8; 20],
+		chain_id: u64,
+	) -> Result<serde_json::Value, QuoteError> {
+		let alloy_token_address = alloy_primitives::Address::from_slice(token_address);
+
+		// Try to get token name
+		let token_name = self
+			.get_token_name(&alloy_token_address, chain_id)
+			.await
+			.unwrap_or_else(|_| "Unknown Token".to_string());
+
+		// Build domain object similar to TheCompact structure (without pre-computed domainSeparator)
+		// The client will compute the domainSeparator using these fields
+		Ok(serde_json::json!({
+			"name": token_name,
+			"chainId": chain_id.to_string(),
+			"verifyingContract": format!("0x{:040x}", alloy_token_address)
+		}))
+	}
+
+	/// Get token name from contract
+	async fn get_token_name(
+		&self,
+		token_address: &alloy_primitives::Address,
+		chain_id: u64,
+	) -> Result<String, QuoteError> {
+		use alloy_sol_types::{sol, SolCall};
+
+		// Define the name() function call
+		sol! {
+			function name() external view returns (string);
+		}
+
+		let call = nameCall {};
+		let encoded = call.abi_encode();
+
+		let tx = solver_types::Transaction {
+			to: Some(solver_types::Address(token_address.0.to_vec())),
+			data: encoded,
+			value: alloy_primitives::U256::ZERO,
+			chain_id,
+			nonce: None,
+			gas_limit: None,
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+		};
+
+		let result = self
+			.delivery_service
+			.contract_call(chain_id, tx)
+			.await
+			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to get token name: {}", e)))?;
+
+		let name = nameCall::abi_decode_returns(&result, false)
+			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to decode token name: {}", e)))?
+			._0;
+
+		Ok(name)
+	}
+
+	/// Get preferred settlement for escrow orders (prioritizes Direct settlement)
+	fn get_preferred_settlement_for_escrow(
+		&self,
+		chain_id: u64,
+	) -> Option<(&dyn SettlementInterface, solver_types::Address)> {
+		// First, try to get Direct settlement specifically
+		if let Some(direct_settlement) = self.settlement_service.get("direct") {
+			if let Some(oracles) = direct_settlement
+				.oracle_config()
+				.input_oracles
+				.get(&chain_id)
+			{
+				if !oracles.is_empty() {
+					let selected_oracle = direct_settlement.select_oracle(oracles, None)?;
+					return Some((direct_settlement, selected_oracle));
+				}
+			}
+		}
+
+		// Fallback to any available settlement if Direct is not available
+		self.settlement_service
+			.get_any_settlement_for_chain(chain_id)
+	}
+
+	/// Build structured domain object for Permit2
+	async fn build_permit2_domain_object(
+		&self,
+		_config: &Config,
+		chain_id: u64,
+	) -> Result<serde_json::Value, QuoteError> {
+		use crate::apis::quote::registry::PROTOCOL_REGISTRY;
+
+		// Get Permit2 contract address for this chain
+		let permit2_address = PROTOCOL_REGISTRY
+			.get_permit2_address(chain_id)
+			.ok_or_else(|| {
+				QuoteError::InvalidRequest(format!("Permit2 not deployed on chain {}", chain_id))
+			})?;
+
+		// Get the actual name from Permit2 contract (like we do for EIP-3009 tokens)
+		let permit2_name = self
+			.get_token_name(&permit2_address, chain_id)
+			.await
+			.unwrap_or_else(|_| "Permit2".to_string()); // Fallback to constant if contract call fails
+
+		// Build domain object similar to TheCompact and EIP-3009 structure
+		Ok(serde_json::json!({
+			"name": permit2_name,
+			"chainId": chain_id.to_string(),
+			"verifyingContract": format!("0x{:040x}", permit2_address)
+		}))
+	}
+
+	/// Build Permit2 message object (clean EIP-712 message without metadata)
+	fn build_permit2_message_object(
+		&self,
+		request: &GetQuoteRequest,
+		config: &Config,
+		settlement: &dyn SettlementInterface,
+		selected_oracle: solver_types::Address,
+	) -> Result<serde_json::Value, QuoteError> {
+		use crate::apis::quote::permit2::build_permit2_batch_witness_digest;
+
+		// Generate the complete message structure
+		let (_final_digest, message_obj) =
+			build_permit2_batch_witness_digest(request, config, settlement, selected_oracle)?;
+
+		// Extract only the EIP-712 message fields (no metadata like "signing", "digest")
+		let permitted = message_obj
+			.get("permitted")
+			.cloned()
+			.unwrap_or(serde_json::Value::Null);
+		let spender = message_obj
+			.get("spender")
+			.cloned()
+			.unwrap_or(serde_json::Value::Null);
+		let nonce = message_obj
+			.get("nonce")
+			.cloned()
+			.unwrap_or(serde_json::Value::Null);
+		let deadline = message_obj
+			.get("deadline")
+			.cloned()
+			.unwrap_or(serde_json::Value::Null);
+		let witness = message_obj
+			.get("witness")
+			.cloned()
+			.unwrap_or(serde_json::Value::Null);
+
+		// Return clean message with only EIP-712 fields (no wrapper)
+		Ok(serde_json::json!({
+			"permitted": permitted,
+			"spender": spender,
+			"nonce": nonce,
+			"deadline": deadline,
+			"witness": witness
+		}))
 	}
 
 	/// Try to compute the digest using the existing eip712/compact module
@@ -806,17 +1207,6 @@ impl QuoteGenerator {
 				"Domain configuration required for lock type: {:?}",
 				lock_kind
 			))),
-		}
-	}
-
-	fn get_escrow_address(&self, config: &Config) -> Result<alloy_primitives::Address, QuoteError> {
-		match &config.settlement.domain {
-			Some(domain_config) => domain_config.address.parse().map_err(|e| {
-				QuoteError::InvalidRequest(format!("Invalid escrow address in config: {}", e))
-			}),
-			None => Err(QuoteError::InvalidRequest(
-				"Escrow address configuration required".to_string(),
-			)),
 		}
 	}
 
@@ -1104,34 +1494,50 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn test_generate_erc3009_order() {
+	#[tokio::test]
+	async fn test_generate_eip3009_order() {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+
+		// Get settlement and oracle like in real usage
+		let (settlement, selected_oracle) = settlement_service
+			.get_any_settlement_for_chain(137)
+			.expect("Should have settlement for test chain");
+
+		let generator = QuoteGenerator::new(settlement_service.clone(), delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
 
-		let result = generator.generate_erc3009_order(&request, &config);
+		let result = generator
+			.generate_eip3009_order(&request, &config, settlement, selected_oracle)
+			.await;
 
 		match result {
 			Ok(order) => {
-				assert_eq!(order.signature_type, SignatureType::Erc3009);
+				assert_eq!(order.signature_type, SignatureType::Eip3009);
 				assert_eq!(order.primary_type, "ReceiveWithAuthorization");
 				assert!(order.message.is_object());
 
-				// Verify message structure
-				let message = order.message.as_object().unwrap();
-				assert!(message.contains_key("from"));
-				assert!(message.contains_key("to"));
-				assert!(message.contains_key("value"));
-				assert!(message.contains_key("validAfter"));
-				assert!(message.contains_key("validBefore"));
-				assert!(message.contains_key("nonce"));
+				// Verify domain is at the order level (new structure)
+				assert!(order.domain.is_object());
+				let domain = order.domain.as_object().unwrap();
+				assert!(domain.contains_key("name"));
+				assert!(domain.contains_key("chainId"));
+				assert!(domain.contains_key("verifyingContract"));
+
+				// Verify message structure (EIP-3009 fields)
+				let message_obj = order.message.as_object().unwrap();
+				assert!(message_obj["from"].is_string());
+				assert!(message_obj["to"].is_string());
+				assert!(message_obj["value"].is_string());
+				assert!(message_obj["validAfter"].is_number());
+				assert!(message_obj["validBefore"].is_number());
+				assert!(message_obj["nonce"].is_string());
+				assert!(message_obj["inputOracle"].is_string());
 			},
 			Err(e) => {
-				// Expected if escrow address configuration is missing
+				// Expected if token contract calls fail or configuration is missing
 				assert!(matches!(e, QuoteError::InvalidRequest(_)));
 			},
 		}
@@ -1368,44 +1774,6 @@ mod tests {
 		assert!(matches!(result, Err(QuoteError::InvalidRequest(_))));
 	}
 
-	#[test]
-	fn test_get_escrow_address_success() {
-		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
-		let config = create_test_config();
-
-		let result = generator.get_escrow_address(&config);
-		assert!(result.is_ok());
-	}
-
-	#[test]
-	fn test_get_escrow_address_missing_config() {
-		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
-		let mut config = create_test_config();
-		config.settlement.domain = None;
-
-		let result = generator.get_escrow_address(&config);
-		assert!(matches!(result, Err(QuoteError::InvalidRequest(_))));
-	}
-
-	#[test]
-	fn test_get_escrow_address_invalid_address() {
-		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
-		let mut config = create_test_config();
-		config.settlement.domain.as_mut().unwrap().address = "invalid_address".to_string();
-
-		let result = generator.get_escrow_address(&config);
-		assert!(matches!(result, Err(QuoteError::InvalidRequest(_))));
-	}
-
 	#[tokio::test]
 	async fn test_generate_quote_for_settlement_resource_lock() {
 		let settlement_service = create_test_settlement_service(true);
@@ -1451,7 +1819,7 @@ mod tests {
 		let request = create_test_request();
 
 		let custody_decision = CustodyDecision::Escrow {
-			kind: EscrowKind::Erc3009,
+			kind: EscrowKind::Eip3009,
 		};
 
 		let result = generator
@@ -1465,7 +1833,7 @@ mod tests {
 				assert!(quote.valid_until.is_some());
 				assert!(quote.eta.is_some());
 				assert_eq!(quote.orders.len(), 1);
-				assert_eq!(quote.orders[0].signature_type, SignatureType::Erc3009);
+				assert_eq!(quote.orders[0].signature_type, SignatureType::Eip3009);
 			},
 			Err(e) => {
 				// Expected due to missing settlement service setup or invalid request

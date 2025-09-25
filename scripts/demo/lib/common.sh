@@ -62,8 +62,11 @@ to_uii_address() {
 from_uii_address() {
     local uii="$1"
     
-    # Extract chain reference (bytes 10-13)
-    local chain_ref="${uii:10:4}"
+    # UII format: 0x + 01 + 00000214 + chainRef + address
+    # Positions:   0-1  2-3   4-11      12-15     16-55
+    
+    # Extract chain reference (positions 12-15)
+    local chain_ref="${uii:12:4}"
     
     # Map chain reference to chain ID
     local chain_id
@@ -77,8 +80,8 @@ from_uii_address() {
         *) chain_id=$((16#$chain_ref)) ;;
     esac
     
-    # Extract address (last 40 chars)
-    local address="0x${uii:14}"
+    # Extract address (positions 16+, last 40 chars)
+    local address="0x${uii:16}"
     
     echo "$chain_id $address"
 }
