@@ -743,10 +743,15 @@ sign_compact_digest_from_quote() {
 
     print_debug "Starting BatchCompact signing with client-side digest computation" >&2
 
-    # Extract EIP-712 message for client computation
+    # For compact orders, the message contains an .eip712 field with the actual EIP-712 message
     local eip712_message=$(echo "$full_message" | jq -r '.eip712 // empty' 2>/dev/null)
     if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ] || [ "$eip712_message" = "empty" ]; then
-        print_error "No EIP-712 message found for digest computation" >&2
+        # If no .eip712 field, use message directly
+        eip712_message="$full_message"
+    fi
+    
+    if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ]; then
+        print_error "No message found for digest computation" >&2
         return 1
     fi
 
@@ -774,110 +779,6 @@ sign_compact_digest_from_quote() {
     echo "$signature"
 }
 
-# Compute EIP-712 digest for PermitBatchWitnessTransferFrom from quote JSON
-compute_permit2_digest_from_quote() {
-    local eip712_message="$1"
-
-    print_debug "Computing PermitBatchWitnessTransferFrom digest from EIP-712 message" >&2
-
-    # Extract domain information
-    local domain=$(echo "$eip712_message" | jq -r '.signing.domain // .domain')
-    local name=$(echo "$domain" | jq -r '.name')
-    local chain_id=$(echo "$domain" | jq -r '.chainId')
-    local verifying_contract=$(echo "$domain" | jq -r '.verifyingContract')
-
-    print_debug "Domain: name=$name, chainId=$chain_id, contract=$verifying_contract" >&2
-
-    # Get Permit2 domain separator
-    local domain_separator=$(get_permit2_domain_separator "$chain_id" "$verifying_contract")
-    print_debug "Domain separator: $domain_separator" >&2
-
-    # Extract message fields
-    local spender=$(echo "$eip712_message" | jq -r '.spender')
-    local nonce=$(echo "$eip712_message" | jq -r '.nonce')
-    local deadline=$(echo "$eip712_message" | jq -r '.deadline')
-    local permitted=$(echo "$eip712_message" | jq -c '.permitted')
-    local witness=$(echo "$eip712_message" | jq -c '.witness')
-
-    print_debug "Message: spender=$spender, nonce=$nonce, deadline=$deadline" >&2
-
-    # Compute TokenPermissions hashes
-    local permitted_count=$(echo "$permitted" | jq '. | length')
-    local token_hashes=""
-
-    for ((i=0; i<permitted_count; i++)); do
-        local permission=$(echo "$permitted" | jq -r ".[$i]")
-        local token=$(echo "$permission" | jq -r '.token')
-        local amount=$(echo "$permission" | jq -r '.amount')
-
-        print_debug "Permission $i: token=$token, amount=$amount" >&2
-
-        local token_hash=$(compute_token_permissions_hash "$token" "$amount")
-        token_hashes="${token_hashes}${token_hash#0x}"
-
-        print_debug "Token permissions hash $i: $token_hash" >&2
-    done
-
-    local permitted_array_hash=$(cast_keccak "0x$token_hashes")
-    print_debug "Permitted array hash: $permitted_array_hash" >&2
-
-    # Compute witness hash
-    local expires=$(echo "$witness" | jq -r '.expires')
-    local input_oracle=$(echo "$witness" | jq -r '.inputOracle')
-    local outputs=$(echo "$witness" | jq -c '.outputs')
-
-    print_debug "Witness: expires=$expires, inputOracle=$input_oracle" >&2
-
-    # Compute MandateOutput hashes for witness
-    local outputs_count=$(echo "$outputs" | jq '. | length')
-    local output_hashes=()
-
-    for ((i=0; i<outputs_count; i++)); do
-        local output=$(echo "$outputs" | jq -r ".[$i]")
-        local oracle=$(echo "$output" | jq -r '.oracle // "0x0000000000000000000000000000000000000000000000000000000000000000"')
-        local settler=$(echo "$output" | jq -r '.settler')
-        local output_chain_id=$(echo "$output" | jq -r '.chainId')
-        local token=$(echo "$output" | jq -r '.token')
-        local amount=$(echo "$output" | jq -r '.amount')
-        local recipient=$(echo "$output" | jq -r '.recipient')
-
-        print_debug "Output $i: oracle=$oracle, settler=$settler, chain=$output_chain_id, token=$token, amount=$amount, recipient=$recipient" >&2
-
-        local output_hash=$(compute_mandate_output_hash "$oracle" "$settler" "$output_chain_id" "$token" "$amount" "$recipient")
-        output_hashes+=("$output_hash")
-
-        print_debug "Output hash $i: $output_hash" >&2
-    done
-
-    local witness_hash=$(compute_permit2_witness_hash "$expires" "$input_oracle" "${output_hashes[@]}")
-    print_debug "Witness hash: $witness_hash" >&2
-
-    # Build the main struct hash for PermitBatchWitnessTransferFrom
-    local mandate_output_type="MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
-    local token_permissions_type="TokenPermissions(address token,uint256 amount)"
-    local witness_type_string="Permit2Witness witness)${mandate_output_type}${token_permissions_type}Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)"
-    local permit_batch_witness_string="PermitBatchWitnessTransferFrom(TokenPermissions[] permitted,address spender,uint256 nonce,uint256 deadline,${witness_type_string}"
-
-    local permit_batch_type_hash=$(compute_type_hash "$permit_batch_witness_string")
-    print_debug "Permit batch type string: $permit_batch_witness_string" >&2
-    print_debug "Permit batch type hash: $permit_batch_type_hash" >&2
-
-    # Build final struct hash
-    local struct_hash=$(cast_keccak $(cast_abi_encode "f(bytes32,bytes32,address,uint256,uint256,bytes32)" \
-        "$permit_batch_type_hash" "$permitted_array_hash" "$spender" "$nonce" "$deadline" "$witness_hash"))
-
-    print_debug "Struct hash: $struct_hash" >&2
-
-    # Create final EIP-712 digest
-    local digest_prefix="0x1901"
-    local digest="${digest_prefix}${domain_separator#0x}${struct_hash#0x}"
-    local final_digest=$(cast_keccak "$digest")
-
-    print_debug "Final digest: $final_digest" >&2
-
-    echo "$final_digest"
-}
-
 # Sign PermitBatchWitnessTransferFrom digest from quote using client-side computation
 sign_permit2_digest_from_quote() {
     local user_private_key="$1"
@@ -885,10 +786,10 @@ sign_permit2_digest_from_quote() {
 
     print_debug "Starting PermitBatchWitnessTransferFrom signing with client-side digest computation" >&2
 
-    # Extract EIP-712 message for client computation
-    local eip712_message=$(echo "$full_message" | jq -r '.eip712 // empty' 2>/dev/null)
-    if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ] || [ "$eip712_message" = "empty" ]; then
-        print_error "No EIP-712 message found for digest computation" >&2
+    # Use message directly for client computation
+    local eip712_message="$full_message"
+    if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ]; then
+        print_error "No message found for digest computation" >&2
         return 1
     fi
 
@@ -923,16 +824,15 @@ compute_permit2_digest_from_quote() {
 
     print_debug "Computing PermitBatchWitnessTransferFrom digest from EIP-712 message" >&2
 
-    # Try to get domain from quote level first, then fall back to message level
+    # Get domain from quote level if provided, otherwise error
     local domain=""
     if [ -n "$quote_domain" ] && echo "$quote_domain" | jq -e 'type == "object"' > /dev/null 2>&1; then
-        # New structured domain format
+        # Structured domain format from quote level
         domain="$quote_domain"
-        print_debug "Using domain from quote level (new format)" >&2
+        print_debug "Using domain from quote level" >&2
     else
-        # Legacy format - extract from signing.domain
-        domain=$(echo "$eip712_message" | jq -r '.signing.domain // .domain')
-        print_debug "Using domain from message level (legacy format)" >&2
+        print_error "No valid domain provided" >&2
+        return 1
     fi
 
     # Extract domain information

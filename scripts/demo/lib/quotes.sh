@@ -353,10 +353,10 @@ show_quote_summary() {
     print_info "Trade details:"
     
     # Parse first order for trade details
-    local input_token=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.eip712.permitted[0].token // "N/A"')
-    local input_amount=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.eip712.permitted[0].amount // "N/A"')
-    local output_token=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.eip712.witness.outputs[0].token // "N/A"')
-    local output_amount=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.eip712.witness.outputs[0].amount // "N/A"')
+    local input_token=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.permitted[0].token // "N/A"')
+    local input_amount=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.permitted[0].amount // "N/A"')
+    local output_token=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.witness.outputs[0].token // "N/A"')
+    local output_amount=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.witness.outputs[0].amount // "N/A"')
     
     if [ "$input_amount" != "N/A" ]; then
         local input_formatted=$(format_balance "$input_amount")
@@ -757,20 +757,18 @@ quote_accept() {
                 while [ $i -lt "$signature_count" ]; do
                     local sig_message=$(echo "$signatures_array" | jq -r ".[$i]")
 
-                    # Parse domain - handle both new structured format and legacy UII format
+                    # Parse domain from structured format
                     local domain_data=$(echo "$order_data" | jq -r '.domain // empty')
                     local origin_chain_id=""
                     local token_contract=""
                     
                     if echo "$domain_data" | jq -e 'type == "object"' > /dev/null 2>&1; then
-                        # New structured domain format
+                        # Structured domain format
                         origin_chain_id=$(echo "$domain_data" | jq -r '.chainId')
                         token_contract=$(echo "$domain_data" | jq -r '.verifyingContract')
                     else
-                        # Legacy UII format
-                        local uii_parsed=$(from_uii_address "$domain_data")
-                        origin_chain_id=$(echo "$uii_parsed" | cut -d' ' -f1)
-                        token_contract=$(echo "$uii_parsed" | cut -d' ' -f2)
+                        print_error "Invalid domain format in order"
+                        return 1
                     fi
 
                     local from_address=$(echo "$sig_message" | jq -r '.from // empty')
@@ -843,24 +841,20 @@ quote_accept() {
                 # Handle single signature (backwards compatibility)
                 print_info "Processing single EIP-3009 signature..."
 
-                # Check if domain is the new structured format (object) or old UII format (string)
+                # Parse domain from structured format
                 local domain_data=$(echo "$order_data" | jq -r '.domain // empty')
                 local origin_chain_id=""
                 local token_contract=""
                 
                 if echo "$domain_data" | jq -e 'type == "object"' > /dev/null 2>&1; then
-                    # New structured domain format
-                    print_debug "Using new structured domain format"
+                    # Structured domain format
+                    print_debug "Using structured domain format"
                     origin_chain_id=$(echo "$domain_data" | jq -r '.chainId')
                     token_contract=$(echo "$domain_data" | jq -r '.verifyingContract')
                     print_debug "Extracted from domain object: chain_id=$origin_chain_id, token=$token_contract"
                 else
-                    # Legacy UII format - parse as before
-                    print_debug "Using legacy UII domain format: $domain_data"
-                    local uii_parsed=$(from_uii_address "$domain_data")
-                    print_debug "UII parsed result: '$uii_parsed'"
-                    origin_chain_id=$(echo "$uii_parsed" | cut -d' ' -f1)
-                    token_contract=$(echo "$uii_parsed" | cut -d' ' -f2)
+                    print_error "Invalid domain format in order"
+                    return 1
                 fi
 
                 # Extract EIP-3009 fields directly from message
@@ -985,17 +979,9 @@ quote_accept() {
         elif [ "$signature_type" = "eip712" ]; then
             print_info "Signing EIP-712 order..."
 
-            # Check if message has eip712 wrapper (legacy) or is clean (new format)
-            local eip712_message=""
-            if echo "$full_message" | jq -e 'has("eip712")' > /dev/null 2>&1; then
-                # Legacy format: extract eip712 wrapper
-                eip712_message=$(echo "$full_message" | jq -r '.eip712')
-                local eip712_primary_type=$(echo "$eip712_message" | jq -r '.primaryType // "PermitBatchWitnessTransferFrom"')
-            else
-                # New clean format: use full_message directly
-                eip712_message="$full_message"
-                local eip712_primary_type=$(echo "$order_data" | jq -r '.primaryType // "PermitBatchWitnessTransferFrom"')
-            fi
+            # Use message directly (no wrapper)
+            local eip712_message="$full_message"
+            local eip712_primary_type=$(echo "$order_data" | jq -r '.primaryType // "PermitBatchWitnessTransferFrom"')
 
             if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ]; then
                 print_error "No EIP-712 message found in EIP-712 order"
@@ -1004,7 +990,7 @@ quote_accept() {
 
             print_debug "EIP-712 Primary type: $eip712_primary_type"
 
-            if [ "$eip712_primary_type" = "BatchCompact" ]; then
+            if [ "$eip712_primary_type" = "BatchCompact" ] || [ "$eip712_primary_type" = "CompactLock" ]; then
                 print_info "Detected BatchCompact order, using compact signing..."
 
                 # Use client-side digest computation
@@ -1027,26 +1013,21 @@ quote_accept() {
             else
                 print_info "Detected Permit2 order, using standard signing..."
 
-            # For new clean format, extract witness data directly from message
+            # Extract witness data directly from message
             local witness=$(echo "$eip712_message" | jq -r '.witness // empty')
             local witness_expires=$(echo "$witness" | jq -r '.expires // 0')
             local input_oracle=$(echo "$witness" | jq -r '.inputOracle // "0x0000000000000000000000000000000000000000"')
 
-            # Get domain from order level (new format) or legacy location
+            # Get domain from order level
             local domain=""
             local order_domain=$(echo "$order_data" | jq -r '.domain // empty')
             if echo "$order_domain" | jq -e 'type == "object"' > /dev/null 2>&1; then
-                # New structured domain format (same as EIP-3009)
+                # Structured domain format
                 domain="$order_domain"
-                print_debug "Using new structured domain format for Permit2"
+                print_debug "Using structured domain format for Permit2"
             else
-                # Legacy format - extract from signing.domain (if it exists)
-                domain=$(echo "$eip712_message" | jq -r '.signing.domain // empty')
-                print_debug "Using legacy signing.domain format for Permit2"
-                if [ -z "$domain" ] || [ "$domain" = "empty" ] || [ "$domain" = "null" ]; then
-                    print_error "No domain information found in Permit2 order"
-                    return 1
-                fi
+                print_error "No domain information found in Permit2 order"
+                return 1
             fi
             
             # Extract message fields directly
@@ -1070,8 +1051,7 @@ quote_accept() {
             # Get origin chain ID from the domain
             local origin_chain_id=$(echo "$domain" | jq -r '.chainId // 31337')
             
-            # For new structured domain format, we have all the domain info already
-            # For legacy format, domain info is embedded in the message
+            # We have all the domain info from the order level
             print_debug "Domain object: $domain"
 
             # Build mandate outputs array from witness outputs
