@@ -171,9 +171,6 @@ pub struct MandateOutput {
 	pub context: Vec<u8>,
 }
 
-/// Alias for backward compatibility
-pub type Output = MandateOutput;
-
 #[cfg(feature = "oif-interfaces")]
 use crate::api::{Quote, QuoteParsable};
 use crate::order::OrderParsable;
@@ -413,28 +410,21 @@ impl interfaces::StandardOrder {
 			.as_object()
 			.ok_or("Invalid EIP-712 message structure")?;
 
-		// Check if this is the new clean format or legacy format with eip712 wrapper
-		let eip712_data = if message_data.contains_key("eip712") {
-			// Legacy format: extract nested eip712 object
-			message_data
+		// Extract EIP-712 data (with or without wrapper)
+		let (eip712_data, primary_type) = if message_data.contains_key("eip712") {
+			// Wrapped format (e.g., Compact orders)
+			let eip712 = message_data
 				.get("eip712")
 				.and_then(|e| e.as_object())
-				.ok_or("Missing 'eip712' object in message")?
-		} else {
-			// New clean format: use message_data directly
-			message_data
-		};
-
-		// Primary type comes from quote order level for new format, or from eip712 data for legacy
-		let primary_type = if message_data.contains_key("eip712") {
-			// Legacy format: get from eip712 data
-			eip712_data
+				.ok_or("Missing 'eip712' object in message")?;
+			let primary = eip712
 				.get("primaryType")
 				.and_then(|p| p.as_str())
-				.unwrap_or("PermitBatchWitnessTransferFrom")
+				.unwrap_or("PermitBatchWitnessTransferFrom");
+			(eip712, primary)
 		} else {
-			// New format: get from quote order level
-			&quote_order.primary_type
+			// Direct format (e.g., Permit2 orders)
+			(message_data, &quote_order.primary_type as &str)
 		};
 
 		Ok((eip712_data, primary_type))
@@ -596,17 +586,8 @@ impl interfaces::StandardOrder {
 			.as_object()
 			.ok_or("Invalid EIP-3009 message structure")?;
 
-		// Check if this is the new nested structure (with domain and message fields)
-		let message_data = if message_root.contains_key("message") {
-			// New structure: extract the nested message object
-			message_root
-				.get("message")
-				.and_then(|m| m.as_object())
-				.ok_or("Missing nested 'message' field in EIP-3009 structure")?
-		} else {
-			// Old structure: use the root object directly (backwards compatibility)
-			message_root
-		};
+		// For EIP-3009, the message is directly at the root level
+		let message_data = message_root;
 
 		// Extract user address from message 'from' field
 		let from_str = message_data
@@ -724,18 +705,6 @@ impl interfaces::StandardOrder {
 			inputs,
 			outputs: sol_outputs,
 		};
-
-		// Debug log the reconstructed StandardOrder for EIP-3009
-		tracing::info!("=== EIP-3009 QUOTE CONVERSION DEBUG ===");
-		tracing::info!("Reconstructed StandardOrder:");
-		tracing::info!("  user: {:?}", standard_order.user);
-		tracing::info!("  nonce: {:#x}", standard_order.nonce);
-		tracing::info!("  originChainId: {}", standard_order.originChainId);
-		tracing::info!("  expires: {}", standard_order.expires);
-		tracing::info!("  fillDeadline: {}", standard_order.fillDeadline);
-		tracing::info!("  inputOracle: {:?}", standard_order.inputOracle);
-		tracing::info!("  inputs.len(): {}", standard_order.inputs.len());
-		tracing::info!("  outputs.len(): {}", standard_order.outputs.len());
 
 		Ok(standard_order)
 	}
@@ -1295,24 +1264,6 @@ mod tests {
 		assert_eq!(order.signature, None);
 		assert_eq!(order.sponsor, None);
 		assert_eq!(order.lock_type, None);
-	}
-
-	#[test]
-	fn test_output_type_alias() {
-		// Test that Output is indeed an alias for MandateOutput
-		let output: Output = MandateOutputBuilder::new()
-			.oracle([1u8; 32])
-			.settler([2u8; 32])
-			.chain_id(U256::from(1))
-			.token([3u8; 32])
-			.amount(U256::from(1000))
-			.recipient([4u8; 32])
-			.call(vec![0xab, 0xcd])
-			.context(vec![0x12, 0x34])
-			.build();
-
-		assert_eq!(output.amount, U256::from(1000));
-		assert_eq!(output.call, vec![0xab, 0xcd]);
 	}
 
 	#[test]

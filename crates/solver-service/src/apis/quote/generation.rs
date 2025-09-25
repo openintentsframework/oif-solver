@@ -498,13 +498,6 @@ impl QuoteGenerator {
 
 		tracing::debug!("Successfully extracted clean order ID: {}", order_id);
 
-		// Debug log the original StandardOrder structure used for quote generation
-		tracing::info!("=== EIP-3009 QUOTE GENERATION DEBUG ===");
-		tracing::info!("Original StandardOrder for order_identifier calculation:");
-		tracing::info!("  order_struct: {}", order_struct);
-		tracing::info!("  nonce (microseconds): {}", nonce);
-		tracing::info!("  calculated order_id: {}", order_id);
-
 		Ok((nonce, order_id))
 	}
 

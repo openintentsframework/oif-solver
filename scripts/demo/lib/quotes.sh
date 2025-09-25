@@ -740,7 +740,7 @@ quote_accept() {
         if [ "$signature_type" = "eip3009" ]; then
             print_info "Signing EIP-3009 order..."
 
-            # Check if this is a multi-signature order (new format)
+            # Check if this is a multi-signature order
             local signatures_array=$(echo "$full_message" | jq -r '.signatures // empty')
 
             if [ -n "$signatures_array" ] && [ "$signatures_array" != "null" ] && [ "$signatures_array" != "empty" ]; then
@@ -834,7 +834,7 @@ quote_accept() {
                 print_success "Multiple EIP-3009 orders signed successfully ($signature_count signatures)"
 
             else
-                # Handle single signature (backwards compatibility)
+                # Handle single signature
                 print_info "Processing single EIP-3009 signature..."
 
                 # Parse domain from structured format
