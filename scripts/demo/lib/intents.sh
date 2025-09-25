@@ -357,7 +357,7 @@ create_eip3009_intent() {
     
     # Pass the StandardOrder struct directly to orderIdentifier
     local order_identifier_sig="orderIdentifier((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))"
-    local order_id=$(cast call "$input_settler" \
+    local order_id=$(cast_cmd "call" "$input_settler" \
         "$order_identifier_sig" \
         "$order_struct" --rpc-url "$origin_rpc")
     
@@ -561,7 +561,7 @@ create_compact_intent() {
     # Include debug information if DEBUG_OUTPUT environment variable is set
     if [ -n "${DEBUG_OUTPUT:-}" ]; then
         # Get the final digest that was signed (need to recompute it here for debug)
-        local domain_separator=$(cast call "$the_compact_addr" "DOMAIN_SEPARATOR()" --rpc-url "http://localhost:8545" 2>/dev/null)
+        local domain_separator=$(cast_cmd "call" "$the_compact_addr" "DOMAIN_SEPARATOR()" --rpc-url "http://localhost:8545" 2>/dev/null)
         local batch_compact_type_hash=$(cast keccak "BatchCompact(address arbiter,address sponsor,uint256 nonce,uint256 expires,Lock[] commitments,Mandate mandate)Lock(bytes12 lockTag,address token,uint256 amount)Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)")
         
         # Recompute commitments hash
@@ -1525,12 +1525,20 @@ intent_build() {
                     ]
                 }')
         else
-            # For escrow intents, no lock field needed
+            # For escrow intents, set lock field based on lock_type/auth_type
+            local lock_kind=""
+            case "$lock_type" in
+                permit2) lock_kind="Permit2" ;;
+                eip3009) lock_kind="eip3009" ;;  # Use kebab-case form
+                *) lock_kind="Permit2" ;;  # Default fallback
+            esac
+            
             local quote_request=$(jq -n \
                 --arg user "$user_uii" \
                 --arg input_user "$user_uii" \
                 --arg input_asset "$input_asset_uii" \
                 --arg input_amount "$amount_in" \
+                --arg lock_kind "$lock_kind" \
                 --arg output_receiver "$recipient_uii" \
                 --arg output_asset "$output_asset_uii" \
                 --arg output_amount "$amount_out" \
@@ -1540,7 +1548,10 @@ intent_build() {
                         {
                             user: $input_user,
                             asset: $input_asset,
-                            amount: $input_amount
+                            amount: $input_amount,
+                            lock: {
+                                kind: $lock_kind
+                            }
                         }
                     ],
                     requestedOutputs: [

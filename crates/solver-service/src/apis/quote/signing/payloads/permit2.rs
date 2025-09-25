@@ -29,7 +29,7 @@ use solver_types::utils::{
 };
 use solver_types::{
 	utils::{compute_final_digest, Eip712AbiEncoder},
-	GetQuoteRequest, InteropAddress, QuoteError,
+	GetQuoteRequest, QuoteError,
 };
 
 pub fn build_permit2_batch_witness_digest(
@@ -217,19 +217,6 @@ pub fn build_permit2_batch_witness_digest(
 	});
 
 	Ok((final_digest, message_json))
-}
-
-/// Build an ERC-7930 interop address for Permit2 domain (no name/version carried here).
-pub fn permit2_domain_address_from_config(
-	_config: &Config,
-	chain_id: u64,
-) -> Result<InteropAddress, QuoteError> {
-	let permit2 = PROTOCOL_REGISTRY
-		.get_permit2_address(chain_id)
-		.ok_or_else(|| {
-			QuoteError::InvalidRequest(format!("Permit2 not deployed on chain {}", chain_id))
-		})?;
-	Ok(InteropAddress::new_ethereum(chain_id, permit2))
 }
 
 #[cfg(test)]
@@ -527,39 +514,6 @@ mod tests {
 			600,
 			expires_u32 - now
 		);
-	}
-
-	#[test]
-	fn test_permit2_domain_address_from_config_success() {
-		let config = create_test_config();
-
-		let result = permit2_domain_address_from_config(&config, TEST_CHAIN_ID_1);
-
-		assert!(result.is_ok());
-
-		let domain_address = result.unwrap();
-
-		// Verify it's an Ethereum address
-		assert_eq!(domain_address.ethereum_chain_id().unwrap(), TEST_CHAIN_ID_1);
-
-		// Verify we get a valid address (not zero)
-		let eth_address = domain_address.ethereum_address().unwrap();
-		assert_ne!(eth_address, [0u8; 20]);
-	}
-
-	#[test]
-	fn test_permit2_domain_address_from_config_chain_not_supported() {
-		let config = create_test_config();
-
-		let result = permit2_domain_address_from_config(&config, 999);
-
-		assert!(result.is_err());
-		match result.err().unwrap() {
-			QuoteError::InvalidRequest(msg) => {
-				assert!(msg.contains("Permit2 not deployed on chain 999"));
-			},
-			_ => panic!("Expected InvalidRequest error"),
-		}
 	}
 
 	#[test]

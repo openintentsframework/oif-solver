@@ -68,7 +68,7 @@ where
 				// Try parsing as enum variant name
 				match value {
 					"permit2_escrow" | "Permit2Escrow" => Ok(LockType::Permit2Escrow),
-					"eip3009_escrow" | "Eip3009Escrow" => Ok(LockType::Eip3009Escrow),
+					"eip3009_escrow" | "Eip3009Escrow" => Ok(LockType::Eip3009Escrow), // Accept both variants for compatibility
 					"compact_resource_lock" | "ResourceLock" => Ok(LockType::ResourceLock),
 					_ => Err(Error::custom("Invalid LockType string")),
 				}
@@ -172,6 +172,10 @@ pub struct Lock {
 pub enum LockKind {
 	#[serde(alias = "TheCompact", alias = "the_compact")]
 	TheCompact,
+	#[serde(alias = "Permit2", alias = "permit2")]
+	Permit2,
+	#[serde(alias = "EIP3009", alias = "eip3009", alias = "Eip3009")]
+	Eip3009,
 }
 
 /// Available input with lock information and user
@@ -233,11 +237,11 @@ pub enum QuotePreference {
 /// EIP-712 compliant order structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuoteOrder {
-	/// Signature type (eip-712 or erc-3009)
+	/// Signature type (eip-712 or eip-3009)
 	#[serde(rename = "signatureType")]
 	pub signature_type: SignatureType,
-	/// ERC-7930 interoperable address of the domain
-	pub domain: InteropAddress,
+	/// ERC-7930 interoperable address of the domain (or domain object for structured domains)
+	pub domain: serde_json::Value,
 	/// Primary type for EIP-712 signing
 	#[serde(rename = "primaryType")]
 	pub primary_type: String,
@@ -250,7 +254,7 @@ pub struct QuoteOrder {
 #[serde(rename_all = "kebab-case")]
 pub enum SignatureType {
 	Eip712,
-	Erc3009,
+	Eip3009,
 }
 
 /// Quote details matching the request structure
@@ -808,8 +812,8 @@ mod tests {
 
 	#[test]
 	fn test_signature_type_serialization() {
-		let sig_types = [SignatureType::Eip712, SignatureType::Erc3009];
-		let expected_values = ["\"eip712\"", "\"erc3009\""];
+		let sig_types = [SignatureType::Eip712, SignatureType::Eip3009];
+		let expected_values = ["\"eip712\"", "\"eip3009\""];
 
 		for (sig_type, expected) in sig_types.iter().zip(expected_values.iter()) {
 			let json = serde_json::to_string(sig_type).unwrap();
@@ -824,10 +828,11 @@ mod tests {
 	fn test_quote_order_serialization() {
 		let order = QuoteOrder {
 			signature_type: SignatureType::Eip712,
-			domain: InteropAddress::new_ethereum(
+			domain: serde_json::to_value(InteropAddress::new_ethereum(
 				1,
 				address!("5555555555555555555555555555555555555555"),
-			),
+			))
+			.unwrap(),
 			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
 			message: serde_json::json!({
 				"permitted": [],
@@ -866,10 +871,11 @@ mod tests {
 		let quote = Quote {
 			orders: vec![QuoteOrder {
 				signature_type: SignatureType::Eip712,
-				domain: InteropAddress::new_ethereum(
+				domain: serde_json::to_value(InteropAddress::new_ethereum(
 					1,
 					address!("5555555555555555555555555555555555555555"),
-				),
+				))
+				.unwrap(),
 				primary_type: "TestType".to_string(),
 				message: serde_json::json!({"test": "value"}),
 			}],

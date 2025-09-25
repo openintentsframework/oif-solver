@@ -353,10 +353,10 @@ show_quote_summary() {
     print_info "Trade details:"
     
     # Parse first order for trade details
-    local input_token=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.eip712.permitted[0].token // "N/A"')
-    local input_amount=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.eip712.permitted[0].amount // "N/A"')
-    local output_token=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.eip712.witness.outputs[0].token // "N/A"')
-    local output_amount=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.eip712.witness.outputs[0].amount // "N/A"')
+    local input_token=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.permitted[0].token // "N/A"')
+    local input_amount=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.permitted[0].amount // "N/A"')
+    local output_token=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.witness.outputs[0].token // "N/A"')
+    local output_amount=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.witness.outputs[0].amount // "N/A"')
     
     if [ "$input_amount" != "N/A" ]; then
         local input_formatted=$(format_balance "$input_amount")
@@ -722,60 +722,307 @@ quote_accept() {
             print_error "User private key not configured"
             return 1
         fi
-        print_debug "User key found, extracting EIP-712 message..."
+        print_debug "User key found, determining order type..."
 
-        # Extract the full message object (contains both digest and eip712)
+        # Extract the full message object and signature type
         local full_message=$(echo "$order_data" | jq -r '.message // empty')
+        local signature_type=$(echo "$order_data" | jq -r '.signatureType // empty')
+        local primary_type=$(echo "$order_data" | jq -r '.primaryType // empty')
+        
         if [ -z "$full_message" ] || [ "$full_message" = "null" ]; then
             print_error "No message found in order"
             return 1
         fi
 
-        # Extract EIP-712 message for signing (for compatibility with existing code)
-        local eip712_message=$(echo "$full_message" | jq -r '.eip712 // empty')
-        if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ]; then
-            print_error "No EIP-712 message found in order"
-            return 1
-        fi
-
-        print_info "Signing EIP-712 order..."
-
-        # Determine the order type based on primaryType
-        local primary_type=$(echo "$eip712_message" | jq -r '.primaryType // "PermitBatchWitnessTransferFrom"')
-        print_debug "Primary type: $primary_type"
-
+        print_debug "Signature type: $signature_type, Primary type: $primary_type"
         local signature=""
 
-        if [ "$primary_type" = "BatchCompact" ]; then
-            print_info "Detected BatchCompact order, using compact signing..."
+        if [ "$signature_type" = "eip3009" ]; then
+            print_info "Signing EIP-3009 order..."
 
-            # Use client-side digest computation
-            signature=$(sign_compact_digest_from_quote "$user_key" "$full_message")
+            # Check if this is a multi-signature order
+            local signatures_array=$(echo "$full_message" | jq -r '.signatures // empty')
 
-            if [ -z "$signature" ]; then
-                print_error "Failed to sign BatchCompact order"
+            if [ -n "$signatures_array" ] && [ "$signatures_array" != "null" ] && [ "$signatures_array" != "empty" ]; then
+                # Handle multiple signatures (new format from quote generator)
+                print_info "Processing multiple EIP-3009 signatures..."
+
+                local signature_count=$(echo "$signatures_array" | jq '. | length')
+                print_debug "Number of signatures required: $signature_count"
+
+                local signatures_bytes_array=""
+                local i=0
+
+                # Process each signature in the array
+                while [ $i -lt "$signature_count" ]; do
+                    local sig_message=$(echo "$signatures_array" | jq -r ".[$i]")
+
+                    # Parse domain from structured format
+                    local domain_data=$(echo "$order_data" | jq -r '.domain // empty')
+                    local origin_chain_id=""
+                    local token_contract=""
+                    
+                    if echo "$domain_data" | jq -e 'type == "object"' > /dev/null 2>&1; then
+                        # Structured domain format
+                        origin_chain_id=$(echo "$domain_data" | jq -r '.chainId')
+                        token_contract=$(echo "$domain_data" | jq -r '.verifyingContract')
+                    else
+                        print_error "Invalid domain format in order"
+                        return 1
+                    fi
+
+                    local from_address=$(echo "$sig_message" | jq -r '.from // empty')
+                    local to_address=$(echo "$sig_message" | jq -r '.to // empty')
+                    local value=$(echo "$sig_message" | jq -r '.value // empty')
+                    local valid_after=$(echo "$sig_message" | jq -r '.validAfter // 0')
+                    local valid_before=$(echo "$sig_message" | jq -r '.validBefore // 0')
+                    local nonce=$(echo "$sig_message" | jq -r '.nonce // empty')
+
+                    print_debug "Signature $((i+1)): token=$token_contract, value=$value, nonce=$nonce"
+
+                    # Compute domain separator from domain object fields (if available)
+                    local domain_separator=""
+                    if echo "$domain_data" | jq -e 'type == "object"' > /dev/null 2>&1; then
+                        # Extract domain fields
+                        local domain_name=$(echo "$domain_data" | jq -r '.name // empty')
+                        local domain_chain_id=$(echo "$domain_data" | jq -r '.chainId // empty')
+                        local domain_contract=$(echo "$domain_data" | jq -r '.verifyingContract // empty')
+                        
+                        if [ -n "$domain_name" ] && [ "$domain_name" != "empty" ] && \
+                           [ -n "$domain_chain_id" ] && [ "$domain_chain_id" != "empty" ] && \
+                           [ -n "$domain_contract" ] && [ "$domain_contract" != "empty" ]; then
+                            # Compute domain separator from domain fields (like signature.sh compute_domain_separator)
+                            local domain_type_hash=$(cast_keccak "EIP712Domain(string name,uint256 chainId,address verifyingContract)")
+                            local name_hash=$(cast_keccak "$domain_name")
+                            domain_separator=$(cast_abi_encode "f(bytes32,bytes32,uint256,address)" \
+                                "$domain_type_hash" "$name_hash" "$domain_chain_id" "$domain_contract")
+                            domain_separator=$(cast_keccak "$domain_separator")
+                            print_debug "Computed domain separator from domain object: $domain_separator"
+                        fi
+                    fi
+
+                    # Sign this individual EIP-3009 authorization
+                    if [ -z "$domain_separator" ] || [ "$domain_separator" = "empty" ]; then
+                        print_error "No domain separator available for EIP-3009 signing"
+                        return 1
+                    fi
+                    
+                    local individual_signature=$(sign_eip3009_authorization_with_domain \
+                        "$user_key" "$origin_chain_id" "$token_contract" \
+                        "$from_address" "$to_address" "$value" \
+                        "$valid_after" "$valid_before" "$nonce" "$domain_separator")
+
+                    if [ -z "$individual_signature" ]; then
+                        print_error "Failed to sign EIP-3009 order $((i+1))"
+                        return 1
+                    fi
+
+                    # Add this signature to the array (no prefix for individual signatures)
+                    if [ -z "$signatures_bytes_array" ]; then
+                        signatures_bytes_array="$individual_signature"
+                    else
+                        signatures_bytes_array="$signatures_bytes_array,$individual_signature"
+                    fi
+
+                    i=$((i+1))
+                done
+
+                # Encode the signatures array and add EIP-3009 prefix
+                local encoded_signatures=$(cast abi-encode "f(bytes[])" "[$signatures_bytes_array]")
+                signature=$(create_prefixed_signature "$encoded_signatures" "eip3009")
+
+                print_success "Multiple EIP-3009 orders signed successfully ($signature_count signatures)"
+
+            else
+                # Handle single signature
+                print_info "Processing single EIP-3009 signature..."
+
+                # Parse domain from structured format
+                local domain_data=$(echo "$order_data" | jq -r '.domain // empty')
+                local origin_chain_id=""
+                local token_contract=""
+                
+                if echo "$domain_data" | jq -e 'type == "object"' > /dev/null 2>&1; then
+                    # Structured domain format
+                    print_debug "Using structured domain format"
+                    origin_chain_id=$(echo "$domain_data" | jq -r '.chainId')
+                    token_contract=$(echo "$domain_data" | jq -r '.verifyingContract')
+                    print_debug "Extracted from domain object: chain_id=$origin_chain_id, token=$token_contract"
+                else
+                    print_error "Invalid domain format in order"
+                    return 1
+                fi
+
+                # Extract EIP-3009 fields directly from message
+                local from_address=$(echo "$full_message" | jq -r '.from // empty')
+                local to_address=$(echo "$full_message" | jq -r '.to // empty')
+                local value=$(echo "$full_message" | jq -r '.value // empty')
+                local valid_after=$(echo "$full_message" | jq -r '.validAfter // 0')
+                local valid_before=$(echo "$full_message" | jq -r '.validBefore // 0')
+                local nonce=$(echo "$full_message" | jq -r '.nonce // empty')
+
+                print_debug "EIP-3009 params: chain_id=$origin_chain_id, token=$token_contract"
+                print_debug "EIP-3009 params: from=$from_address, to=$to_address, value=$value, nonce=$nonce"
+
+                # For EIP-3009, we need to calculate the correct orderIdentifier from the contract
+                # because the quote nonce is temporary. Use same approach as working direct intent.
+                print_debug "Computing orderIdentifier from contract for EIP-3009 nonce (same method as direct intent)..."
+
+                # Get RPC URL for the chain
+                local rpc_url="http://localhost:8545"
+                if [ "$origin_chain_id" = "31338" ]; then
+                    rpc_url="http://localhost:8546"
+                fi
+
+                # Get input settler address for the chain
+                local input_settler_address
+                if [ "$origin_chain_id" = "31337" ]; then
+                    input_settler_address="0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+                else
+                    input_settler_address="0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+                fi
+
+                # Build StandardOrder struct using the same approach as intents script
+                # Use valid_before as both fill_deadline and expiry (this is the key fix)
+                local fill_deadline="$valid_before"
+                local expiry="$valid_before"
+                local input_oracle="0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"
+
+                # Build input tokens array: [[token, amount]]
+                local input_tokens="[[$token_contract,$value]]"
+
+                # Build outputs array (empty for EIP-3009 order ID calculation)
+                local outputs_array="[]"
+
+                # Build StandardOrder struct (same format as intents script)
+                local order_struct="($from_address,0,$origin_chain_id,$expiry,$fill_deadline,$input_oracle,$input_tokens,$outputs_array)"
+
+                # Use same orderIdentifier signature as working intents script
+                local order_identifier_sig="orderIdentifier((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))"
+                # Capture cast call output and filter out any debug logs
+                local old_rust_log="${RUST_LOG:-}"
+                export RUST_LOG=""
+                
+                local cast_output=$(cast call "$input_settler_address" \
+                    "$order_identifier_sig" \
+                    "$order_struct" \
+                    --rpc-url "$rpc_url" 2>/dev/null)
+                local cast_exit_code=$?
+                
+                # Restore original RUST_LOG
+                if [ -n "$old_rust_log" ]; then
+                    export RUST_LOG="$old_rust_log"
+                else
+                    unset RUST_LOG
+                fi
+                
+                local contract_nonce=""
+                if [ $cast_exit_code -eq 0 ] && [ -n "$cast_output" ]; then
+                    contract_nonce=$(echo "$cast_output" | grep -o "0x[0-9a-fA-F]\{64\}" | head -1)
+                fi
+
+                # For EIP-3009 quotes, use the original quote nonce (order_identifier)
+                # The quote was generated with a specific order_identifier that was calculated by the solver
+                local final_nonce="$nonce"
+
+                # Compute domain separator from domain object fields (if available)
+                local domain_separator=""
+                if echo "$domain_data" | jq -e 'type == "object"' > /dev/null 2>&1; then
+                    # Extract domain fields
+                    local domain_name=$(echo "$domain_data" | jq -r '.name // empty')
+                    local domain_chain_id=$(echo "$domain_data" | jq -r '.chainId // empty')
+                    local domain_contract=$(echo "$domain_data" | jq -r '.verifyingContract // empty')
+                    
+                    if [ -n "$domain_name" ] && [ "$domain_name" != "empty" ] && \
+                       [ -n "$domain_chain_id" ] && [ "$domain_chain_id" != "empty" ] && \
+                       [ -n "$domain_contract" ] && [ "$domain_contract" != "empty" ]; then
+                        # Compute domain separator from domain fields (like signature.sh compute_domain_separator)
+                        local domain_type_hash=$(cast_keccak "EIP712Domain(string name,uint256 chainId,address verifyingContract)")
+                        local name_hash=$(cast_keccak "$domain_name")
+                        domain_separator=$(cast_abi_encode "f(bytes32,bytes32,uint256,address)" \
+                            "$domain_type_hash" "$name_hash" "$domain_chain_id" "$domain_contract")
+                        domain_separator=$(cast_keccak "$domain_separator")
+                        print_debug "Computed domain separator from domain object: $domain_separator"
+                    fi
+                fi
+
+                # Sign EIP-3009 authorization with the correct nonce
+                if [ -z "$domain_separator" ] || [ "$domain_separator" = "empty" ]; then
+                    print_error "No domain separator available for EIP-3009 signing"
+                    return 1
+                fi
+                
+                signature=$(sign_eip3009_authorization_with_domain \
+                    "$user_key" "$origin_chain_id" "$token_contract" \
+                    "$from_address" "$to_address" "$value" \
+                    "$valid_after" "$valid_before" "$final_nonce" "$domain_separator")
+
+                if [ -z "$signature" ]; then
+                    print_error "Failed to sign EIP-3009 order"
+                    return 1
+                fi
+
+                # Add EIP-3009 prefix to signature (like in intent flow)
+                signature=$(create_prefixed_signature "$signature" "eip3009")
+
+                print_success "EIP-3009 order signed successfully"
+            fi
+            
+        elif [ "$signature_type" = "eip712" ]; then
+            print_info "Signing EIP-712 order..."
+
+            # Use message directly (no wrapper)
+            local eip712_message="$full_message"
+            local eip712_primary_type=$(echo "$order_data" | jq -r '.primaryType // "PermitBatchWitnessTransferFrom"')
+
+            if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ]; then
+                print_error "No EIP-712 message found in EIP-712 order"
                 return 1
             fi
 
-            print_success "BatchCompact order signed successfully"
+            print_debug "EIP-712 Primary type: $eip712_primary_type"
 
-            # For compact/resource lock, we need to ABI-encode the signature with allocator data
-            # This matches what the working direct intent flow does in intents.sh
-            local allocator_data="0x"  # Empty allocator data for demo
-            signature=$(cast abi-encode "f(bytes,bytes)" "$signature" "$allocator_data")
+            if [ "$eip712_primary_type" = "BatchCompact" ] || [ "$eip712_primary_type" = "CompactLock" ]; then
+                print_info "Detected BatchCompact order, using compact signing..."
 
-            print_debug "ABI-encoded signature: $signature"
+                # Use client-side digest computation
+                signature=$(sign_compact_digest_from_quote "$user_key" "$full_message")
 
-        else
-            print_info "Detected Permit2 order, using standard signing..."
+                if [ -z "$signature" ]; then
+                    print_error "Failed to sign BatchCompact order"
+                    return 1
+                fi
 
-            # Extract witness data first (needed for signing)
+                print_success "BatchCompact order signed successfully"
+
+                # For compact/resource lock, we need to ABI-encode the signature with allocator data
+                # This matches what the working direct intent flow does in intents.sh
+                local allocator_data="0x"  # Empty allocator data for demo
+                signature=$(cast abi-encode "f(bytes,bytes)" "$signature" "$allocator_data")
+
+                print_debug "ABI-encoded signature: $signature"
+
+            else
+                print_info "Detected Permit2 order, using standard signing..."
+
+            # Extract witness data directly from message
             local witness=$(echo "$eip712_message" | jq -r '.witness // empty')
             local witness_expires=$(echo "$witness" | jq -r '.expires // 0')
             local input_oracle=$(echo "$witness" | jq -r '.inputOracle // "0x0000000000000000000000000000000000000000"')
 
-            # Sign the EIP-712 message
-            local domain=$(echo "$eip712_message" | jq -r '.signing.domain // empty')
+            # Get domain from order level
+            local domain=""
+            local order_domain=$(echo "$order_data" | jq -r '.domain // empty')
+            if echo "$order_domain" | jq -e 'type == "object"' > /dev/null 2>&1; then
+                # Structured domain format
+                domain="$order_domain"
+                print_debug "Using structured domain format for Permit2"
+            else
+                print_error "No domain information found in Permit2 order"
+                return 1
+            fi
+            
+            # Extract message fields directly
             local deadline=$(echo "$eip712_message" | jq -r '.deadline // empty')
             local nonce=$(echo "$eip712_message" | jq -r '.nonce // empty')
             local spender=$(echo "$eip712_message" | jq -r '.spender // empty')
@@ -795,13 +1042,16 @@ quote_accept() {
 
             # Get origin chain ID from the domain
             local origin_chain_id=$(echo "$domain" | jq -r '.chainId // 31337')
+            
+            # We have all the domain info from the order level
+            print_debug "Domain object: $domain"
 
             # Build mandate outputs array from witness outputs
             local mandate_outputs_json=$(echo "$witness" | jq -c '.outputs')
 
             # Use client-side digest computation but with proper signature formatting
             print_info "Computing client-side digest..."
-            local client_digest=$(compute_permit2_digest_from_quote "$eip712_message")
+            local client_digest=$(compute_permit2_digest_from_quote "$eip712_message" "$domain")
             if [ $? -ne 0 ] || [ -z "$client_digest" ]; then
                 print_error "Failed to compute client-side digest"
                 return 1
@@ -816,18 +1066,23 @@ quote_accept() {
                 return 1
             fi
 
-            # Create prefixed signature for permit2
-            signature=$(create_prefixed_signature "$raw_signature" "permit2")
+                # Create prefixed signature for permit2
+                signature=$(create_prefixed_signature "$raw_signature" "permit2")
 
-            if [ -z "$signature" ]; then
-                print_error "Failed to sign EIP-712 order"
-                return 1
+                if [ -z "$signature" ]; then
+                    print_error "Failed to sign EIP-712 order"
+                    return 1
+                fi
+
+                print_success "Permit2 signature generated with client-side digest"
             fi
-
-            print_success "Permit2 signature generated with client-side digest"
+            
+            print_success "EIP-712 order signed"
+        else
+            print_error "Unsupported signature type: $signature_type"
+            return 1
         fi
         
-        print_success "EIP-712 order signed"
         print_debug "Signature: $signature"
         
         # Create submission payload with quoteId
