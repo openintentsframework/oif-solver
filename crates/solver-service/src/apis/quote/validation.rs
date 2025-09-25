@@ -39,6 +39,7 @@ pub struct SupportedAsset {
 
 /// Rich validation context that replaces simple SupportedAsset lists
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ValidatedQuoteContext {
 	pub swap_type: SwapType,
 	pub known_inputs: Option<Vec<(QuoteInput, U256)>>,

@@ -130,7 +130,8 @@ pub async fn process_quote_request(
 			.await
 		{
 			Ok(cost) => {
-				quote.cost = Some(cost);
+				// quote.cost = Some(cost);
+				println!("cost: {:#?}", cost);
 			},
 			Err(e) => {
 				tracing::warn!(
