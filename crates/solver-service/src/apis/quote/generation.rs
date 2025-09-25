@@ -156,7 +156,7 @@ impl QuoteGenerator {
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
-		lock: &solver_types::Lock,
+		lock: &solver_types::AssetLockReference,
 	) -> Result<QuoteOrder, QuoteError> {
 		use solver_types::LockKind;
 
@@ -542,7 +542,7 @@ impl QuoteGenerator {
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid user address: {}", e)))?;
 
 		// Get TheCompact domain address (arbiter)
-		let the_compact_lock = solver_types::Lock {
+		let the_compact_lock = solver_types::AssetLockReference {
 			kind: solver_types::LockKind::TheCompact,
 			params: Some(serde_json::json!({})),
 		};
@@ -1221,7 +1221,7 @@ impl QuoteGenerator {
 	fn get_lock_domain_address(
 		&self,
 		config: &Config,
-		lock: &solver_types::Lock,
+		lock: &solver_types::AssetLockReference,
 	) -> Result<InteropAddress, QuoteError> {
 		match &config.settlement.domain {
 			Some(domain_config) => {
@@ -1503,7 +1503,7 @@ mod tests {
 		let config = create_test_config();
 		let request = create_test_request();
 
-		let lock = solver_types::Lock {
+		let lock = solver_types::AssetLockReference {
 			kind: solver_types::LockKind::TheCompact,
 			params: Some(serde_json::json!({"test": "value"})),
 		};
@@ -1777,7 +1777,7 @@ mod tests {
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
-		let lock = solver_types::Lock {
+		let lock = solver_types::AssetLockReference {
 			kind: solver_types::LockKind::TheCompact,
 			params: Some(serde_json::json!({})),
 		};
@@ -1798,7 +1798,7 @@ mod tests {
 		let mut config = create_test_config();
 		config.settlement.domain = None;
 
-		let lock = solver_types::Lock {
+		let lock = solver_types::AssetLockReference {
 			kind: solver_types::LockKind::TheCompact,
 			params: Some(serde_json::json!({})),
 		};
@@ -1817,7 +1817,7 @@ mod tests {
 		let request = create_test_request();
 
 		let custody_decision = CustodyDecision::ResourceLock {
-			lock: solver_types::Lock {
+			lock: solver_types::AssetLockReference {
 				kind: solver_types::LockKind::TheCompact,
 				params: Some(serde_json::json!({})),
 			},

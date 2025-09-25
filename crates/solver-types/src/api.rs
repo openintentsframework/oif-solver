@@ -333,8 +333,6 @@ pub struct AssetAmount {
 	pub amount: U256,
 }
 
-// TODO: Remove this alias and update all code to use AssetLockReference directly
-pub type Lock = AssetLockReference;
 
 /// Supported lock mechanisms
 #[derive(Debug, Clone, Serialize, Deserialize)]
