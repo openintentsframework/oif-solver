@@ -26,7 +26,7 @@
 //!
 //! ### Multi-Protocol Support
 //! - Permit2 for universal token approvals
-//! - ERC-3009 for native gasless transfers
+//! - EIP-3009 for native gasless transfers
 //! - TheCompact for resource lock allocations
 //!
 //! ### Optimization Strategies

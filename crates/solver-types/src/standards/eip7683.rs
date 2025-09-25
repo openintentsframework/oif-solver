@@ -171,9 +171,6 @@ pub struct MandateOutput {
 	pub context: Vec<u8>,
 }
 
-/// Alias for backward compatibility
-pub type Output = MandateOutput;
-
 #[cfg(feature = "oif-interfaces")]
 use crate::api::{Quote, QuoteParsable};
 use crate::order::OrderParsable;
@@ -369,16 +366,31 @@ impl TryFrom<&Quote> for interfaces::StandardOrder {
 	type Error = Box<dyn std::error::Error>;
 
 	fn try_from(quote: &Quote) -> Result<Self, Self::Error> {
-		// Extract and validate EIP-712 data from quote to detect order type
-		let (eip712_data, primary_type) = Self::extract_eip712_data_from_quote(quote)?;
+		// Get the first order to determine the signature type
+		let quote_order = quote
+			.orders
+			.first()
+			.ok_or("Quote must contain at least one order")?;
 
-		// Determine processing approach based on order type
-		if primary_type == "BatchCompact" {
-			// Handle BatchCompact (ResourceLock) orders
-			Self::handle_batch_compact_quote_conversion(quote, eip712_data)
-		} else {
-			// Handle Permit2/EIP3009 orders using existing implementation
-			Self::handle_permit2_eip3009_quote_conversion(quote, eip712_data)
+		// Handle different order types based on signature type
+		match quote_order.signature_type {
+			crate::SignatureType::Eip3009 => {
+				// Handle EIP-3009 orders directly without looking for eip712 object
+				Self::handle_eip3009_quote_conversion(quote)
+			},
+			crate::SignatureType::Eip712 => {
+				// Extract and validate EIP-712 data from quote to detect order type
+				let (eip712_data, primary_type) = Self::extract_eip712_data_from_quote(quote)?;
+
+				// Determine processing approach based on order type
+				if primary_type == "BatchCompact" {
+					// Handle BatchCompact (ResourceLock) orders
+					Self::handle_batch_compact_quote_conversion(quote, eip712_data)
+				} else {
+					// Handle Permit2 orders using existing implementation
+					Self::handle_permit2_quote_conversion(quote, eip712_data)
+				}
+			},
 		}
 	}
 }
@@ -395,21 +407,29 @@ impl interfaces::StandardOrder {
 			.message
 			.as_object()
 			.ok_or("Invalid EIP-712 message structure")?;
-		let eip712_data = message_data
-			.get("eip712")
-			.and_then(|e| e.as_object())
-			.ok_or("Missing 'eip712' object in message")?;
 
-		let primary_type = eip712_data
-			.get("primaryType")
-			.and_then(|p| p.as_str())
-			.unwrap_or("PermitBatchWitnessTransferFrom");
+		// Extract EIP-712 data (with or without wrapper)
+		let (eip712_data, primary_type) = if message_data.contains_key("eip712") {
+			// Wrapped format (e.g., Compact orders)
+			let eip712 = message_data
+				.get("eip712")
+				.and_then(|e| e.as_object())
+				.ok_or("Missing 'eip712' object in message")?;
+			let primary = eip712
+				.get("primaryType")
+				.and_then(|p| p.as_str())
+				.unwrap_or("PermitBatchWitnessTransferFrom");
+			(eip712, primary)
+		} else {
+			// Direct format (e.g., Permit2 orders)
+			(message_data, &quote_order.primary_type as &str)
+		};
 
 		Ok((eip712_data, primary_type))
 	}
 
-	/// Handle Permit2/EIP3009 order conversion (original logic)
-	fn handle_permit2_eip3009_quote_conversion(
+	/// Handle Permit2 order conversion (original logic)
+	fn handle_permit2_quote_conversion(
 		quote: &Quote,
 		eip712_data: &serde_json::Map<String, serde_json::Value>,
 	) -> Result<Self, Box<dyn std::error::Error>> {
@@ -543,6 +563,141 @@ impl interfaces::StandardOrder {
 			inputs,
 			outputs: sol_outputs,
 		})
+	}
+
+	/// Handle EIP-3009 order conversion
+	fn handle_eip3009_quote_conversion(quote: &Quote) -> Result<Self, Box<dyn std::error::Error>> {
+		use crate::standards::eip7930::InteropAddress;
+		use alloy_primitives::{Address, U256};
+		use interfaces::SolMandateOutput;
+
+		// Extract message data from EIP-3009 order
+		let quote_order = quote
+			.orders
+			.first()
+			.ok_or("Quote must contain at least one order")?;
+		let message_root = quote_order
+			.message
+			.as_object()
+			.ok_or("Invalid EIP-3009 message structure")?;
+
+		// For EIP-3009, the message is directly at the root level
+		let message_data = message_root;
+
+		// Extract user address from message 'from' field
+		let from_str = message_data
+			.get("from")
+			.and_then(|f| f.as_str())
+			.ok_or("Missing 'from' field in EIP-3009 message")?;
+		let user_address = Address::from_slice(&hex::decode(from_str.trim_start_matches("0x"))?);
+
+		// Get origin chain ID from available inputs
+		let origin_chain_id = {
+			let input = quote
+				.details
+				.available_inputs
+				.first()
+				.ok_or("Quote must have at least one available input")?;
+			let interop_address = InteropAddress::from_hex(&input.asset.to_string())?;
+			U256::from(interop_address.ethereum_chain_id()?)
+		};
+
+		// Extract timing from 'validBefore' field
+		let valid_before = message_data
+			.get("validBefore")
+			.and_then(|v| v.as_i64())
+			.unwrap_or(0) as u32;
+		let expires = valid_before;
+		let fill_deadline = valid_before;
+
+		// For EIP-3009 orders, extract inputOracle from the message
+		let input_oracle_str = message_data
+			.get("inputOracle")
+			.and_then(|o| o.as_str())
+			.ok_or("Missing 'inputOracle' in EIP-3009 message")?;
+		let input_oracle =
+			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
+
+		// Build inputs from available inputs in quote details
+		let inputs = quote
+			.details
+			.available_inputs
+			.iter()
+			.map(|input| {
+				let interop_address = InteropAddress::from_hex(&input.asset.to_string())
+					.map_err(|e| format!("Invalid asset address: {}", e))?;
+				let token_address = interop_address
+					.ethereum_address()
+					.map_err(|e| format!("Invalid Ethereum address: {}", e))?;
+
+				// Convert token address to U256 (padded to 32 bytes)
+				let mut token_bytes = [0u8; 32];
+				token_bytes[12..32].copy_from_slice(&token_address.0 .0);
+				let token_u256 = U256::from_be_bytes(token_bytes);
+
+				Ok([token_u256, input.amount])
+			})
+			.collect::<Result<Vec<_>, String>>()?;
+
+		// Build outputs from requested outputs in quote details (same as other flows)
+		let mut sol_outputs = Vec::new();
+		for output in &quote.details.requested_outputs {
+			let output_interop = InteropAddress::from_hex(&output.asset.to_string())?;
+			let receiver_interop = InteropAddress::from_hex(&output.receiver.to_string())?;
+
+			let chain_id = output_interop.ethereum_chain_id()?;
+			let token_address = output_interop.ethereum_address()?;
+			let recipient_address = receiver_interop.ethereum_address()?;
+
+			// Convert addresses to bytes32 format
+			let mut token_bytes = [0u8; 32];
+			token_bytes[12..32].copy_from_slice(&token_address.0 .0);
+
+			let mut recipient_bytes = [0u8; 32];
+			recipient_bytes[12..32].copy_from_slice(&recipient_address.0 .0);
+
+			// Use the correct output_settler address (same as direct intent)
+			// TODO: Once we align with new oif-spec, this needs to be fetched from signature metadata object
+			let output_settler_hex = "0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9";
+			let output_settler_bytes = hex::decode(output_settler_hex.trim_start_matches("0x"))
+				.map_err(|e| format!("Invalid output settler address: {}", e))?;
+			let mut settler_bytes32 = [0u8; 32];
+			settler_bytes32[12..32].copy_from_slice(&output_settler_bytes);
+
+			sol_outputs.push(SolMandateOutput {
+				oracle: [0u8; 32].into(), // TODO: Update from signature metadata object once available.
+				settler: settler_bytes32.into(), // TODO: Use correct output settler
+				chainId: U256::from(chain_id),
+				token: token_bytes.into(),
+				amount: output.amount,
+				recipient: recipient_bytes.into(),
+				call: Vec::new().into(),
+				context: Vec::new().into(),
+			});
+		}
+
+		// For EIP-3009, use the realNonce (original microseconds) for StandardOrder construction
+		// The 'nonce' field contains the order_identifier used for signature, 'realNonce' contains the actual nonce
+		let nonce_str = message_data
+			.get("realNonce")
+			.and_then(|n| n.as_str())
+			.or_else(|| message_data.get("nonce").and_then(|n| n.as_str())) // Fallback for compatibility
+			.ok_or("Missing 'realNonce' or 'nonce' field in EIP-3009 message")?;
+		let nonce = U256::from_str_radix(nonce_str.trim_start_matches("0x"), 16)
+			.map_err(|e| format!("Invalid nonce format: {}", e))?;
+
+		let standard_order = interfaces::StandardOrder {
+			user: user_address,
+			nonce,
+			originChainId: origin_chain_id,
+			expires,
+			fillDeadline: fill_deadline,
+			inputOracle: input_oracle,
+			inputs,
+			outputs: sol_outputs,
+		};
+
+		Ok(standard_order)
 	}
 
 	/// Handle BatchCompact order conversion for ResourceLock (moved from existing function)
@@ -717,10 +872,19 @@ impl QuoteParsable for Eip7683OrderData {
 		let mut order_data = Eip7683OrderData::from(standard_order.clone());
 
 		// Add the lock type from the quote
-		let lock_type = quote
-			.lock_type
-			.parse::<LockType>()
-			.unwrap_or_else(|_| LockType::default());
+		let lock_type = quote.lock_type.parse::<LockType>().unwrap_or_else(|e| {
+			tracing::warn!(
+				"Failed to parse lock_type '{}': {}, using default",
+				quote.lock_type,
+				e
+			);
+			LockType::default()
+		});
+		tracing::debug!(
+			"Converting quote with lock_type '{}' -> {:?}",
+			quote.lock_type,
+			lock_type
+		);
 		order_data.lock_type = Some(lock_type);
 
 		// Create ChainSettlerInfo for the Order
@@ -1088,24 +1252,6 @@ mod tests {
 		assert_eq!(order.signature, None);
 		assert_eq!(order.sponsor, None);
 		assert_eq!(order.lock_type, None);
-	}
-
-	#[test]
-	fn test_output_type_alias() {
-		// Test that Output is indeed an alias for MandateOutput
-		let output: Output = MandateOutputBuilder::new()
-			.oracle([1u8; 32])
-			.settler([2u8; 32])
-			.chain_id(U256::from(1))
-			.token([3u8; 32])
-			.amount(U256::from(1000))
-			.recipient([4u8; 32])
-			.call(vec![0xab, 0xcd])
-			.context(vec![0x12, 0x34])
-			.build();
-
-		assert_eq!(output.amount, U256::from(1000));
-		assert_eq!(output.call, vec![0xab, 0xcd]);
 	}
 
 	#[test]
