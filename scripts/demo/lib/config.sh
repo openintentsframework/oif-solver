@@ -294,9 +294,9 @@ config_load_gas() {
     config_set "gas" "permit2_open" "$(parse_toml_value "$file" "gas.flows.permit2_escrow" "open")"
     config_set "gas" "permit2_fill" "$(parse_toml_value "$file" "gas.flows.permit2_escrow" "fill")"
     config_set "gas" "permit2_claim" "$(parse_toml_value "$file" "gas.flows.permit2_escrow" "claim")"
-    config_set "gas" "compact_open" "$(parse_toml_value "$file" "gas.flows.compact_resource_lock" "open")"
-    config_set "gas" "compact_fill" "$(parse_toml_value "$file" "gas.flows.compact_resource_lock" "fill")"
-    config_set "gas" "compact_claim" "$(parse_toml_value "$file" "gas.flows.compact_resource_lock" "claim")"
+    config_set "gas" "compact_open" "$(parse_toml_value "$file" "gas.flows.resource_lock" "open")"
+    config_set "gas" "compact_fill" "$(parse_toml_value "$file" "gas.flows.resource_lock" "fill")"
+    config_set "gas" "compact_claim" "$(parse_toml_value "$file" "gas.flows.resource_lock" "claim")"
     
     print_debug "Loaded gas configuration from $file"
 }

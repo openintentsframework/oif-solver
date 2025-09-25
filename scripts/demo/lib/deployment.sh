@@ -1385,7 +1385,7 @@ EOF
     cat > "$CONFIG_DIR/demo/gas.toml" <<'EOF'
 [gas]
 
-[gas.flows.compact_resource_lock]
+[gas.flows.resource_lock]
 # Gas units captured by scripts/e2e/estimate_gas.sh on local anvil
 open = 0
 fill = 77298

@@ -2,19 +2,208 @@
 //!
 //! This module defines the request and response types for the OIF Solver API
 //! endpoints, following the ERC-7683 Cross-Chain Intents Standard.
-use crate::{
-	costs::CostEstimate,
-	standards::{eip7683::LockType, eip7930::InteropAddress},
-};
+use crate::standards::{eip7683::LockType, eip7930::InteropAddress};
 use alloy_primitives::{Address, Bytes, U256};
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
+use std::str::FromStr;
 
-/// Intent request that unifies both quote acceptances and direct order submissions.
+/// Order interpretation for quote requests
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SwapType {
+	ExactInput,
+	ExactOutput,
+}
+
+/// Origin submission preference
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OriginSubmission {
+	pub mode: OriginMode,
+	pub schemes: Option<Vec<AuthScheme>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OriginMode {
+	User,
+	Protocol,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthScheme {
+	Erc4337,
+	Permit2,
+	Erc20Permit,
+	Eip3009,
+}
+
+/// Failure handling policy
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FailureHandlingMode {
+	RefundAutomatic,
+	RefundClaim,
+	NeedsNewSignature,
+}
+
+/// Intent type identifier
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum IntentType {
+	OifSwap,
+}
+
+/// OIF version constants for order types
+pub mod oif_versions {
+	pub const V0: &str = "v0";
+	pub const V1: &str = "v1"; // For future use
+	pub const CURRENT: &str = V0; // Currently supported version
+
+	// Order type constructors
+	pub fn escrow_order_type(version: &str) -> String {
+		format!("oif-escrow-{}", version)
+	}
+
+	pub fn resource_lock_order_type(version: &str) -> String {
+		format!("oif-resource-lock-{}", version)
+	}
+
+	pub fn eip3009_order_type(version: &str) -> String {
+		format!("oif-3009-{}", version)
+	}
+
+	pub fn generic_order_type(version: &str) -> String {
+		format!("oif-generic-{}", version)
+	}
+}
+
+/// OIF Order union type with versioning support
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum OifOrder {
+	#[serde(rename = "oif-escrow-v0")]
+	OifEscrowV0 { payload: OrderPayload },
+	#[serde(rename = "oif-resource-lock-v0")]
+	OifResourceLockV0 { payload: OrderPayload },
+	#[serde(rename = "oif-3009-v0")]
+	Oif3009V0 {
+		payload: OrderPayload,
+		metadata: serde_json::Value,
+	},
+	#[serde(rename = "oif-generic-v0")]
+	OifGenericV0 {
+		payload: serde_json::Value, // More flexible for generic orders
+	},
+}
+
+/// Standard order payload structure for most order types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderPayload {
+	#[serde(rename = "signatureType")]
+	pub signature_type: SignatureType,
+	pub domain: serde_json::Value,
+	#[serde(rename = "primaryType")]
+	pub primary_type: String,
+	pub message: serde_json::Value,
+}
+
+impl From<&Quote> for Option<OrderPayload> {
+	fn from(quote: &Quote) -> Self {
+		match &quote.order {
+			OifOrder::OifEscrowV0 { payload } => Some(payload.clone()),
+			OifOrder::OifResourceLockV0 { payload } => Some(payload.clone()),
+			OifOrder::Oif3009V0 { payload, .. } => Some(payload.clone()),
+			OifOrder::OifGenericV0 { .. } => None, // Generic orders don't have OrderPayload
+		}
+	}
+}
+
+impl OifOrder {
+	/// Get the order type string for this order
+	pub fn order_type(&self) -> &'static str {
+		match self {
+			OifOrder::OifEscrowV0 { .. } => "oif-escrow-v0",
+			OifOrder::OifResourceLockV0 { .. } => "oif-resource-lock-v0",
+			OifOrder::Oif3009V0 { .. } => "oif-3009-v0",
+			OifOrder::OifGenericV0 { .. } => "oif-generic-v0",
+		}
+	}
+
+	/// Extract version from order type
+	pub fn version(&self) -> &'static str {
+		match self {
+			OifOrder::OifEscrowV0 { .. }
+			| OifOrder::OifResourceLockV0 { .. }
+			| OifOrder::Oif3009V0 { .. }
+			| OifOrder::OifGenericV0 { .. } => oif_versions::V0,
+		}
+	}
+
+	/// Check if this order type is supported
+	pub fn is_supported(&self) -> bool {
+		// For now, only v0 orders are supported
+		matches!(self.version(), oif_versions::V0)
+	}
+
+	/// Get the flow key for gas configuration and cost estimation
+	/// Returns the appropriate flow key based on the order type
+	pub fn flow_key(&self) -> Option<String> {
+		match self {
+			OifOrder::OifEscrowV0 { .. } => Some("permit2_escrow".to_string()),
+			OifOrder::OifResourceLockV0 { .. } => Some("resource_lock".to_string()),
+			OifOrder::Oif3009V0 { .. } => Some("eip3009_escrow".to_string()),
+			OifOrder::OifGenericV0 { .. } => None, // Generic orders don't have a specific flow
+		}
+	}
+}
+
+/// Reference to a lock in a locking system (updated from Lock)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetLockReference {
+	pub kind: LockKind,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub params: Option<serde_json::Value>,
+}
+
+impl AssetLockReference {
+	/// Infer the appropriate order type based on lock kind and version
+	pub fn infer_order_type(&self, version: &str) -> String {
+		use oif_versions::*;
+		match self.kind {
+			LockKind::TheCompact => resource_lock_order_type(version),
+			LockKind::Rhinestone => resource_lock_order_type(version),
+			_ => "unknown".to_string(),
+		}
+	}
+
+	/// Infer order type using current version
+	pub fn infer_current_order_type(&self) -> String {
+		self.infer_order_type(oif_versions::CURRENT)
+	}
+
+	/// Convert to EIP-7683 LockType for protocol-level usage
+	pub fn to_lock_type(&self) -> LockType {
+		match self.kind {
+			LockKind::TheCompact | LockKind::Rhinestone => LockType::ResourceLock,
+			// TODO: remove this once we align with new oif-spec
+			_ => LockType::Permit2Escrow,
+		}
+	}
+
+	/// Check if this is a resource lock (vs escrow)
+	pub fn is_resource_lock(&self) -> bool {
+		matches!(self.kind, LockKind::TheCompact | LockKind::Rhinestone)
+	}
+}
+
+/// Post order request that unifies both quote acceptances and direct order submissions.
 /// Used as the common type for order validation and forwarding to discovery service.
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct IntentRequest {
+pub struct PostOrderRequest {
 	pub order: Bytes,
 	pub sponsor: Address,
 	pub signature: Bytes,
@@ -25,7 +214,7 @@ pub struct IntentRequest {
 	pub lock_type: LockType,
 }
 
-/// Default lock type for IntentRequest
+/// Default lock type for PostOrderRequest
 fn default_lock_type() -> LockType {
 	LockType::Permit2Escrow
 }
@@ -68,8 +257,8 @@ where
 				// Try parsing as enum variant name
 				match value {
 					"permit2_escrow" | "Permit2Escrow" => Ok(LockType::Permit2Escrow),
-					"eip3009_escrow" | "Eip3009Escrow" => Ok(LockType::Eip3009Escrow), // Accept both variants for compatibility
-					"compact_resource_lock" | "ResourceLock" => Ok(LockType::ResourceLock),
+					"eip3009_escrow" | "Eip3009Escrow" => Ok(LockType::Eip3009Escrow),
+					"resource_lock" | "ResourceLock" => Ok(LockType::ResourceLock),
 					_ => Err(Error::custom("Invalid LockType string")),
 				}
 			}
@@ -157,58 +346,296 @@ pub struct AssetAmount {
 	pub amount: U256,
 }
 
-/// Lock information for inputs that are already locked
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Lock {
-	/// Type of lock mechanism
-	pub kind: LockKind,
-	/// Lock-specific parameters
-	pub params: Option<serde_json::Value>,
-}
-
 /// Supported lock mechanisms
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LockKind {
 	#[serde(alias = "TheCompact", alias = "the_compact")]
 	TheCompact,
+	Rhinestone,
+	// TODO: Remove this once we align with new oif-spec
 	#[serde(alias = "Permit2", alias = "permit2")]
 	Permit2,
 	#[serde(alias = "EIP3009", alias = "eip3009", alias = "Eip3009")]
 	Eip3009,
 }
 
-/// Available input with lock information and user
+// TODO: Remove these aliases entirely and update all code to use OrderInput/OrderOutput directly
+// These are temporary aliases for migration purposes
+pub type AvailableInput = OrderInput;
+pub type RequestedOutput = OrderOutput;
+
+/// Quote input from a user (amounts optional for quote requests)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AvailableInput {
-	/// User address in ERC-7930 interoperable format
+pub struct QuoteInput {
+	/// User address in EIP-7930 Address format
 	pub user: InteropAddress,
-	/// Asset address in ERC-7930 interoperable format
+	/// Asset address in EIP-7930 Address format
 	pub asset: InteropAddress,
-	/// Amount as a big integer
-	#[serde(with = "u256_serde")]
-	pub amount: U256,
+	/// Optional Amount as string - depends on SwapType
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub amount: Option<String>,
 	/// Lock information if asset is already locked
-	pub lock: Option<Lock>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub lock: Option<AssetLockReference>,
 }
 
-/// Requested output with receiver and optional calldata
+/// Quote output for a receiver (amounts optional for quote requests)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RequestedOutput {
-	/// Receiver address in ERC-7930 interoperable format
+pub struct QuoteOutput {
+	/// Receiver address in EIP-7930 Address format
 	pub receiver: InteropAddress,
-	/// Asset address in ERC-7930 interoperable format
+	/// Asset address in EIP-7930 Address format
 	pub asset: InteropAddress,
-	/// Amount as a big integer
-	#[serde(with = "u256_serde")]
-	pub amount: U256,
+	/// Optional Amount as string - depends on SwapType
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub amount: Option<String>,
 	/// Optional calldata for the output
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub calldata: Option<String>,
 }
 
-/// Request for getting price quotes following UII standard
+/// Order input for actual intent/order submission (amounts always required)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderInput {
+	/// User address in EIP-7930 Address format
+	pub user: InteropAddress,
+	/// Asset address in EIP-7930 Address format
+	pub asset: InteropAddress,
+	/// Required Amount as U256
+	#[serde(with = "u256_serde")]
+	pub amount: U256,
+	/// Lock information if asset is already locked
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub lock: Option<AssetLockReference>,
+}
+
+/// Order output for actual intent/order submission (amounts always required)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderOutput {
+	/// Receiver address in EIP-7930 Address format
+	pub receiver: InteropAddress,
+	/// Asset address in EIP-7930 Address format
+	pub asset: InteropAddress,
+	/// Required Amount as U256
+	#[serde(with = "u256_serde")]
+	pub amount: U256,
+	/// Optional calldata for the output
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub calldata: Option<String>,
+}
+
+impl QuoteInput {
+	/// Convert optional string amount to U256 for internal use
+	pub fn amount_as_u256(&self) -> Result<Option<U256>, String> {
+		match &self.amount {
+			Some(amt_str) => Ok(Some(
+				U256::from_str_radix(amt_str, 10).map_err(|e| e.to_string())?,
+			)),
+			None => Ok(None),
+		}
+	}
+
+	/// Infer order type from lock, defaulting to escrow if no lock specified
+	pub fn infer_order_type(&self, version: &str) -> String {
+		match &self.lock {
+			Some(lock) => lock.infer_order_type(version),
+			None => oif_versions::escrow_order_type(version), // Default to escrow
+		}
+	}
+
+	/// Infer order type using current version
+	pub fn infer_current_order_type(&self) -> String {
+		self.infer_order_type(oif_versions::CURRENT)
+	}
+}
+
+impl QuoteOutput {
+	pub fn amount_as_u256(&self) -> Result<Option<U256>, String> {
+		match &self.amount {
+			Some(amt_str) => Ok(Some(
+				U256::from_str_radix(amt_str, 10).map_err(|e| e.to_string())?,
+			)),
+			None => Ok(None),
+		}
+	}
+}
+
+/// Conversion from OrderInput to QuoteInput
+impl From<OrderInput> for QuoteInput {
+	fn from(order_input: OrderInput) -> Self {
+		QuoteInput {
+			user: order_input.user,
+			asset: order_input.asset,
+			amount: Some(order_input.amount.to_string()), // OrderInput has required amount, QuoteInput has optional
+			lock: order_input.lock,
+		}
+	}
+}
+
+/// Conversion from OrderOutput to QuoteOutput
+impl From<OrderOutput> for QuoteOutput {
+	fn from(order_output: OrderOutput) -> Self {
+		QuoteOutput {
+			receiver: order_output.receiver,
+			asset: order_output.asset,
+			amount: Some(order_output.amount.to_string()), // OrderOutput has required amount, QuoteOutput has optional
+			calldata: order_output.calldata,
+		}
+	}
+}
+
+/// Conversion from QuoteInput to OrderInput (can fail if amount is missing)
+impl TryFrom<QuoteInput> for OrderInput {
+	type Error = String;
+
+	fn try_from(quote_input: QuoteInput) -> Result<Self, Self::Error> {
+		let amount = quote_input.amount.ok_or_else(|| {
+			"Cannot convert QuoteInput to OrderInput: amount is required".to_string()
+		})?;
+
+		let amount_u256 = U256::from_str(&amount)
+			.map_err(|e| format!("Failed to parse amount '{}': {}", amount, e))?;
+
+		Ok(OrderInput {
+			user: quote_input.user,
+			asset: quote_input.asset,
+			amount: amount_u256,
+			lock: quote_input.lock,
+		})
+	}
+}
+
+/// Conversion from QuoteOutput to OrderOutput (can fail if amount is missing)
+impl TryFrom<QuoteOutput> for OrderOutput {
+	type Error = String;
+
+	fn try_from(quote_output: QuoteOutput) -> Result<Self, Self::Error> {
+		let amount = quote_output.amount.ok_or_else(|| {
+			"Cannot convert QuoteOutput to OrderOutput: amount is required".to_string()
+		})?;
+
+		let amount_u256 = U256::from_str(&amount)
+			.map_err(|e| format!("Failed to parse amount '{}': {}", amount, e))?;
+
+		Ok(OrderOutput {
+			receiver: quote_output.receiver,
+			asset: quote_output.asset,
+			amount: amount_u256,
+			calldata: quote_output.calldata,
+		})
+	}
+}
+
+/// Conversion from &QuoteInput to OrderInput (can fail if amount is missing)
+impl TryFrom<&QuoteInput> for OrderInput {
+	type Error = QuoteError;
+
+	fn try_from(quote_input: &QuoteInput) -> Result<Self, Self::Error> {
+		let amount = quote_input
+			.amount
+			.as_ref()
+			.ok_or(QuoteError::MissingInputAmount)?;
+
+		let amount_u256 = U256::from_str(amount).map_err(|e| {
+			QuoteError::InvalidRequest(format!("Failed to parse amount '{}': {}", amount, e))
+		})?;
+
+		Ok(OrderInput {
+			user: quote_input.user.clone(),
+			asset: quote_input.asset.clone(),
+			amount: amount_u256,
+			lock: quote_input.lock.clone(),
+		})
+	}
+}
+
+/// Conversion from &QuoteOutput to OrderOutput (can fail if amount is missing)
+impl TryFrom<&QuoteOutput> for OrderOutput {
+	type Error = QuoteError;
+
+	fn try_from(quote_output: &QuoteOutput) -> Result<Self, Self::Error> {
+		let amount = quote_output
+			.amount
+			.as_ref()
+			.ok_or(QuoteError::MissingOutputAmount)?;
+
+		let amount_u256 = U256::from_str(amount).map_err(|e| {
+			QuoteError::InvalidRequest(format!("Failed to parse amount '{}': {}", amount, e))
+		})?;
+
+		Ok(OrderOutput {
+			receiver: quote_output.receiver.clone(),
+			asset: quote_output.asset.clone(),
+			amount: amount_u256,
+			calldata: quote_output.calldata.clone(),
+		})
+	}
+}
+
+/// Conversion from &OrderInput to QuoteInput
+impl From<&OrderInput> for QuoteInput {
+	fn from(order_input: &OrderInput) -> Self {
+		QuoteInput {
+			user: order_input.user.clone(),
+			asset: order_input.asset.clone(),
+			amount: Some(order_input.amount.to_string()),
+			lock: order_input.lock.clone(),
+		}
+	}
+}
+
+/// Conversion from &OrderOutput to QuoteOutput
+impl From<&OrderOutput> for QuoteOutput {
+	fn from(order_output: &OrderOutput) -> Self {
+		QuoteOutput {
+			receiver: order_output.receiver.clone(),
+			asset: order_output.asset.clone(),
+			amount: Some(order_output.amount.to_string()),
+			calldata: order_output.calldata.clone(),
+		}
+	}
+}
+
+/// Intent request structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntentRequest {
+	#[serde(rename = "intentType")]
+	pub intent_type: IntentType,
+	pub inputs: Vec<QuoteInput>,
+	pub outputs: Vec<QuoteOutput>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub swap_type: Option<SwapType>,
+	#[serde(rename = "minValidUntil", skip_serializing_if = "Option::is_none")]
+	pub min_valid_until: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub preference: Option<QuotePreference>,
+	#[serde(rename = "originSubmission", skip_serializing_if = "Option::is_none")]
+	pub origin_submission: Option<OriginSubmission>,
+	#[serde(rename = "failureHandling", skip_serializing_if = "Option::is_none")]
+	pub failure_handling: Option<Vec<FailureHandlingMode>>,
+	#[serde(rename = "partialFill", skip_serializing_if = "Option::is_none")]
+	pub partial_fill: Option<bool>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub metadata: Option<serde_json::Value>,
+}
+
+/// Request for getting price quotes - new OIF spec structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetQuoteRequest {
+	/// User address in EIP-7930 Address format
+	pub user: InteropAddress,
+	/// Intent request structure
+	pub intent: IntentRequest,
+	/// Supported order types
+	#[serde(rename = "supportedTypes")]
+	pub supported_types: Vec<String>,
+}
+
+/// Legacy V1 structure for backward compatibility during migration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetQuoteRequestV1 {
 	/// User making the request in ERC-7930 interoperable format
 	pub user: InteropAddress,
 	/// Available inputs (order significant if preference is 'input-priority')
@@ -268,33 +695,34 @@ pub struct QuoteDetails {
 	pub available_inputs: Vec<AvailableInput>,
 }
 
-/// A quote option following UII standard
+/// A quote option following the new OIF standard
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Quote {
-	/// Array of EIP-712 compliant orders
-	pub orders: Vec<QuoteOrder>,
-	/// Quote details matching request structure
-	pub details: QuoteDetails,
+	/// Single versioned Order union type
+	pub order: OifOrder,
+	/// Failure handling policy
+	#[serde(rename = "failureHandling")]
+	pub failure_handling: FailureHandlingMode,
+	/// Whether partial fills are allowed
+	#[serde(rename = "partialFill")]
+	pub partial_fill: bool,
 	/// Quote validity timestamp
 	#[serde(rename = "validUntil")]
-	pub valid_until: Option<u64>,
+	pub valid_until: u64,
 	/// Estimated time to completion in seconds
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub eta: Option<u64>,
 	/// Unique quote identifier
 	#[serde(rename = "quoteId")]
 	pub quote_id: String,
 	/// Provider identifier
-	pub provider: String, // not used by the solver, only relevant for the aggregator
-	/// Cost breakdown
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub cost: Option<CostEstimate>,
-	// Using LockType
-	pub lock_type: String,
+	pub provider: Option<String>,
 }
 
-/// Implementation to convert Quote with signature and standard to IntentRequest
+/// Implementation to convert Quote with signature and standard to PostOrderRequest
 #[cfg(feature = "oif-interfaces")]
-impl TryFrom<(&Quote, &str, &str)> for IntentRequest {
+impl TryFrom<(&Quote, &str, &str)> for PostOrderRequest {
 	type Error = Box<dyn std::error::Error>;
 
 	fn try_from((quote, signature, standard): (&Quote, &str, &str)) -> Result<Self, Self::Error> {
@@ -306,8 +734,8 @@ impl TryFrom<(&Quote, &str, &str)> for IntentRequest {
 }
 
 #[cfg(feature = "oif-interfaces")]
-impl IntentRequest {
-	/// Main conversion function from EIP-7683 quote to IntentRequest
+impl PostOrderRequest {
+	/// Main conversion function from EIP-7683 quote to PostOrderRequest
 	fn from_eip7683_quote(
 		quote: &Quote,
 		signature: &str,
@@ -325,16 +753,13 @@ impl IntentRequest {
 		// Encode the order
 		let encoded_order = StandardOrder::abi_encode(&sol_order);
 
-		// Parse lock_type
-		let lock_type = quote
-			.lock_type
-			.parse::<LockType>()
-			.unwrap_or_else(|_| LockType::default());
+		// Derive lock_type from the OifOrder variant
+		let lock_type = LockType::from(&quote.order);
 
-		// Create final IntentRequest
-		tracing::debug!("Creating IntentRequest with lock_type: {:?}", lock_type);
+		// Create final PostOrderRequest
+		tracing::debug!("Creating PostOrderRequest with lock_type: {:?}", lock_type);
 		let signature_bytes = Bytes::from(hex::decode(signature.trim_start_matches("0x"))?);
-		Ok(IntentRequest {
+		Ok(PostOrderRequest {
 			order: Bytes::from(encoded_order),
 			sponsor: user_address,
 			signature: signature_bytes,
@@ -536,6 +961,20 @@ pub enum QuoteError {
 	SolverCapacityExceeded,
 	#[error("Internal error: {0}")]
 	Internal(String),
+	#[error("Unsupported intent type: {0}")]
+	UnsupportedIntentType(String),
+	#[error("No matching order type found: {0}")]
+	NoMatchingOrderType(String),
+	#[error("No matching auth scheme found")]
+	NoMatchingAuthScheme,
+	#[error("Missing input amount for exact-input swap")]
+	MissingInputAmount,
+	#[error("Missing output amount for exact-output swap")]
+	MissingOutputAmount,
+	#[error("Invalid EIP-7930 address format: {0}")]
+	InvalidEip7930Address(String),
+	#[error("Swap type validation failed: {0}")]
+	SwapTypeValidation(String),
 }
 
 impl From<QuoteError> for APIError {
@@ -569,6 +1008,41 @@ impl From<QuoteError> for APIError {
 			QuoteError::Internal(msg) => APIError::InternalServerError {
 				error_type: ApiErrorType::InternalError,
 				message: format!("An internal error occurred: {}", msg),
+			},
+			QuoteError::UnsupportedIntentType(msg) => APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: format!("Unsupported intent type: {}", msg),
+				details: None,
+			},
+			QuoteError::NoMatchingOrderType(msg) => APIError::UnprocessableEntity {
+				error_type: ApiErrorType::UnsupportedSettlement,
+				message: msg,
+				details: None,
+			},
+			QuoteError::NoMatchingAuthScheme => APIError::UnprocessableEntity {
+				error_type: ApiErrorType::UnsupportedSettlement,
+				message: "No matching authentication scheme found".to_string(),
+				details: None,
+			},
+			QuoteError::MissingInputAmount => APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: "Input amount is required for exact-input swap type".to_string(),
+				details: None,
+			},
+			QuoteError::MissingOutputAmount => APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: "Output amount is required for exact-output swap type".to_string(),
+				details: None,
+			},
+			QuoteError::InvalidEip7930Address(msg) => APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: format!("Invalid address format: {}", msg),
+				details: None,
+			},
+			QuoteError::SwapTypeValidation(msg) => APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: msg,
+				details: None,
 			},
 		}
 	}
@@ -676,13 +1150,13 @@ mod tests {
 
 	#[test]
 	fn test_lock_serialization() {
-		let lock = Lock {
+		let lock = AssetLockReference {
 			kind: LockKind::TheCompact,
 			params: Some(serde_json::json!({"resource_id": "0x123"})),
 		};
 
 		let json = serde_json::to_string(&lock).unwrap();
-		let deserialized: Lock = serde_json::from_str(&json).unwrap();
+		let deserialized: AssetLockReference = serde_json::from_str(&json).unwrap();
 
 		assert!(matches!(deserialized.kind, LockKind::TheCompact));
 		assert!(deserialized.params.is_some());
@@ -700,7 +1174,7 @@ mod tests {
 				address!("2222222222222222222222222222222222222222"),
 			),
 			amount: U256::from(5000),
-			lock: Some(Lock {
+			lock: Some(AssetLockReference {
 				kind: LockKind::TheCompact,
 				params: None,
 			}),
@@ -709,7 +1183,7 @@ mod tests {
 		let json = serde_json::to_string(&input).unwrap();
 		let deserialized: AvailableInput = serde_json::from_str(&json).unwrap();
 
-		assert_eq!(deserialized.amount, U256::from(5000));
+		assert_eq!(deserialized.amount, 5000);
 		assert!(deserialized.lock.is_some());
 	}
 
@@ -731,7 +1205,7 @@ mod tests {
 		let json = serde_json::to_string(&output).unwrap();
 		let deserialized: RequestedOutput = serde_json::from_str(&json).unwrap();
 
-		assert_eq!(deserialized.amount, U256::from(2000));
+		assert_eq!(deserialized.amount, 2000);
 		assert_eq!(deserialized.calldata, Some("0xdeadbeef".to_string()));
 	}
 
@@ -788,7 +1262,7 @@ mod tests {
 			calldata: None,
 		};
 
-		let request = GetQuoteRequest {
+		let request = GetQuoteRequestV1 {
 			user: InteropAddress::new_ethereum(
 				1,
 				address!("1111111111111111111111111111111111111111"),
@@ -804,7 +1278,7 @@ mod tests {
 		assert!(json.contains("\"requestedOutputs\""));
 		assert!(json.contains("\"minValidUntil\""));
 
-		let deserialized: GetQuoteRequest = serde_json::from_str(&json).unwrap();
+		let deserialized: GetQuoteRequestV1 = serde_json::from_str(&json).unwrap();
 		assert_eq!(deserialized.available_inputs.len(), 1);
 		assert_eq!(deserialized.requested_outputs.len(), 1);
 		assert_eq!(deserialized.min_valid_until, Some(1234567890));
@@ -869,26 +1343,24 @@ mod tests {
 	#[test]
 	fn test_quote_serialization() {
 		let quote = Quote {
-			orders: vec![QuoteOrder {
-				signature_type: SignatureType::Eip712,
-				domain: serde_json::to_value(InteropAddress::new_ethereum(
-					1,
-					address!("5555555555555555555555555555555555555555"),
-				))
-				.unwrap(),
-				primary_type: "TestType".to_string(),
-				message: serde_json::json!({"test": "value"}),
-			}],
-			details: QuoteDetails {
-				requested_outputs: vec![],
-				available_inputs: vec![],
+			order: OifOrder::OifEscrowV0 {
+				payload: OrderPayload {
+					signature_type: SignatureType::Eip712,
+					domain: serde_json::to_value(InteropAddress::new_ethereum(
+						1,
+						address!("5555555555555555555555555555555555555555"),
+					))
+					.unwrap(),
+					primary_type: "TestType".to_string(),
+					message: serde_json::json!({"test": "value"}),
+				},
 			},
-			valid_until: Some(1234567890),
+			failure_handling: FailureHandlingMode::RefundAutomatic,
+			partial_fill: false,
+			valid_until: 1234567890,
 			eta: Some(300),
 			quote_id: "quote_123".to_string(),
-			provider: "test_solver".to_string(),
-			cost: None,
-			lock_type: "permit2_escrow".to_string(),
+			provider: Some("test_solver".to_string()),
 		};
 
 		let json = serde_json::to_string(&quote).unwrap();
@@ -898,7 +1370,7 @@ mod tests {
 
 		let deserialized: Quote = serde_json::from_str(&json).unwrap();
 		assert_eq!(deserialized.quote_id, "quote_123");
-		assert_eq!(deserialized.valid_until, Some(1234567890));
+		assert_eq!(deserialized.valid_until, 1234567890);
 		assert_eq!(deserialized.eta, Some(300));
 	}
 
@@ -906,17 +1378,20 @@ mod tests {
 	fn test_get_quote_response_serialization() {
 		let response = GetQuoteResponse {
 			quotes: vec![Quote {
-				orders: vec![],
-				details: QuoteDetails {
-					requested_outputs: vec![],
-					available_inputs: vec![],
+				order: OifOrder::OifEscrowV0 {
+					payload: OrderPayload {
+						signature_type: SignatureType::Eip712,
+						domain: serde_json::json!({"chain": 1, "address": "0x0000000000000000000000000000000000000000"}),
+						primary_type: "TestType".to_string(),
+						message: serde_json::json!({"test": "value"}),
+					},
 				},
-				valid_until: None,
+				failure_handling: FailureHandlingMode::RefundAutomatic,
+				partial_fill: false,
+				valid_until: 1234567890,
 				eta: None,
 				quote_id: "test_quote".to_string(),
-				provider: "test_provider".to_string(),
-				cost: None,
-				lock_type: "permit2_escrow".to_string(),
+				provider: Some("test_provider".to_string()),
 			}],
 		};
 
@@ -1230,7 +1705,7 @@ mod tests {
 	#[test]
 	fn test_edge_cases() {
 		// Test empty arrays
-		let request = GetQuoteRequest {
+		let request = GetQuoteRequestV1 {
 			user: InteropAddress::new_ethereum(
 				1,
 				address!("1111111111111111111111111111111111111111"),
@@ -1242,7 +1717,7 @@ mod tests {
 		};
 
 		let json = serde_json::to_string(&request).unwrap();
-		let deserialized: GetQuoteRequest = serde_json::from_str(&json).unwrap();
+		let deserialized: GetQuoteRequestV1 = serde_json::from_str(&json).unwrap();
 		assert_eq!(deserialized.available_inputs.len(), 0);
 		assert_eq!(deserialized.requested_outputs.len(), 0);
 

@@ -2,7 +2,7 @@
 
 [gas]
 
-[gas.flows.compact_resource_lock]
+[gas.flows.resource_lock]
 open = 0
 fill = 77298
 claim = 122793

@@ -23,7 +23,7 @@ use std::fmt;
 use thiserror::Error;
 
 /// ERC-7930 Interoperable Address
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InteropAddress {
 	/// Version of the interoperable address format
 	pub version: u8,

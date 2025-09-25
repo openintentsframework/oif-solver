@@ -37,28 +37,16 @@
 //! - Permit2 availability (universal but requires deployment)
 //! - Custom protocol support (token-specific features)
 
-use solver_types::{AvailableInput, LockKind as ApiLockKind, QuoteError};
+use solver_types::standards::eip7683::LockType;
+use solver_types::{AssetLockReference, AvailableInput, LockKind, QuoteError};
 
 use super::registry::PROTOCOL_REGISTRY;
-
-/// Types of resource locks supported
-#[derive(Debug, Clone)]
-pub enum LockKind {
-	TheCompact { params: serde_json::Value },
-}
-
-/// Types of escrow mechanisms
-#[derive(Debug, Clone)]
-pub enum EscrowKind {
-	Permit2,
-	Eip3009,
-}
 
 /// Custody strategy decision
 #[derive(Debug, Clone)]
 pub enum CustodyDecision {
-	ResourceLock { kind: LockKind },
-	Escrow { kind: EscrowKind },
+	ResourceLock { lock: AssetLockReference },
+	Escrow { lock_type: LockType },
 }
 
 /// Custody strategy decision engine
@@ -81,21 +69,17 @@ impl CustodyStrategy {
 
 	fn handle_explicit_lock(
 		&self,
-		lock: &solver_types::Lock,
+		lock: &solver_types::AssetLockReference,
 	) -> Result<CustodyDecision, QuoteError> {
 		match lock.kind {
-			ApiLockKind::TheCompact => {
-				let lock_kind = LockKind::TheCompact {
-					params: lock.params.clone().unwrap_or_default(),
-				};
-				Ok(CustodyDecision::ResourceLock { kind: lock_kind })
-			},
-			// Permit2 and EIP3009 are escrow mechanisms, not resource locks
-			ApiLockKind::Permit2 => Ok(CustodyDecision::Escrow {
-				kind: EscrowKind::Permit2,
+			LockKind::TheCompact => Ok(CustodyDecision::ResourceLock { lock: lock.clone() }),
+			LockKind::Rhinestone => Ok(CustodyDecision::ResourceLock { lock: lock.clone() }),
+			//TODO: Remove this. Permit2 and EIP3009 are escrow mechanisms, not resource locks
+			LockKind::Permit2 => Ok(CustodyDecision::Escrow {
+				lock_type: LockType::Permit2Escrow,
 			}),
-			ApiLockKind::Eip3009 => Ok(CustodyDecision::Escrow {
-				kind: EscrowKind::Eip3009,
+			LockKind::Eip3009 => Ok(CustodyDecision::Escrow {
+				lock_type: LockType::Eip3009Escrow,
 			}),
 		}
 	}
@@ -117,11 +101,11 @@ impl CustodyStrategy {
 
 		if capabilities.supports_eip3009 {
 			Ok(CustodyDecision::Escrow {
-				kind: EscrowKind::Eip3009,
+				lock_type: LockType::Eip3009Escrow,
 			})
 		} else if capabilities.permit2_available {
 			Ok(CustodyDecision::Escrow {
-				kind: EscrowKind::Permit2,
+				lock_type: LockType::Permit2Escrow,
 			})
 		} else {
 			Err(QuoteError::UnsupportedSettlement(
