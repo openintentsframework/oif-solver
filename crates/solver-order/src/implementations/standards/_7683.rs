@@ -700,17 +700,6 @@ impl OrderInterface for Eip7683OrderImpl {
 		tx_data.extend_from_slice(&settler_address.0);
 		tx_data.extend_from_slice(&calldata);
 
-		// Compute order ID - for ERC-3009, use the nonce directly, otherwise use callback
-		tracing::info!(
-			"Order validation: lock_type={:?}, nonce=0x{}",
-			lock_type,
-			alloy_primitives::hex::encode(standard_order.nonce.to_be_bytes::<32>())
-		);
-		// Compute order ID from contract using callback
-		tracing::info!(
-			"Computing order ID from contract for lock type: {:?}",
-			lock_type
-		);
 		let order_id_bytes = order_id_callback(chain_id, tx_data).await.map_err(|e| {
 			OrderError::ValidationFailed(format!("Failed to compute order ID: {}", e))
 		})?;

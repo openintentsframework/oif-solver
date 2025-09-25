@@ -1217,17 +1217,6 @@ impl QuoteGenerator {
 		}
 	}
 
-	fn get_escrow_address(&self, config: &Config) -> Result<alloy_primitives::Address, QuoteError> {
-		match &config.settlement.domain {
-			Some(domain_config) => domain_config.address.parse().map_err(|e| {
-				QuoteError::InvalidRequest(format!("Invalid escrow address in config: {}", e))
-			}),
-			None => Err(QuoteError::InvalidRequest(
-				"Escrow address configuration required".to_string(),
-			)),
-		}
-	}
-
 	fn calculate_eta(&self, preference: &Option<QuotePreference>) -> u64 {
 		let base_eta = 120u64;
 		match preference {
@@ -1537,26 +1526,22 @@ mod tests {
 				assert_eq!(order.primary_type, "ReceiveWithAuthorization");
 				assert!(order.message.is_object());
 
-				// Verify new message structure with domain and message fields
+				// Verify domain is at the order level (new structure)
+				assert!(order.domain.is_object());
+				let domain = order.domain.as_object().unwrap();
+				assert!(domain.contains_key("name"));
+				assert!(domain.contains_key("chainId"));
+				assert!(domain.contains_key("verifyingContract"));
+
+				// Verify message structure (EIP-3009 fields)
 				let message_obj = order.message.as_object().unwrap();
-				assert!(message_obj.contains_key("domain"));
-				assert!(message_obj.contains_key("message"));
-
-				// Verify domain structure
-				let domain = &message_obj["domain"];
-				assert!(domain["name"].is_string());
-				assert!(domain["chainId"].is_string());
-				assert!(domain["verifyingContract"].is_string());
-
-				// Verify message structure
-				let inner_message = &message_obj["message"];
-				assert!(inner_message["from"].is_string());
-				assert!(inner_message["to"].is_string());
-				assert!(inner_message["value"].is_string());
-				assert!(inner_message["validAfter"].is_number());
-				assert!(inner_message["validBefore"].is_number());
-				assert!(inner_message["nonce"].is_string());
-				assert!(inner_message["inputOracle"].is_string());
+				assert!(message_obj["from"].is_string());
+				assert!(message_obj["to"].is_string());
+				assert!(message_obj["value"].is_string());
+				assert!(message_obj["validAfter"].is_number());
+				assert!(message_obj["validBefore"].is_number());
+				assert!(message_obj["nonce"].is_string());
+				assert!(message_obj["inputOracle"].is_string());
 			},
 			Err(e) => {
 				// Expected if token contract calls fail or configuration is missing
@@ -1793,44 +1778,6 @@ mod tests {
 		};
 
 		let result = generator.get_lock_domain_address(&config, &lock_kind);
-		assert!(matches!(result, Err(QuoteError::InvalidRequest(_))));
-	}
-
-	#[test]
-	fn test_get_escrow_address_success() {
-		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
-		let config = create_test_config();
-
-		let result = generator.get_escrow_address(&config);
-		assert!(result.is_ok());
-	}
-
-	#[test]
-	fn test_get_escrow_address_missing_config() {
-		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
-		let mut config = create_test_config();
-		config.settlement.domain = None;
-
-		let result = generator.get_escrow_address(&config);
-		assert!(matches!(result, Err(QuoteError::InvalidRequest(_))));
-	}
-
-	#[test]
-	fn test_get_escrow_address_invalid_address() {
-		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
-		let mut config = create_test_config();
-		config.settlement.domain.as_mut().unwrap().address = "invalid_address".to_string();
-
-		let result = generator.get_escrow_address(&config);
 		assert!(matches!(result, Err(QuoteError::InvalidRequest(_))));
 	}
 
