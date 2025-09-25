@@ -446,10 +446,12 @@ impl interfaces::StandardOrder {
 		// 	.get("spender")
 		// 	.and_then(|s| s.as_str())
 		// 	.ok_or("Missing spender in EIP-712 data")?;
-		// TODO we have to ecrecover the user address from the signature
-		let user_address_str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8".to_string();
-		let user_address =
-			Address::from_slice(&hex::decode(user_address_str.trim_start_matches("0x"))?);
+		// Extract the recovered user address from the injected message field
+		let user_str = eip712_data
+			.get("user")
+			.and_then(|u| u.as_str())
+			.ok_or("Missing user in EIP-712 data (should be injected by ecrecover)")?;
+		let user_address = Address::from_slice(&hex::decode(user_str.trim_start_matches("0x"))?);
 		// Extract nonce - directly in message now
 		let nonce_str = eip712_data
 			.get("nonce")

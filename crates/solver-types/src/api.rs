@@ -767,11 +767,25 @@ impl PostOrderRequest {
 		use alloy_primitives::Bytes;
 		use alloy_sol_types::SolType;
 
-		// Use the unified TryFrom implementation that handles all order types automatically
-		let sol_order = StandardOrder::try_from(quote)?;
+		// 1. Reconstruct the EIP-712 digest from scratch using quote data
+		let digest = crate::utils::eip712::reconstruct_permit2_digest_from_quote(quote)?;
+		// 2. Recover the real user address from the signature
+		let recovered_user =
+			crate::utils::eip712::ecrecover_user_from_signature(&digest, signature)?;
+		tracing::info!("Recovered user address from signature: {}", recovered_user);
 
-		// Extract the user address from the order
-		let user_address = sol_order.user;
+		// 3. Clone quote to make it mutable and inject recovered user
+		let mut quote_clone = quote.clone();
+		if let OifOrder::OifEscrowV0 { payload } = &mut quote_clone.order {
+			if let Some(message_obj) = payload.message.as_object_mut() {
+				message_obj.insert(
+					"user".to_string(),
+					serde_json::Value::String(recovered_user.to_string()),
+				);
+			}
+		}
+		// 4. Use the unified TryFrom implementation with the modified quote (now contains recovered user)
+		let sol_order = StandardOrder::try_from(&quote_clone)?;
 
 		// Encode the order
 		let encoded_order = StandardOrder::abi_encode(&sol_order);
@@ -784,7 +798,7 @@ impl PostOrderRequest {
 		let signature_bytes = Bytes::from(hex::decode(signature.trim_start_matches("0x"))?);
 		Ok(PostOrderRequest {
 			order: Bytes::from(encoded_order),
-			sponsor: user_address,
+			sponsor: recovered_user,
 			signature: signature_bytes,
 			lock_type,
 		})
