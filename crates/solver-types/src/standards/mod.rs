@@ -15,4 +15,4 @@ pub mod eip7683;
 pub mod eip7930;
 
 // Re-export commonly used types for convenience
-pub use eip7683::{Eip7683OrderData, Output as Eip7683Output};
+pub use eip7683::{Eip7683OrderData, MandateOutput as Eip7683Output};

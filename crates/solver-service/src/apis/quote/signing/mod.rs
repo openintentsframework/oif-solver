@@ -7,7 +7,7 @@
 //! ## Architecture
 //!
 //! The signing module is organized into:
-//! - **Payloads**: Protocol-specific message generation (Permit2, ERC-3009, etc.)
+//! - **Payloads**: Protocol-specific message generation (Permit2, EIP-3009, etc.)
 //! - **Schemes**: Signature schemes (EIP-712, EIP-191, etc.)
 //! - **Validation**: Signature verification and validation logic
 //!
@@ -19,7 +19,7 @@
 //! - Batch transfers with witness data
 //! - Cross-chain intent specification
 //!
-//! ### ERC-3009 (Future)
+//! ### EIP-3009 (Future)
 //! Transfer with authorization for USDC and similar tokens:
 //! - Native gasless transfers
 //! - Built-in authorization mechanics

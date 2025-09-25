@@ -133,20 +133,49 @@ cast_cmd() {
     fi
     
     print_debug "Running cast $cmd with args: $*"
+    print_debug "Full command: env -u RUST_LOG $cast_path $cmd $*"
     
     local output
     local exit_code
     
-    output=$("$cast_path" "$cmd" "$@" 2>&1)
+    # Capture stdout and stderr separately to avoid mixing debug logs with actual output
+    # Unset RUST_LOG for cast commands to prevent debug logs from interfering
+    local stderr_file=$(mktemp)
+    output=$(env -u RUST_LOG "$cast_path" "$cmd" "$@" 2>"$stderr_file")
     exit_code=$?
+    local stderr_content=$(cat "$stderr_file")
+    rm -f "$stderr_file"
+    
+    print_debug "Cast exit code: $exit_code"
+    print_debug "Cast stdout: $output"
+    print_debug "Cast stderr: $stderr_content"
     
     if [ $exit_code -ne 0 ]; then
         print_error "Cast command failed: cast $cmd"
         print_error "Output: $output"
+        if [ -n "$stderr_content" ]; then
+            print_error "Stderr: $stderr_content"
+        fi
         return $exit_code
     fi
     
-    echo "$output"
+    # Filter out debug logs and keep only valid hex output or other expected formats
+    # Cast commands typically output hex strings, addresses, or plain text
+    local filtered_output
+    if [[ "$output" =~ ^0x[0-9a-fA-F]*$ ]] || [[ "$output" =~ ^[0-9]+$ ]] || [[ "$cmd" == "wallet" ]]; then
+        # Valid hex string, number, or wallet command - use as is
+        filtered_output="$output"
+    else
+        # Multi-line output with potential debug logs - extract the last line that looks like valid output
+        filtered_output=$(echo "$output" | grep -E '^(0x[0-9a-fA-F]+|[0-9]+|true|false|[a-zA-Z0-9+/=]+)$' | tail -1)
+        if [ -z "$filtered_output" ]; then
+            # Fallback: use the last line if no clear hex/number pattern found
+            filtered_output=$(echo "$output" | tail -1)
+        fi
+    fi
+    
+    print_debug "Cast filtered output: $filtered_output"
+    echo "$filtered_output"
     return 0
 }
 
