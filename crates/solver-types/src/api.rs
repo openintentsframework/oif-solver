@@ -830,10 +830,11 @@ mod tests {
 	fn test_quote_order_serialization() {
 		let order = QuoteOrder {
 			signature_type: SignatureType::Eip712,
-			domain: InteropAddress::new_ethereum(
+			domain: serde_json::to_value(InteropAddress::new_ethereum(
 				1,
 				address!("5555555555555555555555555555555555555555"),
-			),
+			))
+			.unwrap(),
 			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
 			message: serde_json::json!({
 				"permitted": [],
@@ -872,10 +873,11 @@ mod tests {
 		let quote = Quote {
 			orders: vec![QuoteOrder {
 				signature_type: SignatureType::Eip712,
-				domain: InteropAddress::new_ethereum(
+				domain: serde_json::to_value(InteropAddress::new_ethereum(
 					1,
 					address!("5555555555555555555555555555555555555555"),
-				),
+				))
+				.unwrap(),
 				primary_type: "TestType".to_string(),
 				message: serde_json::json!({"test": "value"}),
 			}],
