@@ -596,10 +596,6 @@ impl interfaces::StandardOrder {
 			.ok_or("Missing 'from' field in EIP-3009 message")?;
 		let user_address = Address::from_slice(&hex::decode(from_str.trim_start_matches("0x"))?);
 
-		// For EIP-3009, the nonce from the message is temporary
-		// The real nonce should be the orderIdentifier calculated from the final StandardOrder
-		// We'll calculate this after building the StandardOrder structure
-
 		// Get origin chain ID from available inputs
 		let origin_chain_id = {
 			let input = quote
@@ -666,7 +662,7 @@ impl interfaces::StandardOrder {
 			recipient_bytes[12..32].copy_from_slice(&recipient_address.0 .0);
 
 			// Use the correct output_settler address (same as direct intent)
-			// TODO: Get this from config properly instead of hardcoding
+			// TODO: Once we align with new oif-spec, this needs to be fetched from signature metadata object
 			let output_settler_hex = "0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9";
 			let output_settler_bytes = hex::decode(output_settler_hex.trim_start_matches("0x"))
 				.map_err(|e| format!("Invalid output settler address: {}", e))?;
