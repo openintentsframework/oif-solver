@@ -430,13 +430,6 @@ build_standard_order() {
     cast_abi_encode "$abi_type" "$order_struct"
 }
 
-# Extract digest from quote JSON
-extract_digest_from_quote() {
-    local quote_json="$1"
-    
-    echo "$quote_json" | jq -r '.quotes[0].orders[0].message.digest // empty'
-}
-
 # Generate EIP-3009 signature for receiveWithAuthorization
 sign_eip3009_order() {
     local user_private_key="$1"
@@ -941,7 +934,6 @@ export -f sign_personal_message
 export -f verify_signature
 export -f create_prefixed_signature
 export -f build_standard_order
-export -f extract_digest_from_quote
 export -f sign_standard_intent
 export -f compute_compact_digest_from_quote
 export -f sign_compact_digest_from_quote

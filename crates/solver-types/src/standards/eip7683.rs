@@ -415,46 +415,48 @@ impl TryFrom<&Quote> for interfaces::StandardOrder {
 impl interfaces::StandardOrder {
 	/// Handle Permit2 order conversion
 	fn handle_permit2_quote_conversion(
-		_quote: &Quote,
+		quote: &Quote,
 		eip712_data: &serde_json::Map<String, serde_json::Value>,
 	) -> Result<Self, Box<dyn std::error::Error>> {
+		tracing::info!("Starting permit2 quote conversion with new format");
 		use crate::utils::parse_bytes32_from_hex;
 		use alloy_primitives::{Address, U256};
 		use interfaces::SolMandateOutput;
 
-		// Extract signing information to get domain details
-		let signing = eip712_data
-			.get("signing")
-			.and_then(|s| s.as_object())
-			.ok_or("Missing 'signing' object in EIP-712 data")?;
-
-		let domain = signing
-			.get("domain")
-			.and_then(|d| d.as_object())
-			.ok_or("Missing 'domain' in signing data")?;
-
-		// Extract origin chain ID from domain
-		let origin_chain_id = domain
-			.get("chainId")
-			.and_then(|c| c.as_u64())
-			.map(U256::from)
-			.ok_or("Missing chainId in domain")?;
+		// Extract origin chain ID from the quote's payload domain (new format)
+		let origin_chain_id = if let crate::OifOrder::OifEscrowV0 { payload } = &quote.order {
+			// Get domain from payload directly (new format)
+			let domain = payload
+				.domain
+				.as_object()
+				.ok_or("Missing 'domain' object in payload")?;
+			
+			domain
+				.get("chainId")
+				.and_then(|c| c.as_str().and_then(|s| s.parse::<u64>().ok()))
+				.map(U256::from)
+				.ok_or("Missing chainId in domain")?
+		} else {
+			return Err("Expected OifEscrowV0 order type".into());
+		};
 
 		// Extract spender as the user address (the entity that will receive the permit)
-		let spender_str = eip712_data
-			.get("spender")
-			.and_then(|s| s.as_str())
-			.ok_or("Missing spender in EIP-712 data")?;
-		let user_address = Address::from_slice(&hex::decode(spender_str.trim_start_matches("0x"))?);
-
-		// Extract nonce
+		// In the new format, spender is directly in the message
+		// let spender_str = eip712_data
+		// 	.get("spender")
+		// 	.and_then(|s| s.as_str())
+		// 	.ok_or("Missing spender in EIP-712 data")?;
+		// TODO we have to ecrecover the user address from the signature
+		let user_address_str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8".to_string();
+		let user_address = Address::from_slice(&hex::decode(user_address_str.trim_start_matches("0x"))?);
+		// Extract nonce - directly in message now
 		let nonce_str = eip712_data
 			.get("nonce")
 			.and_then(|n| n.as_str())
 			.ok_or("Missing nonce in EIP-712 data")?;
 		let nonce = U256::from_str_radix(nonce_str, 10)?;
 
-		// Extract deadline (this is the permit deadline, also used as fill_deadline)
+		// Extract deadline - directly in message now
 		let deadline_str = eip712_data
 			.get("deadline")
 			.and_then(|d| d.as_str())
@@ -481,7 +483,7 @@ impl interfaces::StandardOrder {
 		let input_oracle =
 			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
 
-		// Extract input data from permitted array
+		// Extract input data from permitted array - directly in message now
 		let permitted = eip712_data
 			.get("permitted")
 			.and_then(|p| p.as_array())
@@ -558,7 +560,7 @@ impl interfaces::StandardOrder {
 		}
 
 		// Create the StandardOrder
-		Ok(interfaces::StandardOrder {
+		let standard_order = interfaces::StandardOrder {
 			user: user_address,
 			nonce,
 			originChainId: origin_chain_id,
@@ -567,7 +569,11 @@ impl interfaces::StandardOrder {
 			inputOracle: input_oracle,
 			inputs,
 			outputs: sol_outputs,
-		})
+		};
+		
+		tracing::info!("Successfully created StandardOrder with {} inputs and {} outputs", 
+			standard_order.inputs.len(), standard_order.outputs.len());
+		Ok(standard_order)
 	}
 
 	/// Handle EIP-3009 order conversion

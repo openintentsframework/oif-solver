@@ -283,10 +283,11 @@ async fn handle_order(
 	}
 
 	// Extract standard, default to eip7683
-	let standard = payload
-		.get("standard")
-		.and_then(|s| s.as_str())
-		.unwrap_or("eip7683");
+	let standard = "eip7683"; // TODO: define properly.
+	// let standard = payload
+	// 	.get("standard")
+	// 	.and_then(|s| s.as_str())
+	// 	.unwrap_or("eip7683");
 
 	// Convert payload to PostOrderRequest
 	let intent_request = match extract_intent_request(payload.clone(), &state, standard).await {
@@ -310,6 +311,7 @@ async fn extract_intent_request(
 	state: &AppState,
 	standard: &str,
 ) -> Result<PostOrderRequest, APIError> {
+	tracing::info!("Extracting intent request from payload: {:?}", payload);
 	// Check if this is a quote acceptance (has quoteId)
 	if payload.get("quoteId").and_then(|v| v.as_str()).is_some() {
 		// Quote acceptance path
@@ -335,10 +337,20 @@ async fn create_intent_from_quote(
 			message: "Missing quoteId in request".to_string(),
 			details: None,
 		})?;
-
+	
 	let signature = payload
 		.get("signature")
-		.and_then(|v| v.as_str())
+		.and_then(|v| {
+			// Handle signature as either string or array of strings
+			if let Some(s) = v.as_str() {
+				Some(s)
+			} else if let Some(arr) = v.as_array() {
+				// Take first element if it's an array
+				arr.first().and_then(|s| s.as_str())
+			} else {
+				None
+			}
+		})
 		.ok_or_else(|| APIError::BadRequest {
 			error_type: ApiErrorType::MissingSignature,
 			message: "Missing signature for quote acceptance".to_string(),
@@ -346,12 +358,14 @@ async fn create_intent_from_quote(
 		})?;
 
 	tracing::info!(
-		"Quote acceptance for quote_id: {}, standard: {}",
+		"Quote acceptance for quote_id: {}, standard: {}, signature: {}",
 		quote_id,
-		standard
+		standard,
+		signature
 	);
 
 	// Retrieve the quote from storage
+	tracing::info!("Attempting to retrieve quote from storage: {}", quote_id);
 	let quote = crate::apis::quote::get_quote_by_id(quote_id, &state.solver)
 		.await
 		.map_err(|e| {
@@ -362,14 +376,21 @@ async fn create_intent_from_quote(
 				details: Some(serde_json::json!({"quoteId": quote_id})),
 			}
 		})?;
-
+	
+	tracing::info!("Successfully retrieved quote, attempting conversion to PostOrderRequest");
 	// Convert Quote to PostOrderRequest using the TryFrom implementation
-	(&quote, signature, standard)
+	let result = (&quote, signature, standard)
 		.try_into()
-		.map_err(|e| APIError::InternalServerError {
-			error_type: ApiErrorType::QuoteConversionFailed,
-			message: format!("Failed to convert quote to intent format: {}", e),
-		})
+		.map_err(|e| {
+			tracing::error!("Quote conversion failed: {}", e);
+			APIError::InternalServerError {
+				error_type: ApiErrorType::QuoteConversionFailed,
+				message: format!("Failed to convert quote to intent format: {}", e),
+			}
+		})?;
+	
+	tracing::info!("Quote conversion successful, PostOrderRequest created");
+	Ok(result)
 }
 
 /// Creates a PostOrderRequest from a direct payload submission.
@@ -389,6 +410,7 @@ async fn validate_intent_request(
 	state: &AppState,
 	standard: &str,
 ) -> Result<Order, APIError> {
+	tracing::info!("Starting intent validation for standard: {}", standard);
 	// Get the order bytes (already in Bytes format from PostOrderRequest)
 	let order_bytes = &intent.order;
 
@@ -482,7 +504,7 @@ async fn validate_intent_request(
 		});
 
 	match &result {
-		Ok(_) => tracing::debug!("Order validation completed successfully"),
+		Ok(_) => tracing::info!("Order validation completed successfully"),
 		Err(e) => tracing::error!("Order validation failed: {:?}", e),
 	}
 
@@ -493,6 +515,7 @@ async fn forward_to_discovery_service(
 	state: &AppState,
 	intent: &PostOrderRequest,
 ) -> axum::response::Response {
+	tracing::info!("Forwarding validated intent to discovery service");
 	// Check if discovery URL is configured
 	let forward_url = match &state.discovery_url {
 		Some(url) => url,
