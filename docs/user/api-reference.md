@@ -110,6 +110,8 @@ Generate price quotes for cross-chain token transfers. This endpoint analyzes yo
 
 **Response:**
 
+For **Permit2 Escrow** orders (`lockType: "permit2_escrow"`):
+
 ```json
 {
   "quotes": [
@@ -117,7 +119,11 @@ Generate price quotes for cross-chain token transfers. This endpoint analyzes yo
       "orders": [
         {
           "signatureType": "eip712",
-          "domain": "1:0x5FbDB2315678afecb367f032d93F642f64180aa3",
+          "domain": {
+            "name": "Permit2",
+            "chainId": "1",
+            "verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+          },
           "primaryType": "PermitBatchWitnessTransferFrom",
           "message": {
             "permitted": [
@@ -130,32 +136,20 @@ Generate price quotes for cross-chain token transfers. This endpoint analyzes yo
             "nonce": "123456789",
             "deadline": "1234567890",
             "witness": {
-              "info": {
-                "reactor": "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9",
-                "swapper": "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
-                "nonce": 0,
-                "deadline": 1234567890,
-                "additionalValidationContract": "0x0000000000000000000000000000000000000000",
-                "additionalValidationData": "0x"
-              },
-              "input": {
-                "token": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
-                "amount": "1000000000000000000",
-                "maxAmount": "1000000000000000000"
-              },
+              "expires": "1234567890",
+              "inputOracle": "0xDf7C8BD0DfC2F3F3a7d46F8D4c5C5C5C5C5C5C5C",
               "outputs": [
                 {
-                  "token": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+                  "oracle": "0x000000000000000000000000DdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDd",
+                  "settler": "0x000000000000000000000000CcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCc",
+                  "chainId": "31338",
+                  "token": "0x0000000000000000000000005FbDB2315678afecb367f032d93F642f64180aa3",
                   "amount": "990000000000000000",
-                  "recipient": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-                  "chainId": "31338"
+                  "recipient": "0x00000000000000000000000070997970C51812dc3A010C7d01b50e0d17dc79C8",
+                  "call": "0x",
+                  "context": "0x"
                 }
-              ],
-              "fillInstructions": {
-                "destinationChainId": "31338",
-                "destinationSettler": "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9",
-                "originData": "0x"
-              }
+              ]
             }
           }
         }
@@ -182,6 +176,7 @@ Generate price quotes for cross-chain token transfers. This endpoint analyzes yo
       "eta": 300,
       "quoteId": "quote_abc123",
       "provider": "oif-solver",
+      "lockType": "permit2_escrow",
       "cost": {
         "totalFee": "10000000000000000",
         "gasEstimate": "150000",
@@ -195,12 +190,102 @@ Generate price quotes for cross-chain token transfers. This endpoint analyzes yo
 }
 ```
 
+For **TheCompact Resource Lock** orders (`lockType: "compact_resource_lock"`):
+
+```json
+{
+  "quotes": [
+    {
+      "orders": [
+        {
+          "signatureType": "eip712",
+          "domain": {
+            "name": "TheCompact",
+            "version": "1",
+            "chainId": "1",
+            "verifyingContract": "0x00000000009aF2B3Cf5D78eb6C28A1F9dB8E1234"
+          },
+          "primaryType": "BatchCompact",
+          "message": {
+            "arbiter": "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0",
+            "sponsor": "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+            "nonce": "1234567890123",
+            "expires": "1234567890",
+            "commitments": [
+              {
+                "lockTag": "0x000000000000000000000000",
+                "token": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+                "amount": "1000000000000000000"
+              }
+            ],
+            "mandate": {
+              "fillDeadline": "1234567890",
+              "inputOracle": "0xDf7C8BD0DfC2F3F3a7d46F8D4c5C5C5C5C5C5C5C",
+              "outputs": [
+                {
+                  "oracle": "0x000000000000000000000000DdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDd",
+                  "settler": "0x000000000000000000000000CcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCc",
+                  "chainId": "31338",
+                  "token": "0x0000000000000000000000005FbDB2315678afecb367f032d93F642f64180aa3",
+                  "amount": "990000000000000000",
+                  "recipient": "0x00000000000000000000000070997970C51812dc3A010C7d01b50e0d17dc79C8",
+                  "call": "0x",
+                  "context": "0x"
+                }
+              ]
+            },
+            "digest": "0xabcd1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+            "eip712": {
+              "types": "...",
+              "domain": "...",
+              "primaryType": "BatchCompact",
+              "message": "..."
+            }
+          }
+        }
+      ],
+      "details": {
+        "requestedOutputs": [
+          {
+            "receiver": "31338:0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+            "asset": "31338:0x5FbDB2315678afecb367f032d93F642f64180aa3",
+            "amount": "990000000000000000",
+            "calldata": null
+          }
+        ],
+        "availableInputs": [
+          {
+            "user": "1:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+            "asset": "1:0x5FbDB2315678afecb367f032d93F642f64180aa3",
+            "amount": "1000000000000000000",
+            "lock": null
+          }
+        ]
+      },
+      "validUntil": 1234567890,
+      "eta": 300,
+      "quoteId": "quote_def456",
+      "provider": "oif-solver",
+      "lockType": "compact_resource_lock",
+      "cost": {
+        "totalFee": "8000000000000000",
+        "gasEstimate": "120000",
+        "breakdown": {
+          "solverFee": "4000000000000000",
+          "gasCost": "4000000000000000"
+        }
+      }
+    }
+  ]
+}
+```
+
 **Response Fields:**
 
 - `quotes` (array): Array of available quote options
   - `orders` (array): EIP-712 compliant order structures ready for signing
     - `signatureType` (string): Signature type ("eip712" or "erc3009")
-    - `domain` (string): Domain address in ERC-7930 interoperable format
+    - `domain` (object): EIP-712 domain object with contract details
     - `primaryType` (string): Primary type for EIP-712 signing
     - `message` (object): Complete message object to be signed
   - `details` (object): Quote details matching the original request structure
@@ -214,11 +299,109 @@ Generate price quotes for cross-chain token transfers. This endpoint analyzes yo
     - `totalFee` (string): Total fee in wei
     - `gasEstimate` (string): Estimated gas cost
     - `breakdown` (object): Detailed cost breakdown
+  - `lockType` (string): Settlement mechanism type
 
 **Signature Types:**
 
-- `eip712`: EIP-712 structured data signing (most common)
-- `erc3009`: ERC-3009 native gasless transfers
+- `eip712`: EIP-712 structured data signing
+
+## User Signing Process
+
+**Important**: Users must manually compute the EIP-712 digest and sign it. The quote response provides the standard EIP-712 components but does not include a pre-computed digest.
+
+### Required Steps:
+
+1. **Extract Signing Components** from each `order` in the quote:
+
+   - `domain`: EIP-712 domain object
+   - `primaryType`: The main struct type (e.g., "PermitBatchWitnessTransferFrom")
+   - `message`: The structured data to sign
+
+2. **Compute EIP-712 Digest**: Use standard EIP-712 hashing with the provided components
+
+3. **Sign the Digest**: Use your wallet/library to sign the EIP-712 structured data
+
+### Domain Object Structure:
+
+The `domain` field contains a structured object, not a string:
+
+```json
+{
+  "name": "Permit2",
+  "chainId": 1,
+  "verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+}
+```
+
+### EIP-712 Type Definitions:
+
+For **Permit2** orders (`primaryType: "PermitBatchWitnessTransferFrom"`):
+
+```javascript
+const types = {
+  PermitBatchWitnessTransferFrom: [
+    { name: "permitted", type: "TokenPermissions[]" },
+    { name: "spender", type: "address" },
+    { name: "nonce", type: "uint256" },
+    { name: "deadline", type: "uint256" },
+    { name: "witness", type: "Witness" },
+  ],
+  TokenPermissions: [
+    { name: "token", type: "address" },
+    { name: "amount", type: "uint256" },
+  ],
+  Witness: [
+    { name: "expires", type: "uint256" },
+    { name: "inputOracle", type: "address" },
+    { name: "outputs", type: "Output[]" },
+  ],
+  Output: [
+    { name: "oracle", type: "bytes32" },
+    { name: "settler", type: "bytes32" },
+    { name: "chainId", type: "uint256" },
+    { name: "token", type: "bytes32" },
+    { name: "amount", type: "uint256" },
+    { name: "recipient", type: "bytes32" },
+    { name: "call", type: "bytes" },
+    { name: "context", type: "bytes" },
+  ],
+};
+```
+
+For **TheCompact Resource Lock** orders (`primaryType: "CompactLock"` or `primaryType: "BatchCompact"`):
+
+```javascript
+const types = {
+  BatchCompact: [
+    { name: "arbiter", type: "address" },
+    { name: "sponsor", type: "address" },
+    { name: "nonce", type: "uint256" },
+    { name: "expires", type: "uint256" },
+    { name: "commitments", type: "Lock[]" },
+    { name: "mandate", type: "Mandate" },
+  ],
+  Lock: [
+    { name: "lockTag", type: "bytes12" },
+    { name: "token", type: "address" },
+    { name: "amount", type: "uint256" },
+  ],
+  Mandate: [
+    { name: "fillDeadline", type: "uint32" },
+    { name: "inputOracle", type: "address" },
+    { name: "outputs", type: "MandateOutput[]" },
+  ],
+  MandateOutput: [
+    { name: "oracle", type: "bytes32" },
+    { name: "settler", type: "bytes32" },
+    { name: "chainId", type: "uint256" },
+    { name: "token", type: "bytes32" },
+    { name: "amount", type: "uint256" },
+    { name: "recipient", type: "bytes32" },
+    { name: "call", type: "bytes" },
+    { name: "context", type: "bytes" },
+  ],
+};
+```
 
 **Example:**
 
