@@ -418,7 +418,6 @@ impl interfaces::StandardOrder {
 		quote: &Quote,
 		eip712_data: &serde_json::Map<String, serde_json::Value>,
 	) -> Result<Self, Box<dyn std::error::Error>> {
-		tracing::info!("Starting permit2 quote conversion with new format");
 		use crate::utils::parse_bytes32_from_hex;
 		use alloy_primitives::{Address, U256};
 		use interfaces::SolMandateOutput;
