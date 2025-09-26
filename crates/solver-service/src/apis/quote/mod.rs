@@ -97,7 +97,6 @@ pub async fn process_quote_request(
 	// Use the new validation architecture to get ValidatedQuoteContext
 	let validated_context = QuoteValidator::validate_quote_request(&request, solver)?;
 
-	// NEW: Pre-calculate costs BEFORE generation
 	let cost_profit_service = solver_core::engine::cost_profit::CostProfitService::new(
 		solver.pricing().clone(),
 		solver.delivery().clone(),
@@ -126,13 +125,9 @@ pub async fn process_quote_request(
 	let delivery_service = solver.delivery();
 	let quote_generator = QuoteGenerator::new(settlement_service.clone(), delivery_service.clone());
 
-	// NEW: Generate quotes with costs already embedded in amounts
 	let quotes = quote_generator
 		.generate_quotes_with_costs(&request, &validated_context, &cost_context, config)
 		.await?;
-
-	// NOTE: Cost calculation has been moved BEFORE generation and embedded in amounts
-	// No longer need post-generation cost enrichment
 
 	// Persist quotes
 	let validity_seconds = config

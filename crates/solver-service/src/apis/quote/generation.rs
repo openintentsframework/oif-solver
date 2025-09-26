@@ -116,7 +116,6 @@ impl QuoteGenerator {
 	}
 
 	/// Generate quotes with costs already embedded in the amounts.
-	/// This is the new flow that calculates costs before quote generation and embeds them.
 	pub async fn generate_quotes_with_costs(
 		&self,
 		request: &GetQuoteRequest,
@@ -160,7 +159,6 @@ impl QuoteGenerator {
 							.copied()
 							.unwrap_or(U256::ZERO);
 
-						// For exact matching, don't distribute cost evenly
 						// Apply full cost to first output, others get their base amount
 						let is_first_output = first_output_asset
 							.as_ref()
@@ -196,7 +194,6 @@ impl QuoteGenerator {
 							.copied()
 							.unwrap_or(U256::ZERO);
 
-						// For exact matching, don't distribute cost evenly
 						// Apply full cost to first input, others get their base amount
 						let is_first_input = first_input_asset
 							.as_ref()
@@ -454,7 +451,6 @@ impl QuoteGenerator {
 			})
 		};
 
-		// Build metadata with proper error handling for amounts
 		// This is needed for conversion back to StandardOrder
 		let mut inputs_metadata = Vec::new();
 		for input in &request.intent.inputs {
