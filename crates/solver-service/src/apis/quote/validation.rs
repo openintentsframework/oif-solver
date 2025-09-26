@@ -126,8 +126,15 @@ impl QuoteValidator {
 					if amount_u256.is_none() {
 						return Err(QuoteError::MissingInputAmount);
 					}
+					
+					let amount = amount_u256.unwrap();
+					if amount.is_zero() {
+						return Err(QuoteError::InvalidRequest(
+							"Input amount cannot be zero for exact-input swaps".to_string()
+						));
+					}
 
-					known_inputs.push((input.clone(), amount_u256.unwrap()));
+					known_inputs.push((input.clone(), amount));
 				}
 
 				// Output amounts are optional constraints
@@ -162,8 +169,15 @@ impl QuoteValidator {
 					if amount_u256.is_none() {
 						return Err(QuoteError::MissingOutputAmount);
 					}
+					
+					let amount = amount_u256.unwrap();
+					if amount.is_zero() {
+						return Err(QuoteError::InvalidRequest(
+							"Output amount cannot be zero for exact-output swaps".to_string()
+						));
+					}
 
-					known_outputs.push((output.clone(), amount_u256.unwrap()));
+					known_outputs.push((output.clone(), amount));
 				}
 
 				// Input amounts are optional constraints

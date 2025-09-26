@@ -126,6 +126,9 @@ impl QuoteGenerator {
 		// Build a new request with swap amounts and cost adjustments from CostContext
 		let adjusted_request = self.build_cost_adjusted_request(request, context, cost_context)?;
 
+		// Validate no zero amounts after adjustment
+		self.validate_no_zero_amounts(&adjusted_request, context)?;
+
 		// Validate constraints on the adjusted amounts
 		self.validate_swap_amount_constraints(&adjusted_request, context)?;
 
@@ -257,6 +260,8 @@ impl QuoteGenerator {
 			},
 			SwapType::ExactOutput => {
 				// For exact-output: check that input amounts don't exceed maximums
+				// When a user provides input constraints for exact-output swaps,
+				// they're specifying the maximum they're willing to provide
 				if let Some(constraints) = &context.constraint_inputs {
 					for (input, constraint_amount_opt) in constraints {
 						if let Some(constraint_amount) = constraint_amount_opt {
@@ -277,6 +282,55 @@ impl QuoteGenerator {
 								)));
 							}
 						}
+					}
+				}
+			},
+		}
+
+		Ok(())
+	}
+
+	/// Validate that no amounts are zero after adjustment
+	fn validate_no_zero_amounts(
+		&self,
+		adjusted_request: &GetQuoteRequest,
+		context: &ValidatedQuoteContext,
+	) -> Result<(), QuoteError> {
+		use alloy_primitives::U256;
+		use std::str::FromStr;
+
+		match context.swap_type {
+			SwapType::ExactInput => {
+				// For exact-input, check that all outputs are non-zero
+				for output in &adjusted_request.intent.outputs {
+					let amount = output
+						.amount
+						.as_ref()
+						.and_then(|amt| U256::from_str(amt).ok())
+						.unwrap_or(U256::ZERO);
+					
+					if amount.is_zero() {
+						return Err(QuoteError::InvalidRequest(format!(
+							"Output amount for {} cannot be zero after cost adjustment",
+							output.asset
+						)));
+					}
+				}
+			},
+			SwapType::ExactOutput => {
+				// For exact-output, check that all inputs are non-zero
+				for input in &adjusted_request.intent.inputs {
+					let amount = input
+						.amount
+						.as_ref()
+						.and_then(|amt| U256::from_str(amt).ok())
+						.unwrap_or(U256::ZERO);
+					
+					if amount.is_zero() {
+						return Err(QuoteError::InvalidRequest(format!(
+							"Input amount for {} cannot be zero after cost adjustment",
+							input.asset
+						)));
 					}
 				}
 			},
