@@ -337,6 +337,20 @@ impl SettlementInterface for DirectSettlement {
 		order: &Order,
 		_fill_proof: &FillProof,
 	) -> Result<Option<Transaction>, SettlementError> {
+		// TheCompact (ResourceLock) orders don't need PreClaim transactions
+		// They handle locks directly in the finalize step
+		if let Ok(parsed_order) = order.parse_order_data() {
+			if let Some(lock_type) = parsed_order.parse_lock_type() {
+				if lock_type == "resource_lock" {
+					tracing::info!(
+						order_id = %order.id,
+						"TheCompact order detected - no PreClaim transaction needed"
+					);
+					return Ok(None);
+				}
+			}
+		}
+
 		// Get the input oracle for PreClaim (happens on origin chain)
 		let origin_chain = order
 			.input_chains

@@ -18,11 +18,15 @@ struct CompactMessageHasher;
 
 impl MessageHashComputer for CompactMessageHasher {
 	/// Compute BatchCompact struct hash for TheCompact protocol
+	/// For quote acceptance, we should use the pre-computed digest from the quote
 	fn compute_message_hash(
 		&self,
 		order_bytes: &[u8],
 		contract_address: AlloyAddress,
 	) -> Result<FixedBytes<32>, APIError> {
+		// TODO: For quote acceptance flow, we should extract the pre-computed digest
+		// from the quote payload instead of re-computing it here to ensure consistency
+		// For now, use the existing computation
 		compute_batch_compact_hash(order_bytes, contract_address)
 	}
 }
@@ -65,7 +69,16 @@ pub fn create_signature_validator() -> impl SignatureValidator {
 
 /// Extract sponsor signature from ABI-encoded signature bytes
 /// This handles ABI-encoded signatures: abi.encode(sponsorSig, allocatorSig)
+/// Also handles prefixed signatures with type byte (0x01 for TheCompact)
 pub fn extract_sponsor_signature(signature: &Bytes) -> Bytes {
+	// Handle prefixed signatures (like 0x01<signature> for TheCompact)
+	if signature.len() == 66
+		&& (signature[0] == 0x01 || signature[0] == 0x00 || signature[0] == 0x02)
+	{
+		// Remove first byte (signature type prefix) and return 65-byte signature
+		return Bytes::from(signature[1..].to_vec());
+	}
+
 	// Handle ABI-encoded signatures: abi.encode(sponsorSig, allocatorSig)
 	if signature.len() > 65 && signature.len() >= 96 {
 		let sponsor_sig_length_offset = 64;

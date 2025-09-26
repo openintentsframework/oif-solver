@@ -796,7 +796,31 @@ impl PostOrderRequest {
 
 		// Create final PostOrderRequest
 		tracing::debug!("Creating PostOrderRequest with lock_type: {:?}", lock_type);
-		let signature_bytes = Bytes::from(hex::decode(signature.trim_start_matches("0x"))?);
+
+		// For TheCompact (ResourceLock), remove the signature type prefix before storing
+		let signature_for_storage = if matches!(lock_type, LockType::ResourceLock) {
+			// Remove 0x01 prefix for TheCompact signatures
+			let sig_hex = signature.trim_start_matches("0x");
+			if sig_hex.len() >= 2
+				&& (sig_hex.starts_with("01")
+					|| sig_hex.starts_with("00")
+					|| sig_hex.starts_with("02"))
+			{
+				format!("0x{}", &sig_hex[2..]) // Remove first 2 hex chars (1 byte)
+			} else {
+				signature.to_string()
+			}
+		} else {
+			signature.to_string()
+		};
+
+		let signature_bytes =
+			Bytes::from(hex::decode(signature_for_storage.trim_start_matches("0x"))?);
+		tracing::debug!(
+			"Signature stored for finalize: 0x{}",
+			hex::encode(&signature_bytes)
+		);
+
 		Ok(PostOrderRequest {
 			order: Bytes::from(encoded_order),
 			sponsor: recovered_user,

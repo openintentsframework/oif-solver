@@ -219,8 +219,12 @@ impl OrderInterface for Eip7683OrderImpl {
 			serde_json::from_value(order.data.clone()).map_err(|e| {
 				OrderError::ValidationFailed(format!("Failed to parse order data: {}", e))
 			})?;
-		// Skip prepare for Compact (resource lock) flows
+		// Skip prepare for TheCompact (ResourceLock) - it doesn't have open() function
+		// TheCompact orders are "opened" automatically when user deposits tokens
 		if matches!(order_data.lock_type, Some(LockType::ResourceLock)) {
+			tracing::info!(
+				"TheCompact order - no prepare transaction needed (no open() function available)"
+			);
 			return Ok(None);
 		}
 
@@ -249,6 +253,8 @@ impl OrderInterface for Eip7683OrderImpl {
 		let signature_bytes = hex::decode(signature.trim_start_matches("0x"))
 			.map_err(|e| OrderError::ValidationFailed(format!("Invalid signature: {}", e)))?;
 
+		// Only Permit2/EIP3009 need prepare transactions with openFor
+		tracing::info!("Generating prepare transaction using IInputSettlerEscrow::openFor");
 		let open_for_data = IInputSettlerEscrow::openForCall {
 			order: order_struct,
 			sponsor: sponsor_address,
@@ -260,6 +266,13 @@ impl OrderInterface for Eip7683OrderImpl {
 			.input_chains
 			.first()
 			.ok_or_else(|| OrderError::ValidationFailed("No input chains in order".into()))?;
+
+		tracing::info!(
+			"Prepare transaction - sending to escrow contract: {}, chain: {}, calldata length: {}",
+			input_chain.settler_address,
+			input_chain.chain_id,
+			open_for_data.len()
+		);
 
 		Ok(Some(Transaction {
 			to: Some(input_chain.settler_address.clone()),
@@ -536,9 +549,18 @@ impl OrderInterface for Eip7683OrderImpl {
 
 					// Expect full signature payload already without any type prefix
 					let sig_str = sig_hex.trim_start_matches("0x");
+					tracing::info!(
+						"TheCompact finalize - raw signature: 0x{}, length: {} chars",
+						sig_str,
+						sig_str.len()
+					);
 					let compact_sig_bytes = hex::decode(sig_str).map_err(|e| {
 						OrderError::ValidationFailed(format!("Invalid compact signatures: {}", e))
 					})?;
+					tracing::info!(
+						"TheCompact finalize - decoded signature bytes length: {}",
+						compact_sig_bytes.len()
+					);
 
 					IInputSettlerCompact::finaliseCall {
 						order: order_struct.clone(),
@@ -564,6 +586,13 @@ impl OrderInterface for Eip7683OrderImpl {
 			.input_chains
 			.first()
 			.ok_or_else(|| OrderError::ValidationFailed("No input chains in order".into()))?;
+
+		tracing::info!(
+			"TheCompact finalize - sending to contract: {}, chain: {}, calldata length: {}",
+			input_chain.settler_address,
+			input_chain.chain_id,
+			call_data.len()
+		);
 
 		Ok(Transaction {
 			to: Some(input_chain.settler_address.clone()),

@@ -595,8 +595,30 @@ sign_standard_intent() {
         return 1
     fi
     
-    # Return prefixed signature
-    create_prefixed_signature "$signature" "permit2"
+    # Return prefixed signature (0x00 for permit2)
+    echo "0x00${signature#0x}"
+}
+
+# Create prefixed signature based on signature type
+create_prefixed_signature() {
+    local raw_signature="$1"
+    local sig_type="$2"
+    
+    case "$sig_type" in
+        "permit2")
+            echo "0x00${raw_signature#0x}"
+            ;;
+        "eip3009")
+            echo "0x02${raw_signature#0x}"
+            ;;
+        "compact")
+            echo "0x01${raw_signature#0x}"
+            ;;
+        *)
+            print_error "Unsupported signature type for prefixing: $sig_type" >&2
+            return 1
+            ;;
+    esac
 }
 
 # Compute EIP-712 digest for BatchCompact from quote JSON

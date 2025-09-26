@@ -582,6 +582,210 @@ impl interfaces::StandardOrder {
 		Ok(standard_order)
 	}
 
+	/// Handle TheCompact BatchCompact order conversion
+	fn handle_batch_compact_quote_conversion(
+		quote: &Quote,
+		eip712_data: &serde_json::Map<String, serde_json::Value>,
+	) -> Result<Self, Box<dyn std::error::Error>> {
+		use crate::utils::parse_bytes32_from_hex;
+		use alloy_primitives::{Address, U256};
+		use interfaces::SolMandateOutput;
+
+		tracing::info!("Starting BatchCompact quote conversion");
+
+		// Extract user address from the injected message field (from ecrecover) or sponsor
+		let user_address = if let Some(user_str) = eip712_data.get("user").and_then(|u| u.as_str())
+		{
+			// User was injected by ecrecover
+			Address::from_slice(&hex::decode(user_str.trim_start_matches("0x"))?)
+		} else {
+			// Fallback: extract from eip712.message.sponsor
+			let eip712_obj = eip712_data
+				.get("eip712")
+				.and_then(|e| e.as_object())
+				.ok_or("Missing eip712 object in TheCompact message")?;
+			let message_obj = eip712_obj
+				.get("message")
+				.and_then(|m| m.as_object())
+				.ok_or("Missing message in eip712 data")?;
+			let sponsor_str = message_obj
+				.get("sponsor")
+				.and_then(|s| s.as_str())
+				.ok_or("Missing sponsor in BatchCompact message")?;
+			Address::from_slice(&hex::decode(sponsor_str.trim_start_matches("0x"))?)
+		};
+
+		// Extract origin chain ID from quote's payload domain
+		let origin_chain_id =
+			if let crate::OifOrder::OifResourceLockV0 { payload: _ } = &quote.order {
+				// For TheCompact, extract chainId from eip712.domain
+				let eip712_obj = eip712_data
+					.get("eip712")
+					.and_then(|e| e.as_object())
+					.ok_or("Missing eip712 object")?;
+				let domain_obj = eip712_obj
+					.get("domain")
+					.and_then(|d| d.as_object())
+					.ok_or("Missing domain in eip712")?;
+				domain_obj
+					.get("chainId")
+					.and_then(|c| c.as_str())
+					.ok_or("Missing chainId in domain")?
+					.parse::<u64>()
+					.map_err(|e| format!("Invalid chainId: {}", e))?
+			} else {
+				return Err("Expected OifResourceLockV0 order type".into());
+			};
+
+		// Extract fields from eip712.message
+		let eip712_obj = eip712_data
+			.get("eip712")
+			.and_then(|e| e.as_object())
+			.ok_or("Missing eip712 object")?;
+		let message_obj = eip712_obj
+			.get("message")
+			.and_then(|m| m.as_object())
+			.ok_or("Missing message in eip712 data")?;
+
+		// Extract nonce from message
+		let nonce_str = message_obj
+			.get("nonce")
+			.and_then(|n| n.as_str())
+			.ok_or("Missing nonce in BatchCompact message")?;
+		let nonce = U256::from_str_radix(nonce_str, 10)?;
+
+		// Extract expires and use as both expires and fillDeadline
+		let expires_str = message_obj
+			.get("expires")
+			.and_then(|e| e.as_str())
+			.ok_or("Missing expires in BatchCompact message")?;
+		let expires = expires_str.parse::<u32>()?;
+		let fill_deadline = expires; // Same value for TheCompact
+
+		// Extract mandate for outputs and inputOracle
+		let mandate_obj = message_obj
+			.get("mandate")
+			.and_then(|m| m.as_object())
+			.ok_or("Missing mandate in BatchCompact message")?;
+		let input_oracle_str = mandate_obj
+			.get("inputOracle")
+			.and_then(|o| o.as_str())
+			.ok_or("Missing inputOracle in mandate")?;
+		let input_oracle =
+			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
+
+		// Extract commitments for inputs (TheCompact commitments = inputs)
+		let commitments = message_obj
+			.get("commitments")
+			.and_then(|c| c.as_array())
+			.ok_or("Missing commitments array in BatchCompact message")?;
+
+		let mut inputs = Vec::new();
+		for commitment in commitments {
+			let commitment_obj = commitment.as_object().ok_or("Invalid commitment object")?;
+
+			let token_str = commitment_obj
+				.get("token")
+				.and_then(|t| t.as_str())
+				.ok_or("Missing token in commitment")?;
+			let amount_str = commitment_obj
+				.get("amount")
+				.and_then(|a| a.as_str())
+				.ok_or("Missing amount in commitment")?;
+
+			let token_addr = Address::from_slice(&hex::decode(token_str.trim_start_matches("0x"))?);
+			let amount = U256::from_str_radix(amount_str, 10)?;
+
+			// Convert token address to U256 (pad to 32 bytes)
+			let mut token_bytes = [0u8; 32];
+			token_bytes[12..32].copy_from_slice(token_addr.as_slice());
+			let token_u256 = U256::from_be_bytes(token_bytes);
+
+			inputs.push([token_u256, amount]);
+		}
+
+		// Extract outputs from mandate.outputs
+		let outputs_array = mandate_obj
+			.get("outputs")
+			.and_then(|o| o.as_array())
+			.ok_or("Missing outputs array in mandate")?;
+
+		let mut sol_outputs = Vec::new();
+		for output in outputs_array {
+			let output_obj = output.as_object().ok_or("Invalid output object")?;
+
+			// Extract output fields
+			let oracle_str = output_obj
+				.get("oracle")
+				.and_then(|o| o.as_str())
+				.unwrap_or("0x0000000000000000000000000000000000000000000000000000000000000000");
+			let settler_str = output_obj
+				.get("settler")
+				.and_then(|s| s.as_str())
+				.ok_or("Missing settler in output")?;
+			let chain_id = output_obj
+				.get("chainId")
+				.and_then(|c| {
+					// Handle chainId as either string or number
+					if let Some(s) = c.as_str() {
+						s.parse::<u64>().ok()
+					} else {
+						c.as_u64()
+					}
+				})
+				.ok_or("Missing chainId in output")?;
+			let token_str = output_obj
+				.get("token")
+				.and_then(|t| t.as_str())
+				.ok_or("Missing token in output")?;
+			let amount_str = output_obj
+				.get("amount")
+				.and_then(|a| a.as_str())
+				.ok_or("Missing amount in output")?;
+			let recipient_str = output_obj
+				.get("recipient")
+				.and_then(|r| r.as_str())
+				.ok_or("Missing recipient in output")?;
+
+			// Parse values
+			let oracle_bytes = parse_bytes32_from_hex(oracle_str)?;
+			let settler_bytes = parse_bytes32_from_hex(settler_str)?;
+			let token_bytes = parse_bytes32_from_hex(token_str)?;
+			let recipient_bytes = parse_bytes32_from_hex(recipient_str)?;
+			let amount = U256::from_str_radix(amount_str, 10)?;
+
+			sol_outputs.push(SolMandateOutput {
+				oracle: oracle_bytes.into(),
+				settler: settler_bytes.into(),
+				chainId: U256::from(chain_id),
+				token: token_bytes.into(),
+				amount,
+				recipient: recipient_bytes.into(),
+				call: Vec::new().into(),
+				context: Vec::new().into(),
+			});
+		}
+
+		// Create the StandardOrder
+		let standard_order = interfaces::StandardOrder {
+			user: user_address,
+			nonce,
+			originChainId: U256::from(origin_chain_id),
+			expires,
+			fillDeadline: fill_deadline,
+			inputOracle: input_oracle,
+			inputs,
+			outputs: sol_outputs,
+		};
+
+		tracing::info!(
+			"Successfully created StandardOrder from BatchCompact with {} inputs and {} outputs",
+			standard_order.inputs.len(),
+			standard_order.outputs.len()
+		);
+		Ok(standard_order)
+	}
+
 	/// Handle EIP-3009 order conversion
 	fn handle_eip3009_quote_conversion(
 		_quote: &Quote,
@@ -781,179 +985,6 @@ impl interfaces::StandardOrder {
 		};
 
 		Ok(standard_order)
-	}
-
-	/// Handle BatchCompact order conversion for ResourceLock
-	fn handle_batch_compact_quote_conversion(
-		_quote: &Quote,
-		eip712_data: &serde_json::Map<String, serde_json::Value>,
-	) -> Result<Self, Box<dyn std::error::Error>> {
-		use crate::utils::parse_bytes32_from_hex;
-		use alloy_primitives::{Address, U256};
-		use interfaces::SolMandateOutput;
-
-		// build_compact_message always wraps the EIP-712 structure in an 'eip712' field
-		// Extract the eip712 object which contains message and domain
-		let eip712_obj = eip712_data
-			.get("eip712")
-			.and_then(|e| e.as_object())
-			.ok_or("Missing eip712 structure from build_compact_message")?;
-		let message = eip712_obj
-			.get("message")
-			.and_then(|m| m.as_object())
-			.ok_or("Missing message in eip712")?;
-		let domain = eip712_obj
-			.get("domain")
-			.and_then(|d| d.as_object())
-			.ok_or("Missing domain in eip712")?;
-
-		// Extract user (sponsor) address from message
-		let sponsor_str = message
-			.get("sponsor")
-			.and_then(|s| s.as_str())
-			.ok_or("Missing sponsor in BatchCompact message")?;
-		let user_address = Address::from_slice(&hex::decode(sponsor_str.trim_start_matches("0x"))?);
-
-		// Extract origin chain ID from domain
-		let origin_chain_id = domain
-			.get("chainId")
-			.and_then(|c| c.as_str())
-			.and_then(|s| s.parse::<u64>().ok())
-			.map(U256::from)
-			.unwrap_or(U256::from(1));
-
-		// Extract nonce from BatchCompact message
-		let nonce_str = message
-			.get("nonce")
-			.and_then(|n| n.as_str())
-			.ok_or("Missing nonce in BatchCompact message")?;
-		let nonce = U256::from_str_radix(nonce_str, 10)?;
-
-		let mandate = message
-			.get("mandate")
-			.and_then(|m| m.as_object())
-			.ok_or("Missing 'mandate' object in BatchCompact message")?;
-
-		let expires_str = message
-			.get("expires")
-			.and_then(|e| e.as_str())
-			.ok_or("Missing 'expires' in BatchCompact message")?;
-		let expires = expires_str
-			.parse::<u64>()
-			.map_err(|e| format!("Invalid expires: {}", e))? as u32;
-
-		let fill_deadline_str = mandate
-			.get("fillDeadline")
-			.and_then(|f| f.as_str())
-			.ok_or("Missing 'fillDeadline' in mandate")?;
-		let fill_deadline = fill_deadline_str
-			.parse::<u64>()
-			.map_err(|e| format!("Invalid fillDeadline: {}", e))? as u32;
-
-		let input_oracle_str = mandate
-			.get("inputOracle")
-			.and_then(|o| o.as_str())
-			.ok_or("Missing 'inputOracle' in mandate")?;
-		let input_oracle =
-			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
-
-		// Extract from commitments array
-		let commitments = message
-			.get("commitments")
-			.and_then(|c| c.as_array())
-			.ok_or("Missing commitments array in BatchCompact message")?;
-		let first_commitment = commitments
-			.first()
-			.ok_or("Empty commitments array in BatchCompact message")?;
-
-		let input_amount_str = first_commitment
-			.get("amount")
-			.and_then(|a| a.as_str())
-			.ok_or("Missing amount in commitment")?;
-		let input_amount = U256::from_str_radix(input_amount_str, 10)?;
-
-		let input_token_str = first_commitment
-			.get("token")
-			.and_then(|t| t.as_str())
-			.ok_or("Missing token in commitment")?;
-		let input_token =
-			Address::from_slice(&hex::decode(input_token_str.trim_start_matches("0x"))?);
-
-		// For BatchCompact, build TOKEN_ID = lockTag (12 bytes) + token address (20 bytes)
-		let lock_tag_str = first_commitment
-			.get("lockTag")
-			.and_then(|t| t.as_str())
-			.ok_or("Missing lockTag in commitment")?;
-		let lock_tag_hex = lock_tag_str.trim_start_matches("0x");
-		let token_hex = hex::encode(input_token.0 .0);
-		let token_id_hex = format!("{}{}", lock_tag_hex, token_hex);
-		let input_token_u256 = U256::from_str_radix(&token_id_hex, 16)
-			.map_err(|e| format!("Failed to parse TOKEN_ID: {}", e))?;
-
-		let inputs = vec![[input_token_u256, input_amount]];
-
-		// Extract outputs from mandate
-		let outputs_value = mandate.get("outputs").ok_or("Missing outputs in mandate")?;
-		let mut sol_outputs = Vec::new();
-
-		if let Some(outputs_array) = outputs_value.as_array() {
-			for output_item in outputs_array {
-				if let Some(output_obj) = output_item.as_object() {
-					let chain_id = output_obj
-						.get("chainId")
-						.and_then(|c| {
-							if let Some(s) = c.as_str() {
-								s.parse::<u64>().ok()
-							} else {
-								c.as_u64()
-							}
-						})
-						.unwrap_or(0);
-					let amount_str = output_obj
-						.get("amount")
-						.and_then(|a| a.as_str())
-						.unwrap_or("0");
-					let token_str = output_obj.get("token").and_then(|t| t.as_str()).unwrap();
-					let recipient_str = output_obj
-						.get("recipient")
-						.and_then(|r| r.as_str())
-						.unwrap();
-					let oracle_str = output_obj.get("oracle").and_then(|o| o.as_str()).unwrap();
-					let settler_str = output_obj.get("settler").and_then(|s| s.as_str()).unwrap();
-
-					if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
-						let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
-						let recipient_bytes =
-							parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
-						let oracle_bytes = parse_bytes32_from_hex(oracle_str).unwrap_or([0u8; 32]);
-						let settler_bytes =
-							parse_bytes32_from_hex(settler_str).unwrap_or([0u8; 32]);
-
-						sol_outputs.push(SolMandateOutput {
-							oracle: oracle_bytes.into(),
-							settler: settler_bytes.into(),
-							chainId: U256::from(chain_id),
-							token: token_bytes.into(),
-							amount,
-							recipient: recipient_bytes.into(),
-							call: Vec::new().into(),
-							context: Vec::new().into(),
-						});
-					}
-				}
-			}
-		}
-
-		Ok(interfaces::StandardOrder {
-			user: user_address,
-			nonce,
-			originChainId: origin_chain_id,
-			expires,
-			fillDeadline: fill_deadline,
-			inputOracle: input_oracle,
-			inputs,
-			outputs: sol_outputs,
-		})
 	}
 }
 
