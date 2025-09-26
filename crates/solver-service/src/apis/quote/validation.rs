@@ -17,8 +17,8 @@ use alloy_primitives::{Address as AlloyAddress, U256};
 use futures::future::try_join_all;
 use solver_core::SolverEngine;
 use solver_types::{
-	AuthScheme, GetQuoteRequest, IntentRequest, IntentType, InteropAddress, QuoteError, SwapType,
-	ValidatedQuoteContext,
+	AuthScheme, CostContext, GetQuoteRequest, IntentRequest, IntentType, InteropAddress,
+	QuoteError, SwapType, ValidatedQuoteContext,
 };
 
 /// Main validator for quote requests.
@@ -364,106 +364,138 @@ impl QuoteValidator {
 		Ok((chain_id, evm_addr))
 	}
 
-	/// Collects and validates supported input assets from the request.
+	/// Validates and collects input assets using calculated swap amounts from cost context.
 	///
-	/// Filters the provided available inputs to include only those tokens that are
-	/// configured and supported by the solver. This creates a validated subset
-	/// for use in subsequent processing stages.
+	/// Uses the pre-calculated swap amounts from the cost context which represent the
+	/// actual amounts needed for the swap. ALL input assets must be supported for
+	/// pricing and execution.
 	///
 	/// # Arguments
 	///
-	/// * `request` - The quote request containing available inputs
-	/// * `solver` - The solver engine with token configuration
+	/// * `request` - The quote request containing inputs
+	/// * `solver` - The solver engine with token configuration  
+	/// * `cost_context` - Contains calculated swap amounts for each asset
 	///
 	/// # Returns
 	///
-	/// A vector of `SupportedAsset` containing only supported inputs.
+	/// A vector of `SupportedAsset` with amounts from cost_context.swap_amounts
 	///
 	/// # Errors
 	///
-	/// Returns `QuoteError::UnsupportedAsset` if no inputs are supported
-	pub fn collect_supported_available_inputs(
+	/// Returns `QuoteError::UnsupportedAsset` if ANY input is not supported
+	pub fn validate_and_collect_inputs_with_costs(
 		request: &GetQuoteRequest,
 		solver: &SolverEngine,
+		cost_context: &CostContext,
 	) -> Result<Vec<SupportedAsset>, QuoteError> {
 		let mut supported_assets = Vec::new();
 
-		for input in &request.intent.inputs {
-			let (chain_id, evm_addr) = Self::extract_chain_and_address(&input.asset)?;
+		for asset_info in &request.intent.inputs {
+			let asset_addr = &asset_info.asset;
+			let (chain_id, evm_addr) = Self::extract_chain_and_address(asset_addr)?;
 
-			let amount_u256 = input
-				.amount_as_u256()
-				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {}", e)))?;
-
-			if Self::is_token_supported(solver, chain_id, &evm_addr) {
-				supported_assets.push(SupportedAsset {
-					asset: input.asset.clone(),
-					amount: amount_u256.unwrap_or_default(),
-				});
+			// ALL assets must be supported for proper pricing
+			if !Self::is_token_supported(solver, chain_id, &evm_addr) {
+				return Err(QuoteError::UnsupportedAsset(format!(
+					"Input token not supported on chain {}: {}",
+					chain_id,
+					alloy_primitives::hex::encode(evm_addr.as_slice())
+				)));
 			}
-		}
 
-		if supported_assets.is_empty() {
-			return Err(QuoteError::UnsupportedAsset(
-				"None of the provided inputs are supported".to_string(),
-			));
+			// Use the swap amount from cost context (the calculated base amount)
+			let amount = cost_context
+				.swap_amounts
+				.get(asset_addr)
+				.copied()
+				.unwrap_or_else(|| {
+					// Fallback to request amount if not in cost context
+					asset_info
+						.amount_as_u256()
+						.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {}", e)))
+						.ok()
+						.flatten()
+						.unwrap_or_default()
+				});
+
+			supported_assets.push(SupportedAsset {
+				asset: asset_addr.clone(),
+				amount,
+			});
 		}
 
 		Ok(supported_assets)
 	}
 
-	/// Validates and collects all requested output assets.
+	/// Validates and collects output assets using calculated swap amounts from cost context.
 	///
-	/// Unlike input validation which allows partial support, this method requires
-	/// ALL requested outputs to be supported by the solver. This ensures the solver
-	/// can fulfill the complete quote request.
+	/// Uses the pre-calculated swap amounts from the cost context which represent the
+	/// actual amounts needed for the swap. ALL output assets must be supported for
+	/// pricing and execution.
 	///
 	/// # Arguments
 	///
-	/// * `request` - The quote request containing requested outputs
+	/// * `request` - The quote request containing outputs
 	/// * `solver` - The solver engine with token configuration
+	/// * `cost_context` - Contains calculated swap amounts for each asset
 	///
 	/// # Returns
 	///
-	/// A vector of `SupportedAsset` containing all validated outputs.
+	/// A vector of `SupportedAsset` with amounts from cost_context.swap_amounts
 	///
 	/// # Errors
 	///
-	/// Returns `QuoteError::UnsupportedAsset` if any output is not supported
-	pub fn validate_and_collect_requested_outputs(
+	/// Returns `QuoteError::UnsupportedAsset` if ANY output is not supported
+	pub fn validate_and_collect_outputs_with_costs(
 		request: &GetQuoteRequest,
 		solver: &SolverEngine,
+		cost_context: &CostContext,
 	) -> Result<Vec<SupportedAsset>, QuoteError> {
-		let mut supported_outputs = Vec::new();
+		let mut supported_assets = Vec::new();
 
-		for output in &request.intent.outputs {
-			let (chain_id, evm_addr) = Self::extract_chain_and_address(&output.asset)?;
+		for asset_info in &request.intent.outputs {
+			let asset_addr = &asset_info.asset;
+			let (chain_id, evm_addr) = Self::extract_chain_and_address(asset_addr)?;
 
+			// ALL assets must be supported for proper pricing
 			if !Self::is_token_supported(solver, chain_id, &evm_addr) {
 				return Err(QuoteError::UnsupportedAsset(format!(
-					"Requested output token not supported on chain {}",
-					chain_id
+					"Output token not supported on chain {}: {}",
+					chain_id,
+					alloy_primitives::hex::encode(evm_addr.as_slice())
 				)));
 			}
 
-			let amount_u256 = output
-				.amount_as_u256()
-				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {}", e)))?;
+			// Use the swap amount from cost context (the calculated base amount)
+			let amount = cost_context
+				.swap_amounts
+				.get(asset_addr)
+				.copied()
+				.unwrap_or_else(|| {
+					// Fallback to request amount if not in cost context
+					asset_info
+						.amount_as_u256()
+						.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {}", e)))
+						.ok()
+						.flatten()
+						.unwrap_or_default()
+				});
 
-			supported_outputs.push(SupportedAsset {
-				asset: output.asset.clone(),
-				amount: amount_u256.unwrap_or_default(),
+			supported_assets.push(SupportedAsset {
+				asset: asset_addr.clone(),
+				amount,
 			});
 		}
 
-		Ok(supported_outputs)
+		Ok(supported_assets)
 	}
 
 	/// Ensures the solver has sufficient balance for all requested destination outputs.
 	///
 	/// Performs parallel balance checks for all output tokens to verify the solver
-	/// has enough liquidity to fulfill the quote. This is a critical pre-flight
-	/// check to prevent quote generation for unfulfillable requests.
+	/// has enough liquidity to fulfill the quote. For ExactInput swaps, this should
+	/// be called with cost-adjusted output amounts. For ExactOutput swaps, the amounts
+	/// remain unchanged.
 	///
 	/// # Performance
 	///
@@ -473,15 +505,19 @@ impl QuoteValidator {
 	/// # Arguments
 	///
 	/// * `solver` - The solver engine with token manager
-	/// * `outputs` - The validated output assets to check
+	/// * `outputs` - The validated output assets with cost-adjusted amounts
+	/// * `context` - The validated quote context to determine swap type
+	/// * `cost_context` - Contains cost amounts for adjusting output requirements
 	///
 	/// # Errors
 	///
 	/// Returns `QuoteError::InsufficientLiquidity` if any balance is insufficient.
 	/// Returns `QuoteError::Internal` if balance checks fail or parsing errors occur.
-	pub async fn ensure_destination_balances(
+	pub async fn ensure_destination_balances_with_costs(
 		solver: &SolverEngine,
 		outputs: &[SupportedAsset],
+		context: &ValidatedQuoteContext,
+		cost_context: &CostContext,
 	) -> Result<(), QuoteError> {
 		let token_manager = solver.token_manager();
 
@@ -500,11 +536,35 @@ impl QuoteValidator {
 				let balance = U256::from_str_radix(&balance_str, 10)
 					.map_err(|e| QuoteError::Internal(format!("Failed to parse balance: {}", e)))?;
 
-				if balance < output.amount {
+				// For ExactInput swaps, adjust the required amount by subtracting costs
+				let required_amount = if matches!(context.swap_type, SwapType::ExactInput) {
+					// Check if this is the first output (which bears the cost)
+					let is_first = outputs
+						.first()
+						.map(|first| first.asset == output.asset)
+						.unwrap_or(false);
+
+					if is_first {
+						// First output: subtract costs from the base amount
+						let cost_in_token = cost_context
+							.cost_amounts_in_tokens
+							.get(&output.asset)
+							.copied()
+							.unwrap_or(U256::ZERO);
+						output.amount.saturating_sub(cost_in_token)
+					} else {
+						output.amount
+					}
+				} else {
+					// For ExactOutput, amounts remain unchanged
+					output.amount
+				};
+
+				if balance < required_amount {
 					let token_hex = alloy_primitives::hex::encode(evm_addr.as_slice());
 					tracing::error!(
 						chain_id = chain_id,
-						required = %output.amount,
+						required = %required_amount,
 						available = %balance,
 						token = %token_hex,
 						"Insufficient destination balance",
@@ -513,7 +573,7 @@ impl QuoteValidator {
 				} else {
 					tracing::debug!(
 						chain_id = chain_id,
-						required = %output.amount,
+						required = %required_amount,
 						available = %balance,
 						token = %alloy_primitives::hex::encode(evm_addr.as_slice()),
 						"Sufficient destination balance"
@@ -526,6 +586,7 @@ impl QuoteValidator {
 
 		// Execute all balance checks in parallel
 		try_join_all(balance_checks).await?;
+
 		Ok(())
 	}
 }

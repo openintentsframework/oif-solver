@@ -73,7 +73,7 @@ pub use generation::QuoteGenerator;
 pub use signing::payloads::permit2;
 pub use validation::QuoteValidator;
 
-use solver_config::{Config, QuoteConfig};
+use solver_config::Config;
 use solver_core::SolverEngine;
 use solver_types::{GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, StorageKey};
 
@@ -111,14 +111,26 @@ pub async fn process_quote_request(
 	// Check solver capabilities: networks only (token support is enforced during collection below)
 	QuoteValidator::validate_supported_networks(&request, solver)?;
 
-	// Collect supported assets for this request (for later use: balances/custody/pricing)
-	let (_supported_inputs, supported_outputs) = (
-		QuoteValidator::collect_supported_available_inputs(&request, solver)?,
-		QuoteValidator::validate_and_collect_requested_outputs(&request, solver)?,
-	);
+	// Validate and collect assets with cost-adjusted amounts
+	let _supported_inputs = QuoteValidator::validate_and_collect_inputs_with_costs(
+		&request,
+		solver,
+		&cost_context,
+	)?;
 
-	// Check destination balances for required outputs
-	QuoteValidator::ensure_destination_balances(solver, &supported_outputs).await?;
+	let supported_outputs = QuoteValidator::validate_and_collect_outputs_with_costs(
+		&request,
+		solver,
+		&cost_context,
+	)?;
+
+	// Check destination balances for cost-adjusted output amounts
+	QuoteValidator::ensure_destination_balances_with_costs(
+		solver,
+		&supported_outputs,
+		&validated_context,
+		&cost_context,
+	).await?;
 
 	// Generate quotes using the business logic layer with embedded costs
 	let settlement_service = solver.settlement();
@@ -130,27 +142,32 @@ pub async fn process_quote_request(
 		.await?;
 
 	// Persist quotes
-	let validity_seconds = config
-		.api
-		.as_ref()
-		.and_then(|api| api.quote.as_ref())
-		.map(|quote| quote.validity_seconds)
-		.unwrap_or_else(|| QuoteConfig::default().validity_seconds);
-	let quote_ttl = Duration::from_secs(validity_seconds);
-	store_quotes(solver, &quotes, quote_ttl).await;
+	store_quotes(solver, &quotes).await;
 
 	info!("Generated and stored {} quote options", quotes.len());
 
 	Ok(GetQuoteResponse { quotes })
 }
 
-/// Stores generated quotes with a given TTL.
+/// Stores generated quotes with TTL based on their valid_until timestamp.
 ///
 /// Storage errors are logged but do not fail the request.
-async fn store_quotes(solver: &SolverEngine, quotes: &[Quote], ttl: Duration) {
+async fn store_quotes(solver: &SolverEngine, quotes: &[Quote]) {
 	let storage = solver.storage();
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_secs();
 
 	for quote in quotes {
+		// Calculate TTL from valid_until timestamp
+		let ttl = if quote.valid_until > now {
+			Duration::from_secs(quote.valid_until - now)
+		} else {
+			// Quote is already expired, store with minimal TTL
+			Duration::from_secs(1)
+		};
+
 		if let Err(e) = storage
 			.store_with_ttl(
 				StorageKey::Quotes.as_str(),
@@ -163,7 +180,12 @@ async fn store_quotes(solver: &SolverEngine, quotes: &[Quote], ttl: Duration) {
 		{
 			tracing::warn!("Failed to store quote {}: {}", quote.quote_id, e);
 		} else {
-			tracing::debug!("Stored quote {} with TTL {:?}", quote.quote_id, ttl);
+			tracing::debug!(
+				"Stored quote {} with TTL {:?} (valid_until: {})",
+				quote.quote_id,
+				ttl,
+				quote.valid_until
+			);
 		}
 	}
 }
