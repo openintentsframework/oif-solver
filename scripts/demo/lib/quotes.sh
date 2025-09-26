@@ -778,30 +778,43 @@ quote_accept() {
         fi
         print_debug "User key found, determining order type..."
 
-        # Read the original quote request to get originSubmission data
-        local quote_req_file="${OUTPUT_DIR:-./demo-output}/get_quote.req.json"
-        local origin_submission_data=""
-        local scheme_type="permit2"  # default fallback
+        # Extract primaryType first to determine order type
+        local primary_type=$(echo "$order_payload" | jq -r '.primaryType // empty')
+        local full_message=$(echo "$order_payload" | jq -r '.message // empty')
         
-        if [ -f "$quote_req_file" ]; then
-            origin_submission_data=$(cat "$quote_req_file" | jq -r '.intent.originSubmission // empty')
-            if [ -n "$origin_submission_data" ] && [ "$origin_submission_data" != "null" ] && [ "$origin_submission_data" != "empty" ]; then
-                # Extract the first scheme from the schemes array
-                scheme_type=$(echo "$origin_submission_data" | jq -r '.schemes[0] // "permit2"')
-                print_debug "Using scheme from original request: $scheme_type"
+        print_debug "Order primaryType: $primary_type"
+        
+        # Determine signature type based on order type
+        local signature_type=""
+        local origin_submission_data=""
+        
+        if [ "$primary_type" = "CompactLock" ]; then
+            # CompactLock orders use BatchCompact signature, no auth scheme
+            signature_type="compact"
+            print_debug "Detected CompactLock order, using compact signature type"
+            # Don't set origin_submission_data for compact
+        else
+            # For non-compact orders, read the original quote request to get originSubmission data
+            local quote_req_file="${OUTPUT_DIR:-./demo-output}/get_quote.req.json"
+            local scheme_type="permit2"  # default fallback for non-compact
+            
+            if [ -f "$quote_req_file" ]; then
+                origin_submission_data=$(cat "$quote_req_file" | jq -r '.intent.originSubmission // empty')
+                if [ -n "$origin_submission_data" ] && [ "$origin_submission_data" != "null" ] && [ "$origin_submission_data" != "empty" ]; then
+                    # Extract the first scheme from the schemes array
+                    scheme_type=$(echo "$origin_submission_data" | jq -r '.schemes[0] // "permit2"')
+                    print_debug "Using scheme from original request: $scheme_type"
+                else
+                    print_debug "No originSubmission found in original request, using default: permit2"
+                    origin_submission_data='{"mode": "user", "schemes": ["permit2"]}'
+                fi
             else
-                print_debug "No originSubmission found in original request, using default: permit2"
+                print_debug "Original quote request file not found: $quote_req_file, using default originSubmission"
                 origin_submission_data='{"mode": "user", "schemes": ["permit2"]}'
             fi
-        else
-            print_debug "Original quote request file not found: $quote_req_file, using default originSubmission"
-            origin_submission_data='{"mode": "user", "schemes": ["permit2"]}'
+            
+            signature_type="$scheme_type"
         fi
-
-        # Extract the full message object and use scheme_type as signature type
-        local full_message=$(echo "$order_payload" | jq -r '.message // empty')
-        local signature_type="$scheme_type"
-        local primary_type=$(echo "$order_payload" | jq -r '.primaryType // empty')
         
         if [ -z "$full_message" ] || [ "$full_message" = "null" ]; then
             print_error "No message found in order"
@@ -811,7 +824,26 @@ quote_accept() {
         print_debug "Signature type: $signature_type, Primary type: $primary_type"
         local signature=""
 
-        if [ "$signature_type" = "eip3009" ] || [ "$signature_type" = "eip-3009" ]; then
+        if [ "$signature_type" = "compact" ]; then
+            print_info "Signing BatchCompact order..."
+            
+            # For CompactLock, the actual EIP-712 data is nested in message.eip712
+            local eip712_data=$(echo "$full_message" | jq '.eip712 // empty')
+            if [ -z "$eip712_data" ] || [ "$eip712_data" = "null" ] || [ "$eip712_data" = "empty" ]; then
+                print_error "No eip712 data found in CompactLock message"
+                return 1
+            fi
+            
+            # Use compact-specific digest computation with the nested eip712 data
+            signature=$(sign_compact_digest_from_quote "$user_key" "$eip712_data")
+            if [ $? -ne 0 ] || [ -z "$signature" ]; then
+                print_error "Failed to sign BatchCompact order"
+                return 1
+            fi
+            
+            print_success "BatchCompact order signed successfully"
+            
+        elif [ "$signature_type" = "eip3009" ] || [ "$signature_type" = "eip-3009" ]; then
             print_info "Signing EIP-3009 order..."
 
             # Check if this is a multi-signature order
