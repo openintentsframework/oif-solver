@@ -406,7 +406,6 @@ async fn validate_intent_request(
 	state: &AppState,
 	standard: &str,
 ) -> Result<Order, APIError> {
-	tracing::info!("Starting intent validation for standard: {}", standard);
 	// Get the order bytes (already in Bytes format from PostOrderRequest)
 	let order_bytes = &intent.order;
 
