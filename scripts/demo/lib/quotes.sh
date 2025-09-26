@@ -864,7 +864,7 @@ quote_accept() {
                     local sig_message=$(echo "$signatures_array" | jq -r ".[$i]")
 
                     # Parse domain from structured format
-                    local domain_data=$(echo "$order_data" | jq -r '.domain // empty')
+                    local domain_data=$(echo "$order_payload" | jq '.domain // empty')
                     local origin_chain_id=""
                     local token_contract=""
                     
@@ -944,7 +944,7 @@ quote_accept() {
                 print_info "Processing single EIP-3009 signature..."
 
                 # Parse domain from structured format
-                local domain_data=$(echo "$order_data" | jq -r '.domain // empty')
+                local domain_data=$(echo "$order_payload" | jq '.domain // empty')
                 local origin_chain_id=""
                 local token_contract=""
                 
@@ -1129,18 +1129,34 @@ quote_accept() {
         
         print_debug "Signature: $signature"
         
-        # Create submission payload with quoteId, order, and originSubmission
-        local submission_json=$(jq -n \
-            --arg quoteId "$quote_id" \
-            --arg signature "$signature" \
-            --argjson order "$order_data" \
-            --argjson originSubmission "$origin_submission_data" \
-            '{
-                order: $order,
-                signature: [$signature],
-                quoteId: $quoteId,
-                originSubmission: $originSubmission
-            }')
+        # Create submission payload
+        # For compact orders, don't include originSubmission
+        local submission_json=""
+        if [ "$signature_type" = "compact" ] || [ -z "$origin_submission_data" ]; then
+            # Compact orders or when no originSubmission data
+            submission_json=$(jq -n \
+                --arg quoteId "$quote_id" \
+                --arg signature "$signature" \
+                --argjson order "$order_data" \
+                '{
+                    order: $order,
+                    signature: [$signature],
+                    quoteId: $quoteId
+                }')
+        else
+            # Include originSubmission for permit2/eip3009 orders
+            submission_json=$(jq -n \
+                --arg quoteId "$quote_id" \
+                --arg signature "$signature" \
+                --argjson order "$order_data" \
+                --argjson originSubmission "$origin_submission_data" \
+                '{
+                    order: $order,
+                    signature: [$signature],
+                    quoteId: $quoteId,
+                    originSubmission: $originSubmission
+                }')
+        fi
         
         # Save request to file
         local request_file="${OUTPUT_DIR:-./demo-output}/post_quote.req.json"
