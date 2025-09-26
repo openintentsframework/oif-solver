@@ -564,64 +564,47 @@ quote_get() {
     local has_signature=$(echo "$intent_json" | jq 'has("signature")')
     
     if [ "$has_order" = "true" ] && [ "$has_signature" = "true" ]; then
-        print_error "File contains a signed order, not a quote request intent"
-        print_info "A quote request intent should have the following structure:"
+        print_error "File contains a signed order, not a quote request"
+        print_info "A GetQuoteRequest should have the following structure:"
         print_info '  {
-    "user": "chain_id:user_address",
-    "inputs": [
-      {
-        "user": "chain_id:user_address",
-        "asset": "chain_id:token_address",
-        "amount": "amount_in_wei"
-      }
-    ],
-    "outputs": [
-      {
-        "receiver": "chain_id:recipient_address",
-        "asset": "chain_id:token_address",
-        "amount": "amount_in_wei"
-      }
-    ]
+    "user": "0x...",
+    "intent": {
+      "intentType": "oif-swap",
+      "inputs": [...],
+      "outputs": [...],
+      "swapType": "exact-input",
+      ...
+    },
+    "supportedTypes": [...]
   }'
-        print_info ""
-        print_info "Example: Create a quote request for swapping 1 TokenA on chain 31337 to 1 TokenA on chain 31338"
-        print_info "Or run without arguments to use default test values: oif-demo quote get"
         return 1
     fi
     
-    # Convert intent to quote request format
-    # Extract key fields from intent for quote request
-    local user=$(echo "$intent_json" | jq -r '.user // empty')
-    local inputs=$(echo "$intent_json" | jq -c '.inputs // .availableInputs // []')
-    local outputs=$(echo "$intent_json" | jq -c '.outputs // .requestedOutputs // []')
+    # Validate required fields for new format
+    local has_intent=$(echo "$intent_json" | jq 'has("intent")')
+    local has_user=$(echo "$intent_json" | jq 'has("user")')
+    local has_supported_types=$(echo "$intent_json" | jq 'has("supportedTypes")')
     
-    if [ -z "$user" ] || [ "$user" = "null" ]; then
-        # Try to extract from sponsor field if present
-        local sponsor=$(echo "$intent_json" | jq -r '.sponsor // empty')
-        if [ -n "$sponsor" ] && [ "$sponsor" != "null" ]; then
-            # Assume origin chain for sponsor
-            user="31337:$sponsor"
-            print_info "Using sponsor as user: $user"
-        else
-            print_error "Intent missing 'user' field"
-            print_info "The intent file should contain a 'user' field in the format 'chain_id:address'"
-            print_info "Example: \"user\": \"31337:0x70997970C51812dc3A010C7d01b50e0d17dc79C8\""
-            return 1
-        fi
+    if [ "$has_intent" != "true" ] || [ "$has_user" != "true" ] || [ "$has_supported_types" != "true" ]; then
+        print_error "Invalid GetQuoteRequest format. Missing required fields."
+        print_info "Required fields: user, intent, supportedTypes"
+        print_info "Example structure:"
+        print_info '  {
+    "user": "0x...",
+    "intent": {
+      "intentType": "oif-swap",
+      "inputs": [...],
+      "outputs": [...]
+    },
+    "supportedTypes": [...]
+  }'
+        return 1
     fi
     
-    # Build quote request from intent
-    local quote_request=$(jq -n \
-        --arg user "$user" \
-        --argjson inputs "$inputs" \
-        --argjson outputs "$outputs" \
-        '{
-            user: $user,
-            availableInputs: $inputs,
-            requestedOutputs: $outputs,
-            preference: "speed",
-            minValidUntil: 600
-        }')
+    print_info "Using GetQuoteRequest format"
+    
+    # Use the JSON as-is (new format)
+    local quote_request="$intent_json"
     
     # Request quote
     if request_quote "$quote_request" "$api_url"; then
