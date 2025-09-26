@@ -773,7 +773,6 @@ impl PostOrderRequest {
 		// 2. Recover the real user address from the signature
 		let recovered_user =
 			crate::utils::eip712::ecrecover_user_from_signature(&digest, signature)?;
-		tracing::info!("Recovered user address from signature: {}", recovered_user);
 
 		// 3. Clone quote to make it mutable and inject recovered user
 		let mut quote_clone = quote.clone();
