@@ -93,17 +93,29 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 		let signature_validator = compact::create_signature_validator();
 
 		// 1. Get domain separator from TheCompact contract
+		tracing::info!(
+			"Getting domain separator from TheCompact contract at {}",
+			the_compact_address
+		);
 		let domain_separator =
 			get_domain_separator(delivery_service, the_compact_address, origin_chain_id).await?;
+		tracing::info!(
+			"Domain separator retrieved: 0x{}",
+			hex::encode(domain_separator)
+		);
 
 		// 2. Compute message hash using interface
-
+		tracing::info!("Computing message hash for TheCompact order");
 		let struct_hash = message_hasher.compute_message_hash(&intent.order, contract_address)?;
+		tracing::info!("Message hash computed: 0x{}", hex::encode(struct_hash));
 
 		// 3. Extract signature using interface
+		tracing::info!("Extracting signature from intent");
 		let signature = signature_validator.extract_signature(&intent.signature);
+		tracing::info!("Signature extracted: 0x{}", hex::encode(&signature));
 
 		// 4. Validate EIP-712 signature using interface
+		tracing::info!("Validating EIP-712 signature");
 		let expected_signer = standard_order.user;
 
 		let is_valid = signature_validator.validate_signature(
@@ -112,14 +124,22 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 			&signature,
 			expected_signer,
 		)?;
+		tracing::info!(
+			"Signature validation result: {}, expected signer: {}",
+			is_valid,
+			expected_signer
+		);
 
 		if !is_valid {
+			tracing::error!("TheCompact signature validation failed");
 			return Err(APIError::BadRequest {
 				error_type: ApiErrorType::OrderValidationFailed,
 				message: "Invalid EIP-712 signature".to_string(),
 				details: None,
 			});
 		}
+
+		tracing::info!("TheCompact signature validation completed successfully");
 		Ok(())
 	}
 }

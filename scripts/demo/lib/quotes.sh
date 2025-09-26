@@ -767,6 +767,10 @@ quote_accept() {
             return 1
         fi
         
+        # Extract primary type for order type detection
+        local primary_type=$(echo "$order_payload" | jq -r '.primaryType // empty')
+        print_debug "Detected primary type: $primary_type"
+        
         print_debug "Order data is valid, proceeding to get user key..."
         
         # Get user's private key from config
@@ -783,19 +787,41 @@ quote_accept() {
         local origin_submission_data=""
         local scheme_type="permit2"  # default fallback
         
+        # Detect order type to determine correct scheme
+        if [ "$primary_type" = "CompactLock" ]; then
+            scheme_type="compact"
+            print_debug "Detected TheCompact order, using scheme: compact"
+        fi
+        
         if [ -f "$quote_req_file" ]; then
             origin_submission_data=$(cat "$quote_req_file" | jq -r '.intent.originSubmission // empty')
             if [ -n "$origin_submission_data" ] && [ "$origin_submission_data" != "null" ] && [ "$origin_submission_data" != "empty" ]; then
-                # Extract the first scheme from the schemes array
-                scheme_type=$(echo "$origin_submission_data" | jq -r '.schemes[0] // "permit2"')
-                print_debug "Using scheme from original request: $scheme_type"
+                # Extract the first scheme from the schemes array, but override for TheCompact
+                if [ "$primary_type" = "CompactLock" ]; then
+                    scheme_type="compact"
+                    origin_submission_data='{"mode": "user", "schemes": ["compact"]}'
+                    print_debug "Overriding scheme for TheCompact: compact"
+                else
+                    scheme_type=$(echo "$origin_submission_data" | jq -r '.schemes[0] // "permit2"')
+                    print_debug "Using scheme from original request: $scheme_type"
+                fi
             else
-                print_debug "No originSubmission found in original request, using default: permit2"
-                origin_submission_data='{"mode": "user", "schemes": ["permit2"]}'
+                if [ "$primary_type" = "CompactLock" ]; then
+                    print_debug "No originSubmission found, using TheCompact default: compact"
+                    origin_submission_data='{"mode": "user", "schemes": ["compact"]}'
+                else
+                    print_debug "No originSubmission found in original request, using default: permit2"
+                    origin_submission_data='{"mode": "user", "schemes": ["permit2"]}'
+                fi
             fi
         else
-            print_debug "Original quote request file not found: $quote_req_file, using default originSubmission"
-            origin_submission_data='{"mode": "user", "schemes": ["permit2"]}'
+            if [ "$primary_type" = "CompactLock" ]; then
+                print_debug "Quote request file not found, using TheCompact default: compact"
+                origin_submission_data='{"mode": "user", "schemes": ["compact"]}'
+            else
+                print_debug "Original quote request file not found: $quote_req_file, using default originSubmission"
+                origin_submission_data='{"mode": "user", "schemes": ["permit2"]}'
+            fi
         fi
 
         # Extract the full message object and use scheme_type as signature type
@@ -1036,12 +1062,49 @@ quote_accept() {
                     return 1
                 fi
 
-                # Add EIP-3009 prefix to signature (like in intent flow)
+                # Add EIP-3009 prefix to signature 
                 signature=$(create_prefixed_signature "$signature" "eip3009")
 
                 print_success "EIP-3009 order signed successfully"
             fi
             
+        elif [ "$primary_type" = "CompactLock" ] || [ "$signature_type" = "compact" ]; then
+            print_info "Signing TheCompact order..."
+
+            # Extract eip712 data from message for digest computation  
+            local eip712_data=$(echo "$full_message" | jq -r '.eip712 // empty')
+            if [ -z "$eip712_data" ] || [ "$eip712_data" = "null" ] || [ "$eip712_data" = "empty" ]; then
+                print_error "No eip712 data found in TheCompact message"
+                return 1
+            fi
+            
+            # Compute client-side digest for TheCompact
+            print_info "Computing client-side digest..."
+            local client_digest=$(compute_compact_digest_from_quote "$eip712_data")
+            if [ $? -ne 0 ] || [ -z "$client_digest" ]; then
+                print_error "Failed to compute client-side digest"
+                return 1
+            fi
+            print_debug "Client computed digest: $client_digest"
+            print_info "Signing with client-computed digest: $client_digest"
+
+            # Sign the digest directly (no-hash since we have the digest)
+            local raw_signature=$(cast wallet sign --no-hash --private-key "$user_key" "$client_digest")
+            if [ $? -ne 0 ] || [ -z "$raw_signature" ]; then
+                print_error "Failed to sign TheCompact digest"
+                return 1
+            fi
+
+            # Create prefixed signature for compact
+            signature=$(create_prefixed_signature "$raw_signature" "compact")
+            if [ -z "$signature" ]; then
+                print_error "Failed to create prefixed TheCompact signature"
+                return 1
+            fi
+
+            print_success "TheCompact signature generated with client-side digest"
+            print_success "TheCompact order signed"
+
         elif [ "$signature_type" = "permit2" ]; then
             print_info "Signing Permit2 order..."
 

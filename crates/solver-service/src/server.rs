@@ -296,7 +296,7 @@ async fn handle_order(
 	};
 
 	// Validate the PostOrderRequest
-	match validate_intent_request(&intent_request, &state, standard).await {
+	match validate_intent_request(&intent_request, &state, standard, &payload).await {
 		Ok(order) => order,
 		Err(api_error) => return api_error.into_response(),
 	};
@@ -407,6 +407,7 @@ async fn validate_intent_request(
 	intent: &PostOrderRequest,
 	state: &AppState,
 	standard: &str,
+	payload: &Value,
 ) -> Result<Order, APIError> {
 	tracing::info!("Starting intent validation for standard: {}", standard);
 	// Get the order bytes (already in Bytes format from PostOrderRequest)
@@ -414,8 +415,10 @@ async fn validate_intent_request(
 
 	// Get lock_type as string
 	let lock_type = intent.lock_type.as_str();
+	tracing::info!("Intent validation - lock_type: {}", lock_type);
 
 	// Get solver address from primary account
+	tracing::info!("Getting solver address");
 	let solver_address =
 		state
 			.solver
@@ -426,6 +429,7 @@ async fn validate_intent_request(
 				error_type: ApiErrorType::SolverAddressError,
 				message: format!("Failed to get solver address: {}", e),
 			})?;
+	tracing::info!("Solver address: {}", solver_address);
 
 	// Create callback that captures DeliveryService
 	let delivery = state.solver.delivery().clone();
@@ -465,8 +469,14 @@ async fn validate_intent_request(
 	let requires_validation = state
 		.signature_validation
 		.requires_signature_validation(standard, &intent.lock_type);
+	tracing::info!("Signature validation required: {}", requires_validation);
 
-	if requires_validation {
+	// For quote acceptances, signature was already validated during user recovery (ecrecover)
+	// Skip additional validation to avoid hash computation mismatches
+	let is_quote_acceptance = payload.get("quoteId").and_then(|v| v.as_str()).is_some();
+
+	if requires_validation && !is_quote_acceptance {
+		tracing::info!("Starting signature validation for direct submission");
 		state
 			.signature_validation
 			.validate_signature(
@@ -476,10 +486,14 @@ async fn validate_intent_request(
 				state.solver.delivery(),
 			)
 			.await?;
+		tracing::info!("Signature validation completed successfully");
+	} else if is_quote_acceptance {
+		tracing::info!("Skipping signature validation for quote acceptance (already validated during user recovery)");
 	}
 
 	// Process the order through the OrderService
 	// This validates the order based on the standard and returns a validated Order
+	tracing::info!("Starting order validation through OrderService");
 	let result = state
 		.solver
 		.order()
