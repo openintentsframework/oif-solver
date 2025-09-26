@@ -510,7 +510,6 @@ async fn forward_to_discovery_service(
 	state: &AppState,
 	intent: &PostOrderRequest,
 ) -> axum::response::Response {
-	tracing::info!("Forwarding validated intent to discovery service");
 	// Check if discovery URL is configured
 	let forward_url = match &state.discovery_url {
 		Some(url) => url,
