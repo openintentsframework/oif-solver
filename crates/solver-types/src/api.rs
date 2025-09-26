@@ -776,13 +776,16 @@ impl PostOrderRequest {
 
 		// 3. Clone quote to make it mutable and inject recovered user
 		let mut quote_clone = quote.clone();
-		if let OifOrder::OifEscrowV0 { payload } = &mut quote_clone.order {
-			if let Some(message_obj) = payload.message.as_object_mut() {
-				message_obj.insert(
-					"user".to_string(),
-					serde_json::Value::String(recovered_user.to_string()),
-				); // workaround because StandardOrder::try_from does not handle the user field
-			}
+		match &mut quote_clone.order {
+			OifOrder::OifEscrowV0 { payload } => {
+				if let Some(message_obj) = payload.message.as_object_mut() {
+					message_obj.insert(
+						"user".to_string(),
+						serde_json::Value::String(recovered_user.to_string()),
+					); // workaround because StandardOrder::try_from does not handle the user field
+				}
+			},
+			_ => {}, // No user injection needed for other order types
 		}
 		// 4. Use the unified TryFrom implementation with the modified quote
 		let sol_order = StandardOrder::try_from(&quote_clone)?;
@@ -794,7 +797,6 @@ impl PostOrderRequest {
 		let lock_type = LockType::from(&quote.order);
 
 		// Create final PostOrderRequest
-		tracing::debug!("Creating PostOrderRequest with lock_type: {:?}", lock_type);
 		let signature_bytes = Bytes::from(hex::decode(signature.trim_start_matches("0x"))?);
 		Ok(PostOrderRequest {
 			order: Bytes::from(encoded_order),
