@@ -568,11 +568,6 @@ impl interfaces::StandardOrder {
 			outputs: sol_outputs,
 		};
 
-		tracing::info!(
-			"Successfully created StandardOrder with {} inputs and {} outputs",
-			standard_order.inputs.len(),
-			standard_order.outputs.len()
-		);
 		Ok(standard_order)
 	}
 
