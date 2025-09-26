@@ -1250,18 +1250,40 @@ quote_accept() {
 }
 
 quote_test() {
-    local intent_type="${1:-escrow}"
+    local swap_type="exact-input"  # Default swap type
+    local intent_type=""
     local auth_type=""
     local token_pair=""
     
-    # Parse arguments based on intent type
+    # Parse arguments to detect flags
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --exact-input)
+                swap_type="exact-input"
+                shift
+                ;;
+            --exact-output)
+                swap_type="exact-output"
+                shift
+                ;;
+            *)
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+    
+    # Now parse positional arguments from args array
+    intent_type="${args[0]:-escrow}"
+    
     if [ "$intent_type" = "compact" ]; then
         # Compact: no auth type needed
-        token_pair="${2:-A2B}"
+        token_pair="${args[1]:-A2B}"
     else
         # Escrow: auth type required
-        auth_type="${2:-permit2}"
-        token_pair="${3:-A2B}"
+        auth_type="${args[1]:-permit2}"
+        token_pair="${args[2]:-A2B}"
         
         # Validate auth type for escrow
         if [[ "$auth_type" != "permit2" && "$auth_type" != "eip3009" ]]; then
@@ -1320,23 +1342,33 @@ quote_test() {
     
     # Build header based on intent type
     if [ "$intent_type" = "compact" ]; then
-        print_header "Testing quote flow: compact (BatchCompact), ${from_token} → ${to_token}"
+        print_header "Testing quote flow: compact (BatchCompact), ${from_token} → ${to_token} (${swap_type})"
     else
-        print_header "Testing quote flow: ${intent_type} with ${auth_type} auth, ${from_token} → ${to_token}"
+        print_header "Testing quote flow: ${intent_type} with ${auth_type} auth, ${from_token} → ${to_token} (${swap_type})"
     fi
     
     # Step 1: Build intent
     if [ "$intent_type" = "compact" ]; then
-        print_step "Building compact intent"
+        print_step "Building compact intent (swap type: $swap_type)"
         
-        if ! intent_build "compact" "$origin_chain" "$dest_chain" "$from_token" "$to_token"; then
+        # Pass swap type flag if not default
+        local build_args=()
+        [ "$swap_type" = "exact-output" ] && build_args+=("--exact-output")
+        build_args+=("compact" "$origin_chain" "$dest_chain" "$from_token" "$to_token")
+        
+        if ! intent_build "${build_args[@]}"; then
             print_error "Failed to build compact intent"
             return 1
         fi
     else
-        print_step "Building ${intent_type} intent with ${auth_type} auth"
+        print_step "Building ${intent_type} intent with ${auth_type} auth (swap type: $swap_type)"
         
-        if ! intent_build "$intent_type" "$auth_type" "$origin_chain" "$dest_chain" "$from_token" "$to_token"; then
+        # Pass swap type flag if not default
+        local build_args=()
+        [ "$swap_type" = "exact-output" ] && build_args+=("--exact-output")
+        build_args+=("$intent_type" "$auth_type" "$origin_chain" "$dest_chain" "$from_token" "$to_token")
+        
+        if ! intent_build "${build_args[@]}"; then
             print_error "Failed to build ${intent_type} intent with ${auth_type} auth"
             return 1
         fi
