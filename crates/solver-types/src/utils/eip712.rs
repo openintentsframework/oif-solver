@@ -135,12 +135,6 @@ pub fn ecrecover_user_from_signature(
 		return Err(format!("Unsupported signature length: {} bytes", sig_bytes.len()).into());
 	};
 
-	tracing::info!(
-		"Parsed signature - r: 0x{}, s: 0x{}, v: {}",
-		hex::encode(&r),
-		hex::encode(&s),
-		v
-	);
 
 	let sig = PrimitiveSignature::from_scalars_and_parity(B256::from(r), B256::from(s), v != 0);
 
