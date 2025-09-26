@@ -750,8 +750,8 @@ quote_accept() {
         
         print_debug "Starting order signing and submission process..."
         
-        # Extract the order details from the quote
-        local order_data=$(echo "$quote_json" | jq -r ".quotes[$quote_index].order.payload // empty")
+        # Extract the complete order object from the quote
+        local order_data=$(echo "$quote_json" | jq -r ".quotes[$quote_index].order // empty")
         
         print_debug "Order data extracted: ${#order_data} chars"
         
