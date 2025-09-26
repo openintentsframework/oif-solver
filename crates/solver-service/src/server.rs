@@ -501,7 +501,7 @@ async fn validate_intent_request(
 		});
 
 	match &result {
-		Ok(_) => tracing::info!("Order validation completed successfully"),
+		Ok(_) => tracing::debug!("Order validation completed successfully"),
 		Err(e) => tracing::error!("Order validation failed: {:?}", e),
 	}
 
