@@ -377,7 +377,6 @@ async fn create_intent_from_quote(
 			}
 		})?;
 
-	tracing::info!("Successfully retrieved quote, attempting conversion to PostOrderRequest");
 	// Convert Quote to PostOrderRequest using the TryFrom implementation
 	let result = (&quote, signature, standard).try_into().map_err(|e| {
 		tracing::error!("Quote conversion failed: {}", e);
