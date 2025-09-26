@@ -652,10 +652,6 @@ pub struct ValidatedQuoteContext {
 	pub known_outputs: Option<Vec<(QuoteOutput, U256)>>,
 	pub constraint_inputs: Option<Vec<(QuoteInput, Option<U256>)>>,
 	pub constraint_outputs: Option<Vec<(QuoteOutput, Option<U256>)>>,
-	pub inferred_order_types: Vec<String>,
-	pub compatible_auth_schemes: Vec<AuthScheme>,
-	pub inputs_for_balance_check: Vec<QuoteInput>,
-	pub outputs_for_balance_check: Vec<QuoteOutput>,
 }
 
 /// Request for getting price quotes - new OIF spec structure

@@ -126,11 +126,11 @@ impl QuoteValidator {
 					if amount_u256.is_none() {
 						return Err(QuoteError::MissingInputAmount);
 					}
-					
+
 					let amount = amount_u256.unwrap();
 					if amount.is_zero() {
 						return Err(QuoteError::InvalidRequest(
-							"Input amount cannot be zero for exact-input swaps".to_string()
+							"Input amount cannot be zero for exact-input swaps".to_string(),
 						));
 					}
 
@@ -152,10 +152,6 @@ impl QuoteValidator {
 					known_outputs: None,
 					constraint_inputs: None,
 					constraint_outputs: Some(constraint_outputs),
-					inferred_order_types: Vec::new(),
-					compatible_auth_schemes: Vec::new(),
-					inputs_for_balance_check: intent.inputs.clone(),
-					outputs_for_balance_check: vec![], // Can't pre-validate - amounts unknown
 				})
 			},
 			SwapType::ExactOutput => {
@@ -169,11 +165,11 @@ impl QuoteValidator {
 					if amount_u256.is_none() {
 						return Err(QuoteError::MissingOutputAmount);
 					}
-					
+
 					let amount = amount_u256.unwrap();
 					if amount.is_zero() {
 						return Err(QuoteError::InvalidRequest(
-							"Output amount cannot be zero for exact-output swaps".to_string()
+							"Output amount cannot be zero for exact-output swaps".to_string(),
 						));
 					}
 
@@ -195,10 +191,6 @@ impl QuoteValidator {
 					known_outputs: Some(known_outputs),
 					constraint_inputs: Some(constraint_inputs),
 					constraint_outputs: None,
-					inferred_order_types: Vec::new(),
-					compatible_auth_schemes: Vec::new(),
-					inputs_for_balance_check: vec![], // Can't pre-validate - amounts unknown
-					outputs_for_balance_check: intent.outputs.clone(),
 				})
 			},
 		}
@@ -602,5 +594,197 @@ impl QuoteValidator {
 		try_join_all(balance_checks).await?;
 
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use alloy_primitives::address;
+	use solver_types::{IntentType, QuoteInput, QuoteOutput};
+
+	fn create_exact_input_request(
+		input_amount: Option<&str>,
+		output_amount: Option<&str>,
+	) -> IntentRequest {
+		IntentRequest {
+			intent_type: IntentType::OifSwap,
+			inputs: vec![QuoteInput {
+				user: InteropAddress::new_ethereum(
+					1,
+					address!("1111111111111111111111111111111111111111"),
+				),
+				asset: InteropAddress::new_ethereum(
+					1,
+					address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+				),
+				amount: input_amount.map(|s| s.to_string()),
+				lock: None,
+			}],
+			outputs: vec![QuoteOutput {
+				receiver: InteropAddress::new_ethereum(
+					137,
+					address!("2222222222222222222222222222222222222222"),
+				),
+				asset: InteropAddress::new_ethereum(
+					137,
+					address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"),
+				),
+				amount: output_amount.map(|s| s.to_string()),
+				calldata: None,
+			}],
+			swap_type: Some(SwapType::ExactInput),
+			min_valid_until: None,
+			preference: None,
+			origin_submission: None,
+			failure_handling: None,
+			partial_fill: None,
+			metadata: None,
+		}
+	}
+
+	fn create_exact_output_request(
+		input_amount: Option<&str>,
+		output_amount: Option<&str>,
+	) -> IntentRequest {
+		IntentRequest {
+			intent_type: IntentType::OifSwap,
+			inputs: vec![QuoteInput {
+				user: InteropAddress::new_ethereum(
+					1,
+					address!("1111111111111111111111111111111111111111"),
+				),
+				asset: InteropAddress::new_ethereum(
+					1,
+					address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+				),
+				amount: input_amount.map(|s| s.to_string()),
+				lock: None,
+			}],
+			outputs: vec![QuoteOutput {
+				receiver: InteropAddress::new_ethereum(
+					137,
+					address!("2222222222222222222222222222222222222222"),
+				),
+				asset: InteropAddress::new_ethereum(
+					137,
+					address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"),
+				),
+				amount: output_amount.map(|s| s.to_string()),
+				calldata: None,
+			}],
+			swap_type: Some(SwapType::ExactOutput),
+			min_valid_until: None,
+			preference: None,
+			origin_submission: None,
+			failure_handling: None,
+			partial_fill: None,
+			metadata: None,
+		}
+	}
+
+	#[test]
+	fn test_exact_input_missing_input_amount_fails() {
+		// Test: Exact-input missing required input amount
+		let intent = create_exact_input_request(
+			None, // Missing required input amount
+			None,
+		);
+
+		let result = QuoteValidator::validate_swap_type_logic(&intent);
+		assert!(
+			matches!(result, Err(QuoteError::MissingInputAmount)),
+			"Should reject missing input amount: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_exact_output_missing_output_amount_fails() {
+		// Test: Exact-output missing required output amount
+		let intent = create_exact_output_request(
+			None, None, // Missing required output amount
+		);
+
+		let result = QuoteValidator::validate_swap_type_logic(&intent);
+		assert!(
+			matches!(result, Err(QuoteError::MissingOutputAmount)),
+			"Should reject missing output amount: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_exact_input_zero_input_amount_fails() {
+		// Test: Exact-input with zero input amount
+		let intent = create_exact_input_request(
+			Some("0"), // Zero input amount
+			None,
+		);
+
+		let result = QuoteValidator::validate_swap_type_logic(&intent);
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("cannot be zero")),
+			"Should reject zero input amount for exact-input: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_exact_output_zero_output_amount_fails() {
+		// Test: Exact-output with zero output amount
+		let intent = create_exact_output_request(
+			None,
+			Some("0"), // Zero output amount
+		);
+
+		let result = QuoteValidator::validate_swap_type_logic(&intent);
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("cannot be zero")),
+			"Should reject zero output amount for exact-output: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_exact_input_with_valid_amounts_succeeds() {
+		// Test: Exact-input with valid input amount should succeed
+		let intent = create_exact_input_request(
+			Some("1000000000000000000"), // 1 token
+			None,
+		);
+
+		let result = QuoteValidator::validate_swap_type_logic(&intent);
+		assert!(
+			result.is_ok(),
+			"Should accept valid exact-input: {:?}",
+			result
+		);
+
+		let context = result.unwrap();
+		assert!(matches!(context.swap_type, SwapType::ExactInput));
+		assert!(context.known_inputs.is_some());
+		assert_eq!(context.known_inputs.unwrap().len(), 1);
+	}
+
+	#[test]
+	fn test_exact_output_with_valid_amounts_succeeds() {
+		// Test: Exact-output with valid output amount should succeed
+		let intent = create_exact_output_request(
+			None,
+			Some("1000000000000000000"), // 1 token
+		);
+
+		let result = QuoteValidator::validate_swap_type_logic(&intent);
+		assert!(
+			result.is_ok(),
+			"Should accept valid exact-output: {:?}",
+			result
+		);
+
+		let context = result.unwrap();
+		assert!(matches!(context.swap_type, SwapType::ExactOutput));
+		assert!(context.known_outputs.is_some());
+		assert_eq!(context.known_outputs.unwrap().len(), 1);
 	}
 }

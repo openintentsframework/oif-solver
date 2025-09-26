@@ -308,7 +308,7 @@ impl QuoteGenerator {
 						.as_ref()
 						.and_then(|amt| U256::from_str(amt).ok())
 						.unwrap_or(U256::ZERO);
-					
+
 					if amount.is_zero() {
 						return Err(QuoteError::InvalidRequest(format!(
 							"Output amount for {} cannot be zero after cost adjustment",
@@ -325,7 +325,7 @@ impl QuoteGenerator {
 						.as_ref()
 						.and_then(|amt| U256::from_str(amt).ok())
 						.unwrap_or(U256::ZERO);
-					
+
 					if amount.is_zero() {
 						return Err(QuoteError::InvalidRequest(format!(
 							"Input amount for {} cannot be zero after cost adjustment",
@@ -1584,12 +1584,11 @@ mod tests {
 		ApiConfig, Config, ConfigBuilder, DomainConfig, QuoteConfig, SettlementConfig,
 	};
 	use solver_settlement::{MockSettlementInterface, SettlementInterface};
-	use solver_types::oif_versions;
-	use solver_types::parse_address;
 	use solver_types::{
+		oif_versions, parse_address,
 		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
-		FailureHandlingMode, IntentRequest, IntentType, OifOrder, OrderPayload, QuoteInput,
-		QuoteOutput, QuotePreference, SignatureType,
+		FailureHandlingMode, GetQuoteRequest, IntentRequest, IntentType, InteropAddress, OifOrder,
+		OrderPayload, QuoteInput, QuoteOutput, QuotePreference, SignatureType, SwapType,
 	};
 	use std::collections::HashMap;
 
@@ -2244,6 +2243,150 @@ mod tests {
 					QuoteError::InvalidRequest(_) | QuoteError::UnsupportedSettlement(_)
 				));
 			},
+		}
+	}
+
+	#[tokio::test]
+	async fn test_exact_input_no_output_constraint_succeeds() {
+		let generator = create_test_generator();
+		let request = create_exact_input_request(
+			Some("1000000000000000000"), // 1 TOKA input
+			None,                        // No output constraint
+		);
+
+		let config = create_test_config();
+		let result = generator.generate_quotes(&request, &config).await;
+
+		// Should not fail with InvalidRequest for missing constraint
+		// May fail with other errors (e.g., InsufficientLiquidity) but that's ok
+		assert!(
+			!matches!(result, Err(QuoteError::InvalidRequest(msg)) if msg.contains("constraint")),
+			"Should accept exact-input without output constraint"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_exact_output_no_input_constraint_succeeds() {
+		let generator = create_test_generator();
+		let request = create_exact_output_request(
+			None,                        // No input constraint
+			Some("1000000000000000000"), // 1 TOKB output
+		);
+
+		let config = create_test_config();
+		let result = generator.generate_quotes(&request, &config).await;
+
+		// Should not fail with InvalidRequest for missing constraint
+		assert!(
+			!matches!(result, Err(QuoteError::InvalidRequest(msg)) if msg.contains("constraint")),
+			"Should accept exact-output without input constraint"
+		);
+	}
+
+	fn create_test_generator() -> QuoteGenerator {
+		let settlement_service = create_test_settlement_service(true);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		QuoteGenerator::new(settlement_service, delivery_service)
+	}
+
+	fn create_exact_input_request(
+		input_amount: Option<&str>,
+		output_amount: Option<&str>,
+	) -> GetQuoteRequest {
+		GetQuoteRequest {
+			user: InteropAddress::new_ethereum(
+				1,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			intent: IntentRequest {
+				intent_type: IntentType::OifSwap,
+				inputs: vec![QuoteInput {
+					user: InteropAddress::new_ethereum(
+						1,
+						address!("1111111111111111111111111111111111111111"),
+					),
+					asset: InteropAddress::new_ethereum(
+						1,
+						address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+					),
+					amount: input_amount.map(|s| s.to_string()),
+					lock: None,
+				}],
+				outputs: vec![QuoteOutput {
+					receiver: InteropAddress::new_ethereum(
+						137,
+						address!("2222222222222222222222222222222222222222"),
+					),
+					asset: InteropAddress::new_ethereum(
+						137,
+						address!("2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+					),
+					amount: output_amount.map(|s| s.to_string()),
+					calldata: None,
+				}],
+				swap_type: Some(SwapType::ExactInput),
+				preference: Some(QuotePreference::Speed),
+				min_valid_until: Some(600),
+				origin_submission: Some(solver_types::OriginSubmission {
+					mode: solver_types::OriginMode::User,
+					schemes: Some(vec![solver_types::AuthScheme::Permit2]),
+				}),
+				failure_handling: None,
+				partial_fill: Some(false),
+				metadata: None,
+			},
+			supported_types: vec!["oif-escrow-v0".to_string()],
+		}
+	}
+
+	fn create_exact_output_request(
+		input_amount: Option<&str>,
+		output_amount: Option<&str>,
+	) -> GetQuoteRequest {
+		GetQuoteRequest {
+			user: InteropAddress::new_ethereum(
+				1,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			intent: IntentRequest {
+				intent_type: IntentType::OifSwap,
+				inputs: vec![QuoteInput {
+					user: InteropAddress::new_ethereum(
+						1,
+						address!("1111111111111111111111111111111111111111"),
+					),
+					asset: InteropAddress::new_ethereum(
+						1,
+						address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+					),
+					amount: input_amount.map(|s| s.to_string()),
+					lock: None,
+				}],
+				outputs: vec![QuoteOutput {
+					receiver: InteropAddress::new_ethereum(
+						137,
+						address!("2222222222222222222222222222222222222222"),
+					),
+					asset: InteropAddress::new_ethereum(
+						137,
+						address!("2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+					),
+					amount: output_amount.map(|s| s.to_string()),
+					calldata: None,
+				}],
+				swap_type: Some(SwapType::ExactOutput),
+				preference: Some(QuotePreference::Speed),
+				min_valid_until: Some(600),
+				origin_submission: Some(solver_types::OriginSubmission {
+					mode: solver_types::OriginMode::User,
+					schemes: Some(vec![solver_types::AuthScheme::Permit2]),
+				}),
+				failure_handling: None,
+				partial_fill: Some(false),
+				metadata: None,
+			},
+			supported_types: vec!["oif-escrow-v0".to_string()],
 		}
 	}
 }
