@@ -365,7 +365,7 @@ async fn create_intent_from_quote(
 	);
 
 	// Retrieve the quote from storage
-	tracing::info!("Attempting to retrieve quote from storage: {}", quote_id);
+	tracing::debug!("Attempting to retrieve quote from storage: {}", quote_id);
 	let quote = crate::apis::quote::get_quote_by_id(quote_id, &state.solver)
 		.await
 		.map_err(|e| {
