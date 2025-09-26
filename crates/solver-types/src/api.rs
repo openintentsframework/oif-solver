@@ -767,11 +767,28 @@ impl PostOrderRequest {
 		use alloy_primitives::Bytes;
 		use alloy_sol_types::SolType;
 
-		// Use the unified TryFrom implementation that handles all order types automatically
-		let sol_order = StandardOrder::try_from(quote)?;
+		// 1. Reconstruct the EIP-712 digest based on order type
+		let digest = Self::reconstruct_digest_for_order_type(quote)?;
 
-		// Extract the user address from the order
-		let user_address = sol_order.user;
+		// 2. Recover the real user address from the signature
+		let recovered_user =
+			crate::utils::eip712::ecrecover_user_from_signature(&digest, signature)?;
+
+		// 3. Clone quote to make it mutable and inject recovered user
+		let mut quote_clone = quote.clone();
+		match &mut quote_clone.order {
+			OifOrder::OifEscrowV0 { payload } => {
+				if let Some(message_obj) = payload.message.as_object_mut() {
+					message_obj.insert(
+						"user".to_string(),
+						serde_json::Value::String(recovered_user.to_string()),
+					); // workaround because StandardOrder::try_from does not handle the user field
+				}
+			},
+			_ => {}, // No user injection needed for other order types
+		}
+		// 4. Use the unified TryFrom implementation with the modified quote
+		let sol_order = StandardOrder::try_from(&quote_clone)?;
 
 		// Encode the order
 		let encoded_order = StandardOrder::abi_encode(&sol_order);
@@ -780,14 +797,39 @@ impl PostOrderRequest {
 		let lock_type = LockType::from(&quote.order);
 
 		// Create final PostOrderRequest
-		tracing::debug!("Creating PostOrderRequest with lock_type: {:?}", lock_type);
 		let signature_bytes = Bytes::from(hex::decode(signature.trim_start_matches("0x"))?);
 		Ok(PostOrderRequest {
 			order: Bytes::from(encoded_order),
-			sponsor: user_address,
+			sponsor: recovered_user,
 			signature: signature_bytes,
 			lock_type,
 		})
+	}
+
+	/// Reconstructs the EIP-712 digest based on the order type.
+	///
+	/// This function dispatches to the appropriate digest reconstruction method
+	/// based on the OifOrder variant type.
+	fn reconstruct_digest_for_order_type(
+		quote: &Quote,
+	) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+		match &quote.order {
+			OifOrder::OifEscrowV0 { .. } => {
+				// Permit2 escrow orders
+				crate::utils::eip712::reconstruct_permit2_digest_from_quote(quote)
+			},
+			OifOrder::Oif3009V0 { .. } => {
+				// EIP-3009 orders
+				crate::utils::eip712::reconstruct_3009_digest_from_quote(quote)
+			},
+			OifOrder::OifResourceLockV0 { .. } => {
+				// TheCompact resource lock orders
+				crate::utils::eip712::reconstruct_compact_digest_from_quote(quote)
+			},
+			OifOrder::OifGenericV0 { .. } => {
+				Err("Generic orders not supported for digest reconstruction".into())
+			},
+		}
 	}
 }
 

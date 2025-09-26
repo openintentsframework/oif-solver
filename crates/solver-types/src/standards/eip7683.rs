@@ -1,7 +1,7 @@
 //! EIP-7683 Cross-Chain Order Types
 //!
 //! This module defines the data structures for EIP-7683 cross-chain orders
-//! that are shared across the solver system. Updated to match the new OIF
+//! that are shared across the solver system. Updated to match the OIF
 //! contracts structure with StandardOrder and MandateOutput types.
 
 use alloy_primitives::U256;
@@ -415,38 +415,38 @@ impl TryFrom<&Quote> for interfaces::StandardOrder {
 impl interfaces::StandardOrder {
 	/// Handle Permit2 order conversion
 	fn handle_permit2_quote_conversion(
-		_quote: &Quote,
+		quote: &Quote,
 		eip712_data: &serde_json::Map<String, serde_json::Value>,
 	) -> Result<Self, Box<dyn std::error::Error>> {
 		use crate::utils::parse_bytes32_from_hex;
 		use alloy_primitives::{Address, U256};
 		use interfaces::SolMandateOutput;
 
-		// Extract signing information to get domain details
-		let signing = eip712_data
-			.get("signing")
-			.and_then(|s| s.as_object())
-			.ok_or("Missing 'signing' object in EIP-712 data")?;
+		// Extract payload from the quote's order
+		let payload = match &quote.order {
+			crate::OifOrder::OifEscrowV0 { payload } => payload,
+			_ => return Err("Expected OifEscrowV0 order type".into()),
+		};
 
-		let domain = signing
-			.get("domain")
-			.and_then(|d| d.as_object())
-			.ok_or("Missing 'domain' in signing data")?;
+		// Extract origin chain ID from payload domain
+		let domain = payload
+			.domain
+			.as_object()
+			.ok_or("Missing 'domain' object in payload")?;
 
-		// Extract origin chain ID from domain
 		let origin_chain_id = domain
 			.get("chainId")
-			.and_then(|c| c.as_u64())
+			.and_then(|c| c.as_str().and_then(|s| s.parse::<u64>().ok()))
 			.map(U256::from)
 			.ok_or("Missing chainId in domain")?;
 
 		// Extract spender as the user address (the entity that will receive the permit)
-		let spender_str = eip712_data
-			.get("spender")
-			.and_then(|s| s.as_str())
-			.ok_or("Missing spender in EIP-712 data")?;
-		let user_address = Address::from_slice(&hex::decode(spender_str.trim_start_matches("0x"))?);
-
+		// Extract the recovered user address from the injected message field
+		let user_str = eip712_data
+			.get("user")
+			.and_then(|u| u.as_str())
+			.ok_or("Missing user in EIP-712 data (should be injected by ecrecover)")?;
+		let user_address = Address::from_slice(&hex::decode(user_str.trim_start_matches("0x"))?);
 		// Extract nonce
 		let nonce_str = eip712_data
 			.get("nonce")
@@ -454,7 +454,7 @@ impl interfaces::StandardOrder {
 			.ok_or("Missing nonce in EIP-712 data")?;
 		let nonce = U256::from_str_radix(nonce_str, 10)?;
 
-		// Extract deadline (this is the permit deadline, also used as fill_deadline)
+		// Extract deadline
 		let deadline_str = eip712_data
 			.get("deadline")
 			.and_then(|d| d.as_str())
