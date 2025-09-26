@@ -1,7 +1,7 @@
 //! EIP-7683 Cross-Chain Order Types
 //!
 //! This module defines the data structures for EIP-7683 cross-chain orders
-//! that are shared across the solver system. Updated to match the new OIF
+//! that are shared across the solver system. Updated to match the OIF
 //! contracts structure with StandardOrder and MandateOutput types.
 
 use alloy_primitives::U256;
@@ -422,22 +422,23 @@ impl interfaces::StandardOrder {
 		use alloy_primitives::{Address, U256};
 		use interfaces::SolMandateOutput;
 
-		// Extract origin chain ID from the quote's payload domain (new format)
-		let origin_chain_id = if let crate::OifOrder::OifEscrowV0 { payload } = &quote.order {
-			// Get domain from payload directly (new format)
-			let domain = payload
-				.domain
-				.as_object()
-				.ok_or("Missing 'domain' object in payload")?;
-
-			domain
-				.get("chainId")
-				.and_then(|c| c.as_str().and_then(|s| s.parse::<u64>().ok()))
-				.map(U256::from)
-				.ok_or("Missing chainId in domain")?
-		} else {
-			return Err("Expected OifEscrowV0 order type".into());
+		// Extract payload from the quote's order
+		let payload = match &quote.order {
+			crate::OifOrder::OifEscrowV0 { payload } => payload,
+			_ => return Err("Expected OifEscrowV0 order type".into()),
 		};
+
+		// Extract origin chain ID from payload domain
+		let domain = payload
+			.domain
+			.as_object()
+			.ok_or("Missing 'domain' object in payload")?;
+
+		let origin_chain_id = domain
+			.get("chainId")
+			.and_then(|c| c.as_str().and_then(|s| s.parse::<u64>().ok()))
+			.map(U256::from)
+			.ok_or("Missing chainId in domain")?;
 
 		// Extract spender as the user address (the entity that will receive the permit)
 		// Extract the recovered user address from the injected message field
@@ -446,14 +447,14 @@ impl interfaces::StandardOrder {
 			.and_then(|u| u.as_str())
 			.ok_or("Missing user in EIP-712 data (should be injected by ecrecover)")?;
 		let user_address = Address::from_slice(&hex::decode(user_str.trim_start_matches("0x"))?);
-		// Extract nonce - directly in message now
+		// Extract nonce
 		let nonce_str = eip712_data
 			.get("nonce")
 			.and_then(|n| n.as_str())
 			.ok_or("Missing nonce in EIP-712 data")?;
 		let nonce = U256::from_str_radix(nonce_str, 10)?;
 
-		// Extract deadline - directly in message now
+		// Extract deadline
 		let deadline_str = eip712_data
 			.get("deadline")
 			.and_then(|d| d.as_str())
@@ -480,7 +481,7 @@ impl interfaces::StandardOrder {
 		let input_oracle =
 			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
 
-		// Extract input data from permitted array - directly in message now
+		// Extract input data from permitted array
 		let permitted = eip712_data
 			.get("permitted")
 			.and_then(|p| p.as_array())
@@ -557,7 +558,7 @@ impl interfaces::StandardOrder {
 		}
 
 		// Create the StandardOrder
-		let standard_order = interfaces::StandardOrder {
+		Ok(interfaces::StandardOrder {
 			user: user_address,
 			nonce,
 			originChainId: origin_chain_id,
@@ -566,9 +567,7 @@ impl interfaces::StandardOrder {
 			inputOracle: input_oracle,
 			inputs,
 			outputs: sol_outputs,
-		};
-
-		Ok(standard_order)
+		})
 	}
 
 	/// Handle EIP-3009 order conversion

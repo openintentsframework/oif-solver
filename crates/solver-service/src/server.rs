@@ -311,7 +311,6 @@ async fn extract_intent_request(
 	state: &AppState,
 	standard: &str,
 ) -> Result<PostOrderRequest, APIError> {
-	tracing::info!("Extracting intent request from payload: {:?}", payload);
 	// Check if this is a quote acceptance (has quoteId)
 	if payload.get("quoteId").and_then(|v| v.as_str()).is_some() {
 		// Quote acceptance path
