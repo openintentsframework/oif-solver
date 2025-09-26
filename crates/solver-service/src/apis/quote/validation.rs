@@ -17,8 +17,8 @@ use alloy_primitives::{Address as AlloyAddress, U256};
 use futures::future::try_join_all;
 use solver_core::SolverEngine;
 use solver_types::{
-	AuthScheme, GetQuoteRequest, IntentRequest, IntentType, InteropAddress, QuoteError, QuoteInput,
-	QuoteOutput, SwapType,
+	AuthScheme, GetQuoteRequest, IntentRequest, IntentType, InteropAddress, QuoteError, SwapType,
+	ValidatedQuoteContext,
 };
 
 /// Main validator for quote requests.
@@ -35,21 +35,6 @@ pub struct QuoteValidator;
 pub struct SupportedAsset {
 	pub asset: InteropAddress,
 	pub amount: U256,
-}
-
-/// Rich validation context that replaces simple SupportedAsset lists
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct ValidatedQuoteContext {
-	pub swap_type: SwapType,
-	pub known_inputs: Option<Vec<(QuoteInput, U256)>>,
-	pub known_outputs: Option<Vec<(QuoteOutput, U256)>>,
-	pub constraint_inputs: Option<Vec<(QuoteInput, Option<U256>)>>,
-	pub constraint_outputs: Option<Vec<(QuoteOutput, Option<U256>)>>,
-	pub inferred_order_types: Vec<String>,
-	pub compatible_auth_schemes: Vec<AuthScheme>,
-	pub inputs_for_balance_check: Vec<QuoteInput>,
-	pub outputs_for_balance_check: Vec<QuoteOutput>,
 }
 
 impl QuoteValidator {
@@ -254,31 +239,10 @@ impl QuoteValidator {
 					"Auth schemes cannot be empty if specified".to_string(),
 				));
 			}
-			// TODO: Check if solver supports these auth schemes
+			// Note: We don't validate specific auth schemes here.
+			// The solver should attempt to work with whatever auth schemes the user prefers.
+			// Actual capability checking happens in custody_strategy.decide_custody()
 		}
-		Ok(())
-	}
-
-	// Keep old validation methods for V1 compatibility
-	/// Validates the basic structure and content of a quote request.
-	///
-	/// This performs initial validation including:
-	/// - Checking for required fields
-	/// - Validating address formats
-	/// - Ensuring amounts are positive
-	///
-	/// # Arguments
-	///
-	/// * `request` - The quote request to validate
-	///
-	/// # Errors
-	///
-	/// Returns `QuoteError::InvalidRequest` if validation fails
-	pub fn validate_request(request: &GetQuoteRequest) -> Result<(), QuoteError> {
-		Self::validate_basic_structure(request)?;
-		Self::validate_user_address(request)?;
-		Self::validate_inputs(request)?;
-		Self::validate_outputs(request)?;
 		Ok(())
 	}
 
@@ -356,94 +320,6 @@ impl QuoteValidator {
 		solver
 			.token_manager()
 			.is_supported(chain_id, &solver_address)
-	}
-
-	/// Validates the basic structure of a quote request.
-	///
-	/// Ensures that the request contains at least one input and one output,
-	/// which are fundamental requirements for any quote.
-	///
-	/// # Errors
-	///
-	/// Returns `QuoteError::InvalidRequest` if inputs or outputs are empty
-	fn validate_basic_structure(request: &GetQuoteRequest) -> Result<(), QuoteError> {
-		// Check that we have at least one input
-		if request.intent.inputs.is_empty() {
-			return Err(QuoteError::InvalidRequest(
-				"At least one input is required".to_string(),
-			));
-		}
-
-		// Check that we have at least one requested output
-		if request.intent.outputs.is_empty() {
-			return Err(QuoteError::InvalidRequest(
-				"At least one output is required".to_string(),
-			));
-		}
-
-		Ok(())
-	}
-
-	/// Validates the user's interoperable address.
-	///
-	/// Ensures the user address follows the ERC-7930 format and is valid.
-	fn validate_user_address(request: &GetQuoteRequest) -> Result<(), QuoteError> {
-		Self::validate_interop_address(&request.user)?;
-		Ok(())
-	}
-
-	/// Validates all input specifications in the request.
-	///
-	/// Checks each available input for:
-	/// - Valid user address format
-	/// - Valid asset address format
-	/// - Positive amount (non-zero)
-	///
-	/// # Errors
-	///
-	/// Returns `QuoteError::InvalidRequest` if any input is invalid
-	fn validate_inputs(request: &GetQuoteRequest) -> Result<(), QuoteError> {
-		for input in &request.intent.inputs {
-			Self::validate_interop_address(&input.user)?;
-			Self::validate_interop_address(&input.asset)?;
-
-			// Check that amount is positive if provided
-			if let Ok(Some(amount)) = input.amount_as_u256() {
-				if amount == U256::ZERO {
-					return Err(QuoteError::InvalidRequest(
-						"Input amount must be greater than zero".to_string(),
-					));
-				}
-			}
-		}
-		Ok(())
-	}
-
-	/// Validates all output specifications in the request.
-	///
-	/// Checks each requested output for:
-	/// - Valid receiver address format
-	/// - Valid asset address format
-	/// - Positive amount (non-zero)
-	///
-	/// # Errors
-	///
-	/// Returns `QuoteError::InvalidRequest` if any output is invalid
-	fn validate_outputs(request: &GetQuoteRequest) -> Result<(), QuoteError> {
-		for output in &request.intent.outputs {
-			Self::validate_interop_address(&output.receiver)?;
-			Self::validate_interop_address(&output.asset)?;
-
-			// Check that amount is positive if provided
-			if let Ok(Some(amount)) = output.amount_as_u256() {
-				if amount == U256::ZERO {
-					return Err(QuoteError::InvalidRequest(
-						"Output amount must be greater than zero".to_string(),
-					));
-				}
-			}
-		}
-		Ok(())
 	}
 
 	/// Validates an ERC-7930 interoperable address.

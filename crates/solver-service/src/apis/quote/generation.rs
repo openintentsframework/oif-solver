@@ -50,13 +50,15 @@
 
 use super::custody::{CustodyDecision, CustodyStrategy};
 use crate::eip712::{compact, get_domain_separator};
+use alloy_primitives::U256;
 use solver_config::{Config, QuoteConfig};
 use solver_delivery::DeliveryService;
 use solver_settlement::{SettlementInterface, SettlementService};
 use solver_types::standards::eip7683::LockType;
 use solver_types::{
-	with_0x_prefix, FailureHandlingMode, GetQuoteRequest, InteropAddress, OifOrder, OrderInput,
-	OrderPayload, Quote, QuoteError, QuotePreference, SignatureType,
+	with_0x_prefix, CostContext, FailureHandlingMode, GetQuoteRequest, InteropAddress, OifOrder,
+	OrderInput, OrderPayload, Quote, QuoteError, QuotePreference, SignatureType, SwapType,
+	ValidatedQuoteContext,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -90,9 +92,26 @@ impl QuoteGenerator {
 	pub async fn generate_quotes(
 		&self,
 		request: &GetQuoteRequest,
-		context: &crate::apis::quote::validation::ValidatedQuoteContext,
 		config: &Config,
 	) -> Result<Vec<Quote>, QuoteError> {
+		println!("😨 OLD generate_quotes method called! This uses original amounts:");
+		for (i, input) in request.intent.inputs.iter().enumerate() {
+			println!(
+				"  Input {}: {} = {}",
+				i,
+				input.asset,
+				input.amount.as_ref().unwrap_or(&"None".to_string())
+			);
+		}
+		for (i, output) in request.intent.outputs.iter().enumerate() {
+			println!(
+				"  Output {}: {} = {}",
+				i,
+				output.asset,
+				output.amount.as_ref().unwrap_or(&"None".to_string())
+			);
+		}
+
 		let mut quotes = Vec::new();
 		for input in &request.intent.inputs {
 			let order_input: OrderInput = input.try_into()?;
@@ -101,7 +120,7 @@ impl QuoteGenerator {
 				.decide_custody(&order_input, request.intent.origin_submission.as_ref())
 				.await?;
 			if let Ok(quote) = self
-				.generate_quote_for_settlement(request, context, config, &custody_decision)
+				.generate_quote_for_settlement(request, config, &custody_decision)
 				.await
 			{
 				quotes.push(quote);
@@ -114,21 +133,205 @@ impl QuoteGenerator {
 		Ok(quotes)
 	}
 
+	/// Generate quotes with costs already embedded in the amounts.
+	/// This is the new flow that calculates costs before quote generation and embeds them.
+	pub async fn generate_quotes_with_costs(
+		&self,
+		request: &GetQuoteRequest,
+		context: &ValidatedQuoteContext,
+		cost_context: &CostContext,
+		config: &Config,
+	) -> Result<Vec<Quote>, QuoteError> {
+		// Build a new request with swap amounts and cost adjustments from CostContext
+		let adjusted_request = self.build_cost_adjusted_request(request, context, cost_context)?;
+
+		println!("📦 Adjusted request ready for quote generation:");
+		for (i, input) in adjusted_request.intent.inputs.iter().enumerate() {
+			println!(
+				"  Input {}: {} = {}",
+				i,
+				input.asset,
+				input.amount.as_ref().unwrap_or(&"None".to_string())
+			);
+		}
+		for (i, output) in adjusted_request.intent.outputs.iter().enumerate() {
+			println!(
+				"  Output {}: {} = {}",
+				i,
+				output.asset,
+				output.amount.as_ref().unwrap_or(&"None".to_string())
+			);
+		}
+
+		// Generate quotes using the adjusted request
+		let quotes = self.generate_quotes(&adjusted_request, config).await?;
+
+		println!("✅ Final quotes generated: {} quotes", quotes.len());
+		for (i, quote) in quotes.iter().enumerate() {
+			match &quote.order {
+				OifOrder::OifEscrowV0 { payload } => {
+					let permitted = payload
+						.message
+						.get("permitted")
+						.and_then(|p| p.as_array())
+						.and_then(|arr| arr.first());
+					let outputs = payload
+						.message
+						.get("witness")
+						.and_then(|w| w.get("outputs"))
+						.and_then(|o| o.as_array())
+						.and_then(|arr| arr.first());
+
+					if let (Some(input), Some(output)) = (permitted, outputs) {
+						let input_amount = input
+							.get("amount")
+							.and_then(|a| a.as_str())
+							.unwrap_or("N/A");
+						let output_amount = output
+							.get("amount")
+							.and_then(|a| a.as_str())
+							.unwrap_or("N/A");
+						println!(
+							"  💼 Quote {}: Input={} → Output={}",
+							i, input_amount, output_amount
+						);
+					}
+				},
+				_ => println!("  💼 Quote {}: Non-escrow order", i),
+			}
+		}
+
+		Ok(quotes)
+	}
+
+	/// Build a new request with swap amounts and cost adjustments based on swap type
+	fn build_cost_adjusted_request(
+		&self,
+		request: &GetQuoteRequest,
+		context: &ValidatedQuoteContext,
+		cost_context: &CostContext,
+	) -> Result<GetQuoteRequest, QuoteError> {
+		let mut adjusted = request.clone();
+
+		println!(
+			"🔧 Adjusting request for {:?} with {} swap amounts and {} cost amounts",
+			context.swap_type,
+			cost_context.swap_amounts.len(),
+			cost_context.cost_amounts_in_tokens.len()
+		);
+
+		match context.swap_type {
+			SwapType::ExactInput => {
+				println!("➡️ ExactInput: Setting output amounts, subtracting costs");
+				// For ExactInput: Use swap amounts for outputs, then subtract costs
+				// Input amounts are already known from the request
+
+				// Determine first output asset before the loop to avoid borrow issues
+				let first_output_asset = adjusted.intent.outputs.first().map(|o| o.asset.clone());
+
+				for output in adjusted.intent.outputs.iter_mut() {
+					// First set the base swap amount from our calculation
+					if let Some(base_amount) = cost_context.swap_amounts.get(&output.asset) {
+						// Get cost for this specific token
+						let cost_in_token = cost_context
+							.cost_amounts_in_tokens
+							.get(&output.asset)
+							.copied()
+							.unwrap_or(U256::ZERO);
+
+						// For exact matching, don't distribute cost evenly
+						// Apply full cost to first output, others get their base amount
+						let is_first_output = first_output_asset
+							.as_ref()
+							.map(|first| first == &output.asset)
+							.unwrap_or(false);
+
+						let adjusted_amount = if is_first_output {
+							// First output bears the full cost
+							base_amount.saturating_sub(cost_in_token)
+						} else {
+							// Other outputs get their base amount
+							*base_amount
+						};
+
+						println!(
+							"💵 Output {}: base={} - cost={} = {} (is_first={})",
+							output.asset,
+							base_amount,
+							cost_in_token,
+							adjusted_amount,
+							is_first_output
+						);
+
+						output.amount = Some(adjusted_amount.to_string());
+					}
+				}
+			},
+			SwapType::ExactOutput => {
+				println!("⬅️ ExactOutput: Setting input amounts, adding costs");
+				// For ExactOutput: Use swap amounts for inputs, then add costs
+				// Output amounts are already known from the request
+
+				// Determine first input asset before the loop to avoid borrow issues
+				let first_input_asset = adjusted.intent.inputs.first().map(|i| i.asset.clone());
+
+				for input in adjusted.intent.inputs.iter_mut() {
+					// First set the base swap amount from our calculation
+					if let Some(base_amount) = cost_context.swap_amounts.get(&input.asset) {
+						// Get cost for this specific token
+						let cost_in_token = cost_context
+							.cost_amounts_in_tokens
+							.get(&input.asset)
+							.copied()
+							.unwrap_or(U256::ZERO);
+
+						// For exact matching, don't distribute cost evenly
+						// Apply full cost to first input, others get their base amount
+						let is_first_input = first_input_asset
+							.as_ref()
+							.map(|first| first == &input.asset)
+							.unwrap_or(false);
+
+						let adjusted_amount = if is_first_input {
+							// First input bears the full cost
+							base_amount + cost_in_token
+						} else {
+							// Other inputs get their base amount
+							*base_amount
+						};
+
+						println!(
+							"💴 Input {}: base={} + cost={} = {} (is_first={})",
+							input.asset,
+							base_amount,
+							cost_in_token,
+							adjusted_amount,
+							is_first_input
+						);
+
+						input.amount = Some(adjusted_amount.to_string());
+					}
+				}
+			},
+		}
+
+		Ok(adjusted)
+	}
+
 	async fn generate_quote_for_settlement(
 		&self,
 		request: &GetQuoteRequest,
-		context: &crate::apis::quote::validation::ValidatedQuoteContext,
 		config: &Config,
 		custody_decision: &CustodyDecision,
 	) -> Result<Quote, QuoteError> {
 		let quote_id = Uuid::new_v4().to_string();
 		let order = match custody_decision {
 			CustodyDecision::ResourceLock { lock } => {
-				self.generate_resource_lock_order(request, context, config, lock)
+				self.generate_resource_lock_order(request, config, lock)
 					.await?
 			},
 			CustodyDecision::Escrow { lock_type } => {
-				self.generate_escrow_order(request, context, config, lock_type)
+				self.generate_escrow_order(request, config, lock_type)
 					.await?
 			},
 		};
@@ -162,7 +365,6 @@ impl QuoteGenerator {
 	async fn generate_resource_lock_order(
 		&self,
 		request: &GetQuoteRequest,
-		_context: &crate::apis::quote::validation::ValidatedQuoteContext,
 		config: &Config,
 		lock: &solver_types::AssetLockReference,
 	) -> Result<OifOrder, QuoteError> {
@@ -199,7 +401,6 @@ impl QuoteGenerator {
 	async fn generate_escrow_order(
 		&self,
 		request: &GetQuoteRequest,
-		_context: &crate::apis::quote::validation::ValidatedQuoteContext,
 		config: &Config,
 		lock_type: &LockType,
 	) -> Result<OifOrder, QuoteError> {
@@ -351,30 +552,42 @@ impl QuoteGenerator {
 			})
 		};
 
-		// Build metadata with full intent information (inputs and outputs)
+		// Build metadata with proper error handling for amounts
 		// This is needed for conversion back to StandardOrder
+		let mut inputs_metadata = Vec::new();
+		for input in &request.intent.inputs {
+			let amount = input.amount.as_ref().ok_or_else(|| {
+				QuoteError::InvalidRequest("Input amount not set after cost adjustment".to_string())
+			})?;
+			inputs_metadata.push(serde_json::json!({
+				"chainId": input.asset.ethereum_chain_id().unwrap_or(1),
+				"asset": input.asset.to_string(),
+				"amount": amount.clone(),
+				"user": input.user.to_string()
+			}));
+		}
+
+		let mut outputs_metadata = Vec::new();
+		for output in &request.intent.outputs {
+			let amount = output.amount.as_ref().ok_or_else(|| {
+				QuoteError::InvalidRequest(
+					"Output amount not set after cost adjustment".to_string(),
+				)
+			})?;
+			outputs_metadata.push(serde_json::json!({
+				"chainId": output.asset.ethereum_chain_id().unwrap_or(1),
+				"asset": output.asset.to_string(),
+				"amount": amount.clone(),
+				"receiver": output.receiver.to_string(),
+				"oracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&selected_oracle.0)),
+				"settler": format!("0x{:040x}", alloy_primitives::Address::from_slice(&output_settler.0)),
+			}));
+		}
+
 		let metadata = serde_json::json!({
 			"user": request.user.to_string(),
-			"inputs": request.intent.inputs.iter().map(|input| {
-				serde_json::json!({
-					"chainId": input.asset.ethereum_chain_id().unwrap_or(1),
-					"asset": input.asset.to_string(),
-					// TODO: Handle swap-type properly - for now use "0" if amount is None
-					"amount": input.amount.as_ref().unwrap_or(&"0".to_string()).clone(),
-					"user": input.user.to_string()
-				})
-			}).collect::<Vec<_>>(),
-			"outputs": request.intent.outputs.iter().map(|output| {
-				serde_json::json!({
-					"chainId": output.asset.ethereum_chain_id().unwrap_or(1),
-					"asset": output.asset.to_string(),
-					// TODO: Handle swap-type properly - for now use "0" if amount is None
-					"amount": output.amount.as_ref().unwrap_or(&"0".to_string()).clone(),
-					"receiver": output.receiver.to_string(),
-					"oracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&selected_oracle.0)),
-					"settler": format!("0x{:040x}", alloy_primitives::Address::from_slice(&output_settler.0)),
-				})
-			}).collect::<Vec<_>>()
+			"inputs": inputs_metadata,
+			"outputs": outputs_metadata
 		});
 
 		let order = OifOrder::Oif3009V0 {
@@ -434,8 +647,14 @@ impl QuoteGenerator {
 			.asset
 			.ethereum_address()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input token: {}", e)))?;
-		// TODO: Handle swap-type properly - for now use "0" if amount is None
-		let input_amount = input.amount.as_ref().unwrap_or(&"0".to_string()).clone();
+		// Input amount should be set after cost adjustment
+		let input_amount = input
+			.amount
+			.as_ref()
+			.ok_or_else(|| {
+				QuoteError::InvalidRequest("Input amount not set after cost adjustment".to_string())
+			})?
+			.clone();
 
 		// TODO: All this needs to all be removed!
 
@@ -465,11 +684,15 @@ impl QuoteGenerator {
 		let output_token = output_interop
 			.ethereum_address()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output token: {}", e)))?;
-		// TODO: Handle swap-type properly - for now use "0" if amount is None
+		// Output amount should be set after cost adjustment
 		let output_amount = output_info
 			.amount
 			.as_ref()
-			.unwrap_or(&"0".to_string())
+			.ok_or_else(|| {
+				QuoteError::InvalidRequest(
+					"Output amount not set after cost adjustment".to_string(),
+				)
+			})?
 			.clone();
 
 		// Extract recipient from InteropAddress
@@ -668,11 +891,10 @@ impl QuoteGenerator {
 				QuoteError::InvalidRequest(format!("Failed to create token ID: {}", e))
 			})?;
 
-			inputs_array.push(serde_json::json!([
-				token_id.to_string(),
-				// TODO: Handle swap-type properly - for now use "0" if amount is None
-				input.amount.as_ref().unwrap_or(&"0".to_string()).clone(),
-			]));
+			let amount = input.amount.as_ref().ok_or_else(|| {
+				QuoteError::InvalidRequest("Input amount not set after cost adjustment".to_string())
+			})?;
+			inputs_array.push(serde_json::json!([token_id.to_string(), amount.clone(),]));
 		}
 
 		// Convert outputs to MandateOutput format
@@ -716,13 +938,17 @@ impl QuoteGenerator {
 				})?;
 
 			// Build MandateOutput with proper oracle and settler addresses
+			let amount = output.amount.as_ref().ok_or_else(|| {
+				QuoteError::InvalidRequest(
+					"Output amount not set after cost adjustment".to_string(),
+				)
+			})?;
 			outputs_array.push(serde_json::json!({
 				"oracle": format!("0x000000000000000000000000{:040x}", output_oracle),
 				"settler": format!("0x000000000000000000000000{:040x}", output_settler),
 				"chainId": output_chain_id.to_string(),
 				"token": format!("0x000000000000000000000000{:040x}", output_token_address),
-				// TODO: Handle swap-type properly - for now use "0" if amount is None
-				"amount": output.amount.as_ref().unwrap_or(&"0".to_string()).clone(),
+				"amount": amount.clone(),
 				"recipient": format!("0x000000000000000000000000{:040x}", recipient_address),
 				"call": output.calldata.clone(),
 				"context": "0x" // Context is typically empty for standard flows
@@ -965,7 +1191,7 @@ impl QuoteGenerator {
 		}))
 	}
 
-	/// Build Permit2 message object (clean EIP-712 message without metadata)
+	/// Build Permit2 message object
 	fn build_permit2_message_object(
 		&self,
 		request: &GetQuoteRequest,
@@ -1332,7 +1558,6 @@ impl QuoteGenerator {
 mod tests {
 	use super::*;
 	use crate::apis::quote::custody::CustodyDecision;
-	use crate::apis::quote::validation::ValidatedQuoteContext;
 	use alloy_primitives::address;
 	use alloy_primitives::U256;
 	use solver_config::{
@@ -1344,7 +1569,7 @@ mod tests {
 	use solver_types::{
 		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
 		FailureHandlingMode, IntentRequest, IntentType, OifOrder, OrderPayload, QuoteInput,
-		QuoteOutput, QuotePreference, SignatureType, SwapType,
+		QuoteOutput, QuotePreference, SignatureType,
 	};
 	use std::collections::HashMap;
 
@@ -1389,20 +1614,6 @@ mod tests {
 			.build()
 	}
 
-	fn create_test_context() -> ValidatedQuoteContext {
-		ValidatedQuoteContext {
-			swap_type: SwapType::ExactInput,
-			known_inputs: None,
-			known_outputs: None,
-			constraint_inputs: None,
-			constraint_outputs: None,
-			inferred_order_types: vec![],
-			compatible_auth_schemes: vec![],
-			inputs_for_balance_check: vec![],
-			outputs_for_balance_check: vec![],
-		}
-	}
-
 	fn create_test_request() -> GetQuoteRequest {
 		GetQuoteRequest {
 			user: InteropAddress::new_ethereum(
@@ -1430,7 +1641,7 @@ mod tests {
 					),
 					asset: InteropAddress::new_ethereum(
 						137,
-						address!("B0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C5C5C5"),
+						address!("B0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
 					),
 					amount: Some(U256::from(950).to_string()),
 					calldata: None,
@@ -1497,9 +1708,8 @@ mod tests {
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
-		let context = create_test_context();
 
-		let result = generator.generate_quotes(&request, &context, &config).await;
+		let result = generator.generate_quotes(&request, &config).await;
 
 		// Should succeed since we have properly configured oracles
 		assert!(result.is_ok());
@@ -1523,7 +1733,7 @@ mod tests {
 
 		// Verify failure handling and partial fill fields
 		assert_eq!(quote.failure_handling, FailureHandlingMode::RefundAutomatic);
-		assert_eq!(quote.partial_fill, false);
+		assert!(!quote.partial_fill);
 	}
 
 	#[tokio::test]
@@ -1534,9 +1744,8 @@ mod tests {
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
-		let context = create_test_context();
 
-		let result = generator.generate_quotes(&request, &context, &config).await;
+		let result = generator.generate_quotes(&request, &config).await;
 
 		// Should fail with insufficient liquidity since our mock settlement has no oracles configured
 		assert!(matches!(result, Err(QuoteError::InsufficientLiquidity)));
@@ -1549,7 +1758,6 @@ mod tests {
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
-		let context = create_test_context();
 
 		// Create request with no available inputs
 		let request = GetQuoteRequest {
@@ -1583,7 +1791,7 @@ mod tests {
 			supported_types: vec![oif_versions::escrow_order_type("v0")],
 		};
 
-		let result = generator.generate_quotes(&request, &context, &config).await;
+		let result = generator.generate_quotes(&request, &config).await;
 		assert!(matches!(result, Err(QuoteError::InsufficientLiquidity)));
 	}
 
@@ -1601,9 +1809,8 @@ mod tests {
 			params: Some(serde_json::json!({"test": "value"})),
 		};
 
-		let context = create_test_context();
 		let result = generator
-			.generate_resource_lock_order(&request, &context, &config, &lock)
+			.generate_resource_lock_order(&request, &config, &lock)
 			.await;
 
 		match result {
@@ -1702,15 +1909,29 @@ mod tests {
 			.await;
 
 		assert!(result.is_ok());
-		let message = result.unwrap();
-		assert!(message.is_object());
+		let result_obj = result.unwrap();
+		assert!(result_obj.is_object());
 
+		let result_map = result_obj.as_object().unwrap();
+		// Should contain either digest+eip712 or just eip712
+		assert!(result_map.contains_key("eip712"));
+
+		// Check the EIP-712 structure
+		let eip712_structure = result_map.get("eip712").unwrap();
+		let eip712_obj = eip712_structure.as_object().unwrap();
+		assert!(eip712_obj.contains_key("types"));
+		assert!(eip712_obj.contains_key("domain"));
+		assert!(eip712_obj.contains_key("primaryType"));
+		assert!(eip712_obj.contains_key("message"));
+
+		// Check the actual message fields
+		let message = eip712_obj.get("message").unwrap();
 		let message_obj = message.as_object().unwrap();
-		assert!(message_obj.contains_key("user"));
-		assert!(message_obj.contains_key("inputs"));
-		assert!(message_obj.contains_key("outputs"));
+		assert!(message_obj.contains_key("sponsor"));
+		assert!(message_obj.contains_key("commitments"));
+		assert!(message_obj.contains_key("mandate"));
 		assert!(message_obj.contains_key("nonce"));
-		assert!(message_obj.contains_key("deadline"));
+		assert!(message_obj.contains_key("expires"));
 	}
 
 	#[test]
@@ -1940,9 +2161,8 @@ mod tests {
 			},
 		};
 
-		let context = create_test_context();
 		let result = generator
-			.generate_quote_for_settlement(&request, &context, &config, &custody_decision)
+			.generate_quote_for_settlement(&request, &config, &custody_decision)
 			.await;
 
 		match result {
@@ -1979,9 +2199,8 @@ mod tests {
 			lock_type: solver_types::standards::eip7683::LockType::Eip3009Escrow,
 		};
 
-		let context = create_test_context();
 		let result = generator
-			.generate_quote_for_settlement(&request, &context, &config, &custody_decision)
+			.generate_quote_for_settlement(&request, &config, &custody_decision)
 			.await;
 
 		match result {

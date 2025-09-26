@@ -97,6 +97,18 @@ pub async fn process_quote_request(
 	// Use the new validation architecture to get ValidatedQuoteContext
 	let validated_context = QuoteValidator::validate_quote_request(&request, solver)?;
 
+	// NEW: Pre-calculate costs BEFORE generation
+	let cost_profit_service = solver_core::engine::cost_profit::CostProfitService::new(
+		solver.pricing().clone(),
+		solver.delivery().clone(),
+		solver.token_manager().clone(),
+	);
+
+	let cost_context = cost_profit_service
+		.calculate_cost_context(&request, &validated_context, config)
+		.await
+		.map_err(|e| QuoteError::Internal(format!("Failed to calculate cost context: {}", e)))?;
+
 	// Check solver capabilities: networks only (token support is enforced during collection below)
 	QuoteValidator::validate_supported_networks(&request, solver)?;
 
@@ -109,39 +121,18 @@ pub async fn process_quote_request(
 	// Check destination balances for required outputs
 	QuoteValidator::ensure_destination_balances(solver, &supported_outputs).await?;
 
-	// Generate quotes using the business logic layer
+	// Generate quotes using the business logic layer with embedded costs
 	let settlement_service = solver.settlement();
 	let delivery_service = solver.delivery();
 	let quote_generator = QuoteGenerator::new(settlement_service.clone(), delivery_service.clone());
-	let mut quotes = quote_generator
-		.generate_quotes(&request, &validated_context, config)
+
+	// NEW: Generate quotes with costs already embedded in amounts
+	let quotes = quote_generator
+		.generate_quotes_with_costs(&request, &validated_context, &cost_context, config)
 		.await?;
 
-	// Enrich quotes with a preliminary cost breakdown using CostProfitService
-	let cost_profit_service = solver_core::engine::cost_profit::CostProfitService::new(
-		solver.pricing().clone(),
-		solver.delivery().clone(),
-		solver.token_manager().clone(),
-	);
-
-	for quote in &mut quotes {
-		match cost_profit_service
-			.estimate_cost_for_quote(quote, config)
-			.await
-		{
-			Ok(cost) => {
-				// quote.cost = Some(cost);
-				println!("cost: {:#?}", cost);
-			},
-			Err(e) => {
-				tracing::warn!(
-					"Failed to estimate cost for quote {}: {}",
-					quote.quote_id,
-					e
-				);
-			},
-		}
-	}
+	// NOTE: Cost calculation has been moved BEFORE generation and embedded in amounts
+	// No longer need post-generation cost enrichment
 
 	// Persist quotes
 	let validity_seconds = config

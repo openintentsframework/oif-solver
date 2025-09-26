@@ -13,25 +13,14 @@ use solver_config::Config;
 use solver_delivery::DeliveryService;
 use solver_pricing::PricingService;
 use solver_types::{
-	costs::{CostComponent, CostEstimate},
+	costs::{CostComponent, CostContext, CostEstimate},
 	current_timestamp, APIError, Address, ApiErrorType, ExecutionParams, FillProof, Order,
-	OrderInput, OrderOutput, Quote, QuoteInput, QuoteOutput, Transaction, TransactionHash,
-	DEFAULT_GAS_PRICE_WEI,
+	OrderInput, OrderOutput, Transaction, TransactionHash, DEFAULT_GAS_PRICE_WEI,
 };
 use std::{str::FromStr, sync::Arc};
 use thiserror::Error;
 
 const HUNDRED: i64 = 10000;
-
-/// Cost context for quote generation with pre-calculated costs
-#[derive(Debug, Clone)]
-pub struct CostContext {
-	pub total_gas_cost_usd: Decimal,
-	pub solver_margin_bps: u32,
-	pub execution_costs_by_chain: std::collections::HashMap<u64, Decimal>,
-	pub liquidity_cost_adjustment: Decimal,
-	pub protocol_fees: std::collections::HashMap<String, Decimal>,
-}
 
 #[derive(Debug, Error)]
 pub enum CostProfitError {
@@ -82,13 +71,227 @@ impl CostProfitService {
 		}
 	}
 
-	/// Calculate cost context before quote generation
+	/// Calculate base swap amounts using pricing service exchange rates.
+	///
+	/// This method determines the required token amounts for a swap based on the swap type:
+	/// - **ExactInput**: Calculates output amounts - how much output token the user will receive
+	/// - **ExactOutput**: Calculates input amounts - how much input token the user needs to provide
+	///
+	/// The calculation uses a two-step conversion through USD as a common base:
+	/// 1. Convert source token amount to USD value
+	/// 2. Convert USD value to target token amount
+	///
+	/// This approach ensures we can handle any token pair as long as both tokens
+	/// have USD pricing available, even if there's no direct trading pair.
+	///
+	/// # Arguments
+	/// * `request` - The quote request with input/output token specifications
+	/// * `context` - Validated context with known amounts and swap type
+	///
+	/// # Returns
+	/// HashMap mapping token addresses to their calculated amounts (in smallest unit)
+	/// Calculate swap amounts for missing inputs or outputs based on exchange rates.
+	///
+	/// This method determines the amounts for inputs (in ExactOutput swaps) or outputs
+	/// (in ExactInput swaps) by converting through USD as an intermediate currency.
+	///
+	/// ## Approach
+	///
+	/// Rather than equal distribution, we match exact input/output pairs:
+	/// - For multi-input, multi-output swaps, we pair inputs with outputs in order
+	/// - Each input amount is used to calculate its corresponding output amount
+	/// - If there are more outputs than inputs, remaining outputs get zero
+	/// - If there are more inputs than outputs, extra inputs contribute to the last output
+	///
+	/// ## Examples
+	///
+	/// - 1 input (100 USDC) → 2 outputs: First output gets full conversion, second gets zero
+	/// - 2 inputs (50 USDC each) → 1 output: Output gets sum of both conversions
+	/// - 2 inputs → 2 outputs: Each input converts to its corresponding output
+	pub async fn calculate_swap_amounts(
+		&self,
+		request: &solver_types::GetQuoteRequest,
+		context: &solver_types::ValidatedQuoteContext,
+	) -> Result<std::collections::HashMap<solver_types::InteropAddress, U256>, CostProfitError> {
+		use solver_types::SwapType;
+		let mut calculated_amounts = std::collections::HashMap::new();
+
+		match context.swap_type {
+			SwapType::ExactInput => {
+				// ExactInput: User specifies input amounts, we calculate output amounts
+				// Flow: Input Token → USD → Output Token
+				if let Some(known_inputs) = &context.known_inputs {
+					println!(
+						"🔄 ExactInput swap: calculating output amounts from {} known inputs",
+						known_inputs.len()
+					);
+					// Convert each input to USD and match with corresponding outputs
+					let mut input_usd_values = Vec::new();
+
+					for (input, input_amount) in known_inputs {
+						let input_chain_id = input.asset.ethereum_chain_id().map_err(|e| {
+							CostProfitError::Calculation(format!("Invalid input chain: {}", e))
+						})?;
+						let input_addr = input.asset.ethereum_address().map_err(|e| {
+							CostProfitError::Calculation(format!("Invalid input address: {}", e))
+						})?;
+						let input_token = self
+							.token_manager
+							.get_token_info(input_chain_id, &Address(input_addr.0.to_vec()))?;
+
+						// Convert raw amount to USD
+						let usd_value = Self::convert_raw_token_to_usd(
+							input_amount,
+							&input_token.symbol,
+							input_token.decimals,
+							&self.pricing_service,
+						)
+						.await
+						.map_err(|e| CostProfitError::Calculation(e.to_string()))?;
+
+						println!(
+							"💰 Input: {} ({}) = {} raw → ${} USD",
+							input_token.symbol, input.asset, input_amount, usd_value
+						);
+						input_usd_values.push(usd_value);
+					}
+
+					// Match inputs with outputs
+					for (idx, output) in request.intent.outputs.iter().enumerate() {
+						let output_usd = if idx < input_usd_values.len() {
+							// Direct pairing: use the corresponding input's USD value
+							input_usd_values[idx]
+						} else if !input_usd_values.is_empty() {
+							// More outputs than inputs: extra outputs get zero
+							Decimal::ZERO
+						} else {
+							Decimal::ZERO
+						};
+
+						// If there are more inputs than outputs, add remaining inputs to last output
+						let final_output_usd = if idx == request.intent.outputs.len() - 1
+							&& input_usd_values.len() > request.intent.outputs.len()
+						{
+							// Sum all remaining input values
+							let mut total = output_usd;
+							for value in input_usd_values.iter().skip(idx + 1) {
+								total += value;
+							}
+							total
+						} else {
+							output_usd
+						};
+
+						// Convert USD to output token amount
+						let output_amount = self
+							.convert_usd_to_token_amount(final_output_usd, &output.asset)
+							.await?;
+						println!(
+							"💱 Output: {} → ${} USD → {} raw",
+							output.asset, final_output_usd, output_amount
+						);
+						calculated_amounts.insert(output.asset.clone(), output_amount);
+					}
+				}
+			},
+			SwapType::ExactOutput => {
+				// ExactOutput: User specifies output amounts, we calculate input amounts
+				// Flow: Output Token → USD → Input Token
+				if let Some(known_outputs) = &context.known_outputs {
+					println!(
+						"🔄 ExactOutput swap: calculating input amounts from {} known outputs",
+						known_outputs.len()
+					);
+					// Convert each output to USD and match with corresponding inputs
+					let mut output_usd_values = Vec::new();
+
+					for (output, output_amount) in known_outputs {
+						let output_chain_id = output.asset.ethereum_chain_id().map_err(|e| {
+							CostProfitError::Calculation(format!("Invalid output chain: {}", e))
+						})?;
+						let output_addr = output.asset.ethereum_address().map_err(|e| {
+							CostProfitError::Calculation(format!("Invalid output address: {}", e))
+						})?;
+						let output_token = self
+							.token_manager
+							.get_token_info(output_chain_id, &Address(output_addr.0.to_vec()))?;
+
+						// Convert raw amount to USD
+						let usd_value = Self::convert_raw_token_to_usd(
+							output_amount,
+							&output_token.symbol,
+							output_token.decimals,
+							&self.pricing_service,
+						)
+						.await
+						.map_err(|e| CostProfitError::Calculation(e.to_string()))?;
+
+						println!(
+							"💰 Output: {} ({}) = {} raw → ${} USD",
+							output_token.symbol, output.asset, output_amount, usd_value
+						);
+						output_usd_values.push(usd_value);
+					}
+
+					// Match outputs with inputs
+					for (idx, input) in request.intent.inputs.iter().enumerate() {
+						let input_usd = if idx < output_usd_values.len() {
+							// Direct pairing: use the corresponding output's USD value
+							output_usd_values[idx]
+						} else if !output_usd_values.is_empty() {
+							// More inputs than outputs: extra inputs get zero
+							Decimal::ZERO
+						} else {
+							Decimal::ZERO
+						};
+
+						// If there are more outputs than inputs, add remaining outputs to last input
+						let final_input_usd = if idx == request.intent.inputs.len() - 1
+							&& output_usd_values.len() > request.intent.inputs.len()
+						{
+							// Sum all remaining output values
+							let mut total = input_usd;
+							for value in output_usd_values.iter().skip(idx + 1) {
+								total += value;
+							}
+							total
+						} else {
+							input_usd
+						};
+
+						// Convert USD to input token amount
+						let input_amount = self
+							.convert_usd_to_token_amount(final_input_usd, &input.asset)
+							.await?;
+						println!(
+							"💱 Input: {} → ${} USD → {} raw",
+							input.asset, final_input_usd, input_amount
+						);
+						calculated_amounts.insert(input.asset.clone(), input_amount);
+					}
+				}
+			},
+		}
+
+		tracing::debug!(
+			"Calculated swap amounts for {:?}: {} tokens",
+			context.swap_type,
+			calculated_amounts.len()
+		);
+
+		Ok(calculated_amounts)
+	}
+
+	/// Calculate cost context and swap amounts before quote generation
 	pub async fn calculate_cost_context(
 		&self,
-		inputs: &[QuoteInput],
-		outputs: &[QuoteOutput],
+		request: &solver_types::GetQuoteRequest,
+		context: &solver_types::ValidatedQuoteContext,
 		config: &Config,
 	) -> Result<CostContext, CostProfitError> {
+		// Use inputs and outputs from request
+		let inputs = &request.intent.inputs;
+		let outputs = &request.intent.outputs;
 		// Extract chain IDs
 		let origin_chain_id = inputs
 			.iter()
@@ -114,8 +317,8 @@ impl CostProfitService {
 		let origin_gp = self.get_chain_gas_price(origin_chain_id).await?;
 		let dest_gp = self.get_chain_gas_price(dest_chain_id).await?;
 
-		// Use config gas units for now
-		let flow_key = None; // Will be determined from lock type later
+		// Determine flow key from the request structure
+		let flow_key = request.flow_key();
 		let (open_units, fill_units, claim_units) =
 			estimate_gas_units_from_config(&flow_key, config, 200000, 150000, 100000);
 
@@ -158,61 +361,65 @@ impl CostProfitService {
 			.unwrap_or(Decimal::ZERO),
 		);
 
+		// Calculate total cost including margin
+		let solver_margin_bps = (config.solver.min_profitability_pct * Decimal::new(100, 0))
+			.to_u32()
+			.unwrap_or(50);
+		let margin = total_gas_cost_usd * Decimal::from(solver_margin_bps) / Decimal::from(10000);
+		let total_cost_usd = total_gas_cost_usd + margin;
+
+		// Pre-calculate cost amounts in relevant tokens
+		let mut cost_amounts_in_tokens = std::collections::HashMap::new();
+
+		// Calculate cost in each requested input token
+		for input in inputs {
+			let cost_in_token = self
+				.convert_usd_to_token_amount(total_cost_usd, &input.asset)
+				.await
+				.unwrap_or(U256::ZERO);
+			println!(
+				"💲 Cost in input token {}: ${} USD → {} raw",
+				input.asset, total_cost_usd, cost_in_token
+			);
+			cost_amounts_in_tokens.insert(input.asset.clone(), cost_in_token);
+		}
+
+		// Also calculate cost in each requested output token for reference
+		for output in outputs {
+			// Only add if not already calculated (in case same token appears in inputs)
+			if !cost_amounts_in_tokens.contains_key(&output.asset) {
+				let cost_in_token = self
+					.convert_usd_to_token_amount(total_cost_usd, &output.asset)
+					.await
+					.unwrap_or(U256::ZERO);
+				println!(
+					"💲 Cost in output token {}: ${} USD → {} raw",
+					output.asset, total_cost_usd, cost_in_token
+				);
+				cost_amounts_in_tokens.insert(output.asset.clone(), cost_in_token);
+			}
+		}
+
+		// Calculate base swap amounts for missing inputs/outputs
+		println!(
+			"🧮 Calculating base swap amounts for {:?}",
+			context.swap_type
+		);
+		let swap_amounts = self.calculate_swap_amounts(request, context).await?;
+		println!("✅ Calculated {} swap amounts", swap_amounts.len());
+		for (asset, amount) in &swap_amounts {
+			println!("  📊 {} → {} raw", asset, amount);
+		}
+
 		Ok(CostContext {
 			total_gas_cost_usd,
-			solver_margin_bps: (config.solver.min_profitability_pct * Decimal::new(100, 0))
-				.to_u32()
-				.unwrap_or(50), // Convert percentage to basis points
+			solver_margin_bps,
 			execution_costs_by_chain,
 			liquidity_cost_adjustment: Decimal::ZERO,
 			protocol_fees: std::collections::HashMap::new(),
+			cost_amounts_in_tokens,
+			swap_amounts,
 		})
-	}
-
-	/// Estimate cost for a Quote
-	pub async fn estimate_cost_for_quote(
-		&self,
-		_quote: &Quote,
-		_config: &Config,
-	) -> Result<CostEstimate, CostProfitError> {
-		Err(CostProfitError::Calculation(
-			"Quote cost estimation not yet implemented for new OIF structure".to_string(),
-		))
-
-		// let (origin_chain_id, dest_chain_id) = self.extract_chain_ids_from_quote(quote)?;
-
-		// let chain_params = ChainParams {
-		// 	origin_chain_id,
-		// 	dest_chain_id,
-		// };
-
-		// // Extract flow key from order type using helper method
-		// let flow_key = quote.order.flow_key();
-
-		// // TODO: pass standard as part of quote request
-		// let standard = "eip7683";
-		// let order = quote
-		// 	.to_order_for_estimation(standard)
-		// 	.map_err(|e| APIError::BadRequest {
-		// 		error_type: ApiErrorType::InvalidRequest,
-		// 		message: format!("Failed to convert quote to order: {}", e),
-		// 		details: None,
-		// 	})?;
-
-		// // Estimate gas units
-		// let gas_units = self
-		// 	.estimate_gas_units(
-		// 		&order,
-		// 		&flow_key,
-		// 		config,
-		// 		chain_params.origin_chain_id,
-		// 		chain_params.dest_chain_id,
-		// 	)
-		// 	.await?;
-
-		// // Calculate cost components
-		// self.calculate_cost_components(chain_params, gas_units, &inputs, &outputs, config)
-		// 	.await
 	}
 
 	/// Estimate cost for an Order using its OrderParsable implementation
@@ -921,6 +1128,65 @@ impl CostProfitService {
 
 		Decimal::from_str(&usd_amount_str)
 			.map_err(|e| format!("Failed to parse USD amount {}: {}", usd_amount_str, e).into())
+	}
+
+	/// Converts a USD amount to token amount in smallest unit
+	async fn convert_usd_to_token_amount(
+		&self,
+		usd_amount: Decimal,
+		asset: &solver_types::InteropAddress,
+	) -> Result<U256, CostProfitError> {
+		// Get token info
+		let chain_id = asset
+			.ethereum_chain_id()
+			.map_err(|e| CostProfitError::Calculation(format!("Failed to get chain ID: {}", e)))?;
+		let ethereum_addr = asset.ethereum_address().map_err(|e| {
+			CostProfitError::Calculation(format!("Failed to get ethereum address: {}", e))
+		})?;
+		let token_address = Address(ethereum_addr.0.to_vec());
+
+		let token_info = self
+			.token_manager
+			.get_token_info(chain_id, &token_address)?;
+
+		// Convert USD to token amount (normalized)
+		let token_amount_str = self
+			.pricing_service
+			.convert_asset("USD", &token_info.symbol, &usd_amount.to_string())
+			.await
+			.map_err(|e| {
+				CostProfitError::Calculation(format!(
+					"Failed to convert USD to {}: {}",
+					token_info.symbol, e
+				))
+			})?;
+
+		let token_amount_decimal = Decimal::from_str(&token_amount_str).map_err(|e| {
+			CostProfitError::Calculation(format!("Failed to parse token amount: {}", e))
+		})?;
+
+		// Convert to smallest unit (apply decimals)
+		let multiplier = U256::from(10u64).pow(U256::from(token_info.decimals));
+
+		// Convert decimal to U256 (handle fractional part properly)
+		let whole_part = token_amount_decimal.trunc();
+		let fractional_part = token_amount_decimal - whole_part;
+
+		// Convert whole part to U256
+		let whole_u256 = U256::from_str(&whole_part.to_string()).map_err(|e| {
+			CostProfitError::Calculation(format!("Failed to convert to U256: {}", e))
+		})?;
+
+		// Calculate fractional part in smallest units
+		let fractional_multiplier = Decimal::new(10_i64.pow(token_info.decimals as u32), 0);
+		let fractional_in_smallest = (fractional_part * fractional_multiplier).trunc();
+		let fractional_u256 =
+			U256::from_str(&fractional_in_smallest.to_string()).unwrap_or(U256::ZERO);
+
+		// Combine whole and fractional parts
+		let result = whole_u256 * multiplier + fractional_u256;
+
+		Ok(result)
 	}
 }
 

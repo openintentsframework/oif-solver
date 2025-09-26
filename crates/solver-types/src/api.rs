@@ -644,6 +644,20 @@ pub struct IntentRequest {
 	pub metadata: Option<serde_json::Value>,
 }
 
+/// Rich validation context
+#[derive(Debug, Clone)]
+pub struct ValidatedQuoteContext {
+	pub swap_type: SwapType,
+	pub known_inputs: Option<Vec<(QuoteInput, U256)>>,
+	pub known_outputs: Option<Vec<(QuoteOutput, U256)>>,
+	pub constraint_inputs: Option<Vec<(QuoteInput, Option<U256>)>>,
+	pub constraint_outputs: Option<Vec<(QuoteOutput, Option<U256>)>>,
+	pub inferred_order_types: Vec<String>,
+	pub compatible_auth_schemes: Vec<AuthScheme>,
+	pub inputs_for_balance_check: Vec<QuoteInput>,
+	pub outputs_for_balance_check: Vec<QuoteOutput>,
+}
+
 /// Request for getting price quotes - new OIF spec structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetQuoteRequest {
@@ -654,6 +668,39 @@ pub struct GetQuoteRequest {
 	/// Supported order types
 	#[serde(rename = "supportedTypes")]
 	pub supported_types: Vec<String>,
+}
+
+impl GetQuoteRequest {
+	/// Determines the appropriate flow key for gas configuration based on the request structure.
+	/// Analyzes inputs for lock types and origin submission for auth schemes to construct the flow key.
+	pub fn flow_key(&self) -> Option<String> {
+		// Check if any input has a lock - if so, use resource lock flow
+		for input in &self.intent.inputs {
+			if let Some(lock) = &input.lock {
+				match lock.kind {
+					LockKind::TheCompact => return Some("resource_lock".to_string()),
+					LockKind::Rhinestone => return Some("resource_lock".to_string()),
+				}
+			}
+		}
+
+		// No locks found, default to escrow - determine auth scheme from origin submission
+		if let Some(origin_submission) = &self.intent.origin_submission {
+			if let Some(schemes) = &origin_submission.schemes {
+				if let Some(scheme) = schemes.iter().next() {
+					match scheme {
+						AuthScheme::Eip3009 => return Some("eip3009_escrow".to_string()),
+						AuthScheme::Permit2 => return Some("permit2_escrow".to_string()),
+						AuthScheme::Erc20Permit => return Some("permit2_escrow".to_string()),
+						AuthScheme::Erc4337 => return Some("permit2_escrow".to_string()), // Default to permit2
+					}
+				}
+			}
+		}
+
+		// Default fallback to permit2_escrow if no specific scheme is found
+		Some("permit2_escrow".to_string())
+	}
 }
 
 /// Legacy V1 structure for backward compatibility during migration

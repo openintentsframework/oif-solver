@@ -64,12 +64,27 @@ pub fn build_permit2_batch_witness_digest(
 		.ethereum_address()
 		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid recipient address: {}", e)))?;
 
-	// TODO: Handle swap-type properly - for now use "0" if amount is None
-	let amount: U256 = input
+	// Input amount should always be set after cost adjustment
+	let input_amount: U256 = input
+		.amount
+		.as_ref()
+		.ok_or_else(|| {
+			QuoteError::InvalidRequest("Input amount not set after cost adjustment".to_string())
+		})?
+		.parse()
+		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input amount format: {}", e)))?;
+
+	// Get output amount from request (this should be our adjusted amount)
+	let output_amount: U256 = output
 		.amount
 		.as_ref()
 		.and_then(|s| U256::from_str_radix(s, 10).ok())
 		.unwrap_or(U256::ZERO);
+
+	println!(
+		"🔍 Permit2 using amounts: input={}, output={}",
+		input_amount, output_amount
+	);
 
 	// Spender = INPUT settler on origin chain
 	let origin_net = config.networks.get(&origin_chain_id).ok_or_else(|| {
@@ -145,7 +160,7 @@ pub fn build_permit2_batch_witness_digest(
 	enc.push_address(&output_settler);
 	enc.push_u256(U256::from(dest_chain_id));
 	enc.push_address(&dest_token);
-	enc.push_u256(amount);
+	enc.push_u256(output_amount);
 	enc.push_address(&recipient);
 	enc.push_b256(&empty_bytes_hash);
 	enc.push_b256(&empty_bytes_hash);
@@ -165,7 +180,7 @@ pub fn build_permit2_batch_witness_digest(
 	let mut enc = Eip712AbiEncoder::new();
 	enc.push_b256(&token_permissions_type_hash);
 	enc.push_address(&origin_token);
-	enc.push_u256(amount);
+	enc.push_u256(input_amount);
 	let token_perm_hash = keccak256(enc.finish());
 
 	let permitted_array_hash = keccak256(token_perm_hash.as_slice());
@@ -204,7 +219,7 @@ pub fn build_permit2_batch_witness_digest(
 		},
 		"permitted": [{
 			"token": format!("0x{:x}", origin_token),
-			"amount": amount.to_string(),
+			"amount": input_amount.to_string(),
 		}],
 		"spender": format!("0x{:x}", spender),
 		"nonce": nonce_ms.to_string(),
@@ -217,7 +232,7 @@ pub fn build_permit2_batch_witness_digest(
 				"settler": format!("0x{}{:x}", "0".repeat(24), output_settler),
 				"chainId": dest_chain_id,
 				"token": format!("0x{}{:x}", "0".repeat(24), dest_token),
-				"amount": amount.to_string(),
+				"amount": output_amount.to_string(),
 				"recipient": format!("0x{}{:x}", "0".repeat(24), recipient),
 				"call": "0x",
 				"context": "0x"
