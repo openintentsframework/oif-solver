@@ -14,9 +14,9 @@ use solver_delivery::DeliveryService;
 use solver_pricing::PricingService;
 use solver_types::{
 	costs::{CostComponent, CostEstimate},
-	current_timestamp, APIError, Address, ApiErrorType, ExecutionParams, FillProof, Order,
-	OrderInput, OrderOutput, Quote, QuoteInput, QuoteOutput, Transaction, TransactionHash,
-	DEFAULT_GAS_PRICE_WEI,
+	current_timestamp, APIError, Address, ApiErrorType, ExecutionParams, FillProof,
+	GetQuoteRequest, IntentRequest, Order, OrderInput, OrderOutput, QuoteInput, QuoteOutput,
+	SwapType, Transaction, TransactionHash, DEFAULT_GAS_PRICE_WEI,
 };
 use std::{str::FromStr, sync::Arc};
 use thiserror::Error;
@@ -31,6 +31,16 @@ pub struct CostContext {
 	pub execution_costs_by_chain: std::collections::HashMap<u64, Decimal>,
 	pub liquidity_cost_adjustment: Decimal,
 	pub protocol_fees: std::collections::HashMap<String, Decimal>,
+}
+
+/// Result of quote generation with profit-guaranteed calculations
+#[derive(Debug, Clone)]
+pub struct QuoteResult {
+	pub quoted_intent: IntentRequest, // Intent with all amounts filled
+	pub calculated_inputs: Vec<(usize, String)>, // (index, calculated_amount)
+	pub calculated_outputs: Vec<(usize, String)>, // (index, calculated_amount)
+	pub cost_context: CostContext,    // Cost breakdown
+	pub profit_margin: Decimal,       // Actual profit margin %
 }
 
 #[derive(Debug, Error)]
@@ -167,52 +177,6 @@ impl CostProfitService {
 			liquidity_cost_adjustment: Decimal::ZERO,
 			protocol_fees: std::collections::HashMap::new(),
 		})
-	}
-
-	/// Estimate cost for a Quote
-	pub async fn estimate_cost_for_quote(
-		&self,
-		_quote: &Quote,
-		_config: &Config,
-	) -> Result<CostEstimate, CostProfitError> {
-		Err(CostProfitError::Calculation(
-			"Quote cost estimation not yet implemented for new OIF structure".to_string(),
-		))
-
-		// let (origin_chain_id, dest_chain_id) = self.extract_chain_ids_from_quote(quote)?;
-
-		// let chain_params = ChainParams {
-		// 	origin_chain_id,
-		// 	dest_chain_id,
-		// };
-
-		// // Extract flow key from order type using helper method
-		// let flow_key = quote.order.flow_key();
-
-		// // TODO: pass standard as part of quote request
-		// let standard = "eip7683";
-		// let order = quote
-		// 	.to_order_for_estimation(standard)
-		// 	.map_err(|e| APIError::BadRequest {
-		// 		error_type: ApiErrorType::InvalidRequest,
-		// 		message: format!("Failed to convert quote to order: {}", e),
-		// 		details: None,
-		// 	})?;
-
-		// // Estimate gas units
-		// let gas_units = self
-		// 	.estimate_gas_units(
-		// 		&order,
-		// 		&flow_key,
-		// 		config,
-		// 		chain_params.origin_chain_id,
-		// 		chain_params.dest_chain_id,
-		// 	)
-		// 	.await?;
-
-		// // Calculate cost components
-		// self.calculate_cost_components(chain_params, gas_units, &inputs, &outputs, config)
-		// 	.await
 	}
 
 	/// Estimate cost for an Order using its OrderParsable implementation
@@ -864,6 +828,385 @@ impl CostProfitService {
         );
 
 		Ok((base_price_usd.to_string(), min_required_profit.to_string()))
+	}
+
+	/// Generate quote with profit-guaranteed calculations
+	/// This method ensures the solver always maintains minimum profitability
+	pub async fn generate_quote_with_calculations(
+		&self,
+		quote_request: &GetQuoteRequest,
+		config: &Config,
+	) -> Result<QuoteResult, CostProfitError> {
+		// Step 1: Validate swap type requirements
+		self.validate_swap_type_amounts(&quote_request.intent)?;
+
+		// Step 2: Calculate execution costs
+		let cost_context = self
+			.calculate_cost_context(
+				&quote_request.intent.inputs,
+				&quote_request.intent.outputs,
+				config,
+			)
+			.await?;
+
+		// Step 3: Calculate missing amounts OR use provided amounts
+		let (quoted_intent, calculated_inputs, calculated_outputs) =
+			if self.all_amounts_provided(&quote_request.intent) {
+				// All amounts provided - no calculations needed, just use them as-is
+				(quote_request.intent.clone(), Vec::new(), Vec::new())
+			} else {
+				// Some amounts missing - calculate them with profit guarantees
+				self.calculate_profitable_amounts(&quote_request.intent, &cost_context)
+					.await?
+			};
+
+		// Step 4: Calculate final profit margin (should always meet minimum)
+		let profit_margin = self
+			.calculate_profit_margin_for_complete_intent(&quoted_intent, &cost_context)
+			.await?;
+
+		// Convert basis points back to percentage for comparison
+		let min_profitability_pct =
+			Decimal::new(cost_context.solver_margin_bps as i64, 0) / Decimal::new(100, 0);
+		if profit_margin < min_profitability_pct {
+			return Err(CostProfitError::Calculation(
+				"Profit margin is less than minimum profitability".to_string(),
+			));
+		}
+
+		Ok(QuoteResult {
+			quoted_intent,
+			calculated_inputs,
+			calculated_outputs,
+			cost_context,
+			profit_margin,
+		})
+	}
+
+	/// Check if all input and output amounts are already provided
+	fn all_amounts_provided(&self, intent: &IntentRequest) -> bool {
+		intent.inputs.iter().all(|i| i.amount.is_some())
+			&& intent.outputs.iter().all(|o| o.amount.is_some())
+	}
+
+	/// Validate that required amounts are present based on swap type
+	fn validate_swap_type_amounts(&self, intent: &IntentRequest) -> Result<(), CostProfitError> {
+		match intent.swap_type.as_ref().unwrap_or(&SwapType::ExactInput) {
+			SwapType::ExactInput => {
+				// At least one input must have an amount
+				let has_input_amount = intent.inputs.iter().any(|i| i.amount.is_some());
+				if !has_input_amount {
+					return Err(CostProfitError::Calculation(
+						"Exact-input swap requires at least one input amount".to_string(),
+					));
+				}
+			},
+			SwapType::ExactOutput => {
+				// At least one output must have an amount
+				let has_output_amount = intent.outputs.iter().any(|o| o.amount.is_some());
+				if !has_output_amount {
+					return Err(CostProfitError::Calculation(
+						"Exact-output swap requires at least one output amount".to_string(),
+					));
+				}
+			},
+		}
+		Ok(())
+	}
+
+	/// Calculate missing amounts that guarantee minimum profitability
+	async fn calculate_profitable_amounts(
+		&self,
+		intent: &IntentRequest,
+		cost_context: &CostContext,
+	) -> Result<(IntentRequest, Vec<(usize, String)>, Vec<(usize, String)>), CostProfitError> {
+		let mut complete_intent = intent.clone();
+		let mut calculated_inputs = Vec::new();
+		let mut calculated_outputs = Vec::new();
+
+		match intent.swap_type.as_ref().unwrap_or(&SwapType::ExactInput) {
+			SwapType::ExactInput => {
+				// Calculate maximum profitable output amounts
+				for (index, output) in intent.outputs.iter().enumerate() {
+					if output.amount.is_none() {
+						let calculated_amount = self
+							.calculate_max_profitable_output(&intent.inputs, output, cost_context)
+							.await?;
+						complete_intent.outputs[index].amount = Some(calculated_amount.clone());
+						calculated_outputs.push((index, calculated_amount));
+					}
+				}
+			},
+			SwapType::ExactOutput => {
+				// Calculate minimum profitable input amounts
+				for (index, input) in intent.inputs.iter().enumerate() {
+					if input.amount.is_none() {
+						let calculated_amount = self
+							.calculate_min_profitable_input(input, &intent.outputs, cost_context)
+							.await?;
+						complete_intent.inputs[index].amount = Some(calculated_amount.clone());
+						calculated_inputs.push((index, calculated_amount));
+					}
+				}
+			},
+		}
+
+		Ok((complete_intent, calculated_inputs, calculated_outputs))
+	}
+
+	/// Calculate maximum output while maintaining minimum profit (exact-input)
+	async fn calculate_max_profitable_output(
+		&self,
+		inputs: &[QuoteInput],
+		target_output: &QuoteOutput,
+		cost_context: &CostContext,
+	) -> Result<String, CostProfitError> {
+		// Convert inputs to USD
+		let total_input_value_usd = self.calculate_total_input_value_usd(inputs).await?;
+
+		// Calculate required costs and minimum profit
+		let protocol_fees_total = cost_context.protocol_fees.values().sum::<Decimal>();
+		let operational_cost_usd = cost_context.total_gas_cost_usd
+			+ cost_context.liquidity_cost_adjustment
+			+ protocol_fees_total;
+		let min_profitability_pct =
+			Decimal::new(cost_context.solver_margin_bps as i64, 0) / Decimal::new(10000, 0);
+		let min_profit_usd = total_input_value_usd * min_profitability_pct;
+
+		// Calculate available value for output
+		let available_for_output_usd =
+			total_input_value_usd - operational_cost_usd - min_profit_usd;
+
+		if available_for_output_usd <= Decimal::ZERO {
+			return Err(CostProfitError::Calculation(
+				"Input value insufficient to cover costs and minimum profit".to_string(),
+			));
+		}
+
+		// Convert to output token
+		self.convert_usd_to_token_amount(available_for_output_usd, target_output)
+			.await
+	}
+
+	/// Calculate minimum input while maintaining minimum profit (exact-output)
+	async fn calculate_min_profitable_input(
+		&self,
+		target_input: &QuoteInput,
+		outputs: &[QuoteOutput],
+		cost_context: &CostContext,
+	) -> Result<String, CostProfitError> {
+		// Convert outputs to USD
+		let total_output_value_usd = self.calculate_total_output_value_usd(outputs).await?;
+
+		// Calculate required costs and minimum profit
+		let protocol_fees_total = cost_context.protocol_fees.values().sum::<Decimal>();
+		let operational_cost_usd = cost_context.total_gas_cost_usd
+			+ cost_context.liquidity_cost_adjustment
+			+ protocol_fees_total;
+		let min_profitability_pct =
+			Decimal::new(cost_context.solver_margin_bps as i64, 0) / Decimal::new(10000, 0);
+		let min_profit_usd = total_output_value_usd * min_profitability_pct;
+
+		// Calculate required input value
+		let required_input_value_usd =
+			total_output_value_usd + operational_cost_usd + min_profit_usd;
+
+		// Convert to input token
+		self.convert_usd_to_quote_input_amount(required_input_value_usd, target_input)
+			.await
+	}
+
+	/// Calculate profit margin for a complete intent
+	async fn calculate_profit_margin_for_complete_intent(
+		&self,
+		complete_intent: &IntentRequest,
+		cost_context: &CostContext,
+	) -> Result<Decimal, CostProfitError> {
+		// Convert inputs and outputs to USD
+		let total_input_value_usd = self
+			.calculate_total_input_value_usd(&complete_intent.inputs)
+			.await?;
+		let total_output_value_usd = self
+			.calculate_total_output_value_usd(&complete_intent.outputs)
+			.await?;
+
+		// Calculate profit including all operational costs
+		let protocol_fees_total = cost_context.protocol_fees.values().sum::<Decimal>();
+		let operational_cost_usd = cost_context.total_gas_cost_usd
+			+ cost_context.liquidity_cost_adjustment
+			+ protocol_fees_total;
+		let profit_usd = total_input_value_usd - total_output_value_usd - operational_cost_usd;
+
+		// Calculate margin as percentage
+		if total_input_value_usd.is_zero() {
+			return Err(CostProfitError::Calculation(
+				"Cannot calculate margin: total input value is zero".to_string(),
+			));
+		}
+
+		let profit_margin = (profit_usd / total_input_value_usd) * Decimal::new(100, 0);
+		Ok(profit_margin)
+	}
+
+	/// Helper: Calculate total input value in USD
+	async fn calculate_total_input_value_usd(
+		&self,
+		inputs: &[QuoteInput],
+	) -> Result<Decimal, CostProfitError> {
+		let mut total_value_usd = Decimal::ZERO;
+
+		for input in inputs {
+			if let Some(amount_str) = &input.amount {
+				let amount = U256::from_str(amount_str).map_err(|e| {
+					CostProfitError::Calculation(format!("Invalid input amount: {}", e))
+				})?;
+
+				let chain_id = input.asset.ethereum_chain_id().map_err(|e| {
+					CostProfitError::Calculation(format!("Failed to get chain ID: {}", e))
+				})?;
+
+				let ethereum_addr = input.asset.ethereum_address().map_err(|e| {
+					CostProfitError::Calculation(format!("Failed to get address: {}", e))
+				})?;
+
+				let token_address = Address(ethereum_addr.0.to_vec());
+				let token_info = self
+					.token_manager
+					.get_token_info(chain_id, &token_address)?;
+
+				let usd_amount = Self::convert_raw_token_to_usd(
+					&amount,
+					&token_info.symbol,
+					token_info.decimals,
+					&self.pricing_service,
+				)
+				.await
+				.map_err(|e| CostProfitError::Calculation(e.to_string()))?;
+
+				total_value_usd += usd_amount;
+			}
+		}
+
+		Ok(total_value_usd)
+	}
+
+	/// Helper: Calculate total output value in USD
+	async fn calculate_total_output_value_usd(
+		&self,
+		outputs: &[QuoteOutput],
+	) -> Result<Decimal, CostProfitError> {
+		let mut total_value_usd = Decimal::ZERO;
+
+		for output in outputs {
+			if let Some(amount_str) = &output.amount {
+				let amount = U256::from_str(amount_str).map_err(|e| {
+					CostProfitError::Calculation(format!("Invalid output amount: {}", e))
+				})?;
+
+				let chain_id = output.asset.ethereum_chain_id().map_err(|e| {
+					CostProfitError::Calculation(format!("Failed to get chain ID: {}", e))
+				})?;
+
+				let ethereum_addr = output.asset.ethereum_address().map_err(|e| {
+					CostProfitError::Calculation(format!("Failed to get address: {}", e))
+				})?;
+
+				let token_address = Address(ethereum_addr.0.to_vec());
+				let token_info = self
+					.token_manager
+					.get_token_info(chain_id, &token_address)?;
+
+				let usd_amount = Self::convert_raw_token_to_usd(
+					&amount,
+					&token_info.symbol,
+					token_info.decimals,
+					&self.pricing_service,
+				)
+				.await
+				.map_err(|e| CostProfitError::Calculation(e.to_string()))?;
+
+				total_value_usd += usd_amount;
+			}
+		}
+
+		Ok(total_value_usd)
+	}
+
+	/// Helper: Convert USD amount to target output token amount
+	async fn convert_usd_to_token_amount(
+		&self,
+		usd_amount: Decimal,
+		target_output: &QuoteOutput,
+	) -> Result<String, CostProfitError> {
+		let chain_id = target_output.asset.ethereum_chain_id().map_err(|e| {
+			CostProfitError::Calculation(format!("Failed to get output chain ID: {}", e))
+		})?;
+
+		let ethereum_addr = target_output.asset.ethereum_address().map_err(|e| {
+			CostProfitError::Calculation(format!("Failed to get output address: {}", e))
+		})?;
+
+		let token_address = Address(ethereum_addr.0.to_vec());
+		let token_info = self
+			.token_manager
+			.get_token_info(chain_id, &token_address)?;
+
+		// Convert USD to normalized token amount
+		let token_amount_str = self
+			.pricing_service
+			.convert_asset("USD", &token_info.symbol, &usd_amount.to_string())
+			.await
+			.map_err(|e| {
+				CostProfitError::Calculation(format!(
+					"Failed to convert USD to output token: {}",
+					e
+				))
+			})?;
+
+		Ok(token_amount_str)
+	}
+
+	/// Helper: Convert USD amount to target input token amount
+	async fn convert_usd_to_quote_input_amount(
+		&self,
+		usd_amount: Decimal,
+		target_input: &QuoteInput,
+	) -> Result<String, CostProfitError> {
+		let chain_id = target_input.asset.ethereum_chain_id().map_err(|e| {
+			CostProfitError::Calculation(format!("Failed to get input chain ID: {}", e))
+		})?;
+
+		let ethereum_addr = target_input.asset.ethereum_address().map_err(|e| {
+			CostProfitError::Calculation(format!("Failed to get input address: {}", e))
+		})?;
+
+		let token_address = Address(ethereum_addr.0.to_vec());
+		let token_info = self
+			.token_manager
+			.get_token_info(chain_id, &token_address)?;
+
+		// Convert USD to normalized token amount
+		let token_amount_str = self
+			.pricing_service
+			.convert_asset("USD", &token_info.symbol, &usd_amount.to_string())
+			.await
+			.map_err(|e| {
+				CostProfitError::Calculation(format!("Failed to convert USD to input token: {}", e))
+			})?;
+
+		// Convert to raw amount
+		let token_amount_decimal = Decimal::from_str(&token_amount_str).map_err(|e| {
+			CostProfitError::Calculation(format!("Failed to parse token amount: {}", e))
+		})?;
+
+		let raw_amount = if token_info.decimals > 0 {
+			let multiplier = Decimal::new(10_i64.pow(token_info.decimals as u32), 0);
+			token_amount_decimal * multiplier
+		} else {
+			token_amount_decimal
+		};
+
+		Ok(raw_amount.trunc().to_string())
 	}
 
 	/// Gets the gas price for a specific chain

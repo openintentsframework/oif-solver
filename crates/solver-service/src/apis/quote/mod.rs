@@ -77,7 +77,7 @@ use solver_config::{Config, QuoteConfig};
 use solver_core::SolverEngine;
 use solver_types::{GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, StorageKey};
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tracing::info;
 
 /// Processes a quote request and returns available quote options.
@@ -112,7 +112,16 @@ pub async fn process_quote_request(
 	// Generate quotes using the business logic layer
 	let settlement_service = solver.settlement();
 	let delivery_service = solver.delivery();
-	let quote_generator = QuoteGenerator::new(settlement_service.clone(), delivery_service.clone());
+	let cost_profit_service = Arc::new(solver_core::engine::cost_profit::CostProfitService::new(
+		solver.pricing().clone(),
+		solver.delivery().clone(),
+		solver.token_manager().clone(),
+	));
+	let quote_generator = QuoteGenerator::new(
+		settlement_service.clone(),
+		delivery_service.clone(),
+		cost_profit_service,
+	);
 	let mut quotes = quote_generator
 		.generate_quotes(&request, &validated_context, config)
 		.await?;
@@ -126,7 +135,7 @@ pub async fn process_quote_request(
 
 	for quote in &mut quotes {
 		match cost_profit_service
-			.estimate_cost_for_quote(quote, config)
+			.generate_quote_with_calculations(&request, config)
 			.await
 		{
 			Ok(cost) => {
