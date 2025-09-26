@@ -105,7 +105,7 @@ pub fn ecrecover_user_from_signature(
 	}
 
 	// Handle different signature formats
-	tracing::info!(
+	tracing::debug!(
 		"Signature length: {} bytes, first 4 bytes: 0x{}",
 		sig_bytes.len(),
 		hex::encode(&sig_bytes[..4.min(sig_bytes.len())])
