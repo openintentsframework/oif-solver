@@ -386,7 +386,6 @@ async fn create_intent_from_quote(
 		}
 	})?;
 
-	tracing::info!("Quote conversion successful, PostOrderRequest created");
 	Ok(result)
 }
 
