@@ -5,11 +5,53 @@ use std::collections::HashMap;
 
 use crate::InteropAddress;
 
+/// Detailed breakdown of costs for order processing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostBreakdown {
+	// Gas components
+	#[serde(with = "rust_decimal::serde::str")]
+	pub gas_open: Decimal,
+	#[serde(with = "rust_decimal::serde::str")]
+	pub gas_fill: Decimal,
+	#[serde(with = "rust_decimal::serde::str")]
+	pub gas_claim: Decimal,
+	#[serde(with = "rust_decimal::serde::str")]
+	pub gas_buffer: Decimal,
+
+	// Market components
+	#[serde(with = "rust_decimal::serde::str")]
+	pub rate_buffer: Decimal,
+	#[serde(with = "rust_decimal::serde::str")]
+	pub base_price: Decimal, // Covers negative spreads
+
+	// Profit components
+	#[serde(with = "rust_decimal::serde::str")]
+	pub min_profit: Decimal, // Based on transaction value, not gas!
+	#[serde(with = "rust_decimal::serde::str")]
+	pub commission: Decimal,
+
+	// Totals
+	#[serde(with = "rust_decimal::serde::str")]
+	pub operational_cost: Decimal, // gas + buffers
+	#[serde(with = "rust_decimal::serde::str")]
+	pub subtotal: Decimal, // operational + base_price + min_profit
+	#[serde(with = "rust_decimal::serde::str")]
+	pub total: Decimal, // subtotal + commission
+
+	// Market values (for logging/analysis)
+	#[serde(with = "rust_decimal::serde::str")]
+	pub market_input_value: Decimal,
+	#[serde(with = "rust_decimal::serde::str")]
+	pub market_output_value: Decimal,
+
+	// Metadata
+	pub currency: String,
+}
+
 /// Cost context for quote generation with pre-calculated costs and swap amounts
 #[derive(Debug, Clone)]
 pub struct CostContext {
-	pub total_gas_cost_usd: Decimal,
-	pub solver_margin_bps: u32,
+	pub cost_breakdown: CostBreakdown,
 	pub execution_costs_by_chain: HashMap<u64, Decimal>,
 	pub liquidity_cost_adjustment: Decimal,
 	pub protocol_fees: HashMap<String, Decimal>,
@@ -19,50 +61,4 @@ pub struct CostContext {
 	/// For ExactInput: contains calculated output amounts
 	/// For ExactOutput: contains calculated input amounts
 	pub swap_amounts: HashMap<InteropAddress, U256>,
-	/// Optional constraint violation message if swap amounts don't meet requirements
-	pub constraint_violation: Option<String>,
-}
-
-impl CostContext {
-	/// Calculate total solver fee in USD including all components
-	pub fn total_solver_fee_usd(&self) -> Decimal {
-		// Calculate margin as percentage of gas costs
-		let margin =
-			self.total_gas_cost_usd * Decimal::from(self.solver_margin_bps) / Decimal::from(10000);
-
-		// Total = gas + margin + liquidity adjustment + protocol fees
-		let protocol_fees_total: Decimal = self.protocol_fees.values().cloned().sum();
-		self.total_gas_cost_usd + margin + self.liquidity_cost_adjustment + protocol_fees_total
-	}
-}
-
-/// Named amount used for cost components.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CostComponent {
-	/// Human-readable component name (e.g., "base-price", "gas-fill", "gas-claim", "buffer-gas", "buffer-rates", "commission")
-	pub name: String,
-	/// Amount as a decimal string in the display currency (matches CostEstimate.currency)
-	pub amount: String,
-	/// Amount as a wei string for gas-related costs (optional)
-	#[serde(rename = "amountWei", skip_serializing_if = "Option::is_none")]
-	pub amount_wei: Option<String>,
-}
-
-/// Unified cost estimate for any order type (standard-agnostic).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CostEstimate {
-	/// Display currency for cost components (e.g., "USDC", "USD").
-	pub currency: String,
-	/// Individual components that sum to the subtotal.
-	pub components: Vec<CostComponent>,
-	/// Commission fee in basis points applied over subtotal.
-	#[serde(rename = "commissionBps")]
-	pub commission_bps: u32,
-	/// Commission amount as a decimal string in the same currency.
-	#[serde(rename = "commissionAmount")]
-	pub commission_amount: String,
-	/// Subtotal before commission, as a decimal string.
-	pub subtotal: String,
-	/// Total price including commission, as a decimal string.
-	pub total: String,
 }

@@ -126,6 +126,9 @@ impl QuoteGenerator {
 		// Build a new request with swap amounts and cost adjustments from CostContext
 		let adjusted_request = self.build_cost_adjusted_request(request, context, cost_context)?;
 
+		// Validate constraints on the adjusted amounts
+		self.validate_swap_amount_constraints(&adjusted_request, context)?;
+
 		// Generate quotes using the adjusted request
 		let quotes = self.generate_quotes(&adjusted_request, config).await?;
 
@@ -215,6 +218,71 @@ impl QuoteGenerator {
 		}
 
 		Ok(adjusted)
+	}
+
+	/// Validate that adjusted amounts meet the constraints
+	fn validate_swap_amount_constraints(
+		&self,
+		adjusted_request: &GetQuoteRequest,
+		context: &ValidatedQuoteContext,
+	) -> Result<(), QuoteError> {
+		use alloy_primitives::U256;
+		use std::str::FromStr;
+
+		match context.swap_type {
+			SwapType::ExactInput => {
+				// For exact-input: check that output amounts meet minimums
+				if let Some(constraints) = &context.constraint_outputs {
+					for (output, constraint_amount_opt) in constraints {
+						if let Some(constraint_amount) = constraint_amount_opt {
+							// Find the adjusted output amount
+							let adjusted_output = adjusted_request
+								.intent
+								.outputs
+								.iter()
+								.find(|o| o.asset == output.asset)
+								.and_then(|o| o.amount.as_ref())
+								.and_then(|amt| U256::from_str(amt).ok())
+								.unwrap_or(U256::ZERO);
+
+							if adjusted_output < *constraint_amount {
+								return Err(QuoteError::InvalidRequest(format!(
+									"Output amount for {} ({}) below minimum required ({})",
+									output.asset, adjusted_output, constraint_amount
+								)));
+							}
+						}
+					}
+				}
+			},
+			SwapType::ExactOutput => {
+				// For exact-output: check that input amounts don't exceed maximums
+				if let Some(constraints) = &context.constraint_inputs {
+					for (input, constraint_amount_opt) in constraints {
+						if let Some(constraint_amount) = constraint_amount_opt {
+							// Find the adjusted input amount
+							let adjusted_input = adjusted_request
+								.intent
+								.inputs
+								.iter()
+								.find(|i| i.asset == input.asset)
+								.and_then(|i| i.amount.as_ref())
+								.and_then(|amt| U256::from_str(amt).ok())
+								.unwrap_or(U256::ZERO);
+
+							if adjusted_input > *constraint_amount {
+								return Err(QuoteError::InvalidRequest(format!(
+									"Input amount for {} ({}) exceeds maximum allowed ({})",
+									input.asset, adjusted_input, constraint_amount
+								)));
+							}
+						}
+					}
+				}
+			},
+		}
+
+		Ok(())
 	}
 
 	async fn generate_quote_for_settlement(

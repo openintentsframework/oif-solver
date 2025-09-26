@@ -108,11 +108,6 @@ pub async fn process_quote_request(
 		.await
 		.map_err(|e| QuoteError::Internal(format!("Failed to calculate cost context: {}", e)))?;
 
-	// Check if there are any constraint violations
-	if let Some(violation_msg) = &cost_context.constraint_violation {
-		return Err(QuoteError::InvalidRequest(violation_msg.clone()));
-	}
-
 	// Check solver capabilities: networks only (token support is enforced during collection below)
 	QuoteValidator::validate_supported_networks(&request, solver)?;
 
