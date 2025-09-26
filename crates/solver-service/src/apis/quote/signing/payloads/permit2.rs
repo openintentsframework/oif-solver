@@ -105,14 +105,18 @@ pub fn build_permit2_batch_witness_digest(
 	// Nonce and deadlines
 	let now_secs = chrono::Utc::now().timestamp() as u64;
 	let nonce_ms: U256 = U256::from((chrono::Utc::now().timestamp_millis()) as u128);
-	let validity_seconds = config
-		.api
-		.as_ref()
-		.and_then(|api| api.quote.as_ref())
-		.map(|quote| quote.validity_seconds)
-		.unwrap_or_else(|| QuoteConfig::default().validity_seconds);
-	let deadline_secs: U256 = U256::from(now_secs + validity_seconds);
-	let expires_secs: u32 = (now_secs + validity_seconds) as u32;
+
+	// Use minValidUntil from request if provided, otherwise use configured validity
+	let intent_validity_seconds = request.intent.min_valid_until.unwrap_or_else(|| {
+		config
+			.api
+			.as_ref()
+			.and_then(|api| api.quote.as_ref())
+			.map(|quote| quote.validity_seconds)
+			.unwrap_or_else(|| QuoteConfig::default().validity_seconds)
+	});
+	let deadline_secs: U256 = U256::from(now_secs + intent_validity_seconds);
+	let expires_secs: u32 = (now_secs + intent_validity_seconds) as u32;
 
 	// Type hashes
 	let domain_type_hash = keccak256(DOMAIN_TYPE.as_bytes());

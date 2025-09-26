@@ -280,7 +280,11 @@ impl QuoteGenerator {
 		_settlement: &dyn SettlementInterface,
 		selected_oracle: solver_types::Address,
 	) -> Result<OifOrder, QuoteError> {
-		let validity_seconds = self.get_quote_validity_seconds(config);
+		// Use minValidUntil from request if provided, otherwise use configured validity
+		let intent_validity_seconds = request
+			.intent
+			.min_valid_until
+			.unwrap_or_else(|| self.get_quote_validity_seconds(config));
 
 		// Get input chain to find the input settler address (the 'to' field)
 		let first_input = &request.intent.inputs[0];
@@ -299,7 +303,7 @@ impl QuoteGenerator {
 		let output_settler = network.output_settler_address.clone();
 
 		// Calculate fillDeadline (should match fillDeadline in StandardOrder)
-		let fill_deadline = chrono::Utc::now().timestamp() as u32 + validity_seconds as u32;
+		let fill_deadline = chrono::Utc::now().timestamp() as u32 + intent_validity_seconds as u32;
 
 		// Calculate the correct orderIdentifier using the contract (same method as intents script)
 		let (nonce_u64, order_identifier) = self.compute_eip3009_order_identifier(
@@ -586,9 +590,13 @@ impl QuoteGenerator {
 		use solver_types::utils::bytes20_to_alloy_address;
 		use std::str::FromStr;
 
-		let validity_seconds = self.get_quote_validity_seconds(config);
+		// Use minValidUntil from request if provided, otherwise use configured validity
+		let intent_validity_seconds = request
+			.intent
+			.min_valid_until
+			.unwrap_or_else(|| self.get_quote_validity_seconds(config));
 		let current_time = chrono::Utc::now().timestamp() as u64;
-		let expires = current_time + validity_seconds;
+		let expires = current_time + intent_validity_seconds;
 		let nonce = chrono::Utc::now().timestamp_millis() as u64; // Use milliseconds timestamp as nonce for uniqueness (matching direct intent flow)
 
 		// Get user address
@@ -795,7 +803,7 @@ impl QuoteGenerator {
 					})
 				}).collect::<Vec<_>>(),
 				"mandate": {
-					"fillDeadline": (current_time + validity_seconds).to_string(),
+					"fillDeadline": (current_time + intent_validity_seconds).to_string(),
 					"inputOracle": format!("0x{:040x}", input_oracle),
 					"outputs": outputs_array
 				}
