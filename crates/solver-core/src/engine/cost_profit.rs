@@ -121,10 +121,6 @@ impl CostProfitService {
 				// ExactInput: User specifies input amounts, we calculate output amounts
 				// Flow: Input Token → USD → Output Token
 				if let Some(known_inputs) = &context.known_inputs {
-					println!(
-						"🔄 ExactInput swap: calculating output amounts from {} known inputs",
-						known_inputs.len()
-					);
 					// Convert each input to USD and match with corresponding outputs
 					let mut input_usd_values = Vec::new();
 
@@ -149,10 +145,6 @@ impl CostProfitService {
 						.await
 						.map_err(|e| CostProfitError::Calculation(e.to_string()))?;
 
-						println!(
-							"💰 Input: {} ({}) = {} raw → ${} USD",
-							input_token.symbol, input.asset, input_amount, usd_value
-						);
 						input_usd_values.push(usd_value);
 					}
 
@@ -186,10 +178,6 @@ impl CostProfitService {
 						let output_amount = self
 							.convert_usd_to_token_amount(final_output_usd, &output.asset)
 							.await?;
-						println!(
-							"💱 Output: {} → ${} USD → {} raw",
-							output.asset, final_output_usd, output_amount
-						);
 						calculated_amounts.insert(output.asset.clone(), output_amount);
 					}
 				}
@@ -198,10 +186,6 @@ impl CostProfitService {
 				// ExactOutput: User specifies output amounts, we calculate input amounts
 				// Flow: Output Token → USD → Input Token
 				if let Some(known_outputs) = &context.known_outputs {
-					println!(
-						"🔄 ExactOutput swap: calculating input amounts from {} known outputs",
-						known_outputs.len()
-					);
 					// Convert each output to USD and match with corresponding inputs
 					let mut output_usd_values = Vec::new();
 
@@ -226,10 +210,6 @@ impl CostProfitService {
 						.await
 						.map_err(|e| CostProfitError::Calculation(e.to_string()))?;
 
-						println!(
-							"💰 Output: {} ({}) = {} raw → ${} USD",
-							output_token.symbol, output.asset, output_amount, usd_value
-						);
 						output_usd_values.push(usd_value);
 					}
 
@@ -263,10 +243,6 @@ impl CostProfitService {
 						let input_amount = self
 							.convert_usd_to_token_amount(final_input_usd, &input.asset)
 							.await?;
-						println!(
-							"💱 Input: {} → ${} USD → {} raw",
-							input.asset, final_input_usd, input_amount
-						);
 						calculated_amounts.insert(input.asset.clone(), input_amount);
 					}
 				}
@@ -377,10 +353,6 @@ impl CostProfitService {
 				.convert_usd_to_token_amount(total_cost_usd, &input.asset)
 				.await
 				.unwrap_or(U256::ZERO);
-			println!(
-				"💲 Cost in input token {}: ${} USD → {} raw",
-				input.asset, total_cost_usd, cost_in_token
-			);
 			cost_amounts_in_tokens.insert(input.asset.clone(), cost_in_token);
 		}
 
@@ -392,24 +364,12 @@ impl CostProfitService {
 					.convert_usd_to_token_amount(total_cost_usd, &output.asset)
 					.await
 					.unwrap_or(U256::ZERO);
-				println!(
-					"💲 Cost in output token {}: ${} USD → {} raw",
-					output.asset, total_cost_usd, cost_in_token
-				);
 				cost_amounts_in_tokens.insert(output.asset.clone(), cost_in_token);
 			}
 		}
 
 		// Calculate base swap amounts for missing inputs/outputs
-		println!(
-			"🧮 Calculating base swap amounts for {:?}",
-			context.swap_type
-		);
 		let swap_amounts = self.calculate_swap_amounts(request, context).await?;
-		println!("✅ Calculated {} swap amounts", swap_amounts.len());
-		for (asset, amount) in &swap_amounts {
-			println!("  📊 {} → {} raw", asset, amount);
-		}
 
 		Ok(CostContext {
 			total_gas_cost_usd,

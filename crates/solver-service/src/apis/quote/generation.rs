@@ -94,24 +94,6 @@ impl QuoteGenerator {
 		request: &GetQuoteRequest,
 		config: &Config,
 	) -> Result<Vec<Quote>, QuoteError> {
-		println!("😨 OLD generate_quotes method called! This uses original amounts:");
-		for (i, input) in request.intent.inputs.iter().enumerate() {
-			println!(
-				"  Input {}: {} = {}",
-				i,
-				input.asset,
-				input.amount.as_ref().unwrap_or(&"None".to_string())
-			);
-		}
-		for (i, output) in request.intent.outputs.iter().enumerate() {
-			println!(
-				"  Output {}: {} = {}",
-				i,
-				output.asset,
-				output.amount.as_ref().unwrap_or(&"None".to_string())
-			);
-		}
-
 		let mut quotes = Vec::new();
 		for input in &request.intent.inputs {
 			let order_input: OrderInput = input.try_into()?;
@@ -145,61 +127,8 @@ impl QuoteGenerator {
 		// Build a new request with swap amounts and cost adjustments from CostContext
 		let adjusted_request = self.build_cost_adjusted_request(request, context, cost_context)?;
 
-		println!("📦 Adjusted request ready for quote generation:");
-		for (i, input) in adjusted_request.intent.inputs.iter().enumerate() {
-			println!(
-				"  Input {}: {} = {}",
-				i,
-				input.asset,
-				input.amount.as_ref().unwrap_or(&"None".to_string())
-			);
-		}
-		for (i, output) in adjusted_request.intent.outputs.iter().enumerate() {
-			println!(
-				"  Output {}: {} = {}",
-				i,
-				output.asset,
-				output.amount.as_ref().unwrap_or(&"None".to_string())
-			);
-		}
-
 		// Generate quotes using the adjusted request
 		let quotes = self.generate_quotes(&adjusted_request, config).await?;
-
-		println!("✅ Final quotes generated: {} quotes", quotes.len());
-		for (i, quote) in quotes.iter().enumerate() {
-			match &quote.order {
-				OifOrder::OifEscrowV0 { payload } => {
-					let permitted = payload
-						.message
-						.get("permitted")
-						.and_then(|p| p.as_array())
-						.and_then(|arr| arr.first());
-					let outputs = payload
-						.message
-						.get("witness")
-						.and_then(|w| w.get("outputs"))
-						.and_then(|o| o.as_array())
-						.and_then(|arr| arr.first());
-
-					if let (Some(input), Some(output)) = (permitted, outputs) {
-						let input_amount = input
-							.get("amount")
-							.and_then(|a| a.as_str())
-							.unwrap_or("N/A");
-						let output_amount = output
-							.get("amount")
-							.and_then(|a| a.as_str())
-							.unwrap_or("N/A");
-						println!(
-							"  💼 Quote {}: Input={} → Output={}",
-							i, input_amount, output_amount
-						);
-					}
-				},
-				_ => println!("  💼 Quote {}: Non-escrow order", i),
-			}
-		}
 
 		Ok(quotes)
 	}
@@ -213,16 +142,8 @@ impl QuoteGenerator {
 	) -> Result<GetQuoteRequest, QuoteError> {
 		let mut adjusted = request.clone();
 
-		println!(
-			"🔧 Adjusting request for {:?} with {} swap amounts and {} cost amounts",
-			context.swap_type,
-			cost_context.swap_amounts.len(),
-			cost_context.cost_amounts_in_tokens.len()
-		);
-
 		match context.swap_type {
 			SwapType::ExactInput => {
-				println!("➡️ ExactInput: Setting output amounts, subtracting costs");
 				// For ExactInput: Use swap amounts for outputs, then subtract costs
 				// Input amounts are already known from the request
 
@@ -254,21 +175,11 @@ impl QuoteGenerator {
 							*base_amount
 						};
 
-						println!(
-							"💵 Output {}: base={} - cost={} = {} (is_first={})",
-							output.asset,
-							base_amount,
-							cost_in_token,
-							adjusted_amount,
-							is_first_output
-						);
-
 						output.amount = Some(adjusted_amount.to_string());
 					}
 				}
 			},
 			SwapType::ExactOutput => {
-				println!("⬅️ ExactOutput: Setting input amounts, adding costs");
 				// For ExactOutput: Use swap amounts for inputs, then add costs
 				// Output amounts are already known from the request
 
@@ -299,15 +210,6 @@ impl QuoteGenerator {
 							// Other inputs get their base amount
 							*base_amount
 						};
-
-						println!(
-							"💴 Input {}: base={} + cost={} = {} (is_first={})",
-							input.asset,
-							base_amount,
-							cost_in_token,
-							adjusted_amount,
-							is_first_input
-						);
 
 						input.amount = Some(adjusted_amount.to_string());
 					}

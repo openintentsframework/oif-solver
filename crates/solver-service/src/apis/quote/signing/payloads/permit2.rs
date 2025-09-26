@@ -81,11 +81,6 @@ pub fn build_permit2_batch_witness_digest(
 		.and_then(|s| U256::from_str_radix(s, 10).ok())
 		.unwrap_or(U256::ZERO);
 
-	println!(
-		"🔍 Permit2 using amounts: input={}, output={}",
-		input_amount, output_amount
-	);
-
 	// Spender = INPUT settler on origin chain
 	let origin_net = config.networks.get(&origin_chain_id).ok_or_else(|| {
 		QuoteError::InvalidRequest(format!(
