@@ -107,15 +107,17 @@ build_quote_request() {
     local output_token="$6"
     local output_amount="$7"
     local recipient="${8:-$user_address}"
-    local preference="${9:-$PREFERENCE_SPEED}"
+    local preference="${9:-speed}"
     local min_valid_until="${10:-600}"  # 10 minutes
+    local supported_types="${11:-[\"oif-escrow-v0\", \"oif-resource-lock-v0\", \"oif-3009-v0\"]}"
     
-    print_debug "Building quote request"
+    print_debug "Building quote request (new OIF spec)"
     print_debug "User: $user_address"
     print_debug "Input: $input_amount of $input_token on chain $input_chain_id"
     print_debug "Output: $output_amount of $output_token on chain $output_chain_id"
     print_debug "Recipient: $recipient"
     print_debug "Preference: $preference"
+    print_debug "Supported types: $supported_types"
     
     # Build UII addresses
     local user_uii=$(build_uii_address "$input_chain_id" "$user_address")
@@ -128,7 +130,7 @@ build_quote_request() {
     print_debug "Output token UII: $output_token_uii"
     print_debug "Recipient UII: $recipient_uii"
     
-    # Build quote request JSON
+    # Build quote request JSON with new OIF spec structure
     local quote_request=$(jq -n \
         --arg user "$user_uii" \
         --arg input_user "$user_uii" \
@@ -139,24 +141,30 @@ build_quote_request() {
         --arg output_amount "$output_amount" \
         --arg preference "$preference" \
         --argjson min_valid_until "$min_valid_until" \
+        --argjson supported_types "$supported_types" \
         '{
             user: $user,
-            availableInputs: [
-                {
-                    user: $input_user,
-                    asset: $input_asset,
-                    amount: $input_amount
-                }
-            ],
-            requestedOutputs: [
-                {
-                    receiver: $output_receiver,
-                    asset: $output_asset,
-                    amount: $output_amount
-                }
-            ],
-            preference: $preference,
-            minValidUntil: $min_valid_until
+            intent: {
+                intentType: "oif-swap",
+                inputs: [
+                    {
+                        user: $input_user,
+                        asset: $input_asset,
+                        amount: $input_amount
+                    }
+                ],
+                outputs: [
+                    {
+                        receiver: $output_receiver,
+                        asset: $output_asset,
+                        amount: $output_amount
+                    }
+                ],
+                swapType: "exact-input",
+                preference: $preference,
+                minValidUntil: $min_valid_until
+            },
+            supportedTypes: $supported_types
         }')
     
     echo "$quote_request"
@@ -279,13 +287,14 @@ request_token_swap_quote() {
     local output_amount="$8"
     local recipient="${9:-$user_address}"
     local api_url="${10:-http://localhost:3000/api/quotes}"
+    local supported_types="${11:-[\"oif-escrow-v0\", \"oif-resource-lock-v0\", \"oif-3009-v0\"]}"
     
     print_header "Requesting Token Swap Quote"
     
-    # Build quote request
+    # Build quote request (with configurable supported types)
     local quote_request=$(build_quote_request \
         "$user_address" "$input_chain_id" "$input_token" "$input_amount" \
-        "$output_chain_id" "$output_token" "$output_amount" "$recipient")
+        "$output_chain_id" "$output_token" "$output_amount" "$recipient" "speed" 600 "$supported_types")
     
     if [ -z "$quote_request" ]; then
         print_error "Failed to build quote request"
@@ -353,10 +362,10 @@ show_quote_summary() {
     print_info "Trade details:"
     
     # Parse first order for trade details
-    local input_token=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.permitted[0].token // "N/A"')
-    local input_amount=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.permitted[0].amount // "N/A"')
-    local output_token=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.witness.outputs[0].token // "N/A"')
-    local output_amount=$(echo "$quote_json" | jq -r '.quotes[0].orders[0].message.witness.outputs[0].amount // "N/A"')
+    local input_token=$(echo "$quote_json" | jq -r '.quotes[0].order.payload.message.permitted[0].token // "N/A"')
+    local input_amount=$(echo "$quote_json" | jq -r '.quotes[0].order.payload.message.permitted[0].amount // "N/A"')
+    local output_token=$(echo "$quote_json" | jq -r '.quotes[0].order.payload.message.witness.outputs[0].token // "N/A"')
+    local output_amount=$(echo "$quote_json" | jq -r '.quotes[0].order.payload.message.witness.outputs[0].amount // "N/A"')
     
     if [ "$input_amount" != "N/A" ]; then
         local input_formatted=$(format_balance "$input_amount")
@@ -568,20 +577,24 @@ quote_get() {
         print_info "A quote request intent should have the following structure:"
         print_info '  {
     "user": "chain_id:user_address",
-    "inputs": [
-      {
-        "user": "chain_id:user_address",
-        "asset": "chain_id:token_address",
-        "amount": "amount_in_wei"
-      }
-    ],
-    "outputs": [
-      {
-        "receiver": "chain_id:recipient_address",
-        "asset": "chain_id:token_address",
-        "amount": "amount_in_wei"
-      }
-    ]
+    "intent": {
+      "intentType": "oif-swap",
+      "inputs": [
+        {
+          "user": "chain_id:user_address",
+          "asset": "chain_id:token_address",
+          "amount": "amount_in_wei"
+        }
+      ],
+      "outputs": [
+        {
+          "receiver": "chain_id:recipient_address",
+          "asset": "chain_id:token_address",
+          "amount": "amount_in_wei"
+        }
+      ]
+    },
+    "supportedTypes": ["oif-escrow-v0"]
   }'
         print_info ""
         print_info "Example: Create a quote request for swapping 1 TokenA on chain 31337 to 1 TokenA on chain 31338"
@@ -592,8 +605,13 @@ quote_get() {
     # Convert intent to quote request format
     # Extract key fields from intent for quote request
     local user=$(echo "$intent_json" | jq -r '.user // empty')
-    local inputs=$(echo "$intent_json" | jq -c '.inputs // .availableInputs // []')
-    local outputs=$(echo "$intent_json" | jq -c '.outputs // .requestedOutputs // []')
+    local inputs=$(echo "$intent_json" | jq -c '.intent.inputs // []')
+    local outputs=$(echo "$intent_json" | jq -c '.intent.outputs // []')
+    local swap_type=$(echo "$intent_json" | jq -r '.intent.swapType // "exact-input"')
+    local preference=$(echo "$intent_json" | jq -r '.intent.preference // "speed"')
+    local min_valid_until=$(echo "$intent_json" | jq -r '.intent.minValidUntil // 600')
+    local origin_submission=$(echo "$intent_json" | jq -c '.intent.originSubmission // null')
+    local supported_types=$(echo "$intent_json" | jq -c '.supportedTypes // ["oif-escrow-v0", "oif-resource-lock-v0", "oif-3009-v0"]')
     
     if [ -z "$user" ] || [ "$user" = "null" ]; then
         # Try to extract from sponsor field if present
@@ -610,18 +628,47 @@ quote_get() {
         fi
     fi
     
-    # Build quote request from intent
+    # Build quote request from intent (preserving all original fields)
+    local quote_request_template='{
+        user: $user,
+        intent: {
+            intentType: "oif-swap",
+            inputs: $inputs,
+            outputs: $outputs,
+            swapType: $swap_type,
+            preference: $preference,
+            minValidUntil: ($min_valid_until | tonumber)
+        },
+        supportedTypes: $supported_types
+    }'
+    
+    # Add originSubmission if it exists
+    if [ "$origin_submission" != "null" ]; then
+        quote_request_template='{
+            user: $user,
+            intent: {
+                intentType: "oif-swap",
+                inputs: $inputs,
+                outputs: $outputs,
+                swapType: $swap_type,
+                preference: $preference,
+                minValidUntil: ($min_valid_until | tonumber),
+                originSubmission: $origin_submission
+            },
+            supportedTypes: $supported_types
+        }'
+    fi
+    
     local quote_request=$(jq -n \
         --arg user "$user" \
         --argjson inputs "$inputs" \
         --argjson outputs "$outputs" \
-        '{
-            user: $user,
-            availableInputs: $inputs,
-            requestedOutputs: $outputs,
-            preference: "speed",
-            minValidUntil: 600
-        }')
+        --arg swap_type "$swap_type" \
+        --arg preference "$preference" \
+        --arg min_valid_until "$min_valid_until" \
+        --argjson origin_submission "$origin_submission" \
+        --argjson supported_types "$supported_types" \
+        "$quote_request_template")
     
     # Request quote
     if request_quote "$quote_request" "$api_url"; then
@@ -703,13 +750,20 @@ quote_accept() {
         
         print_debug "Starting order signing and submission process..."
         
-        # Extract the order details from the quote
-        local order_data=$(echo "$quote_json" | jq -r ".quotes[$quote_index].orders[0] // empty")
+        # Extract the complete order object from the quote
+        local order_data=$(echo "$quote_json" | jq -r ".quotes[$quote_index].order // empty")
         
         print_debug "Order data extracted: ${#order_data} chars"
         
         if [ -z "$order_data" ] || [ "$order_data" = "null" ]; then
             print_error "No order data found in quote"
+            return 1
+        fi
+        
+        # Extract payload for signing
+        local order_payload=$(echo "$order_data" | jq -r ".payload // empty")
+        if [ -z "$order_payload" ] || [ "$order_payload" = "null" ]; then
+            print_error "No order payload found in order"
             return 1
         fi
         
@@ -724,10 +778,43 @@ quote_accept() {
         fi
         print_debug "User key found, determining order type..."
 
-        # Extract the full message object and signature type
-        local full_message=$(echo "$order_data" | jq -r '.message // empty')
-        local signature_type=$(echo "$order_data" | jq -r '.signatureType // empty')
-        local primary_type=$(echo "$order_data" | jq -r '.primaryType // empty')
+        # Extract primaryType first to determine order type
+        local primary_type=$(echo "$order_payload" | jq -r '.primaryType // empty')
+        local full_message=$(echo "$order_payload" | jq -r '.message // empty')
+        
+        print_debug "Order primaryType: $primary_type"
+        
+        # Determine signature type based on order type
+        local signature_type=""
+        local origin_submission_data=""
+        
+        if [ "$primary_type" = "CompactLock" ]; then
+            # CompactLock orders use BatchCompact signature, no auth scheme
+            signature_type="compact"
+            print_debug "Detected CompactLock order, using compact signature type"
+            # Don't set origin_submission_data for compact
+        else
+            # For non-compact orders, read the original quote request to get originSubmission data
+            local quote_req_file="${OUTPUT_DIR:-./demo-output}/get_quote.req.json"
+            local scheme_type="permit2"  # default fallback for non-compact
+            
+            if [ -f "$quote_req_file" ]; then
+                origin_submission_data=$(cat "$quote_req_file" | jq -r '.intent.originSubmission // empty')
+                if [ -n "$origin_submission_data" ] && [ "$origin_submission_data" != "null" ] && [ "$origin_submission_data" != "empty" ]; then
+                    # Extract the first scheme from the schemes array
+                    scheme_type=$(echo "$origin_submission_data" | jq -r '.schemes[0] // "permit2"')
+                    print_debug "Using scheme from original request: $scheme_type"
+                else
+                    print_debug "No originSubmission found in original request, using default: permit2"
+                    origin_submission_data='{"mode": "user", "schemes": ["permit2"]}'
+                fi
+            else
+                print_debug "Original quote request file not found: $quote_req_file, using default originSubmission"
+                origin_submission_data='{"mode": "user", "schemes": ["permit2"]}'
+            fi
+            
+            signature_type="$scheme_type"
+        fi
         
         if [ -z "$full_message" ] || [ "$full_message" = "null" ]; then
             print_error "No message found in order"
@@ -737,7 +824,26 @@ quote_accept() {
         print_debug "Signature type: $signature_type, Primary type: $primary_type"
         local signature=""
 
-        if [ "$signature_type" = "eip3009" ]; then
+        if [ "$signature_type" = "compact" ]; then
+            print_info "Signing BatchCompact order..."
+            
+            # For CompactLock, the actual EIP-712 data is nested in message.eip712
+            local eip712_data=$(echo "$full_message" | jq '.eip712 // empty')
+            if [ -z "$eip712_data" ] || [ "$eip712_data" = "null" ] || [ "$eip712_data" = "empty" ]; then
+                print_error "No eip712 data found in CompactLock message"
+                return 1
+            fi
+            
+            # Use compact-specific digest computation with the nested eip712 data
+            signature=$(sign_compact_digest_from_quote "$user_key" "$eip712_data")
+            if [ $? -ne 0 ] || [ -z "$signature" ]; then
+                print_error "Failed to sign BatchCompact order"
+                return 1
+            fi
+            
+            print_success "BatchCompact order signed successfully"
+            
+        elif [ "$signature_type" = "eip3009" ] || [ "$signature_type" = "eip-3009" ]; then
             print_info "Signing EIP-3009 order..."
 
             # Check if this is a multi-signature order
@@ -758,7 +864,7 @@ quote_accept() {
                     local sig_message=$(echo "$signatures_array" | jq -r ".[$i]")
 
                     # Parse domain from structured format
-                    local domain_data=$(echo "$order_data" | jq -r '.domain // empty')
+                    local domain_data=$(echo "$order_payload" | jq '.domain // empty')
                     local origin_chain_id=""
                     local token_contract=""
                     
@@ -838,7 +944,7 @@ quote_accept() {
                 print_info "Processing single EIP-3009 signature..."
 
                 # Parse domain from structured format
-                local domain_data=$(echo "$order_data" | jq -r '.domain // empty')
+                local domain_data=$(echo "$order_payload" | jq '.domain // empty')
                 local origin_chain_id=""
                 local token_contract=""
                 
@@ -968,88 +1074,29 @@ quote_accept() {
                 print_success "EIP-3009 order signed successfully"
             fi
             
-        elif [ "$signature_type" = "eip712" ]; then
-            print_info "Signing EIP-712 order..."
+        elif [ "$signature_type" = "permit2" ]; then
+            print_info "Signing Permit2 order..."
+
+            # Extract domain from payload
+            local domain=$(echo "$order_payload" | jq -r '.domain // empty')
+            if [ -z "$domain" ] || [ "$domain" = "null" ] || [ "$domain" = "empty" ]; then
+                print_error "No domain information found in Permit2 payload"
+                return 1
+            fi
+            print_debug "Domain object: $domain"
+
+            # Extract primary type from payload
+            local primary_type=$(echo "$order_payload" | jq -r '.primaryType // "PermitBatchWitnessTransferFrom"')
+            print_debug "Primary type: $primary_type"
 
             # Use message directly (no wrapper)
             local eip712_message="$full_message"
-            local eip712_primary_type=$(echo "$order_data" | jq -r '.primaryType // "PermitBatchWitnessTransferFrom"')
-
             if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ]; then
-                print_error "No EIP-712 message found in EIP-712 order"
+                print_error "No message found in Permit2 payload"
                 return 1
             fi
 
-            print_debug "EIP-712 Primary type: $eip712_primary_type"
-
-            if [ "$eip712_primary_type" = "BatchCompact" ] || [ "$eip712_primary_type" = "CompactLock" ]; then
-                print_info "Detected BatchCompact order, using compact signing..."
-
-                # Use client-side digest computation
-                signature=$(sign_compact_digest_from_quote "$user_key" "$full_message")
-
-                if [ -z "$signature" ]; then
-                    print_error "Failed to sign BatchCompact order"
-                    return 1
-                fi
-
-                print_success "BatchCompact order signed successfully"
-
-                # For compact/resource lock, we need to ABI-encode the signature with allocator data
-                # This matches what the working direct intent flow does in intents.sh
-                local allocator_data="0x"  # Empty allocator data for demo
-                signature=$(cast abi-encode "f(bytes,bytes)" "$signature" "$allocator_data")
-
-                print_debug "ABI-encoded signature: $signature"
-
-            else
-                print_info "Detected Permit2 order, using standard signing..."
-
-            # Extract witness data directly from message
-            local witness=$(echo "$eip712_message" | jq -r '.witness // empty')
-            local witness_expires=$(echo "$witness" | jq -r '.expires // 0')
-            local input_oracle=$(echo "$witness" | jq -r '.inputOracle // "0x0000000000000000000000000000000000000000"')
-
-            # Get domain from order level
-            local domain=""
-            local order_domain=$(echo "$order_data" | jq -r '.domain // empty')
-            if echo "$order_domain" | jq -e 'type == "object"' > /dev/null 2>&1; then
-                # Structured domain format
-                domain="$order_domain"
-                print_debug "Using structured domain format for Permit2"
-            else
-                print_error "No domain information found in Permit2 order"
-                return 1
-            fi
-            
-            # Extract message fields directly
-            local deadline=$(echo "$eip712_message" | jq -r '.deadline // empty')
-            local nonce=$(echo "$eip712_message" | jq -r '.nonce // empty')
-            local spender=$(echo "$eip712_message" | jq -r '.spender // empty')
-
-            # Extract the required fields for Permit2 signing
-            local permitted_token=$(echo "$eip712_message" | jq -r '.permitted[0].token // empty')
-            local permitted_amount=$(echo "$eip712_message" | jq -r '.permitted[0].amount // empty')
-
-            # Convert interop address to standard Ethereum address if needed for signing
-            local standard_permitted_token="$permitted_token"
-            # Interop addresses are longer than standard addresses (42 chars)
-            if [[ ${#permitted_token} -gt 42 ]]; then
-                # This is likely an interop address, convert to standard
-                standard_permitted_token=$(from_uii_address "$permitted_token")
-                print_debug "Converted permitted token from interop to standard: $permitted_token -> $standard_permitted_token"
-            fi
-
-            # Get origin chain ID from the domain
-            local origin_chain_id=$(echo "$domain" | jq -r '.chainId // 31337')
-            
-            # We have all the domain info from the order level
-            print_debug "Domain object: $domain"
-
-            # Build mandate outputs array from witness outputs
-            local mandate_outputs_json=$(echo "$witness" | jq -c '.outputs')
-
-            # Use client-side digest computation but with proper signature formatting
+            # Use client-side digest computation
             print_info "Computing client-side digest..."
             local client_digest=$(compute_permit2_digest_from_quote "$eip712_message" "$domain")
             if [ $? -ne 0 ] || [ -z "$client_digest" ]; then
@@ -1059,25 +1106,22 @@ quote_accept() {
             print_debug "Client computed digest: $client_digest"
             print_info "Signing with client-computed digest: $client_digest"
 
-            # Sign the digest directly and add proper permit2 prefix
+            # Sign the digest directly
             local raw_signature=$(cast wallet sign --no-hash --private-key "$user_key" "$client_digest")
             if [ $? -ne 0 ] || [ -z "$raw_signature" ]; then
                 print_error "Failed to sign digest"
                 return 1
             fi
 
-                # Create prefixed signature for permit2
-                signature=$(create_prefixed_signature "$raw_signature" "permit2")
-
-                if [ -z "$signature" ]; then
-                    print_error "Failed to sign EIP-712 order"
-                    return 1
-                fi
-
-                print_success "Permit2 signature generated with client-side digest"
+            # Create prefixed signature for permit2
+            signature=$(create_prefixed_signature "$raw_signature" "permit2")
+            if [ -z "$signature" ]; then
+                print_error "Failed to create prefixed signature"
+                return 1
             fi
-            
-            print_success "EIP-712 order signed"
+
+            print_success "Permit2 signature generated with client-side digest"
+            print_success "Permit2 order signed"
         else
             print_error "Unsupported signature type: $signature_type"
             return 1
@@ -1085,14 +1129,34 @@ quote_accept() {
         
         print_debug "Signature: $signature"
         
-        # Create submission payload with quoteId
-        local submission_json=$(jq -n \
-            --arg quoteId "$quote_id" \
-            --arg signature "$signature" \
-            '{
-                quoteId: $quoteId,
-                signature: $signature
-            }')
+        # Create submission payload
+        # For compact orders, don't include originSubmission
+        local submission_json=""
+        if [ "$signature_type" = "compact" ] || [ -z "$origin_submission_data" ]; then
+            # Compact orders or when no originSubmission data
+            submission_json=$(jq -n \
+                --arg quoteId "$quote_id" \
+                --arg signature "$signature" \
+                --argjson order "$order_data" \
+                '{
+                    order: $order,
+                    signature: [$signature],
+                    quoteId: $quoteId
+                }')
+        else
+            # Include originSubmission for permit2/eip3009 orders
+            submission_json=$(jq -n \
+                --arg quoteId "$quote_id" \
+                --arg signature "$signature" \
+                --argjson order "$order_data" \
+                --argjson originSubmission "$origin_submission_data" \
+                '{
+                    order: $order,
+                    signature: [$signature],
+                    quoteId: $quoteId,
+                    originSubmission: $originSubmission
+                }')
+        fi
         
         # Save request to file
         local request_file="${OUTPUT_DIR:-./demo-output}/post_quote.req.json"

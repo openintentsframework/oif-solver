@@ -39,8 +39,8 @@ pub fn build_permit2_batch_witness_digest(
 	selected_oracle: solver_types::Address,
 ) -> Result<(B256, serde_json::Value), QuoteError> {
 	// TODO: Implement support for multi-input/outputs
-	let input = &request.available_inputs[0];
-	let output = &request.requested_outputs.first().ok_or_else(|| {
+	let input = &request.intent.inputs[0];
+	let output = &request.intent.outputs.first().ok_or_else(|| {
 		QuoteError::InvalidRequest("At least one requested output is required".to_string())
 	})?;
 
@@ -64,7 +64,12 @@ pub fn build_permit2_batch_witness_digest(
 		.ethereum_address()
 		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid recipient address: {}", e)))?;
 
-	let amount: U256 = input.amount;
+	// TODO: Handle swap-type properly - for now use "0" if amount is None
+	let amount: U256 = input
+		.amount
+		.as_ref()
+		.and_then(|s| U256::from_str_radix(s, 10).ok())
+		.unwrap_or(U256::ZERO);
 
 	// Spender = INPUT settler on origin chain
 	let origin_net = config.networks.get(&origin_chain_id).ok_or_else(|| {
@@ -100,14 +105,18 @@ pub fn build_permit2_batch_witness_digest(
 	// Nonce and deadlines
 	let now_secs = chrono::Utc::now().timestamp() as u64;
 	let nonce_ms: U256 = U256::from((chrono::Utc::now().timestamp_millis()) as u128);
-	let validity_seconds = config
-		.api
-		.as_ref()
-		.and_then(|api| api.quote.as_ref())
-		.map(|quote| quote.validity_seconds)
-		.unwrap_or_else(|| QuoteConfig::default().validity_seconds);
-	let deadline_secs: U256 = U256::from(now_secs + validity_seconds);
-	let expires_secs: u32 = (now_secs + validity_seconds) as u32;
+
+	// Use minValidUntil from request if provided, otherwise use configured validity
+	let intent_validity_seconds = request.intent.min_valid_until.unwrap_or_else(|| {
+		config
+			.api
+			.as_ref()
+			.and_then(|api| api.quote.as_ref())
+			.map(|quote| quote.validity_seconds)
+			.unwrap_or_else(|| QuoteConfig::default().validity_seconds)
+	});
+	let deadline_secs: U256 = U256::from(now_secs + intent_validity_seconds);
+	let expires_secs: u32 = (now_secs + intent_validity_seconds) as u32;
 
 	// Type hashes
 	let domain_type_hash = keccak256(DOMAIN_TYPE.as_bytes());
@@ -222,7 +231,7 @@ pub fn build_permit2_batch_witness_digest(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use alloy_primitives::{address, uint, U256};
+	use alloy_primitives::{address, U256};
 	use solver_config::{
 		ApiConfig, Config, ConfigBuilder, DomainConfig, QuoteConfig, SettlementConfig,
 	};
@@ -231,7 +240,7 @@ mod tests {
 		parse_address,
 		standards::eip7930::InteropAddress,
 		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
-		AvailableInput, RequestedOutput,
+		IntentRequest, IntentType, QuoteInput, QuoteOutput,
 	};
 	use std::collections::HashMap;
 
@@ -291,26 +300,35 @@ mod tests {
 			address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
 		);
 
-		let available_input = AvailableInput {
+		let quote_input = QuoteInput {
 			user: user_address.clone(),
 			asset: eth_usdc,
-			amount: uint!(1000_000000_U256), // 1000 USDC (6 decimals)
+			amount: Some("1000000000".to_string()), // 1000 USDC (6 decimals)
 			lock: None,
 		};
 
-		let requested_output = RequestedOutput {
+		let quote_output = QuoteOutput {
 			receiver: user_address.clone(),
 			asset: polygon_usdc,
-			amount: uint!(995_000000_U256), // 995 USDC after fees
+			amount: Some("995000000".to_string()), // 995 USDC after fees
 			calldata: None,
 		};
 
 		GetQuoteRequest {
 			user: user_address,
-			available_inputs: vec![available_input],
-			requested_outputs: vec![requested_output],
-			min_valid_until: None,
-			preference: None,
+			intent: IntentRequest {
+				intent_type: IntentType::OifSwap,
+				inputs: vec![quote_input],
+				outputs: vec![quote_output],
+				swap_type: None,
+				min_valid_until: None,
+				preference: None,
+				origin_submission: None,
+				failure_handling: None,
+				partial_fill: None,
+				metadata: None,
+			},
+			supported_types: vec!["oif-escrow-v0".to_string()],
 		}
 	}
 
@@ -371,7 +389,7 @@ mod tests {
 	fn test_build_permit2_batch_witness_digest_no_outputs() {
 		let config = create_test_config();
 		let mut request = create_test_quote_request();
-		request.requested_outputs.clear(); // Remove all outputs
+		request.intent.outputs.clear(); // Remove all outputs
 		let settlement = MockSettlementInterface::new();
 		let oracle_address = parse_address("0x9999999999999999999999999999999999999999").unwrap();
 
@@ -397,7 +415,7 @@ mod tests {
 			999, // Chain not in config
 			address!("A0b86a33E6417c4c2f4066Ca7e40d36c4D5f8E1a"),
 		);
-		request.available_inputs[0].asset = invalid_asset;
+		request.intent.inputs[0].asset = invalid_asset;
 
 		let settlement = MockSettlementInterface::new();
 		let oracle_address = parse_address("0x9999999999999999999999999999999999999999").unwrap();
@@ -424,7 +442,7 @@ mod tests {
 			999, // Chain not in config
 			address!("2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
 		);
-		request.requested_outputs[0].asset = invalid_asset;
+		request.intent.outputs[0].asset = invalid_asset;
 
 		let settlement = MockSettlementInterface::new();
 		let oracle_address = parse_address("0x9999999999999999999999999999999999999999").unwrap();
@@ -451,7 +469,7 @@ mod tests {
 			56, // BSC - assume not in permit2 registry
 			address!("A0b86a33E6417c4c2f4066Ca7e40d36c4D5f8E1a"),
 		);
-		request.available_inputs[0].asset = unsupported_chain;
+		request.intent.inputs[0].asset = unsupported_chain;
 
 		// Need to add this chain to networks config to get past that check
 		let mut config = config;

@@ -58,7 +58,7 @@ use hex;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use solver_types::{
-	api::IntentRequest,
+	api::PostOrderRequest,
 	bytes32_to_address, current_timestamp, normalize_bytes32_address,
 	standards::eip7683::{
 		interfaces::{IInputSettlerCompact, IInputSettlerEscrow, SolMandateOutput, StandardOrder},
@@ -688,7 +688,7 @@ impl Eip7683OffchainDiscovery {
 /// ```
 async fn handle_intent_submission(
 	State(state): State<ApiState>,
-	Json(request): Json<IntentRequest>,
+	Json(request): Json<PostOrderRequest>,
 ) -> impl IntoResponse {
 	// Parse the StandardOrder from bytes
 	let order = match Eip7683OffchainDiscovery::parse_standard_order(&request.order) {
@@ -1318,7 +1318,7 @@ mod tests {
 		};
 
 		// Create invalid request with malformed order data
-		let invalid_request = IntentRequest {
+		let invalid_request = PostOrderRequest {
 			order: Bytes::from_static(b"invalid_order_data"),
 			signature: Bytes::from_static(b"signature"),
 			sponsor: Address::from_slice(&[0xab; 20]),

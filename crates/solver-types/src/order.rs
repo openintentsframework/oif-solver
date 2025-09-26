@@ -11,8 +11,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::{
-	Address, AssetAmount, AvailableInput, ChainData, Eip7683OrderData, RequestedOutput,
-	SettlementType, TransactionHash, TransactionType,
+	Address, AssetAmount, ChainData, Eip7683OrderData, OrderInput, OrderOutput, SettlementType,
+	TransactionHash, TransactionType,
 };
 
 /// Information about a chain and its associated settler contract.
@@ -57,14 +57,14 @@ pub trait OrderParsable: Send + Sync {
 	///
 	/// # Returns
 	///
-	/// A vector of `AvailableInput` instances. May be empty for orders
+	/// A vector of `OrderInput` instances. May be empty for orders
 	/// that don't require specific inputs (e.g., native currency payments).
 	///
 	/// # Implementation Note
 	///
 	/// Implementations should handle token address formats appropriate to
 	/// their standard and convert them to InteropAddress format.
-	fn parse_available_inputs(&self) -> Vec<AvailableInput>;
+	fn parse_available_inputs(&self) -> Vec<OrderInput>;
 
 	/// Extract requested outputs from the order data.
 	///
@@ -77,14 +77,14 @@ pub trait OrderParsable: Send + Sync {
 	///
 	/// # Returns
 	///
-	/// A vector of `RequestedOutput` instances. May be empty for orders
+	/// A vector of `OrderOutput` instances. May be empty for orders
 	/// that don't specify explicit outputs (though this is unusual).
 	///
 	/// # Implementation Note
 	///
 	/// Implementations should ensure that recipient addresses are properly
 	/// formatted as InteropAddress instances with correct chain IDs.
-	fn parse_requested_outputs(&self) -> Vec<RequestedOutput>;
+	fn parse_requested_outputs(&self) -> Vec<OrderOutput>;
 
 	/// Extract the lock type from the order data, if applicable.
 	///

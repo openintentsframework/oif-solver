@@ -134,7 +134,7 @@
   },
   "gas_estimates": {
     "_comment": "Gas consumption in units, measured from testnet",
-    "compact_resource_lock": {
+    "resource_lock": {
       "open": 0,
       "fill": 77298,
       "claim": 122793

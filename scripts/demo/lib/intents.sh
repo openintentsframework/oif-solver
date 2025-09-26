@@ -1493,9 +1493,9 @@ intent_build() {
         local output_asset_uii=$(to_uii_address "$dest_chain" "$token_out")
         local recipient_uii=$(to_uii_address "$dest_chain" "$recipient_addr")
         
-        # Create quote request JSON (matching API expected format)
-        # For compact intents, add lock field to indicate resource lock
+        # Create quote request JSON using new GetQuoteRequest format
         if [ "$intent_type" = "compact" ]; then
+            # For compact intents (resource locks), add lock field
             local quote_request=$(jq -n \
                 --arg user "$user_uii" \
                 --arg input_user "$user_uii" \
@@ -1506,61 +1506,87 @@ intent_build() {
                 --arg output_amount "$amount_out" \
                 '{
                     user: $user,
-                    availableInputs: [
-                        {
-                            user: $input_user,
-                            asset: $input_asset,
-                            amount: $input_amount,
-                            lock: {
-                                kind: "TheCompact"
+                    intent: {
+                        intentType: "oif-swap",
+                        inputs: [
+                            {
+                                user: $input_user,
+                                asset: $input_asset,
+                                amount: $input_amount,
+                                lock: {
+                                    kind: "the-compact"
+                                }
                             }
-                        }
-                    ],
-                    requestedOutputs: [
-                        {
-                            receiver: $output_receiver,
-                            asset: $output_asset,
-                            amount: $output_amount
-                        }
-                    ]
+                        ],
+                        outputs: [
+                            {
+                                receiver: $output_receiver,
+                                asset: $output_asset,
+                                amount: $output_amount
+                            }
+                        ],
+                        swapType: "exact-input",
+                        preference: "speed",
+                        minValidUntil: 600
+                    },
+                    supportedTypes: ["oif-escrow-v0", "oif-resource-lock-v0", "oif-3009-v0"]
                 }')
         else
-            # For escrow intents, set lock field based on lock_type/auth_type
-            local lock_kind=""
+            # For escrow intents, use originSubmission for auth schemes
+            local auth_schemes=""
+            local origin_submission=""
             case "$lock_type" in
-                permit2) lock_kind="Permit2" ;;
-                eip3009) lock_kind="eip3009" ;;  # Use kebab-case form
-                *) lock_kind="Permit2" ;;  # Default fallback
+                permit2) 
+                    auth_schemes='["permit2"]'
+                    ;;
+                eip3009) 
+                    auth_schemes='["eip3009"]'
+                    ;;
+                *) 
+                    auth_schemes='["permit2"]'  # Default fallback
+                    ;;
             esac
+            
+            origin_submission=$(jq -n \
+                --argjson schemes "$auth_schemes" \
+                '{
+                    mode: "user",
+                    schemes: $schemes
+                }')
             
             local quote_request=$(jq -n \
                 --arg user "$user_uii" \
                 --arg input_user "$user_uii" \
                 --arg input_asset "$input_asset_uii" \
                 --arg input_amount "$amount_in" \
-                --arg lock_kind "$lock_kind" \
                 --arg output_receiver "$recipient_uii" \
                 --arg output_asset "$output_asset_uii" \
                 --arg output_amount "$amount_out" \
+                --argjson origin_submission "$origin_submission" \
                 '{
                     user: $user,
-                    availableInputs: [
-                        {
-                            user: $input_user,
-                            asset: $input_asset,
-                            amount: $input_amount,
-                            lock: {
-                                kind: $lock_kind
+                    intent: {
+                        intentType: "oif-swap",
+                        inputs: [
+                            {
+                                user: $input_user,
+                                asset: $input_asset,
+                                amount: $input_amount
                             }
-                        }
-                    ],
-                    requestedOutputs: [
-                        {
-                            receiver: $output_receiver,
-                            asset: $output_asset,
-                            amount: $output_amount
-                        }
-                    ]
+                        ],
+                        outputs: [
+                            {
+                                receiver: $output_receiver,
+                                asset: $output_asset,
+                                amount: $output_amount
+                            }
+                        ],
+                        swapType: "exact-input",
+                        preference: "speed",
+                        minValidUntil: 600,
+                        originSubmission: $origin_submission
+                    },
+                    supportedTypes: ["oif-escrow-v0", "oif-resource-lock-v0", "oif-3009-v0"]
                 }')
         fi
         

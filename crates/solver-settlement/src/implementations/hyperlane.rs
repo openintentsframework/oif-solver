@@ -15,7 +15,7 @@ use sha3::{Digest, Keccak256};
 use solver_storage::StorageService;
 use solver_types::{
 	with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, InteropAddress, NetworksConfig,
-	Order, RequestedOutput, Schema, StorageKey, Transaction, TransactionHash, TransactionReceipt,
+	Order, OrderOutput, Schema, StorageKey, Transaction, TransactionHash, TransactionReceipt,
 	TransactionType,
 };
 use std::collections::HashMap;
@@ -101,12 +101,16 @@ fn interop_address_to_bytes32(addr: &InteropAddress) -> [u8; 32] {
 	bytes32
 }
 
-/// Convert a RequestedOutput to Hyperlane-compatible format
-fn requested_output_to_hyperlane(output: &RequestedOutput) -> HyperlaneOutput {
+/// Convert an OrderOutput to Hyperlane-compatible format
+fn order_output_to_hyperlane(output: &OrderOutput) -> HyperlaneOutput {
+	let asset = &output.asset;
+	let receiver = &output.receiver;
+	let amount = output.amount;
+
 	HyperlaneOutput {
-		token: interop_address_to_bytes32(&output.asset),
-		amount: output.amount,
-		recipient: interop_address_to_bytes32(&output.receiver),
+		token: interop_address_to_bytes32(asset),
+		amount,
+		recipient: interop_address_to_bytes32(receiver),
 		call: output
 			.calldata
 			.as_ref()
@@ -132,7 +136,7 @@ fn extract_output_details(order: &Order) -> Result<HyperlaneOutput, SettlementEr
 		.ok_or_else(|| SettlementError::ValidationFailed("No outputs found in order".into()))?;
 
 	// Convert to Hyperlane format
-	Ok(requested_output_to_hyperlane(first_output))
+	Ok(order_output_to_hyperlane(first_output))
 }
 
 /// Extract fill details from OutputFilled event in logs

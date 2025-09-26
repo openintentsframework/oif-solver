@@ -11,7 +11,7 @@ use alloy_sol_types::SolType;
 use async_trait::async_trait;
 use solver_delivery::DeliveryService;
 use solver_types::{
-	api::IntentRequest,
+	api::PostOrderRequest,
 	standards::eip7683::{interfaces::StandardOrder as OifStandardOrder, LockType},
 	APIError, ApiErrorType, NetworksConfig,
 };
@@ -27,7 +27,7 @@ pub trait OrderSignatureValidator: Send + Sync {
 	/// Validates an EIP-712 signature for this standard.
 	async fn validate_signature(
 		&self,
-		intent: &IntentRequest,
+		intent: &PostOrderRequest,
 		networks_config: &NetworksConfig,
 		delivery_service: &Arc<DeliveryService>,
 	) -> Result<(), APIError>;
@@ -45,7 +45,7 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 
 	async fn validate_signature(
 		&self,
-		intent: &IntentRequest,
+		intent: &PostOrderRequest,
 		networks_config: &NetworksConfig,
 		delivery_service: &Arc<DeliveryService>,
 	) -> Result<(), APIError> {
@@ -144,7 +144,7 @@ impl SignatureValidationService {
 	pub async fn validate_signature(
 		&self,
 		standard: &str,
-		intent: &IntentRequest,
+		intent: &PostOrderRequest,
 		networks_config: &NetworksConfig,
 		delivery_service: &Arc<DeliveryService>,
 	) -> Result<(), APIError> {

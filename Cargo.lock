@@ -3877,6 +3877,7 @@ dependencies = [
  "alloy-contract",
  "alloy-primitives",
  "alloy-rpc-types",
+ "alloy-signer",
  "alloy-sol-types",
  "async-trait",
  "axum",

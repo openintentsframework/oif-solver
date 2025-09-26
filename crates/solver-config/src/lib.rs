@@ -294,7 +294,7 @@ pub struct PricingConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GasConfig {
 	/// Map of flow key -> GasFlowUnits
-	/// Example keys: "permit2_escrow", "compact_resource_lock"
+	/// Example keys: "permit2_escrow", "resource_lock"
 	pub flows: HashMap<String, GasFlowUnits>,
 }
 
