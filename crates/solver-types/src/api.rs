@@ -508,61 +508,17 @@ impl From<OrderOutput> for QuoteOutput {
 	}
 }
 
-/// Conversion from QuoteInput to OrderInput (can fail if amount is missing)
-impl TryFrom<QuoteInput> for OrderInput {
-	type Error = String;
-
-	fn try_from(quote_input: QuoteInput) -> Result<Self, Self::Error> {
-		let amount = quote_input.amount.ok_or_else(|| {
-			"Cannot convert QuoteInput to OrderInput: amount is required".to_string()
-		})?;
-
-		let amount_u256 = U256::from_str(&amount)
-			.map_err(|e| format!("Failed to parse amount '{}': {}", amount, e))?;
-
-		Ok(OrderInput {
-			user: quote_input.user,
-			asset: quote_input.asset,
-			amount: amount_u256,
-			lock: quote_input.lock,
-		})
-	}
-}
-
-/// Conversion from QuoteOutput to OrderOutput (can fail if amount is missing)
-impl TryFrom<QuoteOutput> for OrderOutput {
-	type Error = String;
-
-	fn try_from(quote_output: QuoteOutput) -> Result<Self, Self::Error> {
-		let amount = quote_output.amount.ok_or_else(|| {
-			"Cannot convert QuoteOutput to OrderOutput: amount is required".to_string()
-		})?;
-
-		let amount_u256 = U256::from_str(&amount)
-			.map_err(|e| format!("Failed to parse amount '{}': {}", amount, e))?;
-
-		Ok(OrderOutput {
-			receiver: quote_output.receiver,
-			asset: quote_output.asset,
-			amount: amount_u256,
-			calldata: quote_output.calldata,
-		})
-	}
-}
-
-/// Conversion from &QuoteInput to OrderInput (can fail if amount is missing)
 impl TryFrom<&QuoteInput> for OrderInput {
 	type Error = QuoteError;
 
 	fn try_from(quote_input: &QuoteInput) -> Result<Self, Self::Error> {
-		let amount = quote_input
-			.amount
-			.as_ref()
-			.ok_or(QuoteError::MissingInputAmount)?;
-
-		let amount_u256 = U256::from_str(amount).map_err(|e| {
-			QuoteError::InvalidRequest(format!("Failed to parse amount '{}': {}", amount, e))
-		})?;
+		let amount_u256 = if let Some(amount) = quote_input.amount.as_ref() {
+			U256::from_str(amount).map_err(|e| {
+				QuoteError::InvalidRequest(format!("Failed to parse amount '{}': {}", amount, e))
+			})?
+		} else {
+			U256::ZERO
+		};
 
 		Ok(OrderInput {
 			user: quote_input.user.clone(),
@@ -573,19 +529,17 @@ impl TryFrom<&QuoteInput> for OrderInput {
 	}
 }
 
-/// Conversion from &QuoteOutput to OrderOutput (can fail if amount is missing)
 impl TryFrom<&QuoteOutput> for OrderOutput {
 	type Error = QuoteError;
 
 	fn try_from(quote_output: &QuoteOutput) -> Result<Self, Self::Error> {
-		let amount = quote_output
-			.amount
-			.as_ref()
-			.ok_or(QuoteError::MissingOutputAmount)?;
-
-		let amount_u256 = U256::from_str(amount).map_err(|e| {
-			QuoteError::InvalidRequest(format!("Failed to parse amount '{}': {}", amount, e))
-		})?;
+		let amount_u256 = if let Some(amount) = quote_output.amount.as_ref() {
+			U256::from_str(amount).map_err(|e| {
+				QuoteError::InvalidRequest(format!("Failed to parse amount '{}': {}", amount, e))
+			})?
+		} else {
+			U256::ZERO
+		};
 
 		Ok(OrderOutput {
 			receiver: quote_output.receiver.clone(),

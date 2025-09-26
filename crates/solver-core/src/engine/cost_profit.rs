@@ -257,6 +257,9 @@ impl CostProfitService {
 		context: &solver_types::ValidatedQuoteContext,
 		config: &Config,
 	) -> Result<CostContext, CostProfitError> {
+		// Calculate base swap amounts FIRST to fill in missing values
+		let swap_amounts = self.calculate_swap_amounts(request, context).await?;
+
 		// Use inputs and outputs from request
 		let inputs = &request.intent.inputs;
 		let outputs = &request.intent.outputs;
@@ -297,14 +300,26 @@ impl CostProfitService {
 		// Parse inputs/outputs to proper types for cost calculation
 		let mut parsed_inputs = Vec::new();
 		for input in inputs {
-			if let Ok(order_input) = input.try_into() {
+			if let Ok(mut order_input) = <OrderInput>::try_from(input) {
+				// Fill in zero amounts with calculated swap amounts
+				if order_input.amount == U256::ZERO {
+					if let Some(calculated_amount) = swap_amounts.get(&input.asset) {
+						order_input.amount = *calculated_amount;
+					}
+				}
 				parsed_inputs.push(order_input);
 			}
 		}
 
 		let mut parsed_outputs = Vec::new();
 		for output in outputs {
-			if let Ok(order_output) = output.try_into() {
+			if let Ok(mut order_output) = <OrderOutput>::try_from(output) {
+				// Fill in zero amounts with calculated swap amounts
+				if order_output.amount == U256::ZERO {
+					if let Some(calculated_amount) = swap_amounts.get(&output.asset) {
+						order_output.amount = *calculated_amount;
+					}
+				}
 				parsed_outputs.push(order_output);
 			}
 		}
@@ -353,9 +368,6 @@ impl CostProfitService {
 			cost_breakdown.gas_open + cost_breakdown.gas_claim,
 		);
 		execution_costs_by_chain.insert(dest_chain_id, cost_breakdown.gas_fill);
-
-		// Calculate base swap amounts for missing inputs/outputs
-		let swap_amounts = self.calculate_swap_amounts(request, context).await?;
 
 		Ok(CostContext {
 			cost_breakdown,
@@ -572,34 +584,35 @@ impl CostProfitService {
 		// Operational cost is already available in the breakdown
 		let operational_cost_usd = cost_breakdown.operational_cost;
 
-		// Calculate actual profit from this order
-		let actual_profit_usd =
-			total_input_value_usd - total_output_value_usd - operational_cost_usd;
+		// Calculate the spread between input and output
+		let spread = total_input_value_usd - total_output_value_usd;
 
-		// Calculate profit margin as percentage
-		if total_input_value_usd.is_zero() {
+		// Actual profit is what's left after covering operational costs
+		let actual_profit_usd = spread - operational_cost_usd;
+
+		// Calculate profit margin as percentage of output value
+		if total_output_value_usd.is_zero() {
 			return Err(APIError::BadRequest {
 				error_type: ApiErrorType::InvalidRequest,
-				message: "Cannot calculate profit margin: zero input value".to_string(),
+				message: "Cannot calculate profit margin: zero output value".to_string(),
 				details: None,
 			});
 		}
 
-		let actual_profit_margin = (actual_profit_usd / total_input_value_usd) * Decimal::from(100);
+		let actual_profit_margin =
+			(actual_profit_usd / total_output_value_usd) * Decimal::from(100);
 
 		// Calculate what the values would be at different stages
 		// Note: We're working backwards from the final quoted values
-		let total_adjustments = cost_breakdown.total + cost_breakdown.min_profit;
+		// Use the actual profit from the spread, not the recalculated min_profit
+		let display_profit = actual_profit_usd;
+		let total_adjustments = cost_breakdown.total + display_profit;
 
-		// Determine if this is ExactInput or ExactOutput based on spread
-		let (input_note, output_note, adjustment_label) =
-			if total_input_value_usd > total_output_value_usd {
-				// ExactInput: output was reduced
-				("", " (includes all deductions)", "Total Deductions")
-			} else {
-				// ExactOutput: input was increased
-				(" (includes all additions)", "", "Total Additions")
-			};
+		// Always show both labels for clarity
+		// One of them will apply depending on whether it's ExactInput or ExactOutput
+		let input_note = " (includes all additions)";
+		let output_note = " (includes all deductions)";
+		let adjustment_label = "Total Adjustments";
 
 		// Log comprehensive cost, value and profitability analysis
 		tracing::info!(
@@ -607,7 +620,7 @@ impl CostProfitService {
 			╭─ Transaction Values (Order):\n\
 			│  ├─ Input Amount:       $ {:>7.2}{}\n\
 			│  ├─ Output Amount:      $ {:>7.2}{}\n\
-			│  ├─ {}:   $ {:>7.2} (costs: ${:.2} + profit: ${:.2})\n\
+			│  ├─ {}:  $ {:>7.2} (costs: ${:.2} + profit: ${:.2})\n\
 			│  ├─ Spread:             $ {:>7.2} {}\n\
 			│  └─ Exchange Rate:      • {:>7.2} (out/in)\n\
 			├─ Cost Breakdown:\n\
@@ -640,7 +653,7 @@ impl CostProfitService {
 			adjustment_label,
 			total_adjustments,
 			cost_breakdown.total,
-			cost_breakdown.min_profit,
+			display_profit,
 			(total_input_value_usd - total_output_value_usd).abs(),
 			if total_input_value_usd >= total_output_value_usd {
 				"(favorable)"
@@ -676,7 +689,7 @@ impl CostProfitService {
 			} else {
 				""
 			},
-			cost_breakdown.min_profit,
+			display_profit,
 			min_profitability_pct,
 			cost_breakdown.commission,
 			if cost_breakdown.commission > Decimal::ZERO {
