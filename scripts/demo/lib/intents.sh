@@ -41,6 +41,7 @@ INTENT_STATUS_last_order_id=""
 INTENT_STATUS_last_tx_hash=""
 INTENT_STATUS_last_signature=""
 INTENT_STATUS_last_lock_type=""
+INTENT_STATUS_last_swap_type=""
 
 # -----------------------------------------------------------------------------
 # Status Management Functions
@@ -51,6 +52,7 @@ clear_intent_status() {
     INTENT_STATUS_last_tx_hash=""
     INTENT_STATUS_last_signature=""
     INTENT_STATUS_last_lock_type=""
+    INTENT_STATUS_last_swap_type=""
 }
 
 # Get intent status field
@@ -68,6 +70,9 @@ get_intent_status() {
             ;;
         "last_lock_type")
             echo "$INTENT_STATUS_last_lock_type"
+            ;;
+        "last_swap_type")
+            echo "$INTENT_STATUS_last_swap_type"
             ;;
         *)
             echo ""
@@ -91,6 +96,9 @@ set_intent_status() {
             ;;
         "last_lock_type")
             INTENT_STATUS_last_lock_type="$value"
+            ;;
+        "last_swap_type")
+            INTENT_STATUS_last_swap_type="$value"
             ;;
     esac
 }
@@ -1137,6 +1145,7 @@ show_intent_summary() {
 # Command line interface functions
 intent_build() {
     local onchain_mode=false
+    local swap_type="exact-input"  # Default swap type
     local intent_type=""
     local lock_type=""
     local origin_chain=""
@@ -1146,12 +1155,20 @@ intent_build() {
     local amount_in="1000000000000000000" # 1 token default
     local amount_out="1000000000000000000" # 1 token default
     
-    # Parse arguments to detect --onchain flag
+    # Parse arguments to detect flags
     local args=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --onchain)
                 onchain_mode=true
+                shift
+                ;;
+            --exact-input)
+                swap_type="exact-input"
+                shift
+                ;;
+            --exact-output)
+                swap_type="exact-output"
                 shift
                 ;;
             *)
@@ -1289,8 +1306,14 @@ intent_build() {
         print_info "Building $intent_type intent with $lock_type auth type"
     fi
     print_info "From chain $origin_chain to chain $dest_chain"
-    print_info "Input: $amount_in wei of $token_in"
-    print_info "Output: $amount_out wei of $token_out"
+    print_info "Swap type: $swap_type"
+    if [ "$swap_type" = "exact-input" ]; then
+        print_info "Input: $amount_in wei of $token_in (exact)"
+        print_info "Output: undefined (market determined) of $token_out"
+    else
+        print_info "Input: undefined (market determined) of $token_in"
+        print_info "Output: $amount_out wei of $token_out (exact)"
+    fi
     print_info "User: $user_addr"
     print_info "Recipient: $recipient_addr"
     
@@ -1484,6 +1507,9 @@ intent_build() {
         echo "$intent_json" > "$output_file"
         print_success "Intent saved to: $output_file (for submission)"
         
+        # Store swap type in the intent status for later use
+        set_intent_status "last_swap_type" "$swap_type"
+        
         # Also create quote request format
         local quote_file="${OUTPUT_DIR:-./demo-output}/get_quote.req.json"
         
@@ -1496,41 +1522,78 @@ intent_build() {
         # Create quote request JSON using new GetQuoteRequest format
         if [ "$intent_type" = "compact" ]; then
             # For compact intents (resource locks), add lock field
-            local quote_request=$(jq -n \
-                --arg user "$user_uii" \
-                --arg input_user "$user_uii" \
-                --arg input_asset "$input_asset_uii" \
-                --arg input_amount "$amount_in" \
-                --arg output_receiver "$recipient_uii" \
-                --arg output_asset "$output_asset_uii" \
-                --arg output_amount "$amount_out" \
-                '{
-                    user: $user,
-                    intent: {
-                        intentType: "oif-swap",
-                        inputs: [
-                            {
-                                user: $input_user,
-                                asset: $input_asset,
-                                amount: $input_amount,
-                                lock: {
-                                    kind: "the-compact"
+            # Handle undefined amounts based on swap type
+            if [ "$swap_type" = "exact-input" ]; then
+                # exact-input: input amount is defined, output amount is undefined
+                local quote_request=$(jq -n \
+                    --arg user "$user_uii" \
+                    --arg input_user "$user_uii" \
+                    --arg input_asset "$input_asset_uii" \
+                    --arg input_amount "$amount_in" \
+                    --arg output_receiver "$recipient_uii" \
+                    --arg output_asset "$output_asset_uii" \
+                    '{
+                        user: $user,
+                        intent: {
+                            intentType: "oif-swap",
+                            inputs: [
+                                {
+                                    user: $input_user,
+                                    asset: $input_asset,
+                                    amount: $input_amount,
+                                    lock: {
+                                        kind: "the-compact"
+                                    }
                                 }
-                            }
-                        ],
-                        outputs: [
-                            {
-                                receiver: $output_receiver,
-                                asset: $output_asset,
-                                amount: $output_amount
-                            }
-                        ],
-                        swapType: "exact-input",
-                        preference: "speed",
-                        minValidUntil: 600
-                    },
-                    supportedTypes: ["oif-escrow-v0", "oif-resource-lock-v0", "oif-3009-v0"]
-                }')
+                            ],
+                            outputs: [
+                                {
+                                    receiver: $output_receiver,
+                                    asset: $output_asset
+                                }
+                            ],
+                            swapType: "'"$swap_type"'",
+                            preference: "speed",
+                            minValidUntil: 600
+                        },
+                        supportedTypes: ["oif-escrow-v0", "oif-resource-lock-v0", "oif-3009-v0"]
+                    }')
+            else
+                # exact-output: output amount is defined, input amount is undefined
+                local quote_request=$(jq -n \
+                    --arg user "$user_uii" \
+                    --arg input_user "$user_uii" \
+                    --arg input_asset "$input_asset_uii" \
+                    --arg output_receiver "$recipient_uii" \
+                    --arg output_asset "$output_asset_uii" \
+                    --arg output_amount "$amount_out" \
+                    '{
+                        user: $user,
+                        intent: {
+                            intentType: "oif-swap",
+                            inputs: [
+                                {
+                                    user: $input_user,
+                                    asset: $input_asset,
+                                    lock: {
+                                        kind: "the-compact"
+                                    }
+                                }
+                            ],
+                            outputs: [
+                                {
+                                    receiver: $output_receiver,
+                                    asset: $output_asset,
+                                    amount: $output_amount
+                                }
+                            ],
+                            swapType: "'"$swap_type"'",
+                            preference: "speed",
+                            minValidUntil: 600
+                        },
+                        supportedTypes: ["oif-escrow-v0", "oif-resource-lock-v0", "oif-3009-v0"]
+                    }')
+            fi
         else
             # For escrow intents, use originSubmission for auth schemes
             local auth_schemes=""
@@ -1554,40 +1617,76 @@ intent_build() {
                     schemes: $schemes
                 }')
             
-            local quote_request=$(jq -n \
-                --arg user "$user_uii" \
-                --arg input_user "$user_uii" \
-                --arg input_asset "$input_asset_uii" \
-                --arg input_amount "$amount_in" \
-                --arg output_receiver "$recipient_uii" \
-                --arg output_asset "$output_asset_uii" \
-                --arg output_amount "$amount_out" \
-                --argjson origin_submission "$origin_submission" \
-                '{
-                    user: $user,
-                    intent: {
-                        intentType: "oif-swap",
-                        inputs: [
-                            {
-                                user: $input_user,
-                                asset: $input_asset,
-                                amount: $input_amount
-                            }
-                        ],
-                        outputs: [
-                            {
-                                receiver: $output_receiver,
-                                asset: $output_asset,
-                                amount: $output_amount
-                            }
-                        ],
-                        swapType: "exact-input",
-                        preference: "speed",
-                        minValidUntil: 600,
-                        originSubmission: $origin_submission
-                    },
-                    supportedTypes: ["oif-escrow-v0", "oif-resource-lock-v0", "oif-3009-v0"]
-                }')
+            # Handle undefined amounts based on swap type
+            if [ "$swap_type" = "exact-input" ]; then
+                # exact-input: input amount is defined, output amount is undefined
+                local quote_request=$(jq -n \
+                    --arg user "$user_uii" \
+                    --arg input_user "$user_uii" \
+                    --arg input_asset "$input_asset_uii" \
+                    --arg input_amount "$amount_in" \
+                    --arg output_receiver "$recipient_uii" \
+                    --arg output_asset "$output_asset_uii" \
+                    --argjson origin_submission "$origin_submission" \
+                    '{
+                        user: $user,
+                        intent: {
+                            intentType: "oif-swap",
+                            inputs: [
+                                {
+                                    user: $input_user,
+                                    asset: $input_asset,
+                                    amount: $input_amount
+                                }
+                            ],
+                            outputs: [
+                                {
+                                    receiver: $output_receiver,
+                                    asset: $output_asset
+                                }
+                            ],
+                            swapType: "'"$swap_type"'",
+                            preference: "speed",
+                            minValidUntil: 600,
+                            originSubmission: $origin_submission
+                        },
+                        supportedTypes: ["oif-escrow-v0", "oif-resource-lock-v0", "oif-3009-v0"]
+                    }')
+            else
+                # exact-output: output amount is defined, input amount is undefined
+                local quote_request=$(jq -n \
+                    --arg user "$user_uii" \
+                    --arg input_user "$user_uii" \
+                    --arg input_asset "$input_asset_uii" \
+                    --arg output_receiver "$recipient_uii" \
+                    --arg output_asset "$output_asset_uii" \
+                    --arg output_amount "$amount_out" \
+                    --argjson origin_submission "$origin_submission" \
+                    '{
+                        user: $user,
+                        intent: {
+                            intentType: "oif-swap",
+                            inputs: [
+                                {
+                                    user: $input_user,
+                                    asset: $input_asset
+                                }
+                            ],
+                            outputs: [
+                                {
+                                    receiver: $output_receiver,
+                                    asset: $output_asset,
+                                    amount: $output_amount
+                                }
+                            ],
+                            swapType: "'"$swap_type"'",
+                            preference: "speed",
+                            minValidUntil: 600,
+                            originSubmission: $origin_submission
+                        },
+                        supportedTypes: ["oif-escrow-v0", "oif-resource-lock-v0", "oif-3009-v0"]
+                    }')
+            fi
         fi
         
         echo "$quote_request" | jq '.' > "$quote_file"
@@ -1666,15 +1765,24 @@ intent_submit() {
 
 intent_test() {
     local onchain_mode=false
+    local swap_type="exact-input"  # Default swap type
     local intent_type=""
     local auth_type=""
     local token_pair=""
     
-    # Parse arguments to detect --onchain flag
+    # Parse arguments to detect flags
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --onchain)
                 onchain_mode=true
+                shift
+                ;;
+            --exact-input)
+                swap_type="exact-input"
+                shift
+                ;;
+            --exact-output)
+                swap_type="exact-output"
                 shift
                 ;;
             *)
@@ -1793,7 +1901,12 @@ intent_test() {
         # Step 1: Build onchain intent
         print_step "Building ${intent_type} intent for onchain submission"
         
-        if ! intent_build --onchain "$intent_type" "$origin_chain" "$dest_chain" "$from_token" "$to_token"; then
+        # Pass swap type flag if not default
+        local build_args=("--onchain")
+        [ "$swap_type" = "exact-output" ] && build_args+=("--exact-output")
+        build_args+=("$intent_type" "$origin_chain" "$dest_chain" "$from_token" "$to_token")
+        
+        if ! intent_build "${build_args[@]}"; then
             print_error "Failed to build ${intent_type} intent for onchain submission"
             return 1
         fi
@@ -1823,7 +1936,12 @@ intent_test() {
             # Step 1: Build compact intent
             print_step "Building compact intent"
             
-            if ! intent_build "compact" "$origin_chain" "$dest_chain" "$from_token" "$to_token"; then
+            # Pass swap type flag if not default
+            local build_args=()
+            [ "$swap_type" = "exact-output" ] && build_args+=("--exact-output")
+            build_args+=("compact" "$origin_chain" "$dest_chain" "$from_token" "$to_token")
+            
+            if ! intent_build "${build_args[@]}"; then
                 print_error "Failed to build compact intent"
                 return 1
             fi
@@ -1833,7 +1951,12 @@ intent_test() {
             # Step 1: Build escrow intent
             print_step "Building ${intent_type} intent with ${auth_type} auth"
             
-            if ! intent_build "$intent_type" "$auth_type" "$origin_chain" "$dest_chain" "$from_token" "$to_token"; then
+            # Pass swap type flag if not default
+            local build_args=()
+            [ "$swap_type" = "exact-output" ] && build_args+=("--exact-output")
+            build_args+=("$intent_type" "$auth_type" "$origin_chain" "$dest_chain" "$from_token" "$to_token")
+            
+            if ! intent_build "${build_args[@]}"; then
                 print_error "Failed to build ${intent_type} intent with ${auth_type} auth"
                 return 1
             fi

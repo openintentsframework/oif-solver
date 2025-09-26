@@ -149,14 +149,7 @@ impl IntentHandler {
 					.estimate_cost_for_order(&order, &self.config)
 					.await
 				{
-					Ok(estimate) => {
-						tracing::info!(
-							"Cost estimate calculated: total={} {}",
-							estimate.total,
-							estimate.currency
-						);
-						estimate
-					},
+					Ok(estimate) => estimate,
 					Err(e) => {
 						tracing::warn!("Failed to calculate cost estimate: {}", e);
 						return Err(IntentError::Service(format!(
@@ -176,12 +169,8 @@ impl IntentHandler {
 					)
 					.await
 				{
-					Ok(actual_profit_margin) => {
-						tracing::info!(
-							"Order passed profitability validation: {:.2}% (min required: {:.2}%)",
-							actual_profit_margin,
-							self.config.solver.min_profitability_pct
-						);
+					Ok(_actual_profit_margin) => {
+						// Profitability details already logged in validate_profitability function
 					},
 					Err(e) => {
 						tracing::warn!("Order failed profitability validation: {}", e);

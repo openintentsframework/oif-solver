@@ -7,31 +7,18 @@
 
 use crate::engine::token_manager::{TokenManager, TokenManagerError};
 use alloy_primitives::U256;
-use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
 use solver_pricing::PricingService;
 use solver_types::{
-	costs::{CostComponent, CostEstimate},
+	costs::{CostBreakdown, CostContext},
 	current_timestamp, APIError, Address, ApiErrorType, ExecutionParams, FillProof, Order,
-	OrderInput, OrderOutput, Quote, QuoteInput, QuoteOutput, Transaction, TransactionHash,
-	DEFAULT_GAS_PRICE_WEI,
+	OrderInput, OrderOutput, Transaction, TransactionHash, DEFAULT_GAS_PRICE_WEI,
 };
+use std::primitive::str;
 use std::{str::FromStr, sync::Arc};
 use thiserror::Error;
-
-const HUNDRED: i64 = 10000;
-
-/// Cost context for quote generation with pre-calculated costs
-#[derive(Debug, Clone)]
-pub struct CostContext {
-	pub total_gas_cost_usd: Decimal,
-	pub solver_margin_bps: u32,
-	pub execution_costs_by_chain: std::collections::HashMap<u64, Decimal>,
-	pub liquidity_cost_adjustment: Decimal,
-	pub protocol_fees: std::collections::HashMap<String, Decimal>,
-}
 
 #[derive(Debug, Error)]
 pub enum CostProfitError {
@@ -45,17 +32,11 @@ pub enum CostProfitError {
 	TokenManager(#[from] TokenManagerError),
 }
 
-/// Parameters for chain-related information
-struct ChainParams {
-	origin_chain_id: u64,
-	dest_chain_id: u64,
-}
-
 /// Parameters for gas unit calculations
-struct GasUnits {
-	open_units: u64,
-	fill_units: u64,
-	claim_units: u64,
+pub struct GasUnits {
+	pub open_units: u64,
+	pub fill_units: u64,
+	pub claim_units: u64,
 }
 
 /// Unified service for cost estimation and profitability calculation.
@@ -82,13 +63,207 @@ impl CostProfitService {
 		}
 	}
 
-	/// Calculate cost context before quote generation
+	/// Calculate base swap amounts using pricing service exchange rates.
+	///
+	/// This method determines the required token amounts for a swap based on the swap type:
+	/// - **ExactInput**: Calculates output amounts - how much output token the user will receive
+	/// - **ExactOutput**: Calculates input amounts - how much input token the user needs to provide
+	///
+	/// The calculation uses a two-step conversion through USD as a common base:
+	/// 1. Convert source token amount to USD value
+	/// 2. Convert USD value to target token amount
+	///
+	/// This approach ensures we can handle any token pair as long as both tokens
+	/// have USD pricing available, even if there's no direct trading pair.
+	///
+	/// # Arguments
+	/// * `request` - The quote request with input/output token specifications
+	/// * `context` - Validated context with known amounts and swap type
+	///
+	/// # Returns
+	/// HashMap mapping token addresses to their calculated amounts (in smallest unit)
+	/// Calculate swap amounts for missing inputs or outputs based on exchange rates.
+	///
+	/// This method determines the amounts for inputs (in ExactOutput swaps) or outputs
+	/// (in ExactInput swaps) by converting through USD as an intermediate currency.
+	///
+	/// ## Approach
+	///
+	/// Rather than equal distribution, we match exact input/output pairs:
+	/// - For multi-input, multi-output swaps, we pair inputs with outputs in order
+	/// - Each input amount is used to calculate its corresponding output amount
+	/// - If there are more outputs than inputs, remaining outputs get zero
+	/// - If there are more inputs than outputs, extra inputs contribute to the last output
+	///
+	/// ## Examples
+	///
+	/// - 1 input (100 USDC) → 2 outputs: First output gets full conversion, second gets zero
+	/// - 2 inputs (50 USDC each) → 1 output: Output gets sum of both conversions
+	/// - 2 inputs → 2 outputs: Each input converts to its corresponding output
+	pub async fn calculate_swap_amounts(
+		&self,
+		request: &solver_types::GetQuoteRequest,
+		context: &solver_types::ValidatedQuoteContext,
+	) -> Result<std::collections::HashMap<solver_types::InteropAddress, U256>, CostProfitError> {
+		use solver_types::SwapType;
+		let mut calculated_amounts = std::collections::HashMap::new();
+
+		match context.swap_type {
+			SwapType::ExactInput => {
+				// ExactInput: User specifies input amounts, we calculate output amounts
+				// Flow: Input Token → USD → Output Token
+				if let Some(known_inputs) = &context.known_inputs {
+					// Convert each input to USD and match with corresponding outputs
+					let mut input_usd_values = Vec::new();
+
+					for (input, input_amount) in known_inputs {
+						let input_chain_id = input.asset.ethereum_chain_id().map_err(|e| {
+							CostProfitError::Calculation(format!("Invalid input chain: {}", e))
+						})?;
+						let input_addr = input.asset.ethereum_address().map_err(|e| {
+							CostProfitError::Calculation(format!("Invalid input address: {}", e))
+						})?;
+						let input_token = self
+							.token_manager
+							.get_token_info(input_chain_id, &Address(input_addr.0.to_vec()))?;
+
+						// Convert raw amount to USD
+						let usd_value = Self::convert_raw_token_to_usd(
+							input_amount,
+							&input_token.symbol,
+							input_token.decimals,
+							&self.pricing_service,
+						)
+						.await
+						.map_err(|e| CostProfitError::Calculation(e.to_string()))?;
+
+						input_usd_values.push(usd_value);
+					}
+
+					// Match inputs with outputs
+					for (idx, output) in request.intent.outputs.iter().enumerate() {
+						let output_usd = if idx < input_usd_values.len() {
+							// Direct pairing: use the corresponding input's USD value
+							input_usd_values[idx]
+						} else if !input_usd_values.is_empty() {
+							// More outputs than inputs: extra outputs get zero
+							Decimal::ZERO
+						} else {
+							Decimal::ZERO
+						};
+
+						// If there are more inputs than outputs, add remaining inputs to last output
+						let final_output_usd = if idx == request.intent.outputs.len() - 1
+							&& input_usd_values.len() > request.intent.outputs.len()
+						{
+							// Sum all remaining input values
+							let mut total = output_usd;
+							for value in input_usd_values.iter().skip(idx + 1) {
+								total += value;
+							}
+							total
+						} else {
+							output_usd
+						};
+
+						// Convert USD to output token amount
+						let output_amount = self
+							.convert_usd_to_token_amount(final_output_usd, &output.asset)
+							.await?;
+						calculated_amounts.insert(output.asset.clone(), output_amount);
+					}
+				}
+			},
+			SwapType::ExactOutput => {
+				// ExactOutput: User specifies output amounts, we calculate input amounts
+				// Flow: Output Token → USD → Input Token
+				if let Some(known_outputs) = &context.known_outputs {
+					// Convert each output to USD and match with corresponding inputs
+					let mut output_usd_values = Vec::new();
+
+					for (output, output_amount) in known_outputs {
+						let output_chain_id = output.asset.ethereum_chain_id().map_err(|e| {
+							CostProfitError::Calculation(format!("Invalid output chain: {}", e))
+						})?;
+						let output_addr = output.asset.ethereum_address().map_err(|e| {
+							CostProfitError::Calculation(format!("Invalid output address: {}", e))
+						})?;
+						let output_token = self
+							.token_manager
+							.get_token_info(output_chain_id, &Address(output_addr.0.to_vec()))?;
+
+						// Convert raw amount to USD
+						let usd_value = Self::convert_raw_token_to_usd(
+							output_amount,
+							&output_token.symbol,
+							output_token.decimals,
+							&self.pricing_service,
+						)
+						.await
+						.map_err(|e| CostProfitError::Calculation(e.to_string()))?;
+
+						output_usd_values.push(usd_value);
+					}
+
+					// Match outputs with inputs
+					for (idx, input) in request.intent.inputs.iter().enumerate() {
+						let input_usd = if idx < output_usd_values.len() {
+							// Direct pairing: use the corresponding output's USD value
+							output_usd_values[idx]
+						} else if !output_usd_values.is_empty() {
+							// More inputs than outputs: extra inputs get zero
+							Decimal::ZERO
+						} else {
+							Decimal::ZERO
+						};
+
+						// If there are more outputs than inputs, add remaining outputs to last input
+						let final_input_usd = if idx == request.intent.inputs.len() - 1
+							&& output_usd_values.len() > request.intent.inputs.len()
+						{
+							// Sum all remaining output values
+							let mut total = input_usd;
+							for value in output_usd_values.iter().skip(idx + 1) {
+								total += value;
+							}
+							total
+						} else {
+							input_usd
+						};
+
+						// Convert USD to input token amount
+						let input_amount = self
+							.convert_usd_to_token_amount(final_input_usd, &input.asset)
+							.await?;
+						calculated_amounts.insert(input.asset.clone(), input_amount);
+					}
+				}
+			},
+		}
+
+		tracing::debug!(
+			"Calculated swap amounts for {:?}: {} tokens",
+			context.swap_type,
+			calculated_amounts.len()
+		);
+
+		Ok(calculated_amounts)
+	}
+
+	/// Calculate cost context and swap amounts before quote generation
 	pub async fn calculate_cost_context(
 		&self,
-		inputs: &[QuoteInput],
-		outputs: &[QuoteOutput],
+		request: &solver_types::GetQuoteRequest,
+		context: &solver_types::ValidatedQuoteContext,
 		config: &Config,
 	) -> Result<CostContext, CostProfitError> {
+		// Calculate base swap amounts FIRST to fill in missing values
+		let swap_amounts = self.calculate_swap_amounts(request, context).await?;
+
+		// Use inputs and outputs from request
+		let inputs = &request.intent.inputs;
+		let outputs = &request.intent.outputs;
+
 		// Extract chain IDs
 		let origin_chain_id = inputs
 			.iter()
@@ -110,109 +285,206 @@ impl CostProfitService {
 				details: None,
 			})?;
 
+		// Determine flow key from the request structure
+		let flow_key = request.flow_key();
+		let (open_units, fill_units, claim_units) =
+			estimate_gas_units_from_config(&flow_key, config, 150000, 150000, 150000);
+
+		// Get gas units for cost calculation
+		let gas_units = GasUnits {
+			open_units,
+			fill_units,
+			claim_units,
+		};
+
+		// Parse inputs/outputs to proper types for cost calculation
+		let mut parsed_inputs = Vec::new();
+		for input in inputs {
+			if let Ok(mut order_input) = <OrderInput>::try_from(input) {
+				// Fill in zero amounts with calculated swap amounts
+				if order_input.amount == U256::ZERO {
+					if let Some(calculated_amount) = swap_amounts.get(&input.asset) {
+						order_input.amount = *calculated_amount;
+					}
+				}
+				parsed_inputs.push(order_input);
+			}
+		}
+
+		let mut parsed_outputs = Vec::new();
+		for output in outputs {
+			if let Ok(mut order_output) = <OrderOutput>::try_from(output) {
+				// Fill in zero amounts with calculated swap amounts
+				if order_output.amount == U256::ZERO {
+					if let Some(calculated_amount) = swap_amounts.get(&output.asset) {
+						order_output.amount = *calculated_amount;
+					}
+				}
+				parsed_outputs.push(order_output);
+			}
+		}
+
+		let cost_breakdown = self
+			.calculate_total_cost(
+				&parsed_inputs,
+				&parsed_outputs,
+				config,
+				origin_chain_id,
+				dest_chain_id,
+				&gas_units,
+			)
+			.await?;
+
+		// Pre-calculate cost amounts in relevant tokens
+		// Include min_profit for quotes so users know the total they need to provide
+		let total_with_profit = cost_breakdown.total + cost_breakdown.min_profit;
+		let mut cost_amounts_in_tokens = std::collections::HashMap::new();
+
+		// Calculate cost in each requested input token
+		for input in inputs {
+			let cost_in_token = self
+				.convert_usd_to_token_amount(total_with_profit, &input.asset)
+				.await
+				.unwrap_or(U256::ZERO);
+			cost_amounts_in_tokens.insert(input.asset.clone(), cost_in_token);
+		}
+
+		// Also calculate cost in each requested output token for reference
+		for output in outputs {
+			// Only add if not already calculated (in case same token appears in inputs)
+			if !cost_amounts_in_tokens.contains_key(&output.asset) {
+				let cost_in_token = self
+					.convert_usd_to_token_amount(total_with_profit, &output.asset)
+					.await
+					.unwrap_or(U256::ZERO);
+				cost_amounts_in_tokens.insert(output.asset.clone(), cost_in_token);
+			}
+		}
+
+		// Build execution costs by chain from cost breakdown
+		let mut execution_costs_by_chain = std::collections::HashMap::new();
+		execution_costs_by_chain.insert(
+			origin_chain_id,
+			cost_breakdown.gas_open + cost_breakdown.gas_claim,
+		);
+		execution_costs_by_chain.insert(dest_chain_id, cost_breakdown.gas_fill);
+
+		Ok(CostContext {
+			cost_breakdown,
+			execution_costs_by_chain,
+			liquidity_cost_adjustment: Decimal::ZERO,
+			protocol_fees: std::collections::HashMap::new(),
+			cost_amounts_in_tokens,
+			swap_amounts,
+		})
+	}
+
+	pub async fn calculate_total_cost(
+		&self,
+		inputs: &[OrderInput],
+		outputs: &[OrderOutput],
+		config: &Config,
+		origin_chain_id: u64,
+		dest_chain_id: u64,
+		gas_units: &GasUnits,
+	) -> Result<CostBreakdown, CostProfitError> {
+		let pricing = self.pricing_service.config();
+
 		// Get gas prices
 		let origin_gp = self.get_chain_gas_price(origin_chain_id).await?;
 		let dest_gp = self.get_chain_gas_price(dest_chain_id).await?;
 
-		// Use config gas units for now
-		let flow_key = None; // Will be determined from lock type later
-		let (open_units, fill_units, claim_units) =
-			estimate_gas_units_from_config(&flow_key, config, 200000, 150000, 100000);
-
-		// Calculate gas costs
-		let open_cost_wei = origin_gp.saturating_mul(U256::from(open_units));
-		let fill_cost_wei = dest_gp.saturating_mul(U256::from(fill_units));
-		let claim_cost_wei = origin_gp.saturating_mul(U256::from(claim_units));
-		let total_gas_wei = open_cost_wei + fill_cost_wei + claim_cost_wei;
+		// Calculate gas costs in wei
+		let open_cost_wei = origin_gp.saturating_mul(U256::from(gas_units.open_units));
+		let fill_cost_wei = dest_gp.saturating_mul(U256::from(gas_units.fill_units));
+		let claim_cost_wei = origin_gp.saturating_mul(U256::from(gas_units.claim_units));
 
 		// Convert to USD
-		let total_gas_usd_str = self
-			.pricing_service
-			.wei_to_currency(&total_gas_wei.to_string(), "USD")
-			.await
-			.unwrap_or_else(|_| "0".to_string());
-		let total_gas_cost_usd = Decimal::from_str(&total_gas_usd_str).unwrap_or(Decimal::ZERO);
+		let gas_open = Decimal::from_str(
+			&self
+				.pricing_service
+				.wei_to_currency(&open_cost_wei.to_string(), "USD")
+				.await
+				.unwrap_or_else(|_| "0".to_string()),
+		)
+		.unwrap_or(Decimal::ZERO);
 
-		// Build execution costs by chain
-		let mut execution_costs_by_chain = std::collections::HashMap::new();
-		execution_costs_by_chain.insert(
-			origin_chain_id,
-			Decimal::from_str(
-				&self
-					.pricing_service
-					.wei_to_currency(&(open_cost_wei + claim_cost_wei).to_string(), "USD")
-					.await
-					.unwrap_or_else(|_| "0".to_string()),
-			)
-			.unwrap_or(Decimal::ZERO),
-		);
-		execution_costs_by_chain.insert(
-			dest_chain_id,
-			Decimal::from_str(
-				&self
-					.pricing_service
-					.wei_to_currency(&fill_cost_wei.to_string(), "USD")
-					.await
-					.unwrap_or_else(|_| "0".to_string()),
-			)
-			.unwrap_or(Decimal::ZERO),
-		);
+		let gas_fill = Decimal::from_str(
+			&self
+				.pricing_service
+				.wei_to_currency(&fill_cost_wei.to_string(), "USD")
+				.await
+				.unwrap_or_else(|_| "0".to_string()),
+		)
+		.unwrap_or(Decimal::ZERO);
 
-		Ok(CostContext {
-			total_gas_cost_usd,
-			solver_margin_bps: (config.solver.min_profitability_pct * Decimal::new(100, 0))
-				.to_u32()
-				.unwrap_or(50), // Convert percentage to basis points
-			execution_costs_by_chain,
-			liquidity_cost_adjustment: Decimal::ZERO,
-			protocol_fees: std::collections::HashMap::new(),
+		let gas_claim = Decimal::from_str(
+			&self
+				.pricing_service
+				.wei_to_currency(&claim_cost_wei.to_string(), "USD")
+				.await
+				.unwrap_or_else(|_| "0".to_string()),
+		)
+		.unwrap_or(Decimal::ZERO);
+
+		// Calculate gas buffer
+		let gas_subtotal = gas_open + gas_fill + gas_claim;
+		let gas_buffer_bps = Decimal::new(pricing.gas_buffer_bps as i64, 0);
+		let gas_buffer = (gas_subtotal * gas_buffer_bps) / Decimal::from(10000);
+
+		// Rate buffer (currently 0, placeholder for future)
+		let rate_buffer = Decimal::ZERO;
+
+		// Calculate input and output values in USD using helpers
+		let total_input_value_usd = self.calculate_inputs_usd_value(inputs).await?;
+		let total_output_value_usd = self.calculate_outputs_usd_value(outputs).await?;
+
+		// Calculate spread and base price
+		let spread = total_input_value_usd - total_output_value_usd;
+		let base_price = if spread < Decimal::ZERO {
+			spread.abs() // Cover negative spread
+		} else {
+			Decimal::ZERO
+		};
+
+		// Calculate minimum profit based on TRANSACTION VALUE, not gas
+		let transaction_value = total_input_value_usd.max(total_output_value_usd);
+		let min_profit =
+			(transaction_value * config.solver.min_profitability_pct) / Decimal::from(100);
+
+		// Calculate operational cost (gas + buffers)
+		let operational_cost = gas_open + gas_fill + gas_claim + gas_buffer + rate_buffer;
+
+		// Calculate subtotal (actual costs only, excluding profit)
+		let subtotal = operational_cost + base_price;
+
+		// Calculate commission (based on costs, not including profit)
+		let commission_bps = Decimal::new(pricing.commission_bps as i64, 0);
+		let commission = if commission_bps > Decimal::ZERO {
+			(subtotal * commission_bps) / Decimal::from(10000)
+		} else {
+			Decimal::ZERO
+		};
+
+		// Calculate total (actual costs only, excluding profit requirement)
+		let total = subtotal + commission;
+
+		Ok(CostBreakdown {
+			gas_open,
+			gas_fill,
+			gas_claim,
+			gas_buffer,
+			rate_buffer,
+			base_price,
+			min_profit,
+			commission,
+			operational_cost,
+			subtotal,
+			total,
+			market_input_value: total_input_value_usd,
+			market_output_value: total_output_value_usd,
+			currency: "USD".to_string(),
 		})
-	}
-
-	/// Estimate cost for a Quote
-	pub async fn estimate_cost_for_quote(
-		&self,
-		_quote: &Quote,
-		_config: &Config,
-	) -> Result<CostEstimate, CostProfitError> {
-		Err(CostProfitError::Calculation(
-			"Quote cost estimation not yet implemented for new OIF structure".to_string(),
-		))
-
-		// let (origin_chain_id, dest_chain_id) = self.extract_chain_ids_from_quote(quote)?;
-
-		// let chain_params = ChainParams {
-		// 	origin_chain_id,
-		// 	dest_chain_id,
-		// };
-
-		// // Extract flow key from order type using helper method
-		// let flow_key = quote.order.flow_key();
-
-		// // TODO: pass standard as part of quote request
-		// let standard = "eip7683";
-		// let order = quote
-		// 	.to_order_for_estimation(standard)
-		// 	.map_err(|e| APIError::BadRequest {
-		// 		error_type: ApiErrorType::InvalidRequest,
-		// 		message: format!("Failed to convert quote to order: {}", e),
-		// 		details: None,
-		// 	})?;
-
-		// // Estimate gas units
-		// let gas_units = self
-		// 	.estimate_gas_units(
-		// 		&order,
-		// 		&flow_key,
-		// 		config,
-		// 		chain_params.origin_chain_id,
-		// 		chain_params.dest_chain_id,
-		// 	)
-		// 	.await?;
-
-		// // Calculate cost components
-		// self.calculate_cost_components(chain_params, gas_units, &inputs, &outputs, config)
-		// 	.await
 	}
 
 	/// Estimate cost for an Order using its OrderParsable implementation
@@ -220,7 +492,7 @@ impl CostProfitService {
 		&self,
 		order: &Order,
 		config: &Config,
-	) -> Result<CostEstimate, CostProfitError> {
+	) -> Result<CostBreakdown, CostProfitError> {
 		// Parse the order data based on its standard
 		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::InvalidRequest,
@@ -242,201 +514,235 @@ impl CostProfitService {
 					details: None,
 				})?;
 
-		let chain_params = ChainParams {
-			origin_chain_id,
-			dest_chain_id,
-		};
-
 		// Extract flow key (lock_type) for gas config lookup
 		let flow_key = order_parsed.parse_lock_type();
 
 		// Estimate gas units
 		let gas_units = self
-			.estimate_gas_units(
-				order,
-				&flow_key,
+			.estimate_gas_units(order, &flow_key, config, origin_chain_id, dest_chain_id)
+			.await?;
+
+		// Get inputs and outputs
+		let available_inputs = order_parsed.parse_available_inputs();
+		let requested_outputs = order_parsed.parse_requested_outputs();
+
+		// Use the unified cost calculation method
+		let cost_breakdown = self
+			.calculate_total_cost(
+				&available_inputs,
+				&requested_outputs,
 				config,
-				chain_params.origin_chain_id,
-				chain_params.dest_chain_id,
+				origin_chain_id,
+				dest_chain_id,
+				&gas_units,
 			)
 			.await?;
 
-		// Calculate cost components
-		let available_inputs = order_parsed.parse_available_inputs();
-		let requested_outputs = order_parsed.parse_requested_outputs();
-		self.calculate_cost_components(
-			chain_params,
-			gas_units,
-			&available_inputs,
-			&requested_outputs,
-			config,
-		)
-		.await
-	}
-
-	/// Calculates the profit margin percentage for an order.
-	///
-	/// The profit margin is calculated as:
-	/// Profit = Total Input Amount (USD) - Total Output Amount (USD) - Execution Costs (USD)
-	/// Profit Margin = (Profit / Total Input Amount (USD)) * 100
-	///
-	/// This represents the percentage profit the solver makes on the input amount.
-	/// All amounts are converted to USD using the pricing service for accurate comparison.
-	pub async fn calculate_profit_margin(
-		&self,
-		order: &Order,
-		cost_estimate: &CostEstimate,
-	) -> Result<Decimal, CostProfitError> {
-		// Parse the order data to get amounts
-		let parsed_order = order.parse_order_data().map_err(|e| {
-			CostProfitError::Calculation(format!("Failed to parse order data: {}", e))
-		})?;
-		let available_inputs = parsed_order.parse_available_inputs();
-		let requested_outputs = parsed_order.parse_requested_outputs();
-
-		// Calculate total input amount in USD using token manager
-		let mut total_input_amount_usd = Decimal::ZERO;
-		for input in available_inputs.iter() {
-			let chain_id = input.asset.ethereum_chain_id().map_err(|e| {
-				CostProfitError::Calculation(format!(
-					"Failed to get chain ID from input asset: {}",
-					e
-				))
-			})?;
-			let ethereum_addr = input.asset.ethereum_address().map_err(|e| {
-				CostProfitError::Calculation(format!(
-					"Failed to get ethereum address from input asset: {}",
-					e
-				))
-			})?;
-			let token_address = Address(ethereum_addr.0.to_vec());
-
-			let token_info = self
-				.token_manager
-				.get_token_info(chain_id, &token_address)
-				.map_err(|e| {
-					CostProfitError::Calculation(format!("Failed to get input token info: {}", e))
-				})?;
-
-			let amount = input.amount;
-
-			let usd_amount = Self::convert_raw_token_to_usd(
-				&amount,
-				&token_info.symbol,
-				token_info.decimals,
-				&self.pricing_service,
-			)
-			.await
-			.map_err(|e| CostProfitError::Calculation(e.to_string()))?;
-
-			total_input_amount_usd += usd_amount;
-		}
-
-		// Calculate total output amount in USD using token manager
-		let mut total_output_amount_usd = Decimal::ZERO;
-		for output in requested_outputs.iter() {
-			let chain_id = output.asset.ethereum_chain_id().map_err(|e| {
-				CostProfitError::Calculation(format!(
-					"Failed to get chain ID from output asset: {}",
-					e
-				))
-			})?;
-			let ethereum_addr = output.asset.ethereum_address().map_err(|e| {
-				CostProfitError::Calculation(format!(
-					"Failed to get ethereum address from output asset: {}",
-					e
-				))
-			})?;
-			let token_address = Address(ethereum_addr.0.to_vec());
-
-			let token_info = self
-				.token_manager
-				.get_token_info(chain_id, &token_address)
-				.map_err(|e| {
-					CostProfitError::Calculation(format!("Failed to get output token info: {}", e))
-				})?;
-
-			let amount = output.amount;
-
-			let usd_amount = Self::convert_raw_token_to_usd(
-				&amount,
-				&token_info.symbol,
-				token_info.decimals,
-				&self.pricing_service,
-			)
-			.await
-			.map_err(|e| CostProfitError::Calculation(e.to_string()))?;
-
-			total_output_amount_usd += usd_amount;
-		}
-
-		// Extract operational cost from the components
-		let operational_cost_usd = cost_estimate
-			.components
-			.iter()
-			.find(|c| c.name == "operational-cost")
-			.and_then(|c| Decimal::from_str(&c.amount).ok())
-			.ok_or_else(|| {
-				CostProfitError::Calculation(
-					"Operational cost component not found in cost estimate".to_string(),
-				)
-			})?;
-
-		// Calculate the solver's actual profit margin
-		// Profit = Input Value - Output Value - Operational Costs
-		// Margin = Profit / Input Value * 100
-		if total_input_amount_usd.is_zero() {
-			return Err(CostProfitError::Calculation(
-				"Division by zero: total_input_amount_usd is zero".to_string(),
-			));
-		}
-
-		let profit_usd = total_input_amount_usd - total_output_amount_usd - operational_cost_usd;
-		let hundred = Decimal::new(100_i64, 0);
-
-		let profit_margin_decimal = (profit_usd / total_input_amount_usd) * hundred;
-
-		tracing::debug!(
-            "Profitability calculation: input=${} (USD), output=${} (USD), operational_cost=${} (USD), profit=${} (USD), margin={}%",
-            total_input_amount_usd,
-            total_output_amount_usd,
-            operational_cost_usd,
-            profit_usd,
-            profit_margin_decimal
-        );
-
-		Ok(profit_margin_decimal)
+		// Convert to API format
+		Ok(cost_breakdown)
 	}
 
 	/// Validates that an order meets the minimum profitability threshold.
+	///
+	/// This method checks if an order (whether from our quote system or submitted directly)
+	/// provides sufficient profit margin. It recalculates costs and compares actual profit
+	/// against the minimum requirement.
 	pub async fn validate_profitability(
 		&self,
 		order: &Order,
-		cost_estimate: &CostEstimate,
+		cost_breakdown: &CostBreakdown,
 		min_profitability_pct: Decimal,
 	) -> Result<Decimal, APIError> {
-		// Calculate profit margin
-		let actual_profit_margin = self
-			.calculate_profit_margin(order, cost_estimate)
+		// Parse the order to get actual inputs/outputs
+		let parsed_order = order
+			.parse_order_data()
+			.map_err(|e| APIError::InternalServerError {
+				error_type: ApiErrorType::InternalError,
+				message: format!("Failed to parse order data: {}", e),
+			})?;
+
+		let available_inputs = parsed_order.parse_available_inputs();
+		let requested_outputs = parsed_order.parse_requested_outputs();
+
+		// Calculate total input and output values in USD using helpers
+		let total_input_value_usd = self
+			.calculate_inputs_usd_value(&available_inputs)
 			.await
 			.map_err(|e| APIError::InternalServerError {
 				error_type: ApiErrorType::InternalError,
-				message: format!("Failed to calculate profitability: {}", e),
+				message: format!("Failed to calculate input value: {}", e),
 			})?;
 
-		// Check if the actual profit margin meets the minimum requirement
+		let total_output_value_usd = self
+			.calculate_outputs_usd_value(&requested_outputs)
+			.await
+			.map_err(|e| APIError::InternalServerError {
+				error_type: ApiErrorType::InternalError,
+				message: format!("Failed to calculate output value: {}", e),
+			})?;
+
+		// Operational cost is already available in the breakdown
+		let operational_cost_usd = cost_breakdown.operational_cost;
+
+		// Calculate the spread between input and output
+		let spread = total_input_value_usd - total_output_value_usd;
+
+		// Actual profit is what's left after covering operational costs
+		let actual_profit_usd = spread - operational_cost_usd;
+
+		// Calculate profit margin as percentage of output value
+		if total_output_value_usd.is_zero() {
+			return Err(APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: "Cannot calculate profit margin: zero output value".to_string(),
+				details: None,
+			});
+		}
+
+		let actual_profit_margin =
+			(actual_profit_usd / total_output_value_usd) * Decimal::from(100);
+
+		// Calculate what the values would be at different stages
+		// Note: We're working backwards from the final quoted values
+		// Use the actual profit from the spread, not the recalculated min_profit
+		let display_profit = actual_profit_usd;
+		let total_adjustments = cost_breakdown.total + display_profit;
+
+		// Always show both labels for clarity
+		// One of them will apply depending on whether it's ExactInput or ExactOutput
+		let input_note = " (includes all additions)";
+		let output_note = " (includes all deductions)";
+		let adjustment_label = "Total Adjustments";
+
+		// Log comprehensive cost, value and profitability analysis
+		tracing::info!(
+			"\n\
+			╭─ Transaction Values (Order):\n\
+			│  ├─ Input Amount:       $ {:>7.2}{}\n\
+			│  ├─ Output Amount:      $ {:>7.2}{}\n\
+			│  ├─ {}:  $ {:>7.2} (costs: ${:.2} + profit: ${:.2})\n\
+			│  ├─ Spread:             $ {:>7.2} {}\n\
+			│  └─ Exchange Rate:      • {:>7.2} (out/in)\n\
+			├─ Cost Breakdown:\n\
+			│  ├─ Gas Costs:\n\
+			│  │  ├─ Open:            $ {:>7.2}\n\
+			│  │  ├─ Fill:            $ {:>7.2}\n\
+			│  │  ├─ Claim:           $ {:>7.2}\n\
+			│  │  └─ Buffer:          $ {:>7.2} ({}%)\n\
+			│  ├─ Market Adjustments:\n\
+			│  │  ├─ Rate Buffer:     $ {:>7.2}\n\
+			│  │  └─ Base Price:      $ {:>7.2} {}\n\
+			│  ├─ Profit Components:\n\
+			│  │  ├─ Min Profit:      $ {:>7.2} ({}%)\n\
+			│  │  └─ Commission:      $ {:>7.2} {}\n\
+			│  └─ Total Cost:         $ {:>7.2}\n\
+			├─ Profitability:\n\
+			│  ├─ Input Value:        $ {:>7.2}\n\
+			│  ├─ Output Value:      -$ {:>7.2}\n\
+			│  ├─ Operational Cost:  -$ {:>7.2}\n\
+			│  ├─ Net Profit:         $ {:>7.2}\n\
+			│  ├─ Profit Margin:      % {:>7.2}\n\
+			│  ├─ Min Required:       % {:>7.2}\n\
+			│  └─ Status:              {}\n\
+			╰─ Decision: {}",
+			// Transaction values
+			total_input_value_usd,
+			input_note,
+			total_output_value_usd,
+			output_note,
+			adjustment_label,
+			total_adjustments,
+			cost_breakdown.total,
+			display_profit,
+			(total_input_value_usd - total_output_value_usd).abs(),
+			if total_input_value_usd >= total_output_value_usd {
+				"(favorable)"
+			} else {
+				"(unfavorable)"
+			},
+			if !total_input_value_usd.is_zero() {
+				(total_output_value_usd / total_input_value_usd).round_dp(4)
+			} else {
+				Decimal::ZERO
+			},
+			// Cost breakdown
+			cost_breakdown.gas_open,
+			cost_breakdown.gas_fill,
+			cost_breakdown.gas_claim,
+			cost_breakdown.gas_buffer,
+			if cost_breakdown.gas_open + cost_breakdown.gas_fill + cost_breakdown.gas_claim
+				> Decimal::ZERO
+			{
+				((cost_breakdown.gas_buffer
+					/ (cost_breakdown.gas_open
+						+ cost_breakdown.gas_fill
+						+ cost_breakdown.gas_claim))
+					* Decimal::from(100))
+				.round_dp(1)
+			} else {
+				Decimal::ZERO
+			},
+			cost_breakdown.rate_buffer,
+			cost_breakdown.base_price,
+			if cost_breakdown.base_price > Decimal::ZERO {
+				"(negative spread)"
+			} else {
+				""
+			},
+			display_profit,
+			min_profitability_pct,
+			cost_breakdown.commission,
+			if cost_breakdown.commission > Decimal::ZERO {
+				format!(
+					"({}%)",
+					((cost_breakdown.commission / cost_breakdown.subtotal) * Decimal::from(100))
+						.round_dp(1)
+				)
+			} else {
+				String::new()
+			},
+			cost_breakdown.total,
+			// Profitability calculation
+			total_input_value_usd,
+			total_output_value_usd,
+			operational_cost_usd,
+			actual_profit_usd,
+			actual_profit_margin,
+			min_profitability_pct,
+			if actual_profit_margin >= min_profitability_pct {
+				"✓ PASSED"
+			} else {
+				"✗ FAILED"
+			},
+			if actual_profit_margin >= min_profitability_pct {
+				format!(
+					"Order accepted with {:.2}% profit margin",
+					actual_profit_margin
+				)
+			} else {
+				format!(
+					"Order rejected - insufficient margin ({:.2}% < {:.2}%)",
+					actual_profit_margin, min_profitability_pct
+				)
+			}
+		);
+
+		// Check if actual profit meets minimum requirement
 		if actual_profit_margin < min_profitability_pct {
+			let error_msg = format!(
+				"Insufficient profit margin: {:.2}% < required {:.2}%",
+				actual_profit_margin, min_profitability_pct
+			);
 			return Err(APIError::UnprocessableEntity {
 				error_type: ApiErrorType::InsufficientProfitability,
-				message: format!(
-					"Insufficient profit margin: {:.2}% (minimum required: {:.2}%)",
-					actual_profit_margin, min_profitability_pct
-				),
+				message: error_msg,
 				details: Some(serde_json::json!({
-					"actual_profit_margin": actual_profit_margin,
-					"min_required": min_profitability_pct,
-					"total_cost": cost_estimate.total,
-					"cost_components": cost_estimate.components,
+					"input_value": format!("${:.2}", total_input_value_usd),
+					"output_value": format!("${:.2}", total_output_value_usd),
+					"operational_cost": format!("${:.2}", operational_cost_usd),
+					"actual_profit": format!("${:.2}", actual_profit_usd),
+					"actual_margin": format!("{:.2}%", actual_profit_margin),
+					"required_margin": format!("{:.2}%", min_profitability_pct),
 				})),
 			});
 		}
@@ -628,244 +934,6 @@ impl CostProfitService {
 		})
 	}
 
-	/// Calculate cost components for the order
-	async fn calculate_cost_components(
-		&self,
-		chain_params: ChainParams,
-		gas_units: GasUnits,
-		available_inputs: &[OrderInput],
-		requested_outputs: &[OrderOutput],
-		config: &Config,
-	) -> Result<CostEstimate, CostProfitError> {
-		let pricing = self.pricing_service.config();
-
-		// Gas prices
-		let origin_gp = self
-			.get_chain_gas_price(chain_params.origin_chain_id)
-			.await?;
-		let dest_gp = self.get_chain_gas_price(chain_params.dest_chain_id).await?;
-
-		// Calculate gas costs in wei
-		let open_cost_wei = origin_gp.saturating_mul(U256::from(gas_units.open_units));
-		let fill_cost_wei = dest_gp.saturating_mul(U256::from(gas_units.fill_units));
-		let claim_cost_wei = origin_gp.saturating_mul(U256::from(gas_units.claim_units));
-
-		// Convert wei amounts to display currency
-		let open_cost_currency = self
-			.pricing_service
-			.wei_to_currency(&open_cost_wei.to_string(), &pricing.currency)
-			.await
-			.unwrap_or_else(|_| "0".to_string());
-		let fill_cost_currency = self
-			.pricing_service
-			.wei_to_currency(&fill_cost_wei.to_string(), &pricing.currency)
-			.await
-			.unwrap_or_else(|_| "0".to_string());
-		let claim_cost_currency = self
-			.pricing_service
-			.wei_to_currency(&claim_cost_wei.to_string(), &pricing.currency)
-			.await
-			.unwrap_or_else(|_| "0".to_string());
-
-		// Calculate gas buffer using Decimal arithmetic
-		let gas_subtotal_wei = open_cost_wei + fill_cost_wei + claim_cost_wei;
-		let bps_decimal = Decimal::new(pricing.gas_buffer_bps as i64, 0);
-		let bps_divisor = Decimal::new(10000, 0); // 10000 basis points = 100%
-
-		let gas_subtotal_decimal =
-			Decimal::from_str(&gas_subtotal_wei.to_string()).unwrap_or(Decimal::ZERO);
-		let buffer_gas_decimal = (gas_subtotal_decimal * bps_decimal) / bps_divisor;
-		let buffer_gas_wei = buffer_gas_decimal.to_string();
-
-		let buffer_gas_currency = self
-			.pricing_service
-			.wei_to_currency(&buffer_gas_wei, &pricing.currency)
-			.await
-			.unwrap_or_else(|_| "0".to_string());
-
-		// Calculate base price and minimum profit requirement in USD
-		let (base_price_usd, min_profit_usd) = self
-			.calculate_pricing_components(available_inputs, requested_outputs, config)
-			.await
-			.unwrap_or_else(|e| {
-				tracing::warn!("Failed to calculate pricing components: {}", e);
-				("0".to_string(), "0".to_string())
-			});
-
-		// Calculate buffer rates (currently 0 since we don't have rate buffers implemented)
-		let buffer_rates = "0".to_string();
-
-		// Calculate operational costs (gas + buffers only) in USD
-		let operational_cost_usd = Decimal::from_str(&open_cost_currency).unwrap_or(Decimal::ZERO)
-			+ Decimal::from_str(&fill_cost_currency).unwrap_or(Decimal::ZERO)
-			+ Decimal::from_str(&claim_cost_currency).unwrap_or(Decimal::ZERO)
-			+ Decimal::from_str(&buffer_gas_currency).unwrap_or(Decimal::ZERO);
-
-		// Calculate subtotal: all cost components before commission
-		let subtotal_usd = operational_cost_usd
-			+ Decimal::from_str(&base_price_usd).unwrap_or(Decimal::ZERO)
-			+ Decimal::from_str(&min_profit_usd).unwrap_or(Decimal::ZERO);
-
-		// Calculate commission on the subtotal
-		let commission_amount_usd = if pricing.commission_bps > 0 {
-			let commission_bps = Decimal::new(pricing.commission_bps as i64, 0);
-			let commission_divisor = Decimal::new(HUNDRED, 0);
-			(subtotal_usd * commission_bps) / commission_divisor
-		} else {
-			Decimal::ZERO
-		};
-
-		// Calculate total: subtotal + commission
-		let total_usd = subtotal_usd + commission_amount_usd;
-
-		Ok(CostEstimate {
-			currency: pricing.currency.clone(),
-			components: vec![
-				CostComponent {
-					name: "base-price".into(),
-					amount: base_price_usd.to_string(),
-					amount_wei: None,
-				},
-				CostComponent {
-					name: "gas-open".into(),
-					amount: open_cost_currency,
-					amount_wei: Some(open_cost_wei.to_string()),
-				},
-				CostComponent {
-					name: "gas-fill".into(),
-					amount: fill_cost_currency,
-					amount_wei: Some(fill_cost_wei.to_string()),
-				},
-				CostComponent {
-					name: "gas-claim".into(),
-					amount: claim_cost_currency,
-					amount_wei: Some(claim_cost_wei.to_string()),
-				},
-				CostComponent {
-					name: "buffer-gas".into(),
-					amount: buffer_gas_currency,
-					amount_wei: Some(buffer_gas_wei),
-				},
-				CostComponent {
-					name: "buffer-rates".into(),
-					amount: buffer_rates.clone(),
-					amount_wei: Some(buffer_rates),
-				},
-				CostComponent {
-					name: "min-profit".into(),
-					amount: min_profit_usd.to_string(),
-					amount_wei: None,
-				},
-				CostComponent {
-					name: "operational-cost".into(),
-					amount: operational_cost_usd.to_string(),
-					amount_wei: None,
-				},
-			],
-			commission_bps: pricing.commission_bps,
-			commission_amount: commission_amount_usd.to_string(),
-			subtotal: subtotal_usd.to_string(),
-			total: total_usd.to_string(),
-		})
-	}
-
-	/// Calculate the base price and minimum profit requirement in USD
-	async fn calculate_pricing_components(
-		&self,
-		available_inputs: &[OrderInput],
-		requested_outputs: &[OrderOutput],
-		config: &Config,
-	) -> Result<(String, String), Box<dyn std::error::Error>> {
-		// Calculate total input value in USD
-		let mut total_input_value_usd = Decimal::ZERO;
-		for input in available_inputs.iter() {
-			let chain_id = input
-				.asset
-				.ethereum_chain_id()
-				.map_err(|e| format!("Failed to get chain ID from input asset: {}", e))?;
-			let ethereum_addr = input
-				.asset
-				.ethereum_address()
-				.map_err(|e| format!("Failed to get ethereum address from input asset: {}", e))?;
-			let token_address = Address(ethereum_addr.0.to_vec());
-
-			let token_info = self
-				.token_manager
-				.get_token_info(chain_id, &token_address)
-				.map_err(|e| format!("Failed to get input token info: {}", e))?;
-
-			let amount = input.amount;
-
-			let usd_amount = Self::convert_raw_token_to_usd(
-				&amount,
-				&token_info.symbol,
-				token_info.decimals,
-				&self.pricing_service,
-			)
-			.await?;
-
-			total_input_value_usd += usd_amount;
-		}
-
-		// Calculate total output value in USD
-		let mut total_output_value_usd = Decimal::ZERO;
-		for output in requested_outputs.iter() {
-			let chain_id = output
-				.asset
-				.ethereum_chain_id()
-				.map_err(|e| format!("Failed to get chain ID from output asset: {}", e))?;
-			let ethereum_addr = output
-				.asset
-				.ethereum_address()
-				.map_err(|e| format!("Failed to get ethereum address from output asset: {}", e))?;
-			let token_address = Address(ethereum_addr.0.to_vec());
-
-			let token_info = self
-				.token_manager
-				.get_token_info(chain_id, &token_address)
-				.map_err(|e| format!("Failed to get output token info: {}", e))?;
-
-			let amount = output.amount;
-
-			let usd_amount = Self::convert_raw_token_to_usd(
-				&amount,
-				&token_info.symbol,
-				token_info.decimals,
-				&self.pricing_service,
-			)
-			.await?;
-
-			total_output_value_usd += usd_amount;
-		}
-
-		// Calculate the spread (can be negative if solver provides more value than received)
-		let spread = total_input_value_usd - total_output_value_usd;
-
-		// Calculate base price needed to cover any negative spread
-		let base_price_usd = if spread < Decimal::ZERO {
-			spread.abs()
-		} else {
-			Decimal::ZERO
-		};
-
-		// Calculate minimum required profit based on the transaction size
-		let transaction_value = total_input_value_usd.max(total_output_value_usd);
-		let hundred = Decimal::new(100_i64, 0);
-		let min_required_profit =
-			(transaction_value * config.solver.min_profitability_pct) / hundred;
-
-		tracing::info!(
-            "Pricing components: input_value={}, output_value={}, spread={}, base_price={}, min_profit={}",
-            total_input_value_usd,
-            total_output_value_usd,
-            spread,
-            base_price_usd,
-            min_required_profit
-        );
-
-		Ok((base_price_usd.to_string(), min_required_profit.to_string()))
-	}
-
 	/// Gets the gas price for a specific chain
 	async fn get_chain_gas_price(&self, chain_id: u64) -> Result<U256, APIError> {
 		let chain_data = self
@@ -921,6 +989,135 @@ impl CostProfitService {
 
 		Decimal::from_str(&usd_amount_str)
 			.map_err(|e| format!("Failed to parse USD amount {}: {}", usd_amount_str, e).into())
+	}
+
+	/// Helper to calculate total USD value for a list of inputs
+	async fn calculate_inputs_usd_value(
+		&self,
+		inputs: &[OrderInput],
+	) -> Result<Decimal, CostProfitError> {
+		let mut total_usd = Decimal::ZERO;
+
+		for input in inputs {
+			let chain_id = input.asset.ethereum_chain_id().map_err(|e| {
+				CostProfitError::Calculation(format!("Failed to get chain ID: {}", e))
+			})?;
+			let ethereum_addr = input.asset.ethereum_address().map_err(|e| {
+				CostProfitError::Calculation(format!("Failed to get address: {}", e))
+			})?;
+			let token_address = Address(ethereum_addr.0.to_vec());
+
+			let token_info = self
+				.token_manager
+				.get_token_info(chain_id, &token_address)?;
+
+			let usd_amount = Self::convert_raw_token_to_usd(
+				&input.amount,
+				&token_info.symbol,
+				token_info.decimals,
+				&self.pricing_service,
+			)
+			.await
+			.map_err(|e| CostProfitError::Calculation(e.to_string()))?;
+
+			total_usd += usd_amount;
+		}
+
+		Ok(total_usd)
+	}
+
+	/// Helper to calculate total USD value for a list of outputs
+	async fn calculate_outputs_usd_value(
+		&self,
+		outputs: &[OrderOutput],
+	) -> Result<Decimal, CostProfitError> {
+		let mut total_usd = Decimal::ZERO;
+
+		for output in outputs {
+			let chain_id = output.asset.ethereum_chain_id().map_err(|e| {
+				CostProfitError::Calculation(format!("Failed to get chain ID: {}", e))
+			})?;
+			let ethereum_addr = output.asset.ethereum_address().map_err(|e| {
+				CostProfitError::Calculation(format!("Failed to get address: {}", e))
+			})?;
+			let token_address = Address(ethereum_addr.0.to_vec());
+
+			let token_info = self
+				.token_manager
+				.get_token_info(chain_id, &token_address)?;
+
+			let usd_amount = Self::convert_raw_token_to_usd(
+				&output.amount,
+				&token_info.symbol,
+				token_info.decimals,
+				&self.pricing_service,
+			)
+			.await
+			.map_err(|e| CostProfitError::Calculation(e.to_string()))?;
+
+			total_usd += usd_amount;
+		}
+
+		Ok(total_usd)
+	}
+
+	/// Converts a USD amount to token amount in smallest unit
+	async fn convert_usd_to_token_amount(
+		&self,
+		usd_amount: Decimal,
+		asset: &solver_types::InteropAddress,
+	) -> Result<U256, CostProfitError> {
+		// Get token info
+		let chain_id = asset
+			.ethereum_chain_id()
+			.map_err(|e| CostProfitError::Calculation(format!("Failed to get chain ID: {}", e)))?;
+		let ethereum_addr = asset.ethereum_address().map_err(|e| {
+			CostProfitError::Calculation(format!("Failed to get ethereum address: {}", e))
+		})?;
+		let token_address = Address(ethereum_addr.0.to_vec());
+
+		let token_info = self
+			.token_manager
+			.get_token_info(chain_id, &token_address)?;
+
+		// Convert USD to token amount (normalized)
+		let token_amount_str = self
+			.pricing_service
+			.convert_asset("USD", &token_info.symbol, &usd_amount.to_string())
+			.await
+			.map_err(|e| {
+				CostProfitError::Calculation(format!(
+					"Failed to convert USD to {}: {}",
+					token_info.symbol, e
+				))
+			})?;
+
+		let token_amount_decimal = Decimal::from_str(&token_amount_str).map_err(|e| {
+			CostProfitError::Calculation(format!("Failed to parse token amount: {}", e))
+		})?;
+
+		// Convert to smallest unit (apply decimals)
+		let multiplier = U256::from(10u64).pow(U256::from(token_info.decimals));
+
+		// Convert decimal to U256 (handle fractional part properly)
+		let whole_part = token_amount_decimal.trunc();
+		let fractional_part = token_amount_decimal - whole_part;
+
+		// Convert whole part to U256
+		let whole_u256 = U256::from_str(&whole_part.to_string()).map_err(|e| {
+			CostProfitError::Calculation(format!("Failed to convert to U256: {}", e))
+		})?;
+
+		// Calculate fractional part in smallest units
+		let fractional_multiplier = Decimal::new(10_i64.pow(token_info.decimals as u32), 0);
+		let fractional_in_smallest = (fractional_part * fractional_multiplier).trunc();
+		let fractional_u256 =
+			U256::from_str(&fractional_in_smallest.to_string()).unwrap_or(U256::ZERO);
+
+		// Combine whole and fractional parts
+		let result = whole_u256 * multiplier + fractional_u256;
+
+		Ok(result)
 	}
 }
 

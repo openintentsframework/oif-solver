@@ -508,61 +508,17 @@ impl From<OrderOutput> for QuoteOutput {
 	}
 }
 
-/// Conversion from QuoteInput to OrderInput (can fail if amount is missing)
-impl TryFrom<QuoteInput> for OrderInput {
-	type Error = String;
-
-	fn try_from(quote_input: QuoteInput) -> Result<Self, Self::Error> {
-		let amount = quote_input.amount.ok_or_else(|| {
-			"Cannot convert QuoteInput to OrderInput: amount is required".to_string()
-		})?;
-
-		let amount_u256 = U256::from_str(&amount)
-			.map_err(|e| format!("Failed to parse amount '{}': {}", amount, e))?;
-
-		Ok(OrderInput {
-			user: quote_input.user,
-			asset: quote_input.asset,
-			amount: amount_u256,
-			lock: quote_input.lock,
-		})
-	}
-}
-
-/// Conversion from QuoteOutput to OrderOutput (can fail if amount is missing)
-impl TryFrom<QuoteOutput> for OrderOutput {
-	type Error = String;
-
-	fn try_from(quote_output: QuoteOutput) -> Result<Self, Self::Error> {
-		let amount = quote_output.amount.ok_or_else(|| {
-			"Cannot convert QuoteOutput to OrderOutput: amount is required".to_string()
-		})?;
-
-		let amount_u256 = U256::from_str(&amount)
-			.map_err(|e| format!("Failed to parse amount '{}': {}", amount, e))?;
-
-		Ok(OrderOutput {
-			receiver: quote_output.receiver,
-			asset: quote_output.asset,
-			amount: amount_u256,
-			calldata: quote_output.calldata,
-		})
-	}
-}
-
-/// Conversion from &QuoteInput to OrderInput (can fail if amount is missing)
 impl TryFrom<&QuoteInput> for OrderInput {
 	type Error = QuoteError;
 
 	fn try_from(quote_input: &QuoteInput) -> Result<Self, Self::Error> {
-		let amount = quote_input
-			.amount
-			.as_ref()
-			.ok_or(QuoteError::MissingInputAmount)?;
-
-		let amount_u256 = U256::from_str(amount).map_err(|e| {
-			QuoteError::InvalidRequest(format!("Failed to parse amount '{}': {}", amount, e))
-		})?;
+		let amount_u256 = if let Some(amount) = quote_input.amount.as_ref() {
+			U256::from_str(amount).map_err(|e| {
+				QuoteError::InvalidRequest(format!("Failed to parse amount '{}': {}", amount, e))
+			})?
+		} else {
+			U256::ZERO
+		};
 
 		Ok(OrderInput {
 			user: quote_input.user.clone(),
@@ -573,19 +529,17 @@ impl TryFrom<&QuoteInput> for OrderInput {
 	}
 }
 
-/// Conversion from &QuoteOutput to OrderOutput (can fail if amount is missing)
 impl TryFrom<&QuoteOutput> for OrderOutput {
 	type Error = QuoteError;
 
 	fn try_from(quote_output: &QuoteOutput) -> Result<Self, Self::Error> {
-		let amount = quote_output
-			.amount
-			.as_ref()
-			.ok_or(QuoteError::MissingOutputAmount)?;
-
-		let amount_u256 = U256::from_str(amount).map_err(|e| {
-			QuoteError::InvalidRequest(format!("Failed to parse amount '{}': {}", amount, e))
-		})?;
+		let amount_u256 = if let Some(amount) = quote_output.amount.as_ref() {
+			U256::from_str(amount).map_err(|e| {
+				QuoteError::InvalidRequest(format!("Failed to parse amount '{}': {}", amount, e))
+			})?
+		} else {
+			U256::ZERO
+		};
 
 		Ok(OrderOutput {
 			receiver: quote_output.receiver.clone(),
@@ -644,6 +598,16 @@ pub struct IntentRequest {
 	pub metadata: Option<serde_json::Value>,
 }
 
+/// Rich validation context
+#[derive(Debug, Clone)]
+pub struct ValidatedQuoteContext {
+	pub swap_type: SwapType,
+	pub known_inputs: Option<Vec<(QuoteInput, U256)>>,
+	pub known_outputs: Option<Vec<(QuoteOutput, U256)>>,
+	pub constraint_inputs: Option<Vec<(QuoteInput, Option<U256>)>>,
+	pub constraint_outputs: Option<Vec<(QuoteOutput, Option<U256>)>>,
+}
+
 /// Request for getting price quotes - new OIF spec structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetQuoteRequest {
@@ -654,6 +618,39 @@ pub struct GetQuoteRequest {
 	/// Supported order types
 	#[serde(rename = "supportedTypes")]
 	pub supported_types: Vec<String>,
+}
+
+impl GetQuoteRequest {
+	/// Determines the appropriate flow key for gas configuration based on the request structure.
+	/// Analyzes inputs for lock types and origin submission for auth schemes to construct the flow key.
+	pub fn flow_key(&self) -> Option<String> {
+		// Check if any input has a lock - if so, use resource lock flow
+		for input in &self.intent.inputs {
+			if let Some(lock) = &input.lock {
+				match lock.kind {
+					LockKind::TheCompact => return Some("resource_lock".to_string()),
+					LockKind::Rhinestone => return Some("resource_lock".to_string()),
+				}
+			}
+		}
+
+		// No locks found, default to escrow - determine auth scheme from origin submission
+		if let Some(origin_submission) = &self.intent.origin_submission {
+			if let Some(schemes) = &origin_submission.schemes {
+				if let Some(scheme) = schemes.iter().next() {
+					match scheme {
+						AuthScheme::Eip3009 => return Some("eip3009_escrow".to_string()),
+						AuthScheme::Permit2 => return Some("permit2_escrow".to_string()),
+						AuthScheme::Erc20Permit => return Some("permit2_escrow".to_string()),
+						AuthScheme::Erc4337 => return Some("permit2_escrow".to_string()), // Default to permit2
+					}
+				}
+			}
+		}
+
+		// Default fallback to permit2_escrow if no specific scheme is found
+		Some("permit2_escrow".to_string())
+	}
 }
 
 /// Legacy V1 structure for backward compatibility during migration
