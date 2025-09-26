@@ -440,11 +440,6 @@ impl interfaces::StandardOrder {
 		};
 
 		// Extract spender as the user address (the entity that will receive the permit)
-		// In the new format, spender is directly in the message
-		// let spender_str = eip712_data
-		// 	.get("spender")
-		// 	.and_then(|s| s.as_str())
-		// 	.ok_or("Missing spender in EIP-712 data")?;
 		// Extract the recovered user address from the injected message field
 		let user_str = eip712_data
 			.get("user")
