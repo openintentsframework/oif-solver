@@ -149,14 +149,7 @@ impl IntentHandler {
 					.estimate_cost_for_order(&order, &self.config)
 					.await
 				{
-					Ok(estimate) => {
-						tracing::info!(
-							"Cost estimate calculated: total={} {}",
-							estimate.total,
-							estimate.currency
-						);
-						estimate
-					},
+					Ok(estimate) => estimate,
 					Err(e) => {
 						tracing::warn!("Failed to calculate cost estimate: {}", e);
 						return Err(IntentError::Service(format!(

@@ -371,6 +371,74 @@ impl CostProfitService {
 		// Calculate base swap amounts for missing inputs/outputs
 		let swap_amounts = self.calculate_swap_amounts(request, context).await?;
 
+		// Validate constraints based on swap type
+		let constraint_violation = match context.swap_type {
+			solver_types::SwapType::ExactInput => {
+				// For exact-input: output amounts must meet or exceed minimums
+				if let Some(constraints) = &context.constraint_outputs {
+					constraints
+						.iter()
+						.find_map(|(output, constraint_amount_opt)| {
+							// Only check if there's an actual constraint amount
+							constraint_amount_opt
+								.as_ref()
+								.and_then(|constraint_amount| {
+									swap_amounts
+										.get(&output.asset)
+										.and_then(|calculated_amount| {
+											if calculated_amount < constraint_amount {
+												tracing::warn!(
+										"Output constraint not met for token {}: calculated {} < minimum {}",
+										output.asset, calculated_amount, constraint_amount
+									);
+												Some(format!(
+										"Output amount for {} ({}) below minimum required ({})",
+										output.asset, calculated_amount, constraint_amount
+									))
+											} else {
+												None
+											}
+										})
+								})
+						})
+				} else {
+					None
+				}
+			},
+			solver_types::SwapType::ExactOutput => {
+				// For exact-output: input amounts must not exceed maximums
+				if let Some(constraints) = &context.constraint_inputs {
+					constraints
+						.iter()
+						.find_map(|(input, constraint_amount_opt)| {
+							// Only check if there's an actual constraint amount
+							constraint_amount_opt
+								.as_ref()
+								.and_then(|constraint_amount| {
+									swap_amounts
+										.get(&input.asset)
+										.and_then(|calculated_amount| {
+											if calculated_amount > constraint_amount {
+												tracing::warn!(
+										"Input constraint not met for token {}: calculated {} > maximum {}",
+										input.asset, calculated_amount, constraint_amount
+									);
+												Some(format!(
+										"Input amount for {} ({}) exceeds maximum allowed ({})",
+										input.asset, calculated_amount, constraint_amount
+									))
+											} else {
+												None
+											}
+										})
+								})
+						})
+				} else {
+					None
+				}
+			},
+		};
+
 		Ok(CostContext {
 			total_gas_cost_usd,
 			solver_margin_bps,
@@ -379,6 +447,7 @@ impl CostProfitService {
 			protocol_fees: std::collections::HashMap::new(),
 			cost_amounts_in_tokens,
 			swap_amounts,
+			constraint_violation,
 		})
 	}
 
@@ -537,20 +606,13 @@ impl CostProfitService {
 			total_output_amount_usd += usd_amount;
 		}
 
-		// Extract operational cost from the components
-		let operational_cost_usd = cost_estimate
-			.components
-			.iter()
-			.find(|c| c.name == "operational-cost")
-			.and_then(|c| Decimal::from_str(&c.amount).ok())
-			.ok_or_else(|| {
-				CostProfitError::Calculation(
-					"Operational cost component not found in cost estimate".to_string(),
-				)
-			})?;
+		// Use the total cost from the estimate (includes all components: gas, buffers, base price, min profit, commission)
+		let total_cost_usd = Decimal::from_str(&cost_estimate.total).map_err(|e| {
+			CostProfitError::Calculation(format!("Failed to parse total cost from estimate: {}", e))
+		})?;
 
 		// Calculate the solver's actual profit margin
-		// Profit = Input Value - Output Value - Operational Costs
+		// Profit = Input Value - Output Value - Total Costs
 		// Margin = Profit / Input Value * 100
 		if total_input_amount_usd.is_zero() {
 			return Err(CostProfitError::Calculation(
@@ -558,19 +620,19 @@ impl CostProfitService {
 			));
 		}
 
-		let profit_usd = total_input_amount_usd - total_output_amount_usd - operational_cost_usd;
+		let profit_usd = total_input_amount_usd - total_output_amount_usd - total_cost_usd;
 		let hundred = Decimal::new(100_i64, 0);
 
 		let profit_margin_decimal = (profit_usd / total_input_amount_usd) * hundred;
 
-		tracing::debug!(
-            "Profitability calculation: input=${} (USD), output=${} (USD), operational_cost=${} (USD), profit=${} (USD), margin={}%",
-            total_input_amount_usd,
-            total_output_amount_usd,
-            operational_cost_usd,
-            profit_usd,
-            profit_margin_decimal
-        );
+		tracing::info!(
+			"Margin {:.2}%: in ${:.2} - out ${:.2} - cost ${:.2} = profit ${:.2}",
+			profit_margin_decimal,
+			total_input_amount_usd,
+			total_output_amount_usd,
+			total_cost_usd,
+			profit_usd
+		);
 
 		Ok(profit_margin_decimal)
 	}
@@ -593,15 +655,16 @@ impl CostProfitService {
 
 		// Check if the actual profit margin meets the minimum requirement
 		if actual_profit_margin < min_profitability_pct {
+			let error_msg = format!(
+				"Profit margin {:.2}% < required {:.2}%",
+				actual_profit_margin, min_profitability_pct
+			);
 			return Err(APIError::UnprocessableEntity {
 				error_type: ApiErrorType::InsufficientProfitability,
-				message: format!(
-					"Insufficient profit margin: {:.2}% (minimum required: {:.2}%)",
-					actual_profit_margin, min_profitability_pct
-				),
+				message: error_msg,
 				details: Some(serde_json::json!({
-					"actual_profit_margin": actual_profit_margin,
-					"min_required": min_profitability_pct,
+					"actual_profit_margin": format!("{:.2}%", actual_profit_margin),
+					"min_required": format!("{:.2}%", min_profitability_pct),
 					"total_cost": cost_estimate.total,
 					"cost_components": cost_estimate.components,
 				})),
@@ -1021,7 +1084,7 @@ impl CostProfitService {
 		let min_required_profit =
 			(transaction_value * config.solver.min_profitability_pct) / hundred;
 
-		tracing::info!(
+		tracing::debug!(
             "Pricing components: input_value={}, output_value={}, spread={}, base_price={}, min_profit={}",
             total_input_value_usd,
             total_output_value_usd,

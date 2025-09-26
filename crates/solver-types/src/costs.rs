@@ -19,6 +19,8 @@ pub struct CostContext {
 	/// For ExactInput: contains calculated output amounts
 	/// For ExactOutput: contains calculated input amounts
 	pub swap_amounts: HashMap<InteropAddress, U256>,
+	/// Optional constraint violation message if swap amounts don't meet requirements
+	pub constraint_violation: Option<String>,
 }
 
 impl CostContext {

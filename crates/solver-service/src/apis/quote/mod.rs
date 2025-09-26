@@ -108,21 +108,20 @@ pub async fn process_quote_request(
 		.await
 		.map_err(|e| QuoteError::Internal(format!("Failed to calculate cost context: {}", e)))?;
 
+	// Check if there are any constraint violations
+	if let Some(violation_msg) = &cost_context.constraint_violation {
+		return Err(QuoteError::InvalidRequest(violation_msg.clone()));
+	}
+
 	// Check solver capabilities: networks only (token support is enforced during collection below)
 	QuoteValidator::validate_supported_networks(&request, solver)?;
 
 	// Validate and collect assets with cost-adjusted amounts
-	let _supported_inputs = QuoteValidator::validate_and_collect_inputs_with_costs(
-		&request,
-		solver,
-		&cost_context,
-	)?;
+	let _supported_inputs =
+		QuoteValidator::validate_and_collect_inputs_with_costs(&request, solver, &cost_context)?;
 
-	let supported_outputs = QuoteValidator::validate_and_collect_outputs_with_costs(
-		&request,
-		solver,
-		&cost_context,
-	)?;
+	let supported_outputs =
+		QuoteValidator::validate_and_collect_outputs_with_costs(&request, solver, &cost_context)?;
 
 	// Check destination balances for cost-adjusted output amounts
 	QuoteValidator::ensure_destination_balances_with_costs(
@@ -130,7 +129,8 @@ pub async fn process_quote_request(
 		&supported_outputs,
 		&validated_context,
 		&cost_context,
-	).await?;
+	)
+	.await?;
 
 	// Generate quotes using the business logic layer with embedded costs
 	let settlement_service = solver.settlement();
