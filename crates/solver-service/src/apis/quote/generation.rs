@@ -391,7 +391,7 @@ impl QuoteGenerator {
 			"user": request.user.to_string(),
 			"nonce": nonce_u64,
 			"originChainId": input_chain_id,
-			"expires": fill_deadline, // Use fillDeadline for both expires and fillDeadline  
+			"expires": fill_deadline, // Use fillDeadline for both expires and fillDeadline
 			"fillDeadline": fill_deadline,
 			"inputOracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&selected_oracle.0)),
 			"inputs": request.intent.inputs.iter().map(|input| {

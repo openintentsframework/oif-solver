@@ -429,12 +429,15 @@ pub fn reconstruct_3009_digest_from_quote(
 		.get("nonce")
 		.and_then(|n| n.as_str())
 		.ok_or("Missing nonce")?;
-	let nonce_bytes = FixedBytes::<32>::from_slice(&hex::decode(nonce_str.trim_start_matches("0x"))?);
+	let nonce_bytes =
+		FixedBytes::<32>::from_slice(&hex::decode(nonce_str.trim_start_matches("0x"))?);
 
 	// Compute domain separator (like the client does)
-	let domain_type_hash = keccak256("EIP712Domain(string name,uint256 chainId,address verifyingContract)".as_bytes());
+	let domain_type_hash =
+		keccak256("EIP712Domain(string name,uint256 chainId,address verifyingContract)".as_bytes());
 	let name_hash = keccak256(name.as_bytes());
-	let contract = AlloyAddress::from_slice(&hex::decode(verifying_contract.trim_start_matches("0x"))?);
+	let contract =
+		AlloyAddress::from_slice(&hex::decode(verifying_contract.trim_start_matches("0x"))?);
 
 	let mut domain_encoder = Eip712AbiEncoder::new();
 	domain_encoder.push_b256(&domain_type_hash);
@@ -459,7 +462,10 @@ pub fn reconstruct_3009_digest_from_quote(
 	// Final EIP-712 digest
 	let final_digest = compute_final_digest(&domain_hash, &struct_hash);
 
-	tracing::info!("EIP-3009 digest reconstruction complete - Final digest: 0x{}", hex::encode(final_digest.0));
+	tracing::info!(
+		"EIP-3009 digest reconstruction complete - Final digest: 0x{}",
+		hex::encode(final_digest.0)
+	);
 
 	Ok(final_digest.0)
 }
