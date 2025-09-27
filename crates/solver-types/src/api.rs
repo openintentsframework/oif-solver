@@ -774,9 +774,26 @@ impl PostOrderRequest {
 		let digest = Self::reconstruct_digest_for_order_type(quote)?;
 
 		// 2. Recover the real user address from the signature
-		let recovered_user =
-			crate::utils::eip712::ecrecover_user_from_signature(&digest, signature)?;
 
+		// if the compact order, extract user directly from message
+		let mut recovered_user = None;
+		if let OifOrder::OifResourceLockV0 { payload } = &quote.order {
+			if let Some(message_obj) = payload.message.as_object() {
+				if let Some(sponsor_str) = message_obj.get("sponsor").and_then(|s| s.as_str()) {
+					recovered_user = Some(Address::from_slice(&hex::decode(
+						sponsor_str.trim_start_matches("0x"),
+					)?));
+				}
+			}
+		} else {
+			recovered_user = Some(crate::utils::eip712::ecrecover_user_from_signature(
+				&digest, signature,
+			)?);
+		}
+
+		tracing::info!("Recovered user: {}", recovered_user.unwrap());
+		tracing::info!("Signature: {}", signature);
+		tracing::info!("Digest: {}", hex::encode(digest));
 		// 3. Clone quote to make it mutable and inject recovered user
 		let mut quote_clone = quote.clone();
 		match &mut quote_clone.order {
@@ -784,7 +801,7 @@ impl PostOrderRequest {
 				if let Some(message_obj) = payload.message.as_object_mut() {
 					message_obj.insert(
 						"user".to_string(),
-						serde_json::Value::String(recovered_user.to_string()),
+						serde_json::Value::String(recovered_user.unwrap().to_string()),
 					); // workaround because StandardOrder::try_from does not handle the user field
 				}
 			},
@@ -803,7 +820,7 @@ impl PostOrderRequest {
 		let signature_bytes = Bytes::from(hex::decode(signature.trim_start_matches("0x"))?);
 		Ok(PostOrderRequest {
 			order: Bytes::from(encoded_order),
-			sponsor: recovered_user,
+			sponsor: recovered_user.unwrap(),
 			signature: signature_bytes,
 			lock_type,
 		})

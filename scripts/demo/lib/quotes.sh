@@ -837,15 +837,20 @@ quote_accept() {
                 return 1
             fi
             
-            # Build complete EIP-712 structure for digest computation
+            # Use the complete EIP-712 structure directly from the quote response
+            # Extract primaryType from the order payload level
+            local primary_type=$(echo "$order_payload" | jq -r '.primaryType // "BatchCompact"')
+            
+            # Build complete EIP-712 structure exactly as received from server
             local complete_eip712=$(jq -n \
                 --argjson domain "$domain_data" \
                 --argjson types "$types_data" \
                 --argjson message "$full_message" \
+                --arg primaryType "$primary_type" \
                 '{
                     domain: $domain,
                     types: $types,
-                    primaryType: "BatchCompact",
+                    primaryType: $primaryType,
                     message: $message
                 }')
             

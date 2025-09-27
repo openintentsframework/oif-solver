@@ -639,12 +639,12 @@ sign_standard_intent() {
 
 # Compute EIP-712 digest for BatchCompact from quote JSON
 compute_compact_digest_from_quote() {
-    local eip712_message="$1"
+    local eip712_structure="$1"
 
-    print_debug "Computing BatchCompact digest from EIP-712 message" >&2
+    print_debug "Computing BatchCompact digest from complete EIP-712 structure" >&2
 
     # Extract domain information
-    local domain=$(echo "$eip712_message" | jq -r '.domain')
+    local domain=$(echo "$eip712_structure" | jq -r '.domain')
     local name=$(echo "$domain" | jq -r '.name')
     local version=$(echo "$domain" | jq -r '.version')
     local chain_id=$(echo "$domain" | jq -r '.chainId')
@@ -663,7 +663,7 @@ compute_compact_digest_from_quote() {
     print_debug "Domain separator: $domain_separator" >&2
 
     # Extract message fields
-    local message=$(echo "$eip712_message" | jq -r '.message')
+    local message=$(echo "$eip712_structure" | jq -r '.message')
     local arbiter=$(echo "$message" | jq -r '.arbiter')
     local sponsor=$(echo "$message" | jq -r '.sponsor')
     local nonce=$(echo "$message" | jq -r '.nonce')
@@ -673,14 +673,25 @@ compute_compact_digest_from_quote() {
 
     print_debug "Message: arbiter=$arbiter, sponsor=$sponsor, nonce=$nonce, expires=$expires" >&2
 
-    # Compute BatchCompact type hash
+    # Extract types and build dynamic type strings if available
+    local eip712_types=$(echo "$eip712_structure" | jq -r '.types // empty')
     local batch_compact_type_string="BatchCompact(address arbiter,address sponsor,uint256 nonce,uint256 expires,Lock[] commitments,Mandate mandate)Lock(bytes12 lockTag,address token,uint256 amount)Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
+    local lock_type_string="Lock(bytes12 lockTag,address token,uint256 amount)"
+    local mandate_type_string="Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
+    local mandate_output_type_string="MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
+
+    # For EIP-712, we need the COMPLETE type string with all dependencies concatenated
+    # Dynamic types alone don't include dependencies, so always use the hardcoded complete version
+    print_debug "Using hardcoded complete EIP-712 types for BatchCompact (required for proper hashing)" >&2
+
+    # Compute type hashes
     local batch_compact_type_hash=$(compute_type_hash "$batch_compact_type_string")
+    local lock_type_hash=$(compute_type_hash "$lock_type_string")
+    local mandate_output_type_hash=$(compute_type_hash "$mandate_output_type_string")
 
     print_debug "BatchCompact type hash: $batch_compact_type_hash" >&2
 
     # Compute commitments hash
-    local lock_type_hash=$(compute_type_hash "Lock(bytes12 lockTag,address token,uint256 amount)")
     local commitments_count=$(echo "$commitments" | jq '. | length')
 
     local lock_hashes=""
@@ -713,7 +724,6 @@ compute_compact_digest_from_quote() {
     local outputs_count=$(echo "$outputs" | jq '. | length')
     local output_hashes=""
 
-    local mandate_output_type_hash=$(compute_type_hash "MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)")
     local empty_bytes_hash="0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"  # keccak256("")
 
     for ((i=0; i<outputs_count; i++)); do
@@ -738,7 +748,7 @@ compute_compact_digest_from_quote() {
     print_debug "Outputs hash: $outputs_hash" >&2
 
     # Compute mandate hash
-    local mandate_type_hash=$(compute_type_hash "Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)")
+    local mandate_type_hash=$(compute_type_hash "$mandate_type_string")
 
     local mandate_hash=$(cast_keccak $(cast_abi_encode "f(bytes32,uint32,address,bytes32)" \
         "$mandate_type_hash" "$fill_deadline" "$input_oracle" "$outputs_hash"))
@@ -795,7 +805,17 @@ sign_compact_digest_from_quote() {
 
     print_debug "Raw signature: $signature" >&2
     print_success "BatchCompact signature generated with client-side digest" >&2
-    echo "$signature"
+    
+    # Encode as abi.encode(sponsorSignature, allocatorData) as required by InputSettlerCompact
+    # allocatorData is empty (0x) for simple allocators like AlwaysOKAllocator
+    local encoded_signatures=$(cast abi-encode "f(bytes,bytes)" "$signature" "0x")
+    if [ $? -ne 0 ] || [ -z "$encoded_signatures" ]; then
+        print_error "Failed to encode signatures for compact claim" >&2
+        return 1
+    fi
+    
+    print_debug "Encoded signatures for compact claim: $encoded_signatures" >&2
+    echo "$encoded_signatures"
 }
 
 # Sign PermitBatchWitnessTransferFrom digest from quote using client-side computation

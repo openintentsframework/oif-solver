@@ -666,13 +666,12 @@ impl QuoteGenerator {
 			QuoteError::InvalidRequest(format!("Network {} not found in config", input_chain_id))
 		})?;
 
-		// Get settlement and selected oracle for input chain (similar to permit2 flow)
+		// Get preferred settlement for TheCompact (prioritizes Direct settlement like escrow)
 		let (_input_settlement, input_selected_oracle) = self
-			.settlement_service
-			.get_any_settlement_for_chain(input_chain_id)
+			.get_preferred_settlement_for_escrow(input_chain_id)
 			.ok_or_else(|| {
 				QuoteError::InvalidRequest(format!(
-					"No settlement available for input chain {}",
+					"No suitable settlement available for TheCompact on chain {}",
 					input_chain_id
 				))
 			})?;
@@ -723,13 +722,12 @@ impl QuoteGenerator {
 				QuoteError::InvalidRequest(format!("Invalid output chain ID: {}", e))
 			})?;
 
-			// Get settlement and selected oracle for the output chain (like permit2 flow)
+			// Get preferred settlement for the output chain (prioritizes Direct settlement like escrow)
 			let (_output_settlement, output_selected_oracle) = self
-				.settlement_service
-				.get_any_settlement_for_chain(output_chain_id)
+				.get_preferred_settlement_for_escrow(output_chain_id)
 				.ok_or_else(|| {
 					QuoteError::InvalidRequest(format!(
-						"No settlement available for output chain {}",
+						"No suitable settlement available for output chain {}",
 						output_chain_id
 					))
 				})?;
