@@ -643,6 +643,88 @@ sign_eip3009_authorization_with_domain() {
     echo "$signature"
 }
 
+# Generate EIP-3009 authorization signature with pre-computed domain separator and dynamic types
+sign_eip3009_authorization_with_domain_and_types() {
+    local user_private_key="$1"
+    local origin_chain_id="$2"
+    local token_contract="$3"
+    local from_address="$4"
+    local to_address="$5"
+    local value="$6"
+    local valid_after="$7"
+    local valid_before="$8"
+    local nonce="$9"
+    local domain_separator="${10}"  # Pre-computed domain separator
+    local eip712_types="${11:-}"    # Optional: dynamic EIP-712 types
+    
+    print_debug "Signing EIP-3009 authorization with domain separator and dynamic types" >&2
+    print_debug "Token: $token_contract" >&2
+    print_debug "From: $from_address, To: $to_address" >&2
+    print_debug "Value: $value, Nonce: $nonce" >&2
+    print_debug "Using domain separator: $domain_separator" >&2
+    
+    # Use dynamic types if provided, otherwise fallback to hardcoded
+    local eip3009_type_string="ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
+    
+    if [ -n "$eip712_types" ] && [ "$eip712_types" != "null" ] && [ "$eip712_types" != "empty" ] && echo "$eip712_types" | jq -e 'type == "object"' > /dev/null 2>&1; then
+        print_debug "Using dynamic EIP-712 types from quote response for EIP-3009" >&2
+        
+        # Build type string from dynamic types
+        local dynamic_type_string=$(build_type_string_from_definition "$eip712_types" "ReceiveWithAuthorization")
+        
+        if [ -n "$dynamic_type_string" ]; then
+            eip3009_type_string="$dynamic_type_string"
+            print_debug "Dynamic EIP-3009 type string: $eip3009_type_string" >&2
+        else
+            print_debug "Failed to build dynamic EIP-3009 type, using hardcoded fallback" >&2
+        fi
+    else
+        print_debug "No dynamic types found, using hardcoded EIP-3009 type" >&2
+    fi
+    
+    # Build EIP-3009 signature for receiveWithAuthorization
+    local eip3009_type_hash=$(cast_keccak "$eip3009_type_string")
+    
+    # Convert nonce from hex string to bytes32 if needed
+    local nonce_bytes32="$nonce"
+    if [[ ! "$nonce" =~ ^0x[0-9a-fA-F]{64}$ ]]; then
+        # If nonce is not already a 64-char hex string, pad it
+        nonce_bytes32=$(printf "0x%064s" "${nonce#0x}" | tr ' ' '0')
+    fi
+    
+    # Encode the struct hash
+    local struct_encoded=$(cast_abi_encode "f(bytes32,address,address,uint256,uint256,uint256,bytes32)" \
+        "$eip3009_type_hash" \
+        "$from_address" \
+        "$to_address" \
+        "$value" \
+        "$valid_after" \
+        "$valid_before" \
+        "$nonce_bytes32")
+    
+    local struct_hash=$(cast_keccak "$struct_encoded")
+    
+    print_debug "EIP-3009 struct hash: $struct_hash" >&2
+    
+    # Create EIP-712 digest
+    local digest_prefix="0x1901"
+    local digest="${digest_prefix}${domain_separator#0x}${struct_hash#0x}"
+    local final_digest=$(cast_keccak "$digest")
+    
+    print_debug "EIP-3009 final digest: $final_digest" >&2
+    
+    # Sign the digest using --no-hash flag for EIP-712 signatures
+    local signature=$(cast wallet sign --no-hash --private-key "$user_private_key" "$final_digest")
+    
+    if [ -z "$signature" ]; then
+        print_error "Failed to generate EIP-3009 authorization signature" >&2
+        return 1
+    fi
+    
+    print_success "EIP-3009 authorization signature generated" >&2
+    echo "$signature"
+}
+
 
 # Simple signature workflow for standard intents
 sign_standard_intent() {
@@ -1080,6 +1162,7 @@ export -f sign_permit2_order
 export -f sign_compact_order
 export -f sign_eip3009_order
 export -f sign_eip3009_authorization_with_domain
+export -f sign_eip3009_authorization_with_domain_and_types
 export -f sign_personal_message
 export -f verify_signature
 export -f create_prefixed_signature

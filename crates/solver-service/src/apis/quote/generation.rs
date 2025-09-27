@@ -385,10 +385,15 @@ impl QuoteGenerator {
 			})
 		};
 
-		// Build metadata with full intent information (inputs and outputs)
-		// This is needed for conversion back to StandardOrder
+		// Build metadata with full intent information AND StandardOrder reconstruction data
+		// This is needed for conversion back to StandardOrder from limited EIP-3009 signature
 		let metadata = serde_json::json!({
 			"user": request.user.to_string(),
+			"nonce": nonce_u64,
+			"originChainId": input_chain_id,
+			"expires": fill_deadline, // Use fillDeadline for both expires and fillDeadline  
+			"fillDeadline": fill_deadline,
+			"inputOracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&selected_oracle.0)),
 			"inputs": request.intent.inputs.iter().map(|input| {
 				serde_json::json!({
 					"chainId": input.asset.ethereum_chain_id().unwrap_or(1),
@@ -417,7 +422,7 @@ impl QuoteGenerator {
 				domain: serde_json::to_value(domain_object).unwrap_or(serde_json::Value::Null),
 				primary_type: "ReceiveWithAuthorization".to_string(),
 				message,
-				types: None, // EIP-3009 uses token's domain, types can be inferred
+				types: Some(self.build_eip3009_eip712_types()),
 			},
 			metadata,
 		};
@@ -1417,6 +1422,25 @@ impl QuoteGenerator {
 				{"name": "recipient", "type": "bytes32"},
 				{"name": "call", "type": "bytes"},
 				{"name": "context", "type": "bytes"}
+			]
+		})
+	}
+
+	/// Generates EIP-712 types definition for EIP-3009 ReceiveWithAuthorization orders
+	fn build_eip3009_eip712_types(&self) -> serde_json::Value {
+		serde_json::json!({
+			"EIP712Domain": [
+				{"name": "name", "type": "string"},
+				{"name": "chainId", "type": "uint256"},
+				{"name": "verifyingContract", "type": "address"}
+			],
+			"ReceiveWithAuthorization": [
+				{"name": "from", "type": "address"},
+				{"name": "to", "type": "address"},
+				{"name": "value", "type": "uint256"},
+				{"name": "validAfter", "type": "uint256"},
+				{"name": "validBefore", "type": "uint256"},
+				{"name": "nonce", "type": "bytes32"}
 			]
 		})
 	}

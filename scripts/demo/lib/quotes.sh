@@ -935,10 +935,13 @@ quote_accept() {
                         return 1
                     fi
                     
-                    local individual_signature=$(sign_eip3009_authorization_with_domain \
+                    # Extract EIP-712 types from order payload if available
+                    local eip712_types=$(echo "$order_payload" | jq -r '.types // empty')
+                    
+                    local individual_signature=$(sign_eip3009_authorization_with_domain_and_types \
                         "$user_key" "$origin_chain_id" "$token_contract" \
                         "$from_address" "$to_address" "$value" \
-                        "$valid_after" "$valid_before" "$nonce" "$domain_separator")
+                        "$valid_after" "$valid_before" "$nonce" "$domain_separator" "$eip712_types")
 
                     if [ -z "$individual_signature" ]; then
                         print_error "Failed to sign EIP-3009 order $((i+1))"
@@ -1074,16 +1077,19 @@ quote_accept() {
                     fi
                 fi
 
-                # Sign EIP-3009 authorization with the correct nonce
+                # Extract EIP-712 types from order payload if available
+                local eip712_types=$(echo "$order_payload" | jq -r '.types // empty')
+                
+                # Sign EIP-3009 authorization with the correct nonce and dynamic types
                 if [ -z "$domain_separator" ] || [ "$domain_separator" = "empty" ]; then
                     print_error "No domain separator available for EIP-3009 signing"
                     return 1
                 fi
                 
-                signature=$(sign_eip3009_authorization_with_domain \
+                signature=$(sign_eip3009_authorization_with_domain_and_types \
                     "$user_key" "$origin_chain_id" "$token_contract" \
                     "$from_address" "$to_address" "$value" \
-                    "$valid_after" "$valid_before" "$final_nonce" "$domain_separator")
+                    "$valid_after" "$valid_before" "$final_nonce" "$domain_separator" "$eip712_types")
 
                 if [ -z "$signature" ]; then
                     print_error "Failed to sign EIP-3009 order"
