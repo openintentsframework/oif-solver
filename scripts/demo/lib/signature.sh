@@ -81,6 +81,44 @@ compute_type_hash() {
     cast_keccak "$type_string"
 }
 
+# Build type string from EIP-712 types definition
+build_type_string_from_definition() {
+    local types_json="$1"
+    local type_name="$2"
+    
+    if [ -z "$types_json" ] || [ -z "$type_name" ]; then
+        print_debug "Missing types_json or type_name for build_type_string_from_definition" >&2
+        return 1
+    fi
+    
+    # Check if the type exists in the types definition
+    local type_definition=$(echo "$types_json" | jq -r ".[\"$type_name\"] // empty")
+    if [ -z "$type_definition" ] || [ "$type_definition" = "null" ] || [ "$type_definition" = "empty" ]; then
+        print_debug "Type '$type_name' not found in types definition" >&2
+        return 1
+    fi
+    
+    # Build the type string: TypeName(type1 field1,type2 field2,...)
+    local fields=""
+    local field_count=$(echo "$type_definition" | jq '. | length')
+    
+    for ((i=0; i<field_count; i++)); do
+        local field_type=$(echo "$type_definition" | jq -r ".[$i].type")
+        local field_name=$(echo "$type_definition" | jq -r ".[$i].name")
+        
+        if [ $i -eq 0 ]; then
+            fields="${field_type} ${field_name}"
+        else
+            fields="${fields},${field_type} ${field_name}"
+        fi
+    done
+    
+    local type_string="${type_name}(${fields})"
+    
+    print_debug "Built type string for $type_name: $type_string" >&2
+    echo "$type_string"
+}
+
 # Standard Permit2 type definitions
 get_permit2_types() {
     echo "TokenPermissions(address token,uint256 amount)"
@@ -808,6 +846,7 @@ sign_permit2_digest_from_quote() {
 compute_permit2_digest_from_quote() {
     local eip712_message="$1"
     local quote_domain="${2:-}" # Optional: domain object from quote level
+    local eip712_types="${3:-}" # Optional: EIP-712 types from quote response
 
     print_debug "Computing PermitBatchWitnessTransferFrom digest from EIP-712 message" >&2
 
@@ -894,8 +933,31 @@ compute_permit2_digest_from_quote() {
     print_debug "Witness hash: $witness_hash" >&2
 
     # Build the main struct hash for PermitBatchWitnessTransferFrom
+    # Use dynamic types if provided, otherwise fallback to hardcoded ones
     local mandate_output_type="MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
     local token_permissions_type="TokenPermissions(address token,uint256 amount)"
+    local permit2_witness_type="Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)"
+    local permit_batch_witness_type="PermitBatchWitnessTransferFrom(TokenPermissions[] permitted,address spender,uint256 nonce,uint256 deadline,Permit2Witness witness)"
+    
+    # If dynamic types provided, build type strings from them
+    if [ -n "$eip712_types" ] && [ "$eip712_types" != "null" ] && echo "$eip712_types" | jq -e 'type == "object"' > /dev/null 2>&1; then
+        print_debug "Using dynamic EIP-712 types from quote response" >&2
+        
+        # Build type strings directly from the types definitions
+        mandate_output_type=$(build_type_string_from_definition "$eip712_types" "MandateOutput")
+        token_permissions_type=$(build_type_string_from_definition "$eip712_types" "TokenPermissions")
+        permit2_witness_type=$(build_type_string_from_definition "$eip712_types" "Permit2Witness")
+        permit_batch_witness_type=$(build_type_string_from_definition "$eip712_types" "PermitBatchWitnessTransferFrom")
+        
+        print_debug "Dynamic MandateOutput type: $mandate_output_type" >&2
+        print_debug "Dynamic TokenPermissions type: $token_permissions_type" >&2
+        print_debug "Dynamic Permit2Witness type: $permit2_witness_type" >&2
+        print_debug "Dynamic PermitBatchWitnessTransferFrom type: $permit_batch_witness_type" >&2
+    else
+        print_debug "Using hardcoded EIP-712 types (fallback)" >&2
+    fi
+
+    # Build the type string for hashing (same concatenation pattern as before)
     local witness_type_string="Permit2Witness witness)${mandate_output_type}${token_permissions_type}Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)"
     local permit_batch_witness_string="PermitBatchWitnessTransferFrom(TokenPermissions[] permitted,address spender,uint256 nonce,uint256 deadline,${witness_type_string}"
 
@@ -923,6 +985,7 @@ compute_permit2_digest_from_quote() {
 export -f compute_domain_separator
 export -f get_permit2_domain_separator
 export -f compute_type_hash
+export -f build_type_string_from_definition
 export -f compute_mandate_output_hash
 export -f compute_permit2_witness_hash
 export -f compute_token_permissions_hash

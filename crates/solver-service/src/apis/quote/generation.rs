@@ -190,6 +190,7 @@ impl QuoteGenerator {
 				domain: serde_json::to_value(domain_address).unwrap_or(serde_json::Value::Null),
 				primary_type,
 				message,
+				types: None, // Resource locks don't need EIP-712 types yet
 			},
 		};
 
@@ -267,6 +268,7 @@ impl QuoteGenerator {
 				domain: serde_json::to_value(domain_object).unwrap_or(serde_json::Value::Null),
 				primary_type: "PermitBatchWitnessTransferFrom".to_string(),
 				message: message_obj,
+				types: Some(self.build_permit2_eip712_types()),
 			},
 		};
 
@@ -383,6 +385,7 @@ impl QuoteGenerator {
 				domain: serde_json::to_value(domain_object).unwrap_or(serde_json::Value::Null),
 				primary_type: "ReceiveWithAuthorization".to_string(),
 				message,
+				types: None, // EIP-3009 uses token's domain, types can be inferred
 			},
 			metadata,
 		};
@@ -1326,6 +1329,43 @@ impl QuoteGenerator {
 			.map(|quote| quote.validity_seconds)
 			.unwrap_or_else(|| QuoteConfig::default().validity_seconds)
 	}
+
+	/// Generates EIP-712 types definition for Permit2 orders
+	fn build_permit2_eip712_types(&self) -> serde_json::Value {
+		serde_json::json!({
+			"EIP712Domain": [
+				{"name": "name", "type": "string"},
+				{"name": "chainId", "type": "uint256"},
+				{"name": "verifyingContract", "type": "address"}
+			],
+			"PermitBatchWitnessTransferFrom": [
+				{"name": "permitted", "type": "TokenPermissions[]"},
+				{"name": "spender", "type": "address"},
+				{"name": "nonce", "type": "uint256"},
+				{"name": "deadline", "type": "uint256"},
+				{"name": "witness", "type": "Permit2Witness"}
+			],
+			"TokenPermissions": [
+				{"name": "token", "type": "address"},
+				{"name": "amount", "type": "uint256"}
+			],
+			"Permit2Witness": [
+				{"name": "expires", "type": "uint32"},
+				{"name": "inputOracle", "type": "address"},
+				{"name": "outputs", "type": "MandateOutput[]"}
+			],
+			"MandateOutput": [
+				{"name": "oracle", "type": "bytes32"},
+				{"name": "settler", "type": "bytes32"},
+				{"name": "chainId", "type": "uint256"},
+				{"name": "token", "type": "bytes32"},
+				{"name": "amount", "type": "uint256"},
+				{"name": "recipient", "type": "bytes32"},
+				{"name": "call", "type": "bytes"},
+				{"name": "context", "type": "bytes"}
+			]
+		})
+	}
 }
 
 #[cfg(test)]
@@ -1756,6 +1796,7 @@ mod tests {
 						domain: serde_json::json!({}),
 						primary_type: "TestType".to_string(),
 						message: serde_json::json!({}),
+						types: None,
 					},
 				},
 				failure_handling: FailureHandlingMode::RefundAutomatic,
@@ -1772,6 +1813,7 @@ mod tests {
 						domain: serde_json::json!({}),
 						primary_type: "TestType".to_string(),
 						message: serde_json::json!({}),
+						types: None,
 					},
 				},
 				failure_handling: FailureHandlingMode::RefundAutomatic,
@@ -1788,6 +1830,7 @@ mod tests {
 						domain: serde_json::json!({}),
 						primary_type: "TestType".to_string(),
 						message: serde_json::json!({}),
+						types: None,
 					},
 				},
 				failure_handling: FailureHandlingMode::RefundAutomatic,
@@ -1822,6 +1865,7 @@ mod tests {
 						domain: serde_json::json!({}),
 						primary_type: "TestType".to_string(),
 						message: serde_json::json!({}),
+						types: None,
 					},
 				},
 				failure_handling: FailureHandlingMode::RefundAutomatic,
@@ -1838,6 +1882,7 @@ mod tests {
 						domain: serde_json::json!({}),
 						primary_type: "TestType".to_string(),
 						message: serde_json::json!({}),
+						types: None,
 					},
 				},
 				failure_handling: FailureHandlingMode::RefundAutomatic,

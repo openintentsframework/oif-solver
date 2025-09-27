@@ -1096,9 +1096,18 @@ quote_accept() {
                 return 1
             fi
 
-            # Use client-side digest computation
+            # Extract EIP-712 types from order payload if available
+            local eip712_types=$(echo "$order_payload" | jq -r '.types // empty')
+            if [ -n "$eip712_types" ] && [ "$eip712_types" != "null" ] && [ "$eip712_types" != "empty" ]; then
+                print_debug "Found EIP-712 types in order payload, using dynamic types for signing"
+            else
+                print_debug "No EIP-712 types found in order payload, will use hardcoded fallback types"
+                eip712_types=""
+            fi
+
+            # Use client-side digest computation with dynamic types
             print_info "Computing client-side digest..."
-            local client_digest=$(compute_permit2_digest_from_quote "$eip712_message" "$domain")
+            local client_digest=$(compute_permit2_digest_from_quote "$eip712_message" "$domain" "$eip712_types")
             if [ $? -ne 0 ] || [ -z "$client_digest" ]; then
                 print_error "Failed to compute client-side digest"
                 return 1
