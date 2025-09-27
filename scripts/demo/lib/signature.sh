@@ -764,25 +764,19 @@ compute_compact_digest_from_quote() {
 # Sign BatchCompact digest from quote using client-side computation
 sign_compact_digest_from_quote() {
     local user_private_key="$1"
-    local full_message="$2"
+    local eip712_structure="$2"
 
     print_debug "Starting BatchCompact signing with client-side digest computation" >&2
 
-    # For compact orders, the message contains an .eip712 field with the actual EIP-712 message
-    local eip712_message=$(echo "$full_message" | jq -r '.eip712 // empty' 2>/dev/null)
-    if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ] || [ "$eip712_message" = "empty" ]; then
-        # If no .eip712 field, use message directly
-        eip712_message="$full_message"
-    fi
-    
-    if [ -z "$eip712_message" ] || [ "$eip712_message" = "null" ]; then
-        print_error "No message found for digest computation" >&2
+    # The eip712_structure now contains the complete EIP-712 object with domain, types, message
+    if [ -z "$eip712_structure" ] || [ "$eip712_structure" = "null" ]; then
+        print_error "No EIP-712 structure found for digest computation" >&2
         return 1
     fi
 
-    # Always compute client-side digest
+    # Always compute client-side digest using the complete structure
     print_info "Computing client-side digest..." >&2
-    local client_digest=$(compute_compact_digest_from_quote "$eip712_message")
+    local client_digest=$(compute_compact_digest_from_quote "$eip712_structure")
     if [ $? -ne 0 ] || [ -z "$client_digest" ]; then
         print_error "Failed to compute client-side digest" >&2
         return 1

@@ -788,10 +788,10 @@ quote_accept() {
         local signature_type=""
         local origin_submission_data=""
         
-        if [ "$primary_type" = "CompactLock" ]; then
-            # CompactLock orders use BatchCompact signature, no auth scheme
+        if [ "$primary_type" = "BatchCompact" ]; then
+            # BatchCompact orders use BatchCompact signature, no auth scheme
             signature_type="compact"
-            print_debug "Detected CompactLock order, using compact signature type"
+            print_debug "Detected BatchCompact order, using compact signature type"
             # Don't set origin_submission_data for compact
         else
             # For non-compact orders, read the original quote request to get originSubmission data
@@ -827,15 +827,32 @@ quote_accept() {
         if [ "$signature_type" = "compact" ]; then
             print_info "Signing BatchCompact order..."
             
-            # For CompactLock, the actual EIP-712 data is nested in message.eip712
-            local eip712_data=$(echo "$full_message" | jq '.eip712 // empty')
-            if [ -z "$eip712_data" ] || [ "$eip712_data" = "null" ] || [ "$eip712_data" = "empty" ]; then
-                print_error "No eip712 data found in CompactLock message"
+            # With the new flat structure, the message is already in the correct format
+            # Extract domain and types from the order payload level
+            local domain_data=$(echo "$order_payload" | jq '.domain // empty')
+            local types_data=$(echo "$order_payload" | jq '.types // empty')
+            
+            if [ -z "$domain_data" ] || [ "$domain_data" = "null" ] || [ "$domain_data" = "empty" ]; then
+                print_error "No domain data found in BatchCompact order"
                 return 1
             fi
             
-            # Use compact-specific digest computation with the nested eip712 data
-            signature=$(sign_compact_digest_from_quote "$user_key" "$eip712_data")
+            # Build complete EIP-712 structure for digest computation
+            local complete_eip712=$(jq -n \
+                --argjson domain "$domain_data" \
+                --argjson types "$types_data" \
+                --argjson message "$full_message" \
+                '{
+                    domain: $domain,
+                    types: $types,
+                    primaryType: "BatchCompact",
+                    message: $message
+                }')
+            
+            print_debug "Complete EIP-712 structure built for BatchCompact signing"
+            
+            # Use compact-specific digest computation
+            signature=$(sign_compact_digest_from_quote "$user_key" "$complete_eip712")
             if [ $? -ne 0 ] || [ -z "$signature" ]; then
                 print_error "Failed to sign BatchCompact order"
                 return 1

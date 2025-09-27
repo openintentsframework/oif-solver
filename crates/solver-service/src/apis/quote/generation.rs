@@ -173,7 +173,7 @@ impl QuoteGenerator {
 		let params = lock.params.as_ref().unwrap_or(&default_params);
 		let (primary_type, message) = match &lock.kind {
 			LockKind::TheCompact => Ok((
-				"CompactLock".to_string(),
+				"BatchCompact".to_string(),
 				self.build_compact_message(request, config, params).await?,
 			)),
 			LockKind::Rhinestone => Ok((
@@ -184,13 +184,45 @@ impl QuoteGenerator {
 		}?;
 
 		// Create OifOrder based on lock kind
-		let order = OifOrder::OifResourceLockV0 {
-			payload: OrderPayload {
-				signature_type: SignatureType::Eip712,
-				domain: serde_json::to_value(domain_address).unwrap_or(serde_json::Value::Null),
-				primary_type,
-				message,
-				types: None, // Resource locks don't need EIP-712 types yet
+		let order = match &lock.kind {
+			LockKind::TheCompact => {
+				// Build structured domain object for TheCompact (similar to Permit2)
+				let input_chain_id =
+					request.intent.inputs[0]
+						.asset
+						.ethereum_chain_id()
+						.map_err(|e| {
+							QuoteError::InvalidRequest(format!(
+								"Invalid chain ID in asset address: {}",
+								e
+							))
+						})?;
+				let domain_object = self
+					.build_compact_domain_object(config, input_chain_id)
+					.await?;
+
+				OifOrder::OifResourceLockV0 {
+					payload: OrderPayload {
+						signature_type: SignatureType::Eip712,
+						domain: serde_json::to_value(domain_object)
+							.unwrap_or(serde_json::Value::Null),
+						primary_type,
+						message,
+						types: Some(self.build_compact_eip712_types()),
+					},
+				}
+			},
+			_ => {
+				OifOrder::OifResourceLockV0 {
+					payload: OrderPayload {
+						signature_type: SignatureType::Eip712,
+						domain: serde_json::to_value(domain_address)
+							.unwrap_or(serde_json::Value::Null),
+						primary_type,
+						message,
+						types: None, // Other resource locks don't need EIP-712 types yet
+					},
+				}
 			},
 		};
 
@@ -813,31 +845,15 @@ impl QuoteGenerator {
 			}
 		});
 
-		// Try to compute the digest the same way the tests/contracts expect
-		// If this fails, fall back to just providing the EIP-712 structure
-		match self
-			.try_compute_server_digest(&eip712_message, request, network, input_chain_id)
-			.await
-		{
-			Ok(digest) => {
-				tracing::debug!(
-					"Quote generation: Successfully computed BatchCompact digest: 0x{}",
-					alloy_primitives::hex::encode(digest)
-				);
-				// Return message with both EIP-712 structure and pre-computed digest (like permit2)
-				Ok(serde_json::json!({
-					"digest": with_0x_prefix(&alloy_primitives::hex::encode(digest)),
-					"eip712": eip712_message
-				}))
-			},
-			Err(e) => {
-				tracing::warn!("Quote generation: Failed to compute BatchCompact digest, falling back to EIP-712 only: {}", e);
-				// Return message in the same format as before (with eip712 field, scripts will compute digest)
-				Ok(serde_json::json!({
-					"eip712": eip712_message
-				}))
-			},
-		}
+		// Extract just the message part for the new flat structure
+		// The domain and types are now handled at the OrderPayload level
+		let message_part = eip712_message
+			.get("message")
+			.cloned()
+			.unwrap_or(serde_json::Value::Null);
+
+		// Return only the message part (flat structure like Permit2)
+		Ok(message_part)
 	}
 
 	async fn build_rhinestone_message(
@@ -1365,6 +1381,72 @@ impl QuoteGenerator {
 				{"name": "context", "type": "bytes"}
 			]
 		})
+	}
+
+	/// Generates EIP-712 types definition for TheCompact BatchCompact orders
+	fn build_compact_eip712_types(&self) -> serde_json::Value {
+		serde_json::json!({
+			"EIP712Domain": [
+				{"name": "name", "type": "string"},
+				{"name": "version", "type": "string"},
+				{"name": "chainId", "type": "uint256"},
+				{"name": "verifyingContract", "type": "address"}
+			],
+			"BatchCompact": [
+				{"name": "arbiter", "type": "address"},
+				{"name": "sponsor", "type": "address"},
+				{"name": "nonce", "type": "uint256"},
+				{"name": "expires", "type": "uint256"},
+				{"name": "commitments", "type": "Lock[]"},
+				{"name": "mandate", "type": "Mandate"}
+			],
+			"Lock": [
+				{"name": "lockTag", "type": "bytes12"},
+				{"name": "token", "type": "address"},
+				{"name": "amount", "type": "uint256"}
+			],
+			"Mandate": [
+				{"name": "fillDeadline", "type": "uint32"},
+				{"name": "inputOracle", "type": "address"},
+				{"name": "outputs", "type": "MandateOutput[]"}
+			],
+			"MandateOutput": [
+				{"name": "oracle", "type": "bytes32"},
+				{"name": "settler", "type": "bytes32"},
+				{"name": "chainId", "type": "uint256"},
+				{"name": "token", "type": "bytes32"},
+				{"name": "amount", "type": "uint256"},
+				{"name": "recipient", "type": "bytes32"},
+				{"name": "call", "type": "bytes"},
+				{"name": "context", "type": "bytes"}
+			]
+		})
+	}
+
+	/// Build structured domain object for TheCompact
+	async fn build_compact_domain_object(
+		&self,
+		config: &Config,
+		chain_id: u64,
+	) -> Result<serde_json::Value, QuoteError> {
+		// Get TheCompact contract address from network config
+		let network = config.networks.get(&chain_id).ok_or_else(|| {
+			QuoteError::InvalidRequest(format!("Network {} not found in config", chain_id))
+		})?;
+
+		let the_compact_address = network.the_compact_address.as_ref().ok_or_else(|| {
+			QuoteError::InvalidRequest("TheCompact address not configured".to_string())
+		})?;
+
+		let contract_address = alloy_primitives::Address::from_slice(&the_compact_address.0);
+
+		// Build domain object similar to Permit2 structure
+		Ok(serde_json::json!({
+			"name": "TheCompact",
+			"version": "1",
+			"chainId": chain_id.to_string(),
+			"verifyingContract": format!("0x{:040x}", contract_address)
+		}))
 	}
 }
 
