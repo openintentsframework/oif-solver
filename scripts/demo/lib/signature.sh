@@ -119,6 +119,44 @@ build_type_string_from_definition() {
     echo "$type_string"
 }
 
+# Build complete EIP-712 type string with all dependencies from dynamic types
+build_complete_type_string_from_definition() {
+    local types_json="$1"
+    local primary_type="$2"
+    
+    if [ -z "$types_json" ] || [ -z "$primary_type" ]; then
+        print_debug "Missing types_json or primary_type for build_complete_type_string_from_definition" >&2
+        return 1
+    fi
+    
+    # Extract all type names from the types definition (excluding EIP712Domain)
+    local type_names=$(echo "$types_json" | jq -r 'keys[] | select(. != "EIP712Domain")')
+    
+    # Build the complete type string starting with the primary type
+    local complete_type_string=""
+    local primary_type_def=$(build_type_string_from_definition "$types_json" "$primary_type")
+    
+    if [ -z "$primary_type_def" ]; then
+        print_debug "Failed to build primary type definition for $primary_type" >&2
+        return 1
+    fi
+    
+    complete_type_string="$primary_type_def"
+    
+    # Add all other types (dependencies) in alphabetical order for consistency
+    while IFS= read -r type_name; do
+        if [ "$type_name" != "$primary_type" ] && [ -n "$type_name" ]; then
+            local type_def=$(build_type_string_from_definition "$types_json" "$type_name")
+            if [ -n "$type_def" ]; then
+                complete_type_string="${complete_type_string}${type_def}"
+            fi
+        fi
+    done <<< "$(echo "$type_names" | sort)"
+    
+    print_debug "Built complete type string for $primary_type: $complete_type_string" >&2
+    echo "$complete_type_string"
+}
+
 # Standard Permit2 type definitions
 get_permit2_types() {
     echo "TokenPermissions(address token,uint256 amount)"
@@ -673,16 +711,50 @@ compute_compact_digest_from_quote() {
 
     print_debug "Message: arbiter=$arbiter, sponsor=$sponsor, nonce=$nonce, expires=$expires" >&2
 
-    # Extract types and build dynamic type strings if available
+    # Extract types and build dynamic type strings from quote response
     local eip712_types=$(echo "$eip712_structure" | jq -r '.types // empty')
-    local batch_compact_type_string="BatchCompact(address arbiter,address sponsor,uint256 nonce,uint256 expires,Lock[] commitments,Mandate mandate)Lock(bytes12 lockTag,address token,uint256 amount)Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
-    local lock_type_string="Lock(bytes12 lockTag,address token,uint256 amount)"
-    local mandate_type_string="Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
-    local mandate_output_type_string="MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
+    local batch_compact_type_string=""
+    local lock_type_string=""
+    local mandate_type_string=""
+    local mandate_output_type_string=""
 
-    # For EIP-712, we need the COMPLETE type string with all dependencies concatenated
-    # Dynamic types alone don't include dependencies, so always use the hardcoded complete version
-    print_debug "Using hardcoded complete EIP-712 types for BatchCompact (required for proper hashing)" >&2
+    # Use dynamic types if provided, otherwise fallback to hardcoded
+    if [ -n "$eip712_types" ] && [ "$eip712_types" != "null" ] && [ "$eip712_types" != "empty" ] && echo "$eip712_types" | jq -e 'type == "object"' > /dev/null 2>&1; then
+        print_debug "Using dynamic EIP-712 types from quote response for BatchCompact" >&2
+        
+        # Build type strings from dynamic types with proper dependencies
+        batch_compact_type_string=$(build_complete_type_string_from_definition "$eip712_types" "BatchCompact")
+        lock_type_string=$(build_type_string_from_definition "$eip712_types" "Lock")
+        # For mandate hash, only include Mandate + MandateOutput (not all types)
+        local mandate_def=$(build_type_string_from_definition "$eip712_types" "Mandate")
+        local mandate_output_def=$(build_type_string_from_definition "$eip712_types" "MandateOutput")
+        mandate_type_string="${mandate_def}${mandate_output_def}"
+        mandate_output_type_string=$(build_type_string_from_definition "$eip712_types" "MandateOutput")
+        
+        print_debug "Dynamic BatchCompact type string: $batch_compact_type_string" >&2
+        print_debug "Dynamic Lock type string: $lock_type_string" >&2
+        print_debug "Dynamic Mandate type string: $mandate_type_string" >&2
+        print_debug "Dynamic MandateOutput type string: $mandate_output_type_string" >&2
+        
+        if [ -z "$batch_compact_type_string" ] || [ -z "$lock_type_string" ] || [ -z "$mandate_output_type_string" ]; then
+            print_debug "Failed to build some dynamic types, falling back to hardcoded" >&2
+            # Fallback to hardcoded if dynamic types fail
+            batch_compact_type_string="BatchCompact(address arbiter,address sponsor,uint256 nonce,uint256 expires,Lock[] commitments,Mandate mandate)Lock(bytes12 lockTag,address token,uint256 amount)Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
+            lock_type_string="Lock(bytes12 lockTag,address token,uint256 amount)"
+            mandate_type_string="Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
+            mandate_output_type_string="MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
+            print_debug "Using hardcoded fallback EIP-712 types for BatchCompact" >&2
+        else
+            print_debug "Successfully built dynamic BatchCompact type string: $batch_compact_type_string" >&2
+        fi
+    else
+        print_debug "No dynamic types found, using hardcoded EIP-712 types for BatchCompact" >&2
+        # Fallback to hardcoded types
+        batch_compact_type_string="BatchCompact(address arbiter,address sponsor,uint256 nonce,uint256 expires,Lock[] commitments,Mandate mandate)Lock(bytes12 lockTag,address token,uint256 amount)Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
+        lock_type_string="Lock(bytes12 lockTag,address token,uint256 amount)"
+        mandate_type_string="Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
+        mandate_output_type_string="MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
+    fi
 
     # Compute type hashes
     local batch_compact_type_hash=$(compute_type_hash "$batch_compact_type_string")
@@ -1000,6 +1072,7 @@ export -f compute_domain_separator
 export -f get_permit2_domain_separator
 export -f compute_type_hash
 export -f build_type_string_from_definition
+export -f build_complete_type_string_from_definition
 export -f compute_mandate_output_hash
 export -f compute_permit2_witness_hash
 export -f compute_token_permissions_hash
