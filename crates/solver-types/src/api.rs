@@ -109,6 +109,9 @@ pub struct OrderPayload {
 	#[serde(rename = "primaryType")]
 	pub primary_type: String,
 	pub message: serde_json::Value,
+	/// EIP-712 types definitions
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub types: Option<serde_json::Value>,
 }
 
 impl From<&Quote> for Option<OrderPayload> {
@@ -1418,6 +1421,7 @@ mod tests {
 					.unwrap(),
 					primary_type: "TestType".to_string(),
 					message: serde_json::json!({"test": "value"}),
+					types: None,
 				},
 			},
 			failure_handling: FailureHandlingMode::RefundAutomatic,
@@ -1449,6 +1453,7 @@ mod tests {
 						domain: serde_json::json!({"chain": 1, "address": "0x0000000000000000000000000000000000000000"}),
 						primary_type: "TestType".to_string(),
 						message: serde_json::json!({"test": "value"}),
+						types: None,
 					},
 				},
 				failure_handling: FailureHandlingMode::RefundAutomatic,
