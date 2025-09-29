@@ -75,7 +75,7 @@ pub use validation::QuoteValidator;
 
 use solver_config::Config;
 use solver_core::SolverEngine;
-use solver_types::{GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, StorageKey};
+use solver_types::{CostContext, GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, StorageKey};
 
 use std::time::Duration;
 use tracing::info;
@@ -101,6 +101,7 @@ pub async fn process_quote_request(
 		solver.pricing().clone(),
 		solver.delivery().clone(),
 		solver.token_manager().clone(),
+		solver.storage().clone(),
 	);
 
 	let cost_context = cost_profit_service
@@ -136,18 +137,18 @@ pub async fn process_quote_request(
 		.generate_quotes_with_costs(&request, &validated_context, &cost_context, config)
 		.await?;
 
-	// Persist quotes
-	store_quotes(solver, &quotes).await;
+	// Persist quotes and cost contexts
+	store_quotes(solver, &quotes, &cost_context).await;
 
 	info!("Generated and stored {} quote options", quotes.len());
 
 	Ok(GetQuoteResponse { quotes })
 }
 
-/// Stores generated quotes with TTL based on their valid_until timestamp.
+/// Stores generated quotes and their cost contexts with TTL based on their valid_until timestamp.
 ///
 /// Storage errors are logged but do not fail the request.
-async fn store_quotes(solver: &SolverEngine, quotes: &[Quote]) {
+async fn store_quotes(solver: &SolverEngine, quotes: &[Quote], cost_context: &CostContext) {
 	let storage = solver.storage();
 	let now = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
@@ -163,6 +164,7 @@ async fn store_quotes(solver: &SolverEngine, quotes: &[Quote]) {
 			Duration::from_secs(1)
 		};
 
+		// Store the quote
 		if let Err(e) = storage
 			.store_with_ttl(
 				StorageKey::Quotes.as_str(),
@@ -180,6 +182,26 @@ async fn store_quotes(solver: &SolverEngine, quotes: &[Quote]) {
 				quote.quote_id,
 				ttl,
 				quote.valid_until
+			);
+		}
+
+		// Store the cost context with the same TTL
+		if let Err(e) = storage
+			.store_with_ttl(
+				StorageKey::CostContexts.as_str(),
+				&quote.quote_id,
+				cost_context,
+				None, // No indexes needed for cost contexts
+				Some(ttl),
+			)
+			.await
+		{
+			tracing::warn!("Failed to store cost context for quote {}: {}", quote.quote_id, e);
+		} else {
+			tracing::debug!(
+				"Stored cost context for quote {} with TTL {:?}",
+				quote.quote_id,
+				ttl
 			);
 		}
 	}

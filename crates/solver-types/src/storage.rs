@@ -16,6 +16,8 @@ pub enum StorageKey {
 	OrderByTxHash,
 	/// Key for storing quote data
 	Quotes,
+	/// Key for storing cost context data (per quote ID)
+	CostContexts,
 	/// Key for storing settlement message data (per implementation)
 	SettlementMessages,
 }
@@ -28,6 +30,7 @@ impl StorageKey {
 			StorageKey::Intents => "intents",
 			StorageKey::OrderByTxHash => "order_by_tx_hash",
 			StorageKey::Quotes => "quotes",
+			StorageKey::CostContexts => "cost_contexts",
 			StorageKey::SettlementMessages => "settlement_messages",
 		}
 	}
@@ -39,6 +42,7 @@ impl StorageKey {
 			Self::Intents,
 			Self::OrderByTxHash,
 			Self::Quotes,
+			Self::CostContexts,
 			Self::SettlementMessages,
 		]
 		.into_iter()
@@ -54,6 +58,7 @@ impl FromStr for StorageKey {
 			"intents" => Ok(Self::Intents),
 			"order_by_tx_hash" => Ok(Self::OrderByTxHash),
 			"quotes" => Ok(Self::Quotes),
+			"cost_contexts" => Ok(Self::CostContexts),
 			"settlement_messages" => Ok(Self::SettlementMessages),
 			_ => Err(()),
 		}
