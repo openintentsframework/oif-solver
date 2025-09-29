@@ -125,6 +125,7 @@ pub trait OrderInterface: Send + Sync {
 	/// * `lock_type` - The lock type for the order ("permit2_escrow", "eip3009_escrow", etc.)
 	/// * `order_id_callback` - Callback function to compute the order ID
 	/// * `solver_address` - The solver's address for reward attribution
+	/// * `quote_id` - Optional quote ID if this order is associated with a quote
 	async fn validate_and_create_order(
 		&self,
 		order_bytes: &Bytes,
@@ -132,6 +133,7 @@ pub trait OrderInterface: Send + Sync {
 		lock_type: &str,
 		order_id_callback: OrderIdCallback,
 		solver_address: &Address,
+		quote_id: Option<String>,
 	) -> Result<Order, OrderError>;
 }
 
@@ -315,6 +317,7 @@ impl OrderService {
 		lock_type: &str,
 		order_id_callback: OrderIdCallback,
 		solver_address: &Address,
+		quote_id: Option<String>,
 	) -> Result<Order, OrderError> {
 		let implementation = self.implementations.get(standard).ok_or_else(|| {
 			OrderError::ValidationFailed(format!("Unknown standard: {}", standard))
@@ -327,6 +330,7 @@ impl OrderService {
 				lock_type,
 				order_id_callback,
 				solver_address,
+				quote_id,
 			)
 			.await
 	}

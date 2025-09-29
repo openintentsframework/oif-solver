@@ -484,6 +484,15 @@ impl CostProfitService {
 		order: &Order,
 		config: &Config,
 	) -> Result<CostBreakdown, CostProfitError> {
+		// Log quoteId if present for tracking
+		if let Some(quote_id) = &order.quote_id {
+			tracing::debug!(
+				order_id = %order.id,
+				quote_id = %quote_id,
+				"Order has associated quoteId"
+			);
+		}
+
 		// Parse the order data based on its standard
 		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::InvalidRequest,
@@ -746,6 +755,15 @@ impl CostProfitService {
 	) -> Result<(), APIError> {
 		use solver_types::truncate_id;
 
+		// Log quoteId if present
+		if let Some(quote_id) = &order.quote_id {
+			tracing::info!(
+				order_id = %truncate_id(&order.id),
+				quote_id = %quote_id,
+				"Validating profitability for order with associated quote"
+			);
+		}
+
 		// Calculate cost estimation
 		let cost_estimate =
 			self.estimate_cost_for_order(order, config)
@@ -765,6 +783,7 @@ impl CostProfitService {
 
 		tracing::info!(
 			order_id = %truncate_id(&order.id),
+			quote_id = ?order.quote_id,
 			margin = %actual_profit_margin,
 			cost = %cost_estimate.total,
 			"Order profitability validation successful for API request"
