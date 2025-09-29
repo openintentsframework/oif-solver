@@ -773,27 +773,27 @@ impl interfaces::StandardOrder {
 
 	/// Handle BatchCompact order conversion for ResourceLock
 	fn handle_batch_compact_quote_conversion(
-		_quote: &Quote,
+		quote: &Quote,
 		eip712_data: &serde_json::Map<String, serde_json::Value>,
 	) -> Result<Self, Box<dyn std::error::Error>> {
 		use crate::utils::parse_bytes32_from_hex;
 		use alloy_primitives::{Address, U256};
 		use interfaces::SolMandateOutput;
 
-		// build_compact_message always wraps the EIP-712 structure in an 'eip712' field
-		// Extract the eip712 object which contains message and domain
-		let eip712_obj = eip712_data
-			.get("eip712")
-			.and_then(|e| e.as_object())
-			.ok_or("Missing eip712 structure from build_compact_message")?;
-		let message = eip712_obj
-			.get("message")
-			.and_then(|m| m.as_object())
-			.ok_or("Missing message in eip712")?;
-		let domain = eip712_obj
-			.get("domain")
-			.and_then(|d| d.as_object())
-			.ok_or("Missing domain in eip712")?;
+		// With the new flat structure, the message is directly in eip712_data
+		// and domain/types are at the payload level
+		let message = eip712_data;
+
+		// Extract domain from the quote payload level
+		let payload = match &quote.order {
+			crate::OifOrder::OifResourceLockV0 { payload } => payload,
+			_ => return Err("Expected OifResourceLockV0 order type".into()),
+		};
+
+		let domain = payload
+			.domain
+			.as_object()
+			.ok_or("Missing domain object in payload")?;
 
 		// Extract user (sponsor) address from message
 		let sponsor_str = message

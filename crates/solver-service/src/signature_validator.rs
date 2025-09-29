@@ -120,6 +120,7 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 				details: None,
 			});
 		}
+		tracing::debug!("EIP-712 signature validated");
 		Ok(())
 	}
 }

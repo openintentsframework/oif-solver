@@ -396,7 +396,7 @@ impl QuoteGenerator {
 		let params = lock.params.as_ref().unwrap_or(&default_params);
 		let (primary_type, message) = match &lock.kind {
 			LockKind::TheCompact => Ok((
-				"CompactLock".to_string(),
+				"BatchCompact".to_string(),
 				self.build_compact_message(request, config, params).await?,
 			)),
 			LockKind::Rhinestone => Ok((
@@ -407,12 +407,45 @@ impl QuoteGenerator {
 		}?;
 
 		// Create OifOrder based on lock kind
-		let order = OifOrder::OifResourceLockV0 {
-			payload: OrderPayload {
-				signature_type: SignatureType::Eip712,
-				domain: serde_json::to_value(domain_address).unwrap_or(serde_json::Value::Null),
-				primary_type,
-				message,
+		let order = match &lock.kind {
+			LockKind::TheCompact => {
+				// Build structured domain object for TheCompact (similar to Permit2)
+				let input_chain_id =
+					request.intent.inputs[0]
+						.asset
+						.ethereum_chain_id()
+						.map_err(|e| {
+							QuoteError::InvalidRequest(format!(
+								"Invalid chain ID in asset address: {}",
+								e
+							))
+						})?;
+				let domain_object = self
+					.build_compact_domain_object(config, input_chain_id)
+					.await?;
+
+				OifOrder::OifResourceLockV0 {
+					payload: OrderPayload {
+						signature_type: SignatureType::Eip712,
+						domain: serde_json::to_value(domain_object)
+							.unwrap_or(serde_json::Value::Null),
+						primary_type,
+						message,
+						types: Some(self.build_compact_eip712_types()),
+					},
+				}
+			},
+			_ => {
+				OifOrder::OifResourceLockV0 {
+					payload: OrderPayload {
+						signature_type: SignatureType::Eip712,
+						domain: serde_json::to_value(domain_address)
+							.unwrap_or(serde_json::Value::Null),
+						primary_type,
+						message,
+						types: None, // Other resource locks don't need EIP-712 types yet
+					},
+				}
 			},
 		};
 
@@ -438,7 +471,8 @@ impl QuoteGenerator {
 
 		// For escrow orders, prefer Direct settlement over other implementations
 		let (settlement, selected_oracle) = self
-			.get_preferred_settlement_for_escrow(chain_id)
+			.settlement_service
+			.get_any_settlement_for_chain(chain_id)
 			.ok_or_else(|| {
 				QuoteError::InvalidRequest(format!(
 					"No suitable settlement available for escrow on chain {}",
@@ -489,6 +523,7 @@ impl QuoteGenerator {
 				domain: serde_json::to_value(domain_object).unwrap_or(serde_json::Value::Null),
 				primary_type: "PermitBatchWitnessTransferFrom".to_string(),
 				message: message_obj,
+				types: Some(self.build_permit2_eip712_types()),
 			},
 		};
 
@@ -573,41 +608,35 @@ impl QuoteGenerator {
 			})
 		};
 
-		// This is needed for conversion back to StandardOrder
-		let mut inputs_metadata = Vec::new();
-		for input in &request.intent.inputs {
-			let amount = input.amount.as_ref().ok_or_else(|| {
-				QuoteError::InvalidRequest("Input amount not set after cost adjustment".to_string())
-			})?;
-			inputs_metadata.push(serde_json::json!({
-				"chainId": input.asset.ethereum_chain_id().unwrap_or(1),
-				"asset": input.asset.to_string(),
-				"amount": amount.clone(),
-				"user": input.user.to_string()
-			}));
-		}
-
-		let mut outputs_metadata = Vec::new();
-		for output in &request.intent.outputs {
-			let amount = output.amount.as_ref().ok_or_else(|| {
-				QuoteError::InvalidRequest(
-					"Output amount not set after cost adjustment".to_string(),
-				)
-			})?;
-			outputs_metadata.push(serde_json::json!({
-				"chainId": output.asset.ethereum_chain_id().unwrap_or(1),
-				"asset": output.asset.to_string(),
-				"amount": amount.clone(),
-				"receiver": output.receiver.to_string(),
-				"oracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&selected_oracle.0)),
-				"settler": format!("0x{:040x}", alloy_primitives::Address::from_slice(&output_settler.0)),
-			}));
-		}
-
+		// Build metadata with full intent information AND StandardOrder reconstruction data
+		// This is needed for conversion back to StandardOrder from limited EIP-3009 signature
 		let metadata = serde_json::json!({
 			"user": request.user.to_string(),
-			"inputs": inputs_metadata,
-			"outputs": outputs_metadata
+			"nonce": nonce_u64,
+			"originChainId": input_chain_id,
+			"expires": fill_deadline, // Use fillDeadline for both expires and fillDeadline
+			"fillDeadline": fill_deadline,
+			"inputOracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&selected_oracle.0)),
+			"inputs": request.intent.inputs.iter().map(|input| {
+				serde_json::json!({
+					"chainId": input.asset.ethereum_chain_id().unwrap_or(1),
+					"asset": input.asset.to_string(),
+					// TODO: Handle swap-type properly - for now use "0" if amount is None
+					"amount": input.amount.as_ref().unwrap_or(&"0".to_string()).clone(),
+					"user": input.user.to_string()
+				})
+			}).collect::<Vec<_>>(),
+			"outputs": request.intent.outputs.iter().map(|output| {
+				serde_json::json!({
+					"chainId": output.asset.ethereum_chain_id().unwrap_or(1),
+					"asset": output.asset.to_string(),
+					// TODO: Handle swap-type properly - for now use "0" if amount is None
+					"amount": output.amount.as_ref().unwrap_or(&"0".to_string()).clone(),
+					"receiver": output.receiver.to_string(),
+					"oracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&selected_oracle.0)),
+					"settler": format!("0x{:040x}", alloy_primitives::Address::from_slice(&output_settler.0)),
+				})
+			}).collect::<Vec<_>>()
 		});
 
 		let order = OifOrder::Oif3009V0 {
@@ -616,6 +645,7 @@ impl QuoteGenerator {
 				domain: serde_json::to_value(domain_object).unwrap_or(serde_json::Value::Null),
 				primary_type: "ReceiveWithAuthorization".to_string(),
 				message,
+				types: Some(self.build_eip3009_eip712_types()),
 			},
 			metadata,
 		};
@@ -874,13 +904,13 @@ impl QuoteGenerator {
 			QuoteError::InvalidRequest(format!("Network {} not found in config", input_chain_id))
 		})?;
 
-		// Get settlement and selected oracle for input chain (similar to permit2 flow)
+		// Get preferred settlement for TheCompact (prioritizes Direct settlement like escrow)
 		let (_input_settlement, input_selected_oracle) = self
 			.settlement_service
 			.get_any_settlement_for_chain(input_chain_id)
 			.ok_or_else(|| {
 				QuoteError::InvalidRequest(format!(
-					"No settlement available for input chain {}",
+					"No suitable settlement available for TheCompact on chain {}",
 					input_chain_id
 				))
 			})?;
@@ -930,13 +960,13 @@ impl QuoteGenerator {
 				QuoteError::InvalidRequest(format!("Invalid output chain ID: {}", e))
 			})?;
 
-			// Get settlement and selected oracle for the output chain (like permit2 flow)
+			// Get preferred settlement for the output chain (prioritizes Direct settlement like escrow)
 			let (_output_settlement, output_selected_oracle) = self
 				.settlement_service
 				.get_any_settlement_for_chain(output_chain_id)
 				.ok_or_else(|| {
 					QuoteError::InvalidRequest(format!(
-						"No settlement available for output chain {}",
+						"No suitable settlement available for output chain {}",
 						output_chain_id
 					))
 				})?;
@@ -1056,31 +1086,14 @@ impl QuoteGenerator {
 			}
 		});
 
-		// Try to compute the digest the same way the tests/contracts expect
-		// If this fails, fall back to just providing the EIP-712 structure
-		match self
-			.try_compute_server_digest(&eip712_message, request, network, input_chain_id)
-			.await
-		{
-			Ok(digest) => {
-				tracing::debug!(
-					"Quote generation: Successfully computed BatchCompact digest: 0x{}",
-					alloy_primitives::hex::encode(digest)
-				);
-				// Return message with both EIP-712 structure and pre-computed digest (like permit2)
-				Ok(serde_json::json!({
-					"digest": with_0x_prefix(&alloy_primitives::hex::encode(digest)),
-					"eip712": eip712_message
-				}))
-			},
-			Err(e) => {
-				tracing::warn!("Quote generation: Failed to compute BatchCompact digest, falling back to EIP-712 only: {}", e);
-				// Return message in the same format as before (with eip712 field, scripts will compute digest)
-				Ok(serde_json::json!({
-					"eip712": eip712_message
-				}))
-			},
-		}
+		// Extract just the message part for the new flat structure
+		// The domain and types are now handled at the OrderPayload level
+		let message_part = eip712_message
+			.get("message")
+			.cloned()
+			.unwrap_or(serde_json::Value::Null);
+
+		Ok(message_part)
 	}
 
 	async fn build_rhinestone_message(
@@ -1156,30 +1169,6 @@ impl QuoteGenerator {
 			._0;
 
 		Ok(name)
-	}
-
-	/// Get preferred settlement for escrow orders (prioritizes Direct settlement)
-	fn get_preferred_settlement_for_escrow(
-		&self,
-		chain_id: u64,
-	) -> Option<(&dyn SettlementInterface, solver_types::Address)> {
-		// First, try to get Direct settlement specifically
-		if let Some(direct_settlement) = self.settlement_service.get("direct") {
-			if let Some(oracles) = direct_settlement
-				.oracle_config()
-				.input_oracles
-				.get(&chain_id)
-			{
-				if !oracles.is_empty() {
-					let selected_oracle = direct_settlement.select_oracle(oracles, None)?;
-					return Some((direct_settlement, selected_oracle));
-				}
-			}
-		}
-
-		// Fallback to any available settlement if Direct is not available
-		self.settlement_service
-			.get_any_settlement_for_chain(chain_id)
 	}
 
 	/// Build structured domain object for Permit2
@@ -1572,6 +1561,128 @@ impl QuoteGenerator {
 			.map(|quote| quote.validity_seconds)
 			.unwrap_or_else(|| QuoteConfig::default().validity_seconds)
 	}
+
+	/// Generates EIP-712 types definition for Permit2 orders
+	fn build_permit2_eip712_types(&self) -> serde_json::Value {
+		serde_json::json!({
+			"EIP712Domain": [
+				{"name": "name", "type": "string"},
+				{"name": "chainId", "type": "uint256"},
+				{"name": "verifyingContract", "type": "address"}
+			],
+			"PermitBatchWitnessTransferFrom": [
+				{"name": "permitted", "type": "TokenPermissions[]"},
+				{"name": "spender", "type": "address"},
+				{"name": "nonce", "type": "uint256"},
+				{"name": "deadline", "type": "uint256"},
+				{"name": "witness", "type": "Permit2Witness"}
+			],
+			"TokenPermissions": [
+				{"name": "token", "type": "address"},
+				{"name": "amount", "type": "uint256"}
+			],
+			"Permit2Witness": [
+				{"name": "expires", "type": "uint32"},
+				{"name": "inputOracle", "type": "address"},
+				{"name": "outputs", "type": "MandateOutput[]"}
+			],
+			"MandateOutput": [
+				{"name": "oracle", "type": "bytes32"},
+				{"name": "settler", "type": "bytes32"},
+				{"name": "chainId", "type": "uint256"},
+				{"name": "token", "type": "bytes32"},
+				{"name": "amount", "type": "uint256"},
+				{"name": "recipient", "type": "bytes32"},
+				{"name": "call", "type": "bytes"},
+				{"name": "context", "type": "bytes"}
+			]
+		})
+	}
+
+	/// Generates EIP-712 types definition for TheCompact BatchCompact orders
+	fn build_compact_eip712_types(&self) -> serde_json::Value {
+		serde_json::json!({
+			"EIP712Domain": [
+				{"name": "name", "type": "string"},
+				{"name": "version", "type": "string"},
+				{"name": "chainId", "type": "uint256"},
+				{"name": "verifyingContract", "type": "address"}
+			],
+			"BatchCompact": [
+				{"name": "arbiter", "type": "address"},
+				{"name": "sponsor", "type": "address"},
+				{"name": "nonce", "type": "uint256"},
+				{"name": "expires", "type": "uint256"},
+				{"name": "commitments", "type": "Lock[]"},
+				{"name": "mandate", "type": "Mandate"}
+			],
+			"Lock": [
+				{"name": "lockTag", "type": "bytes12"},
+				{"name": "token", "type": "address"},
+				{"name": "amount", "type": "uint256"}
+			],
+			"Mandate": [
+				{"name": "fillDeadline", "type": "uint32"},
+				{"name": "inputOracle", "type": "address"},
+				{"name": "outputs", "type": "MandateOutput[]"}
+			],
+			"MandateOutput": [
+				{"name": "oracle", "type": "bytes32"},
+				{"name": "settler", "type": "bytes32"},
+				{"name": "chainId", "type": "uint256"},
+				{"name": "token", "type": "bytes32"},
+				{"name": "amount", "type": "uint256"},
+				{"name": "recipient", "type": "bytes32"},
+				{"name": "call", "type": "bytes"},
+				{"name": "context", "type": "bytes"}
+			]
+		})
+	}
+
+	/// Generates EIP-712 types definition for EIP-3009 ReceiveWithAuthorization orders
+	fn build_eip3009_eip712_types(&self) -> serde_json::Value {
+		serde_json::json!({
+			"EIP712Domain": [
+				{"name": "name", "type": "string"},
+				{"name": "chainId", "type": "uint256"},
+				{"name": "verifyingContract", "type": "address"}
+			],
+			"ReceiveWithAuthorization": [
+				{"name": "from", "type": "address"},
+				{"name": "to", "type": "address"},
+				{"name": "value", "type": "uint256"},
+				{"name": "validAfter", "type": "uint256"},
+				{"name": "validBefore", "type": "uint256"},
+				{"name": "nonce", "type": "bytes32"}
+			]
+		})
+	}
+
+	/// Build structured domain object for TheCompact
+	async fn build_compact_domain_object(
+		&self,
+		config: &Config,
+		chain_id: u64,
+	) -> Result<serde_json::Value, QuoteError> {
+		// Get TheCompact contract address from network config
+		let network = config.networks.get(&chain_id).ok_or_else(|| {
+			QuoteError::InvalidRequest(format!("Network {} not found in config", chain_id))
+		})?;
+
+		let the_compact_address = network.the_compact_address.as_ref().ok_or_else(|| {
+			QuoteError::InvalidRequest("TheCompact address not configured".to_string())
+		})?;
+
+		let contract_address = alloy_primitives::Address::from_slice(&the_compact_address.0);
+
+		// Build domain object similar to Permit2 structure
+		Ok(serde_json::json!({
+			"name": "TheCompact",
+			"version": "1",
+			"chainId": chain_id.to_string(),
+			"verifyingContract": format!("0x{:040x}", contract_address)
+		}))
+	}
 }
 
 #[cfg(test)]
@@ -1836,7 +1947,7 @@ mod tests {
 			Ok(order) => match order {
 				OifOrder::OifResourceLockV0 { payload } => {
 					assert_eq!(payload.signature_type, SignatureType::Eip712);
-					assert_eq!(payload.primary_type, "CompactLock");
+					assert_eq!(payload.primary_type, "BatchCompact");
 					assert!(payload.message.is_object());
 				},
 				_ => panic!("Expected OifResourceLockV0 order"),
@@ -1932,20 +2043,10 @@ mod tests {
 		assert!(result_obj.is_object());
 
 		let result_map = result_obj.as_object().unwrap();
-		// Should contain either digest+eip712 or just eip712
-		assert!(result_map.contains_key("eip712"));
 
-		// Check the EIP-712 structure
-		let eip712_structure = result_map.get("eip712").unwrap();
-		let eip712_obj = eip712_structure.as_object().unwrap();
-		assert!(eip712_obj.contains_key("types"));
-		assert!(eip712_obj.contains_key("domain"));
-		assert!(eip712_obj.contains_key("primaryType"));
-		assert!(eip712_obj.contains_key("message"));
-
-		// Check the actual message fields
-		let message = eip712_obj.get("message").unwrap();
-		let message_obj = message.as_object().unwrap();
+		// The build_compact_message now returns just the message part (flat structure)
+		// Check the actual message fields directly
+		let message_obj = result_map;
 		assert!(message_obj.contains_key("sponsor"));
 		assert!(message_obj.contains_key("commitments"));
 		assert!(message_obj.contains_key("mandate"));
@@ -1996,6 +2097,7 @@ mod tests {
 						domain: serde_json::json!({}),
 						primary_type: "TestType".to_string(),
 						message: serde_json::json!({}),
+						types: None,
 					},
 				},
 				failure_handling: FailureHandlingMode::RefundAutomatic,
@@ -2012,6 +2114,7 @@ mod tests {
 						domain: serde_json::json!({}),
 						primary_type: "TestType".to_string(),
 						message: serde_json::json!({}),
+						types: None,
 					},
 				},
 				failure_handling: FailureHandlingMode::RefundAutomatic,
@@ -2028,6 +2131,7 @@ mod tests {
 						domain: serde_json::json!({}),
 						primary_type: "TestType".to_string(),
 						message: serde_json::json!({}),
+						types: None,
 					},
 				},
 				failure_handling: FailureHandlingMode::RefundAutomatic,
@@ -2062,6 +2166,7 @@ mod tests {
 						domain: serde_json::json!({}),
 						primary_type: "TestType".to_string(),
 						message: serde_json::json!({}),
+						types: None,
 					},
 				},
 				failure_handling: FailureHandlingMode::RefundAutomatic,
@@ -2078,6 +2183,7 @@ mod tests {
 						domain: serde_json::json!({}),
 						primary_type: "TestType".to_string(),
 						message: serde_json::json!({}),
+						types: None,
 					},
 				},
 				failure_handling: FailureHandlingMode::RefundAutomatic,
