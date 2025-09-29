@@ -1174,7 +1174,6 @@ impl QuoteGenerator {
 		Ok(name)
 	}
 
-
 	/// Build structured domain object for Permit2
 	async fn build_permit2_domain_object(
 		&self,
