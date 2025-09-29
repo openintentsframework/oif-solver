@@ -127,16 +127,9 @@ pub fn ecrecover_user_from_signature(
 ///
 /// This function rebuilds the exact same digest that the client computed
 /// by following the same steps: domain hash + struct hash → final digest.
-pub fn reconstruct_permit2_digest_from_quote(
-	quote: &crate::api::Quote,
+pub fn reconstruct_permit2_digest(
+	payload: &crate::api::OrderPayload,
 ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-	use crate::OifOrder;
-
-	let payload = match &quote.order {
-		OifOrder::OifEscrowV0 { payload } => payload,
-		_ => return Err("Expected OifEscrowV0 order type".into()),
-	};
-
 	let domain = payload.domain.as_object().ok_or("Missing domain")?;
 	let message = payload.message.as_object().ok_or("Missing message")?;
 
@@ -253,14 +246,9 @@ pub fn reconstruct_permit2_digest_from_quote(
 		let chain_id = output_obj
 			.get("chainId")
 			.and_then(|c| {
-				// Handle both string and number formats
-				if let Some(s) = c.as_str() {
-					s.parse::<u64>().ok()
-				} else if let Some(n) = c.as_u64() {
-					Some(n)
-				} else {
-					None
-				}
+				c.as_str()
+					.and_then(|s| s.parse::<u64>().ok())
+					.or_else(|| c.as_u64())
 			})
 			.ok_or("Missing or invalid chainId")?;
 		let token_str = output_obj
@@ -355,16 +343,10 @@ pub fn reconstruct_permit2_digest_from_quote(
 ///
 /// This function rebuilds the exact same digest that the client computed
 /// by following the same steps: domain hash + struct hash → final digest.
-pub fn reconstruct_3009_digest_from_quote(
-	quote: &crate::api::Quote,
+pub fn reconstruct_3009_digest(
+	payload: &crate::api::OrderPayload,
 ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-	use crate::OifOrder;
 	use alloy_primitives::{keccak256, Address as AlloyAddress, FixedBytes, U256};
-
-	let payload = match &quote.order {
-		OifOrder::Oif3009V0 { payload, .. } => payload,
-		_ => return Err("Expected Oif3009V0 order type".into()),
-	};
 
 	let domain = payload.domain.as_object().ok_or("Missing domain")?;
 	let message = payload.message.as_object().ok_or("Missing message")?;
@@ -377,14 +359,9 @@ pub fn reconstruct_3009_digest_from_quote(
 	let chain_id = domain
 		.get("chainId")
 		.and_then(|c| {
-			// Handle both string and number formats
-			if let Some(s) = c.as_str() {
-				s.parse::<u64>().ok()
-			} else if let Some(n) = c.as_u64() {
-				Some(n)
-			} else {
-				None
-			}
+			c.as_str()
+				.and_then(|s| s.parse::<u64>().ok())
+				.or_else(|| c.as_u64())
 		})
 		.ok_or("Missing or invalid chainId")?;
 	let verifying_contract = domain
@@ -452,16 +429,11 @@ pub fn reconstruct_3009_digest_from_quote(
 	struct_encoder.push_u256(value);
 	struct_encoder.push_u256(U256::from(valid_after));
 	struct_encoder.push_u256(U256::from(valid_before));
-	struct_encoder.push_b256(&nonce_bytes.into());
+	struct_encoder.push_b256(&nonce_bytes);
 	let struct_hash = keccak256(struct_encoder.finish());
 
 	// Final EIP-712 digest
 	let final_digest = compute_final_digest(&domain_hash, &struct_hash);
-
-	tracing::info!(
-		"EIP-3009 digest reconstruction complete - Final digest: 0x{}",
-		hex::encode(final_digest.0)
-	);
 
 	Ok(final_digest.0)
 }
