@@ -768,29 +768,23 @@ impl PostOrderRequest {
 		use alloy_sol_types::SolType;
 
 		// 1. Reconstruct the EIP-712 digest based on order type
-		let digest = Self::reconstruct_digest_for_order_type(quote)?;
 
 		// 2. Recover the real user address from the signature
 
 		// if the compact order, extract user directly from message
 		let mut recovered_user = None;
-		if let OifOrder::OifResourceLockV0 { payload } = &quote.order {
-			if let Some(message_obj) = payload.message.as_object() {
-				if let Some(sponsor_str) = message_obj.get("sponsor").and_then(|s| s.as_str()) {
-					recovered_user = Some(Address::from_slice(&hex::decode(
-						sponsor_str.trim_start_matches("0x"),
-					)?));
-				}
-			}
-		} else {
+		if let OifOrder::OifEscrowV0 { payload: _ }
+		| OifOrder::Oif3009V0 {
+			payload: _,
+			metadata: _,
+		} = &quote.order
+		{
+			let digest = Self::reconstruct_digest_for_order_type(quote)?;
 			recovered_user = Some(crate::utils::eip712::ecrecover_user_from_signature(
 				&digest, signature,
 			)?);
 		}
 
-		tracing::info!("Recovered user: {}", recovered_user.unwrap());
-		tracing::info!("Signature: {}", signature);
-		tracing::info!("Digest: {}", hex::encode(digest));
 		// 3. Clone quote to make it mutable and inject recovered user
 		let mut quote_clone = quote.clone();
 		match &mut quote_clone.order {
@@ -798,8 +792,33 @@ impl PostOrderRequest {
 				if let Some(message_obj) = payload.message.as_object_mut() {
 					message_obj.insert(
 						"user".to_string(),
-						serde_json::Value::String(recovered_user.unwrap().to_string()),
+						serde_json::Value::String(
+							recovered_user
+								.ok_or_else(|| {
+									QuoteError::InvalidRequest(
+										"Unable to recover user address from signature".to_string(),
+									)
+								})?
+								.to_string(),
+						),
 					); // workaround because StandardOrder::try_from does not handle the user field
+				}
+			},
+			OifOrder::OifResourceLockV0 { payload } => {
+				recovered_user = if let Some(message_obj) = payload.message.as_object() {
+					// Extract sponsor address from the message
+					if let Some(sponsor_value) = message_obj.get("sponsor") {
+						if let Some(sponsor_str) = sponsor_value.as_str() {
+							// Parse the sponsor address string into an Address
+							sponsor_str.parse().ok()
+						} else {
+							None
+						}
+					} else {
+						None
+					}
+				} else {
+					None
 				}
 			},
 			_ => {}, // No user injection needed for other order types
@@ -817,7 +836,11 @@ impl PostOrderRequest {
 		let signature_bytes = Bytes::from(hex::decode(signature.trim_start_matches("0x"))?);
 		Ok(PostOrderRequest {
 			order: Bytes::from(encoded_order),
-			sponsor: recovered_user.unwrap(),
+			sponsor: recovered_user.ok_or_else(|| {
+				QuoteError::InvalidRequest(
+					"Unable to recover user address from signature".to_string(),
+				)
+			})?,
 			signature: signature_bytes,
 			lock_type,
 		})
@@ -840,8 +863,7 @@ impl PostOrderRequest {
 				crate::utils::eip712::reconstruct_3009_digest_from_quote(quote)
 			},
 			OifOrder::OifResourceLockV0 { .. } => {
-				// TheCompact resource lock orders
-				crate::utils::eip712::reconstruct_compact_digest_from_quote(quote)
+				Err("ResourceLockV0 orders not supported for digest reconstruction".into())
 			},
 			OifOrder::OifGenericV0 { .. } => {
 				Err("Generic orders not supported for digest reconstruction".into())

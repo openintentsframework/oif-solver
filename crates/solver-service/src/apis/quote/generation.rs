@@ -396,7 +396,7 @@ impl QuoteGenerator {
 		let params = lock.params.as_ref().unwrap_or(&default_params);
 		let (primary_type, message) = match &lock.kind {
 			LockKind::TheCompact => Ok((
-				"BatchCompact".to_string(),
+				"CompactLock".to_string(),
 				self.build_compact_message(request, config, params).await?,
 			)),
 			LockKind::Rhinestone => Ok((
@@ -471,7 +471,8 @@ impl QuoteGenerator {
 
 		// For escrow orders, prefer Direct settlement over other implementations
 		let (settlement, selected_oracle) = self
-			.get_preferred_settlement_for_escrow(chain_id)
+			.settlement_service
+			.get_any_settlement_for_chain(chain_id)
 			.ok_or_else(|| {
 				QuoteError::InvalidRequest(format!(
 					"No suitable settlement available for escrow on chain {}",
@@ -905,7 +906,8 @@ impl QuoteGenerator {
 
 		// Get preferred settlement for TheCompact (prioritizes Direct settlement like escrow)
 		let (_input_settlement, input_selected_oracle) = self
-			.get_preferred_settlement_for_escrow(input_chain_id)
+			.settlement_service
+			.get_any_settlement_for_chain(input_chain_id)
 			.ok_or_else(|| {
 				QuoteError::InvalidRequest(format!(
 					"No suitable settlement available for TheCompact on chain {}",
@@ -960,7 +962,8 @@ impl QuoteGenerator {
 
 			// Get preferred settlement for the output chain (prioritizes Direct settlement like escrow)
 			let (_output_settlement, output_selected_oracle) = self
-				.get_preferred_settlement_for_escrow(output_chain_id)
+				.settlement_service
+				.get_any_settlement_for_chain(output_chain_id)
 				.ok_or_else(|| {
 					QuoteError::InvalidRequest(format!(
 						"No suitable settlement available for output chain {}",
@@ -1083,15 +1086,17 @@ impl QuoteGenerator {
 			}
 		});
 
-		// Extract just the message part for the new flat structure
-		// The domain and types are now handled at the OrderPayload level
-		let message_part = eip712_message
-			.get("message")
-			.cloned()
-			.unwrap_or(serde_json::Value::Null);
+		// Build the complete EIP-712 structure with the expected format
+		let complete_eip712_structure = serde_json::json!({
+			"eip712": {
+				"types": self.build_compact_eip712_types(),
+				"domain": eip712_message.get("domain").cloned().unwrap_or(serde_json::Value::Null),
+				"primaryType": eip712_message.get("primaryType").cloned().unwrap_or(serde_json::Value::Null),
+				"message": eip712_message.get("message").cloned().unwrap_or(serde_json::Value::Null)
+			}
+		});
 
-		// Return only the message part (flat structure like Permit2)
-		Ok(message_part)
+		Ok(complete_eip712_structure)
 	}
 
 	async fn build_rhinestone_message(
@@ -1169,29 +1174,6 @@ impl QuoteGenerator {
 		Ok(name)
 	}
 
-	/// Get preferred settlement for escrow orders (prioritizes Direct settlement)
-	fn get_preferred_settlement_for_escrow(
-		&self,
-		chain_id: u64,
-	) -> Option<(&dyn SettlementInterface, solver_types::Address)> {
-		// First, try to get Direct settlement specifically
-		if let Some(direct_settlement) = self.settlement_service.get("direct") {
-			if let Some(oracles) = direct_settlement
-				.oracle_config()
-				.input_oracles
-				.get(&chain_id)
-			{
-				if !oracles.is_empty() {
-					let selected_oracle = direct_settlement.select_oracle(oracles, None)?;
-					return Some((direct_settlement, selected_oracle));
-				}
-			}
-		}
-
-		// Fallback to any available settlement if Direct is not available
-		self.settlement_service
-			.get_any_settlement_for_chain(chain_id)
-	}
 
 	/// Build structured domain object for Permit2
 	async fn build_permit2_domain_object(
