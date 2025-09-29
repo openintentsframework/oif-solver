@@ -50,13 +50,15 @@
 
 use super::custody::{CustodyDecision, CustodyStrategy};
 use crate::eip712::{compact, get_domain_separator};
+use alloy_primitives::U256;
 use solver_config::{Config, QuoteConfig};
 use solver_delivery::DeliveryService;
 use solver_settlement::{SettlementInterface, SettlementService};
 use solver_types::standards::eip7683::LockType;
 use solver_types::{
-	with_0x_prefix, FailureHandlingMode, GetQuoteRequest, InteropAddress, OifOrder, OrderInput,
-	OrderPayload, Quote, QuoteError, QuotePreference, SignatureType,
+	with_0x_prefix, CostContext, FailureHandlingMode, GetQuoteRequest, InteropAddress, OifOrder,
+	OrderInput, OrderPayload, Quote, QuoteError, QuotePreference, SignatureType, SwapType,
+	ValidatedQuoteContext,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -90,7 +92,6 @@ impl QuoteGenerator {
 	pub async fn generate_quotes(
 		&self,
 		request: &GetQuoteRequest,
-		context: &crate::apis::quote::validation::ValidatedQuoteContext,
 		config: &Config,
 	) -> Result<Vec<Quote>, QuoteError> {
 		let mut quotes = Vec::new();
@@ -101,7 +102,7 @@ impl QuoteGenerator {
 				.decide_custody(&order_input, request.intent.origin_submission.as_ref())
 				.await?;
 			if let Ok(quote) = self
-				.generate_quote_for_settlement(request, context, config, &custody_decision)
+				.generate_quote_for_settlement(request, config, &custody_decision)
 				.await
 			{
 				quotes.push(quote);
@@ -114,21 +115,244 @@ impl QuoteGenerator {
 		Ok(quotes)
 	}
 
+	/// Generate quotes with costs already embedded in the amounts.
+	pub async fn generate_quotes_with_costs(
+		&self,
+		request: &GetQuoteRequest,
+		context: &ValidatedQuoteContext,
+		cost_context: &CostContext,
+		config: &Config,
+	) -> Result<Vec<Quote>, QuoteError> {
+		// Build a new request with swap amounts and cost adjustments from CostContext
+		let adjusted_request = self.build_cost_adjusted_request(request, context, cost_context)?;
+
+		// Validate no zero amounts after adjustment
+		self.validate_no_zero_amounts(&adjusted_request, context)?;
+
+		// Validate constraints on the adjusted amounts
+		self.validate_swap_amount_constraints(&adjusted_request, context)?;
+
+		// Generate quotes using the adjusted request
+		let quotes = self.generate_quotes(&adjusted_request, config).await?;
+
+		Ok(quotes)
+	}
+
+	/// Build a new request with swap amounts and cost adjustments based on swap type
+	fn build_cost_adjusted_request(
+		&self,
+		request: &GetQuoteRequest,
+		context: &ValidatedQuoteContext,
+		cost_context: &CostContext,
+	) -> Result<GetQuoteRequest, QuoteError> {
+		let mut adjusted = request.clone();
+
+		match context.swap_type {
+			SwapType::ExactInput => {
+				// For ExactInput: Use swap amounts for outputs, then subtract costs
+				// Input amounts are already known from the request
+
+				// Determine first output asset before the loop to avoid borrow issues
+				let first_output_asset = adjusted.intent.outputs.first().map(|o| o.asset.clone());
+
+				for output in adjusted.intent.outputs.iter_mut() {
+					// First set the base swap amount from our calculation
+					if let Some(base_amount) = cost_context.swap_amounts.get(&output.asset) {
+						// Get cost for this specific token
+						let cost_in_token = cost_context
+							.cost_amounts_in_tokens
+							.get(&output.asset)
+							.copied()
+							.unwrap_or(U256::ZERO);
+
+						// Apply full cost to first output, others get their base amount
+						let is_first_output = first_output_asset
+							.as_ref()
+							.map(|first| first == &output.asset)
+							.unwrap_or(false);
+
+						let adjusted_amount = if is_first_output {
+							// First output bears the full cost
+							base_amount.saturating_sub(cost_in_token)
+						} else {
+							// Other outputs get their base amount
+							*base_amount
+						};
+
+						output.amount = Some(adjusted_amount.to_string());
+					}
+				}
+			},
+			SwapType::ExactOutput => {
+				// For ExactOutput: Use swap amounts for inputs, then add costs
+				// Output amounts are already known from the request
+
+				// Determine first input asset before the loop to avoid borrow issues
+				let first_input_asset = adjusted.intent.inputs.first().map(|i| i.asset.clone());
+
+				for input in adjusted.intent.inputs.iter_mut() {
+					// First set the base swap amount from our calculation
+					if let Some(base_amount) = cost_context.swap_amounts.get(&input.asset) {
+						// Get cost for this specific token
+						let cost_in_token = cost_context
+							.cost_amounts_in_tokens
+							.get(&input.asset)
+							.copied()
+							.unwrap_or(U256::ZERO);
+
+						// Apply full cost to first input, others get their base amount
+						let is_first_input = first_input_asset
+							.as_ref()
+							.map(|first| first == &input.asset)
+							.unwrap_or(false);
+
+						let adjusted_amount = if is_first_input {
+							// First input bears the full cost
+							base_amount + cost_in_token
+						} else {
+							// Other inputs get their base amount
+							*base_amount
+						};
+
+						input.amount = Some(adjusted_amount.to_string());
+					}
+				}
+			},
+		}
+
+		Ok(adjusted)
+	}
+
+	/// Validate that adjusted amounts meet the constraints
+	fn validate_swap_amount_constraints(
+		&self,
+		adjusted_request: &GetQuoteRequest,
+		context: &ValidatedQuoteContext,
+	) -> Result<(), QuoteError> {
+		use alloy_primitives::U256;
+		use std::str::FromStr;
+
+		match context.swap_type {
+			SwapType::ExactInput => {
+				// For exact-input: check that output amounts meet minimums
+				if let Some(constraints) = &context.constraint_outputs {
+					for (output, constraint_amount_opt) in constraints {
+						if let Some(constraint_amount) = constraint_amount_opt {
+							// Find the adjusted output amount
+							let adjusted_output = adjusted_request
+								.intent
+								.outputs
+								.iter()
+								.find(|o| o.asset == output.asset)
+								.and_then(|o| o.amount.as_ref())
+								.and_then(|amt| U256::from_str(amt).ok())
+								.unwrap_or(U256::ZERO);
+
+							if adjusted_output < *constraint_amount {
+								return Err(QuoteError::InvalidRequest(format!(
+									"Output amount for {} ({}) below minimum required ({})",
+									output.asset, adjusted_output, constraint_amount
+								)));
+							}
+						}
+					}
+				}
+			},
+			SwapType::ExactOutput => {
+				// For exact-output: check that input amounts don't exceed maximums
+				// When a user provides input constraints for exact-output swaps,
+				// they're specifying the maximum they're willing to provide
+				if let Some(constraints) = &context.constraint_inputs {
+					for (input, constraint_amount_opt) in constraints {
+						if let Some(constraint_amount) = constraint_amount_opt {
+							// Find the adjusted input amount
+							let adjusted_input = adjusted_request
+								.intent
+								.inputs
+								.iter()
+								.find(|i| i.asset == input.asset)
+								.and_then(|i| i.amount.as_ref())
+								.and_then(|amt| U256::from_str(amt).ok())
+								.unwrap_or(U256::ZERO);
+
+							if adjusted_input > *constraint_amount {
+								return Err(QuoteError::InvalidRequest(format!(
+									"Input amount for {} ({}) exceeds maximum allowed ({})",
+									input.asset, adjusted_input, constraint_amount
+								)));
+							}
+						}
+					}
+				}
+			},
+		}
+
+		Ok(())
+	}
+
+	/// Validate that no amounts are zero after adjustment
+	fn validate_no_zero_amounts(
+		&self,
+		adjusted_request: &GetQuoteRequest,
+		context: &ValidatedQuoteContext,
+	) -> Result<(), QuoteError> {
+		use alloy_primitives::U256;
+		use std::str::FromStr;
+
+		match context.swap_type {
+			SwapType::ExactInput => {
+				// For exact-input, check that all outputs are non-zero
+				for output in &adjusted_request.intent.outputs {
+					let amount = output
+						.amount
+						.as_ref()
+						.and_then(|amt| U256::from_str(amt).ok())
+						.unwrap_or(U256::ZERO);
+
+					if amount.is_zero() {
+						return Err(QuoteError::InvalidRequest(format!(
+							"Output amount for {} cannot be zero after cost adjustment",
+							output.asset
+						)));
+					}
+				}
+			},
+			SwapType::ExactOutput => {
+				// For exact-output, check that all inputs are non-zero
+				for input in &adjusted_request.intent.inputs {
+					let amount = input
+						.amount
+						.as_ref()
+						.and_then(|amt| U256::from_str(amt).ok())
+						.unwrap_or(U256::ZERO);
+
+					if amount.is_zero() {
+						return Err(QuoteError::InvalidRequest(format!(
+							"Input amount for {} cannot be zero after cost adjustment",
+							input.asset
+						)));
+					}
+				}
+			},
+		}
+
+		Ok(())
+	}
+
 	async fn generate_quote_for_settlement(
 		&self,
 		request: &GetQuoteRequest,
-		context: &crate::apis::quote::validation::ValidatedQuoteContext,
 		config: &Config,
 		custody_decision: &CustodyDecision,
 	) -> Result<Quote, QuoteError> {
 		let quote_id = Uuid::new_v4().to_string();
 		let order = match custody_decision {
 			CustodyDecision::ResourceLock { lock } => {
-				self.generate_resource_lock_order(request, context, config, lock)
+				self.generate_resource_lock_order(request, config, lock)
 					.await?
 			},
 			CustodyDecision::Escrow { lock_type } => {
-				self.generate_escrow_order(request, context, config, lock_type)
+				self.generate_escrow_order(request, config, lock_type)
 					.await?
 			},
 		};
@@ -162,7 +386,6 @@ impl QuoteGenerator {
 	async fn generate_resource_lock_order(
 		&self,
 		request: &GetQuoteRequest,
-		_context: &crate::apis::quote::validation::ValidatedQuoteContext,
 		config: &Config,
 		lock: &solver_types::AssetLockReference,
 	) -> Result<OifOrder, QuoteError> {
@@ -232,7 +455,6 @@ impl QuoteGenerator {
 	async fn generate_escrow_order(
 		&self,
 		request: &GetQuoteRequest,
-		_context: &crate::apis::quote::validation::ValidatedQuoteContext,
 		config: &Config,
 		lock_type: &LockType,
 	) -> Result<OifOrder, QuoteError> {
@@ -474,8 +696,14 @@ impl QuoteGenerator {
 			.asset
 			.ethereum_address()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input token: {}", e)))?;
-		// TODO: Handle swap-type properly - for now use "0" if amount is None
-		let input_amount = input.amount.as_ref().unwrap_or(&"0".to_string()).clone();
+		// Input amount should be set after cost adjustment
+		let input_amount = input
+			.amount
+			.as_ref()
+			.ok_or_else(|| {
+				QuoteError::InvalidRequest("Input amount not set after cost adjustment".to_string())
+			})?
+			.clone();
 
 		// TODO: All this needs to all be removed!
 
@@ -505,11 +733,15 @@ impl QuoteGenerator {
 		let output_token = output_interop
 			.ethereum_address()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output token: {}", e)))?;
-		// TODO: Handle swap-type properly - for now use "0" if amount is None
+		// Output amount should be set after cost adjustment
 		let output_amount = output_info
 			.amount
 			.as_ref()
-			.unwrap_or(&"0".to_string())
+			.ok_or_else(|| {
+				QuoteError::InvalidRequest(
+					"Output amount not set after cost adjustment".to_string(),
+				)
+			})?
 			.clone();
 
 		// Extract recipient from InteropAddress
@@ -707,11 +939,10 @@ impl QuoteGenerator {
 				QuoteError::InvalidRequest(format!("Failed to create token ID: {}", e))
 			})?;
 
-			inputs_array.push(serde_json::json!([
-				token_id.to_string(),
-				// TODO: Handle swap-type properly - for now use "0" if amount is None
-				input.amount.as_ref().unwrap_or(&"0".to_string()).clone(),
-			]));
+			let amount = input.amount.as_ref().ok_or_else(|| {
+				QuoteError::InvalidRequest("Input amount not set after cost adjustment".to_string())
+			})?;
+			inputs_array.push(serde_json::json!([token_id.to_string(), amount.clone(),]));
 		}
 
 		// Convert outputs to MandateOutput format
@@ -754,13 +985,17 @@ impl QuoteGenerator {
 				})?;
 
 			// Build MandateOutput with proper oracle and settler addresses
+			let amount = output.amount.as_ref().ok_or_else(|| {
+				QuoteError::InvalidRequest(
+					"Output amount not set after cost adjustment".to_string(),
+				)
+			})?;
 			outputs_array.push(serde_json::json!({
 				"oracle": format!("0x000000000000000000000000{:040x}", output_oracle),
 				"settler": format!("0x000000000000000000000000{:040x}", output_settler),
 				"chainId": output_chain_id.to_string(),
 				"token": format!("0x000000000000000000000000{:040x}", output_token_address),
-				// TODO: Handle swap-type properly - for now use "0" if amount is None
-				"amount": output.amount.as_ref().unwrap_or(&"0".to_string()).clone(),
+				"amount": amount.clone(),
 				"recipient": format!("0x000000000000000000000000{:040x}", recipient_address),
 				"call": output.calldata.clone(),
 				"context": "0x" // Context is typically empty for standard flows
@@ -987,7 +1222,7 @@ impl QuoteGenerator {
 		}))
 	}
 
-	/// Build Permit2 message object (clean EIP-712 message without metadata)
+	/// Build Permit2 message object
 	fn build_permit2_message_object(
 		&self,
 		request: &GetQuoteRequest,
@@ -1476,19 +1711,17 @@ impl QuoteGenerator {
 mod tests {
 	use super::*;
 	use crate::apis::quote::custody::CustodyDecision;
-	use crate::apis::quote::validation::ValidatedQuoteContext;
 	use alloy_primitives::address;
 	use alloy_primitives::U256;
 	use solver_config::{
 		ApiConfig, Config, ConfigBuilder, DomainConfig, QuoteConfig, SettlementConfig,
 	};
 	use solver_settlement::{MockSettlementInterface, SettlementInterface};
-	use solver_types::oif_versions;
-	use solver_types::parse_address;
 	use solver_types::{
+		oif_versions, parse_address,
 		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
-		FailureHandlingMode, IntentRequest, IntentType, OifOrder, OrderPayload, QuoteInput,
-		QuoteOutput, QuotePreference, SignatureType, SwapType,
+		FailureHandlingMode, GetQuoteRequest, IntentRequest, IntentType, InteropAddress, OifOrder,
+		OrderPayload, QuoteInput, QuoteOutput, QuotePreference, SignatureType, SwapType,
 	};
 	use std::collections::HashMap;
 
@@ -1533,20 +1766,6 @@ mod tests {
 			.build()
 	}
 
-	fn create_test_context() -> ValidatedQuoteContext {
-		ValidatedQuoteContext {
-			swap_type: SwapType::ExactInput,
-			known_inputs: None,
-			known_outputs: None,
-			constraint_inputs: None,
-			constraint_outputs: None,
-			inferred_order_types: vec![],
-			compatible_auth_schemes: vec![],
-			inputs_for_balance_check: vec![],
-			outputs_for_balance_check: vec![],
-		}
-	}
-
 	fn create_test_request() -> GetQuoteRequest {
 		GetQuoteRequest {
 			user: InteropAddress::new_ethereum(
@@ -1574,7 +1793,7 @@ mod tests {
 					),
 					asset: InteropAddress::new_ethereum(
 						137,
-						address!("B0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C5C5C5"),
+						address!("B0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
 					),
 					amount: Some(U256::from(950).to_string()),
 					calldata: None,
@@ -1641,9 +1860,8 @@ mod tests {
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
-		let context = create_test_context();
 
-		let result = generator.generate_quotes(&request, &context, &config).await;
+		let result = generator.generate_quotes(&request, &config).await;
 
 		// Should succeed since we have properly configured oracles
 		assert!(result.is_ok());
@@ -1667,7 +1885,7 @@ mod tests {
 
 		// Verify failure handling and partial fill fields
 		assert_eq!(quote.failure_handling, FailureHandlingMode::RefundAutomatic);
-		assert_eq!(quote.partial_fill, false);
+		assert!(!quote.partial_fill);
 	}
 
 	#[tokio::test]
@@ -1678,9 +1896,8 @@ mod tests {
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
-		let context = create_test_context();
 
-		let result = generator.generate_quotes(&request, &context, &config).await;
+		let result = generator.generate_quotes(&request, &config).await;
 
 		// Should fail with insufficient liquidity since our mock settlement has no oracles configured
 		assert!(matches!(result, Err(QuoteError::InsufficientLiquidity)));
@@ -1693,7 +1910,6 @@ mod tests {
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
-		let context = create_test_context();
 
 		// Create request with no available inputs
 		let request = GetQuoteRequest {
@@ -1727,7 +1943,7 @@ mod tests {
 			supported_types: vec![oif_versions::escrow_order_type("v0")],
 		};
 
-		let result = generator.generate_quotes(&request, &context, &config).await;
+		let result = generator.generate_quotes(&request, &config).await;
 		assert!(matches!(result, Err(QuoteError::InsufficientLiquidity)));
 	}
 
@@ -1745,9 +1961,8 @@ mod tests {
 			params: Some(serde_json::json!({"test": "value"})),
 		};
 
-		let context = create_test_context();
 		let result = generator
-			.generate_resource_lock_order(&request, &context, &config, &lock)
+			.generate_resource_lock_order(&request, &config, &lock)
 			.await;
 
 		match result {
@@ -1846,15 +2061,29 @@ mod tests {
 			.await;
 
 		assert!(result.is_ok());
-		let message = result.unwrap();
-		assert!(message.is_object());
+		let result_obj = result.unwrap();
+		assert!(result_obj.is_object());
 
+		let result_map = result_obj.as_object().unwrap();
+		// Should contain either digest+eip712 or just eip712
+		assert!(result_map.contains_key("eip712"));
+
+		// Check the EIP-712 structure
+		let eip712_structure = result_map.get("eip712").unwrap();
+		let eip712_obj = eip712_structure.as_object().unwrap();
+		assert!(eip712_obj.contains_key("types"));
+		assert!(eip712_obj.contains_key("domain"));
+		assert!(eip712_obj.contains_key("primaryType"));
+		assert!(eip712_obj.contains_key("message"));
+
+		// Check the actual message fields
+		let message = eip712_obj.get("message").unwrap();
 		let message_obj = message.as_object().unwrap();
-		assert!(message_obj.contains_key("user"));
-		assert!(message_obj.contains_key("inputs"));
-		assert!(message_obj.contains_key("outputs"));
+		assert!(message_obj.contains_key("sponsor"));
+		assert!(message_obj.contains_key("commitments"));
+		assert!(message_obj.contains_key("mandate"));
 		assert!(message_obj.contains_key("nonce"));
-		assert!(message_obj.contains_key("deadline"));
+		assert!(message_obj.contains_key("expires"));
 	}
 
 	#[test]
@@ -2089,9 +2318,8 @@ mod tests {
 			},
 		};
 
-		let context = create_test_context();
 		let result = generator
-			.generate_quote_for_settlement(&request, &context, &config, &custody_decision)
+			.generate_quote_for_settlement(&request, &config, &custody_decision)
 			.await;
 
 		match result {
@@ -2128,9 +2356,8 @@ mod tests {
 			lock_type: solver_types::standards::eip7683::LockType::Eip3009Escrow,
 		};
 
-		let context = create_test_context();
 		let result = generator
-			.generate_quote_for_settlement(&request, &context, &config, &custody_decision)
+			.generate_quote_for_settlement(&request, &config, &custody_decision)
 			.await;
 
 		match result {
@@ -2154,6 +2381,150 @@ mod tests {
 					QuoteError::InvalidRequest(_) | QuoteError::UnsupportedSettlement(_)
 				));
 			},
+		}
+	}
+
+	#[tokio::test]
+	async fn test_exact_input_no_output_constraint_succeeds() {
+		let generator = create_test_generator();
+		let request = create_exact_input_request(
+			Some("1000000000000000000"), // 1 TOKA input
+			None,                        // No output constraint
+		);
+
+		let config = create_test_config();
+		let result = generator.generate_quotes(&request, &config).await;
+
+		// Should not fail with InvalidRequest for missing constraint
+		// May fail with other errors (e.g., InsufficientLiquidity) but that's ok
+		assert!(
+			!matches!(result, Err(QuoteError::InvalidRequest(msg)) if msg.contains("constraint")),
+			"Should accept exact-input without output constraint"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_exact_output_no_input_constraint_succeeds() {
+		let generator = create_test_generator();
+		let request = create_exact_output_request(
+			None,                        // No input constraint
+			Some("1000000000000000000"), // 1 TOKB output
+		);
+
+		let config = create_test_config();
+		let result = generator.generate_quotes(&request, &config).await;
+
+		// Should not fail with InvalidRequest for missing constraint
+		assert!(
+			!matches!(result, Err(QuoteError::InvalidRequest(msg)) if msg.contains("constraint")),
+			"Should accept exact-output without input constraint"
+		);
+	}
+
+	fn create_test_generator() -> QuoteGenerator {
+		let settlement_service = create_test_settlement_service(true);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		QuoteGenerator::new(settlement_service, delivery_service)
+	}
+
+	fn create_exact_input_request(
+		input_amount: Option<&str>,
+		output_amount: Option<&str>,
+	) -> GetQuoteRequest {
+		GetQuoteRequest {
+			user: InteropAddress::new_ethereum(
+				1,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			intent: IntentRequest {
+				intent_type: IntentType::OifSwap,
+				inputs: vec![QuoteInput {
+					user: InteropAddress::new_ethereum(
+						1,
+						address!("1111111111111111111111111111111111111111"),
+					),
+					asset: InteropAddress::new_ethereum(
+						1,
+						address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+					),
+					amount: input_amount.map(|s| s.to_string()),
+					lock: None,
+				}],
+				outputs: vec![QuoteOutput {
+					receiver: InteropAddress::new_ethereum(
+						137,
+						address!("2222222222222222222222222222222222222222"),
+					),
+					asset: InteropAddress::new_ethereum(
+						137,
+						address!("2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+					),
+					amount: output_amount.map(|s| s.to_string()),
+					calldata: None,
+				}],
+				swap_type: Some(SwapType::ExactInput),
+				preference: Some(QuotePreference::Speed),
+				min_valid_until: Some(600),
+				origin_submission: Some(solver_types::OriginSubmission {
+					mode: solver_types::OriginMode::User,
+					schemes: Some(vec![solver_types::AuthScheme::Permit2]),
+				}),
+				failure_handling: None,
+				partial_fill: Some(false),
+				metadata: None,
+			},
+			supported_types: vec!["oif-escrow-v0".to_string()],
+		}
+	}
+
+	fn create_exact_output_request(
+		input_amount: Option<&str>,
+		output_amount: Option<&str>,
+	) -> GetQuoteRequest {
+		GetQuoteRequest {
+			user: InteropAddress::new_ethereum(
+				1,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			intent: IntentRequest {
+				intent_type: IntentType::OifSwap,
+				inputs: vec![QuoteInput {
+					user: InteropAddress::new_ethereum(
+						1,
+						address!("1111111111111111111111111111111111111111"),
+					),
+					asset: InteropAddress::new_ethereum(
+						1,
+						address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+					),
+					amount: input_amount.map(|s| s.to_string()),
+					lock: None,
+				}],
+				outputs: vec![QuoteOutput {
+					receiver: InteropAddress::new_ethereum(
+						137,
+						address!("2222222222222222222222222222222222222222"),
+					),
+					asset: InteropAddress::new_ethereum(
+						137,
+						address!("2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+					),
+					amount: output_amount.map(|s| s.to_string()),
+					calldata: None,
+				}],
+				swap_type: Some(SwapType::ExactOutput),
+				preference: Some(QuotePreference::Speed),
+				min_valid_until: Some(600),
+				origin_submission: Some(solver_types::OriginSubmission {
+					mode: solver_types::OriginMode::User,
+					schemes: Some(vec![solver_types::AuthScheme::Permit2]),
+				}),
+				failure_handling: None,
+				partial_fill: Some(false),
+				metadata: None,
+			},
+			supported_types: vec!["oif-escrow-v0".to_string()],
 		}
 	}
 }
