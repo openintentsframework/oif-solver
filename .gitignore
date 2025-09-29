@@ -32,6 +32,7 @@ data/
 .logs/
 demo-output/
 snapshots/
+.oif-demo/
 
 # Contracts
 oif-contracts/

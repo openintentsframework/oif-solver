@@ -1,0 +1,206 @@
+use anyhow::{anyhow, Result};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{debug, info};
+
+use crate::services::JwtService;
+use solver_types::api::{GetQuoteRequest, GetQuoteResponse, PostOrderRequest, Quote};
+
+#[derive(Clone)]
+pub struct ApiClient {
+	client: Client,
+	base_url: String,
+	jwt_service: Option<Arc<JwtService>>,
+}
+
+impl ApiClient {
+	pub fn new(base_url: String) -> Self {
+		let client = Client::builder()
+			.timeout(Duration::from_secs(30))
+			.build()
+			.expect("Failed to build HTTP client");
+
+		Self {
+			client,
+			base_url,
+			jwt_service: None,
+		}
+	}
+
+	pub fn with_jwt_service(mut self, jwt_service: Arc<JwtService>) -> Self {
+		self.jwt_service = Some(jwt_service);
+		self
+	}
+
+	/// Get a valid authentication token
+	async fn get_auth_token(&self) -> Result<Option<String>> {
+		if let Some(jwt_service) = &self.jwt_service {
+			jwt_service.get_valid_token().await.map(Some)
+		} else {
+			Ok(None)
+		}
+	}
+
+	pub async fn request_quote(&self, request: GetQuoteRequest) -> Result<GetQuoteResponse> {
+		info!("Requesting quote for intent");
+
+		let url = format!("{}/api/quotes", self.base_url);
+		let mut req = self.client.post(&url).json(&request);
+
+		// Add authentication if available
+		if let Some(token) = self.get_auth_token().await? {
+			req = req.bearer_auth(token);
+		}
+
+		let response = req
+			.send()
+			.await
+			.map_err(|e| anyhow!("Failed to send quote request: {}", e))?;
+
+		if !response.status().is_success() {
+			let status = response.status();
+			let text = response.text().await.unwrap_or_default();
+			return Err(anyhow!(
+				"Quote request failed with status {}: {}",
+				status,
+				text
+			));
+		}
+
+		let quote_response: GetQuoteResponse = response
+			.json()
+			.await
+			.map_err(|e| anyhow!("Failed to parse quote response: {}", e))?;
+
+		Ok(quote_response)
+	}
+
+	pub async fn submit_order(
+		&self,
+		quote: &Quote,
+		signature: String,
+	) -> Result<serde_json::Value> {
+		info!("Submitting order for quote {}", quote.quote_id);
+
+		let url = format!("{}/api/orders", self.base_url);
+
+		// Convert quote and signature to PostOrderRequest
+		let post_order_request = PostOrderRequest::try_from((quote, signature.as_str(), "eip7683"))
+			.map_err(|e| anyhow!("Failed to create PostOrderRequest: {}", e))?;
+
+		let mut req = self.client.post(&url).json(&post_order_request);
+
+		// Add authentication if available
+		if let Some(token) = self.get_auth_token().await? {
+			req = req.bearer_auth(token);
+		}
+
+		let response = req
+			.send()
+			.await
+			.map_err(|e| anyhow!("Failed to submit order: {}", e))?;
+
+		if !response.status().is_success() {
+			let status = response.status();
+			let text = response.text().await.unwrap_or_default();
+			return Err(anyhow!(
+				"Order submission failed with status {}: {}",
+				status,
+				text
+			));
+		}
+
+		// Return the full JSON response for flexibility
+		let order_response: serde_json::Value = response
+			.json()
+			.await
+			.map_err(|e| anyhow!("Failed to parse order response: {}", e))?;
+
+		debug!("Order submission response: {:?}", order_response);
+		Ok(order_response)
+	}
+
+	/// Submit an intent directly without getting quotes
+	/// Note: This submits to /api/orders as a direct PostOrderRequest
+	pub async fn post_intent(&self, request: PostOrderRequest) -> Result<serde_json::Value> {
+		info!("Submitting intent directly to orders endpoint");
+
+		let url = format!("{}/api/orders", self.base_url);
+		let mut req = self.client.post(&url).json(&request);
+
+		// Add authentication if available
+		if let Some(token) = self.get_auth_token().await? {
+			req = req.bearer_auth(token);
+		}
+
+		let response = req
+			.send()
+			.await
+			.map_err(|e| anyhow!("Failed to submit intent: {}", e))?;
+
+		if !response.status().is_success() {
+			let status = response.status();
+			let text = response.text().await.unwrap_or_default();
+			return Err(anyhow!(
+				"Intent submission failed with status {}: {}",
+				status,
+				text
+			));
+		}
+
+		let result = response
+			.json::<serde_json::Value>()
+			.await
+			.map_err(|e| anyhow!("Failed to parse intent response: {}", e))?;
+
+		debug!("Intent submitted successfully");
+		Ok(result)
+	}
+
+	pub async fn get_order_status(&self, order_id: &str) -> Result<OrderStatus> {
+		debug!("Getting status for order {}", order_id);
+
+		let url = format!("{}/api/orders/{}", self.base_url, order_id);
+		let mut req = self.client.get(&url);
+
+		// Add authentication if available
+		if let Some(token) = self.get_auth_token().await? {
+			req = req.bearer_auth(token);
+		}
+
+		let response = req
+			.send()
+			.await
+			.map_err(|e| anyhow!("Failed to get order status: {}", e))?;
+
+		if !response.status().is_success() {
+			let status = response.status();
+			let text = response.text().await.unwrap_or_default();
+			return Err(anyhow!(
+				"Status request failed with status {}: {}",
+				status,
+				text
+			));
+		}
+
+		let status: OrderStatus = response
+			.json()
+			.await
+			.map_err(|e| anyhow!("Failed to parse status response: {}", e))?;
+
+		Ok(status)
+	}
+}
+
+// Removed SubmitOrderRequest and SubmitOrderResponse - using PostOrderRequest from solver_types
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OrderStatus {
+	pub order_id: String,
+	pub status: String,
+	pub created_at: u64,
+	pub updated_at: u64,
+	pub tx_hash: Option<String>,
+}

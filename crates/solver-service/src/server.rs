@@ -283,11 +283,10 @@ async fn handle_order(
 	}
 
 	// Extract standard, default to eip7683
-	let standard = "eip7683"; // TODO: define properly.
-						   // let standard = payload
-						   // 	.get("standard")
-						   // 	.and_then(|s| s.as_str())
-						   // 	.unwrap_or("eip7683");
+	let standard = payload
+		.get("standard")
+		.and_then(|s| s.as_str())
+		.unwrap_or("eip7683");
 
 	// Convert payload to PostOrderRequest
 	let intent_request = match extract_intent_request(payload.clone(), &state, standard).await {
@@ -339,17 +338,7 @@ async fn create_intent_from_quote(
 
 	let signature = payload
 		.get("signature")
-		.and_then(|v| {
-			// Handle signature as either string or array of strings
-			if let Some(s) = v.as_str() {
-				Some(s)
-			} else if let Some(arr) = v.as_array() {
-				// Take first element if it's an array
-				arr.first().and_then(|s| s.as_str())
-			} else {
-				None
-			}
-		})
+		.and_then(|v| v.as_str())
 		.ok_or_else(|| APIError::BadRequest {
 			error_type: ApiErrorType::MissingSignature,
 			message: "Missing signature for quote acceptance".to_string(),
@@ -357,14 +346,12 @@ async fn create_intent_from_quote(
 		})?;
 
 	tracing::info!(
-		"Quote acceptance for quote_id: {}, standard: {}, signature: {}",
+		"Quote acceptance for quote_id: {}, standard: {}",
 		quote_id,
-		standard,
-		signature
+		standard
 	);
 
 	// Retrieve the quote from storage
-	tracing::debug!("Attempting to retrieve quote from storage: {}", quote_id);
 	let quote = crate::apis::quote::get_quote_by_id(quote_id, &state.solver)
 		.await
 		.map_err(|e| {
@@ -377,15 +364,12 @@ async fn create_intent_from_quote(
 		})?;
 
 	// Convert Quote to PostOrderRequest using the TryFrom implementation
-	let result = (&quote, signature, standard).try_into().map_err(|e| {
-		tracing::error!("Quote conversion failed: {}", e);
-		APIError::InternalServerError {
+	(&quote, signature, standard)
+		.try_into()
+		.map_err(|e| APIError::InternalServerError {
 			error_type: ApiErrorType::QuoteConversionFailed,
 			message: format!("Failed to convert quote to intent format: {}", e),
-		}
-	})?;
-
-	Ok(result)
+		})
 }
 
 /// Creates a PostOrderRequest from a direct payload submission.
