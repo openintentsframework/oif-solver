@@ -568,7 +568,6 @@ impl QuoteGenerator {
 			&selected_oracle,
 			fill_deadline,
 		)?;
-		tracing::info!("order_identifier{:?}", order_identifier);
 		// Get token address for domain information
 		let token_address = first_input
 			.asset
