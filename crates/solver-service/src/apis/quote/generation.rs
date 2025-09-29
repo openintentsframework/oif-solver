@@ -55,8 +55,8 @@ use solver_delivery::DeliveryService;
 use solver_settlement::{SettlementInterface, SettlementService};
 use solver_types::standards::eip7683::LockType;
 use solver_types::{
-	CostContext, FailureHandlingMode, GetQuoteRequest, InteropAddress, OifOrder,
-	OrderInput, OrderPayload, Quote, QuoteError, QuotePreference, SignatureType, SwapType,
+	CostContext, FailureHandlingMode, GetQuoteRequest, InteropAddress, OifOrder, OrderInput,
+	OrderPayload, Quote, QuoteError, QuotePreference, SignatureType, SwapType,
 	ValidatedQuoteContext,
 };
 use std::sync::Arc;
@@ -708,12 +708,9 @@ impl QuoteGenerator {
 			.asset
 			.ethereum_address()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input token: {}", e)))?;
-		let input_amount = input
-			.amount
-			.as_ref()
-			.ok_or_else(|| {
-				QuoteError::InvalidRequest("Input amount not set after cost adjustment".to_string())
-			})?;
+		let input_amount = input.amount.as_ref().ok_or_else(|| {
+			QuoteError::InvalidRequest("Input amount not set after cost adjustment".to_string())
+		})?;
 		let input_amount_u256 = U256::from_str(input_amount)
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input amount: {}", e)))?;
 
@@ -724,22 +721,18 @@ impl QuoteGenerator {
 		// Build outputs array
 		let mut outputs = Vec::new();
 		for output_info in &request.intent.outputs {
-			let output_chain_id = output_info
-				.asset
-				.ethereum_chain_id()
-				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output chain ID: {}", e)))?;
+			let output_chain_id = output_info.asset.ethereum_chain_id().map_err(|e| {
+				QuoteError::InvalidRequest(format!("Invalid output chain ID: {}", e))
+			})?;
 			let output_token = output_info
 				.asset
 				.ethereum_address()
 				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output token: {}", e)))?;
-			let output_amount = output_info
-				.amount
-				.as_ref()
-				.ok_or_else(|| {
-					QuoteError::InvalidRequest(
-						"Output amount not set after cost adjustment".to_string(),
-					)
-				})?;
+			let output_amount = output_info.amount.as_ref().ok_or_else(|| {
+				QuoteError::InvalidRequest(
+					"Output amount not set after cost adjustment".to_string(),
+				)
+			})?;
 			let output_amount_u256 = U256::from_str(output_amount)
 				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output amount: {}", e)))?;
 			let recipient_addr = output_info
@@ -1183,8 +1176,6 @@ impl QuoteGenerator {
 			"witness": witness
 		}))
 	}
-
-
 
 	fn get_lock_domain_address(
 		&self,
