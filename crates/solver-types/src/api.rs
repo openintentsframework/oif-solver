@@ -862,12 +862,7 @@ impl PostOrderRequest {
 				// EIP-3009 orders
 				crate::utils::eip712::reconstruct_3009_digest_from_quote(quote)
 			},
-			OifOrder::OifResourceLockV0 { .. } => {
-				Err("ResourceLockV0 orders not supported for digest reconstruction".into())
-			},
-			OifOrder::OifGenericV0 { .. } => {
-				Err("Generic orders not supported for digest reconstruction".into())
-			},
+			_ => Err("Order type not supported for digest reconstruction".into()),
 		}
 	}
 }

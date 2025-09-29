@@ -466,17 +466,6 @@ pub fn reconstruct_3009_digest_from_quote(
 	Ok(final_digest.0)
 }
 
-/// Reconstructs the EIP-712 digest for TheCompact resource lock orders.
-///
-/// This function uses the same computation logic as the signature validator
-/// to ensure perfect alignment between digest reconstruction and validation.
-pub fn reconstruct_compact_digest_from_quote(
-	quote: &crate::api::Quote,
-) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-	let user_digest = keccak256(b"TheCompact digest reconstruction placeholder");
-	Ok(user_digest.0)
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
