@@ -458,16 +458,8 @@ impl CostProfitService {
 		// Calculate subtotal (actual costs only, excluding profit)
 		let subtotal = operational_cost + base_price;
 
-		// Calculate commission (based on costs, not including profit)
-		let commission_bps = Decimal::new(pricing.commission_bps as i64, 0);
-		let commission = if commission_bps > Decimal::ZERO {
-			(subtotal * commission_bps) / Decimal::from(10000)
-		} else {
-			Decimal::ZERO
-		};
-
 		// Calculate total (actual costs only, excluding profit requirement)
-		let total = subtotal + commission;
+		let total = subtotal;
 
 		Ok(CostBreakdown {
 			gas_open,
@@ -477,7 +469,6 @@ impl CostProfitService {
 			rate_buffer,
 			base_price,
 			min_profit,
-			commission,
 			operational_cost,
 			subtotal,
 			total,
@@ -590,23 +581,25 @@ impl CostProfitService {
 		// Actual profit is what's left after covering operational costs
 		let actual_profit_usd = spread - operational_cost_usd;
 
-		// Calculate profit margin as percentage of output value
-		if total_output_value_usd.is_zero() {
+		// Calculate profit margin as percentage of transaction value (max of input/output)
+		// This must match the calculation used during quote generation
+		let transaction_value = total_input_value_usd.max(total_output_value_usd);
+		if transaction_value.is_zero() {
 			return Err(APIError::BadRequest {
 				error_type: ApiErrorType::InvalidRequest,
-				message: "Cannot calculate profit margin: zero output value".to_string(),
+				message: "Cannot calculate profit margin: zero transaction value".to_string(),
 				details: None,
 			});
 		}
 
-		let actual_profit_margin =
-			(actual_profit_usd / total_output_value_usd) * Decimal::from(100);
+		let actual_profit_margin = (actual_profit_usd / transaction_value) * Decimal::from(100);
 
 		// Calculate what the values would be at different stages
 		// Note: We're working backwards from the final quoted values
-		// Use the actual profit from the spread, not the recalculated min_profit
-		let display_profit = actual_profit_usd;
-		let total_adjustments = cost_breakdown.total + display_profit;
+		// Display the actual minimum profit requirement from cost breakdown
+		let display_min_profit = cost_breakdown.min_profit;
+		let display_actual_profit = actual_profit_usd;
+		let total_adjustments = cost_breakdown.total + display_actual_profit;
 
 		// Always show both labels for clarity
 		// One of them will apply depending on whether it's ExactInput or ExactOutput
@@ -632,9 +625,9 @@ impl CostProfitService {
 			│  ├─ Market Adjustments:\n\
 			│  │  ├─ Rate Buffer:     $ {:>7.2}\n\
 			│  │  └─ Base Price:      $ {:>7.2} {}\n\
-			│  ├─ Profit Components:\n\
-			│  │  ├─ Min Profit:      $ {:>7.2} ({}%)\n\
-			│  │  └─ Commission:      $ {:>7.2} {}\n\
+			│  ├─ Profit:\n\
+			│  │  ├─ Target:          $ {:>7.2} ({}%)\n\
+			│  │  └─ Actual:          $ {:>7.2}\n\
 			│  └─ Total Cost:         $ {:>7.2}\n\
 			├─ Profitability:\n\
 			│  ├─ Input Value:        $ {:>7.2}\n\
@@ -653,7 +646,7 @@ impl CostProfitService {
 			adjustment_label,
 			total_adjustments,
 			cost_breakdown.total,
-			display_profit,
+			display_actual_profit,
 			(total_input_value_usd - total_output_value_usd).abs(),
 			if total_input_value_usd >= total_output_value_usd {
 				"(favorable)"
@@ -689,18 +682,9 @@ impl CostProfitService {
 			} else {
 				""
 			},
-			display_profit,
+			display_min_profit,
 			min_profitability_pct,
-			cost_breakdown.commission,
-			if cost_breakdown.commission > Decimal::ZERO {
-				format!(
-					"({}%)",
-					((cost_breakdown.commission / cost_breakdown.subtotal) * Decimal::from(100))
-						.round_dp(1)
-				)
-			} else {
-				String::new()
-			},
+			display_actual_profit,
 			cost_breakdown.total,
 			// Profitability calculation
 			total_input_value_usd,
