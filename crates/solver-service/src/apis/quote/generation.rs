@@ -396,7 +396,7 @@ impl QuoteGenerator {
 		let params = lock.params.as_ref().unwrap_or(&default_params);
 		let (primary_type, message) = match &lock.kind {
 			LockKind::TheCompact => Ok((
-				"CompactLock".to_string(),
+				"BatchCompact".to_string(),
 				self.build_compact_message(request, config, params).await?,
 			)),
 			LockKind::Rhinestone => Ok((
@@ -1086,17 +1086,14 @@ impl QuoteGenerator {
 			}
 		});
 
-		// Build the complete EIP-712 structure with the expected format
-		let complete_eip712_structure = serde_json::json!({
-			"eip712": {
-				"types": self.build_compact_eip712_types(),
-				"domain": eip712_message.get("domain").cloned().unwrap_or(serde_json::Value::Null),
-				"primaryType": eip712_message.get("primaryType").cloned().unwrap_or(serde_json::Value::Null),
-				"message": eip712_message.get("message").cloned().unwrap_or(serde_json::Value::Null)
-			}
-		});
+		// Extract just the message part for the new flat structure
+		// The domain and types are now handled at the OrderPayload level
+		let message_part = eip712_message
+			.get("message")
+			.cloned()
+			.unwrap_or(serde_json::Value::Null);
 
-		Ok(complete_eip712_structure)
+		Ok(message_part)
 	}
 
 	async fn build_rhinestone_message(
@@ -1950,7 +1947,7 @@ mod tests {
 			Ok(order) => match order {
 				OifOrder::OifResourceLockV0 { payload } => {
 					assert_eq!(payload.signature_type, SignatureType::Eip712);
-					assert_eq!(payload.primary_type, "CompactLock");
+					assert_eq!(payload.primary_type, "BatchCompact");
 					assert!(payload.message.is_object());
 				},
 				_ => panic!("Expected OifResourceLockV0 order"),
@@ -2046,20 +2043,10 @@ mod tests {
 		assert!(result_obj.is_object());
 
 		let result_map = result_obj.as_object().unwrap();
-		// Should contain either digest+eip712 or just eip712
-		assert!(result_map.contains_key("eip712"));
 
-		// Check the EIP-712 structure
-		let eip712_structure = result_map.get("eip712").unwrap();
-		let eip712_obj = eip712_structure.as_object().unwrap();
-		assert!(eip712_obj.contains_key("types"));
-		assert!(eip712_obj.contains_key("domain"));
-		assert!(eip712_obj.contains_key("primaryType"));
-		assert!(eip712_obj.contains_key("message"));
-
-		// Check the actual message fields
-		let message = eip712_obj.get("message").unwrap();
-		let message_obj = message.as_object().unwrap();
+		// The build_compact_message now returns just the message part (flat structure)
+		// Check the actual message fields directly
+		let message_obj = result_map;
 		assert!(message_obj.contains_key("sponsor"));
 		assert!(message_obj.contains_key("commitments"));
 		assert!(message_obj.contains_key("mandate"));
