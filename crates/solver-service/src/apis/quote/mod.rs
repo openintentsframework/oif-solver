@@ -64,6 +64,7 @@
 //! - `Internal`: System errors
 pub mod custody;
 pub mod generation;
+pub mod order_identifier;
 pub mod registry;
 pub mod signing;
 pub mod validation;

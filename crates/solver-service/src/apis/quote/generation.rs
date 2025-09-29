@@ -49,14 +49,13 @@
 //! - **Input Priority**: Preference for specific input tokens
 
 use super::custody::{CustodyDecision, CustodyStrategy};
-use crate::eip712::{compact, get_domain_separator};
 use alloy_primitives::U256;
 use solver_config::{Config, QuoteConfig};
 use solver_delivery::DeliveryService;
 use solver_settlement::{SettlementInterface, SettlementService};
 use solver_types::standards::eip7683::LockType;
 use solver_types::{
-	with_0x_prefix, CostContext, FailureHandlingMode, GetQuoteRequest, InteropAddress, OifOrder,
+	CostContext, FailureHandlingMode, GetQuoteRequest, InteropAddress, OifOrder,
 	OrderInput, OrderPayload, Quote, QuoteError, QuotePreference, SignatureType, SwapType,
 	ValidatedQuoteContext,
 };
@@ -569,7 +568,7 @@ impl QuoteGenerator {
 			&selected_oracle,
 			fill_deadline,
 		)?;
-
+		tracing::info!("order_identifier{:?}", order_identifier);
 		// Get token address for domain information
 		let token_address = first_input
 			.asset
@@ -653,9 +652,11 @@ impl QuoteGenerator {
 		Ok(order)
 	}
 
-	/// Compute the orderIdentifier for an EIP-3009 order by building a StandardOrder
-	/// and calling the contract's orderIdentifier function - same as the intents script
+	/// Compute the orderIdentifier for an EIP-3009 order using pure Rust implementation.
 	/// Returns (nonce, order_identifier)
+	///
+	/// This uses the same algorithm as StandardOrderType.sol's orderIdentifier function
+	/// but computes it directly in Rust without any external contract calls or `cast` commands.
 	fn compute_eip3009_order_identifier(
 		&self,
 		request: &GetQuoteRequest,
@@ -663,6 +664,11 @@ impl QuoteGenerator {
 		selected_oracle: &solver_types::Address,
 		fill_deadline: u32,
 	) -> Result<(u64, String), QuoteError> {
+		use crate::apis::quote::order_identifier::compute_order_identifier;
+		use alloy_primitives::{Address as AlloyAddress, FixedBytes, U256};
+		use solver_types::standards::eip7683::interfaces::SolMandateOutput;
+		use std::str::FromStr;
+
 		let input = &request.intent.inputs[0];
 
 		// Get input chain info
@@ -674,183 +680,115 @@ impl QuoteGenerator {
 			QuoteError::InvalidRequest(format!("Network {} not found", input_chain_id))
 		})?;
 
-		// Note: We don't need output network info for orderIdentifier calculation
-
-		// Build StandardOrder struct (same approach as intents script)
+		// Get user address
 		let user_addr = input
 			.user
 			.ethereum_address()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid user address: {}", e)))?;
-		// Generate incremental nonce like direct intent (current timestamp in microseconds)
-		let nonce = std::time::SystemTime::now()
+		let user = AlloyAddress::from_slice(user_addr.as_slice());
+
+		// Generate nonce (current timestamp in microseconds)
+		let nonce_u64 = std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
 			.map(|d| d.as_micros() as u64)
 			.unwrap_or(0u64);
-		let expiry = fill_deadline; // Use same value
-		let input_oracle = format!(
-			"0x{:040x}",
-			alloy_primitives::Address::from_slice(&selected_oracle.0)
-		);
+		let nonce = U256::from(nonce_u64);
 
-		// Build input tokens array: [[token, amount]]
+		// Use fillDeadline for both expires and fillDeadline
+		let expires = fill_deadline;
+
+		// Get input oracle address
+		let input_oracle = AlloyAddress::from_slice(&selected_oracle.0);
+
+		// Get settler address
+		let settler = AlloyAddress::from_slice(&input_network.input_settler_address.0);
+
+		// Build inputs array: [[token_id, amount]]
 		let input_token = input
 			.asset
 			.ethereum_address()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input token: {}", e)))?;
-		// Input amount should be set after cost adjustment
 		let input_amount = input
 			.amount
 			.as_ref()
 			.ok_or_else(|| {
 				QuoteError::InvalidRequest("Input amount not set after cost adjustment".to_string())
-			})?
-			.clone();
-
-		// TODO: All this needs to all be removed!
-
-		// Use std::process::Command to call cast (same as scripts)
-		let rpc_url = if input_chain_id == 31337 {
-			"http://localhost:8545"
-		} else {
-			"http://localhost:8546"
-		};
-
-		let input_settler_address = format!(
-			"0x{:040x}",
-			alloy_primitives::Address::from_slice(&input_network.input_settler_address.0)
-		);
-
-		// Get output information for the outputs array (same as direct intent)
-		let output_info =
-			request.intent.outputs.first().ok_or_else(|| {
-				QuoteError::InvalidRequest("No requested outputs found".to_string())
 			})?;
+		let input_amount_u256 = U256::from_str(input_amount)
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input amount: {}", e)))?;
 
-		// Extract output chain and token from InteropAddress
-		let output_interop = output_info.asset.clone();
-		let output_chain_id = output_interop
-			.ethereum_chain_id()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output chain ID: {}", e)))?;
-		let output_token = output_interop
-			.ethereum_address()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output token: {}", e)))?;
-		// Output amount should be set after cost adjustment
-		let output_amount = output_info
-			.amount
-			.as_ref()
-			.ok_or_else(|| {
-				QuoteError::InvalidRequest(
-					"Output amount not set after cost adjustment".to_string(),
-				)
-			})?
-			.clone();
+		// For EIP-3009, the token ID is just the token address (no allocator prefix)
+		let token_id = U256::from_be_slice(input_token.as_slice());
+		let inputs = vec![[token_id, input_amount_u256]];
 
-		// Extract recipient from InteropAddress
-		let recipient_interop = output_info.receiver.clone();
-		let recipient_addr = recipient_interop
-			.ethereum_address()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid recipient address: {}", e)))?;
+		// Build outputs array
+		let mut outputs = Vec::new();
+		for output_info in &request.intent.outputs {
+			let output_chain_id = output_info
+				.asset
+				.ethereum_chain_id()
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output chain ID: {}", e)))?;
+			let output_token = output_info
+				.asset
+				.ethereum_address()
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output token: {}", e)))?;
+			let output_amount = output_info
+				.amount
+				.as_ref()
+				.ok_or_else(|| {
+					QuoteError::InvalidRequest(
+						"Output amount not set after cost adjustment".to_string(),
+					)
+				})?;
+			let output_amount_u256 = U256::from_str(output_amount)
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output amount: {}", e)))?;
+			let recipient_addr = output_info
+				.receiver
+				.ethereum_address()
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid recipient: {}", e)))?;
 
-		// Get output settler from config (same as direct intent)
-		let output_network = config.networks.get(&output_chain_id).ok_or_else(|| {
-			QuoteError::InvalidRequest(format!(
-				"Output network {} not found in config",
-				output_chain_id
-			))
-		})?;
-		let output_settler = output_network.output_settler_address.clone();
-		let output_settler_address = alloy_primitives::Address::from_slice(&output_settler.0);
+			// Get output settler
+			let output_network = config.networks.get(&output_chain_id).ok_or_else(|| {
+				QuoteError::InvalidRequest(format!(
+					"Output network {} not found in config",
+					output_chain_id
+				))
+			})?;
+			let output_settler = AlloyAddress::from_slice(&output_network.output_settler_address.0);
 
-		// Build outputs array (same format as direct intent)
-		let zero_bytes32 = "0x0000000000000000000000000000000000000000000000000000000000000000";
-		let output_settler_bytes32 =
-			format!("0x000000000000000000000000{:040x}", output_settler_address);
-		let output_token_bytes32 = format!("0x000000000000000000000000{:040x}", output_token);
-		let recipient_bytes32 = format!("0x000000000000000000000000{:040x}", recipient_addr);
-
-		let outputs_array = format!(
-			"[({},{},{},{},{},{},0x,0x)]",
-			zero_bytes32,
-			output_settler_bytes32,
-			output_chain_id,
-			output_token_bytes32,
-			output_amount,
-			recipient_bytes32
-		);
-
-		// Build the order struct string (same format as intents script with real outputs)
-		let order_struct = format!(
-			"({},{},{},{},{},{},[[{},{}]],{})",
-			user_addr,      // user
-			nonce,          // nonce (microseconds)
-			input_chain_id, // originChainId
-			expiry,         // expires
-			fill_deadline,  // fillDeadline
-			input_oracle,   // inputOracle
-			input_token,    // input token
-			input_amount,   // input amount
-			outputs_array   // outputs (with real data)
-		);
-
-		// Call contract orderIdentifier function (same as intents script)
-		let order_identifier_sig = "orderIdentifier((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))";
-
-		// Execute cast call in a clean environment without RUST_LOG to avoid contamination
-		let output = std::process::Command::new("cast")
-			.arg("call")
-			.arg(&input_settler_address)
-			.arg(order_identifier_sig)
-			.arg(&order_struct)
-			.arg("--rpc-url")
-			.arg(rpc_url)
-			.env_remove("RUST_LOG")  // Explicitly remove RUST_LOG for this process
-			.output()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to call cast: {}", e)))?;
-
-		if !output.status.success() {
-			let stderr = String::from_utf8_lossy(&output.stderr);
-			return Err(QuoteError::InvalidRequest(format!(
-				"Cast call failed: {}",
-				stderr
-			)));
+			// Build MandateOutput
+			let output = SolMandateOutput {
+				oracle: FixedBytes::<32>::ZERO, // Zero oracle for EIP-3009
+				settler: FixedBytes::<32>::left_padding_from(output_settler.as_slice()),
+				chainId: U256::from(output_chain_id),
+				token: FixedBytes::<32>::left_padding_from(output_token.as_slice()),
+				amount: output_amount_u256,
+				recipient: FixedBytes::<32>::left_padding_from(recipient_addr.as_slice()),
+				call: alloy_primitives::Bytes::new(),
+				context: alloy_primitives::Bytes::new(),
+			};
+			outputs.push(output);
 		}
 
-		let raw_output = String::from_utf8_lossy(&output.stdout);
+		// Compute order identifier using pure Rust implementation
+		let order_id_bytes = compute_order_identifier(
+			input_chain_id,
+			settler,
+			user,
+			nonce,
+			expires,
+			fill_deadline,
+			input_oracle,
+			&inputs,
+			&outputs,
+		)?;
 
-		// Extract only the 64-character hex string (order ID), filtering out any debug logs
-		let order_id = raw_output
-			.lines()
-			.find_map(|line| {
-				// Look for a line that contains a 66-character hex string (0x + 64 hex chars)
-				if let Some(start) = line.find("0x") {
-					let hex_part = &line[start..];
-					if hex_part.len() >= 66 {
-						let candidate = &hex_part[..66];
-						// Validate it's actually a hex string
-						if candidate.chars().skip(2).all(|c| c.is_ascii_hexdigit()) {
-							return Some(candidate.to_string());
-						}
-					}
-				}
-				None
-			})
-			.unwrap_or_else(|| raw_output.trim().to_string());
+		// Convert to hex string with 0x prefix
+		let order_id = format!("0x{}", alloy_primitives::hex::encode(order_id_bytes));
 
-		if order_id.is_empty()
-			|| order_id == "0x0000000000000000000000000000000000000000000000000000000000000000"
-		{
-			tracing::warn!(
-				"Failed to extract valid order ID from cast output: {}",
-				raw_output
-			);
-			return Err(QuoteError::InvalidRequest(
-				"Failed to compute order ID from contract".to_string(),
-			));
-		}
+		tracing::debug!("Computed order ID (pure Rust): {}", order_id);
 
-		tracing::debug!("Successfully extracted clean order ID: {}", order_id);
-
-		Ok((nonce, order_id))
+		Ok((nonce_u64, order_id))
 	}
 
 	async fn build_compact_message(
@@ -1246,260 +1184,7 @@ impl QuoteGenerator {
 		}))
 	}
 
-	/// Try to compute the digest using the existing eip712/compact module
-	async fn try_compute_server_digest(
-		&self,
-		eip712_message: &serde_json::Value,
-		_request: &GetQuoteRequest,
-		network: &solver_types::NetworkConfig,
-		input_chain_id: u64,
-	) -> Result<[u8; 32], QuoteError> {
-		use alloy_primitives::{keccak256, Address as AlloyAddress, FixedBytes, Uint};
-		use alloy_sol_types::SolType;
-		use solver_types::standards::eip7683::interfaces::StandardOrder as OifStandardOrder;
-		use std::str::FromStr;
 
-		// Build a StandardOrder from the EIP-712 message to use with the compact module
-		let message = eip712_message.get("message").ok_or_else(|| {
-			QuoteError::InvalidRequest("Missing message in EIP-712 structure".to_string())
-		})?;
-
-		// Extract basic fields
-		let sponsor_str = message
-			.get("sponsor")
-			.and_then(|v| v.as_str())
-			.ok_or_else(|| QuoteError::InvalidRequest("Missing sponsor in message".to_string()))?;
-		let sponsor = AlloyAddress::from_str(&sponsor_str[2..])
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid sponsor address: {}", e)))?;
-
-		let nonce_str = message
-			.get("nonce")
-			.and_then(|v| v.as_str())
-			.ok_or_else(|| QuoteError::InvalidRequest("Missing nonce in message".to_string()))?;
-		let nonce = Uint::<256, 4>::from_str(nonce_str)
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid nonce: {}", e)))?;
-
-		let expires_str = message
-			.get("expires")
-			.and_then(|v| v.as_str())
-			.ok_or_else(|| QuoteError::InvalidRequest("Missing expires in message".to_string()))?;
-		let expires = u32::from_str(expires_str)
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid expires: {}", e)))?;
-
-		// Extract mandate fields
-		let mandate = message
-			.get("mandate")
-			.ok_or_else(|| QuoteError::InvalidRequest("Missing mandate in message".to_string()))?;
-		let fill_deadline_str = mandate
-			.get("fillDeadline")
-			.and_then(|v| v.as_str())
-			.ok_or_else(|| {
-				QuoteError::InvalidRequest("Missing fillDeadline in mandate".to_string())
-			})?;
-		let fill_deadline = u32::from_str(fill_deadline_str)
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid fillDeadline: {}", e)))?;
-
-		let input_oracle_str = mandate
-			.get("inputOracle")
-			.and_then(|v| v.as_str())
-			.ok_or_else(|| {
-				QuoteError::InvalidRequest("Missing inputOracle in mandate".to_string())
-			})?;
-		let input_oracle = AlloyAddress::from_str(&input_oracle_str[2..])
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid inputOracle: {}", e)))?;
-
-		// Extract inputs from commitments
-		let commitments = message
-			.get("commitments")
-			.and_then(|v| v.as_array())
-			.ok_or_else(|| {
-				QuoteError::InvalidRequest("Missing commitments in message".to_string())
-			})?;
-
-		let mut inputs = Vec::new();
-		for commitment in commitments {
-			let lock_tag_str = commitment
-				.get("lockTag")
-				.and_then(|v| v.as_str())
-				.ok_or_else(|| {
-					QuoteError::InvalidRequest("Missing lockTag in commitment".to_string())
-				})?;
-			let token_str = commitment
-				.get("token")
-				.and_then(|v| v.as_str())
-				.ok_or_else(|| {
-					QuoteError::InvalidRequest("Missing token in commitment".to_string())
-				})?;
-			let amount_str = commitment
-				.get("amount")
-				.and_then(|v| v.as_str())
-				.ok_or_else(|| {
-					QuoteError::InvalidRequest("Missing amount in commitment".to_string())
-				})?;
-
-			// Reconstruct token ID from lock_tag + token_address
-			let lock_tag_bytes = alloy_primitives::hex::decode(&lock_tag_str[2..])
-				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid lockTag hex: {}", e)))?;
-			let token_bytes = alloy_primitives::hex::decode(&token_str[2..])
-				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid token hex: {}", e)))?;
-
-			// Combine lock_tag (12 bytes) + token_address (20 bytes) to form token_id (32 bytes)
-			let mut token_id_bytes = [0u8; 32];
-			token_id_bytes[0..12].copy_from_slice(&lock_tag_bytes);
-			token_id_bytes[12..32].copy_from_slice(&token_bytes);
-			let token_id = Uint::<256, 4>::from_be_bytes(token_id_bytes);
-
-			let amount = Uint::<256, 4>::from_str(amount_str)
-				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {}", e)))?;
-
-			inputs.push([token_id, amount]);
-		}
-
-		// Extract outputs
-		let outputs_array = mandate
-			.get("outputs")
-			.and_then(|v| v.as_array())
-			.ok_or_else(|| QuoteError::InvalidRequest("Missing outputs in mandate".to_string()))?;
-
-		use solver_types::standards::eip7683::interfaces::SolMandateOutput as MandateOutput;
-		let mut outputs = Vec::new();
-		for output in outputs_array {
-			let oracle_str = output
-				.get("oracle")
-				.and_then(|v| v.as_str())
-				.ok_or_else(|| {
-					QuoteError::InvalidRequest("Missing oracle in output".to_string())
-				})?;
-			let oracle = FixedBytes::<32>::from_str(oracle_str)
-				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid oracle: {}", e)))?;
-
-			let settler_str = output
-				.get("settler")
-				.and_then(|v| v.as_str())
-				.ok_or_else(|| {
-					QuoteError::InvalidRequest("Missing settler in output".to_string())
-				})?;
-			let settler = FixedBytes::<32>::from_str(settler_str)
-				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid settler: {}", e)))?;
-
-			let chain_id_str = output
-				.get("chainId")
-				.and_then(|v| v.as_str())
-				.ok_or_else(|| {
-					QuoteError::InvalidRequest("Missing chainId in output".to_string())
-				})?;
-			let chain_id = Uint::<256, 4>::from_str(chain_id_str)
-				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chainId: {}", e)))?;
-
-			let token_str = output
-				.get("token")
-				.and_then(|v| v.as_str())
-				.ok_or_else(|| QuoteError::InvalidRequest("Missing token in output".to_string()))?;
-			let token = FixedBytes::<32>::from_str(token_str)
-				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid token: {}", e)))?;
-
-			let amount_str = output
-				.get("amount")
-				.and_then(|v| v.as_str())
-				.ok_or_else(|| {
-					QuoteError::InvalidRequest("Missing amount in output".to_string())
-				})?;
-			let amount = Uint::<256, 4>::from_str(amount_str)
-				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {}", e)))?;
-
-			let recipient_str = output
-				.get("recipient")
-				.and_then(|v| v.as_str())
-				.ok_or_else(|| {
-					QuoteError::InvalidRequest("Missing recipient in output".to_string())
-				})?;
-			let recipient = FixedBytes::<32>::from_str(recipient_str)
-				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid recipient: {}", e)))?;
-
-			let call_str = output.get("call").and_then(|v| v.as_str()).unwrap_or("0x");
-			let call = if call_str == "0x" {
-				alloy_primitives::Bytes::new()
-			} else {
-				alloy_primitives::Bytes::from(
-					alloy_primitives::hex::decode(&call_str[2..]).map_err(|e| {
-						QuoteError::InvalidRequest(format!("Invalid call data: {}", e))
-					})?,
-				)
-			};
-
-			let context_str = output
-				.get("context")
-				.and_then(|v| v.as_str())
-				.unwrap_or("0x");
-			let context = if context_str == "0x" {
-				alloy_primitives::Bytes::new()
-			} else {
-				alloy_primitives::Bytes::from(
-					alloy_primitives::hex::decode(&context_str[2..]).map_err(|e| {
-						QuoteError::InvalidRequest(format!("Invalid context data: {}", e))
-					})?,
-				)
-			};
-
-			outputs.push(MandateOutput {
-				oracle,
-				settler,
-				chainId: chain_id,
-				token,
-				amount,
-				recipient,
-				call,
-				context,
-			});
-		}
-
-		// Build the StandardOrder
-		let standard_order = OifStandardOrder {
-			user: sponsor,
-			nonce,
-			originChainId: Uint::<256, 4>::from(input_chain_id),
-			expires,
-			fillDeadline: fill_deadline,
-			inputOracle: input_oracle,
-			inputs,
-			outputs,
-		};
-
-		// Encode the order to use with the compact module
-		let order_bytes = OifStandardOrder::abi_encode(&standard_order);
-
-		// Use the same contract address logic as the signature validator
-		let contract_address = {
-			let addr = network
-				.input_settler_compact_address
-				.clone()
-				.unwrap_or_else(|| network.input_settler_address.clone());
-			AlloyAddress::from_slice(&addr.0)
-		};
-
-		// Use the existing compact module to compute the message hash
-		let struct_hash = compact::compute_batch_compact_hash(&order_bytes, contract_address)
-			.map_err(|e| {
-				QuoteError::InvalidRequest(format!("Failed to compute batch compact hash: {}", e))
-			})?;
-
-		// Get domain separator from TheCompact contract
-		let the_compact_address = network.the_compact_address.as_ref().ok_or_else(|| {
-			QuoteError::InvalidRequest("TheCompact address not configured".to_string())
-		})?;
-		let domain_separator =
-			get_domain_separator(&self.delivery_service, the_compact_address, input_chain_id)
-				.await
-				.map_err(|e| {
-					QuoteError::InvalidRequest(format!("Failed to get domain separator: {}", e))
-				})?;
-
-		// Compute final EIP-712 digest
-		let digest_data = [&[0x19, 0x01][..], &domain_separator[..], &struct_hash[..]].concat();
-		let final_digest = keccak256(&digest_data);
-
-		Ok(final_digest.into())
-	}
 
 	fn get_lock_domain_address(
 		&self,
