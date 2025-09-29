@@ -10,7 +10,7 @@ include = [
 [solver]
 id = "oif-solver-demo"
 monitoring_timeout_minutes = 5
-min_profitability_pct = 1.0
+min_profitability_pct = -1.0
 
 # ============================================================================
 # STORAGE
@@ -42,6 +42,7 @@ private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff8
 # ============================================================================
 [delivery]
 min_confirmations = 1
+transaction_poll_interval_seconds = 3
 
 [delivery.implementations.evm_alloy]
 network_ids = [31337, 31338]
@@ -77,7 +78,7 @@ max_gas_price_gwei = 100
 # PRICING
 # ============================================================================
 [pricing]
-primary = "coingecko"
+primary = "mock"
 
 [pricing.implementations.mock]
 # Uses default ETH/USD price of 4615.16
@@ -97,6 +98,7 @@ TOKB = "195.00"
 # SETTLEMENT
 # ============================================================================
 [settlement]
+settlement_poll_interval_seconds = 3
 
 [settlement.domain]
 chain_id = 1
