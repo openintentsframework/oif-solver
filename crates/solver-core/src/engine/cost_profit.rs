@@ -11,10 +11,11 @@ use rust_decimal::Decimal;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
 use solver_pricing::PricingService;
+use solver_storage::StorageService;
 use solver_types::{
 	costs::{CostBreakdown, CostContext},
 	current_timestamp, APIError, Address, ApiErrorType, ExecutionParams, FillProof, Order,
-	OrderInput, OrderOutput, Transaction, TransactionHash, DEFAULT_GAS_PRICE_WEI,
+	OrderInput, OrderOutput, StorageKey, Transaction, TransactionHash, DEFAULT_GAS_PRICE_WEI,
 };
 use std::primitive::str;
 use std::{str::FromStr, sync::Arc};
@@ -30,6 +31,8 @@ pub enum CostProfitError {
 	Config(String),
 	#[error("Token manager error: {0}")]
 	TokenManager(#[from] TokenManagerError),
+	#[error("Storage error: {0}")]
+	Storage(#[from] solver_storage::StorageError),
 }
 
 /// Parameters for gas unit calculations
@@ -47,6 +50,8 @@ pub struct CostProfitService {
 	delivery_service: Arc<DeliveryService>,
 	/// Token manager for token configuration lookups
 	token_manager: Arc<TokenManager>,
+	/// Storage service for reading quotes
+	storage_service: Arc<StorageService>,
 }
 
 impl CostProfitService {
@@ -55,11 +60,41 @@ impl CostProfitService {
 		pricing_service: Arc<PricingService>,
 		delivery_service: Arc<DeliveryService>,
 		token_manager: Arc<TokenManager>,
+		storage_service: Arc<StorageService>,
 	) -> Self {
 		Self {
 			pricing_service,
 			delivery_service,
 			token_manager,
+			storage_service,
+		}
+	}
+
+	/// Retrieves a stored cost context by quote ID.
+	///
+	/// This function looks up the cost context associated with a quote.
+	/// Cost contexts are automatically expired based on their TTL.
+	pub async fn get_cost_context_by_quote_id(
+		&self,
+		quote_id: &str,
+	) -> Result<CostContext, CostProfitError> {
+		match self
+			.storage_service
+			.retrieve::<CostContext>(StorageKey::CostContexts.as_str(), quote_id)
+			.await
+		{
+			Ok(cost_context) => {
+				tracing::debug!("Retrieved cost context for quote {} from storage", quote_id);
+				Ok(cost_context)
+			},
+			Err(e) => {
+				tracing::warn!(
+					"Failed to retrieve cost context for quote {}: {}",
+					quote_id,
+					e
+				);
+				Err(CostProfitError::Storage(e))
+			},
 		}
 	}
 
@@ -338,12 +373,22 @@ impl CostProfitService {
 		// Pre-calculate cost amounts in relevant tokens
 		// Include min_profit for quotes so users know the total they need to provide
 		let total_with_profit = cost_breakdown.total + cost_breakdown.min_profit;
+
+		// Add a rounding buffer to account for precision loss in token conversions
+		// This ensures that after converting USD -> tokens -> USD, we don't lose the profit margin
+		// Use the greater of: 0.1% or $0.01 (to handle both small and large amounts)
+		let percentage_buffer_bps = Decimal::new(10, 0); // 0.1% = 10 basis points
+		let percentage_buffer = (total_with_profit * percentage_buffer_bps) / Decimal::from(10000);
+		let minimum_buffer = Decimal::new(1, 2); // $0.01 minimum buffer
+		let rounding_buffer = percentage_buffer.max(minimum_buffer);
+		let total_with_profit_and_buffer = total_with_profit + rounding_buffer;
+
 		let mut cost_amounts_in_tokens = std::collections::HashMap::new();
 
 		// Calculate cost in each requested input token
 		for input in inputs {
 			let cost_in_token = self
-				.convert_usd_to_token_amount(total_with_profit, &input.asset)
+				.convert_usd_to_token_amount(total_with_profit_and_buffer, &input.asset)
 				.await
 				.unwrap_or(U256::ZERO);
 			cost_amounts_in_tokens.insert(input.asset.clone(), cost_in_token);
@@ -354,7 +399,7 @@ impl CostProfitService {
 			// Only add if not already calculated (in case same token appears in inputs)
 			if !cost_amounts_in_tokens.contains_key(&output.asset) {
 				let cost_in_token = self
-					.convert_usd_to_token_amount(total_with_profit, &output.asset)
+					.convert_usd_to_token_amount(total_with_profit_and_buffer, &output.asset)
 					.await
 					.unwrap_or(U256::ZERO);
 				cost_amounts_in_tokens.insert(output.asset.clone(), cost_in_token);
@@ -547,30 +592,84 @@ impl CostProfitService {
 	/// This method checks if an order (whether from our quote system or submitted directly)
 	/// provides sufficient profit margin. It recalculates costs and compares actual profit
 	/// against the minimum requirement.
+	///
+	/// If `quote_id` is provided, the quote will be retrieved from storage to get additional context.
 	pub async fn validate_profitability(
 		&self,
 		order: &Order,
 		cost_breakdown: &CostBreakdown,
 		min_profitability_pct: Decimal,
+		quote_id: Option<&str>,
 	) -> Result<Decimal, APIError> {
-		// Parse the order to get actual inputs/outputs
-		let parsed_order = order
-			.parse_order_data()
-			.map_err(|e| APIError::InternalServerError {
+		// Parse the order to get actual input/output amounts
+		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
+			error_type: ApiErrorType::InvalidRequest,
+			message: format!("Failed to parse order data: {}", e),
+			details: None,
+		})?;
+
+		let available_inputs = order_parsed.parse_available_inputs();
+		let requested_outputs = order_parsed.parse_requested_outputs();
+
+		// Retrieve the cost context if a quote ID is provided
+		let cost_context = if let Some(id) = quote_id {
+			match self.get_cost_context_by_quote_id(id).await {
+				Ok(ctx) => {
+					tracing::info!(
+						"Retrieved cost context for quote {}: total_cost=${:.2} min_profit=${:.2}",
+						id,
+						ctx.cost_breakdown.total,
+						ctx.cost_breakdown.min_profit
+					);
+					tracing::debug!(
+						"Cost context from quote generation: operational_cost=${:.2}, min_profit=${:.2}, total=${:.2}",
+						ctx.cost_breakdown.operational_cost,
+						ctx.cost_breakdown.min_profit,
+						ctx.cost_breakdown.total
+					);
+					Some(ctx)
+				},
+				Err(e) => {
+					tracing::warn!("Failed to retrieve cost context for quote {}: {}", id, e);
+					None
+				},
+			}
+		} else {
+			None
+		};
+
+		println!("QUOTE cost_context: {:?}", cost_context);
+
+		// Use market values from cost context - required for accurate profitability validation
+		let (market_input_value, market_output_value) = if let Some(ref ctx) = cost_context {
+			tracing::debug!(
+				"Using market values from cost context: input=${:.2}, output=${:.2}",
+				ctx.cost_breakdown.market_input_value,
+				ctx.cost_breakdown.market_output_value
+			);
+			(
+				ctx.cost_breakdown.market_input_value,
+				ctx.cost_breakdown.market_output_value,
+			)
+		} else {
+			tracing::error!(
+				"Cost context not available for quote_id {:?} - cannot validate profitability without market values",
+				quote_id
+			);
+			return Err(APIError::InternalServerError {
 				error_type: ApiErrorType::InternalError,
-				message: format!("Failed to parse order data: {}", e),
-			})?;
+				message: "Cost context with market values is required for profitability validation"
+					.to_string(),
+			});
+		};
 
-		let available_inputs = parsed_order.parse_available_inputs();
-		let requested_outputs = parsed_order.parse_requested_outputs();
-
-		// Calculate total input and output values in USD using helpers
+		// Calculate actual USD values from the order amounts
 		let total_input_value_usd = self
 			.calculate_inputs_usd_value(&available_inputs)
 			.await
 			.map_err(|e| APIError::InternalServerError {
 				error_type: ApiErrorType::InternalError,
-				message: format!("Failed to calculate input value: {}", e),
+				message: format!("Failed to calculate input USD value: {}", e),
 			})?;
 
 		let total_output_value_usd = self
@@ -578,17 +677,17 @@ impl CostProfitService {
 			.await
 			.map_err(|e| APIError::InternalServerError {
 				error_type: ApiErrorType::InternalError,
-				message: format!("Failed to calculate output value: {}", e),
+				message: format!("Failed to calculate output USD value: {}", e),
 			})?;
 
 		// Operational cost is already available in the breakdown
 		let operational_cost_usd = cost_breakdown.operational_cost;
 
-		// Calculate the spread between input and output
-		let spread = total_input_value_usd - total_output_value_usd;
+		// Calculate the actual spread in the order (input - output at current market prices)
+		let order_spread = total_input_value_usd - total_output_value_usd;
 
-		// Actual profit is what's left after covering operational costs
-		let actual_profit_usd = spread - operational_cost_usd;
+		// Actual profit is the spread minus operational costs
+		let actual_profit_usd = order_spread - operational_cost_usd;
 
 		// Calculate profit margin as percentage of transaction value (max of input/output)
 		// This must match the calculation used during quote generation
@@ -620,11 +719,15 @@ impl CostProfitService {
 		// Log comprehensive cost, value and profitability analysis
 		tracing::info!(
 			"\n\
-			╭─ Transaction Values (Order):\n\
+			╭─ Market Values (Quote Time):\n\
+			│  ├─ Input (Market):     $ {:>7.2}\n\
+			│  ├─ Output (Market):    $ {:>7.2}\n\
+			│  └─ Market Spread:      $ {:>7.2}\n\
+			├─ Transaction Values (Order):\n\
 			│  ├─ Input Amount:       $ {:>7.2}{}\n\
 			│  ├─ Output Amount:      $ {:>7.2}{}\n\
 			│  ├─ {}:  $ {:>7.2} (costs: ${:.2} + profit: ${:.2})\n\
-			│  ├─ Spread:             $ {:>7.2} {}\n\
+			│  ├─ Order Spread:       $ {:>7.2} {}\n\
 			│  └─ Exchange Rate:      • {:>7.2} (out/in)\n\
 			├─ Cost Breakdown:\n\
 			│  ├─ Gas Costs:\n\
@@ -648,7 +751,11 @@ impl CostProfitService {
 			│  ├─ Min Required:       % {:>7.2}\n\
 			│  └─ Status:              {}\n\
 			╰─ Decision: {}",
-			// Transaction values
+			// Market values (from quote time)
+			market_input_value,
+			market_output_value,
+			market_input_value - market_output_value,
+			// Transaction values (from order)
 			total_input_value_usd,
 			input_note,
 			total_output_value_usd,
@@ -779,7 +886,12 @@ impl CostProfitService {
 
 		// Validate profitability
 		let actual_profit_margin = self
-			.validate_profitability(order, &cost_estimate, config.solver.min_profitability_pct)
+			.validate_profitability(
+				order,
+				&cost_estimate,
+				config.solver.min_profitability_pct,
+				order.quote_id.as_deref(),
+			)
 			.await?;
 
 		tracing::info!(

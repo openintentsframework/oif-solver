@@ -47,10 +47,11 @@ pub struct CostBreakdown {
 }
 
 /// Cost context for quote generation with pre-calculated costs and swap amounts
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostContext {
 	pub cost_breakdown: CostBreakdown,
 	pub execution_costs_by_chain: HashMap<u64, Decimal>,
+	#[serde(with = "rust_decimal::serde::str")]
 	pub liquidity_cost_adjustment: Decimal,
 	pub protocol_fees: HashMap<String, Decimal>,
 	/// Pre-calculated token amounts for costs (token address -> amount in smallest unit)
