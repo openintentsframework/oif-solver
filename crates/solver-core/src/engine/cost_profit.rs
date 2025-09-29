@@ -581,9 +581,11 @@ impl CostProfitService {
 		// Actual profit is what's left after covering operational costs
 		let actual_profit_usd = spread - operational_cost_usd;
 
-		// Calculate profit margin as percentage of transaction value (max of input/output)
-		// This must match the calculation used during quote generation
-		let transaction_value = total_input_value_usd.max(total_output_value_usd);
+		// Calculate profit margin as percentage of transaction value
+		// For ExactOutput: costs are added to input, so output is the base transaction value
+		// For ExactInput: costs are subtracted from output, so input is the base transaction value
+		// Use the smaller of the two as it represents the base value before cost adjustments
+		let transaction_value = total_input_value_usd.min(total_output_value_usd);
 		if transaction_value.is_zero() {
 			return Err(APIError::BadRequest {
 				error_type: ApiErrorType::InvalidRequest,
