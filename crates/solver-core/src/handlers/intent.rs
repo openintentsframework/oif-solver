@@ -144,15 +144,6 @@ impl IntentHandler {
 			.await
 		{
 			Ok(order) => {
-				// Log quoteId if present for tracking
-				if let Some(quote_id) = &order.quote_id {
-					tracing::info!(
-						order_id = %truncate_id(&order.id),
-						quote_id = %quote_id,
-						"Processing order with associated quote"
-					);
-				}
-
 				// Calculate cost estimation and validate profitability
 				let cost_estimate = match self
 					.cost_profit_service

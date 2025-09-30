@@ -8,15 +8,16 @@
 use crate::engine::token_manager::{TokenManager, TokenManagerError};
 use alloy_primitives::U256;
 use rust_decimal::Decimal;
-use rust_decimal::RoundingStrategy;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
 use solver_pricing::PricingService;
 use solver_storage::StorageService;
 use solver_types::{
-	costs::{CostBreakdown, CostContext},
-	current_timestamp, APIError, Address, ApiErrorType, ExecutionParams, FillProof, Order,
-	OrderInput, OrderOutput, StorageKey, Transaction, TransactionHash, DEFAULT_GAS_PRICE_WEI,
+	costs::{CostBreakdown, CostContext, TokenAmountInfo},
+	current_timestamp,
+	utils::conversion::ceil_dp,
+	APIError, Address, ApiErrorType, ExecutionParams, FillProof, InteropAddress, Order, OrderInput,
+	OrderOutput, StorageKey, SwapType, Transaction, TransactionHash, DEFAULT_GAS_PRICE_WEI,
 };
 use std::primitive::str;
 use std::{str::FromStr, sync::Arc};
@@ -41,21 +42,6 @@ pub struct GasUnits {
 	pub open_units: u64,
 	pub fill_units: u64,
 	pub claim_units: u64,
-}
-
-/// 10^dp as Decimal
-fn pow10(dp: u32) -> Decimal {
-	let mut f = Decimal::ONE;
-	for _ in 0..dp {
-		f *= Decimal::from(10);
-	}
-	f
-}
-
-/// Ceiling to `dp` decimals.
-fn ceil_dp(x: Decimal, dp: u32) -> Decimal {
-	let f = pow10(dp);
-	(x * f).round_dp_with_strategy(0, RoundingStrategy::ToPositiveInfinity) / f
 }
 
 /// Unified service for cost estimation and profitability calculation.
@@ -88,24 +74,29 @@ impl CostProfitService {
 
 	/// Retrieves a stored cost context by quote ID.
 	///
-	/// This function looks up the cost context associated with a quote.
-	/// Cost contexts are automatically expired based on their TTL.
+	/// This function looks up the QuoteWithCostContext and extracts the cost context.
+	/// Quotes and their contexts are automatically expired based on their TTL.
 	pub async fn get_cost_context_by_quote_id(
 		&self,
 		quote_id: &str,
 	) -> Result<CostContext, CostProfitError> {
+		use solver_types::QuoteWithCostContext;
+
 		match self
 			.storage_service
-			.retrieve::<CostContext>(StorageKey::CostContexts.as_str(), quote_id)
+			.retrieve::<QuoteWithCostContext>(StorageKey::Quotes.as_str(), quote_id)
 			.await
 		{
-			Ok(cost_context) => {
-				tracing::debug!("Retrieved cost context for quote {} from storage", quote_id);
-				Ok(cost_context)
+			Ok(quote_with_context) => {
+				tracing::debug!(
+					"Retrieved quote with cost context for {} from storage",
+					quote_id
+				);
+				Ok(quote_with_context.cost_context)
 			},
 			Err(e) => {
 				tracing::warn!(
-					"Failed to retrieve cost context for quote {}: {}",
+					"Failed to retrieve quote with cost context for {}: {}",
 					quote_id,
 					e
 				);
@@ -155,7 +146,11 @@ impl CostProfitService {
 		&self,
 		request: &solver_types::GetQuoteRequest,
 		context: &solver_types::ValidatedQuoteContext,
-	) -> Result<std::collections::HashMap<solver_types::InteropAddress, U256>, CostProfitError> {
+		decimals_map: &std::collections::HashMap<InteropAddress, u8>,
+	) -> Result<
+		std::collections::HashMap<solver_types::InteropAddress, TokenAmountInfo>,
+		CostProfitError,
+	> {
 		use solver_types::SwapType;
 		let mut calculated_amounts = std::collections::HashMap::new();
 
@@ -221,7 +216,15 @@ impl CostProfitService {
 						let output_amount = self
 							.convert_usd_to_token_amount(final_output_usd, &output.asset)
 							.await?;
-						calculated_amounts.insert(output.asset.clone(), output_amount);
+						let decimals = decimals_map.get(&output.asset).copied().unwrap_or(18);
+						calculated_amounts.insert(
+							output.asset.clone(),
+							TokenAmountInfo {
+								token: output.asset.clone(),
+								amount: output_amount,
+								decimals,
+							},
+						);
 					}
 				}
 			},
@@ -286,7 +289,15 @@ impl CostProfitService {
 						let input_amount = self
 							.convert_usd_to_token_amount(final_input_usd, &input.asset)
 							.await?;
-						calculated_amounts.insert(input.asset.clone(), input_amount);
+						let decimals = decimals_map.get(&input.asset).copied().unwrap_or(18);
+						calculated_amounts.insert(
+							input.asset.clone(),
+							TokenAmountInfo {
+								token: input.asset.clone(),
+								amount: input_amount,
+								decimals,
+							},
+						);
 					}
 				}
 			},
@@ -301,6 +312,50 @@ impl CostProfitService {
 		Ok(calculated_amounts)
 	}
 
+	/// Helper function to get decimals for all tokens in a request
+	async fn get_all_token_decimals(
+		&self,
+		request: &solver_types::GetQuoteRequest,
+	) -> std::collections::HashMap<InteropAddress, u8> {
+		let mut decimals_map = std::collections::HashMap::new();
+
+		// Get decimals for all input tokens
+		for input in &request.intent.inputs {
+			if let (Ok(chain_id), Ok(eth_addr)) = (
+				input.asset.ethereum_chain_id(),
+				input.asset.ethereum_address(),
+			) {
+				let decimals = self
+					.token_manager
+					.get_token_info(chain_id, &Address(eth_addr.0.to_vec()))
+					.ok()
+					.map(|info| info.decimals)
+					.unwrap_or(18);
+				decimals_map.insert(input.asset.clone(), decimals);
+			}
+		}
+
+		// Get decimals for all output tokens
+		for output in &request.intent.outputs {
+			if !decimals_map.contains_key(&output.asset) {
+				if let (Ok(chain_id), Ok(eth_addr)) = (
+					output.asset.ethereum_chain_id(),
+					output.asset.ethereum_address(),
+				) {
+					let decimals = self
+						.token_manager
+						.get_token_info(chain_id, &Address(eth_addr.0.to_vec()))
+						.ok()
+						.map(|info| info.decimals)
+						.unwrap_or(18);
+					decimals_map.insert(output.asset.clone(), decimals);
+				}
+			}
+		}
+
+		decimals_map
+	}
+
 	/// Calculate cost context and swap amounts before quote generation
 	pub async fn calculate_cost_context(
 		&self,
@@ -308,8 +363,13 @@ impl CostProfitService {
 		context: &solver_types::ValidatedQuoteContext,
 		config: &Config,
 	) -> Result<CostContext, CostProfitError> {
-		// Calculate base swap amounts FIRST to fill in missing values
-		let swap_amounts = self.calculate_swap_amounts(request, context).await?;
+		// Get all token decimals upfront
+		let decimals_map = self.get_all_token_decimals(request).await;
+
+		// Calculate base swap amounts FIRST to fill in missing values (now returns TokenAmountInfo)
+		let swap_amounts_with_info = self
+			.calculate_swap_amounts(request, context, &decimals_map)
+			.await?;
 
 		// Use inputs and outputs from request
 		let inputs = &request.intent.inputs;
@@ -354,8 +414,8 @@ impl CostProfitService {
 			if let Ok(mut order_input) = <OrderInput>::try_from(input) {
 				// Fill in zero amounts with calculated swap amounts
 				if order_input.amount == U256::ZERO {
-					if let Some(calculated_amount) = swap_amounts.get(&input.asset) {
-						order_input.amount = *calculated_amount;
+					if let Some(calculated_info) = swap_amounts_with_info.get(&input.asset) {
+						order_input.amount = calculated_info.amount;
 					}
 				}
 				parsed_inputs.push(order_input);
@@ -367,15 +427,16 @@ impl CostProfitService {
 			if let Ok(mut order_output) = <OrderOutput>::try_from(output) {
 				// Fill in zero amounts with calculated swap amounts
 				if order_output.amount == U256::ZERO {
-					if let Some(calculated_amount) = swap_amounts.get(&output.asset) {
-						order_output.amount = *calculated_amount;
+					if let Some(calculated_info) = swap_amounts_with_info.get(&output.asset) {
+						order_output.amount = calculated_info.amount;
 					}
 				}
 				parsed_outputs.push(order_output);
 			}
 		}
 
-		let cost_breakdown = self
+		// First calculate base costs with swap amounts to determine operational costs
+		let base_cost_breakdown = self
 			.calculate_total_cost(
 				&parsed_inputs,
 				&parsed_outputs,
@@ -388,11 +449,11 @@ impl CostProfitService {
 
 		// Pre-calculate cost amounts in relevant tokens
 		// Include min_profit for quotes so users know the total they need to provide
-		let total_with_profit = cost_breakdown.total + cost_breakdown.min_profit;
+		let total_with_profit = base_cost_breakdown.total + base_cost_breakdown.min_profit;
 
 		// Ceil to cents to protect our margin during USD -> token -> USD round-trip
 		// This ensures we always collect enough to cover costs + min_profit after conversions
-		let total_with_profit_rounded = ceil_dp(total_with_profit, 2);
+		let total_with_profit_rounded = ceil_dp(total_with_profit, 3);
 
 		let mut cost_amounts_in_tokens = std::collections::HashMap::new();
 
@@ -402,7 +463,16 @@ impl CostProfitService {
 				.convert_usd_to_token_amount(total_with_profit_rounded, &input.asset)
 				.await
 				.unwrap_or(U256::ZERO);
-			cost_amounts_in_tokens.insert(input.asset.clone(), cost_in_token);
+
+			let decimals = decimals_map.get(&input.asset).copied().unwrap_or(18);
+			cost_amounts_in_tokens.insert(
+				input.asset.clone(),
+				TokenAmountInfo {
+					token: input.asset.clone(),
+					amount: cost_in_token,
+					decimals,
+				},
+			);
 		}
 
 		// Also calculate cost in each requested output token for reference
@@ -413,25 +483,100 @@ impl CostProfitService {
 					.convert_usd_to_token_amount(total_with_profit_rounded, &output.asset)
 					.await
 					.unwrap_or(U256::ZERO);
-				cost_amounts_in_tokens.insert(output.asset.clone(), cost_in_token);
+
+				let decimals = decimals_map.get(&output.asset).copied().unwrap_or(18);
+				cost_amounts_in_tokens.insert(
+					output.asset.clone(),
+					TokenAmountInfo {
+						token: output.asset.clone(),
+						amount: cost_in_token,
+						decimals,
+					},
+				);
 			}
 		}
 
-		// Build execution costs by chain from cost breakdown
+		// Build execution costs by chain from base cost breakdown
 		let mut execution_costs_by_chain = std::collections::HashMap::new();
 		execution_costs_by_chain.insert(
 			origin_chain_id,
-			cost_breakdown.gas_open + cost_breakdown.gas_claim,
+			base_cost_breakdown.gas_open + base_cost_breakdown.gas_claim,
 		);
-		execution_costs_by_chain.insert(dest_chain_id, cost_breakdown.gas_fill);
+		execution_costs_by_chain.insert(dest_chain_id, base_cost_breakdown.gas_fill);
+
+		// Calculate adjusted amounts (swap amounts +/- costs based on swap type)
+		let mut adjusted_amounts = std::collections::HashMap::new();
+		match context.swap_type {
+			SwapType::ExactInput => {
+				// For ExactInput: outputs are adjusted (swap_amount - cost)
+				for (token, swap_info) in &swap_amounts_with_info {
+					let cost_info = cost_amounts_in_tokens.get(token);
+					let cost_amount = cost_info.map(|c| c.amount).unwrap_or(U256::ZERO);
+					let adjusted = swap_info.amount.saturating_sub(cost_amount);
+					adjusted_amounts.insert(
+						token.clone(),
+						TokenAmountInfo {
+							token: token.clone(),
+							amount: adjusted,
+							decimals: swap_info.decimals,
+						},
+					);
+				}
+			},
+			SwapType::ExactOutput => {
+				// For ExactOutput: inputs are adjusted (swap_amount + cost)
+				for (token, swap_info) in &swap_amounts_with_info {
+					let cost_info = cost_amounts_in_tokens.get(token);
+					let cost_amount = cost_info.map(|c| c.amount).unwrap_or(U256::ZERO);
+					let adjusted = swap_info.amount.saturating_add(cost_amount);
+					adjusted_amounts.insert(
+						token.clone(),
+						TokenAmountInfo {
+							token: token.clone(),
+							amount: adjusted,
+							decimals: swap_info.decimals,
+						},
+					);
+				}
+			},
+		}
+
+		// Update the cost breakdown to reflect the actual quoted amounts
+		// This is simpler than recalculating everything and ensures consistency
+		let cost_breakdown = match context.swap_type {
+			SwapType::ExactInput => {
+				// For ExactInput: input stays same, output is reduced by costs
+				let adjusted_output_value = base_cost_breakdown.swap_output_value
+					- base_cost_breakdown.total
+					- base_cost_breakdown.min_profit;
+				CostBreakdown {
+					swap_input_value: base_cost_breakdown.swap_input_value,
+					swap_output_value: adjusted_output_value.max(Decimal::ZERO),
+					..base_cost_breakdown
+				}
+			},
+			SwapType::ExactOutput => {
+				// For ExactOutput: output stays same, input is increased by costs
+				let adjusted_input_value = base_cost_breakdown.swap_output_value
+					+ base_cost_breakdown.total
+					+ base_cost_breakdown.min_profit;
+				CostBreakdown {
+					swap_input_value: adjusted_input_value,
+					swap_output_value: base_cost_breakdown.swap_output_value,
+					..base_cost_breakdown
+				}
+			},
+		};
 
 		Ok(CostContext {
 			cost_breakdown,
 			execution_costs_by_chain,
 			liquidity_cost_adjustment: Decimal::ZERO,
 			protocol_fees: std::collections::HashMap::new(),
+			swap_type: context.swap_type.clone(),
 			cost_amounts_in_tokens,
-			swap_amounts,
+			swap_amounts: swap_amounts_with_info,
+			adjusted_amounts,
 		})
 	}
 
@@ -528,8 +673,8 @@ impl CostProfitService {
 			operational_cost,
 			subtotal,
 			total,
-			market_input_value: total_input_value_usd,
-			market_output_value: total_output_value_usd,
+			swap_input_value: total_input_value_usd,
+			swap_output_value: total_output_value_usd,
 			currency: "USD".to_string(),
 		})
 	}
@@ -540,15 +685,6 @@ impl CostProfitService {
 		order: &Order,
 		config: &Config,
 	) -> Result<CostBreakdown, CostProfitError> {
-		// Log quoteId if present for tracking
-		if let Some(quote_id) = &order.quote_id {
-			tracing::debug!(
-				order_id = %order.id,
-				quote_id = %quote_id,
-				"Order has associated quoteId"
-			);
-		}
-
 		// Parse the order data based on its standard
 		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::InvalidRequest,
@@ -612,26 +748,10 @@ impl CostProfitService {
 		min_profitability_pct: Decimal,
 		quote_id: Option<&str>,
 	) -> Result<Decimal, APIError> {
-		// Parse the order to get actual input/output amounts
-		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
-			error_type: ApiErrorType::InvalidRequest,
-			message: format!("Failed to parse order data: {}", e),
-			details: None,
-		})?;
-
-		let available_inputs = order_parsed.parse_available_inputs();
-		let requested_outputs = order_parsed.parse_requested_outputs();
-
 		// Retrieve the cost context if a quote ID is provided
 		let cost_context = if let Some(id) = quote_id {
 			match self.get_cost_context_by_quote_id(id).await {
 				Ok(ctx) => {
-					tracing::info!(
-						"Retrieved cost context for quote {}: total_cost=${:.2} min_profit=${:.2}",
-						id,
-						ctx.cost_breakdown.total,
-						ctx.cost_breakdown.min_profit
-					);
 					tracing::debug!(
 						"Cost context from quote generation: operational_cost=${:.2}, min_profit=${:.2}, total=${:.2}",
 						ctx.cost_breakdown.operational_cost,
@@ -649,30 +769,15 @@ impl CostProfitService {
 			None
 		};
 
-		println!("QUOTE cost_context: {:?}", cost_context);
+		// Parse the order to get actual input/output amounts
+		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
+			error_type: ApiErrorType::InvalidRequest,
+			message: format!("Failed to parse order data: {}", e),
+			details: None,
+		})?;
 
-		// Use market values from cost context - required for accurate profitability validation
-		let (market_input_value, market_output_value) = if let Some(ref ctx) = cost_context {
-			tracing::debug!(
-				"Using market values from cost context: input=${:.2}, output=${:.2}",
-				ctx.cost_breakdown.market_input_value,
-				ctx.cost_breakdown.market_output_value
-			);
-			(
-				ctx.cost_breakdown.market_input_value,
-				ctx.cost_breakdown.market_output_value,
-			)
-		} else {
-			tracing::error!(
-				"Cost context not available for quote_id {:?} - cannot validate profitability without market values",
-				quote_id
-			);
-			return Err(APIError::InternalServerError {
-				error_type: ApiErrorType::InternalError,
-				message: "Cost context with market values is required for profitability validation"
-					.to_string(),
-			});
-		};
+		let available_inputs = order_parsed.parse_available_inputs();
+		let requested_outputs = order_parsed.parse_requested_outputs();
 
 		// Calculate actual USD values from the order amounts
 		let total_input_value_usd = self
@@ -694,15 +799,37 @@ impl CostProfitService {
 		// Operational cost is already available in the breakdown
 		let operational_cost_usd = cost_breakdown.operational_cost;
 
-		// Calculate the actual spread in the order (input - output at current market prices)
+		// Calculate the actual spread in the order
+		// For normal swaps: spread = input - output (positive when user pays more than receives)
+		// For arbitrage: spread = input - output (negative when user receives more than pays)
 		let order_spread = total_input_value_usd - total_output_value_usd;
 
 		// Actual profit is the spread minus operational costs
+		// For normal swaps: profit comes from positive spread
+		// For arbitrage: we would lose money (negative spread means user profits, not us)
 		let actual_profit_usd = order_spread - operational_cost_usd;
 
-		// Calculate profit margin as percentage of transaction value (max of input/output)
-		// This must match the calculation used during quote generation
-		let transaction_value = total_input_value_usd.max(total_output_value_usd);
+		// Calculate profit margin as percentage of transaction value
+		// For ExactOutput swaps, we must use the output value as the base (what the user requested)
+		// For ExactInput swaps, we use the input value as the base
+		// This ensures consistency with how profit was calculated during quote generation
+		let transaction_value = if let Some(ref ctx) = cost_context {
+			match ctx.swap_type {
+				solver_types::SwapType::ExactOutput => {
+					// For ExactOutput: use output value as base (what user wants to receive)
+					total_output_value_usd
+				},
+				solver_types::SwapType::ExactInput => {
+					// For ExactInput: use input value as base (what user is sending)
+					total_input_value_usd
+				},
+			}
+		} else {
+			// No cost context (direct submission), use the larger value
+			// This maintains backward compatibility for non-quoted orders
+			total_input_value_usd.max(total_output_value_usd)
+		};
+
 		if transaction_value.is_zero() {
 			return Err(APIError::BadRequest {
 				error_type: ApiErrorType::InvalidRequest,
@@ -712,120 +839,89 @@ impl CostProfitService {
 		}
 
 		let actual_profit_margin = (actual_profit_usd / transaction_value) * Decimal::from(100);
+		let profit_validation_passed = actual_profit_margin >= min_profitability_pct;
 
 		// Calculate what the values would be at different stages
 		// Note: We're working backwards from the final quoted values
 		// Display the actual minimum profit requirement from cost breakdown
-		let display_min_profit = cost_breakdown.min_profit;
 		let display_actual_profit = actual_profit_usd;
-		let total_adjustments = cost_breakdown.total + display_actual_profit;
 
-		// Always show both labels for clarity
-		// One of them will apply depending on whether it's ExactInput or ExactOutput
-		let input_note = " (includes all additions)";
-		let output_note = " (includes all deductions)";
-		let adjustment_label = "Total Adjustments";
+		// Calculate effective exchange rate (what % of input value user receives)
+		let effective_rate_pct = if !total_input_value_usd.is_zero() {
+			(total_output_value_usd / total_input_value_usd * Decimal::from(100)).round_dp(1)
+		} else {
+			Decimal::ZERO
+		};
 
-		// Log comprehensive cost, value and profitability analysis
+		// For display: show the absolute spread amount (always positive)
+		// and indicate if it's a cost to user or an arbitrage opportunity
+		let display_spread = order_spread.abs();
+		let spread_type = if order_spread >= Decimal::ZERO {
+			"collected from user"
+		} else {
+			"arbitrage opportunity"
+		};
+
+		// Log streamlined profitability validation summary
 		tracing::info!(
 			"\n\
-			╭─ Market Values (Quote Time):\n\
-			│  ├─ Input (Market):     $ {:>7.2}\n\
-			│  ├─ Output (Market):    $ {:>7.2}\n\
-			│  └─ Market Spread:      $ {:>7.2}\n\
-			├─ Transaction Values (Order):\n\
-			│  ├─ Input Amount:       $ {:>7.2}{}\n\
-			│  ├─ Output Amount:      $ {:>7.2}{}\n\
-			│  ├─ {}:  $ {:>7.2} (costs: ${:.2} + profit: ${:.2})\n\
-			│  ├─ Order Spread:       $ {:>7.2} {}\n\
-			│  └─ Exchange Rate:      • {:>7.2} (out/in)\n\
+			╭─ Quote Validation Summary:\n\
+			│  ├─ Quote ID:           {}\n\
+			│  ├─ Swap Type:          {}\n\
+			│  └─ Effective Rate:     {:.1}%\n\
+			├─ Order Economics:\n\
+			│  ├─ Input:\n\
+			│  │  ├─ USD Value:       $ {:>7.2}\n\
+			│  ├─ Output:\n\
+			│  │  ├─ USD Value:       $ {:>7.2}\n\
+			│  └─ Spread:\n\
+			│     ├─ Amount:          $ {:>7.2} ({})\n\
+			│     └─ Solver P&L:      $ {:>7.2} (after ${:.2} costs)\n\
 			├─ Cost Breakdown:\n\
 			│  ├─ Gas Costs:\n\
 			│  │  ├─ Open:            $ {:>7.2}\n\
 			│  │  ├─ Fill:            $ {:>7.2}\n\
 			│  │  ├─ Claim:           $ {:>7.2}\n\
-			│  │  └─ Buffer:          $ {:>7.2} ({}%)\n\
-			│  ├─ Market Adjustments:\n\
-			│  │  ├─ Rate Buffer:     $ {:>7.2}\n\
-			│  │  └─ Base Price:      $ {:>7.2} {}\n\
-			│  ├─ Profit:\n\
-			│  │  ├─ Target:          $ {:>7.2} ({}%)\n\
-			│  │  └─ Actual:          $ {:>7.2}\n\
-			│  └─ Total Cost:         $ {:>7.2}\n\
-			├─ Profitability:\n\
-			│  ├─ Input Value:        $ {:>7.2}\n\
-			│  ├─ Output Value:      -$ {:>7.2}\n\
-			│  ├─ Operational Cost:  -$ {:>7.2}\n\
-			│  ├─ Net Profit:         $ {:>7.2}\n\
-			│  ├─ Profit Margin:      % {:>7.2}\n\
-			│  ├─ Min Required:       % {:>7.2}\n\
-			│  └─ Status:              {}\n\
+			│  │  └─ Buffer (10%):    $ {:>7.2}\n\
+			│  ├─ Total Operational:  $ {:>7.2}\n\
+			│  └─ Solver Profit:      $ {:>7.2} (target: {:.1}% of transaction)\n\
+			├─ Validation Result:\n\
+			│  ├─ Profit Margin:      {:.2}%\n\
+			│  ├─ Min Required:       {:.2}%\n\
+			│  └─ Status:             {}\n\
 			╰─ Decision: {}",
-			// Market values (from quote time)
-			market_input_value,
-			market_output_value,
-			market_input_value - market_output_value,
-			// Transaction values (from order)
+			// Quote info
+			quote_id.unwrap_or("N/A"),
+			if let Some(ref ctx) = cost_context {
+				format!("{:?}", ctx.swap_type)
+			} else {
+				"Unknown".to_string()
+			},
+			effective_rate_pct,
+			// Order values
 			total_input_value_usd,
-			input_note,
 			total_output_value_usd,
-			output_note,
-			adjustment_label,
-			total_adjustments,
-			cost_breakdown.total,
+			display_spread,
+			spread_type,
 			display_actual_profit,
-			(total_input_value_usd - total_output_value_usd).abs(),
-			if total_input_value_usd >= total_output_value_usd {
-				"(favorable)"
-			} else {
-				"(unfavorable)"
-			},
-			if !total_input_value_usd.is_zero() {
-				(total_output_value_usd / total_input_value_usd).round_dp(4)
-			} else {
-				Decimal::ZERO
-			},
+			operational_cost_usd,
 			// Cost breakdown
 			cost_breakdown.gas_open,
 			cost_breakdown.gas_fill,
 			cost_breakdown.gas_claim,
 			cost_breakdown.gas_buffer,
-			if cost_breakdown.gas_open + cost_breakdown.gas_fill + cost_breakdown.gas_claim
-				> Decimal::ZERO
-			{
-				((cost_breakdown.gas_buffer
-					/ (cost_breakdown.gas_open
-						+ cost_breakdown.gas_fill
-						+ cost_breakdown.gas_claim))
-					* Decimal::from(100))
-				.round_dp(1)
-			} else {
-				Decimal::ZERO
-			},
-			cost_breakdown.rate_buffer,
-			cost_breakdown.base_price,
-			if cost_breakdown.base_price > Decimal::ZERO {
-				"(negative spread)"
-			} else {
-				""
-			},
-			display_min_profit,
-			min_profitability_pct,
-			display_actual_profit,
-			cost_breakdown.total,
-			// Profitability calculation
-			total_input_value_usd,
-			total_output_value_usd,
 			operational_cost_usd,
-			actual_profit_usd,
+			display_actual_profit,
+			min_profitability_pct,
+			// Validation
 			actual_profit_margin,
 			min_profitability_pct,
-			if actual_profit_margin >= min_profitability_pct {
+			if profit_validation_passed {
 				"✓ PASSED"
 			} else {
 				"✗ FAILED"
 			},
-			if actual_profit_margin >= min_profitability_pct {
+			if profit_validation_passed {
 				format!(
 					"Order accepted with {:.2}% profit margin",
 					actual_profit_margin
@@ -839,7 +935,7 @@ impl CostProfitService {
 		);
 
 		// Check if actual profit meets minimum requirement
-		if actual_profit_margin < min_profitability_pct {
+		if !profit_validation_passed {
 			let error_msg = format!(
 				"Insufficient profit margin: {:.2}% < required {:.2}%",
 				actual_profit_margin, min_profitability_pct
@@ -859,60 +955,6 @@ impl CostProfitService {
 		}
 
 		Ok(actual_profit_margin)
-	}
-
-	/// Validates cost estimation and profitability for an already-validated order from API requests.
-	///
-	/// This method combines cost estimation and profitability validation specifically for API-originated orders,
-	/// returning APIError types that can be properly handled by the HTTP layer.
-	/// For internally discovered intents, use the individual methods or IntentHandler directly.
-	pub async fn validate_order_profitability_for_api(
-		&self,
-		order: &Order,
-		config: &Config,
-	) -> Result<(), APIError> {
-		use solver_types::truncate_id;
-
-		// Log quoteId if present
-		if let Some(quote_id) = &order.quote_id {
-			tracing::info!(
-				order_id = %truncate_id(&order.id),
-				quote_id = %quote_id,
-				"Validating profitability for order with associated quote"
-			);
-		}
-
-		// Calculate cost estimation
-		let cost_estimate =
-			self.estimate_cost_for_order(order, config)
-				.await
-				.map_err(|e| match e {
-					CostProfitError::Api(api_error) => api_error,
-					other => APIError::InternalServerError {
-						error_type: ApiErrorType::InternalError,
-						message: format!("Cost estimation failed: {}", other),
-					},
-				})?;
-
-		// Validate profitability
-		let actual_profit_margin = self
-			.validate_profitability(
-				order,
-				&cost_estimate,
-				config.solver.min_profitability_pct,
-				order.quote_id.as_deref(),
-			)
-			.await?;
-
-		tracing::info!(
-			order_id = %truncate_id(&order.id),
-			quote_id = ?order.quote_id,
-			margin = %actual_profit_margin,
-			cost = %cost_estimate.total,
-			"Order profitability validation successful for API request"
-		);
-
-		Ok(())
 	}
 
 	/// Estimate gas units with optional live estimation

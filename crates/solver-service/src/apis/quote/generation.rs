@@ -156,12 +156,12 @@ impl QuoteGenerator {
 
 				for output in adjusted.intent.outputs.iter_mut() {
 					// First set the base swap amount from our calculation
-					if let Some(base_amount) = cost_context.swap_amounts.get(&output.asset) {
+					if let Some(base_info) = cost_context.swap_amounts.get(&output.asset) {
 						// Get cost for this specific token
-						let cost_in_token = cost_context
+						let cost_amount = cost_context
 							.cost_amounts_in_tokens
 							.get(&output.asset)
-							.copied()
+							.map(|info| info.amount)
 							.unwrap_or(U256::ZERO);
 
 						// Apply full cost to first output, others get their base amount
@@ -172,12 +172,13 @@ impl QuoteGenerator {
 
 						let adjusted_amount = if is_first_output {
 							// First output bears the full cost
-							base_amount.saturating_sub(cost_in_token)
+							base_info.amount - cost_amount
 						} else {
 							// Other outputs get their base amount
-							*base_amount
+							base_info.amount
 						};
 
+						// Convert Decimal to string (already in smallest unit, no decimal places)
 						output.amount = Some(adjusted_amount.to_string());
 					}
 				}
@@ -191,12 +192,12 @@ impl QuoteGenerator {
 
 				for input in adjusted.intent.inputs.iter_mut() {
 					// First set the base swap amount from our calculation
-					if let Some(base_amount) = cost_context.swap_amounts.get(&input.asset) {
+					if let Some(base_info) = cost_context.swap_amounts.get(&input.asset) {
 						// Get cost for this specific token
-						let cost_in_token = cost_context
+						let cost_amount = cost_context
 							.cost_amounts_in_tokens
 							.get(&input.asset)
-							.copied()
+							.map(|info| info.amount)
 							.unwrap_or(U256::ZERO);
 
 						// Apply full cost to first input, others get their base amount
@@ -207,12 +208,13 @@ impl QuoteGenerator {
 
 						let adjusted_amount = if is_first_input {
 							// First input bears the full cost
-							base_amount + cost_in_token
+							base_info.amount + cost_amount
 						} else {
 							// Other inputs get their base amount
-							*base_amount
+							base_info.amount
 						};
 
+						// Convert Decimal to string (already in smallest unit, no decimal places)
 						input.amount = Some(adjusted_amount.to_string());
 					}
 				}

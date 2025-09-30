@@ -75,7 +75,10 @@ pub use validation::QuoteValidator;
 
 use solver_config::Config;
 use solver_core::SolverEngine;
-use solver_types::{CostContext, GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, StorageKey};
+use solver_types::{
+	CostContext, GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, QuoteWithCostContext,
+	StorageKey,
+};
 
 use std::time::Duration;
 use tracing::info;
@@ -145,8 +148,9 @@ pub async fn process_quote_request(
 	Ok(GetQuoteResponse { quotes })
 }
 
-/// Stores generated quotes and their cost contexts with TTL based on their valid_until timestamp.
+/// Stores generated quotes with their cost contexts.
 ///
+/// Each quote is stored together with its cost context as a QuoteWithCostContext structure.
 /// Storage errors are logged but do not fail the request.
 async fn store_quotes(solver: &SolverEngine, quotes: &[Quote], cost_context: &CostContext) {
 	let storage = solver.storage();
@@ -164,44 +168,34 @@ async fn store_quotes(solver: &SolverEngine, quotes: &[Quote], cost_context: &Co
 			Duration::from_secs(1)
 		};
 
-		// Store the quote
+		// Create combined structure with quote and cost context
+		let quote_with_context = QuoteWithCostContext {
+			quote: quote.clone(),
+			cost_context: cost_context.clone(),
+		};
+
+		// Store the combined structure in a single I/O operation
 		if let Err(e) = storage
 			.store_with_ttl(
 				StorageKey::Quotes.as_str(),
 				&quote.quote_id,
-				quote,
-				None, // No indexes needed for quotes
+				&quote_with_context,
+				None, // No indexes needed
 				Some(ttl),
 			)
 			.await
 		{
-			tracing::warn!("Failed to store quote {}: {}", quote.quote_id, e);
+			tracing::warn!(
+				"Failed to store quote with context {}: {}",
+				quote.quote_id,
+				e
+			);
 		} else {
 			tracing::debug!(
-				"Stored quote {} with TTL {:?} (valid_until: {})",
+				"Stored quote {} with cost context, TTL {:?} (valid_until: {})",
 				quote.quote_id,
 				ttl,
 				quote.valid_until
-			);
-		}
-
-		// Store the cost context with the same TTL
-		if let Err(e) = storage
-			.store_with_ttl(
-				StorageKey::CostContexts.as_str(),
-				&quote.quote_id,
-				cost_context,
-				None, // No indexes needed for cost contexts
-				Some(ttl),
-			)
-			.await
-		{
-			tracing::warn!("Failed to store cost context for quote {}: {}", quote.quote_id, e);
-		} else {
-			tracing::debug!(
-				"Stored cost context for quote {} with TTL {:?}",
-				quote.quote_id,
-				ttl
 			);
 		}
 	}
@@ -216,12 +210,12 @@ pub async fn get_quote_by_id(quote_id: &str, solver: &SolverEngine) -> Result<Qu
 	let storage = solver.storage();
 
 	match storage
-		.retrieve::<Quote>(StorageKey::Quotes.as_str(), quote_id)
+		.retrieve::<QuoteWithCostContext>(StorageKey::Quotes.as_str(), quote_id)
 		.await
 	{
-		Ok(quote) => {
+		Ok(quote_with_context) => {
 			tracing::debug!("Retrieved quote {} from storage", quote_id);
-			Ok(quote)
+			Ok(quote_with_context.quote)
 		},
 		Err(e) => {
 			tracing::warn!("Failed to retrieve quote {}: {}", quote_id, e);

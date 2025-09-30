@@ -413,7 +413,7 @@ impl QuoteValidator {
 			let amount = cost_context
 				.swap_amounts
 				.get(asset_addr)
-				.copied()
+				.map(|info| info.amount)
 				.unwrap_or_else(|| {
 					// Fallback to request amount if not in cost context
 					asset_info
@@ -476,7 +476,7 @@ impl QuoteValidator {
 			let amount = cost_context
 				.swap_amounts
 				.get(asset_addr)
-				.copied()
+				.map(|info| info.amount)
 				.unwrap_or_else(|| {
 					// Fallback to request amount if not in cost context
 					asset_info
@@ -555,7 +555,7 @@ impl QuoteValidator {
 						let cost_in_token = cost_context
 							.cost_amounts_in_tokens
 							.get(&output.asset)
-							.copied()
+							.map(|info| info.amount)
 							.unwrap_or(U256::ZERO);
 						output.amount.saturating_sub(cost_in_token)
 					} else {

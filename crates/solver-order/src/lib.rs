@@ -309,6 +309,7 @@ impl OrderService {
 	///
 	/// This method delegates to the appropriate standard implementation to validate
 	/// the order and compute its ID using the provided callback.
+	#[allow(clippy::too_many_arguments)]
 	pub async fn validate_and_create_order(
 		&self,
 		standard: &str,

@@ -16,8 +16,6 @@ pub enum StorageKey {
 	OrderByTxHash,
 	/// Key for storing quote data
 	Quotes,
-	/// Key for storing cost context data (per quote ID)
-	CostContexts,
 	/// Key for storing settlement message data (per implementation)
 	SettlementMessages,
 }
@@ -30,7 +28,6 @@ impl StorageKey {
 			StorageKey::Intents => "intents",
 			StorageKey::OrderByTxHash => "order_by_tx_hash",
 			StorageKey::Quotes => "quotes",
-			StorageKey::CostContexts => "cost_contexts",
 			StorageKey::SettlementMessages => "settlement_messages",
 		}
 	}
@@ -42,7 +39,6 @@ impl StorageKey {
 			Self::Intents,
 			Self::OrderByTxHash,
 			Self::Quotes,
-			Self::CostContexts,
 			Self::SettlementMessages,
 		]
 		.into_iter()
@@ -58,7 +54,6 @@ impl FromStr for StorageKey {
 			"intents" => Ok(Self::Intents),
 			"order_by_tx_hash" => Ok(Self::OrderByTxHash),
 			"quotes" => Ok(Self::Quotes),
-			"cost_contexts" => Ok(Self::CostContexts),
 			"settlement_messages" => Ok(Self::SettlementMessages),
 			_ => Err(()),
 		}
@@ -159,7 +154,7 @@ mod tests {
 		use std::collections::HashSet;
 
 		let strings: HashSet<&str> = StorageKey::all().map(|k| k.as_str()).collect();
-		assert_eq!(strings.len(), 5, "String representations should be unique");
+		assert_eq!(strings.len(), 4, "String representations should be unique");
 	}
 
 	#[test]
@@ -170,7 +165,7 @@ mod tests {
 		for key in StorageKey::all() {
 			assert!(set.insert(key)); // Should be unique
 		}
-		assert_eq!(set.len(), 5);
+		assert_eq!(set.len(), 4);
 
 		// Test equality
 		assert_eq!(StorageKey::Orders, StorageKey::Orders);
