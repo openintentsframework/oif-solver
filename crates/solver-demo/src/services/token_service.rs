@@ -53,7 +53,7 @@ impl TokenService {
 
 		let amount_bytes = amount.to_be_bytes::<32>();
 		let eth_amount = ethers::types::U256::from_big_endian(&amount_bytes);
-		
+
 		let receipt = self
 			.contract_manager
 			.send_transaction(
@@ -116,7 +116,11 @@ impl TokenService {
 		for chain_id in self.session_manager.get_chain_ids().await {
 			debug!("Checking balances on chain {}", chain_id);
 			if let Some(network) = self.session_manager.get_network_config(chain_id).await {
-				debug!("Found {} tokens for chain {}", network.contracts.tokens.len(), chain_id);
+				debug!(
+					"Found {} tokens for chain {}",
+					network.contracts.tokens.len(),
+					chain_id
+				);
 				for (symbol, token_info) in &network.contracts.tokens {
 					debug!("Checking token {} at {}", symbol, token_info.address);
 					if let Ok(addr) = token_info.address.parse::<Address>() {
@@ -133,7 +137,10 @@ impl TokenService {
 							},
 						}
 					} else {
-						debug!("Failed to parse token address for {}: {}", symbol, token_info.address);
+						debug!(
+							"Failed to parse token address for {}: {}",
+							symbol, token_info.address
+						);
 					}
 				}
 			} else {
@@ -232,10 +239,13 @@ impl BalanceReport {
 	}
 
 	pub fn add(&mut self, chain_id: u64, token: String, balance: U256, decimals: u8) {
-		self.balances
-			.entry(chain_id)
-			.or_default()
-			.insert(token, TokenBalance { amount: balance, decimals });
+		self.balances.entry(chain_id).or_default().insert(
+			token,
+			TokenBalance {
+				amount: balance,
+				decimals,
+			},
+		);
 	}
 
 	pub fn filter_chains(mut self, chains: Option<Vec<u64>>) -> Self {
@@ -265,7 +275,7 @@ impl BalanceReport {
 			if let Some(tokens) = self.balances.get(chain_id) {
 				let mut sorted_tokens: Vec<_> = tokens.iter().collect();
 				sorted_tokens.sort_by_key(|(token_name, _)| token_name.as_str());
-				
+
 				for (token, token_balance) in sorted_tokens {
 					rows.push(vec![
 						chain_id.to_string(),
@@ -283,4 +293,3 @@ impl BalanceReport {
 		self.balances.is_empty()
 	}
 }
-

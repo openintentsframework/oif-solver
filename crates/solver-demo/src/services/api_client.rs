@@ -6,7 +6,10 @@ use std::time::Duration;
 use tracing::{debug, info};
 
 use crate::services::JwtService;
-use solver_types::api::{GetQuoteRequest, GetQuoteResponse, PostOrderRequest, Quote};
+use solver_types::{
+	api::{GetQuoteRequest, GetQuoteResponse, PostOrderRequest, PostOrderResponse, Quote},
+	OriginSubmission,
+};
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -81,14 +84,21 @@ impl ApiClient {
 		&self,
 		quote: &Quote,
 		signature: String,
-	) -> Result<serde_json::Value> {
+	) -> Result<PostOrderResponse> {
 		info!("Submitting order for quote {}", quote.quote_id);
 
 		let url = format!("{}/api/orders", self.base_url);
-
-		// Convert quote and signature to PostOrderRequest
-		let post_order_request = PostOrderRequest::try_from((quote, signature.as_str(), "eip7683"))
-			.map_err(|e| anyhow!("Failed to create PostOrderRequest: {}", e))?;
+		let origin_submission: Option<OriginSubmission> = (&quote.order).into();
+		// Create new PostOrderRequest with structured order
+		let post_order_request = PostOrderRequest {
+			order: quote.order.clone(),
+			signature: vec![alloy_primitives::Bytes::from(
+				hex::decode(signature.trim_start_matches("0x"))
+					.map_err(|e| anyhow!("Invalid signature hex: {}", e))?,
+			)],
+			quote_id: Some(quote.quote_id.clone()),
+			origin_submission,
+		};
 
 		let mut req = self.client.post(&url).json(&post_order_request);
 
@@ -112,8 +122,8 @@ impl ApiClient {
 			));
 		}
 
-		// Return the full JSON response for flexibility
-		let order_response: serde_json::Value = response
+		// Parse PostOrderResponse
+		let order_response: PostOrderResponse = response
 			.json()
 			.await
 			.map_err(|e| anyhow!("Failed to parse order response: {}", e))?;
@@ -124,7 +134,7 @@ impl ApiClient {
 
 	/// Submit an intent directly without getting quotes
 	/// Note: This submits to /api/orders as a direct PostOrderRequest
-	pub async fn post_intent(&self, request: PostOrderRequest) -> Result<serde_json::Value> {
+	pub async fn post_intent(&self, request: PostOrderRequest) -> Result<PostOrderResponse> {
 		info!("Submitting intent directly to orders endpoint");
 
 		let url = format!("{}/api/orders", self.base_url);
@@ -151,7 +161,7 @@ impl ApiClient {
 		}
 
 		let result = response
-			.json::<serde_json::Value>()
+			.json::<PostOrderResponse>()
 			.await
 			.map_err(|e| anyhow!("Failed to parse intent response: {}", e))?;
 

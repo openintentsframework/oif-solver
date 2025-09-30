@@ -42,7 +42,7 @@ pub struct DeployerManager {
 	/// Provides access to RPC endpoints, chain configurations, account information,
 	/// and other session-specific settings required for deployment operations.
 	pub session_manager: Arc<SessionManager>,
-	
+
 	/// Collection of signing wallets keyed by chain ID.
 	///
 	/// Maintains per-chain LocalWallet instances configured with appropriate chain IDs

@@ -6,22 +6,10 @@ pub mod utils;
 
 // Re-export main types
 pub use core::{
-    SessionManager,
-    ContractManager,
-    DeployerManager,
-    AbiManager,
-    init_logging,
-    ProgressManager,
-    DisplayUtils,
+	init_logging, AbiManager, ContractManager, DeployerManager, DisplayUtils, ProgressManager,
+	SessionManager,
 };
 
-pub use models::{
-    SessionConfig,
-    Environment,
-    AccountInfo,
-    Intent,
-    Quote,
-    ContractArtifact,
-};
+pub use models::{AccountInfo, ContractArtifact, Environment, Intent, Quote, SessionConfig};
 
 pub use commands::Commands;

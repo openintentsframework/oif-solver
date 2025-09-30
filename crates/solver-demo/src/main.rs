@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
 					api_client.clone(),
 					signing_service.clone(),
 				)
-				.await?
+				.await?,
 			);
 
 			// Route to appropriate handler

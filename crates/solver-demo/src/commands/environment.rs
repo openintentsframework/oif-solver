@@ -82,7 +82,7 @@ impl EnvironmentHandler {
 
 	async fn status(&self) -> Result<()> {
 		use crate::core::TreeItem;
-		
+
 		let status = self.environment_service.get_status().await?;
 
 		// Display header
@@ -94,15 +94,16 @@ impl EnvironmentHandler {
 		self.display.header(env_type);
 
 		// Display session info
-		let env_mode = if self.session_manager.is_local().await { 
-			"local" 
-		} else { 
-			"production" 
+		let env_mode = if self.session_manager.is_local().await {
+			"local"
+		} else {
+			"production"
 		};
-		
-		self.display.tree("Session", vec![
-			TreeItem::Success(format!("Environment: {}", env_mode)),
-		]);
+
+		self.display.tree(
+			"Session",
+			vec![TreeItem::Success(format!("Environment: {}", env_mode))],
+		);
 
 		if status.chains.is_empty() {
 			self.display.line("No chains configured");
@@ -110,21 +111,23 @@ impl EnvironmentHandler {
 		}
 
 		// Display chains
-		let chain_items: Vec<TreeItem> = status.chains
+		let chain_items: Vec<TreeItem> = status
+			.chains
 			.iter()
 			.map(|chain| {
-				let status_text = if chain.is_running { "Running" } else { "Stopped" };
+				let status_text = if chain.is_running {
+					"Running"
+				} else {
+					"Stopped"
+				};
 				let dots = ".".repeat(10);
 				TreeItem::Text(format!(
 					"Chain {} {} {} [{}]",
-					chain.chain_id,
-					dots,
-					status_text,
-					chain.rpc_url
+					chain.chain_id, dots, status_text, chain.rpc_url
 				))
 			})
 			.collect();
-		
+
 		self.display.tree("Active Chains", chain_items);
 
 		Ok(())

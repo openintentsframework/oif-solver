@@ -116,22 +116,28 @@ impl SigningService {
 
 		// Determine the type of EIP-712 signature based on primary type
 		let (digest, signature_type) = match payload.primary_type.as_str() {
-			"ReceiveWithAuthorization" | "TransferWithAuthorization" | "CancelAuthorization" => {
-				(self.compute_eip3009_digest(payload)?, SignatureScheme::Eip3009)
-			}
-			"PermitBatchWitnessTransferFrom" | "PermitWitnessTransferFrom" => {
-				(self.compute_permit2_digest(payload)?, SignatureScheme::Permit2)
-			}
-			"BatchCompact" | "Compact" => {
-				(self.compute_compact_digest(payload)?, SignatureScheme::Compact)
-			}
+			"ReceiveWithAuthorization" | "TransferWithAuthorization" | "CancelAuthorization" => (
+				self.compute_eip3009_digest(payload)?,
+				SignatureScheme::Eip3009,
+			),
+			"PermitBatchWitnessTransferFrom" | "PermitWitnessTransferFrom" => (
+				self.compute_permit2_digest(payload)?,
+				SignatureScheme::Permit2,
+			),
+			"BatchCompact" | "Compact" => (
+				self.compute_compact_digest(payload)?,
+				SignatureScheme::Compact,
+			),
 			_ => {
 				// Generic EIP-712 handling
 				let typed_data = self.construct_typed_data(payload)?;
 				let domain_separator = self.compute_domain_separator(&typed_data.domain)?;
 				let struct_hash = self.compute_struct_hash(&typed_data)?;
-				(self.compute_eip712_digest(domain_separator, struct_hash)?, SignatureScheme::Generic)
-			}
+				(
+					self.compute_eip712_digest(domain_separator, struct_hash)?,
+					SignatureScheme::Generic,
+				)
+			},
 		};
 
 		let signature = wallet
@@ -139,7 +145,7 @@ impl SigningService {
 			.map_err(|e| anyhow!("Failed to sign digest: {}", e))?;
 
 		let sig_bytes = self.encode_signature(signature);
-		
+
 		// Add signature type prefix based on the scheme
 		let prefixed_signature = match signature_type {
 			SignatureScheme::Permit2 => {
@@ -147,17 +153,17 @@ impl SigningService {
 				let mut prefixed = vec![0x00];
 				prefixed.extend_from_slice(&sig_bytes);
 				prefixed
-			}
+			},
 			SignatureScheme::Eip3009 => {
 				// Prefix with 0x01 for EIP-3009
 				let mut prefixed = vec![0x01];
 				prefixed.extend_from_slice(&sig_bytes);
 				prefixed
-			}
+			},
 			SignatureScheme::Compact | SignatureScheme::Generic => {
 				// No prefix for Compact or generic signatures
 				sig_bytes
-			}
+			},
 		};
 
 		Ok(format!("0x{}", hex::encode(prefixed_signature)))
@@ -203,11 +209,11 @@ impl SigningService {
 			.map_err(|e| anyhow!("Failed to sign EIP-3009 digest: {}", e))?;
 
 		let sig_bytes = self.encode_signature(signature);
-		
+
 		// Prefix with 0x01 for EIP-3009 signatures
 		let mut prefixed = vec![0x01];
 		prefixed.extend_from_slice(&sig_bytes);
-		
+
 		Ok(format!("0x{}", hex::encode(prefixed)))
 	}
 
@@ -339,17 +345,20 @@ impl SigningService {
 	/// Computes the digest for EIP-3009 signatures.
 	fn compute_eip3009_digest(&self, payload: &OrderPayload) -> Result<[u8; 32]> {
 		// EIP-3009 domains don't have version field
-		let domain_type_hash = keccak256(
-			"EIP712Domain(string name,uint256 chainId,address verifyingContract)"
-		);
+		let domain_type_hash =
+			keccak256("EIP712Domain(string name,uint256 chainId,address verifyingContract)");
 
 		let domain = payload.domain.clone();
-		let name = domain["name"].as_str().ok_or_else(|| anyhow!("Missing domain name"))?;
-		let chain_id = domain["chainId"].as_str()
+		let name = domain["name"]
+			.as_str()
+			.ok_or_else(|| anyhow!("Missing domain name"))?;
+		let chain_id = domain["chainId"]
+			.as_str()
 			.and_then(|s| s.parse::<u64>().ok())
 			.or_else(|| domain["chainId"].as_u64())
 			.ok_or_else(|| anyhow!("Missing or invalid chainId"))?;
-		let verifying_contract = domain["verifyingContract"].as_str()
+		let verifying_contract = domain["verifyingContract"]
+			.as_str()
 			.ok_or_else(|| anyhow!("Missing verifyingContract"))?
 			.parse::<Address>()
 			.map_err(|e| anyhow!("Invalid verifyingContract: {}", e))?;
@@ -390,17 +399,20 @@ impl SigningService {
 	/// Computes the digest for Permit2 signatures.
 	fn compute_permit2_digest(&self, payload: &OrderPayload) -> Result<[u8; 32]> {
 		// Permit2 domains don't have version field
-		let domain_type_hash = keccak256(
-			"EIP712Domain(string name,uint256 chainId,address verifyingContract)"
-		);
+		let domain_type_hash =
+			keccak256("EIP712Domain(string name,uint256 chainId,address verifyingContract)");
 
 		let domain = payload.domain.clone();
-		let name = domain["name"].as_str().ok_or_else(|| anyhow!("Missing domain name"))?;
-		let chain_id = domain["chainId"].as_str()
+		let name = domain["name"]
+			.as_str()
+			.ok_or_else(|| anyhow!("Missing domain name"))?;
+		let chain_id = domain["chainId"]
+			.as_str()
 			.and_then(|s| s.parse::<u64>().ok())
 			.or_else(|| domain["chainId"].as_u64())
 			.ok_or_else(|| anyhow!("Missing or invalid chainId"))?;
-		let verifying_contract = domain["verifyingContract"].as_str()
+		let verifying_contract = domain["verifyingContract"]
+			.as_str()
 			.ok_or_else(|| anyhow!("Missing verifyingContract"))?
 			.parse::<Address>()
 			.map_err(|e| anyhow!("Invalid verifyingContract: {}", e))?;
@@ -425,17 +437,23 @@ impl SigningService {
 	fn compute_compact_digest(&self, payload: &OrderPayload) -> Result<[u8; 32]> {
 		// Compact domains have version field
 		let domain_type_hash = keccak256(
-			"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+			"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
 		);
 
 		let domain = payload.domain.clone();
-		let name = domain["name"].as_str().ok_or_else(|| anyhow!("Missing domain name"))?;
-		let version = domain["version"].as_str().ok_or_else(|| anyhow!("Missing domain version"))?;
-		let chain_id = domain["chainId"].as_str()
+		let name = domain["name"]
+			.as_str()
+			.ok_or_else(|| anyhow!("Missing domain name"))?;
+		let version = domain["version"]
+			.as_str()
+			.ok_or_else(|| anyhow!("Missing domain version"))?;
+		let chain_id = domain["chainId"]
+			.as_str()
 			.and_then(|s| s.parse::<u64>().ok())
 			.or_else(|| domain["chainId"].as_u64())
 			.ok_or_else(|| anyhow!("Missing or invalid chainId"))?;
-		let verifying_contract = domain["verifyingContract"].as_str()
+		let verifying_contract = domain["verifyingContract"]
+			.as_str()
 			.ok_or_else(|| anyhow!("Missing verifyingContract"))?
 			.parse::<Address>()
 			.map_err(|e| anyhow!("Invalid verifyingContract: {}", e))?;

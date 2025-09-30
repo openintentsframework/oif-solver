@@ -6,7 +6,7 @@ use tracing::info;
 
 use crate::core::{DisplayUtils, SessionManager};
 use crate::services::TokenService;
-use crate::utils::{parse_address, parse_amount_with_decimals};
+use crate::utils::{parse_address, parse_address_or_identifier, parse_amount_with_decimals};
 
 #[derive(Debug, Subcommand)]
 pub enum TokenCommands {
@@ -197,15 +197,11 @@ impl TokenHandler {
 		let amount = parse_amount_with_decimals(&amount_str, decimals)?;
 
 		// Parse recipient if provided
-		let recipient = if let Some(addr) = to {
-			Some(parse_address(&addr)?)
+		let recipient_addr = if let Some(addr) = to {
+			parse_address_or_identifier(&addr, &self.session_manager).await?
 		} else {
-			None
+			self.session_manager.get_user_account().await.address
 		};
-
-		let recipient_addr = recipient.unwrap_or_else(|| {
-			futures::executor::block_on(self.session_manager.get_user_account()).address
-		});
 
 		self.display.tree(
 			"Transaction Details",

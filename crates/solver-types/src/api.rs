@@ -259,14 +259,14 @@ impl From<&OifOrder> for Option<OriginSubmission> {
 			OifOrder::OifEscrowV0 { .. } => {
 				// Permit2 escrow orders
 				Some(OriginSubmission {
-					mode: OriginMode::Protocol,
+					mode: OriginMode::User,
 					schemes: Some(vec![AuthScheme::Permit2, AuthScheme::Erc20Permit]),
 				})
 			},
 			OifOrder::Oif3009V0 { .. } => {
 				// EIP-3009 orders
 				Some(OriginSubmission {
-					mode: OriginMode::Protocol,
+					mode: OriginMode::User,
 					schemes: Some(vec![AuthScheme::Eip3009]),
 				})
 			},

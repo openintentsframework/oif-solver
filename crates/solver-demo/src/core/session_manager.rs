@@ -926,15 +926,6 @@ impl SessionManager {
 		Ok(address)
 	}
 
-	/// Retrieves the user account's private key.
-	///
-	/// Returns the private key for the user account from the configuration.
-	/// This is typically used for onchain transaction signing.
-	pub async fn get_user_private_key(&self) -> Result<String> {
-		let config = self.load_config_for_env().await?;
-		Ok(config.accounts.user.private_key)
-	}
-
 	/// Retrieves the solver account's private key.
 	///
 	/// Extracts the private key from the configured account implementation

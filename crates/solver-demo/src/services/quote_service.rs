@@ -7,7 +7,10 @@ use std::time::Instant;
 use tokio::fs;
 use tracing::{debug, info, warn};
 
-use solver_types::api::{GetQuoteRequest, GetQuoteResponse};
+use solver_types::{
+	api::{GetQuoteRequest, GetQuoteResponse, PostOrderResponse},
+	OriginSubmission,
+};
 
 use crate::{
 	core::SessionManager,
@@ -30,8 +33,9 @@ impl QuoteService {
 		api_client: Arc<ApiClient>,
 		signing_service: Arc<SigningService>,
 	) -> Result<Self> {
-		let file_indexer = Arc::new(FileIndexer::new(session_manager.requests_dir().as_path()).await?);
-		
+		let file_indexer =
+			Arc::new(FileIndexer::new(session_manager.requests_dir().as_path()).await?);
+
 		Ok(Self {
 			session_manager,
 			api_client,
@@ -50,12 +54,11 @@ impl QuoteService {
 
 		// Use current intent index since intent build already created the files
 		let current_index = self.file_indexer.current_index("intent").await;
-		
+
 		// Determine file paths
 		let requests_dir = self.session_manager.requests_dir();
-		let response_file = output_file.unwrap_or_else(|| {
-			requests_dir.join(format!("{}.get_quote.res.json", current_index))
-		});
+		let response_file = output_file
+			.unwrap_or_else(|| requests_dir.join(format!("{}.get_quote.res.json", current_index)));
 
 		// Make API call using ApiClient
 		let quote_response = self
@@ -133,27 +136,22 @@ impl QuoteService {
 
 		// Get a new index for post_order request
 		let order_index = self.file_indexer.next_index("post_order").await?;
-		
+
 		// Create the post_order request file
 		let requests_dir = self.session_manager.requests_dir();
-		let order_request_file = output_file.unwrap_or_else(|| {
-			requests_dir.join(format!("{}.post_order.req.json", order_index))
-		});
-		
-		// Create a PostOrderRequest with structured Order data (EIP-712 typed data)
-		// Convert the Quote to a StandardOrder structure
-		use solver_types::standards::eip7683::interfaces::StandardOrder;
-		let standard_order = StandardOrder::try_from(quote)
-			.map_err(|e| anyhow!("Failed to convert quote to StandardOrder: {}", e))?;
-		
-		// Create the PostOrderRequest with structured data
+		let order_request_file = output_file
+			.unwrap_or_else(|| requests_dir.join(format!("{}.post_order.req.json", order_index)));
+		let origin_submission: Option<OriginSubmission> = (&quote.order).into();
+		// Create a PostOrderRequest with structured OifOrder
+		// Convert the Quote to OifOrder structure
+		// Create the PostOrderRequest JSON with new structure
 		let post_order_json = serde_json::json!({
-			"order": standard_order,  // EIP-712 typed data structure
-			"signature": final_signature,  // EIP-712 signature
+			"order": quote.order,  // Structured OifOrder with EIP-712 payload
+			"signature": final_signature,  // EIP-712 signature (will be wrapped in array by handler)
 			"quoteId": quote.quote_id,  // Optional quote identifier
-			"originSubmission": quote.origin_submission,  // Optional origin submission preference
+			"originSubmission": origin_submission,  // Optional origin submission preference
 		});
-		
+
 		if let Some(parent) = order_request_file.parent() {
 			fs::create_dir_all(parent).await?;
 		}
@@ -222,28 +220,31 @@ impl QuoteService {
 
 		// Get a new index for post_order
 		let order_index = self.file_indexer.next_index("post_order").await?;
-		
+
 		// Create the post_order request file with the signature
 		let requests_dir = self.session_manager.requests_dir();
 		let order_request_file = requests_dir.join(format!("{}.post_order.req.json", order_index));
-		
+
 		// Update request with actual signature
 		let order_request = serde_json::json!({
 			"quote_id": quote.quote_id,
 			"signature": final_signature,
 			"quote_index": selected_index,
 		});
-		
+
 		if let Some(parent) = order_request_file.parent() {
 			fs::create_dir_all(parent).await?;
 		}
 		let request_json = serde_json::to_string_pretty(&order_request)?;
 		fs::write(&order_request_file, request_json).await?;
-		debug!("Updated order request with signature at: {:?}", order_request_file);
-		
+		debug!(
+			"Updated order request with signature at: {:?}",
+			order_request_file
+		);
+
 		// Submit order to API
 		info!("Submitting order to API");
-		let api_response = self
+		let api_response: PostOrderResponse = self
 			.api_client
 			.submit_order(quote, final_signature.clone())
 			.await
@@ -252,9 +253,8 @@ impl QuoteService {
 		info!("Order submitted successfully");
 
 		// Save API response
-		let response_file = output_file.unwrap_or_else(|| {
-			requests_dir.join(format!("{}.post_order.res.json", order_index))
-		});
+		let response_file = output_file
+			.unwrap_or_else(|| requests_dir.join(format!("{}.post_order.res.json", order_index)));
 
 		// Save raw API response
 		if let Some(parent) = response_file.parent() {
@@ -264,7 +264,11 @@ impl QuoteService {
 		fs::write(&response_file, json).await?;
 		debug!("Saved order response to: {:?}", response_file);
 
-		Ok((api_response, response_file, selected_index))
+		// Convert PostOrderResponse to JSON for backward compatibility
+		let response_json = serde_json::to_value(&api_response)
+			.map_err(|e| anyhow!("Failed to serialize response: {}", e))?;
+
+		Ok((response_json, response_file, selected_index))
 	}
 
 	/// Test multiple intents from a batch file

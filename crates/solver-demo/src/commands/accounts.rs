@@ -38,35 +38,55 @@ impl AccountHandler {
 
 	async fn list(&self) -> Result<()> {
 		use crate::core::TreeItem;
-		
+
 		self.display.header("CONFIGURED ACCOUNTS");
 
 		// User account
 		let user = self.session_manager.get_user_account().await;
-		self.display.tree("User Account", vec![
-			TreeItem::KeyValue("Address".to_string(), user.address.to_string()),
-			TreeItem::KeyValue(
-				"Has Private Key".to_string(),
-				if user.private_key.is_some() { "✓" } else { "✗" }.to_string()
-			),
-		]);
+		self.display.tree(
+			"User Account",
+			vec![
+				TreeItem::KeyValue("Address".to_string(), user.address.to_string()),
+				TreeItem::KeyValue(
+					"Has Private Key".to_string(),
+					if user.private_key.is_some() {
+						"✓"
+					} else {
+						"✗"
+					}
+					.to_string(),
+				),
+			],
+		);
 
 		// Solver account
 		let solver = self.session_manager.get_solver_account().await;
-		self.display.tree("Solver Account", vec![
-			TreeItem::KeyValue("Address".to_string(), solver.address.to_string()),
-			TreeItem::KeyValue(
-				"Has Private Key".to_string(),
-				if solver.private_key.is_some() { "✓" } else { "✗" }.to_string()
-			),
-		]);
+		self.display.tree(
+			"Solver Account",
+			vec![
+				TreeItem::KeyValue("Address".to_string(), solver.address.to_string()),
+				TreeItem::KeyValue(
+					"Has Private Key".to_string(),
+					if solver.private_key.is_some() {
+						"✓"
+					} else {
+						"✗"
+					}
+					.to_string(),
+				),
+			],
+		);
 
 		// Recipient account (if different from user)
 		let recipient = self.session_manager.get_recipient_account().await;
 		if recipient.address != user.address {
-			self.display.tree("Recipient Account", vec![
-				TreeItem::KeyValue("Address".to_string(), recipient.address.to_string()),
-			]);
+			self.display.tree(
+				"Recipient Account",
+				vec![TreeItem::KeyValue(
+					"Address".to_string(),
+					recipient.address.to_string(),
+				)],
+			);
 		}
 
 		Ok(())
@@ -74,36 +94,56 @@ impl AccountHandler {
 
 	async fn info(&self, account: String) -> Result<()> {
 		use crate::core::TreeItem;
-		
+
 		match account.to_lowercase().as_str() {
 			"user" => {
 				let user = self.session_manager.get_user_account().await;
 				self.display.header("USER ACCOUNT DETAILS");
-				self.display.tree("Account Information", vec![
-					TreeItem::KeyValue("Address".to_string(), user.address.to_string()),
-					TreeItem::KeyValue(
-						"Has Private Key".to_string(),
-						if user.private_key.is_some() { "✓" } else { "✗" }.to_string()
-					),
-				]);
+				self.display.tree(
+					"Account Information",
+					vec![
+						TreeItem::KeyValue("Address".to_string(), user.address.to_string()),
+						TreeItem::KeyValue(
+							"Has Private Key".to_string(),
+							if user.private_key.is_some() {
+								"✓"
+							} else {
+								"✗"
+							}
+							.to_string(),
+						),
+					],
+				);
 			},
 			"solver" => {
 				let solver = self.session_manager.get_solver_account().await;
 				self.display.header("SOLVER ACCOUNT DETAILS");
-				self.display.tree("Account Information", vec![
-					TreeItem::KeyValue("Address".to_string(), solver.address.to_string()),
-					TreeItem::KeyValue(
-						"Has Private Key".to_string(),
-						if solver.private_key.is_some() { "✓" } else { "✗" }.to_string()
-					),
-				]);
+				self.display.tree(
+					"Account Information",
+					vec![
+						TreeItem::KeyValue("Address".to_string(), solver.address.to_string()),
+						TreeItem::KeyValue(
+							"Has Private Key".to_string(),
+							if solver.private_key.is_some() {
+								"✓"
+							} else {
+								"✗"
+							}
+							.to_string(),
+						),
+					],
+				);
 			},
 			"recipient" => {
 				let recipient = self.session_manager.get_recipient_account().await;
 				self.display.header("RECIPIENT ACCOUNT DETAILS");
-				self.display.tree("Account Information", vec![
-					TreeItem::KeyValue("Address".to_string(), recipient.address.to_string()),
-				]);
+				self.display.tree(
+					"Account Information",
+					vec![TreeItem::KeyValue(
+						"Address".to_string(),
+						recipient.address.to_string(),
+					)],
+				);
 			},
 			_ => {
 				self.display

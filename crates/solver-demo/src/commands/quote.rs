@@ -40,7 +40,6 @@ pub enum QuoteCommands {
 		quote_index: Option<usize>,
 	},
 
-
 	/// Test quotes for multiple intents
 	Test {
 		/// JSON file containing array of GetQuoteRequest objects
@@ -227,7 +226,6 @@ impl QuoteHandler {
 
 		Ok(())
 	}
-
 
 	async fn handle_test(&self, input_file: PathBuf, output_file: Option<PathBuf>) -> Result<()> {
 		info!("Testing batch quotes from file: {:?}", input_file);

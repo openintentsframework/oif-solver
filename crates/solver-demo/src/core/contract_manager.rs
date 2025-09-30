@@ -452,60 +452,12 @@ impl ContractManager {
 			client.clone(),
 		);
 
-		// Convert StandardOrder to ethers types
-		// This is a simplified version - you may need to adjust based on actual ABI
-		let order_tuple = (
-			ethers::types::H160::from_slice(order.sponsor.as_slice()),
-			ethers::types::U256::from(order.nonce),
-			ethers::types::U256::from(order.origin_chain_id),
-			order.expiry,
-			order.fill_deadline,
-			ethers::types::H160::from_slice(order.oracle.as_slice()),
-			// Convert inputs array
-			order
-				.inputs
-				.iter()
-				.map(|input| {
-					(
-						ethers::types::U256::from_big_endian(&input.token.to_be_bytes::<32>()),
-						ethers::types::U256::from_big_endian(&input.amount.to_be_bytes::<32>()),
-					)
-				})
-				.collect::<Vec<_>>(),
-			// Convert outputs array
-			order
-				.outputs
-				.iter()
-				.map(|output| {
-					// Convert addresses to bytes32 format (padded to 32 bytes)
-					let mut oracle_bytes = [0u8; 32];
-					oracle_bytes[12..].copy_from_slice(output.oracle.as_slice());
-
-					let mut token_bytes = [0u8; 32];
-					token_bytes[12..].copy_from_slice(output.token.as_slice());
-
-					let mut recipient_bytes = [0u8; 32];
-					recipient_bytes[12..].copy_from_slice(output.recipient.as_slice());
-
-					(
-						oracle_bytes,
-						oracle_bytes, // Using oracle as settler for now - adjust based on actual data
-						ethers::types::U256::from(output.chain_id),
-						token_bytes,
-						ethers::types::U256::from_big_endian(&output.amount.to_be_bytes::<32>()),
-						recipient_bytes,
-						vec![], // calldata
-						vec![], // signature
-					)
-				})
-				.collect::<Vec<_>>(),
-		);
-
-		// Call open function
+		// Convert to ethers-friendly tuple and call open
+		let order_args = Self::standard_order_to_ethers_args(order);
 		let method_call = contract
-			.method::<_, H256>("open", order_tuple)
+			.method::<_, H256>("open", order_args)
 			.map_err(|e| anyhow!("Failed to build open transaction: {}", e))?;
-		
+
 		let pending_tx = method_call
 			.send()
 			.await
@@ -525,5 +477,94 @@ impl ContractManager {
 		}
 
 		Ok(format!("{:?}", tx_hash))
+	}
+
+	#[allow(clippy::type_complexity)]
+	fn standard_order_to_ethers_args(
+		order: &solver_types::standards::eip7683::interfaces::StandardOrder,
+	) -> (
+		ethers::types::H160,
+		ethers::types::U256,
+		ethers::types::U256,
+		u32,
+		u32,
+		ethers::types::H160,
+		Vec<(ethers::types::U256, ethers::types::U256)>,
+		Vec<(
+			[u8; 32],
+			[u8; 32],
+			ethers::types::U256,
+			[u8; 32],
+			ethers::types::U256,
+			[u8; 32],
+			Vec<u8>,
+			Vec<u8>,
+		)>,
+	) {
+		let user = ethers::types::H160::from_slice(order.user.as_slice());
+		let nonce = ethers::types::U256::from_big_endian(&order.nonce.to_be_bytes::<32>());
+		let origin_chain_id =
+			ethers::types::U256::from_big_endian(&order.originChainId.to_be_bytes::<32>());
+		let expires = order.expires;
+		let fill_deadline = order.fillDeadline;
+		let input_oracle = ethers::types::H160::from_slice(order.inputOracle.as_slice());
+
+		let inputs = order
+			.inputs
+			.iter()
+			.map(|pair| {
+				(
+					ethers::types::U256::from_big_endian(&pair[0].to_be_bytes::<32>()),
+					ethers::types::U256::from_big_endian(&pair[1].to_be_bytes::<32>()),
+				)
+			})
+			.collect::<Vec<_>>();
+
+		let outputs = order
+			.outputs
+			.iter()
+			.map(|o| {
+				let mut oracle_bytes = [0u8; 32];
+				oracle_bytes.copy_from_slice(o.oracle.as_ref());
+
+				let mut settler_bytes = [0u8; 32];
+				settler_bytes.copy_from_slice(o.settler.as_ref());
+
+				let chain_id = ethers::types::U256::from_big_endian(&o.chainId.to_be_bytes::<32>());
+
+				let mut token_bytes = [0u8; 32];
+				token_bytes.copy_from_slice(o.token.as_ref());
+
+				let amount = ethers::types::U256::from_big_endian(&o.amount.to_be_bytes::<32>());
+
+				let mut recipient_bytes = [0u8; 32];
+				recipient_bytes.copy_from_slice(o.recipient.as_ref());
+
+				let call = o.call.as_ref().to_vec();
+				let context = o.context.as_ref().to_vec();
+
+				(
+					oracle_bytes,
+					settler_bytes,
+					chain_id,
+					token_bytes,
+					amount,
+					recipient_bytes,
+					call,
+					context,
+				)
+			})
+			.collect::<Vec<_>>();
+
+		(
+			user,
+			nonce,
+			origin_chain_id,
+			expires,
+			fill_deadline,
+			input_oracle,
+			inputs,
+			outputs,
+		)
 	}
 }
