@@ -90,16 +90,6 @@ impl std::fmt::Display for LockType {
 	}
 }
 
-impl From<&crate::api::OifOrder> for LockType {
-	fn from(order: &crate::api::OifOrder) -> Self {
-		match order {
-			crate::api::OifOrder::OifResourceLockV0 { .. } => LockType::ResourceLock,
-			crate::api::OifOrder::Oif3009V0 { .. } => LockType::Eip3009Escrow,
-			crate::api::OifOrder::OifEscrowV0 { .. } => LockType::Permit2Escrow,
-			crate::api::OifOrder::OifGenericV0 { .. } => LockType::default(),
-		}
-	}
-}
 /// Gas limit overrides for various transaction types
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct GasLimitOverrides {
@@ -187,7 +177,10 @@ use crate::api::{Quote, QuoteParsable};
 use crate::order::OrderParsable;
 use crate::standards::eip7930::InteropAddress;
 #[cfg(feature = "oif-interfaces")]
-use crate::{bytes32_to_address, parse_address, with_0x_prefix, Address, OrderInput, OrderOutput};
+use crate::{
+	bytes32_to_address, parse_address, with_0x_prefix, Address, OrderInput, OrderOutput,
+	OrderPayload,
+};
 
 #[cfg(feature = "oif-interfaces")]
 use crate::{Order, OrderStatus};
@@ -370,6 +363,23 @@ pub mod interfaces {
 	}
 }
 
+/// Convert OifOrder to StandardOrder with automatic order type detection
+#[cfg(feature = "oif-interfaces")]
+impl TryFrom<&crate::OifOrder> for interfaces::StandardOrder {
+	type Error = Box<dyn std::error::Error>;
+	fn try_from(order: &crate::OifOrder) -> Result<Self, Self::Error> {
+		use crate::OifOrder;
+		match order {
+			OifOrder::Oif3009V0 { payload, metadata } => Self::from_eip3009(payload, metadata),
+			OifOrder::OifResourceLockV0 { payload } => Self::from_batch_compact(payload),
+			OifOrder::OifEscrowV0 { payload } => Self::from_permit2(payload),
+			OifOrder::OifGenericV0 { .. } => {
+				Err("Generic orders are not supported for StandardOrder conversion".into())
+			},
+		}
+	}
+}
+
 /// Convert Quote to StandardOrder with automatic order type detection
 #[cfg(feature = "oif-interfaces")]
 impl TryFrom<&Quote> for interfaces::StandardOrder {
@@ -379,31 +389,9 @@ impl TryFrom<&Quote> for interfaces::StandardOrder {
 		// Handle different order types based on OifOrder variant
 		use crate::OifOrder;
 		match &quote.order {
-			OifOrder::Oif3009V0 { payload, metadata } => {
-				// Extract the message object from payload
-				let message_data = payload
-					.message
-					.as_object()
-					.ok_or("Invalid message structure in ResourceLock order")?;
-
-				Self::handle_eip3009_quote_conversion(quote, message_data, metadata)
-			},
-			OifOrder::OifResourceLockV0 { payload } => {
-				// Extract the message object from payload
-				let message_data = payload
-					.message
-					.as_object()
-					.ok_or("Invalid message structure in ResourceLock order")?;
-				Self::handle_batch_compact_quote_conversion(quote, message_data)
-			},
-			OifOrder::OifEscrowV0 { payload } => {
-				// Extract the message object from payload for Permit2 orders
-				let message_data = payload
-					.message
-					.as_object()
-					.ok_or("Invalid message structure in Escrow order")?;
-				Self::handle_permit2_quote_conversion(quote, message_data)
-			},
+			OifOrder::Oif3009V0 { payload, metadata } => Self::from_eip3009(payload, metadata),
+			OifOrder::OifResourceLockV0 { payload } => Self::from_batch_compact(payload),
+			OifOrder::OifEscrowV0 { payload } => Self::from_permit2(payload),
 			OifOrder::OifGenericV0 { .. } => {
 				Err("Generic orders are not supported for StandardOrder conversion".into())
 			},
@@ -414,19 +402,16 @@ impl TryFrom<&Quote> for interfaces::StandardOrder {
 #[cfg(feature = "oif-interfaces")]
 impl interfaces::StandardOrder {
 	/// Handle Permit2 order conversion
-	fn handle_permit2_quote_conversion(
-		quote: &Quote,
-		eip712_data: &serde_json::Map<String, serde_json::Value>,
-	) -> Result<Self, Box<dyn std::error::Error>> {
+	fn from_permit2(payload: &OrderPayload) -> Result<Self, Box<dyn std::error::Error>> {
 		use crate::utils::parse_bytes32_from_hex;
 		use alloy_primitives::{Address, U256};
 		use interfaces::SolMandateOutput;
 
-		// Extract payload from the quote's order
-		let payload = match &quote.order {
-			crate::OifOrder::OifEscrowV0 { payload } => payload,
-			_ => return Err("Expected OifEscrowV0 order type".into()),
-		};
+		// Extract the message object from payload for Permit2 orders
+		let message_data = payload
+			.message
+			.as_object()
+			.ok_or("Invalid message structure in Escrow order")?;
 
 		// Extract origin chain ID from payload domain
 		let domain = payload
@@ -442,27 +427,27 @@ impl interfaces::StandardOrder {
 
 		// Extract spender as the user address (the entity that will receive the permit)
 		// Extract the recovered user address from the injected message field
-		let user_str = eip712_data
+		let user_str = message_data
 			.get("user")
 			.and_then(|u| u.as_str())
 			.ok_or("Missing user in EIP-712 data (should be injected by ecrecover)")?;
 		let user_address = Address::from_slice(&hex::decode(user_str.trim_start_matches("0x"))?);
 		// Extract nonce
-		let nonce_str = eip712_data
+		let nonce_str = message_data
 			.get("nonce")
 			.and_then(|n| n.as_str())
 			.ok_or("Missing nonce in EIP-712 data")?;
 		let nonce = U256::from_str_radix(nonce_str, 10)?;
 
 		// Extract deadline
-		let deadline_str = eip712_data
+		let deadline_str = message_data
 			.get("deadline")
 			.and_then(|d| d.as_str())
 			.ok_or("Missing deadline in EIP-712 data")?;
 		let fill_deadline = deadline_str.parse::<u32>()?;
 
 		// Extract witness data
-		let witness = eip712_data
+		let witness = message_data
 			.get("witness")
 			.and_then(|w| w.as_object())
 			.ok_or("Missing 'witness' object in EIP-712 message")?;
@@ -482,7 +467,7 @@ impl interfaces::StandardOrder {
 			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
 
 		// Extract input data from permitted array
-		let permitted = eip712_data
+		let permitted = message_data
 			.get("permitted")
 			.and_then(|p| p.as_array())
 			.ok_or("Missing permitted array in EIP-712 data")?;
@@ -571,60 +556,54 @@ impl interfaces::StandardOrder {
 	}
 
 	/// Handle EIP-3009 order conversion
-	fn handle_eip3009_quote_conversion(
-		_quote: &Quote,
-		eip712_data: &serde_json::Map<String, serde_json::Value>,
+	fn from_eip3009(
+		_payload: &OrderPayload,
 		metadata: &serde_json::Value,
 	) -> Result<Self, Box<dyn std::error::Error>> {
 		use crate::utils::parse_bytes32_from_hex;
 		use alloy_primitives::{Address, U256};
 		use interfaces::SolMandateOutput;
 
-		// For EIP-3009, the message contains authorization details
-		// We need to extract input/output information from metadata
-		let message_data = eip712_data;
+		// Extract user address from metadata (for StandardOrder reconstruction)
+		// User is expected to be in InteropAddress (UII) format
+		let user_str = metadata
+			.get("user")
+			.and_then(|u| u.as_str())
+			.ok_or("Missing 'user' in metadata")?;
 
-		// Check if we have multiple signatures (for batch operations)
-		let has_signatures = message_data.contains_key("signatures");
-		let first_message = if has_signatures {
-			message_data
-				.get("signatures")
-				.and_then(|s| s.as_array())
-				.and_then(|arr| arr.first())
-				.and_then(|m| m.as_object())
-				.ok_or("Invalid signatures array in EIP-3009 message")?
-		} else {
-			message_data
-		};
+		// Parse InteropAddress and extract Ethereum address
+		let interop_address = crate::InteropAddress::from_hex(user_str)
+			.map_err(|e| format!("Invalid user InteropAddress: {}", e))?;
+		let user_address = interop_address.ethereum_address().map_err(|e| {
+			format!(
+				"Failed to extract Ethereum address from user InteropAddress: {}",
+				e
+			)
+		})?;
 
-		// Extract user address from message 'from' field
-		let from_str = first_message
-			.get("from")
-			.and_then(|f| f.as_str())
-			.ok_or("Missing 'from' field in EIP-3009 message")?;
-		let user_address = Address::from_slice(&hex::decode(from_str.trim_start_matches("0x"))?);
+		// Extract nonce from metadata (for StandardOrder nonce)
+		let nonce = metadata
+			.get("nonce")
+			.and_then(|n| n.as_u64())
+			.map(U256::from)
+			.ok_or("Missing 'nonce' in metadata")?;
 
-		// Extract nonce (use realNonce if available, otherwise nonce)
-		let nonce_str = first_message
-			.get("realNonce")
-			.and_then(|n| n.as_str())
-			.or_else(|| first_message.get("nonce").and_then(|n| n.as_str()))
-			.ok_or("Missing nonce in EIP-3009 message")?;
-		let nonce = U256::from_str_radix(nonce_str.trim_start_matches("0x"), 16)?;
-
-		// Extract timing from 'validBefore' field
-		let valid_before = first_message
-			.get("validBefore")
-			.and_then(|v| v.as_u64())
+		// Extract timing from metadata
+		let expires = metadata
+			.get("expires")
+			.and_then(|e| e.as_u64())
 			.unwrap_or(0) as u32;
-		let expires = valid_before;
-		let fill_deadline = valid_before;
 
-		// Extract input oracle from message
-		let input_oracle_str = first_message
+		let fill_deadline = metadata
+			.get("fillDeadline")
+			.and_then(|f| f.as_u64())
+			.unwrap_or(expires as u64) as u32;
+
+		// Extract input oracle from metadata (not from the EIP-3009 message)
+		let input_oracle_str = metadata
 			.get("inputOracle")
 			.and_then(|o| o.as_str())
-			.ok_or("Missing 'inputOracle' in EIP-3009 message")?;
+			.ok_or("Missing 'inputOracle' in EIP-3009 metadata")?;
 		let input_oracle =
 			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
 
@@ -772,23 +751,16 @@ impl interfaces::StandardOrder {
 	}
 
 	/// Handle BatchCompact order conversion for ResourceLock
-	fn handle_batch_compact_quote_conversion(
-		quote: &Quote,
-		eip712_data: &serde_json::Map<String, serde_json::Value>,
-	) -> Result<Self, Box<dyn std::error::Error>> {
+	fn from_batch_compact(payload: &OrderPayload) -> Result<Self, Box<dyn std::error::Error>> {
 		use crate::utils::parse_bytes32_from_hex;
 		use alloy_primitives::{Address, U256};
 		use interfaces::SolMandateOutput;
 
-		// With the new flat structure, the message is directly in eip712_data
-		// and domain/types are at the payload level
-		let message = eip712_data;
-
-		// Extract domain from the quote payload level
-		let payload = match &quote.order {
-			crate::OifOrder::OifResourceLockV0 { payload } => payload,
-			_ => return Err("Expected OifResourceLockV0 order type".into()),
-		};
+		// Extract the message object from payload
+		let message_data = payload
+			.message
+			.as_object()
+			.ok_or("Invalid message structure in ResourceLock order")?;
 
 		let domain = payload
 			.domain
@@ -796,7 +768,7 @@ impl interfaces::StandardOrder {
 			.ok_or("Missing domain object in payload")?;
 
 		// Extract user (sponsor) address from message
-		let sponsor_str = message
+		let sponsor_str = message_data
 			.get("sponsor")
 			.and_then(|s| s.as_str())
 			.ok_or("Missing sponsor in BatchCompact message")?;
@@ -811,18 +783,18 @@ impl interfaces::StandardOrder {
 			.unwrap_or(U256::from(1));
 
 		// Extract nonce from BatchCompact message
-		let nonce_str = message
+		let nonce_str = message_data
 			.get("nonce")
 			.and_then(|n| n.as_str())
 			.ok_or("Missing nonce in BatchCompact message")?;
 		let nonce = U256::from_str_radix(nonce_str, 10)?;
 
-		let mandate = message
+		let mandate = message_data
 			.get("mandate")
 			.and_then(|m| m.as_object())
 			.ok_or("Missing 'mandate' object in BatchCompact message")?;
 
-		let expires_str = message
+		let expires_str = message_data
 			.get("expires")
 			.and_then(|e| e.as_str())
 			.ok_or("Missing 'expires' in BatchCompact message")?;
@@ -846,7 +818,7 @@ impl interfaces::StandardOrder {
 			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
 
 		// Extract from commitments array
-		let commitments = message
+		let commitments = message_data
 			.get("commitments")
 			.and_then(|c| c.as_array())
 			.ok_or("Missing commitments array in BatchCompact message")?;
