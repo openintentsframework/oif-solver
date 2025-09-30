@@ -47,13 +47,6 @@ pub struct CostBreakdown {
 	#[serde(with = "rust_decimal::serde::str")]
 	pub total: Decimal,
 
-	// Swap values at market rates (for logging/analysis)
-	// These represent the theoretical swap amounts without any costs applied
-	#[serde(with = "rust_decimal::serde::str")]
-	pub swap_input_value: Decimal,  // USD value of input tokens in the swap
-	#[serde(with = "rust_decimal::serde::str")]
-	pub swap_output_value: Decimal, // USD value of output tokens in the swap
-
 	// Metadata
 	pub currency: String,
 }

@@ -436,7 +436,7 @@ impl CostProfitService {
 		}
 
 		// First calculate base costs with swap amounts to determine operational costs
-		let base_cost_breakdown = self
+		let cost_breakdown = self
 			.calculate_total_cost(
 				&parsed_inputs,
 				&parsed_outputs,
@@ -449,7 +449,7 @@ impl CostProfitService {
 
 		// Pre-calculate cost amounts in relevant tokens
 		// Include min_profit for quotes so users know the total they need to provide
-		let total_with_profit = base_cost_breakdown.total + base_cost_breakdown.min_profit;
+		let total_with_profit = cost_breakdown.total + cost_breakdown.min_profit;
 
 		// Ceil to cents to protect our margin during USD -> token -> USD round-trip
 		// This ensures we always collect enough to cover costs + min_profit after conversions
@@ -500,9 +500,9 @@ impl CostProfitService {
 		let mut execution_costs_by_chain = std::collections::HashMap::new();
 		execution_costs_by_chain.insert(
 			origin_chain_id,
-			base_cost_breakdown.gas_open + base_cost_breakdown.gas_claim,
+			cost_breakdown.gas_open + cost_breakdown.gas_claim,
 		);
-		execution_costs_by_chain.insert(dest_chain_id, base_cost_breakdown.gas_fill);
+		execution_costs_by_chain.insert(dest_chain_id, cost_breakdown.gas_fill);
 
 		// Calculate adjusted amounts (swap amounts +/- costs based on swap type)
 		let mut adjusted_amounts = std::collections::HashMap::new();
@@ -540,33 +540,6 @@ impl CostProfitService {
 				}
 			},
 		}
-
-		// Update the cost breakdown to reflect the actual quoted amounts
-		// This is simpler than recalculating everything and ensures consistency
-		let cost_breakdown = match context.swap_type {
-			SwapType::ExactInput => {
-				// For ExactInput: input stays same, output is reduced by costs
-				let adjusted_output_value = base_cost_breakdown.swap_output_value
-					- base_cost_breakdown.total
-					- base_cost_breakdown.min_profit;
-				CostBreakdown {
-					swap_input_value: base_cost_breakdown.swap_input_value,
-					swap_output_value: adjusted_output_value.max(Decimal::ZERO),
-					..base_cost_breakdown
-				}
-			},
-			SwapType::ExactOutput => {
-				// For ExactOutput: output stays same, input is increased by costs
-				let adjusted_input_value = base_cost_breakdown.swap_output_value
-					+ base_cost_breakdown.total
-					+ base_cost_breakdown.min_profit;
-				CostBreakdown {
-					swap_input_value: adjusted_input_value,
-					swap_output_value: base_cost_breakdown.swap_output_value,
-					..base_cost_breakdown
-				}
-			},
-		};
 
 		Ok(CostContext {
 			cost_breakdown,
@@ -673,8 +646,6 @@ impl CostProfitService {
 			operational_cost,
 			subtotal,
 			total,
-			swap_input_value: total_input_value_usd,
-			swap_output_value: total_output_value_usd,
 			currency: "USD".to_string(),
 		})
 	}
