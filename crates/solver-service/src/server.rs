@@ -283,11 +283,7 @@ async fn handle_order(
 	}
 
 	// Extract standard, default to eip7683
-	let standard = "eip7683"; // TODO: define properly.
-						   // let standard = payload
-						   // 	.get("standard")
-						   // 	.and_then(|s| s.as_str())
-						   // 	.unwrap_or("eip7683");
+	let standard = "eip7683";
 
 	// Convert payload to PostOrderRequest
 	let intent_request = match extract_intent_request(payload.clone(), &state, standard).await {
@@ -306,19 +302,49 @@ async fn handle_order(
 
 /// Extracts a PostOrderRequest from the incoming payload.
 /// Handles both quote acceptances (with quoteId) and direct submissions.
+/// Also injects the recovered user address for Permit2 orders that require ecrecover.
 async fn extract_intent_request(
 	payload: Value,
 	state: &AppState,
 	standard: &str,
 ) -> Result<PostOrderRequest, APIError> {
 	// Check if this is a quote acceptance (has quoteId)
-	if payload.get("quoteId").and_then(|v| v.as_str()).is_some() {
+	let mut intent = if payload.get("quoteId").and_then(|v| v.as_str()).is_some() {
 		// Quote acceptance path
-		create_intent_from_quote(payload, state, standard).await
+		create_intent_from_quote(payload, state, standard).await?
 	} else {
 		// Direct submission path
-		create_intent_from_payload(payload)
+		create_intent_from_payload(payload)?
+	};
+
+	// If this order requires ecrecover, we need to inject the recovered user
+	// into the order message so the discovery service can process it correctly
+	if intent.order.requires_ecrecover() {
+		// Extract sponsor address from the order
+		let signature = intent.signature.first();
+		let sponsor =
+			intent
+				.order
+				.extract_sponsor(signature)
+				.map_err(|e| APIError::BadRequest {
+					error_type: ApiErrorType::OrderValidationFailed,
+					message: format!("Failed to extract sponsor: {}", e),
+					details: None,
+				})?;
+
+		// Inject the recovered user into Permit2 orders
+		if let solver_types::OifOrder::OifEscrowV0 { payload } = &mut intent.order {
+			// Permit2 orders need 'user' field injected after signature recovery
+			if let Some(message_obj) = payload.message.as_object_mut() {
+				message_obj.insert(
+					"user".to_string(),
+					serde_json::Value::String(sponsor.to_string()),
+				);
+			}
+		}
 	}
+
+	Ok(intent)
 }
 
 /// Creates a PostOrderRequest from a quote acceptance.
@@ -405,11 +431,23 @@ async fn validate_intent_request(
 	state: &AppState,
 	standard: &str,
 ) -> Result<Order, APIError> {
-	// Get the order bytes (already in Bytes format from PostOrderRequest)
-	let order_bytes = &intent.order;
+	use alloy_sol_types::SolType;
+	use solver_types::standards::eip7683::interfaces::StandardOrder;
 
-	// Get lock_type as string
-	let lock_type = intent.lock_type.as_str();
+	// Get lock_type from the order
+	let lock_type = intent.order.get_lock_type();
+	let lock_type_str = lock_type.as_str();
+
+	// Convert to StandardOrder and encode
+	// Note: The user injection for Permit2 orders is already done in extract_intent_request
+	let standard_order =
+		StandardOrder::try_from(&intent.order).map_err(|e| APIError::BadRequest {
+			error_type: ApiErrorType::OrderValidationFailed,
+			message: format!("Failed to convert order to standard format: {}", e),
+			details: None,
+		})?;
+
+	let order_bytes = alloy_primitives::Bytes::from(StandardOrder::abi_encode(&standard_order));
 
 	// Get solver address from primary account
 	let solver_address =
@@ -460,7 +498,7 @@ async fn validate_intent_request(
 	// EIP-712 signature validation for ResourceLock orders
 	let requires_validation = state
 		.signature_validation
-		.requires_signature_validation(standard, &intent.lock_type);
+		.requires_signature_validation(standard, &lock_type);
 
 	if requires_validation {
 		state
@@ -481,11 +519,12 @@ async fn validate_intent_request(
 		.order()
 		.validate_and_create_order(
 			standard,
-			order_bytes,
+			&order_bytes,
 			&None,
-			lock_type,
+			lock_type_str,
 			compute_order_id,
 			&solver_address,
+			None, // No quote_id for direct order submissions
 		)
 		.await
 		.map_err(|e| {
@@ -509,18 +548,20 @@ async fn forward_to_discovery_service(
 	state: &AppState,
 	intent: &PostOrderRequest,
 ) -> axum::response::Response {
+	use solver_types::{PostOrderResponse, PostOrderResponseStatus};
+
 	// Check if discovery URL is configured
 	let forward_url = match &state.discovery_url {
 		Some(url) => url,
 		None => {
 			tracing::warn!("offchain_eip7683 discovery source not configured");
-			return (
-				StatusCode::SERVICE_UNAVAILABLE,
-				Json(serde_json::json!({
-					"error": "Intent submission service not configured"
-				})),
-			)
-				.into_response();
+			let response = PostOrderResponse {
+				order_id: None,
+				status: PostOrderResponseStatus::Error,
+				message: Some("Intent submission service not configured".to_string()),
+				order: None,
+			};
+			return (StatusCode::SERVICE_UNAVAILABLE, Json(response)).into_response();
 		},
 	};
 
@@ -534,34 +575,48 @@ async fn forward_to_discovery_service(
 	{
 		Ok(response) => {
 			let status = response.status();
-			match response.json::<Value>().await {
-				Ok(body) => {
+
+			// Try to parse as PostOrderResponse first
+			match response.json::<PostOrderResponse>().await {
+				Ok(post_order_response) => {
 					// Convert reqwest status to axum status
-					let axum_status = StatusCode::from_u16(status.as_u16())
-						.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-					(axum_status, Json(body)).into_response()
+					let axum_status = if status.is_success() {
+						StatusCode::OK
+					} else if status.is_client_error() {
+						StatusCode::BAD_REQUEST
+					} else {
+						StatusCode::from_u16(status.as_u16())
+							.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+					};
+					(axum_status, Json(post_order_response)).into_response()
 				},
 				Err(e) => {
-					tracing::warn!("Failed to parse response from discovery API: {}", e);
-					(
-						StatusCode::BAD_GATEWAY,
-						Json(serde_json::json!({
-							"error": "Failed to read response from discovery service"
-						})),
-					)
-						.into_response()
+					tracing::warn!(
+						"Failed to parse response from discovery API as PostOrderResponse: {}",
+						e
+					);
+					// Return an error response
+					let response = PostOrderResponse {
+						order_id: None,
+						status: PostOrderResponseStatus::Error,
+						message: Some(
+							"Failed to parse response from discovery service".to_string(),
+						),
+						order: None,
+					};
+					(StatusCode::BAD_GATEWAY, Json(response)).into_response()
 				},
 			}
 		},
 		Err(e) => {
 			tracing::warn!("Failed to forward request to discovery API: {}", e);
-			(
-				StatusCode::BAD_GATEWAY,
-				Json(serde_json::json!({
-					"error": format!("Failed to submit intent: {}", e)
-				})),
-			)
-				.into_response()
+			let response = PostOrderResponse {
+				order_id: None,
+				status: PostOrderResponseStatus::Error,
+				message: Some(format!("Failed to submit intent: {}", e)),
+				order: None,
+			};
+			(StatusCode::BAD_GATEWAY, Json(response)).into_response()
 		},
 	}
 }

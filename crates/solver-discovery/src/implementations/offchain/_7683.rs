@@ -42,7 +42,7 @@
 //! 5. The order is converted to an Intent and broadcast to solvers
 
 use crate::{DiscoveryError, DiscoveryInterface};
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address as AlloyAddress, Bytes, U256};
 use alloy_provider::RootProvider;
 use alloy_sol_types::SolType;
 use alloy_transport_http::Http;
@@ -58,6 +58,7 @@ use hex;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use solver_types::{
+	account::Address,
 	api::PostOrderRequest,
 	bytes32_to_address, current_timestamp, normalize_bytes32_address,
 	standards::eip7683::{
@@ -92,12 +93,12 @@ use tower_http::cors::CorsLayer;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiStandardOrder {
-	user: Address,
+	user: AlloyAddress,
 	nonce: U256,
 	origin_chain_id: U256,
 	expires: u32,
 	fill_deadline: u32,
-	input_oracle: Address,
+	input_oracle: AlloyAddress,
 	inputs: Vec<[U256; 2]>,
 	outputs: Vec<ApiMandateOutput>,
 }
@@ -355,31 +356,6 @@ impl Eip7683OffchainDiscovery {
 		})
 	}
 
-	/// Parses StandardOrder data from raw bytes.
-	///
-	/// Decodes the StandardOrder struct from the raw order data bytes
-	/// and extracts all necessary fields.
-	///
-	/// # Arguments
-	///
-	/// * `order_bytes` - The encoded StandardOrder bytes
-	///
-	/// # Returns
-	///
-	/// Returns the decoded StandardOrder struct.
-	///
-	/// # Errors
-	///
-	/// Returns `DiscoveryError::ParseError` if the order data cannot be decoded.
-	fn parse_standard_order(order_bytes: &Bytes) -> Result<StandardOrder, DiscoveryError> {
-		// Decode the StandardOrder struct from the order data
-		let order = <StandardOrder as SolType>::abi_decode(order_bytes, true).map_err(|e| {
-			DiscoveryError::ParseError(format!("Failed to decode StandardOrder: {}", e))
-		})?;
-
-		Ok(order)
-	}
-
 	/// Converts StandardOrder to Intent.
 	///
 	/// Transforms a parsed StandardOrder into the internal Intent format used by
@@ -410,13 +386,16 @@ impl Eip7683OffchainDiscovery {
 	/// - Network configuration is missing for the origin chain
 	async fn order_to_intent(
 		order: &StandardOrder,
-		order_bytes: &Bytes,
 		sponsor: &Address,
 		signature: &Bytes,
 		lock_type: LockType,
 		providers: &HashMap<u64, RootProvider<Http<reqwest::Client>>>,
 		networks: &NetworksConfig,
+		quote_id: Option<String>,
 	) -> Result<Intent, DiscoveryError> {
+		// Encode StandardOrder to bytes for order_to_intent
+		let order_bytes = Bytes::from(StandardOrder::abi_encode(order));
+
 		// Get the input settler address for the order's origin chain
 		let origin_chain_id = order.originChainId.to::<u64>();
 		let network = networks.get(&origin_chain_id).ok_or_else(|| {
@@ -443,10 +422,10 @@ impl Eip7683OffchainDiscovery {
 							origin_chain_id
 						))
 					})?;
-				Address::from_slice(&addr.0)
+				AlloyAddress::from_slice(&addr.0)
 			},
 			LockType::Permit2Escrow | LockType::Eip3009Escrow => {
-				Address::from_slice(&network.input_settler_address.0)
+				AlloyAddress::from_slice(&network.input_settler_address.0)
 			},
 		};
 
@@ -460,7 +439,7 @@ impl Eip7683OffchainDiscovery {
 
 		// Generate order ID from order data
 		let order_id =
-			Self::compute_order_id(order_bytes, provider, settler_address, lock_type).await?;
+			Self::compute_order_id(&order_bytes, provider, settler_address, lock_type).await?;
 
 		// Validate that order has outputs
 		if order.outputs.is_empty() {
@@ -500,7 +479,7 @@ impl Eip7683OffchainDiscovery {
 				})
 				.collect(),
 			// Include raw order data for openFor
-			raw_order_data: Some(with_0x_prefix(&hex::encode(order_bytes))),
+			raw_order_data: Some(with_0x_prefix(&hex::encode(&order_bytes))),
 			// Include signature and sponsor
 			signature: Some(with_0x_prefix(&hex::encode(signature))),
 			sponsor: Some(sponsor.to_string()),
@@ -519,8 +498,8 @@ impl Eip7683OffchainDiscovery {
 			data: serde_json::to_value(&order_data).map_err(|e| {
 				DiscoveryError::ParseError(format!("Failed to serialize order data: {}", e))
 			})?,
-			order_bytes: order_bytes.clone(),
-			quote_id: None, // TODO: add quote id to the intent
+			order_bytes,
+			quote_id,
 			lock_type: lock_type.to_string(),
 		})
 	}
@@ -555,7 +534,7 @@ impl Eip7683OffchainDiscovery {
 	async fn compute_order_id(
 		order_bytes: &Bytes,
 		provider: &RootProvider<Http<reqwest::Client>>,
-		settler_address: Address,
+		settler_address: AlloyAddress,
 		lock_type: LockType,
 	) -> Result<[u8; 32], DiscoveryError> {
 		match lock_type {
@@ -690,17 +669,17 @@ async fn handle_intent_submission(
 	State(state): State<ApiState>,
 	Json(request): Json<PostOrderRequest>,
 ) -> impl IntoResponse {
-	// Parse the StandardOrder from bytes
-	let order = match Eip7683OffchainDiscovery::parse_standard_order(&request.order) {
+	// Convert OifOrder to StandardOrder
+	let order = match StandardOrder::try_from(&request.order) {
 		Ok(order) => order,
 		Err(e) => {
-			tracing::warn!(error = %e, "Failed to parse StandardOrder from request");
+			tracing::warn!(error = %e, "Failed to convert OifOrder to StandardOrder");
 			return (
 				StatusCode::BAD_REQUEST,
 				Json(IntentResponse {
 					order_id: None,
 					status: IntentResponseStatus::Rejected,
-					message: Some(format!("Failed to parse order: {}", e)),
+					message: Some(format!("Failed to convert order: {}", e)),
 					order: None,
 				}),
 			)
@@ -717,15 +696,43 @@ async fn handle_intent_submission(
 		},
 	};
 
+	// Extract sponsor from the order using our new helper
+	let sponsor = match request.order.extract_sponsor(request.signature.first()) {
+		Ok(sponsor) => sponsor,
+		Err(e) => {
+			tracing::warn!(error = %e, "Failed to extract sponsor from order");
+			return (
+				StatusCode::BAD_REQUEST,
+				Json(IntentResponse {
+					order_id: None,
+					status: IntentResponseStatus::Rejected,
+					message: Some(format!("Failed to extract sponsor: {}", e)),
+					order: order_json,
+				}),
+			)
+				.into_response();
+		},
+	};
+
+	// Get the first signature from the array (EIP-7683 expects single signature)
+	let signature = request
+		.signature
+		.first()
+		.cloned()
+		.unwrap_or_else(Bytes::new);
+
+	// Derive lock type from the order
+	let lock_type = LockType::from(&request.order);
+
 	// Convert to intent
 	match Eip7683OffchainDiscovery::order_to_intent(
 		&order,
-		&request.order,
-		&request.sponsor,
-		&request.signature,
-		request.lock_type,
+		&sponsor,
+		&signature,
+		lock_type,
 		&state.providers,
 		&state.networks,
+		request.quote_id,
 	)
 	.await
 	{
@@ -964,7 +971,7 @@ impl crate::DiscoveryRegistry for Registry {}
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use alloy_primitives::{Address, Bytes, U256};
+	use alloy_primitives::{Address as AlloyAddress, Bytes, U256};
 	use serde_json::json;
 	use solver_types::{
 		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
@@ -981,12 +988,12 @@ mod tests {
 
 	fn create_test_standard_order() -> StandardOrder {
 		StandardOrder {
-			user: Address::from_slice(&[0x12u8; 20]),
+			user: AlloyAddress::from_slice(&[0x12u8; 20]),
 			nonce: U256::from(1),
 			originChainId: U256::from(1),
 			expires: (current_timestamp() + 3600) as u32, // 1 hour from now
 			fillDeadline: (current_timestamp() + 1800) as u32, // 30 min from now
-			inputOracle: Address::from_slice(&[0x34u8; 20]),
+			inputOracle: AlloyAddress::from_slice(&[0x34u8; 20]),
 			inputs: vec![[U256::from(1000), U256::from(100)]],
 			outputs: vec![create_test_mandate_output()],
 		}
@@ -1029,37 +1036,6 @@ mod tests {
 
 		assert!(result.is_err());
 		matches!(result.unwrap_err(), DiscoveryError::ValidationError(_));
-	}
-
-	#[test]
-	fn test_parse_standard_order_success() {
-		use alloy_sol_types::SolValue;
-
-		let order = create_test_standard_order();
-		let order_bytes = Bytes::from(order.abi_encode());
-
-		let parsed = Eip7683OffchainDiscovery::parse_standard_order(&order_bytes);
-		assert!(parsed.is_ok());
-
-		let parsed_order = parsed.unwrap();
-		assert_eq!(parsed_order.user, order.user);
-		assert_eq!(parsed_order.nonce, order.nonce);
-		assert_eq!(parsed_order.originChainId, order.originChainId);
-	}
-
-	#[test]
-	fn test_parse_standard_order_invalid_data() {
-		let invalid_bytes = Bytes::from_static(b"invalid_data");
-
-		let result = Eip7683OffchainDiscovery::parse_standard_order(&invalid_bytes);
-		assert!(result.is_err());
-
-		match result.unwrap_err() {
-			DiscoveryError::ParseError(msg) => {
-				assert!(msg.contains("Failed to decode StandardOrder"));
-			},
-			_ => panic!("Expected ParseError"),
-		}
 	}
 
 	#[test]
@@ -1309,6 +1285,7 @@ mod tests {
 	async fn test_handle_intent_submission_invalid_order() {
 		use axum::extract::State;
 		use axum::Json;
+		use solver_types::api::OifOrder;
 
 		let (tx, _rx) = mpsc::unbounded_channel();
 		let state = ApiState {
@@ -1317,12 +1294,17 @@ mod tests {
 			networks: create_test_networks_config(),
 		};
 
-		// Create invalid request with malformed order data
+		// Create invalid request with malformed OifOrder
+		// Using OifGenericV0 with invalid data that will fail StandardOrder conversion
 		let invalid_request = PostOrderRequest {
-			order: Bytes::from_static(b"invalid_order_data"),
-			signature: Bytes::from_static(b"signature"),
-			sponsor: Address::from_slice(&[0xab; 20]),
-			lock_type: LockType::Permit2Escrow,
+			order: OifOrder::OifGenericV0 {
+				payload: serde_json::json!({
+					"invalid": "data_that_cannot_be_converted_to_standard_order"
+				}),
+			},
+			signature: vec![Bytes::from_static(b"signature")],
+			quote_id: None,
+			origin_submission: None,
 		};
 
 		let response = handle_intent_submission(State(state), Json(invalid_request)).await;

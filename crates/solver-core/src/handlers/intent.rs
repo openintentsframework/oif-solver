@@ -139,6 +139,7 @@ impl IntentHandler {
 				&intent.lock_type,
 				order_id_callback,
 				&self.solver_address,
+				intent.quote_id.clone(),
 			)
 			.await
 		{
@@ -166,6 +167,7 @@ impl IntentHandler {
 						&order,
 						&cost_estimate,
 						self.config.solver.min_profitability_pct,
+						intent.quote_id.as_deref(),
 					)
 					.await
 				{

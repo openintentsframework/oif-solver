@@ -156,12 +156,12 @@ impl QuoteGenerator {
 
 				for output in adjusted.intent.outputs.iter_mut() {
 					// First set the base swap amount from our calculation
-					if let Some(base_amount) = cost_context.swap_amounts.get(&output.asset) {
+					if let Some(base_info) = cost_context.swap_amounts.get(&output.asset) {
 						// Get cost for this specific token
-						let cost_in_token = cost_context
+						let cost_amount = cost_context
 							.cost_amounts_in_tokens
 							.get(&output.asset)
-							.copied()
+							.map(|info| info.amount)
 							.unwrap_or(U256::ZERO);
 
 						// Apply full cost to first output, others get their base amount
@@ -172,12 +172,13 @@ impl QuoteGenerator {
 
 						let adjusted_amount = if is_first_output {
 							// First output bears the full cost
-							base_amount.saturating_sub(cost_in_token)
+							base_info.amount.saturating_sub(cost_amount)
 						} else {
 							// Other outputs get their base amount
-							*base_amount
+							base_info.amount
 						};
 
+						// Convert Decimal to string (already in smallest unit, no decimal places)
 						output.amount = Some(adjusted_amount.to_string());
 					}
 				}
@@ -191,12 +192,12 @@ impl QuoteGenerator {
 
 				for input in adjusted.intent.inputs.iter_mut() {
 					// First set the base swap amount from our calculation
-					if let Some(base_amount) = cost_context.swap_amounts.get(&input.asset) {
+					if let Some(base_info) = cost_context.swap_amounts.get(&input.asset) {
 						// Get cost for this specific token
-						let cost_in_token = cost_context
+						let cost_amount = cost_context
 							.cost_amounts_in_tokens
 							.get(&input.asset)
-							.copied()
+							.map(|info| info.amount)
 							.unwrap_or(U256::ZERO);
 
 						// Apply full cost to first input, others get their base amount
@@ -207,12 +208,13 @@ impl QuoteGenerator {
 
 						let adjusted_amount = if is_first_input {
 							// First input bears the full cost
-							base_amount + cost_in_token
+							base_info.amount.saturating_add(cost_amount)
 						} else {
 							// Other inputs get their base amount
-							*base_amount
+							base_info.amount
 						};
 
+						// Convert Decimal to string (already in smallest unit, no decimal places)
 						input.amount = Some(adjusted_amount.to_string());
 					}
 				}
@@ -561,13 +563,14 @@ impl QuoteGenerator {
 		// Calculate fillDeadline (should match fillDeadline in StandardOrder)
 		let fill_deadline = chrono::Utc::now().timestamp() as u32 + intent_validity_seconds as u32;
 
-		// Calculate the correct orderIdentifier using the contract (same method as intents script)
+		// Calculate the correct orderIdentifier using pure Rust
 		let (nonce_u64, order_identifier) = self.compute_eip3009_order_identifier(
 			request,
 			config,
 			&selected_oracle,
 			fill_deadline,
 		)?;
+
 		// Get token address for domain information
 		let token_address = first_input
 			.asset
@@ -589,9 +592,7 @@ impl QuoteGenerator {
 				"value": input.amount,
 				"validAfter": 0,
 				"validBefore": fill_deadline,
-				"nonce": order_identifier,  // Use order_identifier for signature
-				"realNonce": format!("0x{:x}", nonce_u64),  // Include real nonce for StandardOrder
-				"inputOracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&selected_oracle.0))
+				"nonce": order_identifier  // Use order_identifier for signature
 			});
 			signatures_array.push(input_message);
 		}
@@ -619,8 +620,7 @@ impl QuoteGenerator {
 				serde_json::json!({
 					"chainId": input.asset.ethereum_chain_id().unwrap_or(1),
 					"asset": input.asset.to_string(),
-					// TODO: Handle swap-type properly - for now use "0" if amount is None
-					"amount": input.amount.as_ref().unwrap_or(&"0".to_string()).clone(),
+					"amount": input.amount.clone(),
 					"user": input.user.to_string()
 				})
 			}).collect::<Vec<_>>(),
@@ -628,8 +628,7 @@ impl QuoteGenerator {
 				serde_json::json!({
 					"chainId": output.asset.ethereum_chain_id().unwrap_or(1),
 					"asset": output.asset.to_string(),
-					// TODO: Handle swap-type properly - for now use "0" if amount is None
-					"amount": output.amount.as_ref().unwrap_or(&"0".to_string()).clone(),
+					"amount": output.amount.clone(),
 					"receiver": output.receiver.to_string(),
 					"oracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&selected_oracle.0)),
 					"settler": format!("0x{:040x}", alloy_primitives::Address::from_slice(&output_settler.0)),
@@ -665,7 +664,9 @@ impl QuoteGenerator {
 	) -> Result<(u64, String), QuoteError> {
 		use crate::apis::quote::order_identifier::compute_order_identifier;
 		use alloy_primitives::{Address as AlloyAddress, FixedBytes, U256};
-		use solver_types::standards::eip7683::interfaces::SolMandateOutput;
+		use solver_types::standards::eip7683::interfaces::{
+			SolMandateOutput, StandardOrder as SolStandardOrder,
+		};
 		use std::str::FromStr;
 
 		let input = &request.intent.inputs[0];
@@ -693,16 +694,13 @@ impl QuoteGenerator {
 			.unwrap_or(0u64);
 		let nonce = U256::from(nonce_u64);
 
-		// Use fillDeadline for both expires and fillDeadline
-		let expires = fill_deadline;
-
 		// Get input oracle address
 		let input_oracle = AlloyAddress::from_slice(&selected_oracle.0);
 
 		// Get settler address
 		let settler = AlloyAddress::from_slice(&input_network.input_settler_address.0);
 
-		// Build inputs array: [[token_id, amount]]
+		// Build inputs array as Vec<[U256; 2]>
 		let input_token = input
 			.asset
 			.ethereum_address()
@@ -762,18 +760,20 @@ impl QuoteGenerator {
 			outputs.push(output);
 		}
 
-		// Compute order identifier using pure Rust implementation
-		let order_id_bytes = compute_order_identifier(
-			input_chain_id,
-			settler,
+		// Build StandardOrder struct
+		let standard_order = SolStandardOrder {
 			user,
 			nonce,
-			expires,
-			fill_deadline,
-			input_oracle,
-			&inputs,
-			&outputs,
-		)?;
+			originChainId: U256::from(input_chain_id),
+			expires: fill_deadline, // Use fillDeadline for both
+			fillDeadline: fill_deadline,
+			inputOracle: input_oracle,
+			inputs,
+			outputs,
+		};
+
+		// Compute order identifier using simplified API
+		let order_id_bytes = compute_order_identifier(input_chain_id, settler, &standard_order)?;
 
 		// Convert to hex string with 0x prefix
 		let order_id = format!("0x{}", alloy_primitives::hex::encode(order_id_bytes));
@@ -1668,7 +1668,7 @@ mod tests {
 						assert!(domain.contains_key("chainId"));
 						assert!(domain.contains_key("verifyingContract"));
 
-						// Verify message structure (EIP-3009 fields)
+						// Verify message structure (EIP-3009 fields only - 6 standard fields)
 						let message_obj = payload.message.as_object().unwrap();
 						assert!(message_obj["from"].is_string());
 						assert!(message_obj["to"].is_string());
@@ -1676,7 +1676,6 @@ mod tests {
 						assert!(message_obj["validAfter"].is_number());
 						assert!(message_obj["validBefore"].is_number());
 						assert!(message_obj["nonce"].is_string());
-						assert!(message_obj["inputOracle"].is_string());
 					},
 					_ => panic!("Expected Oif3009V0 order"),
 				}
