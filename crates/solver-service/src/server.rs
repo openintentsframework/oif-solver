@@ -321,16 +321,14 @@ async fn extract_intent_request(
 	// into the order message so the discovery service can process it correctly
 	if intent.order.requires_ecrecover() {
 		// Extract sponsor address from the order
-		let signature = intent.signature.first();
-		let sponsor =
-			intent
-				.order
-				.extract_sponsor(signature)
-				.map_err(|e| APIError::BadRequest {
-					error_type: ApiErrorType::OrderValidationFailed,
-					message: format!("Failed to extract sponsor: {}", e),
-					details: None,
-				})?;
+		let sponsor = intent
+			.order
+			.extract_sponsor(Some(&intent.signature))
+			.map_err(|e| APIError::BadRequest {
+				error_type: ApiErrorType::OrderValidationFailed,
+				message: format!("Failed to extract sponsor: {}", e),
+				details: None,
+			})?;
 
 		// Inject the recovered user into Permit2 orders
 		if let solver_types::OifOrder::OifEscrowV0 { payload } = &mut intent.order {

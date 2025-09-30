@@ -92,10 +92,10 @@ impl ApiClient {
 		// Create new PostOrderRequest with structured order
 		let post_order_request = PostOrderRequest {
 			order: quote.order.clone(),
-			signature: vec![alloy_primitives::Bytes::from(
+			signature: alloy_primitives::Bytes::from(
 				hex::decode(signature.trim_start_matches("0x"))
 					.map_err(|e| anyhow!("Invalid signature hex: {}", e))?,
-			)],
+			),
 			quote_id: Some(quote.quote_id.clone()),
 			origin_submission,
 		};

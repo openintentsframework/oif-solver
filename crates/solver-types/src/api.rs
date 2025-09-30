@@ -325,8 +325,8 @@ impl AssetLockReference {
 pub struct PostOrderRequest {
 	/// The structured order to submit
 	pub order: OifOrder,
-	/// Array of signatures for the order (supports multi-sig)
-	pub signature: Vec<Bytes>,
+	/// Signature for the order
+	pub signature: Bytes,
 	/// Optional reference to a prior quote
 	#[serde(rename = "quoteId", skip_serializing_if = "Option::is_none")]
 	pub quote_id: Option<String>,
@@ -859,7 +859,7 @@ impl PostOrderRequest {
 
 		Ok(PostOrderRequest {
 			order: quote.order.clone(),
-			signature: vec![signature_bytes], // Single signature in array
+			signature: signature_bytes,
 			quote_id: Some(quote.quote_id.clone()),
 			origin_submission,
 		})

@@ -395,38 +395,17 @@ impl IntentHandler {
 		// Build PostOrderRequest from JSON
 		let order_json = &post_order_json["order"];
 
-		// Handle signature - it should be an array
-		let signatures = if let Some(sig_array) = post_order_json["signature"].as_array() {
-			// Array of signatures (new format)
-			if sig_array.is_empty() {
-				return Err(anyhow!("Signature array is empty. Please sign the quote first using 'oif-demo quote sign'"));
-			}
-			sig_array
-				.iter()
-				.map(|s| {
-					let sig_str = s
-						.as_str()
-						.ok_or_else(|| anyhow!("Invalid signature in array"))?;
-					if sig_str.is_empty() {
-						return Err(anyhow!("Empty signature in array"));
-					}
-					Ok(alloy_primitives::Bytes::from(
-						hex::decode(sig_str.trim_start_matches("0x"))
-							.map_err(|e| anyhow!("Invalid signature hex: {}", e))?,
-					))
-				})
-				.collect::<Result<Vec<_>>>()?
-		} else if let Some(sig_str) = post_order_json["signature"].as_str() {
-			// Single signature as string (old format - for backward compatibility)
+		// Handle signature - it should be a single string
+		let signature = if let Some(sig_str) = post_order_json["signature"].as_str() {
 			if sig_str.is_empty() {
 				return Err(anyhow!(
 					"Signature is empty. Please sign the quote first using 'oif-demo quote sign'"
 				));
 			}
-			vec![alloy_primitives::Bytes::from(
+			alloy_primitives::Bytes::from(
 				hex::decode(sig_str.trim_start_matches("0x"))
 					.map_err(|e| anyhow!("Invalid signature hex: {}", e))?,
-			)]
+			)
 		} else {
 			return Err(anyhow!("Missing or invalid signature in PostOrderRequest. Please sign the quote first using 'oif-demo quote sign'"));
 		};
@@ -443,7 +422,7 @@ impl IntentHandler {
 		// Create PostOrderRequest with new structure
 		let post_order_request = solver_types::api::PostOrderRequest {
 			order: oif_order,
-			signature: signatures,
+			signature,
 			quote_id,
 			origin_submission,
 		};

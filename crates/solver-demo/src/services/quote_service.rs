@@ -49,8 +49,7 @@ impl QuoteService {
 
 		// Determine file paths - always override
 		let requests_dir = self.session_manager.requests_dir();
-		let response_file = output_file
-			.unwrap_or_else(|| requests_dir.join("get_quote.res.json"));
+		let response_file = output_file.unwrap_or_else(|| requests_dir.join("get_quote.res.json"));
 
 		// Make API call using ApiClient
 		let quote_response = self
@@ -128,18 +127,13 @@ impl QuoteService {
 
 		// Create the post_order request file - always override
 		let requests_dir = self.session_manager.requests_dir();
-		let order_request_file = output_file
-			.unwrap_or_else(|| requests_dir.join("post_order.req.json"));
+		let order_request_file =
+			output_file.unwrap_or_else(|| requests_dir.join("post_order.req.json"));
 		let origin_submission: Option<OriginSubmission> = (&quote.order).into();
-		// Create a PostOrderRequest with structured OifOrder
-		// Convert the Quote to OifOrder structure
-		// Create the PostOrderRequest JSON with new structure
-		// Note: signature should be an array for the API
-		// Remove 0x prefix if present for consistency
 		let clean_signature = final_signature.trim_start_matches("0x");
 		let post_order_json = serde_json::json!({
 			"order": quote.order,  // Structured OifOrder with EIP-712 payload
-			"signature": [format!("0x{}", clean_signature)],  // EIP-712 signature as array with 0x prefix
+			"signature": format!("0x{}", clean_signature),  // EIP-712 signature as single value with 0x prefix
 			"quoteId": quote.quote_id,  // Optional quote identifier
 			"originSubmission": origin_submission,  // Optional origin submission preference
 		});
@@ -242,8 +236,7 @@ impl QuoteService {
 		info!("Order submitted successfully");
 
 		// Save API response - always override
-		let response_file = output_file
-			.unwrap_or_else(|| requests_dir.join("post_order.res.json"));
+		let response_file = output_file.unwrap_or_else(|| requests_dir.join("post_order.res.json"));
 
 		// Save raw API response
 		if let Some(parent) = response_file.parent() {

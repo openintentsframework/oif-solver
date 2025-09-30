@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use serde_json;
 use solver_types::api::GetQuoteRequest;
@@ -43,7 +43,6 @@ pub enum QuoteCommands {
 	/// Test quotes for multiple intents
 	Test {
 		/// JSON file containing array of GetQuoteRequest objects
-		#[arg(short, long)]
 		input: PathBuf,
 
 		/// Optional output file for test results
@@ -135,7 +134,8 @@ impl QuoteHandler {
 			out.clone()
 		} else {
 			// Use the standard response file name in the same directory as input
-			input_file.parent()
+			input_file
+				.parent()
 				.map(|p| p.join("get_quote.res.json"))
 				.unwrap_or_else(|| PathBuf::from("get_quote.res.json"))
 		};
