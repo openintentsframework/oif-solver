@@ -172,7 +172,7 @@ impl QuoteGenerator {
 
 						let adjusted_amount = if is_first_output {
 							// First output bears the full cost
-							base_info.amount - cost_amount
+							base_info.amount.saturating_sub(cost_amount)
 						} else {
 							// Other outputs get their base amount
 							base_info.amount
@@ -208,7 +208,7 @@ impl QuoteGenerator {
 
 						let adjusted_amount = if is_first_input {
 							// First input bears the full cost
-							base_info.amount + cost_amount
+							base_info.amount.saturating_add(cost_amount)
 						} else {
 							// Other inputs get their base amount
 							base_info.amount
