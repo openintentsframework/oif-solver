@@ -127,6 +127,51 @@ build_mandate_output() {
     echo "$oracle_bytes32,$settler_bytes32,$chain_id,$token_bytes32,$amount,$recipient_bytes32,$call_data,$context_data"
 }
 
+# Build OIF order payload structure
+build_oif_order_payload() {
+    local signature_type="$1"
+    local domain_json="$2"
+    local primary_type="$3"
+    local message_json="$4"
+    local types_json="${5:-}"
+    
+    local payload_json=$(jq -n \
+        --arg sig_type "$signature_type" \
+        --argjson domain "$domain_json" \
+        --arg primary "$primary_type" \
+        --argjson message "$message_json" \
+        --argjson types "${types_json:-null}" \
+        '{
+            signatureType: $sig_type,
+            domain: $domain,
+            primaryType: $primary,
+            message: $message
+        } + if $types != null then {types: $types} else {} end')
+    
+    echo "$payload_json"
+}
+
+# Build PostOrderRequest structure
+build_post_order_request() {
+    local order_json="$1"
+    local signature="$2"
+    local quote_id="${3:-}"
+    local origin_submission="${4:-}"
+    
+    local request_json=$(jq -n \
+        --argjson order "$order_json" \
+        --arg sig "$signature" \
+        --arg qid "${quote_id:-}" \
+        --argjson origin "${origin_submission:-null}" \
+        '{
+            order: $order,
+            signature: [$sig]
+        } + if $qid != "" then {quoteId: $qid} else {} end
+          + if $origin != null then {originSubmission: $origin} else {} end')
+    
+    echo "$request_json"
+}
+
 # Build input tokens array
 build_input_tokens() {
     local token_address="$1"
@@ -250,7 +295,7 @@ create_escrow_intent() {
     
     local signature=$(sign_standard_intent \
         "$user_private_key" "$origin_chain_id" "$input_token" "$input_amount" \
-        "$input_settler" "$nonce" "$fill_deadline" "$expiry" "$input_oracle" \
+        "$input_settler" "$nonce" "$permit2_deadline" "$expiry" "$input_oracle" \
         "$mandate_outputs_json")
     
     if [ -z "$signature" ]; then
@@ -259,21 +304,180 @@ create_escrow_intent() {
     fi
     
     print_success "Escrow intent created" >&2
-    print_debug "Order data: $order_data" >&2
     print_debug "Signature: $signature" >&2
     
     # Store in global state
     set_intent_status "last_signature" "$signature"
     set_intent_status "last_lock_type" "$LOCK_TYPE_PERMIT2_ESCROW"
     
-    # Include debug information if DEBUG_OUTPUT environment variable is set
-    if [ -n "${DEBUG_OUTPUT:-}" ]; then
-        # For escrow, we can include useful debug info too
-        echo "{\"order\":\"$order_data\",\"signature\":\"$signature\",\"lock_type\":$LOCK_TYPE_PERMIT2_ESCROW,\"sponsor\":\"$user_addr\",\"_debug\":{\"nonce\":\"$nonce\",\"expiry\":\"$expiry\",\"fill_deadline\":\"$fill_deadline\"}}"
-    else
-        # Return order data and signature as JSON (normal mode)
-        echo "{\"order\":\"$order_data\",\"signature\":\"$signature\",\"lock_type\":$LOCK_TYPE_PERMIT2_ESCROW,\"sponsor\":\"$user_addr\"}"
+    # Build the OIF order structure
+    # Create the EIP-712 domain
+    local domain_json=$(jq -n \
+        --arg chainId "$origin_chain_id" \
+        --arg name "Permit2" \
+        --arg verifyingContract "0x000000000022d473030f116ddee9f6b43ac78ba3" \
+        '{chainId: $chainId, name: $name, verifyingContract: $verifyingContract}')
+    
+    # Create the message JSON with Permit2 witness structure
+    local message_json=$(jq -n \
+        --arg nonce "$nonce" \
+        --arg deadline "$permit2_deadline" \
+        --arg spender "$input_settler" \
+        --arg token "$input_token" \
+        --arg amount "$input_amount" \
+        --arg expires "$expiry" \
+        --arg inputOracle "$input_oracle" \
+        --argjson outputs "$mandate_outputs_json" \
+        '{
+            permitted: [{token: $token, amount: $amount}],
+            spender: $spender,
+            nonce: $nonce,
+            deadline: $deadline,
+            witness: {
+                expires: ($expires | tonumber),
+                inputOracle: $inputOracle,
+                outputs: $outputs
+            }
+        }')
+    
+    # Build EIP-712 types for Permit2
+    local types_json=$(jq -n '{
+        "EIP712Domain": [
+            {"name": "name", "type": "string"},
+            {"name": "chainId", "type": "uint256"},
+            {"name": "verifyingContract", "type": "address"}
+        ],
+        "PermitBatchWitnessTransferFrom": [
+            {"name": "permitted", "type": "TokenPermissions[]"},
+            {"name": "spender", "type": "address"},
+            {"name": "nonce", "type": "uint256"},
+            {"name": "deadline", "type": "uint256"},
+            {"name": "witness", "type": "Permit2Witness"}
+        ],
+        "TokenPermissions": [
+            {"name": "token", "type": "address"},
+            {"name": "amount", "type": "uint256"}
+        ],
+        "Permit2Witness": [
+            {"name": "expires", "type": "uint32"},
+            {"name": "inputOracle", "type": "address"},
+            {"name": "outputs", "type": "MandateOutput[]"}
+        ],
+        "MandateOutput": [
+            {"name": "oracle", "type": "bytes32"},
+            {"name": "settler", "type": "bytes32"},
+            {"name": "chainId", "type": "uint256"},
+            {"name": "token", "type": "bytes32"},
+            {"name": "amount", "type": "uint256"},
+            {"name": "recipient", "type": "bytes32"},
+            {"name": "call", "type": "bytes"},
+            {"name": "context", "type": "bytes"}
+        ]
+    }')
+    
+    # Build the order payload
+    local payload_json=$(build_oif_order_payload "eip712" "$domain_json" "PermitBatchWitnessTransferFrom" "$message_json" "$types_json")
+    
+    # Create the OifOrder structure
+    local order_json=$(jq -n \
+        --argjson payload "$payload_json" \
+        '{type: "oif-escrow-v0", payload: $payload}')
+    
+    # Create PostOrderRequest structure
+    local post_order_json=$(build_post_order_request "$order_json" "$signature")
+    
+    echo "$post_order_json"
+    return 0
+}
+
+# Compute EIP-3009 order identifier by building StandardOrder and calling contract
+# This function mirrors the Rust implementation in solver-service/src/apis/quote/generation.rs
+# 
+# The order ID is computed by:
+# 1. Building a StandardOrder struct with all the intent parameters
+# 2. Encoding it as ABI calldata
+# 3. Calling the InputSettlerEscrow contract's orderIdentifier() function
+# 4. The returned bytes32 is used as the nonce in the EIP-3009 ReceiveWithAuthorization signature
+#
+# Arguments:
+#   $1 - user_addr: User's Ethereum address
+#   $2 - nonce: Unique nonce for the order (typically timestamp in microseconds)
+#   $3 - origin_chain_id: Source chain ID
+#   $4 - expiry: Order expiry timestamp
+#   $5 - fill_deadline: Fill deadline timestamp
+#   $6 - input_oracle: Input oracle address
+#   $7 - input_token: Input token address
+#   $8 - input_amount: Input token amount (in wei)
+#   $9 - dest_chain_id: Destination chain ID
+#   $10 - output_token: Output token address
+#   $11 - output_amount: Output token amount (in wei)
+#   $12 - recipient: Recipient address
+#   $13 - output_settler: Output settler contract address
+#   $14 - input_settler: Input settler contract address
+#
+# Returns:
+#   The computed order ID (bytes32) or empty string on error
+compute_eip3009_order_identifier() {
+    local user_addr="$1"
+    local nonce="$2"
+    local origin_chain_id="$3"
+    local expiry="$4"
+    local fill_deadline="$5"
+    local input_oracle="$6"
+    local input_token="$7"
+    local input_amount="$8"
+    local dest_chain_id="$9"
+    local output_token="${10}"
+    local output_amount="${11}"
+    local recipient="${12}"
+    local output_settler="${13}"
+    local input_settler="${14}"
+    
+    print_debug "Computing EIP-3009 order identifier..." >&2
+    
+    # Build input tokens array
+    local input_tokens=$(build_input_tokens "$input_token" "$input_amount")
+    
+    # Build outputs array
+    local zero_bytes32="0x0000000000000000000000000000000000000000000000000000000000000000"
+    local output_settler_bytes32="0x000000000000000000000000${output_settler#0x}"
+    local output_token_bytes32="0x000000000000000000000000${output_token#0x}"
+    local recipient_bytes32="0x000000000000000000000000${recipient#0x}"
+    
+    local outputs_array="[($zero_bytes32,$output_settler_bytes32,$dest_chain_id,$output_token_bytes32,$output_amount,$recipient_bytes32,0x,0x)]"
+    
+    # Build StandardOrder for order ID calculation
+    local order_struct=$(build_standard_order_struct \
+        "$user_addr" "$nonce" "$origin_chain_id" "$expiry" "$fill_deadline" \
+        "$input_oracle" "$input_tokens" "$outputs_array")
+    
+    local abi_type='f((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))'
+    local order_data=$(cast_abi_encode "$abi_type" "$order_struct")
+    
+    if [ -z "$order_data" ]; then
+        print_error "Failed to encode StandardOrder for order ID computation" >&2
+        return 1
     fi
+    
+    # Get RPC URL for origin chain
+    local origin_rpc=$(config_get_network "$origin_chain_id" "rpc_url")
+    if [ -z "$origin_rpc" ]; then
+        origin_rpc="http://localhost:8545"
+    fi
+    
+    # Call the contract's orderIdentifier function
+    local order_identifier_sig="orderIdentifier((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))"
+    local order_id=$(cast_cmd "call" "$input_settler" \
+        "$order_identifier_sig" \
+        "$order_struct" --rpc-url "$origin_rpc")
+    
+    if [ -z "$order_id" ] || [ "$order_id" = "0x0000000000000000000000000000000000000000000000000000000000000000" ]; then
+        print_error "Failed to compute valid order ID from contract" >&2
+        return 1
+    fi
+    
+    print_debug "Computed order ID: $order_id" >&2
+    echo "$order_id"
     return 0
 }
 
@@ -330,51 +534,25 @@ create_eip3009_intent() {
     print_debug "Expiry: $expiry" >&2
     print_debug "Fill deadline: $fill_deadline" >&2
     
-    # Build input tokens array
-    local input_tokens=$(build_input_tokens "$input_token" "$input_amount")
-    
-    # Build outputs array
-    local zero_bytes32="0x0000000000000000000000000000000000000000000000000000000000000000"
-    local output_settler_bytes32="0x000000000000000000000000${output_settler#0x}"
-    local output_token_bytes32="0x000000000000000000000000${output_token#0x}"
-    local recipient_bytes32="0x000000000000000000000000${recipient#0x}"
-    
-    local outputs_array="[($zero_bytes32,$output_settler_bytes32,$dest_chain_id,$output_token_bytes32,$output_amount,$recipient_bytes32,0x,0x)]"
-    
-    # Build StandardOrder
-    local order_struct=$(build_standard_order_struct \
-        "$user_addr" "$nonce" "$origin_chain_id" "$expiry" "$fill_deadline" \
-        "$input_oracle" "$input_tokens" "$outputs_array")
-    
-    local abi_type='f((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))'
-    local order_data=$(cast_abi_encode "$abi_type" "$order_struct")
-    
-    if [ -z "$order_data" ]; then
-        print_error "Failed to encode StandardOrder" >&2
-        return 1
-    fi
-    
-    print_debug "StandardOrder encoded: $order_data" >&2
-    
-    # Compute order ID from the InputSettlerEscrow contract
+    # Compute order ID using the dedicated function
     print_info "Computing order ID from contract..." >&2
-    local origin_rpc=$(config_get_network "$origin_chain_id" "rpc_url")
-    if [ -z "$origin_rpc" ]; then
-        origin_rpc="http://localhost:8545"
-    fi
+    local order_id=$(compute_eip3009_order_identifier \
+        "$user_addr" "$nonce" "$origin_chain_id" "$expiry" "$fill_deadline" \
+        "$input_oracle" "$input_token" "$input_amount" "$dest_chain_id" \
+        "$output_token" "$output_amount" "$recipient" "$output_settler" "$input_settler")
     
-    # Pass the StandardOrder struct directly to orderIdentifier
-    local order_identifier_sig="orderIdentifier((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))"
-    local order_id=$(cast_cmd "call" "$input_settler" \
-        "$order_identifier_sig" \
-        "$order_struct" --rpc-url "$origin_rpc")
-    
-    if [ -z "$order_id" ] || [ "$order_id" = "0x0000000000000000000000000000000000000000000000000000000000000000" ]; then
-        print_error "Failed to compute order ID from contract" >&2
+    if [ -z "$order_id" ]; then
+        print_error "Failed to compute order ID" >&2
         return 1
     fi
     
     print_debug "Order ID: $order_id" >&2
+    
+    # Get RPC URL for origin chain
+    local origin_rpc=$(config_get_network "$origin_chain_id" "rpc_url")
+    if [ -z "$origin_rpc" ]; then
+        origin_rpc="http://localhost:8545"
+    fi
     
     # Check if token supports EIP-3009
     local eip3009_selector="0xef55bec6"  # receiveWithAuthorization selector
@@ -400,19 +578,131 @@ create_eip3009_intent() {
     local prefixed_signature=$(create_prefixed_signature "$signature" "eip3009")
     
     print_success "EIP-3009 intent created" >&2
-    print_debug "Order data: $order_data" >&2
     print_debug "Signature: $prefixed_signature" >&2
     
     # Store in global state
     set_intent_status "last_signature" "$prefixed_signature"
     set_intent_status "last_lock_type" "$LOCK_TYPE_EIP3009_ESCROW"
     
-    # Return order data and signature as JSON
-    if [ -n "${DEBUG_OUTPUT:-}" ]; then
-        echo "{\"order\":\"$order_data\",\"signature\":\"$prefixed_signature\",\"lock_type\":$LOCK_TYPE_EIP3009_ESCROW,\"sponsor\":\"$user_addr\",\"_debug\":{\"order_id\":\"$order_id\",\"nonce\":\"$nonce\",\"expiry\":\"$expiry\",\"fill_deadline\":\"$fill_deadline\"}}"
-    else
-        echo "{\"order\":\"$order_data\",\"signature\":\"$prefixed_signature\",\"lock_type\":$LOCK_TYPE_EIP3009_ESCROW,\"sponsor\":\"$user_addr\"}"
+    # Build the OIF order structure for EIP-3009
+    # Create the EIP-712 domain
+    # Get the actual token name from the contract
+    local token_name=""
+    token_name=$(cast call "$input_token" "name()" --rpc-url "$origin_rpc" 2>/dev/null | cast --to-ascii 2>/dev/null || echo "")
+    token_name=$(echo "$token_name" | tr -d '\0' | xargs)
+    
+    # If we couldn't get the name, try to determine from config
+    if [ -z "$token_name" ]; then
+        local tokena_addr=$(config_get_network "$origin_chain_id" "tokena_address")
+        local tokenb_addr=$(config_get_network "$origin_chain_id" "tokenb_address")
+        
+        if [ "$(echo "$input_token" | tr '[:upper:]' '[:lower:]')" = "$(echo "$tokena_addr" | tr '[:upper:]' '[:lower:]')" ]; then
+            token_name="TokenA"
+        elif [ "$(echo "$input_token" | tr '[:upper:]' '[:lower:]')" = "$(echo "$tokenb_addr" | tr '[:upper:]' '[:lower:]')" ]; then
+            token_name="TokenB"
+        else
+            token_name="EIP3009"  # Fallback
+        fi
     fi
+    
+    print_debug "Using token name for EIP-3009 domain: $token_name" >&2
+    
+    local domain_json=$(jq -n \
+        --arg chainId "$origin_chain_id" \
+        --arg name "$token_name" \
+        --arg verifyingContract "$input_token" \
+        '{chainId: $chainId, name: $name, verifyingContract: $verifyingContract}')
+    
+    # Create the message JSON for EIP-3009
+    local message_json=$(jq -n \
+        --arg from "$user_addr" \
+        --arg to "$input_settler" \
+        --arg value "$input_amount" \
+        --arg validAfter "0" \
+        --arg validBefore "$fill_deadline" \
+        --arg nonce "$order_id" \
+        '{
+            from: $from,
+            to: $to,
+            value: $value,
+            validAfter: ($validAfter | tonumber),
+            validBefore: ($validBefore | tonumber),
+            nonce: $nonce
+        }')
+    
+    # Build EIP-712 types for EIP-3009
+    local types_json=$(jq -n '{
+        "EIP712Domain": [
+            {"name": "name", "type": "string"},
+            {"name": "chainId", "type": "uint256"},
+            {"name": "verifyingContract", "type": "address"}
+        ],
+        "ReceiveWithAuthorization": [
+            {"name": "from", "type": "address"},
+            {"name": "to", "type": "address"},
+            {"name": "value", "type": "uint256"},
+            {"name": "validAfter", "type": "uint256"},
+            {"name": "validBefore", "type": "uint256"},
+            {"name": "nonce", "type": "bytes32"}
+        ]
+    }')
+    
+    # Build the order payload
+    local payload_json=$(build_oif_order_payload "eip712" "$domain_json" "ReceiveWithAuthorization" "$message_json" "$types_json")
+    
+    # Create the OifOrder structure with metadata for StandardOrder reconstruction
+    # Convert addresses to InteropAddress (UII) format for consistency
+    local user_uii=$(to_uii_address "$origin_chain_id" "$user_addr")
+    local input_token_uii=$(to_uii_address "$origin_chain_id" "$input_token")
+    local output_token_uii=$(to_uii_address "$dest_chain_id" "$output_token")
+    local recipient_uii=$(to_uii_address "$dest_chain_id" "$recipient")
+    
+    local standard_order_metadata=$(jq -n \
+        --arg user "$user_uii" \
+        --arg nonce "$nonce" \
+        --arg originChainId "$origin_chain_id" \
+        --arg expiry "$expiry" \
+        --arg fillDeadline "$fill_deadline" \
+        --arg inputOracle "$input_oracle" \
+        --arg inputToken "$input_token_uii" \
+        --arg inputAmount "$input_amount" \
+        --arg outputSettler "$output_settler" \
+        --arg destChainId "$dest_chain_id" \
+        --arg outputToken "$output_token_uii" \
+        --arg outputAmount "$output_amount" \
+        --arg recipient "$recipient_uii" \
+        '{
+            user: $user,
+            nonce: ($nonce | tonumber),
+            originChainId: ($originChainId | tonumber),
+            expires: ($expiry | tonumber),
+            fillDeadline: ($fillDeadline | tonumber),
+            inputOracle: $inputOracle,
+            inputs: [{
+                chainId: ($originChainId | tonumber),
+                asset: $inputToken,
+                amount: $inputAmount,
+                user: $user
+            }],
+            outputs: [{
+                chainId: ($destChainId | tonumber),
+                asset: $outputToken,
+                amount: $outputAmount,
+                receiver: $recipient,
+                oracle: $inputOracle,
+                settler: $outputSettler
+            }]
+        }')
+    
+    local order_json=$(jq -n \
+        --argjson payload "$payload_json" \
+        --argjson metadata "$standard_order_metadata" \
+        '{type: "oif-3009-v0", payload: $payload, metadata: $metadata}')
+    
+    # Create PostOrderRequest structure
+    local post_order_json=$(build_post_order_request "$order_json" "$prefixed_signature")
+    
+    echo "$post_order_json"
     return 0
 }
 
@@ -566,29 +856,111 @@ create_compact_intent() {
     set_intent_status "last_signature" "$encoded_signature"
     set_intent_status "last_lock_type" "$LOCK_TYPE_RESOURCE_LOCK"
     
-    # Include debug information if DEBUG_OUTPUT environment variable is set
-    if [ -n "${DEBUG_OUTPUT:-}" ]; then
-        # Get the final digest that was signed (need to recompute it here for debug)
-        local domain_separator=$(cast_cmd "call" "$the_compact_addr" "DOMAIN_SEPARATOR()" --rpc-url "http://localhost:8545" 2>/dev/null)
-        local batch_compact_type_hash=$(cast keccak "BatchCompact(address arbiter,address sponsor,uint256 nonce,uint256 expires,Lock[] commitments,Mandate mandate)Lock(bytes12 lockTag,address token,uint256 amount)Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)")
-        
-        # Recompute commitments hash
-        local lock_type_hash=$(cast keccak "Lock(bytes12 lockTag,address token,uint256 amount)")
-        local lock_hash=$(cast keccak $(cast abi-encode "f(bytes32,bytes12,address,uint256)" \
-            "$lock_type_hash" "$allocator_lock_tag" "$origin_token_address" "$lock_amount"))
-        local commitments_hash_debug=$(cast keccak "$lock_hash")
-        
-        # Recompute inner struct and final digest
-        local inner_struct_hash=$(cast keccak $(cast abi-encode "f(bytes32,address,address,uint256,uint256,bytes32,bytes32)" \
-            "$batch_compact_type_hash" "$input_settler_compact" "$user_addr" "$nonce" "$expiry" "$commitments_hash_debug" "$witness_hash"))
-        local final_digest=$(cast keccak "0x1901${domain_separator:2}${inner_struct_hash:2}")
-        
-        # Return with debug info
-        echo "{\"order\":\"$order_data\",\"signature\":\"$encoded_signature\",\"lock_type\":$LOCK_TYPE_RESOURCE_LOCK,\"sponsor\":\"$user_addr\",\"_debug\":{\"witness_hash\":\"$witness_hash\",\"commitments_hash\":\"$commitments_hash_debug\",\"final_digest\":\"$final_digest\",\"sponsor_sig\":\"$compact_signature\",\"domain_separator\":\"$domain_separator\"}}"
-    else
-        # Return order data and signature as JSON (normal mode)
-        echo "{\"order\":\"$order_data\",\"signature\":\"$encoded_signature\",\"lock_type\":$LOCK_TYPE_RESOURCE_LOCK,\"sponsor\":\"$user_addr\"}"
-    fi
+    # Build the OIF order structure for ResourceLock/Compact
+    # Create the EIP-712 domain for BatchCompact (includes version)
+    local domain_json=$(jq -n \
+        --arg chainId "$origin_chain_id" \
+        --arg name "TheCompact" \
+        --arg version "1" \
+        --arg verifyingContract "$the_compact_addr" \
+        '{name: $name, version: $version, chainId: $chainId, verifyingContract: $verifyingContract}')
+    
+    # Create the message JSON for BatchCompact
+    local message_json=$(jq -n \
+        --arg arbiter "$input_settler_compact" \
+        --arg sponsor "$user_addr" \
+        --arg nonce "$nonce" \
+        --arg expires "$expiry" \
+        --arg lockTag "$allocator_lock_tag" \
+        --arg token "$origin_token_address" \
+        --arg amount "$lock_amount" \
+        --arg fillDeadline "$fill_deadline" \
+        --arg inputOracle "$input_oracle" \
+        --arg outputSettler "$output_settler" \
+        --argjson destChainId "$dest_chain_id" \
+        --arg outputToken "$output_token" \
+        --arg outputAmount "$output_amount" \
+        --arg recipient "$recipient" \
+        '{
+            arbiter: $arbiter,
+            sponsor: $sponsor,
+            nonce: $nonce,
+            expires: $expires,
+            commitments: [
+                {
+                    lockTag: $lockTag,
+                    token: $token,
+                    amount: $amount
+                }
+            ],
+            mandate: {
+                fillDeadline: $fillDeadline,
+                inputOracle: $inputOracle,
+                outputs: [
+                    {
+                        oracle: "0x0000000000000000000000000000000000000000000000000000000000000000",
+                        settler: ("0x000000000000000000000000" + ($outputSettler | ltrimstr("0x") | ascii_downcase)),
+                        chainId: $destChainId,
+                        token: ("0x000000000000000000000000" + ($outputToken | ltrimstr("0x") | ascii_downcase)),
+                        amount: $outputAmount,
+                        recipient: ("0x000000000000000000000000" + ($recipient | ltrimstr("0x") | ascii_downcase)),
+                        call: "0x",
+                        context: "0x"
+                    }
+                ]
+            }
+        }')
+    
+    # Build EIP-712 types for BatchCompact
+    local types_json=$(jq -n '{
+        "EIP712Domain": [
+            {"name": "name", "type": "string"},
+            {"name": "version", "type": "string"},
+            {"name": "chainId", "type": "uint256"},
+            {"name": "verifyingContract", "type": "address"}
+        ],
+        "BatchCompact": [
+            {"name": "arbiter", "type": "address"},
+            {"name": "sponsor", "type": "address"},
+            {"name": "nonce", "type": "uint256"},
+            {"name": "expires", "type": "uint256"},
+            {"name": "commitments", "type": "Lock[]"},
+            {"name": "mandate", "type": "Mandate"}
+        ],
+        "Lock": [
+            {"name": "lockTag", "type": "bytes12"},
+            {"name": "token", "type": "address"},
+            {"name": "amount", "type": "uint256"}
+        ],
+        "Mandate": [
+            {"name": "fillDeadline", "type": "uint32"},
+            {"name": "inputOracle", "type": "address"},
+            {"name": "outputs", "type": "MandateOutput[]"}
+        ],
+        "MandateOutput": [
+            {"name": "oracle", "type": "bytes32"},
+            {"name": "settler", "type": "bytes32"},
+            {"name": "chainId", "type": "uint256"},
+            {"name": "token", "type": "bytes32"},
+            {"name": "amount", "type": "uint256"},
+            {"name": "recipient", "type": "bytes32"},
+            {"name": "call", "type": "bytes"},
+            {"name": "context", "type": "bytes"}
+        ]
+    }')
+    
+    # Build the order payload (BatchCompact uses eip712 signature type)
+    local payload_json=$(build_oif_order_payload "eip712" "$domain_json" "BatchCompact" "$message_json" "$types_json")
+    
+    # Create the OifOrder structure
+    local order_json=$(jq -n \
+        --argjson payload "$payload_json" \
+        '{type: "oif-resource-lock-v0", payload: $payload}')
+    
+    # Create PostOrderRequest structure
+    local post_order_json=$(build_post_order_request "$order_json" "$encoded_signature")
+    
+    echo "$post_order_json"
     return 0
 }
 

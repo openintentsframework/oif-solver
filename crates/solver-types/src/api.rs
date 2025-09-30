@@ -2,10 +2,11 @@
 //!
 //! This module defines the request and response types for the OIF Solver API
 //! endpoints, following the ERC-7683 Cross-Chain Intents Standard.
+use crate::account::Address;
 use crate::standards::{eip7683::LockType, eip7930::InteropAddress};
-use alloy_primitives::{Address, Bytes, U256};
-use serde::de::Error;
-use serde::{Deserialize, Deserializer, Serialize};
+use crate::without_0x_prefix;
+use alloy_primitives::{Bytes, U256};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
@@ -109,6 +110,9 @@ pub struct OrderPayload {
 	#[serde(rename = "primaryType")]
 	pub primary_type: String,
 	pub message: serde_json::Value,
+	/// EIP-712 types definitions
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub types: Option<serde_json::Value>,
 }
 
 impl From<&Quote> for Option<OrderPayload> {
@@ -159,6 +163,123 @@ impl OifOrder {
 			OifOrder::OifGenericV0 { .. } => None, // Generic orders don't have a specific flow
 		}
 	}
+
+	/// Check if this order type requires signature recovery to determine sponsor
+	pub fn requires_ecrecover(&self) -> bool {
+		matches!(
+			self,
+			OifOrder::OifEscrowV0 { .. } | OifOrder::Oif3009V0 { .. }
+		)
+	}
+
+	/// Extract sponsor from the order, potentially using ecrecover for Permit2/EIP-3009 orders
+	///
+	/// # Arguments
+	///
+	/// * `signature` - Optional signature bytes to use for ecrecover (required for Permit2/EIP-3009)
+	///
+	/// # Returns
+	///
+	/// Returns the sponsor address or an error if extraction fails
+	pub fn extract_sponsor(&self, signature: Option<&Bytes>) -> Result<Address, String> {
+		// First check if we can extract directly from ResourceLock orders
+		match self {
+			OifOrder::OifResourceLockV0 { payload } => {
+				// TheCompact has 'sponsor' field directly in message
+				if let Some(message_obj) = payload.message.as_object() {
+					if let Some(sponsor_value) = message_obj.get("sponsor") {
+						if let Some(sponsor_str) = sponsor_value.as_str() {
+							return hex::decode(without_0x_prefix(sponsor_str))
+								.ok()
+								.map(Address)
+								.ok_or_else(|| "Failed to decode sponsor address".to_string());
+						}
+					}
+				}
+				Err("Sponsor field not found in ResourceLock order".to_string())
+			},
+			OifOrder::OifEscrowV0 { payload: _ } | OifOrder::Oif3009V0 { payload: _, .. } => {
+				// These require signature recovery
+				let sig = signature.ok_or("Signature required for sponsor extraction")?;
+				if sig.is_empty() {
+					return Err("Empty signature provided".to_string());
+				}
+
+				let signature_str = hex::encode(sig);
+
+				// Reconstruct digest based on order type
+				let digest = match self {
+					OifOrder::OifEscrowV0 { payload } => {
+						crate::utils::eip712::reconstruct_permit2_digest(payload)
+							.map_err(|e| format!("Failed to reconstruct Permit2 digest: {}", e))?
+					},
+					OifOrder::Oif3009V0 { payload, .. } => {
+						crate::utils::eip712::reconstruct_3009_digest(payload)
+							.map_err(|e| format!("Failed to reconstruct EIP-3009 digest: {}", e))?
+					},
+					_ => unreachable!(),
+				};
+
+				// Recover user address from signature
+				let recovered =
+					crate::utils::eip712::ecrecover_user_from_signature(&digest, &signature_str)
+						.map_err(|e| format!("Failed to recover user from signature: {}", e))?;
+
+				// Convert AlloyAddress to our Address type (AlloyAddress implements AsRef<[u8]>)
+				Ok(Address(recovered.as_slice().to_vec()))
+			},
+			OifOrder::OifGenericV0 { .. } => {
+				Err("Cannot extract sponsor from generic order".to_string())
+			},
+		}
+	}
+
+	/// Derive the lock type from the order variant
+	pub fn get_lock_type(&self) -> LockType {
+		match self {
+			OifOrder::OifEscrowV0 { .. } => LockType::Permit2Escrow,
+			OifOrder::Oif3009V0 { .. } => LockType::Eip3009Escrow,
+			OifOrder::OifResourceLockV0 { .. } => LockType::ResourceLock,
+			OifOrder::OifGenericV0 { .. } => LockType::Permit2Escrow, // Default to Permit2
+		}
+	}
+}
+
+/// Implement From trait to convert OifOrder to LockType
+impl From<&OifOrder> for LockType {
+	fn from(order: &OifOrder) -> Self {
+		order.get_lock_type()
+	}
+}
+
+/// Implement From trait to derive OriginSubmission from OifOrder
+impl From<&OifOrder> for Option<OriginSubmission> {
+	fn from(order: &OifOrder) -> Self {
+		match order {
+			OifOrder::OifEscrowV0 { .. } => {
+				// Permit2 escrow orders
+				Some(OriginSubmission {
+					mode: OriginMode::Protocol,
+					schemes: Some(vec![AuthScheme::Permit2, AuthScheme::Erc20Permit]),
+				})
+			},
+			OifOrder::Oif3009V0 { .. } => {
+				// EIP-3009 orders
+				Some(OriginSubmission {
+					mode: OriginMode::Protocol,
+					schemes: Some(vec![AuthScheme::Eip3009]),
+				})
+			},
+			OifOrder::OifResourceLockV0 { .. } => {
+				// Resource lock orders don't use origin submission auth
+				None
+			},
+			OifOrder::OifGenericV0 { .. } => {
+				// Generic orders default to no specific auth scheme
+				None
+			},
+		}
+	}
 }
 
 /// Reference to a lock in a locking system (updated from Lock)
@@ -197,79 +318,47 @@ impl AssetLockReference {
 	}
 }
 
-/// Post order request that unifies both quote acceptances and direct order submissions.
-/// Used as the common type for order validation and forwarding to discovery service.
+/// Post order request following the OIF specification.
+/// Supports both quote acceptances (with quote_id) and direct order submissions.
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct PostOrderRequest {
-	pub order: Bytes,
-	pub sponsor: Address,
-	pub signature: Bytes,
-	#[serde(
-		default = "default_lock_type",
-		deserialize_with = "deserialize_lock_type_flexible"
-	)]
-	pub lock_type: LockType,
+	/// The structured order to submit
+	pub order: OifOrder,
+	/// Array of signatures for the order (supports multi-sig)
+	pub signature: Vec<Bytes>,
+	/// Optional reference to a prior quote
+	#[serde(rename = "quoteId", skip_serializing_if = "Option::is_none")]
+	pub quote_id: Option<String>,
+	/// Optional origin submission preferences
+	#[serde(rename = "originSubmission", skip_serializing_if = "Option::is_none")]
+	pub origin_submission: Option<OriginSubmission>,
 }
 
-/// Default lock type for PostOrderRequest
-fn default_lock_type() -> LockType {
-	LockType::Permit2Escrow
+/// Status for post order response
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum PostOrderResponseStatus {
+	Received,
+	Rejected,
+	Error,
 }
 
-/// Flexible deserializer for LockType that accepts numbers, strings, or enum names.
-fn deserialize_lock_type_flexible<'de, D>(deserializer: D) -> Result<LockType, D::Error>
-where
-	D: Deserializer<'de>,
-{
-	use serde::de::Visitor;
-
-	struct LockTypeVisitor;
-
-	impl Visitor<'_> for LockTypeVisitor {
-		type Value = LockType;
-
-		fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-			formatter.write_str("a number, string, or null for LockType")
-		}
-
-		fn visit_u64<E>(self, value: u64) -> Result<LockType, E>
-		where
-			E: Error,
-		{
-			if value <= 255 {
-				LockType::from_u8(value as u8)
-					.ok_or_else(|| Error::custom("Invalid LockType value"))
-			} else {
-				Err(Error::custom("LockType value out of range"))
-			}
-		}
-
-		fn visit_str<E>(self, value: &str) -> Result<LockType, E>
-		where
-			E: Error,
-		{
-			if let Ok(num) = value.parse::<u8>() {
-				LockType::from_u8(num).ok_or_else(|| Error::custom("Invalid LockType value"))
-			} else {
-				// Try parsing as enum variant name
-				match value {
-					"permit2_escrow" | "Permit2Escrow" => Ok(LockType::Permit2Escrow),
-					"eip3009_escrow" | "Eip3009Escrow" => Ok(LockType::Eip3009Escrow),
-					"resource_lock" | "ResourceLock" => Ok(LockType::ResourceLock),
-					_ => Err(Error::custom("Invalid LockType string")),
-				}
-			}
-		}
-
-		fn visit_none<E>(self) -> Result<LockType, E>
-		where
-			E: Error,
-		{
-			Ok(default_lock_type())
-		}
-	}
-
-	deserializer.deserialize_any(LockTypeVisitor)
+/// Response for post order requests following OIF specification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostOrderResponse {
+	/// Optional order identifier
+	#[serde(rename = "orderId", skip_serializing_if = "Option::is_none")]
+	pub order_id: Option<String>,
+	/// Status of the order submission
+	pub status: PostOrderResponseStatus,
+	/// Optional message providing additional context
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub message: Option<String>,
+	/// Optional echo of the submitted order for confirmation
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub order: Option<serde_json::Value>,
 }
 
 /// API error types as an enum for compile-time safety.
@@ -760,73 +849,20 @@ impl PostOrderRequest {
 		quote: &Quote,
 		signature: &str,
 	) -> Result<Self, Box<dyn std::error::Error>> {
-		use crate::standards::eip7683::interfaces::StandardOrder;
-		use alloy_primitives::Bytes;
-		use alloy_sol_types::SolType;
+		use alloy_primitives::hex;
 
-		// 1. Reconstruct the EIP-712 digest based on order type
-		let digest = Self::reconstruct_digest_for_order_type(quote)?;
-
-		// 2. Recover the real user address from the signature
-		let recovered_user =
-			crate::utils::eip712::ecrecover_user_from_signature(&digest, signature)?;
-
-		// 3. Clone quote to make it mutable and inject recovered user
-		let mut quote_clone = quote.clone();
-		match &mut quote_clone.order {
-			OifOrder::OifEscrowV0 { payload } => {
-				if let Some(message_obj) = payload.message.as_object_mut() {
-					message_obj.insert(
-						"user".to_string(),
-						serde_json::Value::String(recovered_user.to_string()),
-					); // workaround because StandardOrder::try_from does not handle the user field
-				}
-			},
-			_ => {}, // No user injection needed for other order types
-		}
-		// 4. Use the unified TryFrom implementation with the modified quote
-		let sol_order = StandardOrder::try_from(&quote_clone)?;
-
-		// Encode the order
-		let encoded_order = StandardOrder::abi_encode(&sol_order);
-
-		// Derive lock_type from the OifOrder variant
-		let lock_type = LockType::from(&quote.order);
-
-		// Create final PostOrderRequest
+		// Parse the signature into Bytes
 		let signature_bytes = Bytes::from(hex::decode(signature.trim_start_matches("0x"))?);
-		Ok(PostOrderRequest {
-			order: Bytes::from(encoded_order),
-			sponsor: recovered_user,
-			signature: signature_bytes,
-			lock_type,
-		})
-	}
 
-	/// Reconstructs the EIP-712 digest based on the order type.
-	///
-	/// This function dispatches to the appropriate digest reconstruction method
-	/// based on the OifOrder variant type.
-	fn reconstruct_digest_for_order_type(
-		quote: &Quote,
-	) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-		match &quote.order {
-			OifOrder::OifEscrowV0 { .. } => {
-				// Permit2 escrow orders
-				crate::utils::eip712::reconstruct_permit2_digest_from_quote(quote)
-			},
-			OifOrder::Oif3009V0 { .. } => {
-				// EIP-3009 orders
-				crate::utils::eip712::reconstruct_3009_digest_from_quote(quote)
-			},
-			OifOrder::OifResourceLockV0 { .. } => {
-				// TheCompact resource lock orders
-				crate::utils::eip712::reconstruct_compact_digest_from_quote(quote)
-			},
-			OifOrder::OifGenericV0 { .. } => {
-				Err("Generic orders not supported for digest reconstruction".into())
-			},
-		}
+		// Derive origin_submission from the order type using From trait
+		let origin_submission = Option::<OriginSubmission>::from(&quote.order);
+
+		Ok(PostOrderRequest {
+			order: quote.order.clone(),
+			signature: vec![signature_bytes], // Single signature in array
+			quote_id: Some(quote.quote_id.clone()),
+			origin_submission,
+		})
 	}
 }
 
@@ -1415,6 +1451,7 @@ mod tests {
 					.unwrap(),
 					primary_type: "TestType".to_string(),
 					message: serde_json::json!({"test": "value"}),
+					types: None,
 				},
 			},
 			failure_handling: FailureHandlingMode::RefundAutomatic,
@@ -1446,6 +1483,7 @@ mod tests {
 						domain: serde_json::json!({"chain": 1, "address": "0x0000000000000000000000000000000000000000"}),
 						primary_type: "TestType".to_string(),
 						message: serde_json::json!({"test": "value"}),
+						types: None,
 					},
 				},
 				failure_handling: FailureHandlingMode::RefundAutomatic,

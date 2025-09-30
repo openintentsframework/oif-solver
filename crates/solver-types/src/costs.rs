@@ -27,16 +27,14 @@ pub struct CostBreakdown {
 	// Profit components
 	#[serde(with = "rust_decimal::serde::str")]
 	pub min_profit: Decimal, // Based on transaction value, not gas!
-	#[serde(with = "rust_decimal::serde::str")]
-	pub commission: Decimal,
 
 	// Totals
 	#[serde(with = "rust_decimal::serde::str")]
 	pub operational_cost: Decimal, // gas + buffers
 	#[serde(with = "rust_decimal::serde::str")]
-	pub subtotal: Decimal, // operational + base_price + min_profit
+	pub subtotal: Decimal, // operational + base_price
 	#[serde(with = "rust_decimal::serde::str")]
-	pub total: Decimal, // subtotal + commission
+	pub total: Decimal,
 
 	// Market values (for logging/analysis)
 	#[serde(with = "rust_decimal::serde::str")]

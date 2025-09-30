@@ -788,10 +788,10 @@ quote_accept() {
         local signature_type=""
         local origin_submission_data=""
         
-        if [ "$primary_type" = "CompactLock" ]; then
-            # CompactLock orders use BatchCompact signature, no auth scheme
+        if [ "$primary_type" = "BatchCompact" ]; then
+            # BatchCompact orders use BatchCompact signature, no auth scheme
             signature_type="compact"
-            print_debug "Detected CompactLock order, using compact signature type"
+            print_debug "Detected BatchCompact order, using compact signature type"
             # Don't set origin_submission_data for compact
         else
             # For non-compact orders, read the original quote request to get originSubmission data
@@ -827,15 +827,37 @@ quote_accept() {
         if [ "$signature_type" = "compact" ]; then
             print_info "Signing BatchCompact order..."
             
-            # For CompactLock, the actual EIP-712 data is nested in message.eip712
-            local eip712_data=$(echo "$full_message" | jq '.eip712 // empty')
-            if [ -z "$eip712_data" ] || [ "$eip712_data" = "null" ] || [ "$eip712_data" = "empty" ]; then
-                print_error "No eip712 data found in CompactLock message"
+            # With the new flat structure, the message is already in the correct format
+            # Extract domain and types from the order payload level
+            local domain_data=$(echo "$order_payload" | jq '.domain // empty')
+            local types_data=$(echo "$order_payload" | jq '.types // empty')
+            
+            if [ -z "$domain_data" ] || [ "$domain_data" = "null" ] || [ "$domain_data" = "empty" ]; then
+                print_error "No domain data found in BatchCompact order"
                 return 1
             fi
             
-            # Use compact-specific digest computation with the nested eip712 data
-            signature=$(sign_compact_digest_from_quote "$user_key" "$eip712_data")
+            # Use the complete EIP-712 structure directly from the quote response
+            # Extract primaryType from the order payload level
+            local primary_type=$(echo "$order_payload" | jq -r '.primaryType // "BatchCompact"')
+            
+            # Build complete EIP-712 structure exactly as received from server
+            local complete_eip712=$(jq -n \
+                --argjson domain "$domain_data" \
+                --argjson types "$types_data" \
+                --argjson message "$full_message" \
+                --arg primaryType "$primary_type" \
+                '{
+                    domain: $domain,
+                    types: $types,
+                    primaryType: $primaryType,
+                    message: $message
+                }')
+            
+            print_debug "Complete EIP-712 structure built for BatchCompact signing"
+            
+            # Use compact-specific digest computation
+            signature=$(sign_compact_digest_from_quote "$user_key" "$complete_eip712")
             if [ $? -ne 0 ] || [ -z "$signature" ]; then
                 print_error "Failed to sign BatchCompact order"
                 return 1
@@ -913,10 +935,13 @@ quote_accept() {
                         return 1
                     fi
                     
-                    local individual_signature=$(sign_eip3009_authorization_with_domain \
+                    # Extract EIP-712 types from order payload if available
+                    local eip712_types=$(echo "$order_payload" | jq -r '.types // empty')
+                    
+                    local individual_signature=$(sign_eip3009_authorization_with_domain_and_types \
                         "$user_key" "$origin_chain_id" "$token_contract" \
                         "$from_address" "$to_address" "$value" \
-                        "$valid_after" "$valid_before" "$nonce" "$domain_separator")
+                        "$valid_after" "$valid_before" "$nonce" "$domain_separator" "$eip712_types")
 
                     if [ -z "$individual_signature" ]; then
                         print_error "Failed to sign EIP-3009 order $((i+1))"
@@ -1052,16 +1077,19 @@ quote_accept() {
                     fi
                 fi
 
-                # Sign EIP-3009 authorization with the correct nonce
+                # Extract EIP-712 types from order payload if available
+                local eip712_types=$(echo "$order_payload" | jq -r '.types // empty')
+                
+                # Sign EIP-3009 authorization with the correct nonce and dynamic types
                 if [ -z "$domain_separator" ] || [ "$domain_separator" = "empty" ]; then
                     print_error "No domain separator available for EIP-3009 signing"
                     return 1
                 fi
                 
-                signature=$(sign_eip3009_authorization_with_domain \
+                signature=$(sign_eip3009_authorization_with_domain_and_types \
                     "$user_key" "$origin_chain_id" "$token_contract" \
                     "$from_address" "$to_address" "$value" \
-                    "$valid_after" "$valid_before" "$final_nonce" "$domain_separator")
+                    "$valid_after" "$valid_before" "$final_nonce" "$domain_separator" "$eip712_types")
 
                 if [ -z "$signature" ]; then
                     print_error "Failed to sign EIP-3009 order"
@@ -1096,9 +1124,18 @@ quote_accept() {
                 return 1
             fi
 
-            # Use client-side digest computation
+            # Extract EIP-712 types from order payload if available
+            local eip712_types=$(echo "$order_payload" | jq -r '.types // empty')
+            if [ -n "$eip712_types" ] && [ "$eip712_types" != "null" ] && [ "$eip712_types" != "empty" ]; then
+                print_debug "Found EIP-712 types in order payload, using dynamic types for signing"
+            else
+                print_debug "No EIP-712 types found in order payload, will use hardcoded fallback types"
+                eip712_types=""
+            fi
+
+            # Use client-side digest computation with dynamic types
             print_info "Computing client-side digest..."
-            local client_digest=$(compute_permit2_digest_from_quote "$eip712_message" "$domain")
+            local client_digest=$(compute_permit2_digest_from_quote "$eip712_message" "$domain" "$eip712_types")
             if [ $? -ne 0 ] || [ -z "$client_digest" ]; then
                 print_error "Failed to compute client-side digest"
                 return 1
