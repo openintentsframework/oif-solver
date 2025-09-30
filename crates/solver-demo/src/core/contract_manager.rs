@@ -12,6 +12,7 @@
 //! transactions with proper transaction confirmation monitoring.
 
 use alloy_primitives::{Address, U256};
+use alloy_sol_types::SolCall;
 use anyhow::{anyhow, Result};
 use ethers::{
 	abi::Token,
@@ -379,7 +380,7 @@ impl ContractManager {
 		let client = Arc::new(SignerMiddleware::new(provider, wallet));
 
 		// Create ERC20 contract instance
-		let erc20_abi = self.abi_manager.get_abi("ERC20").await?;
+		let erc20_abi = self.abi_manager.get_abi("MockERC20").await?;
 		let contract = Contract::new(
 			ethers::types::H160::from_slice(token_address.as_slice()),
 			erc20_abi,
@@ -428,6 +429,7 @@ impl ContractManager {
 		order: &solver_types::standards::eip7683::interfaces::StandardOrder,
 		private_key: &str,
 		rpc_url: &str,
+		contract_type: &str,
 	) -> Result<String> {
 		info!(
 			"Submitting intent onchain to InputSettler at {}",
@@ -444,22 +446,58 @@ impl ContractManager {
 
 		let client = Arc::new(SignerMiddleware::new(provider, wallet));
 
-		// Get InputSettler ABI
-		let settler_abi = self.abi_manager.get_abi("InputSettler").await?;
+		// Get the appropriate settler ABI based on the order type
+		let settler_abi = self
+			.abi_manager
+			.get_abi(contract_type)
+			.await
+			.map_err(|e| anyhow!("Failed to get ABI for {}: {}", contract_type, e))?;
 		let contract = Contract::new(
 			ethers::types::H160::from_slice(input_settler.as_slice()),
 			settler_abi,
 			client.clone(),
 		);
 
-		// Convert to ethers-friendly tuple and call open
-		let order_args = Self::standard_order_to_ethers_args(order);
-		let method_call = contract
-			.method::<_, H256>("open", order_args)
-			.map_err(|e| anyhow!("Failed to build open transaction: {}", e))?;
+		// Use alloy's ABI encoding to encode the StandardOrder, then manually build the call
+		// The encoding depends on the contract type (escrow vs compact)
+		let call_data = match contract_type {
+			"InputSettlerEscrow" => {
+				use solver_types::standards::eip7683::interfaces::IInputSettlerEscrow;
 
-		let pending_tx = method_call
-			.send()
+				// Build the open call using alloy for escrow
+				let open_call = IInputSettlerEscrow::openCall {
+					order: order.clone(),
+				};
+
+				// Encode the call data
+				open_call.abi_encode()
+			},
+			"InputSettlerCompact" => {
+				// Compact settler doesn't have an open function
+				// It requires the compact signature and uses a different flow
+				// For onchain submission of compact orders, we would need to call
+				// TheCompact contract first to deposit/lock resources, then submit
+				// This is not currently supported in the demo
+				return Err(anyhow!("Onchain submission for InputSettlerCompact is not yet implemented. Compact orders require depositing to TheCompact first."));
+			},
+			_ => {
+				return Err(anyhow!("Unsupported contract type: {}", contract_type));
+			},
+		};
+
+		debug!(
+			"Encoded call data for {}: 0x{}",
+			contract_type,
+			hex::encode(&call_data)
+		);
+
+		// Send the transaction using raw call data
+		let client = contract.client().clone();
+		let tx = ethers::core::types::TransactionRequest::new()
+			.to(ethers::types::H160::from_slice(input_settler.as_slice()))
+			.data(call_data.to_vec());
+		let pending_tx = client
+			.send_transaction(tx, None)
 			.await
 			.map_err(|e| anyhow!("Failed to send open transaction: {}", e))?;
 
@@ -489,7 +527,7 @@ impl ContractManager {
 		u32,
 		u32,
 		ethers::types::H160,
-		Vec<(ethers::types::U256, ethers::types::U256)>,
+		Vec<[ethers::types::U256; 2]>,
 		Vec<(
 			[u8; 32],
 			[u8; 32],
@@ -513,10 +551,10 @@ impl ContractManager {
 			.inputs
 			.iter()
 			.map(|pair| {
-				(
+				[
 					ethers::types::U256::from_big_endian(&pair[0].to_be_bytes::<32>()),
 					ethers::types::U256::from_big_endian(&pair[1].to_be_bytes::<32>()),
-				)
+				]
 			})
 			.collect::<Vec<_>>();
 

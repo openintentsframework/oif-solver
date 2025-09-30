@@ -15,7 +15,7 @@ use solver_types::{
 use crate::{
 	core::SessionManager,
 	models::{BatchTestResults, BatchTestStatistics, QuoteTestResult, QuoteTestStatus},
-	services::{ApiClient, FileIndexer, SigningService},
+	services::{ApiClient, SigningService},
 };
 
 /// Service for handling quote operations including API calls and persistence
@@ -23,7 +23,6 @@ pub struct QuoteService {
 	session_manager: Arc<SessionManager>,
 	api_client: Arc<ApiClient>,
 	signing_service: Arc<SigningService>,
-	file_indexer: Arc<FileIndexer>,
 }
 
 impl QuoteService {
@@ -33,14 +32,10 @@ impl QuoteService {
 		api_client: Arc<ApiClient>,
 		signing_service: Arc<SigningService>,
 	) -> Result<Self> {
-		let file_indexer =
-			Arc::new(FileIndexer::new(session_manager.requests_dir().as_path()).await?);
-
 		Ok(Self {
 			session_manager,
 			api_client,
 			signing_service,
-			file_indexer,
 		})
 	}
 
@@ -52,13 +47,10 @@ impl QuoteService {
 	) -> Result<GetQuoteResponse> {
 		info!("Getting quote for intent request");
 
-		// Use current intent index since intent build already created the files
-		let current_index = self.file_indexer.current_index("intent").await;
-
-		// Determine file paths
+		// Determine file paths - always override
 		let requests_dir = self.session_manager.requests_dir();
 		let response_file = output_file
-			.unwrap_or_else(|| requests_dir.join(format!("{}.get_quote.res.json", current_index)));
+			.unwrap_or_else(|| requests_dir.join("get_quote.res.json"));
 
 		// Make API call using ApiClient
 		let quote_response = self
@@ -134,20 +126,20 @@ impl QuoteService {
 			},
 		};
 
-		// Get a new index for post_order request
-		let order_index = self.file_indexer.next_index("post_order").await?;
-
-		// Create the post_order request file
+		// Create the post_order request file - always override
 		let requests_dir = self.session_manager.requests_dir();
 		let order_request_file = output_file
-			.unwrap_or_else(|| requests_dir.join(format!("{}.post_order.req.json", order_index)));
+			.unwrap_or_else(|| requests_dir.join("post_order.req.json"));
 		let origin_submission: Option<OriginSubmission> = (&quote.order).into();
 		// Create a PostOrderRequest with structured OifOrder
 		// Convert the Quote to OifOrder structure
 		// Create the PostOrderRequest JSON with new structure
+		// Note: signature should be an array for the API
+		// Remove 0x prefix if present for consistency
+		let clean_signature = final_signature.trim_start_matches("0x");
 		let post_order_json = serde_json::json!({
 			"order": quote.order,  // Structured OifOrder with EIP-712 payload
-			"signature": final_signature,  // EIP-712 signature (will be wrapped in array by handler)
+			"signature": [format!("0x{}", clean_signature)],  // EIP-712 signature as array with 0x prefix
 			"quoteId": quote.quote_id,  // Optional quote identifier
 			"originSubmission": origin_submission,  // Optional origin submission preference
 		});
@@ -218,12 +210,9 @@ impl QuoteService {
 			},
 		};
 
-		// Get a new index for post_order
-		let order_index = self.file_indexer.next_index("post_order").await?;
-
-		// Create the post_order request file with the signature
+		// Create the post_order request file with the signature - always override
 		let requests_dir = self.session_manager.requests_dir();
-		let order_request_file = requests_dir.join(format!("{}.post_order.req.json", order_index));
+		let order_request_file = requests_dir.join("post_order.req.json");
 
 		// Update request with actual signature
 		let order_request = serde_json::json!({
@@ -252,9 +241,9 @@ impl QuoteService {
 
 		info!("Order submitted successfully");
 
-		// Save API response
+		// Save API response - always override
 		let response_file = output_file
-			.unwrap_or_else(|| requests_dir.join(format!("{}.post_order.res.json", order_index)));
+			.unwrap_or_else(|| requests_dir.join("post_order.res.json"));
 
 		// Save raw API response
 		if let Some(parent) = response_file.parent() {

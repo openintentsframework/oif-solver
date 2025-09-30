@@ -136,7 +136,6 @@ impl ApiClient {
 	/// Note: This submits to /api/orders as a direct PostOrderRequest
 	pub async fn post_intent(&self, request: PostOrderRequest) -> Result<PostOrderResponse> {
 		info!("Submitting intent directly to orders endpoint");
-
 		let url = format!("{}/api/orders", self.base_url);
 		let mut req = self.client.post(&url).json(&request);
 

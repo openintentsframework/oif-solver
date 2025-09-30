@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::Subcommand;
 use serde_json;
 use solver_types::api::GetQuoteRequest;
@@ -93,7 +93,10 @@ impl QuoteHandler {
 			.map_err(|e| anyhow!("Failed to parse GetQuoteRequest: {}", e))?;
 
 		// Get quote
-		let response = self.quote_service.get_quote(request, output_file).await?;
+		let response = self
+			.quote_service
+			.get_quote(request, output_file.clone())
+			.await?;
 
 		// Display results
 		self.display.header("Quote Request Results");
@@ -124,6 +127,35 @@ impl QuoteHandler {
 					),
 				],
 			);
+		}
+
+		// Determine where the response was saved
+		// With the new always-override approach, response is saved as get_quote.res.json
+		let response_file = if let Some(ref out) = output_file {
+			out.clone()
+		} else {
+			// Use the standard response file name in the same directory as input
+			input_file.parent()
+				.map(|p| p.join("get_quote.res.json"))
+				.unwrap_or_else(|| PathBuf::from("get_quote.res.json"))
+		};
+
+		self.display
+			.success(&format!("Response saved to: {:?}", response_file));
+
+		// Add next steps
+		if quote_count > 0 {
+			if quote_count > 1 {
+				self.display.next_steps(vec![&format!(
+					"Sign a specific quote: oif-demo quote sign {:?} --quote-index 0",
+					response_file
+				)]);
+			} else {
+				self.display.next_steps(vec![&format!(
+					"Sign the quote: oif-demo quote sign {:?}",
+					response_file
+				)]);
+			}
 		}
 
 		Ok(())
