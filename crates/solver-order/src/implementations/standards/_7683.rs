@@ -676,6 +676,7 @@ impl OrderInterface for Eip7683OrderImpl {
 		lock_type: &str,
 		order_id_callback: solver_types::OrderIdCallback,
 		solver_address: &Address,
+		quote_id: Option<String>,
 	) -> Result<Order, OrderError> {
 		// First validate the order
 		let standard_order = self.validate_order(order_bytes).await?;
@@ -794,7 +795,7 @@ impl OrderInterface for Eip7683OrderImpl {
 				OrderError::ValidationFailed(format!("Failed to serialize order: {}", e))
 			})?,
 			solver_address: solver_address.clone(),
-			quote_id: None,
+			quote_id,
 			input_chains,
 			output_chains,
 			execution_params: None,

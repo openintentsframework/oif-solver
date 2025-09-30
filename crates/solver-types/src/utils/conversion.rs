@@ -11,6 +11,40 @@ use alloy_primitives::{
 	utils::{format_ether, parse_ether},
 	Address as AlloyAddress, U256,
 };
+use rust_decimal::{Decimal, RoundingStrategy};
+
+/// 10^dp as Decimal
+pub fn pow10(dp: u32) -> Decimal {
+	let mut f = Decimal::ONE;
+	for _ in 0..dp {
+		f *= Decimal::from(10);
+	}
+	f
+}
+
+/// Ceiling to `dp` decimal places.
+///
+/// Rounds a decimal number up to the specified number of decimal places.
+/// This is useful for protecting margins during conversions, ensuring
+/// we always collect enough to cover costs.
+///
+/// # Arguments
+/// * `x` - The decimal value to round
+/// * `dp` - Number of decimal places to round to
+///
+/// # Example
+/// ```text
+/// use rust_decimal::Decimal;
+/// use solver_types::utils::conversion::ceil_dp;
+///
+/// let value = Decimal::from_str("1.234").unwrap();
+/// let rounded = ceil_dp(value, 2);
+/// assert_eq!(rounded.to_string(), "1.24");
+/// ```
+pub fn ceil_dp(x: Decimal, dp: u32) -> Decimal {
+	let f = pow10(dp);
+	(x * f).round_dp_with_strategy(0, RoundingStrategy::ToPositiveInfinity) / f
+}
 
 /// Normalize a bytes32 that is expected to embed an `address` into
 /// a canonical left-padded form: 12 zero bytes followed by 20 address bytes.
@@ -440,6 +474,57 @@ mod tests {
 
 		let result = wei_string_to_eth_string("123.456");
 		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_pow10() {
+		assert_eq!(pow10(0), Decimal::from(1));
+		assert_eq!(pow10(1), Decimal::from(10));
+		assert_eq!(pow10(2), Decimal::from(100));
+		assert_eq!(pow10(3), Decimal::from(1000));
+		assert_eq!(pow10(6), Decimal::from(1000000));
+	}
+
+	#[test]
+	fn test_ceil_dp() {
+		use std::str::FromStr;
+
+		// Test rounding up to 2 decimal places (cents)
+		let value = Decimal::from_str("1.234").unwrap();
+		assert_eq!(ceil_dp(value, 2).to_string(), "1.24");
+
+		let value = Decimal::from_str("1.231").unwrap();
+		assert_eq!(ceil_dp(value, 2).to_string(), "1.24");
+
+		let value = Decimal::from_str("1.230").unwrap();
+		assert_eq!(ceil_dp(value, 2).to_string(), "1.23");
+
+		// Test with exactly 2 decimal places
+		let value = Decimal::from_str("1.23").unwrap();
+		assert_eq!(ceil_dp(value, 2).to_string(), "1.23");
+
+		// Test with 0 decimal places
+		let value = Decimal::from_str("1.5").unwrap();
+		assert_eq!(ceil_dp(value, 0).to_string(), "2");
+
+		let value = Decimal::from_str("1.1").unwrap();
+		assert_eq!(ceil_dp(value, 0).to_string(), "2");
+
+		// Test with negative numbers (ceiling still goes up/towards positive infinity)
+		let value = Decimal::from_str("-1.234").unwrap();
+		assert_eq!(ceil_dp(value, 2).to_string(), "-1.23");
+
+		// Test with zero
+		let value = Decimal::ZERO;
+		assert_eq!(ceil_dp(value, 2).to_string(), "0");
+
+		// Test with large numbers
+		let value = Decimal::from_str("999999.994").unwrap();
+		assert_eq!(ceil_dp(value, 2).to_string(), "1000000.00");
+
+		// Test with 3 decimal places
+		let value = Decimal::from_str("1.23456").unwrap();
+		assert_eq!(ceil_dp(value, 3).to_string(), "1.235");
 	}
 
 	#[test]

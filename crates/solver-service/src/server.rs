@@ -507,6 +507,7 @@ async fn validate_intent_request(
 			lock_type_str,
 			compute_order_id,
 			&solver_address,
+			None, // No quote_id for direct order submissions
 		)
 		.await
 		.map_err(|e| {

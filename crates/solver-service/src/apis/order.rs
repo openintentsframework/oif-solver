@@ -7,9 +7,9 @@
 use axum::extract::{Extension, Path};
 use solver_core::SolverEngine;
 use solver_types::{
-	bytes32_to_address, parse_address, with_0x_prefix, AssetAmount, GetOrderError,
-	GetOrderResponse, InteropAddress, Order, OrderResponse, OrderStatus, Settlement,
-	SettlementType, StorageKey, TransactionType,
+	bytes32_to_address, standards::eip7930::InteropAddress, utils::conversion::parse_address,
+	with_0x_prefix, AssetAmount, GetOrderError, GetOrderResponse, Order, OrderResponse,
+	OrderStatus, Settlement, SettlementType, StorageKey, TransactionType,
 };
 
 /// Handles GET /orders/{id} requests.
@@ -94,20 +94,6 @@ async fn convert_order_to_response(order: Order) -> Result<OrderResponse, GetOrd
 	}
 }
 
-/// Creates an ERC-7930 interoperable address string from a token address and chain ID.
-fn create_interop_address_string(token: &str, chain_id: u64) -> Result<String, GetOrderError> {
-	// Parse the token address (with or without 0x prefix)
-	let address = parse_address(token)
-		.map_err(|e| GetOrderError::Internal(format!("Invalid token address: {}", e)))?;
-
-	// Convert to alloy Address type
-	let alloy_address = alloy_primitives::Address::from_slice(&address.0);
-
-	// Create InteropAddress and return as hex string
-	let interop_address = InteropAddress::new_ethereum(chain_id, alloy_address);
-	Ok(interop_address.to_hex())
-}
-
 /// Converts an EIP-7683 order to API OrderResponse format.
 async fn convert_eip7683_order_to_response(
 	order: solver_types::Order,
@@ -156,7 +142,10 @@ async fn convert_eip7683_order_to_response(
 		.ok_or_else(|| GetOrderError::Internal("No input chain ID found".to_string()))?;
 
 	// Convert input token to InteropAddress format
-	let input_interop_address = create_interop_address_string(input_token, input_chain_id)?;
+	let address = parse_address(input_token)
+		.map_err(|e| GetOrderError::Internal(format!("Invalid input token address: {}", e)))?;
+	let interop_address: InteropAddress = (input_chain_id, address).into();
+	let input_interop_address = interop_address.to_hex();
 
 	let input_amount = AssetAmount {
 		asset: input_interop_address,
@@ -212,8 +201,10 @@ async fn convert_eip7683_order_to_response(
 		.ok_or_else(|| GetOrderError::Internal("No output chain ID found".to_string()))?;
 
 	// Convert output token to InteropAddress format
-	let output_interop_address =
-		create_interop_address_string(&output_token_address, output_chain_id)?;
+	let address = parse_address(&output_token_address)
+		.map_err(|e| GetOrderError::Internal(format!("Invalid output token address: {}", e)))?;
+	let interop_address: InteropAddress = (output_chain_id, address).into();
+	let output_interop_address = interop_address.to_hex();
 
 	let output_amount = AssetAmount {
 		asset: output_interop_address,

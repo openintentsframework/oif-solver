@@ -1211,6 +1211,16 @@ impl Quote {
 	}
 }
 
+/// Internal structure combining a Quote with its associated CostContext
+/// Used for storage to enable single I/O operations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuoteWithCostContext {
+	/// The quote data
+	pub quote: Quote,
+	/// The associated cost context from quote generation
+	pub cost_context: crate::costs::CostContext,
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

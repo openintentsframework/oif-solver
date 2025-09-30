@@ -391,6 +391,7 @@ impl Eip7683OffchainDiscovery {
 		lock_type: LockType,
 		providers: &HashMap<u64, RootProvider<Http<reqwest::Client>>>,
 		networks: &NetworksConfig,
+		quote_id: Option<String>,
 	) -> Result<Intent, DiscoveryError> {
 		// Encode StandardOrder to bytes for order_to_intent
 		let order_bytes = Bytes::from(StandardOrder::abi_encode(order));
@@ -498,7 +499,7 @@ impl Eip7683OffchainDiscovery {
 				DiscoveryError::ParseError(format!("Failed to serialize order data: {}", e))
 			})?,
 			order_bytes,
-			quote_id: None, // TODO: add quote id to the intent
+			quote_id,
 			lock_type: lock_type.to_string(),
 		})
 	}
@@ -726,6 +727,7 @@ async fn handle_intent_submission(
 		lock_type,
 		&state.providers,
 		&state.networks,
+		request.quote_id,
 	)
 	.await
 	{
