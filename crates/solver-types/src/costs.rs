@@ -3,7 +3,18 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::InteropAddress;
+use crate::{InteropAddress, SwapType};
+
+/// Token amount information including decimals
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenAmountInfo {
+	/// Token address in interop format
+	pub token: InteropAddress,
+	/// Amount in smallest unit (wei)
+	pub amount: U256,
+	/// Token decimals
+	pub decimals: u8,
+}
 
 /// Detailed breakdown of costs for order processing
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,27 +47,28 @@ pub struct CostBreakdown {
 	#[serde(with = "rust_decimal::serde::str")]
 	pub total: Decimal,
 
-	// Market values (for logging/analysis)
-	#[serde(with = "rust_decimal::serde::str")]
-	pub market_input_value: Decimal,
-	#[serde(with = "rust_decimal::serde::str")]
-	pub market_output_value: Decimal,
-
 	// Metadata
 	pub currency: String,
 }
 
 /// Cost context for quote generation with pre-calculated costs and swap amounts
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostContext {
 	pub cost_breakdown: CostBreakdown,
 	pub execution_costs_by_chain: HashMap<u64, Decimal>,
+	#[serde(with = "rust_decimal::serde::str")]
 	pub liquidity_cost_adjustment: Decimal,
 	pub protocol_fees: HashMap<String, Decimal>,
-	/// Pre-calculated token amounts for costs (token address -> amount in smallest unit)
-	pub cost_amounts_in_tokens: HashMap<InteropAddress, U256>,
-	/// Base swap amounts before cost adjustments (token address -> amount in smallest unit)
+	/// The swap type used for this quote (ExactInput or ExactOutput)
+	pub swap_type: SwapType,
+	/// Pre-calculated token amounts for costs (token address -> TokenAmountInfo)
+	pub cost_amounts_in_tokens: HashMap<InteropAddress, TokenAmountInfo>,
+	/// Base swap amounts before cost adjustments (token address -> TokenAmountInfo)
 	/// For ExactInput: contains calculated output amounts
 	/// For ExactOutput: contains calculated input amounts
-	pub swap_amounts: HashMap<InteropAddress, U256>,
+	pub swap_amounts: HashMap<InteropAddress, TokenAmountInfo>,
+	/// Adjusted token amounts after cost application (token address -> TokenAmountInfo)
+	/// For ExactInput: inputs unchanged, outputs = swap_amounts - cost_amounts
+	/// For ExactOutput: outputs unchanged, inputs = swap_amounts + cost_amounts
+	pub adjusted_amounts: HashMap<InteropAddress, TokenAmountInfo>,
 }
