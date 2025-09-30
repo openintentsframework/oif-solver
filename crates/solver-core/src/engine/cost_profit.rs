@@ -8,6 +8,7 @@
 use crate::engine::token_manager::{TokenManager, TokenManagerError};
 use alloy_primitives::U256;
 use rust_decimal::Decimal;
+use rust_decimal::RoundingStrategy;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
 use solver_pricing::PricingService;
@@ -40,6 +41,21 @@ pub struct GasUnits {
 	pub open_units: u64,
 	pub fill_units: u64,
 	pub claim_units: u64,
+}
+
+/// 10^dp as Decimal
+fn pow10(dp: u32) -> Decimal {
+	let mut f = Decimal::ONE;
+	for _ in 0..dp {
+		f *= Decimal::from(10);
+	}
+	f
+}
+
+/// Ceiling to `dp` decimals.
+fn ceil_dp(x: Decimal, dp: u32) -> Decimal {
+	let f = pow10(dp);
+	(x * f).round_dp_with_strategy(0, RoundingStrategy::ToPositiveInfinity) / f
 }
 
 /// Unified service for cost estimation and profitability calculation.
@@ -374,21 +390,16 @@ impl CostProfitService {
 		// Include min_profit for quotes so users know the total they need to provide
 		let total_with_profit = cost_breakdown.total + cost_breakdown.min_profit;
 
-		// Add a rounding buffer to account for precision loss in token conversions
-		// This ensures that after converting USD -> tokens -> USD, we don't lose the profit margin
-		// Use the greater of: 0.1% or $0.01 (to handle both small and large amounts)
-		let percentage_buffer_bps = Decimal::new(10, 0); // 0.1% = 10 basis points
-		let percentage_buffer = (total_with_profit * percentage_buffer_bps) / Decimal::from(10000);
-		let minimum_buffer = Decimal::new(1, 2); // $0.01 minimum buffer
-		let rounding_buffer = percentage_buffer.max(minimum_buffer);
-		let total_with_profit_and_buffer = total_with_profit + rounding_buffer;
+		// Ceil to cents to protect our margin during USD -> token -> USD round-trip
+		// This ensures we always collect enough to cover costs + min_profit after conversions
+		let total_with_profit_rounded = ceil_dp(total_with_profit, 2);
 
 		let mut cost_amounts_in_tokens = std::collections::HashMap::new();
 
 		// Calculate cost in each requested input token
 		for input in inputs {
 			let cost_in_token = self
-				.convert_usd_to_token_amount(total_with_profit_and_buffer, &input.asset)
+				.convert_usd_to_token_amount(total_with_profit_rounded, &input.asset)
 				.await
 				.unwrap_or(U256::ZERO);
 			cost_amounts_in_tokens.insert(input.asset.clone(), cost_in_token);
@@ -399,7 +410,7 @@ impl CostProfitService {
 			// Only add if not already calculated (in case same token appears in inputs)
 			if !cost_amounts_in_tokens.contains_key(&output.asset) {
 				let cost_in_token = self
-					.convert_usd_to_token_amount(total_with_profit_and_buffer, &output.asset)
+					.convert_usd_to_token_amount(total_with_profit_rounded, &output.asset)
 					.await
 					.unwrap_or(U256::ZERO);
 				cost_amounts_in_tokens.insert(output.asset.clone(), cost_in_token);
@@ -1212,26 +1223,18 @@ impl CostProfitService {
 			CostProfitError::Calculation(format!("Failed to parse token amount: {}", e))
 		})?;
 
-		// Convert to smallest unit (apply decimals)
-		let multiplier = U256::from(10u64).pow(U256::from(token_info.decimals));
+		// Convert to smallest unit (apply decimals), rounding up to ensure we collect enough
+		// This protects our margin when costs are deducted from outputs or added to inputs
+		let multiplier = Decimal::new(10_i64.pow(token_info.decimals as u32), 0);
+		let token_amount_in_smallest = token_amount_decimal * multiplier;
 
-		// Convert decimal to U256 (handle fractional part properly)
-		let whole_part = token_amount_decimal.trunc();
-		let fractional_part = token_amount_decimal - whole_part;
+		// Ceil to ensure we always collect enough to cover costs after USD->token->USD round-trip
+		let token_amount_ceiled = token_amount_in_smallest.ceil();
 
-		// Convert whole part to U256
-		let whole_u256 = U256::from_str(&whole_part.to_string()).map_err(|e| {
-			CostProfitError::Calculation(format!("Failed to convert to U256: {}", e))
+		// Convert to U256
+		let result = U256::from_str(&token_amount_ceiled.to_string()).map_err(|e| {
+			CostProfitError::Calculation(format!("Failed to convert ceiled amount to U256: {}", e))
 		})?;
-
-		// Calculate fractional part in smallest units
-		let fractional_multiplier = Decimal::new(10_i64.pow(token_info.decimals as u32), 0);
-		let fractional_in_smallest = (fractional_part * fractional_multiplier).trunc();
-		let fractional_u256 =
-			U256::from_str(&fractional_in_smallest.to_string()).unwrap_or(U256::ZERO);
-
-		// Combine whole and fractional parts
-		let result = whole_u256 * multiplier + fractional_u256;
 
 		Ok(result)
 	}
