@@ -38,12 +38,24 @@ impl Default for ProtocolRegistry {
 		registry.add_permit2_deployment(31337, PERMIT2_CANONICAL); // Local Anvil
 		registry.add_permit2_deployment(31338, PERMIT2_CANONICAL); // Local Anvil secondary
 
+		// Testnet deployments
+		registry.add_permit2_deployment(84532, PERMIT2_CANONICAL); // Base Sepolia
+		registry.add_permit2_deployment(421614, PERMIT2_CANONICAL); // Arbitrum Sepolia
+		registry.add_permit2_deployment(11155111, PERMIT2_CANONICAL); // Ethereum Sepolia
+		registry.add_permit2_deployment(11155420, PERMIT2_CANONICAL); // Optimism Sepolia
+
 		// Configure EIP-3009 tokens (USDC on various chains)
 		registry.add_eip3009_token(1, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"); // Mainnet USDC
 		registry.add_eip3009_token(137, "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"); // Polygon native USDC
 		registry.add_eip3009_token(42161, "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"); // Arbitrum native USDC
 		registry.add_eip3009_token(10, "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"); // Optimism native USDC
 		registry.add_eip3009_token(8453, "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"); // Base USDC
+
+		// Testnet USDC tokens
+		registry.add_eip3009_token(84532, "0x036CbD53842c5426634e7929541eC2318f3dCF7e"); // Base Sepolia USDC
+		registry.add_eip3009_token(421614, "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d"); // Arbitrum Sepolia USDC
+		registry.add_eip3009_token(11155111, "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"); // Ethereum Sepolia USDC
+		registry.add_eip3009_token(11155420, "0x5fd84259d66Cd46123540766Be93DFE6D43130D7"); // Optimism Sepolia USDC
 
 		// Configure test tokens for demo/development (both chains 31337 and 31338)
 		registry.add_eip3009_token(31337, "0x5FbDB2315678afecb367f032d93F642f64180aa3"); // Demo TOKA chain 31337
