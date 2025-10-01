@@ -463,7 +463,7 @@ impl QuoteGenerator {
 		// TODO: Implement support for multiple destination chains
 		let chain_id = request
 			.intent
-			.outputs
+			.inputs
 			.first()
 			.ok_or_else(|| QuoteError::InvalidRequest("No requested outputs".to_string()))?
 			.asset
