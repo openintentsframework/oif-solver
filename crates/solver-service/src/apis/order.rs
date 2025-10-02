@@ -30,7 +30,7 @@ pub async fn get_order_by_id(
 		);
 	}
 
-	let order = process_order_request(&id, _solver).await?;
+	let order = process_order_request(&with_0x_prefix(&id), _solver).await?;
 
 	Ok(GetOrderResponse { order })
 }
