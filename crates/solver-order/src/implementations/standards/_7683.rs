@@ -681,8 +681,8 @@ impl OrderInterface for Eip7683OrderImpl {
 		// First validate the order
 		let standard_order = self.validate_order(order_bytes).await?;
 
-		// Build tx_data for order ID computation
-		let chain_id = standard_order.originChainId.to::<u64>();
+		// Extract chain info from the order
+		let origin_chain_id = standard_order.originChainId.to::<u64>();
 
 		// Parse lock type
 		let lock_type = lock_type
@@ -690,9 +690,11 @@ impl OrderInterface for Eip7683OrderImpl {
 			.map_err(|e| OrderError::ValidationFailed(format!("Invalid lock type: {}", e)))?;
 
 		// Get settler address and build calldata
-		let settler_address = self.get_settler_address(chain_id, lock_type).map_err(|e| {
-			OrderError::ValidationFailed(format!("Failed to get settler address: {}", e))
-		})?;
+		let settler_address = self
+			.get_settler_address(origin_chain_id, lock_type)
+			.map_err(|e| {
+				OrderError::ValidationFailed(format!("Failed to get settler address: {}", e))
+			})?;
 
 		let calldata = self.build_order_id_call(order_bytes, lock_type)?;
 
@@ -701,9 +703,11 @@ impl OrderInterface for Eip7683OrderImpl {
 		tx_data.extend_from_slice(&settler_address.0);
 		tx_data.extend_from_slice(&calldata);
 
-		let order_id_bytes = order_id_callback(chain_id, tx_data).await.map_err(|e| {
-			OrderError::ValidationFailed(format!("Failed to compute order ID: {}", e))
-		})?;
+		let order_id_bytes = order_id_callback(origin_chain_id, tx_data)
+			.await
+			.map_err(|e| {
+				OrderError::ValidationFailed(format!("Failed to compute order ID: {}", e))
+			})?;
 
 		// Ensure order ID is exactly 32 bytes
 		if order_id_bytes.len() != 32 {
@@ -720,27 +724,9 @@ impl OrderInterface for Eip7683OrderImpl {
 		// Convert order ID bytes to hex string
 		let order_id = alloy_primitives::hex::encode_prefixed(&order_id_bytes);
 
-		// Extract chain info from the order
-		let origin_chain_id = standard_order.originChainId.to::<u64>();
-
-		// Get input network and determine settler address based on lock type
-		let input_network = self.networks.get(&origin_chain_id).ok_or_else(|| {
-			OrderError::ValidationFailed(format!("Chain {} not configured", origin_chain_id))
-		})?;
-
-		let is_compact = lock_type == LockType::ResourceLock;
-		let input_settler_address = if is_compact {
-			input_network
-				.input_settler_compact_address
-				.clone()
-				.unwrap_or_else(|| input_network.input_settler_address.clone())
-		} else {
-			input_network.input_settler_address.clone()
-		};
-
 		let input_chains = vec![solver_types::order::ChainSettlerInfo {
 			chain_id: origin_chain_id,
-			settler_address: input_settler_address,
+			settler_address,
 		}];
 
 		// Build output chains with settler addresses
