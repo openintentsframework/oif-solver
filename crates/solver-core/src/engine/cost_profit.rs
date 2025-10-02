@@ -453,7 +453,7 @@ impl CostProfitService {
 
 		// Ceil to cents to protect our margin during USD -> token -> USD round-trip
 		// This ensures we always collect enough to cover costs + min_profit after conversions
-		let total_with_profit_rounded = ceil_dp(total_with_profit, 3);
+		let total_with_profit_rounded = ceil_dp(total_with_profit, 2);
 
 		let mut cost_amounts_in_tokens = std::collections::HashMap::new();
 
@@ -842,20 +842,20 @@ impl CostProfitService {
 			│  └─ Effective Rate:     {:.1}%\n\
 			├─ Order Economics:\n\
 			│  ├─ Input:\n\
-			│  │  ├─ USD Value:       $ {:>7.2}\n\
+			│  │  ├─ USD Value:       $ {:>7.4}\n\
 			│  ├─ Output:\n\
-			│  │  ├─ USD Value:       $ {:>7.2}\n\
+			│  │  ├─ USD Value:       $ {:>7.4}\n\
 			│  └─ Spread:\n\
-			│     ├─ Amount:          $ {:>7.2} ({})\n\
-			│     └─ Solver P&L:      $ {:>7.2} (after ${:.2} costs)\n\
+			│     ├─ Amount:          $ {:>7.4} ({})\n\
+			│     └─ Solver P&L:      $ {:>7.4} (after ${:.2} costs)\n\
 			├─ Cost Breakdown:\n\
 			│  ├─ Gas Costs:\n\
-			│  │  ├─ Open:            $ {:>7.2}\n\
-			│  │  ├─ Fill:            $ {:>7.2}\n\
-			│  │  ├─ Claim:           $ {:>7.2}\n\
-			│  │  └─ Buffer (10%):    $ {:>7.2}\n\
-			│  ├─ Total Operational:  $ {:>7.2}\n\
-			│  └─ Solver Profit:      $ {:>7.2} (target: {:.1}% of transaction)\n\
+			│  │  ├─ Open:            $ {:>7.4}\n\
+			│  │  ├─ Fill:            $ {:>7.4}\n\
+			│  │  ├─ Claim:           $ {:>7.4}\n\
+			│  │  └─ Buffer (10%):    $ {:>7.4}\n\
+			│  ├─ Total Operational:  $ {:>7.4}\n\
+			│  └─ Solver Profit:      $ {:>7.4} (target: {:.1}% of transaction)\n\
 			├─ Validation Result:\n\
 			│  ├─ Profit Margin:      {:.2}%\n\
 			│  ├─ Min Required:       {:.2}%\n\
