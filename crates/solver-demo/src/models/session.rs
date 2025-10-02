@@ -92,6 +92,8 @@ pub struct ContractAddresses {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub compact: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
+	pub input_settler_compact: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub allocator: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub oracle: Option<String>,

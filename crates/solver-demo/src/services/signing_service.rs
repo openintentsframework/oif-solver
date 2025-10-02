@@ -4,24 +4,30 @@
 //! including EIP-712 typed data, Permit2 signatures, EIP-3009 authorizations,
 //! and Compact signatures.
 
+use alloy_dyn_abi::DynSolValue;
+use alloy_primitives::{keccak256, Address, PrimitiveSignature, B256, U256};
+use alloy_provider::Provider;
+use alloy_rpc_types::TransactionRequest;
+use alloy_signer::SignerSync;
+use alloy_signer_local::PrivateKeySigner;
 use anyhow::{anyhow, Result};
-use ethers::{
-	abi::{encode, Token},
-	prelude::*,
-	types::{transaction::eip712, H256, U256 as EthersU256},
-	utils::keccak256,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use solver_types::api::{OrderPayload, Quote, SignatureType};
+use solver_types::{
+	api::{OrderPayload, Quote},
+	standards::eip7683::interfaces::StandardOrder,
+	utils::conversion::parse_bytes32_from_hex,
+};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::info;
 
+use crate::utils::address::to_checksum_address;
+
 /// Service for handling cryptographic signatures.
-#[derive(Debug, Clone)]
 pub struct SigningService {
-	/// Optional wallet for signing operations.
-	wallet: Option<LocalWallet>,
+	/// Contract manager for RPC calls to fetch domain separators.
+	contract_manager: Arc<crate::core::ContractManager>,
 }
 
 /// EIP-712 domain separator structure.
@@ -74,58 +80,90 @@ pub enum SignatureScheme {
 }
 
 impl SigningService {
-	/// Creates a new SigningService with an optional private key.
-	pub fn new(private_key: Option<String>) -> Result<Self> {
-		let wallet = if let Some(key) = private_key {
-			let wallet = key
-				.parse::<LocalWallet>()
-				.map_err(|e| anyhow!("Failed to parse private key: {}", e))?;
-			Some(wallet)
-		} else {
-			None
-		};
-
-		Ok(Self { wallet })
+	/// Creates a new SigningService with a contract manager.
+	pub fn new(contract_manager: Arc<crate::core::ContractManager>) -> Self {
+		Self { contract_manager }
 	}
 
-	/// Signs a quote using the appropriate signature scheme.
-	pub async fn sign_quote(&self, quote: &Quote) -> Result<String> {
+	/// Fetches the domain separator from a contract.
+	async fn fetch_domain_separator(
+		&self,
+		chain_id: u64,
+		verifying_contract: Address,
+	) -> Result<[u8; 32]> {
+		let provider = self.contract_manager.get_provider(chain_id).await?;
+
+		// Call DOMAIN_SEPARATOR() on the contract
+		let call_data =
+			hex::decode("3644e515").map_err(|e| anyhow!("Failed to decode call data: {}", e))?; // DOMAIN_SEPARATOR()
+		let tx = TransactionRequest::default()
+			.to(verifying_contract)
+			.input(call_data.into());
+		let result = provider
+			.call(&tx)
+			.await
+			.map_err(|e| anyhow!("Failed to call DOMAIN_SEPARATOR: {}", e))?;
+
+		if result.len() != 32 {
+			return Err(anyhow!("Invalid domain separator length: {}", result.len()));
+		}
+
+		let mut domain_separator = [0u8; 32];
+		domain_separator.copy_from_slice(&result);
+		Ok(domain_separator)
+	}
+
+	/// Signs a quote using the appropriate signature scheme with the provided private key.
+	pub async fn sign_quote(&self, quote: &Quote, private_key: &str) -> Result<String> {
 		info!("Signing quote with ID: {}", quote.quote_id);
 
-		let payload = match &quote.order {
-			solver_types::api::OifOrder::OifEscrowV0 { payload } => payload,
-			solver_types::api::OifOrder::OifResourceLockV0 { payload } => payload,
-			solver_types::api::OifOrder::Oif3009V0 { payload, .. } => payload,
-			solver_types::api::OifOrder::OifGenericV0 { .. } => {
-				return Err(anyhow!("Generic orders not supported for signing"));
+		match &quote.order {
+			solver_types::api::OifOrder::OifEscrowV0 { payload } => {
+				self.sign_eip712_payload(payload, None, private_key).await
 			},
-		};
-
-		match payload.signature_type {
-			SignatureType::Eip712 => self.sign_eip712_payload(payload).await,
-			SignatureType::Eip3009 => self.sign_eip3009_payload(payload).await,
+			solver_types::api::OifOrder::OifResourceLockV0 { payload } => {
+				self.sign_eip712_payload(payload, None, private_key).await
+			},
+			solver_types::api::OifOrder::Oif3009V0 { payload, metadata } => {
+				self.sign_eip712_payload(payload, Some(metadata), private_key)
+					.await
+			},
+			solver_types::api::OifOrder::OifGenericV0 { .. } => {
+				Err(anyhow!("Generic orders not supported for signing"))
+			},
 		}
 	}
 
 	/// Signs an EIP-712 payload.
-	async fn sign_eip712_payload(&self, payload: &OrderPayload) -> Result<String> {
-		let wallet = self
-			.wallet
-			.as_ref()
-			.ok_or_else(|| anyhow!("No wallet configured for signing"))?;
+	async fn sign_eip712_payload(
+		&self,
+		payload: &OrderPayload,
+		metadata: Option<&serde_json::Value>,
+		private_key: &str,
+	) -> Result<String> {
+		let wallet = private_key
+			.parse::<PrivateKeySigner>()
+			.map_err(|e| anyhow!("Failed to parse private key: {}", e))?;
 
 		// Determine the type of EIP-712 signature based on primary type
 		let (digest, signature_type) = match payload.primary_type.as_str() {
-			"ReceiveWithAuthorization" | "TransferWithAuthorization" | "CancelAuthorization" => (
-				self.compute_eip3009_digest(payload)?,
-				SignatureScheme::Eip3009,
-			),
+			"ReceiveWithAuthorization" | "TransferWithAuthorization" | "CancelAuthorization" => {
+				let metadata = metadata.ok_or_else(|| anyhow!("Missing metadata for EIP-3009"))?;
+				println!(
+					"✏️ [SIGNING] Processing EIP-3009 signature for {}",
+					payload.primary_type
+				);
+				(
+					self.compute_eip3009_digest(payload, metadata).await?,
+					SignatureScheme::Eip3009,
+				)
+			},
 			"PermitBatchWitnessTransferFrom" | "PermitWitnessTransferFrom" => (
 				self.compute_permit2_digest(payload)?,
 				SignatureScheme::Permit2,
 			),
 			"BatchCompact" | "Compact" => (
-				self.compute_compact_digest(payload)?,
+				self.compute_compact_digest(payload).await?,
 				SignatureScheme::Compact,
 			),
 			_ => {
@@ -140,8 +178,9 @@ impl SigningService {
 			},
 		};
 
+		println!("✏️ [SIGNING] Signing digest with wallet...");
 		let signature = wallet
-			.sign_hash(H256::from(digest))
+			.sign_hash_sync(&B256::from(digest))
 			.map_err(|e| anyhow!("Failed to sign digest: {}", e))?;
 
 		let sig_bytes = self.encode_signature(signature);
@@ -149,127 +188,41 @@ impl SigningService {
 		// Add signature type prefix based on the scheme
 		let prefixed_signature = match signature_type {
 			SignatureScheme::Permit2 => {
+				println!("✏️ [SIGNING] Raw signature: 0x{}", hex::encode(&sig_bytes));
 				// Prefix with 0x00 for Permit2
 				let mut prefixed = vec![0x00];
 				prefixed.extend_from_slice(&sig_bytes);
+				println!(
+					"✏️ [SIGNING] Permit2 prefixed signature: 0x{}",
+					hex::encode(&prefixed)
+				);
 				prefixed
 			},
 			SignatureScheme::Eip3009 => {
+				println!("✏️ [SIGNING] Raw signature: 0x{}", hex::encode(&sig_bytes));
 				// Prefix with 0x01 for EIP-3009
 				let mut prefixed = vec![0x01];
 				prefixed.extend_from_slice(&sig_bytes);
+				println!(
+					"✏️ [SIGNING] EIP-3009 prefixed signature: 0x{}",
+					hex::encode(&prefixed)
+				);
 				prefixed
 			},
-			SignatureScheme::Compact | SignatureScheme::Generic => {
-				// No prefix for Compact or generic signatures
+			SignatureScheme::Compact => {
+				println!("sig_bytes {:?}", sig_bytes);
+				// For Compact signatures, ABI-encode as (sponsorSig, allocatorSig) like Bash script
+				// allocatorData is empty (0x) for simple allocators like AlwaysOKAllocator
+				self.encode_compact_signature(sig_bytes)
+			},
+			SignatureScheme::Generic => {
+				println!("✏️ [SIGNING] Raw signature: 0x{}", hex::encode(&sig_bytes));
+				// No prefix for generic signatures
 				sig_bytes
 			},
 		};
 
 		Ok(format!("0x{}", hex::encode(prefixed_signature)))
-	}
-
-	/// Signs an EIP-3009 authorization payload.
-	async fn sign_eip3009_payload(&self, payload: &OrderPayload) -> Result<String> {
-		let wallet = self
-			.wallet
-			.as_ref()
-			.ok_or_else(|| anyhow!("No wallet configured for signing"))?;
-
-		let message = &payload.message;
-
-		let from = self.extract_address(message, "from")?;
-		let to = self.extract_address(message, "to")?;
-		let value = self.extract_u256(message, "value")?;
-		let validity_start = self.extract_u256(message, "validAfter")?;
-		let validity_end = self.extract_u256(message, "validBefore")?;
-		let nonce = self.extract_bytes32(message, "nonce")?;
-
-		let domain_separator = self.compute_eip3009_domain_separator(&payload.domain)?;
-
-		let type_hash = keccak256(
-            "TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
-        );
-
-		let encoded = encode(&[
-			Token::FixedBytes(type_hash.to_vec()),
-			Token::Address(from),
-			Token::Address(to),
-			Token::Uint(value),
-			Token::Uint(validity_start),
-			Token::Uint(validity_end),
-			Token::FixedBytes(nonce.to_vec()),
-		]);
-
-		let struct_hash = keccak256(encoded);
-		let digest = self.compute_eip712_digest(domain_separator, struct_hash)?;
-
-		let signature = wallet
-			.sign_hash(H256::from(digest))
-			.map_err(|e| anyhow!("Failed to sign EIP-3009 digest: {}", e))?;
-
-		let sig_bytes = self.encode_signature(signature);
-
-		// Prefix with 0x01 for EIP-3009 signatures
-		let mut prefixed = vec![0x01];
-		prefixed.extend_from_slice(&sig_bytes);
-
-		Ok(format!("0x{}", hex::encode(prefixed)))
-	}
-
-	/// Signs a Permit2 authorization.
-	pub async fn sign_permit2(&self, permit_data: &Permit2Data) -> Result<String> {
-		let wallet = self
-			.wallet
-			.as_ref()
-			.ok_or_else(|| anyhow!("No wallet configured for signing"))?;
-
-		let domain = eip712::EIP712Domain {
-			name: Some("Permit2".to_string()),
-			version: Some("1".to_string()),
-			chain_id: Some(permit_data.chain_id.into()),
-			verifying_contract: Some(permit_data.permit2_address),
-			salt: None,
-		};
-
-		let domain_separator = domain.separator();
-
-		let type_hash = if permit_data.is_batch {
-			keccak256("PermitBatchWitnessTransferFrom(TokenPermissions[] permitted,address spender,uint256 nonce,uint256 deadline,bytes32 witness)")
-		} else {
-			keccak256("PermitWitnessTransferFrom(TokenPermissions permitted,address spender,uint256 nonce,uint256 deadline,bytes32 witness)")
-		};
-
-		let _witness_type_hash = keccak256(&permit_data.witness_type_string);
-		let witness_hash = keccak256(&permit_data.witness_data);
-
-		let mut encoded = Vec::new();
-		encoded.extend_from_slice(&type_hash);
-
-		if permit_data.is_batch {
-			let permissions_hash = self.hash_token_permissions_batch(&permit_data.permissions)?;
-			encoded.extend_from_slice(&permissions_hash);
-		} else {
-			let permission_hash = self.hash_token_permission(&permit_data.permissions[0])?;
-			encoded.extend_from_slice(&permission_hash);
-		}
-
-		encoded.extend_from_slice(&encode(&[
-			Token::Address(permit_data.spender),
-			Token::Uint(permit_data.nonce),
-			Token::Uint(permit_data.deadline),
-			Token::FixedBytes(witness_hash.to_vec()),
-		]));
-
-		let struct_hash = keccak256(&encoded);
-		let digest = self.compute_eip712_digest(domain_separator, struct_hash)?;
-
-		let signature = wallet
-			.sign_hash(H256::from(digest))
-			.map_err(|e| anyhow!("Failed to sign Permit2 digest: {}", e))?;
-
-		let sig_bytes = self.encode_compact_signature(signature, permit_data.compact);
-		Ok(format!("0x{}", hex::encode(sig_bytes)))
 	}
 
 	/// Constructs typed data from an order payload.
@@ -315,23 +268,16 @@ impl SigningService {
 			"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
 		);
 
-		let encoded = encode(&[
-			Token::FixedBytes(domain_type_hash.to_vec()),
-			Token::FixedBytes(keccak256(domain.name.as_bytes()).to_vec()),
-			Token::FixedBytes(keccak256(domain.version.as_bytes()).to_vec()),
-			Token::Uint(domain.chain_id.into()),
-			Token::Address(domain.verifying_contract),
-		]);
+		let encoded = DynSolValue::Tuple(vec![
+			DynSolValue::FixedBytes(domain_type_hash, 32),
+			DynSolValue::FixedBytes(keccak256(domain.name.as_bytes()), 32),
+			DynSolValue::FixedBytes(keccak256(domain.version.as_bytes()), 32),
+			DynSolValue::Uint(U256::from(domain.chain_id), 256),
+			DynSolValue::Address(domain.verifying_contract),
+		])
+		.abi_encode();
 
-		Ok(keccak256(encoded))
-	}
-
-	/// Computes the domain separator for EIP-3009.
-	fn compute_eip3009_domain_separator(&self, domain_value: &Value) -> Result<[u8; 32]> {
-		let domain: EIP712Domain = serde_json::from_value(domain_value.clone())
-			.map_err(|e| anyhow!("Failed to parse EIP-3009 domain: {}", e))?;
-
-		self.compute_domain_separator(&domain)
+		Ok(keccak256(encoded).into())
 	}
 
 	/// Computes the struct hash for typed data.
@@ -339,19 +285,111 @@ impl SigningService {
 		let message_str = serde_json::to_string(&typed_data.message)
 			.map_err(|e| anyhow!("Failed to serialize message: {}", e))?;
 
-		Ok(keccak256(message_str.as_bytes()))
+		Ok(keccak256(message_str.as_bytes()).into())
 	}
 
-	/// Computes the digest for EIP-3009 signatures.
-	fn compute_eip3009_digest(&self, payload: &OrderPayload) -> Result<[u8; 32]> {
-		// EIP-3009 domains don't have version field
-		let domain_type_hash =
-			keccak256("EIP712Domain(string name,uint256 chainId,address verifyingContract)");
+	/// Computes the digest for EIP-3009 signatures with metadata.
+	async fn compute_eip3009_digest(
+		&self,
+		payload: &OrderPayload,
+		metadata: &serde_json::Value,
+	) -> Result<[u8; 32]> {
+		use solver_types::OifOrder;
 
-		let domain = payload.domain.clone();
-		let name = domain["name"]
+		println!("🔍 [EIP-3009] Starting digest computation with metadata");
+		println!(
+			"🔍 [EIP-3009] Metadata: {}",
+			serde_json::to_string_pretty(metadata)
+				.unwrap_or_else(|_| "Failed to serialize".to_string())
+		);
+
+		// Build OifOrder::Oif3009V0 to use the TryFrom implementation
+		let oif_order = OifOrder::Oif3009V0 {
+			payload: payload.clone(),
+			metadata: metadata.clone(),
+		};
+
+		// Convert to StandardOrder using the public TryFrom implementation
+		let standard_order = StandardOrder::try_from(&oif_order)
+			.map_err(|e| anyhow!("Failed to build StandardOrder from EIP-3009 payload: {}", e))?;
+
+		println!("🔍 [DEMO SIGNING] StandardOrder built by demo for signing:");
+		println!("{:#?}", standard_order);
+
+		// Get the chain ID from domain
+		let domain = payload
+			.domain
+			.as_object()
+			.ok_or_else(|| anyhow!("Missing domain in payload"))?;
+		let chain_id = domain["chainId"]
 			.as_str()
-			.ok_or_else(|| anyhow!("Missing domain name"))?;
+			.and_then(|s| s.parse::<u64>().ok())
+			.or_else(|| domain["chainId"].as_u64())
+			.ok_or_else(|| anyhow!("Missing or invalid chainId"))?;
+
+		// Get the InputSettler address from the EIP-3009 message "to" field
+		let message = payload
+			.message
+			.as_object()
+			.ok_or_else(|| anyhow!("Missing message in payload"))?;
+		let input_settler_str = message["to"]
+			.as_str()
+			.ok_or_else(|| anyhow!("Missing 'to' address in EIP-3009 message"))?;
+		let input_settler_address: alloy_primitives::Address = input_settler_str
+			.parse()
+			.map_err(|e| anyhow!("Invalid InputSettler address: {}", e))?;
+
+		println!("🔍 [EIP-3009] Contract call params:");
+		println!("  - chain_id: {}", chain_id);
+		println!(
+			"  - input_settler_address: {}",
+			to_checksum_address(&input_settler_address, None)
+		);
+
+		// Compute the correct order identifier from the contract
+		let order_identifier = self
+			.contract_manager
+			.compute_order_identifier(chain_id, input_settler_address, &standard_order)
+			.await
+			.map_err(|e| anyhow!("Failed to compute order identifier from contract: {}", e))?;
+
+		println!(
+			"🔍 [EIP-3009] Contract returned order identifier: 0x{}",
+			hex::encode(order_identifier)
+		);
+
+		// Now compute the EIP-3009 digest using the contract-computed order identifier
+		let digest = self
+			.compute_eip3009_digest_with_order_id(payload, metadata, order_identifier)
+			.await?;
+
+		println!("🔍 [EIP-3009] Final digest: 0x{}", hex::encode(digest));
+
+		Ok(digest)
+	}
+
+	/// Computes the digest for EIP-3009 signatures with a provided order identifier.
+	async fn compute_eip3009_digest_with_order_id(
+		&self,
+		payload: &OrderPayload,
+		_metadata: &serde_json::Value,
+		order_identifier: [u8; 32],
+	) -> Result<[u8; 32]> {
+		println!(
+			"🔐 [DIGEST] Computing EIP-3009 digest with order identifier: 0x{}",
+			hex::encode(order_identifier)
+		);
+
+		let domain = payload
+			.domain
+			.as_object()
+			.ok_or_else(|| anyhow!("Missing domain in payload"))?;
+		let message = payload
+			.message
+			.as_object()
+			.ok_or_else(|| anyhow!("Missing message in payload"))?;
+
+		// Extract domain info
 		let chain_id = domain["chainId"]
 			.as_str()
 			.and_then(|s| s.parse::<u64>().ok())
@@ -363,115 +401,200 @@ impl SigningService {
 			.parse::<Address>()
 			.map_err(|e| anyhow!("Invalid verifyingContract: {}", e))?;
 
-		let domain_separator = keccak256(encode(&[
-			Token::FixedBytes(domain_type_hash.to_vec()),
-			Token::FixedBytes(keccak256(name.as_bytes()).to_vec()),
-			Token::Uint(chain_id.into()),
-			Token::Address(verifying_contract),
-		]));
-
-		// Compute struct hash based on ReceiveWithAuthorization
-		let type_hash = keccak256(
-			"ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
+		println!(
+			"🔐 [DIGEST] Token contract (verifyingContract): {}",
+			to_checksum_address(&verifying_contract, None)
 		);
 
-		let message = &payload.message;
-		let from = self.extract_address(message, "from")?;
-		let to = self.extract_address(message, "to")?;
-		let value = self.extract_u256(message, "value")?;
-		let valid_after = self.extract_u256(message, "validAfter")?;
-		let valid_before = self.extract_u256(message, "validBefore")?;
-		let nonce = self.extract_bytes32(message, "nonce")?;
+		// Fetch domain separator directly from token contract like Bash scripts do
+		println!("🔐 [DIGEST] Fetching domain separator directly from token contract (matching Bash behavior)");
+		let domain_separator = self
+			.fetch_domain_separator(chain_id, verifying_contract)
+			.await?;
 
-		let struct_hash = keccak256(encode(&[
-			Token::FixedBytes(type_hash.to_vec()),
-			Token::Address(from),
-			Token::Address(to),
-			Token::Uint(value),
-			Token::Uint(valid_after),
-			Token::Uint(valid_before),
-			Token::FixedBytes(nonce.to_vec()),
-		]));
+		println!(
+			"🔐 [DIGEST] Final domain separator used: 0x{}",
+			hex::encode(domain_separator)
+		);
 
-		self.compute_eip712_digest(domain_separator, struct_hash)
+		// Extract message fields
+		let from_str = message["from"]
+			.as_str()
+			.ok_or_else(|| anyhow!("Missing from address"))?;
+		let from = from_str
+			.parse::<Address>()
+			.map_err(|e| anyhow!("Invalid from address: {}", e))?;
+
+		let to_str = message["to"]
+			.as_str()
+			.ok_or_else(|| anyhow!("Missing to address"))?;
+		let to = to_str
+			.parse::<Address>()
+			.map_err(|e| anyhow!("Invalid to address: {}", e))?;
+
+		let value = message["value"]
+			.as_str()
+			.ok_or_else(|| anyhow!("Missing value"))?
+			.parse::<U256>()
+			.map_err(|e| anyhow!("Invalid value: {}", e))?;
+
+		let valid_after = message["validAfter"]
+			.as_u64()
+			.or_else(|| {
+				message["validAfter"]
+					.as_str()
+					.and_then(|s| s.parse::<u64>().ok())
+			})
+			.unwrap_or(0);
+		let valid_before = message["validBefore"]
+			.as_u64()
+			.or_else(|| {
+				message["validBefore"]
+					.as_str()
+					.and_then(|s| s.parse::<u64>().ok())
+			})
+			.unwrap_or(0);
+
+		// Use nonce from message (this is what the solver computed and set)
+		let nonce_str = message["nonce"]
+			.as_str()
+			.ok_or_else(|| anyhow!("Missing nonce in EIP-3009 message"))?;
+		let nonce_array = parse_bytes32_from_hex(nonce_str)
+			.map_err(|e| anyhow!("Invalid nonce: {}", e))?;
+
+		println!("🔐 [DIGEST] EIP-3009 message fields:");
+		println!("  - from: {}", to_checksum_address(&from, None));
+		println!("  - to: {}", to_checksum_address(&to, None));
+		println!("  - value: {}", value);
+		println!("  - validAfter: {}", valid_after);
+		println!("  - validBefore: {}", valid_before);
+		println!("  - nonce from message: {}", nonce_str);
+		println!(
+			"  - order_identifier (computed): 0x{}",
+			hex::encode(order_identifier)
+		);
+		println!(
+			"  - using nonce from message: 0x{}",
+			hex::encode(nonce_array)
+		);
+
+		// Compute struct hash for ReceiveWithAuthorization
+		let type_hash = keccak256(
+			"ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)",
+		);
+
+		println!("🔐 [DIGEST] Type hash: 0x{}", hex::encode(type_hash));
+
+		let encoded = DynSolValue::Tuple(vec![
+			DynSolValue::FixedBytes(type_hash, 32),
+			DynSolValue::Address(from),
+			DynSolValue::Address(to),
+			DynSolValue::Uint(value, 256),
+			DynSolValue::Uint(U256::from(valid_after), 256),
+			DynSolValue::Uint(U256::from(valid_before), 256),
+			DynSolValue::FixedBytes(nonce_array.into(), 32),
+		])
+		.abi_encode();
+
+		let struct_hash = keccak256(encoded);
+		println!("🔐 [DIGEST] Struct hash: 0x{}", hex::encode(struct_hash));
+
+		// Final EIP-712 digest
+		let final_digest = self.compute_eip712_digest(domain_separator, struct_hash.into())?;
+		println!(
+			"🔐 [DIGEST] Final EIP-712 digest: 0x{}",
+			hex::encode(final_digest)
+		);
+
+		Ok(final_digest)
 	}
 
 	/// Computes the digest for Permit2 signatures.
 	fn compute_permit2_digest(&self, payload: &OrderPayload) -> Result<[u8; 32]> {
-		// Permit2 domains don't have version field
-		let domain_type_hash =
-			keccak256("EIP712Domain(string name,uint256 chainId,address verifyingContract)");
+		use solver_types::utils::reconstruct_permit2_digest;
 
-		let domain = payload.domain.clone();
-		let name = domain["name"]
-			.as_str()
-			.ok_or_else(|| anyhow!("Missing domain name"))?;
-		let chain_id = domain["chainId"]
-			.as_str()
-			.and_then(|s| s.parse::<u64>().ok())
-			.or_else(|| domain["chainId"].as_u64())
-			.ok_or_else(|| anyhow!("Missing or invalid chainId"))?;
-		let verifying_contract = domain["verifyingContract"]
-			.as_str()
-			.ok_or_else(|| anyhow!("Missing verifyingContract"))?
-			.parse::<Address>()
-			.map_err(|e| anyhow!("Invalid verifyingContract: {}", e))?;
+		println!("🔍 [PERMIT2] Computing Permit2 digest");
+		println!(
+			"🔍 [PERMIT2] Payload domain: {}",
+			serde_json::to_string_pretty(&payload.domain)
+				.unwrap_or_else(|_| "Failed to serialize".to_string())
+		);
+		println!(
+			"🔍 [PERMIT2] Payload message: {}",
+			serde_json::to_string_pretty(&payload.message)
+				.unwrap_or_else(|_| "Failed to serialize".to_string())
+		);
+		println!("🔍 [PERMIT2] Primary type: {}", payload.primary_type);
 
-		let domain_separator = keccak256(encode(&[
-			Token::FixedBytes(domain_type_hash.to_vec()),
-			Token::FixedBytes(keccak256(name.as_bytes()).to_vec()),
-			Token::Uint(chain_id.into()),
-			Token::Address(verifying_contract),
-		]));
+		// Use the existing reconstruction function which handles all the complex logic
+		let digest = reconstruct_permit2_digest(payload)
+			.map_err(|e| anyhow!("Failed to reconstruct Permit2 digest: {}", e))?;
 
-		// For Permit2, we need to compute the struct hash properly
-		// This is a simplified version - full implementation would need to handle the nested structures
-		let message_str = serde_json::to_string(&payload.message)
-			.map_err(|e| anyhow!("Failed to serialize message: {}", e))?;
-		let struct_hash = keccak256(message_str.as_bytes());
+		println!("🔍 [PERMIT2] Final digest: 0x{}", hex::encode(digest));
 
-		self.compute_eip712_digest(domain_separator, struct_hash)
+		Ok(digest)
 	}
 
 	/// Computes the digest for Compact signatures.
-	fn compute_compact_digest(&self, payload: &OrderPayload) -> Result<[u8; 32]> {
-		// Compact domains have version field
-		let domain_type_hash = keccak256(
-			"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+	async fn compute_compact_digest(&self, payload: &OrderPayload) -> Result<[u8; 32]> {
+		println!("🔍 [COMPACT] Computing BatchCompact digest with contract domain separator");
+		println!(
+			"🔍 [COMPACT] Payload domain: {}",
+			serde_json::to_string_pretty(&payload.domain)
+				.unwrap_or_else(|_| "Failed to serialize".to_string())
+		);
+		println!(
+			"🔍 [COMPACT] Payload message: {}",
+			serde_json::to_string_pretty(&payload.message)
+				.unwrap_or_else(|_| "Failed to serialize".to_string())
 		);
 
-		let domain = payload.domain.clone();
-		let name = domain["name"]
-			.as_str()
-			.ok_or_else(|| anyhow!("Missing domain name"))?;
-		let version = domain["version"]
-			.as_str()
-			.ok_or_else(|| anyhow!("Missing domain version"))?;
-		let chain_id = domain["chainId"]
-			.as_str()
-			.and_then(|s| s.parse::<u64>().ok())
-			.or_else(|| domain["chainId"].as_u64())
+		// Extract domain info to fetch domain separator from contract
+		let domain = payload
+			.domain
+			.as_object()
+			.ok_or_else(|| anyhow!("Missing domain"))?;
+		let chain_id = domain
+			.get("chainId")
+			.and_then(|c| {
+				c.as_str()
+					.and_then(|s| s.parse::<u64>().ok())
+					.or_else(|| c.as_u64())
+			})
 			.ok_or_else(|| anyhow!("Missing or invalid chainId"))?;
-		let verifying_contract = domain["verifyingContract"]
-			.as_str()
-			.ok_or_else(|| anyhow!("Missing verifyingContract"))?
+		let verifying_contract_str = domain
+			.get("verifyingContract")
+			.and_then(|v| v.as_str())
+			.ok_or_else(|| anyhow!("Missing verifyingContract"))?;
+		let verifying_contract = verifying_contract_str
 			.parse::<Address>()
 			.map_err(|e| anyhow!("Invalid verifyingContract: {}", e))?;
 
-		let domain_separator = keccak256(encode(&[
-			Token::FixedBytes(domain_type_hash.to_vec()),
-			Token::FixedBytes(keccak256(name.as_bytes()).to_vec()),
-			Token::FixedBytes(keccak256(version.as_bytes()).to_vec()),
-			Token::Uint(chain_id.into()),
-			Token::Address(verifying_contract),
-		]));
+		println!(
+			"🔍 [COMPACT] Fetching domain separator from contract: {} on chain {}",
+			verifying_contract, chain_id
+		);
 
-		// For Compact, compute the struct hash
-		let message_str = serde_json::to_string(&payload.message)
-			.map_err(|e| anyhow!("Failed to serialize message: {}", e))?;
-		let struct_hash = keccak256(message_str.as_bytes());
+		// Fetch domain separator directly from TheCompact contract (matching shell script behavior)
+		let domain_separator = self
+			.fetch_domain_separator(chain_id, verifying_contract)
+			.await?;
 
-		self.compute_eip712_digest(domain_separator, struct_hash)
+		println!(
+			"🔍 [COMPACT] Contract domain separator: 0x{}",
+			hex::encode(domain_separator)
+		);
+
+		// Use custom compact digest computation with contract-fetched domain separator
+		// This is based on solver_types::utils::reconstruct_compact_digest but uses
+		// the domain separator fetched from the contract
+		let digest =
+			solver_types::utils::reconstruct_compact_digest(payload, Some(domain_separator))
+				.map_err(|e| anyhow!("Failed to reconstruct Compact digest: {}", e))?;
+
+		println!("🔍 [COMPACT] Final digest: 0x{}", hex::encode(digest));
+
+		Ok(digest)
 	}
 
 	/// Computes the final EIP-712 digest.
@@ -486,115 +609,89 @@ impl SigningService {
 		digest_input.extend_from_slice(&domain_separator);
 		digest_input.extend_from_slice(&struct_hash);
 
-		Ok(keccak256(&digest_input))
+		Ok(keccak256(&digest_input).into())
 	}
 
 	/// Encodes a signature into bytes.
-	fn encode_signature(&self, signature: Signature) -> Vec<u8> {
+	fn encode_signature(&self, signature: PrimitiveSignature) -> Vec<u8> {
 		let mut sig_bytes = Vec::with_capacity(65);
-		let mut r_bytes = [0u8; 32];
-		signature.r.to_big_endian(&mut r_bytes);
-		sig_bytes.extend_from_slice(&r_bytes);
-		let mut s_bytes = [0u8; 32];
-		signature.s.to_big_endian(&mut s_bytes);
-		sig_bytes.extend_from_slice(&s_bytes);
-		sig_bytes.push(signature.v as u8);
+		// alloy PrimitiveSignature has r, s as U256 and v as Parity
+		sig_bytes.extend_from_slice(&signature.r().to_be_bytes::<32>());
+		sig_bytes.extend_from_slice(&signature.s().to_be_bytes::<32>());
+		let v_value = if signature.v() { 28u8 } else { 27u8 };
+		sig_bytes.push(v_value);
+
+		println!("🔐 [SIGNATURE] Signature components:");
+		println!(
+			"  - r: 0x{}",
+			hex::encode(signature.r().to_be_bytes::<32>())
+		);
+		println!(
+			"  - s: 0x{}",
+			hex::encode(signature.s().to_be_bytes::<32>())
+		);
+		println!("  - v: {} (recovery: {})", v_value, signature.v());
+
 		sig_bytes
 	}
 
-	/// Encodes a signature in compact format if requested.
-	fn encode_compact_signature(&self, signature: Signature, compact: bool) -> Vec<u8> {
-		if compact {
-			let mut sig_bytes = Vec::with_capacity(64);
-			let mut r_bytes = [0u8; 32];
-			signature.r.to_big_endian(&mut r_bytes);
-			sig_bytes.extend_from_slice(&r_bytes);
+	/// ABI-encodes a compact signature as (sponsorSig, allocatorSig) for TheCompact protocol
+	fn encode_compact_signature(&self, sponsor_sig: Vec<u8>) -> Vec<u8> {
+		// Empty allocator signature for basic flows (matching Bash script)
+		let allocator_sig: Vec<u8> = Vec::new();
 
-			let mut s_bytes = [0u8; 32];
-			signature.s.to_big_endian(&mut s_bytes);
-			if signature.v == 28 {
-				s_bytes[0] |= 0x80;
-			}
-			sig_bytes.extend_from_slice(&s_bytes);
-			sig_bytes
-		} else {
-			self.encode_signature(signature)
-		}
+		println!("🔐 [COMPACT] Encoding signature as (sponsorSig, allocatorSig)");
+		println!(
+			"🔐 [COMPACT] Sponsor signature: 0x{}",
+			hex::encode(&sponsor_sig)
+		);
+		println!(
+			"🔐 [COMPACT] Allocator signature: 0x{}",
+			hex::encode(&allocator_sig)
+		);
+
+		// Manual ABI encoding to match cast abi-encode "f(bytes,bytes)" exactly
+		// This avoids the tuple overhead that DynSolValue::Tuple creates
+		let mut encoded = Vec::new();
+
+		// Offset to first bytes parameter (64 bytes = 0x40)
+		encoded.extend_from_slice(&[0u8; 28]); // padding
+		encoded.extend_from_slice(&0x40u32.to_be_bytes());
+
+		// Calculate offset to second bytes parameter
+		let second_offset = 64 + 32 + ((sponsor_sig.len() + 31) & !31); // 64 + length word + padded sponsor sig
+		encoded.extend_from_slice(&[0u8; 28]); // padding
+		encoded.extend_from_slice(&(second_offset as u32).to_be_bytes());
+
+		// Encode first bytes parameter (sponsor signature)
+		encoded.extend_from_slice(&[0u8; 28]); // padding for length
+		encoded.extend_from_slice(&(sponsor_sig.len() as u32).to_be_bytes());
+		encoded.extend_from_slice(&sponsor_sig);
+		// Pad to 32-byte boundary
+		let sponsor_padding = (32 - (sponsor_sig.len() % 32)) % 32;
+		encoded.extend_from_slice(&vec![0u8; sponsor_padding]);
+
+		// Encode second bytes parameter (allocator signature)
+		encoded.extend_from_slice(&[0u8; 28]); // padding for length
+		encoded.extend_from_slice(&(allocator_sig.len() as u32).to_be_bytes());
+		encoded.extend_from_slice(&allocator_sig);
+		// Pad to 32-byte boundary
+		let allocator_padding = (32 - (allocator_sig.len() % 32)) % 32;
+		encoded.extend_from_slice(&vec![0u8; allocator_padding]);
+
+		println!(
+			"🔐 [COMPACT] Final encoded signature: 0x{}",
+			hex::encode(&encoded)
+		);
+		encoded
 	}
 
-	/// Hashes a single token permission.
-	fn hash_token_permission(&self, permission: &TokenPermission) -> Result<[u8; 32]> {
-		let type_hash = keccak256("TokenPermissions(address token,uint256 amount)");
-
-		let encoded = encode(&[
-			Token::FixedBytes(type_hash.to_vec()),
-			Token::Address(permission.token),
-			Token::Uint(permission.amount),
-		]);
-
-		Ok(keccak256(encoded))
-	}
-
-	/// Hashes a batch of token permissions.
-	fn hash_token_permissions_batch(&self, permissions: &[TokenPermission]) -> Result<[u8; 32]> {
-		let mut hashes = Vec::new();
-		for permission in permissions {
-			hashes.extend_from_slice(&self.hash_token_permission(permission)?);
-		}
-		Ok(keccak256(&hashes))
-	}
-
-	/// Extracts an Ethereum address from a JSON value.
-	fn extract_address(&self, value: &Value, field: &str) -> Result<Address> {
-		value
-			.get(field)
-			.and_then(|v| v.as_str())
-			.ok_or_else(|| anyhow!("Missing field: {}", field))
-			.and_then(|s| {
-				s.parse::<Address>()
-					.map_err(|e| anyhow!("Invalid address for {}: {}", field, e))
-			})
-	}
-
-	/// Extracts a U256 value from a JSON value.
-	fn extract_u256(&self, value: &Value, field: &str) -> Result<EthersU256> {
-		let field_value = value
-			.get(field)
-			.ok_or_else(|| anyhow!("Missing field: {}", field))?;
-
-		if let Some(s) = field_value.as_str() {
-			EthersU256::from_dec_str(s).map_err(|e| anyhow!("Invalid U256 for {}: {}", field, e))
-		} else if let Some(n) = field_value.as_u64() {
-			Ok(EthersU256::from(n))
-		} else {
-			Err(anyhow!("Field {} is not a string or number", field))
-		}
-	}
-
-	/// Extracts 32 bytes from a JSON value.
-	fn extract_bytes32(&self, value: &Value, field: &str) -> Result<[u8; 32]> {
-		value
-			.get(field)
-			.and_then(|v| v.as_str())
-			.ok_or_else(|| anyhow!("Missing field: {}", field))
-			.and_then(|s| {
-				let bytes = hex::decode(s.trim_start_matches("0x"))
-					.map_err(|e| anyhow!("Invalid hex for {}: {}", field, e))?;
-				if bytes.len() != 32 {
-					return Err(anyhow!("{} must be 32 bytes", field));
-				}
-				let mut arr = [0u8; 32];
-				arr.copy_from_slice(&bytes);
-				Ok(arr)
-			})
-	}
-
-	/// Gets the address of the configured signer.
-	pub fn get_signer_address(&self) -> Result<Address> {
-		self.wallet
-			.as_ref()
-			.map(|w| w.address())
-			.ok_or_else(|| anyhow!("No wallet configured"))
+	/// Gets the address from a private key.
+	pub fn get_signer_address(private_key: &str) -> Result<Address> {
+		let wallet = private_key
+			.parse::<PrivateKeySigner>()
+			.map_err(|e| anyhow!("Failed to parse private key: {}", e))?;
+		Ok(wallet.address())
 	}
 }
 
@@ -606,9 +703,9 @@ pub struct Permit2Data {
 	/// Address authorized to spend tokens.
 	pub spender: Address,
 	/// Nonce for replay protection.
-	pub nonce: EthersU256,
+	pub nonce: U256,
 	/// Expiration timestamp.
-	pub deadline: EthersU256,
+	pub deadline: U256,
 	/// Type string for witness data.
 	pub witness_type_string: String,
 	/// Witness data bytes.
@@ -629,20 +726,5 @@ pub struct TokenPermission {
 	/// Token contract address.
 	pub token: Address,
 	/// Amount authorized.
-	pub amount: EthersU256,
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn test_signing_service_creation() {
-		let service = SigningService::new(None).unwrap();
-		assert!(service.wallet.is_none());
-
-		let private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-		let service = SigningService::new(Some(private_key.to_string())).unwrap();
-		assert!(service.wallet.is_some());
-	}
+	pub amount: U256,
 }

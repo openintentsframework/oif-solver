@@ -11,17 +11,15 @@
 //! and error handling to ensure reliable deployment operations across different network
 //! conditions and configurations.
 
-use alloy_primitives::{Address, U256};
+use alloy_dyn_abi::DynSolValue;
+use alloy_json_abi::JsonAbi;
+use alloy_network::{EthereumWallet, TransactionBuilder};
+use alloy_primitives::U256;
+use alloy_provider::{Provider, ProviderBuilder};
+use alloy_rpc_types::TransactionRequest;
+use alloy_signer::Signer;
+use alloy_signer_local::PrivateKeySigner;
 use anyhow::{anyhow, Result};
-use ethers::{
-	abi::Abi,
-	contract::ContractFactory,
-	core::types::Bytes,
-	middleware::SignerMiddleware,
-	prelude::LocalWallet,
-	providers::{Http, Middleware, Provider},
-	signers::Signer,
-};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -45,10 +43,10 @@ pub struct DeployerManager {
 
 	/// Collection of signing wallets keyed by chain ID.
 	///
-	/// Maintains per-chain LocalWallet instances configured with appropriate chain IDs
+	/// Maintains per-chain PrivateKeySigner instances configured with appropriate chain IDs
 	/// for signing deployment transactions. Only populated in local development mode
 	/// where private keys are available.
-	signers: HashMap<u64, LocalWallet>,
+	signers: HashMap<u64, PrivateKeySigner>,
 }
 
 impl DeployerManager {
@@ -67,13 +65,12 @@ impl DeployerManager {
 
 			if let Some(private_key) = solver_account.private_key {
 				let key = private_key.trim_start_matches("0x");
-				let wallet = key
-					.parse::<LocalWallet>()
+				let signer = PrivateKeySigner::from_slice(&hex::decode(key)?)
 					.map_err(|e| anyhow!("Failed to parse private key: {}", e))?;
 
 				for chain_id in session_manager.get_chain_ids().await {
-					let wallet_with_chain = wallet.clone().with_chain_id(chain_id);
-					signers.insert(chain_id, wallet_with_chain);
+					let signer_with_chain = signer.clone().with_chain_id(Some(chain_id));
+					signers.insert(chain_id, signer_with_chain);
 				}
 			}
 		}
@@ -86,10 +83,10 @@ impl DeployerManager {
 
 	/// Retrieves the configured signer for a specific chain.
 	///
-	/// Returns a reference to the LocalWallet configured for the specified
+	/// Returns a reference to the PrivateKeySigner configured for the specified
 	/// chain ID, which can be used for signing deployment transactions.
 	/// Returns an error if no signer is configured for the chain.
-	pub fn get_signer(&self, chain_id: u64) -> Result<&LocalWallet> {
+	pub fn get_signer(&self, chain_id: u64) -> Result<&PrivateKeySigner> {
 		self.signers
 			.get(&chain_id)
 			.ok_or_else(|| anyhow!("No signer available for chain {}", chain_id))
@@ -109,8 +106,8 @@ impl DeployerManager {
 		&self,
 		chain_id: u64,
 		bytecode: Vec<u8>,
-		abi: &Abi,
-		constructor_args: Vec<ethers::abi::Token>,
+		abi: &JsonAbi,
+		constructor_args: Vec<DynSolValue>,
 	) -> Result<DeploymentResult> {
 		info!("Deploying contract to chain {}", chain_id);
 		debug!("Bytecode length: {} bytes", bytecode.len());
@@ -126,33 +123,73 @@ impl DeployerManager {
 			.await
 			.ok_or_else(|| anyhow!("No RPC URL for chain {}", chain_id))?;
 
-		let provider = Provider::<Http>::try_from(rpc_url.clone())
-			.map_err(|e| anyhow!("Failed to create provider for {}: {}", rpc_url, e))?;
-
-		let signer = self.get_signer(chain_id)?;
+		let signer = self.get_signer(chain_id)?.clone();
 		debug!("Using signer address: {}", signer.address());
 
-		let client = Arc::new(SignerMiddleware::new(provider.clone(), signer.clone()));
+		let wallet = EthereumWallet::from(signer);
+		let provider = ProviderBuilder::new()
+			.with_recommended_fillers()
+			.wallet(wallet)
+			.on_http(rpc_url.parse()?);
 
-		let factory = ContractFactory::new(abi.clone(), Bytes::from(bytecode), client.clone());
+		// Encode constructor arguments if any
+		let mut deployment_data = bytecode.clone();
+		if !constructor_args.is_empty() {
+			// Find the constructor in the ABI
+			if let Some(_constructor) = abi.constructor() {
+				// Debug: Print what we're about to encode
+				println!("🔧 [DEPLOY] Constructor arguments to encode:");
+				for (i, arg) in constructor_args.iter().enumerate() {
+					println!("  [{}]: {:?}", i, arg);
+				}
 
-		let deployer = factory
-			.deploy_tokens(constructor_args.clone())
-			.map_err(|e| anyhow!("Failed to create deployment transaction: {}", e))?;
-		let (contract, receipt) = deployer
-			.send_with_receipt()
+				// Encode constructor arguments properly - they should be encoded as individual arguments, not a tuple
+				use alloy_dyn_abi::DynSolValue;
+				let tuple_value = DynSolValue::Tuple(constructor_args.clone());
+				let encoded_args = tuple_value.abi_encode_sequence().unwrap_or_default();
+
+				println!(
+					"🔧 [DEPLOY] Encoded constructor args length: {} bytes",
+					encoded_args.len()
+				);
+				println!(
+					"🔧 [DEPLOY] Encoded constructor args (hex): 0x{}",
+					hex::encode(&encoded_args)
+				);
+
+				deployment_data.extend(encoded_args);
+			}
+		}
+
+		// Create deployment transaction using alloy's deployment method
+		let tx = TransactionRequest::default().with_deploy_code(deployment_data);
+
+		// Send deployment transaction
+		let pending_tx = provider
+			.send_transaction(tx)
 			.await
-			.map_err(|e| anyhow!("Failed to deploy contract: {}", e))?;
+			.map_err(|e| anyhow!("Failed to send deployment transaction: {}", e))?;
 
-		let address = contract.address();
+		let receipt = pending_tx
+			.get_receipt()
+			.await
+			.map_err(|e| anyhow!("Failed to get deployment receipt: {}", e))?;
+
+		let address = receipt
+			.contract_address
+			.ok_or_else(|| anyhow!("No contract address in deployment receipt"))?;
 		let tx_hash = format!("{:?}", receipt.transaction_hash);
 
-		debug!("Contract deployed at {} with tx {}", address, tx_hash);
+		debug!(
+			"Contract deployed at {} with tx {}",
+			address.to_checksum(Some(chain_id)),
+			tx_hash
+		);
 
 		Ok(DeploymentResult {
-			address: Address::from_slice(address.as_bytes()),
+			address,
 			tx_hash,
-			gas_used: None,
+			gas_used: Some(receipt.gas_used.try_into().unwrap_or(0)),
 		})
 	}
 
@@ -168,30 +205,30 @@ impl DeployerManager {
 			.await
 			.ok_or_else(|| anyhow!("No RPC URL for chain {}", chain_id))?;
 
-		let provider = Provider::<Http>::try_from(rpc_url)?;
+		let provider = ProviderBuilder::new().on_http(rpc_url.parse()?);
 		let signer = self.get_signer(chain_id)?;
 		let address = signer.address();
 
 		let nonce = provider
-			.get_transaction_count(address, None)
+			.get_transaction_count(address)
 			.await
 			.map_err(|e| anyhow!("Failed to get nonce: {}", e))?;
 
-		Ok(U256::from(nonce.as_u64()))
+		Ok(U256::from(nonce))
 	}
 
 	/// Adds a signer wallet for a specific chain.
 	///
-	/// Registers a LocalWallet instance for the specified chain ID, enabling
+	/// Registers a PrivateKeySigner instance for the specified chain ID, enabling
 	/// deployment operations on that network. Typically used in production
 	/// environments where signers are managed externally.
-	pub fn add_signer(&mut self, chain_id: u64, signer: LocalWallet) {
+	pub fn add_signer(&mut self, chain_id: u64, signer: PrivateKeySigner) {
 		self.signers.insert(chain_id, signer);
 	}
 
 	/// Checks if a signer is configured for the specified chain.
 	///
-	/// Returns true if a LocalWallet is available for the given chain ID,
+	/// Returns true if a PrivateKeySigner is available for the given chain ID,
 	/// indicating that deployment operations can be performed on that network.
 	pub fn has_signer(&self, chain_id: u64) -> bool {
 		self.signers.contains_key(&chain_id)

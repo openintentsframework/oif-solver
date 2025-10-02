@@ -10,8 +10,8 @@
 //! custom artifact formats, enabling flexibility in how contract information is stored and
 //! accessed throughout the solver system.
 
+use alloy_json_abi::JsonAbi;
 use anyhow::{anyhow, Result};
-use ethers::abi::Abi;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -173,12 +173,12 @@ impl AbiManager {
 
 	/// Retrieves the parsed ABI for a specific contract.
 	///
-	/// Returns the contract's Application Binary Interface as a parsed Abi
+	/// Returns the contract's Application Binary Interface as a parsed JsonAbi
 	/// structure, ready for use in contract interactions. The ABI is parsed
 	/// from the JSON representation stored in the artifact.
-	pub async fn get_abi(&self, name: &str) -> Result<Abi> {
+	pub async fn get_abi(&self, name: &str) -> Result<JsonAbi> {
 		let artifact = self.get_artifact(name).await?;
-		let abi: Abi = serde_json::from_value(artifact.abi)?;
+		let abi: JsonAbi = serde_json::from_value(artifact.abi)?;
 		Ok(abi)
 	}
 

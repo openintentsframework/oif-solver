@@ -37,9 +37,28 @@ pub fn is_valid_address(address_str: &str) -> bool {
 	address_str.parse::<Address>().is_ok()
 }
 
+/// Converts an address to EIP-55 checksummed format.
+///
+/// This function takes an alloy Address and returns its EIP-55 checksummed
+/// string representation, which is required for compatibility with the
+/// old demo format and proper Ethereum address standards.
+pub fn to_checksum_address(address: &Address, chain_id: Option<u64>) -> String {
+	address.to_checksum(chain_id)
+}
+
+/// Converts address bytes to EIP-55 checksummed format.
+///
+/// This function takes raw address bytes and returns the EIP-55 checksummed
+/// string representation. Useful when working with address bytes from
+/// solver types or network configurations.
+pub fn bytes_to_checksum_address(address_bytes: &[u8], chain_id: Option<u64>) -> String {
+	let address = Address::from_slice(address_bytes);
+	address.to_checksum(chain_id)
+}
+
 /// Format an address for display (shortened form)
 pub fn format_address_short(address: Address) -> String {
-	let full = format!("{:#x}", address);
+	let full = to_checksum_address(&address, None);
 	if full.len() > 10 {
 		format!("{}...{}", &full[0..6], &full[full.len() - 4..])
 	} else {
@@ -80,5 +99,31 @@ mod tests {
 		assert!(formatted.starts_with("0x1234"));
 		assert!(formatted.ends_with("7890"));
 		assert!(formatted.contains("..."));
+	}
+
+	#[test]
+	fn test_checksum_formatting() {
+		// Test with a known address that should be checksummed
+		let addr_str = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8";
+		let address: Address = addr_str.parse().unwrap();
+
+		let checksummed = to_checksum_address(&address, None);
+
+		// Should have mixed case for this specific address
+		assert!(checksummed.contains("C")); // Should have uppercase letters
+		assert!(checksummed.starts_with("0x"));
+		assert_eq!(checksummed.len(), 42); // 0x + 40 hex chars
+	}
+
+	#[test]
+	fn test_bytes_to_checksum() {
+		let addr_str = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8";
+		let address: Address = addr_str.parse().unwrap();
+		let bytes = address.as_slice();
+
+		let checksummed = bytes_to_checksum_address(bytes, None);
+		let direct_checksum = to_checksum_address(&address, None);
+
+		assert_eq!(checksummed, direct_checksum);
 	}
 }

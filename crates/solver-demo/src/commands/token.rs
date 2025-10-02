@@ -72,6 +72,10 @@ pub enum TokenCommands {
 		/// Amount to approve (use "max" for unlimited)
 		#[arg(short, long)]
 		amount: String,
+
+		/// Account to approve from: 'user', 'solver', 'recipient', or an address (defaults to 'user')
+		#[arg(long, default_value = "user")]
+		account: String,
 	},
 }
 
@@ -113,7 +117,8 @@ impl TokenHandler {
 				token,
 				spender,
 				amount,
-			} => self.approve(chain, token, spender, amount).await,
+				account,
+			} => self.approve(chain, token, spender, amount, account).await,
 		}
 	}
 
@@ -384,10 +389,11 @@ impl TokenHandler {
 		token: String,
 		spender_str: String,
 		amount_str: String,
+		account_str: String,
 	) -> Result<()> {
 		info!(
-			"Approving {} to spend {} {} on chain {}",
-			spender_str, amount_str, token, chain_id
+			"Approving {} to spend {} {} on chain {} from account {}",
+			spender_str, amount_str, token, chain_id, account_str
 		);
 
 		// Parse spender address - handle special cases
@@ -397,6 +403,9 @@ impl TokenHandler {
 			"recipient" => self.session_manager.get_recipient_account().await.address,
 			_ => parse_address(&spender_str)?,
 		};
+
+		// Parse account address - who is sending the approval
+		let account = parse_address_or_identifier(&account_str, &self.session_manager).await?;
 
 		// Get token decimals from config
 		let decimals = self
@@ -418,12 +427,12 @@ impl TokenHandler {
 			.map_err(|e| anyhow!("Invalid token address: {}", e))?;
 
 		self.token_service
-			.approve_token(chain_id, token_addr, spender, amount)
+			.approve_token(chain_id, token_addr, spender, amount, account)
 			.await?;
 
 		self.display.success(&format!(
-			"Successfully approved {} to spend {} {} on chain {}",
-			spender_str, amount_str, token, chain_id
+			"Successfully approved {} to spend {} {} on chain {} from account {}",
+			spender_str, amount_str, token, chain_id, account_str
 		));
 		Ok(())
 	}

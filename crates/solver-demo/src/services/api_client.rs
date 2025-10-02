@@ -7,8 +7,11 @@ use tracing::{debug, info};
 
 use crate::services::JwtService;
 use solver_types::{
-	api::{GetQuoteRequest, GetQuoteResponse, PostOrderRequest, PostOrderResponse, Quote},
-	OriginSubmission,
+	api::{
+		GetOrderResponse, GetQuoteRequest, GetQuoteResponse, PostOrderRequest, PostOrderResponse,
+		Quote,
+	},
+	AssetAmount, OriginSubmission,
 };
 
 #[derive(Clone)]
@@ -194,10 +197,29 @@ impl ApiClient {
 			));
 		}
 
-		let status: OrderStatus = response
+		// Parse the actual API response format: GetOrderResponse
+		let order_response: GetOrderResponse = response
 			.json()
 			.await
 			.map_err(|e| anyhow!("Failed to parse status response: {}", e))?;
+
+		// Convert OrderResponse to our OrderStatus format
+		let status = OrderStatus {
+			order_id: order_response.order.id,
+			status: format!("{:?}", order_response.order.status),
+			created_at: order_response.order.created_at,
+			updated_at: order_response.order.updated_at,
+			tx_hash: order_response
+				.order
+				.fill_transaction
+				.as_ref()
+				.and_then(|tx| tx.get("hash"))
+				.and_then(|h| h.as_str())
+				.map(|h| h.to_string()),
+			quote_id: order_response.order.quote_id,
+			input_amount: order_response.order.input_amount,
+			output_amount: order_response.order.output_amount,
+		};
 
 		Ok(status)
 	}
@@ -212,4 +234,7 @@ pub struct OrderStatus {
 	pub created_at: u64,
 	pub updated_at: u64,
 	pub tx_hash: Option<String>,
+	pub quote_id: Option<String>,
+	pub input_amount: AssetAmount,
+	pub output_amount: AssetAmount,
 }

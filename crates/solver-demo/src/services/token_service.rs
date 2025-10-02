@@ -1,6 +1,7 @@
+use alloy_dyn_abi::DynSolValue;
 use alloy_primitives::{Address, U256};
+use alloy_signer::Signer;
 use anyhow::{anyhow, Result};
-use ethers::abi::Token;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -51,9 +52,6 @@ impl TokenService {
 
 		info!("Minting {} tokens to {} on chain {}", amount, to, chain_id);
 
-		let amount_bytes = amount.to_be_bytes::<32>();
-		let eth_amount = ethers::types::U256::from_big_endian(&amount_bytes);
-
 		let receipt = self
 			.contract_manager
 			.send_transaction(
@@ -61,10 +59,7 @@ impl TokenService {
 				token_addr,
 				"MockERC20",
 				"mint",
-				vec![
-					Token::Address(ethers::types::H160::from_slice(to.as_slice())),
-					Token::Uint(eth_amount),
-				],
+				vec![DynSolValue::Address(to), DynSolValue::Uint(amount, 256)],
 			)
 			.await?;
 
@@ -91,18 +86,14 @@ impl TokenService {
 				token_address,
 				"MockERC20",
 				"balanceOf",
-				vec![Token::Address(ethers::types::H160::from_slice(
-					account.as_slice(),
-				))],
+				vec![DynSolValue::Address(account)],
 			)
 			.await?;
 
 		debug!("Balance result: {:?}", result);
 
-		if let Some(Token::Uint(balance)) = result.first() {
-			let mut bytes = [0u8; 32];
-			balance.to_big_endian(&mut bytes);
-			let balance_u256 = U256::from_be_bytes(bytes);
+		if let Some(DynSolValue::Uint(balance, _)) = result.first() {
+			let balance_u256 = U256::from(*balance);
 			debug!("Parsed balance: {}", balance_u256);
 			Ok(balance_u256)
 		} else {
@@ -158,25 +149,42 @@ impl TokenService {
 		token_address: Address,
 		spender: Address,
 		amount: U256,
+		account: Address,
 	) -> Result<()> {
 		info!(
-			"Approving {} to spend {} tokens on chain {}",
-			spender, amount, chain_id
+			"Approving {} to spend {} tokens on chain {} from account {}",
+			spender, amount, chain_id, account
 		);
 
+		// Get the signer for the specified account
+		let signer = if account == self.session_manager.get_user_account().await.address {
+			let user_account = self.session_manager.get_user_account().await;
+			if let Some(private_key_str) = user_account.private_key {
+				let key = private_key_str.trim_start_matches("0x");
+				let signer = alloy_signer_local::PrivateKeySigner::from_slice(&hex::decode(key)?)
+					.map_err(|e| anyhow!("Failed to parse user private key: {}", e))?;
+				Some(signer.with_chain_id(Some(chain_id)))
+			} else {
+				return Err(anyhow!("User account has no private key"));
+			}
+		} else if account == self.session_manager.get_solver_account().await.address {
+			// For solver account, use None (default deployer signer)
+			None
+		} else {
+			return Err(anyhow!("No private key available for account {}", account));
+		};
+
 		self.contract_manager
-			.send_transaction(
+			.send_transaction_with_key(
 				chain_id,
 				token_address,
 				"MockERC20",
 				"approve",
 				vec![
-					Token::Address(ethers::types::H160::from_slice(spender.as_slice())),
-					Token::Uint({
-						let bytes: [u8; 32] = amount.to_be_bytes();
-						ethers::types::U256::from_big_endian(&bytes)
-					}),
+					DynSolValue::Address(spender),
+					DynSolValue::Uint(amount, 256),
 				],
+				signer,
 			)
 			.await?;
 
@@ -203,17 +211,12 @@ impl TokenService {
 				token_address,
 				"MockERC20",
 				"allowance",
-				vec![
-					Token::Address(ethers::types::H160::from_slice(owner.as_slice())),
-					Token::Address(ethers::types::H160::from_slice(spender.as_slice())),
-				],
+				vec![DynSolValue::Address(owner), DynSolValue::Address(spender)],
 			)
 			.await?;
 
-		if let Some(Token::Uint(allowance)) = result.first() {
-			let mut bytes = [0u8; 32];
-			allowance.to_big_endian(&mut bytes);
-			Ok(U256::from_be_bytes(bytes))
+		if let Some(DynSolValue::Uint(allowance, _)) = result.first() {
+			Ok(U256::from(*allowance))
 		} else {
 			Err(anyhow!("Unexpected response from allowance"))
 		}

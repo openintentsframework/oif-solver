@@ -13,10 +13,19 @@ solver-account = { path = "../solver-account" }
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
-# Ethereum
-ethers = { version = "2.0", features = ["legacy", "abigen"] }
+# Ethereum  
 alloy-primitives = "0.8"
 alloy-sol-types = "0.8"
+alloy-signer = "0.8"
+alloy-signer-local = "0.8"
+alloy-json-abi = "0.8"
+alloy-dyn-abi = "0.8"
+alloy-provider = "0.8"
+alloy-transport-http = "0.8"
+alloy-contract = "0.8"
+alloy-rpc-types = "0.8"
+alloy-consensus = "0.8"
+alloy-network = "0.8"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }

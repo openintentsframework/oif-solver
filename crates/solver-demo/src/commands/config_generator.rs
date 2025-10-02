@@ -23,7 +23,7 @@ pub fn generate_demo_config(chain_ids: &[u64], config_name: &str) -> Result<Stri
 	config.push_str("[solver]\n");
 	config.push_str("id = \"oif-solver-demo\"\n");
 	config.push_str("monitoring_timeout_minutes = 5\n");
-	config.push_str("min_profitability_pct = 10.0\n\n");
+	config.push_str("min_profitability_pct = 1.0\n\n");
 
 	// Storage configuration
 	add_storage_config(&mut config);
@@ -273,13 +273,19 @@ pub fn generate_networks_config(chain_ids: &[u64]) -> Result<String> {
 			.ok_or_else(|| anyhow!("Missing PLACEHOLDER_INPUT_SETTLER_{}", chain_id))?;
 		config.push_str(&format!("input_settler_address = \"{}\"\n", input_settler));
 
+		// InputSettlerCompact address
+		let input_settler_compact = placeholders
+			.get(&format!("PLACEHOLDER_INPUT_SETTLER_COMPACT_{}", chain_id))
+			.ok_or_else(|| anyhow!("Missing PLACEHOLDER_INPUT_SETTLER_COMPACT_{}", chain_id))?;
+		config.push_str(&format!(
+			"input_settler_compact_address = \"{}\"\n",
+			input_settler_compact
+		));
+
+		// TheCompact contract address
 		let compact = placeholders
 			.get(&format!("PLACEHOLDER_COMPACT_{}", chain_id))
 			.ok_or_else(|| anyhow!("Missing PLACEHOLDER_COMPACT_{}", chain_id))?;
-		config.push_str(&format!(
-			"input_settler_compact_address = \"{}\"\n",
-			compact
-		));
 		config.push_str(&format!("the_compact_address = \"{}\"\n", compact));
 
 		let allocator = placeholders
@@ -310,7 +316,7 @@ pub fn generate_networks_config(chain_ids: &[u64]) -> Result<String> {
 			.ok_or_else(|| anyhow!("Missing PLACEHOLDER_TOKEN_A_{}", chain_id))?;
 		config.push_str(&format!("address = \"{}\"\n", token_a));
 		config.push_str("symbol = \"TOKA\"\n");
-		config.push_str("decimals = 6\n\n");
+		config.push_str("decimals = 18\n\n");
 
 		config.push_str(&format!("[[networks.{}.tokens]]\n", chain_id));
 		let token_b = placeholders
@@ -318,7 +324,7 @@ pub fn generate_networks_config(chain_ids: &[u64]) -> Result<String> {
 			.ok_or_else(|| anyhow!("Missing PLACEHOLDER_TOKEN_B_{}", chain_id))?;
 		config.push_str(&format!("address = \"{}\"\n", token_b));
 		config.push_str("symbol = \"TOKB\"\n");
-		config.push_str("decimals = 6\n\n");
+		config.push_str("decimals = 18\n\n");
 	}
 
 	Ok(config)

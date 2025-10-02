@@ -323,8 +323,24 @@ impl QuoteHandler {
 			);
 		}
 
-		self.display
-			.info(&format!("Results saved to: {:?}", results.file_path));
+		// Check if post_orders.req.json was created
+		let post_orders_file = self
+			.quote_service
+			.session_manager()
+			.requests_dir()
+			.join("post_orders.req.json");
+
+		if post_orders_file.exists() {
+			self.display
+				.success(&format!("Signed orders saved to: {:?}", post_orders_file));
+			self.display.next_steps(vec![
+				"Submit signed orders: oif-demo intent test post_orders.req.json",
+				"Or check individual order status: oif-demo intent status <order_id>",
+			]);
+		} else {
+			self.display
+				.info("No successful quotes to sign - check the error messages above");
+		}
 
 		Ok(())
 	}

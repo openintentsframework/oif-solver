@@ -8,7 +8,7 @@ use tokio::fs;
 use tracing::{debug, info, warn};
 
 use solver_types::{
-	api::{GetQuoteRequest, GetQuoteResponse, PostOrderResponse},
+	api::{GetQuoteRequest, GetQuoteResponse},
 	OriginSubmission,
 };
 
@@ -37,6 +37,11 @@ impl QuoteService {
 			api_client,
 			signing_service,
 		})
+	}
+
+	/// Get session manager
+	pub fn session_manager(&self) -> &Arc<SessionManager> {
+		&self.session_manager
 	}
 
 	/// Get quotes for a given request and save both request and response
@@ -117,9 +122,15 @@ impl QuoteService {
 				sig
 			},
 			None => {
-				info!("Signing quote with EIP-712");
+				info!("Signing quote with EIP-712 using user's private key");
+				// Get user's private key for signing permits
+				let user_account = self.session_manager.get_user_account().await;
+				let user_private_key = user_account
+					.private_key
+					.ok_or_else(|| anyhow!("User private key not available for signing"))?;
+
 				self.signing_service
-					.sign_quote(quote)
+					.sign_quote(quote, &user_private_key)
 					.await
 					.map_err(|e| anyhow!("Failed to sign quote: {}", e))?
 			},
@@ -148,116 +159,11 @@ impl QuoteService {
 		Ok((post_order_json, order_request_file, selected_index))
 	}
 
-	/// Accept a quote by loading from file and submitting order to API
-	pub async fn accept_quote(
-		&self,
-		quote_file: PathBuf,
-		signature: Option<String>,
-		output_file: Option<PathBuf>,
-		quote_index: Option<usize>,
-	) -> Result<(serde_json::Value, PathBuf, usize)> {
-		info!("Accepting quote from file: {:?}", quote_file);
-
-		// Load the quote response
-		let response: GetQuoteResponse = self.load_response(&quote_file).await?;
-
-		if response.quotes.is_empty() {
-			return Err(anyhow!("No quotes found in the response file"));
-		}
-
-		// Determine which quote to accept
-		let selected_index = if let Some(idx) = quote_index {
-			if idx >= response.quotes.len() {
-				return Err(anyhow!(
-					"Invalid quote index {}. File contains {} quotes",
-					idx,
-					response.quotes.len()
-				));
-			}
-			idx
-		} else if response.quotes.len() == 1 {
-			// Only one quote, accept it automatically
-			0
-		} else {
-			// Multiple quotes but no index specified - caller should handle selection
-			return Err(anyhow!(
-				"Multiple quotes available ({}). Please specify which quote to accept.",
-				response.quotes.len()
-			));
-		};
-
-		let quote = &response.quotes[selected_index];
-		info!("Accepting quote with ID: {}", quote.quote_id);
-
-		// Sign the quote if no signature provided
-		let final_signature = match signature {
-			Some(sig) => {
-				info!("Using provided signature");
-				sig
-			},
-			None => {
-				info!("Signing quote with EIP-712");
-				self.signing_service
-					.sign_quote(quote)
-					.await
-					.map_err(|e| anyhow!("Failed to sign quote: {}", e))?
-			},
-		};
-
-		// Create the post_order request file with the signature - always override
-		let requests_dir = self.session_manager.requests_dir();
-		let order_request_file = requests_dir.join("post_order.req.json");
-
-		// Update request with actual signature
-		let order_request = serde_json::json!({
-			"quote_id": quote.quote_id,
-			"signature": final_signature,
-			"quote_index": selected_index,
-		});
-
-		if let Some(parent) = order_request_file.parent() {
-			fs::create_dir_all(parent).await?;
-		}
-		let request_json = serde_json::to_string_pretty(&order_request)?;
-		fs::write(&order_request_file, request_json).await?;
-		debug!(
-			"Updated order request with signature at: {:?}",
-			order_request_file
-		);
-
-		// Submit order to API
-		info!("Submitting order to API");
-		let api_response: PostOrderResponse = self
-			.api_client
-			.submit_order(quote, final_signature.clone())
-			.await
-			.map_err(|e| anyhow!("Failed to submit order to API: {}", e))?;
-
-		info!("Order submitted successfully");
-
-		// Save API response - always override
-		let response_file = output_file.unwrap_or_else(|| requests_dir.join("post_order.res.json"));
-
-		// Save raw API response
-		if let Some(parent) = response_file.parent() {
-			fs::create_dir_all(parent).await?;
-		}
-		let json = serde_json::to_string_pretty(&api_response)?;
-		fs::write(&response_file, json).await?;
-		debug!("Saved order response to: {:?}", response_file);
-
-		// Convert PostOrderResponse to JSON for backward compatibility
-		let response_json = serde_json::to_value(&api_response)
-			.map_err(|e| anyhow!("Failed to serialize response: {}", e))?;
-
-		Ok((response_json, response_file, selected_index))
-	}
-
 	/// Test multiple intents from a batch file
 	pub async fn test_batch(
 		&self,
 		batch_file: PathBuf,
-		output_file: Option<PathBuf>,
+		_output_file: Option<PathBuf>,
 	) -> Result<BatchTestResults> {
 		info!("Running batch test from file: {:?}", batch_file);
 
@@ -266,8 +172,28 @@ impl QuoteService {
 			.await
 			.map_err(|e| anyhow!("Failed to read batch file: {}", e))?;
 
-		let requests: Vec<GetQuoteRequest> = serde_json::from_str(&batch_content)
-			.map_err(|e| anyhow!("Failed to parse batch file: {}", e))?;
+		let requests: Vec<GetQuoteRequest> = serde_json::from_str(&batch_content).map_err(|e| {
+			// Check if user might be using the wrong file type
+			if batch_content.contains("\"intents\"") && batch_content.contains("\"enabled\"") {
+				anyhow!(
+					"Failed to parse '{}' as array of GetQuoteRequest.\n\n\
+						This file appears to be a batch intent specification (batch_intents.json).\n\n\
+						Use this workflow:\n\
+						1. oif-demo intent build-batch {}  # Creates get_quotes.req.json\n\
+						2. oif-demo quote test get_quotes.req.json         # Tests quotes and signs them\n\
+						3. oif-demo intent test post_orders.req.json       # Submits signed orders\n\n\
+						Original error: {}",
+					batch_file.display(),
+					batch_file.display(),
+					e
+				)
+			} else {
+				anyhow!(
+					"Failed to parse batch file as array of GetQuoteRequest: {}",
+					e
+				)
+			}
+		})?;
 
 		info!("Testing {} quote requests", requests.len());
 
@@ -329,21 +255,15 @@ impl QuoteService {
 			total_duration_ms: total_duration,
 		};
 
-		let results_file = output_file.unwrap_or_else(|| {
-			self.session_manager
-				.requests_dir()
-				.join(format!("batch_test_{}.json", Utc::now().timestamp()))
-		});
-
 		let batch_results = BatchTestResults {
 			results,
 			tested_at: Utc::now(),
-			file_path: results_file,
+			file_path: std::path::PathBuf::new(), // Not saving to file
 			statistics,
 		};
 
-		// Save results
-		self.save_batch_results(&batch_results).await?;
+		// Create post_orders.req.json from successful quotes
+		self.create_post_orders_from_batch(&batch_results).await?;
 
 		info!(
 			"Batch test completed: {}/{} successful, avg response time: {:.2}ms",
@@ -370,17 +290,81 @@ impl QuoteService {
 		Ok(response)
 	}
 
-	/// Save batch test results to disk
-	async fn save_batch_results(&self, results: &BatchTestResults) -> Result<()> {
-		// Ensure quotes directory exists
-		if let Some(parent) = results.file_path.parent() {
+	/// Create post_orders.req.json from successful quotes in batch results
+	async fn create_post_orders_from_batch(&self, batch_results: &BatchTestResults) -> Result<()> {
+		use solver_types::api::PostOrderRequest;
+
+		// Collect all successful quotes
+		let mut post_orders = Vec::new();
+
+		for result in &batch_results.results {
+			if let (QuoteTestStatus::Success, Some(response)) = (&result.status, &result.response) {
+				// Process each quote in the response
+				for quote in &response.quotes {
+					// Get user's private key for signing permits
+					let user_account = self.session_manager.get_user_account().await;
+					let user_private_key = user_account
+						.private_key
+						.clone()
+						.ok_or_else(|| anyhow!("User private key not available for signing"))?;
+
+					// Sign the quote using user's private key
+					let sign_result = self
+						.signing_service
+						.sign_quote(quote, &user_private_key)
+						.await;
+
+					match sign_result {
+						Ok(signature) => {
+							// Create origin submission from the quote
+							let origin_submission: Option<OriginSubmission> = (&quote.order).into();
+
+							// Create PostOrderRequest
+							let post_order = PostOrderRequest {
+								order: quote.order.clone(),
+								signature: alloy_primitives::Bytes::from(
+									hex::decode(signature.trim_start_matches("0x"))
+										.map_err(|e| anyhow!("Invalid signature hex: {}", e))?,
+								),
+								quote_id: Some(quote.quote_id.clone()),
+								origin_submission,
+							};
+
+							post_orders.push(post_order);
+						},
+						Err(e) => {
+							warn!("Failed to sign quote {}: {}", quote.quote_id, e);
+						},
+					}
+				}
+			}
+		}
+
+		if post_orders.is_empty() {
+			info!("No successful quotes to sign - post_orders.req.json not created");
+			return Ok(());
+		}
+
+		// Save to post_orders.req.json
+		let post_orders_file = self
+			.session_manager
+			.requests_dir()
+			.join("post_orders.req.json");
+
+		// Ensure directory exists
+		if let Some(parent) = post_orders_file.parent() {
 			fs::create_dir_all(parent).await?;
 		}
 
-		let json = serde_json::to_string_pretty(results)?;
-		fs::write(&results.file_path, json).await?;
+		let json = serde_json::to_string_pretty(&post_orders)?;
+		fs::write(&post_orders_file, json).await?;
 
-		debug!("Saved batch test results to: {:?}", results.file_path);
+		info!(
+			"Created post_orders.req.json with {} signed orders",
+			post_orders.len()
+		);
+		debug!("Saved to: {:?}", post_orders_file);
+
 		Ok(())
 	}
 }

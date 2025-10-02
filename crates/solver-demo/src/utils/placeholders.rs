@@ -4,6 +4,7 @@ use std::collections::HashMap;
 pub const PLACEHOLDER_INPUT_SETTLER_PREFIX: &str = "PLACEHOLDER_INPUT_SETTLER_";
 pub const PLACEHOLDER_OUTPUT_SETTLER_PREFIX: &str = "PLACEHOLDER_OUTPUT_SETTLER_";
 pub const PLACEHOLDER_COMPACT_PREFIX: &str = "PLACEHOLDER_COMPACT_";
+pub const PLACEHOLDER_INPUT_SETTLER_COMPACT_PREFIX: &str = "PLACEHOLDER_INPUT_SETTLER_COMPACT_";
 pub const PLACEHOLDER_ALLOCATOR_PREFIX: &str = "PLACEHOLDER_ALLOCATOR_";
 pub const PLACEHOLDER_TOKEN_A_PREFIX: &str = "PLACEHOLDER_TOKEN_A_";
 pub const PLACEHOLDER_TOKEN_B_PREFIX: &str = "PLACEHOLDER_TOKEN_B_";
@@ -45,6 +46,13 @@ pub fn generate_placeholder_map(chain_ids: &[u64]) -> HashMap<String, String> {
 		// Compact
 		map.insert(
 			format!("{}{}", PLACEHOLDER_COMPACT_PREFIX, chain_id),
+			format!("0x{:040x}", counter),
+		);
+		counter += 1;
+
+		// InputSettlerCompact
+		map.insert(
+			format!("{}{}", PLACEHOLDER_INPUT_SETTLER_COMPACT_PREFIX, chain_id),
 			format!("0x{:040x}", counter),
 		);
 		counter += 1;
@@ -92,6 +100,9 @@ pub fn get_placeholder_for_contract(chain_id: u64, contract_type: &str) -> Strin
 		"input_settler" => format!("{}{}", PLACEHOLDER_INPUT_SETTLER_PREFIX, chain_id),
 		"output_settler" => format!("{}{}", PLACEHOLDER_OUTPUT_SETTLER_PREFIX, chain_id),
 		"compact" | "the_compact" => format!("{}{}", PLACEHOLDER_COMPACT_PREFIX, chain_id),
+		"input_settler_compact" => {
+			format!("{}{}", PLACEHOLDER_INPUT_SETTLER_COMPACT_PREFIX, chain_id)
+		},
 		"allocator" => format!("{}{}", PLACEHOLDER_ALLOCATOR_PREFIX, chain_id),
 		"token_a" | "toka" => format!("{}{}", PLACEHOLDER_TOKEN_A_PREFIX, chain_id),
 		"token_b" | "tokb" => format!("{}{}", PLACEHOLDER_TOKEN_B_PREFIX, chain_id),

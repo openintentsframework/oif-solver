@@ -29,7 +29,7 @@ pub enum Commands {
 	#[command(subcommand)]
 	Accounts(accounts::AccountCommands),
 
-	/// Intent operations (build, submit, test, status, list)
+	/// Intent operations (build, build-batch, submit, test, status)
 	#[command(subcommand)]
 	Intent(intent::IntentCommands),
 

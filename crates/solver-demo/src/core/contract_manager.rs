@@ -11,17 +11,16 @@
 //! efficient network communication and supports both read-only calls and state-changing
 //! transactions with proper transaction confirmation monitoring.
 
-use alloy_primitives::{Address, U256};
+use alloy_dyn_abi::{DynSolType, DynSolValue};
+use alloy_network::EthereumWallet;
+use alloy_primitives::{Address, B256, U256};
+use alloy_provider::{Provider, ProviderBuilder, RootProvider};
+use alloy_rpc_types::{TransactionReceipt, TransactionRequest};
+use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolCall;
+use alloy_transport_http::Http;
 use anyhow::{anyhow, Result};
-use ethers::{
-	abi::Token,
-	contract::Contract,
-	core::types::{TransactionReceipt, H256},
-	middleware::SignerMiddleware,
-	providers::{Http, Middleware, Provider},
-	signers::{LocalWallet, Signer},
-};
+use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -53,7 +52,8 @@ pub struct ContractManager {
 	///
 	/// Maintains HTTP provider instances for each configured chain to
 	/// optimize network communication and reduce connection overhead.
-	providers: Arc<RwLock<HashMap<u64, Arc<Provider<Http>>>>>,
+	#[allow(clippy::type_complexity)]
+	providers: Arc<RwLock<HashMap<u64, Arc<RootProvider<Http<Client>>>>>>,
 }
 
 impl ContractManager {
@@ -81,7 +81,7 @@ impl ContractManager {
 		&self,
 		chain_id: u64,
 		contract_name: &str,
-		constructor_args: Vec<Token>,
+		constructor_args: Vec<DynSolValue>,
 	) -> Result<Address> {
 		info!("Deploying contract {} to chain {}", contract_name, chain_id);
 
@@ -113,8 +113,8 @@ impl ContractManager {
 		address: Address,
 		abi_name: &str,
 		function: &str,
-		args: Vec<Token>,
-	) -> Result<Vec<Token>> {
+		args: Vec<DynSolValue>,
+	) -> Result<Vec<DynSolValue>> {
 		debug!(
 			"Calling {}::{} on chain {} at {}",
 			abi_name, function, chain_id, address
@@ -126,26 +126,52 @@ impl ContractManager {
 
 		let func = abi
 			.function(function)
-			.map_err(|e| anyhow!("Function '{}' not found in ABI: {}", function, e))?;
+			.ok_or_else(|| anyhow!("Function '{}' not found in ABI", function))?
+			.first()
+			.ok_or_else(|| anyhow!("Function '{}' has no implementations", function))?;
 
-		let encoded = func
-			.encode_input(&args)
-			.map_err(|e| anyhow!("Failed to encode call for {}: {}", function, e))?;
+		// Encode using dynamic ABI encoding
+		let mut encoded = func.selector().to_vec();
 
-		let tx = ethers::types::transaction::eip2718::TypedTransaction::Legacy(
-			ethers::types::TransactionRequest::new()
-				.to(ethers::types::H160::from_slice(address.as_slice()))
-				.data(encoded),
-		);
+		// Encode the inputs using dynamic ABI types
+		if !args.is_empty() {
+			// Use alloy's dynamic ABI encoder
+			let tuple_value = DynSolValue::Tuple(args);
+			let encoded_inputs = tuple_value
+				.abi_encode_sequence()
+				.ok_or_else(|| anyhow!("Failed to encode function arguments"))?;
+			encoded.extend(encoded_inputs);
+		}
+
+		let tx = TransactionRequest::default()
+			.to(address)
+			.input(encoded.into());
 
 		let result = provider
-			.call(&tx, None)
+			.call(&tx)
 			.await
 			.map_err(|e| anyhow!("Contract call failed: {}", e))?;
 
-		let tokens = func
-			.decode_output(&result)
-			.map_err(|e| anyhow!("Failed to decode output: {}", e))?;
+		// Decode the output
+		let output_types: Vec<DynSolType> = func
+			.outputs
+			.iter()
+			.map(|param| param.ty.parse().unwrap())
+			.collect();
+
+		let tokens = if output_types.is_empty() {
+			vec![]
+		} else {
+			let tuple_type = DynSolType::Tuple(output_types);
+			let decoded = tuple_type
+				.abi_decode(&result)
+				.map_err(|e| anyhow!("Failed to decode output: {}", e))?;
+			if let DynSolValue::Tuple(values) = decoded {
+				values
+			} else {
+				vec![decoded]
+			}
+		};
 
 		Ok(tokens)
 	}
@@ -163,67 +189,106 @@ impl ContractManager {
 		address: Address,
 		abi_name: &str,
 		function: &str,
-		args: Vec<Token>,
+		args: Vec<DynSolValue>,
+	) -> Result<TransactionReceipt> {
+		self.send_transaction_with_key(chain_id, address, abi_name, function, args, None)
+			.await
+	}
+
+	/// Executes a function call that modifies blockchain state with an optional private key.
+	///
+	/// If private_key is provided, uses that key for signing. Otherwise uses the default
+	/// deployer signer for the chain.
+	pub async fn send_transaction_with_key(
+		&self,
+		chain_id: u64,
+		address: Address,
+		abi_name: &str,
+		function: &str,
+		args: Vec<DynSolValue>,
+		private_key: Option<PrivateKeySigner>,
 	) -> Result<TransactionReceipt> {
 		info!(
 			"Sending transaction {}::{} on chain {} to {}",
 			abi_name, function, chain_id, address
 		);
 
-		debug!("Transaction args: {:?}", args);
+		info!("Transaction args: {:?}", args);
 
 		let abi = self.abi_manager.get_abi(abi_name).await?;
-		debug!("Loaded ABI for {}", abi_name);
+		info!("Loaded ABI for {}", abi_name);
 
 		let provider = self.get_provider(chain_id).await?;
-		let signer = self.deployer_manager.get_signer(chain_id)?;
+		let signer = if let Some(wallet) = private_key {
+			wallet
+		} else {
+			self.deployer_manager.get_signer(chain_id)?.clone()
+		};
 
-		let client = Arc::new(SignerMiddleware::new(provider.clone(), signer.clone()));
-
-		let contract = Contract::new(
-			ethers::types::H160::from_slice(address.as_slice()),
-			abi,
-			client.clone(),
-		);
+		let wallet = EthereumWallet::from(signer);
+		let rpc_url = provider.client().transport().url();
+		let provider_with_signer = ProviderBuilder::new()
+			.with_recommended_fillers()
+			.wallet(wallet)
+			.on_http(rpc_url.parse()?);
 
 		debug!("Building method call for function: {}", function);
-		debug!("Contract address: {:?}", contract.address());
+		debug!("Contract address: {:?}", address);
 
-		let func = contract
-			.abi()
+		let func = abi
 			.function(function)
-			.map_err(|e| anyhow!("Function '{}' not found in ABI: {}", function, e))?;
+			.ok_or_else(|| anyhow!("Function '{}' not found in ABI", function))?
+			.first()
+			.ok_or_else(|| anyhow!("Function '{}' has no implementations", function))?;
 
-		let encoded = func.encode_input(&args).map_err(|e| {
-			debug!("Encoding failed: {:?}", e);
-			debug!("Function name: {}", function);
-			debug!("Args passed: {:?}", args);
-			anyhow!("Failed to encode call for {}: {}", function, e)
-		})?;
+		// Encode using dynamic ABI encoding
+		let mut encoded = func.selector().to_vec();
+		info!(
+			"Function selector for {}: 0x{}",
+			function,
+			hex::encode(func.selector())
+		);
 
-		let tx = ethers::types::TransactionRequest::new()
-			.to(contract.address())
-			.data(encoded);
+		// Encode the inputs using dynamic ABI types
+		if !args.is_empty() {
+			info!("Encoding {} arguments", args.len());
+			for (i, arg) in args.iter().enumerate() {
+				info!("  Arg[{}]: {:?}", i, arg);
+			}
 
-		let pending_tx = client
-			.send_transaction(tx, None)
+			// Use alloy's dynamic ABI encoder
+			let tuple_value = DynSolValue::Tuple(args);
+			let encoded_inputs = tuple_value
+				.abi_encode_sequence()
+				.ok_or_else(|| anyhow!("Failed to encode function arguments"))?;
+			info!("Encoded inputs: 0x{}", hex::encode(&encoded_inputs));
+			encoded.extend(encoded_inputs);
+		}
+
+		info!("Full calldata: 0x{}", hex::encode(&encoded));
+
+		let tx = TransactionRequest::default()
+			.to(address)
+			.input(encoded.into());
+
+		let pending_tx = provider_with_signer
+			.send_transaction(tx)
 			.await
 			.map_err(|e| anyhow!("Failed to send transaction: {}", e))?;
 
-		debug!("Transaction sent: {:?}", pending_tx);
+		debug!("Transaction sent: {:?}", pending_tx.tx_hash());
 
 		let receipt = pending_tx
-			.await?
-			.ok_or_else(|| anyhow!("Transaction receipt not found"))?;
+			.get_receipt()
+			.await
+			.map_err(|e| anyhow!("Failed to get transaction receipt: {}", e))?;
 
 		info!(
 			"Transaction confirmed in block {} with status {}",
 			receipt
 				.block_number
 				.map_or("pending".to_string(), |n| n.to_string()),
-			receipt
-				.status
-				.map_or("unknown".to_string(), |s| s.to_string())
+			receipt.status()
 		);
 
 		Ok(receipt)
@@ -237,11 +302,11 @@ impl ContractManager {
 	pub async fn get_balance(&self, chain_id: u64, address: Address) -> Result<U256> {
 		let provider = self.get_provider(chain_id).await?;
 		let balance = provider
-			.get_balance(ethers::types::H160::from_slice(address.as_slice()), None)
+			.get_balance(address)
 			.await
 			.map_err(|e| anyhow!("Failed to get balance: {}", e))?;
 
-		Ok(U256::from(balance.as_u128()))
+		Ok(balance)
 	}
 
 	/// Retrieves the transaction receipt for a specific transaction hash.
@@ -252,7 +317,7 @@ impl ContractManager {
 	pub async fn get_transaction_receipt(
 		&self,
 		chain_id: u64,
-		tx_hash: H256,
+		tx_hash: B256,
 	) -> Result<Option<TransactionReceipt>> {
 		let provider = self.get_provider(chain_id).await?;
 		let receipt = provider
@@ -272,7 +337,7 @@ impl ContractManager {
 	pub async fn wait_for_confirmation(
 		&self,
 		chain_id: u64,
-		tx_hash: H256,
+		tx_hash: B256,
 		confirmations: usize,
 	) -> Result<TransactionReceipt> {
 		let provider = self.get_provider(chain_id).await?;
@@ -288,7 +353,7 @@ impl ContractManager {
 
 				if let Some(block_number) = receipt.block_number {
 					let current_block = provider.get_block_number().await?;
-					let confirms = current_block.saturating_sub(block_number).as_u64();
+					let confirms = current_block.saturating_sub(block_number);
 					if confirms >= confirmations as u64 {
 						return Ok(receipt);
 					}
@@ -313,7 +378,7 @@ impl ContractManager {
 	/// Returns a cached provider instance for the chain if available, otherwise
 	/// creates a new provider using the RPC URL from the session manager.
 	/// The provider is cached for future use to optimize network operations.
-	async fn get_provider(&self, chain_id: u64) -> Result<Arc<Provider<Http>>> {
+	pub async fn get_provider(&self, chain_id: u64) -> Result<Arc<RootProvider<Http<Client>>>> {
 		let mut providers = self.providers.write().await;
 
 		if let Some(provider) = providers.get(&chain_id) {
@@ -326,7 +391,7 @@ impl ContractManager {
 			.await
 			.ok_or_else(|| anyhow!("No RPC URL for chain {}", chain_id))?;
 
-		let provider = Arc::new(Provider::<Http>::try_from(rpc_url)?);
+		let provider = Arc::new(ProviderBuilder::new().on_http(rpc_url.parse()?));
 		providers.insert(chain_id, provider.clone());
 
 		Ok(provider)
@@ -370,50 +435,216 @@ impl ContractManager {
 		);
 
 		// Create provider and wallet
-		let provider = Provider::<Http>::try_from(rpc_url)?;
-		let wallet: LocalWallet = private_key
+		let wallet: PrivateKeySigner = private_key
 			.parse()
 			.map_err(|e| anyhow!("Failed to parse private key: {}", e))?;
-		let chain_id = provider.get_chainid().await?.as_u64();
-		let wallet = wallet.with_chain_id(chain_id);
-
-		let client = Arc::new(SignerMiddleware::new(provider, wallet));
+		let eth_wallet = EthereumWallet::from(wallet);
+		let provider_with_signer = ProviderBuilder::new()
+			.with_recommended_fillers()
+			.wallet(eth_wallet)
+			.on_http(rpc_url.parse()?);
 
 		// Create ERC20 contract instance
 		let erc20_abi = self.abi_manager.get_abi("MockERC20").await?;
-		let contract = Contract::new(
-			ethers::types::H160::from_slice(token_address.as_slice()),
-			erc20_abi,
-			client.clone(),
-		);
 
-		// Call approve function
-		let method_call = contract
-			.method::<_, H256>(
-				"approve",
-				(
-					ethers::types::H160::from_slice(spender.as_slice()),
-					ethers::types::U256::from_big_endian(&amount.to_be_bytes::<32>()),
-				),
-			)
-			.map_err(|e| anyhow!("Failed to build approve transaction: {}", e))?;
+		// Build approve function call
+		let func = erc20_abi
+			.function("approve")
+			.ok_or_else(|| anyhow!("Function 'approve' not found in ABI"))?
+			.first()
+			.ok_or_else(|| anyhow!("Function 'approve' has no implementations"))?;
 
-		let pending_tx = method_call
-			.send()
+		// Encode using dynamic ABI encoding
+		let mut encoded = func.selector().to_vec();
+
+		let args = vec![
+			DynSolValue::Address(spender),
+			DynSolValue::Uint(amount, 256),
+		];
+
+		// Encode the inputs using dynamic ABI types
+		if !args.is_empty() {
+			// Use alloy's dynamic ABI encoder
+			let tuple_value = DynSolValue::Tuple(args);
+			let encoded_inputs = tuple_value
+				.abi_encode_sequence()
+				.ok_or_else(|| anyhow!("Failed to encode function arguments"))?;
+			encoded.extend(encoded_inputs);
+		}
+
+		let tx = TransactionRequest::default()
+			.to(token_address)
+			.input(encoded.into());
+
+		let pending_tx = provider_with_signer
+			.send_transaction(tx)
 			.await
 			.map_err(|e| anyhow!("Failed to send approve transaction: {}", e))?;
 
-		let tx_hash = pending_tx.tx_hash();
+		let tx_hash = *pending_tx.tx_hash();
 		info!("Token approval transaction sent: {:?}", tx_hash);
 
 		// Wait for confirmation
 		let receipt = pending_tx
+			.get_receipt()
 			.await
-			.map_err(|e| anyhow!("Failed to wait for transaction: {}", e))?
-			.ok_or_else(|| anyhow!("Transaction receipt not found"))?;
+			.map_err(|e| anyhow!("Failed to wait for transaction: {}", e))?;
 
-		if receipt.status != Some(1.into()) {
+		if !receipt.status() {
 			return Err(anyhow!("Token approval transaction failed"));
+		}
+
+		Ok(format!("{:?}", tx_hash))
+	}
+
+	/// Computes the order identifier from an InputSettler contract.
+	///
+	/// Calls the orderIdentifier() function on the InputSettler contract with the
+	/// StandardOrder struct to get the proper order identifier bytes32 value.
+	pub async fn compute_order_identifier(
+		&self,
+		chain_id: u64,
+		input_settler_address: Address,
+		order: &solver_types::standards::eip7683::interfaces::StandardOrder,
+	) -> Result<[u8; 32]> {
+		use alloy_sol_types::SolCall;
+		use solver_types::standards::eip7683::interfaces::IInputSettlerEscrow;
+
+		println!("📞 [CONTRACT] Calling orderIdentifier on InputSettler");
+		println!("📞 [CONTRACT] Chain ID: {}", chain_id);
+		println!(
+			"📞 [CONTRACT] InputSettler: {}",
+			crate::utils::address::to_checksum_address(&input_settler_address, Some(chain_id))
+		);
+
+		// Build the orderIdentifier call using alloy (same ABI for compact or escrow)
+		let order_id_call = IInputSettlerEscrow::orderIdentifierCall {
+			order: order.clone(),
+		};
+
+		// Encode the call data
+		let call_data = order_id_call.abi_encode();
+		println!("📞 [CONTRACT] Call data length: {} bytes", call_data.len());
+		println!("📞 [CONTRACT] Call data: 0x{}", hex::encode(&call_data));
+
+		let provider = self.get_provider(chain_id).await?;
+
+		// Make the call
+		let tx = TransactionRequest::default()
+			.to(input_settler_address)
+			.input(call_data.into());
+
+		println!("📞 [CONTRACT] Making RPC call to orderIdentifier...");
+		let result = provider.call(&tx).await.map_err(|e| {
+			println!("❌ [CONTRACT] RPC call failed: {}", e);
+			anyhow!("Failed to call orderIdentifier: {}", e)
+		})?;
+
+		println!(
+			"📞 [CONTRACT] RPC call successful, result length: {}",
+			result.len()
+		);
+		println!("📞 [CONTRACT] Raw result: 0x{}", hex::encode(&result));
+
+		if result.len() != 32 {
+			return Err(anyhow!(
+				"Invalid orderIdentifier result length: {}",
+				result.len()
+			));
+		}
+
+		let mut order_id = [0u8; 32];
+		order_id.copy_from_slice(&result);
+		println!("📞 [CONTRACT] Parsed order ID: 0x{}", hex::encode(order_id));
+		Ok(order_id)
+	}
+
+	/// Deposits ERC20 tokens to TheCompact contract.
+	///
+	/// Calls the depositERC20() function on TheCompact contract to lock tokens
+	/// with a specified allocator lock tag. This is required before submitting
+	/// compact/resource lock intents.
+	#[allow(clippy::too_many_arguments)]
+	pub async fn deposit_to_compact(
+		&self,
+		the_compact_address: Address,
+		token_address: Address,
+		allocator_lock_tag: [u8; 12],
+		amount: U256,
+		recipient: Address,
+		private_key: &str,
+		rpc_url: &str,
+	) -> Result<String> {
+		info!(
+			"Depositing {} tokens to TheCompact for recipient {}",
+			amount, recipient
+		);
+
+		// Create provider and wallet
+		let wallet: PrivateKeySigner = private_key
+			.parse()
+			.map_err(|e| anyhow!("Failed to parse private key: {}", e))?;
+		let eth_wallet = EthereumWallet::from(wallet);
+		let provider_with_signer = ProviderBuilder::new()
+			.with_recommended_fillers()
+			.wallet(eth_wallet)
+			.on_http(rpc_url.parse()?);
+
+		// Get TheCompact ABI
+		let compact_abi = self.abi_manager.get_abi("TheCompact").await?;
+
+		// Build depositERC20 function call
+		// function depositERC20(address token, bytes12 allocatorLockTag, uint256 amount, address recipient)
+		let func = compact_abi
+			.function("depositERC20")
+			.ok_or_else(|| anyhow!("Function 'depositERC20' not found in ABI"))?
+			.first()
+			.ok_or_else(|| anyhow!("Function 'depositERC20' has no implementations"))?;
+
+		// Encode using dynamic ABI encoding
+		let mut encoded = func.selector().to_vec();
+
+		// Convert the 12-byte allocator_lock_tag to a 32-byte Word for FixedBytes
+		let mut word_bytes = [0u8; 32];
+		word_bytes[0..12].copy_from_slice(&allocator_lock_tag);
+		let word = alloy_primitives::FixedBytes::<32>::from(word_bytes);
+
+		let args = vec![
+			DynSolValue::Address(token_address),
+			DynSolValue::FixedBytes(word, 12),
+			DynSolValue::Uint(amount, 256),
+			DynSolValue::Address(recipient),
+		];
+
+		// Encode the inputs
+		if !args.is_empty() {
+			let tuple_value = DynSolValue::Tuple(args);
+			let encoded_inputs = tuple_value
+				.abi_encode_sequence()
+				.ok_or_else(|| anyhow!("Failed to encode function arguments"))?;
+			encoded.extend(encoded_inputs);
+		}
+
+		let tx = TransactionRequest::default()
+			.to(the_compact_address)
+			.input(encoded.into());
+
+		let pending_tx = provider_with_signer
+			.send_transaction(tx)
+			.await
+			.map_err(|e| anyhow!("Failed to send deposit transaction: {}", e))?;
+
+		let tx_hash = *pending_tx.tx_hash();
+		info!("Deposit transaction sent: {:?}", tx_hash);
+
+		// Wait for confirmation
+		let receipt = pending_tx
+			.get_receipt()
+			.await
+			.map_err(|e| anyhow!("Failed to wait for deposit transaction: {}", e))?;
+
+		if !receipt.status() {
+			return Err(anyhow!("Deposit transaction failed"));
 		}
 
 		Ok(format!("{:?}", tx_hash))
@@ -437,26 +668,21 @@ impl ContractManager {
 		);
 
 		// Create provider and wallet
-		let provider = Provider::<Http>::try_from(rpc_url)?;
-		let wallet: LocalWallet = private_key
+		let wallet: PrivateKeySigner = private_key
 			.parse()
 			.map_err(|e| anyhow!("Failed to parse private key: {}", e))?;
-		let chain_id = provider.get_chainid().await?.as_u64();
-		let wallet = wallet.with_chain_id(chain_id);
-
-		let client = Arc::new(SignerMiddleware::new(provider, wallet));
+		let eth_wallet = EthereumWallet::from(wallet);
+		let provider_with_signer = ProviderBuilder::new()
+			.with_recommended_fillers()
+			.wallet(eth_wallet)
+			.on_http(rpc_url.parse()?);
 
 		// Get the appropriate settler ABI based on the order type
-		let settler_abi = self
+		let _settler_abi = self
 			.abi_manager
 			.get_abi(contract_type)
 			.await
 			.map_err(|e| anyhow!("Failed to get ABI for {}: {}", contract_type, e))?;
-		let contract = Contract::new(
-			ethers::types::H160::from_slice(input_settler.as_slice()),
-			settler_abi,
-			client.clone(),
-		);
 
 		// Use alloy's ABI encoding to encode the StandardOrder, then manually build the call
 		// The encoding depends on the contract type (escrow vs compact)
@@ -470,7 +696,7 @@ impl ContractManager {
 				};
 
 				// Encode the call data
-				open_call.abi_encode()
+				SolCall::abi_encode(&open_call)
 			},
 			"InputSettlerCompact" => {
 				// Compact settler doesn't have an open function
@@ -478,7 +704,9 @@ impl ContractManager {
 				// For onchain submission of compact orders, we would need to call
 				// TheCompact contract first to deposit/lock resources, then submit
 				// This is not currently supported in the demo
-				return Err(anyhow!("Onchain submission for InputSettlerCompact is not yet implemented. Compact orders require depositing to TheCompact first."));
+				return Err(anyhow!(
+					"Onchain submission for InputSettlerCompact is not yet implemented. Compact orders require depositing to TheCompact first."
+				));
 			},
 			_ => {
 				return Err(anyhow!("Unsupported contract type: {}", contract_type));
@@ -492,25 +720,24 @@ impl ContractManager {
 		);
 
 		// Send the transaction using raw call data
-		let client = contract.client().clone();
-		let tx = ethers::core::types::TransactionRequest::new()
-			.to(ethers::types::H160::from_slice(input_settler.as_slice()))
-			.data(call_data.to_vec());
-		let pending_tx = client
-			.send_transaction(tx, None)
+		let tx = TransactionRequest::default()
+			.to(input_settler)
+			.input(call_data.into());
+		let pending_tx = provider_with_signer
+			.send_transaction(tx)
 			.await
 			.map_err(|e| anyhow!("Failed to send open transaction: {}", e))?;
 
-		let tx_hash = pending_tx.tx_hash();
+		let tx_hash = *pending_tx.tx_hash();
 		info!("Intent submission transaction sent: {:?}", tx_hash);
 
 		// Wait for confirmation
 		let receipt = pending_tx
+			.get_receipt()
 			.await
-			.map_err(|e| anyhow!("Failed to wait for transaction: {}", e))?
-			.ok_or_else(|| anyhow!("Transaction receipt not found"))?;
+			.map_err(|e| anyhow!("Failed to wait for transaction: {}", e))?;
 
-		if receipt.status != Some(1.into()) {
+		if !receipt.status() {
 			return Err(anyhow!("Intent submission transaction failed"));
 		}
 

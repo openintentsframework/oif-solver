@@ -94,12 +94,7 @@ async fn main() -> Result<()> {
 				api_client.clone(),
 			));
 
-			// Create signing service with private key from session manager
-			let private_key = session_manager.get_solver_private_key().await.ok();
-			if private_key.is_none() {
-				debug!("No solver private key available. Signatures will need to be provided manually.");
-			}
-			let signing_service = Arc::new(SigningService::new(private_key).unwrap());
+			let signing_service = Arc::new(SigningService::new(contract_manager.clone()));
 
 			let quote_service = Arc::new(
 				QuoteService::new(

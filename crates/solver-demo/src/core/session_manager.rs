@@ -14,6 +14,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
+use crate::utils::address::bytes_to_checksum_address;
+
 use crate::models::{
 	AccountInfo, ContractAddresses, Environment, JwtTokenEntry, NetworkConfig, SessionConfig,
 	TokenInfo,
@@ -95,72 +97,8 @@ impl SessionManager {
 		let includes = Self::parse_includes_from_config(config_path).await?;
 		config.session.includes = includes;
 
-		let mut chain_ids = Vec::new();
-		let mut rpc_urls = HashMap::new();
-		let mut network_configs = HashMap::new();
-
-		for (chain_id, network) in parsed_config.networks.iter() {
-			chain_ids.push(*chain_id);
-
-			if let Some(rpc_url) = network.rpc_urls.first() {
-				let url = if let Some(http_url) = &rpc_url.http {
-					http_url.clone()
-				} else if let Some(ws_url) = &rpc_url.ws {
-					ws_url.clone()
-				} else {
-					continue;
-				};
-
-				rpc_urls.insert(*chain_id, url.clone());
-
-				let oracle_address =
-					Self::get_oracle_for_chain(&parsed_config.settlement, *chain_id);
-
-				let net_config = NetworkConfig {
-					chain_id: *chain_id,
-					name: format!("Chain {}", chain_id),
-					rpc_url: url,
-					explorer_url: None,
-					contracts: ContractAddresses {
-						input_settler: Some(format!(
-							"0x{}",
-							hex::encode(&network.input_settler_address.0)
-						)),
-						output_settler: Some(format!(
-							"0x{}",
-							hex::encode(&network.output_settler_address.0)
-						)),
-						permit2: Some(
-							crate::utils::constants::PERMIT2_CANONICAL_ADDRESS.to_string(),
-						),
-						tokens: network
-							.tokens
-							.iter()
-							.map(|token| {
-								(
-									token.symbol.clone(),
-									TokenInfo {
-										address: format!("0x{}", hex::encode(&token.address.0)),
-										decimals: token.decimals,
-									},
-								)
-							})
-							.collect(),
-						compact: network
-							.the_compact_address
-							.as_ref()
-							.map(|a| format!("0x{}", hex::encode(&a.0))),
-						allocator: network
-							.allocator_address
-							.as_ref()
-							.map(|a| format!("0x{}", hex::encode(&a.0))),
-						oracle: oracle_address,
-					},
-				};
-
-				network_configs.insert(*chain_id, net_config);
-			}
-		}
+		// Build network configurations using the extracted helper
+		let (chain_ids, rpc_urls, network_configs) = Self::build_network_configs(&parsed_config);
 
 		config.session.chain_ids = chain_ids;
 		config.session.rpc_urls = rpc_urls;
@@ -564,6 +502,125 @@ impl SessionManager {
 			.map(|info| info.decimals)
 	}
 
+	/// Builds network configurations from a parsed solver config.
+	///
+	/// Converts the networks from solver_types::NetworkConfig to the session's
+	/// NetworkConfig format, handling RPC URL selection, address formatting,
+	/// and oracle configuration. Returns chain IDs, RPC URLs, and network configs.
+	fn build_network_configs(
+		parsed_config: &solver_config::Config,
+	) -> (Vec<u64>, HashMap<u64, String>, HashMap<u64, NetworkConfig>) {
+		let mut chain_ids = Vec::new();
+		let mut rpc_urls = HashMap::new();
+		let mut network_configs = HashMap::new();
+
+		for (chain_id, network) in parsed_config.networks.iter() {
+			chain_ids.push(*chain_id);
+			if let Some(rpc_url) = network.rpc_urls.first() {
+				let url = if let Some(http_url) = &rpc_url.http {
+					http_url.clone()
+				} else if let Some(ws_url) = &rpc_url.ws {
+					ws_url.clone()
+				} else {
+					continue;
+				};
+
+				rpc_urls.insert(*chain_id, url.clone());
+				let oracle_address =
+					Self::get_oracle_for_chain(&parsed_config.settlement, *chain_id);
+
+				let net_config = NetworkConfig {
+					chain_id: *chain_id,
+					name: format!("Chain {}", chain_id),
+					rpc_url: url,
+					explorer_url: None,
+					contracts: ContractAddresses {
+						input_settler: Some(bytes_to_checksum_address(
+							&network.input_settler_address.0,
+							Some(*chain_id),
+						)),
+						output_settler: Some(bytes_to_checksum_address(
+							&network.output_settler_address.0,
+							Some(*chain_id),
+						)),
+						permit2: Some(
+							crate::utils::constants::PERMIT2_CANONICAL_ADDRESS.to_string(),
+						),
+						tokens: network
+							.tokens
+							.iter()
+							.map(|token| {
+								(
+									token.symbol.clone(),
+									TokenInfo {
+										address: bytes_to_checksum_address(
+											&token.address.0,
+											Some(*chain_id),
+										),
+										decimals: token.decimals,
+									},
+								)
+							})
+							.collect(),
+						compact: network
+							.the_compact_address
+							.as_ref()
+							.map(|a| bytes_to_checksum_address(&a.0, Some(*chain_id))),
+						input_settler_compact: network
+							.input_settler_compact_address
+							.as_ref()
+							.map(|a| bytes_to_checksum_address(&a.0, Some(*chain_id))),
+						allocator: network
+							.allocator_address
+							.as_ref()
+							.map(|a| bytes_to_checksum_address(&a.0, Some(*chain_id))),
+						oracle: oracle_address,
+					},
+				};
+
+				network_configs.insert(*chain_id, net_config);
+			}
+		}
+
+		(chain_ids, rpc_urls, network_configs)
+	}
+
+	/// Reloads the configuration from disk to pick up any file changes.
+	///
+	/// This method refreshes the in-memory configuration by re-reading the
+	/// TOML files from disk. This is useful after configuration files have
+	/// been updated (e.g., with new contract addresses) and the in-memory
+	/// state needs to be synchronized with the file system.
+	pub async fn reload_config(&self) -> Result<()> {
+		// Get the original config file path from the session
+		let config = self.config.read().await;
+		let config_path = config
+			.session
+			.active_config
+			.as_ref()
+			.ok_or_else(|| anyhow!("No active config path found"))?
+			.clone();
+		drop(config);
+
+		// Parse the config file using the same method as init
+		let parsed_config = solver_config::Config::from_file(
+			config_path
+				.to_str()
+				.ok_or_else(|| anyhow!("Invalid config path"))?,
+		)
+		.await?;
+
+		// Build networks config using the extracted helper
+		let (_, _, network_configs) = Self::build_network_configs(&parsed_config);
+
+		// Update the networks configuration in memory
+		let mut config = self.config.write().await;
+		config.networks_config = network_configs;
+
+		info!("Configuration reloaded from {}", config_path.display());
+		Ok(())
+	}
+
 	/// Updates the contract addresses for a specific chain.
 	///
 	/// Stores the new contract addresses for the specified chain and persists
@@ -762,11 +819,11 @@ impl SessionManager {
 		let original_content = content.clone();
 
 		let format_addr = |addr: &str| -> String {
-			if addr.starts_with("0x") {
-				addr.to_lowercase()
-			} else {
-				format!("0x{}", addr.to_lowercase())
-			}
+			// Parse the address and convert to checksum format
+			let parsed_addr = addr
+				.parse::<alloy_primitives::Address>()
+				.unwrap_or_else(|_| panic!("Invalid address format: {}", addr));
+			parsed_addr.to_checksum(Some(chain_id))
 		};
 
 		let mut all_chain_ids = self.get_chain_ids().await;
@@ -795,6 +852,15 @@ impl SessionManager {
 				placeholders.get(&format!("{}{}", PLACEHOLDER_COMPACT_PREFIX, chain_id))
 			{
 				content = content.replace(placeholder, &format_addr(compact));
+			}
+		}
+
+		if let Some(input_settler_compact) = &addresses.input_settler_compact {
+			if let Some(placeholder) = placeholders.get(&format!(
+				"{}{}",
+				PLACEHOLDER_INPUT_SETTLER_COMPACT_PREFIX, chain_id
+			)) {
+				content = content.replace(placeholder, &format_addr(input_settler_compact));
 			}
 		}
 
@@ -918,7 +984,7 @@ impl SessionManager {
 			.await
 			.map_err(|e| anyhow!("Failed to get solver address: {}", e))?;
 
-		let address_hex = format!("0x{}", hex::encode(&solver_address.0));
+		let address_hex = bytes_to_checksum_address(&solver_address.0, None);
 		let address = address_hex
 			.parse::<alloy_primitives::Address>()
 			.map_err(|e| anyhow!("Failed to parse address: {}", e))?;

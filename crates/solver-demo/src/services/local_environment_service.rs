@@ -4,13 +4,17 @@
 //! including starting and stopping Anvil blockchain instances and deploying
 //! infrastructure contracts for testing.
 
+use alloy_dyn_abi::DynSolValue;
+use alloy_provider::Provider;
 use anyhow::{anyhow, Result};
 use futures::future::try_join_all;
 use std::collections::HashMap;
+
+use crate::utils::address::bytes_to_checksum_address;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use which::which;
 
 use crate::utils::constants::*;
@@ -83,6 +87,13 @@ impl LocalEnvironmentService {
 				.update_contract_addresses(chain_id, addresses)
 				.await?;
 		}
+
+		// Reload configuration to pick up the freshly updated addresses
+		info!("Reloading configuration with updated addresses...");
+		self.session_manager.reload_config().await?;
+
+		info!("Setting up token balances and Permit2 approvals...");
+		self.setup_token_approvals().await?;
 
 		info!("Local environment started successfully");
 		Ok(())
@@ -203,7 +214,7 @@ impl LocalEnvironmentService {
 
 		info!("[1/8] Deploying Permit2 at canonical address...");
 		let permit2_address = self.ensure_permit2(chain_id).await?;
-		addresses.permit2 = Some(format!("0x{}", hex::encode(permit2_address)));
+		addresses.permit2 = Some(bytes_to_checksum_address(&permit2_address, Some(chain_id)));
 
 		info!("[2/8] Deploying TOKA token...");
 		let toka_address = self
@@ -212,9 +223,9 @@ impl LocalEnvironmentService {
 				chain_id,
 				"MockERC20",
 				vec![
-					ethers::abi::Token::String("Test Token A".to_string()),
-					ethers::abi::Token::String("TOKA".to_string()),
-					ethers::abi::Token::Uint(ethers::types::U256::from(6)), // 6 decimals
+					DynSolValue::String("Token A".to_string()),
+					DynSolValue::String("TOKA".to_string()),
+					DynSolValue::Uint(alloy_primitives::U256::from(18), 256),
 				],
 			)
 			.await
@@ -223,8 +234,8 @@ impl LocalEnvironmentService {
 		token_addresses.insert(
 			"TOKA".to_string(),
 			TokenInfo {
-				address: format!("{:#x}", toka_address),
-				decimals: 6,
+				address: crate::utils::address::to_checksum_address(&toka_address, Some(chain_id)),
+				decimals: 18,
 			},
 		);
 
@@ -235,9 +246,9 @@ impl LocalEnvironmentService {
 				chain_id,
 				"MockERC20",
 				vec![
-					ethers::abi::Token::String("Test Token B".to_string()),
-					ethers::abi::Token::String("TOKB".to_string()),
-					ethers::abi::Token::Uint(ethers::types::U256::from(6)), // 6 decimals
+					DynSolValue::String("Token B".to_string()),
+					DynSolValue::String("TOKB".to_string()),
+					DynSolValue::Uint(alloy_primitives::U256::from(18), 256),
 				],
 			)
 			.await
@@ -246,8 +257,8 @@ impl LocalEnvironmentService {
 		token_addresses.insert(
 			"TOKB".to_string(),
 			TokenInfo {
-				address: format!("{:#x}", tokb_address),
-				decimals: 6,
+				address: crate::utils::address::to_checksum_address(&tokb_address, Some(chain_id)),
+				decimals: 18,
 			},
 		);
 
@@ -262,7 +273,10 @@ impl LocalEnvironmentService {
 			.await
 			.map_err(|e| anyhow!("Failed to deploy InputSettlerEscrow: {}", e))?;
 		info!("InputSettlerEscrow deployed at: {}", input_settler_address);
-		addresses.input_settler = Some(format!("{:#x}", input_settler_address));
+		addresses.input_settler = Some(crate::utils::address::to_checksum_address(
+			&input_settler_address,
+			Some(chain_id),
+		));
 
 		info!("[5/8] Deploying OutputSettlerSimple contract...");
 		let output_settler_address = self
@@ -278,9 +292,12 @@ impl LocalEnvironmentService {
 			"OutputSettlerSimple deployed at: {}",
 			output_settler_address
 		);
-		addresses.output_settler = Some(format!("{:#x}", output_settler_address));
+		addresses.output_settler = Some(crate::utils::address::to_checksum_address(
+			&output_settler_address,
+			Some(chain_id),
+		));
 
-		info!("[6/8] Deploying TheCompact contract...");
+		info!("[6/9] Deploying TheCompact contract...");
 		let compact_address = self
 			.contract_manager
 			.deploy_contract(
@@ -291,9 +308,33 @@ impl LocalEnvironmentService {
 			.await
 			.map_err(|e| anyhow!("Failed to deploy TheCompact: {}", e))?;
 		info!("TheCompact deployed at: {}", compact_address);
-		addresses.compact = Some(format!("{:#x}", compact_address));
+		addresses.compact = Some(crate::utils::address::to_checksum_address(
+			&compact_address,
+			Some(chain_id),
+		));
 
-		info!("[7/8] Deploying AlwaysOKAllocator contract...");
+		info!("[7/9] Deploying InputSettlerCompact contract...");
+		// InputSettlerCompact takes TheCompact address as constructor argument
+		use alloy_dyn_abi::DynSolValue;
+		let input_settler_compact_address = self
+			.contract_manager
+			.deploy_contract(
+				chain_id,
+				"InputSettlerCompact",
+				vec![DynSolValue::Address(compact_address)], // TheCompact address as constructor arg
+			)
+			.await
+			.map_err(|e| anyhow!("Failed to deploy InputSettlerCompact: {}", e))?;
+		info!(
+			"InputSettlerCompact deployed at: {}",
+			input_settler_compact_address
+		);
+		addresses.input_settler_compact = Some(crate::utils::address::to_checksum_address(
+			&input_settler_compact_address,
+			Some(chain_id),
+		));
+
+		info!("[8/10] Deploying AlwaysOKAllocator contract...");
 		let allocator_address = self
 			.contract_manager
 			.deploy_contract(
@@ -304,9 +345,19 @@ impl LocalEnvironmentService {
 			.await
 			.map_err(|e| anyhow!("Failed to deploy AlwaysOKAllocator: {}", e))?;
 		info!("AlwaysOKAllocator deployed at: {}", allocator_address);
-		addresses.allocator = Some(format!("{:#x}", allocator_address));
+		addresses.allocator = Some(crate::utils::address::to_checksum_address(
+			&allocator_address,
+			Some(chain_id),
+		));
 
-		info!("[8/8] Deploying AlwaysYesOracle contract...");
+		// Register the allocator with TheCompact
+		info!("[9/10] Registering allocator with TheCompact...");
+		self.register_allocator_with_compact(chain_id, compact_address, allocator_address)
+			.await
+			.map_err(|e| anyhow!("Failed to register allocator with TheCompact: {}", e))?;
+		info!("Allocator registered with TheCompact");
+
+		info!("[10/10] Deploying AlwaysYesOracle contract...");
 		let oracle_address = self
 			.contract_manager
 			.deploy_contract(
@@ -317,15 +368,92 @@ impl LocalEnvironmentService {
 			.await
 			.map_err(|e| anyhow!("Failed to deploy AlwaysYesOracle: {}", e))?;
 		info!("AlwaysYesOracle deployed at: {}", oracle_address);
-		addresses.oracle = Some(format!("{:#x}", oracle_address));
+		addresses.oracle = Some(crate::utils::address::to_checksum_address(
+			&oracle_address,
+			Some(chain_id),
+		));
 
 		addresses.tokens = token_addresses;
 
 		info!(
 			"Infrastructure deployment completed for chain {} with {} contracts",
-			chain_id, 8
+			chain_id, 9
 		);
 		Ok(addresses)
+	}
+
+	/// Register an allocator with TheCompact contract
+	async fn register_allocator_with_compact(
+		&self,
+		chain_id: u64,
+		compact_address: alloy_primitives::Address,
+		allocator_address: alloy_primitives::Address,
+	) -> Result<()> {
+		info!("Registering allocator with TheCompact contract");
+		info!("  Chain ID: {}", chain_id);
+		info!("  TheCompact address: {}", compact_address);
+		info!("  Allocator address: {}", allocator_address);
+
+		// First, let's verify the allocator is deployed
+		let provider = self.contract_manager.get_provider(chain_id).await?;
+		let allocator_code = provider
+			.get_code_at(allocator_address)
+			.await
+			.map_err(|e| anyhow!("Failed to check allocator code: {}", e))?;
+
+		if allocator_code.is_empty() {
+			return Err(anyhow!("Allocator not deployed at {}", allocator_address));
+		}
+		info!("  Allocator code size: {} bytes", allocator_code.len());
+
+		// Debug: Let's try different ways of encoding empty bytes
+		info!("Attempting to register allocator...");
+
+		// Use contract manager to send the transaction
+		match self
+			.contract_manager
+			.send_transaction(
+				chain_id,
+				compact_address,
+				"TheCompact",
+				"__registerAllocator",
+				vec![
+					DynSolValue::Address(allocator_address),
+					DynSolValue::Bytes(vec![]), // Empty bytes for proof
+				],
+			)
+			.await
+		{
+			Ok(receipt) => {
+				info!("✅ Allocator registration successful!");
+				info!("  Transaction hash: {:?}", receipt.transaction_hash);
+				info!("  Block number: {:?}", receipt.block_number);
+				info!("  Gas used: {:?}", receipt.gas_used);
+				info!("  Status: {}", receipt.status());
+
+				// Receipt structure debugging
+				debug!("Full receipt: {:?}", receipt);
+
+				debug!("Allocator successfully registered with TheCompact");
+				Ok(())
+			},
+			Err(e) => {
+				error!("❌ Failed to register allocator: {}", e);
+
+				// Let's try to get more details about the error
+				let error_str = format!("{:?}", e);
+				if error_str.contains("execution reverted") {
+					error!("  Transaction reverted during execution");
+
+					// Try to decode the error if possible
+					if error_str.contains("0x") {
+						error!("  Revert data present, attempting to decode...");
+					}
+				}
+
+				Err(anyhow!("Failed to register allocator: {}", e))
+			},
+		}
 	}
 
 	/// Ensures Permit2 is deployed at its canonical address.
@@ -468,6 +596,131 @@ impl LocalEnvironmentService {
 		if pid_file.exists() {
 			std::fs::remove_file(pid_file)?;
 		}
+		Ok(())
+	}
+
+	/// Sets up token balances and Permit2 approvals for seamless intent submission.
+	/// This mirrors the behavior of the old bash env_up system.
+	async fn setup_token_approvals(&self) -> Result<()> {
+		use alloy_primitives::{Address, U256};
+		use alloy_signer::Signer;
+
+		let chain_ids = self.session_manager.get_chain_ids().await;
+		let user_account = self.session_manager.get_user_account().await;
+		let solver_account = self.session_manager.get_solver_account().await;
+		let permit2_address: Address = PERMIT2_CANONICAL_ADDRESS
+			.parse()
+			.map_err(|e| anyhow!("Invalid Permit2 address: {}", e))?;
+
+		for chain_id in chain_ids {
+			info!(
+				"Setting up token balances and approvals for chain {}",
+				chain_id
+			);
+
+			// Get token addresses for this chain
+			let network_config = self.session_manager.get_network_config(chain_id).await;
+			if network_config.is_none() {
+				warn!("No network config found for chain {}", chain_id);
+				continue;
+			}
+			let network = network_config.unwrap();
+
+			// Set up approvals for each token
+			for (token_symbol, token_info) in &network.contracts.tokens {
+				let token_address: Address = token_info
+					.address
+					.parse()
+					.map_err(|e| anyhow!("Invalid token address for {}: {}", token_symbol, e))?;
+
+				info!(
+					"Setting up {} token balances and approvals on chain {}",
+					token_symbol, chain_id
+				);
+
+				// 1. Mint tokens to user (100 tokens = 100 * 10^decimals)
+				let amount = U256::from(100) * U256::from(10).pow(U256::from(token_info.decimals));
+
+				info!("Minting {} {} to user", amount, token_symbol);
+				self.contract_manager
+					.send_transaction(
+						chain_id,
+						token_address,
+						"MockERC20",
+						"mint",
+						vec![
+							DynSolValue::Address(user_account.address),
+							DynSolValue::Uint(amount, 256),
+						],
+					)
+					.await
+					.map_err(|e| {
+						anyhow!("Failed to mint {} tokens to user: {}", token_symbol, e)
+					})?;
+
+				// 2. Mint tokens to solver (100 tokens = 100 * 10^decimals)
+				info!("Minting {} {} to solver", amount, token_symbol);
+				self.contract_manager
+					.send_transaction(
+						chain_id,
+						token_address,
+						"MockERC20",
+						"mint",
+						vec![
+							DynSolValue::Address(solver_account.address),
+							DynSolValue::Uint(amount, 256),
+						],
+					)
+					.await
+					.map_err(|e| {
+						anyhow!("Failed to mint {} tokens to solver: {}", token_symbol, e)
+					})?;
+
+				// 3. Basic ERC20 approval: User approves Permit2 to spend unlimited tokens
+				// This matches the old bash system behavior (lines 828-835 in deployment.sh)
+				info!(
+					"Approving Permit2 to spend {} tokens for user",
+					token_symbol
+				);
+				let max_amount = U256::MAX;
+
+				// Get user's private key for the approval
+				let key = user_account
+					.private_key
+					.as_ref()
+					.ok_or_else(|| anyhow!("User account has no private key"))?
+					.trim_start_matches("0x");
+				let user_private_key =
+					alloy_signer_local::PrivateKeySigner::from_slice(&hex::decode(key)?)
+						.map_err(|e| anyhow!("Failed to parse user private key: {}", e))?
+						.with_chain_id(Some(chain_id));
+
+				self.contract_manager
+					.send_transaction_with_key(
+						chain_id,
+						token_address,
+						"MockERC20",
+						"approve",
+						vec![
+							DynSolValue::Address(permit2_address),
+							DynSolValue::Uint(max_amount, 256),
+						],
+						Some(user_private_key),
+					)
+					.await
+					.map_err(|e| {
+						anyhow!("Failed to approve Permit2 for {}: {}", token_symbol, e)
+					})?;
+
+				info!(
+					"✓ {} token setup complete (minted to user+solver + ERC20->Permit2 approval)",
+					token_symbol
+				);
+			}
+
+			info!("✓ Chain {} token setup complete", chain_id);
+		}
+
 		Ok(())
 	}
 }
