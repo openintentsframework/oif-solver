@@ -558,7 +558,6 @@ impl QuoteGenerator {
 			"0x{:040x}",
 			alloy_primitives::Address::from_slice(&input_settler.0)
 		);
-		let output_settler = network.output_settler_address.clone();
 
 		// Calculate fillDeadline (should match fillDeadline in StandardOrder)
 		let fill_deadline = chrono::Utc::now().timestamp() as u32 + intent_validity_seconds as u32;
@@ -622,15 +621,25 @@ impl QuoteGenerator {
 				})
 			}).collect::<Vec<_>>(),
 			"outputs": request.intent.outputs.iter().map(|output| {
-				serde_json::json!({
-					"chainId": output.asset.ethereum_chain_id().unwrap_or(1),
+				// Get the output settler for the specific output chain
+				let output_chain_id = output.asset.ethereum_chain_id().unwrap_or(1);
+				let output_network = config.networks.get(&output_chain_id).ok_or_else(|| {
+					QuoteError::InvalidRequest(format!(
+						"Output chain {} not found in config",
+						output_chain_id
+					))
+				})?;
+				let output_settler = &output_network.output_settler_address;
+
+				Ok::<_, QuoteError>(serde_json::json!({
+					"chainId": output_chain_id,
 					"asset": output.asset.to_string(),
 					"amount": output.amount.clone(),
 					"receiver": output.receiver.to_string(),
 					"oracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&selected_oracle.0)),
 					"settler": format!("0x{:040x}", alloy_primitives::Address::from_slice(&output_settler.0)),
-				})
-			}).collect::<Vec<_>>()
+				}))
+			}).collect::<Result<Vec<_>, _>>()?
 		});
 
 		let order = OifOrder::Oif3009V0 {
