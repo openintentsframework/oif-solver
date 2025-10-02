@@ -82,7 +82,7 @@ impl QuoteGenerator {
 		delivery_service: Arc<DeliveryService>,
 	) -> Self {
 		Self {
-			custody_strategy: CustodyStrategy::new(),
+			custody_strategy: CustodyStrategy::new(delivery_service.clone()),
 			settlement_service,
 			delivery_service,
 		}
@@ -538,11 +538,17 @@ impl QuoteGenerator {
 		_settlement: &dyn SettlementInterface,
 		selected_oracle: solver_types::Address,
 	) -> Result<OifOrder, QuoteError> {
-		// Use minValidUntil from request if provided, otherwise use configured validity
-		let intent_validity_seconds = request
-			.intent
-			.min_valid_until
-			.unwrap_or_else(|| self.get_quote_validity_seconds(config));
+		use alloy_primitives::hex;
+
+		// Use minValidUntil from request if provided (as absolute timestamp), otherwise use configured validity duration
+		let deadline_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until {
+			// min_valid_until is an absolute timestamp
+			min_valid_until
+		} else {
+			// Use configured validity duration added to current time
+			let validity_seconds = self.get_quote_validity_seconds(config);
+			chrono::Utc::now().timestamp() as u64 + validity_seconds
+		};
 
 		// Get input chain to find the input settler address (the 'to' field)
 		let first_input = &request.intent.inputs[0];
@@ -561,7 +567,7 @@ impl QuoteGenerator {
 		let output_settler = network.output_settler_address.clone();
 
 		// Calculate fillDeadline (should match fillDeadline in StandardOrder)
-		let fill_deadline = chrono::Utc::now().timestamp() as u32 + intent_validity_seconds as u32;
+		let fill_deadline = deadline_timestamp as u32;
 
 		// Calculate the correct orderIdentifier using the contract
 		let (nonce_u64, order_identifier) = self
@@ -577,6 +583,11 @@ impl QuoteGenerator {
 		// Build structured domain object for EIP-3009 token
 		let domain_object = self
 			.build_eip3009_domain_object(&token_address, input_chain_id)
+			.await?;
+
+		// Get the domain separator from the contract
+		let domain_separator = self
+			.get_eip3009_domain_separator(&token_address, input_chain_id)
 			.await?;
 
 		// For EIP-3009, we need to generate signature templates for each input
@@ -607,6 +618,7 @@ impl QuoteGenerator {
 		// Build metadata with full intent information AND StandardOrder reconstruction data
 		// This is needed for conversion back to StandardOrder from limited EIP-3009 signature
 		let metadata = serde_json::json!({
+			"domain_separator": format!("0x{}", hex::encode(domain_separator)),
 			"user": request.user.to_string(),
 			"nonce": nonce_u64,
 			"originChainId": input_chain_id,
@@ -684,10 +696,10 @@ impl QuoteGenerator {
 			.user
 			.ethereum_address()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid user address: {}", e)))?;
-		// Generate incremental nonce like direct intent (current timestamp in microseconds)
+		// Generate incremental nonce like direct intent (current timestamp in milliseconds)
 		let nonce = std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
-			.map(|d| d.as_micros() as u64)
+			.map(|d| d.as_millis() as u64)
 			.unwrap_or(0u64);
 		let expiry = fill_deadline; // Use same value
 
@@ -861,6 +873,64 @@ impl QuoteGenerator {
 		Ok((nonce, order_id))
 	}
 
+	/// Get the DOMAIN_SEPARATOR from an EIP-3009 token contract
+	async fn get_eip3009_domain_separator(
+		&self,
+		token_address: &[u8; 20],
+		chain_id: u64,
+	) -> Result<[u8; 32], QuoteError> {
+		use alloy_primitives::hex;
+		use alloy_sol_types::SolCall;
+
+		// Define the DOMAIN_SEPARATOR function
+		alloy_sol_types::sol! {
+			function DOMAIN_SEPARATOR() external view returns (bytes32);
+		}
+
+		// Encode the call
+		let encoded_call = DOMAIN_SEPARATORCall {}.abi_encode();
+
+		// Build transaction for the contract call
+		let tx = solver_types::Transaction {
+			to: Some(solver_types::Address(token_address.to_vec())),
+			data: encoded_call,
+			value: alloy_primitives::U256::ZERO,
+			gas_limit: None,
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+			nonce: None,
+			chain_id,
+		};
+
+		// Call the contract using the delivery service
+		let domain_separator_bytes = self
+			.delivery_service
+			.contract_call(chain_id, tx)
+			.await
+			.map_err(|e| {
+				QuoteError::InvalidRequest(format!("Failed to get domain separator: {}", e))
+			})?;
+
+		// Convert the returned bytes to [u8; 32]
+		if domain_separator_bytes.len() != 32 {
+			return Err(QuoteError::InvalidRequest(format!(
+				"Invalid domain separator length: expected 32 bytes, got {}",
+				domain_separator_bytes.len()
+			)));
+		}
+
+		let mut domain_separator = [0u8; 32];
+		domain_separator.copy_from_slice(&domain_separator_bytes);
+
+		tracing::info!(
+			"Successfully retrieved domain separator: 0x{}",
+			hex::encode(domain_separator)
+		);
+
+		Ok(domain_separator)
+	}
+
 	async fn build_compact_message(
 		&self,
 		request: &GetQuoteRequest,
@@ -871,13 +941,16 @@ impl QuoteGenerator {
 		use solver_types::utils::bytes20_to_alloy_address;
 		use std::str::FromStr;
 
-		// Use minValidUntil from request if provided, otherwise use configured validity
-		let intent_validity_seconds = request
-			.intent
-			.min_valid_until
-			.unwrap_or_else(|| self.get_quote_validity_seconds(config));
+		// Use minValidUntil from request if provided (as absolute timestamp), otherwise use configured validity duration
 		let current_time = chrono::Utc::now().timestamp() as u64;
-		let expires = current_time + intent_validity_seconds;
+		let expires = if let Some(min_valid_until) = request.intent.min_valid_until {
+			// min_valid_until is an absolute timestamp
+			min_valid_until
+		} else {
+			// Use configured validity duration added to current time
+			let validity_seconds = self.get_quote_validity_seconds(config);
+			current_time + validity_seconds
+		};
 		let nonce = chrono::Utc::now().timestamp_millis() as u64; // Use milliseconds timestamp as nonce for uniqueness (matching direct intent flow)
 
 		// Get user address
@@ -1087,7 +1160,7 @@ impl QuoteGenerator {
 					})
 				}).collect::<Vec<_>>(),
 				"mandate": {
-					"fillDeadline": (current_time + intent_validity_seconds).to_string(),
+					"fillDeadline": expires.to_string(),
 					"inputOracle": format!("0x{:040x}", input_oracle),
 					"outputs": outputs_array
 				}
