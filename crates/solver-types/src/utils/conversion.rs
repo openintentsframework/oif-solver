@@ -130,24 +130,49 @@ pub fn parse_bytes32_from_hex(hex_str: &str) -> Result<[u8; 32], Box<dyn std::er
 /// This function parses a hex string (with or without "0x" prefix) into
 /// a 20-byte Address type used throughout the solver system.
 ///
+/// Handles both regular 20-byte Ethereum addresses and 32-byte representations
+/// (as used in EIP-7683 where addresses are stored as bytes32).
+///
 /// # Arguments
-/// * `hex_str` - A hex string representing an Ethereum address
+/// * `hex_str` - A hex string representing an Ethereum address (20 or 32 bytes)
 ///
 /// # Returns
-/// * `Ok(Address)` if the string is a valid 20-byte address
+/// * `Ok(Address)` if the string is a valid address
 /// * `Err(String)` with error description if parsing fails
 pub fn parse_address(hex_str: &str) -> Result<Address, String> {
-	let hex = without_0x_prefix(hex_str);
-	hex::decode(hex)
+	let hex_clean = without_0x_prefix(hex_str);
+
+	// Handle U256 hex that's missing leading zeros (common with EIP-7683 inputs)
+	// U256 serialization drops leading zeros, so "0x8ad..." (31 bytes) should be "0x08ad..." (32 bytes)
+	let padded_hex = match hex_clean.len() {
+		40 => hex_clean.to_string(),      // Standard 20-byte address
+		62 => format!("00{}", hex_clean), // 31 bytes -> pad to 32
+		64 => hex_clean.to_string(),      // Already 32 bytes
+		_ if hex_clean.len() < 64 && hex_clean.len() > 40 => {
+			// Other missing zeros cases - pad to 64 chars (32 bytes)
+			format!("{:0>64}", hex_clean)
+		},
+		_ => hex_clean.to_string(),
+	};
+
+	hex::decode(&padded_hex)
 		.map_err(|e| format!("Invalid hex: {}", e))
 		.and_then(|bytes| {
-			if bytes.len() != 20 {
-				Err(format!(
-					"Invalid address length: expected 20 bytes, got {}",
+			match bytes.len() {
+				20 => {
+					// Standard 20-byte Ethereum address
+					Ok(Address(bytes))
+				},
+				32 => {
+					// bytes32 representation - extract last 20 bytes as address
+					let mut addr_bytes = vec![0u8; 20];
+					addr_bytes.copy_from_slice(&bytes[12..32]);
+					Ok(Address(addr_bytes))
+				},
+				_ => Err(format!(
+					"Invalid address length: expected 20 or 32 bytes, got {}",
 					bytes.len()
-				))
-			} else {
-				Ok(Address(bytes))
+				)),
 			}
 		})
 }
