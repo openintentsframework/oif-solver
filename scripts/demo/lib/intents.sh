@@ -165,7 +165,7 @@ build_post_order_request() {
         --argjson origin "${origin_submission:-null}" \
         '{
             order: $order,
-            signature: [$sig]
+            signature: $sig
         } + if $qid != "" then {quoteId: $qid} else {} end
           + if $origin != null then {originSubmission: $origin} else {} end')
     
@@ -277,6 +277,19 @@ create_escrow_intent() {
     local order_struct=$(build_standard_order_struct \
         "$user_addr" "$nonce" "$origin_chain_id" "$expiry" "$fill_deadline" \
         "$input_oracle" "$input_tokens" "$outputs_array")
+    
+    print_debug "=== BASH STANDARDORDER DEBUG ===" >&2
+    print_debug "StandardOrder struct components:" >&2
+    print_debug "  user_addr: $user_addr" >&2
+    print_debug "  nonce: $nonce" >&2
+    print_debug "  origin_chain_id: $origin_chain_id" >&2
+    print_debug "  expiry: $expiry" >&2
+    print_debug "  fill_deadline: $fill_deadline" >&2
+    print_debug "  input_oracle: $input_oracle" >&2
+    print_debug "  input_tokens: $input_tokens" >&2
+    print_debug "  outputs_array: $outputs_array" >&2
+    print_debug "Complete order_struct: $order_struct" >&2
+    print_debug "=================================" >&2
     
     local abi_type='f((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))'
     local order_data=$(cast_abi_encode "$abi_type" "$order_struct")
@@ -1891,6 +1904,10 @@ intent_build() {
         local output_asset_uii=$(to_uii_address "$dest_chain" "$token_out")
         local recipient_uii=$(to_uii_address "$dest_chain" "$recipient_addr")
         
+        # Calculate minValidUntil timestamp (current time + 10 minutes)
+        local current_time=$(get_timestamp)
+        local min_valid_until=$((current_time + 600))
+        
         # Create quote request JSON using new GetQuoteRequest format
         if [ "$intent_type" = "compact" ]; then
             # For compact intents (resource locks), add lock field
@@ -1904,6 +1921,7 @@ intent_build() {
                     --arg input_amount "$amount_in" \
                     --arg output_receiver "$recipient_uii" \
                     --arg output_asset "$output_asset_uii" \
+                    --argjson min_valid_until "$min_valid_until" \
                     '{
                         user: $user,
                         intent: {
@@ -1926,7 +1944,7 @@ intent_build() {
                             ],
                             swapType: "'"$swap_type"'",
                             preference: "speed",
-                            minValidUntil: 600
+                            minValidUntil: $min_valid_until
                         },
                         supportedTypes: ["oif-escrow-v0", "oif-resource-lock-v0", "oif-3009-v0"]
                     }')
@@ -1939,6 +1957,7 @@ intent_build() {
                     --arg output_receiver "$recipient_uii" \
                     --arg output_asset "$output_asset_uii" \
                     --arg output_amount "$amount_out" \
+                    --argjson min_valid_until "$min_valid_until" \
                     '{
                         user: $user,
                         intent: {
@@ -1961,7 +1980,7 @@ intent_build() {
                             ],
                             swapType: "'"$swap_type"'",
                             preference: "speed",
-                            minValidUntil: 600
+                            minValidUntil: $min_valid_until
                         },
                         supportedTypes: ["oif-escrow-v0", "oif-resource-lock-v0", "oif-3009-v0"]
                     }')
@@ -2000,6 +2019,7 @@ intent_build() {
                     --arg output_receiver "$recipient_uii" \
                     --arg output_asset "$output_asset_uii" \
                     --argjson origin_submission "$origin_submission" \
+                    --argjson min_valid_until "$min_valid_until" \
                     '{
                         user: $user,
                         intent: {
@@ -2019,7 +2039,7 @@ intent_build() {
                             ],
                             swapType: "'"$swap_type"'",
                             preference: "speed",
-                            minValidUntil: 600,
+                            minValidUntil: $min_valid_until,
                             originSubmission: $origin_submission
                         },
                         supportedTypes: ["oif-escrow-v0", "oif-resource-lock-v0", "oif-3009-v0"]
@@ -2034,6 +2054,7 @@ intent_build() {
                     --arg output_asset "$output_asset_uii" \
                     --arg output_amount "$amount_out" \
                     --argjson origin_submission "$origin_submission" \
+                    --argjson min_valid_until "$min_valid_until" \
                     '{
                         user: $user,
                         intent: {
@@ -2053,7 +2074,7 @@ intent_build() {
                             ],
                             swapType: "'"$swap_type"'",
                             preference: "speed",
-                            minValidUntil: 600,
+                            minValidUntil: $min_valid_until,
                             originSubmission: $origin_submission
                         },
                         supportedTypes: ["oif-escrow-v0", "oif-resource-lock-v0", "oif-3009-v0"]

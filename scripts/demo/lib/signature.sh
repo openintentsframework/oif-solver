@@ -739,11 +739,30 @@ sign_standard_intent() {
     local input_oracle="$9"
     local mandate_outputs_json="${10}"
     
+    print_debug "=== BASH SIGNING DEBUG ===" >&2
+    print_debug "sign_standard_intent parameters:" >&2
+    print_debug "  user_private_key: [REDACTED]" >&2
+    print_debug "  origin_chain_id: $origin_chain_id" >&2
+    print_debug "  token_address: $token_address" >&2
+    print_debug "  amount: $amount" >&2
+    print_debug "  settler_address: $settler_address" >&2
+    print_debug "  nonce: $nonce" >&2
+    print_debug "  deadline: $deadline" >&2
+    print_debug "  expires: $expires" >&2
+    print_debug "  input_oracle: $input_oracle" >&2
+    print_debug "  mandate_outputs_json: $mandate_outputs_json" >&2
+    
     # Parse mandate outputs from JSON
     local mandate_outputs=()
     while IFS= read -r line; do
         mandate_outputs+=("$line")
     done < <(echo "$mandate_outputs_json" | jq -r '.[] | "\(.oracle),\(.settler),\(.chainId),\(.token),\(.amount),\(.recipient)"')
+    
+    print_debug "Parsed mandate_outputs array:" >&2
+    for i in "${!mandate_outputs[@]}"; do
+        print_debug "  [$i]: ${mandate_outputs[$i]}" >&2
+    done
+    print_debug "=========================" >&2
     
     # Generate signature
     local signature=$(sign_permit2_order "$user_private_key" "$origin_chain_id" "$token_address" \

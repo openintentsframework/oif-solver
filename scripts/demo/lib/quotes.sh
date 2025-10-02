@@ -108,8 +108,12 @@ build_quote_request() {
     local output_amount="$7"
     local recipient="${8:-$user_address}"
     local preference="${9:-speed}"
-    local min_valid_until="${10:-600}"  # 10 minutes
-    local supported_types="${11:-[\"oif-escrow-v0\", \"oif-resource-lock-v0\", \"oif-3009-v0\"]}"
+    local min_valid_until_duration="${10:-600}"  # 10 minutes in seconds
+    local supported_types="${11:-[\"oif-escrow-v0\", \"oif-resource-lock-v0\", \"oif-3009-v0\"]}" 
+    
+    # Convert duration to timestamp
+    local current_time=$(get_timestamp)
+    local min_valid_until=$((current_time + min_valid_until_duration))
     
     print_debug "Building quote request (new OIF spec)"
     print_debug "User: $user_address"
@@ -292,9 +296,13 @@ request_token_swap_quote() {
     print_header "Requesting Token Swap Quote"
     
     # Build quote request (with configurable supported types)
+    # Calculate minValidUntil timestamp (current time + 10 minutes)
+    local current_time=$(get_timestamp)
+    local min_valid_timestamp=$((current_time + 600))
+    
     local quote_request=$(build_quote_request \
         "$user_address" "$input_chain_id" "$input_token" "$input_amount" \
-        "$output_chain_id" "$output_token" "$output_amount" "$recipient" "speed" 600 "$supported_types")
+        "$output_chain_id" "$output_token" "$output_amount" "$recipient" "speed" $min_valid_timestamp "$supported_types")
     
     if [ -z "$quote_request" ]; then
         print_error "Failed to build quote request"
@@ -609,7 +617,10 @@ quote_get() {
     local outputs=$(echo "$intent_json" | jq -c '.intent.outputs // []')
     local swap_type=$(echo "$intent_json" | jq -r '.intent.swapType // "exact-input"')
     local preference=$(echo "$intent_json" | jq -r '.intent.preference // "speed"')
-    local min_valid_until=$(echo "$intent_json" | jq -r '.intent.minValidUntil // 600')
+    # Parse minValidUntil, default to current time + 10 minutes if not provided
+    local current_time=$(get_timestamp)
+    local default_min_valid_until=$((current_time + 600))
+    local min_valid_until=$(echo "$intent_json" | jq -r --arg default "$default_min_valid_until" '.intent.minValidUntil // ($default | tonumber)')
     local origin_submission=$(echo "$intent_json" | jq -c '.intent.originSubmission // null')
     local supported_types=$(echo "$intent_json" | jq -c '.supportedTypes // ["oif-escrow-v0", "oif-resource-lock-v0", "oif-3009-v0"]')
     
@@ -1177,7 +1188,7 @@ quote_accept() {
                 --argjson order "$order_data" \
                 '{
                     order: $order,
-                    signature: [$signature],
+                    signature: $signature,
                     quoteId: $quoteId
                 }')
         else
@@ -1189,7 +1200,7 @@ quote_accept() {
                 --argjson originSubmission "$origin_submission_data" \
                 '{
                     order: $order,
-                    signature: [$signature],
+                    signature: $signature,
                     quoteId: $quoteId,
                     originSubmission: $originSubmission
                 }')
