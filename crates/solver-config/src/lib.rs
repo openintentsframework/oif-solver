@@ -80,15 +80,6 @@ pub struct Config {
 	pub gas: Option<GasConfig>,
 }
 
-/// Domain configuration for EIP-712 signatures in quotes.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DomainConfig {
-	/// Chain ID where the settlement contract is deployed.
-	pub chain_id: u64,
-	/// Settlement contract address.
-	pub address: String,
-}
-
 /// Configuration specific to the solver instance.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SolverConfig {
@@ -192,8 +183,6 @@ pub struct SettlementConfig {
 	/// Map of settlement implementation names to their configurations.
 	/// Each implementation handles specific settlement mechanisms.
 	pub implementations: HashMap<String, toml::Value>,
-	/// Domain configuration for EIP-712 signatures in quotes.
-	pub domain: Option<DomainConfig>,
 	/// Poll interval in seconds for settlement readiness monitoring.
 	/// Defaults to 3 seconds if not specified.
 	#[serde(default = "default_settlement_poll_interval_seconds")]

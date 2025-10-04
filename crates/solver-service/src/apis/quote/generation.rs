@@ -55,9 +55,8 @@ use solver_delivery::DeliveryService;
 use solver_settlement::{SettlementInterface, SettlementService};
 use solver_types::standards::eip7683::LockType;
 use solver_types::{
-	CostContext, FailureHandlingMode, GetQuoteRequest, InteropAddress, OifOrder, OrderInput,
-	OrderPayload, Quote, QuoteError, QuotePreference, SignatureType, SwapType,
-	ValidatedQuoteContext,
+	CostContext, FailureHandlingMode, GetQuoteRequest, OifOrder, OrderInput, OrderPayload, Quote,
+	QuoteError, QuotePreference, SignatureType, SwapType, ValidatedQuoteContext,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -392,7 +391,6 @@ impl QuoteGenerator {
 	) -> Result<OifOrder, QuoteError> {
 		use solver_types::LockKind;
 
-		let domain_address = self.get_lock_domain_address(config, lock)?;
 		let default_params = serde_json::json!({});
 		let params = lock.params.as_ref().unwrap_or(&default_params);
 		let (primary_type, message) = match &lock.kind {
@@ -440,8 +438,7 @@ impl QuoteGenerator {
 				OifOrder::OifResourceLockV0 {
 					payload: OrderPayload {
 						signature_type: SignatureType::Eip712,
-						domain: serde_json::to_value(domain_address)
-							.unwrap_or(serde_json::Value::Null),
+						domain: serde_json::Value::Null, // TBD
 						primary_type,
 						message,
 						types: None, // Other resource locks don't need EIP-712 types yet
@@ -463,7 +460,7 @@ impl QuoteGenerator {
 		// TODO: Implement support for multiple destination chains
 		let chain_id = request
 			.intent
-			.outputs
+			.inputs
 			.first()
 			.ok_or_else(|| QuoteError::InvalidRequest("No requested outputs".to_string()))?
 			.asset
@@ -959,16 +956,6 @@ impl QuoteGenerator {
 			.ethereum_address()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid user address: {}", e)))?;
 
-		// Get TheCompact domain address (arbiter)
-		let the_compact_lock = solver_types::AssetLockReference {
-			kind: solver_types::LockKind::TheCompact,
-			params: Some(serde_json::json!({})),
-		};
-		let domain_address = self.get_lock_domain_address(config, &the_compact_lock)?;
-		let _arbiter_address = domain_address
-			.ethereum_address()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid domain address: {}", e)))?;
-
 		// Get input chain ID from first available input
 		let first_input = request
 			.intent
@@ -1327,28 +1314,6 @@ impl QuoteGenerator {
 		}))
 	}
 
-	fn get_lock_domain_address(
-		&self,
-		config: &Config,
-		lock: &solver_types::AssetLockReference,
-	) -> Result<InteropAddress, QuoteError> {
-		match &config.settlement.domain {
-			Some(domain_config) => {
-				let address = domain_config.address.parse().map_err(|e| {
-					QuoteError::InvalidRequest(format!("Invalid domain address in config: {}", e))
-				})?;
-				Ok(InteropAddress::new_ethereum(
-					domain_config.chain_id,
-					address,
-				))
-			},
-			None => Err(QuoteError::InvalidRequest(format!(
-				"Domain configuration required for lock type: {:?}",
-				lock.kind
-			))),
-		}
-	}
-
 	fn calculate_eta(&self, preference: &Option<QuotePreference>) -> u64 {
 		let base_eta = 120u64;
 		match preference {
@@ -1517,9 +1482,7 @@ mod tests {
 	use crate::apis::quote::custody::CustodyDecision;
 	use alloy_primitives::address;
 	use alloy_primitives::U256;
-	use solver_config::{
-		ApiConfig, Config, ConfigBuilder, DomainConfig, QuoteConfig, SettlementConfig,
-	};
+	use solver_config::{ApiConfig, Config, ConfigBuilder, QuoteConfig, SettlementConfig};
 	use solver_settlement::{MockSettlementInterface, SettlementInterface};
 	use solver_types::{
 		oif_versions, parse_address,
@@ -1549,10 +1512,6 @@ mod tests {
 		// Create settlement configuration with domain
 		let settlement_config = SettlementConfig {
 			implementations: HashMap::new(),
-			domain: Some(DomainConfig {
-				chain_id: 1,
-				address: "0x1234567890123456789012345678901234567890".to_string(),
-			}),
 			settlement_poll_interval_seconds: 3,
 		};
 
@@ -2056,43 +2015,6 @@ mod tests {
 		let config_no_api = ConfigBuilder::new().build();
 		let validity_default = generator.get_quote_validity_seconds(&config_no_api);
 		assert_eq!(validity_default, 20); // if API none, use default 20
-	}
-
-	#[test]
-	fn test_get_lock_domain_address_success() {
-		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
-		let config = create_test_config();
-		let lock = solver_types::AssetLockReference {
-			kind: solver_types::LockKind::TheCompact,
-			params: Some(serde_json::json!({})),
-		};
-
-		let result = generator.get_lock_domain_address(&config, &lock);
-		assert!(result.is_ok());
-
-		let domain = result.unwrap();
-		assert_eq!(domain.ethereum_chain_id().unwrap(), 1);
-	}
-
-	#[test]
-	fn test_get_lock_domain_address_missing_config() {
-		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
-		let mut config = create_test_config();
-		config.settlement.domain = None;
-
-		let lock = solver_types::AssetLockReference {
-			kind: solver_types::LockKind::TheCompact,
-			params: Some(serde_json::json!({})),
-		};
-
-		let result = generator.get_lock_domain_address(&config, &lock);
-		assert!(matches!(result, Err(QuoteError::InvalidRequest(_))));
 	}
 
 	#[tokio::test]

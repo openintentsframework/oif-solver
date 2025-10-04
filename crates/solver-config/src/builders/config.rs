@@ -154,7 +154,6 @@ impl ConfigBuilder {
 			},
 			settlement: self.settlement.unwrap_or_else(|| SettlementConfig {
 				implementations: HashMap::new(),
-				domain: None,
 				settlement_poll_interval_seconds: 3,
 			}),
 			pricing: None,

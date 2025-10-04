@@ -247,9 +247,7 @@ pub fn build_permit2_batch_witness_digest(
 mod tests {
 	use super::*;
 	use alloy_primitives::{address, U256};
-	use solver_config::{
-		ApiConfig, Config, ConfigBuilder, DomainConfig, QuoteConfig, SettlementConfig,
-	};
+	use solver_config::{ApiConfig, Config, ConfigBuilder, QuoteConfig, SettlementConfig};
 	use solver_settlement::MockSettlementInterface;
 	use solver_types::{
 		parse_address,
@@ -280,10 +278,6 @@ mod tests {
 
 		let settlement_config = SettlementConfig {
 			implementations: HashMap::new(),
-			domain: Some(DomainConfig {
-				chain_id: 1,
-				address: "0x1234567890123456789012345678901234567890".to_string(),
-			}),
 			settlement_poll_interval_seconds: 3,
 		};
 
