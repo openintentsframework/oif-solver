@@ -30,7 +30,6 @@ data/
 # Demo output
 .pids/
 .logs/
-demo-output/
 snapshots/
 .oif-demo/
 

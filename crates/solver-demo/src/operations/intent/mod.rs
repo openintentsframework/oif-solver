@@ -325,6 +325,132 @@ impl IntentOps {
 		Ok(response.order_id.unwrap_or_else(|| "pending".to_string()))
 	}
 
+	/// Submit an intent on-chain by calling the open function on the input settler
+	#[instrument(skip(self, order))]
+	pub async fn submit_onchain(&self, order: PostOrderRequest) -> Result<OnchainSubmissionResult> {
+		use crate::core::logging;
+
+		// Convert the OifOrder to StandardOrder using existing conversion
+		use solver_types::standards::eip7683::interfaces::StandardOrder;
+		use std::convert::TryFrom;
+
+		logging::verbose_operation(
+			"Converting order to StandardOrder",
+			"for on-chain submission",
+		);
+
+		let standard_order = StandardOrder::try_from(&order.order).map_err(|e| {
+			crate::types::error::Error::InvalidConfig(format!(
+				"Failed to convert order to StandardOrder: {}",
+				e
+			))
+		})?;
+
+		// Extract chain ID from the StandardOrder
+		let chain_id = standard_order.originChainId.try_into().map_err(|_| {
+			crate::types::error::Error::InvalidConfig("Invalid origin chain ID".to_string())
+		})?;
+		let chain = ChainId::from_u64(chain_id);
+
+		logging::verbose_operation(
+			"Preparing on-chain submission",
+			&format!("chain {}", chain_id),
+		);
+
+		// Get the input settler address for this chain
+		let input_settler_address = {
+			let contracts = self.ctx.contracts.read().map_err(|e| {
+				crate::types::error::Error::StorageError(format!(
+					"Failed to acquire contracts lock: {}",
+					e
+				))
+			})?;
+			let addresses = contracts.addresses(chain).ok_or_else(|| {
+				crate::types::error::Error::InvalidConfig(format!(
+					"No contract addresses found for chain {}",
+					chain.id()
+				))
+			})?;
+			addresses.input_settler.ok_or_else(|| {
+				crate::types::error::Error::InvalidConfig(format!(
+					"Input settler contract not found for chain {}",
+					chain.id()
+				))
+			})?
+		};
+
+		logging::verbose_tech("Using input settler", &input_settler_address.to_string());
+
+		// Check if this is a Compact order that needs deposit
+		let order_type = order.order.order_type();
+		if order_type == "oif-resource-lock-v0" {
+			logging::verbose_operation("Detected Compact order", "performing deposit");
+			self.deposit_compact_tokens(&order).await?;
+		} else {
+			// For non-Compact orders, we need to approve token spending
+			logging::verbose_operation("Approving token allowance", "for input settler");
+			self.approve_tokens_for_onchain_submission(
+				&standard_order,
+				input_settler_address,
+				chain,
+			)
+			.await?;
+		}
+
+		// Encode the open transaction using the contracts module
+		let open_data = {
+			let contracts = self.ctx.contracts.read().map_err(|e| {
+				crate::types::error::Error::StorageError(format!(
+					"Failed to acquire contracts lock: {}",
+					e
+				))
+			})?;
+			contracts.input_settler_open(&standard_order)?
+		};
+
+		// Get provider and signer
+		let provider = self.ctx.provider(chain).await?;
+		let signer = self.get_user_signer()?;
+
+		// Use TxBuilder for the transaction
+		use crate::core::blockchain::TxBuilder;
+		use alloy_rpc_types::TransactionRequest;
+
+		let tx_builder = TxBuilder::new(provider).with_signer(signer);
+
+		let open_request = TransactionRequest::default()
+			.to(input_settler_address)
+			.input(open_data.into());
+
+		logging::verbose_operation("Sending open transaction", "to input settler");
+		let tx_hash = tx_builder.send(open_request).await?;
+
+		logging::verbose_tech("Open transaction sent", &format!("{:?}", tx_hash));
+
+		// Wait for confirmation
+		let receipt = tx_builder.wait(tx_hash).await?;
+
+		if !receipt.status() {
+			return Err(crate::types::error::Error::ContractCallFailed(
+				"Open transaction failed".to_string(),
+			));
+		}
+
+		logging::verbose_success(
+			"Open transaction confirmed",
+			&format!(
+				"hash: {:?}, block: {}",
+				tx_hash,
+				receipt.block_number.unwrap_or_default()
+			),
+		);
+
+		Ok(OnchainSubmissionResult {
+			tx_hash: format!("{:?}", tx_hash),
+			order_id: None, // TODO: extract this from logs
+		})
+	}
+
 	/// Deposits tokens to TheCompact contract for resource lock orders
 	///
 	/// # Arguments
@@ -697,6 +823,109 @@ impl IntentOps {
 		Ok(results)
 	}
 
+	/// Get user signer for transactions
+	fn get_user_signer(&self) -> Result<alloy_signer_local::PrivateKeySigner> {
+		let private_key_str = self
+			.ctx
+			.config
+			.accounts()
+			.user
+			.private_key
+			.as_ref()
+			.ok_or_else(|| {
+				crate::types::error::Error::InvalidConfig("No private key configured".to_string())
+			})?
+			.expose_secret();
+
+		private_key_str
+			.parse::<alloy_signer_local::PrivateKeySigner>()
+			.map_err(|e| {
+				crate::types::error::Error::InvalidConfig(format!("Invalid private key: {}", e))
+			})
+	}
+
+	/// Approve tokens for on-chain submission
+	async fn approve_tokens_for_onchain_submission(
+		&self,
+		standard_order: &solver_types::standards::eip7683::interfaces::StandardOrder,
+		input_settler_address: alloy_primitives::Address,
+		chain: ChainId,
+	) -> Result<()> {
+		use crate::core::logging;
+		use crate::operations::token::TokenOps;
+
+		let token_ops = TokenOps::new(self.ctx.clone());
+
+		// Approve each input token for the input settler
+		for input in &standard_order.inputs {
+			// Extract token address from U256 (it's padded to 32 bytes)
+			let token_u256_bytes = input[0].to_be_bytes::<32>();
+			// Convert last 20 bytes to address (skip first 12 bytes of padding)
+			let token_address = alloy_primitives::Address::from_slice(&token_u256_bytes[12..]);
+			let amount = input[1];
+
+			// Find token symbol by address
+			let token_symbol = self.find_token_symbol_by_address(chain, token_address)?;
+
+			logging::verbose_operation(
+				"Approving token",
+				&format!("{} for input settler on chain {}", token_symbol, chain.id()),
+			);
+
+			match token_ops
+				.approve(
+					chain,
+					&token_symbol,
+					&format!("{:?}", input_settler_address),
+					Some(amount),
+				)
+				.await
+			{
+				Ok(result) => {
+					if let Some(tx_hash) = result.tx_hash {
+						logging::verbose_tech(
+							"Token approved",
+							&format!("{} on chain {} (tx: {})", token_symbol, chain.id(), tx_hash),
+						);
+					}
+				},
+				Err(e) => {
+					return Err(crate::types::error::Error::ContractCallFailed(format!(
+						"Failed to approve {} for input settler on chain {}: {}",
+						token_symbol,
+						chain.id(),
+						e
+					)));
+				},
+			}
+		}
+
+		logging::verbose_success(
+			"Token allowances approved",
+			&format!("chain {}", chain.id()),
+		);
+		Ok(())
+	}
+
+	/// Find token symbol by address
+	fn find_token_symbol_by_address(
+		&self,
+		chain: ChainId,
+		address: alloy_primitives::Address,
+	) -> Result<String> {
+		let tokens = self.ctx.tokens.tokens_for_chain(chain);
+		for token in tokens {
+			if token.address == address {
+				return Ok(token.symbol.clone());
+			}
+		}
+		Err(crate::types::error::Error::InvalidConfig(format!(
+			"Token not found for address {:?} on chain {}",
+			address,
+			chain.id()
+		)))
+	}
+
 	fn create_interop_address(&self, address: Address, chain: ChainId) -> Result<InteropAddress> {
 		// Use the standard new_ethereum method instead of manual EIP-7930 encoding
 		Ok(InteropAddress::new_ethereum(chain.id(), address))
@@ -787,4 +1016,11 @@ pub struct TestResults {
 	pub failed: usize,
 	pub total_time: std::time::Duration,
 	pub errors: Vec<String>,
+}
+
+/// Result of on-chain intent submission
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnchainSubmissionResult {
+	pub tx_hash: String,
+	pub order_id: Option<String>,
 }

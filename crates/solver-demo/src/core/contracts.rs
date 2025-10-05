@@ -386,6 +386,37 @@ impl Contracts {
 		Ok(data.into())
 	}
 
+	/// Encode Input Settler open transaction data for on-chain intent submission
+	///
+	/// # Arguments
+	/// * `standard_order` - StandardOrder struct from EIP-7683
+	///
+	/// # Returns
+	/// Encoded transaction data for open call
+	///
+	/// # Errors
+	/// Returns Error if ABI not loaded or encoding fails
+	pub fn input_settler_open(
+		&self,
+		standard_order: &solver_types::standards::eip7683::interfaces::StandardOrder,
+	) -> Result<Bytes> {
+		use alloy_sol_types::SolValue;
+
+		// Use the actual StandardOrder struct to encode the transaction
+		let encoded = standard_order.abi_encode();
+
+		// The function signature for open(StandardOrder calldata order) is:
+		// Function selector: open(((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[])))
+		let function_selector = alloy_primitives::keccak256(
+			b"open((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))"
+		)[..4].to_vec();
+
+		let mut call_data = function_selector;
+		call_data.extend_from_slice(&encoded);
+
+		Ok(call_data.into())
+	}
+
 	/// Retrieve ERC20 token symbol string
 	///
 	/// # Arguments

@@ -747,20 +747,27 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 
 			logging::verbose_tech("Input file", &input.display().to_string());
 
-			if onchain {
-				use solver_demo::core::logging;
-				logging::warning("On-chain submission not yet implemented");
-				return Ok(());
-			}
-
 			let order_json = std::fs::read_to_string(&input)?;
 			let order: PostOrderRequest = serde_json::from_str(&order_json)?;
 
-			let order_id = intent_ops.submit(order).await?;
+			if onchain {
+				use solver_demo::core::logging;
+				logging::operation_start("Submitting intent on-chain...");
 
-			use solver_demo::core::logging;
-			logging::success(&format!("Order submitted: {}", order_id));
-			logging::info_kv("Order ID", &order_id);
+				let result = intent_ops.submit_onchain(order).await?;
+
+				logging::success(&format!("Order submitted on-chain: {}", result.tx_hash));
+				logging::info_kv("Transaction Hash", &result.tx_hash);
+				if let Some(order_id) = result.order_id {
+					logging::info_kv("Order ID", &order_id);
+				}
+			} else {
+				let order_id = intent_ops.submit(order).await?;
+
+				use solver_demo::core::logging;
+				logging::success(&format!("Order submitted: {}", order_id));
+				logging::info_kv("Order ID", &order_id);
+			}
 		},
 		IntentSubcommand::Status { order_id } => {
 			use solver_demo::core::logging;
