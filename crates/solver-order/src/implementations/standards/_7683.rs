@@ -5,7 +5,7 @@
 //! filling and claiming orders.
 
 use crate::{OrderError, OrderInterface};
-use alloy_primitives::{Address as AlloyAddress, Bytes, FixedBytes, U256};
+use alloy_primitives::{Bytes, FixedBytes, U256};
 use alloy_sol_types::{SolCall, SolType};
 use async_trait::async_trait;
 use solver_types::{
@@ -18,6 +18,7 @@ use solver_types::{
 		},
 		LockType,
 	},
+	utils::conversion::hex_to_alloy_address,
 	Address, ConfigSchema, Eip7683OrderData, ExecutionParams, FillProof, NetworksConfig, Order,
 	OrderStatus, Schema, Transaction,
 };
@@ -238,10 +239,8 @@ impl OrderInterface for Eip7683OrderImpl {
 		// For the OIF contracts, we need to use the StandardOrder openFor
 		// The raw_order_data contains the encoded StandardOrder
 		// We just need to pass the order bytes, sponsor, and signature
-		let sponsor_address =
-			AlloyAddress::from_slice(&hex::decode(sponsor.trim_start_matches("0x")).map_err(
-				|e| OrderError::ValidationFailed(format!("Invalid sponsor address: {}", e)),
-			)?);
+		let sponsor_address = hex_to_alloy_address(sponsor)
+			.map_err(|e| OrderError::ValidationFailed(format!("Invalid sponsor address: {}", e)))?;
 
 		// Decode the raw order bytes into StandardOrder struct
 		let order_struct = Self::decode_standard_order(raw_order_data)?;
@@ -419,16 +418,12 @@ impl OrderInterface for Eip7683OrderImpl {
 		}
 
 		// Parse addresses
-		let user_hex = order_data.user.trim_start_matches("0x");
-		let user_bytes = hex::decode(user_hex)
+		let user_address = hex_to_alloy_address(&order_data.user)
 			.map_err(|e| OrderError::ValidationFailed(format!("Invalid user address: {}", e)))?;
-		let user_address = AlloyAddress::from_slice(&user_bytes);
 
 		// Parse oracle address
-		let oracle_hex = fill_proof.oracle_address.trim_start_matches("0x");
-		let oracle_bytes = hex::decode(oracle_hex)
+		let oracle_address = hex_to_alloy_address(&fill_proof.oracle_address)
 			.map_err(|e| OrderError::ValidationFailed(format!("Invalid oracle address: {}", e)))?;
-		let oracle_address = AlloyAddress::from_slice(&oracle_bytes);
 
 		// Create inputs array from order data
 		let inputs: Vec<[U256; 2]> = order_data.inputs.clone();
@@ -644,16 +639,24 @@ impl OrderInterface for Eip7683OrderImpl {
 
 			// If a specific output oracle is specified, validate it
 			if output.oracle != [0u8; 32] {
-				// Parse the oracle address from bytes32 (last 20 bytes)
-				let output_oracle = Address(output.oracle[12..32].to_vec());
+				// Check if this specific output oracle is compatible with input oracle
+				// Use address normalization to compare regardless of padding format
+				let mut found_compatible = false;
+				for supported in supported_outputs.iter() {
+					if supported.chain_id == dest_chain {
+						let addresses_match = solver_types::utils::conversion::addresses_equal(
+							&supported.oracle.0,
+							output.oracle.as_slice(),
+						);
+						if addresses_match {
+							found_compatible = true;
+							break;
+						}
+					}
+				}
+				let is_compatible = found_compatible;
 
-				let output_info = solver_types::oracle::OracleInfo {
-					chain_id: dest_chain,
-					oracle: output_oracle,
-				};
-
-				// Check if this specific output oracle is in the supported list
-				if !supported_outputs.contains(&output_info) {
+				if !is_compatible {
 					return Err(OrderError::ValidationFailed(format!(
 						"Output oracle {:?} on chain {} is not compatible with input oracle {:?} on chain {}",
 						output.oracle, dest_chain, input_oracle, origin_chain

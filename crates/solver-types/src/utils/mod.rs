@@ -15,8 +15,9 @@ pub use constants::{
 	MOCK_TOKA_USD_PRICE, MOCK_TOKB_USD_PRICE, ZERO_BYTES32,
 };
 pub use conversion::{
-	bytes20_to_alloy_address, bytes32_to_address, normalize_bytes32_address, parse_address,
-	parse_bytes32_from_hex, wei_string_to_eth_string,
+	address_to_bytes32, address_to_bytes32_hex, addresses_equal, bytes20_to_alloy_address,
+	bytes32_to_address, hex_to_alloy_address, normalize_bytes32_address, parse_address,
+	parse_bytes32_from_hex, solver_address_to_bytes32, wei_string_to_eth_string,
 };
 pub use eip712::{
 	compute_domain_hash, compute_final_digest, reconstruct_compact_digest,

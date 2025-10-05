@@ -5,6 +5,8 @@
 //! - Final digest computation (0x1901 || domainHash || structHash)
 //! - A minimal ABI encoder for static EIP-712 field types used commonly
 
+use crate::utils::conversion::hex_to_alloy_address;
+
 use super::formatting::{with_0x_prefix, without_0x_prefix};
 use alloy_primitives::{keccak256, Address as AlloyAddress, B256, U256};
 use alloy_signer::Signature;
@@ -147,7 +149,7 @@ pub fn reconstruct_permit2_digest(
 		.get("verifyingContract")
 		.and_then(|c| c.as_str())
 		.ok_or("Missing contract")?;
-	let contract = AlloyAddress::from_slice(&hex::decode(contract_str.trim_start_matches("0x"))?);
+	let contract = hex_to_alloy_address(contract_str)?;
 
 	let domain_hash = compute_domain_hash(name, chain_id, &contract);
 
@@ -162,7 +164,7 @@ pub fn reconstruct_permit2_digest(
 		.get("spender")
 		.and_then(|s| s.as_str())
 		.ok_or("Missing spender")?;
-	let spender = AlloyAddress::from_slice(&hex::decode(spender_str.trim_start_matches("0x"))?);
+	let spender = hex_to_alloy_address(spender_str)?;
 	let nonce = message
 		.get("nonce")
 		.and_then(|n| n.as_str())
@@ -193,7 +195,7 @@ pub fn reconstruct_permit2_digest(
 			.and_then(|a| a.as_str())
 			.ok_or("Missing amount")?;
 
-		let token = AlloyAddress::from_slice(&hex::decode(token_str.trim_start_matches("0x"))?);
+		let token = hex_to_alloy_address(token_str)?;
 		let amount = U256::from_str_radix(amount_str, 10)?;
 
 		let mut encoder = Eip712AbiEncoder::new();
@@ -223,7 +225,7 @@ pub fn reconstruct_permit2_digest(
 		.get("inputOracle")
 		.and_then(|o| o.as_str())
 		.ok_or("Missing inputOracle")?;
-	let oracle = AlloyAddress::from_slice(&hex::decode(oracle_str.trim_start_matches("0x"))?);
+	let oracle = hex_to_alloy_address(oracle_str)?;
 
 	// Build outputs array hash
 	let outputs = witness
@@ -366,9 +368,7 @@ pub fn reconstruct_compact_digest(
 		.get("verifyingContract")
 		.and_then(|v| v.as_str())
 		.ok_or("Missing verifyingContract")?;
-	let verifying_contract = AlloyAddress::from_slice(&hex::decode(
-		verifying_contract_str.trim_start_matches("0x"),
-	)?);
+	let verifying_contract = hex_to_alloy_address(verifying_contract_str)?;
 
 	// Use provided domain separator or compute it
 	let domain_hash = if let Some(provided_domain_separator) = domain_separator {
@@ -383,13 +383,13 @@ pub fn reconstruct_compact_digest(
 		.get("arbiter")
 		.and_then(|a| a.as_str())
 		.ok_or("Missing arbiter")?;
-	let arbiter = AlloyAddress::from_slice(&hex::decode(arbiter_str.trim_start_matches("0x"))?);
+	let arbiter = hex_to_alloy_address(arbiter_str)?;
 
 	let sponsor_str = message
 		.get("sponsor")
 		.and_then(|s| s.as_str())
 		.ok_or("Missing sponsor")?;
-	let sponsor = AlloyAddress::from_slice(&hex::decode(sponsor_str.trim_start_matches("0x"))?);
+	let sponsor = hex_to_alloy_address(sponsor_str)?;
 
 	let nonce = message
 		.get("nonce")
@@ -432,7 +432,7 @@ pub fn reconstruct_compact_digest(
 		if lock_tag_bytes.len() != 12 {
 			return Err("Invalid lockTag length".into());
 		}
-		let token = AlloyAddress::from_slice(&hex::decode(token_str.trim_start_matches("0x"))?);
+		let token = hex_to_alloy_address(token_str)?;
 		let amount = U256::from_str_radix(amount_str, 10)?;
 
 		// Encode Lock struct: keccak256(abi.encode(Lock_TYPE_HASH, lockTag, token, amount))
@@ -475,8 +475,7 @@ pub fn reconstruct_compact_digest(
 		.get("inputOracle")
 		.and_then(|i| i.as_str())
 		.ok_or("Missing inputOracle")?;
-	let input_oracle =
-		AlloyAddress::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
+	let input_oracle = hex_to_alloy_address(input_oracle_str)?;
 
 	// Compute outputs hash
 	let outputs = mandate
@@ -606,7 +605,7 @@ pub fn reconstruct_eip3009_digest(
 	payload: &crate::api::OrderPayload,
 	domain_separator: Option<[u8; 32]>,
 ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-	use alloy_primitives::{keccak256, Address as AlloyAddress, FixedBytes, U256};
+	use alloy_primitives::{keccak256, FixedBytes, U256};
 
 	let domain = payload.domain.as_object().ok_or("Missing domain")?;
 	let message = payload.message.as_object().ok_or("Missing message")?;
@@ -634,13 +633,13 @@ pub fn reconstruct_eip3009_digest(
 		.get("from")
 		.and_then(|f| f.as_str())
 		.ok_or("Missing from")?;
-	let from = AlloyAddress::from_slice(&hex::decode(from_str.trim_start_matches("0x"))?);
+	let from = hex_to_alloy_address(from_str)?;
 
 	let to_str = message
 		.get("to")
 		.and_then(|t| t.as_str())
 		.ok_or("Missing to")?;
-	let to = AlloyAddress::from_slice(&hex::decode(to_str.trim_start_matches("0x"))?);
+	let to = hex_to_alloy_address(to_str)?;
 
 	let value_str = message
 		.get("value")
@@ -674,8 +673,7 @@ pub fn reconstruct_eip3009_digest(
 			"EIP712Domain(string name,uint256 chainId,address verifyingContract)".as_bytes(),
 		);
 		let name_hash = keccak256(name.as_bytes());
-		let contract =
-			AlloyAddress::from_slice(&hex::decode(verifying_contract.trim_start_matches("0x"))?);
+		let contract = hex_to_alloy_address(verifying_contract)?;
 
 		let mut domain_encoder = Eip712AbiEncoder::new();
 		domain_encoder.push_b256(&domain_type_hash);
