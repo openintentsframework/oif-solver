@@ -96,10 +96,6 @@ TOKB = "195.00"
 [settlement]
 settlement_poll_interval_seconds = 3
 
-[settlement.domain]
-chain_id = 1
-address = "0x9fE46736679D2d9A65F0992f2272de9f3C7FA6e0"
-
 [settlement.implementations.direct]
 order = "eip7683"
 network_ids = [31337, 31338]
@@ -111,15 +107,15 @@ oracle_selection_strategy = "First"
 [settlement.implementations.direct.oracles]
 # Input oracles (on origin chains)
 input = { 31337 = [
-    "0x2279B7A0A67DB372996A5faB50D91EAA73d2EbE6",
+    "0xa513E6E4b8f2a923D98304ec87F64353C4D5C853",
 ], 31338 = [
-    "0x2279B7A0A67DB372996a5faB50d91Eaa73d2eBe6",
+    "0xa513E6E4b8f2a923D98304ec87F64353C4D5C853",
 ] }
 # Output oracles (on destination chains)
 output = { 31337 = [
-    "0x2279B7A0A67DB372996A5faB50D91EAA73d2EbE6",
+    "0x2279B7A0a67DB372996a5FaB50D91eAA73d2eBe6",
 ], 31338 = [
-    "0x2279B7A0A67DB372996a5faB50d91Eaa73d2eBe6",
+    "0x2279B7A0a67DB372996a5FaB50D91eAA73d2eBe6",
 ] }
 
 # Valid routes: from origin chain -> to destination chains

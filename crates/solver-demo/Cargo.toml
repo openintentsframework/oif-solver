@@ -3,71 +3,68 @@ name = "solver-demo"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "solver-demo"
+path = "src/bin/solver-demo.rs"
+
 [dependencies]
 # Workspace dependencies
-solver-config = { path = "../solver-config" }
 solver-types = { path = "../solver-types" }
+solver-config = { path = "../solver-config" }
 solver-account = { path = "../solver-account" }
 
-# Async runtime
-tokio = { version = "1", features = ["full"] }
-async-trait = "0.1"
+# Environment variables
+dotenvy = "0.15"
 
-# Ethereum  
-alloy-primitives = "0.8"
-alloy-sol-types = "0.8"
-alloy-signer = "0.8"
-alloy-signer-local = "0.8"
-alloy-json-abi = "0.8"
-alloy-dyn-abi = "0.8"
-alloy-provider = "0.8"
-alloy-transport-http = "0.8"
-alloy-contract = "0.8"
-alloy-rpc-types = "0.8"
-alloy-consensus = "0.8"
-alloy-network = "0.8"
+# Async runtime
+tokio = { version = "1.41", features = ["full"] }
 
 # CLI
-clap = { version = "4.5", features = ["derive", "env"] }
-colored = "2.1"
-comfy-table = "7.1"
-indicatif = "0.17"
-
-# Logging and tracing
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = [
-    "env-filter",
-    "fmt",
-    "ansi",
-] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-toml = { workspace = true }
-base64 = "0.22"
-hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
 
 # Error handling
-anyhow = "1.0"
-thiserror = "1.0"
+anyhow = "1"
+thiserror = "1"
+
+# Ethereum/Alloy
+alloy-primitives = { version = "0.8", features = ["serde"] }
+alloy-provider = { version = "0.5" }
+alloy-signer = { version = "0.5" }
+alloy-signer-local = { version = "0.5" }
+alloy-contract = { version = "0.5" }
+alloy-json-abi = { version = "0.8" }
+alloy-dyn-abi = { version = "0.8" }
+alloy-transport = { version = "0.5" }
+alloy-transport-http = { version = "0.5" }
+alloy-rpc-client = { version = "0.5" }
+alloy-rpc-types = { version = "0.5" }
+alloy-sol-types = { version = "0.8" }
+alloy-network = { version = "0.5" }
 
 # HTTP
 reqwest = { version = "0.12", features = ["json"] }
 
-# JWT
-jsonwebtoken = "9.3"
-uuid = { version = "1.0", features = ["v4"] }
+# System info
+sysinfo = "0.32"
+
+# Utilities
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+colored = "2"
+comfy-table = "7"
+indicatif = "0.17"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+url = "2"
+base64 = "0.22"
 hostname = "0.4"
 
-# Utils
-chrono = { version = "0.4", features = ["serde"] }
-dirs = "5.0"
-which = "6.0"
-nix = { version = "0.29", features = ["process", "signal"] }
-futures.workspace = true
-
-# Testing
 [dev-dependencies]
-tempfile = "3.10"
-mockall = "0.13"
+tempfile = "3"
