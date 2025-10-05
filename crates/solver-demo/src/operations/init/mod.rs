@@ -6,7 +6,6 @@
 //! file management for both local and production environments.
 
 use crate::{
-	cli::output::Display,
 	constants::{anvil_accounts, env_vars, DEFAULT_TOKEN_DECIMALS, PERMIT2_ADDRESS},
 	core::{config::Config, session::SessionStore, storage::Storage},
 	types::{
@@ -21,7 +20,7 @@ use solver_config::SettlementConfig;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{info, instrument};
+use tracing::instrument;
 
 // Import placeholder constants from the constants module
 use crate::constants::placeholders::*;
@@ -214,7 +213,6 @@ pub async fn generate_new_config(path: &Path, chains: Vec<u64>, force: bool) -> 
 		std::fs::write(api_path, generate_api_config()?)?;
 	}
 
-	Display::success(&format!("Configuration created at: {}", path.display()));
 	Ok(())
 }
 
@@ -245,11 +243,13 @@ pub async fn load_config(path: &Path, is_local: bool) -> Result<()> {
 	session.set_placeholder_map(placeholder_map)?;
 
 	// Load contract addresses from configuration for each chain
-	info!(chain_count = chains.len(), chains = ?chains, "Processing chains for configuration loading");
+	use crate::core::logging;
+	logging::verbose_operation("Processing chains", &format!("{} chains", chains.len()));
+
 	for chain in &chains {
-		info!(chain = %chain, "Processing chain for configuration loading");
+		logging::verbose_operation("Processing chain", &chain.to_string());
 		if let Some(network) = config.network(*chain) {
-			info!(chain = %chain, "Found network configuration for chain");
+			logging::verbose_success("Found network configuration", &chain.to_string());
 			let mut tokens = HashMap::new();
 
 			// Extract token addresses
@@ -260,7 +260,10 @@ pub async fn load_config(path: &Path, is_local: bool) -> Result<()> {
 					})?;
 				tokens.insert(token.symbol.clone(), (addr, token.decimals));
 			}
-			info!(chain = %chain, token_count = tokens.len(), "Processed tokens for chain");
+			logging::verbose_tech(
+				"Processed tokens",
+				&format!("{} tokens for chain {}", tokens.len(), chain),
+			);
 
 			// Helper function to convert solver_types::Address to alloy_primitives::Address
 			let parse_address = |addr: &solver_types::Address| -> Result<Address> {
@@ -309,19 +312,19 @@ pub async fn load_config(path: &Path, is_local: bool) -> Result<()> {
 			};
 
 			// Set contract addresses in session
-			info!(chain = %chain, "Setting contract addresses for chain");
+			logging::verbose_operation("Setting contract addresses", &chain.to_string());
 			session.set_contract_addresses(*chain, contract_addresses)?;
-			info!(chain = %chain, "Finished setting contract addresses for chain");
+			logging::verbose_success("Contract addresses set", &chain.to_string());
 		}
 	}
 
 	// Save initial session
 	session.save()?;
 
-	Display::success("Configuration loaded and session initialized");
-	Display::kv("Environment", if is_local { "Local" } else { "Production" });
-	Display::kv("Chains", &format!("{:?}", chains));
-	Display::kv("Data Directory", &config.data_dir().display().to_string());
+	// Verbose details about what was loaded
+	logging::verbose_tech("Environment", if is_local { "Local" } else { "Production" });
+	logging::verbose_tech("Chains", &format!("{:?}", chains));
+	logging::verbose_tech("Data directory", &config.data_dir().display().to_string());
 
 	Ok(())
 }

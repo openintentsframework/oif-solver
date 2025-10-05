@@ -13,7 +13,7 @@ use crate::{
 };
 use alloy_primitives::{Address, U256};
 use std::{str::FromStr, sync::Arc};
-use tracing::{info, instrument};
+use tracing::instrument;
 
 use super::MintResult;
 
@@ -60,7 +60,14 @@ impl MintOps {
 		recipient: Option<Address>,
 		amount: U256,
 	) -> Result<MintResult> {
-		info!(chain = %chain, token = token_symbol, recipient = ?recipient, amount = %amount, "Starting token mint operation");
+		use crate::core::logging;
+		logging::verbose_tech(
+			"Starting token mint operation",
+			&format!(
+				"chain: {}, token: {}, amount: {}",
+				chain, token_symbol, amount
+			),
+		);
 
 		if !self.ctx.is_local() {
 			return Err(Error::NotLocalMode);

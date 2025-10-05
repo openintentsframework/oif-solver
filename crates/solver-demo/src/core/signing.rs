@@ -5,7 +5,7 @@
 //! Handles typed data construction, digest computation, and signature encoding
 //! with proper scheme-specific prefixes and formatting.
 
-use crate::core::Provider;
+use crate::core::{logging, Provider};
 use crate::Result;
 use alloy_primitives::{keccak256, Address, B256, U256};
 use alloy_signer::SignerSync;
@@ -15,7 +15,7 @@ use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use solver_types::api::{OifOrder, OrderPayload, Quote};
 use std::collections::HashMap;
-use tracing::{debug, info, instrument, warn};
+use tracing::{instrument, warn};
 
 /// Cryptographic signature service supporting multiple EIP standards
 ///
@@ -99,17 +99,17 @@ impl SigningService {
 	///
 	/// # Errors
 	/// Returns Error if signature generation fails or scheme is unsupported
-	#[instrument(skip(self, private_key, provider), fields(quote_id = %quote.quote_id))]
+	#[instrument(skip(self, quote, private_key, provider), fields(quote_id = %quote.quote_id))]
 	pub async fn sign_quote(
 		&self,
 		quote: &Quote,
 		private_key: &str,
 		provider: Provider,
 	) -> Result<String> {
-		info!(
-			quote_id = %quote.quote_id,
-			order_type = ?std::mem::discriminant(&quote.order),
-			"Starting quote signature process"
+		use crate::core::logging;
+		logging::verbose_tech(
+			"Starting quote signature process",
+			&format!("quote_id: {}", quote.quote_id),
 		);
 
 		match &quote.order {
@@ -147,7 +147,7 @@ impl SigningService {
 	///
 	/// # Errors
 	/// Returns Error if digest computation, signing, or encoding fails
-	#[instrument(skip(self, private_key, provider), fields(primary_type = %payload.primary_type))]
+	#[instrument(skip(self, payload, metadata, private_key, provider), fields(primary_type = %payload.primary_type))]
 	async fn sign_eip712_payload(
 		&self,
 		payload: &OrderPayload,
@@ -163,10 +163,9 @@ impl SigningService {
 		let (digest, signature_type) = match payload.primary_type.as_str() {
 			"ReceiveWithAuthorization" | "TransferWithAuthorization" | "CancelAuthorization" => {
 				let metadata = metadata.ok_or_else(|| anyhow!("Missing metadata for EIP-3009"))?;
-				info!(
-					primary_type = %payload.primary_type,
-					scheme = "EIP-3009",
-					"Processing signature for EIP-3009 authorization"
+				logging::verbose_tech(
+					"Processing signature for EIP-3009 authorization",
+					&format!("primary_type: {}", payload.primary_type),
 				);
 				(
 					self.compute_eip3009_digest(payload, metadata, provider)
@@ -194,10 +193,14 @@ impl SigningService {
 			},
 		};
 
-		debug!(
-			digest = %hex::encode(digest),
-			signer_address = %wallet.address(),
-			"Signing digest with wallet"
+		logging::debug_data(
+			"Signing digest",
+			"cryptographic",
+			&format!(
+				"digest: {}, signer: {}",
+				hex::encode(digest),
+				wallet.address()
+			),
 		);
 		let signature = wallet
 			.sign_hash_sync(&B256::from(digest))
@@ -208,54 +211,43 @@ impl SigningService {
 		// Add signature type prefix based on the scheme
 		let prefixed_signature = match signature_type {
 			SignatureScheme::Permit2 => {
-				debug!(
-					raw_signature = %hex::encode(&sig_bytes),
-					signature_length = sig_bytes.len(),
-					"Generated raw signature for Permit2"
+				logging::debug_data(
+					"Generated raw signature",
+					"Permit2",
+					&format!("length: {}", sig_bytes.len()),
 				);
 				// Prefix with 0x00 for Permit2
 				let mut prefixed = vec![0x00];
 				prefixed.extend_from_slice(&sig_bytes);
-				debug!(
-					prefixed_signature = %hex::encode(&prefixed),
-					prefix = "0x00",
-					scheme = "Permit2",
-					"Applied Permit2 signature prefix"
-				);
+				logging::debug_data("Applied signature prefix", "Permit2", "0x00");
 				prefixed
 			},
 			SignatureScheme::Eip3009 => {
-				debug!(
-					raw_signature = %hex::encode(&sig_bytes),
-					signature_length = sig_bytes.len(),
-					"Generated raw signature for EIP-3009"
+				logging::debug_data(
+					"Generated raw signature",
+					"EIP-3009",
+					&format!("length: {}", sig_bytes.len()),
 				);
 				// Prefix with 0x01 for EIP-3009
 				let mut prefixed = vec![0x01];
 				prefixed.extend_from_slice(&sig_bytes);
-				debug!(
-					prefixed_signature = %hex::encode(&prefixed),
-					prefix = "0x01",
-					scheme = "EIP-3009",
-					"Applied EIP-3009 signature prefix"
-				);
+				logging::debug_data("Applied signature prefix", "EIP-3009", "0x01");
 				prefixed
 			},
 			SignatureScheme::Compact => {
-				debug!(
-					signature_bytes = ?sig_bytes,
-					signature_length = sig_bytes.len(),
-					"Processing Compact signature encoding"
+				logging::debug_data(
+					"Processing signature encoding",
+					"Compact",
+					&format!("length: {}", sig_bytes.len()),
 				);
 				// For Compact signatures, ABI-encode as (sponsorSig, allocatorSig)
 				self.encode_compact_signature(sig_bytes)
 			},
 			SignatureScheme::Generic => {
-				debug!(
-					raw_signature = %hex::encode(&sig_bytes),
-					signature_length = sig_bytes.len(),
-					scheme = "Generic",
-					"Generated raw signature for generic EIP-712"
+				logging::debug_data(
+					"Generated raw signature",
+					"Generic",
+					&format!("length: {}", sig_bytes.len()),
 				);
 				// No prefix for generic signatures
 				sig_bytes
@@ -410,14 +402,14 @@ impl SigningService {
 	///
 	/// # Errors
 	/// Returns Error if domain extraction or digest computation fails
-	#[instrument(skip(self, provider), fields(primary_type = %payload.primary_type))]
+	#[instrument(skip(self, payload, _metadata, provider), fields(primary_type = %payload.primary_type))]
 	async fn compute_eip3009_digest(
 		&self,
 		payload: &OrderPayload,
 		_metadata: &serde_json::Value,
 		provider: Provider,
 	) -> Result<[u8; 32]> {
-		debug!("Computing EIP-3009 digest using solver_types utility");
+		logging::debug_operation("EIP-3009 digest", "computing using solver_types utility");
 
 		// Extract domain info to fetch domain separator from contract
 		let domain = payload
@@ -435,19 +427,20 @@ impl SigningService {
 			.parse::<Address>()
 			.map_err(|e| anyhow!("Invalid verifyingContract: {}", e))?;
 
-		debug!(
-			verifying_contract = %verifying_contract,
-			chain_id = chain_id,
-			"Fetching domain separator from token contract"
+		logging::debug_data(
+			"Fetching domain separator",
+			"token contract",
+			&format!("chain: {}, contract: {}", chain_id, verifying_contract),
 		);
 
 		// Fetch domain separator from token contract (like the old demo)
 		let domain_separator = self
 			.fetch_domain_separator(chain_id, verifying_contract, provider)
 			.await?;
-		debug!(
-			domain_separator = %hex::encode(domain_separator),
-			"Retrieved domain separator from contract"
+		logging::debug_data(
+			"Retrieved domain separator",
+			"contract",
+			&hex::encode(domain_separator),
 		);
 
 		// Use solver_types utility function with the contract-fetched domain separator
@@ -455,10 +448,7 @@ impl SigningService {
 			solver_types::utils::reconstruct_eip3009_digest(payload, Some(domain_separator))
 				.map_err(|e| anyhow!("Failed to reconstruct EIP-3009 digest: {}", e))?;
 
-		debug!(
-			digest = %hex::encode(digest),
-			"Computed EIP-3009 digest"
-		);
+		logging::debug_data("Computed digest", "EIP-3009", &hex::encode(digest));
 		Ok(digest)
 	}
 
@@ -472,18 +462,15 @@ impl SigningService {
 	///
 	/// # Errors
 	/// Returns Error if digest reconstruction fails
-	#[instrument(skip(self), fields(primary_type = %payload.primary_type))]
+	#[instrument(skip(self, payload), fields(primary_type = %payload.primary_type))]
 	fn compute_permit2_digest(&self, payload: &OrderPayload) -> Result<[u8; 32]> {
-		debug!("Computing Permit2 digest");
+		logging::debug_operation("Permit2 digest", "computing");
 
 		// Use the existing reconstruction function
 		let digest = solver_types::utils::reconstruct_permit2_digest(payload)
 			.map_err(|e| anyhow!("Failed to reconstruct Permit2 digest: {}", e))?;
 
-		debug!(
-			digest = %hex::encode(digest),
-			"Computed Permit2 digest"
-		);
+		logging::debug_data("Computed digest", "Permit2", &hex::encode(digest));
 		Ok(digest)
 	}
 
@@ -498,13 +485,13 @@ impl SigningService {
 	///
 	/// # Errors
 	/// Returns Error if domain extraction or digest computation fails
-	#[instrument(skip(self, provider), fields(primary_type = %payload.primary_type))]
+	#[instrument(skip(self, payload, provider), fields(primary_type = %payload.primary_type))]
 	async fn compute_compact_digest(
 		&self,
 		payload: &OrderPayload,
 		provider: Provider,
 	) -> Result<[u8; 32]> {
-		debug!("Computing Compact digest");
+		logging::debug_operation("Compact digest", "computing");
 
 		// Extract domain info
 		let domain = payload
@@ -530,10 +517,14 @@ impl SigningService {
 		let domain_separator = self
 			.fetch_domain_separator(chain_id, verifying_contract, provider)
 			.await?;
-		debug!(
-			domain_separator = %hex::encode(domain_separator),
-			verifying_contract = %verifying_contract,
-			"Retrieved domain separator from Compact contract"
+		logging::debug_data(
+			"Retrieved domain separator",
+			"Compact contract",
+			&format!(
+				"contract: {}, separator: {}",
+				verifying_contract,
+				hex::encode(domain_separator)
+			),
 		);
 
 		// Use solver_types utility with contract domain separator
@@ -541,10 +532,7 @@ impl SigningService {
 			solver_types::utils::reconstruct_compact_digest(payload, Some(domain_separator))
 				.map_err(|e| anyhow!("Failed to reconstruct Compact digest: {}", e))?;
 
-		debug!(
-			digest = %hex::encode(digest),
-			"Computed Compact digest"
-		);
+		logging::debug_data("Computed digest", "Compact", &hex::encode(digest));
 		Ok(digest)
 	}
 
@@ -584,15 +572,23 @@ impl SigningService {
 		// Empty allocator signature for basic flows
 		let allocator_sig: Vec<u8> = Vec::new();
 
-		debug!(
-			sponsor_sig_length = sponsor_sig.len(),
-			allocator_sig_length = allocator_sig.len(),
-			"Encoding Compact signature as (sponsorSig, allocatorSig) tuple"
+		logging::debug_data(
+			"Encoding Compact signature",
+			"tuple",
+			&format!(
+				"sponsor: {} bytes, allocator: {} bytes",
+				sponsor_sig.len(),
+				allocator_sig.len()
+			),
 		);
-		debug!(
-			sponsor_signature = %hex::encode(&sponsor_sig),
-			allocator_signature = %hex::encode(&allocator_sig),
-			"Compact signature components"
+		logging::debug_data(
+			"Compact signature components",
+			"encoded",
+			&format!(
+				"sponsor: {}..., allocator: {}...",
+				&hex::encode(&sponsor_sig)[..8.min(hex::encode(&sponsor_sig).len())],
+				&hex::encode(&allocator_sig)[..8.min(hex::encode(&allocator_sig).len())]
+			),
 		);
 
 		// Manual ABI encoding to match cast abi-encode "f(bytes,bytes)"
@@ -621,10 +617,10 @@ impl SigningService {
 		let allocator_padding = (32 - (allocator_sig.len() % 32)) % 32;
 		encoded.extend_from_slice(&vec![0u8; allocator_padding]);
 
-		debug!(
-			encoded_signature = %hex::encode(&encoded),
-			encoded_length = encoded.len(),
-			"Final ABI-encoded Compact signature"
+		logging::debug_data(
+			"Final ABI-encoded Compact signature",
+			"complete",
+			&format!("length: {} bytes", encoded.len()),
 		);
 		encoded
 	}

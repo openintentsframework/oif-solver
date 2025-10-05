@@ -11,8 +11,6 @@ pub mod core;
 pub mod operations;
 pub mod types;
 
-use tracing::{info, warn};
-
 // Re-export key types from solver-types for convenience
 pub use solver_types::{
 	api::{
@@ -58,7 +56,7 @@ pub use core::{
 use std::path::Path;
 use std::sync::RwLock;
 
-use crate::core::contracts::ContractAddresses;
+use crate::core::{contracts::ContractAddresses, logging};
 
 /// Main application context holding all shared state
 pub struct Context {
@@ -104,28 +102,32 @@ impl Context {
 		// Load deployed contracts from session into contracts struct
 		for chain in config.chains() {
 			if let Some(deployed) = session.contracts(chain) {
-				info!(
-					chain_id = chain.id(),
-					allocator = ?deployed.allocator,
-					compact = ?deployed.compact,
-					"Loading contracts for chain"
+				use crate::core::logging;
+				logging::verbose_tech(
+					"Loading contracts for chain",
+					&format!(
+						"chain {}, allocator: {:?}, compact: {:?}",
+						chain.id(),
+						deployed.allocator,
+						deployed.compact
+					),
 				);
 
 				// Convert session contracts to contracts struct format using helper
 				match ContractAddresses::from_session_contract_set(deployed) {
 					Ok(contract_addresses) => {
 						contracts.set_addresses(chain, contract_addresses);
-						info!(
-							chain_id = chain.id(),
-							"Contracts loaded successfully for chain"
+						logging::verbose_success(
+							"Contracts loaded successfully for chain",
+							&chain.id().to_string(),
 						);
 					},
 					Err(e) => {
-						warn!(
-							chain_id = chain.id(),
-							error = %e,
-							"Failed to load contracts for chain"
-						);
+						logging::warning(&format!(
+							"Failed to load contracts for chain {}: {}",
+							chain.id(),
+							e
+						));
 					},
 				}
 			}
@@ -279,11 +281,11 @@ impl Context {
 						contracts.set_addresses(chain, contract_addresses);
 					},
 					Err(e) => {
-						warn!(
-							chain_id = chain.id(),
-							error = %e,
-							"Failed to load contracts for chain from session"
-						);
+						logging::warning(&format!(
+							"Failed to load contracts for chain {} from session: {}",
+							chain.id(),
+							e
+						));
 					},
 				}
 			}

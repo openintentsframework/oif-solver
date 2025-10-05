@@ -8,10 +8,10 @@
 use anyhow::Result;
 use clap::Parser;
 use solver_demo::{
-	cli::{output::Display, Cli, Commands},
+	cli::{Cli, Commands},
+	core::logging,
 	Context, GetQuoteRequest, PostOrderRequest,
 };
-use tracing::{info, instrument};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -19,11 +19,16 @@ async fn main() -> Result<()> {
 	// Load environment variables from .env file if it exists
 	let _ = dotenvy::dotenv();
 
-	// Initialize logging
-	init_logging();
-
 	// Parse CLI arguments
 	let cli = Cli::parse();
+
+	// Set verbose logging if --verbose flag is used
+	if cli.verbose {
+		std::env::set_var("RUST_LOG", "debug");
+	}
+
+	// Initialize logging
+	init_logging();
 
 	// Handle commands
 	match cli.command {
@@ -37,10 +42,11 @@ async fn main() -> Result<()> {
 	}
 }
 
-/// Initialize structured logging with configurable verbosity
+/// Initialize structured logging optimized for CLI usage
 ///
-/// Sets up tracing subscriber with optimized formatting for CLI usage.
+/// Sets up tracing subscriber with clean formatting for user-facing output.
 /// Logs are controlled via RUST_LOG environment variable with sensible defaults.
+/// Uses a cleaner format without timestamps and targets for better CLI experience.
 fn init_logging() {
 	use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -51,20 +57,24 @@ fn init_logging() {
 	tracing_subscriber::registry()
 		.with(
 			fmt::layer()
-				.with_target(true)
+				.with_target(false)
 				.with_thread_ids(false)
 				.with_file(false)
 				.with_line_number(false)
-				.compact(),
+				.with_level(false)
+				.without_time()
+				.with_span_events(fmt::format::FmtSpan::NONE)
+				.compact()  // Use compact format for minimal output
+				.with_ansi(true), // Keep colors for better readability
 		)
 		.with(env_filter)
 		.init();
 }
 
 /// Handle init command
-#[instrument(skip(cmd))]
 async fn handle_init(cmd: solver_demo::cli::commands::InitCommand) -> Result<()> {
 	use solver_demo::cli::commands::InitSubcommand;
+	use solver_demo::core::logging;
 	use solver_demo::operations::init::InitOps;
 
 	match cmd.command {
@@ -73,34 +83,39 @@ async fn handle_init(cmd: solver_demo::cli::commands::InitCommand) -> Result<()>
 			chains,
 			force,
 		} => {
-			info!(
-				config_path = %path.display(),
-				chain_count = chains.len(),
-				force = force,
-				"Creating new configuration"
-			);
-			Display::header("Generating New Configuration");
+			logging::operation_start("Creating configuration...");
+
+			// Log verbose details
+			logging::verbose_operation("Configuration path", &path.display().to_string());
+			logging::verbose_operation("Chain count", &chains.len().to_string());
+			logging::verbose_operation("Force mode", &force.to_string());
 
 			// Generate new configuration (no context needed)
 			let init_ops = InitOps::without_context();
-			init_ops.create(path.clone(), chains, force).await?;
+			init_ops.create(path.clone(), chains.clone(), force).await?;
 
-			Display::next_steps(&[
-				"Review the generated configuration",
-				"Run 'cargo run -p solver-demo init load <path> --local' to initialize",
-				"Start the local environment with 'cargo run -p solver-demo env start'",
-			]);
+			logging::success(&format!("Configuration created at {}", path.display()));
+			logging::success(&format!(
+				"Network templates generated ({} chains)",
+				chains.len()
+			));
+			logging::next_step(&format!(
+				"Load configuration with 'oif-demo init load {} --local'",
+				path.display()
+			));
 		},
 		InitSubcommand::Load { path, local } => {
-			info!(
-				config_path = %path.display(),
-				local_mode = local,
-				"Loading configuration"
-			);
-			Display::header("Loading Configuration");
+			logging::operation_start(&format!("Loading configuration from {}...", path.display()));
+
+			// Log verbose details
+			logging::verbose_operation("Local mode", &local.to_string());
 
 			if !path.exists() {
-				Display::error(&format!("Configuration not found at: {}", path.display()));
+				logging::file_error(
+					"Configuration",
+					&path.display().to_string(),
+					&format!("Create one with: 'oif-demo init new {}'", path.display()),
+				);
 				return Ok(());
 			}
 
@@ -108,12 +123,16 @@ async fn handle_init(cmd: solver_demo::cli::commands::InitCommand) -> Result<()>
 			let init_ops = InitOps::without_context();
 			init_ops.load(path.clone(), local).await?;
 
+			let env_type = if local {
+				"local mode"
+			} else {
+				"production mode"
+			};
+			logging::success(&format!("Configuration loaded ({})", env_type));
+			logging::success("Session initialized");
+
 			if local {
-				Display::next_steps(&[
-					"Start the local environment with 'cargo run -p solver-demo env start'",
-					"Check available tokens with 'cargo run -p solver-demo token list'",
-					"Build an intent with 'cargo run -p solver-demo intent build'",
-				]);
+				logging::next_step("Start environment with 'oif-demo env start'");
 			}
 		},
 	}
@@ -122,31 +141,27 @@ async fn handle_init(cmd: solver_demo::cli::commands::InitCommand) -> Result<()>
 }
 
 /// Handle config command
-#[instrument]
 async fn handle_config() -> Result<()> {
-	Display::header("Current Configuration");
+	use solver_demo::core::logging;
+
+	logging::section_header("Current Configuration");
 
 	// Load config if available
 	match Context::load_existing().await {
 		Ok(ctx) => {
-			info!(
-				config_path = %ctx.config.path.display(),
-				environment = ?ctx.session.environment(),
-				chain_count = ctx.config.chains().len(),
-				"Configuration loaded successfully"
-			);
-			Display::kv("Config file", &ctx.config.path.display().to_string());
-			Display::kv("Environment", &format!("{:?}", ctx.session.environment()));
-			Display::kv("Chains", &format!("{:?}", ctx.config.chains()));
-			Display::kv("RPC Endpoints", &format!("{}", ctx.config.chains().len()));
+			logging::success("Configuration loaded successfully");
+			logging::info_kv("Config path", &ctx.config.path.display().to_string());
+			logging::info_kv("Environment", &format!("{:?}", ctx.session.environment()));
+			logging::info_kv("Chains", &ctx.config.chains().len().to_string());
+
+			// Verbose details
+			logging::verbose_operation("RPC endpoints", &ctx.config.chains().len().to_string());
 		},
 		Err(_) => {
-			info!("No configuration found");
-			Display::warning("No configuration loaded");
-			Display::next_steps(&[
-				"Create a new configuration with 'cargo run -p solver-demo init new'",
-				"Or load an existing one with 'cargo run -p solver-demo init load <path>'",
-			]);
+			logging::warning("No configuration loaded");
+			logging::next_step(
+				"Create with 'oif-demo init new <path>' or load with 'oif-demo init load <path>'",
+			);
 		},
 	}
 
@@ -154,7 +169,6 @@ async fn handle_config() -> Result<()> {
 }
 
 /// Handle environment command
-#[instrument(skip(cmd))]
 async fn handle_env(cmd: solver_demo::cli::commands::EnvCommand) -> Result<()> {
 	use solver_demo::cli::commands::EnvSubcommand;
 	use solver_demo::operations::env::EnvOps;
@@ -171,29 +185,33 @@ async fn handle_env(cmd: solver_demo::cli::commands::EnvCommand) -> Result<()> {
 
 	match cmd.command {
 		EnvSubcommand::Start => {
-			info!("Starting local environment");
-			Display::header("Starting Local Environment");
+			use solver_demo::core::logging;
+
+			logging::operation_start("Starting local environment...");
 
 			// Start environment (Anvil chains only)
 			env_ops.start().await?;
 
-			Display::success("Environment started successfully");
+			logging::success("Anvil chains started");
+			logging::success("Environment ready");
+			logging::next_step("Deploy contracts with 'oif-demo env deploy --all'");
 		},
 		EnvSubcommand::Stop => {
-			Display::header("Stopping Local Environment");
+			use solver_demo::core::logging;
+
+			logging::operation_start("Stopping local environment...");
 
 			env_ops.stop()?;
 
-			Display::success("Environment stopped");
+			logging::success("Environment stopped");
 		},
 		EnvSubcommand::Status => {
-			Display::header("Environment Status");
-
 			let status = env_ops.status()?;
-			Display::kv("Environment", &format!("{:?}", status.environment));
-			Display::kv("Chains Running", &format!("{}", status.chains.len()));
+			use solver_demo::core::logging;
+			logging::info_kv("Environment", &format!("{:?}", status.environment));
+			logging::info_kv("Chains running", &status.chains.len().to_string());
 			for chain_status in status.chains {
-				Display::kv(
+				logging::info_kv(
 					&format!("Chain {}", chain_status.chain),
 					if chain_status.running {
 						"✓ Running"
@@ -211,48 +229,55 @@ async fn handle_env(cmd: solver_demo::cli::commands::EnvCommand) -> Result<()> {
 			list,
 			path,
 		} => {
+			use solver_demo::core::logging;
+
 			// Default to listing if no deployment action is specified
 			let should_list = list || (contract.is_none() && !all);
 
 			if should_list {
-				Display::header("Available Contracts");
-				Display::kv("Contracts Path", &path);
+				logging::section_header("Available contracts");
+				logging::verbose_tech("Contracts path", &path);
 
 				// Use EnvOps to list available contracts
 				match env_ops.list_available_contracts() {
 					Ok(contracts) => {
 						if contracts.is_empty() {
-							Display::warning("No compiled contracts found");
+							logging::warning("No compiled contracts found");
 						} else {
 							for contract in contracts {
-								Display::info(&format!("- {}", contract));
+								logging::info_bullet(&contract);
 							}
 						}
 					},
 					Err(e) => {
-						Display::error(&format!("Failed to list contracts: {}", e));
+						logging::error_with_guidance(
+							"Failed to list contracts",
+							"Check that contracts are compiled in the specified path",
+						);
+						return Err(e.into());
 					},
 				}
 				return Ok(());
 			}
 
-			Display::header("Deploying Contracts");
-			Display::kv("Contracts Path", &path);
+			// Verbose deployment details
+			logging::verbose_tech("Contracts path", &path);
+			logging::verbose_tech("Force mode", &force.to_string());
 
 			if force {
-				Display::warning("Force deployment requested");
+				logging::warning("Force deployment requested");
 			}
 
 			if let Some(contract_name) = contract {
-				Display::kv("Contract", &contract_name);
+				logging::operation_start(&format!("Deploying contract {}...", contract_name));
 
 				// Convert chain option to Vec<u64> if provided
 				let chain_ids = chain.map(|c| vec![c]);
 
 				if let Some(chain_id) = chain {
-					Display::kv("Target Chain", &chain_id.to_string());
+					logging::verbose_operation("Target chain", &chain_id.to_string());
 				} else {
-					Display::info("Deploying to all configured chains");
+					logging::verbose_operation("Target", "all configured chains");
 				}
 
 				// Deploy single contract
@@ -261,64 +286,87 @@ async fn handle_env(cmd: solver_demo::cli::commands::EnvCommand) -> Result<()> {
 					.await
 				{
 					Ok(()) => {
-						// Success already logged by deploy_single_contract
+						logging::success(&format!(
+							"Contract {} deployed successfully",
+							contract_name
+						));
 					},
 					Err(e) => {
-						Display::error(&format!("Contract deployment failed: {}", e));
+						logging::error_with_guidance(
+							&format!("Contract {} deployment failed", contract_name),
+							"Check network connectivity and contract compilation",
+						);
 						return Err(e.into());
 					},
 				}
 			} else if all {
-				Display::info("Deploying all standard contracts");
+				let chain_count = ctx.config.chains().len();
+				logging::operation_start(&format!(
+					"Deploying contracts to {} chains...",
+					chain_count
+				));
 
 				// Filter to specific chain if provided
-				if let Some(chain_id) = chain {
-					Display::kv("Target Chain", &chain_id.to_string());
-					Display::error("Single chain deployment not yet implemented");
-					Display::info("Deployment will happen to all configured chains");
+				if let Some(_chain_id) = chain {
+					logging::verbose_operation(
+						"Note",
+						"single chain deployment not yet implemented, deploying to all chains",
+					);
 				} else {
-					Display::info("Deploying to all configured chains");
+					logging::verbose_operation("Target", "all configured chains");
 				}
 
 				// Use EnvOps to deploy contracts
 				match env_ops.deploy(force).await {
 					Ok(()) => {
-						Display::success("All contracts deployed successfully");
+						logging::success(&format!(
+							"All contracts deployed to {} chains",
+							chain_count
+						));
+						logging::next_step("Setup environment with 'oif-demo env setup'");
 					},
 					Err(e) => {
-						Display::error(&format!("Deployment failed: {}", e));
+						logging::error_with_guidance(
+							"Deployment failed",
+							"Check network connectivity and ensure chains are running",
+						);
 						return Err(e.into());
 					},
 				}
 			} else {
-				Display::error("Please specify --all to deploy all contracts or --list to see available contracts");
+				logging::error_with_guidance(
+					"Please specify deployment action",
+					"Use --all to deploy all contracts or --list to see available contracts",
+				);
 			}
-
-			Display::success("Deploy command completed");
 		},
 		EnvSubcommand::Setup { chain, amount } => {
-			Display::header("Setting Up Test Environment");
+			use solver_demo::core::logging;
 
+			logging::operation_start("Setting up test environment...");
+
+			// Verbose details
 			if let Some(chain_id) = chain {
-				Display::kv("Target Chain", &chain_id.to_string());
+				logging::verbose_operation("Target chain", &chain_id.to_string());
 			} else {
-				Display::info("Setting up all configured chains");
+				logging::verbose_operation("Target", "all configured chains");
 			}
-			Display::kv("Token Amount", &format!("{} tokens", amount));
+			logging::verbose_tech("Token amount", &amount.to_string());
 
 			// Use EnvOps to setup the environment
 			match env_ops.setup(chain, amount).await {
 				Ok(()) => {
-					Display::success("Environment setup completed successfully");
-					Display::next_steps(&[
-						"Environment is now ready for testing",
-						"Tokens have been minted to user and solver addresses",
-						"Permit2 allowances have been approved",
-						"Allocator has been registered with TheCompact",
-					]);
+					logging::success("Tokens minted to all accounts");
+					logging::success("Permit2 allowances approved");
+					logging::success("Allocator registered with TheCompact");
+					logging::success("Environment ready for testing");
+					logging::next_step("Check balances with 'oif-demo token balance'");
 				},
 				Err(e) => {
-					Display::error(&format!("Setup failed: {}", e));
+					logging::error_with_guidance(
+						"Setup failed",
+						"Check that contracts are deployed and chains are running",
+					);
 					return Err(e.into());
 				},
 			}
@@ -329,7 +377,6 @@ async fn handle_env(cmd: solver_demo::cli::commands::EnvCommand) -> Result<()> {
 }
 
 /// Handle token command
-#[instrument(skip(cmd))]
 async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<()> {
 	use solver_demo::cli::commands::TokenSubcommand;
 	use solver_demo::operations::token::TokenOps;
@@ -341,7 +388,9 @@ async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<(
 
 	match cmd.command {
 		TokenSubcommand::List { chains } => {
-			Display::header("Available Tokens");
+			use solver_demo::core::logging;
+
+			logging::section_header("Available tokens");
 
 			let chain_ids: Vec<ChainId> = chains
 				.map(|c| c.into_iter().map(ChainId::from_u64).collect())
@@ -350,12 +399,9 @@ async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<(
 			let tokens = token_ops.list(Some(chain_ids)).await?;
 
 			for (chain, token_list) in tokens.tokens_by_chain {
-				Display::info(&format!("Chain {}:", chain));
+				logging::subsection(&format!("Chain {}", chain));
 				for token in token_list {
-					Display::kv(
-						&format!("  {}", token.symbol),
-						&format!("{}", token.address),
-					);
+					logging::item(&format!("{}: {}", token.symbol, token.address));
 				}
 			}
 		},
@@ -365,11 +411,17 @@ async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<(
 			amount,
 			to,
 		} => {
-			Display::header("Minting Tokens");
+			use solver_demo::core::logging;
 
-			Display::kv("Chain", &chain.to_string());
-			Display::kv("Token", &token);
-			Display::kv("Amount", &amount);
+			logging::operation_start("Minting tokens...");
+
+			// Verbose details
+			logging::verbose_tech("Chain", &chain.to_string());
+			logging::verbose_tech("Token", &token);
+			logging::verbose_tech("Amount", &amount);
+			if let Some(recipient) = &to {
+				logging::verbose_tech("Recipient", recipient);
+			}
 
 			let chain_id = ChainId::from_u64(chain);
 
@@ -382,32 +434,31 @@ async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<(
 				.mint(chain_id, &token, to.as_deref(), amount_u256)
 				.await?;
 
-			Display::success(&format!(
-				"Minted {} {} (tx: {})",
-				result.amount,
-				result.token,
-				result
-					.tx_hash
-					.map(|h| format!("{:?}", h))
-					.unwrap_or_else(|| "pending".to_string())
-			));
+			logging::success(&format!("Minted {} {}", result.amount, result.token));
+
+			if let Some(tx_hash) = result.tx_hash {
+				logging::verbose_tech("Transaction", &format!("{:?}", tx_hash));
+			}
 		},
 		TokenSubcommand::Balance {
 			account,
 			follow,
 			chains,
 		} => {
-			Display::header("Token Balances");
+			use solver_demo::core::logging;
+
+			logging::section_header("Token Balances");
 
 			// Handle "all" account or specific accounts
+			let account_display = format!("{} Account", account);
 			let accounts_to_check = if account == "all" {
 				vec![
-					("user", "User"),
-					("solver", "Solver"),
-					("recipient", "Recipient"),
+					("user", "User Account"),
+					("solver", "Solver Account"),
+					("recipient", "Recipient Account"),
 				]
 			} else {
-				vec![(account.as_str(), account.as_str())]
+				vec![(account.as_str(), account_display.as_str())]
 			};
 
 			loop {
@@ -418,53 +469,26 @@ async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<(
 				};
 
 				for (account_name, display_name) in &accounts_to_check {
-					if accounts_to_check.len() > 1 {
-						Display::info(&format!(
-							"
-{} Account:",
-							display_name
-						));
-					} else {
-						Display::kv("Account", display_name);
-					}
+					logging::subsection(display_name);
 
 					for chain_id in &chain_ids {
 						// Get all tokens for this chain
 						let tokens = ctx.tokens.tokens_for_chain(*chain_id);
 
-						Display::info(&format!(
-							"{}Chain {}:",
-							if accounts_to_check.len() > 1 {
-								"  "
-							} else {
-								"
-"
-							},
-							chain_id
-						));
+						logging::subsection(&format!("Chain {}", chain_id));
+
 						for token in tokens {
 							let result = token_ops
 								.balance(*chain_id, &token.symbol, Some(account_name))
 								.await?;
-							Display::kv(
-								&format!(
-									"{}  {}",
-									if accounts_to_check.len() > 1 {
-										"  "
-									} else {
-										""
-									},
-									result.token
-								),
-								&format!("{}", result.balance),
-							);
+							logging::item(&format!("{}: {}", result.token, result.balance));
 						}
 					}
 				}
 
 				if let Some(interval) = follow {
 					tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
-					Display::info("---");
+					logging::info_bullet("---");
 				} else {
 					break;
 				}
@@ -476,12 +500,15 @@ async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<(
 			spender,
 			amount,
 		} => {
-			Display::header("Token Approval");
+			use solver_demo::core::logging;
 
-			Display::kv("Chain", &chain.to_string());
-			Display::kv("Token", &token);
-			Display::kv("Spender", &spender);
-			Display::kv("Amount", &amount);
+			logging::operation_start("Approving token...");
+
+			// Verbose details
+			logging::verbose_tech("Chain", &chain.to_string());
+			logging::verbose_tech("Token", &token);
+			logging::verbose_tech("Spender", &spender);
+			logging::verbose_tech("Amount", &amount);
 
 			let chain_id = ChainId::from_u64(chain);
 
@@ -494,16 +521,14 @@ async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<(
 				.approve(chain_id, &token, &spender, Some(amount_u256))
 				.await?;
 
-			Display::success(&format!(
-				"Approved {} {} for {} (tx: {})",
-				result.amount,
-				result.token,
-				result.spender,
-				result
-					.tx_hash
-					.map(|h| format!("{:?}", h))
-					.unwrap_or_else(|| "pending".to_string())
+			logging::success(&format!(
+				"Approved {} {} for {}",
+				result.amount, result.token, result.spender
 			));
+
+			if let Some(tx_hash) = result.tx_hash {
+				logging::verbose_tech("Transaction", &format!("{:?}", tx_hash));
+			}
 		},
 	}
 
@@ -511,7 +536,6 @@ async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<(
 }
 
 /// Handle account command
-#[instrument(skip(cmd))]
 async fn handle_account(cmd: solver_demo::cli::commands::AccountCommand) -> Result<()> {
 	use solver_demo::cli::commands::AccountSubcommand;
 
@@ -520,16 +544,20 @@ async fn handle_account(cmd: solver_demo::cli::commands::AccountCommand) -> Resu
 
 	match cmd.command {
 		AccountSubcommand::List => {
-			Display::header("Configured Accounts");
+			use solver_demo::core::logging;
+
+			logging::section_header("Configured Accounts");
 
 			let accounts = ctx.config.accounts();
 
-			Display::kv("User", &accounts.user.address);
-			Display::kv("Solver", &accounts.solver.address);
-			Display::kv("Recipient", &accounts.recipient.address);
+			logging::info_kv("User", &accounts.user.address);
+			logging::info_kv("Solver", &accounts.solver.address);
+			logging::info_kv("Recipient", &accounts.recipient.address);
 		},
 		AccountSubcommand::Info { account } => {
-			Display::header(&format!("Account Info: {}", account));
+			use solver_demo::core::logging;
+
+			logging::section_header(&format!("Account Info: {}", account));
 
 			let accounts = ctx.config.accounts();
 
@@ -538,16 +566,16 @@ async fn handle_account(cmd: solver_demo::cli::commands::AccountCommand) -> Resu
 				"solver" => &accounts.solver,
 				"recipient" => &accounts.recipient,
 				_ => {
-					Display::error(&format!(
-						"Unknown account: {}. Use 'user', 'solver', or 'recipient'",
-						account
-					));
+					logging::error_with_guidance(
+						&format!("Unknown account: {}", account),
+						"Use 'user', 'solver', or 'recipient'",
+					);
 					return Ok(());
 				},
 			};
 
-			Display::kv("Address", &account_info.address);
-			Display::kv(
+			logging::info_kv("Address", &account_info.address);
+			logging::info_kv(
 				"Has Private Key",
 				if account_info.private_key.is_some() {
 					"Yes"
@@ -562,7 +590,6 @@ async fn handle_account(cmd: solver_demo::cli::commands::AccountCommand) -> Resu
 }
 
 /// Handle intent command
-#[instrument(skip(cmd))]
 async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result<()> {
 	use solver_demo::cli::commands::IntentSubcommand;
 	use solver_demo::operations::intent::IntentOps;
@@ -601,7 +628,7 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 			let to_chain_id = ChainId::from_u64(to_chain);
 
 			// Get token info to determine decimals for amount formatting
-			let (from_token_info, amount_u256) = if exact_output {
+			let (from_token_info, _amount_u256) = if exact_output {
 				// For exact output, amount is for the destination token
 				let to_token_info = ctx.tokens.get_or_error(to_chain_id, &to_token)?;
 				let parsed_amount = to_token_info.to_wei(amount.parse::<f64>()?);
@@ -616,12 +643,15 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 				(from_token_info, parsed_amount)
 			};
 
-			Display::header("Building Intent");
+			use solver_demo::core::logging;
 
-			Display::kv("From Chain", &from_chain.to_string());
-			Display::kv("To Chain", &to_chain.to_string());
-			Display::kv("From Token", &from_token);
-			Display::kv("To Token", &to_token);
+			logging::operation_start("Building intent...");
+
+			// Verbose parameter details
+			logging::verbose_tech("From Chain", &from_chain.to_string());
+			logging::verbose_tech("To Chain", &to_chain.to_string());
+			logging::verbose_tech("From Token", &from_token);
+			logging::verbose_tech("To Token", &to_token);
 
 			// Display formatted amount with token info
 			let amount_display = if exact_output {
@@ -630,27 +660,27 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 			} else {
 				format!("{} {} (input)", amount, from_token_info.symbol)
 			};
-			Display::kv("Amount", &amount_display);
-			Display::kv("Swap Type", &swap_type);
-			Display::kv("Settlement", &settlement);
-			Display::kv("Auth", auth.as_deref().unwrap_or("N/A"));
+			// Create user-friendly intent description
+			let intent_desc = format!("{} {} → {}", amount_display, from_token, to_token);
+			logging::success(&format!("Intent created: {}", intent_desc));
 
-			// Parse settlement and auth types
-			let settlement_type =
-				settlement.parse::<solver_demo::operations::intent::SettlementType>()?;
-			let auth_type = match auth {
-				Some(auth_str) => {
-					Some(auth_str.parse::<solver_demo::operations::intent::AuthType>()?)
-				},
-				None => None,
-			};
+			// Verbose technical details
+			logging::verbose_tech("Swap Type", &swap_type);
+			logging::verbose_tech("Settlement", &settlement);
+			logging::verbose_tech("Auth", auth.as_deref().unwrap_or("N/A"));
 
-			let params = solver_demo::operations::intent::IntentParams {
+			// Build intent parameters
+			use solver_demo::operations::intent::{AuthType, IntentParams, SettlementType};
+
+			let settlement_type = settlement.parse::<SettlementType>()?;
+			let auth_type = auth.map(|a| a.parse::<AuthType>()).transpose()?;
+
+			let intent_params = IntentParams {
 				from_chain: from_chain_id,
 				to_chain: to_chain_id,
 				from_token,
 				to_token,
-				amount: amount_u256,
+				amount: _amount_u256,
 				min_amount: None,
 				sender: None,
 				recipient: None,
@@ -659,26 +689,27 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 				auth: auth_type,
 			};
 
-			let quote_request = intent_ops.build(params, output.clone()).await?;
+			// Actually build the intent
+			let _quote_request = intent_ops.build(intent_params, output.clone()).await?;
 
-			// Determine where it was saved and display appropriate message
+			// Display save location and next steps
 			if let Some(output_path) = &output {
-				Display::success(&format!(
-					"GetQuoteRequest saved to: {}",
+				logging::success(&format!("Request saved to {}", output_path.display()));
+				logging::next_step(&format!(
+					"Get quote with 'oif-demo quote get {}'",
 					output_path.display()
 				));
 			} else {
-				Display::success("GetQuoteRequest saved to: .oif-demo/requests/get_quote.req.json");
+				logging::success("Request saved to .oif-demo/requests/get_quote.req.json");
+				logging::next_step(
+					"Get quote with 'oif-demo quote get .oif-demo/requests/get_quote.req.json'",
+				);
 			}
-
-			// Display the intent details for user reference
-			Display::section("Intent Details");
-			Display::info(&serde_json::to_string_pretty(&quote_request.intent)?);
 		},
 		IntentSubcommand::BuildBatch { input, output } => {
-			Display::header("Building Batch Intents");
+			logging::operation_start("Building batch intents...");
 
-			Display::kv("Input file", &input.display().to_string());
+			logging::verbose_tech("Input file", &input.display().to_string());
 
 			let intents = intent_ops.build_batch(&input).await?;
 
@@ -698,32 +729,27 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 			let json = serde_json::to_string_pretty(&intents)?;
 			std::fs::write(&output_path, json)?;
 
-			Display::success(&format!(
-				"Built {} intents and saved to: {}",
-				intents.len(),
-				output_path.display()
-			));
+			logging::success(&format!("Built {} intents", intents.len()));
+			logging::success(&format!("Batch saved to {}", output_path.display()));
 
 			// Show next steps like old demo
-			Display::next_steps(&[
-				&format!(
-					"Test quotes: cargo run solver-demo -- quote test {}",
-					output_path.display()
-				),
-				"This will create post_orders.req.json for batch submission",
-			]);
+			logging::next_step(&format!(
+				"Test quotes with 'oif-demo quote test {}'",
+				output_path.display()
+			));
 		},
 		IntentSubcommand::Submit {
 			input,
 			onchain,
 			chain: _,
 		} => {
-			Display::header("Submitting Intent");
+			logging::operation_start("Submitting intent...");
 
-			Display::kv("Input file", &input.display().to_string());
+			logging::verbose_tech("Input file", &input.display().to_string());
 
 			if onchain {
-				Display::warning("On-chain submission not yet implemented");
+				use solver_demo::core::logging;
+				logging::warning("On-chain submission not yet implemented");
 				return Ok(());
 			}
 
@@ -732,21 +758,22 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 
 			let order_id = intent_ops.submit(order).await?;
 
-			Display::success(&format!("Order submitted: {}", order_id));
-			Display::kv("Order ID", &order_id);
+			use solver_demo::core::logging;
+			logging::success(&format!("Order submitted: {}", order_id));
+			logging::info_kv("Order ID", &order_id);
 		},
 		IntentSubcommand::Status { order_id } => {
-			Display::header("Order Status");
-
-			Display::kv("Order ID", &order_id);
+			use solver_demo::core::logging;
+			logging::operation_start("Order Status");
+			logging::info_kv("Order ID", &order_id);
 
 			let status = intent_ops.status(&order_id).await?;
 
-			Display::kv("Status", &status.status);
-			Display::kv("Timestamp", &status.timestamp);
+			logging::info_kv("Status", &status.status);
+			logging::info_kv("Timestamp", &status.timestamp);
 
 			if let Some(tx_hash) = &status.fill_tx_hash {
-				Display::kv("Fill Transaction", tx_hash);
+				logging::info_kv("Fill Transaction", tx_hash);
 			}
 		},
 		IntentSubcommand::Test {
@@ -754,19 +781,19 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 			onchain,
 			output: _,
 		} => {
-			Display::header("Testing Intents");
-
-			Display::kv("Input file", &input.display().to_string());
+			use solver_demo::core::logging;
+			logging::operation_start("Testing Intents");
+			logging::info_kv("Input file", &input.display().to_string());
 
 			if onchain {
-				Display::warning("On-chain testing not yet implemented");
+				logging::warning("On-chain testing not yet implemented");
 				return Ok(());
 			}
 
 			// Check if input file exists
 			if !input.exists() {
-				Display::error(&format!("Input file not found: {}", input.display()));
-				Display::info("Please run 'cargo run -p solver-demo -- quote test' first to create post_orders.req.json");
+				logging::error_message(&format!("Input file not found: {}", input.display()));
+				logging::next_step("Run 'cargo run -p solver-demo -- quote test' first to create post_orders.req.json");
 				return Ok(());
 			}
 
@@ -775,12 +802,12 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 			let post_order_requests: Vec<PostOrderRequest> = serde_json::from_str(&content)?;
 
 			if post_order_requests.is_empty() {
-				Display::error("No order requests found in input file");
+				logging::error_message("No order requests found in input file");
 				return Ok(());
 			}
 
 			let total_requests = post_order_requests.len();
-			Display::info(&format!("Submitting {} order requests...", total_requests));
+			logging::operation_start(&format!("Submitting {} order requests...", total_requests));
 
 			let mut successful_count = 0;
 			let mut failed_count = 0;
@@ -788,20 +815,26 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 
 			// Process each order request
 			for (index, post_order_request) in post_order_requests.into_iter().enumerate() {
-				Display::info(&format!(
-					"Submitting order request {} of {}...",
-					index + 1,
-					total_requests
-				));
+				logging::verbose_operation(
+					&format!(
+						"Submitting order request {} of {}",
+						index + 1,
+						total_requests
+					),
+					"",
+				);
 
 				match intent_ops.submit(post_order_request).await {
 					Ok(order_id) => {
 						successful_count += 1;
-						Display::success(&format!("Order {} submitted: {}", index + 1, order_id));
+						logging::verbose_success(
+							&format!("Order {} submitted", index + 1),
+							&order_id,
+						);
 					},
 					Err(e) => {
 						failed_count += 1;
-						Display::error(&format!("Order {} failed: {}", index + 1, e));
+						logging::error_message(&format!("Order {} failed: {}", index + 1, e));
 					},
 				}
 			}
@@ -809,7 +842,7 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 			let total_duration = start_time.elapsed();
 
 			// Display results
-			Display::info(&format!(
+			logging::success(&format!(
 				"Results: {} successful, {} failed, took {:.2}s",
 				successful_count,
 				failed_count,
@@ -817,9 +850,9 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 			));
 
 			if successful_count > 0 {
-				Display::next_steps(&[
+				logging::next_step(
 					"Check order status: cargo run -p solver-demo -- intent status <order_id>",
-				]);
+				);
 			}
 		},
 	}
@@ -828,7 +861,6 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 }
 
 /// Handle quote command
-#[instrument(skip(cmd))]
 async fn handle_quote(cmd: solver_demo::cli::commands::QuoteCommand) -> Result<()> {
 	use solver_demo::cli::commands::QuoteSubcommand;
 	use solver_demo::operations::quote::QuoteOps;
@@ -839,23 +871,59 @@ async fn handle_quote(cmd: solver_demo::cli::commands::QuoteCommand) -> Result<(
 
 	match cmd.command {
 		QuoteSubcommand::Get { input, output } => {
-			Display::header("Getting Quote");
+			use solver_demo::core::logging;
+
+			logging::operation_start("Getting quote...");
 
 			// Use QuoteOps to get the quote
 			let response = quote_ops.get(&input).await?;
 
-			Display::success(&format!("Received {} quote(s)", response.quotes.len()));
+			let quote_count = response.quotes.len();
+			if quote_count > 0 {
+				let first_quote = &response.quotes[0];
+				let validity_duration = first_quote
+					.valid_until
+					.saturating_sub(chrono::Utc::now().timestamp() as u64);
+				logging::success(&format!(
+					"Received {} quote(s) (valid for {}s)",
+					quote_count, validity_duration
+				));
+			} else {
+				logging::warning("No quotes received from solver");
+			}
 
 			if let Some(output_path) = output {
 				std::fs::write(&output_path, serde_json::to_string_pretty(&response)?)?;
-				Display::info(&format!("Quote saved to: {}", output_path.display()));
-				info!(
-					output_file = %output_path.display(),
-					"Quote response saved to file"
-				);
+				logging::success(&format!("Quote saved to {}", output_path.display()));
+				logging::next_step(&format!(
+					"Sign quote with 'oif-demo quote sign {}'",
+					output_path.display()
+				));
 			} else {
-				Display::info(&serde_json::to_string_pretty(&response)?);
-				info!("Quote response displayed to stdout");
+				// Display quote summary instead of full JSON
+				if !response.quotes.is_empty() {
+					logging::section_header("Quote Summary");
+					for (i, quote) in response.quotes.iter().enumerate() {
+						logging::info_bullet(&format!(
+							"Quote {}: ID={}, Valid Until={}, ETA={}s",
+							i + 1,
+							quote.quote_id,
+							quote.valid_until,
+							quote.eta.unwrap_or(0)
+						));
+						if let Some(provider) = &quote.provider {
+							logging::verbose_tech("Provider", provider);
+						}
+					}
+				}
+
+				// Default file save location
+				let default_path = std::path::Path::new(".oif-demo/requests/get_quote.res.json");
+				logging::success(&format!("Quote saved to {}", default_path.display()));
+				logging::next_step(&format!(
+					"Sign quote with 'oif-demo quote sign {}'",
+					default_path.display()
+				));
 			}
 		},
 		QuoteSubcommand::Sign {
@@ -864,10 +932,13 @@ async fn handle_quote(cmd: solver_demo::cli::commands::QuoteCommand) -> Result<(
 			signature,
 			output,
 		} => {
-			Display::header("Signing Quote");
+			use solver_demo::core::logging;
 
-			Display::kv("Quote file", &input.display().to_string());
-			Display::kv("Quote index", &quote_index.to_string());
+			logging::operation_start("Signing quote...");
+
+			// Verbose details
+			logging::verbose_tech("Quote file", &input.display().to_string());
+			logging::verbose_tech("Quote index", &quote_index.to_string());
 
 			let quote_json = std::fs::read_to_string(&input)?;
 			let quote_response: solver_demo::GetQuoteResponse = serde_json::from_str(&quote_json)?;
@@ -881,6 +952,7 @@ async fn handle_quote(cmd: solver_demo::cli::commands::QuoteCommand) -> Result<(
 			// Create the order request
 			let order_request = if let Some(sig_str) = signature {
 				// Use provided signature
+				logging::verbose_operation("Using provided signature", &sig_str[..8]);
 				PostOrderRequest {
 					order: quote.order.clone(),
 					signature: alloy_primitives::Bytes::from(hex::decode(&sig_str)?),
@@ -890,50 +962,45 @@ async fn handle_quote(cmd: solver_demo::cli::commands::QuoteCommand) -> Result<(
 			} else {
 				// Sign the quote
 				let order_request = quote_ops.sign(quote_response).await?;
-				Display::success("Quote signed successfully!");
+				logging::success("Quote signed successfully");
 
 				// Save the PostOrderRequest to file
-				if let Some(output_path) = output {
-					let content = serde_json::to_string_pretty(&order_request)?;
-					std::fs::write(&output_path, content)?;
-					Display::info(&format!(
-						"Order request saved to: {}",
-						output_path.display()
-					));
+				let output_path = if let Some(path) = output {
+					path
 				} else {
-					// Save to default location in same directory as quote response
-					let output_path =
+					// Save to default location
+					let default_path =
 						std::path::Path::new(".oif-demo/requests/post_order.req.json");
-					if let Some(parent) = output_path.parent() {
+					if let Some(parent) = default_path.parent() {
 						std::fs::create_dir_all(parent)?;
 					}
-					let content = serde_json::to_string_pretty(&order_request)?;
-					std::fs::write(output_path, content)?;
-					Display::info(&format!(
-						"Order request saved to: {}",
-						output_path.display()
-					));
-				}
+					default_path.to_path_buf()
+				};
+
+				let content = serde_json::to_string_pretty(&order_request)?;
+				std::fs::write(&output_path, content)?;
+				logging::success(&format!("Order request saved to {}", output_path.display()));
+				logging::next_step(&format!(
+					"Submit order with 'oif-demo intent submit {}'",
+					output_path.display()
+				));
 				return Ok(());
 			};
 
 			if let Some(output_path) = output {
 				std::fs::write(&output_path, serde_json::to_string_pretty(&order_request)?)?;
-				Display::info(&format!(
-					"PostOrderRequest saved to: {}",
-					output_path.display()
-				));
+				logging::success(&format!("Order request saved to {}", output_path.display()));
 			}
 		},
 		QuoteSubcommand::Test { input, output: _ } => {
-			Display::header("Testing Quotes");
-
-			Display::kv("Input file", &input.display().to_string());
+			use solver_demo::core::logging;
+			logging::operation_start("Testing Quotes");
+			logging::info_kv("Input file", &input.display().to_string());
 
 			// Check if input file exists
 			if !input.exists() {
-				Display::error(&format!("Input file not found: {}", input.display()));
-				Display::info("Please run 'cargo run -p solver-demo -- intent build-batch' first");
+				logging::error_message(&format!("Input file not found: {}", input.display()));
+				logging::next_step("Run 'cargo run -p solver-demo -- intent build-batch' first");
 				return Ok(());
 			}
 
@@ -942,12 +1009,12 @@ async fn handle_quote(cmd: solver_demo::cli::commands::QuoteCommand) -> Result<(
 			let quote_requests: Vec<GetQuoteRequest> = serde_json::from_str(&content)?;
 
 			if quote_requests.is_empty() {
-				Display::error("No quote requests found in input file");
+				logging::error_message("No quote requests found in input file");
 				return Ok(());
 			}
 
 			let total_requests = quote_requests.len();
-			Display::info(&format!("Processing {} quote requests...", total_requests));
+			logging::operation_start(&format!("Processing {} quote requests...", total_requests));
 
 			let mut successful_orders = Vec::new();
 			let mut failed_count = 0;
@@ -955,29 +1022,33 @@ async fn handle_quote(cmd: solver_demo::cli::commands::QuoteCommand) -> Result<(
 
 			// Process each quote request
 			for (index, quote_request) in quote_requests.into_iter().enumerate() {
-				Display::info(&format!(
-					"Processing quote request {} of {}...",
-					index + 1,
-					total_requests
-				));
+				logging::verbose_operation(
+					&format!(
+						"Processing quote request {} of {}",
+						index + 1,
+						total_requests
+					),
+					"",
+				);
 
 				match quote_ops.get_and_sign_quote(quote_request).await {
 					Ok(post_order_request) => {
 						successful_orders.push(post_order_request);
-						Display::success(&format!("Quote request {} succeeded", index + 1));
-						info!(
-							request_index = index + 1,
-							total_requests = total_requests,
-							"Quote request processed successfully"
+						logging::verbose_success(
+							&format!("Quote request {} succeeded", index + 1),
+							"",
 						);
 					},
 					Err(e) => {
 						failed_count += 1;
-						Display::error(&format!("Quote request {} failed: {}", index + 1, e));
-						info!(
-							request_index = index + 1,
-							error = %e,
-							"Quote request failed"
+						logging::error_message(&format!(
+							"Quote request {} failed: {}",
+							index + 1,
+							e
+						));
+						logging::verbose_tech(
+							&format!("Quote request {} failed", index + 1),
+							&format!("{}", e),
 						);
 					},
 				}
@@ -994,7 +1065,7 @@ async fn handle_quote(cmd: solver_demo::cli::commands::QuoteCommand) -> Result<(
 				let orders_json = serde_json::to_string_pretty(&successful_orders)?;
 				std::fs::write(output_file, orders_json)?;
 
-				Display::success(&format!(
+				logging::success(&format!(
 					"Saved {} signed orders to {}",
 					successful_orders.len(),
 					output_file.display()
@@ -1002,7 +1073,7 @@ async fn handle_quote(cmd: solver_demo::cli::commands::QuoteCommand) -> Result<(
 			}
 
 			// Display results
-			Display::info(&format!(
+			logging::success(&format!(
 				"Results: {} successful, {} failed, took {:.2}s",
 				successful_orders.len(),
 				failed_count,
@@ -1010,10 +1081,10 @@ async fn handle_quote(cmd: solver_demo::cli::commands::QuoteCommand) -> Result<(
 			));
 
 			if !successful_orders.is_empty() {
-				Display::next_steps(&[&format!(
+				logging::next_step(&format!(
 					"Submit orders: cargo run -p solver-demo -- intent test {}",
 					output_file.display()
-				)]);
+				));
 			}
 		},
 	}

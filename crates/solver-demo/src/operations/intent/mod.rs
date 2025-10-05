@@ -5,6 +5,7 @@
 //! schemes, and order submission workflows with comprehensive parameter validation.
 
 use crate::{
+	core::logging,
 	types::{chain::ChainId, error::Result},
 	Context, GetQuoteRequest, PostOrderRequest,
 };
@@ -18,7 +19,7 @@ use solver_types::api::{
 use solver_types::standards::eip7930::InteropAddress;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{info, instrument, warn};
+use tracing::instrument;
 
 /// Intent operations handler
 ///
@@ -305,16 +306,13 @@ impl IntentOps {
 	}
 
 	/// Submit an intent (creates an order)
-	#[instrument(skip(self))]
+	#[instrument(skip(self, order))]
 	pub async fn submit(&self, order: PostOrderRequest) -> Result<String> {
 		// Check if this is a Compact order that needs deposit
 		let order_type = order.order.order_type();
 		if order_type == "oif-resource-lock-v0" {
-			info!(
-				order_type = order_type,
-				"Detected Compact order - performing deposit"
-			);
-			info!("Performing compact deposit for resource lock order");
+			use crate::core::logging;
+			logging::verbose_operation("Detected Compact order", "performing deposit");
 			self.deposit_compact_tokens(&order).await?;
 		}
 
@@ -349,12 +347,10 @@ impl IntentOps {
 				// Get user address (sponsor)
 				let user_address = self.extract_user_address(payload)?;
 
-				info!(
-					chain_id = chain_id,
-					token = %token_address,
-					amount = %amount,
-					user = %user_address,
-					"Preparing compact deposit"
+				use crate::core::logging;
+				logging::verbose_operation(
+					"Preparing compact deposit",
+					&format!("chain {}, amount {}", chain_id, amount),
 				);
 
 				// Generate allocator lock tag from allocator address
@@ -370,7 +366,7 @@ impl IntentOps {
 				)
 				.await?;
 
-				info!("Compact deposit operation completed successfully");
+				logging::verbose_success("Compact deposit", "operation completed successfully");
 			},
 			_ => {
 				// Not a resource lock order, no deposit needed
@@ -492,16 +488,13 @@ impl IntentOps {
 		})?;
 
 		// Debug: Look for contracts on chain
-		info!(chain_id = chain.id(), "Looking for contracts on chain");
+		use crate::core::logging;
+		logging::verbose_operation("Looking for contracts", &format!("chain {}", chain.id()));
 		let addresses = contracts.addresses(chain);
-		if let Some(addresses) = addresses {
-			info!(
-				allocator = ?addresses.allocator,
-				compact = ?addresses.compact,
-				"Found contract addresses"
-			);
+		if let Some(_addresses) = addresses {
+			logging::verbose_success("Found contract addresses", &format!("chain {}", chain.id()));
 		} else {
-			warn!(chain_id = chain.id(), "No addresses found for this chain");
+			logging::verbose_operation("No addresses found", &format!("chain {}", chain.id()));
 		}
 		let addresses = contracts.addresses(chain).ok_or_else(|| {
 			crate::types::error::Error::InvalidConfig(format!(
@@ -521,7 +514,10 @@ impl IntentOps {
 		allocator_lock_tag[0] = 0x00; // First byte is 0x00
 		allocator_lock_tag[1..].copy_from_slice(&allocator_address.as_slice()[9..]);
 
-		info!(lock_tag = %hex::encode(allocator_lock_tag), "Generated allocator lock tag");
+		logging::verbose_tech(
+			"Generated allocator lock tag",
+			&hex::encode(allocator_lock_tag),
+		);
 
 		Ok(allocator_lock_tag)
 	}
@@ -569,7 +565,7 @@ impl IntentOps {
 			(compact_address, approve_data, deposit_data)
 		}; // Lock is dropped here
 
-		info!(compact_address = %compact_address, "Using TheCompact contract");
+		logging::verbose_tech("Using TheCompact contract", &compact_address.to_string());
 
 		// Get user's private key and create signer for transactions
 		let private_key_str = self
@@ -594,28 +590,31 @@ impl IntentOps {
 		let tx_builder = TxBuilder::new(provider).with_signer(signer);
 
 		// Step 1: Approve TheCompact to spend tokens
-		info!(amount = %amount, "Sending approval transaction to TheCompact");
+		logging::verbose_operation(
+			"Sending approval transaction",
+			&format!("amount: {}", amount),
+		);
 		let approve_request = TransactionRequest::default()
 			.to(token)
 			.input(approve_data.into());
 
 		let approve_hash = tx_builder.send(approve_request).await?;
-		info!(approve_hash = %approve_hash, "Approval transaction sent");
+		logging::verbose_tech("Approval transaction sent", &format!("{:?}", approve_hash));
 
 		// Wait for approval to be mined before sending deposit
-		info!("Waiting for approval transaction confirmation");
+		logging::verbose_operation("Waiting for confirmation", "approval transaction");
 		let _approve_receipt = tx_builder.wait(approve_hash).await?;
-		info!("Approval transaction confirmed");
+		logging::verbose_success("Approval transaction confirmed", "");
 
 		// Step 2: Send deposit transaction (using pre-computed deposit_data)
 		let deposit_request = TransactionRequest::default()
 			.to(compact_address)
 			.input(deposit_data.into());
 
-		info!("Sending deposit transaction to TheCompact");
+		logging::verbose_operation("Sending deposit transaction", "to TheCompact");
 		let deposit_hash = tx_builder.send(deposit_request).await?;
 
-		info!(deposit_hash = %deposit_hash, "Deposit transaction sent");
+		logging::verbose_tech("Deposit transaction sent", &format!("{:?}", deposit_hash));
 
 		// Wait for confirmation
 		let receipt = tx_builder.wait(deposit_hash).await?;
@@ -626,10 +625,13 @@ impl IntentOps {
 			));
 		}
 
-		info!(
-			deposit_hash = %deposit_hash,
-			block_number = receipt.block_number.unwrap_or_default(),
-			"Deposit transaction confirmed"
+		logging::verbose_success(
+			"Deposit transaction confirmed",
+			&format!(
+				"hash: {:?}, block: {}",
+				deposit_hash,
+				receipt.block_number.unwrap_or_default()
+			),
 		);
 
 		Ok(())

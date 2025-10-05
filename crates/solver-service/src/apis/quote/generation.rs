@@ -886,7 +886,6 @@ impl QuoteGenerator {
 		token_address: &[u8; 20],
 		chain_id: u64,
 	) -> Result<[u8; 32], QuoteError> {
-		use alloy_primitives::hex;
 		use alloy_sol_types::SolCall;
 
 		// Define the DOMAIN_SEPARATOR function
@@ -929,11 +928,6 @@ impl QuoteGenerator {
 
 		let mut domain_separator = [0u8; 32];
 		domain_separator.copy_from_slice(&domain_separator_bytes);
-
-		tracing::info!(
-			"Successfully retrieved domain separator: 0x{}",
-			hex::encode(domain_separator)
-		);
 
 		Ok(domain_separator)
 	}

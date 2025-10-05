@@ -1,11 +1,10 @@
 //! Command-line interface definitions and parsing
 //!
 //! This module defines the CLI structure using clap, including the main
-//! command parser, subcommand definitions, and output formatting utilities.
-//! Provides the entry point for all CLI operations.
+//! command parser and subcommand definitions. Provides the entry point
+//! for all CLI operations.
 
 pub mod commands;
-pub mod output;
 
 use clap::{Parser, Subcommand};
 
@@ -18,6 +17,10 @@ use clap::{Parser, Subcommand};
 #[command(about = "OIF Solver Demo - Test and demonstrate cross-chain intent resolution")]
 #[command(version)]
 pub struct Cli {
+	/// Enable verbose logging (sets RUST_LOG=debug)
+	#[arg(short, long, global = true)]
+	pub verbose: bool,
+
 	#[command(subcommand)]
 	pub command: Commands,
 }

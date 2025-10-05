@@ -4,12 +4,12 @@
 //! token refresh, validation, and automatic token renewal. Handles secure storage
 //! and retrieval of access and refresh tokens with proper expiration checking.
 
+use crate::core::logging;
 use crate::types::error::{Error, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::{debug, info};
 
 /// Authentication response from JWT token endpoints
 ///
@@ -96,10 +96,11 @@ impl JwtService {
 		if let Some(stored_token) = session_store.get_jwt_token("api_client") {
 			// Double-check token validity by parsing expiration
 			if self.is_token_valid(&stored_token)? {
-				debug!("Using valid stored JWT token");
+				use crate::core::logging;
+				logging::debug_operation("JWT token", "using valid stored token");
 				return Ok(stored_token);
 			} else {
-				debug!("Stored JWT token is expired or invalid");
+				logging::debug_operation("JWT token", "stored token is expired or invalid");
 			}
 		}
 
@@ -109,7 +110,10 @@ impl JwtService {
 		}
 
 		// Fall back to full registration
-		debug!("Registering new client and obtaining JWT token");
+		logging::debug_operation(
+			"JWT authentication",
+			"registering new client and obtaining token",
+		);
 		self.register_and_get_token(session_store).await
 	}
 
@@ -145,7 +149,8 @@ impl JwtService {
 			)?;
 		}
 
-		info!("Stored JWT tokens for client {}", token_response.client_id);
+		use crate::core::logging;
+		logging::verbose_success("Stored JWT tokens for client", &token_response.client_id);
 		Ok(token_response.access_token)
 	}
 
@@ -213,7 +218,7 @@ impl JwtService {
 		session_store: &crate::core::session::SessionStore,
 	) -> Result<String> {
 		if let Some(stored_refresh_token) = session_store.get_jwt_token("api_client_refresh") {
-			debug!("Attempting to refresh access token");
+			logging::debug_operation("JWT token", "attempting to refresh access token");
 
 			let token_response = self.refresh_access_token(&stored_refresh_token).await?;
 
@@ -233,7 +238,7 @@ impl JwtService {
 				)?;
 			}
 
-			info!("Successfully refreshed access token");
+			logging::verbose_success("Successfully refreshed access token", "");
 			return Ok(token_response.access_token);
 		}
 

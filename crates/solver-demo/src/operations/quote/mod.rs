@@ -5,7 +5,7 @@
 //! generation, and order creation with comprehensive testing capabilities.
 
 use crate::{
-	cli::output::Display,
+	core::logging,
 	types::{
 		chain::ChainId,
 		error::{Error, Result},
@@ -15,7 +15,7 @@ use crate::{
 use alloy_primitives::U256;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{info, instrument, warn};
+use tracing::instrument;
 
 /// Quote operations handler
 ///
@@ -50,9 +50,11 @@ impl QuoteOps {
 	/// Returns error if request file missing, API call fails, or response invalid
 	#[instrument(skip(self))]
 	pub async fn get(&self, input_file: &std::path::Path) -> Result<GetQuoteResponse> {
-		info!(
-			input_file = %input_file.display(),
-			"Processing quote request"
+		use crate::core::logging;
+
+		logging::verbose_operation(
+			"Processing quote request",
+			&input_file.display().to_string(),
 		);
 
 		if !input_file.exists() {
@@ -72,12 +74,12 @@ impl QuoteOps {
 			let output_file = parent_dir.join("get_quote.res.json");
 			let content = serde_json::to_string_pretty(&response)?;
 			std::fs::write(&output_file, content)?;
-			info!(output_file = %output_file.display(), "Quote response saved to file");
+			logging::verbose_tech("Quote response saved", &output_file.display().to_string());
 		}
 
-		info!(
-			quote_count = response.quotes.len(),
-			"Quote request completed successfully"
+		logging::verbose_success(
+			"Quote request completed",
+			&format!("{} quotes received", response.quotes.len()),
 		);
 
 		Ok(response)
@@ -93,9 +95,11 @@ impl QuoteOps {
 	///
 	/// # Errors
 	/// Returns error if no quotes available, signing fails, or signature invalid
-	#[instrument(skip(self))]
+	#[instrument(skip(self, quote_response))]
 	pub async fn sign(&self, quote_response: GetQuoteResponse) -> Result<PostOrderRequest> {
-		info!("Starting quote signing process");
+		use crate::core::logging;
+
+		logging::verbose_operation("Starting quote signing", "processing signature");
 
 		let quote = quote_response
 			.quotes
@@ -115,29 +119,24 @@ impl QuoteOps {
 			origin_submission: None,
 		};
 
-		info!(quote_id = %quote.quote_id, "Quote signing completed successfully");
+		logging::verbose_success("Quote signed", &format!("quote ID: {}", quote.quote_id));
 
 		Ok(order_request)
 	}
 
 	#[instrument(skip(self))]
 	pub async fn test(&self, params: TestQuoteParams) -> Result<TestQuoteResults> {
-		info!(
-			from_chain = ?params.from_chain,
-			to_chain = ?params.to_chain,
-			from_token = params.from_token,
-			to_token = params.to_token,
-			count = params.count,
-			"Starting quote testing"
-		);
-
-		info!(
-			from_chain = ?params.from_chain,
-			to_chain = ?params.to_chain,
-			from_token = %params.from_token,
-			to_token = %params.to_token,
-			count = params.count,
-			"Starting quote testing"
+		use crate::core::logging;
+		logging::verbose_tech(
+			"Starting quote testing",
+			&format!(
+				"from {}:{} to {}:{}, count: {}",
+				params.from_chain,
+				params.from_token,
+				params.to_chain,
+				params.to_token,
+				params.count
+			),
 		);
 
 		let mut results = TestQuoteResults {
@@ -152,10 +151,9 @@ impl QuoteOps {
 		let mut total_time = Duration::ZERO;
 
 		for i in 0..params.count {
-			info!(
-				test_number = i + 1,
-				total_tests = params.count,
-				"Running quote test"
+			logging::verbose_operation(
+				&format!("Running quote test {} of {}", i + 1, params.count),
+				"",
 			);
 
 			let amount = params.base_amount * U256::from(i + 1);
@@ -190,16 +188,14 @@ impl QuoteOps {
 						results.worst_rate = Some(rate);
 					}
 
-					info!(
-						test_number = i + 1,
-						duration_ms = duration.as_millis(),
-						rate = rate,
-						"Quote test successful"
+					logging::verbose_success(
+						&format!("Quote test {} successful", i + 1),
+						&format!("{}ms, rate: {}", duration.as_millis(), rate),
 					);
 				},
 				Err(e) => {
 					results.failed += 1;
-					warn!(test_number = i + 1, error = %e, "Quote test failed");
+					logging::warning(&format!("Quote test {} failed: {}", i + 1, e));
 				},
 			}
 		}
@@ -262,18 +258,13 @@ impl QuoteOps {
 	}
 
 	fn display_test_summary(&self, results: &TestQuoteResults) {
-		Display::header("Test Summary");
-
-		info!(
-			total_tests = results.total,
-			successful = results.successful,
-			failed = results.failed,
-			success_rate = (results.successful as f64 / results.total as f64) * 100.0,
-			average_time_ms = results.average_time_ms,
-			best_rate = results.best_rate,
-			worst_rate = results.worst_rate,
-			"Quote test summary completed"
-		);
+		logging::success(&format!(
+			"Quote test summary: {}/{} successful ({:.1}%), avg {}ms",
+			results.successful,
+			results.total,
+			(results.successful as f64 / results.total as f64) * 100.0,
+			results.average_time_ms
+		));
 	}
 
 	/// Get quote and sign it - pure business logic without file I/O

@@ -7,7 +7,10 @@
 
 use crate::{
 	constants,
-	core::blockchain::{Provider, TxBuilder},
+	core::{
+		blockchain::{Provider, TxBuilder},
+		logging,
+	},
 	types::{
 		chain::ChainId,
 		error::{Error, Result},
@@ -24,7 +27,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{info, warn};
 
 /// Contract deployment operations handler
 ///
@@ -80,7 +82,8 @@ impl ContractDeployer {
 	/// Returns error if deployment fails, transaction verification fails,
 	/// or contract artifacts are missing
 	pub async fn deploy_to_chain(&self, chain: ChainId) -> Result<ContractAddresses> {
-		info!(chain = %chain, "Starting contract deployment");
+		use crate::core::logging;
+		logging::verbose_operation("Starting contract deployment", &format!("chain {}", chain));
 
 		// Create provider for this chain
 		let provider = self.ctx.provider(chain).await?;
@@ -122,7 +125,7 @@ impl ContractDeployer {
 			tokens,
 		};
 
-		info!(chain = %chain, "Contract deployment completed successfully");
+		logging::verbose_success("Contract deployment completed", &format!("chain {}", chain));
 		Ok(addresses)
 	}
 
@@ -164,7 +167,10 @@ impl ContractDeployer {
 			.contract_address
 			.ok_or_else(|| Error::DeploymentFailed("No contract address in receipt".to_string()))?;
 
-		info!(contract_name = contract_name, address = %address, "Contract deployed successfully");
+		logging::verbose_success(
+			"Contract deployed",
+			&format!("{} at {}", contract_name, address),
+		);
 		Ok(address)
 	}
 
@@ -230,21 +236,22 @@ impl ContractDeployer {
 		// Check if we should use canonical Permit2 address
 		if !self.ctx.is_local() {
 			// Use canonical Permit2 address on mainnet/testnets
-			let address = constants::PERMIT2_ADDRESS
+			let address: Address = constants::PERMIT2_ADDRESS
 				.parse()
 				.map_err(|e| Error::InvalidConfig(format!("Invalid Permit2 address: {}", e)))?;
-			info!(address = %address, "Using canonical Permit2 address");
+			logging::verbose_tech("Using canonical Permit2", &address.to_string());
 			return Ok(address);
 		}
 
 		// Deploy locally using embedded bytecode
 		match self.deploy_permit2_from_bytecode(provider).await {
 			Ok(address) => {
-				info!(address = %address, "Permit2 deployed successfully");
+				logging::verbose_success("Permit2 deployed", &address.to_string());
 				Ok(address)
 			},
 			Err(e) => {
-				warn!(error = %e, "Permit2 deployment failed");
+				use crate::core::logging;
+				logging::warning(&format!("Permit2 deployment failed: {}", e));
 				Err(Error::DeploymentFailed(format!(
 					"Failed to deploy permit2 from bytecode: {}",
 					e
@@ -367,7 +374,7 @@ impl ContractDeployer {
 			(tokb, constants::DEFAULT_TOKEN_DECIMALS),
 		);
 
-		info!("Test tokens deployment completed");
+		logging::verbose_success("Test tokens deployment", "completed");
 		Ok(tokens)
 	}
 
@@ -390,7 +397,10 @@ impl ContractDeployer {
 		let address = self
 			.deploy_contract(provider, "MockERC20", Some(encoded_args))
 			.await?;
-		info!(symbol = symbol, name = name, decimals = decimals, address = %address, "Test token deployed");
+		logging::verbose_success(
+			"Test token deployed",
+			&format!("{} ({}) at {}", symbol, name, address),
+		);
 		Ok(address)
 	}
 
@@ -414,7 +424,10 @@ impl ContractDeployer {
 		let tx_builder = TxBuilder::new(provider).with_signer(signer);
 		let _receipt = tx_builder.send_and_wait(tx).await?;
 
-		info!(account = %account, amount = %amount, "Account funded successfully");
+		logging::verbose_success(
+			"Account funded",
+			&format!("{} with {} ETH", account, amount),
+		);
 		Ok(())
 	}
 
@@ -424,7 +437,10 @@ impl ContractDeployer {
 		contract_name: &str,
 		chain: ChainId,
 	) -> Result<Address> {
-		info!(contract_name = contract_name, chain = %chain, "Starting single contract deployment");
+		logging::verbose_operation(
+			"Starting single contract deployment",
+			&format!("{} on chain {}", contract_name, chain),
+		);
 
 		// Create provider for this chain
 		let provider = self.ctx.provider(chain).await?;

@@ -14,10 +14,13 @@ use alloy_signer_local::PrivateKeySigner;
 pub use anvil::AnvilManager;
 pub use deploy::ContractDeployer;
 use std::{str::FromStr, sync::Arc};
-use tracing::{info, instrument, warn};
+use tracing::instrument;
 
 use crate::{
-	core::blockchain::{Provider, TxBuilder},
+	core::{
+		blockchain::{Provider, TxBuilder},
+		logging,
+	},
 	types::{
 		chain::ChainId,
 		error::{Error, Result},
@@ -82,7 +85,7 @@ impl EnvOps {
 			));
 		}
 
-		info!("Starting local environment with Anvil chains");
+		use crate::core::logging;
 
 		// Check all chains first and collect any that are already running
 		let chains = self.ctx.config.chains();
@@ -97,18 +100,17 @@ impl EnvOps {
 			}
 		}
 
-		// Report already running chains
+		// Report already running chains in verbose mode
 		if !already_running.is_empty() {
-			info!(
-				already_running_count = already_running.len(),
-				chains = ?already_running,
-				"Some chains already running"
+			logging::verbose_operation(
+				"Chains already running",
+				&format!("{}/{}", already_running.len(), chains.len()),
 			);
 		}
 
 		// If all chains are running, just report status
 		if to_start.is_empty() {
-			info!("All chains are already running, no action needed");
+			logging::verbose_operation("All chains running", "no action needed");
 			return Ok(());
 		}
 
@@ -122,10 +124,9 @@ impl EnvOps {
 			self.anvil.wait_for_chain(*chain).await?;
 		}
 
-		info!(
-			started_chains = to_start.len(),
-			total_chains = chains.len(),
-			"Environment startup completed successfully"
+		logging::verbose_success(
+			"Environment startup",
+			&format!("{} chains started", to_start.len()),
 		);
 		Ok(())
 	}
@@ -133,12 +134,12 @@ impl EnvOps {
 	/// Stop the local environment
 	#[instrument(skip(self))]
 	pub fn stop(&mut self) -> Result<()> {
-		info!("Stopping all Anvil processes");
+		use crate::core::logging;
 
 		// Stop all Anvil processes
 		self.anvil.stop_all()?;
 
-		info!("Local environment shutdown completed");
+		logging::verbose_success("Environment shutdown", "all Anvil processes stopped");
 		Ok(())
 	}
 
@@ -158,12 +159,17 @@ impl EnvOps {
 	pub async fn deploy(&mut self, force: bool) -> Result<()> {
 		let chains = self.ctx.config.chains();
 
+		use crate::core::logging;
+
 		// Filter chains that need deployment
 		let chains_to_deploy: Vec<ChainId> = chains
 			.into_iter()
 			.filter(|&chain| {
 				if !force && self.ctx.session.has_contracts(chain) {
-					info!(chain = %chain, "Chain already has contracts deployed, skipping");
+					logging::verbose_operation(
+						"Skipping chain",
+						&format!("{} (already deployed)", chain),
+					);
 					false
 				} else {
 					true
@@ -172,7 +178,7 @@ impl EnvOps {
 			.collect();
 
 		if chains_to_deploy.is_empty() {
-			info!("All chains already have contracts deployed");
+			logging::verbose_operation("Deployment status", "all chains already deployed");
 			return Ok(());
 		}
 
@@ -183,7 +189,7 @@ impl EnvOps {
 			let deployer = self.deployer.clone();
 			let chain = *chain;
 
-			info!(chain = %chain, "Starting contract deployment to chain");
+			logging::verbose_operation("Starting deployment", &format!("chain {}", chain));
 			let handle = tokio::spawn(async move {
 				let addresses = deployer.deploy_to_chain(chain).await?;
 				Ok::<(ChainId, crate::types::session::ContractAddresses), Error>((chain, addresses))
@@ -250,7 +256,7 @@ impl EnvOps {
 				}
 			}
 
-			info!(chain = %chain, "Successfully deployed contracts to chain");
+			logging::verbose_success("Deployment completed", &format!("chain {}", chain));
 		}
 
 		Ok(())
@@ -291,7 +297,10 @@ impl EnvOps {
 					.set_single_contract(chain, contract_name, address)?;
 			}
 
-			info!(contract_name = contract_name, chain = %chain, address = %address, "Contract deployed successfully");
+			logging::verbose_success(
+				"Contract deployed",
+				&format!("{} on chain {} at {}", contract_name, chain, address),
+			);
 
 			// Handle TOML updates based on environment
 			if self.ctx.is_local() {
@@ -300,18 +309,19 @@ impl EnvOps {
 					.await?;
 			} else {
 				// Production: log that manual update is needed
-				warn!(
-					contract_name = contract_name,
-					chain = %chain,
-					address = %address,
-					"Production deployment: manual TOML config update required"
+				logging::verbose_operation(
+					"Production deployment",
+					&format!(
+						"manual TOML update required for {} on chain {}",
+						contract_name, chain
+					),
 				);
 			}
 		}
 
-		info!(
-			contract_name = contract_name,
-			"Contract deployment completed successfully"
+		logging::verbose_success(
+			"Single contract deployment",
+			&format!("{} completed successfully", contract_name),
 		);
 		Ok(())
 	}
@@ -336,10 +346,7 @@ impl EnvOps {
 		} else {
 			self.ctx.config.chains()
 		};
-		info!(
-			chain_count = chain_ids.len(),
-			"Starting test environment setup"
-		);
+		logging::verbose_operation("Starting setup", &format!("{} chains", chain_ids.len()));
 
 		// Create setup tasks for all chains
 		let mut setup_handles = Vec::new();
@@ -348,7 +355,7 @@ impl EnvOps {
 			let ctx = self.ctx.clone();
 			let chain = *chain;
 
-			info!(chain = %chain, "Starting test environment setup for chain");
+			logging::verbose_operation("Setup starting", &format!("chain {}", chain));
 			let handle = tokio::spawn(async move {
 				Self::setup_single_chain(ctx, chain, amount).await?;
 				Ok::<ChainId, crate::types::error::Error>(chain)
@@ -362,12 +369,12 @@ impl EnvOps {
 			let chain = handle
 				.await
 				.map_err(|e| Error::Other(anyhow::anyhow!("Setup task failed: {}", e)))??;
-			info!(chain = %chain, "Chain setup completed successfully");
+			logging::verbose_success("Chain setup completed", &format!("chain {}", chain));
 		}
 
-		info!(
-			chain_count = chain_ids.len(),
-			"Test environment setup completed successfully for all chains"
+		logging::verbose_success(
+			"Environment setup",
+			&format!("{} chains completed", chain_ids.len()),
 		);
 		Ok(())
 	}
@@ -395,7 +402,11 @@ impl EnvOps {
 		// Get token addresses
 		let tokens = &contracts.tokens;
 		if tokens.is_empty() {
-			warn!(chain = %chain, "No tokens found for chain, skipping token operations");
+			use crate::core::logging;
+			logging::warning(&format!(
+				"No tokens found for chain {}, skipping token operations",
+				chain
+			));
 			return Ok(());
 		}
 
@@ -405,11 +416,9 @@ impl EnvOps {
 			let mint_amount =
 				U256::from(amount) * U256::from(10).pow(U256::from(token_info.decimals));
 
-			info!(
-				chain = %chain,
-				symbol = symbol,
-				amount = amount,
-				"Minting tokens to user and solver"
+			logging::verbose_operation(
+				"Minting tokens",
+				&format!("{} {} on chain {}", amount, symbol, chain),
 			);
 
 			// Mint to user
@@ -424,11 +433,17 @@ impl EnvOps {
 			{
 				Ok(result) => {
 					if let Some(tx_hash) = result.tx_hash {
-						info!(chain = %chain, symbol = symbol, tx_hash = %tx_hash, "User mint transaction completed");
+						logging::verbose_tech(
+							"User mint completed",
+							&format!("{} on chain {} (tx: {:?})", symbol, chain, tx_hash),
+						);
 					}
 				},
 				Err(e) => {
-					warn!(chain = %chain, symbol = symbol, error = %e, "Failed to mint tokens to user");
+					logging::warning(&format!(
+						"Failed to mint {} tokens to user on chain {}: {}",
+						symbol, chain, e
+					));
 					continue;
 				},
 			}
@@ -445,16 +460,25 @@ impl EnvOps {
 			{
 				Ok(result) => {
 					if let Some(tx_hash) = result.tx_hash {
-						info!(chain = %chain, symbol = symbol, tx_hash = %tx_hash, "Solver mint transaction completed");
+						logging::verbose_tech(
+							"Solver mint completed",
+							&format!("{} on chain {} (tx: {:?})", symbol, chain, tx_hash),
+						);
 					}
 				},
 				Err(e) => {
-					warn!(chain = %chain, symbol = symbol, error = %e, "Failed to mint tokens to solver");
+					logging::warning(&format!(
+						"Failed to mint {} tokens to solver on chain {}: {}",
+						symbol, chain, e
+					));
 					continue;
 				},
 			}
 
-			info!(chain = %chain, symbol = symbol, "Token minting completed successfully");
+			logging::verbose_success(
+				"Token minting completed",
+				&format!("{} on chain {}", symbol, chain),
+			);
 		}
 
 		// Approve permit2 allowances for input settlers
@@ -466,10 +490,9 @@ impl EnvOps {
 			// Approve for all tokens
 			for symbol in tokens.keys() {
 				if let Some(_input_settler_addr) = &contracts.input_settler {
-					info!(
-						chain = %chain,
-						symbol = symbol,
-						"Approving token for Permit2 -> InputSettler"
+					logging::verbose_operation(
+						"Approving token",
+						&format!("{} for Permit2 -> InputSettler on chain {}", symbol, chain),
 					);
 					match token_ops
 						.approve(chain, symbol, &permit2_address.to_string(), None)
@@ -477,20 +500,28 @@ impl EnvOps {
 					{
 						Ok(result) => {
 							if let Some(tx_hash) = result.tx_hash {
-								info!(chain = %chain, symbol = symbol, tx_hash = %tx_hash, "InputSettler approval transaction completed");
+								logging::verbose_tech(
+									"InputSettler approval completed",
+									&format!("{} on chain {} (tx: {:?})", symbol, chain, tx_hash),
+								);
 							}
 						},
 						Err(e) => {
-							warn!(chain = %chain, symbol = symbol, error = %e, "Failed to approve token for Permit2 -> InputSettler");
+							logging::warning(&format!(
+								"Failed to approve {} for Permit2 -> InputSettler on chain {}: {}",
+								symbol, chain, e
+							));
 						},
 					}
 				}
 
 				if let Some(_input_settler_compact_addr) = &contracts.input_settler_compact {
-					info!(
-						chain = %chain,
-						symbol = symbol,
-						"Approving token for Permit2 -> InputSettlerCompact"
+					logging::verbose_operation(
+						"Approving token",
+						&format!(
+							"{} for Permit2 -> InputSettlerCompact on chain {}",
+							symbol, chain
+						),
 					);
 					match token_ops
 						.approve(chain, symbol, &permit2_address.to_string(), None)
@@ -498,27 +529,28 @@ impl EnvOps {
 					{
 						Ok(result) => {
 							if let Some(tx_hash) = result.tx_hash {
-								info!(chain = %chain, symbol = symbol, tx_hash = %tx_hash, "InputSettlerCompact approval transaction completed");
+								logging::verbose_tech(
+									"InputSettlerCompact approval completed",
+									&format!("{} on chain {} (tx: {:?})", symbol, chain, tx_hash),
+								);
 							}
 						},
 						Err(e) => {
-							warn!(chain = %chain, symbol = symbol, error = %e, "Failed to approve token for Permit2 -> InputSettlerCompact");
+							logging::warning(&format!("Failed to approve {} for Permit2 -> InputSettlerCompact on chain {}: {}", symbol, chain, e));
 						},
 					}
 				}
 			}
 
-			info!(chain = %chain, "Permit2 allowances approved successfully");
+			logging::verbose_success("Permit2 allowances approved", &format!("chain {}", chain));
 		}
 
 		// Register allocator with TheCompact
 		if let Some(compact_addr) = &contracts.compact {
 			if let Some(allocator_addr) = &contracts.allocator {
-				info!(
-					chain = %chain,
-					compact_addr = compact_addr,
-					allocator_addr = allocator_addr,
-					"Registering allocator with TheCompact"
+				logging::verbose_operation(
+					"Registering allocator with TheCompact",
+					&format!("chain {}", chain),
 				);
 				Self::register_allocator_with_compact_static(
 					&provider,
@@ -526,7 +558,7 @@ impl EnvOps {
 					allocator_addr,
 				)
 				.await?;
-				info!(chain = %chain, "Allocator registered with TheCompact successfully");
+				logging::verbose_success("Allocator registered", &format!("chain {}", chain));
 			}
 		}
 
@@ -567,11 +599,9 @@ impl EnvOps {
 		let tx_builder = TxBuilder::new(provider.clone()).with_signer(signer);
 		let receipt = tx_builder.send_and_wait(tx).await?;
 
-		info!(
-			allocator_address = %allocator_address,
-			compact_address = %compact_address,
-			tx_hash = %receipt.transaction_hash,
-			"Allocator registered with TheCompact transaction completed"
+		logging::verbose_tech(
+			"Allocator registration completed",
+			&format!("tx: {:?}", receipt.transaction_hash),
 		);
 
 		Ok(())
@@ -593,10 +623,10 @@ impl EnvOps {
 		let placeholder_address = self.ctx.session.get_placeholder_address(placeholder_key);
 
 		if placeholder_address.is_none() {
-			warn!(
-				placeholder_key = placeholder_key,
-				"No placeholder address found for key in session"
-			);
+			logging::warning(&format!(
+				"No placeholder address found for key {} in session",
+				placeholder_key
+			));
 			return Ok(());
 		}
 
@@ -669,11 +699,11 @@ impl EnvOps {
 
 		// Check if any replacement was made
 		if !replacement_made {
-			warn!(
-				placeholder_address = placeholder_address,
-				target_file = %target_file.display(),
-				"Placeholder address not found in target file"
-			);
+			logging::warning(&format!(
+				"Placeholder address {} not found in target file {}",
+				placeholder_address,
+				target_file.display()
+			));
 			return Ok(());
 		}
 
