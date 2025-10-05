@@ -103,16 +103,7 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 		let struct_hash = message_hasher.compute_message_hash(&order_bytes, contract_address)?;
 
 		// 3. Extract signature using interface
-		// Use the first signature from the array
-		let signature_bytes = intent
-			.signature
-			.first()
-			.ok_or_else(|| APIError::BadRequest {
-				error_type: ApiErrorType::MissingSignature,
-				message: "No signature provided".to_string(),
-				details: None,
-			})?;
-		let signature = signature_validator.extract_signature(signature_bytes);
+		let signature = signature_validator.extract_signature(&intent.signature);
 
 		// 4. Validate EIP-712 signature using interface
 		let expected_signer = standard_order.user;

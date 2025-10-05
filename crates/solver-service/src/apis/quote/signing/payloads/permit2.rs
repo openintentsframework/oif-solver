@@ -22,10 +22,9 @@ use crate::apis::quote::registry::PROTOCOL_REGISTRY;
 use alloy_primitives::{keccak256, B256, U256};
 use serde_json::json;
 use solver_config::{Config, QuoteConfig};
-use solver_settlement::SettlementInterface;
 use solver_types::utils::{
 	bytes20_to_alloy_address, DOMAIN_TYPE, MANDATE_OUTPUT_TYPE, NAME_PERMIT2, PERMIT2_WITNESS_TYPE,
-	PERMIT_BATCH_WITNESS_TYPE, TOKEN_PERMISSIONS_TYPE, ZERO_BYTES32,
+	PERMIT_BATCH_WITNESS_TYPE, TOKEN_PERMISSIONS_TYPE,
 };
 use solver_types::{
 	utils::{compute_final_digest, Eip712AbiEncoder},
@@ -35,8 +34,8 @@ use solver_types::{
 pub fn build_permit2_batch_witness_digest(
 	request: &GetQuoteRequest,
 	config: &Config,
-	_settlement: &dyn SettlementInterface, // Kept for potential future use
-	selected_oracle: solver_types::Address,
+	input_oracle: solver_types::Address,
+	output_oracle: solver_types::Address,
 ) -> Result<(B256, serde_json::Value), QuoteError> {
 	// TODO: Implement support for multi-input/outputs
 	let input = &request.intent.inputs[0];
@@ -109,24 +108,29 @@ pub fn build_permit2_batch_witness_digest(
 		})?;
 
 	// Use the pre-selected oracle address
-	let input_oracle = bytes20_to_alloy_address(&selected_oracle.0)
+	let input_oracle = bytes20_to_alloy_address(&input_oracle.0)
 		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid oracle address: {}", e)))?;
 
 	// Nonce and deadlines
 	let now_secs = chrono::Utc::now().timestamp() as u64;
 	let nonce_ms: U256 = U256::from((chrono::Utc::now().timestamp_millis()) as u128);
 
-	// Use minValidUntil from request if provided, otherwise use configured validity
-	let intent_validity_seconds = request.intent.min_valid_until.unwrap_or_else(|| {
-		config
+	// Use minValidUntil from request if provided (as absolute timestamp), otherwise use configured validity duration
+	let deadline_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until {
+		// min_valid_until is an absolute timestamp
+		min_valid_until
+	} else {
+		// Use configured validity duration added to current time
+		let validity_seconds = config
 			.api
 			.as_ref()
 			.and_then(|api| api.quote.as_ref())
 			.map(|quote| quote.validity_seconds)
-			.unwrap_or_else(|| QuoteConfig::default().validity_seconds)
-	});
-	let deadline_secs: U256 = U256::from(now_secs + intent_validity_seconds);
-	let expires_secs: u32 = (now_secs + intent_validity_seconds) as u32;
+			.unwrap_or_else(|| QuoteConfig::default().validity_seconds);
+		now_secs + validity_seconds
+	};
+	let deadline_secs: U256 = U256::from(deadline_timestamp);
+	let expires_secs: u32 = deadline_timestamp as u32;
 
 	// Type hashes
 	let domain_type_hash = keccak256(DOMAIN_TYPE.as_bytes());
@@ -223,12 +227,12 @@ pub fn build_permit2_batch_witness_digest(
 			"expires": expires_secs,
 			"inputOracle": format!("0x{:x}", input_oracle),
 			"outputs": [{
-				"oracle": ZERO_BYTES32,
-				"settler": format!("0x{}{:x}", "0".repeat(24), output_settler),
+				"oracle": solver_types::utils::address_to_bytes32_hex(&bytes20_to_alloy_address(&output_oracle.0).map_err(QuoteError::InvalidRequest)?),
+				"settler": solver_types::utils::address_to_bytes32_hex(&output_settler),
 				"chainId": dest_chain_id,
-				"token": format!("0x{}{:x}", "0".repeat(24), dest_token),
+				"token": solver_types::utils::address_to_bytes32_hex(&dest_token),
 				"amount": output_amount.to_string(),
-				"recipient": format!("0x{}{:x}", "0".repeat(24), recipient),
+				"recipient": solver_types::utils::address_to_bytes32_hex(&recipient),
 				"call": "0x",
 				"context": "0x"
 			}]
@@ -242,10 +246,7 @@ pub fn build_permit2_batch_witness_digest(
 mod tests {
 	use super::*;
 	use alloy_primitives::{address, U256};
-	use solver_config::{
-		ApiConfig, Config, ConfigBuilder, DomainConfig, QuoteConfig, SettlementConfig,
-	};
-	use solver_settlement::MockSettlementInterface;
+	use solver_config::{ApiConfig, Config, ConfigBuilder, QuoteConfig, SettlementConfig};
 	use solver_types::{
 		parse_address,
 		standards::eip7930::InteropAddress,
@@ -275,10 +276,6 @@ mod tests {
 
 		let settlement_config = SettlementConfig {
 			implementations: HashMap::new(),
-			domain: Some(DomainConfig {
-				chain_id: 1,
-				address: "0x1234567890123456789012345678901234567890".to_string(),
-			}),
 			settlement_poll_interval_seconds: 3,
 		};
 
@@ -346,11 +343,17 @@ mod tests {
 	fn test_build_permit2_batch_witness_digest_success() {
 		let config = create_test_config();
 		let request = create_test_quote_request();
-		let settlement = MockSettlementInterface::new();
-		let oracle_address = parse_address("0x9999999999999999999999999999999999999999").unwrap();
+		let input_oracle_address =
+			parse_address("0x1999999999999999999999999999999999999999").unwrap();
+		let output_oracle_address =
+			parse_address("0x2999999999999999999999999999999999999999").unwrap();
 
-		let result =
-			build_permit2_batch_witness_digest(&request, &config, &settlement, oracle_address);
+		let result = build_permit2_batch_witness_digest(
+			&request,
+			&config,
+			input_oracle_address,
+			output_oracle_address,
+		);
 
 		assert!(result.is_ok(), "Expected successful digest generation");
 
@@ -400,11 +403,17 @@ mod tests {
 		let config = create_test_config();
 		let mut request = create_test_quote_request();
 		request.intent.outputs.clear(); // Remove all outputs
-		let settlement = MockSettlementInterface::new();
-		let oracle_address = parse_address("0x9999999999999999999999999999999999999999").unwrap();
+		let input_oracle_address =
+			parse_address("0x1999999999999999999999999999999999999999").unwrap();
+		let output_oracle_address =
+			parse_address("0x2999999999999999999999999999999999999999").unwrap();
 
-		let result =
-			build_permit2_batch_witness_digest(&request, &config, &settlement, oracle_address);
+		let result = build_permit2_batch_witness_digest(
+			&request,
+			&config,
+			input_oracle_address,
+			output_oracle_address,
+		);
 
 		assert!(result.is_err());
 		match result.err().unwrap() {
@@ -427,11 +436,17 @@ mod tests {
 		);
 		request.intent.inputs[0].asset = invalid_asset;
 
-		let settlement = MockSettlementInterface::new();
-		let oracle_address = parse_address("0x9999999999999999999999999999999999999999").unwrap();
+		let input_oracle_address =
+			parse_address("0x1999999999999999999999999999999999999999").unwrap();
+		let output_oracle_address =
+			parse_address("0x2999999999999999999999999999999999999999").unwrap();
 
-		let result =
-			build_permit2_batch_witness_digest(&request, &config, &settlement, oracle_address);
+		let result = build_permit2_batch_witness_digest(
+			&request,
+			&config,
+			input_oracle_address,
+			output_oracle_address,
+		);
 
 		assert!(result.is_err());
 		match result.err().unwrap() {
@@ -454,11 +469,17 @@ mod tests {
 		);
 		request.intent.outputs[0].asset = invalid_asset;
 
-		let settlement = MockSettlementInterface::new();
-		let oracle_address = parse_address("0x9999999999999999999999999999999999999999").unwrap();
+		let input_oracle_address =
+			parse_address("0x1999999999999999999999999999999999999999").unwrap();
+		let output_oracle_address =
+			parse_address("0x2999999999999999999999999999999999999999").unwrap();
 
-		let result =
-			build_permit2_batch_witness_digest(&request, &config, &settlement, oracle_address);
+		let result = build_permit2_batch_witness_digest(
+			&request,
+			&config,
+			input_oracle_address,
+			output_oracle_address,
+		);
 
 		assert!(result.is_err());
 		match result.err().unwrap() {
@@ -494,11 +515,17 @@ mod tests {
 
 		config.networks.insert(56, bsc_network);
 
-		let settlement = MockSettlementInterface::new();
-		let oracle_address = parse_address("0x9999999999999999999999999999999999999999").unwrap();
+		let input_oracle_address =
+			parse_address("0x1999999999999999999999999999999999999999").unwrap();
+		let output_oracle_address =
+			parse_address("0x2999999999999999999999999999999999999999").unwrap();
 
-		let result =
-			build_permit2_batch_witness_digest(&request, &config, &settlement, oracle_address);
+		let result = build_permit2_batch_witness_digest(
+			&request,
+			&config,
+			input_oracle_address,
+			output_oracle_address,
+		);
 
 		// This will likely fail because Permit2 is not deployed on chain 56
 		// The exact error depends on the protocol registry implementation
@@ -518,11 +545,17 @@ mod tests {
 			.validity_seconds = 600; // 10 minutes
 
 		let request = create_test_quote_request();
-		let settlement = MockSettlementInterface::new();
-		let oracle_address = parse_address("0x9999999999999999999999999999999999999999").unwrap();
+		let input_oracle_address =
+			parse_address("0x1999999999999999999999999999999999999999").unwrap();
+		let output_oracle_address =
+			parse_address("0x2999999999999999999999999999999999999999").unwrap();
 
-		let result =
-			build_permit2_batch_witness_digest(&request, &config, &settlement, oracle_address);
+		let result = build_permit2_batch_witness_digest(
+			&request,
+			&config,
+			input_oracle_address,
+			output_oracle_address,
+		);
 
 		assert!(result.is_ok());
 
@@ -548,22 +581,28 @@ mod tests {
 	fn test_build_permit2_batch_witness_digest_deterministic() {
 		let config = create_test_config();
 		let request = create_test_quote_request();
-		let settlement = MockSettlementInterface::new();
-		let oracle_address = parse_address("0x9999999999999999999999999999999999999999").unwrap();
+		let input_oracle_address =
+			parse_address("0x1999999999999999999999999999999999999999").unwrap();
+		let output_oracle_address =
+			parse_address("0x2999999999999999999999999999999999999999").unwrap();
 
 		// Build digest twice with same inputs
 		let result1 = build_permit2_batch_witness_digest(
 			&request,
 			&config,
-			&settlement,
-			oracle_address.clone(),
+			input_oracle_address.clone(),
+			output_oracle_address.clone(),
 		);
 
 		// Wait a moment to ensure different timestamp
 		std::thread::sleep(std::time::Duration::from_millis(1));
 
-		let result2 =
-			build_permit2_batch_witness_digest(&request, &config, &settlement, oracle_address);
+		let result2 = build_permit2_batch_witness_digest(
+			&request,
+			&config,
+			input_oracle_address,
+			output_oracle_address,
+		);
 
 		assert!(result1.is_ok());
 		assert!(result2.is_ok());
@@ -582,11 +621,17 @@ mod tests {
 	fn test_build_permit2_batch_witness_digest_message_format() {
 		let config = create_test_config();
 		let request = create_test_quote_request();
-		let settlement = MockSettlementInterface::new();
-		let oracle_address = parse_address("0x9999999999999999999999999999999999999999").unwrap();
+		let input_oracle_address =
+			parse_address("0x1999999999999999999999999999999999999999").unwrap();
+		let output_oracle_address =
+			parse_address("0x2999999999999999999999999999999999999999").unwrap();
 
-		let result =
-			build_permit2_batch_witness_digest(&request, &config, &settlement, oracle_address);
+		let result = build_permit2_batch_witness_digest(
+			&request,
+			&config,
+			input_oracle_address,
+			output_oracle_address,
+		);
 
 		assert!(result.is_ok());
 

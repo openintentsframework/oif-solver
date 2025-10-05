@@ -52,12 +52,11 @@ use super::custody::{CustodyDecision, CustodyStrategy};
 use alloy_primitives::U256;
 use solver_config::{Config, QuoteConfig};
 use solver_delivery::DeliveryService;
-use solver_settlement::{SettlementInterface, SettlementService};
+use solver_settlement::SettlementService;
 use solver_types::standards::eip7683::LockType;
 use solver_types::{
-	CostContext, FailureHandlingMode, GetQuoteRequest, InteropAddress, OifOrder, OrderInput,
-	OrderPayload, Quote, QuoteError, QuotePreference, SignatureType, SwapType,
-	ValidatedQuoteContext,
+	CostContext, FailureHandlingMode, GetQuoteRequest, OifOrder, OrderInput, OrderPayload, Quote,
+	QuoteError, QuotePreference, SignatureType, SwapType, ValidatedQuoteContext,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -82,7 +81,7 @@ impl QuoteGenerator {
 		delivery_service: Arc<DeliveryService>,
 	) -> Self {
 		Self {
-			custody_strategy: CustodyStrategy::new(),
+			custody_strategy: CustodyStrategy::new(delivery_service.clone()),
 			settlement_service,
 			delivery_service,
 		}
@@ -392,7 +391,6 @@ impl QuoteGenerator {
 	) -> Result<OifOrder, QuoteError> {
 		use solver_types::LockKind;
 
-		let domain_address = self.get_lock_domain_address(config, lock)?;
 		let default_params = serde_json::json!({});
 		let params = lock.params.as_ref().unwrap_or(&default_params);
 		let (primary_type, message) = match &lock.kind {
@@ -440,8 +438,7 @@ impl QuoteGenerator {
 				OifOrder::OifResourceLockV0 {
 					payload: OrderPayload {
 						signature_type: SignatureType::Eip712,
-						domain: serde_json::to_value(domain_address)
-							.unwrap_or(serde_json::Value::Null),
+						domain: serde_json::Value::Null, // TBD
 						primary_type,
 						message,
 						types: None, // Other resource locks don't need EIP-712 types yet
@@ -471,7 +468,7 @@ impl QuoteGenerator {
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chain ID: {}", e)))?;
 
 		// For escrow orders, prefer Direct settlement over other implementations
-		let (settlement, selected_oracle) = self
+		let (_settlement, input_oracle, output_oracle) = self
 			.settlement_service
 			.get_any_settlement_for_chain(chain_id)
 			.ok_or_else(|| {
@@ -483,11 +480,11 @@ impl QuoteGenerator {
 
 		match lock_type {
 			LockType::Permit2Escrow => {
-				self.generate_permit2_order(request, config, settlement, selected_oracle)
+				self.generate_permit2_order(request, config, input_oracle, output_oracle)
 					.await
 			},
 			LockType::Eip3009Escrow => {
-				self.generate_eip3009_order(request, config, settlement, selected_oracle)
+				self.generate_eip3009_order(request, config, input_oracle, output_oracle)
 					.await
 			},
 			_ => Err(QuoteError::UnsupportedSettlement(format!(
@@ -501,8 +498,8 @@ impl QuoteGenerator {
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
-		settlement: &dyn SettlementInterface,
-		selected_oracle: solver_types::Address,
+		input_oracle: solver_types::Address,
+		output_oracle: solver_types::Address,
 	) -> Result<OifOrder, QuoteError> {
 		let chain_id = request.intent.inputs[0]
 			.asset
@@ -516,7 +513,7 @@ impl QuoteGenerator {
 
 		// Generate the message object without pre-computed digest
 		let message_obj =
-			self.build_permit2_message_object(request, config, settlement, selected_oracle)?;
+			self.build_permit2_message_object(request, config, input_oracle, output_oracle)?;
 
 		let order = OifOrder::OifEscrowV0 {
 			payload: OrderPayload {
@@ -535,14 +532,20 @@ impl QuoteGenerator {
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
-		_settlement: &dyn SettlementInterface,
-		selected_oracle: solver_types::Address,
+		input_oracle: solver_types::Address,
+		output_oracle: solver_types::Address,
 	) -> Result<OifOrder, QuoteError> {
-		// Use minValidUntil from request if provided, otherwise use configured validity
-		let intent_validity_seconds = request
-			.intent
-			.min_valid_until
-			.unwrap_or_else(|| self.get_quote_validity_seconds(config));
+		use alloy_primitives::hex;
+
+		// Use minValidUntil from request if provided (as absolute timestamp), otherwise use configured validity duration
+		let deadline_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until {
+			// min_valid_until is an absolute timestamp
+			min_valid_until
+		} else {
+			// Use configured validity duration added to current time
+			let validity_seconds = self.get_quote_validity_seconds(config);
+			chrono::Utc::now().timestamp() as u64 + validity_seconds
+		};
 
 		// Get input chain to find the input settler address (the 'to' field)
 		let first_input = &request.intent.inputs[0];
@@ -560,11 +563,17 @@ impl QuoteGenerator {
 		);
 
 		// Calculate fillDeadline (should match fillDeadline in StandardOrder)
-		let fill_deadline = chrono::Utc::now().timestamp() as u32 + intent_validity_seconds as u32;
+		let fill_deadline = deadline_timestamp as u32;
 
 		// Calculate the correct orderIdentifier using the contract
 		let (nonce_u64, order_identifier) = self
-			.compute_eip3009_order_identifier(request, config, &selected_oracle, fill_deadline)
+			.compute_eip3009_order_identifier(
+				request,
+				config,
+				&input_oracle,
+				&output_oracle,
+				fill_deadline,
+			)
 			.await?;
 
 		// Get token address for domain information
@@ -576,6 +585,11 @@ impl QuoteGenerator {
 		// Build structured domain object for EIP-3009 token
 		let domain_object = self
 			.build_eip3009_domain_object(&token_address, input_chain_id)
+			.await?;
+
+		// Get the domain separator from the contract
+		let domain_separator = self
+			.get_eip3009_domain_separator(&token_address, input_chain_id)
 			.await?;
 
 		// For EIP-3009, we need to generate signature templates for each input
@@ -606,12 +620,13 @@ impl QuoteGenerator {
 		// Build metadata with full intent information AND StandardOrder reconstruction data
 		// This is needed for conversion back to StandardOrder from limited EIP-3009 signature
 		let metadata = serde_json::json!({
+			"domain_separator": format!("0x{}", hex::encode(domain_separator)),
 			"user": request.user.to_string(),
 			"nonce": nonce_u64,
 			"originChainId": input_chain_id,
 			"expires": fill_deadline, // Use fillDeadline for both expires and fillDeadline
 			"fillDeadline": fill_deadline,
-			"inputOracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&selected_oracle.0)),
+			"inputOracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&input_oracle.0)),
 			"inputs": request.intent.inputs.iter().map(|input| {
 				serde_json::json!({
 					"chainId": input.asset.ethereum_chain_id().unwrap_or(1),
@@ -636,7 +651,7 @@ impl QuoteGenerator {
 					"asset": output.asset.to_string(),
 					"amount": output.amount.clone(),
 					"receiver": output.receiver.to_string(),
-					"oracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&selected_oracle.0)),
+					"oracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&output_oracle.0)),
 					"settler": format!("0x{:040x}", alloy_primitives::Address::from_slice(&output_settler.0)),
 				}))
 			}).collect::<Result<Vec<_>, _>>()?
@@ -663,7 +678,8 @@ impl QuoteGenerator {
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
-		selected_oracle: &solver_types::Address,
+		input_oracle: &solver_types::Address,
+		output_oracle: &solver_types::Address,
 		fill_deadline: u32,
 	) -> Result<(u64, String), QuoteError> {
 		// Build the StandardOrder struct for encoding
@@ -693,10 +709,10 @@ impl QuoteGenerator {
 			.user
 			.ethereum_address()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid user address: {}", e)))?;
-		// Generate incremental nonce like direct intent (current timestamp in microseconds)
+		// Generate incremental nonce like direct intent (current timestamp in milliseconds)
 		let nonce = std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
-			.map(|d| d.as_micros() as u64)
+			.map(|d| d.as_millis() as u64)
 			.unwrap_or(0u64);
 		let expiry = fill_deadline; // Use same value
 
@@ -756,7 +772,10 @@ impl QuoteGenerator {
 		let output_settler_address = alloy_primitives::Address::from_slice(&output_settler.0);
 
 		// Convert addresses to bytes32 for Output struct
-		let zero_bytes32 = alloy_primitives::FixedBytes::<32>::ZERO;
+		let mut output_oracle_bytes = [0u8; 32];
+		output_oracle_bytes[12..].copy_from_slice(&output_oracle.0[..]);
+		let output_oracle_bytes32 = alloy_primitives::FixedBytes::<32>::from(output_oracle_bytes);
+
 		let mut output_settler_bytes = [0u8; 32];
 		output_settler_bytes[12..].copy_from_slice(&output_settler_address.0[..]);
 		let output_settler_bytes32 = alloy_primitives::FixedBytes::<32>::from(output_settler_bytes);
@@ -787,10 +806,10 @@ impl QuoteGenerator {
 			originChainId: U256::from(input_chain_id),
 			expires: expiry,
 			fillDeadline: fill_deadline,
-			inputOracle: alloy_primitives::Address::from_slice(&selected_oracle.0),
+			inputOracle: alloy_primitives::Address::from_slice(&input_oracle.0),
 			inputs: vec![[input_token_u256, input_amount_u256]],
 			outputs: vec![SolMandateOutput {
-				oracle: zero_bytes32,
+				oracle: output_oracle_bytes32,
 				settler: output_settler_bytes32,
 				chainId: U256::from(output_chain_id),
 				token: output_token_bytes32,
@@ -870,6 +889,58 @@ impl QuoteGenerator {
 		Ok((nonce, order_id))
 	}
 
+	/// Get the DOMAIN_SEPARATOR from an EIP-3009 token contract
+	async fn get_eip3009_domain_separator(
+		&self,
+		token_address: &[u8; 20],
+		chain_id: u64,
+	) -> Result<[u8; 32], QuoteError> {
+		use alloy_sol_types::SolCall;
+
+		// Define the DOMAIN_SEPARATOR function
+		alloy_sol_types::sol! {
+			function DOMAIN_SEPARATOR() external view returns (bytes32);
+		}
+
+		// Encode the call
+		let encoded_call = DOMAIN_SEPARATORCall {}.abi_encode();
+
+		// Build transaction for the contract call
+		let tx = solver_types::Transaction {
+			to: Some(solver_types::Address(token_address.to_vec())),
+			data: encoded_call,
+			value: alloy_primitives::U256::ZERO,
+			gas_limit: None,
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+			nonce: None,
+			chain_id,
+		};
+
+		// Call the contract using the delivery service
+		let domain_separator_bytes = self
+			.delivery_service
+			.contract_call(chain_id, tx)
+			.await
+			.map_err(|e| {
+				QuoteError::InvalidRequest(format!("Failed to get domain separator: {}", e))
+			})?;
+
+		// Convert the returned bytes to [u8; 32]
+		if domain_separator_bytes.len() != 32 {
+			return Err(QuoteError::InvalidRequest(format!(
+				"Invalid domain separator length: expected 32 bytes, got {}",
+				domain_separator_bytes.len()
+			)));
+		}
+
+		let mut domain_separator = [0u8; 32];
+		domain_separator.copy_from_slice(&domain_separator_bytes);
+
+		Ok(domain_separator)
+	}
+
 	async fn build_compact_message(
 		&self,
 		request: &GetQuoteRequest,
@@ -880,13 +951,16 @@ impl QuoteGenerator {
 		use solver_types::utils::bytes20_to_alloy_address;
 		use std::str::FromStr;
 
-		// Use minValidUntil from request if provided, otherwise use configured validity
-		let intent_validity_seconds = request
-			.intent
-			.min_valid_until
-			.unwrap_or_else(|| self.get_quote_validity_seconds(config));
+		// Use minValidUntil from request if provided (as absolute timestamp), otherwise use configured validity duration
 		let current_time = chrono::Utc::now().timestamp() as u64;
-		let expires = current_time + intent_validity_seconds;
+		let expires = if let Some(min_valid_until) = request.intent.min_valid_until {
+			// min_valid_until is an absolute timestamp
+			min_valid_until
+		} else {
+			// Use configured validity duration added to current time
+			let validity_seconds = self.get_quote_validity_seconds(config);
+			current_time + validity_seconds
+		};
 		let nonce = chrono::Utc::now().timestamp_millis() as u64; // Use milliseconds timestamp as nonce for uniqueness (matching direct intent flow)
 
 		// Get user address
@@ -894,16 +968,6 @@ impl QuoteGenerator {
 			.user
 			.ethereum_address()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid user address: {}", e)))?;
-
-		// Get TheCompact domain address (arbiter)
-		let the_compact_lock = solver_types::AssetLockReference {
-			kind: solver_types::LockKind::TheCompact,
-			params: Some(serde_json::json!({})),
-		};
-		let domain_address = self.get_lock_domain_address(config, &the_compact_lock)?;
-		let _arbiter_address = domain_address
-			.ethereum_address()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid domain address: {}", e)))?;
 
 		// Get input chain ID from first available input
 		let first_input = request
@@ -922,7 +986,7 @@ impl QuoteGenerator {
 		})?;
 
 		// Get preferred settlement for TheCompact (prioritizes Direct settlement like escrow)
-		let (_input_settlement, input_selected_oracle) = self
+		let (_input_settlement, input_oracle, _output_oracle) = self
 			.settlement_service
 			.get_any_settlement_for_chain(input_chain_id)
 			.ok_or_else(|| {
@@ -978,7 +1042,7 @@ impl QuoteGenerator {
 			})?;
 
 			// Get preferred settlement for the output chain (prioritizes Direct settlement like escrow)
-			let (_output_settlement, output_selected_oracle) = self
+			let (_output_settlement, _output_input_oracle, output_oracle) = self
 				.settlement_service
 				.get_any_settlement_for_chain(output_chain_id)
 				.ok_or_else(|| {
@@ -999,8 +1063,8 @@ impl QuoteGenerator {
 				.map_err(QuoteError::InvalidRequest)?;
 
 			// Convert oracle address (like permit2 flow)
-			let output_oracle =
-				bytes20_to_alloy_address(&output_selected_oracle.0).map_err(|e| {
+			let output_oracle_address =
+				bytes20_to_alloy_address(&output_oracle.0).map_err(|e| {
 					QuoteError::InvalidRequest(format!("Invalid output oracle address: {}", e))
 				})?;
 
@@ -1011,71 +1075,36 @@ impl QuoteGenerator {
 				)
 			})?;
 			outputs_array.push(serde_json::json!({
-				"oracle": format!("0x000000000000000000000000{:040x}", output_oracle),
-				"settler": format!("0x000000000000000000000000{:040x}", output_settler),
+				"oracle": solver_types::utils::address_to_bytes32_hex(&output_oracle_address),
+				"settler": solver_types::utils::address_to_bytes32_hex(&output_settler),
 				"chainId": output_chain_id.to_string(),
-				"token": format!("0x000000000000000000000000{:040x}", output_token_address),
+				"token": solver_types::utils::address_to_bytes32_hex(&output_token_address),
 				"amount": amount.clone(),
-				"recipient": format!("0x000000000000000000000000{:040x}", recipient_address),
+				"recipient": solver_types::utils::address_to_bytes32_hex(&recipient_address),
 				"call": output.calldata.clone(),
 				"context": "0x" // Context is typically empty for standard flows
 			}));
 		}
 
 		// Use the selected oracle for input chain as the inputOracle (like permit2 flow)
-		let input_oracle = bytes20_to_alloy_address(&input_selected_oracle.0).map_err(|e| {
+		let input_oracle_address = bytes20_to_alloy_address(&input_oracle.0).map_err(|e| {
 			QuoteError::InvalidRequest(format!("Invalid input oracle address: {}", e))
 		})?;
 
 		// Build the EIP-712 message structure (like permit2 flow)
 		// The scripts will compute the digest from this data
 		let eip712_message = serde_json::json!({
-			"types": {
-				"EIP712Domain": [
-					{"name": "name", "type": "string"},
-					{"name": "version", "type": "string"},
-					{"name": "chainId", "type": "uint256"},
-					{"name": "verifyingContract", "type": "address"}
-				],
-				"BatchCompact": [
-					{"name": "arbiter", "type": "address"},
-					{"name": "sponsor", "type": "address"},
-					{"name": "nonce", "type": "uint256"},
-					{"name": "expires", "type": "uint256"},
-					{"name": "commitments", "type": "Lock[]"},
-					{"name": "mandate", "type": "Mandate"}
-				],
-				"Lock": [
-					{"name": "lockTag", "type": "bytes12"},
-					{"name": "token", "type": "address"},
-					{"name": "amount", "type": "uint256"}
-				],
-				"Mandate": [
-					{"name": "fillDeadline", "type": "uint32"},
-					{"name": "inputOracle", "type": "address"},
-					{"name": "outputs", "type": "MandateOutput[]"}
-				],
-				"MandateOutput": [
-					{"name": "oracle", "type": "bytes32"},
-					{"name": "settler", "type": "bytes32"},
-					{"name": "chainId", "type": "uint256"},
-					{"name": "token", "type": "bytes32"},
-					{"name": "amount", "type": "uint256"},
-					{"name": "recipient", "type": "bytes32"},
-					{"name": "call", "type": "bytes"},
-					{"name": "context", "type": "bytes"}
-				]
-			},
+			"types": self.build_compact_eip712_types(),
 			"domain": {
 				"name": "TheCompact",
 				"version": "1",
 				"chainId": input_chain_id.to_string(),
-				"verifyingContract": format!("0x{:040x}", alloy_primitives::Address::from_slice(&network.the_compact_address.as_ref().unwrap().0))
+				"verifyingContract": format!("{:#x}", alloy_primitives::Address::from_slice(&network.the_compact_address.as_ref().unwrap().0))
 			},
 			"primaryType": "BatchCompact",
 			"message": {
-				"arbiter": format!("0x{:040x}", alloy_primitives::Address::from_slice(&network.input_settler_compact_address.as_ref().unwrap_or(&network.input_settler_address).0)),
-				"sponsor": format!("0x{:040x}", user_address),
+				"arbiter": format!("{:#x}", alloy_primitives::Address::from_slice(&network.input_settler_compact_address.as_ref().unwrap_or(&network.input_settler_address).0)),
+				"sponsor": format!("{:#x}", user_address),
 				"nonce": nonce.to_string(),
 				"expires": expires.to_string(),
 				"commitments": inputs_array.iter().map(|input| {
@@ -1096,8 +1125,8 @@ impl QuoteGenerator {
 					})
 				}).collect::<Vec<_>>(),
 				"mandate": {
-					"fillDeadline": (current_time + intent_validity_seconds).to_string(),
-					"inputOracle": format!("0x{:040x}", input_oracle),
+					"fillDeadline": expires.to_string(),
+					"inputOracle": format!("{:#x}", input_oracle_address),
 					"outputs": outputs_array
 				}
 			}
@@ -1222,14 +1251,14 @@ impl QuoteGenerator {
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
-		settlement: &dyn SettlementInterface,
-		selected_oracle: solver_types::Address,
+		input_oracle: solver_types::Address,
+		output_oracle: solver_types::Address,
 	) -> Result<serde_json::Value, QuoteError> {
 		use crate::apis::quote::permit2::build_permit2_batch_witness_digest;
 
 		// Generate the complete message structure
 		let (_final_digest, message_obj) =
-			build_permit2_batch_witness_digest(request, config, settlement, selected_oracle)?;
+			build_permit2_batch_witness_digest(request, config, input_oracle, output_oracle)?;
 
 		// Extract only the EIP-712 message fields (no metadata like "signing", "digest")
 		let permitted = message_obj
@@ -1261,28 +1290,6 @@ impl QuoteGenerator {
 			"deadline": deadline,
 			"witness": witness
 		}))
-	}
-
-	fn get_lock_domain_address(
-		&self,
-		config: &Config,
-		lock: &solver_types::AssetLockReference,
-	) -> Result<InteropAddress, QuoteError> {
-		match &config.settlement.domain {
-			Some(domain_config) => {
-				let address = domain_config.address.parse().map_err(|e| {
-					QuoteError::InvalidRequest(format!("Invalid domain address in config: {}", e))
-				})?;
-				Ok(InteropAddress::new_ethereum(
-					domain_config.chain_id,
-					address,
-				))
-			},
-			None => Err(QuoteError::InvalidRequest(format!(
-				"Domain configuration required for lock type: {:?}",
-				lock.kind
-			))),
-		}
 	}
 
 	fn calculate_eta(&self, preference: &Option<QuotePreference>) -> u64 {
@@ -1442,7 +1449,7 @@ impl QuoteGenerator {
 			"name": "TheCompact",
 			"version": "1",
 			"chainId": chain_id.to_string(),
-			"verifyingContract": format!("0x{:040x}", contract_address)
+			"verifyingContract": format!("{:#x}", contract_address)
 		}))
 	}
 }
@@ -1453,9 +1460,7 @@ mod tests {
 	use crate::apis::quote::custody::CustodyDecision;
 	use alloy_primitives::address;
 	use alloy_primitives::U256;
-	use solver_config::{
-		ApiConfig, Config, ConfigBuilder, DomainConfig, QuoteConfig, SettlementConfig,
-	};
+	use solver_config::{ApiConfig, Config, ConfigBuilder, QuoteConfig, SettlementConfig};
 	use solver_settlement::{MockSettlementInterface, SettlementInterface};
 	use solver_types::{
 		oif_versions, parse_address,
@@ -1485,10 +1490,6 @@ mod tests {
 		// Create settlement configuration with domain
 		let settlement_config = SettlementConfig {
 			implementations: HashMap::new(),
-			domain: Some(DomainConfig {
-				chain_id: 1,
-				address: "0x1234567890123456789012345678901234567890".to_string(),
-			}),
 			settlement_poll_interval_seconds: 3,
 		};
 
@@ -1728,7 +1729,7 @@ mod tests {
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 
 		// Get settlement and oracle like in real usage
-		let (settlement, selected_oracle) = settlement_service
+		let (_settlement, input_oracle, output_oracle) = settlement_service
 			.get_any_settlement_for_chain(137)
 			.expect("Should have settlement for test chain");
 
@@ -1737,7 +1738,7 @@ mod tests {
 		let request = create_test_request();
 
 		let result = generator
-			.generate_eip3009_order(&request, &config, settlement, selected_oracle)
+			.generate_eip3009_order(&request, &config, input_oracle, output_oracle)
 			.await;
 
 		match result {
@@ -1992,43 +1993,6 @@ mod tests {
 		let config_no_api = ConfigBuilder::new().build();
 		let validity_default = generator.get_quote_validity_seconds(&config_no_api);
 		assert_eq!(validity_default, 20); // if API none, use default 20
-	}
-
-	#[test]
-	fn test_get_lock_domain_address_success() {
-		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
-		let config = create_test_config();
-		let lock = solver_types::AssetLockReference {
-			kind: solver_types::LockKind::TheCompact,
-			params: Some(serde_json::json!({})),
-		};
-
-		let result = generator.get_lock_domain_address(&config, &lock);
-		assert!(result.is_ok());
-
-		let domain = result.unwrap();
-		assert_eq!(domain.ethereum_chain_id().unwrap(), 1);
-	}
-
-	#[test]
-	fn test_get_lock_domain_address_missing_config() {
-		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
-		let mut config = create_test_config();
-		config.settlement.domain = None;
-
-		let lock = solver_types::AssetLockReference {
-			kind: solver_types::LockKind::TheCompact,
-			params: Some(serde_json::json!({})),
-		};
-
-		let result = generator.get_lock_domain_address(&config, &lock);
-		assert!(matches!(result, Err(QuoteError::InvalidRequest(_))));
 	}
 
 	#[tokio::test]

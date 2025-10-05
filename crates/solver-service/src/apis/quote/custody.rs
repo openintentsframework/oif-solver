@@ -37,6 +37,9 @@
 //! - Permit2 availability (universal but requires deployment)
 //! - Custom protocol support (token-specific features)
 
+use std::sync::Arc;
+
+use solver_delivery::DeliveryService;
 use solver_types::standards::eip7683::LockType;
 use solver_types::{AssetLockReference, LockKind, OrderInput, QuoteError};
 
@@ -50,11 +53,14 @@ pub enum CustodyDecision {
 }
 
 /// Custody strategy decision engine
-pub struct CustodyStrategy {}
+pub struct CustodyStrategy {
+	/// Reference to delivery service for contract calls.
+	delivery_service: Arc<DeliveryService>,
+}
 
 impl CustodyStrategy {
-	pub fn new() -> Self {
-		Self {}
+	pub fn new(delivery_service: Arc<DeliveryService>) -> Self {
+		Self { delivery_service }
 	}
 
 	pub async fn decide_custody(
@@ -92,7 +98,9 @@ impl CustodyStrategy {
 			.ethereum_address()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid Ethereum address: {}", e)))?;
 
-		let capabilities = PROTOCOL_REGISTRY.get_token_capabilities(chain_id, token_address);
+		let capabilities = PROTOCOL_REGISTRY
+			.get_token_capabilities(chain_id, token_address, self.delivery_service.clone())
+			.await;
 
 		// Respect user's explicit auth scheme preference from originSubmission
 		if let Some(origin) = origin_submission {
@@ -139,11 +147,5 @@ impl CustodyStrategy {
 				"No supported settlement mechanism available for this token".to_string(),
 			))
 		}
-	}
-}
-
-impl Default for CustodyStrategy {
-	fn default() -> Self {
-		Self::new()
 	}
 }

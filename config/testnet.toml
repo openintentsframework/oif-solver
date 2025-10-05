@@ -87,10 +87,6 @@ rate_limit_delay_ms = 1200
 [settlement]
 settlement_poll_interval_seconds = 10 # How often to check can_claim
 
-[settlement.domain]
-chain_id = 11155420
-address = "0xF859d69A86CEdFFe1F88d4bFcC24Ffaa0E050e46"
-
 [settlement.implementations.direct]
 order = "eipXXXX"
 network_ids = [11155420, 84532]

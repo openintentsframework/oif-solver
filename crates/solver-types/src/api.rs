@@ -4,6 +4,7 @@
 //! endpoints, following the ERC-7683 Cross-Chain Intents Standard.
 use crate::account::Address;
 use crate::standards::{eip7683::LockType, eip7930::InteropAddress};
+use crate::utils::conversion::parse_bytes32_from_hex;
 use crate::without_0x_prefix;
 use alloy_primitives::{Bytes, U256};
 use serde::{Deserialize, Serialize};
@@ -166,10 +167,7 @@ impl OifOrder {
 
 	/// Check if this order type requires signature recovery to determine sponsor
 	pub fn requires_ecrecover(&self) -> bool {
-		matches!(
-			self,
-			OifOrder::OifEscrowV0 { .. } | OifOrder::Oif3009V0 { .. }
-		)
+		matches!(self, OifOrder::OifEscrowV0 { .. })
 	}
 
 	/// Extract sponsor from the order, potentially using ecrecover for Permit2/EIP-3009 orders
@@ -213,8 +211,14 @@ impl OifOrder {
 						crate::utils::eip712::reconstruct_permit2_digest(payload)
 							.map_err(|e| format!("Failed to reconstruct Permit2 digest: {}", e))?
 					},
-					OifOrder::Oif3009V0 { payload, .. } => {
-						crate::utils::eip712::reconstruct_3009_digest(payload)
+					OifOrder::Oif3009V0 { payload, metadata } => {
+						// Extract domain_separator from metadata if available
+						let domain_separator = metadata
+							.get("domain_separator")
+							.and_then(|v| v.as_str())
+							.and_then(|s| parse_bytes32_from_hex(s).ok());
+
+						crate::utils::eip712::reconstruct_eip3009_digest(payload, domain_separator)
 							.map_err(|e| format!("Failed to reconstruct EIP-3009 digest: {}", e))?
 					},
 					_ => unreachable!(),
@@ -259,14 +263,14 @@ impl From<&OifOrder> for Option<OriginSubmission> {
 			OifOrder::OifEscrowV0 { .. } => {
 				// Permit2 escrow orders
 				Some(OriginSubmission {
-					mode: OriginMode::Protocol,
+					mode: OriginMode::User,
 					schemes: Some(vec![AuthScheme::Permit2, AuthScheme::Erc20Permit]),
 				})
 			},
 			OifOrder::Oif3009V0 { .. } => {
 				// EIP-3009 orders
 				Some(OriginSubmission {
-					mode: OriginMode::Protocol,
+					mode: OriginMode::User,
 					schemes: Some(vec![AuthScheme::Eip3009]),
 				})
 			},
@@ -325,8 +329,8 @@ impl AssetLockReference {
 pub struct PostOrderRequest {
 	/// The structured order to submit
 	pub order: OifOrder,
-	/// Array of signatures for the order (supports multi-sig)
-	pub signature: Vec<Bytes>,
+	/// Signature for the order
+	pub signature: Bytes,
 	/// Optional reference to a prior quote
 	#[serde(rename = "quoteId", skip_serializing_if = "Option::is_none")]
 	pub quote_id: Option<String>,
@@ -790,7 +794,6 @@ pub struct QuoteOrder {
 #[serde(rename_all = "kebab-case")]
 pub enum SignatureType {
 	Eip712,
-	Eip3009,
 }
 
 /// Quote details matching the request structure
@@ -859,7 +862,7 @@ impl PostOrderRequest {
 
 		Ok(PostOrderRequest {
 			order: quote.order.clone(),
-			signature: vec![signature_bytes], // Single signature in array
+			signature: signature_bytes,
 			quote_id: Some(quote.quote_id.clone()),
 			origin_submission,
 		})
@@ -1394,8 +1397,8 @@ mod tests {
 
 	#[test]
 	fn test_signature_type_serialization() {
-		let sig_types = [SignatureType::Eip712, SignatureType::Eip3009];
-		let expected_values = ["\"eip712\"", "\"eip3009\""];
+		let sig_types = [SignatureType::Eip712];
+		let expected_values = ["\"eip712\""];
 
 		for (sig_type, expected) in sig_types.iter().zip(expected_values.iter()) {
 			let json = serde_json::to_string(sig_type).unwrap();

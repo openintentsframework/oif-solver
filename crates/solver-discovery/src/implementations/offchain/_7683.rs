@@ -696,8 +696,10 @@ async fn handle_intent_submission(
 		},
 	};
 
+	let signature = request.signature;
+
 	// Extract sponsor from the order using our new helper
-	let sponsor = match request.order.extract_sponsor(request.signature.first()) {
+	let sponsor = match request.order.extract_sponsor(Some(&signature)) {
 		Ok(sponsor) => sponsor,
 		Err(e) => {
 			tracing::warn!(error = %e, "Failed to extract sponsor from order");
@@ -713,13 +715,6 @@ async fn handle_intent_submission(
 				.into_response();
 		},
 	};
-
-	// Get the first signature from the array (EIP-7683 expects single signature)
-	let signature = request
-		.signature
-		.first()
-		.cloned()
-		.unwrap_or_else(Bytes::new);
 
 	// Derive lock type from the order
 	let lock_type = LockType::from(&request.order);
@@ -1302,7 +1297,7 @@ mod tests {
 					"invalid": "data_that_cannot_be_converted_to_standard_order"
 				}),
 			},
-			signature: vec![Bytes::from_static(b"signature")],
+			signature: Bytes::from_static(b"signature"),
 			quote_id: None,
 			origin_submission: None,
 		};

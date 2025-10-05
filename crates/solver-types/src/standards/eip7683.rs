@@ -403,8 +403,8 @@ impl TryFrom<&Quote> for interfaces::StandardOrder {
 impl interfaces::StandardOrder {
 	/// Handle Permit2 order conversion
 	fn from_permit2(payload: &OrderPayload) -> Result<Self, Box<dyn std::error::Error>> {
-		use crate::utils::parse_bytes32_from_hex;
-		use alloy_primitives::{Address, U256};
+		use crate::utils::{hex_to_alloy_address, parse_bytes32_from_hex};
+		use alloy_primitives::U256;
 		use interfaces::SolMandateOutput;
 
 		// Extract the message object from payload for Permit2 orders
@@ -431,7 +431,7 @@ impl interfaces::StandardOrder {
 			.get("user")
 			.and_then(|u| u.as_str())
 			.ok_or("Missing user in EIP-712 data (should be injected by ecrecover)")?;
-		let user_address = Address::from_slice(&hex::decode(user_str.trim_start_matches("0x"))?);
+		let user_address = hex_to_alloy_address(user_str)?;
 		// Extract nonce
 		let nonce_str = message_data
 			.get("nonce")
@@ -463,8 +463,7 @@ impl interfaces::StandardOrder {
 			.get("inputOracle")
 			.and_then(|o| o.as_str())
 			.ok_or("Missing 'inputOracle' in witness data")?;
-		let input_oracle =
-			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
+		let input_oracle = hex_to_alloy_address(input_oracle_str)?;
 
 		// Extract input data from permitted array
 		let permitted = message_data
@@ -485,8 +484,7 @@ impl interfaces::StandardOrder {
 			.get("token")
 			.and_then(|t| t.as_str())
 			.ok_or("Missing token in permitted array")?;
-		let input_token =
-			Address::from_slice(&hex::decode(input_token_str.trim_start_matches("0x"))?);
+		let input_token = hex_to_alloy_address(input_token_str)?;
 
 		// Convert input token address to U256
 		let mut token_bytes = [0u8; 32];
@@ -560,8 +558,8 @@ impl interfaces::StandardOrder {
 		_payload: &OrderPayload,
 		metadata: &serde_json::Value,
 	) -> Result<Self, Box<dyn std::error::Error>> {
-		use crate::utils::parse_bytes32_from_hex;
-		use alloy_primitives::{Address, U256};
+		use crate::utils::hex_to_alloy_address;
+		use alloy_primitives::U256;
 		use interfaces::SolMandateOutput;
 
 		// Extract user address from metadata (for StandardOrder reconstruction)
@@ -604,8 +602,7 @@ impl interfaces::StandardOrder {
 			.get("inputOracle")
 			.and_then(|o| o.as_str())
 			.ok_or("Missing 'inputOracle' in EIP-3009 metadata")?;
-		let input_oracle =
-			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
+		let input_oracle = hex_to_alloy_address(input_oracle_str)?;
 
 		// Extract input information from metadata
 		// The metadata should contain the full intent with inputs and outputs
@@ -691,7 +688,7 @@ impl interfaces::StandardOrder {
 				let token_address = token_interop.ethereum_address()?;
 				let recipient_address = recipient_interop.ethereum_address()?;
 
-				// Convert addresses to bytes32 format
+				// Convert addresses to bytes32 format (manual for EIP-3009 compatibility)
 				let mut token_bytes = [0u8; 32];
 				token_bytes[12..32].copy_from_slice(&token_address.0 .0);
 
@@ -708,20 +705,20 @@ impl interfaces::StandardOrder {
 					.and_then(|s| s.as_str())
 					.ok_or("Missing settler in output metadata")?;
 
-				let oracle_bytes = parse_bytes32_from_hex(oracle_str).unwrap_or([0u8; 32]);
-				let settler_bytes = parse_bytes32_from_hex(settler_str).unwrap_or_else(|_| {
-					let mut bytes = [0u8; 32];
-					if let Ok(decoded) = hex::decode(settler_str.trim_start_matches("0x")) {
-						if decoded.len() == 20 {
-							// If it's a 20-byte address, pad it to 32 bytes
-							bytes[12..32].copy_from_slice(&decoded);
-						} else if decoded.len() == 32 {
-							// If it's already 32 bytes, use as-is
-							bytes.copy_from_slice(&decoded);
-						}
-					}
-					bytes
-				});
+				let oracle_bytes = hex_to_alloy_address(oracle_str)
+					.map(|addr| {
+						let mut bytes = [0u8; 32];
+						bytes[12..32].copy_from_slice(addr.as_slice());
+						bytes
+					})
+					.map_err(|e| format!("Invalid oracle address '{}': {}", oracle_str, e))?;
+				let settler_bytes = hex_to_alloy_address(settler_str)
+					.map(|addr| {
+						let mut bytes = [0u8; 32];
+						bytes[12..32].copy_from_slice(addr.as_slice());
+						bytes
+					})
+					.map_err(|e| format!("Invalid settler address '{}': {}", settler_str, e))?;
 
 				sol_outputs.push(SolMandateOutput {
 					oracle: oracle_bytes.into(),
@@ -752,8 +749,8 @@ impl interfaces::StandardOrder {
 
 	/// Handle BatchCompact order conversion for ResourceLock
 	fn from_batch_compact(payload: &OrderPayload) -> Result<Self, Box<dyn std::error::Error>> {
-		use crate::utils::parse_bytes32_from_hex;
-		use alloy_primitives::{Address, U256};
+		use crate::utils::{hex_to_alloy_address, parse_bytes32_from_hex};
+		use alloy_primitives::U256;
 		use interfaces::SolMandateOutput;
 
 		// Extract the message object from payload
@@ -772,7 +769,7 @@ impl interfaces::StandardOrder {
 			.get("sponsor")
 			.and_then(|s| s.as_str())
 			.ok_or("Missing sponsor in BatchCompact message")?;
-		let user_address = Address::from_slice(&hex::decode(sponsor_str.trim_start_matches("0x"))?);
+		let user_address = hex_to_alloy_address(sponsor_str)?;
 
 		// Extract origin chain ID from domain
 		let origin_chain_id = domain
@@ -814,8 +811,7 @@ impl interfaces::StandardOrder {
 			.get("inputOracle")
 			.and_then(|o| o.as_str())
 			.ok_or("Missing 'inputOracle' in mandate")?;
-		let input_oracle =
-			Address::from_slice(&hex::decode(input_oracle_str.trim_start_matches("0x"))?);
+		let input_oracle = hex_to_alloy_address(input_oracle_str)?;
 
 		// Extract from commitments array
 		let commitments = message_data
@@ -836,8 +832,7 @@ impl interfaces::StandardOrder {
 			.get("token")
 			.and_then(|t| t.as_str())
 			.ok_or("Missing token in commitment")?;
-		let input_token =
-			Address::from_slice(&hex::decode(input_token_str.trim_start_matches("0x"))?);
+		let input_token = hex_to_alloy_address(input_token_str)?;
 
 		// For BatchCompact, build TOKEN_ID = lockTag (12 bytes) + token address (20 bytes)
 		let lock_tag_str = first_commitment
@@ -885,9 +880,12 @@ impl interfaces::StandardOrder {
 						let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
 						let recipient_bytes =
 							parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
-						let oracle_bytes = parse_bytes32_from_hex(oracle_str).unwrap_or([0u8; 32]);
-						let settler_bytes =
-							parse_bytes32_from_hex(settler_str).unwrap_or([0u8; 32]);
+						let oracle_bytes = parse_bytes32_from_hex(oracle_str).map_err(|e| {
+							format!("Invalid oracle address '{}': {}", oracle_str, e)
+						})?;
+						let settler_bytes = parse_bytes32_from_hex(settler_str).map_err(|e| {
+							format!("Invalid settler address '{}': {}", settler_str, e)
+						})?;
 
 						sol_outputs.push(SolMandateOutput {
 							oracle: oracle_bytes.into(),
@@ -923,6 +921,8 @@ impl QuoteParsable for Eip7683OrderData {
 	fn quote_to_order_for_estimation(quote: &Quote) -> Order {
 		use std::convert::TryFrom;
 
+		use crate::current_timestamp;
+
 		// Use the unified TryFrom implementation that handles all order types automatically
 		let standard_order = interfaces::StandardOrder::try_from(quote)
 			.expect("Failed to convert quote to StandardOrder");
@@ -955,8 +955,8 @@ impl QuoteParsable for Eip7683OrderData {
 			// Use a clearly marked estimation-only ID
 			id: format!("ESTIMATION_ONLY_quote_{}", quote.quote_id),
 			standard: "eip7683".to_string(), // Use real standard for proper processing
-			created_at: crate::current_timestamp(),
-			updated_at: crate::current_timestamp(),
+			created_at: current_timestamp(),
+			updated_at: current_timestamp(),
 			status: OrderStatus::Created,
 			data: serde_json::to_value(&order_data).unwrap_or(serde_json::Value::Null),
 			solver_address: Address(vec![0u8; 20]), // Dummy address

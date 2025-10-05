@@ -5,7 +5,7 @@
 //! filling and claiming orders.
 
 use crate::{OrderError, OrderInterface};
-use alloy_primitives::{Address as AlloyAddress, Bytes, FixedBytes, U256};
+use alloy_primitives::{Bytes, FixedBytes, U256};
 use alloy_sol_types::{SolCall, SolType};
 use async_trait::async_trait;
 use solver_types::{
@@ -18,6 +18,7 @@ use solver_types::{
 		},
 		LockType,
 	},
+	utils::conversion::hex_to_alloy_address,
 	Address, ConfigSchema, Eip7683OrderData, ExecutionParams, FillProof, NetworksConfig, Order,
 	OrderStatus, Schema, Transaction,
 };
@@ -238,10 +239,8 @@ impl OrderInterface for Eip7683OrderImpl {
 		// For the OIF contracts, we need to use the StandardOrder openFor
 		// The raw_order_data contains the encoded StandardOrder
 		// We just need to pass the order bytes, sponsor, and signature
-		let sponsor_address =
-			AlloyAddress::from_slice(&hex::decode(sponsor.trim_start_matches("0x")).map_err(
-				|e| OrderError::ValidationFailed(format!("Invalid sponsor address: {}", e)),
-			)?);
+		let sponsor_address = hex_to_alloy_address(sponsor)
+			.map_err(|e| OrderError::ValidationFailed(format!("Invalid sponsor address: {}", e)))?;
 
 		// Decode the raw order bytes into StandardOrder struct
 		let order_struct = Self::decode_standard_order(raw_order_data)?;
@@ -419,16 +418,12 @@ impl OrderInterface for Eip7683OrderImpl {
 		}
 
 		// Parse addresses
-		let user_hex = order_data.user.trim_start_matches("0x");
-		let user_bytes = hex::decode(user_hex)
+		let user_address = hex_to_alloy_address(&order_data.user)
 			.map_err(|e| OrderError::ValidationFailed(format!("Invalid user address: {}", e)))?;
-		let user_address = AlloyAddress::from_slice(&user_bytes);
 
 		// Parse oracle address
-		let oracle_hex = fill_proof.oracle_address.trim_start_matches("0x");
-		let oracle_bytes = hex::decode(oracle_hex)
+		let oracle_address = hex_to_alloy_address(&fill_proof.oracle_address)
 			.map_err(|e| OrderError::ValidationFailed(format!("Invalid oracle address: {}", e)))?;
-		let oracle_address = AlloyAddress::from_slice(&oracle_bytes);
 
 		// Create inputs array from order data
 		let inputs: Vec<[U256; 2]> = order_data.inputs.clone();
@@ -644,16 +639,24 @@ impl OrderInterface for Eip7683OrderImpl {
 
 			// If a specific output oracle is specified, validate it
 			if output.oracle != [0u8; 32] {
-				// Parse the oracle address from bytes32 (last 20 bytes)
-				let output_oracle = Address(output.oracle[12..32].to_vec());
+				// Check if this specific output oracle is compatible with input oracle
+				// Use address normalization to compare regardless of padding format
+				let mut found_compatible = false;
+				for supported in supported_outputs.iter() {
+					if supported.chain_id == dest_chain {
+						let addresses_match = solver_types::utils::conversion::addresses_equal(
+							&supported.oracle.0,
+							output.oracle.as_slice(),
+						);
+						if addresses_match {
+							found_compatible = true;
+							break;
+						}
+					}
+				}
+				let is_compatible = found_compatible;
 
-				let output_info = solver_types::oracle::OracleInfo {
-					chain_id: dest_chain,
-					oracle: output_oracle,
-				};
-
-				// Check if this specific output oracle is in the supported list
-				if !supported_outputs.contains(&output_info) {
+				if !is_compatible {
 					return Err(OrderError::ValidationFailed(format!(
 						"Output oracle {:?} on chain {} is not compatible with input oracle {:?} on chain {}",
 						output.oracle, dest_chain, input_oracle, origin_chain
@@ -681,8 +684,8 @@ impl OrderInterface for Eip7683OrderImpl {
 		// First validate the order
 		let standard_order = self.validate_order(order_bytes).await?;
 
-		// Build tx_data for order ID computation
-		let chain_id = standard_order.originChainId.to::<u64>();
+		// Extract chain info from the order
+		let origin_chain_id = standard_order.originChainId.to::<u64>();
 
 		// Parse lock type
 		let lock_type = lock_type
@@ -690,9 +693,11 @@ impl OrderInterface for Eip7683OrderImpl {
 			.map_err(|e| OrderError::ValidationFailed(format!("Invalid lock type: {}", e)))?;
 
 		// Get settler address and build calldata
-		let settler_address = self.get_settler_address(chain_id, lock_type).map_err(|e| {
-			OrderError::ValidationFailed(format!("Failed to get settler address: {}", e))
-		})?;
+		let settler_address = self
+			.get_settler_address(origin_chain_id, lock_type)
+			.map_err(|e| {
+				OrderError::ValidationFailed(format!("Failed to get settler address: {}", e))
+			})?;
 
 		let calldata = self.build_order_id_call(order_bytes, lock_type)?;
 
@@ -701,9 +706,11 @@ impl OrderInterface for Eip7683OrderImpl {
 		tx_data.extend_from_slice(&settler_address.0);
 		tx_data.extend_from_slice(&calldata);
 
-		let order_id_bytes = order_id_callback(chain_id, tx_data).await.map_err(|e| {
-			OrderError::ValidationFailed(format!("Failed to compute order ID: {}", e))
-		})?;
+		let order_id_bytes = order_id_callback(origin_chain_id, tx_data)
+			.await
+			.map_err(|e| {
+				OrderError::ValidationFailed(format!("Failed to compute order ID: {}", e))
+			})?;
 
 		// Ensure order ID is exactly 32 bytes
 		if order_id_bytes.len() != 32 {
@@ -720,27 +727,9 @@ impl OrderInterface for Eip7683OrderImpl {
 		// Convert order ID bytes to hex string
 		let order_id = alloy_primitives::hex::encode_prefixed(&order_id_bytes);
 
-		// Extract chain info from the order
-		let origin_chain_id = standard_order.originChainId.to::<u64>();
-
-		// Get input network and determine settler address based on lock type
-		let input_network = self.networks.get(&origin_chain_id).ok_or_else(|| {
-			OrderError::ValidationFailed(format!("Chain {} not configured", origin_chain_id))
-		})?;
-
-		let is_compact = lock_type == LockType::ResourceLock;
-		let input_settler_address = if is_compact {
-			input_network
-				.input_settler_compact_address
-				.clone()
-				.unwrap_or_else(|| input_network.input_settler_address.clone())
-		} else {
-			input_network.input_settler_address.clone()
-		};
-
 		let input_chains = vec![solver_types::order::ChainSettlerInfo {
 			chain_id: origin_chain_id,
-			settler_address: input_settler_address,
+			settler_address,
 		}];
 
 		// Build output chains with settler addresses

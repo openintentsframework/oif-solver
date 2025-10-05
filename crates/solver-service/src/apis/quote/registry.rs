@@ -3,9 +3,14 @@
 //! Centralizes knowledge about protocol deployments and token capabilities
 //! to avoid duplication and make it easy to add new chains/tokens.
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use once_cell::sync::Lazy;
-use std::collections::{HashMap, HashSet};
+use solver_delivery::DeliveryService;
+use solver_types::Transaction;
+use std::{
+	collections::{HashMap, HashSet},
+	sync::Arc,
+};
 
 /// Global protocol registry instance
 pub static PROTOCOL_REGISTRY: Lazy<ProtocolRegistry> = Lazy::new(ProtocolRegistry::default);
@@ -98,12 +103,67 @@ impl ProtocolRegistry {
 		self.permit2_deployments.get(&chain_id).copied()
 	}
 
-	/// Checks if a token supports EIP-3009
+	/// Checks if a token supports EIP-3009 from static registry only
 	pub fn supports_eip3009(&self, chain_id: u64, token_address: Address) -> bool {
-		self.eip3009_tokens
-			.get(&chain_id)
-			.map(|tokens| tokens.contains(&token_address))
+		if let Some(tokens) = self.eip3009_tokens.get(&chain_id) {
+			tokens.contains(&token_address)
+		} else {
+			false
+		}
+	}
+
+	/// Checks if a token supports EIP-3009 by querying the contract via RPC
+	pub async fn supports_eip3009_with_rpc(
+		&self,
+		chain_id: u64,
+		token_address: Address,
+		delivery_service: Arc<DeliveryService>,
+	) -> bool {
+		// First check our static registry for known tokens
+		if self.supports_eip3009(chain_id, token_address) {
+			return true;
+		}
+
+		// Detect via RPC using function selector
+		self.detect_eip3009_via_rpc(chain_id, token_address, delivery_service)
+			.await
 			.unwrap_or(false)
+	}
+
+	/// Detects EIP-3009 support by checking for RECEIVE_WITH_AUTHORIZATION_TYPEHASH constant
+	async fn detect_eip3009_via_rpc(
+		&self,
+		chain_id: u64,
+		token_address: Address,
+		delivery_service: Arc<DeliveryService>,
+	) -> Result<bool, Box<dyn std::error::Error>> {
+		// Function selector for RECEIVE_WITH_AUTHORIZATION_TYPEHASH() view function
+		// selector: 0x7f2eecc3
+		let call_data = hex::decode("7f2eecc3")?;
+
+		let tx = Transaction {
+			to: Some(solver_types::Address(token_address.to_vec())),
+			data: call_data,
+			value: U256::ZERO,
+			gas_limit: None, // Will be estimated
+			gas_price: None, // Will be set by delivery
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+			nonce: None, // Will be set by delivery
+			chain_id,
+		};
+
+		match delivery_service.contract_call(chain_id, tx).await {
+			Ok(result) => {
+				// Check if the returned value matches the expected EIP-3009 RECEIVE_WITH_AUTHORIZATION_TYPEHASH
+				// Expected: 0xd099cc98ef71107a616c4f0f941f04c322d8e254fe26b3c6668db87aae413de8
+				let expected = hex::decode(
+					"d099cc98ef71107a616c4f0f941f04c322d8e254fe26b3c6668db87aae413de8",
+				)?;
+				Ok(result.len() == 32 && result[..] == expected[..])
+			},
+			Err(_) => Ok(false), // Function doesn't exist, no EIP-3009 support
+		}
 	}
 
 	#[allow(dead_code)]
@@ -113,13 +173,16 @@ impl ProtocolRegistry {
 	}
 
 	/// Gets complete token capabilities
-	pub fn get_token_capabilities(
+	pub async fn get_token_capabilities(
 		&self,
 		chain_id: u64,
 		token_address: Address,
+		delivery_service: Arc<DeliveryService>,
 	) -> TokenCapabilities {
 		TokenCapabilities {
-			supports_eip3009: self.supports_eip3009(chain_id, token_address),
+			supports_eip3009: self
+				.supports_eip3009_with_rpc(chain_id, token_address, delivery_service)
+				.await,
 			permit2_available: self.supports_permit2(chain_id),
 		}
 	}
