@@ -52,7 +52,7 @@ use super::custody::{CustodyDecision, CustodyStrategy};
 use alloy_primitives::U256;
 use solver_config::{Config, QuoteConfig};
 use solver_delivery::DeliveryService;
-use solver_settlement::{SettlementInterface, SettlementService};
+use solver_settlement::SettlementService;
 use solver_types::standards::eip7683::LockType;
 use solver_types::{
 	CostContext, FailureHandlingMode, GetQuoteRequest, OifOrder, OrderInput, OrderPayload, Quote,
@@ -468,7 +468,7 @@ impl QuoteGenerator {
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chain ID: {}", e)))?;
 
 		// For escrow orders, prefer Direct settlement over other implementations
-		let (settlement, selected_oracle) = self
+		let (_settlement, input_oracle, output_oracle) = self
 			.settlement_service
 			.get_any_settlement_for_chain(chain_id)
 			.ok_or_else(|| {
@@ -480,11 +480,11 @@ impl QuoteGenerator {
 
 		match lock_type {
 			LockType::Permit2Escrow => {
-				self.generate_permit2_order(request, config, settlement, selected_oracle)
+				self.generate_permit2_order(request, config, input_oracle, output_oracle)
 					.await
 			},
 			LockType::Eip3009Escrow => {
-				self.generate_eip3009_order(request, config, settlement, selected_oracle)
+				self.generate_eip3009_order(request, config, input_oracle, output_oracle)
 					.await
 			},
 			_ => Err(QuoteError::UnsupportedSettlement(format!(
@@ -498,8 +498,8 @@ impl QuoteGenerator {
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
-		settlement: &dyn SettlementInterface,
-		selected_oracle: solver_types::Address,
+		input_oracle: solver_types::Address,
+		output_oracle: solver_types::Address,
 	) -> Result<OifOrder, QuoteError> {
 		let chain_id = request.intent.inputs[0]
 			.asset
@@ -513,7 +513,7 @@ impl QuoteGenerator {
 
 		// Generate the message object without pre-computed digest
 		let message_obj =
-			self.build_permit2_message_object(request, config, settlement, selected_oracle)?;
+			self.build_permit2_message_object(request, config, input_oracle, output_oracle)?;
 
 		let order = OifOrder::OifEscrowV0 {
 			payload: OrderPayload {
@@ -532,8 +532,8 @@ impl QuoteGenerator {
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
-		_settlement: &dyn SettlementInterface,
-		selected_oracle: solver_types::Address,
+		input_oracle: solver_types::Address,
+		output_oracle: solver_types::Address,
 	) -> Result<OifOrder, QuoteError> {
 		use alloy_primitives::hex;
 
@@ -568,7 +568,13 @@ impl QuoteGenerator {
 
 		// Calculate the correct orderIdentifier using the contract
 		let (nonce_u64, order_identifier) = self
-			.compute_eip3009_order_identifier(request, config, &selected_oracle, fill_deadline)
+			.compute_eip3009_order_identifier(
+				request,
+				config,
+				&input_oracle,
+				&output_oracle,
+				fill_deadline,
+			)
 			.await?;
 
 		// Get token address for domain information
@@ -621,7 +627,7 @@ impl QuoteGenerator {
 			"originChainId": input_chain_id,
 			"expires": fill_deadline, // Use fillDeadline for both expires and fillDeadline
 			"fillDeadline": fill_deadline,
-			"inputOracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&selected_oracle.0)),
+			"inputOracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&input_oracle.0)),
 			"inputs": request.intent.inputs.iter().map(|input| {
 				serde_json::json!({
 					"chainId": input.asset.ethereum_chain_id().unwrap_or(1),
@@ -636,7 +642,7 @@ impl QuoteGenerator {
 					"asset": output.asset.to_string(),
 					"amount": output.amount.clone(),
 					"receiver": output.receiver.to_string(),
-					"oracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&selected_oracle.0)),
+					"oracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&output_oracle.0)),
 					"settler": format!("0x{:040x}", alloy_primitives::Address::from_slice(&output_settler.0)),
 				})
 			}).collect::<Vec<_>>()
@@ -663,7 +669,8 @@ impl QuoteGenerator {
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
-		selected_oracle: &solver_types::Address,
+		input_oracle: &solver_types::Address,
+		output_oracle: &solver_types::Address,
 		fill_deadline: u32,
 	) -> Result<(u64, String), QuoteError> {
 		// Build the StandardOrder struct for encoding
@@ -756,7 +763,10 @@ impl QuoteGenerator {
 		let output_settler_address = alloy_primitives::Address::from_slice(&output_settler.0);
 
 		// Convert addresses to bytes32 for Output struct
-		let zero_bytes32 = alloy_primitives::FixedBytes::<32>::ZERO;
+		let mut output_oracle_bytes = [0u8; 32];
+		output_oracle_bytes[12..].copy_from_slice(&output_oracle.0[..]);
+		let output_oracle_bytes32 = alloy_primitives::FixedBytes::<32>::from(output_oracle_bytes);
+
 		let mut output_settler_bytes = [0u8; 32];
 		output_settler_bytes[12..].copy_from_slice(&output_settler_address.0[..]);
 		let output_settler_bytes32 = alloy_primitives::FixedBytes::<32>::from(output_settler_bytes);
@@ -787,10 +797,10 @@ impl QuoteGenerator {
 			originChainId: U256::from(input_chain_id),
 			expires: expiry,
 			fillDeadline: fill_deadline,
-			inputOracle: alloy_primitives::Address::from_slice(&selected_oracle.0),
+			inputOracle: alloy_primitives::Address::from_slice(&input_oracle.0),
 			inputs: vec![[input_token_u256, input_amount_u256]],
 			outputs: vec![SolMandateOutput {
-				oracle: zero_bytes32,
+				oracle: output_oracle_bytes32,
 				settler: output_settler_bytes32,
 				chainId: U256::from(output_chain_id),
 				token: output_token_bytes32,
@@ -973,7 +983,7 @@ impl QuoteGenerator {
 		})?;
 
 		// Get preferred settlement for TheCompact (prioritizes Direct settlement like escrow)
-		let (_input_settlement, input_selected_oracle) = self
+		let (_input_settlement, input_oracle, _output_oracle) = self
 			.settlement_service
 			.get_any_settlement_for_chain(input_chain_id)
 			.ok_or_else(|| {
@@ -1029,7 +1039,7 @@ impl QuoteGenerator {
 			})?;
 
 			// Get preferred settlement for the output chain (prioritizes Direct settlement like escrow)
-			let (_output_settlement, output_selected_oracle) = self
+			let (_output_settlement, _output_input_oracle, output_oracle) = self
 				.settlement_service
 				.get_any_settlement_for_chain(output_chain_id)
 				.ok_or_else(|| {
@@ -1050,8 +1060,8 @@ impl QuoteGenerator {
 				.map_err(QuoteError::InvalidRequest)?;
 
 			// Convert oracle address (like permit2 flow)
-			let output_oracle =
-				bytes20_to_alloy_address(&output_selected_oracle.0).map_err(|e| {
+			let output_oracle_address =
+				bytes20_to_alloy_address(&output_oracle.0).map_err(|e| {
 					QuoteError::InvalidRequest(format!("Invalid output oracle address: {}", e))
 				})?;
 
@@ -1062,71 +1072,36 @@ impl QuoteGenerator {
 				)
 			})?;
 			outputs_array.push(serde_json::json!({
-				"oracle": format!("0x000000000000000000000000{:040x}", output_oracle),
-				"settler": format!("0x000000000000000000000000{:040x}", output_settler),
+				"oracle": solver_types::utils::address_to_bytes32_hex(&output_oracle_address),
+				"settler": solver_types::utils::address_to_bytes32_hex(&output_settler),
 				"chainId": output_chain_id.to_string(),
-				"token": format!("0x000000000000000000000000{:040x}", output_token_address),
+				"token": solver_types::utils::address_to_bytes32_hex(&output_token_address),
 				"amount": amount.clone(),
-				"recipient": format!("0x000000000000000000000000{:040x}", recipient_address),
+				"recipient": solver_types::utils::address_to_bytes32_hex(&recipient_address),
 				"call": output.calldata.clone(),
 				"context": "0x" // Context is typically empty for standard flows
 			}));
 		}
 
 		// Use the selected oracle for input chain as the inputOracle (like permit2 flow)
-		let input_oracle = bytes20_to_alloy_address(&input_selected_oracle.0).map_err(|e| {
+		let input_oracle_address = bytes20_to_alloy_address(&input_oracle.0).map_err(|e| {
 			QuoteError::InvalidRequest(format!("Invalid input oracle address: {}", e))
 		})?;
 
 		// Build the EIP-712 message structure (like permit2 flow)
 		// The scripts will compute the digest from this data
 		let eip712_message = serde_json::json!({
-			"types": {
-				"EIP712Domain": [
-					{"name": "name", "type": "string"},
-					{"name": "version", "type": "string"},
-					{"name": "chainId", "type": "uint256"},
-					{"name": "verifyingContract", "type": "address"}
-				],
-				"BatchCompact": [
-					{"name": "arbiter", "type": "address"},
-					{"name": "sponsor", "type": "address"},
-					{"name": "nonce", "type": "uint256"},
-					{"name": "expires", "type": "uint256"},
-					{"name": "commitments", "type": "Lock[]"},
-					{"name": "mandate", "type": "Mandate"}
-				],
-				"Lock": [
-					{"name": "lockTag", "type": "bytes12"},
-					{"name": "token", "type": "address"},
-					{"name": "amount", "type": "uint256"}
-				],
-				"Mandate": [
-					{"name": "fillDeadline", "type": "uint32"},
-					{"name": "inputOracle", "type": "address"},
-					{"name": "outputs", "type": "MandateOutput[]"}
-				],
-				"MandateOutput": [
-					{"name": "oracle", "type": "bytes32"},
-					{"name": "settler", "type": "bytes32"},
-					{"name": "chainId", "type": "uint256"},
-					{"name": "token", "type": "bytes32"},
-					{"name": "amount", "type": "uint256"},
-					{"name": "recipient", "type": "bytes32"},
-					{"name": "call", "type": "bytes"},
-					{"name": "context", "type": "bytes"}
-				]
-			},
+			"types": self.build_compact_eip712_types(),
 			"domain": {
 				"name": "TheCompact",
 				"version": "1",
 				"chainId": input_chain_id.to_string(),
-				"verifyingContract": format!("0x{:040x}", alloy_primitives::Address::from_slice(&network.the_compact_address.as_ref().unwrap().0))
+				"verifyingContract": format!("{:#x}", alloy_primitives::Address::from_slice(&network.the_compact_address.as_ref().unwrap().0))
 			},
 			"primaryType": "BatchCompact",
 			"message": {
-				"arbiter": format!("0x{:040x}", alloy_primitives::Address::from_slice(&network.input_settler_compact_address.as_ref().unwrap_or(&network.input_settler_address).0)),
-				"sponsor": format!("0x{:040x}", user_address),
+				"arbiter": format!("{:#x}", alloy_primitives::Address::from_slice(&network.input_settler_compact_address.as_ref().unwrap_or(&network.input_settler_address).0)),
+				"sponsor": format!("{:#x}", user_address),
 				"nonce": nonce.to_string(),
 				"expires": expires.to_string(),
 				"commitments": inputs_array.iter().map(|input| {
@@ -1148,7 +1123,7 @@ impl QuoteGenerator {
 				}).collect::<Vec<_>>(),
 				"mandate": {
 					"fillDeadline": expires.to_string(),
-					"inputOracle": format!("0x{:040x}", input_oracle),
+					"inputOracle": format!("{:#x}", input_oracle_address),
 					"outputs": outputs_array
 				}
 			}
@@ -1273,14 +1248,14 @@ impl QuoteGenerator {
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
-		settlement: &dyn SettlementInterface,
-		selected_oracle: solver_types::Address,
+		input_oracle: solver_types::Address,
+		output_oracle: solver_types::Address,
 	) -> Result<serde_json::Value, QuoteError> {
 		use crate::apis::quote::permit2::build_permit2_batch_witness_digest;
 
 		// Generate the complete message structure
 		let (_final_digest, message_obj) =
-			build_permit2_batch_witness_digest(request, config, settlement, selected_oracle)?;
+			build_permit2_batch_witness_digest(request, config, input_oracle, output_oracle)?;
 
 		// Extract only the EIP-712 message fields (no metadata like "signing", "digest")
 		let permitted = message_obj
@@ -1471,7 +1446,7 @@ impl QuoteGenerator {
 			"name": "TheCompact",
 			"version": "1",
 			"chainId": chain_id.to_string(),
-			"verifyingContract": format!("0x{:040x}", contract_address)
+			"verifyingContract": format!("{:#x}", contract_address)
 		}))
 	}
 }
@@ -1751,7 +1726,7 @@ mod tests {
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 
 		// Get settlement and oracle like in real usage
-		let (settlement, selected_oracle) = settlement_service
+		let (_settlement, input_oracle, output_oracle) = settlement_service
 			.get_any_settlement_for_chain(137)
 			.expect("Should have settlement for test chain");
 
@@ -1760,7 +1735,7 @@ mod tests {
 		let request = create_test_request();
 
 		let result = generator
-			.generate_eip3009_order(&request, &config, settlement, selected_oracle)
+			.generate_eip3009_order(&request, &config, input_oracle, output_oracle)
 			.await;
 
 		match result {
