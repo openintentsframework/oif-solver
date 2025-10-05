@@ -458,23 +458,32 @@ impl QuoteGenerator {
 	) -> Result<OifOrder, QuoteError> {
 		// Extract chain from first output to find appropriate settlement
 		// TODO: Implement support for multiple destination chains
-		let chain_id = request
+		let origin_chain_id = request
 			.intent
 			.inputs
+			.first()
+			.ok_or_else(|| QuoteError::InvalidRequest("No requested inputs".to_string()))?
+			.asset
+			.ethereum_chain_id()
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chain ID: {}", e)))?;
+
+		let destination_chain_id = request
+			.intent
+			.outputs
 			.first()
 			.ok_or_else(|| QuoteError::InvalidRequest("No requested outputs".to_string()))?
 			.asset
 			.ethereum_chain_id()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chain ID: {}", e)))?;
 
-		// For escrow orders, prefer Direct settlement over other implementations
+		// For escrow orders, get settlement that supports both chains
 		let (_settlement, input_oracle, output_oracle) = self
 			.settlement_service
-			.get_any_settlement_for_chain(chain_id)
+			.get_any_settlement_for_chains(origin_chain_id, destination_chain_id)
 			.ok_or_else(|| {
 				QuoteError::InvalidRequest(format!(
-					"No suitable settlement available for escrow on chain {}",
-					chain_id
+					"No suitable settlement available for escrow from chain {} to chain {}",
+					origin_chain_id, destination_chain_id
 				))
 			})?;
 
@@ -970,29 +979,28 @@ impl QuoteGenerator {
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid user address: {}", e)))?;
 
 		// Get input chain ID from first available input
-		let first_input = request
+		let origin_chain_id = request
 			.intent
 			.inputs
 			.first()
-			.ok_or_else(|| QuoteError::InvalidRequest("No available inputs".to_string()))?;
-		let input_chain_id = first_input
+			.ok_or_else(|| QuoteError::InvalidRequest("No requested inputs".to_string()))?
 			.asset
 			.ethereum_chain_id()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input chain ID: {}", e)))?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chain ID: {}", e)))?;
 
 		// Get addresses from network configuration
-		let network = config.networks.get(&input_chain_id).ok_or_else(|| {
-			QuoteError::InvalidRequest(format!("Network {} not found in config", input_chain_id))
+		let network = config.networks.get(&origin_chain_id).ok_or_else(|| {
+			QuoteError::InvalidRequest(format!("Network {} not found in config", origin_chain_id))
 		})?;
 
 		// Get preferred settlement for TheCompact (prioritizes Direct settlement like escrow)
 		let (_input_settlement, input_oracle, _output_oracle) = self
 			.settlement_service
-			.get_any_settlement_for_chain(input_chain_id)
+			.get_any_settlement_for_chain(origin_chain_id)
 			.ok_or_else(|| {
 				QuoteError::InvalidRequest(format!(
 					"No suitable settlement available for TheCompact on chain {}",
-					input_chain_id
+					origin_chain_id
 				))
 			})?;
 
@@ -1098,7 +1106,7 @@ impl QuoteGenerator {
 			"domain": {
 				"name": "TheCompact",
 				"version": "1",
-				"chainId": input_chain_id.to_string(),
+				"chainId": origin_chain_id.to_string(),
 				"verifyingContract": format!("{:#x}", alloy_primitives::Address::from_slice(&network.the_compact_address.as_ref().unwrap().0))
 			},
 			"primaryType": "BatchCompact",

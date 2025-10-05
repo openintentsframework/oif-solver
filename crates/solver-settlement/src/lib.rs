@@ -454,6 +454,59 @@ impl SettlementService {
 		Some((*settlement, input_oracle, output_oracle))
 	}
 
+	/// Get any settlement that supports both origin and destination chains (for cross-chain quote generation).
+	/// Returns settlement, input oracle for origin chain, and output oracle for destination chain.
+	pub fn get_any_settlement_for_chains(
+		&self,
+		origin_chain_id: u64,
+		destination_chain_id: u64,
+	) -> Option<(&dyn SettlementInterface, Address, Address)> {
+		// Collect all settlements that support both chains
+		let mut available_settlements = Vec::new();
+
+		for settlement in self.implementations.values() {
+			let input_oracles = settlement
+				.oracle_config()
+				.input_oracles
+				.get(&origin_chain_id);
+			let output_oracles = settlement
+				.oracle_config()
+				.output_oracles
+				.get(&destination_chain_id);
+
+			// Need both input oracle for origin and output oracle for destination
+			if input_oracles.is_some()
+				&& !input_oracles.unwrap().is_empty()
+				&& output_oracles.is_some()
+				&& !output_oracles.unwrap().is_empty()
+			{
+				available_settlements.push((
+					settlement.as_ref(),
+					input_oracles.cloned().unwrap(),
+					output_oracles.cloned().unwrap(),
+				));
+			}
+		}
+
+		if available_settlements.is_empty() {
+			return None;
+		}
+
+		// Get selection context for deterministic oracle selection
+		let context = self.selection_counter.fetch_add(1, Ordering::Relaxed);
+
+		// Use first available settlement
+		let (settlement, input_oracles, output_oracles) = &available_settlements[0];
+
+		// Select input oracle for origin chain
+		let input_oracle = settlement.select_oracle(input_oracles, Some(context))?;
+
+		// Select output oracle for destination chain
+		let output_oracle = settlement.select_oracle(output_oracles, Some(context + 1))?;
+
+		Some((*settlement, input_oracle, output_oracle))
+	}
+
 	/// Gets attestation for a filled order using the appropriate settlement implementation.
 	///
 	/// # Arguments

@@ -87,28 +87,28 @@ rate_limit_delay_ms = 1200
 [settlement]
 settlement_poll_interval_seconds = 10 # How often to check can_claim
 
-[settlement.implementations.direct]
-order = "eipXXXX"
-network_ids = [11155420, 84532]
-dispute_period_seconds = 60
-oracle_selection_strategy = "First"
+# [settlement.implementations.direct]
+# order = "eipXXXX"
+# network_ids = [11155420, 84532]
+# dispute_period_seconds = 60
+# oracle_selection_strategy = "First"
 
-[settlement.implementations.direct.oracles]
-input = { 11155420 = [
-    "0x048B199f0e9bf17709F86Ac1f62ad7C246f86346",
-], 84532 = [
-    "0x6df0Bc4eE21286BCb83576Cb546100EDE196A54e",
-] }
-output = { 11155420 = [
-    "0x048B199f0e9bf17709F86Ac1f62ad7C246f86346",
-], 84532 = [
-    "0x6df0Bc4eE21286BCb83576Cb546100EDE196A54e",
-] }
+# [settlement.implementations.direct.oracles]
+# input = { 11155420 = [
+#     "0x048B199f0e9bf17709F86Ac1f62ad7C246f86346",
+# ], 84532 = [
+#     "0x6df0Bc4eE21286BCb83576Cb546100EDE196A54e",
+# ] }
+# output = { 11155420 = [
+#     "0x048B199f0e9bf17709F86Ac1f62ad7C246f86346",
+# ], 84532 = [
+#     "0x6df0Bc4eE21286BCb83576Cb546100EDE196A54e",
+# ] }
 
-[settlement.implementations.direct.routes]
-# Bidirectional routes - both chains can send to each other
-11155420 = [84532]
-84532 = [11155420]
+# [settlement.implementations.direct.routes]
+# # Bidirectional routes - both chains can send to each other
+# 11155420 = [84532]
+# 84532 = [11155420]
 
 # ============================================================================
 # HYPERLANE SETTLEMENT
