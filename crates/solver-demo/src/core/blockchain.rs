@@ -9,10 +9,9 @@ use crate::types::{
 	error::{Error, Result},
 };
 use alloy_primitives::{Address, B256, U256};
-use alloy_provider::{Provider as AlloyProvider, RootProvider};
+use alloy_provider::{Provider as AlloyProvider, ProviderBuilder};
 use alloy_rpc_types::{TransactionReceipt, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
-use alloy_transport_http::{Client, Http};
 use std::sync::Arc;
 
 /// Blockchain provider wrapper with chain-specific configuration
@@ -20,10 +19,19 @@ use std::sync::Arc;
 /// Provides high-level interface for blockchain operations including balance queries,
 /// contract calls, and transaction execution with automatic connection testing
 /// and error handling for specific blockchain networks
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Provider {
-	inner: Arc<RootProvider<Http<Client>>>,
+	inner: Arc<dyn AlloyProvider + Send + Sync>,
 	chain: ChainId,
+}
+
+impl std::fmt::Debug for Provider {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Provider")
+			.field("chain", &self.chain)
+			.field("inner", &"<dyn AlloyProvider>")
+			.finish()
+	}
 }
 
 impl Provider {
@@ -46,7 +54,7 @@ impl Provider {
 			.parse()
 			.map_err(|e| Error::RpcError(format!("Invalid RPC URL: {}", e)))?;
 
-		let provider = RootProvider::<Http<Client>>::new_http(url);
+		let provider = ProviderBuilder::new().connect_http(url);
 
 		// Test connection
 		provider
@@ -102,9 +110,9 @@ impl Provider {
 	/// Access underlying Alloy provider for advanced operations
 	///
 	/// # Returns
-	/// Reference to the wrapped RootProvider instance
-	pub fn inner(&self) -> &RootProvider<Http<Client>> {
-		&self.inner
+	/// Reference to the wrapped provider instance
+	pub fn inner(&self) -> &(dyn AlloyProvider + Send + Sync) {
+		&*self.inner
 	}
 
 	/// Test blockchain connectivity by querying chain ID
@@ -127,12 +135,19 @@ impl Provider {
 	/// # Errors
 	/// Returns Error if anvil_setCode RPC call fails
 	pub async fn set_code(&self, address: &str, bytecode: &str) -> crate::types::error::Result<()> {
-		let _response: () = self
+		use std::borrow::Cow;
+
+		// Serialize parameters to RawValue
+		let params = serde_json::to_string(&(address, bytecode)).map_err(|e| {
+			crate::types::error::Error::from(format!("Failed to serialize params: {}", e))
+		})?;
+		let raw_params = serde_json::value::RawValue::from_string(params).map_err(|e| {
+			crate::types::error::Error::from(format!("Failed to create RawValue: {}", e))
+		})?;
+
+		let _response = self
 			.inner
-			.raw_request(
-				"anvil_setCode".into(),
-				Some(serde_json::json!([address, bytecode])),
-			)
+			.raw_request_dyn(Cow::Borrowed("anvil_setCode"), &raw_params)
 			.await
 			.map_err(|e| {
 				crate::types::error::Error::from(format!("anvil_setCode failed: {}", e))
@@ -164,7 +179,7 @@ impl Provider {
 
 		let result = self
 			.inner
-			.call(&tx)
+			.call(tx)
 			.await
 			.map_err(|e| Error::RpcError(format!("Contract call failed: {}", e)))?;
 
@@ -267,7 +282,7 @@ impl TxBuilder {
 				let gas = self
 					.provider
 					.inner
-					.estimate_gas(&tx)
+					.estimate_gas(tx.clone())
 					.await
 					.map_err(|e| Error::RpcError(format!("Failed to estimate gas: {}", e)))?;
 				tx.gas = Some(gas);
@@ -279,7 +294,6 @@ impl TxBuilder {
 					.provider
 					.inner
 					.get_transaction_count(signer.address())
-					.latest()
 					.await
 					.map_err(|e| Error::RpcError(format!("Failed to get nonce: {}", e)))?;
 				tx.nonce = Some(nonce);

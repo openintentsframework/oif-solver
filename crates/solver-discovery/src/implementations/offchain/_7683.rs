@@ -43,9 +43,8 @@
 
 use crate::{DiscoveryError, DiscoveryInterface};
 use alloy_primitives::{Address as AlloyAddress, Bytes, U256};
-use alloy_provider::RootProvider;
+use alloy_provider::DynProvider;
 use alloy_sol_types::SolType;
-use alloy_transport_http::Http;
 use async_trait::async_trait;
 use axum::{
 	extract::State,
@@ -60,13 +59,13 @@ use serde_json;
 use solver_types::{
 	account::Address,
 	api::PostOrderRequest,
-	bytes32_to_address, current_timestamp, normalize_bytes32_address,
+	bytes32_to_address, create_http_provider, current_timestamp, normalize_bytes32_address,
 	standards::eip7683::{
 		interfaces::{IInputSettlerCompact, IInputSettlerEscrow, SolMandateOutput, StandardOrder},
 		GasLimitOverrides, LockType, MandateOutput,
 	},
 	with_0x_prefix, ConfigSchema, Eip7683OrderData, Field, FieldType, ImplementationRegistry,
-	Intent, IntentMetadata, NetworksConfig, Schema,
+	Intent, IntentMetadata, NetworksConfig, ProviderError, Schema,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -258,7 +257,7 @@ struct ApiState {
 	/// Channel to send discovered intents
 	intent_sender: mpsc::UnboundedSender<Intent>,
 	/// RPC providers for each supported network
-	providers: HashMap<u64, RootProvider<Http<reqwest::Client>>>,
+	providers: HashMap<u64, DynProvider>,
 	/// Networks configuration for settler lookups
 	networks: NetworksConfig,
 }
@@ -275,7 +274,7 @@ pub struct Eip7683OffchainDiscovery {
 	api_host: String,
 	api_port: u16,
 	/// RPC providers for each supported network
-	providers: HashMap<u64, RootProvider<Http<reqwest::Client>>>,
+	providers: HashMap<u64, DynProvider>,
 	/// Networks configuration for settler lookups
 	networks: NetworksConfig,
 	/// Flag indicating if the server is running
@@ -318,25 +317,24 @@ impl Eip7683OffchainDiscovery {
 		// Create RPC providers for each supported network
 		let mut providers = HashMap::new();
 		for network_id in &network_ids {
-			if let Some(network) = networks.get(network_id) {
-				let http_url = network.get_http_url().ok_or_else(|| {
-					DiscoveryError::Connection(format!(
-						"No HTTP RPC URL configured for network {}",
-						network_id
-					))
-				})?;
-				let provider = RootProvider::new_http(http_url.parse().map_err(|e| {
-					DiscoveryError::Connection(format!(
-						"Invalid RPC URL for network {}: {}",
-						network_id, e
-					))
-				})?);
-				providers.insert(*network_id, provider);
-			} else {
-				tracing::warn!(
-					"Network {} in supported_networks not found in networks config",
-					network_id
-				);
+			match create_http_provider(*network_id, networks) {
+				Ok(provider) => {
+					providers.insert(*network_id, provider);
+				},
+				Err(e) => match e {
+					ProviderError::NetworkConfig(_) => {
+						tracing::warn!(
+							"Network {} in supported_networks not found in networks config",
+							network_id
+						);
+					},
+					ProviderError::Connection(msg) => {
+						return Err(DiscoveryError::Connection(msg));
+					},
+					ProviderError::InvalidUrl(msg) => {
+						return Err(DiscoveryError::Connection(msg));
+					},
+				},
 			}
 		}
 
@@ -389,7 +387,7 @@ impl Eip7683OffchainDiscovery {
 		sponsor: &Address,
 		signature: &Bytes,
 		lock_type: LockType,
-		providers: &HashMap<u64, RootProvider<Http<reqwest::Client>>>,
+		providers: &HashMap<u64, DynProvider>,
 		networks: &NetworksConfig,
 		quote_id: Option<String>,
 	) -> Result<Intent, DiscoveryError> {
@@ -533,14 +531,14 @@ impl Eip7683OffchainDiscovery {
 	/// `DiscoveryError::ParseError` if order decoding fails for compact orders.
 	async fn compute_order_id(
 		order_bytes: &Bytes,
-		provider: &RootProvider<Http<reqwest::Client>>,
+		provider: &DynProvider,
 		settler_address: AlloyAddress,
 		lock_type: LockType,
 	) -> Result<[u8; 32], DiscoveryError> {
 		match lock_type {
 			LockType::ResourceLock => {
 				// Resource Lock (TheCompact) - use IInputSettlerCompact
-				let std_order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+				let std_order = StandardOrder::abi_decode_validate(order_bytes).map_err(|e| {
 					DiscoveryError::ParseError(format!("Failed to decode StandardOrder: {}", e))
 				})?;
 				let compact = IInputSettlerCompact::new(settler_address, provider);
@@ -554,12 +552,12 @@ impl Eip7683OffchainDiscovery {
 							e
 						))
 					})?;
-				Ok(resp._0.0)
+				Ok(resp.0)
 			},
 			LockType::Permit2Escrow | LockType::Eip3009Escrow => {
 				// Escrow types - use IInputSettlerEscrow
 				// Decode the order bytes to StandardOrder
-				let std_order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+				let std_order = StandardOrder::abi_decode_validate(order_bytes).map_err(|e| {
 					DiscoveryError::ParseError(format!("Failed to decode StandardOrder: {}", e))
 				})?;
 				let escrow = IInputSettlerEscrow::new(settler_address, provider);
@@ -573,7 +571,7 @@ impl Eip7683OffchainDiscovery {
 							e
 						))
 					})?;
-				Ok(resp._0.0)
+				Ok(resp.0)
 			},
 		}
 	}
@@ -602,7 +600,7 @@ impl Eip7683OffchainDiscovery {
 		api_host: String,
 		api_port: u16,
 		intent_sender: mpsc::UnboundedSender<Intent>,
-		providers: HashMap<u64, RootProvider<Http<reqwest::Client>>>,
+		providers: HashMap<u64, DynProvider>,
 		networks: NetworksConfig,
 		mut shutdown_rx: mpsc::Receiver<()>,
 	) -> Result<(), String> {

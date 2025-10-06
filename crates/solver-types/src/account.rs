@@ -4,7 +4,7 @@
 //! that are used throughout the solver for account management and transaction processing.
 
 use crate::with_0x_prefix;
-use alloy_primitives::{Address as AlloyAddress, Bytes, PrimitiveSignature, U256};
+use alloy_primitives::{Address as AlloyAddress, Bytes, Signature as PrimitiveSignature, U256};
 use alloy_rpc_types::TransactionRequest;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -153,7 +153,7 @@ impl From<Transaction> for TransactionRequest {
 mod tests {
 	use super::*;
 	use crate::utils::{conversion::parse_address, tests::builders::TransactionBuilder};
-	use alloy_primitives::{address, U256};
+	use alloy_primitives::{address, Signature as PrimitiveSignature, U256};
 	use serde_json;
 
 	// Helper function to create a test address from hex string
@@ -275,8 +275,6 @@ mod tests {
 
 	#[test]
 	fn test_signature_from_primitive_signature() {
-		use alloy_primitives::{PrimitiveSignature, U256};
-
 		let r = U256::from(1);
 		let s = U256::from(2);
 		let y_parity = false; // v = 27
@@ -291,8 +289,6 @@ mod tests {
 
 	#[test]
 	fn test_signature_from_primitive_signature_odd_parity() {
-		use alloy_primitives::{PrimitiveSignature, U256};
-
 		let r = U256::from(1);
 		let s = U256::from(2);
 		let y_parity = true; // v = 28

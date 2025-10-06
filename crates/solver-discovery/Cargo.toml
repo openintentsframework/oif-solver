@@ -5,15 +5,15 @@ edition = "2021"
 rust-version.workspace = true
 
 [dependencies]
-alloy-contract = "0.8"
-alloy-primitives = "0.8"
-alloy-provider = { version = "0.8", features = ["ws"] }
-alloy-pubsub = "0.8"
-alloy-rpc-types = "0.8"
-alloy-sol-types = "0.8"
-alloy-transport = "0.8"
-alloy-transport-http = "0.8"
-alloy-transport-ws = "0.8"
+alloy-contract = "1.0.37"
+alloy-primitives = "1.0.37"
+alloy-provider = { version = "1.0.37", features = ["ws"] }
+alloy-pubsub = "1.0.37"
+alloy-rpc-types = "1.0.37"
+alloy-sol-types = "1.0.37"
+alloy-transport = "1.0.37"
+alloy-transport-http = "1.0.37"
+alloy-transport-ws = "1.0.37"
 async-trait = "0.1"
 axum = "0.8"
 futures = "0.3"
@@ -22,11 +22,11 @@ reqwest = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 solver-types = { path = "../solver-types", features = ["oif-interfaces"] }
-thiserror = "1.0"
+thiserror = "2.0.17"
 tokio = { version = "1.0", features = ["sync", "rt-multi-thread"] }
 toml = { workspace = true }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.6.6", features = ["cors"] }
 tracing = "0.1"
 
 [dev-dependencies]

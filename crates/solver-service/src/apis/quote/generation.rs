@@ -1218,9 +1218,9 @@ impl QuoteGenerator {
 			.await
 			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to get token name: {}", e)))?;
 
-		let name = nameCall::abi_decode_returns(&result, false)
-			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to decode token name: {}", e)))?
-			._0;
+		let name = nameCall::abi_decode_returns(&result).map_err(|e| {
+			QuoteError::InvalidRequest(format!("Failed to decode token name: {}", e))
+		})?;
 
 		Ok(name)
 	}
