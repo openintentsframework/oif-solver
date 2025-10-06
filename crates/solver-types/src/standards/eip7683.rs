@@ -174,7 +174,9 @@ pub struct MandateOutput {
 
 #[cfg(feature = "oif-interfaces")]
 use crate::api::{Quote, QuoteParsable};
+#[cfg(feature = "oif-interfaces")]
 use crate::order::OrderParsable;
+#[cfg(feature = "oif-interfaces")]
 use crate::standards::eip7930::InteropAddress;
 #[cfg(feature = "oif-interfaces")]
 use crate::{
@@ -186,6 +188,7 @@ use crate::{
 use crate::{Order, OrderStatus};
 
 /// Implementation of OrderParsable for EIP-7683 orders
+#[cfg(feature = "oif-interfaces")]
 impl OrderParsable for Eip7683OrderData {
 	fn parse_available_inputs(&self) -> Vec<OrderInput> {
 		let origin_chain = self.origin_chain_id.try_into().unwrap_or(1);

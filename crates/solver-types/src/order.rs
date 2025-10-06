@@ -11,9 +11,12 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::{
-	Address, AssetAmount, ChainData, Eip7683OrderData, OrderInput, OrderOutput, SettlementType,
-	TransactionHash, TransactionType,
+	Address, AssetAmount, ChainData, OrderInput, OrderOutput, SettlementType, TransactionHash,
+	TransactionType,
 };
+
+#[cfg(feature = "oif-interfaces")]
+use crate::Eip7683OrderData;
 
 /// Information about a chain and its associated settler contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +229,7 @@ pub struct Order {
 
 impl Order {
 	/// Parse the order data based on its standard
+	#[cfg(feature = "oif-interfaces")]
 	pub fn parse_order_data(&self) -> Result<Box<dyn OrderParsable>, Box<dyn std::error::Error>> {
 		match self.standard.as_str() {
 			"eip7683" => {
