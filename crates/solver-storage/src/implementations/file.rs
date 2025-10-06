@@ -512,7 +512,7 @@ impl StorageInterface for FileStorage {
 		let data = match fs::read(&path).await {
 			Ok(data) => data,
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-				return Err(StorageError::NotFound)
+				return Err(StorageError::NotFound(key.to_string()))
 			},
 			Err(e) => return Err(StorageError::Backend(e.to_string())),
 		};
@@ -522,7 +522,7 @@ impl StorageInterface for FileStorage {
 			Ok(header) => {
 				// Check if expired
 				if header.is_expired() {
-					return Err(StorageError::NotFound);
+					return Err(StorageError::Expired(key.to_string()));
 				}
 
 				// Return data after header
@@ -718,7 +718,7 @@ impl StorageInterface for FileStorage {
 		for key in keys {
 			match self.get_bytes(key).await {
 				Ok(bytes) => results.push((key.clone(), bytes)),
-				Err(StorageError::NotFound) => continue,
+				Err(StorageError::NotFound(_)) => continue,
 				Err(e) => return Err(e),
 			}
 		}
@@ -857,7 +857,7 @@ mod tests {
 
 		// Test get after delete
 		let result = storage.get_bytes(key).await;
-		assert!(matches!(result, Err(StorageError::NotFound)));
+		assert!(matches!(result, Err(StorageError::NotFound(_))));
 	}
 
 	#[tokio::test]
@@ -882,7 +882,7 @@ mod tests {
 
 		// Should be expired now
 		let result = storage.get_bytes(key).await;
-		assert!(matches!(result, Err(StorageError::NotFound)));
+		assert!(matches!(result, Err(StorageError::NotFound(_))));
 	}
 
 	#[tokio::test]
@@ -904,7 +904,7 @@ mod tests {
 
 		// Should be expired now
 		let result = storage.get_bytes(key).await;
-		assert!(matches!(result, Err(StorageError::NotFound)));
+		assert!(matches!(result, Err(StorageError::NotFound(_))));
 	}
 
 	#[tokio::test]

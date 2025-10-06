@@ -128,6 +128,27 @@ impl From<&Quote> for Option<OrderPayload> {
 }
 
 impl OifOrder {
+	pub fn origin_chain_id(&self) -> u64 {
+		let payload = match self {
+			OifOrder::OifEscrowV0 { payload } => payload,
+			OifOrder::OifResourceLockV0 { payload } => payload,
+			OifOrder::Oif3009V0 { payload, .. } => payload,
+			_ => return 0, // Generic orders not supported
+		};
+		payload
+			.domain
+			.as_object()
+			.and_then(|domain| domain.get("chainId"))
+			.and_then(|chain_id| {
+				// Try to parse as string first, then as u64
+				chain_id
+					.as_str()
+					.and_then(|s| s.parse::<u64>().ok())
+					.or_else(|| chain_id.as_u64())
+			})
+			.unwrap_or(0)
+	}
+
 	/// Get the order type string for this order
 	pub fn order_type(&self) -> &'static str {
 		match self {

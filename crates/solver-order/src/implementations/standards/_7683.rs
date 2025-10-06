@@ -59,7 +59,7 @@ impl Eip7683OrderImpl {
 		match lock_type {
 			LockType::ResourceLock => {
 				// Decode to StandardOrder for Compact
-				let std_order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+				let std_order = StandardOrder::abi_decode_validate(order_bytes).map_err(|e| {
 					OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
 				})?;
 
@@ -68,7 +68,7 @@ impl Eip7683OrderImpl {
 			},
 			LockType::Permit2Escrow | LockType::Eip3009Escrow => {
 				// Decode to StandardOrder for Escrow contracts
-				let std_order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+				let std_order = StandardOrder::abi_decode_validate(order_bytes).map_err(|e| {
 					OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
 				})?;
 
@@ -132,7 +132,7 @@ impl Eip7683OrderImpl {
 			.map_err(|e| OrderError::ValidationFailed(format!("Invalid hex: {}", e)))?;
 
 		// Decode using alloy's ABI decoder
-		StandardOrder::abi_decode(&bytes, true).map_err(|e| {
+		StandardOrder::abi_decode_validate(&bytes).map_err(|e| {
 			OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
 		})
 	}
@@ -576,7 +576,7 @@ impl OrderInterface for Eip7683OrderImpl {
 	/// Validates EIP-7683 order bytes by decoding to StandardOrder and validating.
 	async fn validate_order(&self, order_bytes: &Bytes) -> Result<StandardOrder, OrderError> {
 		// Decode using the StandardOrder from types module
-		let standard_order = StandardOrder::abi_decode(order_bytes, true).map_err(|e| {
+		let standard_order = StandardOrder::abi_decode_validate(order_bytes).map_err(|e| {
 			OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
 		})?;
 

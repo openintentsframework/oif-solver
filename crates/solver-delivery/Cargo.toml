@@ -5,16 +5,17 @@ edition = "2021"
 rust-version.workspace = true
 
 [dependencies]
-alloy-consensus = "0.8"
-alloy-network = "0.8"
-alloy-primitives = "0.8"
-alloy-provider = "0.8"
-alloy-rpc-types = "0.8"
-alloy-signer = "0.8"
-alloy-signer-local = "0.8"
-alloy-sol-types = "0.8"
-alloy-transport = "0.8"
-alloy-transport-http = "0.8"
+alloy-consensus = "1.0.37"
+alloy-network = "1.0.37"
+alloy-primitives = "1.0.37"
+alloy-provider = "1.0.37"
+alloy-rpc-types = "1.0.37"
+alloy-rpc-client = "1.0.37"
+alloy-signer = "1.0.37"
+alloy-signer-local = "1.0.37"
+alloy-sol-types = "1.0.37"
+alloy-transport = "1.0.37"
+alloy-transport-http = "1.0.37"
 async-trait = "0.1"
 hex = "0.4"
 reqwest = "0.12"
@@ -22,7 +23,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 solver-account = { path = "../solver-account" }
 solver-types = { path = "../solver-types" }
-thiserror = "1.0"
+thiserror = "2.0.17"
 tokio = { version = "1.0", features = ["rt-multi-thread"] }
 toml = { workspace = true }
 tracing = "0.1"

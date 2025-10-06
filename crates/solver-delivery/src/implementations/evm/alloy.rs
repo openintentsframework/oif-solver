@@ -8,19 +8,19 @@ use alloy_network::EthereumWallet;
 use alloy_primitives::{Address, Bytes, FixedBytes, U256};
 use alloy_provider::{
 	fillers::{CachedNonceManager, ChainIdFiller, GasFiller, NonceFiller},
-	Provider, ProviderBuilder,
+	DynProvider, Provider, ProviderBuilder,
 };
+use alloy_rpc_client::RpcClient;
 use alloy_rpc_types::TransactionRequest;
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
-use alloy_transport_http::Http;
+use alloy_transport::layers::RetryBackoffLayer;
 use async_trait::async_trait;
 use solver_types::{
 	with_0x_prefix, ConfigSchema, Field, FieldType, NetworksConfig, Schema,
 	Transaction as SolverTransaction, TransactionHash, TransactionReceipt,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Alloy-based EVM delivery implementation.
 ///
@@ -29,7 +29,7 @@ use std::sync::Arc;
 /// and confirmation tracking. Supports multiple networks with a single instance.
 pub struct AlloyDelivery {
 	/// Alloy providers for each supported network.
-	providers: HashMap<u64, Arc<dyn Provider<Http<reqwest::Client>> + Send + Sync>>,
+	providers: HashMap<u64, DynProvider>,
 }
 
 impl AlloyDelivery {
@@ -79,32 +79,38 @@ impl AlloyDelivery {
 			let chain_signer = signer.clone().with_chain_id(Some(*network_id));
 			let wallet = EthereumWallet::from(chain_signer);
 
-			// Create provider with explicit cached nonce management to avoid race conditions
+			// Configure retry layer for handling network errors, rate limits, and execution reverts
+			let retry_layer = RetryBackoffLayer::new(
+				5,    // max_retry: retry up to 5 times
+				1000, // backoff: initial backoff in milliseconds
+				10,   // cups: compute units per second
+			);
+
+			// Create RPC client with retry capabilities
+			let client = RpcClient::builder().layer(retry_layer).http(url);
+
+			// Create provider with simple nonce management and retry capabilities
 			let provider = ProviderBuilder::new()
 				.filler(NonceFiller::new(CachedNonceManager::default()))
 				.filler(GasFiller)
 				.filler(ChainIdFiller::default())
 				.wallet(wallet)
-				.on_http(url);
+				.connect_client(client);
 
 			provider
 				.client()
 				.set_poll_interval(std::time::Duration::from_secs(7));
 
-			providers.insert(
-				*network_id,
-				Arc::new(provider) as Arc<dyn Provider<Http<reqwest::Client>> + Send + Sync>,
-			);
+			// Use type erasure to simplify the provider type
+			let dyn_provider = provider.erased();
+			providers.insert(*network_id, dyn_provider);
 		}
 
 		Ok(Self { providers })
 	}
 
 	/// Gets the provider for a specific chain ID.
-	fn get_provider(
-		&self,
-		chain_id: u64,
-	) -> Result<&Arc<dyn Provider<Http<reqwest::Client>> + Send + Sync>, DeliveryError> {
+	fn get_provider(&self, chain_id: u64) -> Result<&DynProvider, DeliveryError> {
 		self.providers.get(&chain_id).ok_or_else(|| {
 			DeliveryError::Network(format!("No provider configured for chain ID {}", chain_id))
 		})
@@ -217,24 +223,20 @@ impl DeliveryInterface for AlloyDelivery {
 		// Get the transaction hash
 		let tx_hash = *pending_tx.tx_hash();
 		let hash_str = with_0x_prefix(&hex::encode(tx_hash.0));
+		let tx_hash_obj = TransactionHash(tx_hash.0.to_vec());
 
-		// Wait briefly to ensure transaction is in mempool
-		tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-		// Verify the transaction exists
-		match provider.get_transaction_by_hash(tx_hash).await {
-			Ok(Some(_)) => {
+		// Use wait_for_confirmation with 0 confirmations to verify the transaction is in mempool
+		match self.wait_for_confirmation(&tx_hash_obj, chain_id, 0).await {
+			Ok(_) => {
 				tracing::info!(tx_hash = %hash_str, chain_id = chain_id, "Transaction confirmed in mempool");
-			},
-			Ok(None) => {
-				tracing::warn!(tx_hash = %hash_str, chain_id = chain_id, "Transaction not found in mempool after submission");
 			},
 			Err(e) => {
 				tracing::warn!(tx_hash = %hash_str, chain_id = chain_id, "Could not verify transaction in mempool: {}", e);
+				// Don't fail the submission - the transaction might still be valid
 			},
 		}
 
-		Ok(TransactionHash(tx_hash.0.to_vec()))
+		Ok(tx_hash_obj)
 	}
 
 	async fn wait_for_confirmation(
@@ -449,7 +451,7 @@ impl DeliveryInterface for AlloyDelivery {
 
 				let call_result = provider
 					.call(
-						&TransactionRequest::default()
+						TransactionRequest::default()
 							.to(token_addr)
 							.input(call_data.into()),
 					)
@@ -506,7 +508,7 @@ impl DeliveryInterface for AlloyDelivery {
 			.input(call_data.into());
 
 		let call_result = provider
-			.call(&call_request)
+			.call(call_request)
 			.await
 			.map_err(|e| DeliveryError::Network(format!("Failed to call allowance: {}", e)))?;
 
@@ -554,7 +556,7 @@ impl DeliveryInterface for AlloyDelivery {
 		// The provider with wallet will automatically handle setting the `from` field
 		// when needed for gas estimation
 		let gas = provider
-			.estimate_gas(&request)
+			.estimate_gas(request)
 			.await
 			.map_err(|e| DeliveryError::Network(format!("Failed to estimate gas: {}", e)))?;
 		Ok(gas)
@@ -572,7 +574,7 @@ impl DeliveryInterface for AlloyDelivery {
 
 		// Execute the call without submitting a transaction
 		let result = provider
-			.call(&request)
+			.call(request)
 			.await
 			.map_err(|e| DeliveryError::Network(format!("Failed to execute eth_call: {}", e)))?;
 

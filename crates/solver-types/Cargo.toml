@@ -9,11 +9,14 @@ default = ["oif-interfaces"]
 oif-interfaces = ["alloy-sol-types", "alloy-contract"]
 
 [dependencies]
-alloy-primitives = { version = "0.8", features = ["std", "serde"] }
-alloy-rpc-types = { version = "0.8" }
-alloy-signer = { version = "0.8" }
-alloy-sol-types = { version = "0.8", features = ["std"], optional = true }
-alloy-contract = { version = "0.8", optional = true }
+alloy-primitives = { version = "1.0.37", features = ["std", "serde"] }
+alloy-provider = { version = "1.0.37" }
+alloy-rpc-client = { version = "1.0.37" }
+alloy-rpc-types = { version = "1.0.37" }
+alloy-signer = { version = "1.0.37" }
+alloy-sol-types = { version = "1.0.37", features = ["std"], optional = true }
+alloy-contract = { version = "1.0.37", optional = true }
+alloy-transport = { version = "1.0.37" }
 async-trait = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }

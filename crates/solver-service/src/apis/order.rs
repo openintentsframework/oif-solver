@@ -53,11 +53,11 @@ async fn process_order_request(
 			// Order found in storage, convert to OrderResponse
 			convert_order_to_response(order).await
 		},
-		Err(solver_storage::StorageError::NotFound) => {
+		Err(solver_storage::StorageError::NotFound(key)) => {
 			// Order not found in storage
 			Err(GetOrderError::NotFound(format!(
-				"Order not found: {}",
-				order_id
+				"Order {} with key {} not found",
+				order_id, key
 			)))
 		},
 		Err(e) => {
@@ -448,7 +448,7 @@ mod tests {
 		backend
 			.expect_get_bytes()
 			.with(eq("orders:missing"))
-			.returning(|_| Box::pin(async move { Err(StorageError::NotFound) }));
+			.returning(|_| Box::pin(async move { Err(StorageError::NotFound("key".to_string())) }));
 
 		let solver = create_test_solver_engine(backend).await;
 

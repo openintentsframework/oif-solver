@@ -5,9 +5,9 @@ edition = "2021"
 rust-version.workspace = true
 
 [dependencies]
-alloy-dyn-abi = "0.8"
-alloy-primitives = "0.8"
-alloy-sol-types = "0.8"
+alloy-dyn-abi = "1.0.37"
+alloy-primitives = "1.0.37"
+alloy-sol-types = "1.0.37"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"

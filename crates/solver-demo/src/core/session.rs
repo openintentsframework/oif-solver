@@ -440,7 +440,7 @@ impl SessionStore {
 			"OutputSettler" => contract_set.output_settler = Some(address_str),
 			"Permit2" => contract_set.permit2 = Some(address_str),
 			"TheCompact" => contract_set.compact = Some(address_str),
-			"Allocator" => contract_set.allocator = Some(address_str),
+			"AlwaysOKAllocator" => contract_set.allocator = Some(address_str),
 			"InputOracle" => contract_set.input_oracle = Some(address_str),
 			"OutputOracle" => contract_set.output_oracle = Some(address_str),
 			name if name.starts_with("MockERC20") || name.contains("Token") => {

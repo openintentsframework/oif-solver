@@ -394,7 +394,7 @@ impl SigningService {
 	///
 	/// # Arguments
 	/// * `payload` - Order payload with EIP-3009 data
-	/// * `_metadata` - Additional metadata for EIP-3009
+	/// * `metadata` - Additional metadata for EIP-3009 containing domain_separator if available
 	/// * `provider` - Blockchain provider for domain separator fetching
 	///
 	/// # Returns
@@ -402,46 +402,65 @@ impl SigningService {
 	///
 	/// # Errors
 	/// Returns Error if domain extraction or digest computation fails
-	#[instrument(skip(self, payload, _metadata, provider), fields(primary_type = %payload.primary_type))]
+	#[instrument(skip(self, payload, metadata, provider), fields(primary_type = %payload.primary_type))]
 	async fn compute_eip3009_digest(
 		&self,
 		payload: &OrderPayload,
-		_metadata: &serde_json::Value,
+		metadata: &serde_json::Value,
 		provider: Provider,
 	) -> Result<[u8; 32]> {
 		logging::debug_operation("EIP-3009 digest", "computing using solver_types utility");
 
-		// Extract domain info to fetch domain separator from contract
-		let domain = payload
-			.domain
-			.as_object()
-			.ok_or_else(|| anyhow!("Missing domain in payload"))?;
-		let chain_id = domain["chainId"]
-			.as_str()
-			.and_then(|s| s.parse::<u64>().ok())
-			.or_else(|| domain["chainId"].as_u64())
-			.ok_or_else(|| anyhow!("Missing or invalid chainId"))?;
-		let verifying_contract = domain["verifyingContract"]
-			.as_str()
-			.ok_or_else(|| anyhow!("Missing verifyingContract"))?
-			.parse::<Address>()
-			.map_err(|e| anyhow!("Invalid verifyingContract: {}", e))?;
+		// Try to get domain separator from metadata first (if provided by quote generation)
+		let domain_separator = if let Some(domain_sep_str) =
+			metadata.get("domain_separator").and_then(|v| v.as_str())
+		{
+			// Parse domain separator from metadata
+			let domain_sep_hex = domain_sep_str.trim_start_matches("0x");
+			let domain_sep_bytes = hex::decode(domain_sep_hex)
+				.map_err(|e| anyhow!("Failed to decode domain separator from metadata: {}", e))?;
 
-		logging::debug_data(
-			"Fetching domain separator",
-			"token contract",
-			&format!("chain: {}, contract: {}", chain_id, verifying_contract),
-		);
+			if domain_sep_bytes.len() != 32 {
+				return Err(anyhow!(
+					"Invalid domain separator length in metadata: expected 32 bytes, got {}",
+					domain_sep_bytes.len()
+				)
+				.into());
+			}
 
-		// Fetch domain separator from token contract (like the old demo)
-		let domain_separator = self
-			.fetch_domain_separator(chain_id, verifying_contract, provider)
-			.await?;
-		logging::debug_data(
-			"Retrieved domain separator",
-			"contract",
-			&hex::encode(domain_separator),
-		);
+			let mut domain_separator = [0u8; 32];
+			domain_separator.copy_from_slice(&domain_sep_bytes);
+
+			domain_separator
+		} else {
+			// Fallback: fetch domain separator from token contract
+			let domain = payload
+				.domain
+				.as_object()
+				.ok_or_else(|| anyhow!("Missing domain in payload"))?;
+			let chain_id = domain["chainId"]
+				.as_str()
+				.and_then(|s| s.parse::<u64>().ok())
+				.or_else(|| domain["chainId"].as_u64())
+				.ok_or_else(|| anyhow!("Missing or invalid chainId"))?;
+			let verifying_contract = domain["verifyingContract"]
+				.as_str()
+				.ok_or_else(|| anyhow!("Missing verifyingContract"))?
+				.parse::<Address>()
+				.map_err(|e| anyhow!("Invalid verifyingContract: {}", e))?;
+
+			let domain_separator = self
+				.fetch_domain_separator(chain_id, verifying_contract, provider)
+				.await?;
+
+			logging::debug_data(
+				"Retrieved domain separator from contract",
+				"contract",
+				&hex::encode(domain_separator),
+			);
+
+			domain_separator
+		};
 
 		// Use solver_types utility function with the contract-fetched domain separator
 		let digest =
@@ -517,6 +536,7 @@ impl SigningService {
 		let domain_separator = self
 			.fetch_domain_separator(chain_id, verifying_contract, provider)
 			.await?;
+
 		logging::debug_data(
 			"Retrieved domain separator",
 			"Compact contract",

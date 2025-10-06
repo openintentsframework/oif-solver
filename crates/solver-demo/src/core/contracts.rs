@@ -14,7 +14,6 @@ use crate::types::{
 use alloy_dyn_abi::{DynSolValue, JsonAbiExt};
 use alloy_json_abi::JsonAbi;
 use alloy_primitives::{Address, Bytes, U256};
-use alloy_provider::Provider as AlloyProvider;
 use alloy_rpc_types::TransactionRequest;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -132,7 +131,7 @@ impl Contracts {
 		let call = TransactionRequest::default().to(token).input(data.into());
 
 		let result =
-			provider.inner().call(&call).await.map_err(|e| {
+			provider.inner().call(call).await.map_err(|e| {
 				Error::ContractCallFailed(format!("Call to {} failed: {}", method, e))
 			})?;
 
@@ -289,7 +288,7 @@ impl Contracts {
 		let call = TransactionRequest::default().to(compact).input(data.into());
 
 		let result =
-			provider.inner().call(&call).await.map_err(|e| {
+			provider.inner().call(call).await.map_err(|e| {
 				Error::ContractCallFailed(format!("Call to {} failed: {}", method, e))
 			})?;
 

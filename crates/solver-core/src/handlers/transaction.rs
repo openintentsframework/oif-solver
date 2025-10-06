@@ -118,19 +118,19 @@ impl TransactionHandler {
 			return Ok(());
 		}
 
+		// Retrieve the order for settlement callback
+		let order: Order = self
+			.storage
+			.retrieve(StorageKey::Orders.as_str(), &order_id)
+			.await
+			.map_err(|e| TransactionError::Storage(e.to_string()))?;
+
 		// For PostFill and PreClaim, call settlement callback BEFORE other processing
 		// This allows Hyperlane to extract and store message IDs from receipts
 		if matches!(
 			tx_type,
 			TransactionType::PostFill | TransactionType::PreClaim
 		) {
-			// Retrieve the order for settlement callback
-			let order: Order = self
-				.storage
-				.retrieve(StorageKey::Orders.as_str(), &order_id)
-				.await
-				.map_err(|e| TransactionError::Storage(e.to_string()))?;
-
 			// Call settlement-specific handler
 			if let Ok(settlement) = self.settlement.find_settlement_for_order(&order) {
 				settlement
@@ -145,19 +145,19 @@ impl TransactionHandler {
 		// Handle based on transaction type
 		match tx_type {
 			TransactionType::Prepare => {
-				self.handle_prepare_confirmed(tx_hash).await?;
+				self.handle_prepare_confirmed(tx_hash, order).await?;
 			},
 			TransactionType::Fill => {
-				self.handle_fill_confirmed(tx_hash).await?;
+				self.handle_fill_confirmed(tx_hash, order).await?;
 			},
 			TransactionType::PostFill => {
-				self.handle_post_fill_confirmed(tx_hash).await?;
+				self.handle_post_fill_confirmed(tx_hash, order).await?;
 			},
 			TransactionType::PreClaim => {
-				self.handle_pre_claim_confirmed(tx_hash).await?;
+				self.handle_pre_claim_confirmed(tx_hash, order).await?;
 			},
 			TransactionType::Claim => {
-				self.handle_claim_confirmed(tx_hash).await?;
+				self.handle_claim_confirmed(tx_hash, order).await?;
 			},
 		}
 
@@ -190,22 +190,9 @@ impl TransactionHandler {
 	/// to trigger the fill transaction.
 	async fn handle_prepare_confirmed(
 		&self,
-		tx_hash: TransactionHash,
+		_tx_hash: TransactionHash,
+		order: Order,
 	) -> Result<(), TransactionError> {
-		// Look up the order ID from the transaction hash
-		let order_id = self
-			.storage
-			.retrieve::<String>(StorageKey::OrderByTxHash.as_str(), &hex::encode(&tx_hash.0))
-			.await
-			.map_err(|e| TransactionError::Storage(e.to_string()))?;
-
-		// Retrieve the full order with execution parameters
-		let order: Order = self
-			.storage
-			.retrieve(StorageKey::Orders.as_str(), &order_id)
-			.await
-			.map_err(|e| TransactionError::Storage(format!("Failed to retrieve order: {}", e)))?;
-
 		// Extract execution params
 		let params = order.execution_params.clone().ok_or_else(|| {
 			TransactionError::Service("Order missing execution params".to_string())
@@ -231,25 +218,14 @@ impl TransactionHandler {
 	/// post-fill transaction generation if needed.
 	async fn handle_fill_confirmed(
 		&self,
-		tx_hash: TransactionHash,
+		_tx_hash: TransactionHash,
+		order: Order,
 	) -> Result<(), TransactionError> {
-		// Look up the order ID from the transaction hash
-		let order_id = self
-			.storage
-			.retrieve::<String>(StorageKey::OrderByTxHash.as_str(), &hex::encode(&tx_hash.0))
-			.await
-			.map_err(|e| TransactionError::Storage(e.to_string()))?;
-
-		// Retrieve the order
-		let order: Order = self
-			.storage
-			.retrieve(StorageKey::Orders.as_str(), &order_id)
-			.await
-			.map_err(|e| TransactionError::Storage(e.to_string()))?;
+		let order_id = order.id;
 
 		// Update status from Executing to Executed (fill completed)
 		self.state_machine
-			.transition_order_status(&order.id, OrderStatus::Executed)
+			.transition_order_status(&order_id, OrderStatus::Executed)
 			.await
 			.map_err(|e| TransactionError::State(e.to_string()))?;
 
@@ -269,25 +245,14 @@ impl TransactionHandler {
 	/// monitoring for settlement readiness.
 	async fn handle_post_fill_confirmed(
 		&self,
-		tx_hash: TransactionHash,
+		_tx_hash: TransactionHash,
+		order: Order,
 	) -> Result<(), TransactionError> {
-		// Look up the order ID from the transaction hash
-		let order_id = self
-			.storage
-			.retrieve::<String>(StorageKey::OrderByTxHash.as_str(), &hex::encode(&tx_hash.0))
-			.await
-			.map_err(|e| TransactionError::Storage(e.to_string()))?;
-
-		// Retrieve the order
-		let order: Order = self
-			.storage
-			.retrieve(StorageKey::Orders.as_str(), &order_id)
-			.await
-			.map_err(|e| TransactionError::Storage(e.to_string()))?;
+		let order_id = order.id;
 
 		// Update status to PostFilled
 		self.state_machine
-			.transition_order_status(&order.id, OrderStatus::PostFilled)
+			.transition_order_status(&order_id, OrderStatus::PostFilled)
 			.await
 			.map_err(|e| TransactionError::State(e.to_string()))?;
 
@@ -313,15 +278,10 @@ impl TransactionHandler {
 	/// the final claim transaction.
 	async fn handle_pre_claim_confirmed(
 		&self,
-		tx_hash: TransactionHash,
+		_tx_hash: TransactionHash,
+		order: Order,
 	) -> Result<(), TransactionError> {
-		// Look up the order ID from the transaction hash
-		let order_id = self
-			.storage
-			.retrieve::<String>(StorageKey::OrderByTxHash.as_str(), &hex::encode(&tx_hash.0))
-			.await
-			.map_err(|e| TransactionError::Storage(e.to_string()))?;
-
+		let order_id = order.id;
 		// Update status from Settled to PreClaimed
 		self.state_machine
 			.transition_order_status(&order_id, OrderStatus::PreClaimed)
@@ -345,14 +305,9 @@ impl TransactionHandler {
 	async fn handle_claim_confirmed(
 		&self,
 		tx_hash: TransactionHash,
+		order: Order,
 	) -> Result<(), TransactionError> {
-		// Look up the order ID from the transaction hash
-		let order_id = self
-			.storage
-			.retrieve::<String>(StorageKey::OrderByTxHash.as_str(), &hex::encode(&tx_hash.0))
-			.await
-			.map_err(|e| TransactionError::Storage(e.to_string()))?;
-
+		let order_id = order.id;
 		// Update order with claim transaction hash and mark as finalized
 		self.state_machine
 			.update_order_with(&order_id, |order| {
