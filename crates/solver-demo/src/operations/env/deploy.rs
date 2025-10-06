@@ -19,6 +19,7 @@ use crate::{
 	Context,
 };
 use alloy_dyn_abi::DynSolValue;
+use alloy_network::TransactionBuilder;
 use alloy_primitives::{hex, Address, Bytes, U256};
 use alloy_rpc_types::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
@@ -151,10 +152,10 @@ impl ContractDeployer {
 		}
 
 		// Create signer for deployment
-		let signer = PrivateKeySigner::from_str(constants::anvil_accounts::SOLVER_PRIVATE_KEY)
-			.map_err(|e| Error::InvalidConfig(format!("Invalid private key: {}", e)))?;
+		let signer = self.get_solver_signer()?;
 
 		let tx = TransactionRequest::default()
+			.with_kind(alloy_primitives::TxKind::Create)
 			.input(data.into())
 			.value(U256::ZERO);
 
@@ -185,9 +186,9 @@ impl ContractDeployer {
 				.join(format!("{}.sol/{}.json", contract_name, contract_name)),
 		];
 
-		for path in possible_paths {
+		for path in &possible_paths {
 			if path.exists() {
-				let content = std::fs::read_to_string(&path).map_err(|e| {
+				let content = std::fs::read_to_string(path).map_err(|e| {
 					Error::InvalidConfig(format!("Failed to read {}: {}", path.display(), e))
 				})?;
 
@@ -496,5 +497,26 @@ impl ContractDeployer {
 
 		contracts.sort();
 		Ok(contracts)
+	}
+
+	/// Get user signer for transactions
+	fn get_solver_signer(&self) -> Result<alloy_signer_local::PrivateKeySigner> {
+		let private_key_str = self
+			.ctx
+			.config
+			.accounts()
+			.solver
+			.private_key
+			.as_ref()
+			.ok_or_else(|| {
+				crate::types::error::Error::InvalidConfig("No private key configured".to_string())
+			})?
+			.expose_secret();
+
+		private_key_str
+			.parse::<alloy_signer_local::PrivateKeySigner>()
+			.map_err(|e| {
+				crate::types::error::Error::InvalidConfig(format!("Invalid private key: {}", e))
+			})
 	}
 }

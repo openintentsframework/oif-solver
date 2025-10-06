@@ -713,7 +713,6 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 
 			let intents = intent_ops.build_batch(&input).await?;
 
-			// Determine output file - default to requests/get_quotes.req.json like old demo
 			let output_path = if let Some(custom_output) = output {
 				custom_output
 			} else {
@@ -732,7 +731,6 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 			logging::success(&format!("Built {} intents", intents.len()));
 			logging::success(&format!("Batch saved to {}", output_path.display()));
 
-			// Show next steps like old demo
 			logging::next_step(&format!(
 				"Test quotes with 'oif-demo quote test {}'",
 				output_path.display()

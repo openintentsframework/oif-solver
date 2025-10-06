@@ -7,8 +7,8 @@ use crate::{DeliveryError, DeliveryInterface};
 use alloy_network::EthereumWallet;
 use alloy_primitives::{Address, Bytes, FixedBytes, U256};
 use alloy_provider::{
-	fillers::{ChainIdFiller, GasFiller, NonceFiller, SimpleNonceManager},
-	DynProvider, PendingTransactionConfig, PendingTransactionError, Provider, ProviderBuilder,
+	fillers::{CachedNonceManager, ChainIdFiller, GasFiller, NonceFiller},
+	DynProvider, Provider, ProviderBuilder,
 };
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types::TransactionRequest;
@@ -21,7 +21,6 @@ use solver_types::{
 	Transaction as SolverTransaction, TransactionHash, TransactionReceipt,
 };
 use std::collections::HashMap;
-use std::time::Duration;
 
 /// Alloy-based EVM delivery implementation.
 ///
@@ -92,7 +91,7 @@ impl AlloyDelivery {
 
 			// Create provider with simple nonce management and retry capabilities
 			let provider = ProviderBuilder::new()
-				.filler(NonceFiller::new(SimpleNonceManager::default()))
+				.filler(NonceFiller::new(CachedNonceManager::default()))
 				.filler(GasFiller)
 				.filler(ChainIdFiller::default())
 				.wallet(wallet)
@@ -247,62 +246,103 @@ impl DeliveryInterface for AlloyDelivery {
 		confirmations: u64,
 	) -> Result<TransactionReceipt, DeliveryError> {
 		let tx_hash = FixedBytes::<32>::from_slice(&hash.0);
-		// Approximate seconds per confirmation
-		let seconds_per_confirmation = 45; // TODO: this should be configurable or auto-detect based on network congestion
+
+		// Poll interval for checking confirmations - aligned with monitor's 3-second interval
+		let poll_interval = tokio::time::Duration::from_secs(3);
+		// Allow 3x ~15 seconds per confirmation (typical block time)
+		let seconds_per_confirmation = 45;
 		let max_timeout = 3600; // Cap at 1 hour
 		let timeout_seconds = (confirmations * seconds_per_confirmation)
 			.max(seconds_per_confirmation)
 			.min(max_timeout);
-		let timeout = Duration::from_secs(timeout_seconds);
+		let max_wait_time = tokio::time::Duration::from_secs(timeout_seconds);
+		let start_time = tokio::time::Instant::now();
 
-		if confirmations == 0 {
-			tracing::info!(
-				"Waiting for mempool confirmation (timeout: {}s)",
-				timeout_seconds
-			);
-		} else {
-			tracing::info!(
-				"Waiting for {} confirmations (timeout: {}s)",
-				confirmations,
-				timeout_seconds
-			);
-		}
+		// Log high-level info about what we're doing
+		tracing::info!(
+			"Waiting for {} confirmations (timeout: {}s)",
+			confirmations,
+			timeout_seconds
+		);
 
 		let provider = self.get_provider(chain_id)?;
 
-		// Configure the pending transaction watcher
-		let config = PendingTransactionConfig::new(tx_hash)
-			.with_required_confirmations(confirmations)
-			.with_timeout(Some(timeout));
+		loop {
+			// Check if we've exceeded max wait time
+			if start_time.elapsed() > max_wait_time {
+				return Err(DeliveryError::Network(format!(
+					"Timeout waiting for {} confirmations after {} seconds",
+					confirmations,
+					max_wait_time.as_secs()
+				)));
+			}
 
-		// Use Alloy's built-in transaction watching
-		let pending_tx = provider
-			.watch_pending_transaction(config)
-			.await
-			.map_err(|e| match e {
-				PendingTransactionError::TxWatcher(_) => {
-					DeliveryError::Network(format!("Transaction watch failed: {}", e))
+			// Get transaction receipt
+			let receipt = match provider.get_transaction_receipt(tx_hash).await {
+				Ok(Some(receipt)) => receipt,
+				Ok(None) => {
+					// Transaction not yet mined, wait and retry
+					tokio::time::sleep(poll_interval).await;
+					continue;
 				},
-				PendingTransactionError::FailedToRegister => {
-					DeliveryError::Network("Failed to register transaction watcher".to_string())
+				Err(e) => {
+					return Err(DeliveryError::Network(format!(
+						"Failed to get receipt: {}",
+						e
+					)));
 				},
-				PendingTransactionError::TransportError(_) => {
-					DeliveryError::Network(format!("Transport error: {}", e))
-				},
-				PendingTransactionError::Recv(_) => {
-					DeliveryError::Network(format!("Failed to receive response: {}", e))
-				},
+			};
+
+			// Get current block number
+			let current_block = provider.get_block_number().await.map_err(|e| {
+				DeliveryError::Network(format!("Failed to get block number: {}", e))
 			})?;
 
-		// Wait for the transaction to be confirmed (this returns the tx hash when confirmed)
-		let confirmed_hash = pending_tx
-			.await
-			.map_err(|e| DeliveryError::Network(format!("Failed to confirm transaction: {}", e)))?;
+			let tx_block = receipt.block_number.unwrap_or(0);
+			let current_confirmations = current_block.saturating_sub(tx_block);
 
-		// Now get the actual receipt using the confirmed hash
-		// get_receipt already handles all the conversion and formatting for us
-		self.get_receipt(&TransactionHash(confirmed_hash.0.to_vec()), chain_id)
-			.await
+			// Check if we have enough confirmations
+			if current_confirmations >= confirmations {
+				// Extract block timestamp from the first log that has it
+				let block_timestamp = receipt
+					.inner
+					.logs()
+					.iter()
+					.find_map(|log| log.block_timestamp);
+
+				// Convert alloy logs to our Log type
+				let logs = receipt
+					.inner
+					.logs()
+					.iter()
+					.map(|log| solver_types::Log {
+						address: solver_types::Address(log.address().0.to_vec()),
+						topics: log
+							.topics()
+							.iter()
+							.map(|topic| solver_types::H256(topic.0))
+							.collect(),
+						data: log.inner.data.data.to_vec(),
+					})
+					.collect();
+
+				return Ok(TransactionReceipt {
+					hash: TransactionHash(receipt.transaction_hash.0.to_vec()),
+					block_number: tx_block,
+					success: receipt.status(),
+					logs,
+					block_timestamp,
+				});
+			}
+
+			tracing::debug!(
+				"Waiting for {} more confirmations...",
+				confirmations.saturating_sub(current_confirmations)
+			);
+
+			// Not enough confirmations yet, wait and retry
+			tokio::time::sleep(poll_interval).await;
+		}
 	}
 
 	async fn get_receipt(

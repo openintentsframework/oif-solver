@@ -243,9 +243,8 @@ impl QuoteOps {
 		// Get the private key from the signer
 		let private_key = format!("0x{}", hex::encode(signer.to_bytes()));
 
-		// Create a provider for the appropriate chain (we'll use the default chain for now)
-		let chain = self.ctx.default_chain();
-		let provider = self.ctx.provider(chain).await?;
+		let chain_id = quote.order.origin_chain_id();
+		let provider = self.ctx.provider(ChainId::Custom { id: chain_id }).await?;
 
 		// Use the SigningService to create the signature
 		let signature = self

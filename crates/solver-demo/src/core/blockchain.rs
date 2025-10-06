@@ -8,6 +8,7 @@ use crate::types::{
 	chain::ChainId,
 	error::{Error, Result},
 };
+use alloy_network::EthereumWallet;
 use alloy_primitives::{Address, B256, U256};
 use alloy_provider::{Provider as AlloyProvider, ProviderBuilder};
 use alloy_rpc_types::{TransactionReceipt, TransactionRequest};
@@ -23,6 +24,7 @@ use std::sync::Arc;
 pub struct Provider {
 	inner: Arc<dyn AlloyProvider + Send + Sync>,
 	chain: ChainId,
+	rpc_url: reqwest::Url,
 }
 
 impl std::fmt::Debug for Provider {
@@ -62,9 +64,14 @@ impl Provider {
 			.await
 			.map_err(|e| Error::RpcError(format!("Failed to connect to {}: {}", rpc_url, e)))?;
 
+		let rpc_url: reqwest::Url = rpc_url
+			.parse()
+			.map_err(|e| Error::RpcError(format!("Invalid RPC URL: {}", e)))?;
+
 		Ok(Self {
 			inner: Arc::new(provider),
 			chain,
+			rpc_url,
 		})
 	}
 
@@ -105,6 +112,14 @@ impl Provider {
 	/// ChainId for this provider instance
 	pub fn chain(&self) -> ChainId {
 		self.chain
+	}
+
+	/// Retrieve the RPC URL for this provider
+	///
+	/// # Returns
+	/// The RPC URL as a string
+	pub fn rpc_url(&self) -> &reqwest::Url {
+		&self.rpc_url
 	}
 
 	/// Access underlying Alloy provider for advanced operations
@@ -185,34 +200,6 @@ impl Provider {
 
 		Ok(result.to_vec())
 	}
-
-	/// Calculate order identifier from standard order structure
-	///
-	/// Simplified implementation that returns placeholder order ID.
-	/// Production version would call contract to compute actual order hash
-	///
-	/// # Arguments
-	/// * `_chain_id` - Blockchain network identifier
-	/// * `_contract_address` - Contract address for order processing
-	/// * `_standard_order` - Standard order structure to hash
-	///
-	/// # Returns
-	/// 32-byte order identifier
-	///
-	/// # Errors
-	/// Returns Error if order computation fails
-	pub async fn compute_order_identifier(
-		&self,
-		_chain_id: u64,
-		_contract_address: Address,
-		_standard_order: &solver_types::standards::eip7683::interfaces::StandardOrder,
-	) -> Result<[u8; 32]> {
-		// For now, return a dummy order identifier
-		// In a real implementation, this would call the contract to compute the order hash
-		let mut order_id = [0u8; 32];
-		order_id[0] = 0x01; // Just to make it non-zero
-		Ok(order_id)
-	}
 }
 
 /// Transaction builder with automatic parameter filling and execution
@@ -249,7 +236,22 @@ impl TxBuilder {
 	/// # Returns
 	/// Transaction builder with signer configured
 	pub fn with_signer(mut self, signer: PrivateKeySigner) -> Self {
-		self.signer = Some(signer);
+		self.signer = Some(signer.clone());
+
+		// Use wallet-enabled provider for better testnet compatibility
+		let wallet = EthereumWallet::from(signer);
+
+		let wallet_provider = ProviderBuilder::new()
+			.wallet(wallet)
+			.connect_http(self.provider.rpc_url.clone());
+
+		// Create a new Provider wrapper with the wallet-enabled provider
+		self.provider = Provider {
+			inner: Arc::new(wallet_provider),
+			chain: self.provider.chain,
+			rpc_url: self.provider.rpc_url.clone(),
+		};
+
 		self
 	}
 
@@ -272,65 +274,36 @@ impl TxBuilder {
 			tx.chain_id = Some(self.provider.chain().id());
 		}
 
-		// If we have a signer, sign the transaction
-		if let Some(signer) = &self.signer {
-			// Set the from address to the signer's address
-			tx.from = Some(signer.address());
-
-			// Fill transaction with gas estimates if needed
-			if tx.gas.is_none() {
-				let gas = self
-					.provider
-					.inner
-					.estimate_gas(tx.clone())
-					.await
-					.map_err(|e| Error::RpcError(format!("Failed to estimate gas: {}", e)))?;
-				tx.gas = Some(gas);
-			}
-
-			// Fill nonce if not set
-			if tx.nonce.is_none() {
-				let nonce = self
-					.provider
-					.inner
-					.get_transaction_count(signer.address())
-					.await
-					.map_err(|e| Error::RpcError(format!("Failed to get nonce: {}", e)))?;
-				tx.nonce = Some(nonce);
-			}
-
-			// Fill gas price if not set
-			if tx.gas_price.is_none() && tx.max_fee_per_gas.is_none() {
-				let gas_price = self
-					.provider
-					.inner
-					.get_gas_price()
-					.await
-					.map_err(|e| Error::RpcError(format!("Failed to get gas price: {}", e)))?;
-				tx.gas_price = Some(gas_price);
-			}
-
-			// Send the transaction with from field set
-			// For local test networks like Anvil, this should work without manual signing
-			let pending = self
+		// Fill transaction with gas estimates if needed
+		if tx.gas.is_none() {
+			let gas = self
 				.provider
 				.inner
-				.send_transaction(tx)
+				.estimate_gas(tx.clone())
 				.await
-				.map_err(|e| Error::RpcError(format!("Failed to send transaction: {}", e)))?;
-
-			Ok(*pending.tx_hash())
-		} else {
-			// No signer provided, send unsigned (for view functions only)
-			let pending = self
-				.provider
-				.inner
-				.send_transaction(tx)
-				.await
-				.map_err(|e| Error::RpcError(format!("Failed to send transaction: {}", e)))?;
-
-			Ok(*pending.tx_hash())
+				.map_err(|e| Error::RpcError(format!("Failed to estimate gas: {}", e)))?;
+			tx.gas = Some(gas);
 		}
+
+		// Fill gas price if not set
+		if tx.gas_price.is_none() && tx.max_fee_per_gas.is_none() {
+			let gas_price = self
+				.provider
+				.inner
+				.get_gas_price()
+				.await
+				.map_err(|e| Error::RpcError(format!("Failed to get gas price: {}", e)))?;
+			tx.gas_price = Some(gas_price);
+		}
+
+		let pending = self
+			.provider
+			.inner
+			.send_transaction(tx)
+			.await
+			.map_err(|e| Error::RpcError(format!("Failed to send transaction: {}", e)))?;
+
+		Ok(*pending.tx_hash())
 	}
 
 	/// Poll blockchain for transaction receipt with timeout

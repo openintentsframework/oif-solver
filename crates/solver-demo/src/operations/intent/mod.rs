@@ -151,7 +151,6 @@ impl IntentOps {
 			SwapType::ExactInput
 		};
 
-		// Build complete intent request following old demo pattern
 		let intent = IntentRequest {
 			intent_type: IntentType::OifSwap,
 			inputs: vec![input],
@@ -175,20 +174,17 @@ impl IntentOps {
 			SettlementType::Compact => vec!["oif-resource-lock-v0".to_string()],
 		};
 
-		// Create GetQuoteRequest following old demo pattern
 		let quote_request = GetQuoteRequest {
 			user: self.create_interop_address(user_addr, params.from_chain)?,
 			intent,
 			supported_types,
 		};
 
-		// Save to storage following old demo pattern
 		if let Some(custom_path) = output_path {
 			// Save to custom path
 			let content = serde_json::to_string_pretty(&quote_request)?;
 			std::fs::write(&custom_path, content)?;
 		} else {
-			// Save to requests subdirectory like old demo
 			let requests_storage = self.ctx.storage.subdir("requests")?;
 			requests_storage.save("get_quote.req", &quote_request)?;
 		}
