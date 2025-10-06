@@ -352,7 +352,7 @@ impl ContractDeployer {
 			.deploy_test_token(
 				provider,
 				"TOKA",
-				"USD Coin",
+				"Token A",
 				constants::DEFAULT_TOKEN_DECIMALS,
 			)
 			.await?;
@@ -360,7 +360,7 @@ impl ContractDeployer {
 			.deploy_test_token(
 				provider,
 				"TOKB",
-				"Tether USD",
+				"Token B",
 				constants::DEFAULT_TOKEN_DECIMALS,
 			)
 			.await?;

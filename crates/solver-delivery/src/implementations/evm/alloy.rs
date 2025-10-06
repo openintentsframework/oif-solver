@@ -261,8 +261,7 @@ impl DeliveryInterface for AlloyDelivery {
 		confirmations: u64,
 	) -> Result<TransactionReceipt, DeliveryError> {
 		let tx_hash = FixedBytes::<32>::from_slice(&hash.0);
-		// Approximate seconds per confirmation
-		let seconds_per_confirmation = 45; // TODO: this should be configurable or auto-detect based on network congestion
+		let seconds_per_confirmation = 60; // TODO: this should be configurable or auto-detect based on network congestion
 		let max_timeout = 3600; // Cap at 1 hour
 		let timeout_seconds = (confirmations * seconds_per_confirmation)
 			.max(seconds_per_confirmation)
