@@ -882,7 +882,7 @@ mod tests {
 
 		// Should be expired now
 		let result = storage.get_bytes(key).await;
-		assert!(matches!(result, Err(StorageError::NotFound(_))));
+		assert!(matches!(result, Err(StorageError::Expired(_))));
 	}
 
 	#[tokio::test]
@@ -904,7 +904,7 @@ mod tests {
 
 		// Should be expired now
 		let result = storage.get_bytes(key).await;
-		assert!(matches!(result, Err(StorageError::NotFound(_))));
+		assert!(matches!(result, Err(StorageError::Expired(_))));
 	}
 
 	#[tokio::test]

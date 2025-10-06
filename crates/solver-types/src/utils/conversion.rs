@@ -700,7 +700,7 @@ mod tests {
 
 		// Test with large numbers
 		let value = Decimal::from_str("999999.994").unwrap();
-		assert_eq!(ceil_dp(value, 2).to_string(), "1000000.00");
+		assert_eq!(ceil_dp(value, 2).to_string(), "1000000");
 
 		// Test with 3 decimal places
 		let value = Decimal::from_str("1.23456").unwrap();

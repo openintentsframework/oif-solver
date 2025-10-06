@@ -154,7 +154,7 @@ mod tests {
 		use std::collections::HashSet;
 
 		let strings: HashSet<&str> = StorageKey::all().map(|k| k.as_str()).collect();
-		assert_eq!(strings.len(), 4, "String representations should be unique");
+		assert_eq!(strings.len(), 5, "String representations should be unique");
 	}
 
 	#[test]
@@ -165,7 +165,7 @@ mod tests {
 		for key in StorageKey::all() {
 			assert!(set.insert(key)); // Should be unique
 		}
-		assert_eq!(set.len(), 4);
+		assert_eq!(set.len(), 5);
 
 		// Test equality
 		assert_eq!(StorageKey::Orders, StorageKey::Orders);

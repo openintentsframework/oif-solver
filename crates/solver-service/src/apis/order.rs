@@ -395,7 +395,7 @@ mod tests {
 		let bytes = std::sync::Arc::new(bytes);
 		backend
 			.expect_get_bytes()
-			.with(eq("orders:order-test"))
+			.with(eq("orders:0xorder-test"))
 			.returning({
 				let bytes = bytes.clone();
 				move |_| {
