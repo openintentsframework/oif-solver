@@ -329,7 +329,7 @@ mod tests {
 		let storage = Arc::new(solver_storage::StorageService::new(Box::new(storage_mock)));
 		let account = test_account();
 		let providers: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> = HashMap::new();
-		let delivery = Arc::new(DeliveryService::new(providers, 1, 3));
+		let delivery = Arc::new(DeliveryService::new(providers, 1));
 		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
 		let strategy = create_strategy(&Value::Table(toml::map::Map::new())).unwrap();
 		let order = Arc::new(OrderService::new(HashMap::new(), strategy));

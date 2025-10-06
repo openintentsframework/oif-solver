@@ -1604,8 +1604,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_generate_quotes_success() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
@@ -1640,8 +1639,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_generate_quotes_no_oracles_configured() {
 		let settlement_service = create_test_settlement_service(false);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
@@ -1655,8 +1653,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_generate_quotes_insufficient_liquidity() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 
@@ -1699,8 +1696,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_generate_resource_lock_order_the_compact() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
@@ -1733,8 +1729,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_generate_eip3009_order() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
 
 		// Get settlement and oracle like in real usage
 		let (_settlement, input_oracle, output_oracle) = settlement_service
@@ -1786,8 +1781,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_build_compact_message() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let request = create_test_request();
 		let params = serde_json::json!({"test": "value"});
@@ -1827,8 +1821,7 @@ mod tests {
 	#[test]
 	fn test_calculate_eta_with_preferences() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 
 		// Test speed preference
@@ -1855,8 +1848,7 @@ mod tests {
 	#[test]
 	fn test_sort_quotes_by_preference_speed() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 
 		let mut quotes = vec![
@@ -1924,8 +1916,7 @@ mod tests {
 	#[test]
 	fn test_sort_quotes_by_preference_other() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 
 		let mut quotes = vec![
@@ -1988,8 +1979,7 @@ mod tests {
 	#[test]
 	fn test_get_quote_validity_seconds() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 
 		// Test with configured validity
@@ -2006,8 +1996,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_generate_quote_for_settlement_resource_lock() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
@@ -2047,8 +2036,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_generate_quote_for_settlement_escrow() {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let config = create_test_config();
 		let request = create_test_request();
@@ -2124,8 +2112,7 @@ mod tests {
 
 	fn create_test_generator() -> QuoteGenerator {
 		let settlement_service = create_test_settlement_service(true);
-		let delivery_service =
-			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1));
 		QuoteGenerator::new(settlement_service, delivery_service)
 	}
 

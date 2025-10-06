@@ -136,7 +136,6 @@ impl ConfigBuilder {
 			delivery: DeliveryConfig {
 				implementations: HashMap::new(),
 				min_confirmations: self.min_confirmations,
-				transaction_poll_interval_seconds: 3,
 			},
 			account: AccountConfig {
 				primary: self.account_primary,

@@ -7,7 +7,8 @@
 use crate::{NetworkConfig, NetworksConfig};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
-use alloy_transport::layers::RetryBackoffLayer;
+use alloy_transport::layers::{RateLimitRetryPolicy, RetryBackoffLayer};
+use alloy_transport::TransportError;
 use std::fmt;
 
 /// Errors that can occur during provider creation.
@@ -77,10 +78,23 @@ pub fn create_http_provider(
 	})?;
 
 	// Configure retry layer for handling network errors, rate limits, and execution reverts
-	let retry_layer = RetryBackoffLayer::new(
-		5,    // max_retry: retry up to 5 times
+	// Extend the default rate limit policy to also retry execution reverts during gas estimation
+	let retry_policy = RateLimitRetryPolicy::default().or(|error: &TransportError| {
+		match error {
+			TransportError::ErrorResp(payload) => {
+				// Retry execution reverts (error code 3) that may be temporary
+				// These often occur during gas estimation due to network congestion or node state issues
+				payload.code == 3 && payload.message.contains("execution reverted")
+			},
+			_ => false,
+		}
+	});
+
+	let retry_layer = RetryBackoffLayer::new_with_policy(
+		5,    // max_retry: retry up to 5 times (applies to both rate limits and execution reverts)
 		1000, // backoff: initial backoff in milliseconds
 		10,   // cups: compute units per second for rate limiting
+		retry_policy,
 	);
 
 	// Create RPC client with retry capabilities

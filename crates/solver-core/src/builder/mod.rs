@@ -284,7 +284,6 @@ impl SolverBuilder {
 		let delivery = Arc::new(DeliveryService::new(
 			delivery_implementations,
 			self.config.delivery.min_confirmations,
-			self.config.delivery.transaction_poll_interval_seconds,
 		));
 
 		// Create discovery implementations

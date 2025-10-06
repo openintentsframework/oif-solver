@@ -509,7 +509,6 @@ fn add_delivery_config(config: &mut String, chain_ids: &[u64]) {
 	);
 	config.push_str("[delivery]\n");
 	config.push_str("min_confirmations = 1\n");
-	config.push_str("transaction_poll_interval_seconds = 3\n\n");
 
 	config.push_str("[delivery.implementations.evm_alloy]\n");
 	config.push_str(&format!("network_ids = {:?}\n\n", chain_ids));

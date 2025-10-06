@@ -7,18 +7,19 @@ use crate::{DeliveryError, DeliveryInterface};
 use alloy_network::EthereumWallet;
 use alloy_primitives::{Address, Bytes, FixedBytes, U256};
 use alloy_provider::{
-	fillers::{ChainIdFiller, GasFiller, NonceFiller, SimpleNonceManager},
+	fillers::{CachedNonceManager, ChainIdFiller, GasFiller, NonceFiller},
 	DynProvider, PendingTransactionConfig, PendingTransactionError, Provider, ProviderBuilder,
 };
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types::TransactionRequest;
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
-use alloy_transport::layers::RetryBackoffLayer;
+use alloy_transport::layers::{RateLimitRetryPolicy, RetryBackoffLayer};
+use alloy_transport::TransportError;
 use async_trait::async_trait;
 use solver_types::{
-	with_0x_prefix, ConfigSchema, Field, FieldType, NetworksConfig, Schema,
-	Transaction as SolverTransaction, TransactionHash, TransactionReceipt,
+	ConfigSchema, Field, FieldType, NetworksConfig, Schema, Transaction as SolverTransaction,
+	TransactionHash, TransactionReceipt,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -81,10 +82,23 @@ impl AlloyDelivery {
 			let wallet = EthereumWallet::from(chain_signer);
 
 			// Configure retry layer for handling network errors, rate limits, and execution reverts
-			let retry_layer = RetryBackoffLayer::new(
-				5,    // max_retry: retry up to 5 times
-				1000, // backoff: initial backoff in milliseconds
+			// Extend the default rate limit policy to also retry execution reverts during transaction submission
+			let retry_policy = RateLimitRetryPolicy::default().or(|error: &TransportError| {
+				match error {
+					TransportError::ErrorResp(payload) => {
+						// Retry execution reverts (error code 3) that may be temporary
+						// These often occur during transaction submission due to network congestion or contract state issues
+						payload.code == 3 && payload.message.contains("execution reverted")
+					},
+					_ => false,
+				}
+			});
+
+			let retry_layer = RetryBackoffLayer::new_with_policy(
+				3,    // max_retry: retry up to 3 times for transaction submission (more conservative)
+				1500, // backoff: slightly longer initial backoff for transaction retries
 				10,   // cups: compute units per second
+				retry_policy,
 			);
 
 			// Create RPC client with retry capabilities
@@ -92,7 +106,7 @@ impl AlloyDelivery {
 
 			// Create provider with simple nonce management and retry capabilities
 			let provider = ProviderBuilder::new()
-				.filler(NonceFiller::new(SimpleNonceManager::default()))
+				.filler(NonceFiller::new(CachedNonceManager::default()))
 				.filler(GasFiller)
 				.filler(ChainIdFiller::default())
 				.wallet(wallet)
@@ -223,19 +237,19 @@ impl DeliveryInterface for AlloyDelivery {
 
 		// Get the transaction hash
 		let tx_hash = *pending_tx.tx_hash();
-		let hash_str = with_0x_prefix(&hex::encode(tx_hash.0));
+		// let hash_str = with_0x_prefix(&hex::encode(tx_hash.0));
 		let tx_hash_obj = TransactionHash(tx_hash.0.to_vec());
 
-		// Use wait_for_confirmation with 0 confirmations to verify the transaction is in mempool
-		match self.wait_for_confirmation(&tx_hash_obj, chain_id, 0).await {
-			Ok(_) => {
-				tracing::info!(tx_hash = %hash_str, chain_id = chain_id, "Transaction confirmed in mempool");
-			},
-			Err(e) => {
-				tracing::warn!(tx_hash = %hash_str, chain_id = chain_id, "Could not verify transaction in mempool: {}", e);
-				// Don't fail the submission - the transaction might still be valid
-			},
-		}
+		// // Use wait_for_confirmation with 0 confirmations to verify the transaction is in mempool
+		// match self.wait_for_confirmation(&tx_hash_obj, chain_id, 0).await {
+		// 	Ok(_) => {
+		// 		tracing::info!(tx_hash = %hash_str, chain_id = chain_id, "Transaction confirmed in mempool");
+		// 	},
+		// 	Err(e) => {
+		// 		tracing::warn!(tx_hash = %hash_str, chain_id = chain_id, "Could not verify transaction in mempool: {}", e);
+		// 		// Don't fail the submission - the transaction might still be valid
+		// 	},
+		// }
 
 		Ok(tx_hash_obj)
 	}

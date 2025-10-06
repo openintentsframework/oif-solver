@@ -1183,7 +1183,6 @@ impl SettlementInterface for HyperlaneSettlement {
 		let total_payload_size: usize = payloads.iter().map(|p| p.len()).sum();
 		let gas_limit = self.calculate_message_gas_limit(total_payload_size);
 
-		// Estimate gas payment with correct payloads
 		let gas_payment = self
 			.estimate_gas_payment(
 				dest_chain,

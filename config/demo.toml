@@ -38,7 +38,6 @@ private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff8
 # ============================================================================
 [delivery]
 min_confirmations = 1
-transaction_poll_interval_seconds = 3
 
 [delivery.implementations.evm_alloy]
 network_ids = [31337, 31338]

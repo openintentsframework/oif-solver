@@ -122,10 +122,6 @@ pub struct DeliveryConfig {
 	/// Defaults to 12 confirmations if not specified.
 	#[serde(default = "default_confirmations")]
 	pub min_confirmations: u64,
-	/// Poll interval in seconds for transaction status monitoring.
-	/// Defaults to 3 seconds if not specified.
-	#[serde(default = "default_transaction_poll_interval_seconds")]
-	pub transaction_poll_interval_seconds: u64,
 }
 
 /// Returns the default number of confirmations required.
@@ -134,11 +130,6 @@ pub struct DeliveryConfig {
 /// when no explicit confirmation count is configured.
 fn default_confirmations() -> u64 {
 	12 // Default to 12 confirmations
-}
-
-/// Returns the default transaction poll interval in seconds.
-fn default_transaction_poll_interval_seconds() -> u64 {
-	3 // Default to 3 seconds
 }
 
 /// Configuration for account management.
@@ -520,15 +511,6 @@ impl Config {
 		}
 
 		let monitoring_timeout_in_seconds = self.solver.monitoring_timeout_minutes * 60;
-
-		if self.delivery.transaction_poll_interval_seconds < 1
-			|| self.delivery.transaction_poll_interval_seconds > monitoring_timeout_in_seconds
-		{
-			return Err(ConfigError::Validation(format!(
-				"transaction_poll_interval_seconds must be between 1 and {}",
-				monitoring_timeout_in_seconds
-			)));
-		}
 
 		// Validate account config
 		if self.account.implementations.is_empty() {

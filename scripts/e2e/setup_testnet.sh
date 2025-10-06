@@ -258,7 +258,6 @@ private_key = "\${SOLVER_PRIVATE_KEY}"
 # ============================================================================
 [delivery]
 min_confirmations = $(get_config ".solver_parameters.min_confirmations" "3")
-transaction_poll_interval_seconds = 3
 
 [delivery.implementations.evm_alloy]
 network_ids = [$origin_id, $dest_id]

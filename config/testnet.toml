@@ -39,7 +39,6 @@ private_key = "${SOLVER_PRIVATE_KEY}"
 # ============================================================================
 [delivery]
 min_confirmations = 3
-transaction_poll_interval_seconds = 3 # How often to check transaction status
 
 [delivery.implementations.evm_alloy]
 network_ids = [11155420, 84532]
