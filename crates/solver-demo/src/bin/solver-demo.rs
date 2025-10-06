@@ -746,10 +746,12 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 			logging::verbose_tech("Input file", &input.display().to_string());
 
 			let order_json = std::fs::read_to_string(&input)?;
-			let order: PostOrderRequest = serde_json::from_str(&order_json)?;
+			let mut order: PostOrderRequest = serde_json::from_str(&order_json)?;
 
 			if onchain {
-				use solver_demo::core::logging;
+				// Inject user address for on-chain submission
+				// since we are doing StandardOrder::try_from which is an internal Solver function that requires it
+				inject_user_address_for_onchain(&mut order, &ctx)?;
 				logging::operation_start("Submitting intent on-chain...");
 
 				let result = intent_ops.submit_onchain(order).await?;
@@ -1091,6 +1093,47 @@ async fn handle_quote(cmd: solver_demo::cli::commands::QuoteCommand) -> Result<(
 					output_file.display()
 				));
 			}
+		},
+	}
+
+	Ok(())
+}
+
+/// Inject user address into the order payload for on-chain submission
+fn inject_user_address_for_onchain(
+	order: &mut PostOrderRequest,
+	ctx: &Context,
+) -> anyhow::Result<()> {
+	use solver_types::api::OifOrder;
+
+	// Get user address from config
+	let user_address = {
+		use solver_demo::types::hex::Hex;
+		let address_str = &ctx.config.accounts().user.address;
+		Hex::to_address(address_str)?
+	};
+	let user_address_hex = format!("0x{}", hex::encode(user_address.0));
+
+	// Inject user address based on order type
+	match &mut order.order {
+		OifOrder::OifEscrowV0 { payload } => {
+			// For Permit2 orders, inject user into the message.user field
+			if let Some(message_obj) = payload.message.as_object_mut() {
+				message_obj.insert(
+					"user".to_string(),
+					serde_json::Value::String(user_address_hex),
+				);
+			}
+		},
+		OifOrder::Oif3009V0 { .. } => {
+			// EIP-3009 orders don't need user injection in the message
+			// The user is handled through metadata
+		},
+		OifOrder::OifResourceLockV0 { .. } => {
+			// Compact orders already have the sponsor field
+		},
+		_ => {
+			// Other order types don't need user injection
 		},
 	}
 

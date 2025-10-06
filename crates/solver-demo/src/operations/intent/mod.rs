@@ -377,74 +377,84 @@ impl IntentOps {
 
 		logging::verbose_tech("Using input settler", &input_settler_address.to_string());
 
-		// Check if this is a Compact order that needs deposit
-		let order_type = order.order.order_type();
-		if order_type == "oif-resource-lock-v0" {
-			logging::verbose_operation("Detected Compact order", "performing deposit");
-			self.deposit_compact_tokens(&order).await?;
-		} else {
-			// For non-Compact orders, we need to approve token spending
-			logging::verbose_operation("Approving token allowance", "for input settler");
-			self.approve_tokens_for_onchain_submission(
-				&standard_order,
-				input_settler_address,
-				chain,
-			)
-			.await?;
-		}
-
-		// Encode the open transaction using the contracts module
-		let open_data = {
-			let contracts = self.ctx.contracts.read().map_err(|e| {
-				crate::types::error::Error::StorageError(format!(
-					"Failed to acquire contracts lock: {}",
-					e
+		// Handle different order types with their specific workflows
+		use solver_types::api::OifOrder;
+		match &order.order {
+			OifOrder::OifResourceLockV0 { .. } => {
+				Err(crate::types::error::Error::InvalidConfig(
+					"Compact orders (OifResourceLockV0) cannot use --onchain flag as they are designed to be off-chain by default".to_string()
 				))
-			})?;
-			contracts.input_settler_open(&standard_order)?
-		};
+			},
+			OifOrder::OifEscrowV0 { .. } | OifOrder::Oif3009V0 { .. } => {
+				// Escrow orders: approve tokens and call open()
+				logging::verbose_operation(
+					"Detected Escrow order",
+					"approving tokens and calling open",
+				);
+				self.approve_tokens_for_onchain_submission(
+					&standard_order,
+					input_settler_address,
+					chain,
+				)
+				.await?;
 
-		// Get provider and signer
-		let provider = self.ctx.provider(chain).await?;
-		let signer = self.get_user_signer()?;
+				// Encode the open transaction using the contracts module
+				let open_data = {
+					let contracts = self.ctx.contracts.read().map_err(|e| {
+						crate::types::error::Error::StorageError(format!(
+							"Failed to acquire contracts lock: {}",
+							e
+						))
+					})?;
+					contracts.input_settler_open(&standard_order)?
+				};
 
-		// Use TxBuilder for the transaction
-		use crate::core::blockchain::TxBuilder;
-		use alloy_rpc_types::TransactionRequest;
+				// Get provider and signer
+				let provider = self.ctx.provider(chain).await?;
+				let signer = self.get_user_signer()?;
 
-		let tx_builder = TxBuilder::new(provider).with_signer(signer);
+				// Use TxBuilder for the transaction
+				use crate::core::blockchain::TxBuilder;
+				use alloy_rpc_types::TransactionRequest;
 
-		let open_request = TransactionRequest::default()
-			.to(input_settler_address)
-			.input(open_data.into());
+				let tx_builder = TxBuilder::new(provider).with_signer(signer);
 
-		logging::verbose_operation("Sending open transaction", "to input settler");
-		let tx_hash = tx_builder.send(open_request).await?;
+				let open_request = TransactionRequest::default()
+					.to(input_settler_address)
+					.input(open_data.into());
 
-		logging::verbose_tech("Open transaction sent", &format!("{:?}", tx_hash));
+				logging::verbose_operation("Sending open transaction", "to input settler");
+				let tx_hash = tx_builder.send(open_request).await?;
 
-		// Wait for confirmation
-		let receipt = tx_builder.wait(tx_hash).await?;
+				logging::verbose_tech("Open transaction sent", &format!("{:?}", tx_hash));
 
-		if !receipt.status() {
-			return Err(crate::types::error::Error::ContractCallFailed(
-				"Open transaction failed".to_string(),
-			));
+				// Wait for confirmation
+				let receipt = tx_builder.wait(tx_hash).await?;
+
+				if !receipt.status() {
+					return Err(crate::types::error::Error::ContractCallFailed(
+						"Open transaction failed".to_string(),
+					));
+				}
+
+				logging::verbose_success(
+					"Open transaction confirmed",
+					&format!(
+						"hash: {:?}, block: {}",
+						tx_hash,
+						receipt.block_number.unwrap_or_default()
+					),
+				);
+
+				Ok(OnchainSubmissionResult {
+					tx_hash: format!("{:?}", tx_hash),
+					order_id: None, // TODO: extract this from logs
+				})
+			},
+			OifOrder::OifGenericV0 { .. } => Err(crate::types::error::Error::InvalidConfig(
+				"Generic orders are not supported for on-chain submission".to_string(),
+			)),
 		}
-
-		logging::verbose_success(
-			"Open transaction confirmed",
-			&format!(
-				"hash: {:?}, block: {}",
-				tx_hash,
-				receipt.block_number.unwrap_or_default()
-			),
-		);
-
-		Ok(OnchainSubmissionResult {
-			tx_hash: format!("{:?}", tx_hash),
-			order_id: None, // TODO: extract this from logs
-		})
 	}
 
 	/// Deposits tokens to TheCompact contract for resource lock orders
