@@ -513,25 +513,20 @@ async fn monitor_transaction(
 
 	let timeout_duration = Duration::from_secs(monitoring_timeout_seconds);
 
-	// Watch the transaction using Alloy's PendingTransactionBuilder
+	// Use get_receipt() instead of watch() to avoid race condition where heartbeat
+	// might skip blocks. The get_receipt() method includes a polling fallback that
+	// directly queries eth_getTransactionReceipt, which works even if the block
+	// stream misses the block containing the transaction.
+	// See: https://github.com/alloy-rs/alloy/issues/389
 	match pending_tx
 		.with_required_confirmations(min_confirmations)
 		.with_timeout(Some(timeout_duration))
-		.watch()
+		.get_receipt()
 		.await
 	{
-		Ok(tx_hash) => {
-			// Get receipt and convert to solver receipt
-			match provider.get_transaction_receipt(tx_hash).await {
-				Ok(Some(receipt)) => Ok(TransactionReceipt::from(&receipt)),
-				Ok(None) => Err(DeliveryError::TransactionFailed(
-					"Transaction confirmed but receipt not found".to_string(),
-				)),
-				Err(e) => Err(DeliveryError::Network(format!(
-					"Failed to get receipt: {}",
-					e
-				))),
-			}
+		Ok(receipt) => {
+			// Receipt is already fetched, just convert it
+			Ok(TransactionReceipt::from(&receipt))
 		},
 		Err(e) => Err(DeliveryError::TransactionFailed(format!(
 			"Transaction monitoring failed: {}",
