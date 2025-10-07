@@ -5,10 +5,8 @@
 //! tasks for pending transactions and emits events for settlement processing.
 
 use crate::engine::event_bus::EventBus;
-use crate::monitoring::TransactionMonitor;
 use crate::state::OrderStateMachine;
 use alloy_primitives::hex;
-use solver_delivery::DeliveryService;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
 use solver_types::{
@@ -36,57 +34,29 @@ pub enum TransactionError {
 /// Handler for managing blockchain transaction lifecycle.
 ///
 /// The TransactionHandler manages transaction confirmations, failures,
-/// and state transitions based on transaction type. It spawns monitoring
-/// tasks for pending transactions and emits appropriate events to trigger
-/// subsequent processing by other handlers (e.g., settlement handler for
-/// post-fill and pre-claim transactions).
+/// and state transitions based on transaction type. It emits appropriate events
+/// to trigger subsequent processing by other handlers (e.g., settlement handler
+/// for post-fill and pre-claim transactions).
 pub struct TransactionHandler {
-	delivery: Arc<DeliveryService>,
 	storage: Arc<StorageService>,
 	state_machine: Arc<OrderStateMachine>,
 	settlement: Arc<SettlementService>,
 	event_bus: EventBus,
-	monitoring_timeout_minutes: u64,
 }
 
 impl TransactionHandler {
 	pub fn new(
-		delivery: Arc<DeliveryService>,
 		storage: Arc<StorageService>,
 		state_machine: Arc<OrderStateMachine>,
 		settlement: Arc<SettlementService>,
 		event_bus: EventBus,
-		monitoring_timeout_minutes: u64,
 	) -> Self {
 		Self {
-			delivery,
 			storage,
 			state_machine,
 			settlement,
 			event_bus,
-			monitoring_timeout_minutes,
 		}
-	}
-
-	/// Spawns a monitoring task for a pending transaction
-	pub async fn monitor_transaction(
-		&self,
-		order_id: String,
-		tx_hash: TransactionHash,
-		tx_type: TransactionType,
-		tx_chain_id: u64,
-	) {
-		let monitor = TransactionMonitor::new(
-			self.delivery.clone(),
-			self.event_bus.clone(),
-			self.monitoring_timeout_minutes,
-		);
-
-		tokio::spawn(async move {
-			monitor
-				.monitor(order_id, tx_hash, tx_type, tx_chain_id)
-				.await;
-		});
 	}
 
 	/// Handles confirmed transactions based on their type.

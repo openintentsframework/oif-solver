@@ -7,7 +7,8 @@
 use crate::{NetworkConfig, NetworksConfig};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
-use alloy_transport::layers::RetryBackoffLayer;
+use alloy_transport::layers::{RateLimitRetryPolicy, RetryBackoffLayer};
+use alloy_transport::TransportError;
 use std::fmt;
 
 /// Errors that can occur during provider creation.
@@ -58,10 +59,12 @@ impl std::error::Error for ProviderError {}
 ///
 /// # Retry Behavior
 ///
-/// The provider is configured with exponential backoff retry logic:
-/// - Maximum 5 retry attempts
-/// - Initial backoff of 1000ms, exponentially increasing
+/// The provider is configured with enhanced exponential backoff retry logic:
+/// - Maximum 3 retry attempts (more conservative for production)
+/// - Initial backoff of 1500ms, exponentially increasing
 /// - Rate limiting protection (10 compute units per second)
+/// - Automatic retry of temporary execution reverts (error code 3)
+/// - Smart retry policy for network congestion and contract state issues
 pub fn create_http_provider(
 	network_id: u64,
 	networks: &NetworksConfig,
@@ -77,10 +80,23 @@ pub fn create_http_provider(
 	})?;
 
 	// Configure retry layer for handling network errors, rate limits, and execution reverts
-	let retry_layer = RetryBackoffLayer::new(
-		5,    // max_retry: retry up to 5 times
-		1000, // backoff: initial backoff in milliseconds
+	// Extend the default rate limit policy to also retry execution reverts during transaction submission
+	let retry_policy = RateLimitRetryPolicy::default().or(|error: &TransportError| {
+		match error {
+			TransportError::ErrorResp(payload) => {
+				// Retry execution reverts (error code 3) that may be temporary
+				// These often occur during transaction submission due to network congestion or contract state issues
+				payload.code == 3 && payload.message.contains("execution reverted")
+			},
+			_ => false,
+		}
+	});
+
+	let retry_layer = RetryBackoffLayer::new_with_policy(
+		3,    // max_retry: retry up to 3 times for transaction submission (more conservative)
+		1500, // backoff: slightly longer initial backoff for transaction retries
 		10,   // cups: compute units per second for rate limiting
+		retry_policy,
 	);
 
 	// Create RPC client with retry capabilities
@@ -116,10 +132,12 @@ pub fn create_http_provider(
 ///
 /// # Retry Behavior
 ///
-/// The provider is configured with exponential backoff retry logic:
-/// - Maximum 5 retry attempts
-/// - Initial backoff of 1000ms, exponentially increasing
+/// The provider is configured with enhanced exponential backoff retry logic:
+/// - Maximum 3 retry attempts (more conservative for production)
+/// - Initial backoff of 1500ms, exponentially increasing
 /// - Rate limiting protection (10 compute units per second)
+/// - Automatic retry of temporary execution reverts (error code 3)
+/// - Smart retry policy for network congestion and contract state issues
 pub async fn create_ws_provider(
 	network_id: u64,
 	networks: &NetworksConfig,

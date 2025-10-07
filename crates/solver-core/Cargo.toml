@@ -5,9 +5,9 @@ edition = "2021"
 rust-version.workspace = true
 
 [dependencies]
-alloy-primitives = { version = "1.0.37", features = ["serde"] }
+alloy-primitives = { workspace = true, features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-lru = "0.12"
+lru = "0.16"
 once_cell = "1.19"
 rust_decimal = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
@@ -21,7 +21,7 @@ solver-pricing = { path = "../solver-pricing" }
 solver-settlement = { path = "../solver-settlement" }
 solver-storage = { path = "../solver-storage" }
 solver-types = { path = "../solver-types" }
-thiserror = "1.0"
+thiserror = "2.0"
 tokio = { version = "1.0", features = ["full"] }
-toml =  { workspace = true }
+toml = { workspace = true }
 tracing = "0.1"

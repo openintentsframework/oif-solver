@@ -6,7 +6,7 @@
 use crate::engine::event_bus::EventBus;
 use crate::state::OrderStateMachine;
 use alloy_primitives::hex;
-use solver_delivery::DeliveryService;
+use solver_delivery::{DeliveryService, TransactionMonitoringEvent, TransactionTracking};
 use solver_order::OrderService;
 use solver_storage::StorageService;
 use solver_types::{
@@ -76,10 +76,50 @@ impl OrderHandler {
 			.await
 			.map_err(|e| OrderError::Service(e.to_string()))?
 		{
-			// Submit prepare transaction
+			// Submit prepare transaction with monitoring
+			let event_bus = self.event_bus.clone();
+			let callback = Box::new(move |event: TransactionMonitoringEvent| match event {
+				TransactionMonitoringEvent::Confirmed {
+					id,
+					tx_hash,
+					tx_type,
+					receipt,
+				} => {
+					event_bus
+						.publish(SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
+							order_id: id,
+							tx_hash,
+							tx_type,
+							receipt,
+						}))
+						.ok();
+				},
+				TransactionMonitoringEvent::Failed {
+					id,
+					tx_hash,
+					tx_type,
+					error,
+				} => {
+					event_bus
+						.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+							order_id: id,
+							tx_hash,
+							tx_type,
+							error,
+						}))
+						.ok();
+				},
+			});
+
+			let tracking = TransactionTracking {
+				id: order.id.clone(),
+				tx_type: TransactionType::Prepare,
+				callback,
+			};
+
 			let prepare_tx_hash = self
 				.delivery
-				.deliver(prepare_tx.clone())
+				.deliver(prepare_tx.clone(), Some(tracking))
 				.await
 				.map_err(|e| OrderError::Service(e.to_string()))?;
 
@@ -147,10 +187,50 @@ impl OrderHandler {
 			.await
 			.map_err(|e| OrderError::Service(e.to_string()))?;
 
-		// Submit transaction
+		// Submit transaction with monitoring
+		let event_bus = self.event_bus.clone();
+		let callback = Box::new(move |event: TransactionMonitoringEvent| match event {
+			TransactionMonitoringEvent::Confirmed {
+				id,
+				tx_hash,
+				tx_type,
+				receipt,
+			} => {
+				event_bus
+					.publish(SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
+						order_id: id,
+						tx_hash,
+						tx_type,
+						receipt,
+					}))
+					.ok();
+			},
+			TransactionMonitoringEvent::Failed {
+				id,
+				tx_hash,
+				tx_type,
+				error,
+			} => {
+				event_bus
+					.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+						order_id: id,
+						tx_hash,
+						tx_type,
+						error,
+					}))
+					.ok();
+			},
+		});
+
+		let tracking = TransactionTracking {
+			id: order.id.clone(),
+			tx_type: TransactionType::Fill,
+			callback,
+		};
+
 		let tx_hash = self
 			.delivery
-			.deliver(tx.clone())
+			.deliver(tx.clone(), Some(tracking))
 			.await
 			.map_err(|e| OrderError::Service(e.to_string()))?;
 

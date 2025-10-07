@@ -70,7 +70,7 @@ impl BalanceOps {
 		})
 	}
 
-	/// Queries balances for multiple tokens for an account
+	/// Queries balances for multiple tokens for an account in parallel
 	///
 	/// # Arguments
 	/// * `chain` - Target blockchain network identifier
@@ -88,14 +88,19 @@ impl BalanceOps {
 		tokens: Vec<String>,
 		account: Option<Address>,
 	) -> Result<Vec<BalanceResult>> {
-		let mut results = Vec::new();
+		use futures::future::join_all;
 
-		for token in tokens {
-			let result = self.balance(chain, &token, account).await?;
-			results.push(result);
-		}
+		// Create futures for all balance queries
+		let balance_futures: Vec<_> = tokens
+			.iter()
+			.map(|token| self.balance(chain, token, account))
+			.collect();
 
-		Ok(results)
+		// Execute all queries in parallel and collect results
+		let results = join_all(balance_futures).await;
+
+		// Convert Results to a single Result<Vec<_>>
+		results.into_iter().collect()
 	}
 
 	/// Queries the native token balance for an account

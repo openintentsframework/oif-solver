@@ -203,6 +203,37 @@ impl TokenOps {
 		self.balance_ops.balance(chain, token_symbol, account).await
 	}
 
+	/// Queries balances for multiple tokens in parallel with automatic address resolution
+	///
+	/// # Arguments
+	/// * `chain` - Target blockchain network identifier
+	/// * `token_symbols` - Vector of token symbols to query
+	/// * `account_str` - Account name or address to check, uses default user account if None
+	///
+	/// # Returns
+	/// Vector of balance results for each requested token
+	///
+	/// # Errors
+	/// Returns error if address resolution fails or any balance query fails
+	pub async fn balance_batch(
+		&self,
+		chain: ChainId,
+		token_symbols: Vec<&str>,
+		account_str: Option<&str>,
+	) -> Result<Vec<BalanceResult>> {
+		let account = if let Some(addr_str) = account_str {
+			Some(self.ctx.resolve_address(addr_str)?)
+		} else {
+			None
+		};
+
+		// Convert &str to String for the underlying batch method
+		let token_strings: Vec<String> = token_symbols.iter().map(|s| s.to_string()).collect();
+		self.balance_ops
+			.balance_batch(chain, token_strings, account)
+			.await
+	}
+
 	/// Approves token spending with automatic address resolution
 	///
 	/// # Arguments

@@ -56,6 +56,12 @@ impl fmt::Display for Address {
 	}
 }
 
+impl From<AlloyAddress> for Address {
+	fn from(addr: AlloyAddress) -> Self {
+		Address(addr.as_slice().to_vec())
+	}
+}
+
 /// Cryptographic signature representation.
 ///
 /// Stores signatures as raw bytes in the standard Ethereum format (r, s, v).
@@ -107,7 +113,7 @@ impl From<TransactionRequest> for Transaction {
 	fn from(req: TransactionRequest) -> Self {
 		Transaction {
 			to: req.to.map(|addr| match addr {
-				alloy_primitives::TxKind::Call(a) => Address(a.as_slice().to_vec()),
+				alloy_primitives::TxKind::Call(a) => a.into(),
 				alloy_primitives::TxKind::Create => panic!("Create transactions not supported"),
 			}),
 			data: req.input.input.clone().unwrap_or_default().to_vec(),
@@ -264,6 +270,22 @@ mod tests {
 		assert!(!set.insert(addr2)); // Should not insert duplicate
 		assert!(set.insert(addr3));
 		assert_eq!(set.len(), 2);
+	}
+
+	#[test]
+	fn test_address_from_alloy_address() {
+		use alloy_primitives::address;
+
+		let alloy_addr = address!("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B");
+		let solver_addr = Address::from(alloy_addr);
+
+		// Verify the conversion preserves the address bytes
+		assert_eq!(solver_addr.0, alloy_addr.as_slice());
+		assert_eq!(solver_addr.0.len(), 20);
+
+		// Verify it displays the same hex string
+		let expected_hex = "0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b";
+		assert_eq!(solver_addr.to_string(), expected_hex);
 	}
 
 	#[test]

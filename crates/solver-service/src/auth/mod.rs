@@ -46,16 +46,19 @@ impl JwtService {
 	/// # Returns
 	/// A configured JWT service or an error if initialization fails
 	pub fn new(config: AuthConfig) -> Result<Self, AuthError> {
-		let secret = config.jwt_secret.expose_secret().as_bytes();
-
 		let mut validation = Validation::new(Algorithm::HS256);
 		validation.set_issuer(&[config.issuer.clone()]);
 
-		Ok(Self {
-			encoding_key: EncodingKey::from_secret(secret),
-			decoding_key: DecodingKey::from_secret(secret),
-			validation,
-			config,
+		// Extract jwt_secret first to avoid borrowing issues
+		let jwt_secret = config.jwt_secret.clone();
+		jwt_secret.with_exposed(|secret| {
+			let secret_bytes = secret.as_bytes();
+			Ok(Self {
+				encoding_key: EncodingKey::from_secret(secret_bytes),
+				decoding_key: DecodingKey::from_secret(secret_bytes),
+				validation,
+				config,
+			})
 		})
 	}
 

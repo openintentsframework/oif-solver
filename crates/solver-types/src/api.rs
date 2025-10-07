@@ -251,7 +251,7 @@ impl OifOrder {
 						.map_err(|e| format!("Failed to recover user from signature: {}", e))?;
 
 				// Convert AlloyAddress to our Address type (AlloyAddress implements AsRef<[u8]>)
-				Ok(Address(recovered.as_slice().to_vec()))
+				Ok(recovered.into())
 			},
 			OifOrder::OifGenericV0 { .. } => {
 				Err("Cannot extract sponsor from generic order".to_string())

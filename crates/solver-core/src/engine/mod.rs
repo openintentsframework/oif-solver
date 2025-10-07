@@ -14,6 +14,7 @@ use self::{cost_profit::CostProfitService, token_manager::TokenManager};
 use crate::handlers::{IntentHandler, OrderHandler, SettlementHandler, TransactionHandler};
 use crate::recovery::RecoveryService;
 use crate::state::OrderStateMachine;
+use alloy_primitives::hex;
 use solver_account::AccountService;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
@@ -23,13 +24,15 @@ use solver_pricing::PricingService;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
 use solver_types::{
-	Address, DeliveryEvent, Intent, Order, OrderEvent, SettlementEvent, SolverEvent, StorageKey,
+	truncate_id, Address, DeliveryEvent, Intent, Order, OrderEvent, SettlementEvent, SolverEvent,
+	StorageKey,
 };
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{mpsc, Semaphore};
+use tracing::instrument;
 
 /// Errors that can occur during engine operations.
 ///
@@ -159,12 +162,10 @@ impl SolverEngine {
 		));
 
 		let transaction_handler = Arc::new(TransactionHandler::new(
-			delivery.clone(),
 			storage.clone(),
 			state_machine.clone(),
 			settlement.clone(),
 			event_bus.clone(),
-			config.solver.monitoring_timeout_minutes,
 		));
 
 		let settlement_handler = Arc::new(SettlementHandler::new(
@@ -174,7 +175,7 @@ impl SolverEngine {
 			storage.clone(),
 			state_machine.clone(),
 			event_bus.clone(),
-			config.solver.monitoring_timeout_minutes,
+			config.solver.monitoring_timeout_seconds / 60, // Convert seconds to minutes
 		));
 
 		Self {
@@ -260,6 +261,7 @@ impl SolverEngine {
 	///
 	/// Returns `Ok(())` when the engine shuts down gracefully, or an error
 	/// if a critical failure occurs that prevents continued operation.
+	#[instrument(skip_all)]
 	pub async fn run(&self) -> Result<(), EngineError> {
 		// Subscribe to events before recovery so we don't miss recovery events
 		let mut event_receiver = self.event_bus.subscribe();
@@ -353,16 +355,22 @@ impl SolverEngine {
 							.await;
 						}
 
-						SolverEvent::Delivery(DeliveryEvent::TransactionPending { order_id, tx_hash, tx_type, tx_chain_id }) => {
-							// Monitoring doesn't send transactions - use general semaphore
-							self.spawn_handler(&general_semaphore, move |engine| async move {
-								engine.transaction_handler.monitor_transaction(order_id, tx_hash, tx_type, tx_chain_id).await;
-								Ok(())
-							})
-							.await;
+						SolverEvent::Delivery(DeliveryEvent::TransactionPending { order_id, tx_hash, tx_type, tx_chain_id: _ }) => {
+							tracing::info!(
+								order_id = %truncate_id(&order_id),
+								tx_hash = %truncate_id(&hex::encode(&tx_hash.0)),
+								tx_type = ?tx_type,
+								"Submitted transaction"
+							);
 						}
 
 						SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed { order_id, tx_hash, tx_type, receipt }) => {
+							tracing::info!(
+								order_id = %truncate_id(&order_id),
+								tx_hash = %truncate_id(&hex::encode(&tx_hash.0)),
+								tx_type = ?tx_type,
+								"Confirmed"
+							);
 							// Confirmation handling doesn't directly send transactions - use general semaphore
 							// Note: This may trigger OrderEvent::Executing which will be serialized separately
 							self.spawn_handler(&general_semaphore, move |engine| async move {
@@ -375,6 +383,13 @@ impl SolverEngine {
 						}
 
 						SolverEvent::Delivery(DeliveryEvent::TransactionFailed { order_id, tx_hash, tx_type, error }) => {
+							tracing::error!(
+								order_id = %truncate_id(&order_id),
+								tx_hash = %truncate_id(&hex::encode(&tx_hash.0)),
+								tx_type = ?tx_type,
+								error = %error,
+								"Transaction failed"
+							);
 							// Failure handling doesn't send transactions - use general semaphore
 							self.spawn_handler(&general_semaphore, move |engine| async move {
 								if let Err(e) = engine.transaction_handler.handle_failed(order_id, tx_hash, tx_type, error).await {
