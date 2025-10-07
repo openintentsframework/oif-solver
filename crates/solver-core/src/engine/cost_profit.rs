@@ -712,12 +712,14 @@ impl CostProfitService {
 	/// against the minimum requirement.
 	///
 	/// If `quote_id` is provided, the quote will be retrieved from storage to get additional context.
+	/// The `intent_source` parameter indicates whether the intent is "on-chain" or "off-chain".
 	pub async fn validate_profitability(
 		&self,
 		order: &Order,
 		cost_breakdown: &CostBreakdown,
 		min_profitability_pct: Decimal,
 		quote_id: Option<&str>,
+		intent_source: &str,
 	) -> Result<Decimal, APIError> {
 		// Retrieve the cost context if a quote ID is provided
 		let cost_context = if let Some(id) = quote_id {
@@ -768,12 +770,12 @@ impl CostProfitService {
 			})?;
 
 		// Operational cost is already available in the breakdown
-		// For onchain intents (no cost_context), subtract the open cost since it's already paid
-		let operational_cost_usd = if cost_context.is_none() {
-			// No cost context means this is likely an onchain intent
+		// For onchain intents, subtract the open cost since it's already paid by the user
+		let operational_cost_usd = if intent_source == "on-chain" {
+			// On-chain intent: user already paid for the open transaction
 			cost_breakdown.operational_cost - cost_breakdown.gas_open
 		} else {
-			// Cost context exists, this is from a quote (offchain intent)
+			// Off-chain intent: solver will pay for all costs including open
 			cost_breakdown.operational_cost
 		};
 
@@ -884,7 +886,7 @@ impl CostProfitService {
 			display_actual_profit,
 			operational_cost_usd,
 			// Cost breakdown - show N/A for gas_open if onchain intent
-			if cost_context.is_none() {
+			if intent_source == "on-chain" {
 				"N/A (on-chain intent)".to_string()
 			} else {
 				format!("$ {:>7.4}", cost_breakdown.gas_open)

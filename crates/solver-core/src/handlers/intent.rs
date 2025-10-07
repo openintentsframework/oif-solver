@@ -198,6 +198,7 @@ impl IntentHandler {
 						&cost_estimate,
 						self.config.solver.min_profitability_pct,
 						intent.quote_id.as_deref(),
+						&intent.source,
 					)
 					.await
 				{
