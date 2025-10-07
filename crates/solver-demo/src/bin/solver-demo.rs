@@ -468,20 +468,33 @@ async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<(
 					ctx.config.chains()
 				};
 
-				for (account_name, display_name) in &accounts_to_check {
+				for (i, (account_name, display_name)) in accounts_to_check.iter().enumerate() {
+					// Add blank line between accounts (except for the first one)
+					if i > 0 {
+						println!();
+					}
+
 					logging::subsection(display_name);
 
 					for chain_id in &chain_ids {
 						// Get all tokens for this chain
 						let tokens = ctx.tokens.tokens_for_chain(*chain_id);
 
-						logging::subsection(&format!("Chain {}", chain_id));
+						// Display chain with just the ID, no "Custom Chain" suffix
+						logging::subsection(&format!("  Chain {}:", chain_id.id()));
 
-						for token in tokens {
-							let result = token_ops
-								.balance(*chain_id, &token.symbol, Some(account_name))
+						// Query all token balances in parallel
+						if !tokens.is_empty() {
+							let token_symbols: Vec<&str> =
+								tokens.iter().map(|t| t.symbol.as_str()).collect();
+							let results = token_ops
+								.balance_batch(*chain_id, token_symbols, Some(account_name))
 								.await?;
-							logging::item(&format!("{}: {}", result.token, result.balance));
+
+							// Display results in order
+							for result in results {
+								logging::item(&format!("{}: {}", result.token, result.formatted));
+							}
 						}
 					}
 				}

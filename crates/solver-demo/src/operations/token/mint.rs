@@ -149,17 +149,15 @@ impl MintOps {
 	/// Returns error if private key parsing fails
 	fn get_solver_signer(&self) -> Result<alloy_signer_local::PrivateKeySigner> {
 		use crate::constants::anvil_accounts::SOLVER_PRIVATE_KEY;
-		let solver_pk = self
-			.ctx
-			.config
-			.accounts()
-			.solver
-			.private_key
-			.as_ref()
-			.map(|secret| secret.expose_secret().to_string())
-			.unwrap_or_else(|| SOLVER_PRIVATE_KEY.to_string());
 
-		alloy_signer_local::PrivateKeySigner::from_str(&solver_pk)
-			.map_err(|_| Error::InvalidPrivateKey)
+		if let Some(private_key) = self.ctx.config.accounts().solver.private_key.as_ref() {
+			private_key.with_exposed(|key| {
+				alloy_signer_local::PrivateKeySigner::from_str(key)
+					.map_err(|_| Error::InvalidPrivateKey)
+			})
+		} else {
+			alloy_signer_local::PrivateKeySigner::from_str(SOLVER_PRIVATE_KEY)
+				.map_err(|_| Error::InvalidPrivateKey)
+		}
 	}
 }

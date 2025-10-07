@@ -6,8 +6,8 @@ include = ["testnet/networks.toml", "testnet/api.toml", "testnet/gas.toml"]
 
 [solver]
 id = "oif-solver-testnet"
-monitoring_timeout_minutes = 5
 min_profitability_pct = 1.0
+monitoring_timeout_seconds = 28800
 
 # ============================================================================
 # STORAGE
@@ -39,7 +39,6 @@ private_key = "${SOLVER_PRIVATE_KEY}"
 # ============================================================================
 [delivery]
 min_confirmations = 3
-transaction_poll_interval_seconds = 3 # How often to check transaction status
 
 [delivery.implementations.evm_alloy]
 network_ids = [11155420, 84532]

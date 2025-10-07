@@ -501,7 +501,7 @@ impl ContractDeployer {
 
 	/// Get user signer for transactions
 	fn get_solver_signer(&self) -> Result<alloy_signer_local::PrivateKeySigner> {
-		let private_key_str = self
+		let private_key = self
 			.ctx
 			.config
 			.accounts()
@@ -510,13 +510,12 @@ impl ContractDeployer {
 			.as_ref()
 			.ok_or_else(|| {
 				crate::types::error::Error::InvalidConfig("No private key configured".to_string())
-			})?
-			.expose_secret();
+			})?;
 
-		private_key_str
-			.parse::<alloy_signer_local::PrivateKeySigner>()
-			.map_err(|e| {
-				crate::types::error::Error::InvalidConfig(format!("Invalid private key: {}", e))
+		private_key.with_exposed(|key| {
+			key.parse().map_err(|_| {
+				crate::types::error::Error::InvalidConfig("Invalid private key format".to_string())
 			})
+		})
 	}
 }

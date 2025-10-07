@@ -17,7 +17,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct ConfigBuilder {
 	solver_id: String,
-	monitoring_timeout_minutes: u64,
+	monitoring_timeout_seconds: u64,
 	min_profitability_pct: Decimal,
 	storage_primary: String,
 	storage_cleanup_interval_seconds: u64,
@@ -40,7 +40,7 @@ impl ConfigBuilder {
 	pub fn new() -> Self {
 		Self {
 			solver_id: "test-solver".to_string(),
-			monitoring_timeout_minutes: 1,
+			monitoring_timeout_seconds: 60,
 			min_profitability_pct: Decimal::ZERO,
 			storage_primary: "memory".to_string(),
 			storage_cleanup_interval_seconds: 60,
@@ -59,9 +59,9 @@ impl ConfigBuilder {
 		self
 	}
 
-	/// Sets the monitoring timeout in minutes.
-	pub fn monitoring_timeout_minutes(mut self, timeout: u64) -> Self {
-		self.monitoring_timeout_minutes = timeout;
+	/// Sets the monitoring timeout in seconds.
+	pub fn monitoring_timeout_seconds(mut self, timeout: u64) -> Self {
+		self.monitoring_timeout_seconds = timeout;
 		self
 	}
 
@@ -124,8 +124,8 @@ impl ConfigBuilder {
 		Config {
 			solver: SolverConfig {
 				id: self.solver_id,
-				monitoring_timeout_minutes: self.monitoring_timeout_minutes,
 				min_profitability_pct: self.min_profitability_pct,
+				monitoring_timeout_seconds: self.monitoring_timeout_seconds,
 			},
 			networks: self.networks.unwrap_or_default(),
 			storage: StorageConfig {
@@ -136,7 +136,6 @@ impl ConfigBuilder {
 			delivery: DeliveryConfig {
 				implementations: HashMap::new(),
 				min_confirmations: self.min_confirmations,
-				transaction_poll_interval_seconds: 3,
 			},
 			account: AccountConfig {
 				primary: self.account_primary,

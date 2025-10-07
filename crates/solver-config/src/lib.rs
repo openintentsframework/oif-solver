@@ -85,20 +85,12 @@ pub struct Config {
 pub struct SolverConfig {
 	/// Unique identifier for this solver instance.
 	pub id: String,
-	/// Timeout duration in minutes for monitoring operations.
-	/// Defaults to 480 minutes (8 hours) if not specified.
-	#[serde(default = "default_monitoring_timeout_minutes")]
-	pub monitoring_timeout_minutes: u64,
 	/// Minimum profitability percentage required to execute orders.
 	pub min_profitability_pct: Decimal,
-}
-
-/// Returns the default monitoring timeout in minutes.
-///
-/// This provides a default value of 480 minutes (8 hours) for monitoring operations
-/// when no explicit timeout is configured.
-fn default_monitoring_timeout_minutes() -> u64 {
-	480 // Default to 8 hours
+	/// Timeout in seconds for monitoring transactions.
+	/// Defaults to 28800 seconds (8 hours) if not specified.
+	#[serde(default = "default_monitoring_timeout_seconds")]
+	pub monitoring_timeout_seconds: u64,
 }
 
 /// Configuration for the storage backend.
@@ -119,26 +111,22 @@ pub struct DeliveryConfig {
 	/// Each implementation has its own configuration format stored as raw TOML values.
 	pub implementations: HashMap<String, toml::Value>,
 	/// Minimum number of confirmations required for transactions.
-	/// Defaults to 12 confirmations if not specified.
+	/// Defaults to 3 confirmations if not specified.
 	#[serde(default = "default_confirmations")]
 	pub min_confirmations: u64,
-	/// Poll interval in seconds for transaction status monitoring.
-	/// Defaults to 3 seconds if not specified.
-	#[serde(default = "default_transaction_poll_interval_seconds")]
-	pub transaction_poll_interval_seconds: u64,
 }
 
 /// Returns the default number of confirmations required.
 ///
-/// This provides a default value of 12 confirmations for transaction finality
+/// This provides a default value of 3 confirmations for transaction finality
 /// when no explicit confirmation count is configured.
 fn default_confirmations() -> u64 {
-	12 // Default to 12 confirmations
+	3 // Default to 3 confirmations (was 12, changed to match common use)
 }
 
-/// Returns the default transaction poll interval in seconds.
-fn default_transaction_poll_interval_seconds() -> u64 {
-	3 // Default to 3 seconds
+/// Returns the default monitoring timeout in seconds.
+fn default_monitoring_timeout_seconds() -> u64 {
+	28800 // Default to 8 hours (480 minutes * 60 seconds)
 }
 
 /// Configuration for account management.
@@ -519,15 +507,13 @@ impl Config {
 			));
 		}
 
-		let monitoring_timeout_in_seconds = self.solver.monitoring_timeout_minutes * 60;
-
-		if self.delivery.transaction_poll_interval_seconds < 1
-			|| self.delivery.transaction_poll_interval_seconds > monitoring_timeout_in_seconds
+		// Validate monitoring timeout is reasonable (between 30 seconds and 8 hours)
+		if self.solver.monitoring_timeout_seconds < 30
+			|| self.solver.monitoring_timeout_seconds > 28800
 		{
-			return Err(ConfigError::Validation(format!(
-				"transaction_poll_interval_seconds must be between 1 and {}",
-				monitoring_timeout_in_seconds
-			)));
+			return Err(ConfigError::Validation(
+				"monitoring_timeout_seconds must be between 30 and 28800 seconds".into(),
+			));
 		}
 
 		// Validate account config
@@ -568,14 +554,15 @@ impl Config {
 			));
 		}
 
-		// Validate settlement poll interval (1-monitoring_timeout_in_seconds)
+		// Validate settlement poll interval (1-monitoring_timeout_seconds)
 		// Settlement can be slower, especially for cross-chain
 		if self.settlement.settlement_poll_interval_seconds < 1
-			|| self.settlement.settlement_poll_interval_seconds > monitoring_timeout_in_seconds
+			|| self.settlement.settlement_poll_interval_seconds
+				> self.solver.monitoring_timeout_seconds
 		{
 			return Err(ConfigError::Validation(format!(
 				"settlement_poll_interval_seconds must be between 1 and {}",
-				monitoring_timeout_in_seconds
+				self.solver.monitoring_timeout_seconds
 			)));
 		}
 

@@ -700,7 +700,7 @@ impl IntentOps {
 		logging::verbose_tech("Using TheCompact contract", &compact_address.to_string());
 
 		// Get user's private key and create signer for transactions
-		let private_key_str = self
+		let private_key = self
 			.ctx
 			.config
 			.accounts()
@@ -709,13 +709,12 @@ impl IntentOps {
 			.as_ref()
 			.ok_or_else(|| {
 				crate::types::error::Error::InvalidConfig("No private key configured".to_string())
-			})?
-			.expose_secret();
-		let signer = private_key_str
-			.parse::<alloy_signer_local::PrivateKeySigner>()
-			.map_err(|e| {
-				crate::types::error::Error::InvalidConfig(format!("Invalid private key: {}", e))
 			})?;
+		let signer = private_key.with_exposed(|key| {
+			key.parse().map_err(|_| {
+				crate::types::error::Error::InvalidConfig("Invalid private key format".to_string())
+			})
+		})?;
 
 		// Use TxBuilder for transactions
 		use crate::core::blockchain::TxBuilder;
@@ -831,7 +830,7 @@ impl IntentOps {
 
 	/// Get user signer for transactions
 	fn get_user_signer(&self) -> Result<alloy_signer_local::PrivateKeySigner> {
-		let private_key_str = self
+		let private_key = self
 			.ctx
 			.config
 			.accounts()
@@ -840,14 +839,13 @@ impl IntentOps {
 			.as_ref()
 			.ok_or_else(|| {
 				crate::types::error::Error::InvalidConfig("No private key configured".to_string())
-			})?
-			.expose_secret();
+			})?;
 
-		private_key_str
-			.parse::<alloy_signer_local::PrivateKeySigner>()
-			.map_err(|e| {
-				crate::types::error::Error::InvalidConfig(format!("Invalid private key: {}", e))
+		private_key.with_exposed(|key| {
+			key.parse().map_err(|_| {
+				crate::types::error::Error::InvalidConfig("Invalid private key format".to_string())
 			})
+		})
 	}
 
 	/// Approve tokens for on-chain submission

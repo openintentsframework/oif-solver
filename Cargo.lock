@@ -4128,6 +4128,7 @@ dependencies = [
  "colored",
  "comfy-table",
  "dotenvy",
+ "futures",
  "hex",
  "hostname",
  "indicatif",
@@ -4305,6 +4306,7 @@ dependencies = [
 name = "solver-types"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
  "alloy-contract",
  "alloy-primitives",
  "alloy-provider",

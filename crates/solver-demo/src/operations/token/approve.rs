@@ -181,17 +181,15 @@ impl ApprovalOps {
 	/// Returns error if private key parsing fails
 	fn get_user_signer(&self) -> Result<alloy_signer_local::PrivateKeySigner> {
 		use crate::constants::anvil_accounts::USER_PRIVATE_KEY;
-		let user_pk = self
-			.ctx
-			.config
-			.accounts()
-			.user
-			.private_key
-			.as_ref()
-			.map(|secret| secret.expose_secret().to_string())
-			.unwrap_or_else(|| USER_PRIVATE_KEY.to_string());
 
-		alloy_signer_local::PrivateKeySigner::from_str(&user_pk)
-			.map_err(|_| crate::types::error::Error::InvalidPrivateKey)
+		if let Some(private_key) = self.ctx.config.accounts().user.private_key.as_ref() {
+			private_key.with_exposed(|key| {
+				alloy_signer_local::PrivateKeySigner::from_str(key)
+					.map_err(|_| crate::types::error::Error::InvalidPrivateKey)
+			})
+		} else {
+			alloy_signer_local::PrivateKeySigner::from_str(USER_PRIVATE_KEY)
+				.map_err(|_| crate::types::error::Error::InvalidPrivateKey)
+		}
 	}
 }

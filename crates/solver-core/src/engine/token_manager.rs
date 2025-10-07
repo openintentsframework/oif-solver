@@ -227,7 +227,7 @@ impl TokenManager {
 			nonce: None,
 		};
 
-		let tx_hash = self.delivery.deliver(tx).await?;
+		let tx_hash = self.delivery.deliver(tx, None).await?;
 
 		Ok(tx_hash)
 	}

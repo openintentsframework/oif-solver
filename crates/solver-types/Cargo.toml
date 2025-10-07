@@ -9,6 +9,7 @@ default = ["oif-interfaces"]
 oif-interfaces = ["alloy-sol-types", "alloy-contract"]
 
 [dependencies]
+alloy-consensus = { workspace = true }
 alloy-contract = { workspace = true, optional = true }
 alloy-primitives = { workspace = true, features = ["std", "serde"] }
 alloy-provider = { workspace = true }

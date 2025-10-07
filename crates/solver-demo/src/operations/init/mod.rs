@@ -428,8 +428,8 @@ fn generate_demo_config(
 	// Solver configuration
 	config.push_str("[solver]\n");
 	config.push_str("id = \"oif-solver-demo\"\n");
-	config.push_str("monitoring_timeout_minutes = 5\n");
-	config.push_str("min_profitability_pct = 1.0\n\n");
+	config.push_str("min_profitability_pct = 1.0\n");
+	config.push_str("monitoring_timeout_seconds = 28800\n\n");
 
 	// Storage configuration
 	add_storage_config(&mut config);
@@ -508,8 +508,7 @@ fn add_delivery_config(config: &mut String, chain_ids: &[u64]) {
 		"# ============================================================================\n",
 	);
 	config.push_str("[delivery]\n");
-	config.push_str("min_confirmations = 1\n");
-	config.push_str("transaction_poll_interval_seconds = 3\n\n");
+	config.push_str("min_confirmations = 1\n\n");
 
 	config.push_str("[delivery.implementations.evm_alloy]\n");
 	config.push_str(&format!("network_ids = {:?}\n\n", chain_ids));
