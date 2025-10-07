@@ -15,7 +15,7 @@ use solver_storage::StorageService;
 use solver_types::{
 	costs::{CostBreakdown, CostContext, TokenAmountInfo},
 	current_timestamp,
-	utils::conversion::ceil_dp,
+	utils::{conversion::ceil_dp, formatting::format_percentage},
 	APIError, Address, ApiErrorType, ExecutionParams, FillProof, InteropAddress, Order, OrderInput,
 	OrderOutput, StorageKey, SwapType, Transaction, TransactionHash, DEFAULT_GAS_PRICE_WEI,
 };
@@ -894,13 +894,14 @@ impl CostProfitService {
 			},
 			if profit_validation_passed {
 				format!(
-					"Order accepted with {:.2}% profit margin",
-					actual_profit_margin
+					"Order accepted with {} profit margin",
+					format_percentage(actual_profit_margin)
 				)
 			} else {
 				format!(
-					"Order rejected - insufficient margin ({:.2}% < {:.2}%)",
-					actual_profit_margin, min_profitability_pct
+					"Order rejected - insufficient margin ({} < {})",
+					format_percentage(actual_profit_margin),
+					format_percentage(min_profitability_pct)
 				)
 			}
 		);
