@@ -5,7 +5,7 @@ edition = "2021"
 rust-version.workspace = true
 
 [dependencies]
-alloy-primitives = { workspace = true }                   # Updated from 0.8.0 to 1.0.37 for consistency
+alloy-primitives = { workspace = true }
 async-trait = "0.1.73"
 reqwest = { version = "0.12", features = ["json"] }
 rust_decimal = { version = "1.35", features = ["serde"] }

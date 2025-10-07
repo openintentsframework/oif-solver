@@ -121,7 +121,7 @@ pub struct DeliveryConfig {
 /// This provides a default value of 3 confirmations for transaction finality
 /// when no explicit confirmation count is configured.
 fn default_confirmations() -> u64 {
-	3 // Default to 3 confirmations (was 12, changed to match common use)
+	3 // Default to 3 confirmations
 }
 
 /// Returns the default monitoring timeout in seconds.
