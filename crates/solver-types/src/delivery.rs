@@ -59,7 +59,7 @@ impl From<&AlloyReceipt> for TransactionReceipt {
 			.logs()
 			.iter()
 			.map(|log| Log {
-				address: Address(log.address().0.to_vec()),
+				address: log.address().into(),
 				topics: log.topics().iter().map(|topic| H256(topic.0)).collect(),
 				data: log.data().data.to_vec(),
 			})

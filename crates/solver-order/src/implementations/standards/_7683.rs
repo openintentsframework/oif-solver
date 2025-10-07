@@ -597,7 +597,7 @@ impl OrderInterface for Eip7683OrderImpl {
 		// Validate oracle routes
 		let origin_chain = standard_order.originChainId.to::<u64>();
 		let input_oracle = standard_order.inputOracle;
-		let input_oracle_address = Address(input_oracle.as_slice().to_vec());
+		let input_oracle_address = input_oracle.into();
 
 		let input_info = solver_types::oracle::OracleInfo {
 			chain_id: origin_chain,

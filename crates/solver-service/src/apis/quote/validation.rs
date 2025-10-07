@@ -322,7 +322,7 @@ impl QuoteValidator {
 	/// * `chain_id` - The blockchain network ID
 	/// * `address` - The token contract address
 	fn is_token_supported(solver: &SolverEngine, chain_id: u64, address: &AlloyAddress) -> bool {
-		let solver_address = solver_types::Address(address.as_slice().to_vec());
+		let solver_address: solver_types::Address = (*address).into();
 		solver
 			.token_manager()
 			.is_supported(chain_id, &solver_address)
@@ -532,7 +532,7 @@ impl QuoteValidator {
 			let output = output.clone();
 			async move {
 				let (chain_id, evm_addr) = Self::extract_chain_and_address(&output.asset)?;
-				let token_addr = solver_types::Address(evm_addr.as_slice().to_vec());
+				let token_addr: solver_types::Address = evm_addr.into();
 
 				let balance_str = token_manager
 					.check_balance(chain_id, &token_addr)
