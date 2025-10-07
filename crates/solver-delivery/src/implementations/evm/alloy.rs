@@ -24,7 +24,6 @@ use solver_types::{
 	TransactionHash, TransactionReceipt,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Alloy-based EVM delivery implementation.
 ///
@@ -258,11 +257,9 @@ impl DeliveryInterface for AlloyDelivery {
 
 		// If tracking is provided, set up monitoring
 		if let Some(tracking) = tracking {
-			let provider_clone = Arc::new(provider.clone());
 			let tx_hash_clone = tx_hash_obj.clone();
 			tokio::spawn(async move {
 				let result = monitor_transaction(
-					provider_clone,
 					pending_tx,
 					tracking.min_confirmations,
 					tracking.monitoring_timeout_seconds,
@@ -504,7 +501,6 @@ impl DeliveryInterface for AlloyDelivery {
 
 /// Monitors a pending transaction for confirmation or timeout
 async fn monitor_transaction(
-	provider: Arc<DynProvider>,
 	pending_tx: alloy_provider::PendingTransactionBuilder<alloy_network::Ethereum>,
 	min_confirmations: u64,
 	monitoring_timeout_seconds: u64,
