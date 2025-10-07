@@ -6,12 +6,13 @@
 
 use crate::engine::event_bus::EventBus;
 use crate::state::OrderStateMachine;
+use alloy_primitives::hex;
 use solver_delivery::DeliveryService;
 use solver_settlement::SettlementService;
 use solver_storage::{QueryFilter, StorageService};
 use solver_types::{
-	Intent, Order, OrderEvent, OrderStatus, SettlementEvent, SolverEvent, StorageKey,
-	TransactionType,
+	with_0x_prefix, Intent, Order, OrderEvent, OrderStatus, SettlementEvent, SolverEvent,
+	StorageKey, TransactionType,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -357,7 +358,10 @@ impl RecoveryService {
 				},
 				Ok(false) => {
 					// Transaction failed/reverted
-					tracing::warn!("Fill transaction {:?} failed/reverted", fill_tx);
+					tracing::warn!(
+						"Fill transaction {} failed/reverted",
+						with_0x_prefix(&hex::encode(&fill_tx.0))
+					);
 					return Ok(ReconcileResult::Failed(TransactionType::Fill));
 				},
 				Err(e) => {
