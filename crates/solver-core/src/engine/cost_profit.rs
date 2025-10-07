@@ -768,7 +768,14 @@ impl CostProfitService {
 			})?;
 
 		// Operational cost is already available in the breakdown
-		let operational_cost_usd = cost_breakdown.operational_cost;
+		// For onchain intents (no cost_context), subtract the open cost since it's already paid
+		let operational_cost_usd = if cost_context.is_none() {
+			// No cost context means this is likely an onchain intent
+			cost_breakdown.operational_cost - cost_breakdown.gas_open
+		} else {
+			// Cost context exists, this is from a quote (offchain intent)
+			cost_breakdown.operational_cost
+		};
 
 		// Calculate the actual spread in the order
 		// For normal swaps: spread = input - output (positive when user pays more than receives)
@@ -850,7 +857,7 @@ impl CostProfitService {
 			│     └─ Solver P&L:      $ {:>7.4} (after ${:.2} costs)\n\
 			├─ Cost Breakdown:\n\
 			│  ├─ Gas Costs:\n\
-			│  │  ├─ Open:            $ {:>7.4}\n\
+			│  │  ├─ Open:            {}\n\
 			│  │  ├─ Fill:            $ {:>7.4}\n\
 			│  │  ├─ Claim:           $ {:>7.4}\n\
 			│  │  └─ Buffer (10%):    $ {:>7.4}\n\
@@ -876,8 +883,12 @@ impl CostProfitService {
 			spread_type,
 			display_actual_profit,
 			operational_cost_usd,
-			// Cost breakdown
-			cost_breakdown.gas_open,
+			// Cost breakdown - show N/A for gas_open if onchain intent
+			if cost_context.is_none() {
+				"N/A (on-chain intent)".to_string()
+			} else {
+				format!("$ {:>7.4}", cost_breakdown.gas_open)
+			},
 			cost_breakdown.gas_fill,
 			cost_breakdown.gas_claim,
 			cost_breakdown.gas_buffer,
