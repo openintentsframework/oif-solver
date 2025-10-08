@@ -643,3 +643,178 @@ pub fn create_coingecko_pricing(
 ) -> Result<Box<dyn PricingInterface>, PricingError> {
 	Ok(Box::new(CoinGeckoPricing::new(config)?))
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use tokio;
+
+	fn minimal_config() -> toml::Value {
+		toml::Value::Table(toml::map::Map::new())
+	}
+
+	fn config_with_custom_prices() -> toml::Value {
+		toml::from_str(
+			r#"
+            cache_duration_seconds = 10
+            [custom_prices]
+            ETH = "3000.50"
+            BTC = "65000"
+        "#,
+		)
+		.unwrap()
+	}
+
+	#[test]
+	fn test_new_default_config() {
+		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		assert_eq!(pricing.base_url, "https://api.coingecko.com/api/v3");
+		assert_eq!(pricing.cache_duration, 60);
+		assert_eq!(pricing.rate_limit_delay_ms, 1200);
+	}
+
+	#[test]
+	fn test_new_with_api_key() {
+		let config = toml::from_str(r#"api_key = "pro_key_123""#).unwrap();
+		let pricing = CoinGeckoPricing::new(&config).unwrap();
+		assert_eq!(pricing.base_url, "https://pro-api.coingecko.com/api/v3");
+		assert_eq!(pricing.rate_limit_delay_ms, 100);
+	}
+
+	#[test]
+	fn test_get_coingecko_id() {
+		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		assert_eq!(
+			pricing.get_coingecko_id("ETH"),
+			Some("ethereum".to_string())
+		);
+		assert_eq!(pricing.get_coingecko_id("btc"), Some("bitcoin".to_string()));
+		assert_eq!(
+			pricing.get_coingecko_id("WETH"),
+			Some("ethereum".to_string())
+		);
+		assert_eq!(pricing.get_coingecko_id("UNKNOWN"), None);
+	}
+
+	#[test]
+	fn test_is_usd() {
+		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		assert!(pricing.is_usd("USD"));
+		assert!(pricing.is_usd("usd"));
+		assert!(pricing.is_usd("Usd"));
+		assert!(!pricing.is_usd("EUR"));
+		assert!(!pricing.is_usd("ETH"));
+	}
+
+	#[tokio::test]
+	async fn test_get_pair_price_same_asset() {
+		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let pair = TradingPair::new("ETH", "ETH");
+		let result = pricing.get_pair_price(&pair).await.unwrap();
+		assert_eq!(result, "1.0");
+	}
+
+	#[tokio::test]
+	async fn test_get_pair_price_unsupported() {
+		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let pair = TradingPair::new("ETH", "BTC");
+		let result = pricing.get_pair_price(&pair).await;
+		assert!(result.is_err());
+	}
+
+	#[tokio::test]
+	async fn test_custom_price_retrieval() {
+		let pricing = CoinGeckoPricing::new(&config_with_custom_prices()).unwrap();
+		let result = pricing.get_price("ETH", "USD").await.unwrap();
+		assert_eq!(result, "3000.50");
+	}
+
+	#[tokio::test]
+	async fn test_get_price_non_usd_fails() {
+		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let result = pricing.get_price("ETH", "EUR").await;
+		assert!(matches!(result, Err(PricingError::PriceNotAvailable(_))));
+	}
+
+	#[tokio::test]
+	async fn test_get_price_unknown_token() {
+		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let result = pricing.get_price("FAKECOIN", "USD").await;
+		assert!(matches!(result, Err(PricingError::PriceNotAvailable(_))));
+	}
+
+	#[tokio::test]
+	async fn test_convert_asset_same() {
+		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let result = pricing.convert_asset("ETH", "eth", "5.5").await.unwrap();
+		assert_eq!(result, "5.5");
+	}
+
+	#[tokio::test]
+	async fn test_convert_asset_invalid_amount() {
+		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let result = pricing.convert_asset("ETH", "USD", "not_a_number").await;
+		assert!(matches!(result, Err(PricingError::InvalidData(_))));
+	}
+
+	#[tokio::test]
+	async fn test_wei_to_currency_non_usd() {
+		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let result = pricing.wei_to_currency("1000000000000000000", "EUR").await;
+		assert!(matches!(result, Err(PricingError::PriceNotAvailable(_))));
+	}
+
+	#[tokio::test]
+	async fn test_currency_to_wei_invalid() {
+		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let result = pricing.currency_to_wei("invalid", "USD").await;
+		assert!(matches!(result, Err(PricingError::InvalidData(_))));
+	}
+
+	#[tokio::test]
+	async fn test_get_supported_pairs() {
+		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let pairs = pricing.get_supported_pairs().await;
+		assert!(!pairs.is_empty());
+		// All should be against USD
+		assert!(pairs.iter().all(|p| p.quote == "USD"));
+	}
+
+	#[test]
+	fn test_config_schema_valid() {
+		let schema = CoinGeckoConfigSchema;
+		assert!(schema.validate(&minimal_config()).is_ok());
+		assert!(schema.validate(&config_with_custom_prices()).is_ok());
+	}
+
+	#[test]
+	fn test_config_schema_invalid_api_key() {
+		let schema = CoinGeckoConfigSchema;
+		let bad_config = toml::from_str(r#"api_key = 123"#).unwrap();
+		assert!(schema.validate(&bad_config).is_err());
+	}
+
+	#[test]
+	fn test_config_schema_invalid_custom_price() {
+		let schema = CoinGeckoConfigSchema;
+		let bad_config = toml::from_str(
+			r#"
+            [custom_prices]
+            ETH = "not_a_price"
+        "#,
+		)
+		.unwrap();
+		assert!(schema.validate(&bad_config).is_err());
+	}
+
+	#[test]
+	fn test_price_cache_entry() {
+		let entry = PriceCacheEntry {
+			price: "2500.0".to_string(),
+			timestamp: 1234567890,
+		};
+		let cloned = entry.clone();
+		assert_eq!(entry.price, cloned.price);
+		assert_eq!(entry.timestamp, cloned.timestamp);
+	}
+}
