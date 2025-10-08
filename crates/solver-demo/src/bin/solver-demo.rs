@@ -468,7 +468,8 @@ async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<(
 					ctx.config.chains()
 				};
 
-				let account_names: Vec<&str> = accounts_to_check.iter().map(|(name, _)| *name).collect();
+				let account_names: Vec<&str> =
+					accounts_to_check.iter().map(|(name, _)| *name).collect();
 
 				let results = token_ops
 					.balance(Some(chain_ids), None, Some(account_names))
@@ -488,7 +489,8 @@ async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<(
 						.iter()
 						.filter(|r| {
 							// Match account name to address
-							let account_addr = ctx.resolve_address(account_name).unwrap_or_default();
+							let account_addr =
+								ctx.resolve_address(account_name).unwrap_or_default();
 							r.account == account_addr
 						})
 						.map(|r| r.chain)
@@ -504,11 +506,12 @@ async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<(
 						let mut chain_results: Vec<_> = results
 							.iter()
 							.filter(|r| {
-								let account_addr = ctx.resolve_address(account_name).unwrap_or_default();
+								let account_addr =
+									ctx.resolve_address(account_name).unwrap_or_default();
 								r.account == account_addr && r.chain == chain_id
 							})
 							.collect();
-						
+
 						// Sort by token name for consistent display
 						chain_results.sort_by(|a, b| a.token.cmp(&b.token));
 

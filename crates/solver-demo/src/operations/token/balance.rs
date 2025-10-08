@@ -64,7 +64,9 @@ impl BalanceOps {
 					accounts_inner.into_iter().map(move |account| {
 						let token_clone = token.clone();
 						async move {
-							let result = self.query_single_balance(chain, &token_clone, account).await;
+							let result = self
+								.query_single_balance(chain, &token_clone, account)
+								.await;
 							(chain, token_clone, account, result)
 						}
 					})
