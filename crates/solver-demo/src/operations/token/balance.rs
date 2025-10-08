@@ -11,7 +11,7 @@ use crate::{
 use alloy_primitives::{Address, U256};
 use std::sync::Arc;
 
-use super::BalanceResult;
+use super::{BalanceResult, EnhancedBalanceResult};
 
 /// Balance query operations handler
 ///
@@ -34,25 +34,94 @@ impl BalanceOps {
 		Self { ctx }
 	}
 
-	/// Queries the balance of a specific token for an account
+	/// Balance query method supporting multiple chains, tokens, and accounts
+	///
+	/// # Arguments
+	/// * `chains` - Vector of chain IDs to query
+	/// * `tokens` - Vector of token symbols to query on each chain
+	/// * `accounts` - Vector of account addresses to query for each token
+	///
+	/// # Returns
+	/// Vector of enhanced balance results for all combinations
+	///
+	/// # Errors
+	/// Individual query failures are logged but don't stop the entire operation
+	pub async fn balance(
+		&self,
+		chains: Vec<ChainId>,
+		tokens: Vec<String>,
+		accounts: Vec<Address>,
+	) -> Result<Vec<EnhancedBalanceResult>> {
+		use futures::future::join_all;
+
+		// Create futures for all (chain, token, account) combinations
+		let balance_futures: Vec<_> = chains
+			.iter()
+			.flat_map(|&chain| {
+				let accounts_clone = accounts.clone();
+				tokens.iter().flat_map(move |token| {
+					let accounts_inner = accounts_clone.clone();
+					accounts_inner.into_iter().map(move |account| {
+						let token_clone = token.clone();
+						async move {
+							let result = self.query_single_balance(chain, &token_clone, account).await;
+							(chain, token_clone, account, result)
+						}
+					})
+				})
+			})
+			.collect();
+
+		// Execute all queries in parallel
+		let query_results = join_all(balance_futures).await;
+
+		// Collect successful results into enhanced format
+		let mut results = Vec::new();
+		for (chain, token, account, balance_result) in query_results {
+			match balance_result {
+				Ok(balance_result) => {
+					results.push(EnhancedBalanceResult {
+						balance: balance_result.balance,
+						formatted: balance_result.formatted,
+						token: balance_result.token,
+						account: balance_result.account,
+						chain,
+					});
+				},
+				Err(e) => {
+					// Log individual failures but continue
+					tracing::warn!(
+						"Failed to query balance for chain={:?}, token={}, account={:?}: {}",
+						chain,
+						token,
+						account,
+						e
+					);
+				},
+			}
+		}
+
+		Ok(results)
+	}
+
+	/// Internal method to query a single balance combination
 	///
 	/// # Arguments
 	/// * `chain` - Target blockchain network identifier
 	/// * `token_symbol` - Symbol of the token to query
-	/// * `account` - Account address to check, uses default user account if None
+	/// * `account` - Account address to check
 	///
 	/// # Returns
 	/// Balance result containing raw balance, formatted balance, and metadata
 	///
 	/// # Errors
 	/// Returns error if token not found, provider unavailable, or balance query fails
-	pub async fn balance(
+	async fn query_single_balance(
 		&self,
 		chain: ChainId,
 		token_symbol: &str,
-		account: Option<Address>,
+		account: Address,
 	) -> Result<BalanceResult> {
-		let account = account.unwrap_or_else(|| self.get_default_account());
 		let token = self.ctx.tokens.get_or_error(chain, token_symbol)?;
 		let provider = self.ctx.provider(chain).await?;
 
@@ -68,39 +137,6 @@ impl BalanceOps {
 			token: token_symbol.to_string(),
 			account,
 		})
-	}
-
-	/// Queries balances for multiple tokens for an account in parallel
-	///
-	/// # Arguments
-	/// * `chain` - Target blockchain network identifier
-	/// * `tokens` - Vector of token symbols to query
-	/// * `account` - Account address to check, uses default user account if None
-	///
-	/// # Returns
-	/// Vector of balance results for each requested token
-	///
-	/// # Errors
-	/// Returns error if any token query fails
-	pub async fn balance_batch(
-		&self,
-		chain: ChainId,
-		tokens: Vec<String>,
-		account: Option<Address>,
-	) -> Result<Vec<BalanceResult>> {
-		use futures::future::join_all;
-
-		// Create futures for all balance queries
-		let balance_futures: Vec<_> = tokens
-			.iter()
-			.map(|token| self.balance(chain, token, account))
-			.collect();
-
-		// Execute all queries in parallel and collect results
-		let results = join_all(balance_futures).await;
-
-		// Convert Results to a single Result<Vec<_>>
-		results.into_iter().collect()
 	}
 
 	/// Queries the native token balance for an account
@@ -175,7 +211,7 @@ impl BalanceOps {
 	///
 	/// # Returns
 	/// Default user account address or fallback address if parsing fails
-	fn get_default_account(&self) -> Address {
+	pub fn get_default_account(&self) -> Address {
 		use crate::types::hex::Hex;
 		Hex::to_address(&self.ctx.config.accounts().user.address)
 			.unwrap_or_else(|_| Address::from([0x01; 20]))

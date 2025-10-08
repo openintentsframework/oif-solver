@@ -177,60 +177,60 @@ impl TokenOps {
 			.await
 	}
 
-	/// Checks token balance with automatic address resolution
+	/// Balance query method supporting multiple chains, tokens, and accounts
 	///
 	/// # Arguments
-	/// * `chain` - Target blockchain network identifier
-	/// * `token_symbol` - Symbol of the token to check
-	/// * `account_str` - Optional account address string, uses default if None
+	/// * `chains` - Optional vector of chain IDs, None = all configured chains
+	/// * `tokens` - Optional vector of token symbols, None = all tokens for each chain
+	/// * `accounts` - Optional vector of account names/addresses, None = default user account
 	///
 	/// # Returns
-	/// Balance result containing raw and formatted balance information
+	/// Vector of enhanced balance results for all requested combinations
 	///
 	/// # Errors
-	/// Returns error if address resolution fails or balance query fails
+	/// Returns error if address resolution fails or no valid combinations found
 	pub async fn balance(
 		&self,
-		chain: ChainId,
-		token_symbol: &str,
-		account_str: Option<&str>,
-	) -> Result<BalanceResult> {
-		let account = if let Some(addr_str) = account_str {
-			Some(self.ctx.resolve_address(addr_str)?)
-		} else {
-			None
-		};
-		self.balance_ops.balance(chain, token_symbol, account).await
-	}
+		chains: Option<Vec<ChainId>>,
+		tokens: Option<Vec<&str>>,
+		accounts: Option<Vec<&str>>,
+	) -> Result<Vec<EnhancedBalanceResult>> {
+		// Determine chains to query
+		let chain_ids = chains.unwrap_or_else(|| self.ctx.config.chains());
 
-	/// Queries balances for multiple tokens in parallel with automatic address resolution
-	///
-	/// # Arguments
-	/// * `chain` - Target blockchain network identifier
-	/// * `token_symbols` - Vector of token symbols to query
-	/// * `account_str` - Account name or address to check, uses default user account if None
-	///
-	/// # Returns
-	/// Vector of balance results for each requested token
-	///
-	/// # Errors
-	/// Returns error if address resolution fails or any balance query fails
-	pub async fn balance_batch(
-		&self,
-		chain: ChainId,
-		token_symbols: Vec<&str>,
-		account_str: Option<&str>,
-	) -> Result<Vec<BalanceResult>> {
-		let account = if let Some(addr_str) = account_str {
-			Some(self.ctx.resolve_address(addr_str)?)
+		// Resolve accounts
+		let account_addresses = if let Some(account_strs) = accounts {
+			account_strs
+				.iter()
+				.map(|addr_str| self.ctx.resolve_address(addr_str))
+				.collect::<Result<Vec<_>>>()?
 		} else {
-			None
+			vec![self.balance_ops.get_default_account()]
 		};
 
-		// Convert &str to String for the underlying batch method
-		let token_strings: Vec<String> = token_symbols.iter().map(|s| s.to_string()).collect();
+		// Determine tokens for each chain
+		let mut all_tokens = Vec::new();
+		if let Some(token_symbols) = tokens {
+			// Use specific tokens for all chains
+			all_tokens.extend(token_symbols.iter().map(|s| s.to_string()));
+		} else {
+			// Get all tokens across all chains (deduplicated)
+			let mut token_set = std::collections::HashSet::new();
+			for &chain_id in &chain_ids {
+				let chain_tokens = self.ctx.tokens.tokens_for_chain(chain_id);
+				for token in chain_tokens {
+					token_set.insert(token.symbol.clone());
+				}
+			}
+			all_tokens.extend(token_set);
+		}
+
+		if all_tokens.is_empty() {
+			return Ok(Vec::new());
+		}
+
 		self.balance_ops
-			.balance_batch(chain, token_strings, account)
+			.balance(chain_ids, all_tokens, account_addresses)
 			.await
 	}
 
@@ -291,6 +291,16 @@ pub struct BalanceResult {
 	pub formatted: String,
 	pub token: String,
 	pub account: Address,
+}
+
+/// Enhanced balance query result with chain information
+#[derive(Debug, Clone)]
+pub struct EnhancedBalanceResult {
+	pub balance: U256,
+	pub formatted: String,
+	pub token: String,
+	pub account: Address,
+	pub chain: ChainId,
 }
 
 /// Approval operation result

@@ -468,6 +468,13 @@ async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<(
 					ctx.config.chains()
 				};
 
+				let account_names: Vec<&str> = accounts_to_check.iter().map(|(name, _)| *name).collect();
+
+				let results = token_ops
+					.balance(Some(chain_ids), None, Some(account_names))
+					.await?;
+
+				// Group and display results by account, then by chain
 				for (i, (account_name, display_name)) in accounts_to_check.iter().enumerate() {
 					// Add blank line between accounts (except for the first one)
 					if i > 0 {
@@ -476,25 +483,37 @@ async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<(
 
 					logging::subsection(display_name);
 
-					for chain_id in &chain_ids {
-						// Get all tokens for this chain
-						let tokens = ctx.tokens.tokens_for_chain(*chain_id);
+					// Get chains that have results for this account
+					let mut chains_with_results: Vec<ChainId> = results
+						.iter()
+						.filter(|r| {
+							// Match account name to address
+							let account_addr = ctx.resolve_address(account_name).unwrap_or_default();
+							r.account == account_addr
+						})
+						.map(|r| r.chain)
+						.collect();
+					chains_with_results.sort_by_key(|c| c.id());
+					chains_with_results.dedup();
 
-						// Display chain with just the ID, no "Custom Chain" suffix
+					for chain_id in chains_with_results {
+						// Display chain with just the ID
 						logging::subsection(&format!("  Chain {}:", chain_id.id()));
 
-						// Query all token balances in parallel
-						if !tokens.is_empty() {
-							let token_symbols: Vec<&str> =
-								tokens.iter().map(|t| t.symbol.as_str()).collect();
-							let results = token_ops
-								.balance_batch(*chain_id, token_symbols, Some(account_name))
-								.await?;
+						// Get and display results for this account and chain
+						let mut chain_results: Vec<_> = results
+							.iter()
+							.filter(|r| {
+								let account_addr = ctx.resolve_address(account_name).unwrap_or_default();
+								r.account == account_addr && r.chain == chain_id
+							})
+							.collect();
+						
+						// Sort by token name for consistent display
+						chain_results.sort_by(|a, b| a.token.cmp(&b.token));
 
-							// Display results in order
-							for result in results {
-								logging::item(&format!("{}: {}", result.token, result.formatted));
-							}
+						for result in chain_results {
+							logging::item(&format!("{}: {}", result.token, result.formatted));
 						}
 					}
 				}
