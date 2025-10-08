@@ -5,15 +5,15 @@ edition = "2021"
 rust-version.workspace = true
 
 [dependencies]
-alloy-consensus = "0.8"
-alloy-network = "0.8"
-alloy-primitives = "0.8"
-alloy-signer = "0.8"
-alloy-signer-local = "0.8"
+alloy-consensus = { workspace = true }
+alloy-network = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-signer = { workspace = true }
+alloy-signer-local = { workspace = true }
 async-trait = "0.1"
 hex = "0.4"
 solver-types = { path = "../solver-types" }
-thiserror = "1.0"
+thiserror = "2.0.17"
 toml = { workspace = true }
 
 [dev-dependencies]

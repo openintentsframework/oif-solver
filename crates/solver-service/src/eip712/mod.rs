@@ -73,13 +73,14 @@ pub async fn get_domain_separator(
 		})?;
 
 	// Decode the result using ITheCompact DOMAIN_SEPARATOR response
-	let domain_separator = DOMAIN_SEPARATORCall::abi_decode_returns(&result, false)
-		.map_err(|e| APIError::BadRequest {
-			error_type: ApiErrorType::OrderValidationFailed,
-			message: format!("Failed to decode domain separator: {}", e),
-			details: None,
-		})?
-		._0;
+	let domain_separator =
+		DOMAIN_SEPARATORCall::abi_decode_returns_validate(&result).map_err(|e| {
+			APIError::BadRequest {
+				error_type: ApiErrorType::OrderValidationFailed,
+				message: format!("Failed to decode domain separator: {}", e),
+				details: None,
+			}
+		})?;
 
 	Ok(domain_separator)
 }
@@ -145,21 +146,16 @@ fn recover_signer(
 		})?;
 
 	// Create message from hash
-	let message =
-		Message::from_digest_slice(message_hash.as_slice()).map_err(|_| APIError::BadRequest {
-			error_type: ApiErrorType::OrderValidationFailed,
-			message: "Invalid message hash".to_string(),
-			details: None,
-		})?;
+	let message = Message::from_digest(*message_hash);
 
 	// Recover public key
-	let public_key = secp
-		.recover_ecdsa(&message, &recoverable_sig)
-		.map_err(|_| APIError::BadRequest {
-			error_type: ApiErrorType::OrderValidationFailed,
-			message: "Failed to recover public key".to_string(),
-			details: None,
-		})?;
+	let public_key =
+		secp.recover_ecdsa(message, &recoverable_sig)
+			.map_err(|_| APIError::BadRequest {
+				error_type: ApiErrorType::OrderValidationFailed,
+				message: "Failed to recover public key".to_string(),
+				details: None,
+			})?;
 
 	// Get address from public key
 	let public_key_bytes = public_key.serialize_uncompressed();

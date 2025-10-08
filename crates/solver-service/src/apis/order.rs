@@ -7,9 +7,9 @@
 use axum::extract::{Extension, Path};
 use solver_core::SolverEngine;
 use solver_types::{
-	bytes32_to_address, parse_address, with_0x_prefix, AssetAmount, GetOrderError,
-	GetOrderResponse, InteropAddress, Order, OrderResponse, OrderStatus, Settlement,
-	SettlementType, StorageKey, TransactionType,
+	bytes32_to_address, standards::eip7930::InteropAddress, utils::conversion::parse_address,
+	with_0x_prefix, AssetAmount, GetOrderError, GetOrderResponse, Order, OrderResponse,
+	OrderStatus, Settlement, SettlementType, StorageKey, TransactionType,
 };
 
 /// Handles GET /orders/{id} requests.
@@ -30,7 +30,7 @@ pub async fn get_order_by_id(
 		);
 	}
 
-	let order = process_order_request(&id, _solver).await?;
+	let order = process_order_request(&with_0x_prefix(&id), _solver).await?;
 
 	Ok(GetOrderResponse { order })
 }
@@ -53,11 +53,11 @@ async fn process_order_request(
 			// Order found in storage, convert to OrderResponse
 			convert_order_to_response(order).await
 		},
-		Err(solver_storage::StorageError::NotFound) => {
+		Err(solver_storage::StorageError::NotFound(key)) => {
 			// Order not found in storage
 			Err(GetOrderError::NotFound(format!(
-				"Order not found: {}",
-				order_id
+				"Order {} with key {} not found",
+				order_id, key
 			)))
 		},
 		Err(e) => {
@@ -92,20 +92,6 @@ async fn convert_order_to_response(order: Order) -> Result<OrderResponse, GetOrd
 			)))
 		},
 	}
-}
-
-/// Creates an ERC-7930 interoperable address string from a token address and chain ID.
-fn create_interop_address_string(token: &str, chain_id: u64) -> Result<String, GetOrderError> {
-	// Parse the token address (with or without 0x prefix)
-	let address = parse_address(token)
-		.map_err(|e| GetOrderError::Internal(format!("Invalid token address: {}", e)))?;
-
-	// Convert to alloy Address type
-	let alloy_address = alloy_primitives::Address::from_slice(&address.0);
-
-	// Create InteropAddress and return as hex string
-	let interop_address = InteropAddress::new_ethereum(chain_id, alloy_address);
-	Ok(interop_address.to_hex())
 }
 
 /// Converts an EIP-7683 order to API OrderResponse format.
@@ -156,7 +142,10 @@ async fn convert_eip7683_order_to_response(
 		.ok_or_else(|| GetOrderError::Internal("No input chain ID found".to_string()))?;
 
 	// Convert input token to InteropAddress format
-	let input_interop_address = create_interop_address_string(input_token, input_chain_id)?;
+	let address = parse_address(input_token)
+		.map_err(|e| GetOrderError::Internal(format!("Invalid input token address: {}", e)))?;
+	let interop_address: InteropAddress = (input_chain_id, address).into();
+	let input_interop_address = interop_address.to_hex();
 
 	let input_amount = AssetAmount {
 		asset: input_interop_address,
@@ -212,8 +201,10 @@ async fn convert_eip7683_order_to_response(
 		.ok_or_else(|| GetOrderError::Internal("No output chain ID found".to_string()))?;
 
 	// Convert output token to InteropAddress format
-	let output_interop_address =
-		create_interop_address_string(&output_token_address, output_chain_id)?;
+	let address = parse_address(&output_token_address)
+		.map_err(|e| GetOrderError::Internal(format!("Invalid output token address: {}", e)))?;
+	let interop_address: InteropAddress = (output_chain_id, address).into();
+	let output_interop_address = interop_address.to_hex();
 
 	let output_amount = AssetAmount {
 		asset: output_interop_address,
@@ -404,7 +395,7 @@ mod tests {
 		let bytes = std::sync::Arc::new(bytes);
 		backend
 			.expect_get_bytes()
-			.with(eq("orders:order-test"))
+			.with(eq("orders:0xorder-test"))
 			.returning({
 				let bytes = bytes.clone();
 				move |_| {
@@ -457,7 +448,7 @@ mod tests {
 		backend
 			.expect_get_bytes()
 			.with(eq("orders:missing"))
-			.returning(|_| Box::pin(async move { Err(StorageError::NotFound) }));
+			.returning(|_| Box::pin(async move { Err(StorageError::NotFound("key".to_string())) }));
 
 		let solver = create_test_solver_engine(backend).await;
 

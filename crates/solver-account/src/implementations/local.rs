@@ -97,7 +97,7 @@ impl AccountInterface for LocalWallet {
 
 	async fn address(&self) -> Result<Address, AccountError> {
 		let alloy_address = self.signer.address();
-		Ok(Address(alloy_address.as_slice().to_vec()))
+		Ok(alloy_address.into())
 	}
 
 	async fn sign_transaction(&self, tx: &Transaction) -> Result<Signature, AccountError> {

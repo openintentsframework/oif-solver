@@ -6,12 +6,11 @@
 use crate::eip712::{
 	compact, get_domain_separator, MessageHashComputer, SignatureValidator as EipSignatureValidator,
 };
-use alloy_primitives::Address as AlloyAddress;
-use alloy_sol_types::SolType;
+use alloy_primitives::{Address as AlloyAddress, Bytes};
 use async_trait::async_trait;
 use solver_delivery::DeliveryService;
 use solver_types::{
-	api::IntentRequest,
+	api::PostOrderRequest,
 	standards::eip7683::{interfaces::StandardOrder as OifStandardOrder, LockType},
 	APIError, ApiErrorType, NetworksConfig,
 };
@@ -27,7 +26,7 @@ pub trait OrderSignatureValidator: Send + Sync {
 	/// Validates an EIP-712 signature for this standard.
 	async fn validate_signature(
 		&self,
-		intent: &IntentRequest,
+		intent: &PostOrderRequest,
 		networks_config: &NetworksConfig,
 		delivery_service: &Arc<DeliveryService>,
 	) -> Result<(), APIError>;
@@ -45,18 +44,22 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 
 	async fn validate_signature(
 		&self,
-		intent: &IntentRequest,
+		intent: &PostOrderRequest,
 		networks_config: &NetworksConfig,
 		delivery_service: &Arc<DeliveryService>,
 	) -> Result<(), APIError> {
-		// Parse order to get chain info
-		let standard_order = OifStandardOrder::abi_decode(&intent.order, true).map_err(|e| {
-			APIError::BadRequest {
+		use alloy_sol_types::SolType;
+
+		// Convert OifOrder to StandardOrder
+		let standard_order =
+			OifStandardOrder::try_from(&intent.order).map_err(|e| APIError::BadRequest {
 				error_type: ApiErrorType::OrderValidationFailed,
-				message: format!("Failed to decode order: {}", e),
+				message: format!("Failed to convert order: {}", e),
 				details: None,
-			}
-		})?;
+			})?;
+
+		// Encode to bytes for hashing
+		let order_bytes = Bytes::from(OifStandardOrder::abi_encode(&standard_order));
 
 		let origin_chain_id = standard_order.originChainId.to::<u64>();
 		let network =
@@ -97,8 +100,7 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 			get_domain_separator(delivery_service, the_compact_address, origin_chain_id).await?;
 
 		// 2. Compute message hash using interface
-
-		let struct_hash = message_hasher.compute_message_hash(&intent.order, contract_address)?;
+		let struct_hash = message_hasher.compute_message_hash(&order_bytes, contract_address)?;
 
 		// 3. Extract signature using interface
 		let signature = signature_validator.extract_signature(&intent.signature);
@@ -120,6 +122,7 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 				details: None,
 			});
 		}
+		tracing::debug!("EIP-712 signature validated");
 		Ok(())
 	}
 }
@@ -144,7 +147,7 @@ impl SignatureValidationService {
 	pub async fn validate_signature(
 		&self,
 		standard: &str,
-		intent: &IntentRequest,
+		intent: &PostOrderRequest,
 		networks_config: &NetworksConfig,
 		delivery_service: &Arc<DeliveryService>,
 	) -> Result<(), APIError> {

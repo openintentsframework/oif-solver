@@ -1,16 +1,12 @@
-# OIF Solver Configuration - Main File
+# OIF Solver Configuration - Generated File
+# Generated with placeholder values for easy regex replacement
 
-include = [
-    "demo/networks.toml",
-    "demo/api.toml",
-    "demo/cli.toml",
-    "demo/gas.toml",
-]
+include = ["demo/networks.toml", "demo/api.toml", "demo/gas.toml"]
 
 [solver]
 id = "oif-solver-demo"
-monitoring_timeout_minutes = 5
 min_profitability_pct = 1.0
+monitoring_timeout_seconds = 28800
 
 # ============================================================================
 # STORAGE
@@ -77,7 +73,7 @@ max_gas_price_gwei = 100
 # PRICING
 # ============================================================================
 [pricing]
-primary = "coingecko"
+primary = "mock"
 
 [pricing.implementations.mock]
 # Uses default ETH/USD price of 4615.16
@@ -97,10 +93,7 @@ TOKB = "195.00"
 # SETTLEMENT
 # ============================================================================
 [settlement]
-
-[settlement.domain]
-chain_id = 1
-address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+settlement_poll_interval_seconds = 3
 
 [settlement.implementations.direct]
 order = "eip7683"
@@ -113,57 +106,18 @@ oracle_selection_strategy = "First"
 [settlement.implementations.direct.oracles]
 # Input oracles (on origin chains)
 input = { 31337 = [
-    "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
+    "0xa513E6E4b8f2a923D98304ec87F64353C4D5C853",
 ], 31338 = [
-    "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
+    "0xa513E6E4b8f2a923D98304ec87F64353C4D5C853",
 ] }
 # Output oracles (on destination chains)
 output = { 31337 = [
-    "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
+    "0x2279B7A0a67DB372996a5FaB50D91eAA73d2eBe6",
 ], 31338 = [
-    "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
+    "0x2279B7A0a67DB372996a5FaB50D91eAA73d2eBe6",
 ] }
 
 # Valid routes: from origin chain -> to destination chains
 [settlement.implementations.direct.routes]
-31337 = [31338] # Can go from origin to destination
-31338 = [31337] # Can go from destination to origin
-
-# ============================================================================
-# HYPERLANE SETTLEMENT (For cross-chain messaging)
-# ============================================================================
-[settlement.implementations.hyperlane]
-order = "eipXXXX"
-network_ids = [31337, 31338]
-# Default gas limit for Hyperlane messages
-default_gas_limit = 500000
-message_timeout_seconds = 600
-finalization_required = false # For local testing
-
-# Oracle addresses for Hyperlane (different from direct to avoid conflicts)
-# Use a different oracle address to ensure Direct settlement is used for local demo
-[settlement.implementations.hyperlane.oracles]
-input = { 31337 = [
-    "0x0000000000000000000000000000000000000999",
-], 31338 = [
-    "0x0000000000000000000000000000000000000999",
-] }
-output = { 31337 = [
-    "0x0000000000000000000000000000000000000999",
-], 31338 = [
-    "0x0000000000000000000000000000000000000999",
-] }
-
-[settlement.implementations.hyperlane.routes]
 31337 = [31338]
 31338 = [31337]
-
-# Mailbox addresses (mock for local testing)
-[settlement.implementations.hyperlane.mailboxes]
-31337 = "0x0000000000000000000000000000000000000001" # Mock mailbox for local
-31338 = "0x0000000000000000000000000000000000000001" # Mock mailbox for local
-
-# IGP addresses (mock for local testing)
-[settlement.implementations.hyperlane.igp_addresses]
-31337 = "0x0000000000000000000000000000000000000002" # Mock IGP for local
-31338 = "0x0000000000000000000000000000000000000002" # Mock IGP for local

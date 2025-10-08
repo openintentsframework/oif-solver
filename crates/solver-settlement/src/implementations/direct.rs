@@ -7,13 +7,11 @@
 
 use crate::{utils::parse_oracle_config, OracleConfig, SettlementError, SettlementInterface};
 use alloy_primitives::{hex, FixedBytes, U256};
-use alloy_provider::{Provider, RootProvider};
-use alloy_rpc_types::BlockTransactionsKind;
-use alloy_transport_http::Http;
+use alloy_provider::{DynProvider, Provider};
 use async_trait::async_trait;
 use solver_types::{
-	with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, NetworksConfig, Order, Schema,
-	Transaction, TransactionHash, TransactionReceipt,
+	create_http_provider, with_0x_prefix, ConfigSchema, Field, FieldType, FillProof,
+	NetworksConfig, Order, ProviderError, Schema, Transaction, TransactionHash, TransactionReceipt,
 };
 use std::collections::HashMap;
 
@@ -23,7 +21,7 @@ use std::collections::HashMap;
 /// and manages dispute periods before allowing claims.
 pub struct DirectSettlement {
 	/// RPC providers for each supported network.
-	providers: HashMap<u64, RootProvider<Http<reqwest::Client>>>,
+	providers: HashMap<u64, DynProvider>,
 	/// Oracle configuration including addresses and routes
 	oracle_config: OracleConfig,
 	/// Dispute period duration in seconds.
@@ -54,25 +52,11 @@ impl DirectSettlement {
 		all_network_ids.dedup();
 
 		for network_id in all_network_ids {
-			let network = networks.get(&network_id).ok_or_else(|| {
-				SettlementError::ValidationFailed(format!(
-					"Network {} not found in configuration",
-					network_id
-				))
+			let provider = create_http_provider(network_id, networks).map_err(|e| match e {
+				ProviderError::NetworkConfig(msg) => SettlementError::ValidationFailed(msg),
+				ProviderError::Connection(msg) => SettlementError::ValidationFailed(msg),
+				ProviderError::InvalidUrl(msg) => SettlementError::ValidationFailed(msg),
 			})?;
-
-			let http_url = network.get_http_url().ok_or_else(|| {
-				SettlementError::ValidationFailed(format!(
-					"No HTTP RPC URL configured for network {}",
-					network_id
-				))
-			})?;
-			let provider = RootProvider::new_http(http_url.parse().map_err(|e| {
-				SettlementError::ValidationFailed(format!(
-					"Invalid RPC URL for network {}: {}",
-					network_id, e
-				))
-			})?);
 
 			providers.insert(network_id, provider);
 		}
@@ -224,10 +208,7 @@ impl SettlementInterface for DirectSettlement {
 
 		// Get the block timestamp
 		let block = provider
-			.get_block_by_number(
-				alloy_rpc_types::BlockNumberOrTag::Number(tx_block),
-				BlockTransactionsKind::Hashes,
-			)
+			.get_block_by_number(alloy_rpc_types::BlockNumberOrTag::Number(tx_block))
 			.await
 			.map_err(|e| {
 				SettlementError::ValidationFailed(format!("Failed to get block: {}", e))
@@ -266,10 +247,7 @@ impl SettlementInterface for DirectSettlement {
 
 		// Get current block to check timestamp
 		let current_block = match provider.get_block_number().await {
-			Ok(block_num) => match provider
-				.get_block_by_number(block_num.into(), BlockTransactionsKind::Hashes)
-				.await
-			{
+			Ok(block_num) => match provider.get_block_by_number(block_num.into()).await {
 				Ok(Some(block)) => block,
 				Ok(None) => return false,
 				Err(_) => return false,

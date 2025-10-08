@@ -1,0 +1,13 @@
+# Environment variables
+.env
+.env.local
+
+# Session data
+.oif-demo/
+
+# Build artifacts
+target/
+
+# IDE
+.vscode/
+.idea/
