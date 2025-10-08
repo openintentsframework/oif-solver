@@ -602,7 +602,7 @@ mod tests {
 		let config_toml = r#"
 			[solver]
 			id = "test-solver"
-			monitoring_timeout_minutes = 30
+			monitoring_timeout_seconds = 30
 			min_profitability_pct = 1.0
 			
 			[storage]
@@ -760,8 +760,8 @@ mod tests {
 
 		// Verify the engine was constructed properly by testing its accessors
 		assert_eq!(
-			engine.config().solver.monitoring_timeout_minutes,
-			config.solver.monitoring_timeout_minutes
+			engine.config().solver.monitoring_timeout_seconds,
+			config.solver.monitoring_timeout_seconds
 		);
 		assert!(Arc::ptr_eq(engine.storage(), &storage));
 		assert!(Arc::ptr_eq(engine.token_manager(), &token_manager));

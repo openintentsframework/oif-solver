@@ -460,10 +460,10 @@ mod tests {
 	use solver_types::utils::tests::builders::{
 		OrderBuilder, TransactionBuilder, TransactionReceiptBuilder,
 	};
-	use solver_types::{Order, Transaction, TransactionHash, TransactionReceipt};
+	use solver_types::{Address, Order, Transaction, TransactionHash, TransactionReceipt};
 	use std::collections::HashMap;
 	use std::sync::Arc;
-	use tokio::sync::mpsc;
+	use tokio::sync::broadcast;
 
 	fn create_test_order() -> Order {
 		OrderBuilder::new().build()
@@ -481,12 +481,17 @@ mod tests {
 			.build()
 	}
 
+	fn default_order_oracle_address() -> Address {
+		solver_types::utils::parse_address("0x1234567890123456789012345678901234567890")
+			.expect("Valid oracle address")
+	}
+
 	async fn create_test_handler_with_mocks<F1, F2, F3, F4>(
 		setup_storage: F1,
 		setup_settlement: F2,
 		setup_delivery: F3,
 		setup_order: F4,
-	) -> (SettlementHandler, mpsc::UnboundedReceiver<SolverEvent>)
+	) -> (SettlementHandler, broadcast::Receiver<SolverEvent>)
 	where
 		F1: FnOnce(&mut MockStorageInterface),
 		F2: FnOnce(&mut MockSettlementInterface),
@@ -530,8 +535,8 @@ mod tests {
 		));
 
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
-		let (_, event_rx) = mpsc::unbounded_channel();
 		let event_bus = EventBus::new(100);
+		let event_rx = event_bus.subscribe(); // Get receiver from event bus
 
 		let handler = SettlementHandler::new(
 			settlement,
@@ -550,9 +555,11 @@ mod tests {
 	async fn test_handle_post_fill_ready_storage_error() {
 		let (handler, _) = create_test_handler_with_mocks(
 			|mock_storage| {
-				mock_storage
-					.expect_get_bytes()
-					.returning(|_| Box::pin(async move { Err(StorageError::NotFound) }));
+				mock_storage.expect_get_bytes().returning(|_| {
+					Box::pin(
+						async move { Err(StorageError::NotFound("test_order_123".to_string())) },
+					)
+				});
 			},
 			|_| {}, // No settlement expectations
 			|_| {}, // No delivery expectations
@@ -571,9 +578,11 @@ mod tests {
 	async fn test_handle_pre_claim_ready_missing_fill_proof() {
 		let (handler, _) = create_test_handler_with_mocks(
 			|mock_storage| {
-				mock_storage
-					.expect_get_bytes()
-					.returning(|_| Box::pin(async move { Err(StorageError::NotFound) }));
+				mock_storage.expect_get_bytes().returning(|_| {
+					Box::pin(
+						async move { Err(StorageError::NotFound("test_order_123".to_string())) },
+					)
+				});
 			},
 			|_| {},
 			|_| {},
@@ -596,7 +605,11 @@ mod tests {
 					.expect_get_bytes()
 					.with(eq("orders:nonexistent_order"))
 					.times(1)
-					.returning(|_| Box::pin(async move { Err(StorageError::NotFound) }));
+					.returning(|_| {
+						Box::pin(async move {
+							Err(StorageError::NotFound("nonexistent_order".to_string()))
+						})
+					});
 			},
 			|_| {}, // No settlement expectations
 			|_| {}, // No delivery expectations
@@ -614,17 +627,11 @@ mod tests {
 	async fn test_handle_post_fill_ready_with_transaction() {
 		let (handler, _) = create_test_handler_with_mocks(
 			|mock_storage| {
-				// Check if order exists
-				mock_storage
-					.expect_exists()
-					.with(eq("orders:test_order_123"))
-					.times(1)
-					.returning(|_| Box::pin(async move { Ok(true) }));
-				// Called multiple times: initial retrieval and potentially again
+				// Mock order retrieval - called twice: once by handler, once by settlement service
 				mock_storage
 					.expect_get_bytes()
 					.with(eq("orders:test_order_123"))
-					.times(2)
+					.times(2) // Called twice: initial retrieval + settlement service oracle lookup
 					.returning(|_| {
 						let order = OrderBuilder::new()
 							.with_standard("eip7683")
@@ -632,17 +639,27 @@ mod tests {
 							.build();
 						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
 					});
-				// Second call: store tx hash mapping
+				// Mock exists check for update operation
+				mock_storage
+					.expect_exists()
+					.with(eq("orders:test_order_123"))
+					.times(1)
+					.returning(|_| Box::pin(async move { Ok(true) }));
+				// Mock storage for transaction hash mapping
 				mock_storage
 					.expect_set_bytes()
 					.times(2)
 					.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
 			},
 			|mock_settlement| {
+				// Add expectation for is_input_oracle_supported
 				mock_settlement
 					.expect_is_input_oracle_supported()
+					.with(eq(1u64), eq(default_order_oracle_address()))
 					.times(1)
 					.returning(|_, _| true);
+
+				// Mock settlement service methods
 				mock_settlement
 					.expect_generate_post_fill_transaction()
 					.times(1)
@@ -660,7 +677,7 @@ mod tests {
 						let receipt = create_test_receipt();
 						Box::pin(async move { Ok(receipt) })
 					});
-				mock_delivery.expect_submit().times(1).returning(|_| {
+				mock_delivery.expect_submit().times(1).returning(|_, _| {
 					let hash = TransactionHash(vec![0x33; 32]);
 					Box::pin(async move { Ok(hash) })
 				});
@@ -694,10 +711,13 @@ mod tests {
 					});
 			},
 			|mock_settlement| {
+				// Add expectation for is_input_oracle_supported with the correct oracle address
 				mock_settlement
 					.expect_is_input_oracle_supported()
+					.with(eq(1u64), eq(default_order_oracle_address()))
 					.times(1)
 					.returning(|_, _| true);
+
 				mock_settlement
 					.expect_generate_post_fill_transaction()
 					.times(1)

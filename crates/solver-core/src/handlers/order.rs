@@ -376,10 +376,13 @@ mod tests {
 			},
 			|mock_delivery| {
 				let hash_clone = prepare_tx_hash_clone.clone();
-				mock_delivery.expect_submit().times(1).returning(move |_| {
-					let hash = hash_clone.clone();
-					Box::pin(async move { Ok(hash) })
-				});
+				mock_delivery
+					.expect_submit()
+					.times(1)
+					.returning(move |_tx, _tracking| {
+						let hash = hash_clone.clone();
+						Box::pin(async move { Ok(hash) })
+					});
 			},
 			|mock_storage| {
 				let order_clone = order_clone.clone();
@@ -544,13 +547,16 @@ mod tests {
 					});
 			},
 			|mock_delivery| {
-				mock_delivery.expect_submit().times(1).returning(|_| {
-					Box::pin(async {
-						Err(solver_delivery::DeliveryError::Network(
-							"Delivery failed".to_string(),
-						))
-					})
-				});
+				mock_delivery
+					.expect_submit()
+					.times(1)
+					.returning(|_tx, _tracking| {
+						Box::pin(async {
+							Err(solver_delivery::DeliveryError::Network(
+								"Delivery failed".to_string(),
+							))
+						})
+					});
 			},
 			|_mock_storage| {},
 		)
@@ -585,10 +591,13 @@ mod tests {
 					});
 			},
 			|mock_delivery| {
-				mock_delivery.expect_submit().times(1).returning(move |_| {
-					let hash = prepare_tx_hash.clone();
-					Box::pin(async move { Ok(hash) })
-				});
+				mock_delivery
+					.expect_submit()
+					.times(1)
+					.returning(move |_tx, _tracking| {
+						let hash = prepare_tx_hash.clone();
+						Box::pin(async move { Ok(hash) })
+					});
 			},
 			|mock_storage| {
 				mock_storage
@@ -641,10 +650,13 @@ mod tests {
 			},
 			|mock_delivery| {
 				let fill_tx_hash_clone = fill_tx_hash_clone.clone();
-				mock_delivery.expect_submit().times(1).returning(move |_| {
-					let hash = fill_tx_hash_clone.clone();
-					Box::pin(async move { Ok(hash) })
-				});
+				mock_delivery
+					.expect_submit()
+					.times(1)
+					.returning(move |_tx, _tracking| {
+						let hash = fill_tx_hash_clone.clone();
+						Box::pin(async move { Ok(hash) })
+					});
 			},
 			|mock_storage| {
 				let order_clone = order_clone.clone();
@@ -740,13 +752,16 @@ mod tests {
 					});
 			},
 			|mock_delivery| {
-				mock_delivery.expect_submit().times(1).returning(|_| {
-					Box::pin(async {
-						Err(solver_delivery::DeliveryError::Network(
-							"Execution delivery failed".to_string(),
-						))
-					})
-				});
+				mock_delivery
+					.expect_submit()
+					.times(1)
+					.returning(|_tx, _tracking| {
+						Box::pin(async {
+							Err(solver_delivery::DeliveryError::Network(
+								"Execution delivery failed".to_string(),
+							))
+						})
+					});
 			},
 			|_mock_storage| {},
 		)
@@ -780,10 +795,13 @@ mod tests {
 			},
 			|mock_delivery| {
 				let fill_tx_hash_clone = fill_tx_hash.clone();
-				mock_delivery.expect_submit().times(1).returning(move |_| {
-					let hash = fill_tx_hash_clone.clone();
-					Box::pin(async move { Ok(hash) })
-				});
+				mock_delivery
+					.expect_submit()
+					.times(1)
+					.returning(move |_tx, _tracking| {
+						let hash = fill_tx_hash_clone.clone();
+						Box::pin(async move { Ok(hash) })
+					});
 			},
 			|mock_storage| {
 				// Mock for state machine storage operations - simulate error

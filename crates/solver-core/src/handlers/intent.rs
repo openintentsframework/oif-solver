@@ -449,6 +449,7 @@ mod tests {
 			pricing_service,
 			delivery_service,
 			token_manager,
+			Arc::new(StorageService::new(Box::new(MockStorageInterface::new()))),
 		))
 	}
 
@@ -476,7 +477,7 @@ mod tests {
 		mock_order_interface
 			.expect_validate_and_create_order()
 			.times(1)
-			.returning(move |_, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
+			.returning(move |_, _, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
 
 		mock_strategy
 			.expect_should_execute()
@@ -600,7 +601,7 @@ mod tests {
 		mock_order_interface
 			.expect_validate_and_create_order()
 			.times(1)
-			.returning(|_, _, _, _, _| {
+			.returning(|_, _, _, _, _, _| {
 				Box::pin(async move {
 					Err(solver_order::OrderError::ValidationFailed(
 						"Invalid intent".to_string(),
@@ -676,7 +677,7 @@ mod tests {
 		mock_order_interface
 			.expect_validate_and_create_order()
 			.times(1)
-			.returning(move |_, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
+			.returning(move |_, _, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
 
 		mock_strategy
 			.expect_should_execute()
@@ -747,7 +748,7 @@ mod tests {
 		mock_order_interface
 			.expect_validate_and_create_order()
 			.times(1)
-			.returning(move |_, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
+			.returning(move |_, _, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
 
 		mock_strategy
 			.expect_should_execute()
@@ -865,7 +866,7 @@ mod tests {
 		mock_order_interface
 			.expect_validate_and_create_order()
 			.times(1)
-			.returning(move |_, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
+			.returning(move |_, _, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
 		mock_strategy.expect_should_execute().returning(|_, _| {
 			Box::pin(async move {
 				ExecutionDecision::Execute(ExecutionParams {
