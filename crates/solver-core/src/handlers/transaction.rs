@@ -657,7 +657,11 @@ mod tests {
 		// Store the order in state machine first with Executed status (required for PostFill transition)
 		let mut order_for_state = order.clone();
 		order_for_state.status = OrderStatus::Executed;
-		handler.state_machine.store_order(&order_for_state).await.unwrap();
+		handler
+			.state_machine
+			.store_order(&order_for_state)
+			.await
+			.unwrap();
 
 		let receipt = create_test_receipt(true);
 
@@ -1060,9 +1064,7 @@ mod tests {
 				.times(1)
 				.returning(|key| {
 					let key = key.to_string();
-					Box::pin(async move {
-						Err(solver_storage::StorageError::NotFound(key))
-					})
+					Box::pin(async move { Err(solver_storage::StorageError::NotFound(key)) })
 				});
 		})
 		.await;
