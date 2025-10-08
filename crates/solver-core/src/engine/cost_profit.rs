@@ -1300,3 +1300,1379 @@ pub fn estimate_gas_units_from_config(
 
 	(fallback_open, fallback_fill, fallback_claim)
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use alloy_primitives::address;
+	use mockall::predicate::*;
+	use solver_account::{AccountService, MockAccountInterface};
+	use solver_config::ConfigBuilder;
+	use solver_delivery::MockDeliveryInterface;
+	use solver_pricing::MockPricingInterface;
+	use solver_storage::MockStorageInterface;
+	use solver_types::{
+		current_timestamp, oif_versions,
+		standards::eip7683::{GasLimitOverrides, MandateOutput},
+		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
+		ChainSettlerInfo, CostContext, Eip7683OrderData, FailureHandlingMode, GetQuoteRequest,
+		IntentRequest, IntentType, InteropAddress, NetworksConfig, OifOrder, OrderPayload,
+		OrderStatus, Quote, QuoteInput, QuoteOutput, QuotePreference, QuoteWithCostContext,
+		SignatureType, SwapType, ValidatedQuoteContext,
+	};
+	use std::collections::HashMap;
+	use std::str::FromStr;
+	use std::sync::Arc;
+	use tokio;
+
+	fn create_test_networks_config() -> NetworksConfig {
+		let input_token = solver_types::utils::tests::builders::TokenConfigBuilder::new()
+			.address({
+				// Convert U256::from(1000) to Address - token 1000 = 0x3e8
+				let mut addr_bytes = [0u8; 20];
+				addr_bytes[18] = 0x03; // 0x03e8 = 1000
+				addr_bytes[19] = 0xe8;
+				solver_types::Address(addr_bytes.to_vec())
+			})
+			.symbol("INPUT".to_string())
+			.decimals(18)
+			.build();
+		let output_token = solver_types::utils::tests::builders::TokenConfigBuilder::new()
+			.address(solver_types::Address(vec![0u8; 20])) // Zero address for output
+			.symbol("OUTPUT".to_string())
+			.decimals(18)
+			.build();
+		NetworksConfigBuilder::new()
+			.add_network(
+				1,
+				NetworkConfigBuilder::new()
+					.tokens(vec![input_token])
+					.build(),
+			)
+			.add_network(
+				137,
+				NetworkConfigBuilder::new()
+					.tokens(vec![output_token])
+					.build(),
+			)
+			.build()
+	}
+
+	// Helper functions for creating test data
+	fn create_test_config() -> Config {
+		ConfigBuilder::new()
+			.with_min_profitability_pct(Decimal::from_str("5.0").unwrap())
+			.build()
+	}
+	fn create_test_request(is_exact_input: bool) -> GetQuoteRequest {
+		GetQuoteRequest {
+			user: InteropAddress::new_ethereum(
+				1,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			intent: IntentRequest {
+				intent_type: IntentType::OifSwap,
+				inputs: vec![QuoteInput {
+					user: InteropAddress::new_ethereum(
+						1,
+						address!("1111111111111111111111111111111111111111"),
+					),
+					asset: InteropAddress::new_ethereum(
+						1,
+						address!("A0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
+					),
+					amount: if is_exact_input {
+						Some(U256::from(1000).to_string()) // For ExactInput, specify input amount
+					} else {
+						None // For ExactOutput, input amount will be calculated
+					},
+					lock: None,
+				}],
+				outputs: vec![QuoteOutput {
+					receiver: InteropAddress::new_ethereum(
+						137,
+						address!("2222222222222222222222222222222222222222"),
+					),
+					asset: InteropAddress::new_ethereum(
+						137,
+						address!("B0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
+					),
+					amount: if is_exact_input {
+						Some(U256::from(950).to_string()) // For ExactInput, this is estimated
+					} else {
+						Some(U256::from_str("2000000000").unwrap().to_string()) // For ExactOutput, specify exact output amount (2000 USDC)
+					},
+					calldata: None,
+				}],
+				swap_type: None,
+				min_valid_until: None,
+				preference: Some(QuotePreference::Speed),
+				origin_submission: None,
+				failure_handling: None,
+				partial_fill: None,
+				metadata: None,
+			},
+			supported_types: vec![oif_versions::escrow_order_type("v0")],
+		}
+	}
+
+	fn create_test_validated_context(is_exact_input: bool) -> ValidatedQuoteContext {
+		match is_exact_input {
+			true => {
+				let input = QuoteInput {
+					user: InteropAddress::new_ethereum(
+						1,
+						address!("1111111111111111111111111111111111111111"),
+					),
+					asset: InteropAddress::new_ethereum(
+						1,
+						address!("A0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
+					),
+					amount: Some("1000000000000000000".to_string()), // 1 ETH
+					lock: None,
+				};
+				let input_amount = U256::from_str("1000000000000000000").unwrap();
+
+				ValidatedQuoteContext {
+					swap_type: SwapType::ExactInput,
+					known_inputs: Some(vec![(input, input_amount)]),
+					constraint_inputs: None,
+					constraint_outputs: None,
+					known_outputs: None,
+				}
+			},
+			false => {
+				let output = QuoteOutput {
+					receiver: InteropAddress::new_ethereum(
+						137,
+						address!("2222222222222222222222222222222222222222"),
+					),
+					asset: InteropAddress::new_ethereum(
+						137,
+						address!("B0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
+					),
+					amount: Some(U256::from_str("2000000000").unwrap().to_string()), // 2000 USDC (6 decimals)
+					calldata: None,
+				};
+				let output_amount = U256::from_str("2000000000").unwrap();
+
+				ValidatedQuoteContext {
+					swap_type: SwapType::ExactOutput,
+					known_inputs: None,
+					constraint_inputs: None,
+					constraint_outputs: None,
+					known_outputs: Some(vec![(output, output_amount)]),
+				}
+			},
+		}
+	}
+
+	fn create_test_cost_breakdown() -> CostBreakdown {
+		CostBreakdown {
+			gas_open: Decimal::from_str("0.01").unwrap(),
+			gas_fill: Decimal::from_str("0.02").unwrap(),
+			gas_claim: Decimal::from_str("0.01").unwrap(),
+			gas_buffer: Decimal::from_str("0.004").unwrap(),
+			rate_buffer: Decimal::ZERO,
+			base_price: Decimal::ZERO,
+			min_profit: Decimal::from_str("5.00").unwrap(),
+			operational_cost: Decimal::from_str("0.044").unwrap(),
+			subtotal: Decimal::from_str("0.044").unwrap(),
+			total: Decimal::from_str("0.044").unwrap(),
+			currency: "USD".to_string(),
+		}
+	}
+
+	fn create_test_quote_with_cost_context() -> QuoteWithCostContext {
+		QuoteWithCostContext {
+			quote: Quote {
+				order: OifOrder::OifEscrowV0 {
+					payload: OrderPayload {
+						signature_type: SignatureType::Eip712,
+						domain: serde_json::json!({}),
+						primary_type: "Order".to_string(),
+						message: serde_json::json!({}),
+						types: Some(serde_json::json!({})),
+					},
+				},
+				failure_handling: FailureHandlingMode::RefundAutomatic,
+				partial_fill: false,
+				valid_until: current_timestamp() + 300,
+				eta: Some(60),
+				quote_id: "test_quote_123".to_string(),
+				provider: Some("test_solver".to_string()),
+			},
+			cost_context: CostContext {
+				cost_breakdown: create_test_cost_breakdown(),
+				execution_costs_by_chain: HashMap::new(),
+				liquidity_cost_adjustment: Decimal::ZERO,
+				protocol_fees: HashMap::new(),
+				swap_type: SwapType::ExactInput,
+				cost_amounts_in_tokens: HashMap::new(),
+				swap_amounts: HashMap::new(),
+				adjusted_amounts: HashMap::new(),
+			},
+		}
+	}
+
+	fn create_mock_pricing_service() -> Arc<PricingService> {
+		let mock = MockPricingInterface::new();
+		Arc::new(PricingService::new(Box::new(mock)))
+	}
+
+	fn create_mock_delivery_service() -> Arc<DeliveryService> {
+		let implementations = HashMap::new();
+		Arc::new(DeliveryService::new(implementations, 1, 3600))
+	}
+
+	fn create_mock_token_manager() -> Arc<TokenManager> {
+		let token_manager = Arc::new(TokenManager::new(
+			create_test_networks_config(),
+			create_mock_delivery_service(),
+			create_mock_account_service(),
+		));
+
+		token_manager
+	}
+
+	fn create_mock_account_service() -> Arc<AccountService> {
+		let mut mock_account = MockAccountInterface::new();
+		mock_account
+			.expect_address()
+			.returning(|| Box::pin(async move { Ok(solver_types::Address([0xAB; 20].to_vec())) }));
+		mock_account
+			.expect_config_schema()
+			.returning(|| Box::new(solver_account::implementations::local::LocalWalletSchema));
+		mock_account
+			.expect_get_private_key()
+			.returning(|| solver_types::SecretString::from("0x1234567890abcdef"));
+
+		Arc::new(AccountService::new(Box::new(mock_account)))
+	}
+
+	#[tokio::test]
+	async fn test_get_cost_context_by_quote_id_success() {
+		// Arrange
+		let mut mock_storage = MockStorageInterface::new();
+		let test_quote_with_context = create_test_quote_with_cost_context();
+		let expected_cost_context = test_quote_with_context.cost_context.clone();
+
+		mock_storage
+			.expect_get_bytes()
+			.with(eq("quotes:test_quote_123"))
+			.times(1)
+			.returning(move |_| {
+				let serialized = serde_json::to_vec(&test_quote_with_context).unwrap();
+				Box::pin(async move { Ok(serialized) })
+			});
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let pricing = create_mock_pricing_service();
+		let delivery = create_mock_delivery_service();
+		let token_manager = create_mock_token_manager();
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		// Act
+		let result = service.get_cost_context_by_quote_id("test_quote_123").await;
+
+		// Assert
+		assert!(result.is_ok());
+		let cost_context = result.unwrap();
+		assert_eq!(cost_context.swap_type, expected_cost_context.swap_type);
+	}
+
+	#[tokio::test]
+	async fn test_get_cost_context_by_quote_id_not_found() {
+		// Arrange
+		let mut mock_storage = MockStorageInterface::new();
+
+		mock_storage
+			.expect_get_bytes()
+			.with(eq("quotes:nonexistent_quote"))
+			.times(1)
+			.returning(|_| {
+				Box::pin(async move {
+					Err(solver_storage::StorageError::NotFound(
+						"Quote not found".to_string(),
+					))
+				})
+			});
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let pricing = create_mock_pricing_service();
+		let delivery = create_mock_delivery_service();
+		let token_manager = create_mock_token_manager();
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		// Act
+		let result = service
+			.get_cost_context_by_quote_id("nonexistent_quote")
+			.await;
+
+		// Assert
+		assert!(result.is_err());
+		match result.unwrap_err() {
+			CostProfitError::Storage(_) => {
+				// Expected error type
+			},
+			other => panic!("Expected Storage error, got: {:?}", other),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_calculate_cost_context_exact_input() {
+		// Arrange
+		let mut mock_pricing = MockPricingInterface::new();
+		let mut mock_delivery = MockDeliveryInterface::new();
+		let mock_storage = MockStorageInterface::new();
+
+		// Mock pricing service calls - allow any convert_asset calls
+		mock_pricing
+			.expect_convert_asset()
+			.returning(|from, to, amount| {
+				let from = from.to_string();
+				let to = to.to_string();
+				let amount_f64: f64 = amount.parse().unwrap_or(0.0);
+				Box::pin(async move {
+					match (from.as_str(), to.as_str()) {
+						("ETH", "USD") => Ok((amount_f64 * 4000.0).to_string()),
+						("USD", "ETH") => Ok((amount_f64 / 4000.0).to_string()),
+						("USDC", "USD") => Ok(amount_f64.to_string()),
+						("USD", "USDC") => Ok(amount_f64.to_string()),
+						_ => Ok("1.0".to_string()),
+					}
+				})
+			});
+
+		mock_pricing
+			.expect_wei_to_currency()
+			.returning(|_, _| Box::pin(async move { Ok("0.01".to_string()) }));
+
+		// Add config_schema expectation for the mock
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		// Remove duplicate expectations and add proper setup
+		mock_delivery
+			.expect_get_gas_price()
+			.returning(|_| Box::pin(async move { Ok("20000000000".to_string()) }));
+
+		mock_delivery
+			.expect_get_block_number()
+			.returning(|_| Box::pin(async move { Ok(12345u64) }));
+
+		// Create services with proper delivery implementations
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+
+		// Create delivery service with mock implementations for both chains
+		let mut delivery_implementations = HashMap::new();
+		delivery_implementations.insert(
+			1,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+
+		// Create a second mock for chain 137
+		let mut mock_delivery_137 = MockDeliveryInterface::new();
+		mock_delivery_137.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+		mock_delivery_137
+			.expect_get_gas_price()
+			.returning(|_| Box::pin(async move { Ok("20000000000".to_string()) }));
+		mock_delivery_137
+			.expect_get_block_number()
+			.returning(|_| Box::pin(async move { Ok(12345u64) }));
+
+		delivery_implementations.insert(
+			137,
+			Arc::new(mock_delivery_137) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 1, 3600));
+
+		// Create proper token manager with required tokens
+		let mut networks = solver_types::NetworksConfig::new();
+
+		// Add chain 1 with ETH token
+		let network_1 = solver_types::NetworkConfig {
+			rpc_urls: vec![],
+			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
+			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
+			tokens: vec![solver_types::TokenConfig {
+				address: solver_types::Address(
+					[
+						0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
+						0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+					]
+					.to_vec(),
+				),
+				decimals: 18,
+				symbol: "ETH".to_string(),
+			}],
+			input_settler_compact_address: None,
+			the_compact_address: None,
+			allocator_address: None,
+		};
+		networks.insert(1, network_1);
+
+		// Add chain 137 with USDC token
+		let network_137 = solver_types::NetworkConfig {
+			rpc_urls: vec![],
+			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
+			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
+			tokens: vec![solver_types::TokenConfig {
+				address: solver_types::Address(
+					[
+						0xB0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
+						0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+					]
+					.to_vec(),
+				),
+				decimals: 6,
+				symbol: "USDC".to_string(),
+			}],
+			input_settler_compact_address: None,
+			the_compact_address: None,
+			allocator_address: None,
+		};
+		networks.insert(137, network_137);
+
+		let token_manager = Arc::new(TokenManager::new(
+			networks,
+			delivery.clone(),
+			create_mock_account_service(),
+		));
+
+		// Create services
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let request = create_test_request(true); // true for ExactInput
+		let context = create_test_validated_context(true); // true for ExactInput
+		let config = create_test_config();
+
+		// Act
+		let result = service
+			.calculate_cost_context(&request, &context, &config)
+			.await;
+
+		// Assert
+		assert!(result.is_ok());
+		let cost_context = result.unwrap();
+
+		// Verify swap type
+		assert_eq!(cost_context.swap_type, SwapType::ExactInput);
+
+		// Verify cost breakdown exists and has reasonable values
+		assert!(cost_context.cost_breakdown.total >= Decimal::ZERO);
+		assert!(cost_context.cost_breakdown.operational_cost >= Decimal::ZERO);
+
+		// Verify execution costs by chain
+		assert!(cost_context.execution_costs_by_chain.len() >= 1);
+
+		// Verify swap amounts were calculated
+		assert!(!cost_context.swap_amounts.is_empty());
+
+		// Verify adjusted amounts (for ExactInput, outputs should be adjusted down)
+		assert!(!cost_context.adjusted_amounts.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_calculate_cost_context_exact_output() {
+		// Arrange
+		let mut mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+
+		// Mock pricing service calls for reverse conversion (output -> input)
+		mock_pricing
+			.expect_convert_asset()
+			.with(eq("USDC"), eq("USD"), eq("2000"))
+			.times(1)
+			.returning(|_, _, _| Box::pin(async move { Ok("2000.0".to_string()) }));
+
+		mock_pricing
+			.expect_convert_asset()
+			.with(eq("USD"), eq("ETH"), eq("2000.0"))
+			.times(1)
+			.returning(|_, _, _| Box::pin(async move { Ok("1.0".to_string()) }));
+
+		// Additional mock calls that might be needed for cost calculations
+		mock_pricing
+			.expect_convert_asset()
+			.with(eq("ETH"), eq("USD"), eq("1"))
+			.returning(|_, _, _| Box::pin(async move { Ok("4000.0".to_string()) }));
+
+		mock_pricing
+			.expect_convert_asset()
+			.with(eq("USD"), eq("USDC"), eq("4000.0"))
+			.returning(|_, _, _| Box::pin(async move { Ok("4000.0".to_string()) }));
+
+		// Allow any additional convert_asset calls
+		mock_pricing
+			.expect_convert_asset()
+			.returning(|from, to, amount| {
+				let from = from.to_string();
+				let to = to.to_string();
+				let amount_f64: f64 = amount.parse().unwrap_or(0.0);
+				Box::pin(async move {
+					match (from.as_str(), to.as_str()) {
+						("ETH", "USD") => Ok((amount_f64 * 4000.0).to_string()),
+						("USD", "ETH") => Ok((amount_f64 / 4000.0).to_string()),
+						("USDC", "USD") => Ok(amount_f64.to_string()),
+						("USD", "USDC") => Ok(amount_f64.to_string()),
+						_ => Ok("1.0".to_string()),
+					}
+				})
+			});
+
+		mock_pricing
+			.expect_wei_to_currency()
+			.returning(|_, _| Box::pin(async move { Ok("0.01".to_string()) }));
+
+		// Create mock delivery for chain 1
+		let mut mock_delivery_1 = MockDeliveryInterface::new();
+		mock_delivery_1.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+		mock_delivery_1
+			.expect_get_gas_price()
+			.returning(|_| Box::pin(async move { Ok("20000000000".to_string()) }));
+		mock_delivery_1
+			.expect_get_block_number()
+			.returning(|_| Box::pin(async move { Ok(12345u64) }));
+
+		// Create mock delivery for chain 137
+		let mut mock_delivery_137 = MockDeliveryInterface::new();
+		mock_delivery_137.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+		mock_delivery_137
+			.expect_get_gas_price()
+			.returning(|_| Box::pin(async move { Ok("20000000000".to_string()) }));
+		mock_delivery_137
+			.expect_get_block_number()
+			.returning(|_| Box::pin(async move { Ok(12345u64) }));
+
+		// Create delivery service with mock implementations for both chains
+		let mut delivery_implementations = HashMap::new();
+		delivery_implementations.insert(
+			1,
+			Arc::new(mock_delivery_1) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		delivery_implementations.insert(
+			137,
+			Arc::new(mock_delivery_137) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 1, 3600));
+
+		// Create proper token manager with required tokens
+		let mut networks = solver_types::NetworksConfig::new();
+
+		// Add chain 1 with ETH token
+		let network_1 = solver_types::NetworkConfig {
+			rpc_urls: vec![],
+			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
+			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
+			tokens: vec![solver_types::TokenConfig {
+				address: solver_types::Address(
+					[
+						0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
+						0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+					]
+					.to_vec(),
+				),
+				decimals: 18,
+				symbol: "ETH".to_string(),
+			}],
+			input_settler_compact_address: None,
+			the_compact_address: None,
+			allocator_address: None,
+		};
+		networks.insert(1, network_1);
+
+		// Add chain 137 with USDC token
+		let network_137 = solver_types::NetworkConfig {
+			rpc_urls: vec![],
+			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
+			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
+			tokens: vec![solver_types::TokenConfig {
+				address: solver_types::Address(
+					[
+						0xB0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
+						0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+					]
+					.to_vec(),
+				),
+				decimals: 6,
+				symbol: "USDC".to_string(),
+			}],
+			input_settler_compact_address: None,
+			the_compact_address: None,
+			allocator_address: None,
+		};
+		networks.insert(137, network_137);
+
+		let token_manager = Arc::new(TokenManager::new(
+			networks,
+			delivery.clone(),
+			create_mock_account_service(),
+		));
+
+		// Create services
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		// Create test request for ExactOutput
+		let request = create_test_request(false); // false for ExactOutput
+		let context = create_test_validated_context(false); // false for ExactOutput
+		let config = create_test_config();
+
+		// Act
+		let result = service
+			.calculate_cost_context(&request, &context, &config)
+			.await;
+
+		// Assert
+		assert!(result.is_ok());
+		let cost_context = result.unwrap();
+
+		// Verify swap type
+		assert_eq!(cost_context.swap_type, SwapType::ExactOutput);
+
+		// Verify cost breakdown exists and has reasonable values
+		assert!(cost_context.cost_breakdown.total >= Decimal::ZERO);
+		assert!(cost_context.cost_breakdown.operational_cost >= Decimal::ZERO);
+
+		// Verify execution costs by chain
+		assert!(cost_context.execution_costs_by_chain.len() >= 1);
+
+		// Verify swap amounts were calculated
+		assert!(!cost_context.swap_amounts.is_empty());
+
+		// Verify adjusted amounts (for ExactOutput, inputs should be adjusted up)
+		assert!(!cost_context.adjusted_amounts.is_empty());
+
+		// The adjusted amount should be higher than the swap amount for inputs in ExactOutput
+		for (token, adjusted_info) in &cost_context.adjusted_amounts {
+			if let Some(swap_info) = cost_context.swap_amounts.get(token) {
+				if let Some(cost_info) = cost_context.cost_amounts_in_tokens.get(token) {
+					// For ExactOutput inputs: adjusted = swap + cost
+					let expected_adjusted = swap_info.amount.saturating_add(cost_info.amount);
+					assert_eq!(adjusted_info.amount, expected_adjusted);
+				}
+			}
+		}
+	}
+
+	// ============================================================================
+	// Profitability Validation Tests
+	// ============================================================================
+
+	// Helpers for profitability validation
+	fn create_test_order_with_amounts(input_amount: U256, output_amount: U256) -> Order {
+		// Create EIP-7683 order data
+		let eip7683_data = Eip7683OrderData {
+			user: "0x1111111111111111111111111111111111111111".to_string(),
+			nonce: U256::from(1),
+			origin_chain_id: U256::from(1),
+			expires: (current_timestamp() + 3600) as u32,
+			fill_deadline: (current_timestamp() + 300) as u32,
+			input_oracle: "0x0000000000000000000000000000000000000000".to_string(),
+			inputs: vec![[
+				// Use the INPUT token address from create_test_networks_config (0x3e8 = 1000)
+				U256::from(1000),
+				input_amount, // amount
+			]],
+			order_id: [1u8; 32],
+			gas_limit_overrides: GasLimitOverrides::default(),
+			outputs: vec![MandateOutput {
+				oracle: [0u8; 32],  // Zero oracle for test
+				settler: [0u8; 32], // Zero settler for test
+				token: [0u8; 32],   // Use zero address for OUTPUT token
+				amount: output_amount,
+				recipient: U256::from_str("0x2222222222222222222222222222222222222222")
+					.unwrap()
+					.to_be_bytes(),
+				chain_id: U256::from(137),
+				call: vec![],
+				context: vec![], // Empty context for test
+			}],
+			raw_order_data: None,
+			signature: None,
+			sponsor: None,
+			lock_type: None,
+		};
+
+		Order {
+			id: "test_order_id".to_string(),
+			standard: "eip7683".to_string(),
+			created_at: current_timestamp(),
+			updated_at: current_timestamp(),
+			status: OrderStatus::Created,
+			data: serde_json::to_value(eip7683_data).unwrap(),
+			solver_address: solver_types::Address([0xAB; 20].to_vec()),
+			quote_id: Some("test_quote_id".to_string()),
+			input_chains: vec![ChainSettlerInfo {
+				chain_id: 1,
+				settler_address: solver_types::Address([0x11; 20].to_vec()),
+			}],
+			output_chains: vec![ChainSettlerInfo {
+				chain_id: 137,
+				settler_address: solver_types::Address([0x22; 20].to_vec()),
+			}],
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
+			claim_tx_hash: None,
+			fill_proof: None,
+		}
+	}
+
+	fn create_profitable_order() -> Order {
+		// Input: 1 INPUT (~$4000), Output: 3900 OUTPUT = $100 profit (2.5% margin)
+		create_test_order_with_amounts(
+			U256::from_str("1000000000000000000").unwrap(), // 1 INPUT (18 decimals)
+			U256::from_str("3900000000000000000000").unwrap(), // 3900 OUTPUT (18 decimals)
+		)
+	}
+
+	fn create_unprofitable_order() -> Order {
+		// Input: 1 INPUT (~$4000), Output: 3990 OUTPUT = -$34 loss (considering $44 operational cost)
+		create_test_order_with_amounts(
+			U256::from_str("1000000000000000000").unwrap(), // 1 INPUT (18 decimals)
+			U256::from_str("3990000000000000000000").unwrap(), // 3990 OUTPUT (18 decimals)
+		)
+	}
+
+	fn create_zero_value_order() -> Order {
+		// Both input and output are zero
+		create_test_order_with_amounts(U256::ZERO, U256::ZERO)
+	}
+
+	fn create_test_cost_breakdown_with_profit(min_profit: Decimal) -> CostBreakdown {
+		CostBreakdown {
+			gas_open: Decimal::from_str("0.01").unwrap(),
+			gas_fill: Decimal::from_str("0.02").unwrap(),
+			gas_claim: Decimal::from_str("0.01").unwrap(),
+			gas_buffer: Decimal::from_str("0.004").unwrap(),
+			rate_buffer: Decimal::ZERO,
+			base_price: Decimal::ZERO,
+			min_profit,
+			operational_cost: Decimal::from_str("0.044").unwrap(),
+			subtotal: Decimal::from_str("0.044").unwrap(),
+			total: Decimal::from_str("0.044").unwrap(),
+			currency: "USD".to_string(),
+		}
+	}
+
+	fn create_cost_context_with_swap_type(swap_type: SwapType) -> CostContext {
+		CostContext {
+			cost_breakdown: create_test_cost_breakdown_with_profit(
+				Decimal::from_str("200.0").unwrap(),
+			),
+			execution_costs_by_chain: HashMap::new(),
+			liquidity_cost_adjustment: Decimal::ZERO,
+			protocol_fees: HashMap::new(),
+			swap_type,
+			cost_amounts_in_tokens: HashMap::new(),
+			swap_amounts: HashMap::new(),
+			adjusted_amounts: HashMap::new(),
+		}
+	}
+
+	async fn setup_profitable_mocks() -> (
+		Arc<PricingService>,
+		Arc<DeliveryService>,
+		Arc<TokenManager>,
+		Arc<StorageService>,
+	) {
+		let mut mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+
+		// Mock INPUT to USD conversion (1 INPUT = $4000)
+		mock_pricing
+			.expect_convert_asset()
+			.with(eq("INPUT"), eq("USD"), eq("1"))
+			.returning(|_, _, _| Box::pin(async move { Ok("4000.0".to_string()) }));
+
+		// Mock OUTPUT to USD conversion (normalized amount)
+		mock_pricing
+			.expect_convert_asset()
+			.with(eq("OUTPUT"), eq("USD"), eq("3900"))
+			.returning(|_, _, _| Box::pin(async move { Ok("3900.0".to_string()) }));
+
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let delivery = create_mock_delivery_service();
+		let token_manager = create_mock_token_manager();
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+
+		(pricing, delivery, token_manager, storage)
+	}
+
+	async fn setup_unprofitable_mocks() -> (
+		Arc<PricingService>,
+		Arc<DeliveryService>,
+		Arc<TokenManager>,
+		Arc<StorageService>,
+	) {
+		let mut mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+
+		// Mock INPUT to USD conversion (1 INPUT = $4000)
+		mock_pricing
+			.expect_convert_asset()
+			.with(eq("INPUT"), eq("USD"), eq("1"))
+			.returning(|_, _, _| Box::pin(async move { Ok("4000.0".to_string()) }));
+
+		// Mock OUTPUT to USD conversion - higher output (less profitable)
+		mock_pricing
+			.expect_convert_asset()
+			.with(eq("OUTPUT"), eq("USD"), eq("3990"))
+			.returning(|_, _, _| Box::pin(async move { Ok("3990.0".to_string()) }));
+
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let delivery = create_mock_delivery_service();
+		let token_manager = create_mock_token_manager();
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+
+		(pricing, delivery, token_manager, storage)
+	}
+
+	// ============================================================================
+	// Basic Profitability Scenarios
+	// ============================================================================
+
+	#[tokio::test]
+	async fn test_validate_profitability_profitable_order() {
+		// Arrange
+		let (pricing, delivery, token_manager, storage) = setup_profitable_mocks().await;
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let order = create_profitable_order();
+		let cost_breakdown =
+			create_test_cost_breakdown_with_profit(Decimal::from_str("200.0").unwrap());
+		let min_profitability_pct = Decimal::from_str("2.0").unwrap(); // 2% minimum
+
+		// Act
+		let result = service
+			.validate_profitability(
+				&order,
+				&cost_breakdown,
+				min_profitability_pct,
+				None,
+				"off-chain",
+			)
+			.await;
+
+		// Assert
+		match result {
+			Ok(actual_margin) => {
+				assert!(actual_margin >= min_profitability_pct);
+			},
+			Err(e) => {
+				panic!("Expected success but got error: {:?}", e);
+			},
+		}
+	}
+
+	#[tokio::test]
+	async fn test_validate_profitability_unprofitable_order() {
+		let (pricing, delivery, token_manager, storage) = setup_unprofitable_mocks().await;
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let order = create_unprofitable_order();
+		let cost_breakdown =
+			create_test_cost_breakdown_with_profit(Decimal::from_str("200.0").unwrap());
+		let min_profitability_pct = Decimal::from_str("5.0").unwrap(); // 5% minimum
+
+		// Act
+		let result = service
+			.validate_profitability(
+				&order,
+				&cost_breakdown,
+				min_profitability_pct,
+				None,
+				"off-chain",
+			)
+			.await;
+
+		assert!(result.is_err());
+		match result.unwrap_err() {
+			APIError::UnprocessableEntity {
+				error_type,
+				message,
+				..
+			} => {
+				assert_eq!(error_type, ApiErrorType::InsufficientProfitability);
+				assert!(message.contains("Insufficient profit margin"));
+			},
+			other => panic!("Expected UnprocessableEntity error, got: {:?}", other),
+		}
+	}
+
+	// ============================================================================
+	// Swap Type Variations
+	// ============================================================================
+
+	#[tokio::test]
+	async fn test_validate_profitability_exact_input_with_context() {
+		// Arrange
+		let mut mock_storage = MockStorageInterface::new();
+		let test_quote_with_context = QuoteWithCostContext {
+			quote: Quote {
+				order: OifOrder::OifEscrowV0 {
+					payload: OrderPayload {
+						signature_type: SignatureType::Eip712,
+						domain: serde_json::json!({}),
+						primary_type: "Order".to_string(),
+						message: serde_json::json!({}),
+						types: Some(serde_json::json!({})),
+					},
+				},
+				failure_handling: FailureHandlingMode::RefundAutomatic,
+				partial_fill: false,
+				valid_until: current_timestamp() + 300,
+				eta: Some(60),
+				quote_id: "test_quote_exact_input".to_string(),
+				provider: Some("test_solver".to_string()),
+			},
+			cost_context: create_cost_context_with_swap_type(SwapType::ExactInput),
+		};
+
+		mock_storage
+			.expect_get_bytes()
+			.with(eq("quotes:test_quote_exact_input"))
+			.returning(move |_| {
+				let serialized = serde_json::to_vec(&test_quote_with_context).unwrap();
+				Box::pin(async move { Ok(serialized) })
+			});
+
+		let (pricing, delivery, token_manager, _) = setup_profitable_mocks().await;
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let order = create_profitable_order();
+		let cost_breakdown =
+			create_test_cost_breakdown_with_profit(Decimal::from_str("200.0").unwrap());
+		let min_profitability_pct = Decimal::from_str("2.0").unwrap();
+
+		// Act - with quote context for ExactInput
+		let result = service
+			.validate_profitability(
+				&order,
+				&cost_breakdown,
+				min_profitability_pct,
+				Some("test_quote_exact_input"),
+				"off-chain",
+			)
+			.await;
+
+		// Assert
+		assert!(result.is_ok());
+		let actual_margin = result.unwrap();
+		assert!(actual_margin >= min_profitability_pct);
+	}
+
+	#[tokio::test]
+	async fn test_validate_profitability_exact_output_with_context() {
+		// Arrange
+		let mut mock_storage = MockStorageInterface::new();
+		let test_quote_with_context = QuoteWithCostContext {
+			quote: Quote {
+				order: OifOrder::OifEscrowV0 {
+					payload: OrderPayload {
+						signature_type: SignatureType::Eip712,
+						domain: serde_json::json!({}),
+						primary_type: "Order".to_string(),
+						message: serde_json::json!({}),
+						types: Some(serde_json::json!({})),
+					},
+				},
+				failure_handling: FailureHandlingMode::RefundAutomatic,
+				partial_fill: false,
+				valid_until: current_timestamp() + 300,
+				eta: Some(60),
+				quote_id: "test_quote_exact_output".to_string(),
+				provider: Some("test_solver".to_string()),
+			},
+			cost_context: create_cost_context_with_swap_type(SwapType::ExactOutput),
+		};
+
+		mock_storage
+			.expect_get_bytes()
+			.with(eq("quotes:test_quote_exact_output"))
+			.returning(move |_| {
+				let serialized = serde_json::to_vec(&test_quote_with_context).unwrap();
+				Box::pin(async move { Ok(serialized) })
+			});
+
+		let (pricing, delivery, token_manager, _) = setup_profitable_mocks().await;
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let order = create_profitable_order();
+		let cost_breakdown =
+			create_test_cost_breakdown_with_profit(Decimal::from_str("200.0").unwrap());
+		let min_profitability_pct = Decimal::from_str("2.0").unwrap();
+
+		// Act - with quote context for ExactOutput
+		let result = service
+			.validate_profitability(
+				&order,
+				&cost_breakdown,
+				min_profitability_pct,
+				Some("test_quote_exact_output"),
+				"off-chain",
+			)
+			.await;
+
+		// Assert
+		assert!(result.is_ok());
+		let actual_margin = result.unwrap();
+		assert!(actual_margin >= min_profitability_pct);
+	}
+
+	// ============================================================================
+	// Intent Source Handling
+	// ============================================================================
+
+	#[tokio::test]
+	async fn test_validate_profitability_onchain_intent() {
+		// Arrange
+		let (pricing, delivery, token_manager, storage) = setup_profitable_mocks().await;
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let order = create_profitable_order();
+		let cost_breakdown =
+			create_test_cost_breakdown_with_profit(Decimal::from_str("200.0").unwrap());
+		let min_profitability_pct = Decimal::from_str("2.0").unwrap();
+
+		// On-chain intent (gas_open cost already paid by user)
+		let result = service
+			.validate_profitability(
+				&order,
+				&cost_breakdown,
+				min_profitability_pct,
+				None,
+				"on-chain",
+			)
+			.await;
+
+		// Assert
+		assert!(result.is_ok());
+		let actual_margin = result.unwrap();
+		// Should be higher than off-chain because gas_open is not deducted
+		assert!(actual_margin >= min_profitability_pct);
+	}
+
+	#[tokio::test]
+	async fn test_validate_profitability_offchain_intent() {
+		// Arrange
+		let (pricing, delivery, token_manager, storage) = setup_profitable_mocks().await;
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let order = create_profitable_order();
+		let cost_breakdown =
+			create_test_cost_breakdown_with_profit(Decimal::from_str("200.0").unwrap());
+		let min_profitability_pct = Decimal::from_str("2.0").unwrap();
+
+		// Off-chain intent (solver pays all costs including gas_open)
+		let result = service
+			.validate_profitability(
+				&order,
+				&cost_breakdown,
+				min_profitability_pct,
+				None,
+				"off-chain",
+			)
+			.await;
+
+		// Assert
+		assert!(result.is_ok());
+		let actual_margin = result.unwrap();
+		assert!(actual_margin >= min_profitability_pct);
+	}
+
+	// ============================================================================
+	// Error Scenarios & Edge Cases
+	// ============================================================================
+
+	#[tokio::test]
+	async fn test_validate_profitability_zero_transaction_value() {
+		// Arrange
+		let mut mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+
+		// Mock zero conversions
+		mock_pricing
+			.expect_convert_asset()
+			.returning(|_, _, _| Box::pin(async move { Ok("0.0".to_string()) }));
+
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let delivery = create_mock_delivery_service();
+		let token_manager = create_mock_token_manager();
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let order = create_zero_value_order();
+		let cost_breakdown =
+			create_test_cost_breakdown_with_profit(Decimal::from_str("200.0").unwrap());
+		let min_profitability_pct = Decimal::from_str("5.0").unwrap();
+
+		// Act
+		let result = service
+			.validate_profitability(
+				&order,
+				&cost_breakdown,
+				min_profitability_pct,
+				None,
+				"off-chain",
+			)
+			.await;
+
+		// Assert
+		assert!(result.is_err());
+		match result.unwrap_err() {
+			APIError::BadRequest {
+				error_type,
+				message,
+				..
+			} => {
+				assert_eq!(error_type, ApiErrorType::InvalidRequest);
+				assert!(message.contains("zero transaction value"));
+			},
+			other => panic!("Expected BadRequest error, got: {:?}", other),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_validate_profitability_order_parsing_failure() {
+		// Arrange
+		let (pricing, delivery, token_manager, storage) = setup_profitable_mocks().await;
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		// Create invalid order with malformed JSON
+		let mut invalid_order = create_profitable_order();
+		// Directly set invalid data structure (missing required EIP-7683 fields)
+		invalid_order.data = serde_json::json!({
+			"invalid": "structure"
+			// Missing required fields like user, nonce, origin_chain_id, etc.
+		});
+
+		let cost_breakdown =
+			create_test_cost_breakdown_with_profit(Decimal::from_str("200.0").unwrap());
+		let min_profitability_pct = Decimal::from_str("5.0").unwrap();
+
+		// Act
+		let result = service
+			.validate_profitability(
+				&invalid_order,
+				&cost_breakdown,
+				min_profitability_pct,
+				None,
+				"off-chain",
+			)
+			.await;
+
+		// Assert
+		assert!(result.is_err());
+		match result.unwrap_err() {
+			APIError::BadRequest {
+				error_type,
+				message,
+				..
+			} => {
+				assert_eq!(error_type, ApiErrorType::InvalidRequest);
+				assert!(message.contains("Failed to parse order data"));
+			},
+			other => panic!("Expected BadRequest error, got: {:?}", other),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_validate_profitability_pricing_service_failure() {
+		// Arrange
+		let mut mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+
+		// Mock pricing service failure
+		mock_pricing.expect_convert_asset().returning(|_, _, _| {
+			Box::pin(async move {
+				Err(solver_types::PricingError::InvalidData(
+					"Pricing service unavailable".to_string(),
+				))
+			})
+		});
+
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let delivery = create_mock_delivery_service();
+		let token_manager = create_mock_token_manager();
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let order = create_profitable_order();
+		let cost_breakdown =
+			create_test_cost_breakdown_with_profit(Decimal::from_str("200.0").unwrap());
+		let min_profitability_pct = Decimal::from_str("5.0").unwrap();
+
+		// Act
+		let result = service
+			.validate_profitability(
+				&order,
+				&cost_breakdown,
+				min_profitability_pct,
+				None,
+				"off-chain",
+			)
+			.await;
+
+		// Assert
+		assert!(result.is_err());
+		match result.unwrap_err() {
+			APIError::InternalServerError {
+				error_type,
+				message,
+				..
+			} => {
+				assert_eq!(error_type, ApiErrorType::InternalError);
+				assert!(message.contains("Failed to calculate"));
+			},
+			other => panic!("Expected InternalServerError error, got: {:?}", other),
+		}
+	}
+
+	// ============================================================================
+	// Quote Context Scenarios
+	// ============================================================================
+
+	#[tokio::test]
+	async fn test_validate_profitability_missing_quote_context() {
+		// Arrange
+		let mut mock_storage = MockStorageInterface::new();
+
+		// Mock quote not found
+		mock_storage
+			.expect_get_bytes()
+			.with(eq("quotes:nonexistent_quote"))
+			.returning(|_| {
+				Box::pin(async move {
+					Err(solver_storage::StorageError::NotFound(
+						"Quote not found".to_string(),
+					))
+				})
+			});
+
+		let (pricing, delivery, token_manager, _) = setup_profitable_mocks().await;
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let order = create_profitable_order();
+		let cost_breakdown =
+			create_test_cost_breakdown_with_profit(Decimal::from_str("200.0").unwrap());
+		let min_profitability_pct = Decimal::from_str("2.0").unwrap();
+
+		// Act - quote ID provided but not found (should still work, just without context)
+		let result = service
+			.validate_profitability(
+				&order,
+				&cost_breakdown,
+				min_profitability_pct,
+				Some("nonexistent_quote"),
+				"off-chain",
+			)
+			.await;
+
+		// Assert
+		assert!(result.is_ok());
+		// Should fall back to using max of input/output value as transaction base
+	}
+
+	#[tokio::test]
+	async fn test_validate_profitability_without_quote_context() {
+		// Arrange
+		let (pricing, delivery, token_manager, storage) = setup_profitable_mocks().await;
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let order = create_profitable_order();
+		let cost_breakdown =
+			create_test_cost_breakdown_with_profit(Decimal::from_str("200.0").unwrap());
+		let min_profitability_pct = Decimal::from_str("2.0").unwrap();
+
+		// No quote ID provided (direct order submission)
+		let result = service
+			.validate_profitability(
+				&order,
+				&cost_breakdown,
+				min_profitability_pct,
+				None,
+				"off-chain",
+			)
+			.await;
+
+		// Assert
+		assert!(result.is_ok());
+		let actual_margin = result.unwrap();
+		assert!(actual_margin >= min_profitability_pct);
+	}
+
+	#[tokio::test]
+	async fn test_validate_profitability_high_margin_order() {
+		// Arrange
+		let mut mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+
+		// Very profitable scenario: Input $4000, Output $3000 = $1000 spread
+		mock_pricing
+			.expect_convert_asset()
+			.with(eq("INPUT"), eq("USD"), eq("1"))
+			.returning(|_, _, _| Box::pin(async move { Ok("4000.0".to_string()) }));
+
+		mock_pricing
+			.expect_convert_asset()
+			.with(eq("OUTPUT"), eq("USD"), eq("3000"))
+			.returning(|_, _, _| Box::pin(async move { Ok("3000.0".to_string()) }));
+
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let delivery = create_mock_delivery_service();
+		let token_manager = create_mock_token_manager();
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let order = create_test_order_with_amounts(
+			U256::from_str("1000000000000000000").unwrap(), // 1 INPUT
+			U256::from_str("3000000000000000000000").unwrap(), // 3000 OUTPUT (18 decimals)
+		);
+		let cost_breakdown =
+			create_test_cost_breakdown_with_profit(Decimal::from_str("200.0").unwrap());
+		let min_profitability_pct = Decimal::from_str("5.0").unwrap();
+
+		// Act
+		let result = service
+			.validate_profitability(
+				&order,
+				&cost_breakdown,
+				min_profitability_pct,
+				None,
+				"off-chain",
+			)
+			.await;
+
+		// Assert
+		assert!(result.is_ok());
+		let actual_margin = result.unwrap();
+		// Should be much higher than minimum
+		assert!(actual_margin > Decimal::from_str("20.0").unwrap());
+	}
+}
