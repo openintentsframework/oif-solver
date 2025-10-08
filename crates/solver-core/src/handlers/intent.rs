@@ -8,16 +8,19 @@ use crate::engine::{
 	token_manager::TokenManager,
 };
 use crate::state::OrderStateMachine;
+use lru::LruCache;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
 use solver_order::OrderService;
 use solver_storage::StorageService;
 use solver_types::{
-	truncate_id, Address, DiscoveryEvent, ExecutionDecision, Intent, OrderEvent, SolverEvent,
-	StorageKey,
+	truncate_id, with_0x_prefix, Address, DiscoveryEvent, ExecutionDecision, Intent, OrderEvent,
+	SolverEvent, StorageKey,
 };
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::RwLock;
 use tracing::instrument;
 
 /// Errors that can occur during intent processing.
@@ -49,6 +52,9 @@ pub struct IntentHandler {
 	token_manager: Arc<TokenManager>,
 	cost_profit_service: Arc<CostProfitService>,
 	config: Config,
+	/// In-memory LRU cache for fast intent deduplication to prevent race conditions
+	/// Automatically evicts oldest entries when capacity is exceeded
+	processed_intents: Arc<RwLock<LruCache<String, ()>>>,
 }
 
 impl IntentHandler {
@@ -74,6 +80,9 @@ impl IntentHandler {
 			token_manager,
 			cost_profit_service,
 			config,
+			processed_intents: Arc::new(RwLock::new(LruCache::new(
+				NonZeroUsize::new(10000).unwrap(),
+			))),
 		}
 	}
 
@@ -89,6 +98,22 @@ impl IntentHandler {
 		//
 		// By checking if the intent already exists in storage, we ensure each order is only
 		// processed once, regardless of which discovery module receives it first.
+		// This is for fast in-memory deduplication to prevent race conditions
+		// This provides atomic check-and-insert for intent IDs
+		{
+			let mut processed = self.processed_intents.write().await;
+			if processed.contains(&intent.id) {
+				tracing::debug!(
+					"Duplicate intent detected in memory cache, already being processed"
+				);
+				return Ok(());
+			}
+			// Atomically claim this intent ID (LRU will auto-evict oldest if at capacity)
+			processed.put(intent.id.clone(), ());
+		}
+
+		// Fallback check against persistent storage for cross-restart deduplication
+		// This handles cases where the service was restarted between intent discovery
 		let exists = self
 			.storage
 			.exists(StorageKey::Intents.as_str(), &intent.id)
@@ -97,14 +122,19 @@ impl IntentHandler {
 				IntentError::Storage(format!("Failed to check intent existence: {}", e))
 			})?;
 		if exists {
-			tracing::debug!("Duplicate intent detected, already being processed or completed");
+			tracing::debug!("Duplicate intent detected in persistent storage, already processed");
 			return Ok(());
 		}
 
 		// Store intent immediately to prevent race conditions with duplicate discovery
 		// This claims the intent ID slot before we start the potentially slow validation process
 		self.storage
-			.store(StorageKey::Intents.as_str(), &intent.id, &intent, None)
+			.store(
+				StorageKey::Intents.as_str(),
+				&with_0x_prefix(&intent.id),
+				&intent,
+				None,
+			)
 			.await
 			.map_err(|e| {
 				IntentError::Storage(format!("Failed to store intent for deduplication: {}", e))
@@ -139,6 +169,7 @@ impl IntentHandler {
 				&intent.lock_type,
 				order_id_callback,
 				&self.solver_address,
+				intent.quote_id.clone(),
 			)
 			.await
 		{
@@ -149,14 +180,7 @@ impl IntentHandler {
 					.estimate_cost_for_order(&order, &self.config)
 					.await
 				{
-					Ok(estimate) => {
-						tracing::info!(
-							"Cost estimate calculated: total={} {}",
-							estimate.total,
-							estimate.currency
-						);
-						estimate
-					},
+					Ok(estimate) => estimate,
 					Err(e) => {
 						tracing::warn!("Failed to calculate cost estimate: {}", e);
 						return Err(IntentError::Service(format!(
@@ -173,15 +197,13 @@ impl IntentHandler {
 						&order,
 						&cost_estimate,
 						self.config.solver.min_profitability_pct,
+						intent.quote_id.as_deref(),
+						&intent.source,
 					)
 					.await
 				{
-					Ok(actual_profit_margin) => {
-						tracing::info!(
-							"Order passed profitability validation: {:.2}% (min required: {:.2}%)",
-							actual_profit_margin,
-							self.config.solver.min_profitability_pct
-						);
+					Ok(_actual_profit_margin) => {
+						// Profitability details already logged in validate_profitability function
 					},
 					Err(e) => {
 						tracing::warn!("Order failed profitability validation: {}", e);

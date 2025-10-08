@@ -4,7 +4,7 @@
 //! that are used throughout the solver for account management and transaction processing.
 
 use crate::with_0x_prefix;
-use alloy_primitives::{Address as AlloyAddress, Bytes, PrimitiveSignature, U256};
+use alloy_primitives::{Address as AlloyAddress, Bytes, Signature as PrimitiveSignature, U256};
 use alloy_rpc_types::TransactionRequest;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -53,6 +53,12 @@ impl fmt::Display for Address {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		// Format as hex string with 0x prefix
 		write!(f, "0x{}", hex::encode(&self.0))
+	}
+}
+
+impl From<AlloyAddress> for Address {
+	fn from(addr: AlloyAddress) -> Self {
+		Address(addr.as_slice().to_vec())
 	}
 }
 
@@ -107,7 +113,7 @@ impl From<TransactionRequest> for Transaction {
 	fn from(req: TransactionRequest) -> Self {
 		Transaction {
 			to: req.to.map(|addr| match addr {
-				alloy_primitives::TxKind::Call(a) => Address(a.as_slice().to_vec()),
+				alloy_primitives::TxKind::Call(a) => a.into(),
 				alloy_primitives::TxKind::Create => panic!("Create transactions not supported"),
 			}),
 			data: req.input.input.clone().unwrap_or_default().to_vec(),
@@ -153,7 +159,7 @@ impl From<Transaction> for TransactionRequest {
 mod tests {
 	use super::*;
 	use crate::utils::{conversion::parse_address, tests::builders::TransactionBuilder};
-	use alloy_primitives::{address, U256};
+	use alloy_primitives::{address, Signature as PrimitiveSignature, U256};
 	use serde_json;
 
 	// Helper function to create a test address from hex string
@@ -267,6 +273,22 @@ mod tests {
 	}
 
 	#[test]
+	fn test_address_from_alloy_address() {
+		use alloy_primitives::address;
+
+		let alloy_addr = address!("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B");
+		let solver_addr = Address::from(alloy_addr);
+
+		// Verify the conversion preserves the address bytes
+		assert_eq!(solver_addr.0, alloy_addr.as_slice());
+		assert_eq!(solver_addr.0.len(), 20);
+
+		// Verify it displays the same hex string
+		let expected_hex = "0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b";
+		assert_eq!(solver_addr.to_string(), expected_hex);
+	}
+
+	#[test]
 	fn test_signature_creation() {
 		let sig_bytes = vec![1u8; 65]; // 65 bytes for r + s + v
 		let signature = Signature(sig_bytes.clone());
@@ -275,8 +297,6 @@ mod tests {
 
 	#[test]
 	fn test_signature_from_primitive_signature() {
-		use alloy_primitives::{PrimitiveSignature, U256};
-
 		let r = U256::from(1);
 		let s = U256::from(2);
 		let y_parity = false; // v = 27
@@ -291,8 +311,6 @@ mod tests {
 
 	#[test]
 	fn test_signature_from_primitive_signature_odd_parity() {
-		use alloy_primitives::{PrimitiveSignature, U256};
-
 		let r = U256::from(1);
 		let s = U256::from(2);
 		let y_parity = true; // v = 28

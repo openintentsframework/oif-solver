@@ -66,8 +66,8 @@ impl StorageIndexes {
 #[derive(Debug, Error)]
 pub enum StorageError {
 	/// Error that occurs when a requested item is not found.
-	#[error("Not found")]
-	NotFound,
+	#[error("Not found: {0}")]
+	NotFound(String),
 	/// Error that occurs during serialization/deserialization.
 	#[error("Serialization error: {0}")]
 	Serialization(String),
@@ -77,6 +77,9 @@ pub enum StorageError {
 	/// Error that occurs during configuration validation.
 	#[error("Configuration error: {0}")]
 	Configuration(String),
+	/// Error that occurs when resource is expired.
+	#[error("Expired error: {0}")]
+	Expired(String),
 }
 
 /// Trait defining the low-level interface for storage backends.
@@ -250,7 +253,7 @@ impl StorageService {
 
 		// Check if the key exists first
 		if !self.backend.exists(&key).await? {
-			return Err(StorageError::NotFound);
+			return Err(StorageError::NotFound(key.to_string()));
 		}
 
 		let bytes =
@@ -291,7 +294,7 @@ impl StorageService {
 
 		// Check if the key exists first
 		if !self.backend.exists(&key).await? {
-			return Err(StorageError::NotFound);
+			return Err(StorageError::NotFound(key.to_string()));
 		}
 
 		let bytes =

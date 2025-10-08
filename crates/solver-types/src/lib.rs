@@ -22,6 +22,8 @@ pub mod networks;
 pub mod oracle;
 /// Order processing types including intents, orders, and execution contexts.
 pub mod order;
+/// Provider utilities for creating and managing Alloy providers.
+pub mod provider;
 /// Registry trait for self-registering implementations.
 pub mod registry;
 /// Secure string type for handling sensitive data.
@@ -44,17 +46,21 @@ pub mod pricing;
 pub use account::*;
 pub use api::*;
 pub use auth::{AuthConfig, AuthScope, JwtClaims, RefreshTokenData};
-pub use costs::{CostComponent, CostEstimate};
+pub use costs::{CostBreakdown, CostContext};
 pub use delivery::*;
 pub use discovery::*;
 pub use events::*;
 pub use networks::{NetworkConfig, NetworksConfig, TokenConfig};
 pub use order::*;
 pub use pricing::*;
+pub use provider::{
+	create_http_provider, create_http_providers, create_ws_provider, create_ws_providers,
+	ProviderError,
+};
 pub use registry::ImplementationRegistry;
 pub use secret_string::SecretString;
 pub use standards::{
-	eip7683::{Eip7683OrderData, Output as Eip7683Output},
+	eip7683::{Eip7683OrderData, MandateOutput as Eip7683Output},
 	eip7930::{InteropAddress, InteropAddressError},
 };
 pub use storage::*;

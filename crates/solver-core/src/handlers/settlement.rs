@@ -8,7 +8,7 @@ use crate::engine::event_bus::EventBus;
 use crate::monitoring::SettlementMonitor;
 use crate::state::OrderStateMachine;
 use alloy_primitives::hex;
-use solver_delivery::DeliveryService;
+use solver_delivery::{DeliveryService, TransactionMonitoringEvent, TransactionTracking};
 use solver_order::OrderService;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
@@ -124,9 +124,50 @@ impl SettlementHandler {
 
 		match post_fill_tx {
 			Some(post_fill_tx) => {
+				// Create callback for monitoring
+				let event_bus = self.event_bus.clone();
+				let callback = Box::new(move |event: TransactionMonitoringEvent| match event {
+					TransactionMonitoringEvent::Confirmed {
+						id,
+						tx_hash,
+						tx_type,
+						receipt,
+					} => {
+						event_bus
+							.publish(SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
+								order_id: id,
+								tx_hash,
+								tx_type,
+								receipt,
+							}))
+							.ok();
+					},
+					TransactionMonitoringEvent::Failed {
+						id,
+						tx_hash,
+						tx_type,
+						error,
+					} => {
+						event_bus
+							.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+								order_id: id,
+								tx_hash,
+								tx_type,
+								error,
+							}))
+							.ok();
+					},
+				});
+
+				let tracking = TransactionTracking {
+					id: order_id.clone(),
+					tx_type: TransactionType::PostFill,
+					callback,
+				};
+
 				let tx_hash = self
 					.delivery
-					.deliver(post_fill_tx.clone())
+					.deliver(post_fill_tx.clone(), Some(tracking))
 					.await
 					.map_err(|e| SettlementError::Service(e.to_string()))?;
 
@@ -213,9 +254,50 @@ impl SettlementHandler {
 
 		match pre_claim_tx {
 			Some(pre_claim_tx) => {
+				// Create callback for monitoring
+				let event_bus = self.event_bus.clone();
+				let callback = Box::new(move |event: TransactionMonitoringEvent| match event {
+					TransactionMonitoringEvent::Confirmed {
+						id,
+						tx_hash,
+						tx_type,
+						receipt,
+					} => {
+						event_bus
+							.publish(SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
+								order_id: id,
+								tx_hash,
+								tx_type,
+								receipt,
+							}))
+							.ok();
+					},
+					TransactionMonitoringEvent::Failed {
+						id,
+						tx_hash,
+						tx_type,
+						error,
+					} => {
+						event_bus
+							.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+								order_id: id,
+								tx_hash,
+								tx_type,
+								error,
+							}))
+							.ok();
+					},
+				});
+
+				let tracking = TransactionTracking {
+					id: order_id.clone(),
+					tx_type: TransactionType::PreClaim,
+					callback,
+				};
+
 				let tx_hash = self
 					.delivery
-					.deliver(pre_claim_tx.clone())
+					.deliver(pre_claim_tx.clone(), Some(tracking))
 					.await
 					.map_err(|e| SettlementError::Service(e.to_string()))?;
 
@@ -290,10 +372,50 @@ impl SettlementHandler {
 				.await
 				.map_err(|e| SettlementError::Service(e.to_string()))?;
 
-			// Submit claim transaction through delivery service
+			// Submit claim transaction through delivery service with monitoring
+			let event_bus = self.event_bus.clone();
+			let callback = Box::new(move |event: TransactionMonitoringEvent| match event {
+				TransactionMonitoringEvent::Confirmed {
+					id,
+					tx_hash,
+					tx_type,
+					receipt,
+				} => {
+					event_bus
+						.publish(SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
+							order_id: id,
+							tx_hash,
+							tx_type,
+							receipt,
+						}))
+						.ok();
+				},
+				TransactionMonitoringEvent::Failed {
+					id,
+					tx_hash,
+					tx_type,
+					error,
+				} => {
+					event_bus
+						.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+							order_id: id,
+							tx_hash,
+							tx_type,
+							error,
+						}))
+						.ok();
+				},
+			});
+
+			let tracking = TransactionTracking {
+				id: order.id.clone(),
+				tx_type: TransactionType::Claim,
+				callback,
+			};
+
 			let claim_tx_hash = self
 				.delivery
-				.deliver(claim_tx.clone())
+				.deliver(claim_tx.clone(), Some(tracking))
 				.await
 				.map_err(|e| SettlementError::Service(e.to_string()))?;
 

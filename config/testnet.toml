@@ -6,8 +6,8 @@ include = ["testnet/networks.toml", "testnet/api.toml", "testnet/gas.toml"]
 
 [solver]
 id = "oif-solver-testnet"
-monitoring_timeout_minutes = 5
 min_profitability_pct = 1.0
+monitoring_timeout_seconds = 28800
 
 # ============================================================================
 # STORAGE
@@ -39,7 +39,6 @@ private_key = "${SOLVER_PRIVATE_KEY}"
 # ============================================================================
 [delivery]
 min_confirmations = 3
-transaction_poll_interval_seconds = 3 # How often to check transaction status
 
 [delivery.implementations.evm_alloy]
 network_ids = [11155420, 84532]
@@ -87,32 +86,28 @@ rate_limit_delay_ms = 1200
 [settlement]
 settlement_poll_interval_seconds = 10 # How often to check can_claim
 
-[settlement.domain]
-chain_id = 11155420
-address = "0xF859d69A86CEdFFe1F88d4bFcC24Ffaa0E050e46"
+# [settlement.implementations.direct]
+# order = "eipXXXX"
+# network_ids = [11155420, 84532]
+# dispute_period_seconds = 60
+# oracle_selection_strategy = "First"
 
-[settlement.implementations.direct]
-order = "eipXXXX"
-network_ids = [11155420, 84532]
-dispute_period_seconds = 60
-oracle_selection_strategy = "First"
+# [settlement.implementations.direct.oracles]
+# input = { 11155420 = [
+#     "0x048B199f0e9bf17709F86Ac1f62ad7C246f86346",
+# ], 84532 = [
+#     "0x6df0Bc4eE21286BCb83576Cb546100EDE196A54e",
+# ] }
+# output = { 11155420 = [
+#     "0x048B199f0e9bf17709F86Ac1f62ad7C246f86346",
+# ], 84532 = [
+#     "0x6df0Bc4eE21286BCb83576Cb546100EDE196A54e",
+# ] }
 
-[settlement.implementations.direct.oracles]
-input = { 11155420 = [
-    "0x048B199f0e9bf17709F86Ac1f62ad7C246f86346",
-], 84532 = [
-    "0x6df0Bc4eE21286BCb83576Cb546100EDE196A54e",
-] }
-output = { 11155420 = [
-    "0x048B199f0e9bf17709F86Ac1f62ad7C246f86346",
-], 84532 = [
-    "0x6df0Bc4eE21286BCb83576Cb546100EDE196A54e",
-] }
-
-[settlement.implementations.direct.routes]
-# Bidirectional routes - both chains can send to each other
-11155420 = [84532]
-84532 = [11155420]
+# [settlement.implementations.direct.routes]
+# # Bidirectional routes - both chains can send to each other
+# 11155420 = [84532]
+# 84532 = [11155420]
 
 # ============================================================================
 # HYPERLANE SETTLEMENT

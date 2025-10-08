@@ -24,7 +24,6 @@ pub use handlers::settlement::SettlementError;
 pub use handlers::transaction::TransactionError;
 pub use state::OrderStateError;
 
-// Re-export old SolverError for compatibility
 use thiserror::Error;
 
 #[derive(Debug, Error)]

@@ -5,18 +5,16 @@
 
 use crate::{utils::parse_oracle_config, OracleConfig, SettlementError, SettlementInterface};
 use alloy_primitives::{hex, FixedBytes, U256};
-use alloy_provider::{Provider, RootProvider};
-use alloy_rpc_types::BlockTransactionsKind;
+use alloy_provider::{DynProvider, Provider};
 use alloy_sol_types::{sol, SolCall};
-use alloy_transport_http::Http;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use solver_storage::StorageService;
 use solver_types::{
-	with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, InteropAddress, NetworksConfig,
-	Order, RequestedOutput, Schema, StorageKey, Transaction, TransactionHash, TransactionReceipt,
-	TransactionType,
+	create_http_provider, with_0x_prefix, ConfigSchema, Field, FieldType, FillProof,
+	InteropAddress, NetworksConfig, Order, OrderOutput, ProviderError, Schema, StorageKey,
+	Transaction, TransactionHash, TransactionReceipt, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -101,12 +99,16 @@ fn interop_address_to_bytes32(addr: &InteropAddress) -> [u8; 32] {
 	bytes32
 }
 
-/// Convert a RequestedOutput to Hyperlane-compatible format
-fn requested_output_to_hyperlane(output: &RequestedOutput) -> HyperlaneOutput {
+/// Convert an OrderOutput to Hyperlane-compatible format
+fn order_output_to_hyperlane(output: &OrderOutput) -> HyperlaneOutput {
+	let asset = &output.asset;
+	let receiver = &output.receiver;
+	let amount = output.amount;
+
 	HyperlaneOutput {
-		token: interop_address_to_bytes32(&output.asset),
-		amount: output.amount,
-		recipient: interop_address_to_bytes32(&output.receiver),
+		token: interop_address_to_bytes32(asset),
+		amount,
+		recipient: interop_address_to_bytes32(receiver),
 		call: output
 			.calldata
 			.as_ref()
@@ -132,7 +134,7 @@ fn extract_output_details(order: &Order) -> Result<HyperlaneOutput, SettlementEr
 		.ok_or_else(|| SettlementError::ValidationFailed("No outputs found in order".into()))?;
 
 	// Convert to Hyperlane format
-	Ok(requested_output_to_hyperlane(first_output))
+	Ok(order_output_to_hyperlane(first_output))
 }
 
 /// Extract fill details from OutputFilled event in logs
@@ -485,7 +487,7 @@ impl MessageTracker {
 		&self,
 		_order_id: &str,
 		_oracle_address: solver_types::Address,
-		_provider: &RootProvider<Http<reqwest::Client>>,
+		_provider: &DynProvider,
 	) -> Result<bool, SettlementError> {
 		// Hyperlane doesn't require explicit finalization
 		// Messages are automatically processed when they arrive at the destination
@@ -530,7 +532,7 @@ impl MessageTracker {
 /// Hyperlane settlement implementation
 #[allow(dead_code)]
 pub struct HyperlaneSettlement {
-	providers: HashMap<u64, RootProvider<Http<reqwest::Client>>>,
+	providers: HashMap<u64, DynProvider>,
 	oracle_config: OracleConfig,
 	mailbox_addresses: HashMap<u64, solver_types::Address>,
 	igp_addresses: HashMap<u64, solver_types::Address>,
@@ -603,7 +605,7 @@ impl HyperlaneSettlement {
 			..Default::default()
 		};
 
-		let result = provider.call(&request).await.map_err(|e| {
+		let result = provider.call(request).await.map_err(|e| {
 			SettlementError::ValidationFailed(format!("Failed to call isProven: {}", e))
 		})?;
 
@@ -774,26 +776,11 @@ impl HyperlaneSettlement {
 		all_network_ids.dedup();
 
 		for network_id in &all_network_ids {
-			let network = networks.get(network_id).ok_or_else(|| {
-				SettlementError::ValidationFailed(format!(
-					"Network {} not found in configuration",
-					network_id
-				))
+			let provider = create_http_provider(*network_id, networks).map_err(|e| match e {
+				ProviderError::NetworkConfig(msg) => SettlementError::ValidationFailed(msg),
+				ProviderError::Connection(msg) => SettlementError::ValidationFailed(msg),
+				ProviderError::InvalidUrl(msg) => SettlementError::ValidationFailed(msg),
 			})?;
-
-			let http_url = network.get_http_url().ok_or_else(|| {
-				SettlementError::ValidationFailed(format!(
-					"No HTTP RPC URL configured for network {}",
-					network_id
-				))
-			})?;
-
-			let provider = RootProvider::new_http(http_url.parse().map_err(|e| {
-				SettlementError::ValidationFailed(format!(
-					"Invalid RPC URL for network {}: {}",
-					network_id, e
-				))
-			})?);
 
 			providers.insert(*network_id, provider);
 		}
@@ -886,7 +873,7 @@ impl HyperlaneSettlement {
 		};
 
 		// Make the eth_call to get the quote
-		let result = provider.call(&call_request).await.map_err(|e| {
+		let result = provider.call(call_request).await.map_err(|e| {
 			SettlementError::ValidationFailed(format!("Failed to quote gas payment: {}", e))
 		})?;
 
@@ -1041,10 +1028,7 @@ impl SettlementInterface for HyperlaneSettlement {
 
 		// Get the block timestamp
 		let block = provider
-			.get_block_by_number(
-				alloy_rpc_types::BlockNumberOrTag::Number(tx_block),
-				BlockTransactionsKind::Hashes,
-			)
+			.get_block_by_number(alloy_rpc_types::BlockNumberOrTag::Number(tx_block))
 			.await
 			.map_err(|e| {
 				SettlementError::ValidationFailed(format!("Failed to get block: {}", e))
