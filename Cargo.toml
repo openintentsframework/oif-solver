@@ -12,8 +12,9 @@ members = [
     "crates/solver-settlement",
     "crates/solver-pricing",
     "crates/solver-service",
+    "crates/solver-demo",
 ]
-default-members = ["crates/solver-service"]
+default-members = ["crates/solver-service", "crates/solver-demo"]
 
 [workspace.package]
 version = "0.1.0"
@@ -28,7 +29,20 @@ license = "MIT"
 repository = "https://github.com/openintentsframework/oif-solver"
 
 [workspace.dependencies]
-alloy = "1.0.22"
+alloy = "1.0.37"
+alloy-consensus = "1.0.37"
+alloy-contract = "1.0.37"
+alloy-dyn-abi = "1.0.37"
+alloy-network = "1.0.37"
+alloy-primitives = "1.0.37"
+alloy-provider = "1.0.37"
+alloy-rpc-client = "1.0.37"
+alloy-rpc-types = "1.0.37"
+alloy-signer = "1.0.37"
+alloy-signer-local = "1.0.37"
+alloy-sol-types = "1.0.37"
+alloy-transport = "1.0.37"
+alloy-transport-http = "1.0.37"
 anyhow = "1.0"
 arc-swap = "1.7"
 async-stream = "0.3"
@@ -43,7 +57,7 @@ futures = "0.3"
 hex = "0.4"
 priority-queue = "2.0"
 reqwest = { version = "0.12.22", features = ["json"] }
-rust_decimal = { version = "1.35", features = ["serde"] }
+rust_decimal = { version = "1.35", features = ["serde", "serde-with-str"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
@@ -58,7 +72,7 @@ tower-http = { version = "0.6.6", features = ["trace", "cors"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1.10", features = ["v4", "serde"] }
-validator = { version = "0.18", features = ["derive"] }
+validator = { version = "0.20", features = ["derive"] }
 
 [profile.release]
 opt-level = 3

@@ -37,72 +37,57 @@
 //! - Permit2 availability (universal but requires deployment)
 //! - Custom protocol support (token-specific features)
 
-use solver_types::{AvailableInput, LockKind as ApiLockKind, QuoteError};
+use std::sync::Arc;
+
+use solver_delivery::DeliveryService;
+use solver_types::standards::eip7683::LockType;
+use solver_types::{AssetLockReference, LockKind, OrderInput, QuoteError};
 
 use super::registry::PROTOCOL_REGISTRY;
-
-/// Types of resource locks supported
-#[derive(Debug, Clone)]
-pub enum LockKind {
-	TheCompact { params: serde_json::Value },
-}
-
-/// Types of escrow mechanisms
-#[derive(Debug, Clone)]
-pub enum EscrowKind {
-	Permit2,
-	Eip3009,
-}
 
 /// Custody strategy decision
 #[derive(Debug, Clone)]
 pub enum CustodyDecision {
-	ResourceLock { kind: LockKind },
-	Escrow { kind: EscrowKind },
+	ResourceLock { lock: AssetLockReference },
+	Escrow { lock_type: LockType },
 }
 
 /// Custody strategy decision engine
-pub struct CustodyStrategy {}
+pub struct CustodyStrategy {
+	/// Reference to delivery service for contract calls.
+	delivery_service: Arc<DeliveryService>,
+}
 
 impl CustodyStrategy {
-	pub fn new() -> Self {
-		Self {}
+	pub fn new(delivery_service: Arc<DeliveryService>) -> Self {
+		Self { delivery_service }
 	}
 
 	pub async fn decide_custody(
 		&self,
-		input: &AvailableInput,
+		input: &OrderInput,
+		origin_submission: Option<&solver_types::OriginSubmission>,
 	) -> Result<CustodyDecision, QuoteError> {
 		if let Some(lock) = &input.lock {
 			return self.handle_explicit_lock(lock);
 		}
-		self.decide_escrow_strategy(input).await
+		self.decide_escrow_strategy(input, origin_submission).await
 	}
 
 	fn handle_explicit_lock(
 		&self,
-		lock: &solver_types::Lock,
+		lock: &solver_types::AssetLockReference,
 	) -> Result<CustodyDecision, QuoteError> {
 		match lock.kind {
-			ApiLockKind::TheCompact => {
-				let lock_kind = LockKind::TheCompact {
-					params: lock.params.clone().unwrap_or_default(),
-				};
-				Ok(CustodyDecision::ResourceLock { kind: lock_kind })
-			},
-			// Permit2 and EIP3009 are escrow mechanisms, not resource locks
-			ApiLockKind::Permit2 => Ok(CustodyDecision::Escrow {
-				kind: EscrowKind::Permit2,
-			}),
-			ApiLockKind::Eip3009 => Ok(CustodyDecision::Escrow {
-				kind: EscrowKind::Eip3009,
-			}),
+			LockKind::TheCompact => Ok(CustodyDecision::ResourceLock { lock: lock.clone() }),
+			LockKind::Rhinestone => Ok(CustodyDecision::ResourceLock { lock: lock.clone() }),
 		}
 	}
 
 	async fn decide_escrow_strategy(
 		&self,
-		input: &AvailableInput,
+		input: &OrderInput,
+		origin_submission: Option<&solver_types::OriginSubmission>,
 	) -> Result<CustodyDecision, QuoteError> {
 		let chain_id = input.asset.ethereum_chain_id().map_err(|e| {
 			QuoteError::InvalidRequest(format!("Invalid chain ID in asset address: {}", e))
@@ -113,26 +98,54 @@ impl CustodyStrategy {
 			.ethereum_address()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid Ethereum address: {}", e)))?;
 
-		let capabilities = PROTOCOL_REGISTRY.get_token_capabilities(chain_id, token_address);
+		let capabilities = PROTOCOL_REGISTRY
+			.get_token_capabilities(chain_id, token_address, self.delivery_service.clone())
+			.await;
 
+		// Respect user's explicit auth scheme preference from originSubmission
+		if let Some(origin) = origin_submission {
+			if let Some(schemes) = &origin.schemes {
+				// Check for explicit EIP-3009 preference
+				if schemes.contains(&solver_types::AuthScheme::Eip3009) {
+					if capabilities.supports_eip3009 {
+						return Ok(CustodyDecision::Escrow {
+							lock_type: LockType::Eip3009Escrow,
+						});
+					} else {
+						return Err(QuoteError::UnsupportedSettlement(
+							"EIP-3009 requested but not supported by this token".to_string(),
+						));
+					}
+				}
+
+				// Check for explicit Permit2 preference
+				if schemes.contains(&solver_types::AuthScheme::Permit2) {
+					if capabilities.permit2_available {
+						return Ok(CustodyDecision::Escrow {
+							lock_type: LockType::Permit2Escrow,
+						});
+					} else {
+						return Err(QuoteError::UnsupportedSettlement(
+							"Permit2 requested but not available on this chain".to_string(),
+						));
+					}
+				}
+			}
+		}
+
+		// Fallback to automatic selection if no explicit preference
 		if capabilities.supports_eip3009 {
 			Ok(CustodyDecision::Escrow {
-				kind: EscrowKind::Eip3009,
+				lock_type: LockType::Eip3009Escrow,
 			})
 		} else if capabilities.permit2_available {
 			Ok(CustodyDecision::Escrow {
-				kind: EscrowKind::Permit2,
+				lock_type: LockType::Permit2Escrow,
 			})
 		} else {
 			Err(QuoteError::UnsupportedSettlement(
 				"No supported settlement mechanism available for this token".to_string(),
 			))
 		}
-	}
-}
-
-impl Default for CustodyStrategy {
-	fn default() -> Self {
-		Self::new()
 	}
 }

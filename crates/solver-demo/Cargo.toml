@@ -1,0 +1,53 @@
+[package]
+name = "solver-demo"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+
+[[bin]]
+name = "solver-demo"
+path = "src/bin/solver-demo.rs"
+
+[dependencies]
+alloy-contract = { workspace = true }
+alloy-dyn-abi = { workspace = true }
+alloy-json-abi = { version = "1.0.37" }
+alloy-network = { workspace = true }
+alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-provider = { workspace = true }
+alloy-rpc-client = { workspace = true }
+alloy-rpc-types = { workspace = true }
+alloy-signer = { workspace = true }
+alloy-signer-local = { workspace = true }
+alloy-sol-types = { workspace = true }
+alloy-transport = { workspace = true }
+alloy-transport-http = { workspace = true }
+anyhow = "1"
+base64 = "0.22"
+chrono = "0.4"
+clap = { version = "4", features = ["derive", "env"] }
+colored = "3"
+comfy-table = "7"
+dotenvy = "0.15"
+futures = "0.3"
+hex = "0.4"
+hostname = "0.4"
+indicatif = "0.18"
+rand = "0.9"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+solver-account = { path = "../solver-account" }
+solver-config = { path = "../solver-config" }
+solver-types = { path = "../solver-types" }
+sysinfo = "0.32"
+thiserror = "2"
+tokio = { version = "1.41", features = ["full"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

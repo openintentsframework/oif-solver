@@ -89,7 +89,6 @@ pub struct NetworkConfig {
 	/// Optional Compact/Resource Lock input settler address
 	#[serde(default)]
 	pub input_settler_compact_address: Option<Address>,
-	/// Optional TheCompact contract address (for demos/tools)
 	#[serde(default)]
 	pub the_compact_address: Option<Address>,
 	/// Optional allocator address for TheCompact resource locks

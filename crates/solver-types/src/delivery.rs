@@ -4,6 +4,7 @@
 //! and monitoring, including transaction hashes and receipts.
 
 use crate::Address;
+use alloy_rpc_types::TransactionReceipt as AlloyReceipt;
 
 /// Blockchain transaction hash representation.
 ///
@@ -46,6 +47,32 @@ pub struct TransactionReceipt {
 	/// Block timestamp (Unix timestamp) - extracted from logs if available
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub block_timestamp: Option<u64>,
+}
+
+impl From<&AlloyReceipt> for TransactionReceipt {
+	fn from(receipt: &AlloyReceipt) -> Self {
+		// Extract block timestamp from the first log that has it
+		let block_timestamp = receipt.logs().iter().find_map(|log| log.block_timestamp);
+
+		// Convert alloy logs to our Log type
+		let logs = receipt
+			.logs()
+			.iter()
+			.map(|log| Log {
+				address: log.address().into(),
+				topics: log.topics().iter().map(|topic| H256(topic.0)).collect(),
+				data: log.data().data.to_vec(),
+			})
+			.collect();
+
+		TransactionReceipt {
+			hash: TransactionHash(receipt.transaction_hash.0.to_vec()),
+			block_number: receipt.block_number.unwrap_or(0),
+			success: receipt.inner.status(),
+			logs,
+			block_timestamp,
+		}
+	}
 }
 
 /// Chain data structure containing current blockchain state information.

@@ -41,7 +41,10 @@ impl Default for MemoryStorage {
 impl StorageInterface for MemoryStorage {
 	async fn get_bytes(&self, key: &str) -> Result<Vec<u8>, StorageError> {
 		let store = self.store.read().await;
-		store.get(key).cloned().ok_or(StorageError::NotFound)
+		store
+			.get(key)
+			.cloned()
+			.ok_or(StorageError::NotFound(key.to_string()))
 	}
 
 	async fn set_bytes(
@@ -169,7 +172,7 @@ mod tests {
 
 		// Test get after delete
 		let result = storage.get_bytes(key).await;
-		assert!(matches!(result, Err(StorageError::NotFound)));
+		assert!(matches!(result, Err(StorageError::NotFound(_))));
 	}
 
 	#[tokio::test]

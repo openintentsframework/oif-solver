@@ -5,12 +5,12 @@ edition = "2021"
 rust-version.workspace = true
 
 [dependencies]
-alloy-primitives = "0.8"
-alloy-provider = "0.8"
-alloy-rpc-types = "0.8"
-alloy-sol-types = "0.8"
-alloy-transport = "0.8"
-alloy-transport-http = "0.8"
+alloy-primitives = { workspace = true }
+alloy-provider = { workspace = true }
+alloy-rpc-types = { workspace = true }
+alloy-sol-types = { workspace = true }
+alloy-transport = { workspace = true }
+alloy-transport-http = { workspace = true }
 async-trait = "0.1"
 mockall = { version = "0.13", optional = true }
 reqwest = "0.12"
@@ -19,7 +19,7 @@ serde_json = "1.0"
 sha3 = { workspace = true }
 solver-storage = { path = "../solver-storage" }
 solver-types = { path = "../solver-types" }
-thiserror = "1.0"
+thiserror = "2.0"
 tokio = { version = "1.0", features = ["rt-multi-thread", "sync"] }
 toml = { workspace = true }
 tracing = "0.1"

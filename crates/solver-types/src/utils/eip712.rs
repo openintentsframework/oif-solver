@@ -5,7 +5,12 @@
 //! - Final digest computation (0x1901 || domainHash || structHash)
 //! - A minimal ABI encoder for static EIP-712 field types used commonly
 
+use crate::utils::conversion::hex_to_alloy_address;
+
+use super::formatting::{with_0x_prefix, without_0x_prefix};
 use alloy_primitives::{keccak256, Address as AlloyAddress, B256, U256};
+use alloy_signer::Signature;
+use hex;
 
 // Common EIP-712 type strings used across the solver
 pub const DOMAIN_TYPE: &str = "EIP712Domain(string name,uint256 chainId,address verifyingContract)";
@@ -16,10 +21,6 @@ pub const PERMIT2_WITNESS_TYPE: &str =
 pub const TOKEN_PERMISSIONS_TYPE: &str = "TokenPermissions(address token,uint256 amount)";
 pub const PERMIT_BATCH_WITNESS_TYPE: &str =
 	"PermitBatchWitnessTransferFrom(TokenPermissions[] permitted,address spender,uint256 nonce,uint256 deadline,Permit2Witness witness)";
-
-/// Type alias for EIP-712 data extraction result
-pub type Eip712ExtractionResult<'a> =
-	Result<(&'a serde_json::Map<String, serde_json::Value>, &'a str), Box<dyn std::error::Error>>;
 
 /// Compute EIP-712 domain hash (keccak256(abi.encode(typeHash, nameHash, chainId, verifyingContract))).
 pub fn compute_domain_hash(name: &str, chain_id: u64, verifying_contract: &AlloyAddress) -> B256 {
@@ -83,6 +84,622 @@ impl Eip712AbiEncoder {
 	pub fn finish(self) -> Vec<u8> {
 		self.buf
 	}
+}
+
+/// Recovers the user address from a Permit2 signature using ecrecover.
+///
+/// # Arguments
+///
+/// * `digest` - The EIP-712 digest that was signed (32 bytes)
+/// * `signature` - The signature string with format "0x00<65_byte_signature>"
+///
+/// # Returns
+///
+/// Returns the recovered user address or an error if recovery fails.
+pub fn ecrecover_user_from_signature(
+	digest: &[u8; 32],
+	signature: &str,
+) -> Result<AlloyAddress, Box<dyn std::error::Error>> {
+	// Handle different signature formats before parsing with alloy-signer
+	let sig_to_parse = {
+		let without_prefix = without_0x_prefix(signature);
+		if without_prefix.len() == 132 {
+			// 66-byte signature (132 hex chars): skip first byte (signature type)
+			with_0x_prefix(&without_prefix[2..])
+		} else {
+			// Standard 65-byte signature: ensure it has 0x prefix
+			with_0x_prefix(signature)
+		}
+	};
+
+	// Try parsing the processed signature string using alloy-signer
+	let sig: Signature = sig_to_parse
+		.parse()
+		.map_err(|e| format!("Failed to parse signature: {}", e))?;
+
+	// Recover address from the prehash
+	let recovered = sig
+		.recover_address_from_prehash(&B256::from(*digest))
+		.map_err(|e| format!("Recovery failed: {}", e))?;
+
+	Ok(recovered)
+}
+
+/// Reconstructs the complete EIP-712 digest for Permit2 orders.
+///
+/// This function rebuilds the exact same digest that the client computed
+/// by following the same steps: domain hash + struct hash → final digest.
+pub fn reconstruct_permit2_digest(
+	payload: &crate::api::OrderPayload,
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+	let domain = payload.domain.as_object().ok_or("Missing domain")?;
+	let message = payload.message.as_object().ok_or("Missing message")?;
+
+	// 1. Compute domain hash
+	let chain_id = domain
+		.get("chainId")
+		.and_then(|c| c.as_str())
+		.ok_or("Missing chainId")?
+		.parse::<u64>()?;
+	let name = domain
+		.get("name")
+		.and_then(|n| n.as_str())
+		.ok_or("Missing name")?;
+	let contract_str = domain
+		.get("verifyingContract")
+		.and_then(|c| c.as_str())
+		.ok_or("Missing contract")?;
+	let contract = hex_to_alloy_address(contract_str)?;
+
+	let domain_hash = compute_domain_hash(name, chain_id, &contract);
+
+	// 2. Compute struct hash for PermitBatchWitnessTransferFrom
+
+	// Type hash for the main struct
+	let permit_type = "PermitBatchWitnessTransferFrom(TokenPermissions[] permitted,address spender,uint256 nonce,uint256 deadline,Permit2Witness witness)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)TokenPermissions(address token,uint256 amount)Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)";
+	let type_hash = keccak256(permit_type.as_bytes());
+
+	// Extract message fields
+	let spender_str = message
+		.get("spender")
+		.and_then(|s| s.as_str())
+		.ok_or("Missing spender")?;
+	let spender = hex_to_alloy_address(spender_str)?;
+	let nonce = message
+		.get("nonce")
+		.and_then(|n| n.as_str())
+		.ok_or("Missing nonce")?
+		.parse::<u64>()?;
+	let deadline = message
+		.get("deadline")
+		.and_then(|d| d.as_str())
+		.ok_or("Missing deadline")?
+		.parse::<u64>()?;
+
+	// Build permitted array hash
+	let permitted = message
+		.get("permitted")
+		.and_then(|p| p.as_array())
+		.ok_or("Missing permitted")?;
+	let token_type_hash = keccak256("TokenPermissions(address token,uint256 amount)".as_bytes());
+	let mut token_hashes = Vec::new();
+
+	for perm in permitted {
+		let perm_obj = perm.as_object().ok_or("Invalid permission")?;
+		let token_str = perm_obj
+			.get("token")
+			.and_then(|t| t.as_str())
+			.ok_or("Missing token")?;
+		let amount_str = perm_obj
+			.get("amount")
+			.and_then(|a| a.as_str())
+			.ok_or("Missing amount")?;
+
+		let token = hex_to_alloy_address(token_str)?;
+		let amount = U256::from_str_radix(amount_str, 10)?;
+
+		let mut encoder = Eip712AbiEncoder::new();
+		encoder.push_b256(&token_type_hash);
+		encoder.push_address(&token);
+		encoder.push_u256(amount);
+		token_hashes.push(keccak256(encoder.finish()));
+	}
+
+	// Hash the token permissions array
+	let mut permitted_encoder = Eip712AbiEncoder::new();
+	for hash in token_hashes {
+		permitted_encoder.push_b256(&hash);
+	}
+	let permitted_hash = keccak256(permitted_encoder.finish());
+
+	// Build witness hash
+	let witness = message
+		.get("witness")
+		.and_then(|w| w.as_object())
+		.ok_or("Missing witness")?;
+	let expires = witness
+		.get("expires")
+		.and_then(|e| e.as_u64())
+		.ok_or("Missing expires")? as u32;
+	let oracle_str = witness
+		.get("inputOracle")
+		.and_then(|o| o.as_str())
+		.ok_or("Missing inputOracle")?;
+	let oracle = hex_to_alloy_address(oracle_str)?;
+
+	// Build outputs array hash
+	let outputs = witness
+		.get("outputs")
+		.and_then(|o| o.as_array())
+		.ok_or("Missing outputs")?;
+	let output_type_hash = keccak256("MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)".as_bytes());
+	let mut output_hashes = Vec::new();
+
+	for output in outputs {
+		let output_obj = output.as_object().ok_or("Invalid output")?;
+		let oracle_str = output_obj
+			.get("oracle")
+			.and_then(|o| o.as_str())
+			.ok_or("Missing oracle")?;
+		let settler_str = output_obj
+			.get("settler")
+			.and_then(|s| s.as_str())
+			.ok_or("Missing settler")?;
+		let chain_id = output_obj
+			.get("chainId")
+			.and_then(|c| {
+				c.as_str()
+					.and_then(|s| s.parse::<u64>().ok())
+					.or_else(|| c.as_u64())
+			})
+			.ok_or("Missing or invalid chainId")?;
+		let token_str = output_obj
+			.get("token")
+			.and_then(|t| t.as_str())
+			.ok_or("Missing token")?;
+		let amount_str = output_obj
+			.get("amount")
+			.and_then(|a| a.as_str())
+			.ok_or("Missing amount")?;
+		let recipient_str = output_obj
+			.get("recipient")
+			.and_then(|r| r.as_str())
+			.ok_or("Missing recipient")?;
+		let call_str = output_obj
+			.get("call")
+			.and_then(|c| if c.is_null() { Some("0x") } else { c.as_str() })
+			.unwrap_or("0x");
+		let context_str = output_obj
+			.get("context")
+			.and_then(|c| c.as_str())
+			.unwrap_or("0x");
+
+		// Parse to bytes32 format
+		let oracle = crate::utils::parse_bytes32_from_hex(oracle_str)?;
+		let settler = crate::utils::parse_bytes32_from_hex(settler_str)?;
+		let token = crate::utils::parse_bytes32_from_hex(token_str)?;
+		let recipient = crate::utils::parse_bytes32_from_hex(recipient_str)?;
+		let amount = U256::from_str_radix(amount_str, 10)?;
+
+		// Hash call and context data
+		let call_bytes = if call_str == "0x" {
+			Vec::new()
+		} else {
+			hex::decode(call_str.trim_start_matches("0x"))?
+		};
+		let context_bytes = if context_str == "0x" {
+			Vec::new()
+		} else {
+			hex::decode(context_str.trim_start_matches("0x"))?
+		};
+		let call_hash = keccak256(&call_bytes);
+		let context_hash = keccak256(&context_bytes);
+
+		// Encode MandateOutput struct
+		let mut encoder = Eip712AbiEncoder::new();
+		encoder.push_b256(&output_type_hash);
+		encoder.push_b256(&B256::from(oracle));
+		encoder.push_b256(&B256::from(settler));
+		encoder.push_u256(U256::from(chain_id));
+		encoder.push_b256(&B256::from(token));
+		encoder.push_u256(amount);
+		encoder.push_b256(&B256::from(recipient));
+		encoder.push_b256(&call_hash);
+		encoder.push_b256(&context_hash);
+
+		output_hashes.push(keccak256(encoder.finish()));
+	}
+
+	// Hash outputs array
+	let mut outputs_encoder = Eip712AbiEncoder::new();
+	for hash in output_hashes {
+		outputs_encoder.push_b256(&hash);
+	}
+	let outputs_hash = keccak256(outputs_encoder.finish());
+
+	// Build witness struct hash
+	let witness_type_hash = keccak256("Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)".as_bytes());
+	let mut witness_encoder = Eip712AbiEncoder::new();
+	witness_encoder.push_b256(&witness_type_hash);
+	witness_encoder.push_u32(expires);
+	witness_encoder.push_address(&oracle);
+	witness_encoder.push_b256(&outputs_hash);
+	let witness_hash = keccak256(witness_encoder.finish());
+
+	let mut struct_encoder = Eip712AbiEncoder::new();
+	struct_encoder.push_b256(&type_hash);
+	struct_encoder.push_b256(&permitted_hash);
+	struct_encoder.push_address(&spender);
+	struct_encoder.push_u256(U256::from(nonce));
+	struct_encoder.push_u256(U256::from(deadline));
+	struct_encoder.push_b256(&witness_hash);
+	let struct_hash = keccak256(struct_encoder.finish());
+
+	// Final EIP-712 digest
+	let final_digest = compute_final_digest(&domain_hash, &struct_hash);
+
+	Ok(final_digest.0)
+}
+
+/// Reconstructs the EIP-712 digest for BatchCompact orders.
+///
+/// This function rebuilds the exact same digest that the client computed
+pub fn reconstruct_compact_digest(
+	payload: &crate::api::OrderPayload,
+	domain_separator: Option<[u8; 32]>,
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+	let domain = payload.domain.as_object().ok_or("Missing domain")?;
+	let message = payload.message.as_object().ok_or("Missing message")?;
+
+	// 1. Extract domain information
+	let name = domain
+		.get("name")
+		.and_then(|n| n.as_str())
+		.ok_or("Missing name")?;
+	let chain_id = domain
+		.get("chainId")
+		.and_then(|c| {
+			c.as_str()
+				.and_then(|s| s.parse::<u64>().ok())
+				.or_else(|| c.as_u64())
+		})
+		.ok_or("Missing or invalid chainId")?;
+	let verifying_contract_str = domain
+		.get("verifyingContract")
+		.and_then(|v| v.as_str())
+		.ok_or("Missing verifyingContract")?;
+	let verifying_contract = hex_to_alloy_address(verifying_contract_str)?;
+
+	// Use provided domain separator or compute it
+	let domain_hash = if let Some(provided_domain_separator) = domain_separator {
+		B256::from(provided_domain_separator)
+	} else {
+		// Fallback: compute domain separator
+		compute_domain_hash(name, chain_id, &verifying_contract)
+	};
+
+	// 2. Extract message fields
+	let arbiter_str = message
+		.get("arbiter")
+		.and_then(|a| a.as_str())
+		.ok_or("Missing arbiter")?;
+	let arbiter = hex_to_alloy_address(arbiter_str)?;
+
+	let sponsor_str = message
+		.get("sponsor")
+		.and_then(|s| s.as_str())
+		.ok_or("Missing sponsor")?;
+	let sponsor = hex_to_alloy_address(sponsor_str)?;
+
+	let nonce = message
+		.get("nonce")
+		.and_then(|n| n.as_str())
+		.ok_or("Missing nonce")?
+		.parse::<u64>()?;
+
+	let expires = message
+		.get("expires")
+		.and_then(|e| e.as_str())
+		.ok_or("Missing expires")?
+		.parse::<u64>()?;
+
+	// 3. Compute commitments (locks) hash
+	let commitments = message
+		.get("commitments")
+		.and_then(|c| c.as_array())
+		.ok_or("Missing commitments")?;
+
+	let lock_type_hash = keccak256("Lock(bytes12 lockTag,address token,uint256 amount)".as_bytes());
+	let mut lock_hashes = Vec::new();
+
+	for commitment in commitments {
+		let commitment_obj = commitment.as_object().ok_or("Invalid commitment")?;
+		let lock_tag_str = commitment_obj
+			.get("lockTag")
+			.and_then(|l| l.as_str())
+			.ok_or("Missing lockTag")?;
+		let token_str = commitment_obj
+			.get("token")
+			.and_then(|t| t.as_str())
+			.ok_or("Missing token")?;
+		let amount_str = commitment_obj
+			.get("amount")
+			.and_then(|a| a.as_str())
+			.ok_or("Missing amount")?;
+
+		// Parse lock tag as bytes12
+		let lock_tag_bytes = hex::decode(lock_tag_str.trim_start_matches("0x"))?;
+		if lock_tag_bytes.len() != 12 {
+			return Err("Invalid lockTag length".into());
+		}
+		let token = hex_to_alloy_address(token_str)?;
+		let amount = U256::from_str_radix(amount_str, 10)?;
+
+		// Encode Lock struct: keccak256(abi.encode(Lock_TYPE_HASH, lockTag, token, amount))
+		let mut lock_encoder = Eip712AbiEncoder::new();
+		lock_encoder.push_b256(&lock_type_hash);
+
+		// Push lockTag as bytes12 (left-aligned in 32-byte word)
+		let mut lock_tag_word = [0u8; 32];
+		lock_tag_word[0..12].copy_from_slice(&lock_tag_bytes);
+		lock_encoder.push_b256(&B256::from(lock_tag_word));
+
+		lock_encoder.push_address(&token);
+		lock_encoder.push_u256(amount);
+
+		lock_hashes.push(keccak256(lock_encoder.finish()));
+	}
+
+	// Hash all lock hashes together
+	let mut commitments_encoder = Eip712AbiEncoder::new();
+	for hash in lock_hashes {
+		commitments_encoder.push_b256(&hash);
+	}
+	let commitments_hash = keccak256(commitments_encoder.finish());
+
+	// 4. Compute mandate (witness) hash
+	let mandate = message
+		.get("mandate")
+		.and_then(|m| m.as_object())
+		.ok_or("Missing mandate")?;
+
+	let fill_deadline = mandate
+		.get("fillDeadline")
+		.and_then(|f| {
+			f.as_u64()
+				.or_else(|| f.as_str().and_then(|s| s.parse::<u64>().ok()))
+		})
+		.ok_or("Missing or invalid fillDeadline")? as u32;
+
+	let input_oracle_str = mandate
+		.get("inputOracle")
+		.and_then(|i| i.as_str())
+		.ok_or("Missing inputOracle")?;
+	let input_oracle = hex_to_alloy_address(input_oracle_str)?;
+
+	// Compute outputs hash
+	let outputs = mandate
+		.get("outputs")
+		.and_then(|o| o.as_array())
+		.ok_or("Missing outputs")?;
+
+	let mandate_output_type_hash = keccak256("MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)".as_bytes());
+	let mut output_hashes = Vec::new();
+
+	for output in outputs {
+		let output_obj = output.as_object().ok_or("Invalid output")?;
+
+		let oracle_str = output_obj
+			.get("oracle")
+			.and_then(|o| o.as_str())
+			.ok_or("Missing oracle")?;
+		let settler_str = output_obj
+			.get("settler")
+			.and_then(|s| s.as_str())
+			.ok_or("Missing settler")?;
+		let output_chain_id = output_obj
+			.get("chainId")
+			.and_then(|c| {
+				c.as_str()
+					.and_then(|s| s.parse::<u64>().ok())
+					.or_else(|| c.as_u64())
+			})
+			.ok_or("Missing or invalid chainId")?;
+		let token_str = output_obj
+			.get("token")
+			.and_then(|t| t.as_str())
+			.ok_or("Missing token")?;
+		let amount_str = output_obj
+			.get("amount")
+			.and_then(|a| a.as_str())
+			.ok_or("Missing amount")?;
+		let recipient_str = output_obj
+			.get("recipient")
+			.and_then(|r| r.as_str())
+			.ok_or("Missing recipient")?;
+		let call_str = output_obj
+			.get("call")
+			.and_then(|c| if c.is_null() { Some("0x") } else { c.as_str() })
+			.unwrap_or("0x");
+		let context_str = output_obj
+			.get("context")
+			.and_then(|c| c.as_str())
+			.unwrap_or("0x");
+
+		// Parse to bytes32 format
+		let oracle = crate::utils::parse_bytes32_from_hex(oracle_str)?;
+		let settler = crate::utils::parse_bytes32_from_hex(settler_str)?;
+		let token = crate::utils::parse_bytes32_from_hex(token_str)?;
+		let recipient = crate::utils::parse_bytes32_from_hex(recipient_str)?;
+		let amount = U256::from_str_radix(amount_str, 10)?;
+
+		// Hash call and context data
+		let call_bytes = if call_str == "0x" {
+			Vec::new()
+		} else {
+			hex::decode(call_str.trim_start_matches("0x"))?
+		};
+		let context_bytes = if context_str == "0x" {
+			Vec::new()
+		} else {
+			hex::decode(context_str.trim_start_matches("0x"))?
+		};
+		let call_hash = keccak256(&call_bytes);
+		let context_hash = keccak256(&context_bytes);
+
+		// Encode MandateOutput struct
+		let mut output_encoder = Eip712AbiEncoder::new();
+		output_encoder.push_b256(&mandate_output_type_hash);
+		output_encoder.push_b256(&B256::from(oracle));
+		output_encoder.push_b256(&B256::from(settler));
+		output_encoder.push_u256(U256::from(output_chain_id));
+		output_encoder.push_b256(&B256::from(token));
+		output_encoder.push_u256(amount);
+		output_encoder.push_b256(&B256::from(recipient));
+		output_encoder.push_b256(&call_hash);
+		output_encoder.push_b256(&context_hash);
+
+		output_hashes.push(keccak256(output_encoder.finish()));
+	}
+
+	// Hash outputs array
+	let mut outputs_encoder = Eip712AbiEncoder::new();
+	for hash in output_hashes {
+		outputs_encoder.push_b256(&hash);
+	}
+	let outputs_hash = keccak256(outputs_encoder.finish());
+
+	// Build mandate struct hash
+	let mandate_type_hash = keccak256("Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)".as_bytes());
+	let mut mandate_encoder = Eip712AbiEncoder::new();
+	mandate_encoder.push_b256(&mandate_type_hash);
+	mandate_encoder.push_u32(fill_deadline);
+	mandate_encoder.push_address(&input_oracle);
+	mandate_encoder.push_b256(&outputs_hash);
+	let mandate_hash = keccak256(mandate_encoder.finish());
+
+	// 5. Build BatchCompact struct hash
+	let batch_compact_type_hash = keccak256("BatchCompact(address arbiter,address sponsor,uint256 nonce,uint256 expires,Lock[] commitments,Mandate mandate)Lock(bytes12 lockTag,address token,uint256 amount)Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)".as_bytes());
+
+	let mut struct_encoder = Eip712AbiEncoder::new();
+	struct_encoder.push_b256(&batch_compact_type_hash);
+	struct_encoder.push_address(&arbiter);
+	struct_encoder.push_address(&sponsor);
+	struct_encoder.push_u256(U256::from(nonce));
+	struct_encoder.push_u256(U256::from(expires));
+	struct_encoder.push_b256(&commitments_hash);
+	struct_encoder.push_b256(&mandate_hash);
+	let struct_hash = keccak256(struct_encoder.finish());
+
+	// 6. Final EIP-712 digest
+	let final_digest = compute_final_digest(&domain_hash, &struct_hash);
+
+	Ok(final_digest.0)
+}
+
+/// Reconstructs the EIP-712 digest for EIP-3009 orders.
+///
+/// This function rebuilds the exact same digest that the client computed
+/// by following the same steps: domain hash + struct hash → final digest.
+pub fn reconstruct_eip3009_digest(
+	payload: &crate::api::OrderPayload,
+	domain_separator: Option<[u8; 32]>,
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+	use alloy_primitives::{keccak256, FixedBytes, U256};
+
+	let domain = payload.domain.as_object().ok_or("Missing domain")?;
+	let message = payload.message.as_object().ok_or("Missing message")?;
+
+	// Extract domain information
+	let name = domain
+		.get("name")
+		.and_then(|n| n.as_str())
+		.ok_or("Missing name")?;
+	let chain_id = domain
+		.get("chainId")
+		.and_then(|c| {
+			c.as_str()
+				.and_then(|s| s.parse::<u64>().ok())
+				.or_else(|| c.as_u64())
+		})
+		.ok_or("Missing or invalid chainId")?;
+	let verifying_contract = domain
+		.get("verifyingContract")
+		.and_then(|v| v.as_str())
+		.ok_or("Missing verifyingContract")?;
+
+	// Extract message fields
+	let from_str = message
+		.get("from")
+		.and_then(|f| f.as_str())
+		.ok_or("Missing from")?;
+	let from = hex_to_alloy_address(from_str)?;
+
+	let to_str = message
+		.get("to")
+		.and_then(|t| t.as_str())
+		.ok_or("Missing to")?;
+	let to = hex_to_alloy_address(to_str)?;
+
+	let value_str = message
+		.get("value")
+		.and_then(|v| v.as_str())
+		.ok_or("Missing value")?;
+	let value = U256::from_str_radix(value_str, 10)?;
+
+	let valid_after = message
+		.get("validAfter")
+		.and_then(|v| v.as_u64())
+		.unwrap_or(0);
+
+	let valid_before = message
+		.get("validBefore")
+		.and_then(|v| v.as_u64())
+		.unwrap_or(0);
+
+	let nonce_str = message
+		.get("nonce")
+		.and_then(|n| n.as_str())
+		.ok_or("Missing nonce")?;
+	let nonce_bytes =
+		FixedBytes::<32>::from_slice(&hex::decode(nonce_str.trim_start_matches("0x"))?);
+
+	// Use provided domain separator or compute it
+	let domain_hash = if let Some(provided_domain_separator) = domain_separator {
+		FixedBytes::<32>::from(provided_domain_separator)
+	} else {
+		// Fallback: compute domain separator
+		let domain_type_hash = keccak256(
+			"EIP712Domain(string name,uint256 chainId,address verifyingContract)".as_bytes(),
+		);
+		let name_hash = keccak256(name.as_bytes());
+		let contract = hex_to_alloy_address(verifying_contract)?;
+
+		let mut domain_encoder = Eip712AbiEncoder::new();
+		domain_encoder.push_b256(&domain_type_hash);
+		domain_encoder.push_b256(&name_hash);
+		domain_encoder.push_u256(U256::from(chain_id));
+		domain_encoder.push_address(&contract);
+		keccak256(domain_encoder.finish())
+	};
+
+	// Compute struct hash for ReceiveWithAuthorization
+	let type_hash = keccak256("ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)".as_bytes());
+
+	let mut struct_encoder = Eip712AbiEncoder::new();
+	struct_encoder.push_b256(&type_hash);
+	struct_encoder.push_address(&from);
+	struct_encoder.push_address(&to);
+	struct_encoder.push_u256(value);
+	struct_encoder.push_u256(U256::from(valid_after));
+	struct_encoder.push_u256(U256::from(valid_before));
+	struct_encoder.push_b256(&nonce_bytes);
+	let struct_hash = keccak256(struct_encoder.finish());
+
+	// Final EIP-712 digest
+	let final_digest = compute_final_digest(&domain_hash, &struct_hash);
+
+	Ok(final_digest.0)
 }
 
 #[cfg(test)]
