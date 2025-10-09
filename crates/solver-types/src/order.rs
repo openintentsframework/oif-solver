@@ -327,11 +327,11 @@ pub struct OrderResponse {
 	#[serde(rename = "quoteId")]
 	pub quote_id: Option<String>,
 	/// Input asset and amount
-	#[serde(rename = "inputAmount")]
-	pub input_amount: AssetAmount,
+	#[serde(rename = "inputAmounts")]
+	pub input_amounts: Vec<AssetAmount>,
 	/// Output asset and amount
-	#[serde(rename = "outputAmount")]
-	pub output_amount: AssetAmount,
+	#[serde(rename = "outputAmounts")]
+	pub output_amounts: Vec<AssetAmount>,
 	/// Settlement information
 	pub settlement: Settlement,
 	/// Transaction details if order has been executed
