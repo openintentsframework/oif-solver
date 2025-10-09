@@ -1534,13 +1534,11 @@ mod tests {
 	}
 
 	fn create_mock_token_manager() -> Arc<TokenManager> {
-		let token_manager = Arc::new(TokenManager::new(
+		Arc::new(TokenManager::new(
 			create_test_networks_config(),
 			create_mock_delivery_service(),
 			create_mock_account_service(),
-		));
-
-		token_manager
+		))
 	}
 
 	fn create_mock_account_service() -> Arc<AccountService> {
@@ -1780,7 +1778,7 @@ mod tests {
 		assert!(cost_context.cost_breakdown.operational_cost >= Decimal::ZERO);
 
 		// Verify execution costs by chain
-		assert!(cost_context.execution_costs_by_chain.len() >= 1);
+		assert!(!cost_context.execution_costs_by_chain.is_empty());
 
 		// Verify swap amounts were calculated
 		assert!(!cost_context.swap_amounts.is_empty());
@@ -1959,7 +1957,7 @@ mod tests {
 		assert!(cost_context.cost_breakdown.operational_cost >= Decimal::ZERO);
 
 		// Verify execution costs by chain
-		assert!(cost_context.execution_costs_by_chain.len() >= 1);
+		assert!(!cost_context.execution_costs_by_chain.is_empty());
 
 		// Verify swap amounts were calculated
 		assert!(!cost_context.swap_amounts.is_empty());
