@@ -473,7 +473,7 @@ impl PricingInterface for CoinGeckoPricing {
 			"Converted gas cost: {} wei = {} ETH = ${} USD (ETH price: ${})",
 			wei_amount,
 			eth_amount_str,
-			result.round_dp(2),
+			result.round_dp(8),
 			eth_price
 		);
 		Ok(result.round_dp(2).to_string())
