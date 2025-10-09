@@ -51,6 +51,284 @@ pub enum FailureHandlingMode {
 	NeedsNewSignature,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuotePreview {
+	pub inputs: Vec<QuoteInput>,
+	pub outputs: Vec<QuoteOutput>,
+}
+
+impl QuotePreview {
+	/// Create a QuotePreview from an OifOrder and user address
+	pub fn from_order_and_user(order: &OifOrder, user: &InteropAddress) -> Self {
+		use crate::utils::conversion::hex_to_alloy_address;
+
+		match order {
+			OifOrder::Oif3009V0 {
+				payload: _,
+				metadata,
+			} => {
+				// EIP-3009 uses ReceiveWithAuthorization with direct from/to/value fields
+				// But the actual outputs are in the metadata
+				let mut inputs = Vec::new();
+				let mut outputs = Vec::new();
+
+				// Extract from metadata if available
+				if let Some(metadata_obj) = metadata.as_object() {
+					// Extract inputs from metadata
+					if let Some(metadata_inputs) =
+						metadata_obj.get("inputs").and_then(|v| v.as_array())
+					{
+						for input in metadata_inputs {
+							if let (Some(user), Some(asset), Some(amount)) = (
+								input.get("user").and_then(|v| v.as_str()),
+								input.get("asset").and_then(|v| v.as_str()),
+								input.get("amount").and_then(|v| v.as_str()),
+							) {
+								// These are already in InteropAddress format
+								if let (Ok(user_addr), Ok(asset_addr)) = (
+									InteropAddress::from_hex(user),
+									InteropAddress::from_hex(asset),
+								) {
+									inputs.push(QuoteInput {
+										user: user_addr,
+										asset: asset_addr,
+										amount: Some(amount.to_string()),
+										lock: None,
+									});
+								}
+							}
+						}
+					}
+
+					// Extract outputs from metadata
+					if let Some(metadata_outputs) =
+						metadata_obj.get("outputs").and_then(|v| v.as_array())
+					{
+						for output in metadata_outputs {
+							if let (Some(receiver), Some(asset), Some(amount)) = (
+								output.get("receiver").and_then(|v| v.as_str()),
+								output.get("asset").and_then(|v| v.as_str()),
+								output.get("amount").and_then(|v| v.as_str()),
+							) {
+								// These are already in InteropAddress format
+								if let (Ok(receiver_addr), Ok(asset_addr)) = (
+									InteropAddress::from_hex(receiver),
+									InteropAddress::from_hex(asset),
+								) {
+									outputs.push(QuoteOutput {
+										receiver: receiver_addr,
+										asset: asset_addr,
+										amount: Some(amount.to_string()),
+										calldata: None,
+									});
+								}
+							}
+						}
+					}
+				}
+
+				QuotePreview { inputs, outputs }
+			},
+			OifOrder::OifEscrowV0 { payload } => {
+				let mut inputs = Vec::new();
+				let mut outputs = Vec::new();
+
+				// Permit2-based escrow order
+				if let Some(message) = payload.message.as_object() {
+					// Extract chain ID from domain (can be string or number)
+					let origin_chain_id = payload
+						.domain
+						.as_object()
+						.and_then(|d| d.get("chainId"))
+						.and_then(|v| {
+							v.as_str()
+								.and_then(|s| s.parse::<u64>().ok())
+								.or_else(|| v.as_u64())
+						})
+						.unwrap_or(1);
+
+					// For Permit2: extract from "permitted" array
+					if let Some(permitted) = message.get("permitted").and_then(|v| v.as_array()) {
+						for perm in permitted {
+							if let (Some(token), Some(amount)) = (
+								perm.get("token").and_then(|v| v.as_str()),
+								perm.get("amount").and_then(|v| v.as_str()),
+							) {
+								if let Ok(token_addr) = hex_to_alloy_address(token) {
+									// Use the provided user address directly (it's already an InteropAddress)
+									inputs.push(QuoteInput {
+										user: user.clone(),
+										asset: InteropAddress::new_ethereum(
+											origin_chain_id,
+											token_addr,
+										),
+										amount: Some(amount.to_string()),
+										lock: None,
+									});
+								}
+							}
+						}
+					}
+
+					// Extract outputs from witness.outputs for Permit2
+					if let Some(witness) = message.get("witness") {
+						if let Some(outputs_arr) = witness.get("outputs").and_then(|v| v.as_array())
+						{
+							for output in outputs_arr {
+								// Extract chain ID - can be string or number
+								let chain_id = output
+									.get("chainId")
+									.and_then(|v| {
+										v.as_str()
+											.and_then(|s| s.parse::<u64>().ok())
+											.or_else(|| v.as_u64())
+									});
+								
+								if let (
+									Some(chain_id),
+									Some(token),
+									Some(amount),
+									Some(recipient),
+								) = (
+									chain_id,
+									output.get("token").and_then(|v| v.as_str()),
+									output.get("amount").and_then(|v| v.as_str()),
+									output.get("recipient").and_then(|v| v.as_str()),
+								) {
+									// Token and recipient might be in bytes32 format (64 hex chars)
+									// hex_to_alloy_address handles both 20-byte and 32-byte formats
+									if let (Ok(token_addr), Ok(recipient_addr)) = (
+										hex_to_alloy_address(token),
+										hex_to_alloy_address(recipient),
+									) {
+										outputs.push(QuoteOutput {
+											receiver: InteropAddress::new_ethereum(
+												chain_id,
+												recipient_addr,
+											),
+											asset: InteropAddress::new_ethereum(
+												chain_id, token_addr,
+											),
+											amount: Some(amount.to_string()),
+											calldata: output
+												.get("call")
+												.and_then(|v| v.as_str())
+												.map(String::from),
+										});
+									}
+								}
+							}
+						}
+					}
+				}
+
+				QuotePreview { inputs, outputs }
+			},
+			OifOrder::OifResourceLockV0 { payload } => {
+				let mut inputs = Vec::new();
+				let mut outputs = Vec::new();
+				// Compact-based resource lock order
+				if let Some(message) = payload.message.as_object() {
+					// Extract chain ID from domain (can be string or number)
+					let origin_chain_id = payload
+						.domain
+						.as_object()
+						.and_then(|d| d.get("chainId"))
+						.and_then(|v| {
+							v.as_str()
+								.and_then(|s| s.parse::<u64>().ok())
+								.or_else(|| v.as_u64())
+						})
+						.unwrap_or(1);
+
+					// For Compact: extract from "commitments" array
+					if let Some(commitments) = message.get("commitments").and_then(|v| v.as_array())
+					{
+						for commitment in commitments {
+							if let (Some(token), Some(amount)) = (
+								commitment.get("token").and_then(|v| v.as_str()),
+								commitment.get("amount").and_then(|v| v.as_str()),
+							) {
+								if let Ok(token_addr) = hex_to_alloy_address(token) {
+									// Use the provided user address directly for ResourceLock
+									inputs.push(QuoteInput {
+										user: user.clone(),
+										asset: InteropAddress::new_ethereum(
+											origin_chain_id,
+											token_addr,
+										),
+										amount: Some(amount.to_string()),
+										lock: None,
+									});
+								}
+							}
+						}
+					}
+
+					// Extract outputs from mandate.outputs for Compact
+					if let Some(mandate) = message.get("mandate") {
+						if let Some(outputs_arr) = mandate.get("outputs").and_then(|v| v.as_array())
+						{
+							for output in outputs_arr {
+								// Extract chain ID - can be string or number
+								let chain_id = output
+									.get("chainId")
+									.and_then(|v| {
+										v.as_str()
+											.and_then(|s| s.parse::<u64>().ok())
+											.or_else(|| v.as_u64())
+									});
+								
+								if let (
+									Some(chain_id),
+									Some(token),
+									Some(amount),
+									Some(recipient),
+								) = (
+									chain_id,
+									output.get("token").and_then(|v| v.as_str()),
+									output.get("amount").and_then(|v| v.as_str()),
+									output.get("recipient").and_then(|v| v.as_str()),
+								) {
+									// Token and recipient might be in bytes32 format (64 hex chars)
+									// hex_to_alloy_address handles both 20-byte and 32-byte formats
+									if let (Ok(token_addr), Ok(recipient_addr)) = (
+										hex_to_alloy_address(token),
+										hex_to_alloy_address(recipient),
+									) {
+										outputs.push(QuoteOutput {
+											receiver: InteropAddress::new_ethereum(
+												chain_id,
+												recipient_addr,
+											),
+											asset: InteropAddress::new_ethereum(
+												chain_id, token_addr,
+											),
+											amount: Some(amount.to_string()),
+											calldata: output
+												.get("call")
+												.and_then(|v| v.as_str())
+												.map(String::from),
+										});
+									}
+								}
+							}
+						}
+					}
+				}
+				QuotePreview { inputs, outputs }
+			},
+			OifOrder::OifGenericV0 { payload: _ } => {
+				// Generic orders don't have standardized structure
+				QuotePreview {
+					inputs: Vec::new(),
+					outputs: Vec::new(),
+				}
+			},
+		}
+	}
+}
+
 /// Intent type identifier
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -308,7 +586,7 @@ impl From<&OifOrder> for Option<OriginSubmission> {
 }
 
 /// Reference to a lock in a locking system (updated from Lock)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AssetLockReference {
 	pub kind: LockKind,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -458,7 +736,7 @@ pub struct AssetAmount {
 }
 
 /// Supported lock mechanisms
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum LockKind {
 	#[serde(alias = "TheCompact", alias = "the_compact")]
@@ -466,13 +744,8 @@ pub enum LockKind {
 	Rhinestone,
 }
 
-// TODO: Remove these aliases entirely and update all code to use OrderInput/OrderOutput directly
-// These are temporary aliases for migration purposes
-pub type AvailableInput = OrderInput;
-pub type RequestedOutput = OrderOutput;
-
 /// Quote input from a user (amounts optional for quote requests)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QuoteInput {
 	/// User address in EIP-7930 Address format
 	pub user: InteropAddress,
@@ -487,7 +760,7 @@ pub struct QuoteInput {
 }
 
 /// Quote output for a receiver (amounts optional for quote requests)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QuoteOutput {
 	/// Receiver address in EIP-7930 Address format
 	pub receiver: InteropAddress,
@@ -767,24 +1040,6 @@ impl GetQuoteRequest {
 	}
 }
 
-/// Legacy V1 structure for backward compatibility during migration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetQuoteRequestV1 {
-	/// User making the request in ERC-7930 interoperable format
-	pub user: InteropAddress,
-	/// Available inputs (order significant if preference is 'input-priority')
-	#[serde(rename = "availableInputs")]
-	pub available_inputs: Vec<AvailableInput>,
-	/// Requested outputs
-	#[serde(rename = "requestedOutputs")]
-	pub requested_outputs: Vec<RequestedOutput>,
-	/// Minimum quote validity duration in seconds
-	#[serde(rename = "minValidUntil")]
-	pub min_valid_until: Option<u64>,
-	/// User preference for optimization
-	pub preference: Option<QuotePreference>,
-}
-
 /// Quote optimization preferences following UII standard
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -817,17 +1072,6 @@ pub enum SignatureType {
 	Eip712,
 }
 
-/// Quote details matching the request structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QuoteDetails {
-	/// Requested outputs for this quote
-	#[serde(rename = "requestedOutputs")]
-	pub requested_outputs: Vec<RequestedOutput>,
-	/// Available inputs for this quote
-	#[serde(rename = "availableInputs")]
-	pub available_inputs: Vec<AvailableInput>,
-}
-
 /// A quote option following the new OIF standard
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Quote {
@@ -851,6 +1095,8 @@ pub struct Quote {
 	/// Provider identifier
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub provider: Option<String>,
+	/// Informational amounts for UX/display, must be verified against the order
+	pub preview: QuotePreview,
 }
 
 /// Implementation to convert Quote with signature and standard to PostOrderRequest
@@ -1295,53 +1541,6 @@ mod tests {
 	}
 
 	#[test]
-	fn test_available_input_serialization() {
-		let input = AvailableInput {
-			user: InteropAddress::new_ethereum(
-				1,
-				address!("1111111111111111111111111111111111111111"),
-			),
-			asset: InteropAddress::new_ethereum(
-				1,
-				address!("2222222222222222222222222222222222222222"),
-			),
-			amount: U256::from(5000),
-			lock: Some(AssetLockReference {
-				kind: LockKind::TheCompact,
-				params: None,
-			}),
-		};
-
-		let json = serde_json::to_string(&input).unwrap();
-		let deserialized: AvailableInput = serde_json::from_str(&json).unwrap();
-
-		assert_eq!(deserialized.amount, 5000);
-		assert!(deserialized.lock.is_some());
-	}
-
-	#[test]
-	fn test_requested_output_serialization() {
-		let output = RequestedOutput {
-			receiver: InteropAddress::new_ethereum(
-				1,
-				address!("3333333333333333333333333333333333333333"),
-			),
-			asset: InteropAddress::new_ethereum(
-				1,
-				address!("4444444444444444444444444444444444444444"),
-			),
-			amount: U256::from(2000),
-			calldata: Some("0xdeadbeef".to_string()),
-		};
-
-		let json = serde_json::to_string(&output).unwrap();
-		let deserialized: RequestedOutput = serde_json::from_str(&json).unwrap();
-
-		assert_eq!(deserialized.amount, 2000);
-		assert_eq!(deserialized.calldata, Some("0xdeadbeef".to_string()));
-	}
-
-	#[test]
 	fn test_quote_preference_serialization() {
 		let preferences = [
 			QuotePreference::Price,
@@ -1368,7 +1567,7 @@ mod tests {
 
 	#[test]
 	fn test_get_quote_request_serialization() {
-		let input = AvailableInput {
+		let input = QuoteInput {
 			user: InteropAddress::new_ethereum(
 				1,
 				address!("1111111111111111111111111111111111111111"),
@@ -1377,11 +1576,11 @@ mod tests {
 				1,
 				address!("2222222222222222222222222222222222222222"),
 			),
-			amount: U256::from(1000),
+			amount: Some("1000".to_string()),
 			lock: None,
 		};
 
-		let output = RequestedOutput {
+		let output = QuoteOutput {
 			receiver: InteropAddress::new_ethereum(
 				1,
 				address!("3333333333333333333333333333333333333333"),
@@ -1390,30 +1589,38 @@ mod tests {
 				1,
 				address!("4444444444444444444444444444444444444444"),
 			),
-			amount: U256::from(900),
+			amount: Some("900".to_string()),
 			calldata: None,
 		};
 
-		let request = GetQuoteRequestV1 {
+		let request = GetQuoteRequest {
 			user: InteropAddress::new_ethereum(
 				1,
 				address!("1111111111111111111111111111111111111111"),
 			),
-			available_inputs: vec![input],
-			requested_outputs: vec![output],
-			min_valid_until: Some(1234567890),
-			preference: Some(QuotePreference::Price),
+			intent: IntentRequest {
+				intent_type: IntentType::OifSwap,
+				inputs: vec![input],
+				outputs: vec![output],
+				swap_type: None,
+				min_valid_until: Some(1234567890),
+				preference: Some(QuotePreference::Price),
+				origin_submission: None,
+				failure_handling: None,
+				partial_fill: None,
+				metadata: None,
+			},
+			supported_types: vec![oif_versions::escrow_order_type(oif_versions::CURRENT)],
 		};
 
 		let json = serde_json::to_string(&request).unwrap();
-		assert!(json.contains("\"availableInputs\""));
-		assert!(json.contains("\"requestedOutputs\""));
+		assert!(json.contains("\"intent\""));
 		assert!(json.contains("\"minValidUntil\""));
 
-		let deserialized: GetQuoteRequestV1 = serde_json::from_str(&json).unwrap();
-		assert_eq!(deserialized.available_inputs.len(), 1);
-		assert_eq!(deserialized.requested_outputs.len(), 1);
-		assert_eq!(deserialized.min_valid_until, Some(1234567890));
+		let deserialized: GetQuoteRequest = serde_json::from_str(&json).unwrap();
+		assert_eq!(deserialized.intent.inputs.len(), 1);
+		assert_eq!(deserialized.intent.outputs.len(), 1);
+		assert_eq!(deserialized.intent.min_valid_until, Some(1234567890));
 	}
 
 	#[test]
@@ -1494,6 +1701,32 @@ mod tests {
 			eta: Some(300),
 			quote_id: "quote_123".to_string(),
 			provider: Some("test_solver".to_string()),
+			preview: QuotePreview {
+				inputs: vec![QuoteInput {
+					user: InteropAddress::new_ethereum(
+						1,
+						address!("1111111111111111111111111111111111111111"),
+					),
+					asset: InteropAddress::new_ethereum(
+						1,
+						address!("2222222222222222222222222222222222222222"),
+					),
+					amount: Some("100".to_string()),
+					lock: None,
+				}],
+				outputs: vec![QuoteOutput {
+					receiver: InteropAddress::new_ethereum(
+						1,
+						address!("3333333333333333333333333333333333333333"),
+					),
+					asset: InteropAddress::new_ethereum(
+						1,
+						address!("4444444444444444444444444444444444444444"),
+					),
+					amount: Some("90".to_string()),
+					calldata: None,
+				}],
+			},
 		};
 
 		let json = serde_json::to_string(&quote).unwrap();
@@ -1526,6 +1759,10 @@ mod tests {
 				eta: None,
 				quote_id: "test_quote".to_string(),
 				provider: Some("test_provider".to_string()),
+				preview: QuotePreview {
+					inputs: vec![],
+					outputs: vec![],
+				},
 			}],
 		};
 
@@ -1839,21 +2076,30 @@ mod tests {
 	#[test]
 	fn test_edge_cases() {
 		// Test empty arrays
-		let request = GetQuoteRequestV1 {
+		let request = GetQuoteRequest {
 			user: InteropAddress::new_ethereum(
 				1,
 				address!("1111111111111111111111111111111111111111"),
 			),
-			available_inputs: vec![],
-			requested_outputs: vec![],
-			min_valid_until: None,
-			preference: None,
+			intent: IntentRequest {
+				intent_type: IntentType::OifSwap,
+				inputs: vec![],
+				outputs: vec![],
+				swap_type: None,
+				min_valid_until: None,
+				preference: None,
+				origin_submission: None,
+				failure_handling: None,
+				partial_fill: None,
+				metadata: None,
+			},
+			supported_types: vec![oif_versions::escrow_order_type(oif_versions::CURRENT)],
 		};
 
 		let json = serde_json::to_string(&request).unwrap();
-		let deserialized: GetQuoteRequestV1 = serde_json::from_str(&json).unwrap();
-		assert_eq!(deserialized.available_inputs.len(), 0);
-		assert_eq!(deserialized.requested_outputs.len(), 0);
+		let deserialized: GetQuoteRequest = serde_json::from_str(&json).unwrap();
+		assert_eq!(deserialized.intent.inputs.len(), 0);
+		assert_eq!(deserialized.intent.outputs.len(), 0);
 
 		// Test zero amounts
 		let asset_amount = AssetAmount {
