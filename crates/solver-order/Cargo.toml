@@ -11,7 +11,7 @@ alloy-sol-types = { workspace = true }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
-mockall = { version = "0.13", optional = true }
+mockall = { workspace = true, optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 solver-types = { path = "../solver-types" }

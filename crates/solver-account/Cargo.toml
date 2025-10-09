@@ -12,7 +12,7 @@ alloy-signer = { workspace = true }
 alloy-signer-local = { workspace = true }
 async-trait = "0.1"
 hex = "0.4"
-mockall = { version = "0.13", optional = true }
+mockall = { workspace = true, optional = true }
 solver-types = { path = "../solver-types" }
 thiserror = "2.0.17"
 toml = { workspace = true }

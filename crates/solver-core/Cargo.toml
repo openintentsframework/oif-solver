@@ -27,7 +27,7 @@ toml = { workspace = true }
 tracing = "0.1"
 
 [dev-dependencies]
-mockall = "0.13"
+mockall = { workspace = true }
 async-trait = { workspace = true }
 # Add testing feature only for tests
 solver-delivery = { path = "../solver-delivery", features = ["testing"] }
