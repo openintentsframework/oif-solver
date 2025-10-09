@@ -1151,6 +1151,7 @@ pub struct GetQuoteResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetOrderResponse {
 	/// Order details
+	#[serde(flatten)]
 	pub order: crate::order::OrderResponse,
 }
 
