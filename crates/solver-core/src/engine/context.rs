@@ -262,8 +262,11 @@ mod tests {
 	use solver_account::MockAccountInterface;
 	use solver_delivery::MockDeliveryInterface;
 	use solver_types::{
-		networks::RpcEndpoint, utils::tests::builders::IntentBuilder, Address, Intent,
-		NetworkConfig, NetworksConfig, TokenConfig,
+		networks::RpcEndpoint,
+		utils::tests::builders::{
+			IntentBuilder, NetworkConfigBuilder, NetworksConfigBuilder, TokenConfigBuilder,
+		},
+		Address, Intent, NetworksConfig,
 	};
 	use std::collections::HashMap;
 
@@ -320,32 +323,35 @@ mod tests {
 	}
 
 	fn create_test_networks_config() -> NetworksConfig {
-		let mut networks = NetworksConfig::new();
+		// Create tokens using builders for consistency
+		let usdc_token = TokenConfigBuilder::new()
+			.address(Address([0xA0; 20].to_vec()))
+			.symbol("USDC")
+			.decimals(6)
+			.build();
 
-		// Add test network with some tokens
-		let network_config = NetworkConfig {
-			rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
-			input_settler_address: Address([0x11; 20].to_vec()),
-			output_settler_address: Address([0x22; 20].to_vec()),
-			tokens: vec![
-				TokenConfig {
-					address: Address([0xA0; 20].to_vec()),
-					decimals: 6,
-					symbol: "USDC".to_string(),
-				},
-				TokenConfig {
-					address: Address([0xC0; 20].to_vec()),
-					decimals: 18,
-					symbol: "WETH".to_string(),
-				},
-			],
-			input_settler_compact_address: None,
-			the_compact_address: None,
-			allocator_address: None,
-		};
+		let weth_token = TokenConfigBuilder::new()
+			.address(Address([0xC0; 20].to_vec()))
+			.symbol("WETH")
+			.decimals(18)
+			.build();
 
-		networks.insert(1, network_config);
-		networks
+		// Use NetworkConfigBuilder but replace tokens completely using .tokens()
+		// Note: This will extend the default tokens, so we need to account for that
+		let mut network_config = NetworkConfigBuilder::new()
+			.rpc_endpoints(vec![RpcEndpoint::http_only(
+				"http://localhost:8545".to_string(),
+			)])
+			.input_settler_address(Address([0x11; 20].to_vec()))
+			.output_settler_address(Address([0x22; 20].to_vec()))
+			.build();
+
+		// Manually set the tokens to exactly what we want (overriding defaults)
+		network_config.tokens = vec![usdc_token, weth_token];
+
+		NetworksConfigBuilder::new()
+			.add_network(1, network_config)
+			.build()
 	}
 
 	fn create_context_builder() -> ContextBuilder {
