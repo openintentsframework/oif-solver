@@ -725,7 +725,7 @@ impl fmt::Display for ApiErrorType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetAmount {
 	/// Asset address in ERC-7930 interoperable format
-	pub asset: String,
+	pub asset: InteropAddress,
 	/// Amount as a big integer
 	#[serde(with = "u256_serde")]
 	pub amount: U256,
@@ -1499,8 +1499,14 @@ mod tests {
 
 	#[test]
 	fn test_asset_amount_serialization() {
+		// Create an InteropAddress for the test
+		let address = "0x1234567890123456789012345678901234567890"
+			.parse::<alloy_primitives::Address>()
+			.unwrap();
+		let interop_address = crate::standards::eip7930::InteropAddress::new_ethereum(1, address);
+
 		let asset_amount = AssetAmountBuilder::new()
-			.asset("0x1234567890123456789012345678901234567890")
+			.asset(interop_address.clone())
 			.amount_u64(1000)
 			.build();
 
@@ -1509,7 +1515,7 @@ mod tests {
 		assert!(json.contains("\"amount\":\"1000\""));
 
 		let deserialized: AssetAmount = serde_json::from_str(&json).unwrap();
-		assert_eq!(deserialized.asset, asset_amount.asset);
+		assert_eq!(deserialized.asset.to_hex(), asset_amount.asset.to_hex());
 		assert_eq!(deserialized.amount, asset_amount.amount);
 	}
 
@@ -2034,13 +2040,18 @@ mod tests {
 
 	#[test]
 	fn test_debug_implementations() {
+		let address = "0x1234567890123456789012345678901234567890"
+			.parse::<alloy_primitives::Address>()
+			.unwrap();
+		let interop_address = crate::standards::eip7930::InteropAddress::new_ethereum(1, address);
+
 		let asset_amount = AssetAmount {
-			asset: "test_asset".to_string(),
+			asset: interop_address,
 			amount: U256::from(100),
 		};
 		let debug_str = format!("{:?}", asset_amount);
 		assert!(debug_str.contains("AssetAmount"));
-		assert!(debug_str.contains("test_asset"));
+		assert!(debug_str.contains("InteropAddress"));
 
 		let lock_kind = LockKind::TheCompact;
 		let debug_str = format!("{:?}", lock_kind);
@@ -2057,8 +2068,13 @@ mod tests {
 
 	#[test]
 	fn test_clone_implementations() {
+		let address = "0x1234567890123456789012345678901234567890"
+			.parse::<alloy_primitives::Address>()
+			.unwrap();
+		let interop_address = crate::standards::eip7930::InteropAddress::new_ethereum(1, address);
+
 		let asset_amount = AssetAmount {
-			asset: "test_asset".to_string(),
+			asset: interop_address,
 			amount: U256::from(100),
 		};
 		let cloned = asset_amount.clone();
@@ -2099,8 +2115,13 @@ mod tests {
 		assert_eq!(deserialized.intent.outputs.len(), 0);
 
 		// Test zero amounts
+		let address = "0x0000000000000000000000000000000000000000"
+			.parse::<alloy_primitives::Address>()
+			.unwrap();
+		let interop_address = crate::standards::eip7930::InteropAddress::new_ethereum(1, address);
+
 		let asset_amount = AssetAmount {
-			asset: "test".to_string(),
+			asset: interop_address,
 			amount: U256::ZERO,
 		};
 
