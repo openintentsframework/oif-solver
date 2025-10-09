@@ -98,7 +98,7 @@ async fn convert_order_to_response(order: Order) -> Result<OrderResponse, GetOrd
 async fn convert_eip7683_order_to_response(
 	order: solver_types::Order,
 ) -> Result<OrderResponse, GetOrderError> {
-	// Extract input amount from EIP-7683 "inputs" field
+	// Extract input amounts from EIP-7683 "inputs" field
 	let inputs = order.data.get("inputs").ok_or_else(|| {
 		GetOrderError::Internal("Missing inputs field in EIP-7683 order data".to_string())
 	})?;
@@ -107,52 +107,62 @@ async fn convert_eip7683_order_to_response(
 		GetOrderError::Internal("Invalid inputs format - expected array".to_string())
 	})?;
 
-	// For now, take the first input (TODO: handle multiple inputs properly)
-	let first_input = inputs_array
-		.first()
-		.ok_or_else(|| GetOrderError::Internal("No inputs found in order".to_string()))?;
+	let mut input_amounts = Vec::new();
 
-	let input_array = first_input.as_array().ok_or_else(|| {
-		GetOrderError::Internal("Invalid input format - expected [token, amount] array".to_string())
-	})?;
+	for (idx, input) in inputs_array.iter().enumerate() {
+		let input_array = input.as_array().ok_or_else(|| {
+			GetOrderError::Internal(format!(
+				"Invalid input format at index {} - expected [token, amount] array",
+				idx
+			))
+		})?;
 
-	if input_array.len() != 2 {
-		return Err(GetOrderError::Internal(
-			"Invalid input format - expected [token, amount]".to_string(),
-		));
+		if input_array.len() != 2 {
+			return Err(GetOrderError::Internal(format!(
+				"Invalid input format at index {} - expected [token, amount]",
+				idx
+			)));
+		}
+
+		let input_token = input_array[0].as_str().ok_or_else(|| {
+			GetOrderError::Internal(format!("Invalid input token format at index {}", idx))
+		})?;
+
+		let input_amount_str = input_array[1].as_str().ok_or_else(|| {
+			GetOrderError::Internal(format!("Invalid input amount format at index {}", idx))
+		})?;
+
+		let input_amount_u256 =
+			input_amount_str
+				.parse::<alloy_primitives::U256>()
+				.map_err(|e| {
+					GetOrderError::Internal(format!("Invalid input amount at index {}: {}", idx, e))
+				})?;
+
+		// Get the chain ID for this input (use corresponding chain if available, otherwise first)
+		let input_chain_id = order
+			.input_chains
+			.get(idx)
+			.or_else(|| order.input_chains.first())
+			.map(|c| c.chain_id)
+			.ok_or_else(|| GetOrderError::Internal("No input chain ID found".to_string()))?;
+
+		// Convert input token to InteropAddress format
+		let address = parse_address(input_token).map_err(|e| {
+			GetOrderError::Internal(format!(
+				"Invalid input token address at index {}: {}",
+				idx, e
+			))
+		})?;
+		let interop_address: InteropAddress = (input_chain_id, address).into();
+
+		input_amounts.push(AssetAmount {
+			asset: interop_address,
+			amount: input_amount_u256,
+		});
 	}
 
-	let input_token = input_array[0]
-		.as_str()
-		.ok_or_else(|| GetOrderError::Internal("Invalid input token format".to_string()))?;
-
-	let input_amount_str = input_array[1]
-		.as_str()
-		.ok_or_else(|| GetOrderError::Internal("Invalid input amount format".to_string()))?;
-
-	let input_amount_u256 = input_amount_str
-		.parse::<alloy_primitives::U256>()
-		.map_err(|e| GetOrderError::Internal(format!("Invalid input amount: {}", e)))?;
-
-	// Get the input chain ID (use first one if multiple)
-	let input_chain_id = order
-		.input_chains
-		.first()
-		.map(|c| c.chain_id)
-		.ok_or_else(|| GetOrderError::Internal("No input chain ID found".to_string()))?;
-
-	// Convert input token to InteropAddress format
-	let address = parse_address(input_token)
-		.map_err(|e| GetOrderError::Internal(format!("Invalid input token address: {}", e)))?;
-	let interop_address: InteropAddress = (input_chain_id, address).into();
-	let input_interop_address = interop_address.to_hex();
-
-	let input_amount = AssetAmount {
-		asset: input_interop_address,
-		amount: input_amount_u256,
-	};
-
-	// Extract output amount from EIP-7683 "outputs" field
+	// Extract output amounts from EIP-7683 "outputs" field
 	let outputs = order.data.get("outputs").ok_or_else(|| {
 		GetOrderError::Internal("Missing outputs field in EIP-7683 order data".to_string())
 	})?;
@@ -161,55 +171,66 @@ async fn convert_eip7683_order_to_response(
 		GetOrderError::Internal("Invalid outputs format - expected array".to_string())
 	})?;
 
-	// For now, take the first output (TODO: handle multiple outputs properly)
-	let first_output = outputs_array
-		.first()
-		.ok_or_else(|| GetOrderError::Internal("No outputs found in order".to_string()))?;
+	let mut output_amounts = Vec::new();
 
-	let output_token_bytes = first_output
-		.get("token")
-		.ok_or_else(|| GetOrderError::Internal("Missing token field in output".to_string()))?;
-
-	// Convert token bytes array to address
-	let token_array = output_token_bytes.as_array().ok_or_else(|| {
-		GetOrderError::Internal("Invalid token format - expected bytes array".to_string())
-	})?;
-
-	// Convert bytes32 array from JSON to [u8; 32]
-	let mut token_bytes32 = [0u8; 32];
-	for (i, byte_val) in token_array.iter().take(32).enumerate() {
-		token_bytes32[i] = byte_val.as_u64().unwrap_or(0) as u8;
-	}
-	let output_token_address = with_0x_prefix(&bytes32_to_address(&token_bytes32));
-
-	let output_amount_str = first_output
-		.get("amount")
-		.and_then(|v| v.as_str())
-		.ok_or_else(|| {
-			GetOrderError::Internal("Missing or invalid amount field in output".to_string())
+	for (idx, output) in outputs_array.iter().enumerate() {
+		let output_token_bytes = output.get("token").ok_or_else(|| {
+			GetOrderError::Internal(format!("Missing token field in output at index {}", idx))
 		})?;
 
-	let output_amount_u256 = output_amount_str
-		.parse::<alloy_primitives::U256>()
-		.map_err(|e| GetOrderError::Internal(format!("Invalid output amount: {}", e)))?;
+		// Convert token bytes array to address
+		let token_array = output_token_bytes.as_array().ok_or_else(|| {
+			GetOrderError::Internal(format!(
+				"Invalid token format at index {} - expected bytes array",
+				idx
+			))
+		})?;
 
-	// Get the output chain ID (use first one if multiple)
-	let output_chain_id = order
-		.output_chains
-		.first()
-		.map(|c| c.chain_id)
-		.ok_or_else(|| GetOrderError::Internal("No output chain ID found".to_string()))?;
+		// Convert bytes32 array from JSON to [u8; 32]
+		let mut token_bytes32 = [0u8; 32];
+		for (i, byte_val) in token_array.iter().take(32).enumerate() {
+			token_bytes32[i] = byte_val.as_u64().unwrap_or(0) as u8;
+		}
+		let output_token_address = with_0x_prefix(&bytes32_to_address(&token_bytes32));
 
-	// Convert output token to InteropAddress format
-	let address = parse_address(&output_token_address)
-		.map_err(|e| GetOrderError::Internal(format!("Invalid output token address: {}", e)))?;
-	let interop_address: InteropAddress = (output_chain_id, address).into();
-	let output_interop_address = interop_address.to_hex();
+		let output_amount_str = output
+			.get("amount")
+			.and_then(|v| v.as_str())
+			.ok_or_else(|| {
+				GetOrderError::Internal(format!(
+					"Missing or invalid amount field in output at index {}",
+					idx
+				))
+			})?;
 
-	let output_amount = AssetAmount {
-		asset: output_interop_address,
-		amount: output_amount_u256,
-	};
+		let output_amount_u256 = output_amount_str
+			.parse::<alloy_primitives::U256>()
+			.map_err(|e| {
+				GetOrderError::Internal(format!("Invalid output amount at index {}: {}", idx, e))
+			})?;
+
+		// Get the chain ID for this output (use corresponding chain if available, otherwise first)
+		let output_chain_id = order
+			.output_chains
+			.get(idx)
+			.or_else(|| order.output_chains.first())
+			.map(|c| c.chain_id)
+			.ok_or_else(|| GetOrderError::Internal("No output chain ID found".to_string()))?;
+
+		// Convert output token to InteropAddress format
+		let address = parse_address(&output_token_address).map_err(|e| {
+			GetOrderError::Internal(format!(
+				"Invalid output token address at index {}: {}",
+				idx, e
+			))
+		})?;
+		let interop_address: InteropAddress = (output_chain_id, address).into();
+
+		output_amounts.push(AssetAmount {
+			asset: interop_address,
+			amount: output_amount_u256,
+		});
+	}
 
 	// For EIP-7683, we can infer settlement type (default to Escrow for now)
 	// TODO: Handle other settlement types
@@ -273,8 +294,8 @@ async fn convert_eip7683_order_to_response(
 		created_at: order.created_at,
 		updated_at: order.updated_at,
 		quote_id: order.quote_id,
-		input_amount,
-		output_amount,
+		input_amounts,
+		output_amounts,
 		settlement: Settlement {
 			settlement_type,
 			data: settlement_data,
@@ -471,20 +492,27 @@ mod tests {
 		// input - should be an interop address with chain ID 1
 		// Format: 0x01000001011234567890123456789012345678901234567890
 		// Version: 01, ChainType: 0000, ChainRefLen: 01, ChainRef: 01, AddrLen: 14, Address: 20 bytes
-		assert!(resp.input_amount.asset.starts_with("0x01000001"));
-		assert!(resp
-			.input_amount
-			.asset
-			.contains("1234567890123456789012345678901234567890"));
+		assert_eq!(resp.input_amounts.len(), 1, "Should have one input");
+		let input_hex = resp.input_amounts[0].asset.to_hex();
+		assert!(
+			input_hex.starts_with("0x01000001"),
+			"Input should have chain ID 1 encoded"
+		);
+		assert!(input_hex.contains("1234567890123456789012345678901234567890"));
 		assert_eq!(
-			resp.input_amount.amount,
+			resp.input_amounts[0].amount,
 			U256::from_str_radix("1000000000000000000", 10).unwrap()
 		);
 
 		// output - should be an interop address with chain ID 2
-		assert!(resp.output_amount.asset.starts_with("0x01000001"));
+		assert_eq!(resp.output_amounts.len(), 1, "Should have one output");
+		let output_hex = resp.output_amounts[0].asset.to_hex();
+		assert!(
+			output_hex.starts_with("0x01000001"),
+			"Output should have chain ID 2 encoded (but shows 1 due to test data)"
+		);
 		assert_eq!(
-			resp.output_amount.amount,
+			resp.output_amounts[0].amount,
 			U256::from_str_radix("2000000000000000000", 10).unwrap()
 		);
 

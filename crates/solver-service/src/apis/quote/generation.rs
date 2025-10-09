@@ -56,7 +56,7 @@ use solver_settlement::SettlementService;
 use solver_types::standards::eip7683::LockType;
 use solver_types::{
 	CostContext, FailureHandlingMode, GetQuoteRequest, OifOrder, OrderInput, OrderPayload, Quote,
-	QuoteError, QuotePreference, SignatureType, SwapType, ValidatedQuoteContext,
+	QuoteError, QuotePreference, QuotePreview, SignatureType, SwapType, ValidatedQuoteContext,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -373,13 +373,14 @@ impl QuoteGenerator {
 		let partial_fill = request.intent.partial_fill.unwrap_or(false);
 
 		Ok(Quote {
-			order,
+			order: order.clone(),
 			failure_handling,
 			partial_fill,
 			valid_until: chrono::Utc::now().timestamp() as u64 + validity_seconds,
 			eta: Some(eta),
 			quote_id,
 			provider: Some("oif-solver".to_string()),
+			preview: QuotePreview::from_order_and_user(&order, &request.user),
 		})
 	}
 
@@ -1876,6 +1877,10 @@ mod tests {
 				eta: Some(200),
 				quote_id: "quote1".to_string(),
 				provider: Some("test".to_string()),
+				preview: solver_types::QuotePreview {
+					inputs: vec![],
+					outputs: vec![],
+				},
 			},
 			Quote {
 				order: OifOrder::OifEscrowV0 {
@@ -1893,6 +1898,10 @@ mod tests {
 				eta: Some(100),
 				quote_id: "quote2".to_string(),
 				provider: Some("test".to_string()),
+				preview: solver_types::QuotePreview {
+					inputs: vec![],
+					outputs: vec![],
+				},
 			},
 			Quote {
 				order: OifOrder::OifEscrowV0 {
@@ -1910,6 +1919,10 @@ mod tests {
 				eta: None,
 				quote_id: "quote3".to_string(),
 				provider: Some("test".to_string()),
+				preview: solver_types::QuotePreview {
+					inputs: vec![],
+					outputs: vec![],
+				},
 			},
 		];
 
@@ -1945,6 +1958,10 @@ mod tests {
 				eta: Some(200),
 				quote_id: "quote1".to_string(),
 				provider: Some("test".to_string()),
+				preview: solver_types::QuotePreview {
+					inputs: vec![],
+					outputs: vec![],
+				},
 			},
 			Quote {
 				order: OifOrder::OifEscrowV0 {
@@ -1962,6 +1979,10 @@ mod tests {
 				eta: Some(100),
 				quote_id: "quote2".to_string(),
 				provider: Some("test".to_string()),
+				preview: solver_types::QuotePreview {
+					inputs: vec![],
+					outputs: vec![],
+				},
 			},
 		];
 
