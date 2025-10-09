@@ -9,7 +9,7 @@ use crate::{
 use alloy_network::EthereumWallet;
 use alloy_primitives::{Address, Bytes, FixedBytes, U256};
 use alloy_provider::{
-	fillers::{CachedNonceManager, ChainIdFiller, GasFiller, NonceFiller},
+	fillers::{ChainIdFiller, GasFiller, NonceFiller, SimpleNonceManager},
 	DynProvider, Provider, ProviderBuilder,
 };
 use alloy_rpc_client::RpcClient;
@@ -107,7 +107,7 @@ impl AlloyDelivery {
 
 			// Create provider with simple nonce management and retry capabilities
 			let provider = ProviderBuilder::new()
-				.filler(NonceFiller::new(CachedNonceManager::default()))
+				.filler(NonceFiller::new(SimpleNonceManager::default()))
 				.filler(GasFiller)
 				.filler(ChainIdFiller::default())
 				.wallet(wallet)
