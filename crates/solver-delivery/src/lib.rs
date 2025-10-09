@@ -94,6 +94,7 @@ pub struct TransactionTrackingWithConfig {
 /// integrate with the solver system. It provides methods for submitting
 /// transactions and monitoring their confirmation status.
 #[async_trait]
+#[cfg_attr(feature = "testing", mockall::automock)]
 pub trait DeliveryInterface: Send + Sync {
 	/// Returns the configuration schema for this delivery implementation.
 	///

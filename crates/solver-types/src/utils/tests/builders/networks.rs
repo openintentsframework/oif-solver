@@ -338,7 +338,6 @@ impl NetworkConfigBuilder {
 ///
 /// let networks = NetworksConfigBuilder::new()
 ///     .add_network(1, NetworkConfigBuilder::new()
-///         .add_rpc_endpoint(RpcEndpointBuilder::new().http("https://mainnet.infura.io").build())
 ///         .input_settler_address_hex("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9")
 ///         .output_settler_address_hex("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
 ///         .build())

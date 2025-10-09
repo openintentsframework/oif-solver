@@ -64,6 +64,7 @@ pub enum StrategyError {
 /// that the solver supports. It handles standard-specific validation and
 /// transaction generation logic.
 #[async_trait]
+#[cfg_attr(feature = "testing", mockall::automock)]
 pub trait OrderInterface: Send + Sync {
 	/// Returns the configuration schema for this order implementation.
 	///
@@ -142,6 +143,7 @@ pub trait OrderInterface: Send + Sync {
 /// Execution strategies determine when and how orders should be executed
 /// based on market conditions, profitability, and other factors.
 #[async_trait]
+#[cfg_attr(feature = "testing", mockall::automock)]
 pub trait ExecutionStrategy: Send + Sync {
 	/// Returns the configuration schema for this strategy implementation.
 	///
