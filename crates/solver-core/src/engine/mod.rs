@@ -585,6 +585,7 @@ mod tests {
 	use tokio::sync::Semaphore;
 
 	// Helper function to create mock services for testing
+	#[allow(clippy::type_complexity)]
 	fn create_mock_services() -> (
 		Config,
 		Arc<StorageService>,
