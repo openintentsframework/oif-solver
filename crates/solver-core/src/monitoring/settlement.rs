@@ -117,3 +117,293 @@ impl SettlementMonitor {
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use mockall::predicate::eq;
+	use solver_settlement::{
+		MockSettlementInterface, OracleConfig, OracleSelectionStrategy, SettlementService,
+	};
+	use solver_storage::{MockStorageInterface, StorageService};
+	use solver_types::{
+		utils::tests::builders::OrderBuilder, FillProof, Order, SettlementEvent, SolverEvent,
+	};
+	use std::{collections::HashMap, sync::Arc, time::Duration};
+	use tokio::sync::broadcast;
+
+	fn create_test_order() -> Order {
+		OrderBuilder::new().build()
+	}
+
+	fn create_test_tx_hash() -> TransactionHash {
+		TransactionHash(vec![0xab; 32])
+	}
+
+	fn create_test_fill_proof() -> FillProof {
+		FillProof {
+			tx_hash: create_test_tx_hash(),
+			block_number: 12345,
+			attestation_data: Some(vec![0x01, 0x02, 0x03]),
+			filled_timestamp: 1234567890,
+			oracle_address: "0x1234567890123456789012345678901234567890".to_string(),
+		}
+	}
+
+	async fn create_test_monitor_with_mocks<F1, F2>(
+		setup_settlement: F1,
+		setup_storage: F2,
+		timeout_minutes: u64,
+	) -> (SettlementMonitor, broadcast::Receiver<SolverEvent>)
+	where
+		F1: FnOnce(&mut MockSettlementInterface),
+		F2: FnOnce(&mut MockStorageInterface),
+	{
+		let mut mock_settlement = MockSettlementInterface::new();
+		let mut mock_storage = MockStorageInterface::new();
+
+		// Set up expectations using the provided closures
+		setup_settlement(&mut mock_settlement);
+		setup_storage(&mut mock_storage);
+
+		// Create services with configured mocks
+		let settlement = Arc::new(SettlementService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]),
+			20,
+		));
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let receiver = event_bus.subscribe();
+
+		let monitor = SettlementMonitor::new(settlement, state_machine, event_bus, timeout_minutes);
+
+		(monitor, receiver)
+	}
+
+	#[test]
+	fn test_new_settlement_monitor() {
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), 20));
+		let storage = Arc::new(StorageService::new(Box::new(
+			solver_storage::implementations::memory::MemoryStorage::new(),
+		)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage));
+		let event_bus = EventBus::new(100);
+		let timeout_minutes = 30;
+
+		let monitor = SettlementMonitor::new(settlement, state_machine, event_bus, timeout_minutes);
+
+		assert_eq!(monitor.timeout_minutes, 30);
+	}
+
+	#[tokio::test]
+	async fn test_monitor_claim_readiness_success() {
+		let order = create_test_order();
+		let tx_hash = create_test_tx_hash();
+
+		let (monitor, mut receiver) = create_test_monitor_with_mocks(
+			|settlement| {
+				// Add oracle config mocks
+				settlement
+					.expect_oracle_config()
+					.return_const(OracleConfig {
+						input_oracles: std::collections::HashMap::new(),
+						output_oracles: std::collections::HashMap::new(),
+						routes: std::collections::HashMap::new(),
+						selection_strategy: OracleSelectionStrategy::RoundRobin,
+					});
+
+				settlement
+					.expect_is_input_oracle_supported()
+					.return_const(true);
+
+				settlement
+					.expect_is_output_oracle_supported()
+					.return_const(true);
+
+				settlement
+					.expect_get_attestation()
+					.times(1)
+					.returning(|_, _| Box::pin(async move { Ok(create_test_fill_proof()) }));
+
+				settlement
+					.expect_can_claim()
+					.times(1)
+					.returning(|_, _| Box::pin(async move { true }));
+			},
+			|storage| {
+				// Mock exists check
+				storage
+					.expect_exists()
+					.with(eq("orders:test_order_123"))
+					.returning(|_| Box::pin(async move { Ok(true) }));
+
+				// Mock storage operations for set_fill_proof
+				storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(2) // Only called once for set_fill_proof
+					.returning({
+						let order = order.clone();
+						move |_| {
+							let order = order.clone();
+							Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+						}
+					});
+
+				storage
+					.expect_set_bytes()
+					.times(1) // Only called once for set_fill_proof
+					.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+			},
+			1,
+		)
+		.await;
+
+		// Call monitor_claim_readiness directly
+		monitor.monitor_claim_readiness(order, tx_hash).await;
+
+		// Check for the event
+		match receiver.try_recv() {
+			Ok(SolverEvent::Settlement(SettlementEvent::PreClaimReady { order_id })) => {
+				assert_eq!(order_id, "test_order_123");
+			},
+			Ok(other) => panic!("Expected PreClaimReady event, got: {:?}", other),
+			Err(e) => panic!("Expected event but got error: {:?}", e),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_monitor_claim_readiness_attestation_error() {
+		let order = create_test_order();
+		let tx_hash = create_test_tx_hash();
+
+		let (monitor, mut receiver) = create_test_monitor_with_mocks(
+			|settlement| {
+				// Add oracle config mocks
+				settlement
+					.expect_oracle_config()
+					.return_const(OracleConfig {
+						input_oracles: std::collections::HashMap::new(),
+						output_oracles: std::collections::HashMap::new(),
+						routes: std::collections::HashMap::new(),
+						selection_strategy: OracleSelectionStrategy::RoundRobin,
+					});
+
+				settlement
+					.expect_is_input_oracle_supported()
+					.return_const(true);
+
+				settlement
+					.expect_is_output_oracle_supported()
+					.return_const(true);
+
+				settlement
+					.expect_get_attestation()
+					.times(1)
+					.returning(|_, _| {
+						Box::pin(async move {
+							Err(solver_settlement::SettlementError::ValidationFailed(
+								"Test error".to_string(),
+							))
+						})
+					});
+			},
+			|_storage| {
+				// No storage expectations since we should return early on attestation error
+			},
+			1, // 1 minute timeout for faster test
+		)
+		.await;
+
+		// Start monitoring
+		monitor.monitor_claim_readiness(order, tx_hash).await;
+
+		// Should not receive any events due to early return on error
+		// Use a small timeout to verify no events are sent
+		let result = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
+		assert!(
+			result.is_err(),
+			"Should not receive any events on attestation error"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_monitor_claim_readiness_storage_error() {
+		let order = create_test_order();
+		let tx_hash = create_test_tx_hash();
+
+		let (monitor, mut receiver) = create_test_monitor_with_mocks(
+			|settlement| {
+				// Add oracle config mocks
+				settlement
+					.expect_oracle_config()
+					.return_const(OracleConfig {
+						input_oracles: std::collections::HashMap::new(),
+						output_oracles: std::collections::HashMap::new(),
+						routes: std::collections::HashMap::new(),
+						selection_strategy: OracleSelectionStrategy::RoundRobin,
+					});
+
+				settlement
+					.expect_is_input_oracle_supported()
+					.return_const(true);
+
+				settlement
+					.expect_is_output_oracle_supported()
+					.return_const(true);
+
+				settlement
+					.expect_get_attestation()
+					.times(1)
+					.returning(|_, _| Box::pin(async move { Ok(create_test_fill_proof()) }));
+			},
+			|storage| {
+				// Mock exists check
+				storage
+					.expect_exists()
+					.with(eq("orders:test_order_123"))
+					.times(1)
+					.returning(|_| Box::pin(async move { Ok(true) }));
+
+				// Mock get_bytes for retrieve operation in set_fill_proof
+				storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(1)
+					.returning({
+						let order = order.clone();
+						move |_| {
+							let order = order.clone();
+							Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+						}
+					});
+
+				// Mock set_bytes to fail (this should cause the storage error)
+				storage.expect_set_bytes().times(1).returning(|_, _, _, _| {
+					Box::pin(async move {
+						Err(solver_storage::StorageError::Serialization(
+							"Test storage error".to_string(),
+						))
+					})
+				});
+			},
+			1,
+		)
+		.await;
+
+		// Call monitor_claim_readiness directly
+		monitor.monitor_claim_readiness(order, tx_hash).await;
+
+		// Should not receive any events due to early return on storage error
+		let result = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
+		assert!(
+			result.is_err(),
+			"Should not receive any events on storage error"
+		);
+	}
+}

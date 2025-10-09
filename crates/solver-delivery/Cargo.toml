@@ -18,6 +18,7 @@ alloy-transport = { workspace = true }
 alloy-transport-http = { workspace = true }
 async-trait = "0.1"
 hex = "0.4"
+mockall = { workspace = true, optional = true }
 reqwest = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -27,3 +28,6 @@ thiserror = "2.0.17"
 tokio = { version = "1.0", features = ["rt-multi-thread"] }
 toml = { workspace = true }
 tracing = "0.1"
+
+[features]
+testing = ["mockall"]
