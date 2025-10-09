@@ -1325,6 +1325,10 @@ mod tests {
 	use std::sync::Arc;
 	use tokio;
 
+	// Test price constants for consistent mock pricing across test functions
+	const ETH_USD_PRICE: f64 = 4000.0;
+	const USDC_USD_PRICE: f64 = 1.0;
+
 	fn create_test_networks_config() -> NetworksConfig {
 		let input_token = solver_types::utils::tests::builders::TokenConfigBuilder::new()
 			.address({
@@ -1501,6 +1505,10 @@ mod tests {
 				eta: Some(60),
 				quote_id: "test_quote_123".to_string(),
 				provider: Some("test_solver".to_string()),
+				preview: solver_types::QuotePreview {
+					inputs: vec![],
+					outputs: vec![],
+				},
 			},
 			cost_context: CostContext {
 				cost_breakdown: create_test_cost_breakdown(),
@@ -1637,10 +1645,10 @@ mod tests {
 				let amount_f64: f64 = amount.parse().unwrap_or(0.0);
 				Box::pin(async move {
 					match (from.as_str(), to.as_str()) {
-						("ETH", "USD") => Ok((amount_f64 * 4000.0).to_string()),
-						("USD", "ETH") => Ok((amount_f64 / 4000.0).to_string()),
-						("USDC", "USD") => Ok(amount_f64.to_string()),
-						("USD", "USDC") => Ok(amount_f64.to_string()),
+						("ETH", "USD") => Ok((amount_f64 * ETH_USD_PRICE).to_string()),
+						("USD", "ETH") => Ok((amount_f64 / ETH_USD_PRICE).to_string()),
+						("USDC", "USD") => Ok((amount_f64 * USDC_USD_PRICE).to_string()),
+						("USD", "USDC") => Ok((amount_f64 / USDC_USD_PRICE).to_string()),
 						_ => Ok("1.0".to_string()),
 					}
 				})
@@ -1820,10 +1828,10 @@ mod tests {
 				let amount_f64: f64 = amount.parse().unwrap_or(0.0);
 				Box::pin(async move {
 					match (from.as_str(), to.as_str()) {
-						("ETH", "USD") => Ok((amount_f64 * 4000.0).to_string()),
-						("USD", "ETH") => Ok((amount_f64 / 4000.0).to_string()),
-						("USDC", "USD") => Ok(amount_f64.to_string()),
-						("USD", "USDC") => Ok(amount_f64.to_string()),
+						("ETH", "USD") => Ok((amount_f64 * ETH_USD_PRICE).to_string()),
+						("USD", "ETH") => Ok((amount_f64 / ETH_USD_PRICE).to_string()),
+						("USDC", "USD") => Ok((amount_f64 * USDC_USD_PRICE).to_string()),
+						("USD", "USDC") => Ok((amount_f64 / USDC_USD_PRICE).to_string()),
 						_ => Ok("1.0".to_string()),
 					}
 				})
@@ -2244,6 +2252,10 @@ mod tests {
 				eta: Some(60),
 				quote_id: "test_quote_exact_input".to_string(),
 				provider: Some("test_solver".to_string()),
+				preview: solver_types::QuotePreview {
+					inputs: vec![],
+					outputs: vec![],
+				},
 			},
 			cost_context: create_cost_context_with_swap_type(SwapType::ExactInput),
 		};
@@ -2303,6 +2315,10 @@ mod tests {
 				eta: Some(60),
 				quote_id: "test_quote_exact_output".to_string(),
 				provider: Some("test_solver".to_string()),
+				preview: solver_types::QuotePreview {
+					inputs: vec![],
+					outputs: vec![],
+				},
 			},
 			cost_context: create_cost_context_with_swap_type(SwapType::ExactOutput),
 		};
