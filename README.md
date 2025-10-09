@@ -14,7 +14,7 @@ A high-performance cross-chain solver implementation for the Open Intents Framew
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
 - [API Reference](#api-reference)
-- [OIF Demo CLI Tool](#oif-demo-cli-tool)
+- [Testing and Development with solver-demo](#testing-and-development-with-solver-demo)
 - [Development](#development)
 - [License](#license)
 
@@ -108,9 +108,10 @@ The solver is built as a modular Rust workspace with clearly defined service bou
 - **solver-delivery**: Handles transaction preparation, submission, and monitoring across multiple chains
 - **solver-settlement**: Manages settlement verification and claim processing after transaction execution
 
-### Binary
+### Binaries
 
-- **solver-service**: Main executable that wires up all components and runs the solver
+- **solver-service**: Main executable that wires up all components and runs the solver in production
+- **solver-demo**: CLI tool for testing and demonstrating cross-chain intent execution in development environments
 
 ## Project Structure
 
@@ -122,14 +123,16 @@ oif-solver/
 │   ├── solver-config/           # Configuration management
 │   ├── solver-core/             # Orchestration engine
 │   ├── solver-delivery/         # Transaction submission
+│   ├── solver-demo/             # Testing and demo CLI
 │   ├── solver-discovery/        # Intent monitoring
 │   ├── solver-order/            # Order processing
+│   ├── solver-pricing/          # Price and profitability calculations
 │   ├── solver-service/          # Main executable
 │   ├── solver-settlement/       # Settlement verification
 │   ├── solver-storage/          # State persistence
 │   └── solver-types/            # Shared types
 ├── config/                      # Configuration examples
-└── scripts/                     # Deployment and demo scripts
+└── scripts/                     # E2E testing and deployment scripts
 ```
 
 ## Component Responsibilities
@@ -185,6 +188,23 @@ oif-solver/
 - Provides secure signing for transactions
 - Handles address derivation
 
+### solver-pricing
+
+- Provides pricing oracle implementations for asset valuation
+- Converts between wei amounts and fiat currencies
+- Supports multiple pricing backends
+- Manages pricing configuration (commission, gas buffer, rate buffer)
+- Enables profitability calculations and cost estimation
+
+### solver-demo
+
+- Provides CLI tool for testing and demonstrating the solver
+- Manages local test environments with Anvil chains
+- Deploys and configures test contracts
+- Handles token operations (minting, approvals, balance checks)
+- Builds and submits test intents and quotes
+- Supports both on-chain and off-chain intent submission modes
+
 ## Quick Start
 
 ```bash
@@ -220,7 +240,7 @@ include = [
 
 [solver]
 id = "oif-solver-local"
-monitoring_timeout_minutes = 5
+monitoring_timeout_seconds = 300
 ```
 
 **Important**: Each top-level section must be unique across all files. Duplicate sections will cause an error.
@@ -235,8 +255,8 @@ You can also use a single configuration file. See `config/example.toml` for a co
 # Solver identity and settings
 [solver]
 id = "oif-solver-local"
-monitoring_timeout_minutes = 5
-# Minimum profitability percentage required for order execution
+monitoring_timeout_seconds = 300
+# Minimum profitability percentage required for intent execution
 min_profitability_pct = 1.0
 
 # Networks configuration - defines supported chains and tokens
@@ -311,16 +331,50 @@ primary = "simple"
 [order.strategy.implementations.simple]
 max_gas_price_gwei = 100
 
+# Pricing configuration
+[pricing]
+primary = "mock"  # Use "coingecko" for real pricing
+
+[pricing.implementations.mock]
+# Uses default ETH/USD price of 4615.16
+
+# Coingecko example
+[pricing.implementations.coingecko]
+# Free tier configuration (no API key required)
+# api_key = "CG-YOUR-API-KEY-HERE"
+cache_duration_seconds = 60
+rate_limit_delay_ms = 1200
+
 # Settlement configuration
 [settlement]
-[settlement.domain]
-chain_id = 1  # For EIP-712 signatures
-address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+settlement_poll_interval_seconds = 3
 
-[settlement.implementations.eip7683]
-network_ids = [31337, 31338]  # Monitor multiple chains for oracle verification
-oracle_addresses = { 31337 = "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9", 31338 = "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9" }
+[settlement.implementations.direct]
+order = "eip7683"
+network_ids = [31337, 31338]
 dispute_period_seconds = 1
+# Oracle selection strategy when multiple oracles are available (First, RoundRobin, Random)
+oracle_selection_strategy = "First"
+
+# Oracle configuration with multiple oracle support
+[settlement.implementations.direct.oracles]
+# Input oracles (on origin chains)
+input = { 31337 = [
+    "0xa513E6E4b8f2a923D98304ec87F64353C4D5C853",
+], 31338 = [
+    "0xa513E6E4b8f2a923D98304ec87F64353C4D5C853",
+] }
+# Output oracles (on destination chains)
+output = { 31337 = [
+    "0x2279B7A0a67DB372996a5FaB50D91eAA73d2eBe6",
+], 31338 = [
+    "0x2279B7A0a67DB372996a5FaB50D91eAA73d2eBe6",
+] }
+
+# Valid routes: from origin chain -> to destination chains
+[settlement.implementations.direct.routes]
+31337 = [31338]
+31338 = [31337]
 
 # API server (optional)
 [api]
@@ -339,6 +393,7 @@ max_request_size = 1048576  # 1MB
 - **delivery**: Handles transaction submission to multiple chains (supports per-network account mapping)
 - **discovery**: Sources for discovering new intents (on-chain events, off-chain APIs)
 - **order**: Execution strategy and protocol-specific settings
+- **pricing**: Configures pricing oracles for asset valuation and profitability calculations (supports mock and CoinGecko)
 - **settlement**: Configuration for claiming rewards and handling disputes
 - **api**: Optional REST API server for receiving off-chain intents
 
@@ -446,198 +501,208 @@ The `--log-level` flag acts as a fallback when `RUST_LOG` is not set:
 cargo run -- --config config/demo.toml --log-level info
 ```
 
-## OIF Demo CLI Tool
+## Testing and Development with solver-demo
 
-The project includes a unified CLI tool (`./oif-demo`) for testing cross-chain intent execution between two local chains. This tool provides a streamlined interface for all demo operations.
+The project includes a Rust-based CLI tool (`solver-demo`) for testing cross-chain intent execution. This tool provides comprehensive functionality for setting up test environments, managing tokens, and testing intent execution flows.
 
 **Note:** The demo has been tested on macOS systems only.
 
 ### Prerequisites
 
-- [Foundry](https://book.getfoundry.sh/getting-started/installation) (for Anvil, Forge, and Cast)
-- Rust toolchain (stable)
-- Bash version > 4.0 (for `declare -g` support)
-- Additional dependencies: `jq`, `curl`, `bc`, `perl`
+- [Foundry](https://book.getfoundry.sh/getting-started/installation) (for Anvil and deployment)
+- Rust toolchain (stable, 1.86.0+)
+- Contract compilation tools (Foundry) (for deploying test contracts)
 
 ### Quick Start
 
 ```bash
-# 1. Start local environment and generate configuration
-./oif-demo env up
+# 1. Initialize configuration and load it
+cargo run -p solver-demo -- init new config/demo.toml
+cargo run -p solver-demo -- init load config/demo.toml --local
 
-# 2. In another terminal, start the solver
+# 2. Start local environment (Anvil chains)
+cargo run -p solver-demo -- env start
+
+# 3. Deploy contracts and setup test environment
+cargo run -p solver-demo -- env deploy --all
+cargo run -p solver-demo -- env setup
+
+# 4. In another terminal, start the solver
 cargo run --bin solver -- --config config/demo.toml
 
-# 3. Test a complete quote flow (build → submit → get quote → accept)
-./oif-demo quote test escrow permit2 A2B   # Using Permit2 authorization
-# OR
-./oif-demo quote test escrow eip3009 A2B   # Using EIP-3009 authorization
-# OR for onchain submission (direct to blockchain):
-./oif-demo intent test --onchain escrow A2B  # Submit directly to InputSettler
+# 5. Build and test intents
+# Build an intent request
+cargo run -p solver-demo -- intent build 31337 31338 TokenA TokenB 100 \
+    --swap-type exact-input --settlement escrow --auth permit2
 
-# 4. Monitor balances in real-time
-./oif-demo monitor 3 all
+# Get quote and sign
+cargo run -p solver-demo -- quote get .oif-demo/requests/get_quote.req.json
+cargo run -p solver-demo -- quote sign .oif-demo/requests/get_quote.res.json
+
+# Submit the order
+cargo run -p solver-demo -- intent submit .oif-demo/requests/post_order.req.json
+
+# 6. Monitor token balances
+cargo run -p solver-demo -- token balance all
 ```
 
 ### Commands Overview
 
+#### Initialization Commands
+
+```bash
+# Create new configuration template
+cargo run -p solver-demo -- init new <config-path> --chains <chain-ids>
+
+# Load existing configuration
+cargo run -p solver-demo -- init load <config-path> [--local]
+
+# Show current configuration
+cargo run -p solver-demo -- config
+```
+
 #### Environment Management
 
 ```bash
-# Start Anvil chains, deploy contracts, generate config
-./oif-demo env up
-
-# Check chain status and connectivity
-./oif-demo env status
+# Start Anvil chains
+cargo run -p solver-demo -- env start
 
 # Stop Anvil chains
-./oif-demo env down
+cargo run -p solver-demo -- env stop
 
-# Reset all data and environment
-./oif-demo env reset
-```
 
-#### Configuration Management
+# Deploy contracts
+cargo run -p solver-demo -- env deploy --all
 
-```bash
-./oif-demo init config/demo.toml
+
+# Setup test environment (mint tokens, approvals, etc.)
+cargo run -p solver-demo -- env setup [--chain <id>] [--amount <amount>]
 ```
 
 #### Intent Operations
 
-The demo supports two submission modes:
-
-- **Offchain**: Intents are submitted to the solver API (default)
-- **Onchain**: Intents are submitted directly to the blockchain via InputSettler.open()
-
-##### Offchain Intent Submission (via Solver API)
-
 ```bash
-# Build various types of intents for offchain submission
-# Format: intent build <lock_type> <auth_type> <origin_chain> <dest_chain> <from_token> <to_token>
-./oif-demo intent build escrow permit2 31337 31338 TokenA TokenB   # Escrow with Permit2
-./oif-demo intent build escrow eip3009 31337 31338 TokenA TokenB   # Escrow with EIP-3009
-./oif-demo intent build compact permit2 31337 31338 TokenB TokenA  # Compact with Permit2 (EIP-3009 not supported)
+# Build an intent request
+# Format: intent build <from-chain> <to-chain> <from-token> <to-token> <amount>
+cargo run -p solver-demo -- intent build 31337 31338 TokenA TokenB 100 \
+    --swap-type exact-input \
+    --settlement escrow \
+    --auth permit2 \
+    [--output <path>]
 
-# Submit intent to solver API
-./oif-demo intent submit demo-output/post_intent.req.json
+# Build batch intents from JSON file
+cargo run -p solver-demo -- intent build-batch <input-file> [--output <path>]
 
-# Test command - builds and submits in one step
-# Format: intent test <lock_type> <auth_type> <token_pair>
-./oif-demo intent test escrow permit2 A2B   # Escrow lock with Permit2 auth
-./oif-demo intent test escrow eip3009 A2B   # Escrow lock with EIP-3009 auth
-./oif-demo intent test compact A2B  # Compact lock with Permit2 auth (EIP-3009 not supported)
+# Submit intent to solver API (off-chain)
+cargo run -p solver-demo -- intent submit <request-file>
+
+# Submit intent directly to blockchain (on-chain)
+cargo run -p solver-demo -- intent submit <request-file> --onchain
+
+# Check intent/order status
+cargo run -p solver-demo -- intent status <order-id>
+
+# Test batch intent submission
+cargo run -p solver-demo -- intent test <post-orders-file>
 ```
 
-##### Onchain Intent Submission (Direct to Blockchain)
+**Supported Options:**
 
-```bash
-# Build intent for onchain submission (no auth_type needed)
-# Format: intent build --onchain escrow <origin_chain> <dest_chain> <from_token> <to_token>
-./oif-demo intent build --onchain escrow 31337 31338 TokenA TokenB
-
-# Submit intent directly to blockchain
-./oif-demo intent submit --onchain demo-output/post_intent.req.json
-
-# Test command - builds and submits onchain in one step
-# Format: intent test --onchain escrow <token_pair>
-./oif-demo intent test --onchain escrow A2B   # Submit directly to InputSettler
-./oif-demo intent test --onchain escrow B2A   # TokenB → TokenA onchain
-
-# Note: Onchain submission:
-# - Only supports escrow intents (not compact/resource locks)
-# - Requires token approval before submission
-# - Submits directly to InputSettler.open() on the blockchain
-# - Does not require permit2/eip3009 signatures
-```
-
-##### Token Formats Supported
-
-```bash
-# Token formats:
-# - Symbol names: TokenA, TokenB
-# - Direct addresses: 0x5FbDB2315678afecb367f032d93F642f64180aa3
-# - Token pairs for test: A2A, A2B, B2A, B2B
-```
+- `--swap-type`: `exact-input` or `exact-output`
+- `--settlement`: `escrow` or `compact` (resource locks)
+- `--auth`: `permit2` or `eip3009` (for off-chain submission)
 
 #### Quote Operations
 
 ```bash
-# Get quote for an intent
-./oif-demo quote get demo-output/get_quote.req.json
+# Get quote from solver API
+cargo run -p solver-demo -- quote get <quote-request-file> [--output <path>]
 
-# Accept and execute a quote
-./oif-demo quote accept demo-output/get_quote.res.json
+# Sign a quote (prepares order request for submission)
+cargo run -p solver-demo -- quote sign <quote-response-file> \
+    [--quote-index <index>] \
+    [--signature <sig>] \
+    [--output <path>]
 
-# Test command - full flow: build → get quote → accept
-# Format: quote test <lock_type> <auth_type> <token_pair>
-./oif-demo quote test escrow permit2 A2B   # Full flow with escrow lock and Permit2
-./oif-demo quote test escrow eip3009 A2B   # Full flow with escrow lock and EIP-3009
-./oif-demo quote test compact A2B  # Full flow with the-compact
+# Test batch quote flow (get quotes and sign them)
+cargo run -p solver-demo -- quote test <quote-requests-file>
 ```
 
-#### Balance Monitoring
+#### Token Operations
 
 ```bash
-# Check all balances
-./oif-demo balance all
+# List tokens on all or specific chains
+cargo run -p solver-demo -- token list [--chains <chain-ids>]
 
-# Check specific balance types
-./oif-demo balance user       # User wallet balances
-./oif-demo balance recipient  # Recipient balances
-./oif-demo balance solver     # Solver balances
-./oif-demo balance settlers   # All settler contract balances
-./oif-demo balance escrow     # Escrow settler balances only
-./oif-demo balance compact    # Compact settler balances only
+# Mint tokens to an account
+cargo run -p solver-demo -- token mint <chain> <token> <amount> [--to <address>]
+
+# Approve token spending
+cargo run -p solver-demo -- token approve <chain> <token> <spender> <amount>
+
+# Check token balances
+cargo run -p solver-demo -- token balance <account> [--chains <chain-ids>]
+cargo run -p solver-demo -- token balance all  # All accounts
+cargo run -p solver-demo -- token balance user  # Just user account
 
 # Monitor balances with auto-refresh
-./oif-demo monitor 5 all      # Refresh every 5 seconds, show all
-./oif-demo monitor 3 user     # Refresh every 3 seconds, user only
-./oif-demo monitor 10 settlers # Refresh every 10 seconds, settlers only
+cargo run -p solver-demo -- token balance <account> --follow <seconds>
+```
+
+#### Account Management
+
+```bash
+# List configured accounts
+cargo run -p solver-demo -- account list
+
+# Show account details
+cargo run -p solver-demo -- account info <account-name>
 ```
 
 ### Output File Naming Conventions
 
-The demo tool generates files in the `demo-output/` directory following a clear naming convention:
+The demo tool generates files in the `.oif-demo/requests/` directory following a clear naming convention:
 
 - **`.req.json`** - Request payloads sent to the API
 - **`.res.json`** - Responses received from the API
 
-| File                   | Description                       | Generated By    |
-| ---------------------- | --------------------------------- | --------------- |
-| `post_intent.req.json` | Intent submission request payload | `intent build`  |
-| `post_intent.res.json` | Intent submission response        | `intent submit` |
-| `get_quote.req.json`   | Quote request payload             | `intent build`  |
-| `get_quote.res.json`   | Quote response with pricing       | `quote get`     |
-| `post_quote.req.json`  | Signed quote acceptance request   | `quote accept`  |
-| `post_quote.res.json`  | Quote acceptance response         | `quote accept`  |
+| File                   | Description                 | Generated By         |
+| ---------------------- | --------------------------- | -------------------- |
+| `get_quote.req.json`   | Quote request payload       | `intent build`       |
+| `get_quote.res.json`   | Quote response with pricing | `quote get`          |
+| `post_order.req.json`  | Signed order request        | `quote sign`         |
+| `get_quotes.req.json`  | Batch quote requests        | `intent build-batch` |
+| `post_orders.req.json` | Batch signed orders         | `quote test`         |
 
 ### Environment Setup Details
 
-When you run `./oif-demo env up`, the tool will:
+The demo tool provides a complete workflow for setting up a test environment:
 
-1. **Start Blockchain Networks**:
+1. **Initialize Configuration** (`init new` / `init load`):
 
-   - Origin chain (ID: 31337) on port 8545
-   - Destination chain (ID: 31338) on port 8546
+   - Creates or loads solver configuration
+   - Sets up network definitions and RPC endpoints
+   - Configures account keys and signing
+   - Stores session data in `.oif-demo/` directory
 
-2. **Deploy Smart Contracts**:
+2. **Start Blockchain Networks** (`env start`):
 
-   - Test tokens (TokenA, TokenB) on both chains
-   - Escrow settlers (InputSettler, OutputSettler)
-   - Compact settlers
-   - Oracle contracts for attestations
+   - Launches Anvil chains (default: 31337 on port 8545, 31338 on port 8546)
+   - Manages chain processes in the background
+   - Validates connectivity to each chain
 
-3. **Generate Configuration**:
+3. **Deploy Smart Contracts** (`env deploy`):
 
-   - Creates `config/demo.toml` with all contract addresses
-   - Configures network settings and token mappings
-   - Sets up account keys and signing configuration
+   - Deploys test tokens (TokenA, TokenB) on configured chains
+   - Deploys escrow settlers (InputSettler, OutputSettler)
+   - Deploys compact settlers and Permit2 contracts
+   - Updates session with deployed contract addresses
 
-4. **Initialize Test Environment**:
-   - Funds test accounts with tokens
-   - Approves token spending for settler contracts
-   - Validates all deployments and connectivity
+4. **Setup Test Environment** (`env setup`):
+   - Mints tokens to test accounts (user, solver, recipient)
+   - Approves token spending for Permit2 and settler contracts
+   - Registers allocator with TheCompact
+   - Validates all approvals and registrations
 
 ### Running the Solver
 
