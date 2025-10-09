@@ -176,14 +176,12 @@ impl QuotePreview {
 						{
 							for output in outputs_arr {
 								// Extract chain ID - can be string or number
-								let chain_id = output
-									.get("chainId")
-									.and_then(|v| {
-										v.as_str()
-											.and_then(|s| s.parse::<u64>().ok())
-											.or_else(|| v.as_u64())
-									});
-								
+								let chain_id = output.get("chainId").and_then(|v| {
+									v.as_str()
+										.and_then(|s| s.parse::<u64>().ok())
+										.or_else(|| v.as_u64())
+								});
+
 								if let (
 									Some(chain_id),
 									Some(token),
@@ -271,14 +269,12 @@ impl QuotePreview {
 						{
 							for output in outputs_arr {
 								// Extract chain ID - can be string or number
-								let chain_id = output
-									.get("chainId")
-									.and_then(|v| {
-										v.as_str()
-											.and_then(|s| s.parse::<u64>().ok())
-											.or_else(|| v.as_u64())
-									});
-								
+								let chain_id = output.get("chainId").and_then(|v| {
+									v.as_str()
+										.and_then(|s| s.parse::<u64>().ok())
+										.or_else(|| v.as_u64())
+								});
+
 								if let (
 									Some(chain_id),
 									Some(token),
