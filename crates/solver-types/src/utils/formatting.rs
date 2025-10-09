@@ -3,6 +3,8 @@
 //! Provides functions for formatting strings for display, including
 //! hex string prefix management, token amount formatting, and truncation for readability.
 
+use rust_decimal::{prelude::ToPrimitive, Decimal};
+
 /// Utility function to truncate a hex string for display purposes.
 ///
 /// Shows only the first 8 characters followed by ".." for longer strings.
@@ -97,6 +99,19 @@ pub fn format_token_amount(amount: &str, decimals: u8) -> String {
 	}
 }
 
+pub fn format_percentage(percentage: Decimal) -> String {
+	let abs_value = percentage.abs();
+
+	if abs_value >= Decimal::from(1_000_000) {
+		// Convert to f64 for scientific notation
+		let as_f64 = percentage.to_f64().unwrap_or(0.0);
+		format!("{:.2e}%", as_f64)
+	} else {
+		// Normal decimal formatting
+		format!("{:.2}%", percentage)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -168,5 +183,61 @@ mod tests {
 		// Test large amounts
 		assert_eq!(format_token_amount("102000000000000000000", 18), "102");
 		assert_eq!(format_token_amount("98000000000000000000", 18), "98");
+	}
+
+	#[test]
+	fn test_format_percentage() {
+		use rust_decimal::Decimal;
+		use std::str::FromStr;
+
+		// Small percentages (normal formatting)
+		assert_eq!(
+			format_percentage(Decimal::from_str("1.50").unwrap()),
+			"1.50%"
+		);
+		assert_eq!(
+			format_percentage(Decimal::from_str("145.00").unwrap()),
+			"145.00%"
+		);
+		assert_eq!(
+			format_percentage(Decimal::from_str("14500.00").unwrap()),
+			"14500.00%"
+		);
+		assert_eq!(
+			format_percentage(Decimal::from_str("999999.99").unwrap()),
+			"999999.99%"
+		);
+
+		// Large percentages (scientific notation)
+		assert_eq!(
+			format_percentage(Decimal::from_str("1000000.00").unwrap()),
+			"1.00e6%"
+		);
+		assert_eq!(
+			format_percentage(Decimal::from_str("1450000000").unwrap()),
+			"1.45e9%"
+		);
+		assert_eq!(
+			format_percentage(Decimal::from_str("7250000000000000000").unwrap()),
+			"7.25e18%"
+		);
+		assert_eq!(
+			format_percentage(Decimal::from_str("14500000000000000000000").unwrap()),
+			"1.45e22%"
+		);
+
+		// Edge cases
+		assert_eq!(
+			format_percentage(Decimal::from_str("0.01").unwrap()),
+			"0.01%"
+		);
+		assert_eq!(
+			format_percentage(Decimal::from_str("-145.00").unwrap()),
+			"-145.00%"
+		);
+		assert_eq!(
+			format_percentage(Decimal::from_str("-1450000000").unwrap()),
+			"-1.45e9%"
+		);
 	}
 }

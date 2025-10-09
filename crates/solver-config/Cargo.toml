@@ -10,7 +10,7 @@ regex = "1.10"
 rust_decimal = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 solver-types = { path = "../solver-types" }
-thiserror = "1.0"
+thiserror = "2.0"
 tokio = { workspace = true }
 toml = { workspace = true }
 

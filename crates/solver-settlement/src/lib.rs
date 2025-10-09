@@ -74,8 +74,8 @@ pub struct OracleConfig {
 /// This trait must be implemented by each settlement mechanism to handle
 /// validation of fills and management of the claim process for different
 /// order types. Settlements are order-agnostic and only handle oracle mechanics.
-#[cfg_attr(feature = "testing", mockall::automock)]
 #[async_trait]
+#[cfg_attr(feature = "testing", mockall::automock)]
 pub trait SettlementInterface: Send + Sync {
 	/// Get the oracle configuration for this settlement
 	fn oracle_config(&self) -> &OracleConfig;
@@ -395,19 +395,27 @@ impl SettlementService {
 	}
 
 	/// Get any settlement that supports a given chain (for quote generation).
-	/// Returns both settlement and selected oracle for consistency.
+	/// Returns settlement, input oracle, and output oracle for consistency.
 	pub fn get_any_settlement_for_chain(
 		&self,
 		chain_id: u64,
-	) -> Option<(&dyn SettlementInterface, Address)> {
+	) -> Option<(&dyn SettlementInterface, Address, Address)> {
 		// Collect all settlements that support this chain with their oracles
 		let mut available_settlements = Vec::new();
 
 		for settlement in self.implementations.values() {
-			if let Some(oracles) = settlement.oracle_config().input_oracles.get(&chain_id) {
-				if !oracles.is_empty() {
-					available_settlements.push((settlement.as_ref(), oracles.clone()));
-				}
+			let input_oracles = settlement.oracle_config().input_oracles.get(&chain_id);
+			let output_oracles = settlement.oracle_config().output_oracles.get(&chain_id);
+
+			// Need at least one type of oracle for this chain
+			if (input_oracles.is_some() && !input_oracles.unwrap().is_empty())
+				|| (output_oracles.is_some() && !output_oracles.unwrap().is_empty())
+			{
+				available_settlements.push((
+					settlement.as_ref(),
+					input_oracles.cloned(),
+					output_oracles.cloned(),
+				));
 			}
 		}
 
@@ -418,17 +426,85 @@ impl SettlementService {
 		// Get selection context for deterministic oracle selection
 		let context = self.selection_counter.fetch_add(1, Ordering::Relaxed);
 
-		// If only one settlement, use it with oracle selection
-		if available_settlements.len() == 1 {
-			let (settlement, oracles) = &available_settlements[0];
-			let selected_oracle = settlement.select_oracle(oracles, Some(context))?;
-			return Some((*settlement, selected_oracle));
+		// Use first available settlement
+		let (settlement, input_oracles, output_oracles) = &available_settlements[0];
+
+		// Select input oracle if available
+		let input_oracle = if let Some(oracles) = input_oracles {
+			if !oracles.is_empty() {
+				settlement.select_oracle(oracles, Some(context))?
+			} else {
+				Address(vec![0u8; 20]) // Default if no input oracle
+			}
+		} else {
+			Address(vec![0u8; 20]) // Default if no input oracle
+		};
+
+		// Select output oracle if available
+		let output_oracle = if let Some(oracles) = output_oracles {
+			if !oracles.is_empty() {
+				settlement.select_oracle(oracles, Some(context))?
+			} else {
+				Address(vec![0u8; 20]) // Default if no output oracle
+			}
+		} else {
+			Address(vec![0u8; 20]) // Default if no output oracle
+		};
+
+		Some((*settlement, input_oracle, output_oracle))
+	}
+
+	/// Get any settlement that supports both origin and destination chains (for cross-chain quote generation).
+	/// Returns settlement, input oracle for origin chain, and output oracle for destination chain.
+	pub fn get_any_settlement_for_chains(
+		&self,
+		origin_chain_id: u64,
+		destination_chain_id: u64,
+	) -> Option<(&dyn SettlementInterface, Address, Address)> {
+		// Collect all settlements that support both chains
+		let mut available_settlements = Vec::new();
+
+		for settlement in self.implementations.values() {
+			let input_oracles = settlement
+				.oracle_config()
+				.input_oracles
+				.get(&origin_chain_id);
+			let output_oracles = settlement
+				.oracle_config()
+				.output_oracles
+				.get(&destination_chain_id);
+
+			// Need both input oracle for origin and output oracle for destination
+			if input_oracles.is_some()
+				&& !input_oracles.unwrap().is_empty()
+				&& output_oracles.is_some()
+				&& !output_oracles.unwrap().is_empty()
+			{
+				available_settlements.push((
+					settlement.as_ref(),
+					input_oracles.cloned().unwrap(),
+					output_oracles.cloned().unwrap(),
+				));
+			}
 		}
 
-		// Multiple settlements - use first one but apply oracle selection
-		let (settlement, oracles) = &available_settlements[0];
-		let selected_oracle = settlement.select_oracle(oracles, Some(context))?;
-		Some((*settlement, selected_oracle))
+		if available_settlements.is_empty() {
+			return None;
+		}
+
+		// Get selection context for deterministic oracle selection
+		let context = self.selection_counter.fetch_add(1, Ordering::Relaxed);
+
+		// Use first available settlement
+		let (settlement, input_oracles, output_oracles) = &available_settlements[0];
+
+		// Select input oracle for origin chain
+		let input_oracle = settlement.select_oracle(input_oracles, Some(context))?;
+
+		// Select output oracle for destination chain
+		let output_oracle = settlement.select_oracle(output_oracles, Some(context + 1))?;
+
+		Some((*settlement, input_oracle, output_oracle))
 	}
 
 	/// Gets attestation for a filled order using the appropriate settlement implementation.

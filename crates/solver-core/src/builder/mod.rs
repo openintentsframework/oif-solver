@@ -82,7 +82,7 @@ impl SolverBuilder {
 		) -> Result<Box<dyn OrderInterface>, OrderError>,
 		PF: Fn(
 			&toml::Value,
-		) -> Result<Box<dyn solver_types::PricingInterface>, solver_types::PricingError>,
+		) -> Result<Box<dyn solver_pricing::PricingInterface>, solver_types::PricingError>,
 		SEF: Fn(
 			&toml::Value,
 			&solver_types::NetworksConfig,
@@ -284,7 +284,7 @@ impl SolverBuilder {
 		let delivery = Arc::new(DeliveryService::new(
 			delivery_implementations,
 			self.config.delivery.min_confirmations,
-			self.config.delivery.transaction_poll_interval_seconds,
+			self.config.solver.monitoring_timeout_seconds,
 		));
 
 		// Create discovery implementations

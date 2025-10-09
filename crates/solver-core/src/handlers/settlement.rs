@@ -8,7 +8,7 @@ use crate::engine::event_bus::EventBus;
 use crate::monitoring::SettlementMonitor;
 use crate::state::OrderStateMachine;
 use alloy_primitives::hex;
-use solver_delivery::DeliveryService;
+use solver_delivery::{DeliveryService, TransactionMonitoringEvent, TransactionTracking};
 use solver_order::OrderService;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
@@ -124,9 +124,50 @@ impl SettlementHandler {
 
 		match post_fill_tx {
 			Some(post_fill_tx) => {
+				// Create callback for monitoring
+				let event_bus = self.event_bus.clone();
+				let callback = Box::new(move |event: TransactionMonitoringEvent| match event {
+					TransactionMonitoringEvent::Confirmed {
+						id,
+						tx_hash,
+						tx_type,
+						receipt,
+					} => {
+						event_bus
+							.publish(SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
+								order_id: id,
+								tx_hash,
+								tx_type,
+								receipt,
+							}))
+							.ok();
+					},
+					TransactionMonitoringEvent::Failed {
+						id,
+						tx_hash,
+						tx_type,
+						error,
+					} => {
+						event_bus
+							.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+								order_id: id,
+								tx_hash,
+								tx_type,
+								error,
+							}))
+							.ok();
+					},
+				});
+
+				let tracking = TransactionTracking {
+					id: order_id.clone(),
+					tx_type: TransactionType::PostFill,
+					callback,
+				};
+
 				let tx_hash = self
 					.delivery
-					.deliver(post_fill_tx.clone())
+					.deliver(post_fill_tx.clone(), Some(tracking))
 					.await
 					.map_err(|e| SettlementError::Service(e.to_string()))?;
 
@@ -213,9 +254,50 @@ impl SettlementHandler {
 
 		match pre_claim_tx {
 			Some(pre_claim_tx) => {
+				// Create callback for monitoring
+				let event_bus = self.event_bus.clone();
+				let callback = Box::new(move |event: TransactionMonitoringEvent| match event {
+					TransactionMonitoringEvent::Confirmed {
+						id,
+						tx_hash,
+						tx_type,
+						receipt,
+					} => {
+						event_bus
+							.publish(SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
+								order_id: id,
+								tx_hash,
+								tx_type,
+								receipt,
+							}))
+							.ok();
+					},
+					TransactionMonitoringEvent::Failed {
+						id,
+						tx_hash,
+						tx_type,
+						error,
+					} => {
+						event_bus
+							.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+								order_id: id,
+								tx_hash,
+								tx_type,
+								error,
+							}))
+							.ok();
+					},
+				});
+
+				let tracking = TransactionTracking {
+					id: order_id.clone(),
+					tx_type: TransactionType::PreClaim,
+					callback,
+				};
+
 				let tx_hash = self
 					.delivery
-					.deliver(pre_claim_tx.clone())
+					.deliver(pre_claim_tx.clone(), Some(tracking))
 					.await
 					.map_err(|e| SettlementError::Service(e.to_string()))?;
 
@@ -290,10 +372,50 @@ impl SettlementHandler {
 				.await
 				.map_err(|e| SettlementError::Service(e.to_string()))?;
 
-			// Submit claim transaction through delivery service
+			// Submit claim transaction through delivery service with monitoring
+			let event_bus = self.event_bus.clone();
+			let callback = Box::new(move |event: TransactionMonitoringEvent| match event {
+				TransactionMonitoringEvent::Confirmed {
+					id,
+					tx_hash,
+					tx_type,
+					receipt,
+				} => {
+					event_bus
+						.publish(SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
+							order_id: id,
+							tx_hash,
+							tx_type,
+							receipt,
+						}))
+						.ok();
+				},
+				TransactionMonitoringEvent::Failed {
+					id,
+					tx_hash,
+					tx_type,
+					error,
+				} => {
+					event_bus
+						.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+							order_id: id,
+							tx_hash,
+							tx_type,
+							error,
+						}))
+						.ok();
+				},
+			});
+
+			let tracking = TransactionTracking {
+				id: order.id.clone(),
+				tx_type: TransactionType::Claim,
+				callback,
+			};
+
 			let claim_tx_hash = self
 				.delivery
-				.deliver(claim_tx.clone())
+				.deliver(claim_tx.clone(), Some(tracking))
 				.await
 				.map_err(|e| SettlementError::Service(e.to_string()))?;
 
@@ -324,5 +446,356 @@ impl SettlementHandler {
 				.map_err(|e| SettlementError::Storage(e.to_string()))?;
 		}
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use mockall::predicate::*;
+	use solver_delivery::{DeliveryService, MockDeliveryInterface};
+	use solver_order::{MockOrderInterface, OrderService};
+	use solver_settlement::{MockSettlementInterface, SettlementService};
+	use solver_storage::{MockStorageInterface, StorageError, StorageService};
+	use solver_types::utils::tests::builders::{
+		OrderBuilder, TransactionBuilder, TransactionReceiptBuilder,
+	};
+	use solver_types::{Address, Order, Transaction, TransactionHash, TransactionReceipt};
+	use std::collections::HashMap;
+	use std::sync::Arc;
+	use tokio::sync::broadcast;
+
+	fn create_test_order() -> Order {
+		OrderBuilder::new().build()
+	}
+
+	fn create_test_receipt() -> TransactionReceipt {
+		TransactionReceiptBuilder::new().build()
+	}
+
+	fn create_test_transaction() -> Transaction {
+		TransactionBuilder::new()
+			.chain_id(137)
+			.gas_limit(21000)
+			.gas_price_gwei(20)
+			.build()
+	}
+
+	fn default_order_oracle_address() -> Address {
+		solver_types::utils::parse_address("0x1234567890123456789012345678901234567890")
+			.expect("Valid oracle address")
+	}
+
+	async fn create_test_handler_with_mocks<F1, F2, F3, F4>(
+		setup_storage: F1,
+		setup_settlement: F2,
+		setup_delivery: F3,
+		setup_order: F4,
+	) -> (SettlementHandler, broadcast::Receiver<SolverEvent>)
+	where
+		F1: FnOnce(&mut MockStorageInterface),
+		F2: FnOnce(&mut MockSettlementInterface),
+		F3: FnOnce(&mut MockDeliveryInterface),
+		F4: FnOnce(&mut MockOrderInterface),
+	{
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_settlement = MockSettlementInterface::new();
+		let mut mock_delivery = MockDeliveryInterface::new();
+		let mut mock_order = MockOrderInterface::new();
+
+		// Set up expectations using the provided closures
+		setup_storage(&mut mock_storage);
+		setup_settlement(&mut mock_settlement);
+		setup_delivery(&mut mock_delivery);
+		setup_order(&mut mock_order);
+
+		// Create services with configured mocks
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let settlement = Arc::new(SettlementService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]),
+			20,
+		));
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				137u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			20,
+		));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(solver_order::MockExecutionStrategy::new()),
+		));
+
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let event_rx = event_bus.subscribe(); // Get receiver from event bus
+
+		let handler = SettlementHandler::new(
+			settlement,
+			order_service,
+			delivery,
+			storage,
+			state_machine,
+			event_bus,
+			30,
+		);
+
+		(handler, event_rx)
+	}
+
+	#[tokio::test]
+	async fn test_handle_post_fill_ready_storage_error() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage.expect_get_bytes().returning(|_| {
+					Box::pin(
+						async move { Err(StorageError::NotFound("test_order_123".to_string())) },
+					)
+				});
+			},
+			|_| {}, // No settlement expectations
+			|_| {}, // No delivery expectations
+			|_| {}, // No order expectations
+		)
+		.await;
+
+		let result = handler
+			.handle_post_fill_ready("test_order_123".to_string())
+			.await;
+		assert!(result.is_err());
+		assert!(matches!(result.unwrap_err(), SettlementError::Storage(_)));
+	}
+
+	#[tokio::test]
+	async fn test_handle_pre_claim_ready_missing_fill_proof() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage.expect_get_bytes().returning(|_| {
+					Box::pin(
+						async move { Err(StorageError::NotFound("test_order_123".to_string())) },
+					)
+				});
+			},
+			|_| {},
+			|_| {},
+			|_| {},
+		)
+		.await;
+
+		let result = handler
+			.handle_pre_claim_ready("test_order_123".to_string())
+			.await;
+		assert!(result.is_err());
+		assert!(matches!(result.unwrap_err(), SettlementError::Storage(_)));
+	}
+
+	#[tokio::test]
+	async fn test_process_claim_batch_storage_error() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:nonexistent_order"))
+					.times(1)
+					.returning(|_| {
+						Box::pin(async move {
+							Err(StorageError::NotFound("nonexistent_order".to_string()))
+						})
+					});
+			},
+			|_| {}, // No settlement expectations
+			|_| {}, // No delivery expectations
+			|_| {}, // No order expectations
+		)
+		.await;
+
+		let mut batch = vec!["nonexistent_order".to_string()];
+		let result = handler.process_claim_batch(&mut batch).await;
+		assert!(result.is_err());
+		assert!(matches!(result.unwrap_err(), SettlementError::Storage(_)));
+	}
+
+	#[tokio::test]
+	async fn test_handle_post_fill_ready_with_transaction() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				// Mock order retrieval - called twice: once by handler, once by settlement service
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(2) // Called twice: initial retrieval + settlement service oracle lookup
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_standard("eip7683")
+							.with_fill_tx_hash(Some(TransactionHash(vec![0x11; 32])))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+				// Mock exists check for update operation
+				mock_storage
+					.expect_exists()
+					.with(eq("orders:test_order_123"))
+					.times(1)
+					.returning(|_| Box::pin(async move { Ok(true) }));
+				// Mock storage for transaction hash mapping
+				mock_storage
+					.expect_set_bytes()
+					.times(2)
+					.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+			},
+			|mock_settlement| {
+				// Add expectation for is_input_oracle_supported
+				mock_settlement
+					.expect_is_input_oracle_supported()
+					.with(eq(1u64), eq(default_order_oracle_address()))
+					.times(1)
+					.returning(|_, _| true);
+
+				// Mock settlement service methods
+				mock_settlement
+					.expect_generate_post_fill_transaction()
+					.times(1)
+					.returning(|_, _| {
+						let tx = create_test_transaction();
+						Box::pin(async move { Ok(Some(tx)) })
+					});
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_receipt()
+					.with(eq(TransactionHash(vec![0x11; 32])), eq(137u64))
+					.times(1)
+					.returning(|_, _| {
+						let receipt = create_test_receipt();
+						Box::pin(async move { Ok(receipt) })
+					});
+				mock_delivery.expect_submit().times(1).returning(|_, _| {
+					let hash = TransactionHash(vec![0x33; 32]);
+					Box::pin(async move { Ok(hash) })
+				});
+			},
+			|_| {}, // No order expectations
+		)
+		.await;
+
+		let result = handler
+			.handle_post_fill_ready("test_order_123".to_string())
+			.await;
+
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_handle_post_fill_ready_no_transaction_needed() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				// Called twice: initial retrieval + when no PostFill needed
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(2)
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_standard("eip7683")
+							.with_fill_tx_hash(Some(TransactionHash(vec![0x11; 32])))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+			},
+			|mock_settlement| {
+				// Add expectation for is_input_oracle_supported with the correct oracle address
+				mock_settlement
+					.expect_is_input_oracle_supported()
+					.with(eq(1u64), eq(default_order_oracle_address()))
+					.times(1)
+					.returning(|_, _| true);
+
+				mock_settlement
+					.expect_generate_post_fill_transaction()
+					.times(1)
+					// Return None to indicate no transaction needed
+					.returning(|_, _| Box::pin(async move { Ok(None) }));
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_receipt()
+					.with(eq(TransactionHash(vec![0x11; 32])), eq(137u64))
+					.times(1)
+					.returning(|_, _| {
+						let receipt = create_test_receipt();
+						Box::pin(async move { Ok(receipt) })
+					});
+			},
+			|_| {}, // No order expectations
+		)
+		.await;
+
+		let result = handler
+			.handle_post_fill_ready("test_order_123".to_string())
+			.await;
+
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_handle_post_fill_ready_missing_fill_tx_hash() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(1)
+					.returning(|_| {
+						let mut order = create_test_order();
+						order.fill_tx_hash = None; // Missing fill tx hash
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+			},
+			|_| {},
+			|_| {},
+			|_| {}, // No other expectations needed
+		)
+		.await;
+
+		let result = handler
+			.handle_post_fill_ready("test_order_123".to_string())
+			.await;
+		assert!(result.is_err());
+		assert!(matches!(result.unwrap_err(), SettlementError::Service(_)));
+	}
+
+	#[tokio::test]
+	async fn test_handle_post_fill_ready_no_output_chains() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(1)
+					.returning(|_| {
+						let mut order = create_test_order();
+						order.output_chains = vec![]; // No output chains
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+			},
+			|_| {},
+			|_| {},
+			|_| {}, // No other expectations needed
+		)
+		.await;
+
+		let result = handler
+			.handle_post_fill_ready("test_order_123".to_string())
+			.await;
+		assert!(result.is_err());
+		assert!(matches!(result.unwrap_err(), SettlementError::Service(_)));
 	}
 }

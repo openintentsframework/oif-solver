@@ -14,6 +14,7 @@ use self::{cost_profit::CostProfitService, token_manager::TokenManager};
 use crate::handlers::{IntentHandler, OrderHandler, SettlementHandler, TransactionHandler};
 use crate::recovery::RecoveryService;
 use crate::state::OrderStateMachine;
+use alloy_primitives::hex;
 use solver_account::AccountService;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
@@ -23,13 +24,15 @@ use solver_pricing::PricingService;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
 use solver_types::{
-	Address, DeliveryEvent, Intent, Order, OrderEvent, SettlementEvent, SolverEvent, StorageKey,
+	truncate_id, Address, DeliveryEvent, Intent, Order, OrderEvent, SettlementEvent, SolverEvent,
+	StorageKey,
 };
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{mpsc, Semaphore};
+use tracing::instrument;
 
 /// Errors that can occur during engine operations.
 ///
@@ -135,6 +138,7 @@ impl SolverEngine {
 			pricing.clone(),
 			delivery.clone(),
 			token_manager.clone(),
+			storage.clone(),
 		));
 
 		let intent_handler = Arc::new(IntentHandler::new(
@@ -158,12 +162,10 @@ impl SolverEngine {
 		));
 
 		let transaction_handler = Arc::new(TransactionHandler::new(
-			delivery.clone(),
 			storage.clone(),
 			state_machine.clone(),
 			settlement.clone(),
 			event_bus.clone(),
-			config.solver.monitoring_timeout_minutes,
 		));
 
 		let settlement_handler = Arc::new(SettlementHandler::new(
@@ -173,7 +175,7 @@ impl SolverEngine {
 			storage.clone(),
 			state_machine.clone(),
 			event_bus.clone(),
-			config.solver.monitoring_timeout_minutes,
+			config.solver.monitoring_timeout_seconds / 60, // Convert seconds to minutes
 		));
 
 		Self {
@@ -259,6 +261,7 @@ impl SolverEngine {
 	///
 	/// Returns `Ok(())` when the engine shuts down gracefully, or an error
 	/// if a critical failure occurs that prevents continued operation.
+	#[instrument(skip_all)]
 	pub async fn run(&self) -> Result<(), EngineError> {
 		// Subscribe to events before recovery so we don't miss recovery events
 		let mut event_receiver = self.event_bus.subscribe();
@@ -352,16 +355,22 @@ impl SolverEngine {
 							.await;
 						}
 
-						SolverEvent::Delivery(DeliveryEvent::TransactionPending { order_id, tx_hash, tx_type, tx_chain_id }) => {
-							// Monitoring doesn't send transactions - use general semaphore
-							self.spawn_handler(&general_semaphore, move |engine| async move {
-								engine.transaction_handler.monitor_transaction(order_id, tx_hash, tx_type, tx_chain_id).await;
-								Ok(())
-							})
-							.await;
+						SolverEvent::Delivery(DeliveryEvent::TransactionPending { order_id, tx_hash, tx_type, tx_chain_id: _ }) => {
+							tracing::info!(
+								order_id = %truncate_id(&order_id),
+								tx_hash = %truncate_id(&hex::encode(&tx_hash.0)),
+								tx_type = ?tx_type,
+								"Submitted transaction"
+							);
 						}
 
 						SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed { order_id, tx_hash, tx_type, receipt }) => {
+							tracing::info!(
+								order_id = %truncate_id(&order_id),
+								tx_hash = %truncate_id(&hex::encode(&tx_hash.0)),
+								tx_type = ?tx_type,
+								"Confirmed"
+							);
 							// Confirmation handling doesn't directly send transactions - use general semaphore
 							// Note: This may trigger OrderEvent::Executing which will be serialized separately
 							self.spawn_handler(&general_semaphore, move |engine| async move {
@@ -374,6 +383,13 @@ impl SolverEngine {
 						}
 
 						SolverEvent::Delivery(DeliveryEvent::TransactionFailed { order_id, tx_hash, tx_type, error }) => {
+							tracing::error!(
+								order_id = %truncate_id(&order_id),
+								tx_hash = %truncate_id(&hex::encode(&tx_hash.0)),
+								tx_type = ?tx_type,
+								error = %error,
+								"Transaction failed"
+							);
 							// Failure handling doesn't send transactions - use general semaphore
 							self.spawn_handler(&general_semaphore, move |engine| async move {
 								if let Err(e) = engine.transaction_handler.handle_failed(order_id, tx_hash, tx_type, error).await {
@@ -550,5 +566,343 @@ impl SolverEngine {
 				tracing::error!("Failed to acquire semaphore permit: {}", e);
 			},
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::engine::event_bus::EventBus;
+	use solver_account::AccountService;
+	use solver_config::Config;
+	use solver_delivery::DeliveryService;
+	use solver_discovery::DiscoveryService;
+	use solver_order::OrderService;
+	use solver_settlement::SettlementService;
+	use solver_storage::StorageService;
+	use solver_types::Address;
+	use std::sync::Arc;
+	use tokio::sync::Semaphore;
+
+	// Helper function to create mock services for testing
+	fn create_mock_services() -> (
+		Config,
+		Arc<StorageService>,
+		Arc<AccountService>,
+		Address,
+		Arc<DeliveryService>,
+		Arc<DiscoveryService>,
+		Arc<OrderService>,
+		Arc<SettlementService>,
+		Arc<PricingService>,
+		EventBus,
+		Arc<TokenManager>,
+	) {
+		// Create minimal config for testing
+		let config_toml = r#"
+			[solver]
+			id = "test-solver"
+			monitoring_timeout_seconds = 30
+			min_profitability_pct = 1.0
+			
+			[storage]
+			primary = "memory"
+			cleanup_interval_seconds = 3600
+			[storage.implementations.memory]
+			
+			[delivery]
+			min_confirmations = 1
+			[delivery.implementations]
+			
+			[account]
+			primary = "local"
+			[account.implementations.local]
+			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
+			
+			[discovery]
+			[discovery.implementations]
+			
+			[order]
+			[order.implementations]
+			[order.strategy]
+			primary = "simple"
+			[order.strategy.implementations.simple]
+			
+			[settlement]
+			[settlement.implementations]
+			
+			[networks.1]
+			chain_id = 1
+			input_settler_address = "0x1111111111111111111111111111111111111111"
+			output_settler_address = "0x2222222222222222222222222222222222222222"
+			[[networks.1.rpc_urls]]
+			http = "http://localhost:8545"
+			[[networks.1.tokens]]
+			symbol = "TEST"
+			address = "0x3333333333333333333333333333333333333333"
+			decimals = 18
+			
+			[networks.2]
+			chain_id = 2
+			input_settler_address = "0x4444444444444444444444444444444444444444"
+			output_settler_address = "0x5555555555555555555555555555555555555555"
+			[[networks.2.rpc_urls]]
+			http = "http://localhost:8546"
+			[[networks.2.tokens]]
+			symbol = "TEST2"
+			address = "0x6666666666666666666666666666666666666666"
+			decimals = 18
+		"#;
+		let config: Config = toml::from_str(config_toml).expect("Failed to parse test config");
+
+		// Create mock services using proper constructors
+		let storage = Arc::new(StorageService::new(Box::new(
+			solver_storage::implementations::memory::MemoryStorage::new(),
+		)));
+
+		// Create account service with local wallet
+		let account_config = toml::from_str(
+			r#"private_key = "0x1234567890123456789012345678901234567890123456789012345678901234""#,
+		)
+		.expect("Failed to parse account config");
+		let account = Arc::new(AccountService::new(
+			solver_account::implementations::local::create_account(&account_config)
+				.expect("Failed to create account"),
+		));
+
+		// Create address from bytes
+		let solver_address = Address(vec![1u8; 20]);
+
+		// Create delivery service - using empty implementations map for testing
+		let delivery = Arc::new(DeliveryService::new(
+			std::collections::HashMap::new(),
+			1,
+			20,
+		));
+
+		// Create discovery service - using empty implementations map for testing
+		let discovery = Arc::new(DiscoveryService::new(std::collections::HashMap::new()));
+
+		// Create order service - needs implementations and strategy
+		let strategy_config = toml::Value::Table(toml::value::Table::new());
+		let strategy =
+			solver_order::implementations::strategies::simple::create_strategy(&strategy_config)
+				.expect("Failed to create strategy");
+		let order = Arc::new(OrderService::new(
+			std::collections::HashMap::new(),
+			strategy,
+		));
+
+		// Create settlement service - using empty implementations map for testing
+		let settlement = Arc::new(SettlementService::new(std::collections::HashMap::new(), 20));
+
+		// Create pricing service with mock implementation
+		let pricing_config = toml::Value::Table(toml::value::Table::new());
+		let pricing_impl =
+			solver_pricing::implementations::mock::create_mock_pricing(&pricing_config)
+				.expect("Failed to create mock pricing");
+		let pricing = Arc::new(solver_pricing::PricingService::new(pricing_impl));
+
+		let event_bus = EventBus::new(100);
+
+		// Create token manager with empty networks config
+		let networks = std::collections::HashMap::new();
+		let token_manager = Arc::new(TokenManager::new(
+			networks,
+			delivery.clone(),
+			account.clone(),
+		));
+
+		(
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+		)
+	}
+
+	#[test]
+	fn test_solver_engine_new() {
+		let (
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+		) = create_mock_services();
+
+		let engine = SolverEngine::new(
+			config.clone(),
+			storage.clone(),
+			account.clone(),
+			solver_address,
+			delivery.clone(),
+			discovery.clone(),
+			order.clone(),
+			settlement.clone(),
+			pricing.clone(),
+			event_bus.clone(),
+			token_manager.clone(),
+		);
+
+		// Verify the engine was constructed properly by testing its accessors
+		assert_eq!(
+			engine.config().solver.monitoring_timeout_seconds,
+			config.solver.monitoring_timeout_seconds
+		);
+		assert!(Arc::ptr_eq(engine.storage(), &storage));
+		assert!(Arc::ptr_eq(engine.token_manager(), &token_manager));
+		assert!(Arc::ptr_eq(engine.settlement(), &settlement));
+		assert!(Arc::ptr_eq(engine.discovery(), &discovery));
+
+		// Verify event bus is accessible
+		let _event_bus_ref = engine.event_bus();
+	}
+
+	#[tokio::test]
+	async fn test_initialize_with_recovery_success() {
+		let (
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+		) = create_mock_services();
+
+		let engine = SolverEngine::new(
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+		);
+
+		// This test assumes the RecoveryService will return empty results for memory storage
+		let result = engine.initialize_with_recovery().await;
+		assert!(result.is_ok());
+		let orphaned_intents = result.unwrap();
+		assert!(orphaned_intents.is_empty()); // Memory storage should have no existing state
+	}
+
+	#[tokio::test]
+	async fn test_initialize_with_recovery_handles_errors_gracefully() {
+		let (
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+		) = create_mock_services();
+
+		let engine = SolverEngine::new(
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+		);
+
+		// Even if recovery fails internally, the method should return Ok with empty Vec
+		// as per the implementation's error handling strategy
+		let result = engine.initialize_with_recovery().await;
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_spawn_handler_with_handler_error() {
+		let (
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+		) = create_mock_services();
+
+		let engine = SolverEngine::new(
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+		);
+
+		let semaphore = Arc::new(Semaphore::new(1));
+
+		// Test handler that returns an error - should be logged but not panic
+		engine
+			.spawn_handler(&semaphore, move |_engine| async move {
+				Err(EngineError::Service("Test error".to_string()))
+			})
+			.await;
+	}
+
+	#[test]
+	fn test_engine_error_display() {
+		let config_error = EngineError::Config("test config error".to_string());
+		assert_eq!(
+			config_error.to_string(),
+			"Configuration error: test config error"
+		);
+
+		let service_error = EngineError::Service("test service error".to_string());
+		assert_eq!(
+			service_error.to_string(),
+			"Service error: test service error"
+		);
+
+		let handler_error = EngineError::Handler("test handler error".to_string());
+		assert_eq!(
+			handler_error.to_string(),
+			"Handler error: test handler error"
+		);
 	}
 }

@@ -253,3 +253,408 @@ impl ContextBuilder {
 			.collect()
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use mockall::predicate::*;
+	use serde_json::json;
+	use solver_account::MockAccountInterface;
+	use solver_delivery::MockDeliveryInterface;
+	use solver_types::{
+		networks::RpcEndpoint,
+		utils::tests::builders::{
+			IntentBuilder, NetworkConfigBuilder, NetworksConfigBuilder, TokenConfigBuilder,
+		},
+		Address, Intent, NetworksConfig,
+	};
+	use std::collections::HashMap;
+
+	fn create_test_intent(standard: &str, data: serde_json::Value) -> Intent {
+		IntentBuilder::new()
+			.with_standard(standard)
+			.with_data(data)
+			.build()
+	}
+
+	fn create_mock_delivery_service() -> Arc<DeliveryService> {
+		let mut mock_delivery = MockDeliveryInterface::new();
+
+		// Mock get_chain_data calls
+		mock_delivery
+			.expect_get_gas_price()
+			.returning(|_| Box::pin(async { Ok("20000000000".to_string()) }));
+		mock_delivery
+			.expect_get_block_number()
+			.returning(|_| Box::pin(async { Ok(12345678) }));
+
+		// Mock get_balance calls
+		mock_delivery
+			.expect_get_balance()
+			.returning(|_, _, _| Box::pin(async { Ok("1000000000000000000".to_string()) }));
+
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations = HashMap::new();
+		implementations.insert(
+			1,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+
+		Arc::new(DeliveryService::new(implementations, 1, 20))
+	}
+
+	fn create_mock_account_service() -> Arc<solver_account::AccountService> {
+		let mut mock_account = MockAccountInterface::new();
+
+		mock_account
+			.expect_address()
+			.returning(|| Box::pin(async { Ok(Address([0xAB; 20].to_vec())) }));
+		mock_account
+			.expect_get_private_key()
+			.returning(|| solver_types::SecretString::from("0x1234567890abcdef"));
+		mock_account
+			.expect_config_schema()
+			.returning(|| Box::new(solver_account::implementations::local::LocalWalletSchema));
+
+		Arc::new(solver_account::AccountService::new(Box::new(mock_account)))
+	}
+
+	fn create_test_networks_config() -> NetworksConfig {
+		// Create tokens using builders for consistency
+		let usdc_token = TokenConfigBuilder::new()
+			.address(Address([0xA0; 20].to_vec()))
+			.symbol("USDC")
+			.decimals(6)
+			.build();
+
+		let weth_token = TokenConfigBuilder::new()
+			.address(Address([0xC0; 20].to_vec()))
+			.symbol("WETH")
+			.decimals(18)
+			.build();
+
+		// Use NetworkConfigBuilder but replace tokens completely using .tokens()
+		// Note: This will extend the default tokens, so we need to account for that
+		let mut network_config = NetworkConfigBuilder::new()
+			.rpc_endpoints(vec![RpcEndpoint::http_only(
+				"http://localhost:8545".to_string(),
+			)])
+			.input_settler_address(Address([0x11; 20].to_vec()))
+			.output_settler_address(Address([0x22; 20].to_vec()))
+			.build();
+
+		// Manually set the tokens to exactly what we want (overriding defaults)
+		network_config.tokens = vec![usdc_token, weth_token];
+
+		NetworksConfigBuilder::new()
+			.add_network(1, network_config)
+			.build()
+	}
+
+	fn create_context_builder() -> ContextBuilder {
+		let delivery = create_mock_delivery_service();
+		let account = create_mock_account_service();
+		let networks = create_test_networks_config();
+		let token_manager = Arc::new(TokenManager::new(networks, delivery.clone(), account));
+
+		ContextBuilder::new(
+			delivery,
+			Address([0xAB; 20].to_vec()),
+			token_manager,
+			solver_config::ConfigBuilder::default().build(),
+		)
+	}
+
+	#[test]
+	fn test_extract_eip7683_chains_with_numeric_chain_ids() {
+		let context_builder = create_context_builder();
+		let intent_data = json!({
+			"origin_chain_id": 1,
+			"outputs": [
+				{"chain_id": 137, "amount": "1000000"},
+				{"chain_id": 42161, "amount": "2000000"}
+			]
+		});
+
+		let result = context_builder.extract_eip7683_chains(&intent_data);
+		assert!(result.is_ok());
+
+		let chains = result.unwrap();
+		assert_eq!(chains.len(), 3);
+		assert!(chains.contains(&1));
+		assert!(chains.contains(&137));
+		assert!(chains.contains(&42161));
+	}
+
+	#[test]
+	fn test_extract_eip7683_chains_with_string_chain_ids() {
+		let context_builder = create_context_builder();
+		let intent_data = json!({
+			"origin_chain_id": "1",
+			"outputs": [
+				{"chain_id": "137", "amount": "1000000"},
+				{"chain_id": "42161", "amount": "2000000"}
+			]
+		});
+
+		let result = context_builder.extract_eip7683_chains(&intent_data);
+		assert!(result.is_ok());
+
+		let chains = result.unwrap();
+		assert_eq!(chains.len(), 3);
+		assert!(chains.contains(&1));
+		assert!(chains.contains(&137));
+		assert!(chains.contains(&42161));
+	}
+
+	#[test]
+	fn test_extract_eip7683_chains_with_hex_chain_ids() {
+		let context_builder = create_context_builder();
+		let intent_data = json!({
+			"origin_chain_id": "0x1",
+			"outputs": [
+				{"chain_id": "0x89", "amount": "1000000"}, // 137 in hex
+				{"chain_id": "0xa4b1", "amount": "2000000"} // 42161 in hex
+			]
+		});
+
+		let result = context_builder.extract_eip7683_chains(&intent_data);
+		assert!(result.is_ok());
+
+		let chains = result.unwrap();
+		assert_eq!(chains.len(), 3);
+		assert!(chains.contains(&1));
+		assert!(chains.contains(&137));
+		assert!(chains.contains(&42161));
+	}
+
+	#[test]
+	fn test_extract_eip7683_chains_removes_duplicates() {
+		let context_builder = create_context_builder();
+		let intent_data = json!({
+			"origin_chain_id": "1",
+			"outputs": [
+				{"chain_id": "1", "amount": "1000000"},
+				{"chain_id": "1", "amount": "2000000"},
+				{"chain_id": "137", "amount": "3000000"}
+			]
+		});
+
+		let result = context_builder.extract_eip7683_chains(&intent_data);
+		assert!(result.is_ok());
+
+		let chains = result.unwrap();
+		assert_eq!(chains.len(), 2);
+		assert!(chains.contains(&1));
+		assert!(chains.contains(&137));
+	}
+
+	#[test]
+	fn test_extract_eip7683_chains_no_chains_found() {
+		let context_builder = create_context_builder();
+		let intent_data = json!({
+			"some_other_field": "value"
+		});
+
+		let result = context_builder.extract_eip7683_chains(&intent_data);
+		assert!(result.is_err());
+		assert!(result.unwrap_err().to_string().contains("No chains found"));
+	}
+
+	#[test]
+	fn test_extract_eip7683_chains_invalid_chain_id_format() {
+		let context_builder = create_context_builder();
+		let intent_data = json!({
+			"origin_chain_id": "invalid",
+			"outputs": [
+				{"chain_id": "0xGGG", "amount": "1000000"}, // Invalid hex
+				{"chain_id": "not_a_number", "amount": "2000000"}
+			]
+		});
+
+		let result = context_builder.extract_eip7683_chains(&intent_data);
+		assert!(result.is_err());
+		assert!(result.unwrap_err().to_string().contains("No chains found"));
+	}
+
+	#[test]
+	fn test_extract_chains_from_intent_unsupported_standard() {
+		let context_builder = create_context_builder();
+		let intent_data = json!({"some": "data"});
+		let intent = create_test_intent("unsupported_standard", intent_data);
+
+		let result = context_builder.extract_chains_from_intent(&intent);
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Unsupported intent standard"));
+	}
+
+	#[test]
+	fn test_get_common_tokens_for_chain() {
+		let context_builder = create_context_builder();
+
+		// Test with configured network (chain 1 has USDC and WETH)
+		let tokens_chain_1 = context_builder.get_common_tokens_for_chain(1);
+		assert_eq!(tokens_chain_1.len(), 2);
+		assert!(tokens_chain_1.contains(&"a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0".to_string()));
+		assert!(tokens_chain_1.contains(&"c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0".to_string()));
+
+		// Test with unconfigured network
+		let tokens_unknown = context_builder.get_common_tokens_for_chain(999);
+		assert_eq!(tokens_unknown.len(), 0);
+	}
+
+	#[tokio::test]
+	async fn test_fetch_solver_balances_success() {
+		let context_builder = create_context_builder();
+		let chains = vec![1];
+
+		let result = context_builder.fetch_solver_balances(&chains).await;
+		assert!(result.is_ok());
+
+		let balances = result.unwrap();
+		// Should have native balance + 2 token balances for chain 1
+		assert_eq!(balances.len(), 3);
+
+		// Check native balance
+		assert!(balances.contains_key(&(1, None)));
+		assert_eq!(balances.get(&(1, None)).unwrap(), "1000000000000000000");
+
+		// Check token balances
+		assert!(balances.contains_key(&(
+			1,
+			Some("a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0".to_string())
+		)));
+		assert!(balances.contains_key(&(
+			1,
+			Some("c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0".to_string())
+		)));
+	}
+
+	#[tokio::test]
+	async fn test_build_execution_context_success() {
+		let context_builder = create_context_builder();
+		let intent_data = json!({
+			"origin_chain_id": "1"
+		});
+
+		let intent = create_test_intent("eip7683", intent_data);
+		let result = context_builder.build_execution_context(&intent).await;
+
+		assert!(result.is_ok());
+		let context = result.unwrap();
+
+		// Should have chain data for chain 1
+		assert_eq!(context.chain_data.len(), 1);
+		assert!(context.chain_data.contains_key(&1));
+
+		let chain_data = context.chain_data.get(&1).unwrap();
+		assert_eq!(chain_data.chain_id, 1);
+		assert_eq!(chain_data.gas_price, "20000000000");
+		assert_eq!(chain_data.block_number, 12345678);
+
+		// Should have solver balances (native + 2 tokens)
+		assert_eq!(context.solver_balances.len(), 3);
+
+		// Timestamp should be set
+		assert!(context.timestamp > 0);
+	}
+
+	#[tokio::test]
+	async fn test_build_execution_context_with_multiple_chains() {
+		// Create a more comprehensive mock for multiple chains
+		let mut mock_delivery_1 = MockDeliveryInterface::new();
+		let mut mock_delivery_137 = MockDeliveryInterface::new();
+
+		// Setup mocks for chain 1 - should be called 3 times (native + 2 tokens)
+		mock_delivery_1
+			.expect_get_gas_price()
+			.times(1)
+			.returning(|_| Box::pin(async { Ok("20000000000".to_string()) }));
+		mock_delivery_1
+			.expect_get_block_number()
+			.times(1)
+			.returning(|_| Box::pin(async { Ok(12345678) }));
+		mock_delivery_1
+			.expect_get_balance()
+			.times(3) // native + 2 tokens
+			.returning(|_, _, _| Box::pin(async { Ok("1000000000000000000".to_string()) }));
+		mock_delivery_1.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		// Setup mocks for chain 137 - should be called 1 time (native only)
+		mock_delivery_137
+			.expect_get_gas_price()
+			.times(1)
+			.returning(|_| Box::pin(async { Ok("30000000000".to_string()) }));
+		mock_delivery_137
+			.expect_get_block_number()
+			.times(1)
+			.returning(|_| Box::pin(async { Ok(87654321) }));
+		mock_delivery_137
+			.expect_get_balance()
+			.times(1) // native only, no tokens configured
+			.returning(|_, _, _| Box::pin(async { Ok("2000000000000000000".to_string()) }));
+		mock_delivery_137.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations = HashMap::new();
+		implementations.insert(
+			1,
+			Arc::new(mock_delivery_1) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		implementations.insert(
+			137,
+			Arc::new(mock_delivery_137) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 20));
+		let account = create_mock_account_service();
+		let networks = create_test_networks_config();
+		let token_manager = Arc::new(TokenManager::new(networks, delivery.clone(), account));
+
+		let context_builder = ContextBuilder::new(
+			delivery,
+			Address([0xAB; 20].to_vec()),
+			token_manager,
+			solver_config::ConfigBuilder::default().build(),
+		);
+
+		let intent_data = json!({
+			"origin_chain_id": 1,
+			"outputs": [
+				{"chain_id": 137, "amount": "1000000"}
+			]
+		});
+
+		let intent = create_test_intent("eip7683", intent_data);
+		let result = context_builder.build_execution_context(&intent).await;
+
+		assert!(result.is_ok());
+		let context = result.unwrap();
+
+		// Should have chain data for both chains
+		assert_eq!(context.chain_data.len(), 2);
+		assert!(context.chain_data.contains_key(&1));
+		assert!(context.chain_data.contains_key(&137));
+
+		// Verify chain-specific data
+		let chain_1_data = context.chain_data.get(&1).unwrap();
+		assert_eq!(chain_1_data.gas_price, "20000000000");
+		assert_eq!(chain_1_data.block_number, 12345678);
+
+		let chain_137_data = context.chain_data.get(&137).unwrap();
+		assert_eq!(chain_137_data.gas_price, "30000000000");
+		assert_eq!(chain_137_data.block_number, 87654321);
+
+		// Should have solver balances for both chains: chain 1 (native + 2 tokens) + chain 137 (native only)
+		assert_eq!(context.solver_balances.len(), 4);
+	}
+}

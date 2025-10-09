@@ -82,8 +82,11 @@ impl ExecutionStrategy for SimpleStrategy {
 
 				// Check each output to ensure we have sufficient balance
 				for output in &outputs {
+					// Get the asset's InteropAddress directly
+					let asset = output.asset.clone();
+
 					// Get chain ID from the asset's InteropAddress
-					let chain_id = output.asset.ethereum_chain_id().unwrap_or_else(|_| {
+					let chain_id = asset.ethereum_chain_id().unwrap_or_else(|_| {
 						tracing::warn!(
 							order_id = %order.id,
 							"Failed to get chain ID from asset, defaulting to 1"
@@ -92,8 +95,7 @@ impl ExecutionStrategy for SimpleStrategy {
 					});
 
 					// Get token address from the asset's InteropAddress
-					let token_address = output
-						.asset
+					let token_address = asset
 						.ethereum_address()
 						.map(|addr| hex::encode(addr.as_slice()))
 						.unwrap_or_else(|e| {

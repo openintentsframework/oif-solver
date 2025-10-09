@@ -8,16 +8,19 @@ use crate::engine::{
 	token_manager::TokenManager,
 };
 use crate::state::OrderStateMachine;
+use lru::LruCache;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
 use solver_order::OrderService;
 use solver_storage::StorageService;
 use solver_types::{
-	truncate_id, Address, DiscoveryEvent, ExecutionDecision, Intent, OrderEvent, SolverEvent,
-	StorageKey,
+	truncate_id, with_0x_prefix, Address, DiscoveryEvent, ExecutionDecision, Intent, OrderEvent,
+	SolverEvent, StorageKey,
 };
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::RwLock;
 use tracing::instrument;
 
 /// Errors that can occur during intent processing.
@@ -49,6 +52,9 @@ pub struct IntentHandler {
 	token_manager: Arc<TokenManager>,
 	cost_profit_service: Arc<CostProfitService>,
 	config: Config,
+	/// In-memory LRU cache for fast intent deduplication to prevent race conditions
+	/// Automatically evicts oldest entries when capacity is exceeded
+	processed_intents: Arc<RwLock<LruCache<String, ()>>>,
 }
 
 impl IntentHandler {
@@ -74,6 +80,9 @@ impl IntentHandler {
 			token_manager,
 			cost_profit_service,
 			config,
+			processed_intents: Arc::new(RwLock::new(LruCache::new(
+				NonZeroUsize::new(10000).unwrap(),
+			))),
 		}
 	}
 
@@ -89,6 +98,22 @@ impl IntentHandler {
 		//
 		// By checking if the intent already exists in storage, we ensure each order is only
 		// processed once, regardless of which discovery module receives it first.
+		// This is for fast in-memory deduplication to prevent race conditions
+		// This provides atomic check-and-insert for intent IDs
+		{
+			let mut processed = self.processed_intents.write().await;
+			if processed.contains(&intent.id) {
+				tracing::debug!(
+					"Duplicate intent detected in memory cache, already being processed"
+				);
+				return Ok(());
+			}
+			// Atomically claim this intent ID (LRU will auto-evict oldest if at capacity)
+			processed.put(intent.id.clone(), ());
+		}
+
+		// Fallback check against persistent storage for cross-restart deduplication
+		// This handles cases where the service was restarted between intent discovery
 		let exists = self
 			.storage
 			.exists(StorageKey::Intents.as_str(), &intent.id)
@@ -97,14 +122,19 @@ impl IntentHandler {
 				IntentError::Storage(format!("Failed to check intent existence: {}", e))
 			})?;
 		if exists {
-			tracing::debug!("Duplicate intent detected, already being processed or completed");
+			tracing::debug!("Duplicate intent detected in persistent storage, already processed");
 			return Ok(());
 		}
 
 		// Store intent immediately to prevent race conditions with duplicate discovery
 		// This claims the intent ID slot before we start the potentially slow validation process
 		self.storage
-			.store(StorageKey::Intents.as_str(), &intent.id, &intent, None)
+			.store(
+				StorageKey::Intents.as_str(),
+				&with_0x_prefix(&intent.id),
+				&intent,
+				None,
+			)
 			.await
 			.map_err(|e| {
 				IntentError::Storage(format!("Failed to store intent for deduplication: {}", e))
@@ -139,6 +169,7 @@ impl IntentHandler {
 				&intent.lock_type,
 				order_id_callback,
 				&self.solver_address,
+				intent.quote_id.clone(),
 			)
 			.await
 		{
@@ -149,14 +180,7 @@ impl IntentHandler {
 					.estimate_cost_for_order(&order, &self.config)
 					.await
 				{
-					Ok(estimate) => {
-						tracing::info!(
-							"Cost estimate calculated: total={} {}",
-							estimate.total,
-							estimate.currency
-						);
-						estimate
-					},
+					Ok(estimate) => estimate,
 					Err(e) => {
 						tracing::warn!("Failed to calculate cost estimate: {}", e);
 						return Err(IntentError::Service(format!(
@@ -173,15 +197,13 @@ impl IntentHandler {
 						&order,
 						&cost_estimate,
 						self.config.solver.min_profitability_pct,
+						intent.quote_id.as_deref(),
+						&intent.source,
 					)
 					.await
 				{
-					Ok(actual_profit_margin) => {
-						tracing::info!(
-							"Order passed profitability validation: {:.2}% (min required: {:.2}%)",
-							actual_profit_margin,
-							self.config.solver.min_profitability_pct
-						);
+					Ok(_actual_profit_margin) => {
+						// Profitability details already logged in validate_profitability function
 					},
 					Err(e) => {
 						tracing::warn!("Order failed profitability validation: {}", e);
@@ -262,5 +284,657 @@ impl IntentHandler {
 		}
 
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::engine::token_manager::TokenManager;
+	use alloy_primitives::U256;
+	use mockall::predicate::*;
+	use solver_account::MockAccountInterface;
+	use solver_config::ConfigBuilder;
+	use solver_delivery::DeliveryService;
+	use solver_order::{MockExecutionStrategy, MockOrderInterface};
+	use solver_pricing::{MockPricingInterface, PricingService};
+	use solver_storage::{MockStorageInterface, StorageError};
+	use solver_types::utils::tests::builders::{
+		Eip7683OrderDataBuilder, IntentBuilder, OrderBuilder,
+	};
+	use solver_types::{Address, ExecutionParams, Intent, Order, SolverEvent};
+	use std::collections::HashMap;
+	use std::sync::Arc;
+	use std::time::Duration;
+
+	fn create_test_intent() -> Intent {
+		IntentBuilder::new().build()
+	}
+
+	fn create_test_order() -> Order {
+		let order_data = Eip7683OrderDataBuilder::new().build();
+		OrderBuilder::new()
+			.with_id("test_intent_123".to_string())
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.build()
+	}
+
+	fn create_test_address() -> Address {
+		Address(vec![0xab; 20])
+	}
+
+	fn create_test_config() -> Config {
+		ConfigBuilder::new().build()
+	}
+
+	fn create_mock_cost_profit_service() -> Arc<CostProfitService> {
+		// Create mock pricing service with expected method responses
+		let mut mock_pricing = MockPricingInterface::new();
+
+		mock_pricing
+			.expect_wei_to_currency()
+			.returning(|_, _| Box::pin(async move { Ok("0.01".to_string()) }));
+
+		// Mock convert_asset calls - return different prices for input vs output tokens
+		mock_pricing
+			.expect_convert_asset()
+			.returning(|token_symbol, _, amount| {
+				let token_symbol = token_symbol.to_string();
+				let amount_str = amount.to_string();
+				Box::pin(async move {
+					// Parse the amount and multiply by token price
+					let amount_decimal = amount_str.parse::<f64>().unwrap_or(0.0);
+					let price_per_token = match token_symbol.as_str() {
+						"INPUT" => 1.0,  // $1 per INPUT token
+						"OUTPUT" => 1.0, // $1 per OUTPUT token
+						_ => 1.0,
+					};
+					let total_usd = amount_decimal * price_per_token;
+					Ok(total_usd.to_string())
+				})
+			});
+
+		// Mock get_supported_pairs - return the token pairs we support
+		mock_pricing.expect_get_supported_pairs().returning(|| {
+			Box::pin(async move {
+				vec![
+					solver_types::TradingPair {
+						base: "INPUT".to_string(),
+						quote: "USD".to_string(),
+					},
+					solver_types::TradingPair {
+						base: "OUTPUT".to_string(),
+						quote: "USD".to_string(),
+					},
+				]
+			})
+		});
+
+		let pricing_service = Arc::new(PricingService::new(Box::new(mock_pricing)));
+
+		// Create mock delivery service with chain implementations
+		let mut delivery_impls = HashMap::new();
+
+		let mut mock_delivery_1 = solver_delivery::MockDeliveryInterface::new();
+		mock_delivery_1
+			.expect_get_gas_price()
+			.returning(|_| Box::pin(async move { Ok("20000".to_string()) }));
+		mock_delivery_1
+			.expect_get_block_number()
+			.returning(|_| Box::pin(async move { Ok(1000000u64) }));
+
+		let mut mock_delivery_137 = solver_delivery::MockDeliveryInterface::new();
+		mock_delivery_137
+			.expect_get_gas_price()
+			.returning(|_| Box::pin(async move { Ok("20000".to_string()) }));
+		mock_delivery_137
+			.expect_get_block_number()
+			.returning(|_| Box::pin(async move { Ok(1000000u64) }));
+
+		delivery_impls.insert(
+			1u64,
+			Arc::new(mock_delivery_1) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		delivery_impls.insert(
+			137u64,
+			Arc::new(mock_delivery_137) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+
+		let delivery_service = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
+
+		// Create tokens that match the test order data exactly
+		let input_token = solver_types::utils::tests::builders::TokenConfigBuilder::new()
+			.address({
+				// Convert U256::from(1000) to Address - token 1000 = 0x3e8
+				let mut addr_bytes = [0u8; 20];
+				addr_bytes[18] = 0x03; // 0x03e8 = 1000
+				addr_bytes[19] = 0xe8;
+				solver_types::Address(addr_bytes.to_vec())
+			})
+			.symbol("INPUT".to_string())
+			.decimals(18)
+			.build();
+
+		let output_token = solver_types::utils::tests::builders::TokenConfigBuilder::new()
+			.address(solver_types::Address(vec![0u8; 20])) // Zero address for output
+			.symbol("OUTPUT".to_string())
+			.decimals(18)
+			.build();
+
+		// Create networks config with matching token addresses
+		let networks_config = solver_types::utils::tests::builders::NetworksConfigBuilder::new()
+			.add_network(
+				1,
+				solver_types::utils::tests::builders::NetworkConfigBuilder::new()
+					.tokens(vec![input_token])
+					.build(),
+			)
+			.add_network(
+				137,
+				solver_types::utils::tests::builders::NetworkConfigBuilder::new()
+					.tokens(vec![output_token])
+					.build(),
+			)
+			.build();
+
+		let token_manager = Arc::new(TokenManager::new(
+			networks_config,
+			delivery_service.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+
+		Arc::new(CostProfitService::new(
+			pricing_service,
+			delivery_service,
+			token_manager,
+			Arc::new(StorageService::new(Box::new(MockStorageInterface::new()))),
+		))
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_success_execute() {
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_order_interface = MockOrderInterface::new();
+		let mut mock_strategy = MockExecutionStrategy::new();
+
+		let intent = create_test_intent();
+		let solver_address = create_test_address();
+
+		// Setup expectations
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:test_intent_123"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+
+		mock_storage
+			.expect_set_bytes()
+			.times(2) // Once for intent, once for order
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		mock_order_interface
+			.expect_validate_and_create_order()
+			.times(1)
+			.returning(move |_, _, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
+
+		mock_strategy
+			.expect_should_execute()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					ExecutionDecision::Execute(ExecutionParams {
+						gas_price: U256::from(20000000000u64),
+						priority_fee: Some(U256::from(1000u64)),
+					})
+				})
+			});
+
+		// Create services
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order_interface) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(mock_strategy),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+
+		// Create mock delivery service and token manager
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(), // empty networks config
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let cost_profit_service = create_mock_cost_profit_service();
+		let config = create_test_config();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address.clone(),
+			token_manager,
+			cost_profit_service,
+			config,
+		);
+
+		let result = handler.handle(intent).await;
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_duplicate_skipped() {
+		let mut mock_storage = MockStorageInterface::new();
+
+		let intent = create_test_intent();
+		let solver_address = create_test_address();
+
+		// Setup expectations - intent already exists
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:test_intent_123"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(true) }));
+
+		// Should not call any other methods since we skip duplicate
+		mock_storage.expect_set_bytes().times(0);
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::new(),
+			Box::new(MockExecutionStrategy::new()),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let cost_profit_service = create_mock_cost_profit_service();
+		let config = create_test_config();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+		);
+
+		let result = handler.handle(intent).await;
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_validation_failure() {
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_order_interface = MockOrderInterface::new();
+
+		let intent = create_test_intent();
+		let solver_address = create_test_address();
+
+		// Setup expectations
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:test_intent_123"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+
+		mock_order_interface
+			.expect_validate_and_create_order()
+			.times(1)
+			.returning(|_, _, _, _, _, _| {
+				Box::pin(async move {
+					Err(solver_order::OrderError::ValidationFailed(
+						"Invalid intent".to_string(),
+					))
+				})
+			});
+
+		// Intent is always stored first for deduplication, even if validation fails later
+		mock_storage
+			.expect_set_bytes()
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order_interface) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(MockExecutionStrategy::new()),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let config = create_test_config();
+
+		let cost_profit_service = create_mock_cost_profit_service();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+		);
+
+		let result = handler.handle(intent).await;
+		assert!(result.is_ok()); // Handler doesn't fail on validation errors
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_skip_execution() {
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_order_interface = MockOrderInterface::new();
+		let mut mock_strategy = MockExecutionStrategy::new();
+
+		let intent = create_test_intent();
+		let solver_address = create_test_address();
+
+		// Setup expectations
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:test_intent_123"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+
+		mock_storage
+			.expect_set_bytes()
+			.times(2) // Once for intent, once for order
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		mock_order_interface
+			.expect_validate_and_create_order()
+			.times(1)
+			.returning(move |_, _, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
+
+		mock_strategy
+			.expect_should_execute()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move { ExecutionDecision::Skip("Insufficient balance".to_string()) })
+			});
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order_interface) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(mock_strategy),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let config = create_test_config();
+
+		let cost_profit_service = create_mock_cost_profit_service();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+		);
+
+		let result = handler.handle(intent).await;
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_defer_execution() {
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_order_interface = MockOrderInterface::new();
+		let mut mock_strategy = MockExecutionStrategy::new();
+
+		let intent = create_test_intent();
+		let solver_address = create_test_address();
+
+		// Setup expectations
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:test_intent_123"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+
+		mock_storage
+			.expect_set_bytes()
+			.times(2)
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		mock_order_interface
+			.expect_validate_and_create_order()
+			.times(1)
+			.returning(move |_, _, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
+
+		mock_strategy
+			.expect_should_execute()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move { ExecutionDecision::Defer(Duration::from_secs(60)) })
+			});
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order_interface) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(mock_strategy),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let config = create_test_config();
+
+		let cost_profit_service = create_mock_cost_profit_service();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+		);
+
+		let result = handler.handle(intent).await;
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_storage_error() {
+		let mut mock_storage = MockStorageInterface::new();
+
+		let intent = create_test_intent();
+		let solver_address = create_test_address();
+
+		// Setup expectations - storage fails
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:test_intent_123"))
+			.times(1)
+			.returning(|_| {
+				Box::pin(async move { Err(StorageError::Backend("Database down".to_string())) })
+			});
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::new(),
+			Box::new(MockExecutionStrategy::new()),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let config = create_test_config();
+
+		let cost_profit_service = create_mock_cost_profit_service();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+		);
+
+		let result = handler.handle(intent).await;
+		assert!(result.is_err());
+		assert!(matches!(result.unwrap_err(), IntentError::Storage(_)));
+	}
+
+	#[tokio::test]
+	async fn test_event_publishing() {
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_order_interface = MockOrderInterface::new();
+		let mut mock_strategy = MockExecutionStrategy::new();
+
+		let intent = create_test_intent();
+		let solver_address = create_test_address();
+
+		// Setup expectations
+		mock_storage
+			.expect_exists()
+			.returning(|_| Box::pin(async move { Ok(false) }));
+		mock_storage
+			.expect_set_bytes()
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+		mock_order_interface
+			.expect_validate_and_create_order()
+			.times(1)
+			.returning(move |_, _, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
+		mock_strategy.expect_should_execute().returning(|_, _| {
+			Box::pin(async move {
+				ExecutionDecision::Execute(ExecutionParams {
+					gas_price: U256::from(20000000000u64),
+					priority_fee: Some(U256::from(1000u64)),
+				})
+			})
+		});
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order_interface) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(mock_strategy),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let config = create_test_config();
+
+		// Subscribe to events before creating handler
+		let mut receiver = event_bus.subscribe();
+
+		let cost_profit_service = create_mock_cost_profit_service();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+		);
+
+		// Handle intent and check events
+		let result = handler.handle(intent.clone()).await;
+		assert!(result.is_ok());
+
+		// Should receive IntentValidated and Preparing events
+		let event1 = receiver.recv().await.unwrap();
+		match event1 {
+			SolverEvent::Discovery(solver_types::DiscoveryEvent::IntentValidated {
+				intent_id,
+				..
+			}) => {
+				assert_eq!(intent_id, intent.id);
+			},
+			_ => panic!("Expected IntentValidated event"),
+		}
+
+		let event2 = receiver.recv().await.unwrap();
+		match event2 {
+			SolverEvent::Order(solver_types::OrderEvent::Preparing { .. }) => {
+				// Success
+			},
+			_ => panic!("Expected Preparing event"),
+		}
 	}
 }

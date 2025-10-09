@@ -6,6 +6,7 @@
 
 use alloy_primitives::Bytes;
 use async_trait::async_trait;
+use solver_types::events::TransactionType;
 use solver_types::{
 	ChainData, ConfigSchema, ImplementationRegistry, NetworksConfig, Transaction, TransactionHash,
 	TransactionReceipt,
@@ -35,12 +36,65 @@ pub enum DeliveryError {
 	NoImplementationAvailable,
 }
 
+/// Callback for transaction monitoring events
+pub type TransactionCallback = Box<dyn Fn(TransactionMonitoringEvent) + Send + Sync>;
+
+/// Events emitted during transaction monitoring
+#[derive(Debug, Clone)]
+pub enum TransactionMonitoringEvent {
+	/// Transaction was successfully confirmed
+	Confirmed {
+		id: String, // order_id in case of intents
+		tx_hash: TransactionHash,
+		tx_type: TransactionType,
+		receipt: TransactionReceipt,
+	},
+	/// Transaction failed or was reverted
+	Failed {
+		id: String, // order_id in case of intents
+		tx_hash: TransactionHash,
+		tx_type: TransactionType,
+		error: String,
+	},
+}
+
+/// Options for tracking transaction confirmation
+pub struct TransactionTracking {
+	/// Unique identifier for the transaction (e.g. order_id)
+	pub id: String,
+	/// Type of transaction being submitted
+	pub tx_type: TransactionType,
+	/// Callback to invoke when transaction state changes
+	pub callback: TransactionCallback,
+}
+
+impl std::fmt::Debug for TransactionTracking {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("TransactionTracking")
+			.field("id", &self.id)
+			.field("tx_type", &self.tx_type)
+			.finish()
+	}
+}
+
+/// Extended tracking options with service configuration
+#[derive(Debug)]
+pub struct TransactionTrackingWithConfig {
+	/// Base tracking options
+	pub tracking: TransactionTracking,
+	/// Minimum confirmations required before considering transaction confirmed
+	pub min_confirmations: u64,
+	/// Timeout in seconds for monitoring the transaction
+	pub monitoring_timeout_seconds: u64,
+}
+
 /// Trait defining the interface for transaction delivery implementations.
 ///
 /// This trait must be implemented by any delivery implementation that wants to
 /// integrate with the solver system. It provides methods for submitting
 /// transactions and monitoring their confirmation status.
 #[async_trait]
+#[cfg_attr(feature = "testing", mockall::automock)]
 pub trait DeliveryInterface: Send + Sync {
 	/// Returns the configuration schema for this delivery implementation.
 	///
@@ -53,18 +107,14 @@ pub trait DeliveryInterface: Send + Sync {
 	///
 	/// Takes a transaction, signs it with the appropriate signer for the chain,
 	/// then submits it to the network and returns the transaction hash.
-	async fn submit(&self, tx: Transaction) -> Result<TransactionHash, DeliveryError>;
-
-	/// Waits for a transaction to be confirmed with the specified number of confirmations.
 	///
-	/// Blocks until the transaction has received the required number of confirmations
-	/// or an error occurs (e.g., transaction reverted or timeout).
-	async fn wait_for_confirmation(
+	/// If tracking is provided, monitors the transaction for confirmation/failure
+	/// and calls the callback when the transaction state changes.
+	async fn submit(
 		&self,
-		hash: &TransactionHash,
-		chain_id: u64,
-		confirmations: u64,
-	) -> Result<TransactionReceipt, DeliveryError>;
+		tx: Transaction,
+		tracking: Option<TransactionTrackingWithConfig>,
+	) -> Result<TransactionHash, DeliveryError>;
 
 	/// Retrieves the receipt for a transaction if available.
 	///
@@ -162,8 +212,8 @@ pub struct DeliveryService {
 	implementations: std::collections::HashMap<u64, Arc<dyn DeliveryInterface>>,
 	/// Default number of confirmations required for transactions.
 	min_confirmations: u64,
-	/// Poll interval for transaction monitoring in seconds.
-	poll_interval_seconds: u64,
+	/// Timeout for transaction monitoring in seconds.
+	monitoring_timeout_seconds: u64,
 }
 
 impl DeliveryService {
@@ -174,12 +224,12 @@ impl DeliveryService {
 	pub fn new(
 		implementations: std::collections::HashMap<u64, Arc<dyn DeliveryInterface>>,
 		min_confirmations: u64,
-		poll_interval_seconds: u64,
+		monitoring_timeout_seconds: u64,
 	) -> Self {
 		Self {
 			implementations,
 			min_confirmations,
-			poll_interval_seconds,
+			monitoring_timeout_seconds,
 		}
 	}
 
@@ -188,7 +238,13 @@ impl DeliveryService {
 	/// This method:
 	/// 1. Selects the appropriate implementation based on the transaction's chain ID
 	/// 2. Submits the transaction through the implementation (which handles signing)
-	pub async fn deliver(&self, tx: Transaction) -> Result<TransactionHash, DeliveryError> {
+	///
+	/// If tracking is provided, monitors the transaction for confirmation/failure.
+	pub async fn deliver(
+		&self,
+		tx: Transaction,
+		tracking: Option<TransactionTracking>,
+	) -> Result<TransactionHash, DeliveryError> {
 		// Get the implementation for the transaction's chain ID
 		let implementation = self
 			.implementations
@@ -196,39 +252,13 @@ impl DeliveryService {
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
 		// Submit using the chain-specific implementation (which handles signing)
-		implementation.submit(tx).await
-	}
-
-	/// Waits for a transaction to be confirmed with the specified number of confirmations.
-	///
-	/// This method uses the chain_id to directly route to the correct implementation.
-	pub async fn confirm(
-		&self,
-		hash: &TransactionHash,
-		chain_id: u64,
-		confirmations: u64,
-	) -> Result<TransactionReceipt, DeliveryError> {
-		// Get the implementation for the specified chain
-		let implementation = self
-			.implementations
-			.get(&chain_id)
-			.ok_or(DeliveryError::NoImplementationAvailable)?;
-
-		implementation
-			.wait_for_confirmation(hash, chain_id, confirmations)
-			.await
-	}
-
-	/// Waits for a transaction to be confirmed with the default number of confirmations.
-	///
-	/// Uses the min_confirmations value configured for this service.
-	pub async fn confirm_with_default(
-		&self,
-		hash: &TransactionHash,
-		chain_id: u64,
-	) -> Result<TransactionReceipt, DeliveryError> {
-		// Use configured confirmations
-		self.confirm(hash, chain_id, self.min_confirmations).await
+		// If tracking is provided, add our service configuration
+		let enhanced_tracking = tracking.map(|t| TransactionTrackingWithConfig {
+			tracking: t,
+			min_confirmations: self.min_confirmations,
+			monitoring_timeout_seconds: self.monitoring_timeout_seconds,
+		});
+		implementation.submit(tx, enhanced_tracking).await
 	}
 
 	/// Gets the transaction receipt for a given transaction hash.
@@ -381,10 +411,5 @@ impl DeliveryService {
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
 		implementation.eth_call(tx).await
-	}
-
-	/// Get the configured poll interval for transaction monitoring
-	pub fn poll_interval_seconds(&self) -> u64 {
-		self.poll_interval_seconds
 	}
 }

@@ -64,6 +64,7 @@ pub enum StrategyError {
 /// that the solver supports. It handles standard-specific validation and
 /// transaction generation logic.
 #[async_trait]
+#[cfg_attr(feature = "testing", mockall::automock)]
 pub trait OrderInterface: Send + Sync {
 	/// Returns the configuration schema for this order implementation.
 	///
@@ -125,6 +126,7 @@ pub trait OrderInterface: Send + Sync {
 	/// * `lock_type` - The lock type for the order ("permit2_escrow", "eip3009_escrow", etc.)
 	/// * `order_id_callback` - Callback function to compute the order ID
 	/// * `solver_address` - The solver's address for reward attribution
+	/// * `quote_id` - Optional quote ID if this order is associated with a quote
 	async fn validate_and_create_order(
 		&self,
 		order_bytes: &Bytes,
@@ -132,6 +134,7 @@ pub trait OrderInterface: Send + Sync {
 		lock_type: &str,
 		order_id_callback: OrderIdCallback,
 		solver_address: &Address,
+		quote_id: Option<String>,
 	) -> Result<Order, OrderError>;
 }
 
@@ -140,6 +143,7 @@ pub trait OrderInterface: Send + Sync {
 /// Execution strategies determine when and how orders should be executed
 /// based on market conditions, profitability, and other factors.
 #[async_trait]
+#[cfg_attr(feature = "testing", mockall::automock)]
 pub trait ExecutionStrategy: Send + Sync {
 	/// Returns the configuration schema for this strategy implementation.
 	///
@@ -307,6 +311,7 @@ impl OrderService {
 	///
 	/// This method delegates to the appropriate standard implementation to validate
 	/// the order and compute its ID using the provided callback.
+	#[allow(clippy::too_many_arguments)]
 	pub async fn validate_and_create_order(
 		&self,
 		standard: &str,
@@ -315,6 +320,7 @@ impl OrderService {
 		lock_type: &str,
 		order_id_callback: OrderIdCallback,
 		solver_address: &Address,
+		quote_id: Option<String>,
 	) -> Result<Order, OrderError> {
 		let implementation = self.implementations.get(standard).ok_or_else(|| {
 			OrderError::ValidationFailed(format!("Unknown standard: {}", standard))
@@ -327,6 +333,7 @@ impl OrderService {
 				lock_type,
 				order_id_callback,
 				solver_address,
+				quote_id,
 			)
 			.await
 	}

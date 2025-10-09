@@ -11,9 +11,12 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::{
-	Address, AssetAmount, AvailableInput, ChainData, Eip7683OrderData, RequestedOutput,
-	SettlementType, TransactionHash, TransactionType,
+	Address, AssetAmount, ChainData, OrderInput, OrderOutput, SettlementType, TransactionHash,
+	TransactionType,
 };
+
+#[cfg(feature = "oif-interfaces")]
+use crate::Eip7683OrderData;
 
 /// Information about a chain and its associated settler contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,14 +60,14 @@ pub trait OrderParsable: Send + Sync {
 	///
 	/// # Returns
 	///
-	/// A vector of `AvailableInput` instances. May be empty for orders
+	/// A vector of `OrderInput` instances. May be empty for orders
 	/// that don't require specific inputs (e.g., native currency payments).
 	///
 	/// # Implementation Note
 	///
 	/// Implementations should handle token address formats appropriate to
 	/// their standard and convert them to InteropAddress format.
-	fn parse_available_inputs(&self) -> Vec<AvailableInput>;
+	fn parse_available_inputs(&self) -> Vec<OrderInput>;
 
 	/// Extract requested outputs from the order data.
 	///
@@ -77,14 +80,14 @@ pub trait OrderParsable: Send + Sync {
 	///
 	/// # Returns
 	///
-	/// A vector of `RequestedOutput` instances. May be empty for orders
+	/// A vector of `OrderOutput` instances. May be empty for orders
 	/// that don't specify explicit outputs (though this is unusual).
 	///
 	/// # Implementation Note
 	///
 	/// Implementations should ensure that recipient addresses are properly
 	/// formatted as InteropAddress instances with correct chain IDs.
-	fn parse_requested_outputs(&self) -> Vec<RequestedOutput>;
+	fn parse_requested_outputs(&self) -> Vec<OrderOutput>;
 
 	/// Extract the lock type from the order data, if applicable.
 	///
@@ -226,6 +229,7 @@ pub struct Order {
 
 impl Order {
 	/// Parse the order data based on its standard
+	#[cfg(feature = "oif-interfaces")]
 	pub fn parse_order_data(&self) -> Result<Box<dyn OrderParsable>, Box<dyn std::error::Error>> {
 		match self.standard.as_str() {
 			"eip7683" => {
@@ -323,11 +327,11 @@ pub struct OrderResponse {
 	#[serde(rename = "quoteId")]
 	pub quote_id: Option<String>,
 	/// Input asset and amount
-	#[serde(rename = "inputAmount")]
-	pub input_amount: AssetAmount,
+	#[serde(rename = "inputAmounts")]
+	pub input_amounts: Vec<AssetAmount>,
 	/// Output asset and amount
-	#[serde(rename = "outputAmount")]
-	pub output_amount: AssetAmount,
+	#[serde(rename = "outputAmounts")]
+	pub output_amounts: Vec<AssetAmount>,
 	/// Settlement information
 	pub settlement: Settlement,
 	/// Transaction details if order has been executed

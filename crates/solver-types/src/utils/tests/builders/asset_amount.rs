@@ -3,8 +3,8 @@
 //! Provides a fluent API for constructing AssetAmount instances with
 //! proper validation and sensible defaults.
 
-use crate::api::AssetAmount;
-use alloy_primitives::U256;
+use crate::{api::AssetAmount, InteropAddress};
+use alloy_primitives::{Address, U256};
 
 /// Builder for creating `AssetAmount` instances with a fluent API.
 ///
@@ -17,14 +17,21 @@ use alloy_primitives::U256;
 /// use solver_types::utils::builders::AssetAmountBuilder;
 /// use alloy_primitives::U256;
 ///
+/// // Using InteropAddress directly
 /// let asset_amount = AssetAmountBuilder::new()
-///     .asset("0x1234567890123456789012345678901234567890")
+///     .asset(interop_address)
+///     .amount(U256::from(1000))
+///     .build();
+///
+/// // Or from hex string
+/// let asset_amount = AssetAmountBuilder::new()
+///     .asset_from_hex("0x00010000010114D8DA6BF26964AF9D7EED9E03E53415D37AA96045")
 ///     .amount(U256::from(1000))
 ///     .build();
 /// ```
 #[derive(Debug, Clone)]
 pub struct AssetAmountBuilder {
-	asset: Option<String>,
+	asset: Option<InteropAddress>,
 	amount: U256,
 }
 
@@ -43,21 +50,38 @@ impl AssetAmountBuilder {
 		}
 	}
 
-	/// Sets the asset address.
-	pub fn asset<S: Into<String>>(mut self, asset: S) -> Self {
-		self.asset = Some(asset.into());
+	/// Sets the asset as an InteropAddress.
+	pub fn asset(mut self, asset: InteropAddress) -> Self {
+		self.asset = Some(asset);
 		self
 	}
 
-	/// Sets the asset address from a hex string (with or without 0x prefix).
-	pub fn asset_hex(mut self, hex: &str) -> Self {
-		let hex = if hex.starts_with("0x") {
-			hex
+	/// Sets the asset from an InteropAddress hex string.
+	pub fn asset_from_hex(mut self, hex: &str) -> Result<Self, AssetAmountBuilderError> {
+		let interop_address = InteropAddress::from_hex(hex).map_err(|e| {
+			AssetAmountBuilderError::InvalidAsset(format!("Invalid InteropAddress: {}", e))
+		})?;
+		self.asset = Some(interop_address);
+		Ok(self)
+	}
+
+	/// Sets the asset from chain ID and Ethereum address.
+	pub fn asset_from_chain_and_address(
+		mut self,
+		chain_id: u64,
+		address_str: &str,
+	) -> Result<Self, AssetAmountBuilderError> {
+		let address_str = if address_str.starts_with("0x") {
+			address_str
 		} else {
-			&format!("0x{}", hex)
+			&format!("0x{}", address_str)
 		};
-		self.asset = Some(hex.to_string());
-		self
+		let address = address_str.parse::<Address>().map_err(|e| {
+			AssetAmountBuilderError::InvalidAsset(format!("Invalid address: {}", e))
+		})?;
+		let interop_address = InteropAddress::new_ethereum(chain_id, address);
+		self.asset = Some(interop_address);
+		Ok(self)
 	}
 
 	/// Sets the amount.
@@ -119,4 +143,6 @@ pub enum AssetAmountBuilderError {
 	MissingField(&'static str),
 	#[error("Invalid amount: {0}")]
 	InvalidAmount(String),
+	#[error("Invalid asset: {0}")]
+	InvalidAsset(String),
 }

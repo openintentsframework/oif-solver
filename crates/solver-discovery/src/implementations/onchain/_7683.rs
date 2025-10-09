@@ -5,20 +5,17 @@
 
 use crate::{DiscoveryError, DiscoveryInterface};
 use alloy_primitives::{Address as AlloyAddress, Log as PrimLog, LogData};
-use alloy_provider::{Provider, ProviderBuilder, RootProvider};
-use alloy_pubsub::PubSubFrontend;
+use alloy_provider::{DynProvider, Provider};
 use alloy_rpc_types::{Filter, Log};
 use alloy_sol_types::sol;
 use alloy_sol_types::{SolEvent, SolValue};
-use alloy_transport_http::Http;
-use alloy_transport_ws::WsConnect;
 use async_trait::async_trait;
 use futures::StreamExt;
-use solver_types::current_timestamp;
 use solver_types::{
+	create_http_provider, create_ws_provider, current_timestamp,
 	standards::eip7683::{GasLimitOverrides, LockType, MandateOutput},
 	with_0x_prefix, ConfigSchema, Eip7683OrderData, Field, FieldType, Intent, IntentMetadata,
-	NetworksConfig, Schema,
+	NetworksConfig, ProviderError, Schema,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,9 +63,9 @@ const MAX_POLLING_INTERVAL_SECS: u64 = 300;
 /// Provider types for different transport modes.
 enum ProviderType {
 	/// HTTP provider for polling mode.
-	Http(RootProvider<Http<reqwest::Client>>),
+	Http(DynProvider),
 	/// WebSocket provider for subscription mode.
-	WebSocket(RootProvider<PubSubFrontend>),
+	WebSocket(DynProvider),
 }
 
 /// EIP-7683 on-chain discovery implementation.
@@ -121,57 +118,30 @@ impl Eip7683Discovery {
 		let mut last_blocks = HashMap::new();
 
 		for network_id in &network_ids {
-			// Validate network exists
-			let network = networks.get(network_id).ok_or_else(|| {
-				DiscoveryError::ValidationError(format!(
-					"Network {} not found in configuration",
-					network_id
-				))
-			})?;
-
 			if use_websocket {
 				// WebSocket mode
-				let ws_url = network.get_ws_url().ok_or_else(|| {
-					DiscoveryError::Connection(format!(
-						"No WebSocket RPC URL configured for network {}",
-						network_id
-					))
-				})?;
+				let provider =
+					create_ws_provider(*network_id, &networks)
+						.await
+						.map_err(|e| match e {
+							ProviderError::NetworkConfig(msg) => {
+								DiscoveryError::ValidationError(msg)
+							},
+							ProviderError::Connection(msg) => DiscoveryError::Connection(msg),
+							ProviderError::InvalidUrl(msg) => DiscoveryError::Connection(msg),
+						})?;
 
-				tracing::info!(
-					"Creating WebSocket provider for network {}: {}",
-					network_id,
-					ws_url
-				);
+				tracing::info!("Created WebSocket provider for network {}", network_id);
 
-				let ws_connect = WsConnect::new(ws_url.to_string());
-				let provider = ProviderBuilder::new()
-					.with_recommended_fillers()
-					.on_ws(ws_connect)
-					.await
-					.map_err(|e| {
-						DiscoveryError::Connection(format!(
-							"Failed to create WebSocket provider for network {}: {}",
-							network_id, e
-						))
-					})?;
-
-				let root_provider = provider.root().clone();
-				providers.insert(*network_id, ProviderType::WebSocket(root_provider));
+				providers.insert(*network_id, ProviderType::WebSocket(provider));
 			} else {
 				// HTTP polling mode
-				let http_url = network.get_http_url().ok_or_else(|| {
-					DiscoveryError::Connection(format!(
-						"No HTTP RPC URL configured for network {}",
-						network_id
-					))
-				})?;
-				let provider = RootProvider::new_http(http_url.parse().map_err(|e| {
-					DiscoveryError::Connection(format!(
-						"Invalid RPC URL for network {}: {}",
-						network_id, e
-					))
-				})?);
+				let provider =
+					create_http_provider(*network_id, &networks).map_err(|e| match e {
+						ProviderError::NetworkConfig(msg) => DiscoveryError::ValidationError(msg),
+						ProviderError::Connection(msg) => DiscoveryError::Connection(msg),
+						ProviderError::InvalidUrl(msg) => DiscoveryError::Connection(msg),
+					})?;
 
 				// Get initial block number
 				let current_block = provider.get_block_number().await.map_err(|e| {
@@ -210,7 +180,7 @@ impl Eip7683Discovery {
 		};
 
 		// Decode the Open event
-		let open_event = Open::decode_log(&prim_log, true).map_err(|e| {
+		let open_event = Open::decode_log_validate(&prim_log).map_err(|e| {
 			DiscoveryError::ParseError(format!("Failed to decode Open event: {}", e))
 		})?;
 
@@ -298,7 +268,7 @@ impl Eip7683Discovery {
 	/// Periodically polls the blockchain for new Open events and sends
 	/// discovered intents through the provided channel.
 	async fn monitor_chain_polling(
-		provider: RootProvider<Http<reqwest::Client>>,
+		provider: DynProvider,
 		chain_id: u64,
 		networks: NetworksConfig,
 		last_blocks: Arc<Mutex<HashMap<u64, u64>>>,
@@ -388,7 +358,7 @@ impl Eip7683Discovery {
 	/// Uses WebSocket connection to subscribe to Open events via eth_subscribe
 	/// and processes events as they arrive in real-time.
 	async fn monitor_chain_subscription(
-		provider: RootProvider<PubSubFrontend>,
+		provider: DynProvider,
 		chain_id: u64,
 		networks: NetworksConfig,
 		sender: mpsc::UnboundedSender<Intent>,
@@ -1101,7 +1071,7 @@ mod tests {
 		let encoded = standard_order.abi_encode();
 		assert!(!encoded.is_empty());
 
-		let decoded = StandardOrder::abi_decode(&encoded, true).unwrap();
+		let decoded = StandardOrder::abi_decode_validate(&encoded).unwrap();
 		assert_eq!(decoded.nonce, standard_order.nonce);
 		assert_eq!(decoded.outputs.len(), standard_order.outputs.len());
 	}
