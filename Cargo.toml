@@ -55,6 +55,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 dashmap = "6.0"
 futures = "0.3"
 hex = "0.4"
+mockall = "0.13"
 priority-queue = "2.0"
 reqwest = { version = "0.12.22", features = ["json"] }
 rust_decimal = { version = "1.35", features = ["serde", "serde-with-str"] }

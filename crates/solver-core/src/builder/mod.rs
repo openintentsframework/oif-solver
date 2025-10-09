@@ -82,7 +82,7 @@ impl SolverBuilder {
 		) -> Result<Box<dyn OrderInterface>, OrderError>,
 		PF: Fn(
 			&toml::Value,
-		) -> Result<Box<dyn solver_types::PricingInterface>, solver_types::PricingError>,
+		) -> Result<Box<dyn solver_pricing::PricingInterface>, solver_types::PricingError>,
 		SEF: Fn(
 			&toml::Value,
 			&solver_types::NetworksConfig,
