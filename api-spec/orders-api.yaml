@@ -214,30 +214,45 @@ components:
 
   schemas:
     PostOrderRequest:
-      type: object
       description: |
         Order submission request following OIF specification.
-        Supports both quote acceptance and direct submission.
-      properties:
-        order:
-          oneOf:
-            - $ref: "#/components/schemas/OifEscrowV0"
-            - $ref: "#/components/schemas/OifResourceLockV0"
-            - $ref: "#/components/schemas/Oif3009V0"
-          description: Structured order (required for direct submission, omit for quote acceptance)
-        signature:
-          type: string
-          description: Hex-encoded signature bytes
-          pattern: "^0x[a-fA-F0-9]+$"
-          example: "0x1234567890abcdef..."
-        quoteId:
-          type: string
-          description: Quote identifier (for quote acceptance)
-          example: "quote_abc123def456"
-        originSubmission:
-          $ref: "#/components/schemas/OriginSubmission"
-      required:
-        - signature
+        Supports both quote acceptance and direct submission modes.
+      oneOf:
+        - type: object
+          description: Quote acceptance mode - accepts a previously generated quote
+          required:
+            - quoteId
+            - signature
+          properties:
+            quoteId:
+              type: string
+              description: Quote identifier from a previously generated quote
+              example: "quote_abc123def456"
+            signature:
+              type: string
+              description: Hex-encoded signature bytes
+              pattern: "^0x[a-fA-F0-9]+$"
+              example: "0x1234567890abcdef..."
+        - type: object
+          description: Direct submission mode - submits a complete order structure
+          required:
+            - order
+            - signature
+          properties:
+            order:
+              oneOf:
+                - $ref: "#/components/schemas/OifEscrowV0"
+                - $ref: "#/components/schemas/OifResourceLockV0"
+                - $ref: "#/components/schemas/Oif3009V0"
+              description: Complete order structure with type and payload
+            signature:
+              type: string
+              description: Hex-encoded signature bytes
+              pattern: "^0x[a-fA-F0-9]+$"
+              example: "0x1234567890abcdef..."
+            originSubmission:
+              $ref: "#/components/schemas/OriginSubmission"
+              description: Optional submission mode and schemes information
 
     OifEscrowV0:
       type: object
