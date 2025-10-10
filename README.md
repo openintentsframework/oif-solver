@@ -193,7 +193,7 @@ oif-solver/
 - Provides pricing oracle implementations for asset valuation
 - Converts between wei amounts and fiat currencies
 - Supports multiple pricing backends
-- Manages pricing configuration (commission, gas buffer, rate buffer)
+- Manages pricing configuration
 - Enables profitability calculations and cost estimation
 
 ### solver-demo
@@ -546,7 +546,15 @@ cargo run -p solver-demo -- intent submit .oif-demo/requests/post_order.req.json
 cargo run -p solver-demo -- token balance all
 ```
 
-**Important:** The demo tool requires the Permit2 contract bytecode file located at `crates/solver-demo/src/operations/env/data/permit2_bytecode.hex`. This file contains the canonical Permit2 bytecode and is essential for deploying contracts to local Anvil chains. The bytecode is automatically used during the `env deploy` step.
+**Important:** The demo tool requires the Permit2 contract bytecode file located at `crates/solver-demo/data/permit2_bytecode.hex`. This file contains the canonical Permit2 bytecode and is essential for deploying contracts to local Anvil chains. The bytecode is automatically used during the `env deploy` step.
+
+To fetch and store the Permit2 bytecode, run this command from the project root:
+
+```bash
+# Fetch Permit2 bytecode from Ethereum mainnet and save to the required location
+# This will skip if the file already exists
+[ ! -f crates/solver-demo/data/permit2_bytecode.hex ] && mkdir -p crates/solver-demo/data && cast code 0x000000000022D473030F116dDEE9F6B43aC78BA3 --rpc-url https://eth.llamarpc.com > crates/solver-demo/data/permit2_bytecode.hex || echo "Permit2 bytecode already exists at crates/solver-demo/data/permit2_bytecode.hex"
+```
 
 ### Commands Overview
 
