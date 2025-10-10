@@ -69,10 +69,6 @@ impl MintOps {
 			),
 		);
 
-		if !self.ctx.is_local() {
-			return Err(Error::NotLocalMode);
-		}
-
 		let recipient = recipient.unwrap_or_else(|| self.get_default_recipient());
 		let token = self.ctx.tokens.get_or_error(chain, token_symbol)?;
 		let provider = self.ctx.provider(chain).await?;

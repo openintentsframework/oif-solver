@@ -195,10 +195,10 @@ impl Context {
 	/// Create an authenticated API client for solver service communication
 	///
 	/// # Returns
-	/// An ApiClient instance configured with JWT authentication
+	/// An ApiClient instance configured with JWT authentication if enabled
 	///
 	/// # Errors
-	/// Returns Error if JWT token retrieval fails or API client creation fails
+	/// Returns Error if JWT token retrieval fails (when auth is enabled) or API client creation fails
 	pub async fn api_client(&self) -> Result<ApiClient> {
 		// Get API URL from config if available, otherwise use default
 		let api_url = if let Some(api_config) = &self.config.solver.api {
@@ -207,11 +207,25 @@ impl Context {
 			"http://localhost:3000".to_string()
 		};
 
-		// Get valid JWT token
-		let token = self.jwt.get_valid_token(&self.session).await?;
+		// Check if auth is enabled
+		let auth_enabled = self
+			.config
+			.solver
+			.api
+			.as_ref()
+			.and_then(|api| api.auth.as_ref())
+			.map(|auth| auth.enabled)
+			.unwrap_or(false);
 
-		// Create API client with JWT authentication
-		ApiClient::new(&api_url).map(|client| client.with_jwt(token))
+		// Create API client with or without JWT authentication
+		if auth_enabled {
+			// Get valid JWT token
+			let token = self.jwt.get_valid_token(&self.session).await?;
+			ApiClient::new(&api_url).map(|client| client.with_jwt(token))
+		} else {
+			// Create API client without authentication
+			ApiClient::new(&api_url)
+		}
 	}
 }
 

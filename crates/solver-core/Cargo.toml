@@ -25,3 +25,14 @@ thiserror = "2.0"
 tokio = { version = "1.0", features = ["full"] }
 toml = { workspace = true }
 tracing = "0.1"
+
+[dev-dependencies]
+mockall = { workspace = true }
+async-trait = { workspace = true }
+# Add testing feature only for tests
+solver-delivery = { path = "../solver-delivery", features = ["testing"] }
+solver-storage = { path = "../solver-storage", features = ["testing"] }
+solver-order = { path = "../solver-order", features = ["testing"] }
+solver-account = { path = "../solver-account", features = ["testing"] }
+solver-settlement = { path = "../solver-settlement", features = ["testing"] }
+solver-pricing = { path = "../solver-pricing", features = ["testing"] }

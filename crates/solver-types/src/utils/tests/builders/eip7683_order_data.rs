@@ -6,6 +6,11 @@
 use crate::standards::eip7683::{Eip7683OrderData, GasLimitOverrides, LockType, MandateOutput};
 use alloy_primitives::U256;
 
+// Constants for token amounts with 18 decimals
+const TOKENS_18_DECIMALS: u128 = 1_000_000_000_000_000_000;
+const DEFAULT_INPUT_AMOUNT_TOKENS: u128 = 100;
+const DEFAULT_OUTPUT_AMOUNT_TOKENS: u128 = 95;
+
 /// Builder for creating `Eip7683OrderData` instances with a fluent API.
 ///
 /// Provides an easy way to construct EIP-7683 order data with proper validation
@@ -72,7 +77,10 @@ impl Eip7683OrderDataBuilder {
 					.as_secs() + 1800) as u32,
 			),
 			input_oracle: Some("0x0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A".to_string()),
-			inputs: vec![[U256::from(1000), U256::from(100)]],
+			inputs: vec![[
+				U256::from(1000),
+				U256::from(DEFAULT_INPUT_AMOUNT_TOKENS * TOKENS_18_DECIMALS),
+			]],
 			order_id: Some([1u8; 32]),
 			gas_limit_overrides: GasLimitOverrides::default(),
 			outputs: vec![MandateOutput {
@@ -80,7 +88,7 @@ impl Eip7683OrderDataBuilder {
 				settler: [0u8; 32],
 				chain_id: U256::from(137),
 				token: [0u8; 32],
-				amount: U256::from(100),
+				amount: U256::from(DEFAULT_OUTPUT_AMOUNT_TOKENS * TOKENS_18_DECIMALS),
 				recipient: [0u8; 32],
 				call: vec![],
 				context: vec![],

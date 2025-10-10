@@ -74,8 +74,8 @@ pub struct OracleConfig {
 /// This trait must be implemented by each settlement mechanism to handle
 /// validation of fills and management of the claim process for different
 /// order types. Settlements are order-agnostic and only handle oracle mechanics.
-#[cfg_attr(feature = "testing", mockall::automock)]
 #[async_trait]
+#[cfg_attr(feature = "testing", mockall::automock)]
 pub trait SettlementInterface: Send + Sync {
 	/// Get the oracle configuration for this settlement
 	fn oracle_config(&self) -> &OracleConfig;

@@ -4029,6 +4029,7 @@ dependencies = [
  "alloy-signer-local",
  "async-trait",
  "hex",
+ "mockall",
  "solver-types",
  "thiserror",
  "tokio",
@@ -4055,8 +4056,10 @@ name = "solver-core"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "async-trait",
  "chrono",
  "lru 0.16.1",
+ "mockall",
  "once_cell",
  "rust_decimal",
  "serde",
@@ -4093,6 +4096,7 @@ dependencies = [
  "alloy-transport-http",
  "async-trait",
  "hex",
+ "mockall",
  "reqwest",
  "serde",
  "serde_json",
@@ -4190,6 +4194,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "hex",
+ "mockall",
  "serde",
  "serde_json",
  "solver-types",
@@ -4206,6 +4211,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "async-trait",
+ "mockall",
  "reqwest",
  "rust_decimal",
  "serde",
