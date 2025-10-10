@@ -1,0 +1,524 @@
+openapi: 3.0.3
+info:
+  title: OIF Solver Quotes API
+  description: |
+    API endpoint for requesting price quotes for cross-chain intent execution.
+    This endpoint processes user requests for cross-chain token transfers and generates
+    executable quotes with appropriate signatures, settlement mechanisms, and execution guarantees.
+
+    ## Quote Lifecycle
+
+    1. User submits intent with inputs/outputs
+    2. Solver validates request and checks capabilities
+    3. Solver verifies balances and calculates costs
+    4. Multiple quote options are generated with different mechanisms
+    6. User can accept a quote by submitting to /orders
+
+    ## Supported Settlement Mechanisms
+
+    - **Permit2 Escrow** (oif-escrow-v0): Universal token approvals via Permit2
+    - **EIP-3009 Escrow** (oif-3009-v0): Native gasless transfers for supported tokens
+    - **Resource Lock** (oif-resource-lock-v0): TheCompact allocations for resource locking
+  version: 1.0.0
+servers:
+  - url: http://localhost:3000/api
+    description: Local development server
+  - url: https://api.solver.example.com/api
+    description: Production server (replace with actual URL)
+
+paths:
+  /quotes:
+    post:
+      summary: Request price quotes for cross-chain intents
+      description: |
+        Processes a quote request and returns available quote options for executing
+        a cross-chain intent. The solver evaluates the request, checks its capabilities,
+        verifies balances, and generates one or more quotes with different settlement
+        mechanisms and optimization strategies.
+
+        Each quote includes:
+        - Complete order structure ready for signing
+        - Settlement mechanism details
+        - Validity period and estimated execution time
+        - Preview of input/output amounts
+
+        Quotes are stored temporarily (default 5 minutes) and can be accepted by
+        submitting to /orders with the quoteId.
+      operationId: getQuote
+      tags:
+        - Quotes
+      requestBody:
+        required: true
+        description: Cross-chain intent quote request
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetQuoteRequest"
+            example:
+              user: "1:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+              intent:
+                intentType: "oif-swap"
+                inputs:
+                  - user: "1:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+                    asset: "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                    amount: "1000000"
+                outputs:
+                  - receiver: "42161:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+                    asset: "42161:0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+                    amount: "990000"
+                swapType: "exact-input"
+                originSubmission:
+                  mode: "user"
+                  schemes: ["permit2"]
+              supportedTypes: ["oif-escrow-v0"]
+      responses:
+        "200":
+          description: Successfully generated quote options
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetQuoteResponse"
+              example:
+                quotes:
+                  - order:
+                      type: "oif-escrow-v0"
+                      payload:
+                        signatureType: "eip712"
+                        domain:
+                          name: "Permit2"
+                          chainId: "1"
+                          verifyingContract: "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+                        primaryType: "PermitBatchWitnessTransferFrom"
+                        message:
+                          permitted:
+                            - token: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                              amount: "1000000"
+                          spender: "0x1234567890abcdef1234567890abcdef12345678"
+                          nonce: "123456"
+                          deadline: "1700000000"
+                          witness:
+                            outputs:
+                              - chainId: "42161"
+                                token: "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+                                amount: "990000"
+                                recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+                    failureHandling: "refund-automatic"
+                    partialFill: false
+                    validUntil: 1700000300
+                    eta: 120
+                    quoteId: "quote_abc123def456"
+                    provider: "oif-solver-v1"
+                    preview:
+                      inputs:
+                        - user: "1:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+                          asset: "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                          amount: "1000000"
+                      outputs:
+                        - receiver: "42161:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+                          asset: "42161:0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+                          amount: "990000"
+        "400":
+          description: Invalid request format or parameters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "INVALID_REQUEST"
+                message: "Input amount is required for exact-input swap type"
+        "422":
+          description: Request cannot be fulfilled (unsupported asset, insufficient liquidity, etc.)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                unsupportedAsset:
+                  value:
+                    error: "UNSUPPORTED_ASSET"
+                    message: "Asset not supported by solver: 1:0x1234..."
+                    details:
+                      asset: "1:0x1234567890abcdef1234567890abcdef12345678"
+                insufficientLiquidity:
+                  value:
+                    error: "INSUFFICIENT_LIQUIDITY"
+                    message: "Insufficient liquidity available for the requested amount"
+        "503":
+          description: Solver capacity exceeded or service temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "SOLVER_CAPACITY_EXCEEDED"
+                message: "Solver capacity exceeded, please try again later"
+                retryAfter: 60
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "INTERNAL_ERROR"
+                message: "An internal error occurred while processing the quote request"
+
+components:
+  schemas:
+    GetQuoteRequest:
+      type: object
+      description: Request for price quotes on a cross-chain intent
+      required:
+        - user
+        - intent
+        - supportedTypes
+      properties:
+        user:
+          type: string
+          description: User address in ERC-7930 interoperable format (chainId:address)
+          pattern: "^[0-9]+:0x[a-fA-F0-9]{40}$"
+          example: "1:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+        intent:
+          $ref: "#/components/schemas/IntentRequest"
+        supportedTypes:
+          type: array
+          description: List of order types supported by the client
+          items:
+            type: string
+            enum: ["oif-escrow-v0", "oif-resource-lock-v0", "oif-3009-v0"]
+          example: ["oif-escrow-v0", "oif-resource-lock-v0"]
+
+    IntentRequest:
+      type: object
+      description: Cross-chain intent specification
+      required:
+        - intentType
+        - inputs
+        - outputs
+      properties:
+        intentType:
+          type: string
+          enum: ["oif-swap"]
+          description: Type of intent operation
+          example: "oif-swap"
+        inputs:
+          type: array
+          description: Input assets from the user
+          items:
+            $ref: "#/components/schemas/QuoteInput"
+        outputs:
+          type: array
+          description: Output assets to be received
+          items:
+            $ref: "#/components/schemas/QuoteOutput"
+        swapType:
+          type: string
+          enum: ["exact-input", "exact-output"]
+          description: |
+            Swap type determining which amounts are fixed:
+            - exact-input: Input amounts are exact, outputs are estimates
+            - exact-output: Output amounts are exact, inputs are estimates
+          example: "exact-input"
+        minValidUntil:
+          type: integer
+          format: int64
+          description: Minimum Unix timestamp for quote validity
+          example: 1700000000
+        preference:
+          type: string
+          enum: ["price", "speed", "input-priority", "trust-minimization"]
+          description: Optimization preference for quote generation
+          example: "price"
+        originSubmission:
+          $ref: "#/components/schemas/OriginSubmission"
+        failureHandling:
+          type: array
+          description: Accepted failure handling modes
+          items:
+            type: string
+            enum: ["refund-automatic", "refund-claim", "needs-new-signature"]
+          example: ["refund-automatic"]
+        partialFill:
+          type: boolean
+          description: Whether partial fills are acceptable
+          example: false
+        metadata:
+          type: object
+          description: Additional metadata for the intent
+          additionalProperties: true
+
+    QuoteInput:
+      type: object
+      description: Input asset specification
+      required:
+        - user
+        - asset
+      properties:
+        user:
+          type: string
+          description: User address in ERC-7930 format
+          pattern: "^[0-9]+:0x[a-fA-F0-9]{40}$"
+          example: "1:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+        asset:
+          type: string
+          description: Asset address in ERC-7930 format
+          pattern: "^[0-9]+:0x[a-fA-F0-9]{40}$"
+          example: "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+        amount:
+          type: string
+          description: Amount as decimal string (required for exact-input, optional for exact-output)
+          example: "1000000"
+        lock:
+          $ref: "#/components/schemas/AssetLockReference"
+
+    QuoteOutput:
+      type: object
+      description: Output asset specification
+      required:
+        - receiver
+        - asset
+      properties:
+        receiver:
+          type: string
+          description: Receiver address in ERC-7930 format
+          pattern: "^[0-9]+:0x[a-fA-F0-9]{40}$"
+          example: "42161:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+        asset:
+          type: string
+          description: Asset address in ERC-7930 format
+          pattern: "^[0-9]+:0x[a-fA-F0-9]{40}$"
+          example: "42161:0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+        amount:
+          type: string
+          description: Amount as decimal string (required for exact-output, optional for exact-input)
+          example: "990000"
+        calldata:
+          type: string
+          description: Optional calldata for the output
+          example: "0x"
+
+    AssetLockReference:
+      type: object
+      description: Reference to an existing asset lock
+      required:
+        - kind
+      properties:
+        kind:
+          type: string
+          enum: ["the-compact", "rhinestone"]
+          description: Lock mechanism type
+          example: "the-compact"
+        params:
+          type: object
+          description: Lock-specific parameters
+          additionalProperties: true
+
+    OriginSubmission:
+      type: object
+      description: Origin submission preferences
+      required:
+        - mode
+      properties:
+        mode:
+          type: string
+          enum: ["user", "protocol"]
+          description: Who submits the origin transaction
+          example: "user"
+        schemes:
+          type: array
+          description: Supported authentication schemes
+          items:
+            type: string
+            enum: ["erc4337", "permit2", "erc20-permit", "eip3009"]
+          example: ["permit2"]
+
+    GetQuoteResponse:
+      type: object
+      description: Response containing one or more quote options
+      required:
+        - quotes
+      properties:
+        quotes:
+          type: array
+          description: Available quote options
+          items:
+            $ref: "#/components/schemas/Quote"
+
+    Quote:
+      type: object
+      description: A quote option with complete order details
+      required:
+        - order
+        - failureHandling
+        - partialFill
+        - validUntil
+        - quoteId
+        - preview
+      properties:
+        order:
+          oneOf:
+            - $ref: "#/components/schemas/OifEscrowV0"
+            - $ref: "#/components/schemas/OifResourceLockV0"
+            - $ref: "#/components/schemas/Oif3009V0"
+          discriminator:
+            propertyName: type
+            mapping:
+              oif-escrow-v0: "#/components/schemas/OifEscrowV0"
+              oif-resource-lock-v0: "#/components/schemas/OifResourceLockV0"
+              oif-3009-v0: "#/components/schemas/Oif3009V0"
+        failureHandling:
+          type: string
+          enum: ["refund-automatic", "refund-claim", "needs-new-signature"]
+          description: Failure handling mechanism
+          example: "refund-automatic"
+        partialFill:
+          type: boolean
+          description: Whether partial fills are supported
+          example: false
+        validUntil:
+          type: integer
+          format: int64
+          description: Unix timestamp when quote expires
+          example: 1700000300
+        eta:
+          type: integer
+          description: Estimated time to completion in seconds
+          example: 120
+        quoteId:
+          type: string
+          description: Unique quote identifier for acceptance
+          example: "quote_abc123def456"
+        provider:
+          type: string
+          description: Solver provider identifier
+          example: "oif-solver-v1"
+        preview:
+          $ref: "#/components/schemas/QuotePreview"
+
+    QuotePreview:
+      type: object
+      description: Informational preview of quote amounts (must be verified against order)
+      required:
+        - inputs
+        - outputs
+      properties:
+        inputs:
+          type: array
+          items:
+            $ref: "#/components/schemas/QuoteInput"
+        outputs:
+          type: array
+          items:
+            $ref: "#/components/schemas/QuoteOutput"
+
+    OifEscrowV0:
+      type: object
+      description: Permit2-based escrow order (v0)
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          enum: ["oif-escrow-v0"]
+          example: "oif-escrow-v0"
+        payload:
+          $ref: "#/components/schemas/OrderPayload"
+
+    OifResourceLockV0:
+      type: object
+      description: Resource lock order via TheCompact (v0)
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          enum: ["oif-resource-lock-v0"]
+          example: "oif-resource-lock-v0"
+        payload:
+          $ref: "#/components/schemas/OrderPayload"
+
+    Oif3009V0:
+      type: object
+      description: EIP-3009 based escrow order (v0)
+      required:
+        - type
+        - payload
+        - metadata
+      properties:
+        type:
+          type: string
+          enum: ["oif-3009-v0"]
+          example: "oif-3009-v0"
+        payload:
+          $ref: "#/components/schemas/OrderPayload"
+        metadata:
+          type: object
+          description: EIP-3009 specific metadata
+          additionalProperties: true
+
+    OrderPayload:
+      type: object
+      description: EIP-712 compliant order structure
+      required:
+        - signatureType
+        - domain
+        - primaryType
+        - message
+      properties:
+        signatureType:
+          type: string
+          enum: ["eip712"]
+          description: Signature standard
+          example: "eip712"
+        domain:
+          type: object
+          description: EIP-712 domain separator
+          additionalProperties: true
+          example:
+            name: "Permit2"
+            chainId: "1"
+            verifyingContract: "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+        primaryType:
+          type: string
+          description: Primary type for EIP-712 signing
+          example: "PermitBatchWitnessTransferFrom"
+        message:
+          type: object
+          description: Message object to be signed
+          additionalProperties: true
+        types:
+          type: object
+          description: EIP-712 type definitions (optional, may be inferred)
+          additionalProperties: true
+
+    ErrorResponse:
+      type: object
+      description: Standard error response
+      required:
+        - error
+        - message
+      properties:
+        error:
+          type: string
+          description: Error type code
+          example: "INVALID_REQUEST"
+        message:
+          type: string
+          description: Human-readable error description
+          example: "Input amount is required for exact-input swap type"
+        details:
+          type: object
+          description: Additional error context
+          additionalProperties: true
+        retryAfter:
+          type: integer
+          description: Suggested retry delay in seconds (for 503 errors)
+          example: 60
+
+tags:
+  - name: Quotes
+    description: |
+      Endpoints for requesting price quotes for cross-chain intents.
+      Quotes provide complete order structures ready for signing and execution.

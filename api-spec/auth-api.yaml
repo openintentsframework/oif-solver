@@ -1,0 +1,317 @@
+openapi: 3.0.3
+info:
+  title: OIF Solver Authentication API
+  description: |
+    API endpoints for JWT-based authentication and authorization for the OIF Solver.
+
+    ## Authentication Flow
+
+    1. **Client Registration**: POST /auth/register to obtain initial access and refresh tokens
+    2. **API Access**: Include access token in Authorization header: `Bearer <access_token>`
+    3. **Token Refresh**: When access token expires, POST /auth/refresh with refresh token to get new tokens
+    4. **Scope-Based Authorization**: Different endpoints require different scopes
+
+    ## Token Lifecycle
+
+    - **Access Tokens**: Short-lived (default 1 hour), used for API authentication
+    - **Refresh Tokens**: Long-lived (default 30 days), used to obtain new access tokens
+    - **Token Rotation**: Each refresh invalidates the old refresh token and issues a new one
+
+    ## Scopes
+
+    - `read-orders`: Read access to order information (GET /orders/{id})
+    - `create-orders`: Permission to create new orders (POST /orders)
+    - `admin-all`: Full administrative access to all endpoints
+
+    ## Security Notes
+
+    - Authentication is optional and configured per solver instance
+    - If authentication is disabled, all endpoints are publicly accessible
+    - Refresh tokens are single-use and automatically rotated on each refresh
+    - Client IDs must be between 3-100 characters
+  version: 1.0.0
+servers:
+  - url: http://localhost:3000/api
+    description: Local development server
+  - url: https://api.solver.example.com/api
+    description: Production server (replace with actual URL)
+
+paths:
+  /auth/register:
+    post:
+      summary: Register a new client
+      description: |
+        Allows clients to self-register and receive both access and refresh tokens
+        for API authentication. This endpoint is used for initial client onboarding.
+
+        The access token has a short expiry (1 hour by default) and should be included
+        in the Authorization header for subsequent API calls. The refresh token has a
+        longer expiry (30 days by default) and should be used to obtain new tokens
+        when the access token expires.
+
+        If no scopes are provided, the client is granted basic read permissions (read-orders).
+      operationId: registerClient
+      tags:
+        - Authentication
+      requestBody:
+        required: true
+        description: Client registration details
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+            examples:
+              basicRegistration:
+                summary: Basic registration with default scopes
+                value:
+                  client_id: "my-app-client"
+                  client_name: "My Application"
+              customScopes:
+                summary: Registration with custom scopes
+                value:
+                  client_id: "solver-integration"
+                  client_name: "Solver Integration Service"
+                  scopes: ["read-orders", "create-orders"]
+              adminAccess:
+                summary: Registration with admin access
+                value:
+                  client_id: "admin-dashboard"
+                  client_name: "Admin Dashboard"
+                  scopes: ["admin-all"]
+      responses:
+        "201":
+          description: Client successfully registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisterResponse"
+              example:
+                access_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                refresh_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                client_id: "my-app-client"
+                access_token_expires_at: 1700003600
+                refresh_token_expires_at: 1702595600
+                scopes: ["read-orders"]
+                token_type: "Bearer"
+        "400":
+          description: Invalid request (empty or invalid client_id, invalid scopes)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                emptyClientId:
+                  value:
+                    error: "Client ID cannot be empty"
+                invalidClientIdLength:
+                  value:
+                    error: "Client ID must be between 3 and 100 characters"
+                invalidScopes:
+                  value:
+                    error: "Invalid scopes: Unknown scope: invalid-scope"
+        "500":
+          description: Failed to generate tokens (internal server error)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "Failed to generate access token"
+        "503":
+          description: Authentication service not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "Authentication service is not configured"
+
+  /auth/refresh:
+    post:
+      summary: Refresh access token
+      description: |
+        Exchanges a valid refresh token for new access and refresh tokens.
+        The old refresh token is invalidated and cannot be reused.
+
+        This endpoint implements token rotation for enhanced security:
+        - Each refresh operation generates both a new access token and a new refresh token
+        - The old refresh token is immediately invalidated
+        - If the old refresh token is reused, the request will fail
+
+        Use this endpoint when the access token expires (typically after 1 hour)
+        to continue making authenticated API calls.
+      operationId: refreshToken
+      tags:
+        - Authentication
+      requestBody:
+        required: true
+        description: Refresh token to exchange
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+            example:
+              refresh_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+      responses:
+        "200":
+          description: Tokens successfully refreshed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisterResponse"
+              example:
+                access_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                refresh_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                client_id: "my-app-client"
+                access_token_expires_at: 1700007200
+                refresh_token_expires_at: 1702599200
+                scopes: ["read-orders"]
+                token_type: "Bearer"
+        "400":
+          description: Invalid request (empty refresh token)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "Refresh token cannot be empty"
+        "401":
+          description: Invalid or expired refresh token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "Invalid or expired refresh token"
+        "503":
+          description: Authentication service not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "Authentication service is not configured"
+
+components:
+  schemas:
+    RegisterRequest:
+      type: object
+      description: Request payload for client registration
+      required:
+        - client_id
+      properties:
+        client_id:
+          type: string
+          minLength: 3
+          maxLength: 100
+          description: |
+            Unique client identifier (e.g., application name, user email, service name).
+            Must be between 3 and 100 characters.
+          example: "my-app-client"
+        client_name:
+          type: string
+          description: Optional human-readable client name for display purposes
+          example: "My Application"
+        scopes:
+          type: array
+          description: |
+            Requested scopes for authorization. If not provided, defaults to ["read-orders"].
+            Available scopes:
+            - read-orders: Read access to order information
+            - create-orders: Permission to create new orders
+            - admin-all: Full administrative access
+          items:
+            type: string
+            enum: ["read-orders", "create-orders", "admin-all"]
+          example: ["read-orders", "create-orders"]
+
+    RefreshRequest:
+      type: object
+      description: Request payload for token refresh
+      required:
+        - refresh_token
+      properties:
+        refresh_token:
+          type: string
+          description: The refresh token to exchange for new tokens
+          example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+
+    RegisterResponse:
+      type: object
+      description: Response payload for successful registration or refresh
+      required:
+        - access_token
+        - refresh_token
+        - client_id
+        - access_token_expires_at
+        - refresh_token_expires_at
+        - scopes
+        - token_type
+      properties:
+        access_token:
+          type: string
+          description: |
+            JWT access token for API authentication.
+            Include in Authorization header as: `Bearer <access_token>`
+          example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJteS1hcHAtY2xpZW50Iiwic2NvcGUiOlsicmVhZC1vcmRlcnMiXSwiZXhwIjoxNzAwMDAzNjAwLCJpYXQiOjE3MDAwMDAwMDAsImlzcyI6Im9pZi1zb2x2ZXIifQ..."
+        refresh_token:
+          type: string
+          description: |
+            JWT refresh token for obtaining new access tokens.
+            Use with /auth/refresh endpoint when access token expires.
+          example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJteS1hcHAtY2xpZW50Iiwic2NvcGUiOlsicmVhZC1vcmRlcnMiXSwiZXhwIjoxNzAyNTk1NjAwLCJpYXQiOjE3MDAwMDAwMDAsImlzcyI6Im9pZi1zb2x2ZXItcmVmcmVzaCJ9..."
+        client_id:
+          type: string
+          description: The client identifier
+          example: "my-app-client"
+        access_token_expires_at:
+          type: integer
+          format: int64
+          description: Unix timestamp when the access token expires
+          example: 1700003600
+        refresh_token_expires_at:
+          type: integer
+          format: int64
+          description: Unix timestamp when the refresh token expires
+          example: 1702595600
+        scopes:
+          type: array
+          description: Granted scopes for this client
+          items:
+            type: string
+          example: ["read-orders"]
+        token_type:
+          type: string
+          description: Token type (always "Bearer")
+          example: "Bearer"
+
+    ErrorResponse:
+      type: object
+      description: Error response for authentication failures
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Error message
+          example: "Client ID cannot be empty"
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT token obtained from /auth/register or /auth/refresh.
+        Include in requests as: `Authorization: Bearer <access_token>`
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Authentication
+    description: |
+      Endpoints for JWT-based authentication and authorization.
+
+      Use these endpoints to obtain and refresh access tokens for protected API endpoints.
+      Authentication is optional and configured per solver instance.
