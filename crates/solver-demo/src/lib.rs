@@ -208,7 +208,10 @@ impl Context {
 		};
 
 		// Check if auth is enabled
-		let auth_enabled = self.config.solver.api
+		let auth_enabled = self
+			.config
+			.solver
+			.api
 			.as_ref()
 			.and_then(|api| api.auth.as_ref())
 			.map(|auth| auth.enabled)
