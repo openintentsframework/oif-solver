@@ -420,17 +420,18 @@ The solver provides a REST API for interacting with the system and submitting of
 
 #### Quotes
 
-- **POST `/api/quotes`** - Get a price quote for a cross-chain swap
-  - Request body: `{ originChainId, outputChainId, inputToken, outputToken, inputAmount }`
-  - Returns: Quote with `quoteId`, amounts, and cost breakdown
+- **POST `/api/quotes`** - Request price quotes for a cross-chain swap
+  - Request body: `{ user, intent: { intentType, inputs, outputs, swapType, originSubmission }, supportedTypes }`
+  - Returns: Array of quotes with `quoteId`, order structure ready for signing, and preview of amounts
 
 #### Orders
 
 - **POST `/api/orders`** - Submit a new order (direct or from quote)
 
-  - Direct submission: `{ order: "0x...", sponsor: "0x...", signature: "0x00...", lock_type: "..." }`
   - Quote acceptance: `{ quoteId: "...", signature: "0x..." }`
-  - Returns: `{ status: "success", order_id: "...", message: null }`
+  - Direct submission: `{ order: { type, payload }, signature: "0x...", originSubmission }`
+  - Supported order types: `oif-escrow-v0`, `oif-resource-lock-v0`, `oif-3009-v0`
+  - Returns: `{ orderId: "...", status: "received", message: null }`
 
 - **GET `/api/orders/{id}`** - Get order status and details
   - Returns complete order information including status, amounts, settlement data, and fill transaction
@@ -447,13 +448,58 @@ The solver provides a REST API for interacting with the system and submitting of
 ### Example Usage
 
 ```bash
-# Submit an off-chain intent order
+# Request a quote for a cross-chain swap
+curl -X POST http://localhost:3000/api/quotes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user": "0x74...,
+    "intent": {
+      "intentType": "oif-swap",
+      "inputs": [{
+        "user": "0x74...",
+        "asset": "0x12...",
+        "amount": "1000000"
+      }],
+      "outputs": [{
+        "receiver": "0x11...",
+        "asset": "0x11...",
+        "amount": "990000"
+      }],
+      "swapType": "exact-input",
+      "originSubmission": {
+        "mode": "user",
+        "schemes": ["permit2"]
+      }
+    },
+    "supportedTypes": ["oif-escrow-v0"]
+  }'
+
+# Accept a quote (submit order with quoteId)
 curl -X POST http://localhost:3000/api/orders \
   -H "Content-Type: application/json" \
   -d '{
-    "order": "0x...",
-    "sponsor": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-    "signature": "0x00..."
+    "quoteId": "quote_abc123def456",
+    "signature": "0x1234567890abcdef..."
+  }'
+
+# Submit an order directly (without quote)
+curl -X POST http://localhost:3000/api/orders \
+  -H "Content-Type: application/json" \
+  -d '{
+    "order": {
+      "type": "oif-escrow-v0",
+      "payload": {
+        "signatureType": "eip712",
+        "domain": {...},
+        "primaryType": "PermitBatchWitnessTransferFrom",
+        "message": {...}
+      }
+    },
+    "signature": "0x1234567890abcdef...",
+    "originSubmission": {
+      "mode": "user",
+      "schemes": ["permit2"]
+    }
   }'
 
 # Check order status
@@ -546,15 +592,17 @@ cargo run -p solver-demo -- intent submit .oif-demo/requests/post_order.req.json
 cargo run -p solver-demo -- token balance all
 ```
 
-**Important:** The demo tool requires the Permit2 contract bytecode file located at `crates/solver-demo/data/permit2_bytecode.hex`. This file contains the canonical Permit2 bytecode and is essential for deploying contracts to local Anvil chains. The bytecode is automatically used during the `env deploy` step.
+[!NOTE]
 
-To fetch and store the Permit2 bytecode, run this command from the project root:
-
-```bash
-# Fetch Permit2 bytecode from Ethereum mainnet and save to the required location
-# This will skip if the file already exists
-[ ! -f crates/solver-demo/data/permit2_bytecode.hex ] && mkdir -p crates/solver-demo/data && cast code 0x000000000022D473030F116dDEE9F6B43aC78BA3 --rpc-url https://eth.llamarpc.com > crates/solver-demo/data/permit2_bytecode.hex || echo "Permit2 bytecode already exists at crates/solver-demo/data/permit2_bytecode.hex"
-```
+> The demo tool requires the Permit2 contract bytecode file located at `crates/solver-demo/data/permit2_bytecode.hex`. This file contains the canonical Permit2 bytecode and is essential for deploying contracts to local Anvil chains. The bytecode is automatically used during the `env deploy` step.
+>
+> To fetch and store the Permit2 bytecode, run this command from the project root:
+>
+> ```bash
+> # Fetch Permit2 bytecode from Ethereum mainnet and save to the required location
+> # This will skip if the file already exists
+> [ ! -f crates/solver-demo/data/permit2_bytecode.hex ] && mkdir -p crates/solver-demo/data && cast code 0x000000000022D473030F116dDEE9F6B43aC78BA3 --rpc-url https://eth.llamarpc.com > crates/solver-demo/data/permit2_bytecode.hex || echo "Permit2 bytecode already exists at crates/solver-demo/data/permit2_bytecode.hex"
+> ```
 
 ### Commands Overview
 
