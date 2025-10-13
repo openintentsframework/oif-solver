@@ -65,7 +65,7 @@ jobs:
               - '**/*.rs'
               - tests/**/*.json
   ci:
-    if: ${{ github.event.pull_request.draft == false && always() }}
+    if: ${{ github.event_name == 'push' || (github.event.pull_request && github.event.pull_request.draft == false) }}
     permissions:
       contents: none
     name: CI
