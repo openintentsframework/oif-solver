@@ -22,14 +22,16 @@ oif-solver/
 │   ├── solver-config/           # Configuration management
 │   ├── solver-core/             # Orchestration engine
 │   ├── solver-delivery/         # Transaction submission
+│   ├── solver-demo/             # Testing and demo CLI
 │   ├── solver-discovery/        # Intent monitoring
 │   ├── solver-order/            # Order processing
+│   ├── solver-pricing/          # Price and profitability calculations
 │   ├── solver-service/          # Main executable
 │   ├── solver-settlement/       # Settlement verification
 │   ├── solver-storage/          # State persistence
 │   └── solver-types/            # Shared types
 ├── config/                      # Configuration examples
-└── scripts/                     # Deployment and demo scripts
+└── scripts/                     # E2E testing and deployment scripts
 ```
 
 ## Directory Responsibilities
@@ -47,11 +49,16 @@ oif-solver/
 - **solver-order**: Intent validation, strategy evaluation, and transaction generation
 - **solver-delivery**: Reliable transaction submission and confirmation monitoring
 - **solver-settlement**: Fill validation and oracle verification management
+- **solver-pricing**: Pricing oracle implementations for asset valuation and profitability calculations
 
 ### Orchestration
 
 - **solver-core**: Event-driven orchestration of the entire order lifecycle
 - **solver-service**: Binary entry point that wires up all components
+
+### Development & Testing
+
+- **solver-demo**: CLI tool for testing and demonstrating cross-chain intent execution in development environments
 
 ## High-Level System Flow
 
@@ -72,23 +79,47 @@ sequenceDiagram
     Order->>Core: Validated Order
     Core->>Storage: Store Order
 
-    Note over Core,Settlement: Intent Processing
+    Note over Core,Settlement: Intent Execution (Prepare → Fill)
     Core->>Order: Check Execution Strategy
-    Order->>Core: Execute Decision
+    Order->>Core: Execute Decision (Status: Executing)
     Core->>Order: Generate Fill Transaction
-    Order->>Core: Transaction Ready
-    Core->>Delivery: Submit Transaction
-    Delivery->>Core: Transaction Submitted
+    Order->>Core: Fill Transaction Ready
+    Core->>Delivery: Submit Fill Transaction
+    Delivery->>Core: Fill Confirmed (Status: Executed)
 
-    Note over Core,Settlement: Settlement Processing
-    Core->>Delivery: Monitor Transaction
-    Delivery->>Core: Transaction Confirmed
-    Core->>Settlement: Validate Fill
-    Settlement->>Core: Fill Validated
-    Core->>Order: Generate Claim
+    Note over Core,Settlement: Post-Fill Processing
+    Core->>Settlement: Generate PostFill Transaction
+    Settlement->>Core: PostFill Transaction (if needed)
+    Core->>Delivery: Submit PostFill
+    Delivery->>Core: PostFill Confirmed (Status: PostFilled)
+
+    Note over Core,Settlement: Settlement Monitoring
+    Core->>Settlement: Start Monitoring for Claim Readiness
+    Settlement->>Core: Monitor Fill Proof
+    Settlement->>Core: Dispute Period Passed
+
+    Note over Core,Settlement: Pre-Claim & Claim
+    Core->>Settlement: Generate PreClaim Transaction
+    Settlement->>Core: PreClaim Transaction (if needed)
+    Core->>Delivery: Submit PreClaim
+    Delivery->>Core: PreClaim Confirmed (Status: PreClaimed)
+    Core->>Order: Generate Claim Transaction
+    Order->>Core: Claim Transaction Ready
     Core->>Delivery: Submit Claim
-    Delivery->>Core: Claim Confirmed
+    Delivery->>Core: Claim Confirmed (Status: Finalized)
 ```
+
+## Transaction State Transitions
+
+The solver manages orders through distinct transaction states with the following progression:
+
+1. **Prepare** → Status: `Executing` (emits `OrderEvent::Executing`)
+2. **Fill** → Status: `Executed` (emits `SettlementEvent::PostFillReady`)
+3. **PostFill** → Status: `PostFilled` (emits `SettlementEvent::StartMonitoring`)
+4. **PreClaim** → Status: `PreClaimed` (emits `SettlementEvent::ClaimReady`)
+5. **Claim** → Status: `Finalized` (emits `SettlementEvent::Completed`)
+
+Each transition updates the order status in storage and triggers appropriate events for downstream processing.
 
 ## Module Deep Dive
 
