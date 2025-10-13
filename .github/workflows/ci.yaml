@@ -27,7 +27,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   changed_files:
-    if: ${{ github.event.pull_request.draft == false }}
+    if: ${{ github.event.pull_request.draft == false || github.event_name == 'push' }}
     runs-on: ubuntu-latest
     name: Test changed-files
     outputs:
@@ -65,7 +65,7 @@ jobs:
               - '**/*.rs'
               - tests/**/*.json
   ci:
-    if: ${{ github.event.pull_request.draft == false && always() }}
+    if: ${{ github.event.pull_request.draft == false || github.event_name == 'push' }}
     permissions:
       contents: none
     name: CI
@@ -163,7 +163,7 @@ jobs:
       - name: Report status
         run: cargo clippy --all-features --all-targets -- -D warnings --allow deprecated
   test:
-    if: ${{ github.event.pull_request.draft == false && needs.changed_files.outputs.changed-tests-files == 'true' }}
+    if: ${{ (github.event.pull_request.draft == false || github.event_name == 'push') && needs.changed_files.outputs.changed-tests-files == 'true' }}
     permissions:
       contents: read
     needs:
