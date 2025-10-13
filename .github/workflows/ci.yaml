@@ -27,7 +27,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   changed_files:
-    if: ${{ github.event_name == 'push' || (github.event.pull_request && github.event.pull_request.draft == false) }}
+    if: ${{ github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     name: Test changed-files
     outputs:
@@ -163,7 +163,7 @@ jobs:
       - name: Report status
         run: cargo clippy --all-features --all-targets -- -D warnings --allow deprecated
   test:
-    if: ${{ (github.event_name == 'push' || (github.event.pull_request && github.event.pull_request.draft == false)) && needs.changed_files.outputs.changed-tests-files == 'true' }}
+    if: ${{ github.event.pull_request.draft == false && needs.changed_files.outputs.changed-tests-files == 'true' }}
     permissions:
       contents: read
     needs:
@@ -203,4 +203,4 @@ jobs:
           LLVM_PROFILE_FILE: unit-%p-%m.profraw
           RUSTFLAGS: -Cinstrument-coverage
           RUST_TEST_THREADS: 1
-        run: cargo llvm-cov --workspace --locked --lib --bins --lcov --output-path unit-lcov.info
+        run: cargo hack llvm-cov --locked --workspace --lib --lcov --output-path unit-lcov.info
