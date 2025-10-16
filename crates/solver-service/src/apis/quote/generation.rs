@@ -49,13 +49,103 @@
 //! - **Input Priority**: Preference for specific input tokens
 
 use super::custody::{CustodyDecision, CustodyStrategy, EscrowKind, LockKind};
+use super::router::uniswap::{UniswapConfig, UniswapRouter};
+use super::router::uniswap_v3_onchain::UniswapV3OnchainRouter;
+
+/// Public utility function to enrich a quote output with Uniswap V3 on-chain routing.
+/// Can be called from other modules like permit2.
+///
+/// Returns (calldata, amount_out, recipient_override) where:
+/// - calldata: Uniswap V3 SwapRouter calldata (empty if routing disabled/failed)
+/// - amount_out: Quoted output amount from on-chain Quoter (or original amount if routing disabled)
+/// - recipient_override: SwapRouter address (None if routing disabled)
+pub async fn try_enrich_with_uniswap_v3_onchain(
+	input_token: &alloy_primitives::Address,
+	output_token: &alloy_primitives::Address,
+	recipient: &alloy_primitives::Address,
+	input_amount: &alloy_primitives::U256,
+	output_amount: &alloy_primitives::U256,
+	output_chain_id: u64,
+	config: &Config,
+) -> Result<(Vec<u8>, alloy_primitives::U256, Option<alloy_primitives::Address>), QuoteError> {
+	// Check if Uniswap V3 on-chain routing is enabled
+	let v3_config = match config
+		.api
+		.as_ref()
+		.and_then(|api| api.quote.as_ref())
+		.and_then(|quote| quote.uniswap_v3_onchain.as_ref())
+	{
+		Some(cfg) if cfg.enabled => cfg,
+		_ => {
+			// Uniswap V3 on-chain not enabled, return empty calldata
+			return Ok((vec![], *output_amount, None));
+		},
+	};
+
+	tracing::info!("try_enrich_with_uniswap_v3_onchain: Using Uniswap V3 on-chain routing");
+
+	// Get RPC URL from output network configuration
+	let output_network = config.networks.get(&output_chain_id).ok_or_else(|| {
+		QuoteError::InvalidRequest(format!(
+			"No network config for output chain {}",
+			output_chain_id
+		))
+	})?;
+	let rpc_url = output_network
+		.rpc_urls
+		.first()
+		.ok_or_else(|| QuoteError::InvalidRequest(format!(
+			"No RPC URL configured for chain {}",
+			output_chain_id
+		)))?
+		.http
+		.as_ref()
+		.ok_or_else(|| QuoteError::InvalidRequest(format!(
+			"No HTTP RPC URL configured for chain {}",
+			output_chain_id
+		)))?
+		.as_str();
+
+	// Log V3 on-chain routing configuration
+	tracing::info!(
+		"V3 on-chain routing: chain={}, rpc={}, quoter={:?}, router={:?}",
+		output_chain_id,
+		rpc_url,
+		v3_config.quoter.get(&output_chain_id),
+		v3_config.router.get(&output_chain_id)
+	);
+
+	// Build Uniswap V3 on-chain router
+	let router = UniswapV3OnchainRouter::from_config(v3_config)?;
+
+	// Get route and calldata
+	let (calldata, amount_out, router_addr) = router
+		.get_route_and_calldata(
+			rpc_url,
+			output_chain_id,
+			*input_token,
+			*output_token,
+			*input_amount,
+			*recipient,
+		)
+		.await?;
+
+	tracing::info!(
+		"✓ Uniswap V3 on-chain route found: amount_out={}, calldata_len={} bytes, router={:?}",
+		amount_out,
+		calldata.len(),
+		router_addr
+	);
+
+	Ok((calldata, amount_out, Some(router_addr)))
+}
 use crate::eip712::{compact, get_domain_separator};
 use solver_config::{Config, QuoteConfig};
 use solver_delivery::DeliveryService;
 use solver_settlement::{SettlementInterface, SettlementService};
 use solver_types::{
 	with_0x_prefix, GetQuoteRequest, InteropAddress, Quote, QuoteDetails, QuoteError, QuoteOrder,
-	QuotePreference, SignatureType,
+	QuotePreference, RequestedOutput, SignatureType,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -94,15 +184,21 @@ impl QuoteGenerator {
 		let mut quotes = Vec::new();
 		for input in &request.available_inputs {
 			let custody_decision = self.custody_strategy.decide_custody(input).await?;
-			if let Ok(quote) = self
+			match self
 				.generate_quote_for_settlement(request, config, &custody_decision)
 				.await
 			{
-				quotes.push(quote);
+				Ok(quote) => {
+					quotes.push(quote);
+				}
+				Err(e) => {
+					tracing::warn!("Failed to generate quote for input: {}", e);
+				}
 			}
 		}
 		if quotes.is_empty() {
-			return Err(QuoteError::InsufficientLiquidity);
+			// Quote-only mode: return a more generic error instead of liquidity error
+			return Err(QuoteError::Internal("No quotes could be generated".to_string()));
 		}
 		self.sort_quotes_by_preference(&mut quotes, &request.preference);
 		Ok(quotes)
@@ -226,14 +322,14 @@ impl QuoteGenerator {
 				QuoteError::InvalidRequest(format!("Invalid chain ID in asset address: {}", e))
 			})?;
 
-		// Build structured domain object for Permit2
-		let domain_object = self.build_permit2_domain_object(config, chain_id).await?;
+	// Build structured domain object for Permit2
+	let domain_object = self.build_permit2_domain_object(config, chain_id).await?;
 
-		// Generate the message object without pre-computed digest
-		let message_obj =
-			self.build_permit2_message_object(request, config, settlement, selected_oracle)?;
+	// Generate the message object without pre-computed digest
+	let message_obj =
+		self.build_permit2_message_object(request, config, settlement, selected_oracle).await?;
 
-		Ok(QuoteOrder {
+	Ok(QuoteOrder {
 			signature_type: SignatureType::Eip712,
 			domain: domain_object,
 			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
@@ -365,12 +461,21 @@ impl QuoteGenerator {
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input token: {}", e)))?;
 		let input_amount = input.amount.to_string();
 
-		// Use std::process::Command to call cast (same as scripts)
-		let rpc_url = if input_chain_id == 31337 {
-			"http://localhost:8545"
-		} else {
-			"http://localhost:8546"
-		};
+		// Get RPC URL from network configuration instead of hardcoded localhost
+		let rpc_url = input_network
+			.rpc_urls
+			.first()
+			.ok_or_else(|| QuoteError::InvalidRequest(format!(
+				"No RPC URL configured for chain {}",
+				input_chain_id
+			)))?
+			.http
+			.as_ref()
+			.ok_or_else(|| QuoteError::InvalidRequest(format!(
+				"No HTTP RPC URL configured for chain {}",
+				input_chain_id
+			)))?
+			.as_str();
 
 		let input_settler_address = format!(
 			"0x{:040x}",
@@ -590,18 +695,77 @@ impl QuoteGenerator {
 			]));
 		}
 
-		// Convert outputs to MandateOutput format
-		let mut outputs_array = Vec::new();
-		for output in &request.requested_outputs {
-			let output_token_address = output.asset.ethereum_address().map_err(|e| {
-				QuoteError::InvalidRequest(format!("Invalid output token address: {}", e))
-			})?;
-			let recipient_address = output.receiver.ethereum_address().map_err(|e| {
-				QuoteError::InvalidRequest(format!("Invalid recipient address: {}", e))
-			})?;
-			let output_chain_id = output.asset.ethereum_chain_id().map_err(|e| {
-				QuoteError::InvalidRequest(format!("Invalid output chain ID: {}", e))
-			})?;
+	// Convert outputs to MandateOutput format
+	let mut outputs_array = Vec::new();
+	for output in &request.requested_outputs {
+		let output_token_address = output.asset.ethereum_address().map_err(|e| {
+			QuoteError::InvalidRequest(format!("Invalid output token address: {}", e))
+		})?;
+		let recipient_address = output.receiver.ethereum_address().map_err(|e| {
+			QuoteError::InvalidRequest(format!("Invalid recipient address: {}", e))
+		})?;
+		let output_chain_id = output.asset.ethereum_chain_id().map_err(|e| {
+			QuoteError::InvalidRequest(format!("Invalid output chain ID: {}", e))
+		})?;
+
+		// Get input token for Uniswap routing - prefer input on same chain as output
+		let (input_token, input_amount) = if request.available_inputs.is_empty() {
+			(None, alloy_primitives::U256::ZERO)
+		} else if request.available_inputs.len() == 1 {
+			let inp = &request.available_inputs[0];
+			(inp.asset.ethereum_address().ok(), inp.amount)
+		} else {
+			// Multiple inputs: try to find one on the same chain as output
+			let same_chain_input = request.available_inputs.iter().find(|inp| {
+				inp.asset.ethereum_chain_id().ok() == Some(output_chain_id)
+			});
+			if let Some(inp) = same_chain_input {
+				(inp.asset.ethereum_address().ok(), inp.amount)
+			} else {
+				// Fallback to first input
+				let inp = &request.available_inputs[0];
+				(inp.asset.ethereum_address().ok(), inp.amount)
+			}
+		};
+
+		// Log diagnostics for V3 on-chain routing
+		tracing::info!(
+			"Quote generation context: output_chain={}, has_input_token={}, input_amount={}, has_uniswap_v3_onchain_cfg={}",
+			output_chain_id,
+			input_token.is_some(),
+			input_amount,
+			config.api.as_ref()
+				.and_then(|api| api.quote.as_ref())
+				.and_then(|q| q.uniswap_v3_onchain.as_ref())
+				.map(|cfg| cfg.enabled)
+				.unwrap_or(false)
+		);
+
+		// Enrich output with Uniswap routing if enabled
+		let (call_data, enriched_amount, recipient_override) = if let Some(input_tok) = input_token {
+			// Try Uniswap V3 on-chain first (no API required)
+			match self.enrich_output_with_uniswap_v3_onchain(output, &input_tok, &input_amount, config, network).await {
+				Ok(result) => result,
+				Err(e) => {
+					tracing::debug!("Uniswap V3 on-chain routing failed: {}", e);
+					// Fallback to API-based routing if configured
+					self.enrich_output_with_uniswap(output, &input_tok, &input_amount, config)
+						.await
+						.unwrap_or_else(|e2| {
+							tracing::warn!("Failed to enrich output with Uniswap (tried V3 on-chain and API): {} / {}", e, e2);
+							(vec![], output.amount, None)
+						})
+				}
+			}
+		} else {
+			(vec![], output.amount, None)
+		};
+
+		// Use recipient override (Universal Router) if provided, otherwise use original recipient
+		let final_recipient_addr = match recipient_override {
+			Some(override_bytes) => alloy_primitives::Address::from(override_bytes),
+			None => recipient_address,  // recipient_address is already an alloy_primitives::Address
+		};
 
 			// Get settlement and selected oracle for the output chain (like permit2 flow)
 			let (_output_settlement, output_selected_oracle) = self
@@ -636,9 +800,9 @@ impl QuoteGenerator {
 				"settler": format!("0x000000000000000000000000{:040x}", output_settler),
 				"chainId": output_chain_id.to_string(),
 				"token": format!("0x000000000000000000000000{:040x}", output_token_address),
-				"amount": output.amount.to_string(),
-				"recipient": format!("0x000000000000000000000000{:040x}", recipient_address),
-				"call": output.calldata.as_ref().map(|cd| format!("0x{}", hex::encode(cd))).unwrap_or_else(|| "0x".to_string()),
+				"amount": enriched_amount.to_string(),
+				"recipient": format!("0x000000000000000000000000{:040x}", final_recipient_addr),
+				"call": if call_data.is_empty() { "0x".to_string() } else { format!("0x{}", hex::encode(&call_data)) },
 				"context": "0x" // Context is typically empty for standard flows
 			}));
 		}
@@ -888,7 +1052,7 @@ impl QuoteGenerator {
 	}
 
 	/// Build Permit2 message object (clean EIP-712 message without metadata)
-	fn build_permit2_message_object(
+	async fn build_permit2_message_object(
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
@@ -899,7 +1063,7 @@ impl QuoteGenerator {
 
 		// Generate the complete message structure
 		let (_final_digest, message_obj) =
-			build_permit2_batch_witness_digest(request, config, settlement, selected_oracle)?;
+			build_permit2_batch_witness_digest(request, config, settlement, selected_oracle).await?;
 
 		// Extract only the EIP-712 message fields (no metadata like "signing", "digest")
 		let permitted = message_obj
@@ -1248,6 +1412,243 @@ impl QuoteGenerator {
 			.map(|quote| quote.validity_seconds)
 			.unwrap_or_else(|| QuoteConfig::default().validity_seconds)
 	}
+
+	/// Enriches an output with Uniswap routing if enabled and no calldata provided.
+	///
+	/// Returns (calldata, amount_out, recipient_override) where:
+	/// - calldata: Uniswap Universal Router calldata (or original calldata if already provided)
+	/// - amount_out: Quoted output amount from Uniswap (or original amount if routing disabled)
+	/// - recipient_override: Optional Universal Router address if routing is used
+	async fn enrich_output_with_uniswap(
+		&self,
+		output: &RequestedOutput,
+		input_token: &[u8; 20],
+		input_amount: &alloy_primitives::U256,
+		config: &Config,
+	) -> Result<(Vec<u8>, alloy_primitives::U256, Option<[u8; 20]>), QuoteError> {
+		use alloy_primitives::hex;
+
+		// Check if output already has calldata - don't override
+		if let Some(ref calldata_str) = output.calldata {
+			let calldata = alloy_primitives::hex::decode(calldata_str.trim_start_matches("0x"))
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid calldata hex: {}", e)))?;
+			return Ok((
+				calldata,
+				output.amount,
+				None,
+			));
+		}
+
+		// Check if Uniswap routing is enabled
+		let uniswap_config = match config
+			.api
+			.as_ref()
+			.and_then(|api| api.quote.as_ref())
+			.and_then(|quote| quote.uniswap.as_ref())
+		{
+			Some(cfg) if cfg.enabled => cfg,
+			_ => {
+				// Uniswap not enabled, return empty calldata
+				return Ok((vec![], output.amount, None));
+			},
+		};
+
+		// Get output chain and token
+		let output_chain_id = output.asset.ethereum_chain_id().map_err(|e| {
+			QuoteError::InvalidRequest(format!("Invalid output chain ID: {}", e))
+		})?;
+		let output_token = output.asset.ethereum_address().map_err(|e| {
+			QuoteError::InvalidRequest(format!("Invalid output token address: {}", e))
+		})?;
+		let final_recipient = output.receiver.ethereum_address().map_err(|e| {
+			QuoteError::InvalidRequest(format!("Invalid recipient address: {}", e))
+		})?;
+
+		// Build Uniswap config
+		let mut router_addresses = UniswapConfig::default_router_addresses();
+		for (chain_id, address) in &uniswap_config.router_addresses {
+			router_addresses.insert(*chain_id, address.clone());
+		}
+
+		let router_config = UniswapConfig {
+			api_key: uniswap_config.api_key.clone(),
+			slippage_bps: uniswap_config.slippage_bps,
+			enabled: true,
+			router_addresses,
+		};
+
+		// Get Universal Router address for this chain
+		let router_address_str = router_config.get_router_address(output_chain_id).ok_or_else(|| {
+			QuoteError::InvalidRequest(format!(
+				"Universal Router not configured for chain {}",
+				output_chain_id
+			))
+		})?;
+
+		// Create Uniswap router client
+		let router = UniswapRouter::new(router_config.api_key.clone());
+
+		// Fetch route from Uniswap API
+		tracing::info!(
+			"Fetching Uniswap route: chain={}, input_token=0x{}, output_token=0x{}, amount={}",
+			output_chain_id,
+			hex::encode(input_token),
+			hex::encode(output_token),
+			input_amount
+		);
+
+		let route = router
+			.get_route(
+				output_chain_id,
+				&format!("0x{}", hex::encode(input_token)),
+				&format!("0x{}", hex::encode(output_token)),
+				input_amount,
+				&format!("0x{}", hex::encode(final_recipient)),
+				router_config.slippage_bps,
+			)
+			.await
+			.map_err(|e| QuoteError::InvalidRequest(format!("Uniswap routing failed: {}", e)))?;
+
+		tracing::info!(
+			"Uniswap route obtained: amount_out={}, gas_estimate={:?}",
+			route.amount_out,
+			route.gas_estimate
+		);
+
+		// Parse calldata
+		let calldata = hex::decode(route.calldata.trim_start_matches("0x"))
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid Uniswap calldata: {}", e)))?;
+
+		// Parse amount_out
+		let amount_out = alloy_primitives::U256::from_str_radix(&route.amount_out, 10)
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount_out: {}", e)))?;
+
+		// Parse Universal Router address
+		let router_addr_bytes = hex::decode(router_address_str.trim_start_matches("0x"))
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid router address: {}", e)))?;
+		let mut router_addr = [0u8; 20];
+		router_addr.copy_from_slice(&router_addr_bytes);
+
+		Ok((calldata, amount_out, Some(router_addr)))
+	}
+
+	/// Enriches an output with Uniswap V3 on-chain routing (no API required).
+	///
+	/// Returns (calldata, amount_out, recipient_override) where:
+	/// - calldata: Uniswap V3 SwapRouter calldata
+	/// - amount_out: Quoted output amount from on-chain Quoter
+	/// - recipient_override: SwapRouter address
+	async fn enrich_output_with_uniswap_v3_onchain(
+		&self,
+		output: &RequestedOutput,
+		input_token: &[u8; 20],
+		input_amount: &alloy_primitives::U256,
+		config: &Config,
+		input_network: &solver_types::NetworkConfig,
+	) -> Result<(Vec<u8>, alloy_primitives::U256, Option<[u8; 20]>), QuoteError> {
+		use alloy_primitives::hex;
+
+		// Check if output already has calldata - don't override
+		if let Some(ref calldata_str) = output.calldata {
+			let calldata = alloy_primitives::hex::decode(calldata_str.trim_start_matches("0x"))
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid calldata hex: {}", e)))?;
+			return Ok((
+				calldata,
+				output.amount,
+				None,
+			));
+		}
+
+	// Check if Uniswap V3 on-chain routing is enabled
+	let v3_config = match config
+		.api
+		.as_ref()
+		.and_then(|api| api.quote.as_ref())
+		.and_then(|quote| quote.uniswap_v3_onchain.as_ref())
+	{
+		Some(cfg) if cfg.enabled => cfg,
+		_ => {
+			// Uniswap V3 on-chain not enabled, return empty calldata
+			return Ok((vec![], output.amount, None));
+		},
+	};
+
+	tracing::info!("Using Uniswap V3 on-chain routing");
+
+	// Get output chain and token
+	let output_chain_id = output.asset.ethereum_chain_id().map_err(|e| {
+		QuoteError::InvalidRequest(format!("Invalid output chain ID: {}", e))
+	})?;
+	let output_token = output.asset.ethereum_address().map_err(|e| {
+		QuoteError::InvalidRequest(format!("Invalid output token address: {}", e))
+	})?;
+	let final_recipient = output.receiver.ethereum_address().map_err(|e| {
+		QuoteError::InvalidRequest(format!("Invalid recipient address: {}", e))
+	})?;
+
+	// Get RPC URL from output network configuration (not input network)
+	let output_network = config.networks.get(&output_chain_id).ok_or_else(|| {
+		QuoteError::InvalidRequest(format!(
+			"No network config for output chain {}",
+			output_chain_id
+		))
+	})?;
+	let rpc_url = output_network
+		.rpc_urls
+		.first()
+		.ok_or_else(|| QuoteError::InvalidRequest(format!(
+			"No RPC URL configured for chain {}",
+			output_chain_id
+		)))?
+		.http
+		.as_ref()
+		.ok_or_else(|| QuoteError::InvalidRequest(format!(
+			"No HTTP RPC URL configured for chain {}",
+			output_chain_id
+		)))?
+		.as_str();
+
+	// Log V3 on-chain routing configuration
+	tracing::info!(
+		"V3 on-chain routing: chain={}, rpc={}, quoter={:?}, router={:?}",
+		output_chain_id,
+		rpc_url,
+		v3_config.quoter.get(&output_chain_id),
+		v3_config.router.get(&output_chain_id)
+	);
+
+		// Build Uniswap V3 on-chain router
+		let router = UniswapV3OnchainRouter::from_config(v3_config)?;
+
+		// Convert addresses to alloy Address type
+		let input_token_addr = alloy_primitives::Address::from_slice(input_token);
+		let output_token_addr = output_token;  // Already an Address
+		let recipient_addr = final_recipient;  // Already an Address
+
+	// Get route and calldata
+	let (calldata, amount_out, router_addr) = router
+		.get_route_and_calldata(
+			rpc_url,
+			output_chain_id,
+			input_token_addr,
+			output_token_addr,
+			*input_amount,
+			recipient_addr,
+		)
+		.await?;
+
+	tracing::info!(
+		"✓ Uniswap V3 on-chain route found: amount_out={}, calldata_len={} bytes, router={:?}",
+		amount_out,
+		calldata.len(),
+		router_addr
+	);
+
+	// Convert router address to [u8; 20]
+	let router_addr_bytes: [u8; 20] = router_addr.into();
+
+	Ok((calldata, amount_out, Some(router_addr_bytes)))
+	}
 }
 
 #[cfg(test)]
@@ -1281,6 +1682,7 @@ mod tests {
 			auth: None,
 			quote: Some(QuoteConfig {
 				validity_seconds: 300,
+				uniswap: None,
 			}),
 		};
 
@@ -1737,6 +2139,84 @@ mod tests {
 		let config_no_api = ConfigBuilder::new().build();
 		let validity_default = generator.get_quote_validity_seconds(&config_no_api);
 		assert_eq!(validity_default, 20); // if API none, use default 20
+	}
+
+	#[tokio::test]
+	async fn test_enrich_output_with_uniswap_disabled() {
+		let settlement_service = create_test_settlement_service(true);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		
+		// Create config without Uniswap enabled
+		let config = create_test_config();
+		
+		let output = RequestedOutput {
+			receiver: InteropAddress::new_ethereum(
+				137,
+				address!("2222222222222222222222222222222222222222"),
+			),
+			asset: InteropAddress::new_ethereum(
+				137,
+				address!("B0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
+			),
+			amount: U256::from(950),
+			calldata: None,
+		};
+		
+		let input_token = address!("A0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C");
+		let input_amount = U256::from(1000);
+		
+		let result = generator
+			.enrich_output_with_uniswap(&output, &input_token.0.into(), &input_amount, &config)
+			.await;
+		
+		// Should return empty calldata when Uniswap is disabled
+		assert!(result.is_ok());
+		let (calldata, amount, recipient_override) = result.unwrap();
+		assert!(calldata.is_empty());
+		assert_eq!(amount, output.amount);
+		assert!(recipient_override.is_none());
+	}
+
+	#[tokio::test]
+	async fn test_enrich_output_with_existing_calldata() {
+		let settlement_service = create_test_settlement_service(true);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		
+		let config = create_test_config();
+		
+		// Output with existing calldata
+		let existing_calldata = "0x1234567890abcdef";
+		let output = RequestedOutput {
+			receiver: InteropAddress::new_ethereum(
+				137,
+				address!("2222222222222222222222222222222222222222"),
+			),
+			asset: InteropAddress::new_ethereum(
+				137,
+				address!("B0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
+			),
+			amount: U256::from(950),
+			calldata: Some(existing_calldata.to_string()),
+		};
+		
+		let input_token = address!("A0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C");
+		let input_amount = U256::from(1000);
+		
+		let result = generator
+			.enrich_output_with_uniswap(&output, &input_token.0.into(), &input_amount, &config)
+			.await;
+		
+		// Should return existing calldata without calling Uniswap
+		assert!(result.is_ok());
+		let (calldata, amount, recipient_override) = result.unwrap();
+		assert!(!calldata.is_empty());
+		assert_eq!(hex::encode(&calldata), "1234567890abcdef");
+		assert_eq!(amount, output.amount);
+		assert!(recipient_override.is_none());
 	}
 
 	#[test]

@@ -1,0 +1,23 @@
+# Uniswap Routing Configuration Example
+# Add this to your api.toml or include it in demo.toml
+
+[api.quote.uniswap]
+# Enable Uniswap routing for automatic swap path generation
+enabled = true
+
+# Optional: Uniswap Routing API key for higher rate limits
+# Can also be set via environment variable: ${UNISWAP_API_KEY}
+# api_key = "YOUR_UNISWAP_API_KEY"
+
+# Slippage tolerance in basis points (50 = 0.5%)
+slippage_bps = 50
+
+# Universal Router addresses per chain (optional, defaults to canonical addresses)
+# Only override if using custom deployments
+# [api.quote.uniswap.router_addresses]
+# 1 = "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD"      # Ethereum Mainnet
+# 10 = "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD"     # Optimism
+# 137 = "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD"    # Polygon
+# 8453 = "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD"   # Base
+# 42161 = "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD"  # Arbitrum One
+

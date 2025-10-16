@@ -32,7 +32,7 @@ use solver_types::{
 	GetQuoteRequest, QuoteError,
 };
 
-pub fn build_permit2_batch_witness_digest(
+pub async fn build_permit2_batch_witness_digest(
 	request: &GetQuoteRequest,
 	config: &Config,
 	_settlement: &dyn SettlementInterface, // Kept for potential future use
@@ -181,6 +181,31 @@ pub fn build_permit2_batch_witness_digest(
 
 	let final_digest = compute_final_digest(&domain_separator_hash, &main_struct_hash);
 
+	// Try to enrich the output with Uniswap V3 on-chain routing
+	use crate::apis::quote::generation::try_enrich_with_uniswap_v3_onchain;
+	let (call_data, enriched_amount, recipient_override) = try_enrich_with_uniswap_v3_onchain(
+		&origin_token,
+		&dest_token,
+		&recipient,
+		&amount,
+		&amount, // Use input amount as initial output amount
+		dest_chain_id,
+		config,
+	)
+	.await
+	.unwrap_or_else(|e| {
+		tracing::warn!("Failed to enrich permit2 output with Uniswap V3 on-chain: {}", e);
+		(vec![], amount, None)
+	});
+
+	// Use recipient override (SwapRouter) if provided, otherwise use original recipient
+	let final_recipient = recipient_override.unwrap_or(recipient);
+	let call_hex = if call_data.is_empty() {
+		"0x".to_string()
+	} else {
+		format!("0x{}", hex::encode(&call_data))
+	};
+
 	let message_json = json!({
 		"digest": final_digest,
 		"signing": {
@@ -208,9 +233,9 @@ pub fn build_permit2_batch_witness_digest(
 				"settler": format!("0x{}{:x}", "0".repeat(24), output_settler),
 				"chainId": dest_chain_id,
 				"token": format!("0x{}{:x}", "0".repeat(24), dest_token),
-				"amount": amount.to_string(),
-				"recipient": format!("0x{}{:x}", "0".repeat(24), recipient),
-				"call": "0x",
+				"amount": enriched_amount.to_string(),
+				"recipient": format!("0x{}{:x}", "0".repeat(24), final_recipient),
+				"call": call_hex,
 				"context": "0x"
 			}]
 		}
@@ -249,9 +274,10 @@ mod tests {
 			rate_limiting: None,
 			cors: None,
 			auth: None,
-			quote: Some(QuoteConfig {
-				validity_seconds: 300, // 5 minutes
-			}),
+		quote: Some(QuoteConfig {
+			validity_seconds: 300, // 5 minutes
+			uniswap: None,
+		}),
 		};
 
 		let settlement_config = SettlementConfig {

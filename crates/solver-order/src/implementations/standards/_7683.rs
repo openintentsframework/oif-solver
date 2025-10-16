@@ -342,12 +342,11 @@ impl OrderInterface for Eip7683OrderImpl {
 			token: FixedBytes::<32>::from(output.token),
 			amount: output.amount,
 			recipient: FixedBytes::<32>::from(output.recipient),
-			// For direct transfers, no additional call data is required, so this field is left empty.
-			// If the output settlement requires invoking a contract with specific calldata, populate this field accordingly.
-			call: vec![].into(),
-			// Context is also left empty for direct transfers, as no extra execution context is needed.
-			// This field may be populated for advanced settlement scenarios (e.g., meta-transactions, custom logic).
-			context: vec![].into(),
+			// Pass through the call data from the order output
+			// This enables Uniswap routing or any other arbitrary contract calls
+			call: output.call.clone().into(),
+			// Pass through the context from the order output
+			context: output.context.clone().into(),
 		};
 
 		// Encode fill data for OutputSettlerSimple using the new signature

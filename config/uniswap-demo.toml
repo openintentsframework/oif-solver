@@ -1,0 +1,145 @@
+# Configuration Minimale - Mini-Solver Uniswap
+# Mode "quote only" - génère des quotes sans exécuter les transactions
+
+include = [
+    "quote-only-networks.toml",
+    "demo/gas.toml",
+]
+
+[solver]
+id = "uniswap-mini-solver"
+monitoring_timeout_minutes = 5
+min_profitability_pct = 1.0
+
+# ============================================================================
+# API SERVER - Endpoints HTTP pour les quotes
+# ============================================================================
+[api]
+enabled = true
+host = "127.0.0.1"
+port = 3002
+timeout_seconds = 30
+max_request_size = 1048576  # 1MB
+
+[api.implementations]
+discovery = "offchain_eip7683"
+
+# Configuration des quotes
+[api.quote]
+validity_seconds = 60  # 1 minute de validité
+
+# Configuration Uniswap
+[api.quote.uniswap]
+enabled = true
+slippage_bps = 50  # 0.5% de slippage
+# api_key = "YOUR_UNISWAP_API_KEY"  # Optionnel: ou définissez la variable d'env UNISWAP_API_KEY
+
+# Adresses Universal Router: laissez vide pour utiliser les adresses par défaut intégrées
+
+# ============================================================================
+# STORAGE - Requis pour le service
+# ============================================================================
+[storage]
+primary = "memory"  # Stockage en mémoire pour les tests
+cleanup_interval_seconds = 60
+
+[storage.implementations.memory]
+# Pas de configuration nécessaire
+
+# ============================================================================
+# ACCOUNT - Requis mais non utilisé en mode quote-only
+# ============================================================================
+[account]
+primary = "local"
+
+[account.implementations.local]
+# Clé privée de test (Anvil account #0 - NE PAS UTILISER EN PRODUCTION)
+private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+
+# ============================================================================
+# PRICING - Pour calculer la profitabilité des quotes
+# ============================================================================
+[pricing]
+primary = "mock"  # Utilise des prix mockés pour les tests
+
+[pricing.implementations.mock]
+# Prix par défaut ETH/USD = 4615.16
+
+# ============================================================================
+# DISCOVERY - Configuration minimale (non utilisé en mode quote-only)
+# ============================================================================
+[discovery]
+
+[discovery.implementations.offchain_eip7683]
+api_host = "127.0.0.1"
+api_port = 3001
+network_ids = [1]
+
+# ============================================================================
+# DELIVERY - Requis pour la validation
+# ============================================================================
+[delivery]
+min_confirmations = 1
+
+[delivery.implementations.evm_alloy]
+network_ids = [1, 10, 137, 8453, 42161]
+
+# ============================================================================
+# ORDER - Requis pour la validation
+# ============================================================================
+[order]
+
+[order.implementations.eip7683]
+
+[order.strategy]
+primary = "simple"
+
+[order.strategy.implementations.simple]
+max_gas_price_gwei = 100
+
+# ============================================================================
+# SETTLEMENT - Requis pour la validation
+# ============================================================================
+[settlement]
+
+[settlement.domain]
+chain_id = 1
+address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+
+[settlement.implementations.direct]
+order = "eip7683"
+network_ids = [1, 10, 137, 8453, 42161]
+dispute_period_seconds = 1
+oracle_selection_strategy = "First"
+
+[settlement.implementations.direct.oracles]
+input = { 1 = [
+    "0x0000000000000000000000000000000000000000",
+], 10 = [
+    "0x0000000000000000000000000000000000000000",
+], 137 = [
+    "0x0000000000000000000000000000000000000000",
+], 8453 = [
+    "0x0000000000000000000000000000000000000000",
+], 42161 = [
+    "0x0000000000000000000000000000000000000000",
+] }
+output = { 1 = [
+    "0x0000000000000000000000000000000000000000",
+], 10 = [
+    "0x0000000000000000000000000000000000000000",
+], 137 = [
+    "0x0000000000000000000000000000000000000000",
+], 8453 = [
+    "0x0000000000000000000000000000000000000000",
+], 42161 = [
+    "0x0000000000000000000000000000000000000000",
+] }
+
+[settlement.implementations.direct.routes]
+1 = [10, 137, 8453, 42161]
+10 = [1, 137, 8453, 42161]
+137 = [1, 10, 8453, 42161]
+8453 = [1, 10, 137, 42161]
+42161 = [1, 10, 137, 8453]
+

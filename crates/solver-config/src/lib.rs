@@ -305,12 +305,98 @@ pub struct QuoteConfig {
 	/// Defaults to 20 seconds if not specified.
 	#[serde(default = "default_quote_validity_seconds")]
 	pub validity_seconds: u64,
+    /// Allow unknown tokens that are not listed in networks tokens config.
+    /// When enabled, token support checks are bypassed and any ERC-20 address
+    /// in inputs/outputs is accepted. Use with care; pricing/profitability
+    /// may be unavailable for unknown symbols.
+    #[serde(default)]
+    pub allow_unknown_tokens: bool,
+    /// Optional Uniswap routing configuration
+    #[serde(default)]
+    pub uniswap: Option<UniswapQuoteConfig>,
+    /// Optional Uniswap V3 on-chain routing configuration
+    #[serde(default)]
+    pub uniswap_v3_onchain: Option<UniswapV3OnchainConfig>,
+}
+
+/// Configuration for Uniswap routing in quotes.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UniswapQuoteConfig {
+	/// Whether Uniswap routing is enabled
+	#[serde(default)]
+	pub enabled: bool,
+	/// Optional API key for Uniswap Routing API
+	pub api_key: Option<String>,
+	/// Slippage tolerance in basis points (e.g., 50 = 0.5%)
+	/// Defaults to 50 if not specified.
+	#[serde(default = "default_uniswap_slippage_bps")]
+	pub slippage_bps: u16,
+	/// Universal Router addresses per chain ID
+	/// If not specified, uses default canonical addresses
+	#[serde(default)]
+	pub router_addresses: HashMap<u64, String>,
+}
+
+/// Configuration for Uniswap V3 on-chain routing (no API required).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UniswapV3OnchainConfig {
+	/// Whether Uniswap V3 on-chain routing is enabled
+	#[serde(default)]
+	pub enabled: bool,
+	/// Slippage tolerance in basis points (e.g., 50 = 0.5%)
+	#[serde(default = "default_uniswap_slippage_bps")]
+	pub slippage_bps: u16,
+	/// WETH addresses per chain ID
+	#[serde(default, deserialize_with = "deserialize_chain_address_map")]
+	pub weth: HashMap<u64, String>,
+	/// Quoter V2 contract addresses per chain ID
+	#[serde(default, deserialize_with = "deserialize_chain_address_map")]
+	pub quoter: HashMap<u64, String>,
+	/// SwapRouter contract addresses per chain ID
+	#[serde(default, deserialize_with = "deserialize_chain_address_map")]
+	pub router: HashMap<u64, String>,
+	/// Default fee tiers to try (in order) for single-hop routes
+	#[serde(default = "default_uniswap_v3_fees")]
+	pub default_fees: Vec<u32>,
+	/// Enable fallback to 2-hop routing via WETH
+	#[serde(default = "default_bridge_via_weth")]
+	pub bridge_via_weth: bool,
+}
+
+#[derive(Deserialize)]
+struct ChainAddress {
+	chain_id: u64,
+	address: String,
+}
+
+fn deserialize_chain_address_map<'de, D>(deserializer: D) -> Result<HashMap<u64, String>, D::Error>
+where
+	D: serde::Deserializer<'de>,
+{
+	let items: Vec<ChainAddress> = Vec::deserialize(deserializer)?;
+	Ok(items.into_iter().map(|item| (item.chain_id, item.address)).collect())
+}
+
+fn default_uniswap_v3_fees() -> Vec<u32> {
+	vec![500, 3000, 10000]
+}
+
+fn default_bridge_via_weth() -> bool {
+	true
+}
+
+/// Returns the default Uniswap slippage in basis points.
+fn default_uniswap_slippage_bps() -> u16 {
+	50 // 0.5% default slippage
 }
 
 impl Default for QuoteConfig {
 	fn default() -> Self {
 		Self {
 			validity_seconds: default_quote_validity_seconds(),
+            allow_unknown_tokens: false,
+			uniswap: None,
+			uniswap_v3_onchain: None,
 		}
 	}
 }

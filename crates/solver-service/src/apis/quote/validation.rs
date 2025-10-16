@@ -17,6 +17,7 @@ use alloy_primitives::{Address as AlloyAddress, U256};
 use futures::future::try_join_all;
 use solver_core::SolverEngine;
 use solver_types::{GetQuoteRequest, InteropAddress, QuoteError};
+use solver_config::Config;
 
 /// Main validator for quote requests.
 ///
@@ -281,16 +282,23 @@ impl QuoteValidator {
 	/// # Errors
 	///
 	/// Returns `QuoteError::UnsupportedAsset` if no inputs are supported
-	pub fn collect_supported_available_inputs(
-		request: &GetQuoteRequest,
-		solver: &SolverEngine,
-	) -> Result<Vec<SupportedAsset>, QuoteError> {
+    pub fn collect_supported_available_inputs(
+        request: &GetQuoteRequest,
+        solver: &SolverEngine,
+        config: &Config,
+    ) -> Result<Vec<SupportedAsset>, QuoteError> {
 		let mut supported_assets = Vec::new();
 
 		for input in &request.available_inputs {
 			let (chain_id, evm_addr) = Self::extract_chain_and_address(&input.asset)?;
+            let allow_unknown = config
+                .api
+                .as_ref()
+                .and_then(|api| api.quote.as_ref())
+                .map(|q| q.allow_unknown_tokens)
+                .unwrap_or(false);
 
-			if Self::is_token_supported(solver, chain_id, &evm_addr) {
+            if allow_unknown || Self::is_token_supported(solver, chain_id, &evm_addr) {
 				supported_assets.push(SupportedAsset {
 					asset: input.asset.clone(),
 					amount: input.amount,
@@ -325,16 +333,23 @@ impl QuoteValidator {
 	/// # Errors
 	///
 	/// Returns `QuoteError::UnsupportedAsset` if any output is not supported
-	pub fn validate_and_collect_requested_outputs(
-		request: &GetQuoteRequest,
-		solver: &SolverEngine,
-	) -> Result<Vec<SupportedAsset>, QuoteError> {
+    pub fn validate_and_collect_requested_outputs(
+        request: &GetQuoteRequest,
+        solver: &SolverEngine,
+        config: &Config,
+    ) -> Result<Vec<SupportedAsset>, QuoteError> {
 		let mut supported_outputs = Vec::new();
 
 		for output in &request.requested_outputs {
 			let (chain_id, evm_addr) = Self::extract_chain_and_address(&output.asset)?;
+            let allow_unknown = config
+                .api
+                .as_ref()
+                .and_then(|api| api.quote.as_ref())
+                .map(|q| q.allow_unknown_tokens)
+                .unwrap_or(false);
 
-			if !Self::is_token_supported(solver, chain_id, &evm_addr) {
+            if !allow_unknown && !Self::is_token_supported(solver, chain_id, &evm_addr) {
 				return Err(QuoteError::UnsupportedAsset(format!(
 					"Requested output token not supported on chain {}",
 					chain_id

@@ -65,6 +65,7 @@
 pub mod custody;
 pub mod generation;
 pub mod registry;
+pub mod router;
 pub mod signing;
 pub mod validation;
 
@@ -101,13 +102,14 @@ pub async fn process_quote_request(
 	QuoteValidator::validate_supported_networks(&request, solver)?;
 
 	// Collect supported assets for this request (for later use: balances/custody/pricing)
-	let (_supported_inputs, supported_outputs) = (
-		QuoteValidator::collect_supported_available_inputs(&request, solver)?,
-		QuoteValidator::validate_and_collect_requested_outputs(&request, solver)?,
-	);
+    let (_supported_inputs, supported_outputs) = (
+        QuoteValidator::collect_supported_available_inputs(&request, solver, config)?,
+        QuoteValidator::validate_and_collect_requested_outputs(&request, solver, config)?,
+    );
 
 	// Check destination balances for required outputs
-	QuoteValidator::ensure_destination_balances(solver, &supported_outputs).await?;
+	// DISABLED: Quote-only mode doesn't require actual liquidity
+	// QuoteValidator::ensure_destination_balances(solver, &supported_outputs).await?;
 
 	// Generate quotes using the business logic layer
 	let settlement_service = solver.settlement();

@@ -12,6 +12,7 @@ A high-performance cross-chain solver implementation for the Open Intents Framew
 - [Project Structure](#project-structure)
 - [Component Responsibilities](#component-responsibilities)
 - [Quick Start](#quick-start)
+- [Mini-Solver Uniswap](#mini-solver-uniswap)
 - [Configuration](#configuration)
 - [API Reference](#api-reference)
 - [OIF Demo CLI Tool](#oif-demo-cli-tool)
@@ -200,6 +201,49 @@ cargo run -- --config config/example.toml
 # Run with debug logs for solver modules only
 RUST_LOG=solver_core=debug,solver_delivery=debug,info cargo run -- --config config/example.toml
 ```
+
+## Mini-Solver Uniswap
+
+Un mini-solver de test qui génère des quotes en utilisant l'API Routing de Uniswap. Idéal pour tester l'intégration avec l'agrégateur OIF sans exécuter de transactions on-chain.
+
+### Démarrage Rapide
+
+```bash
+# 1. Démarrer le mini-solver
+./start-uniswap-solver.sh
+
+# 2. Tester la génération de quotes
+./test-uniswap-quote.sh
+
+# 3. (Optionnel) Avec une clé API Uniswap
+export UNISWAP_API_KEY="votre-cle-api"
+./start-uniswap-solver.sh
+```
+
+### Fonctionnalités
+
+- ✅ **Génération de quotes** avec calldata Uniswap Universal Router
+- ✅ **Calcul automatique** des montants de sortie via l'API Routing
+- ✅ **Support multi-chaînes** (Ethereum, Optimism, Polygon, Base, Arbitrum)
+- ✅ **Mode quote-only** : pas d'exécution automatique des transactions
+- ✅ **Compatible EIP-7683/7930** pour l'intégration avec l'agrégateur
+
+### Documentation
+
+- [Guide de Démarrage Rapide](./QUICKSTART_UNISWAP.md) - Instructions détaillées
+- [Architecture Uniswap](./UNISWAP_ROUTING.md) - Documentation technique complète
+- [Plan d'Implémentation](./plan.md) - Détails de conception
+
+### Endpoints API
+
+Le mini-solver expose les mêmes endpoints que le solver complet :
+
+- `GET /health` - Vérifier l'état du service
+- `POST /quote` - Générer une quote avec routing Uniswap
+- `POST /intents` - Soumettre un intent (mode quote-only)
+- `POST /orders` - Soumettre un ordre (mode quote-only)
+
+Voir [QUICKSTART_UNISWAP.md](./QUICKSTART_UNISWAP.md) pour des exemples de requêtes.
 
 ## Configuration
 
