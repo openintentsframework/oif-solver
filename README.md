@@ -249,141 +249,7 @@ See `config/demo/` for a complete modular configuration example.
 
 ### Single File Configuration
 
-You can also use a single configuration file. See `config/example.toml` for a complete example:
-
-```toml
-# Solver identity and settings
-[solver]
-id = "oif-solver-local"
-monitoring_timeout_seconds = 300
-# Minimum profitability percentage required for intent execution
-min_profitability_pct = 1.0
-
-# Networks configuration - defines supported chains and tokens
-[networks.31337]  # Origin chain
-input_settler_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
-output_settler_address = "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"
-[[networks.31337.tokens]]
-address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
-symbol = "TOKA"
-decimals = 18
-[[networks.31337.tokens]]
-address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
-symbol = "TOKB"
-decimals = 18
-
-[networks.31338]  # Destination chain
-input_settler_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
-output_settler_address = "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"
-[[networks.31338.tokens]]
-address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
-symbol = "TOKA"
-decimals = 18
-
-# Storage configuration with TTL management
-[storage]
-primary = "file"
-cleanup_interval_seconds = 3600
-
-[storage.implementations.file]
-storage_path = "./data/storage"
-ttl_orders = 0                  # Permanent
-ttl_intents = 86400             # 24 hours
-ttl_order_by_tx_hash = 86400    # 24 hours
-
-# Account management
-[account]
-primary = "local"  # Specifies which account to use as default
-
-[account.implementations.local]
-private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-
-# Optional: Additional accounts for per-network signing
-# [account.implementations.local2]
-# private_key = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
-
-# Delivery implementations for different chains
-[delivery]
-min_confirmations = 1
-
-[delivery.implementations.evm_alloy]
-network_ids = [31337, 31338]  # Supports multiple networks in one implementation
-# Optional: Map specific networks to different accounts
-# accounts = { 31337 = "local", 31338 = "local2" }
-
-# Discovery implementations for finding intents
-[discovery.implementations.onchain_eip7683]
-network_id = 31337  # Required: specifies which chain to monitor
-
-[discovery.implementations.offchain_eip7683]
-api_host = "127.0.0.1"
-api_port = 8081
-network_ids = [31337]  # Optional: declares multi-chain support
-
-# Order execution strategy
-[order]
-[order.implementations.eip7683]
-# Uses networks config for settler addresses
-
-[order.strategy]
-primary = "simple"
-
-[order.strategy.implementations.simple]
-max_gas_price_gwei = 100
-
-# Pricing configuration
-[pricing]
-primary = "mock"  # Use "coingecko" for real pricing
-
-[pricing.implementations.mock]
-# Uses default ETH/USD price of 4615.16
-
-# Coingecko example
-[pricing.implementations.coingecko]
-# Free tier configuration (no API key required)
-# api_key = "CG-YOUR-API-KEY-HERE"
-cache_duration_seconds = 60
-rate_limit_delay_ms = 1200
-
-# Settlement configuration
-[settlement]
-settlement_poll_interval_seconds = 3
-
-[settlement.implementations.direct]
-order = "eip7683"
-network_ids = [31337, 31338]
-dispute_period_seconds = 1
-# Oracle selection strategy when multiple oracles are available (First, RoundRobin, Random)
-oracle_selection_strategy = "First"
-
-# Oracle configuration with multiple oracle support
-[settlement.implementations.direct.oracles]
-# Input oracles (on origin chains)
-input = { 31337 = [
-    "0xa513E6E4b8f2a923D98304ec87F64353C4D5C853",
-], 31338 = [
-    "0xa513E6E4b8f2a923D98304ec87F64353C4D5C853",
-] }
-# Output oracles (on destination chains)
-output = { 31337 = [
-    "0x2279B7A0a67DB372996a5FaB50D91eAA73d2eBe6",
-], 31338 = [
-    "0x2279B7A0a67DB372996a5FaB50D91eAA73d2eBe6",
-] }
-
-# Valid routes: from origin chain -> to destination chains
-[settlement.implementations.direct.routes]
-31337 = [31338]
-31338 = [31337]
-
-# API server (optional)
-[api]
-enabled = true
-host = "127.0.0.1"
-port = 3000
-timeout_seconds = 30
-max_request_size = 1048576  # 1MB
-```
+You can also use a single configuration file. See [`config/demo.toml`](config/demo.toml) for a complete configuration example with all supported options.
 
 ### Key Configuration Sections
 
@@ -421,17 +287,50 @@ The solver provides a REST API for interacting with the system and submitting of
 #### Quotes
 
 - **POST `/api/quotes`** - Request price quotes for a cross-chain swap
-  - Request body: `{ user, intent: { intentType, inputs, outputs, swapType, originSubmission }, supportedTypes }`
+  - Request body:
+    ```json
+    { 
+      "user": "...", 
+      "intent": { 
+        "intentType": "...", 
+        "inputs": [...], 
+        "outputs": [...], 
+        "swapType": "...", 
+        "originSubmission": {...} 
+      }, 
+      "supportedTypes": [...] 
+    }
+    ```
   - Returns: Array of quotes with `quoteId`, order structure ready for signing, and preview of amounts
 
 #### Orders
 
 - **POST `/api/orders`** - Submit a new order (direct or from quote)
 
-  - Quote acceptance: `{ quoteId: "...", signature: "0x..." }`
-  - Direct submission: `{ order: { type, payload }, signature: "0x...", originSubmission }`
+  - Quote acceptance:
+    ```json
+    { 
+      "quoteId": "...", 
+      "signature": "0x..." 
+    }
+    ```
+  - Direct submission:
+    ```json
+    { 
+      "order": { "type": "...", "payload": {...} }, 
+      "signature": "0x...", 
+      "originSubmission": {...} 
+    }
+    ```
   - Supported order types: `oif-escrow-v0`, `oif-resource-lock-v0`, `oif-3009-v0`
-  - Returns: `{ orderId: "...", status: "received", message: null }`
+  - Returns:
+    ```json
+    { 
+      "orderId": "...", 
+      "status": "received", 
+      "message": null 
+    }
+    ```
 
 - **GET `/api/orders/{id}`** - Get order status and details
   - Returns complete order information including status, amounts, settlement data, and fill transaction
