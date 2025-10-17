@@ -491,8 +491,6 @@ cargo run -p solver-demo -- intent submit .oif-demo/requests/post_order.req.json
 cargo run -p solver-demo -- token balance all
 ```
 
-[!NOTE]
-
 > The demo tool requires the Permit2 contract bytecode file located at `crates/solver-demo/data/permit2_bytecode.hex`. This file contains the canonical Permit2 bytecode and is essential for deploying contracts to local Anvil chains. The bytecode is automatically used during the `env deploy` step.
 >
 > To fetch and store the Permit2 bytecode, run this command from the project root:
