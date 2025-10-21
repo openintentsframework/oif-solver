@@ -3,8 +3,8 @@ set -euo pipefail
 
 # Configuration for real solver (adjust for production)
 LOG_DIR="./solver_logs_$(date +%Y%m%d_%H%M%S)"
-MAX_LOG_SIZE="20K"  # Rotate when file reaches 20KB
-CHECK_INTERVAL=100  # Check every 5 minutes
+MAX_LOG_SIZE="10M"  # Rotate when file reaches 10MB
+CHECK_INTERVAL=300  # Check every 5 minutes (300 seconds)
 SOLVER_CONFIG="${1:-config/demo.toml}"
 
 echo "=== REAL SOLVER WITH LOG ROTATION ==="
