@@ -150,6 +150,7 @@ zcat $LOG_DIR/solver_*.log.gz | grep -i error
 zcat $LOG_DIR/solver_*.log.gz | grep -c "INFO"
 zcat $LOG_DIR/solver_*.log.gz | grep -c "ERROR"
 zcat $LOG_DIR/solver_*.log.gz | grep -c "WARN"
+zcat $LOG_DIR/solver_*.log.gz | grep -c "DEBUG"
 
 === END REPORT ===
 EOF
@@ -228,7 +229,7 @@ MONITOR_PID=$!
 echo "$(date '+%Y-%m-%d %H:%M:%S') [START] Starting OIF Solver..." | tee -a "$CURRENT_LOG"
 
 # Run the actual solver with proper error handling
-if cargo run --bin solver -- --config "$SOLVER_CONFIG" --log-level info 2>&1 | \
+if cargo run --bin solver -- --config "$SOLVER_CONFIG" --log-level debug 2>&1 | \
    while IFS= read -r line; do
        echo "$(date '+%Y-%m-%d %H:%M:%S') $line" | tee -a "$CURRENT_LOG"
    done; then
