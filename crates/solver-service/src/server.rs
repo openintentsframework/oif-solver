@@ -60,9 +60,9 @@ pub async fn start_server(
 
 	// Create a reusable HTTP client with connection pooling
 	let http_client = reqwest::Client::builder()
-		.pool_idle_timeout(std::time::Duration::from_secs(90))
+		.pool_idle_timeout(std::time::Duration::from_secs(200))
 		.pool_max_idle_per_host(10)
-		.timeout(std::time::Duration::from_secs(30))
+		.timeout(std::time::Duration::from_secs(api_config.timeout_seconds))
 		.build()?;
 
 	// Extract discovery service URL once during startup
