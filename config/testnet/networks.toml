@@ -9,7 +9,7 @@ allocator_address = "0x565466528d126141ddb5c7d558803f79d9b66a6d"
 
 
 [[networks.11155420.rpc_urls]]
-http = "https://sepolia.optimism.io"
+http = "https://opt-sepolia.g.alchemy.com/v2/${RPC_API_KEY}"
 
 [[networks.11155420.tokens]]
 address = "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"
@@ -24,7 +24,7 @@ the_compact_address = "0x00000000000000171ede64904551eedf3c6c9788"
 allocator_address = "0x04bb6e565f0067e0411528e2d3a55a712d9a8b32"
 
 [[networks.84532.rpc_urls]]
-http = "https://sepolia.base.org"
+http = "https://base-sepolia.g.alchemy.com/v2/${RPC_API_KEY}"
 
 [[networks.84532.tokens]]
 address = "0x73c83DAcc74bB8a704717AC09703b959E74b9705"
