@@ -4,7 +4,7 @@
 enabled = true
 host = "127.0.0.1"
 port = 3000
-timeout_seconds = 30
+timeout_seconds = 120
 max_request_size = 1048576
 
 [api.implementations]
