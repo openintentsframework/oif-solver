@@ -106,6 +106,7 @@ impl JwtService {
 
 		// Try to refresh token first
 		if let Ok(refreshed_token) = self.refresh_token(session_store).await {
+			// TODO: STORE THE TOKEN BEFORE RETURNING IT
 			return Ok(refreshed_token);
 		}
 

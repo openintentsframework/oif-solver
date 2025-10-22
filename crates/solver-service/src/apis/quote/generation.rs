@@ -61,6 +61,8 @@ use solver_types::{
 use std::sync::Arc;
 use uuid::Uuid;
 
+const PERMIT2_NAME: &str = "Permit2";
+
 /// Quote generation engine with settlement service integration.
 pub struct QuoteGenerator {
 	custody_strategy: CustodyStrategy,
@@ -93,23 +95,53 @@ impl QuoteGenerator {
 		config: &Config,
 	) -> Result<Vec<Quote>, QuoteError> {
 		let mut quotes = Vec::new();
-		for input in &request.intent.inputs {
+		for (idx, input) in request.intent.inputs.iter().enumerate() {
+			tracing::info!(
+				"→→ generate_quotes: Processing input {}/{}",
+				idx + 1,
+				request.intent.inputs.len()
+			);
 			let order_input: OrderInput = input.try_into()?;
+			tracing::info!("→→ generate_quotes: Deciding custody for input {}", idx + 1);
 			let custody_decision = self
 				.custody_strategy
 				.decide_custody(&order_input, request.intent.origin_submission.as_ref())
 				.await?;
+			tracing::info!(
+				"→→ generate_quotes: Custody decided for input {}, generating quote",
+				idx + 1
+			);
 			if let Ok(quote) = self
 				.generate_quote_for_settlement(request, config, &custody_decision)
 				.await
 			{
+				tracing::info!(
+					"→→ generate_quotes: Quote generated successfully for input {}",
+					idx + 1
+				);
 				quotes.push(quote);
+			} else {
+				tracing::warn!(
+					"→→ generate_quotes: Failed to generate quote for input {}",
+					idx + 1
+				);
 			}
 		}
 		if quotes.is_empty() {
+			tracing::warn!(
+				"→→ generate_quotes: No quotes generated, returning InsufficientLiquidity"
+			);
 			return Err(QuoteError::InsufficientLiquidity);
 		}
+		tracing::info!(
+			"→→ generate_quotes: Sorting {} quotes by preference",
+			quotes.len()
+		);
 		self.sort_quotes_by_preference(&mut quotes, &request.intent.preference);
+		tracing::info!(
+			"→→ generate_quotes: Completed successfully with {} quotes",
+			quotes.len()
+		);
 		Ok(quotes)
 	}
 
@@ -121,17 +153,27 @@ impl QuoteGenerator {
 		cost_context: &CostContext,
 		config: &Config,
 	) -> Result<Vec<Quote>, QuoteError> {
+		tracing::info!("→ generate_quotes_with_costs: Starting");
+
 		// Build a new request with swap amounts and cost adjustments from CostContext
 		let adjusted_request = self.build_cost_adjusted_request(request, context, cost_context)?;
+		tracing::info!("→ generate_quotes_with_costs: Cost adjustment complete");
 
 		// Validate no zero amounts after adjustment
 		self.validate_no_zero_amounts(&adjusted_request, context)?;
+		tracing::info!("→ generate_quotes_with_costs: Zero amount validation complete");
 
 		// Validate constraints on the adjusted amounts
 		self.validate_swap_amount_constraints(&adjusted_request, context)?;
+		tracing::info!("→ generate_quotes_with_costs: Constraint validation complete");
 
 		// Generate quotes using the adjusted request
+		tracing::info!("→ generate_quotes_with_costs: Calling generate_quotes");
 		let quotes = self.generate_quotes(&adjusted_request, config).await?;
+		tracing::info!(
+			"→ generate_quotes_with_costs: Generated {} quotes",
+			quotes.len()
+		);
 
 		Ok(quotes)
 	}
@@ -345,17 +387,24 @@ impl QuoteGenerator {
 		config: &Config,
 		custody_decision: &CustodyDecision,
 	) -> Result<Quote, QuoteError> {
+		tracing::info!("→→→ generate_quote_for_settlement: Starting");
 		let quote_id = Uuid::new_v4().to_string();
 		let order = match custody_decision {
 			CustodyDecision::ResourceLock { lock } => {
+				tracing::info!("→→→ generate_quote_for_settlement: Generating ResourceLock order");
 				self.generate_resource_lock_order(request, config, lock)
 					.await?
 			},
 			CustodyDecision::Escrow { lock_type } => {
+				tracing::info!(
+					"→→→ generate_quote_for_settlement: Generating Escrow order (type: {:?})",
+					lock_type
+				);
 				self.generate_escrow_order(request, config, lock_type)
 					.await?
 			},
 		};
+		tracing::info!("→→→ generate_quote_for_settlement: Order generated successfully");
 
 		let eta = self.calculate_eta(&request.intent.preference);
 		let validity_seconds = self.get_quote_validity_seconds(config);
@@ -457,6 +506,10 @@ impl QuoteGenerator {
 		config: &Config,
 		lock_type: &LockType,
 	) -> Result<OifOrder, QuoteError> {
+		tracing::info!(
+			"→→→→ generate_escrow_order: Starting for lock_type: {:?}",
+			lock_type
+		);
 		// Extract chain from first output to find appropriate settlement
 		// TODO: Implement support for multiple destination chains
 		let origin_chain_id = request
@@ -477,6 +530,12 @@ impl QuoteGenerator {
 			.ethereum_chain_id()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chain ID: {}", e)))?;
 
+		tracing::info!(
+			"→→→→ generate_escrow_order: origin_chain={}, dest_chain={}",
+			origin_chain_id,
+			destination_chain_id
+		);
+
 		// For escrow orders, get settlement that supports both chains
 		let (_settlement, input_oracle, output_oracle) = self
 			.settlement_service
@@ -488,12 +547,16 @@ impl QuoteGenerator {
 				))
 			})?;
 
+		tracing::info!("→→→→ generate_escrow_order: Settlement found, oracles configured");
+
 		match lock_type {
 			LockType::Permit2Escrow => {
+				tracing::info!("→→→→ generate_escrow_order: Calling generate_permit2_order");
 				self.generate_permit2_order(request, config, input_oracle, output_oracle)
 					.await
 			},
 			LockType::Eip3009Escrow => {
+				tracing::info!("→→→→ generate_escrow_order: Calling generate_eip3009_order");
 				self.generate_eip3009_order(request, config, input_oracle, output_oracle)
 					.await
 			},
@@ -511,20 +574,30 @@ impl QuoteGenerator {
 		input_oracle: solver_types::Address,
 		output_oracle: solver_types::Address,
 	) -> Result<OifOrder, QuoteError> {
+		tracing::info!("→→→→→ generate_permit2_order: Starting");
 		let chain_id = request.intent.inputs[0]
 			.asset
 			.ethereum_chain_id()
 			.map_err(|e| {
 				QuoteError::InvalidRequest(format!("Invalid chain ID in asset address: {}", e))
 			})?;
+		tracing::info!(
+			"→→→→→ generate_permit2_order: Chain ID extracted: {}",
+			chain_id
+		);
 
 		// Build structured domain object for Permit2
+		tracing::info!("→→→→→ generate_permit2_order: About to call build_permit2_domain_object");
 		let domain_object = self.build_permit2_domain_object(config, chain_id).await?;
+		tracing::info!("→→→→→ generate_permit2_order: Domain object built successfully");
 
 		// Generate the message object without pre-computed digest
+		tracing::info!("→→→→→ generate_permit2_order: About to call build_permit2_message_object");
 		let message_obj =
 			self.build_permit2_message_object(request, config, input_oracle, output_oracle)?;
+		tracing::info!("→→→→→ generate_permit2_order: Message object built successfully");
 
+		tracing::info!("→→→→→ generate_permit2_order: Creating order struct");
 		let order = OifOrder::OifEscrowV0 {
 			payload: OrderPayload {
 				signature_type: SignatureType::Eip712,
@@ -534,6 +607,7 @@ impl QuoteGenerator {
 				types: Some(self.build_permit2_eip712_types()),
 			},
 		};
+		tracing::info!("→→→→→ generate_permit2_order: Order created successfully");
 
 		Ok(order)
 	}
@@ -692,6 +766,7 @@ impl QuoteGenerator {
 		output_oracle: &solver_types::Address,
 		fill_deadline: u32,
 	) -> Result<(u64, String), QuoteError> {
+		tracing::info!("→→→→→ compute_eip3009_order_identifier: Starting");
 		// Build the StandardOrder struct for encoding
 		use alloy_primitives::U256;
 		use alloy_sol_types::SolCall;
@@ -877,24 +952,39 @@ impl QuoteGenerator {
 		};
 
 		// Call the contract using the delivery service directly
+		tracing::info!(
+			"→→→→→ compute_eip3009_order_identifier: About to call contract_call on chain {}",
+			input_chain_id
+		);
 		let order_id_bytes = self
 			.delivery_service
 			.contract_call(input_chain_id, tx)
 			.await
 			.map_err(|e| {
+				tracing::error!(
+					"→→→→→ compute_eip3009_order_identifier: contract_call FAILED: {}",
+					e
+				);
 				QuoteError::InvalidRequest(format!("Failed to compute order ID: {}", e))
 			})?;
+		tracing::info!(
+			"→→→→→ compute_eip3009_order_identifier: contract_call completed successfully"
+		);
 
 		// Convert the returned bytes to hex string
 		let order_id = format!("0x{}", alloy_primitives::hex::encode(&order_id_bytes));
 
 		if order_id == "0x0000000000000000000000000000000000000000000000000000000000000000" {
+			tracing::error!("→→→→→ compute_eip3009_order_identifier: Got zero order ID");
 			return Err(QuoteError::InvalidRequest(
 				"Failed to compute valid order ID from contract".to_string(),
 			));
 		}
 
-		tracing::debug!("Successfully computed order ID: {}", order_id);
+		tracing::info!(
+			"→→→→→ compute_eip3009_order_identifier: Successfully computed order ID: {}",
+			order_id
+		);
 
 		Ok((nonce, order_id))
 	}
@@ -1191,6 +1281,10 @@ impl QuoteGenerator {
 		token_address: &alloy_primitives::Address,
 		chain_id: u64,
 	) -> Result<String, QuoteError> {
+		println!(
+			"→→→→→ get_token_name: Starting for token address: {:?}",
+			token_address
+		);
 		use alloy_sol_types::{sol, SolCall};
 
 		// Define the name() function call
@@ -1198,8 +1292,11 @@ impl QuoteGenerator {
 			function name() external view returns (string);
 		}
 
+		println!("→→→→→ get_token_name: About to call nameCall");
 		let call = nameCall {};
 		let encoded = call.abi_encode();
+
+		println!("→→→→→ get_token_name: encoded: {:?}", encoded);
 
 		let tx = solver_types::Transaction {
 			to: Some(solver_types::Address(token_address.0.to_vec())),
@@ -1213,15 +1310,25 @@ impl QuoteGenerator {
 			max_priority_fee_per_gas: None,
 		};
 
+		println!("→→→→→ get_token_name: About to call contract_call");
+
 		let result = self
 			.delivery_service
 			.contract_call(chain_id, tx)
 			.await
-			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to get token name: {}", e)))?;
+			.map_err(|e| {
+				println!("→→→→→ get_token_name: contract_call ERROR: {}", e);
+				QuoteError::InvalidRequest(format!("Failed to get token name: {}", e))
+			})?;
+
+		println!("→→→→→ get_token_name: result: {:?}", result);
 
 		let name = nameCall::abi_decode_returns(&result).map_err(|e| {
+			println!("→→→→→ get_token_name: abi_decode_returns ERROR: {}", e);
 			QuoteError::InvalidRequest(format!("Failed to decode token name: {}", e))
 		})?;
+
+		println!("→→→→→ get_token_name: name: {:?}", name);
 
 		Ok(name)
 	}
@@ -1234,6 +1341,10 @@ impl QuoteGenerator {
 	) -> Result<serde_json::Value, QuoteError> {
 		use crate::apis::quote::registry::PROTOCOL_REGISTRY;
 
+		tracing::info!(
+			"→→→→→→ build_permit2_domain_object: Starting for chain {}",
+			chain_id
+		);
 		// Get Permit2 contract address for this chain
 		let permit2_address = PROTOCOL_REGISTRY
 			.get_permit2_address(chain_id)
@@ -1241,15 +1352,10 @@ impl QuoteGenerator {
 				QuoteError::InvalidRequest(format!("Permit2 not deployed on chain {}", chain_id))
 			})?;
 
-		// Get the actual name from Permit2 contract (like we do for EIP-3009 tokens)
-		let permit2_name = self
-			.get_token_name(&permit2_address, chain_id)
-			.await
-			.unwrap_or_else(|_| "Permit2".to_string()); // Fallback to constant if contract call fails
-
 		// Build domain object similar to TheCompact and EIP-3009 structure
+		tracing::info!("→→→→→→ build_permit2_domain_object: Building JSON response");
 		Ok(serde_json::json!({
-			"name": permit2_name,
+			"name": PERMIT2_NAME,
 			"chainId": chain_id.to_string(),
 			"verifyingContract": format!("0x{:040x}", permit2_address)
 		}))
@@ -1265,11 +1371,19 @@ impl QuoteGenerator {
 	) -> Result<serde_json::Value, QuoteError> {
 		use crate::apis::quote::permit2::build_permit2_batch_witness_digest;
 
+		tracing::info!("→→→→→→ build_permit2_message_object: Starting");
 		// Generate the complete message structure
+		tracing::info!(
+			"→→→→→→ build_permit2_message_object: About to call build_permit2_batch_witness_digest"
+		);
 		let (_final_digest, message_obj) =
 			build_permit2_batch_witness_digest(request, config, input_oracle, output_oracle)?;
+		tracing::info!(
+			"→→→→→→ build_permit2_message_object: build_permit2_batch_witness_digest completed"
+		);
 
 		// Extract only the EIP-712 message fields (no metadata like "signing", "digest")
+		tracing::info!("→→→→→→ build_permit2_message_object: Extracting message fields");
 		let permitted = message_obj
 			.get("permitted")
 			.cloned()
@@ -1291,6 +1405,7 @@ impl QuoteGenerator {
 			.cloned()
 			.unwrap_or(serde_json::Value::Null);
 
+		tracing::info!("→→→→→→ build_permit2_message_object: Building JSON response");
 		// Return clean message with only EIP-712 fields (no wrapper)
 		Ok(serde_json::json!({
 			"permitted": permitted,
