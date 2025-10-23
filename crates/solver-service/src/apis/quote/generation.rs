@@ -1241,15 +1241,9 @@ impl QuoteGenerator {
 				QuoteError::InvalidRequest(format!("Permit2 not deployed on chain {}", chain_id))
 			})?;
 
-		// Get the actual name from Permit2 contract (like we do for EIP-3009 tokens)
-		let permit2_name = self
-			.get_token_name(&permit2_address, chain_id)
-			.await
-			.unwrap_or_else(|_| "Permit2".to_string()); // Fallback to constant if contract call fails
-
 		// Build domain object similar to TheCompact and EIP-3009 structure
 		Ok(serde_json::json!({
-			"name": permit2_name,
+			"name": "Permit2",
 			"chainId": chain_id.to_string(),
 			"verifyingContract": format!("0x{:040x}", permit2_address)
 		}))

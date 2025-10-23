@@ -35,7 +35,9 @@ pub struct JwtClaims {
 	pub exp: i64,
 	pub iat: i64,
 	pub iss: String,
+	#[serde(rename = "sub")]
 	pub client_id: String,
+	#[serde(rename = "scope")]
 	pub scopes: Vec<String>,
 }
 

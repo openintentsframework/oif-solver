@@ -42,6 +42,7 @@ pub type SettlementFactory = fn(
 pub type StrategyFactory = fn(&toml::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError>;
 
 /// Global registry for all implementation factories
+#[derive(Default)]
 pub struct FactoryRegistry {
 	pub storage: HashMap<String, StorageFactory>,
 	pub account: HashMap<String, AccountFactory>,

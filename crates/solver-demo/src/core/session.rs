@@ -289,11 +289,7 @@ impl SessionStore {
 	/// Get or create JWT token
 	pub fn get_jwt_token(&self, key: &str) -> Option<String> {
 		let session = self.session.read().ok()?;
-		session
-			.jwt_tokens
-			.get(key)
-			.filter(|t| !t.is_expired())
-			.map(|t| t.token.clone())
+		session.jwt_tokens.get(key).map(|t| t.token.clone())
 	}
 
 	/// Store JWT token
