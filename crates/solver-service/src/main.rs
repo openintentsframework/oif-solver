@@ -6,17 +6,9 @@
 
 use clap::Parser;
 use solver_config::Config;
+use solver_service::{build_solver_from_config, server};
 use std::path::PathBuf;
 use std::sync::Arc;
-
-mod apis;
-mod auth;
-mod eip712;
-mod factory_registry;
-mod server;
-mod signature_validator;
-
-use factory_registry::build_solver_from_config;
 
 /// Command-line arguments for the solver service.
 #[derive(Parser, Debug)]
