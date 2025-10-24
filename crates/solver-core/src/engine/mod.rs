@@ -493,13 +493,12 @@ impl SolverEngine {
 								claim_batch.clear();
 								// Claim sends a transaction - use transaction semaphore
 								self.spawn_handler(&transaction_semaphore, move |engine| async move {
-									let batch_order_ids = batch.to_vec();
 									if let Err(e) = engine.settlement_handler.process_claim_batch(&mut batch).await {
 										let error_msg = format!("Failed to process claim batch: {}", e);
 										// Attempt to mark all orders in batch as failed
-										for order_id in batch_order_ids {
+										for order_id in batch.iter() {
 											if let Err(state_err) = engine.state_machine
-												.transition_order_status(&order_id, solver_types::OrderStatus::Failed(solver_types::TransactionType::Claim, error_msg.clone()))
+												.transition_order_status(order_id, solver_types::OrderStatus::Failed(solver_types::TransactionType::Claim, error_msg.clone()))
 												.await
 											{
 												tracing::error!("Failed to mark order {} as failed: {}", order_id, state_err);

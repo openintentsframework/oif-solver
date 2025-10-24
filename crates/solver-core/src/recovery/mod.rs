@@ -133,6 +133,13 @@ impl RecoveryService {
 
 		// Step 3: Reconcile each order with blockchain and publish recovery events
 		for order in orders {
+			// Skip reconciliation for orders already in Failed state (terminal state)
+			if matches!(order.status, OrderStatus::Failed(_, _)) {
+				tracing::info!("Order {} already failed, skipping reconciliation", order.id);
+				report.reconciled_orders += 1;
+				continue;
+			}
+
 			match self.reconcile_with_blockchain(&order).await {
 				Ok(result) => {
 					self.publish_recovery_event(order, result).await;

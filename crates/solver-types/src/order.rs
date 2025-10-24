@@ -340,7 +340,7 @@ pub struct OrderResponse {
 }
 
 /// Status of an order in the solver system.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum OrderStatus {
 	/// Order has been created but not yet prepared.
@@ -384,6 +384,22 @@ impl fmt::Display for OrderStatus {
 			OrderStatus::Settled => write!(f, "Settled"),
 			OrderStatus::Finalized => write!(f, "Finalized"),
 			OrderStatus::Failed(_, _) => write!(f, "Failed"),
+		}
+	}
+}
+
+impl fmt::Debug for OrderStatus {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			OrderStatus::Created => write!(f, "Created"),
+			OrderStatus::Pending => write!(f, "Pending"),
+			OrderStatus::Executing => write!(f, "Executing"),
+			OrderStatus::Executed => write!(f, "Executed"),
+			OrderStatus::PostFilled => write!(f, "PostFilled"),
+			OrderStatus::PreClaimed => write!(f, "PreClaimed"),
+			OrderStatus::Settled => write!(f, "Settled"),
+			OrderStatus::Finalized => write!(f, "Finalized"),
+			OrderStatus::Failed(tx_type, _) => write!(f, "Failed({:?})", tx_type),
 		}
 	}
 }
