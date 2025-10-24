@@ -145,9 +145,9 @@ impl TransactionHandler {
 	) -> Result<(), TransactionError> {
 		tracing::error!("Transaction failed: {}", error);
 
-		// Update order status with specific failure type
+		// Update order status with specific failure type and error message
 		self.state_machine
-			.transition_order_status(&order_id, OrderStatus::Failed(tx_type))
+			.transition_order_status(&order_id, OrderStatus::Failed(tx_type, error))
 			.await
 			.map_err(|e| TransactionError::State(e.to_string()))?;
 
@@ -1014,7 +1014,7 @@ mod tests {
 			.unwrap();
 		assert_eq!(
 			updated_order.status,
-			OrderStatus::Failed(TransactionType::Fill)
+			OrderStatus::Failed(TransactionType::Fill, "Transaction failed".to_string())
 		);
 	}
 

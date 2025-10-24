@@ -367,9 +367,9 @@ pub enum OrderStatus {
 	/// Order is finalized and complete - claim transaction confirmed.
 	/// Terminal state: No further transitions.
 	Finalized,
-	/// Order execution failed with specific transaction type.
+	/// Order execution failed with specific transaction type and error message.
 	/// Terminal state: No further transitions.
-	Failed(TransactionType),
+	Failed(TransactionType, String),
 }
 
 impl fmt::Display for OrderStatus {
@@ -383,7 +383,7 @@ impl fmt::Display for OrderStatus {
 			OrderStatus::PreClaimed => write!(f, "PreClaimed"),
 			OrderStatus::Settled => write!(f, "Settled"),
 			OrderStatus::Finalized => write!(f, "Finalized"),
-			OrderStatus::Failed(_) => write!(f, "Failed"),
+			OrderStatus::Failed(_, _) => write!(f, "Failed"),
 		}
 	}
 }

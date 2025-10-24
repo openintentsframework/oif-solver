@@ -174,7 +174,7 @@ impl OrderStateMachine {
 				OrderStatus::PreClaimed => OrderStatusKind::PreClaimed,
 				OrderStatus::Settled => OrderStatusKind::Settled,
 				OrderStatus::Finalized => OrderStatusKind::Finalized,
-				OrderStatus::Failed(_) => OrderStatusKind::Failed,
+				OrderStatus::Failed(_, _) => OrderStatusKind::Failed,
 			}
 		};
 

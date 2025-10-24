@@ -337,8 +337,17 @@ impl SolverEngine {
 						SolverEvent::Order(OrderEvent::Preparing { intent, order, params }) => {
 							// Preparing sends a prepare transaction - use transaction semaphore
 							self.spawn_handler(&transaction_semaphore, move |engine| async move {
+								let order_id = order.id.clone();
 								if let Err(e) = engine.order_handler.handle_preparation(intent.source, order, params).await {
-									return Err(EngineError::Service(format!("Failed to handle order preparation: {}", e)));
+									let error_msg = format!("Failed to handle order preparation: {}", e);
+									// Attempt to mark order as failed
+									if let Err(state_err) = engine.state_machine
+										.transition_order_status(&order_id, solver_types::OrderStatus::Failed(solver_types::TransactionType::Prepare, error_msg.clone()))
+										.await
+									{
+										tracing::error!("Failed to mark order as failed: {}", state_err);
+									}
+									return Err(EngineError::Service(error_msg));
 								}
 								Ok(())
 							})
@@ -347,8 +356,17 @@ impl SolverEngine {
 						SolverEvent::Order(OrderEvent::Executing { order, params }) => {
 							// Executing sends a fill transaction - use transaction semaphore
 							self.spawn_handler(&transaction_semaphore, move |engine| async move {
+								let order_id = order.id.clone();
 								if let Err(e) = engine.order_handler.handle_execution(order, params).await {
-									return Err(EngineError::Service(format!("Failed to handle order execution: {}", e)));
+									let error_msg = format!("Failed to handle order execution: {}", e);
+									// Attempt to mark order as failed
+									if let Err(state_err) = engine.state_machine
+										.transition_order_status(&order_id, solver_types::OrderStatus::Failed(solver_types::TransactionType::Fill, error_msg.clone()))
+										.await
+									{
+										tracing::error!("Failed to mark order as failed: {}", state_err);
+									}
+									return Err(EngineError::Service(error_msg));
 								}
 								Ok(())
 							})
@@ -374,8 +392,17 @@ impl SolverEngine {
 							// Confirmation handling doesn't directly send transactions - use general semaphore
 							// Note: This may trigger OrderEvent::Executing which will be serialized separately
 							self.spawn_handler(&general_semaphore, move |engine| async move {
+								let order_id_clone = order_id.clone();
 								if let Err(e) = engine.transaction_handler.handle_confirmed(order_id, tx_hash, tx_type, receipt).await {
-									return Err(EngineError::Service(format!("Failed to handle transaction confirmation: {}", e)));
+									let error_msg = format!("Failed to handle transaction confirmation: {}", e);
+									// Attempt to mark order as failed with the transaction type from the event
+									if let Err(state_err) = engine.state_machine
+										.transition_order_status(&order_id_clone, solver_types::OrderStatus::Failed(tx_type, error_msg.clone()))
+										.await
+									{
+										tracing::error!("Failed to mark order as failed: {}", state_err);
+									}
+									return Err(EngineError::Service(error_msg));
 								}
 								Ok(())
 							})
@@ -403,8 +430,17 @@ impl SolverEngine {
 						// Handle PostFillReady - use settlement handler
 						SolverEvent::Settlement(SettlementEvent::PostFillReady { order_id }) => {
 							self.spawn_handler(&transaction_semaphore, move |engine| async move {
+								let order_id_clone = order_id.clone();
 								if let Err(e) = engine.settlement_handler.handle_post_fill_ready(order_id).await {
-									return Err(EngineError::Service(format!("Failed to handle PostFillReady: {}", e)));
+									let error_msg = format!("Failed to handle PostFillReady: {}", e);
+									// Attempt to mark order as failed
+									if let Err(state_err) = engine.state_machine
+										.transition_order_status(&order_id_clone, solver_types::OrderStatus::Failed(solver_types::TransactionType::PostFill, error_msg.clone()))
+										.await
+									{
+										tracing::error!("Failed to mark order as failed: {}", state_err);
+									}
+									return Err(EngineError::Service(error_msg));
 								}
 								Ok(())
 							})
@@ -414,8 +450,17 @@ impl SolverEngine {
 						// Handle PreClaimReady - use settlement handler
 						SolverEvent::Settlement(SettlementEvent::PreClaimReady { order_id }) => {
 							self.spawn_handler(&transaction_semaphore, move |engine| async move {
+								let order_id_clone = order_id.clone();
 								if let Err(e) = engine.settlement_handler.handle_pre_claim_ready(order_id).await {
-									return Err(EngineError::Service(format!("Failed to handle PreClaimReady: {}", e)));
+									let error_msg = format!("Failed to handle PreClaimReady: {}", e);
+									// Attempt to mark order as failed
+									if let Err(state_err) = engine.state_machine
+										.transition_order_status(&order_id_clone, solver_types::OrderStatus::Failed(solver_types::TransactionType::PreClaim, error_msg.clone()))
+										.await
+									{
+										tracing::error!("Failed to mark order as failed: {}", state_err);
+									}
+									return Err(EngineError::Service(error_msg));
 								}
 								Ok(())
 							})
@@ -448,8 +493,19 @@ impl SolverEngine {
 								claim_batch.clear();
 								// Claim sends a transaction - use transaction semaphore
 								self.spawn_handler(&transaction_semaphore, move |engine| async move {
+									let batch_order_ids = batch.to_vec();
 									if let Err(e) = engine.settlement_handler.process_claim_batch(&mut batch).await {
-										return Err(EngineError::Service(format!("Failed to process claim batch: {}", e)));
+										let error_msg = format!("Failed to process claim batch: {}", e);
+										// Attempt to mark all orders in batch as failed
+										for order_id in batch_order_ids {
+											if let Err(state_err) = engine.state_machine
+												.transition_order_status(&order_id, solver_types::OrderStatus::Failed(solver_types::TransactionType::Claim, error_msg.clone()))
+												.await
+											{
+												tracing::error!("Failed to mark order {} as failed: {}", order_id, state_err);
+											}
+										}
+										return Err(EngineError::Service(error_msg));
 									}
 									Ok(())
 								})
