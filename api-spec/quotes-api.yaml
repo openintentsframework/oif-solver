@@ -55,17 +55,17 @@ paths:
             schema:
               $ref: "#/components/schemas/GetQuoteRequest"
             example:
-              user: "1:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+              user: "0x0100000314aa37dc487c810990e17594a2caa022a1e132c7b94f832f"
               intent:
                 intentType: "oif-swap"
                 inputs:
-                  - user: "1:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
-                    asset: "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                  - user: "0x0100000314aa37dc487c810990e17594a2caa022a1e132c7b94f832f"
+                    asset: "0x0100000314aa37dc191688b2ff5be8f0a5bcab3e819c900a810faaf6"
                     amount: "1000000"
                 outputs:
-                  - receiver: "42161:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
-                    asset: "42161:0xaf88d065e77c8cc2239327c5edb3a432268e5831"
-                    amount: "990000"
+                  - receiver: "0x0100000314014a34487c810990e17594a2caa022a1e132c7b94f832f"
+                    asset: "0x0100000314014a3473c83dacc74bb8a704717ac09703b959e74b9705"
+                    amount: "989998"
                 swapType: "exact-input"
                 originSubmission:
                   mode: "user"
@@ -110,13 +110,13 @@ paths:
                     provider: "oif-solver-v1"
                     preview:
                       inputs:
-                        - user: "1:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
-                          asset: "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                        - user: "0x0100000314aa37dc487c810990e17594a2caa022a1e132c7b94f832f"
+                          asset: "0x0100000314aa37dc191688b2ff5be8f0a5bcab3e819c900a810faaf6"
                           amount: "1000000"
                       outputs:
-                        - receiver: "42161:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
-                          asset: "42161:0xaf88d065e77c8cc2239327c5edb3a432268e5831"
-                          amount: "990000"
+                        - receiver: "0x0100000314014a34487c810990e17594a2caa022a1e132c7b94f832f"
+                          asset: "0x0100000314014a3473c83dacc74bb8a704717ac09703b959e74b9705"
+                          amount: "989998"
         "400":
           description: Invalid request format or parameters
           content:
@@ -136,9 +136,9 @@ paths:
                 unsupportedAsset:
                   value:
                     error: "UNSUPPORTED_ASSET"
-                    message: "Asset not supported by solver: 1:0x1234..."
+                    message: "Asset not supported by solver: 0x0100000314..."
                     details:
-                      asset: "1:0x1234567890abcdef1234567890abcdef12345678"
+                      asset: "0x01000003141234567890abcdef1234567890abcdef12345678"
                 insufficientLiquidity:
                   value:
                     error: "INSUFFICIENT_LIQUIDITY"
@@ -175,9 +175,9 @@ components:
       properties:
         user:
           type: string
-          description: User address in ERC-7930 interoperable format (chainId:address)
-          pattern: "^[0-9]+:0x[a-fA-F0-9]{40}$"
-          example: "1:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+          description: User address in ERC-7930 interoperable format
+          pattern: "^0x[a-fA-F0-9]{50}$"
+          example: "0x0100000314aa37dc487c810990e17594a2caa022a1e132c7b94f832f"
         intent:
           $ref: "#/components/schemas/IntentRequest"
         supportedTypes:
@@ -257,13 +257,13 @@ components:
         user:
           type: string
           description: User address in ERC-7930 format
-          pattern: "^[0-9]+:0x[a-fA-F0-9]{40}$"
-          example: "1:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+          pattern: "^0x[a-fA-F0-9]{50}$"
+          example: "0x0100000314aa37dc487c810990e17594a2caa022a1e132c7b94f832f"
         asset:
           type: string
           description: Asset address in ERC-7930 format
-          pattern: "^[0-9]+:0x[a-fA-F0-9]{40}$"
-          example: "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+          pattern: "^0x[a-fA-F0-9]{50}$"
+          example: "0x0100000314aa37dc191688b2ff5be8f0a5bcab3e819c900a810faaf6"
         amount:
           type: string
           description: Amount as decimal string (required for exact-input, optional for exact-output)
@@ -281,17 +281,17 @@ components:
         receiver:
           type: string
           description: Receiver address in ERC-7930 format
-          pattern: "^[0-9]+:0x[a-fA-F0-9]{40}$"
-          example: "42161:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+          pattern: "^0x[a-fA-F0-9]{50}$"
+          example: "0x0100000314014a34487c810990e17594a2caa022a1e132c7b94f832f"
         asset:
           type: string
           description: Asset address in ERC-7930 format
-          pattern: "^[0-9]+:0x[a-fA-F0-9]{40}$"
-          example: "42161:0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+          pattern: "^0x[a-fA-F0-9]{50}$"
+          example: "0x0100000314014a3473c83dacc74bb8a704717ac09703b959e74b9705"
         amount:
           type: string
           description: Amount as decimal string (required for exact-output, optional for exact-input)
-          example: "990000"
+          example: "989998"
         calldata:
           type: string
           description: Optional calldata for the output
