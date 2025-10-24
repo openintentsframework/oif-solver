@@ -186,6 +186,46 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GetOrderResponse"
+              examples:
+                successfulOrder:
+                  summary: Successfully executed order
+                  value:
+                    order:
+                      id: "abc123def456"
+                      status: "executed"
+                      createdAt: 1699900000
+                      updatedAt: 1699900120
+                      inputAmount:
+                        asset: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                        amount: "1000000"
+                      outputAmount:
+                        asset: "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+                        amount: "990000"
+                      settlement:
+                        type: "escrow"
+                        data: {}
+                failedOrder:
+                  summary: Failed order with error details
+                  value:
+                    order:
+                      id: "abc123def456"
+                      status:
+                        failed:
+                          [
+                            "Fill",
+                            "Failed to handle order execution: Service error: Network timeout",
+                          ]
+                      createdAt: 1699900000
+                      updatedAt: 1699900120
+                      inputAmount:
+                        asset: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                        amount: "1000000"
+                      outputAmount:
+                        asset: "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+                        amount: "990000"
+                      settlement:
+                        type: "escrow"
+                        data: {}
         "404":
           description: Order not found
           content:
@@ -431,22 +471,30 @@ components:
               example: 1699900100
 
     OrderStatus:
-      type: string
-      description: |
-        Current status of the order in its lifecycle:
-        - Created: Order has been created but not yet prepared
-        - Pending: Order is pending execution
-        - Executed: Order has been executed on-chain
-        - Settled: Order has been settled and is ready to be claimed
-        - Finalized: Order is complete (after claim confirmation)
-        - Failed: Order execution failed (with transaction type details)
-      enum:
-        - created
-        - pending
-        - executed
-        - settled
-        - finalized
-        - failed
+      oneOf:
+        - type: string
+          enum: [created, pending, executed, settled, finalized]
+          description: Standard order status values
+        - type: object
+          description: Failed status with detailed error information
+          required: [failed]
+          properties:
+            failed:
+              type: array
+              items:
+                type: string
+              minItems: 2
+              maxItems: 2
+              description: |
+                Array containing transaction type and error message for failed orders.
+                - Index 0: Transaction type (Prepare, Fill, PostFill, PreClaim, Claim)
+                - Index 1: Detailed error message explaining the failure
+              example:
+                [
+                  "PostFill",
+                  "Failed to handle PostFillReady: Service error: Network error: Failed to send transaction: Max retries exceeded server returned an error response: error code 3: execution reverted",
+                ]
+              additionalProperties: false
       example: "executed"
 
     AssetAmount:

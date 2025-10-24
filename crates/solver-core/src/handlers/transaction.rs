@@ -1014,7 +1014,7 @@ mod tests {
 			.unwrap();
 		assert_eq!(
 			updated_order.status,
-			OrderStatus::Failed(TransactionType::Fill, "Transaction failed".to_string())
+			OrderStatus::Failed(TransactionType::Fill, "Gas limit exceeded".to_string())
 		);
 	}
 
