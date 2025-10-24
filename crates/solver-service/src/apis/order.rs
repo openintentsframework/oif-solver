@@ -266,9 +266,9 @@ async fn convert_eip7683_order_to_response(
 				"pending"
 			},
 			// Fill transaction failed
-			OrderStatus::Failed(TransactionType::Fill) => "failed",
+			OrderStatus::Failed(TransactionType::Fill, _) => "failed",
 			// Prepare failed - shouldn't have fill_tx_hash
-			OrderStatus::Failed(TransactionType::Prepare) => {
+			OrderStatus::Failed(TransactionType::Prepare, _) => {
 				tracing::warn!(
 					order_id = %order.id,
 					"Unexpected fill_tx_hash when prepare transaction failed"
@@ -276,9 +276,9 @@ async fn convert_eip7683_order_to_response(
 				"failed"
 			},
 			// Fill succeeded but later transaction failed
-			OrderStatus::Failed(TransactionType::PostFill)
-			| OrderStatus::Failed(TransactionType::PreClaim)
-			| OrderStatus::Failed(TransactionType::Claim) => "executed",
+			OrderStatus::Failed(TransactionType::PostFill, _)
+			| OrderStatus::Failed(TransactionType::PreClaim, _)
+			| OrderStatus::Failed(TransactionType::Claim, _) => "executed",
 		};
 
 		serde_json::json!({
