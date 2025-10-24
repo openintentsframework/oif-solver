@@ -483,7 +483,7 @@ components:
           additionalProperties: true
           example:
             raw_order_data:
-              user: "1:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+              user: "0x0100000314aa37dc487c810990e17594a2caa022a1e132c7b94f832f"
               nonce: "12345"
             signature: "0x1234567890abcdef..."
             expires: 1700000000
