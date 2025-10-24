@@ -12,6 +12,20 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+/// Kind of order status for state transition validation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum OrderStatusKind {
+	Created,
+	Pending,
+	Executing,
+	Executed,
+	PostFilled,
+	PreClaimed,
+	Settled,
+	Finalized,
+	Failed,
+}
+
 /// Errors that can occur during order state management.
 ///
 /// These errors represent failures in storage operations,
@@ -85,6 +99,12 @@ impl OrderStateMachine {
 			.await
 			.map_err(|e| OrderStateError::Storage(e.to_string()))?;
 
+		// Skip transition if already in the same status kind
+		// (ignoring error message differences in Failed status)
+		if status_kind(&order.status) == status_kind(&new_status) {
+			return Ok(order);
+		}
+
 		// Validate state transition
 		if !Self::is_valid_transition(&order.status, &new_status) {
 			return Err(OrderStateError::InvalidTransition {
@@ -101,19 +121,6 @@ impl OrderStateMachine {
 
 	/// Checks if a state transition is valid
 	fn is_valid_transition(from: &OrderStatus, to: &OrderStatus) -> bool {
-		#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-		enum OrderStatusKind {
-			Created,
-			Pending,
-			Executing,
-			Executed,
-			PostFilled,
-			PreClaimed,
-			Settled,
-			Finalized,
-			Failed,
-		}
-
 		// Static transition table - each state maps to allowed next states
 		static TRANSITIONS: Lazy<HashMap<OrderStatusKind, HashSet<OrderStatusKind>>> =
 			Lazy::new(|| {
@@ -162,21 +169,6 @@ impl OrderStateMachine {
 				m.insert(OrderStatusKind::Finalized, HashSet::new()); // terminal
 				m
 			});
-
-		// Helper to convert OrderStatus to OrderStatusKind
-		let status_kind = |status: &OrderStatus| -> OrderStatusKind {
-			match status {
-				OrderStatus::Created => OrderStatusKind::Created,
-				OrderStatus::Pending => OrderStatusKind::Pending,
-				OrderStatus::Executing => OrderStatusKind::Executing,
-				OrderStatus::Executed => OrderStatusKind::Executed,
-				OrderStatus::PostFilled => OrderStatusKind::PostFilled,
-				OrderStatus::PreClaimed => OrderStatusKind::PreClaimed,
-				OrderStatus::Settled => OrderStatusKind::Settled,
-				OrderStatus::Finalized => OrderStatusKind::Finalized,
-				OrderStatus::Failed(_) => OrderStatusKind::Failed,
-			}
-		};
 
 		let from_kind = status_kind(from);
 		let to_kind = status_kind(to);
@@ -244,6 +236,21 @@ impl OrderStateMachine {
 			order.fill_proof = Some(proof);
 		})
 		.await
+	}
+}
+
+/// Helper to convert OrderStatus to OrderStatusKind for comparison
+fn status_kind(status: &OrderStatus) -> OrderStatusKind {
+	match status {
+		OrderStatus::Created => OrderStatusKind::Created,
+		OrderStatus::Pending => OrderStatusKind::Pending,
+		OrderStatus::Executing => OrderStatusKind::Executing,
+		OrderStatus::Executed => OrderStatusKind::Executed,
+		OrderStatus::PostFilled => OrderStatusKind::PostFilled,
+		OrderStatus::PreClaimed => OrderStatusKind::PreClaimed,
+		OrderStatus::Settled => OrderStatusKind::Settled,
+		OrderStatus::Finalized => OrderStatusKind::Finalized,
+		OrderStatus::Failed(_, _) => OrderStatusKind::Failed,
 	}
 }
 

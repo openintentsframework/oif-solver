@@ -133,6 +133,13 @@ impl RecoveryService {
 
 		// Step 3: Reconcile each order with blockchain and publish recovery events
 		for order in orders {
+			// Skip reconciliation for orders already in Failed state (terminal state)
+			if matches!(order.status, OrderStatus::Failed(_, _)) {
+				tracing::info!("Order {} already failed, skipping reconciliation", order.id);
+				report.reconciled_orders += 1;
+				continue;
+			}
+
 			match self.reconcile_with_blockchain(&order).await {
 				Ok(result) => {
 					self.publish_recovery_event(order, result).await;
@@ -168,16 +175,31 @@ impl RecoveryService {
 		let non_terminal_statuses = vec![
 			serde_json::to_value(OrderStatus::Finalized)
 				.expect("OrderStatus::Finalized serialization should not fail"),
-			serde_json::to_value(OrderStatus::Failed(TransactionType::Prepare))
-				.expect("OrderStatus::Failed(Prepare) serialization should not fail"),
-			serde_json::to_value(OrderStatus::Failed(TransactionType::Fill))
-				.expect("OrderStatus::Failed(Fill) serialization should not fail"),
-			serde_json::to_value(OrderStatus::Failed(TransactionType::Claim))
-				.expect("OrderStatus::Failed(Claim) serialization should not fail"),
-			serde_json::to_value(OrderStatus::Failed(TransactionType::PostFill))
-				.expect("OrderStatus::Failed(PostFill) serialization should not fail"),
-			serde_json::to_value(OrderStatus::Failed(TransactionType::PreClaim))
-				.expect("OrderStatus::Failed(PreClaim) serialization should not fail"),
+			serde_json::to_value(OrderStatus::Failed(
+				TransactionType::Prepare,
+				"Recovery failure".to_string(),
+			))
+			.expect("OrderStatus::Failed(Prepare) serialization should not fail"),
+			serde_json::to_value(OrderStatus::Failed(
+				TransactionType::Fill,
+				"Recovery failure".to_string(),
+			))
+			.expect("OrderStatus::Failed(Fill) serialization should not fail"),
+			serde_json::to_value(OrderStatus::Failed(
+				TransactionType::Claim,
+				"Recovery failure".to_string(),
+			))
+			.expect("OrderStatus::Failed(Claim) serialization should not fail"),
+			serde_json::to_value(OrderStatus::Failed(
+				TransactionType::PostFill,
+				"Recovery failure".to_string(),
+			))
+			.expect("OrderStatus::Failed(PostFill) serialization should not fail"),
+			serde_json::to_value(OrderStatus::Failed(
+				TransactionType::PreClaim,
+				"Recovery failure".to_string(),
+			))
+			.expect("OrderStatus::Failed(PreClaim) serialization should not fail"),
 		];
 
 		// Query for all non-terminal orders
@@ -473,7 +495,7 @@ impl RecoveryService {
 			},
 			ReconcileResult::Failed(tx_type) => {
 				// Failed at some stage
-				OrderStatus::Failed(*tx_type)
+				OrderStatus::Failed(*tx_type, "Blockchain reconciliation failed".to_string())
 			},
 		};
 
@@ -661,7 +683,13 @@ impl RecoveryService {
 				// Update order status to failed
 				if let Err(e) = self
 					.state_machine
-					.transition_order_status(&order.id, OrderStatus::Failed(tx_type))
+					.transition_order_status(
+						&order.id,
+						OrderStatus::Failed(
+							tx_type,
+							"Blockchain reconciliation failed".to_string(),
+						),
+					)
 					.await
 				{
 					tracing::error!("Failed to update order {} status: {}", order.id, e);
@@ -729,7 +757,7 @@ impl RecoveryService {
 						OrderStatus::Finalized => {
 							// Already finalized, nothing to do
 						},
-						OrderStatus::Failed(_) => {
+						OrderStatus::Failed(_, _) => {
 							// Order is failed, don't transition to finalized
 							tracing::warn!("Order {} is in failed state but blockchain shows finalized - data inconsistency", order.id);
 						},

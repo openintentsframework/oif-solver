@@ -227,7 +227,7 @@ impl OrderBuilder {
 
 	/// Convenience method to create a failed order.
 	pub fn failed_with_transaction_type(mut self, tx_type: crate::TransactionType) -> Self {
-		self.status = OrderStatus::Failed(tx_type);
+		self.status = OrderStatus::Failed(tx_type, "Test failure".to_string());
 		self
 	}
 
