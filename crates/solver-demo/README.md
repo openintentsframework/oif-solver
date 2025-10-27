@@ -172,8 +172,19 @@ oif-demo intent build \
 # Load testnet configuration
 oif-demo init load config/testnet.toml
 
-# Check accounts and balances
+# List tokens and accounts
+oif-demo token list
 oif-demo account list
+
+# Mint tokens for testing (Optimism Sepolia - Chain 11155420)
+oif-demo token mint --chain 11155420 --token USDC --amount 100 --to user
+oif-demo token mint --chain 11155420 --token USDC --amount 100 --to solver
+
+# Mint tokens for testing (Base Sepolia - Chain 84532)
+oif-demo token mint --chain 84532 --token USDC --amount 100 --to user
+oif-demo token mint --chain 84532 --token USDC --amount 100 --to solver
+
+# Check accounts and balances
 oif-demo token balance
 
 # Approve tokens for Permit2 (required for escrow settlement)
