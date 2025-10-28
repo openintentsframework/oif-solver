@@ -171,7 +171,7 @@ fn extract_fill_details_from_logs(
 	}
 
 	Err(SettlementError::ValidationFailed(
-		"OutputFilled event not found in logs".into(),
+		"No OutputFilled event detected in logs. The output may have already been completed by another solver".into(),
 	))
 }
 
