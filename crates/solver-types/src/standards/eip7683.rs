@@ -315,18 +315,18 @@ pub mod interfaces {
 			SolMandateOutput[] outputs;
 		}
 
-	/// MandateOutput for the OIF contracts (used for ABI encoding)
-	#[derive(Debug)]
-	struct SolMandateOutput {
-		bytes32 oracle;
-		bytes32 settler;
-		uint256 chainId;
-		bytes32 token;
-		uint256 amount;
-		bytes32 recipient;
-		bytes callbackData;
-		bytes context;
-	}
+		/// MandateOutput for the OIF contracts (used for ABI encoding)
+		#[derive(Debug)]
+		struct SolMandateOutput {
+			bytes32 oracle;
+			bytes32 settler;
+			uint256 chainId;
+			bytes32 token;
+			uint256 amount;
+			bytes32 recipient;
+			bytes callbackData;
+			bytes context;
+		}
 
 		/// Solve parameters combining timestamp and solver.
 		struct SolveParams {

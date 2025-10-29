@@ -1337,22 +1337,22 @@ impl QuoteGenerator {
 	/// Generates EIP-712 types definition for Permit2 orders
 	fn build_permit2_eip712_types(&self) -> serde_json::Value {
 		serde_json::json!({
-				"EIP712Domain": [
-					{"name": "name", "type": "string"},
-					{"name": "chainId", "type": "uint256"},
-					{"name": "verifyingContract", "type": "address"}
-				],
-				"PermitBatchWitnessTransferFrom": [
-					{"name": "permitted", "type": "TokenPermissions[]"},
-					{"name": "spender", "type": "address"},
-					{"name": "nonce", "type": "uint256"},
-					{"name": "deadline", "type": "uint256"},
-					{"name": "witness", "type": "Permit2Witness"}
-				],
-				"TokenPermissions": [
-					{"name": "token", "type": "address"},
-					{"name": "amount", "type": "uint256"}
-				],
+			"EIP712Domain": [
+				{"name": "name", "type": "string"},
+				{"name": "chainId", "type": "uint256"},
+				{"name": "verifyingContract", "type": "address"}
+			],
+			"PermitBatchWitnessTransferFrom": [
+				{"name": "permitted", "type": "TokenPermissions[]"},
+				{"name": "spender", "type": "address"},
+				{"name": "nonce", "type": "uint256"},
+				{"name": "deadline", "type": "uint256"},
+				{"name": "witness", "type": "Permit2Witness"}
+			],
+			"TokenPermissions": [
+				{"name": "token", "type": "address"},
+				{"name": "amount", "type": "uint256"}
+			],
 			"Permit2Witness": [
 				{"name": "expires", "type": "uint32"},
 				{"name": "inputOracle", "type": "address"},
@@ -1374,30 +1374,30 @@ impl QuoteGenerator {
 	/// Generates EIP-712 types definition for TheCompact BatchCompact orders
 	fn build_compact_eip712_types(&self) -> serde_json::Value {
 		serde_json::json!({
-				"EIP712Domain": [
-					{"name": "name", "type": "string"},
-					{"name": "version", "type": "string"},
-					{"name": "chainId", "type": "uint256"},
-					{"name": "verifyingContract", "type": "address"}
-				],
-				"BatchCompact": [
-					{"name": "arbiter", "type": "address"},
-					{"name": "sponsor", "type": "address"},
-					{"name": "nonce", "type": "uint256"},
-					{"name": "expires", "type": "uint256"},
-					{"name": "commitments", "type": "Lock[]"},
-					{"name": "mandate", "type": "Mandate"}
-				],
-				"Lock": [
-					{"name": "lockTag", "type": "bytes12"},
-					{"name": "token", "type": "address"},
-					{"name": "amount", "type": "uint256"}
-				],
-				"Mandate": [
-					{"name": "fillDeadline", "type": "uint32"},
-					{"name": "inputOracle", "type": "address"},
-					{"name": "outputs", "type": "MandateOutput[]"}
-				],
+			"EIP712Domain": [
+				{"name": "name", "type": "string"},
+				{"name": "version", "type": "string"},
+				{"name": "chainId", "type": "uint256"},
+				{"name": "verifyingContract", "type": "address"}
+			],
+			"BatchCompact": [
+				{"name": "arbiter", "type": "address"},
+				{"name": "sponsor", "type": "address"},
+				{"name": "nonce", "type": "uint256"},
+				{"name": "expires", "type": "uint256"},
+				{"name": "commitments", "type": "Lock[]"},
+				{"name": "mandate", "type": "Mandate"}
+			],
+			"Lock": [
+				{"name": "lockTag", "type": "bytes12"},
+				{"name": "token", "type": "address"},
+				{"name": "amount", "type": "uint256"}
+			],
+			"Mandate": [
+				{"name": "fillDeadline", "type": "uint32"},
+				{"name": "inputOracle", "type": "address"},
+				{"name": "outputs", "type": "MandateOutput[]"}
+			],
 			"MandateOutput": [
 				{"name": "oracle", "type": "bytes32"},
 				{"name": "settler", "type": "bytes32"},

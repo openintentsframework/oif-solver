@@ -1035,8 +1035,8 @@ mod tests {
 	#[test]
 	fn test_deserialize_bytes32_valid() {
 		let json_data = json!({
-				"oracle": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-				"settler": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+			"oracle": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+			"settler": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
 			"chainId": "137",
 			"token": "9999999999999999999999999999999999999999999999999999999999999999",
 			"amount": "500",
@@ -1055,14 +1055,14 @@ mod tests {
 	#[test]
 	fn test_deserialize_bytes32_no_prefix() {
 		let json_data = json!({
-		"oracle": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-		"settler": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-		"chainId": "137",
-		"token": "9999999999999999999999999999999999999999999999999999999999999999",
-		"amount": "500",
-		"recipient": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-		"callbackData": "0x",
-		"context": "0x"
+			"oracle": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+			"settler": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+			"chainId": "137",
+			"token": "9999999999999999999999999999999999999999999999999999999999999999",
+			"amount": "500",
+			"recipient": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+			"callbackData": "0x",
+			"context": "0x"
 		});
 		let result: Result<ApiMandateOutput, _> = serde_json::from_value(json_data);
 		assert!(result.is_ok());
