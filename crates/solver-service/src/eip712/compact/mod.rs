@@ -315,4 +315,44 @@ mod tests {
 		let extracted_short = extract_sponsor_signature(&short_sig);
 		assert_eq!(extracted_short, short_sig);
 	}
+
+	#[test]
+	fn test_compute_lock_hash() {
+		use alloy_primitives::Uint;
+
+		// Test case: Single lock with known values
+		let token_id = Uint::<256, 4>::from(0x123456789abcdef0u64); // 12 bytes lock tag + 20 bytes token address
+		let amount = Uint::<256, 4>::from(1000u64);
+		let ids_and_amounts = vec![[token_id, amount]];
+
+		let result = compute_lock_hash(&ids_and_amounts);
+		assert!(result.is_ok());
+
+		let lock_hash = result.unwrap();
+		// Verify it's a valid 32-byte hash
+		assert_eq!(lock_hash.len(), 32);
+
+		// Test case: Multiple locks
+		let token_id_2 = Uint::<256, 4>::from(0xfedcba9876543210u64);
+		let amount_2 = Uint::<256, 4>::from(2000u64);
+		let multiple_locks = vec![[token_id, amount], [token_id_2, amount_2]];
+
+		let result_multiple = compute_lock_hash(&multiple_locks);
+		assert!(result_multiple.is_ok());
+
+		let multiple_lock_hash = result_multiple.unwrap();
+		assert_eq!(multiple_lock_hash.len(), 32);
+
+		// Different inputs should produce different hashes
+		assert_ne!(lock_hash, multiple_lock_hash);
+
+		// Test case: Empty locks array
+		let empty_locks: Vec<[Uint<256, 4>; 2]> = vec![];
+		let result_empty = compute_lock_hash(&empty_locks);
+		assert!(result_empty.is_ok());
+
+		let empty_hash = result_empty.unwrap();
+		assert_eq!(empty_hash.len(), 32);
+		assert_ne!(empty_hash, lock_hash);
+	}
 }
