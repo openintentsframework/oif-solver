@@ -296,7 +296,7 @@ mod tests {
 		abi_encoded_sig.extend_from_slice(&65u32.to_be_bytes());
 
 		// Allocator signature data (65 bytes)
-		abi_encoded_sig.extend_from_slice(&vec![0x22u8; 65]);
+		abi_encoded_sig.extend_from_slice(&[0x22u8; 65]);
 
 		let signature = Bytes::from(abi_encoded_sig);
 		let extracted = extract_sponsor_signature(&signature);
