@@ -1,6 +1,7 @@
 # OIF Solver
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/openintentsframework/oif-solver)
+[![codecov](https://codecov.io/gh/openintentsframework/oif-solvers/branch/main/graph/badge.svg)](https://codecov.io/gh/openintentsframework/oif-solvers)
 
 > :warning: This software is in alpha. Use in production environments at your own risk.
 
