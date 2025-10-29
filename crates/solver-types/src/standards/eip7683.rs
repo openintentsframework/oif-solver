@@ -165,8 +165,8 @@ pub struct MandateOutput {
 	/// The recipient that should receive the tokens (bytes32 - padded address)
 	pub recipient: [u8; 32],
 	/// Data delivered to recipient through settlement callback
-	#[serde(with = "hex_string")]
-	pub call: Vec<u8>,
+	#[serde(rename = "callbackData", with = "hex_string")]
+	pub callback_data: Vec<u8>,
 	/// Additional output context for settlement
 	#[serde(with = "hex_string")]
 	pub context: Vec<u8>,
@@ -243,10 +243,10 @@ impl OrderParsable for Eip7683OrderData {
 					receiver,
 					asset,
 					amount: output.amount,
-					calldata: if output.call.is_empty() {
+					calldata: if output.callback_data.is_empty() {
 						None
 					} else {
-						Some(with_0x_prefix(&hex::encode(&output.call)))
+						Some(with_0x_prefix(&hex::encode(&output.callback_data)))
 					},
 				}
 			})
@@ -315,18 +315,18 @@ pub mod interfaces {
 			SolMandateOutput[] outputs;
 		}
 
-		/// MandateOutput for the OIF contracts (used for ABI encoding)
-		#[derive(Debug)]
-		struct SolMandateOutput {
-			bytes32 oracle;
-			bytes32 settler;
-			uint256 chainId;
-			bytes32 token;
-			uint256 amount;
-			bytes32 recipient;
-			bytes call;
-			bytes context;
-		}
+	/// MandateOutput for the OIF contracts (used for ABI encoding)
+	#[derive(Debug)]
+	struct SolMandateOutput {
+		bytes32 oracle;
+		bytes32 settler;
+		uint256 chainId;
+		bytes32 token;
+		uint256 amount;
+		bytes32 recipient;
+		bytes callbackData;
+		bytes context;
+	}
 
 		/// Solve parameters combining timestamp and solver.
 		struct SolveParams {
@@ -536,7 +536,7 @@ impl interfaces::StandardOrder {
 						token: token_bytes.into(),
 						amount,
 						recipient: recipient_bytes.into(),
-						call: Vec::new().into(),
+						callbackData: Vec::new().into(),
 						context: Vec::new().into(),
 					});
 				}
@@ -730,7 +730,7 @@ impl interfaces::StandardOrder {
 					token: token_bytes.into(),
 					amount,
 					recipient: recipient_bytes.into(),
-					call: Vec::new().into(),
+					callbackData: Vec::new().into(),
 					context: Vec::new().into(),
 				});
 			}
@@ -897,7 +897,7 @@ impl interfaces::StandardOrder {
 							token: token_bytes.into(),
 							amount,
 							recipient: recipient_bytes.into(),
-							call: Vec::new().into(),
+							callbackData: Vec::new().into(),
 							context: Vec::new().into(),
 						});
 					}
@@ -988,7 +988,7 @@ impl From<interfaces::SolMandateOutput> for MandateOutput {
 			token: output.token.0,
 			amount: output.amount,
 			recipient: output.recipient.0,
-			call: output.call.to_vec(),
+			callback_data: output.callbackData.to_vec(),
 			context: output.context.to_vec(),
 		}
 	}
@@ -1006,7 +1006,7 @@ impl From<MandateOutput> for interfaces::SolMandateOutput {
 			token: FixedBytes::<32>::from(output.token),
 			amount: output.amount,
 			recipient: FixedBytes::<32>::from(output.recipient),
-			call: output.call.into(),
+			callbackData: output.callback_data.into(),
 			context: output.context.into(),
 		}
 	}
@@ -1172,7 +1172,7 @@ mod tests {
 			.build();
 
 		let json = serde_json::to_string(&output).unwrap();
-		assert!(json.contains("\"call\":\"0xabcd\""));
+		assert!(json.contains("\"callbackData\":\"0xabcd\""));
 		assert!(json.contains("\"context\":\"0x1234\""));
 	}
 
@@ -1185,12 +1185,12 @@ mod tests {
 			"token": [3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],
 			"amount": "1000",
 			"recipient": [4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4],
-			"call": "0xabcd",
+			"callbackData": "0xabcd",
 			"context": "0x1234"
 		}"#;
 
 		let output: MandateOutput = serde_json::from_str(json).unwrap();
-		assert_eq!(output.call, vec![0xab, 0xcd]);
+		assert_eq!(output.callback_data, vec![0xab, 0xcd]);
 		assert_eq!(output.context, vec![0x12, 0x34]);
 	}
 
@@ -1203,12 +1203,12 @@ mod tests {
 			"token": [3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],
 			"amount": "1000",
 			"recipient": [4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4],
-			"call": "abcd",
+			"callbackData": "abcd",
 			"context": "1234"
 		}"#;
 
 		let output: MandateOutput = serde_json::from_str(json).unwrap();
-		assert_eq!(output.call, vec![0xab, 0xcd]);
+		assert_eq!(output.callback_data, vec![0xab, 0xcd]);
 		assert_eq!(output.context, vec![0x12, 0x34]);
 	}
 
@@ -1224,12 +1224,12 @@ mod tests {
 			.build();
 
 		let json = serde_json::to_string(&output).unwrap();
-		assert!(json.contains("\"call\":\"0x\""));
+		assert!(json.contains("\"callbackData\":\"0x\""));
 		assert!(json.contains("\"context\":\"0x\""));
 
 		// Test round-trip
 		let deserialized: MandateOutput = serde_json::from_str(&json).unwrap();
-		assert_eq!(deserialized.call, Vec::<u8>::new());
+		assert_eq!(deserialized.callback_data, Vec::<u8>::new());
 		assert_eq!(deserialized.context, Vec::<u8>::new());
 	}
 
@@ -1288,7 +1288,7 @@ mod tests {
 				"token": [3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],
 				"amount": "1000",
 				"recipient": [4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4],
-				"call": "0xabcd",
+				"callbackData": "0xabcd",
 				"context": "0x1234"
 			}]
 		}"#;
@@ -1350,7 +1350,7 @@ mod tests {
 			.build();
 		let cloned_output = output.clone();
 		assert_eq!(output.amount, cloned_output.amount);
-		assert_eq!(output.call, cloned_output.call);
+		assert_eq!(output.callback_data, cloned_output.callback_data);
 	}
 
 	#[test]
@@ -1373,7 +1373,7 @@ mod tests {
 
 		assert_eq!(deserialized.chain_id, large_u256);
 		assert_eq!(deserialized.amount, large_u256);
-		assert_eq!(deserialized.call.len(), 1000);
+		assert_eq!(deserialized.callback_data.len(), 1000);
 		assert_eq!(deserialized.context.len(), 500);
 	}
 }

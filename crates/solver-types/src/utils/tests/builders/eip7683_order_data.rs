@@ -90,7 +90,7 @@ impl Eip7683OrderDataBuilder {
 				token: [0u8; 32],
 				amount: U256::from(DEFAULT_OUTPUT_AMOUNT_TOKENS * TOKENS_18_DECIMALS),
 				recipient: [0u8; 32],
-				call: vec![],
+				callback_data: vec![],
 				context: vec![],
 			}],
 			raw_order_data: None,

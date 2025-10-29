@@ -171,7 +171,7 @@ pub fn compute_single_output_hash(output: &MandateOutput) -> Result<FixedBytes<3
 	data.extend_from_slice(output.token.as_slice());
 	data.extend_from_slice(&output.amount.to_be_bytes::<32>());
 	data.extend_from_slice(output.recipient.as_slice());
-	data.extend_from_slice(keccak256(&output.call).as_slice());
+	data.extend_from_slice(keccak256(&output.callbackData).as_slice());
 	data.extend_from_slice(keccak256(&output.context).as_slice());
 
 	Ok(keccak256(data))

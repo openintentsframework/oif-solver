@@ -245,7 +245,7 @@ mod tests {
 				},
 				amount: U256::from(95),
 				recipient: [3u8; 32],
-				call: vec![],
+				callback_data: vec![],
 				context: vec![],
 			}],
 			raw_order_data: None,
@@ -478,7 +478,7 @@ mod tests {
 			token: [4u8; 32],         // Different token
 			amount: U256::from(75),
 			recipient: [5u8; 32],
-			call: vec![],
+			callback_data: vec![],
 			context: vec![],
 		});
 
@@ -527,7 +527,7 @@ mod tests {
 			token: [4u8; 32],
 			amount: U256::from(75),
 			recipient: [5u8; 32],
-			call: vec![],
+			callback_data: vec![],
 			context: vec![],
 		});
 

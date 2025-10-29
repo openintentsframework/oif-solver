@@ -128,7 +128,8 @@ struct ApiMandateOutput {
 		serialize_with = "serialize_bytes32"
 	)]
 	recipient: [u8; 32],
-	call: Bytes,
+	#[serde(rename = "callbackData")]
+	callback_data: Bytes,
 	context: Bytes,
 }
 
@@ -153,7 +154,7 @@ impl From<&SolMandateOutput> for ApiMandateOutput {
 			token: output.token.0,
 			amount: output.amount,
 			recipient: output.recipient.0,
-			call: output.call.clone(),
+			callback_data: output.callbackData.clone(),
 			context: output.context.clone(),
 		}
 	}
@@ -471,7 +472,7 @@ impl Eip7683OffchainDiscovery {
 						token,
 						amount: output.amount,
 						recipient,
-						call: output.call.clone().into(),
+						callback_data: output.callbackData.clone().into(),
 						context: output.context.clone().into(),
 					}
 				})
@@ -1000,7 +1001,7 @@ mod tests {
 			token: alloy_primitives::FixedBytes::from([0x9au8; 32]),
 			amount: U256::from(500),
 			recipient: alloy_primitives::FixedBytes::from([0xbcu8; 32]),
-			call: Bytes::new(),
+			callbackData: Bytes::new(),
 			context: Bytes::new(),
 		}
 	}
@@ -1034,13 +1035,13 @@ mod tests {
 	#[test]
 	fn test_deserialize_bytes32_valid() {
 		let json_data = json!({
-			"oracle": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-			"settler": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+				"oracle": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+				"settler": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
 			"chainId": "137",
 			"token": "9999999999999999999999999999999999999999999999999999999999999999",
 			"amount": "500",
 			"recipient": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-			"call": "0x",
+			"callbackData": "0x",
 			"context": "0x"
 		});
 		let result: Result<ApiMandateOutput, _> = serde_json::from_value(json_data);
@@ -1054,14 +1055,14 @@ mod tests {
 	#[test]
 	fn test_deserialize_bytes32_no_prefix() {
 		let json_data = json!({
-			"oracle": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-			"settler": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-			"chainId": "137",
-			"token": "9999999999999999999999999999999999999999999999999999999999999999",
-			"amount": "500",
-			"recipient": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-			"call": "0x",
-			"context": "0x"
+		"oracle": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+		"settler": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+		"chainId": "137",
+		"token": "9999999999999999999999999999999999999999999999999999999999999999",
+		"amount": "500",
+		"recipient": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		"callbackData": "0x",
+		"context": "0x"
 		});
 		let result: Result<ApiMandateOutput, _> = serde_json::from_value(json_data);
 		assert!(result.is_ok());

@@ -22,7 +22,7 @@
   },
   "infrastructure": {
     "permit2_address": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
-    "oif_contracts_commit": "eafdaa8",
+    "oif_contracts_commit": "2078e9286d27b7126f1e6631dcfe73ad36a8d7e9",
     "oif_contracts_repo": "https://github.com/openintentsframework/oif-contracts.git"
   },
   "solver_parameters": {

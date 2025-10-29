@@ -36,7 +36,7 @@ sol! {
 		bytes32 token;
 		uint256 amount;
 		bytes32 recipient;
-		bytes call;
+		bytes callbackData;
 		bytes context;
 	}
 
@@ -219,7 +219,7 @@ impl Eip7683Discovery {
 					token: output.token.0,
 					amount: output.amount,
 					recipient: output.recipient.0,
-					call: output.call.clone().into(),
+					callback_data: output.callbackData.clone().into(),
 					context: output.context.clone().into(),
 				})
 				.collect::<Vec<_>>(),
@@ -660,7 +660,7 @@ mod tests {
 				token: B256::from([7u8; 32]),
 				amount: U256::from(1000),
 				recipient: B256::from([8u8; 32]),
-				call: vec![1, 2, 3].into(),
+				callbackData: vec![1, 2, 3].into(),
 				context: vec![4, 5, 6].into(),
 			}],
 		}
@@ -1017,7 +1017,7 @@ mod tests {
 				token: [7u8; 32],
 				amount: U256::from(1000),
 				recipient: [8u8; 32],
-				call: vec![1, 2, 3],
+				callback_data: vec![1, 2, 3],
 				context: vec![4, 5, 6],
 			}],
 			raw_order_data: Some(with_0x_prefix("deadbeef")),
@@ -1052,7 +1052,7 @@ mod tests {
 			token: B256::from([3u8; 32]),
 			amount: U256::from(1000),
 			recipient: B256::from([4u8; 32]),
-			call: vec![1, 2, 3].into(),
+			callbackData: vec![1, 2, 3].into(),
 			context: vec![4, 5, 6].into(),
 		};
 

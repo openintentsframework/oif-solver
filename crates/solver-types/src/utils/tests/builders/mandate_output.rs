@@ -32,7 +32,7 @@ pub struct MandateOutputBuilder {
 	token: Option<[u8; 32]>,
 	amount: Option<U256>,
 	recipient: Option<[u8; 32]>,
-	call: Vec<u8>,
+	callback_data: Vec<u8>,
 	context: Vec<u8>,
 }
 
@@ -52,7 +52,7 @@ impl MandateOutputBuilder {
 			token: None,
 			amount: None,
 			recipient: None,
-			call: Vec::new(),
+			callback_data: Vec::new(),
 			context: Vec::new(),
 		}
 	}
@@ -95,14 +95,14 @@ impl MandateOutputBuilder {
 
 	/// Sets the call data for settlement callback.
 	pub fn call(mut self, call: Vec<u8>) -> Self {
-		self.call = call;
+		self.callback_data = call;
 		self
 	}
 
 	/// Sets the call data from a hex string (with or without 0x prefix).
 	pub fn call_hex(mut self, hex: &str) -> Result<Self, hex::FromHexError> {
 		let hex = hex.strip_prefix("0x").unwrap_or(hex);
-		self.call = hex::decode(hex)?;
+		self.callback_data = hex::decode(hex)?;
 		Ok(self)
 	}
 
@@ -159,7 +159,7 @@ impl MandateOutputBuilder {
 			token: self.token.unwrap(),
 			amount: self.amount.unwrap(),
 			recipient: self.recipient.unwrap(),
-			call: self.call,
+			callback_data: self.callback_data,
 			context: self.context,
 		})
 	}
