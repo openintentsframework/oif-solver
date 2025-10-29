@@ -1,7 +1,7 @@
 # OIF Solver
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/openintentsframework/oif-solver)
-[![codecov](https://codecov.io/gh/openintentsframework/oif-solvers/branch/main/graph/badge.svg)](https://codecov.io/gh/openintentsframework/oif-solvers)
+[![codecov](https://codecov.io/github/openintentsframework/oif-solver/graph/badge.svg?token=JCYSH684F4)](https://codecov.io/github/openintentsframework/oif-solver)
 
 > :warning: This software is in alpha. Use in production environments at your own risk.
 
@@ -292,16 +292,16 @@ The solver provides a REST API for interacting with the system and submitting of
 - **POST `/api/quotes`** - Request price quotes for a cross-chain swap
   - Request body:
     ```json
-    { 
-      "user": "...", 
-      "intent": { 
-        "intentType": "...", 
-        "inputs": [...], 
-        "outputs": [...], 
-        "swapType": "...", 
-        "originSubmission": {...} 
-      }, 
-      "supportedTypes": [...] 
+    {
+      "user": "...",
+      "intent": {
+        "intentType": "...",
+        "inputs": [...],
+        "outputs": [...],
+        "swapType": "...",
+        "originSubmission": {...}
+      },
+      "supportedTypes": [...]
     }
     ```
   - Returns: Array of quotes with `quoteId`, order structure ready for signing, and preview of amounts
@@ -312,26 +312,26 @@ The solver provides a REST API for interacting with the system and submitting of
 
   - Quote acceptance:
     ```json
-    { 
-      "quoteId": "...", 
-      "signature": "0x..." 
+    {
+      "quoteId": "...",
+      "signature": "0x..."
     }
     ```
   - Direct submission:
     ```json
-    { 
-      "order": { "type": "...", "payload": {...} }, 
-      "signature": "0x...", 
-      "originSubmission": {...} 
+    {
+      "order": { "type": "...", "payload": {...} },
+      "signature": "0x...",
+      "originSubmission": {...}
     }
     ```
   - Supported order types: `oif-escrow-v0`, `oif-resource-lock-v0`, `oif-3009-v0`
   - Returns:
     ```json
-    { 
-      "orderId": "...", 
-      "status": "received", 
-      "message": null 
+    {
+      "orderId": "...",
+      "status": "received",
+      "message": null
     }
     ```
 
