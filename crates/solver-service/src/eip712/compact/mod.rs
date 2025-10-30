@@ -256,3 +256,103 @@ pub fn compute_batch_compact_struct_hash(
 
 	Ok(keccak256(struct_data))
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use alloy_primitives::Bytes;
+
+	#[test]
+	fn test_extract_sponsor_signature() {
+		// Test case: ABI-encoded signature with sponsor and allocator signatures
+		// Structure: abi.encode(sponsorSig, allocatorSig)
+		// - First 32 bytes: offset to sponsorSig (0x40 = 64)
+		// - Next 32 bytes: offset to allocatorSig (0x80 = 128)
+		// - Next 32 bytes: length of sponsorSig (65 bytes)
+		// - Next 65 bytes: actual sponsorSig data
+		// - Next 32 bytes: length of allocatorSig (65 bytes)
+		// - Last 65 bytes: actual allocatorSig data
+
+		let mut abi_encoded_sig = Vec::new();
+
+		// Offset to sponsorSig (64 bytes from start)
+		abi_encoded_sig.extend_from_slice(&[0u8; 28]);
+		abi_encoded_sig.extend_from_slice(&64u32.to_be_bytes());
+
+		// Offset to allocatorSig (128 bytes from start)
+		abi_encoded_sig.extend_from_slice(&[0u8; 28]);
+		abi_encoded_sig.extend_from_slice(&128u32.to_be_bytes());
+
+		// Length of sponsorSig (65 bytes)
+		abi_encoded_sig.extend_from_slice(&[0u8; 28]);
+		abi_encoded_sig.extend_from_slice(&65u32.to_be_bytes());
+
+		// Sponsor signature data (65 bytes)
+		let sponsor_sig_data = vec![0x11u8; 65];
+		abi_encoded_sig.extend_from_slice(&sponsor_sig_data);
+
+		// Length of allocatorSig (65 bytes)
+		abi_encoded_sig.extend_from_slice(&[0u8; 28]);
+		abi_encoded_sig.extend_from_slice(&65u32.to_be_bytes());
+
+		// Allocator signature data (65 bytes)
+		abi_encoded_sig.extend_from_slice(&[0x22u8; 65]);
+
+		let signature = Bytes::from(abi_encoded_sig);
+		let extracted = extract_sponsor_signature(&signature);
+
+		// Should extract the sponsor signature (65 bytes of 0x11)
+		assert_eq!(extracted.len(), 65);
+		assert_eq!(extracted.to_vec(), sponsor_sig_data);
+
+		// Test case: Raw signature (not ABI-encoded, should return as-is)
+		let raw_sig = Bytes::from(vec![0x33u8; 65]);
+		let extracted_raw = extract_sponsor_signature(&raw_sig);
+		assert_eq!(extracted_raw, raw_sig);
+
+		// Test case: Short signature (should return as-is)
+		let short_sig = Bytes::from(vec![0x44u8; 32]);
+		let extracted_short = extract_sponsor_signature(&short_sig);
+		assert_eq!(extracted_short, short_sig);
+	}
+
+	#[test]
+	fn test_compute_lock_hash() {
+		use alloy_primitives::Uint;
+
+		// Test case: Single lock with known values
+		let token_id = Uint::<256, 4>::from(0x123456789abcdef0u64); // 12 bytes lock tag + 20 bytes token address
+		let amount = Uint::<256, 4>::from(1000u64);
+		let ids_and_amounts = vec![[token_id, amount]];
+
+		let result = compute_lock_hash(&ids_and_amounts);
+		assert!(result.is_ok());
+
+		let lock_hash = result.unwrap();
+		// Verify it's a valid 32-byte hash
+		assert_eq!(lock_hash.len(), 32);
+
+		// Test case: Multiple locks
+		let token_id_2 = Uint::<256, 4>::from(0xfedcba9876543210u64);
+		let amount_2 = Uint::<256, 4>::from(2000u64);
+		let multiple_locks = vec![[token_id, amount], [token_id_2, amount_2]];
+
+		let result_multiple = compute_lock_hash(&multiple_locks);
+		assert!(result_multiple.is_ok());
+
+		let multiple_lock_hash = result_multiple.unwrap();
+		assert_eq!(multiple_lock_hash.len(), 32);
+
+		// Different inputs should produce different hashes
+		assert_ne!(lock_hash, multiple_lock_hash);
+
+		// Test case: Empty locks array
+		let empty_locks: Vec<[Uint<256, 4>; 2]> = vec![];
+		let result_empty = compute_lock_hash(&empty_locks);
+		assert!(result_empty.is_ok());
+
+		let empty_hash = result_empty.unwrap();
+		assert_eq!(empty_hash.len(), 32);
+		assert_ne!(empty_hash, lock_hash);
+	}
+}

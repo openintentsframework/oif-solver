@@ -202,4 +202,14 @@ jobs:
           LLVM_PROFILE_FILE: unit-%p-%m.profraw
           RUSTFLAGS: -Cinstrument-coverage
           RUST_TEST_THREADS: 1
-        run: cargo hack llvm-cov --locked --workspace --lib --lcov --output-path unit-lcov.info
+        run: cargo llvm-cov --locked --workspace --lcov --output-path unit-lcov.info
+
+      # Upload unit coverage
+      - name: Upload Unit Coverage to Codecov
+        uses: codecov/codecov-action@18283e04ce6e62d37312384ff67231eb8fd56d24 # v5.4.3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          name: unit-coverage
+          files: unit-lcov.info
+          flags: unittests
+          fail_ci_if_error: false
