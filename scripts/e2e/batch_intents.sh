@@ -279,7 +279,7 @@ process_intent() {
     echo -e "${YELLOW}🔏 Generating EIP-712 signature...${NC}"
     
     # Type hashes
-    local mandate_output_type="MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
+    local mandate_output_type="MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)"
     local mandate_output_type_hash=$(cast keccak "$mandate_output_type")
     
     local permit2_witness_type="Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)${mandate_output_type}"

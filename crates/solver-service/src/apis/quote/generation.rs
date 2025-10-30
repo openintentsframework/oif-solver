@@ -1090,7 +1090,7 @@ impl QuoteGenerator {
 				"token": solver_types::utils::address_to_bytes32_hex(&output_token_address),
 				"amount": amount.clone(),
 				"recipient": solver_types::utils::address_to_bytes32_hex(&recipient_address),
-				"call": output.calldata.clone(),
+				"callbackData": output.calldata.as_ref().unwrap_or(&"0x".to_string()).clone(),
 				"context": "0x" // Context is typically empty for standard flows
 			}));
 		}

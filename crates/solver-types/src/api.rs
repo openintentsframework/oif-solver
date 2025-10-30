@@ -209,7 +209,7 @@ impl QuotePreview {
 											),
 											amount: Some(amount.to_string()),
 											calldata: output
-												.get("call")
+												.get("callbackData")
 												.and_then(|v| v.as_str())
 												.map(String::from),
 										});
@@ -302,7 +302,7 @@ impl QuotePreview {
 											),
 											amount: Some(amount.to_string()),
 											calldata: output
-												.get("call")
+												.get("callbackData")
 												.and_then(|v| v.as_str())
 												.map(String::from),
 										});
