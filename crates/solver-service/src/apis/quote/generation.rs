@@ -1449,7 +1449,7 @@ impl QuoteGenerator {
 
 		// Build domain object similar to Permit2 structure
 		Ok(serde_json::json!({
-			"name": "TheCompact",
+			"name": "The Compact",
 			"version": "1",
 			"chainId": chain_id.to_string(),
 			"verifyingContract": format!("{:#x}", contract_address)
