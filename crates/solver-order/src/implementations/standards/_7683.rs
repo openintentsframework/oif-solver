@@ -343,7 +343,7 @@ impl OrderInterface for Eip7683OrderImpl {
 			recipient: FixedBytes::<32>::from(output.recipient),
 			// For direct transfers, no additional call data is required, so this field is left empty.
 			// If the output settlement requires invoking a contract with specific calldata, populate this field accordingly.
-			call: vec![].into(),
+			callbackData: vec![].into(),
 			// Context is also left empty for direct transfers, as no extra execution context is needed.
 			// This field may be populated for advanced settlement scenarios (e.g., meta-transactions, custom logic).
 			context: vec![].into(),
@@ -480,7 +480,7 @@ impl OrderInterface for Eip7683OrderImpl {
 					token: token_bytes32,
 					amount: output.amount,
 					recipient: recipient_bytes32,
-					call: vec![].into(),
+					callbackData: vec![].into(),
 					context: vec![].into(),
 				})
 			})
@@ -976,7 +976,7 @@ mod tests {
 				token: B256::from([0x55; 32]),
 				amount: U256::from(1000),
 				recipient: B256::from([0x66; 32]),
-				call: vec![].into(),
+				callbackData: vec![].into(),
 				context: vec![].into(),
 			}],
 		};

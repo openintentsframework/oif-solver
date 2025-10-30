@@ -122,7 +122,7 @@ pub fn compute_batch_compact_hash(
 /// Compute witness hash for TheCompact mandate
 pub fn compute_witness_hash(order: &OifStandardOrder) -> Result<FixedBytes<32>, APIError> {
 	let mandate_type_hash = keccak256(
-		b"Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
+		b"Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)"
 	);
 
 	let outputs_hash = compute_outputs_hash(&order.outputs)?;
@@ -160,7 +160,7 @@ pub fn compute_outputs_hash(outputs: &[MandateOutput]) -> Result<FixedBytes<32>,
 /// Compute hash of a single mandate output
 pub fn compute_single_output_hash(output: &MandateOutput) -> Result<FixedBytes<32>, APIError> {
 	let output_type_hash = keccak256(
-		b"MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
+		b"MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)"
 	);
 
 	let mut data = Vec::new();
@@ -171,7 +171,7 @@ pub fn compute_single_output_hash(output: &MandateOutput) -> Result<FixedBytes<3
 	data.extend_from_slice(output.token.as_slice());
 	data.extend_from_slice(&output.amount.to_be_bytes::<32>());
 	data.extend_from_slice(output.recipient.as_slice());
-	data.extend_from_slice(keccak256(&output.call).as_slice());
+	data.extend_from_slice(keccak256(&output.callbackData).as_slice());
 	data.extend_from_slice(keccak256(&output.context).as_slice());
 
 	Ok(keccak256(data))
@@ -233,7 +233,7 @@ pub fn compute_batch_compact_struct_hash(
 	witness: FixedBytes<32>,
 ) -> Result<FixedBytes<32>, APIError> {
 	let batch_compact_type_hash = keccak256(
-		b"BatchCompact(address arbiter,address sponsor,uint256 nonce,uint256 expires,Lock[] commitments,Mandate mandate)Lock(bytes12 lockTag,address token,uint256 amount)Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
+		b"BatchCompact(address arbiter,address sponsor,uint256 nonce,uint256 expires,Lock[] commitments,Mandate mandate)Lock(bytes12 lockTag,address token,uint256 amount)Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)"
 	);
 
 	let mut struct_data = Vec::new();

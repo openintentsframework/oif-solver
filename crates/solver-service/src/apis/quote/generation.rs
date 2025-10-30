@@ -825,7 +825,7 @@ impl QuoteGenerator {
 				token: output_token_bytes32,
 				amount: output_amount_u256,
 				recipient: recipient_bytes32,
-				call: vec![].into(),
+				callbackData: vec![].into(),
 				context: vec![].into(),
 			}],
 		};
@@ -851,7 +851,7 @@ impl QuoteGenerator {
 							o.token,
 							o.amount,
 							o.recipient,
-							o.call.clone(),
+							o.callbackData.clone(),
 							o.context.clone(),
 						)
 					})
@@ -1090,7 +1090,7 @@ impl QuoteGenerator {
 				"token": solver_types::utils::address_to_bytes32_hex(&output_token_address),
 				"amount": amount.clone(),
 				"recipient": solver_types::utils::address_to_bytes32_hex(&recipient_address),
-				"call": output.calldata.clone(),
+				"callbackData": output.calldata.as_ref().unwrap_or(&"0x".to_string()).clone(),
 				"context": "0x" // Context is typically empty for standard flows
 			}));
 		}
@@ -1349,15 +1349,6 @@ impl QuoteGenerator {
 				{"name": "deadline", "type": "uint256"},
 				{"name": "witness", "type": "Permit2Witness"}
 			],
-			"TokenPermissions": [
-				{"name": "token", "type": "address"},
-				{"name": "amount", "type": "uint256"}
-			],
-			"Permit2Witness": [
-				{"name": "expires", "type": "uint32"},
-				{"name": "inputOracle", "type": "address"},
-				{"name": "outputs", "type": "MandateOutput[]"}
-			],
 			"MandateOutput": [
 				{"name": "oracle", "type": "bytes32"},
 				{"name": "settler", "type": "bytes32"},
@@ -1365,8 +1356,17 @@ impl QuoteGenerator {
 				{"name": "token", "type": "bytes32"},
 				{"name": "amount", "type": "uint256"},
 				{"name": "recipient", "type": "bytes32"},
-				{"name": "call", "type": "bytes"},
+				{"name": "callbackData", "type": "bytes"},
 				{"name": "context", "type": "bytes"}
+			],
+			"Permit2Witness": [
+				{"name": "expires", "type": "uint32"},
+				{"name": "inputOracle", "type": "address"},
+				{"name": "outputs", "type": "MandateOutput[]"}
+			],
+			"TokenPermissions": [
+				{"name": "token", "type": "address"},
+				{"name": "amount", "type": "uint256"}
 			]
 		})
 	}
@@ -1405,7 +1405,7 @@ impl QuoteGenerator {
 				{"name": "token", "type": "bytes32"},
 				{"name": "amount", "type": "uint256"},
 				{"name": "recipient", "type": "bytes32"},
-				{"name": "call", "type": "bytes"},
+				{"name": "callbackData", "type": "bytes"},
 				{"name": "context", "type": "bytes"}
 			]
 		})
