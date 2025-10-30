@@ -15,7 +15,7 @@ use hex;
 // Common EIP-712 type strings used across the solver
 pub const DOMAIN_TYPE: &str = "EIP712Domain(string name,uint256 chainId,address verifyingContract)";
 pub const NAME_PERMIT2: &str = "Permit2";
-pub const MANDATE_OUTPUT_TYPE: &str = "MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)";
+pub const MANDATE_OUTPUT_TYPE: &str = "MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)";
 pub const PERMIT2_WITNESS_TYPE: &str =
 	"Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)";
 pub const TOKEN_PERMISSIONS_TYPE: &str = "TokenPermissions(address token,uint256 amount)";
@@ -156,7 +156,7 @@ pub fn reconstruct_permit2_digest(
 	// 2. Compute struct hash for PermitBatchWitnessTransferFrom
 
 	// Type hash for the main struct
-	let permit_type = "PermitBatchWitnessTransferFrom(TokenPermissions[] permitted,address spender,uint256 nonce,uint256 deadline,Permit2Witness witness)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)TokenPermissions(address token,uint256 amount)Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)";
+	let permit_type = "PermitBatchWitnessTransferFrom(TokenPermissions[] permitted,address spender,uint256 nonce,uint256 deadline,Permit2Witness witness)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)TokenPermissions(address token,uint256 amount)";
 	let type_hash = keccak256(permit_type.as_bytes());
 
 	// Extract message fields
@@ -232,7 +232,7 @@ pub fn reconstruct_permit2_digest(
 		.get("outputs")
 		.and_then(|o| o.as_array())
 		.ok_or("Missing outputs")?;
-	let output_type_hash = keccak256("MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)".as_bytes());
+	let output_type_hash = keccak256("MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)".as_bytes());
 	let mut output_hashes = Vec::new();
 
 	for output in outputs {
@@ -266,7 +266,7 @@ pub fn reconstruct_permit2_digest(
 			.and_then(|r| r.as_str())
 			.ok_or("Missing recipient")?;
 		let call_str = output_obj
-			.get("call")
+			.get("callbackData")
 			.and_then(|c| if c.is_null() { Some("0x") } else { c.as_str() })
 			.unwrap_or("0x");
 		let context_str = output_obj
@@ -318,7 +318,7 @@ pub fn reconstruct_permit2_digest(
 	let outputs_hash = keccak256(outputs_encoder.finish());
 
 	// Build witness struct hash
-	let witness_type_hash = keccak256("Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)".as_bytes());
+	let witness_type_hash = keccak256("Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)".as_bytes());
 	let mut witness_encoder = Eip712AbiEncoder::new();
 	witness_encoder.push_b256(&witness_type_hash);
 	witness_encoder.push_u32(expires);
@@ -483,7 +483,7 @@ pub fn reconstruct_compact_digest(
 		.and_then(|o| o.as_array())
 		.ok_or("Missing outputs")?;
 
-	let mandate_output_type_hash = keccak256("MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)".as_bytes());
+	let mandate_output_type_hash = keccak256("MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)".as_bytes());
 	let mut output_hashes = Vec::new();
 
 	for output in outputs {
@@ -518,7 +518,7 @@ pub fn reconstruct_compact_digest(
 			.and_then(|r| r.as_str())
 			.ok_or("Missing recipient")?;
 		let call_str = output_obj
-			.get("call")
+			.get("callbackData")
 			.and_then(|c| if c.is_null() { Some("0x") } else { c.as_str() })
 			.unwrap_or("0x");
 		let context_str = output_obj
@@ -570,7 +570,7 @@ pub fn reconstruct_compact_digest(
 	let outputs_hash = keccak256(outputs_encoder.finish());
 
 	// Build mandate struct hash
-	let mandate_type_hash = keccak256("Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)".as_bytes());
+	let mandate_type_hash = keccak256("Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)".as_bytes());
 	let mut mandate_encoder = Eip712AbiEncoder::new();
 	mandate_encoder.push_b256(&mandate_type_hash);
 	mandate_encoder.push_u32(fill_deadline);
@@ -579,7 +579,7 @@ pub fn reconstruct_compact_digest(
 	let mandate_hash = keccak256(mandate_encoder.finish());
 
 	// 5. Build BatchCompact struct hash
-	let batch_compact_type_hash = keccak256("BatchCompact(address arbiter,address sponsor,uint256 nonce,uint256 expires,Lock[] commitments,Mandate mandate)Lock(bytes12 lockTag,address token,uint256 amount)Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)".as_bytes());
+	let batch_compact_type_hash = keccak256("BatchCompact(address arbiter,address sponsor,uint256 nonce,uint256 expires,Lock[] commitments,Mandate mandate)Lock(bytes12 lockTag,address token,uint256 amount)Mandate(uint32 fillDeadline,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)".as_bytes());
 
 	let mut struct_encoder = Eip712AbiEncoder::new();
 	struct_encoder.push_b256(&batch_compact_type_hash);

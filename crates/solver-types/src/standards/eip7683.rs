@@ -165,7 +165,7 @@ pub struct MandateOutput {
 	/// The recipient that should receive the tokens (bytes32 - padded address)
 	pub recipient: [u8; 32],
 	/// Data delivered to recipient through settlement callback
-	#[serde(with = "hex_string")]
+	#[serde(rename = "callbackData", with = "hex_string")]
 	pub call: Vec<u8>,
 	/// Additional output context for settlement
 	#[serde(with = "hex_string")]
@@ -324,7 +324,7 @@ pub mod interfaces {
 			bytes32 token;
 			uint256 amount;
 			bytes32 recipient;
-			bytes call;
+			bytes callbackData;
 			bytes context;
 		}
 
@@ -536,7 +536,7 @@ impl interfaces::StandardOrder {
 						token: token_bytes.into(),
 						amount,
 						recipient: recipient_bytes.into(),
-						call: Vec::new().into(),
+						callbackData: Vec::new().into(),
 						context: Vec::new().into(),
 					});
 				}
@@ -730,7 +730,7 @@ impl interfaces::StandardOrder {
 					token: token_bytes.into(),
 					amount,
 					recipient: recipient_bytes.into(),
-					call: Vec::new().into(),
+					callbackData: Vec::new().into(),
 					context: Vec::new().into(),
 				});
 			}
@@ -897,7 +897,7 @@ impl interfaces::StandardOrder {
 							token: token_bytes.into(),
 							amount,
 							recipient: recipient_bytes.into(),
-							call: Vec::new().into(),
+							callbackData: Vec::new().into(),
 							context: Vec::new().into(),
 						});
 					}
@@ -988,7 +988,7 @@ impl From<interfaces::SolMandateOutput> for MandateOutput {
 			token: output.token.0,
 			amount: output.amount,
 			recipient: output.recipient.0,
-			call: output.call.to_vec(),
+			call: output.callbackData.to_vec(),
 			context: output.context.to_vec(),
 		}
 	}
@@ -1006,7 +1006,7 @@ impl From<MandateOutput> for interfaces::SolMandateOutput {
 			token: FixedBytes::<32>::from(output.token),
 			amount: output.amount,
 			recipient: FixedBytes::<32>::from(output.recipient),
-			call: output.call.into(),
+			callbackData: output.call.into(),
 			context: output.context.into(),
 		}
 	}
@@ -1172,7 +1172,7 @@ mod tests {
 			.build();
 
 		let json = serde_json::to_string(&output).unwrap();
-		assert!(json.contains("\"call\":\"0xabcd\""));
+		assert!(json.contains("\"callbackData\":\"0xabcd\""));
 		assert!(json.contains("\"context\":\"0x1234\""));
 	}
 
@@ -1185,7 +1185,7 @@ mod tests {
 			"token": [3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],
 			"amount": "1000",
 			"recipient": [4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4],
-			"call": "0xabcd",
+			"callbackData": "0xabcd",
 			"context": "0x1234"
 		}"#;
 
@@ -1203,7 +1203,7 @@ mod tests {
 			"token": [3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],
 			"amount": "1000",
 			"recipient": [4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4],
-			"call": "abcd",
+			"callbackData": "abcd",
 			"context": "1234"
 		}"#;
 
@@ -1224,7 +1224,7 @@ mod tests {
 			.build();
 
 		let json = serde_json::to_string(&output).unwrap();
-		assert!(json.contains("\"call\":\"0x\""));
+		assert!(json.contains("\"callbackData\":\"0x\""));
 		assert!(json.contains("\"context\":\"0x\""));
 
 		// Test round-trip
@@ -1288,7 +1288,7 @@ mod tests {
 				"token": [3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],
 				"amount": "1000",
 				"recipient": [4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4],
-				"call": "0xabcd",
+				"callbackData": "0xabcd",
 				"context": "0x1234"
 			}]
 		}"#;
