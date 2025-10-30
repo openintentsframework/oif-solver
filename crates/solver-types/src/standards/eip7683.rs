@@ -166,7 +166,7 @@ pub struct MandateOutput {
 	pub recipient: [u8; 32],
 	/// Data delivered to recipient through settlement callback
 	#[serde(rename = "callbackData", with = "hex_string")]
-	pub callback_data: Vec<u8>,
+	pub call: Vec<u8>,
 	/// Additional output context for settlement
 	#[serde(with = "hex_string")]
 	pub context: Vec<u8>,
@@ -243,10 +243,10 @@ impl OrderParsable for Eip7683OrderData {
 					receiver,
 					asset,
 					amount: output.amount,
-					calldata: if output.callback_data.is_empty() {
+					calldata: if output.call.is_empty() {
 						None
 					} else {
-						Some(with_0x_prefix(&hex::encode(&output.callback_data)))
+						Some(with_0x_prefix(&hex::encode(&output.call)))
 					},
 				}
 			})
@@ -988,7 +988,7 @@ impl From<interfaces::SolMandateOutput> for MandateOutput {
 			token: output.token.0,
 			amount: output.amount,
 			recipient: output.recipient.0,
-			callback_data: output.callbackData.to_vec(),
+			call: output.callbackData.to_vec(),
 			context: output.context.to_vec(),
 		}
 	}
@@ -1006,7 +1006,7 @@ impl From<MandateOutput> for interfaces::SolMandateOutput {
 			token: FixedBytes::<32>::from(output.token),
 			amount: output.amount,
 			recipient: FixedBytes::<32>::from(output.recipient),
-			callbackData: output.callback_data.into(),
+			callbackData: output.call.into(),
 			context: output.context.into(),
 		}
 	}
@@ -1190,7 +1190,7 @@ mod tests {
 		}"#;
 
 		let output: MandateOutput = serde_json::from_str(json).unwrap();
-		assert_eq!(output.callback_data, vec![0xab, 0xcd]);
+		assert_eq!(output.call, vec![0xab, 0xcd]);
 		assert_eq!(output.context, vec![0x12, 0x34]);
 	}
 
@@ -1208,7 +1208,7 @@ mod tests {
 		}"#;
 
 		let output: MandateOutput = serde_json::from_str(json).unwrap();
-		assert_eq!(output.callback_data, vec![0xab, 0xcd]);
+		assert_eq!(output.call, vec![0xab, 0xcd]);
 		assert_eq!(output.context, vec![0x12, 0x34]);
 	}
 
@@ -1229,7 +1229,7 @@ mod tests {
 
 		// Test round-trip
 		let deserialized: MandateOutput = serde_json::from_str(&json).unwrap();
-		assert_eq!(deserialized.callback_data, Vec::<u8>::new());
+		assert_eq!(deserialized.call, Vec::<u8>::new());
 		assert_eq!(deserialized.context, Vec::<u8>::new());
 	}
 
@@ -1350,7 +1350,7 @@ mod tests {
 			.build();
 		let cloned_output = output.clone();
 		assert_eq!(output.amount, cloned_output.amount);
-		assert_eq!(output.callback_data, cloned_output.callback_data);
+		assert_eq!(output.call, cloned_output.call);
 	}
 
 	#[test]
@@ -1373,7 +1373,7 @@ mod tests {
 
 		assert_eq!(deserialized.chain_id, large_u256);
 		assert_eq!(deserialized.amount, large_u256);
-		assert_eq!(deserialized.callback_data.len(), 1000);
+		assert_eq!(deserialized.call.len(), 1000);
 		assert_eq!(deserialized.context.len(), 500);
 	}
 }

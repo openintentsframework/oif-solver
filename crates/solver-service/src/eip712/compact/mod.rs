@@ -160,7 +160,7 @@ pub fn compute_outputs_hash(outputs: &[MandateOutput]) -> Result<FixedBytes<32>,
 /// Compute hash of a single mandate output
 pub fn compute_single_output_hash(output: &MandateOutput) -> Result<FixedBytes<32>, APIError> {
 	let output_type_hash = keccak256(
-		b"MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes call,bytes context)"
+		b"MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)"
 	);
 
 	let mut data = Vec::new();

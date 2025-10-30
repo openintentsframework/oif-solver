@@ -129,7 +129,7 @@ struct ApiMandateOutput {
 	)]
 	recipient: [u8; 32],
 	#[serde(rename = "callbackData")]
-	callback_data: Bytes,
+	call: Bytes,
 	context: Bytes,
 }
 
@@ -154,7 +154,7 @@ impl From<&SolMandateOutput> for ApiMandateOutput {
 			token: output.token.0,
 			amount: output.amount,
 			recipient: output.recipient.0,
-			callback_data: output.callbackData.clone(),
+			call: output.callbackData.clone(),
 			context: output.context.clone(),
 		}
 	}
@@ -472,7 +472,7 @@ impl Eip7683OffchainDiscovery {
 						token,
 						amount: output.amount,
 						recipient,
-						callback_data: output.callbackData.clone().into(),
+						call: output.callbackData.clone().into(),
 						context: output.context.clone().into(),
 					}
 				})
@@ -1041,7 +1041,7 @@ mod tests {
 			"token": "9999999999999999999999999999999999999999999999999999999999999999",
 			"amount": "500",
 			"recipient": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-			"callbackData": "0x",
+			"call": "0x",
 			"context": "0x"
 		});
 		let result: Result<ApiMandateOutput, _> = serde_json::from_value(json_data);
@@ -1061,7 +1061,7 @@ mod tests {
 			"token": "9999999999999999999999999999999999999999999999999999999999999999",
 			"amount": "500",
 			"recipient": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-			"callbackData": "0x",
+			"call": "0x",
 			"context": "0x"
 		});
 		let result: Result<ApiMandateOutput, _> = serde_json::from_value(json_data);

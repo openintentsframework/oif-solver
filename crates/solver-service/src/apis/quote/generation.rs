@@ -1090,7 +1090,7 @@ impl QuoteGenerator {
 				"token": solver_types::utils::address_to_bytes32_hex(&output_token_address),
 				"amount": amount.clone(),
 				"recipient": solver_types::utils::address_to_bytes32_hex(&recipient_address),
-				"callbackData": output.calldata.clone(),
+				"call": output.calldata.clone(),
 				"context": "0x" // Context is typically empty for standard flows
 			}));
 		}
@@ -1349,15 +1349,6 @@ impl QuoteGenerator {
 				{"name": "deadline", "type": "uint256"},
 				{"name": "witness", "type": "Permit2Witness"}
 			],
-			"TokenPermissions": [
-				{"name": "token", "type": "address"},
-				{"name": "amount", "type": "uint256"}
-			],
-			"Permit2Witness": [
-				{"name": "expires", "type": "uint32"},
-				{"name": "inputOracle", "type": "address"},
-				{"name": "outputs", "type": "MandateOutput[]"}
-			],
 			"MandateOutput": [
 				{"name": "oracle", "type": "bytes32"},
 				{"name": "settler", "type": "bytes32"},
@@ -1367,6 +1358,15 @@ impl QuoteGenerator {
 				{"name": "recipient", "type": "bytes32"},
 				{"name": "callbackData", "type": "bytes"},
 				{"name": "context", "type": "bytes"}
+			],
+			"Permit2Witness": [
+				{"name": "expires", "type": "uint32"},
+				{"name": "inputOracle", "type": "address"},
+				{"name": "outputs", "type": "MandateOutput[]"}
+			],
+			"TokenPermissions": [
+				{"name": "token", "type": "address"},
+				{"name": "amount", "type": "uint256"}
 			]
 		})
 	}

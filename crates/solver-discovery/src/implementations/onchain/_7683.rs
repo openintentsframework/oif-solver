@@ -219,7 +219,7 @@ impl Eip7683Discovery {
 					token: output.token.0,
 					amount: output.amount,
 					recipient: output.recipient.0,
-					callback_data: output.callbackData.clone().into(),
+					call: output.callbackData.clone().into(),
 					context: output.context.clone().into(),
 				})
 				.collect::<Vec<_>>(),
@@ -1017,7 +1017,7 @@ mod tests {
 				token: [7u8; 32],
 				amount: U256::from(1000),
 				recipient: [8u8; 32],
-				callback_data: vec![1, 2, 3],
+				call: vec![1, 2, 3],
 				context: vec![4, 5, 6],
 			}],
 			raw_order_data: Some(with_0x_prefix("deadbeef")),
