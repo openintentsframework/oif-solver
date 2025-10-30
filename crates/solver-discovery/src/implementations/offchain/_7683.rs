@@ -1041,7 +1041,7 @@ mod tests {
 			"token": "9999999999999999999999999999999999999999999999999999999999999999",
 			"amount": "500",
 			"recipient": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-			"call": "0x",
+			"callbackData": "0x",
 			"context": "0x"
 		});
 		let result: Result<ApiMandateOutput, _> = serde_json::from_value(json_data);
@@ -1061,7 +1061,7 @@ mod tests {
 			"token": "9999999999999999999999999999999999999999999999999999999999999999",
 			"amount": "500",
 			"recipient": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-			"call": "0x",
+			"callbackData": "0x",
 			"context": "0x"
 		});
 		let result: Result<ApiMandateOutput, _> = serde_json::from_value(json_data);
