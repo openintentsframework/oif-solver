@@ -233,7 +233,7 @@ pub fn build_permit2_batch_witness_digest(
 				"token": solver_types::utils::address_to_bytes32_hex(&dest_token),
 				"amount": output_amount.to_string(),
 				"recipient": solver_types::utils::address_to_bytes32_hex(&recipient),
-				"call": "0x",
+				"callbackData": "0x",
 				"context": "0x"
 			}]
 		}
