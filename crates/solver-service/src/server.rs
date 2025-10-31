@@ -603,3 +603,274 @@ async fn forward_to_discovery_service(
 		},
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use axum::body;
+	use axum::http::StatusCode;
+	use reqwest::Client;
+	use serde_json::json;
+	use solver_account::AccountService;
+	use solver_config::Config;
+	use solver_core::engine::event_bus::EventBus;
+	use solver_core::engine::token_manager::TokenManager;
+	use solver_delivery::DeliveryService;
+	use solver_discovery::DiscoveryService;
+	use solver_order::OrderService;
+	use solver_pricing::implementations::mock::create_mock_pricing;
+	use solver_pricing::PricingService;
+	use solver_settlement::SettlementService;
+	use solver_storage::implementations::memory::MemoryStorage;
+	use solver_storage::StorageService;
+	use solver_types::api::{OrderPayload, PostOrderResponse, PostOrderResponseStatus, SignatureType};
+	use solver_types::api::{PostOrderRequest, OifOrder};
+	use solver_types::Address;
+	use std::collections::HashMap;
+	use std::sync::Arc;
+	use wiremock::matchers::{method, path};
+	use wiremock::{Mock, MockServer, ResponseTemplate};
+
+	fn build_test_solver_engine() -> Arc<SolverEngine> {
+		let config_toml = r#"
+			[solver]
+			id = "test-solver"
+			monitoring_timeout_seconds = 30
+			min_profitability_pct = 1.0
+
+			[storage]
+			primary = "memory"
+			cleanup_interval_seconds = 60
+			[storage.implementations.memory]
+
+			[delivery]
+			min_confirmations = 1
+			[delivery.implementations]
+
+			[account]
+			primary = "local"
+			[account.implementations.local]
+			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
+
+			[discovery]
+			[discovery.implementations]
+
+			[order]
+			[order.implementations]
+			[order.strategy]
+			primary = "simple"
+			[order.strategy.implementations.simple]
+
+			[settlement]
+			[settlement.implementations]
+
+			[networks.1]
+			chain_id = 1
+			input_settler_address = "0x0000000000000000000000000000000000000011"
+			output_settler_address = "0x0000000000000000000000000000000000000022"
+			[[networks.1.rpc_urls]]
+			http = "http://localhost:8545"
+			[[networks.1.tokens]]
+			symbol = "TEST"
+			address = "0x0000000000000000000000000000000000000033"
+			decimals = 18
+		"#;
+
+		let config: Config = toml::from_str(config_toml).expect("failed to parse test config");
+
+		let storage = Arc::new(StorageService::new(Box::new(MemoryStorage::new())));
+
+		let account_config: toml::Value = toml::from_str(
+			r#"private_key = "0x1234567890123456789012345678901234567890123456789012345678901234""#,
+		)
+		.expect("failed to parse account config");
+		let account_impl = solver_account::implementations::local::create_account(&account_config)
+			.expect("failed to create account impl");
+		let account = Arc::new(AccountService::new(account_impl));
+
+		let solver_address = Address(vec![0x11; 20]);
+
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 10));
+		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
+
+		let strategy_config = toml::Value::Table(toml::value::Table::new());
+		let strategy = solver_order::implementations::strategies::simple::create_strategy(
+			&strategy_config,
+		)
+		.expect("failed to create order strategy");
+		let order = Arc::new(OrderService::new(HashMap::new(), strategy));
+
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), 10));
+
+		let pricing_impl =
+			create_mock_pricing(&toml::Value::Table(toml::value::Table::new()))
+				.expect("failed to create mock pricing");
+		let pricing = Arc::new(PricingService::new(pricing_impl));
+
+		let event_bus = EventBus::new(10);
+
+		let token_manager = Arc::new(TokenManager::new(HashMap::new(), delivery.clone(), account.clone()));
+
+		let engine = SolverEngine::new(
+			config.clone(),
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+		);
+
+		Arc::new(engine)
+	}
+
+	fn build_test_app_state(discovery_url: Option<String>) -> AppState {
+		let solver = build_test_solver_engine();
+		let config = solver.config().clone();
+
+		let http_client = Client::builder()
+			.no_proxy()
+			.build()
+			.expect("failed to build client");
+
+		AppState {
+			solver,
+			config,
+			http_client,
+			discovery_url,
+			jwt_service: None,
+			signature_validation: Arc::new(SignatureValidationService::new()),
+		}
+	}
+
+	fn sample_post_order_request() -> PostOrderRequest {
+		let payload = OrderPayload {
+			signature_type: SignatureType::Eip712,
+			domain: json!({
+				"name": "TestDomain",
+				"version": "1",
+				"chainId": "1",
+				"verifyingContract": "0x0000000000000000000000000000000000000000"
+			}),
+			primary_type: "PermitBatchTransferFrom".to_string(),
+			message: json!({
+				"permitted": [{
+					"token": "0x0000000000000000000000000000000000000000",
+					"amount": "1"
+				}],
+				"spender": "0x0000000000000000000000000000000000000001",
+				"nonce": "1",
+				"deadline": "1",
+				"witness": {}
+			}),
+			types: None,
+		};
+
+		PostOrderRequest {
+			order: OifOrder::OifEscrowV0 { payload },
+			signature: alloy_primitives::Bytes::from(vec![0u8; 65]),
+			quote_id: None,
+			origin_submission: None,
+		}
+	}
+
+	#[test]
+	fn create_intent_from_payload_rejects_invalid_json() {
+		let payload = json!({"unexpected": true});
+		let result = super::create_intent_from_payload(payload);
+		assert!(matches!(
+			result,
+			Err(APIError::BadRequest { error_type: ApiErrorType::InvalidRequest, .. })
+		));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn forward_to_discovery_service_returns_service_unavailable_when_missing_url() {
+		let state = build_test_app_state(None);
+		let response = super::forward_to_discovery_service(&state, &sample_post_order_request()).await;
+
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+		let body_bytes = body::to_bytes(response.into_body(), usize::MAX)
+			.await
+			.expect("body");
+		let parsed: PostOrderResponse = serde_json::from_slice(&body_bytes).expect("parse body");
+		assert_eq!(parsed.status, PostOrderResponseStatus::Error);
+		assert!(
+			parsed
+				.message
+				.as_deref()
+				.unwrap_or_default()
+				.contains("Intent submission service not configured")
+		);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn forward_to_discovery_service_succeeds_with_valid_backend() {
+		let mock_server = MockServer::start().await;
+
+		let expected_response = PostOrderResponse {
+			order_id: Some("order-123".to_string()),
+			status: PostOrderResponseStatus::Received,
+			message: Some("ok".to_string()),
+			order: None,
+		};
+
+		Mock::given(method("POST"))
+			.and(path("/intent"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(&expected_response))
+			.expect(1)
+			.mount(&mock_server)
+			.await;
+
+		let discovery_url = format!("{}/intent", mock_server.uri());
+		let state = build_test_app_state(Some(discovery_url));
+
+		let response = super::forward_to_discovery_service(&state, &sample_post_order_request()).await;
+
+		assert_eq!(response.status(), StatusCode::OK);
+
+		let body_bytes = body::to_bytes(response.into_body(), usize::MAX)
+			.await
+			.expect("body");
+		let parsed: PostOrderResponse = serde_json::from_slice(&body_bytes).expect("parse body");
+		assert_eq!(parsed.status, PostOrderResponseStatus::Received);
+		assert_eq!(parsed.order_id.as_deref(), Some("order-123"));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn forward_to_discovery_service_returns_bad_gateway_on_invalid_payload() {
+		let mock_server = MockServer::start().await;
+
+		Mock::given(method("POST"))
+			.and(path("/intent"))
+			.respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
+			.expect(1)
+			.mount(&mock_server)
+			.await;
+
+		let discovery_url = format!("{}/intent", mock_server.uri());
+		let state = build_test_app_state(Some(discovery_url));
+
+		let response = super::forward_to_discovery_service(&state, &sample_post_order_request()).await;
+
+		assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+		let body_bytes = body::to_bytes(response.into_body(), usize::MAX)
+			.await
+			.expect("body");
+		let parsed: PostOrderResponse = serde_json::from_slice(&body_bytes).expect("parse body");
+		assert_eq!(parsed.status, PostOrderResponseStatus::Error);
+		assert!(
+			parsed
+				.message
+				.as_deref()
+				.unwrap_or_default()
+				.contains("Failed to parse response from discovery service")
+		);
+	}
+}
