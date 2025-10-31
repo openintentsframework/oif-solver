@@ -194,7 +194,10 @@ mod tests {
 	use solver_types::networks::RpcEndpoint;
 	use solver_types::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
 	use solver_types::standards::eip7683::LockType;
-	use solver_types::{Address, ConfigSchema, NetworkConfig, NetworksConfig, Transaction, TransactionHash, TransactionReceipt, ValidationError};
+	use solver_types::{
+		Address, ConfigSchema, NetworkConfig, NetworksConfig, Transaction, TransactionHash,
+		TransactionReceipt, ValidationError,
+	};
 	use std::collections::HashMap;
 	use std::sync::Arc;
 	use toml::Value;
@@ -485,7 +488,9 @@ mod tests {
 		};
 
 		let intent = PostOrderRequest {
-			order: solver_types::OifOrder::OifResourceLockV0 { payload: order_payload },
+			order: solver_types::OifOrder::OifResourceLockV0 {
+				payload: order_payload,
+			},
 			signature: Bytes::from(signature_bytes),
 			quote_id: None,
 			origin_submission: None,
@@ -507,7 +512,9 @@ mod tests {
 		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
 		implementations.insert(
 			chain_id,
-			Arc::new(SuccessfulDelivery::new(Bytes::from(domain_separator.to_vec()))),
+			Arc::new(SuccessfulDelivery::new(Bytes::from(
+				domain_separator.to_vec(),
+			))),
 		);
 		let delivery = Arc::new(DeliveryService::new(implementations, 1, 30));
 
@@ -532,7 +539,12 @@ mod tests {
 		let fixture = build_signature_fixture();
 		let service = SignatureValidationService::new();
 		service
-			.validate_signature("eip7683", &fixture.intent, &fixture.networks, &fixture.delivery)
+			.validate_signature(
+				"eip7683",
+				&fixture.intent,
+				&fixture.networks,
+				&fixture.delivery,
+			)
 			.await
 			.expect("signature should validate");
 	}
@@ -542,7 +554,12 @@ mod tests {
 		let fixture = build_signature_fixture();
 		let service = SignatureValidationService::new();
 		let result = service
-			.validate_signature("unknown", &fixture.intent, &fixture.networks, &fixture.delivery)
+			.validate_signature(
+				"unknown",
+				&fixture.intent,
+				&fixture.networks,
+				&fixture.delivery,
+			)
 			.await;
 		assert!(matches!(
 			result,
@@ -556,7 +573,12 @@ mod tests {
 		let service = SignatureValidationService::new();
 		let empty_networks = NetworksConfig::new();
 		let result = service
-			.validate_signature("eip7683", &fixture.intent, &empty_networks, &fixture.delivery)
+			.validate_signature(
+				"eip7683",
+				&fixture.intent,
+				&empty_networks,
+				&fixture.delivery,
+			)
 			.await;
 		assert!(matches!(
 			result,
@@ -589,7 +611,12 @@ mod tests {
 		let failing_delivery = Arc::new(DeliveryService::new(implementations, 1, 30));
 		let service = SignatureValidationService::new();
 		let result = service
-			.validate_signature("eip7683", &fixture.intent, &fixture.networks, &failing_delivery)
+			.validate_signature(
+				"eip7683",
+				&fixture.intent,
+				&fixture.networks,
+				&failing_delivery,
+			)
 			.await;
 		assert!(matches!(
 			result,
