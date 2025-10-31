@@ -52,3 +52,4 @@ solver-settlement = { path = "../solver-settlement", features = ["testing"] }
 solver-storage = { path = "../solver-storage", features = ["testing"] }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+wiremock = "0.5"

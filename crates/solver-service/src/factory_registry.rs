@@ -252,3 +252,72 @@ pub async fn build_solver_from_config(
 
 	Ok(builder.build(factories).await?)
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use solver_config::Config;
+
+	#[test]
+	fn initialize_registry_is_idempotent() {
+		let first = initialize_registry() as *const FactoryRegistry;
+		let second = initialize_registry() as *const FactoryRegistry;
+		assert_eq!(first, second);
+	}
+
+	#[tokio::test]
+	async fn build_solver_from_config_errors_on_unknown_delivery_impl() {
+		let config_toml = r#"
+			[solver]
+			id = "test-solver"
+			monitoring_timeout_seconds = 30
+			min_profitability_pct = 1.0
+
+			[storage]
+			primary = "memory"
+			cleanup_interval_seconds = 60
+			[storage.implementations.memory]
+
+			[delivery]
+			min_confirmations = 1
+			primary = "unknown"
+			[delivery.implementations]
+			unknown = {}
+
+			[account]
+			primary = "local"
+			[account.implementations.local]
+			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
+
+			[discovery]
+			[discovery.implementations]
+
+			[order]
+			[order.implementations]
+			[order.strategy]
+			primary = "simple"
+			[order.strategy.implementations.simple]
+
+			[settlement]
+			[settlement.implementations]
+
+			[networks.1]
+			chain_id = 1
+			input_settler_address = "0x0000000000000000000000000000000000000001"
+			output_settler_address = "0x0000000000000000000000000000000000000002"
+			[[networks.1.rpc_urls]]
+			http = "http://localhost:8545"
+			[[networks.1.tokens]]
+			symbol = "TEST"
+			address = "0x0000000000000000000000000000000000000003"
+			decimals = 18
+		"#;
+
+		let config: Config = toml::from_str(config_toml).expect("config parses");
+		let message = match build_solver_from_config(config).await {
+			Ok(_) => panic!("expected failure"),
+			Err(error) => error.to_string(),
+		};
+		assert!(message.contains("Unknown delivery implementation 'unknown'"));
+	}
+}
