@@ -627,7 +627,7 @@ mod tests {
 		OifOrder, OrderPayload, PostOrderRequest, PostOrderResponse, PostOrderResponseStatus,
 		SignatureType,
 	};
-	use solver_types::{Address, APIError, ApiErrorType};
+	use solver_types::{APIError, Address, ApiErrorType};
 	use std::collections::HashMap;
 	use std::sync::Arc;
 	use wiremock::matchers::{method, path};

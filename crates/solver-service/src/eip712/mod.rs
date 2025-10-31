@@ -172,11 +172,11 @@ mod tests {
 	use async_trait::async_trait;
 	use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 	use solver_delivery::{DeliveryError, DeliveryInterface, DeliveryService};
+	use solver_types::standards::eip7683::interfaces::ITheCompact::DOMAIN_SEPARATORCall;
+	use solver_types::Address;
 	use solver_types::{
 		ConfigSchema, Transaction, TransactionHash, TransactionReceipt, ValidationError,
 	};
-	use solver_types::Address;
-	use solver_types::standards::eip7683::interfaces::ITheCompact::DOMAIN_SEPARATORCall;
 	use std::collections::HashMap;
 	use std::sync::Arc;
 	use toml::Value;
@@ -364,8 +364,9 @@ mod tests {
 		let signature = Bytes::from(signature_bytes);
 
 		let other_signer = AlloyAddress::from_slice(&[0xFFu8; 20]);
-		let result = validate_eip712_signature(domain_separator, struct_hash, &signature, other_signer)
-			.expect("validation result");
+		let result =
+			validate_eip712_signature(domain_separator, struct_hash, &signature, other_signer)
+				.expect("validation result");
 		assert!(!result);
 	}
 
@@ -384,5 +385,4 @@ mod tests {
 			APIError::BadRequest { message, .. } if message.contains("Invalid signature length")
 		));
 	}
-
 }
