@@ -623,4 +623,31 @@ mod tests {
 			Err(APIError::BadRequest { message, .. }) if message.contains("Failed to get domain separator")
 		));
 	}
+
+	#[tokio::test]
+	async fn validate_signature_errors_for_invalid_signature_bytes() {
+		let mut fixture = build_signature_fixture();
+		fixture.intent.signature = Bytes::from(vec![0u8; 65]);
+		let service = SignatureValidationService::new();
+		let result = service
+			.validate_signature(
+				"eip7683",
+				&fixture.intent,
+				&fixture.networks,
+				&fixture.delivery,
+			)
+			.await;
+		match result {
+			Ok(_) => panic!("expected signature validation failure"),
+			Err(APIError::BadRequest { message, .. }) => {
+				assert!(
+					(message.contains("Invalid") && message.contains("signature"))
+						|| message.contains("Failed to recover public key"),
+					"unexpected error message: {}",
+					message
+				);
+			},
+			Err(other) => panic!("unexpected error: {:?}", other),
+		}
+	}
 }

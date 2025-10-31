@@ -610,7 +610,7 @@ mod tests {
 	use axum::body;
 	use axum::http::StatusCode;
 	use reqwest::Client;
-	use serde_json::json;
+	use serde_json::{json, to_value};
 	use solver_account::AccountService;
 	use solver_config::Config;
 	use solver_core::engine::event_bus::EventBus;
@@ -623,11 +623,11 @@ mod tests {
 	use solver_settlement::SettlementService;
 	use solver_storage::implementations::memory::MemoryStorage;
 	use solver_storage::StorageService;
-	use solver_types::api::{OifOrder, PostOrderRequest};
 	use solver_types::api::{
-		OrderPayload, PostOrderResponse, PostOrderResponseStatus, SignatureType,
+		OifOrder, OrderPayload, PostOrderRequest, PostOrderResponse, PostOrderResponseStatus,
+		SignatureType,
 	};
-	use solver_types::Address;
+	use solver_types::{Address, APIError, ApiErrorType};
 	use std::collections::HashMap;
 	use std::sync::Arc;
 	use wiremock::matchers::{method, path};
@@ -878,5 +878,125 @@ mod tests {
 			.as_deref()
 			.unwrap_or_default()
 			.contains("Failed to parse response from discovery service"));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn create_intent_from_quote_errors_without_quote_id() {
+		let state = build_test_app_state(None);
+		let payload = json!({ "signature": "0x1234" });
+
+		let error = super::create_intent_from_quote(payload, &state, "eip7683")
+			.await
+			.expect_err("expected missing quoteId error");
+
+		assert!(matches!(
+			error,
+			APIError::BadRequest {
+				error_type: ApiErrorType::MissingSignature,
+				..
+			}
+		));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn create_intent_from_quote_errors_without_signature() {
+		let state = build_test_app_state(None);
+		let payload = json!({ "quoteId": "quote-123" });
+
+		let error = super::create_intent_from_quote(payload, &state, "eip7683")
+			.await
+			.expect_err("expected missing signature error");
+
+		assert!(matches!(
+			error,
+			APIError::BadRequest {
+				error_type: ApiErrorType::MissingSignature,
+				..
+			}
+		));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn create_intent_from_quote_errors_when_quote_not_found() {
+		let state = build_test_app_state(None);
+		let payload = json!({
+			"quoteId": "missing-quote",
+			"signature": "0x1234"
+		});
+
+		let error = super::create_intent_from_quote(payload, &state, "eip7683")
+			.await
+			.expect_err("expected quote not found error");
+
+		assert!(matches!(
+			error,
+			APIError::BadRequest {
+				error_type: ApiErrorType::QuoteNotFound,
+				..
+			}
+		));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn extract_intent_request_returns_direct_payload_unchanged() {
+		let state = build_test_app_state(None);
+		let resource_order_payload = OrderPayload {
+			signature_type: SignatureType::Eip712,
+			domain: json!({
+				"name": "ResourceLock",
+				"version": "1",
+				"chainId": "1"
+			}),
+			primary_type: "BatchCompact".to_string(),
+			message: json!({
+				"sponsor": "0x1111111111111111111111111111111111111111",
+				"nonce": "1",
+				"expires": "1700000000",
+				"mandate": {
+					"fillDeadline": "1700000100",
+					"inputOracle": "0x2222222222222222222222222222222222222222",
+					"outputs": []
+				},
+				"commitments": []
+			}),
+			types: None,
+		};
+
+		let original_request = PostOrderRequest {
+			order: OifOrder::OifResourceLockV0 {
+				payload: resource_order_payload,
+			},
+			signature: alloy_primitives::Bytes::from(vec![0xAA, 0xBB]),
+			quote_id: None,
+			origin_submission: None,
+		};
+
+		let payload_value = to_value(&original_request).expect("serialize request");
+		let result = super::extract_intent_request(payload_value.clone(), &state, "eip7683")
+			.await
+			.expect("expected successful extraction");
+
+		let result_value = to_value(&result).expect("serialize result");
+		assert_eq!(result_value, payload_value);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn extract_intent_request_errors_when_signature_recovery_fails() {
+		let state = build_test_app_state(None);
+		let mut request = sample_post_order_request();
+		request.signature = alloy_primitives::Bytes::from(Vec::<u8>::new());
+		let payload = to_value(&request).expect("serialize request");
+
+		let error = super::extract_intent_request(payload, &state, "eip7683")
+			.await
+			.expect_err("expected sponsor extraction failure");
+
+		assert!(matches!(
+			error,
+			APIError::BadRequest {
+				error_type: ApiErrorType::OrderValidationFailed,
+				..
+			}
+		));
 	}
 }
