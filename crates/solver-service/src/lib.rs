@@ -8,7 +8,7 @@ pub mod auth;
 pub mod eip712;
 pub mod factory_registry;
 pub mod server;
-pub mod signature_validator;
+pub mod validators;
 
 // Re-export commonly used types and functions
 pub use factory_registry::build_solver_from_config;

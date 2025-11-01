@@ -6,7 +6,8 @@
 use crate::{
 	apis::order::get_order_by_id,
 	auth::{auth_middleware, AuthState, JwtService},
-	signature_validator::SignatureValidationService,
+	validators::order::ensure_user_capacity_for_order,
+	validators::signature::SignatureValidationService,
 };
 use alloy_primitives::U256;
 use axum::{
@@ -21,10 +22,11 @@ use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
 use solver_types::{
-	api::PostOrderRequest, APIError, Address, ApiErrorType, GetOrderResponse, GetQuoteRequest,
-	GetQuoteResponse, Order, OrderIdCallback, Transaction,
+	api::PostOrderRequest, standards::eip7683::interfaces::StandardOrder, APIError, Address,
+	ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse, Order, OrderIdCallback,
+	Transaction,
 };
-use std::sync::Arc;
+use std::{convert::TryInto, sync::Arc};
 use tokio::net::TcpListener;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
@@ -415,7 +417,6 @@ async fn validate_intent_request(
 	standard: &str,
 ) -> Result<Order, APIError> {
 	use alloy_sol_types::SolType;
-	use solver_types::standards::eip7683::interfaces::StandardOrder;
 
 	// Get lock_type from the order
 	let lock_type = intent.order.get_lock_type();
@@ -429,6 +430,14 @@ async fn validate_intent_request(
 			message: format!("Failed to convert order to standard format: {}", e),
 			details: None,
 		})?;
+
+	ensure_user_capacity_for_order(
+		state.solver.as_ref(),
+		&state.config,
+		lock_type,
+		&standard_order,
+	)
+	.await?;
 
 	let order_bytes = alloy_primitives::Bytes::from(StandardOrder::abi_encode(&standard_order));
 
