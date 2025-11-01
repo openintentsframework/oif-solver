@@ -51,9 +51,11 @@ pub async fn ensure_user_capacity_for_order(
 			}
 		},
 		_ => {
-			//  double check because when executing the openOrder will fail.
-			// We can reduce RPC Calls if we delete this validation
-			// But UX increase since will detect earlier if user has insufficient balance.
+			// Defensive check: validates sufficient balance before calling `openFor`.
+			// Trade-off: This adds an extra RPC call, but improves UX by failing fast
+			// with a clear error rather than waiting for the `openFor` transaction to revert.
+			// The `openFor` call would fail anyway with insufficient balance, so this
+			// check is optional but recommended for better user experience.
 			for input in &standard_order.inputs {
 				let token_field = input[0];
 				let amount = input[1];
