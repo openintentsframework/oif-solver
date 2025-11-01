@@ -5,6 +5,5 @@
 
 pub mod auth;
 pub mod order;
-pub mod order_validation;
 pub mod quote;
 pub mod tokens;
