@@ -1,3 +1,8 @@
+//! Order validator for the OIF solver service.
+//!
+//! This module contains the validator for the OIF solver service.
+//! It validates the order and ensures the user has sufficient capacity to fill the order.
+
 use alloy_primitives::{hex, Address as AlloyAddress, U256};
 use alloy_sol_types::SolCall;
 use solver_config::Config;

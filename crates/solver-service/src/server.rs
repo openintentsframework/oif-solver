@@ -4,9 +4,10 @@
 //! for the OIF Solver API.
 
 use crate::{
-	apis::{order::get_order_by_id, order_validation},
+	apis::order::get_order_by_id,
 	auth::{auth_middleware, AuthState, JwtService},
-	signature_validator::SignatureValidationService,
+	validators::order::ensure_user_capacity_for_order,
+	validators::signature::SignatureValidationService,
 };
 use alloy_primitives::U256;
 use axum::{
@@ -430,7 +431,7 @@ async fn validate_intent_request(
 			details: None,
 		})?;
 
-	order_validation::ensure_user_capacity_for_order(
+	ensure_user_capacity_for_order(
 		state.solver.as_ref(),
 		&state.config,
 		lock_type,
