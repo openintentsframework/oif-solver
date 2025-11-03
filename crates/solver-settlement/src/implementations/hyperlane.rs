@@ -822,7 +822,7 @@ impl HyperlaneSettlement {
 		U256::from(base_gas + (payload_size * gas_per_byte) + buffer)
 	}
 
-	/// Estimate gas payment for a Hyperlane message
+
 	#[allow(clippy::too_many_arguments)]
 	async fn estimate_gas_payment(
 		&self,
@@ -833,6 +833,7 @@ impl HyperlaneSettlement {
 		custom_metadata: Vec<u8>,
 		source: solver_types::Address,
 		payloads: Vec<Vec<u8>>,
+		from: solver_types::Address,
 	) -> Result<U256, SettlementError> {
 		// Get the output oracle address for the oracle chain (where we're calling from)
 		let oracle_addresses = self.get_output_oracles(oracle_chain);
@@ -863,8 +864,9 @@ impl HyperlaneSettlement {
 			payloads: payloads.into_iter().map(Into::into).collect(),
 		};
 
-		// Create call request
+		// Create call request with from address to ensure correct msg.sender in the call
 		let call_request = alloy_rpc_types::eth::transaction::TransactionRequest {
+			from: Some(alloy_primitives::Address::from_slice(&from.0)),
 			to: Some(alloy_primitives::TxKind::Call(
 				alloy_primitives::Address::from_slice(&oracle_address.0),
 			)),
@@ -872,15 +874,40 @@ impl HyperlaneSettlement {
 			..Default::default()
 		};
 
-		// Make the eth_call to get the quote
+		// Make the eth_call to get the quote with timing
+		let start = std::time::Instant::now();
 		let result = provider.call(call_request).await.map_err(|e| {
+			let duration = start.elapsed();
+			tracing::error!(
+				oracle_chain,
+				destination_chain,
+				oracle = %hex::encode(&oracle_address.0),
+				from = %hex::encode(&from.0),
+				recipient = %hex::encode(&recipient_oracle.0),
+				source = %hex::encode(&source.0),
+				gas_limit = %gas_limit,
+				duration_ms = duration.as_millis(),
+				error = %e,
+				"❌ quoteGasPayment FAILED"
+			);
 			SettlementError::ValidationFailed(format!("Failed to quote gas payment: {}", e))
 		})?;
+		
+		let duration = start.elapsed();
 
 		// Decode the result
 		let quote = U256::from_be_slice(&result);
 
-		// Return quote without buffer for now - the quote already includes IGP overhead
+		// Log success with timing for diagnostics (debug mode only)
+		tracing::debug!(
+			oracle_chain,
+			destination_chain,
+			quote = %quote,
+			duration_ms = duration.as_millis(),
+			"quoteGasPayment success"
+		);
+
+		// Return quote without buffer - the quote already includes IGP overhead
 		Ok(quote)
 	}
 }
@@ -1184,6 +1211,7 @@ impl SettlementInterface for HyperlaneSettlement {
 		let gas_limit = self.calculate_message_gas_limit(total_payload_size);
 
 		// Estimate gas payment with correct payloads
+		// Pass solver address to ensure correct msg.sender in eth_call
 		let gas_payment = self
 			.estimate_gas_payment(
 				dest_chain,
@@ -1193,6 +1221,7 @@ impl SettlementInterface for HyperlaneSettlement {
 				vec![], // No custom metadata
 				output_settler.settler_address.clone(),
 				payloads.clone(),
+				order.solver_address.clone(), // Solver address for msg.sender
 			)
 			.await?;
 

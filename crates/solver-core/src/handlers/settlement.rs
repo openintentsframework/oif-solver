@@ -89,6 +89,12 @@ impl SettlementHandler {
 	/// Handles PostFillReady event by generating and submitting PostFill transaction if needed.
 	#[instrument(skip_all, fields(order_id = %truncate_id(&order_id)))]
 	pub async fn handle_post_fill_ready(&self, order_id: String) -> Result<(), SettlementError> {
+		// Small delay to allow fill state to propagate across RPC nodes
+		// This prevents intermittent failures when using public/load-balanced RPCs
+		// where different backend nodes may not have the latest block indexed yet
+		// Increased to 2000ms (2s) for better reliability with public RPCs
+		tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+		
 		// Retrieve the order
 		let order: Order = self
 			.storage
