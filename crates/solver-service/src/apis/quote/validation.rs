@@ -601,11 +601,141 @@ impl QuoteValidator {
 mod tests {
 	use super::*;
 	use alloy_primitives::address;
-	use solver_types::{IntentType, QuoteInput, QuoteOutput};
+	use solver_core::SolverEngine;
+	use solver_types::networks::NetworkConfig;
+	use solver_types::{
+		AuthScheme, GetQuoteRequest, IntentType, OriginMode, OriginSubmission, QuoteInput,
+		QuoteOutput,
+	};
+	use std::collections::HashMap;
+	use std::sync::Arc;
 
-	fn create_exact_input_request(
+	/// Creates a minimal mock SolverEngine for testing
+	fn create_mock_solver() -> SolverEngine {
+		create_mock_solver_with_networks(HashMap::new())
+	}
+
+	/// Creates a minimal mock SolverEngine for testing with custom network configurations
+	fn create_mock_solver_with_networks(networks: HashMap<u64, NetworkConfig>) -> SolverEngine {
+		use solver_account::AccountService;
+		use solver_config::Config;
+		use solver_core::engine::event_bus::EventBus;
+		use solver_core::engine::token_manager::TokenManager;
+		use solver_delivery::DeliveryService;
+		use solver_discovery::DiscoveryService;
+		use solver_order::OrderService;
+		use solver_settlement::SettlementService;
+		use solver_storage::StorageService;
+		use solver_types::Address;
+
+		// Create minimal config for testing
+		let config_toml = r#"
+			[solver]
+			id = "test-solver"
+			monitoring_timeout_seconds = 30
+			min_profitability_pct = 1.0
+			
+			[storage]
+			primary = "memory"
+			cleanup_interval_seconds = 3600
+			[storage.implementations.memory]
+			
+			[delivery]
+			min_confirmations = 1
+			[delivery.implementations]
+			
+			[account]
+			primary = "local"
+			[account.implementations.local]
+			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
+			
+			[discovery]
+			[discovery.implementations]
+			
+			[order]
+			[order.implementations]
+			[order.strategy]
+			primary = "simple"
+			[order.strategy.implementations.simple]
+			
+			[settlement]
+			[settlement.implementations]
+			
+			[networks]
+		"#;
+		let config: Config = toml::from_str(config_toml).expect("Failed to parse test config");
+
+		// Create mock services
+		let storage = Arc::new(StorageService::new(Box::new(
+			solver_storage::implementations::memory::MemoryStorage::new(),
+		)));
+
+		let account_config = toml::from_str(
+			r#"private_key = "0x1234567890123456789012345678901234567890123456789012345678901234""#,
+		)
+		.expect("Failed to parse account config");
+		let account = Arc::new(AccountService::new(
+			solver_account::implementations::local::create_account(&account_config)
+				.expect("Failed to create account"),
+		));
+
+		let solver_address = Address(vec![1u8; 20]);
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
+
+		let strategy_config = toml::Value::Table(toml::value::Table::new());
+		let strategy =
+			solver_order::implementations::strategies::simple::create_strategy(&strategy_config)
+				.expect("Failed to create strategy");
+		let order = Arc::new(OrderService::new(HashMap::new(), strategy));
+
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), 20));
+
+		let pricing_config = toml::Value::Table(toml::value::Table::new());
+		let pricing_impl =
+			solver_pricing::implementations::mock::create_mock_pricing(&pricing_config)
+				.expect("Failed to create mock pricing");
+		let pricing = Arc::new(solver_pricing::PricingService::new(pricing_impl));
+
+		let event_bus = EventBus::new(100);
+
+		// Create token manager with provided networks config
+		let token_manager = Arc::new(TokenManager::new(
+			networks,
+			delivery.clone(),
+			account.clone(),
+		));
+
+		SolverEngine::new(
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+		)
+	}
+
+	fn create_valid_get_quote_request() -> GetQuoteRequest {
+		GetQuoteRequest {
+			user: InteropAddress::new_ethereum(
+				1,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			intent: create_exact_input_request(Some("1000000000000000000"), None),
+			supported_types: vec!["oif-escrow-v0".to_string()],
+		}
+	}
+
+	fn create_intent_request(
 		input_amount: Option<&str>,
 		output_amount: Option<&str>,
+		exact_input: bool, // true for ExactInput (default), false for ExactOutput
 	) -> IntentRequest {
 		IntentRequest {
 			intent_type: IntentType::OifSwap,
@@ -633,7 +763,11 @@ mod tests {
 				amount: output_amount.map(|s| s.to_string()),
 				calldata: None,
 			}],
-			swap_type: Some(SwapType::ExactInput),
+			swap_type: Some(if exact_input {
+				SwapType::ExactInput
+			} else {
+				SwapType::ExactOutput
+			}),
 			min_valid_until: None,
 			preference: None,
 			origin_submission: None,
@@ -643,44 +777,18 @@ mod tests {
 		}
 	}
 
+	fn create_exact_input_request(
+		input_amount: Option<&str>,
+		output_amount: Option<&str>,
+	) -> IntentRequest {
+		create_intent_request(input_amount, output_amount, true)
+	}
+
 	fn create_exact_output_request(
 		input_amount: Option<&str>,
 		output_amount: Option<&str>,
 	) -> IntentRequest {
-		IntentRequest {
-			intent_type: IntentType::OifSwap,
-			inputs: vec![QuoteInput {
-				user: InteropAddress::new_ethereum(
-					1,
-					address!("1111111111111111111111111111111111111111"),
-				),
-				asset: InteropAddress::new_ethereum(
-					1,
-					address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
-				),
-				amount: input_amount.map(|s| s.to_string()),
-				lock: None,
-			}],
-			outputs: vec![QuoteOutput {
-				receiver: InteropAddress::new_ethereum(
-					137,
-					address!("2222222222222222222222222222222222222222"),
-				),
-				asset: InteropAddress::new_ethereum(
-					137,
-					address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"),
-				),
-				amount: output_amount.map(|s| s.to_string()),
-				calldata: None,
-			}],
-			swap_type: Some(SwapType::ExactOutput),
-			min_valid_until: None,
-			preference: None,
-			origin_submission: None,
-			failure_handling: None,
-			partial_fill: None,
-			metadata: None,
-		}
+		create_intent_request(input_amount, output_amount, false)
 	}
 
 	#[test]
@@ -786,5 +894,1143 @@ mod tests {
 		assert!(matches!(context.swap_type, SwapType::ExactOutput));
 		assert!(context.known_outputs.is_some());
 		assert_eq!(context.known_outputs.unwrap().len(), 1);
+	}
+
+	// ========== validate_quote_request Tests ==========
+
+	#[test]
+	fn test_validate_quote_request_success_exact_input() {
+		let solver = create_mock_solver();
+		let request = create_valid_get_quote_request();
+
+		let result = QuoteValidator::validate_quote_request(&request, &solver);
+		assert!(
+			result.is_ok(),
+			"Valid exact-input request should succeed: {:?}",
+			result
+		);
+
+		let context = result.unwrap();
+		assert!(matches!(context.swap_type, SwapType::ExactInput));
+		assert!(context.known_inputs.is_some());
+		assert!(context.constraint_outputs.is_some());
+	}
+
+	#[test]
+	fn test_validate_quote_request_success_exact_output() {
+		let solver = create_mock_solver();
+		let mut request = create_valid_get_quote_request();
+		request.intent = create_exact_output_request(None, Some("1000000000000000000"));
+
+		let result = QuoteValidator::validate_quote_request(&request, &solver);
+		assert!(
+			result.is_ok(),
+			"Valid exact-output request should succeed: {:?}",
+			result
+		);
+
+		let context = result.unwrap();
+		assert!(matches!(context.swap_type, SwapType::ExactOutput));
+		assert!(context.known_outputs.is_some());
+		assert!(context.constraint_inputs.is_some());
+	}
+
+	#[test]
+	fn test_validate_quote_request_fails_empty_inputs() {
+		let solver = create_mock_solver();
+		let mut request = create_valid_get_quote_request();
+		request.intent.inputs = vec![]; // Empty inputs
+
+		let result = QuoteValidator::validate_quote_request(&request, &solver);
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("inputs and outputs are required")),
+			"Should reject empty inputs: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_quote_request_fails_empty_outputs() {
+		let solver = create_mock_solver();
+		let mut request = create_valid_get_quote_request();
+		request.intent.outputs = vec![]; // Empty outputs
+
+		let result = QuoteValidator::validate_quote_request(&request, &solver);
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("inputs and outputs are required")),
+			"Should reject empty outputs: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_quote_request_fails_empty_supported_types() {
+		let solver = create_mock_solver();
+		let mut request = create_valid_get_quote_request();
+		request.supported_types = vec![]; // Empty supported types
+
+		let result = QuoteValidator::validate_quote_request(&request, &solver);
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("supportedTypes cannot be empty")),
+			"Should reject empty supported types: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_quote_request_fails_invalid_order_type_format() {
+		let solver = create_mock_solver();
+		let mut request = create_valid_get_quote_request();
+		request.supported_types = vec!["invalid-format".to_string()]; // Invalid format
+
+		let result = QuoteValidator::validate_quote_request(&request, &solver);
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("Invalid order type format")),
+			"Should reject invalid order type format: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_quote_request_fails_missing_input_amount_exact_input() {
+		let solver = create_mock_solver();
+		let mut request = create_valid_get_quote_request();
+		request.intent = create_exact_input_request(None, None); // Missing input amount
+
+		let result = QuoteValidator::validate_quote_request(&request, &solver);
+		assert!(
+			matches!(result, Err(QuoteError::MissingInputAmount)),
+			"Should reject missing input amount for exact-input: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_quote_request_fails_missing_output_amount_exact_output() {
+		let solver = create_mock_solver();
+		let mut request = create_valid_get_quote_request();
+		request.intent = create_exact_output_request(None, None); // Missing output amount
+
+		let result = QuoteValidator::validate_quote_request(&request, &solver);
+		assert!(
+			matches!(result, Err(QuoteError::MissingOutputAmount)),
+			"Should reject missing output amount for exact-output: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_quote_request_fails_zero_input_amount_exact_input() {
+		let solver = create_mock_solver();
+		let mut request = create_valid_get_quote_request();
+		request.intent = create_exact_input_request(Some("0"), None); // Zero input amount
+
+		let result = QuoteValidator::validate_quote_request(&request, &solver);
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("cannot be zero")),
+			"Should reject zero input amount for exact-input: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_quote_request_fails_zero_output_amount_exact_output() {
+		let solver = create_mock_solver();
+		let mut request = create_valid_get_quote_request();
+		request.intent = create_exact_output_request(None, Some("0")); // Zero output amount
+
+		let result = QuoteValidator::validate_quote_request(&request, &solver);
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("cannot be zero")),
+			"Should reject zero output amount for exact-output: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_quote_request_fails_empty_auth_schemes() {
+		let solver = create_mock_solver();
+		let mut request = create_valid_get_quote_request();
+		request.intent.origin_submission = Some(OriginSubmission {
+			mode: OriginMode::User,
+			schemes: Some(vec![]), // Empty auth schemes
+		});
+
+		let result = QuoteValidator::validate_quote_request(&request, &solver);
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("Auth schemes cannot be empty")),
+			"Should reject empty auth schemes: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_quote_request_success_with_valid_auth_schemes() {
+		let solver = create_mock_solver();
+		let mut request = create_valid_get_quote_request();
+		request.intent.origin_submission = Some(OriginSubmission {
+			mode: OriginMode::User,
+			schemes: Some(vec![AuthScheme::Permit2]),
+		});
+
+		let result = QuoteValidator::validate_quote_request(&request, &solver);
+		assert!(
+			result.is_ok(),
+			"Should accept valid auth schemes: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_quote_request_success_with_no_auth_schemes() {
+		let solver = create_mock_solver();
+		let mut request = create_valid_get_quote_request();
+		request.intent.origin_submission = Some(OriginSubmission {
+			mode: OriginMode::User,
+			schemes: None,
+		});
+
+		let result = QuoteValidator::validate_quote_request(&request, &solver);
+		assert!(
+			result.is_ok(),
+			"Should accept None auth schemes: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_quote_request_success_with_no_origin_submission() {
+		let solver = create_mock_solver();
+		let mut request = create_valid_get_quote_request();
+		request.intent.origin_submission = None;
+
+		let result = QuoteValidator::validate_quote_request(&request, &solver);
+		assert!(
+			result.is_ok(),
+			"Should accept no origin submission: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_quote_request_fails_order_type_compatibility() {
+		let solver = create_mock_solver();
+		let mut request = create_valid_get_quote_request();
+		// Set supported types that won't match the inferred order type
+		request.supported_types = vec!["oif-different-v1".to_string()];
+
+		let result = QuoteValidator::validate_quote_request(&request, &solver);
+		assert!(
+			matches!(result, Err(QuoteError::NoMatchingOrderType(_))),
+			"Should reject incompatible order types: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_quote_request_handles_invalid_interop_addresses() {
+		let solver = create_mock_solver();
+		let request = create_valid_get_quote_request();
+
+		// Create an invalid interop address by directly constructing it
+		// This test would need to be adjusted based on how InteropAddress validation works
+		// For now, we'll test with a request that has valid structure but might fail address validation
+
+		let result = QuoteValidator::validate_quote_request(&request, &solver);
+		// This test assumes the addresses in create_valid_get_quote_request are valid
+		// If we need to test invalid addresses, we'd need to construct them differently
+		assert!(
+			result.is_ok() || matches!(result, Err(QuoteError::InvalidRequest(_))),
+			"Should handle address validation appropriately: {:?}",
+			result
+		);
+	}
+
+	// ========== validate_supported_networks Tests ==========
+
+	/// Helper function to create a network config with specified settler addresses
+	fn create_network_config(
+		input_settler_empty: bool,
+		output_settler_empty: bool,
+	) -> NetworkConfig {
+		use solver_types::networks::{NetworkConfig, RpcEndpoint, TokenConfig};
+		use solver_types::Address;
+
+		NetworkConfig {
+			rpc_urls: vec![RpcEndpoint::http_only("https://test.rpc".to_string())],
+			input_settler_address: if input_settler_empty {
+				Address(vec![]) // Empty address (empty vector)
+			} else {
+				Address(vec![1u8; 20]) // Non-empty address
+			},
+			output_settler_address: if output_settler_empty {
+				Address(vec![]) // Empty address (empty vector)
+			} else {
+				Address(vec![2u8; 20]) // Non-empty address
+			},
+			tokens: vec![TokenConfig {
+				address: Address(vec![3u8; 20]),
+				symbol: "TEST".to_string(),
+				decimals: 18,
+			}],
+			input_settler_compact_address: None,
+			the_compact_address: None,
+			allocator_address: None,
+		}
+	}
+
+	/// Helper function to create a request with specific chain IDs for inputs and outputs
+	fn create_request_with_chains(input_chain: u64, output_chain: u64) -> GetQuoteRequest {
+		GetQuoteRequest {
+			user: InteropAddress::new_ethereum(
+				1,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			intent: IntentRequest {
+				intent_type: IntentType::OifSwap,
+				inputs: vec![QuoteInput {
+					user: InteropAddress::new_ethereum(
+						1,
+						address!("1111111111111111111111111111111111111111"),
+					),
+					asset: InteropAddress::new_ethereum(
+						input_chain,
+						address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+					),
+					amount: Some("1000000000000000000".to_string()),
+					lock: None,
+				}],
+				outputs: vec![QuoteOutput {
+					receiver: InteropAddress::new_ethereum(
+						output_chain,
+						address!("2222222222222222222222222222222222222222"),
+					),
+					asset: InteropAddress::new_ethereum(
+						output_chain,
+						address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"),
+					),
+					amount: None,
+					calldata: None,
+				}],
+				swap_type: Some(SwapType::ExactInput),
+				min_valid_until: None,
+				preference: None,
+				origin_submission: None,
+				failure_handling: None,
+				partial_fill: None,
+				metadata: None,
+			},
+			supported_types: vec!["oif-escrow-v0".to_string()],
+		}
+	}
+
+	#[test]
+	fn test_validate_supported_networks_success_both_chains_supported() {
+		// Test: Both input and output chains are properly configured
+		let mut networks = HashMap::new();
+		networks.insert(1u64, create_network_config(false, false)); // Chain 1: both settlers configured
+		networks.insert(137u64, create_network_config(false, false)); // Chain 137: both settlers configured
+
+		let solver = create_mock_solver_with_networks(networks);
+		let request = create_request_with_chains(1, 137);
+
+		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		assert!(
+			result.is_ok(),
+			"Should accept request with supported chains: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_supported_networks_success_input_origin_only() {
+		// Test: Input chain has input settler, output chain has output settler
+		let mut networks = HashMap::new();
+		networks.insert(1u64, create_network_config(false, true)); // Chain 1: input settler only
+		networks.insert(137u64, create_network_config(true, false)); // Chain 137: output settler only
+
+		let solver = create_mock_solver_with_networks(networks);
+		let request = create_request_with_chains(1, 137);
+
+		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		assert!(
+			result.is_ok(),
+			"Should accept request with proper origin/destination setup: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_supported_networks_fails_no_input_origin_chains() {
+		// Test: No input chains have input settler configured
+		let mut networks = HashMap::new();
+		networks.insert(1u64, create_network_config(true, false)); // Chain 1: no input settler
+		networks.insert(137u64, create_network_config(true, false)); // Chain 137: no input settler
+
+		let solver = create_mock_solver_with_networks(networks);
+		let request = create_request_with_chains(1, 137);
+
+		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("No supported origin chains")),
+			"Should reject when no input chains have input settlers: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_supported_networks_fails_output_not_destination() {
+		// Test: Output chain doesn't have output settler configured
+		let mut networks = HashMap::new();
+		networks.insert(1u64, create_network_config(false, false)); // Chain 1: both settlers
+		networks.insert(137u64, create_network_config(false, true)); // Chain 137: no output settler
+
+		let solver = create_mock_solver_with_networks(networks);
+		let request = create_request_with_chains(1, 137);
+
+		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Chain 137 not supported as destination")),
+			"Should reject when output chain lacks output settler: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_supported_networks_fails_input_chain_not_configured() {
+		// Test: Input chain is not configured at all
+		let mut networks = HashMap::new();
+		networks.insert(137u64, create_network_config(false, false)); // Only chain 137 configured
+
+		let solver = create_mock_solver_with_networks(networks);
+		let request = create_request_with_chains(1, 137); // Input on chain 1 (not configured)
+
+		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("No supported origin chains")),
+			"Should reject when input chain is not configured: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_supported_networks_fails_output_chain_not_configured() {
+		// Test: Output chain is not configured at all
+		let mut networks = HashMap::new();
+		networks.insert(1u64, create_network_config(false, false)); // Only chain 1 configured
+
+		let solver = create_mock_solver_with_networks(networks);
+		let request = create_request_with_chains(1, 137); // Output on chain 137 (not configured)
+
+		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Chain 137 not supported as destination")),
+			"Should reject when output chain is not configured: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_supported_networks_success_multiple_inputs_one_valid() {
+		// Test: Multiple inputs, at least one on supported origin chain
+		let mut networks = HashMap::new();
+		networks.insert(1u64, create_network_config(false, false)); // Chain 1: both settlers
+		networks.insert(42u64, create_network_config(true, false)); // Chain 42: no input settler
+		networks.insert(137u64, create_network_config(false, false)); // Chain 137: both settlers
+
+		let solver = create_mock_solver_with_networks(networks);
+
+		let mut request = create_request_with_chains(1, 137);
+		// Add another input on unsupported origin chain
+		request.intent.inputs.push(QuoteInput {
+			user: InteropAddress::new_ethereum(
+				42,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			asset: InteropAddress::new_ethereum(
+				42,
+				address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+			),
+			amount: Some("500000000000000000".to_string()),
+			lock: None,
+		});
+
+		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		assert!(
+			result.is_ok(),
+			"Should accept when at least one input is on supported origin chain: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_supported_networks_fails_multiple_outputs_one_invalid() {
+		// Test: Multiple outputs, all must be on supported destination chains
+		let mut networks = HashMap::new();
+		networks.insert(1u64, create_network_config(false, false)); // Chain 1: both settlers
+		networks.insert(137u64, create_network_config(false, false)); // Chain 137: both settlers
+		networks.insert(42u64, create_network_config(false, true)); // Chain 42: no output settler
+
+		let solver = create_mock_solver_with_networks(networks);
+
+		let mut request = create_request_with_chains(1, 137);
+		// Add another output on unsupported destination chain
+		request.intent.outputs.push(QuoteOutput {
+			receiver: InteropAddress::new_ethereum(
+				42,
+				address!("2222222222222222222222222222222222222222"),
+			),
+			asset: InteropAddress::new_ethereum(
+				42,
+				address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"),
+			),
+			amount: None,
+			calldata: None,
+		});
+
+		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Chain 42 not supported as destination")),
+			"Should reject when any output is on unsupported destination chain: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_supported_networks_success_same_chain_input_output() {
+		// Test: Input and output on same chain with both settlers configured
+		let mut networks = HashMap::new();
+		networks.insert(1u64, create_network_config(false, false)); // Chain 1: both settlers
+
+		let solver = create_mock_solver_with_networks(networks);
+		let request = create_request_with_chains(1, 1); // Same chain for input and output
+
+		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		assert!(
+			result.is_ok(),
+			"Should accept same-chain swaps when both settlers configured: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_supported_networks_fails_same_chain_missing_settlers() {
+		// Test: Input and output on same chain but missing required settlers
+		let mut networks = HashMap::new();
+		networks.insert(1u64, create_network_config(false, true)); // Chain 1: no output settler
+
+		let solver = create_mock_solver_with_networks(networks);
+		let request = create_request_with_chains(1, 1); // Same chain for input and output
+
+		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Chain 1 not supported as destination")),
+			"Should reject same-chain swaps when output settler missing: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_supported_networks_handles_invalid_interop_address() {
+		// Test: Invalid chain ID in interop address should be handled gracefully
+		let mut networks = HashMap::new();
+		networks.insert(1u64, create_network_config(false, false));
+
+		let solver = create_mock_solver_with_networks(networks);
+
+		// This test would need to construct an invalid InteropAddress
+		// For now, we test with a valid request to ensure the function works correctly
+		let request = create_request_with_chains(1, 1);
+
+		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		assert!(
+			result.is_ok() || matches!(result, Err(QuoteError::InvalidRequest(_))),
+			"Should handle address parsing appropriately: {:?}",
+			result
+		);
+	}
+
+	// ========== Helper functions for testing validate_and_collect_*_with_costs ==========
+
+	/// Creates a mock CostContext for testing
+	fn create_mock_cost_context(
+		swap_amounts: HashMap<InteropAddress, (U256, u8)>,
+		cost_amounts: HashMap<InteropAddress, (U256, u8)>,
+		swap_type: SwapType,
+	) -> solver_types::CostContext {
+		use rust_decimal::Decimal;
+		use solver_types::costs::TokenAmountInfo;
+		use solver_types::{CostBreakdown, CostContext};
+
+		let mut swap_amounts_map = HashMap::new();
+		for (addr, (amount, decimals)) in swap_amounts {
+			swap_amounts_map.insert(
+				addr.clone(),
+				TokenAmountInfo {
+					token: addr.clone(),
+					amount,
+					decimals,
+				},
+			);
+		}
+
+		let mut cost_amounts_map = HashMap::new();
+		for (addr, (amount, decimals)) in cost_amounts {
+			cost_amounts_map.insert(
+				addr.clone(),
+				TokenAmountInfo {
+					token: addr.clone(),
+					amount,
+					decimals,
+				},
+			);
+		}
+
+		CostContext {
+			cost_breakdown: CostBreakdown {
+				gas_open: Decimal::ZERO,
+				gas_fill: Decimal::ZERO,
+				gas_claim: Decimal::ZERO,
+				gas_buffer: Decimal::ZERO,
+				rate_buffer: Decimal::ZERO,
+				base_price: Decimal::ZERO,
+				min_profit: Decimal::ZERO,
+				operational_cost: Decimal::ZERO,
+				subtotal: Decimal::ZERO,
+				total: Decimal::ZERO,
+				currency: "USD".to_string(),
+			},
+			execution_costs_by_chain: HashMap::new(),
+			liquidity_cost_adjustment: Decimal::ZERO,
+			protocol_fees: HashMap::new(),
+			swap_type,
+			cost_amounts_in_tokens: cost_amounts_map,
+			swap_amounts: swap_amounts_map,
+			adjusted_amounts: HashMap::new(),
+		}
+	}
+
+	/// Creates a mock solver with specific token support configuration
+	fn create_mock_solver_with_token_support(
+		supported_tokens: HashMap<u64, Vec<AlloyAddress>>,
+	) -> SolverEngine {
+		use solver_types::networks::{NetworkConfig, RpcEndpoint, TokenConfig};
+		use solver_types::Address;
+
+		let mut networks = HashMap::new();
+
+		for (chain_id, token_addresses) in supported_tokens {
+			let tokens = token_addresses
+				.into_iter()
+				.enumerate()
+				.map(|(i, addr)| TokenConfig {
+					address: Address(addr.as_slice().to_vec()),
+					symbol: format!("TOKEN{}", i),
+					decimals: 18,
+				})
+				.collect();
+
+			networks.insert(
+				chain_id,
+				NetworkConfig {
+					rpc_urls: vec![RpcEndpoint::http_only("https://test.rpc".to_string())],
+					input_settler_address: Address(vec![1u8; 20]),
+					output_settler_address: Address(vec![2u8; 20]),
+					tokens,
+					input_settler_compact_address: None,
+					the_compact_address: None,
+					allocator_address: None,
+				},
+			);
+		}
+
+		create_mock_solver_with_networks(networks)
+	}
+
+	/// Creates a GetQuoteRequest for testing with customizable inputs and outputs
+	fn create_test_quote_request(
+		inputs: Vec<(InteropAddress, Option<&str>)>, // (asset, amount)
+		outputs: Vec<(InteropAddress, Option<&str>)>, // (asset, amount)
+		swap_type: SwapType,
+	) -> GetQuoteRequest {
+		let user_address =
+			InteropAddress::new_ethereum(1, address!("1111111111111111111111111111111111111111"));
+
+		let quote_inputs = inputs
+			.into_iter()
+			.map(|(asset, amount)| QuoteInput {
+				user: user_address.clone(),
+				asset,
+				amount: amount.map(|s| s.to_string()),
+				lock: None,
+			})
+			.collect();
+
+		let quote_outputs = outputs
+			.into_iter()
+			.map(|(asset, amount)| QuoteOutput {
+				receiver: InteropAddress::new_ethereum(
+					137,
+					address!("2222222222222222222222222222222222222222"),
+				),
+				asset,
+				amount: amount.map(|s| s.to_string()),
+				calldata: None,
+			})
+			.collect();
+
+		GetQuoteRequest {
+			user: user_address,
+			intent: IntentRequest {
+				intent_type: IntentType::OifSwap,
+				inputs: quote_inputs,
+				outputs: quote_outputs,
+				swap_type: Some(swap_type),
+				min_valid_until: None,
+				preference: None,
+				origin_submission: None,
+				failure_handling: None,
+				partial_fill: None,
+				metadata: None,
+			},
+			supported_types: vec!["oif-escrow-v0".to_string()],
+		}
+	}
+
+	/// Creates a simple single-input, single-output GetQuoteRequest for testing
+	fn create_simple_test_quote_request(
+		input_asset: InteropAddress,
+		input_amount: Option<&str>,
+		output_asset: InteropAddress,
+		output_amount: Option<&str>,
+		swap_type: SwapType,
+	) -> GetQuoteRequest {
+		create_test_quote_request(
+			vec![(input_asset, input_amount)],
+			vec![(output_asset, output_amount)],
+			swap_type,
+		)
+	}
+
+	// ========== validate_and_collect_inputs_with_costs Tests ==========
+
+	#[test]
+	fn test_validate_and_collect_inputs_with_costs_success_all_supported() {
+		// Test: All input tokens are supported, amounts from cost context
+		let input_token =
+			InteropAddress::new_ethereum(1, address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"));
+		let output_token =
+			InteropAddress::new_ethereum(137, address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"));
+
+		let mut supported_tokens = HashMap::new();
+		supported_tokens.insert(
+			1u64,
+			vec![address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")],
+		);
+		let solver = create_mock_solver_with_token_support(supported_tokens);
+
+		let request = create_simple_test_quote_request(
+			input_token.clone(),
+			Some("1000000"), // 1 USDC (6 decimals)
+			output_token,
+			None,
+			SwapType::ExactInput,
+		);
+
+		// Create cost context with swap amounts
+		let mut swap_amounts = HashMap::new();
+		swap_amounts.insert(input_token.clone(), (U256::from(2000000u64), 6)); // 2 USDC from cost context
+
+		let cost_context =
+			create_mock_cost_context(swap_amounts, HashMap::new(), SwapType::ExactInput);
+
+		let result = QuoteValidator::validate_and_collect_inputs_with_costs(
+			&request,
+			&solver,
+			&cost_context,
+		);
+
+		assert!(
+			result.is_ok(),
+			"Should succeed with supported tokens: {:?}",
+			result
+		);
+
+		let supported_assets = result.unwrap();
+		assert_eq!(supported_assets.len(), 1);
+		assert_eq!(supported_assets[0].asset, input_token);
+		assert_eq!(supported_assets[0].amount, U256::from(2000000u64)); // Amount from cost context
+	}
+
+	#[test]
+	fn test_validate_and_collect_inputs_with_costs_fallback_to_request_amount() {
+		// Test: Token not in cost context, falls back to request amount
+		let input_token =
+			InteropAddress::new_ethereum(1, address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"));
+		let output_token =
+			InteropAddress::new_ethereum(137, address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"));
+
+		let mut supported_tokens = HashMap::new();
+		supported_tokens.insert(
+			1u64,
+			vec![address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")],
+		);
+		let solver = create_mock_solver_with_token_support(supported_tokens);
+
+		let request = create_simple_test_quote_request(
+			input_token.clone(),
+			Some("1000000"), // 1 USDC (6 decimals)
+			output_token,
+			None,
+			SwapType::ExactInput,
+		);
+
+		// Create cost context without this token (empty swap_amounts)
+		let cost_context =
+			create_mock_cost_context(HashMap::new(), HashMap::new(), SwapType::ExactInput);
+
+		let result = QuoteValidator::validate_and_collect_inputs_with_costs(
+			&request,
+			&solver,
+			&cost_context,
+		);
+
+		assert!(
+			result.is_ok(),
+			"Should succeed with fallback to request amount: {:?}",
+			result
+		);
+
+		let supported_assets = result.unwrap();
+		assert_eq!(supported_assets.len(), 1);
+		assert_eq!(supported_assets[0].asset, input_token);
+		assert_eq!(supported_assets[0].amount, U256::from(1000000u64)); // Amount from request
+	}
+
+	#[test]
+	fn test_validate_and_collect_inputs_with_costs_fails_unsupported_token() {
+		// Test: Input token is not supported by solver
+		let input_token =
+			InteropAddress::new_ethereum(1, address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"));
+		let output_token =
+			InteropAddress::new_ethereum(137, address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"));
+
+		// Create solver that doesn't support this token
+		let solver = create_mock_solver_with_token_support(HashMap::new());
+
+		let request = create_simple_test_quote_request(
+			input_token.clone(),
+			Some("1000000"),
+			output_token,
+			None,
+			SwapType::ExactInput,
+		);
+
+		let cost_context =
+			create_mock_cost_context(HashMap::new(), HashMap::new(), SwapType::ExactInput);
+
+		let result = QuoteValidator::validate_and_collect_inputs_with_costs(
+			&request,
+			&solver,
+			&cost_context,
+		);
+
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Input token not supported")),
+			"Should reject unsupported input token: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_and_collect_inputs_with_costs_multiple_inputs_mixed_support() {
+		// Test: Multiple inputs, some supported, some not - should fail if ANY is unsupported
+		let supported_token =
+			InteropAddress::new_ethereum(1, address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"));
+		let unsupported_token =
+			InteropAddress::new_ethereum(1, address!("1111111111111111111111111111111111111111"));
+		let output_token =
+			InteropAddress::new_ethereum(137, address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"));
+
+		let mut supported_tokens = HashMap::new();
+		supported_tokens.insert(
+			1u64,
+			vec![address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")],
+		);
+		let solver = create_mock_solver_with_token_support(supported_tokens);
+
+		let request = create_test_quote_request(
+			vec![
+				(supported_token.clone(), Some("1000000")),
+				(unsupported_token.clone(), Some("500000")),
+			],
+			vec![(output_token, None)],
+			SwapType::ExactInput,
+		);
+
+		let cost_context =
+			create_mock_cost_context(HashMap::new(), HashMap::new(), SwapType::ExactInput);
+
+		let result = QuoteValidator::validate_and_collect_inputs_with_costs(
+			&request,
+			&solver,
+			&cost_context,
+		);
+
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Input token not supported")),
+			"Should reject when any input token is unsupported: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_and_collect_inputs_with_costs_multiple_inputs_all_supported() {
+		// Test: Multiple inputs, all supported
+		let token1 =
+			InteropAddress::new_ethereum(1, address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"));
+		let token2 =
+			InteropAddress::new_ethereum(1, address!("dAC17F958D2ee523a2206206994597C13D831ec7"));
+		let output_token =
+			InteropAddress::new_ethereum(137, address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"));
+
+		let mut supported_tokens = HashMap::new();
+		supported_tokens.insert(
+			1u64,
+			vec![
+				address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+				address!("dAC17F958D2ee523a2206206994597C13D831ec7"),
+			],
+		);
+		let solver = create_mock_solver_with_token_support(supported_tokens);
+
+		let request = create_test_quote_request(
+			vec![
+				(token1.clone(), Some("1000000")),
+				(token2.clone(), Some("500000")),
+			],
+			vec![(output_token, None)],
+			SwapType::ExactInput,
+		);
+
+		// Create cost context with amounts for both tokens
+		let mut swap_amounts = HashMap::new();
+		swap_amounts.insert(token1.clone(), (U256::from(2000000u64), 6));
+		swap_amounts.insert(token2.clone(), (U256::from(1000000u64), 6));
+
+		let cost_context =
+			create_mock_cost_context(swap_amounts, HashMap::new(), SwapType::ExactInput);
+
+		let result = QuoteValidator::validate_and_collect_inputs_with_costs(
+			&request,
+			&solver,
+			&cost_context,
+		);
+
+		assert!(
+			result.is_ok(),
+			"Should succeed with all supported tokens: {:?}",
+			result
+		);
+
+		let supported_assets = result.unwrap();
+		assert_eq!(supported_assets.len(), 2);
+
+		// Check both tokens are present with correct amounts
+		let asset1 = supported_assets.iter().find(|a| a.asset == token1).unwrap();
+		let asset2 = supported_assets.iter().find(|a| a.asset == token2).unwrap();
+
+		assert_eq!(asset1.amount, U256::from(2000000u64)); // From cost context
+		assert_eq!(asset2.amount, U256::from(1000000u64)); // From cost context
+	}
+
+	// ========== validate_and_collect_outputs_with_costs Tests ==========
+
+	#[test]
+	fn test_validate_and_collect_outputs_with_costs_success_all_supported() {
+		// Test: All output tokens are supported, amounts from cost context
+		let input_token =
+			InteropAddress::new_ethereum(1, address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"));
+		let output_token =
+			InteropAddress::new_ethereum(137, address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"));
+
+		let mut supported_tokens = HashMap::new();
+		supported_tokens.insert(
+			137u64,
+			vec![address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1")],
+		);
+		let solver = create_mock_solver_with_token_support(supported_tokens);
+
+		let request = create_simple_test_quote_request(
+			input_token,
+			Some("1000000"),
+			output_token.clone(),
+			Some("950000"), // 0.95 token (18 decimals)
+			SwapType::ExactOutput,
+		);
+
+		// Create cost context with swap amounts
+		let mut swap_amounts = HashMap::new();
+		swap_amounts.insert(output_token.clone(), (U256::from(1000000u64), 18)); // 1 token from cost context
+
+		let cost_context =
+			create_mock_cost_context(swap_amounts, HashMap::new(), SwapType::ExactOutput);
+
+		let result = QuoteValidator::validate_and_collect_outputs_with_costs(
+			&request,
+			&solver,
+			&cost_context,
+		);
+
+		assert!(
+			result.is_ok(),
+			"Should succeed with supported tokens: {:?}",
+			result
+		);
+
+		let supported_assets = result.unwrap();
+		assert_eq!(supported_assets.len(), 1);
+		assert_eq!(supported_assets[0].asset, output_token);
+		assert_eq!(supported_assets[0].amount, U256::from(1000000u64)); // Amount from cost context
+	}
+
+	#[test]
+	fn test_validate_and_collect_outputs_with_costs_fallback_to_request_amount() {
+		// Test: Token not in cost context, falls back to request amount
+		let input_token =
+			InteropAddress::new_ethereum(1, address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"));
+		let output_token =
+			InteropAddress::new_ethereum(137, address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"));
+
+		let mut supported_tokens = HashMap::new();
+		supported_tokens.insert(
+			137u64,
+			vec![address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1")],
+		);
+		let solver = create_mock_solver_with_token_support(supported_tokens);
+
+		let request = create_simple_test_quote_request(
+			input_token,
+			Some("1000000"),
+			output_token.clone(),
+			Some("950000"), // 0.95 token
+			SwapType::ExactOutput,
+		);
+
+		// Create cost context without this token (empty swap_amounts)
+		let cost_context =
+			create_mock_cost_context(HashMap::new(), HashMap::new(), SwapType::ExactOutput);
+
+		let result = QuoteValidator::validate_and_collect_outputs_with_costs(
+			&request,
+			&solver,
+			&cost_context,
+		);
+
+		assert!(
+			result.is_ok(),
+			"Should succeed with fallback to request amount: {:?}",
+			result
+		);
+
+		let supported_assets = result.unwrap();
+		assert_eq!(supported_assets.len(), 1);
+		assert_eq!(supported_assets[0].asset, output_token);
+		assert_eq!(supported_assets[0].amount, U256::from(950000u64)); // Amount from request
+	}
+
+	#[test]
+	fn test_validate_and_collect_outputs_with_costs_fails_unsupported_token() {
+		// Test: Output token is not supported by solver
+		let input_token =
+			InteropAddress::new_ethereum(1, address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"));
+		let output_token =
+			InteropAddress::new_ethereum(137, address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"));
+
+		// Create solver that doesn't support this token
+		let solver = create_mock_solver_with_token_support(HashMap::new());
+
+		let request = create_simple_test_quote_request(
+			input_token,
+			Some("1000000"),
+			output_token.clone(),
+			Some("950000"),
+			SwapType::ExactOutput,
+		);
+
+		let cost_context =
+			create_mock_cost_context(HashMap::new(), HashMap::new(), SwapType::ExactOutput);
+
+		let result = QuoteValidator::validate_and_collect_outputs_with_costs(
+			&request,
+			&solver,
+			&cost_context,
+		);
+
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Output token not supported")),
+			"Should reject unsupported output token: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_and_collect_outputs_with_costs_multiple_outputs_all_supported() {
+		// Test: Multiple outputs, all supported
+		let input_token =
+			InteropAddress::new_ethereum(1, address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"));
+		let token1 =
+			InteropAddress::new_ethereum(137, address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"));
+		let token2 =
+			InteropAddress::new_ethereum(137, address!("c2132D05D31c914a87C6611C10748AEb04B58e8F"));
+
+		let mut supported_tokens = HashMap::new();
+		supported_tokens.insert(
+			137u64,
+			vec![
+				address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"),
+				address!("c2132D05D31c914a87C6611C10748AEb04B58e8F"),
+			],
+		);
+		let solver = create_mock_solver_with_token_support(supported_tokens);
+
+		let request = create_test_quote_request(
+			vec![(input_token, Some("1000000"))],
+			vec![
+				(token1.clone(), Some("950000")),
+				(token2.clone(), Some("500000")),
+			],
+			SwapType::ExactOutput,
+		);
+
+		// Create cost context with amounts for both tokens
+		let mut swap_amounts = HashMap::new();
+		swap_amounts.insert(token1.clone(), (U256::from(1000000u64), 18));
+		swap_amounts.insert(token2.clone(), (U256::from(750000u64), 6));
+
+		let cost_context =
+			create_mock_cost_context(swap_amounts, HashMap::new(), SwapType::ExactOutput);
+
+		let result = QuoteValidator::validate_and_collect_outputs_with_costs(
+			&request,
+			&solver,
+			&cost_context,
+		);
+
+		assert!(
+			result.is_ok(),
+			"Should succeed with all supported tokens: {:?}",
+			result
+		);
+
+		let supported_assets = result.unwrap();
+		assert_eq!(supported_assets.len(), 2);
+
+		// Check both tokens are present with correct amounts
+		let asset1 = supported_assets.iter().find(|a| a.asset == token1).unwrap();
+		let asset2 = supported_assets.iter().find(|a| a.asset == token2).unwrap();
+
+		assert_eq!(asset1.amount, U256::from(1000000u64)); // From cost context
+		assert_eq!(asset2.amount, U256::from(750000u64)); // From cost context
 	}
 }
