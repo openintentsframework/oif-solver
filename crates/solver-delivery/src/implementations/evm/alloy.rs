@@ -225,31 +225,36 @@ impl DeliveryInterface for AlloyDelivery {
 		let request: TransactionRequest = tx.clone().into();
 
 		// Log request details for debugging
-		if tracking.is_some() {
-			tracing::debug!(
-				"Sending transaction with monitoring on chain {}: to={:?}, value={:?}, data_len={}, gas_limit={:?}",
-				chain_id,
-				request.to,
-				request.value,
-				request.input.input().map(|d| d.len()).unwrap_or(0),
-				request.gas
-			);
-		} else {
-			tracing::debug!(
-				"Sending transaction on chain {}: to={:?}, value={:?}, data_len={}, gas_limit={:?}",
-				chain_id,
-				request.to,
-				request.value,
-				request.input.input().map(|d| d.len()).unwrap_or(0),
-				request.gas
-			);
-		}
+		let to_hex = request.to.as_ref().map(|t| match t {
+			alloy_primitives::TxKind::Call(addr) => format!("{:?}", addr),
+			alloy_primitives::TxKind::Create => "CREATE".to_string(),
+		});
+
+		tracing::debug!(
+			chain_id,
+			to = ?to_hex,
+			value = %request.value.unwrap_or_default(),
+			data_len = request.input.input().map(|d| d.len()).unwrap_or(0),
+			gas_limit = ?request.gas,
+			with_tracking = tracking.is_some(),
+			"Submitting transaction"
+		);
 
 		// Send transaction - the provider's wallet will handle signing
-		let pending_tx = provider.send_transaction(request).await.map_err(|e| {
-			tracing::error!("Transaction submission failed on chain {}: {}", chain_id, e);
-			DeliveryError::Network(format!("Failed to send transaction: {}", e))
-		})?;
+		let pending_tx = provider
+			.send_transaction(request.clone())
+			.await
+			.map_err(|e| {
+				tracing::error!(
+					chain_id,
+					to = ?to_hex,
+					value = %request.value.unwrap_or_default(),
+					data_len = request.input.input().map(|d| d.len()).unwrap_or(0),
+					error = %e,
+					"Transaction submission failed"
+				);
+				DeliveryError::Network(format!("Failed to send transaction: {}", e))
+			})?;
 
 		// Get the transaction hash
 		let tx_hash = *pending_tx.tx_hash();

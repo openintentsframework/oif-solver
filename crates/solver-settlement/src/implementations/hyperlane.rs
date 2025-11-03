@@ -822,7 +822,6 @@ impl HyperlaneSettlement {
 		U256::from(base_gas + (payload_size * gas_per_byte) + buffer)
 	}
 
-
 	#[allow(clippy::too_many_arguments)]
 	async fn estimate_gas_payment(
 		&self,
@@ -892,7 +891,7 @@ impl HyperlaneSettlement {
 			);
 			SettlementError::ValidationFailed(format!("Failed to quote gas payment: {}", e))
 		})?;
-		
+
 		let duration = start.elapsed();
 
 		// Decode the result
