@@ -250,9 +250,18 @@ pub async fn quote_exists(quote_id: &str, solver: &SolverEngine) -> Result<bool,
 mod tests {
 	use super::*;
 	use alloy_primitives::Address as AlloyAddress;
+	use solver_account::AccountService;
+	use solver_core::engine::event_bus::EventBus;
+	use solver_core::engine::token_manager::TokenManager;
+	use solver_core::SolverEngine;
+	use solver_delivery::DeliveryService;
+	use solver_discovery::DiscoveryService;
+	use solver_order::OrderService;
+	use solver_pricing::PricingService;
+	use solver_settlement::SettlementService;
 	use solver_storage::{implementations::memory::MemoryStorage, StorageService};
 	use solver_types::{
-		current_timestamp, oif_versions, CostBreakdown, CostContext, FailureHandlingMode,
+		current_timestamp, oif_versions, Address, CostBreakdown, CostContext, FailureHandlingMode,
 		GetQuoteRequest, IntentRequest, IntentType, InteropAddress, OifOrder, OrderPayload, Quote,
 		QuoteError, QuoteInput, QuoteOutput, QuotePreference, QuotePreview, QuoteWithCostContext,
 		SignatureType, StorageKey, SwapType,
@@ -269,19 +278,98 @@ mod tests {
 		Arc::new(StorageService::new(Box::new(MemoryStorage::new())))
 	}
 
-	/// Creates a mock SolverEngine for testing that only implements the storage interface
-	struct MockSolverEngine {
-		storage: Arc<StorageService>,
-	}
+	/// Creates a minimal SolverEngine for testing
+	fn create_test_solver_engine() -> SolverEngine {
+		// Create minimal config for testing
+		let config_toml = r#"
+			[solver]
+			id = "test-solver"
+			monitoring_timeout_seconds = 30
+			min_profitability_pct = 1.0
+			
+			[storage]
+			primary = "memory"
+			cleanup_interval_seconds = 3600
+			[storage.implementations.memory]
+			
+			[delivery]
+			min_confirmations = 1
+			[delivery.implementations]
+			
+			[account]
+			primary = "local"
+			[account.implementations.local]
+			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
+			
+			[discovery]
+			[discovery.implementations]
+			
+			[order]
+			[order.implementations]
+			[order.strategy]
+			primary = "simple"
+			[order.strategy.implementations.simple]
+			
+			[settlement]
+			[settlement.implementations]
+			
+			[networks.1]
+			chain_id = 1
+			input_settler_address = "0x1111111111111111111111111111111111111111"
+			output_settler_address = "0x2222222222222222222222222222222222222222"
+			[[networks.1.rpc_urls]]
+			http = "http://localhost:8545"
+			[[networks.1.tokens]]
+			symbol = "TEST"
+			address = "0x3333333333333333333333333333333333333333"
+			decimals = 18
+		"#;
+		let config: solver_config::Config =
+			toml::from_str(config_toml).expect("Failed to parse test config");
 
-	impl MockSolverEngine {
-		fn new(storage: Arc<StorageService>) -> Self {
-			Self { storage }
-		}
+		// Create mock services
+		let storage = create_test_storage();
+		let account = Arc::new(AccountService::new(Box::new(
+			solver_account::implementations::local::LocalWallet::new(
+				"0x1234567890123456789012345678901234567890123456789012345678901234",
+			)
+			.unwrap(),
+		)));
+		let solver_address = Address([0xAB; 20].to_vec());
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
+		let strategy = solver_order::implementations::strategies::simple::create_strategy(
+			&toml::Value::Table(toml::map::Map::new()),
+		)
+		.unwrap();
+		let order = Arc::new(OrderService::new(HashMap::new(), strategy));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), 3));
+		let pricing_impl = solver_pricing::implementations::mock::create_mock_pricing(
+			&toml::Value::Table(toml::map::Map::new()),
+		)
+		.unwrap();
+		let pricing = Arc::new(PricingService::new(pricing_impl));
+		let event_bus = EventBus::new(64);
+		let networks: solver_types::NetworksConfig = HashMap::new();
+		let token_manager = Arc::new(TokenManager::new(
+			networks,
+			delivery.clone(),
+			account.clone(),
+		));
 
-		fn storage(&self) -> &Arc<StorageService> {
-			&self.storage
-		}
+		SolverEngine::new(
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+		)
 	}
 
 	/// Creates a valid test quote request
@@ -383,55 +471,22 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_store_quotes_success() {
-		let storage = create_test_storage();
-		let mock_solver = MockSolverEngine::new(storage);
+		let solver = create_test_solver_engine();
 		let quotes = vec![create_test_quote()];
 		let cost_context = create_test_cost_context();
 
-		// Test store_quotes by directly calling the storage operations
-		let storage = mock_solver.storage();
-		let now = std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.unwrap_or_default()
-			.as_secs();
+		// Test the actual store_quotes function
+		store_quotes(&solver, &quotes, &cost_context).await;
 
-		for quote in &quotes {
-			let ttl = if quote.valid_until > now {
-				Duration::from_secs(quote.valid_until - now)
-			} else {
-				Duration::from_secs(1)
-			};
-
-			let quote_with_context = QuoteWithCostContext {
-				quote: quote.clone(),
-				cost_context: cost_context.clone(),
-			};
-
-			storage
-				.store_with_ttl(
-					StorageKey::Quotes.as_str(),
-					&quote.quote_id,
-					&quote_with_context,
-					None,
-					Some(ttl),
-				)
-				.await
-				.expect("Should store quote successfully");
-		}
-
-		// Verify the quote was stored by trying to retrieve it
-		let stored_quote: Result<QuoteWithCostContext, _> = mock_solver
-			.storage()
-			.retrieve(StorageKey::Quotes.as_str(), TEST_QUOTE_ID)
-			.await;
-		assert!(stored_quote.is_ok());
-		assert_eq!(stored_quote.unwrap().quote.quote_id, TEST_QUOTE_ID);
+		// Verify the quote was stored by trying to retrieve it using the public API
+		let result = get_quote_by_id(TEST_QUOTE_ID, &solver).await;
+		assert!(result.is_ok());
+		assert_eq!(result.unwrap().quote_id, TEST_QUOTE_ID);
 	}
 
 	#[tokio::test]
 	async fn test_store_quotes_with_expired_quote() {
-		let storage = create_test_storage();
-		let mock_solver = MockSolverEngine::new(storage);
+		let solver = create_test_solver_engine();
 
 		let mut quote = create_test_quote();
 		// Set quote to be already expired
@@ -439,53 +494,23 @@ mod tests {
 		let quotes = vec![quote];
 		let cost_context = create_test_cost_context();
 
-		// Test store_quotes with expired quote
-		let storage = mock_solver.storage();
-		let now = std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.unwrap_or_default()
-			.as_secs();
-
-		for quote in &quotes {
-			let ttl = if quote.valid_until > now {
-				Duration::from_secs(quote.valid_until - now)
-			} else {
-				Duration::from_secs(1) // Minimal TTL for expired quotes
-			};
-
-			let quote_with_context = QuoteWithCostContext {
-				quote: quote.clone(),
-				cost_context: cost_context.clone(),
-			};
-
-			storage
-				.store_with_ttl(
-					StorageKey::Quotes.as_str(),
-					&quote.quote_id,
-					&quote_with_context,
-					None,
-					Some(ttl),
-				)
-				.await
-				.expect("Should store expired quote successfully");
-		}
+		// Test the actual store_quotes function with expired quote
+		store_quotes(&solver, &quotes, &cost_context).await;
 
 		// Verify the quote was still stored (memory storage ignores TTL)
-		let stored_quote: Result<QuoteWithCostContext, _> = mock_solver
-			.storage()
-			.retrieve(StorageKey::Quotes.as_str(), TEST_QUOTE_ID)
-			.await;
-		assert!(stored_quote.is_ok());
+		// Use the public API to retrieve it
+		let result = get_quote_by_id(TEST_QUOTE_ID, &solver).await;
+		assert!(result.is_ok());
+		assert_eq!(result.unwrap().quote_id, TEST_QUOTE_ID);
 	}
 
 	#[tokio::test]
 	async fn test_get_quote_by_id_success() {
-		let storage = create_test_storage();
-		let mock_solver = MockSolverEngine::new(storage);
+		let solver = create_test_solver_engine();
 		let quote_with_context = create_test_quote_with_context();
 
-		// Store the quote first
-		mock_solver
+		// Store the quote first using direct storage access (setup)
+		solver
 			.storage()
 			.store(
 				StorageKey::Quotes.as_str(),
@@ -496,31 +521,18 @@ mod tests {
 			.await
 			.unwrap();
 
-		// Test retrieval using storage directly
-		let stored_quote: Result<QuoteWithCostContext, _> = mock_solver
-			.storage()
-			.retrieve(StorageKey::Quotes.as_str(), TEST_QUOTE_ID)
-			.await;
-		let result = stored_quote
-			.map(|qwc| qwc.quote)
-			.map_err(|_| QuoteError::InvalidRequest(format!("Quote not found: {}", TEST_QUOTE_ID)));
+		// Test the actual get_quote_by_id function
+		let result = get_quote_by_id(TEST_QUOTE_ID, &solver).await;
 		assert!(result.is_ok());
 		assert_eq!(result.unwrap().quote_id, TEST_QUOTE_ID);
 	}
 
 	#[tokio::test]
 	async fn test_get_quote_by_id_not_found() {
-		let storage = create_test_storage();
-		let mock_solver = MockSolverEngine::new(storage);
+		let solver = create_test_solver_engine();
 
-		// Test retrieval of nonexistent quote using storage directly
-		let stored_quote: Result<QuoteWithCostContext, _> = mock_solver
-			.storage()
-			.retrieve(StorageKey::Quotes.as_str(), "nonexistent_quote")
-			.await;
-		let result = stored_quote.map(|qwc| qwc.quote).map_err(|_| {
-			QuoteError::InvalidRequest("Quote not found: nonexistent_quote".to_string())
-		});
+		// Test the actual get_quote_by_id function with nonexistent quote
+		let result = get_quote_by_id("nonexistent_quote", &solver).await;
 		assert!(result.is_err());
 		match result.unwrap_err() {
 			QuoteError::InvalidRequest(msg) => assert!(msg.contains("Quote not found")),
@@ -530,12 +542,11 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_quote_exists_true() {
-		let storage = create_test_storage();
-		let mock_solver = MockSolverEngine::new(storage);
+		let solver = create_test_solver_engine();
 		let quote_with_context = create_test_quote_with_context();
 
-		// Store the quote first
-		mock_solver
+		// Store the quote first using direct storage access (setup)
+		solver
 			.storage()
 			.store(
 				StorageKey::Quotes.as_str(),
@@ -546,27 +557,18 @@ mod tests {
 			.await
 			.unwrap();
 
-		// Test quote existence using storage directly
-		let result = mock_solver
-			.storage()
-			.exists(StorageKey::Quotes.as_str(), TEST_QUOTE_ID)
-			.await
-			.map_err(|e| QuoteError::Internal(format!("Storage error: {}", e)));
+		// Test the actual quote_exists function
+		let result = quote_exists(TEST_QUOTE_ID, &solver).await;
 		assert!(result.is_ok());
 		assert!(result.unwrap());
 	}
 
 	#[tokio::test]
 	async fn test_quote_exists_false() {
-		let storage = create_test_storage();
-		let mock_solver = MockSolverEngine::new(storage);
+		let solver = create_test_solver_engine();
 
-		// Test nonexistent quote using storage directly
-		let result = mock_solver
-			.storage()
-			.exists(StorageKey::Quotes.as_str(), "nonexistent_quote")
-			.await
-			.map_err(|e| QuoteError::Internal(format!("Storage error: {}", e)));
+		// Test the actual quote_exists function with nonexistent quote
+		let result = quote_exists("nonexistent_quote", &solver).await;
 		assert!(result.is_ok());
 		assert!(!result.unwrap());
 	}
