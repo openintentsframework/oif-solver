@@ -94,7 +94,7 @@ impl SettlementHandler {
 		// where different backend nodes may not have the latest block indexed yet
 		// Increased to 2000ms (2s) for better reliability with public RPCs
 		tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
-		
+
 		// Retrieve the order
 		let order: Order = self
 			.storage
