@@ -164,3 +164,163 @@ fn recover_signer(
 
 	Ok(AlloyAddress::from_slice(address_bytes))
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use alloy_primitives::{keccak256, Address as AlloyAddress, Bytes};
+	use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
+	use solver_delivery::{
+		DeliveryError, DeliveryInterface, DeliveryService, MockDeliveryInterface,
+	};
+	use solver_types::standards::eip7683::interfaces::ITheCompact::DOMAIN_SEPARATORCall;
+	use solver_types::Address;
+	use std::collections::HashMap;
+	use std::sync::Arc;
+
+	fn delivery_service_from_mock(mock: MockDeliveryInterface) -> Arc<DeliveryService> {
+		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+		implementations.insert(1, Arc::new(mock) as Arc<dyn DeliveryInterface>);
+		Arc::new(DeliveryService::new(implementations, 1, 30))
+	}
+
+	fn delivery_service_with_success(response: Bytes) -> Arc<DeliveryService> {
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_eth_call().returning(move |_tx| {
+			let bytes = response.clone();
+			Box::pin(async move { Ok(bytes) })
+		});
+		delivery_service_from_mock(mock)
+	}
+
+	fn delivery_service_with_error(message: &'static str) -> Arc<DeliveryService> {
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_eth_call().returning(move |_tx| {
+			let msg = message.to_string();
+			Box::pin(async move { Err(DeliveryError::Network(msg)) })
+		});
+		delivery_service_from_mock(mock)
+	}
+
+	fn contract_address() -> Address {
+		Address(vec![0x11; 20])
+	}
+
+	#[tokio::test]
+	async fn get_domain_separator_returns_value() {
+		let expected = FixedBytes::from([0xAAu8; 32]);
+		let encoded = DOMAIN_SEPARATORCall::abi_encode_returns(&expected);
+		let delivery = delivery_service_with_success(Bytes::from(encoded));
+
+		let result = get_domain_separator(&delivery, &contract_address(), 1)
+			.await
+			.expect("domain separator");
+
+		assert_eq!(result, expected);
+	}
+
+	#[tokio::test]
+	async fn get_domain_separator_propagates_contract_call_errors() {
+		let delivery = delivery_service_with_error("call failed");
+
+		let error = get_domain_separator(&delivery, &contract_address(), 1)
+			.await
+			.expect_err("expected error");
+
+		assert!(matches!(
+			error,
+			APIError::BadRequest { message, .. } if message.contains("Failed to get domain separator")
+		));
+	}
+
+	#[tokio::test]
+	async fn get_domain_separator_errors_on_decode_failure() {
+		let delivery = delivery_service_with_success(Bytes::from(vec![0u8; 4]));
+		let error = get_domain_separator(&delivery, &contract_address(), 1)
+			.await
+			.expect_err("expected decode error");
+		assert!(matches!(
+			error,
+			APIError::BadRequest { message, .. } if message.contains("Failed to decode domain separator")
+		));
+	}
+
+	#[test]
+	fn validate_eip712_signature_returns_true_for_matching_signer() {
+		let domain_separator = FixedBytes::from([0x11u8; 32]);
+		let struct_hash = FixedBytes::from([0x22u8; 32]);
+		let message_hash = keccak256(
+			[
+				&[0x19, 0x01][..],
+				domain_separator.as_slice(),
+				struct_hash.as_slice(),
+			]
+			.concat(),
+		);
+
+		let secret = SecretKey::from_byte_array([0x12u8; 32]).expect("secret");
+		let secp = Secp256k1::new();
+		let message = Message::from_digest(*message_hash);
+		let signature = secp.sign_ecdsa_recoverable(message, &secret);
+		let (recovery_id, sig_bytes) = signature.serialize_compact();
+		let mut signature_bytes = sig_bytes.to_vec();
+		let rec: i32 = recovery_id.into();
+		signature_bytes.push((rec as u8) + 27);
+		let signature = Bytes::from(signature_bytes);
+
+		let public_key = PublicKey::from_secret_key(&secp, &secret);
+		let public_key_bytes = public_key.serialize_uncompressed();
+		let signer_hash = keccak256(&public_key_bytes[1..]);
+		let signer = AlloyAddress::from_slice(&signer_hash.as_slice()[12..]);
+
+		let is_valid = validate_eip712_signature(domain_separator, struct_hash, &signature, signer)
+			.expect("validation");
+		assert!(is_valid);
+	}
+
+	#[test]
+	fn validate_eip712_signature_returns_false_for_mismatched_signer() {
+		let domain_separator = FixedBytes::from([0x33u8; 32]);
+		let struct_hash = FixedBytes::from([0x44u8; 32]);
+		let message_hash = keccak256(
+			[
+				&[0x19, 0x01][..],
+				domain_separator.as_slice(),
+				struct_hash.as_slice(),
+			]
+			.concat(),
+		);
+
+		let secret = SecretKey::from_byte_array([0x21u8; 32]).expect("secret");
+		let secp = Secp256k1::new();
+		let message = Message::from_digest(*message_hash);
+		let signature = secp.sign_ecdsa_recoverable(message, &secret);
+		let (recovery_id, sig_bytes) = signature.serialize_compact();
+		let mut signature_bytes = sig_bytes.to_vec();
+		let rec: i32 = recovery_id.into();
+		signature_bytes.push((rec as u8) + 27);
+		let signature = Bytes::from(signature_bytes);
+
+		let other_signer = AlloyAddress::from_slice(&[0xFFu8; 20]);
+		let result =
+			validate_eip712_signature(domain_separator, struct_hash, &signature, other_signer)
+				.expect("validation result");
+		assert!(!result);
+	}
+
+	#[test]
+	fn validate_eip712_signature_errors_on_invalid_length() {
+		let signature = Bytes::from(vec![0u8; 10]);
+		let err = validate_eip712_signature(
+			FixedBytes::from([0x55u8; 32]),
+			FixedBytes::from([0x66u8; 32]),
+			&signature,
+			AlloyAddress::from_slice(&[0u8; 20]),
+		)
+		.expect_err("expected length error");
+		assert!(matches!(
+			err,
+			APIError::BadRequest { message, .. } if message.contains("Invalid signature length")
+		));
+	}
+}
