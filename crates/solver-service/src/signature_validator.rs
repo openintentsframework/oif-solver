@@ -186,165 +186,16 @@ mod tests {
 	use super::*;
 	use alloy_primitives::{hex, keccak256, Address as AlloyAddress, Bytes, FixedBytes, U256};
 	use alloy_sol_types::SolType;
-	use async_trait::async_trait;
 	use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 	use serde_json::json;
-	use solver_delivery::{DeliveryError, DeliveryInterface, DeliveryService};
+	use solver_delivery::{DeliveryError, DeliveryInterface, DeliveryService, MockDeliveryInterface};
 	use solver_types::api::{OrderPayload, PostOrderRequest, SignatureType};
 	use solver_types::networks::RpcEndpoint;
 	use solver_types::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
 	use solver_types::standards::eip7683::LockType;
-	use solver_types::{
-		Address, ConfigSchema, NetworkConfig, NetworksConfig, Transaction, TransactionHash,
-		TransactionReceipt, ValidationError,
-	};
+	use solver_types::{Address, NetworkConfig, NetworksConfig};
 	use std::collections::HashMap;
 	use std::sync::Arc;
-	use toml::Value;
-
-	struct NoopConfigSchema;
-
-	impl ConfigSchema for NoopConfigSchema {
-		fn validate(&self, _config: &Value) -> Result<(), ValidationError> {
-			Ok(())
-		}
-	}
-
-	struct SuccessfulDelivery {
-		response: Bytes,
-	}
-
-	impl SuccessfulDelivery {
-		fn new(response: Bytes) -> Self {
-			Self { response }
-		}
-	}
-
-	struct FailingDelivery;
-
-	#[async_trait]
-	impl DeliveryInterface for SuccessfulDelivery {
-		fn config_schema(&self) -> Box<dyn ConfigSchema> {
-			Box::new(NoopConfigSchema)
-		}
-
-		async fn submit(
-			&self,
-			_tx: Transaction,
-			_tracking: Option<solver_delivery::TransactionTrackingWithConfig>,
-		) -> Result<TransactionHash, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn get_receipt(
-			&self,
-			_hash: &TransactionHash,
-			_chain_id: u64,
-		) -> Result<TransactionReceipt, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn get_gas_price(&self, _chain_id: u64) -> Result<String, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn get_balance(
-			&self,
-			_address: &str,
-			_token: Option<&str>,
-			_chain_id: u64,
-		) -> Result<String, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn get_allowance(
-			&self,
-			_owner: &str,
-			_spender: &str,
-			_token_address: &str,
-			_chain_id: u64,
-		) -> Result<String, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn get_nonce(&self, _address: &str, _chain_id: u64) -> Result<u64, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn get_block_number(&self, _chain_id: u64) -> Result<u64, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn estimate_gas(&self, _tx: Transaction) -> Result<u64, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn eth_call(&self, _tx: Transaction) -> Result<Bytes, DeliveryError> {
-			Ok(self.response.clone())
-		}
-	}
-
-	#[async_trait]
-	impl DeliveryInterface for FailingDelivery {
-		fn config_schema(&self) -> Box<dyn ConfigSchema> {
-			Box::new(NoopConfigSchema)
-		}
-
-		async fn submit(
-			&self,
-			_tx: Transaction,
-			_tracking: Option<solver_delivery::TransactionTrackingWithConfig>,
-		) -> Result<TransactionHash, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn get_receipt(
-			&self,
-			_hash: &TransactionHash,
-			_chain_id: u64,
-		) -> Result<TransactionReceipt, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn get_gas_price(&self, _chain_id: u64) -> Result<String, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn get_balance(
-			&self,
-			_address: &str,
-			_token: Option<&str>,
-			_chain_id: u64,
-		) -> Result<String, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn get_allowance(
-			&self,
-			_owner: &str,
-			_spender: &str,
-			_token_address: &str,
-			_chain_id: u64,
-		) -> Result<String, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn get_nonce(&self, _address: &str, _chain_id: u64) -> Result<u64, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn get_block_number(&self, _chain_id: u64) -> Result<u64, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn estimate_gas(&self, _tx: Transaction) -> Result<u64, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn eth_call(&self, _tx: Transaction) -> Result<Bytes, DeliveryError> {
-			Err(DeliveryError::Network("eth_call failed".to_string()))
-		}
-	}
 
 	#[derive(Clone)]
 	struct SignatureFixture {
@@ -352,6 +203,12 @@ mod tests {
 		networks: NetworksConfig,
 		delivery: Arc<DeliveryService>,
 		chain_id: u64,
+	}
+
+	fn delivery_service_from_mock(chain_id: u64, mock: MockDeliveryInterface) -> Arc<DeliveryService> {
+		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+		implementations.insert(chain_id, Arc::new(mock) as Arc<dyn DeliveryInterface>);
+		Arc::new(DeliveryService::new(implementations, 1, 30))
 	}
 
 	fn address_from_hex(hex_str: &str) -> Address {
@@ -509,14 +366,13 @@ mod tests {
 		let mut networks = NetworksConfig::new();
 		networks.insert(chain_id, network_config);
 
-		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
-		implementations.insert(
-			chain_id,
-			Arc::new(SuccessfulDelivery::new(Bytes::from(
-				domain_separator.to_vec(),
-			))),
-		);
-		let delivery = Arc::new(DeliveryService::new(implementations, 1, 30));
+		let mut mock_delivery = MockDeliveryInterface::new();
+		let domain_bytes = Bytes::from(domain_separator.to_vec());
+		mock_delivery.expect_eth_call().returning(move |_tx| {
+			let bytes = domain_bytes.clone();
+			Box::pin(async move { Ok(bytes) })
+		});
+		let delivery = delivery_service_from_mock(chain_id, mock_delivery);
 
 		SignatureFixture {
 			intent,
@@ -606,9 +462,11 @@ mod tests {
 	#[tokio::test]
 	async fn validate_signature_errors_when_domain_separator_call_fails() {
 		let fixture = build_signature_fixture();
-		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
-		implementations.insert(fixture.chain_id, Arc::new(FailingDelivery));
-		let failing_delivery = Arc::new(DeliveryService::new(implementations, 1, 30));
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_eth_call().returning(|_| {
+			Box::pin(async move { Err(DeliveryError::Network("eth_call failed".to_string())) })
+		});
+		let failing_delivery = delivery_service_from_mock(fixture.chain_id, mock_delivery);
 		let service = SignatureValidationService::new();
 		let result = service
 			.validate_signature(

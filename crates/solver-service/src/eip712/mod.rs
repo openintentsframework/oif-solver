@@ -168,100 +168,36 @@ fn recover_signer(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use alloy_primitives::{keccak256, Address as AlloyAddress};
-	use async_trait::async_trait;
+	use alloy_primitives::{keccak256, Address as AlloyAddress, Bytes};
 	use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
-	use solver_delivery::{DeliveryError, DeliveryInterface, DeliveryService};
+	use solver_delivery::{DeliveryError, DeliveryInterface, DeliveryService, MockDeliveryInterface};
 	use solver_types::standards::eip7683::interfaces::ITheCompact::DOMAIN_SEPARATORCall;
 	use solver_types::Address;
-	use solver_types::{
-		ConfigSchema, Transaction, TransactionHash, TransactionReceipt, ValidationError,
-	};
 	use std::collections::HashMap;
 	use std::sync::Arc;
-	use toml::Value;
 
-	struct NoopSchema;
-
-	impl ConfigSchema for NoopSchema {
-		fn validate(&self, _config: &Value) -> Result<(), ValidationError> {
-			Ok(())
-		}
-	}
-
-	struct TestDelivery {
-		response: Result<Bytes, String>,
-	}
-
-	#[async_trait]
-	impl DeliveryInterface for TestDelivery {
-		fn config_schema(&self) -> Box<dyn ConfigSchema> {
-			Box::new(NoopSchema)
-		}
-
-		async fn submit(
-			&self,
-			_tx: Transaction,
-			_tracking: Option<solver_delivery::TransactionTrackingWithConfig>,
-		) -> Result<TransactionHash, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn get_receipt(
-			&self,
-			_hash: &TransactionHash,
-			_chain_id: u64,
-		) -> Result<TransactionReceipt, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn get_gas_price(&self, _chain_id: u64) -> Result<String, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn get_balance(
-			&self,
-			_address: &str,
-			_token: Option<&str>,
-			_chain_id: u64,
-		) -> Result<String, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn get_allowance(
-			&self,
-			_owner: &str,
-			_spender: &str,
-			_token_address: &str,
-			_chain_id: u64,
-		) -> Result<String, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn get_nonce(&self, _address: &str, _chain_id: u64) -> Result<u64, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn get_block_number(&self, _chain_id: u64) -> Result<u64, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn estimate_gas(&self, _tx: Transaction) -> Result<u64, DeliveryError> {
-			unimplemented!()
-		}
-
-		async fn eth_call(&self, _tx: Transaction) -> Result<Bytes, DeliveryError> {
-			match &self.response {
-				Ok(bytes) => Ok(bytes.clone()),
-				Err(msg) => Err(DeliveryError::Network(msg.clone())),
-			}
-		}
-	}
-
-	fn delivery_service_with_response(response: Result<Bytes, String>) -> Arc<DeliveryService> {
+	fn delivery_service_from_mock(mock: MockDeliveryInterface) -> Arc<DeliveryService> {
 		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
-		implementations.insert(1, Arc::new(TestDelivery { response }));
+		implementations.insert(1, Arc::new(mock) as Arc<dyn DeliveryInterface>);
 		Arc::new(DeliveryService::new(implementations, 1, 30))
+	}
+
+	fn delivery_service_with_success(response: Bytes) -> Arc<DeliveryService> {
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_eth_call().returning(move |_tx| {
+			let bytes = response.clone();
+			Box::pin(async move { Ok(bytes) })
+		});
+		delivery_service_from_mock(mock)
+	}
+
+	fn delivery_service_with_error(message: &'static str) -> Arc<DeliveryService> {
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_eth_call().returning(move |_tx| {
+			let msg = message.to_string();
+			Box::pin(async move { Err(DeliveryError::Network(msg)) })
+		});
+		delivery_service_from_mock(mock)
 	}
 
 	fn contract_address() -> Address {
@@ -272,7 +208,7 @@ mod tests {
 	async fn get_domain_separator_returns_value() {
 		let expected = FixedBytes::from([0xAAu8; 32]);
 		let encoded = DOMAIN_SEPARATORCall::abi_encode_returns(&expected);
-		let delivery = delivery_service_with_response(Ok(Bytes::from(encoded)));
+		let delivery = delivery_service_with_success(Bytes::from(encoded));
 
 		let result = get_domain_separator(&delivery, &contract_address(), 1)
 			.await
@@ -283,7 +219,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn get_domain_separator_propagates_contract_call_errors() {
-		let delivery = delivery_service_with_response(Err("call failed".to_string()));
+		let delivery = delivery_service_with_error("call failed");
 
 		let error = get_domain_separator(&delivery, &contract_address(), 1)
 			.await
@@ -297,7 +233,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn get_domain_separator_errors_on_decode_failure() {
-		let delivery = delivery_service_with_response(Ok(Bytes::from(vec![0u8; 4])));
+		let delivery = delivery_service_with_success(Bytes::from(vec![0u8; 4]));
 		let error = get_domain_separator(&delivery, &contract_address(), 1)
 			.await
 			.expect_err("expected decode error");
