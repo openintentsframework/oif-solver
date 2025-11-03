@@ -188,7 +188,9 @@ mod tests {
 	use alloy_sol_types::SolType;
 	use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 	use serde_json::json;
-	use solver_delivery::{DeliveryError, DeliveryInterface, DeliveryService, MockDeliveryInterface};
+	use solver_delivery::{
+		DeliveryError, DeliveryInterface, DeliveryService, MockDeliveryInterface,
+	};
 	use solver_types::api::{OrderPayload, PostOrderRequest, SignatureType};
 	use solver_types::networks::RpcEndpoint;
 	use solver_types::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
@@ -205,7 +207,10 @@ mod tests {
 		chain_id: u64,
 	}
 
-	fn delivery_service_from_mock(chain_id: u64, mock: MockDeliveryInterface) -> Arc<DeliveryService> {
+	fn delivery_service_from_mock(
+		chain_id: u64,
+		mock: MockDeliveryInterface,
+	) -> Arc<DeliveryService> {
 		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
 		implementations.insert(chain_id, Arc::new(mock) as Arc<dyn DeliveryInterface>);
 		Arc::new(DeliveryService::new(implementations, 1, 30))

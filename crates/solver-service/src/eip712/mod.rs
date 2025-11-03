@@ -170,7 +170,9 @@ mod tests {
 	use super::*;
 	use alloy_primitives::{keccak256, Address as AlloyAddress, Bytes};
 	use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
-	use solver_delivery::{DeliveryError, DeliveryInterface, DeliveryService, MockDeliveryInterface};
+	use solver_delivery::{
+		DeliveryError, DeliveryInterface, DeliveryService, MockDeliveryInterface,
+	};
 	use solver_types::standards::eip7683::interfaces::ITheCompact::DOMAIN_SEPARATORCall;
 	use solver_types::Address;
 	use std::collections::HashMap;
