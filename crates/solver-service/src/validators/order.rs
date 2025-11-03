@@ -106,11 +106,20 @@ async fn validate_wallet_balance_for_order(
 			details: None,
 		})?;
 
-	let balance = U256::from_str_radix(&balance_str, 10).map_err(|e| APIError::BadRequest {
-		error_type: ApiErrorType::OrderValidationFailed,
-		message: format!("Failed to parse user balance '{}': {}", balance_str, e),
-		details: None,
-	})?;
+	// Parse balance - handle both hex (0x prefix) and decimal formats
+	let balance = if let Some(hex_str) = balance_str.strip_prefix("0x") {
+		U256::from_str_radix(hex_str, 16).map_err(|e| APIError::BadRequest {
+			error_type: ApiErrorType::OrderValidationFailed,
+			message: format!("Failed to parse user balance '{}': {}", balance_str, e),
+			details: None,
+		})?
+	} else {
+		U256::from_str_radix(&balance_str, 10).map_err(|e| APIError::BadRequest {
+			error_type: ApiErrorType::OrderValidationFailed,
+			message: format!("Failed to parse user balance '{}': {}", balance_str, e),
+			details: None,
+		})?
+	};
 
 	if balance < required_amount {
 		return Err(APIError::BadRequest {
@@ -436,7 +445,7 @@ mod tests {
 		let token_hex = hex::encode(parse_alloy_address(TEST_TOKEN).as_slice());
 		balances.insert(
 			(TEST_CHAIN_ID, user_hex, Some(token_hex)),
-			"1000".to_string(),
+			"0x3e8".to_string(), // 1000 in hex
 		);
 
 		let delivery =
@@ -466,7 +475,10 @@ mod tests {
 		let mut balances = HashMap::new();
 		let user_hex = hex::encode(parse_alloy_address(TEST_USER).as_slice());
 		let token_hex = hex::encode(parse_alloy_address(TEST_TOKEN).as_slice());
-		balances.insert((TEST_CHAIN_ID, user_hex, Some(token_hex)), "10".to_string());
+		balances.insert(
+			(TEST_CHAIN_ID, user_hex, Some(token_hex)),
+			"0xa".to_string(), // 10 in hex
+		);
 
 		let delivery =
 			Arc::new(TestDelivery::new(balances, HashMap::new())) as Arc<dyn DeliveryInterface>;
@@ -553,5 +565,342 @@ mod tests {
 			},
 			_ => panic!("expected compact deposit failure"),
 		}
+	}
+
+	#[tokio::test]
+	async fn test_ensure_user_capacity_invalid_chain_id() {
+		let amount = U256::from(500u64);
+		let token_u256 = token_to_u256(parse_alloy_address(TEST_TOKEN));
+		let mut standard_order = build_standard_order(TEST_CHAIN_ID, token_u256, amount);
+
+		// Set chain ID to a value that exceeds u64::MAX when converted
+		standard_order.originChainId = U256::from_be_slice(&[0xff; 32]);
+
+		let delivery = Arc::new(TestDelivery::new(HashMap::new(), HashMap::new()))
+			as Arc<dyn DeliveryInterface>;
+		let mut delivery_map = HashMap::new();
+		delivery_map.insert(TEST_CHAIN_ID, delivery);
+
+		let config = build_config(TEST_CHAIN_ID, TEST_COMPACT);
+		let solver = build_solver_engine(config.clone(), delivery_map);
+
+		let result = super::ensure_user_capacity_for_order(
+			&solver,
+			&config,
+			LockType::Permit2Escrow,
+			&standard_order,
+		)
+		.await;
+
+		match result {
+			Err(APIError::BadRequest { message, .. }) => {
+				assert!(message.contains("Origin chain ID missing or invalid"));
+			},
+			_ => panic!("expected invalid chain ID error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_ensure_user_capacity_network_not_configured() {
+		let amount = U256::from(500u64);
+		let token_id = U256::from(123u64);
+		let wrong_chain_id = 999u64;
+		let standard_order = build_standard_order(wrong_chain_id, token_id, amount);
+
+		let mut contract_responses = HashMap::new();
+		contract_responses.insert(TEST_CHAIN_ID, amount.to_be_bytes::<32>().to_vec());
+
+		let delivery = Arc::new(TestDelivery::new(HashMap::new(), contract_responses))
+			as Arc<dyn DeliveryInterface>;
+		let mut delivery_map = HashMap::new();
+		delivery_map.insert(TEST_CHAIN_ID, delivery);
+
+		// Config only has TEST_CHAIN_ID, not wrong_chain_id
+		let config = build_config(TEST_CHAIN_ID, TEST_COMPACT);
+		let solver = build_solver_engine(config.clone(), delivery_map);
+
+		let result = super::ensure_user_capacity_for_order(
+			&solver,
+			&config,
+			LockType::ResourceLock,
+			&standard_order,
+		)
+		.await;
+
+		match result {
+			Err(APIError::BadRequest { message, .. }) => {
+				assert!(message.contains("Network") && message.contains("not configured"));
+			},
+			_ => panic!("expected network not configured error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_ensure_user_capacity_compact_address_not_configured() {
+		use solver_types::{networks::NetworkConfig, parse_address};
+
+		let amount = U256::from(500u64);
+		let token_id = U256::from(123u64);
+		let standard_order = build_standard_order(TEST_CHAIN_ID, token_id, amount);
+
+		let mut contract_responses = HashMap::new();
+		contract_responses.insert(TEST_CHAIN_ID, amount.to_be_bytes::<32>().to_vec());
+
+		let delivery = Arc::new(TestDelivery::new(HashMap::new(), contract_responses))
+			as Arc<dyn DeliveryInterface>;
+		let mut delivery_map = HashMap::new();
+		delivery_map.insert(TEST_CHAIN_ID, delivery);
+
+		// Build config manually without TheCompact address (builder sets a default)
+		let network = NetworkConfig {
+			rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
+			input_settler_address: parse_address(TEST_SOLVER).unwrap(),
+			output_settler_address: parse_address(TEST_SOLVER).unwrap(),
+			tokens: vec![],
+			input_settler_compact_address: None,
+			the_compact_address: None, // Explicitly set to None
+			allocator_address: None,
+		};
+		let mut networks_config = HashMap::new();
+		networks_config.insert(TEST_CHAIN_ID, network);
+		let config = ConfigBuilder::new().networks(networks_config).build();
+		let solver = build_solver_engine(config.clone(), delivery_map);
+
+		let result = super::ensure_user_capacity_for_order(
+			&solver,
+			&config,
+			LockType::ResourceLock,
+			&standard_order,
+		)
+		.await;
+
+		match result {
+			Err(APIError::BadRequest { message, .. }) => {
+				assert!(message.contains("TheCompact address not configured"));
+			},
+			_ => panic!("expected TheCompact address not configured error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_ensure_user_capacity_contract_call_fails() {
+		let amount = U256::from(500u64);
+		let token_id = U256::from(123u64);
+		let standard_order = build_standard_order(TEST_CHAIN_ID, token_id, amount);
+
+		// Don't set any contract response, so contract_call will fail
+		let delivery = Arc::new(TestDelivery::new(HashMap::new(), HashMap::new()))
+			as Arc<dyn DeliveryInterface>;
+		let mut delivery_map = HashMap::new();
+		delivery_map.insert(TEST_CHAIN_ID, delivery);
+
+		let config = build_config(TEST_CHAIN_ID, TEST_COMPACT);
+		let solver = build_solver_engine(config.clone(), delivery_map);
+
+		let result = super::ensure_user_capacity_for_order(
+			&solver,
+			&config,
+			LockType::ResourceLock,
+			&standard_order,
+		)
+		.await;
+
+		match result {
+			Err(APIError::BadRequest { message, .. }) => {
+				assert!(message.contains("Failed to query TheCompact deposit"));
+			},
+			_ => panic!("expected contract call failure error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_ensure_user_capacity_invalid_response_length() {
+		let amount = U256::from(500u64);
+		let token_id = U256::from(123u64);
+		let standard_order = build_standard_order(TEST_CHAIN_ID, token_id, amount);
+
+		let mut contract_responses = HashMap::new();
+		// Return invalid response with wrong length (not 32 bytes)
+		contract_responses.insert(TEST_CHAIN_ID, vec![0u8; 16]);
+
+		let delivery = Arc::new(TestDelivery::new(HashMap::new(), contract_responses))
+			as Arc<dyn DeliveryInterface>;
+		let mut delivery_map = HashMap::new();
+		delivery_map.insert(TEST_CHAIN_ID, delivery);
+
+		let config = build_config(TEST_CHAIN_ID, TEST_COMPACT);
+		let solver = build_solver_engine(config.clone(), delivery_map);
+
+		let result = super::ensure_user_capacity_for_order(
+			&solver,
+			&config,
+			LockType::ResourceLock,
+			&standard_order,
+		)
+		.await;
+
+		match result {
+			Err(APIError::BadRequest { message, .. }) => {
+				assert!(message.contains("Unexpected TheCompact balanceOf response length"));
+			},
+			_ => panic!("expected invalid response length error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_ensure_user_capacity_wallet_balance_fetch_fails() {
+		let amount = U256::from(500u64);
+		let token_u256 = token_to_u256(parse_alloy_address(TEST_TOKEN));
+		let standard_order = build_standard_order(TEST_CHAIN_ID, token_u256, amount);
+
+		// Don't set any balance, so get_balance will fail
+		let delivery = Arc::new(TestDelivery::new(HashMap::new(), HashMap::new()))
+			as Arc<dyn DeliveryInterface>;
+		let mut delivery_map = HashMap::new();
+		delivery_map.insert(TEST_CHAIN_ID, delivery);
+
+		let config = build_config(TEST_CHAIN_ID, TEST_COMPACT);
+		let solver = build_solver_engine(config.clone(), delivery_map);
+
+		let result = super::ensure_user_capacity_for_order(
+			&solver,
+			&config,
+			LockType::Permit2Escrow,
+			&standard_order,
+		)
+		.await;
+
+		match result {
+			Err(APIError::BadRequest { message, .. }) => {
+				assert!(message.contains("Failed to fetch user balance"));
+			},
+			_ => panic!("expected balance fetch failure error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_ensure_user_capacity_wallet_balance_parse_fails() {
+		let amount = U256::from(500u64);
+		let token_u256 = token_to_u256(parse_alloy_address(TEST_TOKEN));
+		let standard_order = build_standard_order(TEST_CHAIN_ID, token_u256, amount);
+
+		let mut balances = HashMap::new();
+		let user_hex = hex::encode(parse_alloy_address(TEST_USER).as_slice());
+		let token_hex = hex::encode(parse_alloy_address(TEST_TOKEN).as_slice());
+		// Set invalid balance string that can't be parsed
+		balances.insert(
+			(TEST_CHAIN_ID, user_hex, Some(token_hex)),
+			"not_a_number".to_string(),
+		);
+
+		let delivery =
+			Arc::new(TestDelivery::new(balances, HashMap::new())) as Arc<dyn DeliveryInterface>;
+		let mut delivery_map = HashMap::new();
+		delivery_map.insert(TEST_CHAIN_ID, delivery);
+
+		let config = build_config(TEST_CHAIN_ID, TEST_COMPACT);
+		let solver = build_solver_engine(config.clone(), delivery_map);
+
+		let result = super::ensure_user_capacity_for_order(
+			&solver,
+			&config,
+			LockType::Permit2Escrow,
+			&standard_order,
+		)
+		.await;
+
+		match result {
+			Err(APIError::BadRequest { message, .. }) => {
+				assert!(message.contains("Failed to parse user balance"));
+			},
+			_ => panic!("expected balance parse failure error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_ensure_user_capacity_zero_amount_skipped() {
+		// Test that zero amounts are skipped and don't cause errors
+		let token_u256 = token_to_u256(parse_alloy_address(TEST_TOKEN));
+		let standard_order = build_standard_order(TEST_CHAIN_ID, token_u256, U256::ZERO);
+
+		// Don't set any balances - if zero amounts weren't skipped, this would fail
+		let delivery = Arc::new(TestDelivery::new(HashMap::new(), HashMap::new()))
+			as Arc<dyn DeliveryInterface>;
+		let mut delivery_map = HashMap::new();
+		delivery_map.insert(TEST_CHAIN_ID, delivery);
+
+		let config = build_config(TEST_CHAIN_ID, TEST_COMPACT);
+		let solver = build_solver_engine(config.clone(), delivery_map);
+
+		// Should succeed because zero amounts are skipped
+		assert!(super::ensure_user_capacity_for_order(
+			&solver,
+			&config,
+			LockType::Permit2Escrow,
+			&standard_order,
+		)
+		.await
+		.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_ensure_user_capacity_resource_lock_zero_amount_skipped() {
+		// Test that zero amounts are skipped for ResourceLock as well
+		let token_id = U256::from(123u64);
+		let standard_order = build_standard_order(TEST_CHAIN_ID, token_id, U256::ZERO);
+
+		// Don't set any contract responses - if zero amounts weren't skipped, this would fail
+		let delivery = Arc::new(TestDelivery::new(HashMap::new(), HashMap::new()))
+			as Arc<dyn DeliveryInterface>;
+		let mut delivery_map = HashMap::new();
+		delivery_map.insert(TEST_CHAIN_ID, delivery);
+
+		let config = build_config(TEST_CHAIN_ID, TEST_COMPACT);
+		let solver = build_solver_engine(config.clone(), delivery_map);
+
+		// Should succeed because zero amounts are skipped
+		assert!(super::ensure_user_capacity_for_order(
+			&solver,
+			&config,
+			LockType::ResourceLock,
+			&standard_order,
+		)
+		.await
+		.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_ensure_user_capacity_decimal_format_balance() {
+		// Test that decimal format balances are also supported (backward compatibility)
+		let amount = U256::from(500u64);
+		let token_u256 = token_to_u256(parse_alloy_address(TEST_TOKEN));
+		let standard_order = build_standard_order(TEST_CHAIN_ID, token_u256, amount);
+
+		let mut balances = HashMap::new();
+		let user_hex = hex::encode(parse_alloy_address(TEST_USER).as_slice());
+		let token_hex = hex::encode(parse_alloy_address(TEST_TOKEN).as_slice());
+		// Use decimal format without 0x prefix
+		balances.insert(
+			(TEST_CHAIN_ID, user_hex, Some(token_hex)),
+			"1000".to_string(),
+		);
+
+		let delivery =
+			Arc::new(TestDelivery::new(balances, HashMap::new())) as Arc<dyn DeliveryInterface>;
+		let mut delivery_map = HashMap::new();
+		delivery_map.insert(TEST_CHAIN_ID, delivery);
+
+		let config = build_config(TEST_CHAIN_ID, TEST_COMPACT);
+		let solver = build_solver_engine(config.clone(), delivery_map);
+
+		// Should succeed with decimal format
+		assert!(super::ensure_user_capacity_for_order(
+			&solver,
+			&config,
+			LockType::Permit2Escrow,
+			&standard_order,
+		)
+		.await
+		.is_ok());
 	}
 }
