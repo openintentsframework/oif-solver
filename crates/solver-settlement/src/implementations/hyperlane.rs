@@ -1147,6 +1147,12 @@ impl SettlementInterface for HyperlaneSettlement {
 		// Extract fill details from order
 		let output = extract_output_details(order)?;
 
+		// Get OutputSettler address (source that can attest)
+		let output_settler = order
+			.output_chains
+			.first()
+			.ok_or_else(|| SettlementError::ValidationFailed("No output chain".into()))?;
+
 		// Convert order ID to bytes32
 		let order_id_bytes = order_id_to_bytes32(&order.id);
 
@@ -1175,30 +1181,65 @@ impl SettlementInterface for HyperlaneSettlement {
 		// Create payloads array with single FillDescription
 		let payloads = vec![fill_description];
 
-		// Get OutputSettler address (source that can attest)
-		let output_settler = order
-			.output_chains
-			.first()
-			.ok_or_else(|| SettlementError::ValidationFailed("No output chain".into()))?;
-
 		// Calculate gas limit based on actual payload size
 		let total_payload_size: usize = payloads.iter().map(|p| p.len()).sum();
 		let gas_limit = self.calculate_message_gas_limit(total_payload_size);
 
-		// Estimate gas payment with correct payloads
-		// Pass solver address to ensure correct msg.sender in eth_call
-		let gas_payment = self
-			.estimate_gas_payment(
-				dest_chain,
-				origin_chain as u32,
-				recipient_oracle.clone(),
-				gas_limit,
-				vec![], // No custom metadata
-				output_settler.settler_address.clone(),
-				payloads.clone(),
-				order.solver_address.clone(), // Solver address for msg.sender
-			)
-			.await?;
+		// Smart retry: Attempt gas payment estimation with exponential backoff
+		// This adapts to RPC speed - retries when fill state isn't propagated yet
+		// The contract will revert with "NotAllPayloadsValid" if the fill isn't visible yet
+		const MAX_ATTEMPTS: u32 = 8;
+		const INITIAL_DELAY_MS: u64 = 300;
+		
+		let mut gas_payment = None;
+		for attempt in 1..=MAX_ATTEMPTS {
+			match self
+				.estimate_gas_payment(
+					dest_chain,
+					origin_chain as u32,
+					recipient_oracle.clone(),
+					gas_limit,
+					vec![], // No custom metadata
+					output_settler.settler_address.clone(),
+					payloads.clone(),
+					order.solver_address.clone(), // Solver address for msg.sender
+				)
+				.await
+			{
+				Ok(payment) => {
+					if attempt > 1 {
+						tracing::info!(
+							order_id = %solver_types::utils::formatting::truncate_id(&order.id),
+							attempt,
+							"Gas payment quote succeeded after retry"
+						);
+					}
+					gas_payment = Some(payment);
+					break;
+				},
+				Err(e) => {
+					if attempt < MAX_ATTEMPTS {
+						// Exponential backoff: 300ms, 600ms, 1200ms, 2400ms, 4800ms...
+						let delay = INITIAL_DELAY_MS * 2_u64.pow(attempt - 1);
+						tracing::debug!(
+							order_id = %solver_types::utils::formatting::truncate_id(&order.id),
+							attempt,
+							delay_ms = delay,
+							error = %e,
+							"Gas payment quote failed, retrying after delay"
+						);
+						tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+					} else {
+						// Final attempt failed
+						return Err(e);
+					}
+				},
+			}
+		}
+		
+		let gas_payment = gas_payment.ok_or_else(|| {
+			SettlementError::ValidationFailed("Failed to get gas payment after all retries".to_string())
+		})?;
 
 		// Build submit call with correct payloads
 		let call_data = IHyperlaneOracle::submit_0Call {
