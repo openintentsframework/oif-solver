@@ -3044,7 +3044,9 @@ mod tests {
 		let result = generator.generate_quotes(&request, &config).await;
 
 		// Should fail due to no supported settlement mechanism on invalid chain
-		assert!(matches!(result, Err(QuoteError::UnsupportedSettlement(_))));
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedSettlement(msg)) if msg.contains("No supported settlement mechanism available for this token"))
+		);
 	}
 
 	#[tokio::test]
