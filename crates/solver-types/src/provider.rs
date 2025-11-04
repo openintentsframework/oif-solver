@@ -318,6 +318,7 @@ mod tests {
 				crate::parse_address("0x00000000000c2e074ec69a0dfb2997ba6c7d2e1f").unwrap(),
 			),
 			allocator_address: None,
+			rpc_indexing_delay_seconds: 2,
 		};
 
 		let mut networks = std::collections::HashMap::new();

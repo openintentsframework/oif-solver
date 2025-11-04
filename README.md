@@ -85,12 +85,12 @@ sequenceDiagram
 The solver manages orders through distinct transaction states with the following progression:
 
 1. **Prepare** → Status: `Executing` (emits `OrderEvent::Executing`)
-2. **Fill** → Status: `Executed` (emits `SettlementEvent::PostFillReady`)
-3. **PostFill** → Status: `PostFilled` (emits `SettlementEvent::StartMonitoring`)
+2. **Fill** → Status: `Executed` (emits `SettlementEvent::StartFillMonitoring`)
+3. **PostFill** → Status: `PostFilled` (emits `SettlementEvent::StartClaimMonitoring`)
 4. **PreClaim** → Status: `PreClaimed` (emits `SettlementEvent::ClaimReady`)
 5. **Claim** → Status: `Finalized` (emits `SettlementEvent::Completed`)
 
-Each transition updates the order status in storage and triggers appropriate events for downstream processing.
+Each transition updates the order status in storage and triggers appropriate events for downstream processing. The `StartFillMonitoring` event triggers an RPC indexing delay before emitting `PostFillReady`, while `StartClaimMonitoring` initiates oracle attestation monitoring.
 
 ## Architecture
 

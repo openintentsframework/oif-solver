@@ -63,8 +63,8 @@ impl TransactionHandler {
 	///
 	/// Routes to the appropriate handler based on transaction type:
 	/// - Prepare: Updates status to Executing and emits OrderEvent::Executing
-	/// - Fill: Updates status to Executed and emits SettlementEvent::PostFillReady
-	/// - PostFill: Updates status to PostFilled and emits SettlementEvent::StartMonitoring
+	/// - Fill: Updates status to Executed and emits SettlementEvent::StartFillMonitoring
+	/// - PostFill: Updates status to PostFilled and emits SettlementEvent::StartClaimMonitoring
 	/// - PreClaim: Updates status to PreClaimed and emits SettlementEvent::ClaimReady
 	/// - Claim: Updates status to Finalized and emits SettlementEvent::Completed
 	#[instrument(skip_all, fields(order_id = %truncate_id(&order_id), tx_type = ?tx_type))]
@@ -184,14 +184,19 @@ impl TransactionHandler {
 
 	/// Handles confirmed fill transactions.
 	///
-	/// Updates status to Executed and emits PostFillReady event to trigger
-	/// post-fill transaction generation if needed.
+	/// Updates status to Executed and emits StartFillMonitoring event to trigger
+	/// RPC indexing delay before post-fill processing.
 	async fn handle_fill_confirmed(
 		&self,
-		_tx_hash: TransactionHash,
+		tx_hash: TransactionHash,
 		order: Order,
 	) -> Result<(), TransactionError> {
-		let order_id = order.id;
+		let order_id = order.id.clone();
+		let chain_id = order
+			.output_chains
+			.first()
+			.map(|c| c.chain_id)
+			.ok_or_else(|| TransactionError::State("No output chains in order".to_string()))?;
 
 		// Update status from Executing to Executed (fill completed)
 		self.state_machine
@@ -199,11 +204,15 @@ impl TransactionHandler {
 			.await
 			.map_err(|e| TransactionError::State(e.to_string()))?;
 
-		// Emit PostFillReady event - handler will determine if transaction needed
+		// Emit StartFillMonitoring event - handler will wait for RPC indexing
 		self.event_bus
-			.publish(SolverEvent::Settlement(SettlementEvent::PostFillReady {
-				order_id,
-			}))
+			.publish(SolverEvent::Settlement(
+				SettlementEvent::StartFillMonitoring {
+					order_id,
+					fill_tx_hash: tx_hash,
+					chain_id,
+				},
+			))
 			.ok();
 
 		Ok(())
@@ -211,7 +220,7 @@ impl TransactionHandler {
 
 	/// Handles confirmed post-fill transactions.
 	///
-	/// Updates status to PostFilled and emits StartMonitoring event to begin
+	/// Updates status to PostFilled and emits StartClaimMonitoring event to begin
 	/// monitoring for settlement readiness.
 	async fn handle_post_fill_confirmed(
 		&self,
@@ -233,10 +242,12 @@ impl TransactionHandler {
 			.ok_or_else(|| TransactionError::Service("Missing fill transaction hash: required for post-fill transaction processing and settlement monitoring".into()))?;
 
 		self.event_bus
-			.publish(SolverEvent::Settlement(SettlementEvent::StartMonitoring {
-				order_id,
-				fill_tx_hash,
-			}))
+			.publish(SolverEvent::Settlement(
+				SettlementEvent::StartClaimMonitoring {
+					order_id,
+					fill_tx_hash,
+				},
+			))
 			.ok();
 
 		Ok(())
@@ -591,13 +602,19 @@ mod tests {
 
 		assert!(result.is_ok());
 
-		// Should emit PostFillReady event
+		// Should emit StartFillMonitoring event
 		let event = receiver.recv().await.unwrap();
 		match event {
-			SolverEvent::Settlement(SettlementEvent::PostFillReady { order_id }) => {
+			SolverEvent::Settlement(SettlementEvent::StartFillMonitoring {
+				order_id,
+				fill_tx_hash,
+				chain_id,
+			}) => {
 				assert_eq!(order_id, "test_order_123");
+				assert_eq!(fill_tx_hash, TransactionHash(vec![0x11; 32]));
+				assert_eq!(chain_id, 137);
 			},
-			_ => panic!("Expected PostFillReady event, got: {:?}", event),
+			_ => panic!("Expected StartFillMonitoring event, got: {:?}", event),
 		}
 
 		// Verify order status was updated to Executed by checking the state machine
@@ -676,17 +693,17 @@ mod tests {
 
 		assert!(result.is_ok());
 
-		// Should emit StartMonitoring event
+		// Should emit StartClaimMonitoring event
 		let event = receiver.recv().await.unwrap();
 		match event {
-			SolverEvent::Settlement(SettlementEvent::StartMonitoring {
+			SolverEvent::Settlement(SettlementEvent::StartClaimMonitoring {
 				order_id,
 				fill_tx_hash,
 			}) => {
 				assert_eq!(order_id, "test_order_123");
 				assert_eq!(fill_tx_hash, TransactionHash(vec![0xab; 32]));
 			},
-			_ => panic!("Expected StartMonitoring event, got: {:?}", event),
+			_ => panic!("Expected StartClaimMonitoring event, got: {:?}", event),
 		}
 
 		// Verify order status was updated to PostFilled

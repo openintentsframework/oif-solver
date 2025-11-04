@@ -591,10 +591,12 @@ impl RecoveryService {
 				// Emit event to spawn settlement monitor
 				if let Some(fill_tx_hash) = order.fill_tx_hash.clone() {
 					self.event_bus
-						.publish(SolverEvent::Settlement(SettlementEvent::StartMonitoring {
-							order_id: order.id.clone(),
-							fill_tx_hash,
-						}))
+						.publish(SolverEvent::Settlement(
+							SettlementEvent::StartClaimMonitoring {
+								order_id: order.id.clone(),
+								fill_tx_hash,
+							},
+						))
 						.ok();
 				}
 			},
@@ -618,7 +620,7 @@ impl RecoveryService {
 						if let Some(fill_tx_hash) = order.fill_tx_hash.clone() {
 							self.event_bus
 								.publish(SolverEvent::Settlement(
-									SettlementEvent::StartMonitoring {
+									SettlementEvent::StartClaimMonitoring {
 										order_id: order.id.clone(),
 										fill_tx_hash,
 									},
@@ -632,10 +634,12 @@ impl RecoveryService {
 					// Start monitoring to get the proof
 					if let Some(fill_tx_hash) = order.fill_tx_hash.clone() {
 						self.event_bus
-							.publish(SolverEvent::Settlement(SettlementEvent::StartMonitoring {
-								order_id: order.id.clone(),
-								fill_tx_hash,
-							}))
+							.publish(SolverEvent::Settlement(
+								SettlementEvent::StartClaimMonitoring {
+									order_id: order.id.clone(),
+									fill_tx_hash,
+								},
+							))
 							.ok();
 					}
 				}
@@ -657,7 +661,7 @@ impl RecoveryService {
 						if let Some(fill_tx_hash) = order.fill_tx_hash.clone() {
 							self.event_bus
 								.publish(SolverEvent::Settlement(
-									SettlementEvent::StartMonitoring {
+									SettlementEvent::StartClaimMonitoring {
 										order_id: order.id.clone(),
 										fill_tx_hash,
 									},
@@ -669,10 +673,12 @@ impl RecoveryService {
 					// No proof yet, emit event to spawn monitor to get it
 					if let Some(fill_tx_hash) = order.fill_tx_hash.clone() {
 						self.event_bus
-							.publish(SolverEvent::Settlement(SettlementEvent::StartMonitoring {
-								order_id: order.id.clone(),
-								fill_tx_hash,
-							}))
+							.publish(SolverEvent::Settlement(
+								SettlementEvent::StartClaimMonitoring {
+									order_id: order.id.clone(),
+									fill_tx_hash,
+								},
+							))
 							.ok();
 					}
 				}
@@ -1248,7 +1254,7 @@ mod tests {
 		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
 
 		// Create empty settlement service - this will cause can_claim to return false,
-		// which should trigger spawn_settlement_monitor instead of publishing ClaimReady
+		// which should trigger spawn_claim_readiness_monitor instead of publishing ClaimReady
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));

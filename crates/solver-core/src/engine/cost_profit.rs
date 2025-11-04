@@ -1721,6 +1721,7 @@ mod tests {
 			input_settler_compact_address: None,
 			the_compact_address: None,
 			allocator_address: None,
+			rpc_indexing_delay_seconds: 2,
 		};
 		networks.insert(1, network_1);
 
@@ -1743,6 +1744,7 @@ mod tests {
 			input_settler_compact_address: None,
 			the_compact_address: None,
 			allocator_address: None,
+			rpc_indexing_delay_seconds: 2,
 		};
 		networks.insert(137, network_137);
 
@@ -1898,6 +1900,7 @@ mod tests {
 			input_settler_compact_address: None,
 			the_compact_address: None,
 			allocator_address: None,
+			rpc_indexing_delay_seconds: 2,
 		};
 		networks.insert(1, network_1);
 
@@ -1920,6 +1923,7 @@ mod tests {
 			input_settler_compact_address: None,
 			the_compact_address: None,
 			allocator_address: None,
+			rpc_indexing_delay_seconds: 2,
 		};
 		networks.insert(137, network_137);
 

@@ -52,6 +52,14 @@ impl RpcEndpoint {
 	}
 }
 
+/// Default RPC indexing delay in seconds.
+///
+/// This is the time to wait after a transaction is confirmed before
+/// attempting to read its state, to allow load-balanced RPC nodes to index it.
+fn default_rpc_indexing_delay_seconds() -> u64 {
+	2
+}
+
 /// Configuration for a token on a specific network.
 ///
 /// Defines the essential properties of a token that the solver needs
@@ -80,6 +88,7 @@ pub struct TokenConfig {
 /// * `input_settler_address` - Address of the input settler contract (for origin chains)
 /// * `output_settler_address` - Address of the output settler contract (for destination chains)
 /// * `tokens` - List of supported tokens on this network
+/// * `rpc_indexing_delay_seconds` - Delay in seconds to wait for RPC indexing after transaction confirmation
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NetworkConfig {
 	pub rpc_urls: Vec<RpcEndpoint>,
@@ -94,6 +103,12 @@ pub struct NetworkConfig {
 	/// Optional allocator address for TheCompact resource locks
 	#[serde(default)]
 	pub allocator_address: Option<Address>,
+	/// Delay in seconds to wait for RPC indexing after transaction confirmation.
+	/// This prevents failures when calling hasAttested() on load-balanced public RPCs
+	/// where different backend nodes may have different indexing states.
+	/// Defaults to 2 seconds if not specified.
+	#[serde(default = "default_rpc_indexing_delay_seconds")]
+	pub rpc_indexing_delay_seconds: u64,
 }
 
 impl NetworkConfig {

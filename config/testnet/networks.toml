@@ -4,6 +4,7 @@ output_settler_address = "0x923aa6CC898540092616f97cA770FFb8080354Fc"
 input_settler_compact_address = "0x086e28545bB8494C6041225922A705877AE5362A"
 the_compact_address = "0x00000000000000171ede64904551eedf3c6c9788"
 allocator_address = "0x565466528d126141ddb5c7d558803f79d9b66a6d"
+rpc_indexing_delay_seconds = 2
 
 
 [[networks.11155420.rpc_urls]]
@@ -20,6 +21,7 @@ output_settler_address = "0xC450A11afb68731833BE13225A88ecdad7D7Ed52"
 input_settler_compact_address = "0xa7B995442F909849F96B5ED07ff7f58E57a41fc9"
 the_compact_address = "0x00000000000000171ede64904551eedf3c6c9788"
 allocator_address = "0x04bb6e565f0067e0411528e2d3a55a712d9a8b32"
+rpc_indexing_delay_seconds = 2
 
 [[networks.84532.rpc_urls]]
 http = "https://sepolia.base.org"

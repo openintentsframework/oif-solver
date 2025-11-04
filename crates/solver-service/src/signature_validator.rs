@@ -366,6 +366,7 @@ mod tests {
 			input_settler_compact_address: Some(address_from_hex(compact_settler_hex)),
 			the_compact_address: Some(address_from_hex(the_compact_address_hex)),
 			allocator_address: None,
+			rpc_indexing_delay_seconds: 2,
 		};
 
 		let mut networks = NetworksConfig::new();

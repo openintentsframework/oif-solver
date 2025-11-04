@@ -823,6 +823,7 @@ impl HyperlaneSettlement {
 	}
 
 	#[allow(clippy::too_many_arguments)]
+	/// Estimate gas payment for a Hyperlane message
 	async fn estimate_gas_payment(
 		&self,
 		oracle_chain: u64, // Chain where the oracle is deployed (where we're calling from)
@@ -874,37 +875,12 @@ impl HyperlaneSettlement {
 		};
 
 		// Make the eth_call to get the quote with timing
-		let start = std::time::Instant::now();
 		let result = provider.call(call_request).await.map_err(|e| {
-			let duration = start.elapsed();
-			tracing::error!(
-				oracle_chain,
-				destination_chain,
-				oracle = %hex::encode(&oracle_address.0),
-				from = %hex::encode(&from.0),
-				recipient = %hex::encode(&recipient_oracle.0),
-				source = %hex::encode(&source.0),
-				gas_limit = %gas_limit,
-				duration_ms = duration.as_millis(),
-				error = %e,
-				"❌ quoteGasPayment FAILED"
-			);
 			SettlementError::ValidationFailed(format!("Failed to quote gas payment: {}", e))
 		})?;
 
-		let duration = start.elapsed();
-
 		// Decode the result
 		let quote = U256::from_be_slice(&result);
-
-		// Log success with timing for diagnostics (debug mode only)
-		tracing::debug!(
-			oracle_chain,
-			destination_chain,
-			quote = %quote,
-			duration_ms = duration.as_millis(),
-			"quoteGasPayment success"
-		);
 
 		// Return quote without buffer - the quote already includes IGP overhead
 		Ok(quote)

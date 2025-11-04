@@ -175,6 +175,7 @@ impl SolverEngine {
 			storage.clone(),
 			state_machine.clone(),
 			event_bus.clone(),
+			config.networks.clone(),
 			config.solver.monitoring_timeout_seconds / 60, // Convert seconds to minutes
 		));
 
@@ -467,24 +468,43 @@ impl SolverEngine {
 							.await;
 						}
 
-						// Handle StartMonitoring - spawn settlement monitor
-						SolverEvent::Settlement(SettlementEvent::StartMonitoring { order_id, fill_tx_hash }) => {
-							// Retrieve order
-							let order: Order = match self.storage
-								.retrieve(StorageKey::Orders.as_str(), &order_id)
-								.await
-							{
-								Ok(order) => order,
-								Err(e) => {
-									tracing::error!("Failed to retrieve order {}: {}", order_id, e);
-									EngineError::Service(format!("Failed to retrieve order {}: {}", order_id, e));
-									continue;
-								}
-							};
+					// Handle StartFillMonitoring - spawn fill readiness monitor
+					SolverEvent::Settlement(SettlementEvent::StartFillMonitoring { order_id, fill_tx_hash: _, chain_id }) => {
+						// Retrieve order
+						let order: Order = match self.storage
+							.retrieve(StorageKey::Orders.as_str(), &order_id)
+							.await
+						{
+							Ok(order) => order,
+							Err(e) => {
+								tracing::error!("Failed to retrieve order {}: {}", order_id, e);
+								EngineError::Service(format!("Failed to retrieve order {}: {}", order_id, e));
+								continue;
+							}
+						};
 
-							// Spawn monitor directly (it handles its own tokio::spawn internally)
-							self.settlement_handler.spawn_settlement_monitor(order, fill_tx_hash);
-						}
+						// Spawn fill readiness monitor (waits for RPC indexing)
+						self.settlement_handler.spawn_fill_readiness_monitor(order, chain_id);
+					}
+
+					// Handle StartClaimMonitoring - spawn claim readiness monitor
+					SolverEvent::Settlement(SettlementEvent::StartClaimMonitoring { order_id, fill_tx_hash }) => {
+						// Retrieve order
+						let order: Order = match self.storage
+							.retrieve(StorageKey::Orders.as_str(), &order_id)
+							.await
+						{
+							Ok(order) => order,
+							Err(e) => {
+								tracing::error!("Failed to retrieve order {}: {}", order_id, e);
+								EngineError::Service(format!("Failed to retrieve order {}: {}", order_id, e));
+								continue;
+							}
+						};
+
+						// Spawn claim readiness monitor (monitors oracle attestations)
+						self.settlement_handler.spawn_claim_readiness_monitor(order, fill_tx_hash);
+					}
 
 						SolverEvent::Settlement(SettlementEvent::ClaimReady { order_id }) => {
 							claim_batch.push(order_id);

@@ -8,7 +8,7 @@ use crate::engine::event_bus::EventBus;
 use crate::state::OrderStateMachine;
 use solver_settlement::SettlementService;
 use solver_types::{
-	truncate_id, Order, OrderStatus, SettlementEvent, SolverEvent, TransactionHash,
+	truncate_id, NetworksConfig, Order, OrderStatus, SettlementEvent, SolverEvent, TransactionHash,
 };
 use std::sync::Arc;
 
@@ -115,6 +115,47 @@ impl SettlementMonitor {
 			// Wait before next check
 			tokio::time::sleep(check_interval).await;
 		}
+	}
+
+	/// Monitors fill transaction for RPC indexing readiness.
+	///
+	/// Waits for RPC nodes to index the fill transaction before emitting
+	/// PostFillReady event. This prevents failures when calling hasAttested()
+	/// on load-balanced public RPCs where different backend nodes may have
+	/// different indexing states.
+	pub async fn monitor_fill_readiness(
+		&self,
+		order: Order,
+		chain_id: u64,
+		networks_config: NetworksConfig,
+	) {
+		// Get RPC indexing delay for this network
+		let delay_seconds = networks_config
+			.get(&chain_id)
+			.map(|config| config.rpc_indexing_delay_seconds)
+			.unwrap_or(2); // Default to 2 seconds
+
+		tracing::debug!(
+			order_id = %truncate_id(&order.id),
+			chain_id = chain_id,
+			delay_seconds = delay_seconds,
+			"Waiting for RPC indexing before PostFillReady"
+		);
+
+		// Wait for RPC nodes to index the fill transaction
+		tokio::time::sleep(tokio::time::Duration::from_secs(delay_seconds)).await;
+
+		// Emit PostFillReady event
+		self.event_bus
+			.publish(SolverEvent::Settlement(SettlementEvent::PostFillReady {
+				order_id: order.id.clone(),
+			}))
+			.ok();
+
+		tracing::debug!(
+			order_id = %truncate_id(&order.id),
+			"PostFillReady emitted after RPC indexing delay"
+		);
 	}
 }
 

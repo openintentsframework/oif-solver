@@ -94,12 +94,21 @@ pub enum SettlementEvent {
 	},
 	/// Fill proof has been generated and is ready.
 	ProofReady { order_id: String, proof: FillProof },
-	/// Emitted after Fill confirmation to trigger post-fill processing.
+	/// Start monitoring for RPC indexing after fill confirmation.
+	/// Waits for load-balanced RPC nodes to index the fill transaction
+	/// before emitting PostFillReady.
+	StartFillMonitoring {
+		order_id: String,
+		fill_tx_hash: TransactionHash,
+		chain_id: u64,
+	},
+	/// Emitted after Fill confirmation and RPC indexing delay to trigger post-fill processing.
 	PostFillReady { order_id: String },
 	/// Emitted when ready for pre-claim processing.
 	PreClaimReady { order_id: String },
-	/// Start monitoring for settlement readiness.
-	StartMonitoring {
+	/// Start monitoring for claim readiness after post-fill confirmation.
+	/// Monitors oracle attestations and claim conditions.
+	StartClaimMonitoring {
 		order_id: String,
 		fill_tx_hash: TransactionHash,
 	},

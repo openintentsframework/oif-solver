@@ -13,8 +13,8 @@ use solver_order::OrderService;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
 use solver_types::{
-	truncate_id, DeliveryEvent, Order, SettlementEvent, SolverEvent, StorageKey, TransactionHash,
-	TransactionType,
+	truncate_id, DeliveryEvent, NetworksConfig, Order, SettlementEvent, SolverEvent, StorageKey,
+	TransactionHash, TransactionType,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -37,6 +37,7 @@ pub enum SettlementError {
 /// Handler for processing settlement operations.
 ///
 /// The SettlementHandler manages the complete settlement lifecycle including:
+/// - Fill readiness monitoring (RPC indexing delays)
 /// - Post-fill transaction generation and submission (e.g., oracle attestation requests)
 /// - Pre-claim transaction generation and submission (e.g., oracle signature submission)
 /// - Claim transaction batch processing for reward collection
@@ -48,10 +49,12 @@ pub struct SettlementHandler {
 	storage: Arc<StorageService>,
 	state_machine: Arc<OrderStateMachine>,
 	event_bus: EventBus,
+	networks_config: NetworksConfig,
 	monitoring_timeout_minutes: u64,
 }
 
 impl SettlementHandler {
+	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		settlement: Arc<SettlementService>,
 		order_service: Arc<OrderService>,
@@ -59,6 +62,7 @@ impl SettlementHandler {
 		storage: Arc<StorageService>,
 		state_machine: Arc<OrderStateMachine>,
 		event_bus: EventBus,
+		networks_config: NetworksConfig,
 		monitoring_timeout_minutes: u64,
 	) -> Self {
 		Self {
@@ -68,12 +72,37 @@ impl SettlementHandler {
 			storage,
 			state_machine,
 			event_bus,
+			networks_config,
 			monitoring_timeout_minutes,
 		}
 	}
 
-	/// Helper method to spawn settlement monitoring task.
-	pub fn spawn_settlement_monitor(&self, order: Order, fill_tx_hash: TransactionHash) {
+	/// Helper method to spawn fill readiness monitoring task.
+	///
+	/// Spawns a monitor that waits for RPC indexing before emitting PostFillReady event.
+	/// This prevents failures when calling hasAttested() on load-balanced public RPCs
+	/// where different backend nodes may have different indexing states.
+	pub fn spawn_fill_readiness_monitor(&self, order: Order, chain_id: u64) {
+		let monitor = SettlementMonitor::new(
+			self.settlement.clone(),
+			self.state_machine.clone(),
+			self.event_bus.clone(),
+			self.monitoring_timeout_minutes,
+		);
+		let networks_config = self.networks_config.clone();
+
+		tokio::spawn(async move {
+			monitor
+				.monitor_fill_readiness(order, chain_id, networks_config)
+				.await;
+		});
+	}
+
+	/// Helper method to spawn claim readiness monitoring task.
+	///
+	/// Spawns a monitor that polls for oracle attestations and claim conditions
+	/// until the order is ready to be claimed.
+	pub fn spawn_claim_readiness_monitor(&self, order: Order, fill_tx_hash: TransactionHash) {
 		let monitor = SettlementMonitor::new(
 			self.settlement.clone(),
 			self.state_machine.clone(),
@@ -89,12 +118,6 @@ impl SettlementHandler {
 	/// Handles PostFillReady event by generating and submitting PostFill transaction if needed.
 	#[instrument(skip_all, fields(order_id = %truncate_id(&order_id)))]
 	pub async fn handle_post_fill_ready(&self, order_id: String) -> Result<(), SettlementError> {
-		// Small delay to allow fill state to propagate across RPC nodes
-		// This prevents intermittent failures when using public/load-balanced RPCs
-		// where different backend nodes may not have the latest block indexed yet
-		// Increased to 2000ms (2s) for better reliability with public RPCs
-		tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
-
 		// Retrieve the order
 		let order: Order = self
 			.storage
@@ -225,10 +248,12 @@ impl SettlementHandler {
 				})?;
 
 				self.event_bus
-					.publish(SolverEvent::Settlement(SettlementEvent::StartMonitoring {
-						order_id,
-						fill_tx_hash,
-					}))
+					.publish(SolverEvent::Settlement(
+						SettlementEvent::StartClaimMonitoring {
+							order_id,
+							fill_tx_hash,
+						},
+					))
 					.ok();
 			},
 		}
@@ -551,6 +576,7 @@ mod tests {
 			storage,
 			state_machine,
 			event_bus,
+			solver_types::NetworksConfig::new(), // Empty networks config for tests
 			30,
 		);
 

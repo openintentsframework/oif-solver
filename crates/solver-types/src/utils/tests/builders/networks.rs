@@ -320,7 +320,8 @@ impl NetworkConfigBuilder {
 			tokens: self.tokens,
 			input_settler_compact_address: self.input_settler_compact_address,
 			the_compact_address: self.the_compact_address,
-			allocator_address: None, // Default to None for tests
+			allocator_address: None,       // Default to None for tests
+			rpc_indexing_delay_seconds: 2, // Default to 2 seconds for tests
 		})
 	}
 }
