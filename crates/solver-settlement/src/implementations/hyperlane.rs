@@ -1190,7 +1190,7 @@ impl SettlementInterface for HyperlaneSettlement {
 		// The contract will revert with "NotAllPayloadsValid" if the fill isn't visible yet
 		const MAX_ATTEMPTS: u32 = 8;
 		const INITIAL_DELAY_MS: u64 = 300;
-		
+
 		let mut gas_payment = None;
 		for attempt in 1..=MAX_ATTEMPTS {
 			match self
@@ -1236,9 +1236,11 @@ impl SettlementInterface for HyperlaneSettlement {
 				},
 			}
 		}
-		
+
 		let gas_payment = gas_payment.ok_or_else(|| {
-			SettlementError::ValidationFailed("Failed to get gas payment after all retries".to_string())
+			SettlementError::ValidationFailed(
+				"Failed to get gas payment after all retries".to_string(),
+			)
 		})?;
 
 		// Build submit call with correct payloads
