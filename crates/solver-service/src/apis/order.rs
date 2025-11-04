@@ -570,4 +570,576 @@ mod tests {
 			Some("pending")
 		);
 	}
+
+	#[tokio::test]
+	async fn test_validate_order_id_empty() {
+		let result = validate_order_id("");
+		match result {
+			Err(GetOrderError::InvalidId(msg)) => {
+				assert_eq!(msg, "Order ID cannot be empty");
+			},
+			_ => panic!("Expected InvalidId error for empty order ID"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_id_valid() {
+		assert!(validate_order_id("valid-order-id").is_ok());
+		assert!(validate_order_id("0x1234567890abcdef").is_ok());
+		assert!(validate_order_id("order_with_underscores").is_ok());
+		assert!(validate_order_id("123456789").is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_get_order_by_id_with_jwt_claims() {
+		let mut backend = MockStorageInterface::new();
+		let order = create_test_eip7683_order("order-auth", OrderStatus::Executed);
+
+		let bytes = serde_json::to_vec(&order).unwrap();
+		let bytes = std::sync::Arc::new(bytes);
+		backend
+			.expect_get_bytes()
+			.with(eq("orders:0xorder-auth"))
+			.returning({
+				let bytes = bytes.clone();
+				move |_| {
+					let bytes = bytes.clone();
+					Box::pin(async move { Ok((*bytes).to_vec()) })
+				}
+			});
+
+		let solver = create_test_solver_engine(backend).await;
+
+		// Create JWT claims for authenticated request
+		let claims = solver_types::JwtClaims {
+			sub: "test-client-id".to_string(),
+			exp: 9999999999, // Far future
+			iat: 1640995200,
+			iss: "test-issuer".to_string(),
+			scope: vec![],
+			nonce: None,
+		};
+
+		let result = get_order_by_id(
+			Path("order-auth".to_string()),
+			&solver,
+			Some(Extension(claims)),
+		)
+		.await;
+
+		assert!(result.is_ok());
+		let response = result.unwrap();
+		assert_eq!(response.order.id, "order-auth");
+	}
+
+	#[tokio::test]
+	async fn test_process_order_request_storage_error() {
+		let mut backend = MockStorageInterface::new();
+		backend
+			.expect_get_bytes()
+			.with(eq("orders:error-order"))
+			.returning(|_| {
+				Box::pin(async move {
+					Err(StorageError::Backend(
+						"Database connection failed".to_string(),
+					))
+				})
+			});
+
+		let solver = create_test_solver_engine(backend).await;
+
+		let result = process_order_request("error-order", &solver).await;
+		match result {
+			Err(GetOrderError::Internal(msg)) => {
+				assert!(msg.contains("Storage error"));
+				assert!(msg.contains("Database connection failed"));
+			},
+			other => panic!("Expected Internal error, got {:?}", other),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_missing_outputs() {
+		let mut order = create_test_eip7683_order("order-missing-outputs", OrderStatus::Executed);
+		order.data = json!({
+			"inputs": [[TEST_ADDR, "1000000000000000000"]]
+		});
+
+		let err = convert_order_to_response(order).await.expect_err("err");
+		match err {
+			GetOrderError::Internal(msg) => assert!(msg.contains("Missing outputs field")),
+			_ => panic!("expected Internal error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_invalid_inputs_format() {
+		let mut order = create_test_eip7683_order("order-invalid-inputs", OrderStatus::Executed);
+		order.data = json!({
+			"inputs": "not-an-array",
+			"outputs": [{
+				"token": [18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52],
+				"amount": "2000000000000000000"
+			}]
+		});
+
+		let err = convert_order_to_response(order).await.expect_err("err");
+		match err {
+			GetOrderError::Internal(msg) => {
+				assert!(msg.contains("Invalid inputs format - expected array"))
+			},
+			_ => panic!("expected Internal error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_invalid_outputs_format() {
+		let mut order = create_test_eip7683_order("order-invalid-outputs", OrderStatus::Executed);
+		order.data = json!({
+			"inputs": [[TEST_ADDR, "1000000000000000000"]],
+			"outputs": "not-an-array"
+		});
+
+		let err = convert_order_to_response(order).await.expect_err("err");
+		match err {
+			GetOrderError::Internal(msg) => {
+				assert!(msg.contains("Invalid outputs format - expected array"))
+			},
+			_ => panic!("expected Internal error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_invalid_input_item_format() {
+		let mut order =
+			create_test_eip7683_order("order-invalid-input-item", OrderStatus::Executed);
+		order.data = json!({
+			"inputs": ["not-an-array"],
+			"outputs": [{
+				"token": [18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52],
+				"amount": "2000000000000000000"
+			}]
+		});
+
+		let err = convert_order_to_response(order).await.expect_err("err");
+		match err {
+			GetOrderError::Internal(msg) => {
+				assert!(msg
+					.contains("Invalid input format at index 0 - expected [token, amount] array"))
+			},
+			_ => panic!("expected Internal error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_wrong_input_array_length() {
+		let mut order =
+			create_test_eip7683_order("order-wrong-input-length", OrderStatus::Executed);
+		order.data = json!({
+			"inputs": [[TEST_ADDR]], // Missing amount
+			"outputs": [{
+				"token": [18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52],
+				"amount": "2000000000000000000"
+			}]
+		});
+
+		let err = convert_order_to_response(order).await.expect_err("err");
+		match err {
+			GetOrderError::Internal(msg) => {
+				assert!(msg.contains("Invalid input format at index 0 - expected [token, amount]"))
+			},
+			_ => panic!("expected Internal error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_invalid_input_token_format() {
+		let mut order =
+			create_test_eip7683_order("order-invalid-input-token", OrderStatus::Executed);
+		order.data = json!({
+			"inputs": [[123, "1000000000000000000"]], // Token should be string
+			"outputs": [{
+				"token": [18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52],
+				"amount": "2000000000000000000"
+			}]
+		});
+
+		let err = convert_order_to_response(order).await.expect_err("err");
+		match err {
+			GetOrderError::Internal(msg) => {
+				assert!(msg.contains("Invalid input token format at index 0"))
+			},
+			_ => panic!("expected Internal error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_invalid_input_amount_format() {
+		let mut order =
+			create_test_eip7683_order("order-invalid-input-amount", OrderStatus::Executed);
+		order.data = json!({
+			"inputs": [[TEST_ADDR, 123]], // Amount should be string
+			"outputs": [{
+				"token": [18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52],
+				"amount": "2000000000000000000"
+			}]
+		});
+
+		let err = convert_order_to_response(order).await.expect_err("err");
+		match err {
+			GetOrderError::Internal(msg) => {
+				assert!(msg.contains("Invalid input amount format at index 0"))
+			},
+			_ => panic!("expected Internal error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_invalid_input_amount_parse() {
+		let mut order =
+			create_test_eip7683_order("order-invalid-input-parse", OrderStatus::Executed);
+		order.data = json!({
+			"inputs": [[TEST_ADDR, "not-a-number"]],
+			"outputs": [{
+				"token": [18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52],
+				"amount": "2000000000000000000"
+			}]
+		});
+
+		let err = convert_order_to_response(order).await.expect_err("err");
+		match err {
+			GetOrderError::Internal(msg) => {
+				assert!(msg.contains("Invalid input amount at index 0"))
+			},
+			_ => panic!("expected Internal error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_no_input_chain_id() {
+		let mut order = create_test_eip7683_order("order-no-input-chain", OrderStatus::Executed);
+		order.input_chains = vec![]; // No input chains
+
+		let err = convert_order_to_response(order).await.expect_err("err");
+		match err {
+			GetOrderError::Internal(msg) => {
+				assert!(msg.contains("No input chain ID found"))
+			},
+			_ => panic!("expected Internal error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_invalid_input_address() {
+		let mut order =
+			create_test_eip7683_order("order-invalid-input-addr", OrderStatus::Executed);
+		order.data = json!({
+			"inputs": [["invalid-address", "1000000000000000000"]],
+			"outputs": [{
+				"token": [18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52],
+				"amount": "2000000000000000000"
+			}]
+		});
+
+		let err = convert_order_to_response(order).await.expect_err("err");
+		match err {
+			GetOrderError::Internal(msg) => {
+				assert!(msg.contains("Invalid input token address at index 0"))
+			},
+			_ => panic!("expected Internal error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_missing_output_token() {
+		let mut order =
+			create_test_eip7683_order("order-missing-output-token", OrderStatus::Executed);
+		order.data = json!({
+			"inputs": [[TEST_ADDR, "1000000000000000000"]],
+			"outputs": [{
+				"amount": "2000000000000000000"
+				// Missing "token" field
+			}]
+		});
+
+		let err = convert_order_to_response(order).await.expect_err("err");
+		match err {
+			GetOrderError::Internal(msg) => {
+				assert!(msg.contains("Missing token field in output at index 0"))
+			},
+			_ => panic!("expected Internal error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_invalid_output_token_format() {
+		let mut order =
+			create_test_eip7683_order("order-invalid-output-token", OrderStatus::Executed);
+		order.data = json!({
+			"inputs": [[TEST_ADDR, "1000000000000000000"]],
+			"outputs": [{
+				"token": "not-an-array",
+				"amount": "2000000000000000000"
+			}]
+		});
+
+		let err = convert_order_to_response(order).await.expect_err("err");
+		match err {
+			GetOrderError::Internal(msg) => {
+				assert!(msg.contains("Invalid token format at index 0 - expected bytes array"))
+			},
+			_ => panic!("expected Internal error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_missing_output_amount() {
+		let mut order =
+			create_test_eip7683_order("order-missing-output-amount", OrderStatus::Executed);
+		order.data = json!({
+			"inputs": [[TEST_ADDR, "1000000000000000000"]],
+			"outputs": [{
+				"token": [18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52]
+				// Missing "amount" field
+			}]
+		});
+
+		let err = convert_order_to_response(order).await.expect_err("err");
+		match err {
+			GetOrderError::Internal(msg) => {
+				assert!(msg.contains("Missing or invalid amount field in output at index 0"))
+			},
+			_ => panic!("expected Internal error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_invalid_output_amount_parse() {
+		let mut order =
+			create_test_eip7683_order("order-invalid-output-parse", OrderStatus::Executed);
+		order.data = json!({
+			"inputs": [[TEST_ADDR, "1000000000000000000"]],
+			"outputs": [{
+				"token": [18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52],
+				"amount": "not-a-number"
+			}]
+		});
+
+		let err = convert_order_to_response(order).await.expect_err("err");
+		match err {
+			GetOrderError::Internal(msg) => {
+				assert!(msg.contains("Invalid output amount at index 0"))
+			},
+			_ => panic!("expected Internal error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_no_output_chain_id() {
+		let mut order = create_test_eip7683_order("order-no-output-chain", OrderStatus::Executed);
+		order.output_chains = vec![]; // No output chains
+
+		let err = convert_order_to_response(order).await.expect_err("err");
+		match err {
+			GetOrderError::Internal(msg) => {
+				assert!(msg.contains("No output chain ID found"))
+			},
+			_ => panic!("expected Internal error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_invalid_output_address() {
+		let mut order =
+			create_test_eip7683_order("order-invalid-output-addr", OrderStatus::Executed);
+		// Create invalid token bytes that will result in invalid address
+		order.data = json!({
+			"inputs": [[TEST_ADDR, "1000000000000000000"]],
+			"outputs": [{
+				"token": [255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255],
+				"amount": "2000000000000000000"
+			}]
+		});
+
+		let result = convert_order_to_response(order).await;
+		// This should still work as bytes32_to_address handles any 32 bytes
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_different_order_statuses() {
+		let test_cases = vec![
+			(OrderStatus::Executing, "pending"),
+			(OrderStatus::PostFilled, "executed"),
+			(OrderStatus::PreClaimed, "executed"),
+			(OrderStatus::Settled, "executed"),
+			(OrderStatus::Finalized, "executed"),
+			(OrderStatus::Pending, "pending"),
+			(
+				OrderStatus::Failed(TransactionType::Fill, "Fill failed".to_string()),
+				"failed",
+			),
+			(
+				OrderStatus::Failed(TransactionType::Prepare, "Prepare failed".to_string()),
+				"failed",
+			),
+			(
+				OrderStatus::Failed(TransactionType::PostFill, "PostFill failed".to_string()),
+				"executed",
+			),
+			(
+				OrderStatus::Failed(TransactionType::PreClaim, "PreClaim failed".to_string()),
+				"executed",
+			),
+			(
+				OrderStatus::Failed(TransactionType::Claim, "Claim failed".to_string()),
+				"executed",
+			),
+		];
+
+		for (status, expected_tx_status) in test_cases {
+			let order = create_test_eip7683_order("order-status-test", status);
+			let resp = convert_order_to_response(order).await.expect("ok");
+
+			if let Some(fill_tx) = resp.fill_transaction {
+				assert_eq!(
+					fill_tx.get("status").and_then(|v| v.as_str()),
+					Some(expected_tx_status),
+					"Status mismatch for {:?}",
+					resp.status
+				);
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_no_fill_transaction() {
+		let mut order = create_test_eip7683_order("order-no-fill-tx", OrderStatus::Created);
+		order.fill_tx_hash = None; // No fill transaction
+
+		let resp = convert_order_to_response(order).await.expect("ok");
+		assert!(resp.fill_transaction.is_none());
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_multiple_inputs_outputs() {
+		let mut order = create_test_eip7683_order("order-multi", OrderStatus::Executed);
+
+		// Add multiple input and output chains
+		order.input_chains = vec![
+			solver_types::ChainSettlerInfo {
+				chain_id: 1,
+				settler_address: addr(),
+			},
+			solver_types::ChainSettlerInfo {
+				chain_id: 2,
+				settler_address: addr(),
+			},
+		];
+		order.output_chains = vec![
+			solver_types::ChainSettlerInfo {
+				chain_id: 3,
+				settler_address: addr(),
+			},
+			solver_types::ChainSettlerInfo {
+				chain_id: 4,
+				settler_address: addr(),
+			},
+		];
+
+		order.data = json!({
+			"inputs": [
+				[TEST_ADDR, "1000000000000000000"],
+				["0x9876543210987654321098765432109876543210", "500000000000000000"]
+			],
+			"outputs": [
+				{
+					"token": [18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52],
+					"amount": "2000000000000000000"
+				},
+				{
+					"token": [19,53,87,121,145,19,53,87,121,145,19,53,87,121,145,19,53,87,121,145,19,53,87,121,145,19,53,87,121,145,19,53],
+					"amount": "1500000000000000000"
+				}
+			],
+			"raw_order_data": {"some":"data"},
+			"signature": "0xsignature",
+			"nonce": "42",
+			"expires": "1640995800"
+		});
+
+		let resp = convert_order_to_response(order).await.expect("ok");
+
+		// Should have 2 inputs and 2 outputs
+		assert_eq!(resp.input_amounts.len(), 2);
+		assert_eq!(resp.output_amounts.len(), 2);
+
+		// Check amounts
+		assert_eq!(
+			resp.input_amounts[0].amount,
+			U256::from_str_radix("1000000000000000000", 10).unwrap()
+		);
+		assert_eq!(
+			resp.input_amounts[1].amount,
+			U256::from_str_radix("500000000000000000", 10).unwrap()
+		);
+		assert_eq!(
+			resp.output_amounts[0].amount,
+			U256::from_str_radix("2000000000000000000", 10).unwrap()
+		);
+		assert_eq!(
+			resp.output_amounts[1].amount,
+			U256::from_str_radix("1500000000000000000", 10).unwrap()
+		);
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_settlement_data_fields() {
+		let order = create_test_eip7683_order("order-settlement", OrderStatus::Executed);
+		let resp = convert_order_to_response(order).await.expect("ok");
+
+		// Check settlement data contains expected fields
+		let settlement_data = &resp.settlement.data;
+		assert!(settlement_data.get("raw_order_data").is_some());
+		assert!(settlement_data.get("signature").is_some());
+		assert!(settlement_data.get("nonce").is_some());
+		assert!(settlement_data.get("expires").is_some());
+
+		// Check specific values
+		assert_eq!(
+			settlement_data.get("signature").and_then(|v| v.as_str()),
+			Some("0xsignature")
+		);
+		assert_eq!(
+			settlement_data.get("nonce").and_then(|v| v.as_str()),
+			Some("42")
+		);
+		assert_eq!(
+			settlement_data.get("expires").and_then(|v| v.as_str()),
+			Some("1640995800")
+		);
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_missing_settlement_fields() {
+		let mut order =
+			create_test_eip7683_order("order-missing-settlement", OrderStatus::Executed);
+		order.data = json!({
+			"inputs": [[TEST_ADDR, "1000000000000000000"]],
+			"outputs": [{
+				"token": [18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52,86,120,144,18,52],
+				"amount": "2000000000000000000"
+			}]
+			// Missing settlement fields
+		});
+
+		let resp = convert_order_to_response(order).await.expect("ok");
+
+		// Should still work with null values for missing fields
+		let settlement_data = &resp.settlement.data;
+		assert!(settlement_data.get("raw_order_data").unwrap().is_null());
+		assert!(settlement_data.get("signature").unwrap().is_null());
+		assert!(settlement_data.get("nonce").unwrap().is_null());
+		assert!(settlement_data.get("expires").unwrap().is_null());
+	}
 }
