@@ -11,7 +11,7 @@ use solver_types::AuthScope;
 use std::sync::Arc;
 
 /// Request payload for client registration
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RegisterRequest {
 	/// Client identifier (e.g., application name, user email)
 	pub client_id: String,
@@ -22,7 +22,7 @@ pub struct RegisterRequest {
 }
 
 /// Response payload for successful registration
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RegisterResponse {
 	/// The generated access token
 	pub access_token: String,
@@ -41,7 +41,7 @@ pub struct RegisterResponse {
 }
 
 /// Request payload for token refresh
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RefreshRequest {
 	/// The refresh token to exchange for new tokens
 	pub refresh_token: String,
@@ -293,7 +293,31 @@ fn parse_scopes(scopes: Option<Vec<String>>) -> Result<Vec<AuthScope>, String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::auth::JwtService;
+	use axum::http::StatusCode;
+	use serde_json::Value;
+	use solver_types::{AuthConfig, SecretString};
+	use std::sync::Arc;
 
+	// Helper function to create a test JWT service
+	fn create_test_jwt_service() -> Arc<JwtService> {
+		let config = AuthConfig {
+			enabled: true,
+			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars-long"),
+			access_token_expiry_hours: 1,
+			refresh_token_expiry_hours: 720,
+			issuer: "test-issuer".to_string(),
+		};
+		Arc::new(JwtService::new(config).unwrap())
+	}
+
+	// Helper function to extract JSON from response body
+	async fn extract_json_from_body(body: axum::body::Body) -> Value {
+		let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+		serde_json::from_slice(&bytes).unwrap()
+	}
+
+	// Tests for parse_scopes function
 	#[test]
 	fn test_parse_scopes_default() {
 		let scopes = parse_scopes(None).unwrap();
@@ -320,5 +344,333 @@ mod tests {
 		let input = Some(vec!["admin-all".to_string()]);
 		let scopes = parse_scopes(input).unwrap();
 		assert_eq!(scopes, vec![AuthScope::AdminAll]);
+	}
+
+	#[test]
+	fn test_parse_scopes_all_variants() {
+		let input = Some(vec![
+			"read-orders".to_string(),
+			"create-orders".to_string(),
+			"read-quotes".to_string(),
+			"create-quotes".to_string(),
+			"admin-all".to_string(),
+		]);
+		let scopes = parse_scopes(input).unwrap();
+		assert_eq!(
+			scopes,
+			vec![
+				AuthScope::ReadOrders,
+				AuthScope::CreateOrders,
+				AuthScope::ReadQuotes,
+				AuthScope::CreateQuotes,
+				AuthScope::AdminAll,
+			]
+		);
+	}
+
+	#[test]
+	fn test_parse_scopes_mixed_valid_invalid() {
+		let input = Some(vec!["read-orders".to_string(), "invalid-scope".to_string()]);
+		let result = parse_scopes(input);
+		assert!(result.is_err());
+		assert!(result.unwrap_err().contains("Unknown scope"));
+	}
+
+	#[test]
+	fn test_parse_scopes_empty_list() {
+		let input = Some(vec![]);
+		let scopes = parse_scopes(input).unwrap();
+		assert_eq!(scopes, vec![]); // Empty list should remain empty
+	}
+
+	// Tests for register_client endpoint
+	#[tokio::test]
+	async fn test_register_client_success() {
+		let jwt_service = create_test_jwt_service();
+		let request = RegisterRequest {
+			client_id: "test-client".to_string(),
+			client_name: Some("Test Client".to_string()),
+			scopes: Some(vec!["read-orders".to_string(), "create-orders".to_string()]),
+		};
+
+		let response =
+			register_client(axum::extract::State(Some(jwt_service)), Json(request)).await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::CREATED);
+
+		let json_body = extract_json_from_body(body).await;
+		let response: RegisterResponse = serde_json::from_value(json_body).unwrap();
+		assert_eq!(response.client_id, "test-client");
+		assert_eq!(response.token_type, "Bearer");
+		assert_eq!(response.scopes, vec!["read-orders", "create-orders"]);
+		assert!(!response.access_token.is_empty());
+		assert!(!response.refresh_token.is_empty());
+		assert!(response.access_token_expires_at > 0);
+		assert!(response.refresh_token_expires_at > 0);
+	}
+
+	#[tokio::test]
+	async fn test_register_client_no_jwt_service() {
+		let request = RegisterRequest {
+			client_id: "test-client".to_string(),
+			client_name: None,
+			scopes: None,
+		};
+
+		let response = register_client(axum::extract::State(None), Json(request)).await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
+
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(
+			json_body["error"],
+			"Authentication service is not configured"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_register_client_empty_client_id() {
+		let jwt_service = create_test_jwt_service();
+		let request = RegisterRequest {
+			client_id: "".to_string(),
+			client_name: None,
+			scopes: None,
+		};
+
+		let response =
+			register_client(axum::extract::State(Some(jwt_service)), Json(request)).await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "Client ID cannot be empty");
+	}
+
+	#[tokio::test]
+	async fn test_register_client_short_client_id() {
+		let jwt_service = create_test_jwt_service();
+		let request = RegisterRequest {
+			client_id: "ab".to_string(), // Too short
+			client_name: None,
+			scopes: None,
+		};
+
+		let response =
+			register_client(axum::extract::State(Some(jwt_service)), Json(request)).await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(
+			json_body["error"],
+			"Client ID must be between 3 and 100 characters"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_register_client_long_client_id() {
+		let jwt_service = create_test_jwt_service();
+		let request = RegisterRequest {
+			client_id: "a".repeat(101), // Too long
+			client_name: None,
+			scopes: None,
+		};
+
+		let response =
+			register_client(axum::extract::State(Some(jwt_service)), Json(request)).await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(
+			json_body["error"],
+			"Client ID must be between 3 and 100 characters"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_register_client_invalid_scopes() {
+		let jwt_service = create_test_jwt_service();
+		let request = RegisterRequest {
+			client_id: "test-client".to_string(),
+			client_name: None,
+			scopes: Some(vec!["invalid-scope".to_string()]),
+		};
+
+		let response =
+			register_client(axum::extract::State(Some(jwt_service)), Json(request)).await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+
+		let json_body = extract_json_from_body(body).await;
+		assert!(json_body["error"]
+			.as_str()
+			.unwrap()
+			.contains("Invalid scopes"));
+	}
+
+	#[tokio::test]
+	async fn test_register_client_default_scopes() {
+		let jwt_service = create_test_jwt_service();
+		let request = RegisterRequest {
+			client_id: "test-client".to_string(),
+			client_name: None,
+			scopes: None, // Should default to read-orders
+		};
+
+		let response =
+			register_client(axum::extract::State(Some(jwt_service)), Json(request)).await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::CREATED);
+
+		let json_body = extract_json_from_body(body).await;
+		let response: RegisterResponse = serde_json::from_value(json_body).unwrap();
+		assert_eq!(response.scopes, vec!["read-orders"]);
+	}
+
+	// Tests for refresh_token endpoint
+	#[tokio::test]
+	async fn test_refresh_token_success() {
+		let jwt_service = create_test_jwt_service();
+
+		// First generate a refresh token
+		let refresh_token_str = jwt_service
+			.generate_refresh_token("test-client", vec![AuthScope::ReadOrders])
+			.await
+			.unwrap();
+
+		let request = RefreshRequest {
+			refresh_token: refresh_token_str,
+		};
+
+		let response = refresh_token(axum::extract::State(Some(jwt_service)), Json(request)).await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::OK);
+
+		let json_body = extract_json_from_body(body).await;
+		let response: RegisterResponse = serde_json::from_value(json_body).unwrap();
+		assert_eq!(response.client_id, "test-client");
+		assert_eq!(response.token_type, "Bearer");
+		assert_eq!(response.scopes, vec!["read-orders"]);
+		assert!(!response.access_token.is_empty());
+		assert!(!response.refresh_token.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_refresh_token_no_jwt_service() {
+		let request = RefreshRequest {
+			refresh_token: "some-token".to_string(),
+		};
+
+		let response = refresh_token(axum::extract::State(None), Json(request)).await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
+
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(
+			json_body["error"],
+			"Authentication service is not configured"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_refresh_token_empty_token() {
+		let jwt_service = create_test_jwt_service();
+		let request = RefreshRequest {
+			refresh_token: "".to_string(),
+		};
+
+		let response = refresh_token(axum::extract::State(Some(jwt_service)), Json(request)).await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "Refresh token cannot be empty");
+	}
+
+	#[tokio::test]
+	async fn test_refresh_token_invalid_token() {
+		let jwt_service = create_test_jwt_service();
+		let request = RefreshRequest {
+			refresh_token: "invalid-token".to_string(),
+		};
+
+		let response = refresh_token(axum::extract::State(Some(jwt_service)), Json(request)).await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
+
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "Invalid or expired refresh token");
+	}
+
+	// Tests for request/response serialization
+	#[test]
+	fn test_register_request_serialization() {
+		let request = RegisterRequest {
+			client_id: "test-client".to_string(),
+			client_name: Some("Test Client".to_string()),
+			scopes: Some(vec!["read-orders".to_string()]),
+		};
+
+		let json = serde_json::to_string(&request).unwrap();
+		let deserialized: RegisterRequest = serde_json::from_str(&json).unwrap();
+
+		assert_eq!(deserialized.client_id, "test-client");
+		assert_eq!(deserialized.client_name, Some("Test Client".to_string()));
+		assert_eq!(deserialized.scopes, Some(vec!["read-orders".to_string()]));
+	}
+
+	#[test]
+	fn test_register_response_serialization() {
+		let response = RegisterResponse {
+			access_token: "access-token".to_string(),
+			refresh_token: "refresh-token".to_string(),
+			client_id: "test-client".to_string(),
+			access_token_expires_at: 1234567890,
+			refresh_token_expires_at: 1234567890,
+			scopes: vec!["read-orders".to_string()],
+			token_type: "Bearer".to_string(),
+		};
+
+		let json = serde_json::to_string(&response).unwrap();
+		let deserialized: RegisterResponse = serde_json::from_str(&json).unwrap();
+
+		assert_eq!(deserialized.client_id, "test-client");
+		assert_eq!(deserialized.token_type, "Bearer");
+		assert_eq!(deserialized.scopes, vec!["read-orders"]);
+	}
+
+	#[test]
+	fn test_refresh_request_serialization() {
+		let request = RefreshRequest {
+			refresh_token: "refresh-token".to_string(),
+		};
+
+		let json = serde_json::to_string(&request).unwrap();
+		let deserialized: RefreshRequest = serde_json::from_str(&json).unwrap();
+
+		assert_eq!(deserialized.refresh_token, "refresh-token");
 	}
 }
