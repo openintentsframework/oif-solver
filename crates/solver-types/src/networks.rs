@@ -56,7 +56,7 @@ impl RpcEndpoint {
 ///
 /// This is the time to wait after a transaction is confirmed before
 /// attempting to read its state, to allow load-balanced RPC nodes to index it.
-fn default_rpc_indexing_delay_seconds() -> u64 {
+pub fn default_rpc_indexing_delay_seconds() -> u64 {
 	2
 }
 

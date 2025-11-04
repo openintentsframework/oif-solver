@@ -133,7 +133,7 @@ impl SettlementMonitor {
 		let delay_seconds = networks_config
 			.get(&chain_id)
 			.map(|config| config.rpc_indexing_delay_seconds)
-			.unwrap_or(2); // Default to 2 seconds
+			.unwrap_or(solver_types::networks::default_rpc_indexing_delay_seconds());
 
 		tracing::debug!(
 			order_id = %truncate_id(&order.id),
