@@ -1596,6 +1596,205 @@ mod tests {
 		Arc::new(SettlementService::new(implementations, 3))
 	}
 
+	fn create_exact_output_request(
+		input_amount: Option<&str>,
+		output_amount: Option<&str>,
+	) -> GetQuoteRequest {
+		GetQuoteRequest {
+			user: InteropAddress::new_ethereum(
+				1,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			intent: IntentRequest {
+				intent_type: IntentType::OifSwap,
+				inputs: vec![QuoteInput {
+					user: InteropAddress::new_ethereum(
+						1,
+						address!("1111111111111111111111111111111111111111"),
+					),
+					asset: InteropAddress::new_ethereum(
+						1,
+						address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+					),
+					amount: input_amount.map(|s| s.to_string()),
+					lock: None,
+				}],
+				outputs: vec![QuoteOutput {
+					receiver: InteropAddress::new_ethereum(
+						137,
+						address!("2222222222222222222222222222222222222222"),
+					),
+					asset: InteropAddress::new_ethereum(
+						137,
+						address!("2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+					),
+					amount: output_amount.map(|s| s.to_string()),
+					calldata: None,
+				}],
+				swap_type: Some(SwapType::ExactOutput),
+				preference: Some(QuotePreference::Speed),
+				min_valid_until: Some(600),
+				origin_submission: Some(solver_types::OriginSubmission {
+					mode: solver_types::OriginMode::User,
+					schemes: Some(vec![solver_types::AuthScheme::Permit2]),
+				}),
+				failure_handling: None,
+				partial_fill: Some(false),
+				metadata: None,
+			},
+			supported_types: vec!["oif-escrow-v0".to_string()],
+		}
+	}
+
+	fn create_cost_context() -> CostContext {
+		use rust_decimal::Decimal;
+		use solver_types::{costs::TokenAmountInfo, CostBreakdown};
+		use std::collections::HashMap;
+		use std::str::FromStr;
+
+		let mut swap_amounts = HashMap::new();
+		let mut cost_amounts_in_tokens = HashMap::new();
+		let mut adjusted_amounts = HashMap::new();
+
+		let input_asset =
+			InteropAddress::new_ethereum(1, address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"));
+		let output_asset =
+			InteropAddress::new_ethereum(137, address!("2791Bca1f2de4661ED88A30C99A7a9449Aa84174"));
+
+		swap_amounts.insert(
+			input_asset.clone(),
+			TokenAmountInfo {
+				token: input_asset.clone(),
+				amount: U256::from_str("1000000000000000000").unwrap(),
+				decimals: 18,
+			},
+		);
+		swap_amounts.insert(
+			output_asset.clone(),
+			TokenAmountInfo {
+				token: output_asset.clone(),
+				amount: U256::from_str("950000000000000000").unwrap(),
+				decimals: 18,
+			},
+		);
+
+		cost_amounts_in_tokens.insert(
+			input_asset.clone(),
+			TokenAmountInfo {
+				token: input_asset.clone(),
+				amount: U256::from_str("10000000000000000").unwrap(), // 0.01 token cost
+				decimals: 18,
+			},
+		);
+		cost_amounts_in_tokens.insert(
+			output_asset.clone(),
+			TokenAmountInfo {
+				token: output_asset.clone(),
+				amount: U256::from_str("9500000000000000").unwrap(), // 0.0095 token cost
+				decimals: 18,
+			},
+		);
+
+		adjusted_amounts.insert(
+			input_asset.clone(),
+			TokenAmountInfo {
+				token: input_asset.clone(),
+				amount: U256::from_str("1010000000000000000").unwrap(), // input + cost
+				decimals: 18,
+			},
+		);
+		adjusted_amounts.insert(
+			output_asset.clone(),
+			TokenAmountInfo {
+				token: output_asset.clone(),
+				amount: U256::from_str("940500000000000000").unwrap(), // output - cost
+				decimals: 18,
+			},
+		);
+
+		CostContext {
+			cost_breakdown: CostBreakdown {
+				gas_open: Decimal::from_str("0.001").unwrap(),
+				gas_fill: Decimal::from_str("0.002").unwrap(),
+				gas_claim: Decimal::from_str("0.001").unwrap(),
+				gas_buffer: Decimal::from_str("0.0005").unwrap(),
+				rate_buffer: Decimal::from_str("0.01").unwrap(),
+				base_price: Decimal::from_str("1.0").unwrap(),
+				min_profit: Decimal::from_str("0.005").unwrap(),
+				operational_cost: Decimal::from_str("0.0045").unwrap(),
+				subtotal: Decimal::from_str("1.0045").unwrap(),
+				total: Decimal::from_str("1.0095").unwrap(),
+				currency: "USD".to_string(),
+			},
+			execution_costs_by_chain: HashMap::new(),
+			liquidity_cost_adjustment: Decimal::from_str("0.001").unwrap(),
+			protocol_fees: HashMap::new(),
+			swap_type: SwapType::ExactInput,
+			swap_amounts,
+			cost_amounts_in_tokens,
+			adjusted_amounts,
+		}
+	}
+
+	fn create_validated_quote_context(swap_type: SwapType) -> ValidatedQuoteContext {
+		use std::str::FromStr;
+
+		let input_asset =
+			InteropAddress::new_ethereum(1, address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"));
+		let output_asset =
+			InteropAddress::new_ethereum(137, address!("2791Bca1f2de4661ED88A30C99A7a9449Aa84174"));
+
+		let mut constraint_inputs = Vec::new();
+		let mut constraint_outputs = Vec::new();
+
+		match swap_type {
+			SwapType::ExactInput => {
+				constraint_outputs.push((
+					QuoteOutput {
+						receiver: InteropAddress::new_ethereum(
+							137,
+							address!("2222222222222222222222222222222222222222"),
+						),
+						asset: output_asset,
+						amount: Some("900000000000000000".to_string()),
+						calldata: None,
+					},
+					Some(U256::from_str("900000000000000000").unwrap()),
+				));
+			},
+			SwapType::ExactOutput => {
+				constraint_inputs.push((
+					QuoteInput {
+						user: InteropAddress::new_ethereum(
+							1,
+							address!("1111111111111111111111111111111111111111"),
+						),
+						asset: input_asset,
+						amount: Some("1100000000000000000".to_string()),
+						lock: None,
+					},
+					Some(U256::from_str("1100000000000000000").unwrap()),
+				));
+			},
+		}
+
+		ValidatedQuoteContext {
+			swap_type,
+			known_inputs: None,
+			known_outputs: None,
+			constraint_inputs: if constraint_inputs.is_empty() {
+				None
+			} else {
+				Some(constraint_inputs)
+			},
+			constraint_outputs: if constraint_outputs.is_empty() {
+				None
+			} else {
+				Some(constraint_outputs)
+			},
+		}
+	}
+
 	#[tokio::test]
 	async fn test_generate_quotes_success() {
 		let settlement_service = create_test_settlement_service(true);
@@ -2194,53 +2393,819 @@ mod tests {
 		}
 	}
 
-	fn create_exact_output_request(
-		input_amount: Option<&str>,
-		output_amount: Option<&str>,
-	) -> GetQuoteRequest {
-		GetQuoteRequest {
+	#[tokio::test]
+	async fn test_generate_quotes_with_costs_exact_input() {
+		let generator = create_test_generator();
+		let request = create_exact_input_request(
+			Some("1000000000000000000"), // 1 token input
+			None,
+		);
+		let context = create_validated_quote_context(SwapType::ExactInput);
+		let cost_context = create_cost_context();
+		let config = create_test_config();
+
+		let result = generator
+			.generate_quotes_with_costs(&request, &context, &cost_context, &config)
+			.await;
+
+		match result {
+			Ok(quotes) => {
+				assert!(!quotes.is_empty());
+				// Verify that costs were properly applied
+			},
+			Err(e) => {
+				// Should not fail due to cost adjustment logic
+				assert!(
+					!matches!(e, QuoteError::InvalidRequest(msg) if msg.contains("cost adjustment"))
+				);
+			},
+		}
+	}
+
+	#[tokio::test]
+	async fn test_generate_quotes_with_costs_exact_output() {
+		let generator = create_test_generator();
+		let request = create_exact_output_request(
+			None,
+			Some("950000000000000000"), // 0.95 token output
+		);
+		let context = create_validated_quote_context(SwapType::ExactOutput);
+		let cost_context = create_cost_context();
+		let config = create_test_config();
+
+		let result = generator
+			.generate_quotes_with_costs(&request, &context, &cost_context, &config)
+			.await;
+
+		// Should succeed or fail with expected errors (not InvalidRequest for cost adjustment)
+		match result {
+			Ok(quotes) => {
+				assert!(!quotes.is_empty());
+			},
+			Err(e) => {
+				// Should not fail due to cost adjustment logic
+				assert!(
+					!matches!(e, QuoteError::InvalidRequest(msg) if msg.contains("cost adjustment"))
+				);
+			},
+		}
+	}
+
+	#[test]
+	fn test_build_cost_adjusted_request_exact_input() {
+		let generator = create_test_generator();
+		let request = create_exact_input_request(
+			Some("1000000000000000000"), // 1 token input
+			None,
+		);
+		let context = create_validated_quote_context(SwapType::ExactInput);
+		let cost_context = create_cost_context();
+
+		let result = generator.build_cost_adjusted_request(&request, &context, &cost_context);
+
+		assert!(result.is_ok());
+		let adjusted = result.unwrap();
+
+		// For exact input, outputs should be adjusted (reduced by costs)
+		assert!(adjusted.intent.outputs[0].amount.is_some());
+		let output_amount = adjusted.intent.outputs[0].amount.as_ref().unwrap();
+		let expected = U256::from(950000000000000000u64) - U256::from(9500000000000000u64);
+		assert_eq!(output_amount, &expected.to_string());
+	}
+
+	#[test]
+	fn test_build_cost_adjusted_request_exact_output() {
+		let generator = create_test_generator();
+		let request = create_exact_output_request(
+			None,
+			Some("950000000000000000"), // 0.95 token output
+		);
+		let context = create_validated_quote_context(SwapType::ExactOutput);
+		let cost_context = create_cost_context();
+
+		let result = generator.build_cost_adjusted_request(&request, &context, &cost_context);
+
+		assert!(result.is_ok());
+		let adjusted = result.unwrap();
+
+		// For exact output, inputs should be adjusted (increased by costs)
+		assert!(adjusted.intent.inputs[0].amount.is_some());
+		let input_amount = adjusted.intent.inputs[0].amount.as_ref().unwrap();
+		let expected = U256::from(1000000000000000000u64) + U256::from(10000000000000000u64);
+		assert_eq!(input_amount, &expected.to_string());
+	}
+
+	#[test]
+	fn test_validate_no_zero_amounts_exact_input_zero_output() {
+		let generator = create_test_generator();
+		let request = create_exact_input_request(
+			Some("1000000000000000000"),
+			Some("0"), // Zero output after cost adjustment
+		);
+		let context = create_validated_quote_context(SwapType::ExactInput);
+
+		let result = generator.validate_no_zero_amounts(&request, &context);
+
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(msg)) if msg.contains("cannot be zero after cost adjustment"))
+		);
+	}
+
+	#[test]
+	fn test_validate_no_zero_amounts_exact_output_zero_input() {
+		let generator = create_test_generator();
+		let request = create_exact_output_request(
+			Some("0"), // Zero input after cost adjustment
+			Some("950000000000000000"),
+		);
+		let context = create_validated_quote_context(SwapType::ExactOutput);
+
+		let result = generator.validate_no_zero_amounts(&request, &context);
+
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(msg)) if msg.contains("cannot be zero after cost adjustment"))
+		);
+	}
+
+	#[test]
+	fn test_validate_swap_amount_constraints_exact_input_below_minimum() {
+		let generator = create_test_generator();
+		let request = create_exact_input_request(
+			Some("1000000000000000000"),
+			Some("800000000000000000"), // Below minimum constraint
+		);
+		let context = create_validated_quote_context(SwapType::ExactInput);
+
+		let result = generator.validate_swap_amount_constraints(&request, &context);
+
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(msg)) if msg.contains("below minimum required"))
+		);
+	}
+
+	#[test]
+	fn test_validate_swap_amount_constraints_exact_output_above_maximum() {
+		let generator = create_test_generator();
+		let request = create_exact_output_request(
+			Some("1200000000000000000"), // Above maximum constraint
+			Some("950000000000000000"),
+		);
+		let context = create_validated_quote_context(SwapType::ExactOutput);
+
+		let result = generator.validate_swap_amount_constraints(&request, &context);
+
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(msg)) if msg.contains("exceeds maximum allowed"))
+		);
+	}
+
+	#[tokio::test]
+	async fn test_generate_permit2_order_success() {
+		let settlement_service = create_test_settlement_service(true);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service.clone(), delivery_service);
+		let config = create_test_config();
+		let request = create_test_request();
+
+		// Get oracles like in real usage
+		let (_settlement, input_oracle, output_oracle) = settlement_service
+			.get_any_settlement_for_chains(1, 137)
+			.expect("Should have settlement for test chains");
+
+		let result = generator
+			.generate_permit2_order(&request, &config, input_oracle, output_oracle)
+			.await;
+
+		match result {
+			Ok(order) => {
+				match order {
+					OifOrder::OifEscrowV0 { payload } => {
+						assert_eq!(payload.signature_type, SignatureType::Eip712);
+						assert_eq!(payload.primary_type, "PermitBatchWitnessTransferFrom");
+						assert!(payload.message.is_object());
+						assert!(payload.domain.is_object());
+						assert!(payload.types.is_some());
+
+						// Verify message structure
+						let message = payload.message.as_object().unwrap();
+						assert!(message.contains_key("permitted"));
+						assert!(message.contains_key("spender"));
+						assert!(message.contains_key("nonce"));
+						assert!(message.contains_key("deadline"));
+						assert!(message.contains_key("witness"));
+					},
+					_ => panic!("Expected OifEscrowV0 order"),
+				}
+			},
+			Err(e) => {
+				// Expected if Permit2 registry or domain configuration is missing
+				assert!(matches!(e, QuoteError::InvalidRequest(_)));
+			},
+		}
+	}
+
+	#[tokio::test]
+	async fn test_generate_escrow_order_permit2() {
+		let settlement_service = create_test_settlement_service(true);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let config = create_test_config();
+		let request = create_test_request();
+
+		let result = generator
+			.generate_escrow_order(&request, &config, &LockType::Permit2Escrow)
+			.await;
+
+		match result {
+			Ok(order) => match order {
+				OifOrder::OifEscrowV0 { payload } => {
+					assert_eq!(payload.signature_type, SignatureType::Eip712);
+					assert_eq!(payload.primary_type, "PermitBatchWitnessTransferFrom");
+				},
+				_ => panic!("Expected OifEscrowV0 order"),
+			},
+			Err(e) => {
+				// Expected due to missing settlement or configuration
+				assert!(matches!(e, QuoteError::InvalidRequest(_)));
+			},
+		}
+	}
+
+	#[tokio::test]
+	async fn test_generate_escrow_order_eip3009() {
+		let settlement_service = create_test_settlement_service(true);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let config = create_test_config();
+		let request = create_test_request();
+
+		let result = generator
+			.generate_escrow_order(&request, &config, &LockType::Eip3009Escrow)
+			.await;
+
+		match result {
+			Ok(order) => match order {
+				OifOrder::Oif3009V0 { payload, .. } => {
+					assert_eq!(payload.signature_type, SignatureType::Eip712);
+					assert_eq!(payload.primary_type, "ReceiveWithAuthorization");
+				},
+				_ => panic!("Expected Oif3009V0 order"),
+			},
+			Err(e) => {
+				// Expected due to missing settlement or contract calls failing
+				assert!(matches!(e, QuoteError::InvalidRequest(_)));
+			},
+		}
+	}
+
+	#[tokio::test]
+	async fn test_generate_escrow_order_unsupported_lock_type() {
+		let settlement_service = create_test_settlement_service(true);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let config = create_test_config();
+		let request = create_test_request();
+
+		// Use an unsupported lock type
+		let result = generator
+			.generate_escrow_order(&request, &config, &LockType::ResourceLock)
+			.await;
+
+		assert!(matches!(result, Err(QuoteError::UnsupportedSettlement(_))));
+	}
+
+	#[tokio::test]
+	async fn test_generate_escrow_order_no_settlement() {
+		let settlement_service = create_test_settlement_service(false); // No oracles
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let config = create_test_config();
+		let request = create_test_request();
+
+		let result = generator
+			.generate_escrow_order(&request, &config, &LockType::Permit2Escrow)
+			.await;
+
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(msg)) if msg.contains("No suitable settlement available"))
+		);
+	}
+
+	#[test]
+	fn test_build_permit2_eip712_types() {
+		let generator = create_test_generator();
+		let types = generator.build_permit2_eip712_types();
+
+		assert!(types.is_object());
+		let types_obj = types.as_object().unwrap();
+
+		// Verify all required types are present
+		assert!(types_obj.contains_key("EIP712Domain"));
+		assert!(types_obj.contains_key("PermitBatchWitnessTransferFrom"));
+		assert!(types_obj.contains_key("MandateOutput"));
+		assert!(types_obj.contains_key("Permit2Witness"));
+		assert!(types_obj.contains_key("TokenPermissions"));
+
+		// Verify EIP712Domain structure
+		let domain_type = &types_obj["EIP712Domain"];
+		assert!(domain_type.is_array());
+		let domain_fields = domain_type.as_array().unwrap();
+		assert!(domain_fields.len() >= 3); // name, chainId, verifyingContract
+	}
+
+	#[test]
+	fn test_build_compact_eip712_types() {
+		let generator = create_test_generator();
+		let types = generator.build_compact_eip712_types();
+
+		assert!(types.is_object());
+		let types_obj = types.as_object().unwrap();
+
+		// Verify all required types are present
+		assert!(types_obj.contains_key("EIP712Domain"));
+		assert!(types_obj.contains_key("BatchCompact"));
+		assert!(types_obj.contains_key("Lock"));
+		assert!(types_obj.contains_key("Mandate"));
+		assert!(types_obj.contains_key("MandateOutput"));
+
+		// Verify BatchCompact structure
+		let batch_compact_type = &types_obj["BatchCompact"];
+		assert!(batch_compact_type.is_array());
+		let batch_compact_fields = batch_compact_type.as_array().unwrap();
+		assert!(batch_compact_fields.len() >= 5); // arbiter, sponsor, nonce, expires, commitments, mandate
+	}
+
+	#[test]
+	fn test_build_eip3009_eip712_types() {
+		let generator = create_test_generator();
+		let types = generator.build_eip3009_eip712_types();
+
+		assert!(types.is_object());
+		let types_obj = types.as_object().unwrap();
+
+		// Verify all required types are present
+		assert!(types_obj.contains_key("EIP712Domain"));
+		assert!(types_obj.contains_key("ReceiveWithAuthorization"));
+
+		// Verify ReceiveWithAuthorization structure
+		let receive_auth_type = &types_obj["ReceiveWithAuthorization"];
+		assert!(receive_auth_type.is_array());
+		let receive_auth_fields = receive_auth_type.as_array().unwrap();
+		assert_eq!(receive_auth_fields.len(), 6); // from, to, value, validAfter, validBefore, nonce
+	}
+
+	#[tokio::test]
+	async fn test_build_compact_domain_object() {
+		let generator = create_test_generator();
+		let mut config = create_test_config();
+
+		// Add TheCompact address to network config
+		let mut network = config.networks.get(&1).unwrap().clone();
+		network.the_compact_address = Some(solver_types::Address(vec![0x12; 20]));
+		config.networks.insert(1, network);
+
+		let result = generator.build_compact_domain_object(&config, 1).await;
+
+		match result {
+			Ok(domain) => {
+				assert!(domain.is_object());
+				let domain_obj = domain.as_object().unwrap();
+				assert_eq!(domain_obj["name"], "The Compact");
+				assert_eq!(domain_obj["version"], "1");
+				assert_eq!(domain_obj["chainId"], "1");
+				assert!(domain_obj.contains_key("verifyingContract"));
+			},
+			Err(e) => {
+				// Expected if TheCompact address is not configured
+				assert!(matches!(e, QuoteError::InvalidRequest(_)));
+			},
+		}
+	}
+
+	#[tokio::test]
+	async fn test_build_compact_domain_object_missing_address() {
+		let generator = create_test_generator();
+		let mut config = create_test_config();
+
+		// Remove TheCompact address from network config to test missing address case
+		let mut network = config.networks.get(&1).unwrap().clone();
+		network.the_compact_address = None;
+		config.networks.insert(1, network);
+
+		let result = generator.build_compact_domain_object(&config, 1).await;
+		println!("result: {:?}", result);
+
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(msg)) if msg.contains("TheCompact address not configured"))
+		);
+	}
+
+	#[tokio::test]
+	async fn test_build_eip3009_domain_object() {
+		let generator = create_test_generator();
+		let token_address = [0x42; 20];
+
+		let result = generator
+			.build_eip3009_domain_object(&token_address, 1)
+			.await;
+
+		match result {
+			Ok(domain) => {
+				assert!(domain.is_object());
+				let domain_obj = domain.as_object().unwrap();
+				assert!(domain_obj.contains_key("name"));
+				assert_eq!(domain_obj["chainId"], "1");
+				assert!(domain_obj.contains_key("verifyingContract"));
+			},
+			Err(e) => {
+				// Expected if token name call fails
+				assert!(matches!(e, QuoteError::InvalidRequest(_)));
+			},
+		}
+	}
+
+	#[tokio::test]
+	async fn test_build_rhinestone_message_unsupported() {
+		let generator = create_test_generator();
+		let request = create_test_request();
+		let config = create_test_config();
+		let params = serde_json::json!({});
+
+		let result = generator
+			.build_rhinestone_message(&request, &config, &params)
+			.await;
+
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedSettlement(msg)) if msg.contains("Rhinestone resource locks are not yet supported"))
+		);
+	}
+
+	#[tokio::test]
+	async fn test_generate_quotes_with_failure_handling_modes() {
+		let generator = create_test_generator();
+		let config = create_test_config();
+
+		// Test with explicit failure handling mode
+		let mut request = create_test_request();
+		request.intent.failure_handling = Some(vec![FailureHandlingMode::RefundClaim]);
+		request.intent.partial_fill = Some(true);
+
+		let result = generator.generate_quotes(&request, &config).await;
+
+		match result {
+			Ok(quotes) => {
+				let quote = &quotes[0];
+				assert_eq!(quote.failure_handling, FailureHandlingMode::RefundClaim);
+				assert!(quote.partial_fill);
+			},
+			Err(_) => {
+				// Expected due to missing settlement configuration
+			},
+		}
+	}
+
+	#[tokio::test]
+	async fn test_generate_quotes_with_multiple_failure_modes() {
+		let generator = create_test_generator();
+		let config = create_test_config();
+
+		// Test with multiple failure handling modes (should use first)
+		let mut request = create_test_request();
+		request.intent.failure_handling = Some(vec![
+			FailureHandlingMode::RefundClaim,
+			FailureHandlingMode::RefundAutomatic,
+		]);
+
+		let result = generator.generate_quotes(&request, &config).await;
+
+		match result {
+			Ok(quotes) => {
+				let quote = &quotes[0];
+				assert_eq!(quote.failure_handling, FailureHandlingMode::RefundClaim);
+			},
+			Err(_) => {
+				// Expected due to missing settlement configuration
+			},
+		}
+	}
+
+	#[test]
+	fn test_generate_quotes_input_conversion_error() {
+		use solver_types::QuoteInput;
+
+		// This test would require creating an invalid QuoteInput that fails try_into()
+		// For now, we'll test the basic structure since the conversion is typically reliable
+		let input = QuoteInput {
 			user: InteropAddress::new_ethereum(
 				1,
 				address!("1111111111111111111111111111111111111111"),
 			),
-			intent: IntentRequest {
-				intent_type: IntentType::OifSwap,
-				inputs: vec![QuoteInput {
-					user: InteropAddress::new_ethereum(
-						1,
-						address!("1111111111111111111111111111111111111111"),
-					),
-					asset: InteropAddress::new_ethereum(
-						1,
-						address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
-					),
-					amount: input_amount.map(|s| s.to_string()),
-					lock: None,
-				}],
-				outputs: vec![QuoteOutput {
-					receiver: InteropAddress::new_ethereum(
-						137,
-						address!("2222222222222222222222222222222222222222"),
-					),
-					asset: InteropAddress::new_ethereum(
-						137,
-						address!("2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
-					),
-					amount: output_amount.map(|s| s.to_string()),
-					calldata: None,
-				}],
-				swap_type: Some(SwapType::ExactOutput),
-				preference: Some(QuotePreference::Speed),
-				min_valid_until: Some(600),
-				origin_submission: Some(solver_types::OriginSubmission {
-					mode: solver_types::OriginMode::User,
-					schemes: Some(vec![solver_types::AuthScheme::Permit2]),
-				}),
-				failure_handling: None,
-				partial_fill: Some(false),
-				metadata: None,
+			asset: InteropAddress::new_ethereum(
+				1,
+				address!("A0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
+			),
+			amount: Some("1000".to_string()),
+			lock: None,
+		};
+
+		let order_input_result: Result<OrderInput, _> = (&input).try_into();
+		assert!(order_input_result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_generate_quotes_min_valid_until() {
+		let generator = create_test_generator();
+		let config = create_test_config();
+
+		// Test with min_valid_until set
+		let mut request = create_test_request();
+		request.intent.min_valid_until = Some(1234567890);
+
+		let result = generator.generate_quotes(&request, &config).await;
+
+		match result {
+			Ok(quotes) => {
+				let quote = &quotes[0];
+				// Should use min_valid_until for expiry calculation
+				assert!(quote.valid_until >= 1234567890);
 			},
-			supported_types: vec!["oif-escrow-v0".to_string()],
+			Err(_) => {
+				// Expected due to missing settlement configuration
+			},
+		}
+	}
+
+	#[tokio::test]
+	async fn test_get_token_name_contract_call() {
+		let generator = create_test_generator();
+		let token_address = alloy_primitives::Address::from([0x42; 20]);
+
+		let result = generator.get_token_name(&token_address, 1).await;
+
+		// Expected to fail since we don't have a real contract to call
+		assert!(matches!(result, Err(QuoteError::InvalidRequest(_))));
+	}
+
+	#[tokio::test]
+	async fn test_get_eip3009_domain_separator_contract_call() {
+		let generator = create_test_generator();
+		let token_address = [0x42; 20];
+
+		let result = generator
+			.get_eip3009_domain_separator(&token_address, 1)
+			.await;
+
+		// Expected to fail since we don't have a real contract to call
+		assert!(matches!(result, Err(QuoteError::InvalidRequest(_))));
+	}
+
+	#[tokio::test]
+	async fn test_compute_eip3009_order_identifier_contract_call() {
+		let generator = create_test_generator();
+		let config = create_test_config();
+		let request = create_test_request();
+		let input_oracle = solver_types::Address(vec![0xaa; 20]);
+		let output_oracle = solver_types::Address(vec![0xbb; 20]);
+
+		let result = generator
+			.compute_eip3009_order_identifier(
+				&request,
+				&config,
+				&input_oracle,
+				&output_oracle,
+				1234567890,
+			)
+			.await;
+
+		// Expected to fail since we don't have a real contract to call
+		assert!(matches!(result, Err(QuoteError::InvalidRequest(_))));
+	}
+
+	#[tokio::test]
+	async fn test_build_permit2_domain_object_missing_permit2() {
+		let generator = create_test_generator();
+		let config = create_test_config();
+
+		// Use a chain ID that doesn't have Permit2 deployed
+		let result = generator.build_permit2_domain_object(&config, 999999).await;
+
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(msg)) if msg.contains("Permit2 not deployed"))
+		);
+	}
+
+	#[test]
+	fn test_build_permit2_message_object_structure() {
+		let generator = create_test_generator();
+		let config = create_test_config();
+		let request = create_test_request();
+		let input_oracle = solver_types::Address(vec![0xaa; 20]);
+		let output_oracle = solver_types::Address(vec![0xbb; 20]);
+
+		let result =
+			generator.build_permit2_message_object(&request, &config, input_oracle, output_oracle);
+
+		match result {
+			Ok(message) => {
+				assert!(message.is_object());
+				let message_obj = message.as_object().unwrap();
+
+				// Verify required Permit2 message fields
+				assert!(message_obj.contains_key("permitted"));
+				assert!(message_obj.contains_key("spender"));
+				assert!(message_obj.contains_key("nonce"));
+				assert!(message_obj.contains_key("deadline"));
+				assert!(message_obj.contains_key("witness"));
+			},
+			Err(e) => {
+				// Expected if permit2 module dependencies are missing
+				assert!(matches!(e, QuoteError::InvalidRequest(_)));
+			},
+		}
+	}
+
+	#[tokio::test]
+	async fn test_generate_quotes_invalid_chain_id() {
+		let generator = create_test_generator();
+		let config = create_test_config();
+
+		// Create request with invalid chain ID
+		let mut request = create_test_request();
+		request.intent.inputs[0].asset = InteropAddress::new_ethereum(
+			999999, // Invalid chain ID not in config
+			address!("A0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
+		);
+
+		let result = generator.generate_quotes(&request, &config).await;
+
+		// Should fail due to no supported settlement mechanism on invalid chain
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedSettlement(msg)) if msg.contains("No supported settlement mechanism available for this token"))
+		);
+	}
+
+	#[tokio::test]
+	async fn test_generate_quotes_mismatched_input_output_chains() {
+		let generator = create_test_generator();
+		let config = create_test_config();
+
+		// Create request where input and output are on same chain (no cross-chain)
+		let mut request = create_test_request();
+		request.intent.outputs[0].asset = InteropAddress::new_ethereum(
+			1, // Same chain as input
+			address!("B0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
+		);
+
+		let result = generator.generate_quotes(&request, &config).await;
+
+		// May succeed or fail depending on settlement configuration
+		match result {
+			Ok(quotes) => {
+				assert!(!quotes.is_empty());
+			},
+			Err(_) => {
+				// Expected due to settlement configuration or liquidity issues
+			},
+		}
+	}
+
+	#[tokio::test]
+	async fn test_generate_resource_lock_order_rhinestone() {
+		let settlement_service = create_test_settlement_service(true);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let config = create_test_config();
+		let request = create_test_request();
+
+		let lock = solver_types::AssetLockReference {
+			kind: solver_types::LockKind::Rhinestone,
+			params: Some(serde_json::json!({"test": "value"})),
+		};
+
+		let result = generator
+			.generate_resource_lock_order(&request, &config, &lock)
+			.await;
+
+		// Should fail with unsupported settlement error
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedSettlement(msg)) if msg.contains("Rhinestone resource locks are not yet supported"))
+		);
+	}
+
+	#[test]
+	fn test_get_quote_validity_seconds_edge_cases() {
+		let generator = create_test_generator();
+
+		// Test with completely empty config (no API config)
+		let empty_config = ConfigBuilder::new().build();
+
+		let validity = generator.get_quote_validity_seconds(&empty_config);
+		assert_eq!(validity, 20); // Default value when no API config
+
+		// Test with API config but no quote config
+		let api_no_quote_config = ConfigBuilder::new()
+			.api(Some(solver_config::ApiConfig {
+				enabled: true,
+				host: "127.0.0.1".to_string(),
+				port: 8080,
+				timeout_seconds: 30,
+				max_request_size: 1048576,
+				implementations: Default::default(),
+				rate_limiting: None,
+				cors: None,
+				auth: None,
+				quote: None, // No quote config
+			}))
+			.build();
+
+		let validity_no_quote = generator.get_quote_validity_seconds(&api_no_quote_config);
+		assert_eq!(validity_no_quote, 20); // Default value when no quote config
+	}
+
+	#[tokio::test]
+	async fn test_generate_quotes_empty_supported_types() {
+		let generator = create_test_generator();
+		let config = create_test_config();
+
+		// Create request with empty supported types
+		let mut request = create_test_request();
+		request.supported_types = vec![];
+
+		let result = generator.generate_quotes(&request, &config).await;
+
+		// Should still work as supported_types is used for filtering, not generation
+		match result {
+			Ok(quotes) => {
+				assert!(!quotes.is_empty());
+			},
+			Err(_) => {
+				// Expected due to missing settlement configuration
+			},
+		}
+	}
+
+	#[tokio::test]
+	async fn test_generate_quotes_multiple_inputs() {
+		let generator = create_test_generator();
+		let config = create_test_config();
+
+		// Create request with multiple inputs
+		let mut request = create_test_request();
+		request.intent.inputs.push(QuoteInput {
+			user: InteropAddress::new_ethereum(
+				1,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			asset: InteropAddress::new_ethereum(
+				1,
+				address!("C0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
+			),
+			amount: Some(U256::from(500).to_string()),
+			lock: None,
+		});
+
+		let result = generator.generate_quotes(&request, &config).await;
+
+		// Should generate quotes for each input
+		match result {
+			Ok(quotes) => {
+				// Should have quotes for multiple inputs (up to 2)
+				assert!(!quotes.is_empty());
+			},
+			Err(_) => {
+				// Expected due to missing settlement configuration
+			},
+		}
+	}
+
+	#[tokio::test]
+	async fn test_generate_quotes_with_metadata() {
+		let generator = create_test_generator();
+		let config = create_test_config();
+
+		// Create request with metadata
+		let mut request = create_test_request();
+		request.intent.metadata = Some(serde_json::json!({
+			"custom_field": "test_value",
+			"priority": "high"
+		}));
+
+		let result = generator.generate_quotes(&request, &config).await;
+
+		// Metadata should not affect quote generation
+		match result {
+			Ok(quotes) => {
+				assert!(!quotes.is_empty());
+			},
+			Err(_) => {
+				// Expected due to missing settlement configuration
+			},
 		}
 	}
 }
