@@ -889,4 +889,698 @@ mod tests {
 
 		assert_eq!(result, expected);
 	}
+
+	#[test]
+	fn test_ecrecover_user_from_signature_standard_format() {
+		// Test with a standard 65-byte signature (130 hex chars + 0x prefix)
+		let digest = [0u8; 32]; // Zero digest for simplicity
+		let signature = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1c";
+
+		// This should attempt to parse and recover (will fail with invalid signature)
+		let result = ecrecover_user_from_signature(&digest, signature);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_ecrecover_user_from_signature_66_byte_format() {
+		// Test with a 66-byte signature (132 hex chars + 0x prefix) - should skip first byte
+		let digest = [0u8; 32];
+		let signature = "0x001234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1c";
+
+		let result = ecrecover_user_from_signature(&digest, signature);
+		// Should fail due to invalid signature but format handling should work
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_ecrecover_user_from_signature_without_0x_prefix() {
+		// Test signature without 0x prefix
+		let digest = [0u8; 32];
+		let signature = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1c";
+
+		let result = ecrecover_user_from_signature(&digest, signature);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_ecrecover_user_from_signature_invalid_length() {
+		// Test with invalid signature length
+		let digest = [0u8; 32];
+		let signature = "0x1234"; // Too short
+
+		let result = ecrecover_user_from_signature(&digest, signature);
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Failed to parse signature"));
+	}
+
+	#[test]
+	fn test_ecrecover_user_from_signature_invalid_hex() {
+		// Test with invalid hex characters
+		let digest = [0u8; 32];
+		let signature = "0xgggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg1c";
+
+		let result = ecrecover_user_from_signature(&digest, signature);
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Failed to parse signature"));
+	}
+
+	#[test]
+	fn test_reconstruct_permit2_digest_missing_domain() {
+		use crate::api::OrderPayload;
+		use serde_json::json;
+
+		let payload = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!(null), // Missing domain
+			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
+			message: json!({}),
+			types: None,
+		};
+
+		let result = reconstruct_permit2_digest(&payload);
+		assert!(result.is_err());
+		assert!(result.unwrap_err().to_string().contains("Missing domain"));
+	}
+
+	#[test]
+	fn test_reconstruct_permit2_digest_missing_message() {
+		use crate::api::OrderPayload;
+		use serde_json::json;
+
+		let payload = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!({
+				"name": "Permit2",
+				"chainId": "1",
+				"verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+			}),
+			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
+			message: json!(null), // Missing message
+			types: None,
+		};
+
+		let result = reconstruct_permit2_digest(&payload);
+		assert!(result.is_err());
+		assert!(result.unwrap_err().to_string().contains("Missing message"));
+	}
+
+	#[test]
+	fn test_reconstruct_permit2_digest_invalid_chain_id() {
+		use crate::api::OrderPayload;
+		use serde_json::json;
+
+		let payload = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!({
+				"name": "Permit2",
+				"chainId": "invalid", // Invalid chain ID
+				"verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+			}),
+			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
+			message: json!({
+				"spender": "0x1234567890123456789012345678901234567890",
+				"nonce": "123",
+				"deadline": "1234567890",
+				"permitted": [],
+				"witness": {
+					"expires": 1234567890,
+					"inputOracle": "0x1234567890123456789012345678901234567890",
+					"outputs": []
+				}
+			}),
+			types: None,
+		};
+
+		let result = reconstruct_permit2_digest(&payload);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_reconstruct_compact_digest_missing_domain() {
+		use crate::api::OrderPayload;
+		use serde_json::json;
+
+		let payload = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!(null), // Missing domain
+			primary_type: "BatchCompact".to_string(),
+			message: json!({}),
+			types: None,
+		};
+
+		let result = reconstruct_compact_digest(&payload, None);
+		assert!(result.is_err());
+		assert!(result.unwrap_err().to_string().contains("Missing domain"));
+	}
+
+	#[test]
+	fn test_reconstruct_compact_digest_with_provided_domain_separator() {
+		use crate::api::OrderPayload;
+		use serde_json::json;
+
+		let domain_separator = [0x12u8; 32];
+		let payload = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!({
+				"name": "BatchCompact",
+				"chainId": "1",
+				"verifyingContract": "0x1234567890123456789012345678901234567890"
+			}),
+			primary_type: "BatchCompact".to_string(),
+			message: json!({
+				"arbiter": "0x1234567890123456789012345678901234567890",
+				"sponsor": "0x1234567890123456789012345678901234567890",
+				"nonce": "123",
+				"expires": "1234567890",
+				"commitments": [],
+				"mandate": {
+					"fillDeadline": 1234567890,
+					"inputOracle": "0x1234567890123456789012345678901234567890",
+					"outputs": []
+				}
+			}),
+			types: None,
+		};
+
+		let result = reconstruct_compact_digest(&payload, Some(domain_separator));
+		assert!(result.is_ok());
+		// The result should be deterministic
+		let result2 = reconstruct_compact_digest(&payload, Some(domain_separator));
+		assert_eq!(result.unwrap(), result2.unwrap());
+	}
+
+	#[test]
+	fn test_reconstruct_compact_digest_invalid_lock_tag() {
+		use crate::api::OrderPayload;
+		use serde_json::json;
+
+		let payload = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!({
+				"name": "BatchCompact",
+				"chainId": "1",
+				"verifyingContract": "0x1234567890123456789012345678901234567890"
+			}),
+			primary_type: "BatchCompact".to_string(),
+			message: json!({
+				"arbiter": "0x1234567890123456789012345678901234567890",
+				"sponsor": "0x1234567890123456789012345678901234567890",
+				"nonce": "123",
+				"expires": "1234567890",
+				"commitments": [{
+					"lockTag": "0x1234", // Invalid length (should be 12 bytes)
+					"token": "0x1234567890123456789012345678901234567890",
+					"amount": "1000000000000000000"
+				}],
+				"mandate": {
+					"fillDeadline": 1234567890,
+					"inputOracle": "0x1234567890123456789012345678901234567890",
+					"outputs": []
+				}
+			}),
+			types: None,
+		};
+
+		let result = reconstruct_compact_digest(&payload, None);
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Invalid lockTag length"));
+	}
+
+	#[test]
+	fn test_reconstruct_eip3009_digest_missing_domain() {
+		use crate::api::OrderPayload;
+		use serde_json::json;
+
+		let payload = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!(null), // Missing domain
+			primary_type: "ReceiveWithAuthorization".to_string(),
+			message: json!({}),
+			types: None,
+		};
+
+		let result = reconstruct_eip3009_digest(&payload, None);
+		assert!(result.is_err());
+		assert!(result.unwrap_err().to_string().contains("Missing domain"));
+	}
+
+	#[test]
+	fn test_reconstruct_eip3009_digest_with_provided_domain_separator() {
+		use crate::api::OrderPayload;
+		use serde_json::json;
+
+		let domain_separator = [0x34u8; 32];
+		let payload = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!({
+				"name": "USD Coin",
+				"chainId": "1",
+				"verifyingContract": "0xA0b86a33E6441E13C7D3fE1D5D8B6C8A9A8E8E8E"
+			}),
+			primary_type: "ReceiveWithAuthorization".to_string(),
+			message: json!({
+				"from": "0x1234567890123456789012345678901234567890",
+				"to": "0x0987654321098765432109876543210987654321",
+				"value": "1000000000000000000",
+				"validAfter": 0,
+				"validBefore": 0,
+				"nonce": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+			}),
+			types: None,
+		};
+
+		let result = reconstruct_eip3009_digest(&payload, Some(domain_separator));
+		assert!(result.is_ok());
+		// The result should be deterministic
+		let result2 = reconstruct_eip3009_digest(&payload, Some(domain_separator));
+		assert_eq!(result.unwrap(), result2.unwrap());
+	}
+
+	#[test]
+	fn test_reconstruct_eip3009_digest_invalid_nonce_hex() {
+		use crate::api::OrderPayload;
+		use serde_json::json;
+
+		let payload = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!({
+				"name": "USD Coin",
+				"chainId": "1",
+				"verifyingContract": "0xA0b86a33E6441E13C7D3fE1D5D8B6C8A9A8E8E8E"
+			}),
+			primary_type: "ReceiveWithAuthorization".to_string(),
+			message: json!({
+				"from": "0x1234567890123456789012345678901234567890",
+				"to": "0x0987654321098765432109876543210987654321",
+				"value": "1000000000000000000",
+				"validAfter": 0,
+				"validBefore": 0,
+				"nonce": "0xgggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg" // Invalid hex
+			}),
+			types: None,
+		};
+
+		let result = reconstruct_eip3009_digest(&payload, None);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_reconstruct_functions_with_valid_minimal_data() {
+		use crate::api::OrderPayload;
+		use serde_json::json;
+
+		// Test Permit2 with minimal valid data
+		let permit2_payload = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!({
+				"name": "Permit2",
+				"chainId": "1",
+				"verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+			}),
+			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
+			message: json!({
+				"spender": "0x1234567890123456789012345678901234567890",
+				"nonce": "123",
+				"deadline": "1234567890",
+				"permitted": [{
+					"token": "0x1234567890123456789012345678901234567890",
+					"amount": "1000000000000000000"
+				}],
+				"witness": {
+					"expires": 1234567890,
+					"inputOracle": "0x1234567890123456789012345678901234567890",
+					"outputs": [{
+						"oracle": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"settler": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"chainId": "137",
+						"token": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"amount": "950000000000000000",
+						"recipient": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"callbackData": "0x",
+						"context": "0x"
+					}]
+				}
+			}),
+			types: None,
+		};
+
+		let permit2_result = reconstruct_permit2_digest(&permit2_payload);
+		assert!(permit2_result.is_ok());
+
+		// Test BatchCompact with minimal valid data
+		let compact_payload = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!({
+				"name": "BatchCompact",
+				"chainId": "1",
+				"verifyingContract": "0x1234567890123456789012345678901234567890"
+			}),
+			primary_type: "BatchCompact".to_string(),
+			message: json!({
+				"arbiter": "0x1234567890123456789012345678901234567890",
+				"sponsor": "0x1234567890123456789012345678901234567890",
+				"nonce": "123",
+				"expires": "1234567890",
+				"commitments": [{
+					"lockTag": "0x123456789012345678901234",
+					"token": "0x1234567890123456789012345678901234567890",
+					"amount": "1000000000000000000"
+				}],
+				"mandate": {
+					"fillDeadline": 1234567890,
+					"inputOracle": "0x1234567890123456789012345678901234567890",
+					"outputs": [{
+						"oracle": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"settler": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"chainId": "137",
+						"token": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"amount": "950000000000000000",
+						"recipient": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"callbackData": "0x",
+						"context": "0x"
+					}]
+				}
+			}),
+			types: None,
+		};
+
+		let compact_result = reconstruct_compact_digest(&compact_payload, None);
+		assert!(compact_result.is_ok());
+
+		// Test EIP-3009 with minimal valid data
+		let eip3009_payload = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!({
+				"name": "USD Coin",
+				"chainId": "1",
+				"verifyingContract": "0xA0b86a33E6441E13C7D3fE1D5D8B6C8A9A8E8E8E"
+			}),
+			primary_type: "ReceiveWithAuthorization".to_string(),
+			message: json!({
+				"from": "0x1234567890123456789012345678901234567890",
+				"to": "0x0987654321098765432109876543210987654321",
+				"value": "1000000000000000000",
+				"validAfter": 0,
+				"validBefore": 0,
+				"nonce": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+			}),
+			types: None,
+		};
+
+		let eip3009_result = reconstruct_eip3009_digest(&eip3009_payload, None);
+		assert!(eip3009_result.is_ok());
+
+		// All results should be deterministic
+		assert_eq!(
+			permit2_result.unwrap(),
+			reconstruct_permit2_digest(&permit2_payload).unwrap()
+		);
+		assert_eq!(
+			compact_result.unwrap(),
+			reconstruct_compact_digest(&compact_payload, None).unwrap()
+		);
+		assert_eq!(
+			eip3009_result.unwrap(),
+			reconstruct_eip3009_digest(&eip3009_payload, None).unwrap()
+		);
+	}
+
+	#[test]
+	fn test_domain_hash_edge_cases() {
+		// Test with empty name
+		let empty_name = "";
+		let chain_id = 1u64;
+		let contract = address!("1234567890123456789012345678901234567890");
+		let result = compute_domain_hash(empty_name, chain_id, &contract);
+		assert_eq!(result.len(), 32);
+
+		// Test with very long name
+		let long_name = "a".repeat(1000);
+		let result_long = compute_domain_hash(&long_name, chain_id, &contract);
+		assert_eq!(result_long.len(), 32);
+		assert_ne!(result, result_long);
+
+		// Test with zero chain ID
+		let result_zero_chain = compute_domain_hash("TestDomain", 0u64, &contract);
+		assert_eq!(result_zero_chain.len(), 32);
+
+		// Test with max chain ID
+		let result_max_chain = compute_domain_hash("TestDomain", u64::MAX, &contract);
+		assert_eq!(result_max_chain.len(), 32);
+	}
+
+	#[test]
+	fn test_final_digest_edge_cases() {
+		// Test with zero hashes
+		let zero_hash = B256::ZERO;
+		let result = compute_final_digest(&zero_hash, &zero_hash);
+		assert_eq!(result.len(), 32);
+
+		// Test with max hashes
+		let max_hash = B256::from([0xffu8; 32]);
+		let result_max = compute_final_digest(&max_hash, &max_hash);
+		assert_eq!(result_max.len(), 32);
+		assert_ne!(result, result_max);
+	}
+
+	#[test]
+	fn test_abi_encoder_edge_cases() {
+		let mut encoder = Eip712AbiEncoder::new();
+
+		// Test with zero values
+		encoder.push_u256(U256::ZERO);
+		encoder.push_u32(0u32);
+		encoder.push_address(&AlloyAddress::ZERO);
+		encoder.push_b256(&B256::ZERO);
+
+		let result = encoder.finish();
+		assert_eq!(result.len(), 32 * 4);
+
+		// Test with max values
+		let mut encoder_max = Eip712AbiEncoder::new();
+		encoder_max.push_u256(U256::MAX);
+		encoder_max.push_u32(u32::MAX);
+		encoder_max.push_address(&address!("ffffffffffffffffffffffffffffffffffffffff"));
+		encoder_max.push_b256(&B256::from([0xffu8; 32]));
+
+		let result_max = encoder_max.finish();
+		assert_eq!(result_max.len(), 32 * 4);
+		assert_ne!(result, result_max);
+	}
+
+	#[test]
+	fn test_reconstruct_permit2_digest_empty_arrays() {
+		use crate::api::OrderPayload;
+		use serde_json::json;
+
+		let payload = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!({
+				"name": "Permit2",
+				"chainId": "1",
+				"verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+			}),
+			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
+			message: json!({
+				"spender": "0x1234567890123456789012345678901234567890",
+				"nonce": "123",
+				"deadline": "1234567890",
+				"permitted": [], // Empty array
+				"witness": {
+					"expires": 1234567890,
+					"inputOracle": "0x1234567890123456789012345678901234567890",
+					"outputs": [] // Empty array
+				}
+			}),
+			types: None,
+		};
+
+		let result = reconstruct_permit2_digest(&payload);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_reconstruct_compact_digest_empty_arrays() {
+		use crate::api::OrderPayload;
+		use serde_json::json;
+
+		let payload = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!({
+				"name": "BatchCompact",
+				"chainId": "1",
+				"verifyingContract": "0x1234567890123456789012345678901234567890"
+			}),
+			primary_type: "BatchCompact".to_string(),
+			message: json!({
+				"arbiter": "0x1234567890123456789012345678901234567890",
+				"sponsor": "0x1234567890123456789012345678901234567890",
+				"nonce": "123",
+				"expires": "1234567890",
+				"commitments": [], // Empty array
+				"mandate": {
+					"fillDeadline": 1234567890,
+					"inputOracle": "0x1234567890123456789012345678901234567890",
+					"outputs": [] // Empty array
+				}
+			}),
+			types: None,
+		};
+
+		let result = reconstruct_compact_digest(&payload, None);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_reconstruct_functions_with_null_callback_data() {
+		use crate::api::OrderPayload;
+		use serde_json::json;
+
+		// Test with null callbackData and context
+		let payload = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!({
+				"name": "Permit2",
+				"chainId": "1",
+				"verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+			}),
+			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
+			message: json!({
+				"spender": "0x1234567890123456789012345678901234567890",
+				"nonce": "123",
+				"deadline": "1234567890",
+				"permitted": [{
+					"token": "0x1234567890123456789012345678901234567890",
+					"amount": "1000000000000000000"
+				}],
+				"witness": {
+					"expires": 1234567890,
+					"inputOracle": "0x1234567890123456789012345678901234567890",
+					"outputs": [{
+						"oracle": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"settler": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"chainId": "137",
+						"token": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"amount": "950000000000000000",
+						"recipient": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"callbackData": null, // null value
+						"context": null // null value
+					}]
+				}
+			}),
+			types: None,
+		};
+
+		let result = reconstruct_permit2_digest(&payload);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_reconstruct_functions_with_large_amounts() {
+		use crate::api::OrderPayload;
+		use serde_json::json;
+
+		// Test with very large amounts (near U256 max)
+		let large_amount =
+			"115792089237316195423570985008687907853269984665640564039457584007913129639935"; // U256::MAX
+
+		let payload = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!({
+				"name": "Permit2",
+				"chainId": "1",
+				"verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+			}),
+			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
+			message: json!({
+				"spender": "0x1234567890123456789012345678901234567890",
+				"nonce": "123",
+				"deadline": "1234567890",
+				"permitted": [{
+					"token": "0x1234567890123456789012345678901234567890",
+					"amount": large_amount
+				}],
+				"witness": {
+					"expires": 1234567890,
+					"inputOracle": "0x1234567890123456789012345678901234567890",
+					"outputs": [{
+						"oracle": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"settler": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"chainId": "137",
+						"token": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"amount": large_amount,
+						"recipient": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"callbackData": "0x",
+						"context": "0x"
+					}]
+				}
+			}),
+			types: None,
+		};
+
+		let result = reconstruct_permit2_digest(&payload);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_reconstruct_functions_deterministic_behavior() {
+		use crate::api::OrderPayload;
+		use serde_json::json;
+
+		// Create identical payloads and ensure they produce identical results
+		let create_payload = || OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!({
+				"name": "Permit2",
+				"chainId": "1",
+				"verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+			}),
+			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
+			message: json!({
+				"spender": "0x1234567890123456789012345678901234567890",
+				"nonce": "123",
+				"deadline": "1234567890",
+				"permitted": [{
+					"token": "0x1234567890123456789012345678901234567890",
+					"amount": "1000000000000000000"
+				}],
+				"witness": {
+					"expires": 1234567890,
+					"inputOracle": "0x1234567890123456789012345678901234567890",
+					"outputs": [{
+						"oracle": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"settler": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"chainId": "137",
+						"token": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"amount": "950000000000000000",
+						"recipient": "0x1234567890123456789012345678901234567890123456789012345678901234",
+						"callbackData": "0x",
+						"context": "0x"
+					}]
+				}
+			}),
+			types: None,
+		};
+
+		let payload1 = create_payload();
+		let payload2 = create_payload();
+
+		let result1 = reconstruct_permit2_digest(&payload1).unwrap();
+		let result2 = reconstruct_permit2_digest(&payload2).unwrap();
+
+		assert_eq!(result1, result2);
+
+		// Test multiple calls on the same payload
+		let result3 = reconstruct_permit2_digest(&payload1).unwrap();
+		assert_eq!(result1, result3);
+	}
 }
