@@ -732,18 +732,10 @@ impl OrderInterface for Eip7683OrderImpl {
 			settler_address,
 		}];
 
-		// Build output chains with settler addresses (deduplicated by chain_id)
+		// Build output chains with settler addresses
 		let mut output_chains = Vec::new();
-		let mut seen_chains = std::collections::HashSet::new();
-
 		for output in &standard_order.outputs {
 			let output_chain_id = output.chainId.to::<u64>();
-
-			// Skip if we've already added this chain
-			if seen_chains.contains(&output_chain_id) {
-				continue;
-			}
-
 			let output_network = self.networks.get(&output_chain_id).ok_or_else(|| {
 				OrderError::ValidationFailed(format!("Chain {} not configured", output_chain_id))
 			})?;
@@ -752,8 +744,6 @@ impl OrderInterface for Eip7683OrderImpl {
 				chain_id: output_chain_id,
 				settler_address: output_network.output_settler_address.clone(),
 			});
-
-			seen_chains.insert(output_chain_id);
 		}
 
 		// Try to use existing Eip7683OrderData from intent_data if available,
@@ -1731,16 +1721,41 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_validate_and_create_order_multiple_outputs() {
-		let networks = create_test_networks();
-		let oracle_routes = create_test_oracle_routes();
+		// Create networks with an additional chain (42161 for Arbitrum)
+		let networks = NetworksConfigBuilder::new()
+        .add_network(1, NetworkConfigBuilder::new().build())
+        .add_network(137, NetworkConfigBuilder::new().build())
+        .add_network(42161, NetworkConfigBuilder::new().build()) // Add Arbitrum
+        .build();
+
+		// Create oracle routes that support the additional chain
+		let mut supported_routes = HashMap::new();
+		let input_oracle = OracleInfo {
+			chain_id: 1,
+			oracle: Address(vec![10u8; 20]),
+		};
+		let output_oracle_polygon = OracleInfo {
+			chain_id: 137,
+			oracle: Address(vec![11u8; 20]),
+		};
+		let output_oracle_arbitrum = OracleInfo {
+			chain_id: 42161,
+			oracle: Address(vec![12u8; 20]), // Different oracle for Arbitrum
+		};
+		supported_routes.insert(
+			input_oracle,
+			vec![output_oracle_polygon, output_oracle_arbitrum],
+		);
+		let oracle_routes = OracleRoutes { supported_routes };
+
 		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let mut standard_order = create_valid_standard_order();
-		// Add a second output on the same destination chain
+		// Add a second output on a different destination chain (Arbitrum)
 		standard_order.outputs.push(interfaces::SolMandateOutput {
-			oracle: alloy_primitives::B256::from([11u8; 32]),
+			oracle: alloy_primitives::B256::from([12u8; 32]), // Different oracle for Arbitrum
 			settler: alloy_primitives::B256::from([0x44; 32]),
-			chainId: U256::from(137), // Same as first output
+			chainId: U256::from(42161), // Arbitrum chain ID (different from first output)
 			token: alloy_primitives::B256::from([0x77; 32]),
 			amount: U256::from(500),
 			recipient: alloy_primitives::B256::from([0x88; 32]),
@@ -1764,9 +1779,11 @@ mod tests {
 		assert!(result.is_ok());
 		let order = result.unwrap();
 
-		// Should have one output chain (137) even with multiple outputs
-		assert_eq!(order.output_chains.len(), 1);
-		assert_eq!(order.output_chains[0].chain_id, 137);
+		// Should have two output chains (137 and 42161) with multiple outputs
+		assert_eq!(order.output_chains.len(), 2);
+		let chain_ids: Vec<u64> = order.output_chains.iter().map(|oc| oc.chain_id).collect();
+		assert!(chain_ids.contains(&137));
+		assert!(chain_ids.contains(&42161));
 
 		let order_data: Eip7683OrderData = serde_json::from_value(order.data).unwrap();
 		assert_eq!(order_data.outputs.len(), 2);
