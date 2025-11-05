@@ -153,7 +153,7 @@ impl ProtocolRegistry {
 			chain_id,
 		};
 
-		match delivery_service.contract_call(chain_id, tx).await {
+		match delivery_service.contract_call(chain_id, tx, None).await {
 			Ok(result) => {
 				// Check if the returned value matches the expected EIP-3009 RECEIVE_WITH_AUTHORIZATION_TYPEHASH
 				// Expected: 0xd099cc98ef71107a616c4f0f941f04c322d8e254fe26b3c6668db87aae413de8

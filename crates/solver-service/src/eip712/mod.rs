@@ -64,7 +64,7 @@ pub async fn get_domain_separator(
 	};
 
 	let result = delivery
-		.contract_call(chain_id, tx)
+		.contract_call(chain_id, tx, None)
 		.await
 		.map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
@@ -186,7 +186,7 @@ mod tests {
 
 	fn delivery_service_with_success(response: Bytes) -> Arc<DeliveryService> {
 		let mut mock = MockDeliveryInterface::new();
-		mock.expect_eth_call().returning(move |_tx| {
+		mock.expect_eth_call().returning(move |_tx, _| {
 			let bytes = response.clone();
 			Box::pin(async move { Ok(bytes) })
 		});
@@ -195,7 +195,7 @@ mod tests {
 
 	fn delivery_service_with_error(message: &'static str) -> Arc<DeliveryService> {
 		let mut mock = MockDeliveryInterface::new();
-		mock.expect_eth_call().returning(move |_tx| {
+		mock.expect_eth_call().returning(move |_tx, _| {
 			let msg = message.to_string();
 			Box::pin(async move { Err(DeliveryError::Network(msg)) })
 		});

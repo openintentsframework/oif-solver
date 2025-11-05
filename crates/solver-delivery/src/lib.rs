@@ -114,6 +114,7 @@ pub trait DeliveryInterface: Send + Sync {
 		&self,
 		tx: Transaction,
 		tracking: Option<TransactionTrackingWithConfig>,
+		block_number: Option<u64>,
 	) -> Result<TransactionHash, DeliveryError>;
 
 	/// Retrieves the receipt for a transaction if available.
@@ -173,7 +174,12 @@ pub trait DeliveryInterface: Send + Sync {
 	///
 	/// This performs an eth_call RPC to read data from smart contracts
 	/// or simulate transaction execution without submitting to the blockchain.
-	async fn eth_call(&self, tx: Transaction) -> Result<Bytes, DeliveryError>;
+	/// If `block_number` is provided the call executes against that historical block.
+	async fn eth_call(
+		&self,
+		tx: Transaction,
+		block_number: Option<u64>,
+	) -> Result<Bytes, DeliveryError>;
 }
 
 /// Type alias for delivery factory functions.
@@ -244,6 +250,7 @@ impl DeliveryService {
 		&self,
 		tx: Transaction,
 		tracking: Option<TransactionTracking>,
+		block_number: Option<u64>,
 	) -> Result<TransactionHash, DeliveryError> {
 		// Get the implementation for the transaction's chain ID
 		let implementation = self
@@ -258,7 +265,9 @@ impl DeliveryService {
 			min_confirmations: self.min_confirmations,
 			monitoring_timeout_seconds: self.monitoring_timeout_seconds,
 		});
-		implementation.submit(tx, enhanced_tracking).await
+		implementation
+			.submit(tx, enhanced_tracking, block_number)
+			.await
 	}
 
 	/// Gets the transaction receipt for a given transaction hash.
@@ -399,17 +408,19 @@ impl DeliveryService {
 	///
 	/// This method is used to read data from smart contracts or simulate
 	/// transaction execution without actually submitting to the blockchain.
+	/// When `block_number` is provided the call is executed against that block.
 	/// Returns the raw bytes returned by the contract call.
 	pub async fn contract_call(
 		&self,
 		chain_id: u64,
 		tx: Transaction,
+		block_number: Option<u64>,
 	) -> Result<alloy_primitives::Bytes, DeliveryError> {
 		let implementation = self
 			.implementations
 			.get(&chain_id)
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
-		implementation.eth_call(tx).await
+		implementation.eth_call(tx, block_number).await
 	}
 }

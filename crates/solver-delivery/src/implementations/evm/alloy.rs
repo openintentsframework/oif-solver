@@ -13,7 +13,7 @@ use alloy_provider::{
 	DynProvider, Provider, ProviderBuilder,
 };
 use alloy_rpc_client::RpcClient;
-use alloy_rpc_types::TransactionRequest;
+use alloy_rpc_types::{BlockId, BlockNumberOrTag, TransactionRequest};
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_transport::layers::{RateLimitRetryPolicy, RetryBackoffLayer};
@@ -214,12 +214,41 @@ impl DeliveryInterface for AlloyDelivery {
 		&self,
 		tx: SolverTransaction,
 		tracking: Option<TransactionTrackingWithConfig>,
+		block_number: Option<u64>,
 	) -> Result<TransactionHash, DeliveryError> {
 		// Get the chain ID from the transaction
 		let chain_id = tx.chain_id;
 
 		// Get the appropriate provider for this chain
 		let provider = self.get_provider(chain_id)?;
+		if let Some(expected_block) = block_number {
+			match provider.get_block_number().await {
+				Ok(current_block) => {
+					tracing::debug!(
+						chain_id,
+						expected_block,
+						current_block,
+						"Submitting transaction with block hint"
+					);
+					if current_block != expected_block {
+						tracing::info!(
+							chain_id,
+							expected_block,
+							current_block,
+							"Block hint differs from current chain head"
+						);
+					}
+				},
+				Err(error) => {
+					tracing::warn!(
+						chain_id,
+						expected_block,
+						error = %error,
+						"Failed to fetch current block while using block hint"
+					);
+				},
+			}
+		}
 
 		// Convert solver transaction to alloy transaction request
 		let request: TransactionRequest = tx.clone().into();
@@ -484,7 +513,11 @@ impl DeliveryInterface for AlloyDelivery {
 		Ok(gas)
 	}
 
-	async fn eth_call(&self, tx: SolverTransaction) -> Result<Bytes, DeliveryError> {
+	async fn eth_call(
+		&self,
+		tx: SolverTransaction,
+		block_number: Option<u64>,
+	) -> Result<Bytes, DeliveryError> {
 		// Get the chain ID from the transaction
 		let chain_id = tx.chain_id;
 
@@ -495,8 +528,14 @@ impl DeliveryInterface for AlloyDelivery {
 		let request: TransactionRequest = tx.into();
 
 		// Execute the call without submitting a transaction
-		let result = provider
-			.call(request)
+		let call = provider.call(request);
+		let call = if let Some(number) = block_number {
+			let block_id = BlockId::Number(BlockNumberOrTag::Number(number));
+			call.block(block_id)
+		} else {
+			call
+		};
+		let result = call
 			.await
 			.map_err(|e| DeliveryError::Network(format!("Failed to execute eth_call: {}", e)))?;
 

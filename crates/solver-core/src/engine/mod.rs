@@ -175,8 +175,8 @@ impl SolverEngine {
 			storage.clone(),
 			state_machine.clone(),
 			event_bus.clone(),
-			config.networks.clone(),
 			config.solver.monitoring_timeout_seconds / 60, // Convert seconds to minutes
+			config.networks.clone(),
 		));
 
 		Self {

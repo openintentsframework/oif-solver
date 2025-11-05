@@ -6,9 +6,12 @@
 use crate::{utils::parse_oracle_config, OracleConfig, SettlementError, SettlementInterface};
 use alloy_primitives::{hex, FixedBytes, U256};
 use alloy_provider::{DynProvider, Provider};
+use alloy_rpc_types::{BlockId, BlockNumberOrTag};
 use alloy_sol_types::{sol, SolCall};
+use alloy_transport::TransportError;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
 use solver_storage::StorageService;
 use solver_types::{
@@ -834,6 +837,7 @@ impl HyperlaneSettlement {
 		source: solver_types::Address,
 		payloads: Vec<Vec<u8>>,
 		from: solver_types::Address,
+		block_id: Option<u64>,
 	) -> Result<U256, SettlementError> {
 		// Get the output oracle address for the oracle chain (where we're calling from)
 		let oracle_addresses = self.get_output_oracles(oracle_chain);
@@ -854,6 +858,10 @@ impl HyperlaneSettlement {
 			SettlementError::ValidationFailed(format!("No provider for chain {}", oracle_chain))
 		})?;
 
+		let payload_sizes: Vec<usize> = payloads.iter().map(Vec::len).collect();
+		let total_payload_len: usize = payload_sizes.iter().sum();
+		let custom_metadata_len = custom_metadata.len();
+
 		// Build the quoteGasPayment call
 		let call_data = IHyperlaneOracle::quoteGasPayment_0Call {
 			destinationDomain: destination_chain,
@@ -864,18 +872,93 @@ impl HyperlaneSettlement {
 			payloads: payloads.into_iter().map(Into::into).collect(),
 		};
 
+		let encoded_call = call_data.abi_encode();
+		let call_data_hex = solver_types::with_0x_prefix(&hex::encode(&encoded_call));
+		let call_data_len = encoded_call.len();
+
+		let call_block_id = if let Some(block_number) = block_id {
+			BlockId::Number(BlockNumberOrTag::Number(block_number))
+		} else {
+			Self::resolve_call_block_id(provider, oracle_chain, destination_chain).await
+		};
+		let block_source = if block_id.is_some() {
+			"provided"
+		} else {
+			"resolved_latest"
+		};
 		// Create call request with from address to ensure correct msg.sender in the call
 		let call_request = alloy_rpc_types::eth::transaction::TransactionRequest {
 			from: Some(alloy_primitives::Address::from_slice(&from.0)),
 			to: Some(alloy_primitives::TxKind::Call(
 				alloy_primitives::Address::from_slice(&oracle_address.0),
 			)),
-			input: call_data.abi_encode().into(),
+			input: encoded_call.clone().into(),
 			..Default::default()
 		};
 
+		tracing::info!(
+			oracle_chain,
+			destination_chain,
+			block_id = %Self::format_block_id(call_block_id.clone()),
+			block_source,
+			gas_limit = %gas_limit,
+			recipient_oracle = %solver_types::with_0x_prefix(&hex::encode(&recipient_oracle.0)),
+			source = %solver_types::with_0x_prefix(&hex::encode(&source.0)),
+			caller = %solver_types::with_0x_prefix(&hex::encode(&from.0)),
+			payload_count = payload_sizes.len(),
+			payload_sizes = ?payload_sizes,
+			total_payload_len,
+			custom_metadata_len,
+			call_data_len,
+			"Hyperlane gas quote request"
+		);
+
 		// Make the eth_call to get the quote with timing
-		let result = provider.call(call_request).await.map_err(|e| {
+		let call_data_hex_for_error = call_data_hex.clone();
+		let call_result = provider
+			.call(call_request.clone())
+			.block(call_block_id.clone())
+			.await;
+
+		if let Err(ref e) = call_result {
+			let (rpc_code, rpc_message, rpc_data) = match &e {
+				TransportError::ErrorResp(payload) => (
+					Some(payload.code),
+					Some(payload.message.clone()),
+					payload.data.as_ref().map(|data| format!("{:?}", data)),
+				),
+				_ => (None, None, None),
+			};
+			tracing::info!(
+				oracle_chain,
+				destination_chain,
+				error = %e,
+				rpc_code = ?rpc_code,
+				rpc_message = ?rpc_message,
+				rpc_data = ?rpc_data,
+				block_id = %Self::format_block_id(call_block_id.clone()),
+				call_data_len,
+				call_data = %call_data_hex_for_error,
+				"Hyperlane gas quote failed"
+			);
+		}
+		match Self::fetch_debug_trace(provider, &call_request, call_block_id.clone()).await {
+			Ok(trace) => tracing::info!(
+				oracle_chain,
+				destination_chain,
+				block_id = %Self::format_block_id(call_block_id.clone()),
+				trace = ?trace,
+				"Hyperlane debug_traceCall response"
+			),
+			Err(trace_err) => tracing::info!(
+				oracle_chain,
+				destination_chain,
+				block_id = %Self::format_block_id(call_block_id),
+				error = ?trace_err,
+				"Hyperlane debug_traceCall failed"
+			),
+		}
+		let result = call_result.map_err(|e| {
 			SettlementError::ValidationFailed(format!("Failed to quote gas payment: {}", e))
 		})?;
 
@@ -884,6 +967,59 @@ impl HyperlaneSettlement {
 
 		// Return quote without buffer - the quote already includes IGP overhead
 		Ok(quote)
+	}
+
+	async fn resolve_call_block_id(
+		provider: &DynProvider,
+		oracle_chain: u64,
+		destination_chain: u32,
+	) -> BlockId {
+		match provider.get_block_by_number(BlockNumberOrTag::Latest).await {
+			Ok(Some(block)) => BlockId::hash(block.header.hash),
+			Ok(None) => {
+				tracing::warn!(
+					oracle_chain,
+					destination_chain,
+					"Latest block query returned None; defaulting to tag:latest"
+				);
+				BlockId::Number(BlockNumberOrTag::Latest)
+			},
+			Err(error) => {
+				tracing::warn!(
+					oracle_chain,
+					destination_chain,
+					error = %error,
+					"Failed to fetch latest block; defaulting to tag:latest"
+				);
+				BlockId::Number(BlockNumberOrTag::Latest)
+			},
+		}
+	}
+
+	async fn fetch_debug_trace(
+		provider: &DynProvider,
+		call_request: &alloy_rpc_types::eth::transaction::TransactionRequest,
+		block_id: BlockId,
+	) -> Result<Value, TransportError> {
+		let params = (
+			call_request.clone(),
+			block_id,
+			json!({ "tracer": "callTracer" }),
+		);
+		let client = provider.client();
+		client.request::<_, Value>("debug_traceCall", params).await
+	}
+
+	fn format_block_id(block_id: BlockId) -> String {
+		match block_id {
+			BlockId::Hash(hash) => format!("hash:0x{}", hex::encode(hash.block_hash)),
+			BlockId::Number(BlockNumberOrTag::Number(num)) => format!("number:{}", num),
+			BlockId::Number(BlockNumberOrTag::Latest) => "tag:latest".to_string(),
+			BlockId::Number(BlockNumberOrTag::Finalized) => "tag:finalized".to_string(),
+			BlockId::Number(BlockNumberOrTag::Safe) => "tag:safe".to_string(),
+			BlockId::Number(BlockNumberOrTag::Earliest) => "tag:earliest".to_string(),
+			BlockId::Number(BlockNumberOrTag::Pending) => "tag:pending".to_string(),
+		}
 	}
 }
 
@@ -1111,6 +1247,7 @@ impl SettlementInterface for HyperlaneSettlement {
 		&self,
 		order: &Order,
 		fill_receipt: &TransactionReceipt,
+		block_number: Option<u64>,
 	) -> Result<Option<Transaction>, SettlementError> {
 		// Get chains
 		let dest_chain = order
@@ -1197,6 +1334,7 @@ impl SettlementInterface for HyperlaneSettlement {
 				output_settler.settler_address.clone(),
 				payloads.clone(),
 				order.solver_address.clone(), // Solver address for msg.sender
+				block_number,
 			)
 			.await?;
 

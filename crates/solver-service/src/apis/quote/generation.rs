@@ -879,7 +879,7 @@ impl QuoteGenerator {
 		// Call the contract using the delivery service directly
 		let order_id_bytes = self
 			.delivery_service
-			.contract_call(input_chain_id, tx)
+			.contract_call(input_chain_id, tx, None)
 			.await
 			.map_err(|e| {
 				QuoteError::InvalidRequest(format!("Failed to compute order ID: {}", e))
@@ -931,7 +931,7 @@ impl QuoteGenerator {
 		// Call the contract using the delivery service
 		let domain_separator_bytes = self
 			.delivery_service
-			.contract_call(chain_id, tx)
+			.contract_call(chain_id, tx, None)
 			.await
 			.map_err(|e| {
 				QuoteError::InvalidRequest(format!("Failed to get domain separator: {}", e))
@@ -1215,7 +1215,7 @@ impl QuoteGenerator {
 
 		let result = self
 			.delivery_service
-			.contract_call(chain_id, tx)
+			.contract_call(chain_id, tx, None)
 			.await
 			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to get token name: {}", e)))?;
 

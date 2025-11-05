@@ -471,7 +471,7 @@ async fn validate_intent_request(
 
 			// Execute via DeliveryService
 			delivery
-				.contract_call(chain_id, tx)
+				.contract_call(chain_id, tx, None)
 				.await
 				.map(|bytes| bytes.to_vec())
 				.map_err(|e| format!("Contract call failed: {}", e))

@@ -200,6 +200,7 @@ pub trait SettlementInterface: Send + Sync {
 		&self,
 		_order: &Order,
 		_fill_receipt: &TransactionReceipt,
+		_block_number: Option<u64>,
 	) -> Result<Option<Transaction>, SettlementError> {
 		// Default: no post-fill transaction needed
 		Ok(None)
@@ -541,10 +542,11 @@ impl SettlementService {
 		&self,
 		order: &Order,
 		fill_receipt: &TransactionReceipt,
+		block_number: Option<u64>,
 	) -> Result<Option<Transaction>, SettlementError> {
 		let implementation = self.find_settlement_for_order(order)?;
 		implementation
-			.generate_post_fill_transaction(order, fill_receipt)
+			.generate_post_fill_transaction(order, fill_receipt, block_number)
 			.await
 	}
 

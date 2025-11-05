@@ -374,7 +374,7 @@ mod tests {
 
 		let mut mock_delivery = MockDeliveryInterface::new();
 		let domain_bytes = Bytes::from(domain_separator.to_vec());
-		mock_delivery.expect_eth_call().returning(move |_tx| {
+		mock_delivery.expect_eth_call().returning(move |_tx, _| {
 			let bytes = domain_bytes.clone();
 			Box::pin(async move { Ok(bytes) })
 		});
@@ -469,7 +469,7 @@ mod tests {
 	async fn validate_signature_errors_when_domain_separator_call_fails() {
 		let fixture = build_signature_fixture();
 		let mut mock_delivery = MockDeliveryInterface::new();
-		mock_delivery.expect_eth_call().returning(|_| {
+		mock_delivery.expect_eth_call().returning(|_, _| {
 			Box::pin(async move { Err(DeliveryError::Network("eth_call failed".to_string())) })
 		});
 		let failing_delivery = delivery_service_from_mock(fixture.chain_id, mock_delivery);

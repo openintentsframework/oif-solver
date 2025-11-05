@@ -274,6 +274,7 @@ impl SettlementInterface for DirectSettlement {
 		&self,
 		order: &Order,
 		_fill_receipt: &TransactionReceipt,
+		_block_number: Option<u64>,
 	) -> Result<Option<Transaction>, SettlementError> {
 		// Get the output oracle for PostFill (happens on destination chain)
 		let dest_chain = order

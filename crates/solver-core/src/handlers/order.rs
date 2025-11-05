@@ -119,7 +119,7 @@ impl OrderHandler {
 
 			let prepare_tx_hash = self
 				.delivery
-				.deliver(prepare_tx.clone(), Some(tracking))
+				.deliver(prepare_tx.clone(), Some(tracking), None)
 				.await
 				.map_err(|e| OrderError::Service(e.to_string()))?;
 
@@ -230,7 +230,7 @@ impl OrderHandler {
 
 		let tx_hash = self
 			.delivery
-			.deliver(tx.clone(), Some(tracking))
+			.deliver(tx.clone(), Some(tracking), None)
 			.await
 			.map_err(|e| OrderError::Service(e.to_string()))?;
 
@@ -379,7 +379,7 @@ mod tests {
 				mock_delivery
 					.expect_submit()
 					.times(1)
-					.returning(move |_tx, _tracking| {
+					.returning(move |_tx, _tracking, _| {
 						let hash = hash_clone.clone();
 						Box::pin(async move { Ok(hash) })
 					});
@@ -594,7 +594,7 @@ mod tests {
 				mock_delivery
 					.expect_submit()
 					.times(1)
-					.returning(move |_tx, _tracking| {
+					.returning(move |_tx, _tracking, _| {
 						let hash = prepare_tx_hash.clone();
 						Box::pin(async move { Ok(hash) })
 					});
@@ -653,7 +653,7 @@ mod tests {
 				mock_delivery
 					.expect_submit()
 					.times(1)
-					.returning(move |_tx, _tracking| {
+					.returning(move |_tx, _tracking, _| {
 						let hash = fill_tx_hash_clone.clone();
 						Box::pin(async move { Ok(hash) })
 					});

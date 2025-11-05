@@ -37,7 +37,6 @@ pub enum SettlementError {
 /// Handler for processing settlement operations.
 ///
 /// The SettlementHandler manages the complete settlement lifecycle including:
-/// - Fill readiness monitoring (RPC indexing delays)
 /// - Post-fill transaction generation and submission (e.g., oracle attestation requests)
 /// - Pre-claim transaction generation and submission (e.g., oracle signature submission)
 /// - Claim transaction batch processing for reward collection
@@ -49,12 +48,11 @@ pub struct SettlementHandler {
 	storage: Arc<StorageService>,
 	state_machine: Arc<OrderStateMachine>,
 	event_bus: EventBus,
-	networks_config: NetworksConfig,
 	monitoring_timeout_minutes: u64,
+	networks_config: NetworksConfig,
 }
 
 impl SettlementHandler {
-	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		settlement: Arc<SettlementService>,
 		order_service: Arc<OrderService>,
@@ -62,8 +60,8 @@ impl SettlementHandler {
 		storage: Arc<StorageService>,
 		state_machine: Arc<OrderStateMachine>,
 		event_bus: EventBus,
-		networks_config: NetworksConfig,
 		monitoring_timeout_minutes: u64,
+		networks_config: NetworksConfig,
 	) -> Self {
 		Self {
 			settlement,
@@ -72,8 +70,8 @@ impl SettlementHandler {
 			storage,
 			state_machine,
 			event_bus,
-			networks_config,
 			monitoring_timeout_minutes,
+			networks_config,
 		}
 	}
 
@@ -143,11 +141,23 @@ impl SettlementHandler {
 			.get_receipt(&fill_tx_hash, chain_id)
 			.await
 			.map_err(|e| SettlementError::Service(format!("Failed to get fill receipt: {}", e)))?;
-
+		// Get the latest block number for the destination chain (optional hint)
+		let block_number = match self.delivery.get_block_number(chain_id).await {
+			Ok(number) => Some(number),
+			Err(error) => {
+				tracing::warn!(
+					order_id = %truncate_id(&order_id),
+					chain_id,
+					error = %error,
+					"Failed to fetch latest block number; continuing without block hint"
+				);
+				None
+			},
+		};
 		// Generate post-fill transaction
 		let post_fill_tx = self
 			.settlement
-			.generate_post_fill_transaction(&order, &receipt)
+			.generate_post_fill_transaction(&order, &receipt, block_number)
 			.await
 			.map_err(|e| SettlementError::Service(e.to_string()))?;
 
@@ -196,7 +206,7 @@ impl SettlementHandler {
 
 				let tx_hash = self
 					.delivery
-					.deliver(post_fill_tx.clone(), Some(tracking))
+					.deliver(post_fill_tx.clone(), Some(tracking), block_number)
 					.await
 					.map_err(|e| SettlementError::Service(e.to_string()))?;
 
@@ -328,7 +338,7 @@ impl SettlementHandler {
 
 				let tx_hash = self
 					.delivery
-					.deliver(pre_claim_tx.clone(), Some(tracking))
+					.deliver(pre_claim_tx.clone(), Some(tracking), None)
 					.await
 					.map_err(|e| SettlementError::Service(e.to_string()))?;
 
@@ -446,7 +456,7 @@ impl SettlementHandler {
 
 			let claim_tx_hash = self
 				.delivery
-				.deliver(claim_tx.clone(), Some(tracking))
+				.deliver(claim_tx.clone(), Some(tracking), None)
 				.await
 				.map_err(|e| SettlementError::Service(e.to_string()))?;
 
@@ -491,7 +501,9 @@ mod tests {
 	use solver_types::utils::tests::builders::{
 		OrderBuilder, TransactionBuilder, TransactionReceiptBuilder,
 	};
-	use solver_types::{Address, Order, Transaction, TransactionHash, TransactionReceipt};
+	use solver_types::{
+		Address, NetworksConfig, Order, Transaction, TransactionHash, TransactionReceipt,
+	};
 	use std::collections::HashMap;
 	use std::sync::Arc;
 	use tokio::sync::broadcast;
@@ -576,8 +588,8 @@ mod tests {
 			storage,
 			state_machine,
 			event_bus,
-			solver_types::NetworksConfig::new(), // Empty networks config for tests
 			30,
+			NetworksConfig::new(),
 		);
 
 		(handler, event_rx)
@@ -695,7 +707,7 @@ mod tests {
 				mock_settlement
 					.expect_generate_post_fill_transaction()
 					.times(1)
-					.returning(|_, _| {
+					.returning(|_, _, _| {
 						let tx = create_test_transaction();
 						Box::pin(async move { Ok(Some(tx)) })
 					});
@@ -709,7 +721,12 @@ mod tests {
 						let receipt = create_test_receipt();
 						Box::pin(async move { Ok(receipt) })
 					});
-				mock_delivery.expect_submit().times(1).returning(|_, _| {
+				mock_delivery
+					.expect_get_block_number()
+					.with(eq(137u64))
+					.times(1)
+					.returning(|_| Box::pin(async move { Ok(123u64) }));
+				mock_delivery.expect_submit().times(1).returning(|_, _, _| {
 					let hash = TransactionHash(vec![0x33; 32]);
 					Box::pin(async move { Ok(hash) })
 				});
@@ -754,7 +771,7 @@ mod tests {
 					.expect_generate_post_fill_transaction()
 					.times(1)
 					// Return None to indicate no transaction needed
-					.returning(|_, _| Box::pin(async move { Ok(None) }));
+				.returning(|_, _, _| Box::pin(async move { Ok(None) }));
 			},
 			|mock_delivery| {
 				mock_delivery
@@ -765,6 +782,11 @@ mod tests {
 						let receipt = create_test_receipt();
 						Box::pin(async move { Ok(receipt) })
 					});
+				mock_delivery
+					.expect_get_block_number()
+					.with(eq(137u64))
+					.times(1)
+					.returning(|_| Box::pin(async move { Ok(123u64) }));
 			},
 			|_| {}, // No order expectations
 		)

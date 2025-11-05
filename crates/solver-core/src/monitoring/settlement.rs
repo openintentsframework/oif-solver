@@ -135,7 +135,7 @@ impl SettlementMonitor {
 			.map(|config| config.rpc_indexing_delay_seconds)
 			.unwrap_or(solver_types::networks::default_rpc_indexing_delay_seconds());
 
-		tracing::debug!(
+		tracing::info!(
 			order_id = %truncate_id(&order.id),
 			chain_id = chain_id,
 			delay_seconds = delay_seconds,
@@ -152,7 +152,7 @@ impl SettlementMonitor {
 			}))
 			.ok();
 
-		tracing::debug!(
+		tracing::info!(
 			order_id = %truncate_id(&order.id),
 			"PostFillReady emitted after RPC indexing delay"
 		);
