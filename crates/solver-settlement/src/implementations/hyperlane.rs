@@ -873,9 +873,13 @@ impl HyperlaneSettlement {
 		};
 
 		// Make the eth_call to get the quote
-		let result = provider.call(call_request).await.map_err(|e| {
-			SettlementError::ValidationFailed(format!("Failed to quote gas payment: {}", e))
-		})?;
+		let result = provider
+			.call(call_request)
+			.block(alloy_rpc_types::eth::BlockId::latest())
+			.await
+			.map_err(|e| {
+				SettlementError::ValidationFailed(format!("Failed to quote gas payment: {}", e))
+			})?;
 
 		// Decode the result
 		let quote = U256::from_be_slice(&result);
