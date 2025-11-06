@@ -873,9 +873,13 @@ impl HyperlaneSettlement {
 		};
 
 		// Make the eth_call to get the quote
-		let result = provider.call(call_request).await.map_err(|e| {
-			SettlementError::ValidationFailed(format!("Failed to quote gas payment: {}", e))
-		})?;
+		let result = provider
+			.call(call_request)
+			.block(alloy_rpc_types::eth::BlockId::latest())
+			.await
+			.map_err(|e| {
+				SettlementError::ValidationFailed(format!("Failed to quote gas payment: {}", e))
+			})?;
 
 		// Decode the result
 		let quote = U256::from_be_slice(&result);
@@ -1206,13 +1210,16 @@ impl SettlementInterface for HyperlaneSettlement {
 			payloads: payloads.into_iter().map(Into::into).collect(),
 		};
 
+		// Set explicit gas limit for the submit transaction
+		let submit_gas_limit = self.default_gas_limit;
+
 		Ok(Some(Transaction {
 			to: Some(oracle_address),
 			data: call_data.abi_encode(),
 			value: gas_payment,
 			chain_id: dest_chain,
 			nonce: None,
-			gas_limit: None,
+			gas_limit: Some(submit_gas_limit),
 			gas_price: None,
 			max_fee_per_gas: None,
 			max_priority_fee_per_gas: None,
