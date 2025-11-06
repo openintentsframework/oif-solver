@@ -1210,13 +1210,16 @@ impl SettlementInterface for HyperlaneSettlement {
 			payloads: payloads.into_iter().map(Into::into).collect(),
 		};
 
+		// Set explicit gas limit for the submit transaction
+		let submit_gas_limit = self.default_gas_limit;
+
 		Ok(Some(Transaction {
 			to: Some(oracle_address),
 			data: call_data.abi_encode(),
 			value: gas_payment,
 			chain_id: dest_chain,
 			nonce: None,
-			gas_limit: None,
+			gas_limit: Some(submit_gas_limit),
 			gas_price: None,
 			max_fee_per_gas: None,
 			max_priority_fee_per_gas: None,
