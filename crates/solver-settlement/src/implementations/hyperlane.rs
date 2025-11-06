@@ -873,15 +873,63 @@ impl HyperlaneSettlement {
 		};
 
 		// Make the eth_call to get the quote
-		let result = provider.call(call_request).await.map_err(|e| {
-			SettlementError::ValidationFailed(format!("Failed to quote gas payment: {}", e))
-		})?;
+		let result = provider
+			.call(call_request)
+			.block(alloy_rpc_types::eth::BlockId::latest())
+			.await
+			.map_err(|e| {
+				SettlementError::ValidationFailed(format!("Failed to quote gas payment: {}", e))
+			})?;
 
 		// Decode the result
 		let quote = U256::from_be_slice(&result);
 
 		// Return quote without buffer for now - the quote already includes IGP overhead
 		Ok(quote)
+	}
+
+	/// Check if payloads have been attested by OutputSettler
+	/// Must be called with 'from' set to the oracle address since the contract
+	/// uses msg.sender as the oracle when computing the output hash
+	async fn check_payloads_attested(
+		&self,
+		output_settler_address: &solver_types::Address,
+		payloads: &[Vec<u8>],
+		chain_id: u64,
+		oracle_address: &solver_types::Address,
+	) -> Result<bool, SettlementError> {
+		let provider = self.providers.get(&chain_id).ok_or_else(|| {
+			SettlementError::ValidationFailed(format!("No provider for chain {}", chain_id))
+		})?;
+
+		// Build the hasAttested call
+		sol! {
+			interface IAttester {
+				function hasAttested(bytes[] calldata payloads) external view returns (bool);
+			}
+		}
+
+		let call_data = IAttester::hasAttestedCall {
+			payloads: payloads.iter().map(|p| p.clone().into()).collect(),
+		};
+
+		// CRITICAL: Set 'from' to the oracle address
+		// The contract uses msg.sender (oracle) when computing the output hash
+		let request = alloy_rpc_types::eth::transaction::TransactionRequest {
+			from: Some(alloy_primitives::Address::from_slice(&oracle_address.0)),
+			to: Some(alloy_primitives::TxKind::Call(
+				alloy_primitives::Address::from_slice(&output_settler_address.0),
+			)),
+			input: call_data.abi_encode().into(),
+			..Default::default()
+		};
+
+		let result = provider.call(request).await.map_err(|e| {
+			SettlementError::ValidationFailed(format!("Failed to check attestation: {}", e))
+		})?;
+
+		// Decode boolean result (last byte of 32-byte result)
+		Ok(result.len() >= 32 && result[31] != 0)
 	}
 }
 
@@ -1182,6 +1230,77 @@ impl SettlementInterface for HyperlaneSettlement {
 		// Calculate gas limit based on actual payload size
 		let total_payload_size: usize = payloads.iter().map(|p| p.len()).sum();
 		let gas_limit = self.calculate_message_gas_limit(total_payload_size);
+
+		// Smart polling: Check if payloads are attested before calling estimate_gas_payment
+		// Uses hasAttested() with 'from' set to oracle address for correct hash computation
+		const MAX_POLL_ATTEMPTS: u32 = 10;
+		const INITIAL_DELAY_MS: u64 = 200;
+
+		tracing::info!(
+			order_id = %solver_types::utils::formatting::truncate_id(&order.id),
+			oracle = %hex::encode(&oracle_address.0),
+			settler = %hex::encode(&output_settler.settler_address.0),
+			"🔍 Polling hasAttested() on OutputSettler"
+		);
+
+		for attempt in 1..=MAX_POLL_ATTEMPTS {
+			match self
+				.check_payloads_attested(
+					&output_settler.settler_address,
+					&payloads,
+					dest_chain,
+					&oracle_address, // Use oracle address as 'from' for correct hash
+				)
+				.await
+			{
+				Ok(true) => {
+					tracing::info!(
+						order_id = %solver_types::utils::formatting::truncate_id(&order.id),
+						attempt,
+						"✅ hasAttested=TRUE, proceeding"
+					);
+					break;
+				},
+				Ok(false) => {
+					if attempt < MAX_POLL_ATTEMPTS {
+						let delay = INITIAL_DELAY_MS * 2_u64.pow(attempt - 1);
+						tracing::info!(
+							order_id = %solver_types::utils::formatting::truncate_id(&order.id),
+							attempt,
+							delay_ms = delay,
+							"❌ hasAttested=FALSE, retrying..."
+						);
+						tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+					} else {
+						tracing::warn!(
+							order_id = %solver_types::utils::formatting::truncate_id(&order.id),
+							attempts = attempt,
+							"⚠️  hasAttested still FALSE after max polling"
+						);
+					}
+				},
+				Err(e) => {
+					if attempt < MAX_POLL_ATTEMPTS {
+						let delay = INITIAL_DELAY_MS * 2_u64.pow(attempt - 1);
+						tracing::info!(
+							order_id = %solver_types::utils::formatting::truncate_id(&order.id),
+							attempt,
+							delay_ms = delay,
+							error = %e,
+							"⚠️  hasAttested ERROR, retrying..."
+						);
+						tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+					} else {
+						tracing::warn!(
+							order_id = %solver_types::utils::formatting::truncate_id(&order.id),
+							attempts = attempt,
+							error = %e,
+							"❌ hasAttested check failed after max attempts"
+						);
+					}
+				},
+			}
+		}
 
 		// Estimate gas payment with correct payloads
 		let gas_payment = self

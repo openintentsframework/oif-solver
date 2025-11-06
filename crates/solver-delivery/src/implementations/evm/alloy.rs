@@ -222,31 +222,96 @@ impl DeliveryInterface for AlloyDelivery {
 		let provider = self.get_provider(chain_id)?;
 
 		// Convert solver transaction to alloy transaction request
-		let request: TransactionRequest = tx.clone().into();
+		let mut request: TransactionRequest = tx.clone().into();
+
+		// Override gas limit with a high value to avoid gas estimation issues
+		// Set to 800,000 which should be sufficient for most transactions
+		if request.gas.is_none() {
+			request.gas = Some(800_000);
+			tracing::info!(
+				"Setting gas limit to 800,000 for transaction on chain {}",
+				chain_id
+			);
+		}
+
+		// Get call data for logging
+		let empty_bytes = Bytes::new();
+		let call_data = request.input.input().unwrap_or(&empty_bytes);
+		let call_data_hex = format!("0x{}", hex::encode(call_data));
 
 		// Log request details for debugging
 		if tracking.is_some() {
-			tracing::debug!(
+			tracing::info!(
 				"Sending transaction with monitoring on chain {}: to={:?}, value={:?}, data_len={}, gas_limit={:?}",
 				chain_id,
 				request.to,
 				request.value,
-				request.input.input().map(|d| d.len()).unwrap_or(0),
-				request.gas
+				call_data.len(),
+				request.gas,
 			);
 		} else {
-			tracing::debug!(
+			tracing::info!(
 				"Sending transaction on chain {}: to={:?}, value={:?}, data_len={}, gas_limit={:?}",
 				chain_id,
 				request.to,
 				request.value,
-				request.input.input().map(|d| d.len()).unwrap_or(0),
+				call_data.len(),
 				request.gas
 			);
 		}
 
+		// Extract data for error logging before moving request
+		let from_addr = request.from;
+		let to_addr = request.to;
+		let value = request.value;
+		let gas = request.gas;
+		let call_data_hex_clone = call_data_hex.clone();
+
 		// Send transaction - the provider's wallet will handle signing
 		let pending_tx = provider.send_transaction(request).await.map_err(|e| {
+			// Log detailed transaction data for simulation with cast
+			tracing::info!(
+				"🔍 CAST SIMULATION DATA for chain {}:\n\
+			 From: {:?}\n\
+			 To: {:?}\n\
+			 Value: {}\n\
+			 Data: {}\n\
+			 Gas: {}",
+				chain_id,
+				from_addr,
+				to_addr,
+				value
+					.map(|v| v.to_string())
+					.unwrap_or_else(|| "0".to_string()),
+				call_data_hex_clone,
+				gas.map(|g| g.to_string())
+					.unwrap_or_else(|| "auto".to_string())
+			);
+
+			// Log the exact cast command for easy copy-paste
+			if let Some(to_kind) = to_addr {
+				if let Some(to_address) = to_kind.to() {
+					let from_str = from_addr
+						.map(|f| format!("--from {}", f))
+						.unwrap_or_else(|| "--from <YOUR_ACCOUNT>".to_string());
+					let value_str = value
+						.map(|v| v.to_string())
+						.unwrap_or_else(|| "0".to_string());
+					let gas_str = gas
+						.map(|g| format!("--gas-limit {}", g))
+						.unwrap_or_else(|| "".to_string());
+					tracing::info!(
+						"📋 Run this command to simulate:\n\
+					 cast call {} {} {} --value {} {} --rpc-url <YOUR_RPC_URL>",
+						to_address,
+						call_data_hex_clone,
+						from_str,
+						value_str,
+						gas_str
+					);
+				}
+			}
+
 			tracing::error!("Transaction submission failed on chain {}: {}", chain_id, e);
 			DeliveryError::Network(format!("Failed to send transaction: {}", e))
 		})?;
