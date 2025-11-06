@@ -115,7 +115,7 @@ settlement_poll_interval_seconds = 10 # How often to check can_claim
 [settlement.implementations.hyperlane]
 order = "eip7683"
 network_ids = [11155420, 84532]
-default_gas_limit = 500000
+default_gas_limit = 300000
 message_timeout_seconds = 600
 finalization_required = true
 
