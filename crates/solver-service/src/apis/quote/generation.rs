@@ -2261,15 +2261,15 @@ mod tests {
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 
-	// Test with configured validity
-	let config = create_test_config();
-	let validity = generator.get_quote_validity_seconds(&config);
-	assert_eq!(validity, 60); // Updated default: 1 minute
+		// Test with configured validity
+		let config = create_test_config();
+		let validity = generator.get_quote_validity_seconds(&config);
+		assert_eq!(validity, 60); // Updated default: 1 minute
 
-	// Test with no API config (should use default)
-	let config_no_api = ConfigBuilder::new().build();
-	let validity_default = generator.get_quote_validity_seconds(&config_no_api);
-	assert_eq!(validity_default, 60); // Updated default: 1 minute
+		// Test with no API config (should use default)
+		let config_no_api = ConfigBuilder::new().build();
+		let validity_default = generator.get_quote_validity_seconds(&config_no_api);
+		assert_eq!(validity_default, 60); // Updated default: 1 minute
 	}
 
 	#[tokio::test]
@@ -3158,30 +3158,30 @@ mod tests {
 	fn test_get_quote_validity_seconds_edge_cases() {
 		let generator = create_test_generator();
 
-	// Test with completely empty config (no API config)
-	let empty_config = ConfigBuilder::new().build();
+		// Test with completely empty config (no API config)
+		let empty_config = ConfigBuilder::new().build();
 
-	let validity = generator.get_quote_validity_seconds(&empty_config);
-	assert_eq!(validity, 60); // Updated default: 1 minute
+		let validity = generator.get_quote_validity_seconds(&empty_config);
+		assert_eq!(validity, 60); // Updated default: 1 minute
 
-	// Test with API config but no quote config
-	let api_no_quote_config = ConfigBuilder::new()
-		.api(Some(solver_config::ApiConfig {
-			enabled: true,
-			host: "127.0.0.1".to_string(),
-			port: 8080,
-			timeout_seconds: 30,
-			max_request_size: 1048576,
-			implementations: Default::default(),
-			rate_limiting: None,
-			cors: None,
-			auth: None,
-			quote: None, // No quote config
-		}))
-		.build();
+		// Test with API config but no quote config
+		let api_no_quote_config = ConfigBuilder::new()
+			.api(Some(solver_config::ApiConfig {
+				enabled: true,
+				host: "127.0.0.1".to_string(),
+				port: 8080,
+				timeout_seconds: 30,
+				max_request_size: 1048576,
+				implementations: Default::default(),
+				rate_limiting: None,
+				cors: None,
+				auth: None,
+				quote: None, // No quote config
+			}))
+			.build();
 
-	let validity_no_quote = generator.get_quote_validity_seconds(&api_no_quote_config);
-	assert_eq!(validity_no_quote, 60); // Updated default: 1 minute
+		let validity_no_quote = generator.get_quote_validity_seconds(&api_no_quote_config);
+		assert_eq!(validity_no_quote, 60); // Updated default: 1 minute
 	}
 
 	#[tokio::test]
