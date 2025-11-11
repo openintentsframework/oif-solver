@@ -292,15 +292,15 @@ mod tests {
 			port: 8080,
 			timeout_seconds: 30,
 			max_request_size: 1048576,
-		implementations: Default::default(),
-		rate_limiting: None,
-		cors: None,
-		auth: None,
-		quote: Some(QuoteConfig {
-			validity_seconds: 60,  // 1 minute
-			fill_deadline_seconds: 300,  // 5 minutes
-			expires_seconds: 600,  // 10 minutes
-		}),
+			implementations: Default::default(),
+			rate_limiting: None,
+			cors: None,
+			auth: None,
+			quote: Some(QuoteConfig {
+				validity_seconds: 60,       // 1 minute
+				fill_deadline_seconds: 300, // 5 minutes
+				expires_seconds: 600,       // 10 minutes
+			}),
 		};
 
 		let settlement_config = SettlementConfig {

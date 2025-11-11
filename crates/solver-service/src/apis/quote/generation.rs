@@ -551,7 +551,8 @@ impl QuoteGenerator {
 
 		// Calculate separate deadlines
 		// fillDeadline: Time to fill outputs on destination chains (default 5 minutes)
-		let fill_deadline_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until {
+		let fill_deadline_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until
+		{
 			// If user specifies min_valid_until, use it as fillDeadline
 			min_valid_until
 		} else {
@@ -562,7 +563,8 @@ impl QuoteGenerator {
 		// expires: Time to finalize/claim on origin chain (default 10 minutes, must be > fillDeadline)
 		let expires_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until {
 			// If user specifies min_valid_until, add buffer for expires
-			min_valid_until + (self.get_expires_seconds(config) - self.get_fill_deadline_seconds(config))
+			min_valid_until
+				+ (self.get_expires_seconds(config) - self.get_fill_deadline_seconds(config))
 		} else {
 			let expires_seconds = self.get_expires_seconds(config);
 			current_time + expires_seconds
@@ -979,7 +981,8 @@ impl QuoteGenerator {
 
 		// Calculate separate deadlines
 		// fillDeadline: Time to fill outputs on destination chains (default 5 minutes)
-		let fill_deadline_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until {
+		let fill_deadline_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until
+		{
 			// If user specifies min_valid_until, use it as fillDeadline
 			min_valid_until
 		} else {
@@ -990,7 +993,8 @@ impl QuoteGenerator {
 		// expires: Time for BatchCompact signature/claim on origin chain (default 10 minutes, must be > fillDeadline)
 		let expires = if let Some(min_valid_until) = request.intent.min_valid_until {
 			// If user specifies min_valid_until, add buffer for expires
-			min_valid_until + (self.get_expires_seconds(config) - self.get_fill_deadline_seconds(config))
+			min_valid_until
+				+ (self.get_expires_seconds(config) - self.get_fill_deadline_seconds(config))
 		} else {
 			let expires_seconds = self.get_expires_seconds(config);
 			current_time + expires_seconds
@@ -1532,13 +1536,13 @@ mod tests {
 			max_request_size: 1048576,
 			implementations: Default::default(),
 			rate_limiting: None,
-		cors: None,
-		auth: None,
-		quote: Some(QuoteConfig {
-			validity_seconds: 60,
-			fill_deadline_seconds: 300,
-			expires_seconds: 600,
-		}),
+			cors: None,
+			auth: None,
+			quote: Some(QuoteConfig {
+				validity_seconds: 60,
+				fill_deadline_seconds: 300,
+				expires_seconds: 600,
+			}),
 		};
 
 		// Create settlement configuration with domain
@@ -2257,15 +2261,15 @@ mod tests {
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 
-		// Test with configured validity
-		let config = create_test_config();
-		let validity = generator.get_quote_validity_seconds(&config);
-		assert_eq!(validity, 300);
+	// Test with configured validity
+	let config = create_test_config();
+	let validity = generator.get_quote_validity_seconds(&config);
+	assert_eq!(validity, 60); // Updated default: 1 minute
 
-		// Test with no API config (should use default)
-		let config_no_api = ConfigBuilder::new().build();
-		let validity_default = generator.get_quote_validity_seconds(&config_no_api);
-		assert_eq!(validity_default, 20); // if API none, use default 20
+	// Test with no API config (should use default)
+	let config_no_api = ConfigBuilder::new().build();
+	let validity_default = generator.get_quote_validity_seconds(&config_no_api);
+	assert_eq!(validity_default, 60); // Updated default: 1 minute
 	}
 
 	#[tokio::test]
@@ -3023,16 +3027,16 @@ mod tests {
 		let input_oracle = solver_types::Address(vec![0xaa; 20]);
 		let output_oracle = solver_types::Address(vec![0xbb; 20]);
 
-	let result = generator
-		.compute_eip3009_order_identifier(
-			&request,
-			&config,
-			&input_oracle,
-			&output_oracle,
-			1234567890,  // fill_deadline
-			1234568000,  // expires (should be > fill_deadline)
-		)
-		.await;
+		let result = generator
+			.compute_eip3009_order_identifier(
+				&request,
+				&config,
+				&input_oracle,
+				&output_oracle,
+				1234567890, // fill_deadline
+				1234568000, // expires (should be > fill_deadline)
+			)
+			.await;
 
 		// Expected to fail since we don't have a real contract to call
 		assert!(matches!(result, Err(QuoteError::InvalidRequest(_))));
@@ -3154,30 +3158,30 @@ mod tests {
 	fn test_get_quote_validity_seconds_edge_cases() {
 		let generator = create_test_generator();
 
-		// Test with completely empty config (no API config)
-		let empty_config = ConfigBuilder::new().build();
+	// Test with completely empty config (no API config)
+	let empty_config = ConfigBuilder::new().build();
 
-		let validity = generator.get_quote_validity_seconds(&empty_config);
-		assert_eq!(validity, 20); // Default value when no API config
+	let validity = generator.get_quote_validity_seconds(&empty_config);
+	assert_eq!(validity, 60); // Updated default: 1 minute
 
-		// Test with API config but no quote config
-		let api_no_quote_config = ConfigBuilder::new()
-			.api(Some(solver_config::ApiConfig {
-				enabled: true,
-				host: "127.0.0.1".to_string(),
-				port: 8080,
-				timeout_seconds: 30,
-				max_request_size: 1048576,
-				implementations: Default::default(),
-				rate_limiting: None,
-				cors: None,
-				auth: None,
-				quote: None, // No quote config
-			}))
-			.build();
+	// Test with API config but no quote config
+	let api_no_quote_config = ConfigBuilder::new()
+		.api(Some(solver_config::ApiConfig {
+			enabled: true,
+			host: "127.0.0.1".to_string(),
+			port: 8080,
+			timeout_seconds: 30,
+			max_request_size: 1048576,
+			implementations: Default::default(),
+			rate_limiting: None,
+			cors: None,
+			auth: None,
+			quote: None, // No quote config
+		}))
+		.build();
 
-		let validity_no_quote = generator.get_quote_validity_seconds(&api_no_quote_config);
-		assert_eq!(validity_no_quote, 20); // Default value when no quote config
+	let validity_no_quote = generator.get_quote_validity_seconds(&api_no_quote_config);
+	assert_eq!(validity_no_quote, 60); // Updated default: 1 minute
 	}
 
 	#[tokio::test]
