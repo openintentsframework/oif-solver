@@ -11,11 +11,11 @@ max_request_size = 1048576
 discovery = "offchain_eip7683"
 
 [api.auth]
-enabled = true
+enabled = false
 jwt_secret = "${JWT_SECRET:-JWT_SECRET}"
 access_token_expiry_hours = 1
 refresh_token_expiry_hours = 720
-issuer = "oif-solver-testnet"
+issuer = "oif-solver-mainnet"
 
 [api.quote]
 validity_seconds = 60
