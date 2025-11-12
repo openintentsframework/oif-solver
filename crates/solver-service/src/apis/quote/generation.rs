@@ -547,14 +547,27 @@ impl QuoteGenerator {
 	) -> Result<OifOrder, QuoteError> {
 		use alloy_primitives::hex;
 
-		// Use minValidUntil from request if provided (as absolute timestamp), otherwise use configured validity duration
-		let deadline_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until {
-			// min_valid_until is an absolute timestamp
+		let current_time = chrono::Utc::now().timestamp() as u64;
+
+		// Calculate separate deadlines
+		// fillDeadline: Time to fill outputs on destination chains (default 5 minutes)
+		let fill_deadline_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until
+		{
+			// If user specifies min_valid_until, use it as fillDeadline
 			min_valid_until
 		} else {
-			// Use configured validity duration added to current time
-			let validity_seconds = self.get_quote_validity_seconds(config);
-			chrono::Utc::now().timestamp() as u64 + validity_seconds
+			let fill_deadline_seconds = self.get_fill_deadline_seconds(config);
+			current_time + fill_deadline_seconds
+		};
+
+		// expires: Time to finalize/claim on origin chain (default 10 minutes, must be > fillDeadline)
+		let expires_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until {
+			// If user specifies min_valid_until, add buffer for expires
+			min_valid_until
+				+ (self.get_expires_seconds(config) - self.get_fill_deadline_seconds(config))
+		} else {
+			let expires_seconds = self.get_expires_seconds(config);
+			current_time + expires_seconds
 		};
 
 		// Get input chain to find the input settler address (the 'to' field)
@@ -572,8 +585,9 @@ impl QuoteGenerator {
 			alloy_primitives::Address::from_slice(&input_settler.0)
 		);
 
-		// Calculate fillDeadline (should match fillDeadline in StandardOrder)
-		let fill_deadline = deadline_timestamp as u32;
+		// Set fillDeadline for order
+		let fill_deadline = fill_deadline_timestamp as u32;
+		let expires = expires_timestamp as u32;
 
 		// Calculate the correct orderIdentifier using the contract
 		let (nonce_u64, order_identifier) = self
@@ -583,6 +597,7 @@ impl QuoteGenerator {
 				&input_oracle,
 				&output_oracle,
 				fill_deadline,
+				expires,
 			)
 			.await?;
 
@@ -634,8 +649,8 @@ impl QuoteGenerator {
 			"user": request.user.to_string(),
 			"nonce": nonce_u64,
 			"originChainId": input_chain_id,
-			"expires": fill_deadline, // Use fillDeadline for both expires and fillDeadline
-			"fillDeadline": fill_deadline,
+			"expires": expires, // Separate expires (10 min default) for finalization
+			"fillDeadline": fill_deadline, // Fill deadline (5 min default) for output fills
 			"inputOracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&input_oracle.0)),
 			"inputs": request.intent.inputs.iter().map(|input| {
 				serde_json::json!({
@@ -691,6 +706,7 @@ impl QuoteGenerator {
 		input_oracle: &solver_types::Address,
 		output_oracle: &solver_types::Address,
 		fill_deadline: u32,
+		expires: u32,
 	) -> Result<(u64, String), QuoteError> {
 		// Build the StandardOrder struct for encoding
 		use alloy_primitives::U256;
@@ -724,7 +740,7 @@ impl QuoteGenerator {
 			.duration_since(std::time::UNIX_EPOCH)
 			.map(|d| d.as_millis() as u64)
 			.unwrap_or(0u64);
-		let expiry = fill_deadline; // Use same value
+		let expiry = expires; // Use expires for the order expiry
 
 		// Build input tokens array: [[token, amount]]
 		let input_token = input
@@ -961,16 +977,29 @@ impl QuoteGenerator {
 		use solver_types::utils::bytes20_to_alloy_address;
 		use std::str::FromStr;
 
-		// Use minValidUntil from request if provided (as absolute timestamp), otherwise use configured validity duration
 		let current_time = chrono::Utc::now().timestamp() as u64;
-		let expires = if let Some(min_valid_until) = request.intent.min_valid_until {
-			// min_valid_until is an absolute timestamp
+
+		// Calculate separate deadlines
+		// fillDeadline: Time to fill outputs on destination chains (default 5 minutes)
+		let fill_deadline_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until
+		{
+			// If user specifies min_valid_until, use it as fillDeadline
 			min_valid_until
 		} else {
-			// Use configured validity duration added to current time
-			let validity_seconds = self.get_quote_validity_seconds(config);
-			current_time + validity_seconds
+			let fill_deadline_seconds = self.get_fill_deadline_seconds(config);
+			current_time + fill_deadline_seconds
 		};
+
+		// expires: Time for BatchCompact signature/claim on origin chain (default 10 minutes, must be > fillDeadline)
+		let expires = if let Some(min_valid_until) = request.intent.min_valid_until {
+			// If user specifies min_valid_until, add buffer for expires
+			min_valid_until
+				+ (self.get_expires_seconds(config) - self.get_fill_deadline_seconds(config))
+		} else {
+			let expires_seconds = self.get_expires_seconds(config);
+			current_time + expires_seconds
+		};
+
 		let nonce = chrono::Utc::now().timestamp_millis() as u64; // Use milliseconds timestamp as nonce for uniqueness (matching direct intent flow)
 
 		// Get user address
@@ -1134,7 +1163,7 @@ impl QuoteGenerator {
 					})
 				}).collect::<Vec<_>>(),
 				"mandate": {
-					"fillDeadline": expires.to_string(),
+					"fillDeadline": fill_deadline_timestamp.to_string(),
 					"inputOracle": format!("{:#x}", input_oracle_address),
 					"outputs": outputs_array
 				}
@@ -1334,6 +1363,30 @@ impl QuoteGenerator {
 			.unwrap_or_else(|| QuoteConfig::default().validity_seconds)
 	}
 
+	/// Gets the fill deadline duration from configuration.
+	///
+	/// Returns the configured fill deadline seconds from api.quote config or default.
+	fn get_fill_deadline_seconds(&self, config: &Config) -> u64 {
+		config
+			.api
+			.as_ref()
+			.and_then(|api| api.quote.as_ref())
+			.map(|quote| quote.fill_deadline_seconds)
+			.unwrap_or_else(|| QuoteConfig::default().fill_deadline_seconds)
+	}
+
+	/// Gets the expires duration from configuration.
+	///
+	/// Returns the configured expires seconds from api.quote config or default.
+	fn get_expires_seconds(&self, config: &Config) -> u64 {
+		config
+			.api
+			.as_ref()
+			.and_then(|api| api.quote.as_ref())
+			.map(|quote| quote.expires_seconds)
+			.unwrap_or_else(|| QuoteConfig::default().expires_seconds)
+	}
+
 	/// Generates EIP-712 types definition for Permit2 orders
 	fn build_permit2_eip712_types(&self) -> serde_json::Value {
 		serde_json::json!({
@@ -1486,7 +1539,9 @@ mod tests {
 			cors: None,
 			auth: None,
 			quote: Some(QuoteConfig {
-				validity_seconds: 300,
+				validity_seconds: 60,
+				fill_deadline_seconds: 300,
+				expires_seconds: 600,
 			}),
 		};
 
@@ -2209,12 +2264,12 @@ mod tests {
 		// Test with configured validity
 		let config = create_test_config();
 		let validity = generator.get_quote_validity_seconds(&config);
-		assert_eq!(validity, 300);
+		assert_eq!(validity, 60); // Updated default: 1 minute
 
 		// Test with no API config (should use default)
 		let config_no_api = ConfigBuilder::new().build();
 		let validity_default = generator.get_quote_validity_seconds(&config_no_api);
-		assert_eq!(validity_default, 20); // if API none, use default 20
+		assert_eq!(validity_default, 60); // Updated default: 1 minute
 	}
 
 	#[tokio::test]
@@ -2978,7 +3033,8 @@ mod tests {
 				&config,
 				&input_oracle,
 				&output_oracle,
-				1234567890,
+				1234567890, // fill_deadline
+				1234568000, // expires (should be > fill_deadline)
 			)
 			.await;
 
@@ -3106,7 +3162,7 @@ mod tests {
 		let empty_config = ConfigBuilder::new().build();
 
 		let validity = generator.get_quote_validity_seconds(&empty_config);
-		assert_eq!(validity, 20); // Default value when no API config
+		assert_eq!(validity, 60); // Updated default: 1 minute
 
 		// Test with API config but no quote config
 		let api_no_quote_config = ConfigBuilder::new()
@@ -3125,7 +3181,7 @@ mod tests {
 			.build();
 
 		let validity_no_quote = generator.get_quote_validity_seconds(&api_no_quote_config);
-		assert_eq!(validity_no_quote, 20); // Default value when no quote config
+		assert_eq!(validity_no_quote, 60); // Updated default: 1 minute
 	}
 
 	#[tokio::test]

@@ -115,22 +115,49 @@ pub fn build_permit2_batch_witness_digest(
 	let now_secs = chrono::Utc::now().timestamp() as u64;
 	let nonce_ms: U256 = U256::from((chrono::Utc::now().timestamp_millis()) as u128);
 
-	// Use minValidUntil from request if provided (as absolute timestamp), otherwise use configured validity duration
-	let deadline_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until {
-		// min_valid_until is an absolute timestamp
+	// Calculate separate deadlines
+	// deadline (Permit2 openFor deadline): Time to open the order (default 5 minutes, matches fillDeadline)
+	let fill_deadline_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until {
+		// If user specifies min_valid_until, use it as fillDeadline
 		min_valid_until
 	} else {
-		// Use configured validity duration added to current time
-		let validity_seconds = config
+		let fill_deadline_seconds = config
 			.api
 			.as_ref()
 			.and_then(|api| api.quote.as_ref())
-			.map(|quote| quote.validity_seconds)
-			.unwrap_or_else(|| QuoteConfig::default().validity_seconds);
-		now_secs + validity_seconds
+			.map(|quote| quote.fill_deadline_seconds)
+			.unwrap_or_else(|| QuoteConfig::default().fill_deadline_seconds);
+		now_secs + fill_deadline_seconds
 	};
-	let deadline_secs: U256 = U256::from(deadline_timestamp);
-	let expires_secs: u32 = deadline_timestamp as u32;
+
+	// expires (witness expires): Time to finalize/claim on origin chain (default 10 minutes, must be > fillDeadline)
+	let expires_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until {
+		// If user specifies min_valid_until, add buffer for expires
+		let fill_deadline_seconds = config
+			.api
+			.as_ref()
+			.and_then(|api| api.quote.as_ref())
+			.map(|quote| quote.fill_deadline_seconds)
+			.unwrap_or_else(|| QuoteConfig::default().fill_deadline_seconds);
+		let expires_seconds = config
+			.api
+			.as_ref()
+			.and_then(|api| api.quote.as_ref())
+			.map(|quote| quote.expires_seconds)
+			.unwrap_or_else(|| QuoteConfig::default().expires_seconds);
+		min_valid_until + (expires_seconds - fill_deadline_seconds)
+	} else {
+		let expires_seconds = config
+			.api
+			.as_ref()
+			.and_then(|api| api.quote.as_ref())
+			.map(|quote| quote.expires_seconds)
+			.unwrap_or_else(|| QuoteConfig::default().expires_seconds);
+		now_secs + expires_seconds
+	};
+
+	let deadline_secs: U256 = U256::from(fill_deadline_timestamp);
+	let expires_secs: u32 = expires_timestamp as u32;
 
 	// Type hashes
 	let domain_type_hash = keccak256(DOMAIN_TYPE.as_bytes());
@@ -270,7 +297,9 @@ mod tests {
 			cors: None,
 			auth: None,
 			quote: Some(QuoteConfig {
-				validity_seconds: 300, // 5 minutes
+				validity_seconds: 60,       // 1 minute
+				fill_deadline_seconds: 300, // 5 minutes
+				expires_seconds: 600,       // 10 minutes
 			}),
 		};
 
