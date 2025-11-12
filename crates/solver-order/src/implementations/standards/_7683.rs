@@ -899,6 +899,39 @@ mod tests {
 			.build()
 	}
 
+	// Helper function to create a valid StandardOrder for testing
+	fn create_valid_standard_order() -> interfaces::StandardOrder {
+		use alloy_primitives::{Address as AlloyAddress, B256};
+		use solver_types::current_timestamp;
+
+		let current_time = current_timestamp() as u32;
+		interfaces::StandardOrder {
+			user: AlloyAddress::from([0x11; 20]),
+			nonce: U256::from(123),
+			originChainId: U256::from(1),
+			expires: current_time + 3600,                // 1 hour from now
+			fillDeadline: current_time + 1800,           // 30 minutes from now
+			inputOracle: AlloyAddress::from([10u8; 20]), // Matches test oracle routes
+			inputs: vec![[U256::from(100), U256::from(200)]],
+			outputs: vec![interfaces::SolMandateOutput {
+				oracle: B256::from([11u8; 32]), // Matches test oracle routes
+				settler: B256::from([0x44; 32]),
+				chainId: U256::from(137), // Cross-chain output
+				token: B256::from([0x55; 32]),
+				amount: U256::from(1000),
+				recipient: B256::from([0x66; 32]),
+				callbackData: vec![].into(),
+				context: vec![].into(),
+			}],
+		}
+	}
+
+	// Helper function to encode StandardOrder to bytes
+	fn encode_standard_order(order: &interfaces::StandardOrder) -> Bytes {
+		use alloy_sol_types::SolValue;
+		Bytes::from(order.abi_encode())
+	}
+
 	#[test]
 	fn test_new_eip7683_order_impl() {
 		let networks = create_test_networks();
@@ -1170,5 +1203,589 @@ mod tests {
 			.unwrap_err()
 			.to_string()
 			.contains("No cross-chain output found"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_success() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let standard_order = create_valid_standard_order();
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(result.is_ok());
+
+		let validated_order = result.unwrap();
+		assert_eq!(validated_order.user, standard_order.user);
+		assert_eq!(validated_order.nonce, standard_order.nonce);
+		assert_eq!(validated_order.originChainId, standard_order.originChainId);
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_invalid_bytes() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		// Invalid bytes that cannot be decoded
+		let invalid_bytes = Bytes::from(vec![0x00, 0x01, 0x02]);
+
+		let result = order_impl.validate_order(&invalid_bytes).await;
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Failed to decode StandardOrder"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_expired() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		// Set expiry to past timestamp
+		standard_order.expires = (solver_types::current_timestamp() as u32) - 3600; // 1 hour ago
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Order has expired"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_fill_deadline_passed() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		// Set fill deadline to past timestamp
+		standard_order.fillDeadline = (solver_types::current_timestamp() as u32) - 1800; // 30 minutes ago
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Order fill deadline has passed"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_unsupported_input_oracle() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		// Use unsupported input oracle
+		standard_order.inputOracle = alloy_primitives::Address::from([0x99; 20]);
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(result.is_err());
+		let error_msg = result.unwrap_err().to_string();
+		assert!(error_msg.contains("Input oracle"));
+		assert!(error_msg.contains("is not supported"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_unsupported_destination_chain() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		// Use unsupported destination chain
+		standard_order.outputs[0].chainId = U256::from(999); // Unsupported chain
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Route from chain 1 to chain 999 is not supported"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_incompatible_output_oracle() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		// Use incompatible output oracle (different from what's supported)
+		standard_order.outputs[0].oracle = alloy_primitives::B256::from([0x99; 32]);
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(result.is_err());
+		let error_msg = result.unwrap_err().to_string();
+		assert!(error_msg.contains("Output oracle"));
+		assert!(error_msg.contains("is not compatible with input oracle"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_zero_output_oracle_allowed() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		// Use zero oracle (should be allowed - means any compatible oracle can be used)
+		standard_order.outputs[0].oracle = alloy_primitives::B256::from([0x00; 32]);
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_multiple_outputs_mixed_validity() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		// Add a second output with unsupported chain
+		standard_order.outputs.push(interfaces::SolMandateOutput {
+			oracle: alloy_primitives::B256::from([11u8; 32]),
+			settler: alloy_primitives::B256::from([0x44; 32]),
+			chainId: U256::from(999), // Unsupported chain
+			token: alloy_primitives::B256::from([0x55; 32]),
+			amount: U256::from(500),
+			recipient: alloy_primitives::B256::from([0x77; 32]),
+			callbackData: vec![].into(),
+			context: vec![].into(),
+		});
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Route from chain 1 to chain 999 is not supported"));
+	}
+
+	// Helper function to create a mock order ID callback
+	fn mock_order_id_callback(
+		_chain_id: u64,
+		_tx_data: Vec<u8>,
+	) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+		Box::pin(async move {
+			Ok(vec![0x42; 32]) // Return a fixed 32-byte order ID
+		})
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_success() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let standard_order = create_valid_standard_order();
+		let order_bytes = encode_standard_order(&standard_order);
+		let solver_address = Address(vec![0x99; 20]);
+		let quote_id = Some("test-quote-123".to_string());
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&None,
+				"permit2_escrow",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				quote_id.clone(),
+			)
+			.await;
+
+		assert!(result.is_ok());
+		let order = result.unwrap();
+
+		// Verify order properties
+		assert_eq!(order.standard, "eip7683");
+		assert_eq!(order.solver_address, solver_address);
+		assert_eq!(order.quote_id, quote_id);
+		assert_eq!(order.status, OrderStatus::Pending);
+		assert_eq!(order.input_chains.len(), 1);
+		assert_eq!(order.input_chains[0].chain_id, 1);
+		assert_eq!(order.output_chains.len(), 1);
+		assert_eq!(order.output_chains[0].chain_id, 137);
+
+		// Verify order data
+		let order_data: Eip7683OrderData = serde_json::from_value(order.data).unwrap();
+		assert_eq!(order_data.lock_type, Some(LockType::Permit2Escrow));
+		assert!(order_data.raw_order_data.is_some());
+		assert_eq!(order_data.order_id, [0x42; 32]);
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_with_resource_lock() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let standard_order = create_valid_standard_order();
+		let order_bytes = encode_standard_order(&standard_order);
+		let solver_address = Address(vec![0x99; 20]);
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&None,
+				"resource_lock",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await;
+
+		assert!(result.is_ok());
+		let order = result.unwrap();
+
+		let order_data: Eip7683OrderData = serde_json::from_value(order.data).unwrap();
+		assert_eq!(order_data.lock_type, Some(LockType::ResourceLock));
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_with_existing_intent_data() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let standard_order = create_valid_standard_order();
+		let order_bytes = encode_standard_order(&standard_order);
+		let solver_address = Address(vec![0x99; 20]);
+
+		// Create intent data with sponsor and signature
+		let mut existing_order_data = Eip7683OrderData::from(standard_order.clone());
+		existing_order_data.sponsor =
+			Some("0x1111111111111111111111111111111111111111".to_string());
+		existing_order_data.signature = Some("0x123456789abcdef".to_string());
+		let intent_data = Some(serde_json::to_value(&existing_order_data).unwrap());
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&intent_data,
+				"permit2_escrow",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await;
+
+		assert!(result.is_ok());
+		let order = result.unwrap();
+
+		let order_data: Eip7683OrderData = serde_json::from_value(order.data).unwrap();
+		assert_eq!(
+			order_data.sponsor,
+			Some("0x1111111111111111111111111111111111111111".to_string())
+		);
+		assert_eq!(order_data.signature, Some("0x123456789abcdef".to_string()));
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_invalid_order_bytes() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		// Invalid bytes that cannot be decoded
+		let invalid_bytes = Bytes::from(vec![0x00, 0x01, 0x02]);
+		let solver_address = Address(vec![0x99; 20]);
+
+		let result = order_impl
+			.validate_and_create_order(
+				&invalid_bytes,
+				&None,
+				"permit2_escrow",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await;
+
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Failed to decode StandardOrder"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_expired_order() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		// Set expiry to past timestamp
+		standard_order.expires = (solver_types::current_timestamp() as u32) - 3600; // 1 hour ago
+		let order_bytes = encode_standard_order(&standard_order);
+		let solver_address = Address(vec![0x99; 20]);
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&None,
+				"permit2_escrow",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await;
+
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Order has expired"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_invalid_lock_type() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let standard_order = create_valid_standard_order();
+		let order_bytes = encode_standard_order(&standard_order);
+		let solver_address = Address(vec![0x99; 20]);
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&None,
+				"invalid_lock_type",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await;
+
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Invalid lock type"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_unsupported_chain() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		// Use unsupported origin chain
+		standard_order.originChainId = U256::from(999);
+		let order_bytes = encode_standard_order(&standard_order);
+		let solver_address = Address(vec![0x99; 20]);
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&None,
+				"permit2_escrow",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await;
+		assert!(result.is_err());
+		let error_msg = result.unwrap_err().to_string();
+		assert!(error_msg.contains("Input oracle"));
+		assert!(error_msg.contains("is not supported"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_order_id_callback_failure() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let standard_order = create_valid_standard_order();
+		let order_bytes = encode_standard_order(&standard_order);
+		let solver_address = Address(vec![0x99; 20]);
+
+		// Mock callback that fails
+		let failing_callback = |_chain_id: u64, _tx_data: Vec<u8>| {
+			Box::pin(async move { Err("Order ID computation failed".to_string()) })
+				as std::pin::Pin<
+					Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>,
+				>
+		};
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&None,
+				"permit2_escrow",
+				Box::new(failing_callback),
+				&solver_address,
+				None,
+			)
+			.await;
+
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Failed to compute order ID"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_invalid_order_id_length() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let standard_order = create_valid_standard_order();
+		let order_bytes = encode_standard_order(&standard_order);
+		let solver_address = Address(vec![0x99; 20]);
+
+		// Mock callback that returns wrong length
+		let invalid_length_callback = |_chain_id: u64, _tx_data: Vec<u8>| {
+			Box::pin(async move {
+				Ok(vec![0x42u8; 16]) // Wrong length (16 instead of 32)
+			})
+				as std::pin::Pin<
+					Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>,
+				>
+		};
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&None,
+				"permit2_escrow",
+				Box::new(invalid_length_callback),
+				&solver_address,
+				None,
+			)
+			.await;
+
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Invalid order ID length: expected 32 bytes, got 16"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_with_malformed_intent_data() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let standard_order = create_valid_standard_order();
+		let order_bytes = encode_standard_order(&standard_order);
+		let solver_address = Address(vec![0x99; 20]);
+
+		// Create malformed intent data that can't be parsed as Eip7683OrderData
+		let malformed_intent_data = Some(serde_json::json!({
+			"invalid_field": "invalid_value"
+		}));
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&malformed_intent_data,
+				"permit2_escrow",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await;
+
+		// Should succeed by falling back to creating fresh order data from StandardOrder
+		assert!(result.is_ok());
+		let order = result.unwrap();
+
+		let order_data: Eip7683OrderData = serde_json::from_value(order.data).unwrap();
+		// Should have fresh data without sponsor/signature
+		assert!(order_data.sponsor.is_none());
+		assert!(order_data.signature.is_none());
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_multiple_outputs() {
+		// Create networks with an additional chain (42161 for Arbitrum)
+		let networks = NetworksConfigBuilder::new()
+        .add_network(1, NetworkConfigBuilder::new().build())
+        .add_network(137, NetworkConfigBuilder::new().build())
+        .add_network(42161, NetworkConfigBuilder::new().build()) // Add Arbitrum
+        .build();
+
+		// Create oracle routes that support the additional chain
+		let mut supported_routes = HashMap::new();
+		let input_oracle = OracleInfo {
+			chain_id: 1,
+			oracle: Address(vec![10u8; 20]),
+		};
+		let output_oracle_polygon = OracleInfo {
+			chain_id: 137,
+			oracle: Address(vec![11u8; 20]),
+		};
+		let output_oracle_arbitrum = OracleInfo {
+			chain_id: 42161,
+			oracle: Address(vec![12u8; 20]), // Different oracle for Arbitrum
+		};
+		supported_routes.insert(
+			input_oracle,
+			vec![output_oracle_polygon, output_oracle_arbitrum],
+		);
+		let oracle_routes = OracleRoutes { supported_routes };
+
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		// Add a second output on a different destination chain (Arbitrum)
+		standard_order.outputs.push(interfaces::SolMandateOutput {
+			oracle: alloy_primitives::B256::from([12u8; 32]), // Different oracle for Arbitrum
+			settler: alloy_primitives::B256::from([0x44; 32]),
+			chainId: U256::from(42161), // Arbitrum chain ID (different from first output)
+			token: alloy_primitives::B256::from([0x77; 32]),
+			amount: U256::from(500),
+			recipient: alloy_primitives::B256::from([0x88; 32]),
+			callbackData: vec![].into(),
+			context: vec![].into(),
+		});
+		let order_bytes = encode_standard_order(&standard_order);
+		let solver_address = Address(vec![0x99; 20]);
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&None,
+				"permit2_escrow",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await;
+
+		assert!(result.is_ok());
+		let order = result.unwrap();
+
+		// Should have two output chains (137 and 42161) with multiple outputs
+		assert_eq!(order.output_chains.len(), 2);
+		let chain_ids: Vec<u64> = order.output_chains.iter().map(|oc| oc.chain_id).collect();
+		assert!(chain_ids.contains(&137));
+		assert!(chain_ids.contains(&42161));
+
+		let order_data: Eip7683OrderData = serde_json::from_value(order.data).unwrap();
+		assert_eq!(order_data.outputs.len(), 2);
 	}
 }
