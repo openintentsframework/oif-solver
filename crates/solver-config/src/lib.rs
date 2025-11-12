@@ -279,25 +279,51 @@ pub struct GasConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct QuoteConfig {
 	/// Quote validity duration in seconds.
-	/// Defaults to 20 seconds if not specified.
+	/// Defaults to 60 seconds (1 minute) if not specified.
 	#[serde(default = "default_quote_validity_seconds")]
 	pub validity_seconds: u64,
+	/// Fill deadline duration in seconds (time to fill outputs on destination chains).
+	/// Defaults to 300 seconds (5 minutes) if not specified.
+	#[serde(default = "default_fill_deadline_seconds")]
+	pub fill_deadline_seconds: u64,
+	/// Expiry duration in seconds (time to finalize/claim on origin chain).
+	/// Defaults to 600 seconds (10 minutes) if not specified.
+	#[serde(default = "default_expires_seconds")]
+	pub expires_seconds: u64,
 }
 
 impl Default for QuoteConfig {
 	fn default() -> Self {
 		Self {
 			validity_seconds: default_quote_validity_seconds(),
+			fill_deadline_seconds: default_fill_deadline_seconds(),
+			expires_seconds: default_expires_seconds(),
 		}
 	}
 }
 
 /// Returns the default quote validity duration in seconds.
 ///
-/// This provides a default value of 20 seconds for quote validity
+/// This provides a default value of 60 seconds (1 minute) for quote validity
 /// when no explicit duration is configured.
 fn default_quote_validity_seconds() -> u64 {
-	20 // Default to 20 seconds
+	60 // Default to 60 seconds (1 minute)
+}
+
+/// Returns the default fill deadline duration in seconds.
+///
+/// This provides a default value of 300 seconds (5 minutes) for fill deadline
+/// when no explicit duration is configured.
+fn default_fill_deadline_seconds() -> u64 {
+	300 // Default to 300 seconds (5 minutes)
+}
+
+/// Returns the default expires duration in seconds.
+///
+/// This provides a default value of 600 seconds (10 minutes) for expires
+/// when no explicit duration is configured.
+fn default_expires_seconds() -> u64 {
+	600 // Default to 600 seconds (10 minutes)
 }
 
 /// Returns the default API host.
