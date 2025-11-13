@@ -113,7 +113,7 @@ output = { 10 = [
 ] }
 
 [settlement.implementations.hyperlane.routes]
-# Bidirectional routes - both chains can send to each other
+# Omnidirectional route - everyone sends to each other 
 10 = [8453, 42161]
 8453 = [10, 42161]
 42161 = [10, 8453]
