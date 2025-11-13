@@ -1,6 +1,6 @@
 # OIF Solver Configuration
-# Origin Chain ID: 10
-# Destination Chain ID: 8453
+# Supported networks: [10, 8453, 42161]
+
 
 include = ["mainnet/networks.toml", "mainnet/api.toml", "mainnet/gas.toml"]
 
@@ -41,7 +41,7 @@ private_key = "${SOLVER_PRIVATE_KEY}"
 min_confirmations = 3
 
 [delivery.implementations.evm_alloy]
-network_ids = [10, 8453]
+network_ids = [10, 8453, 42161]
 
 # ============================================================================
 # DISCOVERY
@@ -49,13 +49,13 @@ network_ids = [10, 8453]
 [discovery]
 
 [discovery.implementations.onchain_eip7683]
-network_ids = [10, 8453]
+network_ids = [10, 8453, 42161]
 polling_interval_secs = 5
 
 [discovery.implementations.offchain_eip7683]
 api_host = "127.0.0.1"
 api_port = 8081
-network_ids = [10, 8453]
+network_ids = [10, 8453, 42161]
 
 # ============================================================================
 # ORDER
@@ -91,7 +91,7 @@ settlement_poll_interval_seconds = 10 # How often to check can_claim
 # ============================================================================
 [settlement.implementations.hyperlane]
 order = "eip7683"
-network_ids = [10, 8453]
+network_ids = [10, 8453, 42161]
 default_gas_limit = 300000
 message_timeout_seconds = 600
 finalization_required = true
@@ -113,9 +113,10 @@ output = { 10 = [
 ] }
 
 [settlement.implementations.hyperlane.routes]
-# Bidirectional routes - both chains can send to each other
-10 = [8453]
-8453 = [10]
+# Omnidirectional route - everyone sends to each other 
+10 = [8453, 42161]
+8453 = [10, 42161]
+42161 = [10, 8453]
 
 [settlement.implementations.hyperlane.mailboxes]
 10 = "0xd4C1905BB1D26BC93DAC913e13CaCC278CdCC80D"
