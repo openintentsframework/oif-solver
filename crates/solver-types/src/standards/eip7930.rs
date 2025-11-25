@@ -8,7 +8,7 @@
 //! An ERC-7930 interoperable address has the following structure:
 //! ```text
 //! 0x00010000010114D8DA6BF26964AF9D7EED9E03E53415D37AA96045
-//!   ^^^^-------------------------------------------------- Version:              decimal 1
+//!   ^^^^-------------------------------------------------- Version:              decimal 1 (2 bytes, big-endian)
 //!       ^^^^---------------------------------------------- ChainType:            2 bytes of CAIP namespace
 //!           ^^-------------------------------------------- ChainReferenceLength: decimal 1
 //!             ^^------------------------------------------ ChainReference:       1 byte to store uint8(1)
@@ -25,8 +25,8 @@ use thiserror::Error;
 /// ERC-7930 Interoperable Address
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
 pub struct InteropAddress {
-	/// Version of the interoperable address format
-	pub version: u8,
+	/// Version of the interoperable address format (2 bytes per EIP-7930 spec)
+	pub version: u16,
 	/// CAIP namespace (2 bytes)
 	pub chain_type: [u8; 2],
 	/// Chain reference data
@@ -53,7 +53,7 @@ pub enum InteropAddressError {
 	#[error("Address too short: expected at least {expected} bytes, got {actual}")]
 	TooShort { expected: usize, actual: usize },
 	#[error("Unsupported version: {0}")]
-	UnsupportedVersion(u8),
+	UnsupportedVersion(u16),
 	#[error("Invalid chain reference length: expected {expected}, got {actual}")]
 	InvalidChainReferenceLength { expected: u8, actual: usize },
 	#[error("Invalid address length: expected {expected}, got {actual}")]
@@ -63,8 +63,8 @@ pub enum InteropAddressError {
 }
 
 impl InteropAddress {
-	/// Current supported version of ERC-7930
-	pub const CURRENT_VERSION: u8 = 1;
+	/// Current supported version of ERC-7930 (2-byte field per spec)
+	pub const CURRENT_VERSION: u16 = 1;
 
 	/// Standard Ethereum address length
 	pub const ETH_ADDRESS_LENGTH: u8 = 20;
@@ -105,23 +105,24 @@ impl InteropAddress {
 
 	/// Parse an ERC-7930 interoperable address from bytes
 	pub fn from_bytes(bytes: &[u8]) -> Result<Self, InteropAddressError> {
-		if bytes.len() < 6 {
+		if bytes.len() < 7 {
 			return Err(InteropAddressError::TooShort {
-				expected: 6,
+				expected: 7,
 				actual: bytes.len(),
 			});
 		}
 
-		let version = bytes[0];
+		// Version is 2 bytes, big-endian
+		let version = u16::from_be_bytes([bytes[0], bytes[1]]);
 		if version != Self::CURRENT_VERSION {
 			return Err(InteropAddressError::UnsupportedVersion(version));
 		}
 
-		let chain_type = [bytes[1], bytes[2]];
-		let chain_ref_length = bytes[3];
-		let address_length = bytes[4];
+		let chain_type = [bytes[2], bytes[3]];
+		let chain_ref_length = bytes[4];
+		let address_length = bytes[5];
 
-		let expected_total_length = 5 + chain_ref_length as usize + address_length as usize;
+		let expected_total_length = 6 + chain_ref_length as usize + address_length as usize;
 		if bytes.len() != expected_total_length {
 			return Err(InteropAddressError::TooShort {
 				expected: expected_total_length,
@@ -129,8 +130,8 @@ impl InteropAddress {
 			});
 		}
 
-		let chain_reference = bytes[5..5 + chain_ref_length as usize].to_vec();
-		let address = bytes[5 + chain_ref_length as usize..].to_vec();
+		let chain_reference = bytes[6..6 + chain_ref_length as usize].to_vec();
+		let address = bytes[6 + chain_ref_length as usize..].to_vec();
 
 		if chain_reference.len() != chain_ref_length as usize {
 			return Err(InteropAddressError::InvalidChainReferenceLength {
@@ -157,7 +158,8 @@ impl InteropAddress {
 	/// Convert to bytes representation
 	pub fn to_bytes(&self) -> Vec<u8> {
 		let mut bytes = Vec::new();
-		bytes.push(self.version);
+		// Version is 2 bytes, big-endian per EIP-7930
+		bytes.extend_from_slice(&self.version.to_be_bytes());
 		bytes.extend_from_slice(&self.chain_type);
 		bytes.push(self.chain_reference.len() as u8);
 		bytes.push(self.address.len() as u8);

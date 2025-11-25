@@ -490,13 +490,13 @@ mod tests {
 		assert_eq!(resp.quote_id, Some("quote-test".to_string()));
 
 		// input - should be an interop address with chain ID 1
-		// Format: 0x01000001011234567890123456789012345678901234567890
-		// Version: 01, ChainType: 0000, ChainRefLen: 01, ChainRef: 01, AddrLen: 14, Address: 20 bytes
+		// Format: 0x0001000001011234567890123456789012345678901234567890
+		// Version: 0001 (2 bytes), ChainType: 0000, ChainRefLen: 01, ChainRef: 01, AddrLen: 14, Address: 20 bytes
 		assert_eq!(resp.input_amounts.len(), 1, "Should have one input");
 		let input_hex = resp.input_amounts[0].asset.to_hex();
 		assert!(
-			input_hex.starts_with("0x01000001"),
-			"Input should have chain ID 1 encoded"
+			input_hex.starts_with("0x0001000001"),
+			"Input should have chain ID 1 encoded with 2-byte version"
 		);
 		assert!(input_hex.contains("1234567890123456789012345678901234567890"));
 		assert_eq!(
@@ -508,8 +508,8 @@ mod tests {
 		assert_eq!(resp.output_amounts.len(), 1, "Should have one output");
 		let output_hex = resp.output_amounts[0].asset.to_hex();
 		assert!(
-			output_hex.starts_with("0x01000001"),
-			"Output should have chain ID 2 encoded (but shows 1 due to test data)"
+			output_hex.starts_with("0x0001000001"),
+			"Output should have chain ID 2 encoded (but shows 1 due to test data) with 2-byte version"
 		);
 		assert_eq!(
 			resp.output_amounts[0].amount,
