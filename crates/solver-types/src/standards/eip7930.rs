@@ -157,15 +157,14 @@ impl InteropAddress {
 	/// Convert to bytes representation
 	pub fn to_bytes(&self) -> Vec<u8> {
 		let mut bytes = Vec::new();
-		bytes.push(self.version);
+		bytes.extend_from_slice(&self.version.to_be_bytes());
 		bytes.extend_from_slice(&self.chain_type);
 		bytes.push(self.chain_reference.len() as u8);
-		bytes.push(self.address.len() as u8);
 		bytes.extend_from_slice(&self.chain_reference);
+		bytes.push(self.address.len() as u8);
 		bytes.extend_from_slice(&self.address);
 		bytes
 	}
-
 	/// Convert to hex string with 0x prefix
 	pub fn to_hex(&self) -> String {
 		with_0x_prefix(&hex::encode(self.to_bytes()))
