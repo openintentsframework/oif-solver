@@ -205,7 +205,7 @@ pub fn build_permit2_batch_witness_digest(
 	enc.push_u256(output_amount);
 	enc.push_address(&recipient);
 	enc.push_b256(&callback_data_hash);
-	enc.push_b256(&empty_bytes_hash);  // context remains empty
+	enc.push_b256(&empty_bytes_hash); // context remains empty
 	let mandate_output_hash = keccak256(enc.finish());
 
 	let outputs_hash = keccak256(mandate_output_hash.as_slice());
