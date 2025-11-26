@@ -217,6 +217,27 @@ impl IntentHandler {
 					},
 				}
 
+				// Validate callback safety
+				match self
+					.cost_profit_service
+					.validate_callback_safety(&order, &self.config)
+					.await
+				{
+					Ok(_) => {
+						// Callback validation passed
+					},
+					Err(e) => {
+						tracing::warn!("Order failed callback safety validation: {}", e);
+						self.event_bus
+							.publish(SolverEvent::Order(OrderEvent::Skipped {
+								order_id: order.id.clone(),
+								reason: format!("Callback safety check failed: {}", e),
+							}))
+							.ok();
+						return Ok(());
+					},
+				}
+
 				self.event_bus
 					.publish(SolverEvent::Discovery(DiscoveryEvent::IntentValidated {
 						intent_id: intent.id.clone(),

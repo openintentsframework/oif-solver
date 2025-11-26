@@ -521,6 +521,14 @@ impl interfaces::StandardOrder {
 					.unwrap();
 				let oracle_str = output_obj.get("oracle").and_then(|o| o.as_str()).unwrap();
 				let settler_str = output_obj.get("settler").and_then(|s| s.as_str()).unwrap();
+				let callback_str = output_obj
+					.get("callbackData")
+					.and_then(|c| c.as_str())
+					.unwrap_or("0x");
+				let context_str = output_obj
+					.get("context")
+					.and_then(|c| c.as_str())
+					.unwrap_or("0x");
 
 				if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
 					let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
@@ -528,6 +536,20 @@ impl interfaces::StandardOrder {
 						parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
 					let oracle_bytes = parse_bytes32_from_hex(oracle_str).unwrap_or([0u8; 32]);
 					let settler_bytes = parse_bytes32_from_hex(settler_str).unwrap_or([0u8; 32]);
+					
+					// Parse callbackData from hex
+					let callback_bytes = if callback_str == "0x" || callback_str.is_empty() {
+						Vec::new()
+					} else {
+						hex::decode(callback_str.trim_start_matches("0x")).unwrap_or_else(|_| Vec::new())
+					};
+					
+					// Parse context from hex
+					let context_bytes = if context_str == "0x" || context_str.is_empty() {
+						Vec::new()
+					} else {
+						hex::decode(context_str.trim_start_matches("0x")).unwrap_or_else(|_| Vec::new())
+					};
 
 					sol_outputs.push(SolMandateOutput {
 						oracle: oracle_bytes.into(),
@@ -536,8 +558,8 @@ impl interfaces::StandardOrder {
 						token: token_bytes.into(),
 						amount,
 						recipient: recipient_bytes.into(),
-						callbackData: Vec::new().into(),
-						context: Vec::new().into(),
+						callbackData: callback_bytes.into(),
+						context: context_bytes.into(),
 					});
 				}
 			}
@@ -876,31 +898,53 @@ impl interfaces::StandardOrder {
 						.get("recipient")
 						.and_then(|r| r.as_str())
 						.unwrap();
-					let oracle_str = output_obj.get("oracle").and_then(|o| o.as_str()).unwrap();
-					let settler_str = output_obj.get("settler").and_then(|s| s.as_str()).unwrap();
+				let oracle_str = output_obj.get("oracle").and_then(|o| o.as_str()).unwrap();
+				let settler_str = output_obj.get("settler").and_then(|s| s.as_str()).unwrap();
+				let callback_str = output_obj
+					.get("callbackData")
+					.and_then(|c| c.as_str())
+					.unwrap_or("0x");
+				let context_str = output_obj
+					.get("context")
+					.and_then(|c| c.as_str())
+					.unwrap_or("0x");
 
-					if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
-						let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
-						let recipient_bytes =
-							parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
-						let oracle_bytes = parse_bytes32_from_hex(oracle_str).map_err(|e| {
-							format!("Invalid oracle address '{}': {}", oracle_str, e)
-						})?;
-						let settler_bytes = parse_bytes32_from_hex(settler_str).map_err(|e| {
-							format!("Invalid settler address '{}': {}", settler_str, e)
-						})?;
+				if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
+					let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
+					let recipient_bytes =
+						parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
+					let oracle_bytes = parse_bytes32_from_hex(oracle_str).map_err(|e| {
+						format!("Invalid oracle address '{}': {}", oracle_str, e)
+					})?;
+					let settler_bytes = parse_bytes32_from_hex(settler_str).map_err(|e| {
+						format!("Invalid settler address '{}': {}", settler_str, e)
+					})?;
+					
+					// Parse callbackData from hex
+					let callback_bytes = if callback_str == "0x" || callback_str.is_empty() {
+						Vec::new()
+					} else {
+						hex::decode(callback_str.trim_start_matches("0x")).unwrap_or_else(|_| Vec::new())
+					};
+					
+					// Parse context from hex
+					let context_bytes = if context_str == "0x" || context_str.is_empty() {
+						Vec::new()
+					} else {
+						hex::decode(context_str.trim_start_matches("0x")).unwrap_or_else(|_| Vec::new())
+					};
 
-						sol_outputs.push(SolMandateOutput {
-							oracle: oracle_bytes.into(),
-							settler: settler_bytes.into(),
-							chainId: U256::from(chain_id),
-							token: token_bytes.into(),
-							amount,
-							recipient: recipient_bytes.into(),
-							callbackData: Vec::new().into(),
-							context: Vec::new().into(),
-						});
-					}
+					sol_outputs.push(SolMandateOutput {
+						oracle: oracle_bytes.into(),
+						settler: settler_bytes.into(),
+						chainId: U256::from(chain_id),
+						token: token_bytes.into(),
+						amount,
+						recipient: recipient_bytes.into(),
+						callbackData: callback_bytes.into(),
+						context: context_bytes.into(),
+					});
+				}
 				}
 			}
 		}

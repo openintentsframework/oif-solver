@@ -336,6 +336,8 @@ oif-demo intent build \
   --settlement <compact|escrow> \
   [--auth <permit2|eip3009>] \
   [--swap-type <exact-input|exact-output>] \
+  [--callback-data <hex>] \
+  [--callback-recipient <address>] \
   [--output <path>]
 
 # Build batch intents
@@ -433,6 +435,72 @@ oif-demo token approve \
 ```
 
 ## Advanced Features
+
+### Callback Data (Settlement Callbacks)
+
+The solver supports callback data for intents, allowing you to trigger contract calls on the destination chain when the intent is filled. This is useful for integrating with protocols that need to be notified of the settlement.
+
+#### Building Intents with Callback Data
+
+```bash
+# Build intent with callback data
+oif-demo intent build \
+  --from-chain 31337 \
+  --to-chain 31338 \
+  --from-token TOKA \
+  --to-token TOKB \
+  --amount 1 \
+  --settlement compact \
+  --callback-data 0xdeadbeef \
+  --callback-recipient 0xYourContractAddress
+```
+
+**Parameters:**
+- `--callback-data`: Hex-encoded bytes to pass to the callback (e.g., `0xabcd1234`)
+- `--callback-recipient`: Address of the contract on the destination chain that will receive the callback (defaults to the regular recipient if not specified)
+
+#### How Callbacks Work
+
+1. When an intent is filled, the `callbackData` is included in the `MandateOutput` struct
+2. The destination chain's OutputSettler calls the callback recipient with the provided data
+3. The callback recipient contract should implement the expected callback interface
+
+#### Solver Configuration for Callbacks
+
+Solvers can configure callback safety checks in their config file:
+
+```toml
+[order]
+# Whitelisted callback contract addresses (per chain)
+# Format: "chainId:address"
+callback_whitelist = [
+  "8453:0x154C8BB598dF835e9617c2cdcb8c84838Bd329C6",
+  "84532:0xYourTestnetContractAddress"
+]
+
+# Enable gas simulation for callbacks before filling (default: true)
+simulate_callbacks = true
+```
+
+The solver will only fill intents with callback data if:
+1. The callback recipient is in the whitelist, OR
+2. The callback whitelist is empty (all callbacks allowed)
+
+#### Example: Intent with Callback
+
+```bash
+# Build intent that calls a contract on settlement
+oif-demo intent build \
+  --from-chain 11155420 \
+  --to-chain 84532 \
+  --from-token USDC \
+  --to-token USDC \
+  --amount 10 \
+  --settlement escrow \
+  --auth permit2 \
+  --callback-data 0x12345678 \
+  --callback-recipient 0x154C8BB598dF835e9617c2cdcb8c84838Bd329C6
+```
 
 ### Monitoring Balances
 ```bash

@@ -61,6 +61,10 @@ network_ids = [11155420, 84532]
 # ORDER
 # ============================================================================
 [order]
+simulate_callbacks = true
+callback_whitelist = [
+    "84532:0x154C8BB598dF835e9617c2cdcb8c84838Bd329C6",  # MockCallbackExecutor on Base Sepolia
+]
 
 [order.implementations.eip7683]
 

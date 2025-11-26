@@ -1104,6 +1104,72 @@ impl CostProfitService {
 		}
 	}
 
+	/// Validates callback safety for an order with callbackData
+	pub async fn validate_callback_safety(
+		&self,
+		order: &Order,
+		config: &Config,
+	) -> Result<(), CostProfitError> {
+		tracing::info!("🔍 Starting callback safety validation for order {}", order.id);
+		
+		// Check if callback simulation is enabled
+		if !config.order.simulate_callbacks {
+			tracing::info!("⚠️  Callback simulation disabled - skipping validation");
+			return Ok(());
+		}
+		tracing::info!("✓ Callback simulation is enabled");
+
+		// Parse order to check for callbacks
+		let order_data = order.parse_order_data().map_err(|e| {
+			CostProfitError::Calculation(format!("Failed to parse order data: {}", e))
+		})?;
+
+		let outputs = order_data.parse_requested_outputs();
+		tracing::info!("Found {} output(s) to validate", outputs.len());
+		
+		let output = outputs.first().ok_or_else(|| {
+			CostProfitError::Calculation("No outputs found in order".to_string())
+		})?;
+
+		// Check if there's callback data
+		let has_callback = output.calldata.as_ref().map_or(false, |c| !c.is_empty() && c != "0x");
+		tracing::info!("Callback data present: {} (value: {:?})", has_callback, output.calldata);
+		
+		if !has_callback {
+			tracing::info!("✓ No callback data - safe to proceed");
+			return Ok(());
+		}
+
+		tracing::info!("⚠️  Order has callback data - validating safety");
+
+		// Extract recipient address and chain ID from InteropAddress
+		let recipient_bytes = &output.receiver.address;
+		let recipient_address = format!("0x{}", alloy_primitives::hex::encode(recipient_bytes));
+		
+		let chain_id = output.receiver.ethereum_chain_id().map_err(|e| {
+			CostProfitError::Config(format!("Failed to extract chain ID from recipient: {}", e))
+		})?;
+
+		// Check whitelist
+		let whitelist_key = format!("{}:{}", chain_id, recipient_address.to_lowercase());
+		
+		// Check if any whitelist entry matches (case-insensitive)
+		let is_whitelisted = config.order.callback_whitelist.iter().any(|entry| {
+			entry.to_lowercase() == whitelist_key
+		});
+		
+		if is_whitelisted {
+			tracing::info!("✅ Callback recipient {} on chain {} is whitelisted", recipient_address, chain_id);
+			return Ok(());
+		}
+
+		tracing::warn!("❌ Callback recipient {} on chain {} is NOT whitelisted", recipient_address, chain_id);
+		Err(CostProfitError::Config(format!(
+			"Callback recipient {} on chain {} not in whitelist. Add '{}:{}' to order.callback_whitelist in config",
+			recipient_address, chain_id, chain_id, recipient_address
+		)))
+	}
+
 	/// Converts a raw token amount to USD, handling decimals normalization.
 	async fn convert_raw_token_to_usd(
 		raw_amount: &U256,
