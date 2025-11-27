@@ -1443,7 +1443,10 @@ mod tests {
 		// Verify callback data was parsed correctly (32-byte ABI-encoded address)
 		assert_eq!(output.call.len(), 32);
 		// The address 0xd890aa4d1b1517a16f9c3d938d06721356e48b7d is in the last 20 bytes
-		assert_eq!(output.call[12..], hex::decode("d890aa4d1b1517a16f9c3d938d06721356e48b7d").unwrap());
+		assert_eq!(
+			output.call[12..],
+			hex::decode("d890aa4d1b1517a16f9c3d938d06721356e48b7d").unwrap()
+		);
 		assert_eq!(output.context, Vec::<u8>::new());
 	}
 
