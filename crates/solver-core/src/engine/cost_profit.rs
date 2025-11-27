@@ -3149,9 +3149,8 @@ mod tests {
 		// The recipient in the order is 0x2222...2222
 		// EIP-7930 format: Version(2) | ChainType(2) | ChainRefLen(1) | ChainRef | AddrLen(1) | Address
 		// For chain 137 (0x89): 0x0001 | 0x0000 | 0x01 | 0x89 | 0x14 | <20-byte address>
-		let whitelist = vec![
-			"0x000100000189142222222222222222222222222222222222222222".to_lowercase(),
-		];
+		let whitelist =
+			vec!["0x000100000189142222222222222222222222222222222222222222".to_lowercase()];
 		let config = create_config_with_callback_whitelist(whitelist);
 
 		// Act
@@ -3284,9 +3283,8 @@ mod tests {
 
 		// Whitelist the recipient
 		// EIP-7930 format for chain 137 (0x89): 0x0001 | 0x0000 | 0x01 | 0x89 | 0x14 | <address>
-		let whitelist = vec![
-			"0x000100000189142222222222222222222222222222222222222222".to_lowercase(),
-		];
+		let whitelist =
+			vec!["0x000100000189142222222222222222222222222222222222222222".to_lowercase()];
 		let config = create_config_with_callback_whitelist(whitelist);
 
 		// Act
@@ -3304,5 +3302,4 @@ mod tests {
 			other => panic!("Expected Calculation error, got: {:?}", other),
 		}
 	}
-
 }
