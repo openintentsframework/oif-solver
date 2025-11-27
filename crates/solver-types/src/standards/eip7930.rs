@@ -377,7 +377,8 @@ mod tests {
 		//
 		// Example: chain_id=11155420 (0xaa37dc), address=0x067e39121f2bba7531ccdf393bb76306ac11cac1
 		// Correct format: 0x0001000003aa37dc14067e39121f2bba7531ccdf393bb76306ac11cac1
-		let correct_bytes = hex::decode("0001000003aa37dc14067e39121f2bba7531ccdf393bb76306ac11cac1").unwrap();
+		let correct_bytes =
+			hex::decode("0001000003aa37dc14067e39121f2bba7531ccdf393bb76306ac11cac1").unwrap();
 
 		let parsed = InteropAddress::from_bytes(&correct_bytes).unwrap();
 
@@ -401,7 +402,8 @@ mod tests {
 		//
 		// Old format: 0x000100000314aa37dc067e39121f2bba7531ccdf393bb76306ac11cac1
 		// Breakdown: 0001 (version) | 0000 (chain_type) | 03 (chain_ref_len) | 14 (addr_len - WRONG POS) | aa37dc...
-		let old_format_bytes = hex::decode("000100000314aa37dc067e39121f2bba7531ccdf393bb76306ac11cac1").unwrap();
+		let old_format_bytes =
+			hex::decode("000100000314aa37dc067e39121f2bba7531ccdf393bb76306ac11cac1").unwrap();
 
 		// This will parse but produce WRONG results because:
 		// - It reads chain_ref_len=3, then chain_ref from bytes[5..8] = [0x14, 0xaa, 0x37]
@@ -451,7 +453,11 @@ mod tests {
 		assert_eq!(bytes[6], 0x14, "AddrLen should be 20 (0x14)");
 
 		// Bytes 7-26: Address (20 bytes)
-		assert_eq!(&bytes[7..27], eth_address.as_slice(), "Address should match");
+		assert_eq!(
+			&bytes[7..27],
+			eth_address.as_slice(),
+			"Address should match"
+		);
 
 		// Total length should be 2 + 2 + 1 + 1 + 1 + 20 = 27 bytes
 		assert_eq!(bytes.len(), 27);
@@ -468,9 +474,13 @@ mod tests {
 	#[test]
 	fn test_from_bytes_invalid_version() {
 		// Version 2 is not supported
-		let invalid_version = hex::decode("0002000001011406067e39121f2bba7531ccdf393bb76306ac11cac1").unwrap();
+		let invalid_version =
+			hex::decode("0002000001011406067e39121f2bba7531ccdf393bb76306ac11cac1").unwrap();
 		let result = InteropAddress::from_bytes(&invalid_version);
-		assert!(matches!(result, Err(InteropAddressError::UnsupportedVersion(2))));
+		assert!(matches!(
+			result,
+			Err(InteropAddressError::UnsupportedVersion(2))
+		));
 	}
 
 	#[test]
