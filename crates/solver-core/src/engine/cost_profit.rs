@@ -1168,10 +1168,7 @@ impl CostProfitService {
 		fill_tx: &Transaction,
 		config: &Config,
 	) -> Result<CallbackSimulationResult, CostProfitError> {
-		tracing::info!(
-			"🔍 Starting callback simulation for order {}",
-			order.id
-		);
+		tracing::info!("🔍 Starting callback simulation for order {}", order.id);
 
 		let chain_id = fill_tx.chain_id;
 
@@ -1197,10 +1194,7 @@ impl CostProfitService {
 			return self.estimate_fill_gas(fill_tx, chain_id, false).await;
 		}
 
-		tracing::info!(
-			"⚠️  Order has callback data: {:?}",
-			output.calldata
-		);
+		tracing::info!("⚠️  Order has callback data: {:?}", output.calldata);
 
 		// Check if callback simulation is enabled
 		if !config.order.simulate_callbacks {
@@ -1268,7 +1262,11 @@ impl CostProfitService {
 			has_callback
 		);
 
-		match self.delivery_service.estimate_gas(chain_id, fill_tx.clone()).await {
+		match self
+			.delivery_service
+			.estimate_gas(chain_id, fill_tx.clone())
+			.await
+		{
 			Ok(estimated_gas) => {
 				tracing::info!(
 					"✅ Gas estimation successful: {} units (has_callback: {})",
@@ -1281,13 +1279,10 @@ impl CostProfitService {
 					chain_id,
 					has_callback,
 				})
-			}
+			},
 			Err(e) => {
 				let error_msg = e.to_string();
-				tracing::warn!(
-					"❌ Gas estimation failed (likely revert): {}",
-					error_msg
-				);
+				tracing::warn!("❌ Gas estimation failed (likely revert): {}", error_msg);
 
 				// Check if this is a revert error
 				if error_msg.contains("revert")
@@ -1313,7 +1308,7 @@ impl CostProfitService {
 						has_callback,
 					})
 				}
-			}
+			},
 		}
 	}
 
