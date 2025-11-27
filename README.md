@@ -162,6 +162,7 @@ oif-solver/
 - Evaluates order profitability against minimum thresholds
 - Generates fill and claim transactions
 - Manages order-specific logic for different protocols
+- Supports callback data for settlement notifications
 
 ### solver-delivery
 

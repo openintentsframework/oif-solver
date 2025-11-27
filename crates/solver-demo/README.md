@@ -465,6 +465,26 @@ oif-demo intent build \
 2. The destination chain's OutputSettler calls the callback recipient with the provided data
 3. The callback recipient contract should implement the expected callback interface
 
+#### Gas Simulation for Callbacks
+
+Before accepting an order with callback data, the solver automatically:
+
+1. **Generates the fill transaction** with the callback data included
+2. **Simulates the transaction** using `eth_estimateGas` to:
+   - Detect if the callback would revert (order is rejected if so)
+   - Get the accurate gas cost including callback execution
+3. **Uses the simulated gas** in profitability calculations
+
+This ensures the solver:
+- Never attempts fills that would fail due to callback reverts
+- Accurately accounts for callback gas costs in profit margins
+
+Example log output:
+```
+✅ Callback simulation passed for order 0x57bc92.. - estimated gas: 79850 units on chain 84532
+Using simulated fill gas: 79850 units (config default was: 77298 units)
+```
+
 #### Solver Configuration for Callbacks
 
 Solvers can configure callback safety checks in their config file:
@@ -483,8 +503,10 @@ simulate_callbacks = true
 ```
 
 The solver will only fill intents with callback data if:
-1. The callback recipient is in the whitelist, OR
-2. The callback whitelist is empty (all callbacks allowed)
+1. The callback recipient is in the whitelist
+2. The callback simulation passes (transaction doesn't revert)
+
+**Note:** If `callback_whitelist` is empty, all callback recipients are allowed (but simulation still runs).
 
 #### Example: Intent with Callback
 
