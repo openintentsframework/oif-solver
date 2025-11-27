@@ -1424,4 +1424,75 @@ mod tests {
 		assert_eq!(deserialized.call.len(), 1000);
 		assert_eq!(deserialized.context.len(), 500);
 	}
+
+	#[test]
+	fn test_mandate_output_deserialization_with_callback_data() {
+		// Test parsing callback data with various formats
+		let json = r#"{
+			"oracle": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+			"settler": [2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],
+			"chain_id": "84532",
+			"token": [3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],
+			"amount": "1000000",
+			"recipient": [4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4],
+			"callbackData": "0x000000000000000000000000d890aa4d1b1517a16f9c3d938d06721356e48b7d",
+			"context": "0x"
+		}"#;
+
+		let output: MandateOutput = serde_json::from_str(json).unwrap();
+		// Verify callback data was parsed correctly (32-byte ABI-encoded address)
+		assert_eq!(output.call.len(), 32);
+		// The address 0xd890aa4d1b1517a16f9c3d938d06721356e48b7d is in the last 20 bytes
+		assert_eq!(output.call[12..], hex::decode("d890aa4d1b1517a16f9c3d938d06721356e48b7d").unwrap());
+		assert_eq!(output.context, Vec::<u8>::new());
+	}
+
+	#[test]
+	fn test_mandate_output_deserialization_empty_callback_formats() {
+		// Test empty callback as "0x"
+		let json_0x = r#"{
+			"oracle": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+			"settler": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+			"chain_id": "1",
+			"token": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+			"amount": "0",
+			"recipient": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+			"callbackData": "0x",
+			"context": "0x"
+		}"#;
+		let output: MandateOutput = serde_json::from_str(json_0x).unwrap();
+		assert!(output.call.is_empty());
+
+		// Test empty callback as empty string
+		let json_empty = r#"{
+			"oracle": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+			"settler": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+			"chain_id": "1",
+			"token": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+			"amount": "0",
+			"recipient": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+			"callbackData": "",
+			"context": ""
+		}"#;
+		let output: MandateOutput = serde_json::from_str(json_empty).unwrap();
+		assert!(output.call.is_empty());
+	}
+
+	#[test]
+	fn test_mandate_output_deserialization_invalid_callback_hex() {
+		// Test that invalid hex gracefully returns empty vec
+		let json = r#"{
+			"oracle": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+			"settler": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+			"chain_id": "1",
+			"token": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+			"amount": "0",
+			"recipient": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+			"callbackData": "not_valid_hex",
+			"context": "0x"
+		}"#;
+		// This should fail deserialization since hex_string deserializer expects valid hex
+		let result: Result<MandateOutput, _> = serde_json::from_str(json);
+		assert!(result.is_err());
+	}
 }

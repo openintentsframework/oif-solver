@@ -1195,7 +1195,7 @@ impl CostProfitService {
 		let has_callback = output
 			.calldata
 			.as_ref()
-			.map_or(false, |c| !c.is_empty() && c != "0x");
+			.is_some_and(|c| !c.is_empty() && c != "0x");
 
 		if !has_callback {
 			tracing::info!("✓ No callback data - using default gas estimate");
@@ -1207,13 +1207,15 @@ impl CostProfitService {
 
 		// Check if callback simulation is enabled
 		if !config.order.simulate_callbacks {
-			tracing::info!("⚠️  Callback simulation disabled - skipping gas estimation");
-			return Ok(CallbackSimulationResult {
-				success: true,
-				estimated_gas_units: 0, // Will use config default
-				chain_id,
-				has_callback: true,
-			});
+			tracing::warn!(
+				"❌ Order has callback but callback simulation is disabled. \
+				Enable 'simulate_callbacks = true' in config to support callbacks."
+			);
+			return Err(CostProfitError::Config(
+				"Order has callback data but callback simulation is disabled. \
+				Callbacks are not supported when simulate_callbacks = false in config."
+					.to_string(),
+			));
 		}
 
 		// Extract recipient info for whitelist check
@@ -3300,6 +3302,51 @@ mod tests {
 				assert!(msg.contains("callback would revert"));
 			},
 			other => panic!("Expected Calculation error, got: {:?}", other),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_simulate_callback_disabled_with_callback_data_rejected() {
+		// Arrange
+		let mock_delivery = MockDeliveryInterface::new();
+		let mut delivery_implementations = HashMap::new();
+		delivery_implementations.insert(
+			137,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 137, 3600));
+
+		let mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let token_manager = create_mock_token_manager();
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		// Order with callback data
+		let callback_data = vec![0xde, 0xad, 0xbe, 0xef];
+		let order = create_order_with_callback(callback_data);
+		let fill_tx = create_test_fill_transaction();
+
+		// Config with simulate_callbacks = false
+		let mut config = create_test_config();
+		config.order.simulate_callbacks = false;
+
+		// Act
+		let result = service
+			.simulate_callback_and_estimate_gas(&order, &fill_tx, &config)
+			.await;
+
+		// Assert - should fail because callbacks are not supported when simulation is disabled
+		assert!(result.is_err());
+		let error = result.unwrap_err();
+		match error {
+			CostProfitError::Config(msg) => {
+				assert!(msg.contains("callback simulation is disabled"));
+				assert!(msg.contains("not supported"));
+			},
+			other => panic!("Expected Config error, got: {:?}", other),
 		}
 	}
 }

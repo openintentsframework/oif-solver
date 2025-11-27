@@ -268,3 +268,123 @@ pub fn create_mock_pricing(
 ) -> Result<Box<dyn PricingInterface>, PricingError> {
 	Ok(Box::new(MockPricing::new(config)?))
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn create_default_config() -> toml::Value {
+		toml::Value::Table(toml::map::Map::new())
+	}
+
+	#[tokio::test]
+	async fn test_wei_to_currency_precision() {
+		// Test that small gas costs are preserved with 8 decimal precision
+		let config = create_default_config();
+		let pricing = MockPricing::new(&config).unwrap();
+
+		// 167885103876 wei at ETH price of $4615.16 (MOCK_ETH_USD_PRICE)
+		// = 0.000000167885103876 ETH * 4615.16 = very small USD amount
+		let result = pricing
+			.wei_to_currency("167885103876", "USD")
+			.await
+			.unwrap();
+
+		// Should have 8 decimal places of precision, not rounded to $0.00
+		let value: f64 = result.parse().unwrap();
+		assert!(value > 0.0, "Small gas cost should not be zero");
+		assert!(value < 0.01, "Value should be less than 1 cent");
+
+		// Verify we have more than 2 decimal places of precision
+		assert!(
+			result.contains('.'),
+			"Result should have decimal point: {}",
+			result
+		);
+		let decimal_places = result.split('.').nth(1).map(|s| s.len()).unwrap_or(0);
+		assert!(
+			decimal_places >= 4,
+			"Should have at least 4 decimal places for precision, got {}: {}",
+			decimal_places,
+			result
+		);
+	}
+
+	#[tokio::test]
+	async fn test_wei_to_currency_larger_amounts() {
+		let config = create_default_config();
+		let pricing = MockPricing::new(&config).unwrap();
+
+		// 1 ETH in wei
+		let result = pricing
+			.wei_to_currency("1000000000000000000", "USD")
+			.await
+			.unwrap();
+
+		let value: f64 = result.parse().unwrap();
+		// Should be approximately $4615.16 (MOCK_ETH_USD_PRICE)
+		assert!(
+			value > 4000.0 && value < 5000.0,
+			"1 ETH should be between $4000-$5000, got {}",
+			value
+		);
+	}
+
+	#[tokio::test]
+	async fn test_convert_asset_same_currency() {
+		let config = create_default_config();
+		let pricing = MockPricing::new(&config).unwrap();
+
+		// Same currency should return the same amount
+		let result = pricing.convert_asset("ETH", "ETH", "1.5").await.unwrap();
+		assert_eq!(result, "1.5");
+	}
+
+	#[tokio::test]
+	async fn test_convert_asset_through_usd() {
+		let config = create_default_config();
+		let pricing = MockPricing::new(&config).unwrap();
+
+		// ETH -> SOL conversion through USD
+		// ETH = $4615.16, SOL = $240.50, so 1 ETH ≈ 19.2 SOL
+		let result = pricing.convert_asset("ETH", "SOL", "1").await.unwrap();
+		let value: f64 = result.parse().unwrap();
+
+		assert!(
+			value > 15.0 && value < 25.0,
+			"1 ETH should be between 15-25 SOL, got {}",
+			value
+		);
+	}
+
+	#[tokio::test]
+	async fn test_currency_to_wei() {
+		let config = create_default_config();
+		let pricing = MockPricing::new(&config).unwrap();
+
+		// Get the mock ETH price first
+		let eth_price: f64 = MOCK_ETH_USD_PRICE.parse().unwrap();
+
+		// Convert that USD amount to wei - should be approximately 1 ETH
+		let result = pricing
+			.currency_to_wei(&eth_price.to_string(), "USD")
+			.await
+			.unwrap();
+		let wei: u128 = result.parse().unwrap();
+
+		// Should be close to 1e18 (1 ETH)
+		let one_eth: u128 = 1_000_000_000_000_000_000;
+		let diff = if wei > one_eth {
+			wei - one_eth
+		} else {
+			one_eth - wei
+		};
+		// Allow 1% tolerance
+		assert!(
+			diff < one_eth / 100,
+			"${} should be ~1 ETH (1e18 wei), got {} wei",
+			eth_price,
+			wei
+		);
+	}
+}
