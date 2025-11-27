@@ -104,10 +104,12 @@ impl InteropAddress {
 	}
 
 	/// Parse an ERC-7930 interoperable address from bytes
+	/// Format per EIP-7930: Version (2) | ChainType (2) | ChainRefLen (1) | ChainRef | AddrLen (1) | Address
 	pub fn from_bytes(bytes: &[u8]) -> Result<Self, InteropAddressError> {
-		if bytes.len() < 7 {
+		// Minimum: 2 (version) + 2 (chain_type) + 1 (chain_ref_len) + 1 (addr_len) = 6 bytes
+		if bytes.len() < 6 {
 			return Err(InteropAddressError::TooShort {
-				expected: 7,
+				expected: 6,
 				actual: bytes.len(),
 			});
 		}
@@ -119,10 +121,20 @@ impl InteropAddress {
 		}
 
 		let chain_type = [bytes[2], bytes[3]];
-		let chain_ref_length = bytes[4];
-		let address_length = bytes[5];
+		let chain_ref_length = bytes[4] as usize;
 
-		let expected_total_length = 6 + chain_ref_length as usize + address_length as usize;
+		// Check we have enough bytes for chain_reference + address_length byte
+		if bytes.len() < 5 + chain_ref_length + 1 {
+			return Err(InteropAddressError::TooShort {
+				expected: 5 + chain_ref_length + 1,
+				actual: bytes.len(),
+			});
+		}
+
+		let chain_reference = bytes[5..5 + chain_ref_length].to_vec();
+		let address_length = bytes[5 + chain_ref_length] as usize;
+
+		let expected_total_length = 6 + chain_ref_length + address_length;
 		if bytes.len() != expected_total_length {
 			return Err(InteropAddressError::TooShort {
 				expected: expected_total_length,
@@ -130,19 +142,18 @@ impl InteropAddress {
 			});
 		}
 
-		let chain_reference = bytes[6..6 + chain_ref_length as usize].to_vec();
-		let address = bytes[6 + chain_ref_length as usize..].to_vec();
+		let address = bytes[6 + chain_ref_length..].to_vec();
 
-		if chain_reference.len() != chain_ref_length as usize {
+		if chain_reference.len() != chain_ref_length {
 			return Err(InteropAddressError::InvalidChainReferenceLength {
-				expected: chain_ref_length,
+				expected: chain_ref_length as u8,
 				actual: chain_reference.len(),
 			});
 		}
 
-		if address.len() != address_length as usize {
+		if address.len() != address_length {
 			return Err(InteropAddressError::InvalidAddressLength {
-				expected: address_length,
+				expected: address_length as u8,
 				actual: address.len(),
 			});
 		}
@@ -156,14 +167,15 @@ impl InteropAddress {
 	}
 
 	/// Convert to bytes representation
+	/// Format per EIP-7930: Version (2) | ChainType (2) | ChainRefLen (1) | ChainRef | AddrLen (1) | Address
 	pub fn to_bytes(&self) -> Vec<u8> {
 		let mut bytes = Vec::new();
 		// Version is 2 bytes, big-endian per EIP-7930
 		bytes.extend_from_slice(&self.version.to_be_bytes());
 		bytes.extend_from_slice(&self.chain_type);
 		bytes.push(self.chain_reference.len() as u8);
-		bytes.push(self.address.len() as u8);
 		bytes.extend_from_slice(&self.chain_reference);
+		bytes.push(self.address.len() as u8);
 		bytes.extend_from_slice(&self.address);
 		bytes
 	}
@@ -356,5 +368,127 @@ mod tests {
 		let interop_addr = InteropAddress::new_ethereum(1, eth_address);
 
 		assert!(interop_addr.validate().is_ok());
+	}
+
+	#[test]
+	fn test_from_bytes_correct_eip7930_format() {
+		// Test that from_bytes correctly parses the EIP-7930 format:
+		// Version (2) | ChainType (2) | ChainRefLen (1) | ChainRef | AddrLen (1) | Address
+		//
+		// Example: chain_id=11155420 (0xaa37dc), address=0x067e39121f2bba7531ccdf393bb76306ac11cac1
+		// Correct format: 0x0001000003aa37dc14067e39121f2bba7531ccdf393bb76306ac11cac1
+		let correct_bytes =
+			hex::decode("0001000003aa37dc14067e39121f2bba7531ccdf393bb76306ac11cac1").unwrap();
+
+		let parsed = InteropAddress::from_bytes(&correct_bytes).unwrap();
+
+		assert_eq!(parsed.version, 1);
+		assert_eq!(parsed.chain_type, [0x00, 0x00]);
+		assert_eq!(parsed.chain_reference, vec![0xaa, 0x37, 0xdc]); // chain_id = 11155420
+		assert_eq!(parsed.address.len(), 20);
+		assert_eq!(
+			parsed.address,
+			hex::decode("067e39121f2bba7531ccdf393bb76306ac11cac1").unwrap()
+		);
+
+		// Verify chain_id extraction
+		assert_eq!(parsed.ethereum_chain_id().unwrap(), 11155420);
+	}
+
+	#[test]
+	fn test_from_bytes_rejects_old_incorrect_format() {
+		// The OLD incorrect format had: ChainRefLen | AddrLen | ChainRef | Address
+		// This should fail to parse correctly or produce wrong results
+		//
+		// Old format: 0x000100000314aa37dc067e39121f2bba7531ccdf393bb76306ac11cac1
+		// Breakdown: 0001 (version) | 0000 (chain_type) | 03 (chain_ref_len) | 14 (addr_len - WRONG POS) | aa37dc...
+		let old_format_bytes =
+			hex::decode("000100000314aa37dc067e39121f2bba7531ccdf393bb76306ac11cac1").unwrap();
+
+		// This will parse but produce WRONG results because:
+		// - It reads chain_ref_len=3, then chain_ref from bytes[5..8] = [0x14, 0xaa, 0x37]
+		// - Then addr_len from bytes[8] = 0xdc = 220, which is wrong
+		let result = InteropAddress::from_bytes(&old_format_bytes);
+
+		// Should fail because addr_len (220) doesn't match remaining bytes
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_from_bytes_to_bytes_roundtrip_preserves_format() {
+		// Verify that encoding then decoding preserves the correct format
+		let eth_address = address!("067e39121f2bBa7531CcdF393Bb76306AC11CaC1");
+		let interop_addr = InteropAddress::new_ethereum(11155420, eth_address);
+
+		let bytes = interop_addr.to_bytes();
+		let parsed = InteropAddress::from_bytes(&bytes).unwrap();
+
+		assert_eq!(interop_addr, parsed);
+		assert_eq!(parsed.ethereum_chain_id().unwrap(), 11155420);
+		assert_eq!(parsed.ethereum_address().unwrap(), eth_address);
+	}
+
+	#[test]
+	fn test_from_bytes_format_matches_eip7930_spec() {
+		// Verify byte positions match EIP-7930 spec exactly
+		let eth_address = address!("D8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
+		let interop_addr = InteropAddress::new_ethereum(1, eth_address);
+
+		let bytes = interop_addr.to_bytes();
+
+		// Verify byte layout per EIP-7930:
+		// Bytes 0-1: Version (big-endian)
+		assert_eq!(&bytes[0..2], &[0x00, 0x01], "Version should be 1");
+
+		// Bytes 2-3: ChainType
+		assert_eq!(&bytes[2..4], &[0x00, 0x00], "ChainType should be EIP155");
+
+		// Byte 4: ChainRefLen
+		assert_eq!(bytes[4], 1, "ChainRefLen should be 1 for chain_id=1");
+
+		// Byte 5: ChainRef (for chain_id=1, this is just 0x01)
+		assert_eq!(bytes[5], 0x01, "ChainRef should be 0x01 for chain_id=1");
+
+		// Byte 6: AddrLen (should be 20 = 0x14)
+		assert_eq!(bytes[6], 0x14, "AddrLen should be 20 (0x14)");
+
+		// Bytes 7-26: Address (20 bytes)
+		assert_eq!(
+			&bytes[7..27],
+			eth_address.as_slice(),
+			"Address should match"
+		);
+
+		// Total length should be 2 + 2 + 1 + 1 + 1 + 20 = 27 bytes
+		assert_eq!(bytes.len(), 27);
+	}
+
+	#[test]
+	fn test_from_bytes_too_short() {
+		// Less than minimum 6 bytes
+		let short_bytes = hex::decode("00010000").unwrap();
+		let result = InteropAddress::from_bytes(&short_bytes);
+		assert!(matches!(result, Err(InteropAddressError::TooShort { .. })));
+	}
+
+	#[test]
+	fn test_from_bytes_invalid_version() {
+		// Version 2 is not supported
+		let invalid_version =
+			hex::decode("0002000001011406067e39121f2bba7531ccdf393bb76306ac11cac1").unwrap();
+		let result = InteropAddress::from_bytes(&invalid_version);
+		assert!(matches!(
+			result,
+			Err(InteropAddressError::UnsupportedVersion(2))
+		));
+	}
+
+	#[test]
+	fn test_from_bytes_truncated_address() {
+		// Valid header but address is truncated
+		// Format: version(0001) | chain_type(0000) | chain_ref_len(01) | chain_ref(01) | addr_len(14=20) | address(only 10 bytes)
+		let truncated = hex::decode("00010000010114067e39121f2bba7531ccdf").unwrap();
+		let result = InteropAddress::from_bytes(&truncated);
+		assert!(matches!(result, Err(InteropAddressError::TooShort { .. })));
 	}
 }
