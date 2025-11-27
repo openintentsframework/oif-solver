@@ -166,7 +166,8 @@ impl PricingInterface for MockPricing {
 				.parse::<f64>()
 				.map_err(|e| PricingError::InvalidData(format!("Invalid price: {}", e)))?;
 			let result = eth_amount_f64 * price_f64;
-			Ok(format!("{:.2}", result))
+			// Use 8 decimal places to preserve precision for small gas costs
+			Ok(format!("{:.8}", result))
 		} else {
 			Err(PricingError::PriceNotAvailable(format!("ETH/{}", currency)))
 		}

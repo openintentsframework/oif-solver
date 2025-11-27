@@ -159,8 +159,9 @@ pub struct OrderConfig {
 	pub implementations: HashMap<String, toml::Value>,
 	/// Strategy configuration for order execution.
 	pub strategy: StrategyConfig,
-	/// Whitelisted callback contract addresses (per chain).
-	/// Format: "chainId:address" e.g. "8453:0x154C8BB598dF835e9617c2cdcb8c84838Bd329C6"
+	/// Whitelisted callback contract addresses in EIP-7930 InteropAddress format.
+	/// Format: EIP-7930 hex string e.g. "0x0001000002210514154c8bb598df835e9617c2cdcb8c84838bd329c6"
+	/// The format encodes: Version (2 bytes) | ChainType (2 bytes) | ChainRefLen (1 byte) | ChainRef | AddrLen (1 byte) | Address
 	#[serde(default)]
 	pub callback_whitelist: Vec<String>,
 	/// Enable gas simulation for callbacks before filling.

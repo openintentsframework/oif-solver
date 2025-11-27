@@ -491,16 +491,27 @@ Solvers can configure callback safety checks in their config file:
 
 ```toml
 [order]
-# Whitelisted callback contract addresses (per chain)
-# Format: "chainId:address"
+# Whitelisted callback contract addresses in EIP-7930 InteropAddress format
+# Format: "0x" + Version(2 bytes) + ChainType(2 bytes) + ChainRefLen(1 byte) + ChainRef + AddrLen(1 byte) + Address
 callback_whitelist = [
-  "8453:0x154C8BB598dF835e9617c2cdcb8c84838Bd329C6",
-  "84532:0xYourTestnetContractAddress"
+  "0x0001000002210514154c8bb598df835e9617c2cdcb8c84838bd329c6",  # Base (8453)
+  "0x0001000003014a3414154c8bb598df835e9617c2cdcb8c84838bd329c6",  # Base Sepolia (84532)
 ]
 
 # Enable gas simulation for callbacks before filling (default: true)
 simulate_callbacks = true
 ```
+
+**EIP-7930 InteropAddress Format:**
+- Bytes 0-1: Version (always `0001`)
+- Bytes 2-3: ChainType (`0000` for EIP155/Ethereum)
+- Byte 4: ChainRefLen (number of bytes for chain ID)
+- Next N bytes: ChainRef (chain ID in big-endian)
+- Next byte: AddrLen (`14` = 20 for Ethereum addresses)
+- Remaining: Address (20 bytes)
+
+Example for Base (chain ID 8453 = 0x2105):
+`0x0001` + `0000` + `02` + `2105` + `14` + `154c8bb598df835e9617c2cdcb8c84838bd329c6`
 
 The solver will only fill intents with callback data if:
 1. The callback recipient is in the whitelist

@@ -14,8 +14,8 @@ use solver_delivery::DeliveryService;
 use solver_order::OrderService;
 use solver_storage::StorageService;
 use solver_types::{
-	truncate_id, with_0x_prefix, Address, DiscoveryEvent, ExecutionDecision, ExecutionParams,
-	Intent, OrderEvent, SolverEvent, StorageKey,
+	truncate_id, with_0x_prefix, Address, DiscoveryEvent, Eip7683OrderData, ExecutionDecision,
+	ExecutionParams, Intent, OrderEvent, SolverEvent, StorageKey,
 };
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -275,6 +275,24 @@ impl IntentHandler {
 							.ok();
 						return Ok(());
 					},
+				}
+
+				// Update order's gas_limit_overrides with simulated gas before storing
+				// This ensures the actual fill transaction uses the simulated gas limit
+				let mut order = order;
+				if let Some(simulated_gas) = simulated_fill_gas {
+					if let Ok(mut order_data) =
+						serde_json::from_value::<Eip7683OrderData>(order.data.clone())
+					{
+						order_data.gas_limit_overrides.fill_gas_limit = Some(simulated_gas);
+						if let Ok(updated_data) = serde_json::to_value(&order_data) {
+							order.data = updated_data;
+							tracing::debug!(
+								"Updated order gas_limit_overrides.fill_gas_limit to {} units",
+								simulated_gas
+							);
+						}
+					}
 				}
 
 				self.event_bus

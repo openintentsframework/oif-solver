@@ -63,7 +63,8 @@ network_ids = [11155420, 84532]
 [order]
 simulate_callbacks = true
 callback_whitelist = [
-    "84532:0x154C8BB598dF835e9617c2cdcb8c84838Bd329C6",  # MockCallbackExecutor on Base Sepolia
+    "0x0001000003014a3414154c8bb598df835e9617c2cdcb8c84838bd329c6",  # MockCallbackExecutor on Base Sepolia
+    "0x0001000003014a3414f2a313a3dc028295e1dfa3bee34eafd2f801c994",  # MockCallbackExecutorWithFee on Base Sepolia
 ]
 
 [order.implementations.eip7683]

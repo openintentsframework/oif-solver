@@ -1178,6 +1178,15 @@ impl CostProfitService {
 		})?;
 
 		let outputs = order_data.parse_requested_outputs();
+
+		// Currently only single-output orders are supported
+		if outputs.len() > 1 {
+			return Err(CostProfitError::Calculation(format!(
+				"Multiple outputs ({}) not supported. Only single-output orders can be processed",
+				outputs.len()
+			)));
+		}
+
 		let output = outputs
 			.first()
 			.ok_or_else(|| CostProfitError::Calculation("No outputs found in order".to_string()))?;
@@ -1207,37 +1216,44 @@ impl CostProfitService {
 			});
 		}
 
-		// Extract recipient address for whitelist check
-		let recipient_bytes = &output.receiver.address;
-		let recipient_address = format!("0x{}", alloy_primitives::hex::encode(recipient_bytes));
+		// Extract recipient info for whitelist check
+		// The receiver is already an InteropAddress (EIP-7930 format)
+		let recipient_interop_hex = output.receiver.to_hex().to_lowercase();
 
 		let output_chain_id = output.receiver.ethereum_chain_id().map_err(|e| {
 			CostProfitError::Config(format!("Failed to extract chain ID from recipient: {}", e))
 		})?;
 
-		// Check whitelist
-		let whitelist_key = format!("{}:{}", output_chain_id, recipient_address.to_lowercase());
+		let recipient_eth_address = output
+			.receiver
+			.ethereum_address()
+			.map(|addr| format!("0x{}", alloy_primitives::hex::encode(addr)))
+			.unwrap_or_else(|_| "unknown".to_string());
+
+		// Check whitelist using EIP-7930 InteropAddress format
+		// Whitelist entries should be in EIP-7930 hex format (e.g., "0x0001000002210514...")
 		let is_whitelisted = config
 			.order
 			.callback_whitelist
 			.iter()
-			.any(|entry| entry.to_lowercase() == whitelist_key);
+			.any(|entry| entry.to_lowercase() == recipient_interop_hex);
 
 		if !is_whitelisted {
 			tracing::warn!(
-				"❌ Callback recipient {} on chain {} is NOT whitelisted",
-				recipient_address,
-				output_chain_id
+				"❌ Callback recipient {} (chain {}) is NOT whitelisted. InteropAddress: {}",
+				recipient_eth_address,
+				output_chain_id,
+				recipient_interop_hex
 			);
 			return Err(CostProfitError::Config(format!(
-				"Callback recipient {} on chain {} not in whitelist. Add '{}:{}' to order.callback_whitelist in config",
-				recipient_address, output_chain_id, output_chain_id, recipient_address
+				"Callback recipient {} on chain {} not in whitelist. Add '{}' to order.callback_whitelist in config (EIP-7930 format)",
+				recipient_eth_address, output_chain_id, recipient_interop_hex
 			)));
 		}
 
 		tracing::info!(
-			"✅ Callback recipient {} on chain {} is whitelisted - simulating gas",
-			recipient_address,
+			"✅ Callback recipient {} (chain {}) is whitelisted - simulating gas",
+			recipient_eth_address,
 			output_chain_id
 		);
 
@@ -2897,4 +2913,396 @@ mod tests {
 		// Should be much higher than minimum
 		assert!(actual_margin > Decimal::from_str("20.0").unwrap());
 	}
+
+	// ============================================================================
+	// Callback Gas Simulation Tests
+	// ============================================================================
+
+	fn create_order_with_callback(callback_data: Vec<u8>) -> Order {
+		let eip7683_data = Eip7683OrderData {
+			user: "0x1111111111111111111111111111111111111111".to_string(),
+			nonce: U256::from(1),
+			origin_chain_id: U256::from(1),
+			expires: (current_timestamp() + 3600) as u32,
+			fill_deadline: (current_timestamp() + 300) as u32,
+			input_oracle: "0x0000000000000000000000000000000000000000".to_string(),
+			inputs: vec![[U256::from(1000), U256::from(1000000)]],
+			order_id: [1u8; 32],
+			gas_limit_overrides: GasLimitOverrides::default(),
+			outputs: vec![MandateOutput {
+				oracle: [0u8; 32],
+				settler: [0u8; 32],
+				token: [0u8; 32],
+				amount: U256::from(1000000),
+				recipient: U256::from_str("0x2222222222222222222222222222222222222222")
+					.unwrap()
+					.to_be_bytes(),
+				chain_id: U256::from(137),
+				call: callback_data,
+				context: vec![],
+			}],
+			raw_order_data: None,
+			signature: None,
+			sponsor: None,
+			lock_type: None,
+		};
+
+		Order {
+			id: "test_callback_order".to_string(),
+			standard: "eip7683".to_string(),
+			created_at: current_timestamp(),
+			updated_at: current_timestamp(),
+			status: OrderStatus::Created,
+			data: serde_json::to_value(eip7683_data).unwrap(),
+			solver_address: solver_types::Address([0xAB; 20].to_vec()),
+			quote_id: None,
+			input_chains: vec![ChainSettlerInfo {
+				chain_id: 1,
+				settler_address: solver_types::Address([0x11; 20].to_vec()),
+			}],
+			output_chains: vec![ChainSettlerInfo {
+				chain_id: 137,
+				settler_address: solver_types::Address([0x22; 20].to_vec()),
+			}],
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
+			claim_tx_hash: None,
+			fill_proof: None,
+		}
+	}
+
+	fn create_order_with_multiple_outputs() -> Order {
+		let eip7683_data = Eip7683OrderData {
+			user: "0x1111111111111111111111111111111111111111".to_string(),
+			nonce: U256::from(1),
+			origin_chain_id: U256::from(1),
+			expires: (current_timestamp() + 3600) as u32,
+			fill_deadline: (current_timestamp() + 300) as u32,
+			input_oracle: "0x0000000000000000000000000000000000000000".to_string(),
+			inputs: vec![[U256::from(1000), U256::from(1000000)]],
+			order_id: [1u8; 32],
+			gas_limit_overrides: GasLimitOverrides::default(),
+			outputs: vec![
+				MandateOutput {
+					oracle: [0u8; 32],
+					settler: [0u8; 32],
+					token: [0u8; 32],
+					amount: U256::from(500000),
+					recipient: U256::from_str("0x2222222222222222222222222222222222222222")
+						.unwrap()
+						.to_be_bytes(),
+					chain_id: U256::from(137),
+					call: vec![],
+					context: vec![],
+				},
+				MandateOutput {
+					oracle: [0u8; 32],
+					settler: [0u8; 32],
+					token: [0u8; 32],
+					amount: U256::from(500000),
+					recipient: U256::from_str("0x3333333333333333333333333333333333333333")
+						.unwrap()
+						.to_be_bytes(),
+					chain_id: U256::from(42161), // Different chain
+					call: vec![],
+					context: vec![],
+				},
+			],
+			raw_order_data: None,
+			signature: None,
+			sponsor: None,
+			lock_type: None,
+		};
+
+		Order {
+			id: "test_multi_output_order".to_string(),
+			standard: "eip7683".to_string(),
+			created_at: current_timestamp(),
+			updated_at: current_timestamp(),
+			status: OrderStatus::Created,
+			data: serde_json::to_value(eip7683_data).unwrap(),
+			solver_address: solver_types::Address([0xAB; 20].to_vec()),
+			quote_id: None,
+			input_chains: vec![ChainSettlerInfo {
+				chain_id: 1,
+				settler_address: solver_types::Address([0x11; 20].to_vec()),
+			}],
+			output_chains: vec![
+				ChainSettlerInfo {
+					chain_id: 137,
+					settler_address: solver_types::Address([0x22; 20].to_vec()),
+				},
+				ChainSettlerInfo {
+					chain_id: 42161,
+					settler_address: solver_types::Address([0x33; 20].to_vec()),
+				},
+			],
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
+			claim_tx_hash: None,
+			fill_proof: None,
+		}
+	}
+
+	fn create_test_fill_transaction() -> Transaction {
+		Transaction {
+			to: Some(solver_types::Address([0x22; 20].to_vec())),
+			data: vec![0xde, 0xad, 0xbe, 0xef],
+			value: U256::ZERO,
+			chain_id: 137,
+			nonce: None,
+			gas_limit: None,
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+		}
+	}
+
+	fn create_config_with_callback_whitelist(whitelist: Vec<String>) -> Config {
+		let mut config = create_test_config();
+		config.order.callback_whitelist = whitelist;
+		config.order.simulate_callbacks = true;
+		config
+	}
+
+	#[tokio::test]
+	async fn test_simulate_callback_no_callback_data() {
+		// Arrange
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+		mock_delivery
+			.expect_estimate_gas()
+			.returning(|_| Box::pin(async move { Ok(75000u64) }));
+
+		let mut delivery_implementations = HashMap::new();
+		delivery_implementations.insert(
+			137,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 137, 3600));
+
+		let mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let token_manager = create_mock_token_manager();
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let order = create_order_with_callback(vec![]); // Empty callback
+		let fill_tx = create_test_fill_transaction();
+		let config = create_config_with_callback_whitelist(vec![]);
+
+		// Act
+		let result = service
+			.simulate_callback_and_estimate_gas(&order, &fill_tx, &config)
+			.await;
+
+		// Assert
+		assert!(result.is_ok());
+		let simulation_result = result.unwrap();
+		assert!(!simulation_result.has_callback);
+		assert_eq!(simulation_result.estimated_gas_units, 75000);
+		assert_eq!(simulation_result.chain_id, 137);
+	}
+
+	#[tokio::test]
+	async fn test_simulate_callback_with_callback_data_whitelisted() {
+		// Arrange
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+		mock_delivery
+			.expect_estimate_gas()
+			.returning(|_| Box::pin(async move { Ok(95000u64) }));
+
+		let mut delivery_implementations = HashMap::new();
+		delivery_implementations.insert(
+			137,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 137, 3600));
+
+		let mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let token_manager = create_mock_token_manager();
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		// Callback data: some arbitrary bytes
+		let callback_data = vec![0xde, 0xad, 0xbe, 0xef];
+		let order = create_order_with_callback(callback_data);
+		let fill_tx = create_test_fill_transaction();
+
+		// Whitelist the recipient (chain 137, recipient from order)
+		// The recipient in the order is 0x2222...2222
+		// EIP-7930 format: Version(2) | ChainType(2) | ChainRefLen(1) | ChainRef | AddrLen(1) | Address
+		// For chain 137 (0x89): 0x0001 | 0x0000 | 0x01 | 0x89 | 0x14 | <20-byte address>
+		let whitelist = vec![
+			"0x000100000189142222222222222222222222222222222222222222".to_lowercase(),
+		];
+		let config = create_config_with_callback_whitelist(whitelist);
+
+		// Act
+		let result = service
+			.simulate_callback_and_estimate_gas(&order, &fill_tx, &config)
+			.await;
+
+		// Assert
+		assert!(result.is_ok());
+		let simulation_result = result.unwrap();
+		assert!(simulation_result.has_callback);
+		assert_eq!(simulation_result.estimated_gas_units, 95000);
+	}
+
+	#[tokio::test]
+	async fn test_simulate_callback_not_whitelisted() {
+		// Arrange
+		let mock_delivery = MockDeliveryInterface::new();
+		let mut delivery_implementations = HashMap::new();
+		delivery_implementations.insert(
+			137,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 137, 3600));
+
+		let mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let token_manager = create_mock_token_manager();
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let callback_data = vec![0xde, 0xad, 0xbe, 0xef];
+		let order = create_order_with_callback(callback_data);
+		let fill_tx = create_test_fill_transaction();
+
+		// Empty whitelist - recipient not whitelisted
+		let config = create_config_with_callback_whitelist(vec![]);
+
+		// Act
+		let result = service
+			.simulate_callback_and_estimate_gas(&order, &fill_tx, &config)
+			.await;
+
+		// Assert - should fail because recipient is not whitelisted
+		assert!(result.is_err());
+		let error = result.unwrap_err();
+		match error {
+			CostProfitError::Config(msg) => {
+				assert!(msg.contains("not in whitelist"));
+			},
+			other => panic!("Expected Config error, got: {:?}", other),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_simulate_callback_multiple_outputs_rejected() {
+		// Arrange
+		let mock_delivery = MockDeliveryInterface::new();
+		let mut delivery_implementations = HashMap::new();
+		delivery_implementations.insert(
+			137,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 137, 3600));
+
+		let mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let token_manager = create_mock_token_manager();
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let order = create_order_with_multiple_outputs();
+		let fill_tx = create_test_fill_transaction();
+		let config = create_config_with_callback_whitelist(vec![]);
+
+		// Act
+		let result = service
+			.simulate_callback_and_estimate_gas(&order, &fill_tx, &config)
+			.await;
+
+		// Assert - should fail because multiple outputs are not supported
+		assert!(result.is_err());
+		let error = result.unwrap_err();
+		match error {
+			CostProfitError::Calculation(msg) => {
+				assert!(msg.contains("Multiple outputs"));
+				assert!(msg.contains("not supported"));
+			},
+			other => panic!("Expected Calculation error, got: {:?}", other),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_simulate_callback_gas_estimation_failure_revert() {
+		// Arrange
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+		mock_delivery.expect_estimate_gas().returning(|_| {
+			Box::pin(async move {
+				Err(solver_delivery::DeliveryError::Network(
+					"execution reverted".to_string(),
+				))
+			})
+		});
+
+		let mut delivery_implementations = HashMap::new();
+		delivery_implementations.insert(
+			137,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 137, 3600));
+
+		let mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let token_manager = create_mock_token_manager();
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let callback_data = vec![0xde, 0xad, 0xbe, 0xef];
+		let order = create_order_with_callback(callback_data);
+		let fill_tx = create_test_fill_transaction();
+
+		// Whitelist the recipient
+		// EIP-7930 format for chain 137 (0x89): 0x0001 | 0x0000 | 0x01 | 0x89 | 0x14 | <address>
+		let whitelist = vec![
+			"0x000100000189142222222222222222222222222222222222222222".to_lowercase(),
+		];
+		let config = create_config_with_callback_whitelist(whitelist);
+
+		// Act
+		let result = service
+			.simulate_callback_and_estimate_gas(&order, &fill_tx, &config)
+			.await;
+
+		// Assert - should fail because callback would revert
+		assert!(result.is_err());
+		let error = result.unwrap_err();
+		match error {
+			CostProfitError::Calculation(msg) => {
+				assert!(msg.contains("callback would revert"));
+			},
+			other => panic!("Expected Calculation error, got: {:?}", other),
+		}
+	}
+
 }
