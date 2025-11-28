@@ -669,10 +669,7 @@ impl QuoteValidator {
 
 			if !is_whitelisted {
 				// Extract chain ID and address for helpful error message
-				let chain_id = output
-					.receiver
-					.ethereum_chain_id()
-					.unwrap_or(0);
+				let chain_id = output.receiver.ethereum_chain_id().unwrap_or(0);
 				let recipient_addr = output
 					.receiver
 					.ethereum_address()
@@ -686,10 +683,7 @@ impl QuoteValidator {
 				)));
 			}
 
-			tracing::debug!(
-				"Callback recipient {} is whitelisted",
-				receiver_interop_hex
-			);
+			tracing::debug!("Callback recipient {} is whitelisted", receiver_interop_hex);
 		}
 
 		Ok(())
