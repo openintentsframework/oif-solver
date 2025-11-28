@@ -75,7 +75,9 @@ impl IntentOps {
 		let to_token_addr = self.get_token_address(params.to_chain, &params.to_token)?;
 		let asset_output = self.create_interop_address(to_token_addr, params.to_chain)?;
 
-		let receiver = self.create_interop_address(recipient_addr, params.to_chain)?;
+		// Use callback_recipient if provided, otherwise use regular recipient
+		let output_recipient_addr = params.callback_recipient.unwrap_or(recipient_addr);
+		let receiver = self.create_interop_address(output_recipient_addr, params.to_chain)?;
 
 		let (origin_submission, lock) = match params.settlement {
 			SettlementType::Escrow => {
@@ -121,7 +123,7 @@ impl IntentOps {
 				receiver,
 				asset: asset_output,
 				amount: Some(params.amount.to_string()), // Use the specified amount as output
-				calldata: None,
+				calldata: params.callback_data.clone(),
 			};
 
 			(input, output)
@@ -138,7 +140,7 @@ impl IntentOps {
 				receiver,
 				asset: asset_output,
 				amount: params.min_amount.map(|a| a.to_string()), // Optional minimum output amount
-				calldata: None,
+				calldata: params.callback_data.clone(),
 			};
 
 			(input, output)
@@ -298,6 +300,8 @@ impl IntentOps {
 			exact_output,
 			settlement: settlement_type,
 			auth: auth_type,
+			callback_data: None,
+			callback_recipient: None,
 		})
 	}
 
@@ -1002,6 +1006,8 @@ pub struct IntentParams {
 	pub exact_output: bool,
 	pub settlement: SettlementType,
 	pub auth: Option<AuthType>,
+	pub callback_data: Option<String>,
+	pub callback_recipient: Option<Address>,
 }
 
 /// Order status information

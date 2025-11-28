@@ -162,6 +162,7 @@ oif-solver/
 - Evaluates order profitability against minimum thresholds
 - Generates fill and claim transactions
 - Manages order-specific logic for different protocols
+- Supports callback data for settlement notifications
 
 ### solver-delivery
 
@@ -569,6 +570,29 @@ cargo run -p solver-demo -- intent test <post-orders-file>
 - `--swap-type`: `exact-input` or `exact-output`
 - `--settlement`: `escrow` or `compact` (resource locks)
 - `--auth`: `permit2` or `eip3009` (for off-chain submission)
+- `--callback-recipient`: Address to receive callback after fill (optional)
+- `--callback-data`: Hex-encoded data to pass to callback (optional)
+
+**Example with Callback:**
+
+```bash
+# Build intent with callback for post-fill notification
+# - callback-recipient: MockCallbackExecutorWithFee contract on Base Sepolia
+# - callback-data: ABI-encoded address to receive the fee (0xd890aa4d1b1517a16f9c3d938d06721356e48b7d)
+oif-demo intent build \
+    --to-chain 84532 \
+    --from-chain 11155420 \
+    --from-token USDC \
+    --to-token USDC \
+    --swap-type exact-output \
+    --amount 1 \
+    --settlement escrow \
+    --auth permit2 \
+    --callback-recipient 0xf2a313a3Dc028295e1dFa3BEE34EaFD2f801C994 \
+    --callback-data 0x000000000000000000000000d890aa4d1b1517a16f9c3d938d06721356e48b7d
+```
+
+The callback recipient will be called after the fill transaction with the provided callback data. The solver simulates the callback during gas estimation to ensure it won't revert and to accurately estimate gas costs.
 
 #### Quote Operations
 

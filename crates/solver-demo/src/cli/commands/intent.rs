@@ -57,6 +57,14 @@ pub enum IntentSubcommand {
 		#[arg(long)]
 		auth: Option<String>,
 
+		/// Optional callback data (hex string like 0xabcd1234)
+		#[arg(long)]
+		callback_data: Option<String>,
+
+		/// Optional callback recipient address (overrides default recipient)
+		#[arg(long)]
+		callback_recipient: Option<String>,
+
 		/// Optional output file path for generated intent
 		#[arg(short, long)]
 		output: Option<PathBuf>,

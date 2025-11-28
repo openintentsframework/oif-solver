@@ -336,6 +336,8 @@ oif-demo intent build \
   --settlement <compact|escrow> \
   [--auth <permit2|eip3009>] \
   [--swap-type <exact-input|exact-output>] \
+  [--callback-data <hex>] \
+  [--callback-recipient <address>] \
   [--output <path>]
 
 # Build batch intents
@@ -433,6 +435,105 @@ oif-demo token approve \
 ```
 
 ## Advanced Features
+
+### Callback Data (Settlement Callbacks)
+
+The solver supports callback data for intents, allowing you to trigger contract calls on the destination chain when the intent is filled. This is useful for integrating with protocols that need to be notified of the settlement.
+
+#### Building Intents with Callback Data
+
+```bash
+# Build intent with callback data
+oif-demo intent build \
+  --from-chain 31337 \
+  --to-chain 31338 \
+  --from-token TOKA \
+  --to-token TOKB \
+  --amount 1 \
+  --settlement compact \
+  --callback-data 0xdeadbeef \
+  --callback-recipient 0xYourContractAddress
+```
+
+**Parameters:**
+- `--callback-data`: Hex-encoded bytes to pass to the callback (e.g., `0xabcd1234`)
+- `--callback-recipient`: Address of the contract on the destination chain that will receive the callback (defaults to the regular recipient if not specified)
+
+#### How Callbacks Work
+
+1. When an intent is filled, the `callbackData` is included in the `MandateOutput` struct
+2. The destination chain's OutputSettler calls the callback recipient with the provided data
+3. The callback recipient contract should implement the expected callback interface
+
+#### Gas Simulation for Callbacks
+
+Before accepting an order with callback data, the solver automatically:
+
+1. **Generates the fill transaction** with the callback data included
+2. **Simulates the transaction** using `eth_estimateGas` to:
+   - Detect if the callback would revert (order is rejected if so)
+   - Get the accurate gas cost including callback execution
+3. **Uses the simulated gas** in profitability calculations
+
+This ensures the solver:
+- Never attempts fills that would fail due to callback reverts
+- Accurately accounts for callback gas costs in profit margins
+
+Example log output:
+```
+✅ Callback simulation passed for order 0x57bc92.. - estimated gas: 79850 units on chain 84532
+Using simulated fill gas: 79850 units (config default was: 77298 units)
+```
+
+#### Solver Configuration for Callbacks
+
+Solvers can configure callback safety checks in their config file:
+
+```toml
+[order]
+# Whitelisted callback contract addresses in EIP-7930 InteropAddress format
+# Format: "0x" + Version(2 bytes) + ChainType(2 bytes) + ChainRefLen(1 byte) + ChainRef + AddrLen(1 byte) + Address
+callback_whitelist = [
+  "0x0001000002210514154c8bb598df835e9617c2cdcb8c84838bd329c6",  # Base (8453)
+  "0x0001000003014a3414154c8bb598df835e9617c2cdcb8c84838bd329c6",  # Base Sepolia (84532)
+]
+
+# Enable gas simulation for callbacks before filling (default: true)
+simulate_callbacks = true
+```
+
+**EIP-7930 InteropAddress Format:**
+- Bytes 0-1: Version (always `0001`)
+- Bytes 2-3: ChainType (`0000` for EIP155/Ethereum)
+- Byte 4: ChainRefLen (number of bytes for chain ID)
+- Next N bytes: ChainRef (chain ID in big-endian)
+- Next byte: AddrLen (`14` = 20 for Ethereum addresses)
+- Remaining: Address (20 bytes)
+
+Example for Base (chain ID 8453 = 0x2105):
+`0x0001` + `0000` + `02` + `2105` + `14` + `154c8bb598df835e9617c2cdcb8c84838bd329c6`
+
+The solver will only fill intents with callback data if:
+1. The callback recipient is in the whitelist
+2. The callback simulation passes (transaction doesn't revert)
+
+**Note:** If `callback_whitelist` is empty, all callback recipients are allowed (but simulation still runs).
+
+#### Example: Intent with Callback
+
+```bash
+# Build intent that calls a contract on settlement
+oif-demo intent build \
+  --from-chain 11155420 \
+  --to-chain 84532 \
+  --from-token USDC \
+  --to-token USDC \
+  --amount 10 \
+  --settlement escrow \
+  --auth permit2 \
+  --callback-data 0x12345678 \
+  --callback-recipient 0x154C8BB598dF835e9617c2cdcb8c84838Bd329C6
+```
 
 ### Monitoring Balances
 ```bash

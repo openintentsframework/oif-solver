@@ -150,6 +150,8 @@ impl ConfigBuilder {
 					primary: self.strategy_primary,
 					implementations: HashMap::new(),
 				},
+				callback_whitelist: Vec::new(),
+				simulate_callbacks: true,
 			},
 			settlement: self.settlement.unwrap_or_else(|| SettlementConfig {
 				implementations: HashMap::new(),

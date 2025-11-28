@@ -476,7 +476,8 @@ impl PricingInterface for CoinGeckoPricing {
 			result.round_dp(8),
 			eth_price
 		);
-		Ok(result.round_dp(2).to_string())
+		// Use 8 decimal places to preserve precision for small gas costs
+		Ok(result.round_dp(8).to_string())
 	}
 
 	async fn currency_to_wei(

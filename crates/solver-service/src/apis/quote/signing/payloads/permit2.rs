@@ -179,6 +179,22 @@ pub fn build_permit2_batch_witness_digest(
 
 	let empty_bytes_hash = keccak256([]);
 
+	// Parse callbackData from request if present
+	let callback_data_bytes = if let Some(ref calldata_hex) = output.calldata {
+		if calldata_hex.is_empty() || calldata_hex == "0x" {
+			vec![]
+		} else {
+			let hex_str = calldata_hex.trim_start_matches("0x");
+			hex::decode(hex_str).unwrap_or_else(|e| {
+				tracing::warn!("Failed to decode callbackData '{}': {}", calldata_hex, e);
+				vec![]
+			})
+		}
+	} else {
+		vec![]
+	};
+	let callback_data_hash = keccak256(&callback_data_bytes);
+
 	// MandateOutput hash
 	let mut enc = Eip712AbiEncoder::new();
 	enc.push_b256(&mandate_output_type_hash);
@@ -188,8 +204,8 @@ pub fn build_permit2_batch_witness_digest(
 	enc.push_address(&dest_token);
 	enc.push_u256(output_amount);
 	enc.push_address(&recipient);
-	enc.push_b256(&empty_bytes_hash);
-	enc.push_b256(&empty_bytes_hash);
+	enc.push_b256(&callback_data_hash);
+	enc.push_b256(&empty_bytes_hash); // context remains empty
 	let mandate_output_hash = keccak256(enc.finish());
 
 	let outputs_hash = keccak256(mandate_output_hash.as_slice());
@@ -260,7 +276,7 @@ pub fn build_permit2_batch_witness_digest(
 				"token": solver_types::utils::address_to_bytes32_hex(&dest_token),
 				"amount": output_amount.to_string(),
 				"recipient": solver_types::utils::address_to_bytes32_hex(&recipient),
-				"callbackData": "0x",
+				"callbackData": output.calldata.as_ref().unwrap_or(&"0x".to_string()).clone(),
 				"context": "0x"
 			}]
 		}
