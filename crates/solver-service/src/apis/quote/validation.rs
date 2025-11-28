@@ -595,6 +595,105 @@ impl QuoteValidator {
 
 		Ok(())
 	}
+
+	/// Validates callback data in outputs against the solver's callback whitelist.
+	///
+	/// This validation runs early in the quote generation flow to provide fail-fast
+	/// behavior when a user requests a callback that the solver cannot support.
+	///
+	/// # Validation Rules
+	///
+	/// 1. If an output has callback data (`calldata` field):
+	///    - If `simulate_callbacks` is disabled in config, reject with error
+	///    - If the receiver (callback recipient) is not in the whitelist, reject with error
+	///    - An empty whitelist allows all callbacks (but simulation must be enabled)
+	///
+	/// 2. If an output has no callback data, no validation is needed
+	///
+	/// # Arguments
+	///
+	/// * `request` - The quote request containing outputs with potential callbacks
+	/// * `config` - Solver configuration containing callback settings
+	///
+	/// # Errors
+	///
+	/// Returns `QuoteError::InvalidRequest` if:
+	/// - Callback data is present but simulation is disabled
+	/// - Callback recipient is not in the whitelist
+	pub fn validate_callback_whitelist(
+		request: &GetQuoteRequest,
+		config: &solver_config::Config,
+	) -> Result<(), QuoteError> {
+		for output in &request.intent.outputs {
+			// Check if this output has callback data
+			let has_callback = output
+				.calldata
+				.as_ref()
+				.map(|c| !c.is_empty() && c != "0x")
+				.unwrap_or(false);
+
+			if !has_callback {
+				continue;
+			}
+
+			// Output has callback data - validate it
+			tracing::debug!(
+				"Output has callback data: {:?}, receiver: {}",
+				output.calldata,
+				output.receiver.to_hex()
+			);
+
+			// Check if callback simulation is enabled
+			if !config.order.simulate_callbacks {
+				return Err(QuoteError::InvalidRequest(
+					"Callback data provided but callback simulation is disabled in solver config. \
+					The solver cannot process orders with callbacks."
+						.to_string(),
+				));
+			}
+
+			// Check whitelist (empty whitelist means all callbacks allowed)
+			if config.order.callback_whitelist.is_empty() {
+				tracing::debug!("Callback whitelist is empty - all callbacks allowed");
+				continue;
+			}
+
+			// Get the receiver's EIP-7930 hex representation for whitelist comparison
+			let receiver_interop_hex = output.receiver.to_hex().to_lowercase();
+
+			let is_whitelisted = config
+				.order
+				.callback_whitelist
+				.iter()
+				.any(|entry| entry.to_lowercase() == receiver_interop_hex);
+
+			if !is_whitelisted {
+				// Extract chain ID and address for helpful error message
+				let chain_id = output
+					.receiver
+					.ethereum_chain_id()
+					.unwrap_or(0);
+				let recipient_addr = output
+					.receiver
+					.ethereum_address()
+					.map(|a| format!("{:?}", a))
+					.unwrap_or_else(|_| "unknown".to_string());
+
+				return Err(QuoteError::InvalidRequest(format!(
+					"Callback recipient {} on chain {} is not in the solver's whitelist. \
+					Add '{}' to order.callback_whitelist in config (EIP-7930 format) to enable this callback.",
+					recipient_addr, chain_id, receiver_interop_hex
+				)));
+			}
+
+			tracing::debug!(
+				"Callback recipient {} is whitelisted",
+				receiver_interop_hex
+			);
+		}
+
+		Ok(())
+	}
 }
 
 #[cfg(test)]
@@ -2032,5 +2131,196 @@ mod tests {
 
 		assert_eq!(asset1.amount, U256::from(1000000u64)); // From cost context
 		assert_eq!(asset2.amount, U256::from(750000u64)); // From cost context
+	}
+
+	// ========== validate_callback_whitelist Tests ==========
+
+	fn create_test_config_with_callbacks(
+		simulate_callbacks: bool,
+		whitelist: Vec<String>,
+	) -> solver_config::Config {
+		let config_toml = format!(
+			r#"
+			[solver]
+			id = "test-solver"
+			monitoring_timeout_seconds = 30
+			min_profitability_pct = 1.0
+
+			[storage]
+			primary = "memory"
+			cleanup_interval_seconds = 3600
+			[storage.implementations.memory]
+
+			[delivery]
+			min_confirmations = 1
+			[delivery.implementations]
+
+			[account]
+			primary = "local"
+			[account.implementations.local]
+			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
+
+			[discovery]
+			[discovery.implementations]
+
+			[order]
+			simulate_callbacks = {}
+			callback_whitelist = {:?}
+			[order.implementations]
+			[order.strategy]
+			primary = "simple"
+			[order.strategy.implementations.simple]
+
+			[settlement]
+			[settlement.implementations]
+
+			[networks]
+		"#,
+			simulate_callbacks, whitelist
+		);
+		toml::from_str(&config_toml).expect("Failed to parse test config")
+	}
+
+	fn create_request_with_callback(calldata: Option<&str>) -> GetQuoteRequest {
+		GetQuoteRequest {
+			user: InteropAddress::new_ethereum(
+				1,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			intent: IntentRequest {
+				intent_type: IntentType::OifSwap,
+				inputs: vec![QuoteInput {
+					user: InteropAddress::new_ethereum(
+						1,
+						address!("1111111111111111111111111111111111111111"),
+					),
+					asset: InteropAddress::new_ethereum(
+						1,
+						address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+					),
+					amount: Some("1000000000000000000".to_string()),
+					lock: None,
+				}],
+				outputs: vec![QuoteOutput {
+					receiver: InteropAddress::new_ethereum(
+						84532,
+						address!("f2a313a3Dc028295e1dFa3BEE34EaFD2f801C994"),
+					),
+					asset: InteropAddress::new_ethereum(
+						84532,
+						address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"),
+					),
+					amount: None,
+					calldata: calldata.map(|s| s.to_string()),
+				}],
+				swap_type: Some(SwapType::ExactInput),
+				min_valid_until: None,
+				preference: None,
+				origin_submission: None,
+				failure_handling: None,
+				partial_fill: None,
+				metadata: None,
+			},
+			supported_types: vec!["oif-escrow-v0".to_string()],
+		}
+	}
+
+	#[test]
+	fn test_validate_callback_whitelist_no_callback_succeeds() {
+		// Test: No callback data should always succeed
+		let config = create_test_config_with_callbacks(false, vec![]);
+		let request = create_request_with_callback(None);
+
+		let result = QuoteValidator::validate_callback_whitelist(&request, &config);
+		assert!(
+			result.is_ok(),
+			"Should succeed when no callback data: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_callback_whitelist_empty_callback_succeeds() {
+		// Test: Empty callback ("0x") should be treated as no callback
+		let config = create_test_config_with_callbacks(false, vec![]);
+		let request = create_request_with_callback(Some("0x"));
+
+		let result = QuoteValidator::validate_callback_whitelist(&request, &config);
+		assert!(
+			result.is_ok(),
+			"Should succeed when callback is empty '0x': {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_callback_whitelist_simulation_disabled_fails() {
+		// Test: Callback data with simulation disabled should fail
+		let config = create_test_config_with_callbacks(false, vec![]);
+		let request = create_request_with_callback(Some(
+			"0x000000000000000000000000d890aa4d1b1517a16f9c3d938d06721356e48b7d",
+		));
+
+		let result = QuoteValidator::validate_callback_whitelist(&request, &config);
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("simulation is disabled")),
+			"Should reject callback when simulation disabled: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_callback_whitelist_empty_whitelist_allows_all() {
+		// Test: Empty whitelist should allow all callbacks (when simulation enabled)
+		let config = create_test_config_with_callbacks(true, vec![]);
+		let request = create_request_with_callback(Some(
+			"0x000000000000000000000000d890aa4d1b1517a16f9c3d938d06721356e48b7d",
+		));
+
+		let result = QuoteValidator::validate_callback_whitelist(&request, &config);
+		assert!(
+			result.is_ok(),
+			"Should allow any callback when whitelist is empty: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_callback_whitelist_recipient_whitelisted_succeeds() {
+		// Test: Callback recipient in whitelist should succeed
+		// Receiver is 0xf2a313a3Dc028295e1dFa3BEE34EaFD2f801C994 on chain 84532 (0x014a34)
+		// EIP-7930 format: 0x0001 | 0x0000 | 0x03 | 0x014a34 | 0x14 | <address>
+		let whitelist_entry =
+			"0x0001000003014a3414f2a313a3dc028295e1dfa3bee34eafd2f801c994".to_string();
+		let config = create_test_config_with_callbacks(true, vec![whitelist_entry]);
+		let request = create_request_with_callback(Some(
+			"0x000000000000000000000000d890aa4d1b1517a16f9c3d938d06721356e48b7d",
+		));
+
+		let result = QuoteValidator::validate_callback_whitelist(&request, &config);
+		assert!(
+			result.is_ok(),
+			"Should succeed when callback recipient is whitelisted: {:?}",
+			result
+		);
+	}
+
+	#[test]
+	fn test_validate_callback_whitelist_recipient_not_whitelisted_fails() {
+		// Test: Callback recipient NOT in whitelist should fail
+		// Whitelist has a different address
+		let whitelist_entry =
+			"0x0001000003014a34140000000000000000000000000000000000000000".to_string();
+		let config = create_test_config_with_callbacks(true, vec![whitelist_entry]);
+		let request = create_request_with_callback(Some(
+			"0x000000000000000000000000d890aa4d1b1517a16f9c3d938d06721356e48b7d",
+		));
+
+		let result = QuoteValidator::validate_callback_whitelist(&request, &config);
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("not in the solver's whitelist")),
+			"Should reject callback when recipient not whitelisted: {:?}",
+			result
+		);
 	}
 }
