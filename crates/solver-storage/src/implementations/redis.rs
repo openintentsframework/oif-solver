@@ -1735,7 +1735,9 @@ mod tests {
 		});
 
 		let storage = create_storage(&config).unwrap();
-		let result = storage.set_bytes("test:key", b"value".to_vec(), None, None).await;
+		let result = storage
+			.set_bytes("test:key", b"value".to_vec(), None, None)
+			.await;
 
 		assert!(result.is_err());
 		assert!(matches!(result, Err(StorageError::Backend(_))));
@@ -1767,7 +1769,12 @@ mod tests {
 
 		let storage = create_storage(&config).unwrap();
 		let result = storage
-			.set_bytes("test:key", b"value".to_vec(), None, Some(Duration::from_secs(60)))
+			.set_bytes(
+				"test:key",
+				b"value".to_vec(),
+				None,
+				Some(Duration::from_secs(60)),
+			)
 			.await;
 
 		assert!(result.is_err());
@@ -2027,7 +2034,12 @@ mod tests {
 
 		let indexes = StorageIndexes::new().with_field("status", "pending");
 		let result = storage
-			.update_indexes("orders:key1", "orders", &indexes, Some(Duration::from_secs(60)))
+			.update_indexes(
+				"orders:key1",
+				"orders",
+				&indexes,
+				Some(Duration::from_secs(60)),
+			)
 			.await;
 
 		assert!(result.is_err());
