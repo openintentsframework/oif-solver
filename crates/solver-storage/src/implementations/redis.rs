@@ -559,12 +559,20 @@ impl StorageInterface for RedisStorage {
 		};
 
 		// Validate that keys still exist (handles TTL expiration edge cases)
-		let mut valid_keys = Vec::new();
-		for key in keys {
-			if self.exists(&key).await.unwrap_or(false) {
-				valid_keys.push(key);
-			}
-		}
+		// Use MGET for bulk validation instead of N individual EXISTS calls
+		let valid_keys = if keys.is_empty() {
+			Vec::new()
+		} else {
+			let redis_keys: Vec<String> = keys.iter().map(|k| self.data_key(k)).collect();
+			let results: Vec<Option<Vec<u8>>> = conn
+				.mget(&redis_keys)
+				.await
+				.map_err(|e| self.map_redis_error(e, "query_validate"))?;
+			keys.into_iter()
+				.zip(results)
+				.filter_map(|(k, v)| v.map(|_| k))
+				.collect()
+		};
 
 		debug!(namespace = %namespace, count = valid_keys.len(), "query returned keys");
 		Ok(valid_keys)
@@ -627,8 +635,8 @@ impl RedisStorageSchema {
 impl ConfigSchema for RedisStorageSchema {
 	fn validate(&self, config: &toml::Value) -> Result<(), ValidationError> {
 		// Build TTL fields dynamically based on StorageKey variants
+		// Note: redis_url is required, so it's not in optional_fields
 		let mut optional_fields = vec![
-			Field::new("redis_url", FieldType::String),
 			Field::new("key_prefix", FieldType::String),
 			Field::new(
 				"connection_timeout_ms",
@@ -713,6 +721,23 @@ pub async fn initialize_redis_connection(
 	Ok(Arc::new(connection_manager))
 }
 
+/// Builds full Redis URL with database number appended if not already present.
+fn build_redis_url(redis_url: &str, db: u8) -> String {
+	if redis_url.contains('/')
+		&& redis_url
+			.split('/')
+			.next_back()
+			.map(|s| s.parse::<u8>().is_ok())
+			.unwrap_or(false)
+	{
+		// URL already contains database number
+		redis_url.to_string()
+	} else {
+		// Append database number
+		format!("{}/{}", redis_url.trim_end_matches('/'), db)
+	}
+}
+
 /// Factory function to create a Redis storage backend from configuration.
 ///
 /// Configuration parameters:
@@ -753,21 +778,7 @@ pub fn create_storage(config: &toml::Value) -> Result<Box<dyn StorageInterface>,
 		.map(|v| v as u8)
 		.unwrap_or(0);
 
-	// Build full Redis URL with database
-	let full_redis_url = if redis_url.contains('/')
-		&& redis_url
-			.split('/')
-			.next_back()
-			.map(|s| s.parse::<u8>().is_ok())
-			.unwrap_or(false)
-	{
-		// URL already contains database number
-		redis_url.to_string()
-	} else {
-		// Append database number
-		format!("{}/{}", redis_url.trim_end_matches('/'), db)
-	};
-
+	let full_redis_url = build_redis_url(redis_url, db);
 	let ttl_config = TtlConfig::from_config(config);
 
 	// Create storage with lazy connection initialization
@@ -814,19 +825,7 @@ pub async fn create_storage_async(
 		.map(|v| v as u8)
 		.unwrap_or(0);
 
-	// Build full Redis URL with database
-	let full_redis_url = if redis_url.contains('/')
-		&& redis_url
-			.split('/')
-			.next_back()
-			.map(|s| s.parse::<u8>().is_ok())
-			.unwrap_or(false)
-	{
-		redis_url.to_string()
-	} else {
-		format!("{}/{}", redis_url.trim_end_matches('/'), db)
-	};
-
+	let full_redis_url = build_redis_url(redis_url, db);
 	let ttl_config = TtlConfig::from_config(config);
 
 	let storage = RedisStorage::new(full_redis_url, timeout_ms, key_prefix, ttl_config)?;
@@ -1709,6 +1708,39 @@ mod tests {
 		// 256 is out of u8 range, so should append db
 		let result = create_storage(&config);
 		assert!(result.is_ok());
+	}
+
+	// ==================== build_redis_url() Tests ====================
+
+	#[test]
+	fn test_build_redis_url_appends_db() {
+		let result = build_redis_url("redis://localhost:6379", 5);
+		assert_eq!(result, "redis://localhost:6379/5");
+	}
+
+	#[test]
+	fn test_build_redis_url_with_trailing_slash() {
+		let result = build_redis_url("redis://localhost:6379/", 3);
+		assert_eq!(result, "redis://localhost:6379/3");
+	}
+
+	#[test]
+	fn test_build_redis_url_already_has_db() {
+		let result = build_redis_url("redis://localhost:6379/2", 5);
+		assert_eq!(result, "redis://localhost:6379/2");
+	}
+
+	#[test]
+	fn test_build_redis_url_with_invalid_db_segment() {
+		// "notadb" is not a valid u8, so db should be appended
+		let result = build_redis_url("redis://localhost:6379/notadb", 5);
+		assert_eq!(result, "redis://localhost:6379/notadb/5");
+	}
+
+	#[test]
+	fn test_build_redis_url_db_zero() {
+		let result = build_redis_url("redis://localhost:6379", 0);
+		assert_eq!(result, "redis://localhost:6379/0");
 	}
 
 	// ==================== Async Method Tests (connection failure scenarios) ====================
