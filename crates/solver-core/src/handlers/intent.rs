@@ -14,8 +14,8 @@ use solver_delivery::DeliveryService;
 use solver_order::OrderService;
 use solver_storage::StorageService;
 use solver_types::{
-	truncate_id, with_0x_prefix, Address, DiscoveryEvent, ExecutionDecision, Intent, OrderEvent,
-	SolverEvent, StorageKey,
+	truncate_id, with_0x_prefix, Address, DiscoveryEvent, Eip7683OrderData, ExecutionDecision,
+	ExecutionParams, Intent, OrderEvent, SolverEvent, StorageKey,
 };
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -174,10 +174,70 @@ impl IntentHandler {
 			.await
 		{
 			Ok(order) => {
-				// Calculate cost estimation and validate profitability
+				// Step 1: Generate fill transaction and simulate to get accurate gas estimate
+				// This also validates callbacks won't revert
+				let default_params = ExecutionParams {
+					gas_price: alloy_primitives::U256::ZERO,
+					priority_fee: None,
+				};
+
+				let simulated_fill_gas = match self
+					.order_service
+					.generate_fill_transaction(&order, &default_params)
+					.await
+				{
+					Ok(fill_tx) => {
+						// Simulate the fill transaction to validate callbacks and get gas estimate
+						match self
+							.cost_profit_service
+							.simulate_callback_and_estimate_gas(&order, &fill_tx, &self.config)
+							.await
+						{
+							Ok(simulation_result) => {
+								if simulation_result.has_callback {
+									tracing::info!(
+										"✅ Callback simulation passed for order {} - estimated gas: {} units on chain {}",
+										order.id,
+										simulation_result.estimated_gas_units,
+										simulation_result.chain_id
+									);
+								}
+								// Use simulated gas if available, otherwise None (will use config default)
+								if simulation_result.estimated_gas_units > 0 {
+									Some(simulation_result.estimated_gas_units)
+								} else {
+									None
+								}
+							},
+							Err(e) => {
+								tracing::warn!("Order failed callback simulation: {}", e);
+								self.event_bus
+									.publish(SolverEvent::Order(OrderEvent::Skipped {
+										order_id: order.id.clone(),
+										reason: format!("Callback simulation failed: {}", e),
+									}))
+									.ok();
+								return Ok(());
+							},
+						}
+					},
+					Err(e) => {
+						// If fill transaction generation fails, skip the order
+						tracing::warn!("Failed to generate fill transaction for simulation: {}", e);
+						self.event_bus
+							.publish(SolverEvent::Order(OrderEvent::Skipped {
+								order_id: order.id.clone(),
+								reason: format!("Fill transaction generation failed: {}", e),
+							}))
+							.ok();
+						return Ok(());
+					},
+				};
+
+				// Step 2: Calculate cost estimation using simulated gas
 				let cost_estimate = match self
 					.cost_profit_service
-					.estimate_cost_for_order(&order, &self.config)
+					.estimate_cost_for_order_with_gas(&order, &self.config, simulated_fill_gas)
 					.await
 				{
 					Ok(estimate) => estimate,
@@ -190,7 +250,7 @@ impl IntentHandler {
 					},
 				};
 
-				// Validate profitability
+				// Step 3: Validate profitability with accurate gas costs
 				match self
 					.cost_profit_service
 					.validate_profitability(
@@ -215,6 +275,24 @@ impl IntentHandler {
 							.ok();
 						return Ok(());
 					},
+				}
+
+				// Update order's gas_limit_overrides with simulated gas before storing
+				// This ensures the actual fill transaction uses the simulated gas limit
+				let mut order = order;
+				if let Some(simulated_gas) = simulated_fill_gas {
+					if let Ok(mut order_data) =
+						serde_json::from_value::<Eip7683OrderData>(order.data.clone())
+					{
+						order_data.gas_limit_overrides.fill_gas_limit = Some(simulated_gas);
+						if let Ok(updated_data) = serde_json::to_value(&order_data) {
+							order.data = updated_data;
+							tracing::debug!(
+								"Updated order gas_limit_overrides.fill_gas_limit to {} units",
+								simulated_gas
+							);
+						}
+					}
 				}
 
 				self.event_bus
@@ -382,6 +460,9 @@ mod tests {
 		mock_delivery_1
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async move { Ok(1000000u64) }));
+		mock_delivery_1
+			.expect_estimate_gas()
+			.returning(|_| Box::pin(async move { Ok(200000u64) }));
 
 		let mut mock_delivery_137 = solver_delivery::MockDeliveryInterface::new();
 		mock_delivery_137
@@ -390,6 +471,9 @@ mod tests {
 		mock_delivery_137
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async move { Ok(1000000u64) }));
+		mock_delivery_137
+			.expect_estimate_gas()
+			.returning(|_| Box::pin(async move { Ok(200000u64) }));
 
 		delivery_impls.insert(
 			1u64,
@@ -478,6 +562,26 @@ mod tests {
 			.expect_validate_and_create_order()
 			.times(1)
 			.returning(move |_, _, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
+
+		// Add expectation for generate_fill_transaction (used for callback simulation)
+		mock_order_interface
+			.expect_generate_fill_transaction()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					Ok(solver_types::Transaction {
+						to: Some(solver_types::Address(vec![0u8; 20])),
+						data: vec![],
+						value: U256::ZERO,
+						chain_id: 137,
+						nonce: None,
+						gas_limit: Some(200000),
+						gas_price: None,
+						max_fee_per_gas: None,
+						max_priority_fee_per_gas: None,
+					})
+				})
+			});
 
 		mock_strategy
 			.expect_should_execute()
@@ -679,6 +783,26 @@ mod tests {
 			.times(1)
 			.returning(move |_, _, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
 
+		// Add expectation for generate_fill_transaction (used for callback simulation)
+		mock_order_interface
+			.expect_generate_fill_transaction()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					Ok(solver_types::Transaction {
+						to: Some(solver_types::Address(vec![0u8; 20])),
+						data: vec![],
+						value: U256::ZERO,
+						chain_id: 137,
+						nonce: None,
+						gas_limit: Some(200000),
+						gas_price: None,
+						max_fee_per_gas: None,
+						max_priority_fee_per_gas: None,
+					})
+				})
+			});
+
 		mock_strategy
 			.expect_should_execute()
 			.times(1)
@@ -749,6 +873,26 @@ mod tests {
 			.expect_validate_and_create_order()
 			.times(1)
 			.returning(move |_, _, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
+
+		// Add expectation for generate_fill_transaction (used for callback simulation)
+		mock_order_interface
+			.expect_generate_fill_transaction()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					Ok(solver_types::Transaction {
+						to: Some(solver_types::Address(vec![0u8; 20])),
+						data: vec![],
+						value: U256::ZERO,
+						chain_id: 137,
+						nonce: None,
+						gas_limit: Some(200000),
+						gas_price: None,
+						max_fee_per_gas: None,
+						max_priority_fee_per_gas: None,
+					})
+				})
+			});
 
 		mock_strategy
 			.expect_should_execute()
@@ -867,6 +1011,27 @@ mod tests {
 			.expect_validate_and_create_order()
 			.times(1)
 			.returning(move |_, _, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
+
+		// Add expectation for generate_fill_transaction (used for callback simulation)
+		mock_order_interface
+			.expect_generate_fill_transaction()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					Ok(solver_types::Transaction {
+						to: Some(solver_types::Address(vec![0u8; 20])),
+						data: vec![],
+						value: U256::ZERO,
+						chain_id: 137,
+						nonce: None,
+						gas_limit: Some(200000),
+						gas_price: None,
+						max_fee_per_gas: None,
+						max_priority_fee_per_gas: None,
+					})
+				})
+			});
+
 		mock_strategy.expect_should_execute().returning(|_, _| {
 			Box::pin(async move {
 				ExecutionDecision::Execute(ExecutionParams {
