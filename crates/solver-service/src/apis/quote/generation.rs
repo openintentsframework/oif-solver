@@ -825,6 +825,21 @@ impl QuoteGenerator {
 		input_token_bytes[12..].copy_from_slice(&input_token.0[..]);
 		let input_token_u256 = U256::from_be_bytes(input_token_bytes);
 
+		// Parse callbackData from request if present
+		let callback_data_bytes = if let Some(ref calldata_hex) = output_info.calldata {
+			if calldata_hex.is_empty() || calldata_hex == "0x" {
+				vec![]
+			} else {
+				let hex_str = calldata_hex.trim_start_matches("0x");
+				hex::decode(hex_str).unwrap_or_else(|e| {
+					tracing::warn!("Failed to decode callbackData '{}': {}", calldata_hex, e);
+					vec![]
+				})
+			}
+		} else {
+			vec![]
+		};
+
 		// Build the StandardOrder
 		let order = StandardOrder {
 			user: user_addr,
@@ -841,7 +856,7 @@ impl QuoteGenerator {
 				token: output_token_bytes32,
 				amount: output_amount_u256,
 				recipient: recipient_bytes32,
-				callbackData: vec![].into(),
+				callbackData: callback_data_bytes.into(),
 				context: vec![].into(),
 			}],
 		};

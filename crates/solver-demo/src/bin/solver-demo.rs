@@ -644,6 +644,8 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 			swap_type,
 			settlement,
 			auth,
+			callback_data,
+			callback_recipient,
 			output,
 		} => {
 			// Parse swap type first
@@ -703,12 +705,22 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 			logging::verbose_tech("Swap Type", &swap_type);
 			logging::verbose_tech("Settlement", &settlement);
 			logging::verbose_tech("Auth", auth.as_deref().unwrap_or("N/A"));
+			if let Some(ref cb_data) = callback_data {
+				logging::verbose_tech("Callback Data", cb_data);
+			}
+			if let Some(ref cb_recipient) = callback_recipient {
+				logging::verbose_tech("Callback Recipient", cb_recipient);
+			}
 
 			// Build intent parameters
 			use solver_demo::operations::intent::{AuthType, IntentParams, SettlementType};
+			use solver_demo::types::hex::Hex;
 
 			let settlement_type = settlement.parse::<SettlementType>()?;
 			let auth_type = auth.map(|a| a.parse::<AuthType>()).transpose()?;
+			let callback_recipient_addr = callback_recipient
+				.map(|addr| Hex::to_address(&addr))
+				.transpose()?;
 
 			let intent_params = IntentParams {
 				from_chain: from_chain_id,
@@ -722,6 +734,8 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 				exact_output,
 				settlement: settlement_type,
 				auth: auth_type,
+				callback_data,
+				callback_recipient: callback_recipient_addr,
 			};
 
 			// Actually build the intent

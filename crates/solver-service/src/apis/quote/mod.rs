@@ -100,6 +100,10 @@ pub async fn process_quote_request(
 	// Use the new validation architecture to get ValidatedQuoteContext
 	let validated_context = QuoteValidator::validate_quote_request(&request, solver)?;
 
+	// Validate callback whitelist early for fail-fast behavior
+	// This prevents users from getting quotes they can't execute due to callback restrictions
+	QuoteValidator::validate_callback_whitelist(&request, config)?;
+
 	let cost_profit_service = solver_core::engine::cost_profit::CostProfitService::new(
 		solver.pricing().clone(),
 		solver.delivery().clone(),

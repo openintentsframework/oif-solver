@@ -129,6 +129,11 @@ fn default_monitoring_timeout_seconds() -> u64 {
 	28800 // Default to 8 hours (480 minutes * 60 seconds)
 }
 
+/// Returns the default value for boolean flags (true).
+fn default_true() -> bool {
+	true
+}
+
 /// Configuration for account management.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AccountConfig {
@@ -154,6 +159,14 @@ pub struct OrderConfig {
 	pub implementations: HashMap<String, toml::Value>,
 	/// Strategy configuration for order execution.
 	pub strategy: StrategyConfig,
+	/// Whitelisted callback contract addresses in EIP-7930 InteropAddress format.
+	/// Format: EIP-7930 hex string e.g. "0x0001000002210514154c8bb598df835e9617c2cdcb8c84838bd329c6"
+	/// The format encodes: Version (2 bytes) | ChainType (2 bytes) | ChainRefLen (1 byte) | ChainRef | AddrLen (1 byte) | Address
+	#[serde(default)]
+	pub callback_whitelist: Vec<String>,
+	/// Enable gas simulation for callbacks before filling.
+	#[serde(default = "default_true")]
+	pub simulate_callbacks: bool,
 }
 
 /// Configuration for execution strategies.
