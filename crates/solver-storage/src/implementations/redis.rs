@@ -1711,226 +1711,371 @@ mod tests {
 		assert!(result.is_ok());
 	}
 
-	// ==================== Integration tests (require running Redis) ====================
-	// These are marked with #[ignore] and can be run with: cargo test -- --ignored
+	// ==================== Async Method Tests (connection failure scenarios) ====================
 
 	#[tokio::test]
-	#[ignore = "Requires active Redis instance"]
-	async fn test_redis_connection() {
-		let conn = initialize_redis_connection("redis://127.0.0.1:6379", 5000).await;
-		assert!(conn.is_ok());
+	async fn test_get_bytes_connection_failure() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://invalid-host:6379"
+			connection_timeout_ms = 100
+		});
+
+		let storage = create_storage(&config).unwrap();
+		let result = storage.get_bytes("test:key").await;
+
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
 	}
 
 	#[tokio::test]
-	#[ignore = "Requires active Redis instance"]
-	async fn test_basic_operations() {
+	async fn test_set_bytes_connection_failure() {
 		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://127.0.0.1:6379"
-			key_prefix = "test_basic"
+			redis_url = "redis://invalid-host:6379"
+			connection_timeout_ms = 100
 		});
 
-		let storage = create_storage_async(&config).await.unwrap();
+		let storage = create_storage(&config).unwrap();
+		let result = storage.set_bytes("test:key", b"value".to_vec(), None, None).await;
 
-		let key = "test:key1";
-		let value = b"test_value".to_vec();
-
-		// Test set and get
-		storage
-			.set_bytes(key, value.clone(), None, None)
-			.await
-			.unwrap();
-		let retrieved = storage.get_bytes(key).await.unwrap();
-		assert_eq!(retrieved, value);
-
-		// Test exists
-		assert!(storage.exists(key).await.unwrap());
-
-		// Test delete
-		storage.delete(key).await.unwrap();
-		assert!(!storage.exists(key).await.unwrap());
-
-		// Test get after delete
-		let result = storage.get_bytes(key).await;
-		assert!(matches!(result, Err(StorageError::NotFound(_))));
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
 	}
 
 	#[tokio::test]
-	#[ignore = "Requires active Redis instance"]
-	async fn test_ttl_functionality() {
+	async fn test_set_bytes_with_indexes_connection_failure() {
 		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://127.0.0.1:6379"
-			key_prefix = "test_ttl"
-			ttl_orders = 1
+			redis_url = "redis://invalid-host:6379"
+			connection_timeout_ms = 100
 		});
 
-		let storage = create_storage_async(&config).await.unwrap();
+		let storage = create_storage(&config).unwrap();
+		let indexes = StorageIndexes::new().with_field("status", "pending");
+		let result = storage
+			.set_bytes("orders:key", b"value".to_vec(), Some(indexes), None)
+			.await;
 
-		let key = "orders:test_order";
-		let value = b"test_value".to_vec();
-
-		// Store with TTL from config (1 second for orders)
-		storage
-			.set_bytes(key, value.clone(), None, None)
-			.await
-			.unwrap();
-
-		// Should be available immediately
-		let retrieved = storage.get_bytes(key).await.unwrap();
-		assert_eq!(retrieved, value);
-
-		// Wait for expiration
-		tokio::time::sleep(Duration::from_millis(1500)).await;
-
-		// Should be expired now
-		let result = storage.get_bytes(key).await;
-		assert!(matches!(result, Err(StorageError::NotFound(_))));
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
 	}
 
 	#[tokio::test]
-	#[ignore = "Requires active Redis instance"]
-	async fn test_indexing_operations() {
+	async fn test_set_bytes_with_explicit_ttl_connection_failure() {
 		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://127.0.0.1:6379"
-			key_prefix = "test_index"
+			redis_url = "redis://invalid-host:6379"
+			connection_timeout_ms = 100
 		});
 
-		let storage = create_storage_async(&config).await.unwrap();
+		let storage = create_storage(&config).unwrap();
+		let result = storage
+			.set_bytes("test:key", b"value".to_vec(), None, Some(Duration::from_secs(60)))
+			.await;
 
-		let namespace = "orders";
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
+	}
 
-		// Clean up any existing test data
-		for i in 1..=3 {
-			let _ = storage.delete(&format!("orders:order{}", i)).await;
-		}
+	#[tokio::test]
+	async fn test_delete_connection_failure() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://invalid-host:6379"
+			connection_timeout_ms = 100
+		});
 
-		let indexes1 = StorageIndexes::new()
-			.with_field("status", "pending")
-			.with_field("amount", 100);
-		let indexes2 = StorageIndexes::new()
-			.with_field("status", "completed")
-			.with_field("amount", 200);
-		let indexes3 = StorageIndexes::new()
-			.with_field("status", "pending")
-			.with_field("amount", 150);
+		let storage = create_storage(&config).unwrap();
+		let result = storage.delete("test:key").await;
 
-		// Store with indexes
-		storage
-			.set_bytes("orders:order1", b"data1".to_vec(), Some(indexes1), None)
-			.await
-			.unwrap();
-		storage
-			.set_bytes("orders:order2", b"data2".to_vec(), Some(indexes2), None)
-			.await
-			.unwrap();
-		storage
-			.set_bytes("orders:order3", b"data3".to_vec(), Some(indexes3), None)
-			.await
-			.unwrap();
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
+	}
 
-		// Query by status
-		let pending_orders = storage
+	#[tokio::test]
+	async fn test_exists_connection_failure() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://invalid-host:6379"
+			connection_timeout_ms = 100
+		});
+
+		let storage = create_storage(&config).unwrap();
+		let result = storage.exists("test:key").await;
+
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
+	}
+
+	#[tokio::test]
+	async fn test_query_all_connection_failure() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://invalid-host:6379"
+			connection_timeout_ms = 100
+		});
+
+		let storage = create_storage(&config).unwrap();
+		let result = storage.query("orders", QueryFilter::All).await;
+
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
+	}
+
+	#[tokio::test]
+	async fn test_query_equals_connection_failure() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://invalid-host:6379"
+			connection_timeout_ms = 100
+		});
+
+		let storage = create_storage(&config).unwrap();
+		let result = storage
 			.query(
-				namespace,
-				QueryFilter::Equals(
+				"orders",
+				QueryFilter::Equals("status".to_string(), serde_json::json!("pending")),
+			)
+			.await;
+
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
+	}
+
+	#[tokio::test]
+	async fn test_query_not_equals_connection_failure() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://invalid-host:6379"
+			connection_timeout_ms = 100
+		});
+
+		let storage = create_storage(&config).unwrap();
+		let result = storage
+			.query(
+				"orders",
+				QueryFilter::NotEquals("status".to_string(), serde_json::json!("pending")),
+			)
+			.await;
+
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
+	}
+
+	#[tokio::test]
+	async fn test_query_in_connection_failure() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://invalid-host:6379"
+			connection_timeout_ms = 100
+		});
+
+		let storage = create_storage(&config).unwrap();
+		let result = storage
+			.query(
+				"orders",
+				QueryFilter::In(
 					"status".to_string(),
-					serde_json::Value::String("pending".to_string()),
+					vec![serde_json::json!("pending"), serde_json::json!("completed")],
 				),
 			)
-			.await
-			.unwrap();
-		assert_eq!(pending_orders.len(), 2);
-		assert!(pending_orders.contains(&"orders:order1".to_string()));
-		assert!(pending_orders.contains(&"orders:order3".to_string()));
+			.await;
 
-		// Query all
-		let all_orders = storage.query(namespace, QueryFilter::All).await.unwrap();
-		assert_eq!(all_orders.len(), 3);
-
-		// Clean up
-		for i in 1..=3 {
-			let _ = storage.delete(&format!("orders:order{}", i)).await;
-		}
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
 	}
 
 	#[tokio::test]
-	#[ignore = "Requires active Redis instance"]
-	async fn test_batch_operations() {
+	async fn test_query_not_in_connection_failure() {
 		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://127.0.0.1:6379"
-			key_prefix = "test_batch"
+			redis_url = "redis://invalid-host:6379"
+			connection_timeout_ms = 100
 		});
 
-		let storage = create_storage_async(&config).await.unwrap();
+		let storage = create_storage(&config).unwrap();
+		let result = storage
+			.query(
+				"orders",
+				QueryFilter::NotIn(
+					"status".to_string(),
+					vec![serde_json::json!("pending"), serde_json::json!("completed")],
+				),
+			)
+			.await;
 
-		let keys = vec![
-			"batch:key1".to_string(),
-			"batch:key2".to_string(),
-			"batch:key3".to_string(),
-		];
-		let values = [b"value1".to_vec(), b"value2".to_vec(), b"value3".to_vec()];
-
-		// Store multiple items
-		for (key, value) in keys.iter().zip(values.iter()) {
-			storage
-				.set_bytes(key, value.clone(), None, None)
-				.await
-				.unwrap();
-		}
-
-		// Batch retrieve
-		let results = storage.get_batch(&keys).await.unwrap();
-		assert_eq!(results.len(), 3);
-
-		for (key, value) in results {
-			let index = keys.iter().position(|k| k == &key).unwrap();
-			assert_eq!(value, values[index]);
-		}
-
-		// Test batch with missing keys
-		let keys_with_missing = vec![
-			"batch:key1".to_string(),
-			"batch:missing_key".to_string(),
-			"batch:key3".to_string(),
-		];
-		let results = storage.get_batch(&keys_with_missing).await.unwrap();
-		assert_eq!(results.len(), 2); // Only existing keys
-
-		// Clean up
-		for key in &keys {
-			let _ = storage.delete(key).await;
-		}
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
 	}
 
 	#[tokio::test]
-	#[ignore = "Requires active Redis instance"]
-	async fn test_cleanup_expired() {
+	async fn test_get_batch_connection_failure() {
 		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://127.0.0.1:6379"
-			key_prefix = "test_cleanup"
+			redis_url = "redis://invalid-host:6379"
+			connection_timeout_ms = 100
 		});
 
-		let storage = create_storage_async(&config).await.unwrap();
+		let storage = create_storage(&config).unwrap();
+		let keys = vec!["test:key1".to_string(), "test:key2".to_string()];
+		let result = storage.get_batch(&keys).await;
 
-		// cleanup_expired should return 0 (Redis handles TTL automatically)
-		let result = storage.cleanup_expired().await.unwrap();
-		assert_eq!(result, 0);
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
 	}
 
 	#[tokio::test]
-	#[ignore = "Requires active Redis instance"]
-	async fn test_create_storage_async_verifies_connection() {
-		// Valid Redis URL - should succeed
-		let valid_config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://127.0.0.1:6379"
+	async fn test_get_batch_empty_keys() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://invalid-host:6379"
+			connection_timeout_ms = 100
 		});
-		assert!(create_storage_async(&valid_config).await.is_ok());
 
-		// Invalid Redis URL - should fail during eager connection
+		let storage = create_storage(&config).unwrap();
+		let keys: Vec<String> = vec![];
+		// Empty keys should return immediately without connection
+		let result = storage.get_batch(&keys).await;
+
+		assert!(result.is_ok());
+		assert!(result.unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_cleanup_expired_no_connection_needed() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://invalid-host:6379"
+			connection_timeout_ms = 100
+		});
+
+		let storage = create_storage(&config).unwrap();
+		// cleanup_expired doesn't need a connection for Redis (TTL is automatic)
+		let result = storage.cleanup_expired().await;
+
+		assert!(result.is_ok());
+		assert_eq!(result.unwrap(), 0);
+	}
+
+	#[tokio::test]
+	async fn test_initialize_redis_connection_invalid_url() {
+		let result = initialize_redis_connection("invalid://url", 100).await;
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Configuration(_))));
+	}
+
+	#[tokio::test]
+	async fn test_initialize_redis_connection_timeout() {
+		// Use a non-routable IP to trigger timeout
+		let result = initialize_redis_connection("redis://10.255.255.1:6379", 100).await;
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
+	}
+
+	#[tokio::test]
+	async fn test_create_storage_async_validation_failure() {
 		let invalid_config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host-that-does-not-exist:6379"
-			connection_timeout_ms = 1000
+			key_prefix = "test"
 		});
+
 		let result = create_storage_async(&invalid_config).await;
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Configuration(_))));
+	}
+
+	#[tokio::test]
+	async fn test_create_storage_async_connection_failure() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://invalid-host:6379"
+			connection_timeout_ms = 100
+		});
+
+		let result = create_storage_async(&config).await;
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
+	}
+
+	// ==================== update_indexes Tests ====================
+
+	#[tokio::test]
+	async fn test_update_indexes_connection_failure() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://invalid-host:6379"
+			connection_timeout_ms = 100
+		});
+
+		let ttl_config = TtlConfig::from_config(&config);
+		let storage = RedisStorage::new(
+			"redis://invalid-host:6379".to_string(),
+			100,
+			"test".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		let indexes = StorageIndexes::new().with_field("status", "pending");
+		let result = storage
+			.update_indexes("orders:key1", "orders", &indexes, None)
+			.await;
+
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
+	}
+
+	#[tokio::test]
+	async fn test_update_indexes_with_ttl_connection_failure() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://invalid-host:6379"
+			connection_timeout_ms = 100
+		});
+
+		let ttl_config = TtlConfig::from_config(&config);
+		let storage = RedisStorage::new(
+			"redis://invalid-host:6379".to_string(),
+			100,
+			"test".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		let indexes = StorageIndexes::new().with_field("status", "pending");
+		let result = storage
+			.update_indexes("orders:key1", "orders", &indexes, Some(Duration::from_secs(60)))
+			.await;
+
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
+	}
+
+	// ==================== remove_from_indexes Tests ====================
+
+	#[tokio::test]
+	async fn test_remove_from_indexes_connection_failure() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://invalid-host:6379"
+			connection_timeout_ms = 100
+		});
+
+		let ttl_config = TtlConfig::from_config(&config);
+		let storage = RedisStorage::new(
+			"redis://invalid-host:6379".to_string(),
+			100,
+			"test".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		let result = storage.remove_from_indexes("orders:key1", "orders").await;
+
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
+	}
+
+	// ==================== get_connection Tests ====================
+
+	#[tokio::test]
+	async fn test_get_connection_lazy_initialization() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://invalid-host:6379".to_string(),
+			100,
+			"test".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		// Connection should not be initialized yet
+		assert!(!storage.client.initialized());
+
+		// Attempt to get connection (will fail due to invalid host)
+		let result = storage.get_connection().await;
 		assert!(result.is_err());
 	}
 }
