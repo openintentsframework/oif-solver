@@ -180,8 +180,12 @@ oif-solver/
 ### solver-storage
 
 - Provides persistent storage for orders and state
-- Implements TTL (time-to-live) for temporary data
-- Supports different storage backends
+- Implements TTL (time-to-live) for automatic data expiration
+- Supports multiple storage backends:
+  - **Memory**: Fast, non-persistent (for testing)
+  - **File**: File-based persistence with custom binary format
+  - **Redis**: Production-ready with native TTL and connection pooling
+- Index-based querying for efficient lookups
 - Ensures data consistency across services
 
 ### solver-account
@@ -257,7 +261,7 @@ You can also use a single configuration file. See [`config/demo.toml`](config/de
 ### Key Configuration Sections
 
 - **networks**: Defines supported chains with their settler contracts and available tokens
-- **storage**: Configures persistence backend with TTL for different data types
+- **storage**: Configures persistence backend (memory, file, or redis) with TTL for different data types
 - **account**: Manages signing keys for the solver (supports multiple accounts)
 - **delivery**: Handles transaction submission to multiple chains (supports per-network account mapping)
 - **discovery**: Sources for discovering new intents (on-chain events, off-chain APIs)
@@ -274,6 +278,61 @@ cargo run -- --config path/to/your/config.toml
 
 # Using environment variable
 CONFIG_FILE=path/to/your/config.toml cargo run
+```
+
+### Storage Backend Configuration
+
+The solver supports three storage backends. Choose based on your deployment needs:
+
+#### Memory Storage (Testing Only)
+
+```toml
+[storage]
+primary = "memory"
+
+[storage.implementations.memory]
+# No configuration required
+```
+
+#### File Storage (Development/Simple Deployments)
+
+```toml
+[storage]
+primary = "file"
+cleanup_interval_seconds = 60
+
+[storage.implementations.file]
+storage_path = "./data/storage"
+ttl_orders = 300                # 5 minutes
+ttl_intents = 120               # 2 minutes
+ttl_order_by_tx_hash = 300      # 5 minutes
+```
+
+#### Redis Storage (Production Recommended)
+
+Redis provides the best performance and reliability for production deployments with native TTL support and connection pooling.
+
+```toml
+[storage]
+primary = "redis"
+cleanup_interval_seconds = 60
+
+[storage.implementations.redis]
+redis_url = "redis://localhost:6379"
+key_prefix = "oif-solver"
+connection_timeout_ms = 5000
+db = 0
+ttl_orders = 300                # 5 minutes
+ttl_intents = 120               # 2 minutes
+ttl_order_by_tx_hash = 300      # 5 minutes
+ttl_quotes = 60                 # 1 minute
+ttl_settlement_messages = 600   # 10 minutes
+```
+
+**Running Redis with Docker:**
+
+```bash
+docker run -d --name redis -p 6379:6379 redis:latest
 ```
 
 ## API Reference
