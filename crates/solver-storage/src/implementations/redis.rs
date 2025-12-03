@@ -854,6 +854,9 @@ impl crate::StorageRegistry for Registry {}
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use solver_types::ImplementationRegistry;
+
+	// ==================== TtlConfig Tests ====================
 
 	#[test]
 	fn test_ttl_config_from_toml() {
@@ -878,7 +881,7 @@ mod tests {
 			ttl_config.get_ttl(StorageKey::Quotes),
 			Some(Duration::from_secs(1800))
 		);
-		assert_eq!(ttl_config.get_ttl(StorageKey::OrderByTxHash), None); // Not configured
+		assert_eq!(ttl_config.get_ttl(StorageKey::OrderByTxHash), None);
 	}
 
 	#[test]
@@ -898,6 +901,478 @@ mod tests {
 			Some(Duration::from_secs(100))
 		);
 	}
+
+	#[test]
+	fn test_ttl_config_empty_config() {
+		let config = toml::Value::Table(toml::map::Map::new());
+		let ttl_config = TtlConfig::from_config(&config);
+
+		// No TTLs should be configured
+		assert_eq!(ttl_config.get_ttl(StorageKey::Orders), None);
+		assert_eq!(ttl_config.get_ttl(StorageKey::Intents), None);
+		assert_eq!(ttl_config.get_ttl(StorageKey::Quotes), None);
+		assert_eq!(ttl_config.get_ttl(StorageKey::OrderByTxHash), None);
+		assert_eq!(ttl_config.get_ttl(StorageKey::SettlementMessages), None);
+	}
+
+	#[test]
+	fn test_ttl_config_non_table_value() {
+		// When config is not a table, should return empty TtlConfig
+		let config = toml::Value::String("not a table".to_string());
+		let ttl_config = TtlConfig::from_config(&config);
+
+		assert_eq!(ttl_config.get_ttl(StorageKey::Orders), None);
+	}
+
+	#[test]
+	fn test_ttl_config_all_storage_keys() {
+		let config = toml::Value::Table(toml::toml! {
+			ttl_orders = 100
+			ttl_intents = 200
+			ttl_order_by_tx_hash = 300
+			ttl_quotes = 400
+			ttl_settlement_messages = 500
+		});
+
+		let ttl_config = TtlConfig::from_config(&config);
+
+		assert_eq!(
+			ttl_config.get_ttl(StorageKey::Orders),
+			Some(Duration::from_secs(100))
+		);
+		assert_eq!(
+			ttl_config.get_ttl(StorageKey::Intents),
+			Some(Duration::from_secs(200))
+		);
+		assert_eq!(
+			ttl_config.get_ttl(StorageKey::OrderByTxHash),
+			Some(Duration::from_secs(300))
+		);
+		assert_eq!(
+			ttl_config.get_ttl(StorageKey::Quotes),
+			Some(Duration::from_secs(400))
+		);
+		assert_eq!(
+			ttl_config.get_ttl(StorageKey::SettlementMessages),
+			Some(Duration::from_secs(500))
+		);
+	}
+
+	#[test]
+	fn test_ttl_config_negative_values_treated_as_zero() {
+		// Negative values in TOML are still i64, but we cast to u64
+		// This tests the behavior with edge values
+		let config = toml::Value::Table(toml::toml! {
+			ttl_orders = 1
+		});
+
+		let ttl_config = TtlConfig::from_config(&config);
+		assert_eq!(
+			ttl_config.get_ttl(StorageKey::Orders),
+			Some(Duration::from_secs(1))
+		);
+	}
+
+	#[test]
+	fn test_ttl_config_debug_impl() {
+		let config = toml::Value::Table(toml::toml! {
+			ttl_orders = 100
+		});
+		let ttl_config = TtlConfig::from_config(&config);
+
+		// Should not panic and should contain relevant info
+		let debug_str = format!("{:?}", ttl_config);
+		assert!(debug_str.contains("TtlConfig"));
+		assert!(debug_str.contains("ttls"));
+	}
+
+	// ==================== RedisStorage::new() Tests ====================
+
+	#[test]
+	fn test_redis_storage_new_valid() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let result =
+			RedisStorage::new("redis://localhost:6379".to_string(), 5000, "test".to_string(), ttl_config);
+
+		assert!(result.is_ok());
+		let storage = result.unwrap();
+		assert_eq!(storage.redis_url, "redis://localhost:6379");
+		assert_eq!(storage.key_prefix, "test");
+		assert_eq!(storage.timeout_ms, 5000);
+	}
+
+	#[test]
+	fn test_redis_storage_new_empty_prefix() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let result =
+			RedisStorage::new("redis://localhost:6379".to_string(), 5000, "".to_string(), ttl_config);
+
+		assert!(result.is_err());
+		let err = result.unwrap_err();
+		assert!(matches!(err, StorageError::Configuration(_)));
+		assert!(err.to_string().contains("key prefix cannot be empty"));
+	}
+
+	#[test]
+	fn test_redis_storage_new_empty_url() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let result = RedisStorage::new("".to_string(), 5000, "test".to_string(), ttl_config);
+
+		assert!(result.is_err());
+		let err = result.unwrap_err();
+		assert!(matches!(err, StorageError::Configuration(_)));
+		assert!(err.to_string().contains("URL cannot be empty"));
+	}
+
+	// ==================== Key Generation Tests ====================
+
+	#[test]
+	fn test_data_key_generation() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"oif-solver".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		assert_eq!(storage.data_key("orders:123"), "oif-solver:orders:123");
+		assert_eq!(
+			storage.data_key("intents:abc-def"),
+			"oif-solver:intents:abc-def"
+		);
+		assert_eq!(storage.data_key("quotes:q1"), "oif-solver:quotes:q1");
+	}
+
+	#[test]
+	fn test_data_key_with_custom_prefix() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"my-custom-prefix".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		assert_eq!(
+			storage.data_key("orders:123"),
+			"my-custom-prefix:orders:123"
+		);
+	}
+
+	#[test]
+	fn test_all_ids_key_generation() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"oif-solver".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		assert_eq!(storage.all_ids_key("orders"), "oif-solver:orders:_all");
+		assert_eq!(storage.all_ids_key("intents"), "oif-solver:intents:_all");
+		assert_eq!(storage.all_ids_key("quotes"), "oif-solver:quotes:_all");
+	}
+
+	#[test]
+	fn test_index_key_generation_string_value() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"oif-solver".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		let value = serde_json::Value::String("pending".to_string());
+		assert_eq!(
+			storage.index_key("orders", "status", &value),
+			"oif-solver:orders:_index:status:pending"
+		);
+	}
+
+	#[test]
+	fn test_index_key_generation_number_value() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"oif-solver".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		let value = serde_json::json!(42);
+		assert_eq!(
+			storage.index_key("orders", "amount", &value),
+			"oif-solver:orders:_index:amount:42"
+		);
+	}
+
+	#[test]
+	fn test_index_key_generation_bool_value() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"oif-solver".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		let value = serde_json::Value::Bool(true);
+		assert_eq!(
+			storage.index_key("orders", "active", &value),
+			"oif-solver:orders:_index:active:true"
+		);
+
+		let value_false = serde_json::Value::Bool(false);
+		assert_eq!(
+			storage.index_key("orders", "active", &value_false),
+			"oif-solver:orders:_index:active:false"
+		);
+	}
+
+	#[test]
+	fn test_index_key_generation_complex_value() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"oif-solver".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		// Array value
+		let array_value = serde_json::json!([1, 2, 3]);
+		let key = storage.index_key("orders", "items", &array_value);
+		assert!(key.starts_with("oif-solver:orders:_index:items:"));
+		assert!(key.contains("[1,2,3]"));
+
+		// Object value
+		let obj_value = serde_json::json!({"key": "value"});
+		let key = storage.index_key("orders", "metadata", &obj_value);
+		assert!(key.starts_with("oif-solver:orders:_index:metadata:"));
+	}
+
+	#[test]
+	fn test_index_key_generation_null_value() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"oif-solver".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		let null_value = serde_json::Value::Null;
+		let key = storage.index_key("orders", "field", &null_value);
+		assert!(key.starts_with("oif-solver:orders:_index:field:"));
+	}
+
+	// ==================== get_ttl_for_key() Tests ====================
+
+	#[test]
+	fn test_get_ttl_for_key_orders() {
+		let config = toml::Value::Table(toml::toml! {
+			ttl_orders = 3600
+		});
+		let ttl_config = TtlConfig::from_config(&config);
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"test".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		assert_eq!(
+			storage.get_ttl_for_key("orders:123"),
+			Some(Duration::from_secs(3600))
+		);
+	}
+
+	#[test]
+	fn test_get_ttl_for_key_intents() {
+		let config = toml::Value::Table(toml::toml! {
+			ttl_intents = 1800
+		});
+		let ttl_config = TtlConfig::from_config(&config);
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"test".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		assert_eq!(
+			storage.get_ttl_for_key("intents:abc"),
+			Some(Duration::from_secs(1800))
+		);
+	}
+
+	#[test]
+	fn test_get_ttl_for_key_no_ttl_configured() {
+		let config = toml::Value::Table(toml::toml! {
+			ttl_orders = 3600
+		});
+		let ttl_config = TtlConfig::from_config(&config);
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"test".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		// No TTL configured for quotes
+		assert_eq!(storage.get_ttl_for_key("quotes:q1"), None);
+	}
+
+	#[test]
+	fn test_get_ttl_for_key_unknown_namespace() {
+		let config = toml::Value::Table(toml::toml! {
+			ttl_orders = 3600
+		});
+		let ttl_config = TtlConfig::from_config(&config);
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"test".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		// Unknown namespace should return None
+		assert_eq!(storage.get_ttl_for_key("unknown:key"), None);
+	}
+
+	#[test]
+	fn test_get_ttl_for_key_empty_key() {
+		let config = toml::Value::Table(toml::toml! {
+			ttl_orders = 3600
+		});
+		let ttl_config = TtlConfig::from_config(&config);
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"test".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		assert_eq!(storage.get_ttl_for_key(""), None);
+	}
+
+	#[test]
+	fn test_get_ttl_for_key_no_colon() {
+		let config = toml::Value::Table(toml::toml! {
+			ttl_orders = 3600
+		});
+		let ttl_config = TtlConfig::from_config(&config);
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"test".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		// Key without colon - namespace is the whole key
+		assert_eq!(storage.get_ttl_for_key("orders"), Some(Duration::from_secs(3600)));
+	}
+
+	// ==================== map_redis_error() Tests ====================
+
+	#[test]
+	fn test_map_redis_error_type_error() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"test".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		let redis_error = redis::RedisError::from((redis::ErrorKind::TypeError, "type error"));
+		let storage_error = storage.map_redis_error(redis_error, "test_op");
+
+		assert!(matches!(storage_error, StorageError::Backend(_)));
+		let error_msg = storage_error.to_string();
+		assert!(error_msg.contains("data type error"));
+		assert!(error_msg.contains("test_op"));
+	}
+
+	#[test]
+	fn test_map_redis_error_auth_failed() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"test".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		let redis_error =
+			redis::RedisError::from((redis::ErrorKind::AuthenticationFailed, "auth failed"));
+		let storage_error = storage.map_redis_error(redis_error, "auth_op");
+
+		assert!(matches!(storage_error, StorageError::Backend(_)));
+		assert!(storage_error.to_string().contains("authentication failed"));
+	}
+
+	#[test]
+	fn test_map_redis_error_io_error() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"test".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		let redis_error = redis::RedisError::from((redis::ErrorKind::IoError, "io error"));
+		let storage_error = storage.map_redis_error(redis_error, "io_op");
+
+		assert!(matches!(storage_error, StorageError::Backend(_)));
+		let error_msg = storage_error.to_string();
+		assert!(error_msg.contains("connection error"));
+		assert!(error_msg.contains("io_op"));
+	}
+
+	#[test]
+	fn test_map_redis_error_generic() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"test".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		let redis_error =
+			redis::RedisError::from((redis::ErrorKind::ResponseError, "some response error"));
+		let storage_error = storage.map_redis_error(redis_error, "generic_op");
+
+		assert!(matches!(storage_error, StorageError::Backend(_)));
+		let error_msg = storage_error.to_string();
+		assert!(error_msg.contains("generic_op"));
+		assert!(error_msg.contains("failed"));
+	}
+
+	// ==================== RedisStorageSchema Tests ====================
 
 	#[test]
 	fn test_config_schema_validation_valid() {
@@ -939,10 +1414,23 @@ mod tests {
 	}
 
 	#[test]
+	fn test_config_schema_validation_timeout_too_high() {
+		let schema = RedisStorageSchema;
+
+		// Timeout too high (> 60000)
+		let invalid_config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://localhost:6379"
+			connection_timeout_ms = 100000
+		});
+
+		assert!(schema.validate(&invalid_config).is_err());
+	}
+
+	#[test]
 	fn test_config_schema_validation_invalid_db() {
 		let schema = RedisStorageSchema;
 
-		// DB out of range
+		// DB out of range (> 15)
 		let invalid_config = toml::Value::Table(toml::toml! {
 			redis_url = "redis://localhost:6379"
 			db = 20
@@ -952,28 +1440,267 @@ mod tests {
 	}
 
 	#[test]
-	fn test_key_generation() {
-		// We can't easily test key generation without a RedisStorage instance,
-		// but we can test the key format logic
-		let prefix = "oif-solver";
-		let namespace = "orders";
-		let id = "order123";
-		let key = format!("{}:{}", namespace, id);
+	fn test_config_schema_validation_db_negative() {
+		let schema = RedisStorageSchema;
 
-		let data_key = format!("{}:{}", prefix, key);
-		assert_eq!(data_key, "oif-solver:orders:order123");
+		// DB negative
+		let invalid_config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://localhost:6379"
+			db = -1
+		});
 
-		let all_ids_key = format!("{}:{}:{}", prefix, namespace, ALL_IDS_SUFFIX);
-		assert_eq!(all_ids_key, "oif-solver:orders:_all");
-
-		let index_key = format!(
-			"{}:{}:{}:{}:{}",
-			prefix, namespace, INDEX_SUFFIX, "status", "pending"
-		);
-		assert_eq!(index_key, "oif-solver:orders:_index:status:pending");
+		assert!(schema.validate(&invalid_config).is_err());
 	}
 
-	// Integration tests that require a running Redis instance
+	#[test]
+	fn test_config_schema_validation_minimal() {
+		let schema = RedisStorageSchema;
+
+		// Only redis_url is required
+		let minimal_config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://localhost:6379"
+		});
+
+		assert!(schema.validate(&minimal_config).is_ok());
+	}
+
+	#[test]
+	fn test_config_schema_validation_all_ttls() {
+		let schema = RedisStorageSchema;
+
+		let config_with_all_ttls = toml::Value::Table(toml::toml! {
+			redis_url = "redis://localhost:6379"
+			ttl_orders = 100
+			ttl_intents = 200
+			ttl_order_by_tx_hash = 300
+			ttl_quotes = 400
+			ttl_settlement_messages = 500
+		});
+
+		assert!(schema.validate(&config_with_all_ttls).is_ok());
+	}
+
+	#[test]
+	fn test_config_schema_static_validate() {
+		let valid_config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://localhost:6379"
+		});
+
+		assert!(RedisStorageSchema::validate_config(&valid_config).is_ok());
+
+		let invalid_config = toml::Value::Table(toml::map::Map::new());
+		assert!(RedisStorageSchema::validate_config(&invalid_config).is_err());
+	}
+
+	// ==================== create_storage() Factory Tests ====================
+
+	#[test]
+	fn test_create_storage_valid_config() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://localhost:6379"
+			key_prefix = "test"
+			connection_timeout_ms = 5000
+		});
+
+		let result = create_storage(&config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_create_storage_default_prefix() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://localhost:6379"
+		});
+
+		let result = create_storage(&config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_create_storage_default_timeout() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://localhost:6379"
+		});
+
+		let result = create_storage(&config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_create_storage_with_db_number() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://localhost:6379"
+			db = 5
+		});
+
+		let result = create_storage(&config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_create_storage_url_already_has_db() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://localhost:6379/3"
+			db = 5
+		});
+
+		// Should use the db from URL, not from config
+		let result = create_storage(&config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_create_storage_missing_url() {
+		let config = toml::Value::Table(toml::toml! {
+			key_prefix = "test"
+		});
+
+		let result = create_storage(&config);
+		assert!(result.is_err());
+		match result {
+			Err(StorageError::Configuration(_)) => (),
+			_ => panic!("Expected Configuration error"),
+		}
+	}
+
+	#[test]
+	fn test_create_storage_invalid_timeout() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://localhost:6379"
+			connection_timeout_ms = 10
+		});
+
+		let result = create_storage(&config);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_create_storage_with_ttl_config() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://localhost:6379"
+			ttl_orders = 3600
+			ttl_intents = 1800
+		});
+
+		let result = create_storage(&config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_create_storage_url_with_trailing_slash() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://localhost:6379/"
+			db = 2
+		});
+
+		let result = create_storage(&config);
+		assert!(result.is_ok());
+	}
+
+	// ==================== Debug Implementation Tests ====================
+
+	#[test]
+	fn test_redis_storage_debug() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"test-prefix".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		let debug_str = format!("{:?}", storage);
+
+		assert!(debug_str.contains("RedisStorage"));
+		assert!(debug_str.contains("redis://localhost:6379"));
+		assert!(debug_str.contains("test-prefix"));
+		assert!(debug_str.contains("connected"));
+		assert!(debug_str.contains("false")); // Not connected yet (lazy init)
+	}
+
+	// ==================== Registry Tests ====================
+
+	#[test]
+	fn test_registry_name() {
+		assert_eq!(Registry::NAME, "redis");
+	}
+
+	#[test]
+	fn test_registry_factory() {
+		let factory = Registry::factory();
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://localhost:6379"
+		});
+
+		let result = factory(&config);
+		assert!(result.is_ok());
+	}
+
+	// ==================== Constants Tests ====================
+
+	#[test]
+	fn test_constants() {
+		assert_eq!(DEFAULT_CONNECTION_TIMEOUT_MS, 5000);
+		assert_eq!(DEFAULT_KEY_PREFIX, "oif-solver");
+		assert_eq!(ALL_IDS_SUFFIX, "_all");
+		assert_eq!(INDEX_SUFFIX, "_index");
+	}
+
+	// ==================== config_schema() Tests ====================
+
+	#[test]
+	fn test_storage_interface_config_schema() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"test".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		let schema = storage.config_schema();
+
+		// Test that the schema validates correctly
+		let valid_config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://localhost:6379"
+		});
+		assert!(schema.validate(&valid_config).is_ok());
+
+		let invalid_config = toml::Value::Table(toml::map::Map::new());
+		assert!(schema.validate(&invalid_config).is_err());
+	}
+
+	// ==================== URL Building Edge Cases ====================
+
+	#[test]
+	fn test_url_with_path_not_db() {
+		// URL that has a slash but the last segment is not a valid db number
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://localhost:6379/notanumber"
+			db = 5
+		});
+
+		// This should append db because "notanumber" is not a valid u8
+		let result = create_storage(&config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_url_building_db_out_of_u8_range() {
+		// URL with a number larger than u8 max
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://localhost:6379/256"
+			db = 5
+		});
+
+		// 256 is out of u8 range, so should append db
+		let result = create_storage(&config);
+		assert!(result.is_ok());
+	}
+
+	// ==================== Integration tests (require running Redis) ====================
 	// These are marked with #[ignore] and can be run with: cargo test -- --ignored
 
 	#[tokio::test]
@@ -997,10 +1724,7 @@ mod tests {
 		let value = b"test_value".to_vec();
 
 		// Test set and get
-		storage
-			.set_bytes(key, value.clone(), None, None)
-			.await
-			.unwrap();
+		storage.set_bytes(key, value.clone(), None, None).await.unwrap();
 		let retrieved = storage.get_bytes(key).await.unwrap();
 		assert_eq!(retrieved, value);
 
@@ -1031,10 +1755,7 @@ mod tests {
 		let value = b"test_value".to_vec();
 
 		// Store with TTL from config (1 second for orders)
-		storage
-			.set_bytes(key, value.clone(), None, None)
-			.await
-			.unwrap();
+		storage.set_bytes(key, value.clone(), None, None).await.unwrap();
 
 		// Should be available immediately
 		let retrieved = storage.get_bytes(key).await.unwrap();
@@ -1133,10 +1854,7 @@ mod tests {
 
 		// Store multiple items
 		for (key, value) in keys.iter().zip(values.iter()) {
-			storage
-				.set_bytes(key, value.clone(), None, None)
-				.await
-				.unwrap();
+			storage.set_bytes(key, value.clone(), None, None).await.unwrap();
 		}
 
 		// Batch retrieve
@@ -1161,5 +1879,38 @@ mod tests {
 		for key in &keys {
 			let _ = storage.delete(key).await;
 		}
+	}
+
+	#[tokio::test]
+	#[ignore = "Requires active Redis instance"]
+	async fn test_cleanup_expired() {
+		let config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://127.0.0.1:6379"
+			key_prefix = "test_cleanup"
+		});
+
+		let storage = create_storage_async(&config).await.unwrap();
+
+		// cleanup_expired should return 0 (Redis handles TTL automatically)
+		let result = storage.cleanup_expired().await.unwrap();
+		assert_eq!(result, 0);
+	}
+
+	#[tokio::test]
+	#[ignore = "Requires active Redis instance"]
+	async fn test_create_storage_async_verifies_connection() {
+		// Valid Redis URL - should succeed
+		let valid_config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://127.0.0.1:6379"
+		});
+		assert!(create_storage_async(&valid_config).await.is_ok());
+
+		// Invalid Redis URL - should fail during eager connection
+		let invalid_config = toml::Value::Table(toml::toml! {
+			redis_url = "redis://invalid-host-that-does-not-exist:6379"
+			connection_timeout_ms = 1000
+		});
+		let result = create_storage_async(&invalid_config).await;
+		assert!(result.is_err());
 	}
 }
