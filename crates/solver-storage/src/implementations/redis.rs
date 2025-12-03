@@ -991,8 +991,12 @@ mod tests {
 	#[test]
 	fn test_redis_storage_new_valid() {
 		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
-		let result =
-			RedisStorage::new("redis://localhost:6379".to_string(), 5000, "test".to_string(), ttl_config);
+		let result = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"test".to_string(),
+			ttl_config,
+		);
 
 		assert!(result.is_ok());
 		let storage = result.unwrap();
@@ -1004,8 +1008,12 @@ mod tests {
 	#[test]
 	fn test_redis_storage_new_empty_prefix() {
 		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
-		let result =
-			RedisStorage::new("redis://localhost:6379".to_string(), 5000, "".to_string(), ttl_config);
+		let result = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"".to_string(),
+			ttl_config,
+		);
 
 		assert!(result.is_err());
 		let err = result.unwrap_err();
@@ -1287,7 +1295,10 @@ mod tests {
 		.unwrap();
 
 		// Key without colon - namespace is the whole key
-		assert_eq!(storage.get_ttl_for_key("orders"), Some(Duration::from_secs(3600)));
+		assert_eq!(
+			storage.get_ttl_for_key("orders"),
+			Some(Duration::from_secs(3600))
+		);
 	}
 
 	// ==================== map_redis_error() Tests ====================
@@ -1724,7 +1735,10 @@ mod tests {
 		let value = b"test_value".to_vec();
 
 		// Test set and get
-		storage.set_bytes(key, value.clone(), None, None).await.unwrap();
+		storage
+			.set_bytes(key, value.clone(), None, None)
+			.await
+			.unwrap();
 		let retrieved = storage.get_bytes(key).await.unwrap();
 		assert_eq!(retrieved, value);
 
@@ -1755,7 +1769,10 @@ mod tests {
 		let value = b"test_value".to_vec();
 
 		// Store with TTL from config (1 second for orders)
-		storage.set_bytes(key, value.clone(), None, None).await.unwrap();
+		storage
+			.set_bytes(key, value.clone(), None, None)
+			.await
+			.unwrap();
 
 		// Should be available immediately
 		let retrieved = storage.get_bytes(key).await.unwrap();
@@ -1854,7 +1871,10 @@ mod tests {
 
 		// Store multiple items
 		for (key, value) in keys.iter().zip(values.iter()) {
-			storage.set_bytes(key, value.clone(), None, None).await.unwrap();
+			storage
+				.set_bytes(key, value.clone(), None, None)
+				.await
+				.unwrap();
 		}
 
 		// Batch retrieve
