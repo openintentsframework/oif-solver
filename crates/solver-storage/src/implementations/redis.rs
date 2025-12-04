@@ -52,10 +52,14 @@
 //! The storage uses a hierarchical key structure:
 //!
 //! ```text
-//! {prefix}:{namespace}:{id}           → JSON data (e.g., oif-solver:orders:abc123)
-//! {prefix}:{namespace}:_all           → Set of all IDs in namespace
+//! {prefix}:{namespace}:{id}                   → JSON data (e.g., oif-solver:orders:abc123)
+//! {prefix}:{namespace}:_all                   → Set of all IDs in namespace
 //! {prefix}:{namespace}:_index:{field}:{value} → Set of IDs matching field=value
+//! {prefix}:{namespace}:{id}:_idx_meta         → Set of index keys referencing this data key
 //! ```
+//!
+//! The `_idx_meta` keys are used to track which index sets reference each data key,
+//! enabling proper cleanup when data is deleted (preventing unbounded index growth).
 //!
 //! # Example Usage
 //!
@@ -110,6 +114,9 @@ const ALL_IDS_SUFFIX: &str = "_all";
 
 /// Suffix for field index keys.
 const INDEX_SUFFIX: &str = "_index";
+
+/// Suffix for storing index metadata (which indexes reference a key).
+const INDEX_META_SUFFIX: &str = "_idx_meta";
 
 /// TTL configuration for different storage keys.
 #[derive(Debug, Clone)]
@@ -248,6 +255,16 @@ impl RedisStorage {
 		)
 	}
 
+	/// Generates the Redis key for storing index metadata for a data key.
+	///
+	/// This key stores a set of all index keys that reference this data key,
+	/// enabling proper cleanup when the data is deleted.
+	///
+	/// Format: `{prefix}:{key}:_idx_meta`
+	fn index_meta_key(&self, key: &str) -> String {
+		format!("{}:{}:{}", self.key_prefix, key, INDEX_META_SUFFIX)
+	}
+
 	/// Gets the TTL for a given key based on its namespace.
 	fn get_ttl_for_key(&self, key: &str) -> Option<Duration> {
 		// Parse namespace from key (e.g., "orders:123" -> "orders")
@@ -281,6 +298,9 @@ impl RedisStorage {
 	}
 
 	/// Updates indexes when storing data.
+	///
+	/// This method also stores metadata about which index keys reference this data key,
+	/// enabling proper cleanup when the data is deleted.
 	async fn update_indexes(
 		&self,
 		key: &str,
@@ -314,6 +334,10 @@ impl RedisStorage {
 			}
 		}
 
+		// Track index keys for this data key (for cleanup on delete)
+		let index_meta_key = self.index_meta_key(key);
+		let mut index_keys_for_meta: Vec<String> = Vec::new();
+
 		// Add to field-specific indexes
 		for (field, value) in &indexes.fields {
 			let index_key = self.index_key(namespace, field, value);
@@ -321,6 +345,9 @@ impl RedisStorage {
 				.sadd(&index_key, key)
 				.await
 				.map_err(|e| self.map_redis_error(e, "update_indexes_add_field"))?;
+
+			// Track this index key for cleanup
+			index_keys_for_meta.push(index_key.clone());
 
 			// Set TTL on index key
 			if let Some(ttl) = ttl {
@@ -338,11 +365,33 @@ impl RedisStorage {
 			}
 		}
 
-		debug!(key = %key, namespace = %namespace, "updated indexes");
+		// Store index metadata (which index keys reference this data key)
+		if !index_keys_for_meta.is_empty() {
+			for idx_key in &index_keys_for_meta {
+				let _: () = conn
+					.sadd(&index_meta_key, idx_key)
+					.await
+					.map_err(|e| self.map_redis_error(e, "update_indexes_add_meta"))?;
+			}
+
+			// Set TTL on index metadata key
+			if let Some(ttl) = ttl {
+				let _: () = conn
+					.expire(&index_meta_key, ttl.as_secs() as i64)
+					.await
+					.map_err(|e| self.map_redis_error(e, "update_indexes_expire_meta"))?;
+			}
+		}
+
+		debug!(key = %key, namespace = %namespace, index_count = index_keys_for_meta.len(), "updated indexes");
 		Ok(())
 	}
 
 	/// Removes key from indexes when deleting.
+	///
+	/// This method uses the stored index metadata to clean up all field-specific
+	/// index sets that reference this data key, preventing unbounded growth of
+	/// stale index entries.
 	async fn remove_from_indexes(&self, key: &str, namespace: &str) -> Result<(), StorageError> {
 		let client = self.get_connection().await?;
 		let mut conn = client.as_ref().clone();
@@ -354,12 +403,32 @@ impl RedisStorage {
 			.await
 			.map_err(|e| self.map_redis_error(e, "remove_from_indexes_all"))?;
 
-		// We can't easily remove from field indexes without knowing what fields were indexed.
-		// The entry will be cleaned up when TTL expires or when querying returns stale keys.
-		// This is a trade-off for simplicity - in production, you might want to store
-		// the index fields alongside the data.
+		// Get index metadata to find all field-specific index keys
+		let index_meta_key = self.index_meta_key(key);
+		let index_keys: Vec<String> = conn
+			.smembers(&index_meta_key)
+			.await
+			.map_err(|e| self.map_redis_error(e, "remove_from_indexes_get_meta"))?;
 
-		debug!(key = %key, namespace = %namespace, "removed from all-IDs index");
+		// Remove this key from all field-specific index sets
+		let mut removed_count = 0;
+		for idx_key in &index_keys {
+			let _: () = conn
+				.srem(idx_key, key)
+				.await
+				.map_err(|e| self.map_redis_error(e, "remove_from_indexes_field"))?;
+			removed_count += 1;
+		}
+
+		// Delete the index metadata key itself
+		if !index_keys.is_empty() {
+			let _: () = conn
+				.del(&index_meta_key)
+				.await
+				.map_err(|e| self.map_redis_error(e, "remove_from_indexes_del_meta"))?;
+		}
+
+		debug!(key = %key, namespace = %namespace, removed_indexes = removed_count, "removed from indexes");
 		Ok(())
 	}
 }
@@ -1184,6 +1253,46 @@ mod tests {
 		assert!(key.starts_with("oif-solver:orders:_index:field:"));
 	}
 
+	// ==================== index_meta_key() Tests ====================
+
+	#[test]
+	fn test_index_meta_key_generation() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"oif-solver".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		assert_eq!(
+			storage.index_meta_key("orders:123"),
+			"oif-solver:orders:123:_idx_meta"
+		);
+		assert_eq!(
+			storage.index_meta_key("intents:abc-def"),
+			"oif-solver:intents:abc-def:_idx_meta"
+		);
+	}
+
+	#[test]
+	fn test_index_meta_key_with_custom_prefix() {
+		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"my-prefix".to_string(),
+			ttl_config,
+		)
+		.unwrap();
+
+		assert_eq!(
+			storage.index_meta_key("orders:123"),
+			"my-prefix:orders:123:_idx_meta"
+		);
+	}
+
 	// ==================== get_ttl_for_key() Tests ====================
 
 	#[test]
@@ -1655,6 +1764,7 @@ mod tests {
 		assert_eq!(DEFAULT_KEY_PREFIX, "oif-solver");
 		assert_eq!(ALL_IDS_SUFFIX, "_all");
 		assert_eq!(INDEX_SUFFIX, "_index");
+		assert_eq!(INDEX_META_SUFFIX, "_idx_meta");
 	}
 
 	// ==================== config_schema() Tests ====================
