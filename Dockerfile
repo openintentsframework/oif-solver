@@ -43,8 +43,7 @@ EXPOSE 3000
 
 # Set default environment variables
 ENV RUST_LOG=info
-ENV CONFIG_FILE=/app/config/config.toml
 
-# Default command
+# Config must be mounted at runtime via volume mount
+# Example: docker run -v $(pwd)/config:/app/config:ro oif-solver --config /app/config/testnet.toml
 ENTRYPOINT ["/app/solver"]
-CMD ["--config", "/app/config/config.toml"]

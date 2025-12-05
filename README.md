@@ -15,6 +15,7 @@ A high-performance cross-chain solver implementation for the Open Intents Framew
 - [Project Structure](#project-structure)
 - [Component Responsibilities](#component-responsibilities)
 - [Quick Start](#quick-start)
+- [Docker](#docker)
 - [Configuration](#configuration)
 - [API Reference](#api-reference)
 - [Testing and Development with solver-demo](#testing-and-development-with-solver-demo)
@@ -223,6 +224,58 @@ cargo run -- --config config/example.toml
 # Run with debug logs for solver modules only
 RUST_LOG=solver_core=debug,solver_delivery=debug,info cargo run -- --config config/example.toml
 ```
+
+## Docker
+
+The solver can be run in a Docker container for production deployments.
+
+### Building the Image
+
+```bash
+docker build -t oif-solver .
+```
+
+### Running the Container
+
+```bash
+# Create a docker-compatible env file (removes 'export' prefixes if present)
+sed 's/^export //' .env > .env.docker
+
+# Run the solver
+docker run -it --rm \
+  -p 3000:3000 \
+  --env-file .env.docker \
+  -v $(pwd)/config:/app/config:ro \
+  -v $(pwd)/data:/app/data \
+  oif-solver --config /app/config/testnet.toml
+```
+
+### Required Configuration
+
+For Docker deployments, ensure your API config binds to `0.0.0.0` instead of `127.0.0.1`:
+
+```toml
+# config/testnet/api.toml
+[api]
+host = "0.0.0.0"  # Required for Docker - allows external connections
+port = 3000
+```
+
+### Environment Variables
+
+The container expects environment variables for sensitive configuration:
+
+| Variable | Description |
+|----------|-------------|
+| `SOLVER_PRIVATE_KEY` | Private key for the solver account |
+| `RUST_LOG` | Log level (default: `info`) |
+
+### Volume Mounts
+
+| Mount | Purpose |
+|-------|---------|
+| `/app/config` | Configuration files (read-only recommended) |
+| `/app/data` | Persistent storage for solver state |
 
 ## Configuration
 
