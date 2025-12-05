@@ -15,6 +15,7 @@ use thiserror::Error;
 pub mod implementations {
 	pub mod file;
 	pub mod memory;
+	pub mod redis;
 }
 
 /// Query filter for storage operations.
@@ -161,11 +162,12 @@ pub trait StorageRegistry: ImplementationRegistry<Factory = StorageFactory> {}
 /// Returns a vector of (name, factory) tuples for all available storage implementations.
 /// This is used by the factory registry to automatically register all implementations.
 pub fn get_all_implementations() -> Vec<(&'static str, StorageFactory)> {
-	use implementations::{file, memory};
+	use implementations::{file, memory, redis};
 
 	vec![
 		(file::Registry::NAME, file::Registry::factory()),
 		(memory::Registry::NAME, memory::Registry::factory()),
+		(redis::Registry::NAME, redis::Registry::factory()),
 	]
 }
 
