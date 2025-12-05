@@ -32,10 +32,6 @@ WORKDIR /app
 # Copy the compiled binary
 COPY --from=builder --chown=nonroot:nonroot /usr/app/bin/solver /app/solver
 
-# Remove unnecessary tools for smaller attack surface
-USER root
-RUN apk del wolfi-base apk-tools
-
 USER nonroot
 
 # Expose the default API port
