@@ -1159,4 +1159,170 @@ mod tests {
 			assert!(debug_str.contains("TransactionFailed"));
 		}
 	}
+
+	// ========================================================================
+	// Transaction Request Conversion Tests
+	// ========================================================================
+
+	mod transaction_conversion_tests {
+		use super::*;
+		use alloy_primitives::U256;
+
+		/// Test Transaction to TransactionRequest conversion
+		#[test]
+		fn test_transaction_to_request_basic() {
+			let tx = SolverTransaction {
+				to: Some(solver_types::Address(vec![0x12; 20])),
+				data: vec![0xab, 0xcd],
+				value: U256::from(1000u64),
+				chain_id: 1,
+				nonce: Some(5),
+				gas_limit: Some(21000),
+				gas_price: None,
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+			};
+
+			let request: TransactionRequest = tx.into();
+			assert!(request.to.is_some());
+			assert_eq!(request.nonce, Some(5));
+			assert_eq!(request.gas, Some(21000));
+		}
+
+		/// Test Transaction with EIP-1559 gas parameters
+		#[test]
+		fn test_transaction_eip1559() {
+			let tx = SolverTransaction {
+				to: Some(solver_types::Address(vec![0x12; 20])),
+				data: vec![],
+				value: U256::from(0u64),
+				chain_id: 1,
+				nonce: None,
+				gas_limit: Some(100000),
+				gas_price: None,
+				max_fee_per_gas: Some(50_000_000_000), // 50 gwei
+				max_priority_fee_per_gas: Some(2_000_000_000), // 2 gwei
+			};
+
+			let request: TransactionRequest = tx.into();
+			assert_eq!(request.max_fee_per_gas, Some(50_000_000_000));
+			assert_eq!(request.max_priority_fee_per_gas, Some(2_000_000_000));
+		}
+
+		/// Test Transaction with legacy gas price
+		#[test]
+		fn test_transaction_legacy_gas() {
+			let tx = SolverTransaction {
+				to: Some(solver_types::Address(vec![0x12; 20])),
+				data: vec![],
+				value: U256::from(0u64),
+				chain_id: 1,
+				nonce: None,
+				gas_limit: Some(21000),
+				gas_price: Some(20_000_000_000), // 20 gwei
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+			};
+
+			let request: TransactionRequest = tx.into();
+			assert_eq!(request.gas_price, Some(20_000_000_000));
+		}
+
+		/// Test Transaction for contract deployment (no 'to' address)
+		#[test]
+		fn test_transaction_contract_deployment() {
+			let tx = SolverTransaction {
+				to: None, // Contract creation
+				data: vec![0x60, 0x80, 0x60, 0x40], // Some bytecode
+				value: U256::from(0u64),
+				chain_id: 1,
+				nonce: Some(0),
+				gas_limit: Some(1000000),
+				gas_price: None,
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+			};
+
+			let request: TransactionRequest = tx.into();
+			assert!(request.to.is_none());
+		}
+	}
+
+	// ========================================================================
+	// TransactionHash Tests
+	// ========================================================================
+
+	mod transaction_hash_tests {
+		use super::*;
+
+		#[test]
+		fn test_transaction_hash_clone() {
+			let hash = TransactionHash(vec![0x12; 32]);
+			let cloned = hash.clone();
+			assert_eq!(hash.0, cloned.0);
+		}
+
+		#[test]
+		fn test_transaction_hash_partial_eq() {
+			let hash1 = TransactionHash(vec![0x12; 32]);
+			let hash2 = TransactionHash(vec![0x12; 32]);
+			let hash3 = TransactionHash(vec![0x34; 32]);
+
+			assert_eq!(hash1, hash2);
+			assert_ne!(hash1, hash3);
+		}
+	}
+
+	// ========================================================================
+	// TrackingConfig Tests
+	// ========================================================================
+
+	mod tracking_config_tests {
+		use crate::{TransactionTracking, TransactionTrackingWithConfig};
+		use solver_types::TransactionType;
+
+		#[test]
+		fn test_tracking_with_config_creation() {
+			let callback = Box::new(|_: crate::TransactionMonitoringEvent| {});
+
+			let tracking = TransactionTracking {
+				id: "test-order-123".to_string(),
+				tx_type: TransactionType::Fill,
+				callback,
+			};
+
+			let config = TransactionTrackingWithConfig {
+				tracking,
+				min_confirmations: 3,
+				monitoring_timeout_seconds: 300,
+			};
+
+			assert_eq!(config.min_confirmations, 3);
+			assert_eq!(config.monitoring_timeout_seconds, 300);
+			assert_eq!(config.tracking.id, "test-order-123");
+		}
+
+		#[test]
+		fn test_tracking_different_tx_types() {
+			let tx_types = vec![
+				TransactionType::Prepare,
+				TransactionType::Fill,
+				TransactionType::PostFill,
+				TransactionType::PreClaim,
+				TransactionType::Claim,
+			];
+
+			for tx_type in tx_types {
+				let callback = Box::new(|_: crate::TransactionMonitoringEvent| {});
+				let tracking = TransactionTracking {
+					id: format!("order-{:?}", tx_type),
+					tx_type,
+					callback,
+				};
+
+				// Verify each type can be used in tracking
+				assert!(!tracking.id.is_empty());
+			}
+		}
+	}
 }
