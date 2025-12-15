@@ -501,9 +501,9 @@ impl DeliveryInterface for AlloyDelivery {
 	}
 }
 
-/// Monitors a pending transaction for confirmation or timeout using manual polling.
-/// This avoids race conditions in alloy's PendingTransactionBuilder that can cause
-/// transactions to be missed intermittently.
+/// Monitors a pending transaction for confirmation or timeout.
+/// First checks if the receipt already exists (to handle fast-mining transactions),
+/// then falls back to alloy's subscription-based monitoring.
 async fn monitor_transaction(
 	pending_tx: alloy_provider::PendingTransactionBuilder<alloy_network::Ethereum>,
 	min_confirmations: u64,
@@ -515,8 +515,6 @@ async fn monitor_transaction(
 	let tx_hash = *pending_tx.tx_hash();
 	let provider = pending_tx.provider().clone();
 	let timeout_duration = Duration::from_secs(monitoring_timeout_seconds);
-	let poll_interval = Duration::from_secs(2);
-	let start_time = std::time::Instant::now();
 
 	tracing::info!(
 		tx_hash = %tx_hash,
@@ -526,83 +524,77 @@ async fn monitor_transaction(
 		"Starting transaction monitoring"
 	);
 
-	// Manual polling loop - more reliable than PendingTransactionBuilder
-	loop {
-		// Check timeout
-		if start_time.elapsed() > timeout_duration {
-			tracing::error!(
-				tx_hash = %tx_hash,
-				chain_id = chain_id,
-				"Transaction monitoring timed out"
-			);
-			return Err(DeliveryError::TransactionFailed(
-				"Transaction monitoring timed out".to_string(),
-			));
-		}
-
-		// Poll for receipt
-		match provider.get_transaction_receipt(tx_hash).await {
-			Ok(Some(receipt)) => {
-				// Check if transaction was successful
-				if !receipt.status() {
-					tracing::error!(
-						tx_hash = %tx_hash,
-						chain_id = chain_id,
-						"Transaction reverted"
-					);
-					return Err(DeliveryError::TransactionFailed(
-						"Transaction reverted".to_string(),
-					));
-				}
-
-				// Check confirmations if required
-				if min_confirmations > 0 {
-					if let Some(block_number) = receipt.block_number {
-						match provider.get_block_number().await {
-							Ok(current_block) => {
-								let confirmations = current_block.saturating_sub(block_number);
-								if confirmations < min_confirmations {
-									// Not enough confirmations yet, keep polling
-									tokio::time::sleep(poll_interval).await;
-									continue;
-								}
-							},
-							Err(e) => {
-								tracing::warn!(
-									tx_hash = %tx_hash,
-									chain_id = chain_id,
-									error = %e,
-									"Failed to get current block number, retrying..."
-								);
-								tokio::time::sleep(poll_interval).await;
-								continue;
-							},
+	// First, check if the transaction is already mined (handles race condition where
+	// tx mines before the subscription is set up)
+	if let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await {
+		if receipt.status() {
+			// Transaction already mined and successful, check confirmations
+			if min_confirmations > 0 {
+				if let Some(block_number) = receipt.block_number {
+					if let Ok(current_block) = provider.get_block_number().await {
+						let confirmations = current_block.saturating_sub(block_number);
+						if confirmations >= min_confirmations {
+							tracing::info!(
+								tx_hash = %tx_hash,
+								chain_id = chain_id,
+								block_number = ?receipt.block_number,
+								"Transaction already confirmed"
+							);
+							return Ok(TransactionReceipt::from(&receipt));
 						}
+						// Not enough confirmations yet, fall through to subscription
 					}
 				}
-
+			} else {
+				// No confirmations required
 				tracing::info!(
 					tx_hash = %tx_hash,
 					chain_id = chain_id,
 					block_number = ?receipt.block_number,
-					"Transaction confirmed in monitoring"
+					"Transaction already confirmed"
 				);
 				return Ok(TransactionReceipt::from(&receipt));
-			},
-			Ok(None) => {
-				// Transaction not yet mined, keep polling
-				tokio::time::sleep(poll_interval).await;
-			},
-			Err(e) => {
-				tracing::warn!(
-					tx_hash = %tx_hash,
-					chain_id = chain_id,
-					error = %e,
-					"Failed to get receipt, retrying..."
-				);
-				tokio::time::sleep(poll_interval).await;
-			},
+			}
+		} else {
+			tracing::error!(
+				tx_hash = %tx_hash,
+				chain_id = chain_id,
+				"Transaction reverted"
+			);
+			return Err(DeliveryError::TransactionFailed(
+				"Transaction reverted".to_string(),
+			));
 		}
+	}
+
+	// Use alloy's subscription-based monitoring for pending transactions
+	match pending_tx
+		.with_required_confirmations(min_confirmations)
+		.with_timeout(Some(timeout_duration))
+		.get_receipt()
+		.await
+	{
+		Ok(receipt) => {
+			tracing::info!(
+				tx_hash = %tx_hash,
+				chain_id = chain_id,
+				block_number = ?receipt.block_number,
+				"Transaction confirmed in monitoring"
+			);
+			Ok(TransactionReceipt::from(&receipt))
+		},
+		Err(e) => {
+			tracing::error!(
+				tx_hash = %tx_hash,
+				chain_id = chain_id,
+				error = %e,
+				"Transaction monitoring failed"
+			);
+			Err(DeliveryError::TransactionFailed(format!(
+				"Transaction monitoring failed: {}",
+				e
+			)))
+		},
 	}
 }
 
