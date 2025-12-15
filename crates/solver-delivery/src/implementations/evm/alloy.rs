@@ -507,7 +507,15 @@ async fn monitor_transaction(
 ) -> Result<TransactionReceipt, DeliveryError> {
 	use std::time::Duration;
 
+	let tx_hash = pending_tx.tx_hash();
 	let timeout_duration = Duration::from_secs(monitoring_timeout_seconds);
+
+	tracing::info!(
+		tx_hash = %tx_hash,
+		min_confirmations = min_confirmations,
+		timeout_seconds = monitoring_timeout_seconds,
+		"Starting transaction monitoring"
+	);
 
 	// Use get_receipt() instead of watch() to avoid race condition where heartbeat
 	// might skip blocks. The get_receipt() method includes a polling fallback that
@@ -521,13 +529,25 @@ async fn monitor_transaction(
 		.await
 	{
 		Ok(receipt) => {
+			tracing::info!(
+				tx_hash = %tx_hash,
+				block_number = ?receipt.block_number,
+				"Transaction confirmed in monitoring"
+			);
 			// Receipt is already fetched, just convert it
 			Ok(TransactionReceipt::from(&receipt))
 		},
-		Err(e) => Err(DeliveryError::TransactionFailed(format!(
-			"Transaction monitoring failed: {}",
-			e
-		))),
+		Err(e) => {
+			tracing::error!(
+				tx_hash = %tx_hash,
+				error = %e,
+				"Transaction monitoring failed"
+			);
+			Err(DeliveryError::TransactionFailed(format!(
+				"Transaction monitoring failed: {}",
+				e
+			)))
+		},
 	}
 }
 
