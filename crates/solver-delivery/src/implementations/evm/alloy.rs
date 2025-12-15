@@ -507,7 +507,7 @@ async fn monitor_transaction(
 ) -> Result<TransactionReceipt, DeliveryError> {
 	use std::time::Duration;
 
-	let tx_hash = pending_tx.tx_hash();
+	let tx_hash = *pending_tx.tx_hash();
 	let timeout_duration = Duration::from_secs(monitoring_timeout_seconds);
 
 	tracing::info!(
