@@ -258,11 +258,13 @@ impl DeliveryInterface for AlloyDelivery {
 		// If tracking is provided, set up monitoring
 		if let Some(tracking) = tracking {
 			let tx_hash_clone = tx_hash_obj.clone();
+			let monitor_chain_id = chain_id;
 			tokio::spawn(async move {
 				let result = monitor_transaction(
 					pending_tx,
 					tracking.min_confirmations,
 					tracking.monitoring_timeout_seconds,
+					monitor_chain_id,
 				)
 				.await;
 
@@ -499,55 +501,108 @@ impl DeliveryInterface for AlloyDelivery {
 	}
 }
 
-/// Monitors a pending transaction for confirmation or timeout
+/// Monitors a pending transaction for confirmation or timeout using manual polling.
+/// This avoids race conditions in alloy's PendingTransactionBuilder that can cause
+/// transactions to be missed intermittently.
 async fn monitor_transaction(
 	pending_tx: alloy_provider::PendingTransactionBuilder<alloy_network::Ethereum>,
 	min_confirmations: u64,
 	monitoring_timeout_seconds: u64,
+	chain_id: u64,
 ) -> Result<TransactionReceipt, DeliveryError> {
 	use std::time::Duration;
 
 	let tx_hash = *pending_tx.tx_hash();
+	let provider = pending_tx.provider().clone();
 	let timeout_duration = Duration::from_secs(monitoring_timeout_seconds);
+	let poll_interval = Duration::from_secs(2);
+	let start_time = std::time::Instant::now();
 
 	tracing::info!(
 		tx_hash = %tx_hash,
+		chain_id = chain_id,
 		min_confirmations = min_confirmations,
 		timeout_seconds = monitoring_timeout_seconds,
 		"Starting transaction monitoring"
 	);
 
-	// Use get_receipt() instead of watch() to avoid race condition where heartbeat
-	// might skip blocks. The get_receipt() method includes a polling fallback that
-	// directly queries eth_getTransactionReceipt, which works even if the block
-	// stream misses the block containing the transaction.
-	// See: https://github.com/alloy-rs/alloy/issues/389
-	match pending_tx
-		.with_required_confirmations(min_confirmations)
-		.with_timeout(Some(timeout_duration))
-		.get_receipt()
-		.await
-	{
-		Ok(receipt) => {
-			tracing::info!(
-				tx_hash = %tx_hash,
-				block_number = ?receipt.block_number,
-				"Transaction confirmed in monitoring"
-			);
-			// Receipt is already fetched, just convert it
-			Ok(TransactionReceipt::from(&receipt))
-		},
-		Err(e) => {
+	// Manual polling loop - more reliable than PendingTransactionBuilder
+	loop {
+		// Check timeout
+		if start_time.elapsed() > timeout_duration {
 			tracing::error!(
 				tx_hash = %tx_hash,
-				error = %e,
-				"Transaction monitoring failed"
+				chain_id = chain_id,
+				"Transaction monitoring timed out"
 			);
-			Err(DeliveryError::TransactionFailed(format!(
-				"Transaction monitoring failed: {}",
-				e
-			)))
-		},
+			return Err(DeliveryError::TransactionFailed(
+				"Transaction monitoring timed out".to_string(),
+			));
+		}
+
+		// Poll for receipt
+		match provider.get_transaction_receipt(tx_hash).await {
+			Ok(Some(receipt)) => {
+				// Check if transaction was successful
+				if !receipt.status() {
+					tracing::error!(
+						tx_hash = %tx_hash,
+						chain_id = chain_id,
+						"Transaction reverted"
+					);
+					return Err(DeliveryError::TransactionFailed(
+						"Transaction reverted".to_string(),
+					));
+				}
+
+				// Check confirmations if required
+				if min_confirmations > 0 {
+					if let Some(block_number) = receipt.block_number {
+						match provider.get_block_number().await {
+							Ok(current_block) => {
+								let confirmations = current_block.saturating_sub(block_number);
+								if confirmations < min_confirmations {
+									// Not enough confirmations yet, keep polling
+									tokio::time::sleep(poll_interval).await;
+									continue;
+								}
+							},
+							Err(e) => {
+								tracing::warn!(
+									tx_hash = %tx_hash,
+									chain_id = chain_id,
+									error = %e,
+									"Failed to get current block number, retrying..."
+								);
+								tokio::time::sleep(poll_interval).await;
+								continue;
+							},
+						}
+					}
+				}
+
+				tracing::info!(
+					tx_hash = %tx_hash,
+					chain_id = chain_id,
+					block_number = ?receipt.block_number,
+					"Transaction confirmed in monitoring"
+				);
+				return Ok(TransactionReceipt::from(&receipt));
+			},
+			Ok(None) => {
+				// Transaction not yet mined, keep polling
+				tokio::time::sleep(poll_interval).await;
+			},
+			Err(e) => {
+				tracing::warn!(
+					tx_hash = %tx_hash,
+					chain_id = chain_id,
+					error = %e,
+					"Failed to get receipt, retrying..."
+				);
+				tokio::time::sleep(poll_interval).await;
+			},
+		}
 	}
 }
 
