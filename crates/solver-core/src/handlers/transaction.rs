@@ -107,7 +107,6 @@ impl TransactionHandler {
 					.handle_transaction_confirmed(&order, tx_type, &receipt)
 					.await
 					.map_err(|e: solver_settlement::SettlementError| {
-						tracing::error!("handle_transaction_confirmed failed: {:?}", e);
 						TransactionError::Service(format!("Settlement callback failed: {}", e))
 					})?;
 			}
