@@ -258,13 +258,11 @@ impl DeliveryInterface for AlloyDelivery {
 		// If tracking is provided, set up monitoring
 		if let Some(tracking) = tracking {
 			let tx_hash_clone = tx_hash_obj.clone();
-			let monitor_chain_id = chain_id;
 			tokio::spawn(async move {
 				let result = monitor_transaction(
 					pending_tx,
 					tracking.min_confirmations,
 					tracking.monitoring_timeout_seconds,
-					monitor_chain_id,
 				)
 				.await;
 
@@ -508,21 +506,12 @@ async fn monitor_transaction(
 	pending_tx: alloy_provider::PendingTransactionBuilder<alloy_network::Ethereum>,
 	min_confirmations: u64,
 	monitoring_timeout_seconds: u64,
-	chain_id: u64,
 ) -> Result<TransactionReceipt, DeliveryError> {
 	use std::time::Duration;
 
 	let tx_hash = *pending_tx.tx_hash();
 	let provider = pending_tx.provider().clone();
 	let timeout_duration = Duration::from_secs(monitoring_timeout_seconds);
-
-	tracing::info!(
-		tx_hash = %tx_hash,
-		chain_id = chain_id,
-		min_confirmations = min_confirmations,
-		timeout_seconds = monitoring_timeout_seconds,
-		"Starting transaction monitoring"
-	);
 
 	// First, check if the transaction is already mined (handles race condition where
 	// tx mines before the subscription is set up)
@@ -534,12 +523,6 @@ async fn monitor_transaction(
 					if let Ok(current_block) = provider.get_block_number().await {
 						let confirmations = current_block.saturating_sub(block_number);
 						if confirmations >= min_confirmations {
-							tracing::info!(
-								tx_hash = %tx_hash,
-								chain_id = chain_id,
-								block_number = ?receipt.block_number,
-								"Transaction already confirmed"
-							);
 							return Ok(TransactionReceipt::from(&receipt));
 						}
 						// Not enough confirmations yet, fall through to subscription
@@ -547,20 +530,9 @@ async fn monitor_transaction(
 				}
 			} else {
 				// No confirmations required
-				tracing::info!(
-					tx_hash = %tx_hash,
-					chain_id = chain_id,
-					block_number = ?receipt.block_number,
-					"Transaction already confirmed"
-				);
 				return Ok(TransactionReceipt::from(&receipt));
 			}
 		} else {
-			tracing::error!(
-				tx_hash = %tx_hash,
-				chain_id = chain_id,
-				"Transaction reverted"
-			);
 			return Err(DeliveryError::TransactionFailed(
 				"Transaction reverted".to_string(),
 			));
@@ -575,26 +547,19 @@ async fn monitor_transaction(
 		.await
 	{
 		Ok(receipt) => {
-			tracing::info!(
-				tx_hash = %tx_hash,
-				chain_id = chain_id,
-				block_number = ?receipt.block_number,
-				"Transaction confirmed in monitoring"
-			);
-			Ok(TransactionReceipt::from(&receipt))
+			// Check status for consistency with pre-mined path
+			if receipt.status() {
+				Ok(TransactionReceipt::from(&receipt))
+			} else {
+				Err(DeliveryError::TransactionFailed(
+					"Transaction reverted".to_string(),
+				))
+			}
 		},
-		Err(e) => {
-			tracing::error!(
-				tx_hash = %tx_hash,
-				chain_id = chain_id,
-				error = %e,
-				"Transaction monitoring failed"
-			);
-			Err(DeliveryError::TransactionFailed(format!(
-				"Transaction monitoring failed: {}",
-				e
-			)))
-		},
+		Err(e) => Err(DeliveryError::TransactionFailed(format!(
+			"Transaction monitoring failed: {}",
+			e
+		))),
 	}
 }
 
