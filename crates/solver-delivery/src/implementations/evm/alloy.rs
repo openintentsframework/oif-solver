@@ -1200,7 +1200,7 @@ mod tests {
 				nonce: None,
 				gas_limit: Some(100000),
 				gas_price: None,
-				max_fee_per_gas: Some(50_000_000_000), // 50 gwei
+				max_fee_per_gas: Some(50_000_000_000),         // 50 gwei
 				max_priority_fee_per_gas: Some(2_000_000_000), // 2 gwei
 			};
 
@@ -1232,7 +1232,7 @@ mod tests {
 		#[test]
 		fn test_transaction_contract_deployment() {
 			let tx = SolverTransaction {
-				to: None, // Contract creation
+				to: None,                           // Contract creation
 				data: vec![0x60, 0x80, 0x60, 0x40], // Some bytecode
 				value: U256::from(0u64),
 				chain_id: 1,
