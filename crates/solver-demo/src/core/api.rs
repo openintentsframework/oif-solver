@@ -68,7 +68,7 @@ impl ApiClient {
 	/// # Errors
 	/// Returns error if HTTP request fails or response parsing fails
 	pub async fn get_quote(&self, request: GetQuoteRequest) -> Result<GetQuoteResponse> {
-		self.post("/api/quotes", &request).await
+		self.post("/api/v1/quotes", &request).await
 	}
 
 	/// Submits a signed order to the solver service
@@ -82,7 +82,7 @@ impl ApiClient {
 	/// # Errors
 	/// Returns error if HTTP request fails or response parsing fails
 	pub async fn submit_order(&self, request: PostOrderRequest) -> Result<PostOrderResponse> {
-		self.post("/api/orders", &request).await
+		self.post("/api/v1/orders", &request).await
 	}
 
 	/// Retrieves order status and details by order ID
@@ -96,7 +96,7 @@ impl ApiClient {
 	/// # Errors
 	/// Returns error if order not found, HTTP request fails, or response parsing fails
 	pub async fn get_order(&self, order_id: &str) -> Result<GetOrderResponse> {
-		self.get(&format!("/api/orders/{}", order_id)).await
+		self.get(&format!("/api/v1/orders/{}", order_id)).await
 	}
 
 	/// Executes a generic POST request with JSON serialization
