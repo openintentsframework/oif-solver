@@ -28,7 +28,7 @@ allocator_address = "0xb8Eb0f7851B4F5E44cFE21C856FAb5A6378AD280"
 http = "https://arb1.arbitrum.io/rpc"
 
 [[networks.42161.tokens]]
-address = "0x36AC0B9F17815e80d9D271fd5081A83FD7c1804e"
+address = "0x7e13E59a15E4703a54a0976dDd970F8Fe52d3a76"
 symbol = "Fake-USDC"
 decimals = 6
 
