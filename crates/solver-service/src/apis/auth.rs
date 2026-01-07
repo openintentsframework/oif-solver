@@ -47,7 +47,7 @@ pub struct RefreshRequest {
 	pub refresh_token: String,
 }
 
-/// Handles POST /api/auth/register requests.
+/// Handles POST /api/v1/auth/register requests.
 ///
 /// This endpoint allows clients to self-register and receive both access and refresh tokens
 /// for API authentication. The access token has a short expiry (1 hour by default) while
@@ -183,7 +183,7 @@ pub async fn register_client(
 	(StatusCode::CREATED, Json(response)).into_response()
 }
 
-/// Handles POST /api/auth/refresh requests.
+/// Handles POST /api/v1/auth/refresh requests.
 ///
 /// This endpoint exchanges a valid refresh token for new access and refresh tokens.
 /// The old refresh token is invalidated and cannot be reused.

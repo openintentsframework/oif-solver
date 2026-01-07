@@ -164,7 +164,7 @@ impl JwtService {
 	/// # Errors
 	/// Returns Error if API registration request fails or returns invalid response
 	async fn register_client(&self) -> Result<JwtTokenResponse> {
-		let url = format!("{}/api/auth/register", self.base_url);
+		let url = format!("{}/api/v1/auth/register", self.base_url);
 
 		let scopes = vec![
 			solver_types::auth::AuthScope::ReadOrders.to_string(),
@@ -260,7 +260,7 @@ impl JwtService {
 	/// # Errors
 	/// Returns Error if refresh API request fails or returns invalid response
 	async fn refresh_access_token(&self, refresh_token: &str) -> Result<JwtTokenResponse> {
-		let url = format!("{}/api/auth/refresh", self.base_url);
+		let url = format!("{}/api/v1/auth/refresh", self.base_url);
 
 		let request = json!({
 			"refresh_token": refresh_token

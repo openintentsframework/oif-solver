@@ -349,7 +349,7 @@ The solver provides a REST API for interacting with the system and submitting of
 
 #### Quotes
 
-- **POST `/api/quotes`** - Request price quotes for a cross-chain swap
+- **POST `/api/v1/quotes`** - Request price quotes for a cross-chain swap
   - Request body:
     ```json
     {
@@ -368,7 +368,7 @@ The solver provides a REST API for interacting with the system and submitting of
 
 #### Orders
 
-- **POST `/api/orders`** - Submit a new order (direct or from quote)
+- **POST `/api/v1/orders`** - Submit a new order (direct or from quote)
 
   - Quote acceptance:
     ```json
@@ -395,23 +395,23 @@ The solver provides a REST API for interacting with the system and submitting of
     }
     ```
 
-- **GET `/api/orders/{id}`** - Get order status and details
+- **GET `/api/v1/orders/{id}`** - Get order status and details
   - Returns complete order information including status, amounts, settlement data, and fill transaction
 
 #### Tokens
 
-- **GET `/api/tokens`** - Get all supported tokens across all networks
+- **GET `/api/v1/tokens`** - Get all supported tokens across all networks
 
   - Returns a map of chain IDs to network configurations with supported tokens
 
-- **GET `/api/tokens/{chain_id}`** - Get supported tokens for a specific chain
+- **GET `/api/v1/tokens/{chain_id}`** - Get supported tokens for a specific chain
   - Returns network configuration including settler addresses and token list
 
 ### Example Usage
 
 ```bash
 # Request a quote for a cross-chain swap
-curl -X POST http://localhost:3000/api/quotes \
+curl -X POST http://localhost:3000/api/v1/quotes \
   -H "Content-Type: application/json" \
   -d '{
     "user": "0x74...,
@@ -437,7 +437,7 @@ curl -X POST http://localhost:3000/api/quotes \
   }'
 
 # Accept a quote (submit order with quoteId)
-curl -X POST http://localhost:3000/api/orders \
+curl -X POST http://localhost:3000/api/v1/orders \
   -H "Content-Type: application/json" \
   -d '{
     "quoteId": "quote_abc123def456",
@@ -445,7 +445,7 @@ curl -X POST http://localhost:3000/api/orders \
   }'
 
 # Submit an order directly (without quote)
-curl -X POST http://localhost:3000/api/orders \
+curl -X POST http://localhost:3000/api/v1/orders \
   -H "Content-Type: application/json" \
   -d '{
     "order": {
@@ -465,13 +465,13 @@ curl -X POST http://localhost:3000/api/orders \
   }'
 
 # Check order status
-curl http://localhost:3000/api/orders/1fa518079ecf01372290adf75c55858771efcbcee080594cc8bc24e3309a3a09
+curl http://localhost:3000/api/v1/orders/1fa518079ecf01372290adf75c55858771efcbcee080594cc8bc24e3309a3a09
 
 # Get supported tokens for chain 31338
-curl http://localhost:3000/api/tokens/31338
+curl http://localhost:3000/api/v1/tokens/31338
 
 # Get all supported tokens
-curl http://localhost:3000/api/tokens
+curl http://localhost:3000/api/v1/tokens
 ```
 
 The API server is enabled by default on port 3000 when the solver is running. You can disable it or change the port in the configuration file.
