@@ -1,0 +1,42 @@
+# Build artifacts
+target/
+*.rlib
+*.rmeta
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+!README.md
+docs/
+
+# Test and demo files
+.oif-demo/
+scripts/
+
+# Local configuration (mount at runtime instead)
+config/*.local.toml
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Docker
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# Miscellaneous
+*.log
+*.tmp
+.env*
+.DS_Store
