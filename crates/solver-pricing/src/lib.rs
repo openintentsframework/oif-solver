@@ -57,12 +57,13 @@ pub trait PricingRegistry: ImplementationRegistry<Factory = PricingFactory> {}
 /// Re-export implementations
 pub mod implementations {
 	pub mod coingecko;
+	pub mod defillama;
 	pub mod mock;
 }
 
 /// Get all registered pricing implementations.
 pub fn get_all_implementations() -> Vec<(&'static str, PricingFactory)> {
-	use implementations::{coingecko, mock};
+	use implementations::{coingecko, defillama, mock};
 	vec![
 		(
 			mock::MockPricingRegistry::NAME,
@@ -71,6 +72,10 @@ pub fn get_all_implementations() -> Vec<(&'static str, PricingFactory)> {
 		(
 			coingecko::CoinGeckoPricingRegistry::NAME,
 			coingecko::CoinGeckoPricingRegistry::factory(),
+		),
+		(
+			defillama::DefiLlamaPricingRegistry::NAME,
+			defillama::DefiLlamaPricingRegistry::factory(),
 		),
 	]
 }
@@ -131,9 +136,12 @@ impl PricingConfig {
 }
 
 /// Service that manages asset pricing across the solver system.
+/// Supports primary implementation with optional fallbacks.
 pub struct PricingService {
 	/// The primary pricing implementation.
 	implementation: Box<dyn PricingInterface>,
+	/// Fallback pricing implementations (tried in order if primary fails).
+	fallbacks: Vec<Box<dyn PricingInterface>>,
 	/// Pricing configuration.
 	config: PricingConfig,
 }
@@ -143,6 +151,7 @@ impl PricingService {
 	pub fn new(implementation: Box<dyn PricingInterface>) -> Self {
 		Self {
 			implementation,
+			fallbacks: Vec::new(),
 			config: PricingConfig::default_values(),
 		}
 	}
@@ -154,6 +163,32 @@ impl PricingService {
 	) -> Self {
 		Self {
 			implementation,
+			fallbacks: Vec::new(),
+			config,
+		}
+	}
+
+	/// Creates a new PricingService with fallback implementations.
+	pub fn new_with_fallbacks(
+		implementation: Box<dyn PricingInterface>,
+		fallbacks: Vec<Box<dyn PricingInterface>>,
+	) -> Self {
+		Self {
+			implementation,
+			fallbacks,
+			config: PricingConfig::default_values(),
+		}
+	}
+
+	/// Creates a new PricingService with fallback implementations and config.
+	pub fn new_with_fallbacks_and_config(
+		implementation: Box<dyn PricingInterface>,
+		fallbacks: Vec<Box<dyn PricingInterface>>,
+		config: PricingConfig,
+	) -> Self {
+		Self {
+			implementation,
+			fallbacks,
 			config,
 		}
 	}
@@ -162,42 +197,147 @@ impl PricingService {
 	pub fn config(&self) -> &PricingConfig {
 		&self.config
 	}
+
 	/// Gets all supported trading pairs.
 	pub async fn get_supported_pairs(&self) -> Vec<TradingPair> {
 		self.implementation.get_supported_pairs().await
 	}
 
 	/// Converts between two assets using available pricing data.
+	/// Falls back to alternative providers if primary fails.
 	pub async fn convert_asset(
 		&self,
 		from_asset: &str,
 		to_asset: &str,
 		amount: &str,
 	) -> Result<String, PricingError> {
-		self.implementation
+		// Try primary implementation
+		match self
+			.implementation
 			.convert_asset(from_asset, to_asset, amount)
 			.await
+		{
+			Ok(result) => return Ok(result),
+			Err(e) => {
+				if self.fallbacks.is_empty() {
+					return Err(e);
+				}
+				tracing::warn!(
+					"Primary pricing provider failed for convert_asset: {}, trying fallbacks",
+					e
+				);
+			}
+		}
+
+		// Try fallbacks in order
+		for (idx, fallback) in self.fallbacks.iter().enumerate() {
+			match fallback.convert_asset(from_asset, to_asset, amount).await {
+				Ok(result) => {
+					tracing::info!("Fallback provider {} succeeded for convert_asset", idx + 1);
+					return Ok(result);
+				}
+				Err(e) => {
+					tracing::warn!("Fallback provider {} failed for convert_asset: {}", idx + 1, e);
+				}
+			}
+		}
+
+		Err(PricingError::Network(
+			"All pricing providers failed for convert_asset".to_string(),
+		))
 	}
 
 	/// Converts a wei amount to the specified currency using current ETH price.
+	/// Falls back to alternative providers if primary fails.
 	pub async fn wei_to_currency(
 		&self,
 		wei_amount: &str,
 		currency: &str,
 	) -> Result<String, PricingError> {
-		self.implementation
+		// Try primary implementation
+		match self
+			.implementation
 			.wei_to_currency(wei_amount, currency)
 			.await
+		{
+			Ok(result) => return Ok(result),
+			Err(e) => {
+				if self.fallbacks.is_empty() {
+					return Err(e);
+				}
+				tracing::warn!(
+					"Primary pricing provider failed for wei_to_currency: {}, trying fallbacks",
+					e
+				);
+			}
+		}
+
+		// Try fallbacks in order
+		for (idx, fallback) in self.fallbacks.iter().enumerate() {
+			match fallback.wei_to_currency(wei_amount, currency).await {
+				Ok(result) => {
+					tracing::info!("Fallback provider {} succeeded for wei_to_currency", idx + 1);
+					return Ok(result);
+				}
+				Err(e) => {
+					tracing::warn!(
+						"Fallback provider {} failed for wei_to_currency: {}",
+						idx + 1,
+						e
+					);
+				}
+			}
+		}
+
+		Err(PricingError::Network(
+			"All pricing providers failed for wei_to_currency".to_string(),
+		))
 	}
 
 	/// Converts a currency amount to wei using current ETH price.
+	/// Falls back to alternative providers if primary fails.
 	pub async fn currency_to_wei(
 		&self,
 		currency_amount: &str,
 		currency: &str,
 	) -> Result<String, PricingError> {
-		self.implementation
+		// Try primary implementation
+		match self
+			.implementation
 			.currency_to_wei(currency_amount, currency)
 			.await
+		{
+			Ok(result) => return Ok(result),
+			Err(e) => {
+				if self.fallbacks.is_empty() {
+					return Err(e);
+				}
+				tracing::warn!(
+					"Primary pricing provider failed for currency_to_wei: {}, trying fallbacks",
+					e
+				);
+			}
+		}
+
+		// Try fallbacks in order
+		for (idx, fallback) in self.fallbacks.iter().enumerate() {
+			match fallback.currency_to_wei(currency_amount, currency).await {
+				Ok(result) => {
+					tracing::info!("Fallback provider {} succeeded for currency_to_wei", idx + 1);
+					return Ok(result);
+				}
+				Err(e) => {
+					tracing::warn!(
+						"Fallback provider {} failed for currency_to_wei: {}",
+						idx + 1,
+						e
+					);
+				}
+			}
+		}
+
+		Err(PricingError::Network(
+			"All pricing providers failed for currency_to_wei".to_string(),
+		))
 	}
 }
