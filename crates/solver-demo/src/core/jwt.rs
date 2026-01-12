@@ -327,7 +327,7 @@ impl JwtService {
 		}
 
 		// Decode the payload (middle part)
-		use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+		use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 		let payload = URL_SAFE_NO_PAD
 			.decode(parts[1])
 			.map_err(|e| Error::Other(anyhow::anyhow!("Failed to decode token payload: {}", e)))?;

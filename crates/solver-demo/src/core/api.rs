@@ -6,7 +6,7 @@
 
 use crate::types::error::{Error, Result};
 use reqwest::{Client, Response};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Serialize};
 use solver_types::api::{
 	GetOrderResponse, GetQuoteRequest, GetQuoteResponse, PostOrderRequest, PostOrderResponse,
 };
