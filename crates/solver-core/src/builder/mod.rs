@@ -424,7 +424,10 @@ impl SolverBuilder {
 				fallback_count = %fallback_impls.len(),
 				"Pricing service initialized with fallbacks"
 			);
-			Arc::new(PricingService::new_with_fallbacks(pricing_impl, fallback_impls))
+			Arc::new(PricingService::new_with_fallbacks(
+				pricing_impl,
+				fallback_impls,
+			))
 		};
 
 		// Build oracle routes from settlement implementations

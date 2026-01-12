@@ -226,7 +226,7 @@ impl PricingService {
 					"Primary pricing provider failed for convert_asset: {}, trying fallbacks",
 					e
 				);
-			}
+			},
 		}
 
 		// Try fallbacks in order
@@ -235,10 +235,14 @@ impl PricingService {
 				Ok(result) => {
 					tracing::info!("Fallback provider {} succeeded for convert_asset", idx + 1);
 					return Ok(result);
-				}
+				},
 				Err(e) => {
-					tracing::warn!("Fallback provider {} failed for convert_asset: {}", idx + 1, e);
-				}
+					tracing::warn!(
+						"Fallback provider {} failed for convert_asset: {}",
+						idx + 1,
+						e
+					);
+				},
 			}
 		}
 
@@ -269,23 +273,26 @@ impl PricingService {
 					"Primary pricing provider failed for wei_to_currency: {}, trying fallbacks",
 					e
 				);
-			}
+			},
 		}
 
 		// Try fallbacks in order
 		for (idx, fallback) in self.fallbacks.iter().enumerate() {
 			match fallback.wei_to_currency(wei_amount, currency).await {
 				Ok(result) => {
-					tracing::info!("Fallback provider {} succeeded for wei_to_currency", idx + 1);
+					tracing::info!(
+						"Fallback provider {} succeeded for wei_to_currency",
+						idx + 1
+					);
 					return Ok(result);
-				}
+				},
 				Err(e) => {
 					tracing::warn!(
 						"Fallback provider {} failed for wei_to_currency: {}",
 						idx + 1,
 						e
 					);
-				}
+				},
 			}
 		}
 
@@ -316,23 +323,26 @@ impl PricingService {
 					"Primary pricing provider failed for currency_to_wei: {}, trying fallbacks",
 					e
 				);
-			}
+			},
 		}
 
 		// Try fallbacks in order
 		for (idx, fallback) in self.fallbacks.iter().enumerate() {
 			match fallback.currency_to_wei(currency_amount, currency).await {
 				Ok(result) => {
-					tracing::info!("Fallback provider {} succeeded for currency_to_wei", idx + 1);
+					tracing::info!(
+						"Fallback provider {} succeeded for currency_to_wei",
+						idx + 1
+					);
 					return Ok(result);
-				}
+				},
 				Err(e) => {
 					tracing::warn!(
 						"Fallback provider {} failed for currency_to_wei: {}",
 						idx + 1,
 						e
 					);
-				}
+				},
 			}
 		}
 
