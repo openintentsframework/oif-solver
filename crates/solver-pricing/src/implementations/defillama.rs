@@ -585,6 +585,38 @@ mod tests {
 		.unwrap()
 	}
 
+	fn config_with_custom_base_url() -> toml::Value {
+		toml::from_str(
+			r#"
+            base_url = "https://custom.llama.fi"
+            cache_duration_seconds = 120
+        "#,
+		)
+		.unwrap()
+	}
+
+	fn config_with_custom_token_map() -> toml::Value {
+		toml::from_str(
+			r#"
+            [token_id_map]
+            MYTOKEN = "coingecko:my-custom-token"
+            CUSTOM = "coingecko:custom-coin"
+        "#,
+		)
+		.unwrap()
+	}
+
+	fn config_with_float_custom_prices() -> toml::Value {
+		toml::from_str(
+			r#"
+            [custom_prices]
+            ETH = 3000.123
+            SOL = 150
+        "#,
+		)
+		.unwrap()
+	}
+
 	#[test]
 	fn test_new_default_config() {
 		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
@@ -712,5 +744,275 @@ mod tests {
 		)
 		.unwrap();
 		assert!(schema.validate(&bad_config).is_err());
+	}
+
+	#[test]
+	fn test_new_with_custom_base_url() {
+		let pricing = DefiLlamaPricing::new(&config_with_custom_base_url()).unwrap();
+		assert_eq!(pricing.base_url, "https://custom.llama.fi");
+		assert_eq!(pricing.cache_duration, 120);
+	}
+
+	#[test]
+	fn test_custom_token_mapping() {
+		let pricing = DefiLlamaPricing::new(&config_with_custom_token_map()).unwrap();
+		assert_eq!(
+			pricing.get_defillama_id("MYTOKEN"),
+			Some("coingecko:my-custom-token".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("CUSTOM"),
+			Some("coingecko:custom-coin".to_string())
+		);
+		// Should still have defaults
+		assert_eq!(
+			pricing.get_defillama_id("ETH"),
+			Some("coingecko:ethereum".to_string())
+		);
+	}
+
+	#[tokio::test]
+	async fn test_custom_price_float_format() {
+		let pricing = DefiLlamaPricing::new(&config_with_float_custom_prices()).unwrap();
+		let result = pricing.get_price("ETH", "USD").await.unwrap();
+		assert_eq!(result, "3000.123");
+	}
+
+	#[tokio::test]
+	async fn test_custom_price_integer_format() {
+		let pricing = DefiLlamaPricing::new(&config_with_float_custom_prices()).unwrap();
+		let result = pricing.get_price("SOL", "USD").await.unwrap();
+		assert_eq!(result, "150");
+	}
+
+	#[tokio::test]
+	async fn test_convert_asset_with_custom_prices() {
+		let pricing = DefiLlamaPricing::new(&config_with_custom_prices()).unwrap();
+		// Convert 2 ETH to USD at $3000.50 each = $6001.00
+		let result = pricing.convert_asset("ETH", "USD", "2").await.unwrap();
+		assert_eq!(result, "6001.00");
+	}
+
+	#[tokio::test]
+	async fn test_convert_asset_usd_to_crypto() {
+		let pricing = DefiLlamaPricing::new(&config_with_custom_prices()).unwrap();
+		// Convert $6001 USD to ETH at $3000.50 per ETH
+		let result = pricing.convert_asset("USD", "ETH", "6001").await.unwrap();
+		// $6001 / $3000.50 = ~1.9996667...
+		let result_decimal: Decimal = result.parse().unwrap();
+		assert!(result_decimal > Decimal::from(1));
+		assert!(result_decimal < Decimal::from(3));
+	}
+
+	#[tokio::test]
+	async fn test_wei_to_currency_with_custom_eth_price() {
+		let pricing = DefiLlamaPricing::new(&config_with_custom_prices()).unwrap();
+		// 1 ETH in wei = 1000000000000000000
+		let result = pricing
+			.wei_to_currency("1000000000000000000", "USD")
+			.await
+			.unwrap();
+		// Should be $3000.50 (with 8 decimal places)
+		assert_eq!(result, "3000.50000000");
+	}
+
+	#[tokio::test]
+	async fn test_currency_to_wei_non_usd() {
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
+		let result = pricing.currency_to_wei("100", "EUR").await;
+		assert!(matches!(result, Err(PricingError::PriceNotAvailable(_))));
+	}
+
+	#[tokio::test]
+	async fn test_currency_to_wei_with_custom_price() {
+		let pricing = DefiLlamaPricing::new(&config_with_custom_prices()).unwrap();
+		// $3000.50 USD = 1 ETH = 1000000000000000000 wei
+		let result = pricing.currency_to_wei("3000.50", "USD").await.unwrap();
+		// Should be approximately 1 ETH in wei
+		let wei: u128 = result.parse().unwrap();
+		let one_eth_wei: u128 = 1_000_000_000_000_000_000;
+		// Allow small precision difference
+		assert!(wei > one_eth_wei - 1_000_000_000_000_000);
+		assert!(wei < one_eth_wei + 1_000_000_000_000_000);
+	}
+
+	#[test]
+	fn test_config_schema_invalid_base_url_type() {
+		let schema = DefiLlamaConfigSchema;
+		let bad_config = toml::from_str(
+			r#"
+            base_url = 123
+        "#,
+		)
+		.unwrap();
+		assert!(schema.validate(&bad_config).is_err());
+	}
+
+	#[test]
+	fn test_config_schema_invalid_cache_duration_type() {
+		let schema = DefiLlamaConfigSchema;
+		let bad_config = toml::from_str(
+			r#"
+            cache_duration_seconds = "not_a_number"
+        "#,
+		)
+		.unwrap();
+		assert!(schema.validate(&bad_config).is_err());
+	}
+
+	#[test]
+	fn test_config_schema_invalid_token_map_not_table() {
+		let schema = DefiLlamaConfigSchema;
+		let bad_config = toml::from_str(
+			r#"
+            token_id_map = "invalid"
+        "#,
+		)
+		.unwrap();
+		assert!(schema.validate(&bad_config).is_err());
+	}
+
+	#[test]
+	fn test_config_schema_invalid_token_map_value() {
+		let schema = DefiLlamaConfigSchema;
+		let bad_config = toml::from_str(
+			r#"
+            [token_id_map]
+            MYTOKEN = 123
+        "#,
+		)
+		.unwrap();
+		assert!(schema.validate(&bad_config).is_err());
+	}
+
+	#[test]
+	fn test_config_schema_invalid_custom_prices_not_table() {
+		let schema = DefiLlamaConfigSchema;
+		let bad_config = toml::from_str(
+			r#"
+            custom_prices = "invalid"
+        "#,
+		)
+		.unwrap();
+		assert!(schema.validate(&bad_config).is_err());
+	}
+
+	#[test]
+	fn test_config_schema_valid_float_prices() {
+		let schema = DefiLlamaConfigSchema;
+		assert!(schema.validate(&config_with_float_custom_prices()).is_ok());
+	}
+
+	#[test]
+	fn test_registry_name() {
+		assert_eq!(DefiLlamaPricingRegistry::NAME, "defillama");
+	}
+
+	#[test]
+	fn test_factory_function() {
+		let config = minimal_config();
+		let result = create_defillama_pricing(&config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_config_schema_method() {
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
+		let schema = pricing.config_schema();
+		assert!(schema.validate(&minimal_config()).is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_cache_hit() {
+		let pricing = DefiLlamaPricing::new(&config_with_custom_prices()).unwrap();
+		// First call should populate cache
+		let result1 = pricing.get_price("ETH", "USD").await.unwrap();
+		// Second call should hit cache
+		let result2 = pricing.get_price("ETH", "USD").await.unwrap();
+		assert_eq!(result1, result2);
+		assert_eq!(result1, "3000.50");
+	}
+
+	#[tokio::test]
+	async fn test_get_pair_price_with_usd_base() {
+		let pricing = DefiLlamaPricing::new(&config_with_custom_prices()).unwrap();
+		// USD/ETH should give inverse of ETH/USD
+		let pair = TradingPair::new("USD", "ETH");
+		let result = pricing.get_pair_price(&pair).await.unwrap();
+		let result_decimal: Decimal = result.parse().unwrap();
+		// 1/3000.50 ≈ 0.000333...
+		assert!(result_decimal > Decimal::ZERO);
+		assert!(result_decimal < Decimal::ONE);
+	}
+
+	#[tokio::test]
+	async fn test_convert_asset_crypto_to_crypto_fails() {
+		let pricing = DefiLlamaPricing::new(&config_with_custom_prices()).unwrap();
+		// ETH to BTC should fail (non-USD pair)
+		let result = pricing.convert_asset("ETH", "BTC", "1").await;
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_default_token_mappings() {
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
+		// Check various default mappings
+		assert_eq!(
+			pricing.get_defillama_id("ETHEREUM"),
+			Some("coingecko:ethereum".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("SOLANA"),
+			Some("coingecko:solana".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("BITCOIN"),
+			Some("coingecko:bitcoin".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("USDC"),
+			Some("coingecko:usd-coin".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("USDT"),
+			Some("coingecko:tether".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("DAI"),
+			Some("coingecko:dai".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("WBTC"),
+			Some("coingecko:wrapped-bitcoin".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("MATIC"),
+			Some("coingecko:matic-network".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("ARB"),
+			Some("coingecko:arbitrum".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("OP"),
+			Some("coingecko:optimism".to_string())
+		);
+	}
+
+	#[test]
+	fn test_get_defillama_id_case_insensitive() {
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
+		assert_eq!(
+			pricing.get_defillama_id("eth"),
+			Some("coingecko:ethereum".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("Eth"),
+			Some("coingecko:ethereum".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("ETH"),
+			Some("coingecko:ethereum".to_string())
+		);
 	}
 }
