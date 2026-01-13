@@ -415,20 +415,15 @@ impl SolverBuilder {
 			}
 		}
 
-		let pricing = if fallback_impls.is_empty() {
-			Arc::new(PricingService::new(pricing_impl))
-		} else {
+		if !fallback_impls.is_empty() {
 			tracing::info!(
 				component = "pricing",
 				primary = %primary_pricing,
 				fallback_count = %fallback_impls.len(),
 				"Pricing service initialized with fallbacks"
 			);
-			Arc::new(PricingService::new_with_fallbacks(
-				pricing_impl,
-				fallback_impls,
-			))
-		};
+		}
+		let pricing = Arc::new(PricingService::new(pricing_impl, fallback_impls));
 
 		// Build oracle routes from settlement implementations
 		let oracle_routes = settlement.build_oracle_routes();

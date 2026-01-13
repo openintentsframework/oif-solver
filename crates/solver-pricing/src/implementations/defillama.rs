@@ -2,7 +2,6 @@
 //!
 //! This implementation provides real-time asset prices from DeFiLlama API.
 //! DeFiLlama is a free, open-source API with no rate limits for basic usage.
-//! Used as a fallback when CoinGecko is unavailable.
 
 use crate::{PricingFactory, PricingInterface, PricingRegistry};
 use alloy_primitives::utils::parse_ether;
@@ -40,7 +39,7 @@ pub struct DefiLlamaPricing {
 	price_cache: Arc<RwLock<HashMap<String, PriceCacheEntry>>>,
 	/// Cache duration in seconds
 	cache_duration: u64,
-	/// Map of token symbols to DeFiLlama coin IDs (coingecko: prefix)
+	/// Map of token symbols (e.g., "ETH") to DeFiLlama coin IDs (e.g., "coingecko:ethereum")
 	token_id_map: HashMap<String, String>,
 	/// Custom fixed prices for tokens (useful for testing/demo)
 	custom_prices: HashMap<String, String>,
@@ -83,24 +82,11 @@ impl DefiLlamaPricing {
 			.and_then(|v| v.as_integer())
 			.unwrap_or(60) as u64;
 
-		// Build token ID map - DeFiLlama uses coingecko IDs with "coingecko:" prefix
-		let mut token_id_map = HashMap::new();
-
-		// Default mappings using coingecko IDs
-		token_id_map.insert("ETH".to_string(), "coingecko:ethereum".to_string());
-		token_id_map.insert("ETHEREUM".to_string(), "coingecko:ethereum".to_string());
-		token_id_map.insert("SOL".to_string(), "coingecko:solana".to_string());
-		token_id_map.insert("SOLANA".to_string(), "coingecko:solana".to_string());
-		token_id_map.insert("BTC".to_string(), "coingecko:bitcoin".to_string());
-		token_id_map.insert("BITCOIN".to_string(), "coingecko:bitcoin".to_string());
-		token_id_map.insert("USDC".to_string(), "coingecko:usd-coin".to_string());
-		token_id_map.insert("USDT".to_string(), "coingecko:tether".to_string());
-		token_id_map.insert("DAI".to_string(), "coingecko:dai".to_string());
-		token_id_map.insert("WETH".to_string(), "coingecko:ethereum".to_string());
-		token_id_map.insert("WBTC".to_string(), "coingecko:wrapped-bitcoin".to_string());
-		token_id_map.insert("MATIC".to_string(), "coingecko:matic-network".to_string());
-		token_id_map.insert("ARB".to_string(), "coingecko:arbitrum".to_string());
-		token_id_map.insert("OP".to_string(), "coingecko:optimism".to_string());
+		// Build token ID map from shared defaults, adding "coingecko:" prefix for DeFiLlama API
+		let mut token_id_map: HashMap<String, String> = crate::DEFAULT_TOKEN_MAPPINGS
+			.iter()
+			.map(|(symbol, id)| (symbol.to_string(), format!("coingecko:{}", id)))
+			.collect();
 
 		// Allow custom token mappings
 		if let Some(custom_tokens) = config.get("token_id_map").and_then(|v| v.as_table()) {

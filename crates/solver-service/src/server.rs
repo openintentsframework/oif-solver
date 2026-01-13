@@ -714,7 +714,7 @@ mod tests {
 
 		let pricing_impl = create_mock_pricing(&toml::Value::Table(toml::value::Table::new()))
 			.expect("failed to create mock pricing");
-		let pricing = Arc::new(PricingService::new(pricing_impl));
+		let pricing = Arc::new(PricingService::new(pricing_impl, Vec::new()));
 
 		let event_bus = EventBus::new(10);
 

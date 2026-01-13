@@ -61,6 +61,24 @@ pub mod implementations {
 	pub mod mock;
 }
 
+/// Default token symbol
+pub const DEFAULT_TOKEN_MAPPINGS: &[(&str, &str)] = &[
+	("ETH", "ethereum"),
+	("ETHEREUM", "ethereum"),
+	("SOL", "solana"),
+	("SOLANA", "solana"),
+	("BTC", "bitcoin"),
+	("BITCOIN", "bitcoin"),
+	("USDC", "usd-coin"),
+	("USDT", "tether"),
+	("DAI", "dai"),
+	("WETH", "ethereum"),
+	("WBTC", "wrapped-bitcoin"),
+	("MATIC", "matic-network"),
+	("ARB", "arbitrum"),
+	("OP", "optimism"),
+];
+
 /// Get all registered pricing implementations.
 pub fn get_all_implementations() -> Vec<(&'static str, PricingFactory)> {
 	use implementations::{coingecko, defillama, mock};
@@ -135,6 +153,49 @@ impl PricingConfig {
 	}
 }
 
+/// Macro to reduce duplication of fallback logic across pricing methods.
+macro_rules! try_with_fallback {
+	($self:expr, $op_name:expr, $method:ident($($arg:expr),*)) => {{
+		// Try primary implementation
+		match $self.implementation.$method($($arg),*).await {
+			Ok(result) => return Ok(result),
+			Err(e) => {
+				if $self.fallbacks.is_empty() {
+					return Err(e);
+				}
+				tracing::warn!(
+					"Primary pricing provider failed for {}: {}, trying fallbacks",
+					$op_name,
+					e
+				);
+			},
+		}
+
+		// Try fallbacks in order
+		for (idx, fallback) in $self.fallbacks.iter().enumerate() {
+			match fallback.$method($($arg),*).await {
+				Ok(result) => {
+					tracing::debug!("Fallback provider {} succeeded for {}", idx + 1, $op_name);
+					return Ok(result);
+				},
+				Err(e) => {
+					tracing::warn!(
+						"Fallback provider {} failed for {}: {}",
+						idx + 1,
+						$op_name,
+						e
+					);
+				},
+			}
+		}
+
+		Err(PricingError::Network(format!(
+			"All pricing providers failed for {}",
+			$op_name
+		)))
+	}};
+}
+
 /// Service that manages asset pricing across the solver system.
 /// Supports primary implementation with optional fallbacks.
 pub struct PricingService {
@@ -147,29 +208,12 @@ pub struct PricingService {
 }
 
 impl PricingService {
-	/// Creates a new PricingService with the specified implementation and default config.
-	pub fn new(implementation: Box<dyn PricingInterface>) -> Self {
-		Self {
-			implementation,
-			fallbacks: Vec::new(),
-			config: PricingConfig::default_values(),
-		}
-	}
-
-	/// Creates a new PricingService with the specified implementation and config.
-	pub fn new_with_config(
-		implementation: Box<dyn PricingInterface>,
-		config: PricingConfig,
-	) -> Self {
-		Self {
-			implementation,
-			fallbacks: Vec::new(),
-			config,
-		}
-	}
-
-	/// Creates a new PricingService with fallback implementations.
-	pub fn new_with_fallbacks(
+	/// Creates a new PricingService with the specified implementation.
+	///
+	/// # Arguments
+	/// * `implementation` - The primary pricing implementation
+	/// * `fallbacks` - Fallback implementations (tried in order if primary fails)
+	pub fn new(
 		implementation: Box<dyn PricingInterface>,
 		fallbacks: Vec<Box<dyn PricingInterface>>,
 	) -> Self {
@@ -180,8 +224,13 @@ impl PricingService {
 		}
 	}
 
-	/// Creates a new PricingService with fallback implementations and config.
-	pub fn new_with_fallbacks_and_config(
+	/// Creates a new PricingService with the specified implementation and config.
+	///
+	/// # Arguments
+	/// * `implementation` - The primary pricing implementation
+	/// * `fallbacks` - Fallback implementations (tried in order if primary fails)
+	/// * `config` - Pricing configuration
+	pub fn new_with_config(
 		implementation: Box<dyn PricingInterface>,
 		fallbacks: Vec<Box<dyn PricingInterface>>,
 		config: PricingConfig,
@@ -211,44 +260,11 @@ impl PricingService {
 		to_asset: &str,
 		amount: &str,
 	) -> Result<String, PricingError> {
-		// Try primary implementation
-		match self
-			.implementation
-			.convert_asset(from_asset, to_asset, amount)
-			.await
-		{
-			Ok(result) => return Ok(result),
-			Err(e) => {
-				if self.fallbacks.is_empty() {
-					return Err(e);
-				}
-				tracing::warn!(
-					"Primary pricing provider failed for convert_asset: {}, trying fallbacks",
-					e
-				);
-			},
-		}
-
-		// Try fallbacks in order
-		for (idx, fallback) in self.fallbacks.iter().enumerate() {
-			match fallback.convert_asset(from_asset, to_asset, amount).await {
-				Ok(result) => {
-					tracing::info!("Fallback provider {} succeeded for convert_asset", idx + 1);
-					return Ok(result);
-				},
-				Err(e) => {
-					tracing::warn!(
-						"Fallback provider {} failed for convert_asset: {}",
-						idx + 1,
-						e
-					);
-				},
-			}
-		}
-
-		Err(PricingError::Network(
-			"All pricing providers failed for convert_asset".to_string(),
-		))
+		try_with_fallback!(
+			self,
+			"convert_asset",
+			convert_asset(from_asset, to_asset, amount)
+		)
 	}
 
 	/// Converts a wei amount to the specified currency using current ETH price.
@@ -258,47 +274,7 @@ impl PricingService {
 		wei_amount: &str,
 		currency: &str,
 	) -> Result<String, PricingError> {
-		// Try primary implementation
-		match self
-			.implementation
-			.wei_to_currency(wei_amount, currency)
-			.await
-		{
-			Ok(result) => return Ok(result),
-			Err(e) => {
-				if self.fallbacks.is_empty() {
-					return Err(e);
-				}
-				tracing::warn!(
-					"Primary pricing provider failed for wei_to_currency: {}, trying fallbacks",
-					e
-				);
-			},
-		}
-
-		// Try fallbacks in order
-		for (idx, fallback) in self.fallbacks.iter().enumerate() {
-			match fallback.wei_to_currency(wei_amount, currency).await {
-				Ok(result) => {
-					tracing::info!(
-						"Fallback provider {} succeeded for wei_to_currency",
-						idx + 1
-					);
-					return Ok(result);
-				},
-				Err(e) => {
-					tracing::warn!(
-						"Fallback provider {} failed for wei_to_currency: {}",
-						idx + 1,
-						e
-					);
-				},
-			}
-		}
-
-		Err(PricingError::Network(
-			"All pricing providers failed for wei_to_currency".to_string(),
-		))
+		try_with_fallback!(self, "wei_to_currency", wei_to_currency(wei_amount, currency))
 	}
 
 	/// Converts a currency amount to wei using current ETH price.
@@ -308,46 +284,321 @@ impl PricingService {
 		currency_amount: &str,
 		currency: &str,
 	) -> Result<String, PricingError> {
-		// Try primary implementation
-		match self
-			.implementation
-			.currency_to_wei(currency_amount, currency)
-			.await
-		{
-			Ok(result) => return Ok(result),
-			Err(e) => {
-				if self.fallbacks.is_empty() {
-					return Err(e);
-				}
-				tracing::warn!(
-					"Primary pricing provider failed for currency_to_wei: {}, trying fallbacks",
-					e
-				);
-			},
+		try_with_fallback!(
+			self,
+			"currency_to_wei",
+			currency_to_wei(currency_amount, currency)
+		)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// Tests for PricingConfig
+	#[test]
+	fn test_pricing_config_default_values() {
+		let config = PricingConfig::default_values();
+		assert_eq!(config.currency, "USD");
+		assert_eq!(config.commission_bps, 20);
+		assert_eq!(config.gas_buffer_bps, 1000);
+		assert_eq!(config.rate_buffer_bps, 14);
+		assert!(!config.enable_live_gas_estimate);
+	}
+
+	#[test]
+	fn test_pricing_config_from_empty_table() {
+		let table = toml::Value::Table(toml::map::Map::new());
+		let config = PricingConfig::from_table(&table);
+		// Should use all defaults
+		assert_eq!(config.currency, "USD");
+		assert_eq!(config.commission_bps, 20);
+		assert_eq!(config.gas_buffer_bps, 1000);
+		assert_eq!(config.rate_buffer_bps, 14);
+		assert!(!config.enable_live_gas_estimate);
+	}
+
+	#[test]
+	fn test_pricing_config_from_table_with_values() {
+		let table: toml::Value = toml::from_str(
+			r#"
+			pricing_currency = "EUR"
+			commission_bps = 50
+			gas_buffer_bps = 500
+			rate_buffer_bps = 25
+			enable_live_gas_estimate = true
+		"#,
+		)
+		.unwrap();
+		let config = PricingConfig::from_table(&table);
+		assert_eq!(config.currency, "EUR");
+		assert_eq!(config.commission_bps, 50);
+		assert_eq!(config.gas_buffer_bps, 500);
+		assert_eq!(config.rate_buffer_bps, 25);
+		assert!(config.enable_live_gas_estimate);
+	}
+
+	#[test]
+	fn test_pricing_config_from_table_partial_values() {
+		let table: toml::Value = toml::from_str(
+			r#"
+			pricing_currency = "GBP"
+			commission_bps = 30
+		"#,
+		)
+		.unwrap();
+		let config = PricingConfig::from_table(&table);
+		assert_eq!(config.currency, "GBP");
+		assert_eq!(config.commission_bps, 30);
+		// These should use defaults
+		assert_eq!(config.gas_buffer_bps, 1000);
+		assert_eq!(config.rate_buffer_bps, 14);
+		assert!(!config.enable_live_gas_estimate);
+	}
+
+	#[test]
+	fn test_get_all_implementations() {
+		let implementations = get_all_implementations();
+		assert_eq!(implementations.len(), 3);
+
+		let names: Vec<&str> = implementations.iter().map(|(name, _)| *name).collect();
+		assert!(names.contains(&"mock"));
+		assert!(names.contains(&"coingecko"));
+		assert!(names.contains(&"defillama"));
+	}
+
+	#[test]
+	fn test_default_token_mappings() {
+		assert!(!DEFAULT_TOKEN_MAPPINGS.is_empty());
+		// Check some key mappings exist
+		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("ETH", "ethereum")));
+		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("BTC", "bitcoin")));
+		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("USDC", "usd-coin")));
+	}
+
+	// Tests for PricingService using mock implementation
+	mod pricing_service_tests {
+		use super::*;
+		use implementations::mock::create_mock_pricing;
+		use solver_types::ConfigSchema;
+
+		fn create_test_pricing() -> Box<dyn PricingInterface> {
+			let config = toml::Value::Table(toml::map::Map::new());
+			create_mock_pricing(&config).unwrap()
 		}
 
-		// Try fallbacks in order
-		for (idx, fallback) in self.fallbacks.iter().enumerate() {
-			match fallback.currency_to_wei(currency_amount, currency).await {
-				Ok(result) => {
-					tracing::info!(
-						"Fallback provider {} succeeded for currency_to_wei",
-						idx + 1
-					);
-					return Ok(result);
-				},
-				Err(e) => {
-					tracing::warn!(
-						"Fallback provider {} failed for currency_to_wei: {}",
-						idx + 1,
-						e
-					);
-				},
+		/// A pricing implementation that always fails - for testing fallback logic
+		struct FailingPricing;
+
+		struct FailingConfigSchema;
+
+		impl ConfigSchema for FailingConfigSchema {
+			fn validate(&self, _config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+				Ok(())
 			}
 		}
 
-		Err(PricingError::Network(
-			"All pricing providers failed for currency_to_wei".to_string(),
-		))
+		#[async_trait]
+		impl PricingInterface for FailingPricing {
+			fn config_schema(&self) -> Box<dyn ConfigSchema> {
+				Box::new(FailingConfigSchema)
+			}
+
+			async fn get_supported_pairs(&self) -> Vec<TradingPair> {
+				Vec::new()
+			}
+
+			async fn convert_asset(
+				&self,
+				_from_asset: &str,
+				_to_asset: &str,
+				_amount: &str,
+			) -> Result<String, PricingError> {
+				Err(PricingError::Network("Simulated failure".to_string()))
+			}
+
+			async fn wei_to_currency(
+				&self,
+				_wei_amount: &str,
+				_currency: &str,
+			) -> Result<String, PricingError> {
+				Err(PricingError::Network("Simulated failure".to_string()))
+			}
+
+			async fn currency_to_wei(
+				&self,
+				_currency_amount: &str,
+				_currency: &str,
+			) -> Result<String, PricingError> {
+				Err(PricingError::Network("Simulated failure".to_string()))
+			}
+		}
+
+		#[tokio::test]
+		async fn test_pricing_service_new() {
+			let primary = create_test_pricing();
+			let service = PricingService::new(primary, Vec::new());
+			assert_eq!(service.config().currency, "USD");
+		}
+
+		#[tokio::test]
+		async fn test_pricing_service_new_with_config() {
+			let primary = create_test_pricing();
+			let config = PricingConfig {
+				currency: "EUR".to_string(),
+				commission_bps: 50,
+				gas_buffer_bps: 500,
+				rate_buffer_bps: 25,
+				enable_live_gas_estimate: true,
+			};
+			let service = PricingService::new_with_config(primary, Vec::new(), config);
+			assert_eq!(service.config().currency, "EUR");
+			assert_eq!(service.config().commission_bps, 50);
+		}
+
+		#[tokio::test]
+		async fn test_pricing_service_get_supported_pairs() {
+			let primary = create_test_pricing();
+			let service = PricingService::new(primary, Vec::new());
+			let pairs = service.get_supported_pairs().await;
+			assert!(!pairs.is_empty());
+		}
+
+		#[tokio::test]
+		async fn test_pricing_service_convert_asset_primary_success() {
+			let primary = create_test_pricing();
+			let service = PricingService::new(primary, Vec::new());
+			// Same asset conversion should always work
+			let result = service.convert_asset("ETH", "ETH", "1.0").await;
+			assert!(result.is_ok());
+			assert_eq!(result.unwrap(), "1.0");
+		}
+
+		#[tokio::test]
+		async fn test_pricing_service_wei_to_currency() {
+			let primary = create_test_pricing();
+			let service = PricingService::new(primary, Vec::new());
+			let result = service.wei_to_currency("1000000000000000000", "USD").await;
+			assert!(result.is_ok());
+		}
+
+		#[tokio::test]
+		async fn test_pricing_service_currency_to_wei() {
+			let primary = create_test_pricing();
+			let service = PricingService::new(primary, Vec::new());
+			let result = service.currency_to_wei("3000", "USD").await;
+			assert!(result.is_ok());
+		}
+
+		#[tokio::test]
+		async fn test_pricing_service_with_fallback_primary_success() {
+			let primary = create_test_pricing();
+			let fallback = create_test_pricing();
+			let service = PricingService::new(primary, vec![fallback]);
+			// Primary should succeed, fallback not used
+			let result = service.convert_asset("ETH", "ETH", "1.0").await;
+			assert!(result.is_ok());
+		}
+
+		#[tokio::test]
+		async fn test_pricing_service_convert_asset_to_usd() {
+			let primary = create_test_pricing();
+			let service = PricingService::new(primary, Vec::new());
+			let result = service.convert_asset("ETH", "USD", "1.0").await;
+			assert!(result.is_ok());
+			// Mock returns 3000 for ETH/USD
+			let value: f64 = result.unwrap().parse().unwrap();
+			assert!(value > 0.0);
+		}
+
+		// Fallback tests
+		#[tokio::test]
+		async fn test_primary_fails_no_fallback_returns_error() {
+			let primary: Box<dyn PricingInterface> = Box::new(FailingPricing);
+			let service = PricingService::new(primary, Vec::new());
+
+			let result = service.convert_asset("ETH", "USD", "1.0").await;
+			assert!(result.is_err());
+			assert!(matches!(result, Err(PricingError::Network(_))));
+		}
+
+		#[tokio::test]
+		async fn test_primary_fails_fallback_succeeds() {
+			let primary: Box<dyn PricingInterface> = Box::new(FailingPricing);
+			let fallback = create_test_pricing();
+			let service = PricingService::new(primary, vec![fallback]);
+
+			let result = service.convert_asset("ETH", "USD", "1.0").await;
+			assert!(result.is_ok());
+		}
+
+		#[tokio::test]
+		async fn test_primary_fails_all_fallbacks_fail() {
+			let primary: Box<dyn PricingInterface> = Box::new(FailingPricing);
+			let fallback1: Box<dyn PricingInterface> = Box::new(FailingPricing);
+			let fallback2: Box<dyn PricingInterface> = Box::new(FailingPricing);
+			let service = PricingService::new(primary, vec![fallback1, fallback2]);
+
+			let result = service.convert_asset("ETH", "USD", "1.0").await;
+			assert!(result.is_err());
+			// Should mention all providers failed
+			if let Err(PricingError::Network(msg)) = result {
+				assert!(msg.contains("All pricing providers failed"));
+			} else {
+				panic!("Expected Network error");
+			}
+		}
+
+		#[tokio::test]
+		async fn test_wei_to_currency_primary_fails_fallback_succeeds() {
+			let primary: Box<dyn PricingInterface> = Box::new(FailingPricing);
+			let fallback = create_test_pricing();
+			let service = PricingService::new(primary, vec![fallback]);
+
+			let result = service.wei_to_currency("1000000000000000000", "USD").await;
+			assert!(result.is_ok());
+		}
+
+		#[tokio::test]
+		async fn test_wei_to_currency_all_fail() {
+			let primary: Box<dyn PricingInterface> = Box::new(FailingPricing);
+			let fallback: Box<dyn PricingInterface> = Box::new(FailingPricing);
+			let service = PricingService::new(primary, vec![fallback]);
+
+			let result = service.wei_to_currency("1000000000000000000", "USD").await;
+			assert!(result.is_err());
+		}
+
+		#[tokio::test]
+		async fn test_currency_to_wei_primary_fails_fallback_succeeds() {
+			let primary: Box<dyn PricingInterface> = Box::new(FailingPricing);
+			let fallback = create_test_pricing();
+			let service = PricingService::new(primary, vec![fallback]);
+
+			let result = service.currency_to_wei("3000", "USD").await;
+			assert!(result.is_ok());
+		}
+
+		#[tokio::test]
+		async fn test_currency_to_wei_all_fail() {
+			let primary: Box<dyn PricingInterface> = Box::new(FailingPricing);
+			let fallback: Box<dyn PricingInterface> = Box::new(FailingPricing);
+			let service = PricingService::new(primary, vec![fallback]);
+
+			let result = service.currency_to_wei("3000", "USD").await;
+			assert!(result.is_err());
+		}
+
+		#[tokio::test]
+		async fn test_multiple_fallbacks_second_succeeds() {
+			let primary: Box<dyn PricingInterface> = Box::new(FailingPricing);
+			let fallback1: Box<dyn PricingInterface> = Box::new(FailingPricing);
+			let fallback2 = create_test_pricing(); // This one succeeds
+			let service = PricingService::new(primary, vec![fallback1, fallback2]);
+
+			let result = service.convert_asset("ETH", "USD", "1.0").await;
+			assert!(result.is_ok());
+		}
 	}
 }

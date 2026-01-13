@@ -94,24 +94,11 @@ impl CoinGeckoPricing {
 			.and_then(|v| v.as_integer())
 			.unwrap_or(if api_key.is_some() { 100 } else { 1200 }) as u64; // Pro: 100ms, Free: 1.2s
 
-		// Build token ID map
-		let mut token_id_map = HashMap::new();
-
-		// Default mappings
-		token_id_map.insert("ETH".to_string(), "ethereum".to_string());
-		token_id_map.insert("ETHEREUM".to_string(), "ethereum".to_string());
-		token_id_map.insert("SOL".to_string(), "solana".to_string());
-		token_id_map.insert("SOLANA".to_string(), "solana".to_string());
-		token_id_map.insert("BTC".to_string(), "bitcoin".to_string());
-		token_id_map.insert("BITCOIN".to_string(), "bitcoin".to_string());
-		token_id_map.insert("USDC".to_string(), "usd-coin".to_string());
-		token_id_map.insert("USDT".to_string(), "tether".to_string());
-		token_id_map.insert("DAI".to_string(), "dai".to_string());
-		token_id_map.insert("WETH".to_string(), "ethereum".to_string());
-		token_id_map.insert("WBTC".to_string(), "wrapped-bitcoin".to_string());
-		token_id_map.insert("MATIC".to_string(), "matic-network".to_string());
-		token_id_map.insert("ARB".to_string(), "arbitrum".to_string());
-		token_id_map.insert("OP".to_string(), "optimism".to_string());
+		// Build token ID map from shared defaults
+		let mut token_id_map: HashMap<String, String> = crate::DEFAULT_TOKEN_MAPPINGS
+			.iter()
+			.map(|(symbol, id)| (symbol.to_string(), id.to_string()))
+			.collect();
 
 		// Allow custom token mappings
 		if let Some(custom_tokens) = config.get("token_id_map").and_then(|v| v.as_table()) {
