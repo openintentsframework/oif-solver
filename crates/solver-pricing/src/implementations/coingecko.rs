@@ -172,6 +172,7 @@ impl CoinGeckoPricing {
 
 		let client = Client::builder()
 			.default_headers(headers)
+			.user_agent("oif-solver/0.1.0 (https://github.com/openintentsframework/oif-solver)")
 			.timeout(Duration::from_secs(30))
 			.build()
 			.map_err(|e| PricingError::Network(format!("Failed to create HTTP client: {}", e)))?;
