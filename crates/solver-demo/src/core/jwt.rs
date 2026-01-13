@@ -164,7 +164,7 @@ impl JwtService {
 	/// # Errors
 	/// Returns Error if API registration request fails or returns invalid response
 	async fn register_client(&self) -> Result<JwtTokenResponse> {
-		let url = format!("{}/api/auth/register", self.base_url);
+		let url = format!("{}/api/v1/auth/register", self.base_url);
 
 		let scopes = vec![
 			solver_types::auth::AuthScope::ReadOrders.to_string(),
@@ -260,7 +260,7 @@ impl JwtService {
 	/// # Errors
 	/// Returns Error if refresh API request fails or returns invalid response
 	async fn refresh_access_token(&self, refresh_token: &str) -> Result<JwtTokenResponse> {
-		let url = format!("{}/api/auth/refresh", self.base_url);
+		let url = format!("{}/api/v1/auth/refresh", self.base_url);
 
 		let request = json!({
 			"refresh_token": refresh_token
@@ -347,5 +347,98 @@ impl JwtService {
 		let timestamp = Utc::now().timestamp();
 		let uuid = uuid::Uuid::new_v4();
 		format!("oif-demo-v2-{}-{}-{}", hostname, timestamp, uuid.simple())
+	}
+
+	/// Creates a JWT service for testing with a custom client ID
+	#[cfg(test)]
+	pub fn new_with_client_id(base_url: String, client_id: String) -> Self {
+		let client = Client::builder()
+			.timeout(std::time::Duration::from_secs(30))
+			.build()
+			.expect("Failed to build HTTP client");
+
+		Self {
+			client,
+			base_url,
+			client_id,
+		}
+	}
+
+	/// Exposes register_client for testing
+	#[cfg(test)]
+	pub async fn test_register_client(&self) -> Result<JwtTokenResponse> {
+		self.register_client().await
+	}
+
+	/// Exposes refresh_access_token for testing
+	#[cfg(test)]
+	pub async fn test_refresh_access_token(&self, refresh_token: &str) -> Result<JwtTokenResponse> {
+		self.refresh_access_token(refresh_token).await
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use wiremock::matchers::{method, path};
+	use wiremock::{Mock, MockServer, ResponseTemplate};
+
+	#[tokio::test]
+	async fn register_client_uses_v1_auth_path() {
+		let mock_server = MockServer::start().await;
+
+		let response = JwtTokenResponse {
+			access_token: "test-access-token".to_string(),
+			refresh_token: "test-refresh-token".to_string(),
+			client_id: "test-client".to_string(),
+			access_token_expires_at: Utc::now().timestamp() + 3600,
+			refresh_token_expires_at: Utc::now().timestamp() + 86400,
+			scopes: vec!["read:orders".to_string()],
+			token_type: "Bearer".to_string(),
+		};
+
+		Mock::given(method("POST"))
+			.and(path("/api/v1/auth/register"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(&response))
+			.expect(1)
+			.mount(&mock_server)
+			.await;
+
+		let service = JwtService::new_with_client_id(mock_server.uri(), "test-client".to_string());
+		let result = service.test_register_client().await;
+
+		assert!(result.is_ok());
+		let token_response = result.unwrap();
+		assert_eq!(token_response.access_token, "test-access-token");
+		assert_eq!(token_response.client_id, "test-client");
+	}
+
+	#[tokio::test]
+	async fn refresh_access_token_uses_v1_auth_path() {
+		let mock_server = MockServer::start().await;
+
+		let response = JwtTokenResponse {
+			access_token: "new-access-token".to_string(),
+			refresh_token: "new-refresh-token".to_string(),
+			client_id: "test-client".to_string(),
+			access_token_expires_at: Utc::now().timestamp() + 3600,
+			refresh_token_expires_at: Utc::now().timestamp() + 86400,
+			scopes: vec!["read:orders".to_string()],
+			token_type: "Bearer".to_string(),
+		};
+
+		Mock::given(method("POST"))
+			.and(path("/api/v1/auth/refresh"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(&response))
+			.expect(1)
+			.mount(&mock_server)
+			.await;
+
+		let service = JwtService::new_with_client_id(mock_server.uri(), "test-client".to_string());
+		let result = service.test_refresh_access_token("old-refresh-token").await;
+
+		assert!(result.is_ok());
+		let token_response = result.unwrap();
+		assert_eq!(token_response.access_token, "new-access-token");
 	}
 }
