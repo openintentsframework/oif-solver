@@ -68,7 +68,7 @@ impl ApiClient {
 	/// # Errors
 	/// Returns error if HTTP request fails or response parsing fails
 	pub async fn get_quote(&self, request: GetQuoteRequest) -> Result<GetQuoteResponse> {
-		self.post("/api/quotes", &request).await
+		self.post("/api/v1/quotes", &request).await
 	}
 
 	/// Submits a signed order to the solver service
@@ -82,7 +82,7 @@ impl ApiClient {
 	/// # Errors
 	/// Returns error if HTTP request fails or response parsing fails
 	pub async fn submit_order(&self, request: PostOrderRequest) -> Result<PostOrderResponse> {
-		self.post("/api/orders", &request).await
+		self.post("/api/v1/orders", &request).await
 	}
 
 	/// Retrieves order status and details by order ID
@@ -96,7 +96,7 @@ impl ApiClient {
 	/// # Errors
 	/// Returns error if order not found, HTTP request fails, or response parsing fails
 	pub async fn get_order(&self, order_id: &str) -> Result<GetOrderResponse> {
-		self.get(&format!("/api/orders/{}", order_id)).await
+		self.get(&format!("/api/v1/orders/{}", order_id)).await
 	}
 
 	/// Executes a generic POST request with JSON serialization
@@ -159,5 +159,121 @@ impl ApiClient {
 			.json::<T>()
 			.await
 			.map_err(|e| Error::InvalidApiResponse(e.to_string()))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use solver_types::api::PostOrderResponseStatus;
+	use wiremock::matchers::{method, path};
+	use wiremock::{Mock, MockServer, ResponseTemplate};
+
+	#[tokio::test]
+	async fn get_quote_uses_v1_api_path() {
+		let mock_server = MockServer::start().await;
+
+		// Use JSON directly to avoid complex type construction
+		let response = serde_json::json!({
+			"quotes": []
+		});
+
+		Mock::given(method("POST"))
+			.and(path("/api/v1/quotes"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(&response))
+			.expect(1)
+			.mount(&mock_server)
+			.await;
+
+		let client = ApiClient::new(&mock_server.uri()).expect("client creation");
+
+		// Construct a minimal valid GetQuoteRequest using JSON deserialization
+		// EIP-7930 InteropAddress format: Version(2)|ChainType(2)|ChainRefLen(1)|ChainRef|AddrLen(1)|Address
+		// For Ethereum chain 1: 0x0001 | 0x0000 | 0x01 | 0x01 | 0x14 | <20 bytes address>
+		let interop_addr = "0x000100000101141111111111111111111111111111111111111111";
+		let request: GetQuoteRequest = serde_json::from_value(serde_json::json!({
+			"user": interop_addr,
+			"intent": {
+				"intentType": "oif-swap",
+				"inputs": [],
+				"outputs": []
+			},
+			"supportedTypes": ["permit2"]
+		}))
+		.expect("valid request json");
+
+		let result = client.get_quote(request).await;
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn submit_order_uses_v1_api_path() {
+		let mock_server = MockServer::start().await;
+
+		let response = solver_types::api::PostOrderResponse {
+			order_id: Some("order-456".to_string()),
+			status: PostOrderResponseStatus::Received,
+			message: None,
+			order: None,
+		};
+
+		Mock::given(method("POST"))
+			.and(path("/api/v1/orders"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(&response))
+			.expect(1)
+			.mount(&mock_server)
+			.await;
+
+		let client = ApiClient::new(&mock_server.uri()).expect("client creation");
+
+		let payload = solver_types::api::OrderPayload {
+			signature_type: solver_types::api::SignatureType::Eip712,
+			domain: serde_json::json!({}),
+			primary_type: "Test".to_string(),
+			message: serde_json::json!({}),
+			types: None,
+		};
+
+		let request = PostOrderRequest {
+			order: solver_types::api::OifOrder::OifEscrowV0 { payload },
+			signature: alloy_primitives::Bytes::from(vec![0u8; 65]),
+			quote_id: None,
+			origin_submission: None,
+		};
+
+		let result = client.submit_order(request).await;
+		assert!(result.is_ok());
+		assert_eq!(result.unwrap().order_id, Some("order-456".to_string()));
+	}
+
+	#[tokio::test]
+	async fn get_order_uses_v1_api_path() {
+		let mock_server = MockServer::start().await;
+
+		// Use JSON directly - the GetOrderResponse flattens an OrderResponse
+		let response = serde_json::json!({
+			"id": "order-789",
+			"status": "created",
+			"createdAt": 1704067200,
+			"updatedAt": 1704067200,
+			"inputAmounts": [],
+			"outputAmounts": [],
+			"settlement": {
+				"type": "escrow",
+				"data": {}
+			}
+		});
+
+		Mock::given(method("GET"))
+			.and(path("/api/v1/orders/order-789"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(&response))
+			.expect(1)
+			.mount(&mock_server)
+			.await;
+
+		let client = ApiClient::new(&mock_server.uri()).expect("client creation");
+		let result = client.get_order("order-789").await;
+		assert!(result.is_ok());
+		assert_eq!(result.unwrap().order.id, "order-789");
 	}
 }

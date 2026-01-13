@@ -46,7 +46,7 @@ pub struct TokenInfo {
 	pub decimals: u8,
 }
 
-/// Handles GET /api/tokens requests.
+/// Handles GET /api/v1/tokens requests.
 ///
 /// Returns all supported tokens across all configured networks.
 pub async fn get_tokens(State(solver): State<Arc<SolverEngine>>) -> Json<TokensResponse> {
@@ -79,7 +79,7 @@ pub async fn get_tokens(State(solver): State<Arc<SolverEngine>>) -> Json<TokensR
 	Json(response)
 }
 
-/// Handles GET /api/tokens/{chain_id} requests.
+/// Handles GET /api/v1/tokens/{chain_id} requests.
 ///
 /// Returns supported tokens for a specific chain.
 pub async fn get_tokens_for_chain(
