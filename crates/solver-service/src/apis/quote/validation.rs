@@ -788,7 +788,10 @@ mod tests {
 		let pricing_impl =
 			solver_pricing::implementations::mock::create_mock_pricing(&pricing_config)
 				.expect("Failed to create mock pricing");
-		let pricing = Arc::new(solver_pricing::PricingService::new(pricing_impl, Vec::new()));
+		let pricing = Arc::new(solver_pricing::PricingService::new(
+			pricing_impl,
+			Vec::new(),
+		));
 
 		let event_bus = EventBus::new(100);
 

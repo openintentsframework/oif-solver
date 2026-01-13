@@ -274,7 +274,11 @@ impl PricingService {
 		wei_amount: &str,
 		currency: &str,
 	) -> Result<String, PricingError> {
-		try_with_fallback!(self, "wei_to_currency", wei_to_currency(wei_amount, currency))
+		try_with_fallback!(
+			self,
+			"wei_to_currency",
+			wei_to_currency(wei_amount, currency)
+		)
 	}
 
 	/// Converts a currency amount to wei using current ETH price.
