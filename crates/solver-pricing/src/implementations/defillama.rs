@@ -439,8 +439,9 @@ impl PricingInterface for DefiLlamaPricing {
 		}
 
 		// Convert currency to ETH, then to wei
+		// Round to 18 decimal places as parse_ether only accepts at most 18 fractional digits
 		let eth_amount = currency_amount_decimal / eth_price_decimal;
-		let eth_amount_str = eth_amount.to_string();
+		let eth_amount_str = format!("{:.18}", eth_amount);
 		let wei_amount = parse_ether(&eth_amount_str).map_err(|e| {
 			PricingError::InvalidData(format!("Failed to convert ETH to wei: {}", e))
 		})?;
