@@ -118,7 +118,7 @@ pub async fn start_server(
 		signature_validation,
 	};
 
-	// Build the router with /api base path and quote endpoint
+	// Build the router with /api/v1 base path and quote endpoint
 	let mut api_routes = Router::new()
 		.route("/quotes", post(handle_quote))
 		.route("/tokens", get(handle_get_tokens))
@@ -167,7 +167,7 @@ pub async fn start_server(
 	api_routes = api_routes.merge(order_routes);
 
 	let app = Router::new()
-		.nest("/api", api_routes)
+		.nest("/api/v1", api_routes)
 		.layer(ServiceBuilder::new().layer(CorsLayer::permissive()))
 		.with_state(app_state);
 
@@ -185,7 +185,7 @@ pub async fn start_server(
 	Ok(())
 }
 
-/// Handles POST /api/quotes requests.
+/// Handles POST /api/v1/quotes requests.
 ///
 /// This endpoint processes quote requests and returns price estimates
 /// for cross-chain intents following the ERC-7683 standard.
@@ -202,7 +202,7 @@ async fn handle_quote(
 	}
 }
 
-/// Handles GET /api/orders/{id} requests.
+/// Handles GET /api/v1/orders/{id} requests.
 ///
 /// This endpoint retrieves order details by ID, providing status information
 /// and execution details for cross-chain intent orders.
@@ -228,7 +228,7 @@ async fn handle_get_order_by_id(
 	}
 }
 
-/// Handles GET /api/tokens requests.
+/// Handles GET /api/v1/tokens requests.
 ///
 /// Returns all supported tokens across all configured networks.
 async fn handle_get_tokens(
@@ -237,7 +237,7 @@ async fn handle_get_tokens(
 	crate::apis::tokens::get_tokens(State(state.solver)).await
 }
 
-/// Handles GET /api/tokens/{chain_id} requests.
+/// Handles GET /api/v1/tokens/{chain_id} requests.
 ///
 /// Returns supported tokens for a specific chain.
 async fn handle_get_tokens_for_chain(
@@ -247,7 +247,7 @@ async fn handle_get_tokens_for_chain(
 	crate::apis::tokens::get_tokens_for_chain(Path(chain_id), State(state.solver)).await
 }
 
-/// Handles POST /api/auth/register requests.
+/// Handles POST /api/v1/auth/register requests.
 ///
 /// Auth endpoint that provides both access and refresh tokens.
 async fn handle_auth_register(
@@ -257,7 +257,7 @@ async fn handle_auth_register(
 	crate::apis::auth::register_client(State(state.jwt_service), Json(payload)).await
 }
 
-/// Handles POST /api/auth/refresh requests.
+/// Handles POST /api/v1/auth/refresh requests.
 ///
 /// Endpoint exchanges refresh tokens for new access and refresh tokens.
 async fn handle_auth_refresh(
@@ -267,7 +267,7 @@ async fn handle_auth_refresh(
 	crate::apis::auth::refresh_token(State(state.jwt_service), Json(payload)).await
 }
 
-/// Handles POST /api/orders requests.
+/// Handles POST /api/v1/orders requests.
 ///
 /// This endpoint processes both quote acceptances and direct order submissions
 /// through a unified validation pipeline before forwarding to the discovery service.
