@@ -276,6 +276,9 @@ pub struct GasFlowUnits {
 pub struct PricingConfig {
 	/// Which implementation to use as primary.
 	pub primary: String,
+	/// Fallback implementations to try if primary fails (in order).
+	#[serde(default)]
+	pub fallbacks: Vec<String>,
 	/// Map of pricing implementation names to their configurations.
 	pub implementations: HashMap<String, toml::Value>,
 }

@@ -395,7 +395,35 @@ impl SolverBuilder {
 				primary_pricing
 			))
 		})?;
-		let pricing = Arc::new(PricingService::new(pricing_impl));
+
+		// Collect fallback implementations in order
+		let mut fallback_impls = Vec::new();
+		for fallback_name in &pricing_config.fallbacks {
+			if let Some(fallback_impl) = pricing_impls.remove(fallback_name) {
+				tracing::info!(
+					component = "pricing",
+					implementation = %fallback_name,
+					"Registered as fallback"
+				);
+				fallback_impls.push(fallback_impl);
+			} else {
+				tracing::warn!(
+					component = "pricing",
+					implementation = %fallback_name,
+					"Fallback pricing implementation not found or not configured"
+				);
+			}
+		}
+
+		if !fallback_impls.is_empty() {
+			tracing::info!(
+				component = "pricing",
+				primary = %primary_pricing,
+				fallback_count = %fallback_impls.len(),
+				"Pricing service initialized with fallbacks"
+			);
+		}
+		let pricing = Arc::new(PricingService::new(pricing_impl, fallback_impls));
 
 		// Build oracle routes from settlement implementations
 		let oracle_routes = settlement.build_oracle_routes();

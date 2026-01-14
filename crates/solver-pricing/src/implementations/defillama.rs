@@ -1,7 +1,7 @@
-//! CoinGecko pricing implementation for production use.
+//! DeFiLlama pricing implementation for production use.
 //!
-//! This implementation provides real-time asset prices from CoinGecko API.
-//! Supports ETH and other major cryptocurrencies against USD.
+//! This implementation provides real-time asset prices from DeFiLlama API.
+//! DeFiLlama is a free, open-source API with no rate limits for basic usage.
 
 use crate::{PricingFactory, PricingInterface, PricingRegistry};
 use alloy_primitives::utils::parse_ether;
@@ -29,75 +29,63 @@ struct PriceCacheEntry {
 	timestamp: u64,
 }
 
-/// CoinGecko pricing implementation with caching and rate limiting.
-pub struct CoinGeckoPricing {
+/// DeFiLlama pricing implementation with caching.
+pub struct DefiLlamaPricing {
 	/// HTTP client for API requests
 	client: Client,
-	/// API key for authentication (optional for free tier)
-	#[allow(dead_code)]
-	api_key: Option<String>,
 	/// Base URL for the API
 	base_url: String,
 	/// Cache for price data
 	price_cache: Arc<RwLock<HashMap<String, PriceCacheEntry>>>,
 	/// Cache duration in seconds
 	cache_duration: u64,
-	/// Map of token symbols to CoinGecko IDs
+	/// Map of token symbols (e.g., "ETH") to DeFiLlama coin IDs (e.g., "coingecko:ethereum")
 	token_id_map: HashMap<String, String>,
 	/// Custom fixed prices for tokens (useful for testing/demo)
 	custom_prices: HashMap<String, String>,
-	/// Rate limit delay in milliseconds
-	rate_limit_delay_ms: u64,
-	/// Last API call timestamp
-	last_api_call: Arc<RwLock<Option<u64>>>,
 }
 
-/// CoinGecko API response for simple price endpoint
+/// DeFiLlama API response for current prices endpoint
 #[derive(Debug, Deserialize)]
-struct SimplePriceResponse {
-	#[serde(flatten)]
-	prices: HashMap<String, HashMap<String, Decimal>>,
+struct DefiLlamaPriceResponse {
+	coins: HashMap<String, CoinPrice>,
 }
 
-impl CoinGeckoPricing {
-	/// Creates a new CoinGeckoPricing instance with configuration.
+#[derive(Debug, Deserialize)]
+struct CoinPrice {
+	price: f64,
+	#[allow(dead_code)]
+	symbol: Option<String>,
+	#[allow(dead_code)]
+	timestamp: Option<u64>,
+	#[allow(dead_code)]
+	confidence: Option<f64>,
+}
+
+impl DefiLlamaPricing {
+	/// Creates a new DefiLlamaPricing instance with configuration.
 	pub fn new(config: &toml::Value) -> Result<Self, PricingError> {
 		// Validate configuration first
-		let schema = CoinGeckoConfigSchema;
+		let schema = DefiLlamaConfigSchema;
 		schema.validate(config).map_err(|e| {
 			PricingError::InvalidData(format!("Configuration validation failed: {}", e))
 		})?;
 
-		// Extract configuration
-		let api_key = config
-			.get("api_key")
-			.and_then(|v| v.as_str())
-			.map(|s| s.to_string());
-
 		let base_url = config
 			.get("base_url")
 			.and_then(|v| v.as_str())
-			.unwrap_or(if api_key.is_some() {
-				"https://pro-api.coingecko.com/api/v3"
-			} else {
-				"https://api.coingecko.com/api/v3"
-			})
+			.unwrap_or("https://coins.llama.fi")
 			.to_string();
 
 		let cache_duration = config
 			.get("cache_duration_seconds")
 			.and_then(|v| v.as_integer())
-			.unwrap_or(60) as u64; // Default 60 seconds cache
+			.unwrap_or(60) as u64;
 
-		let rate_limit_delay_ms = config
-			.get("rate_limit_delay_ms")
-			.and_then(|v| v.as_integer())
-			.unwrap_or(if api_key.is_some() { 100 } else { 1200 }) as u64; // Pro: 100ms, Free: 1.2s
-
-		// Build token ID map from shared defaults
+		// Build token ID map from shared defaults, adding "coingecko:" prefix for DeFiLlama API
 		let mut token_id_map: HashMap<String, String> = crate::DEFAULT_TOKEN_MAPPINGS
 			.iter()
-			.map(|(symbol, id)| (symbol.to_string(), id.to_string()))
+			.map(|(symbol, id)| (symbol.to_string(), format!("coingecko:{}", id)))
 			.collect();
 
 		// Allow custom token mappings
@@ -147,72 +135,36 @@ impl CoinGeckoPricing {
 
 		// Create HTTP client with headers
 		let mut headers = HeaderMap::new();
-		if let Some(ref key) = api_key {
-			headers.insert(
-				"x-cg-pro-api-key",
-				HeaderValue::from_str(key).map_err(|e| {
-					PricingError::InvalidData(format!("Invalid API key format: {}", e))
-				})?,
-			);
-		}
 		headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
 
 		let client = Client::builder()
 			.default_headers(headers)
-			.user_agent("oif-solver/0.1.0 (https://github.com/openintentsframework/oif-solver)")
+			.user_agent("oif-solver/0.1.0 (https://github.com/openzeppelin/oif-solver)")
 			.timeout(Duration::from_secs(30))
 			.build()
 			.map_err(|e| PricingError::Network(format!("Failed to create HTTP client: {}", e)))?;
 
 		debug!(
-			"CoinGecko pricing initialized - Base URL: {}, Cache: {}s, Rate limit: {}ms",
-			base_url, cache_duration, rate_limit_delay_ms
+			"DeFiLlama pricing initialized - Base URL: {}, Cache: {}s",
+			base_url, cache_duration
 		);
 		debug!(
-			"CoinGecko token mappings: {} tokens configured",
+			"DeFiLlama token mappings: {} tokens configured",
 			token_id_map.len()
 		);
 
 		Ok(Self {
 			client,
-			api_key,
 			base_url,
 			price_cache: Arc::new(RwLock::new(HashMap::new())),
 			cache_duration,
 			token_id_map,
 			custom_prices,
-			rate_limit_delay_ms,
-			last_api_call: Arc::new(RwLock::new(None)),
 		})
 	}
 
-	/// Apply rate limiting
-	async fn apply_rate_limit(&self) {
-		let mut last_call = self.last_api_call.write().await;
-
-		if let Some(last_timestamp) = *last_call {
-			let now = SystemTime::now()
-				.duration_since(UNIX_EPOCH)
-				.unwrap()
-				.as_millis() as u64;
-
-			let elapsed = now - last_timestamp;
-			if elapsed < self.rate_limit_delay_ms {
-				let delay = self.rate_limit_delay_ms - elapsed;
-				tokio::time::sleep(Duration::from_millis(delay)).await;
-			}
-		}
-
-		*last_call = Some(
-			SystemTime::now()
-				.duration_since(UNIX_EPOCH)
-				.unwrap()
-				.as_millis() as u64,
-		);
-	}
-
-	/// Get CoinGecko ID for a token symbol
-	fn get_coingecko_id(&self, symbol: &str) -> Option<String> {
+	/// Get DeFiLlama coin ID for a token symbol
+	fn get_defillama_id(&self, symbol: &str) -> Option<String> {
 		self.token_id_map.get(&symbol.to_uppercase()).cloned()
 	}
 
@@ -221,23 +173,14 @@ impl CoinGeckoPricing {
 		currency.to_uppercase() == "USD"
 	}
 
-	/// Fetch prices from CoinGecko API
-	async fn fetch_prices(
-		&self,
-		ids: Vec<String>,
-		vs_currencies: Vec<String>,
-	) -> Result<SimplePriceResponse, PricingError> {
-		self.apply_rate_limit().await;
-
+	/// Fetch prices from DeFiLlama API
+	async fn fetch_prices(&self, ids: Vec<String>) -> Result<DefiLlamaPriceResponse, PricingError> {
 		let ids_param = ids.join(",");
-		let vs_currencies_param = vs_currencies.join(",");
 
-		let url = format!(
-			"{}/simple/price?ids={}&vs_currencies={}",
-			self.base_url, ids_param, vs_currencies_param
-		);
+		// DeFiLlama endpoint: /prices/current/{coins}
+		let url = format!("{}/prices/current/{}", self.base_url, ids_param);
 
-		debug!("Fetching prices from CoinGecko API: {}", url);
+		debug!("Fetching prices from DeFiLlama API: {}", url);
 
 		let response = self
 			.client
@@ -256,7 +199,7 @@ impl CoinGeckoPricing {
 		}
 
 		response
-			.json::<SimplePriceResponse>()
+			.json::<DefiLlamaPriceResponse>()
 			.await
 			.map_err(|e| PricingError::InvalidData(format!("Failed to parse response: {}", e)))
 	}
@@ -314,21 +257,20 @@ impl CoinGeckoPricing {
 		}
 
 		// Fetch from API
-		let coingecko_id = self
-			.get_coingecko_id(token)
+		let defillama_id = self
+			.get_defillama_id(token)
 			.ok_or_else(|| PricingError::PriceNotAvailable(format!("Unknown token: {}", token)))?;
 
-		let response = self
-			.fetch_prices(vec![coingecko_id.clone()], vec!["usd".to_string()])
-			.await?;
+		let response = self.fetch_prices(vec![defillama_id.clone()]).await?;
 
 		let price = response
-			.prices
-			.get(&coingecko_id)
-			.and_then(|prices| prices.get("usd"))
+			.coins
+			.get(&defillama_id)
 			.ok_or_else(|| PricingError::PriceNotAvailable(format!("{}/USD", token)))?;
 
-		let price_str = price.to_string();
+		let price_decimal = Decimal::try_from(price.price)
+			.map_err(|e| PricingError::InvalidData(format!("Invalid price value: {}", e)))?;
+		let price_str = price_decimal.to_string();
 
 		// Update cache
 		{
@@ -379,8 +321,7 @@ impl CoinGeckoPricing {
 			return Ok((one / price).to_string());
 		}
 
-		// For non-USD pairs, we could support crypto-to-crypto through USD
-		// but there's no current use case in the solver
+		// For non-USD pairs, not supported
 		Err(PricingError::PriceNotAvailable(format!(
 			"Only USD pairs are supported, got {}/{}",
 			base, quote
@@ -389,9 +330,9 @@ impl CoinGeckoPricing {
 }
 
 #[async_trait]
-impl PricingInterface for CoinGeckoPricing {
+impl PricingInterface for DefiLlamaPricing {
 	fn config_schema(&self) -> Box<dyn ConfigSchema> {
-		Box::new(CoinGeckoConfigSchema)
+		Box::new(DefiLlamaConfigSchema)
 	}
 
 	async fn get_supported_pairs(&self) -> Vec<TradingPair> {
@@ -498,8 +439,9 @@ impl PricingInterface for CoinGeckoPricing {
 		}
 
 		// Convert currency to ETH, then to wei
+		// Round to 18 decimal places as parse_ether only accepts at most 18 fractional digits
 		let eth_amount = currency_amount_decimal / eth_price_decimal;
-		let eth_amount_str = eth_amount.to_string();
+		let eth_amount_str = format!("{:.18}", eth_amount);
 		let wei_amount = parse_ether(&eth_amount_str).map_err(|e| {
 			PricingError::InvalidData(format!("Failed to convert ETH to wei: {}", e))
 		})?;
@@ -508,22 +450,11 @@ impl PricingInterface for CoinGeckoPricing {
 	}
 }
 
-/// Configuration schema for CoinGecko pricing implementation.
-pub struct CoinGeckoConfigSchema;
+/// Configuration schema for DeFiLlama pricing implementation.
+pub struct DefiLlamaConfigSchema;
 
-impl ConfigSchema for CoinGeckoConfigSchema {
+impl ConfigSchema for DefiLlamaConfigSchema {
 	fn validate(&self, config: &toml::Value) -> Result<(), ValidationError> {
-		// Optional API key
-		if let Some(api_key) = config.get("api_key") {
-			if api_key.as_str().is_none() {
-				return Err(ValidationError::TypeMismatch {
-					field: "api_key".to_string(),
-					expected: "string".to_string(),
-					actual: format!("{:?}", api_key),
-				});
-			}
-		}
-
 		// Optional base URL
 		if let Some(base_url) = config.get("base_url") {
 			if base_url.as_str().is_none() {
@@ -542,17 +473,6 @@ impl ConfigSchema for CoinGeckoConfigSchema {
 					field: "cache_duration_seconds".to_string(),
 					expected: "integer".to_string(),
 					actual: format!("{:?}", cache_duration),
-				});
-			}
-		}
-
-		// Optional rate limit delay
-		if let Some(delay) = config.get("rate_limit_delay_ms") {
-			if delay.as_integer().is_none() {
-				return Err(ValidationError::TypeMismatch {
-					field: "rate_limit_delay_ms".to_string(),
-					expected: "integer".to_string(),
-					actual: format!("{:?}", delay),
 				});
 			}
 		}
@@ -582,7 +502,6 @@ impl ConfigSchema for CoinGeckoConfigSchema {
 		if let Some(custom_prices) = config.get("custom_prices") {
 			if let Some(table) = custom_prices.as_table() {
 				for (symbol, price) in table {
-					// Price can be string (parseable as Decimal), float, or integer
 					let is_valid = if let Some(price_str) = price.as_str() {
 						price_str.parse::<Decimal>().is_ok()
 					} else if let Some(price_num) = price.as_float() {
@@ -612,31 +531,30 @@ impl ConfigSchema for CoinGeckoConfigSchema {
 	}
 }
 
-/// Registry for CoinGecko pricing implementation.
-pub struct CoinGeckoPricingRegistry;
+/// Registry for DeFiLlama pricing implementation.
+pub struct DefiLlamaPricingRegistry;
 
-impl ImplementationRegistry for CoinGeckoPricingRegistry {
-	const NAME: &'static str = "coingecko";
+impl ImplementationRegistry for DefiLlamaPricingRegistry {
+	const NAME: &'static str = "defillama";
 	type Factory = PricingFactory;
 
 	fn factory() -> Self::Factory {
-		create_coingecko_pricing
+		create_defillama_pricing
 	}
 }
 
-impl PricingRegistry for CoinGeckoPricingRegistry {}
+impl PricingRegistry for DefiLlamaPricingRegistry {}
 
-/// Factory function for creating CoinGeckoPricing instances.
-pub fn create_coingecko_pricing(
+/// Factory function for creating DefiLlamaPricing instances.
+pub fn create_defillama_pricing(
 	config: &toml::Value,
 ) -> Result<Box<dyn PricingInterface>, PricingError> {
-	Ok(Box::new(CoinGeckoPricing::new(config)?))
+	Ok(Box::new(DefiLlamaPricing::new(config)?))
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use tokio;
 
 	fn minimal_config() -> toml::Value {
 		toml::Value::Table(toml::map::Map::new())
@@ -654,40 +572,66 @@ mod tests {
 		.unwrap()
 	}
 
+	fn config_with_custom_base_url() -> toml::Value {
+		toml::from_str(
+			r#"
+            base_url = "https://custom.llama.fi"
+            cache_duration_seconds = 120
+        "#,
+		)
+		.unwrap()
+	}
+
+	fn config_with_custom_token_map() -> toml::Value {
+		toml::from_str(
+			r#"
+            [token_id_map]
+            MYTOKEN = "coingecko:my-custom-token"
+            CUSTOM = "coingecko:custom-coin"
+        "#,
+		)
+		.unwrap()
+	}
+
+	fn config_with_float_custom_prices() -> toml::Value {
+		toml::from_str(
+			r#"
+            [custom_prices]
+            ETH = 3000.123
+            SOL = 150
+        "#,
+		)
+		.unwrap()
+	}
+
 	#[test]
 	fn test_new_default_config() {
-		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
-		assert_eq!(pricing.base_url, "https://api.coingecko.com/api/v3");
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
+		assert_eq!(pricing.base_url, "https://coins.llama.fi");
 		assert_eq!(pricing.cache_duration, 60);
-		assert_eq!(pricing.rate_limit_delay_ms, 1200);
 	}
 
 	#[test]
-	fn test_new_with_api_key() {
-		let config = toml::from_str(r#"api_key = "pro_key_123""#).unwrap();
-		let pricing = CoinGeckoPricing::new(&config).unwrap();
-		assert_eq!(pricing.base_url, "https://pro-api.coingecko.com/api/v3");
-		assert_eq!(pricing.rate_limit_delay_ms, 100);
-	}
-
-	#[test]
-	fn test_get_coingecko_id() {
-		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+	fn test_get_defillama_id() {
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
 		assert_eq!(
-			pricing.get_coingecko_id("ETH"),
-			Some("ethereum".to_string())
+			pricing.get_defillama_id("ETH"),
+			Some("coingecko:ethereum".to_string())
 		);
-		assert_eq!(pricing.get_coingecko_id("btc"), Some("bitcoin".to_string()));
 		assert_eq!(
-			pricing.get_coingecko_id("WETH"),
-			Some("ethereum".to_string())
+			pricing.get_defillama_id("btc"),
+			Some("coingecko:bitcoin".to_string())
 		);
-		assert_eq!(pricing.get_coingecko_id("UNKNOWN"), None);
+		assert_eq!(
+			pricing.get_defillama_id("WETH"),
+			Some("coingecko:ethereum".to_string())
+		);
+		assert_eq!(pricing.get_defillama_id("UNKNOWN"), None);
 	}
 
 	#[test]
 	fn test_is_usd() {
-		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
 		assert!(pricing.is_usd("USD"));
 		assert!(pricing.is_usd("usd"));
 		assert!(pricing.is_usd("Usd"));
@@ -697,7 +641,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_get_pair_price_same_asset() {
-		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
 		let pair = TradingPair::new("ETH", "ETH");
 		let result = pricing.get_pair_price(&pair).await.unwrap();
 		assert_eq!(result, "1.0");
@@ -705,7 +649,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_get_pair_price_unsupported() {
-		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
 		let pair = TradingPair::new("ETH", "BTC");
 		let result = pricing.get_pair_price(&pair).await;
 		assert!(result.is_err());
@@ -713,56 +657,56 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_custom_price_retrieval() {
-		let pricing = CoinGeckoPricing::new(&config_with_custom_prices()).unwrap();
+		let pricing = DefiLlamaPricing::new(&config_with_custom_prices()).unwrap();
 		let result = pricing.get_price("ETH", "USD").await.unwrap();
 		assert_eq!(result, "3000.50");
 	}
 
 	#[tokio::test]
 	async fn test_get_price_non_usd_fails() {
-		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
 		let result = pricing.get_price("ETH", "EUR").await;
 		assert!(matches!(result, Err(PricingError::PriceNotAvailable(_))));
 	}
 
 	#[tokio::test]
 	async fn test_get_price_unknown_token() {
-		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
 		let result = pricing.get_price("FAKECOIN", "USD").await;
 		assert!(matches!(result, Err(PricingError::PriceNotAvailable(_))));
 	}
 
 	#[tokio::test]
 	async fn test_convert_asset_same() {
-		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
 		let result = pricing.convert_asset("ETH", "eth", "5.5").await.unwrap();
 		assert_eq!(result, "5.5");
 	}
 
 	#[tokio::test]
 	async fn test_convert_asset_invalid_amount() {
-		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
 		let result = pricing.convert_asset("ETH", "USD", "not_a_number").await;
 		assert!(matches!(result, Err(PricingError::InvalidData(_))));
 	}
 
 	#[tokio::test]
 	async fn test_wei_to_currency_non_usd() {
-		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
 		let result = pricing.wei_to_currency("1000000000000000000", "EUR").await;
 		assert!(matches!(result, Err(PricingError::PriceNotAvailable(_))));
 	}
 
 	#[tokio::test]
 	async fn test_currency_to_wei_invalid() {
-		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
 		let result = pricing.currency_to_wei("invalid", "USD").await;
 		assert!(matches!(result, Err(PricingError::InvalidData(_))));
 	}
 
 	#[tokio::test]
 	async fn test_get_supported_pairs() {
-		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
 		let pairs = pricing.get_supported_pairs().await;
 		assert!(!pairs.is_empty());
 		// All should be against USD
@@ -771,21 +715,14 @@ mod tests {
 
 	#[test]
 	fn test_config_schema_valid() {
-		let schema = CoinGeckoConfigSchema;
+		let schema = DefiLlamaConfigSchema;
 		assert!(schema.validate(&minimal_config()).is_ok());
 		assert!(schema.validate(&config_with_custom_prices()).is_ok());
 	}
 
 	#[test]
-	fn test_config_schema_invalid_api_key() {
-		let schema = CoinGeckoConfigSchema;
-		let bad_config = toml::from_str(r#"api_key = 123"#).unwrap();
-		assert!(schema.validate(&bad_config).is_err());
-	}
-
-	#[test]
 	fn test_config_schema_invalid_custom_price() {
-		let schema = CoinGeckoConfigSchema;
+		let schema = DefiLlamaConfigSchema;
 		let bad_config = toml::from_str(
 			r#"
             [custom_prices]
@@ -797,13 +734,272 @@ mod tests {
 	}
 
 	#[test]
-	fn test_price_cache_entry() {
-		let entry = PriceCacheEntry {
-			price: "2500.0".to_string(),
-			timestamp: 1234567890,
-		};
-		let cloned = entry.clone();
-		assert_eq!(entry.price, cloned.price);
-		assert_eq!(entry.timestamp, cloned.timestamp);
+	fn test_new_with_custom_base_url() {
+		let pricing = DefiLlamaPricing::new(&config_with_custom_base_url()).unwrap();
+		assert_eq!(pricing.base_url, "https://custom.llama.fi");
+		assert_eq!(pricing.cache_duration, 120);
+	}
+
+	#[test]
+	fn test_custom_token_mapping() {
+		let pricing = DefiLlamaPricing::new(&config_with_custom_token_map()).unwrap();
+		assert_eq!(
+			pricing.get_defillama_id("MYTOKEN"),
+			Some("coingecko:my-custom-token".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("CUSTOM"),
+			Some("coingecko:custom-coin".to_string())
+		);
+		// Should still have defaults
+		assert_eq!(
+			pricing.get_defillama_id("ETH"),
+			Some("coingecko:ethereum".to_string())
+		);
+	}
+
+	#[tokio::test]
+	async fn test_custom_price_float_format() {
+		let pricing = DefiLlamaPricing::new(&config_with_float_custom_prices()).unwrap();
+		let result = pricing.get_price("ETH", "USD").await.unwrap();
+		assert_eq!(result, "3000.123");
+	}
+
+	#[tokio::test]
+	async fn test_custom_price_integer_format() {
+		let pricing = DefiLlamaPricing::new(&config_with_float_custom_prices()).unwrap();
+		let result = pricing.get_price("SOL", "USD").await.unwrap();
+		assert_eq!(result, "150");
+	}
+
+	#[tokio::test]
+	async fn test_convert_asset_with_custom_prices() {
+		let pricing = DefiLlamaPricing::new(&config_with_custom_prices()).unwrap();
+		// Convert 2 ETH to USD at $3000.50 each = $6001.00
+		let result = pricing.convert_asset("ETH", "USD", "2").await.unwrap();
+		assert_eq!(result, "6001.00");
+	}
+
+	#[tokio::test]
+	async fn test_convert_asset_usd_to_crypto() {
+		let pricing = DefiLlamaPricing::new(&config_with_custom_prices()).unwrap();
+		// Convert $6001 USD to ETH at $3000.50 per ETH
+		let result = pricing.convert_asset("USD", "ETH", "6001").await.unwrap();
+		// $6001 / $3000.50 = ~1.9996667...
+		let result_decimal: Decimal = result.parse().unwrap();
+		assert!(result_decimal > Decimal::from(1));
+		assert!(result_decimal < Decimal::from(3));
+	}
+
+	#[tokio::test]
+	async fn test_wei_to_currency_with_custom_eth_price() {
+		let pricing = DefiLlamaPricing::new(&config_with_custom_prices()).unwrap();
+		// 1 ETH in wei = 1000000000000000000
+		let result = pricing
+			.wei_to_currency("1000000000000000000", "USD")
+			.await
+			.unwrap();
+		// Should be $3000.50 (with 8 decimal places)
+		assert_eq!(result, "3000.50000000");
+	}
+
+	#[tokio::test]
+	async fn test_currency_to_wei_non_usd() {
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
+		let result = pricing.currency_to_wei("100", "EUR").await;
+		assert!(matches!(result, Err(PricingError::PriceNotAvailable(_))));
+	}
+
+	#[tokio::test]
+	async fn test_currency_to_wei_with_custom_price() {
+		let pricing = DefiLlamaPricing::new(&config_with_custom_prices()).unwrap();
+		// $3000.50 USD = 1 ETH = 1000000000000000000 wei
+		let result = pricing.currency_to_wei("3000.50", "USD").await.unwrap();
+		// Should be approximately 1 ETH in wei
+		let wei: u128 = result.parse().unwrap();
+		let one_eth_wei: u128 = 1_000_000_000_000_000_000;
+		// Allow small precision difference
+		assert!(wei > one_eth_wei - 1_000_000_000_000_000);
+		assert!(wei < one_eth_wei + 1_000_000_000_000_000);
+	}
+
+	#[test]
+	fn test_config_schema_invalid_base_url_type() {
+		let schema = DefiLlamaConfigSchema;
+		let bad_config = toml::from_str(
+			r#"
+            base_url = 123
+        "#,
+		)
+		.unwrap();
+		assert!(schema.validate(&bad_config).is_err());
+	}
+
+	#[test]
+	fn test_config_schema_invalid_cache_duration_type() {
+		let schema = DefiLlamaConfigSchema;
+		let bad_config = toml::from_str(
+			r#"
+            cache_duration_seconds = "not_a_number"
+        "#,
+		)
+		.unwrap();
+		assert!(schema.validate(&bad_config).is_err());
+	}
+
+	#[test]
+	fn test_config_schema_invalid_token_map_not_table() {
+		let schema = DefiLlamaConfigSchema;
+		let bad_config = toml::from_str(
+			r#"
+            token_id_map = "invalid"
+        "#,
+		)
+		.unwrap();
+		assert!(schema.validate(&bad_config).is_err());
+	}
+
+	#[test]
+	fn test_config_schema_invalid_token_map_value() {
+		let schema = DefiLlamaConfigSchema;
+		let bad_config = toml::from_str(
+			r#"
+            [token_id_map]
+            MYTOKEN = 123
+        "#,
+		)
+		.unwrap();
+		assert!(schema.validate(&bad_config).is_err());
+	}
+
+	#[test]
+	fn test_config_schema_invalid_custom_prices_not_table() {
+		let schema = DefiLlamaConfigSchema;
+		let bad_config = toml::from_str(
+			r#"
+            custom_prices = "invalid"
+        "#,
+		)
+		.unwrap();
+		assert!(schema.validate(&bad_config).is_err());
+	}
+
+	#[test]
+	fn test_config_schema_valid_float_prices() {
+		let schema = DefiLlamaConfigSchema;
+		assert!(schema.validate(&config_with_float_custom_prices()).is_ok());
+	}
+
+	#[test]
+	fn test_registry_name() {
+		assert_eq!(DefiLlamaPricingRegistry::NAME, "defillama");
+	}
+
+	#[test]
+	fn test_factory_function() {
+		let config = minimal_config();
+		let result = create_defillama_pricing(&config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_config_schema_method() {
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
+		let schema = pricing.config_schema();
+		assert!(schema.validate(&minimal_config()).is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_cache_hit() {
+		let pricing = DefiLlamaPricing::new(&config_with_custom_prices()).unwrap();
+		// First call should populate cache
+		let result1 = pricing.get_price("ETH", "USD").await.unwrap();
+		// Second call should hit cache
+		let result2 = pricing.get_price("ETH", "USD").await.unwrap();
+		assert_eq!(result1, result2);
+		assert_eq!(result1, "3000.50");
+	}
+
+	#[tokio::test]
+	async fn test_get_pair_price_with_usd_base() {
+		let pricing = DefiLlamaPricing::new(&config_with_custom_prices()).unwrap();
+		// USD/ETH should give inverse of ETH/USD
+		let pair = TradingPair::new("USD", "ETH");
+		let result = pricing.get_pair_price(&pair).await.unwrap();
+		let result_decimal: Decimal = result.parse().unwrap();
+		// 1/3000.50 ≈ 0.000333...
+		assert!(result_decimal > Decimal::ZERO);
+		assert!(result_decimal < Decimal::ONE);
+	}
+
+	#[tokio::test]
+	async fn test_convert_asset_crypto_to_crypto_fails() {
+		let pricing = DefiLlamaPricing::new(&config_with_custom_prices()).unwrap();
+		// ETH to BTC should fail (non-USD pair)
+		let result = pricing.convert_asset("ETH", "BTC", "1").await;
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_default_token_mappings() {
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
+		// Check various default mappings
+		assert_eq!(
+			pricing.get_defillama_id("ETHEREUM"),
+			Some("coingecko:ethereum".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("SOLANA"),
+			Some("coingecko:solana".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("BITCOIN"),
+			Some("coingecko:bitcoin".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("USDC"),
+			Some("coingecko:usd-coin".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("USDT"),
+			Some("coingecko:tether".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("DAI"),
+			Some("coingecko:dai".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("WBTC"),
+			Some("coingecko:wrapped-bitcoin".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("MATIC"),
+			Some("coingecko:matic-network".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("ARB"),
+			Some("coingecko:arbitrum".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("OP"),
+			Some("coingecko:optimism".to_string())
+		);
+	}
+
+	#[test]
+	fn test_get_defillama_id_case_insensitive() {
+		let pricing = DefiLlamaPricing::new(&minimal_config()).unwrap();
+		assert_eq!(
+			pricing.get_defillama_id("eth"),
+			Some("coingecko:ethereum".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("Eth"),
+			Some("coingecko:ethereum".to_string())
+		);
+		assert_eq!(
+			pricing.get_defillama_id("ETH"),
+			Some("coingecko:ethereum".to_string())
+		);
 	}
 }

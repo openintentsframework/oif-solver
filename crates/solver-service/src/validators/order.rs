@@ -379,7 +379,7 @@ mod tests {
 		));
 		let pricing_impl =
 			mock::create_mock_pricing(&toml::Value::Table(toml::map::Map::new())).unwrap();
-		let pricing = Arc::new(PricingService::new(pricing_impl));
+		let pricing = Arc::new(PricingService::new(pricing_impl, Vec::new()));
 		let solver_address = solver_types::parse_address(TEST_SOLVER).unwrap();
 
 		SolverEngine::new(
