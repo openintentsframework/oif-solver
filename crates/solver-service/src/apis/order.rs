@@ -367,7 +367,7 @@ mod tests {
 		// Create a mock pricing service for tests
 		let pricing_config = toml::Value::Table(toml::map::Map::new());
 		let pricing_impl = mock::create_mock_pricing(&pricing_config).unwrap();
-		let pricing = Arc::new(PricingService::new(pricing_impl));
+		let pricing = Arc::new(PricingService::new(pricing_impl, Vec::new()));
 
 		SolverEngine::new(
 			cfg,
