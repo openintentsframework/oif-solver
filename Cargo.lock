@@ -4645,14 +4645,17 @@ dependencies = [
  "futures",
  "mockall",
  "redis",
+ "rust_decimal",
  "serde",
  "serde_json",
+ "solver-config",
  "solver-types",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "toml",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

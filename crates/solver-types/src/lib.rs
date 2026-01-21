@@ -6,6 +6,10 @@
 
 /// Account-related types for managing solver identities and signatures.
 pub mod account;
+/// Deployment configuration types for initializing a new solver.
+pub mod deployment_config;
+/// Versioned wrapper for optimistic locking.
+pub mod versioned;
 /// API types for HTTP endpoints and request/response structures.
 pub mod api;
 /// Authentication and authorization types.
@@ -71,3 +75,5 @@ pub use utils::{
 	MOCK_TOKA_USD_PRICE, MOCK_TOKB_USD_PRICE,
 };
 pub use validation::*;
+pub use versioned::Versioned;
+pub use deployment_config::{DeploymentConfig, NetworkOverride, Token};
