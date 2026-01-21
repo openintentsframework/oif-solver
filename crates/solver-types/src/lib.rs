@@ -6,16 +6,14 @@
 
 /// Account-related types for managing solver identities and signatures.
 pub mod account;
-/// Deployment configuration types for initializing a new solver.
-pub mod deployment_config;
-/// Versioned wrapper for optimistic locking.
-pub mod versioned;
 /// API types for HTTP endpoints and request/response structures.
 pub mod api;
 /// Authentication and authorization types.
 pub mod auth;
 /// Transaction delivery types for blockchain interactions.
 pub mod delivery;
+/// Deployment configuration types for initializing a new solver.
+pub mod deployment_config;
 /// Intent discovery types for finding and processing new orders.
 pub mod discovery;
 /// Event types for inter-service communication.
@@ -40,6 +38,8 @@ pub mod storage;
 pub mod utils;
 /// Configuration validation types for ensuring type-safe configurations.
 pub mod validation;
+/// Versioned wrapper for optimistic locking.
+pub mod versioned;
 
 // Cost types
 pub mod costs;
@@ -52,6 +52,7 @@ pub use api::*;
 pub use auth::{AuthConfig, AuthScope, JwtClaims, RefreshTokenData};
 pub use costs::{CostBreakdown, CostContext};
 pub use delivery::*;
+pub use deployment_config::{DeploymentConfig, NetworkOverride, Token};
 pub use discovery::*;
 pub use events::*;
 pub use networks::{NetworkConfig, NetworksConfig, TokenConfig};
@@ -76,4 +77,3 @@ pub use utils::{
 };
 pub use validation::*;
 pub use versioned::Versioned;
-pub use deployment_config::{DeploymentConfig, NetworkOverride, Token};
