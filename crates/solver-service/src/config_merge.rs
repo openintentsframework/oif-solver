@@ -258,15 +258,6 @@ fn build_account_config(defaults: &SeedDefaults) -> AccountConfig {
 		.map(|k| k.trim().to_string())
 		.unwrap_or_else(|_| "${SOLVER_PRIVATE_KEY}".to_string());
 
-	// Strip 0x prefix if present for length check
-	let key_for_check = private_key.strip_prefix("0x").unwrap_or(&private_key);
-	tracing::info!(
-		key_len = private_key.len(),
-		key_without_prefix_len = key_for_check.len(),
-		key_first_chars = %private_key.chars().take(8).collect::<String>(),
-		"Building account config with private key"
-	);
-
 	let local_config = toml_table(vec![("private_key", toml::Value::String(private_key))]);
 	implementations.insert("local".to_string(), local_config);
 
