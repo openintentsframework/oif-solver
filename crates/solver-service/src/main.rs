@@ -139,13 +139,7 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 	// Handle seeding if requested
 	if let (Some(seed_name), Some(seed_overrides_str)) = (&args.seed, &args.seed_overrides) {
 		// Parse seed preset
-		let seed_preset = SeedPreset::from_str(seed_name).ok_or_else(|| {
-			format!(
-				"Unknown seed preset: '{}'. Available presets: {:?}",
-				seed_name,
-				SeedPreset::all_names()
-			)
-		})?;
+		let seed_preset: SeedPreset = seed_name.parse()?;
 		let seed = seed_preset.get_seed();
 
 		// Parse seed overrides

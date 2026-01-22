@@ -20,6 +20,8 @@
 //! let optimism = seed.get_network(10).unwrap();
 //! ```
 
+use std::str::FromStr;
+
 mod mainnet;
 mod testnet;
 pub mod types;
@@ -37,21 +39,41 @@ pub enum SeedPreset {
 	Testnet,
 }
 
+/// Error type for parsing seed presets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseSeedPresetError(String);
+
+impl std::fmt::Display for ParseSeedPresetError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"Unknown seed preset: '{}'. Available presets: {:?}",
+			self.0,
+			SeedPreset::all_names()
+		)
+	}
+}
+
+impl std::error::Error for ParseSeedPresetError {}
+
+impl FromStr for SeedPreset {
+	type Err = ParseSeedPresetError;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		match s.to_lowercase().as_str() {
+			"mainnet" => Ok(SeedPreset::Mainnet),
+			"testnet" => Ok(SeedPreset::Testnet),
+			_ => Err(ParseSeedPresetError(s.to_string())),
+		}
+	}
+}
+
 impl SeedPreset {
 	/// Get the seed configuration for this preset.
 	pub fn get_seed(&self) -> &'static SeedConfig {
 		match self {
 			SeedPreset::Mainnet => &MAINNET_SEED,
 			SeedPreset::Testnet => &TESTNET_SEED,
-		}
-	}
-
-	/// Parse a preset from a string name.
-	pub fn from_str(s: &str) -> Option<Self> {
-		match s.to_lowercase().as_str() {
-			"mainnet" => Some(SeedPreset::Mainnet),
-			"testnet" => Some(SeedPreset::Testnet),
-			_ => None,
 		}
 	}
 
@@ -67,11 +89,11 @@ mod tests {
 
 	#[test]
 	fn test_seed_preset_from_str() {
-		assert_eq!(SeedPreset::from_str("mainnet"), Some(SeedPreset::Mainnet));
-		assert_eq!(SeedPreset::from_str("MAINNET"), Some(SeedPreset::Mainnet));
-		assert_eq!(SeedPreset::from_str("testnet"), Some(SeedPreset::Testnet));
-		assert_eq!(SeedPreset::from_str("TESTNET"), Some(SeedPreset::Testnet));
-		assert_eq!(SeedPreset::from_str("invalid"), None);
+		assert_eq!(SeedPreset::from_str("mainnet"), Ok(SeedPreset::Mainnet));
+		assert_eq!(SeedPreset::from_str("MAINNET"), Ok(SeedPreset::Mainnet));
+		assert_eq!(SeedPreset::from_str("testnet"), Ok(SeedPreset::Testnet));
+		assert_eq!(SeedPreset::from_str("TESTNET"), Ok(SeedPreset::Testnet));
+		assert!(SeedPreset::from_str("invalid").is_err());
 	}
 
 	#[test]
