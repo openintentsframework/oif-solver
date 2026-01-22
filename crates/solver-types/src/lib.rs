@@ -12,8 +12,6 @@ pub mod api;
 pub mod auth;
 /// Transaction delivery types for blockchain interactions.
 pub mod delivery;
-/// Seed override types for initializing a new solver.
-pub mod seed_overrides;
 /// Intent discovery types for finding and processing new orders.
 pub mod discovery;
 /// Event types for inter-service communication.
@@ -30,6 +28,8 @@ pub mod provider;
 pub mod registry;
 /// Secure string type for handling sensitive data.
 pub mod secret_string;
+/// Seed override types for initializing a new solver.
+pub mod seed_overrides;
 /// Standard-specific types for different cross-chain protocols.
 pub mod standards;
 /// Storage types for managing persistent data.
@@ -52,7 +52,6 @@ pub use api::*;
 pub use auth::{AuthConfig, AuthScope, JwtClaims, RefreshTokenData};
 pub use costs::{CostBreakdown, CostContext};
 pub use delivery::*;
-pub use seed_overrides::{NetworkOverride, SeedOverrides, Token};
 pub use discovery::*;
 pub use events::*;
 pub use networks::{NetworkConfig, NetworksConfig, TokenConfig};
@@ -64,6 +63,7 @@ pub use provider::{
 };
 pub use registry::ImplementationRegistry;
 pub use secret_string::SecretString;
+pub use seed_overrides::{NetworkOverride, SeedOverrides, Token};
 pub use standards::{
 	eip7683::{Eip7683OrderData, MandateOutput as Eip7683Output},
 	eip7930::{InteropAddress, InteropAddressError},
