@@ -3,6 +3,13 @@
 //! This module provides abstractions for persistent storage of solver data,
 //! supporting different backend implementations such as in-memory, file-based,
 //! or distributed storage systems.
+//!
+//! # Configuration Storage
+//!
+//! The [`config_store`] module provides specialized storage for solver configuration
+//! with optimistic locking support via versioning.
+
+pub mod config_store;
 
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
