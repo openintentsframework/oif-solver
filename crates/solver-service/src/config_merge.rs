@@ -1,6 +1,6 @@
-//! Configuration merge logic for combining deployment config with seed data.
+//! Configuration merge logic for combining seed overrides with seed data.
 //!
-//! This module provides the logic to merge a user-provided `DeploymentConfig`
+//! This module provides the logic to merge user-provided `SeedOverrides`
 //! with hardcoded `SeedConfig` to produce a complete `solver_config::Config`.
 //!
 //! # Architecture
@@ -10,17 +10,17 @@
 //! 2. Builds NetworksConfig from user tokens + seed contract addresses
 //! 3. Builds Hyperlane settlement config dynamically based on selected chains
 //! 4. Sets all standard implementations (storage, delivery, discovery, etc.)
-//! 5. Auto-generates a unique solver ID
+//! 5. Auto-generates a unique solver ID (or uses the provided one)
 //!
 //! # Example
 //!
 //! ```rust,ignore
 //! use solver_service::config_merge::merge_config;
 //! use solver_service::seeds::TESTNET_SEED;
-//! use solver_types::DeploymentConfig;
+//! use solver_types::SeedOverrides;
 //!
-//! let deployment: DeploymentConfig = serde_json::from_str(json)?;
-//! let config = merge_config(deployment, &TESTNET_SEED)?;
+//! let overrides: SeedOverrides = serde_json::from_str(json)?;
+//! let config = merge_config(overrides, &TESTNET_SEED)?;
 //! ```
 
 use crate::seeds::types::{NetworkSeed, SeedConfig, SeedDefaults};
@@ -30,7 +30,7 @@ use solver_config::{
 	StorageConfig, StrategyConfig,
 };
 use solver_types::{
-	networks::RpcEndpoint, DeploymentConfig, NetworkConfig, NetworkOverride, NetworksConfig,
+	networks::RpcEndpoint, NetworkConfig, NetworkOverride, NetworksConfig, SeedOverrides,
 	TokenConfig,
 };
 use std::collections::HashMap;
@@ -57,11 +57,11 @@ pub enum MergeError {
 	Validation(String),
 }
 
-/// Merges a deployment config with a seed config to produce a complete Config.
+/// Merges seed overrides with a seed config to produce a complete Config.
 ///
 /// # Arguments
 ///
-/// * `deployment` - User-provided deployment configuration with chain IDs and tokens
+/// * `overrides` - User-provided seed overrides with chain IDs and tokens
 /// * `seed` - Hardcoded seed configuration with contract addresses and defaults
 ///
 /// # Returns
@@ -74,15 +74,15 @@ pub enum MergeError {
 /// - A requested chain ID is not supported by the seed
 /// - No tokens are specified for a network
 /// - Fewer than 2 networks are requested
-pub fn merge_config(deployment: DeploymentConfig, seed: &SeedConfig) -> Result<Config, MergeError> {
+pub fn merge_config(overrides: SeedOverrides, seed: &SeedConfig) -> Result<Config, MergeError> {
 	// Validate we have at least 2 networks
-	if deployment.networks.len() < 2 {
+	if overrides.networks.len() < 2 {
 		return Err(MergeError::InsufficientNetworks);
 	}
 
 	// Validate all chain IDs exist in seed and have tokens
-	let chain_ids: Vec<u64> = deployment.networks.iter().map(|n| n.chain_id).collect();
-	for network in &deployment.networks {
+	let chain_ids: Vec<u64> = overrides.networks.iter().map(|n| n.chain_id).collect();
+	for network in &overrides.networks {
 		if !seed.supports_chain(network.chain_id) {
 			return Err(MergeError::UnknownChainId(
 				network.chain_id,
@@ -95,13 +95,13 @@ pub fn merge_config(deployment: DeploymentConfig, seed: &SeedConfig) -> Result<C
 	}
 
 	// Use provided solver_id or generate a new one
-	let solver_id = deployment
+	let solver_id = overrides
 		.solver_id
 		.clone()
 		.unwrap_or_else(|| format!("solver-{}", Uuid::new_v4()));
 
 	// Build networks config
-	let networks = build_networks_config(&deployment.networks, seed)?;
+	let networks = build_networks_config(&overrides.networks, seed)?;
 
 	// Build the full config
 	let config = Config {
@@ -121,7 +121,7 @@ pub fn merge_config(deployment: DeploymentConfig, seed: &SeedConfig) -> Result<C
 	Ok(config)
 }
 
-/// Builds the NetworksConfig from deployment overrides and seed data.
+/// Builds the NetworksConfig from seed overrides and seed data.
 fn build_networks_config(
 	overrides: &[NetworkOverride],
 	seed: &SeedConfig,
@@ -529,13 +529,13 @@ mod tests {
 	use crate::seeds::TESTNET_SEED;
 	use alloy_primitives::address;
 
-	fn test_deployment_config() -> DeploymentConfig {
-		DeploymentConfig {
+	fn test_seed_overrides() -> SeedOverrides {
+		SeedOverrides {
 			solver_id: None,
 			networks: vec![
 				NetworkOverride {
 					chain_id: 11155420, // Optimism Sepolia
-					tokens: vec![solver_types::deployment_config::Token {
+					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
 						decimals: 6,
@@ -544,7 +544,7 @@ mod tests {
 				},
 				NetworkOverride {
 					chain_id: 84532, // Base Sepolia
-					tokens: vec![solver_types::deployment_config::Token {
+					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
 						decimals: 6,
@@ -557,8 +557,8 @@ mod tests {
 
 	#[test]
 	fn test_merge_config_success() {
-		let deployment = test_deployment_config();
-		let result = merge_config(deployment, &TESTNET_SEED);
+		let overrides = test_seed_overrides();
+		let result = merge_config(overrides, &TESTNET_SEED);
 
 		assert!(result.is_ok());
 		let config = result.unwrap();
@@ -574,12 +574,12 @@ mod tests {
 
 	#[test]
 	fn test_merge_config_unknown_chain() {
-		let deployment = DeploymentConfig {
+		let overrides = SeedOverrides {
 			solver_id: None,
 			networks: vec![
 				NetworkOverride {
 					chain_id: 999999, // Unknown chain
-					tokens: vec![solver_types::deployment_config::Token {
+					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "TEST".to_string(),
 						address: address!("1111111111111111111111111111111111111111"),
 						decimals: 18,
@@ -588,7 +588,7 @@ mod tests {
 				},
 				NetworkOverride {
 					chain_id: 11155420,
-					tokens: vec![solver_types::deployment_config::Token {
+					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
 						decimals: 6,
@@ -598,7 +598,7 @@ mod tests {
 			],
 		};
 
-		let result = merge_config(deployment, &TESTNET_SEED);
+		let result = merge_config(overrides, &TESTNET_SEED);
 		assert!(result.is_err());
 		assert!(matches!(
 			result.unwrap_err(),
@@ -608,7 +608,7 @@ mod tests {
 
 	#[test]
 	fn test_merge_config_no_tokens() {
-		let deployment = DeploymentConfig {
+		let overrides = SeedOverrides {
 			solver_id: None,
 			networks: vec![
 				NetworkOverride {
@@ -618,7 +618,7 @@ mod tests {
 				},
 				NetworkOverride {
 					chain_id: 84532,
-					tokens: vec![solver_types::deployment_config::Token {
+					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
 						decimals: 6,
@@ -628,7 +628,7 @@ mod tests {
 			],
 		};
 
-		let result = merge_config(deployment, &TESTNET_SEED);
+		let result = merge_config(overrides, &TESTNET_SEED);
 		assert!(result.is_err());
 		assert!(matches!(
 			result.unwrap_err(),
@@ -638,11 +638,11 @@ mod tests {
 
 	#[test]
 	fn test_merge_config_insufficient_networks() {
-		let deployment = DeploymentConfig {
+		let overrides = SeedOverrides {
 			solver_id: None,
 			networks: vec![NetworkOverride {
 				chain_id: 11155420,
-				tokens: vec![solver_types::deployment_config::Token {
+				tokens: vec![solver_types::seed_overrides::Token {
 					symbol: "USDC".to_string(),
 					address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
 					decimals: 6,
@@ -651,7 +651,7 @@ mod tests {
 			}],
 		};
 
-		let result = merge_config(deployment, &TESTNET_SEED);
+		let result = merge_config(overrides, &TESTNET_SEED);
 		assert!(result.is_err());
 		assert!(matches!(
 			result.unwrap_err(),
@@ -661,8 +661,8 @@ mod tests {
 
 	#[test]
 	fn test_network_config_uses_seed_defaults() {
-		let deployment = test_deployment_config();
-		let config = merge_config(deployment, &TESTNET_SEED).unwrap();
+		let overrides = test_seed_overrides();
+		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
 
 		// Check Optimism Sepolia uses seed default RPC (no override provided)
 		let opt_network = config.networks.get(&11155420).unwrap();
@@ -672,8 +672,8 @@ mod tests {
 
 	#[test]
 	fn test_network_config_uses_custom_rpc() {
-		let deployment = test_deployment_config();
-		let config = merge_config(deployment, &TESTNET_SEED).unwrap();
+		let overrides = test_seed_overrides();
+		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
 
 		// Check Base Sepolia uses custom RPC (override provided)
 		let base_network = config.networks.get(&84532).unwrap();
@@ -683,8 +683,8 @@ mod tests {
 
 	#[test]
 	fn test_settlement_config_has_hyperlane() {
-		let deployment = test_deployment_config();
-		let config = merge_config(deployment, &TESTNET_SEED).unwrap();
+		let overrides = test_seed_overrides();
+		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
 
 		assert!(config.settlement.implementations.contains_key("hyperlane"));
 
@@ -698,8 +698,8 @@ mod tests {
 
 	#[test]
 	fn test_hyperlane_routes_bidirectional() {
-		let deployment = test_deployment_config();
-		let config = merge_config(deployment, &TESTNET_SEED).unwrap();
+		let overrides = test_seed_overrides();
+		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
 
 		let hyperlane = config.settlement.implementations.get("hyperlane").unwrap();
 		let routes = hyperlane.get("routes").unwrap().as_table().unwrap();
@@ -715,8 +715,8 @@ mod tests {
 
 	#[test]
 	fn test_storage_config() {
-		let deployment = test_deployment_config();
-		let config = merge_config(deployment, &TESTNET_SEED).unwrap();
+		let overrides = test_seed_overrides();
+		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
 
 		assert_eq!(config.storage.primary, "redis");
 		assert!(config.storage.implementations.contains_key("redis"));
@@ -725,8 +725,8 @@ mod tests {
 
 	#[test]
 	fn test_pricing_config() {
-		let deployment = test_deployment_config();
-		let config = merge_config(deployment, &TESTNET_SEED).unwrap();
+		let overrides = test_seed_overrides();
+		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
 
 		let pricing = config.pricing.as_ref().unwrap();
 		assert_eq!(pricing.primary, "coingecko");
@@ -737,8 +737,8 @@ mod tests {
 
 	#[test]
 	fn test_gas_config() {
-		let deployment = test_deployment_config();
-		let config = merge_config(deployment, &TESTNET_SEED).unwrap();
+		let overrides = test_seed_overrides();
+		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
 
 		let gas = config.gas.as_ref().unwrap();
 		assert!(gas.flows.contains_key("resource_lock"));

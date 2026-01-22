@@ -12,8 +12,8 @@ pub mod api;
 pub mod auth;
 /// Transaction delivery types for blockchain interactions.
 pub mod delivery;
-/// Deployment configuration types for initializing a new solver.
-pub mod deployment_config;
+/// Seed override types for initializing a new solver.
+pub mod seed_overrides;
 /// Intent discovery types for finding and processing new orders.
 pub mod discovery;
 /// Event types for inter-service communication.
@@ -52,7 +52,7 @@ pub use api::*;
 pub use auth::{AuthConfig, AuthScope, JwtClaims, RefreshTokenData};
 pub use costs::{CostBreakdown, CostContext};
 pub use delivery::*;
-pub use deployment_config::{DeploymentConfig, NetworkOverride, Token};
+pub use seed_overrides::{NetworkOverride, SeedOverrides, Token};
 pub use discovery::*;
 pub use events::*;
 pub use networks::{NetworkConfig, NetworksConfig, TokenConfig};

@@ -4,26 +4,26 @@
 //! validates, executes, and settles cross-chain orders. It uses a modular
 //! architecture with pluggable implementations for different components.
 //!
-//! # Configuration Modes
+//! # Configuration
 //!
-//! The solver can be configured in two ways:
+//! The solver uses Redis as the single source of truth for runtime configuration.
+//! Configuration is seeded once when deploying a new solver, then loaded from Redis
+//! on subsequent startups.
 //!
-//! 1. **Legacy mode (--config)**: Load configuration from a TOML file
-//! 2. **Redis mode (--seed + --deployment-config)**: Load configuration from Redis
-//!
-//! # Redis Mode Usage
+//! # Usage
 //!
 //! ```bash
 //! # First run: seed configuration to Redis
 //! export REDIS_URL="redis://localhost:6379"
-//! export SOLVER_PRIVATE_KEY="0x..."
-//! solver --seed testnet --deployment-config '{"networks":[...]}'
+//! export SOLVER_PRIVATE_KEY="your_64_hex_character_private_key"
+//! solver --seed testnet --seed-overrides '{"networks":[...]}'
 //!
 //! # Subsequent runs: load from Redis
+//! export SOLVER_ID="your-solver-id"
 //! solver
 //!
-//! # Force re-seed
-//! solver --seed testnet --deployment-config '{"networks":[...]}' --force-seed
+//! # Force re-seed (overwrite existing configuration)
+//! solver --seed testnet --seed-overrides '{"networks":[...]}' --force-seed
 //! ```
 
 use clap::Parser;
@@ -32,31 +32,25 @@ use solver_service::{
 	build_solver_from_config, config_merge::merge_config, seeds::SeedPreset, server,
 };
 use solver_storage::config_store::{ConfigStore, RedisConfigStore};
-use solver_types::DeploymentConfig;
-use std::path::PathBuf;
+use solver_types::SeedOverrides;
 use std::sync::Arc;
 
 /// Command-line arguments for the solver service.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-	/// Path to configuration file (legacy mode)
-	///
-	/// When specified, configuration is loaded from this TOML file instead of Redis.
-	#[arg(short, long)]
-	config: Option<PathBuf>,
-
 	/// Seed preset to use (mainnet, testnet)
 	///
-	/// Use this with --deployment-config to seed initial configuration to Redis.
+	/// Use this with --seed-overrides to seed initial configuration to Redis.
 	#[arg(long)]
 	seed: Option<String>,
 
-	/// Deployment configuration (JSON string or path to JSON file)
+	/// Seed overrides (JSON string or path to JSON file)
 	///
 	/// Contains the networks and tokens this solver should support.
+	/// These values override/extend the seed preset defaults.
 	#[arg(long)]
-	deployment_config: Option<String>,
+	seed_overrides: Option<String>,
 
 	/// Force re-seed even if configuration exists in Redis
 	#[arg(long, default_value = "false")]
@@ -137,24 +131,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Load configuration based on command-line arguments.
 ///
-/// Supports two modes:
-/// 1. Legacy mode: Load from TOML file (--config)
-/// 2. Redis mode: Load from Redis, optionally seeding first (--seed + --deployment-config)
+/// Configuration is loaded from Redis, optionally seeding first with --seed + --seed-overrides.
 async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> {
-	// Legacy mode: load from TOML file
-	if let Some(config_path) = &args.config {
-		tracing::info!("Loading configuration from file: {:?}", config_path);
-		return Config::from_file(config_path.to_str().unwrap())
-			.await
-			.map_err(Into::into);
-	}
-
-	// Redis mode: load from Redis (with optional seeding)
 	let redis_url =
 		std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
 
 	// Handle seeding if requested
-	if let (Some(seed_name), Some(deployment_config_str)) = (&args.seed, &args.deployment_config) {
+	if let (Some(seed_name), Some(seed_overrides_str)) = (&args.seed, &args.seed_overrides) {
 		// Parse seed preset
 		let seed_preset = SeedPreset::from_str(seed_name).ok_or_else(|| {
 			format!(
@@ -165,12 +148,12 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 		})?;
 		let seed = seed_preset.get_seed();
 
-		// Parse deployment config
-		let deployment_config = parse_deployment_config(deployment_config_str)?;
+		// Parse seed overrides
+		let seed_overrides = parse_seed_overrides(seed_overrides_str)?;
 
-		// Merge seed + deployment config
-		tracing::info!("Merging deployment config with {} seed", seed_name);
-		let merged_config = merge_config(deployment_config, seed)?;
+		// Merge seed + overrides
+		tracing::info!("Merging seed overrides with {} seed", seed_name);
+		let merged_config = merge_config(seed_overrides, seed)?;
 
 		// Create config store for seeding
 		let config_store =
@@ -189,20 +172,33 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 			tracing::info!("Seeding configuration to Redis");
 			let versioned = config_store.seed(merged_config).await?;
 			let solver_id = &versioned.data.solver.id;
-			tracing::info!(
-				"Configuration seeded: solver_id={}, version={}",
-				solver_id,
-				versioned.version
-			);
-			tracing::info!("For subsequent runs, set: export SOLVER_ID={}", solver_id);
+
+			// Print prominent output for the solver ID
+			println!();
+			println!("════════════════════════════════════════════════════════════");
+			println!("  Configuration seeded successfully!");
+			println!("════════════════════════════════════════════════════════════");
+			println!("  SOLVER_ID: {}", solver_id);
+			println!("  Version:   {}", versioned.version);
+			println!();
+			println!("  For subsequent runs, set:");
+			println!("    export SOLVER_ID={}", solver_id);
+			println!("════════════════════════════════════════════════════════════");
+			println!();
 
 			return Ok(versioned.into_inner());
 		} else {
-			tracing::info!(
-				"Configuration already exists in Redis for solver_id={}, skipping seed",
-				merged_config.solver.id
-			);
-			tracing::info!("Use --force-seed to overwrite existing configuration");
+			// Print info about existing config
+			println!();
+			println!("════════════════════════════════════════════════════════════");
+			println!("  Configuration already exists (skipping seed)");
+			println!("════════════════════════════════════════════════════════════");
+			println!("  SOLVER_ID: {}", merged_config.solver.id);
+			println!();
+			println!("  Use --force-seed to overwrite existing configuration");
+			println!("════════════════════════════════════════════════════════════");
+			println!();
+
 			// Load and return existing config
 			let versioned = config_store.get().await?;
 			return Ok(versioned.into_inner());
@@ -216,9 +212,8 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 	// 2. Error out because we don't know which config to load
 	let solver_id = std::env::var("SOLVER_ID").map_err(|_| {
 		"No configuration source specified. Use one of:\n\
-         1. --config <file.toml> for legacy file-based configuration\n\
-         2. --seed <preset> --deployment-config <json> to seed new configuration\n\
-         3. Set SOLVER_ID environment variable to load existing configuration from Redis"
+         1. --seed <preset> --seed-overrides <json> to seed new configuration\n\
+         2. Set SOLVER_ID environment variable to load existing configuration from Redis"
 	})?;
 
 	tracing::info!("Loading configuration from Redis for solver: {}", solver_id);
@@ -234,8 +229,8 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 	Ok(versioned.into_inner())
 }
 
-/// Parse deployment configuration from a JSON string or file path.
-fn parse_deployment_config(input: &str) -> Result<DeploymentConfig, Box<dyn std::error::Error>> {
+/// Parse seed overrides from a JSON string or file path.
+fn parse_seed_overrides(input: &str) -> Result<SeedOverrides, Box<dyn std::error::Error>> {
 	// Try as file path first
 	if std::path::Path::new(input).exists() {
 		let content = std::fs::read_to_string(input)?;

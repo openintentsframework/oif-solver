@@ -134,7 +134,7 @@ oif-solver/
 │   ├── solver-settlement/       # Settlement verification
 │   ├── solver-storage/          # State persistence
 │   └── solver-types/            # Shared types
-├── config/                      # Configuration examples
+├── config/                      # Seed overrides and demo settings
 └── scripts/                     # E2E testing and deployment scripts
 ```
 
@@ -224,7 +224,7 @@ export REDIS_URL=redis://localhost:6379
 export SOLVER_PRIVATE_KEY=your_64_hex_character_private_key
 
 # 3. First run: Seed configuration from preset + deployment config
-cargo run -- --seed testnet --deployment-config config/deployment-testnet.json
+cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
 
 # 4. Subsequent runs: Configuration loads automatically from Redis
 cargo run --
@@ -239,14 +239,17 @@ The solver uses Redis as the single source of truth for runtime configuration. C
 ### Seeding Configuration
 
 ```bash
-# Seed testnet configuration
-cargo run -- --seed testnet --deployment-config config/deployment-testnet.json
+# Seed testnet configuration (using file)
+cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
 
-# Seed mainnet configuration
-cargo run -- --seed mainnet --deployment-config config/deployment-mainnet.json
+# Seed mainnet configuration (using file)
+cargo run -- --seed mainnet --seed-overrides config/seed-overrides-mainnet.json
+
+# Or pass JSON directly (useful for deployment services)
+cargo run -- --seed testnet --seed-overrides '{"solver_id":"my-solver","networks":[{"chain_id":11155420,"tokens":[{"symbol":"USDC","address":"0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6","decimals":6}]},{"chain_id":84532,"tokens":[{"symbol":"USDC","address":"0x73c83DAcc74bB8a704717AC09703b959E74b9705","decimals":6}]}]}'
 
 # Force re-seed (overwrite existing)
-cargo run -- --seed testnet --deployment-config config/deployment-testnet.json --force-seed
+cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json --force-seed
 ```
 
 ### Environment Variables
@@ -257,9 +260,9 @@ cargo run -- --seed testnet --deployment-config config/deployment-testnet.json -
 | `SOLVER_PRIVATE_KEY` | Yes | 64-character hex private key (without 0x prefix) |
 | `SOLVER_ID` | For loading | Solver ID to load from Redis (set after first seed) |
 
-### Deployment Config
+### Seed Overrides Format
 
-Create a JSON file specifying which networks and tokens to support:
+Create a JSON file specifying which networks and tokens to support (these override/extend the seed preset defaults):
 
 ```json
 {
@@ -463,16 +466,16 @@ The solver uses the `RUST_LOG` environment variable for fine-grained logging con
 
 ```bash
 # Show debug logs for solver modules only
-RUST_LOG=solver_core=debug,solver_delivery=debug,info cargo run -- --config config/demo.toml
+RUST_LOG=solver_core=debug,solver_delivery=debug,info cargo run
 
 # Reduce noise from external crates
-RUST_LOG=info,hyper=warn,alloy_provider=warn cargo run -- --config config/demo.toml
+RUST_LOG=info,hyper=warn,alloy_provider=warn cargo run
 
 # Debug specific modules
-RUST_LOG=solver_core=debug,solver_delivery=info,alloy=warn,hyper=warn cargo run -- --config config/demo.toml
+RUST_LOG=solver_core=debug,solver_delivery=info,alloy=warn,hyper=warn cargo run
 
 # Show all debug logs (very verbose)
-RUST_LOG=debug cargo run -- --config config/demo.toml
+RUST_LOG=debug cargo run
 ```
 
 Available log levels (from most to least verbose):
@@ -487,7 +490,7 @@ The `--log-level` flag acts as a fallback when `RUST_LOG` is not set:
 
 ```bash
 # Uses info level for all modules when RUST_LOG is not set
-cargo run -- --config config/demo.toml --log-level info
+cargo run -- --log-level info
 ```
 
 ## Testing and Development with solver-demo
@@ -504,6 +507,8 @@ The project includes a Rust-based CLI tool (`solver-demo`) for testing cross-cha
 
 ### Quick Start
 
+> **Note:** The solver-demo tool uses local Anvil chains for testing. The main solver binary uses Redis-based configuration for production deployments. See below for demo-specific setup.
+
 ```bash
 # 1. Initialize configuration and load it
 cargo run -p solver-demo -- init new config/demo.toml
@@ -516,8 +521,8 @@ cargo run -p solver-demo -- env start
 cargo run -p solver-demo -- env deploy --all
 cargo run -p solver-demo -- env setup
 
-# 4. In another terminal, start the solver
-cargo run --bin solver -- --config config/demo.toml
+# 4. In another terminal, the demo tests can be run without starting the main solver
+#    The solver-demo tool handles intent building, quoting, and submission for testing
 
 # 5. Build and test intents
 # Build an intent request
@@ -726,24 +731,28 @@ The demo tool provides a complete workflow for setting up a test environment:
    - Registers allocator with TheCompact
    - Validates all approvals and registrations
 
-### Running the Solver
+### Running the Solver (Production)
 
-After setting up the environment, start the solver in a separate terminal:
+For production deployments, the solver uses Redis-based configuration:
 
 ```bash
 # Build the project
 cargo build
 
-# Run the solver with local configuration
-cargo run --bin solver -- --config config/demo.toml
+# Seed configuration (first run only)
+cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
+
+# Run the solver (loads config from Redis)
+export SOLVER_ID=your-solver-id  # Output from seeding step
+cargo run
 
 # Or with debug logs for debugging
-RUST_LOG=solver_core=debug,solver_delivery=info,info cargo run --bin solver -- --config config/demo.toml
+RUST_LOG=solver_core=debug,solver_delivery=info,info cargo run
 ```
 
 The solver will:
 
-- Connect to both local chains
+- Connect to configured chains
 - Start monitoring for new intents
 - Process discovered intents automatically
 

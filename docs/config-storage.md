@@ -24,11 +24,14 @@ export SOLVER_PRIVATE_KEY=your_64_hex_character_private_key
 ### First Run: Seed Configuration
 
 ```bash
-# Seed testnet configuration
-cargo run -- --seed testnet --deployment-config config/deployment-testnet.json
+# Seed testnet configuration (using file path)
+cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
 
-# Or seed mainnet configuration
-cargo run -- --seed mainnet --deployment-config config/deployment-mainnet.json
+# Or seed mainnet configuration (using file path)
+cargo run -- --seed mainnet --seed-overrides config/seed-overrides-mainnet.json
+
+# Or pass JSON directly (useful for deployment services)
+cargo run -- --seed testnet --seed-overrides '{"solver_id":"my-solver","networks":[{"chain_id":11155420,"tokens":[{"symbol":"USDC","address":"0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6","decimals":6}]},{"chain_id":84532,"tokens":[{"symbol":"USDC","address":"0x73c83DAcc74bB8a704717AC09703b959E74b9705","decimals":6}]}]}'
 ```
 
 ### Subsequent Runs: Load from Redis
@@ -43,12 +46,12 @@ cargo run --
 | Flag | Description |
 |------|-------------|
 | `--seed <preset>` | Seed configuration using a preset (`testnet` or `mainnet`) |
-| `--deployment-config <path>` | Path to deployment config JSON file |
+| `--seed-overrides <value>` | Seed overrides as JSON file path OR raw JSON string |
 | `--force-seed` | Overwrite existing configuration in Redis |
 
-## Deployment Config Format
+## Seed Overrides Format
 
-The deployment config specifies which networks and tokens your solver will support:
+The seed overrides specify which networks and tokens your solver will support (these override/extend the seed preset defaults):
 
 ```json
 {
@@ -128,13 +131,13 @@ The deployment config specifies which networks and tokens your solver will suppo
 When you run with `--seed`, the solver:
 
 1. Loads the seed preset (testnet/mainnet) with hardcoded contract addresses
-2. Merges your deployment config (tokens, optional RPC URLs) with the seed
+2. Merges your seed overrides (tokens, optional RPC URLs) with the seed
 3. Generates a unique `solver_id` (e.g., `solver-abc123-...`)
 4. Stores the complete configuration in Redis
 
 ```
 ┌─────────────────────┐     ┌─────────────────────┐     ┌─────────────────┐
-│  Hardcoded Seeds    │     │  Deployment Config  │     │  Final Config   │
+│  Hardcoded Seeds    │     │   Seed Overrides    │     │  Final Config   │
 │  (testnet/mainnet)  │  +  │  (your JSON file)   │  =  │  (in Redis)     │
 │                     │     │                     │     │                 │
 │  - Contract addrs   │     │  - Chain IDs        │     │  Complete       │
@@ -189,7 +192,7 @@ The solver ID in your environment doesn't have configuration in Redis. Either:
 You're trying to seed when configuration already exists. Use `--force-seed` to overwrite:
 
 ```bash
-cargo run -- --seed testnet --deployment-config config/deployment-testnet.json --force-seed
+cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json --force-seed
 ```
 
 ### "Private key must be 64 hex characters"
@@ -239,8 +242,8 @@ redis-server
 export REDIS_URL=redis://localhost:6379
 export SOLVER_PRIVATE_KEY=your_private_key_here
 
-# 3. Create deployment config
-cat > config/my-deployment.json << 'EOF'
+# 3. Create seed overrides
+cat > config/my-overrides.json << 'EOF'
 {
   "networks": [
     {
@@ -260,7 +263,7 @@ cat > config/my-deployment.json << 'EOF'
 EOF
 
 # 4. Seed configuration
-cargo run -- --seed testnet --deployment-config config/my-deployment.json
+cargo run -- --seed testnet --seed-overrides config/my-overrides.json
 
 # 5. Subsequent runs just load from Redis
 cargo run --
