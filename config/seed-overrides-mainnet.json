@@ -6,7 +6,7 @@
       "tokens": [
         {
           "symbol": "USDC",
-          "address": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
+          "address": "0xc0b782920B2DE8b55f08FC98004Eb5c7d4fBf287",
           "decimals": 6
         }
       ]
@@ -16,7 +16,7 @@
       "tokens": [
         {
           "symbol": "USDC",
-          "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "address": "0xc0b782920B2DE8b55f08FC98004Eb5c7d4fBf287",
           "decimals": 6
         }
       ]
@@ -26,7 +26,7 @@
       "tokens": [
         {
           "symbol": "USDC",
-          "address": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+          "address": "0x7e13E59a15E4703a54a0976dDd970F8Fe52d3a76",
           "decimals": 6
         }
       ]
