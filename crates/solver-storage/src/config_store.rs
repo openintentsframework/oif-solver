@@ -577,4 +577,133 @@ mod integration_tests {
 		// Cleanup
 		store.delete().await.expect("delete() failed");
 	}
+
+	#[tokio::test]
+	#[ignore] // Requires running Redis
+	async fn test_optimistic_locking_version_mismatch() {
+		let solver_id = unique_solver_id();
+		let store = create_redis_config_store::<TestConfig>(
+			"redis://localhost:6379".to_string(),
+			solver_id.clone(),
+		).unwrap();
+
+		// Cleanup
+		let _ = store.delete().await;
+
+		// Seed initial configuration
+		let config = create_test_config(&solver_id);
+		let seeded = store.seed(config.clone()).await.unwrap();
+		assert_eq!(seeded.version, 1);
+
+		// Update with correct version should succeed
+		let mut updated_config = config.clone();
+		updated_config.version = 999;
+		let updated = store.update(updated_config, 1).await.unwrap();
+		assert_eq!(updated.version, 2);
+
+		// Update with stale version should fail
+		let mut stale_config = config.clone();
+		stale_config.settings.insert("stale_update".to_string(), "should_fail".to_string());
+		
+		let result = store.update(stale_config, 1).await; // Using stale version 1
+		assert!(result.is_err());
+		assert!(matches!(result.unwrap_err(), ConfigStoreError::VersionMismatch { expected: 1, found: 2 }));
+
+		// Configuration should be unchanged
+		let current = store.get().await.unwrap();
+		assert_eq!(current.version, 2);
+		assert_eq!(current.data.version, 999); // Should still have the successful update
+
+		// Cleanup
+		store.delete().await.unwrap();
+	}
+
+
+	#[tokio::test]
+	#[ignore] // Requires running Redis
+	async fn test_update_not_found() {
+		let solver_id = unique_solver_id();
+		let store = create_redis_config_store::<TestConfig>(
+			"redis://localhost:6379".to_string(),
+			solver_id.clone(),
+		).unwrap();
+
+		// Cleanup to ensure clean state
+		let _ = store.delete().await;
+
+		// Update on non-existent config should return NotFound
+		let config = create_test_config(&solver_id);
+		let result = store.update(config, 1).await;
+		assert!(result.is_err());
+		assert!(matches!(result.unwrap_err(), ConfigStoreError::NotFound(id) if id == solver_id));
+	}
+
+	#[tokio::test]
+	#[ignore] // Requires running Redis
+	async fn test_delete_idempotent() {
+		let solver_id = unique_solver_id();
+		let store = create_redis_config_store::<TestConfig>(
+			"redis://localhost:6379".to_string(),
+			solver_id.clone(),
+		).unwrap();
+
+		// Cleanup to ensure clean state
+		let _ = store.delete().await;
+
+		// Delete on non-existent config should succeed (idempotent)
+		assert!(store.delete().await.is_ok());
+
+		// Seed, then delete, then delete again
+		let config = create_test_config(&solver_id);
+		store.seed(config).await.unwrap();
+		
+		// First delete should succeed
+		assert!(store.delete().await.is_ok());
+		assert_eq!(store.exists().await.unwrap(), false);
+		
+		// Second delete should still succeed (idempotent)
+		assert!(store.delete().await.is_ok());
+	}
+
+	#[tokio::test]
+	#[ignore] // Requires running Redis
+	async fn test_config_persistence_across_connections() {
+		let solver_id = unique_solver_id();
+		
+		// Create first store instance
+		let store1 = create_redis_config_store::<TestConfig>(
+			"redis://localhost:6379".to_string(),
+			solver_id.clone(),
+		).unwrap();
+
+		// Cleanup
+		let _ = store1.delete().await;
+
+		// Seed configuration
+		let config = create_test_config(&solver_id);
+		let seeded = store1.seed(config.clone()).await.unwrap();
+		assert_eq!(seeded.version, 1);
+
+		// Drop the first store and create a new one
+		drop(store1);
+		let store2 = create_redis_config_store::<TestConfig>(
+			"redis://localhost:6379".to_string(),
+			solver_id.clone(),
+		).unwrap();
+
+		// Configuration should persist across connections
+		let retrieved = store2.get().await.unwrap();
+		assert_eq!(retrieved.version, 1);
+		assert_eq!(retrieved.data, config);
+
+		// Should be able to update from new connection
+		let mut updated_config = config.clone();
+		updated_config.version = 123;
+		let updated = store2.update(updated_config.clone(), 1).await.unwrap();
+		assert_eq!(updated.version, 2);
+		assert_eq!(updated.data, updated_config);
+
+		// Cleanup
+		store2.delete().await.unwrap();
+	}
 }
