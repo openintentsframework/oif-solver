@@ -152,9 +152,7 @@ impl std::fmt::Debug for ConfigStoreConfig {
 			ConfigStoreConfig::Redis { url } => {
 				// Redact credentials from URL to prevent leaking secrets in logs
 				let redacted_url = redact_url_credentials(url);
-				f.debug_struct("Redis")
-					.field("url", &redacted_url)
-					.finish()
+				f.debug_struct("Redis").field("url", &redacted_url).finish()
 			},
 		}
 	}
