@@ -8,8 +8,14 @@
 //!
 //! The [`config_store`] module provides specialized storage for solver configuration
 //! with optimistic locking support via versioning.
+//!
+//! # Nonce Storage
+//!
+//! The [`nonce_store`] module provides nonce management for admin authentication
+//! with Redis-backed storage and TTL support.
 
 pub mod config_store;
+pub mod nonce_store;
 
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};

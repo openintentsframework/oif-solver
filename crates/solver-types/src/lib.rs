@@ -49,7 +49,7 @@ pub mod pricing;
 // Re-export all types for convenient access
 pub use account::*;
 pub use api::*;
-pub use auth::{AuthConfig, AuthScope, JwtClaims, RefreshTokenData};
+pub use auth::{AdminConfig, AuthConfig, AuthScope, JwtClaims, RefreshTokenData};
 pub use costs::{CostBreakdown, CostContext};
 pub use delivery::*;
 pub use discovery::*;

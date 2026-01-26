@@ -1,0 +1,161 @@
+//! Error types for admin authentication.
+
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Json};
+use serde::Serialize;
+use thiserror::Error;
+
+/// Errors that can occur during admin authentication.
+#[derive(Error, Debug)]
+pub enum AdminAuthError {
+	/// Invalid signature format or length
+	#[error("Invalid signature: {0}")]
+	InvalidSignature(String),
+
+	/// Signature verification/recovery failed
+	#[error("Signature verification failed: {0}")]
+	SignatureVerification(String),
+
+	/// Address is not in the admin registry
+	#[error("Address {0} is not authorized as admin")]
+	NotAuthorized(String),
+
+	/// Invalid nonce format
+	#[error("Invalid nonce: {0}")]
+	InvalidNonce(String),
+
+	/// Nonce not found or already consumed
+	#[error("Nonce not found or already used")]
+	NonceNotFound,
+
+	/// Request has expired
+	#[error("Request expired")]
+	Expired,
+
+	/// Domain in signature doesn't match expected domain
+	#[error("Domain mismatch: expected {expected}, got {actual}")]
+	DomainMismatch { expected: String, actual: String },
+
+	/// Message format is invalid
+	#[error("Invalid message format: {0}")]
+	InvalidMessage(String),
+
+	/// Internal server error
+	#[error("Internal error: {0}")]
+	Internal(String),
+}
+
+/// API error response format for admin auth errors.
+#[derive(Serialize, serde::Deserialize)]
+pub struct AdminAuthErrorResponse {
+	/// Error code (e.g., "invalid_signature", "not_authorized")
+	pub error: String,
+	/// Human-readable error description
+	pub error_description: String,
+}
+
+impl IntoResponse for AdminAuthError {
+	fn into_response(self) -> axum::response::Response {
+		let (status, error_code) = match &self {
+			AdminAuthError::InvalidSignature(_) => (StatusCode::BAD_REQUEST, "invalid_signature"),
+			AdminAuthError::SignatureVerification(_) => {
+				(StatusCode::UNAUTHORIZED, "signature_failed")
+			},
+			AdminAuthError::NotAuthorized(_) => (StatusCode::FORBIDDEN, "not_authorized"),
+			AdminAuthError::InvalidNonce(_) => (StatusCode::BAD_REQUEST, "invalid_nonce"),
+			AdminAuthError::NonceNotFound => (StatusCode::BAD_REQUEST, "nonce_not_found"),
+			AdminAuthError::Expired => (StatusCode::UNAUTHORIZED, "expired"),
+			AdminAuthError::DomainMismatch { .. } => (StatusCode::UNAUTHORIZED, "domain_mismatch"),
+			AdminAuthError::InvalidMessage(_) => (StatusCode::BAD_REQUEST, "invalid_message"),
+			AdminAuthError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+		};
+
+		let body = AdminAuthErrorResponse {
+			error: error_code.to_string(),
+			error_description: self.to_string(),
+		};
+
+		(status, Json(body)).into_response()
+	}
+}
+
+impl From<solver_storage::nonce_store::NonceError> for AdminAuthError {
+	fn from(err: solver_storage::nonce_store::NonceError) -> Self {
+		match err {
+			solver_storage::nonce_store::NonceError::NotFound => AdminAuthError::NonceNotFound,
+			solver_storage::nonce_store::NonceError::Redis(e) => {
+				AdminAuthError::Internal(format!("Redis error: {}", e))
+			},
+			solver_storage::nonce_store::NonceError::Configuration(msg) => {
+				AdminAuthError::Internal(format!("Configuration error: {}", msg))
+			},
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use axum::body::to_bytes;
+
+	#[tokio::test]
+	async fn test_error_response_status_codes() {
+		// Test each error variant produces correct status code
+		let cases = vec![
+			(
+				AdminAuthError::InvalidSignature("test".into()),
+				StatusCode::BAD_REQUEST,
+			),
+			(
+				AdminAuthError::SignatureVerification("test".into()),
+				StatusCode::UNAUTHORIZED,
+			),
+			(
+				AdminAuthError::NotAuthorized("0x123".into()),
+				StatusCode::FORBIDDEN,
+			),
+			(
+				AdminAuthError::InvalidNonce("test".into()),
+				StatusCode::BAD_REQUEST,
+			),
+			(AdminAuthError::NonceNotFound, StatusCode::BAD_REQUEST),
+			(AdminAuthError::Expired, StatusCode::UNAUTHORIZED),
+			(
+				AdminAuthError::DomainMismatch {
+					expected: "a".into(),
+					actual: "b".into(),
+				},
+				StatusCode::UNAUTHORIZED,
+			),
+			(
+				AdminAuthError::InvalidMessage("test".into()),
+				StatusCode::BAD_REQUEST,
+			),
+			(
+				AdminAuthError::Internal("test".into()),
+				StatusCode::INTERNAL_SERVER_ERROR,
+			),
+		];
+
+		for (error, expected_status) in cases {
+			let response = error.into_response();
+			assert_eq!(
+				response.status(),
+				expected_status,
+				"Wrong status for error"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn test_error_response_body() {
+		let error = AdminAuthError::NotAuthorized("0xABC".into());
+		let response = error.into_response();
+
+		let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let parsed: AdminAuthErrorResponse = serde_json::from_slice(&body).unwrap();
+
+		assert_eq!(parsed.error, "not_authorized");
+		assert!(parsed.error_description.contains("0xABC"));
+	}
+}
