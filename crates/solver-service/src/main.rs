@@ -187,7 +187,6 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 			let existing_config = versioned.into_inner();
 
 			// Print info about existing config
-			println!();
 			tracing::info!("════════════════════════════════════════════════════════════");
 			tracing::info!("  Configuration already exists (skipping seed)");
 			tracing::info!("════════════════════════════════════════════════════════════");

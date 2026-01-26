@@ -259,75 +259,39 @@ where
 		})?;
 
 		// Use atomic Lua script for compare-and-swap
+		// Returns integer status codes to avoid protocol error handling issues:
+		// 1 = success, 0 = version mismatch, -1 = not found
 		let script = redis::Script::new(
 			r#"
             local key = KEYS[1]
-            local expected = ARGV[1]
+            local expected_version = tonumber(ARGV[1])
             local new_value = ARGV[2]
-            
+
             local current = redis.call('GET', key)
             if not current then
-                return redis.error_reply("CONFIG_NOT_FOUND")
+                return -1
             end
-            
+
             local current_data = cjson.decode(current)
-            local expected_data = cjson.decode(expected)
-            
-            if current_data.version ~= expected_data.version then
-                return 0
+            if current_data.version ~= expected_version then
+                return current_data.version
             end
-            
+
             redis.call('SET', key, new_value)
-            return redis.status_reply("OK")
+            return 1
             "#,
 		);
 
-		let old_json = serde_json::to_string(&current).map_err(|e| {
-			ConfigStoreError::Serialization(format!("Failed to serialize current config: {}", e))
-		})?;
-
-		let result: redis::Value = script
-			.key(key.clone())
-			.arg(&old_json)
+		let result: i64 = script
+			.key(&key)
+			.arg(expected_version)
 			.arg(&new_json)
 			.invoke_async(&mut conn)
 			.await
-			.map_err(|e| {
-				if e.to_string().contains("CONFIG_NOT_FOUND") {
-					ConfigStoreError::NotFound(self.solver_id.clone())
-				} else {
-					ConfigStoreError::Backend(format!("Redis script failed: {}", e))
-				}
-			})?;
+			.map_err(|e| ConfigStoreError::Backend(format!("Redis script failed: {}", e)))?;
 
 		match result {
-			redis::Value::Int(0) => {
-				// If we get here, the script returned an unexpected result
-				// This might be a version mismatch that wasn't caught properly
-				// Re-check the version
-				let check_json: Option<String> = conn
-					.get(&key)
-					.await
-					.map_err(|e| ConfigStoreError::Backend(format!("Redis GET failed: {}", e)))?;
-
-				if let Some(json) = check_json {
-					let current: Versioned<T> = serde_json::from_str(&json).map_err(|e| {
-						ConfigStoreError::Serialization(format!("Failed to deserialize: {}", e))
-					})?;
-
-					if current.version != expected_version {
-						return Err(ConfigStoreError::VersionMismatch {
-							expected: expected_version,
-							found: current.version,
-						});
-					}
-				}
-
-				Err(ConfigStoreError::Backend(
-					"Unexpected script result".to_string(),
-				))
-			},
-			redis::Value::Okay => {
+			1 => {
 				debug!(
 					key = %key,
 					old_version = expected_version,
@@ -336,10 +300,11 @@ where
 				);
 				Ok(new_versioned)
 			},
-			_ => Err(ConfigStoreError::Backend(format!(
-				"Unexpected Redis response: {:?}",
-				result
-			))),
+			-1 => Err(ConfigStoreError::NotFound(self.solver_id.clone())),
+			found_version => Err(ConfigStoreError::VersionMismatch {
+				expected: expected_version,
+				found: found_version as u64,
+			}),
 		}
 	}
 
