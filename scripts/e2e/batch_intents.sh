@@ -221,7 +221,7 @@ process_intent() {
     fi
     
     # Set API URL
-    local api_url="http://localhost:3000/api/orders"
+    local api_url="http://localhost:3000/api/v1/orders"
     
     echo -e "${YELLOW}🔗 API Endpoint: $api_url${NC}"
     

@@ -448,7 +448,7 @@ mod tests {
 			})
 		});
 
-		let pricing_service = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing_service = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 
 		// Create mock delivery service with chain implementations
 		let mut delivery_impls = HashMap::new();

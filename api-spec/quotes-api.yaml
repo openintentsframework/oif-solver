@@ -21,9 +21,9 @@ info:
     - **Resource Lock** (oif-resource-lock-v0): TheCompact allocations for resource locking
   version: 1.0.0
 servers:
-  - url: http://localhost:3000/api
+  - url: http://localhost:3000/api/v1
     description: Local development server
-  - url: https://api.solver.example.com/api
+  - url: https://api.solver.example.com/api/v1
     description: Production server (replace with actual URL)
 
 paths:

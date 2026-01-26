@@ -1751,7 +1751,7 @@ mod tests {
 
 	fn create_mock_pricing_service() -> Arc<PricingService> {
 		let mock = MockPricingInterface::new();
-		Arc::new(PricingService::new(Box::new(mock)))
+		Arc::new(PricingService::new(Box::new(mock), Vec::new()))
 	}
 
 	fn create_mock_delivery_service() -> Arc<DeliveryService> {
@@ -1897,7 +1897,7 @@ mod tests {
 			.returning(|_| Box::pin(async move { Ok(12345u64) }));
 
 		// Create services with proper delivery implementations
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 
 		// Create delivery service with mock implementations for both chains
 		let mut delivery_implementations = HashMap::new();
@@ -2156,7 +2156,7 @@ mod tests {
 		));
 
 		// Create services
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 
 		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
@@ -2342,7 +2342,7 @@ mod tests {
 			.with(eq("OUTPUT"), eq("USD"), eq("3900"))
 			.returning(|_, _, _| Box::pin(async move { Ok("3900.0".to_string()) }));
 
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let delivery = create_mock_delivery_service();
 		let token_manager = create_mock_token_manager();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
@@ -2371,7 +2371,7 @@ mod tests {
 			.with(eq("OUTPUT"), eq("USD"), eq("3990"))
 			.returning(|_, _, _| Box::pin(async move { Ok("3990.0".to_string()) }));
 
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let delivery = create_mock_delivery_service();
 		let token_manager = create_mock_token_manager();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
@@ -2657,7 +2657,7 @@ mod tests {
 			.expect_convert_asset()
 			.returning(|_, _, _| Box::pin(async move { Ok("0.0".to_string()) }));
 
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let delivery = create_mock_delivery_service();
 		let token_manager = create_mock_token_manager();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
@@ -2754,7 +2754,7 @@ mod tests {
 			})
 		});
 
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let delivery = create_mock_delivery_service();
 		let token_manager = create_mock_token_manager();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
@@ -2883,7 +2883,7 @@ mod tests {
 			.with(eq("OUTPUT"), eq("USD"), eq("3000"))
 			.returning(|_, _, _| Box::pin(async move { Ok("3000.0".to_string()) }));
 
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let delivery = create_mock_delivery_service();
 		let token_manager = create_mock_token_manager();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
@@ -3093,7 +3093,7 @@ mod tests {
 
 		let mock_pricing = MockPricingInterface::new();
 		let mock_storage = MockStorageInterface::new();
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let token_manager = create_mock_token_manager();
 
@@ -3136,7 +3136,7 @@ mod tests {
 
 		let mock_pricing = MockPricingInterface::new();
 		let mock_storage = MockStorageInterface::new();
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let token_manager = create_mock_token_manager();
 
@@ -3180,7 +3180,7 @@ mod tests {
 
 		let mock_pricing = MockPricingInterface::new();
 		let mock_storage = MockStorageInterface::new();
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let token_manager = create_mock_token_manager();
 
@@ -3222,7 +3222,7 @@ mod tests {
 
 		let mock_pricing = MockPricingInterface::new();
 		let mock_storage = MockStorageInterface::new();
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let token_manager = create_mock_token_manager();
 
@@ -3273,7 +3273,7 @@ mod tests {
 
 		let mock_pricing = MockPricingInterface::new();
 		let mock_storage = MockStorageInterface::new();
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let token_manager = create_mock_token_manager();
 
@@ -3318,7 +3318,7 @@ mod tests {
 
 		let mock_pricing = MockPricingInterface::new();
 		let mock_storage = MockStorageInterface::new();
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let token_manager = create_mock_token_manager();
 

@@ -352,7 +352,7 @@ mod tests {
 			&toml::Value::Table(toml::map::Map::new()),
 		)
 		.unwrap();
-		let pricing = Arc::new(PricingService::new(pricing_impl));
+		let pricing = Arc::new(PricingService::new(pricing_impl, Vec::new()));
 		let event_bus = EventBus::new(64);
 		let networks: solver_types::NetworksConfig = HashMap::new();
 		let token_manager = Arc::new(TokenManager::new(
