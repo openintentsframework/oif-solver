@@ -63,19 +63,8 @@
 //!
 //! # Example Usage
 //!
-//! ```rust,ignore
-//! use solver_storage::implementations::redis::{create_storage, create_storage_async};
-//!
-//! // Synchronous creation (connection is lazy)
-//! let config = toml::toml! {
-//!     redis_url = "redis://localhost:6379"
-//!     key_prefix = "my-solver"
-//! };
-//! let storage = create_storage(&toml::Value::Table(config))?;
-//!
-//! // Async creation with eager connection verification
-//! let storage = create_storage_async(&toml::Value::Table(config)).await?;
-//! ```
+//! This module provides factory functions for creating Redis storage instances
+//! with both synchronous (lazy connection) and asynchronous (eager verification) options.
 //!
 //! # Running Redis
 //!
@@ -765,11 +754,6 @@ impl ConfigSchema for RedisStorageSchema {
 /// - The connection times out
 /// - The connection manager fails to initialize
 ///
-/// # Example
-///
-/// ```rust,ignore
-/// let conn = initialize_redis_connection("redis://localhost:6379", 5000).await?;
-/// ```
 pub async fn initialize_redis_connection(
 	redis_url: &str,
 	timeout_ms: u64,
