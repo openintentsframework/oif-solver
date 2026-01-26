@@ -85,7 +85,7 @@ impl AdminActionVerifier {
 		}
 
 		// 3. Compute message hash and recover signer
-		let message_hash = action.message_hash(self.chain_id);
+		let message_hash = action.message_hash(self.chain_id)?;
 		let signer = recover_from_hash(&message_hash.0, signature)?;
 
 		// 4. Check signer is in admin registry
@@ -205,7 +205,7 @@ mod tests {
 		};
 
 		// Sign
-		let message_hash = action.message_hash(1);
+		let message_hash = action.message_hash(1).unwrap();
 		let signature = sign_hash(&message_hash.0, &secret);
 
 		// Verify - nonce is now extracted from action contents
@@ -247,7 +247,7 @@ mod tests {
 			deadline: 1000, // Far in the past
 		};
 
-		let message_hash = action.message_hash(1);
+		let message_hash = action.message_hash(1).unwrap();
 		let signature = sign_hash(&message_hash.0, &secret);
 
 		let result = verifier.verify(&action, &signature).await;
@@ -283,7 +283,7 @@ mod tests {
 			deadline: (chrono::Utc::now().timestamp() + 300) as u64,
 		};
 
-		let message_hash = action.message_hash(1);
+		let message_hash = action.message_hash(1).unwrap();
 		let signature = sign_hash(&message_hash.0, &secret);
 
 		let result = verifier.verify(&action, &signature).await;

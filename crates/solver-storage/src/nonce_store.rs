@@ -20,7 +20,6 @@
 
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
-use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::OnceCell;
 use tracing::{debug, warn};
@@ -51,7 +50,7 @@ pub enum NonceError {
 /// - Namespaced by solver_id (multi-solver safe)
 pub struct NonceStore {
 	/// Redis connection manager (lazily initialized)
-	connection: OnceCell<Arc<ConnectionManager>>,
+	connection: OnceCell<ConnectionManager>,
 	/// Redis URL for connection
 	redis_url: String,
 	/// Solver ID for namespacing
@@ -102,7 +101,7 @@ impl NonceStore {
 	}
 
 	/// Get or initialize the Redis connection.
-	async fn get_connection(&self) -> Result<Arc<ConnectionManager>, NonceError> {
+	async fn get_connection(&self) -> Result<ConnectionManager, NonceError> {
 		self.connection
 			.get_or_try_init(|| async {
 				let client = redis::Client::open(self.redis_url.as_str())?;
@@ -112,10 +111,10 @@ impl NonceStore {
 					solver_id = %self.solver_id,
 					"Nonce store Redis connection established"
 				);
-				Ok(Arc::new(manager))
+				Ok(manager)
 			})
 			.await
-			.cloned()
+			.map(Clone::clone)
 	}
 
 	/// Build the Redis key for a nonce.
@@ -140,7 +139,6 @@ impl NonceStore {
 		let key = self.nonce_key(&nonce_str);
 
 		let mut conn = self.get_connection().await?;
-		let conn = Arc::make_mut(&mut conn);
 
 		// Store with TTL - value is creation timestamp for debugging
 		let timestamp = chrono::Utc::now().timestamp().to_string();
@@ -164,8 +162,6 @@ impl NonceStore {
 		let key = self.nonce_key(&nonce.to_string());
 
 		let mut conn = self.get_connection().await?;
-		let conn = Arc::make_mut(&mut conn);
-
 		let exists: bool = conn.exists(&key).await?;
 		Ok(exists)
 	}
@@ -181,7 +177,6 @@ impl NonceStore {
 		let key = self.nonce_key(&nonce.to_string());
 
 		let mut conn = self.get_connection().await?;
-		let conn = Arc::make_mut(&mut conn);
 
 		// DEL returns number of keys deleted (1 if existed, 0 if not)
 		let deleted: i64 = conn.del(&key).await?;

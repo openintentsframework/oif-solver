@@ -6,6 +6,15 @@
 use alloy_primitives::{Address, FixedBytes, U256};
 use alloy_sol_types::sol;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Errors that can occur when computing EIP-712 hashes for admin actions.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum AdminActionHashError {
+	/// The amount field could not be parsed as a valid number
+	#[error("Invalid amount: {0}")]
+	InvalidAmount(String),
+}
 
 /// EIP-712 domain for admin actions.
 ///
@@ -217,14 +226,23 @@ pub struct WithdrawContents {
 }
 
 impl WithdrawContents {
-	pub fn struct_hash(&self) -> FixedBytes<32> {
+	pub fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
 		use alloy_primitives::keccak256;
 
 		let type_hash = keccak256(
 			b"Withdraw(uint256 chainId,address token,uint256 amount,address recipient,uint256 nonce,uint256 deadline)",
 		);
 
-		let amount = U256::from_str_radix(&self.amount, 10).unwrap_or(U256::ZERO);
+		// Validate amount is not empty
+		if self.amount.is_empty() {
+			return Err(AdminActionHashError::InvalidAmount(
+				"amount cannot be empty".to_string(),
+			));
+		}
+
+		// Parse amount - fail explicitly on invalid values instead of silently using zero
+		let amount = U256::from_str_radix(&self.amount, 10)
+			.map_err(|_| AdminActionHashError::InvalidAmount(self.amount.clone()))?;
 
 		let encoded = [
 			type_hash.as_slice(),
@@ -245,7 +263,7 @@ impl WithdrawContents {
 		]
 		.concat();
 
-		keccak256(&encoded)
+		Ok(keccak256(&encoded))
 	}
 }
 
@@ -258,14 +276,14 @@ pub trait AdminAction {
 	fn deadline(&self) -> u64;
 
 	/// Compute the EIP-712 struct hash for this action
-	fn struct_hash(&self) -> FixedBytes<32>;
+	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError>;
 
 	/// Compute the full EIP-712 message hash
-	fn message_hash(&self, chain_id: u64) -> FixedBytes<32> {
+	fn message_hash(&self, chain_id: u64) -> Result<FixedBytes<32>, AdminActionHashError> {
 		use alloy_primitives::keccak256;
 
 		let domain_separator = admin_domain_separator(chain_id);
-		let struct_hash = self.struct_hash();
+		let struct_hash = self.struct_hash()?;
 
 		// EIP-712: keccak256("\x19\x01" || domainSeparator || structHash)
 		let encoded = [
@@ -275,7 +293,7 @@ pub trait AdminAction {
 		]
 		.concat();
 
-		keccak256(&encoded)
+		Ok(keccak256(&encoded))
 	}
 }
 
@@ -288,8 +306,9 @@ impl AdminAction for AddTokenContents {
 		self.deadline
 	}
 
-	fn struct_hash(&self) -> FixedBytes<32> {
-		self.struct_hash()
+	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
+		// AddToken has no fallible parsing, always succeeds
+		Ok(AddTokenContents::struct_hash(self))
 	}
 }
 
@@ -302,8 +321,9 @@ impl AdminAction for RemoveTokenContents {
 		self.deadline
 	}
 
-	fn struct_hash(&self) -> FixedBytes<32> {
-		self.struct_hash()
+	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
+		// RemoveToken has no fallible parsing, always succeeds
+		Ok(RemoveTokenContents::struct_hash(self))
 	}
 }
 
@@ -316,8 +336,9 @@ impl AdminAction for WithdrawContents {
 		self.deadline
 	}
 
-	fn struct_hash(&self) -> FixedBytes<32> {
-		self.struct_hash()
+	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
+		// Withdraw has amount parsing that can fail
+		WithdrawContents::struct_hash(self)
 	}
 }
 
@@ -389,11 +410,11 @@ mod tests {
 			deadline: 1706184000,
 		};
 
-		let hash = contents.message_hash(1);
+		let hash = contents.message_hash(1).unwrap();
 		assert_eq!(hash.len(), 32);
 
 		// Different chain should produce different hash
-		let hash_other = contents.message_hash(10);
+		let hash_other = contents.message_hash(10).unwrap();
 		assert_ne!(hash, hash_other);
 	}
 
@@ -434,5 +455,58 @@ mod tests {
 
 		assert_eq!(contents.nonce(), 42);
 		assert_eq!(contents.deadline(), 1706184000);
+	}
+
+	#[test]
+	fn test_withdraw_valid_amount() {
+		let contents = WithdrawContents {
+			chain_id: 10,
+			token: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			amount: "1000000000".to_string(), // Valid amount
+			recipient: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		// Should succeed
+		let hash = contents.struct_hash();
+		assert!(hash.is_ok());
+		assert_eq!(hash.unwrap().len(), 32);
+	}
+
+	#[test]
+	fn test_withdraw_invalid_amount_string() {
+		let contents = WithdrawContents {
+			chain_id: 10,
+			token: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			amount: "abc".to_string(), // Invalid - not a number
+			recipient: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		// Should fail with InvalidAmount error
+		let result = contents.struct_hash();
+		assert!(result.is_err());
+		assert!(matches!(
+			result.unwrap_err(),
+			AdminActionHashError::InvalidAmount(s) if s == "abc"
+		));
+	}
+
+	#[test]
+	fn test_withdraw_empty_amount() {
+		let contents = WithdrawContents {
+			chain_id: 10,
+			token: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			amount: "".to_string(), // Invalid - empty
+			recipient: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		// Should fail
+		let result = contents.struct_hash();
+		assert!(result.is_err());
 	}
 }

@@ -70,9 +70,18 @@ impl IntoResponse for AdminAuthError {
 			AdminAuthError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
 		};
 
+		// For internal errors, log details server-side but return generic message to client
+		let error_description = match &self {
+			AdminAuthError::Internal(details) => {
+				tracing::error!(error = %details, "Internal admin auth error");
+				"An internal error occurred".to_string()
+			},
+			_ => format!("{}", self),
+		};
+
 		let body = AdminAuthErrorResponse {
 			error: error_code.to_string(),
-			error_description: self.to_string(),
+			error_description,
 		};
 
 		(status, Json(body)).into_response()
@@ -88,6 +97,16 @@ impl From<solver_storage::nonce_store::NonceError> for AdminAuthError {
 			},
 			solver_storage::nonce_store::NonceError::Configuration(msg) => {
 				AdminAuthError::Internal(format!("Configuration error: {}", msg))
+			},
+		}
+	}
+}
+
+impl From<super::types::AdminActionHashError> for AdminAuthError {
+	fn from(err: super::types::AdminActionHashError) -> Self {
+		match err {
+			super::types::AdminActionHashError::InvalidAmount(amount) => {
+				AdminAuthError::InvalidMessage(format!("Invalid amount: {}", amount))
 			},
 		}
 	}
@@ -153,5 +172,24 @@ mod tests {
 
 		assert_eq!(parsed.error, "not_authorized");
 		assert!(parsed.error_description.contains("0xABC"));
+	}
+
+	#[tokio::test]
+	async fn test_internal_error_hides_details() {
+		// Internal errors should NOT leak details to clients
+		let error = AdminAuthError::Internal("Redis connection failed: redis://secret@host".into());
+		let response = error.into_response();
+
+		assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+		let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let parsed: AdminAuthErrorResponse = serde_json::from_slice(&body).unwrap();
+
+		assert_eq!(parsed.error, "server_error");
+		// Should NOT contain internal details
+		assert!(!parsed.error_description.contains("Redis"));
+		assert!(!parsed.error_description.contains("secret"));
+		// Should contain generic message
+		assert_eq!(parsed.error_description, "An internal error occurred");
 	}
 }
