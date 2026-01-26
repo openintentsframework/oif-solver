@@ -114,7 +114,7 @@ impl NonceStore {
 				Ok(manager)
 			})
 			.await
-			.map(Clone::clone)
+			.cloned()
 	}
 
 	/// Build the Redis key for a nonce.
