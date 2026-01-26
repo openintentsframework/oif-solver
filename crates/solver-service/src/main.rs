@@ -168,17 +168,13 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 			let solver_id = &versioned.data.solver.id;
 
 			// Print prominent output for the solver ID
-			println!();
-			println!("════════════════════════════════════════════════════════════");
-			println!("  Configuration seeded successfully!");
-			println!("════════════════════════════════════════════════════════════");
-			println!("  SOLVER_ID: {}", solver_id);
-			println!("  Version:   {}", versioned.version);
-			println!();
-			println!("  For subsequent runs, set:");
-			println!("    export SOLVER_ID={}", solver_id);
-			println!("════════════════════════════════════════════════════════════");
-			println!();
+			tracing::info!("════════════════════════════════════════════════════════════");
+			tracing::info!("  Configuration seeded successfully!");
+			tracing::info!("  SOLVER_ID: {}", solver_id);
+			tracing::info!("  Version:   {}", versioned.version);
+			tracing::info!("  For subsequent runs, set:");
+			tracing::info!("    export SOLVER_ID={}", solver_id);
+			tracing::info!("════════════════════════════════════════════════════════════");
 
 			return Ok(versioned.into_inner());
 		} else {
@@ -188,14 +184,12 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 
 			// Print info about existing config
 			println!();
-			println!("════════════════════════════════════════════════════════════");
-			println!("  Configuration already exists (skipping seed)");
-			println!("════════════════════════════════════════════════════════════");
-			println!("  SOLVER_ID: {}", existing_config.solver.id);
-			println!();
-			println!("  Use --force-seed to overwrite existing configuration");
-			println!("════════════════════════════════════════════════════════════");
-			println!();
+			tracing::info!("════════════════════════════════════════════════════════════");
+			tracing::info!("  Configuration already exists (skipping seed)");
+			tracing::info!("════════════════════════════════════════════════════════════");
+			tracing::info!("  SOLVER_ID: {}", existing_config.solver.id);
+			tracing::info!("  Use --force-seed to overwrite existing configuration");
+			tracing::info!("════════════════════════════════════════════════════════════");
 
 			return Ok(existing_config);
 		}
