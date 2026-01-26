@@ -128,11 +128,16 @@ impl NonceStore {
 
 	/// Generate and store a new nonce.
 	///
-	/// Returns a unique nonce string that must be included in the signed message.
+	/// Returns a unique numeric nonce that must be included in the signed message.
 	/// The nonce will automatically expire after `ttl_seconds`.
-	pub async fn generate(&self) -> Result<String, NonceError> {
-		let nonce = Uuid::new_v4().to_string();
-		let key = self.nonce_key(&nonce);
+	///
+	/// The nonce is a u64 derived from UUID v4's cryptographically secure randomness,
+	/// making it compatible with EIP-712's uint256 nonce fields.
+	pub async fn generate(&self) -> Result<u64, NonceError> {
+		// Use UUID v4's 128-bit randomness, take lower 64 bits
+		let nonce = Uuid::new_v4().as_u128() as u64;
+		let nonce_str = nonce.to_string();
+		let key = self.nonce_key(&nonce_str);
 
 		let mut conn = self.get_connection().await?;
 		let conn = Arc::make_mut(&mut conn);
@@ -155,8 +160,8 @@ impl NonceStore {
 	/// Check if a nonce exists (without consuming it).
 	///
 	/// Useful for pre-validation before expensive signature verification.
-	pub async fn exists(&self, nonce: &str) -> Result<bool, NonceError> {
-		let key = self.nonce_key(nonce);
+	pub async fn exists(&self, nonce: u64) -> Result<bool, NonceError> {
+		let key = self.nonce_key(&nonce.to_string());
 
 		let mut conn = self.get_connection().await?;
 		let conn = Arc::make_mut(&mut conn);
@@ -172,8 +177,8 @@ impl NonceStore {
 	///
 	/// This operation is atomic - the nonce is deleted in the same
 	/// operation that checks for its existence.
-	pub async fn consume(&self, nonce: &str) -> Result<(), NonceError> {
-		let key = self.nonce_key(nonce);
+	pub async fn consume(&self, nonce: u64) -> Result<(), NonceError> {
+		let key = self.nonce_key(&nonce.to_string());
 
 		let mut conn = self.get_connection().await?;
 		let conn = Arc::make_mut(&mut conn);
@@ -271,20 +276,20 @@ mod tests {
 
 		// Generate
 		let nonce = store.generate().await.unwrap();
-		assert!(!nonce.is_empty());
+		assert!(nonce > 0);
 
 		// Exists
-		assert!(store.exists(&nonce).await.unwrap());
+		assert!(store.exists(nonce).await.unwrap());
 
 		// Consume once - should succeed
-		assert!(store.consume(&nonce).await.is_ok());
+		assert!(store.consume(nonce).await.is_ok());
 
 		// No longer exists
-		assert!(!store.exists(&nonce).await.unwrap());
+		assert!(!store.exists(nonce).await.unwrap());
 
 		// Consume again - should fail (single-use)
 		assert!(matches!(
-			store.consume(&nonce).await,
+			store.consume(nonce).await,
 			Err(NonceError::NotFound)
 		));
 	}
@@ -296,7 +301,7 @@ mod tests {
 		let store = NonceStore::new("redis://127.0.0.1:6379", &solver_id, 300).unwrap();
 
 		// Random nonce that was never generated
-		let result = store.consume("invalid-nonce-12345").await;
+		let result = store.consume(12345).await;
 		assert!(matches!(result, Err(NonceError::NotFound)));
 	}
 
@@ -313,18 +318,18 @@ mod tests {
 		let nonce = store1.generate().await.unwrap();
 
 		// Should exist in store1
-		assert!(store1.exists(&nonce).await.unwrap());
+		assert!(store1.exists(nonce).await.unwrap());
 
 		// Should NOT exist in store2 (different solver namespace)
-		assert!(!store2.exists(&nonce).await.unwrap());
+		assert!(!store2.exists(nonce).await.unwrap());
 
 		// Consume from store2 should fail
 		assert!(matches!(
-			store2.consume(&nonce).await,
+			store2.consume(nonce).await,
 			Err(NonceError::NotFound)
 		));
 
 		// Consume from store1 should succeed
-		assert!(store1.consume(&nonce).await.is_ok());
+		assert!(store1.consume(nonce).await.is_ok());
 	}
 }

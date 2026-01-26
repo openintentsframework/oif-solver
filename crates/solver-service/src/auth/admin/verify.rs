@@ -57,16 +57,19 @@ impl AdminActionVerifier {
 	///
 	/// * `action` - The action contents that were signed
 	/// * `signature` - The 65-byte EIP-712 signature
-	/// * `nonce_string` - The nonce string (used as key in nonce store)
 	///
 	/// # Returns
 	///
 	/// The verified admin address, or an error.
+	///
+	/// # Note
+	///
+	/// The nonce is extracted from the action contents directly, ensuring
+	/// the signed nonce matches what we verify against the nonce store.
 	pub async fn verify<T: AdminAction>(
 		&self,
 		action: &T,
 		signature: &[u8],
-		nonce_string: &str,
 	) -> Result<Address, AdminAuthError> {
 		// 1. Check deadline hasn't passed
 		let now = chrono::Utc::now().timestamp() as u64;
@@ -75,7 +78,9 @@ impl AdminActionVerifier {
 		}
 
 		// 2. Check nonce exists (don't consume yet - prevents DoS)
-		if !self.nonce_store.exists(nonce_string).await? {
+		// The nonce comes from the signed action contents
+		let nonce = action.nonce();
+		if !self.nonce_store.exists(nonce).await? {
 			return Err(AdminAuthError::NonceNotFound);
 		}
 
@@ -89,11 +94,11 @@ impl AdminActionVerifier {
 		}
 
 		// 5. Consume nonce atomically (prevents replay)
-		self.nonce_store.consume(nonce_string).await?;
+		self.nonce_store.consume(nonce).await?;
 
 		tracing::info!(
 			admin = %signer,
-			action_nonce = %action.nonce(),
+			nonce = %nonce,
 			"Admin action verified"
 		);
 
@@ -103,7 +108,8 @@ impl AdminActionVerifier {
 	/// Generate a new nonce for an admin action.
 	///
 	/// The nonce should be included in the action contents before signing.
-	pub async fn generate_nonce(&self) -> Result<String, AdminAuthError> {
+	/// Returns a u64 that is compatible with EIP-712's uint256 nonce field.
+	pub async fn generate_nonce(&self) -> Result<u64, AdminAuthError> {
 		self.nonce_store.generate().await.map_err(Into::into)
 	}
 
@@ -185,16 +191,16 @@ mod tests {
 
 		let verifier = AdminActionVerifier::new(nonce_store.clone(), admin_config, 1);
 
-		// Generate nonce
-		let nonce_string = verifier.generate_nonce().await.unwrap();
+		// Generate nonce (now returns u64)
+		let nonce = verifier.generate_nonce().await.unwrap();
 
-		// Create action
+		// Create action with the generated nonce
 		let action = AddTokenContents {
 			chain_id: 10,
 			symbol: "USDC".to_string(),
 			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
-			nonce: 1,
+			nonce,
 			deadline: (chrono::Utc::now().timestamp() + 300) as u64, // 5 min from now
 		};
 
@@ -202,13 +208,13 @@ mod tests {
 		let message_hash = action.message_hash(1);
 		let signature = sign_hash(&message_hash.0, &secret);
 
-		// Verify
-		let result = verifier.verify(&action, &signature, &nonce_string).await;
+		// Verify - nonce is now extracted from action contents
+		let result = verifier.verify(&action, &signature).await;
 		assert!(result.is_ok());
 		assert_eq!(result.unwrap(), admin_address);
 
 		// Try to reuse nonce - should fail
-		let result = verifier.verify(&action, &signature, &nonce_string).await;
+		let result = verifier.verify(&action, &signature).await;
 		assert!(matches!(result, Err(AdminAuthError::NonceNotFound)));
 	}
 
@@ -229,7 +235,7 @@ mod tests {
 		};
 
 		let verifier = AdminActionVerifier::new(nonce_store.clone(), admin_config, 1);
-		let nonce_string = verifier.generate_nonce().await.unwrap();
+		let nonce = verifier.generate_nonce().await.unwrap();
 
 		// Create expired action
 		let action = AddTokenContents {
@@ -237,14 +243,14 @@ mod tests {
 			symbol: "USDC".to_string(),
 			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
-			nonce: 1,
+			nonce,
 			deadline: 1000, // Far in the past
 		};
 
 		let message_hash = action.message_hash(1);
 		let signature = sign_hash(&message_hash.0, &secret);
 
-		let result = verifier.verify(&action, &signature, &nonce_string).await;
+		let result = verifier.verify(&action, &signature).await;
 		assert!(matches!(result, Err(AdminAuthError::Expired)));
 	}
 
@@ -266,21 +272,21 @@ mod tests {
 		};
 
 		let verifier = AdminActionVerifier::new(nonce_store.clone(), admin_config, 1);
-		let nonce_string = verifier.generate_nonce().await.unwrap();
+		let nonce = verifier.generate_nonce().await.unwrap();
 
 		let action = AddTokenContents {
 			chain_id: 10,
 			symbol: "USDC".to_string(),
 			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
-			nonce: 1,
+			nonce,
 			deadline: (chrono::Utc::now().timestamp() + 300) as u64,
 		};
 
 		let message_hash = action.message_hash(1);
 		let signature = sign_hash(&message_hash.0, &secret);
 
-		let result = verifier.verify(&action, &signature, &nonce_string).await;
+		let result = verifier.verify(&action, &signature).await;
 		assert!(matches!(result, Err(AdminAuthError::NotAuthorized(_))));
 	}
 }

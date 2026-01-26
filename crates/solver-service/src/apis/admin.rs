@@ -28,7 +28,8 @@ pub struct AdminApiState {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NonceResponse {
-	pub nonce: String,
+	/// Numeric nonce for EIP-712 signing (uint256 compatible)
+	pub nonce: u64,
 	pub expires_in: u64,
 	pub domain: String,
 	pub chain_id: u64,
@@ -73,24 +74,23 @@ pub async fn handle_get_nonce(
 ///     "symbol": "USDC",
 ///     "tokenAddress": "0x...",
 ///     "decimals": 6,
-///     "nonce": 1,
+///     "nonce": 12345678901234,
 ///     "deadline": 1706184000
 ///   }
 /// }
 /// ```
+///
+/// The `nonce` must be obtained from `GET /api/v1/admin/nonce` and included
+/// in the signed contents. This ensures the client signs the same nonce
+/// that the server will verify.
 pub async fn handle_add_token(
 	State(state): State<AdminApiState>,
 	Json(request): Json<SignedAdminRequest<AddTokenContents>>,
 ) -> Result<Json<AdminActionResponse>, AdminAuthError> {
-	// The nonce in the request body should match a nonce we issued
-	// For now, we use the nonce field as the nonce string
-	// In production, you'd want to generate the nonce separately
-	let nonce_string = request.contents.nonce.to_string();
-
-	// Verify the signature
+	// Verify the signature - nonce is extracted from the signed contents
 	let admin = state
 		.verifier
-		.verify(&request.contents, &request.signature, &nonce_string)
+		.verify(&request.contents, &request.signature)
 		.await?;
 
 	// TODO: Actually add the token to the configuration
@@ -100,6 +100,7 @@ pub async fn handle_add_token(
 		chain_id = %request.contents.chain_id,
 		symbol = %request.contents.symbol,
 		token_address = %request.contents.token_address,
+		nonce = %request.contents.nonce,
 		"Admin added token"
 	);
 
@@ -202,14 +203,14 @@ mod tests {
 	#[test]
 	fn test_nonce_response_serialization() {
 		let response = NonceResponse {
-			nonce: "abc123".to_string(),
+			nonce: 12345678901234,
 			expires_in: 300,
 			domain: "test.example.com".to_string(),
 			chain_id: 1,
 		};
 
 		let json = serde_json::to_string(&response).unwrap();
-		assert!(json.contains("\"nonce\":\"abc123\""));
+		assert!(json.contains("\"nonce\":12345678901234"));
 		assert!(json.contains("\"expiresIn\":300"));
 	}
 
