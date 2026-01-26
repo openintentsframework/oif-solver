@@ -46,6 +46,18 @@ pub struct RedisConfigStore<T> {
 	_phantom: std::marker::PhantomData<T>,
 }
 
+impl<T> std::fmt::Debug for RedisConfigStore<T> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("RedisConfigStore")
+			.field("redis_url", &self.redis_url)
+			.field("timeout_ms", &self.timeout_ms)
+			.field("solver_id", &self.solver_id)
+			.field("key_prefix", &self.key_prefix)
+			.field("connected", &self.client.initialized())
+			.finish()
+	}
+}
+
 impl<T> RedisConfigStore<T>
 where
 	T: Serialize + for<'de> Deserialize<'de> + Send + Sync + Clone,
@@ -334,5 +346,279 @@ where
 
 		debug!(key = %key, "deleted config from redis");
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use serde::{Deserialize, Serialize};
+
+	#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+	struct TestConfig {
+		name: String,
+		value: u32,
+	}
+
+	// ==================== Constructor Tests ====================
+
+	#[test]
+	fn test_new_valid() {
+		let result = RedisConfigStore::<TestConfig>::new(
+			"redis://localhost:6379".to_string(),
+			"test-solver".to_string(),
+			"oif-solver".to_string(),
+		);
+		assert!(result.is_ok());
+		let store = result.unwrap();
+		assert_eq!(store.solver_id, "test-solver");
+		assert_eq!(store.key_prefix, "oif-solver");
+		assert_eq!(store.redis_url, "redis://localhost:6379");
+	}
+
+	#[test]
+	fn test_new_empty_solver_id() {
+		let result = RedisConfigStore::<TestConfig>::new(
+			"redis://localhost:6379".to_string(),
+			"".to_string(),
+			"oif-solver".to_string(),
+		);
+		assert!(result.is_err());
+		let err = result.unwrap_err();
+		assert!(matches!(err, ConfigStoreError::Configuration(_)));
+		assert!(err.to_string().contains("Solver ID"));
+	}
+
+	#[test]
+	fn test_new_empty_redis_url() {
+		let result = RedisConfigStore::<TestConfig>::new(
+			"".to_string(),
+			"test-solver".to_string(),
+			"oif-solver".to_string(),
+		);
+		assert!(result.is_err());
+		let err = result.unwrap_err();
+		assert!(matches!(err, ConfigStoreError::Configuration(_)));
+		assert!(err.to_string().contains("Redis URL"));
+	}
+
+	#[test]
+	fn test_new_empty_key_prefix() {
+		let result = RedisConfigStore::<TestConfig>::new(
+			"redis://localhost:6379".to_string(),
+			"test-solver".to_string(),
+			"".to_string(),
+		);
+		assert!(result.is_err());
+		let err = result.unwrap_err();
+		assert!(matches!(err, ConfigStoreError::Configuration(_)));
+		assert!(err.to_string().contains("Key prefix"));
+	}
+
+	#[test]
+	fn test_with_defaults() {
+		let result = RedisConfigStore::<TestConfig>::with_defaults(
+			"redis://localhost:6379".to_string(),
+			"test-solver".to_string(),
+		);
+		assert!(result.is_ok());
+		let store = result.unwrap();
+		assert_eq!(store.key_prefix, "oif-solver");
+		assert_eq!(store.timeout_ms, DEFAULT_CONNECTION_TIMEOUT_MS);
+	}
+
+	#[test]
+	fn test_with_timeout() {
+		let store = RedisConfigStore::<TestConfig>::new(
+			"redis://localhost:6379".to_string(),
+			"test-solver".to_string(),
+			"oif-solver".to_string(),
+		)
+		.unwrap()
+		.with_timeout(10000);
+
+		assert_eq!(store.timeout_ms, 10000);
+	}
+
+	// ==================== Key Generation Tests ====================
+
+	#[test]
+	fn test_config_key_generation() {
+		let store = RedisConfigStore::<TestConfig>::new(
+			"redis://localhost:6379".to_string(),
+			"my-solver".to_string(),
+			"oif-solver".to_string(),
+		)
+		.unwrap();
+
+		assert_eq!(store.config_key(), "oif-solver:config:my-solver");
+	}
+
+	#[test]
+	fn test_config_key_with_custom_prefix() {
+		let store = RedisConfigStore::<TestConfig>::new(
+			"redis://localhost:6379".to_string(),
+			"my-solver".to_string(),
+			"custom-prefix".to_string(),
+		)
+		.unwrap();
+
+		assert_eq!(store.config_key(), "custom-prefix:config:my-solver");
+	}
+
+	#[test]
+	fn test_config_key_with_special_characters() {
+		let store = RedisConfigStore::<TestConfig>::new(
+			"redis://localhost:6379".to_string(),
+			"solver-123-abc".to_string(),
+			"prefix".to_string(),
+		)
+		.unwrap();
+
+		assert_eq!(store.config_key(), "prefix:config:solver-123-abc");
+	}
+
+	// ==================== Constants Tests ====================
+
+	#[test]
+	fn test_constants() {
+		assert_eq!(DEFAULT_CONNECTION_TIMEOUT_MS, 5000);
+		assert_eq!(CONFIG_KEY_PREFIX, "config");
+	}
+
+	// ==================== Connection Failure Tests ====================
+
+	#[tokio::test]
+	async fn test_get_connection_failure_invalid_host() {
+		let store = RedisConfigStore::<TestConfig>::new(
+			"redis://invalid-host-that-does-not-exist:6379".to_string(),
+			"test-solver".to_string(),
+			"oif-solver".to_string(),
+		)
+		.unwrap()
+		.with_timeout(100); // Short timeout for faster test
+
+		let result = store.exists().await;
+		assert!(result.is_err());
+		assert!(matches!(result, Err(ConfigStoreError::Backend(_))));
+	}
+
+	#[tokio::test]
+	async fn test_get_connection_failure_timeout() {
+		let store = RedisConfigStore::<TestConfig>::new(
+			"redis://10.255.255.1:6379".to_string(), // Non-routable IP
+			"test-solver".to_string(),
+			"oif-solver".to_string(),
+		)
+		.unwrap()
+		.with_timeout(100); // Very short timeout
+
+		let result = store.exists().await;
+		assert!(result.is_err());
+		assert!(matches!(result, Err(ConfigStoreError::Backend(_))));
+	}
+
+	#[tokio::test]
+	async fn test_seed_connection_failure() {
+		let store = RedisConfigStore::<TestConfig>::new(
+			"redis://invalid-host:6379".to_string(),
+			"test-solver".to_string(),
+			"oif-solver".to_string(),
+		)
+		.unwrap()
+		.with_timeout(100);
+
+		let config = TestConfig {
+			name: "test".to_string(),
+			value: 42,
+		};
+		let result = store.seed(config).await;
+		assert!(result.is_err());
+		assert!(matches!(result, Err(ConfigStoreError::Backend(_))));
+	}
+
+	#[tokio::test]
+	async fn test_get_connection_failure() {
+		let store = RedisConfigStore::<TestConfig>::new(
+			"redis://invalid-host:6379".to_string(),
+			"test-solver".to_string(),
+			"oif-solver".to_string(),
+		)
+		.unwrap()
+		.with_timeout(100);
+
+		let result = store.get().await;
+		assert!(result.is_err());
+		assert!(matches!(result, Err(ConfigStoreError::Backend(_))));
+	}
+
+	#[tokio::test]
+	async fn test_update_connection_failure() {
+		let store = RedisConfigStore::<TestConfig>::new(
+			"redis://invalid-host:6379".to_string(),
+			"test-solver".to_string(),
+			"oif-solver".to_string(),
+		)
+		.unwrap()
+		.with_timeout(100);
+
+		let config = TestConfig {
+			name: "test".to_string(),
+			value: 42,
+		};
+		let result = store.update(config, 1).await;
+		assert!(result.is_err());
+		assert!(matches!(result, Err(ConfigStoreError::Backend(_))));
+	}
+
+	#[tokio::test]
+	async fn test_delete_connection_failure() {
+		let store = RedisConfigStore::<TestConfig>::new(
+			"redis://invalid-host:6379".to_string(),
+			"test-solver".to_string(),
+			"oif-solver".to_string(),
+		)
+		.unwrap()
+		.with_timeout(100);
+
+		let result = store.delete().await;
+		assert!(result.is_err());
+		assert!(matches!(result, Err(ConfigStoreError::Backend(_))));
+	}
+
+	// ==================== Debug Implementation Tests ====================
+
+	#[test]
+	fn test_debug_impl() {
+		let store = RedisConfigStore::<TestConfig>::new(
+			"redis://localhost:6379".to_string(),
+			"test-solver".to_string(),
+			"oif-solver".to_string(),
+		)
+		.unwrap();
+
+		let debug_str = format!("{:?}", store);
+		assert!(debug_str.contains("RedisConfigStore"));
+		assert!(debug_str.contains("redis://localhost:6379"));
+		assert!(debug_str.contains("test-solver"));
+		assert!(debug_str.contains("oif-solver"));
+		assert!(debug_str.contains("connected"));
+		assert!(debug_str.contains("false")); // Not connected yet
+	}
+
+	#[test]
+	fn test_debug_impl_with_custom_timeout() {
+		let store = RedisConfigStore::<TestConfig>::new(
+			"redis://localhost:6379".to_string(),
+			"my-solver".to_string(),
+			"custom-prefix".to_string(),
+		)
+		.unwrap()
+		.with_timeout(10000);
+
+		let debug_str = format!("{:?}", store);
+		assert!(debug_str.contains("10000"));
+		assert!(debug_str.contains("my-solver"));
+		assert!(debug_str.contains("custom-prefix"));
 	}
 }

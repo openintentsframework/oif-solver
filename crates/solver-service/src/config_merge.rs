@@ -741,4 +741,53 @@ mod tests {
 		assert_eq!(resource_lock.fill, Some(77298));
 		assert_eq!(resource_lock.claim, Some(122793));
 	}
+
+	#[test]
+	fn test_merge_error_display() {
+		// Test all error variants have proper Display implementations
+		let unknown_chain = MergeError::UnknownChainId(999, vec![1, 2, 3]);
+		assert!(unknown_chain.to_string().contains("Unknown chain ID"));
+		assert!(unknown_chain.to_string().contains("999"));
+
+		let no_tokens = MergeError::NoTokens(42);
+		assert!(no_tokens.to_string().contains("No tokens"));
+		assert!(no_tokens.to_string().contains("42"));
+
+		let insufficient = MergeError::InsufficientNetworks;
+		assert!(insufficient.to_string().contains("At least 2 networks"));
+
+		let validation = MergeError::Validation("test error".to_string());
+		assert!(validation.to_string().contains("Configuration validation failed"));
+		assert!(validation.to_string().contains("test error"));
+	}
+
+	#[test]
+	fn test_custom_solver_id() {
+		let overrides = SeedOverrides {
+			solver_id: Some("my-custom-solver".to_string()),
+			networks: vec![
+				NetworkOverride {
+					chain_id: 11155420,
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "USDC".to_string(),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+				NetworkOverride {
+					chain_id: 84532,
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "USDC".to_string(),
+						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+			],
+		};
+
+		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
+		assert_eq!(config.solver.id, "my-custom-solver");
+	}
 }
