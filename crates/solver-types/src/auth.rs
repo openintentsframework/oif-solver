@@ -145,10 +145,13 @@ fn default_nonce_ttl() -> u64 {
 impl AdminConfig {
 	/// Check if an address is an authorized admin.
 	///
+	/// Returns `false` if admin auth is disabled (`enabled = false`),
+	/// even if the address is in the admin list.
+	///
 	/// Comparison is done on the raw bytes, which is case-insensitive
 	/// and handles checksummed vs non-checksummed addresses correctly.
 	pub fn is_admin(&self, address: &Address) -> bool {
-		self.admin_addresses.iter().any(|a| a == address)
+		self.enabled && self.admin_addresses.iter().any(|a| a == address)
 	}
 
 	/// Get the number of configured admin addresses.
@@ -207,6 +210,22 @@ mod tests {
 		assert!(config.is_admin(&admin2));
 		assert!(!config.is_admin(&non_admin));
 		assert_eq!(config.admin_count(), 2);
+	}
+
+	#[test]
+	fn test_admin_config_disabled_rejects_all() {
+		// Even if an address is in the admin list, it should be rejected when disabled
+		let admin_addr = Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
+
+		let config = AdminConfig {
+			enabled: false, // Disabled!
+			domain: "solver.example.com".to_string(),
+			nonce_ttl_seconds: 300,
+			admin_addresses: vec![admin_addr],
+		};
+
+		// Should return false because enabled = false
+		assert!(!config.is_admin(&admin_addr));
 	}
 
 	#[test]

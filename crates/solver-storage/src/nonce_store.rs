@@ -10,12 +10,12 @@
 //!
 //! let store = NonceStore::new("redis://localhost:6379", "my-solver", 300)?;
 //!
-//! // Generate a nonce
-//! let nonce = store.generate().await?;
+//! // Generate a nonce (returns u64)
+//! let nonce: u64 = store.generate().await?;
 //!
 //! // Later, verify and consume the nonce
-//! let exists = store.exists(&nonce).await?;  // Check without consuming
-//! store.consume(&nonce).await?;               // Consume (single-use)
+//! let exists = store.exists(nonce).await?;  // Check without consuming
+//! store.consume(nonce).await?;              // Consume (single-use)
 //! ```
 
 use redis::aio::ConnectionManager;
