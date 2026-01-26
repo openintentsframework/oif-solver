@@ -237,36 +237,38 @@ mod integration_tests {
 				url: "redis://localhost:6379".to_string(),
 			},
 			solver_id.clone(),
-		).unwrap();
-		
+		)
+		.unwrap();
+
 		// Verify it implements the ConfigStore trait correctly
 		assert!(store.exists().await.is_ok());
-		
+
 		// Test basic operations through the factory-created store
 		let config = create_test_config(&solver_id);
 		let seeded = store.seed(config.clone()).await.unwrap();
 		assert_eq!(seeded.version, 1);
 		assert_eq!(seeded.data.solver_id, solver_id);
-		
+
 		// Cleanup
 		store.delete().await.unwrap();
 	}
 
-	#[tokio::test] 
+	#[tokio::test]
 	#[ignore] // Requires running Redis
 	async fn test_create_redis_config_store_convenience() {
 		let solver_id = unique_solver_id();
 		let store = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
-		).unwrap();
-		
+		)
+		.unwrap();
+
 		// Should work identically to the generic factory
 		let config = create_test_config(&solver_id);
 		let seeded = store.seed(config.clone()).await.unwrap();
 		assert_eq!(seeded.version, 1);
 		assert_eq!(seeded.data.solver_id, solver_id);
-		
+
 		// Cleanup
 		store.delete().await.unwrap();
 	}
@@ -277,20 +279,35 @@ mod integration_tests {
 	fn test_config_store_error_types() {
 		// Test error formatting
 		let not_found = ConfigStoreError::NotFound("test-solver".to_string());
-		assert_eq!(format!("{}", not_found), "Configuration not found for solver: test-solver");
-		
+		assert_eq!(
+			format!("{}", not_found),
+			"Configuration not found for solver: test-solver"
+		);
+
 		let already_exists = ConfigStoreError::AlreadyExists("test-solver".to_string());
-		assert_eq!(format!("{}", already_exists), "Configuration already exists for solver: test-solver");
-		
-		let version_mismatch = ConfigStoreError::VersionMismatch { expected: 1, found: 2 };
-		assert_eq!(format!("{}", version_mismatch), "Version mismatch: expected 1, found 2");
-		
+		assert_eq!(
+			format!("{}", already_exists),
+			"Configuration already exists for solver: test-solver"
+		);
+
+		let version_mismatch = ConfigStoreError::VersionMismatch {
+			expected: 1,
+			found: 2,
+		};
+		assert_eq!(
+			format!("{}", version_mismatch),
+			"Version mismatch: expected 1, found 2"
+		);
+
 		let serialization = ConfigStoreError::Serialization("invalid JSON".to_string());
-		assert_eq!(format!("{}", serialization), "Serialization error: invalid JSON");
-		
+		assert_eq!(
+			format!("{}", serialization),
+			"Serialization error: invalid JSON"
+		);
+
 		let backend = ConfigStoreError::Backend("connection failed".to_string());
 		assert_eq!(format!("{}", backend), "Backend error: connection failed");
-		
+
 		let config = ConfigStoreError::Configuration("invalid config".to_string());
 		assert_eq!(format!("{}", config), "Configuration error: invalid config");
 	}
@@ -301,24 +318,27 @@ mod integration_tests {
 		let redis_config = ConfigStoreConfig::Redis {
 			url: "redis://localhost:6379".to_string(),
 		};
-		
+
 		// Should be cloneable and debuggable
 		let _cloned = redis_config.clone();
 		let _debug_str = format!("{:?}", redis_config);
-		
+
 		// Test that we can create different configurations
 		let redis_config2 = ConfigStoreConfig::Redis {
 			url: "redis://remote:6379".to_string(),
 		};
-		
-		assert_ne!(format!("{:?}", redis_config), format!("{:?}", redis_config2));
+
+		assert_ne!(
+			format!("{:?}", redis_config),
+			format!("{:?}", redis_config2)
+		);
 	}
 
 	#[test]
 	fn test_versioned_type_alias() {
 		// Test that JsonConfigStore type alias works
 		let _: Option<JsonConfigStore> = None;
-		
+
 		// Test that we can work with the Value type
 		use serde_json::json;
 		let test_value = json!({
@@ -327,7 +347,7 @@ mod integration_tests {
 				"networks": ["mainnet", "testnet"]
 			}
 		});
-		
+
 		let versioned = Versioned::new(test_value.clone());
 		assert_eq!(versioned.version, 1);
 		assert_eq!(versioned.data, test_value);
@@ -338,15 +358,13 @@ mod integration_tests {
 	#[tokio::test]
 	async fn test_redis_config_validation() {
 		// Test empty URL
-		let result = create_redis_config_store::<TestConfig>(
-			"".to_string(),
-			"test-solver".to_string(),
-		);
+		let result =
+			create_redis_config_store::<TestConfig>("".to_string(), "test-solver".to_string());
 		assert!(result.is_err());
 		if let Err(error) = result {
 			assert!(matches!(error, ConfigStoreError::Configuration(_)));
 		}
-		
+
 		// Test empty solver ID
 		let result = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
@@ -356,7 +374,7 @@ mod integration_tests {
 		if let Err(error) = result {
 			assert!(matches!(error, ConfigStoreError::Configuration(_)));
 		}
-		
+
 		// Test valid configuration
 		let result = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
@@ -372,7 +390,8 @@ mod integration_tests {
 		let store = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
-		).unwrap();
+		)
+		.unwrap();
 
 		// Ensure config doesn't exist
 		let _ = store.delete().await;
@@ -396,7 +415,8 @@ mod integration_tests {
 		let store = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
-		).unwrap();
+		)
+		.unwrap();
 
 		// Cleanup
 		let _ = store.delete().await;
@@ -408,7 +428,10 @@ mod integration_tests {
 		// Seeding again should fail
 		let result = store.seed(config).await;
 		assert!(result.is_err());
-		assert!(matches!(result.unwrap_err(), ConfigStoreError::AlreadyExists(_)));
+		assert!(matches!(
+			result.unwrap_err(),
+			ConfigStoreError::AlreadyExists(_)
+		));
 
 		// Cleanup
 		store.delete().await.unwrap();
@@ -420,42 +443,44 @@ mod integration_tests {
 	#[ignore] // Requires running Redis
 	async fn test_concurrent_update_version_conflict() {
 		let solver_id = unique_solver_id();
-		
+
 		// Create two separate stores for the same solver
 		let store1 = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
-		).unwrap();
+		)
+		.unwrap();
 		let store2 = create_redis_config_store::<TestConfig>(
-			"redis://localhost:6379".to_string(), 
+			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
-		).unwrap();
-		
+		)
+		.unwrap();
+
 		// Cleanup
 		let _ = store1.delete().await;
-		
+
 		// Seed initial config
 		let config = create_test_config(&solver_id);
 		store1.seed(config.clone()).await.unwrap();
-		
+
 		// Both stores get the same version
 		let v1 = store1.get().await.unwrap();
 		let v2 = store2.get().await.unwrap();
 		assert_eq!(v1.version, v2.version);
 		assert_eq!(v1.version, 1);
-		
+
 		// Store1 updates successfully
 		let mut updated_config1 = v1.data.clone();
 		updated_config1.version = 999;
 		let result1 = store1.update(updated_config1, v1.version).await;
 		assert!(result1.is_ok());
 		assert_eq!(result1.unwrap().version, 2);
-		
+
 		// Store2 update should fail with version mismatch (still trying to update version 1)
-		let mut updated_config2 = v2.data.clone(); 
+		let mut updated_config2 = v2.data.clone();
 		updated_config2.version = 888;
 		let result2 = store2.update(updated_config2, v2.version).await;
-		
+
 		assert!(result2.is_err());
 		match result2.unwrap_err() {
 			ConfigStoreError::VersionMismatch { expected, found } => {
@@ -468,7 +493,7 @@ mod integration_tests {
 		// Store2 can succeed if it gets the updated version first
 		let current = store2.get().await.unwrap();
 		assert_eq!(current.version, 2);
-		
+
 		let mut final_config = current.data.clone();
 		final_config.version = 777;
 		let result3 = store2.update(final_config, current.version).await;
@@ -480,49 +505,51 @@ mod integration_tests {
 	}
 
 	#[tokio::test]
-	#[ignore] // Requires running Redis  
+	#[ignore] // Requires running Redis
 	async fn test_multiple_solvers_isolation() {
 		let solver1_id = unique_solver_id();
 		let solver2_id = unique_solver_id();
-		
+
 		let store1 = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver1_id.clone(),
-		).unwrap();
+		)
+		.unwrap();
 		let store2 = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver2_id.clone(),
-		).unwrap();
-		
+		)
+		.unwrap();
+
 		// Cleanup both
 		let _ = store1.delete().await;
 		let _ = store2.delete().await;
-		
+
 		// Each solver should have isolated configuration
 		let config1 = create_test_config(&solver1_id);
 		let config2 = create_test_config(&solver2_id);
-		
+
 		store1.seed(config1).await.unwrap();
 		store2.seed(config2).await.unwrap();
-		
+
 		// Verify isolation
 		let retrieved1 = store1.get().await.unwrap();
 		let retrieved2 = store2.get().await.unwrap();
-		
+
 		assert_eq!(retrieved1.data.solver_id, solver1_id);
 		assert_eq!(retrieved2.data.solver_id, solver2_id);
 		assert_ne!(retrieved1.data.solver_id, retrieved2.data.solver_id);
-		
+
 		// Updates should be independent
 		let mut updated1 = retrieved1.data.clone();
 		updated1.version = 111;
 		let result1 = store1.update(updated1, retrieved1.version).await.unwrap();
 		assert_eq!(result1.version, 2);
-		
+
 		// Solver2's version should still be 1
 		let current2 = store2.get().await.unwrap();
 		assert_eq!(current2.version, 1);
-		
+
 		// Cleanup
 		store1.delete().await.unwrap();
 		store2.delete().await.unwrap();
@@ -585,7 +612,8 @@ mod integration_tests {
 		let store = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
-		).unwrap();
+		)
+		.unwrap();
 
 		// Cleanup
 		let _ = store.delete().await;
@@ -603,11 +631,19 @@ mod integration_tests {
 
 		// Update with stale version should fail
 		let mut stale_config = config.clone();
-		stale_config.settings.insert("stale_update".to_string(), "should_fail".to_string());
-		
+		stale_config
+			.settings
+			.insert("stale_update".to_string(), "should_fail".to_string());
+
 		let result = store.update(stale_config, 1).await; // Using stale version 1
 		assert!(result.is_err());
-		assert!(matches!(result.unwrap_err(), ConfigStoreError::VersionMismatch { expected: 1, found: 2 }));
+		assert!(matches!(
+			result.unwrap_err(),
+			ConfigStoreError::VersionMismatch {
+				expected: 1,
+				found: 2
+			}
+		));
 
 		// Configuration should be unchanged
 		let current = store.get().await.unwrap();
@@ -618,7 +654,6 @@ mod integration_tests {
 		store.delete().await.unwrap();
 	}
 
-
 	#[tokio::test]
 	#[ignore] // Requires running Redis
 	async fn test_update_not_found() {
@@ -626,7 +661,8 @@ mod integration_tests {
 		let store = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
-		).unwrap();
+		)
+		.unwrap();
 
 		// Cleanup to ensure clean state
 		let _ = store.delete().await;
@@ -645,7 +681,8 @@ mod integration_tests {
 		let store = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
-		).unwrap();
+		)
+		.unwrap();
 
 		// Cleanup to ensure clean state
 		let _ = store.delete().await;
@@ -656,11 +693,11 @@ mod integration_tests {
 		// Seed, then delete, then delete again
 		let config = create_test_config(&solver_id);
 		store.seed(config).await.unwrap();
-		
+
 		// First delete should succeed
 		assert!(store.delete().await.is_ok());
 		assert_eq!(store.exists().await.unwrap(), false);
-		
+
 		// Second delete should still succeed (idempotent)
 		assert!(store.delete().await.is_ok());
 	}
@@ -669,12 +706,13 @@ mod integration_tests {
 	#[ignore] // Requires running Redis
 	async fn test_config_persistence_across_connections() {
 		let solver_id = unique_solver_id();
-		
+
 		// Create first store instance
 		let store1 = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
-		).unwrap();
+		)
+		.unwrap();
 
 		// Cleanup
 		let _ = store1.delete().await;
@@ -689,7 +727,8 @@ mod integration_tests {
 		let store2 = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
-		).unwrap();
+		)
+		.unwrap();
 
 		// Configuration should persist across connections
 		let retrieved = store2.get().await.unwrap();
