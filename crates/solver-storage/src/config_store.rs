@@ -507,6 +507,55 @@ impl ConfigStore for RedisConfigStore {
 	}
 }
 
+/// Creates a config store instance based on the specified backend type.
+///
+/// This factory function provides an abstraction layer for config store creation,
+/// allowing the backend implementation to be selected at runtime.
+///
+/// # Arguments
+///
+/// * `backend` - The backend type (currently only "redis" is supported)
+/// * `redis_url` - Redis connection URL (required for redis backend)
+/// * `solver_id` - Unique identifier for this solver instance
+///
+/// # Returns
+///
+/// A boxed `ConfigStore` trait object.
+///
+/// # Errors
+///
+/// Returns `ConfigStoreError::Configuration` if:
+/// - The backend type is unknown
+/// - Required parameters are invalid
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use solver_storage::config_store::create_config_store;
+///
+/// let store = create_config_store(
+///     "redis",
+///     "redis://localhost:6379".to_string(),
+///     "my-solver".to_string(),
+/// )?;
+/// ```
+pub fn create_config_store(
+	backend: &str,
+	redis_url: String,
+	solver_id: String,
+) -> Result<Box<dyn ConfigStore>, ConfigStoreError> {
+	match backend {
+		"redis" => {
+			let store = RedisConfigStore::with_defaults(redis_url, solver_id)?;
+			Ok(Box::new(store))
+		},
+		_ => Err(ConfigStoreError::Configuration(format!(
+			"Unknown config store backend '{}'. Available: [redis]",
+			backend
+		))),
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
