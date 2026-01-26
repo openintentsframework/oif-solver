@@ -48,14 +48,39 @@ pub struct RedisConfigStore<T> {
 
 impl<T> std::fmt::Debug for RedisConfigStore<T> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		// Redact credentials from redis_url to prevent leaking secrets in logs
+		let redacted_url = redact_url_credentials(&self.redis_url);
 		f.debug_struct("RedisConfigStore")
-			.field("redis_url", &self.redis_url)
+			.field("redis_url", &redacted_url)
 			.field("timeout_ms", &self.timeout_ms)
 			.field("solver_id", &self.solver_id)
 			.field("key_prefix", &self.key_prefix)
 			.field("connected", &self.client.initialized())
 			.finish()
 	}
+}
+
+/// Redacts credentials (userinfo) from a Redis URL to prevent leaking secrets.
+///
+/// Transforms URLs like `redis://:password@host:port` to `redis://[REDACTED]@host:port`
+fn redact_url_credentials(url: &str) -> String {
+	// Find the scheme separator
+	let Some(scheme_end) = url.find("://") else {
+		return url.to_string();
+	};
+
+	let after_scheme = &url[scheme_end + 3..];
+
+	// Find the @ symbol which separates userinfo from host
+	let Some(at_pos) = after_scheme.find('@') else {
+		// No credentials in URL
+		return url.to_string();
+	};
+
+	// Reconstruct URL with redacted credentials
+	let scheme = &url[..scheme_end + 3];
+	let host_and_path = &after_scheme[at_pos + 1..];
+	format!("{}[REDACTED]@{}", scheme, host_and_path)
 }
 
 impl<T> RedisConfigStore<T>
@@ -620,5 +645,64 @@ mod tests {
 		assert!(debug_str.contains("10000"));
 		assert!(debug_str.contains("my-solver"));
 		assert!(debug_str.contains("custom-prefix"));
+	}
+
+	#[test]
+	fn test_debug_impl_redacts_credentials() {
+		let store = RedisConfigStore::<TestConfig>::new(
+			"redis://:secretpassword@localhost:6379".to_string(),
+			"test-solver".to_string(),
+			"oif-solver".to_string(),
+		)
+		.unwrap();
+
+		let debug_str = format!("{:?}", store);
+		assert!(debug_str.contains("RedisConfigStore"));
+		// Password should be redacted
+		assert!(!debug_str.contains("secretpassword"));
+		assert!(debug_str.contains("[REDACTED]"));
+		assert!(debug_str.contains("localhost:6379"));
+	}
+
+	// ==================== URL Redaction Tests ====================
+
+	#[test]
+	fn test_redact_url_no_credentials() {
+		let url = "redis://localhost:6379";
+		let redacted = redact_url_credentials(url);
+		assert_eq!(redacted, "redis://localhost:6379");
+	}
+
+	#[test]
+	fn test_redact_url_with_password_only() {
+		let url = "redis://:mypassword@localhost:6379";
+		let redacted = redact_url_credentials(url);
+		assert_eq!(redacted, "redis://[REDACTED]@localhost:6379");
+		assert!(!redacted.contains("mypassword"));
+	}
+
+	#[test]
+	fn test_redact_url_with_username_and_password() {
+		let url = "redis://user:pass@localhost:6379";
+		let redacted = redact_url_credentials(url);
+		assert_eq!(redacted, "redis://[REDACTED]@localhost:6379");
+		assert!(!redacted.contains("user"));
+		assert!(!redacted.contains("pass"));
+	}
+
+	#[test]
+	fn test_redact_url_with_path() {
+		let url = "redis://:secret@localhost:6379/0";
+		let redacted = redact_url_credentials(url);
+		assert_eq!(redacted, "redis://[REDACTED]@localhost:6379/0");
+		assert!(!redacted.contains("secret"));
+	}
+
+	#[test]
+	fn test_redact_url_invalid() {
+		let url = "not-a-valid-url";
+		let redacted = redact_url_credentials(url);
+		// Should return as-is since there's no :// scheme
+		assert_eq!(redacted, "not-a-valid-url");
 	}
 }
