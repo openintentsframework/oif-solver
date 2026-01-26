@@ -132,7 +132,7 @@ where
 pub type JsonConfigStore = Box<dyn ConfigStore<Value> + Send + Sync>;
 
 /// Configuration for different config store backends.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum ConfigStoreConfig {
 	/// Redis backend configuration
 	Redis {
@@ -144,6 +144,43 @@ pub enum ConfigStoreConfig {
 	//     /// Base directory for config files
 	//     base_dir: PathBuf,
 	// },
+}
+
+impl std::fmt::Debug for ConfigStoreConfig {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			ConfigStoreConfig::Redis { url } => {
+				// Redact credentials from URL to prevent leaking secrets in logs
+				let redacted_url = redact_url_credentials(url);
+				f.debug_struct("Redis")
+					.field("url", &redacted_url)
+					.finish()
+			},
+		}
+	}
+}
+
+/// Redacts credentials (userinfo) from a Redis URL to prevent leaking secrets.
+///
+/// Transforms URLs like `redis://:password@host:port` to `redis://[REDACTED]@host:port`
+fn redact_url_credentials(url: &str) -> String {
+	// Find the scheme separator
+	let Some(scheme_end) = url.find("://") else {
+		return url.to_string();
+	};
+
+	let after_scheme = &url[scheme_end + 3..];
+
+	// Find the @ symbol which separates userinfo from host
+	let Some(at_pos) = after_scheme.find('@') else {
+		// No credentials in URL
+		return url.to_string();
+	};
+
+	// Reconstruct URL with redacted credentials
+	let scheme = &url[..scheme_end + 3];
+	let host_and_path = &after_scheme[at_pos + 1..];
+	format!("{}[REDACTED]@{}", scheme, host_and_path)
 }
 
 /// Creates a config store instance based on the specified configuration.
