@@ -28,6 +28,8 @@ pub mod provider;
 pub mod registry;
 /// Secure string type for handling sensitive data.
 pub mod secret_string;
+/// Seed override types for initializing a new solver.
+pub mod seed_overrides;
 /// Standard-specific types for different cross-chain protocols.
 pub mod standards;
 /// Storage types for managing persistent data.
@@ -36,6 +38,8 @@ pub mod storage;
 pub mod utils;
 /// Configuration validation types for ensuring type-safe configurations.
 pub mod validation;
+/// Versioned wrapper for optimistic locking.
+pub mod versioned;
 
 // Cost types
 pub mod costs;
@@ -59,6 +63,7 @@ pub use provider::{
 };
 pub use registry::ImplementationRegistry;
 pub use secret_string::SecretString;
+pub use seed_overrides::{NetworkOverride, SeedOverrides, Token};
 pub use standards::{
 	eip7683::{Eip7683OrderData, MandateOutput as Eip7683Output},
 	eip7930::{InteropAddress, InteropAddressError},
@@ -71,3 +76,4 @@ pub use utils::{
 	MOCK_TOKA_USD_PRICE, MOCK_TOKB_USD_PRICE,
 };
 pub use validation::*;
+pub use versioned::Versioned;

@@ -134,7 +134,7 @@ oif-solver/
 │   ├── solver-settlement/       # Settlement verification
 │   ├── solver-storage/          # State persistence
 │   └── solver-types/            # Shared types
-├── config/                      # Configuration examples
+├── config/                      # Seed overrides and demo settings
 └── scripts/                     # E2E testing and deployment scripts
 ```
 
@@ -216,124 +216,108 @@ oif-solver/
 ## Quick Start
 
 ```bash
-# Build the project
-cargo build
+# 1. Start Redis
+redis-server
 
-# Run tests
-cargo test
+# 2. Set required environment variables
+export REDIS_URL=redis://localhost:6379
+export SOLVER_PRIVATE_KEY=your_64_hex_character_private_key
 
-# Run the solver service with info logs
-cargo run -- --config config/example.toml
+# 3. First run: Seed configuration from preset + deployment config
+cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
 
-# Run with debug logs for solver modules only
-RUST_LOG=solver_core=debug,solver_delivery=debug,info cargo run -- --config config/example.toml
+# 4. Subsequent runs: Configuration loads automatically from Redis
+cargo run --
 ```
+
+See [docs/config-storage.md](docs/config-storage.md) for detailed documentation.
 
 ## Configuration
 
-The solver uses TOML configuration files with support for modular configuration through file includes.
+The solver uses Redis as the single source of truth for runtime configuration. Configuration is seeded once and then loaded from Redis on subsequent startups.
 
-### Modular Configuration (Recommended)
-
-Split your configuration into multiple files for better organization:
-
-```toml
-# config/main.toml - Main configuration file
-include = [
-    "networks.toml",  # Network and token configurations
-    "api.toml",       # API server settings
-    "storage.toml",   # Storage backend configuration
-    # ... other modules
-]
-
-[solver]
-id = "oif-solver-local"
-monitoring_timeout_seconds = 300
-```
-
-**Important**: Each top-level section must be unique across all files. Duplicate sections will cause an error.
-
-See `config/demo/` for a complete modular configuration example.
-
-### Single File Configuration
-
-You can also use a single configuration file. See [`config/demo.toml`](config/demo.toml) for a complete configuration example with all supported options.
-
-### Key Configuration Sections
-
-- **networks**: Defines supported chains with their settler contracts and available tokens
-- **storage**: Configures persistence backend (memory, file, or redis) with TTL for different data types
-- **account**: Manages signing keys for the solver (supports multiple accounts)
-- **delivery**: Handles transaction submission to multiple chains (supports per-network account mapping)
-- **discovery**: Sources for discovering new intents (on-chain events, off-chain APIs)
-- **order**: Execution strategy and protocol-specific settings
-- **pricing**: Configures pricing oracles for asset valuation and profitability calculations (supports mock and CoinGecko)
-- **settlement**: Configuration for claiming rewards and handling disputes
-- **api**: Optional REST API server for receiving off-chain intents
-
-### Running with Custom Configuration
+### Seeding Configuration
 
 ```bash
-# Using command line flag
-cargo run -- --config path/to/your/config.toml
+# Seed testnet configuration (using file)
+cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
 
-# Using environment variable
-CONFIG_FILE=path/to/your/config.toml cargo run
+# Seed mainnet configuration (using file)
+cargo run -- --seed mainnet --seed-overrides config/seed-overrides-mainnet.json
+
+# Or pass JSON directly (useful for deployment services)
+cargo run -- --seed testnet --seed-overrides '{"solver_id":"my-solver","networks":[{"chain_id":11155420,"tokens":[{"symbol":"USDC","address":"0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6","decimals":6}]},{"chain_id":84532,"tokens":[{"symbol":"USDC","address":"0x73c83DAcc74bB8a704717AC09703b959E74b9705","decimals":6}]}]}'
+
+# Force re-seed (overwrite existing)
+cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json --force-seed
 ```
 
-### Storage Backend Configuration
+### Environment Variables
 
-The solver supports three storage backends. Choose based on your deployment needs:
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `REDIS_URL` | Yes | Redis connection URL (default: `redis://localhost:6379`) |
+| `SOLVER_PRIVATE_KEY` | Yes | 64-character hex private key (without 0x prefix) |
+| `SOLVER_ID` | For loading | Solver ID to load from Redis (set after first seed) |
 
-#### Memory Storage (Testing Only)
+### Seed Overrides Format
 
-```toml
-[storage]
-primary = "memory"
+Create a JSON file specifying which networks and tokens to support (these override/extend the seed preset defaults):
 
-[storage.implementations.memory]
-# No configuration required
+```json
+{
+  "solver_id": "my-solver-instance",
+  "networks": [
+    {
+      "chain_id": 11155420,
+      "tokens": [
+        {
+          "symbol": "USDC",
+          "address": "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6",
+          "decimals": 6
+        }
+      ]
+    },
+    {
+      "chain_id": 84532,
+      "tokens": [
+        {
+          "symbol": "USDC",
+          "address": "0x73c83DAcc74bB8a704717AC09703b959E74b9705",
+          "decimals": 6
+        }
+      ],
+      "rpc_urls": ["https://my-custom-rpc.com"]
+    }
+  ]
+}
 ```
 
-#### File Storage (Development/Simple Deployments)
+**Note:** The `solver_id` field is optional but recommended. If provided, seeding becomes idempotent (re-running `--seed` with same config skips seeding). After seeding, set `SOLVER_ID` env var for subsequent runs.
 
-```toml
-[storage]
-primary = "file"
-cleanup_interval_seconds = 60
+### Supported Networks
 
-[storage.implementations.file]
-storage_path = "./data/storage"
-ttl_orders = 300                # 5 minutes
-ttl_intents = 120               # 2 minutes
-ttl_order_by_tx_hash = 300      # 5 minutes
-```
+**Testnet:**
+| Chain | Chain ID |
+|-------|----------|
+| Optimism Sepolia | 11155420 |
+| Base Sepolia | 84532 |
 
-#### Redis Storage (Production Recommended)
+**Mainnet:**
+| Chain | Chain ID |
+|-------|----------|
+| Optimism | 10 |
+| Base | 8453 |
+| Arbitrum | 42161 |
 
-Redis provides the best performance and reliability for production deployments with native TTL support and connection pooling.
-
-```toml
-[storage]
-primary = "redis"
-cleanup_interval_seconds = 60
-
-[storage.implementations.redis]
-redis_url = "redis://localhost:6379"
-key_prefix = "oif-solver"
-connection_timeout_ms = 5000
-db = 0
-ttl_orders = 300                # 5 minutes
-ttl_intents = 120               # 2 minutes
-ttl_order_by_tx_hash = 300      # 5 minutes
-ttl_quotes = 60                 # 1 minute
-ttl_settlement_messages = 600   # 10 minutes
-```
-
-**Running Redis with Docker:**
+### Running Redis
 
 ```bash
+# Using Docker
 docker run -d --name redis -p 6379:6379 redis:latest
+
+# Or install locally
+redis-server
 ```
 
 ## API Reference
@@ -482,16 +466,16 @@ The solver uses the `RUST_LOG` environment variable for fine-grained logging con
 
 ```bash
 # Show debug logs for solver modules only
-RUST_LOG=solver_core=debug,solver_delivery=debug,info cargo run -- --config config/demo.toml
+RUST_LOG=solver_core=debug,solver_delivery=debug,info cargo run
 
 # Reduce noise from external crates
-RUST_LOG=info,hyper=warn,alloy_provider=warn cargo run -- --config config/demo.toml
+RUST_LOG=info,hyper=warn,alloy_provider=warn cargo run
 
 # Debug specific modules
-RUST_LOG=solver_core=debug,solver_delivery=info,alloy=warn,hyper=warn cargo run -- --config config/demo.toml
+RUST_LOG=solver_core=debug,solver_delivery=info,alloy=warn,hyper=warn cargo run
 
 # Show all debug logs (very verbose)
-RUST_LOG=debug cargo run -- --config config/demo.toml
+RUST_LOG=debug cargo run
 ```
 
 Available log levels (from most to least verbose):
@@ -506,7 +490,7 @@ The `--log-level` flag acts as a fallback when `RUST_LOG` is not set:
 
 ```bash
 # Uses info level for all modules when RUST_LOG is not set
-cargo run -- --config config/demo.toml --log-level info
+cargo run -- --log-level info
 ```
 
 ## Testing and Development with solver-demo
@@ -523,6 +507,8 @@ The project includes a Rust-based CLI tool (`solver-demo`) for testing cross-cha
 
 ### Quick Start
 
+> **Note:** The solver-demo tool uses local Anvil chains for testing. The main solver binary uses Redis-based configuration for production deployments. See below for demo-specific setup.
+
 ```bash
 # 1. Initialize configuration and load it
 cargo run -p solver-demo -- init new config/demo.toml
@@ -535,8 +521,8 @@ cargo run -p solver-demo -- env start
 cargo run -p solver-demo -- env deploy --all
 cargo run -p solver-demo -- env setup
 
-# 4. In another terminal, start the solver
-cargo run --bin solver -- --config config/demo.toml
+# 4. In another terminal, the demo tests can be run without starting the main solver
+#    The solver-demo tool handles intent building, quoting, and submission for testing
 
 # 5. Build and test intents
 # Build an intent request
@@ -745,24 +731,28 @@ The demo tool provides a complete workflow for setting up a test environment:
    - Registers allocator with TheCompact
    - Validates all approvals and registrations
 
-### Running the Solver
+### Running the Solver (Production)
 
-After setting up the environment, start the solver in a separate terminal:
+For production deployments, the solver uses Redis-based configuration:
 
 ```bash
 # Build the project
 cargo build
 
-# Run the solver with local configuration
-cargo run --bin solver -- --config config/demo.toml
+# Seed configuration (first run only)
+cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
+
+# Run the solver (loads config from Redis)
+export SOLVER_ID=your-solver-id  # Output from seeding step
+cargo run
 
 # Or with debug logs for debugging
-RUST_LOG=solver_core=debug,solver_delivery=info,info cargo run --bin solver -- --config config/demo.toml
+RUST_LOG=solver_core=debug,solver_delivery=info,info cargo run
 ```
 
 The solver will:
 
-- Connect to both local chains
+- Connect to configured chains
 - Start monitoring for new intents
 - Process discovered intents automatically
 

@@ -1,0 +1,35 @@
+{
+  "solver_id": "oif-solver-mainnet",
+  "networks": [
+    {
+      "chain_id": 10,
+      "tokens": [
+        {
+          "symbol": "USDC",
+          "address": "0xc0b782920B2DE8b55f08FC98004Eb5c7d4fBf287",
+          "decimals": 6
+        }
+      ]
+    },
+    {
+      "chain_id": 8453,
+      "tokens": [
+        {
+          "symbol": "USDC",
+          "address": "0xc0b782920B2DE8b55f08FC98004Eb5c7d4fBf287",
+          "decimals": 6
+        }
+      ]
+    },
+    {
+      "chain_id": 42161,
+      "tokens": [
+        {
+          "symbol": "USDC",
+          "address": "0x7e13E59a15E4703a54a0976dDd970F8Fe52d3a76",
+          "decimals": 6
+        }
+      ]
+    }
+  ]
+}

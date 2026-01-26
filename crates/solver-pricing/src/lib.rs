@@ -374,7 +374,6 @@ mod tests {
 
 	#[test]
 	fn test_default_token_mappings() {
-		assert!(!DEFAULT_TOKEN_MAPPINGS.is_empty());
 		// Check some key mappings exist
 		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("ETH", "ethereum")));
 		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("BTC", "bitcoin")));
