@@ -26,8 +26,7 @@ pub fn admin_domain_separator(chain_id: u64) -> FixedBytes<32> {
 	use alloy_primitives::keccak256;
 
 	// EIP-712 domain type hash (without verifyingContract - it's optional per spec)
-	let domain_type_hash =
-		keccak256(b"EIP712Domain(string name,string version,uint256 chainId)");
+	let domain_type_hash = keccak256(b"EIP712Domain(string name,string version,uint256 chainId)");
 
 	let name_hash = keccak256(ADMIN_DOMAIN_NAME.as_bytes());
 	let version_hash = keccak256(ADMIN_DOMAIN_VERSION.as_bytes());
@@ -184,8 +183,9 @@ impl RemoveTokenContents {
 	pub fn struct_hash(&self) -> FixedBytes<32> {
 		use alloy_primitives::keccak256;
 
-		let type_hash =
-			keccak256(b"RemoveToken(uint256 chainId,address tokenAddress,uint256 nonce,uint256 deadline)");
+		let type_hash = keccak256(
+			b"RemoveToken(uint256 chainId,address tokenAddress,uint256 nonce,uint256 deadline)",
+		);
 
 		let encoded = [
 			type_hash.as_slice(),
@@ -364,8 +364,7 @@ mod tests {
 		let contents = AddTokenContents {
 			chain_id: 10,
 			symbol: "USDC".to_string(),
-			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85")
-				.unwrap(),
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
 			nonce: 1,
 			deadline: 1706184000,
@@ -384,8 +383,7 @@ mod tests {
 		let contents = AddTokenContents {
 			chain_id: 10,
 			symbol: "USDC".to_string(),
-			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85")
-				.unwrap(),
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
 			nonce: 1,
 			deadline: 1706184000,
@@ -428,8 +426,7 @@ mod tests {
 		let contents = AddTokenContents {
 			chain_id: 10,
 			symbol: "USDC".to_string(),
-			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85")
-				.unwrap(),
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
 			nonce: 42,
 			deadline: 1706184000,

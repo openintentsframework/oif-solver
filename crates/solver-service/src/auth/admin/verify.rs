@@ -192,8 +192,7 @@ mod tests {
 		let action = AddTokenContents {
 			chain_id: 10,
 			symbol: "USDC".to_string(),
-			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85")
-				.unwrap(),
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
 			nonce: 1,
 			deadline: (chrono::Utc::now().timestamp() + 300) as u64, // 5 min from now
@@ -236,8 +235,7 @@ mod tests {
 		let action = AddTokenContents {
 			chain_id: 10,
 			symbol: "USDC".to_string(),
-			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85")
-				.unwrap(),
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
 			nonce: 1,
 			deadline: 1000, // Far in the past
@@ -273,8 +271,7 @@ mod tests {
 		let action = AddTokenContents {
 			chain_id: 10,
 			symbol: "USDC".to_string(),
-			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85")
-				.unwrap(),
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
 			nonce: 1,
 			deadline: (chrono::Utc::now().timestamp() + 300) as u64,
