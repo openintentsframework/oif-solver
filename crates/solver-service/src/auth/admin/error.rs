@@ -139,11 +139,7 @@ mod tests {
 
 		for (error, expected_status) in cases {
 			let response = error.into_response();
-			assert_eq!(
-				response.status(),
-				expected_status,
-				"Wrong status for error"
-			);
+			assert_eq!(response.status(), expected_status, "Wrong status for error");
 		}
 	}
 
