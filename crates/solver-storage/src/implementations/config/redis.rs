@@ -296,8 +296,10 @@ where
 		})?;
 
 		// Use atomic Lua script for compare-and-swap
-		// Returns integer status codes to avoid protocol error handling issues:
-		// 1 = success, 0 = version mismatch, -1 = not found
+		// Returns integer status codes to avoid collision with version numbers:
+		// 0 = success (versions start at 1, so 0 is never a valid version)
+		// -1 = not found
+		// version + 2 = mismatch (offset ensures no collision with 0 or -1)
 		let script = redis::Script::new(
 			r#"
             local key = KEYS[1]
@@ -311,11 +313,11 @@ where
 
             local current_data = cjson.decode(current)
             if current_data.version ~= expected_version then
-                return current_data.version
+                return current_data.version + 2
             end
 
             redis.call('SET', key, new_value)
-            return 1
+            return 0
             "#,
 		);
 
@@ -328,7 +330,7 @@ where
 			.map_err(|e| ConfigStoreError::Backend(format!("Redis script failed: {}", e)))?;
 
 		match result {
-			1 => {
+			0 => {
 				debug!(
 					key = %key,
 					old_version = expected_version,
@@ -338,9 +340,9 @@ where
 				Ok(new_versioned)
 			},
 			-1 => Err(ConfigStoreError::NotFound(self.solver_id.clone())),
-			found_version => Err(ConfigStoreError::VersionMismatch {
+			encoded_version => Err(ConfigStoreError::VersionMismatch {
 				expected: expected_version,
-				found: found_version as u64,
+				found: (encoded_version - 2) as u64,
 			}),
 		}
 	}
