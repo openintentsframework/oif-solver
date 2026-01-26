@@ -26,6 +26,7 @@ use thiserror::Error;
 
 /// Re-export implementations
 pub mod implementations {
+	pub mod config;
 	pub mod file;
 	pub mod memory;
 	pub mod redis;

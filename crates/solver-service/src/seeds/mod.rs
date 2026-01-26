@@ -111,4 +111,55 @@ mod tests {
 		assert!(names.contains(&"mainnet"));
 		assert!(names.contains(&"testnet"));
 	}
+
+	#[test]
+	fn test_parse_seed_preset_error_display() {
+		let error = ParseSeedPresetError("unknown".to_string());
+		let error_msg = format!("{}", error);
+		assert!(error_msg.contains("Unknown seed preset"));
+		assert!(error_msg.contains("unknown"));
+		assert!(error_msg.contains("mainnet"));
+		assert!(error_msg.contains("testnet"));
+	}
+
+	#[test]
+	fn test_parse_seed_preset_error_is_error_trait() {
+		let error = ParseSeedPresetError("bad".to_string());
+		// Test that it implements std::error::Error
+		let _: &dyn std::error::Error = &error;
+	}
+
+	#[test]
+	fn test_parse_seed_preset_error_debug() {
+		let error = ParseSeedPresetError("test".to_string());
+		let debug_str = format!("{:?}", error);
+		assert!(debug_str.contains("ParseSeedPresetError"));
+		assert!(debug_str.contains("test"));
+	}
+
+	#[test]
+	fn test_seed_preset_copy() {
+		let preset = SeedPreset::Mainnet;
+		let copied = preset; // Copy trait
+		assert_eq!(preset, copied);
+
+		let preset2 = SeedPreset::Testnet;
+		let copied2 = preset2;
+		assert_eq!(preset2, copied2);
+	}
+
+	#[test]
+	fn test_seed_preset_equality() {
+		assert_eq!(SeedPreset::Mainnet, SeedPreset::Mainnet);
+		assert_eq!(SeedPreset::Testnet, SeedPreset::Testnet);
+		assert_ne!(SeedPreset::Mainnet, SeedPreset::Testnet);
+	}
+
+	#[test]
+	fn test_seed_preset_debug() {
+		let mainnet = SeedPreset::Mainnet;
+		let testnet = SeedPreset::Testnet;
+		assert_eq!(format!("{:?}", mainnet), "Mainnet");
+		assert_eq!(format!("{:?}", testnet), "Testnet");
+	}
 }

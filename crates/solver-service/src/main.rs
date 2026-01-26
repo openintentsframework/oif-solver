@@ -31,7 +31,7 @@ use solver_config::Config;
 use solver_service::{
 	build_solver_from_config, config_merge::merge_config, seeds::SeedPreset, server,
 };
-use solver_storage::config_store::{ConfigStore, RedisConfigStore};
+use solver_storage::config_store::{create_config_store, ConfigStoreConfig};
 use solver_types::SeedOverrides;
 use std::sync::Arc;
 
@@ -150,8 +150,12 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 		let merged_config = merge_config(seed_overrides, seed)?;
 
 		// Create config store for seeding
-		let config_store =
-			RedisConfigStore::with_defaults(redis_url.clone(), merged_config.solver.id.clone())?;
+		let config_store = create_config_store::<Config>(
+			ConfigStoreConfig::Redis {
+				url: redis_url.clone(),
+			},
+			merged_config.solver.id.clone(),
+		)?;
 
 		// Check if we should seed
 		let exists = config_store.exists().await?;
@@ -168,17 +172,13 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 			let solver_id = &versioned.data.solver.id;
 
 			// Print prominent output for the solver ID
-			println!();
-			println!("════════════════════════════════════════════════════════════");
-			println!("  Configuration seeded successfully!");
-			println!("════════════════════════════════════════════════════════════");
-			println!("  SOLVER_ID: {}", solver_id);
-			println!("  Version:   {}", versioned.version);
-			println!();
-			println!("  For subsequent runs, set:");
-			println!("    export SOLVER_ID={}", solver_id);
-			println!("════════════════════════════════════════════════════════════");
-			println!();
+			tracing::info!("════════════════════════════════════════════════════════════");
+			tracing::info!("  Configuration seeded successfully!");
+			tracing::info!("  SOLVER_ID: {}", solver_id);
+			tracing::info!("  Version:   {}", versioned.version);
+			tracing::info!("  For subsequent runs, set:");
+			tracing::info!("    export SOLVER_ID={}", solver_id);
+			tracing::info!("════════════════════════════════════════════════════════════");
 
 			return Ok(versioned.into_inner());
 		} else {
@@ -187,15 +187,12 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 			let existing_config = versioned.into_inner();
 
 			// Print info about existing config
-			println!();
-			println!("════════════════════════════════════════════════════════════");
-			println!("  Configuration already exists (skipping seed)");
-			println!("════════════════════════════════════════════════════════════");
-			println!("  SOLVER_ID: {}", existing_config.solver.id);
-			println!();
-			println!("  Use --force-seed to overwrite existing configuration");
-			println!("════════════════════════════════════════════════════════════");
-			println!();
+			tracing::info!("════════════════════════════════════════════════════════════");
+			tracing::info!("  Configuration already exists (skipping seed)");
+			tracing::info!("════════════════════════════════════════════════════════════");
+			tracing::info!("  SOLVER_ID: {}", existing_config.solver.id);
+			tracing::info!("  Use --force-seed to overwrite existing configuration");
+			tracing::info!("════════════════════════════════════════════════════════════");
 
 			return Ok(existing_config);
 		}
@@ -214,7 +211,8 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 
 	tracing::info!("Loading configuration from Redis for solver: {}", solver_id);
 
-	let config_store = RedisConfigStore::with_defaults(redis_url, solver_id)?;
+	let config_store =
+		create_config_store::<Config>(ConfigStoreConfig::Redis { url: redis_url }, solver_id)?;
 	let versioned = config_store.get().await?;
 
 	tracing::info!(

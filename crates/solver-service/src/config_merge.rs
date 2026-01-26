@@ -48,6 +48,10 @@ pub enum MergeError {
 	#[error("No tokens specified for chain {0}")]
 	NoTokens(u64),
 
+	/// Duplicate chain ID in network configuration.
+	#[error("Duplicate chain ID: {0}")]
+	DuplicateChainId(u64),
+
 	/// At least 2 networks are required.
 	#[error("At least 2 networks are required for cross-chain operations")]
 	InsufficientNetworks,
@@ -75,8 +79,17 @@ pub enum MergeError {
 /// - No tokens are specified for a network
 /// - Fewer than 2 networks are requested
 pub fn merge_config(overrides: SeedOverrides, seed: &SeedConfig) -> Result<Config, MergeError> {
-	// Validate we have at least 2 networks
-	if overrides.networks.len() < 2 {
+	// Check for duplicate chain IDs first (before the 2-network check)
+	// to prevent duplicates from collapsing in HashMap and bypassing validation
+	let mut seen_chain_ids = std::collections::HashSet::new();
+	for network in &overrides.networks {
+		if !seen_chain_ids.insert(network.chain_id) {
+			return Err(MergeError::DuplicateChainId(network.chain_id));
+		}
+	}
+
+	// Validate we have at least 2 unique networks
+	if seen_chain_ids.len() < 2 {
 		return Err(MergeError::InsufficientNetworks);
 	}
 
@@ -740,5 +753,94 @@ mod tests {
 		assert_eq!(resource_lock.open, Some(0));
 		assert_eq!(resource_lock.fill, Some(77298));
 		assert_eq!(resource_lock.claim, Some(122793));
+	}
+
+	#[test]
+	fn test_merge_error_display() {
+		// Test all error variants have proper Display implementations
+		let unknown_chain = MergeError::UnknownChainId(999, vec![1, 2, 3]);
+		assert!(unknown_chain.to_string().contains("Unknown chain ID"));
+		assert!(unknown_chain.to_string().contains("999"));
+
+		let no_tokens = MergeError::NoTokens(42);
+		assert!(no_tokens.to_string().contains("No tokens"));
+		assert!(no_tokens.to_string().contains("42"));
+
+		let duplicate = MergeError::DuplicateChainId(123);
+		assert!(duplicate.to_string().contains("Duplicate chain ID"));
+		assert!(duplicate.to_string().contains("123"));
+
+		let insufficient = MergeError::InsufficientNetworks;
+		assert!(insufficient.to_string().contains("At least 2 networks"));
+
+		let validation = MergeError::Validation("test error".to_string());
+		assert!(validation
+			.to_string()
+			.contains("Configuration validation failed"));
+		assert!(validation.to_string().contains("test error"));
+	}
+
+	#[test]
+	fn test_merge_config_duplicate_chain_ids() {
+		let overrides = SeedOverrides {
+			solver_id: None,
+			networks: vec![
+				NetworkOverride {
+					chain_id: 11155420,
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "USDC".to_string(),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+				NetworkOverride {
+					chain_id: 11155420, // Duplicate!
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "DAI".to_string(),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						decimals: 18,
+					}],
+					rpc_urls: None,
+				},
+			],
+		};
+
+		let result = merge_config(overrides, &TESTNET_SEED);
+		assert!(result.is_err());
+		assert!(matches!(
+			result.unwrap_err(),
+			MergeError::DuplicateChainId(11155420)
+		));
+	}
+
+	#[test]
+	fn test_custom_solver_id() {
+		let overrides = SeedOverrides {
+			solver_id: Some("my-custom-solver".to_string()),
+			networks: vec![
+				NetworkOverride {
+					chain_id: 11155420,
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "USDC".to_string(),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+				NetworkOverride {
+					chain_id: 84532,
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "USDC".to_string(),
+						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+			],
+		};
+
+		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
+		assert_eq!(config.solver.id, "my-custom-solver");
 	}
 }
