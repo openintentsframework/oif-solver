@@ -696,7 +696,7 @@ mod integration_tests {
 
 		// First delete should succeed
 		assert!(store.delete().await.is_ok());
-		assert_eq!(store.exists().await.unwrap(), false);
+		assert!(!store.exists().await.unwrap());
 
 		// Second delete should still succeed (idempotent)
 		assert!(store.delete().await.is_ok());

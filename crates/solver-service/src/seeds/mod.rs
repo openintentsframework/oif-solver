@@ -138,12 +138,14 @@ mod tests {
 	}
 
 	#[test]
-	fn test_seed_preset_clone_and_copy() {
+	fn test_seed_preset_copy() {
 		let preset = SeedPreset::Mainnet;
-		let cloned = preset.clone();
-		let copied = preset;
-		assert_eq!(preset, cloned);
+		let copied = preset; // Copy trait
 		assert_eq!(preset, copied);
+
+		let preset2 = SeedPreset::Testnet;
+		let copied2 = preset2;
+		assert_eq!(preset2, copied2);
 	}
 
 	#[test]
