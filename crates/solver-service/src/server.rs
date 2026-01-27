@@ -4,11 +4,16 @@
 //! for the OIF Solver API.
 
 use crate::{
+	apis::admin::{handle_add_token, handle_get_nonce, handle_get_types, AdminApiState},
 	apis::order::get_order_by_id,
-	auth::{auth_middleware, AuthState, JwtService},
+	auth::{
+		admin::AdminActionVerifier,
+		auth_middleware, AuthState, JwtService,
+	},
 	validators::order::ensure_user_capacity_for_order,
 	validators::signature::SignatureValidationService,
 };
+use solver_storage::nonce_store::NonceStore;
 use alloy_primitives::U256;
 use axum::{
 	extract::{Extension, Path, State},
@@ -109,6 +114,40 @@ pub async fn start_server(
 	// Initialize signature validation service
 	let signature_validation = Arc::new(SignatureValidationService::new());
 
+	// Initialize admin API if enabled in config (before AppState consumes config)
+	let admin_state = if let Some(auth_config) = &api_config.auth {
+		if let Some(admin_config) = &auth_config.admin {
+			if admin_config.enabled {
+				let redis_url = std::env::var("REDIS_URL")
+					.unwrap_or_else(|_| "redis://localhost:6379".to_string());
+				let solver_id = config.solver.id.clone();
+				let chain_id = config.networks.keys().next().copied().unwrap_or(1);
+
+				match NonceStore::new(&redis_url, &solver_id, admin_config.nonce_ttl_seconds) {
+					Ok(nonce_store) => {
+						let verifier = AdminActionVerifier::new(
+							std::sync::Arc::new(nonce_store),
+							admin_config.clone(),
+							chain_id,
+						);
+						tracing::info!("Admin API enabled for {} admin(s)", admin_config.admin_count());
+						Some(AdminApiState { verifier: std::sync::Arc::new(verifier) })
+					}
+					Err(e) => {
+						tracing::error!("Failed to initialize admin nonce store: {}", e);
+						None
+					}
+				}
+			} else {
+				None
+			}
+		} else {
+			None
+		}
+	} else {
+		None
+	};
+
 	let app_state = AppState {
 		solver,
 		config,
@@ -130,6 +169,17 @@ pub async fn start_server(
 		.route("/refresh", post(handle_auth_refresh));
 
 	api_routes = api_routes.nest("/auth", auth_routes);
+
+	// Add admin routes if enabled
+	if let Some(admin_state) = admin_state {
+		let admin_routes = Router::new()
+			.route("/nonce", get(handle_get_nonce))
+			.route("/types", get(handle_get_types))
+			.route("/tokens", post(handle_add_token))
+			.with_state(admin_state);
+		api_routes = api_routes.nest("/admin", admin_routes);
+		tracing::info!("Admin routes registered at /api/v1/admin/*");
+	}
 
 	// Create order routes with optional auth
 	let mut order_routes = Router::new()

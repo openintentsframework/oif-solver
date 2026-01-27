@@ -127,7 +127,7 @@ pub fn merge_config(overrides: SeedOverrides, seed: &SeedConfig) -> Result<Confi
 		order: build_order_config(&seed.defaults),
 		settlement: build_settlement_config(&chain_ids, seed),
 		pricing: Some(build_pricing_config(&seed.defaults)),
-		api: Some(build_api_config()),
+		api: Some(build_api_config(overrides.admin.as_ref())),
 		gas: Some(build_gas_config(&seed.defaults)),
 	};
 
@@ -510,7 +510,26 @@ fn build_gas_config(defaults: &SeedDefaults) -> GasConfig {
 }
 
 /// Builds the ApiConfig section with default values for HTTP API server.
-fn build_api_config() -> ApiConfig {
+fn build_api_config(admin_override: Option<&solver_types::seed_overrides::AdminOverride>) -> ApiConfig {
+	// Build auth config if admin is configured
+	let auth = admin_override.map(|admin| {
+		use solver_types::{AdminConfig, AuthConfig, SecretString};
+
+		AuthConfig {
+			enabled: true,
+			jwt_secret: SecretString::new(uuid::Uuid::new_v4().to_string()),
+			access_token_expiry_hours: 1,
+			refresh_token_expiry_hours: 720, // 30 days
+			issuer: "oif-solver".to_string(),
+			admin: Some(AdminConfig {
+				enabled: admin.enabled,
+				domain: admin.domain.clone(),
+				nonce_ttl_seconds: admin.nonce_ttl_seconds.unwrap_or(300),
+				admin_addresses: admin.admin_addresses.clone(),
+			}),
+		}
+	});
+
 	ApiConfig {
 		enabled: true,
 		host: "127.0.0.1".to_string(),
@@ -522,7 +541,7 @@ fn build_api_config() -> ApiConfig {
 		},
 		rate_limiting: None,
 		cors: None,
-		auth: None,
+		auth,
 		quote: None,
 	}
 }
@@ -556,6 +575,7 @@ mod tests {
 					rpc_urls: Some(vec!["https://custom-rpc.example.com".to_string()]),
 				},
 			],
+			admin: None,
 		}
 	}
 
@@ -600,6 +620,7 @@ mod tests {
 					rpc_urls: None,
 				},
 			],
+			admin: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -630,6 +651,7 @@ mod tests {
 					rpc_urls: None,
 				},
 			],
+			admin: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -653,6 +675,7 @@ mod tests {
 				}],
 				rpc_urls: None,
 			}],
+			admin: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -804,6 +827,7 @@ mod tests {
 					rpc_urls: None,
 				},
 			],
+			admin: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -838,6 +862,7 @@ mod tests {
 					rpc_urls: None,
 				},
 			],
+			admin: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();

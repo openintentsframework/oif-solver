@@ -18,7 +18,12 @@
 //!       ],
 //!       "rpc_urls": ["https://user-rpc.com"]
 //!     }
-//!   ]
+//!   ],
+//!   "admin": {
+//!     "enabled": true,
+//!     "domain": "solver.example.com",
+//!     "admin_addresses": ["0xYourAdminWallet"]
+//!   }
 //! }
 //! ```
 
@@ -41,6 +46,35 @@ pub struct SeedOverrides {
 	/// List of networks the solver should support.
 	/// Each network must exist in the seed configuration.
 	pub networks: Vec<NetworkOverride>,
+
+	/// Optional admin configuration for wallet-based admin authentication.
+	/// If provided, enables admin API endpoints with EIP-712 signature auth.
+	#[serde(default)]
+	pub admin: Option<AdminOverride>,
+}
+
+/// Admin configuration for wallet-based admin authentication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminOverride {
+	/// Enable admin authentication. Defaults to true if admin config is present.
+	#[serde(default = "default_admin_enabled")]
+	pub enabled: bool,
+
+	/// Domain for signature verification (prevents cross-site attacks).
+	/// Example: "solver.example.com"
+	pub domain: String,
+
+	/// List of authorized admin wallet addresses.
+	/// Only these addresses can perform admin operations.
+	pub admin_addresses: Vec<Address>,
+
+	/// Optional nonce TTL in seconds. Default: 300 (5 minutes).
+	#[serde(default)]
+	pub nonce_ttl_seconds: Option<u64>,
+}
+
+fn default_admin_enabled() -> bool {
+	true
 }
 
 /// Per-network configuration provided by the user.
@@ -189,6 +223,7 @@ mod tests {
 					rpc_urls: None,
 				},
 			],
+			admin: None,
 		};
 
 		let chain_ids = config.chain_ids();
@@ -204,6 +239,7 @@ mod tests {
 				tokens: vec![],
 				rpc_urls: None,
 			}],
+			admin: None,
 		};
 
 		assert!(config.has_chain(10));
@@ -223,6 +259,7 @@ mod tests {
 				}],
 				rpc_urls: None,
 			}],
+			admin: None,
 		};
 
 		let network = config.get_network(10);
@@ -267,6 +304,7 @@ mod tests {
 				}],
 				rpc_urls: Some(vec!["https://rpc.com".to_string()]),
 			}],
+			admin: None,
 		};
 
 		let json = serde_json::to_string(&config).unwrap();
