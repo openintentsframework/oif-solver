@@ -149,6 +149,7 @@ mod tests {
 	use crate::auth::admin::types::AddTokenContents;
 	use alloy_primitives::keccak256;
 	use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
+	use solver_storage::nonce_store::{create_nonce_store, NonceStoreConfig};
 	use std::str::FromStr;
 
 	/// Get address from secret key
@@ -173,14 +174,14 @@ mod tests {
 	}
 
 	#[tokio::test]
-	#[ignore] // Requires Redis
 	async fn test_verify_admin_action() {
 		// Setup
 		let secret = SecretKey::from_byte_array([0x42u8; 32]).expect("valid secret");
 		let admin_address = address_from_secret(&secret);
 
-		let nonce_store =
-			Arc::new(NonceStore::new("redis://127.0.0.1:6379", "test-verify", 300).unwrap());
+		let nonce_store = Arc::new(
+			create_nonce_store(NonceStoreConfig::Memory, "test-verify", 300).unwrap(),
+		);
 
 		let admin_config = AdminConfig {
 			enabled: true,
@@ -219,13 +220,13 @@ mod tests {
 	}
 
 	#[tokio::test]
-	#[ignore] // Requires Redis
 	async fn test_verify_expired_action() {
 		let secret = SecretKey::from_byte_array([0x42u8; 32]).expect("valid secret");
 		let admin_address = address_from_secret(&secret);
 
-		let nonce_store =
-			Arc::new(NonceStore::new("redis://127.0.0.1:6379", "test-expired", 300).unwrap());
+		let nonce_store = Arc::new(
+			create_nonce_store(NonceStoreConfig::Memory, "test-expired", 300).unwrap(),
+		);
 
 		let admin_config = AdminConfig {
 			enabled: true,
@@ -255,14 +256,14 @@ mod tests {
 	}
 
 	#[tokio::test]
-	#[ignore] // Requires Redis
 	async fn test_verify_non_admin() {
 		let secret = SecretKey::from_byte_array([0x42u8; 32]).expect("valid secret");
 		let other_address =
 			Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
 
-		let nonce_store =
-			Arc::new(NonceStore::new("redis://127.0.0.1:6379", "test-non-admin", 300).unwrap());
+		let nonce_store = Arc::new(
+			create_nonce_store(NonceStoreConfig::Memory, "test-non-admin", 300).unwrap(),
+		);
 
 		let admin_config = AdminConfig {
 			enabled: true,

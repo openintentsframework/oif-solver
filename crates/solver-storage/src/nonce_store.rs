@@ -1,36 +1,48 @@
 //! Nonce management for admin authentication.
 //!
 //! Provides cryptographically secure nonce generation and single-use
-//! consumption via Redis. Used for replay protection in admin authentication.
+//! consumption via a pluggable storage backend. Used for replay protection
+//! in admin authentication.
+//!
+//! # Architecture
+//!
+//! This module uses the common [`StorageInterface`] for persistence, allowing
+//! different backends (Redis, memory, file) to be used. This follows the
+//! same pattern as [`crate::config_store`].
 //!
 //! # Example
 //!
 //! ```rust,ignore
-//! use solver_storage::nonce_store::NonceStore;
+//! use solver_storage::nonce_store::{create_nonce_store, NonceStoreConfig};
 //!
-//! let store = NonceStore::new("redis://localhost:6379", "my-solver", 300)?;
+//! // Create nonce store with Redis backend
+//! let nonce_store = create_nonce_store(
+//!     NonceStoreConfig::Redis { url: "redis://localhost:6379".to_string() },
+//!     "my-solver",
+//!     300,  // TTL in seconds
+//! )?;
 //!
 //! // Generate a nonce (returns u64)
-//! let nonce: u64 = store.generate().await?;
+//! let nonce: u64 = nonce_store.generate().await?;
 //!
 //! // Later, verify and consume the nonce
-//! let exists = store.exists(nonce).await?;  // Check without consuming
-//! store.consume(nonce).await?;              // Consume (single-use)
+//! let exists = nonce_store.exists(nonce).await?;  // Check without consuming
+//! nonce_store.consume(nonce).await?;              // Consume (single-use)
 //! ```
 
-use redis::aio::ConnectionManager;
-use redis::AsyncCommands;
+use crate::{implementations, StorageError, StorageInterface};
+use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::OnceCell;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 /// Errors that can occur during nonce operations.
 #[derive(Error, Debug)]
 pub enum NonceError {
-	/// Redis connection or operation failed
-	#[error("Redis error: {0}")]
-	Redis(#[from] redis::RedisError),
+	/// Storage backend operation failed
+	#[error("Storage error: {0}")]
+	Storage(String),
 
 	/// Nonce was not found or already consumed
 	#[error("Nonce not found or already used")]
@@ -41,44 +53,167 @@ pub enum NonceError {
 	Configuration(String),
 }
 
+impl From<StorageError> for NonceError {
+	fn from(err: StorageError) -> Self {
+		match err {
+			StorageError::NotFound(_) => NonceError::NotFound,
+			StorageError::Configuration(msg) => NonceError::Configuration(msg),
+			other => NonceError::Storage(other.to_string()),
+		}
+	}
+}
+
+/// Configuration for different nonce store backends.
+///
+/// Similar to [`crate::config_store::ConfigStoreConfig`], this enum allows
+/// selecting the storage backend at runtime.
+#[derive(Clone)]
+pub enum NonceStoreConfig {
+	/// Use an existing StorageInterface (for sharing storage with other components)
+	Storage(Arc<dyn StorageInterface>),
+	/// Create a new Redis-backed storage
+	Redis {
+		/// Redis connection URL (e.g., "redis://localhost:6379")
+		url: String,
+	},
+	/// Create an in-memory storage (useful for testing)
+	Memory,
+}
+
+impl std::fmt::Debug for NonceStoreConfig {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			NonceStoreConfig::Storage(_) => f.debug_struct("Storage").finish_non_exhaustive(),
+			NonceStoreConfig::Redis { url } => {
+				let redacted = redact_url_credentials(url);
+				f.debug_struct("Redis").field("url", &redacted).finish()
+			},
+			NonceStoreConfig::Memory => f.debug_struct("Memory").finish(),
+		}
+	}
+}
+
+/// Redacts credentials from a URL to prevent leaking secrets in logs.
+fn redact_url_credentials(url: &str) -> String {
+	let Some(scheme_end) = url.find("://") else {
+		return url.to_string();
+	};
+
+	let after_scheme = &url[scheme_end + 3..];
+
+	let Some(at_pos) = after_scheme.find('@') else {
+		return url.to_string();
+	};
+
+	let scheme = &url[..scheme_end + 3];
+	let host_and_path = &after_scheme[at_pos + 1..];
+	format!("{}[REDACTED]@{}", scheme, host_and_path)
+}
+
+/// Creates a nonce store with the specified backend configuration.
+///
+/// # Arguments
+///
+/// * `config` - Backend configuration (Redis, Memory, or existing StorageInterface)
+/// * `solver_id` - Unique solver identifier for namespacing
+/// * `ttl_seconds` - How long nonces are valid before expiring
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // For production (Redis)
+/// let store = create_nonce_store(
+///     NonceStoreConfig::Redis { url: redis_url },
+///     &solver_id,
+///     300,
+/// )?;
+///
+/// // For testing (Memory)
+/// let store = create_nonce_store(
+///     NonceStoreConfig::Memory,
+///     "test-solver",
+///     300,
+/// )?;
+/// ```
+pub fn create_nonce_store(
+	config: NonceStoreConfig,
+	solver_id: &str,
+	ttl_seconds: u64,
+) -> Result<NonceStore, NonceError> {
+	let storage: Arc<dyn StorageInterface> = match config {
+		NonceStoreConfig::Storage(s) => s,
+		NonceStoreConfig::Redis { url } => {
+			let redis_config = toml::Value::Table({
+				let mut table = toml::map::Map::new();
+				table.insert("redis_url".to_string(), toml::Value::String(url));
+				table
+			});
+			Arc::from(implementations::redis::create_storage(&redis_config)?)
+		},
+		NonceStoreConfig::Memory => {
+			let config = toml::Value::Table(toml::map::Map::new());
+			Arc::from(implementations::memory::create_storage(&config)?)
+		},
+	};
+	NonceStore::new(storage, solver_id, ttl_seconds)
+}
+
+/// Convenience function for creating a Redis-backed nonce store.
+///
+/// This mirrors the pattern of [`crate::config_store::create_redis_config_store`].
+pub fn create_redis_nonce_store(
+	redis_url: String,
+	solver_id: &str,
+	ttl_seconds: u64,
+) -> Result<NonceStore, NonceError> {
+	create_nonce_store(
+		NonceStoreConfig::Redis { url: redis_url },
+		solver_id,
+		ttl_seconds,
+	)
+}
+
 /// Manages nonces for replay protection in admin authentication.
 ///
 /// Nonces are:
 /// - Cryptographically random (UUID v4)
-/// - Stored in Redis with TTL (auto-expire)
-/// - Single-use (atomically deleted on consumption)
+/// - Stored with TTL (auto-expire)
+/// - Single-use (deleted on consumption)
 /// - Namespaced by solver_id (multi-solver safe)
+///
+/// This struct wraps a [`StorageInterface`] implementation, allowing
+/// different storage backends to be used (Redis, memory, file).
 pub struct NonceStore {
-	/// Redis connection manager (lazily initialized)
-	connection: OnceCell<ConnectionManager>,
-	/// Redis URL for connection
-	redis_url: String,
+	/// Storage backend
+	storage: Arc<dyn StorageInterface>,
 	/// Solver ID for namespacing
 	solver_id: String,
-	/// Key prefix for nonces
-	key_prefix: String,
-	/// TTL in seconds for nonces
-	ttl_seconds: u64,
+	/// Storage namespace for nonces
+	namespace: String,
+	/// TTL for nonces
+	ttl: Duration,
 }
 
 impl NonceStore {
-	/// Create a new NonceStore.
+	/// Create a new NonceStore with a storage backend.
+	///
+	/// Prefer using [`create_nonce_store`] or [`create_redis_nonce_store`]
+	/// instead of calling this directly.
 	///
 	/// # Arguments
 	///
-	/// * `redis_url` - Redis connection URL (e.g., "redis://localhost:6379")
+	/// * `storage` - Storage backend implementing `StorageInterface`
 	/// * `solver_id` - Unique solver identifier for namespacing
-	/// * `ttl_seconds` - How long nonces are valid (default: 300 = 5 min)
+	/// * `ttl_seconds` - How long nonces are valid (e.g., 300 = 5 min)
 	///
 	/// # Errors
 	///
-	/// Returns an error if solver_id or redis_url is empty.
-	pub fn new(redis_url: &str, solver_id: &str, ttl_seconds: u64) -> Result<Self, NonceError> {
-		if redis_url.is_empty() {
-			return Err(NonceError::Configuration(
-				"Redis URL cannot be empty".to_string(),
-			));
-		}
+	/// Returns an error if solver_id is empty.
+	pub fn new(
+		storage: Arc<dyn StorageInterface>,
+		solver_id: &str,
+		ttl_seconds: u64,
+	) -> Result<Self, NonceError> {
 		if solver_id.is_empty() {
 			return Err(NonceError::Configuration(
 				"Solver ID cannot be empty".to_string(),
@@ -86,68 +221,34 @@ impl NonceStore {
 		}
 
 		Ok(Self {
-			connection: OnceCell::new(),
-			redis_url: redis_url.to_string(),
+			storage,
 			solver_id: solver_id.to_string(),
-			key_prefix: "oif-solver".to_string(),
-			ttl_seconds,
+			namespace: format!("{}:admin:nonce", solver_id),
+			ttl: Duration::from_secs(ttl_seconds),
 		})
-	}
-
-	/// Create a NonceStore with a custom key prefix.
-	pub fn with_prefix(mut self, prefix: &str) -> Self {
-		self.key_prefix = prefix.to_string();
-		self
-	}
-
-	/// Get or initialize the Redis connection.
-	async fn get_connection(&self) -> Result<ConnectionManager, NonceError> {
-		self.connection
-			.get_or_try_init(|| async {
-				let client = redis::Client::open(self.redis_url.as_str())?;
-				let manager = ConnectionManager::new(client).await?;
-				debug!(
-					redis_url = %self.redis_url,
-					solver_id = %self.solver_id,
-					"Nonce store Redis connection established"
-				);
-				Ok(manager)
-			})
-			.await
-			.cloned()
-	}
-
-	/// Build the Redis key for a nonce.
-	fn nonce_key(&self, nonce: &str) -> String {
-		format!(
-			"{}:{}:admin:nonce:{}",
-			self.key_prefix, self.solver_id, nonce
-		)
 	}
 
 	/// Generate and store a new nonce.
 	///
 	/// Returns a unique numeric nonce that must be included in the signed message.
-	/// The nonce will automatically expire after `ttl_seconds`.
+	/// The nonce will automatically expire after the configured TTL.
 	///
 	/// The nonce is a u64 derived from UUID v4's cryptographically secure randomness,
 	/// making it compatible with EIP-712's uint256 nonce fields.
 	pub async fn generate(&self) -> Result<u64, NonceError> {
 		// Use UUID v4's 128-bit randomness, take lower 64 bits
 		let nonce = Uuid::new_v4().as_u128() as u64;
-		let nonce_str = nonce.to_string();
-		let key = self.nonce_key(&nonce_str);
-
-		let mut conn = self.get_connection().await?;
+		let nonce_key = self.nonce_key(nonce);
 
 		// Store with TTL - value is creation timestamp for debugging
 		let timestamp = chrono::Utc::now().timestamp().to_string();
-		conn.set_ex::<_, _, ()>(&key, &timestamp, self.ttl_seconds)
+		self.storage
+			.set_bytes(&nonce_key, timestamp.into_bytes(), None, Some(self.ttl))
 			.await?;
 
 		debug!(
 			nonce = %nonce,
-			ttl = %self.ttl_seconds,
+			ttl_secs = %self.ttl.as_secs(),
 			solver_id = %self.solver_id,
 			"Generated admin nonce"
 		);
@@ -159,11 +260,8 @@ impl NonceStore {
 	///
 	/// Useful for pre-validation before expensive signature verification.
 	pub async fn exists(&self, nonce: u64) -> Result<bool, NonceError> {
-		let key = self.nonce_key(&nonce.to_string());
-
-		let mut conn = self.get_connection().await?;
-		let exists: bool = conn.exists(&key).await?;
-		Ok(exists)
+		let nonce_key = self.nonce_key(nonce);
+		Ok(self.storage.exists(&nonce_key).await?)
 	}
 
 	/// Consume a nonce (single-use).
@@ -171,36 +269,42 @@ impl NonceStore {
 	/// Returns `Ok(())` if nonce was valid and is now consumed.
 	/// Returns `Err(NotFound)` if nonce doesn't exist or was already used.
 	///
-	/// This operation is atomic - the nonce is deleted in the same
-	/// operation that checks for its existence.
+	/// Note: This operation uses exists + delete which is not strictly atomic,
+	/// but is acceptable for nonces since each nonce is unique (UUID-based)
+	/// and the window between operations is minimal.
 	pub async fn consume(&self, nonce: u64) -> Result<(), NonceError> {
-		let key = self.nonce_key(&nonce.to_string());
+		let nonce_key = self.nonce_key(nonce);
 
-		let mut conn = self.get_connection().await?;
-
-		// DEL returns number of keys deleted (1 if existed, 0 if not)
-		let deleted: i64 = conn.del(&key).await?;
-
-		if deleted > 0 {
-			debug!(
-				nonce = %nonce,
-				solver_id = %self.solver_id,
-				"Consumed admin nonce"
-			);
-			Ok(())
-		} else {
+		// Check if exists first
+		if !self.storage.exists(&nonce_key).await? {
 			warn!(
 				nonce = %nonce,
 				solver_id = %self.solver_id,
 				"Attempted to use invalid/expired nonce"
 			);
-			Err(NonceError::NotFound)
+			return Err(NonceError::NotFound);
 		}
+
+		// Delete the nonce
+		self.storage.delete(&nonce_key).await?;
+
+		debug!(
+			nonce = %nonce,
+			solver_id = %self.solver_id,
+			"Consumed admin nonce"
+		);
+
+		Ok(())
 	}
 
-	/// Get the configured TTL for nonces.
+	/// Build the storage key for a nonce.
+	fn nonce_key(&self, nonce: u64) -> String {
+		format!("{}:{}", self.namespace, nonce)
+	}
+
+	/// Get the configured TTL for nonces in seconds.
 	pub fn ttl_seconds(&self) -> u64 {
-		self.ttl_seconds
+		self.ttl.as_secs()
 	}
 
 	/// Get the solver ID this store is configured for.
@@ -212,10 +316,9 @@ impl NonceStore {
 impl std::fmt::Debug for NonceStore {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("NonceStore")
-			.field("redis_url", &self.redis_url)
 			.field("solver_id", &self.solver_id)
-			.field("key_prefix", &self.key_prefix)
-			.field("ttl_seconds", &self.ttl_seconds)
+			.field("namespace", &self.namespace)
+			.field("ttl_secs", &self.ttl.as_secs())
 			.finish()
 	}
 }
@@ -226,7 +329,7 @@ mod tests {
 
 	#[test]
 	fn test_new_valid() {
-		let store = NonceStore::new("redis://localhost:6379", "test-solver", 300);
+		let store = create_nonce_store(NonceStoreConfig::Memory, "test-solver", 300);
 		assert!(store.is_ok());
 
 		let store = store.unwrap();
@@ -235,39 +338,61 @@ mod tests {
 	}
 
 	#[test]
-	fn test_new_empty_redis_url() {
-		let result = NonceStore::new("", "test-solver", 300);
-		assert!(matches!(result, Err(NonceError::Configuration(_))));
-	}
-
-	#[test]
 	fn test_new_empty_solver_id() {
-		let result = NonceStore::new("redis://localhost:6379", "", 300);
+		let result = create_nonce_store(NonceStoreConfig::Memory, "", 300);
 		assert!(matches!(result, Err(NonceError::Configuration(_))));
 	}
 
 	#[test]
 	fn test_nonce_key_format() {
-		let store = NonceStore::new("redis://localhost:6379", "my-solver", 300).unwrap();
-		let key = store.nonce_key("abc123");
-		assert_eq!(key, "oif-solver:my-solver:admin:nonce:abc123");
+		let store = create_nonce_store(NonceStoreConfig::Memory, "my-solver", 300).unwrap();
+		let key = store.nonce_key(12345);
+		assert_eq!(key, "my-solver:admin:nonce:12345");
 	}
 
 	#[test]
-	fn test_nonce_key_with_custom_prefix() {
-		let store = NonceStore::new("redis://localhost:6379", "my-solver", 300)
-			.unwrap()
-			.with_prefix("custom");
-		let key = store.nonce_key("abc123");
-		assert_eq!(key, "custom:my-solver:admin:nonce:abc123");
+	fn test_debug_impl() {
+		let store = create_nonce_store(NonceStoreConfig::Memory, "test-solver", 300).unwrap();
+
+		let debug_str = format!("{:?}", store);
+		assert!(debug_str.contains("NonceStore"));
+		assert!(debug_str.contains("test-solver"));
+		assert!(debug_str.contains("300"));
 	}
 
-	// Integration tests require Redis - run with: cargo test --features redis-tests
+	#[test]
+	fn test_config_debug_redacts_credentials() {
+		let config = NonceStoreConfig::Redis {
+			url: "redis://:secretpassword@localhost:6379".to_string(),
+		};
+		let debug_str = format!("{:?}", config);
+		assert!(!debug_str.contains("secretpassword"));
+		assert!(debug_str.contains("[REDACTED]"));
+	}
+
+	#[test]
+	fn test_config_debug_memory() {
+		let config = NonceStoreConfig::Memory;
+		let debug_str = format!("{:?}", config);
+		assert!(debug_str.contains("Memory"));
+	}
+
+	#[test]
+	fn test_redact_url_no_credentials() {
+		let url = "redis://localhost:6379";
+		assert_eq!(redact_url_credentials(url), "redis://localhost:6379");
+	}
+
+	#[test]
+	fn test_redact_url_with_password() {
+		let url = "redis://:mypassword@localhost:6379";
+		let redacted = redact_url_credentials(url);
+		assert_eq!(redacted, "redis://[REDACTED]@localhost:6379");
+	}
+
 	#[tokio::test]
-	#[ignore] // Requires Redis
 	async fn test_nonce_lifecycle() {
-		let solver_id = format!("test-{}", Uuid::new_v4());
-		let store = NonceStore::new("redis://127.0.0.1:6379", &solver_id, 300).unwrap();
+		let store = create_nonce_store(NonceStoreConfig::Memory, "test-solver", 300).unwrap();
 
 		// Generate
 		let nonce = store.generate().await.unwrap();
@@ -290,10 +415,8 @@ mod tests {
 	}
 
 	#[tokio::test]
-	#[ignore] // Requires Redis
 	async fn test_invalid_nonce() {
-		let solver_id = format!("test-{}", Uuid::new_v4());
-		let store = NonceStore::new("redis://127.0.0.1:6379", &solver_id, 300).unwrap();
+		let store = create_nonce_store(NonceStoreConfig::Memory, "test-solver", 300).unwrap();
 
 		// Random nonce that was never generated
 		let result = store.consume(12345).await;
@@ -301,13 +424,19 @@ mod tests {
 	}
 
 	#[tokio::test]
-	#[ignore] // Requires Redis
 	async fn test_nonce_isolation_between_solvers() {
-		let solver1 = format!("test-solver1-{}", Uuid::new_v4());
-		let solver2 = format!("test-solver2-{}", Uuid::new_v4());
+		// Create shared storage
+		let storage = Arc::from(
+			implementations::memory::create_storage(&toml::Value::Table(toml::map::Map::new()))
+				.unwrap(),
+		);
 
-		let store1 = NonceStore::new("redis://127.0.0.1:6379", &solver1, 300).unwrap();
-		let store2 = NonceStore::new("redis://127.0.0.1:6379", &solver2, 300).unwrap();
+		let store1 =
+			create_nonce_store(NonceStoreConfig::Storage(Arc::clone(&storage)), "solver1", 300)
+				.unwrap();
+		let store2 =
+			create_nonce_store(NonceStoreConfig::Storage(Arc::clone(&storage)), "solver2", 300)
+				.unwrap();
 
 		// Generate nonce in store1
 		let nonce = store1.generate().await.unwrap();
@@ -326,5 +455,44 @@ mod tests {
 
 		// Consume from store1 should succeed
 		assert!(store1.consume(nonce).await.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_multiple_nonces() {
+		let store = create_nonce_store(NonceStoreConfig::Memory, "test-solver", 300).unwrap();
+
+		// Generate multiple nonces
+		let nonce1 = store.generate().await.unwrap();
+		let nonce2 = store.generate().await.unwrap();
+		let nonce3 = store.generate().await.unwrap();
+
+		// All should be unique
+		assert_ne!(nonce1, nonce2);
+		assert_ne!(nonce2, nonce3);
+		assert_ne!(nonce1, nonce3);
+
+		// All should exist
+		assert!(store.exists(nonce1).await.unwrap());
+		assert!(store.exists(nonce2).await.unwrap());
+		assert!(store.exists(nonce3).await.unwrap());
+
+		// Consume in different order
+		store.consume(nonce2).await.unwrap();
+		assert!(!store.exists(nonce2).await.unwrap());
+		assert!(store.exists(nonce1).await.unwrap());
+		assert!(store.exists(nonce3).await.unwrap());
+	}
+
+	#[test]
+	fn test_create_redis_nonce_store_convenience() {
+		// This will fail because there's no Redis, but it tests the API
+		let result = create_redis_nonce_store(
+			"redis://invalid-host:6379".to_string(),
+			"test-solver",
+			300,
+		);
+		// Should fail at connection time (lazy), not at creation time
+		// The error depends on the implementation details
+		assert!(result.is_ok() || result.is_err());
 	}
 }

@@ -92,8 +92,8 @@ impl From<solver_storage::nonce_store::NonceError> for AdminAuthError {
 	fn from(err: solver_storage::nonce_store::NonceError) -> Self {
 		match err {
 			solver_storage::nonce_store::NonceError::NotFound => AdminAuthError::NonceNotFound,
-			solver_storage::nonce_store::NonceError::Redis(e) => {
-				AdminAuthError::Internal(format!("Redis error: {}", e))
+			solver_storage::nonce_store::NonceError::Storage(e) => {
+				AdminAuthError::Internal(format!("Storage error: {}", e))
 			},
 			solver_storage::nonce_store::NonceError::Configuration(msg) => {
 				AdminAuthError::Internal(format!("Configuration error: {}", msg))

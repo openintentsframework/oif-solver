@@ -22,7 +22,7 @@ use axum::{
 use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
-use solver_storage::nonce_store::NonceStore;
+use solver_storage::nonce_store::{create_nonce_store, NonceStoreConfig};
 use solver_types::{
 	api::PostOrderRequest, standards::eip7683::interfaces::StandardOrder, APIError, Address,
 	ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse, Order, OrderIdCallback,
@@ -120,7 +120,11 @@ pub async fn start_server(
 				let solver_id = config.solver.id.clone();
 				let chain_id = config.networks.keys().next().copied().unwrap_or(1);
 
-				match NonceStore::new(&redis_url, &solver_id, admin_config.nonce_ttl_seconds) {
+				match create_nonce_store(
+					NonceStoreConfig::Redis { url: redis_url },
+					&solver_id,
+					admin_config.nonce_ttl_seconds,
+				) {
 					Ok(nonce_store) => {
 						let verifier = AdminActionVerifier::new(
 							std::sync::Arc::new(nonce_store),
