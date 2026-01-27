@@ -431,12 +431,18 @@ mod tests {
 				.unwrap(),
 		);
 
-		let store1 =
-			create_nonce_store(NonceStoreConfig::Storage(Arc::clone(&storage)), "solver1", 300)
-				.unwrap();
-		let store2 =
-			create_nonce_store(NonceStoreConfig::Storage(Arc::clone(&storage)), "solver2", 300)
-				.unwrap();
+		let store1 = create_nonce_store(
+			NonceStoreConfig::Storage(Arc::clone(&storage)),
+			"solver1",
+			300,
+		)
+		.unwrap();
+		let store2 = create_nonce_store(
+			NonceStoreConfig::Storage(Arc::clone(&storage)),
+			"solver2",
+			300,
+		)
+		.unwrap();
 
 		// Generate nonce in store1
 		let nonce = store1.generate().await.unwrap();
@@ -486,11 +492,8 @@ mod tests {
 	#[test]
 	fn test_create_redis_nonce_store_convenience() {
 		// This will fail because there's no Redis, but it tests the API
-		let result = create_redis_nonce_store(
-			"redis://invalid-host:6379".to_string(),
-			"test-solver",
-			300,
-		);
+		let result =
+			create_redis_nonce_store("redis://invalid-host:6379".to_string(), "test-solver", 300);
 		// Should fail at connection time (lazy), not at creation time
 		// The error depends on the implementation details
 		assert!(result.is_ok() || result.is_err());
