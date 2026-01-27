@@ -6,14 +6,10 @@
 use crate::{
 	apis::admin::{handle_add_token, handle_get_nonce, handle_get_types, AdminApiState},
 	apis::order::get_order_by_id,
-	auth::{
-		admin::AdminActionVerifier,
-		auth_middleware, AuthState, JwtService,
-	},
+	auth::{admin::AdminActionVerifier, auth_middleware, AuthState, JwtService},
 	validators::order::ensure_user_capacity_for_order,
 	validators::signature::SignatureValidationService,
 };
-use solver_storage::nonce_store::NonceStore;
 use alloy_primitives::U256;
 use axum::{
 	extract::{Extension, Path, State},
@@ -26,6 +22,7 @@ use axum::{
 use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
+use solver_storage::nonce_store::NonceStore;
 use solver_types::{
 	api::PostOrderRequest, standards::eip7683::interfaces::StandardOrder, APIError, Address,
 	ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse, Order, OrderIdCallback,
@@ -130,13 +127,18 @@ pub async fn start_server(
 							admin_config.clone(),
 							chain_id,
 						);
-						tracing::info!("Admin API enabled for {} admin(s)", admin_config.admin_count());
-						Some(AdminApiState { verifier: std::sync::Arc::new(verifier) })
-					}
+						tracing::info!(
+							"Admin API enabled for {} admin(s)",
+							admin_config.admin_count()
+						);
+						Some(AdminApiState {
+							verifier: std::sync::Arc::new(verifier),
+						})
+					},
 					Err(e) => {
 						tracing::error!("Failed to initialize admin nonce store: {}", e);
 						None
-					}
+					},
 				}
 			} else {
 				None

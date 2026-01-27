@@ -510,7 +510,9 @@ fn build_gas_config(defaults: &SeedDefaults) -> GasConfig {
 }
 
 /// Builds the ApiConfig section with default values for HTTP API server.
-fn build_api_config(admin_override: Option<&solver_types::seed_overrides::AdminOverride>) -> ApiConfig {
+fn build_api_config(
+	admin_override: Option<&solver_types::seed_overrides::AdminOverride>,
+) -> ApiConfig {
 	// Build auth config if admin is configured
 	let auth = admin_override.map(|admin| {
 		use solver_types::{AdminConfig, AuthConfig, SecretString};
