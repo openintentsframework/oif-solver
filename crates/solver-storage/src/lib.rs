@@ -243,12 +243,6 @@ pub trait StorageInterface: Send + Sync {
 /// to create instances of their storage interface.
 pub type StorageFactory = fn(&toml::Value) -> Result<Box<dyn StorageInterface>, StorageError>;
 
-/// Registry trait for storage implementations.
-///
-/// This trait extends the base ImplementationRegistry to specify that
-/// storage implementations must provide a StorageFactory.
-pub trait StorageRegistry: ImplementationRegistry<Factory = StorageFactory> {}
-
 /// Get all registered storage implementations.
 ///
 /// Returns a vector of (name, factory) tuples for all available storage implementations.
@@ -333,20 +327,12 @@ pub fn create_storage_backend(
 	match config {
 		StoreConfig::Storage(s) => Ok(s),
 		StoreConfig::Redis { url } => {
-			let redis_config = toml::Value::Table({
-				let mut table = toml::map::Map::new();
-				table.insert("redis_url".to_string(), toml::Value::String(url));
-				table
-			});
-			Ok(std::sync::Arc::from(
-				implementations::redis::create_storage(&redis_config)?,
-			))
+			let storage = implementations::redis::RedisStorage::with_url(url)?;
+			Ok(std::sync::Arc::new(storage))
 		},
 		StoreConfig::Memory => {
-			let config = toml::Value::Table(toml::map::Map::new());
-			Ok(std::sync::Arc::from(
-				implementations::memory::create_storage(&config)?,
-			))
+			let storage = implementations::memory::MemoryStorage::new();
+			Ok(std::sync::Arc::new(storage))
 		},
 	}
 }

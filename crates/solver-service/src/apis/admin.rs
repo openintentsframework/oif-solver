@@ -28,8 +28,7 @@ pub struct AdminApiState {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NonceResponse {
-	/// Numeric nonce for EIP-712 signing (uint256 compatible)
-	pub nonce: u64,
+	pub nonce: String,
 	pub expires_in: u64,
 	pub domain: String,
 	pub chain_id: u64,
@@ -54,7 +53,7 @@ pub async fn handle_get_nonce(
 	let nonce = state.verifier.generate_nonce().await?;
 
 	Ok(Json(NonceResponse {
-		nonce,
+		nonce: nonce.to_string(),
 		expires_in: state.verifier.nonce_ttl(),
 		domain: state.verifier.domain().to_string(),
 		chain_id: state.verifier.chain_id(),
@@ -192,14 +191,15 @@ mod tests {
 	#[test]
 	fn test_nonce_response_serialization() {
 		let response = NonceResponse {
-			nonce: 12345678901234,
+			nonce: "12345678901234567890".to_string(),
 			expires_in: 300,
 			domain: "test.example.com".to_string(),
 			chain_id: 1,
 		};
 
 		let json = serde_json::to_string(&response).unwrap();
-		assert!(json.contains("\"nonce\":12345678901234"));
+		// Nonce is now a string to preserve precision for JavaScript clients
+		assert!(json.contains("\"nonce\":\"12345678901234567890\""));
 		assert!(json.contains("\"expiresIn\":300"));
 	}
 

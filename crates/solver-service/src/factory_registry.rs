@@ -12,13 +12,12 @@ use solver_order::{ExecutionStrategy, OrderError, OrderInterface, StrategyError}
 
 use solver_pricing::PricingInterface;
 use solver_settlement::{SettlementError, SettlementInterface};
-use solver_storage::{StorageError, StorageInterface};
+use solver_storage::StorageFactory;
 use solver_types::{NetworksConfig, PricingError};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
 // Type aliases for factory functions
-pub type StorageFactory = fn(&toml::Value) -> Result<Box<dyn StorageInterface>, StorageError>;
 pub type AccountFactory = fn(&toml::Value) -> Result<Box<dyn AccountInterface>, AccountError>;
 pub type DeliveryFactory = fn(
 	&toml::Value,

@@ -936,8 +936,6 @@ impl solver_types::ImplementationRegistry for Registry {
 	}
 }
 
-impl crate::StorageRegistry for Registry {}
-
 #[cfg(test)]
 mod tests {
 	use super::*;

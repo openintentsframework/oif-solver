@@ -114,6 +114,13 @@ pub struct TtlConfig {
 }
 
 impl TtlConfig {
+	/// Creates an empty TTL config (no automatic expiration).
+	pub fn new() -> Self {
+		Self {
+			ttls: HashMap::new(),
+		}
+	}
+
 	/// Creates TTL config from TOML configuration.
 	fn from_config(config: &toml::Value) -> Self {
 		let mut ttls = HashMap::new();
@@ -142,6 +149,12 @@ impl TtlConfig {
 	}
 }
 
+impl Default for TtlConfig {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
 /// Redis storage implementation.
 ///
 /// This implementation stores data in Redis, providing:
@@ -167,6 +180,29 @@ pub struct RedisStorage {
 }
 
 impl RedisStorage {
+	/// Creates a new RedisStorage instance with just a URL, using defaults for other options.
+	///
+	/// This is the simplest way to create a Redis storage backend.
+	/// Uses default key prefix (`oif-solver`), timeout (5000ms), and no automatic TTLs.
+	///
+	/// # Arguments
+	///
+	/// * `redis_url` - Redis connection URL (e.g., "redis://localhost:6379")
+	///
+	/// # Example
+	///
+	/// ```rust,ignore
+	/// let storage = RedisStorage::with_url("redis://localhost:6379".to_string())?;
+	/// ```
+	pub fn with_url(redis_url: String) -> Result<Self, StorageError> {
+		Self::new(
+			redis_url,
+			DEFAULT_CONNECTION_TIMEOUT_MS,
+			DEFAULT_KEY_PREFIX.to_string(),
+			TtlConfig::default(),
+		)
+	}
+
 	/// Creates a new RedisStorage instance with lazy connection initialization.
 	///
 	/// # Arguments
@@ -1018,8 +1054,6 @@ impl solver_types::ImplementationRegistry for Registry {
 		create_storage
 	}
 }
-
-impl crate::StorageRegistry for Registry {}
 
 #[cfg(test)]
 mod tests {
