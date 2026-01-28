@@ -18,6 +18,8 @@ pub mod discovery;
 pub mod events;
 /// Network and token configuration types.
 pub mod networks;
+/// Operator configuration types for runtime storage in Redis.
+pub mod operator_config;
 /// Oracle-related types for settlement validation and routing.
 pub mod oracle;
 /// Order processing types including intents, orders, and execution contexts.
@@ -30,8 +32,6 @@ pub mod registry;
 pub mod secret_string;
 /// Seed override types for initializing a new solver.
 pub mod seed_overrides;
-/// Operator configuration types for runtime storage in Redis.
-pub mod operator_config;
 /// Standard-specific types for different cross-chain protocols.
 pub mod standards;
 /// Storage types for managing persistent data.
@@ -57,6 +57,11 @@ pub use delivery::*;
 pub use discovery::*;
 pub use events::*;
 pub use networks::{NetworkConfig, NetworksConfig, TokenConfig};
+pub use operator_config::{
+	OperatorAdminConfig, OperatorConfig, OperatorGasConfig, OperatorGasFlowUnits,
+	OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig, OperatorPricingConfig,
+	OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSolverConfig, OperatorToken,
+};
 pub use order::*;
 pub use pricing::*;
 pub use provider::{
@@ -66,11 +71,6 @@ pub use provider::{
 pub use registry::ImplementationRegistry;
 pub use secret_string::SecretString;
 pub use seed_overrides::{NetworkOverride, SeedOverrides, Token};
-pub use operator_config::{
-	OperatorAdminConfig, OperatorConfig, OperatorGasConfig, OperatorGasFlowUnits,
-	OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig, OperatorPricingConfig,
-	OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSolverConfig, OperatorToken,
-};
 pub use standards::{
 	eip7683::{Eip7683OrderData, MandateOutput as Eip7683Output},
 	eip7930::{InteropAddress, InteropAddressError},

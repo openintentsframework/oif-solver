@@ -394,9 +394,7 @@ mod string_or_number {
 		}
 
 		match StringOrNumber::deserialize(deserializer)? {
-			StringOrNumber::String(s) => {
-				s.parse::<u64>().map_err(serde::de::Error::custom)
-			},
+			StringOrNumber::String(s) => s.parse::<u64>().map_err(serde::de::Error::custom),
 			StringOrNumber::Number(n) => Ok(n),
 		}
 	}
@@ -597,8 +595,7 @@ mod tests {
 			}
 		}"#;
 
-		let request: SignedAdminRequest<AddTokenContents> =
-			serde_json::from_str(json).unwrap();
+		let request: SignedAdminRequest<AddTokenContents> = serde_json::from_str(json).unwrap();
 		assert_eq!(request.contents.chain_id, 84532);
 		assert_eq!(request.contents.symbol, "USDT");
 		assert_eq!(request.contents.nonce, 1737925846892);

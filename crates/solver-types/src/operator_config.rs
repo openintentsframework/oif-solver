@@ -117,15 +117,15 @@ pub struct OperatorRpcEndpoint {
 impl OperatorRpcEndpoint {
 	/// Create an HTTP-only endpoint.
 	pub fn http_only(url: String) -> Self {
-		Self { http: url, ws: None }
+		Self {
+			http: url,
+			ws: None,
+		}
 	}
 
 	/// Create an endpoint with both HTTP and WebSocket URLs.
 	pub fn with_ws(http: String, ws: String) -> Self {
-		Self {
-			http,
-			ws: Some(ws),
-		}
+		Self { http, ws: Some(ws) }
 	}
 }
 
@@ -336,7 +336,6 @@ impl Default for OperatorAdminConfig {
 	}
 }
 
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -427,9 +426,8 @@ mod tests {
 		assert!(network.get_token_by_symbol("DAI").is_none());
 
 		assert!(network.has_token(&test_token_address()));
-		assert!(!network.has_token(
-			&Address::from_str("0x1111111111111111111111111111111111111111").unwrap()
-		));
+		assert!(!network
+			.has_token(&Address::from_str("0x1111111111111111111111111111111111111111").unwrap()));
 
 		assert_eq!(network.get_http_url(), Some("https://rpc.example.com"));
 		assert_eq!(network.get_ws_url(), None);

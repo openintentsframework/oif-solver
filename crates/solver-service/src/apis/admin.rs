@@ -140,7 +140,7 @@ pub async fn handle_add_token(
 		.map_err(|e| match e {
 			ConfigStoreError::VersionMismatch { .. } => {
 				AdminAuthError::Internal("Config was modified, please retry".to_string())
-			}
+			},
 			other => config_store_error(other),
 		})?;
 
@@ -171,25 +171,23 @@ fn config_store_error(err: ConfigStoreError) -> AdminAuthError {
 	match err {
 		ConfigStoreError::NotFound(msg) => {
 			AdminAuthError::Internal(format!("Configuration not found: {}", msg))
-		}
-		ConfigStoreError::VersionMismatch { expected, found } => AdminAuthError::Internal(
-			format!(
-				"Configuration was modified concurrently (expected version {}, found {}), please retry",
-				expected, found
-			),
-		),
+		},
+		ConfigStoreError::VersionMismatch { expected, found } => AdminAuthError::Internal(format!(
+			"Configuration was modified concurrently (expected version {}, found {}), please retry",
+			expected, found
+		)),
 		ConfigStoreError::Serialization(msg) => {
 			AdminAuthError::Internal(format!("Serialization error: {}", msg))
-		}
+		},
 		ConfigStoreError::Backend(msg) => {
 			AdminAuthError::Internal(format!("Storage error: {}", msg))
-		}
+		},
 		ConfigStoreError::Configuration(msg) => {
 			AdminAuthError::Internal(format!("Configuration error: {}", msg))
-		}
+		},
 		ConfigStoreError::AlreadyExists(msg) => {
 			AdminAuthError::Internal(format!("Configuration already exists: {}", msg))
-		}
+		},
 	}
 }
 

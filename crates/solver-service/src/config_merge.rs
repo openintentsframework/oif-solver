@@ -311,7 +311,10 @@ fn build_operator_network_config(
 }
 
 /// Builds the Hyperlane configuration for OperatorConfig.
-fn build_operator_hyperlane_config(chain_ids: &[u64], seed: &SeedConfig) -> OperatorHyperlaneConfig {
+fn build_operator_hyperlane_config(
+	chain_ids: &[u64],
+	seed: &SeedConfig,
+) -> OperatorHyperlaneConfig {
 	// Build mailboxes map
 	let mut mailboxes = HashMap::new();
 	for chain_id in chain_ids {
@@ -341,7 +344,11 @@ fn build_operator_hyperlane_config(chain_ids: &[u64], seed: &SeedConfig) -> Oper
 	// Build routes - each chain can send to all other chains
 	let mut routes = HashMap::new();
 	for chain_id in chain_ids {
-		let other_chains: Vec<u64> = chain_ids.iter().filter(|c| *c != chain_id).copied().collect();
+		let other_chains: Vec<u64> = chain_ids
+			.iter()
+			.filter(|c| *c != chain_id)
+			.copied()
+			.collect();
 		routes.insert(*chain_id, other_chains);
 	}
 
@@ -567,7 +574,8 @@ fn build_order_config_from_operator() -> OrderConfig {
 
 	// Strategy implementations
 	let mut strategy_implementations = HashMap::new();
-	let simple_strategy_config = toml_table(vec![("max_gas_price_gwei", toml::Value::Integer(100))]);
+	let simple_strategy_config =
+		toml_table(vec![("max_gas_price_gwei", toml::Value::Integer(100))]);
 	strategy_implementations.insert("simple".to_string(), simple_strategy_config);
 
 	OrderConfig {
@@ -1240,12 +1248,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 			.tokens
 			.iter()
 			.map(|t| {
-				let addr_bytes: [u8; 20] = t
-					.address
-					.0
-					.as_slice()
-					.try_into()
-					.unwrap_or([0u8; 20]);
+				let addr_bytes: [u8; 20] = t.address.0.as_slice().try_into().unwrap_or([0u8; 20]);
 				OperatorToken {
 					symbol: t.symbol.clone(),
 					address: Address::from(addr_bytes),
@@ -1257,10 +1260,12 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		let rpc_urls = network_config
 			.rpc_urls
 			.iter()
-			.filter_map(|r| r.http.as_ref().map(|http| OperatorRpcEndpoint {
-				http: http.clone(),
-				ws: r.ws.clone(),
-			}))
+			.filter_map(|r| {
+				r.http.as_ref().map(|http| OperatorRpcEndpoint {
+					http: http.clone(),
+					ws: r.ws.clone(),
+				})
+			})
 			.collect();
 
 		let input_settler_bytes: [u8; 20] = network_config
@@ -1283,20 +1288,14 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 				let bytes: [u8; 20] = a.0.as_slice().try_into().ok()?;
 				Some(Address::from(bytes))
 			});
-		let the_compact_address = network_config
-			.the_compact_address
-			.as_ref()
-			.and_then(|a| {
-				let bytes: [u8; 20] = a.0.as_slice().try_into().ok()?;
-				Some(Address::from(bytes))
-			});
-		let allocator_address = network_config
-			.allocator_address
-			.as_ref()
-			.and_then(|a| {
-				let bytes: [u8; 20] = a.0.as_slice().try_into().ok()?;
-				Some(Address::from(bytes))
-			});
+		let the_compact_address = network_config.the_compact_address.as_ref().and_then(|a| {
+			let bytes: [u8; 20] = a.0.as_slice().try_into().ok()?;
+			Some(Address::from(bytes))
+		});
+		let allocator_address = network_config.allocator_address.as_ref().and_then(|a| {
+			let bytes: [u8; 20] = a.0.as_slice().try_into().ok()?;
+			Some(Address::from(bytes))
+		});
 
 		let op_network = OperatorNetworkConfig {
 			chain_id: *chain_id,
@@ -1381,7 +1380,9 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		.map(|a| OperatorAdminConfig {
 			enabled: a.enabled,
 			domain: a.domain.clone(),
-			chain_id: a.chain_id.unwrap_or(chain_ids.first().copied().unwrap_or(1)),
+			chain_id: a
+				.chain_id
+				.unwrap_or(chain_ids.first().copied().unwrap_or(1)),
 			nonce_ttl_seconds: a.nonce_ttl_seconds,
 			admin_addresses: a.admin_addresses.clone(),
 		})
@@ -1416,12 +1417,10 @@ fn extract_hyperlane_config(
 	// Helper to parse address from hex string
 	let parse_addr = |s: &str| -> Option<Address> {
 		let s = s.strip_prefix("0x").unwrap_or(s);
-		hex::decode(s)
-			.ok()
-			.and_then(|bytes| {
-				let arr: [u8; 20] = bytes.as_slice().try_into().ok()?;
-				Some(Address::from(arr))
-			})
+		hex::decode(s).ok().and_then(|bytes| {
+			let arr: [u8; 20] = bytes.as_slice().try_into().ok()?;
+			Some(Address::from(arr))
+		})
 	};
 
 	let default_gas_limit = hyperlane_toml
@@ -1441,9 +1440,13 @@ fn extract_hyperlane_config(
 
 	// Extract mailboxes
 	let mut mailboxes = HashMap::new();
-	if let Some(toml_mailboxes) = hyperlane_toml.and_then(|h| h.get("mailboxes")).and_then(|v| v.as_table()) {
+	if let Some(toml_mailboxes) = hyperlane_toml
+		.and_then(|h| h.get("mailboxes"))
+		.and_then(|v| v.as_table())
+	{
 		for (chain_id_str, addr_val) in toml_mailboxes {
-			if let (Ok(chain_id), Some(addr_str)) = (chain_id_str.parse::<u64>(), addr_val.as_str()) {
+			if let (Ok(chain_id), Some(addr_str)) = (chain_id_str.parse::<u64>(), addr_val.as_str())
+			{
 				if let Some(addr) = parse_addr(addr_str) {
 					mailboxes.insert(chain_id, addr);
 				}
@@ -1453,9 +1456,13 @@ fn extract_hyperlane_config(
 
 	// Extract IGP addresses
 	let mut igp_addresses = HashMap::new();
-	if let Some(toml_igp) = hyperlane_toml.and_then(|h| h.get("igp_addresses")).and_then(|v| v.as_table()) {
+	if let Some(toml_igp) = hyperlane_toml
+		.and_then(|h| h.get("igp_addresses"))
+		.and_then(|v| v.as_table())
+	{
 		for (chain_id_str, addr_val) in toml_igp {
-			if let (Ok(chain_id), Some(addr_str)) = (chain_id_str.parse::<u64>(), addr_val.as_str()) {
+			if let (Ok(chain_id), Some(addr_str)) = (chain_id_str.parse::<u64>(), addr_val.as_str())
+			{
 				if let Some(addr) = parse_addr(addr_str) {
 					igp_addresses.insert(chain_id, addr);
 				}
@@ -1466,10 +1473,15 @@ fn extract_hyperlane_config(
 	// Extract oracles
 	let mut input_oracles = HashMap::new();
 	let mut output_oracles = HashMap::new();
-	if let Some(toml_oracles) = hyperlane_toml.and_then(|h| h.get("oracles")).and_then(|v| v.as_table()) {
+	if let Some(toml_oracles) = hyperlane_toml
+		.and_then(|h| h.get("oracles"))
+		.and_then(|v| v.as_table())
+	{
 		if let Some(input_table) = toml_oracles.get("input").and_then(|v| v.as_table()) {
 			for (chain_id_str, addrs_val) in input_table {
-				if let (Ok(chain_id), Some(addrs_array)) = (chain_id_str.parse::<u64>(), addrs_val.as_array()) {
+				if let (Ok(chain_id), Some(addrs_array)) =
+					(chain_id_str.parse::<u64>(), addrs_val.as_array())
+				{
 					let addrs: Vec<Address> = addrs_array
 						.iter()
 						.filter_map(|v| v.as_str().and_then(parse_addr))
@@ -1482,7 +1494,9 @@ fn extract_hyperlane_config(
 		}
 		if let Some(output_table) = toml_oracles.get("output").and_then(|v| v.as_table()) {
 			for (chain_id_str, addrs_val) in output_table {
-				if let (Ok(chain_id), Some(addrs_array)) = (chain_id_str.parse::<u64>(), addrs_val.as_array()) {
+				if let (Ok(chain_id), Some(addrs_array)) =
+					(chain_id_str.parse::<u64>(), addrs_val.as_array())
+				{
 					let addrs: Vec<Address> = addrs_array
 						.iter()
 						.filter_map(|v| v.as_str().and_then(parse_addr))
@@ -1497,9 +1511,14 @@ fn extract_hyperlane_config(
 
 	// Extract routes
 	let mut routes = HashMap::new();
-	if let Some(toml_routes) = hyperlane_toml.and_then(|h| h.get("routes")).and_then(|v| v.as_table()) {
+	if let Some(toml_routes) = hyperlane_toml
+		.and_then(|h| h.get("routes"))
+		.and_then(|v| v.as_table())
+	{
 		for (chain_id_str, dests_val) in toml_routes {
-			if let (Ok(chain_id), Some(dests_array)) = (chain_id_str.parse::<u64>(), dests_val.as_array()) {
+			if let (Ok(chain_id), Some(dests_array)) =
+				(chain_id_str.parse::<u64>(), dests_val.as_array())
+			{
 				let dests: Vec<u64> = dests_array
 					.iter()
 					.filter_map(|v| v.as_integer().map(|i| i as u64))
@@ -1512,7 +1531,11 @@ fn extract_hyperlane_config(
 	// If routes is empty, build default routes (each chain to all others)
 	if routes.is_empty() {
 		for chain_id in chain_ids {
-			let other_chains: Vec<u64> = chain_ids.iter().filter(|c| *c != chain_id).copied().collect();
+			let other_chains: Vec<u64> = chain_ids
+				.iter()
+				.filter(|c| *c != chain_id)
+				.copied()
+				.collect();
 			routes.insert(*chain_id, other_chains);
 		}
 	}

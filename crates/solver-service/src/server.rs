@@ -140,26 +140,27 @@ pub async fn start_server(
 							std::io::ErrorKind::InvalidData,
 							format!("Config conversion error: {}", e),
 						)));
-					}
+					},
 				};
 
 				// Create ConfigStore for OperatorConfig
-				let config_store: Arc<dyn solver_storage::config_store::ConfigStore<OperatorConfig>> =
-					match create_config_store::<OperatorConfig>(
-						StoreConfig::Redis {
-							url: redis_url.clone(),
-						},
-						format!("{}-operator", solver_id),
-					) {
-						Ok(store) => Arc::from(store),
-						Err(e) => {
-							tracing::error!("Failed to create operator config store: {}", e);
-							return Err(Box::new(std::io::Error::new(
-								std::io::ErrorKind::Other,
-								format!("Config store error: {}", e),
-							)));
-						}
-					};
+				let config_store: Arc<
+					dyn solver_storage::config_store::ConfigStore<OperatorConfig>,
+				> = match create_config_store::<OperatorConfig>(
+					StoreConfig::Redis {
+						url: redis_url.clone(),
+					},
+					format!("{}-operator", solver_id),
+				) {
+					Ok(store) => Arc::from(store),
+					Err(e) => {
+						tracing::error!("Failed to create operator config store: {}", e);
+						return Err(Box::new(std::io::Error::new(
+							std::io::ErrorKind::Other,
+							format!("Config store error: {}", e),
+						)));
+					},
+				};
 
 				// Seed OperatorConfig if it doesn't exist
 				match config_store.exists().await {
@@ -172,17 +173,17 @@ pub async fn start_server(
 							)));
 						}
 						tracing::info!("Seeded operator config for admin API persistence");
-					}
+					},
 					Ok(true) => {
 						tracing::info!("Operator config already exists, using existing");
-					}
+					},
 					Err(e) => {
 						tracing::error!("Failed to check operator config existence: {}", e);
 						return Err(Box::new(std::io::Error::new(
 							std::io::ErrorKind::Other,
 							format!("Config check error: {}", e),
 						)));
-					}
+					},
 				}
 
 				// Create nonce store
@@ -209,11 +210,11 @@ pub async fn start_server(
 							}),
 							Some(shared_config),
 						)
-					}
+					},
 					Err(e) => {
 						tracing::error!("Failed to initialize admin nonce store: {}", e);
 						(None, None)
-					}
+					},
 				}
 			} else {
 				(None, None)
@@ -377,8 +378,11 @@ async fn handle_get_tokens_for_chain(
 	State(state): State<AppState>,
 ) -> Result<Json<crate::apis::tokens::NetworkTokens>, StatusCode> {
 	// Use shared config to support hot reload from admin API
-	crate::apis::tokens::get_tokens_for_chain_from_config(Path(chain_id), State(state.config.clone()))
-		.await
+	crate::apis::tokens::get_tokens_for_chain_from_config(
+		Path(chain_id),
+		State(state.config.clone()),
+	)
+	.await
 }
 
 /// Handles POST /api/v1/auth/register requests.
@@ -567,13 +571,8 @@ async fn validate_intent_request(
 
 	{
 		let config = state.config.read().await;
-		ensure_user_capacity_for_order(
-			state.solver.as_ref(),
-			&config,
-			lock_type,
-			&standard_order,
-		)
-		.await?;
+		ensure_user_capacity_for_order(state.solver.as_ref(), &config, lock_type, &standard_order)
+			.await?;
 	}
 
 	let order_bytes = alloy_primitives::Bytes::from(StandardOrder::abi_encode(&standard_order));
@@ -633,12 +632,7 @@ async fn validate_intent_request(
 		let config = state.config.read().await;
 		state
 			.signature_validation
-			.validate_signature(
-				standard,
-				intent,
-				&config.networks,
-				state.solver.delivery(),
-			)
+			.validate_signature(standard, intent, &config.networks, state.solver.delivery())
 			.await?;
 	}
 
