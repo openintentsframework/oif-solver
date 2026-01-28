@@ -80,6 +80,119 @@ sequenceDiagram
     Delivery->>Core: Claim Confirmed (Status: Finalized)
 ```
 
+### Quote & Order Submission Flows
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Solver
+    participant PricingAPI as Pricing API
+    participant OriginRPC as Origin Chain RPC
+    participant DestRPC as Dest Chain RPC
+    participant TokenRPC as Token Contract RPC
+    participant TheCompact as TheCompact Contract
+    participant Settler as Input Settler Contract
+    participant Discovery as Discovery Service
+
+    %% ==================== QUOTE REQUEST ====================
+    Note over Client,Solver: QUOTE REQUEST
+    Client->>Solver: POST /api/v1/quotes
+    Note over Solver: Validate request, extract chain IDs
+
+    Note over Solver,DestRPC: Chain Data & Cost Context Calculation (parallel)
+    par Origin Chain Data
+        Solver->>OriginRPC: eth_gasPrice
+        Solver->>OriginRPC: eth_blockNumber
+        OriginRPC-->>Solver: gas price + block
+    and Dest Chain Data
+        Solver->>DestRPC: eth_gasPrice
+        Solver->>DestRPC: eth_blockNumber
+        DestRPC-->>Solver: gas price + block
+    and Token Pricing (HTTP)
+        Solver->>PricingAPI: GET CoinGecko /simple/price?...&vs_currencies=usd<br/>OR DefiLlama /prices/current/{coins}
+        PricingAPI-->>Solver: price data (USD)
+    end
+    Note over Solver: Calculate cost context (gas costs, swap amounts, profit margins)
+
+    Note over Solver,DestRPC: Solver Balance Check
+    Solver->>DestRPC: eth_call ERC20 balanceOf(solver_address)
+    Note right of DestRPC: selector 0x70a08231
+    DestRPC-->>Solver: uint256 balance
+
+    Note over Solver: Custody Strategy Decision & Quote Generation
+    alt EIP-3009 Capability & Quote Generation
+        Solver->>OriginRPC: eth_call RECEIVE_WITH_AUTHORIZATION_TYPEHASH()
+        Note right of OriginRPC: selector 0x7f2eecc3
+        OriginRPC-->>Solver: bytes32 typehash (if supported)
+        Note over Solver,TokenRPC: EIP-3009 Domain Separator
+        Solver->>TokenRPC: eth_call token DOMAIN_SEPARATOR()
+        Note right of TokenRPC: selector 0x3644e515
+        TokenRPC-->>Solver: bytes32 domainSeparator
+        Note over Solver,Settler: Order ID for Quote
+        Solver->>Settler: eth_call input settler orderIdentifier(order)
+        Settler-->>Solver: bytes32 orderId
+        Note over Solver: Generate EIP-3009 Quote + EIP-712 typed data
+    else ResourceLock Quote Generation
+        Note over Solver,Settler: Order ID for Quote
+        Solver->>Settler: eth_call input settler orderIdentifier(order)
+        Settler-->>Solver: bytes32 orderId
+        Note over Solver: Generate ResourceLock Quote + EIP-712 typed data
+    else Permit2 Quote Generation
+        Note over Solver,Settler: Order ID for Quote
+        Solver->>Settler: eth_call input settler orderIdentifier(order)
+        Settler-->>Solver: bytes32 orderId
+        Note over Solver: Generate Permit2 Quote + EIP-712 typed data
+    end
+
+    Solver-->>Client: Quote Response with multiple options
+
+    %% ==================== ORDER SUBMISSION ====================
+    Note over Client,Solver: ORDER SUBMISSION
+    Client->>Solver: POST /api/v1/orders {order, signature}
+    Note over Solver: Parse order, detect lock_type
+
+    alt ResourceLock Order
+        Note over Solver,TheCompact: Signature Validation (EIP-712)
+        Solver->>TheCompact: eth_call TheCompact DOMAIN_SEPARATOR()
+        Note right of TheCompact: selector 0x3644e515
+        TheCompact-->>Solver: bytes32 domainSeparator
+        Note over Solver: EIP-712 hash + ecrecover
+        Note over Solver,TheCompact: Capacity Check (TheCompact deposit)
+        Solver->>TheCompact: eth_call TheCompact balanceOf(user, tokenId)
+        Note right of TheCompact: selector from ABI encoding
+        TheCompact-->>Solver: uint256 depositBalance
+        Note over Solver,Settler: Order ID Computation
+        Solver->>Settler: eth_call input settler orderIdentifier(order)
+        Settler-->>Solver: bytes32 orderId
+    else Permit2 Order
+        Note over Solver,OriginRPC: Capacity Check (Wallet)
+        Solver->>OriginRPC: eth_call ERC20 balanceOf(user)
+        Note right of OriginRPC: selector 0x70a08231
+        OriginRPC-->>Solver: uint256 walletBalance
+        Note over Solver,Settler: Order ID Computation
+        Solver->>Settler: eth_call input settler orderIdentifier(order)
+        Settler-->>Solver: bytes32 orderId
+    else EIP-3009 Order
+        Note over Solver,OriginRPC: Capacity Check (Wallet)
+        Solver->>OriginRPC: eth_call ERC20 balanceOf(user)
+        Note right of OriginRPC: selector 0x70a08231
+        OriginRPC-->>Solver: uint256 walletBalance
+        Note over Solver,Settler: Order ID Computation
+        Solver->>Settler: eth_call input settler orderIdentifier(order)
+        Settler-->>Solver: bytes32 orderId
+    end
+
+    Note over Solver,Discovery: Forward to Discovery Service
+    Solver->>Discovery: POST /intent {order, signature, quote_id?, origin_submission?}
+    alt Discovery Success
+        Discovery-->>Solver: PostOrderResponse {status: "received", order_id}
+        Solver-->>Client: 200 OK + PostOrderResponse
+    else Discovery Error
+        Discovery-->>Solver: PostOrderResponse {status: "error", message}
+        Solver-->>Client: 400/500 + PostOrderResponse
+    end
+```
+
 ### Transaction State Transitions
 
 The solver manages orders through distinct transaction states with the following progression:
