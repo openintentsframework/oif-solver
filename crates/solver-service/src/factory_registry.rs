@@ -210,8 +210,12 @@ pub async fn build_solver_from_config(
 	let builder = SolverBuilder::new(shared_config, config_snapshot.clone());
 
 	// Build factories for each component type using the macro
-	let storage_factories =
-		build_factories!(registry, config_snapshot.storage.implementations, storage, "storage");
+	let storage_factories = build_factories!(
+		registry,
+		config_snapshot.storage.implementations,
+		storage,
+		"storage"
+	);
 	let delivery_factories = build_factories!(
 		registry,
 		config_snapshot.delivery.implementations,
@@ -224,7 +228,12 @@ pub async fn build_solver_from_config(
 		discovery,
 		"discovery"
 	);
-	let order_factories = build_factories!(registry, config_snapshot.order.implementations, order, "order");
+	let order_factories = build_factories!(
+		registry,
+		config_snapshot.order.implementations,
+		order,
+		"order"
+	);
 	let pricing_factories = if let Some(pricing_config) = &config_snapshot.pricing {
 		build_factories!(registry, pricing_config.implementations, pricing, "pricing")
 	} else {
@@ -236,8 +245,12 @@ pub async fn build_solver_from_config(
 		settlement,
 		"settlement"
 	);
-	let account_factories =
-		build_factories!(registry, config_snapshot.account.implementations, account, "account");
+	let account_factories = build_factories!(
+		registry,
+		config_snapshot.account.implementations,
+		account,
+		"account"
+	);
 	let strategy_factories = build_factories!(
 		registry,
 		config_snapshot.order.strategy.implementations,

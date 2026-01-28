@@ -365,7 +365,9 @@ impl SolverBuilder {
 
 		let settlement = Arc::new(SettlementService::new(
 			settlement_impls,
-			self.config_snapshot.settlement.settlement_poll_interval_seconds,
+			self.config_snapshot
+				.settlement
+				.settlement_poll_interval_seconds,
 		));
 
 		// Create pricing service

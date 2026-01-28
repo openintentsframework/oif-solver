@@ -383,8 +383,8 @@ mod tests {
 		let solver_address = solver_types::parse_address(TEST_SOLVER).unwrap();
 
 		let shared_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
-	SolverEngine::new(
-		shared_config,
+		SolverEngine::new(
+			shared_config,
 			config,
 			storage,
 			account,
