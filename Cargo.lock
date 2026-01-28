@@ -4649,7 +4649,6 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
- "solver-config",
  "solver-types",
  "tempfile",
  "thiserror 2.0.17",

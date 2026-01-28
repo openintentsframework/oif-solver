@@ -93,16 +93,6 @@ pub async fn handle_add_token(
 		.verify(&request.contents, &request.signature)
 		.await?;
 
-	// TODO: Actually add the token to the configuration
-	// This would interact with the config store
-	tracing::info!(
-		admin = %admin,
-		chain_id = %request.contents.chain_id,
-		symbol = %request.contents.symbol,
-		token_address = %request.contents.token_address,
-		nonce = %request.contents.nonce,
-		"Admin added token"
-	);
 
 	Ok(Json(AdminActionResponse {
 		success: true,
