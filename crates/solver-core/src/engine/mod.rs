@@ -31,7 +31,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::instrument;
 
 /// Errors that can occur during engine operations.
@@ -52,8 +52,10 @@ pub enum EngineError {
 /// Main solver engine that orchestrates the order execution lifecycle.
 #[derive(Clone)]
 pub struct SolverEngine {
-	/// Solver configuration.
-	pub(crate) config: Config,
+	/// Shared solver configuration (supports hot reload).
+	pub(crate) shared_config: Arc<RwLock<Config>>,
+	/// Snapshot of config at startup (for internal services that don't support hot reload).
+	pub(crate) config_snapshot: Config,
 	/// Storage service for persisting state.
 	pub(crate) storage: Arc<StorageService>,
 	/// Account service for address and signing operations.
@@ -106,7 +108,8 @@ impl SolverEngine {
 	///
 	/// # Arguments
 	///
-	/// * `config` - Solver configuration settings
+	/// * `shared_config` - Shared solver configuration (supports hot reload)
+	/// * `config_snapshot` - Snapshot of config at startup (for services that don't support hot reload)
 	/// * `storage` - Storage service for persisting state
 	/// * `account` - Account service for address and signing operations
 	/// * `solver_address` - The solver's Ethereum address
@@ -119,7 +122,8 @@ impl SolverEngine {
 	/// * `token_manager` - Manager for token approvals and validation
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
-		config: Config,
+		shared_config: Arc<RwLock<Config>>,
+		config_snapshot: Config,
 		storage: Arc<StorageService>,
 		account: Arc<AccountService>,
 		solver_address: Address,
@@ -150,7 +154,7 @@ impl SolverEngine {
 			solver_address,
 			token_manager.clone(),
 			cost_profit_service,
-			config.clone(),
+			config_snapshot.clone(),
 		));
 
 		let order_handler = Arc::new(OrderHandler::new(
@@ -175,11 +179,12 @@ impl SolverEngine {
 			storage.clone(),
 			state_machine.clone(),
 			event_bus.clone(),
-			config.solver.monitoring_timeout_seconds / 60, // Convert seconds to minutes
+			config_snapshot.solver.monitoring_timeout_seconds / 60, // Convert seconds to minutes
 		));
 
 		Self {
-			config,
+			shared_config,
+			config_snapshot,
 			storage,
 			account,
 			delivery,
@@ -289,7 +294,7 @@ impl SolverEngine {
 
 		// Start storage cleanup task
 		let storage = self.storage.clone();
-		let cleanup_interval_seconds = self.config.storage.cleanup_interval_seconds;
+		let cleanup_interval_seconds = self.config_snapshot.storage.cleanup_interval_seconds;
 		let cleanup_interval = tokio::time::interval(Duration::from_secs(cleanup_interval_seconds));
 		tracing::info!(
 			"Starting storage cleanup service, will run every {} seconds",
@@ -542,12 +547,20 @@ impl SolverEngine {
 		&self.event_bus
 	}
 
-	/// Returns a reference to the solver configuration.
+	/// Returns a reference to the config snapshot (taken at startup).
 	///
-	/// Provides access to all configuration settings including network
-	/// parameters, timeouts, and service-specific settings.
+	/// Note: This returns the snapshot, not the hot-reloadable config.
+	/// For hot-reloaded config values, use `shared_config()`.
 	pub fn config(&self) -> &Config {
-		&self.config
+		&self.config_snapshot
+	}
+
+	/// Returns the shared config for hot reload support.
+	///
+	/// Use this when you need access to config values that may have been
+	/// updated via the admin API.
+	pub fn shared_config(&self) -> &Arc<RwLock<Config>> {
+		&self.shared_config
 	}
 
 	/// Returns a reference to the storage service.
@@ -642,6 +655,7 @@ mod tests {
 	// Helper function to create mock services for testing
 	#[allow(clippy::type_complexity)]
 	fn create_mock_services() -> (
+		Arc<RwLock<Config>>,
 		Config,
 		Arc<StorageService>,
 		Arc<AccountService>,
@@ -772,7 +786,10 @@ mod tests {
 			account.clone(),
 		));
 
+		let shared_config = Arc::new(RwLock::new(config.clone()));
+
 		(
+			shared_config,
 			config,
 			storage,
 			account,
@@ -790,6 +807,7 @@ mod tests {
 	#[test]
 	fn test_solver_engine_new() {
 		let (
+			shared_config,
 			config,
 			storage,
 			account,
@@ -804,6 +822,7 @@ mod tests {
 		) = create_mock_services();
 
 		let engine = SolverEngine::new(
+			shared_config,
 			config.clone(),
 			storage.clone(),
 			account.clone(),
@@ -834,6 +853,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_initialize_with_recovery_success() {
 		let (
+			shared_config,
 			config,
 			storage,
 			account,
@@ -848,6 +868,7 @@ mod tests {
 		) = create_mock_services();
 
 		let engine = SolverEngine::new(
+			shared_config,
 			config,
 			storage,
 			account,
@@ -871,6 +892,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_initialize_with_recovery_handles_errors_gracefully() {
 		let (
+			shared_config,
 			config,
 			storage,
 			account,
@@ -885,6 +907,7 @@ mod tests {
 		) = create_mock_services();
 
 		let engine = SolverEngine::new(
+			shared_config,
 			config,
 			storage,
 			account,
@@ -907,6 +930,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_spawn_handler_with_handler_error() {
 		let (
+			shared_config,
 			config,
 			storage,
 			account,
@@ -921,6 +945,7 @@ mod tests {
 		) = create_mock_services();
 
 		let engine = SolverEngine::new(
+			shared_config,
 			config,
 			storage,
 			account,

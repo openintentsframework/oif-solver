@@ -4,8 +4,10 @@
 //! for the OIF Solver API.
 
 use crate::{
+	apis::admin::{handle_add_token, handle_get_nonce, handle_get_types, AdminApiState},
 	apis::order::get_order_by_id,
-	auth::{auth_middleware, AuthState, JwtService},
+	auth::{admin::AdminActionVerifier, auth_middleware, AuthState, JwtService},
+	config_merge::config_to_operator_config,
 	validators::order::ensure_user_capacity_for_order,
 	validators::signature::SignatureValidationService,
 };
@@ -21,13 +23,17 @@ use axum::{
 use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
+use solver_storage::{
+	config_store::create_config_store, nonce_store::create_nonce_store, StoreConfig,
+};
 use solver_types::{
 	api::PostOrderRequest, standards::eip7683::interfaces::StandardOrder, APIError, Address,
-	ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse, Order, OrderIdCallback,
-	Transaction,
+	ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse, OperatorConfig, Order,
+	OrderIdCallback, Transaction,
 };
 use std::{convert::TryInto, sync::Arc};
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tower_http::normalize_path::NormalizePath;
@@ -37,8 +43,9 @@ use tower_http::normalize_path::NormalizePath;
 pub struct AppState {
 	/// Reference to the solver engine for processing requests.
 	pub solver: Arc<SolverEngine>,
-	/// Complete configuration.
-	pub config: Config,
+	/// Shared runtime config that gets hot-reloaded by admin API.
+	/// Always use this for reading current config (tokens, networks, etc.).
+	pub config: Arc<RwLock<Config>>,
 	/// HTTP client for forwarding requests.
 	pub http_client: reqwest::Client,
 	/// Discovery service URL for forwarding orders (if configured).
@@ -109,9 +116,128 @@ pub async fn start_server(
 	// Initialize signature validation service
 	let signature_validation = Arc::new(SignatureValidationService::new());
 
+	// Initialize admin API if enabled in config (before AppState consumes config)
+	let (admin_state, shared_config) = if let Some(auth_config) = &api_config.auth {
+		if let Some(admin_config) = &auth_config.admin {
+			if admin_config.enabled {
+				let redis_url = std::env::var("REDIS_URL")
+					.unwrap_or_else(|_| "redis://localhost:6379".to_string());
+				let solver_id = config.solver.id.clone();
+				// Use explicit chain_id from admin config, or fall back to first network
+				let chain_id = admin_config
+					.chain_id
+					.unwrap_or_else(|| config.networks.keys().next().copied().unwrap_or(1));
+
+				// Create shared config for hot reload
+				let shared_config = Arc::new(RwLock::new(config.clone()));
+
+				// Convert Config to OperatorConfig for persistence
+				let operator_config = match config_to_operator_config(&config) {
+					Ok(oc) => oc,
+					Err(e) => {
+						tracing::error!("Failed to convert config to OperatorConfig: {}", e);
+						return Err(Box::new(std::io::Error::new(
+							std::io::ErrorKind::InvalidData,
+							format!("Config conversion error: {}", e),
+						)));
+					},
+				};
+
+				// Create ConfigStore for OperatorConfig
+				let config_store: Arc<
+					dyn solver_storage::config_store::ConfigStore<OperatorConfig>,
+				> = match create_config_store::<OperatorConfig>(
+					StoreConfig::Redis {
+						url: redis_url.clone(),
+					},
+					format!("{}-operator", solver_id),
+				) {
+					Ok(store) => Arc::from(store),
+					Err(e) => {
+						tracing::error!("Failed to create operator config store: {}", e);
+						return Err(Box::new(std::io::Error::new(
+							std::io::ErrorKind::Other,
+							format!("Config store error: {}", e),
+						)));
+					},
+				};
+
+				// Seed OperatorConfig if it doesn't exist
+				match config_store.exists().await {
+					Ok(false) => {
+						if let Err(e) = config_store.seed(operator_config).await {
+							tracing::error!("Failed to seed operator config: {}", e);
+							return Err(Box::new(std::io::Error::new(
+								std::io::ErrorKind::Other,
+								format!("Config seed error: {}", e),
+							)));
+						}
+						tracing::info!("Seeded operator config for admin API persistence");
+					},
+					Ok(true) => {
+						tracing::info!("Operator config already exists, using existing");
+					},
+					Err(e) => {
+						tracing::error!("Failed to check operator config existence: {}", e);
+						return Err(Box::new(std::io::Error::new(
+							std::io::ErrorKind::Other,
+							format!("Config check error: {}", e),
+						)));
+					},
+				}
+
+				// Create nonce store (concrete NonceStore type, not a trait)
+				match create_nonce_store(
+					StoreConfig::Redis { url: redis_url },
+					&solver_id,
+					admin_config.nonce_ttl_seconds,
+				) {
+					Ok(nonce_store) => {
+						// Keep nonce_store as Arc for sharing with verifier and AdminApiState
+						let nonce_store: Arc<solver_storage::nonce_store::NonceStore> =
+							Arc::new(nonce_store);
+						let verifier = AdminActionVerifier::new(
+							nonce_store.clone(),
+							admin_config.clone(),
+							chain_id,
+						);
+						tracing::info!(
+							"Admin API enabled for {} admin(s) with config persistence",
+							admin_config.admin_count()
+						);
+						(
+							Some(AdminApiState {
+								// Wrap verifier in RwLock for hot reload of admin list
+								verifier: Arc::new(RwLock::new(verifier)),
+								config_store,
+								shared_config: shared_config.clone(),
+								// Store nonce_store for rebuilding verifier later
+								nonce_store,
+							}),
+							Some(shared_config),
+						)
+					},
+					Err(e) => {
+						tracing::error!("Failed to initialize admin nonce store: {}", e);
+						(None, None)
+					},
+				}
+			} else {
+				(None, None)
+			}
+		} else {
+			(None, None)
+		}
+	} else {
+		(None, None)
+	};
+
+	// Create shared config for AppState - use admin's shared_config if available, otherwise create new
+	let shared_config = shared_config.unwrap_or_else(|| Arc::new(RwLock::new(config)));
+
 	let app_state = AppState {
 		solver,
-		config,
+		config: shared_config,
 		http_client,
 		discovery_url,
 		jwt_service: jwt_service.clone(),
@@ -130,6 +256,17 @@ pub async fn start_server(
 		.route("/refresh", post(handle_auth_refresh));
 
 	api_routes = api_routes.nest("/auth", auth_routes);
+
+	// Add admin routes if enabled
+	if let Some(admin_state) = admin_state {
+		let admin_routes = Router::new()
+			.route("/nonce", get(handle_get_nonce))
+			.route("/types", get(handle_get_types))
+			.route("/tokens", post(handle_add_token))
+			.with_state(admin_state);
+		api_routes = api_routes.nest("/admin", admin_routes);
+		tracing::info!("Admin routes registered at /api/v1/admin/*");
+	}
 
 	// Create order routes with optional auth
 	let mut order_routes = Router::new()
@@ -193,7 +330,8 @@ async fn handle_quote(
 	State(state): State<AppState>,
 	Json(request): Json<GetQuoteRequest>,
 ) -> Result<Json<GetQuoteResponse>, APIError> {
-	match crate::apis::quote::process_quote_request(request, &state.solver, &state.config).await {
+	let config = state.config.read().await;
+	match crate::apis::quote::process_quote_request(request, &state.solver, &config).await {
 		Ok(response) => Ok(Json(response)),
 		Err(e) => {
 			tracing::warn!("Quote request failed: {}", e);
@@ -234,7 +372,8 @@ async fn handle_get_order_by_id(
 async fn handle_get_tokens(
 	State(state): State<AppState>,
 ) -> Json<crate::apis::tokens::TokensResponse> {
-	crate::apis::tokens::get_tokens(State(state.solver)).await
+	// Use shared config to support hot reload from admin API
+	crate::apis::tokens::get_tokens_from_config(State(state.config)).await
 }
 
 /// Handles GET /api/v1/tokens/{chain_id} requests.
@@ -244,7 +383,12 @@ async fn handle_get_tokens_for_chain(
 	Path(chain_id): Path<u64>,
 	State(state): State<AppState>,
 ) -> Result<Json<crate::apis::tokens::NetworkTokens>, StatusCode> {
-	crate::apis::tokens::get_tokens_for_chain(Path(chain_id), State(state.solver)).await
+	// Use shared config to support hot reload from admin API
+	crate::apis::tokens::get_tokens_for_chain_from_config(
+		Path(chain_id),
+		State(state.config.clone()),
+	)
+	.await
 }
 
 /// Handles POST /api/v1/auth/register requests.
@@ -431,13 +575,11 @@ async fn validate_intent_request(
 			details: None,
 		})?;
 
-	ensure_user_capacity_for_order(
-		state.solver.as_ref(),
-		&state.config,
-		lock_type,
-		&standard_order,
-	)
-	.await?;
+	{
+		let config = state.config.read().await;
+		ensure_user_capacity_for_order(state.solver.as_ref(), &config, lock_type, &standard_order)
+			.await?;
+	}
 
 	let order_bytes = alloy_primitives::Bytes::from(StandardOrder::abi_encode(&standard_order));
 
@@ -493,14 +635,10 @@ async fn validate_intent_request(
 		.requires_signature_validation(standard, &lock_type);
 
 	if requires_validation {
+		let config = state.config.read().await;
 		state
 			.signature_validation
-			.validate_signature(
-				standard,
-				intent,
-				&state.solver.config().networks,
-				state.solver.delivery(),
-			)
+			.validate_signature(standard, intent, &config.networks, state.solver.delivery())
 			.await?;
 	}
 
@@ -724,7 +862,9 @@ mod tests {
 			account.clone(),
 		));
 
+		let shared_config = Arc::new(RwLock::new(config.clone()));
 		let engine = SolverEngine::new(
+			shared_config,
 			config.clone(),
 			storage,
 			account,
@@ -744,6 +884,7 @@ mod tests {
 	fn build_test_app_state(discovery_url: Option<String>) -> AppState {
 		let solver = build_test_solver_engine();
 		let config = solver.config().clone();
+		let shared_config = Arc::new(RwLock::new(config));
 
 		let http_client = Client::builder()
 			.no_proxy()
@@ -752,7 +893,7 @@ mod tests {
 
 		AppState {
 			solver,
-			config,
+			config: shared_config,
 			http_client,
 			discovery_url,
 			jwt_service: None,

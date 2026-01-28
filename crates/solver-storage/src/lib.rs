@@ -8,8 +8,14 @@
 //!
 //! The [`config_store`] module provides specialized storage for solver configuration
 //! with optimistic locking support via versioning.
+//!
+//! # Nonce Storage
+//!
+//! The [`nonce_store`] module provides nonce management for admin authentication
+//! with Redis-backed storage and TTL support.
 
 pub mod config_store;
+pub mod nonce_store;
 
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -20,7 +26,6 @@ use thiserror::Error;
 
 /// Re-export implementations
 pub mod implementations {
-	pub mod config;
 	pub mod file;
 	pub mod memory;
 	pub mod redis;
@@ -96,6 +101,16 @@ pub enum StorageError {
 /// This trait must be implemented by any storage backend that wants to
 /// integrate with the solver system. It provides basic key-value operations
 /// with optional TTL support and querying capabilities.
+///
+/// # Atomic Operations
+///
+/// This trait includes atomic operations for concurrent access patterns:
+/// - [`set_nx`](StorageInterface::set_nx): Set if not exists (for initialization)
+/// - [`compare_and_swap`](StorageInterface::compare_and_swap): Atomic CAS on raw bytes
+/// - [`delete_if_exists`](StorageInterface::delete_if_exists): Atomic delete returning existence
+///
+/// These are low-level byte operations - higher-level logic (JSON parsing,
+/// versioning) should be handled by wrapper stores like `ConfigStore`.
 #[async_trait]
 #[cfg_attr(feature = "testing", mockall::automock)]
 pub trait StorageInterface: Send + Sync {
@@ -151,6 +166,75 @@ pub trait StorageInterface: Send + Sync {
 	async fn cleanup_expired(&self) -> Result<usize, StorageError> {
 		Ok(0) // Default implementation for backends without TTL support
 	}
+
+	// ==================== Atomic Operations ====================
+
+	/// Set a value only if the key does not exist.
+	///
+	/// Returns `Ok(true)` if set successfully, `Ok(false)` if key already exists.
+	///
+	/// # Atomicity
+	///
+	/// - **Redis**: Uses native `SETNX` / `SET NX EX` (truly atomic)
+	/// - **Memory**: Uses `RwLock` (atomic within process)
+	/// - **File**: Best-effort with file locking
+	///
+	/// # Arguments
+	///
+	/// * `key` - The key to set
+	/// * `value` - The value to store
+	/// * `ttl` - Optional time-to-live for the key
+	async fn set_nx(
+		&self,
+		key: &str,
+		value: Vec<u8>,
+		ttl: Option<Duration>,
+	) -> Result<bool, StorageError>;
+
+	/// Atomic compare-and-swap on raw bytes.
+	///
+	/// Only updates if the current value exactly equals `expected`.
+	///
+	/// # Returns
+	///
+	/// - `Ok(true)` if swapped successfully
+	/// - `Ok(false)` if current value doesn't match expected
+	/// - `Err(NotFound)` if key doesn't exist
+	///
+	/// # Arguments
+	///
+	/// * `key` - The key to update
+	/// * `expected` - The expected current value (exact byte comparison)
+	/// * `new_value` - The new value to set if comparison succeeds
+	/// * `ttl` - Optional TTL for the new value (preserves or sets TTL)
+	///
+	/// # Atomicity
+	///
+	/// - **Redis**: Uses Lua script for atomic operation
+	/// - **Memory**: Uses `RwLock` (atomic within process)
+	async fn compare_and_swap(
+		&self,
+		key: &str,
+		expected: &[u8],
+		new_value: Vec<u8>,
+		ttl: Option<Duration>,
+	) -> Result<bool, StorageError>;
+
+	/// Delete a key and return whether it existed.
+	///
+	/// Useful for single-use tokens like nonces where you need to
+	/// atomically check existence and delete in one operation.
+	///
+	/// # Returns
+	///
+	/// - `Ok(true)` if key existed and was deleted
+	/// - `Ok(false)` if key didn't exist
+	///
+	/// # Atomicity
+	///
+	/// - **Redis**: `DEL` returns count of deleted keys (atomic)
+	/// - **Memory**: Uses `RwLock` (atomic within process)
+	async fn delete_if_exists(&self, key: &str) -> Result<bool, StorageError>;
 }
 
 /// Type alias for storage factory functions.
@@ -158,12 +242,6 @@ pub trait StorageInterface: Send + Sync {
 /// This is the function signature that all storage implementations must provide
 /// to create instances of their storage interface.
 pub type StorageFactory = fn(&toml::Value) -> Result<Box<dyn StorageInterface>, StorageError>;
-
-/// Registry trait for storage implementations.
-///
-/// This trait extends the base ImplementationRegistry to specify that
-/// storage implementations must provide a StorageFactory.
-pub trait StorageRegistry: ImplementationRegistry<Factory = StorageFactory> {}
 
 /// Get all registered storage implementations.
 ///
@@ -178,6 +256,121 @@ pub fn get_all_implementations() -> Vec<(&'static str, StorageFactory)> {
 		(redis::Registry::NAME, redis::Registry::factory()),
 	]
 }
+
+// =============================================================================
+// Shared Store Configuration
+// =============================================================================
+
+/// Configuration for storage backends used by specialized stores.
+///
+/// This enum is shared by [`config_store::ConfigStore`] and [`nonce_store::NonceStore`]
+/// to avoid code duplication. All stores use the same backend options.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use solver_storage::{StoreConfig, create_storage_backend};
+///
+/// // For production (Redis)
+/// let storage = create_storage_backend(StoreConfig::Redis {
+///     url: "redis://localhost:6379".to_string(),
+/// })?;
+///
+/// // For testing (Memory)
+/// let storage = create_storage_backend(StoreConfig::Memory)?;
+/// ```
+#[derive(Clone)]
+pub enum StoreConfig {
+	/// Use an existing StorageInterface (for sharing storage with other components)
+	Storage(std::sync::Arc<dyn StorageInterface>),
+	/// Create a new Redis-backed storage
+	Redis {
+		/// Redis connection URL (e.g., "redis://localhost:6379")
+		url: String,
+	},
+	/// Create an in-memory storage (useful for testing)
+	Memory,
+}
+
+impl std::fmt::Debug for StoreConfig {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			StoreConfig::Storage(_) => f.debug_struct("Storage").finish_non_exhaustive(),
+			StoreConfig::Redis { url } => {
+				let redacted = redact_url_credentials(url);
+				f.debug_struct("Redis").field("url", &redacted).finish()
+			},
+			StoreConfig::Memory => f.debug_struct("Memory").finish(),
+		}
+	}
+}
+
+/// Creates a storage backend from the given configuration.
+///
+/// This factory function is used by [`config_store`] and [`nonce_store`]
+/// to create their underlying storage backends.
+///
+/// # Arguments
+///
+/// * `config` - Backend configuration (Redis, Memory, or existing StorageInterface)
+///
+/// # Returns
+///
+/// An `Arc<dyn StorageInterface>` ready for use.
+///
+/// # Errors
+///
+/// Returns `StorageError` if the backend cannot be created (e.g., invalid Redis URL).
+pub fn create_storage_backend(
+	config: StoreConfig,
+) -> Result<std::sync::Arc<dyn StorageInterface>, StorageError> {
+	match config {
+		StoreConfig::Storage(s) => Ok(s),
+		StoreConfig::Redis { url } => {
+			let storage = implementations::redis::RedisStorage::with_url(url)?;
+			Ok(std::sync::Arc::new(storage))
+		},
+		StoreConfig::Memory => {
+			let storage = implementations::memory::MemoryStorage::new();
+			Ok(std::sync::Arc::new(storage))
+		},
+	}
+}
+
+/// Redacts credentials (userinfo) from a URL to prevent leaking secrets in logs.
+///
+/// Transforms URLs like `redis://:password@host:port` to `redis://[REDACTED]@host:port`
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let url = "redis://:secret@localhost:6379";
+/// let redacted = redact_url_credentials(url);
+/// assert_eq!(redacted, "redis://[REDACTED]@localhost:6379");
+/// ```
+pub fn redact_url_credentials(url: &str) -> String {
+	// Find the scheme separator
+	let Some(scheme_end) = url.find("://") else {
+		return url.to_string();
+	};
+
+	let after_scheme = &url[scheme_end + 3..];
+
+	// Find the @ symbol which separates userinfo from host
+	let Some(at_pos) = after_scheme.find('@') else {
+		// No credentials in URL
+		return url.to_string();
+	};
+
+	// Reconstruct URL with redacted credentials
+	let scheme = &url[..scheme_end + 3];
+	let host_and_path = &after_scheme[at_pos + 1..];
+	format!("{}[REDACTED]@{}", scheme, host_and_path)
+}
+
+// =============================================================================
+// Storage Service
+// =============================================================================
 
 /// High-level storage service that provides typed operations.
 ///

@@ -2,7 +2,13 @@
 //!
 //! This module provides JWT-based authentication and authorization
 //! functionality for protecting API endpoints.
+//!
+//! # Admin Authentication
+//!
+//! The [`admin`] submodule provides wallet-based authentication for admin
+//! operations using Ethereum signatures.
 
+pub mod admin;
 pub mod middleware;
 
 use chrono::{Duration, Utc};
@@ -211,6 +217,7 @@ mod tests {
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,
 			issuer: "test-issuer".to_string(),
+			admin: None,
 		}
 	}
 

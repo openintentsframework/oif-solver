@@ -3,6 +3,7 @@
 //! This module contains the implementation of the HTTP API endpoints
 //! for the OIF Solver.
 
+pub mod admin;
 pub mod auth;
 pub mod order;
 pub mod quote;
