@@ -91,7 +91,8 @@ sequenceDiagram
     participant DestRPC as Dest Chain RPC
     participant TokenRPC as Token Contract RPC
     participant TheCompact as TheCompact Contract
-    participant Settler as Input Settler Contract
+    participant SettlerEscrow as InputSettlerEscrow
+    participant SettlerCompact as InputSettlerCompact
     participant Discovery as Discovery Service
 
     %% ==================== QUOTE REQUEST ====================
@@ -128,19 +129,19 @@ sequenceDiagram
         Solver->>TokenRPC: eth_call token DOMAIN_SEPARATOR()
         Note right of TokenRPC: selector 0x3644e515
         TokenRPC-->>Solver: bytes32 domainSeparator
-        Note over Solver,Settler: Order ID for Quote
-        Solver->>Settler: eth_call input settler orderIdentifier(order)
-        Settler-->>Solver: bytes32 orderId
+        Note over Solver,SettlerEscrow: Order ID for Quote (Escrow)
+        Solver->>SettlerEscrow: eth_call orderIdentifier(order)
+        SettlerEscrow-->>Solver: bytes32 orderId
         Note over Solver: Generate EIP-3009 Quote + EIP-712 typed data
     else ResourceLock Quote Generation
-        Note over Solver,Settler: Order ID for Quote
-        Solver->>Settler: eth_call input settler orderIdentifier(order)
-        Settler-->>Solver: bytes32 orderId
+        Note over Solver,SettlerCompact: Order ID for Quote (Compact)
+        Solver->>SettlerCompact: eth_call orderIdentifier(order)
+        SettlerCompact-->>Solver: bytes32 orderId
         Note over Solver: Generate ResourceLock Quote + EIP-712 typed data
     else Permit2 Quote Generation
-        Note over Solver,Settler: Order ID for Quote
-        Solver->>Settler: eth_call input settler orderIdentifier(order)
-        Settler-->>Solver: bytes32 orderId
+        Note over Solver,SettlerEscrow: Order ID for Quote (Escrow)
+        Solver->>SettlerEscrow: eth_call orderIdentifier(order)
+        SettlerEscrow-->>Solver: bytes32 orderId
         Note over Solver: Generate Permit2 Quote + EIP-712 typed data
     end
 
@@ -161,25 +162,31 @@ sequenceDiagram
         Solver->>TheCompact: eth_call TheCompact balanceOf(user, tokenId)
         Note right of TheCompact: selector from ABI encoding
         TheCompact-->>Solver: uint256 depositBalance
-        Note over Solver,Settler: Order ID Computation
-        Solver->>Settler: eth_call input settler orderIdentifier(order)
-        Settler-->>Solver: bytes32 orderId
+        Note over Solver,SettlerCompact: Order ID Computation (Compact)
+        Solver->>SettlerCompact: eth_call orderIdentifier(order)
+        SettlerCompact-->>Solver: bytes32 orderId
     else Permit2 Order
+        Note over Solver: Signature Recovery (EIP-712 ecrecover)
+        Note over Solver: Derive user address from signature
+        Note over Solver: Inject user into order payload
         Note over Solver,OriginRPC: Capacity Check (Wallet)
         Solver->>OriginRPC: eth_call ERC20 balanceOf(user)
         Note right of OriginRPC: selector 0x70a08231
         OriginRPC-->>Solver: uint256 walletBalance
-        Note over Solver,Settler: Order ID Computation
-        Solver->>Settler: eth_call input settler orderIdentifier(order)
-        Settler-->>Solver: bytes32 orderId
+        Note over Solver,SettlerEscrow: Order ID Computation (Escrow)
+        Solver->>SettlerEscrow: eth_call orderIdentifier(order)
+        SettlerEscrow-->>Solver: bytes32 orderId
     else EIP-3009 Order
+        Note over Solver: Signature Recovery (EIP-712 ecrecover)
+        Note over Solver: Derive user address from signature
+        Note over Solver: Inject user into order payload
         Note over Solver,OriginRPC: Capacity Check (Wallet)
         Solver->>OriginRPC: eth_call ERC20 balanceOf(user)
         Note right of OriginRPC: selector 0x70a08231
         OriginRPC-->>Solver: uint256 walletBalance
-        Note over Solver,Settler: Order ID Computation
-        Solver->>Settler: eth_call input settler orderIdentifier(order)
-        Settler-->>Solver: bytes32 orderId
+        Note over Solver,SettlerEscrow: Order ID Computation (Escrow)
+        Solver->>SettlerEscrow: eth_call orderIdentifier(order)
+        SettlerEscrow-->>Solver: bytes32 orderId
     end
 
     Note over Solver,Discovery: Forward to Discovery Service
