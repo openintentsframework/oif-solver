@@ -335,6 +335,8 @@ The following diagrams show the detailed RPC interactions for each API endpoint.
 
 #### Quote Request Flow
 
+**RPC calls:** 8 (EIP-3009) · 6 (ResourceLock) · 6 (Permit2)
+
 ```mermaid
 sequenceDiagram
     participant Client
@@ -399,6 +401,8 @@ sequenceDiagram
 ```
 
 #### Order Submission Flow
+
+**RPC calls:** 2 (EIP-3009) · 3 (ResourceLock) · 2 (Permit2)
 
 ```mermaid
 sequenceDiagram
