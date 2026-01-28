@@ -22,7 +22,7 @@ use axum::{
 use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
-use solver_storage::nonce_store::{create_nonce_store, NonceStoreConfig};
+use solver_storage::{nonce_store::create_nonce_store, StoreConfig};
 use solver_types::{
 	api::PostOrderRequest, standards::eip7683::interfaces::StandardOrder, APIError, Address,
 	ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse, Order, OrderIdCallback,
@@ -121,7 +121,7 @@ pub async fn start_server(
 				let chain_id = config.networks.keys().next().copied().unwrap_or(1);
 
 				match create_nonce_store(
-					NonceStoreConfig::Redis { url: redis_url },
+					StoreConfig::Redis { url: redis_url },
 					&solver_id,
 					admin_config.nonce_ttl_seconds,
 				) {

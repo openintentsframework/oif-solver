@@ -18,17 +18,17 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use solver_storage::config_store::{create_config_store, ConfigStoreConfig};
+//! use solver_storage::{config_store::create_config_store, StoreConfig};
 //!
 //! // For production (Redis)
 //! let store = create_config_store::<MyConfig>(
-//!     ConfigStoreConfig::Redis { url: "redis://localhost:6379".to_string() },
+//!     StoreConfig::Redis { url: "redis://localhost:6379".to_string() },
 //!     "my-solver".to_string(),
 //! )?;
 //!
 //! // For testing (Memory)
 //! let store = create_config_store::<MyConfig>(
-//!     ConfigStoreConfig::Memory,
+//!     StoreConfig::Memory,
 //!     "test-solver".to_string(),
 //! )?;
 //! ```
@@ -42,7 +42,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::debug;
 
-use crate::{implementations, StorageError, StorageInterface};
+use crate::{create_storage_backend, StorageError, StorageInterface, StoreConfig};
 
 /// Errors that can occur during configuration storage operations.
 #[derive(Debug, Error)]
@@ -153,57 +153,6 @@ where
 /// This provides flexibility for storing any JSON-serializable configuration.
 pub type JsonConfigStore = Box<dyn ConfigStore<Value> + Send + Sync>;
 
-/// Configuration for different config store backends.
-#[derive(Clone)]
-pub enum ConfigStoreConfig {
-	/// Use an existing StorageInterface (for sharing storage with other components)
-	Storage(Arc<dyn StorageInterface>),
-	/// Redis backend configuration
-	Redis {
-		/// Redis connection URL (e.g., "redis://localhost:6379")
-		url: String,
-	},
-	/// In-memory storage (useful for testing)
-	Memory,
-}
-
-impl std::fmt::Debug for ConfigStoreConfig {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			ConfigStoreConfig::Storage(_) => f.debug_struct("Storage").finish_non_exhaustive(),
-			ConfigStoreConfig::Redis { url } => {
-				// Redact credentials from URL to prevent leaking secrets in logs
-				let redacted_url = redact_url_credentials(url);
-				f.debug_struct("Redis").field("url", &redacted_url).finish()
-			},
-			ConfigStoreConfig::Memory => f.debug_struct("Memory").finish(),
-		}
-	}
-}
-
-/// Redacts credentials (userinfo) from a Redis URL to prevent leaking secrets.
-///
-/// Transforms URLs like `redis://:password@host:port` to `redis://[REDACTED]@host:port`
-fn redact_url_credentials(url: &str) -> String {
-	// Find the scheme separator
-	let Some(scheme_end) = url.find("://") else {
-		return url.to_string();
-	};
-
-	let after_scheme = &url[scheme_end + 3..];
-
-	// Find the @ symbol which separates userinfo from host
-	let Some(at_pos) = after_scheme.find('@') else {
-		// No credentials in URL
-		return url.to_string();
-	};
-
-	// Reconstruct URL with redacted credentials
-	let scheme = &url[..scheme_end + 3];
-	let host_and_path = &after_scheme[at_pos + 1..];
-	format!("{}[REDACTED]@{}", scheme, host_and_path)
-}
-
 /// Creates a config store instance based on the specified configuration.
 ///
 /// This factory function provides an abstraction layer for config store creation,
@@ -211,7 +160,7 @@ fn redact_url_credentials(url: &str) -> String {
 ///
 /// # Arguments
 ///
-/// * `config` - Backend-specific configuration
+/// * `config` - Backend-specific configuration (see [`StoreConfig`](crate::StoreConfig))
 /// * `solver_id` - Unique identifier for this solver instance
 ///
 /// # Returns
@@ -222,7 +171,7 @@ fn redact_url_credentials(url: &str) -> String {
 ///
 /// Returns `ConfigStoreError::Configuration` if the configuration is invalid.
 pub fn create_config_store<T>(
-	config: ConfigStoreConfig,
+	config: StoreConfig,
 	solver_id: String,
 ) -> Result<Box<dyn ConfigStore<T>>, ConfigStoreError>
 where
@@ -234,32 +183,17 @@ where
 		));
 	}
 
-	let storage: Arc<dyn StorageInterface> = match config {
-		ConfigStoreConfig::Storage(s) => s,
-		ConfigStoreConfig::Redis { url } => {
-			if url.is_empty() {
-				return Err(ConfigStoreError::Configuration(
-					"Redis URL cannot be empty".to_string(),
-				));
-			}
-			let redis_config = toml::Value::Table({
-				let mut table = toml::map::Map::new();
-				table.insert("redis_url".to_string(), toml::Value::String(url));
-				table
-			});
-			Arc::from(
-				implementations::redis::create_storage(&redis_config)
-					.map_err(|e| ConfigStoreError::Configuration(e.to_string()))?,
-			)
-		},
-		ConfigStoreConfig::Memory => {
-			let config = toml::Value::Table(toml::map::Map::new());
-			Arc::from(
-				implementations::memory::create_storage(&config)
-					.map_err(|e| ConfigStoreError::Configuration(e.to_string()))?,
-			)
-		},
-	};
+	// Validate Redis URL if provided
+	if let StoreConfig::Redis { ref url } = config {
+		if url.is_empty() {
+			return Err(ConfigStoreError::Configuration(
+				"Redis URL cannot be empty".to_string(),
+			));
+		}
+	}
+
+	let storage = create_storage_backend(config)
+		.map_err(|e| ConfigStoreError::Configuration(e.to_string()))?;
 
 	let store = StorageConfigStore::<T>::new(storage, solver_id)?;
 	Ok(Box::new(store))
@@ -273,7 +207,7 @@ pub fn create_redis_config_store<T>(
 where
 	T: Serialize + for<'de> Deserialize<'de> + Send + Sync + Clone + 'static,
 {
-	create_config_store(ConfigStoreConfig::Redis { url: redis_url }, solver_id)
+	create_config_store(StoreConfig::Redis { url: redis_url }, solver_id)
 }
 
 // =============================================================================
@@ -522,7 +456,7 @@ mod integration_tests {
 	async fn test_create_config_store_redis() {
 		let solver_id = unique_solver_id();
 		let store = create_config_store::<TestConfig>(
-			ConfigStoreConfig::Redis {
+			StoreConfig::Redis {
 				url: "redis://localhost:6379".to_string(),
 			},
 			solver_id.clone(),
@@ -567,7 +501,7 @@ mod integration_tests {
 	#[tokio::test]
 	async fn test_memory_config_store_lifecycle() {
 		let solver_id = unique_solver_id();
-		let store = create_config_store::<TestConfig>(ConfigStoreConfig::Memory, solver_id.clone())
+		let store = create_config_store::<TestConfig>(StoreConfig::Memory, solver_id.clone())
 			.expect("Failed to create memory store");
 
 		// 1. Should not exist initially
@@ -602,7 +536,7 @@ mod integration_tests {
 	#[tokio::test]
 	async fn test_memory_seed_already_exists() {
 		let solver_id = unique_solver_id();
-		let store = create_config_store::<TestConfig>(ConfigStoreConfig::Memory, solver_id.clone())
+		let store = create_config_store::<TestConfig>(StoreConfig::Memory, solver_id.clone())
 			.unwrap();
 
 		let config = create_test_config(&solver_id);
@@ -621,7 +555,7 @@ mod integration_tests {
 	#[tokio::test]
 	async fn test_memory_update_version_mismatch() {
 		let solver_id = unique_solver_id();
-		let store = create_config_store::<TestConfig>(ConfigStoreConfig::Memory, solver_id.clone())
+		let store = create_config_store::<TestConfig>(StoreConfig::Memory, solver_id.clone())
 			.unwrap();
 
 		let config = create_test_config(&solver_id);
@@ -644,7 +578,7 @@ mod integration_tests {
 	#[tokio::test]
 	async fn test_memory_get_not_found() {
 		let solver_id = unique_solver_id();
-		let store = create_config_store::<TestConfig>(ConfigStoreConfig::Memory, solver_id.clone())
+		let store = create_config_store::<TestConfig>(StoreConfig::Memory, solver_id.clone())
 			.unwrap();
 
 		let result = store.get().await;
@@ -654,7 +588,7 @@ mod integration_tests {
 	#[tokio::test]
 	async fn test_memory_update_not_found() {
 		let solver_id = unique_solver_id();
-		let store = create_config_store::<TestConfig>(ConfigStoreConfig::Memory, solver_id.clone())
+		let store = create_config_store::<TestConfig>(StoreConfig::Memory, solver_id.clone())
 			.unwrap();
 
 		let config = create_test_config(&solver_id);
@@ -702,9 +636,9 @@ mod integration_tests {
 	}
 
 	#[test]
-	fn test_config_store_config_enum() {
+	fn test_store_config_enum() {
 		// Test Redis configuration
-		let redis_config = ConfigStoreConfig::Redis {
+		let redis_config = StoreConfig::Redis {
 			url: "redis://localhost:6379".to_string(),
 		};
 
@@ -713,7 +647,7 @@ mod integration_tests {
 		let _debug_str = format!("{:?}", redis_config);
 
 		// Test that we can create different configurations
-		let redis_config2 = ConfigStoreConfig::Redis {
+		let redis_config2 = StoreConfig::Redis {
 			url: "redis://remote:6379".to_string(),
 		};
 

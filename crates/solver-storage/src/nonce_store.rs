@@ -13,11 +13,11 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use solver_storage::nonce_store::{create_nonce_store, NonceStoreConfig};
+//! use solver_storage::{nonce_store::create_nonce_store, StoreConfig};
 //!
 //! // Create nonce store with Redis backend
 //! let nonce_store = create_nonce_store(
-//!     NonceStoreConfig::Redis { url: "redis://localhost:6379".to_string() },
+//!     StoreConfig::Redis { url: "redis://localhost:6379".to_string() },
 //!     "my-solver",
 //!     300,  // TTL in seconds
 //! )?;
@@ -30,7 +30,9 @@
 //! nonce_store.consume(nonce).await?;              // Consume (single-use)
 //! ```
 
-use crate::{implementations, StorageError, StorageInterface};
+// Re-export shared types for this module's API
+pub use crate::{create_storage_backend, redact_url_credentials, StoreConfig};
+use crate::{StorageError, StorageInterface};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -63,58 +65,12 @@ impl From<StorageError> for NonceError {
 	}
 }
 
-/// Configuration for different nonce store backends.
-///
-/// Similar to [`crate::config_store::ConfigStoreConfig`], this enum allows
-/// selecting the storage backend at runtime.
-#[derive(Clone)]
-pub enum NonceStoreConfig {
-	/// Use an existing StorageInterface (for sharing storage with other components)
-	Storage(Arc<dyn StorageInterface>),
-	/// Create a new Redis-backed storage
-	Redis {
-		/// Redis connection URL (e.g., "redis://localhost:6379")
-		url: String,
-	},
-	/// Create an in-memory storage (useful for testing)
-	Memory,
-}
-
-impl std::fmt::Debug for NonceStoreConfig {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			NonceStoreConfig::Storage(_) => f.debug_struct("Storage").finish_non_exhaustive(),
-			NonceStoreConfig::Redis { url } => {
-				let redacted = redact_url_credentials(url);
-				f.debug_struct("Redis").field("url", &redacted).finish()
-			},
-			NonceStoreConfig::Memory => f.debug_struct("Memory").finish(),
-		}
-	}
-}
-
-/// Redacts credentials from a URL to prevent leaking secrets in logs.
-fn redact_url_credentials(url: &str) -> String {
-	let Some(scheme_end) = url.find("://") else {
-		return url.to_string();
-	};
-
-	let after_scheme = &url[scheme_end + 3..];
-
-	let Some(at_pos) = after_scheme.find('@') else {
-		return url.to_string();
-	};
-
-	let scheme = &url[..scheme_end + 3];
-	let host_and_path = &after_scheme[at_pos + 1..];
-	format!("{}[REDACTED]@{}", scheme, host_and_path)
-}
 
 /// Creates a nonce store with the specified backend configuration.
 ///
 /// # Arguments
 ///
-/// * `config` - Backend configuration (Redis, Memory, or existing StorageInterface)
+/// * `config` - Backend configuration (see [`StoreConfig`](crate::StoreConfig))
 /// * `solver_id` - Unique solver identifier for namespacing
 /// * `ttl_seconds` - How long nonces are valid before expiring
 ///
@@ -123,38 +79,24 @@ fn redact_url_credentials(url: &str) -> String {
 /// ```rust,ignore
 /// // For production (Redis)
 /// let store = create_nonce_store(
-///     NonceStoreConfig::Redis { url: redis_url },
+///     StoreConfig::Redis { url: redis_url },
 ///     &solver_id,
 ///     300,
 /// )?;
 ///
 /// // For testing (Memory)
 /// let store = create_nonce_store(
-///     NonceStoreConfig::Memory,
+///     StoreConfig::Memory,
 ///     "test-solver",
 ///     300,
 /// )?;
 /// ```
 pub fn create_nonce_store(
-	config: NonceStoreConfig,
+	config: StoreConfig,
 	solver_id: &str,
 	ttl_seconds: u64,
 ) -> Result<NonceStore, NonceError> {
-	let storage: Arc<dyn StorageInterface> = match config {
-		NonceStoreConfig::Storage(s) => s,
-		NonceStoreConfig::Redis { url } => {
-			let redis_config = toml::Value::Table({
-				let mut table = toml::map::Map::new();
-				table.insert("redis_url".to_string(), toml::Value::String(url));
-				table
-			});
-			Arc::from(implementations::redis::create_storage(&redis_config)?)
-		},
-		NonceStoreConfig::Memory => {
-			let config = toml::Value::Table(toml::map::Map::new());
-			Arc::from(implementations::memory::create_storage(&config)?)
-		},
-	};
+	let storage = create_storage_backend(config)?;
 	NonceStore::new(storage, solver_id, ttl_seconds)
 }
 
@@ -167,7 +109,7 @@ pub fn create_redis_nonce_store(
 	ttl_seconds: u64,
 ) -> Result<NonceStore, NonceError> {
 	create_nonce_store(
-		NonceStoreConfig::Redis { url: redis_url },
+		StoreConfig::Redis { url: redis_url },
 		solver_id,
 		ttl_seconds,
 	)
@@ -327,7 +269,7 @@ mod tests {
 
 	#[test]
 	fn test_new_valid() {
-		let store = create_nonce_store(NonceStoreConfig::Memory, "test-solver", 300);
+		let store = create_nonce_store(StoreConfig::Memory, "test-solver", 300);
 		assert!(store.is_ok());
 
 		let store = store.unwrap();
@@ -337,20 +279,20 @@ mod tests {
 
 	#[test]
 	fn test_new_empty_solver_id() {
-		let result = create_nonce_store(NonceStoreConfig::Memory, "", 300);
+		let result = create_nonce_store(StoreConfig::Memory, "", 300);
 		assert!(matches!(result, Err(NonceError::Configuration(_))));
 	}
 
 	#[test]
 	fn test_nonce_key_format() {
-		let store = create_nonce_store(NonceStoreConfig::Memory, "my-solver", 300).unwrap();
+		let store = create_nonce_store(StoreConfig::Memory, "my-solver", 300).unwrap();
 		let key = store.nonce_key(12345);
 		assert_eq!(key, "my-solver:admin:nonce:12345");
 	}
 
 	#[test]
 	fn test_debug_impl() {
-		let store = create_nonce_store(NonceStoreConfig::Memory, "test-solver", 300).unwrap();
+		let store = create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap();
 
 		let debug_str = format!("{:?}", store);
 		assert!(debug_str.contains("NonceStore"));
@@ -360,7 +302,7 @@ mod tests {
 
 	#[test]
 	fn test_config_debug_redacts_credentials() {
-		let config = NonceStoreConfig::Redis {
+		let config = StoreConfig::Redis {
 			url: "redis://:secretpassword@localhost:6379".to_string(),
 		};
 		let debug_str = format!("{:?}", config);
@@ -370,7 +312,7 @@ mod tests {
 
 	#[test]
 	fn test_config_debug_memory() {
-		let config = NonceStoreConfig::Memory;
+		let config = StoreConfig::Memory;
 		let debug_str = format!("{:?}", config);
 		assert!(debug_str.contains("Memory"));
 	}
@@ -390,7 +332,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_nonce_lifecycle() {
-		let store = create_nonce_store(NonceStoreConfig::Memory, "test-solver", 300).unwrap();
+		let store = create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap();
 
 		// Generate
 		let nonce = store.generate().await.unwrap();
@@ -414,7 +356,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_invalid_nonce() {
-		let store = create_nonce_store(NonceStoreConfig::Memory, "test-solver", 300).unwrap();
+		let store = create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap();
 
 		// Random nonce that was never generated
 		let result = store.consume(12345).await;
@@ -424,19 +366,16 @@ mod tests {
 	#[tokio::test]
 	async fn test_nonce_isolation_between_solvers() {
 		// Create shared storage
-		let storage = Arc::from(
-			implementations::memory::create_storage(&toml::Value::Table(toml::map::Map::new()))
-				.unwrap(),
-		);
+		let storage = create_storage_backend(StoreConfig::Memory).unwrap();
 
 		let store1 = create_nonce_store(
-			NonceStoreConfig::Storage(Arc::clone(&storage)),
+			StoreConfig::Storage(Arc::clone(&storage)),
 			"solver1",
 			300,
 		)
 		.unwrap();
 		let store2 = create_nonce_store(
-			NonceStoreConfig::Storage(Arc::clone(&storage)),
+			StoreConfig::Storage(Arc::clone(&storage)),
 			"solver2",
 			300,
 		)
@@ -463,7 +402,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_multiple_nonces() {
-		let store = create_nonce_store(NonceStoreConfig::Memory, "test-solver", 300).unwrap();
+		let store = create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap();
 
 		// Generate multiple nonces
 		let nonce1 = store.generate().await.unwrap();

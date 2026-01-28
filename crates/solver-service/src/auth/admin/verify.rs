@@ -140,7 +140,7 @@ mod tests {
 	use crate::auth::admin::types::AddTokenContents;
 	use alloy_primitives::keccak256;
 	use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
-	use solver_storage::nonce_store::{create_nonce_store, NonceStoreConfig};
+	use solver_storage::{nonce_store::create_nonce_store, StoreConfig};
 	use std::str::FromStr;
 
 	/// Get address from secret key
@@ -171,7 +171,7 @@ mod tests {
 		let admin_address = address_from_secret(&secret);
 
 		let nonce_store =
-			Arc::new(create_nonce_store(NonceStoreConfig::Memory, "test-verify", 300).unwrap());
+			Arc::new(create_nonce_store(StoreConfig::Memory, "test-verify", 300).unwrap());
 
 		let admin_config = AdminConfig {
 			enabled: true,
@@ -215,7 +215,7 @@ mod tests {
 		let admin_address = address_from_secret(&secret);
 
 		let nonce_store =
-			Arc::new(create_nonce_store(NonceStoreConfig::Memory, "test-expired", 300).unwrap());
+			Arc::new(create_nonce_store(StoreConfig::Memory, "test-expired", 300).unwrap());
 
 		let admin_config = AdminConfig {
 			enabled: true,
@@ -251,7 +251,7 @@ mod tests {
 			Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
 
 		let nonce_store =
-			Arc::new(create_nonce_store(NonceStoreConfig::Memory, "test-non-admin", 300).unwrap());
+			Arc::new(create_nonce_store(StoreConfig::Memory, "test-non-admin", 300).unwrap());
 
 		let admin_config = AdminConfig {
 			enabled: true,

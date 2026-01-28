@@ -31,7 +31,7 @@ use solver_config::Config;
 use solver_service::{
 	build_solver_from_config, config_merge::merge_config, seeds::SeedPreset, server,
 };
-use solver_storage::config_store::{create_config_store, ConfigStoreConfig};
+use solver_storage::{config_store::create_config_store, StoreConfig};
 use solver_types::SeedOverrides;
 use std::sync::Arc;
 
@@ -151,7 +151,7 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 
 		// Create config store for seeding
 		let config_store = create_config_store::<Config>(
-			ConfigStoreConfig::Redis {
+			StoreConfig::Redis {
 				url: redis_url.clone(),
 			},
 			merged_config.solver.id.clone(),
@@ -212,7 +212,7 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 	tracing::info!("Loading configuration from Redis for solver: {}", solver_id);
 
 	let config_store =
-		create_config_store::<Config>(ConfigStoreConfig::Redis { url: redis_url }, solver_id)?;
+		create_config_store::<Config>(StoreConfig::Redis { url: redis_url }, solver_id)?;
 	let versioned = config_store.get().await?;
 
 	tracing::info!(

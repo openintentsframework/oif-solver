@@ -263,6 +263,129 @@ pub fn get_all_implementations() -> Vec<(&'static str, StorageFactory)> {
 	]
 }
 
+// =============================================================================
+// Shared Store Configuration
+// =============================================================================
+
+/// Configuration for storage backends used by specialized stores.
+///
+/// This enum is shared by [`config_store::ConfigStore`] and [`nonce_store::NonceStore`]
+/// to avoid code duplication. All stores use the same backend options.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use solver_storage::{StoreConfig, create_storage_backend};
+///
+/// // For production (Redis)
+/// let storage = create_storage_backend(StoreConfig::Redis {
+///     url: "redis://localhost:6379".to_string(),
+/// })?;
+///
+/// // For testing (Memory)
+/// let storage = create_storage_backend(StoreConfig::Memory)?;
+/// ```
+#[derive(Clone)]
+pub enum StoreConfig {
+	/// Use an existing StorageInterface (for sharing storage with other components)
+	Storage(std::sync::Arc<dyn StorageInterface>),
+	/// Create a new Redis-backed storage
+	Redis {
+		/// Redis connection URL (e.g., "redis://localhost:6379")
+		url: String,
+	},
+	/// Create an in-memory storage (useful for testing)
+	Memory,
+}
+
+impl std::fmt::Debug for StoreConfig {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			StoreConfig::Storage(_) => f.debug_struct("Storage").finish_non_exhaustive(),
+			StoreConfig::Redis { url } => {
+				let redacted = redact_url_credentials(url);
+				f.debug_struct("Redis").field("url", &redacted).finish()
+			},
+			StoreConfig::Memory => f.debug_struct("Memory").finish(),
+		}
+	}
+}
+
+/// Creates a storage backend from the given configuration.
+///
+/// This factory function is used by [`config_store`] and [`nonce_store`]
+/// to create their underlying storage backends.
+///
+/// # Arguments
+///
+/// * `config` - Backend configuration (Redis, Memory, or existing StorageInterface)
+///
+/// # Returns
+///
+/// An `Arc<dyn StorageInterface>` ready for use.
+///
+/// # Errors
+///
+/// Returns `StorageError` if the backend cannot be created (e.g., invalid Redis URL).
+pub fn create_storage_backend(
+	config: StoreConfig,
+) -> Result<std::sync::Arc<dyn StorageInterface>, StorageError> {
+	match config {
+		StoreConfig::Storage(s) => Ok(s),
+		StoreConfig::Redis { url } => {
+			let redis_config = toml::Value::Table({
+				let mut table = toml::map::Map::new();
+				table.insert("redis_url".to_string(), toml::Value::String(url));
+				table
+			});
+			Ok(std::sync::Arc::from(implementations::redis::create_storage(
+				&redis_config,
+			)?))
+		},
+		StoreConfig::Memory => {
+			let config = toml::Value::Table(toml::map::Map::new());
+			Ok(std::sync::Arc::from(implementations::memory::create_storage(
+				&config,
+			)?))
+		},
+	}
+}
+
+/// Redacts credentials (userinfo) from a URL to prevent leaking secrets in logs.
+///
+/// Transforms URLs like `redis://:password@host:port` to `redis://[REDACTED]@host:port`
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let url = "redis://:secret@localhost:6379";
+/// let redacted = redact_url_credentials(url);
+/// assert_eq!(redacted, "redis://[REDACTED]@localhost:6379");
+/// ```
+pub fn redact_url_credentials(url: &str) -> String {
+	// Find the scheme separator
+	let Some(scheme_end) = url.find("://") else {
+		return url.to_string();
+	};
+
+	let after_scheme = &url[scheme_end + 3..];
+
+	// Find the @ symbol which separates userinfo from host
+	let Some(at_pos) = after_scheme.find('@') else {
+		// No credentials in URL
+		return url.to_string();
+	};
+
+	// Reconstruct URL with redacted credentials
+	let scheme = &url[..scheme_end + 3];
+	let host_and_path = &after_scheme[at_pos + 1..];
+	format!("{}[REDACTED]@{}", scheme, host_and_path)
+}
+
+// =============================================================================
+// Storage Service
+// =============================================================================
+
 /// High-level storage service that provides typed operations.
 ///
 /// The StorageService wraps a low-level storage backend and provides
