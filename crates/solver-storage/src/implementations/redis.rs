@@ -677,6 +677,126 @@ impl StorageInterface for RedisStorage {
 		debug!("cleanup_expired called - Redis handles TTL automatically");
 		Ok(0)
 	}
+
+	async fn set_nx(
+		&self,
+		key: &str,
+		value: Vec<u8>,
+		ttl: Option<Duration>,
+	) -> Result<bool, StorageError> {
+		let client = self.get_connection().await?;
+		let mut conn = client.as_ref().clone();
+		let redis_key = self.data_key(key);
+
+		let result: bool = if let Some(ttl) = ttl {
+			// SET key value NX EX seconds - returns "OK" if set, nil if key exists
+			let reply: Option<String> = redis::cmd("SET")
+				.arg(&redis_key)
+				.arg(&value)
+				.arg("NX")
+				.arg("EX")
+				.arg(ttl.as_secs())
+				.query_async(&mut conn)
+				.await
+				.map_err(|e| self.map_redis_error(e, "set_nx"))?;
+			reply.is_some()
+		} else {
+			// SETNX returns true if set, false if key exists
+			conn.set_nx(&redis_key, &value)
+				.await
+				.map_err(|e| self.map_redis_error(e, "set_nx"))?
+		};
+
+		debug!(key = %key, set = result, "set_nx operation");
+		Ok(result)
+	}
+
+	async fn compare_and_swap(
+		&self,
+		key: &str,
+		expected: &[u8],
+		new_value: Vec<u8>,
+		ttl: Option<Duration>,
+	) -> Result<bool, StorageError> {
+		let client = self.get_connection().await?;
+		let mut conn = client.as_ref().clone();
+		let redis_key = self.data_key(key);
+
+		// Lua script for atomic CAS (works on raw bytes)
+		// Returns:
+		//   1 = success (swapped)
+		//   0 = mismatch (current value != expected)
+		//  -1 = not found (key doesn't exist)
+		let script = redis::Script::new(
+			r#"
+            local key = KEYS[1]
+            local expected = ARGV[1]
+            local new_value = ARGV[2]
+            local ttl = tonumber(ARGV[3])
+
+            local current = redis.call('GET', key)
+            if not current then
+                return -1  -- not found
+            end
+
+            if current ~= expected then
+                return 0  -- mismatch
+            end
+
+            if ttl and ttl > 0 then
+                redis.call('SETEX', key, ttl, new_value)
+            else
+                redis.call('SET', key, new_value)
+            end
+            return 1  -- success
+            "#,
+		);
+
+		let ttl_secs = ttl.map(|d| d.as_secs() as i64).unwrap_or(0);
+
+		let result: i64 = script
+			.key(&redis_key)
+			.arg(expected)
+			.arg(&new_value)
+			.arg(ttl_secs)
+			.invoke_async(&mut conn)
+			.await
+			.map_err(|e| self.map_redis_error(e, "compare_and_swap"))?;
+
+		match result {
+			1 => {
+				debug!(key = %key, "compare_and_swap succeeded");
+				Ok(true)
+			},
+			0 => {
+				debug!(key = %key, "compare_and_swap mismatch");
+				Ok(false)
+			},
+			-1 => {
+				debug!(key = %key, "compare_and_swap key not found");
+				Err(StorageError::NotFound(key.to_string()))
+			},
+			_ => Err(StorageError::Backend(
+				"Unexpected CAS result".to_string(),
+			)),
+		}
+	}
+
+	async fn delete_if_exists(&self, key: &str) -> Result<bool, StorageError> {
+		let client = self.get_connection().await?;
+		let mut conn = client.as_ref().clone();
+		let redis_key = self.data_key(key);
+
+		// DEL returns count of deleted keys (0 or 1 for single key)
+		let deleted: i64 = conn
+			.del(&redis_key)
+			.await
+			.map_err(|e| self.map_redis_error(e, "delete_if_exists"))?;
+
+		let existed = deleted > 0;
+		debug!(key = %key, existed, "delete_if_exists operation");
+		Ok(existed)
+	}
 }
 
 /// Configuration schema for RedisStorage.

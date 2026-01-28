@@ -269,14 +269,15 @@ impl NonceStore {
 	/// Returns `Ok(())` if nonce was valid and is now consumed.
 	/// Returns `Err(NotFound)` if nonce doesn't exist or was already used.
 	///
-	/// Note: This operation uses exists + delete which is not strictly atomic,
-	/// but is acceptable for nonces since each nonce is unique (UUID-based)
-	/// and the window between operations is minimal.
+	/// This operation uses `delete_if_exists` for atomic consumption,
+	/// ensuring the nonce can only be consumed once even under concurrent access.
 	pub async fn consume(&self, nonce: u64) -> Result<(), NonceError> {
 		let nonce_key = self.nonce_key(nonce);
 
-		// Check if exists first
-		if !self.storage.exists(&nonce_key).await? {
+		// Atomic delete - returns true if existed and was deleted
+		let existed = self.storage.delete_if_exists(&nonce_key).await?;
+
+		if !existed {
 			warn!(
 				nonce = %nonce,
 				solver_id = %self.solver_id,
@@ -284,9 +285,6 @@ impl NonceStore {
 			);
 			return Err(NonceError::NotFound);
 		}
-
-		// Delete the nonce
-		self.storage.delete(&nonce_key).await?;
 
 		debug!(
 			nonce = %nonce,

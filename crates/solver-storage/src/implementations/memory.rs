@@ -2,24 +2,53 @@
 //!
 //! This module provides a memory-based implementation of the StorageInterface trait,
 //! useful for testing and development scenarios where persistence is not required.
+//!
+//! # ⚠️ Test-Only Backend
+//!
+//! This backend is intended for **testing only**:
+//! - TTL is tracked but cleanup is manual (call `cleanup_expired()`)
+//! - Atomic operations use `RwLock` (single-process only, not distributed)
+//! - Data is lost on restart
+//!
+//! For production, use Redis or another persistent backend.
 
 use crate::{QueryFilter, StorageError, StorageIndexes, StorageInterface};
 use async_trait::async_trait;
 use solver_types::{ConfigSchema, Schema, ValidationError};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+
+/// Entry stored in memory with optional expiration.
+#[derive(Clone)]
+struct StorageEntry {
+	/// The stored value.
+	value: Vec<u8>,
+	/// When this entry expires (None = never expires).
+	expires_at: Option<Instant>,
+}
+
+impl StorageEntry {
+	/// Check if this entry has expired.
+	fn is_expired(&self) -> bool {
+		self.expires_at.map(|t| Instant::now() > t).unwrap_or(false)
+	}
+}
 
 /// In-memory storage implementation.
 ///
-/// This implementation stores data in a HashMap in memory,
-/// providing fast access but no persistence across restarts.
-/// TTL and indexes are ignored as this is primarily for testing
-/// and has no recovery capability.
+/// # ⚠️ Test-Only Backend
+///
+/// This implementation stores data in a HashMap in memory:
+/// - TTL is tracked but cleanup requires calling `cleanup_expired()`
+/// - Atomic operations use `RwLock` (single-process only)
+/// - Data is lost on restart
+///
+/// For production, use Redis or another persistent backend.
 pub struct MemoryStorage {
 	/// The in-memory store protected by a read-write lock.
-	store: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+	store: Arc<RwLock<HashMap<String, StorageEntry>>>,
 }
 
 impl MemoryStorage {
@@ -41,10 +70,11 @@ impl Default for MemoryStorage {
 impl StorageInterface for MemoryStorage {
 	async fn get_bytes(&self, key: &str) -> Result<Vec<u8>, StorageError> {
 		let store = self.store.read().await;
-		store
-			.get(key)
-			.cloned()
-			.ok_or(StorageError::NotFound(key.to_string()))
+		match store.get(key) {
+			Some(entry) if !entry.is_expired() => Ok(entry.value.clone()),
+			Some(_) => Err(StorageError::NotFound(key.to_string())), // Expired
+			None => Err(StorageError::NotFound(key.to_string())),
+		}
 	}
 
 	async fn set_bytes(
@@ -52,11 +82,14 @@ impl StorageInterface for MemoryStorage {
 		key: &str,
 		value: Vec<u8>,
 		_indexes: Option<StorageIndexes>,
-		_ttl: Option<Duration>,
+		ttl: Option<Duration>,
 	) -> Result<(), StorageError> {
-		// TTL and indexes are ignored for memory storage
 		let mut store = self.store.write().await;
-		store.insert(key.to_string(), value);
+		let entry = StorageEntry {
+			value,
+			expires_at: ttl.map(|d| Instant::now() + d),
+		};
+		store.insert(key.to_string(), entry);
 		Ok(())
 	}
 
@@ -68,7 +101,10 @@ impl StorageInterface for MemoryStorage {
 
 	async fn exists(&self, key: &str) -> Result<bool, StorageError> {
 		let store = self.store.read().await;
-		Ok(store.contains_key(key))
+		match store.get(key) {
+			Some(entry) => Ok(!entry.is_expired()),
+			None => Ok(false),
+		}
 	}
 
 	fn config_schema(&self) -> Box<dyn ConfigSchema> {
@@ -90,12 +126,91 @@ impl StorageInterface for MemoryStorage {
 		let mut results = Vec::new();
 
 		for key in keys {
-			if let Some(value) = store.get(key) {
-				results.push((key.clone(), value.clone()));
+			if let Some(entry) = store.get(key) {
+				if !entry.is_expired() {
+					results.push((key.clone(), entry.value.clone()));
+				}
 			}
 		}
 
 		Ok(results)
+	}
+
+	async fn cleanup_expired(&self) -> Result<usize, StorageError> {
+		let mut store = self.store.write().await;
+		let before = store.len();
+		store.retain(|_, entry| !entry.is_expired());
+		let removed = before - store.len();
+		Ok(removed)
+	}
+
+	// ==================== Atomic Operations ====================
+
+	async fn set_nx(
+		&self,
+		key: &str,
+		value: Vec<u8>,
+		ttl: Option<Duration>,
+	) -> Result<bool, StorageError> {
+		let mut store = self.store.write().await;
+
+		// Check if key exists and is not expired
+		if let Some(entry) = store.get(key) {
+			if !entry.is_expired() {
+				return Ok(false); // Key exists
+			}
+			// Key is expired, remove it and continue
+		}
+
+		// Set the value
+		let entry = StorageEntry {
+			value,
+			expires_at: ttl.map(|d| Instant::now() + d),
+		};
+		store.insert(key.to_string(), entry);
+		Ok(true)
+	}
+
+	async fn compare_and_swap(
+		&self,
+		key: &str,
+		expected: &[u8],
+		new_value: Vec<u8>,
+		ttl: Option<Duration>,
+	) -> Result<bool, StorageError> {
+		let mut store = self.store.write().await;
+
+		match store.get(key) {
+			Some(entry) if entry.is_expired() => {
+				// Treat expired as not found
+				Err(StorageError::NotFound(key.to_string()))
+			},
+			Some(entry) => {
+				if entry.value == expected {
+					// Match - swap the value
+					let new_entry = StorageEntry {
+						value: new_value,
+						expires_at: ttl.map(|d| Instant::now() + d),
+					};
+					store.insert(key.to_string(), new_entry);
+					Ok(true)
+				} else {
+					// Mismatch
+					Ok(false)
+				}
+			},
+			None => Err(StorageError::NotFound(key.to_string())),
+		}
+	}
+
+	async fn delete_if_exists(&self, key: &str) -> Result<bool, StorageError> {
+		let mut store = self.store.write().await;
+
+		match store.remove(key) {
+			Some(entry) if !entry.is_expired() => Ok(true), // Existed and was deleted
+			Some(_) => Ok(false),                           // Was expired (treat as not existed)
+			None => Ok(false),                              // Didn't exist
+		}
 	}
 }
 

@@ -514,11 +514,13 @@ fn build_api_config(
 	admin_override: Option<&solver_types::seed_overrides::AdminOverride>,
 ) -> ApiConfig {
 	// Build auth config if admin is configured
+	// Note: `auth.enabled` controls JWT requirement for /orders endpoint
+	// Admin auth (wallet signatures for /admin/*) is controlled separately by `auth.admin.enabled`
 	let auth = admin_override.map(|admin| {
 		use solver_types::{AdminConfig, AuthConfig, SecretString};
 
 		AuthConfig {
-			enabled: true,
+			enabled: false, // Don't require JWT for /orders - admin auth is separate
 			jwt_secret: SecretString::new(uuid::Uuid::new_v4().to_string()),
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720, // 30 days

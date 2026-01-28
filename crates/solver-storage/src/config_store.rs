@@ -1,26 +1,48 @@
-//! Configuration storage trait and Redis implementation.
+//! Configuration storage trait and implementation.
 //!
 //! This module provides a specialized storage interface for solver configuration
 //! with optimistic locking support via versioning. It allows configuration to be
-//! stored in and retrieved from Redis with concurrent access safety.
+//! stored in any backend implementing [`StorageInterface`](crate::StorageInterface)
+//! with concurrent access safety.
 //!
 //! # Architecture
 //!
-//! The configuration storage is separate from the general-purpose `StorageInterface`
-//! because configuration has different requirements:
-//! - Single configuration per solver (keyed by solver_id)
-//! - Optimistic locking for safe concurrent updates
-//! - No TTL (configuration should never expire)
-//! - Versioning for change tracking
+//! The `ConfigStore` is a thin wrapper around [`StorageInterface`] that adds:
+//! - Optimistic locking via version checking
+//! - JSON serialization/deserialization
+//! - Versioned wrapper for change tracking
+//!
+//! The atomic operations (`set_nx`, `compare_and_swap`) are provided by
+//! the underlying storage backend, while versioning logic stays in this module.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use solver_storage::config_store::{create_config_store, ConfigStoreConfig};
+//!
+//! // For production (Redis)
+//! let store = create_config_store::<MyConfig>(
+//!     ConfigStoreConfig::Redis { url: "redis://localhost:6379".to_string() },
+//!     "my-solver".to_string(),
+//! )?;
+//!
+//! // For testing (Memory)
+//! let store = create_config_store::<MyConfig>(
+//!     ConfigStoreConfig::Memory,
+//!     "test-solver".to_string(),
+//! )?;
+//! ```
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use solver_types::Versioned;
+use std::marker::PhantomData;
+use std::sync::Arc;
 use thiserror::Error;
+use tracing::debug;
 
-// Import implementations from the implementations module
-use crate::implementations::config::RedisConfigStore;
+use crate::{implementations, StorageError, StorageInterface};
 
 /// Errors that can occur during configuration storage operations.
 #[derive(Debug, Error)]
@@ -134,26 +156,27 @@ pub type JsonConfigStore = Box<dyn ConfigStore<Value> + Send + Sync>;
 /// Configuration for different config store backends.
 #[derive(Clone)]
 pub enum ConfigStoreConfig {
+	/// Use an existing StorageInterface (for sharing storage with other components)
+	Storage(Arc<dyn StorageInterface>),
 	/// Redis backend configuration
 	Redis {
 		/// Redis connection URL (e.g., "redis://localhost:6379")
 		url: String,
 	},
-	// File backend could be added like this:
-	// File {
-	//     /// Base directory for config files
-	//     base_dir: PathBuf,
-	// },
+	/// In-memory storage (useful for testing)
+	Memory,
 }
 
 impl std::fmt::Debug for ConfigStoreConfig {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
+			ConfigStoreConfig::Storage(_) => f.debug_struct("Storage").finish_non_exhaustive(),
 			ConfigStoreConfig::Redis { url } => {
 				// Redact credentials from URL to prevent leaking secrets in logs
 				let redacted_url = redact_url_credentials(url);
 				f.debug_struct("Redis").field("url", &redacted_url).finish()
 			},
+			ConfigStoreConfig::Memory => f.debug_struct("Memory").finish(),
 		}
 	}
 }
@@ -205,17 +228,41 @@ pub fn create_config_store<T>(
 where
 	T: Serialize + for<'de> Deserialize<'de> + Send + Sync + Clone + 'static,
 {
-	match config {
-		ConfigStoreConfig::Redis { url } => {
-			let store = RedisConfigStore::<T>::with_defaults(url, solver_id)?;
-			Ok(Box::new(store))
-		},
-		// File backend could be implemented like:
-		// ConfigStoreConfig::File { base_dir } => {
-		//     let store = FileConfigStore::<T>::new(base_dir, solver_id)?;
-		//     Ok(Box::new(store))
-		// },
+	if solver_id.is_empty() {
+		return Err(ConfigStoreError::Configuration(
+			"Solver ID cannot be empty".to_string(),
+		));
 	}
+
+	let storage: Arc<dyn StorageInterface> = match config {
+		ConfigStoreConfig::Storage(s) => s,
+		ConfigStoreConfig::Redis { url } => {
+			if url.is_empty() {
+				return Err(ConfigStoreError::Configuration(
+					"Redis URL cannot be empty".to_string(),
+				));
+			}
+			let redis_config = toml::Value::Table({
+				let mut table = toml::map::Map::new();
+				table.insert("redis_url".to_string(), toml::Value::String(url));
+				table
+			});
+			Arc::from(
+				implementations::redis::create_storage(&redis_config)
+					.map_err(|e| ConfigStoreError::Configuration(e.to_string()))?,
+			)
+		},
+		ConfigStoreConfig::Memory => {
+			let config = toml::Value::Table(toml::map::Map::new());
+			Arc::from(
+				implementations::memory::create_storage(&config)
+					.map_err(|e| ConfigStoreError::Configuration(e.to_string()))?,
+			)
+		},
+	};
+
+	let store = StorageConfigStore::<T>::new(storage, solver_id)?;
+	Ok(Box::new(store))
 }
 
 /// Convenience function to create a Redis config store.
@@ -227,6 +274,213 @@ where
 	T: Serialize + for<'de> Deserialize<'de> + Send + Sync + Clone + 'static,
 {
 	create_config_store(ConfigStoreConfig::Redis { url: redis_url }, solver_id)
+}
+
+// =============================================================================
+// StorageConfigStore - ConfigStore implementation over StorageInterface
+// =============================================================================
+
+/// Key prefix for configuration storage.
+const CONFIG_KEY_PREFIX: &str = "config";
+
+/// ConfigStore implementation backed by any [`StorageInterface`].
+///
+/// This is a thin wrapper that adds:
+/// - JSON serialization with [`Versioned<T>`](solver_types::Versioned)
+/// - Optimistic locking via `compare_and_swap`
+/// - Atomic seeding via `set_nx`
+///
+/// Version management is handled in this struct, not in the storage layer.
+pub struct StorageConfigStore<T> {
+	/// Underlying storage backend
+	storage: Arc<dyn StorageInterface>,
+	/// Solver ID for key namespacing
+	solver_id: String,
+	/// Storage key for this solver's config
+	key: String,
+	/// Phantom data for type parameter
+	_phantom: PhantomData<T>,
+}
+
+impl<T> StorageConfigStore<T>
+where
+	T: Serialize + for<'de> Deserialize<'de> + Send + Sync + Clone,
+{
+	/// Creates a new StorageConfigStore.
+	///
+	/// # Arguments
+	///
+	/// * `storage` - The underlying storage backend
+	/// * `solver_id` - Unique identifier for this solver
+	pub fn new(
+		storage: Arc<dyn StorageInterface>,
+		solver_id: String,
+	) -> Result<Self, ConfigStoreError> {
+		if solver_id.is_empty() {
+			return Err(ConfigStoreError::Configuration(
+				"Solver ID cannot be empty".to_string(),
+			));
+		}
+
+		let key = format!("{}:{}", CONFIG_KEY_PREFIX, solver_id);
+
+		Ok(Self {
+			storage,
+			solver_id,
+			key,
+			_phantom: PhantomData,
+		})
+	}
+
+	/// Serialize a versioned config to bytes.
+	fn serialize(&self, versioned: &Versioned<T>) -> Result<Vec<u8>, ConfigStoreError> {
+		serde_json::to_vec(versioned)
+			.map_err(|e| ConfigStoreError::Serialization(format!("Failed to serialize: {}", e)))
+	}
+
+	/// Deserialize bytes to a versioned config.
+	fn deserialize(&self, bytes: &[u8]) -> Result<Versioned<T>, ConfigStoreError> {
+		serde_json::from_slice(bytes)
+			.map_err(|e| ConfigStoreError::Serialization(format!("Failed to deserialize: {}", e)))
+	}
+}
+
+impl<T> std::fmt::Debug for StorageConfigStore<T> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("StorageConfigStore")
+			.field("solver_id", &self.solver_id)
+			.field("key", &self.key)
+			.finish()
+	}
+}
+
+#[async_trait]
+impl<T> ConfigStore<T> for StorageConfigStore<T>
+where
+	T: Serialize + for<'de> Deserialize<'de> + Send + Sync + Clone,
+{
+	async fn get(&self) -> Result<Versioned<T>, ConfigStoreError> {
+		let bytes = self
+			.storage
+			.get_bytes(&self.key)
+			.await
+			.map_err(|e| match e {
+				StorageError::NotFound(_) => ConfigStoreError::NotFound(self.solver_id.clone()),
+				other => ConfigStoreError::Backend(other.to_string()),
+			})?;
+
+		let versioned = self.deserialize(&bytes)?;
+		debug!(
+			key = %self.key,
+			version = versioned.version,
+			"retrieved config"
+		);
+		Ok(versioned)
+	}
+
+	async fn seed(&self, config: T) -> Result<Versioned<T>, ConfigStoreError> {
+		let versioned = Versioned::new(config);
+		let bytes = self.serialize(&versioned)?;
+
+		// Use set_nx for atomic "create if not exists"
+		let created = self
+			.storage
+			.set_nx(&self.key, bytes, None)
+			.await
+			.map_err(|e| ConfigStoreError::Backend(e.to_string()))?;
+
+		if !created {
+			return Err(ConfigStoreError::AlreadyExists(self.solver_id.clone()));
+		}
+
+		debug!(
+			key = %self.key,
+			version = versioned.version,
+			"seeded config"
+		);
+		Ok(versioned)
+	}
+
+	async fn update(
+		&self,
+		config: T,
+		expected_version: u64,
+	) -> Result<Versioned<T>, ConfigStoreError> {
+		// Get current value to compare
+		let current_bytes = self
+			.storage
+			.get_bytes(&self.key)
+			.await
+			.map_err(|e| match e {
+				StorageError::NotFound(_) => ConfigStoreError::NotFound(self.solver_id.clone()),
+				other => ConfigStoreError::Backend(other.to_string()),
+			})?;
+
+		let current: Versioned<T> = self.deserialize(&current_bytes)?;
+
+		// Check version
+		if current.version != expected_version {
+			return Err(ConfigStoreError::VersionMismatch {
+				expected: expected_version,
+				found: current.version,
+			});
+		}
+
+		// Create new versioned config
+		let mut new_versioned = Versioned::new(config);
+		new_versioned.version = expected_version + 1;
+		let new_bytes = self.serialize(&new_versioned)?;
+
+		// Atomic compare-and-swap
+		let swapped = self
+			.storage
+			.compare_and_swap(&self.key, &current_bytes, new_bytes, None)
+			.await
+			.map_err(|e| match e {
+				StorageError::NotFound(_) => ConfigStoreError::NotFound(self.solver_id.clone()),
+				other => ConfigStoreError::Backend(other.to_string()),
+			})?;
+
+		if !swapped {
+			// Value changed between get and CAS - re-read to get actual version
+			let actual_bytes = self
+				.storage
+				.get_bytes(&self.key)
+				.await
+				.map_err(|e| ConfigStoreError::Backend(e.to_string()))?;
+			let actual: Versioned<T> = self.deserialize(&actual_bytes)?;
+
+			return Err(ConfigStoreError::VersionMismatch {
+				expected: expected_version,
+				found: actual.version,
+			});
+		}
+
+		debug!(
+			key = %self.key,
+			old_version = expected_version,
+			new_version = new_versioned.version,
+			"updated config"
+		);
+		Ok(new_versioned)
+	}
+
+	async fn exists(&self) -> Result<bool, ConfigStoreError> {
+		self.storage
+			.exists(&self.key)
+			.await
+			.map_err(|e| ConfigStoreError::Backend(e.to_string()))
+	}
+
+	async fn delete(&self) -> Result<(), ConfigStoreError> {
+		self.storage
+			.delete(&self.key)
+			.await
+			.map_err(|e| ConfigStoreError::Backend(e.to_string()))?;
+
+		debug!(key = %self.key, "deleted config");
+		Ok(())
+	}
 }
 
 #[cfg(test)]
@@ -306,6 +560,106 @@ mod integration_tests {
 
 		// Cleanup
 		store.delete().await.unwrap();
+	}
+
+	// ==================== Memory Backend Tests (No Redis Required) ====================
+
+	#[tokio::test]
+	async fn test_memory_config_store_lifecycle() {
+		let solver_id = unique_solver_id();
+		let store = create_config_store::<TestConfig>(ConfigStoreConfig::Memory, solver_id.clone())
+			.expect("Failed to create memory store");
+
+		// 1. Should not exist initially
+		assert!(!store.exists().await.unwrap());
+
+		// 2. Seed config
+		let config = create_test_config(&solver_id);
+		let seeded = store.seed(config.clone()).await.unwrap();
+		assert_eq!(seeded.version, 1);
+		assert_eq!(seeded.data.solver_id, solver_id);
+
+		// 3. Should exist now
+		assert!(store.exists().await.unwrap());
+
+		// 4. Get config
+		let retrieved = store.get().await.unwrap();
+		assert_eq!(retrieved.version, 1);
+		assert_eq!(retrieved.data, config);
+
+		// 5. Update config
+		let mut updated_config = config.clone();
+		updated_config.version = 42;
+		let updated = store.update(updated_config.clone(), 1).await.unwrap();
+		assert_eq!(updated.version, 2);
+		assert_eq!(updated.data.version, 42);
+
+		// 6. Delete
+		store.delete().await.unwrap();
+		assert!(!store.exists().await.unwrap());
+	}
+
+	#[tokio::test]
+	async fn test_memory_seed_already_exists() {
+		let solver_id = unique_solver_id();
+		let store = create_config_store::<TestConfig>(ConfigStoreConfig::Memory, solver_id.clone())
+			.unwrap();
+
+		let config = create_test_config(&solver_id);
+
+		// First seed should succeed
+		store.seed(config.clone()).await.unwrap();
+
+		// Second seed should fail
+		let result = store.seed(config).await;
+		assert!(matches!(
+			result.unwrap_err(),
+			ConfigStoreError::AlreadyExists(_)
+		));
+	}
+
+	#[tokio::test]
+	async fn test_memory_update_version_mismatch() {
+		let solver_id = unique_solver_id();
+		let store = create_config_store::<TestConfig>(ConfigStoreConfig::Memory, solver_id.clone())
+			.unwrap();
+
+		let config = create_test_config(&solver_id);
+		store.seed(config.clone()).await.unwrap();
+
+		// Update with wrong version
+		let mut updated = config.clone();
+		updated.version = 999;
+		let result = store.update(updated, 5).await; // Wrong version
+
+		assert!(matches!(
+			result.unwrap_err(),
+			ConfigStoreError::VersionMismatch {
+				expected: 5,
+				found: 1
+			}
+		));
+	}
+
+	#[tokio::test]
+	async fn test_memory_get_not_found() {
+		let solver_id = unique_solver_id();
+		let store = create_config_store::<TestConfig>(ConfigStoreConfig::Memory, solver_id.clone())
+			.unwrap();
+
+		let result = store.get().await;
+		assert!(matches!(result.unwrap_err(), ConfigStoreError::NotFound(_)));
+	}
+
+	#[tokio::test]
+	async fn test_memory_update_not_found() {
+		let solver_id = unique_solver_id();
+		let store = create_config_store::<TestConfig>(ConfigStoreConfig::Memory, solver_id.clone())
+			.unwrap();
+
+		let config = create_test_config(&solver_id);
+		let result = store.update(config, 1).await;
+		assert!(matches!(result.unwrap_err(), ConfigStoreError::NotFound(_)));
 	}
 
 	// ==================== Unit Tests ====================
@@ -597,7 +951,7 @@ mod integration_tests {
 	#[ignore] // Requires running Redis
 	async fn test_redis_seed_get_update_flow() {
 		let solver_id = unique_solver_id();
-		let store = RedisConfigStore::<TestConfig>::with_defaults(
+		let store = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
 		)

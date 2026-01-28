@@ -26,7 +26,6 @@ use thiserror::Error;
 
 /// Re-export implementations
 pub mod implementations {
-	pub mod config;
 	pub mod file;
 	pub mod memory;
 	pub mod redis;
@@ -102,6 +101,16 @@ pub enum StorageError {
 /// This trait must be implemented by any storage backend that wants to
 /// integrate with the solver system. It provides basic key-value operations
 /// with optional TTL support and querying capabilities.
+///
+/// # Atomic Operations
+///
+/// This trait includes atomic operations for concurrent access patterns:
+/// - [`set_nx`](StorageInterface::set_nx): Set if not exists (for initialization)
+/// - [`compare_and_swap`](StorageInterface::compare_and_swap): Atomic CAS on raw bytes
+/// - [`delete_if_exists`](StorageInterface::delete_if_exists): Atomic delete returning existence
+///
+/// These are low-level byte operations - higher-level logic (JSON parsing,
+/// versioning) should be handled by wrapper stores like `ConfigStore`.
 #[async_trait]
 #[cfg_attr(feature = "testing", mockall::automock)]
 pub trait StorageInterface: Send + Sync {
@@ -157,6 +166,75 @@ pub trait StorageInterface: Send + Sync {
 	async fn cleanup_expired(&self) -> Result<usize, StorageError> {
 		Ok(0) // Default implementation for backends without TTL support
 	}
+
+	// ==================== Atomic Operations ====================
+
+	/// Set a value only if the key does not exist.
+	///
+	/// Returns `Ok(true)` if set successfully, `Ok(false)` if key already exists.
+	///
+	/// # Atomicity
+	///
+	/// - **Redis**: Uses native `SETNX` / `SET NX EX` (truly atomic)
+	/// - **Memory**: Uses `RwLock` (atomic within process)
+	/// - **File**: Best-effort with file locking
+	///
+	/// # Arguments
+	///
+	/// * `key` - The key to set
+	/// * `value` - The value to store
+	/// * `ttl` - Optional time-to-live for the key
+	async fn set_nx(
+		&self,
+		key: &str,
+		value: Vec<u8>,
+		ttl: Option<Duration>,
+	) -> Result<bool, StorageError>;
+
+	/// Atomic compare-and-swap on raw bytes.
+	///
+	/// Only updates if the current value exactly equals `expected`.
+	///
+	/// # Returns
+	///
+	/// - `Ok(true)` if swapped successfully
+	/// - `Ok(false)` if current value doesn't match expected
+	/// - `Err(NotFound)` if key doesn't exist
+	///
+	/// # Arguments
+	///
+	/// * `key` - The key to update
+	/// * `expected` - The expected current value (exact byte comparison)
+	/// * `new_value` - The new value to set if comparison succeeds
+	/// * `ttl` - Optional TTL for the new value (preserves or sets TTL)
+	///
+	/// # Atomicity
+	///
+	/// - **Redis**: Uses Lua script for atomic operation
+	/// - **Memory**: Uses `RwLock` (atomic within process)
+	async fn compare_and_swap(
+		&self,
+		key: &str,
+		expected: &[u8],
+		new_value: Vec<u8>,
+		ttl: Option<Duration>,
+	) -> Result<bool, StorageError>;
+
+	/// Delete a key and return whether it existed.
+	///
+	/// Useful for single-use tokens like nonces where you need to
+	/// atomically check existence and delete in one operation.
+	///
+	/// # Returns
+	///
+	/// - `Ok(true)` if key existed and was deleted
+	/// - `Ok(false)` if key didn't exist
+	///
+	/// # Atomicity
+	///
+	/// - **Redis**: `DEL` returns count of deleted keys (atomic)
+	/// - **Memory**: Uses `RwLock` (atomic within process)
+	async fn delete_if_exists(&self, key: &str) -> Result<bool, StorageError>;
 }
 
 /// Type alias for storage factory functions.

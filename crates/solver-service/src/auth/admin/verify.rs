@@ -134,15 +134,6 @@ impl AdminActionVerifier {
 	}
 }
 
-/// Result of a successful admin action verification.
-#[derive(Debug)]
-pub struct VerifiedAdminAction<T> {
-	/// The verified admin address
-	pub admin: Address,
-	/// The action contents
-	pub action: T,
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
