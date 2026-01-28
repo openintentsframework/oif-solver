@@ -12,16 +12,26 @@
 
 use axum::{extract::State, Json};
 use serde::Serialize;
+use solver_config::Config;
+use solver_storage::config_store::{ConfigStore, ConfigStoreError};
+use solver_types::{OperatorConfig, OperatorToken};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::auth::admin::{
 	AddTokenContents, AdminActionVerifier, AdminAuthError, SignedAdminRequest,
 };
+use crate::config_merge::build_runtime_config;
 
 /// Shared state for admin endpoints.
 #[derive(Clone)]
 pub struct AdminApiState {
+	/// Verifier for EIP-712 admin signatures.
 	pub verifier: Arc<AdminActionVerifier>,
+	/// ConfigStore for persisting OperatorConfig to Redis.
+	pub config_store: Arc<dyn ConfigStore<OperatorConfig>>,
+	/// Shared runtime config that gets hot-reloaded.
+	pub shared_config: Arc<RwLock<Config>>,
 }
 
 /// Response for nonce generation.
@@ -86,11 +96,65 @@ pub async fn handle_add_token(
 	State(state): State<AdminApiState>,
 	Json(request): Json<SignedAdminRequest<AddTokenContents>>,
 ) -> Result<Json<AdminActionResponse>, AdminAuthError> {
-	// Verify the signature - nonce is extracted from the signed contents
+	// 1. Verify the signature - nonce is extracted from the signed contents
 	let admin = state
 		.verifier
 		.verify(&request.contents, &request.signature)
 		.await?;
+
+	// 2. Get current OperatorConfig from Redis
+	let versioned = state.config_store.get().await.map_err(config_store_error)?;
+
+	// 3. Find network and add token
+	let mut operator_config = versioned.data;
+	let network = operator_config
+		.networks
+		.get_mut(&request.contents.chain_id)
+		.ok_or_else(|| {
+			AdminAuthError::InvalidMessage(format!(
+				"Network {} not found",
+				request.contents.chain_id
+			))
+		})?;
+
+	// 4. Check for duplicates
+	if network.has_token(&request.contents.token_address) {
+		return Err(AdminAuthError::InvalidMessage(format!(
+			"Token {} already exists on chain {}",
+			request.contents.symbol, request.contents.chain_id
+		)));
+	}
+
+	// 5. Add token to OperatorConfig
+	network.tokens.push(OperatorToken {
+		symbol: request.contents.symbol.clone(),
+		address: request.contents.token_address,
+		decimals: request.contents.decimals,
+	});
+
+	// 6. Save to Redis with optimistic locking
+	let new_versioned = state
+		.config_store
+		.update(operator_config.clone(), versioned.version)
+		.await
+		.map_err(|e| match e {
+			ConfigStoreError::VersionMismatch { .. } => {
+				AdminAuthError::Internal("Config was modified, please retry".to_string())
+			}
+			other => config_store_error(other),
+		})?;
+
+	// 7. HOT RELOAD: Rebuild runtime Config from updated OperatorConfig
+	let new_config = build_runtime_config(&new_versioned.data)
+		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {}", e)))?;
+	*state.shared_config.write().await = new_config;
+
+	tracing::info!(
+		version = new_versioned.version,
+		token = %request.contents.symbol,
+		chain_id = request.contents.chain_id,
+		"Token added and config hot-reloaded"
+	);
 
 	Ok(Json(AdminActionResponse {
 		success: true,
@@ -100,6 +164,33 @@ pub async fn handle_add_token(
 		),
 		admin: format!("{:?}", admin),
 	}))
+}
+
+/// Convert ConfigStoreError to AdminAuthError.
+fn config_store_error(err: ConfigStoreError) -> AdminAuthError {
+	match err {
+		ConfigStoreError::NotFound(msg) => {
+			AdminAuthError::Internal(format!("Configuration not found: {}", msg))
+		}
+		ConfigStoreError::VersionMismatch { expected, found } => AdminAuthError::Internal(
+			format!(
+				"Configuration was modified concurrently (expected version {}, found {}), please retry",
+				expected, found
+			),
+		),
+		ConfigStoreError::Serialization(msg) => {
+			AdminAuthError::Internal(format!("Serialization error: {}", msg))
+		}
+		ConfigStoreError::Backend(msg) => {
+			AdminAuthError::Internal(format!("Storage error: {}", msg))
+		}
+		ConfigStoreError::Configuration(msg) => {
+			AdminAuthError::Internal(format!("Configuration error: {}", msg))
+		}
+		ConfigStoreError::AlreadyExists(msg) => {
+			AdminAuthError::Internal(format!("Configuration already exists: {}", msg))
+		}
+	}
 }
 
 /// EIP-712 type information for client-side signing.

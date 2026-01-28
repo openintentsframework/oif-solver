@@ -126,7 +126,9 @@ pub struct AddTokenContents {
 	pub symbol: String,
 	pub token_address: Address,
 	pub decimals: u8,
+	#[serde(with = "string_or_number")]
 	pub nonce: u64,
+	#[serde(with = "string_or_number")]
 	pub deadline: u64,
 }
 
@@ -184,7 +186,9 @@ impl AddTokenContents {
 pub struct RemoveTokenContents {
 	pub chain_id: u64,
 	pub token_address: Address,
+	#[serde(with = "string_or_number")]
 	pub nonce: u64,
+	#[serde(with = "string_or_number")]
 	pub deadline: u64,
 }
 
@@ -221,7 +225,9 @@ pub struct WithdrawContents {
 	pub token: Address,
 	pub amount: String, // String to handle large numbers in JSON
 	pub recipient: Address,
+	#[serde(with = "string_or_number")]
 	pub nonce: u64,
+	#[serde(with = "string_or_number")]
 	pub deadline: u64,
 }
 
@@ -361,6 +367,38 @@ mod hex_signature {
 		let s = String::deserialize(deserializer)?;
 		let s = s.strip_prefix("0x").unwrap_or(&s);
 		hex::decode(s).map_err(serde::de::Error::custom)
+	}
+}
+
+/// Helper module for deserializing u64 from either number or string.
+/// This handles JavaScript's precision issues with large numbers (>2^53-1).
+mod string_or_number {
+	use serde::{self, Deserialize, Deserializer, Serializer};
+
+	pub fn serialize<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		serializer.serialize_u64(*value)
+	}
+
+	pub fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		#[derive(Deserialize)]
+		#[serde(untagged)]
+		enum StringOrNumber {
+			String(String),
+			Number(u64),
+		}
+
+		match StringOrNumber::deserialize(deserializer)? {
+			StringOrNumber::String(s) => {
+				s.parse::<u64>().map_err(serde::de::Error::custom)
+			},
+			StringOrNumber::Number(n) => Ok(n),
+		}
 	}
 }
 
@@ -508,5 +546,63 @@ mod tests {
 		// Should fail
 		let result = contents.struct_hash();
 		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_nonce_deserialize_from_string() {
+		// Test that nonce/deadline can be deserialized from strings (for JavaScript precision)
+		let json = r#"{
+			"chainId": 10,
+			"symbol": "USDC",
+			"tokenAddress": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
+			"decimals": 6,
+			"nonce": "12345678901234567890",
+			"deadline": "1706184000"
+		}"#;
+
+		let contents: AddTokenContents = serde_json::from_str(json).unwrap();
+		assert_eq!(contents.nonce, 12345678901234567890u64);
+		assert_eq!(contents.deadline, 1706184000);
+	}
+
+	#[test]
+	fn test_nonce_deserialize_from_number() {
+		// Test that nonce/deadline can still be deserialized from numbers
+		let json = r#"{
+			"chainId": 10,
+			"symbol": "USDC",
+			"tokenAddress": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
+			"decimals": 6,
+			"nonce": 123456,
+			"deadline": 1706184000
+		}"#;
+
+		let contents: AddTokenContents = serde_json::from_str(json).unwrap();
+		assert_eq!(contents.nonce, 123456);
+		assert_eq!(contents.deadline, 1706184000);
+	}
+
+	#[test]
+	fn test_signed_request_with_string_nonce() {
+		// Test full request deserialization with string nonce (what frontend sends)
+		let json = r#"{
+			"signature": "0xabababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab1b",
+			"contents": {
+				"chainId": 84532,
+				"symbol": "USDT",
+				"tokenAddress": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+				"decimals": 6,
+				"nonce": "1737925846892",
+				"deadline": "1737929446"
+			}
+		}"#;
+
+		let request: SignedAdminRequest<AddTokenContents> =
+			serde_json::from_str(json).unwrap();
+		assert_eq!(request.contents.chain_id, 84532);
+		assert_eq!(request.contents.symbol, "USDT");
+		assert_eq!(request.contents.nonce, 1737925846892);
+		assert_eq!(request.contents.deadline, 1737929446);
+		assert_eq!(request.signature.len(), 65);
 	}
 }

@@ -10,10 +10,12 @@ use axum::{
 	Json,
 };
 use serde::Serialize;
+use solver_config::Config;
 use solver_core::SolverEngine;
 use solver_types::with_0x_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Response structure for all supported tokens across all networks.
 #[derive(Debug, Serialize)]
@@ -89,6 +91,71 @@ pub async fn get_tokens_for_chain(
 	let networks = solver.token_manager().get_networks();
 
 	match networks.get(&chain_id) {
+		Some(network) => Ok(Json(NetworkTokens {
+			chain_id,
+			input_settler: with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
+			output_settler: with_0x_prefix(&hex::encode(&network.output_settler_address.0)),
+			tokens: network
+				.tokens
+				.iter()
+				.map(|t| TokenInfo {
+					address: with_0x_prefix(&hex::encode(&t.address.0)),
+					symbol: t.symbol.clone(),
+					decimals: t.decimals,
+				})
+				.collect(),
+		})),
+		None => Err(StatusCode::NOT_FOUND),
+	}
+}
+
+/// Handles GET /api/v1/tokens requests using shared_config.
+///
+/// Returns all supported tokens across all configured networks.
+/// This version reads from shared_config to support hot reload.
+pub async fn get_tokens_from_config(
+	State(shared_config): State<Arc<RwLock<Config>>>,
+) -> Json<TokensResponse> {
+	let config = shared_config.read().await;
+
+	let mut response = TokensResponse {
+		networks: HashMap::new(),
+	};
+
+	for (chain_id, network) in &config.networks {
+		response.networks.insert(
+			chain_id.to_string(),
+			NetworkTokens {
+				chain_id: *chain_id,
+				input_settler: with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
+				output_settler: with_0x_prefix(&hex::encode(&network.output_settler_address.0)),
+				tokens: network
+					.tokens
+					.iter()
+					.map(|t| TokenInfo {
+						address: with_0x_prefix(&hex::encode(&t.address.0)),
+						symbol: t.symbol.clone(),
+						decimals: t.decimals,
+					})
+					.collect(),
+			},
+		);
+	}
+
+	Json(response)
+}
+
+/// Handles GET /api/v1/tokens/{chain_id} requests using shared_config.
+///
+/// Returns supported tokens for a specific chain.
+/// This version reads from shared_config to support hot reload.
+pub async fn get_tokens_for_chain_from_config(
+	Path(chain_id): Path<u64>,
+	State(shared_config): State<Arc<RwLock<Config>>>,
+) -> Result<Json<NetworkTokens>, StatusCode> {
+	let config = shared_config.read().await;
+
+	match config.networks.get(&chain_id) {
 		Some(network) => Ok(Json(NetworkTokens {
 			chain_id,
 			input_settler: with_0x_prefix(&hex::encode(&network.input_settler_address.0)),

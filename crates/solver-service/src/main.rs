@@ -29,10 +29,13 @@
 use clap::Parser;
 use solver_config::Config;
 use solver_service::{
-	build_solver_from_config, config_merge::merge_config, seeds::SeedPreset, server,
+	build_solver_from_config,
+	config_merge::{build_runtime_config, config_to_operator_config, merge_config},
+	seeds::SeedPreset,
+	server,
 };
 use solver_storage::{config_store::create_config_store, StoreConfig};
-use solver_types::SeedOverrides;
+use solver_types::{OperatorConfig, SeedOverrides};
 use std::sync::Arc;
 
 /// Command-line arguments for the solver service.
@@ -145,57 +148,66 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 		// Parse seed overrides
 		let seed_overrides = parse_seed_overrides(seed_overrides_str)?;
 
-		// Merge seed + overrides
+		// Merge seed + overrides to get Config, then convert to OperatorConfig
 		tracing::info!("Merging seed overrides with {} seed", seed_name);
 		let merged_config = merge_config(seed_overrides, seed)?;
+		let operator_config = config_to_operator_config(&merged_config)?;
+		let solver_id = operator_config.solver_id.clone();
 
-		// Create config store for seeding
-		let config_store = create_config_store::<Config>(
+		// Create OperatorConfig store for seeding (not legacy Config store)
+		let operator_store = create_config_store::<OperatorConfig>(
 			StoreConfig::Redis {
 				url: redis_url.clone(),
 			},
-			merged_config.solver.id.clone(),
+			format!("{}-operator", solver_id),
 		)?;
 
-		// Check if we should seed
-		let exists = config_store.exists().await?;
-		let should_seed = args.force_seed || !exists;
+		// Check if OperatorConfig already exists
+		let exists = operator_store.exists().await?;
 
-		if should_seed {
-			if exists && args.force_seed {
-				tracing::warn!("Force seeding: deleting existing configuration");
-				config_store.delete().await?;
-			}
+		if exists && !args.force_seed {
+			// OperatorConfig exists, skip seeding and load existing
+			tracing::warn!(
+				"OperatorConfig already exists for solver '{}'. Use --force-seed to overwrite.",
+				solver_id
+			);
 
-			tracing::info!("Seeding configuration to Redis");
-			let versioned = config_store.seed(merged_config).await?;
-			let solver_id = &versioned.data.solver.id;
+			let versioned = operator_store.get().await?;
+			let config = build_runtime_config(&versioned.data)?;
 
-			// Print prominent output for the solver ID
-			tracing::info!("════════════════════════════════════════════════════════════");
-			tracing::info!("  Configuration seeded successfully!");
-			tracing::info!("  SOLVER_ID: {}", solver_id);
-			tracing::info!("  Version:   {}", versioned.version);
-			tracing::info!("  For subsequent runs, set:");
-			tracing::info!("    export SOLVER_ID={}", solver_id);
-			tracing::info!("════════════════════════════════════════════════════════════");
-
-			return Ok(versioned.into_inner());
-		} else {
-			// Load existing config first to display the correct solver_id
-			let versioned = config_store.get().await?;
-			let existing_config = versioned.into_inner();
-
-			// Print info about existing config
 			tracing::info!("════════════════════════════════════════════════════════════");
 			tracing::info!("  Configuration already exists (skipping seed)");
 			tracing::info!("════════════════════════════════════════════════════════════");
-			tracing::info!("  SOLVER_ID: {}", existing_config.solver.id);
+			tracing::info!("  SOLVER_ID: {}", solver_id);
+			tracing::info!("  Version:   {}", versioned.version);
 			tracing::info!("  Use --force-seed to overwrite existing configuration");
 			tracing::info!("════════════════════════════════════════════════════════════");
 
-			return Ok(existing_config);
+			return Ok(config);
 		}
+
+		// Proceed with seeding (new or force)
+		if exists && args.force_seed {
+			tracing::warn!("Force seeding: overwriting existing OperatorConfig");
+			operator_store.delete().await?;
+		}
+
+		tracing::info!("Seeding OperatorConfig to Redis");
+		let versioned = operator_store.seed(operator_config).await?;
+
+		// Build runtime Config from OperatorConfig
+		let config = build_runtime_config(&versioned.data)?;
+
+		// Print prominent output for the solver ID
+		tracing::info!("════════════════════════════════════════════════════════════");
+		tracing::info!("  Configuration seeded successfully!");
+		tracing::info!("  SOLVER_ID: {}", solver_id);
+		tracing::info!("  Version:   {}", versioned.version);
+		tracing::info!("  For subsequent runs, set:");
+		tracing::info!("    export SOLVER_ID={}", solver_id);
+		tracing::info!("════════════════════════════════════════════════════════════");
+
+		return Ok(config);
 	}
 
 	// Try to load from Redis
@@ -211,16 +223,69 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 
 	tracing::info!("Loading configuration from Redis for solver: {}", solver_id);
 
+	// First, try to load OperatorConfig (admin API may have modified it)
+	let operator_store = create_config_store::<OperatorConfig>(
+		StoreConfig::Redis {
+			url: redis_url.clone(),
+		},
+		format!("{}-operator", solver_id),
+	)?;
+
+	if operator_store.exists().await? {
+		// OperatorConfig exists - this is the expected path for admin API changes
+		match operator_store.get().await {
+			Ok(versioned) => {
+				tracing::info!(
+					"Loaded OperatorConfig from Redis: version={} (admin API changes will be applied)",
+					versioned.version
+				);
+
+				// Build runtime Config from OperatorConfig - fail loudly if invalid
+				match build_runtime_config(&versioned.data) {
+					Ok(config) => return Ok(config),
+					Err(e) => {
+						// OperatorConfig exists but is invalid - fail with clear error
+						return Err(format!(
+							"OperatorConfig in Redis is invalid: {}. \
+							Fix the config or delete key '{}-operator' to re-seed.",
+							e, solver_id
+						)
+						.into());
+					},
+				}
+			},
+			Err(e) => {
+				// OperatorConfig exists but failed to load (corrupted?)
+				return Err(format!(
+					"Failed to load OperatorConfig from Redis: {}. \
+					Check Redis connectivity or delete key '{}-operator' to re-seed.",
+					e, solver_id
+				)
+				.into());
+			},
+		}
+	}
+
+	// Fall back to loading Config directly (backward compatibility for existing deployments)
+	tracing::info!("No OperatorConfig found, loading legacy Config directly");
 	let config_store =
-		create_config_store::<Config>(StoreConfig::Redis { url: redis_url }, solver_id)?;
-	let versioned = config_store.get().await?;
+		create_config_store::<Config>(StoreConfig::Redis { url: redis_url }, solver_id.clone())?;
 
-	tracing::info!(
-		"Loaded configuration from Redis: version={}",
-		versioned.version
-	);
-
-	Ok(versioned.into_inner())
+	match config_store.get().await {
+		Ok(versioned) => {
+			tracing::info!(
+				"Loaded legacy configuration from Redis: version={}",
+				versioned.version
+			);
+			Ok(versioned.into_inner())
+		},
+		Err(e) => Err(format!(
+			"No configuration found for solver '{}': {}. \
+			Use --seed <preset> --seed-overrides <json> to create initial configuration.",
+			solver_id, e
+		)
+		.into()),
+	}
 }
 
 /// Parse seed overrides from a JSON string or file path.

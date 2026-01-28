@@ -176,6 +176,7 @@ mod tests {
 		let admin_config = AdminConfig {
 			enabled: true,
 			domain: "test.example.com".to_string(),
+			chain_id: Some(1),
 			nonce_ttl_seconds: 300,
 			admin_addresses: vec![admin_address],
 		};
@@ -220,6 +221,7 @@ mod tests {
 		let admin_config = AdminConfig {
 			enabled: true,
 			domain: "test.example.com".to_string(),
+			chain_id: Some(1),
 			nonce_ttl_seconds: 300,
 			admin_addresses: vec![admin_address],
 		};
@@ -256,6 +258,7 @@ mod tests {
 		let admin_config = AdminConfig {
 			enabled: true,
 			domain: "test.example.com".to_string(),
+			chain_id: Some(1),
 			nonce_ttl_seconds: 300,
 			admin_addresses: vec![other_address], // Different address
 		};

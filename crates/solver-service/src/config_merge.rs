@@ -30,8 +30,10 @@ use solver_config::{
 	StorageConfig, StrategyConfig,
 };
 use solver_types::{
-	networks::RpcEndpoint, NetworkConfig, NetworkOverride, NetworksConfig, SeedOverrides,
-	TokenConfig,
+	networks::RpcEndpoint, NetworkConfig, NetworkOverride, NetworksConfig, OperatorAdminConfig,
+	OperatorConfig, OperatorGasConfig, OperatorGasFlowUnits, OperatorHyperlaneConfig,
+	OperatorNetworkConfig, OperatorOracleConfig, OperatorPricingConfig, OperatorRpcEndpoint,
+	OperatorSettlementConfig, OperatorSolverConfig, OperatorToken, SeedOverrides, TokenConfig,
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -132,6 +134,671 @@ pub fn merge_config(overrides: SeedOverrides, seed: &SeedConfig) -> Result<Confi
 	};
 
 	Ok(config)
+}
+
+/// Merges Seeds (Rust defaults) + Initializer (JSON) into a full OperatorConfig.
+///
+/// Called ONLY on first boot. The result is stored in Redis and becomes the
+/// source of truth for all subsequent boots.
+///
+/// # Arguments
+///
+/// * `initializer` - User-provided seed overrides with chain IDs and tokens
+/// * `seed` - Hardcoded seed configuration with contract addresses and defaults
+///
+/// # Returns
+///
+/// A complete `OperatorConfig` ready to be stored in Redis.
+pub fn merge_to_operator_config(
+	initializer: SeedOverrides,
+	seed: &SeedConfig,
+) -> Result<OperatorConfig, MergeError> {
+	// Check for duplicate chain IDs
+	let mut seen_chain_ids = std::collections::HashSet::new();
+	for network in &initializer.networks {
+		if !seen_chain_ids.insert(network.chain_id) {
+			return Err(MergeError::DuplicateChainId(network.chain_id));
+		}
+	}
+
+	// Validate we have at least 2 unique networks
+	if seen_chain_ids.len() < 2 {
+		return Err(MergeError::InsufficientNetworks);
+	}
+
+	// Validate all chain IDs exist in seed and have tokens
+	for network in &initializer.networks {
+		if !seed.supports_chain(network.chain_id) {
+			return Err(MergeError::UnknownChainId(
+				network.chain_id,
+				seed.supported_chain_ids(),
+			));
+		}
+		if network.tokens.is_empty() {
+			return Err(MergeError::NoTokens(network.chain_id));
+		}
+	}
+
+	// Use provided solver_id or generate a new one
+	let solver_id = initializer
+		.solver_id
+		.clone()
+		.unwrap_or_else(|| format!("solver-{}", Uuid::new_v4()));
+
+	// Build operator networks config
+	let networks = build_operator_networks_config(&initializer.networks, seed)?;
+
+	// Get chain IDs for hyperlane config
+	let chain_ids: Vec<u64> = initializer.networks.iter().map(|n| n.chain_id).collect();
+
+	// Build hyperlane config
+	let hyperlane = build_operator_hyperlane_config(&chain_ids, seed);
+
+	// Build admin config from initializer
+	let admin = match &initializer.admin {
+		Some(admin_override) => OperatorAdminConfig {
+			enabled: admin_override.enabled,
+			domain: admin_override.domain.clone(),
+			chain_id: admin_override.chain_id.unwrap_or(chain_ids[0]),
+			nonce_ttl_seconds: admin_override.nonce_ttl_seconds.unwrap_or(300),
+			admin_addresses: admin_override.admin_addresses.clone(),
+		},
+		None => OperatorAdminConfig::default(),
+	};
+
+	Ok(OperatorConfig {
+		solver_id,
+		networks,
+		settlement: OperatorSettlementConfig {
+			settlement_poll_interval_seconds: seed.defaults.settlement_poll_interval_seconds,
+			hyperlane,
+		},
+		gas: OperatorGasConfig {
+			resource_lock: OperatorGasFlowUnits {
+				open: seed.defaults.gas_resource_lock.open,
+				fill: seed.defaults.gas_resource_lock.fill,
+				claim: seed.defaults.gas_resource_lock.claim,
+			},
+			permit2_escrow: OperatorGasFlowUnits {
+				open: seed.defaults.gas_permit2_escrow.open,
+				fill: seed.defaults.gas_permit2_escrow.fill,
+				claim: seed.defaults.gas_permit2_escrow.claim,
+			},
+			eip3009_escrow: OperatorGasFlowUnits {
+				open: seed.defaults.gas_eip3009_escrow.open,
+				fill: seed.defaults.gas_eip3009_escrow.fill,
+				claim: seed.defaults.gas_eip3009_escrow.claim,
+			},
+		},
+		pricing: OperatorPricingConfig {
+			primary: seed.defaults.pricing_primary.to_string(),
+			fallbacks: seed
+				.defaults
+				.pricing_fallbacks
+				.iter()
+				.map(|s| s.to_string())
+				.collect(),
+			cache_duration_seconds: seed.defaults.cache_duration_seconds,
+			custom_prices: HashMap::new(),
+		},
+		solver: OperatorSolverConfig {
+			min_profitability_pct: seed.defaults.min_profitability_pct,
+			monitoring_timeout_seconds: seed.defaults.monitoring_timeout_seconds,
+		},
+		admin,
+	})
+}
+
+/// Builds OperatorNetworkConfig HashMap from seed overrides and seed data.
+fn build_operator_networks_config(
+	overrides: &[NetworkOverride],
+	seed: &SeedConfig,
+) -> Result<HashMap<u64, OperatorNetworkConfig>, MergeError> {
+	let mut networks = HashMap::new();
+
+	for override_ in overrides {
+		let network_seed = seed.get_network(override_.chain_id).ok_or_else(|| {
+			MergeError::UnknownChainId(override_.chain_id, seed.supported_chain_ids())
+		})?;
+
+		let network_config = build_operator_network_config(network_seed, override_);
+		networks.insert(override_.chain_id, network_config);
+	}
+
+	Ok(networks)
+}
+
+/// Builds a single OperatorNetworkConfig from seed data and user overrides.
+fn build_operator_network_config(
+	seed: &NetworkSeed,
+	override_: &NetworkOverride,
+) -> OperatorNetworkConfig {
+	// Build RPC endpoints - use override if provided, otherwise use seed defaults
+	let rpc_urls = match &override_.rpc_urls {
+		Some(urls) if !urls.is_empty() => urls
+			.iter()
+			.map(|url| OperatorRpcEndpoint::http_only(url.clone()))
+			.collect(),
+		_ => seed
+			.default_rpc_urls
+			.iter()
+			.map(|url| OperatorRpcEndpoint::http_only(url.to_string()))
+			.collect(),
+	};
+
+	// Convert user tokens to OperatorToken
+	let tokens = override_
+		.tokens
+		.iter()
+		.map(|t| OperatorToken {
+			symbol: t.symbol.clone(),
+			address: t.address,
+			decimals: t.decimals,
+		})
+		.collect();
+
+	OperatorNetworkConfig {
+		chain_id: override_.chain_id,
+		name: seed.name.to_string(),
+		tokens,
+		rpc_urls,
+		input_settler_address: seed.input_settler,
+		output_settler_address: seed.output_settler,
+		input_settler_compact_address: Some(seed.input_settler_compact),
+		the_compact_address: Some(seed.the_compact),
+		allocator_address: Some(seed.allocator),
+	}
+}
+
+/// Builds the Hyperlane configuration for OperatorConfig.
+fn build_operator_hyperlane_config(chain_ids: &[u64], seed: &SeedConfig) -> OperatorHyperlaneConfig {
+	// Build mailboxes map
+	let mut mailboxes = HashMap::new();
+	for chain_id in chain_ids {
+		if let Some(network) = seed.get_network(*chain_id) {
+			mailboxes.insert(*chain_id, network.hyperlane_mailbox);
+		}
+	}
+
+	// Build IGP addresses map
+	let mut igp_addresses = HashMap::new();
+	for chain_id in chain_ids {
+		if let Some(network) = seed.get_network(*chain_id) {
+			igp_addresses.insert(*chain_id, network.hyperlane_igp);
+		}
+	}
+
+	// Build oracles map
+	let mut input_oracles = HashMap::new();
+	let mut output_oracles = HashMap::new();
+	for chain_id in chain_ids {
+		if let Some(network) = seed.get_network(*chain_id) {
+			input_oracles.insert(*chain_id, vec![network.hyperlane_oracle]);
+			output_oracles.insert(*chain_id, vec![network.hyperlane_oracle]);
+		}
+	}
+
+	// Build routes - each chain can send to all other chains
+	let mut routes = HashMap::new();
+	for chain_id in chain_ids {
+		let other_chains: Vec<u64> = chain_ids.iter().filter(|c| *c != chain_id).copied().collect();
+		routes.insert(*chain_id, other_chains);
+	}
+
+	OperatorHyperlaneConfig {
+		default_gas_limit: seed.defaults.hyperlane_default_gas_limit,
+		message_timeout_seconds: seed.defaults.hyperlane_message_timeout_seconds,
+		finalization_required: seed.defaults.hyperlane_finalization_required,
+		mailboxes,
+		igp_addresses,
+		oracles: OperatorOracleConfig {
+			input: input_oracles,
+			output: output_oracles,
+		},
+		routes,
+	}
+}
+
+/// Builds runtime Config from OperatorConfig.
+///
+/// Called on every boot (after first boot) and on hot reload.
+/// Transforms the persisted OperatorConfig into the runtime Config used by the solver.
+///
+/// # Arguments
+///
+/// * `operator_config` - The OperatorConfig loaded from Redis
+///
+/// # Returns
+///
+/// A complete `Config` ready for use by the solver.
+pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, MergeError> {
+	let chain_ids: Vec<u64> = operator_config.networks.keys().copied().collect();
+
+	// Validate we have at least 2 networks
+	if chain_ids.len() < 2 {
+		return Err(MergeError::InsufficientNetworks);
+	}
+
+	// Build networks config from OperatorConfig
+	let networks = build_networks_from_operator_config(operator_config);
+
+	// Build the full config
+	let config = Config {
+		solver: SolverConfig {
+			id: operator_config.solver_id.clone(),
+			min_profitability_pct: operator_config.solver.min_profitability_pct,
+			monitoring_timeout_seconds: operator_config.solver.monitoring_timeout_seconds,
+		},
+		networks,
+		storage: build_storage_config_from_operator(),
+		delivery: build_delivery_config_from_operator(&chain_ids),
+		account: build_account_config_from_operator(),
+		discovery: build_discovery_config_from_operator(&chain_ids),
+		order: build_order_config_from_operator(),
+		settlement: build_settlement_config_from_operator(operator_config),
+		pricing: Some(build_pricing_config_from_operator(&operator_config.pricing)),
+		api: Some(build_api_config_from_operator(&operator_config.admin)),
+		gas: Some(build_gas_config_from_operator(&operator_config.gas)),
+	};
+
+	Ok(config)
+}
+
+/// Builds NetworksConfig from OperatorConfig.
+fn build_networks_from_operator_config(operator_config: &OperatorConfig) -> NetworksConfig {
+	let mut networks = HashMap::new();
+
+	for (chain_id, op_network) in &operator_config.networks {
+		// Build RPC endpoints
+		let rpc_urls = op_network
+			.rpc_urls
+			.iter()
+			.map(|r| RpcEndpoint {
+				http: Some(r.http.clone()),
+				ws: r.ws.clone(),
+			})
+			.collect();
+
+		// Convert tokens
+		let tokens = op_network
+			.tokens
+			.iter()
+			.map(|t| TokenConfig {
+				address: solver_types::Address(t.address.as_slice().to_vec()),
+				symbol: t.symbol.clone(),
+				decimals: t.decimals,
+			})
+			.collect();
+
+		let network_config = NetworkConfig {
+			rpc_urls,
+			input_settler_address: solver_types::Address(
+				op_network.input_settler_address.as_slice().to_vec(),
+			),
+			output_settler_address: solver_types::Address(
+				op_network.output_settler_address.as_slice().to_vec(),
+			),
+			tokens,
+			input_settler_compact_address: op_network
+				.input_settler_compact_address
+				.map(|a| solver_types::Address(a.as_slice().to_vec())),
+			the_compact_address: op_network
+				.the_compact_address
+				.map(|a| solver_types::Address(a.as_slice().to_vec())),
+			allocator_address: op_network
+				.allocator_address
+				.map(|a| solver_types::Address(a.as_slice().to_vec())),
+		};
+
+		networks.insert(*chain_id, network_config);
+	}
+
+	networks
+}
+
+/// Builds StorageConfig from operator defaults.
+fn build_storage_config_from_operator() -> StorageConfig {
+	let mut implementations = HashMap::new();
+
+	// Read Redis URL from environment variable with default fallback
+	let redis_url =
+		std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+
+	// Redis implementation config
+	let redis_config = toml_table(vec![
+		("redis_url", toml::Value::String(redis_url)),
+		("key_prefix", toml::Value::String("oif-solver".to_string())),
+		("connection_timeout_ms", toml::Value::Integer(5000)),
+		("ttl_orders", toml::Value::Integer(0)),
+		("ttl_intents", toml::Value::Integer(86400)),
+		("ttl_order_by_tx_hash", toml::Value::Integer(86400)),
+	]);
+	implementations.insert("redis".to_string(), redis_config);
+
+	// Memory implementation (fallback for testing)
+	implementations.insert(
+		"memory".to_string(),
+		toml::Value::Table(toml::map::Map::new()),
+	);
+
+	StorageConfig {
+		primary: "redis".to_string(),
+		implementations,
+		cleanup_interval_seconds: 3600,
+	}
+}
+
+/// Builds DeliveryConfig from operator config.
+fn build_delivery_config_from_operator(chain_ids: &[u64]) -> DeliveryConfig {
+	let mut implementations = HashMap::new();
+
+	let network_ids_array = toml::Value::Array(
+		chain_ids
+			.iter()
+			.map(|id| toml::Value::Integer(*id as i64))
+			.collect(),
+	);
+
+	let evm_alloy_config = toml_table(vec![("network_ids", network_ids_array)]);
+	implementations.insert("evm_alloy".to_string(), evm_alloy_config);
+
+	DeliveryConfig {
+		implementations,
+		min_confirmations: 3,
+	}
+}
+
+/// Builds AccountConfig from operator defaults.
+fn build_account_config_from_operator() -> AccountConfig {
+	let mut implementations = HashMap::new();
+
+	// Read private key from environment variable and trim whitespace
+	let private_key = std::env::var("SOLVER_PRIVATE_KEY")
+		.map(|k| k.trim().to_string())
+		.unwrap_or_else(|_| "${SOLVER_PRIVATE_KEY}".to_string());
+
+	let local_config = toml_table(vec![("private_key", toml::Value::String(private_key))]);
+	implementations.insert("local".to_string(), local_config);
+
+	AccountConfig {
+		primary: "local".to_string(),
+		implementations,
+	}
+}
+
+/// Builds DiscoveryConfig from operator config.
+fn build_discovery_config_from_operator(chain_ids: &[u64]) -> DiscoveryConfig {
+	let mut implementations = HashMap::new();
+
+	let network_ids_array = toml::Value::Array(
+		chain_ids
+			.iter()
+			.map(|id| toml::Value::Integer(*id as i64))
+			.collect(),
+	);
+
+	// Onchain discovery - polls chain for new orders
+	let onchain_config = toml_table(vec![
+		("network_ids", network_ids_array.clone()),
+		("polling_interval_secs", toml::Value::Integer(5)),
+	]);
+	implementations.insert("onchain_eip7683".to_string(), onchain_config);
+
+	// Offchain discovery - receives orders via HTTP API from aggregators
+	let offchain_config = toml_table(vec![
+		("api_host", toml::Value::String("127.0.0.1".to_string())),
+		("api_port", toml::Value::Integer(8081)),
+		("network_ids", network_ids_array),
+	]);
+	implementations.insert("offchain_eip7683".to_string(), offchain_config);
+
+	DiscoveryConfig { implementations }
+}
+
+/// Builds OrderConfig from operator defaults.
+fn build_order_config_from_operator() -> OrderConfig {
+	let mut implementations = HashMap::new();
+
+	// EIP-7683 order implementation
+	implementations.insert(
+		"eip7683".to_string(),
+		toml::Value::Table(toml::map::Map::new()),
+	);
+
+	// Strategy implementations
+	let mut strategy_implementations = HashMap::new();
+	let simple_strategy_config = toml_table(vec![("max_gas_price_gwei", toml::Value::Integer(100))]);
+	strategy_implementations.insert("simple".to_string(), simple_strategy_config);
+
+	OrderConfig {
+		implementations,
+		strategy: StrategyConfig {
+			primary: "simple".to_string(),
+			implementations: strategy_implementations,
+		},
+		callback_whitelist: Vec::new(),
+		simulate_callbacks: true,
+	}
+}
+
+/// Builds SettlementConfig from OperatorConfig.
+fn build_settlement_config_from_operator(operator_config: &OperatorConfig) -> SettlementConfig {
+	let mut implementations = HashMap::new();
+
+	// Build Hyperlane settlement config from OperatorConfig
+	let hyperlane = &operator_config.settlement.hyperlane;
+	let chain_ids: Vec<u64> = operator_config.networks.keys().copied().collect();
+
+	let hyperlane_config = build_hyperlane_toml_from_operator(hyperlane, &chain_ids);
+	implementations.insert("hyperlane".to_string(), hyperlane_config);
+
+	SettlementConfig {
+		implementations,
+		settlement_poll_interval_seconds: operator_config
+			.settlement
+			.settlement_poll_interval_seconds,
+	}
+}
+
+/// Builds Hyperlane toml config from OperatorHyperlaneConfig.
+fn build_hyperlane_toml_from_operator(
+	hyperlane: &OperatorHyperlaneConfig,
+	chain_ids: &[u64],
+) -> toml::Value {
+	let mut table = toml::map::Map::new();
+
+	// Basic settings
+	table.insert(
+		"order".to_string(),
+		toml::Value::String("eip7683".to_string()),
+	);
+	table.insert(
+		"network_ids".to_string(),
+		toml::Value::Array(
+			chain_ids
+				.iter()
+				.map(|id| toml::Value::Integer(*id as i64))
+				.collect(),
+		),
+	);
+	table.insert(
+		"default_gas_limit".to_string(),
+		toml::Value::Integer(hyperlane.default_gas_limit as i64),
+	);
+	table.insert(
+		"message_timeout_seconds".to_string(),
+		toml::Value::Integer(hyperlane.message_timeout_seconds as i64),
+	);
+	table.insert(
+		"finalization_required".to_string(),
+		toml::Value::Boolean(hyperlane.finalization_required),
+	);
+
+	// Build oracles map
+	let mut input_oracles = toml::map::Map::new();
+	let mut output_oracles = toml::map::Map::new();
+
+	for (chain_id, oracles) in &hyperlane.oracles.input {
+		let oracle_array = toml::Value::Array(
+			oracles
+				.iter()
+				.map(|addr| toml::Value::String(format!("0x{}", hex::encode(addr))))
+				.collect(),
+		);
+		input_oracles.insert(chain_id.to_string(), oracle_array);
+	}
+
+	for (chain_id, oracles) in &hyperlane.oracles.output {
+		let oracle_array = toml::Value::Array(
+			oracles
+				.iter()
+				.map(|addr| toml::Value::String(format!("0x{}", hex::encode(addr))))
+				.collect(),
+		);
+		output_oracles.insert(chain_id.to_string(), oracle_array);
+	}
+
+	let mut oracles = toml::map::Map::new();
+	oracles.insert("input".to_string(), toml::Value::Table(input_oracles));
+	oracles.insert("output".to_string(), toml::Value::Table(output_oracles));
+	table.insert("oracles".to_string(), toml::Value::Table(oracles));
+
+	// Build routes
+	let mut routes = toml::map::Map::new();
+	for (chain_id, destinations) in &hyperlane.routes {
+		let dest_array = toml::Value::Array(
+			destinations
+				.iter()
+				.map(|c| toml::Value::Integer(*c as i64))
+				.collect(),
+		);
+		routes.insert(chain_id.to_string(), dest_array);
+	}
+	table.insert("routes".to_string(), toml::Value::Table(routes));
+
+	// Build mailboxes map
+	let mut mailboxes = toml::map::Map::new();
+	for (chain_id, addr) in &hyperlane.mailboxes {
+		mailboxes.insert(
+			chain_id.to_string(),
+			toml::Value::String(format!("0x{}", hex::encode(addr))),
+		);
+	}
+	table.insert("mailboxes".to_string(), toml::Value::Table(mailboxes));
+
+	// Build IGP addresses map
+	let mut igp_addresses = toml::map::Map::new();
+	for (chain_id, addr) in &hyperlane.igp_addresses {
+		igp_addresses.insert(
+			chain_id.to_string(),
+			toml::Value::String(format!("0x{}", hex::encode(addr))),
+		);
+	}
+	table.insert(
+		"igp_addresses".to_string(),
+		toml::Value::Table(igp_addresses),
+	);
+
+	toml::Value::Table(table)
+}
+
+/// Builds PricingConfig from OperatorPricingConfig.
+fn build_pricing_config_from_operator(pricing: &OperatorPricingConfig) -> PricingConfig {
+	let mut implementations = HashMap::new();
+
+	// CoinGecko implementation
+	let coingecko_config = toml_table(vec![
+		(
+			"cache_duration_seconds",
+			toml::Value::Integer(pricing.cache_duration_seconds as i64),
+		),
+		("rate_limit_delay_ms", toml::Value::Integer(1200)),
+	]);
+	implementations.insert("coingecko".to_string(), coingecko_config);
+
+	// DefiLlama implementation
+	let defillama_config = toml_table(vec![(
+		"cache_duration_seconds",
+		toml::Value::Integer(pricing.cache_duration_seconds as i64),
+	)]);
+	implementations.insert("defillama".to_string(), defillama_config);
+
+	PricingConfig {
+		primary: pricing.primary.clone(),
+		fallbacks: pricing.fallbacks.clone(),
+		implementations,
+	}
+}
+
+/// Builds GasConfig from OperatorGasConfig.
+fn build_gas_config_from_operator(gas: &OperatorGasConfig) -> GasConfig {
+	let mut flows = HashMap::new();
+
+	flows.insert(
+		"resource_lock".to_string(),
+		GasFlowUnits {
+			open: Some(gas.resource_lock.open),
+			fill: Some(gas.resource_lock.fill),
+			claim: Some(gas.resource_lock.claim),
+		},
+	);
+
+	flows.insert(
+		"permit2_escrow".to_string(),
+		GasFlowUnits {
+			open: Some(gas.permit2_escrow.open),
+			fill: Some(gas.permit2_escrow.fill),
+			claim: Some(gas.permit2_escrow.claim),
+		},
+	);
+
+	flows.insert(
+		"eip3009_escrow".to_string(),
+		GasFlowUnits {
+			open: Some(gas.eip3009_escrow.open),
+			fill: Some(gas.eip3009_escrow.fill),
+			claim: Some(gas.eip3009_escrow.claim),
+		},
+	);
+
+	GasConfig { flows }
+}
+
+/// Builds ApiConfig from OperatorAdminConfig.
+fn build_api_config_from_operator(admin: &OperatorAdminConfig) -> ApiConfig {
+	let auth = if admin.enabled {
+		Some(solver_types::AuthConfig {
+			enabled: false, // Don't require JWT for /orders - admin auth is separate
+			jwt_secret: solver_types::SecretString::new(uuid::Uuid::new_v4().to_string()),
+			access_token_expiry_hours: 1,
+			refresh_token_expiry_hours: 720, // 30 days
+			issuer: "oif-solver".to_string(),
+			admin: Some(solver_types::AdminConfig {
+				enabled: admin.enabled,
+				domain: admin.domain.clone(),
+				chain_id: Some(admin.chain_id),
+				nonce_ttl_seconds: admin.nonce_ttl_seconds,
+				admin_addresses: admin.admin_addresses.clone(),
+			}),
+		})
+	} else {
+		None
+	};
+
+	ApiConfig {
+		enabled: true,
+		host: "127.0.0.1".to_string(),
+		port: 3000,
+		timeout_seconds: 30,
+		max_request_size: 1024 * 1024, // 1MB
+		implementations: ApiImplementations {
+			discovery: Some("offchain_eip7683".to_string()),
+		},
+		rate_limiting: None,
+		cors: None,
+		auth,
+		quote: None,
+	}
 }
 
 /// Builds the NetworksConfig from seed overrides and seed data.
@@ -528,6 +1195,7 @@ fn build_api_config(
 			admin: Some(AdminConfig {
 				enabled: admin.enabled,
 				domain: admin.domain.clone(),
+				chain_id: admin.chain_id,
 				nonce_ttl_seconds: admin.nonce_ttl_seconds.unwrap_or(300),
 				admin_addresses: admin.admin_addresses.clone(),
 			}),
@@ -547,6 +1215,319 @@ fn build_api_config(
 		cors: None,
 		auth,
 		quote: None,
+	}
+}
+
+/// Converts an existing Config to OperatorConfig.
+///
+/// This is a backward-compatibility helper that extracts the modifiable
+/// configuration from an existing Config struct. Used when the solver
+/// already has a Config loaded from Redis but needs to convert it to
+/// OperatorConfig for admin API persistence.
+///
+/// Note: Some information (like Hyperlane addresses) may be incomplete
+/// as Config stores them in toml format. The function does best-effort
+/// extraction.
+pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, MergeError> {
+	use alloy_primitives::Address;
+
+	let chain_ids: Vec<u64> = config.networks.keys().copied().collect();
+
+	// Build operator networks from Config networks
+	let mut networks = HashMap::new();
+	for (chain_id, network_config) in &config.networks {
+		let tokens = network_config
+			.tokens
+			.iter()
+			.map(|t| {
+				let addr_bytes: [u8; 20] = t
+					.address
+					.0
+					.as_slice()
+					.try_into()
+					.unwrap_or([0u8; 20]);
+				OperatorToken {
+					symbol: t.symbol.clone(),
+					address: Address::from(addr_bytes),
+					decimals: t.decimals,
+				}
+			})
+			.collect();
+
+		let rpc_urls = network_config
+			.rpc_urls
+			.iter()
+			.filter_map(|r| r.http.as_ref().map(|http| OperatorRpcEndpoint {
+				http: http.clone(),
+				ws: r.ws.clone(),
+			}))
+			.collect();
+
+		let input_settler_bytes: [u8; 20] = network_config
+			.input_settler_address
+			.0
+			.as_slice()
+			.try_into()
+			.unwrap_or([0u8; 20]);
+		let output_settler_bytes: [u8; 20] = network_config
+			.output_settler_address
+			.0
+			.as_slice()
+			.try_into()
+			.unwrap_or([0u8; 20]);
+
+		let input_settler_compact_address = network_config
+			.input_settler_compact_address
+			.as_ref()
+			.and_then(|a| {
+				let bytes: [u8; 20] = a.0.as_slice().try_into().ok()?;
+				Some(Address::from(bytes))
+			});
+		let the_compact_address = network_config
+			.the_compact_address
+			.as_ref()
+			.and_then(|a| {
+				let bytes: [u8; 20] = a.0.as_slice().try_into().ok()?;
+				Some(Address::from(bytes))
+			});
+		let allocator_address = network_config
+			.allocator_address
+			.as_ref()
+			.and_then(|a| {
+				let bytes: [u8; 20] = a.0.as_slice().try_into().ok()?;
+				Some(Address::from(bytes))
+			});
+
+		let op_network = OperatorNetworkConfig {
+			chain_id: *chain_id,
+			name: format!("chain-{}", chain_id),
+			tokens,
+			rpc_urls,
+			input_settler_address: Address::from(input_settler_bytes),
+			output_settler_address: Address::from(output_settler_bytes),
+			input_settler_compact_address,
+			the_compact_address,
+			allocator_address,
+		};
+
+		networks.insert(*chain_id, op_network);
+	}
+
+	// Extract Hyperlane config from settlement
+	let hyperlane = extract_hyperlane_config(&config.settlement, &chain_ids);
+
+	// Extract gas config
+	let gas = config
+		.gas
+		.as_ref()
+		.map(|g| OperatorGasConfig {
+			resource_lock: g
+				.flows
+				.get("resource_lock")
+				.map(|f| OperatorGasFlowUnits {
+					open: f.open.unwrap_or(0),
+					fill: f.fill.unwrap_or(0),
+					claim: f.claim.unwrap_or(0),
+				})
+				.unwrap_or_default(),
+			permit2_escrow: g
+				.flows
+				.get("permit2_escrow")
+				.map(|f| OperatorGasFlowUnits {
+					open: f.open.unwrap_or(0),
+					fill: f.fill.unwrap_or(0),
+					claim: f.claim.unwrap_or(0),
+				})
+				.unwrap_or_default(),
+			eip3009_escrow: g
+				.flows
+				.get("eip3009_escrow")
+				.map(|f| OperatorGasFlowUnits {
+					open: f.open.unwrap_or(0),
+					fill: f.fill.unwrap_or(0),
+					claim: f.claim.unwrap_or(0),
+				})
+				.unwrap_or_default(),
+		})
+		.unwrap_or(OperatorGasConfig {
+			resource_lock: OperatorGasFlowUnits::default(),
+			permit2_escrow: OperatorGasFlowUnits::default(),
+			eip3009_escrow: OperatorGasFlowUnits::default(),
+		});
+
+	// Extract pricing config
+	let pricing = config
+		.pricing
+		.as_ref()
+		.map(|p| OperatorPricingConfig {
+			primary: p.primary.clone(),
+			fallbacks: p.fallbacks.clone(),
+			cache_duration_seconds: 60, // Default
+			custom_prices: HashMap::new(),
+		})
+		.unwrap_or(OperatorPricingConfig {
+			primary: "coingecko".to_string(),
+			fallbacks: vec!["defillama".to_string()],
+			cache_duration_seconds: 60,
+			custom_prices: HashMap::new(),
+		});
+
+	// Extract admin config
+	let admin = config
+		.api
+		.as_ref()
+		.and_then(|api| api.auth.as_ref())
+		.and_then(|auth| auth.admin.as_ref())
+		.map(|a| OperatorAdminConfig {
+			enabled: a.enabled,
+			domain: a.domain.clone(),
+			chain_id: a.chain_id.unwrap_or(chain_ids.first().copied().unwrap_or(1)),
+			nonce_ttl_seconds: a.nonce_ttl_seconds,
+			admin_addresses: a.admin_addresses.clone(),
+		})
+		.unwrap_or_default();
+
+	Ok(OperatorConfig {
+		solver_id: config.solver.id.clone(),
+		networks,
+		settlement: OperatorSettlementConfig {
+			settlement_poll_interval_seconds: config.settlement.settlement_poll_interval_seconds,
+			hyperlane,
+		},
+		gas,
+		pricing,
+		solver: OperatorSolverConfig {
+			min_profitability_pct: config.solver.min_profitability_pct,
+			monitoring_timeout_seconds: config.solver.monitoring_timeout_seconds,
+		},
+		admin,
+	})
+}
+
+/// Extracts Hyperlane config from settlement toml config.
+fn extract_hyperlane_config(
+	settlement: &SettlementConfig,
+	chain_ids: &[u64],
+) -> OperatorHyperlaneConfig {
+	use alloy_primitives::Address;
+
+	let hyperlane_toml = settlement.implementations.get("hyperlane");
+
+	// Helper to parse address from hex string
+	let parse_addr = |s: &str| -> Option<Address> {
+		let s = s.strip_prefix("0x").unwrap_or(s);
+		hex::decode(s)
+			.ok()
+			.and_then(|bytes| {
+				let arr: [u8; 20] = bytes.as_slice().try_into().ok()?;
+				Some(Address::from(arr))
+			})
+	};
+
+	let default_gas_limit = hyperlane_toml
+		.and_then(|h| h.get("default_gas_limit"))
+		.and_then(|v| v.as_integer())
+		.unwrap_or(300_000) as u64;
+
+	let message_timeout_seconds = hyperlane_toml
+		.and_then(|h| h.get("message_timeout_seconds"))
+		.and_then(|v| v.as_integer())
+		.unwrap_or(600) as u64;
+
+	let finalization_required = hyperlane_toml
+		.and_then(|h| h.get("finalization_required"))
+		.and_then(|v| v.as_bool())
+		.unwrap_or(true);
+
+	// Extract mailboxes
+	let mut mailboxes = HashMap::new();
+	if let Some(toml_mailboxes) = hyperlane_toml.and_then(|h| h.get("mailboxes")).and_then(|v| v.as_table()) {
+		for (chain_id_str, addr_val) in toml_mailboxes {
+			if let (Ok(chain_id), Some(addr_str)) = (chain_id_str.parse::<u64>(), addr_val.as_str()) {
+				if let Some(addr) = parse_addr(addr_str) {
+					mailboxes.insert(chain_id, addr);
+				}
+			}
+		}
+	}
+
+	// Extract IGP addresses
+	let mut igp_addresses = HashMap::new();
+	if let Some(toml_igp) = hyperlane_toml.and_then(|h| h.get("igp_addresses")).and_then(|v| v.as_table()) {
+		for (chain_id_str, addr_val) in toml_igp {
+			if let (Ok(chain_id), Some(addr_str)) = (chain_id_str.parse::<u64>(), addr_val.as_str()) {
+				if let Some(addr) = parse_addr(addr_str) {
+					igp_addresses.insert(chain_id, addr);
+				}
+			}
+		}
+	}
+
+	// Extract oracles
+	let mut input_oracles = HashMap::new();
+	let mut output_oracles = HashMap::new();
+	if let Some(toml_oracles) = hyperlane_toml.and_then(|h| h.get("oracles")).and_then(|v| v.as_table()) {
+		if let Some(input_table) = toml_oracles.get("input").and_then(|v| v.as_table()) {
+			for (chain_id_str, addrs_val) in input_table {
+				if let (Ok(chain_id), Some(addrs_array)) = (chain_id_str.parse::<u64>(), addrs_val.as_array()) {
+					let addrs: Vec<Address> = addrs_array
+						.iter()
+						.filter_map(|v| v.as_str().and_then(parse_addr))
+						.collect();
+					if !addrs.is_empty() {
+						input_oracles.insert(chain_id, addrs);
+					}
+				}
+			}
+		}
+		if let Some(output_table) = toml_oracles.get("output").and_then(|v| v.as_table()) {
+			for (chain_id_str, addrs_val) in output_table {
+				if let (Ok(chain_id), Some(addrs_array)) = (chain_id_str.parse::<u64>(), addrs_val.as_array()) {
+					let addrs: Vec<Address> = addrs_array
+						.iter()
+						.filter_map(|v| v.as_str().and_then(parse_addr))
+						.collect();
+					if !addrs.is_empty() {
+						output_oracles.insert(chain_id, addrs);
+					}
+				}
+			}
+		}
+	}
+
+	// Extract routes
+	let mut routes = HashMap::new();
+	if let Some(toml_routes) = hyperlane_toml.and_then(|h| h.get("routes")).and_then(|v| v.as_table()) {
+		for (chain_id_str, dests_val) in toml_routes {
+			if let (Ok(chain_id), Some(dests_array)) = (chain_id_str.parse::<u64>(), dests_val.as_array()) {
+				let dests: Vec<u64> = dests_array
+					.iter()
+					.filter_map(|v| v.as_integer().map(|i| i as u64))
+					.collect();
+				routes.insert(chain_id, dests);
+			}
+		}
+	}
+
+	// If routes is empty, build default routes (each chain to all others)
+	if routes.is_empty() {
+		for chain_id in chain_ids {
+			let other_chains: Vec<u64> = chain_ids.iter().filter(|c| *c != chain_id).copied().collect();
+			routes.insert(*chain_id, other_chains);
+		}
+	}
+
+	OperatorHyperlaneConfig {
+		default_gas_limit,
+		message_timeout_seconds,
+		finalization_required,
+		mailboxes,
+		igp_addresses,
+		oracles: OperatorOracleConfig {
+			input: input_oracles,
+			output: output_oracles,
+		},
+		routes,
 	}
 }
 

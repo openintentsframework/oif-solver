@@ -128,6 +128,12 @@ pub struct AdminConfig {
 	/// Example: "solver.example.com"
 	pub domain: String,
 
+	/// Chain ID for EIP-712 domain separator.
+	/// The wallet must be connected to this chain when signing admin actions.
+	/// If not set, uses the first network's chain ID from config.
+	#[serde(default)]
+	pub chain_id: Option<u64>,
+
 	/// Nonce TTL in seconds. Nonces expire after this duration.
 	/// Default: 300 seconds (5 minutes)
 	#[serde(default = "default_nonce_ttl")]
@@ -165,6 +171,7 @@ impl Default for AdminConfig {
 		Self {
 			enabled: false,
 			domain: String::new(),
+			chain_id: None,
 			nonce_ttl_seconds: default_nonce_ttl(),
 			admin_addresses: Vec::new(),
 		}
@@ -185,6 +192,7 @@ mod tests {
 		let config = AdminConfig {
 			enabled: true,
 			domain: "solver.example.com".to_string(),
+			chain_id: None,
 			nonce_ttl_seconds: 300,
 			admin_addresses: vec![admin_addr],
 		};
@@ -202,6 +210,7 @@ mod tests {
 		let config = AdminConfig {
 			enabled: true,
 			domain: "solver.example.com".to_string(),
+			chain_id: None,
 			nonce_ttl_seconds: 300,
 			admin_addresses: vec![admin1, admin2],
 		};
@@ -220,6 +229,7 @@ mod tests {
 		let config = AdminConfig {
 			enabled: false, // Disabled!
 			domain: "solver.example.com".to_string(),
+			chain_id: None,
 			nonce_ttl_seconds: 300,
 			admin_addresses: vec![admin_addr],
 		};
@@ -245,6 +255,7 @@ mod tests {
 		let config = AdminConfig {
 			enabled: true,
 			domain: "solver.example.com".to_string(),
+			chain_id: Some(1),
 			nonce_ttl_seconds: 600,
 			admin_addresses: vec![admin_addr],
 		};
@@ -254,6 +265,7 @@ mod tests {
 
 		assert_eq!(parsed.enabled, config.enabled);
 		assert_eq!(parsed.domain, config.domain);
+		assert_eq!(parsed.chain_id, config.chain_id);
 		assert_eq!(parsed.nonce_ttl_seconds, config.nonce_ttl_seconds);
 		assert_eq!(parsed.admin_addresses, config.admin_addresses);
 	}

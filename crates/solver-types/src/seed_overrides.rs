@@ -64,6 +64,12 @@ pub struct AdminOverride {
 	/// Example: "solver.example.com"
 	pub domain: String,
 
+	/// Chain ID for EIP-712 domain separator.
+	/// The wallet must be connected to this chain when signing admin actions.
+	/// If not set, uses the first network's chain ID from config.
+	#[serde(default)]
+	pub chain_id: Option<u64>,
+
 	/// List of authorized admin wallet addresses.
 	/// Only these addresses can perform admin operations.
 	pub admin_addresses: Vec<Address>,
