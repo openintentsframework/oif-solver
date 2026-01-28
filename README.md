@@ -329,6 +329,142 @@ The solver provides a REST API for interacting with the system and submitting of
 - **Orders API**: [`api-spec/orders-api.yaml`](api-spec/orders-api.yaml) - Submit and track cross-chain intent orders
 - **Tokens API**: [`api-spec/tokens-api.yaml`](api-spec/tokens-api.yaml) - Query supported tokens and networks
 
+### API Flows
+
+The following diagrams show the detailed RPC interactions for each API endpoint.
+
+#### Quote Request Flow
+
+**RPC calls:** 8 (EIP-3009) · 6 (ResourceLock) · 6 (Permit2)
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Solver
+    participant PricingAPI as Pricing API
+    participant OriginRPC as Origin Chain RPC
+    participant DestRPC as Dest Chain RPC
+    participant TokenRPC as Token Contract RPC
+    participant SettlerEscrow as InputSettlerEscrow
+    participant SettlerCompact as InputSettlerCompact
+
+    Client->>Solver: POST /api/v1/quotes
+    Note over Solver: Validate request, extract chain IDs
+
+    Note over Solver,DestRPC: Chain Data & Cost Context Calculation (parallel)
+    par Origin Chain Data
+        Solver->>OriginRPC: eth_gasPrice
+        Solver->>OriginRPC: eth_blockNumber
+        OriginRPC-->>Solver: gas price + block
+    and Dest Chain Data
+        Solver->>DestRPC: eth_gasPrice
+        Solver->>DestRPC: eth_blockNumber
+        DestRPC-->>Solver: gas price + block
+    and Token Pricing (HTTP)
+        Note over Solver,PricingAPI: Pricing source configured (CoinGecko or DefiLlama)
+        Solver->>PricingAPI: GET /simple/price or /prices/current
+        PricingAPI-->>Solver: price data (USD)
+    end
+    Note over Solver: Calculate cost context (gas costs, swap amounts, profit margins)
+
+    Note over Solver,DestRPC: Solver Balance Check
+    Solver->>DestRPC: eth_call ERC20 balanceOf(solver_address)
+    Note right of DestRPC: selector 0x70a08231
+    DestRPC-->>Solver: uint256 balance
+
+    Note over Solver: Custody Strategy Decision & Quote Generation
+    alt EIP-3009 Capability & Quote Generation
+        Solver->>OriginRPC: eth_call RECEIVE_WITH_AUTHORIZATION_TYPEHASH()
+        Note right of OriginRPC: selector 0x7f2eecc3
+        OriginRPC-->>Solver: bytes32 typehash (if supported)
+        Note over Solver,TokenRPC: EIP-3009 Domain Separator
+        Solver->>TokenRPC: eth_call token DOMAIN_SEPARATOR()
+        Note right of TokenRPC: selector 0x3644e515
+        TokenRPC-->>Solver: bytes32 domainSeparator
+        Note over Solver,SettlerEscrow: Order ID for Quote (Escrow)
+        Solver->>SettlerEscrow: eth_call orderIdentifier(order)
+        SettlerEscrow-->>Solver: bytes32 orderId
+        Note over Solver: Generate EIP-3009 Quote + EIP-712 typed data
+    else ResourceLock Quote Generation
+        Note over Solver,SettlerCompact: Order ID for Quote (Compact)
+        Solver->>SettlerCompact: eth_call orderIdentifier(order)
+        SettlerCompact-->>Solver: bytes32 orderId
+        Note over Solver: Generate ResourceLock Quote + EIP-712 typed data
+    else Permit2 Quote Generation
+        Note over Solver,SettlerEscrow: Order ID for Quote (Escrow)
+        Solver->>SettlerEscrow: eth_call orderIdentifier(order)
+        SettlerEscrow-->>Solver: bytes32 orderId
+        Note over Solver: Generate Permit2 Quote + EIP-712 typed data
+    end
+
+    Solver-->>Client: Quote Response with multiple options
+```
+
+#### Order Submission Flow
+
+**RPC calls:** 2 (EIP-3009) · 3 (ResourceLock) · 2 (Permit2)
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Solver
+    participant OriginRPC as Origin Chain RPC
+    participant TheCompact as TheCompact Contract
+    participant SettlerEscrow as InputSettlerEscrow
+    participant SettlerCompact as InputSettlerCompact
+    participant Discovery as Discovery Service
+
+    Client->>Solver: POST /api/v1/orders {order, signature}
+    Note over Solver: Parse order, detect lock_type
+
+    alt ResourceLock Order
+        Note over Solver,TheCompact: Signature Validation (EIP-712)
+        Solver->>TheCompact: eth_call TheCompact DOMAIN_SEPARATOR()
+        Note right of TheCompact: selector 0x3644e515
+        TheCompact-->>Solver: bytes32 domainSeparator
+        Note over Solver: EIP-712 hash + ecrecover
+        Note over Solver,TheCompact: Capacity Check (TheCompact deposit)
+        Solver->>TheCompact: eth_call TheCompact balanceOf(user, tokenId)
+        Note right of TheCompact: selector 0x00fdd58e
+        TheCompact-->>Solver: uint256 depositBalance
+        Note over Solver,SettlerCompact: Order ID Computation (Compact)
+        Solver->>SettlerCompact: eth_call orderIdentifier(order)
+        SettlerCompact-->>Solver: bytes32 orderId
+    else Permit2 Order
+        Note over Solver: Signature Recovery (EIP-712 ecrecover)
+        Note over Solver: Derive user address from signature
+        Note over Solver: Inject user into order payload
+        Note over Solver,OriginRPC: Capacity Check (Wallet)
+        Solver->>OriginRPC: eth_call ERC20 balanceOf(user)
+        Note right of OriginRPC: selector 0x70a08231
+        OriginRPC-->>Solver: uint256 walletBalance
+        Note over Solver,SettlerEscrow: Order ID Computation (Escrow)
+        Solver->>SettlerEscrow: eth_call orderIdentifier(order)
+        SettlerEscrow-->>Solver: bytes32 orderId
+    else EIP-3009 Order
+        Note over Solver: Signature Recovery (EIP-712 ecrecover)
+        Note over Solver: Derive user address from signature
+        Note over Solver: Inject user into order payload
+        Note over Solver,OriginRPC: Capacity Check (Wallet)
+        Solver->>OriginRPC: eth_call ERC20 balanceOf(user)
+        Note right of OriginRPC: selector 0x70a08231
+        OriginRPC-->>Solver: uint256 walletBalance
+        Note over Solver,SettlerEscrow: Order ID Computation (Escrow)
+        Solver->>SettlerEscrow: eth_call orderIdentifier(order)
+        SettlerEscrow-->>Solver: bytes32 orderId
+    end
+
+    Note over Solver,Discovery: Forward to Discovery Service
+    Solver->>Discovery: POST /intent {order, signature, quote_id?, origin_submission?}
+    alt Discovery Success
+        Discovery-->>Solver: PostOrderResponse {status: "received", order_id}
+        Solver-->>Client: 200 OK + PostOrderResponse
+    else Discovery Error
+        Discovery-->>Solver: PostOrderResponse {status: "error", message}
+        Solver-->>Client: 400/500 + PostOrderResponse
+    end
+```
+
 ### Available Endpoints
 
 #### Quotes
