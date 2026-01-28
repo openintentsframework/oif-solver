@@ -776,9 +776,7 @@ impl StorageInterface for RedisStorage {
 				debug!(key = %key, "compare_and_swap key not found");
 				Err(StorageError::NotFound(key.to_string()))
 			},
-			_ => Err(StorageError::Backend(
-				"Unexpected CAS result".to_string(),
-			)),
+			_ => Err(StorageError::Backend("Unexpected CAS result".to_string())),
 		}
 	}
 
