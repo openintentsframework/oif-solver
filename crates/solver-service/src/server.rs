@@ -186,15 +186,18 @@ pub async fn start_server(
 					},
 				}
 
-				// Create nonce store
+				// Create nonce store (concrete NonceStore type, not a trait)
 				match create_nonce_store(
 					StoreConfig::Redis { url: redis_url },
 					&solver_id,
 					admin_config.nonce_ttl_seconds,
 				) {
 					Ok(nonce_store) => {
+						// Keep nonce_store as Arc for sharing with verifier and AdminApiState
+						let nonce_store: Arc<solver_storage::nonce_store::NonceStore> =
+							Arc::new(nonce_store);
 						let verifier = AdminActionVerifier::new(
-							std::sync::Arc::new(nonce_store),
+							nonce_store.clone(),
 							admin_config.clone(),
 							chain_id,
 						);
@@ -204,9 +207,12 @@ pub async fn start_server(
 						);
 						(
 							Some(AdminApiState {
-								verifier: std::sync::Arc::new(verifier),
+								// Wrap verifier in RwLock for hot reload of admin list
+								verifier: Arc::new(RwLock::new(verifier)),
 								config_store,
 								shared_config: shared_config.clone(),
+								// Store nonce_store for rebuilding verifier later
+								nonce_store,
 							}),
 							Some(shared_config),
 						)
@@ -856,7 +862,9 @@ mod tests {
 			account.clone(),
 		));
 
+		let shared_config = Arc::new(RwLock::new(config.clone()));
 		let engine = SolverEngine::new(
+			shared_config,
 			config.clone(),
 			storage,
 			account,

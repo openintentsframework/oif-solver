@@ -13,8 +13,11 @@
 use axum::{extract::State, Json};
 use serde::Serialize;
 use solver_config::Config;
-use solver_storage::config_store::{ConfigStore, ConfigStoreError};
-use solver_types::{OperatorConfig, OperatorToken};
+use solver_storage::{
+	config_store::{ConfigStore, ConfigStoreError},
+	nonce_store::NonceStore,
+};
+use solver_types::{AdminConfig, OperatorAdminConfig, OperatorConfig, OperatorToken};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -26,12 +29,42 @@ use crate::config_merge::build_runtime_config;
 /// Shared state for admin endpoints.
 #[derive(Clone)]
 pub struct AdminApiState {
-	/// Verifier for EIP-712 admin signatures.
-	pub verifier: Arc<AdminActionVerifier>,
+	/// Verifier for EIP-712 admin signatures (wrapped in RwLock for hot reload).
+	pub verifier: Arc<RwLock<AdminActionVerifier>>,
 	/// ConfigStore for persisting OperatorConfig to Redis.
 	pub config_store: Arc<dyn ConfigStore<OperatorConfig>>,
 	/// Shared runtime config that gets hot-reloaded.
 	pub shared_config: Arc<RwLock<Config>>,
+	/// Nonce store (concrete type, kept for rebuilding verifier).
+	pub nonce_store: Arc<NonceStore>,
+}
+
+impl AdminApiState {
+	/// Rebuild the verifier with updated admin configuration.
+	///
+	/// Call this after modifying `OperatorConfig.admin` fields (admin list, chain_id, etc.)
+	/// to make changes take effect immediately without restart.
+	pub async fn rebuild_verifier(&self, admin_config: &OperatorAdminConfig) {
+		let new_verifier = AdminActionVerifier::new(
+			self.nonce_store.clone(),
+			AdminConfig {
+				enabled: admin_config.enabled,
+				domain: admin_config.domain.clone(),
+				chain_id: Some(admin_config.chain_id),
+				nonce_ttl_seconds: admin_config.nonce_ttl_seconds,
+				admin_addresses: admin_config.admin_addresses.clone(),
+			},
+			admin_config.chain_id,
+		);
+
+		*self.verifier.write().await = new_verifier;
+
+		tracing::info!(
+			admin_count = admin_config.admin_addresses.len(),
+			chain_id = admin_config.chain_id,
+			"Admin verifier rebuilt with updated config"
+		);
+	}
 }
 
 /// Response for nonce generation.
@@ -60,13 +93,14 @@ pub struct AdminActionResponse {
 pub async fn handle_get_nonce(
 	State(state): State<AdminApiState>,
 ) -> Result<Json<NonceResponse>, AdminAuthError> {
-	let nonce = state.verifier.generate_nonce().await?;
+	let verifier = state.verifier.read().await;
+	let nonce = verifier.generate_nonce().await?;
 
 	Ok(Json(NonceResponse {
 		nonce: nonce.to_string(),
-		expires_in: state.verifier.nonce_ttl(),
-		domain: state.verifier.domain().to_string(),
-		chain_id: state.verifier.chain_id(),
+		expires_in: verifier.nonce_ttl(),
+		domain: verifier.domain().to_string(),
+		chain_id: verifier.chain_id(),
 	}))
 }
 
@@ -96,11 +130,13 @@ pub async fn handle_add_token(
 	State(state): State<AdminApiState>,
 	Json(request): Json<SignedAdminRequest<AddTokenContents>>,
 ) -> Result<Json<AdminActionResponse>, AdminAuthError> {
-	// 1. Verify the signature - nonce is extracted from the signed contents
-	let admin = state
-		.verifier
-		.verify(&request.contents, &request.signature)
-		.await?;
+	// 1. Verify the signature - acquire read lock, then release after verification
+	let admin = {
+		let verifier = state.verifier.read().await;
+		verifier
+			.verify(&request.contents, &request.signature)
+			.await?
+	};
 
 	// 2. Get current OperatorConfig from Redis
 	let versioned = state.config_store.get().await.map_err(config_store_error)?;
@@ -215,6 +251,8 @@ pub struct Eip712Domain {
 pub async fn handle_get_types(State(state): State<AdminApiState>) -> Json<Eip712TypeInfo> {
 	use crate::auth::admin::{ADMIN_DOMAIN_NAME, ADMIN_DOMAIN_VERSION};
 
+	let verifier = state.verifier.read().await;
+
 	// EIP-712 types for all admin actions
 	// Note: EIP712Domain does NOT include verifyingContract (off-chain verification)
 	let types = serde_json::json!({
@@ -267,7 +305,7 @@ pub async fn handle_get_types(State(state): State<AdminApiState>) -> Json<Eip712
 		domain: Eip712Domain {
 			name: ADMIN_DOMAIN_NAME.to_string(),
 			version: ADMIN_DOMAIN_VERSION.to_string(),
-			chain_id: state.verifier.chain_id(),
+			chain_id: verifier.chain_id(),
 		},
 		types,
 	})

@@ -353,7 +353,9 @@ mod tests {
 
 		let event_bus = solver_core::engine::event_bus::EventBus::new(100);
 
-		Arc::new(solver_core::SolverEngine::new(
+		let shared_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
+	Arc::new(solver_core::SolverEngine::new(
+		shared_config,
 			config,
 			storage,
 			account,

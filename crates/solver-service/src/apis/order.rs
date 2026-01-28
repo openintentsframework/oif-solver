@@ -369,7 +369,9 @@ mod tests {
 		let pricing_impl = mock::create_mock_pricing(&pricing_config).unwrap();
 		let pricing = Arc::new(PricingService::new(pricing_impl, Vec::new()));
 
+		let shared_config = Arc::new(tokio::sync::RwLock::new(cfg.clone()));
 		SolverEngine::new(
+			shared_config,
 			cfg,
 			storage,
 			account,

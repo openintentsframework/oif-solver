@@ -37,6 +37,7 @@ use solver_service::{
 use solver_storage::{config_store::create_config_store, StoreConfig};
 use solver_types::{OperatorConfig, SeedOverrides};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Command-line arguments for the solver service.
 #[derive(Parser, Debug)]
@@ -96,8 +97,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let config = load_config(&args).await?;
 	tracing::info!("Loaded configuration [{}]", config.solver.id);
 
+	// Create shared config for hot reload support
+	// This Arc<RwLock<Config>> is shared between SolverEngine and API server
+	let shared_config = Arc::new(RwLock::new(config.clone()));
+
 	// Build solver engine with implementations using the factory registry
-	let solver = build_solver_from_config(config.clone()).await?;
+	// The solver receives the shared config for hot reload support
+	let solver = build_solver_from_config(shared_config.clone()).await?;
 	let solver = Arc::new(solver);
 
 	// Check if API server should be started

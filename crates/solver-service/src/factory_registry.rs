@@ -15,7 +15,8 @@ use solver_settlement::{SettlementError, SettlementInterface};
 use solver_storage::StorageFactory;
 use solver_types::{NetworksConfig, PricingError};
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::RwLock;
 
 // Type aliases for factory functions
 pub type AccountFactory = fn(&toml::Value) -> Result<Box<dyn AccountInterface>, AccountError>;
@@ -195,45 +196,51 @@ macro_rules! build_factories {
 	}};
 }
 
-/// Build solver using registry and config
+/// Build solver using registry and shared config.
+///
+/// Note: Services created during build use a snapshot of the config and will NOT
+/// see hot-reload changes. Only SolverEngine's `shared_config()` accessor provides
+/// access to hot-reloaded values.
 pub async fn build_solver_from_config(
-	config: Config,
+	shared_config: Arc<RwLock<Config>>,
 ) -> Result<SolverEngine, Box<dyn std::error::Error>> {
 	let registry = get_registry();
-	let builder = SolverBuilder::new(config.clone());
+	// Take a snapshot for building services (they stay stale after hot reload)
+	let config_snapshot = shared_config.read().await.clone();
+	let builder = SolverBuilder::new(shared_config, config_snapshot.clone());
 
 	// Build factories for each component type using the macro
 	let storage_factories =
-		build_factories!(registry, config.storage.implementations, storage, "storage");
+		build_factories!(registry, config_snapshot.storage.implementations, storage, "storage");
 	let delivery_factories = build_factories!(
 		registry,
-		config.delivery.implementations,
+		config_snapshot.delivery.implementations,
 		delivery,
 		"delivery"
 	);
 	let discovery_factories = build_factories!(
 		registry,
-		config.discovery.implementations,
+		config_snapshot.discovery.implementations,
 		discovery,
 		"discovery"
 	);
-	let order_factories = build_factories!(registry, config.order.implementations, order, "order");
-	let pricing_factories = if let Some(pricing_config) = &config.pricing {
+	let order_factories = build_factories!(registry, config_snapshot.order.implementations, order, "order");
+	let pricing_factories = if let Some(pricing_config) = &config_snapshot.pricing {
 		build_factories!(registry, pricing_config.implementations, pricing, "pricing")
 	} else {
 		HashMap::new()
 	};
 	let settlement_factories = build_factories!(
 		registry,
-		config.settlement.implementations,
+		config_snapshot.settlement.implementations,
 		settlement,
 		"settlement"
 	);
 	let account_factories =
-		build_factories!(registry, config.account.implementations, account, "account");
+		build_factories!(registry, config_snapshot.account.implementations, account, "account");
 	let strategy_factories = build_factories!(
 		registry,
-		config.order.strategy.implementations,
+		config_snapshot.order.strategy.implementations,
 		strategy,
 		"strategy"
 	);
@@ -313,7 +320,8 @@ mod tests {
 		"#;
 
 		let config: Config = toml::from_str(config_toml).expect("config parses");
-		let message = match build_solver_from_config(config).await {
+		let shared_config = Arc::new(RwLock::new(config));
+		let message = match build_solver_from_config(shared_config).await {
 			Ok(_) => panic!("expected failure"),
 			Err(error) => error.to_string(),
 		};
