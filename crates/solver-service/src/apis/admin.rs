@@ -93,7 +93,6 @@ pub async fn handle_add_token(
 		.verify(&request.contents, &request.signature)
 		.await?;
 
-
 	Ok(Json(AdminActionResponse {
 		success: true,
 		message: format!(
