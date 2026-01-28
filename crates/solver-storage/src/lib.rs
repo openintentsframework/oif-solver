@@ -338,15 +338,15 @@ pub fn create_storage_backend(
 				table.insert("redis_url".to_string(), toml::Value::String(url));
 				table
 			});
-			Ok(std::sync::Arc::from(implementations::redis::create_storage(
-				&redis_config,
-			)?))
+			Ok(std::sync::Arc::from(
+				implementations::redis::create_storage(&redis_config)?,
+			))
 		},
 		StoreConfig::Memory => {
 			let config = toml::Value::Table(toml::map::Map::new());
-			Ok(std::sync::Arc::from(implementations::memory::create_storage(
-				&config,
-			)?))
+			Ok(std::sync::Arc::from(
+				implementations::memory::create_storage(&config)?,
+			))
 		},
 	}
 }

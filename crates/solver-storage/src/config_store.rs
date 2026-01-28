@@ -536,8 +536,8 @@ mod integration_tests {
 	#[tokio::test]
 	async fn test_memory_seed_already_exists() {
 		let solver_id = unique_solver_id();
-		let store = create_config_store::<TestConfig>(StoreConfig::Memory, solver_id.clone())
-			.unwrap();
+		let store =
+			create_config_store::<TestConfig>(StoreConfig::Memory, solver_id.clone()).unwrap();
 
 		let config = create_test_config(&solver_id);
 
@@ -555,8 +555,8 @@ mod integration_tests {
 	#[tokio::test]
 	async fn test_memory_update_version_mismatch() {
 		let solver_id = unique_solver_id();
-		let store = create_config_store::<TestConfig>(StoreConfig::Memory, solver_id.clone())
-			.unwrap();
+		let store =
+			create_config_store::<TestConfig>(StoreConfig::Memory, solver_id.clone()).unwrap();
 
 		let config = create_test_config(&solver_id);
 		store.seed(config.clone()).await.unwrap();
@@ -578,8 +578,8 @@ mod integration_tests {
 	#[tokio::test]
 	async fn test_memory_get_not_found() {
 		let solver_id = unique_solver_id();
-		let store = create_config_store::<TestConfig>(StoreConfig::Memory, solver_id.clone())
-			.unwrap();
+		let store =
+			create_config_store::<TestConfig>(StoreConfig::Memory, solver_id.clone()).unwrap();
 
 		let result = store.get().await;
 		assert!(matches!(result.unwrap_err(), ConfigStoreError::NotFound(_)));
@@ -588,8 +588,8 @@ mod integration_tests {
 	#[tokio::test]
 	async fn test_memory_update_not_found() {
 		let solver_id = unique_solver_id();
-		let store = create_config_store::<TestConfig>(StoreConfig::Memory, solver_id.clone())
-			.unwrap();
+		let store =
+			create_config_store::<TestConfig>(StoreConfig::Memory, solver_id.clone()).unwrap();
 
 		let config = create_test_config(&solver_id);
 		let result = store.update(config, 1).await;

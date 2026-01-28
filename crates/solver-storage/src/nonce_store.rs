@@ -65,7 +65,6 @@ impl From<StorageError> for NonceError {
 	}
 }
 
-
 /// Creates a nonce store with the specified backend configuration.
 ///
 /// # Arguments
@@ -368,18 +367,10 @@ mod tests {
 		// Create shared storage
 		let storage = create_storage_backend(StoreConfig::Memory).unwrap();
 
-		let store1 = create_nonce_store(
-			StoreConfig::Storage(Arc::clone(&storage)),
-			"solver1",
-			300,
-		)
-		.unwrap();
-		let store2 = create_nonce_store(
-			StoreConfig::Storage(Arc::clone(&storage)),
-			"solver2",
-			300,
-		)
-		.unwrap();
+		let store1 =
+			create_nonce_store(StoreConfig::Storage(Arc::clone(&storage)), "solver1", 300).unwrap();
+		let store2 =
+			create_nonce_store(StoreConfig::Storage(Arc::clone(&storage)), "solver2", 300).unwrap();
 
 		// Generate nonce in store1
 		let nonce = store1.generate().await.unwrap();
