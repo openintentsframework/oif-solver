@@ -110,7 +110,8 @@ sequenceDiagram
         Solver->>DestRPC: eth_blockNumber
         DestRPC-->>Solver: gas price + block
     and Token Pricing (HTTP)
-        Solver->>PricingAPI: GET CoinGecko /simple/price?...&vs_currencies=usd<br/>OR DefiLlama /prices/current/{coins}
+        Note over Solver,PricingAPI: Pricing source configured (CoinGecko or DefiLlama)
+        Solver->>PricingAPI: GET /simple/price or /prices/current
         PricingAPI-->>Solver: price data (USD)
     end
     Note over Solver: Calculate cost context (gas costs, swap amounts, profit margins)
@@ -160,7 +161,7 @@ sequenceDiagram
         Note over Solver: EIP-712 hash + ecrecover
         Note over Solver,TheCompact: Capacity Check (TheCompact deposit)
         Solver->>TheCompact: eth_call TheCompact balanceOf(user, tokenId)
-        Note right of TheCompact: selector from ABI encoding
+        Note right of TheCompact: selector 0x00fdd58e
         TheCompact-->>Solver: uint256 depositBalance
         Note over Solver,SettlerCompact: Order ID Computation (Compact)
         Solver->>SettlerCompact: eth_call orderIdentifier(order)
