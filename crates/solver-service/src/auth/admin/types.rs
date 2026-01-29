@@ -602,4 +602,241 @@ mod tests {
 		assert_eq!(request.contents.deadline, 1737929446);
 		assert_eq!(request.signature.len(), 65);
 	}
+
+	#[test]
+	fn test_remove_token_struct_hash() {
+		let contents = RemoveTokenContents {
+			chain_id: 10,
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		let hash = contents.struct_hash();
+		assert_eq!(hash.len(), 32);
+
+		// Same contents should produce same hash
+		let hash2 = contents.struct_hash();
+		assert_eq!(hash, hash2);
+	}
+
+	#[test]
+	fn test_remove_token_admin_action_trait() {
+		let contents = RemoveTokenContents {
+			chain_id: 10,
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			nonce: 42,
+			deadline: 1706184000,
+		};
+
+		assert_eq!(contents.nonce(), 42);
+		assert_eq!(contents.deadline(), 1706184000);
+
+		// struct_hash via trait should succeed
+		let hash = AdminAction::struct_hash(&contents);
+		assert!(hash.is_ok());
+	}
+
+	#[test]
+	fn test_remove_token_message_hash() {
+		let contents = RemoveTokenContents {
+			chain_id: 10,
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		let hash = contents.message_hash(1).unwrap();
+		assert_eq!(hash.len(), 32);
+
+		// Different chain should produce different hash
+		let hash_other = contents.message_hash(10).unwrap();
+		assert_ne!(hash, hash_other);
+	}
+
+	#[test]
+	fn test_withdraw_admin_action_trait() {
+		let contents = WithdrawContents {
+			chain_id: 10,
+			token: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			amount: "1000000".to_string(),
+			recipient: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap(),
+			nonce: 99,
+			deadline: 1706184000,
+		};
+
+		assert_eq!(contents.nonce(), 99);
+		assert_eq!(contents.deadline(), 1706184000);
+
+		// struct_hash via trait should succeed
+		let hash = AdminAction::struct_hash(&contents);
+		assert!(hash.is_ok());
+	}
+
+	#[test]
+	fn test_withdraw_message_hash() {
+		let contents = WithdrawContents {
+			chain_id: 10,
+			token: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			amount: "1000000".to_string(),
+			recipient: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		let hash = contents.message_hash(1).unwrap();
+		assert_eq!(hash.len(), 32);
+	}
+
+	#[test]
+	fn test_withdraw_message_hash_fails_with_invalid_amount() {
+		let contents = WithdrawContents {
+			chain_id: 10,
+			token: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			amount: "not_a_number".to_string(),
+			recipient: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		let result = contents.message_hash(1);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_add_token_to_eip712() {
+		let contents = AddTokenContents {
+			chain_id: 10,
+			symbol: "USDC".to_string(),
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			decimals: 6,
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		let eip712 = contents.to_eip712();
+		assert_eq!(eip712.chainId, U256::from(10));
+		assert_eq!(eip712.symbol, "USDC");
+		assert_eq!(eip712.decimals, 6);
+		assert_eq!(eip712.nonce, U256::from(1));
+		assert_eq!(eip712.deadline, U256::from(1706184000));
+	}
+
+	#[test]
+	fn test_remove_token_contents_serialization() {
+		let contents = RemoveTokenContents {
+			chain_id: 10,
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			nonce: 12345,
+			deadline: 1706184000,
+		};
+
+		let json = serde_json::to_string(&contents).unwrap();
+		assert!(json.contains("\"chainId\":10"));
+		assert!(json.contains("\"tokenAddress\""));
+		assert!(json.contains("\"nonce\":12345"));
+		assert!(json.contains("\"deadline\":1706184000"));
+
+		// Round trip
+		let parsed: RemoveTokenContents = serde_json::from_str(&json).unwrap();
+		assert_eq!(parsed.chain_id, 10);
+		assert_eq!(parsed.nonce, 12345);
+	}
+
+	#[test]
+	fn test_withdraw_contents_serialization() {
+		let contents = WithdrawContents {
+			chain_id: 137,
+			token: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			amount: "1000000000000000000".to_string(),
+			recipient: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap(),
+			nonce: 42,
+			deadline: 1706184000,
+		};
+
+		let json = serde_json::to_string(&contents).unwrap();
+		assert!(json.contains("\"chainId\":137"));
+		assert!(json.contains("\"amount\":\"1000000000000000000\""));
+		assert!(json.contains("\"nonce\":42"));
+
+		// Round trip
+		let parsed: WithdrawContents = serde_json::from_str(&json).unwrap();
+		assert_eq!(parsed.chain_id, 137);
+		assert_eq!(parsed.amount, "1000000000000000000");
+	}
+
+	#[test]
+	fn test_hex_signature_round_trip() {
+		let request = SignedAdminRequest {
+			signature: vec![0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0],
+			contents: AddTokenContents {
+				chain_id: 1,
+				symbol: "TEST".to_string(),
+				token_address: Address::from_str("0x0000000000000000000000000000000000000001").unwrap(),
+				decimals: 18,
+				nonce: 1,
+				deadline: 1,
+			},
+		};
+
+		let json = serde_json::to_string(&request).unwrap();
+		assert!(json.contains("0x123456789abcdef0"));
+
+		let parsed: SignedAdminRequest<AddTokenContents> = serde_json::from_str(&json).unwrap();
+		assert_eq!(parsed.signature, vec![0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0]);
+	}
+
+	#[test]
+	fn test_hex_signature_without_0x_prefix() {
+		let json = r#"{
+			"signature": "abcdef0123456789",
+			"contents": {
+				"chainId": 1,
+				"symbol": "TEST",
+				"tokenAddress": "0x0000000000000000000000000000000000000001",
+				"decimals": 18,
+				"nonce": 1,
+				"deadline": 1
+			}
+		}"#;
+
+		let request: SignedAdminRequest<AddTokenContents> = serde_json::from_str(json).unwrap();
+		assert_eq!(request.signature, vec![0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89]);
+	}
+
+	#[test]
+	fn test_admin_action_hash_error_display() {
+		let err = AdminActionHashError::InvalidAmount("bad_value".to_string());
+		assert_eq!(format!("{}", err), "Invalid amount: bad_value");
+	}
+
+	#[test]
+	fn test_domain_separator_same_chain_same_result() {
+		let sep1 = admin_domain_separator(1);
+		let sep2 = admin_domain_separator(1);
+		assert_eq!(sep1, sep2);
+	}
+
+	#[test]
+	fn test_add_token_different_symbols_different_hash() {
+		let contents1 = AddTokenContents {
+			chain_id: 10,
+			symbol: "USDC".to_string(),
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			decimals: 6,
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		let contents2 = AddTokenContents {
+			chain_id: 10,
+			symbol: "USDT".to_string(), // Different symbol
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			decimals: 6,
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		assert_ne!(contents1.struct_hash(), contents2.struct_hash());
+	}
 }

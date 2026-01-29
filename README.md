@@ -328,6 +328,7 @@ The solver provides a REST API for interacting with the system and submitting of
 
 - **Orders API**: [`api-spec/orders-api.yaml`](api-spec/orders-api.yaml) - Submit and track cross-chain intent orders
 - **Tokens API**: [`api-spec/tokens-api.yaml`](api-spec/tokens-api.yaml) - Query supported tokens and networks
+- **Admin API**: [`docs/openapi-admin.json`](docs/openapi-admin.json) - Wallet-based admin operations (EIP-712 signed)
 
 ### Available Endpoints
 
@@ -390,6 +391,85 @@ The solver provides a REST API for interacting with the system and submitting of
 
 - **GET `/api/v1/tokens/{chain_id}`** - Get supported tokens for a specific chain
   - Returns network configuration including settler addresses and token list
+
+#### Health
+
+- **GET `/health`** - Health check endpoint
+  - Returns solver health status including Redis connectivity and persistence info
+  - Response:
+    ```json
+    {
+      "status": "healthy",
+      "redis": {
+        "connected": true,
+        "persistence_enabled": true,
+        "rdb_enabled": true,
+        "aof_enabled": false
+      },
+      "solver_id": "my-solver",
+      "version": "0.1.0"
+    }
+    ```
+  - Status codes: `200 OK` (healthy), `503 Service Unavailable` (unhealthy)
+
+#### Admin API (Wallet-Based Authentication)
+
+The admin API enables authorized wallet addresses to perform administrative operations using EIP-712 signed messages. This provides secure, decentralized admin access without shared secrets.
+
+**Setup:** Configure admin addresses in your seed overrides or TOML config:
+
+```json
+{
+  "admin": {
+    "enabled": true,
+    "domain": "solver.example.com",
+    "chain_id": 1,
+    "admin_addresses": ["0xYourAdminWalletAddress"]
+  }
+}
+```
+
+**Endpoints:**
+
+- **GET `/api/v1/admin/nonce`** - Get a nonce for signing admin actions
+  - Response:
+    ```json
+    {
+      "nonce": "1706184000123456",
+      "expiresIn": 300,
+      "domain": "solver.example.com",
+      "chainId": 1
+    }
+    ```
+
+- **GET `/api/v1/admin/types`** - Get EIP-712 type definitions for client-side signing
+  - Returns domain and type definitions for all admin actions (AddToken, RemoveToken, etc.)
+
+- **POST `/api/v1/admin/tokens`** - Add a new token to a network
+  - Request body:
+    ```json
+    {
+      "signature": "0x...",
+      "contents": {
+        "chainId": 10,
+        "symbol": "USDC",
+        "tokenAddress": "0x...",
+        "decimals": 6,
+        "nonce": 1706184000123456,
+        "deadline": 1706184300
+      }
+    }
+    ```
+  - The signature must be an EIP-712 typed data signature from an authorized admin
+  - Changes are hot-reloaded immediately (no restart required)
+
+**Admin Action Flow:**
+
+1. Call `GET /api/v1/admin/nonce` to get a fresh nonce
+2. Call `GET /api/v1/admin/types` to get EIP-712 type definitions
+3. Construct the typed data with the nonce and a deadline
+4. Sign with your admin wallet (EIP-712)
+5. Submit the signed action to the appropriate endpoint
 
 ### Example Usage
 
@@ -456,6 +536,15 @@ curl http://localhost:3000/api/v1/tokens/31338
 
 # Get all supported tokens
 curl http://localhost:3000/api/v1/tokens
+
+# Health check
+curl http://localhost:3000/health
+
+# Admin: Get nonce for signing
+curl http://localhost:3000/api/v1/admin/nonce
+
+# Admin: Get EIP-712 types for signing
+curl http://localhost:3000/api/v1/admin/types
 ```
 
 The API server is enabled by default on port 3000 when the solver is running. You can disable it or change the port in the configuration file.

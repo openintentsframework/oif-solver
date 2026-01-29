@@ -1559,6 +1559,9 @@ mod tests {
 	use super::*;
 	use crate::seeds::TESTNET_SEED;
 	use alloy_primitives::address;
+	use rust_decimal::Decimal;
+	use std::str::FromStr;
+	use solver_types::seed_overrides::AdminOverride;
 
 	fn test_seed_overrides() -> SeedOverrides {
 		SeedOverrides {
@@ -1875,5 +1878,612 @@ mod tests {
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
 		assert_eq!(config.solver.id, "my-custom-solver");
+	}
+
+	// ===== Tests for merge_to_operator_config =====
+
+	#[test]
+	fn test_merge_to_operator_config_success() {
+		let overrides = test_seed_overrides();
+		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
+
+		assert!(result.is_ok());
+		let op_config = result.unwrap();
+
+		// Check solver ID is auto-generated
+		assert!(op_config.solver_id.starts_with("solver-"));
+
+		// Check networks
+		assert_eq!(op_config.networks.len(), 2);
+		assert!(op_config.networks.contains_key(&11155420));
+		assert!(op_config.networks.contains_key(&84532));
+
+		// Check network details
+		let opt_network = op_config.networks.get(&11155420).unwrap();
+		assert_eq!(opt_network.chain_id, 11155420);
+		assert_eq!(opt_network.tokens.len(), 1);
+		assert_eq!(opt_network.tokens[0].symbol, "USDC");
+	}
+
+	#[test]
+	fn test_merge_to_operator_config_with_custom_solver_id() {
+		let overrides = SeedOverrides {
+			solver_id: Some("my-operator-solver".to_string()),
+			networks: vec![
+				NetworkOverride {
+					chain_id: 11155420,
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "USDC".to_string(),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+				NetworkOverride {
+					chain_id: 84532,
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "USDC".to_string(),
+						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+			],
+			admin: None,
+		};
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		assert_eq!(op_config.solver_id, "my-operator-solver");
+	}
+
+	#[test]
+	fn test_merge_to_operator_config_unknown_chain() {
+		let overrides = SeedOverrides {
+			solver_id: None,
+			networks: vec![
+				NetworkOverride {
+					chain_id: 999999,
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "TEST".to_string(),
+						address: address!("1111111111111111111111111111111111111111"),
+						decimals: 18,
+					}],
+					rpc_urls: None,
+				},
+				NetworkOverride {
+					chain_id: 11155420,
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "USDC".to_string(),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+			],
+			admin: None,
+		};
+
+		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
+		assert!(result.is_err());
+		assert!(matches!(
+			result.unwrap_err(),
+			MergeError::UnknownChainId(999999, _)
+		));
+	}
+
+	#[test]
+	fn test_merge_to_operator_config_duplicate_chain() {
+		let overrides = SeedOverrides {
+			solver_id: None,
+			networks: vec![
+				NetworkOverride {
+					chain_id: 11155420,
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "USDC".to_string(),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+				NetworkOverride {
+					chain_id: 11155420, // Duplicate
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "DAI".to_string(),
+						address: address!("1111111111111111111111111111111111111111"),
+						decimals: 18,
+					}],
+					rpc_urls: None,
+				},
+			],
+			admin: None,
+		};
+
+		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
+		assert!(result.is_err());
+		assert!(matches!(
+			result.unwrap_err(),
+			MergeError::DuplicateChainId(11155420)
+		));
+	}
+
+	#[test]
+	fn test_merge_to_operator_config_insufficient_networks() {
+		let overrides = SeedOverrides {
+			solver_id: None,
+			networks: vec![NetworkOverride {
+				chain_id: 11155420,
+				tokens: vec![solver_types::seed_overrides::Token {
+					symbol: "USDC".to_string(),
+					address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+					decimals: 6,
+				}],
+				rpc_urls: None,
+			}],
+			admin: None,
+		};
+
+		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
+		assert!(result.is_err());
+		assert!(matches!(
+			result.unwrap_err(),
+			MergeError::InsufficientNetworks
+		));
+	}
+
+	#[test]
+	fn test_merge_to_operator_config_no_tokens() {
+		let overrides = SeedOverrides {
+			solver_id: None,
+			networks: vec![
+				NetworkOverride {
+					chain_id: 11155420,
+					tokens: vec![], // No tokens
+					rpc_urls: None,
+				},
+				NetworkOverride {
+					chain_id: 84532,
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "USDC".to_string(),
+						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+			],
+			admin: None,
+		};
+
+		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
+		assert!(result.is_err());
+		assert!(matches!(
+			result.unwrap_err(),
+			MergeError::NoTokens(11155420)
+		));
+	}
+
+	#[test]
+	fn test_merge_to_operator_config_with_admin() {
+		let overrides = SeedOverrides {
+			solver_id: Some("admin-test-solver".to_string()),
+			networks: vec![
+				NetworkOverride {
+					chain_id: 11155420,
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "USDC".to_string(),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+				NetworkOverride {
+					chain_id: 84532,
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "USDC".to_string(),
+						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+			],
+			admin: Some(AdminOverride {
+				enabled: true,
+				domain: "test.solver.com".to_string(),
+				chain_id: Some(1),
+				nonce_ttl_seconds: Some(600),
+				admin_addresses: vec![address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")],
+			}),
+		};
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+
+		assert!(op_config.admin.enabled);
+		assert_eq!(op_config.admin.domain, "test.solver.com");
+		assert_eq!(op_config.admin.chain_id, 1);
+		assert_eq!(op_config.admin.nonce_ttl_seconds, 600);
+		assert_eq!(op_config.admin.admin_addresses.len(), 1);
+	}
+
+	#[test]
+	fn test_merge_to_operator_config_hyperlane() {
+		let overrides = test_seed_overrides();
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+
+		let hyperlane = &op_config.settlement.hyperlane;
+
+		// Check mailboxes exist for both chains
+		assert!(hyperlane.mailboxes.contains_key(&11155420));
+		assert!(hyperlane.mailboxes.contains_key(&84532));
+
+		// Check IGP addresses exist
+		assert!(hyperlane.igp_addresses.contains_key(&11155420));
+		assert!(hyperlane.igp_addresses.contains_key(&84532));
+
+		// Check routes are bidirectional
+		let opt_routes = hyperlane.routes.get(&11155420).unwrap();
+		assert!(opt_routes.contains(&84532));
+
+		let base_routes = hyperlane.routes.get(&84532).unwrap();
+		assert!(base_routes.contains(&11155420));
+	}
+
+	#[test]
+	fn test_merge_to_operator_config_gas() {
+		let overrides = test_seed_overrides();
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+
+		// Gas config should be populated from seed defaults
+		assert!(op_config.gas.resource_lock.fill > 0);
+		assert!(op_config.gas.permit2_escrow.fill > 0);
+		assert!(op_config.gas.eip3009_escrow.fill > 0);
+	}
+
+	// ===== Tests for build_runtime_config =====
+
+	#[test]
+	fn test_build_runtime_config_success() {
+		let overrides = test_seed_overrides();
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		let result = build_runtime_config(&op_config);
+
+		assert!(result.is_ok());
+		let config = result.unwrap();
+
+		// Check solver config
+		assert_eq!(config.solver.id, op_config.solver_id);
+		assert_eq!(
+			config.solver.min_profitability_pct,
+			op_config.solver.min_profitability_pct
+		);
+
+		// Check networks
+		assert_eq!(config.networks.len(), 2);
+		assert!(config.networks.contains_key(&11155420));
+		assert!(config.networks.contains_key(&84532));
+	}
+
+	#[test]
+	fn test_build_runtime_config_insufficient_networks() {
+		// Create an OperatorConfig with only 1 network (invalid)
+		let mut op_config = OperatorConfig {
+			solver_id: "test-solver".to_string(),
+			networks: HashMap::new(),
+			settlement: OperatorSettlementConfig {
+				settlement_poll_interval_seconds: 60,
+				hyperlane: OperatorHyperlaneConfig {
+					default_gas_limit: 300000,
+					message_timeout_seconds: 600,
+					finalization_required: true,
+					mailboxes: HashMap::new(),
+					igp_addresses: HashMap::new(),
+					oracles: OperatorOracleConfig {
+						input: HashMap::new(),
+						output: HashMap::new(),
+					},
+					routes: HashMap::new(),
+				},
+			},
+			gas: OperatorGasConfig {
+				resource_lock: OperatorGasFlowUnits::default(),
+				permit2_escrow: OperatorGasFlowUnits::default(),
+				eip3009_escrow: OperatorGasFlowUnits::default(),
+			},
+			pricing: OperatorPricingConfig {
+				primary: "coingecko".to_string(),
+				fallbacks: vec![],
+				cache_duration_seconds: 60,
+				custom_prices: HashMap::new(),
+			},
+			solver: OperatorSolverConfig {
+				min_profitability_pct: Decimal::from_str("0.0").unwrap(),
+				monitoring_timeout_seconds: 30,
+			},
+			admin: OperatorAdminConfig::default(),
+		};
+
+		// Add only one network
+		op_config.networks.insert(
+			1,
+			OperatorNetworkConfig {
+				chain_id: 1,
+				name: "test".to_string(),
+				tokens: vec![],
+				rpc_urls: vec![],
+				input_settler_address: address!("0000000000000000000000000000000000000001"),
+				output_settler_address: address!("0000000000000000000000000000000000000002"),
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+
+		let result = build_runtime_config(&op_config);
+		assert!(result.is_err());
+		assert!(matches!(
+			result.unwrap_err(),
+			MergeError::InsufficientNetworks
+		));
+	}
+
+	#[test]
+	fn test_build_runtime_config_preserves_gas_config() {
+		let overrides = test_seed_overrides();
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		let config = build_runtime_config(&op_config).unwrap();
+
+		let gas = config.gas.as_ref().unwrap();
+		let resource_lock = gas.flows.get("resource_lock").unwrap();
+
+		// Check that gas values are preserved
+		assert_eq!(
+			resource_lock.fill.unwrap(),
+			op_config.gas.resource_lock.fill
+		);
+		assert_eq!(
+			resource_lock.claim.unwrap(),
+			op_config.gas.resource_lock.claim
+		);
+	}
+
+	#[test]
+	fn test_build_runtime_config_preserves_pricing_config() {
+		let overrides = test_seed_overrides();
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		let config = build_runtime_config(&op_config).unwrap();
+
+		let pricing = config.pricing.as_ref().unwrap();
+		assert_eq!(pricing.primary, op_config.pricing.primary);
+		assert_eq!(pricing.fallbacks, op_config.pricing.fallbacks);
+	}
+
+	// ===== Tests for config_to_operator_config =====
+
+	#[test]
+	fn test_config_to_operator_config_roundtrip() {
+		// Create a config via merge
+		let overrides = test_seed_overrides();
+		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
+
+		// Convert to operator config
+		let result = config_to_operator_config(&config);
+		assert!(result.is_ok());
+
+		let op_config = result.unwrap();
+
+		// Check basic fields are preserved
+		assert_eq!(op_config.solver_id, config.solver.id);
+		assert_eq!(
+			op_config.solver.min_profitability_pct,
+			config.solver.min_profitability_pct
+		);
+		assert_eq!(
+			op_config.solver.monitoring_timeout_seconds,
+			config.solver.monitoring_timeout_seconds
+		);
+
+		// Check networks are preserved
+		assert_eq!(op_config.networks.len(), config.networks.len());
+		for chain_id in config.networks.keys() {
+			assert!(op_config.networks.contains_key(chain_id));
+		}
+	}
+
+	#[test]
+	fn test_config_to_operator_config_preserves_tokens() {
+		let overrides = test_seed_overrides();
+		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
+		let op_config = config_to_operator_config(&config).unwrap();
+
+		// Check tokens are preserved
+		let orig_network = config.networks.get(&11155420).unwrap();
+		let op_network = op_config.networks.get(&11155420).unwrap();
+
+		assert_eq!(op_network.tokens.len(), orig_network.tokens.len());
+		assert_eq!(op_network.tokens[0].symbol, orig_network.tokens[0].symbol);
+		assert_eq!(
+			op_network.tokens[0].decimals,
+			orig_network.tokens[0].decimals
+		);
+	}
+
+	#[test]
+	fn test_config_to_operator_config_extracts_gas() {
+		let overrides = test_seed_overrides();
+		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
+		let op_config = config_to_operator_config(&config).unwrap();
+
+		// Gas config should be extracted
+		let orig_gas = config.gas.as_ref().unwrap();
+		let orig_resource_lock = orig_gas.flows.get("resource_lock").unwrap();
+
+		assert_eq!(
+			op_config.gas.resource_lock.fill,
+			orig_resource_lock.fill.unwrap()
+		);
+		assert_eq!(
+			op_config.gas.resource_lock.claim,
+			orig_resource_lock.claim.unwrap()
+		);
+	}
+
+	#[test]
+	fn test_config_to_operator_config_extracts_hyperlane() {
+		let overrides = test_seed_overrides();
+		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
+		let op_config = config_to_operator_config(&config).unwrap();
+
+		let hyperlane = &op_config.settlement.hyperlane;
+
+		// Hyperlane config should be extracted
+		assert!(!hyperlane.mailboxes.is_empty());
+		assert!(!hyperlane.routes.is_empty());
+
+		// Check routes exist for both chains
+		assert!(hyperlane.routes.contains_key(&11155420));
+		assert!(hyperlane.routes.contains_key(&84532));
+	}
+
+	// ===== Tests for helper functions =====
+
+	#[test]
+	fn test_toml_table_helper() {
+		let table = toml_table(vec![
+			("key1", toml::Value::String("value1".to_string())),
+			("key2", toml::Value::Integer(42)),
+			("key3", toml::Value::Boolean(true)),
+		]);
+
+		assert!(table.is_table());
+		let t = table.as_table().unwrap();
+		assert_eq!(t.get("key1").unwrap().as_str().unwrap(), "value1");
+		assert_eq!(t.get("key2").unwrap().as_integer().unwrap(), 42);
+		assert!(t.get("key3").unwrap().as_bool().unwrap());
+	}
+
+	#[test]
+	fn test_build_delivery_config_from_operator() {
+		let chain_ids = vec![1, 10, 137];
+		let delivery = build_delivery_config_from_operator(&chain_ids);
+
+		assert!(delivery.implementations.contains_key("evm_alloy"));
+		let evm_config = delivery.implementations.get("evm_alloy").unwrap();
+		let network_ids = evm_config.get("network_ids").unwrap().as_array().unwrap();
+		assert_eq!(network_ids.len(), 3);
+	}
+
+	#[test]
+	fn test_build_discovery_config_from_operator() {
+		let chain_ids = vec![1, 10];
+		let discovery = build_discovery_config_from_operator(&chain_ids);
+
+		assert!(discovery.implementations.contains_key("onchain_eip7683"));
+		assert!(discovery.implementations.contains_key("offchain_eip7683"));
+
+		let onchain = discovery.implementations.get("onchain_eip7683").unwrap();
+		assert!(onchain.get("polling_interval_secs").is_some());
+	}
+
+	#[test]
+	fn test_build_order_config_from_operator() {
+		let order = build_order_config_from_operator();
+
+		assert!(order.implementations.contains_key("eip7683"));
+		assert_eq!(order.strategy.primary, "simple");
+		assert!(order.strategy.implementations.contains_key("simple"));
+	}
+
+	#[test]
+	fn test_build_storage_config_from_operator() {
+		let storage = build_storage_config_from_operator();
+
+		assert_eq!(storage.primary, "redis");
+		assert!(storage.implementations.contains_key("redis"));
+		assert!(storage.implementations.contains_key("memory"));
+	}
+
+	#[test]
+	fn test_build_gas_config_from_operator() {
+		let op_gas = OperatorGasConfig {
+			resource_lock: OperatorGasFlowUnits {
+				open: 100,
+				fill: 200,
+				claim: 300,
+			},
+			permit2_escrow: OperatorGasFlowUnits {
+				open: 400,
+				fill: 500,
+				claim: 600,
+			},
+			eip3009_escrow: OperatorGasFlowUnits {
+				open: 700,
+				fill: 800,
+				claim: 900,
+			},
+		};
+
+		let gas = build_gas_config_from_operator(&op_gas);
+
+		let resource_lock = gas.flows.get("resource_lock").unwrap();
+		assert_eq!(resource_lock.open, Some(100));
+		assert_eq!(resource_lock.fill, Some(200));
+		assert_eq!(resource_lock.claim, Some(300));
+
+		let permit2 = gas.flows.get("permit2_escrow").unwrap();
+		assert_eq!(permit2.fill, Some(500));
+
+		let eip3009 = gas.flows.get("eip3009_escrow").unwrap();
+		assert_eq!(eip3009.claim, Some(900));
+	}
+
+	#[test]
+	fn test_build_pricing_config_from_operator() {
+		let op_pricing = OperatorPricingConfig {
+			primary: "coingecko".to_string(),
+			fallbacks: vec!["defillama".to_string()],
+			cache_duration_seconds: 120,
+			custom_prices: HashMap::new(),
+		};
+
+		let pricing = build_pricing_config_from_operator(&op_pricing);
+
+		assert_eq!(pricing.primary, "coingecko");
+		assert_eq!(pricing.fallbacks, vec!["defillama".to_string()]);
+		assert!(pricing.implementations.contains_key("coingecko"));
+		assert!(pricing.implementations.contains_key("defillama"));
+	}
+
+	#[test]
+	fn test_build_api_config_from_operator_admin_enabled() {
+		let admin = OperatorAdminConfig {
+			enabled: true,
+			domain: "solver.example.com".to_string(),
+			chain_id: 1,
+			nonce_ttl_seconds: 300,
+			admin_addresses: vec![address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")],
+		};
+
+		let api = build_api_config_from_operator(&admin);
+
+		assert!(api.enabled);
+		let auth = api.auth.as_ref().unwrap();
+		let admin_config = auth.admin.as_ref().unwrap();
+		assert!(admin_config.enabled);
+		assert_eq!(admin_config.domain, "solver.example.com");
+		assert_eq!(admin_config.chain_id, Some(1));
+	}
+
+	#[test]
+	fn test_build_api_config_from_operator_admin_disabled() {
+		let admin = OperatorAdminConfig {
+			enabled: false,
+			domain: "".to_string(),
+			chain_id: 0,
+			nonce_ttl_seconds: 0,
+			admin_addresses: vec![],
+		};
+
+		let api = build_api_config_from_operator(&admin);
+
+		assert!(api.enabled); // API is always enabled
+		assert!(api.auth.is_none()); // But auth is None when admin disabled
 	}
 }

@@ -323,6 +323,124 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn test_error_display_connection_failed() {
+		let err = RedisHealthError::ConnectionFailed("timeout".to_string());
+		assert!(format!("{}", err).contains("connection failed"));
+		assert!(format!("{}", err).contains("timeout"));
+	}
+
+	#[test]
+	fn test_error_display_persistence_disabled() {
+		let err = RedisHealthError::PersistenceDisabled;
+		let msg = format!("{}", err);
+		assert!(msg.contains("persistence is disabled"));
+		assert!(msg.contains("Enable RDB or AOF"));
+	}
+
+	#[test]
+	fn test_error_display_check_failed() {
+		let err = RedisHealthError::CheckFailed("some error".to_string());
+		assert!(format!("{}", err).contains("Failed to check"));
+		assert!(format!("{}", err).contains("some error"));
+	}
+
+	#[test]
+	fn test_error_display_config_denied() {
+		let err = RedisHealthError::ConfigDenied;
+		let msg = format!("{}", err);
+		assert!(msg.contains("CONFIG command denied"));
+		assert!(msg.contains("managed Redis"));
+	}
+
+	#[test]
+	fn test_persistence_detection_method_equality() {
+		assert_eq!(
+			PersistenceDetectionMethod::InfoCommand,
+			PersistenceDetectionMethod::InfoCommand
+		);
+		assert_eq!(
+			PersistenceDetectionMethod::ConfigCommand,
+			PersistenceDetectionMethod::ConfigCommand
+		);
+		assert_ne!(
+			PersistenceDetectionMethod::InfoCommand,
+			PersistenceDetectionMethod::ConfigCommand
+		);
+	}
+
+	#[test]
+	fn test_persistence_detection_method_debug() {
+		let info_method = PersistenceDetectionMethod::InfoCommand;
+		let config_method = PersistenceDetectionMethod::ConfigCommand;
+		assert!(format!("{:?}", info_method).contains("InfoCommand"));
+		assert!(format!("{:?}", config_method).contains("ConfigCommand"));
+	}
+
+	#[test]
+	fn test_redis_persistence_info_debug() {
+		let info = RedisPersistenceInfo {
+			rdb_enabled: true,
+			aof_enabled: false,
+			rdb_last_bgsave_status: "ok".to_string(),
+			aof_last_rewrite_status: "unknown".to_string(),
+			detection_method: PersistenceDetectionMethod::InfoCommand,
+		};
+		let debug_str = format!("{:?}", info);
+		assert!(debug_str.contains("rdb_enabled: true"));
+		assert!(debug_str.contains("aof_enabled: false"));
+	}
+
+	#[test]
+	fn test_redis_persistence_info_clone() {
+		let info = RedisPersistenceInfo {
+			rdb_enabled: true,
+			aof_enabled: true,
+			rdb_last_bgsave_status: "ok".to_string(),
+			aof_last_rewrite_status: "ok".to_string(),
+			detection_method: PersistenceDetectionMethod::ConfigCommand,
+		};
+		let cloned = info.clone();
+		assert_eq!(cloned.rdb_enabled, info.rdb_enabled);
+		assert_eq!(cloned.aof_enabled, info.aof_enabled);
+		assert_eq!(cloned.detection_method, info.detection_method);
+	}
+
+	#[test]
+	fn test_parse_status_from_info_complete() {
+		let info = r#"
+# Persistence
+rdb_last_bgsave_status:ok
+aof_last_rewrite_status:ok
+"#;
+		let (rdb_status, aof_status) = parse_status_from_info(info);
+		assert_eq!(rdb_status, "ok");
+		assert_eq!(aof_status, "ok");
+	}
+
+	#[test]
+	fn test_parse_status_from_info_partial() {
+		let info = "rdb_last_bgsave_status:err";
+		let (rdb_status, aof_status) = parse_status_from_info(info);
+		assert_eq!(rdb_status, "err");
+		assert_eq!(aof_status, "unknown");
+	}
+
+	#[test]
+	fn test_parse_status_from_info_empty() {
+		let (rdb_status, aof_status) = parse_status_from_info("");
+		assert_eq!(rdb_status, "unknown");
+		assert_eq!(aof_status, "unknown");
+	}
+
+	#[test]
+	fn test_parse_status_from_info_with_whitespace() {
+		let info = "  rdb_last_bgsave_status:  ok  \n  aof_last_rewrite_status:  err  ";
+		let (rdb_status, aof_status) = parse_status_from_info(info);
+		assert_eq!(rdb_status, "ok");
+		assert_eq!(aof_status, "err");
+	}
+
+	#[test]
 	fn test_parse_info_persistence_with_aof() {
 		let info = r#"
 # Persistence
@@ -411,5 +529,109 @@ aof_enabled:0
 			detection_method: PersistenceDetectionMethod::InfoCommand,
 		};
 		assert!(!info_none.has_persistence());
+	}
+
+	#[test]
+	fn test_has_persistence_rdb_only() {
+		let info = RedisPersistenceInfo {
+			rdb_enabled: true,
+			aof_enabled: false,
+			rdb_last_bgsave_status: "ok".to_string(),
+			aof_last_rewrite_status: "unknown".to_string(),
+			detection_method: PersistenceDetectionMethod::InfoCommand,
+		};
+		assert!(info.has_persistence());
+	}
+
+	#[test]
+	fn test_has_persistence_aof_only() {
+		let info = RedisPersistenceInfo {
+			rdb_enabled: false,
+			aof_enabled: true,
+			rdb_last_bgsave_status: "err".to_string(),
+			aof_last_rewrite_status: "ok".to_string(),
+			detection_method: PersistenceDetectionMethod::InfoCommand,
+		};
+		assert!(info.has_persistence());
+	}
+
+	#[test]
+	fn test_parse_info_persistence_empty_string() {
+		let result = parse_info_persistence("").unwrap();
+		assert!(!result.aof_enabled);
+		assert!(!result.rdb_enabled);
+		assert_eq!(result.rdb_last_bgsave_status, "unknown");
+		assert_eq!(result.aof_last_rewrite_status, "unknown");
+	}
+
+	#[test]
+	fn test_parse_info_persistence_only_comments() {
+		let info = r#"
+# Persistence
+# This is a comment
+# Another comment
+"#;
+		let result = parse_info_persistence(info).unwrap();
+		assert!(!result.aof_enabled);
+		assert!(!result.rdb_enabled);
+	}
+
+	#[test]
+	fn test_parse_info_persistence_rdb_via_ok_status() {
+		// When rdb_last_save_time is 0 but status is ok, RDB should be enabled
+		let info = r#"
+rdb_last_save_time:0
+rdb_last_bgsave_status:ok
+aof_enabled:0
+"#;
+		let result = parse_info_persistence(info).unwrap();
+		assert!(result.rdb_enabled); // Should be true because status is "ok"
+		assert!(!result.aof_enabled);
+	}
+
+	#[test]
+	fn test_parse_info_persistence_rdb_via_save_time() {
+		// When rdb_last_save_time > 0, RDB should be detected as enabled
+		let info = r#"
+rdb_last_save_time:1706500000
+rdb_last_bgsave_status:err
+aof_enabled:0
+"#;
+		let result = parse_info_persistence(info).unwrap();
+		assert!(result.rdb_enabled); // Should be true because save_time > 0
+	}
+
+	#[test]
+	fn test_parse_info_persistence_malformed_lines() {
+		// Lines without colons should be skipped
+		let info = r#"
+malformed line without colon
+aof_enabled:1
+another malformed line
+rdb_last_bgsave_status:ok
+"#;
+		let result = parse_info_persistence(info).unwrap();
+		assert!(result.aof_enabled);
+		assert_eq!(result.rdb_last_bgsave_status, "ok");
+	}
+
+	#[test]
+	fn test_parse_info_persistence_unknown_keys() {
+		// Unknown keys should be ignored
+		let info = r#"
+unknown_key:some_value
+another_unknown:123
+aof_enabled:1
+"#;
+		let result = parse_info_persistence(info).unwrap();
+		assert!(result.aof_enabled);
+	}
+
+	#[test]
+	fn test_error_debug_implementation() {
+		let err = RedisHealthError::ConnectionFailed("test".to_string());
+		let debug = format!("{:?}", err);
+		assert!(debug.contains("ConnectionFailed"));
+		assert!(debug.contains("test"));
 	}
 }

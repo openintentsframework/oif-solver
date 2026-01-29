@@ -106,3 +106,125 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 
 	(status_code, Json(response))
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_health_response_serialization_healthy() {
+		let response = HealthResponse {
+			status: "healthy".to_string(),
+			redis: RedisHealth {
+				connected: true,
+				persistence_enabled: true,
+				rdb_enabled: true,
+				aof_enabled: false,
+				error: None,
+			},
+			solver_id: "test-solver".to_string(),
+			version: "0.1.0".to_string(),
+		};
+
+		let json = serde_json::to_string(&response).unwrap();
+		assert!(json.contains("\"status\":\"healthy\""));
+		assert!(json.contains("\"connected\":true"));
+		assert!(json.contains("\"persistence_enabled\":true"));
+		assert!(json.contains("\"rdb_enabled\":true"));
+		assert!(json.contains("\"aof_enabled\":false"));
+		assert!(json.contains("\"solver_id\":\"test-solver\""));
+		// Error should be omitted when None
+		assert!(!json.contains("\"error\""));
+	}
+
+	#[test]
+	fn test_health_response_serialization_unhealthy() {
+		let response = HealthResponse {
+			status: "unhealthy".to_string(),
+			redis: RedisHealth {
+				connected: false,
+				persistence_enabled: false,
+				rdb_enabled: false,
+				aof_enabled: false,
+				error: Some("Connection refused".to_string()),
+			},
+			solver_id: "test-solver".to_string(),
+			version: "0.1.0".to_string(),
+		};
+
+		let json = serde_json::to_string(&response).unwrap();
+		assert!(json.contains("\"status\":\"unhealthy\""));
+		assert!(json.contains("\"connected\":false"));
+		assert!(json.contains("\"error\":\"Connection refused\""));
+	}
+
+	#[test]
+	fn test_redis_health_serialization_with_error() {
+		let redis_health = RedisHealth {
+			connected: false,
+			persistence_enabled: false,
+			rdb_enabled: false,
+			aof_enabled: false,
+			error: Some("timeout".to_string()),
+		};
+
+		let json = serde_json::to_string(&redis_health).unwrap();
+		assert!(json.contains("\"error\":\"timeout\""));
+	}
+
+	#[test]
+	fn test_redis_health_serialization_without_error() {
+		let redis_health = RedisHealth {
+			connected: true,
+			persistence_enabled: true,
+			rdb_enabled: true,
+			aof_enabled: true,
+			error: None,
+		};
+
+		let json = serde_json::to_string(&redis_health).unwrap();
+		// error field should be skipped when None
+		assert!(!json.contains("error"));
+		assert!(json.contains("\"connected\":true"));
+		assert!(json.contains("\"aof_enabled\":true"));
+	}
+
+	#[test]
+	fn test_redis_health_persistence_combinations() {
+		// Only RDB enabled
+		let rdb_only = RedisHealth {
+			connected: true,
+			persistence_enabled: true,
+			rdb_enabled: true,
+			aof_enabled: false,
+			error: None,
+		};
+		let json = serde_json::to_string(&rdb_only).unwrap();
+		assert!(json.contains("\"rdb_enabled\":true"));
+		assert!(json.contains("\"aof_enabled\":false"));
+
+		// Only AOF enabled
+		let aof_only = RedisHealth {
+			connected: true,
+			persistence_enabled: true,
+			rdb_enabled: false,
+			aof_enabled: true,
+			error: None,
+		};
+		let json = serde_json::to_string(&aof_only).unwrap();
+		assert!(json.contains("\"rdb_enabled\":false"));
+		assert!(json.contains("\"aof_enabled\":true"));
+
+		// Both enabled
+		let both = RedisHealth {
+			connected: true,
+			persistence_enabled: true,
+			rdb_enabled: true,
+			aof_enabled: true,
+			error: None,
+		};
+		let json = serde_json::to_string(&both).unwrap();
+		assert!(json.contains("\"rdb_enabled\":true"));
+		assert!(json.contains("\"aof_enabled\":true"));
+	}
+}
