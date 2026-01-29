@@ -1560,8 +1560,8 @@ mod tests {
 	use crate::seeds::TESTNET_SEED;
 	use alloy_primitives::address;
 	use rust_decimal::Decimal;
-	use std::str::FromStr;
 	use solver_types::seed_overrides::AdminOverride;
+	use std::str::FromStr;
 
 	fn test_seed_overrides() -> SeedOverrides {
 		SeedOverrides {

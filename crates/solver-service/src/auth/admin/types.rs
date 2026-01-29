@@ -772,7 +772,8 @@ mod tests {
 			contents: AddTokenContents {
 				chain_id: 1,
 				symbol: "TEST".to_string(),
-				token_address: Address::from_str("0x0000000000000000000000000000000000000001").unwrap(),
+				token_address: Address::from_str("0x0000000000000000000000000000000000000001")
+					.unwrap(),
 				decimals: 18,
 				nonce: 1,
 				deadline: 1,
@@ -783,7 +784,10 @@ mod tests {
 		assert!(json.contains("0x123456789abcdef0"));
 
 		let parsed: SignedAdminRequest<AddTokenContents> = serde_json::from_str(&json).unwrap();
-		assert_eq!(parsed.signature, vec![0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0]);
+		assert_eq!(
+			parsed.signature,
+			vec![0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0]
+		);
 	}
 
 	#[test]
@@ -801,7 +805,10 @@ mod tests {
 		}"#;
 
 		let request: SignedAdminRequest<AddTokenContents> = serde_json::from_str(json).unwrap();
-		assert_eq!(request.signature, vec![0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89]);
+		assert_eq!(
+			request.signature,
+			vec![0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89]
+		);
 	}
 
 	#[test]

@@ -767,5 +767,4 @@ mod tests {
 		assert_eq!(network.tokens.len(), 1);
 		assert_eq!(network.tokens[0].symbol, "USDC");
 	}
-
 }
