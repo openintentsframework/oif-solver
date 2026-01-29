@@ -5,6 +5,7 @@
 
 use crate::{
 	apis::admin::{handle_add_token, handle_get_nonce, handle_get_types, AdminApiState},
+	apis::health::handle_health,
 	apis::order::get_order_by_id,
 	auth::{admin::AdminActionVerifier, auth_middleware, AuthState, JwtService},
 	config_merge::config_to_operator_config,
@@ -303,7 +304,13 @@ pub async fn start_server(
 	// Combine all routes
 	api_routes = api_routes.merge(order_routes);
 
+	// Health check route at root level (no auth required)
+	let health_routes = Router::new()
+		.route("/health", get(handle_health))
+		.with_state(app_state.clone());
+
 	let app = Router::new()
+		.merge(health_routes) // Health endpoints at root level
 		.nest("/api/v1", api_routes)
 		.layer(ServiceBuilder::new().layer(CorsLayer::permissive()))
 		.with_state(app_state);

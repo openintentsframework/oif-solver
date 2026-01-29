@@ -34,7 +34,10 @@ use solver_service::{
 	seeds::SeedPreset,
 	server,
 };
-use solver_storage::{config_store::create_config_store, StoreConfig};
+use solver_storage::{
+	config_store::create_config_store, get_readiness_checker, ReadinessConfig, ReadinessError,
+	StoreConfig,
+};
 use solver_types::{OperatorConfig, SeedOverrides};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -92,6 +95,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		.init();
 
 	tracing::info!("Started solver");
+
+	// Verify storage readiness (informational by default)
+	verify_storage_readiness().await?;
 
 	// Load configuration based on mode
 	let config = load_config(&args).await?;
@@ -304,4 +310,120 @@ fn parse_seed_overrides(input: &str) -> Result<SeedOverrides, Box<dyn std::error
 
 	// Treat as JSON string
 	Ok(serde_json::from_str(input)?)
+}
+
+/// Verify storage readiness for the configured backend.
+///
+/// This function uses the `StorageReadiness` trait to check backend-specific
+/// requirements. Currently supports Redis backend.
+///
+/// By default, this function:
+/// - Checks backend connectivity
+/// - Logs readiness status (warning if issues found)
+/// - Does NOT fail if checks don't pass (informational only)
+///
+/// # Strict Mode
+///
+/// Set `REQUIRE_PERSISTENCE=true` to fail startup if persistence is disabled.
+/// Set `REQUIRE_PERSISTENCE_STRICT=true` to use more accurate checks (e.g., CONFIG GET
+/// for Redis, which may fail on managed Redis with restricted ACLs).
+async fn verify_storage_readiness() -> Result<(), Box<dyn std::error::Error>> {
+	// Determine backend (default to redis for now)
+	let backend_name =
+		std::env::var("STORAGE_BACKEND").unwrap_or_else(|_| "redis".to_string());
+
+	let backend_url = match backend_name.as_str() {
+		"redis" => {
+			std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string())
+		},
+		_ => String::new(),
+	};
+
+	// Get readiness checker for this backend
+	let Some(checker) = get_readiness_checker(&backend_name) else {
+		tracing::info!("No readiness checker for backend: {}", backend_name);
+		return Ok(());
+	};
+
+	// Skip if backend has no checks to perform
+	if !checker.has_checks() {
+		tracing::warn!(
+			"Using {} backend - no readiness checks to perform",
+			backend_name
+		);
+		return Ok(());
+	}
+
+	// Build config from environment
+	let config = ReadinessConfig {
+		strict: std::env::var("REQUIRE_PERSISTENCE")
+			.map(|v| v == "1" || v.to_lowercase() == "true")
+			.unwrap_or(false),
+		strict_checks: std::env::var("REQUIRE_PERSISTENCE_STRICT")
+			.map(|v| v == "1" || v.to_lowercase() == "true")
+			.unwrap_or(false),
+		timeout_ms: 5000,
+	};
+
+	tracing::info!("Checking {} storage readiness...", backend_name);
+
+	match checker.check(&backend_url, &config).await {
+		Ok(status) => {
+			// Log the readiness status
+			tracing::info!("════════════════════════════════════════════════════════════");
+			tracing::info!("  {} Storage Readiness", status.backend_name);
+			tracing::info!("════════════════════════════════════════════════════════════");
+
+			for check in &status.checks {
+				if check.passed {
+					tracing::info!("  {}: {}", check.name, check.status);
+				} else {
+					tracing::warn!("  {}: {}", check.name, check.status);
+				}
+				if let Some(msg) = &check.message {
+					tracing::info!("    └─ {}", msg);
+				}
+			}
+
+			for (key, value) in &status.details {
+				tracing::info!("  {}: {}", key, value);
+			}
+
+			tracing::info!("════════════════════════════════════════════════════════════");
+
+			// Fail if not ready and strict mode is enabled
+			if !status.is_ready {
+				tracing::error!("════════════════════════════════════════════════════════════");
+				tracing::error!("  STARTUP BLOCKED: Storage not ready");
+				tracing::error!("════════════════════════════════════════════════════════════");
+				tracing::error!("");
+				tracing::error!("  To fix:");
+				tracing::error!("  1. Address the failed checks above OR");
+				tracing::error!("  2. Set REQUIRE_PERSISTENCE=false (not recommended)");
+				tracing::error!("");
+				tracing::error!("  See docs/redis-persistence.md for instructions.");
+				tracing::error!("════════════════════════════════════════════════════════════");
+				return Err(ReadinessError::NotReady("Storage readiness checks failed".to_string()).into());
+			}
+
+			Ok(())
+		},
+		Err(ReadinessError::ConnectionFailed(msg)) => {
+			tracing::error!("════════════════════════════════════════════════════════════");
+			tracing::error!("  {} Storage: CONNECTION FAILED", backend_name);
+			tracing::error!("════════════════════════════════════════════════════════════");
+			tracing::error!("  Error: {}", msg);
+			tracing::error!("");
+			tracing::error!("  Verify that:");
+			tracing::error!("  1. The storage backend is running");
+			tracing::error!("  2. Connection URL is correct");
+			tracing::error!("  3. Network connectivity is available");
+			tracing::error!("════════════════════════════════════════════════════════════");
+			Err(ReadinessError::ConnectionFailed(msg).into())
+		},
+		Err(e) => {
+			tracing::error!("Storage readiness check failed: {}", e);
+			Err(e.into())
+		},
+	}
 }

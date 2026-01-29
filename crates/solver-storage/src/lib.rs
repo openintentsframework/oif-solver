@@ -16,6 +16,20 @@
 
 pub mod config_store;
 pub mod nonce_store;
+pub mod readiness;
+pub mod redis_health;
+
+// Re-export redis_health types for convenience
+pub use redis_health::{
+	check_redis_health, check_redis_health_strict, PersistenceDetectionMethod, RedisHealthError,
+	RedisPersistenceInfo,
+};
+
+// Re-export readiness types for convenience
+pub use readiness::{
+	get_readiness_checker, ReadinessCheck, ReadinessConfig, ReadinessError, ReadinessStatus,
+	StorageReadiness,
+};
 
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
