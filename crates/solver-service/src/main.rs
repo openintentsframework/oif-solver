@@ -329,8 +329,7 @@ fn parse_seed_overrides(input: &str) -> Result<SeedOverrides, Box<dyn std::error
 /// for Redis, which may fail on managed Redis with restricted ACLs).
 async fn verify_storage_readiness() -> Result<(), Box<dyn std::error::Error>> {
 	// Determine backend (default to redis for now)
-	let backend_name =
-		std::env::var("STORAGE_BACKEND").unwrap_or_else(|_| "redis".to_string());
+	let backend_name = std::env::var("STORAGE_BACKEND").unwrap_or_else(|_| "redis".to_string());
 
 	let backend_url = match backend_name.as_str() {
 		"redis" => {
@@ -403,7 +402,10 @@ async fn verify_storage_readiness() -> Result<(), Box<dyn std::error::Error>> {
 				tracing::error!("");
 				tracing::error!("  See docs/redis-persistence.md for instructions.");
 				tracing::error!("════════════════════════════════════════════════════════════");
-				return Err(ReadinessError::NotReady("Storage readiness checks failed".to_string()).into());
+				return Err(ReadinessError::NotReady(
+					"Storage readiness checks failed".to_string(),
+				)
+				.into());
 			}
 
 			Ok(())

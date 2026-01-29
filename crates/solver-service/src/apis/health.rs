@@ -88,14 +88,21 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 	let solver_id = state.config.read().await.solver.id.clone();
 
 	let response = HealthResponse {
-		status: if redis_health.connected { "healthy".to_string() } else { "unhealthy".to_string() },
+		status: if redis_health.connected {
+			"healthy".to_string()
+		} else {
+			"unhealthy".to_string()
+		},
 		redis: redis_health,
 		solver_id,
 		version: env!("CARGO_PKG_VERSION").to_string(),
 	};
 
-	let status_code =
-		if response.status == "healthy" { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+	let status_code = if response.status == "healthy" {
+		StatusCode::OK
+	} else {
+		StatusCode::SERVICE_UNAVAILABLE
+	};
 
 	(status_code, Json(response))
 }

@@ -200,8 +200,11 @@ async fn try_config_get_persistence(
 	conn: &mut redis::aio::MultiplexedConnection,
 ) -> Result<RedisPersistenceInfo, RedisHealthError> {
 	// Check RDB save config
-	let save_result: Result<Vec<String>, _> =
-		redis::cmd("CONFIG").arg("GET").arg("save").query_async(conn).await;
+	let save_result: Result<Vec<String>, _> = redis::cmd("CONFIG")
+		.arg("GET")
+		.arg("save")
+		.query_async(conn)
+		.await;
 
 	let save_config = match save_result {
 		Ok(config) => config,
@@ -236,8 +239,11 @@ async fn try_config_get_persistence(
 	let aof_enabled = aof_config.get(1).map(|v| v == "yes").unwrap_or(false);
 
 	// Get status info for diagnostics
-	let info: String =
-		redis::cmd("INFO").arg("persistence").query_async(conn).await.unwrap_or_default();
+	let info: String = redis::cmd("INFO")
+		.arg("persistence")
+		.query_async(conn)
+		.await
+		.unwrap_or_default();
 
 	let (rdb_last_bgsave_status, aof_last_rewrite_status) = parse_status_from_info(&info);
 
@@ -334,7 +340,10 @@ aof_last_rewrite_status:ok
 		assert!(result.rdb_enabled);
 		assert_eq!(result.rdb_last_bgsave_status, "ok");
 		assert_eq!(result.aof_last_rewrite_status, "ok");
-		assert_eq!(result.detection_method, PersistenceDetectionMethod::InfoCommand);
+		assert_eq!(
+			result.detection_method,
+			PersistenceDetectionMethod::InfoCommand
+		);
 	}
 
 	#[test]

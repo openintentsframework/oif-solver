@@ -81,7 +81,11 @@ pub struct ReadinessConfig {
 
 impl Default for ReadinessConfig {
 	fn default() -> Self {
-		Self { strict: false, strict_checks: false, timeout_ms: 5000 }
+		Self {
+			strict: false,
+			strict_checks: false,
+			timeout_ms: 5000,
+		}
 	}
 }
 
