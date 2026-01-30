@@ -87,6 +87,10 @@ pub struct SolverConfig {
 	pub id: String,
 	/// Minimum profitability percentage required to execute orders.
 	pub min_profitability_pct: Decimal,
+	/// Gas buffer in basis points (e.g., 1000 = 10%).
+	/// Applied as safety margin on gas cost estimates.
+	#[serde(default = "default_gas_buffer_bps")]
+	pub gas_buffer_bps: u32,
 	/// Timeout in seconds for monitoring transactions.
 	/// Defaults to 28800 seconds (8 hours) if not specified.
 	#[serde(default = "default_monitoring_timeout_seconds")]
@@ -281,10 +285,6 @@ pub struct PricingConfig {
 	pub fallbacks: Vec<String>,
 	/// Map of pricing implementation names to their configurations.
 	pub implementations: HashMap<String, toml::Value>,
-	/// Gas buffer in basis points (e.g., 1000 = 10%).
-	/// Applied as safety margin on gas cost estimates.
-	#[serde(default = "default_gas_buffer_bps")]
-	pub gas_buffer_bps: u32,
 }
 
 fn default_gas_buffer_bps() -> u32 {

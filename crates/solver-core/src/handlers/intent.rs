@@ -51,9 +51,9 @@ pub struct IntentHandler {
 	solver_address: Address,
 	token_manager: Arc<TokenManager>,
 	cost_profit_service: Arc<CostProfitService>,
-	/// Shared config for hot-reload support.
+	/// Dynamic config for hot-reload support.
 	/// Config changes via Admin API are immediately visible.
-	shared_config: Arc<RwLock<Config>>,
+	dynamic_config: Arc<RwLock<Config>>,
 	/// In-memory LRU cache for fast intent deduplication to prevent race conditions
 	/// Automatically evicts oldest entries when capacity is exceeded
 	processed_intents: Arc<RwLock<LruCache<String, ()>>>,
@@ -70,7 +70,7 @@ impl IntentHandler {
 		solver_address: Address,
 		token_manager: Arc<TokenManager>,
 		cost_profit_service: Arc<CostProfitService>,
-		shared_config: Arc<RwLock<Config>>,
+		dynamic_config: Arc<RwLock<Config>>,
 	) -> Self {
 		Self {
 			order_service,
@@ -81,7 +81,7 @@ impl IntentHandler {
 			solver_address,
 			token_manager,
 			cost_profit_service,
-			shared_config,
+			dynamic_config,
 			processed_intents: Arc::new(RwLock::new(LruCache::new(
 				NonZeroUsize::new(10000).unwrap(),
 			))),
@@ -93,7 +93,7 @@ impl IntentHandler {
 	pub async fn handle(&self, intent: Intent) -> Result<(), IntentError> {
 		// Clone config early to release lock before any async calls.
 		// This enables hot-reload: config changes via Admin API are picked up on next intent.
-		let config = self.shared_config.read().await.clone();
+		let config = self.dynamic_config.read().await.clone();
 
 		// Prevent duplicate order processing when multiple discovery modules for the same standard are active.
 		//

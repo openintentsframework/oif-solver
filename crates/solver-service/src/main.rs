@@ -103,13 +103,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let config = load_config(&args).await?;
 	tracing::info!("Loaded configuration [{}]", config.solver.id);
 
-	// Create shared config for hot reload support
+	// Create dynamic config for hot reload support
 	// This Arc<RwLock<Config>> is shared between SolverEngine and API server
-	let shared_config = Arc::new(RwLock::new(config.clone()));
+	let dynamic_config = Arc::new(RwLock::new(config.clone()));
 
 	// Build solver engine with implementations using the factory registry
-	// The solver receives the shared config for hot reload support
-	let solver = build_solver_from_config(shared_config.clone()).await?;
+	// The solver receives the dynamic config for hot reload support
+	let solver = build_solver_from_config(dynamic_config.clone()).await?;
 	let solver = Arc::new(solver);
 
 	// Check if API server should be started

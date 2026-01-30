@@ -67,9 +67,9 @@ pub async fn start_server(
 	api_config: ApiConfig,
 	solver: Arc<SolverEngine>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-	// Get the shared config from the solver engine for hot-reload support.
+	// Get the dynamic config from the solver engine for hot-reload support.
 	// This is the SAME Arc used by the solver - admin API updates will propagate immediately.
-	let shared_config = solver.shared_config().clone();
+	let dynamic_config = solver.dynamic_config().clone();
 	// Get a snapshot for reading config values during setup
 	let config = solver.config().clone();
 
@@ -134,7 +134,7 @@ pub async fn start_server(
 					.chain_id
 					.unwrap_or_else(|| config.networks.keys().next().copied().unwrap_or(1));
 
-				// Use the solver's shared_config for hot reload (same Arc!)
+				// Use the solver's dynamic_config for hot reload (same Arc!)
 				// This ensures admin API updates propagate to the solver engine.
 
 				// Convert Config to OperatorConfig for persistence
@@ -215,7 +215,7 @@ pub async fn start_server(
 							// Wrap verifier in RwLock for hot reload of admin list
 							verifier: Arc::new(RwLock::new(verifier)),
 							config_store,
-							shared_config: shared_config.clone(),
+							dynamic_config: dynamic_config.clone(),
 							// Store nonce_store for rebuilding verifier later
 							nonce_store,
 						})
@@ -235,12 +235,12 @@ pub async fn start_server(
 		None
 	};
 
-	// Note: shared_config is already defined at function start from solver.shared_config()
+	// Note: dynamic_config is already defined at function start from solver.dynamic_config()
 	// This ensures AppState and AdminApiState use the same Arc as the solver engine.
 
 	let app_state = AppState {
 		solver,
-		config: shared_config,
+		config: dynamic_config,
 		http_client,
 		discovery_url,
 		jwt_service: jwt_service.clone(),
@@ -872,9 +872,9 @@ mod tests {
 			account.clone(),
 		));
 
-		let shared_config = Arc::new(RwLock::new(config.clone()));
+		let dynamic_config = Arc::new(RwLock::new(config.clone()));
 		let engine = SolverEngine::new(
-			shared_config,
+			dynamic_config,
 			config.clone(),
 			storage,
 			account,
@@ -894,7 +894,7 @@ mod tests {
 	fn build_test_app_state(discovery_url: Option<String>) -> AppState {
 		let solver = build_test_solver_engine();
 		let config = solver.config().clone();
-		let shared_config = Arc::new(RwLock::new(config));
+		let dynamic_config = Arc::new(RwLock::new(config));
 
 		let http_client = Client::builder()
 			.no_proxy()
@@ -903,7 +903,7 @@ mod tests {
 
 		AppState {
 			solver,
-			config: shared_config,
+			config: dynamic_config,
 			http_client,
 			discovery_url,
 			jwt_service: None,

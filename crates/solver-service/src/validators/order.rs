@@ -382,9 +382,9 @@ mod tests {
 		let pricing = Arc::new(PricingService::new(pricing_impl, Vec::new()));
 		let solver_address = solver_types::parse_address(TEST_SOLVER).unwrap();
 
-		let shared_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
+		let dynamic_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
 		SolverEngine::new(
-			shared_config,
+			dynamic_config,
 			config,
 			storage,
 			account,

@@ -34,8 +34,8 @@ pub struct AdminApiState {
 	pub verifier: Arc<RwLock<AdminActionVerifier>>,
 	/// ConfigStore for persisting OperatorConfig to Redis.
 	pub config_store: Arc<dyn ConfigStore<OperatorConfig>>,
-	/// Shared runtime config that gets hot-reloaded.
-	pub shared_config: Arc<RwLock<Config>>,
+	/// Dynamic runtime config that supports hot-reload.
+	pub dynamic_config: Arc<RwLock<Config>>,
 	/// Nonce store (concrete type, kept for rebuilding verifier).
 	pub nonce_store: Arc<NonceStore>,
 }
@@ -184,7 +184,7 @@ pub async fn handle_add_token(
 	// 7. HOT RELOAD: Rebuild runtime Config from updated OperatorConfig
 	let new_config = build_runtime_config(&new_versioned.data)
 		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {}", e)))?;
-	*state.shared_config.write().await = new_config;
+	*state.dynamic_config.write().await = new_config;
 
 	tracing::info!(
 		version = new_versioned.version,
@@ -259,7 +259,7 @@ pub async fn handle_update_fees(
 
 	// 5. Update fee configuration
 	let mut operator_config = versioned.data;
-	operator_config.pricing.gas_buffer_bps = request.contents.gas_buffer_bps;
+	operator_config.solver.gas_buffer_bps = request.contents.gas_buffer_bps;
 	operator_config.solver.min_profitability_pct = min_profitability;
 
 	// 6. Save to Redis with optimistic locking
@@ -277,7 +277,7 @@ pub async fn handle_update_fees(
 	// 7. HOT RELOAD: Rebuild runtime Config from updated OperatorConfig
 	let new_config = build_runtime_config(&new_versioned.data)
 		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {}", e)))?;
-	*state.shared_config.write().await = new_config;
+	*state.dynamic_config.write().await = new_config;
 
 	tracing::info!(
 		version = new_versioned.version,

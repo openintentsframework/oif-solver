@@ -109,14 +109,14 @@ pub async fn get_tokens_for_chain(
 	}
 }
 
-/// Handles GET /api/v1/tokens requests using shared_config.
+/// Handles GET /api/v1/tokens requests using dynamic_config.
 ///
 /// Returns all supported tokens across all configured networks.
-/// This version reads from shared_config to support hot reload.
+/// This version reads from dynamic_config to support hot reload.
 pub async fn get_tokens_from_config(
-	State(shared_config): State<Arc<RwLock<Config>>>,
+	State(dynamic_config): State<Arc<RwLock<Config>>>,
 ) -> Json<TokensResponse> {
-	let config = shared_config.read().await;
+	let config = dynamic_config.read().await;
 
 	let mut response = TokensResponse {
 		networks: HashMap::new(),
@@ -145,15 +145,15 @@ pub async fn get_tokens_from_config(
 	Json(response)
 }
 
-/// Handles GET /api/v1/tokens/{chain_id} requests using shared_config.
+/// Handles GET /api/v1/tokens/{chain_id} requests using dynamic_config.
 ///
 /// Returns supported tokens for a specific chain.
-/// This version reads from shared_config to support hot reload.
+/// This version reads from dynamic_config to support hot reload.
 pub async fn get_tokens_for_chain_from_config(
 	Path(chain_id): Path<u64>,
-	State(shared_config): State<Arc<RwLock<Config>>>,
+	State(dynamic_config): State<Arc<RwLock<Config>>>,
 ) -> Result<Json<NetworkTokens>, StatusCode> {
-	let config = shared_config.read().await;
+	let config = dynamic_config.read().await;
 
 	match config.networks.get(&chain_id) {
 		Some(network) => Ok(Json(NetworkTokens {
@@ -353,9 +353,9 @@ mod tests {
 
 		let event_bus = solver_core::engine::event_bus::EventBus::new(100);
 
-		let shared_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
+		let dynamic_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
 		Arc::new(solver_core::SolverEngine::new(
-			shared_config,
+			dynamic_config,
 			config,
 			storage,
 			account,
@@ -674,9 +674,9 @@ mod tests {
 	#[tokio::test]
 	async fn test_get_tokens_from_config_returns_all_networks() {
 		let config = create_test_config();
-		let shared_config = Arc::new(RwLock::new(config));
+		let dynamic_config = Arc::new(RwLock::new(config));
 
-		let response = get_tokens_from_config(State(shared_config)).await;
+		let response = get_tokens_from_config(State(dynamic_config)).await;
 		let tokens_response = response.0;
 
 		// Should have 2 networks
@@ -719,9 +719,9 @@ mod tests {
 	#[tokio::test]
 	async fn test_get_tokens_for_chain_from_config_valid_chain() {
 		let config = create_test_config();
-		let shared_config = Arc::new(RwLock::new(config));
+		let dynamic_config = Arc::new(RwLock::new(config));
 
-		let response = get_tokens_for_chain_from_config(Path(1), State(shared_config)).await;
+		let response = get_tokens_for_chain_from_config(Path(1), State(dynamic_config)).await;
 
 		assert!(response.is_ok());
 		let network = response.unwrap().0;
@@ -741,9 +741,9 @@ mod tests {
 	#[tokio::test]
 	async fn test_get_tokens_for_chain_from_config_invalid_chain() {
 		let config = create_test_config();
-		let shared_config = Arc::new(RwLock::new(config));
+		let dynamic_config = Arc::new(RwLock::new(config));
 
-		let response = get_tokens_for_chain_from_config(Path(999), State(shared_config)).await;
+		let response = get_tokens_for_chain_from_config(Path(999), State(dynamic_config)).await;
 
 		assert!(response.is_err());
 		assert_eq!(response.unwrap_err(), StatusCode::NOT_FOUND);
@@ -752,9 +752,9 @@ mod tests {
 	#[tokio::test]
 	async fn test_get_tokens_for_chain_from_config_polygon() {
 		let config = create_test_config();
-		let shared_config = Arc::new(RwLock::new(config));
+		let dynamic_config = Arc::new(RwLock::new(config));
 
-		let response = get_tokens_for_chain_from_config(Path(137), State(shared_config)).await;
+		let response = get_tokens_for_chain_from_config(Path(137), State(dynamic_config)).await;
 
 		assert!(response.is_ok());
 		let network = response.unwrap().0;

@@ -575,12 +575,8 @@ impl CostProfitService {
 		dest_chain_id: u64,
 		gas_units: &GasUnits,
 	) -> Result<CostBreakdown, CostProfitError> {
-		// Read gas_buffer_bps from config (hot-reloadable) instead of PricingService's internal config
-		let gas_buffer_bps_value = config
-			.pricing
-			.as_ref()
-			.map(|p| p.gas_buffer_bps)
-			.unwrap_or(1000); // Default 10%
+		// Read gas_buffer_bps from solver config (hot-reloadable)
+		let gas_buffer_bps_value = config.solver.gas_buffer_bps;
 
 		// Get gas prices
 		let origin_gp = self.get_chain_gas_price(origin_chain_id).await?;

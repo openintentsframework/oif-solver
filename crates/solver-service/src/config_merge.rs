@@ -121,7 +121,12 @@ pub fn merge_config(overrides: SeedOverrides, seed: &SeedConfig) -> Result<Confi
 
 	// Build the full config
 	let config = Config {
-		solver: build_solver_config(&solver_id, &seed.defaults, overrides.min_profitability_pct),
+		solver: build_solver_config(
+			&solver_id,
+			&seed.defaults,
+			overrides.min_profitability_pct,
+			overrides.gas_buffer_bps,
+		),
 		networks,
 		storage: build_storage_config(&seed.defaults),
 		delivery: build_delivery_config(&chain_ids, &seed.defaults),
@@ -129,10 +134,7 @@ pub fn merge_config(overrides: SeedOverrides, seed: &SeedConfig) -> Result<Confi
 		discovery: build_discovery_config(&chain_ids, &seed.defaults),
 		order: build_order_config(&seed.defaults),
 		settlement: build_settlement_config(&chain_ids, seed),
-		pricing: Some(build_pricing_config(
-			&seed.defaults,
-			overrides.gas_buffer_bps,
-		)),
+		pricing: Some(build_pricing_config(&seed.defaults)),
 		api: Some(build_api_config(overrides.admin.as_ref())),
 		gas: Some(build_gas_config(&seed.defaults)),
 	};
@@ -251,10 +253,10 @@ pub fn merge_to_operator_config(
 				.collect(),
 			cache_duration_seconds: seed.defaults.cache_duration_seconds,
 			custom_prices: HashMap::new(),
-			gas_buffer_bps,
 		},
 		solver: OperatorSolverConfig {
 			min_profitability_pct,
+			gas_buffer_bps,
 			monitoring_timeout_seconds: seed.defaults.monitoring_timeout_seconds,
 		},
 		admin,
@@ -406,6 +408,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 		solver: SolverConfig {
 			id: operator_config.solver_id.clone(),
 			min_profitability_pct: operator_config.solver.min_profitability_pct,
+			gas_buffer_bps: operator_config.solver.gas_buffer_bps,
 			monitoring_timeout_seconds: operator_config.solver.monitoring_timeout_seconds,
 		},
 		networks,
@@ -747,7 +750,6 @@ fn build_pricing_config_from_operator(pricing: &OperatorPricingConfig) -> Pricin
 		primary: pricing.primary.clone(),
 		fallbacks: pricing.fallbacks.clone(),
 		implementations,
-		gas_buffer_bps: pricing.gas_buffer_bps,
 	}
 }
 
@@ -885,10 +887,12 @@ fn build_solver_config(
 	solver_id: &str,
 	defaults: &SeedDefaults,
 	min_profitability_override: Option<Decimal>,
+	gas_buffer_bps_override: Option<u32>,
 ) -> SolverConfig {
 	SolverConfig {
 		id: solver_id.to_string(),
 		min_profitability_pct: min_profitability_override.unwrap_or(defaults.min_profitability_pct),
+		gas_buffer_bps: gas_buffer_bps_override.unwrap_or(1000),
 		monitoring_timeout_seconds: defaults.monitoring_timeout_seconds,
 	}
 }
@@ -1136,10 +1140,7 @@ fn build_hyperlane_config(chain_ids: &[u64], seed: &SeedConfig) -> toml::Value {
 }
 
 /// Builds the PricingConfig section.
-fn build_pricing_config(
-	defaults: &SeedDefaults,
-	gas_buffer_bps_override: Option<u32>,
-) -> PricingConfig {
+fn build_pricing_config(defaults: &SeedDefaults) -> PricingConfig {
 	let mut implementations = HashMap::new();
 
 	// CoinGecko implementation
@@ -1167,7 +1168,6 @@ fn build_pricing_config(
 			.map(|s| s.to_string())
 			.collect(),
 		implementations,
-		gas_buffer_bps: gas_buffer_bps_override.unwrap_or(1000), // Default 10%
 	}
 }
 
@@ -1375,7 +1375,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 			eip3009_escrow: OperatorGasFlowUnits::default(),
 		});
 
-	// Extract pricing config, preserving gas_buffer_bps if present
+	// Extract pricing config
 	let pricing = config
 		.pricing
 		.as_ref()
@@ -1384,14 +1384,12 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 			fallbacks: p.fallbacks.clone(),
 			cache_duration_seconds: 60, // Default
 			custom_prices: HashMap::new(),
-			gas_buffer_bps: p.gas_buffer_bps,
 		})
 		.unwrap_or(OperatorPricingConfig {
 			primary: "coingecko".to_string(),
 			fallbacks: vec!["defillama".to_string()],
 			cache_duration_seconds: 60,
 			custom_prices: HashMap::new(),
-			gas_buffer_bps: 1000, // Default 10%
 		});
 
 	// Extract admin config
@@ -1422,6 +1420,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		pricing,
 		solver: OperatorSolverConfig {
 			min_profitability_pct: config.solver.min_profitability_pct,
+			gas_buffer_bps: config.solver.gas_buffer_bps,
 			monitoring_timeout_seconds: config.solver.monitoring_timeout_seconds,
 		},
 		admin,
@@ -1791,8 +1790,7 @@ mod tests {
 		);
 
 		// Verify gas_buffer_bps is applied
-		let pricing = config.pricing.as_ref().unwrap();
-		assert_eq!(pricing.gas_buffer_bps, 1500);
+		assert_eq!(config.solver.gas_buffer_bps, 1500);
 	}
 
 	#[test]
@@ -1808,8 +1806,7 @@ mod tests {
 		);
 
 		// Should use default gas_buffer_bps (1000 = 10%)
-		let pricing = config.pricing.as_ref().unwrap();
-		assert_eq!(pricing.gas_buffer_bps, 1000);
+		assert_eq!(config.solver.gas_buffer_bps, 1000);
 	}
 
 	#[test]
@@ -2301,10 +2298,10 @@ mod tests {
 				fallbacks: vec![],
 				cache_duration_seconds: 60,
 				custom_prices: HashMap::new(),
-				gas_buffer_bps: 1000,
 			},
 			solver: OperatorSolverConfig {
 				min_profitability_pct: Decimal::from_str("0.0").unwrap(),
+				gas_buffer_bps: 1000,
 				monitoring_timeout_seconds: 30,
 			},
 			admin: OperatorAdminConfig::default(),
@@ -2551,7 +2548,6 @@ mod tests {
 			fallbacks: vec!["defillama".to_string()],
 			cache_duration_seconds: 120,
 			custom_prices: HashMap::new(),
-			gas_buffer_bps: 1500,
 		};
 
 		let pricing = build_pricing_config_from_operator(&op_pricing);
@@ -2560,7 +2556,6 @@ mod tests {
 		assert_eq!(pricing.fallbacks, vec!["defillama".to_string()]);
 		assert!(pricing.implementations.contains_key("coingecko"));
 		assert!(pricing.implementations.contains_key("defillama"));
-		assert_eq!(pricing.gas_buffer_bps, 1500);
 	}
 
 	#[test]

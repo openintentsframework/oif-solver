@@ -802,9 +802,9 @@ mod tests {
 			account.clone(),
 		));
 
-		let shared_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
+		let dynamic_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
 		SolverEngine::new(
-			shared_config,
+			dynamic_config,
 			config,
 			storage,
 			account,
