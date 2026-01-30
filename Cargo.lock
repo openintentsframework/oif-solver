@@ -4573,6 +4573,7 @@ name = "solver-service"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "alloy-signer",
  "alloy-sol-types",
  "async-trait",
  "axum",

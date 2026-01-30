@@ -3,8 +3,8 @@
 //! Provides functions to recover Ethereum addresses from signatures,
 //! supporting both EIP-191 personal_sign and EIP-712 typed data.
 
-use alloy_primitives::{keccak256, Address};
-use secp256k1::{ecdsa::RecoverableSignature, Message, Secp256k1};
+use alloy_primitives::{keccak256, Address, B256};
+use alloy_signer::Signature;
 
 use super::error::AdminAuthError;
 use solver_types::AdminConfig;
@@ -55,43 +55,11 @@ pub fn recover_from_hash(hash: &[u8; 32], signature: &[u8]) -> Result<Address, A
 		)));
 	}
 
-	let r = &signature[0..32];
-	let s = &signature[32..64];
-	let v = signature[64];
+	let sig = Signature::try_from(signature)
+		.map_err(|e| AdminAuthError::InvalidSignature(format!("Invalid signature: {}", e)))?;
 
-	// Normalize v: Ethereum uses 27/28, secp256k1 uses 0/1
-	let recovery_id = if v >= 27 { v - 27 } else { v };
-
-	if recovery_id > 1 {
-		return Err(AdminAuthError::InvalidSignature(format!(
-			"Invalid recovery id: {}",
-			v
-		)));
-	}
-
-	let secp = Secp256k1::new();
-
-	let recovery_id = secp256k1::ecdsa::RecoveryId::try_from(recovery_id as i32)
-		.map_err(|_| AdminAuthError::InvalidSignature("Invalid recovery id".into()))?;
-
-	let mut sig_bytes = [0u8; 64];
-	sig_bytes[..32].copy_from_slice(r);
-	sig_bytes[32..].copy_from_slice(s);
-
-	let recoverable_sig = RecoverableSignature::from_compact(&sig_bytes, recovery_id)
-		.map_err(|e| AdminAuthError::SignatureVerification(format!("Invalid signature: {}", e)))?;
-
-	let msg = Message::from_digest(*hash);
-	let pubkey = secp.recover_ecdsa(msg, &recoverable_sig).map_err(|e| {
-		AdminAuthError::SignatureVerification(format!("Failed to recover public key: {}", e))
-	})?;
-
-	// Public key to address: keccak256(pubkey[1..65])[12..32]
-	let pubkey_bytes = pubkey.serialize_uncompressed();
-	let hash = keccak256(&pubkey_bytes[1..]);
-	let address = Address::from_slice(&hash[12..]);
-
-	Ok(address)
+	sig.recover_address_from_prehash(&B256::from(*hash))
+		.map_err(|e| AdminAuthError::SignatureVerification(format!("Recovery failed: {}", e)))
 }
 
 /// Verify a signature and check if the signer is an admin.
@@ -127,7 +95,7 @@ pub fn verify_admin_signature(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use secp256k1::{PublicKey, SecretKey};
+	use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 	use std::str::FromStr;
 
 	/// Create a test signature for a message using the given secret key
