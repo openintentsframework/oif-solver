@@ -35,9 +35,7 @@ use solver_service::{
 	seeds::SeedPreset,
 	server,
 };
-use solver_storage::{
-	config_store::create_config_store, verify_storage_readiness, StoreConfig,
-};
+use solver_storage::{config_store::create_config_store, verify_storage_readiness, StoreConfig};
 use solver_types::{OperatorConfig, SeedOverrides};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -154,7 +152,6 @@ async fn load_config(
 	args: &Args,
 	store_config: StoreConfig,
 ) -> Result<Config, Box<dyn std::error::Error>> {
-
 	// Handle seeding if requested
 	if let (Some(seed_name), Some(seed_overrides_str)) = (&args.seed, &args.seed_overrides) {
 		// Parse seed preset
@@ -235,7 +232,10 @@ async fn load_config(
          2. Set SOLVER_ID environment variable to load existing configuration from storage"
 	})?;
 
-	tracing::info!("Loading configuration from storage for solver: {}", solver_id);
+	tracing::info!(
+		"Loading configuration from storage for solver: {}",
+		solver_id
+	);
 
 	// First, try to load OperatorConfig (admin API may have modified it)
 	let operator_store = create_config_store::<OperatorConfig>(

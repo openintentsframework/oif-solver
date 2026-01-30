@@ -21,11 +21,11 @@ mod redis;
 
 pub use redis::RedisReadiness;
 
+use crate::StoreConfig;
 use async_trait::async_trait;
 use serde::Serialize;
 use std::collections::HashMap;
 use thiserror::Error;
-use crate::StoreConfig;
 
 /// Errors that can occur during readiness checks.
 #[derive(Debug, Error)]
@@ -197,9 +197,7 @@ pub async fn check_storage_readiness(
 ///
 /// This helper performs readiness checks, logs details, and enforces persistence
 /// based on `PersistencePolicy` derived from environment variables.
-pub async fn verify_storage_readiness(
-	store_config: &StoreConfig,
-) -> Result<(), ReadinessError> {
+pub async fn verify_storage_readiness(store_config: &StoreConfig) -> Result<(), ReadinessError> {
 	let backend_label = match store_config {
 		StoreConfig::Redis { .. } => "Redis",
 		StoreConfig::Memory => "Memory",
