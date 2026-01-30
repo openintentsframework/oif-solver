@@ -4,7 +4,9 @@
 //! for the OIF Solver API.
 
 use crate::{
-	apis::admin::{handle_add_token, handle_get_nonce, handle_get_types, AdminApiState},
+	apis::admin::{
+		handle_add_token, handle_get_nonce, handle_get_types, handle_update_fees, AdminApiState,
+	},
 	apis::health::handle_health,
 	apis::order::get_order_by_id,
 	auth::{admin::AdminActionVerifier, auth_middleware, AuthState, JwtService},
@@ -18,7 +20,7 @@ use axum::{
 	http::StatusCode,
 	middleware,
 	response::{IntoResponse, Json},
-	routing::{get, post},
+	routing::{get, post, put},
 	Router, ServiceExt,
 };
 use serde_json::Value;
@@ -65,7 +67,10 @@ pub async fn start_server(
 	api_config: ApiConfig,
 	solver: Arc<SolverEngine>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-	// Get the full config from the solver engine
+	// Get the shared config from the solver engine for hot-reload support.
+	// This is the SAME Arc used by the solver - admin API updates will propagate immediately.
+	let shared_config = solver.shared_config().clone();
+	// Get a snapshot for reading config values during setup
 	let config = solver.config().clone();
 
 	// Create a reusable HTTP client with connection pooling
@@ -117,8 +122,8 @@ pub async fn start_server(
 	// Initialize signature validation service
 	let signature_validation = Arc::new(SignatureValidationService::new());
 
-	// Initialize admin API if enabled in config (before AppState consumes config)
-	let (admin_state, shared_config) = if let Some(auth_config) = &api_config.auth {
+	// Initialize admin API if enabled in config
+	let admin_state = if let Some(auth_config) = &api_config.auth {
 		if let Some(admin_config) = &auth_config.admin {
 			if admin_config.enabled {
 				let redis_url = std::env::var("REDIS_URL")
@@ -129,8 +134,8 @@ pub async fn start_server(
 					.chain_id
 					.unwrap_or_else(|| config.networks.keys().next().copied().unwrap_or(1));
 
-				// Create shared config for hot reload
-				let shared_config = Arc::new(RwLock::new(config.clone()));
+				// Use the solver's shared_config for hot reload (same Arc!)
+				// This ensures admin API updates propagate to the solver engine.
 
 				// Convert Config to OperatorConfig for persistence
 				let operator_config = match config_to_operator_config(&config) {
@@ -206,35 +211,32 @@ pub async fn start_server(
 							"Admin API enabled for {} admin(s) with config persistence",
 							admin_config.admin_count()
 						);
-						(
-							Some(AdminApiState {
-								// Wrap verifier in RwLock for hot reload of admin list
-								verifier: Arc::new(RwLock::new(verifier)),
-								config_store,
-								shared_config: shared_config.clone(),
-								// Store nonce_store for rebuilding verifier later
-								nonce_store,
-							}),
-							Some(shared_config),
-						)
+						Some(AdminApiState {
+							// Wrap verifier in RwLock for hot reload of admin list
+							verifier: Arc::new(RwLock::new(verifier)),
+							config_store,
+							shared_config: shared_config.clone(),
+							// Store nonce_store for rebuilding verifier later
+							nonce_store,
+						})
 					},
 					Err(e) => {
 						tracing::error!("Failed to initialize admin nonce store: {}", e);
-						(None, None)
+						None
 					},
 				}
 			} else {
-				(None, None)
+				None
 			}
 		} else {
-			(None, None)
+			None
 		}
 	} else {
-		(None, None)
+		None
 	};
 
-	// Create shared config for AppState - use admin's shared_config if available, otherwise create new
-	let shared_config = shared_config.unwrap_or_else(|| Arc::new(RwLock::new(config)));
+	// Note: shared_config is already defined at function start from solver.shared_config()
+	// This ensures AppState and AdminApiState use the same Arc as the solver engine.
 
 	let app_state = AppState {
 		solver,
@@ -264,6 +266,7 @@ pub async fn start_server(
 			.route("/nonce", get(handle_get_nonce))
 			.route("/types", get(handle_get_types))
 			.route("/tokens", post(handle_add_token))
+			.route("/fees", put(handle_update_fees))
 			.with_state(admin_state);
 		api_routes = api_routes.nest("/admin", admin_routes);
 		tracing::info!("Admin routes registered at /api/v1/admin/*");

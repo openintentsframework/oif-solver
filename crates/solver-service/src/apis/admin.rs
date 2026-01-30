@@ -23,6 +23,7 @@ use tokio::sync::RwLock;
 
 use crate::auth::admin::{
 	AddTokenContents, AdminActionVerifier, AdminAuthError, SignedAdminRequest,
+	UpdateFeeConfigContents,
 };
 use crate::config_merge::build_runtime_config;
 
@@ -202,6 +203,99 @@ pub async fn handle_add_token(
 	}))
 }
 
+/// PUT /api/v1/admin/fees
+///
+/// Update fee configuration (gas buffer and minimum profitability).
+///
+/// Request body:
+/// ```json
+/// {
+///   "signature": "0x...",
+///   "contents": {
+///     "gasBufferBps": 1500,
+///     "minProfitabilityPct": "2.5",
+///     "nonce": 12345678901234,
+///     "deadline": 1706184000
+///   }
+/// }
+/// ```
+///
+/// - `gasBufferBps`: Gas buffer in basis points (e.g., 1500 = 15%)
+/// - `minProfitabilityPct`: Minimum profitability as decimal string (e.g., "2.5" for 2.5%)
+pub async fn handle_update_fees(
+	State(state): State<AdminApiState>,
+	Json(request): Json<SignedAdminRequest<UpdateFeeConfigContents>>,
+) -> Result<Json<AdminActionResponse>, AdminAuthError> {
+	use rust_decimal::Decimal;
+	use std::str::FromStr;
+
+	// 1. Verify the signature
+	let admin = {
+		let verifier = state.verifier.read().await;
+		verifier
+			.verify(&request.contents, &request.signature)
+			.await?
+	};
+
+	// 2. Validate min_profitability_pct is a valid decimal
+	let min_profitability =
+		Decimal::from_str(&request.contents.min_profitability_pct).map_err(|_| {
+			AdminAuthError::InvalidMessage(format!(
+				"Invalid minProfitabilityPct: '{}' is not a valid decimal",
+				request.contents.min_profitability_pct
+			))
+		})?;
+
+	// 3. Validate gas_buffer_bps is reasonable (0-10000 = 0-100%)
+	if request.contents.gas_buffer_bps > 10000 {
+		return Err(AdminAuthError::InvalidMessage(format!(
+			"Invalid gasBufferBps: {} exceeds maximum of 10000 (100%)",
+			request.contents.gas_buffer_bps
+		)));
+	}
+
+	// 4. Get current OperatorConfig from Redis
+	let versioned = state.config_store.get().await.map_err(config_store_error)?;
+
+	// 5. Update fee configuration
+	let mut operator_config = versioned.data;
+	operator_config.pricing.gas_buffer_bps = request.contents.gas_buffer_bps;
+	operator_config.solver.min_profitability_pct = min_profitability;
+
+	// 6. Save to Redis with optimistic locking
+	let new_versioned = state
+		.config_store
+		.update(operator_config.clone(), versioned.version)
+		.await
+		.map_err(|e| match e {
+			ConfigStoreError::VersionMismatch { .. } => {
+				AdminAuthError::Internal("Config was modified, please retry".to_string())
+			},
+			other => config_store_error(other),
+		})?;
+
+	// 7. HOT RELOAD: Rebuild runtime Config from updated OperatorConfig
+	let new_config = build_runtime_config(&new_versioned.data)
+		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {}", e)))?;
+	*state.shared_config.write().await = new_config;
+
+	tracing::info!(
+		version = new_versioned.version,
+		gas_buffer_bps = request.contents.gas_buffer_bps,
+		min_profitability_pct = %request.contents.min_profitability_pct,
+		"Fee configuration updated and config hot-reloaded"
+	);
+
+	Ok(Json(AdminActionResponse {
+		success: true,
+		message: format!(
+			"Fee configuration updated: gasBufferBps={}, minProfitabilityPct={}",
+			request.contents.gas_buffer_bps, request.contents.min_profitability_pct
+		),
+		admin: format!("{:?}", admin),
+	}))
+}
+
 /// Convert ConfigStoreError to AdminAuthError.
 fn config_store_error(err: ConfigStoreError) -> AdminAuthError {
 	match err {
@@ -296,6 +390,12 @@ pub async fn handle_get_types(State(state): State<AdminApiState>) -> Json<Eip712
 		],
 		"RemoveAdmin": [
 			{"name": "adminToRemove", "type": "address"},
+			{"name": "nonce", "type": "uint256"},
+			{"name": "deadline", "type": "uint256"}
+		],
+		"UpdateFeeConfig": [
+			{"name": "gasBufferBps", "type": "uint32"},
+			{"name": "minProfitabilityPct", "type": "string"},
 			{"name": "nonce", "type": "uint256"},
 			{"name": "deadline", "type": "uint256"}
 		]

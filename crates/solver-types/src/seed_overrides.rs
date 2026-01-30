@@ -19,6 +19,8 @@
 //!       "rpc_urls": ["https://user-rpc.com"]
 //!     }
 //!   ],
+//!   "min_profitability_pct": "2.0",
+//!   "gas_buffer_bps": 1500,
 //!   "admin": {
 //!     "enabled": true,
 //!     "domain": "solver.example.com",
@@ -28,6 +30,7 @@
 //! ```
 
 use alloy_primitives::Address;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 /// Seed overrides received from UI/CLI for deploying a new solver.
@@ -51,6 +54,16 @@ pub struct SeedOverrides {
 	/// If provided, enables admin API endpoints with EIP-712 signature auth.
 	#[serde(default)]
 	pub admin: Option<AdminOverride>,
+
+	/// Minimum profitability percentage (e.g., 1.0 = 1%).
+	/// If not set, uses seed default (typically 1.0%).
+	#[serde(default, with = "option_decimal_str")]
+	pub min_profitability_pct: Option<Decimal>,
+
+	/// Gas buffer in basis points (e.g., 1000 = 10%).
+	/// If not set, uses default (1000 = 10%).
+	#[serde(default)]
+	pub gas_buffer_bps: Option<u32>,
 }
 
 /// Admin configuration for wallet-based admin authentication.
@@ -81,6 +94,45 @@ pub struct AdminOverride {
 
 fn default_admin_enabled() -> bool {
 	true
+}
+
+/// Helper module for Option<Decimal> serialization.
+/// Accepts both string and number input for flexibility.
+mod option_decimal_str {
+	use rust_decimal::Decimal;
+	use serde::{self, Deserialize, Deserializer, Serializer};
+	use std::str::FromStr;
+
+	pub fn serialize<S>(value: &Option<Decimal>, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		match value {
+			Some(d) => serializer.serialize_str(&d.to_string()),
+			None => serializer.serialize_none(),
+		}
+	}
+
+	pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		// Accept both string and number input
+		let opt: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+		match opt {
+			Some(v) => {
+				let s = match v {
+					serde_json::Value::String(s) => s,
+					serde_json::Value::Number(n) => n.to_string(),
+					_ => return Err(serde::de::Error::custom("invalid decimal value")),
+				};
+				Decimal::from_str(&s)
+					.map(Some)
+					.map_err(serde::de::Error::custom)
+			},
+			None => Ok(None),
+		}
+	}
 }
 
 /// Per-network configuration provided by the user.
@@ -148,6 +200,7 @@ impl NetworkOverride {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use rust_decimal::Decimal;
 	use std::str::FromStr;
 
 	fn test_address() -> Address {
@@ -230,6 +283,8 @@ mod tests {
 				},
 			],
 			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
 		};
 
 		let chain_ids = config.chain_ids();
@@ -246,6 +301,8 @@ mod tests {
 				rpc_urls: None,
 			}],
 			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
 		};
 
 		assert!(config.has_chain(10));
@@ -266,6 +323,8 @@ mod tests {
 				rpc_urls: None,
 			}],
 			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
 		};
 
 		let network = config.get_network(10);
@@ -311,6 +370,8 @@ mod tests {
 				rpc_urls: Some(vec!["https://rpc.com".to_string()]),
 			}],
 			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
 		};
 
 		let json = serde_json::to_string(&config).unwrap();
@@ -319,5 +380,72 @@ mod tests {
 		assert_eq!(parsed.networks.len(), 1);
 		assert_eq!(parsed.networks[0].chain_id, 10);
 		assert_eq!(parsed.networks[0].tokens[0], config.networks[0].tokens[0]);
+	}
+
+	#[test]
+	fn test_parse_fee_config_fields() {
+		let json = r#"{
+            "networks": [
+                {
+                    "chain_id": 10,
+                    "tokens": [
+                        {"symbol": "USDC", "address": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85", "decimals": 6}
+                    ]
+                }
+            ],
+            "min_profitability_pct": "2.5",
+            "gas_buffer_bps": 1500
+        }"#;
+
+		let config: SeedOverrides = serde_json::from_str(json).unwrap();
+
+		assert_eq!(
+			config.min_profitability_pct,
+			Some(Decimal::from_str("2.5").unwrap())
+		);
+		assert_eq!(config.gas_buffer_bps, Some(1500));
+	}
+
+	#[test]
+	fn test_parse_fee_config_as_number() {
+		// Test that min_profitability_pct accepts numeric input too
+		let json = r#"{
+            "networks": [
+                {
+                    "chain_id": 10,
+                    "tokens": [
+                        {"symbol": "USDC", "address": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85", "decimals": 6}
+                    ]
+                }
+            ],
+            "min_profitability_pct": 3.0
+        }"#;
+
+		let config: SeedOverrides = serde_json::from_str(json).unwrap();
+
+		assert_eq!(
+			config.min_profitability_pct,
+			Some(Decimal::from_str("3.0").unwrap())
+		);
+		assert_eq!(config.gas_buffer_bps, None);
+	}
+
+	#[test]
+	fn test_fee_config_defaults_to_none() {
+		let json = r#"{
+            "networks": [
+                {
+                    "chain_id": 10,
+                    "tokens": [
+                        {"symbol": "USDC", "address": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85", "decimals": 6}
+                    ]
+                }
+            ]
+        }"#;
+
+		let config: SeedOverrides = serde_json::from_str(json).unwrap();
+
+		assert_eq!(config.min_profitability_pct, None);
+		assert_eq!(config.gas_buffer_bps, None);
 	}
 }

@@ -103,6 +103,14 @@ sol! {
 		uint256 nonce;
 		uint256 deadline;
 	}
+
+	/// Update fee configuration (gas buffer and min profitability)
+	struct UpdateFeeConfig {
+		uint32 gasBufferBps;
+		string minProfitabilityPct;
+		uint256 nonce;
+		uint256 deadline;
+	}
 }
 
 /// Request wrapper containing signature and contents.
@@ -273,6 +281,50 @@ impl WithdrawContents {
 	}
 }
 
+/// UpdateFeeConfig action contents
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateFeeConfigContents {
+	/// Gas buffer in basis points (e.g., 1000 = 10%)
+	pub gas_buffer_bps: u32,
+	/// Minimum profitability percentage as a decimal string (e.g., "1.5" for 1.5%)
+	pub min_profitability_pct: String,
+	#[serde(with = "string_or_number")]
+	pub nonce: u64,
+	#[serde(with = "string_or_number")]
+	pub deadline: u64,
+}
+
+impl UpdateFeeConfigContents {
+	pub fn struct_hash(&self) -> FixedBytes<32> {
+		use alloy_primitives::keccak256;
+
+		// Type hash for UpdateFeeConfig
+		let type_hash = keccak256(
+			b"UpdateFeeConfig(uint32 gasBufferBps,string minProfitabilityPct,uint256 nonce,uint256 deadline)",
+		);
+
+		let min_profitability_hash = keccak256(self.min_profitability_pct.as_bytes());
+
+		// Encode struct
+		let encoded = [
+			type_hash.as_slice(),
+			&{
+				// uint32 is left-padded to 32 bytes
+				let mut buf = [0u8; 32];
+				buf[28..].copy_from_slice(&self.gas_buffer_bps.to_be_bytes());
+				buf
+			},
+			min_profitability_hash.as_slice(),
+			&U256::from(self.nonce).to_be_bytes::<32>(),
+			&U256::from(self.deadline).to_be_bytes::<32>(),
+		]
+		.concat();
+
+		keccak256(&encoded)
+	}
+}
+
 /// Trait for admin action contents that can compute their EIP-712 hash
 pub trait AdminAction {
 	/// Get the nonce from the action
@@ -345,6 +397,21 @@ impl AdminAction for WithdrawContents {
 	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
 		// Withdraw has amount parsing that can fail
 		WithdrawContents::struct_hash(self)
+	}
+}
+
+impl AdminAction for UpdateFeeConfigContents {
+	fn nonce(&self) -> u64 {
+		self.nonce
+	}
+
+	fn deadline(&self) -> u64 {
+		self.deadline
+	}
+
+	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
+		// UpdateFeeConfig has no fallible parsing, always succeeds
+		Ok(UpdateFeeConfigContents::struct_hash(self))
 	}
 }
 
@@ -845,5 +912,143 @@ mod tests {
 		};
 
 		assert_ne!(contents1.struct_hash(), contents2.struct_hash());
+	}
+
+	#[test]
+	fn test_update_fee_config_struct_hash() {
+		let contents = UpdateFeeConfigContents {
+			gas_buffer_bps: 1500,
+			min_profitability_pct: "2.5".to_string(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		let hash = contents.struct_hash();
+		assert_eq!(hash.len(), 32);
+
+		// Same contents should produce same hash
+		let hash2 = contents.struct_hash();
+		assert_eq!(hash, hash2);
+	}
+
+	#[test]
+	fn test_update_fee_config_different_values_different_hash() {
+		let contents1 = UpdateFeeConfigContents {
+			gas_buffer_bps: 1500,
+			min_profitability_pct: "2.5".to_string(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		let contents2 = UpdateFeeConfigContents {
+			gas_buffer_bps: 2000, // Different gas buffer
+			min_profitability_pct: "2.5".to_string(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		assert_ne!(contents1.struct_hash(), contents2.struct_hash());
+
+		let contents3 = UpdateFeeConfigContents {
+			gas_buffer_bps: 1500,
+			min_profitability_pct: "3.0".to_string(), // Different profitability
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		assert_ne!(contents1.struct_hash(), contents3.struct_hash());
+	}
+
+	#[test]
+	fn test_update_fee_config_admin_action_trait() {
+		let contents = UpdateFeeConfigContents {
+			gas_buffer_bps: 1000,
+			min_profitability_pct: "1.5".to_string(),
+			nonce: 42,
+			deadline: 1706184000,
+		};
+
+		assert_eq!(contents.nonce(), 42);
+		assert_eq!(contents.deadline(), 1706184000);
+
+		// struct_hash via trait should succeed
+		let hash = AdminAction::struct_hash(&contents);
+		assert!(hash.is_ok());
+	}
+
+	#[test]
+	fn test_update_fee_config_message_hash() {
+		let contents = UpdateFeeConfigContents {
+			gas_buffer_bps: 1500,
+			min_profitability_pct: "2.5".to_string(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		let hash = contents.message_hash(1).unwrap();
+		assert_eq!(hash.len(), 32);
+
+		// Different chain should produce different hash
+		let hash_other = contents.message_hash(10).unwrap();
+		assert_ne!(hash, hash_other);
+	}
+
+	#[test]
+	fn test_update_fee_config_serialization() {
+		let contents = UpdateFeeConfigContents {
+			gas_buffer_bps: 1500,
+			min_profitability_pct: "2.5".to_string(),
+			nonce: 12345,
+			deadline: 1706184000,
+		};
+
+		let json = serde_json::to_string(&contents).unwrap();
+		assert!(json.contains("\"gasBufferBps\":1500"));
+		assert!(json.contains("\"minProfitabilityPct\":\"2.5\""));
+		assert!(json.contains("\"nonce\":12345"));
+		assert!(json.contains("\"deadline\":1706184000"));
+
+		// Round trip
+		let parsed: UpdateFeeConfigContents = serde_json::from_str(&json).unwrap();
+		assert_eq!(parsed.gas_buffer_bps, 1500);
+		assert_eq!(parsed.min_profitability_pct, "2.5");
+		assert_eq!(parsed.nonce, 12345);
+	}
+
+	#[test]
+	fn test_update_fee_config_deserialize_with_string_nonce() {
+		let json = r#"{
+			"gasBufferBps": 1500,
+			"minProfitabilityPct": "2.5",
+			"nonce": "12345678901234567890",
+			"deadline": "1706184000"
+		}"#;
+
+		let contents: UpdateFeeConfigContents = serde_json::from_str(json).unwrap();
+		assert_eq!(contents.gas_buffer_bps, 1500);
+		assert_eq!(contents.min_profitability_pct, "2.5");
+		assert_eq!(contents.nonce, 12345678901234567890u64);
+		assert_eq!(contents.deadline, 1706184000);
+	}
+
+	#[test]
+	fn test_update_fee_config_signed_request() {
+		let json = r#"{
+			"signature": "0xabababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab1b",
+			"contents": {
+				"gasBufferBps": 1500,
+				"minProfitabilityPct": "2.5",
+				"nonce": "1737925846892",
+				"deadline": "1737929446"
+			}
+		}"#;
+
+		let request: SignedAdminRequest<UpdateFeeConfigContents> =
+			serde_json::from_str(json).unwrap();
+		assert_eq!(request.contents.gas_buffer_bps, 1500);
+		assert_eq!(request.contents.min_profitability_pct, "2.5");
+		assert_eq!(request.contents.nonce, 1737925846892);
+		assert_eq!(request.contents.deadline, 1737929446);
+		assert_eq!(request.signature.len(), 65);
 	}
 }

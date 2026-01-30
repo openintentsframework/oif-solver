@@ -216,6 +216,15 @@ pub struct OperatorPricingConfig {
 	/// Key is token symbol, value is price as decimal string.
 	#[serde(default)]
 	pub custom_prices: HashMap<String, String>,
+
+	/// Gas buffer in basis points (e.g., 1000 = 10%).
+	/// Applied as safety margin on gas cost estimates.
+	#[serde(default = "default_gas_buffer_bps")]
+	pub gas_buffer_bps: u32,
+}
+
+fn default_gas_buffer_bps() -> u32 {
+	1000 // 10%
 }
 
 /// Solver behavior settings.
@@ -504,6 +513,7 @@ mod tests {
 				fallbacks: vec!["defillama".to_string()],
 				cache_duration_seconds: 60,
 				custom_prices: HashMap::new(),
+				gas_buffer_bps: 1000,
 			},
 			solver: OperatorSolverConfig {
 				min_profitability_pct: Decimal::ONE,

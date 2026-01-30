@@ -154,7 +154,7 @@ impl SolverEngine {
 			solver_address,
 			token_manager.clone(),
 			cost_profit_service,
-			config_snapshot.clone(),
+			shared_config.clone(), // Pass shared config for hot-reload support
 		));
 
 		let order_handler = Arc::new(OrderHandler::new(

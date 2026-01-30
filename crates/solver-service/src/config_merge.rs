@@ -24,6 +24,7 @@
 //! ```
 
 use crate::seeds::types::{NetworkSeed, SeedConfig, SeedDefaults};
+use rust_decimal::Decimal;
 use solver_config::{
 	AccountConfig, ApiConfig, ApiImplementations, Config, DeliveryConfig, DiscoveryConfig,
 	GasConfig, GasFlowUnits, OrderConfig, PricingConfig, SettlementConfig, SolverConfig,
@@ -120,7 +121,7 @@ pub fn merge_config(overrides: SeedOverrides, seed: &SeedConfig) -> Result<Confi
 
 	// Build the full config
 	let config = Config {
-		solver: build_solver_config(&solver_id, &seed.defaults),
+		solver: build_solver_config(&solver_id, &seed.defaults, overrides.min_profitability_pct),
 		networks,
 		storage: build_storage_config(&seed.defaults),
 		delivery: build_delivery_config(&chain_ids, &seed.defaults),
@@ -128,7 +129,10 @@ pub fn merge_config(overrides: SeedOverrides, seed: &SeedConfig) -> Result<Confi
 		discovery: build_discovery_config(&chain_ids, &seed.defaults),
 		order: build_order_config(&seed.defaults),
 		settlement: build_settlement_config(&chain_ids, seed),
-		pricing: Some(build_pricing_config(&seed.defaults)),
+		pricing: Some(build_pricing_config(
+			&seed.defaults,
+			overrides.gas_buffer_bps,
+		)),
 		api: Some(build_api_config(overrides.admin.as_ref())),
 		gas: Some(build_gas_config(&seed.defaults)),
 	};
@@ -206,6 +210,13 @@ pub fn merge_to_operator_config(
 		None => OperatorAdminConfig::default(),
 	};
 
+	// Extract fee config overrides (flattened in SeedOverrides)
+	let min_profitability_pct = initializer
+		.min_profitability_pct
+		.unwrap_or(seed.defaults.min_profitability_pct);
+
+	let gas_buffer_bps = initializer.gas_buffer_bps.unwrap_or(1000);
+
 	Ok(OperatorConfig {
 		solver_id,
 		networks,
@@ -240,9 +251,10 @@ pub fn merge_to_operator_config(
 				.collect(),
 			cache_duration_seconds: seed.defaults.cache_duration_seconds,
 			custom_prices: HashMap::new(),
+			gas_buffer_bps,
 		},
 		solver: OperatorSolverConfig {
-			min_profitability_pct: seed.defaults.min_profitability_pct,
+			min_profitability_pct,
 			monitoring_timeout_seconds: seed.defaults.monitoring_timeout_seconds,
 		},
 		admin,
@@ -735,6 +747,7 @@ fn build_pricing_config_from_operator(pricing: &OperatorPricingConfig) -> Pricin
 		primary: pricing.primary.clone(),
 		fallbacks: pricing.fallbacks.clone(),
 		implementations,
+		gas_buffer_bps: pricing.gas_buffer_bps,
 	}
 }
 
@@ -868,10 +881,14 @@ fn build_network_config(seed: &NetworkSeed, override_: &NetworkOverride) -> Netw
 }
 
 /// Builds the SolverConfig section.
-fn build_solver_config(solver_id: &str, defaults: &SeedDefaults) -> SolverConfig {
+fn build_solver_config(
+	solver_id: &str,
+	defaults: &SeedDefaults,
+	min_profitability_override: Option<Decimal>,
+) -> SolverConfig {
 	SolverConfig {
 		id: solver_id.to_string(),
-		min_profitability_pct: defaults.min_profitability_pct,
+		min_profitability_pct: min_profitability_override.unwrap_or(defaults.min_profitability_pct),
 		monitoring_timeout_seconds: defaults.monitoring_timeout_seconds,
 	}
 }
@@ -1119,7 +1136,10 @@ fn build_hyperlane_config(chain_ids: &[u64], seed: &SeedConfig) -> toml::Value {
 }
 
 /// Builds the PricingConfig section.
-fn build_pricing_config(defaults: &SeedDefaults) -> PricingConfig {
+fn build_pricing_config(
+	defaults: &SeedDefaults,
+	gas_buffer_bps_override: Option<u32>,
+) -> PricingConfig {
 	let mut implementations = HashMap::new();
 
 	// CoinGecko implementation
@@ -1147,6 +1167,7 @@ fn build_pricing_config(defaults: &SeedDefaults) -> PricingConfig {
 			.map(|s| s.to_string())
 			.collect(),
 		implementations,
+		gas_buffer_bps: gas_buffer_bps_override.unwrap_or(1000), // Default 10%
 	}
 }
 
@@ -1354,7 +1375,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 			eip3009_escrow: OperatorGasFlowUnits::default(),
 		});
 
-	// Extract pricing config
+	// Extract pricing config, preserving gas_buffer_bps if present
 	let pricing = config
 		.pricing
 		.as_ref()
@@ -1363,12 +1384,14 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 			fallbacks: p.fallbacks.clone(),
 			cache_duration_seconds: 60, // Default
 			custom_prices: HashMap::new(),
+			gas_buffer_bps: p.gas_buffer_bps,
 		})
 		.unwrap_or(OperatorPricingConfig {
 			primary: "coingecko".to_string(),
 			fallbacks: vec!["defillama".to_string()],
 			cache_duration_seconds: 60,
 			custom_prices: HashMap::new(),
+			gas_buffer_bps: 1000, // Default 10%
 		});
 
 	// Extract admin config
@@ -1587,6 +1610,8 @@ mod tests {
 				},
 			],
 			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
 		}
 	}
 
@@ -1632,6 +1657,8 @@ mod tests {
 				},
 			],
 			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -1663,6 +1690,8 @@ mod tests {
 				},
 			],
 			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -1687,6 +1716,8 @@ mod tests {
 				rpc_urls: None,
 			}],
 			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -1717,6 +1748,68 @@ mod tests {
 		let base_network = config.networks.get(&84532).unwrap();
 		let rpc_url = base_network.get_http_url().unwrap();
 		assert_eq!(rpc_url, "https://custom-rpc.example.com");
+	}
+
+	#[test]
+	fn test_merge_config_applies_fee_overrides() {
+		use std::str::FromStr;
+
+		// Create overrides with fee configuration
+		let overrides = SeedOverrides {
+			solver_id: Some("fee-test-solver".to_string()),
+			networks: vec![
+				NetworkOverride {
+					chain_id: 11155420,
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "USDC".to_string(),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+				NetworkOverride {
+					chain_id: 84532,
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "USDC".to_string(),
+						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+			],
+			admin: None,
+			min_profitability_pct: Some(Decimal::from_str("2.5").unwrap()), // Override: 2.5%
+			gas_buffer_bps: Some(1500),                                     // Override: 15%
+		};
+
+		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
+
+		// Verify min_profitability_pct is applied
+		assert_eq!(
+			config.solver.min_profitability_pct,
+			Decimal::from_str("2.5").unwrap()
+		);
+
+		// Verify gas_buffer_bps is applied
+		let pricing = config.pricing.as_ref().unwrap();
+		assert_eq!(pricing.gas_buffer_bps, 1500);
+	}
+
+	#[test]
+	fn test_merge_config_uses_defaults_when_no_fee_overrides() {
+		// Test seed overrides without fee configuration uses seed defaults
+		let overrides = test_seed_overrides();
+		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
+
+		// Should use seed default min_profitability_pct
+		assert_eq!(
+			config.solver.min_profitability_pct,
+			TESTNET_SEED.defaults.min_profitability_pct
+		);
+
+		// Should use default gas_buffer_bps (1000 = 10%)
+		let pricing = config.pricing.as_ref().unwrap();
+		assert_eq!(pricing.gas_buffer_bps, 1000);
 	}
 
 	#[test]
@@ -1839,6 +1932,8 @@ mod tests {
 				},
 			],
 			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -1874,6 +1969,8 @@ mod tests {
 				},
 			],
 			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -1930,6 +2027,8 @@ mod tests {
 				},
 			],
 			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -1961,6 +2060,8 @@ mod tests {
 				},
 			],
 			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -1996,6 +2097,8 @@ mod tests {
 				},
 			],
 			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -2020,6 +2123,8 @@ mod tests {
 				rpc_urls: None,
 			}],
 			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -2051,6 +2156,8 @@ mod tests {
 				},
 			],
 			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -2092,6 +2199,8 @@ mod tests {
 				nonce_ttl_seconds: Some(600),
 				admin_addresses: vec![address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")],
 			}),
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -2192,6 +2301,7 @@ mod tests {
 				fallbacks: vec![],
 				cache_duration_seconds: 60,
 				custom_prices: HashMap::new(),
+				gas_buffer_bps: 1000,
 			},
 			solver: OperatorSolverConfig {
 				min_profitability_pct: Decimal::from_str("0.0").unwrap(),
@@ -2441,6 +2551,7 @@ mod tests {
 			fallbacks: vec!["defillama".to_string()],
 			cache_duration_seconds: 120,
 			custom_prices: HashMap::new(),
+			gas_buffer_bps: 1500,
 		};
 
 		let pricing = build_pricing_config_from_operator(&op_pricing);
@@ -2449,6 +2560,7 @@ mod tests {
 		assert_eq!(pricing.fallbacks, vec!["defillama".to_string()]);
 		assert!(pricing.implementations.contains_key("coingecko"));
 		assert!(pricing.implementations.contains_key("defillama"));
+		assert_eq!(pricing.gas_buffer_bps, 1500);
 	}
 
 	#[test]
