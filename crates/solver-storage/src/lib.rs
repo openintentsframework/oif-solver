@@ -27,8 +27,8 @@ pub use redis_health::{
 
 // Re-export readiness types for convenience
 pub use readiness::{
-	get_readiness_checker, ReadinessCheck, ReadinessConfig, ReadinessError, ReadinessStatus,
-	StorageReadiness,
+	check_storage_readiness, get_readiness_checker, verify_storage_readiness, PersistencePolicy,
+	ReadinessCheck, ReadinessConfig, ReadinessError, ReadinessStatus, StorageReadiness,
 };
 
 use async_trait::async_trait;
@@ -315,6 +315,29 @@ impl std::fmt::Debug for StoreConfig {
 				f.debug_struct("Redis").field("url", &redacted).finish()
 			},
 			StoreConfig::Memory => f.debug_struct("Memory").finish(),
+		}
+	}
+}
+
+impl StoreConfig {
+	/// Build a storage config from environment variables.
+	///
+	/// Supported backends:
+	/// - STORAGE_BACKEND=redis (default) uses REDIS_URL
+	/// - STORAGE_BACKEND=memory
+	pub fn from_env() -> Result<Self, StorageError> {
+		let backend = std::env::var("STORAGE_BACKEND").unwrap_or_else(|_| "redis".to_string());
+		match backend.as_str() {
+			"redis" => {
+				let url = std::env::var("REDIS_URL")
+					.unwrap_or_else(|_| "redis://localhost:6379".to_string());
+				Ok(StoreConfig::Redis { url })
+			},
+			"memory" => Ok(StoreConfig::Memory),
+			other => Err(StorageError::Configuration(format!(
+				"Unsupported storage backend '{}'",
+				other
+			))),
 		}
 	}
 }

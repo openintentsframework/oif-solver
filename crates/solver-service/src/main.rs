@@ -6,19 +6,20 @@
 //!
 //! # Configuration
 //!
-//! The solver uses Redis as the single source of truth for runtime configuration.
-//! Configuration is seeded once when deploying a new solver, then loaded from Redis
+//! The solver uses a storage backend (Redis by default) as the single source of truth
+//! for runtime configuration. Configuration is seeded once when deploying a new solver,
+//! then loaded from storage on subsequent startups.
 //! on subsequent startups.
 //!
 //! # Usage
 //!
 //! ```bash
-//! # First run: seed configuration to Redis
+//! # First run: seed configuration to storage (Redis by default)
 //! export REDIS_URL="redis://localhost:6379"
 //! export SOLVER_PRIVATE_KEY="your_64_hex_character_private_key"
 //! solver --seed testnet --seed-overrides '{"networks":[...]}'
 //!
-//! # Subsequent runs: load from Redis
+//! # Subsequent runs: load from storage
 //! export SOLVER_ID="your-solver-id"
 //! solver
 //!
@@ -35,8 +36,7 @@ use solver_service::{
 	server,
 };
 use solver_storage::{
-	config_store::create_config_store, get_readiness_checker, ReadinessConfig, ReadinessError,
-	StoreConfig,
+	config_store::create_config_store, verify_storage_readiness, StoreConfig,
 };
 use solver_types::{OperatorConfig, SeedOverrides};
 use std::sync::Arc;
@@ -48,7 +48,7 @@ use tokio::sync::RwLock;
 struct Args {
 	/// Seed preset to use (mainnet, testnet)
 	///
-	/// Use this with --seed-overrides to seed initial configuration to Redis.
+	/// Use this with --seed-overrides to seed initial configuration to storage.
 	#[arg(long)]
 	seed: Option<String>,
 
@@ -59,7 +59,7 @@ struct Args {
 	#[arg(long)]
 	seed_overrides: Option<String>,
 
-	/// Force re-seed even if configuration exists in Redis
+	/// Force re-seed even if configuration exists in storage
 	#[arg(long, default_value = "false")]
 	force_seed: bool,
 
@@ -73,7 +73,7 @@ struct Args {
 /// This function:
 /// 1. Parses command-line arguments
 /// 2. Initializes logging infrastructure
-/// 3. Loads or seeds configuration (from file or Redis)
+/// 3. Loads or seeds configuration (from file or storage)
 /// 4. Builds the solver engine with all implementations
 /// 5. Runs the solver until interrupted
 #[tokio::main]
@@ -96,11 +96,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 	tracing::info!("Started solver");
 
+	// Build storage configuration from environment
+	let store_config = StoreConfig::from_env()?;
+
 	// Verify storage readiness (informational by default)
-	verify_storage_readiness().await?;
+	verify_storage_readiness(&store_config).await?;
 
 	// Load configuration based on mode
-	let config = load_config(&args).await?;
+	let config = load_config(&args, store_config.clone()).await?;
 	tracing::info!("Loaded configuration [{}]", config.solver.id);
 
 	// Create dynamic config for hot reload support
@@ -146,10 +149,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Load configuration based on command-line arguments.
 ///
-/// Configuration is loaded from Redis, optionally seeding first with --seed + --seed-overrides.
-async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> {
-	let redis_url =
-		std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+/// Configuration is loaded from storage, optionally seeding first with --seed + --seed-overrides.
+async fn load_config(
+	args: &Args,
+	store_config: StoreConfig,
+) -> Result<Config, Box<dyn std::error::Error>> {
 
 	// Handle seeding if requested
 	if let (Some(seed_name), Some(seed_overrides_str)) = (&args.seed, &args.seed_overrides) {
@@ -168,9 +172,7 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 
 		// Create OperatorConfig store for seeding (not legacy Config store)
 		let operator_store = create_config_store::<OperatorConfig>(
-			StoreConfig::Redis {
-				url: redis_url.clone(),
-			},
+			store_config.clone(),
 			format!("{}-operator", solver_id),
 		)?;
 
@@ -204,7 +206,7 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 			operator_store.delete().await?;
 		}
 
-		tracing::info!("Seeding OperatorConfig to Redis");
+		tracing::info!("Seeding OperatorConfig to storage");
 		let versioned = operator_store.seed(operator_config).await?;
 
 		// Build runtime Config from OperatorConfig
@@ -222,7 +224,7 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 		return Ok(config);
 	}
 
-	// Try to load from Redis
+	// Try to load from storage
 	// First, we need to determine the solver_id to use
 	// If not seeding, we need to either:
 	// 1. Use a solver_id from environment
@@ -230,74 +232,47 @@ async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> 
 	let solver_id = std::env::var("SOLVER_ID").map_err(|_| {
 		"No configuration source specified. Use one of:\n\
          1. --seed <preset> --seed-overrides <json> to seed new configuration\n\
-         2. Set SOLVER_ID environment variable to load existing configuration from Redis"
+         2. Set SOLVER_ID environment variable to load existing configuration from storage"
 	})?;
 
-	tracing::info!("Loading configuration from Redis for solver: {}", solver_id);
+	tracing::info!("Loading configuration from storage for solver: {}", solver_id);
 
 	// First, try to load OperatorConfig (admin API may have modified it)
 	let operator_store = create_config_store::<OperatorConfig>(
-		StoreConfig::Redis {
-			url: redis_url.clone(),
-		},
+		store_config.clone(),
 		format!("{}-operator", solver_id),
 	)?;
 
-	if operator_store.exists().await? {
-		// OperatorConfig exists - this is the expected path for admin API changes
-		match operator_store.get().await {
-			Ok(versioned) => {
-				tracing::info!(
-					"Loaded OperatorConfig from Redis: version={} (admin API changes will be applied)",
-					versioned.version
-				);
-
-				// Build runtime Config from OperatorConfig - fail loudly if invalid
-				match build_runtime_config(&versioned.data) {
-					Ok(config) => return Ok(config),
-					Err(e) => {
-						// OperatorConfig exists but is invalid - fail with clear error
-						return Err(format!(
-							"OperatorConfig in Redis is invalid: {}. \
-							Fix the config or delete key '{}-operator' to re-seed.",
-							e, solver_id
-						)
-						.into());
-					},
-				}
-			},
-			Err(e) => {
-				// OperatorConfig exists but failed to load (corrupted?)
-				return Err(format!(
-					"Failed to load OperatorConfig from Redis: {}. \
-					Check Redis connectivity or delete key '{}-operator' to re-seed.",
-					e, solver_id
-				)
-				.into());
-			},
-		}
-	}
-
-	// Fall back to loading Config directly (backward compatibility for existing deployments)
-	tracing::info!("No OperatorConfig found, loading legacy Config directly");
-	let config_store =
-		create_config_store::<Config>(StoreConfig::Redis { url: redis_url }, solver_id.clone())?;
-
-	match config_store.get().await {
-		Ok(versioned) => {
-			tracing::info!(
-				"Loaded legacy configuration from Redis: version={}",
-				versioned.version
-			);
-			Ok(versioned.into_inner())
-		},
-		Err(e) => Err(format!(
-			"No configuration found for solver '{}': {}. \
-			Use --seed <preset> --seed-overrides <json> to create initial configuration.",
-			solver_id, e
+	if !operator_store.exists().await? {
+		return Err(format!(
+			"OperatorConfig not found in storage for solver '{}'. \
+			Run with --seed <preset> to initialize configuration first.",
+			solver_id
 		)
-		.into()),
+		.into());
 	}
+
+	let versioned = operator_store.get().await.map_err(|e| {
+		format!(
+			"Failed to load OperatorConfig from storage: {}. \
+			Check storage connectivity or delete key '{}-operator' to re-seed.",
+			e, solver_id
+		)
+	})?;
+
+	tracing::info!(
+		"Loaded OperatorConfig from storage: version={}",
+		versioned.version
+	);
+
+	build_runtime_config(&versioned.data).map_err(|e| {
+		format!(
+			"OperatorConfig in storage is invalid: {}. \
+			Fix the config or delete key '{}-operator' to re-seed.",
+			e, solver_id
+		)
+		.into()
+	})
 }
 
 /// Parse seed overrides from a JSON string or file path.
@@ -310,122 +285,4 @@ fn parse_seed_overrides(input: &str) -> Result<SeedOverrides, Box<dyn std::error
 
 	// Treat as JSON string
 	Ok(serde_json::from_str(input)?)
-}
-
-/// Verify storage readiness for the configured backend.
-///
-/// This function uses the `StorageReadiness` trait to check backend-specific
-/// requirements. Currently supports Redis backend.
-///
-/// By default, this function:
-/// - Checks backend connectivity
-/// - Logs readiness status (warning if issues found)
-/// - Does NOT fail if checks don't pass (informational only)
-///
-/// # Strict Mode
-///
-/// Set `REQUIRE_PERSISTENCE=true` to fail startup if persistence is disabled.
-/// Set `REQUIRE_PERSISTENCE_STRICT=true` to use more accurate checks (e.g., CONFIG GET
-/// for Redis, which may fail on managed Redis with restricted ACLs).
-async fn verify_storage_readiness() -> Result<(), Box<dyn std::error::Error>> {
-	// Determine backend (default to redis for now)
-	let backend_name = std::env::var("STORAGE_BACKEND").unwrap_or_else(|_| "redis".to_string());
-
-	let backend_url = match backend_name.as_str() {
-		"redis" => {
-			std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string())
-		},
-		_ => String::new(),
-	};
-
-	// Get readiness checker for this backend
-	let Some(checker) = get_readiness_checker(&backend_name) else {
-		tracing::info!("No readiness checker for backend: {}", backend_name);
-		return Ok(());
-	};
-
-	// Skip if backend has no checks to perform
-	if !checker.has_checks() {
-		tracing::warn!(
-			"Using {} backend - no readiness checks to perform",
-			backend_name
-		);
-		return Ok(());
-	}
-
-	// Build config from environment
-	let config = ReadinessConfig {
-		strict: std::env::var("REQUIRE_PERSISTENCE")
-			.map(|v| v == "1" || v.to_lowercase() == "true")
-			.unwrap_or(false),
-		strict_checks: std::env::var("REQUIRE_PERSISTENCE_STRICT")
-			.map(|v| v == "1" || v.to_lowercase() == "true")
-			.unwrap_or(false),
-		timeout_ms: 5000,
-	};
-
-	tracing::info!("Checking {} storage readiness...", backend_name);
-
-	match checker.check(&backend_url, &config).await {
-		Ok(status) => {
-			// Log the readiness status
-			tracing::info!("════════════════════════════════════════════════════════════");
-			tracing::info!("  {} Storage Readiness", status.backend_name);
-			tracing::info!("════════════════════════════════════════════════════════════");
-
-			for check in &status.checks {
-				if check.passed {
-					tracing::info!("  {}: {}", check.name, check.status);
-				} else {
-					tracing::warn!("  {}: {}", check.name, check.status);
-				}
-				if let Some(msg) = &check.message {
-					tracing::info!("    └─ {}", msg);
-				}
-			}
-
-			for (key, value) in &status.details {
-				tracing::info!("  {}: {}", key, value);
-			}
-
-			tracing::info!("════════════════════════════════════════════════════════════");
-
-			// Fail if not ready and strict mode is enabled
-			if !status.is_ready {
-				tracing::error!("════════════════════════════════════════════════════════════");
-				tracing::error!("  STARTUP BLOCKED: Storage not ready");
-				tracing::error!("════════════════════════════════════════════════════════════");
-				tracing::error!("");
-				tracing::error!("  To fix:");
-				tracing::error!("  1. Address the failed checks above OR");
-				tracing::error!("  2. Set REQUIRE_PERSISTENCE=false (not recommended)");
-				tracing::error!("");
-				tracing::error!("  See docs/redis-persistence.md for instructions.");
-				tracing::error!("════════════════════════════════════════════════════════════");
-				return Err(ReadinessError::NotReady(
-					"Storage readiness checks failed".to_string(),
-				)
-				.into());
-			}
-
-			Ok(())
-		},
-		Err(ReadinessError::ConnectionFailed(msg)) => {
-			tracing::error!("════════════════════════════════════════════════════════════");
-			tracing::error!("  {} Storage: CONNECTION FAILED", backend_name);
-			tracing::error!("════════════════════════════════════════════════════════════");
-			tracing::error!("  Error: {}", msg);
-			tracing::error!("");
-			tracing::error!("  Verify that:");
-			tracing::error!("  1. The storage backend is running");
-			tracing::error!("  2. Connection URL is correct");
-			tracing::error!("  3. Network connectivity is available");
-			tracing::error!("════════════════════════════════════════════════════════════");
-			Err(ReadinessError::ConnectionFailed(msg).into())
-		},
-		Err(e) => {
-			tracing::error!("Storage readiness check failed: {}", e);
-			Err(e.into())
-		},
-	}
 }

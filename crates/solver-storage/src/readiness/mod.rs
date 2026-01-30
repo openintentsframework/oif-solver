@@ -22,8 +22,10 @@ mod redis;
 pub use redis::RedisReadiness;
 
 use async_trait::async_trait;
+use serde::Serialize;
 use std::collections::HashMap;
 use thiserror::Error;
+use crate::StoreConfig;
 
 /// Errors that can occur during readiness checks.
 #[derive(Debug, Error)]
@@ -42,7 +44,7 @@ pub enum ReadinessError {
 }
 
 /// Result of readiness verification.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ReadinessStatus {
 	/// Human-readable name of the backend
 	pub backend_name: String,
@@ -54,8 +56,50 @@ pub struct ReadinessStatus {
 	pub details: HashMap<String, String>,
 }
 
+/// Persistence enforcement policy for readiness checks.
+#[derive(Debug, Clone, Copy)]
+pub enum PersistencePolicy {
+	/// Do not fail startup if persistence is disabled (warn only).
+	WarnIfDisabled,
+	/// Fail startup if persistence is disabled.
+	RequireEnabled,
+	/// Fail startup if persistence is disabled and use strict checks (CONFIG GET).
+	RequireEnabledStrict,
+}
+
+impl PersistencePolicy {
+	/// Build policy from environment variables.
+	///
+	/// - REQUIRE_PERSISTENCE=true => RequireEnabled
+	/// - REQUIRE_PERSISTENCE_STRICT=true => RequireEnabledStrict
+	pub fn from_env() -> Self {
+		let require = std::env::var("REQUIRE_PERSISTENCE")
+			.map(|v| v == "1" || v.to_lowercase() == "true")
+			.unwrap_or(false);
+		let strict = std::env::var("REQUIRE_PERSISTENCE_STRICT")
+			.map(|v| v == "1" || v.to_lowercase() == "true")
+			.unwrap_or(false);
+
+		if strict {
+			Self::RequireEnabledStrict
+		} else if require {
+			Self::RequireEnabled
+		} else {
+			Self::WarnIfDisabled
+		}
+	}
+
+	fn is_strict(self) -> bool {
+		matches!(self, Self::RequireEnabled | Self::RequireEnabledStrict)
+	}
+
+	fn use_strict_checks(self) -> bool {
+		matches!(self, Self::RequireEnabledStrict)
+	}
+}
+
 /// Individual readiness check result.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ReadinessCheck {
 	/// Name of the check (e.g., "connectivity", "persistence")
 	pub name: String,
@@ -113,6 +157,116 @@ pub trait StorageReadiness: Send + Sync {
 	/// Some backends (like memory) have no meaningful readiness checks.
 	fn has_checks(&self) -> bool {
 		true
+	}
+}
+
+/// Run readiness checks for a storage configuration.
+///
+/// This is storage-agnostic: backend-specific logic lives in each checker.
+pub async fn check_storage_readiness(
+	config: &StoreConfig,
+	policy: PersistencePolicy,
+	timeout_ms: u64,
+) -> Result<ReadinessStatus, ReadinessError> {
+	match config {
+		StoreConfig::Redis { url } => {
+			let checker = RedisReadiness::new();
+			let config = ReadinessConfig {
+				strict: policy.is_strict(),
+				strict_checks: policy.use_strict_checks(),
+				timeout_ms,
+			};
+			checker.check(url, &config).await
+		},
+		StoreConfig::Memory => Ok(ReadinessStatus {
+			backend_name: "Memory".to_string(),
+			is_ready: true,
+			checks: Vec::new(),
+			details: HashMap::new(),
+		}),
+		StoreConfig::Storage(_) => Ok(ReadinessStatus {
+			backend_name: "Storage".to_string(),
+			is_ready: true,
+			checks: Vec::new(),
+			details: HashMap::new(),
+		}),
+	}
+}
+
+/// Verify storage readiness with logging and optional enforcement.
+///
+/// This helper performs readiness checks, logs details, and enforces persistence
+/// based on `PersistencePolicy` derived from environment variables.
+pub async fn verify_storage_readiness(
+	store_config: &StoreConfig,
+) -> Result<(), ReadinessError> {
+	let backend_label = match store_config {
+		StoreConfig::Redis { .. } => "Redis",
+		StoreConfig::Memory => "Memory",
+		StoreConfig::Storage(_) => "Storage",
+	};
+
+	let policy = PersistencePolicy::from_env();
+	let timeout_ms = 5000;
+
+	match check_storage_readiness(store_config, policy, timeout_ms).await {
+		Ok(status) => {
+			tracing::info!("════════════════════════════════════════════════════════════");
+			tracing::info!("  {} Storage Readiness", status.backend_name);
+			tracing::info!("════════════════════════════════════════════════════════════");
+
+			for check in &status.checks {
+				if check.passed {
+					tracing::info!("  {}: {}", check.name, check.status);
+				} else {
+					tracing::warn!("  {}: {}", check.name, check.status);
+				}
+				if let Some(msg) = &check.message {
+					tracing::info!("    └─ {}", msg);
+				}
+			}
+
+			for (key, value) in &status.details {
+				tracing::info!("  {}: {}", key, value);
+			}
+
+			tracing::info!("════════════════════════════════════════════════════════════");
+
+			if !status.is_ready {
+				tracing::error!("════════════════════════════════════════════════════════════");
+				tracing::error!("  STARTUP BLOCKED: Storage not ready");
+				tracing::error!("════════════════════════════════════════════════════════════");
+				tracing::error!("");
+				tracing::error!("  To fix:");
+				tracing::error!("  1. Address the failed checks above OR");
+				tracing::error!("  2. Set REQUIRE_PERSISTENCE=false (not recommended)");
+				tracing::error!("");
+				tracing::error!("  See docs/redis-persistence.md for instructions.");
+				tracing::error!("════════════════════════════════════════════════════════════");
+				return Err(ReadinessError::NotReady(
+					"Storage readiness checks failed".to_string(),
+				));
+			}
+
+			Ok(())
+		},
+		Err(ReadinessError::ConnectionFailed(msg)) => {
+			tracing::error!("════════════════════════════════════════════════════════════");
+			tracing::error!("  {} Storage: CONNECTION FAILED", backend_label);
+			tracing::error!("════════════════════════════════════════════════════════════");
+			tracing::error!("  Error: {}", msg);
+			tracing::error!("");
+			tracing::error!("  Verify that:");
+			tracing::error!("  1. The storage backend is running");
+			tracing::error!("  2. Connection URL is correct");
+			tracing::error!("  3. Network connectivity is available");
+			tracing::error!("════════════════════════════════════════════════════════════");
+			Err(ReadinessError::ConnectionFailed(msg))
+		},
+		Err(e) => {
+			tracing::error!("Storage readiness check failed: {}", e);
+			Err(e)
+		},
 	}
 }
 

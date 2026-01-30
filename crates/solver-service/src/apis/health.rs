@@ -6,7 +6,8 @@
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Serialize;
-use solver_storage::check_redis_health;
+use solver_storage::{check_storage_readiness, PersistencePolicy, ReadinessCheck, StoreConfig};
+use std::collections::HashMap;
 
 use crate::server::AppState;
 
@@ -15,8 +16,11 @@ use crate::server::AppState;
 pub struct HealthResponse {
 	/// Overall health status: "healthy" or "unhealthy"
 	pub status: String,
-	/// Redis connection and persistence status
-	pub redis: RedisHealth,
+	/// Generic storage readiness status
+	pub storage: StorageHealth,
+	/// Redis connection and persistence status (only for Redis backend)
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub redis: Option<RedisHealth>,
 	/// Solver ID from configuration
 	pub solver_id: String,
 	/// Application version
@@ -35,6 +39,22 @@ pub struct RedisHealth {
 	/// Whether AOF (append-only file) is enabled
 	pub aof_enabled: bool,
 	/// Error message if health check failed
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub error: Option<String>,
+}
+
+/// Generic storage health status.
+#[derive(Serialize)]
+pub struct StorageHealth {
+	/// Backend name (e.g., "Redis", "Memory")
+	pub backend: String,
+	/// Whether the backend is ready for operation
+	pub ready: bool,
+	/// Individual readiness checks
+	pub checks: Vec<ReadinessCheck>,
+	/// Additional details for debugging
+	pub details: HashMap<String, String>,
+	/// Optional error message
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub error: Option<String>,
 }
@@ -65,22 +85,72 @@ pub struct RedisHealth {
 /// - `200 OK` - Healthy (Redis connected)
 /// - `503 Service Unavailable` - Unhealthy (Redis disconnected)
 pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
-	let redis_url =
-		std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+	let store_config = match StoreConfig::from_env() {
+		Ok(config) => config,
+		Err(e) => {
+			let response = HealthResponse {
+				status: "unhealthy".to_string(),
+				storage: StorageHealth {
+					backend: "unknown".to_string(),
+					ready: false,
+					checks: Vec::new(),
+					details: HashMap::new(),
+					error: Some(e.to_string()),
+				},
+				redis: None,
+				solver_id: state.config.read().await.solver.id.clone(),
+				version: env!("CARGO_PKG_VERSION").to_string(),
+			};
 
-	let redis_health = match check_redis_health(&redis_url, 2000).await {
-		Ok(info) => RedisHealth {
-			connected: true,
-			persistence_enabled: info.has_persistence(),
-			rdb_enabled: info.rdb_enabled,
-			aof_enabled: info.aof_enabled,
-			error: None,
+			return (StatusCode::SERVICE_UNAVAILABLE, Json(response));
 		},
-		Err(e) => RedisHealth {
-			connected: false,
-			persistence_enabled: false,
-			rdb_enabled: false,
-			aof_enabled: false,
+	};
+
+	let policy = PersistencePolicy::from_env();
+	let readiness = check_storage_readiness(&store_config, policy, 2000).await;
+
+	let mut redis_health: Option<RedisHealth> = None;
+	let storage_health = match readiness {
+		Ok(status) => {
+			if status.backend_name.to_lowercase() == "redis" {
+				let mut connected = false;
+				let mut rdb_enabled = false;
+				let mut aof_enabled = false;
+				for check in &status.checks {
+					match check.name.as_str() {
+						"connectivity" => connected = check.passed,
+						"rdb_persistence" => rdb_enabled = check.passed,
+						"aof_persistence" => aof_enabled = check.passed,
+						_ => {},
+					}
+				}
+
+				redis_health = Some(RedisHealth {
+					connected,
+					persistence_enabled: rdb_enabled || aof_enabled,
+					rdb_enabled,
+					aof_enabled,
+					error: None,
+				});
+			}
+
+			StorageHealth {
+				backend: status.backend_name.clone(),
+				ready: status.is_ready,
+				checks: status.checks,
+				details: status.details,
+				error: None,
+			}
+		},
+		Err(e) => StorageHealth {
+			backend: match store_config {
+				StoreConfig::Redis { .. } => "Redis".to_string(),
+				StoreConfig::Memory => "Memory".to_string(),
+				StoreConfig::Storage(_) => "Storage".to_string(),
+			},
+			ready: false,
+			checks: Vec::new(),
+			details: HashMap::new(),
 			error: Some(e.to_string()),
 		},
 	};
@@ -88,11 +158,12 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 	let solver_id = state.config.read().await.solver.id.clone();
 
 	let response = HealthResponse {
-		status: if redis_health.connected {
+		status: if storage_health.ready {
 			"healthy".to_string()
 		} else {
 			"unhealthy".to_string()
 		},
+		storage: storage_health,
 		redis: redis_health,
 		solver_id,
 		version: env!("CARGO_PKG_VERSION").to_string(),
@@ -115,13 +186,20 @@ mod tests {
 	fn test_health_response_serialization_healthy() {
 		let response = HealthResponse {
 			status: "healthy".to_string(),
-			redis: RedisHealth {
+			storage: StorageHealth {
+				backend: "Redis".to_string(),
+				ready: true,
+				checks: Vec::new(),
+				details: HashMap::new(),
+				error: None,
+			},
+			redis: Some(RedisHealth {
 				connected: true,
 				persistence_enabled: true,
 				rdb_enabled: true,
 				aof_enabled: false,
 				error: None,
-			},
+			}),
 			solver_id: "test-solver".to_string(),
 			version: "0.1.0".to_string(),
 		};
@@ -141,13 +219,20 @@ mod tests {
 	fn test_health_response_serialization_unhealthy() {
 		let response = HealthResponse {
 			status: "unhealthy".to_string(),
-			redis: RedisHealth {
+			storage: StorageHealth {
+				backend: "Redis".to_string(),
+				ready: false,
+				checks: Vec::new(),
+				details: HashMap::new(),
+				error: Some("Connection refused".to_string()),
+			},
+			redis: Some(RedisHealth {
 				connected: false,
 				persistence_enabled: false,
 				rdb_enabled: false,
 				aof_enabled: false,
 				error: Some("Connection refused".to_string()),
-			},
+			}),
 			solver_id: "test-solver".to_string(),
 			version: "0.1.0".to_string(),
 		};
