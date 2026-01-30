@@ -1,5 +1,4 @@
 {
-  "solver_id": "oif-solver-testnet",
   "networks": [
     {
       "chain_id": 11155420,
