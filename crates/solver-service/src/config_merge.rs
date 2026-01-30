@@ -128,7 +128,7 @@ pub fn merge_config(overrides: SeedOverrides, seed: &SeedConfig) -> Result<Confi
 			overrides.gas_buffer_bps,
 		),
 		networks,
-		storage: build_storage_config(&seed.defaults),
+		storage: build_storage_config(&seed.defaults, &solver_id),
 		delivery: build_delivery_config(&chain_ids, &seed.defaults),
 		account: build_account_config(&seed.defaults),
 		discovery: build_discovery_config(&chain_ids, &seed.defaults),
@@ -412,7 +412,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 			monitoring_timeout_seconds: operator_config.solver.monitoring_timeout_seconds,
 		},
 		networks,
-		storage: build_storage_config_from_operator(),
+		storage: build_storage_config_from_operator(&operator_config.solver_id),
 		delivery: build_delivery_config_from_operator(&chain_ids),
 		account: build_account_config_from_operator(),
 		discovery: build_discovery_config_from_operator(&chain_ids),
@@ -479,7 +479,9 @@ fn build_networks_from_operator_config(operator_config: &OperatorConfig) -> Netw
 }
 
 /// Builds StorageConfig from operator defaults.
-fn build_storage_config_from_operator() -> StorageConfig {
+///
+/// Uses `solver_id` as the Redis key prefix to isolate storage per solver instance.
+fn build_storage_config_from_operator(solver_id: &str) -> StorageConfig {
 	let mut implementations = HashMap::new();
 
 	// Read Redis URL from environment variable with default fallback
@@ -487,9 +489,10 @@ fn build_storage_config_from_operator() -> StorageConfig {
 		std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
 
 	// Redis implementation config
+	// Use solver_id as key_prefix to isolate storage per solver instance
 	let redis_config = toml_table(vec![
 		("redis_url", toml::Value::String(redis_url)),
-		("key_prefix", toml::Value::String("oif-solver".to_string())),
+		("key_prefix", toml::Value::String(solver_id.to_string())),
 		("connection_timeout_ms", toml::Value::Integer(5000)),
 		("ttl_orders", toml::Value::Integer(0)),
 		("ttl_intents", toml::Value::Integer(86400)),
@@ -907,7 +910,9 @@ fn toml_table(pairs: Vec<(&str, toml::Value)>) -> toml::Value {
 }
 
 /// Builds the StorageConfig section.
-fn build_storage_config(defaults: &SeedDefaults) -> StorageConfig {
+///
+/// Uses `solver_id` as the Redis key prefix to isolate storage per solver instance.
+fn build_storage_config(defaults: &SeedDefaults, solver_id: &str) -> StorageConfig {
 	let mut implementations = HashMap::new();
 
 	// Read Redis URL from environment variable with default fallback
@@ -915,9 +920,10 @@ fn build_storage_config(defaults: &SeedDefaults) -> StorageConfig {
 		std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
 
 	// Redis implementation config
+	// Use solver_id as key_prefix to isolate storage per solver instance
 	let redis_config = toml_table(vec![
 		("redis_url", toml::Value::String(redis_url)),
-		("key_prefix", toml::Value::String("oif-solver".to_string())),
+		("key_prefix", toml::Value::String(solver_id.to_string())),
 		("connection_timeout_ms", toml::Value::Integer(5000)),
 		("ttl_orders", toml::Value::Integer(0)),
 		("ttl_intents", toml::Value::Integer(86400)),
@@ -2500,11 +2506,16 @@ mod tests {
 
 	#[test]
 	fn test_build_storage_config_from_operator() {
-		let storage = build_storage_config_from_operator();
+		let storage = build_storage_config_from_operator("test-solver");
 
 		assert_eq!(storage.primary, "redis");
 		assert!(storage.implementations.contains_key("redis"));
 		assert!(storage.implementations.contains_key("memory"));
+
+		// Verify key_prefix is set to solver_id
+		let redis_config = storage.implementations.get("redis").unwrap();
+		let key_prefix = redis_config.get("key_prefix").unwrap().as_str().unwrap();
+		assert_eq!(key_prefix, "test-solver");
 	}
 
 	#[test]
