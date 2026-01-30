@@ -575,7 +575,8 @@ impl CostProfitService {
 		dest_chain_id: u64,
 		gas_units: &GasUnits,
 	) -> Result<CostBreakdown, CostProfitError> {
-		let pricing = self.pricing_service.config();
+		// Read gas_buffer_bps from solver config (hot-reloadable)
+		let gas_buffer_bps_value = config.solver.gas_buffer_bps;
 
 		// Get gas prices
 		let origin_gp = self.get_chain_gas_price(origin_chain_id).await?;
@@ -614,9 +615,9 @@ impl CostProfitService {
 		)
 		.unwrap_or(Decimal::ZERO);
 
-		// Calculate gas buffer
+		// Calculate gas buffer using config value (hot-reloadable)
 		let gas_subtotal = gas_open + gas_fill + gas_claim;
-		let gas_buffer_bps = Decimal::new(pricing.gas_buffer_bps as i64, 0);
+		let gas_buffer_bps = Decimal::new(gas_buffer_bps_value as i64, 0);
 		let gas_buffer = (gas_subtotal * gas_buffer_bps) / Decimal::from(10000);
 
 		// Rate buffer (currently 0, placeholder for future)

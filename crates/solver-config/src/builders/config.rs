@@ -19,6 +19,7 @@ pub struct ConfigBuilder {
 	solver_id: String,
 	monitoring_timeout_seconds: u64,
 	min_profitability_pct: Decimal,
+	gas_buffer_bps: u32,
 	storage_primary: String,
 	storage_cleanup_interval_seconds: u64,
 	min_confirmations: u64,
@@ -42,6 +43,7 @@ impl ConfigBuilder {
 			solver_id: "test-solver".to_string(),
 			monitoring_timeout_seconds: 60,
 			min_profitability_pct: Decimal::ZERO,
+			gas_buffer_bps: 1000, // 10% default
 			storage_primary: "memory".to_string(),
 			storage_cleanup_interval_seconds: 60,
 			min_confirmations: 1,
@@ -125,6 +127,7 @@ impl ConfigBuilder {
 			solver: SolverConfig {
 				id: self.solver_id,
 				min_profitability_pct: self.min_profitability_pct,
+				gas_buffer_bps: self.gas_buffer_bps,
 				monitoring_timeout_seconds: self.monitoring_timeout_seconds,
 			},
 			networks: self.networks.unwrap_or_default(),

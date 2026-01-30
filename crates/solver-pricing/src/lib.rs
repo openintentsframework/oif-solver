@@ -105,8 +105,6 @@ pub struct PricingConfig {
 	pub currency: String,
 	/// Commission in basis points.
 	pub commission_bps: u32,
-	/// Gas buffer in basis points.
-	pub gas_buffer_bps: u32,
 	/// Rate buffer in basis points.
 	pub rate_buffer_bps: u32,
 	/// Whether to use live gas estimation.
@@ -118,7 +116,6 @@ impl PricingConfig {
 		Self {
 			currency: "USD".to_string(),
 			commission_bps: 20,
-			gas_buffer_bps: 1000,
 			rate_buffer_bps: 14,
 			enable_live_gas_estimate: false,
 		}
@@ -137,10 +134,6 @@ impl PricingConfig {
 				.get("commission_bps")
 				.and_then(|v| v.as_integer())
 				.unwrap_or(defaults.commission_bps as i64) as u32,
-			gas_buffer_bps: table
-				.get("gas_buffer_bps")
-				.and_then(|v| v.as_integer())
-				.unwrap_or(defaults.gas_buffer_bps as i64) as u32,
 			rate_buffer_bps: table
 				.get("rate_buffer_bps")
 				.and_then(|v| v.as_integer())
@@ -306,7 +299,6 @@ mod tests {
 		let config = PricingConfig::default_values();
 		assert_eq!(config.currency, "USD");
 		assert_eq!(config.commission_bps, 20);
-		assert_eq!(config.gas_buffer_bps, 1000);
 		assert_eq!(config.rate_buffer_bps, 14);
 		assert!(!config.enable_live_gas_estimate);
 	}
@@ -318,7 +310,6 @@ mod tests {
 		// Should use all defaults
 		assert_eq!(config.currency, "USD");
 		assert_eq!(config.commission_bps, 20);
-		assert_eq!(config.gas_buffer_bps, 1000);
 		assert_eq!(config.rate_buffer_bps, 14);
 		assert!(!config.enable_live_gas_estimate);
 	}
@@ -329,7 +320,6 @@ mod tests {
 			r#"
 			pricing_currency = "EUR"
 			commission_bps = 50
-			gas_buffer_bps = 500
 			rate_buffer_bps = 25
 			enable_live_gas_estimate = true
 		"#,
@@ -338,7 +328,6 @@ mod tests {
 		let config = PricingConfig::from_table(&table);
 		assert_eq!(config.currency, "EUR");
 		assert_eq!(config.commission_bps, 50);
-		assert_eq!(config.gas_buffer_bps, 500);
 		assert_eq!(config.rate_buffer_bps, 25);
 		assert!(config.enable_live_gas_estimate);
 	}
@@ -356,7 +345,6 @@ mod tests {
 		assert_eq!(config.currency, "GBP");
 		assert_eq!(config.commission_bps, 30);
 		// These should use defaults
-		assert_eq!(config.gas_buffer_bps, 1000);
 		assert_eq!(config.rate_buffer_bps, 14);
 		assert!(!config.enable_live_gas_estimate);
 	}
@@ -451,7 +439,6 @@ mod tests {
 			let config = PricingConfig {
 				currency: "EUR".to_string(),
 				commission_bps: 50,
-				gas_buffer_bps: 500,
 				rate_buffer_bps: 25,
 				enable_live_gas_estimate: true,
 			};

@@ -361,7 +361,9 @@ mod tests {
 			account.clone(),
 		));
 
+		let dynamic_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
 		SolverEngine::new(
+			dynamic_config,
 			config,
 			storage,
 			account,
