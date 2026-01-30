@@ -153,38 +153,10 @@ impl AddTokenContents {
 		}
 	}
 
-	/// Compute the EIP-712 struct hash
+	/// Compute the EIP-712 struct hash using Alloy's built-in support
 	pub fn struct_hash(&self) -> FixedBytes<32> {
-		use alloy_primitives::keccak256;
-
-		// Type hash for AddToken
-		let type_hash = keccak256(
-			b"AddToken(uint256 chainId,string symbol,address tokenAddress,uint8 decimals,uint256 nonce,uint256 deadline)",
-		);
-
-		let symbol_hash = keccak256(self.symbol.as_bytes());
-
-		// Encode struct
-		let encoded = [
-			type_hash.as_slice(),
-			&U256::from(self.chain_id).to_be_bytes::<32>(),
-			symbol_hash.as_slice(),
-			&{
-				let mut buf = [0u8; 32];
-				buf[12..].copy_from_slice(self.token_address.as_slice());
-				buf
-			},
-			&{
-				let mut buf = [0u8; 32];
-				buf[31] = self.decimals;
-				buf
-			},
-			&U256::from(self.nonce).to_be_bytes::<32>(),
-			&U256::from(self.deadline).to_be_bytes::<32>(),
-		]
-		.concat();
-
-		keccak256(&encoded)
+		use alloy_sol_types::SolStruct;
+		self.to_eip712().eip712_hash_struct()
 	}
 }
 
@@ -201,27 +173,20 @@ pub struct RemoveTokenContents {
 }
 
 impl RemoveTokenContents {
+	/// Convert to EIP-712 struct for hashing
+	pub fn to_eip712(&self) -> RemoveToken {
+		RemoveToken {
+			chainId: U256::from(self.chain_id),
+			tokenAddress: self.token_address,
+			nonce: U256::from(self.nonce),
+			deadline: U256::from(self.deadline),
+		}
+	}
+
+	/// Compute the EIP-712 struct hash using Alloy's built-in support
 	pub fn struct_hash(&self) -> FixedBytes<32> {
-		use alloy_primitives::keccak256;
-
-		let type_hash = keccak256(
-			b"RemoveToken(uint256 chainId,address tokenAddress,uint256 nonce,uint256 deadline)",
-		);
-
-		let encoded = [
-			type_hash.as_slice(),
-			&U256::from(self.chain_id).to_be_bytes::<32>(),
-			&{
-				let mut buf = [0u8; 32];
-				buf[12..].copy_from_slice(self.token_address.as_slice());
-				buf
-			},
-			&U256::from(self.nonce).to_be_bytes::<32>(),
-			&U256::from(self.deadline).to_be_bytes::<32>(),
-		]
-		.concat();
-
-		keccak256(&encoded)
+		use alloy_sol_types::SolStruct;
+		self.to_eip712().eip712_hash_struct()
 	}
 }
 
@@ -240,13 +205,10 @@ pub struct WithdrawContents {
 }
 
 impl WithdrawContents {
-	pub fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
-		use alloy_primitives::keccak256;
-
-		let type_hash = keccak256(
-			b"Withdraw(uint256 chainId,address token,uint256 amount,address recipient,uint256 nonce,uint256 deadline)",
-		);
-
+	/// Convert to EIP-712 struct for hashing
+	///
+	/// Returns an error if the amount cannot be parsed as a valid U256.
+	pub fn to_eip712(&self) -> Result<Withdraw, AdminActionHashError> {
 		// Validate amount is not empty
 		if self.amount.is_empty() {
 			return Err(AdminActionHashError::InvalidAmount(
@@ -258,26 +220,20 @@ impl WithdrawContents {
 		let amount = U256::from_str_radix(&self.amount, 10)
 			.map_err(|_| AdminActionHashError::InvalidAmount(self.amount.clone()))?;
 
-		let encoded = [
-			type_hash.as_slice(),
-			&U256::from(self.chain_id).to_be_bytes::<32>(),
-			&{
-				let mut buf = [0u8; 32];
-				buf[12..].copy_from_slice(self.token.as_slice());
-				buf
-			},
-			&amount.to_be_bytes::<32>(),
-			&{
-				let mut buf = [0u8; 32];
-				buf[12..].copy_from_slice(self.recipient.as_slice());
-				buf
-			},
-			&U256::from(self.nonce).to_be_bytes::<32>(),
-			&U256::from(self.deadline).to_be_bytes::<32>(),
-		]
-		.concat();
+		Ok(Withdraw {
+			chainId: U256::from(self.chain_id),
+			token: self.token,
+			amount,
+			recipient: self.recipient,
+			nonce: U256::from(self.nonce),
+			deadline: U256::from(self.deadline),
+		})
+	}
 
-		Ok(keccak256(&encoded))
+	/// Compute the EIP-712 struct hash using Alloy's built-in support
+	pub fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
+		use alloy_sol_types::SolStruct;
+		Ok(self.to_eip712()?.eip712_hash_struct())
 	}
 }
 
@@ -296,32 +252,20 @@ pub struct UpdateFeeConfigContents {
 }
 
 impl UpdateFeeConfigContents {
+	/// Convert to EIP-712 struct for hashing
+	pub fn to_eip712(&self) -> UpdateFeeConfig {
+		UpdateFeeConfig {
+			gasBufferBps: self.gas_buffer_bps,
+			minProfitabilityPct: self.min_profitability_pct.clone(),
+			nonce: U256::from(self.nonce),
+			deadline: U256::from(self.deadline),
+		}
+	}
+
+	/// Compute the EIP-712 struct hash using Alloy's built-in support
 	pub fn struct_hash(&self) -> FixedBytes<32> {
-		use alloy_primitives::keccak256;
-
-		// Type hash for UpdateFeeConfig
-		let type_hash = keccak256(
-			b"UpdateFeeConfig(uint32 gasBufferBps,string minProfitabilityPct,uint256 nonce,uint256 deadline)",
-		);
-
-		let min_profitability_hash = keccak256(self.min_profitability_pct.as_bytes());
-
-		// Encode struct
-		let encoded = [
-			type_hash.as_slice(),
-			&{
-				// uint32 is left-padded to 32 bytes
-				let mut buf = [0u8; 32];
-				buf[28..].copy_from_slice(&self.gas_buffer_bps.to_be_bytes());
-				buf
-			},
-			min_profitability_hash.as_slice(),
-			&U256::from(self.nonce).to_be_bytes::<32>(),
-			&U256::from(self.deadline).to_be_bytes::<32>(),
-		]
-		.concat();
-
-		keccak256(&encoded)
+		use alloy_sol_types::SolStruct;
+		self.to_eip712().eip712_hash_struct()
 	}
 }
 
@@ -500,6 +444,32 @@ mod tests {
 		// Same contents should produce same hash
 		let hash2 = contents.struct_hash();
 		assert_eq!(hash, hash2);
+	}
+
+	#[test]
+	fn test_alloy_eip712_hash_struct_matches_manual() {
+		use alloy_sol_types::SolStruct;
+
+		let contents = AddTokenContents {
+			chain_id: 10,
+			symbol: "USDC".to_string(),
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			decimals: 6,
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		// Manual hash (current implementation)
+		let manual_hash = AddTokenContents::struct_hash(&contents);
+
+		// Alloy's hash via SolStruct trait
+		let eip712_struct = contents.to_eip712();
+		let alloy_hash = eip712_struct.eip712_hash_struct();
+
+		assert_eq!(
+			manual_hash, alloy_hash,
+			"Alloy's eip712_hash_struct should match manual implementation"
+		);
 	}
 
 	#[test]
