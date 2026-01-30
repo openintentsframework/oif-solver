@@ -4574,6 +4574,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "alloy-signer",
+ "alloy-signer-local",
  "alloy-sol-types",
  "async-trait",
  "axum",

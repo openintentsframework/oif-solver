@@ -95,63 +95,35 @@ pub fn verify_admin_signature(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
+	use alloy_signer::SignerSync;
+	use alloy_signer_local::PrivateKeySigner;
 	use std::str::FromStr;
 
-	/// Create a test signature for a message using the given secret key
-	fn sign_message(message: &[u8], secret: &SecretKey) -> Vec<u8> {
-		let secp = Secp256k1::new();
-
-		// EIP-191 prefix
-		let prefixed = format!("\x19Ethereum Signed Message:\n{}", message.len());
-		let mut prefixed_message = prefixed.into_bytes();
-		prefixed_message.extend_from_slice(message);
-
-		let hash = keccak256(&prefixed_message);
-		let msg = Message::from_digest(*hash);
-
-		let signature = secp.sign_ecdsa_recoverable(msg, secret);
-		let (recovery_id, sig_bytes) = signature.serialize_compact();
-
-		let mut signature_bytes = sig_bytes.to_vec();
-		let rec: i32 = recovery_id.into();
-		signature_bytes.push((rec as u8) + 27);
-
-		signature_bytes
-	}
-
-	/// Get the address for a secret key
-	fn address_from_secret(secret: &SecretKey) -> Address {
-		let secp = Secp256k1::new();
-		let public_key = PublicKey::from_secret_key(&secp, secret);
-		let public_key_bytes = public_key.serialize_uncompressed();
-		let hash = keccak256(&public_key_bytes[1..]);
-		Address::from_slice(&hash[12..])
+	/// Create a test signer from a 32-byte secret
+	fn test_signer(secret: [u8; 32]) -> PrivateKeySigner {
+		PrivateKeySigner::from_bytes(&B256::from(secret)).expect("valid secret")
 	}
 
 	#[test]
 	fn test_recover_personal_sign() {
-		let secret = SecretKey::from_byte_array([0x42u8; 32]).expect("valid secret");
-		let expected_address = address_from_secret(&secret);
-
+		let signer = test_signer([0x42u8; 32]);
 		let message = b"Hello, World!";
-		let signature = sign_message(message, &secret);
 
-		let recovered = recover_personal_sign(message, &signature).unwrap();
-		assert_eq!(recovered, expected_address);
+		let sig = signer.sign_message_sync(message).unwrap();
+		let recovered = recover_personal_sign(message, &sig.as_bytes()).unwrap();
+
+		assert_eq!(recovered, signer.address());
 	}
 
 	#[test]
 	fn test_recover_personal_sign_with_nonce() {
-		let secret = SecretKey::from_byte_array([0x42u8; 32]).expect("valid secret");
-		let expected_address = address_from_secret(&secret);
-
-		// SIWE-like message with nonce
+		let signer = test_signer([0x42u8; 32]);
 		let message = b"solver.example.com wants you to sign in...\nNonce: abc123";
-		let signature = sign_message(message, &secret);
 
-		let recovered = recover_personal_sign(message, &signature).unwrap();
-		assert_eq!(recovered, expected_address);
+		let sig = signer.sign_message_sync(message).unwrap();
+		let recovered = recover_personal_sign(message, &sig.as_bytes()).unwrap();
+
+		assert_eq!(recovered, signer.address());
 	}
 
 	#[test]
@@ -174,28 +146,27 @@ mod tests {
 
 	#[test]
 	fn test_verify_admin_signature_authorized() {
-		let secret = SecretKey::from_byte_array([0x42u8; 32]).expect("valid secret");
-		let admin_address = address_from_secret(&secret);
+		let signer = test_signer([0x42u8; 32]);
+		let message = b"test message";
 
 		let config = AdminConfig {
 			enabled: true,
 			domain: "test.example.com".to_string(),
 			chain_id: Some(1),
 			nonce_ttl_seconds: 300,
-			admin_addresses: vec![admin_address],
+			admin_addresses: vec![signer.address()],
 		};
 
-		let message = b"test message";
-		let signature = sign_message(message, &secret);
+		let sig = signer.sign_message_sync(message).unwrap();
+		let result = verify_admin_signature(message, &sig.as_bytes(), &config);
 
-		let result = verify_admin_signature(message, &signature, &config);
 		assert!(result.is_ok());
-		assert_eq!(result.unwrap(), admin_address);
+		assert_eq!(result.unwrap(), signer.address());
 	}
 
 	#[test]
 	fn test_verify_admin_signature_not_authorized() {
-		let secret = SecretKey::from_byte_array([0x42u8; 32]).expect("valid secret");
+		let signer = test_signer([0x42u8; 32]);
 		let other_address =
 			Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
 
@@ -207,29 +178,20 @@ mod tests {
 			admin_addresses: vec![other_address], // Different address
 		};
 
-		let message = b"test message";
-		let signature = sign_message(message, &secret);
+		let sig = signer.sign_message_sync(b"test message").unwrap();
+		let result = verify_admin_signature(b"test message", &sig.as_bytes(), &config);
 
-		let result = verify_admin_signature(message, &signature, &config);
 		assert!(matches!(result, Err(AdminAuthError::NotAuthorized(_))));
 	}
 
 	#[test]
 	fn test_recover_from_hash_directly() {
-		let secret = SecretKey::from_byte_array([0x42u8; 32]).expect("valid secret");
-		let expected_address = address_from_secret(&secret);
+		let signer = test_signer([0x42u8; 32]);
+		let hash = B256::from([0x11u8; 32]);
 
-		// Create a hash and sign it directly (for EIP-712)
-		let hash = [0x11u8; 32];
-		let secp = Secp256k1::new();
-		let msg = Message::from_digest(hash);
-		let signature = secp.sign_ecdsa_recoverable(msg, &secret);
-		let (recovery_id, sig_bytes) = signature.serialize_compact();
-		let mut signature_bytes = sig_bytes.to_vec();
-		let rec: i32 = recovery_id.into();
-		signature_bytes.push((rec as u8) + 27);
+		let sig = signer.sign_hash_sync(&hash).unwrap();
+		let recovered = recover_from_hash(&hash.0, &sig.as_bytes()).unwrap();
 
-		let recovered = recover_from_hash(&hash, &signature_bytes).unwrap();
-		assert_eq!(recovered, expected_address);
+		assert_eq!(recovered, signer.address());
 	}
 }
