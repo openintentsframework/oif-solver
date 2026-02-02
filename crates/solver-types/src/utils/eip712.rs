@@ -1675,15 +1675,14 @@ mod tests {
 	#[test]
 	fn test_admin_eip712_types_domain_fields() {
 		let types = admin_eip712_types();
-		let domain = types["EIP712Domain"].as_array().expect("should be an array");
+		let domain = types["EIP712Domain"]
+			.as_array()
+			.expect("should be an array");
 
 		// Domain should have name, version, chainId (no verifyingContract for off-chain)
 		assert_eq!(domain.len(), 3);
 
-		let names: Vec<&str> = domain
-			.iter()
-			.map(|f| f["name"].as_str().unwrap())
-			.collect();
+		let names: Vec<&str> = domain.iter().map(|f| f["name"].as_str().unwrap()).collect();
 		assert!(names.contains(&"name"));
 		assert!(names.contains(&"version"));
 		assert!(names.contains(&"chainId"));

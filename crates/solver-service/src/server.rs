@@ -108,9 +108,7 @@ pub async fn start_server(
 						auth_config.issuer
 					);
 				} else {
-					tracing::info!(
-						"JWT service initialized for admin auth (orders auth disabled)"
-					);
+					tracing::info!("JWT service initialized for admin auth (orders auth disabled)");
 				}
 				Some(Arc::new(service))
 			},
@@ -126,11 +124,7 @@ pub async fn start_server(
 	};
 
 	// Track whether orders should require auth
-	let orders_require_auth = api_config
-		.auth
-		.as_ref()
-		.map(|a| a.enabled)
-		.unwrap_or(false);
+	let orders_require_auth = api_config.auth.as_ref().map(|a| a.enabled).unwrap_or(false);
 
 	// Initialize signature validation service
 	let signature_validation = Arc::new(SignatureValidationService::new());
