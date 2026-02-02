@@ -437,7 +437,11 @@ mod tests {
 		assert_eq!(status.checks.len(), 3);
 
 		// Check directory exists
-		let dir_check = status.checks.iter().find(|c| c.name == "directory").unwrap();
+		let dir_check = status
+			.checks
+			.iter()
+			.find(|c| c.name == "directory")
+			.unwrap();
 		assert!(dir_check.passed);
 		assert_eq!(dir_check.status, "EXISTS");
 
@@ -516,7 +520,10 @@ mod tests {
 		assert_eq!(err.to_string(), "Connection failed: timeout");
 
 		let err = ReadinessError::CheckFailed("persistence disabled".to_string());
-		assert_eq!(err.to_string(), "Readiness check failed: persistence disabled");
+		assert_eq!(
+			err.to_string(),
+			"Readiness check failed: persistence disabled"
+		);
 
 		let err = ReadinessError::NotReady("storage not ready".to_string());
 		assert_eq!(err.to_string(), "Not ready: storage not ready");
