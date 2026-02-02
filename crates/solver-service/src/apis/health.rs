@@ -313,4 +313,170 @@ mod tests {
 		assert!(json.contains("\"rdb_enabled\":true"));
 		assert!(json.contains("\"aof_enabled\":true"));
 	}
+
+	#[test]
+	fn test_storage_health_with_checks() {
+		let storage = StorageHealth {
+			backend: "Redis".to_string(),
+			ready: true,
+			checks: vec![
+				ReadinessCheck {
+					name: "connectivity".to_string(),
+					passed: true,
+					status: "CONNECTED".to_string(),
+					message: None,
+				},
+				ReadinessCheck {
+					name: "persistence".to_string(),
+					passed: true,
+					status: "ENABLED".to_string(),
+					message: Some("RDB enabled".to_string()),
+				},
+			],
+			details: HashMap::new(),
+			error: None,
+		};
+
+		let json = serde_json::to_string(&storage).unwrap();
+		assert!(json.contains("\"backend\":\"Redis\""));
+		assert!(json.contains("\"ready\":true"));
+		assert!(json.contains("\"connectivity\""));
+		assert!(json.contains("\"persistence\""));
+		assert!(json.contains("\"CONNECTED\""));
+		assert!(json.contains("\"ENABLED\""));
+	}
+
+	#[test]
+	fn test_storage_health_with_details() {
+		let mut details = HashMap::new();
+		details.insert("redis_version".to_string(), "7.0.0".to_string());
+		details.insert("uptime_days".to_string(), "30".to_string());
+
+		let storage = StorageHealth {
+			backend: "Redis".to_string(),
+			ready: true,
+			checks: Vec::new(),
+			details,
+			error: None,
+		};
+
+		let json = serde_json::to_string(&storage).unwrap();
+		assert!(json.contains("\"redis_version\":\"7.0.0\""));
+		assert!(json.contains("\"uptime_days\":\"30\""));
+	}
+
+	#[test]
+	fn test_storage_health_file_backend() {
+		let storage = StorageHealth {
+			backend: "File".to_string(),
+			ready: true,
+			checks: vec![
+				ReadinessCheck {
+					name: "directory".to_string(),
+					passed: true,
+					status: "EXISTS".to_string(),
+					message: Some("Path: ./data/storage".to_string()),
+				},
+				ReadinessCheck {
+					name: "writable".to_string(),
+					passed: true,
+					status: "WRITABLE".to_string(),
+					message: None,
+				},
+			],
+			details: HashMap::new(),
+			error: None,
+		};
+
+		let json = serde_json::to_string(&storage).unwrap();
+		assert!(json.contains("\"backend\":\"File\""));
+		assert!(json.contains("\"directory\""));
+		assert!(json.contains("\"writable\""));
+	}
+
+	#[test]
+	fn test_storage_health_memory_backend() {
+		let storage = StorageHealth {
+			backend: "Memory".to_string(),
+			ready: true,
+			checks: Vec::new(),
+			details: HashMap::new(),
+			error: None,
+		};
+
+		let json = serde_json::to_string(&storage).unwrap();
+		assert!(json.contains("\"backend\":\"Memory\""));
+		assert!(json.contains("\"ready\":true"));
+	}
+
+	#[test]
+	fn test_health_response_without_redis() {
+		let response = HealthResponse {
+			status: "healthy".to_string(),
+			storage: StorageHealth {
+				backend: "Memory".to_string(),
+				ready: true,
+				checks: Vec::new(),
+				details: HashMap::new(),
+				error: None,
+			},
+			redis: None,
+			solver_id: "test-solver".to_string(),
+			version: "0.1.0".to_string(),
+		};
+
+		let json = serde_json::to_string(&response).unwrap();
+		assert!(json.contains("\"status\":\"healthy\""));
+		assert!(json.contains("\"backend\":\"Memory\""));
+		// redis should be omitted when None
+		assert!(!json.contains("\"redis\""));
+	}
+
+	#[test]
+	fn test_health_response_file_storage() {
+		let response = HealthResponse {
+			status: "healthy".to_string(),
+			storage: StorageHealth {
+				backend: "File".to_string(),
+				ready: true,
+				checks: vec![ReadinessCheck {
+					name: "persistence".to_string(),
+					passed: true,
+					status: "ENABLED".to_string(),
+					message: Some("File-based storage is always persistent".to_string()),
+				}],
+				details: HashMap::new(),
+				error: None,
+			},
+			redis: None,
+			solver_id: "file-solver".to_string(),
+			version: "0.1.0".to_string(),
+		};
+
+		let json = serde_json::to_string(&response).unwrap();
+		assert!(json.contains("\"backend\":\"File\""));
+		assert!(json.contains("\"solver_id\":\"file-solver\""));
+	}
+
+	#[test]
+	fn test_storage_health_not_ready() {
+		let storage = StorageHealth {
+			backend: "Redis".to_string(),
+			ready: false,
+			checks: vec![ReadinessCheck {
+				name: "connectivity".to_string(),
+				passed: false,
+				status: "DISCONNECTED".to_string(),
+				message: Some("Connection timeout".to_string()),
+			}],
+			details: HashMap::new(),
+			error: Some("Failed to connect to Redis".to_string()),
+		};
+
+		let json = serde_json::to_string(&storage).unwrap();
+		assert!(json.contains("\"ready\":false"));
+		assert!(json.contains("\"passed\":false"));
+		assert!(json.contains("\"DISCONNECTED\""));
+		assert!(json.contains("Failed to connect to Redis"));
+	}
 }

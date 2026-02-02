@@ -441,4 +441,176 @@ mod tests {
 		let json = serde_json::to_string(&response).unwrap();
 		assert!(json.contains("\"success\":true"));
 	}
+
+	#[test]
+	fn test_nonce_response_full_serialization() {
+		let response = NonceResponse {
+			nonce: "9999999999999999999".to_string(),
+			expires_in: 600,
+			domain: "solver.example.com".to_string(),
+			chain_id: 10,
+		};
+
+		let json = serde_json::to_string(&response).unwrap();
+		assert!(json.contains("\"nonce\":\"9999999999999999999\""));
+		assert!(json.contains("\"expiresIn\":600"));
+		assert!(json.contains("\"domain\":\"solver.example.com\""));
+		assert!(json.contains("\"chainId\":10"));
+	}
+
+	#[test]
+	fn test_admin_action_response_failure() {
+		let response = AdminActionResponse {
+			success: false,
+			message: "Token already exists".to_string(),
+			admin: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".to_string(),
+		};
+
+		let json = serde_json::to_string(&response).unwrap();
+		assert!(json.contains("\"success\":false"));
+		assert!(json.contains("\"message\":\"Token already exists\""));
+		assert!(json.contains("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"));
+	}
+
+	#[test]
+	fn test_eip712_domain_serialization() {
+		let domain = Eip712Domain {
+			name: "OIF Solver Admin".to_string(),
+			version: "1".to_string(),
+			chain_id: 1,
+		};
+
+		let json = serde_json::to_string(&domain).unwrap();
+		assert!(json.contains("\"name\":\"OIF Solver Admin\""));
+		assert!(json.contains("\"version\":\"1\""));
+		assert!(json.contains("\"chainId\":1"));
+	}
+
+	#[test]
+	fn test_eip712_type_info_serialization() {
+		let types = serde_json::json!({
+			"EIP712Domain": [
+				{"name": "name", "type": "string"}
+			]
+		});
+
+		let type_info = Eip712TypeInfo {
+			domain: Eip712Domain {
+				name: "Test".to_string(),
+				version: "1".to_string(),
+				chain_id: 10,
+			},
+			types,
+		};
+
+		let json = serde_json::to_string(&type_info).unwrap();
+		assert!(json.contains("\"domain\""));
+		assert!(json.contains("\"types\""));
+		assert!(json.contains("\"name\":\"Test\""));
+		assert!(json.contains("EIP712Domain"));
+	}
+
+	#[test]
+	fn test_config_store_error_not_found() {
+		let err = ConfigStoreError::NotFound("solver-config".to_string());
+		let admin_err = config_store_error(err);
+		match admin_err {
+			AdminAuthError::Internal(msg) => {
+				assert!(msg.contains("Configuration not found"));
+				assert!(msg.contains("solver-config"));
+			},
+			_ => panic!("Expected Internal error"),
+		}
+	}
+
+	#[test]
+	fn test_config_store_error_version_mismatch() {
+		let err = ConfigStoreError::VersionMismatch {
+			expected: 5,
+			found: 6,
+		};
+		let admin_err = config_store_error(err);
+		match admin_err {
+			AdminAuthError::Internal(msg) => {
+				assert!(msg.contains("modified concurrently"));
+				assert!(msg.contains("expected version 5"));
+				assert!(msg.contains("found 6"));
+			},
+			_ => panic!("Expected Internal error"),
+		}
+	}
+
+	#[test]
+	fn test_config_store_error_serialization() {
+		let err = ConfigStoreError::Serialization("invalid JSON".to_string());
+		let admin_err = config_store_error(err);
+		match admin_err {
+			AdminAuthError::Internal(msg) => {
+				assert!(msg.contains("Serialization error"));
+				assert!(msg.contains("invalid JSON"));
+			},
+			_ => panic!("Expected Internal error"),
+		}
+	}
+
+	#[test]
+	fn test_config_store_error_backend() {
+		let err = ConfigStoreError::Backend("Redis connection failed".to_string());
+		let admin_err = config_store_error(err);
+		match admin_err {
+			AdminAuthError::Internal(msg) => {
+				assert!(msg.contains("Storage error"));
+				assert!(msg.contains("Redis connection failed"));
+			},
+			_ => panic!("Expected Internal error"),
+		}
+	}
+
+	#[test]
+	fn test_config_store_error_configuration() {
+		let err = ConfigStoreError::Configuration("Invalid URL".to_string());
+		let admin_err = config_store_error(err);
+		match admin_err {
+			AdminAuthError::Internal(msg) => {
+				assert!(msg.contains("Configuration error"));
+				assert!(msg.contains("Invalid URL"));
+			},
+			_ => panic!("Expected Internal error"),
+		}
+	}
+
+	#[test]
+	fn test_config_store_error_already_exists() {
+		let err = ConfigStoreError::AlreadyExists("solver-config".to_string());
+		let admin_err = config_store_error(err);
+		match admin_err {
+			AdminAuthError::Internal(msg) => {
+				assert!(msg.contains("already exists"));
+				assert!(msg.contains("solver-config"));
+			},
+			_ => panic!("Expected Internal error"),
+		}
+	}
+
+	#[test]
+	fn test_eip712_domain_different_chains() {
+		let mainnet = Eip712Domain {
+			name: "Solver".to_string(),
+			version: "1".to_string(),
+			chain_id: 1,
+		};
+
+		let optimism = Eip712Domain {
+			name: "Solver".to_string(),
+			version: "1".to_string(),
+			chain_id: 10,
+		};
+
+		let mainnet_json = serde_json::to_string(&mainnet).unwrap();
+		let optimism_json = serde_json::to_string(&optimism).unwrap();
+
+		assert!(mainnet_json.contains("\"chainId\":1"));
+		assert!(optimism_json.contains("\"chainId\":10"));
+		assert_ne!(mainnet_json, optimism_json);
+	}
 }

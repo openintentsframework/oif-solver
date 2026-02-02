@@ -356,3 +356,299 @@ pub fn get_readiness_checker(backend_name: &str) -> Option<Box<dyn StorageReadin
 		_ => None,
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use tempfile::TempDir;
+
+	#[test]
+	fn test_persistence_policy_from_env_default() {
+		// Clear the env var to test default behavior
+		std::env::remove_var("REQUIRE_PERSISTENCE");
+		let policy = PersistencePolicy::from_env();
+		assert_eq!(policy, PersistencePolicy::WarnIfDisabled);
+		assert!(!policy.requires_persistence());
+	}
+
+	#[test]
+	fn test_persistence_policy_from_env_true() {
+		std::env::set_var("REQUIRE_PERSISTENCE", "true");
+		let policy = PersistencePolicy::from_env();
+		assert_eq!(policy, PersistencePolicy::RequireEnabled);
+		assert!(policy.requires_persistence());
+		std::env::remove_var("REQUIRE_PERSISTENCE");
+	}
+
+	#[test]
+	fn test_persistence_policy_from_env_one() {
+		std::env::set_var("REQUIRE_PERSISTENCE", "1");
+		let policy = PersistencePolicy::from_env();
+		assert_eq!(policy, PersistencePolicy::RequireEnabled);
+		std::env::remove_var("REQUIRE_PERSISTENCE");
+	}
+
+	#[test]
+	fn test_persistence_policy_from_env_false() {
+		std::env::set_var("REQUIRE_PERSISTENCE", "false");
+		let policy = PersistencePolicy::from_env();
+		assert_eq!(policy, PersistencePolicy::WarnIfDisabled);
+		std::env::remove_var("REQUIRE_PERSISTENCE");
+	}
+
+	#[test]
+	fn test_readiness_config_default() {
+		let config = ReadinessConfig::default();
+		assert!(!config.require_persistence);
+		assert_eq!(config.timeout_ms, 5000);
+	}
+
+	#[test]
+	fn test_get_readiness_checker_redis() {
+		let checker = get_readiness_checker("redis");
+		assert!(checker.is_some());
+		assert_eq!(checker.unwrap().name(), "redis");
+	}
+
+	#[test]
+	fn test_get_readiness_checker_unknown() {
+		let checker = get_readiness_checker("unknown");
+		assert!(checker.is_none());
+	}
+
+	#[test]
+	fn test_get_readiness_checker_file() {
+		// File doesn't have a trait-based checker, returns None
+		let checker = get_readiness_checker("file");
+		assert!(checker.is_none());
+	}
+
+	#[tokio::test]
+	async fn test_check_file_readiness_new_directory() {
+		let temp_dir = TempDir::new().unwrap();
+		let new_path = temp_dir.path().join("new_storage_dir");
+
+		let result = check_file_readiness(new_path.to_str().unwrap()).await;
+		assert!(result.is_ok());
+
+		let status = result.unwrap();
+		assert_eq!(status.backend_name, "File");
+		assert!(status.is_ready);
+		assert_eq!(status.checks.len(), 3);
+
+		// Check directory exists
+		let dir_check = status.checks.iter().find(|c| c.name == "directory").unwrap();
+		assert!(dir_check.passed);
+		assert_eq!(dir_check.status, "EXISTS");
+
+		// Check writable
+		let write_check = status.checks.iter().find(|c| c.name == "writable").unwrap();
+		assert!(write_check.passed);
+		assert_eq!(write_check.status, "WRITABLE");
+
+		// Check persistence
+		let persist_check = status
+			.checks
+			.iter()
+			.find(|c| c.name == "persistence")
+			.unwrap();
+		assert!(persist_check.passed);
+		assert_eq!(persist_check.status, "ENABLED");
+	}
+
+	#[tokio::test]
+	async fn test_check_file_readiness_existing_directory() {
+		let temp_dir = TempDir::new().unwrap();
+
+		let result = check_file_readiness(temp_dir.path().to_str().unwrap()).await;
+		assert!(result.is_ok());
+
+		let status = result.unwrap();
+		assert!(status.is_ready);
+	}
+
+	#[tokio::test]
+	async fn test_check_storage_readiness_memory() {
+		let config = StoreConfig::Memory;
+		let result =
+			check_storage_readiness(&config, PersistencePolicy::WarnIfDisabled, 1000).await;
+
+		assert!(result.is_ok());
+		let status = result.unwrap();
+		assert_eq!(status.backend_name, "Memory");
+		assert!(status.is_ready);
+		assert!(status.checks.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_check_storage_readiness_file() {
+		let temp_dir = TempDir::new().unwrap();
+		let config = StoreConfig::File {
+			path: temp_dir.path().to_str().unwrap().to_string(),
+		};
+
+		let result =
+			check_storage_readiness(&config, PersistencePolicy::WarnIfDisabled, 1000).await;
+
+		assert!(result.is_ok());
+		let status = result.unwrap();
+		assert_eq!(status.backend_name, "File");
+		assert!(status.is_ready);
+	}
+
+	#[tokio::test]
+	async fn test_check_storage_readiness_with_storage_interface() {
+		let memory = crate::implementations::memory::MemoryStorage::new();
+		let config = StoreConfig::Storage(std::sync::Arc::new(memory));
+
+		let result =
+			check_storage_readiness(&config, PersistencePolicy::WarnIfDisabled, 1000).await;
+
+		assert!(result.is_ok());
+		let status = result.unwrap();
+		assert_eq!(status.backend_name, "Storage");
+		assert!(status.is_ready);
+	}
+
+	#[test]
+	fn test_readiness_error_display() {
+		let err = ReadinessError::ConnectionFailed("timeout".to_string());
+		assert_eq!(err.to_string(), "Connection failed: timeout");
+
+		let err = ReadinessError::CheckFailed("persistence disabled".to_string());
+		assert_eq!(err.to_string(), "Readiness check failed: persistence disabled");
+
+		let err = ReadinessError::NotReady("storage not ready".to_string());
+		assert_eq!(err.to_string(), "Not ready: storage not ready");
+	}
+
+	#[test]
+	fn test_readiness_status_serialization() {
+		let status = ReadinessStatus {
+			backend_name: "Test".to_string(),
+			is_ready: true,
+			checks: vec![ReadinessCheck {
+				name: "test_check".to_string(),
+				passed: true,
+				status: "OK".to_string(),
+				message: Some("All good".to_string()),
+			}],
+			details: HashMap::new(),
+		};
+
+		let json = serde_json::to_string(&status).unwrap();
+		assert!(json.contains("\"backend_name\":\"Test\""));
+		assert!(json.contains("\"is_ready\":true"));
+		assert!(json.contains("\"test_check\""));
+	}
+
+	#[test]
+	fn test_readiness_check_serialization() {
+		let check = ReadinessCheck {
+			name: "connectivity".to_string(),
+			passed: true,
+			status: "CONNECTED".to_string(),
+			message: None,
+		};
+
+		let json = serde_json::to_string(&check).unwrap();
+		assert!(json.contains("\"name\":\"connectivity\""));
+		assert!(json.contains("\"passed\":true"));
+	}
+
+	#[tokio::test]
+	async fn test_verify_storage_readiness_memory() {
+		std::env::remove_var("REQUIRE_PERSISTENCE");
+		let config = StoreConfig::Memory;
+		let result = verify_storage_readiness(&config).await;
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_verify_storage_readiness_file() {
+		std::env::remove_var("REQUIRE_PERSISTENCE");
+		let temp_dir = TempDir::new().unwrap();
+		let config = StoreConfig::File {
+			path: temp_dir.path().to_str().unwrap().to_string(),
+		};
+		let result = verify_storage_readiness(&config).await;
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_verify_storage_readiness_storage_interface() {
+		std::env::remove_var("REQUIRE_PERSISTENCE");
+		let memory = crate::implementations::memory::MemoryStorage::new();
+		let config = StoreConfig::Storage(std::sync::Arc::new(memory));
+		let result = verify_storage_readiness(&config).await;
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_check_file_readiness_cannot_create_directory() {
+		// Try to create a directory in a path that doesn't exist and can't be created
+		// On most systems, /proc is read-only
+		#[cfg(target_os = "linux")]
+		{
+			let result = check_file_readiness("/proc/impossible_path/storage").await;
+			assert!(result.is_err());
+			assert!(matches!(result, Err(ReadinessError::ConnectionFailed(_))));
+		}
+
+		// On macOS, use a similar approach with /System which is read-only
+		#[cfg(target_os = "macos")]
+		{
+			let result = check_file_readiness("/System/impossible_path/storage").await;
+			assert!(result.is_err());
+			assert!(matches!(result, Err(ReadinessError::ConnectionFailed(_))));
+		}
+	}
+
+	#[test]
+	fn test_readiness_check_with_message() {
+		let check = ReadinessCheck {
+			name: "persistence".to_string(),
+			passed: true,
+			status: "ENABLED".to_string(),
+			message: Some("Last save: ok".to_string()),
+		};
+
+		let json = serde_json::to_string(&check).unwrap();
+		assert!(json.contains("\"message\":\"Last save: ok\""));
+	}
+
+	#[test]
+	fn test_readiness_status_not_ready() {
+		let status = ReadinessStatus {
+			backend_name: "Redis".to_string(),
+			is_ready: false,
+			checks: vec![ReadinessCheck {
+				name: "persistence".to_string(),
+				passed: false,
+				status: "DISABLED".to_string(),
+				message: Some("Neither RDB nor AOF enabled".to_string()),
+			}],
+			details: HashMap::new(),
+		};
+
+		assert!(!status.is_ready);
+		assert_eq!(status.checks.len(), 1);
+		assert!(!status.checks[0].passed);
+	}
+
+	#[test]
+	fn test_readiness_status_with_details() {
+		let mut details = HashMap::new();
+		details.insert("redis_version".to_string(), "7.0.0".to_string());
+
+		let status = ReadinessStatus {
+			backend_name: "Redis".to_string(),
+			is_ready: true,
+			checks: Vec::new(),
+			details,
+		};
+
+		let json = serde_json::to_string(&status).unwrap();
+		assert!(json.contains("\"redis_version\":\"7.0.0\""));
+	}
+}

@@ -599,3 +599,223 @@ impl StorageService {
 		self.query(namespace, QueryFilter::All).await
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_store_config_from_env_redis_default() {
+		std::env::remove_var("STORAGE_BACKEND");
+		std::env::remove_var("REDIS_URL");
+
+		let config = StoreConfig::from_env().unwrap();
+		match config {
+			StoreConfig::Redis { url } => {
+				assert_eq!(url, "redis://localhost:6379");
+			},
+			_ => panic!("Expected Redis config"),
+		}
+	}
+
+	#[test]
+	fn test_store_config_from_env_redis_custom_url() {
+		std::env::set_var("STORAGE_BACKEND", "redis");
+		std::env::set_var("REDIS_URL", "redis://custom:6380");
+
+		let config = StoreConfig::from_env().unwrap();
+		match config {
+			StoreConfig::Redis { url } => {
+				assert_eq!(url, "redis://custom:6380");
+			},
+			_ => panic!("Expected Redis config"),
+		}
+
+		std::env::remove_var("STORAGE_BACKEND");
+		std::env::remove_var("REDIS_URL");
+	}
+
+	#[test]
+	fn test_store_config_from_env_file_default_path() {
+		std::env::set_var("STORAGE_BACKEND", "file");
+		std::env::remove_var("STORAGE_PATH");
+
+		let config = StoreConfig::from_env().unwrap();
+		match config {
+			StoreConfig::File { path } => {
+				assert_eq!(path, "./data/storage");
+			},
+			_ => panic!("Expected File config"),
+		}
+
+		std::env::remove_var("STORAGE_BACKEND");
+	}
+
+	#[test]
+	fn test_store_config_from_env_file_custom_path() {
+		std::env::set_var("STORAGE_BACKEND", "file");
+		std::env::set_var("STORAGE_PATH", "/custom/path");
+
+		let config = StoreConfig::from_env().unwrap();
+		match config {
+			StoreConfig::File { path } => {
+				assert_eq!(path, "/custom/path");
+			},
+			_ => panic!("Expected File config"),
+		}
+
+		std::env::remove_var("STORAGE_BACKEND");
+		std::env::remove_var("STORAGE_PATH");
+	}
+
+	#[test]
+	fn test_store_config_from_env_memory() {
+		std::env::set_var("STORAGE_BACKEND", "memory");
+
+		let config = StoreConfig::from_env().unwrap();
+		assert!(matches!(config, StoreConfig::Memory));
+
+		std::env::remove_var("STORAGE_BACKEND");
+	}
+
+	#[test]
+	fn test_store_config_from_env_unsupported() {
+		std::env::set_var("STORAGE_BACKEND", "unsupported");
+
+		let result = StoreConfig::from_env();
+		assert!(result.is_err());
+		let err = result.unwrap_err();
+		assert!(err.to_string().contains("Unsupported storage backend"));
+		assert!(err.to_string().contains("unsupported"));
+
+		std::env::remove_var("STORAGE_BACKEND");
+	}
+
+	#[test]
+	fn test_store_config_debug_redis() {
+		let config = StoreConfig::Redis {
+			url: "redis://:secret@localhost:6379".to_string(),
+		};
+		let debug_str = format!("{:?}", config);
+		// Should redact credentials
+		assert!(debug_str.contains("[REDACTED]"));
+		assert!(!debug_str.contains("secret"));
+	}
+
+	#[test]
+	fn test_store_config_debug_file() {
+		let config = StoreConfig::File {
+			path: "/my/storage/path".to_string(),
+		};
+		let debug_str = format!("{:?}", config);
+		assert!(debug_str.contains("File"));
+		assert!(debug_str.contains("/my/storage/path"));
+	}
+
+	#[test]
+	fn test_store_config_debug_memory() {
+		let config = StoreConfig::Memory;
+		let debug_str = format!("{:?}", config);
+		assert!(debug_str.contains("Memory"));
+	}
+
+	#[test]
+	fn test_create_storage_backend_memory() {
+		let config = StoreConfig::Memory;
+		let result = create_storage_backend(config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_create_storage_backend_file() {
+		let temp_dir = tempfile::TempDir::new().unwrap();
+		let config = StoreConfig::File {
+			path: temp_dir.path().to_str().unwrap().to_string(),
+		};
+		let result = create_storage_backend(config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_create_storage_backend_existing_storage() {
+		let memory = implementations::memory::MemoryStorage::new();
+		let config = StoreConfig::Storage(std::sync::Arc::new(memory));
+		let result = create_storage_backend(config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_redact_url_credentials_with_password() {
+		let url = "redis://:secret@localhost:6379";
+		let redacted = redact_url_credentials(url);
+		assert_eq!(redacted, "redis://[REDACTED]@localhost:6379");
+	}
+
+	#[test]
+	fn test_redact_url_credentials_with_user_and_password() {
+		let url = "redis://user:secret@localhost:6379";
+		let redacted = redact_url_credentials(url);
+		assert_eq!(redacted, "redis://[REDACTED]@localhost:6379");
+	}
+
+	#[test]
+	fn test_redact_url_credentials_no_credentials() {
+		let url = "redis://localhost:6379";
+		let redacted = redact_url_credentials(url);
+		assert_eq!(redacted, "redis://localhost:6379");
+	}
+
+	#[test]
+	fn test_redact_url_credentials_no_scheme() {
+		let url = "localhost:6379";
+		let redacted = redact_url_credentials(url);
+		assert_eq!(redacted, "localhost:6379");
+	}
+
+	#[test]
+	fn test_storage_error_display() {
+		let err = StorageError::NotFound("key1".to_string());
+		assert_eq!(err.to_string(), "Not found: key1");
+
+		let err = StorageError::Serialization("bad json".to_string());
+		assert_eq!(err.to_string(), "Serialization error: bad json");
+
+		let err = StorageError::Backend("connection failed".to_string());
+		assert_eq!(err.to_string(), "Backend error: connection failed");
+
+		let err = StorageError::Configuration("invalid config".to_string());
+		assert_eq!(err.to_string(), "Configuration error: invalid config");
+
+		let err = StorageError::Expired("key2".to_string());
+		assert_eq!(err.to_string(), "Expired error: key2");
+	}
+
+	#[test]
+	fn test_query_filter_variants() {
+		let filter = QueryFilter::All;
+		assert!(matches!(filter, QueryFilter::All));
+
+		let filter = QueryFilter::Equals("field".to_string(), serde_json::json!("value"));
+		assert!(matches!(filter, QueryFilter::Equals(_, _)));
+
+		let filter = QueryFilter::NotEquals("field".to_string(), serde_json::json!("value"));
+		assert!(matches!(filter, QueryFilter::NotEquals(_, _)));
+
+		let filter = QueryFilter::In("field".to_string(), vec![serde_json::json!("a")]);
+		assert!(matches!(filter, QueryFilter::In(_, _)));
+
+		let filter = QueryFilter::NotIn("field".to_string(), vec![serde_json::json!("a")]);
+		assert!(matches!(filter, QueryFilter::NotIn(_, _)));
+	}
+
+	#[test]
+	fn test_storage_indexes_builder() {
+		let indexes = StorageIndexes::new()
+			.with_field("status", "pending")
+			.with_field("amount", 100);
+
+		assert_eq!(indexes.fields.len(), 2);
+		assert!(indexes.fields.contains_key("status"));
+		assert!(indexes.fields.contains_key("amount"));
+	}
+}
