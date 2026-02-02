@@ -341,8 +341,8 @@ impl StoreConfig {
 				Ok(StoreConfig::Redis { url })
 			},
 			"file" => {
-				let path = std::env::var("STORAGE_PATH")
-					.unwrap_or_else(|_| "./data/storage".to_string());
+				let path =
+					std::env::var("STORAGE_PATH").unwrap_or_else(|_| "./data/storage".to_string());
 				Ok(StoreConfig::File { path })
 			},
 			"memory" => Ok(StoreConfig::Memory),
