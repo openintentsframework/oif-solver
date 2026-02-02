@@ -145,6 +145,7 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 		Err(e) => StorageHealth {
 			backend: match store_config {
 				StoreConfig::Redis { .. } => "Redis".to_string(),
+				StoreConfig::File { .. } => "File".to_string(),
 				StoreConfig::Memory => "Memory".to_string(),
 				StoreConfig::Storage(_) => "Storage".to_string(),
 			},

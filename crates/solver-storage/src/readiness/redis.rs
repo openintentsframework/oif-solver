@@ -5,9 +5,7 @@
 //! - Persistence configuration (RDB and/or AOF)
 
 use super::{ReadinessCheck, ReadinessConfig, ReadinessError, ReadinessStatus, StorageReadiness};
-use crate::redis_health::{
-	check_redis_health, check_redis_health_strict, PersistenceDetectionMethod,
-};
+use crate::redis_health::check_redis_health;
 use async_trait::async_trait;
 
 /// Redis readiness checker.
@@ -16,6 +14,9 @@ use async_trait::async_trait;
 /// - **Connectivity**: Can we connect to Redis?
 /// - **RDB Persistence**: Is RDB (snapshotting) enabled?
 /// - **AOF Persistence**: Is AOF (append-only file) enabled?
+///
+/// Uses INFO-based persistence detection which works on all Redis deployments
+/// including managed services (ElastiCache, Redis Enterprise).
 pub struct RedisReadiness;
 
 impl RedisReadiness {
@@ -44,17 +45,13 @@ impl StorageReadiness for RedisReadiness {
 			5000
 		};
 
-		// Choose check method based on config
-		// strict_checks uses CONFIG GET (more accurate but may be blocked by ACLs)
-		// default uses INFO persistence (always works)
-		let health_result = if config.strict_checks {
-			check_redis_health_strict(url, timeout).await
-		} else {
-			check_redis_health(url, timeout).await
-		};
+		// Use INFO-based check (ACL-safe, works with managed Redis)
+		let health_result = check_redis_health(url, timeout).await;
 
 		match health_result {
 			Ok(info) => {
+				let persistence_enabled = info.has_persistence();
+
 				let checks = vec![
 					ReadinessCheck {
 						name: "connectivity".to_string(),
@@ -94,19 +91,10 @@ impl StorageReadiness for RedisReadiness {
 					},
 				];
 
-				let persistence_enabled = info.has_persistence();
+				let details = std::collections::HashMap::new();
 
-				let mut details = std::collections::HashMap::new();
-				details.insert(
-					"detection_method".to_string(),
-					match info.detection_method {
-						PersistenceDetectionMethod::InfoCommand => "INFO".to_string(),
-						PersistenceDetectionMethod::ConfigCommand => "CONFIG".to_string(),
-					},
-				);
-
-				// Ready if persistence is enabled OR if we're not in strict mode
-				let is_ready = persistence_enabled || !config.strict;
+				// Ready if persistence is enabled OR if persistence is not required
+				let is_ready = persistence_enabled || !config.require_persistence;
 
 				Ok(ReadinessStatus {
 					backend_name: "Redis".to_string(),
@@ -143,8 +131,7 @@ mod tests {
 	#[test]
 	fn test_readiness_config_default() {
 		let config = ReadinessConfig::default();
-		assert!(!config.strict);
-		assert!(!config.strict_checks);
+		assert!(!config.require_persistence);
 		assert_eq!(config.timeout_ms, 5000);
 	}
 

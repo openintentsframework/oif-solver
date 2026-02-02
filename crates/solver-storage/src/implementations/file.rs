@@ -128,7 +128,7 @@ pub struct NamespaceIndex {
 }
 
 /// TTL configuration for different storage keys.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TtlConfig {
 	ttls: HashMap<StorageKey, Duration>,
 }

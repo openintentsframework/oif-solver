@@ -57,44 +57,39 @@ pub struct ReadinessStatus {
 }
 
 /// Persistence enforcement policy for readiness checks.
-#[derive(Debug, Clone, Copy)]
+///
+/// This policy controls whether the solver should fail startup if the
+/// storage backend does not have persistence enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistencePolicy {
 	/// Do not fail startup if persistence is disabled (warn only).
+	/// Use this for development/testing environments.
 	WarnIfDisabled,
 	/// Fail startup if persistence is disabled.
+	/// Use this for production environments where data durability is required.
 	RequireEnabled,
-	/// Fail startup if persistence is disabled and use strict checks (CONFIG GET).
-	RequireEnabledStrict,
 }
 
 impl PersistencePolicy {
 	/// Build policy from environment variables.
 	///
-	/// - REQUIRE_PERSISTENCE=true => RequireEnabled
-	/// - REQUIRE_PERSISTENCE_STRICT=true => RequireEnabledStrict
+	/// - `REQUIRE_PERSISTENCE=true` => `RequireEnabled`
+	/// - Default (not set or false) => `WarnIfDisabled`
 	pub fn from_env() -> Self {
 		let require = std::env::var("REQUIRE_PERSISTENCE")
 			.map(|v| v == "1" || v.to_lowercase() == "true")
 			.unwrap_or(false);
-		let strict = std::env::var("REQUIRE_PERSISTENCE_STRICT")
-			.map(|v| v == "1" || v.to_lowercase() == "true")
-			.unwrap_or(false);
 
-		if strict {
-			Self::RequireEnabledStrict
-		} else if require {
+		if require {
 			Self::RequireEnabled
 		} else {
 			Self::WarnIfDisabled
 		}
 	}
 
-	fn is_strict(self) -> bool {
-		matches!(self, Self::RequireEnabled | Self::RequireEnabledStrict)
-	}
-
-	fn use_strict_checks(self) -> bool {
-		matches!(self, Self::RequireEnabledStrict)
+	/// Returns true if persistence is required for startup.
+	pub fn requires_persistence(self) -> bool {
+		matches!(self, Self::RequireEnabled)
 	}
 }
 
@@ -115,10 +110,7 @@ pub struct ReadinessCheck {
 #[derive(Debug, Clone)]
 pub struct ReadinessConfig {
 	/// Fail if readiness checks don't pass (default: false = warn only)
-	pub strict: bool,
-	/// Use more accurate but potentially restricted checks (default: false)
-	/// For Redis, this uses CONFIG GET which may be blocked by ACLs
-	pub strict_checks: bool,
+	pub require_persistence: bool,
 	/// Connection timeout in milliseconds
 	pub timeout_ms: u64,
 }
@@ -126,8 +118,7 @@ pub struct ReadinessConfig {
 impl Default for ReadinessConfig {
 	fn default() -> Self {
 		Self {
-			strict: false,
-			strict_checks: false,
+			require_persistence: false,
 			timeout_ms: 5000,
 		}
 	}
@@ -171,13 +162,13 @@ pub async fn check_storage_readiness(
 	match config {
 		StoreConfig::Redis { url } => {
 			let checker = RedisReadiness::new();
-			let config = ReadinessConfig {
-				strict: policy.is_strict(),
-				strict_checks: policy.use_strict_checks(),
+			let readiness_config = ReadinessConfig {
+				require_persistence: policy.requires_persistence(),
 				timeout_ms,
 			};
-			checker.check(url, &config).await
+			checker.check(url, &readiness_config).await
 		},
+		StoreConfig::File { path } => check_file_readiness(path).await,
 		StoreConfig::Memory => Ok(ReadinessStatus {
 			backend_name: "Memory".to_string(),
 			is_ready: true,
@@ -193,6 +184,80 @@ pub async fn check_storage_readiness(
 	}
 }
 
+/// Check file storage readiness.
+///
+/// Verifies that the storage directory exists (or can be created) and is writable.
+async fn check_file_readiness(path: &str) -> Result<ReadinessStatus, ReadinessError> {
+	let path = std::path::Path::new(path);
+	let mut checks = Vec::new();
+
+	// Check if directory exists or can be created
+	let dir_exists = if path.exists() {
+		true
+	} else {
+		// Try to create the directory
+		match std::fs::create_dir_all(path) {
+			Ok(_) => true,
+			Err(e) => {
+				return Err(ReadinessError::ConnectionFailed(format!(
+					"Cannot create storage directory '{}': {}",
+					path.display(),
+					e
+				)));
+			},
+		}
+	};
+
+	checks.push(ReadinessCheck {
+		name: "directory".to_string(),
+		passed: dir_exists,
+		status: if dir_exists {
+			"EXISTS".to_string()
+		} else {
+			"MISSING".to_string()
+		},
+		message: Some(format!("Path: {}", path.display())),
+	});
+
+	// Check if directory is writable
+	let test_file = path.join(".write_test");
+	let writable = match std::fs::write(&test_file, b"test") {
+		Ok(_) => {
+			let _ = std::fs::remove_file(&test_file);
+			true
+		},
+		Err(_) => false,
+	};
+
+	checks.push(ReadinessCheck {
+		name: "writable".to_string(),
+		passed: writable,
+		status: if writable {
+			"WRITABLE".to_string()
+		} else {
+			"READ-ONLY".to_string()
+		},
+		message: None,
+	});
+
+	// File storage always has persistence enabled (it writes to disk)
+	checks.push(ReadinessCheck {
+		name: "persistence".to_string(),
+		passed: true,
+		status: "ENABLED".to_string(),
+		message: Some("File-based storage is always persistent".to_string()),
+	});
+
+	let is_ready = dir_exists && writable;
+
+	Ok(ReadinessStatus {
+		backend_name: "File".to_string(),
+		is_ready,
+		checks,
+		details: HashMap::new(),
+	})
+}
+
 /// Verify storage readiness with logging and optional enforcement.
 ///
 /// This helper performs readiness checks, logs details, and enforces persistence
@@ -200,6 +265,7 @@ pub async fn check_storage_readiness(
 pub async fn verify_storage_readiness(store_config: &StoreConfig) -> Result<(), ReadinessError> {
 	let backend_label = match store_config {
 		StoreConfig::Redis { .. } => "Redis",
+		StoreConfig::File { .. } => "File",
 		StoreConfig::Memory => "Memory",
 		StoreConfig::Storage(_) => "Storage",
 	};

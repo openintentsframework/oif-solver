@@ -302,6 +302,11 @@ pub enum StoreConfig {
 		/// Redis connection URL (e.g., "redis://localhost:6379")
 		url: String,
 	},
+	/// Create a file-based storage (useful for single-instance deployments)
+	File {
+		/// Base directory path for storing files (e.g., "./data/storage")
+		path: String,
+	},
 	/// Create an in-memory storage (useful for testing)
 	Memory,
 }
@@ -314,6 +319,7 @@ impl std::fmt::Debug for StoreConfig {
 				let redacted = redact_url_credentials(url);
 				f.debug_struct("Redis").field("url", &redacted).finish()
 			},
+			StoreConfig::File { path } => f.debug_struct("File").field("path", path).finish(),
 			StoreConfig::Memory => f.debug_struct("Memory").finish(),
 		}
 	}
@@ -324,6 +330,7 @@ impl StoreConfig {
 	///
 	/// Supported backends:
 	/// - STORAGE_BACKEND=redis (default) uses REDIS_URL
+	/// - STORAGE_BACKEND=file uses STORAGE_PATH (default: "./data/storage")
 	/// - STORAGE_BACKEND=memory
 	pub fn from_env() -> Result<Self, StorageError> {
 		let backend = std::env::var("STORAGE_BACKEND").unwrap_or_else(|_| "redis".to_string());
@@ -333,9 +340,14 @@ impl StoreConfig {
 					.unwrap_or_else(|_| "redis://localhost:6379".to_string());
 				Ok(StoreConfig::Redis { url })
 			},
+			"file" => {
+				let path = std::env::var("STORAGE_PATH")
+					.unwrap_or_else(|_| "./data/storage".to_string());
+				Ok(StoreConfig::File { path })
+			},
 			"memory" => Ok(StoreConfig::Memory),
 			other => Err(StorageError::Configuration(format!(
-				"Unsupported storage backend '{}'",
+				"Unsupported storage backend '{}'. Supported: redis, file, memory",
 				other
 			))),
 		}
@@ -365,6 +377,12 @@ pub fn create_storage_backend(
 		StoreConfig::Storage(s) => Ok(s),
 		StoreConfig::Redis { url } => {
 			let storage = implementations::redis::RedisStorage::with_url(url)?;
+			Ok(std::sync::Arc::new(storage))
+		},
+		StoreConfig::File { path } => {
+			let ttl_config = implementations::file::TtlConfig::default();
+			let storage =
+				implementations::file::FileStorage::new(std::path::PathBuf::from(path), ttl_config);
 			Ok(std::sync::Arc::new(storage))
 		},
 		StoreConfig::Memory => {
