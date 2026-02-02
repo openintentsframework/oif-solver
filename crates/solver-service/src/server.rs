@@ -98,14 +98,20 @@ pub async fn start_server(
 		tracing::warn!("No offchain_eip7683 discovery source configured - /orders endpoint will not be available");
 	}
 
-	// Initialize JWT service if auth is enabled
+	// Initialize JWT service if auth config exists (needed for admin endpoints even if orders auth is disabled)
 	let jwt_service = match &api_config.auth {
-		Some(auth_config) if auth_config.enabled => match JwtService::new(auth_config.clone()) {
+		Some(auth_config) => match JwtService::new(auth_config.clone()) {
 			Ok(service) => {
-				tracing::info!(
-					"API authentication enabled with issuer: {}",
-					auth_config.issuer
-				);
+				if auth_config.enabled {
+					tracing::info!(
+						"API authentication enabled for orders with issuer: {}",
+						auth_config.issuer
+					);
+				} else {
+					tracing::info!(
+						"JWT service initialized for admin auth (orders auth disabled)"
+					);
+				}
 				Some(Arc::new(service))
 			},
 			Err(e) => {
@@ -113,11 +119,18 @@ pub async fn start_server(
 				return Err(e.into());
 			},
 		},
-		_ => {
+		None => {
 			tracing::info!("API authentication disabled");
 			None
 		},
 	};
+
+	// Track whether orders should require auth
+	let orders_require_auth = api_config
+		.auth
+		.as_ref()
+		.map(|a| a.enabled)
+		.unwrap_or(false);
 
 	// Initialize signature validation service
 	let signature_validation = Arc::new(SignatureValidationService::new());
@@ -262,12 +275,22 @@ pub async fn start_server(
 
 	// Add admin routes if enabled
 	if let Some(admin_state) = admin_state {
-		let admin_routes = Router::new()
+		let mut admin_routes = Router::new()
 			.route("/nonce", get(handle_get_nonce))
 			.route("/types", get(handle_get_types))
 			.route("/tokens", post(handle_add_token))
 			.route("/fees", put(handle_update_fees))
 			.with_state(admin_state);
+		// If JWT auth is enabled, require admin-all scope for all admin endpoints.
+		if let Some(jwt) = &jwt_service {
+			admin_routes = admin_routes.layer(middleware::from_fn_with_state(
+				AuthState {
+					jwt_service: jwt.clone(),
+					required_scope: solver_types::AuthScope::AdminAll,
+				},
+				auth_middleware,
+			));
+		}
 		api_routes = api_routes.nest("/admin", admin_routes);
 		tracing::info!("Admin routes registered at /api/v1/admin/*");
 	}
@@ -277,31 +300,33 @@ pub async fn start_server(
 		.route("/orders", post(handle_order))
 		.route("/orders/{id}", get(handle_get_order_by_id));
 
-	// Apply auth middleware to order routes if enabled
-	if let Some(jwt) = &jwt_service {
-		// POST /orders requires CreateOrders scope
-		let order_post_route = Router::new().route("/orders", post(handle_order)).layer(
-			middleware::from_fn_with_state(
-				AuthState {
-					jwt_service: jwt.clone(),
-					required_scope: solver_types::AuthScope::CreateOrders,
-				},
-				auth_middleware,
-			),
-		);
+	// Apply auth middleware to order routes only if orders_require_auth is true
+	if orders_require_auth {
+		if let Some(jwt) = &jwt_service {
+			// POST /orders requires CreateOrders scope
+			let order_post_route = Router::new().route("/orders", post(handle_order)).layer(
+				middleware::from_fn_with_state(
+					AuthState {
+						jwt_service: jwt.clone(),
+						required_scope: solver_types::AuthScope::CreateOrders,
+					},
+					auth_middleware,
+				),
+			);
 
-		// GET /orders/{id} requires ReadOrders scope
-		let order_get_route = Router::new()
-			.route("/orders/{id}", get(handle_get_order_by_id))
-			.layer(middleware::from_fn_with_state(
-				AuthState {
-					jwt_service: jwt.clone(),
-					required_scope: solver_types::AuthScope::ReadOrders,
-				},
-				auth_middleware,
-			));
+			// GET /orders/{id} requires ReadOrders scope
+			let order_get_route = Router::new()
+				.route("/orders/{id}", get(handle_get_order_by_id))
+				.layer(middleware::from_fn_with_state(
+					AuthState {
+						jwt_service: jwt.clone(),
+						required_scope: solver_types::AuthScope::ReadOrders,
+					},
+					auth_middleware,
+				));
 
-		order_routes = order_post_route.merge(order_get_route);
+			order_routes = order_post_route.merge(order_get_route);
+		}
 	}
 
 	// Combine all routes

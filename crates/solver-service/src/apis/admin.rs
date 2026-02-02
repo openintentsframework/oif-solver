@@ -344,62 +344,9 @@ pub struct Eip712Domain {
 /// Clients can use this to construct the typed data for signing.
 pub async fn handle_get_types(State(state): State<AdminApiState>) -> Json<Eip712TypeInfo> {
 	use crate::auth::admin::{ADMIN_DOMAIN_NAME, ADMIN_DOMAIN_VERSION};
+	use solver_types::utils::admin_eip712_types;
 
 	let verifier = state.verifier.read().await;
-
-	// EIP-712 types for all admin actions
-	// Note: EIP712Domain does NOT include verifyingContract (off-chain verification)
-	let types = serde_json::json!({
-		"EIP712Domain": [
-			{"name": "name", "type": "string"},
-			{"name": "version", "type": "string"},
-			{"name": "chainId", "type": "uint256"}
-		],
-		"AddToken": [
-			{"name": "chainId", "type": "uint256"},
-			{"name": "symbol", "type": "string"},
-			{"name": "tokenAddress", "type": "address"},
-			{"name": "decimals", "type": "uint8"},
-			{"name": "nonce", "type": "uint256"},
-			{"name": "deadline", "type": "uint256"}
-		],
-		"RemoveToken": [
-			{"name": "chainId", "type": "uint256"},
-			{"name": "tokenAddress", "type": "address"},
-			{"name": "nonce", "type": "uint256"},
-			{"name": "deadline", "type": "uint256"}
-		],
-		"Withdraw": [
-			{"name": "chainId", "type": "uint256"},
-			{"name": "token", "type": "address"},
-			{"name": "amount", "type": "uint256"},
-			{"name": "recipient", "type": "address"},
-			{"name": "nonce", "type": "uint256"},
-			{"name": "deadline", "type": "uint256"}
-		],
-		"UpdateNetwork": [
-			{"name": "chainId", "type": "uint256"},
-			{"name": "rpcUrls", "type": "string[]"},
-			{"name": "nonce", "type": "uint256"},
-			{"name": "deadline", "type": "uint256"}
-		],
-		"AddAdmin": [
-			{"name": "newAdmin", "type": "address"},
-			{"name": "nonce", "type": "uint256"},
-			{"name": "deadline", "type": "uint256"}
-		],
-		"RemoveAdmin": [
-			{"name": "adminToRemove", "type": "address"},
-			{"name": "nonce", "type": "uint256"},
-			{"name": "deadline", "type": "uint256"}
-		],
-		"UpdateFeeConfig": [
-			{"name": "gasBufferBps", "type": "uint32"},
-			{"name": "minProfitabilityPct", "type": "string"},
-			{"name": "nonce", "type": "uint256"},
-			{"name": "deadline", "type": "uint256"}
-		]
-	});
 
 	Json(Eip712TypeInfo {
 		domain: Eip712Domain {
@@ -407,7 +354,7 @@ pub async fn handle_get_types(State(state): State<AdminApiState>) -> Json<Eip712
 			version: ADMIN_DOMAIN_VERSION.to_string(),
 			chain_id: verifier.chain_id(),
 		},
-		types,
+		types: admin_eip712_types(),
 	})
 }
 

@@ -793,9 +793,17 @@ fn build_gas_config_from_operator(gas: &OperatorGasConfig) -> GasConfig {
 /// Builds ApiConfig from OperatorAdminConfig.
 fn build_api_config_from_operator(admin: &OperatorAdminConfig) -> ApiConfig {
 	let auth = if admin.enabled {
+		// Read JWT secret from environment variable
+		let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| {
+			tracing::warn!(
+				"JWT_SECRET not set - using random secret. Tokens will be invalid after restart!"
+			);
+			uuid::Uuid::new_v4().to_string()
+		});
+
 		Some(solver_types::AuthConfig {
 			enabled: false, // Don't require JWT for /orders - admin auth is separate
-			jwt_secret: solver_types::SecretString::new(uuid::Uuid::new_v4().to_string()),
+			jwt_secret: solver_types::SecretString::new(jwt_secret),
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720, // 30 days
 			issuer: "oif-solver".to_string(),
@@ -1221,9 +1229,17 @@ fn build_api_config(
 	let auth = admin_override.map(|admin| {
 		use solver_types::{AdminConfig, AuthConfig, SecretString};
 
+		// Read JWT secret from environment variable
+		let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| {
+			tracing::warn!(
+				"JWT_SECRET not set - using random secret. Tokens will be invalid after restart!"
+			);
+			uuid::Uuid::new_v4().to_string()
+		});
+
 		AuthConfig {
 			enabled: false, // Don't require JWT for /orders - admin auth is separate
-			jwt_secret: SecretString::new(uuid::Uuid::new_v4().to_string()),
+			jwt_secret: SecretString::new(jwt_secret),
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720, // 30 days
 			issuer: "oif-solver".to_string(),
@@ -2603,5 +2619,35 @@ mod tests {
 
 		assert!(api.enabled); // API is always enabled
 		assert!(api.auth.is_none()); // But auth is None when admin disabled
+	}
+
+	#[test]
+	fn test_jwt_secret_from_env_var() {
+		use std::env;
+
+		// Save original value
+		let original_jwt = env::var("JWT_SECRET").ok();
+
+		// Test: Set JWT_SECRET and verify it's used
+		env::set_var("JWT_SECRET", "test-jwt-secret-from-env-var-32ch");
+		let admin = OperatorAdminConfig {
+			enabled: true,
+			domain: "test.com".to_string(),
+			chain_id: 1,
+			nonce_ttl_seconds: 300,
+			admin_addresses: vec![address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")],
+		};
+		let api = build_api_config_from_operator(&admin);
+		let auth = api.auth.as_ref().unwrap();
+		assert_eq!(
+			auth.jwt_secret.expose_secret(),
+			"test-jwt-secret-from-env-var-32ch"
+		);
+
+		// Restore original env var
+		env::remove_var("JWT_SECRET");
+		if let Some(val) = original_jwt {
+			env::set_var("JWT_SECRET", val);
+		}
 	}
 }

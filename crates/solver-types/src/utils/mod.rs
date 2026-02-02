@@ -20,7 +20,7 @@ pub use conversion::{
 	parse_bytes32_from_hex, solver_address_to_bytes32, wei_string_to_eth_string,
 };
 pub use eip712::{
-	compute_domain_hash, compute_final_digest, reconstruct_compact_digest,
+	admin_eip712_types, compute_domain_hash, compute_final_digest, reconstruct_compact_digest,
 	reconstruct_eip3009_digest, reconstruct_permit2_digest, Eip712AbiEncoder, DOMAIN_TYPE,
 	MANDATE_OUTPUT_TYPE, NAME_PERMIT2, PERMIT2_WITNESS_TYPE, PERMIT_BATCH_WITNESS_TYPE,
 	TOKEN_PERMISSIONS_TYPE,
