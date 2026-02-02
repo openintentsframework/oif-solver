@@ -60,8 +60,8 @@ impl SolverBuilder {
 	///
 	/// The builder takes a static snapshot of the config for building services.
 	/// Services created from this snapshot will NOT see hot-reload changes.
-	/// Only services explicitly designed for hot reload (e.g., TokenManager)
-	/// will read from the dynamic config.
+	/// Hot-reload is handled at the API layer (e.g., quote validation reads
+	/// networks directly from the dynamic config passed to handlers).
 	pub fn new(dynamic_config: Arc<RwLock<Config>>, static_config: Config) -> Self {
 		Self {
 			dynamic_config,
