@@ -130,6 +130,7 @@ impl AccountInterface for KmsWallet {
 /// Factory function to create a KMS wallet from configuration.
 ///
 /// Returns an async future that initializes the KMS signer.
+#[allow(clippy::type_complexity)]
 pub fn create_account(
 	config: &toml::Value,
 ) -> Pin<Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + '_>> {
