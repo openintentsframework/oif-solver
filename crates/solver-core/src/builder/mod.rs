@@ -17,6 +17,7 @@ use solver_storage::{StorageError, StorageInterface, StorageService};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::RwLock;
 
 /// Errors that can occur during solver engine construction.
 ///
@@ -48,13 +49,24 @@ pub struct SolverFactories<SF, AF, DF, DIF, OF, PF, SEF, STF> {
 
 /// Builder for constructing a SolverEngine with pluggable implementations.
 pub struct SolverBuilder {
-	config: Config,
+	/// Dynamic configuration that supports hot reload via admin API.
+	dynamic_config: Arc<RwLock<Config>>,
+	/// Static configuration snapshot (services don't see hot reload changes).
+	static_config: Config,
 }
 
 impl SolverBuilder {
 	/// Creates a new SolverBuilder with the given configuration.
-	pub fn new(config: Config) -> Self {
-		Self { config }
+	///
+	/// The builder takes a static snapshot of the config for building services.
+	/// Services created from this snapshot will NOT see hot-reload changes.
+	/// Hot-reload is handled at the API layer (e.g., quote validation reads
+	/// networks directly from the dynamic config passed to handlers).
+	pub fn new(dynamic_config: Arc<RwLock<Config>>, static_config: Config) -> Self {
+		Self {
+			dynamic_config,
+			static_config,
+		}
 	}
 
 	/// Builds the SolverEngine using factories for each component type.
@@ -92,13 +104,13 @@ impl SolverBuilder {
 	{
 		// Create storage implementations
 		let mut storage_impls = HashMap::new();
-		for (name, config) in &self.config.storage.implementations {
+		for (name, config) in &self.static_config.storage.implementations {
 			if let Some(factory) = factories.storage_factories.get(name) {
 				match factory(config) {
 					Ok(implementation) => {
 						// Validation already happened in the factory
 						storage_impls.insert(name.clone(), implementation);
-						let is_primary = &self.config.storage.primary == name;
+						let is_primary = &self.static_config.storage.primary == name;
 						tracing::info!(component = "storage", implementation = %name, enabled = %is_primary, "Loaded");
 					},
 					Err(e) => {
@@ -124,7 +136,7 @@ impl SolverBuilder {
 		}
 
 		// Get the primary storage implementation
-		let primary_storage = &self.config.storage.primary;
+		let primary_storage = &self.static_config.storage.primary;
 		let storage_backend = storage_impls.remove(primary_storage).ok_or_else(|| {
 			BuilderError::Config(format!(
 				"Primary storage '{}' failed to load or has invalid configuration",
@@ -136,12 +148,12 @@ impl SolverBuilder {
 
 		// Create account implementations
 		let mut account_impls = HashMap::new();
-		for (name, config) in &self.config.account.implementations {
+		for (name, config) in &self.static_config.account.implementations {
 			if let Some(factory) = factories.account_factories.get(name) {
 				match factory(config) {
 					Ok(implementation) => {
 						account_impls.insert(name.clone(), implementation);
-						let is_primary = &self.config.account.primary == name;
+						let is_primary = &self.static_config.account.primary == name;
 						tracing::info!(component = "account", implementation = %name, enabled = %is_primary, "Loaded");
 					},
 					Err(e) => {
@@ -173,7 +185,7 @@ impl SolverBuilder {
 		}
 
 		// Get the primary account service
-		let primary_account = self.config.account.primary.as_str();
+		let primary_account = self.static_config.account.primary.as_str();
 		let account = account_services
 			.get(primary_account)
 			.ok_or_else(|| {
@@ -206,7 +218,7 @@ impl SolverBuilder {
 		// Get the default private key from the primary account
 		let default_private_key = account.get_private_key();
 
-		for (name, config) in &self.config.delivery.implementations {
+		for (name, config) in &self.static_config.delivery.implementations {
 			if let Some(factory) = factories.delivery_factories.get(name) {
 				// Parse per-network account mappings from config
 				let mut network_private_keys = HashMap::new();
@@ -230,7 +242,7 @@ impl SolverBuilder {
 
 				match factory(
 					config,
-					&self.config.networks,
+					&self.static_config.networks,
 					&default_private_key,
 					&network_private_keys,
 				) {
@@ -283,15 +295,15 @@ impl SolverBuilder {
 
 		let delivery = Arc::new(DeliveryService::new(
 			delivery_implementations,
-			self.config.delivery.min_confirmations,
-			self.config.solver.monitoring_timeout_seconds,
+			self.static_config.delivery.min_confirmations,
+			self.static_config.solver.monitoring_timeout_seconds,
 		));
 
 		// Create discovery implementations
 		let mut discovery_implementations = HashMap::new();
-		for (name, config) in &self.config.discovery.implementations {
+		for (name, config) in &self.static_config.discovery.implementations {
 			if let Some(factory) = factories.discovery_factories.get(name) {
-				match factory(config, &self.config.networks) {
+				match factory(config, &self.static_config.networks) {
 					Ok(implementation) => {
 						// Validation already happened in the factory
 						discovery_implementations.insert(name.clone(), implementation);
@@ -323,9 +335,9 @@ impl SolverBuilder {
 
 		// Create settlement implementations first (needed for oracle routes)
 		let mut settlement_impls = HashMap::new();
-		for (name, config) in &self.config.settlement.implementations {
+		for (name, config) in &self.static_config.settlement.implementations {
 			if let Some(factory) = factories.settlement_factories.get(name) {
-				match factory(config, &self.config.networks, storage.clone()) {
+				match factory(config, &self.static_config.networks, storage.clone()) {
 					Ok(implementation) => {
 						// Validation already happened in the factory
 						settlement_impls.insert(name.clone(), implementation);
@@ -353,12 +365,14 @@ impl SolverBuilder {
 
 		let settlement = Arc::new(SettlementService::new(
 			settlement_impls,
-			self.config.settlement.settlement_poll_interval_seconds,
+			self.static_config
+				.settlement
+				.settlement_poll_interval_seconds,
 		));
 
 		// Create pricing service
 		let pricing_config =
-			self.config.pricing.as_ref().ok_or_else(|| {
+			self.static_config.pricing.as_ref().ok_or_else(|| {
 				BuilderError::Config("Pricing configuration is required".to_string())
 			})?;
 
@@ -434,9 +448,9 @@ impl SolverBuilder {
 
 		// Create order implementations (now with oracle routes)
 		let mut order_impls = HashMap::new();
-		for (name, config) in &self.config.order.implementations {
+		for (name, config) in &self.static_config.order.implementations {
 			if let Some(factory) = factories.order_factories.get(name) {
-				match factory(config, &self.config.networks, &oracle_routes) {
+				match factory(config, &self.static_config.networks, &oracle_routes) {
 					Ok(implementation) => {
 						// Validation already happened in the factory
 						order_impls.insert(name.clone(), implementation);
@@ -464,12 +478,12 @@ impl SolverBuilder {
 
 		// Create strategy implementations
 		let mut strategy_impls = HashMap::new();
-		for (name, config) in &self.config.order.strategy.implementations {
+		for (name, config) in &self.static_config.order.strategy.implementations {
 			if let Some(factory) = factories.strategy_factories.get(name) {
 				match factory(config) {
 					Ok(implementation) => {
 						strategy_impls.insert(name.clone(), implementation);
-						let is_primary = &self.config.order.strategy.primary == name;
+						let is_primary = &self.static_config.order.strategy.primary == name;
 						tracing::info!(component = "strategy", implementation = %name, enabled = %is_primary, "Loaded");
 					},
 					Err(e) => {
@@ -495,7 +509,7 @@ impl SolverBuilder {
 		}
 
 		// Use the primary strategy implementation
-		let primary_strategy = self.config.order.strategy.primary.as_str();
+		let primary_strategy = self.static_config.order.strategy.primary.as_str();
 		let strategy = strategy_impls.remove(primary_strategy).ok_or_else(|| {
 			BuilderError::Config(format!(
 				"Primary strategy '{}' failed to load or has invalid configuration",
@@ -507,7 +521,7 @@ impl SolverBuilder {
 
 		// Create and initialize the TokenManager
 		let token_manager = Arc::new(crate::engine::token_manager::TokenManager::new(
-			self.config.networks.clone(),
+			self.static_config.networks.clone(),
 			delivery.clone(),
 			account.clone(),
 		));
@@ -517,7 +531,7 @@ impl SolverBuilder {
 			Ok(()) => {
 				tracing::info!(
 					component = "token_manager",
-					networks = self.config.networks.len(),
+					networks = self.static_config.networks.len(),
 					"Token manager initialized with approvals"
 				);
 			},
@@ -561,7 +575,8 @@ impl SolverBuilder {
 		}
 
 		Ok(SolverEngine::new(
-			self.config,
+			self.dynamic_config,
+			self.static_config,
 			storage,
 			account,
 			solver_address,

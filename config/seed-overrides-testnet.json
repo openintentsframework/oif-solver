@@ -1,5 +1,4 @@
 {
-  "solver_id": "oif-solver-testnet",
   "networks": [
     {
       "chain_id": 11155420,
@@ -21,5 +20,10 @@
         }
       ]
     }
-  ]
+  ],
+  "admin": {
+    "enabled": true,
+    "domain": "localhost",
+    "admin_addresses": ["0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"]
+  }
 }

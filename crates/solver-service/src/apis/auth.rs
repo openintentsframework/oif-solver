@@ -307,6 +307,7 @@ mod tests {
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,
 			issuer: "test-issuer".to_string(),
+			admin: None,
 		};
 		Arc::new(JwtService::new(config).unwrap())
 	}

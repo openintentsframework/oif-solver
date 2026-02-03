@@ -18,7 +18,7 @@ use futures::future::try_join_all;
 use solver_core::SolverEngine;
 use solver_types::{
 	AuthScheme, CostContext, GetQuoteRequest, IntentRequest, IntentType, InteropAddress,
-	QuoteError, SwapType, ValidatedQuoteContext,
+	NetworksConfig, QuoteError, SwapType, ValidatedQuoteContext,
 };
 
 /// Main validator for quote requests.
@@ -265,17 +265,15 @@ impl QuoteValidator {
 	/// # Arguments
 	///
 	/// * `request` - The quote request containing chain references
-	/// * `solver` - The solver engine with network configuration
+	/// * `networks` - Networks config with token and settler configuration
 	///
 	/// # Errors
 	///
 	/// Returns `QuoteError::UnsupportedAsset` if unsupported chains are detected
 	pub fn validate_supported_networks(
 		request: &GetQuoteRequest,
-		solver: &SolverEngine,
+		networks: &NetworksConfig,
 	) -> Result<(), QuoteError> {
-		let networks = solver.token_manager().get_networks();
-
 		// Check if any input is on a supported origin chain
 		let has_valid_input = request.intent.inputs.iter().any(|input| {
 			Self::chain_id_from_interop(&input.asset)
@@ -313,19 +311,23 @@ impl QuoteValidator {
 
 	/// Checks if a specific token is supported by the solver on a given chain.
 	///
-	/// This method queries the TokenManager to determine if the solver has
+	/// This method queries the networks config to determine if the solver has
 	/// configuration for the specified token.
 	///
 	/// # Arguments
 	///
-	/// * `solver` - The solver engine containing token configuration
+	/// * `networks` - Networks config containing token configuration
 	/// * `chain_id` - The blockchain network ID
 	/// * `address` - The token contract address
-	fn is_token_supported(solver: &SolverEngine, chain_id: u64, address: &AlloyAddress) -> bool {
+	fn is_token_supported(
+		networks: &NetworksConfig,
+		chain_id: u64,
+		address: &AlloyAddress,
+	) -> bool {
 		let solver_address: solver_types::Address = (*address).into();
-		solver
-			.token_manager()
-			.is_supported(chain_id, &solver_address)
+		networks
+			.get(&chain_id)
+			.is_some_and(|network| network.tokens.iter().any(|t| t.address == solver_address))
 	}
 
 	/// Validates an ERC-7930 interoperable address.
@@ -379,7 +381,7 @@ impl QuoteValidator {
 	/// # Arguments
 	///
 	/// * `request` - The quote request containing inputs
-	/// * `solver` - The solver engine with token configuration  
+	/// * `networks` - Networks config with token configuration  
 	/// * `cost_context` - Contains calculated swap amounts for each asset
 	///
 	/// # Returns
@@ -391,7 +393,7 @@ impl QuoteValidator {
 	/// Returns `QuoteError::UnsupportedAsset` if ANY input is not supported
 	pub fn validate_and_collect_inputs_with_costs(
 		request: &GetQuoteRequest,
-		solver: &SolverEngine,
+		networks: &NetworksConfig,
 		cost_context: &CostContext,
 	) -> Result<Vec<SupportedAsset>, QuoteError> {
 		let mut supported_assets = Vec::new();
@@ -401,7 +403,7 @@ impl QuoteValidator {
 			let (chain_id, evm_addr) = Self::extract_chain_and_address(asset_addr)?;
 
 			// ALL assets must be supported for proper pricing
-			if !Self::is_token_supported(solver, chain_id, &evm_addr) {
+			if !Self::is_token_supported(networks, chain_id, &evm_addr) {
 				return Err(QuoteError::UnsupportedAsset(format!(
 					"Input token not supported on chain {}: {}",
 					chain_id,
@@ -442,7 +444,7 @@ impl QuoteValidator {
 	/// # Arguments
 	///
 	/// * `request` - The quote request containing outputs
-	/// * `solver` - The solver engine with token configuration
+	/// * `networks` - Networks config with token configuration
 	/// * `cost_context` - Contains calculated swap amounts for each asset
 	///
 	/// # Returns
@@ -454,7 +456,7 @@ impl QuoteValidator {
 	/// Returns `QuoteError::UnsupportedAsset` if ANY output is not supported
 	pub fn validate_and_collect_outputs_with_costs(
 		request: &GetQuoteRequest,
-		solver: &SolverEngine,
+		networks: &NetworksConfig,
 		cost_context: &CostContext,
 	) -> Result<Vec<SupportedAsset>, QuoteError> {
 		let mut supported_assets = Vec::new();
@@ -464,7 +466,7 @@ impl QuoteValidator {
 			let (chain_id, evm_addr) = Self::extract_chain_and_address(asset_addr)?;
 
 			// ALL assets must be supported for proper pricing
-			if !Self::is_token_supported(solver, chain_id, &evm_addr) {
+			if !Self::is_token_supported(networks, chain_id, &evm_addr) {
 				return Err(QuoteError::UnsupportedAsset(format!(
 					"Output token not supported on chain {}: {}",
 					chain_id,
@@ -697,8 +699,8 @@ mod tests {
 	use solver_core::SolverEngine;
 	use solver_types::networks::NetworkConfig;
 	use solver_types::{
-		AuthScheme, GetQuoteRequest, IntentType, OriginMode, OriginSubmission, QuoteInput,
-		QuoteOutput,
+		AuthScheme, GetQuoteRequest, IntentType, NetworksConfig, OriginMode, OriginSubmission,
+		QuoteInput, QuoteOutput,
 	};
 	use std::collections::HashMap;
 	use std::sync::Arc;
@@ -709,7 +711,7 @@ mod tests {
 	}
 
 	/// Creates a minimal mock SolverEngine for testing with custom network configurations
-	fn create_mock_solver_with_networks(networks: HashMap<u64, NetworkConfig>) -> SolverEngine {
+	fn create_mock_solver_with_networks(networks: NetworksConfig) -> SolverEngine {
 		use solver_account::AccountService;
 		use solver_config::Config;
 		use solver_core::engine::event_bus::EventBus;
@@ -802,7 +804,9 @@ mod tests {
 			account.clone(),
 		));
 
+		let dynamic_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
 		SolverEngine::new(
+			dynamic_config,
 			config,
 			storage,
 			account,
@@ -1327,10 +1331,9 @@ mod tests {
 		networks.insert(1u64, create_network_config(false, false)); // Chain 1: both settlers configured
 		networks.insert(137u64, create_network_config(false, false)); // Chain 137: both settlers configured
 
-		let solver = create_mock_solver_with_networks(networks);
 		let request = create_request_with_chains(1, 137);
 
-		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			result.is_ok(),
 			"Should accept request with supported chains: {:?}",
@@ -1345,10 +1348,9 @@ mod tests {
 		networks.insert(1u64, create_network_config(false, true)); // Chain 1: input settler only
 		networks.insert(137u64, create_network_config(true, false)); // Chain 137: output settler only
 
-		let solver = create_mock_solver_with_networks(networks);
 		let request = create_request_with_chains(1, 137);
 
-		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			result.is_ok(),
 			"Should accept request with proper origin/destination setup: {:?}",
@@ -1363,10 +1365,9 @@ mod tests {
 		networks.insert(1u64, create_network_config(true, false)); // Chain 1: no input settler
 		networks.insert(137u64, create_network_config(true, false)); // Chain 137: no input settler
 
-		let solver = create_mock_solver_with_networks(networks);
 		let request = create_request_with_chains(1, 137);
 
-		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("No supported origin chains")),
 			"Should reject when no input chains have input settlers: {:?}",
@@ -1381,10 +1382,9 @@ mod tests {
 		networks.insert(1u64, create_network_config(false, false)); // Chain 1: both settlers
 		networks.insert(137u64, create_network_config(false, true)); // Chain 137: no output settler
 
-		let solver = create_mock_solver_with_networks(networks);
 		let request = create_request_with_chains(1, 137);
 
-		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Chain 137 not supported as destination")),
 			"Should reject when output chain lacks output settler: {:?}",
@@ -1398,10 +1398,9 @@ mod tests {
 		let mut networks = HashMap::new();
 		networks.insert(137u64, create_network_config(false, false)); // Only chain 137 configured
 
-		let solver = create_mock_solver_with_networks(networks);
 		let request = create_request_with_chains(1, 137); // Input on chain 1 (not configured)
 
-		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("No supported origin chains")),
 			"Should reject when input chain is not configured: {:?}",
@@ -1415,10 +1414,9 @@ mod tests {
 		let mut networks = HashMap::new();
 		networks.insert(1u64, create_network_config(false, false)); // Only chain 1 configured
 
-		let solver = create_mock_solver_with_networks(networks);
 		let request = create_request_with_chains(1, 137); // Output on chain 137 (not configured)
 
-		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Chain 137 not supported as destination")),
 			"Should reject when output chain is not configured: {:?}",
@@ -1433,8 +1431,6 @@ mod tests {
 		networks.insert(1u64, create_network_config(false, false)); // Chain 1: both settlers
 		networks.insert(42u64, create_network_config(true, false)); // Chain 42: no input settler
 		networks.insert(137u64, create_network_config(false, false)); // Chain 137: both settlers
-
-		let solver = create_mock_solver_with_networks(networks);
 
 		let mut request = create_request_with_chains(1, 137);
 		// Add another input on unsupported origin chain
@@ -1451,7 +1447,7 @@ mod tests {
 			lock: None,
 		});
 
-		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			result.is_ok(),
 			"Should accept when at least one input is on supported origin chain: {:?}",
@@ -1466,8 +1462,6 @@ mod tests {
 		networks.insert(1u64, create_network_config(false, false)); // Chain 1: both settlers
 		networks.insert(137u64, create_network_config(false, false)); // Chain 137: both settlers
 		networks.insert(42u64, create_network_config(false, true)); // Chain 42: no output settler
-
-		let solver = create_mock_solver_with_networks(networks);
 
 		let mut request = create_request_with_chains(1, 137);
 		// Add another output on unsupported destination chain
@@ -1484,7 +1478,7 @@ mod tests {
 			calldata: None,
 		});
 
-		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Chain 42 not supported as destination")),
 			"Should reject when any output is on unsupported destination chain: {:?}",
@@ -1498,10 +1492,9 @@ mod tests {
 		let mut networks = HashMap::new();
 		networks.insert(1u64, create_network_config(false, false)); // Chain 1: both settlers
 
-		let solver = create_mock_solver_with_networks(networks);
 		let request = create_request_with_chains(1, 1); // Same chain for input and output
 
-		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			result.is_ok(),
 			"Should accept same-chain swaps when both settlers configured: {:?}",
@@ -1515,10 +1508,9 @@ mod tests {
 		let mut networks = HashMap::new();
 		networks.insert(1u64, create_network_config(false, true)); // Chain 1: no output settler
 
-		let solver = create_mock_solver_with_networks(networks);
 		let request = create_request_with_chains(1, 1); // Same chain for input and output
 
-		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Chain 1 not supported as destination")),
 			"Should reject same-chain swaps when output settler missing: {:?}",
@@ -1532,13 +1524,11 @@ mod tests {
 		let mut networks = HashMap::new();
 		networks.insert(1u64, create_network_config(false, false));
 
-		let solver = create_mock_solver_with_networks(networks);
-
 		// This test would need to construct an invalid InteropAddress
 		// For now, we test with a valid request to ensure the function works correctly
 		let request = create_request_with_chains(1, 1);
 
-		let result = QuoteValidator::validate_supported_networks(&request, &solver);
+		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			result.is_ok() || matches!(result, Err(QuoteError::InvalidRequest(_))),
 			"Should handle address parsing appropriately: {:?}",
@@ -1606,10 +1596,10 @@ mod tests {
 		}
 	}
 
-	/// Creates a mock solver with specific token support configuration
+	/// Creates a mock networks config with specific token support configuration
 	fn create_mock_solver_with_token_support(
 		supported_tokens: HashMap<u64, Vec<AlloyAddress>>,
-	) -> SolverEngine {
+	) -> NetworksConfig {
 		use solver_types::networks::{NetworkConfig, RpcEndpoint, TokenConfig};
 		use solver_types::Address;
 
@@ -1640,7 +1630,7 @@ mod tests {
 			);
 		}
 
-		create_mock_solver_with_networks(networks)
+		networks
 	}
 
 	/// Creates a GetQuoteRequest for testing with customizable inputs and outputs
@@ -1723,7 +1713,7 @@ mod tests {
 			1u64,
 			vec![address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")],
 		);
-		let solver = create_mock_solver_with_token_support(supported_tokens);
+		let networks = create_mock_solver_with_token_support(supported_tokens);
 
 		let request = create_simple_test_quote_request(
 			input_token.clone(),
@@ -1742,7 +1732,7 @@ mod tests {
 
 		let result = QuoteValidator::validate_and_collect_inputs_with_costs(
 			&request,
-			&solver,
+			&networks,
 			&cost_context,
 		);
 
@@ -1771,7 +1761,7 @@ mod tests {
 			1u64,
 			vec![address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")],
 		);
-		let solver = create_mock_solver_with_token_support(supported_tokens);
+		let networks = create_mock_solver_with_token_support(supported_tokens);
 
 		let request = create_simple_test_quote_request(
 			input_token.clone(),
@@ -1787,7 +1777,7 @@ mod tests {
 
 		let result = QuoteValidator::validate_and_collect_inputs_with_costs(
 			&request,
-			&solver,
+			&networks,
 			&cost_context,
 		);
 
@@ -1812,7 +1802,7 @@ mod tests {
 			InteropAddress::new_ethereum(137, address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"));
 
 		// Create solver that doesn't support this token
-		let solver = create_mock_solver_with_token_support(HashMap::new());
+		let networks = create_mock_solver_with_token_support(HashMap::new());
 
 		let request = create_simple_test_quote_request(
 			input_token.clone(),
@@ -1827,7 +1817,7 @@ mod tests {
 
 		let result = QuoteValidator::validate_and_collect_inputs_with_costs(
 			&request,
-			&solver,
+			&networks,
 			&cost_context,
 		);
 
@@ -1853,7 +1843,7 @@ mod tests {
 			1u64,
 			vec![address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")],
 		);
-		let solver = create_mock_solver_with_token_support(supported_tokens);
+		let networks = create_mock_solver_with_token_support(supported_tokens);
 
 		let request = create_test_quote_request(
 			vec![
@@ -1869,7 +1859,7 @@ mod tests {
 
 		let result = QuoteValidator::validate_and_collect_inputs_with_costs(
 			&request,
-			&solver,
+			&networks,
 			&cost_context,
 		);
 
@@ -1898,7 +1888,7 @@ mod tests {
 				address!("dAC17F958D2ee523a2206206994597C13D831ec7"),
 			],
 		);
-		let solver = create_mock_solver_with_token_support(supported_tokens);
+		let networks = create_mock_solver_with_token_support(supported_tokens);
 
 		let request = create_test_quote_request(
 			vec![
@@ -1919,7 +1909,7 @@ mod tests {
 
 		let result = QuoteValidator::validate_and_collect_inputs_with_costs(
 			&request,
-			&solver,
+			&networks,
 			&cost_context,
 		);
 
@@ -1955,7 +1945,7 @@ mod tests {
 			137u64,
 			vec![address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1")],
 		);
-		let solver = create_mock_solver_with_token_support(supported_tokens);
+		let networks = create_mock_solver_with_token_support(supported_tokens);
 
 		let request = create_simple_test_quote_request(
 			input_token,
@@ -1974,7 +1964,7 @@ mod tests {
 
 		let result = QuoteValidator::validate_and_collect_outputs_with_costs(
 			&request,
-			&solver,
+			&networks,
 			&cost_context,
 		);
 
@@ -2003,7 +1993,7 @@ mod tests {
 			137u64,
 			vec![address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1")],
 		);
-		let solver = create_mock_solver_with_token_support(supported_tokens);
+		let networks = create_mock_solver_with_token_support(supported_tokens);
 
 		let request = create_simple_test_quote_request(
 			input_token,
@@ -2019,7 +2009,7 @@ mod tests {
 
 		let result = QuoteValidator::validate_and_collect_outputs_with_costs(
 			&request,
-			&solver,
+			&networks,
 			&cost_context,
 		);
 
@@ -2044,7 +2034,7 @@ mod tests {
 			InteropAddress::new_ethereum(137, address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"));
 
 		// Create solver that doesn't support this token
-		let solver = create_mock_solver_with_token_support(HashMap::new());
+		let networks = create_mock_solver_with_token_support(HashMap::new());
 
 		let request = create_simple_test_quote_request(
 			input_token,
@@ -2059,7 +2049,7 @@ mod tests {
 
 		let result = QuoteValidator::validate_and_collect_outputs_with_costs(
 			&request,
-			&solver,
+			&networks,
 			&cost_context,
 		);
 
@@ -2088,7 +2078,7 @@ mod tests {
 				address!("c2132D05D31c914a87C6611C10748AEb04B58e8F"),
 			],
 		);
-		let solver = create_mock_solver_with_token_support(supported_tokens);
+		let networks = create_mock_solver_with_token_support(supported_tokens);
 
 		let request = create_test_quote_request(
 			vec![(input_token, Some("1000000"))],
@@ -2109,7 +2099,7 @@ mod tests {
 
 		let result = QuoteValidator::validate_and_collect_outputs_with_costs(
 			&request,
-			&solver,
+			&networks,
 			&cost_context,
 		);
 

@@ -702,6 +702,76 @@ pub fn reconstruct_eip3009_digest(
 	Ok(final_digest.0)
 }
 
+/// Returns the EIP-712 type definitions for admin actions.
+///
+/// These types are used by clients to construct typed data for signing admin actions.
+/// The EIP712Domain does NOT include verifyingContract (off-chain verification).
+///
+/// # Returns
+///
+/// A `serde_json::Value` containing all admin action type definitions:
+/// - EIP712Domain
+/// - AddToken
+/// - RemoveToken
+/// - Withdraw
+/// - UpdateNetwork
+/// - AddAdmin
+/// - RemoveAdmin
+/// - UpdateFeeConfig
+pub fn admin_eip712_types() -> serde_json::Value {
+	serde_json::json!({
+		"EIP712Domain": [
+			{"name": "name", "type": "string"},
+			{"name": "version", "type": "string"},
+			{"name": "chainId", "type": "uint256"}
+		],
+		"AddToken": [
+			{"name": "chainId", "type": "uint256"},
+			{"name": "symbol", "type": "string"},
+			{"name": "tokenAddress", "type": "address"},
+			{"name": "decimals", "type": "uint8"},
+			{"name": "nonce", "type": "uint256"},
+			{"name": "deadline", "type": "uint256"}
+		],
+		"RemoveToken": [
+			{"name": "chainId", "type": "uint256"},
+			{"name": "tokenAddress", "type": "address"},
+			{"name": "nonce", "type": "uint256"},
+			{"name": "deadline", "type": "uint256"}
+		],
+		"Withdraw": [
+			{"name": "chainId", "type": "uint256"},
+			{"name": "token", "type": "address"},
+			{"name": "amount", "type": "uint256"},
+			{"name": "recipient", "type": "address"},
+			{"name": "nonce", "type": "uint256"},
+			{"name": "deadline", "type": "uint256"}
+		],
+		"UpdateNetwork": [
+			{"name": "chainId", "type": "uint256"},
+			{"name": "rpcUrls", "type": "string[]"},
+			{"name": "nonce", "type": "uint256"},
+			{"name": "deadline", "type": "uint256"}
+		],
+		"AddAdmin": [
+			{"name": "newAdmin", "type": "address"},
+			{"name": "nonce", "type": "uint256"},
+			{"name": "deadline", "type": "uint256"}
+		],
+		"RemoveAdmin": [
+			{"name": "adminToRemove", "type": "address"},
+			{"name": "nonce", "type": "uint256"},
+			{"name": "deadline", "type": "uint256"}
+		],
+		"UpdateFeeConfig": [
+			{"name": "gasBufferBps", "type": "uint32"},
+			{"name": "minProfitabilityPct", "type": "string"},
+			{"name": "nonce", "type": "uint256"},
+			{"name": "deadline", "type": "uint256"}
+		]
+	})
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1582,5 +1652,86 @@ mod tests {
 		// Test multiple calls on the same payload
 		let result3 = reconstruct_permit2_digest(&payload1).unwrap();
 		assert_eq!(result1, result3);
+	}
+
+	#[test]
+	fn test_admin_eip712_types_structure() {
+		let types = admin_eip712_types();
+
+		// Verify it's an object with expected keys
+		let obj = types.as_object().expect("should be an object");
+
+		// Check all expected type definitions exist
+		assert!(obj.contains_key("EIP712Domain"));
+		assert!(obj.contains_key("AddToken"));
+		assert!(obj.contains_key("RemoveToken"));
+		assert!(obj.contains_key("Withdraw"));
+		assert!(obj.contains_key("UpdateNetwork"));
+		assert!(obj.contains_key("AddAdmin"));
+		assert!(obj.contains_key("RemoveAdmin"));
+		assert!(obj.contains_key("UpdateFeeConfig"));
+	}
+
+	#[test]
+	fn test_admin_eip712_types_domain_fields() {
+		let types = admin_eip712_types();
+		let domain = types["EIP712Domain"]
+			.as_array()
+			.expect("should be an array");
+
+		// Domain should have name, version, chainId (no verifyingContract for off-chain)
+		assert_eq!(domain.len(), 3);
+
+		let names: Vec<&str> = domain.iter().map(|f| f["name"].as_str().unwrap()).collect();
+		assert!(names.contains(&"name"));
+		assert!(names.contains(&"version"));
+		assert!(names.contains(&"chainId"));
+	}
+
+	#[test]
+	fn test_admin_eip712_types_add_token_fields() {
+		let types = admin_eip712_types();
+		let add_token = types["AddToken"].as_array().expect("should be an array");
+
+		// AddToken should have: chainId, symbol, tokenAddress, decimals, nonce, deadline
+		assert_eq!(add_token.len(), 6);
+
+		let names: Vec<&str> = add_token
+			.iter()
+			.map(|f| f["name"].as_str().unwrap())
+			.collect();
+		assert!(names.contains(&"chainId"));
+		assert!(names.contains(&"symbol"));
+		assert!(names.contains(&"tokenAddress"));
+		assert!(names.contains(&"decimals"));
+		assert!(names.contains(&"nonce"));
+		assert!(names.contains(&"deadline"));
+	}
+
+	#[test]
+	fn test_admin_eip712_types_update_fee_config_fields() {
+		let types = admin_eip712_types();
+		let fee_config = types["UpdateFeeConfig"]
+			.as_array()
+			.expect("should be an array");
+
+		// UpdateFeeConfig should have: gasBufferBps, minProfitabilityPct, nonce, deadline
+		assert_eq!(fee_config.len(), 4);
+
+		let names: Vec<&str> = fee_config
+			.iter()
+			.map(|f| f["name"].as_str().unwrap())
+			.collect();
+		assert!(names.contains(&"gasBufferBps"));
+		assert!(names.contains(&"minProfitabilityPct"));
+		assert!(names.contains(&"nonce"));
+		assert!(names.contains(&"deadline"));
+	}
+
+	#[test]
+	fn test_admin_eip712_types_deterministic() {
+		let types1 = admin_eip712_types();
+		let types2 = admin_eip712_types();
+		assert_eq!(types1, types2);
 	}
 }

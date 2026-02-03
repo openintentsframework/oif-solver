@@ -4,8 +4,13 @@
 //! for the OIF Solver API.
 
 use crate::{
+	apis::admin::{
+		handle_add_token, handle_get_nonce, handle_get_types, handle_update_fees, AdminApiState,
+	},
+	apis::health::handle_health,
 	apis::order::get_order_by_id,
-	auth::{auth_middleware, AuthState, JwtService},
+	auth::{admin::AdminActionVerifier, auth_middleware, AuthState, JwtService},
+	config_merge::config_to_operator_config,
 	validators::order::ensure_user_capacity_for_order,
 	validators::signature::SignatureValidationService,
 };
@@ -15,19 +20,23 @@ use axum::{
 	http::StatusCode,
 	middleware,
 	response::{IntoResponse, Json},
-	routing::{get, post},
+	routing::{get, post, put},
 	Router, ServiceExt,
 };
 use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
+use solver_storage::{
+	config_store::create_config_store, nonce_store::create_nonce_store, StoreConfig,
+};
 use solver_types::{
 	api::PostOrderRequest, standards::eip7683::interfaces::StandardOrder, APIError, Address,
-	ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse, Order, OrderIdCallback,
-	Transaction,
+	ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse, OperatorConfig, Order,
+	OrderIdCallback, Transaction,
 };
 use std::{convert::TryInto, sync::Arc};
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tower_http::normalize_path::NormalizePath;
@@ -37,8 +46,9 @@ use tower_http::normalize_path::NormalizePath;
 pub struct AppState {
 	/// Reference to the solver engine for processing requests.
 	pub solver: Arc<SolverEngine>,
-	/// Complete configuration.
-	pub config: Config,
+	/// Shared runtime config that gets hot-reloaded by admin API.
+	/// Always use this for reading current config (tokens, networks, etc.).
+	pub config: Arc<RwLock<Config>>,
 	/// HTTP client for forwarding requests.
 	pub http_client: reqwest::Client,
 	/// Discovery service URL for forwarding orders (if configured).
@@ -57,7 +67,10 @@ pub async fn start_server(
 	api_config: ApiConfig,
 	solver: Arc<SolverEngine>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-	// Get the full config from the solver engine
+	// Get the dynamic config from the solver engine for hot-reload support.
+	// This is the SAME Arc used by the solver - admin API updates will propagate immediately.
+	let dynamic_config = solver.dynamic_config().clone();
+	// Get a snapshot for reading config values during setup
 	let config = solver.config().clone();
 
 	// Create a reusable HTTP client with connection pooling
@@ -85,14 +98,18 @@ pub async fn start_server(
 		tracing::warn!("No offchain_eip7683 discovery source configured - /orders endpoint will not be available");
 	}
 
-	// Initialize JWT service if auth is enabled
+	// Initialize JWT service if auth config exists (needed for admin endpoints even if orders auth is disabled)
 	let jwt_service = match &api_config.auth {
-		Some(auth_config) if auth_config.enabled => match JwtService::new(auth_config.clone()) {
+		Some(auth_config) => match JwtService::new(auth_config.clone()) {
 			Ok(service) => {
-				tracing::info!(
-					"API authentication enabled with issuer: {}",
-					auth_config.issuer
-				);
+				if auth_config.enabled {
+					tracing::info!(
+						"API authentication enabled for orders with issuer: {}",
+						auth_config.issuer
+					);
+				} else {
+					tracing::info!("JWT service initialized for admin auth (orders auth disabled)");
+				}
 				Some(Arc::new(service))
 			},
 			Err(e) => {
@@ -100,18 +117,137 @@ pub async fn start_server(
 				return Err(e.into());
 			},
 		},
-		_ => {
+		None => {
 			tracing::info!("API authentication disabled");
 			None
 		},
 	};
 
+	// Track whether orders should require auth
+	let orders_require_auth = api_config.auth.as_ref().map(|a| a.enabled).unwrap_or(false);
+
 	// Initialize signature validation service
 	let signature_validation = Arc::new(SignatureValidationService::new());
 
+	// Initialize admin API if enabled in config
+	let admin_state = if let Some(auth_config) = &api_config.auth {
+		if let Some(admin_config) = &auth_config.admin {
+			if admin_config.enabled {
+				let redis_url = std::env::var("REDIS_URL")
+					.unwrap_or_else(|_| "redis://localhost:6379".to_string());
+				let solver_id = config.solver.id.clone();
+				// Use explicit chain_id from admin config, or fall back to first network
+				let chain_id = admin_config
+					.chain_id
+					.unwrap_or_else(|| config.networks.keys().next().copied().unwrap_or(1));
+
+				// Use the solver's dynamic_config for hot reload (same Arc!)
+				// This ensures admin API updates propagate to the solver engine.
+
+				// Convert Config to OperatorConfig for persistence
+				let operator_config = match config_to_operator_config(&config) {
+					Ok(oc) => oc,
+					Err(e) => {
+						tracing::error!("Failed to convert config to OperatorConfig: {}", e);
+						return Err(Box::new(std::io::Error::new(
+							std::io::ErrorKind::InvalidData,
+							format!("Config conversion error: {}", e),
+						)));
+					},
+				};
+
+				// Create ConfigStore for OperatorConfig
+				let config_store: Arc<
+					dyn solver_storage::config_store::ConfigStore<OperatorConfig>,
+				> = match create_config_store::<OperatorConfig>(
+					StoreConfig::Redis {
+						url: redis_url.clone(),
+					},
+					format!("{}-operator", solver_id),
+				) {
+					Ok(store) => Arc::from(store),
+					Err(e) => {
+						tracing::error!("Failed to create operator config store: {}", e);
+						return Err(Box::new(std::io::Error::new(
+							std::io::ErrorKind::Other,
+							format!("Config store error: {}", e),
+						)));
+					},
+				};
+
+				// Seed OperatorConfig if it doesn't exist
+				match config_store.exists().await {
+					Ok(false) => {
+						if let Err(e) = config_store.seed(operator_config).await {
+							tracing::error!("Failed to seed operator config: {}", e);
+							return Err(Box::new(std::io::Error::new(
+								std::io::ErrorKind::Other,
+								format!("Config seed error: {}", e),
+							)));
+						}
+						tracing::info!("Seeded operator config for admin API persistence");
+					},
+					Ok(true) => {
+						tracing::info!("Operator config already exists, using existing");
+					},
+					Err(e) => {
+						tracing::error!("Failed to check operator config existence: {}", e);
+						return Err(Box::new(std::io::Error::new(
+							std::io::ErrorKind::Other,
+							format!("Config check error: {}", e),
+						)));
+					},
+				}
+
+				// Create nonce store (concrete NonceStore type, not a trait)
+				match create_nonce_store(
+					StoreConfig::Redis { url: redis_url },
+					&solver_id,
+					admin_config.nonce_ttl_seconds,
+				) {
+					Ok(nonce_store) => {
+						// Keep nonce_store as Arc for sharing with verifier and AdminApiState
+						let nonce_store: Arc<solver_storage::nonce_store::NonceStore> =
+							Arc::new(nonce_store);
+						let verifier = AdminActionVerifier::new(
+							nonce_store.clone(),
+							admin_config.clone(),
+							chain_id,
+						);
+						tracing::info!(
+							"Admin API enabled for {} admin(s) with config persistence",
+							admin_config.admin_count()
+						);
+						Some(AdminApiState {
+							// Wrap verifier in RwLock for hot reload of admin list
+							verifier: Arc::new(RwLock::new(verifier)),
+							config_store,
+							dynamic_config: dynamic_config.clone(),
+							// Store nonce_store for rebuilding verifier later
+							nonce_store,
+						})
+					},
+					Err(e) => {
+						tracing::error!("Failed to initialize admin nonce store: {}", e);
+						None
+					},
+				}
+			} else {
+				None
+			}
+		} else {
+			None
+		}
+	} else {
+		None
+	};
+
+	// Note: dynamic_config is already defined at function start from solver.dynamic_config()
+	// This ensures AppState and AdminApiState use the same Arc as the solver engine.
+
 	let app_state = AppState {
 		solver,
-		config,
+		config: dynamic_config,
 		http_client,
 		discovery_url,
 		jwt_service: jwt_service.clone(),
@@ -131,42 +267,72 @@ pub async fn start_server(
 
 	api_routes = api_routes.nest("/auth", auth_routes);
 
+	// Add admin routes if enabled
+	if let Some(admin_state) = admin_state {
+		let mut admin_routes = Router::new()
+			.route("/nonce", get(handle_get_nonce))
+			.route("/types", get(handle_get_types))
+			.route("/tokens", post(handle_add_token))
+			.route("/fees", put(handle_update_fees))
+			.with_state(admin_state);
+		// If JWT auth is enabled, require admin-all scope for all admin endpoints.
+		if let Some(jwt) = &jwt_service {
+			admin_routes = admin_routes.layer(middleware::from_fn_with_state(
+				AuthState {
+					jwt_service: jwt.clone(),
+					required_scope: solver_types::AuthScope::AdminAll,
+				},
+				auth_middleware,
+			));
+		}
+		api_routes = api_routes.nest("/admin", admin_routes);
+		tracing::info!("Admin routes registered at /api/v1/admin/*");
+	}
+
 	// Create order routes with optional auth
 	let mut order_routes = Router::new()
 		.route("/orders", post(handle_order))
 		.route("/orders/{id}", get(handle_get_order_by_id));
 
-	// Apply auth middleware to order routes if enabled
-	if let Some(jwt) = &jwt_service {
-		// POST /orders requires CreateOrders scope
-		let order_post_route = Router::new().route("/orders", post(handle_order)).layer(
-			middleware::from_fn_with_state(
-				AuthState {
-					jwt_service: jwt.clone(),
-					required_scope: solver_types::AuthScope::CreateOrders,
-				},
-				auth_middleware,
-			),
-		);
+	// Apply auth middleware to order routes only if orders_require_auth is true
+	if orders_require_auth {
+		if let Some(jwt) = &jwt_service {
+			// POST /orders requires CreateOrders scope
+			let order_post_route = Router::new().route("/orders", post(handle_order)).layer(
+				middleware::from_fn_with_state(
+					AuthState {
+						jwt_service: jwt.clone(),
+						required_scope: solver_types::AuthScope::CreateOrders,
+					},
+					auth_middleware,
+				),
+			);
 
-		// GET /orders/{id} requires ReadOrders scope
-		let order_get_route = Router::new()
-			.route("/orders/{id}", get(handle_get_order_by_id))
-			.layer(middleware::from_fn_with_state(
-				AuthState {
-					jwt_service: jwt.clone(),
-					required_scope: solver_types::AuthScope::ReadOrders,
-				},
-				auth_middleware,
-			));
+			// GET /orders/{id} requires ReadOrders scope
+			let order_get_route = Router::new()
+				.route("/orders/{id}", get(handle_get_order_by_id))
+				.layer(middleware::from_fn_with_state(
+					AuthState {
+						jwt_service: jwt.clone(),
+						required_scope: solver_types::AuthScope::ReadOrders,
+					},
+					auth_middleware,
+				));
 
-		order_routes = order_post_route.merge(order_get_route);
+			order_routes = order_post_route.merge(order_get_route);
+		}
 	}
 
 	// Combine all routes
 	api_routes = api_routes.merge(order_routes);
 
+	// Health check route at root level (no auth required)
+	let health_routes = Router::new()
+		.route("/health", get(handle_health))
+		.with_state(app_state.clone());
+
 	let app = Router::new()
+		.merge(health_routes) // Health endpoints at root level
 		.nest("/api/v1", api_routes)
 		.layer(ServiceBuilder::new().layer(CorsLayer::permissive()))
 		.with_state(app_state);
@@ -193,7 +359,8 @@ async fn handle_quote(
 	State(state): State<AppState>,
 	Json(request): Json<GetQuoteRequest>,
 ) -> Result<Json<GetQuoteResponse>, APIError> {
-	match crate::apis::quote::process_quote_request(request, &state.solver, &state.config).await {
+	let config = state.config.read().await;
+	match crate::apis::quote::process_quote_request(request, &state.solver, &config).await {
 		Ok(response) => Ok(Json(response)),
 		Err(e) => {
 			tracing::warn!("Quote request failed: {}", e);
@@ -234,7 +401,8 @@ async fn handle_get_order_by_id(
 async fn handle_get_tokens(
 	State(state): State<AppState>,
 ) -> Json<crate::apis::tokens::TokensResponse> {
-	crate::apis::tokens::get_tokens(State(state.solver)).await
+	// Use shared config to support hot reload from admin API
+	crate::apis::tokens::get_tokens_from_config(State(state.config)).await
 }
 
 /// Handles GET /api/v1/tokens/{chain_id} requests.
@@ -244,7 +412,12 @@ async fn handle_get_tokens_for_chain(
 	Path(chain_id): Path<u64>,
 	State(state): State<AppState>,
 ) -> Result<Json<crate::apis::tokens::NetworkTokens>, StatusCode> {
-	crate::apis::tokens::get_tokens_for_chain(Path(chain_id), State(state.solver)).await
+	// Use shared config to support hot reload from admin API
+	crate::apis::tokens::get_tokens_for_chain_from_config(
+		Path(chain_id),
+		State(state.config.clone()),
+	)
+	.await
 }
 
 /// Handles POST /api/v1/auth/register requests.
@@ -431,13 +604,11 @@ async fn validate_intent_request(
 			details: None,
 		})?;
 
-	ensure_user_capacity_for_order(
-		state.solver.as_ref(),
-		&state.config,
-		lock_type,
-		&standard_order,
-	)
-	.await?;
+	{
+		let config = state.config.read().await;
+		ensure_user_capacity_for_order(state.solver.as_ref(), &config, lock_type, &standard_order)
+			.await?;
+	}
 
 	let order_bytes = alloy_primitives::Bytes::from(StandardOrder::abi_encode(&standard_order));
 
@@ -493,14 +664,10 @@ async fn validate_intent_request(
 		.requires_signature_validation(standard, &lock_type);
 
 	if requires_validation {
+		let config = state.config.read().await;
 		state
 			.signature_validation
-			.validate_signature(
-				standard,
-				intent,
-				&state.solver.config().networks,
-				state.solver.delivery(),
-			)
+			.validate_signature(standard, intent, &config.networks, state.solver.delivery())
 			.await?;
 	}
 
@@ -724,7 +891,9 @@ mod tests {
 			account.clone(),
 		));
 
+		let dynamic_config = Arc::new(RwLock::new(config.clone()));
 		let engine = SolverEngine::new(
+			dynamic_config,
 			config.clone(),
 			storage,
 			account,
@@ -744,6 +913,7 @@ mod tests {
 	fn build_test_app_state(discovery_url: Option<String>) -> AppState {
 		let solver = build_test_solver_engine();
 		let config = solver.config().clone();
+		let dynamic_config = Arc::new(RwLock::new(config));
 
 		let http_client = Client::builder()
 			.no_proxy()
@@ -752,7 +922,7 @@ mod tests {
 
 		AppState {
 			solver,
-			config,
+			config: dynamic_config,
 			http_client,
 			discovery_url,
 			jwt_service: None,

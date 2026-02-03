@@ -51,7 +51,9 @@ pub struct IntentHandler {
 	solver_address: Address,
 	token_manager: Arc<TokenManager>,
 	cost_profit_service: Arc<CostProfitService>,
-	config: Config,
+	/// Dynamic config for hot-reload support.
+	/// Config changes via Admin API are immediately visible.
+	dynamic_config: Arc<RwLock<Config>>,
 	/// In-memory LRU cache for fast intent deduplication to prevent race conditions
 	/// Automatically evicts oldest entries when capacity is exceeded
 	processed_intents: Arc<RwLock<LruCache<String, ()>>>,
@@ -68,7 +70,7 @@ impl IntentHandler {
 		solver_address: Address,
 		token_manager: Arc<TokenManager>,
 		cost_profit_service: Arc<CostProfitService>,
-		config: Config,
+		dynamic_config: Arc<RwLock<Config>>,
 	) -> Self {
 		Self {
 			order_service,
@@ -79,7 +81,7 @@ impl IntentHandler {
 			solver_address,
 			token_manager,
 			cost_profit_service,
-			config,
+			dynamic_config,
 			processed_intents: Arc::new(RwLock::new(LruCache::new(
 				NonZeroUsize::new(10000).unwrap(),
 			))),
@@ -89,6 +91,10 @@ impl IntentHandler {
 	/// Handles a newly discovered intent.
 	#[instrument(skip_all, fields(order_id = %truncate_id(&intent.id)))]
 	pub async fn handle(&self, intent: Intent) -> Result<(), IntentError> {
+		// Clone config early to release lock before any async calls.
+		// This enables hot-reload: config changes via Admin API are picked up on next intent.
+		let config = self.dynamic_config.read().await.clone();
+
 		// Prevent duplicate order processing when multiple discovery modules for the same standard are active.
 		//
 		// When an off-chain 7683 order is submitted via the API, it triggers an `openFor` transaction
@@ -190,7 +196,7 @@ impl IntentHandler {
 						// Simulate the fill transaction to validate callbacks and get gas estimate
 						match self
 							.cost_profit_service
-							.simulate_callback_and_estimate_gas(&order, &fill_tx, &self.config)
+							.simulate_callback_and_estimate_gas(&order, &fill_tx, &config)
 							.await
 						{
 							Ok(simulation_result) => {
@@ -237,7 +243,7 @@ impl IntentHandler {
 				// Step 2: Calculate cost estimation using simulated gas
 				let cost_estimate = match self
 					.cost_profit_service
-					.estimate_cost_for_order_with_gas(&order, &self.config, simulated_fill_gas)
+					.estimate_cost_for_order_with_gas(&order, &config, simulated_fill_gas)
 					.await
 				{
 					Ok(estimate) => estimate,
@@ -256,7 +262,7 @@ impl IntentHandler {
 					.validate_profitability(
 						&order,
 						&cost_estimate,
-						self.config.solver.min_profitability_pct,
+						config.solver.min_profitability_pct,
 						intent.quote_id.as_deref(),
 						&intent.source,
 					)
@@ -313,7 +319,7 @@ impl IntentHandler {
 					self.delivery.clone(),
 					self.solver_address.clone(),
 					self.token_manager.clone(),
-					self.config.clone(),
+					config.clone(),
 				);
 				let context = builder
 					.build_execution_context(&intent)
@@ -401,8 +407,8 @@ mod tests {
 		Address(vec![0xab; 20])
 	}
 
-	fn create_test_config() -> Config {
-		ConfigBuilder::new().build()
+	fn create_test_config() -> Arc<RwLock<Config>> {
+		Arc::new(RwLock::new(ConfigBuilder::new().build()))
 	}
 
 	fn create_mock_cost_profit_service() -> Arc<CostProfitService> {

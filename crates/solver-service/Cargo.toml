@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 alloy-primitives = { workspace = true, features = ["std", "serde"] }
+alloy-signer = { workspace = true }
 alloy-sol-types = { workspace = true }
 async-trait = "0.1"
 axum = "0.8"
@@ -47,6 +48,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
 
 [dev-dependencies]
+alloy-signer-local = { workspace = true }
 mockall = { workspace = true }
 solver-settlement = { path = "../solver-settlement", features = ["testing"] }
 solver-storage = { path = "../solver-storage", features = ["testing"] }
