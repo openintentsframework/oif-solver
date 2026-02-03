@@ -1378,9 +1378,10 @@ impl CostProfitService {
 			let chain_id = input.asset.ethereum_chain_id().map_err(|e| {
 				CostProfitError::Calculation(format!("Failed to get chain ID: {e}"))
 			})?;
-			let ethereum_addr = input.asset.ethereum_address().map_err(|e| {
-				CostProfitError::Calculation(format!("Failed to get address: {e}"))
-			})?;
+			let ethereum_addr = input
+				.asset
+				.ethereum_address()
+				.map_err(|e| CostProfitError::Calculation(format!("Failed to get address: {e}")))?;
 			let token_address = Address(ethereum_addr.0.to_vec());
 
 			let token_info = self
@@ -1413,9 +1414,10 @@ impl CostProfitService {
 			let chain_id = output.asset.ethereum_chain_id().map_err(|e| {
 				CostProfitError::Calculation(format!("Failed to get chain ID: {e}"))
 			})?;
-			let ethereum_addr = output.asset.ethereum_address().map_err(|e| {
-				CostProfitError::Calculation(format!("Failed to get address: {e}"))
-			})?;
+			let ethereum_addr = output
+				.asset
+				.ethereum_address()
+				.map_err(|e| CostProfitError::Calculation(format!("Failed to get address: {e}")))?;
 			let token_address = Address(ethereum_addr.0.to_vec());
 
 			let token_info = self

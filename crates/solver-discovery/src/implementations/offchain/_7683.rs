@@ -202,8 +202,7 @@ where
 	}
 
 	let mut bytes = [0u8; 32];
-	hex::decode_to_slice(s, &mut bytes)
-		.map_err(|e| Error::custom(format!("Invalid hex: {e}")))?;
+	hex::decode_to_slice(s, &mut bytes).map_err(|e| Error::custom(format!("Invalid hex: {e}")))?;
 
 	Ok(bytes)
 }
@@ -935,9 +934,7 @@ pub fn create_discovery(
 
 	let discovery = Eip7683OffchainDiscovery::new(api_host, api_port, network_ids, networks)
 		.map_err(|e| {
-			DiscoveryError::Connection(format!(
-				"Failed to create offchain discovery service: {e}"
-			))
+			DiscoveryError::Connection(format!("Failed to create offchain discovery service: {e}"))
 		})?;
 
 	Ok(Box::new(discovery))

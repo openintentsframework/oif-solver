@@ -164,9 +164,7 @@ impl Provider {
 			.inner
 			.raw_request_dyn(Cow::Borrowed("anvil_setCode"), &raw_params)
 			.await
-			.map_err(|e| {
-				crate::types::error::Error::from(format!("anvil_setCode failed: {e}"))
-			})?;
+			.map_err(|e| crate::types::error::Error::from(format!("anvil_setCode failed: {e}")))?;
 		Ok(())
 	}
 

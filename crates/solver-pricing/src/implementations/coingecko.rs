@@ -115,15 +115,11 @@ impl CoinGeckoPricing {
 			for (symbol, price) in prices_config {
 				let price_decimal = if let Some(price_str) = price.as_str() {
 					price_str.parse::<Decimal>().map_err(|e| {
-						PricingError::InvalidData(format!(
-							"Invalid custom price for {symbol}: {e}"
-						))
+						PricingError::InvalidData(format!("Invalid custom price for {symbol}: {e}"))
 					})?
 				} else if let Some(price_num) = price.as_float() {
 					Decimal::try_from(price_num).map_err(|e| {
-						PricingError::InvalidData(format!(
-							"Invalid custom price for {symbol}: {e}"
-						))
+						PricingError::InvalidData(format!("Invalid custom price for {symbol}: {e}"))
 					})?
 				} else if let Some(price_int) = price.as_integer() {
 					Decimal::from(price_int)
@@ -492,9 +488,8 @@ impl PricingInterface for CoinGeckoPricing {
 		// Convert currency to ETH, then to wei
 		let eth_amount = currency_amount_decimal / eth_price_decimal;
 		let eth_amount_str = eth_amount.to_string();
-		let wei_amount = parse_ether(&eth_amount_str).map_err(|e| {
-			PricingError::InvalidData(format!("Failed to convert ETH to wei: {e}"))
-		})?;
+		let wei_amount = parse_ether(&eth_amount_str)
+			.map_err(|e| PricingError::InvalidData(format!("Failed to convert ETH to wei: {e}")))?;
 
 		Ok(wei_amount.to_string())
 	}

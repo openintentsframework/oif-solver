@@ -124,9 +124,7 @@ impl IntentHandler {
 			.storage
 			.exists(StorageKey::Intents.as_str(), &intent.id)
 			.await
-			.map_err(|e| {
-				IntentError::Storage(format!("Failed to check intent existence: {e}"))
-			})?;
+			.map_err(|e| IntentError::Storage(format!("Failed to check intent existence: {e}")))?;
 		if exists {
 			tracing::debug!("Duplicate intent detected in persistent storage, already processed");
 			return Ok(());
@@ -249,9 +247,7 @@ impl IntentHandler {
 					Ok(estimate) => estimate,
 					Err(e) => {
 						tracing::warn!("Failed to calculate cost estimate: {}", e);
-						return Err(IntentError::Service(format!(
-							"Cost estimation failed: {e}"
-						)));
+						return Err(IntentError::Service(format!("Cost estimation failed: {e}")));
 					},
 				};
 

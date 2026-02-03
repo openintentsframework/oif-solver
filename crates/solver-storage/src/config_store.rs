@@ -651,10 +651,7 @@ mod integration_tests {
 			url: "redis://remote:6379".to_string(),
 		};
 
-		assert_ne!(
-			format!("{redis_config:?}"),
-			format!("{:?}", redis_config2)
-		);
+		assert_ne!(format!("{redis_config:?}"), format!("{:?}", redis_config2));
 	}
 
 	#[test]

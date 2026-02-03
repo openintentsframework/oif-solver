@@ -907,9 +907,7 @@ impl QuoteGenerator {
 			.delivery_service
 			.contract_call(input_chain_id, tx)
 			.await
-			.map_err(|e| {
-				QuoteError::InvalidRequest(format!("Failed to compute order ID: {e}"))
-			})?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to compute order ID: {e}")))?;
 
 		// Convert the returned bytes to hex string
 		let order_id = format!("0x{}", alloy_primitives::hex::encode(&order_id_bytes));
@@ -1084,9 +1082,10 @@ impl QuoteGenerator {
 			let recipient_address = output.receiver.ethereum_address().map_err(|e| {
 				QuoteError::InvalidRequest(format!("Invalid recipient address: {e}"))
 			})?;
-			let output_chain_id = output.asset.ethereum_chain_id().map_err(|e| {
-				QuoteError::InvalidRequest(format!("Invalid output chain ID: {e}"))
-			})?;
+			let output_chain_id = output
+				.asset
+				.ethereum_chain_id()
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output chain ID: {e}")))?;
 
 			// Get preferred settlement for the output chain (prioritizes Direct settlement like escrow)
 			let (_output_settlement, _output_input_oracle, output_oracle) = self
@@ -1255,9 +1254,8 @@ impl QuoteGenerator {
 			.await
 			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to get token name: {e}")))?;
 
-		let name = nameCall::abi_decode_returns(&result).map_err(|e| {
-			QuoteError::InvalidRequest(format!("Failed to decode token name: {e}"))
-		})?;
+		let name = nameCall::abi_decode_returns(&result)
+			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to decode token name: {e}")))?;
 
 		Ok(name)
 	}

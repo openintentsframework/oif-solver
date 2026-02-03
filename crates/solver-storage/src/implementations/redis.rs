@@ -910,9 +910,8 @@ pub async fn initialize_redis_connection(
 	redis_url: &str,
 	timeout_ms: u64,
 ) -> Result<Arc<ConnectionManager>, StorageError> {
-	let redis_client = redis::Client::open(redis_url).map_err(|e| {
-		StorageError::Configuration(format!("Failed to create Redis client: {e}"))
-	})?;
+	let redis_client = redis::Client::open(redis_url)
+		.map_err(|e| StorageError::Configuration(format!("Failed to create Redis client: {e}")))?;
 
 	let connection_manager = timeout(
 		Duration::from_millis(timeout_ms),

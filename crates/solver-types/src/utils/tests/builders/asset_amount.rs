@@ -76,9 +76,9 @@ impl AssetAmountBuilder {
 		} else {
 			&format!("0x{address_str}")
 		};
-		let address = address_str.parse::<Address>().map_err(|e| {
-			AssetAmountBuilderError::InvalidAsset(format!("Invalid address: {e}"))
-		})?;
+		let address = address_str
+			.parse::<Address>()
+			.map_err(|e| AssetAmountBuilderError::InvalidAsset(format!("Invalid address: {e}")))?;
 		let interop_address = InteropAddress::new_ethereum(chain_id, address);
 		self.asset = Some(interop_address);
 		Ok(self)

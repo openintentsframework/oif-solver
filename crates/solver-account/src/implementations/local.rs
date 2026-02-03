@@ -132,19 +132,18 @@ impl AccountInterface for LocalWallet {
 			.signer
 			.sign_transaction(&mut legacy_tx)
 			.await
-			.map_err(|e| {
-				AccountError::SigningFailed(format!("Failed to sign transaction: {e}"))
-			})?;
+			.map_err(|e| AccountError::SigningFailed(format!("Failed to sign transaction: {e}")))?;
 
 		Ok(signature.into())
 	}
 
 	async fn sign_message(&self, message: &[u8]) -> Result<Signature, AccountError> {
 		// Use Alloy's signer to sign the message (handles EIP-191 internally)
-		let signature =
-			self.signer.sign_message(message).await.map_err(|e| {
-				AccountError::SigningFailed(format!("Failed to sign message: {e}"))
-			})?;
+		let signature = self
+			.signer
+			.sign_message(message)
+			.await
+			.map_err(|e| AccountError::SigningFailed(format!("Failed to sign message: {e}")))?;
 
 		Ok(signature.into())
 	}

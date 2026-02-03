@@ -23,9 +23,7 @@ pub fn parse_oracle_table(
 	if let Some(table) = table.as_table() {
 		for (chain_id_str, oracles_value) in table {
 			let chain_id = chain_id_str.parse::<u64>().map_err(|e| {
-				SettlementError::ValidationFailed(format!(
-					"Invalid chain ID '{chain_id_str}': {e}"
-				))
+				SettlementError::ValidationFailed(format!("Invalid chain ID '{chain_id_str}': {e}"))
 			})?;
 
 			let oracles = if let Some(array) = oracles_value.as_array() {
@@ -80,9 +78,7 @@ pub fn parse_routes_table(table: &toml::Value) -> Result<HashMap<u64, Vec<u64>>,
 	if let Some(table) = table.as_table() {
 		for (chain_id_str, destinations_value) in table {
 			let chain_id = chain_id_str.parse::<u64>().map_err(|e| {
-				SettlementError::ValidationFailed(format!(
-					"Invalid chain ID '{chain_id_str}': {e}"
-				))
+				SettlementError::ValidationFailed(format!("Invalid chain ID '{chain_id_str}': {e}"))
 			})?;
 
 			let destinations = if let Some(array) = destinations_value.as_array() {

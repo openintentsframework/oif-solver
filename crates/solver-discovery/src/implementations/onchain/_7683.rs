@@ -179,9 +179,8 @@ impl Eip7683Discovery {
 		};
 
 		// Decode the Open event
-		let open_event = Open::decode_log_validate(&prim_log).map_err(|e| {
-			DiscoveryError::ParseError(format!("Failed to decode Open event: {e}"))
-		})?;
+		let open_event = Open::decode_log_validate(&prim_log)
+			.map_err(|e| DiscoveryError::ParseError(format!("Failed to decode Open event: {e}")))?;
 
 		let order_id = open_event.orderId;
 		let order = open_event.order.clone();

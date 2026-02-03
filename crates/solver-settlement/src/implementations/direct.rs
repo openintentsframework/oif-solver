@@ -187,9 +187,7 @@ impl SettlementInterface for DirectSettlement {
 		let receipt = provider
 			.get_transaction_receipt(hash)
 			.await
-			.map_err(|e| {
-				SettlementError::ValidationFailed(format!("Failed to get receipt: {e}"))
-			})?
+			.map_err(|e| SettlementError::ValidationFailed(format!("Failed to get receipt: {e}")))?
 			.ok_or_else(|| {
 				SettlementError::ValidationFailed("Transaction not found".to_string())
 			})?;
@@ -207,9 +205,7 @@ impl SettlementInterface for DirectSettlement {
 		let block = provider
 			.get_block_by_number(alloy_rpc_types::BlockNumberOrTag::Number(tx_block))
 			.await
-			.map_err(|e| {
-				SettlementError::ValidationFailed(format!("Failed to get block: {e}"))
-			})?;
+			.map_err(|e| SettlementError::ValidationFailed(format!("Failed to get block: {e}")))?;
 
 		let block_timestamp = block
 			.ok_or_else(|| SettlementError::ValidationFailed("Block not found".to_string()))?

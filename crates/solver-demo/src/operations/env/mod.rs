@@ -311,9 +311,7 @@ impl EnvOps {
 				// Production: log that manual update is needed
 				logging::verbose_operation(
 					"Production deployment",
-					&format!(
-						"manual TOML update required for {contract_name} on chain {chain}"
-					),
+					&format!("manual TOML update required for {contract_name} on chain {chain}"),
 				);
 			}
 		}
@@ -513,9 +511,7 @@ impl EnvOps {
 				if let Some(_input_settler_compact_addr) = &contracts.input_settler_compact {
 					logging::verbose_operation(
 						"Approving token",
-						&format!(
-							"{symbol} for Permit2 -> InputSettlerCompact on chain {chain}"
-						),
+						&format!("{symbol} for Permit2 -> InputSettlerCompact on chain {chain}"),
 					);
 					match token_ops
 						.approve(chain, symbol, &permit2_address.to_string(), None)

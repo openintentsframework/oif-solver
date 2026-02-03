@@ -424,10 +424,7 @@ impl ContractDeployer {
 		let tx_builder = TxBuilder::new(provider).with_signer(signer);
 		let _receipt = tx_builder.send_and_wait(tx).await?;
 
-		logging::verbose_success(
-			"Account funded",
-			&format!("{account} with {amount} ETH"),
-		);
+		logging::verbose_success("Account funded", &format!("{account} with {amount} ETH"));
 		Ok(())
 	}
 
@@ -459,9 +456,9 @@ impl ContractDeployer {
 			return Ok(contracts);
 		}
 
-		for entry in std::fs::read_dir(&self.contracts_path).map_err(|e| {
-			Error::InvalidConfig(format!("Failed to read contracts directory: {e}"))
-		})? {
+		for entry in std::fs::read_dir(&self.contracts_path)
+			.map_err(|e| Error::InvalidConfig(format!("Failed to read contracts directory: {e}")))?
+		{
 			let entry = entry.map_err(|e| {
 				Error::InvalidConfig(format!("Failed to read directory entry: {e}"))
 			})?;

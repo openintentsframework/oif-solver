@@ -871,10 +871,7 @@ mod tests {
 
 		for config_str in &configs {
 			let config = toml::from_str(config_str).unwrap();
-			assert!(
-				schema.validate(&config).is_ok(),
-				"Failed for: {config_str}"
-			);
+			assert!(schema.validate(&config).is_ok(), "Failed for: {config_str}");
 		}
 	}
 

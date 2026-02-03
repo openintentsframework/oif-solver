@@ -82,9 +82,9 @@ impl KmsWallet {
 		let config = config_loader.load().await;
 		let client = KmsClient::new(&config);
 
-		let signer = AwsSigner::new(client, key_id, None).await.map_err(|e| {
-			AccountError::Implementation(format!("KMS initialization failed: {e}"))
-		})?;
+		let signer = AwsSigner::new(client, key_id, None)
+			.await
+			.map_err(|e| AccountError::Implementation(format!("KMS initialization failed: {e}")))?;
 
 		Ok(Self { signer })
 	}

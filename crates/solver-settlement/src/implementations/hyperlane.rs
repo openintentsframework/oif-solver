@@ -1010,9 +1010,7 @@ impl SettlementInterface for HyperlaneSettlement {
 		let receipt = provider
 			.get_transaction_receipt(hash)
 			.await
-			.map_err(|e| {
-				SettlementError::ValidationFailed(format!("Failed to get receipt: {e}"))
-			})?
+			.map_err(|e| SettlementError::ValidationFailed(format!("Failed to get receipt: {e}")))?
 			.ok_or_else(|| {
 				SettlementError::ValidationFailed("Transaction not found".to_string())
 			})?;
@@ -1029,9 +1027,7 @@ impl SettlementInterface for HyperlaneSettlement {
 		let block = provider
 			.get_block_by_number(alloy_rpc_types::BlockNumberOrTag::Number(tx_block))
 			.await
-			.map_err(|e| {
-				SettlementError::ValidationFailed(format!("Failed to get block: {e}"))
-			})?;
+			.map_err(|e| SettlementError::ValidationFailed(format!("Failed to get block: {e}")))?;
 
 		let block_timestamp = block
 			.ok_or_else(|| SettlementError::ValidationFailed("Block not found".to_string()))?
@@ -1329,9 +1325,7 @@ fn parse_address_table(
 	if let Some(table) = table.as_table() {
 		for (chain_id_str, address_value) in table {
 			let chain_id = chain_id_str.parse::<u64>().map_err(|e| {
-				SettlementError::ValidationFailed(format!(
-					"Invalid chain ID '{chain_id_str}': {e}"
-				))
+				SettlementError::ValidationFailed(format!("Invalid chain ID '{chain_id_str}': {e}"))
 			})?;
 
 			let address_str = address_value.as_str().ok_or_else(|| {

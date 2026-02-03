@@ -1469,10 +1469,7 @@ impl Quote {
 				// Use the EIP-7683 implementation of QuoteParsable
 				Ok(crate::Eip7683OrderData::quote_to_order_for_estimation(self))
 			},
-			_ => Err(format!(
-				"Unsupported order standard for quote conversion: {standard}"
-			)
-			.into()),
+			_ => Err(format!("Unsupported order standard for quote conversion: {standard}").into()),
 		}
 	}
 }

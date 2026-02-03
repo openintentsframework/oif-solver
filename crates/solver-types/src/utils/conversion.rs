@@ -145,9 +145,9 @@ pub fn parse_address(hex_str: &str) -> Result<Address, String> {
 	// Handle U256 hex that's missing leading zeros (common with EIP-7683 inputs)
 	// U256 serialization drops leading zeros, so "0x8ad..." (31 bytes) should be "0x08ad..." (32 bytes)
 	let padded_hex = match hex_clean.len() {
-		40 => hex_clean.to_string(),      // Standard 20-byte address
+		40 => hex_clean.to_string(),    // Standard 20-byte address
 		62 => format!("00{hex_clean}"), // 31 bytes -> pad to 32
-		64 => hex_clean.to_string(),      // Already 32 bytes
+		64 => hex_clean.to_string(),    // Already 32 bytes
 		_ if hex_clean.len() < 64 && hex_clean.len() > 40 => {
 			// Other missing zeros cases - pad to 64 chars (32 bytes)
 			format!("{hex_clean:0>64}")
@@ -221,8 +221,7 @@ pub fn wei_to_eth_string(wei_amount: U256) -> String {
 /// assert_eq!(wei.to_string(), "1500000000000000000");
 /// ```
 pub fn eth_string_to_wei(eth_amount: &str) -> Result<U256, String> {
-	parse_ether(eth_amount)
-		.map_err(|e| format!("Failed to parse ETH amount '{eth_amount}': {e}"))
+	parse_ether(eth_amount).map_err(|e| format!("Failed to parse ETH amount '{eth_amount}': {e}"))
 }
 
 /// Convert wei string to ETH string using Alloy utilities.

@@ -188,9 +188,7 @@ impl ConfigSchema for AlloyDeliverySchema {
 						}
 						// Check value is a string
 						if !val.is_str() {
-							return Err(format!(
-								"Account name for network {key} must be a string"
-							));
+							return Err(format!("Account name for network {key} must be a string"));
 						}
 					}
 					Ok(())

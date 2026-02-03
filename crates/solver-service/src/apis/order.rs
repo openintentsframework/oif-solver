@@ -146,9 +146,7 @@ async fn convert_eip7683_order_to_response(
 
 		// Convert input token to InteropAddress format
 		let address = parse_address(input_token).map_err(|e| {
-			GetOrderError::Internal(format!(
-				"Invalid input token address at index {idx}: {e}"
-			))
+			GetOrderError::Internal(format!("Invalid input token address at index {idx}: {e}"))
 		})?;
 		let interop_address: InteropAddress = (input_chain_id, address).into();
 
@@ -213,9 +211,7 @@ async fn convert_eip7683_order_to_response(
 
 		// Convert output token to InteropAddress format
 		let address = parse_address(&output_token_address).map_err(|e| {
-			GetOrderError::Internal(format!(
-				"Invalid output token address at index {idx}: {e}"
-			))
+			GetOrderError::Internal(format!("Invalid output token address at index {idx}: {e}"))
 		})?;
 		let interop_address: InteropAddress = (output_chain_id, address).into();
 

@@ -254,10 +254,11 @@ pub async fn load_config(path: &Path, is_local: bool) -> Result<()> {
 
 			// Extract token addresses
 			for token in &network.tokens {
-				let addr: Address =
-					token.address.to_string().parse().map_err(|e| {
-						Error::InvalidConfig(format!("Invalid token address: {e}"))
-					})?;
+				let addr: Address = token
+					.address
+					.to_string()
+					.parse()
+					.map_err(|e| Error::InvalidConfig(format!("Invalid token address: {e}")))?;
 				tokens.insert(token.symbol.clone(), (addr, token.decimals));
 			}
 			logging::verbose_tech(

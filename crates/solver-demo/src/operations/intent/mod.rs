@@ -720,10 +720,7 @@ impl IntentOps {
 		let tx_builder = TxBuilder::new(provider).with_signer(signer);
 
 		// Step 1: Approve TheCompact to spend tokens
-		logging::verbose_operation(
-			"Sending approval transaction",
-			&format!("amount: {amount}"),
-		);
+		logging::verbose_operation("Sending approval transaction", &format!("amount: {amount}"));
 		let approve_request = TransactionRequest::default()
 			.to(token)
 			.input(approve_data.into());

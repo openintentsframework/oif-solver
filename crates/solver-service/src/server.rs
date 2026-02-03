@@ -168,9 +168,9 @@ pub async fn start_server(
 					Ok(store) => Arc::from(store),
 					Err(e) => {
 						tracing::error!("Failed to create operator config store: {}", e);
-						return Err(Box::new(std::io::Error::other(
-							format!("Config store error: {e}"),
-						)));
+						return Err(Box::new(std::io::Error::other(format!(
+							"Config store error: {e}"
+						))));
 					},
 				};
 
@@ -179,9 +179,9 @@ pub async fn start_server(
 					Ok(false) => {
 						if let Err(e) = config_store.seed(operator_config).await {
 							tracing::error!("Failed to seed operator config: {}", e);
-							return Err(Box::new(std::io::Error::other(
-								format!("Config seed error: {e}"),
-							)));
+							return Err(Box::new(std::io::Error::other(format!(
+								"Config seed error: {e}"
+							))));
 						}
 						tracing::info!("Seeded operator config for admin API persistence");
 					},
@@ -190,9 +190,9 @@ pub async fn start_server(
 					},
 					Err(e) => {
 						tracing::error!("Failed to check operator config existence: {}", e);
-						return Err(Box::new(std::io::Error::other(
-							format!("Config check error: {e}"),
-						)));
+						return Err(Box::new(std::io::Error::other(format!(
+							"Config check error: {e}"
+						))));
 					},
 				}
 

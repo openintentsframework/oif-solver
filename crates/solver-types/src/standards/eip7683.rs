@@ -600,9 +600,7 @@ impl interfaces::StandardOrder {
 		let interop_address = crate::InteropAddress::from_hex(user_str)
 			.map_err(|e| format!("Invalid user InteropAddress: {e}"))?;
 		let user_address = interop_address.ethereum_address().map_err(|e| {
-			format!(
-				"Failed to extract Ethereum address from user InteropAddress: {e}"
-			)
+			format!("Failed to extract Ethereum address from user InteropAddress: {e}")
 		})?;
 
 		// Extract nonce from metadata (for StandardOrder nonce)
@@ -914,12 +912,10 @@ impl interfaces::StandardOrder {
 						let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
 						let recipient_bytes =
 							parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
-						let oracle_bytes = parse_bytes32_from_hex(oracle_str).map_err(|e| {
-							format!("Invalid oracle address '{oracle_str}': {e}")
-						})?;
-						let settler_bytes = parse_bytes32_from_hex(settler_str).map_err(|e| {
-							format!("Invalid settler address '{settler_str}': {e}")
-						})?;
+						let oracle_bytes = parse_bytes32_from_hex(oracle_str)
+							.map_err(|e| format!("Invalid oracle address '{oracle_str}': {e}"))?;
+						let settler_bytes = parse_bytes32_from_hex(settler_str)
+							.map_err(|e| format!("Invalid settler address '{settler_str}': {e}"))?;
 
 						// Parse callbackData from hex
 						let callback_bytes = if callback_str == "0x" || callback_str.is_empty() {

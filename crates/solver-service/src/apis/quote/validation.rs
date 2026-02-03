@@ -118,9 +118,9 @@ impl QuoteValidator {
 				// Input amounts must be provided
 				let mut known_inputs = Vec::new();
 				for input in &intent.inputs {
-					let amount_u256 = input.amount_as_u256().map_err(|e| {
-						QuoteError::InvalidRequest(format!("Invalid amount: {e}"))
-					})?;
+					let amount_u256 = input
+						.amount_as_u256()
+						.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {e}")))?;
 
 					if amount_u256.is_none() {
 						return Err(QuoteError::MissingInputAmount);
@@ -139,9 +139,9 @@ impl QuoteValidator {
 				// Output amounts are optional constraints
 				let mut constraint_outputs = Vec::new();
 				for output in &intent.outputs {
-					let amount_u256 = output.amount_as_u256().map_err(|e| {
-						QuoteError::InvalidRequest(format!("Invalid amount: {e}"))
-					})?;
+					let amount_u256 = output
+						.amount_as_u256()
+						.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {e}")))?;
 					constraint_outputs.push((output.clone(), amount_u256));
 				}
 
@@ -157,9 +157,9 @@ impl QuoteValidator {
 				// Output amounts must be provided
 				let mut known_outputs = Vec::new();
 				for output in &intent.outputs {
-					let amount_u256 = output.amount_as_u256().map_err(|e| {
-						QuoteError::InvalidRequest(format!("Invalid amount: {e}"))
-					})?;
+					let amount_u256 = output
+						.amount_as_u256()
+						.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {e}")))?;
 
 					if amount_u256.is_none() {
 						return Err(QuoteError::MissingOutputAmount);
@@ -178,9 +178,9 @@ impl QuoteValidator {
 				// Input amounts are optional constraints
 				let mut constraint_inputs = Vec::new();
 				for input in &intent.inputs {
-					let amount_u256 = input.amount_as_u256().map_err(|e| {
-						QuoteError::InvalidRequest(format!("Invalid amount: {e}"))
-					})?;
+					let amount_u256 = input
+						.amount_as_u256()
+						.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {e}")))?;
 					constraint_inputs.push((input.clone(), amount_u256));
 				}
 

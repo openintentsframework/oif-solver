@@ -118,22 +118,23 @@ impl Contracts {
 			.function(method)
 			.ok_or_else(|| Error::InvalidAbi(format!("Function {method} not found")))?;
 
-		let function = functions.first().ok_or_else(|| {
-			Error::InvalidAbi(format!("No implementation for function {method}"))
-		})?;
+		let function = functions
+			.first()
+			.ok_or_else(|| Error::InvalidAbi(format!("No implementation for function {method}")))?;
 
 		// Encode the call data
-		let data = function.abi_encode_input(&args).map_err(|e| {
-			Error::ContractCallFailed(format!("Failed to encode {method}: {e}"))
-		})?;
+		let data = function
+			.abi_encode_input(&args)
+			.map_err(|e| Error::ContractCallFailed(format!("Failed to encode {method}: {e}")))?;
 
 		// Make the call
 		let call = TransactionRequest::default().to(token).input(data.into());
 
-		let result =
-			provider.inner().call(call).await.map_err(|e| {
-				Error::ContractCallFailed(format!("Call to {method} failed: {e}"))
-			})?;
+		let result = provider
+			.inner()
+			.call(call)
+			.await
+			.map_err(|e| Error::ContractCallFailed(format!("Call to {method} failed: {e}")))?;
 
 		Ok(result)
 	}
@@ -275,22 +276,23 @@ impl Contracts {
 			.function(method)
 			.ok_or_else(|| Error::InvalidAbi(format!("Function {method} not found")))?;
 
-		let function = functions.first().ok_or_else(|| {
-			Error::InvalidAbi(format!("No implementation for function {method}"))
-		})?;
+		let function = functions
+			.first()
+			.ok_or_else(|| Error::InvalidAbi(format!("No implementation for function {method}")))?;
 
 		// Encode the call data
-		let data = function.abi_encode_input(&args).map_err(|e| {
-			Error::ContractCallFailed(format!("Failed to encode {method}: {e}"))
-		})?;
+		let data = function
+			.abi_encode_input(&args)
+			.map_err(|e| Error::ContractCallFailed(format!("Failed to encode {method}: {e}")))?;
 
 		// Make the call
 		let call = TransactionRequest::default().to(compact).input(data.into());
 
-		let result =
-			provider.inner().call(call).await.map_err(|e| {
-				Error::ContractCallFailed(format!("Call to {method} failed: {e}"))
-			})?;
+		let result = provider
+			.inner()
+			.call(call)
+			.await
+			.map_err(|e| Error::ContractCallFailed(format!("Call to {method} failed: {e}")))?;
 
 		Ok(result)
 	}
