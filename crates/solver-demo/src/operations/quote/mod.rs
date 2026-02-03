@@ -110,7 +110,7 @@ impl QuoteOps {
 		let signature_hex = self.create_signature(quote, signer).await?;
 
 		let signature_bytes = hex::decode(signature_hex.trim_start_matches("0x"))
-			.map_err(|e| Error::Other(anyhow::anyhow!("Failed to decode signature: {}", e)))?;
+			.map_err(|e| Error::Other(anyhow::anyhow!("Failed to decode signature: {e}")))?;
 
 		let order_request = PostOrderRequest {
 			order: quote.order.clone(),

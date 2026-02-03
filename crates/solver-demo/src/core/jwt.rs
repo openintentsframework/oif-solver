@@ -185,22 +185,19 @@ impl JwtService {
 			.json(&request)
 			.send()
 			.await
-			.map_err(|e| Error::Other(anyhow::anyhow!("Failed to register client: {}", e)))?;
+			.map_err(|e| Error::Other(anyhow::anyhow!("Failed to register client: {e}")))?;
 
 		if !response.status().is_success() {
 			let status = response.status();
 			let text = response.text().await.unwrap_or_default();
 			return Err(Error::Other(anyhow::anyhow!(
-				"Client registration failed with status {}: {}",
-				status,
-				text
+				"Client registration failed with status {status}: {text}"
 			)));
 		}
 
 		response.json().await.map_err(|e| {
 			Error::Other(anyhow::anyhow!(
-				"Failed to parse registration response: {}",
-				e
+				"Failed to parse registration response: {e}"
 			))
 		})
 	}
@@ -272,22 +269,20 @@ impl JwtService {
 			.json(&request)
 			.send()
 			.await
-			.map_err(|e| Error::Other(anyhow::anyhow!("Failed to refresh token: {}", e)))?;
+			.map_err(|e| Error::Other(anyhow::anyhow!("Failed to refresh token: {e}")))?;
 
 		if !response.status().is_success() {
 			let status = response.status();
 			let text = response.text().await.unwrap_or_default();
 			return Err(Error::Other(anyhow::anyhow!(
-				"Token refresh failed with status {}: {}",
-				status,
-				text
+				"Token refresh failed with status {status}: {text}"
 			)));
 		}
 
 		response
 			.json()
 			.await
-			.map_err(|e| Error::Other(anyhow::anyhow!("Failed to parse refresh response: {}", e)))
+			.map_err(|e| Error::Other(anyhow::anyhow!("Failed to parse refresh response: {e}")))
 	}
 
 	/// Validate token by checking expiration time with safety buffer
@@ -330,10 +325,10 @@ impl JwtService {
 		use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 		let payload = URL_SAFE_NO_PAD
 			.decode(parts[1])
-			.map_err(|e| Error::Other(anyhow::anyhow!("Failed to decode token payload: {}", e)))?;
+			.map_err(|e| Error::Other(anyhow::anyhow!("Failed to decode token payload: {e}")))?;
 
 		serde_json::from_slice(&payload)
-			.map_err(|e| Error::Other(anyhow::anyhow!("Failed to parse token claims: {}", e)))
+			.map_err(|e| Error::Other(anyhow::anyhow!("Failed to parse token claims: {e}")))
 	}
 
 	/// Generate unique client identifier using hostname, timestamp, and UUID

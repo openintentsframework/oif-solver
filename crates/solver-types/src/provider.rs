@@ -25,9 +25,9 @@ pub enum ProviderError {
 impl fmt::Display for ProviderError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
-			ProviderError::NetworkConfig(msg) => write!(f, "Network configuration error: {}", msg),
-			ProviderError::Connection(msg) => write!(f, "Connection error: {}", msg),
-			ProviderError::InvalidUrl(msg) => write!(f, "Invalid URL: {}", msg),
+			ProviderError::NetworkConfig(msg) => write!(f, "Network configuration error: {msg}"),
+			ProviderError::Connection(msg) => write!(f, "Connection error: {msg}"),
+			ProviderError::InvalidUrl(msg) => write!(f, "Invalid URL: {msg}"),
 		}
 	}
 }
@@ -74,8 +74,7 @@ pub fn create_http_provider(
 
 	let url = http_url.parse().map_err(|e| {
 		ProviderError::InvalidUrl(format!(
-			"Invalid HTTP RPC URL for network {}: {}",
-			network_id, e
+			"Invalid HTTP RPC URL for network {network_id}: {e}"
 		))
 	})?;
 
@@ -150,8 +149,7 @@ pub async fn create_ws_provider(
 	// For execution revert retries, WebSocket providers have built-in reconnection logic
 	let provider = ProviderBuilder::new().connect(ws_url).await.map_err(|e| {
 		ProviderError::Connection(format!(
-			"Failed to create WebSocket provider for network {}: {}",
-			network_id, e
+			"Failed to create WebSocket provider for network {network_id}: {e}"
 		))
 	})?;
 
@@ -246,7 +244,7 @@ fn get_network_config(
 	networks: &NetworksConfig,
 ) -> Result<&NetworkConfig, ProviderError> {
 	networks.get(&network_id).ok_or_else(|| {
-		ProviderError::NetworkConfig(format!("Network {} not found in configuration", network_id))
+		ProviderError::NetworkConfig(format!("Network {network_id} not found in configuration"))
 	})
 }
 
@@ -254,8 +252,7 @@ fn get_network_config(
 fn get_http_url(network_id: u64, network: &NetworkConfig) -> Result<&str, ProviderError> {
 	network.get_http_url().ok_or_else(|| {
 		ProviderError::NetworkConfig(format!(
-			"No HTTP RPC URL configured for network {}",
-			network_id
+			"No HTTP RPC URL configured for network {network_id}"
 		))
 	})
 }
@@ -264,8 +261,7 @@ fn get_http_url(network_id: u64, network: &NetworkConfig) -> Result<&str, Provid
 fn get_ws_url(network_id: u64, network: &NetworkConfig) -> Result<&str, ProviderError> {
 	network.get_ws_url().ok_or_else(|| {
 		ProviderError::NetworkConfig(format!(
-			"No WebSocket RPC URL configured for network {}",
-			network_id
+			"No WebSocket RPC URL configured for network {network_id}"
 		))
 	})
 }

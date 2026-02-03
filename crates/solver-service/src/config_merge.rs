@@ -1342,7 +1342,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 
 		let op_network = OperatorNetworkConfig {
 			chain_id: *chain_id,
-			name: format!("chain-{}", chain_id),
+			name: format!("chain-{chain_id}"),
 			tokens,
 			rpc_urls,
 			input_settler_address: Address::from(input_settler_bytes),

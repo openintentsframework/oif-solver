@@ -128,7 +128,7 @@ async fn handle_init(cmd: solver_demo::cli::commands::InitCommand) -> Result<()>
 			} else {
 				"production mode"
 			};
-			logging::success(&format!("Configuration loaded ({})", env_type));
+			logging::success(&format!("Configuration loaded ({env_type})"));
 			logging::success("Session initialized");
 
 			if local {
@@ -269,7 +269,7 @@ async fn handle_env(cmd: solver_demo::cli::commands::EnvCommand) -> Result<()> {
 			}
 
 			if let Some(contract_name) = contract {
-				logging::operation_start(&format!("Deploying contract {}...", contract_name));
+				logging::operation_start(&format!("Deploying contract {contract_name}..."));
 
 				// Convert chain option to Vec<u64> if provided
 				let chain_ids = chain.map(|c| vec![c]);
@@ -287,13 +287,12 @@ async fn handle_env(cmd: solver_demo::cli::commands::EnvCommand) -> Result<()> {
 				{
 					Ok(()) => {
 						logging::success(&format!(
-							"Contract {} deployed successfully",
-							contract_name
+							"Contract {contract_name} deployed successfully"
 						));
 					},
 					Err(e) => {
 						logging::error_with_guidance(
-							&format!("Contract {} deployment failed", contract_name),
+							&format!("Contract {contract_name} deployment failed"),
 							"Check network connectivity and contract compilation",
 						);
 						return Err(e.into());
@@ -302,8 +301,7 @@ async fn handle_env(cmd: solver_demo::cli::commands::EnvCommand) -> Result<()> {
 			} else if all {
 				let chain_count = ctx.config.chains().len();
 				logging::operation_start(&format!(
-					"Deploying contracts to {} chains...",
-					chain_count
+					"Deploying contracts to {chain_count} chains..."
 				));
 
 				// Filter to specific chain if provided
@@ -320,8 +318,7 @@ async fn handle_env(cmd: solver_demo::cli::commands::EnvCommand) -> Result<()> {
 				match env_ops.deploy(force).await {
 					Ok(()) => {
 						logging::success(&format!(
-							"All contracts deployed to {} chains",
-							chain_count
+							"All contracts deployed to {chain_count} chains"
 						));
 						logging::next_step("Setup environment with 'oif-demo env setup'");
 					},
@@ -399,7 +396,7 @@ async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<(
 			let tokens = token_ops.list(Some(chain_ids)).await?;
 
 			for (chain, token_list) in tokens.tokens_by_chain {
-				logging::subsection(&format!("Chain {}", chain));
+				logging::subsection(&format!("Chain {chain}"));
 				for token in token_list {
 					logging::item(&format!("{}: {}", token.symbol, token.address));
 				}
@@ -437,7 +434,7 @@ async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<(
 			logging::success(&format!("Minted {} {}", result.amount, result.token));
 
 			if let Some(tx_hash) = result.tx_hash {
-				logging::verbose_tech("Transaction", &format!("{:?}", tx_hash));
+				logging::verbose_tech("Transaction", &format!("{tx_hash:?}"));
 			}
 		},
 		TokenSubcommand::Balance {
@@ -450,7 +447,7 @@ async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<(
 			logging::section_header("Token Balances");
 
 			// Handle "all" account or specific accounts
-			let account_display = format!("{} Account", account);
+			let account_display = format!("{account} Account");
 			let accounts_to_check = if account == "all" {
 				vec![
 					("user", "User Account"),
@@ -562,7 +559,7 @@ async fn handle_token(cmd: solver_demo::cli::commands::TokenCommand) -> Result<(
 			));
 
 			if let Some(tx_hash) = result.tx_hash {
-				logging::verbose_tech("Transaction", &format!("{:?}", tx_hash));
+				logging::verbose_tech("Transaction", &format!("{tx_hash:?}"));
 			}
 		},
 	}
@@ -592,7 +589,7 @@ async fn handle_account(cmd: solver_demo::cli::commands::AccountCommand) -> Resu
 		AccountSubcommand::Info { account } => {
 			use solver_demo::core::logging;
 
-			logging::section_header(&format!("Account Info: {}", account));
+			logging::section_header(&format!("Account Info: {account}"));
 
 			let accounts = ctx.config.accounts();
 
@@ -602,7 +599,7 @@ async fn handle_account(cmd: solver_demo::cli::commands::AccountCommand) -> Resu
 				"recipient" => &accounts.recipient,
 				_ => {
 					logging::error_with_guidance(
-						&format!("Unknown account: {}", account),
+						&format!("Unknown account: {account}"),
 						"Use 'user', 'solver', or 'recipient'",
 					);
 					return Ok(());
@@ -654,8 +651,7 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 				"exact-output" => true,
 				_ => {
 					return Err(anyhow::anyhow!(
-						"Invalid swap type: {}. Use 'exact-input' or 'exact-output'",
-						swap_type
+						"Invalid swap type: {swap_type}. Use 'exact-input' or 'exact-output'"
 					))
 				},
 			};
@@ -698,8 +694,8 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 				format!("{} {} (input)", amount, from_token_info.symbol)
 			};
 			// Create user-friendly intent description
-			let intent_desc = format!("{} {} → {}", amount_display, from_token, to_token);
-			logging::success(&format!("Intent created: {}", intent_desc));
+			let intent_desc = format!("{amount_display} {from_token} → {to_token}");
+			logging::success(&format!("Intent created: {intent_desc}"));
 
 			// Verbose technical details
 			logging::verbose_tech("Swap Type", &swap_type);
@@ -814,7 +810,7 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 				let order_id = intent_ops.submit(order).await?;
 
 				use solver_demo::core::logging;
-				logging::success(&format!("Order submitted: {}", order_id));
+				logging::success(&format!("Order submitted: {order_id}"));
 				logging::info_kv("Order ID", &order_id);
 			}
 		},
@@ -863,7 +859,7 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 			}
 
 			let total_requests = post_order_requests.len();
-			logging::operation_start(&format!("Submitting {} order requests...", total_requests));
+			logging::operation_start(&format!("Submitting {total_requests} order requests..."));
 
 			let mut successful_count = 0;
 			let mut failed_count = 0;
@@ -941,8 +937,7 @@ async fn handle_quote(cmd: solver_demo::cli::commands::QuoteCommand) -> Result<(
 					.valid_until
 					.saturating_sub(chrono::Utc::now().timestamp() as u64);
 				logging::success(&format!(
-					"Received {} quote(s) (valid for {}s)",
-					quote_count, validity_duration
+					"Received {quote_count} quote(s) (valid for {validity_duration}s)"
 				));
 			} else {
 				logging::warning("No quotes received from solver");
@@ -1003,7 +998,7 @@ async fn handle_quote(cmd: solver_demo::cli::commands::QuoteCommand) -> Result<(
 			let quote = quote_response
 				.quotes
 				.get(quote_index)
-				.ok_or_else(|| anyhow::anyhow!("Quote index {} not found", quote_index))?;
+				.ok_or_else(|| anyhow::anyhow!("Quote index {quote_index} not found"))?;
 
 			// Create the order request
 			let order_request = if let Some(sig_str) = signature {
@@ -1070,7 +1065,7 @@ async fn handle_quote(cmd: solver_demo::cli::commands::QuoteCommand) -> Result<(
 			}
 
 			let total_requests = quote_requests.len();
-			logging::operation_start(&format!("Processing {} quote requests...", total_requests));
+			logging::operation_start(&format!("Processing {total_requests} quote requests..."));
 
 			let mut successful_orders = Vec::new();
 			let mut failed_count = 0;
@@ -1104,7 +1099,7 @@ async fn handle_quote(cmd: solver_demo::cli::commands::QuoteCommand) -> Result<(
 						));
 						logging::verbose_tech(
 							&format!("Quote request {} failed", index + 1),
-							&format!("{}", e),
+							&format!("{e}"),
 						);
 					},
 				}

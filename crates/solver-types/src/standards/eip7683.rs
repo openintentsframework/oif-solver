@@ -79,7 +79,7 @@ impl FromStr for LockType {
 			"1" => Ok(LockType::Permit2Escrow),
 			"2" => Ok(LockType::Eip3009Escrow),
 			"3" => Ok(LockType::ResourceLock),
-			_ => Err(format!("Invalid lock type: {}", s)),
+			_ => Err(format!("Invalid lock type: {s}")),
 		}
 	}
 }
@@ -598,11 +598,10 @@ impl interfaces::StandardOrder {
 
 		// Parse InteropAddress and extract Ethereum address
 		let interop_address = crate::InteropAddress::from_hex(user_str)
-			.map_err(|e| format!("Invalid user InteropAddress: {}", e))?;
+			.map_err(|e| format!("Invalid user InteropAddress: {e}"))?;
 		let user_address = interop_address.ethereum_address().map_err(|e| {
 			format!(
-				"Failed to extract Ethereum address from user InteropAddress: {}",
-				e
+				"Failed to extract Ethereum address from user InteropAddress: {e}"
 			)
 		})?;
 
@@ -666,10 +665,10 @@ impl interfaces::StandardOrder {
 
 				// Parse token address
 				let interop_address = InteropAddress::from_hex(token_str)
-					.map_err(|e| format!("Invalid asset address: {}", e))?;
+					.map_err(|e| format!("Invalid asset address: {e}"))?;
 				let token_address = interop_address
 					.ethereum_address()
-					.map_err(|e| format!("Invalid Ethereum address: {}", e))?;
+					.map_err(|e| format!("Invalid Ethereum address: {e}"))?;
 
 				// Convert token address to U256 (padded to 32 bytes)
 				let mut token_bytes = [0u8; 32];
@@ -738,14 +737,14 @@ impl interfaces::StandardOrder {
 						bytes[12..32].copy_from_slice(addr.as_slice());
 						bytes
 					})
-					.map_err(|e| format!("Invalid oracle address '{}': {}", oracle_str, e))?;
+					.map_err(|e| format!("Invalid oracle address '{oracle_str}': {e}"))?;
 				let settler_bytes = hex_to_alloy_address(settler_str)
 					.map(|addr| {
 						let mut bytes = [0u8; 32];
 						bytes[12..32].copy_from_slice(addr.as_slice());
 						bytes
 					})
-					.map_err(|e| format!("Invalid settler address '{}': {}", settler_str, e))?;
+					.map_err(|e| format!("Invalid settler address '{settler_str}': {e}"))?;
 
 				sol_outputs.push(SolMandateOutput {
 					oracle: oracle_bytes.into(),
@@ -824,7 +823,7 @@ impl interfaces::StandardOrder {
 			.ok_or("Missing 'expires' in BatchCompact message")?;
 		let expires = expires_str
 			.parse::<u64>()
-			.map_err(|e| format!("Invalid expires: {}", e))? as u32;
+			.map_err(|e| format!("Invalid expires: {e}"))? as u32;
 
 		let fill_deadline_str = mandate
 			.get("fillDeadline")
@@ -832,7 +831,7 @@ impl interfaces::StandardOrder {
 			.ok_or("Missing 'fillDeadline' in mandate")?;
 		let fill_deadline = fill_deadline_str
 			.parse::<u64>()
-			.map_err(|e| format!("Invalid fillDeadline: {}", e))? as u32;
+			.map_err(|e| format!("Invalid fillDeadline: {e}"))? as u32;
 
 		let input_oracle_str = mandate
 			.get("inputOracle")
@@ -868,9 +867,9 @@ impl interfaces::StandardOrder {
 			.ok_or("Missing lockTag in commitment")?;
 		let lock_tag_hex = lock_tag_str.trim_start_matches("0x");
 		let token_hex = hex::encode(input_token.0 .0);
-		let token_id_hex = format!("{}{}", lock_tag_hex, token_hex);
+		let token_id_hex = format!("{lock_tag_hex}{token_hex}");
 		let input_token_u256 = U256::from_str_radix(&token_id_hex, 16)
-			.map_err(|e| format!("Failed to parse TOKEN_ID: {}", e))?;
+			.map_err(|e| format!("Failed to parse TOKEN_ID: {e}"))?;
 
 		let inputs = vec![[input_token_u256, input_amount]];
 
@@ -916,10 +915,10 @@ impl interfaces::StandardOrder {
 						let recipient_bytes =
 							parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
 						let oracle_bytes = parse_bytes32_from_hex(oracle_str).map_err(|e| {
-							format!("Invalid oracle address '{}': {}", oracle_str, e)
+							format!("Invalid oracle address '{oracle_str}': {e}")
 						})?;
 						let settler_bytes = parse_bytes32_from_hex(settler_str).map_err(|e| {
-							format!("Invalid settler address '{}': {}", settler_str, e)
+							format!("Invalid settler address '{settler_str}': {e}")
 						})?;
 
 						// Parse callbackData from hex
@@ -1376,7 +1375,7 @@ mod tests {
 		let cloned = lock_type.clone();
 		assert_eq!(lock_type, cloned);
 
-		let debug_str = format!("{:?}", lock_type);
+		let debug_str = format!("{lock_type:?}");
 		assert!(debug_str.contains("Permit2Escrow"));
 
 		let overrides = GasLimitOverrides::default();

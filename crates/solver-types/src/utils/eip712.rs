@@ -115,12 +115,12 @@ pub fn ecrecover_user_from_signature(
 	// Try parsing the processed signature string using alloy-signer
 	let sig: Signature = sig_to_parse
 		.parse()
-		.map_err(|e| format!("Failed to parse signature: {}", e))?;
+		.map_err(|e| format!("Failed to parse signature: {e}"))?;
 
 	// Recover address from the prehash
 	let recovered = sig
 		.recover_address_from_prehash(&B256::from(*digest))
-		.map_err(|e| format!("Recovery failed: {}", e))?;
+		.map_err(|e| format!("Recovery failed: {e}"))?;
 
 	Ok(recovered)
 }

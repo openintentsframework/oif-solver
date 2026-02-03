@@ -36,7 +36,7 @@ impl LocalWallet {
 		// Parse the private key using Alloy's signer
 		let signer = private_key_hex
 			.parse::<PrivateKeySigner>()
-			.map_err(|e| AccountError::InvalidKey(format!("Invalid private key: {}", e)))?;
+			.map_err(|e| AccountError::InvalidKey(format!("Invalid private key: {e}")))?;
 
 		Ok(Self { signer })
 	}
@@ -133,7 +133,7 @@ impl AccountInterface for LocalWallet {
 			.sign_transaction(&mut legacy_tx)
 			.await
 			.map_err(|e| {
-				AccountError::SigningFailed(format!("Failed to sign transaction: {}", e))
+				AccountError::SigningFailed(format!("Failed to sign transaction: {e}"))
 			})?;
 
 		Ok(signature.into())
@@ -143,7 +143,7 @@ impl AccountInterface for LocalWallet {
 		// Use Alloy's signer to sign the message (handles EIP-191 internally)
 		let signature =
 			self.signer.sign_message(message).await.map_err(|e| {
-				AccountError::SigningFailed(format!("Failed to sign message: {}", e))
+				AccountError::SigningFailed(format!("Failed to sign message: {e}"))
 			})?;
 
 		Ok(signature.into())
@@ -178,7 +178,7 @@ pub fn create_account(
 	Box::pin(async move {
 		// Validate configuration first
 		LocalWalletSchema::validate_config(config)
-			.map_err(|e| AccountError::InvalidKey(format!("Invalid configuration: {}", e)))?;
+			.map_err(|e| AccountError::InvalidKey(format!("Invalid configuration: {e}")))?;
 
 		let private_key = config
 			.get("private_key")

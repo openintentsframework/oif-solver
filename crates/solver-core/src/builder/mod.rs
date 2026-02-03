@@ -127,8 +127,7 @@ impl SolverBuilder {
 							"Failed to create storage implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create storage implementation '{}': {}",
-							name, e
+							"Failed to create storage implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -145,8 +144,7 @@ impl SolverBuilder {
 		let primary_storage = &self.static_config.storage.primary;
 		let storage_backend = storage_impls.remove(primary_storage).ok_or_else(|| {
 			BuilderError::Config(format!(
-				"Primary storage '{}' failed to load or has invalid configuration",
-				primary_storage
+				"Primary storage '{primary_storage}' failed to load or has invalid configuration"
 			))
 		})?;
 
@@ -170,8 +168,7 @@ impl SolverBuilder {
 							"Failed to create account implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create account implementation '{}': {}",
-							name, e
+							"Failed to create account implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -196,8 +193,7 @@ impl SolverBuilder {
 			.get(primary_account)
 			.ok_or_else(|| {
 				BuilderError::Config(format!(
-					"Primary account '{}' not found in loaded accounts",
-					primary_account
+					"Primary account '{primary_account}' not found in loaded accounts"
 				))
 			})?
 			.clone();
@@ -212,8 +208,7 @@ impl SolverBuilder {
 					"Failed to get solver address"
 				);
 				return Err(BuilderError::Config(format!(
-					"Failed to get solver address: {}",
-					e
+					"Failed to get solver address: {e}"
 				)));
 			},
 		};
@@ -281,8 +276,7 @@ impl SolverBuilder {
 								"Missing network_ids configuration"
 							);
 							return Err(BuilderError::Config(format!(
-								"Delivery implementation '{}' missing network_ids configuration",
-								name
+								"Delivery implementation '{name}' missing network_ids configuration"
 							)));
 						}
 					},
@@ -294,8 +288,7 @@ impl SolverBuilder {
 							"Failed to create delivery implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create delivery implementation '{}': {}",
-							name, e
+							"Failed to create delivery implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -330,8 +323,7 @@ impl SolverBuilder {
 							"Failed to create discovery implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create discovery implementation '{}': {}",
-							name, e
+							"Failed to create discovery implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -364,8 +356,7 @@ impl SolverBuilder {
 							"Failed to create settlement implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create settlement implementation '{}': {}",
-							name, e
+							"Failed to create settlement implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -406,8 +397,7 @@ impl SolverBuilder {
 							"Failed to create pricing implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create pricing implementation '{}': {}",
-							name, e
+							"Failed to create pricing implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -418,8 +408,7 @@ impl SolverBuilder {
 		let primary_pricing = pricing_config.primary.as_str();
 		let pricing_impl = pricing_impls.remove(primary_pricing).ok_or_else(|| {
 			BuilderError::Config(format!(
-				"Primary pricing '{}' failed to load or has invalid configuration",
-				primary_pricing
+				"Primary pricing '{primary_pricing}' failed to load or has invalid configuration"
 			))
 		})?;
 
@@ -477,8 +466,7 @@ impl SolverBuilder {
 							"Failed to create order implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create order implementation '{}': {}",
-							name, e
+							"Failed to create order implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -507,8 +495,7 @@ impl SolverBuilder {
 							"Failed to create strategy implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create strategy implementation '{}': {}",
-							name, e
+							"Failed to create strategy implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -525,8 +512,7 @@ impl SolverBuilder {
 		let primary_strategy = self.static_config.order.strategy.primary.as_str();
 		let strategy = strategy_impls.remove(primary_strategy).ok_or_else(|| {
 			BuilderError::Config(format!(
-				"Primary strategy '{}' failed to load or has invalid configuration",
-				primary_strategy
+				"Primary strategy '{primary_strategy}' failed to load or has invalid configuration"
 			))
 		})?;
 
@@ -555,8 +541,7 @@ impl SolverBuilder {
 					"Failed to ensure token approvals"
 				);
 				return Err(BuilderError::Config(format!(
-					"Failed to ensure token approvals: {}",
-					e
+					"Failed to ensure token approvals: {e}"
 				)));
 			},
 		}

@@ -122,7 +122,7 @@ fn order_output_to_hyperlane(output: &OrderOutput) -> HyperlaneOutput {
 fn extract_output_details(order: &Order) -> Result<HyperlaneOutput, SettlementError> {
 	// Parse order data using the OrderParsable trait
 	let parsed_order = order.parse_order_data().map_err(|e| {
-		SettlementError::ValidationFailed(format!("Failed to parse order data: {}", e))
+		SettlementError::ValidationFailed(format!("Failed to parse order data: {e}"))
 	})?;
 
 	// Get requested outputs
@@ -375,7 +375,7 @@ impl MessageTracker {
 
 	/// Generate storage key for a specific order
 	fn storage_key(order_id: &str) -> String {
-		format!("hyperlane:{}", order_id)
+		format!("hyperlane:{order_id}")
 	}
 
 	/// Load message state for a specific order
@@ -430,7 +430,7 @@ impl MessageTracker {
 			)
 			.await
 			.map_err(|e| {
-				SettlementError::ValidationFailed(format!("Failed to persist message state: {}", e))
+				SettlementError::ValidationFailed(format!("Failed to persist message state: {e}"))
 			})?;
 
 		// Update cache
@@ -585,7 +585,7 @@ impl HyperlaneSettlement {
 		payload_hash: [u8; 32],
 	) -> Result<bool, SettlementError> {
 		let provider = self.providers.get(&oracle_chain).ok_or_else(|| {
-			SettlementError::ValidationFailed(format!("No provider for chain {}", oracle_chain))
+			SettlementError::ValidationFailed(format!("No provider for chain {oracle_chain}"))
 		})?;
 
 		// Build the call
@@ -606,7 +606,7 @@ impl HyperlaneSettlement {
 		};
 
 		let result = provider.call(request).await.map_err(|e| {
-			SettlementError::ValidationFailed(format!("Failed to call isProven: {}", e))
+			SettlementError::ValidationFailed(format!("Failed to call isProven: {e}"))
 		})?;
 
 		// Decode boolean (last byte of 32-byte result)
@@ -789,8 +789,7 @@ impl HyperlaneSettlement {
 		for chain_id in &all_network_ids {
 			if !mailbox_addresses.contains_key(chain_id) {
 				return Err(SettlementError::ValidationFailed(format!(
-					"Mailbox address not configured for chain {}",
-					chain_id
+					"Mailbox address not configured for chain {chain_id}"
 				)));
 			}
 		}
@@ -838,8 +837,7 @@ impl HyperlaneSettlement {
 		let oracle_addresses = self.get_output_oracles(oracle_chain);
 		if oracle_addresses.is_empty() {
 			return Err(SettlementError::ValidationFailed(format!(
-				"No output oracle configured for chain {}",
-				oracle_chain
+				"No output oracle configured for chain {oracle_chain}"
 			)));
 		}
 
@@ -850,7 +848,7 @@ impl HyperlaneSettlement {
 
 		// Get provider for the oracle chain
 		let provider = self.providers.get(&oracle_chain).ok_or_else(|| {
-			SettlementError::ValidationFailed(format!("No provider for chain {}", oracle_chain))
+			SettlementError::ValidationFailed(format!("No provider for chain {oracle_chain}"))
 		})?;
 
 		// Build the quoteGasPayment call
@@ -878,7 +876,7 @@ impl HyperlaneSettlement {
 			.block(alloy_rpc_types::eth::BlockId::latest())
 			.await
 			.map_err(|e| {
-				SettlementError::ValidationFailed(format!("Failed to quote gas payment: {}", e))
+				SettlementError::ValidationFailed(format!("Failed to quote gas payment: {e}"))
 			})?;
 
 		// Decode the result
@@ -981,8 +979,7 @@ impl SettlementInterface for HyperlaneSettlement {
 		// Get the appropriate provider for destination chain
 		let provider = self.providers.get(&destination_chain_id).ok_or_else(|| {
 			SettlementError::ValidationFailed(format!(
-				"No provider configured for chain {}",
-				destination_chain_id
+				"No provider configured for chain {destination_chain_id}"
 			))
 		})?;
 
@@ -990,8 +987,7 @@ impl SettlementInterface for HyperlaneSettlement {
 		let oracle_addresses = self.get_input_oracles(origin_chain_id);
 		if oracle_addresses.is_empty() {
 			return Err(SettlementError::ValidationFailed(format!(
-				"No input oracle configured for chain {}",
-				origin_chain_id
+				"No input oracle configured for chain {origin_chain_id}"
 			)));
 		}
 
@@ -1005,8 +1001,7 @@ impl SettlementInterface for HyperlaneSettlement {
 			.select_oracle(&oracle_addresses, Some(selection_context))
 			.ok_or_else(|| {
 				SettlementError::ValidationFailed(format!(
-					"Failed to select oracle for chain {}",
-					origin_chain_id
+					"Failed to select oracle for chain {origin_chain_id}"
 				))
 			})?;
 
@@ -1016,7 +1011,7 @@ impl SettlementInterface for HyperlaneSettlement {
 			.get_transaction_receipt(hash)
 			.await
 			.map_err(|e| {
-				SettlementError::ValidationFailed(format!("Failed to get receipt: {}", e))
+				SettlementError::ValidationFailed(format!("Failed to get receipt: {e}"))
 			})?
 			.ok_or_else(|| {
 				SettlementError::ValidationFailed("Transaction not found".to_string())
@@ -1035,7 +1030,7 @@ impl SettlementInterface for HyperlaneSettlement {
 			.get_block_by_number(alloy_rpc_types::BlockNumberOrTag::Number(tx_block))
 			.await
 			.map_err(|e| {
-				SettlementError::ValidationFailed(format!("Failed to get block: {}", e))
+				SettlementError::ValidationFailed(format!("Failed to get block: {e}"))
 			})?;
 
 		let block_timestamp = block
@@ -1260,7 +1255,7 @@ impl SettlementInterface for HyperlaneSettlement {
 
 			// Need to get the fill transaction to extract solver and timestamp
 			let dest_provider = self.providers.get(&dest_chain).ok_or_else(|| {
-				SettlementError::ValidationFailed(format!("No provider for chain {}", dest_chain))
+				SettlementError::ValidationFailed(format!("No provider for chain {dest_chain}"))
 			})?;
 
 			let fill_receipt = dest_provider
@@ -1269,7 +1264,7 @@ impl SettlementInterface for HyperlaneSettlement {
 				))
 				.await
 				.map_err(|e| {
-					SettlementError::ValidationFailed(format!("Failed to get fill receipt: {}", e))
+					SettlementError::ValidationFailed(format!("Failed to get fill receipt: {e}"))
 				})?
 				.ok_or_else(|| {
 					SettlementError::ValidationFailed("Fill transaction not found".to_string())
@@ -1335,22 +1330,19 @@ fn parse_address_table(
 		for (chain_id_str, address_value) in table {
 			let chain_id = chain_id_str.parse::<u64>().map_err(|e| {
 				SettlementError::ValidationFailed(format!(
-					"Invalid chain ID '{}': {}",
-					chain_id_str, e
+					"Invalid chain ID '{chain_id_str}': {e}"
 				))
 			})?;
 
 			let address_str = address_value.as_str().ok_or_else(|| {
 				SettlementError::ValidationFailed(format!(
-					"Address must be string for chain {}",
-					chain_id
+					"Address must be string for chain {chain_id}"
 				))
 			})?;
 
 			let address = solver_types::utils::parse_address(address_str).map_err(|e| {
 				SettlementError::ValidationFailed(format!(
-					"Invalid address for chain {}: {}",
-					chain_id, e
+					"Invalid address for chain {chain_id}: {e}"
 				))
 			})?;
 
@@ -1369,7 +1361,7 @@ pub fn create_settlement(
 ) -> Result<Box<dyn SettlementInterface>, SettlementError> {
 	// Validate configuration first
 	HyperlaneSettlementSchema::validate_config(config)
-		.map_err(|e| SettlementError::ValidationFailed(format!("Invalid configuration: {}", e)))?;
+		.map_err(|e| SettlementError::ValidationFailed(format!("Invalid configuration: {e}")))?;
 
 	// Parse oracle configuration using common utilities
 	let oracle_config = parse_oracle_config(config)?;

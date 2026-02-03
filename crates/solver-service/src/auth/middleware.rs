@@ -166,7 +166,7 @@ mod tests {
 			.oneshot(
 				Request::builder()
 					.uri("/protected")
-					.header("Authorization", format!("Bearer {}", token))
+					.header("Authorization", format!("Bearer {token}"))
 					.body(Body::empty())
 					.unwrap(),
 			)
@@ -225,7 +225,7 @@ mod tests {
 			.oneshot(
 				Request::builder()
 					.uri("/protected")
-					.header("Authorization", format!("Bearer {}", token))
+					.header("Authorization", format!("Bearer {token}"))
 					.body(Body::empty())
 					.unwrap(),
 			)

@@ -44,24 +44,24 @@ pub fn build_permit2_batch_witness_digest(
 	})?;
 
 	let origin_chain_id = input.asset.ethereum_chain_id().map_err(|e| {
-		QuoteError::InvalidRequest(format!("Invalid origin chain ID in asset address: {}", e))
+		QuoteError::InvalidRequest(format!("Invalid origin chain ID in asset address: {e}"))
 	})?;
 	let dest_chain_id = output
 		.asset
 		.ethereum_chain_id()
-		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid destination chain ID: {}", e)))?;
+		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid destination chain ID: {e}")))?;
 
 	let origin_token = input
 		.asset
 		.ethereum_address()
-		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid origin token address: {}", e)))?;
+		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid origin token address: {e}")))?;
 	let dest_token = output.asset.ethereum_address().map_err(|e| {
-		QuoteError::InvalidRequest(format!("Invalid destination token address: {}", e))
+		QuoteError::InvalidRequest(format!("Invalid destination token address: {e}"))
 	})?;
 	let recipient = output
 		.receiver
 		.ethereum_address()
-		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid recipient address: {}", e)))?;
+		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid recipient address: {e}")))?;
 
 	// Input amount should always be set after cost adjustment
 	let input_amount: U256 = input
@@ -71,7 +71,7 @@ pub fn build_permit2_batch_witness_digest(
 			QuoteError::InvalidRequest("Input amount not set after cost adjustment".to_string())
 		})?
 		.parse()
-		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input amount format: {}", e)))?;
+		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input amount format: {e}")))?;
 
 	// Get output amount from request (this should be our adjusted amount)
 	let output_amount: U256 = output
@@ -83,8 +83,7 @@ pub fn build_permit2_batch_witness_digest(
 	// Spender = INPUT settler on origin chain
 	let origin_net = config.networks.get(&origin_chain_id).ok_or_else(|| {
 		QuoteError::InvalidRequest(format!(
-			"Origin chain {} missing from networks config",
-			origin_chain_id
+			"Origin chain {origin_chain_id} missing from networks config"
 		))
 	})?;
 	let spender = bytes20_to_alloy_address(&origin_net.input_settler_address.0)
@@ -93,8 +92,7 @@ pub fn build_permit2_batch_witness_digest(
 	// Output settler = OUTPUT settler on destination chain
 	let dest_net = config.networks.get(&dest_chain_id).ok_or_else(|| {
 		QuoteError::InvalidRequest(format!(
-			"Destination chain {} missing from networks config",
-			dest_chain_id
+			"Destination chain {dest_chain_id} missing from networks config"
 		))
 	})?;
 	let output_settler = bytes20_to_alloy_address(&dest_net.output_settler_address.0)
@@ -104,12 +102,12 @@ pub fn build_permit2_batch_witness_digest(
 	let permit2 = PROTOCOL_REGISTRY
 		.get_permit2_address(origin_chain_id)
 		.ok_or_else(|| {
-			QuoteError::InvalidRequest(format!("Permit2 not deployed on chain {}", origin_chain_id))
+			QuoteError::InvalidRequest(format!("Permit2 not deployed on chain {origin_chain_id}"))
 		})?;
 
 	// Use the pre-selected oracle address
 	let input_oracle = bytes20_to_alloy_address(&input_oracle.0)
-		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid oracle address: {}", e)))?;
+		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid oracle address: {e}")))?;
 
 	// Nonce and deadlines
 	let now_secs = chrono::Utc::now().timestamp() as u64;
@@ -164,15 +162,11 @@ pub fn build_permit2_batch_witness_digest(
 	let name_hash = keccak256(NAME_PERMIT2.as_bytes());
 	let mandate_output_type_hash = keccak256(MANDATE_OUTPUT_TYPE.as_bytes());
 	let permit2_witness_type_hash =
-		keccak256(format!("{}{}", PERMIT2_WITNESS_TYPE, MANDATE_OUTPUT_TYPE).as_bytes());
+		keccak256(format!("{PERMIT2_WITNESS_TYPE}{MANDATE_OUTPUT_TYPE}").as_bytes());
 	let token_permissions_type_hash = keccak256(TOKEN_PERMISSIONS_TYPE.as_bytes());
 	let permit_batch_witness_type_hash = keccak256(
 		format!(
-			"{}{}{}{}",
-			PERMIT_BATCH_WITNESS_TYPE,
-			MANDATE_OUTPUT_TYPE,
-			PERMIT2_WITNESS_TYPE,
-			TOKEN_PERMISSIONS_TYPE
+			"{PERMIT_BATCH_WITNESS_TYPE}{MANDATE_OUTPUT_TYPE}{PERMIT2_WITNESS_TYPE}{TOKEN_PERMISSIONS_TYPE}"
 		)
 		.as_bytes(),
 	);

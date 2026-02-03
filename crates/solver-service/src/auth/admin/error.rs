@@ -76,7 +76,7 @@ impl IntoResponse for AdminAuthError {
 				tracing::error!(error = %details, "Internal admin auth error");
 				"An internal error occurred".to_string()
 			},
-			_ => format!("{}", self),
+			_ => format!("{self}"),
 		};
 
 		let body = AdminAuthErrorResponse {
@@ -93,10 +93,10 @@ impl From<solver_storage::nonce_store::NonceError> for AdminAuthError {
 		match err {
 			solver_storage::nonce_store::NonceError::NotFound => AdminAuthError::NonceNotFound,
 			solver_storage::nonce_store::NonceError::Storage(e) => {
-				AdminAuthError::Internal(format!("Storage error: {}", e))
+				AdminAuthError::Internal(format!("Storage error: {e}"))
 			},
 			solver_storage::nonce_store::NonceError::Configuration(msg) => {
-				AdminAuthError::Internal(format!("Configuration error: {}", msg))
+				AdminAuthError::Internal(format!("Configuration error: {msg}"))
 			},
 		}
 	}
@@ -106,7 +106,7 @@ impl From<super::types::AdminActionHashError> for AdminAuthError {
 	fn from(err: super::types::AdminActionHashError) -> Self {
 		match err {
 			super::types::AdminActionHashError::InvalidAmount(amount) => {
-				AdminAuthError::InvalidMessage(format!("Invalid amount: {}", amount))
+				AdminAuthError::InvalidMessage(format!("Invalid amount: {amount}"))
 			},
 		}
 	}

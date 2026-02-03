@@ -83,7 +83,7 @@ impl KmsWallet {
 		let client = KmsClient::new(&config);
 
 		let signer = AwsSigner::new(client, key_id, None).await.map_err(|e| {
-			AccountError::Implementation(format!("KMS initialization failed: {}", e))
+			AccountError::Implementation(format!("KMS initialization failed: {e}"))
 		})?;
 
 		Ok(Self { signer })
@@ -135,7 +135,7 @@ pub fn create_account(
 ) -> Pin<Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + '_>> {
 	Box::pin(async move {
 		KmsWalletSchema::validate_config(config)
-			.map_err(|e| AccountError::InvalidKey(format!("Invalid configuration: {}", e)))?;
+			.map_err(|e| AccountError::InvalidKey(format!("Invalid configuration: {e}")))?;
 
 		let key_id = config
 			.get("key_id")

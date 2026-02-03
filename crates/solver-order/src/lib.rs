@@ -301,7 +301,7 @@ impl OrderService {
 		order_bytes: &Bytes,
 	) -> Result<StandardOrder, OrderError> {
 		let implementation = self.implementations.get(standard).ok_or_else(|| {
-			OrderError::ValidationFailed(format!("Unknown standard: {}", standard))
+			OrderError::ValidationFailed(format!("Unknown standard: {standard}"))
 		})?;
 
 		implementation.validate_order(order_bytes).await
@@ -323,7 +323,7 @@ impl OrderService {
 		quote_id: Option<String>,
 	) -> Result<Order, OrderError> {
 		let implementation = self.implementations.get(standard).ok_or_else(|| {
-			OrderError::ValidationFailed(format!("Unknown standard: {}", standard))
+			OrderError::ValidationFailed(format!("Unknown standard: {standard}"))
 		})?;
 
 		implementation

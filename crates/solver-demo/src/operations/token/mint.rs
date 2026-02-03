@@ -64,8 +64,7 @@ impl MintOps {
 		logging::verbose_tech(
 			"Starting token mint operation",
 			&format!(
-				"chain: {}, token: {}, amount: {}",
-				chain, token_symbol, amount
+				"chain: {chain}, token: {token_symbol}, amount: {amount}"
 			),
 		);
 

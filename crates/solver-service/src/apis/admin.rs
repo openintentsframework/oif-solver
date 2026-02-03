@@ -183,7 +183,7 @@ pub async fn handle_add_token(
 
 	// 7. HOT RELOAD: Rebuild runtime Config from updated OperatorConfig
 	let new_config = build_runtime_config(&new_versioned.data)
-		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {}", e)))?;
+		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {e}")))?;
 	*state.dynamic_config.write().await = new_config;
 
 	tracing::info!(
@@ -199,7 +199,7 @@ pub async fn handle_add_token(
 			"Token {} added to chain {}",
 			request.contents.symbol, request.contents.chain_id
 		),
-		admin: format!("{:?}", admin),
+		admin: format!("{admin:?}"),
 	}))
 }
 
@@ -276,7 +276,7 @@ pub async fn handle_update_fees(
 
 	// 7. HOT RELOAD: Rebuild runtime Config from updated OperatorConfig
 	let new_config = build_runtime_config(&new_versioned.data)
-		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {}", e)))?;
+		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {e}")))?;
 	*state.dynamic_config.write().await = new_config;
 
 	tracing::info!(
@@ -292,7 +292,7 @@ pub async fn handle_update_fees(
 			"Fee configuration updated: gasBufferBps={}, minProfitabilityPct={}",
 			request.contents.gas_buffer_bps, request.contents.min_profitability_pct
 		),
-		admin: format!("{:?}", admin),
+		admin: format!("{admin:?}"),
 	}))
 }
 
@@ -300,23 +300,22 @@ pub async fn handle_update_fees(
 fn config_store_error(err: ConfigStoreError) -> AdminAuthError {
 	match err {
 		ConfigStoreError::NotFound(msg) => {
-			AdminAuthError::Internal(format!("Configuration not found: {}", msg))
+			AdminAuthError::Internal(format!("Configuration not found: {msg}"))
 		},
 		ConfigStoreError::VersionMismatch { expected, found } => AdminAuthError::Internal(format!(
-			"Configuration was modified concurrently (expected version {}, found {}), please retry",
-			expected, found
+			"Configuration was modified concurrently (expected version {expected}, found {found}), please retry"
 		)),
 		ConfigStoreError::Serialization(msg) => {
-			AdminAuthError::Internal(format!("Serialization error: {}", msg))
+			AdminAuthError::Internal(format!("Serialization error: {msg}"))
 		},
 		ConfigStoreError::Backend(msg) => {
-			AdminAuthError::Internal(format!("Storage error: {}", msg))
+			AdminAuthError::Internal(format!("Storage error: {msg}"))
 		},
 		ConfigStoreError::Configuration(msg) => {
-			AdminAuthError::Internal(format!("Configuration error: {}", msg))
+			AdminAuthError::Internal(format!("Configuration error: {msg}"))
 		},
 		ConfigStoreError::AlreadyExists(msg) => {
-			AdminAuthError::Internal(format!("Configuration already exists: {}", msg))
+			AdminAuthError::Internal(format!("Configuration already exists: {msg}"))
 		},
 	}
 }

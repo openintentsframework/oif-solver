@@ -157,7 +157,7 @@ impl SigningService {
 	) -> Result<String> {
 		let wallet = private_key
 			.parse::<PrivateKeySigner>()
-			.map_err(|e| anyhow!("Failed to parse private key: {}", e))?;
+			.map_err(|e| anyhow!("Failed to parse private key: {e}"))?;
 
 		// Determine signature scheme and compute digest
 		let (digest, signature_type) = match payload.primary_type.as_str() {
@@ -204,7 +204,7 @@ impl SigningService {
 		);
 		let signature = wallet
 			.sign_hash_sync(&B256::from(digest))
-			.map_err(|e| anyhow!("Failed to sign digest: {}", e))?;
+			.map_err(|e| anyhow!("Failed to sign digest: {e}"))?;
 
 		let sig_bytes = signature.as_bytes().to_vec();
 
@@ -277,12 +277,12 @@ impl SigningService {
 	) -> Result<[u8; 32]> {
 		// Call DOMAIN_SEPARATOR() on the contract
 		let call_data =
-			hex::decode("3644e515").map_err(|e| anyhow!("Failed to decode call data: {}", e))?;
+			hex::decode("3644e515").map_err(|e| anyhow!("Failed to decode call data: {e}"))?;
 
 		let result = provider
 			.call_contract(verifying_contract, call_data.into(), Some(chain_id))
 			.await
-			.map_err(|e| anyhow!("Failed to call DOMAIN_SEPARATOR: {}", e))?;
+			.map_err(|e| anyhow!("Failed to call DOMAIN_SEPARATOR: {e}"))?;
 
 		if result.len() != 32 {
 			return Err(anyhow!("Invalid domain separator length: {}", result.len()).into());
@@ -305,7 +305,7 @@ impl SigningService {
 	/// Returns Error if domain parsing fails
 	fn construct_typed_data(&self, payload: &OrderPayload) -> Result<TypedData> {
 		let domain: EIP712Domain = serde_json::from_value(payload.domain.clone())
-			.map_err(|e| anyhow!("Failed to parse domain: {}", e))?;
+			.map_err(|e| anyhow!("Failed to parse domain: {e}"))?;
 
 		let mut types = HashMap::new();
 		types.insert(
@@ -386,7 +386,7 @@ impl SigningService {
 	/// Returns Error if message serialization fails
 	fn compute_struct_hash(&self, typed_data: &TypedData) -> Result<[u8; 32]> {
 		let message_str = serde_json::to_string(&typed_data.message)
-			.map_err(|e| anyhow!("Failed to serialize message: {}", e))?;
+			.map_err(|e| anyhow!("Failed to serialize message: {e}"))?;
 		Ok(keccak256(message_str.as_bytes()).into())
 	}
 
@@ -418,7 +418,7 @@ impl SigningService {
 			// Parse domain separator from metadata
 			let domain_sep_hex = domain_sep_str.trim_start_matches("0x");
 			let domain_sep_bytes = hex::decode(domain_sep_hex)
-				.map_err(|e| anyhow!("Failed to decode domain separator from metadata: {}", e))?;
+				.map_err(|e| anyhow!("Failed to decode domain separator from metadata: {e}"))?;
 
 			if domain_sep_bytes.len() != 32 {
 				return Err(anyhow!(
@@ -447,7 +447,7 @@ impl SigningService {
 				.as_str()
 				.ok_or_else(|| anyhow!("Missing verifyingContract"))?
 				.parse::<Address>()
-				.map_err(|e| anyhow!("Invalid verifyingContract: {}", e))?;
+				.map_err(|e| anyhow!("Invalid verifyingContract: {e}"))?;
 
 			let domain_separator = self
 				.fetch_domain_separator(chain_id, verifying_contract, provider)
@@ -465,7 +465,7 @@ impl SigningService {
 		// Use solver_types utility function with the contract-fetched domain separator
 		let digest =
 			solver_types::utils::reconstruct_eip3009_digest(payload, Some(domain_separator))
-				.map_err(|e| anyhow!("Failed to reconstruct EIP-3009 digest: {}", e))?;
+				.map_err(|e| anyhow!("Failed to reconstruct EIP-3009 digest: {e}"))?;
 
 		logging::debug_data("Computed digest", "EIP-3009", &hex::encode(digest));
 		Ok(digest)
@@ -487,7 +487,7 @@ impl SigningService {
 
 		// Use the existing reconstruction function
 		let digest = solver_types::utils::reconstruct_permit2_digest(payload)
-			.map_err(|e| anyhow!("Failed to reconstruct Permit2 digest: {}", e))?;
+			.map_err(|e| anyhow!("Failed to reconstruct Permit2 digest: {e}"))?;
 
 		logging::debug_data("Computed digest", "Permit2", &hex::encode(digest));
 		Ok(digest)
@@ -530,7 +530,7 @@ impl SigningService {
 			.and_then(|v| v.as_str())
 			.ok_or_else(|| anyhow!("Missing verifyingContract"))?
 			.parse::<Address>()
-			.map_err(|e| anyhow!("Invalid verifyingContract: {}", e))?;
+			.map_err(|e| anyhow!("Invalid verifyingContract: {e}"))?;
 
 		// Fetch domain separator from TheCompact contract
 		let domain_separator = self
@@ -550,7 +550,7 @@ impl SigningService {
 		// Use solver_types utility with contract domain separator
 		let digest =
 			solver_types::utils::reconstruct_compact_digest(payload, Some(domain_separator))
-				.map_err(|e| anyhow!("Failed to reconstruct Compact digest: {}", e))?;
+				.map_err(|e| anyhow!("Failed to reconstruct Compact digest: {e}"))?;
 
 		logging::debug_data("Computed digest", "Compact", &hex::encode(digest));
 		Ok(digest)
@@ -659,7 +659,7 @@ impl SigningService {
 	pub fn get_signer_address(private_key: &str) -> Result<Address> {
 		let wallet = private_key
 			.parse::<PrivateKeySigner>()
-			.map_err(|e| anyhow!("Failed to parse private key: {}", e))?;
+			.map_err(|e| anyhow!("Failed to parse private key: {e}"))?;
 		Ok(wallet.address())
 	}
 }

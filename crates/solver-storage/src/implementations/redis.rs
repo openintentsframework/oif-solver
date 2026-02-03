@@ -308,17 +308,15 @@ impl RedisStorage {
 
 		match error.kind() {
 			redis::ErrorKind::TypeError => StorageError::Backend(format!(
-				"Redis data type error in operation '{}': {}",
-				context, error
+				"Redis data type error in operation '{context}': {error}"
 			)),
 			redis::ErrorKind::AuthenticationFailed => {
 				StorageError::Backend("Redis authentication failed".to_string())
 			},
 			redis::ErrorKind::IoError => StorageError::Backend(format!(
-				"Redis connection error in operation '{}': {}",
-				context, error
+				"Redis connection error in operation '{context}': {error}"
 			)),
-			_ => StorageError::Backend(format!("Redis operation '{}' failed: {}", context, error)),
+			_ => StorageError::Backend(format!("Redis operation '{context}' failed: {error}")),
 		}
 	}
 
@@ -913,7 +911,7 @@ pub async fn initialize_redis_connection(
 	timeout_ms: u64,
 ) -> Result<Arc<ConnectionManager>, StorageError> {
 	let redis_client = redis::Client::open(redis_url).map_err(|e| {
-		StorageError::Configuration(format!("Failed to create Redis client: {}", e))
+		StorageError::Configuration(format!("Failed to create Redis client: {e}"))
 	})?;
 
 	let connection_manager = timeout(
@@ -921,8 +919,8 @@ pub async fn initialize_redis_connection(
 		ConnectionManager::new(redis_client),
 	)
 	.await
-	.map_err(|_| StorageError::Backend(format!("Redis connection timeout after {}ms", timeout_ms)))?
-	.map_err(|e| StorageError::Backend(format!("Failed to create connection manager: {}", e)))?;
+	.map_err(|_| StorageError::Backend(format!("Redis connection timeout after {timeout_ms}ms")))?
+	.map_err(|e| StorageError::Backend(format!("Failed to create connection manager: {e}")))?;
 
 	debug!(redis_url = %redis_url, "redis connection established");
 	Ok(Arc::new(connection_manager))
@@ -960,7 +958,7 @@ fn build_redis_url(redis_url: &str, db: u8) -> String {
 pub fn create_storage(config: &toml::Value) -> Result<Box<dyn StorageInterface>, StorageError> {
 	// Validate configuration first
 	RedisStorageSchema::validate_config(config)
-		.map_err(|e| StorageError::Configuration(format!("Invalid configuration: {}", e)))?;
+		.map_err(|e| StorageError::Configuration(format!("Invalid configuration: {e}")))?;
 
 	let redis_url = config
 		.get("redis_url")
@@ -1007,7 +1005,7 @@ pub async fn create_storage_async(
 ) -> Result<Box<dyn StorageInterface>, StorageError> {
 	// Validate configuration first
 	RedisStorageSchema::validate_config(config)
-		.map_err(|e| StorageError::Configuration(format!("Invalid configuration: {}", e)))?;
+		.map_err(|e| StorageError::Configuration(format!("Invalid configuration: {e}")))?;
 
 	let redis_url = config
 		.get("redis_url")
@@ -1185,7 +1183,7 @@ mod tests {
 		let ttl_config = TtlConfig::from_config(&config);
 
 		// Should not panic and should contain relevant info
-		let debug_str = format!("{:?}", ttl_config);
+		let debug_str = format!("{ttl_config:?}");
 		assert!(debug_str.contains("TtlConfig"));
 		assert!(debug_str.contains("ttls"));
 	}
@@ -1865,7 +1863,7 @@ mod tests {
 		)
 		.unwrap();
 
-		let debug_str = format!("{:?}", storage);
+		let debug_str = format!("{storage:?}");
 
 		assert!(debug_str.contains("RedisStorage"));
 		assert!(debug_str.contains("redis://localhost:6379"));

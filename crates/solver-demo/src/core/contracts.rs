@@ -116,15 +116,15 @@ impl Contracts {
 
 		let functions = abi
 			.function(method)
-			.ok_or_else(|| Error::InvalidAbi(format!("Function {} not found", method)))?;
+			.ok_or_else(|| Error::InvalidAbi(format!("Function {method} not found")))?;
 
 		let function = functions.first().ok_or_else(|| {
-			Error::InvalidAbi(format!("No implementation for function {}", method))
+			Error::InvalidAbi(format!("No implementation for function {method}"))
 		})?;
 
 		// Encode the call data
 		let data = function.abi_encode_input(&args).map_err(|e| {
-			Error::ContractCallFailed(format!("Failed to encode {}: {}", method, e))
+			Error::ContractCallFailed(format!("Failed to encode {method}: {e}"))
 		})?;
 
 		// Make the call
@@ -132,7 +132,7 @@ impl Contracts {
 
 		let result =
 			provider.inner().call(call).await.map_err(|e| {
-				Error::ContractCallFailed(format!("Call to {} failed: {}", method, e))
+				Error::ContractCallFailed(format!("Call to {method} failed: {e}"))
 			})?;
 
 		Ok(result)
@@ -203,7 +203,7 @@ impl Contracts {
 
 		let data = function
 			.abi_encode_input(&args)
-			.map_err(|e| Error::ContractCallFailed(format!("Failed to encode approve: {}", e)))?;
+			.map_err(|e| Error::ContractCallFailed(format!("Failed to encode approve: {e}")))?;
 
 		Ok(data.into())
 	}
@@ -241,7 +241,7 @@ impl Contracts {
 
 		let data = function
 			.abi_encode_input(&args)
-			.map_err(|e| Error::ContractCallFailed(format!("Failed to encode mint: {}", e)))?;
+			.map_err(|e| Error::ContractCallFailed(format!("Failed to encode mint: {e}")))?;
 
 		Ok(data.into())
 	}
@@ -273,15 +273,15 @@ impl Contracts {
 
 		let functions = abi
 			.function(method)
-			.ok_or_else(|| Error::InvalidAbi(format!("Function {} not found", method)))?;
+			.ok_or_else(|| Error::InvalidAbi(format!("Function {method} not found")))?;
 
 		let function = functions.first().ok_or_else(|| {
-			Error::InvalidAbi(format!("No implementation for function {}", method))
+			Error::InvalidAbi(format!("No implementation for function {method}"))
 		})?;
 
 		// Encode the call data
 		let data = function.abi_encode_input(&args).map_err(|e| {
-			Error::ContractCallFailed(format!("Failed to encode {}: {}", method, e))
+			Error::ContractCallFailed(format!("Failed to encode {method}: {e}"))
 		})?;
 
 		// Make the call
@@ -289,7 +289,7 @@ impl Contracts {
 
 		let result =
 			provider.inner().call(call).await.map_err(|e| {
-				Error::ContractCallFailed(format!("Call to {} failed: {}", method, e))
+				Error::ContractCallFailed(format!("Call to {method} failed: {e}"))
 			})?;
 
 		Ok(result)
@@ -341,7 +341,7 @@ impl Contracts {
 		];
 
 		let data = function.abi_encode_input(&args).map_err(|e| {
-			Error::ContractCallFailed(format!("Failed to encode depositERC20: {}", e))
+			Error::ContractCallFailed(format!("Failed to encode depositERC20: {e}"))
 		})?;
 
 		Ok(data.into())
@@ -379,7 +379,7 @@ impl Contracts {
 		let args = vec![DynSolValue::Address(allocator), DynSolValue::Bytes(proof)];
 
 		let data = function.abi_encode_input(&args).map_err(|e| {
-			Error::ContractCallFailed(format!("Failed to encode __registerAllocator: {}", e))
+			Error::ContractCallFailed(format!("Failed to encode __registerAllocator: {e}"))
 		})?;
 
 		Ok(data.into())
@@ -450,7 +450,7 @@ impl Contracts {
 
 		let symbol_bytes = &result[64..64 + length];
 		let symbol = String::from_utf8(symbol_bytes.to_vec())
-			.map_err(|e| Error::ContractCallFailed(format!("Invalid UTF-8 in symbol: {}", e)))?;
+			.map_err(|e| Error::ContractCallFailed(format!("Invalid UTF-8 in symbol: {e}")))?;
 
 		Ok(symbol)
 	}

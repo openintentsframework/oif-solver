@@ -60,7 +60,7 @@ impl Eip7683OrderImpl {
 			LockType::ResourceLock => {
 				// Decode to StandardOrder for Compact
 				let std_order = StandardOrder::abi_decode_validate(order_bytes).map_err(|e| {
-					OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
+					OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {e}"))
 				})?;
 
 				let call = IInputSettlerCompact::orderIdentifierCall { order: std_order };
@@ -69,7 +69,7 @@ impl Eip7683OrderImpl {
 			LockType::Permit2Escrow | LockType::Eip3009Escrow => {
 				// Decode to StandardOrder for Escrow contracts
 				let std_order = StandardOrder::abi_decode_validate(order_bytes).map_err(|e| {
-					OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
+					OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {e}"))
 				})?;
 
 				let call = IInputSettlerEscrow::orderIdentifierCall { order: std_order };
@@ -85,7 +85,7 @@ impl Eip7683OrderImpl {
 		lock_type: LockType,
 	) -> Result<Address, OrderError> {
 		let network = self.networks.get(&chain_id).ok_or_else(|| {
-			OrderError::InvalidOrder(format!("No network config for chain {}", chain_id))
+			OrderError::InvalidOrder(format!("No network config for chain {chain_id}"))
 		})?;
 
 		match lock_type {
@@ -95,8 +95,7 @@ impl Eip7683OrderImpl {
 					.clone()
 					.ok_or_else(|| {
 						OrderError::InvalidOrder(format!(
-							"No compact settler configured for chain {}",
-							chain_id
+							"No compact settler configured for chain {chain_id}"
 						))
 					})
 			},
@@ -129,11 +128,11 @@ impl Eip7683OrderImpl {
 	/// Decode raw order bytes into StandardOrder struct.
 	fn decode_standard_order(order_bytes: &str) -> Result<StandardOrder, OrderError> {
 		let bytes = hex::decode(order_bytes.trim_start_matches("0x"))
-			.map_err(|e| OrderError::ValidationFailed(format!("Invalid hex: {}", e)))?;
+			.map_err(|e| OrderError::ValidationFailed(format!("Invalid hex: {e}")))?;
 
 		// Decode using alloy's ABI decoder
 		StandardOrder::abi_decode_validate(&bytes).map_err(|e| {
-			OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
+			OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {e}"))
 		})
 	}
 }
@@ -218,7 +217,7 @@ impl OrderInterface for Eip7683OrderImpl {
 
 		let order_data: Eip7683OrderData =
 			serde_json::from_value(order.data.clone()).map_err(|e| {
-				OrderError::ValidationFailed(format!("Failed to parse order data: {}", e))
+				OrderError::ValidationFailed(format!("Failed to parse order data: {e}"))
 			})?;
 		// Skip prepare for Compact (resource lock) flows
 		if matches!(order_data.lock_type, Some(LockType::ResourceLock)) {
@@ -240,13 +239,13 @@ impl OrderInterface for Eip7683OrderImpl {
 		// The raw_order_data contains the encoded StandardOrder
 		// We just need to pass the order bytes, sponsor, and signature
 		let sponsor_address = hex_to_alloy_address(sponsor)
-			.map_err(|e| OrderError::ValidationFailed(format!("Invalid sponsor address: {}", e)))?;
+			.map_err(|e| OrderError::ValidationFailed(format!("Invalid sponsor address: {e}")))?;
 
 		// Decode the raw order bytes into StandardOrder struct
 		let order_struct = Self::decode_standard_order(raw_order_data)?;
 
 		let signature_bytes = hex::decode(signature.trim_start_matches("0x"))
-			.map_err(|e| OrderError::ValidationFailed(format!("Invalid signature: {}", e)))?;
+			.map_err(|e| OrderError::ValidationFailed(format!("Invalid signature: {e}")))?;
 
 		let open_for_data = IInputSettlerEscrow::openForCall {
 			order: order_struct,
@@ -301,7 +300,7 @@ impl OrderInterface for Eip7683OrderImpl {
 	) -> Result<Transaction, OrderError> {
 		let order_data: Eip7683OrderData =
 			serde_json::from_value(order.data.clone()).map_err(|e| {
-				OrderError::ValidationFailed(format!("Failed to parse order data: {}", e))
+				OrderError::ValidationFailed(format!("Failed to parse order data: {e}"))
 			})?;
 
 		// For multi-output orders, we need to handle each output separately
@@ -323,8 +322,7 @@ impl OrderInterface for Eip7683OrderImpl {
 			.find(|c| c.chain_id == dest_chain_id)
 			.ok_or_else(|| {
 				OrderError::ValidationFailed(format!(
-					"Chain ID {} not found in order output chains",
-					dest_chain_id
+					"Chain ID {dest_chain_id} not found in order output chains"
 				))
 			})?;
 		let output_settler_address = output_chain.settler_address.clone();
@@ -399,7 +397,7 @@ impl OrderInterface for Eip7683OrderImpl {
 	) -> Result<Transaction, OrderError> {
 		let order_data: Eip7683OrderData =
 			serde_json::from_value(order.data.clone()).map_err(|e| {
-				OrderError::ValidationFailed(format!("Failed to parse order data: {}", e))
+				OrderError::ValidationFailed(format!("Failed to parse order data: {e}"))
 			})?;
 
 		// Check if all outputs are on the origin chain (same-chain order)
@@ -415,11 +413,11 @@ impl OrderInterface for Eip7683OrderImpl {
 
 		// Parse addresses
 		let user_address = hex_to_alloy_address(&order_data.user)
-			.map_err(|e| OrderError::ValidationFailed(format!("Invalid user address: {}", e)))?;
+			.map_err(|e| OrderError::ValidationFailed(format!("Invalid user address: {e}")))?;
 
 		// Parse oracle address
 		let oracle_address = hex_to_alloy_address(&fill_proof.oracle_address)
-			.map_err(|e| OrderError::ValidationFailed(format!("Invalid oracle address: {}", e)))?;
+			.map_err(|e| OrderError::ValidationFailed(format!("Invalid oracle address: {e}")))?;
 
 		// Create inputs array from order data
 		let inputs: Vec<[U256; 2]> = order_data.inputs.clone();
@@ -455,8 +453,7 @@ impl OrderInterface for Eip7683OrderImpl {
 							.map(|c| &c.settler_address)
 							.ok_or_else(|| {
 								OrderError::ValidationFailed(format!(
-									"Chain ID {} not found in order output chains",
-									output_chain_id
+									"Chain ID {output_chain_id} not found in order output chains"
 								))
 							})?
 					};
@@ -515,7 +512,7 @@ impl OrderInterface for Eip7683OrderImpl {
 		let call_data = {
 			let parsed =
 				serde_json::from_value::<Eip7683OrderData>(order.data.clone()).map_err(|e| {
-					OrderError::ValidationFailed(format!("Failed to parse order data: {}", e))
+					OrderError::ValidationFailed(format!("Failed to parse order data: {e}"))
 				})?;
 			match parsed.lock_type {
 				Some(LockType::ResourceLock) => {
@@ -528,7 +525,7 @@ impl OrderInterface for Eip7683OrderImpl {
 					// Expect full signature payload already without any type prefix
 					let sig_str = sig_hex.trim_start_matches("0x");
 					let compact_sig_bytes = hex::decode(sig_str).map_err(|e| {
-						OrderError::ValidationFailed(format!("Invalid compact signatures: {}", e))
+						OrderError::ValidationFailed(format!("Invalid compact signatures: {e}"))
 					})?;
 
 					IInputSettlerCompact::finaliseCall {
@@ -573,7 +570,7 @@ impl OrderInterface for Eip7683OrderImpl {
 	async fn validate_order(&self, order_bytes: &Bytes) -> Result<StandardOrder, OrderError> {
 		// Decode using the StandardOrder from types module
 		let standard_order = StandardOrder::abi_decode_validate(order_bytes).map_err(|e| {
-			OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {}", e))
+			OrderError::ValidationFailed(format!("Failed to decode StandardOrder: {e}"))
 		})?;
 
 		let current_time = current_timestamp() as u32;
@@ -607,8 +604,7 @@ impl OrderInterface for Eip7683OrderImpl {
 			.get(&input_info)
 			.ok_or_else(|| {
 				OrderError::ValidationFailed(format!(
-					"Input oracle {:?} on chain {} is not supported",
-					input_oracle, origin_chain
+					"Input oracle {input_oracle:?} on chain {origin_chain} is not supported"
 				))
 			})?;
 
@@ -628,8 +624,7 @@ impl OrderInterface for Eip7683OrderImpl {
 			// First check if destination chain is supported at all
 			if !supported_destinations.contains(&dest_chain) {
 				return Err(OrderError::ValidationFailed(format!(
-					"Route from chain {} to chain {} is not supported (oracle {:?} has no route to destination)",
-					origin_chain, dest_chain, input_oracle
+					"Route from chain {origin_chain} to chain {dest_chain} is not supported (oracle {input_oracle:?} has no route to destination)"
 				)));
 			}
 
@@ -686,13 +681,13 @@ impl OrderInterface for Eip7683OrderImpl {
 		// Parse lock type
 		let lock_type = lock_type
 			.parse::<LockType>()
-			.map_err(|e| OrderError::ValidationFailed(format!("Invalid lock type: {}", e)))?;
+			.map_err(|e| OrderError::ValidationFailed(format!("Invalid lock type: {e}")))?;
 
 		// Get settler address and build calldata
 		let settler_address = self
 			.get_settler_address(origin_chain_id, lock_type)
 			.map_err(|e| {
-				OrderError::ValidationFailed(format!("Failed to get settler address: {}", e))
+				OrderError::ValidationFailed(format!("Failed to get settler address: {e}"))
 			})?;
 
 		let calldata = self.build_order_id_call(order_bytes, lock_type)?;
@@ -705,7 +700,7 @@ impl OrderInterface for Eip7683OrderImpl {
 		let order_id_bytes = order_id_callback(origin_chain_id, tx_data)
 			.await
 			.map_err(|e| {
-				OrderError::ValidationFailed(format!("Failed to compute order ID: {}", e))
+				OrderError::ValidationFailed(format!("Failed to compute order ID: {e}"))
 			})?;
 
 		// Ensure order ID is exactly 32 bytes
@@ -733,7 +728,7 @@ impl OrderInterface for Eip7683OrderImpl {
 		for output in &standard_order.outputs {
 			let output_chain_id = output.chainId.to::<u64>();
 			let output_network = self.networks.get(&output_chain_id).ok_or_else(|| {
-				OrderError::ValidationFailed(format!("Chain {} not configured", output_chain_id))
+				OrderError::ValidationFailed(format!("Chain {output_chain_id} not configured"))
 			})?;
 
 			output_chains.push(solver_types::order::ChainSettlerInfo {
@@ -777,7 +772,7 @@ impl OrderInterface for Eip7683OrderImpl {
 			updated_at: current_timestamp(),
 			status: OrderStatus::Pending,
 			data: serde_json::to_value(&order_data).map_err(|e| {
-				OrderError::ValidationFailed(format!("Failed to serialize order: {}", e))
+				OrderError::ValidationFailed(format!("Failed to serialize order: {e}"))
 			})?,
 			solver_address: solver_address.clone(),
 			quote_id,
@@ -822,7 +817,7 @@ pub fn create_order_impl(
 ) -> Result<Box<dyn OrderInterface>, OrderError> {
 	// Validate configuration first
 	Eip7683OrderSchema::validate_config(config)
-		.map_err(|e| OrderError::InvalidOrder(format!("Invalid configuration: {}", e)))?;
+		.map_err(|e| OrderError::InvalidOrder(format!("Invalid configuration: {e}")))?;
 
 	let order_impl = Eip7683OrderImpl::new(networks.clone(), oracle_routes.clone())?;
 	Ok(Box::new(order_impl))

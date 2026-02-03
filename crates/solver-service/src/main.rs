@@ -170,7 +170,7 @@ async fn load_config(
 		// Create OperatorConfig store for seeding (not legacy Config store)
 		let operator_store = create_config_store::<OperatorConfig>(
 			store_config.clone(),
-			format!("{}-operator", solver_id),
+			format!("{solver_id}-operator"),
 		)?;
 
 		// Check if OperatorConfig already exists
@@ -240,23 +240,21 @@ async fn load_config(
 	// First, try to load OperatorConfig (admin API may have modified it)
 	let operator_store = create_config_store::<OperatorConfig>(
 		store_config.clone(),
-		format!("{}-operator", solver_id),
+		format!("{solver_id}-operator"),
 	)?;
 
 	if !operator_store.exists().await? {
 		return Err(format!(
-			"OperatorConfig not found in storage for solver '{}'. \
-			Run with --seed <preset> to initialize configuration first.",
-			solver_id
+			"OperatorConfig not found in storage for solver '{solver_id}'. \
+			Run with --seed <preset> to initialize configuration first."
 		)
 		.into());
 	}
 
 	let versioned = operator_store.get().await.map_err(|e| {
 		format!(
-			"Failed to load OperatorConfig from storage: {}. \
-			Check storage connectivity or delete key '{}-operator' to re-seed.",
-			e, solver_id
+			"Failed to load OperatorConfig from storage: {e}. \
+			Check storage connectivity or delete key '{solver_id}-operator' to re-seed."
 		)
 	})?;
 
@@ -267,9 +265,8 @@ async fn load_config(
 
 	build_runtime_config(&versioned.data).map_err(|e| {
 		format!(
-			"OperatorConfig in storage is invalid: {}. \
-			Fix the config or delete key '{}-operator' to re-seed.",
-			e, solver_id
+			"OperatorConfig in storage is invalid: {e}. \
+			Fix the config or delete key '{solver_id}-operator' to re-seed."
 		)
 		.into()
 	})

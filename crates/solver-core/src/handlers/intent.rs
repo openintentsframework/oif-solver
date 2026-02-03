@@ -125,7 +125,7 @@ impl IntentHandler {
 			.exists(StorageKey::Intents.as_str(), &intent.id)
 			.await
 			.map_err(|e| {
-				IntentError::Storage(format!("Failed to check intent existence: {}", e))
+				IntentError::Storage(format!("Failed to check intent existence: {e}"))
 			})?;
 		if exists {
 			tracing::debug!("Duplicate intent detected in persistent storage, already processed");
@@ -143,7 +143,7 @@ impl IntentHandler {
 			)
 			.await
 			.map_err(|e| {
-				IntentError::Storage(format!("Failed to store intent for deduplication: {}", e))
+				IntentError::Storage(format!("Failed to store intent for deduplication: {e}"))
 			})?;
 
 		tracing::info!("Discovered intent");
@@ -160,7 +160,7 @@ impl IntentHandler {
 				Box::pin(async move {
 					// Return the intent ID as bytes (it's already a hex string)
 					alloy_primitives::hex::decode(&id)
-						.map_err(|e| format!("Failed to decode intent ID: {}", e))
+						.map_err(|e| format!("Failed to decode intent ID: {e}"))
 				})
 			});
 
@@ -220,7 +220,7 @@ impl IntentHandler {
 								self.event_bus
 									.publish(SolverEvent::Order(OrderEvent::Skipped {
 										order_id: order.id.clone(),
-										reason: format!("Callback simulation failed: {}", e),
+										reason: format!("Callback simulation failed: {e}"),
 									}))
 									.ok();
 								return Ok(());
@@ -233,7 +233,7 @@ impl IntentHandler {
 						self.event_bus
 							.publish(SolverEvent::Order(OrderEvent::Skipped {
 								order_id: order.id.clone(),
-								reason: format!("Fill transaction generation failed: {}", e),
+								reason: format!("Fill transaction generation failed: {e}"),
 							}))
 							.ok();
 						return Ok(());
@@ -250,8 +250,7 @@ impl IntentHandler {
 					Err(e) => {
 						tracing::warn!("Failed to calculate cost estimate: {}", e);
 						return Err(IntentError::Service(format!(
-							"Cost estimation failed: {}",
-							e
+							"Cost estimation failed: {e}"
 						)));
 					},
 				};
@@ -276,7 +275,7 @@ impl IntentHandler {
 						self.event_bus
 							.publish(SolverEvent::Order(OrderEvent::Skipped {
 								order_id: order.id.clone(),
-								reason: format!("Insufficient profitability: {}", e),
+								reason: format!("Insufficient profitability: {e}"),
 							}))
 							.ok();
 						return Ok(());

@@ -124,7 +124,7 @@ mod tests {
 		let address = signer.address();
 		// Anvil account #0 address (lowercase)
 		assert_eq!(
-			format!("{:?}", address).to_lowercase(),
+			format!("{address:?}").to_lowercase(),
 			"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
 		);
 	}
@@ -174,7 +174,7 @@ mod tests {
 		let signer = create_test_signer();
 		let address = <AccountSigner as TxSigner<Signature>>::address(&signer);
 		assert_eq!(
-			format!("{:?}", address).to_lowercase(),
+			format!("{address:?}").to_lowercase(),
 			"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
 		);
 	}
@@ -182,7 +182,7 @@ mod tests {
 	#[test]
 	fn test_account_signer_debug() {
 		let signer = create_test_signer();
-		let debug_str = format!("{:?}", signer);
+		let debug_str = format!("{signer:?}");
 		assert!(debug_str.contains("AccountSigner::Local"));
 	}
 }

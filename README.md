@@ -420,12 +420,6 @@ aws kms get-public-key --key-id "your-key-id" --output text --query 'PublicKey' 
 
 Or use a simpler approach - run the solver once and it will display the address in the logs.
 
-#### Performance Considerations
-
-- **Latency**: KMS adds ~50-200ms per signing operation (public key is cached)
-- **Rate Limits**: AWS KMS supports ~5,500 cryptographic requests/second
-- **Cost**: See [AWS KMS pricing](https://aws.amazon.com/kms/pricing/)
-
 #### LocalStack Testing
 
 For local development, you can test KMS integration with LocalStack:

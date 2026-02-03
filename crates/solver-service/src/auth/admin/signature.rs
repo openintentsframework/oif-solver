@@ -56,10 +56,10 @@ pub fn recover_from_hash(hash: &[u8; 32], signature: &[u8]) -> Result<Address, A
 	}
 
 	let sig = Signature::try_from(signature)
-		.map_err(|e| AdminAuthError::InvalidSignature(format!("Invalid signature: {}", e)))?;
+		.map_err(|e| AdminAuthError::InvalidSignature(format!("Invalid signature: {e}")))?;
 
 	sig.recover_address_from_prehash(&B256::from(*hash))
-		.map_err(|e| AdminAuthError::SignatureVerification(format!("Recovery failed: {}", e)))
+		.map_err(|e| AdminAuthError::SignatureVerification(format!("Recovery failed: {e}")))
 }
 
 /// Verify a signature and check if the signer is an admin.
@@ -86,7 +86,7 @@ pub fn verify_admin_signature(
 
 	// Check if signer is an admin
 	if !config.is_admin(&address) {
-		return Err(AdminAuthError::NotAuthorized(format!("{:?}", address)));
+		return Err(AdminAuthError::NotAuthorized(format!("{address:?}")));
 	}
 
 	Ok(address)

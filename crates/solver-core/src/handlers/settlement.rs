@@ -113,7 +113,7 @@ impl SettlementHandler {
 			.delivery
 			.get_receipt(&fill_tx_hash, chain_id)
 			.await
-			.map_err(|e| SettlementError::Service(format!("Failed to get fill receipt: {}", e)))?;
+			.map_err(|e| SettlementError::Service(format!("Failed to get fill receipt: {e}")))?;
 
 		// Generate post-fill transaction
 		let post_fill_tx = self

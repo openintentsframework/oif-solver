@@ -184,13 +184,13 @@ mod tests {
 	#[test]
 	fn test_account_error_display() {
 		let err = AccountError::SigningFailed("test error".to_string());
-		assert_eq!(format!("{}", err), "Signing failed: test error");
+		assert_eq!(format!("{err}"), "Signing failed: test error");
 
 		let err = AccountError::InvalidKey("bad key".to_string());
-		assert_eq!(format!("{}", err), "Invalid key: bad key");
+		assert_eq!(format!("{err}"), "Invalid key: bad key");
 
 		let err = AccountError::Implementation("impl error".to_string());
-		assert_eq!(format!("{}", err), "Implementation error: impl error");
+		assert_eq!(format!("{err}"), "Implementation error: impl error");
 	}
 
 	#[test]

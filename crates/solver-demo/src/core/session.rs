@@ -156,7 +156,7 @@ impl SessionStore {
 		let session = self
 			.session
 			.read()
-			.map_err(|e| Error::StorageError(format!("Failed to acquire read lock: {}", e)))?;
+			.map_err(|e| Error::StorageError(format!("Failed to acquire read lock: {e}")))?;
 		self.storage.save("session", &*session)
 	}
 
@@ -185,7 +185,7 @@ impl SessionStore {
 		let mut session = self
 			.session
 			.write()
-			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {}", e)))?;
+			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {e}")))?;
 		session.environment = env;
 		drop(session);
 		self.save()
@@ -216,7 +216,7 @@ impl SessionStore {
 		let mut session = self
 			.session
 			.write()
-			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {}", e)))?;
+			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {e}")))?;
 		session.chains = chains;
 		drop(session);
 		self.save()
@@ -236,7 +236,7 @@ impl SessionStore {
 		let mut session = self
 			.session
 			.write()
-			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {}", e)))?;
+			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {e}")))?;
 		session.config_path = path;
 		drop(session);
 		self.save()
@@ -261,7 +261,7 @@ impl SessionStore {
 		let mut session = self
 			.session
 			.write()
-			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {}", e)))?;
+			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {e}")))?;
 		session.placeholder_map = placeholder_map;
 		drop(session);
 		self.save()
@@ -297,7 +297,7 @@ impl SessionStore {
 		let mut session = self
 			.session
 			.write()
-			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {}", e)))?;
+			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {e}")))?;
 		session
 			.jwt_tokens
 			.insert(key, JwtToken::new(token, expires_at));
@@ -339,7 +339,7 @@ impl SessionStore {
 		let mut session = self
 			.session
 			.write()
-			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {}", e)))?;
+			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {e}")))?;
 		session
 			.deployed_contracts
 			.insert(chain.id().to_string(), contracts);
@@ -357,18 +357,18 @@ impl SessionStore {
 			let mut session = self
 				.session
 				.write()
-				.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {}", e)))?;
+				.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {e}")))?;
 
 			// Convert ContractAddresses to ContractSet
 			let contract_set = ContractSet {
-				input_settler: addresses.input_settler.map(|a| format!("{:?}", a)),
-				input_settler_compact: addresses.input_settler_compact.map(|a| format!("{:?}", a)),
-				output_settler: addresses.output_settler.map(|a| format!("{:?}", a)),
-				permit2: addresses.permit2.map(|a| format!("{:?}", a)),
-				compact: addresses.the_compact.map(|a| format!("{:?}", a)),
-				allocator: addresses.allocator.map(|a| format!("{:?}", a)),
-				input_oracle: addresses.input_oracle.map(|a| format!("{:?}", a)),
-				output_oracle: addresses.output_oracle.map(|a| format!("{:?}", a)),
+				input_settler: addresses.input_settler.map(|a| format!("{a:?}")),
+				input_settler_compact: addresses.input_settler_compact.map(|a| format!("{a:?}")),
+				output_settler: addresses.output_settler.map(|a| format!("{a:?}")),
+				permit2: addresses.permit2.map(|a| format!("{a:?}")),
+				compact: addresses.the_compact.map(|a| format!("{a:?}")),
+				allocator: addresses.allocator.map(|a| format!("{a:?}")),
+				input_oracle: addresses.input_oracle.map(|a| format!("{a:?}")),
+				output_oracle: addresses.output_oracle.map(|a| format!("{a:?}")),
 				tokens: addresses
 					.tokens
 					.into_iter()
@@ -418,7 +418,7 @@ impl SessionStore {
 		let mut session = self
 			.session
 			.write()
-			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {}", e)))?;
+			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {e}")))?;
 
 		// Get or create contract set for this chain
 		let chain_key = chain.id().to_string();
@@ -429,7 +429,7 @@ impl SessionStore {
 			.unwrap_or_default();
 
 		// Update the specific contract based on name
-		let address_str = format!("{:?}", address);
+		let address_str = format!("{address:?}");
 		match contract_name {
 			"InputSettlerEscrow" => contract_set.input_settler = Some(address_str),
 			"InputSettlerCompact" => contract_set.input_settler_compact = Some(address_str),
@@ -452,8 +452,7 @@ impl SessionStore {
 			},
 			_ => {
 				return Err(Error::InvalidConfig(format!(
-					"Unknown contract name: {}",
-					contract_name
+					"Unknown contract name: {contract_name}"
 				)));
 			},
 		}
@@ -490,7 +489,7 @@ impl SessionStore {
 		let mut session = self
 			.session
 			.write()
-			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {}", e)))?;
+			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {e}")))?;
 
 		// Get or create contract set for this chain
 		let chain_key = chain.id().to_string();
@@ -501,7 +500,7 @@ impl SessionStore {
 			.unwrap_or_default();
 
 		// Store with the actual symbol
-		let address_str = format!("{:?}", address);
+		let address_str = format!("{address:?}");
 		contract_set.tokens.insert(symbol, {
 			SessionTokenInfo {
 				address: address_str,
@@ -566,7 +565,7 @@ impl SessionStore {
 		let mut session = self
 			.session
 			.write()
-			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {}", e)))?;
+			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {e}")))?;
 		let config_path = session.config_path.clone();
 		let config_sections = build_config_sections_mapping(&config_path);
 		let placeholder_map = HashMap::new(); // Clear the placeholder map
@@ -600,7 +599,7 @@ impl SessionStore {
 		let mut session = self
 			.session
 			.write()
-			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {}", e)))?;
+			.map_err(|e| Error::StorageError(format!("Failed to acquire write lock: {e}")))?;
 		let result = f(&mut session)?;
 		drop(session);
 		self.save()?;

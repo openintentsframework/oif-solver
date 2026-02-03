@@ -177,10 +177,10 @@ impl CostProfitService {
 
 					for (input, input_amount) in known_inputs {
 						let input_chain_id = input.asset.ethereum_chain_id().map_err(|e| {
-							CostProfitError::Calculation(format!("Invalid input chain: {}", e))
+							CostProfitError::Calculation(format!("Invalid input chain: {e}"))
 						})?;
 						let input_addr = input.asset.ethereum_address().map_err(|e| {
-							CostProfitError::Calculation(format!("Invalid input address: {}", e))
+							CostProfitError::Calculation(format!("Invalid input address: {e}"))
 						})?;
 						let input_token = self
 							.token_manager
@@ -250,10 +250,10 @@ impl CostProfitService {
 
 					for (output, output_amount) in known_outputs {
 						let output_chain_id = output.asset.ethereum_chain_id().map_err(|e| {
-							CostProfitError::Calculation(format!("Invalid output chain: {}", e))
+							CostProfitError::Calculation(format!("Invalid output chain: {e}"))
 						})?;
 						let output_addr = output.asset.ethereum_address().map_err(|e| {
-							CostProfitError::Calculation(format!("Invalid output address: {}", e))
+							CostProfitError::Calculation(format!("Invalid output address: {e}"))
 						})?;
 						let output_token = self
 							.token_manager
@@ -693,7 +693,7 @@ impl CostProfitService {
 		// Parse the order data based on its standard
 		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::InvalidRequest,
-			message: format!("Failed to parse order data: {}", e),
+			message: format!("Failed to parse order data: {e}"),
 			details: None,
 		})?;
 
@@ -791,7 +791,7 @@ impl CostProfitService {
 		// Parse the order to get actual input/output amounts
 		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::InvalidRequest,
-			message: format!("Failed to parse order data: {}", e),
+			message: format!("Failed to parse order data: {e}"),
 			details: None,
 		})?;
 
@@ -804,7 +804,7 @@ impl CostProfitService {
 			.await
 			.map_err(|e| APIError::InternalServerError {
 				error_type: ApiErrorType::InternalError,
-				message: format!("Failed to calculate input USD value: {}", e),
+				message: format!("Failed to calculate input USD value: {e}"),
 			})?;
 
 		let total_output_value_usd = self
@@ -812,7 +812,7 @@ impl CostProfitService {
 			.await
 			.map_err(|e| APIError::InternalServerError {
 				error_type: ApiErrorType::InternalError,
-				message: format!("Failed to calculate output USD value: {}", e),
+				message: format!("Failed to calculate output USD value: {e}"),
 			})?;
 
 		// Operational cost is already available in the breakdown
@@ -968,8 +968,7 @@ impl CostProfitService {
 		// Check if actual profit meets minimum requirement
 		if !profit_validation_passed {
 			let error_msg = format!(
-				"Insufficient profit margin: {:.2}% < required {:.2}%",
-				actual_profit_margin, min_profitability_pct
+				"Insufficient profit margin: {actual_profit_margin:.2}% < required {min_profitability_pct:.2}%"
 			);
 			return Err(APIError::UnprocessableEntity {
 				error_type: ApiErrorType::InsufficientProfitability,
@@ -1080,7 +1079,7 @@ impl CostProfitService {
 		// Parse the order to get the destination chain ID
 		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::InvalidRequest,
-			message: format!("Failed to parse order data for fill tx: {}", e),
+			message: format!("Failed to parse order data for fill tx: {e}"),
 			details: None,
 		})?;
 		let dest_chain_ids = order_parsed.destination_chain_ids();
@@ -1115,7 +1114,7 @@ impl CostProfitService {
 		// Parse the order to get the origin chain ID
 		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::InvalidRequest,
-			message: format!("Failed to parse order data for claim tx: {}", e),
+			message: format!("Failed to parse order data for claim tx: {e}"),
 			details: None,
 		})?;
 		let chain_id = order_parsed.origin_chain_id();
@@ -1141,7 +1140,7 @@ impl CostProfitService {
 			.await
 			.map_err(|e| APIError::InternalServerError {
 				error_type: ApiErrorType::ServiceError,
-				message: format!("Failed to get chain data: {}", e),
+				message: format!("Failed to get chain data: {e}"),
 			})?;
 
 		match U256::from_str_radix(&chain_data.gas_price, 10) {
@@ -1175,7 +1174,7 @@ impl CostProfitService {
 
 		// Parse order to check for callbacks
 		let order_data = order.parse_order_data().map_err(|e| {
-			CostProfitError::Calculation(format!("Failed to parse order data: {}", e))
+			CostProfitError::Calculation(format!("Failed to parse order data: {e}"))
 		})?;
 
 		let outputs = order_data.parse_requested_outputs();
@@ -1224,7 +1223,7 @@ impl CostProfitService {
 		let recipient_interop_hex = output.receiver.to_hex().to_lowercase();
 
 		let output_chain_id = output.receiver.ethereum_chain_id().map_err(|e| {
-			CostProfitError::Config(format!("Failed to extract chain ID from recipient: {}", e))
+			CostProfitError::Config(format!("Failed to extract chain ID from recipient: {e}"))
 		})?;
 
 		let recipient_eth_address = output
@@ -1249,8 +1248,7 @@ impl CostProfitService {
 				recipient_interop_hex
 			);
 			return Err(CostProfitError::Config(format!(
-				"Callback recipient {} on chain {} not in whitelist. Add '{}' to order.callback_whitelist in config (EIP-7930 format)",
-				recipient_eth_address, output_chain_id, recipient_interop_hex
+				"Callback recipient {recipient_eth_address} on chain {output_chain_id} not in whitelist. Add '{recipient_interop_hex}' to order.callback_whitelist in config (EIP-7930 format)"
 			)));
 		}
 
@@ -1310,8 +1308,7 @@ impl CostProfitService {
 					|| error_msg.contains("insufficient funds")
 				{
 					Err(CostProfitError::Calculation(format!(
-						"Fill transaction simulation failed (callback would revert): {}",
-						error_msg
+						"Fill transaction simulation failed (callback would revert): {error_msg}"
 					)))
 				} else {
 					// For other errors (network issues, etc.), we might want to retry or use fallback
@@ -1341,8 +1338,7 @@ impl CostProfitService {
 		// Handle potential overflow for large decimals
 		if token_decimals > 28 {
 			return Err(format!(
-				"Token decimals {} exceeds maximum supported precision",
-				token_decimals
+				"Token decimals {token_decimals} exceeds maximum supported precision"
 			)
 			.into());
 		}
@@ -1350,7 +1346,7 @@ impl CostProfitService {
 		// Convert U256 to Decimal
 		let raw_amount_str = raw_amount.to_string();
 		let raw_amount_decimal = Decimal::from_str(&raw_amount_str)
-			.map_err(|e| format!("Failed to parse raw amount {}: {}", raw_amount_str, e))?;
+			.map_err(|e| format!("Failed to parse raw amount {raw_amount_str}: {e}"))?;
 
 		// Normalize amount by token decimals
 		let normalized_amount = match token_decimals {
@@ -1365,10 +1361,10 @@ impl CostProfitService {
 		let usd_amount_str = pricing_service
 			.convert_asset(token_symbol, "USD", &normalized_amount.to_string())
 			.await
-			.map_err(|e| format!("Failed to convert {} to USD: {}", token_symbol, e))?;
+			.map_err(|e| format!("Failed to convert {token_symbol} to USD: {e}"))?;
 
 		Decimal::from_str(&usd_amount_str)
-			.map_err(|e| format!("Failed to parse USD amount {}: {}", usd_amount_str, e).into())
+			.map_err(|e| format!("Failed to parse USD amount {usd_amount_str}: {e}").into())
 	}
 
 	/// Helper to calculate total USD value for a list of inputs
@@ -1380,10 +1376,10 @@ impl CostProfitService {
 
 		for input in inputs {
 			let chain_id = input.asset.ethereum_chain_id().map_err(|e| {
-				CostProfitError::Calculation(format!("Failed to get chain ID: {}", e))
+				CostProfitError::Calculation(format!("Failed to get chain ID: {e}"))
 			})?;
 			let ethereum_addr = input.asset.ethereum_address().map_err(|e| {
-				CostProfitError::Calculation(format!("Failed to get address: {}", e))
+				CostProfitError::Calculation(format!("Failed to get address: {e}"))
 			})?;
 			let token_address = Address(ethereum_addr.0.to_vec());
 
@@ -1415,10 +1411,10 @@ impl CostProfitService {
 
 		for output in outputs {
 			let chain_id = output.asset.ethereum_chain_id().map_err(|e| {
-				CostProfitError::Calculation(format!("Failed to get chain ID: {}", e))
+				CostProfitError::Calculation(format!("Failed to get chain ID: {e}"))
 			})?;
 			let ethereum_addr = output.asset.ethereum_address().map_err(|e| {
-				CostProfitError::Calculation(format!("Failed to get address: {}", e))
+				CostProfitError::Calculation(format!("Failed to get address: {e}"))
 			})?;
 			let token_address = Address(ethereum_addr.0.to_vec());
 
@@ -1450,9 +1446,9 @@ impl CostProfitService {
 		// Get token info
 		let chain_id = asset
 			.ethereum_chain_id()
-			.map_err(|e| CostProfitError::Calculation(format!("Failed to get chain ID: {}", e)))?;
+			.map_err(|e| CostProfitError::Calculation(format!("Failed to get chain ID: {e}")))?;
 		let ethereum_addr = asset.ethereum_address().map_err(|e| {
-			CostProfitError::Calculation(format!("Failed to get ethereum address: {}", e))
+			CostProfitError::Calculation(format!("Failed to get ethereum address: {e}"))
 		})?;
 		let token_address = Address(ethereum_addr.0.to_vec());
 
@@ -1473,7 +1469,7 @@ impl CostProfitService {
 			})?;
 
 		let token_amount_decimal = Decimal::from_str(&token_amount_str).map_err(|e| {
-			CostProfitError::Calculation(format!("Failed to parse token amount: {}", e))
+			CostProfitError::Calculation(format!("Failed to parse token amount: {e}"))
 		})?;
 
 		// Convert to smallest unit (apply decimals), rounding up to ensure we collect enough
@@ -1486,7 +1482,7 @@ impl CostProfitService {
 
 		// Convert to U256
 		let result = U256::from_str(&token_amount_ceiled.to_string()).map_err(|e| {
-			CostProfitError::Calculation(format!("Failed to convert ceiled amount to U256: {}", e))
+			CostProfitError::Calculation(format!("Failed to convert ceiled amount to U256: {e}"))
 		})?;
 
 		Ok(result)
@@ -1855,7 +1851,7 @@ mod tests {
 			CostProfitError::Storage(_) => {
 				// Expected error type
 			},
-			other => panic!("Expected Storage error, got: {:?}", other),
+			other => panic!("Expected Storage error, got: {other:?}"),
 		}
 	}
 
@@ -2417,7 +2413,7 @@ mod tests {
 				assert!(actual_margin >= min_profitability_pct);
 			},
 			Err(e) => {
-				panic!("Expected success but got error: {:?}", e);
+				panic!("Expected success but got error: {e:?}");
 			},
 		}
 	}
@@ -2453,7 +2449,7 @@ mod tests {
 				assert_eq!(error_type, ApiErrorType::InsufficientProfitability);
 				assert!(message.contains("Insufficient profit margin"));
 			},
-			other => panic!("Expected UnprocessableEntity error, got: {:?}", other),
+			other => panic!("Expected UnprocessableEntity error, got: {other:?}"),
 		}
 	}
 
@@ -2697,7 +2693,7 @@ mod tests {
 				assert_eq!(error_type, ApiErrorType::InvalidRequest);
 				assert!(message.contains("zero transaction value"));
 			},
-			other => panic!("Expected BadRequest error, got: {:?}", other),
+			other => panic!("Expected BadRequest error, got: {other:?}"),
 		}
 	}
 
@@ -2741,7 +2737,7 @@ mod tests {
 				assert_eq!(error_type, ApiErrorType::InvalidRequest);
 				assert!(message.contains("Failed to parse order data"));
 			},
-			other => panic!("Expected BadRequest error, got: {:?}", other),
+			other => panic!("Expected BadRequest error, got: {other:?}"),
 		}
 	}
 
@@ -2794,7 +2790,7 @@ mod tests {
 				assert_eq!(error_type, ApiErrorType::InternalError);
 				assert!(message.contains("Failed to calculate"));
 			},
-			other => panic!("Expected InternalServerError error, got: {:?}", other),
+			other => panic!("Expected InternalServerError error, got: {other:?}"),
 		}
 	}
 
@@ -3211,7 +3207,7 @@ mod tests {
 			CostProfitError::Config(msg) => {
 				assert!(msg.contains("not in whitelist"));
 			},
-			other => panic!("Expected Config error, got: {:?}", other),
+			other => panic!("Expected Config error, got: {other:?}"),
 		}
 	}
 
@@ -3251,7 +3247,7 @@ mod tests {
 				assert!(msg.contains("Multiple outputs"));
 				assert!(msg.contains("not supported"));
 			},
-			other => panic!("Expected Calculation error, got: {:?}", other),
+			other => panic!("Expected Calculation error, got: {other:?}"),
 		}
 	}
 
@@ -3307,7 +3303,7 @@ mod tests {
 			CostProfitError::Calculation(msg) => {
 				assert!(msg.contains("callback would revert"));
 			},
-			other => panic!("Expected Calculation error, got: {:?}", other),
+			other => panic!("Expected Calculation error, got: {other:?}"),
 		}
 	}
 
@@ -3352,7 +3348,7 @@ mod tests {
 				assert!(msg.contains("callback simulation is disabled"));
 				assert!(msg.contains("not supported"));
 			},
-			other => panic!("Expected Config error, got: {:?}", other),
+			other => panic!("Expected Config error, got: {other:?}"),
 		}
 	}
 }

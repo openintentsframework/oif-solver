@@ -102,7 +102,7 @@ async fn validate_wallet_balance_for_order(
 		.await
 		.map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
-			message: format!("Failed to fetch user balance: {}", e),
+			message: format!("Failed to fetch user balance: {e}"),
 			details: None,
 		})?;
 
@@ -110,13 +110,13 @@ async fn validate_wallet_balance_for_order(
 	let balance = if let Some(hex_str) = balance_str.strip_prefix("0x") {
 		U256::from_str_radix(hex_str, 16).map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
-			message: format!("Failed to parse user balance '{}': {}", balance_str, e),
+			message: format!("Failed to parse user balance '{balance_str}': {e}"),
 			details: None,
 		})?
 	} else {
 		U256::from_str_radix(&balance_str, 10).map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
-			message: format!("Failed to parse user balance '{}': {}", balance_str, e),
+			message: format!("Failed to parse user balance '{balance_str}': {e}"),
 			details: None,
 		})?
 	};
@@ -125,12 +125,7 @@ async fn validate_wallet_balance_for_order(
 		return Err(APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
 			message: format!(
-				"User {:#x} has insufficient balance for token {:#x} on chain {} (required {}, available {})",
-				user,
-				token,
-				chain_id,
-				required_amount,
-				balance,
+				"User {user:#x} has insufficient balance for token {token:#x} on chain {chain_id} (required {required_amount}, available {balance})",
 			),
 			details: None,
 		});
@@ -152,7 +147,7 @@ async fn validate_compact_deposit_for_order(
 		.get(&chain_id)
 		.ok_or_else(|| APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
-			message: format!("Network {} not configured for solver", chain_id),
+			message: format!("Network {chain_id} not configured for solver"),
 			details: None,
 		})?;
 
@@ -162,7 +157,7 @@ async fn validate_compact_deposit_for_order(
 			.as_ref()
 			.ok_or_else(|| APIError::BadRequest {
 				error_type: ApiErrorType::OrderValidationFailed,
-				message: format!("TheCompact address not configured for chain {}", chain_id),
+				message: format!("TheCompact address not configured for chain {chain_id}"),
 				details: None,
 			})?;
 
@@ -190,7 +185,7 @@ async fn validate_compact_deposit_for_order(
 		.await
 		.map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
-			message: format!("Failed to query TheCompact deposit: {}", e),
+			message: format!("Failed to query TheCompact deposit: {e}"),
 			details: None,
 		})?;
 
@@ -213,11 +208,7 @@ async fn validate_compact_deposit_for_order(
 		return Err(APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
 			message: format!(
-				"Compact deposit for user {:#x} is insufficient on chain {} (required {}, available {})",
-				user,
-				chain_id,
-				required_amount,
-				balance,
+				"Compact deposit for user {user:#x} is insufficient on chain {chain_id} (required {required_amount}, available {balance})",
 			),
 			details: None,
 		});

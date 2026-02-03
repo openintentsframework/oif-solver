@@ -56,13 +56,12 @@ async fn process_order_request(
 		Err(solver_storage::StorageError::NotFound(key)) => {
 			// Order not found in storage
 			Err(GetOrderError::NotFound(format!(
-				"Order {} with key {} not found",
-				order_id, key
+				"Order {order_id} with key {key} not found"
 			)))
 		},
 		Err(e) => {
 			// Other storage error
-			Err(GetOrderError::Internal(format!("Storage error: {}", e)))
+			Err(GetOrderError::Internal(format!("Storage error: {e}")))
 		},
 	}
 }
@@ -112,31 +111,29 @@ async fn convert_eip7683_order_to_response(
 	for (idx, input) in inputs_array.iter().enumerate() {
 		let input_array = input.as_array().ok_or_else(|| {
 			GetOrderError::Internal(format!(
-				"Invalid input format at index {} - expected [token, amount] array",
-				idx
+				"Invalid input format at index {idx} - expected [token, amount] array"
 			))
 		})?;
 
 		if input_array.len() != 2 {
 			return Err(GetOrderError::Internal(format!(
-				"Invalid input format at index {} - expected [token, amount]",
-				idx
+				"Invalid input format at index {idx} - expected [token, amount]"
 			)));
 		}
 
 		let input_token = input_array[0].as_str().ok_or_else(|| {
-			GetOrderError::Internal(format!("Invalid input token format at index {}", idx))
+			GetOrderError::Internal(format!("Invalid input token format at index {idx}"))
 		})?;
 
 		let input_amount_str = input_array[1].as_str().ok_or_else(|| {
-			GetOrderError::Internal(format!("Invalid input amount format at index {}", idx))
+			GetOrderError::Internal(format!("Invalid input amount format at index {idx}"))
 		})?;
 
 		let input_amount_u256 =
 			input_amount_str
 				.parse::<alloy_primitives::U256>()
 				.map_err(|e| {
-					GetOrderError::Internal(format!("Invalid input amount at index {}: {}", idx, e))
+					GetOrderError::Internal(format!("Invalid input amount at index {idx}: {e}"))
 				})?;
 
 		// Get the chain ID for this input (use corresponding chain if available, otherwise first)
@@ -150,8 +147,7 @@ async fn convert_eip7683_order_to_response(
 		// Convert input token to InteropAddress format
 		let address = parse_address(input_token).map_err(|e| {
 			GetOrderError::Internal(format!(
-				"Invalid input token address at index {}: {}",
-				idx, e
+				"Invalid input token address at index {idx}: {e}"
 			))
 		})?;
 		let interop_address: InteropAddress = (input_chain_id, address).into();
@@ -175,14 +171,13 @@ async fn convert_eip7683_order_to_response(
 
 	for (idx, output) in outputs_array.iter().enumerate() {
 		let output_token_bytes = output.get("token").ok_or_else(|| {
-			GetOrderError::Internal(format!("Missing token field in output at index {}", idx))
+			GetOrderError::Internal(format!("Missing token field in output at index {idx}"))
 		})?;
 
 		// Convert token bytes array to address
 		let token_array = output_token_bytes.as_array().ok_or_else(|| {
 			GetOrderError::Internal(format!(
-				"Invalid token format at index {} - expected bytes array",
-				idx
+				"Invalid token format at index {idx} - expected bytes array"
 			))
 		})?;
 
@@ -198,15 +193,14 @@ async fn convert_eip7683_order_to_response(
 			.and_then(|v| v.as_str())
 			.ok_or_else(|| {
 				GetOrderError::Internal(format!(
-					"Missing or invalid amount field in output at index {}",
-					idx
+					"Missing or invalid amount field in output at index {idx}"
 				))
 			})?;
 
 		let output_amount_u256 = output_amount_str
 			.parse::<alloy_primitives::U256>()
 			.map_err(|e| {
-				GetOrderError::Internal(format!("Invalid output amount at index {}: {}", idx, e))
+				GetOrderError::Internal(format!("Invalid output amount at index {idx}: {e}"))
 			})?;
 
 		// Get the chain ID for this output (use corresponding chain if available, otherwise first)
@@ -220,8 +214,7 @@ async fn convert_eip7683_order_to_response(
 		// Convert output token to InteropAddress format
 		let address = parse_address(&output_token_address).map_err(|e| {
 			GetOrderError::Internal(format!(
-				"Invalid output token address at index {}: {}",
-				idx, e
+				"Invalid output token address at index {idx}: {e}"
 			))
 		})?;
 		let interop_address: InteropAddress = (output_chain_id, address).into();
@@ -478,7 +471,7 @@ mod tests {
 		let res = process_order_request("missing", &solver).await;
 		match res {
 			Err(GetOrderError::NotFound(msg)) => assert!(msg.contains("missing")),
-			other => panic!("expected NotFound, got {:?}", other),
+			other => panic!("expected NotFound, got {other:?}"),
 		}
 	}
 
@@ -656,7 +649,7 @@ mod tests {
 				assert!(msg.contains("Storage error"));
 				assert!(msg.contains("Database connection failed"));
 			},
-			other => panic!("Expected Internal error, got {:?}", other),
+			other => panic!("Expected Internal error, got {other:?}"),
 		}
 	}
 

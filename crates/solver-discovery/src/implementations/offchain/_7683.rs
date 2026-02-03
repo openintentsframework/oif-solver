@@ -203,7 +203,7 @@ where
 
 	let mut bytes = [0u8; 32];
 	hex::decode_to_slice(s, &mut bytes)
-		.map_err(|e| Error::custom(format!("Invalid hex: {}", e)))?;
+		.map_err(|e| Error::custom(format!("Invalid hex: {e}")))?;
 
 	Ok(bytes)
 }
@@ -417,8 +417,7 @@ impl Eip7683OffchainDiscovery {
 					.clone()
 					.ok_or_else(|| {
 						DiscoveryError::ValidationError(format!(
-							"No input settler compact address found for chain ID {}",
-							origin_chain_id
+							"No input settler compact address found for chain ID {origin_chain_id}"
 						))
 					})?;
 				AlloyAddress::from_slice(&addr.0)
@@ -431,8 +430,7 @@ impl Eip7683OffchainDiscovery {
 		// Get provider for the origin chain
 		let provider = providers.get(&origin_chain_id).ok_or_else(|| {
 			DiscoveryError::ValidationError(format!(
-				"No RPC provider configured for chain ID {}",
-				origin_chain_id
+				"No RPC provider configured for chain ID {origin_chain_id}"
 			))
 		})?;
 
@@ -495,7 +493,7 @@ impl Eip7683OffchainDiscovery {
 				discovered_at: current_timestamp(),
 			},
 			data: serde_json::to_value(&order_data).map_err(|e| {
-				DiscoveryError::ParseError(format!("Failed to serialize order data: {}", e))
+				DiscoveryError::ParseError(format!("Failed to serialize order data: {e}"))
 			})?,
 			order_bytes,
 			quote_id,
@@ -540,7 +538,7 @@ impl Eip7683OffchainDiscovery {
 			LockType::ResourceLock => {
 				// Resource Lock (TheCompact) - use IInputSettlerCompact
 				let std_order = StandardOrder::abi_decode_validate(order_bytes).map_err(|e| {
-					DiscoveryError::ParseError(format!("Failed to decode StandardOrder: {}", e))
+					DiscoveryError::ParseError(format!("Failed to decode StandardOrder: {e}"))
 				})?;
 				let compact = IInputSettlerCompact::new(settler_address, provider);
 				let resp = compact
@@ -549,8 +547,7 @@ impl Eip7683OffchainDiscovery {
 					.await
 					.map_err(|e| {
 						DiscoveryError::Connection(format!(
-							"Failed to get order ID from compact contract: {}",
-							e
+							"Failed to get order ID from compact contract: {e}"
 						))
 					})?;
 				Ok(resp.0)
@@ -559,7 +556,7 @@ impl Eip7683OffchainDiscovery {
 				// Escrow types - use IInputSettlerEscrow
 				// Decode the order bytes to StandardOrder
 				let std_order = StandardOrder::abi_decode_validate(order_bytes).map_err(|e| {
-					DiscoveryError::ParseError(format!("Failed to decode StandardOrder: {}", e))
+					DiscoveryError::ParseError(format!("Failed to decode StandardOrder: {e}"))
 				})?;
 				let escrow = IInputSettlerEscrow::new(settler_address, provider);
 				let resp = escrow
@@ -568,8 +565,7 @@ impl Eip7683OffchainDiscovery {
 					.await
 					.map_err(|e| {
 						DiscoveryError::Connection(format!(
-							"Failed to get order ID from escrow contract: {}",
-							e
+							"Failed to get order ID from escrow contract: {e}"
 						))
 					})?;
 				Ok(resp.0)
@@ -616,13 +612,13 @@ impl Eip7683OffchainDiscovery {
 			.layer(CorsLayer::permissive())
 			.with_state(state);
 
-		let addr = format!("{}:{}", api_host, api_port)
+		let addr = format!("{api_host}:{api_port}")
 			.parse::<SocketAddr>()
-			.map_err(|e| format!("Invalid address '{}:{}': {}", api_host, api_port, e))?;
+			.map_err(|e| format!("Invalid address '{api_host}:{api_port}': {e}"))?;
 
 		let listener = tokio::net::TcpListener::bind(addr)
 			.await
-			.map_err(|e| format!("Failed to bind address {}: {}", addr, e))?;
+			.map_err(|e| format!("Failed to bind address {addr}: {e}"))?;
 
 		tracing::info!("EIP-7683 offchain discovery API listening on {}", addr);
 
@@ -632,7 +628,7 @@ impl Eip7683OffchainDiscovery {
 				tracing::info!("Shutting down API server");
 			})
 			.await
-			.map_err(|e| format!("Server error: {}", e))?;
+			.map_err(|e| format!("Server error: {e}"))?;
 
 		Ok(())
 	}
@@ -678,7 +674,7 @@ async fn handle_intent_submission(
 				Json(IntentResponse {
 					order_id: None,
 					status: IntentResponseStatus::Rejected,
-					message: Some(format!("Failed to convert order: {}", e)),
+					message: Some(format!("Failed to convert order: {e}")),
 					order: None,
 				}),
 			)
@@ -707,7 +703,7 @@ async fn handle_intent_submission(
 				Json(IntentResponse {
 					order_id: None,
 					status: IntentResponseStatus::Rejected,
-					message: Some(format!("Failed to extract sponsor: {}", e)),
+					message: Some(format!("Failed to extract sponsor: {e}")),
 					order: order_json,
 				}),
 			)
@@ -741,7 +737,7 @@ async fn handle_intent_submission(
 					Json(IntentResponse {
 						order_id: Some(order_id),
 						status: IntentResponseStatus::Error,
-						message: Some(format!("Failed to process intent: {}", e)),
+						message: Some(format!("Failed to process intent: {e}")),
 						order: order_json.clone(),
 					}),
 				)
@@ -913,7 +909,7 @@ pub fn create_discovery(
 ) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError> {
 	// Validate configuration first
 	Eip7683OffchainDiscoverySchema::validate_config(config)
-		.map_err(|e| DiscoveryError::ValidationError(format!("Invalid configuration: {}", e)))?;
+		.map_err(|e| DiscoveryError::ValidationError(format!("Invalid configuration: {e}")))?;
 
 	let api_host = config
 		.get("api_host")
@@ -940,8 +936,7 @@ pub fn create_discovery(
 	let discovery = Eip7683OffchainDiscovery::new(api_host, api_port, network_ids, networks)
 		.map_err(|e| {
 			DiscoveryError::Connection(format!(
-				"Failed to create offchain discovery service: {}",
-				e
+				"Failed to create offchain discovery service: {e}"
 			))
 		})?;
 

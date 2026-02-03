@@ -788,8 +788,7 @@ impl RecoveryService {
 				.await
 			{
 				return Err(RecoveryError::StateMachine(format!(
-					"Failed to transition order {} to {:?}: {}",
-					order_id, state, e
+					"Failed to transition order {order_id} to {state:?}: {e}"
 				)));
 			}
 		}

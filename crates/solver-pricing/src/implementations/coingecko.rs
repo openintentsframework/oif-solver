@@ -65,7 +65,7 @@ impl CoinGeckoPricing {
 		// Validate configuration first
 		let schema = CoinGeckoConfigSchema;
 		schema.validate(config).map_err(|e| {
-			PricingError::InvalidData(format!("Configuration validation failed: {}", e))
+			PricingError::InvalidData(format!("Configuration validation failed: {e}"))
 		})?;
 
 		// Extract configuration
@@ -116,23 +116,20 @@ impl CoinGeckoPricing {
 				let price_decimal = if let Some(price_str) = price.as_str() {
 					price_str.parse::<Decimal>().map_err(|e| {
 						PricingError::InvalidData(format!(
-							"Invalid custom price for {}: {}",
-							symbol, e
+							"Invalid custom price for {symbol}: {e}"
 						))
 					})?
 				} else if let Some(price_num) = price.as_float() {
 					Decimal::try_from(price_num).map_err(|e| {
 						PricingError::InvalidData(format!(
-							"Invalid custom price for {}: {}",
-							symbol, e
+							"Invalid custom price for {symbol}: {e}"
 						))
 					})?
 				} else if let Some(price_int) = price.as_integer() {
 					Decimal::from(price_int)
 				} else {
 					return Err(PricingError::InvalidData(format!(
-						"Custom price for {} must be a number or numeric string",
-						symbol
+						"Custom price for {symbol} must be a number or numeric string"
 					)));
 				};
 
@@ -151,7 +148,7 @@ impl CoinGeckoPricing {
 			headers.insert(
 				"x-cg-pro-api-key",
 				HeaderValue::from_str(key).map_err(|e| {
-					PricingError::InvalidData(format!("Invalid API key format: {}", e))
+					PricingError::InvalidData(format!("Invalid API key format: {e}"))
 				})?,
 			);
 		}
@@ -162,7 +159,7 @@ impl CoinGeckoPricing {
 			.user_agent("oif-solver/0.1.0 (https://github.com/openintentsframework/oif-solver)")
 			.timeout(Duration::from_secs(30))
 			.build()
-			.map_err(|e| PricingError::Network(format!("Failed to create HTTP client: {}", e)))?;
+			.map_err(|e| PricingError::Network(format!("Failed to create HTTP client: {e}")))?;
 
 		debug!(
 			"CoinGecko pricing initialized - Base URL: {}, Cache: {}s, Rate limit: {}ms",
@@ -244,21 +241,20 @@ impl CoinGeckoPricing {
 			.get(&url)
 			.send()
 			.await
-			.map_err(|e| PricingError::Network(format!("API request failed: {}", e)))?;
+			.map_err(|e| PricingError::Network(format!("API request failed: {e}")))?;
 
 		if !response.status().is_success() {
 			let status = response.status();
 			let body = response.text().await.unwrap_or_default();
 			return Err(PricingError::Network(format!(
-				"API returned error status {}: {}",
-				status, body
+				"API returned error status {status}: {body}"
 			)));
 		}
 
 		response
 			.json::<SimplePriceResponse>()
 			.await
-			.map_err(|e| PricingError::InvalidData(format!("Failed to parse response: {}", e)))
+			.map_err(|e| PricingError::InvalidData(format!("Failed to parse response: {e}")))
 	}
 
 	/// Get cached price or fetch from API
@@ -284,8 +280,7 @@ impl CoinGeckoPricing {
 		// Always fetch in USD
 		if !self.is_usd(vs_currency) {
 			return Err(PricingError::PriceNotAvailable(format!(
-				"Only USD is supported, got {}",
-				vs_currency
+				"Only USD is supported, got {vs_currency}"
 			)));
 		}
 
@@ -316,7 +311,7 @@ impl CoinGeckoPricing {
 		// Fetch from API
 		let coingecko_id = self
 			.get_coingecko_id(token)
-			.ok_or_else(|| PricingError::PriceNotAvailable(format!("Unknown token: {}", token)))?;
+			.ok_or_else(|| PricingError::PriceNotAvailable(format!("Unknown token: {token}")))?;
 
 		let response = self
 			.fetch_prices(vec![coingecko_id.clone()], vec!["usd".to_string()])
@@ -326,7 +321,7 @@ impl CoinGeckoPricing {
 			.prices
 			.get(&coingecko_id)
 			.and_then(|prices| prices.get("usd"))
-			.ok_or_else(|| PricingError::PriceNotAvailable(format!("{}/USD", token)))?;
+			.ok_or_else(|| PricingError::PriceNotAvailable(format!("{token}/USD")))?;
 
 		let price_str = price.to_string();
 
@@ -369,7 +364,7 @@ impl CoinGeckoPricing {
 			let crypto_price = self.get_price(quote, "USD").await?;
 			let price: Decimal = crypto_price
 				.parse()
-				.map_err(|e| PricingError::InvalidData(format!("Invalid price: {}", e)))?;
+				.map_err(|e| PricingError::InvalidData(format!("Invalid price: {e}")))?;
 
 			if price.is_zero() {
 				return Err(PricingError::InvalidData("Price is zero".to_string()));
@@ -382,8 +377,7 @@ impl CoinGeckoPricing {
 		// For non-USD pairs, we could support crypto-to-crypto through USD
 		// but there's no current use case in the solver
 		Err(PricingError::PriceNotAvailable(format!(
-			"Only USD pairs are supported, got {}/{}",
-			base, quote
+			"Only USD pairs are supported, got {base}/{quote}"
 		)))
 	}
 }
@@ -417,13 +411,13 @@ impl PricingInterface for CoinGeckoPricing {
 
 		let amount_decimal: Decimal = amount
 			.parse()
-			.map_err(|e| PricingError::InvalidData(format!("Invalid amount: {}", e)))?;
+			.map_err(|e| PricingError::InvalidData(format!("Invalid amount: {e}")))?;
 
 		let pair = TradingPair::new(&from_upper, &to_upper);
 		let rate = self.get_pair_price(&pair).await?;
 		let rate_decimal: Decimal = rate
 			.parse()
-			.map_err(|e| PricingError::InvalidData(format!("Invalid rate: {}", e)))?;
+			.map_err(|e| PricingError::InvalidData(format!("Invalid rate: {e}")))?;
 
 		let result = amount_decimal * rate_decimal;
 		Ok(result.to_string())
@@ -437,8 +431,7 @@ impl PricingInterface for CoinGeckoPricing {
 		// Only USD is supported
 		if !self.is_usd(currency) {
 			return Err(PricingError::PriceNotAvailable(format!(
-				"Only USD is supported, got {}",
-				currency
+				"Only USD is supported, got {currency}"
 			)));
 		}
 
@@ -448,13 +441,13 @@ impl PricingInterface for CoinGeckoPricing {
 
 		let eth_amount: Decimal = eth_amount_str
 			.parse()
-			.map_err(|e| PricingError::InvalidData(format!("Invalid ETH amount: {}", e)))?;
+			.map_err(|e| PricingError::InvalidData(format!("Invalid ETH amount: {e}")))?;
 
 		// Get ETH price in USD
 		let eth_price = self.get_price("ETH", "USD").await?;
 		let price_decimal: Decimal = eth_price
 			.parse()
-			.map_err(|e| PricingError::InvalidData(format!("Invalid price: {}", e)))?;
+			.map_err(|e| PricingError::InvalidData(format!("Invalid price: {e}")))?;
 
 		let result = eth_amount * price_decimal;
 		debug!(
@@ -476,20 +469,19 @@ impl PricingInterface for CoinGeckoPricing {
 		// Only USD is supported
 		if !self.is_usd(currency) {
 			return Err(PricingError::PriceNotAvailable(format!(
-				"Only USD is supported, got {}",
-				currency
+				"Only USD is supported, got {currency}"
 			)));
 		}
 
 		let currency_amount_decimal: Decimal = currency_amount
 			.parse()
-			.map_err(|e| PricingError::InvalidData(format!("Invalid currency amount: {}", e)))?;
+			.map_err(|e| PricingError::InvalidData(format!("Invalid currency amount: {e}")))?;
 
 		// Get ETH price in USD
 		let eth_price = self.get_price("ETH", "USD").await?;
 		let eth_price_decimal: Decimal = eth_price
 			.parse()
-			.map_err(|e| PricingError::InvalidData(format!("Invalid ETH price: {}", e)))?;
+			.map_err(|e| PricingError::InvalidData(format!("Invalid ETH price: {e}")))?;
 
 		if eth_price_decimal.is_zero() {
 			return Err(PricingError::InvalidData(
@@ -501,7 +493,7 @@ impl PricingInterface for CoinGeckoPricing {
 		let eth_amount = currency_amount_decimal / eth_price_decimal;
 		let eth_amount_str = eth_amount.to_string();
 		let wei_amount = parse_ether(&eth_amount_str).map_err(|e| {
-			PricingError::InvalidData(format!("Failed to convert ETH to wei: {}", e))
+			PricingError::InvalidData(format!("Failed to convert ETH to wei: {e}"))
 		})?;
 
 		Ok(wei_amount.to_string())
@@ -519,7 +511,7 @@ impl ConfigSchema for CoinGeckoConfigSchema {
 				return Err(ValidationError::TypeMismatch {
 					field: "api_key".to_string(),
 					expected: "string".to_string(),
-					actual: format!("{:?}", api_key),
+					actual: format!("{api_key:?}"),
 				});
 			}
 		}
@@ -530,7 +522,7 @@ impl ConfigSchema for CoinGeckoConfigSchema {
 				return Err(ValidationError::TypeMismatch {
 					field: "base_url".to_string(),
 					expected: "string".to_string(),
-					actual: format!("{:?}", base_url),
+					actual: format!("{base_url:?}"),
 				});
 			}
 		}
@@ -541,7 +533,7 @@ impl ConfigSchema for CoinGeckoConfigSchema {
 				return Err(ValidationError::TypeMismatch {
 					field: "cache_duration_seconds".to_string(),
 					expected: "integer".to_string(),
-					actual: format!("{:?}", cache_duration),
+					actual: format!("{cache_duration:?}"),
 				});
 			}
 		}
@@ -552,7 +544,7 @@ impl ConfigSchema for CoinGeckoConfigSchema {
 				return Err(ValidationError::TypeMismatch {
 					field: "rate_limit_delay_ms".to_string(),
 					expected: "integer".to_string(),
-					actual: format!("{:?}", delay),
+					actual: format!("{delay:?}"),
 				});
 			}
 		}
@@ -563,9 +555,9 @@ impl ConfigSchema for CoinGeckoConfigSchema {
 				for (symbol, id) in table {
 					if id.as_str().is_none() {
 						return Err(ValidationError::TypeMismatch {
-							field: format!("token_id_map.{}", symbol),
+							field: format!("token_id_map.{symbol}"),
 							expected: "string".to_string(),
-							actual: format!("{:?}", id),
+							actual: format!("{id:?}"),
 						});
 					}
 				}
@@ -573,7 +565,7 @@ impl ConfigSchema for CoinGeckoConfigSchema {
 				return Err(ValidationError::TypeMismatch {
 					field: "token_id_map".to_string(),
 					expected: "table".to_string(),
-					actual: format!("{:?}", token_map),
+					actual: format!("{token_map:?}"),
 				});
 			}
 		}
@@ -593,9 +585,9 @@ impl ConfigSchema for CoinGeckoConfigSchema {
 
 					if !is_valid {
 						return Err(ValidationError::TypeMismatch {
-							field: format!("custom_prices.{}", symbol),
+							field: format!("custom_prices.{symbol}"),
 							expected: "valid decimal string, float, or integer".to_string(),
-							actual: format!("{:?}", price),
+							actual: format!("{price:?}"),
 						});
 					}
 				}
@@ -603,7 +595,7 @@ impl ConfigSchema for CoinGeckoConfigSchema {
 				return Err(ValidationError::TypeMismatch {
 					field: "custom_prices".to_string(),
 					expected: "table".to_string(),
-					actual: format!("{:?}", custom_prices),
+					actual: format!("{custom_prices:?}"),
 				});
 			}
 		}

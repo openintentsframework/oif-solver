@@ -114,7 +114,7 @@ pub async fn process_quote_request(
 	let cost_context = cost_profit_service
 		.calculate_cost_context(&request, &validated_context, config)
 		.await
-		.map_err(|e| QuoteError::Internal(format!("Failed to calculate cost context: {}", e)))?;
+		.map_err(|e| QuoteError::Internal(format!("Failed to calculate cost context: {e}")))?;
 
 	// Check solver capabilities: networks only (token support is enforced during collection below)
 	QuoteValidator::validate_supported_networks(&request, &config.networks)?;
@@ -230,8 +230,7 @@ pub async fn get_quote_by_id(quote_id: &str, solver: &SolverEngine) -> Result<Qu
 		Err(e) => {
 			tracing::warn!("Failed to retrieve quote {}: {}", quote_id, e);
 			Err(QuoteError::InvalidRequest(format!(
-				"Quote not found: {}",
-				quote_id
+				"Quote not found: {quote_id}"
 			)))
 		},
 	}
@@ -251,7 +250,7 @@ pub async fn quote_exists(quote_id: &str, solver: &SolverEngine) -> Result<bool,
 		},
 		Err(e) => {
 			tracing::warn!("Failed to check quote existence {}: {}", quote_id, e);
-			Err(QuoteError::Internal(format!("Storage error: {}", e)))
+			Err(QuoteError::Internal(format!("Storage error: {e}")))
 		},
 	}
 }

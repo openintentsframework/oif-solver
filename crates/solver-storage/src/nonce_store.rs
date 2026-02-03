@@ -164,7 +164,7 @@ impl NonceStore {
 		Ok(Self {
 			storage,
 			solver_id: solver_id.to_string(),
-			namespace: format!("{}:admin:nonce", solver_id),
+			namespace: format!("{solver_id}:admin:nonce"),
 			ttl: Duration::from_secs(ttl_seconds),
 		})
 	}
@@ -293,7 +293,7 @@ mod tests {
 	fn test_debug_impl() {
 		let store = create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap();
 
-		let debug_str = format!("{:?}", store);
+		let debug_str = format!("{store:?}");
 		assert!(debug_str.contains("NonceStore"));
 		assert!(debug_str.contains("test-solver"));
 		assert!(debug_str.contains("300"));
@@ -304,7 +304,7 @@ mod tests {
 		let config = StoreConfig::Redis {
 			url: "redis://:secretpassword@localhost:6379".to_string(),
 		};
-		let debug_str = format!("{:?}", config);
+		let debug_str = format!("{config:?}");
 		assert!(!debug_str.contains("secretpassword"));
 		assert!(debug_str.contains("[REDACTED]"));
 	}
@@ -312,7 +312,7 @@ mod tests {
 	#[test]
 	fn test_config_debug_memory() {
 		let config = StoreConfig::Memory;
-		let debug_str = format!("{:?}", config);
+		let debug_str = format!("{config:?}");
 		assert!(debug_str.contains("Memory"));
 	}
 

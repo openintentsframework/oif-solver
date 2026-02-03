@@ -88,7 +88,7 @@ pub async fn start_server(
 		.and_then(|discovery_impl| {
 			solver.discovery().get_url(discovery_impl).map(|url| {
 				// Format as complete URL with /intent endpoint
-				format!("http://{}/intent", url)
+				format!("http://{url}/intent")
 			})
 		});
 
@@ -151,7 +151,7 @@ pub async fn start_server(
 						tracing::error!("Failed to convert config to OperatorConfig: {}", e);
 						return Err(Box::new(std::io::Error::new(
 							std::io::ErrorKind::InvalidData,
-							format!("Config conversion error: {}", e),
+							format!("Config conversion error: {e}"),
 						)));
 					},
 				};
@@ -163,14 +163,13 @@ pub async fn start_server(
 					StoreConfig::Redis {
 						url: redis_url.clone(),
 					},
-					format!("{}-operator", solver_id),
+					format!("{solver_id}-operator"),
 				) {
 					Ok(store) => Arc::from(store),
 					Err(e) => {
 						tracing::error!("Failed to create operator config store: {}", e);
-						return Err(Box::new(std::io::Error::new(
-							std::io::ErrorKind::Other,
-							format!("Config store error: {}", e),
+						return Err(Box::new(std::io::Error::other(
+							format!("Config store error: {e}"),
 						)));
 					},
 				};
@@ -180,9 +179,8 @@ pub async fn start_server(
 					Ok(false) => {
 						if let Err(e) = config_store.seed(operator_config).await {
 							tracing::error!("Failed to seed operator config: {}", e);
-							return Err(Box::new(std::io::Error::new(
-								std::io::ErrorKind::Other,
-								format!("Config seed error: {}", e),
+							return Err(Box::new(std::io::Error::other(
+								format!("Config seed error: {e}"),
 							)));
 						}
 						tracing::info!("Seeded operator config for admin API persistence");
@@ -192,9 +190,8 @@ pub async fn start_server(
 					},
 					Err(e) => {
 						tracing::error!("Failed to check operator config existence: {}", e);
-						return Err(Box::new(std::io::Error::new(
-							std::io::ErrorKind::Other,
-							format!("Config check error: {}", e),
+						return Err(Box::new(std::io::Error::other(
+							format!("Config check error: {e}"),
 						)));
 					},
 				}
@@ -501,7 +498,7 @@ async fn extract_intent_request(
 			.extract_sponsor(Some(&intent.signature))
 			.map_err(|e| APIError::BadRequest {
 				error_type: ApiErrorType::OrderValidationFailed,
-				message: format!("Failed to extract sponsor: {}", e),
+				message: format!("Failed to extract sponsor: {e}"),
 				details: None,
 			})?;
 
@@ -558,7 +555,7 @@ async fn create_intent_from_quote(
 			tracing::warn!("Failed to retrieve quote {}: {}", quote_id, e);
 			APIError::BadRequest {
 				error_type: ApiErrorType::QuoteNotFound,
-				message: format!("Quote not found: {}", e),
+				message: format!("Quote not found: {e}"),
 				details: Some(serde_json::json!({"quoteId": quote_id})),
 			}
 		})?;
@@ -568,7 +565,7 @@ async fn create_intent_from_quote(
 		.try_into()
 		.map_err(|e| APIError::InternalServerError {
 			error_type: ApiErrorType::QuoteConversionFailed,
-			message: format!("Failed to convert quote to intent format: {}", e),
+			message: format!("Failed to convert quote to intent format: {e}"),
 		})
 }
 
@@ -578,7 +575,7 @@ fn create_intent_from_payload(payload: Value) -> Result<PostOrderRequest, APIErr
 	// {order: Bytes, sponsor: Address, signature: Bytes, lock_type: LockType}
 	serde_json::from_value::<PostOrderRequest>(payload).map_err(|e| APIError::BadRequest {
 		error_type: ApiErrorType::InvalidRequest,
-		message: format!("Invalid intent request format: {}", e),
+		message: format!("Invalid intent request format: {e}"),
 		details: None,
 	})
 }
@@ -600,7 +597,7 @@ async fn validate_intent_request(
 	let standard_order =
 		StandardOrder::try_from(&intent.order).map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
-			message: format!("Failed to convert order to standard format: {}", e),
+			message: format!("Failed to convert order to standard format: {e}"),
 			details: None,
 		})?;
 
@@ -621,7 +618,7 @@ async fn validate_intent_request(
 			.await
 			.map_err(|e| APIError::InternalServerError {
 				error_type: ApiErrorType::SolverAddressError,
-				message: format!("Failed to get solver address: {}", e),
+				message: format!("Failed to get solver address: {e}"),
 			})?;
 
 	// Create callback that captures DeliveryService
@@ -654,7 +651,7 @@ async fn validate_intent_request(
 				.contract_call(chain_id, tx)
 				.await
 				.map(|bytes| bytes.to_vec())
-				.map_err(|e| format!("Contract call failed: {}", e))
+				.map_err(|e| format!("Contract call failed: {e}"))
 		})
 	});
 
@@ -690,7 +687,7 @@ async fn validate_intent_request(
 			tracing::error!("Order validation failed with error: {}", e);
 			APIError::BadRequest {
 				error_type: ApiErrorType::OrderValidationFailed,
-				message: format!("Order validation failed: {}", e),
+				message: format!("Order validation failed: {e}"),
 				details: None,
 			}
 		});
@@ -772,7 +769,7 @@ async fn forward_to_discovery_service(
 			let response = PostOrderResponse {
 				order_id: None,
 				status: PostOrderResponseStatus::Error,
-				message: Some(format!("Failed to submit intent: {}", e)),
+				message: Some(format!("Failed to submit intent: {e}")),
 				order: None,
 			};
 			(StatusCode::BAD_GATEWAY, Json(response)).into_response()

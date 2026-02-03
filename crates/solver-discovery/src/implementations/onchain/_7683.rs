@@ -146,8 +146,7 @@ impl Eip7683Discovery {
 				// Get initial block number
 				let current_block = provider.get_block_number().await.map_err(|e| {
 					DiscoveryError::Connection(format!(
-						"Failed to get block for chain {}: {}",
-						network_id, e
+						"Failed to get block for chain {network_id}: {e}"
 					))
 				})?;
 
@@ -181,7 +180,7 @@ impl Eip7683Discovery {
 
 		// Decode the Open event
 		let open_event = Open::decode_log_validate(&prim_log).map_err(|e| {
-			DiscoveryError::ParseError(format!("Failed to decode Open event: {}", e))
+			DiscoveryError::ParseError(format!("Failed to decode Open event: {e}"))
 		})?;
 
 		let order_id = open_event.orderId;
@@ -240,7 +239,7 @@ impl Eip7683Discovery {
 				discovered_at: current_timestamp(),
 			},
 			data: serde_json::to_value(&order_data).map_err(|e| {
-				DiscoveryError::ParseError(format!("Failed to serialize order data: {}", e))
+				DiscoveryError::ParseError(format!("Failed to serialize order data: {e}"))
 			})?,
 			order_bytes: abi_encoded_bytes,
 			quote_id: None,
@@ -578,7 +577,7 @@ pub fn create_discovery(
 ) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError> {
 	// Validate configuration first
 	Eip7683DiscoverySchema::validate_config(config)
-		.map_err(|e| DiscoveryError::ValidationError(format!("Invalid configuration: {}", e)))?;
+		.map_err(|e| DiscoveryError::ValidationError(format!("Invalid configuration: {e}")))?;
 
 	// Parse network_ids (required field)
 	let network_ids = config
@@ -873,7 +872,7 @@ mod tests {
 		let log = create_test_open_log();
 		match Eip7683Discovery::parse_open_event(&log) {
 			Ok(intent) => println!("Direct parse succeeded: {}", intent.id),
-			Err(e) => println!("Direct parse failed: {:?}", e),
+			Err(e) => println!("Direct parse failed: {e:?}"),
 		}
 
 		let logs = vec![log];

@@ -84,7 +84,7 @@ impl ContractDeployer {
 	/// or contract artifacts are missing
 	pub async fn deploy_to_chain(&self, chain: ChainId) -> Result<ContractAddresses> {
 		use crate::core::logging;
-		logging::verbose_operation("Starting contract deployment", &format!("chain {}", chain));
+		logging::verbose_operation("Starting contract deployment", &format!("chain {chain}"));
 
 		// Create provider for this chain
 		let provider = self.ctx.provider(chain).await?;
@@ -126,7 +126,7 @@ impl ContractDeployer {
 			tokens,
 		};
 
-		logging::verbose_success("Contract deployment completed", &format!("chain {}", chain));
+		logging::verbose_success("Contract deployment completed", &format!("chain {chain}"));
 		Ok(addresses)
 	}
 
@@ -170,7 +170,7 @@ impl ContractDeployer {
 
 		logging::verbose_success(
 			"Contract deployed",
-			&format!("{} at {}", contract_name, address),
+			&format!("{contract_name} at {address}"),
 		);
 		Ok(address)
 	}
@@ -180,10 +180,10 @@ impl ContractDeployer {
 		// Look for the contract in the expected paths
 		let possible_paths = vec![
 			self.contracts_path
-				.join(format!("{}.sol", contract_name))
-				.join(format!("{}.json", contract_name)),
+				.join(format!("{contract_name}.sol"))
+				.join(format!("{contract_name}.json")),
 			self.contracts_path
-				.join(format!("{}.sol/{}.json", contract_name, contract_name)),
+				.join(format!("{contract_name}.sol/{contract_name}.json")),
 		];
 
 		for path in &possible_paths {
@@ -221,7 +221,7 @@ impl ContractDeployer {
 		let hex_str = bytecode_obj.strip_prefix("0x").unwrap_or(bytecode_obj);
 
 		hex::decode(hex_str)
-			.map_err(|e| Error::InvalidConfig(format!("Invalid bytecode hex: {}", e)))
+			.map_err(|e| Error::InvalidConfig(format!("Invalid bytecode hex: {e}")))
 			.map(Bytes::from)
 	}
 
@@ -239,7 +239,7 @@ impl ContractDeployer {
 			// Use canonical Permit2 address on mainnet/testnets
 			let address: Address = constants::PERMIT2_ADDRESS
 				.parse()
-				.map_err(|e| Error::InvalidConfig(format!("Invalid Permit2 address: {}", e)))?;
+				.map_err(|e| Error::InvalidConfig(format!("Invalid Permit2 address: {e}")))?;
 			logging::verbose_tech("Using canonical Permit2", &address.to_string());
 			return Ok(address);
 		}
@@ -252,10 +252,9 @@ impl ContractDeployer {
 			},
 			Err(e) => {
 				use crate::core::logging;
-				logging::warning(&format!("Permit2 deployment failed: {}", e));
+				logging::warning(&format!("Permit2 deployment failed: {e}"));
 				Err(Error::DeploymentFailed(format!(
-					"Failed to deploy permit2 from bytecode: {}",
-					e
+					"Failed to deploy permit2 from bytecode: {e}"
 				)))
 			},
 		}
@@ -268,14 +267,14 @@ impl ContractDeployer {
 			.join("src/operations/env/data/permit2_bytecode.hex");
 
 		let bytecode_hex = std::fs::read_to_string(&bytecode_path)
-			.map_err(|e| Error::InvalidConfig(format!("Failed to read Permit2 bytecode: {}", e)))?;
+			.map_err(|e| Error::InvalidConfig(format!("Failed to read Permit2 bytecode: {e}")))?;
 
 		// Prepare bytecode with 0x prefix
 		let bytecode_hex = bytecode_hex.trim();
 		let bytecode_with_prefix = if bytecode_hex.starts_with("0x") {
 			bytecode_hex.to_string()
 		} else {
-			format!("0x{}", bytecode_hex)
+			format!("0x{bytecode_hex}")
 		};
 
 		// Use anvil_setCode to set the bytecode at canonical address
@@ -284,12 +283,12 @@ impl ContractDeployer {
 		provider
 			.set_code(canonical_address, &bytecode_with_prefix)
 			.await
-			.map_err(|e| Error::DeploymentFailed(format!("Failed to set Permit2 code: {}", e)))?;
+			.map_err(|e| Error::DeploymentFailed(format!("Failed to set Permit2 code: {e}")))?;
 
 		// Parse the canonical address as Address
 		let address = canonical_address
 			.parse::<Address>()
-			.map_err(|e| Error::InvalidConfig(format!("Invalid canonical address: {}", e)))?;
+			.map_err(|e| Error::InvalidConfig(format!("Invalid canonical address: {e}")))?;
 
 		Ok(address)
 	}
@@ -400,7 +399,7 @@ impl ContractDeployer {
 			.await?;
 		logging::verbose_success(
 			"Test token deployed",
-			&format!("{} ({}) at {}", symbol, name, address),
+			&format!("{symbol} ({name}) at {address}"),
 		);
 		Ok(address)
 	}
@@ -415,7 +414,7 @@ impl ContractDeployer {
 
 		// Create a transaction to send ETH from the default funded account
 		let signer = PrivateKeySigner::from_str(constants::anvil_accounts::SOLVER_PRIVATE_KEY)
-			.map_err(|e| Error::InvalidConfig(format!("Invalid private key: {}", e)))?;
+			.map_err(|e| Error::InvalidConfig(format!("Invalid private key: {e}")))?;
 
 		let tx = TransactionRequest::default()
 			.to(account)
@@ -427,7 +426,7 @@ impl ContractDeployer {
 
 		logging::verbose_success(
 			"Account funded",
-			&format!("{} with {} ETH", account, amount),
+			&format!("{account} with {amount} ETH"),
 		);
 		Ok(())
 	}
@@ -440,7 +439,7 @@ impl ContractDeployer {
 	) -> Result<Address> {
 		logging::verbose_operation(
 			"Starting single contract deployment",
-			&format!("{} on chain {}", contract_name, chain),
+			&format!("{contract_name} on chain {chain}"),
 		);
 
 		// Create provider for this chain
@@ -461,15 +460,15 @@ impl ContractDeployer {
 		}
 
 		for entry in std::fs::read_dir(&self.contracts_path).map_err(|e| {
-			Error::InvalidConfig(format!("Failed to read contracts directory: {}", e))
+			Error::InvalidConfig(format!("Failed to read contracts directory: {e}"))
 		})? {
 			let entry = entry.map_err(|e| {
-				Error::InvalidConfig(format!("Failed to read directory entry: {}", e))
+				Error::InvalidConfig(format!("Failed to read directory entry: {e}"))
 			})?;
 
 			if entry
 				.file_type()
-				.map_err(|e| Error::InvalidConfig(format!("Failed to get file type: {}", e)))?
+				.map_err(|e| Error::InvalidConfig(format!("Failed to get file type: {e}")))?
 				.is_dir()
 			{
 				let dir_name = entry.file_name();
