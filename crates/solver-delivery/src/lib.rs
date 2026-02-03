@@ -183,7 +183,7 @@ pub trait DeliveryInterface: Send + Sync {
 pub type DeliveryFactory = fn(
 	&toml::Value,
 	&NetworksConfig,
-	&solver_account::AccountSigner,               // Default/primary signer
+	&solver_account::AccountSigner, // Default/primary signer
 	&HashMap<u64, solver_account::AccountSigner>, // Per-network signers
 ) -> Result<Box<dyn DeliveryInterface>, DeliveryError>;
 

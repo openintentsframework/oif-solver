@@ -212,6 +212,13 @@ impl SolverBuilder {
 			},
 		};
 
+		// Log the solver address for operational visibility
+		tracing::info!(
+			component = "account",
+			address = %solver_address,
+			"Solver address initialized"
+		);
+
 		// Create delivery implementations
 		let mut delivery_implementations = std::collections::HashMap::new();
 

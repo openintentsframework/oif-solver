@@ -81,9 +81,9 @@ impl KmsWallet {
 		let config = config_loader.load().await;
 		let client = KmsClient::new(&config);
 
-		let signer = AwsSigner::new(client, key_id, None)
-			.await
-			.map_err(|e| AccountError::Implementation(format!("KMS initialization failed: {}", e)))?;
+		let signer = AwsSigner::new(client, key_id, None).await.map_err(|e| {
+			AccountError::Implementation(format!("KMS initialization failed: {}", e))
+		})?;
 
 		Ok(Self { signer })
 	}
@@ -149,13 +149,11 @@ pub fn create_account(config: &toml::Value) -> Result<Box<dyn AccountInterface>,
 
 	// Block for async initialization with runtime safety
 	let wallet = match tokio::runtime::Handle::try_current() {
-		Ok(handle) => {
-			tokio::task::block_in_place(|| {
-				handle.block_on(async {
-					KmsWallet::new(key_id.to_string(), region.to_string(), endpoint).await
-				})
-			})?
-		},
+		Ok(handle) => tokio::task::block_in_place(|| {
+			handle.block_on(async {
+				KmsWallet::new(key_id.to_string(), region.to_string(), endpoint).await
+			})
+		})?,
 		Err(_) => {
 			// Fallback for tests without runtime
 			let rt = tokio::runtime::Builder::new_current_thread()

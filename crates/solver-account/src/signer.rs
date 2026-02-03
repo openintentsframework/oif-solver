@@ -97,7 +97,9 @@ impl TxSigner<Signature> for AccountSigner {
 impl std::fmt::Debug for AccountSigner {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
-			Self::Local(_) => f.debug_struct("AccountSigner::Local").finish_non_exhaustive(),
+			Self::Local(_) => f
+				.debug_struct("AccountSigner::Local")
+				.finish_non_exhaustive(),
 			#[cfg(feature = "kms")]
 			Self::Kms(_) => f.debug_struct("AccountSigner::Kms").finish_non_exhaustive(),
 		}

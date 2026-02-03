@@ -14,10 +14,10 @@ use alloy_provider::{
 };
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types::TransactionRequest;
-use solver_account::AccountSigner;
 use alloy_transport::layers::{RateLimitRetryPolicy, RetryBackoffLayer};
 use alloy_transport::TransportError;
 use async_trait::async_trait;
+use solver_account::AccountSigner;
 use solver_types::{
 	ConfigSchema, Field, FieldType, NetworksConfig, Schema, Transaction as SolverTransaction,
 	TransactionHash, TransactionReceipt,
