@@ -221,8 +221,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_account_service_sign() {
-		use implementations::local::create_account;
 		use alloy_primitives::U256;
+		use implementations::local::create_account;
 
 		let config: toml::Value = toml::from_str(
 			r#"private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80""#,
