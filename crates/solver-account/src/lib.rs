@@ -10,9 +10,18 @@ use solver_types::{
 };
 use thiserror::Error;
 
+/// Signer abstraction module
+pub mod signer;
+
+/// Re-export AccountSigner for convenience
+pub use signer::AccountSigner;
+
 /// Re-export implementations
 pub mod implementations {
 	pub mod local;
+
+	#[cfg(feature = "kms")]
+	pub mod kms;
 }
 
 /// Errors that can occur during account operations.
@@ -61,11 +70,21 @@ pub trait AccountInterface: Send + Sync {
 	/// This is useful for message authentication and verification purposes.
 	async fn sign_message(&self, message: &[u8]) -> Result<Signature, AccountError>;
 
+	/// Returns a unified signer for use with Alloy's EthereumWallet.
+	///
+	/// This is the preferred way to get signing capability for the delivery layer.
+	fn signer(&self) -> AccountSigner;
+
 	/// Returns the private key as a SecretString with 0x prefix.
 	///
-	/// This is required for all account implementations as it's used by
-	/// delivery implementations for transaction signing.
-	fn get_private_key(&self) -> SecretString;
+	/// # Panics
+	/// Panics if called on a KMS signer (use `signer()` instead).
+	///
+	/// # Deprecated
+	/// Use `signer()` instead - this method is not supported for KMS.
+	fn get_private_key(&self) -> SecretString {
+		panic!("get_private_key() not supported - use signer() instead")
+	}
 }
 
 /// Type alias for account factory functions.
@@ -87,7 +106,16 @@ pub trait AccountRegistry: ImplementationRegistry<Factory = AccountFactory> {}
 pub fn get_all_implementations() -> Vec<(&'static str, AccountFactory)> {
 	use implementations::local;
 
-	vec![(local::Registry::NAME, local::Registry::factory())]
+	#[allow(unused_mut)]
+	let mut impls = vec![(local::Registry::NAME, local::Registry::factory())];
+
+	#[cfg(feature = "kms")]
+	{
+		use implementations::kms;
+		impls.push((kms::Registry::NAME, kms::Registry::factory()));
+	}
+
+	impls
 }
 
 /// Service that manages account operations.
@@ -122,9 +150,18 @@ impl AccountService {
 		self.implementation.sign_transaction(tx).await
 	}
 
+	/// Returns a unified signer for use with the delivery layer.
+	///
+	/// This is the preferred way to get signing capability.
+	pub fn signer(&self) -> AccountSigner {
+		self.implementation.signer()
+	}
+
 	/// Returns the private key as a SecretString.
 	///
 	/// This is used by delivery implementations for transaction signing.
+	#[deprecated(note = "Use signer() instead - not supported for KMS")]
+	#[allow(deprecated)]
 	pub fn get_private_key(&self) -> SecretString {
 		self.implementation.get_private_key()
 	}

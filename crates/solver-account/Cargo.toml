@@ -16,9 +16,16 @@ mockall = { workspace = true, optional = true }
 solver-types = { path = "../solver-types" }
 thiserror = "2.0.17"
 toml = { workspace = true }
+tokio = { workspace = true }
+
+# KMS dependencies (optional)
+alloy-signer-aws = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+aws-sdk-kms = { workspace = true, optional = true }
 
 [features]
 testing = ["mockall"]
+kms = ["alloy-signer-aws", "aws-config", "aws-sdk-kms"]
 
 [dev-dependencies]
 tokio = { workspace = true }

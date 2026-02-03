@@ -433,9 +433,14 @@ mod tests {
 		mock_account
 			.expect_config_schema()
 			.returning(|| Box::new(solver_account::implementations::local::LocalWalletSchema));
-		mock_account
-			.expect_get_private_key()
-			.returning(|| solver_types::SecretString::from("0x1234567890abcdef"));
+		mock_account.expect_signer().returning(|| {
+			use alloy_signer_local::PrivateKeySigner;
+			let signer: PrivateKeySigner =
+				"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+					.parse()
+					.unwrap();
+			solver_account::AccountSigner::Local(signer)
+		});
 
 		Arc::new(AccountService::new(Box::new(mock_account)))
 	}

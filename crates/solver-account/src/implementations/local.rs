@@ -3,7 +3,7 @@
 //! This module provides concrete implementations of the AccountInterface trait,
 //! currently supporting local private key wallets using the Alloy library.
 
-use crate::{AccountError, AccountInterface};
+use crate::{AccountError, AccountInterface, AccountSigner};
 use alloy_consensus::TxLegacy;
 use alloy_network::TxSigner;
 use alloy_primitives::{Address as AlloyAddress, Bytes, TxKind};
@@ -147,8 +147,13 @@ impl AccountInterface for LocalWallet {
 		Ok(signature.into())
 	}
 
+	fn signer(&self) -> AccountSigner {
+		AccountSigner::Local(self.signer.clone())
+	}
+
 	fn get_private_key(&self) -> SecretString {
-		self.get_private_key()
+		// Explicit call to inherent method to avoid ambiguity
+		LocalWallet::get_private_key(self)
 	}
 }
 

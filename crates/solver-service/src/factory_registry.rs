@@ -23,8 +23,8 @@ pub type AccountFactory = fn(&toml::Value) -> Result<Box<dyn AccountInterface>, 
 pub type DeliveryFactory = fn(
 	&toml::Value,
 	&NetworksConfig,
-	&solver_types::SecretString,
-	&std::collections::HashMap<u64, solver_types::SecretString>,
+	&solver_account::AccountSigner,
+	&std::collections::HashMap<u64, solver_account::AccountSigner>,
 ) -> Result<Box<dyn DeliveryInterface>, DeliveryError>;
 pub type DiscoveryFactory =
 	fn(&toml::Value, &NetworksConfig) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError>;

@@ -80,8 +80,8 @@ impl SolverBuilder {
 		DF: Fn(
 			&toml::Value,
 			&solver_types::NetworksConfig,
-			&solver_types::SecretString,
-			&std::collections::HashMap<u64, solver_types::SecretString>,
+			&solver_account::AccountSigner,
+			&std::collections::HashMap<u64, solver_account::AccountSigner>,
 		) -> Result<Box<dyn DeliveryInterface>, DeliveryError>,
 		DIF: Fn(
 			&toml::Value,
@@ -215,20 +215,20 @@ impl SolverBuilder {
 		// Create delivery implementations
 		let mut delivery_implementations = std::collections::HashMap::new();
 
-		// Get the default private key from the primary account
-		let default_private_key = account.get_private_key();
+		// Get the default signer from the primary account
+		let default_signer = account.signer();
 
 		for (name, config) in &self.static_config.delivery.implementations {
 			if let Some(factory) = factories.delivery_factories.get(name) {
 				// Parse per-network account mappings from config
-				let mut network_private_keys = HashMap::new();
+				let mut network_signers = HashMap::new();
 				if let Some(accounts_table) = config.get("accounts").and_then(|v| v.as_table()) {
 					for (network_id_str, account_name_value) in accounts_table {
 						if let Ok(network_id) = network_id_str.parse::<u64>() {
 							if let Some(account_name) = account_name_value.as_str() {
 								if let Some(account_service) = account_services.get(account_name) {
-									let private_key = account_service.get_private_key();
-									network_private_keys.insert(network_id, private_key);
+									let signer = account_service.signer();
+									network_signers.insert(network_id, signer);
 								} else {
 									tracing::warn!(
 										"Account '{}' not found, skipping",
@@ -243,8 +243,8 @@ impl SolverBuilder {
 				match factory(
 					config,
 					&self.static_config.networks,
-					&default_private_key,
-					&network_private_keys,
+					&default_signer,
+					&network_signers,
 				) {
 					Ok(implementation) => {
 						// Extract network_ids from config to create the mapping

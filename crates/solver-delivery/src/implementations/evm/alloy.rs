@@ -14,8 +14,7 @@ use alloy_provider::{
 };
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types::TransactionRequest;
-use alloy_signer::Signer;
-use alloy_signer_local::PrivateKeySigner;
+use solver_account::AccountSigner;
 use alloy_transport::layers::{RateLimitRetryPolicy, RetryBackoffLayer};
 use alloy_transport::TransportError;
 use async_trait::async_trait;
@@ -44,8 +43,8 @@ impl AlloyDelivery {
 	pub async fn new(
 		network_ids: Vec<u64>,
 		networks: &NetworksConfig,
-		signers: HashMap<u64, PrivateKeySigner>,
-		default_signer: PrivateKeySigner,
+		signers: HashMap<u64, AccountSigner>,
+		default_signer: AccountSigner,
 	) -> Result<Self, DeliveryError> {
 		// Validate at least one network
 		if network_ids.is_empty() {
@@ -76,10 +75,13 @@ impl AlloyDelivery {
 			})?;
 
 			// Get the signer for this network, or use the default
-			let signer = signers.get(network_id).unwrap_or(&default_signer);
+			let signer = signers
+				.get(network_id)
+				.cloned()
+				.unwrap_or_else(|| default_signer.clone());
 
 			// Create signer with chain ID
-			let chain_signer = signer.clone().with_chain_id(Some(*network_id));
+			let chain_signer = signer.with_chain_id(Some(*network_id));
 			let wallet = EthereumWallet::from(chain_signer);
 
 			// Configure retry layer for handling network errors, rate limits, and execution reverts
@@ -573,16 +575,16 @@ async fn monitor_transaction(
 ///   - `network_ids` (required): Array of network IDs to support
 ///   - `accounts` (optional): Map of network IDs to account names for per-network signing
 /// - `networks`: Network configuration containing RPC URLs and contract addresses
-/// - `default_private_key`: Default private key for signing transactions
-/// - `network_private_keys`: Map of network IDs to private keys for per-network signing
+/// - `default_signer`: Default signer for signing transactions
+/// - `network_signers`: Map of network IDs to signers for per-network signing
 ///
 /// # Returns
 /// A boxed implementation of DeliveryInterface configured for the specified networks
 pub fn create_http_delivery(
 	config: &toml::Value,
 	networks: &NetworksConfig,
-	default_private_key: &solver_types::SecretString,
-	network_private_keys: &HashMap<u64, solver_types::SecretString>,
+	default_signer: &AccountSigner,
+	network_signers: &HashMap<u64, AccountSigner>,
 ) -> Result<Box<dyn DeliveryInterface>, DeliveryError> {
 	// Validate configuration first
 	AlloyDeliverySchema::validate_config(config)
@@ -605,25 +607,9 @@ pub fn create_http_delivery(
 		));
 	}
 
-	// Parse the default signer
-	let default_signer: PrivateKeySigner = default_private_key.with_exposed(|key| {
-		key.parse()
-			.map_err(|_| DeliveryError::Network("Invalid default private key format".to_string()))
-	})?;
-
-	// Parse network-specific signers
-	let mut network_signers = HashMap::new();
-	for (network_id, private_key) in network_private_keys {
-		let signer: PrivateKeySigner = private_key.with_exposed(|key| {
-			key.parse().map_err(|_| {
-				DeliveryError::Network(format!(
-					"Invalid private key format for network {}",
-					network_id
-				))
-			})
-		})?;
-		network_signers.insert(*network_id, signer);
-	}
+	// Clone the signers for use in the async block
+	let default_signer = default_signer.clone();
+	let network_signers = network_signers.clone();
 
 	// Create delivery service synchronously, but the actual connection happens async
 	let delivery = tokio::task::block_in_place(|| {
@@ -652,10 +638,8 @@ impl crate::DeliveryRegistry for Registry {}
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use solver_types::{
-		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
-		SecretString,
-	};
+	use alloy_signer_local::PrivateKeySigner;
+	use solver_types::utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder};
 	use std::collections::HashMap;
 
 	fn create_test_networks() -> NetworksConfig {
@@ -665,10 +649,12 @@ mod tests {
 			.build()
 	}
 
-	fn create_test_signer() -> PrivateKeySigner {
-		"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-			.parse()
-			.unwrap()
+	fn create_test_signer() -> AccountSigner {
+		let private_key_signer: PrivateKeySigner =
+			"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+				.parse()
+				.unwrap();
+		AccountSigner::Local(private_key_signer)
 	}
 
 	#[tokio::test]
@@ -741,12 +727,10 @@ mod tests {
 		});
 
 		let networks = create_test_networks();
-		let default_key = SecretString::from(
-			"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-		);
-		let network_keys = HashMap::new();
+		let default_signer = create_test_signer();
+		let network_signers = HashMap::new();
 
-		let result = create_http_delivery(&config, &networks, &default_key, &network_keys);
+		let result = create_http_delivery(&config, &networks, &default_signer, &network_signers);
 		assert!(result.is_ok());
 	}
 
@@ -895,10 +879,11 @@ mod tests {
 				.build();
 
 			let default_signer = create_test_signer();
-			let network_signer: PrivateKeySigner =
+			let network_signer_key: PrivateKeySigner =
 				"0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
 					.parse()
 					.unwrap();
+			let network_signer = AccountSigner::Local(network_signer_key);
 
 			let mut network_signers = HashMap::new();
 			network_signers.insert(137u64, network_signer);
