@@ -99,7 +99,9 @@ pub trait AccountInterface: Send + Sync {
 /// borrows the config safely for its entire lifetime.
 pub type AccountFactory = for<'a> fn(
 	&'a toml::Value,
-) -> Pin<Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + 'a>>;
+) -> Pin<
+	Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + 'a>,
+>;
 
 /// Registry trait for account implementations.
 ///

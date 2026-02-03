@@ -23,7 +23,9 @@ use tokio::sync::RwLock;
 // Type aliases for factory functions
 pub type AccountFactory = for<'a> fn(
 	&'a toml::Value,
-) -> Pin<Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + 'a>>;
+) -> Pin<
+	Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + 'a>,
+>;
 pub type DeliveryFactory = fn(
 	&toml::Value,
 	&NetworksConfig,
