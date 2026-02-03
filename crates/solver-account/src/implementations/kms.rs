@@ -6,15 +6,13 @@
 //!
 //! This module is only available when the `kms` feature is enabled.
 
-use crate::{AccountError, AccountInterface, AccountSigner};
+use crate::{AccountError, AccountFactoryFuture, AccountInterface, AccountSigner};
 use alloy_signer_aws::AwsSigner;
 use async_trait::async_trait;
 use aws_sdk_kms::Client as KmsClient;
 use solver_types::{
 	Address, ConfigSchema, Field, FieldType, Schema, Signature, Transaction, ValidationError,
 };
-use std::future::Future;
-use std::pin::Pin;
 
 /// Configuration schema for KMS wallet.
 pub struct KmsWalletSchema;
@@ -130,10 +128,7 @@ impl AccountInterface for KmsWallet {
 /// Factory function to create a KMS wallet from configuration.
 ///
 /// Returns an async future that initializes the KMS signer.
-#[allow(clippy::type_complexity)]
-pub fn create_account(
-	config: &toml::Value,
-) -> Pin<Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + '_>> {
+pub fn create_account(config: &toml::Value) -> AccountFactoryFuture<'_> {
 	Box::pin(async move {
 		KmsWalletSchema::validate_config(config)
 			.map_err(|e| AccountError::InvalidKey(format!("Invalid configuration: {e}")))?;

@@ -89,6 +89,12 @@ pub trait AccountInterface: Send + Sync {
 	}
 }
 
+/// The return type for async account factory functions.
+///
+/// This type alias simplifies the complex return type used by `create_account` functions.
+pub type AccountFactoryFuture<'a> =
+	Pin<Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + 'a>>;
+
 /// Async factory function type for account implementations.
 ///
 /// This is the function signature that all account implementations must provide
@@ -97,11 +103,7 @@ pub trait AccountInterface: Send + Sync {
 ///
 /// The `for<'a>` higher-ranked trait bound ensures the returned future
 /// borrows the config safely for its entire lifetime.
-pub type AccountFactory = for<'a> fn(
-	&'a toml::Value,
-) -> Pin<
-	Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + 'a>,
->;
+pub type AccountFactory = for<'a> fn(&'a toml::Value) -> AccountFactoryFuture<'a>;
 
 /// Registry trait for account implementations.
 ///

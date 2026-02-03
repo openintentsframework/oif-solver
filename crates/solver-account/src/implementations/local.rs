@@ -3,7 +3,7 @@
 //! This module provides concrete implementations of the AccountInterface trait,
 //! currently supporting local private key wallets using the Alloy library.
 
-use crate::{AccountError, AccountInterface, AccountSigner};
+use crate::{AccountError, AccountFactoryFuture, AccountInterface, AccountSigner};
 use alloy_consensus::TxLegacy;
 use alloy_network::TxSigner;
 use alloy_primitives::{Address as AlloyAddress, Bytes, TxKind};
@@ -14,8 +14,6 @@ use solver_types::{
 	with_0x_prefix, Address, ConfigSchema, Field, FieldType, Schema, SecretString, Signature,
 	Transaction,
 };
-use std::future::Future;
-use std::pin::Pin;
 
 /// Local wallet implementation using Alloy's signer.
 ///
@@ -171,10 +169,7 @@ impl AccountInterface for LocalWallet {
 /// Returns an error if:
 /// - `private_key` is not provided in the configuration
 /// - The wallet creation fails
-#[allow(clippy::type_complexity)]
-pub fn create_account(
-	config: &toml::Value,
-) -> Pin<Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + '_>> {
+pub fn create_account(config: &toml::Value) -> AccountFactoryFuture<'_> {
 	Box::pin(async move {
 		// Validate configuration first
 		LocalWalletSchema::validate_config(config)
