@@ -105,3 +105,84 @@ impl std::fmt::Debug for AccountSigner {
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	const TEST_PRIVATE_KEY: &str =
+		"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+	fn create_test_signer() -> AccountSigner {
+		let signer: PrivateKeySigner = TEST_PRIVATE_KEY.parse().unwrap();
+		AccountSigner::Local(signer)
+	}
+
+	#[test]
+	fn test_account_signer_address() {
+		let signer = create_test_signer();
+		let address = signer.address();
+		// Anvil account #0 address (lowercase)
+		assert_eq!(
+			format!("{:?}", address).to_lowercase(),
+			"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+		);
+	}
+
+	#[test]
+	fn test_account_signer_chain_id_none_by_default() {
+		let signer = create_test_signer();
+		assert_eq!(signer.chain_id(), None);
+	}
+
+	#[test]
+	fn test_account_signer_with_chain_id() {
+		let signer = create_test_signer();
+		let signer_with_chain = signer.with_chain_id(Some(1));
+		assert_eq!(signer_with_chain.chain_id(), Some(1));
+	}
+
+	#[test]
+	fn test_account_signer_set_chain_id() {
+		let mut signer = create_test_signer();
+		assert_eq!(signer.chain_id(), None);
+
+		signer.set_chain_id(Some(42));
+		assert_eq!(signer.chain_id(), Some(42));
+
+		signer.set_chain_id(None);
+		assert_eq!(signer.chain_id(), None);
+	}
+
+	#[test]
+	fn test_account_signer_clone() {
+		let signer = create_test_signer();
+		let cloned = signer.clone();
+		assert_eq!(signer.address(), cloned.address());
+	}
+
+	#[tokio::test]
+	async fn test_account_signer_sign_hash() {
+		let signer = create_test_signer();
+		let hash = B256::ZERO;
+		let signature = signer.sign_hash(&hash).await;
+		assert!(signature.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_account_signer_tx_signer_address() {
+		let signer = create_test_signer();
+		let address = <AccountSigner as TxSigner<Signature>>::address(&signer);
+		assert_eq!(
+			format!("{:?}", address).to_lowercase(),
+			"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+		);
+	}
+
+	#[test]
+	fn test_account_signer_debug() {
+		let signer = create_test_signer();
+		let debug_str = format!("{:?}", signer);
+		assert!(debug_str.contains("AccountSigner::Local"));
+	}
+}

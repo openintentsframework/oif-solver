@@ -166,3 +166,119 @@ impl AccountService {
 		self.implementation.get_private_key()
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_account_error_display() {
+		let err = AccountError::SigningFailed("test error".to_string());
+		assert_eq!(format!("{}", err), "Signing failed: test error");
+
+		let err = AccountError::InvalidKey("bad key".to_string());
+		assert_eq!(format!("{}", err), "Invalid key: bad key");
+
+		let err = AccountError::Implementation("impl error".to_string());
+		assert_eq!(format!("{}", err), "Implementation error: impl error");
+	}
+
+	#[test]
+	fn test_get_all_implementations_includes_local() {
+		let impls = get_all_implementations();
+		assert!(!impls.is_empty());
+		assert!(impls.iter().any(|(name, _)| *name == "local"));
+	}
+
+	#[test]
+	fn test_account_service_new() {
+		use implementations::local::create_account;
+
+		let config: toml::Value = toml::from_str(
+			r#"private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80""#,
+		)
+		.unwrap();
+		let account = create_account(&config).unwrap();
+		let service = AccountService::new(account);
+		// Just verify it can be created
+		let _ = service.signer();
+	}
+
+	#[tokio::test]
+	async fn test_account_service_get_address() {
+		use implementations::local::create_account;
+
+		let config: toml::Value = toml::from_str(
+			r#"private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80""#,
+		)
+		.unwrap();
+		let account = create_account(&config).unwrap();
+		let service = AccountService::new(account);
+
+		let address = service.get_address().await.unwrap();
+		assert!(!address.0.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_account_service_sign() {
+		use implementations::local::create_account;
+		use alloy_primitives::U256;
+
+		let config: toml::Value = toml::from_str(
+			r#"private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80""#,
+		)
+		.unwrap();
+		let account = create_account(&config).unwrap();
+		let service = AccountService::new(account);
+
+		let tx = Transaction {
+			to: Some(Address(vec![0u8; 20])),
+			value: U256::ZERO,
+			data: vec![],
+			gas_limit: Some(21000),
+			gas_price: Some(1000000000),
+			nonce: Some(0),
+			chain_id: 1,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+		};
+
+		let signature = service.sign(&tx).await.unwrap();
+		assert!(!signature.0.is_empty());
+	}
+
+	#[test]
+	#[allow(deprecated)]
+	fn test_account_service_get_private_key() {
+		use implementations::local::create_account;
+
+		let config: toml::Value = toml::from_str(
+			r#"private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80""#,
+		)
+		.unwrap();
+		let account = create_account(&config).unwrap();
+		let service = AccountService::new(account);
+
+		let key = service.get_private_key();
+		key.with_exposed(|s| {
+			assert!(s.starts_with("0x"));
+			assert_eq!(s.len(), 66); // 0x + 64 hex chars
+		});
+	}
+
+	#[test]
+	fn test_account_service_signer() {
+		use implementations::local::create_account;
+
+		let config: toml::Value = toml::from_str(
+			r#"private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80""#,
+		)
+		.unwrap();
+		let account = create_account(&config).unwrap();
+		let service = AccountService::new(account);
+
+		let signer = service.signer();
+		// Verify it returns a valid signer
+		let _ = signer.address();
+	}
+}

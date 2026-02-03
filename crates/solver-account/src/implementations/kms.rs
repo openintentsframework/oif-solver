@@ -11,8 +11,7 @@ use alloy_signer_aws::AwsSigner;
 use async_trait::async_trait;
 use aws_sdk_kms::Client as KmsClient;
 use solver_types::{
-	Address, ConfigSchema, Field, FieldType, Schema, SecretString, Signature, Transaction,
-	ValidationError,
+	Address, ConfigSchema, Field, FieldType, Schema, Signature, Transaction, ValidationError,
 };
 
 /// Configuration schema for KMS wallet.

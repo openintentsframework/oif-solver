@@ -375,4 +375,34 @@ mod tests {
 		let config = create_test_config(TEST_PRIVATE_KEY);
 		assert!(schema.validate(&config).is_ok());
 	}
+
+	#[test]
+	fn test_account_interface_signer() {
+		let wallet = LocalWallet::new(TEST_PRIVATE_KEY).unwrap();
+		let signer = wallet.signer();
+
+		// Verify the signer is a Local variant and has the correct address
+		match signer {
+			crate::AccountSigner::Local(s) => {
+				// Verify address matches
+				let expected_address = alloy_signer::Signer::address(&wallet.signer);
+				let actual_address = alloy_signer::Signer::address(&s);
+				assert_eq!(expected_address, actual_address);
+			},
+			#[cfg(feature = "kms")]
+			_ => panic!("Expected Local signer"),
+		}
+	}
+
+	#[test]
+	fn test_account_interface_get_private_key_trait() {
+		use crate::AccountInterface;
+		let wallet = LocalWallet::new(TEST_PRIVATE_KEY).unwrap();
+		// Call through the trait to test the trait impl
+		let key = AccountInterface::get_private_key(&wallet);
+		key.with_exposed(|s| {
+			assert!(s.starts_with("0x"));
+			assert_eq!(s.len(), 66);
+		});
+	}
 }
