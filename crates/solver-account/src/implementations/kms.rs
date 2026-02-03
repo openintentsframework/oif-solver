@@ -147,22 +147,20 @@ pub fn create_account(config: &toml::Value) -> Result<Box<dyn AccountInterface>,
 		.map(String::from);
 
 	// Block for async initialization with runtime safety
-	let wallet = match tokio::runtime::Handle::try_current() {
-		Ok(handle) => tokio::task::block_in_place(|| {
-			handle.block_on(async {
-				KmsWallet::new(key_id.to_string(), region.to_string(), endpoint).await
-			})
-		})?,
-		Err(_) => {
-			// Fallback for tests without runtime
-			let rt = tokio::runtime::Builder::new_current_thread()
-				.enable_all()
-				.build()
-				.map_err(|e| AccountError::Implementation(format!("Runtime error: {}", e)))?;
-			rt.block_on(async {
-				KmsWallet::new(key_id.to_string(), region.to_string(), endpoint).await
-			})?
-		},
+	// We create a new runtime to avoid issues with block_in_place panicking
+	// on current_thread runtimes (e.g., in tests using #[tokio::test])
+	let wallet = {
+		let key_id = key_id.to_string();
+		let region = region.to_string();
+
+		// Always create a dedicated runtime for KMS initialization
+		// This avoids block_in_place panic on single-threaded runtimes
+		let rt = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.map_err(|e| AccountError::Implementation(format!("Runtime error: {}", e)))?;
+
+		rt.block_on(async { KmsWallet::new(key_id, region, endpoint).await })?
 	};
 
 	Ok(Box::new(wallet))

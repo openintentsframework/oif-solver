@@ -77,8 +77,9 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 validator = { version = "0.20", features = ["derive"] }
 
 # AWS dependencies (for KMS signer)
-aws-config = "1.5"
-aws-sdk-kms = "1.50"
+# Minimum versions that fix CVE GHSA-g59m-gf8j-gjf5 (region validation flaw)
+aws-config = "1.8"
+aws-sdk-kms = "1.93"
 
 [profile.release]
 opt-level = 3
