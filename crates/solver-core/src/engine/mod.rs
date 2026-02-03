@@ -654,7 +654,7 @@ mod tests {
 
 	// Helper function to create mock services for testing
 	#[allow(clippy::type_complexity)]
-	fn create_mock_services() -> (
+	async fn create_mock_services() -> (
 		Arc<RwLock<Config>>,
 		Config,
 		Arc<StorageService>,
@@ -674,33 +674,33 @@ mod tests {
 			id = "test-solver"
 			monitoring_timeout_seconds = 30
 			min_profitability_pct = 1.0
-			
+
 			[storage]
 			primary = "memory"
 			cleanup_interval_seconds = 3600
 			[storage.implementations.memory]
-			
+
 			[delivery]
 			min_confirmations = 1
 			[delivery.implementations]
-			
+
 			[account]
 			primary = "local"
 			[account.implementations.local]
 			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
-			
+
 			[discovery]
 			[discovery.implementations]
-			
+
 			[order]
 			[order.implementations]
 			[order.strategy]
 			primary = "simple"
 			[order.strategy.implementations.simple]
-			
+
 			[settlement]
 			[settlement.implementations]
-			
+
 			[networks.1]
 			chain_id = 1
 			input_settler_address = "0x1111111111111111111111111111111111111111"
@@ -711,7 +711,7 @@ mod tests {
 			symbol = "TEST"
 			address = "0x3333333333333333333333333333333333333333"
 			decimals = 18
-			
+
 			[networks.2]
 			chain_id = 2
 			input_settler_address = "0x4444444444444444444444444444444444444444"
@@ -737,6 +737,7 @@ mod tests {
 		.expect("Failed to parse account config");
 		let account = Arc::new(AccountService::new(
 			solver_account::implementations::local::create_account(&account_config)
+				.await
 				.expect("Failed to create account"),
 		));
 
@@ -804,8 +805,8 @@ mod tests {
 		)
 	}
 
-	#[test]
-	fn test_solver_engine_new() {
+	#[tokio::test]
+	async fn test_solver_engine_new() {
 		let (
 			dynamic_config,
 			config,
@@ -819,7 +820,7 @@ mod tests {
 			pricing,
 			event_bus,
 			token_manager,
-		) = create_mock_services();
+		) = create_mock_services().await;
 
 		let engine = SolverEngine::new(
 			dynamic_config,
@@ -865,7 +866,7 @@ mod tests {
 			pricing,
 			event_bus,
 			token_manager,
-		) = create_mock_services();
+		) = create_mock_services().await;
 
 		let engine = SolverEngine::new(
 			dynamic_config,
@@ -904,7 +905,7 @@ mod tests {
 			pricing,
 			event_bus,
 			token_manager,
-		) = create_mock_services();
+		) = create_mock_services().await;
 
 		let engine = SolverEngine::new(
 			dynamic_config,
@@ -942,7 +943,7 @@ mod tests {
 			pricing,
 			event_bus,
 			token_manager,
-		) = create_mock_services();
+		) = create_mock_services().await;
 
 		let engine = SolverEngine::new(
 			dynamic_config,

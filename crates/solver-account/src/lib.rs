@@ -8,6 +8,8 @@ use async_trait::async_trait;
 use solver_types::{
 	Address, ConfigSchema, ImplementationRegistry, SecretString, Signature, Transaction,
 };
+use std::future::Future;
+use std::pin::Pin;
 use thiserror::Error;
 
 /// Signer abstraction module
@@ -87,11 +89,17 @@ pub trait AccountInterface: Send + Sync {
 	}
 }
 
-/// Type alias for account factory functions.
+/// Async factory function type for account implementations.
 ///
 /// This is the function signature that all account implementations must provide
-/// to create instances of their account interface.
-pub type AccountFactory = fn(&toml::Value) -> Result<Box<dyn AccountInterface>, AccountError>;
+/// to create instances of their account interface. The factory returns a future
+/// that resolves to the account implementation.
+///
+/// The `for<'a>` higher-ranked trait bound ensures the returned future
+/// borrows the config safely for its entire lifetime.
+pub type AccountFactory = for<'a> fn(
+	&'a toml::Value,
+) -> Pin<Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + 'a>>;
 
 /// Registry trait for account implementations.
 ///
@@ -190,15 +198,15 @@ mod tests {
 		assert!(impls.iter().any(|(name, _)| *name == "local"));
 	}
 
-	#[test]
-	fn test_account_service_new() {
+	#[tokio::test]
+	async fn test_account_service_new() {
 		use implementations::local::create_account;
 
 		let config: toml::Value = toml::from_str(
 			r#"private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80""#,
 		)
 		.unwrap();
-		let account = create_account(&config).unwrap();
+		let account = create_account(&config).await.unwrap();
 		let service = AccountService::new(account);
 		// Just verify it can be created
 		let _ = service.signer();
@@ -212,7 +220,7 @@ mod tests {
 			r#"private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80""#,
 		)
 		.unwrap();
-		let account = create_account(&config).unwrap();
+		let account = create_account(&config).await.unwrap();
 		let service = AccountService::new(account);
 
 		let address = service.get_address().await.unwrap();
@@ -228,7 +236,7 @@ mod tests {
 			r#"private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80""#,
 		)
 		.unwrap();
-		let account = create_account(&config).unwrap();
+		let account = create_account(&config).await.unwrap();
 		let service = AccountService::new(account);
 
 		let tx = Transaction {
@@ -247,16 +255,16 @@ mod tests {
 		assert!(!signature.0.is_empty());
 	}
 
-	#[test]
+	#[tokio::test]
 	#[allow(deprecated)]
-	fn test_account_service_get_private_key() {
+	async fn test_account_service_get_private_key() {
 		use implementations::local::create_account;
 
 		let config: toml::Value = toml::from_str(
 			r#"private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80""#,
 		)
 		.unwrap();
-		let account = create_account(&config).unwrap();
+		let account = create_account(&config).await.unwrap();
 		let service = AccountService::new(account);
 
 		let key = service.get_private_key();
@@ -266,15 +274,15 @@ mod tests {
 		});
 	}
 
-	#[test]
-	fn test_account_service_signer() {
+	#[tokio::test]
+	async fn test_account_service_signer() {
 		use implementations::local::create_account;
 
 		let config: toml::Value = toml::from_str(
 			r#"private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80""#,
 		)
 		.unwrap();
-		let account = create_account(&config).unwrap();
+		let account = create_account(&config).await.unwrap();
 		let service = AccountService::new(account);
 
 		let signer = service.signer();

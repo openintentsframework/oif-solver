@@ -15,11 +15,15 @@ use solver_settlement::{SettlementError, SettlementInterface};
 use solver_storage::StorageFactory;
 use solver_types::{NetworksConfig, PricingError};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 
 // Type aliases for factory functions
-pub type AccountFactory = fn(&toml::Value) -> Result<Box<dyn AccountInterface>, AccountError>;
+pub type AccountFactory = for<'a> fn(
+	&'a toml::Value,
+) -> Pin<Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + 'a>>;
 pub type DeliveryFactory = fn(
 	&toml::Value,
 	&NetworksConfig,

@@ -706,12 +706,12 @@ mod tests {
 	use std::sync::Arc;
 
 	/// Creates a minimal mock SolverEngine for testing
-	fn create_mock_solver() -> SolverEngine {
-		create_mock_solver_with_networks(HashMap::new())
+	async fn create_mock_solver() -> SolverEngine {
+		create_mock_solver_with_networks(HashMap::new()).await
 	}
 
 	/// Creates a minimal mock SolverEngine for testing with custom network configurations
-	fn create_mock_solver_with_networks(networks: NetworksConfig) -> SolverEngine {
+	async fn create_mock_solver_with_networks(networks: NetworksConfig) -> SolverEngine {
 		use solver_account::AccountService;
 		use solver_config::Config;
 		use solver_core::engine::event_bus::EventBus;
@@ -729,33 +729,33 @@ mod tests {
 			id = "test-solver"
 			monitoring_timeout_seconds = 30
 			min_profitability_pct = 1.0
-			
+
 			[storage]
 			primary = "memory"
 			cleanup_interval_seconds = 3600
 			[storage.implementations.memory]
-			
+
 			[delivery]
 			min_confirmations = 1
 			[delivery.implementations]
-			
+
 			[account]
 			primary = "local"
 			[account.implementations.local]
 			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
-			
+
 			[discovery]
 			[discovery.implementations]
-			
+
 			[order]
 			[order.implementations]
 			[order.strategy]
 			primary = "simple"
 			[order.strategy.implementations.simple]
-			
+
 			[settlement]
 			[settlement.implementations]
-			
+
 			[networks]
 		"#;
 		let config: Config = toml::from_str(config_toml).expect("Failed to parse test config");
@@ -771,6 +771,7 @@ mod tests {
 		.expect("Failed to parse account config");
 		let account = Arc::new(AccountService::new(
 			solver_account::implementations::local::create_account(&account_config)
+				.await
 				.expect("Failed to create account"),
 		));
 
@@ -998,9 +999,9 @@ mod tests {
 
 	// ========== validate_quote_request Tests ==========
 
-	#[test]
-	fn test_validate_quote_request_success_exact_input() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_success_exact_input() {
+		let solver = create_mock_solver().await;
 		let request = create_valid_get_quote_request();
 
 		let result = QuoteValidator::validate_quote_request(&request, &solver);
@@ -1016,9 +1017,9 @@ mod tests {
 		assert!(context.constraint_outputs.is_some());
 	}
 
-	#[test]
-	fn test_validate_quote_request_success_exact_output() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_success_exact_output() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent = create_exact_output_request(None, Some("1000000000000000000"));
 
@@ -1035,9 +1036,9 @@ mod tests {
 		assert!(context.constraint_inputs.is_some());
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_empty_inputs() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_empty_inputs() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent.inputs = vec![]; // Empty inputs
 
@@ -1049,9 +1050,9 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_empty_outputs() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_empty_outputs() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent.outputs = vec![]; // Empty outputs
 
@@ -1063,9 +1064,9 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_empty_supported_types() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_empty_supported_types() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.supported_types = vec![]; // Empty supported types
 
@@ -1077,9 +1078,9 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_invalid_order_type_format() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_invalid_order_type_format() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.supported_types = vec!["invalid-format".to_string()]; // Invalid format
 
@@ -1091,9 +1092,9 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_missing_input_amount_exact_input() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_missing_input_amount_exact_input() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent = create_exact_input_request(None, None); // Missing input amount
 
@@ -1105,9 +1106,9 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_missing_output_amount_exact_output() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_missing_output_amount_exact_output() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent = create_exact_output_request(None, None); // Missing output amount
 
@@ -1119,9 +1120,9 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_zero_input_amount_exact_input() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_zero_input_amount_exact_input() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent = create_exact_input_request(Some("0"), None); // Zero input amount
 
@@ -1133,9 +1134,9 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_zero_output_amount_exact_output() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_zero_output_amount_exact_output() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent = create_exact_output_request(None, Some("0")); // Zero output amount
 
@@ -1147,9 +1148,9 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_empty_auth_schemes() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_empty_auth_schemes() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent.origin_submission = Some(OriginSubmission {
 			mode: OriginMode::User,
@@ -1164,9 +1165,9 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_success_with_valid_auth_schemes() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_success_with_valid_auth_schemes() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent.origin_submission = Some(OriginSubmission {
 			mode: OriginMode::User,
@@ -1181,9 +1182,9 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_success_with_no_auth_schemes() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_success_with_no_auth_schemes() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent.origin_submission = Some(OriginSubmission {
 			mode: OriginMode::User,
@@ -1198,9 +1199,9 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_success_with_no_origin_submission() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_success_with_no_origin_submission() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent.origin_submission = None;
 
@@ -1212,9 +1213,9 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_order_type_compatibility() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_order_type_compatibility() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		// Set supported types that won't match the inferred order type
 		request.supported_types = vec!["oif-different-v1".to_string()];
@@ -1227,9 +1228,9 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_handles_invalid_interop_addresses() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_handles_invalid_interop_addresses() {
+		let solver = create_mock_solver().await;
 		let request = create_valid_get_quote_request();
 
 		// Create an invalid interop address by directly constructing it

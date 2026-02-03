@@ -809,7 +809,7 @@ mod tests {
 	use wiremock::matchers::{method, path};
 	use wiremock::{Mock, MockServer, ResponseTemplate};
 
-	fn build_test_solver_engine() -> Arc<SolverEngine> {
+	async fn build_test_solver_engine() -> Arc<SolverEngine> {
 		let config_toml = r#"
 			[solver]
 			id = "test-solver"
@@ -863,6 +863,7 @@ mod tests {
 		)
 		.expect("failed to parse account config");
 		let account_impl = solver_account::implementations::local::create_account(&account_config)
+			.await
 			.expect("failed to create account impl");
 		let account = Arc::new(AccountService::new(account_impl));
 
@@ -910,8 +911,8 @@ mod tests {
 		Arc::new(engine)
 	}
 
-	fn build_test_app_state(discovery_url: Option<String>) -> AppState {
-		let solver = build_test_solver_engine();
+	async fn build_test_app_state(discovery_url: Option<String>) -> AppState {
+		let solver = build_test_solver_engine().await;
 		let config = solver.config().clone();
 		let dynamic_config = Arc::new(RwLock::new(config));
 
@@ -976,7 +977,7 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn forward_to_discovery_service_returns_service_unavailable_when_missing_url() {
-		let state = build_test_app_state(None);
+		let state = build_test_app_state(None).await;
 		let response =
 			super::forward_to_discovery_service(&state, &sample_post_order_request()).await;
 
@@ -1013,7 +1014,7 @@ mod tests {
 			.await;
 
 		let discovery_url = format!("{}/intent", mock_server.uri());
-		let state = build_test_app_state(Some(discovery_url));
+		let state = build_test_app_state(Some(discovery_url)).await;
 
 		let response =
 			super::forward_to_discovery_service(&state, &sample_post_order_request()).await;
@@ -1040,7 +1041,7 @@ mod tests {
 			.await;
 
 		let discovery_url = format!("{}/intent", mock_server.uri());
-		let state = build_test_app_state(Some(discovery_url));
+		let state = build_test_app_state(Some(discovery_url)).await;
 
 		let response =
 			super::forward_to_discovery_service(&state, &sample_post_order_request()).await;
@@ -1061,7 +1062,7 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn create_intent_from_quote_errors_without_quote_id() {
-		let state = build_test_app_state(None);
+		let state = build_test_app_state(None).await;
 		let payload = json!({ "signature": "0x1234" });
 
 		let error = super::create_intent_from_quote(payload, &state, "eip7683")
@@ -1079,7 +1080,7 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn create_intent_from_quote_errors_without_signature() {
-		let state = build_test_app_state(None);
+		let state = build_test_app_state(None).await;
 		let payload = json!({ "quoteId": "quote-123" });
 
 		let error = super::create_intent_from_quote(payload, &state, "eip7683")
@@ -1097,7 +1098,7 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn create_intent_from_quote_errors_when_quote_not_found() {
-		let state = build_test_app_state(None);
+		let state = build_test_app_state(None).await;
 		let payload = json!({
 			"quoteId": "missing-quote",
 			"signature": "0x1234"
@@ -1118,7 +1119,7 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn extract_intent_request_returns_direct_payload_unchanged() {
-		let state = build_test_app_state(None);
+		let state = build_test_app_state(None).await;
 		let resource_order_payload = OrderPayload {
 			signature_type: SignatureType::Eip712,
 			domain: json!({
@@ -1161,7 +1162,7 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn extract_intent_request_errors_when_signature_recovery_fails() {
-		let state = build_test_app_state(None);
+		let state = build_test_app_state(None).await;
 		let mut request = sample_post_order_request();
 		request.signature = alloy_primitives::Bytes::from(Vec::<u8>::new());
 		let payload = to_value(&request).expect("serialize request");

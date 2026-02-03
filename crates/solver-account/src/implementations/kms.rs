@@ -13,6 +13,8 @@ use aws_sdk_kms::Client as KmsClient;
 use solver_types::{
 	Address, ConfigSchema, Field, FieldType, Schema, Signature, Transaction, ValidationError,
 };
+use std::future::Future;
+use std::pin::Pin;
 
 /// Configuration schema for KMS wallet.
 pub struct KmsWalletSchema;
@@ -127,43 +129,36 @@ impl AccountInterface for KmsWallet {
 
 /// Factory function to create a KMS wallet from configuration.
 ///
-/// This function uses sync blocking to initialize the async KMS signer.
-/// Safe to call from within a tokio runtime context.
-pub fn create_account(config: &toml::Value) -> Result<Box<dyn AccountInterface>, AccountError> {
-	KmsWalletSchema::validate_config(config)
-		.map_err(|e| AccountError::InvalidKey(format!("Invalid configuration: {}", e)))?;
+/// Returns an async future that initializes the KMS signer.
+pub fn create_account(
+	config: &toml::Value,
+) -> Pin<Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + '_>> {
+	Box::pin(async move {
+		KmsWalletSchema::validate_config(config)
+			.map_err(|e| AccountError::InvalidKey(format!("Invalid configuration: {}", e)))?;
 
-	let key_id = config
-		.get("key_id")
-		.and_then(|v| v.as_str())
-		.ok_or_else(|| AccountError::InvalidKey("key_id required".into()))?;
-	let region = config
-		.get("region")
-		.and_then(|v| v.as_str())
-		.ok_or_else(|| AccountError::InvalidKey("region required".into()))?;
-	let endpoint = config
-		.get("endpoint")
-		.and_then(|v| v.as_str())
-		.map(String::from);
+		let key_id = config
+			.get("key_id")
+			.and_then(|v| v.as_str())
+			.ok_or_else(|| AccountError::InvalidKey("key_id required".into()))?
+			.to_string();
 
-	// Block for async initialization with runtime safety
-	// We create a new runtime to avoid issues with block_in_place panicking
-	// on current_thread runtimes (e.g., in tests using #[tokio::test])
-	let wallet = {
-		let key_id = key_id.to_string();
-		let region = region.to_string();
+		let region = config
+			.get("region")
+			.and_then(|v| v.as_str())
+			.ok_or_else(|| AccountError::InvalidKey("region required".into()))?
+			.to_string();
 
-		// Always create a dedicated runtime for KMS initialization
-		// This avoids block_in_place panic on single-threaded runtimes
-		let rt = tokio::runtime::Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.map_err(|e| AccountError::Implementation(format!("Runtime error: {}", e)))?;
+		let endpoint = config
+			.get("endpoint")
+			.and_then(|v| v.as_str())
+			.map(String::from);
 
-		rt.block_on(async { KmsWallet::new(key_id, region, endpoint).await })?
-	};
+		// Direct async call - no more block_on!
+		let wallet = KmsWallet::new(key_id, region, endpoint).await?;
 
-	Ok(Box::new(wallet))
+		Ok(Box::new(wallet) as Box<dyn AccountInterface>)
+	})
 }
 
 /// Registry for the KMS account implementation.

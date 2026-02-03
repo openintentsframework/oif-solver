@@ -15,6 +15,8 @@ use solver_pricing::PricingService;
 use solver_settlement::{SettlementError, SettlementInterface, SettlementService};
 use solver_storage::{StorageError, StorageInterface, StorageService};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -76,7 +78,11 @@ impl SolverBuilder {
 	) -> Result<SolverEngine, BuilderError>
 	where
 		SF: Fn(&toml::Value) -> Result<Box<dyn StorageInterface>, StorageError>,
-		AF: Fn(&toml::Value) -> Result<Box<dyn AccountInterface>, AccountError>,
+		for<'a> AF: Fn(
+			&'a toml::Value,
+		) -> Pin<
+			Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + 'a>,
+		>,
 		DF: Fn(
 			&toml::Value,
 			&solver_types::NetworksConfig,
@@ -150,7 +156,7 @@ impl SolverBuilder {
 		let mut account_impls = HashMap::new();
 		for (name, config) in &self.static_config.account.implementations {
 			if let Some(factory) = factories.account_factories.get(name) {
-				match factory(config) {
+				match factory(config).await {
 					Ok(implementation) => {
 						account_impls.insert(name.clone(), implementation);
 						let is_primary = &self.static_config.account.primary == name;

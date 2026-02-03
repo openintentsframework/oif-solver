@@ -254,7 +254,7 @@ mod tests {
 	}
 
 	/// Creates a mock SolverEngine with test data for unit tests.
-	fn create_mock_solver_engine() -> Arc<SolverEngine> {
+	async fn create_mock_solver_engine() -> Arc<SolverEngine> {
 		let token_manager = create_mock_token_manager();
 
 		// Create minimal config for testing
@@ -263,33 +263,33 @@ mod tests {
 			id = "test-solver"
 			monitoring_timeout_seconds = 30
 			min_profitability_pct = 1.0
-			
+
 			[storage]
 			primary = "memory"
 			cleanup_interval_seconds = 3600
 			[storage.implementations.memory]
-			
+
 			[delivery]
 			min_confirmations = 1
 			[delivery.implementations]
-			
+
 			[account]
 			primary = "local"
 			[account.implementations.local]
 			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
-			
+
 			[discovery]
 			[discovery.implementations]
-			
+
 			[order]
 			[order.implementations]
 			[order.strategy]
 			primary = "simple"
 			[order.strategy.implementations.simple]
-			
+
 			[settlement]
 			[settlement.implementations]
-			
+
 			[networks.1]
 			chain_id = 1
 			input_settler_address = "0x1111111111111111111111111111111111111111"
@@ -316,6 +316,7 @@ mod tests {
 		.expect("Failed to parse account config");
 		let account = Arc::new(solver_account::AccountService::new(
 			solver_account::implementations::local::create_account(&account_config)
+				.await
 				.expect("Failed to create account"),
 		));
 
@@ -372,7 +373,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_get_tokens_returns_all_networks() {
-		let solver = create_mock_solver_engine();
+		let solver = create_mock_solver_engine().await;
 		let response = get_tokens(State(solver)).await;
 
 		let tokens_response = response.0;
@@ -454,7 +455,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_get_tokens_for_chain_valid_chain_id() {
-		let solver = create_mock_solver_engine();
+		let solver = create_mock_solver_engine().await;
 		let response = get_tokens_for_chain(Path(1), State(solver)).await;
 
 		assert!(response.is_ok());
@@ -486,7 +487,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_get_tokens_for_chain_invalid_chain_id() {
-		let solver = create_mock_solver_engine();
+		let solver = create_mock_solver_engine().await;
 		let response = get_tokens_for_chain(Path(999), State(solver)).await;
 
 		assert!(response.is_err());
@@ -495,7 +496,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_get_tokens_for_chain_polygon() {
-		let solver = create_mock_solver_engine();
+		let solver = create_mock_solver_engine().await;
 		let response = get_tokens_for_chain(Path(137), State(solver)).await;
 
 		assert!(response.is_ok());

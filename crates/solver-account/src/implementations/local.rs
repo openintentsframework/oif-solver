@@ -14,6 +14,8 @@ use solver_types::{
 	with_0x_prefix, Address, ConfigSchema, Field, FieldType, Schema, SecretString, Signature,
 	Transaction,
 };
+use std::future::Future;
+use std::pin::Pin;
 
 /// Local wallet implementation using Alloy's signer.
 ///
@@ -163,22 +165,28 @@ impl AccountInterface for LocalWallet {
 /// AccountInterface implementation. Currently only supports local wallets
 /// with a private_key configuration parameter.
 ///
+/// Returns an async future that resolves to the account implementation.
+///
 /// # Errors
 ///
 /// Returns an error if:
 /// - `private_key` is not provided in the configuration
 /// - The wallet creation fails
-pub fn create_account(config: &toml::Value) -> Result<Box<dyn AccountInterface>, AccountError> {
-	// Validate configuration first
-	LocalWalletSchema::validate_config(config)
-		.map_err(|e| AccountError::InvalidKey(format!("Invalid configuration: {}", e)))?;
+pub fn create_account(
+	config: &toml::Value,
+) -> Pin<Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + '_>> {
+	Box::pin(async move {
+		// Validate configuration first
+		LocalWalletSchema::validate_config(config)
+			.map_err(|e| AccountError::InvalidKey(format!("Invalid configuration: {}", e)))?;
 
-	let private_key = config
-		.get("private_key")
-		.and_then(|v| v.as_str())
-		.expect("private_key already validated");
+		let private_key = config
+			.get("private_key")
+			.and_then(|v| v.as_str())
+			.ok_or_else(|| AccountError::InvalidKey("private_key required".into()))?;
 
-	Ok(Box::new(LocalWallet::new(private_key)?))
+		Ok(Box::new(LocalWallet::new(private_key)?) as Box<dyn AccountInterface>)
+	})
 }
 
 /// Registry for the local account implementation.
@@ -334,24 +342,24 @@ mod tests {
 		assert!(!signature.0.is_empty());
 	}
 
-	#[test]
-	fn test_create_account_valid_config() {
+	#[tokio::test]
+	async fn test_create_account_valid_config() {
 		let config = create_test_config(TEST_PRIVATE_KEY);
-		let account = create_account(&config).unwrap();
+		let account = create_account(&config).await.unwrap();
 		assert!(!account.get_private_key().with_exposed(|s| s.is_empty()));
 	}
 
-	#[test]
-	fn test_create_account_invalid_config() {
+	#[tokio::test]
+	async fn test_create_account_invalid_config() {
 		let config = create_test_config(INVALID_PRIVATE_KEY);
-		let result = create_account(&config);
+		let result = create_account(&config).await;
 		assert!(result.is_err());
 	}
 
-	#[test]
-	fn test_create_account_missing_private_key() {
+	#[tokio::test]
+	async fn test_create_account_missing_private_key() {
 		let config = toml::Value::Table(HashMap::new().into_iter().collect());
-		let result = create_account(&config);
+		let result = create_account(&config).await;
 		assert!(result.is_err());
 	}
 
@@ -360,11 +368,11 @@ mod tests {
 		assert_eq!(Registry::NAME, "local");
 	}
 
-	#[test]
-	fn test_registry_factory() {
+	#[tokio::test]
+	async fn test_registry_factory() {
 		let factory = Registry::factory();
 		let config = create_test_config(TEST_PRIVATE_KEY);
-		let account = factory(&config).unwrap();
+		let account = factory(&config).await.unwrap();
 		assert!(!account.get_private_key().with_exposed(|s| s.is_empty()));
 	}
 
