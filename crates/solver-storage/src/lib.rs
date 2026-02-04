@@ -347,8 +347,7 @@ impl StoreConfig {
 			},
 			"memory" => Ok(StoreConfig::Memory),
 			other => Err(StorageError::Configuration(format!(
-				"Unsupported storage backend '{}'. Supported: redis, file, memory",
-				other
+				"Unsupported storage backend '{other}'. Supported: redis, file, memory"
 			))),
 		}
 	}
@@ -420,7 +419,7 @@ pub fn redact_url_credentials(url: &str) -> String {
 	// Reconstruct URL with redacted credentials
 	let scheme = &url[..scheme_end + 3];
 	let host_and_path = &after_scheme[at_pos + 1..];
-	format!("{}[REDACTED]@{}", scheme, host_and_path)
+	format!("{scheme}[REDACTED]@{host_and_path}")
 }
 
 // =============================================================================
@@ -455,7 +454,7 @@ impl StorageService {
 		indexes: Option<StorageIndexes>,
 		ttl: Option<Duration>,
 	) -> Result<(), StorageError> {
-		let key = format!("{}:{}", namespace, id);
+		let key = format!("{namespace}:{id}");
 		let bytes =
 			serde_json::to_vec(data).map_err(|e| StorageError::Serialization(e.to_string()))?;
 		self.backend.set_bytes(&key, bytes, indexes, ttl).await
@@ -482,7 +481,7 @@ impl StorageService {
 		namespace: &str,
 		id: &str,
 	) -> Result<T, StorageError> {
-		let key = format!("{}:{}", namespace, id);
+		let key = format!("{namespace}:{id}");
 		let bytes = self.backend.get_bytes(&key).await?;
 		serde_json::from_slice(&bytes).map_err(|e| StorageError::Serialization(e.to_string()))
 	}
@@ -491,7 +490,7 @@ impl StorageService {
 	///
 	/// The namespace and id are combined to form the key to delete.
 	pub async fn remove(&self, namespace: &str, id: &str) -> Result<(), StorageError> {
-		let key = format!("{}:{}", namespace, id);
+		let key = format!("{namespace}:{id}");
 		self.backend.delete(&key).await
 	}
 
@@ -507,7 +506,7 @@ impl StorageService {
 		data: &T,
 		indexes: Option<StorageIndexes>,
 	) -> Result<(), StorageError> {
-		let key = format!("{}:{}", namespace, id);
+		let key = format!("{namespace}:{id}");
 
 		// Check if the key exists first
 		if !self.backend.exists(&key).await? {
@@ -524,7 +523,7 @@ impl StorageService {
 	/// The namespace and id are combined to form the lookup key.
 	/// Returns true if the key exists, false otherwise.
 	pub async fn exists(&self, namespace: &str, id: &str) -> Result<bool, StorageError> {
-		let key = format!("{}:{}", namespace, id);
+		let key = format!("{namespace}:{id}");
 		self.backend.exists(&key).await
 	}
 
@@ -548,7 +547,7 @@ impl StorageService {
 		indexes: Option<StorageIndexes>,
 		ttl: Option<Duration>,
 	) -> Result<(), StorageError> {
-		let key = format!("{}:{}", namespace, id);
+		let key = format!("{namespace}:{id}");
 
 		// Check if the key exists first
 		if !self.backend.exists(&key).await? {
@@ -696,7 +695,7 @@ mod tests {
 		let config = StoreConfig::Redis {
 			url: "redis://:secret@localhost:6379".to_string(),
 		};
-		let debug_str = format!("{:?}", config);
+		let debug_str = format!("{config:?}");
 		// Should redact credentials
 		assert!(debug_str.contains("[REDACTED]"));
 		assert!(!debug_str.contains("secret"));
@@ -707,7 +706,7 @@ mod tests {
 		let config = StoreConfig::File {
 			path: "/my/storage/path".to_string(),
 		};
-		let debug_str = format!("{:?}", config);
+		let debug_str = format!("{config:?}");
 		assert!(debug_str.contains("File"));
 		assert!(debug_str.contains("/my/storage/path"));
 	}
@@ -715,7 +714,7 @@ mod tests {
 	#[test]
 	fn test_store_config_debug_memory() {
 		let config = StoreConfig::Memory;
-		let debug_str = format!("{:?}", config);
+		let debug_str = format!("{config:?}");
 		assert!(debug_str.contains("Memory"));
 	}
 

@@ -13,6 +13,7 @@
 use axum::{extract::State, Json};
 use serde::Serialize;
 use solver_config::Config;
+use solver_core::engine::token_manager::TokenManager;
 use solver_storage::{
 	config_store::{ConfigStore, ConfigStoreError},
 	nonce_store::NonceStore,
@@ -38,6 +39,8 @@ pub struct AdminApiState {
 	pub dynamic_config: Arc<RwLock<Config>>,
 	/// Nonce store (concrete type, kept for rebuilding verifier).
 	pub nonce_store: Arc<NonceStore>,
+	/// Token manager for hot-reloading token configurations.
+	pub token_manager: Arc<TokenManager>,
 }
 
 impl AdminApiState {
@@ -183,14 +186,21 @@ pub async fn handle_add_token(
 
 	// 7. HOT RELOAD: Rebuild runtime Config from updated OperatorConfig
 	let new_config = build_runtime_config(&new_versioned.data)
-		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {}", e)))?;
+		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {e}")))?;
+
+	// 8. Update TokenManager with new networks configuration
+	// This ensures quotes and other token operations immediately see the new token
+	let new_networks = new_config.networks.clone();
+	state.token_manager.update_networks(new_networks).await;
+
+	// 9. Update dynamic_config
 	*state.dynamic_config.write().await = new_config;
 
 	tracing::info!(
 		version = new_versioned.version,
 		token = %request.contents.symbol,
 		chain_id = request.contents.chain_id,
-		"Token added and config hot-reloaded"
+		"Token added and config hot-reloaded (TokenManager updated)"
 	);
 
 	Ok(Json(AdminActionResponse {
@@ -199,7 +209,7 @@ pub async fn handle_add_token(
 			"Token {} added to chain {}",
 			request.contents.symbol, request.contents.chain_id
 		),
-		admin: format!("{:?}", admin),
+		admin: format!("{admin:?}"),
 	}))
 }
 
@@ -276,7 +286,7 @@ pub async fn handle_update_fees(
 
 	// 7. HOT RELOAD: Rebuild runtime Config from updated OperatorConfig
 	let new_config = build_runtime_config(&new_versioned.data)
-		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {}", e)))?;
+		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {e}")))?;
 	*state.dynamic_config.write().await = new_config;
 
 	tracing::info!(
@@ -292,7 +302,7 @@ pub async fn handle_update_fees(
 			"Fee configuration updated: gasBufferBps={}, minProfitabilityPct={}",
 			request.contents.gas_buffer_bps, request.contents.min_profitability_pct
 		),
-		admin: format!("{:?}", admin),
+		admin: format!("{admin:?}"),
 	}))
 }
 
@@ -300,23 +310,22 @@ pub async fn handle_update_fees(
 fn config_store_error(err: ConfigStoreError) -> AdminAuthError {
 	match err {
 		ConfigStoreError::NotFound(msg) => {
-			AdminAuthError::Internal(format!("Configuration not found: {}", msg))
+			AdminAuthError::Internal(format!("Configuration not found: {msg}"))
 		},
 		ConfigStoreError::VersionMismatch { expected, found } => AdminAuthError::Internal(format!(
-			"Configuration was modified concurrently (expected version {}, found {}), please retry",
-			expected, found
+			"Configuration was modified concurrently (expected version {expected}, found {found}), please retry"
 		)),
 		ConfigStoreError::Serialization(msg) => {
-			AdminAuthError::Internal(format!("Serialization error: {}", msg))
+			AdminAuthError::Internal(format!("Serialization error: {msg}"))
 		},
 		ConfigStoreError::Backend(msg) => {
-			AdminAuthError::Internal(format!("Storage error: {}", msg))
+			AdminAuthError::Internal(format!("Storage error: {msg}"))
 		},
 		ConfigStoreError::Configuration(msg) => {
-			AdminAuthError::Internal(format!("Configuration error: {}", msg))
+			AdminAuthError::Internal(format!("Configuration error: {msg}"))
 		},
 		ConfigStoreError::AlreadyExists(msg) => {
-			AdminAuthError::Internal(format!("Configuration already exists: {}", msg))
+			AdminAuthError::Internal(format!("Configuration already exists: {msg}"))
 		},
 	}
 }

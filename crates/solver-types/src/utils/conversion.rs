@@ -145,18 +145,18 @@ pub fn parse_address(hex_str: &str) -> Result<Address, String> {
 	// Handle U256 hex that's missing leading zeros (common with EIP-7683 inputs)
 	// U256 serialization drops leading zeros, so "0x8ad..." (31 bytes) should be "0x08ad..." (32 bytes)
 	let padded_hex = match hex_clean.len() {
-		40 => hex_clean.to_string(),      // Standard 20-byte address
-		62 => format!("00{}", hex_clean), // 31 bytes -> pad to 32
-		64 => hex_clean.to_string(),      // Already 32 bytes
+		40 => hex_clean.to_string(),    // Standard 20-byte address
+		62 => format!("00{hex_clean}"), // 31 bytes -> pad to 32
+		64 => hex_clean.to_string(),    // Already 32 bytes
 		_ if hex_clean.len() < 64 && hex_clean.len() > 40 => {
 			// Other missing zeros cases - pad to 64 chars (32 bytes)
-			format!("{:0>64}", hex_clean)
+			format!("{hex_clean:0>64}")
 		},
 		_ => hex_clean.to_string(),
 	};
 
 	hex::decode(&padded_hex)
-		.map_err(|e| format!("Invalid hex: {}", e))
+		.map_err(|e| format!("Invalid hex: {e}"))
 		.and_then(|bytes| {
 			match bytes.len() {
 				20 => {
@@ -221,8 +221,7 @@ pub fn wei_to_eth_string(wei_amount: U256) -> String {
 /// assert_eq!(wei.to_string(), "1500000000000000000");
 /// ```
 pub fn eth_string_to_wei(eth_amount: &str) -> Result<U256, String> {
-	parse_ether(eth_amount)
-		.map_err(|e| format!("Failed to parse ETH amount '{}': {}", eth_amount, e))
+	parse_ether(eth_amount).map_err(|e| format!("Failed to parse ETH amount '{eth_amount}': {e}"))
 }
 
 /// Convert wei string to ETH string using Alloy utilities.
@@ -246,7 +245,7 @@ pub fn eth_string_to_wei(eth_amount: &str) -> Result<U256, String> {
 /// ```
 pub fn wei_string_to_eth_string(wei_string: &str) -> Result<String, String> {
 	let wei = U256::from_str_radix(wei_string, 10)
-		.map_err(|e| format!("Invalid wei amount '{}': {}", wei_string, e))?;
+		.map_err(|e| format!("Invalid wei amount '{wei_string}': {e}"))?;
 	Ok(format_ether(wei))
 }
 
@@ -360,7 +359,7 @@ pub fn solver_address_to_bytes32(address: &crate::Address) -> [u8; 32] {
 /// ```
 pub fn hex_to_alloy_address(hex_str: &str) -> Result<AlloyAddress, String> {
 	let hex_clean = hex_str.trim_start_matches("0x");
-	let bytes = hex::decode(hex_clean).map_err(|e| format!("Invalid hex string: {}", e))?;
+	let bytes = hex::decode(hex_clean).map_err(|e| format!("Invalid hex string: {e}"))?;
 
 	match bytes.len() {
 		20 => {
@@ -373,9 +372,9 @@ pub fn hex_to_alloy_address(hex_str: &str) -> Result<AlloyAddress, String> {
 				.try_into()
 				.map_err(|_| "Failed to convert to 32-byte array")?;
 			let address_hex = bytes32_to_address(&bytes32_array);
-			format!("0x{}", address_hex)
+			format!("0x{address_hex}")
 				.parse::<AlloyAddress>()
-				.map_err(|e| format!("Failed to parse extracted address: {}", e))
+				.map_err(|e| format!("Failed to parse extracted address: {e}"))
 		},
 		_ => Err(format!(
 			"Invalid address length: expected 20 or 32 bytes, got {}",
@@ -438,7 +437,7 @@ mod tests {
 
 		let address = result.unwrap();
 		assert_eq!(
-			format!("{:x}", address),
+			format!("{address:x}"),
 			"5fbdb2315678afecb367f032d93f642f64180aa3"
 		);
 	}
@@ -454,7 +453,7 @@ mod tests {
 		let address = result.unwrap();
 		assert_eq!(address, AlloyAddress::ZERO);
 		assert_eq!(
-			format!("{:x}", address),
+			format!("{address:x}"),
 			"0000000000000000000000000000000000000000"
 		);
 	}
@@ -508,7 +507,7 @@ mod tests {
 		assert!(result.is_ok());
 		let address = result.unwrap();
 		assert_eq!(
-			format!("{:x}", address),
+			format!("{address:x}"),
 			"a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 		);
 
@@ -521,7 +520,7 @@ mod tests {
 		assert!(result.is_ok());
 		let address = result.unwrap();
 		assert_eq!(
-			format!("{:x}", address),
+			format!("{address:x}"),
 			"c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
 		);
 	}

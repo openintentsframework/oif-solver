@@ -90,13 +90,13 @@ impl CustodyStrategy {
 		origin_submission: Option<&solver_types::OriginSubmission>,
 	) -> Result<CustodyDecision, QuoteError> {
 		let chain_id = input.asset.ethereum_chain_id().map_err(|e| {
-			QuoteError::InvalidRequest(format!("Invalid chain ID in asset address: {}", e))
+			QuoteError::InvalidRequest(format!("Invalid chain ID in asset address: {e}"))
 		})?;
 
 		let token_address = input
 			.asset
 			.ethereum_address()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid Ethereum address: {}", e)))?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid Ethereum address: {e}")))?;
 
 		let capabilities = PROTOCOL_REGISTRY
 			.get_token_capabilities(chain_id, token_address, self.delivery_service.clone())
@@ -494,8 +494,8 @@ mod tests {
 		};
 
 		// Should not panic when formatting
-		let _resource_str = format!("{:?}", resource_lock);
-		let _escrow_str = format!("{:?}", escrow);
+		let _resource_str = format!("{resource_lock:?}");
+		let _escrow_str = format!("{escrow:?}");
 	}
 
 	#[test]

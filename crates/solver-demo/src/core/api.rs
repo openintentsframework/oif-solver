@@ -96,7 +96,7 @@ impl ApiClient {
 	/// # Errors
 	/// Returns error if order not found, HTTP request fails, or response parsing fails
 	pub async fn get_order(&self, order_id: &str) -> Result<GetOrderResponse> {
-		self.get(&format!("/api/v1/orders/{}", order_id)).await
+		self.get(&format!("/api/v1/orders/{order_id}")).await
 	}
 
 	/// Executes a generic POST request with JSON serialization
@@ -152,7 +152,7 @@ impl ApiClient {
 				.text()
 				.await
 				.unwrap_or_else(|_| "Unknown error".to_string());
-			return Err(Error::ApiRequestFailed(format!("{}: {}", status, text)));
+			return Err(Error::ApiRequestFailed(format!("{status}: {text}")));
 		}
 
 		response

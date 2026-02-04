@@ -23,10 +23,7 @@ pub fn parse_oracle_table(
 	if let Some(table) = table.as_table() {
 		for (chain_id_str, oracles_value) in table {
 			let chain_id = chain_id_str.parse::<u64>().map_err(|e| {
-				SettlementError::ValidationFailed(format!(
-					"Invalid chain ID '{}': {}",
-					chain_id_str, e
-				))
+				SettlementError::ValidationFailed(format!("Invalid chain ID '{chain_id_str}': {e}"))
 			})?;
 
 			let oracles = if let Some(array) = oracles_value.as_array() {
@@ -36,15 +33,13 @@ pub fn parse_oracle_table(
 						v.as_str()
 							.ok_or_else(|| {
 								SettlementError::ValidationFailed(format!(
-									"Oracle address must be string for chain {}",
-									chain_id
+									"Oracle address must be string for chain {chain_id}"
 								))
 							})
 							.and_then(|s| {
 								parse_address(s).map_err(|e| {
 									SettlementError::ValidationFailed(format!(
-										"Invalid oracle address for chain {}: {}",
-										chain_id, e
+										"Invalid oracle address for chain {chain_id}: {e}"
 									))
 								})
 							})
@@ -52,15 +47,13 @@ pub fn parse_oracle_table(
 					.collect::<Result<Vec<_>, _>>()?
 			} else {
 				return Err(SettlementError::ValidationFailed(format!(
-					"Oracles for chain {} must be an array",
-					chain_id
+					"Oracles for chain {chain_id} must be an array"
 				)));
 			};
 
 			if oracles.is_empty() {
 				return Err(SettlementError::ValidationFailed(format!(
-					"At least one oracle address required for chain {}",
-					chain_id
+					"At least one oracle address required for chain {chain_id}"
 				)));
 			}
 
@@ -85,10 +78,7 @@ pub fn parse_routes_table(table: &toml::Value) -> Result<HashMap<u64, Vec<u64>>,
 	if let Some(table) = table.as_table() {
 		for (chain_id_str, destinations_value) in table {
 			let chain_id = chain_id_str.parse::<u64>().map_err(|e| {
-				SettlementError::ValidationFailed(format!(
-					"Invalid chain ID '{}': {}",
-					chain_id_str, e
-				))
+				SettlementError::ValidationFailed(format!("Invalid chain ID '{chain_id_str}': {e}"))
 			})?;
 
 			let destinations = if let Some(array) = destinations_value.as_array() {
@@ -97,23 +87,20 @@ pub fn parse_routes_table(table: &toml::Value) -> Result<HashMap<u64, Vec<u64>>,
 					.map(|v| {
 						v.as_integer().map(|i| i as u64).ok_or_else(|| {
 							SettlementError::ValidationFailed(format!(
-								"Destination chain ID must be integer for route from chain {}",
-								chain_id
+								"Destination chain ID must be integer for route from chain {chain_id}"
 							))
 						})
 					})
 					.collect::<Result<Vec<_>, _>>()?
 			} else {
 				return Err(SettlementError::ValidationFailed(format!(
-					"Destinations for chain {} must be an array",
-					chain_id
+					"Destinations for chain {chain_id} must be an array"
 				)));
 			};
 
 			if destinations.is_empty() {
 				return Err(SettlementError::ValidationFailed(format!(
-					"At least one destination required for route from chain {}",
-					chain_id
+					"At least one destination required for route from chain {chain_id}"
 				)));
 			}
 
@@ -198,8 +185,7 @@ fn validate_routes(
 		// Source chain must have input oracle
 		if !input_oracles.contains_key(from_chain) {
 			return Err(SettlementError::ValidationFailed(format!(
-				"Route from chain {} has no input oracle configured",
-				from_chain
+				"Route from chain {from_chain} has no input oracle configured"
 			)));
 		}
 
@@ -207,8 +193,7 @@ fn validate_routes(
 		for to_chain in to_chains {
 			if !output_oracles.contains_key(to_chain) {
 				return Err(SettlementError::ValidationFailed(format!(
-					"Route from chain {} to chain {} has no output oracle configured",
-					from_chain, to_chain
+					"Route from chain {from_chain} to chain {to_chain} has no output oracle configured"
 				)));
 			}
 		}

@@ -234,7 +234,7 @@ impl Order {
 		match self.standard.as_str() {
 			"eip7683" => {
 				let order_data: Eip7683OrderData = serde_json::from_value(self.data.clone())
-					.map_err(|e| format!("Failed to parse EIP-7683 order data: {}", e))?;
+					.map_err(|e| format!("Failed to parse EIP-7683 order data: {e}"))?;
 				Ok(Box::new(order_data))
 			},
 			_ => Err(format!("Unsupported order standard: {}", self.standard).into()),
@@ -399,7 +399,7 @@ impl fmt::Debug for OrderStatus {
 			OrderStatus::PreClaimed => write!(f, "PreClaimed"),
 			OrderStatus::Settled => write!(f, "Settled"),
 			OrderStatus::Finalized => write!(f, "Finalized"),
-			OrderStatus::Failed(tx_type, _) => write!(f, "Failed({:?})", tx_type),
+			OrderStatus::Failed(tx_type, _) => write!(f, "Failed({tx_type:?})"),
 		}
 	}
 }

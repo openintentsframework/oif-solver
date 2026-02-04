@@ -154,8 +154,7 @@ impl SettlementInterface for DirectSettlement {
 		// Get the appropriate provider for this chain
 		let provider = self.providers.get(&destination_chain_id).ok_or_else(|| {
 			SettlementError::ValidationFailed(format!(
-				"No provider configured for chain {}",
-				destination_chain_id
+				"No provider configured for chain {destination_chain_id}"
 			))
 		})?;
 
@@ -163,8 +162,7 @@ impl SettlementInterface for DirectSettlement {
 		let oracle_addresses = self.get_input_oracles(origin_chain_id);
 		if oracle_addresses.is_empty() {
 			return Err(SettlementError::ValidationFailed(format!(
-				"No input oracle configured for chain {}",
-				origin_chain_id
+				"No input oracle configured for chain {origin_chain_id}"
 			)));
 		}
 
@@ -178,8 +176,7 @@ impl SettlementInterface for DirectSettlement {
 			.select_oracle(&oracle_addresses, Some(selection_context))
 			.ok_or_else(|| {
 				SettlementError::ValidationFailed(format!(
-					"Failed to select oracle for chain {}",
-					origin_chain_id
+					"Failed to select oracle for chain {origin_chain_id}"
 				))
 			})?;
 
@@ -190,9 +187,7 @@ impl SettlementInterface for DirectSettlement {
 		let receipt = provider
 			.get_transaction_receipt(hash)
 			.await
-			.map_err(|e| {
-				SettlementError::ValidationFailed(format!("Failed to get receipt: {}", e))
-			})?
+			.map_err(|e| SettlementError::ValidationFailed(format!("Failed to get receipt: {e}")))?
 			.ok_or_else(|| {
 				SettlementError::ValidationFailed("Transaction not found".to_string())
 			})?;
@@ -210,9 +205,7 @@ impl SettlementInterface for DirectSettlement {
 		let block = provider
 			.get_block_by_number(alloy_rpc_types::BlockNumberOrTag::Number(tx_block))
 			.await
-			.map_err(|e| {
-				SettlementError::ValidationFailed(format!("Failed to get block: {}", e))
-			})?;
+			.map_err(|e| SettlementError::ValidationFailed(format!("Failed to get block: {e}")))?;
 
 		let block_timestamp = block
 			.ok_or_else(|| SettlementError::ValidationFailed("Block not found".to_string()))?
@@ -363,7 +356,7 @@ pub fn create_settlement(
 ) -> Result<Box<dyn SettlementInterface>, SettlementError> {
 	// Validate configuration first
 	DirectSettlementSchema::validate_config(config)
-		.map_err(|e| SettlementError::ValidationFailed(format!("Invalid configuration: {}", e)))?;
+		.map_err(|e| SettlementError::ValidationFailed(format!("Invalid configuration: {e}")))?;
 
 	// Parse oracle configuration using common utilities
 	let oracle_config = parse_oracle_config(config)?;

@@ -248,7 +248,7 @@ fn validate_field_type(
 				if int_val < *min_val {
 					return Err(ValidationError::InvalidValue {
 						field: field_name.to_string(),
-						message: format!("Value {} is less than minimum {}", int_val, min_val),
+						message: format!("Value {int_val} is less than minimum {min_val}"),
 					});
 				}
 			}
@@ -257,7 +257,7 @@ fn validate_field_type(
 				if int_val > *max_val {
 					return Err(ValidationError::InvalidValue {
 						field: field_name.to_string(),
-						message: format!("Value {} is greater than maximum {}", int_val, max_val),
+						message: format!("Value {int_val} is greater than maximum {max_val}"),
 					});
 				}
 			}
@@ -281,16 +281,16 @@ fn validate_field_type(
 				})?;
 
 			for (i, item) in array.iter().enumerate() {
-				validate_field_type(&format!("{}[{}]", field_name, i), item, inner_type)?;
+				validate_field_type(&format!("{field_name}[{i}]"), item, inner_type)?;
 			}
 		},
 		FieldType::Table(schema) => {
 			schema.validate(value).map_err(|e| match e {
 				ValidationError::MissingField(f) => {
-					ValidationError::MissingField(format!("{}.{}", field_name, f))
+					ValidationError::MissingField(format!("{field_name}.{f}"))
 				},
 				ValidationError::InvalidValue { field, message } => ValidationError::InvalidValue {
-					field: format!("{}.{}", field_name, field),
+					field: format!("{field_name}.{field}"),
 					message,
 				},
 				ValidationError::TypeMismatch {
@@ -298,7 +298,7 @@ fn validate_field_type(
 					expected,
 					actual,
 				} => ValidationError::TypeMismatch {
-					field: format!("{}.{}", field_name, field),
+					field: format!("{field_name}.{field}"),
 					expected,
 					actual,
 				},
@@ -399,7 +399,7 @@ mod tests {
 	#[test]
 	fn test_field_debug() {
 		let field = Field::new("test", FieldType::Boolean);
-		let debug_str = format!("{:?}", field);
+		let debug_str = format!("{field:?}");
 		assert!(debug_str.contains("Field"));
 		assert!(debug_str.contains("test"));
 		assert!(debug_str.contains("Boolean"));
@@ -684,8 +684,7 @@ mod tests {
 			let config = toml::from_str(config_str).unwrap();
 			assert!(
 				schema.validate(&config).is_ok(),
-				"Failed for config: {}",
-				config_str
+				"Failed for config: {config_str}"
 			);
 		}
 
@@ -697,8 +696,7 @@ mod tests {
 			let result = schema.validate(&config);
 			assert!(
 				result.is_err(),
-				"Should have failed for config: {}",
-				config_str
+				"Should have failed for config: {config_str}"
 			);
 			assert!(matches!(
 				result.unwrap_err(),
@@ -873,11 +871,7 @@ mod tests {
 
 		for config_str in &configs {
 			let config = toml::from_str(config_str).unwrap();
-			assert!(
-				schema.validate(&config).is_ok(),
-				"Failed for: {}",
-				config_str
-			);
+			assert!(schema.validate(&config).is_ok(), "Failed for: {config_str}");
 		}
 	}
 

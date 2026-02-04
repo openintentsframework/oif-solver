@@ -157,7 +157,7 @@ where
 	for (key, value) in string_map {
 		let chain_id = key
 			.parse::<u64>()
-			.map_err(|e| serde::de::Error::custom(format!("Invalid chain_id '{}': {}", key, e)))?;
+			.map_err(|e| serde::de::Error::custom(format!("Invalid chain_id '{key}': {e}")))?;
 		result.insert(chain_id, value);
 	}
 
@@ -401,7 +401,7 @@ mod tests {
 			"https://eth.llamarpc.com".to_string(),
 			"wss://eth.llamarpc.com".to_string(),
 		);
-		let debug_str = format!("{:?}", endpoint);
+		let debug_str = format!("{endpoint:?}");
 		assert!(debug_str.contains("RpcEndpoint"));
 		assert!(debug_str.contains("https://eth.llamarpc.com"));
 
@@ -411,13 +411,13 @@ mod tests {
 			.symbol("TEST")
 			.decimals(18)
 			.build();
-		let debug_str = format!("{:?}", token);
+		let debug_str = format!("{token:?}");
 		assert!(debug_str.contains("TokenConfig"));
 		assert!(debug_str.contains("TEST"));
 		assert!(debug_str.contains("18"));
 
 		let network = NetworkConfigBuilder::new().build();
-		let debug_str = format!("{:?}", network);
+		let debug_str = format!("{network:?}");
 		assert!(debug_str.contains("NetworkConfig"));
 	}
 

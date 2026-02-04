@@ -32,7 +32,7 @@ pub fn with_0x_prefix(hex_str: &str) -> String {
 	if hex_str.to_lowercase().starts_with("0x") {
 		hex_str.to_string()
 	} else {
-		format!("0x{}", hex_str)
+		format!("0x{hex_str}")
 	}
 }
 
@@ -78,7 +78,7 @@ pub fn format_token_amount(amount: &str, decimals: u8) -> String {
 	// Handle amounts smaller than 1 token
 	let (integer_part, decimal_part) = if amount.len() <= decimal_places {
 		// Pad with leading zeros
-		let decimal_str = format!("{:0>width$}", amount, width = decimal_places);
+		let decimal_str = format!("{amount:0>decimal_places$}");
 		("0".to_string(), decimal_str)
 	} else {
 		// Split at the decimal point
@@ -95,7 +95,7 @@ pub fn format_token_amount(amount: &str, decimals: u8) -> String {
 	if decimal_trimmed.is_empty() {
 		integer_part
 	} else {
-		format!("{}.{}", integer_part, decimal_trimmed)
+		format!("{integer_part}.{decimal_trimmed}")
 	}
 }
 
@@ -105,10 +105,10 @@ pub fn format_percentage(percentage: Decimal) -> String {
 	if abs_value >= Decimal::from(1_000_000) {
 		// Convert to f64 for scientific notation
 		let as_f64 = percentage.to_f64().unwrap_or(0.0);
-		format!("{:.2e}%", as_f64)
+		format!("{as_f64:.2e}%")
 	} else {
 		// Normal decimal formatting
-		format!("{:.2}%", percentage)
+		format!("{percentage:.2}%")
 	}
 }
 

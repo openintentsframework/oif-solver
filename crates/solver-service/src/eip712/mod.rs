@@ -68,7 +68,7 @@ pub async fn get_domain_separator(
 		.await
 		.map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
-			message: format!("Failed to get domain separator: {}", e),
+			message: format!("Failed to get domain separator: {e}"),
 			details: None,
 		})?;
 
@@ -77,7 +77,7 @@ pub async fn get_domain_separator(
 		DOMAIN_SEPARATORCall::abi_decode_returns_validate(&result).map_err(|e| {
 			APIError::BadRequest {
 				error_type: ApiErrorType::OrderValidationFailed,
-				message: format!("Failed to decode domain separator: {}", e),
+				message: format!("Failed to decode domain separator: {e}"),
 				details: None,
 			}
 		})?;

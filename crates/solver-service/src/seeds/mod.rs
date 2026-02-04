@@ -115,7 +115,7 @@ mod tests {
 	#[test]
 	fn test_parse_seed_preset_error_display() {
 		let error = ParseSeedPresetError("unknown".to_string());
-		let error_msg = format!("{}", error);
+		let error_msg = format!("{error}");
 		assert!(error_msg.contains("Unknown seed preset"));
 		assert!(error_msg.contains("unknown"));
 		assert!(error_msg.contains("mainnet"));
@@ -132,7 +132,7 @@ mod tests {
 	#[test]
 	fn test_parse_seed_preset_error_debug() {
 		let error = ParseSeedPresetError("test".to_string());
-		let debug_str = format!("{:?}", error);
+		let debug_str = format!("{error:?}");
 		assert!(debug_str.contains("ParseSeedPresetError"));
 		assert!(debug_str.contains("test"));
 	}
@@ -159,7 +159,7 @@ mod tests {
 	fn test_seed_preset_debug() {
 		let mainnet = SeedPreset::Mainnet;
 		let testnet = SeedPreset::Testnet;
-		assert_eq!(format!("{:?}", mainnet), "Mainnet");
-		assert_eq!(format!("{:?}", testnet), "Testnet");
+		assert_eq!(format!("{mainnet:?}"), "Mainnet");
+		assert_eq!(format!("{testnet:?}"), "Testnet");
 	}
 }

@@ -15,6 +15,8 @@ use solver_pricing::PricingService;
 use solver_settlement::{SettlementError, SettlementInterface, SettlementService};
 use solver_storage::{StorageError, StorageInterface, StorageService};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -76,12 +78,16 @@ impl SolverBuilder {
 	) -> Result<SolverEngine, BuilderError>
 	where
 		SF: Fn(&toml::Value) -> Result<Box<dyn StorageInterface>, StorageError>,
-		AF: Fn(&toml::Value) -> Result<Box<dyn AccountInterface>, AccountError>,
+		for<'a> AF: Fn(
+			&'a toml::Value,
+		) -> Pin<
+			Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + 'a>,
+		>,
 		DF: Fn(
 			&toml::Value,
 			&solver_types::NetworksConfig,
-			&solver_types::SecretString,
-			&std::collections::HashMap<u64, solver_types::SecretString>,
+			&solver_account::AccountSigner,
+			&std::collections::HashMap<u64, solver_account::AccountSigner>,
 		) -> Result<Box<dyn DeliveryInterface>, DeliveryError>,
 		DIF: Fn(
 			&toml::Value,
@@ -121,8 +127,7 @@ impl SolverBuilder {
 							"Failed to create storage implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create storage implementation '{}': {}",
-							name, e
+							"Failed to create storage implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -139,8 +144,7 @@ impl SolverBuilder {
 		let primary_storage = &self.static_config.storage.primary;
 		let storage_backend = storage_impls.remove(primary_storage).ok_or_else(|| {
 			BuilderError::Config(format!(
-				"Primary storage '{}' failed to load or has invalid configuration",
-				primary_storage
+				"Primary storage '{primary_storage}' failed to load or has invalid configuration"
 			))
 		})?;
 
@@ -150,7 +154,7 @@ impl SolverBuilder {
 		let mut account_impls = HashMap::new();
 		for (name, config) in &self.static_config.account.implementations {
 			if let Some(factory) = factories.account_factories.get(name) {
-				match factory(config) {
+				match factory(config).await {
 					Ok(implementation) => {
 						account_impls.insert(name.clone(), implementation);
 						let is_primary = &self.static_config.account.primary == name;
@@ -164,8 +168,7 @@ impl SolverBuilder {
 							"Failed to create account implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create account implementation '{}': {}",
-							name, e
+							"Failed to create account implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -190,8 +193,7 @@ impl SolverBuilder {
 			.get(primary_account)
 			.ok_or_else(|| {
 				BuilderError::Config(format!(
-					"Primary account '{}' not found in loaded accounts",
-					primary_account
+					"Primary account '{primary_account}' not found in loaded accounts"
 				))
 			})?
 			.clone();
@@ -206,29 +208,35 @@ impl SolverBuilder {
 					"Failed to get solver address"
 				);
 				return Err(BuilderError::Config(format!(
-					"Failed to get solver address: {}",
-					e
+					"Failed to get solver address: {e}"
 				)));
 			},
 		};
 
+		// Log the solver address for operational visibility
+		tracing::info!(
+			component = "account",
+			address = %solver_address,
+			"Solver address initialized"
+		);
+
 		// Create delivery implementations
 		let mut delivery_implementations = std::collections::HashMap::new();
 
-		// Get the default private key from the primary account
-		let default_private_key = account.get_private_key();
+		// Get the default signer from the primary account
+		let default_signer = account.signer();
 
 		for (name, config) in &self.static_config.delivery.implementations {
 			if let Some(factory) = factories.delivery_factories.get(name) {
 				// Parse per-network account mappings from config
-				let mut network_private_keys = HashMap::new();
+				let mut network_signers = HashMap::new();
 				if let Some(accounts_table) = config.get("accounts").and_then(|v| v.as_table()) {
 					for (network_id_str, account_name_value) in accounts_table {
 						if let Ok(network_id) = network_id_str.parse::<u64>() {
 							if let Some(account_name) = account_name_value.as_str() {
 								if let Some(account_service) = account_services.get(account_name) {
-									let private_key = account_service.get_private_key();
-									network_private_keys.insert(network_id, private_key);
+									let signer = account_service.signer();
+									network_signers.insert(network_id, signer);
 								} else {
 									tracing::warn!(
 										"Account '{}' not found, skipping",
@@ -243,8 +251,8 @@ impl SolverBuilder {
 				match factory(
 					config,
 					&self.static_config.networks,
-					&default_private_key,
-					&network_private_keys,
+					&default_signer,
+					&network_signers,
 				) {
 					Ok(implementation) => {
 						// Extract network_ids from config to create the mapping
@@ -268,8 +276,7 @@ impl SolverBuilder {
 								"Missing network_ids configuration"
 							);
 							return Err(BuilderError::Config(format!(
-								"Delivery implementation '{}' missing network_ids configuration",
-								name
+								"Delivery implementation '{name}' missing network_ids configuration"
 							)));
 						}
 					},
@@ -281,8 +288,7 @@ impl SolverBuilder {
 							"Failed to create delivery implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create delivery implementation '{}': {}",
-							name, e
+							"Failed to create delivery implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -317,8 +323,7 @@ impl SolverBuilder {
 							"Failed to create discovery implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create discovery implementation '{}': {}",
-							name, e
+							"Failed to create discovery implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -351,8 +356,7 @@ impl SolverBuilder {
 							"Failed to create settlement implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create settlement implementation '{}': {}",
-							name, e
+							"Failed to create settlement implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -393,8 +397,7 @@ impl SolverBuilder {
 							"Failed to create pricing implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create pricing implementation '{}': {}",
-							name, e
+							"Failed to create pricing implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -405,8 +408,7 @@ impl SolverBuilder {
 		let primary_pricing = pricing_config.primary.as_str();
 		let pricing_impl = pricing_impls.remove(primary_pricing).ok_or_else(|| {
 			BuilderError::Config(format!(
-				"Primary pricing '{}' failed to load or has invalid configuration",
-				primary_pricing
+				"Primary pricing '{primary_pricing}' failed to load or has invalid configuration"
 			))
 		})?;
 
@@ -464,8 +466,7 @@ impl SolverBuilder {
 							"Failed to create order implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create order implementation '{}': {}",
-							name, e
+							"Failed to create order implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -494,8 +495,7 @@ impl SolverBuilder {
 							"Failed to create strategy implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create strategy implementation '{}': {}",
-							name, e
+							"Failed to create strategy implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -512,8 +512,7 @@ impl SolverBuilder {
 		let primary_strategy = self.static_config.order.strategy.primary.as_str();
 		let strategy = strategy_impls.remove(primary_strategy).ok_or_else(|| {
 			BuilderError::Config(format!(
-				"Primary strategy '{}' failed to load or has invalid configuration",
-				primary_strategy
+				"Primary strategy '{primary_strategy}' failed to load or has invalid configuration"
 			))
 		})?;
 
@@ -542,8 +541,7 @@ impl SolverBuilder {
 					"Failed to ensure token approvals"
 				);
 				return Err(BuilderError::Config(format!(
-					"Failed to ensure token approvals: {}",
-					e
+					"Failed to ensure token approvals: {e}"
 				)));
 			},
 		}

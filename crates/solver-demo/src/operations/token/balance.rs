@@ -197,12 +197,12 @@ impl BalanceOps {
 		let fraction = balance % divisor;
 
 		if fraction.is_zero() {
-			format!("{}", whole)
+			format!("{whole}")
 		} else {
 			let fraction_str = format!("{:0width$}", fraction, width = decimals as usize);
 			let trimmed = fraction_str.trim_end_matches('0');
 			if trimmed.is_empty() {
-				format!("{}", whole)
+				format!("{whole}")
 			} else {
 				format!("{}.{}", whole, &trimmed[..trimmed.len().min(6)])
 			}

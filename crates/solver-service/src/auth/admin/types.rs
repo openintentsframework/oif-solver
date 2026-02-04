@@ -851,7 +851,7 @@ mod tests {
 	#[test]
 	fn test_admin_action_hash_error_display() {
 		let err = AdminActionHashError::InvalidAmount("bad_value".to_string());
-		assert_eq!(format!("{}", err), "Invalid amount: bad_value");
+		assert_eq!(format!("{err}"), "Invalid amount: bad_value");
 	}
 
 	#[test]

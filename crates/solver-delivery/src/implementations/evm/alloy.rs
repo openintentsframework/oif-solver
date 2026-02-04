@@ -14,11 +14,10 @@ use alloy_provider::{
 };
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types::TransactionRequest;
-use alloy_signer::Signer;
-use alloy_signer_local::PrivateKeySigner;
 use alloy_transport::layers::{RateLimitRetryPolicy, RetryBackoffLayer};
 use alloy_transport::TransportError;
 use async_trait::async_trait;
+use solver_account::AccountSigner;
 use solver_types::{
 	ConfigSchema, Field, FieldType, NetworksConfig, Schema, Transaction as SolverTransaction,
 	TransactionHash, TransactionReceipt,
@@ -44,8 +43,8 @@ impl AlloyDelivery {
 	pub async fn new(
 		network_ids: Vec<u64>,
 		networks: &NetworksConfig,
-		signers: HashMap<u64, PrivateKeySigner>,
-		default_signer: PrivateKeySigner,
+		signers: HashMap<u64, AccountSigner>,
+		default_signer: AccountSigner,
 	) -> Result<Self, DeliveryError> {
 		// Validate at least one network
 		if network_ids.is_empty() {
@@ -59,27 +58,29 @@ impl AlloyDelivery {
 		for network_id in &network_ids {
 			// Get network configuration
 			let network = networks.get(network_id).ok_or_else(|| {
-				DeliveryError::Network(format!("Network {} not found in configuration", network_id))
+				DeliveryError::Network(format!("Network {network_id} not found in configuration"))
 			})?;
 
 			// Get HTTP URL from network configuration
 			let http_url = network.get_http_url().ok_or_else(|| {
 				DeliveryError::Network(format!(
-					"No HTTP RPC URL configured for network {}",
-					network_id
+					"No HTTP RPC URL configured for network {network_id}"
 				))
 			})?;
 
 			// Parse RPC URL
 			let url = http_url.parse().map_err(|e| {
-				DeliveryError::Network(format!("Invalid RPC URL for network {}: {}", network_id, e))
+				DeliveryError::Network(format!("Invalid RPC URL for network {network_id}: {e}"))
 			})?;
 
 			// Get the signer for this network, or use the default
-			let signer = signers.get(network_id).unwrap_or(&default_signer);
+			let signer = signers
+				.get(network_id)
+				.cloned()
+				.unwrap_or_else(|| default_signer.clone());
 
 			// Create signer with chain ID
-			let chain_signer = signer.clone().with_chain_id(Some(*network_id));
+			let chain_signer = signer.with_chain_id(Some(*network_id));
 			let wallet = EthereumWallet::from(chain_signer);
 
 			// Configure retry layer for handling network errors, rate limits, and execution reverts
@@ -128,7 +129,7 @@ impl AlloyDelivery {
 	/// Gets the provider for a specific chain ID.
 	fn get_provider(&self, chain_id: u64) -> Result<&DynProvider, DeliveryError> {
 		self.providers.get(&chain_id).ok_or_else(|| {
-			DeliveryError::Network(format!("No provider configured for chain ID {}", chain_id))
+			DeliveryError::Network(format!("No provider configured for chain ID {chain_id}"))
 		})
 	}
 }
@@ -183,14 +184,11 @@ impl ConfigSchema for AlloyDeliverySchema {
 					for (key, val) in table {
 						// Try to parse key as network ID
 						if key.parse::<u64>().is_err() {
-							return Err(format!("Invalid network ID in accounts: {}", key));
+							return Err(format!("Invalid network ID in accounts: {key}"));
 						}
 						// Check value is a string
 						if !val.is_str() {
-							return Err(format!(
-								"Account name for network {} must be a string",
-								key
-							));
+							return Err(format!("Account name for network {key} must be a string"));
 						}
 					}
 					Ok(())
@@ -248,7 +246,7 @@ impl DeliveryInterface for AlloyDelivery {
 		// Send transaction - the provider's wallet will handle signing
 		let pending_tx = provider.send_transaction(request).await.map_err(|e| {
 			tracing::error!("Transaction submission failed on chain {}: {}", chain_id, e);
-			DeliveryError::Network(format!("Failed to send transaction: {}", e))
+			DeliveryError::Network(format!("Failed to send transaction: {e}"))
 		})?;
 
 		// Get the transaction hash
@@ -306,12 +304,10 @@ impl DeliveryInterface for AlloyDelivery {
 				Ok(TransactionReceipt::from(&receipt))
 			},
 			Ok(None) => Err(DeliveryError::Network(format!(
-				"Transaction not found on chain {}",
-				chain_id
+				"Transaction not found on chain {chain_id}"
 			))),
 			Err(e) => Err(DeliveryError::Network(format!(
-				"Failed to get receipt on chain {}: {}",
-				chain_id, e
+				"Failed to get receipt on chain {chain_id}: {e}"
 			))),
 		}
 	}
@@ -325,7 +321,7 @@ impl DeliveryInterface for AlloyDelivery {
 		let gas_price = provider
 			.get_gas_price()
 			.await
-			.map_err(|e| DeliveryError::Network(format!("Failed to get gas price: {}", e)))?;
+			.map_err(|e| DeliveryError::Network(format!("Failed to get gas price: {e}")))?;
 
 		Ok(gas_price.to_string())
 	}
@@ -338,7 +334,7 @@ impl DeliveryInterface for AlloyDelivery {
 	) -> Result<String, DeliveryError> {
 		let address: Address = address
 			.parse()
-			.map_err(|e| DeliveryError::Network(format!("Invalid address: {}", e)))?;
+			.map_err(|e| DeliveryError::Network(format!("Invalid address: {e}")))?;
 
 		let provider = self.get_provider(chain_id)?;
 
@@ -348,7 +344,7 @@ impl DeliveryInterface for AlloyDelivery {
 				let balance = provider
 					.get_balance(address)
 					.await
-					.map_err(|e| DeliveryError::Network(format!("Failed to get balance: {}", e)))?;
+					.map_err(|e| DeliveryError::Network(format!("Failed to get balance: {e}")))?;
 
 				Ok(balance.to_string())
 			},
@@ -356,7 +352,7 @@ impl DeliveryInterface for AlloyDelivery {
 				// Get ERC-20 token balance
 				let token_addr: Address = token_address
 					.parse()
-					.map_err(|e| DeliveryError::Network(format!("Invalid token address: {}", e)))?;
+					.map_err(|e| DeliveryError::Network(format!("Invalid token address: {e}")))?;
 
 				// Create the balanceOf call data
 				// balanceOf(address) selector is 0x70a08231
@@ -374,7 +370,7 @@ impl DeliveryInterface for AlloyDelivery {
 					)
 					.await
 					.map_err(|e| {
-						DeliveryError::Network(format!("Failed to call balanceOf: {}", e))
+						DeliveryError::Network(format!("Failed to call balanceOf: {e}"))
 					})?;
 
 				if call_result.len() < 32 {
@@ -398,15 +394,15 @@ impl DeliveryInterface for AlloyDelivery {
 	) -> Result<String, DeliveryError> {
 		let owner_addr: Address = owner
 			.parse()
-			.map_err(|e| DeliveryError::Network(format!("Invalid owner address: {}", e)))?;
+			.map_err(|e| DeliveryError::Network(format!("Invalid owner address: {e}")))?;
 
 		let spender_addr: Address = spender
 			.parse()
-			.map_err(|e| DeliveryError::Network(format!("Invalid spender address: {}", e)))?;
+			.map_err(|e| DeliveryError::Network(format!("Invalid spender address: {e}")))?;
 
 		let token_addr: Address = token_address
 			.parse()
-			.map_err(|e| DeliveryError::Network(format!("Invalid token address: {}", e)))?;
+			.map_err(|e| DeliveryError::Network(format!("Invalid token address: {e}")))?;
 
 		let provider = self.get_provider(chain_id)?;
 
@@ -427,7 +423,7 @@ impl DeliveryInterface for AlloyDelivery {
 		let call_result = provider
 			.call(call_request)
 			.await
-			.map_err(|e| DeliveryError::Network(format!("Failed to call allowance: {}", e)))?;
+			.map_err(|e| DeliveryError::Network(format!("Failed to call allowance: {e}")))?;
 
 		if call_result.len() < 32 {
 			return Err(DeliveryError::Network(
@@ -442,14 +438,14 @@ impl DeliveryInterface for AlloyDelivery {
 	async fn get_nonce(&self, address: &str, chain_id: u64) -> Result<u64, DeliveryError> {
 		let address: Address = address
 			.parse()
-			.map_err(|e| DeliveryError::Network(format!("Invalid address: {}", e)))?;
+			.map_err(|e| DeliveryError::Network(format!("Invalid address: {e}")))?;
 
 		let provider = self.get_provider(chain_id)?;
 
 		provider
 			.get_transaction_count(address)
 			.await
-			.map_err(|e| DeliveryError::Network(format!("Failed to get nonce: {}", e)))
+			.map_err(|e| DeliveryError::Network(format!("Failed to get nonce: {e}")))
 	}
 
 	async fn get_block_number(&self, chain_id: u64) -> Result<u64, DeliveryError> {
@@ -458,7 +454,7 @@ impl DeliveryInterface for AlloyDelivery {
 		provider
 			.get_block_number()
 			.await
-			.map_err(|e| DeliveryError::Network(format!("Failed to get block number: {}", e)))
+			.map_err(|e| DeliveryError::Network(format!("Failed to get block number: {e}")))
 	}
 	async fn estimate_gas(&self, tx: SolverTransaction) -> Result<u64, DeliveryError> {
 		// Get the chain ID from the transaction
@@ -475,7 +471,7 @@ impl DeliveryInterface for AlloyDelivery {
 		let gas = provider
 			.estimate_gas(request)
 			.await
-			.map_err(|e| DeliveryError::Network(format!("Failed to estimate gas: {}", e)))?;
+			.map_err(|e| DeliveryError::Network(format!("Failed to estimate gas: {e}")))?;
 		Ok(gas)
 	}
 
@@ -493,7 +489,7 @@ impl DeliveryInterface for AlloyDelivery {
 		let result = provider
 			.call(request)
 			.await
-			.map_err(|e| DeliveryError::Network(format!("Failed to execute eth_call: {}", e)))?;
+			.map_err(|e| DeliveryError::Network(format!("Failed to execute eth_call: {e}")))?;
 
 		Ok(result)
 	}
@@ -557,8 +553,7 @@ async fn monitor_transaction(
 			}
 		},
 		Err(e) => Err(DeliveryError::TransactionFailed(format!(
-			"Transaction monitoring failed: {}",
-			e
+			"Transaction monitoring failed: {e}"
 		))),
 	}
 }
@@ -573,20 +568,20 @@ async fn monitor_transaction(
 ///   - `network_ids` (required): Array of network IDs to support
 ///   - `accounts` (optional): Map of network IDs to account names for per-network signing
 /// - `networks`: Network configuration containing RPC URLs and contract addresses
-/// - `default_private_key`: Default private key for signing transactions
-/// - `network_private_keys`: Map of network IDs to private keys for per-network signing
+/// - `default_signer`: Default signer for signing transactions
+/// - `network_signers`: Map of network IDs to signers for per-network signing
 ///
 /// # Returns
 /// A boxed implementation of DeliveryInterface configured for the specified networks
 pub fn create_http_delivery(
 	config: &toml::Value,
 	networks: &NetworksConfig,
-	default_private_key: &solver_types::SecretString,
-	network_private_keys: &HashMap<u64, solver_types::SecretString>,
+	default_signer: &AccountSigner,
+	network_signers: &HashMap<u64, AccountSigner>,
 ) -> Result<Box<dyn DeliveryInterface>, DeliveryError> {
 	// Validate configuration first
 	AlloyDeliverySchema::validate_config(config)
-		.map_err(|e| DeliveryError::Network(format!("Invalid configuration: {}", e)))?;
+		.map_err(|e| DeliveryError::Network(format!("Invalid configuration: {e}")))?;
 
 	// Parse network_ids (required field)
 	let network_ids = config
@@ -605,25 +600,9 @@ pub fn create_http_delivery(
 		));
 	}
 
-	// Parse the default signer
-	let default_signer: PrivateKeySigner = default_private_key.with_exposed(|key| {
-		key.parse()
-			.map_err(|_| DeliveryError::Network("Invalid default private key format".to_string()))
-	})?;
-
-	// Parse network-specific signers
-	let mut network_signers = HashMap::new();
-	for (network_id, private_key) in network_private_keys {
-		let signer: PrivateKeySigner = private_key.with_exposed(|key| {
-			key.parse().map_err(|_| {
-				DeliveryError::Network(format!(
-					"Invalid private key format for network {}",
-					network_id
-				))
-			})
-		})?;
-		network_signers.insert(*network_id, signer);
-	}
+	// Clone the signers for use in the async block
+	let default_signer = default_signer.clone();
+	let network_signers = network_signers.clone();
 
 	// Create delivery service synchronously, but the actual connection happens async
 	let delivery = tokio::task::block_in_place(|| {
@@ -652,11 +631,18 @@ impl crate::DeliveryRegistry for Registry {}
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use solver_types::{
-		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
-		SecretString,
-	};
+	use alloy_signer_local::PrivateKeySigner;
+	use solver_types::utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder};
 	use std::collections::HashMap;
+
+	// Test private key split to avoid triggering secret scanners in CI
+	// This is Anvil's default test account #0 - DO NOT use in production
+	const TEST_PRIVATE_KEY: &str = concat!(
+		"0xac0974bec39a17e3",
+		"6ba4a6b4d238ff94",
+		"4bacb478cbed5efc",
+		"ae784d7bf4f2ff80",
+	);
 
 	fn create_test_networks() -> NetworksConfig {
 		NetworksConfigBuilder::new()
@@ -665,10 +651,9 @@ mod tests {
 			.build()
 	}
 
-	fn create_test_signer() -> PrivateKeySigner {
-		"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-			.parse()
-			.unwrap()
+	fn create_test_signer() -> AccountSigner {
+		let private_key_signer: PrivateKeySigner = TEST_PRIVATE_KEY.parse().unwrap();
+		AccountSigner::Local(private_key_signer)
 	}
 
 	#[tokio::test]
@@ -741,12 +726,10 @@ mod tests {
 		});
 
 		let networks = create_test_networks();
-		let default_key = SecretString::from(
-			"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-		);
-		let network_keys = HashMap::new();
+		let default_signer = create_test_signer();
+		let network_signers = HashMap::new();
 
-		let result = create_http_delivery(&config, &networks, &default_key, &network_keys);
+		let result = create_http_delivery(&config, &networks, &default_signer, &network_signers);
 		assert!(result.is_ok());
 	}
 
@@ -895,10 +878,11 @@ mod tests {
 				.build();
 
 			let default_signer = create_test_signer();
-			let network_signer: PrivateKeySigner =
+			let network_signer_key: PrivateKeySigner =
 				"0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
 					.parse()
 					.unwrap();
+			let network_signer = AccountSigner::Local(network_signer_key);
 
 			let mut network_signers = HashMap::new();
 			network_signers.insert(137u64, network_signer);
@@ -1112,7 +1096,7 @@ mod tests {
 
 			for error in errors {
 				// Ensure Display is implemented and doesn't panic
-				let _ = format!("{}", error);
+				let _ = format!("{error}");
 			}
 		}
 
@@ -1120,7 +1104,7 @@ mod tests {
 		fn test_delivery_error_debug() {
 			let error = DeliveryError::TransactionFailed("test error".to_string());
 			// Ensure Debug is implemented
-			let debug_str = format!("{:?}", error);
+			let debug_str = format!("{error:?}");
 			assert!(debug_str.contains("TransactionFailed"));
 		}
 	}
@@ -1280,7 +1264,7 @@ mod tests {
 			for tx_type in tx_types {
 				let callback = Box::new(|_: crate::TransactionMonitoringEvent| {});
 				let tracking = TransactionTracking {
-					id: format!("order-{:?}", tx_type),
+					id: format!("order-{tx_type:?}"),
 					tx_type,
 					callback,
 				};

@@ -88,7 +88,7 @@ pub async fn start_server(
 		.and_then(|discovery_impl| {
 			solver.discovery().get_url(discovery_impl).map(|url| {
 				// Format as complete URL with /intent endpoint
-				format!("http://{}/intent", url)
+				format!("http://{url}/intent")
 			})
 		});
 
@@ -151,7 +151,7 @@ pub async fn start_server(
 						tracing::error!("Failed to convert config to OperatorConfig: {}", e);
 						return Err(Box::new(std::io::Error::new(
 							std::io::ErrorKind::InvalidData,
-							format!("Config conversion error: {}", e),
+							format!("Config conversion error: {e}"),
 						)));
 					},
 				};
@@ -163,15 +163,14 @@ pub async fn start_server(
 					StoreConfig::Redis {
 						url: redis_url.clone(),
 					},
-					format!("{}-operator", solver_id),
+					format!("{solver_id}-operator"),
 				) {
 					Ok(store) => Arc::from(store),
 					Err(e) => {
 						tracing::error!("Failed to create operator config store: {}", e);
-						return Err(Box::new(std::io::Error::new(
-							std::io::ErrorKind::Other,
-							format!("Config store error: {}", e),
-						)));
+						return Err(Box::new(std::io::Error::other(format!(
+							"Config store error: {e}"
+						))));
 					},
 				};
 
@@ -180,10 +179,9 @@ pub async fn start_server(
 					Ok(false) => {
 						if let Err(e) = config_store.seed(operator_config).await {
 							tracing::error!("Failed to seed operator config: {}", e);
-							return Err(Box::new(std::io::Error::new(
-								std::io::ErrorKind::Other,
-								format!("Config seed error: {}", e),
-							)));
+							return Err(Box::new(std::io::Error::other(format!(
+								"Config seed error: {e}"
+							))));
 						}
 						tracing::info!("Seeded operator config for admin API persistence");
 					},
@@ -192,10 +190,9 @@ pub async fn start_server(
 					},
 					Err(e) => {
 						tracing::error!("Failed to check operator config existence: {}", e);
-						return Err(Box::new(std::io::Error::new(
-							std::io::ErrorKind::Other,
-							format!("Config check error: {}", e),
-						)));
+						return Err(Box::new(std::io::Error::other(format!(
+							"Config check error: {e}"
+						))));
 					},
 				}
 
@@ -225,6 +222,8 @@ pub async fn start_server(
 							dynamic_config: dynamic_config.clone(),
 							// Store nonce_store for rebuilding verifier later
 							nonce_store,
+							// Token manager for hot-reloading token configurations
+							token_manager: solver.token_manager().clone(),
 						})
 					},
 					Err(e) => {
@@ -275,15 +274,19 @@ pub async fn start_server(
 			.route("/tokens", post(handle_add_token))
 			.route("/fees", put(handle_update_fees))
 			.with_state(admin_state);
-		// If JWT auth is enabled, require admin-all scope for all admin endpoints.
-		if let Some(jwt) = &jwt_service {
-			admin_routes = admin_routes.layer(middleware::from_fn_with_state(
-				AuthState {
-					jwt_service: jwt.clone(),
-					required_scope: solver_types::AuthScope::AdminAll,
-				},
-				auth_middleware,
-			));
+		// Only apply JWT auth to admin routes if orders_require_auth is true
+		// (i.e., auth.enabled in config). Admin routes also have their own
+		// EIP-712 signature auth for admin actions.
+		if orders_require_auth {
+			if let Some(jwt) = &jwt_service {
+				admin_routes = admin_routes.layer(middleware::from_fn_with_state(
+					AuthState {
+						jwt_service: jwt.clone(),
+						required_scope: solver_types::AuthScope::AdminAll,
+					},
+					auth_middleware,
+				));
+			}
 		}
 		api_routes = api_routes.nest("/admin", admin_routes);
 		tracing::info!("Admin routes registered at /api/v1/admin/*");
@@ -501,7 +504,7 @@ async fn extract_intent_request(
 			.extract_sponsor(Some(&intent.signature))
 			.map_err(|e| APIError::BadRequest {
 				error_type: ApiErrorType::OrderValidationFailed,
-				message: format!("Failed to extract sponsor: {}", e),
+				message: format!("Failed to extract sponsor: {e}"),
 				details: None,
 			})?;
 
@@ -558,7 +561,7 @@ async fn create_intent_from_quote(
 			tracing::warn!("Failed to retrieve quote {}: {}", quote_id, e);
 			APIError::BadRequest {
 				error_type: ApiErrorType::QuoteNotFound,
-				message: format!("Quote not found: {}", e),
+				message: format!("Quote not found: {e}"),
 				details: Some(serde_json::json!({"quoteId": quote_id})),
 			}
 		})?;
@@ -568,7 +571,7 @@ async fn create_intent_from_quote(
 		.try_into()
 		.map_err(|e| APIError::InternalServerError {
 			error_type: ApiErrorType::QuoteConversionFailed,
-			message: format!("Failed to convert quote to intent format: {}", e),
+			message: format!("Failed to convert quote to intent format: {e}"),
 		})
 }
 
@@ -578,7 +581,7 @@ fn create_intent_from_payload(payload: Value) -> Result<PostOrderRequest, APIErr
 	// {order: Bytes, sponsor: Address, signature: Bytes, lock_type: LockType}
 	serde_json::from_value::<PostOrderRequest>(payload).map_err(|e| APIError::BadRequest {
 		error_type: ApiErrorType::InvalidRequest,
-		message: format!("Invalid intent request format: {}", e),
+		message: format!("Invalid intent request format: {e}"),
 		details: None,
 	})
 }
@@ -600,7 +603,7 @@ async fn validate_intent_request(
 	let standard_order =
 		StandardOrder::try_from(&intent.order).map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
-			message: format!("Failed to convert order to standard format: {}", e),
+			message: format!("Failed to convert order to standard format: {e}"),
 			details: None,
 		})?;
 
@@ -621,7 +624,7 @@ async fn validate_intent_request(
 			.await
 			.map_err(|e| APIError::InternalServerError {
 				error_type: ApiErrorType::SolverAddressError,
-				message: format!("Failed to get solver address: {}", e),
+				message: format!("Failed to get solver address: {e}"),
 			})?;
 
 	// Create callback that captures DeliveryService
@@ -654,7 +657,7 @@ async fn validate_intent_request(
 				.contract_call(chain_id, tx)
 				.await
 				.map(|bytes| bytes.to_vec())
-				.map_err(|e| format!("Contract call failed: {}", e))
+				.map_err(|e| format!("Contract call failed: {e}"))
 		})
 	});
 
@@ -690,7 +693,7 @@ async fn validate_intent_request(
 			tracing::error!("Order validation failed with error: {}", e);
 			APIError::BadRequest {
 				error_type: ApiErrorType::OrderValidationFailed,
-				message: format!("Order validation failed: {}", e),
+				message: format!("Order validation failed: {e}"),
 				details: None,
 			}
 		});
@@ -772,7 +775,7 @@ async fn forward_to_discovery_service(
 			let response = PostOrderResponse {
 				order_id: None,
 				status: PostOrderResponseStatus::Error,
-				message: Some(format!("Failed to submit intent: {}", e)),
+				message: Some(format!("Failed to submit intent: {e}")),
 				order: None,
 			};
 			(StatusCode::BAD_GATEWAY, Json(response)).into_response()
@@ -809,7 +812,7 @@ mod tests {
 	use wiremock::matchers::{method, path};
 	use wiremock::{Mock, MockServer, ResponseTemplate};
 
-	fn build_test_solver_engine() -> Arc<SolverEngine> {
+	async fn build_test_solver_engine() -> Arc<SolverEngine> {
 		let config_toml = r#"
 			[solver]
 			id = "test-solver"
@@ -863,6 +866,7 @@ mod tests {
 		)
 		.expect("failed to parse account config");
 		let account_impl = solver_account::implementations::local::create_account(&account_config)
+			.await
 			.expect("failed to create account impl");
 		let account = Arc::new(AccountService::new(account_impl));
 
@@ -910,8 +914,8 @@ mod tests {
 		Arc::new(engine)
 	}
 
-	fn build_test_app_state(discovery_url: Option<String>) -> AppState {
-		let solver = build_test_solver_engine();
+	async fn build_test_app_state(discovery_url: Option<String>) -> AppState {
+		let solver = build_test_solver_engine().await;
 		let config = solver.config().clone();
 		let dynamic_config = Arc::new(RwLock::new(config));
 
@@ -976,7 +980,7 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn forward_to_discovery_service_returns_service_unavailable_when_missing_url() {
-		let state = build_test_app_state(None);
+		let state = build_test_app_state(None).await;
 		let response =
 			super::forward_to_discovery_service(&state, &sample_post_order_request()).await;
 
@@ -1013,7 +1017,7 @@ mod tests {
 			.await;
 
 		let discovery_url = format!("{}/intent", mock_server.uri());
-		let state = build_test_app_state(Some(discovery_url));
+		let state = build_test_app_state(Some(discovery_url)).await;
 
 		let response =
 			super::forward_to_discovery_service(&state, &sample_post_order_request()).await;
@@ -1040,7 +1044,7 @@ mod tests {
 			.await;
 
 		let discovery_url = format!("{}/intent", mock_server.uri());
-		let state = build_test_app_state(Some(discovery_url));
+		let state = build_test_app_state(Some(discovery_url)).await;
 
 		let response =
 			super::forward_to_discovery_service(&state, &sample_post_order_request()).await;
@@ -1061,7 +1065,7 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn create_intent_from_quote_errors_without_quote_id() {
-		let state = build_test_app_state(None);
+		let state = build_test_app_state(None).await;
 		let payload = json!({ "signature": "0x1234" });
 
 		let error = super::create_intent_from_quote(payload, &state, "eip7683")
@@ -1079,7 +1083,7 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn create_intent_from_quote_errors_without_signature() {
-		let state = build_test_app_state(None);
+		let state = build_test_app_state(None).await;
 		let payload = json!({ "quoteId": "quote-123" });
 
 		let error = super::create_intent_from_quote(payload, &state, "eip7683")
@@ -1097,7 +1101,7 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn create_intent_from_quote_errors_when_quote_not_found() {
-		let state = build_test_app_state(None);
+		let state = build_test_app_state(None).await;
 		let payload = json!({
 			"quoteId": "missing-quote",
 			"signature": "0x1234"
@@ -1118,7 +1122,7 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn extract_intent_request_returns_direct_payload_unchanged() {
-		let state = build_test_app_state(None);
+		let state = build_test_app_state(None).await;
 		let resource_order_payload = OrderPayload {
 			signature_type: SignatureType::Eip712,
 			domain: json!({
@@ -1161,7 +1165,7 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn extract_intent_request_errors_when_signature_recovery_fails() {
-		let state = build_test_app_state(None);
+		let state = build_test_app_state(None).await;
 		let mut request = sample_post_order_request();
 		request.signature = alloy_primitives::Bytes::from(Vec::<u8>::new());
 		let payload = to_value(&request).expect("serialize request");

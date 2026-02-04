@@ -82,8 +82,7 @@ impl FileHeader {
 		let version = u16::from_le_bytes([bytes[4], bytes[5]]);
 		if version > Self::VERSION {
 			return Err(StorageError::Backend(format!(
-				"Unsupported file version: {}",
-				version
+				"Unsupported file version: {version}"
 			)));
 		}
 
@@ -191,7 +190,7 @@ impl FileStorage {
 	fn get_file_path(&self, key: &str) -> PathBuf {
 		// Sanitize key to be filesystem-safe
 		let safe_key = key.replace(['/', ':'], "_");
-		self.base_path.join(format!("{}.bin", safe_key))
+		self.base_path.join(format!("{safe_key}.bin"))
 	}
 
 	/// Gets the TTL for a given key based on its namespace.
@@ -218,7 +217,7 @@ impl FileStorage {
 		// Ensure parent directory exists
 		if let Some(parent) = lock_path.parent() {
 			fs::create_dir_all(parent).await.map_err(|e| {
-				StorageError::Backend(format!("Failed to create lock directory: {}", e))
+				StorageError::Backend(format!("Failed to create lock directory: {e}"))
 			})?;
 		}
 
@@ -230,16 +229,16 @@ impl FileStorage {
 				.truncate(true)
 				.write(true)
 				.open(&lock_path)
-				.map_err(|e| StorageError::Backend(format!("Failed to open lock file: {}", e)))?;
+				.map_err(|e| StorageError::Backend(format!("Failed to open lock file: {e}")))?;
 
 			// Acquire exclusive lock (blocking)
 			FileExt::lock_exclusive(&lock_file)
-				.map_err(|e| StorageError::Backend(format!("Failed to acquire lock: {}", e)))?;
+				.map_err(|e| StorageError::Backend(format!("Failed to acquire lock: {e}")))?;
 
 			Ok((lock_file,))
 		})
 		.await
-		.map_err(|e| StorageError::Backend(format!("Failed to spawn blocking task: {}", e)))?;
+		.map_err(|e| StorageError::Backend(format!("Failed to spawn blocking task: {e}")))?;
 
 		let (_lock_file,) = result?;
 
@@ -265,7 +264,7 @@ impl FileStorage {
 		// Ensure parent directory exists
 		if let Some(parent) = lock_path.parent() {
 			fs::create_dir_all(parent).await.map_err(|e| {
-				StorageError::Backend(format!("Failed to create lock directory: {}", e))
+				StorageError::Backend(format!("Failed to create lock directory: {e}"))
 			})?;
 		}
 
@@ -278,17 +277,17 @@ impl FileStorage {
 				.read(true)
 				.write(true)
 				.open(&lock_path)
-				.map_err(|e| StorageError::Backend(format!("Failed to open lock file: {}", e)))?;
+				.map_err(|e| StorageError::Backend(format!("Failed to open lock file: {e}")))?;
 
 			// Acquire shared lock (blocking)
 			FileExt::lock_shared(&lock_file).map_err(|e| {
-				StorageError::Backend(format!("Failed to acquire shared lock: {}", e))
+				StorageError::Backend(format!("Failed to acquire shared lock: {e}"))
 			})?;
 
 			Ok((lock_file,))
 		})
 		.await
-		.map_err(|e| StorageError::Backend(format!("Failed to spawn blocking task: {}", e)))?;
+		.map_err(|e| StorageError::Backend(format!("Failed to spawn blocking task: {e}")))?;
 
 		let (_lock_file,) = result?;
 
@@ -304,7 +303,7 @@ impl FileStorage {
 		key: &str,
 		indexes: &StorageIndexes,
 	) -> Result<(), StorageError> {
-		let index_path = self.base_path.join(format!("{}.index", namespace));
+		let index_path = self.base_path.join(format!("{namespace}.index"));
 		let index_path_clone = index_path.clone();
 
 		// Clone data to move into closure
@@ -379,7 +378,7 @@ impl FileStorage {
 
 	/// Removes key from indexes when deleting.
 	async fn remove_from_indexes(&self, namespace: &str, key: &str) -> Result<(), StorageError> {
-		let index_path = self.base_path.join(format!("{}.index", namespace));
+		let index_path = self.base_path.join(format!("{namespace}.index"));
 
 		if !index_path.exists() {
 			return Ok(());
@@ -619,7 +618,7 @@ impl StorageInterface for FileStorage {
 		namespace: &str,
 		filter: QueryFilter,
 	) -> Result<Vec<String>, StorageError> {
-		let index_path = self.base_path.join(format!("{}.index", namespace));
+		let index_path = self.base_path.join(format!("{namespace}.index"));
 
 		// If no index exists, return empty results (nothing has been indexed yet)
 		if !index_path.exists() {
@@ -908,7 +907,7 @@ impl ConfigSchema for FileStorageSchema {
 pub fn create_storage(config: &toml::Value) -> Result<Box<dyn StorageInterface>, StorageError> {
 	// Validate configuration first
 	FileStorageSchema::validate_config(config)
-		.map_err(|e| StorageError::Configuration(format!("Invalid configuration: {}", e)))?;
+		.map_err(|e| StorageError::Configuration(format!("Invalid configuration: {e}")))?;
 
 	let storage_path = config
 		.get("storage_path")
@@ -1289,10 +1288,10 @@ mod tests {
 		let tasks = (0..10).map(|i| {
 			let storage = &storage;
 			async move {
-				let key = format!("orders:order{}", i);
+				let key = format!("orders:order{i}");
 				let indexes = StorageIndexes::new().with_field("batch", "test");
 				storage
-					.set_bytes(&key, format!("data{}", i).into_bytes(), Some(indexes), None)
+					.set_bytes(&key, format!("data{i}").into_bytes(), Some(indexes), None)
 					.await
 			}
 		});

@@ -90,7 +90,7 @@ impl AdminActionVerifier {
 
 		// 4. Check signer is in admin registry
 		if !self.admin_config.is_admin(&signer) {
-			return Err(AdminAuthError::NotAuthorized(format!("{:?}", signer)));
+			return Err(AdminAuthError::NotAuthorized(format!("{signer:?}")));
 		}
 
 		// 5. Consume nonce atomically (prevents replay)

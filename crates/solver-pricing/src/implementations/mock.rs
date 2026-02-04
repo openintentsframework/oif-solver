@@ -64,7 +64,7 @@ impl MockPricing {
 			if let Ok(price_f64) = reverse_price.parse::<f64>() {
 				if price_f64 != 0.0 {
 					let inverse = 1.0 / price_f64;
-					Some((format!("{:.8}", inverse), true))
+					Some((format!("{inverse:.8}"), true))
 				} else {
 					None
 				}
@@ -108,14 +108,14 @@ impl PricingInterface for MockPricing {
 
 		let amount_f64 = amount
 			.parse::<f64>()
-			.map_err(|e| PricingError::InvalidData(format!("Invalid amount: {}", e)))?;
+			.map_err(|e| PricingError::InvalidData(format!("Invalid amount: {e}")))?;
 
 		// Direct conversion
 		let direct_pair = TradingPair::new(&from_upper, &to_upper);
 		if let Some((price, _)) = self.get_pair_price_internal(&direct_pair) {
 			let price_f64 = price
 				.parse::<f64>()
-				.map_err(|e| PricingError::InvalidData(format!("Invalid price: {}", e)))?;
+				.map_err(|e| PricingError::InvalidData(format!("Invalid price: {e}")))?;
 			return Ok((amount_f64 * price_f64).to_string());
 		}
 
@@ -129,10 +129,10 @@ impl PricingInterface for MockPricing {
 		) {
 			let from_price_f64 = from_usd_price
 				.parse::<f64>()
-				.map_err(|e| PricingError::InvalidData(format!("Invalid from price: {}", e)))?;
+				.map_err(|e| PricingError::InvalidData(format!("Invalid from price: {e}")))?;
 			let to_price_f64 = to_usd_price
 				.parse::<f64>()
-				.map_err(|e| PricingError::InvalidData(format!("Invalid to price: {}", e)))?;
+				.map_err(|e| PricingError::InvalidData(format!("Invalid to price: {e}")))?;
 
 			if to_price_f64 != 0.0 {
 				let conversion_rate = from_price_f64 / to_price_f64;
@@ -141,8 +141,7 @@ impl PricingInterface for MockPricing {
 		}
 
 		Err(PricingError::PriceNotAvailable(format!(
-			"No conversion path from {} to {}",
-			from_asset, to_asset
+			"No conversion path from {from_asset} to {to_asset}"
 		)))
 	}
 
@@ -157,19 +156,19 @@ impl PricingInterface for MockPricing {
 
 		let eth_amount_f64 = eth_amount_str
 			.parse::<f64>()
-			.map_err(|e| PricingError::InvalidData(format!("Invalid ETH amount: {}", e)))?;
+			.map_err(|e| PricingError::InvalidData(format!("Invalid ETH amount: {e}")))?;
 
 		// Convert ETH to target currency
 		let eth_pair = TradingPair::new("ETH", currency);
 		if let Some((price, _)) = self.get_pair_price_internal(&eth_pair) {
 			let price_f64 = price
 				.parse::<f64>()
-				.map_err(|e| PricingError::InvalidData(format!("Invalid price: {}", e)))?;
+				.map_err(|e| PricingError::InvalidData(format!("Invalid price: {e}")))?;
 			let result = eth_amount_f64 * price_f64;
 			// Use 8 decimal places to preserve precision for small gas costs
-			Ok(format!("{:.8}", result))
+			Ok(format!("{result:.8}"))
 		} else {
-			Err(PricingError::PriceNotAvailable(format!("ETH/{}", currency)))
+			Err(PricingError::PriceNotAvailable(format!("ETH/{currency}")))
 		}
 	}
 
@@ -180,14 +179,14 @@ impl PricingInterface for MockPricing {
 	) -> Result<String, PricingError> {
 		let currency_amount_f64 = currency_amount
 			.parse::<f64>()
-			.map_err(|e| PricingError::InvalidData(format!("Invalid currency amount: {}", e)))?;
+			.map_err(|e| PricingError::InvalidData(format!("Invalid currency amount: {e}")))?;
 
 		// Get ETH price in the given currency
 		let eth_pair = TradingPair::new("ETH", currency);
 		if let Some((price, _)) = self.get_pair_price_internal(&eth_pair) {
 			let eth_price_f64 = price
 				.parse::<f64>()
-				.map_err(|e| PricingError::InvalidData(format!("Invalid ETH price: {}", e)))?;
+				.map_err(|e| PricingError::InvalidData(format!("Invalid ETH price: {e}")))?;
 
 			if eth_price_f64 == 0.0 {
 				return Err(PricingError::InvalidData(
@@ -197,14 +196,14 @@ impl PricingInterface for MockPricing {
 
 			// Convert currency to ETH, then to wei using Alloy's parse_ether helper
 			let eth_amount = currency_amount_f64 / eth_price_f64;
-			let eth_amount_str = format!("{:.18}", eth_amount); // Use high precision for ETH
+			let eth_amount_str = format!("{eth_amount:.18}"); // Use high precision for ETH
 			let wei_amount = parse_ether(&eth_amount_str).map_err(|e| {
-				PricingError::InvalidData(format!("Failed to convert ETH to wei: {}", e))
+				PricingError::InvalidData(format!("Failed to convert ETH to wei: {e}"))
 			})?;
 
 			Ok(wei_amount.to_string())
 		} else {
-			Err(PricingError::PriceNotAvailable(format!("ETH/{}", currency)))
+			Err(PricingError::PriceNotAvailable(format!("ETH/{currency}")))
 		}
 	}
 }
@@ -221,7 +220,7 @@ impl ConfigSchema for MockPricingSchema {
 					// Validate pair format
 					if !pair.contains('/') {
 						return Err(ValidationError::InvalidValue {
-							field: format!("pair_prices.{}", pair),
+							field: format!("pair_prices.{pair}"),
 							message: "Pair must be in format 'BASE/QUOTE'".to_string(),
 						});
 					}
@@ -229,9 +228,9 @@ impl ConfigSchema for MockPricingSchema {
 					// Validate price is string
 					if price.as_str().is_none() {
 						return Err(ValidationError::TypeMismatch {
-							field: format!("pair_prices.{}", pair),
+							field: format!("pair_prices.{pair}"),
 							expected: "string".to_string(),
-							actual: format!("{:?}", price),
+							actual: format!("{price:?}"),
 						});
 					}
 				}
@@ -239,7 +238,7 @@ impl ConfigSchema for MockPricingSchema {
 				return Err(ValidationError::TypeMismatch {
 					field: "pair_prices".to_string(),
 					expected: "table".to_string(),
-					actual: format!("{:?}", pair_prices),
+					actual: format!("{pair_prices:?}"),
 				});
 			}
 		}
@@ -298,15 +297,12 @@ mod tests {
 		// Verify we have more than 2 decimal places of precision
 		assert!(
 			result.contains('.'),
-			"Result should have decimal point: {}",
-			result
+			"Result should have decimal point: {result}"
 		);
 		let decimal_places = result.split('.').nth(1).map(|s| s.len()).unwrap_or(0);
 		assert!(
 			decimal_places >= 4,
-			"Should have at least 4 decimal places for precision, got {}: {}",
-			decimal_places,
-			result
+			"Should have at least 4 decimal places for precision, got {decimal_places}: {result}"
 		);
 	}
 
@@ -325,8 +321,7 @@ mod tests {
 		// Should be approximately $4615.16 (MOCK_ETH_USD_PRICE)
 		assert!(
 			value > 4000.0 && value < 5000.0,
-			"1 ETH should be between $4000-$5000, got {}",
-			value
+			"1 ETH should be between $4000-$5000, got {value}"
 		);
 	}
 
@@ -352,8 +347,7 @@ mod tests {
 
 		assert!(
 			value > 15.0 && value < 25.0,
-			"1 ETH should be between 15-25 SOL, got {}",
-			value
+			"1 ETH should be between 15-25 SOL, got {value}"
 		);
 	}
 
@@ -374,17 +368,11 @@ mod tests {
 
 		// Should be close to 1e18 (1 ETH)
 		let one_eth: u128 = 1_000_000_000_000_000_000;
-		let diff = if wei > one_eth {
-			wei - one_eth
-		} else {
-			one_eth - wei
-		};
+		let diff = wei.abs_diff(one_eth);
 		// Allow 1% tolerance
 		assert!(
 			diff < one_eth / 100,
-			"${} should be ~1 ETH (1e18 wei), got {} wei",
-			eth_price,
-			wei
+			"${eth_price} should be ~1 ETH (1e18 wei), got {wei} wei"
 		);
 	}
 }

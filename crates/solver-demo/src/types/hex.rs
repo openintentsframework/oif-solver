@@ -29,7 +29,7 @@ impl Hex {
 		let s = s.trim_start_matches("0x");
 		hex::decode(s)
 			.map(Into::into)
-			.map_err(|e| Error::InvalidHex(format!("{}: {}", s, e)))
+			.map_err(|e| Error::InvalidHex(format!("{s}: {e}")))
 	}
 
 	/// Encode bytes to hexadecimal string with 0x prefix
@@ -82,7 +82,7 @@ impl Hex {
 		use solver_types::utils::conversion::hex_to_alloy_address;
 
 		let alloy_addr =
-			hex_to_alloy_address(s).map_err(|e| Error::InvalidAddress(format!("{}: {}", s, e)))?;
+			hex_to_alloy_address(s).map_err(|e| Error::InvalidAddress(format!("{s}: {e}")))?;
 
 		// Convert alloy Address to our Address type
 		Ok(Address::from_slice(alloy_addr.as_slice()))

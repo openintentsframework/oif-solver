@@ -63,10 +63,7 @@ impl MintOps {
 		use crate::core::logging;
 		logging::verbose_tech(
 			"Starting token mint operation",
-			&format!(
-				"chain: {}, token: {}, amount: {}",
-				chain, token_symbol, amount
-			),
+			&format!("chain: {chain}, token: {token_symbol}, amount: {amount}"),
 		);
 
 		let recipient = recipient.unwrap_or_else(|| self.get_default_recipient());

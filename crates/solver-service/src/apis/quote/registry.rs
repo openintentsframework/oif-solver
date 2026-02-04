@@ -76,7 +76,7 @@ impl ProtocolRegistry {
 	pub fn add_permit2_deployment(&mut self, chain_id: u64, permit2_address: &str) {
 		let address = permit2_address
 			.parse()
-			.unwrap_or_else(|_| panic!("Valid Permit2 address: {}", permit2_address));
+			.unwrap_or_else(|_| panic!("Valid Permit2 address: {permit2_address}"));
 
 		self.permit2_deployments.insert(chain_id, address);
 	}
@@ -85,7 +85,7 @@ impl ProtocolRegistry {
 	pub fn add_eip3009_token(&mut self, chain_id: u64, token_address: &str) {
 		let address = token_address
 			.parse()
-			.unwrap_or_else(|_| panic!("Valid token address: {}", token_address));
+			.unwrap_or_else(|_| panic!("Valid token address: {token_address}"));
 
 		self.eip3009_tokens
 			.entry(chain_id)

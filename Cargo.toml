@@ -19,7 +19,7 @@ default-members = ["crates/solver-service", "crates/solver-demo"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.86.0"
+rust-version = "1.88.0"
 authors = [
     "nahim.terrazas@openzeppelin.com",
     "nami@openzeppelin.com",
@@ -39,6 +39,7 @@ alloy-provider = "1.0.37"
 alloy-rpc-client = "1.0.37"
 alloy-rpc-types = "1.0.37"
 alloy-signer = "1.0.37"
+alloy-signer-aws = "1.0.37"
 alloy-signer-local = "1.0.37"
 alloy-sol-types = "1.0.37"
 alloy-transport = "1.0.37"
@@ -74,6 +75,11 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 validator = { version = "0.20", features = ["derive"] }
+
+# AWS dependencies (for KMS signer)
+# Minimum versions that fix CVE GHSA-g59m-gf8j-gjf5 (region validation flaw)
+aws-config = "1.8"
+aws-sdk-kms = "1.93"
 
 [profile.release]
 opt-level = 3

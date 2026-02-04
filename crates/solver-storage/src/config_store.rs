@@ -256,7 +256,7 @@ where
 			));
 		}
 
-		let key = format!("{}:{}", CONFIG_KEY_PREFIX, solver_id);
+		let key = format!("{CONFIG_KEY_PREFIX}:{solver_id}");
 
 		Ok(Self {
 			storage,
@@ -269,13 +269,13 @@ where
 	/// Serialize a versioned config to bytes.
 	fn serialize(&self, versioned: &Versioned<T>) -> Result<Vec<u8>, ConfigStoreError> {
 		serde_json::to_vec(versioned)
-			.map_err(|e| ConfigStoreError::Serialization(format!("Failed to serialize: {}", e)))
+			.map_err(|e| ConfigStoreError::Serialization(format!("Failed to serialize: {e}")))
 	}
 
 	/// Deserialize bytes to a versioned config.
 	fn deserialize(&self, bytes: &[u8]) -> Result<Versioned<T>, ConfigStoreError> {
 		serde_json::from_slice(bytes)
-			.map_err(|e| ConfigStoreError::Serialization(format!("Failed to deserialize: {}", e)))
+			.map_err(|e| ConfigStoreError::Serialization(format!("Failed to deserialize: {e}")))
 	}
 }
 
@@ -603,13 +603,13 @@ mod integration_tests {
 		// Test error formatting
 		let not_found = ConfigStoreError::NotFound("test-solver".to_string());
 		assert_eq!(
-			format!("{}", not_found),
+			format!("{not_found}"),
 			"Configuration not found for solver: test-solver"
 		);
 
 		let already_exists = ConfigStoreError::AlreadyExists("test-solver".to_string());
 		assert_eq!(
-			format!("{}", already_exists),
+			format!("{already_exists}"),
 			"Configuration already exists for solver: test-solver"
 		);
 
@@ -618,21 +618,21 @@ mod integration_tests {
 			found: 2,
 		};
 		assert_eq!(
-			format!("{}", version_mismatch),
+			format!("{version_mismatch}"),
 			"Version mismatch: expected 1, found 2"
 		);
 
 		let serialization = ConfigStoreError::Serialization("invalid JSON".to_string());
 		assert_eq!(
-			format!("{}", serialization),
+			format!("{serialization}"),
 			"Serialization error: invalid JSON"
 		);
 
 		let backend = ConfigStoreError::Backend("connection failed".to_string());
-		assert_eq!(format!("{}", backend), "Backend error: connection failed");
+		assert_eq!(format!("{backend}"), "Backend error: connection failed");
 
 		let config = ConfigStoreError::Configuration("invalid config".to_string());
-		assert_eq!(format!("{}", config), "Configuration error: invalid config");
+		assert_eq!(format!("{config}"), "Configuration error: invalid config");
 	}
 
 	#[test]
@@ -644,17 +644,14 @@ mod integration_tests {
 
 		// Should be cloneable and debuggable
 		let _cloned = redis_config.clone();
-		let _debug_str = format!("{:?}", redis_config);
+		let _debug_str = format!("{redis_config:?}");
 
 		// Test that we can create different configurations
 		let redis_config2 = StoreConfig::Redis {
 			url: "redis://remote:6379".to_string(),
 		};
 
-		assert_ne!(
-			format!("{:?}", redis_config),
-			format!("{:?}", redis_config2)
-		);
+		assert_ne!(format!("{redis_config:?}"), format!("{:?}", redis_config2));
 	}
 
 	#[test]

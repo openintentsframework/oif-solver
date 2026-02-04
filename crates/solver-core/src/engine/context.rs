@@ -217,7 +217,7 @@ impl ContextBuilder {
 			}
 
 			// Get balances for common tokens on this chain
-			let common_tokens = self.get_common_tokens_for_chain(chain_id);
+			let common_tokens = self.get_common_tokens_for_chain(chain_id).await;
 			for token_address in common_tokens {
 				match self
 					.delivery
@@ -245,9 +245,10 @@ impl ContextBuilder {
 	/// Gets token addresses for a given chain from the token manager.
 	///
 	/// Returns addresses of tokens configured for this chain.
-	fn get_common_tokens_for_chain(&self, chain_id: u64) -> Vec<String> {
+	async fn get_common_tokens_for_chain(&self, chain_id: u64) -> Vec<String> {
 		self.token_manager
 			.get_tokens_for_chain(chain_id)
+			.await
 			.into_iter()
 			.map(|token| hex::encode(&token.address.0))
 			.collect()
@@ -312,9 +313,14 @@ mod tests {
 		mock_account
 			.expect_address()
 			.returning(|| Box::pin(async { Ok(Address([0xAB; 20].to_vec())) }));
-		mock_account
-			.expect_get_private_key()
-			.returning(|| solver_types::SecretString::from("0x1234567890abcdef"));
+		mock_account.expect_signer().returning(|| {
+			use alloy_signer_local::PrivateKeySigner;
+			let signer: PrivateKeySigner =
+				"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+					.parse()
+					.unwrap();
+			solver_account::AccountSigner::Local(signer)
+		});
 		mock_account
 			.expect_config_schema()
 			.returning(|| Box::new(solver_account::implementations::local::LocalWalletSchema));
@@ -494,18 +500,18 @@ mod tests {
 			.contains("Unsupported intent standard"));
 	}
 
-	#[test]
-	fn test_get_common_tokens_for_chain() {
+	#[tokio::test]
+	async fn test_get_common_tokens_for_chain() {
 		let context_builder = create_context_builder();
 
 		// Test with configured network (chain 1 has USDC and WETH)
-		let tokens_chain_1 = context_builder.get_common_tokens_for_chain(1);
+		let tokens_chain_1 = context_builder.get_common_tokens_for_chain(1).await;
 		assert_eq!(tokens_chain_1.len(), 2);
 		assert!(tokens_chain_1.contains(&"a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0".to_string()));
 		assert!(tokens_chain_1.contains(&"c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0".to_string()));
 
 		// Test with unconfigured network
-		let tokens_unknown = context_builder.get_common_tokens_for_chain(999);
+		let tokens_unknown = context_builder.get_common_tokens_for_chain(999).await;
 		assert_eq!(tokens_unknown.len(), 0);
 	}
 

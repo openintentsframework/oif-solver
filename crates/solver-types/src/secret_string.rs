@@ -120,7 +120,7 @@ mod tests {
 	#[test]
 	fn test_secret_string_debug() {
 		let secret = SecretString::from("my-secret-key");
-		let debug_str = format!("{:?}", secret);
+		let debug_str = format!("{secret:?}");
 		assert_eq!(debug_str, "SecretString(***REDACTED***)");
 		assert!(!debug_str.contains("my-secret-key"));
 	}
@@ -128,7 +128,7 @@ mod tests {
 	#[test]
 	fn test_secret_string_display() {
 		let secret = SecretString::from("my-secret-key");
-		let display_str = format!("{}", secret);
+		let display_str = format!("{secret}");
 		assert_eq!(display_str, "***REDACTED***");
 		assert!(!display_str.contains("my-secret-key"));
 	}
@@ -165,7 +165,7 @@ mod tests {
 		assert_eq!(uppercase, "MY-SECRET-VALUE");
 
 		// Test that the secret is not exposed outside the closure
-		let debug_str = format!("{:?}", secret);
+		let debug_str = format!("{secret:?}");
 		assert!(!debug_str.contains("my-secret-value"));
 	}
 }

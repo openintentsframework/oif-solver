@@ -119,7 +119,7 @@ pub async fn check_redis_health(
 	)
 	.await
 	.map_err(|_| {
-		RedisHealthError::ConnectionFailed(format!("Connection timeout after {}ms", timeout_ms))
+		RedisHealthError::ConnectionFailed(format!("Connection timeout after {timeout_ms}ms"))
 	})?
 	.map_err(|e| RedisHealthError::ConnectionFailed(e.to_string()))?;
 
@@ -167,7 +167,7 @@ pub async fn check_redis_health_strict(
 	)
 	.await
 	.map_err(|_| {
-		RedisHealthError::ConnectionFailed(format!("Connection timeout after {}ms", timeout_ms))
+		RedisHealthError::ConnectionFailed(format!("Connection timeout after {timeout_ms}ms"))
 	})?
 	.map_err(|e| RedisHealthError::ConnectionFailed(e.to_string()))?;
 
@@ -325,14 +325,14 @@ mod tests {
 	#[test]
 	fn test_error_display_connection_failed() {
 		let err = RedisHealthError::ConnectionFailed("timeout".to_string());
-		assert!(format!("{}", err).contains("connection failed"));
-		assert!(format!("{}", err).contains("timeout"));
+		assert!(format!("{err}").contains("connection failed"));
+		assert!(format!("{err}").contains("timeout"));
 	}
 
 	#[test]
 	fn test_error_display_persistence_disabled() {
 		let err = RedisHealthError::PersistenceDisabled;
-		let msg = format!("{}", err);
+		let msg = format!("{err}");
 		assert!(msg.contains("persistence is disabled"));
 		assert!(msg.contains("Enable RDB or AOF"));
 	}
@@ -340,14 +340,14 @@ mod tests {
 	#[test]
 	fn test_error_display_check_failed() {
 		let err = RedisHealthError::CheckFailed("some error".to_string());
-		assert!(format!("{}", err).contains("Failed to check"));
-		assert!(format!("{}", err).contains("some error"));
+		assert!(format!("{err}").contains("Failed to check"));
+		assert!(format!("{err}").contains("some error"));
 	}
 
 	#[test]
 	fn test_error_display_config_denied() {
 		let err = RedisHealthError::ConfigDenied;
-		let msg = format!("{}", err);
+		let msg = format!("{err}");
 		assert!(msg.contains("CONFIG command denied"));
 		assert!(msg.contains("managed Redis"));
 	}
@@ -372,8 +372,8 @@ mod tests {
 	fn test_persistence_detection_method_debug() {
 		let info_method = PersistenceDetectionMethod::InfoCommand;
 		let config_method = PersistenceDetectionMethod::ConfigCommand;
-		assert!(format!("{:?}", info_method).contains("InfoCommand"));
-		assert!(format!("{:?}", config_method).contains("ConfigCommand"));
+		assert!(format!("{info_method:?}").contains("InfoCommand"));
+		assert!(format!("{config_method:?}").contains("ConfigCommand"));
 	}
 
 	#[test]
@@ -385,7 +385,7 @@ mod tests {
 			aof_last_rewrite_status: "unknown".to_string(),
 			detection_method: PersistenceDetectionMethod::InfoCommand,
 		};
-		let debug_str = format!("{:?}", info);
+		let debug_str = format!("{info:?}");
 		assert!(debug_str.contains("rdb_enabled: true"));
 		assert!(debug_str.contains("aof_enabled: false"));
 	}
@@ -630,7 +630,7 @@ aof_enabled:1
 	#[test]
 	fn test_error_debug_implementation() {
 		let err = RedisHealthError::ConnectionFailed("test".to_string());
-		let debug = format!("{:?}", err);
+		let debug = format!("{err:?}");
 		assert!(debug.contains("ConnectionFailed"));
 		assert!(debug.contains("test"));
 	}

@@ -100,8 +100,7 @@ impl QuoteValidator {
 		for order_type in supported_types {
 			if !order_type.starts_with("oif-") || !order_type.contains("-v") {
 				return Err(QuoteError::InvalidRequest(format!(
-					"Invalid order type format: {}",
-					order_type
+					"Invalid order type format: {order_type}"
 				)));
 			}
 		}
@@ -119,9 +118,9 @@ impl QuoteValidator {
 				// Input amounts must be provided
 				let mut known_inputs = Vec::new();
 				for input in &intent.inputs {
-					let amount_u256 = input.amount_as_u256().map_err(|e| {
-						QuoteError::InvalidRequest(format!("Invalid amount: {}", e))
-					})?;
+					let amount_u256 = input
+						.amount_as_u256()
+						.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {e}")))?;
 
 					if amount_u256.is_none() {
 						return Err(QuoteError::MissingInputAmount);
@@ -140,9 +139,9 @@ impl QuoteValidator {
 				// Output amounts are optional constraints
 				let mut constraint_outputs = Vec::new();
 				for output in &intent.outputs {
-					let amount_u256 = output.amount_as_u256().map_err(|e| {
-						QuoteError::InvalidRequest(format!("Invalid amount: {}", e))
-					})?;
+					let amount_u256 = output
+						.amount_as_u256()
+						.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {e}")))?;
 					constraint_outputs.push((output.clone(), amount_u256));
 				}
 
@@ -158,9 +157,9 @@ impl QuoteValidator {
 				// Output amounts must be provided
 				let mut known_outputs = Vec::new();
 				for output in &intent.outputs {
-					let amount_u256 = output.amount_as_u256().map_err(|e| {
-						QuoteError::InvalidRequest(format!("Invalid amount: {}", e))
-					})?;
+					let amount_u256 = output
+						.amount_as_u256()
+						.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {e}")))?;
 
 					if amount_u256.is_none() {
 						return Err(QuoteError::MissingOutputAmount);
@@ -179,9 +178,9 @@ impl QuoteValidator {
 				// Input amounts are optional constraints
 				let mut constraint_inputs = Vec::new();
 				for input in &intent.inputs {
-					let amount_u256 = input.amount_as_u256().map_err(|e| {
-						QuoteError::InvalidRequest(format!("Invalid amount: {}", e))
-					})?;
+					let amount_u256 = input
+						.amount_as_u256()
+						.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {e}")))?;
 					constraint_inputs.push((input.clone(), amount_u256));
 				}
 
@@ -300,8 +299,7 @@ impl QuoteValidator {
 
 			if !is_dest {
 				return Err(QuoteError::UnsupportedAsset(format!(
-					"Chain {} not supported as destination",
-					chain_id
+					"Chain {chain_id} not supported as destination"
 				)));
 			}
 		}
@@ -344,7 +342,7 @@ impl QuoteValidator {
 	fn validate_interop_address(address: &InteropAddress) -> Result<(), QuoteError> {
 		// Validate the interoperable address format
 		address.validate().map_err(|e| {
-			QuoteError::InvalidRequest(format!("Invalid interoperable address: {}", e))
+			QuoteError::InvalidRequest(format!("Invalid interoperable address: {e}"))
 		})?;
 
 		Ok(())
@@ -352,7 +350,7 @@ impl QuoteValidator {
 
 	fn chain_id_from_interop(addr: &InteropAddress) -> Result<u64, QuoteError> {
 		addr.ethereum_chain_id().map_err(|e| {
-			QuoteError::InvalidRequest(format!("Invalid chain in interoperable address: {}", e))
+			QuoteError::InvalidRequest(format!("Invalid chain in interoperable address: {e}"))
 		})
 	}
 
@@ -368,7 +366,7 @@ impl QuoteValidator {
 		let chain_id = Self::chain_id_from_interop(addr)?;
 		let evm_addr = addr
 			.ethereum_address()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid asset address: {}", e)))?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid asset address: {e}")))?;
 		Ok((chain_id, evm_addr))
 	}
 
@@ -420,7 +418,7 @@ impl QuoteValidator {
 					// Fallback to request amount if not in cost context
 					asset_info
 						.amount_as_u256()
-						.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {}", e)))
+						.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {e}")))
 						.ok()
 						.flatten()
 						.unwrap_or_default()
@@ -483,7 +481,7 @@ impl QuoteValidator {
 					// Fallback to request amount if not in cost context
 					asset_info
 						.amount_as_u256()
-						.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {}", e)))
+						.map_err(|e| QuoteError::InvalidRequest(format!("Invalid amount: {e}")))
 						.ok()
 						.flatten()
 						.unwrap_or_default()
@@ -539,10 +537,10 @@ impl QuoteValidator {
 				let balance_str = token_manager
 					.check_balance(chain_id, &token_addr)
 					.await
-					.map_err(|e| QuoteError::Internal(format!("Balance check failed: {}", e)))?;
+					.map_err(|e| QuoteError::Internal(format!("Balance check failed: {e}")))?;
 
 				let balance = U256::from_str_radix(&balance_str, 10)
-					.map_err(|e| QuoteError::Internal(format!("Failed to parse balance: {}", e)))?;
+					.map_err(|e| QuoteError::Internal(format!("Failed to parse balance: {e}")))?;
 
 				// For ExactInput swaps, adjust the required amount by subtracting costs
 				let required_amount = if matches!(context.swap_type, SwapType::ExactInput) {
@@ -675,13 +673,12 @@ impl QuoteValidator {
 				let recipient_addr = output
 					.receiver
 					.ethereum_address()
-					.map(|a| format!("{:?}", a))
+					.map(|a| format!("{a:?}"))
 					.unwrap_or_else(|_| "unknown".to_string());
 
 				return Err(QuoteError::InvalidRequest(format!(
-					"Callback recipient {} on chain {} is not in the solver's whitelist. \
-					Add '{}' to order.callback_whitelist in config (EIP-7930 format) to enable this callback.",
-					recipient_addr, chain_id, receiver_interop_hex
+					"Callback recipient {recipient_addr} on chain {chain_id} is not in the solver's whitelist. \
+					Add '{receiver_interop_hex}' to order.callback_whitelist in config (EIP-7930 format) to enable this callback."
 				)));
 			}
 
@@ -706,12 +703,12 @@ mod tests {
 	use std::sync::Arc;
 
 	/// Creates a minimal mock SolverEngine for testing
-	fn create_mock_solver() -> SolverEngine {
-		create_mock_solver_with_networks(HashMap::new())
+	async fn create_mock_solver() -> SolverEngine {
+		create_mock_solver_with_networks(HashMap::new()).await
 	}
 
 	/// Creates a minimal mock SolverEngine for testing with custom network configurations
-	fn create_mock_solver_with_networks(networks: NetworksConfig) -> SolverEngine {
+	async fn create_mock_solver_with_networks(networks: NetworksConfig) -> SolverEngine {
 		use solver_account::AccountService;
 		use solver_config::Config;
 		use solver_core::engine::event_bus::EventBus;
@@ -729,33 +726,33 @@ mod tests {
 			id = "test-solver"
 			monitoring_timeout_seconds = 30
 			min_profitability_pct = 1.0
-			
+
 			[storage]
 			primary = "memory"
 			cleanup_interval_seconds = 3600
 			[storage.implementations.memory]
-			
+
 			[delivery]
 			min_confirmations = 1
 			[delivery.implementations]
-			
+
 			[account]
 			primary = "local"
 			[account.implementations.local]
 			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
-			
+
 			[discovery]
 			[discovery.implementations]
-			
+
 			[order]
 			[order.implementations]
 			[order.strategy]
 			primary = "simple"
 			[order.strategy.implementations.simple]
-			
+
 			[settlement]
 			[settlement.implementations]
-			
+
 			[networks]
 		"#;
 		let config: Config = toml::from_str(config_toml).expect("Failed to parse test config");
@@ -771,6 +768,7 @@ mod tests {
 		.expect("Failed to parse account config");
 		let account = Arc::new(AccountService::new(
 			solver_account::implementations::local::create_account(&account_config)
+				.await
 				.expect("Failed to create account"),
 		));
 
@@ -902,8 +900,7 @@ mod tests {
 		let result = QuoteValidator::validate_swap_type_logic(&intent);
 		assert!(
 			matches!(result, Err(QuoteError::MissingInputAmount)),
-			"Should reject missing input amount: {:?}",
-			result
+			"Should reject missing input amount: {result:?}"
 		);
 	}
 
@@ -917,8 +914,7 @@ mod tests {
 		let result = QuoteValidator::validate_swap_type_logic(&intent);
 		assert!(
 			matches!(result, Err(QuoteError::MissingOutputAmount)),
-			"Should reject missing output amount: {:?}",
-			result
+			"Should reject missing output amount: {result:?}"
 		);
 	}
 
@@ -933,8 +929,7 @@ mod tests {
 		let result = QuoteValidator::validate_swap_type_logic(&intent);
 		assert!(
 			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("cannot be zero")),
-			"Should reject zero input amount for exact-input: {:?}",
-			result
+			"Should reject zero input amount for exact-input: {result:?}"
 		);
 	}
 
@@ -949,8 +944,7 @@ mod tests {
 		let result = QuoteValidator::validate_swap_type_logic(&intent);
 		assert!(
 			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("cannot be zero")),
-			"Should reject zero output amount for exact-output: {:?}",
-			result
+			"Should reject zero output amount for exact-output: {result:?}"
 		);
 	}
 
@@ -965,8 +959,7 @@ mod tests {
 		let result = QuoteValidator::validate_swap_type_logic(&intent);
 		assert!(
 			result.is_ok(),
-			"Should accept valid exact-input: {:?}",
-			result
+			"Should accept valid exact-input: {result:?}"
 		);
 
 		let context = result.unwrap();
@@ -986,8 +979,7 @@ mod tests {
 		let result = QuoteValidator::validate_swap_type_logic(&intent);
 		assert!(
 			result.is_ok(),
-			"Should accept valid exact-output: {:?}",
-			result
+			"Should accept valid exact-output: {result:?}"
 		);
 
 		let context = result.unwrap();
@@ -998,16 +990,15 @@ mod tests {
 
 	// ========== validate_quote_request Tests ==========
 
-	#[test]
-	fn test_validate_quote_request_success_exact_input() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_success_exact_input() {
+		let solver = create_mock_solver().await;
 		let request = create_valid_get_quote_request();
 
 		let result = QuoteValidator::validate_quote_request(&request, &solver);
 		assert!(
 			result.is_ok(),
-			"Valid exact-input request should succeed: {:?}",
-			result
+			"Valid exact-input request should succeed: {result:?}"
 		);
 
 		let context = result.unwrap();
@@ -1016,17 +1007,16 @@ mod tests {
 		assert!(context.constraint_outputs.is_some());
 	}
 
-	#[test]
-	fn test_validate_quote_request_success_exact_output() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_success_exact_output() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent = create_exact_output_request(None, Some("1000000000000000000"));
 
 		let result = QuoteValidator::validate_quote_request(&request, &solver);
 		assert!(
 			result.is_ok(),
-			"Valid exact-output request should succeed: {:?}",
-			result
+			"Valid exact-output request should succeed: {result:?}"
 		);
 
 		let context = result.unwrap();
@@ -1035,121 +1025,113 @@ mod tests {
 		assert!(context.constraint_inputs.is_some());
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_empty_inputs() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_empty_inputs() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent.inputs = vec![]; // Empty inputs
 
 		let result = QuoteValidator::validate_quote_request(&request, &solver);
 		assert!(
 			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("inputs and outputs are required")),
-			"Should reject empty inputs: {:?}",
-			result
+			"Should reject empty inputs: {result:?}"
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_empty_outputs() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_empty_outputs() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent.outputs = vec![]; // Empty outputs
 
 		let result = QuoteValidator::validate_quote_request(&request, &solver);
 		assert!(
 			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("inputs and outputs are required")),
-			"Should reject empty outputs: {:?}",
-			result
+			"Should reject empty outputs: {result:?}"
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_empty_supported_types() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_empty_supported_types() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.supported_types = vec![]; // Empty supported types
 
 		let result = QuoteValidator::validate_quote_request(&request, &solver);
 		assert!(
 			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("supportedTypes cannot be empty")),
-			"Should reject empty supported types: {:?}",
-			result
+			"Should reject empty supported types: {result:?}"
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_invalid_order_type_format() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_invalid_order_type_format() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.supported_types = vec!["invalid-format".to_string()]; // Invalid format
 
 		let result = QuoteValidator::validate_quote_request(&request, &solver);
 		assert!(
 			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("Invalid order type format")),
-			"Should reject invalid order type format: {:?}",
-			result
+			"Should reject invalid order type format: {result:?}"
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_missing_input_amount_exact_input() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_missing_input_amount_exact_input() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent = create_exact_input_request(None, None); // Missing input amount
 
 		let result = QuoteValidator::validate_quote_request(&request, &solver);
 		assert!(
 			matches!(result, Err(QuoteError::MissingInputAmount)),
-			"Should reject missing input amount for exact-input: {:?}",
-			result
+			"Should reject missing input amount for exact-input: {result:?}"
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_missing_output_amount_exact_output() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_missing_output_amount_exact_output() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent = create_exact_output_request(None, None); // Missing output amount
 
 		let result = QuoteValidator::validate_quote_request(&request, &solver);
 		assert!(
 			matches!(result, Err(QuoteError::MissingOutputAmount)),
-			"Should reject missing output amount for exact-output: {:?}",
-			result
+			"Should reject missing output amount for exact-output: {result:?}"
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_zero_input_amount_exact_input() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_zero_input_amount_exact_input() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent = create_exact_input_request(Some("0"), None); // Zero input amount
 
 		let result = QuoteValidator::validate_quote_request(&request, &solver);
 		assert!(
 			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("cannot be zero")),
-			"Should reject zero input amount for exact-input: {:?}",
-			result
+			"Should reject zero input amount for exact-input: {result:?}"
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_zero_output_amount_exact_output() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_zero_output_amount_exact_output() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent = create_exact_output_request(None, Some("0")); // Zero output amount
 
 		let result = QuoteValidator::validate_quote_request(&request, &solver);
 		assert!(
 			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("cannot be zero")),
-			"Should reject zero output amount for exact-output: {:?}",
-			result
+			"Should reject zero output amount for exact-output: {result:?}"
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_empty_auth_schemes() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_empty_auth_schemes() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent.origin_submission = Some(OriginSubmission {
 			mode: OriginMode::User,
@@ -1159,14 +1141,13 @@ mod tests {
 		let result = QuoteValidator::validate_quote_request(&request, &solver);
 		assert!(
 			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("Auth schemes cannot be empty")),
-			"Should reject empty auth schemes: {:?}",
-			result
+			"Should reject empty auth schemes: {result:?}"
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_success_with_valid_auth_schemes() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_success_with_valid_auth_schemes() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent.origin_submission = Some(OriginSubmission {
 			mode: OriginMode::User,
@@ -1176,14 +1157,13 @@ mod tests {
 		let result = QuoteValidator::validate_quote_request(&request, &solver);
 		assert!(
 			result.is_ok(),
-			"Should accept valid auth schemes: {:?}",
-			result
+			"Should accept valid auth schemes: {result:?}"
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_success_with_no_auth_schemes() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_success_with_no_auth_schemes() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent.origin_submission = Some(OriginSubmission {
 			mode: OriginMode::User,
@@ -1193,28 +1173,26 @@ mod tests {
 		let result = QuoteValidator::validate_quote_request(&request, &solver);
 		assert!(
 			result.is_ok(),
-			"Should accept None auth schemes: {:?}",
-			result
+			"Should accept None auth schemes: {result:?}"
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_success_with_no_origin_submission() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_success_with_no_origin_submission() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		request.intent.origin_submission = None;
 
 		let result = QuoteValidator::validate_quote_request(&request, &solver);
 		assert!(
 			result.is_ok(),
-			"Should accept no origin submission: {:?}",
-			result
+			"Should accept no origin submission: {result:?}"
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_fails_order_type_compatibility() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_fails_order_type_compatibility() {
+		let solver = create_mock_solver().await;
 		let mut request = create_valid_get_quote_request();
 		// Set supported types that won't match the inferred order type
 		request.supported_types = vec!["oif-different-v1".to_string()];
@@ -1222,14 +1200,13 @@ mod tests {
 		let result = QuoteValidator::validate_quote_request(&request, &solver);
 		assert!(
 			matches!(result, Err(QuoteError::NoMatchingOrderType(_))),
-			"Should reject incompatible order types: {:?}",
-			result
+			"Should reject incompatible order types: {result:?}"
 		);
 	}
 
-	#[test]
-	fn test_validate_quote_request_handles_invalid_interop_addresses() {
-		let solver = create_mock_solver();
+	#[tokio::test]
+	async fn test_validate_quote_request_handles_invalid_interop_addresses() {
+		let solver = create_mock_solver().await;
 		let request = create_valid_get_quote_request();
 
 		// Create an invalid interop address by directly constructing it
@@ -1241,8 +1218,7 @@ mod tests {
 		// If we need to test invalid addresses, we'd need to construct them differently
 		assert!(
 			result.is_ok() || matches!(result, Err(QuoteError::InvalidRequest(_))),
-			"Should handle address validation appropriately: {:?}",
-			result
+			"Should handle address validation appropriately: {result:?}"
 		);
 	}
 
@@ -1336,8 +1312,7 @@ mod tests {
 		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			result.is_ok(),
-			"Should accept request with supported chains: {:?}",
-			result
+			"Should accept request with supported chains: {result:?}"
 		);
 	}
 
@@ -1353,8 +1328,7 @@ mod tests {
 		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			result.is_ok(),
-			"Should accept request with proper origin/destination setup: {:?}",
-			result
+			"Should accept request with proper origin/destination setup: {result:?}"
 		);
 	}
 
@@ -1370,8 +1344,7 @@ mod tests {
 		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("No supported origin chains")),
-			"Should reject when no input chains have input settlers: {:?}",
-			result
+			"Should reject when no input chains have input settlers: {result:?}"
 		);
 	}
 
@@ -1387,8 +1360,7 @@ mod tests {
 		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Chain 137 not supported as destination")),
-			"Should reject when output chain lacks output settler: {:?}",
-			result
+			"Should reject when output chain lacks output settler: {result:?}"
 		);
 	}
 
@@ -1403,8 +1375,7 @@ mod tests {
 		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("No supported origin chains")),
-			"Should reject when input chain is not configured: {:?}",
-			result
+			"Should reject when input chain is not configured: {result:?}"
 		);
 	}
 
@@ -1419,8 +1390,7 @@ mod tests {
 		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Chain 137 not supported as destination")),
-			"Should reject when output chain is not configured: {:?}",
-			result
+			"Should reject when output chain is not configured: {result:?}"
 		);
 	}
 
@@ -1450,8 +1420,7 @@ mod tests {
 		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			result.is_ok(),
-			"Should accept when at least one input is on supported origin chain: {:?}",
-			result
+			"Should accept when at least one input is on supported origin chain: {result:?}"
 		);
 	}
 
@@ -1481,8 +1450,7 @@ mod tests {
 		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Chain 42 not supported as destination")),
-			"Should reject when any output is on unsupported destination chain: {:?}",
-			result
+			"Should reject when any output is on unsupported destination chain: {result:?}"
 		);
 	}
 
@@ -1497,8 +1465,7 @@ mod tests {
 		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			result.is_ok(),
-			"Should accept same-chain swaps when both settlers configured: {:?}",
-			result
+			"Should accept same-chain swaps when both settlers configured: {result:?}"
 		);
 	}
 
@@ -1513,8 +1480,7 @@ mod tests {
 		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Chain 1 not supported as destination")),
-			"Should reject same-chain swaps when output settler missing: {:?}",
-			result
+			"Should reject same-chain swaps when output settler missing: {result:?}"
 		);
 	}
 
@@ -1531,8 +1497,7 @@ mod tests {
 		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
 			result.is_ok() || matches!(result, Err(QuoteError::InvalidRequest(_))),
-			"Should handle address parsing appropriately: {:?}",
-			result
+			"Should handle address parsing appropriately: {result:?}"
 		);
 	}
 
@@ -1611,7 +1576,7 @@ mod tests {
 				.enumerate()
 				.map(|(i, addr)| TokenConfig {
 					address: Address(addr.as_slice().to_vec()),
-					symbol: format!("TOKEN{}", i),
+					symbol: format!("TOKEN{i}"),
 					decimals: 18,
 				})
 				.collect();
@@ -1738,8 +1703,7 @@ mod tests {
 
 		assert!(
 			result.is_ok(),
-			"Should succeed with supported tokens: {:?}",
-			result
+			"Should succeed with supported tokens: {result:?}"
 		);
 
 		let supported_assets = result.unwrap();
@@ -1783,8 +1747,7 @@ mod tests {
 
 		assert!(
 			result.is_ok(),
-			"Should succeed with fallback to request amount: {:?}",
-			result
+			"Should succeed with fallback to request amount: {result:?}"
 		);
 
 		let supported_assets = result.unwrap();
@@ -1823,8 +1786,7 @@ mod tests {
 
 		assert!(
 			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Input token not supported")),
-			"Should reject unsupported input token: {:?}",
-			result
+			"Should reject unsupported input token: {result:?}"
 		);
 	}
 
@@ -1865,8 +1827,7 @@ mod tests {
 
 		assert!(
 			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Input token not supported")),
-			"Should reject when any input token is unsupported: {:?}",
-			result
+			"Should reject when any input token is unsupported: {result:?}"
 		);
 	}
 
@@ -1915,8 +1876,7 @@ mod tests {
 
 		assert!(
 			result.is_ok(),
-			"Should succeed with all supported tokens: {:?}",
-			result
+			"Should succeed with all supported tokens: {result:?}"
 		);
 
 		let supported_assets = result.unwrap();
@@ -1970,8 +1930,7 @@ mod tests {
 
 		assert!(
 			result.is_ok(),
-			"Should succeed with supported tokens: {:?}",
-			result
+			"Should succeed with supported tokens: {result:?}"
 		);
 
 		let supported_assets = result.unwrap();
@@ -2015,8 +1974,7 @@ mod tests {
 
 		assert!(
 			result.is_ok(),
-			"Should succeed with fallback to request amount: {:?}",
-			result
+			"Should succeed with fallback to request amount: {result:?}"
 		);
 
 		let supported_assets = result.unwrap();
@@ -2055,8 +2013,7 @@ mod tests {
 
 		assert!(
 			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Output token not supported")),
-			"Should reject unsupported output token: {:?}",
-			result
+			"Should reject unsupported output token: {result:?}"
 		);
 	}
 
@@ -2105,8 +2062,7 @@ mod tests {
 
 		assert!(
 			result.is_ok(),
-			"Should succeed with all supported tokens: {:?}",
-			result
+			"Should succeed with all supported tokens: {result:?}"
 		);
 
 		let supported_assets = result.unwrap();
@@ -2151,8 +2107,8 @@ mod tests {
 			[discovery.implementations]
 
 			[order]
-			simulate_callbacks = {}
-			callback_whitelist = {:?}
+			simulate_callbacks = {simulate_callbacks}
+			callback_whitelist = {whitelist:?}
 			[order.implementations]
 			[order.strategy]
 			primary = "simple"
@@ -2162,8 +2118,7 @@ mod tests {
 			[settlement.implementations]
 
 			[networks]
-		"#,
-			simulate_callbacks, whitelist
+		"#
 		);
 		toml::from_str(&config_toml).expect("Failed to parse test config")
 	}
@@ -2221,8 +2176,7 @@ mod tests {
 		let result = QuoteValidator::validate_callback_whitelist(&request, &config);
 		assert!(
 			result.is_ok(),
-			"Should succeed when no callback data: {:?}",
-			result
+			"Should succeed when no callback data: {result:?}"
 		);
 	}
 
@@ -2235,8 +2189,7 @@ mod tests {
 		let result = QuoteValidator::validate_callback_whitelist(&request, &config);
 		assert!(
 			result.is_ok(),
-			"Should succeed when callback is empty '0x': {:?}",
-			result
+			"Should succeed when callback is empty '0x': {result:?}"
 		);
 	}
 
@@ -2251,8 +2204,7 @@ mod tests {
 		let result = QuoteValidator::validate_callback_whitelist(&request, &config);
 		assert!(
 			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("simulation is disabled")),
-			"Should reject callback when simulation disabled: {:?}",
-			result
+			"Should reject callback when simulation disabled: {result:?}"
 		);
 	}
 
@@ -2267,8 +2219,7 @@ mod tests {
 		let result = QuoteValidator::validate_callback_whitelist(&request, &config);
 		assert!(
 			result.is_ok(),
-			"Should allow any callback when whitelist is empty: {:?}",
-			result
+			"Should allow any callback when whitelist is empty: {result:?}"
 		);
 	}
 
@@ -2287,8 +2238,7 @@ mod tests {
 		let result = QuoteValidator::validate_callback_whitelist(&request, &config);
 		assert!(
 			result.is_ok(),
-			"Should succeed when callback recipient is whitelisted: {:?}",
-			result
+			"Should succeed when callback recipient is whitelisted: {result:?}"
 		);
 	}
 
@@ -2306,8 +2256,7 @@ mod tests {
 		let result = QuoteValidator::validate_callback_whitelist(&request, &config);
 		assert!(
 			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("not in the solver's whitelist")),
-			"Should reject callback when recipient not whitelisted: {:?}",
-			result
+			"Should reject callback when recipient not whitelisted: {result:?}"
 		);
 	}
 }

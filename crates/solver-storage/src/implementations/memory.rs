@@ -240,7 +240,7 @@ impl ConfigSchema for MemoryStorageSchema {
 pub fn create_storage(config: &toml::Value) -> Result<Box<dyn StorageInterface>, StorageError> {
 	// Validate configuration first (even though memory storage has no config)
 	MemoryStorageSchema::validate_config(config)
-		.map_err(|e| StorageError::Configuration(format!("Invalid configuration: {}", e)))?;
+		.map_err(|e| StorageError::Configuration(format!("Invalid configuration: {e}")))?;
 
 	Ok(Box::new(MemoryStorage::new()))
 }

@@ -16,6 +16,7 @@ A high-performance cross-chain solver implementation for the Open Intents Framew
 - [Component Responsibilities](#component-responsibilities)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
+  - [AWS KMS Signing](#aws-kms-signing)
 - [API Reference](#api-reference)
 - [Testing and Development with solver-demo](#testing-and-development-with-solver-demo)
 - [Development](#development)
@@ -192,7 +193,9 @@ oif-solver/
 ### solver-account
 
 - Manages private keys and signing operations
-- Supports different key management backends
+- Supports different key management backends:
+  - **Local**: Private key stored in memory (default)
+  - **AWS KMS**: Private key stored in AWS KMS HSM (feature-gated)
 - Provides secure signing for transactions
 - Handles address derivation
 
@@ -257,8 +260,10 @@ cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `REDIS_URL` | Yes | Redis connection URL (default: `redis://localhost:6379`) |
-| `SOLVER_PRIVATE_KEY` | Yes | 64-character hex private key (without 0x prefix) |
+| `SOLVER_PRIVATE_KEY` | Yes* | 64-character hex private key (without 0x prefix) |
 | `SOLVER_ID` | For loading | Solver ID to load from Redis (set after first seed) |
+
+\* Not required when using AWS KMS for signing (see [AWS KMS Signing](#aws-kms-signing) below).
 
 ### Seed Overrides Format
 
@@ -318,6 +323,129 @@ docker run -d --name redis -p 6379:6379 redis:latest
 
 # Or install locally
 redis-server
+```
+
+### AWS KMS Signing
+
+For production deployments requiring enhanced security, the solver supports AWS KMS for transaction signing. The private key never leaves the KMS hardware security module.
+
+#### Prerequisites
+
+1. **Create a KMS Key** (must be secp256k1 for Ethereum compatibility):
+
+```bash
+aws kms create-key \
+  --key-spec ECC_SECG_P256K1 \
+  --key-usage SIGN_VERIFY \
+  --description "OIF Solver signing key"
+```
+
+Note the `KeyId` from the output.
+
+2. **IAM Permissions** - Your AWS credentials need:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["kms:Sign", "kms:GetPublicKey"],
+    "Resource": "arn:aws:kms:REGION:ACCOUNT:key/KEY_ID"
+  }]
+}
+```
+
+#### Building with KMS Support
+
+```bash
+# Build with KMS feature enabled
+cargo build --release --features kms
+```
+
+#### Configuration
+
+Configure KMS in your seed overrides JSON:
+
+```json
+{
+  "solver_id": "my-solver",
+  "account": {
+    "primary": "kms",
+    "implementations": {
+      "kms": {
+        "key_id": "arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012",
+        "region": "us-east-1"
+      }
+    }
+  },
+  "networks": [...]
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `key_id` | Yes | KMS key ID or full ARN |
+| `region` | Yes | AWS region (e.g., `us-east-1`) |
+| `endpoint` | No | Custom endpoint URL (for LocalStack testing) |
+
+#### Running with KMS
+
+```bash
+# Set AWS credentials (or use IAM roles on EC2/ECS)
+export AWS_ACCESS_KEY_ID=your_access_key
+export AWS_SECRET_ACCESS_KEY=your_secret_key
+export AWS_REGION=us-east-1
+
+# Seed and run
+cargo run --features kms -- --seed testnet --seed-overrides config/seed-overrides-kms.json
+```
+
+#### Finding Your KMS Wallet Address
+
+The solver logs the wallet address at startup:
+
+```
+INFO solver_core::builder: Solver address initialized component="account" address=0x1234...abcd
+```
+
+You can also query the address directly using the AWS CLI:
+
+```bash
+# Get public key from KMS and derive Ethereum address
+aws kms get-public-key --key-id "your-key-id" --output text --query 'PublicKey' | \
+  base64 -d | openssl ec -pubin -inform DER -outform PEM 2>/dev/null | \
+  openssl ec -pubin -conv_form uncompressed -outform DER 2>/dev/null | \
+  tail -c 64 | keccak-256sum | tail -c 41 | sed 's/^/0x/'
+```
+
+Or use a simpler approach - run the solver once and it will display the address in the logs.
+
+#### LocalStack Testing
+
+For local development, you can test KMS integration with LocalStack:
+
+```bash
+# Start LocalStack
+docker run -d --name localstack -p 4566:4566 localstack/localstack
+
+# Create test key
+aws --endpoint-url=http://localhost:4566 kms create-key \
+  --key-spec ECC_SECG_P256K1 \
+  --key-usage SIGN_VERIFY
+
+# Configure with endpoint
+{
+  "account": {
+    "primary": "kms",
+    "implementations": {
+      "kms": {
+        "key_id": "your-localstack-key-id",
+        "region": "us-east-1",
+        "endpoint": "http://localhost:4566"
+      }
+    }
+  }
+}
 ```
 
 ## API Reference

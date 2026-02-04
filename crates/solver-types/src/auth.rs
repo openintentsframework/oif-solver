@@ -45,7 +45,7 @@ impl fmt::Display for AuthScope {
 			AuthScope::ReadQuotes => "read-quotes",
 			AuthScope::AdminAll => "admin-all",
 		};
-		write!(f, "{}", scope_str)
+		write!(f, "{scope_str}")
 	}
 }
 
@@ -59,7 +59,7 @@ impl FromStr for AuthScope {
 			"create-quotes" => Ok(AuthScope::CreateQuotes),
 			"read-quotes" => Ok(AuthScope::ReadQuotes),
 			"admin-all" => Ok(AuthScope::AdminAll),
-			_ => Err(format!("Unknown scope: {}", s)),
+			_ => Err(format!("Unknown scope: {s}")),
 		}
 	}
 }
