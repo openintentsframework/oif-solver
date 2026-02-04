@@ -617,7 +617,8 @@ mod tests {
 					.add_token(
 						TokenConfigBuilder::new()
 							.address(
-								parse_address("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").unwrap(),
+								parse_address("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
+									.unwrap(),
 							)
 							.symbol("USDC")
 							.decimals(6)
@@ -631,7 +632,8 @@ mod tests {
 					.add_token(
 						TokenConfigBuilder::new()
 							.address(
-								parse_address("0xaf88d065e77c8cc2239327c5edb3a432268e5831").unwrap(),
+								parse_address("0xaf88d065e77c8cc2239327c5edb3a432268e5831")
+									.unwrap(),
 							)
 							.symbol("USDC")
 							.decimals(6)
