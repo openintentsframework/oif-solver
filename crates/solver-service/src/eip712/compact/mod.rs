@@ -99,7 +99,7 @@ pub fn compute_batch_compact_hash(
 	let order =
 		OifStandardOrder::abi_decode_validate(order_bytes).map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
-			message: format!("Failed to decode order: {}", e),
+			message: format!("Failed to decode order: {e}"),
 			details: None,
 		})?;
 

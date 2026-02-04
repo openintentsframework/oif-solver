@@ -115,7 +115,7 @@ impl AmountExt for U256 {
 		} else {
 			let fraction_str = format!("{:0width$}", fraction, width = decimals as usize);
 			let fraction_str = fraction_str.trim_end_matches('0');
-			format!("{}.{}", integer, fraction_str)
+			format!("{integer}.{fraction_str}")
 		}
 	}
 

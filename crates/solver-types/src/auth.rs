@@ -3,6 +3,7 @@
 //! This module provides types for JWT-based authentication including
 //! scopes, claims, and configuration structures.
 
+use alloy_primitives::Address;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
@@ -44,7 +45,7 @@ impl fmt::Display for AuthScope {
 			AuthScope::ReadQuotes => "read-quotes",
 			AuthScope::AdminAll => "admin-all",
 		};
-		write!(f, "{}", scope_str)
+		write!(f, "{scope_str}")
 	}
 }
 
@@ -58,7 +59,7 @@ impl FromStr for AuthScope {
 			"create-quotes" => Ok(AuthScope::CreateQuotes),
 			"read-quotes" => Ok(AuthScope::ReadQuotes),
 			"admin-all" => Ok(AuthScope::AdminAll),
-			_ => Err(format!("Unknown scope: {}", s)),
+			_ => Err(format!("Unknown scope: {s}")),
 		}
 	}
 }
@@ -106,4 +107,220 @@ pub struct AuthConfig {
 	pub refresh_token_expiry_hours: u32,
 	/// JWT issuer identifier
 	pub issuer: String,
+	/// Admin authentication configuration (optional)
+	/// If not present, admin authentication via wallet signatures is disabled
+	#[serde(default)]
+	pub admin: Option<AdminConfig>,
+}
+
+/// Admin authentication configuration for wallet-based admin operations.
+///
+/// This configuration enables admins to authenticate using their Ethereum
+/// wallet signatures. Works for both SIWE session-based and per-action
+/// signature approaches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminConfig {
+	/// Enable admin authentication
+	#[serde(default)]
+	pub enabled: bool,
+
+	/// Domain for signature verification (prevents cross-site attacks).
+	/// Example: "solver.example.com"
+	pub domain: String,
+
+	/// Chain ID for EIP-712 domain separator.
+	/// The wallet must be connected to this chain when signing admin actions.
+	/// If not set, uses the first network's chain ID from config.
+	#[serde(default)]
+	pub chain_id: Option<u64>,
+
+	/// Nonce TTL in seconds. Nonces expire after this duration.
+	/// Default: 300 seconds (5 minutes)
+	#[serde(default = "default_nonce_ttl")]
+	pub nonce_ttl_seconds: u64,
+
+	/// List of authorized admin wallet addresses.
+	/// Only these addresses can perform admin operations.
+	pub admin_addresses: Vec<Address>,
+}
+
+fn default_nonce_ttl() -> u64 {
+	300
+}
+
+impl AdminConfig {
+	/// Check if an address is an authorized admin.
+	///
+	/// Returns `false` if admin auth is disabled (`enabled = false`),
+	/// even if the address is in the admin list.
+	///
+	/// Comparison is done on the raw bytes, which is case-insensitive
+	/// and handles checksummed vs non-checksummed addresses correctly.
+	pub fn is_admin(&self, address: &Address) -> bool {
+		self.enabled && self.admin_addresses.iter().any(|a| a == address)
+	}
+
+	/// Get the number of configured admin addresses.
+	pub fn admin_count(&self) -> usize {
+		self.admin_addresses.len()
+	}
+}
+
+impl Default for AdminConfig {
+	fn default() -> Self {
+		Self {
+			enabled: false,
+			domain: String::new(),
+			chain_id: None,
+			nonce_ttl_seconds: default_nonce_ttl(),
+			admin_addresses: Vec::new(),
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::str::FromStr;
+
+	#[test]
+	fn test_admin_config_is_admin() {
+		let admin_addr = Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
+		let non_admin_addr =
+			Address::from_str("0x70997970C51812dc3A010C7d01b50e0d17dc79C8").unwrap();
+
+		let config = AdminConfig {
+			enabled: true,
+			domain: "solver.example.com".to_string(),
+			chain_id: None,
+			nonce_ttl_seconds: 300,
+			admin_addresses: vec![admin_addr],
+		};
+
+		assert!(config.is_admin(&admin_addr));
+		assert!(!config.is_admin(&non_admin_addr));
+	}
+
+	#[test]
+	fn test_admin_config_multiple_admins() {
+		let admin1 = Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
+		let admin2 = Address::from_str("0x70997970C51812dc3A010C7d01b50e0d17dc79C8").unwrap();
+		let non_admin = Address::from_str("0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC").unwrap();
+
+		let config = AdminConfig {
+			enabled: true,
+			domain: "solver.example.com".to_string(),
+			chain_id: None,
+			nonce_ttl_seconds: 300,
+			admin_addresses: vec![admin1, admin2],
+		};
+
+		assert!(config.is_admin(&admin1));
+		assert!(config.is_admin(&admin2));
+		assert!(!config.is_admin(&non_admin));
+		assert_eq!(config.admin_count(), 2);
+	}
+
+	#[test]
+	fn test_admin_config_disabled_rejects_all() {
+		// Even if an address is in the admin list, it should be rejected when disabled
+		let admin_addr = Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
+
+		let config = AdminConfig {
+			enabled: false, // Disabled!
+			domain: "solver.example.com".to_string(),
+			chain_id: None,
+			nonce_ttl_seconds: 300,
+			admin_addresses: vec![admin_addr],
+		};
+
+		// Should return false because enabled = false
+		assert!(!config.is_admin(&admin_addr));
+	}
+
+	#[test]
+	fn test_admin_config_default() {
+		let config = AdminConfig::default();
+
+		assert!(!config.enabled);
+		assert!(config.domain.is_empty());
+		assert_eq!(config.nonce_ttl_seconds, 300);
+		assert!(config.admin_addresses.is_empty());
+	}
+
+	#[test]
+	fn test_admin_config_serialization() {
+		let admin_addr = Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
+
+		let config = AdminConfig {
+			enabled: true,
+			domain: "solver.example.com".to_string(),
+			chain_id: Some(1),
+			nonce_ttl_seconds: 600,
+			admin_addresses: vec![admin_addr],
+		};
+
+		let json = serde_json::to_string(&config).unwrap();
+		let parsed: AdminConfig = serde_json::from_str(&json).unwrap();
+
+		assert_eq!(parsed.enabled, config.enabled);
+		assert_eq!(parsed.domain, config.domain);
+		assert_eq!(parsed.chain_id, config.chain_id);
+		assert_eq!(parsed.nonce_ttl_seconds, config.nonce_ttl_seconds);
+		assert_eq!(parsed.admin_addresses, config.admin_addresses);
+	}
+
+	#[test]
+	fn test_admin_config_deserialization_with_defaults() {
+		let json = r#"{
+			"domain": "solver.example.com",
+			"admin_addresses": ["0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"]
+		}"#;
+
+		let config: AdminConfig = serde_json::from_str(json).unwrap();
+
+		assert!(!config.enabled); // Default
+		assert_eq!(config.nonce_ttl_seconds, 300); // Default
+		assert_eq!(config.domain, "solver.example.com");
+		assert_eq!(config.admin_count(), 1);
+	}
+
+	#[test]
+	fn test_auth_config_with_admin() {
+		let json = r#"{
+			"enabled": true,
+			"jwt_secret": "test-secret-at-least-32-characters-long",
+			"access_token_expiry_hours": 1,
+			"refresh_token_expiry_hours": 720,
+			"issuer": "oif-solver",
+			"admin": {
+				"enabled": true,
+				"domain": "solver.example.com",
+				"admin_addresses": ["0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"]
+			}
+		}"#;
+
+		let config: AuthConfig = serde_json::from_str(json).unwrap();
+
+		assert!(config.admin.is_some());
+		let admin = config.admin.unwrap();
+		assert!(admin.enabled);
+		assert_eq!(admin.domain, "solver.example.com");
+		assert_eq!(admin.admin_count(), 1);
+	}
+
+	#[test]
+	fn test_auth_config_without_admin() {
+		let json = r#"{
+			"enabled": true,
+			"jwt_secret": "test-secret-at-least-32-characters-long",
+			"access_token_expiry_hours": 1,
+			"refresh_token_expiry_hours": 720,
+			"issuer": "oif-solver"
+		}"#;
+
+		let config: AuthConfig = serde_json::from_str(json).unwrap();
+
+		assert!(config.admin.is_none());
+	}
 }

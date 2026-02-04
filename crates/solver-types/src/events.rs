@@ -13,6 +13,7 @@ use std::time::Duration;
 /// Events are categorized by the service that produces them, allowing
 /// consumers to filter and handle specific event types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum SolverEvent {
 	/// Events from the discovery service.
 	Discovery(DiscoveryEvent),
@@ -26,6 +27,7 @@ pub enum SolverEvent {
 
 /// Events related to intent discovery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum DiscoveryEvent {
 	/// A new intent has been discovered.
 	IntentDiscovered { intent: Intent },
@@ -37,6 +39,7 @@ pub enum DiscoveryEvent {
 
 /// Events related to order processing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum OrderEvent {
 	/// An order is being prepared for execution (e.g., openFor for off-chain orders).
 	Preparing {

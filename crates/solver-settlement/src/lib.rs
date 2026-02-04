@@ -371,7 +371,7 @@ impl SettlementService {
 			oracle_address
 				.0
 				.iter()
-				.map(|b| format!("{:02x}", b))
+				.map(|b| format!("{b:02x}"))
 				.collect::<String>(),
 			chain_id
 		)))

@@ -82,8 +82,7 @@ impl FileHeader {
 		let version = u16::from_le_bytes([bytes[4], bytes[5]]);
 		if version > Self::VERSION {
 			return Err(StorageError::Backend(format!(
-				"Unsupported file version: {}",
-				version
+				"Unsupported file version: {version}"
 			)));
 		}
 
@@ -128,7 +127,7 @@ pub struct NamespaceIndex {
 }
 
 /// TTL configuration for different storage keys.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TtlConfig {
 	ttls: HashMap<StorageKey, Duration>,
 }
@@ -191,7 +190,7 @@ impl FileStorage {
 	fn get_file_path(&self, key: &str) -> PathBuf {
 		// Sanitize key to be filesystem-safe
 		let safe_key = key.replace(['/', ':'], "_");
-		self.base_path.join(format!("{}.bin", safe_key))
+		self.base_path.join(format!("{safe_key}.bin"))
 	}
 
 	/// Gets the TTL for a given key based on its namespace.
@@ -218,7 +217,7 @@ impl FileStorage {
 		// Ensure parent directory exists
 		if let Some(parent) = lock_path.parent() {
 			fs::create_dir_all(parent).await.map_err(|e| {
-				StorageError::Backend(format!("Failed to create lock directory: {}", e))
+				StorageError::Backend(format!("Failed to create lock directory: {e}"))
 			})?;
 		}
 
@@ -230,16 +229,16 @@ impl FileStorage {
 				.truncate(true)
 				.write(true)
 				.open(&lock_path)
-				.map_err(|e| StorageError::Backend(format!("Failed to open lock file: {}", e)))?;
+				.map_err(|e| StorageError::Backend(format!("Failed to open lock file: {e}")))?;
 
 			// Acquire exclusive lock (blocking)
 			FileExt::lock_exclusive(&lock_file)
-				.map_err(|e| StorageError::Backend(format!("Failed to acquire lock: {}", e)))?;
+				.map_err(|e| StorageError::Backend(format!("Failed to acquire lock: {e}")))?;
 
 			Ok((lock_file,))
 		})
 		.await
-		.map_err(|e| StorageError::Backend(format!("Failed to spawn blocking task: {}", e)))?;
+		.map_err(|e| StorageError::Backend(format!("Failed to spawn blocking task: {e}")))?;
 
 		let (_lock_file,) = result?;
 
@@ -265,7 +264,7 @@ impl FileStorage {
 		// Ensure parent directory exists
 		if let Some(parent) = lock_path.parent() {
 			fs::create_dir_all(parent).await.map_err(|e| {
-				StorageError::Backend(format!("Failed to create lock directory: {}", e))
+				StorageError::Backend(format!("Failed to create lock directory: {e}"))
 			})?;
 		}
 
@@ -278,17 +277,17 @@ impl FileStorage {
 				.read(true)
 				.write(true)
 				.open(&lock_path)
-				.map_err(|e| StorageError::Backend(format!("Failed to open lock file: {}", e)))?;
+				.map_err(|e| StorageError::Backend(format!("Failed to open lock file: {e}")))?;
 
 			// Acquire shared lock (blocking)
 			FileExt::lock_shared(&lock_file).map_err(|e| {
-				StorageError::Backend(format!("Failed to acquire shared lock: {}", e))
+				StorageError::Backend(format!("Failed to acquire shared lock: {e}"))
 			})?;
 
 			Ok((lock_file,))
 		})
 		.await
-		.map_err(|e| StorageError::Backend(format!("Failed to spawn blocking task: {}", e)))?;
+		.map_err(|e| StorageError::Backend(format!("Failed to spawn blocking task: {e}")))?;
 
 		let (_lock_file,) = result?;
 
@@ -304,7 +303,7 @@ impl FileStorage {
 		key: &str,
 		indexes: &StorageIndexes,
 	) -> Result<(), StorageError> {
-		let index_path = self.base_path.join(format!("{}.index", namespace));
+		let index_path = self.base_path.join(format!("{namespace}.index"));
 		let index_path_clone = index_path.clone();
 
 		// Clone data to move into closure
@@ -379,7 +378,7 @@ impl FileStorage {
 
 	/// Removes key from indexes when deleting.
 	async fn remove_from_indexes(&self, namespace: &str, key: &str) -> Result<(), StorageError> {
-		let index_path = self.base_path.join(format!("{}.index", namespace));
+		let index_path = self.base_path.join(format!("{namespace}.index"));
 
 		if !index_path.exists() {
 			return Ok(());
@@ -619,7 +618,7 @@ impl StorageInterface for FileStorage {
 		namespace: &str,
 		filter: QueryFilter,
 	) -> Result<Vec<String>, StorageError> {
-		let index_path = self.base_path.join(format!("{}.index", namespace));
+		let index_path = self.base_path.join(format!("{namespace}.index"));
 
 		// If no index exists, return empty results (nothing has been indexed yet)
 		if !index_path.exists() {
@@ -725,6 +724,137 @@ impl StorageInterface for FileStorage {
 
 		Ok(results)
 	}
+
+	// ==================== Atomic Operations ====================
+	//
+	// Note: File-based atomic operations use file existence checks.
+	// These are best-effort and not truly atomic across processes.
+	// For production use with concurrent access, prefer Redis.
+
+	async fn set_nx(
+		&self,
+		key: &str,
+		value: Vec<u8>,
+		ttl: Option<Duration>,
+	) -> Result<bool, StorageError> {
+		let path = self.get_file_path(key);
+
+		// Check if file already exists and is not expired
+		if path.exists() {
+			// Check if expired
+			if let Ok(data) = fs::read(&path).await {
+				if let Ok(header) = FileHeader::deserialize(&data) {
+					if !header.is_expired() {
+						return Ok(false); // Key exists and is valid
+					}
+				}
+			}
+		}
+
+		// Create parent directory if needed
+		if let Some(parent) = path.parent() {
+			fs::create_dir_all(parent)
+				.await
+				.map_err(|e| StorageError::Backend(e.to_string()))?;
+		}
+
+		// Determine TTL
+		let ttl = ttl.unwrap_or_else(|| self.get_ttl_for_key(key));
+
+		// Create header and file data
+		let header = FileHeader::new(ttl);
+		let header_bytes = header.serialize();
+
+		let mut file_data = Vec::with_capacity(FileHeader::SIZE + value.len());
+		file_data.extend_from_slice(&header_bytes);
+		file_data.extend_from_slice(&value);
+
+		// Write atomically
+		let temp_path = path.with_extension("tmp");
+		fs::write(&temp_path, file_data)
+			.await
+			.map_err(|e| StorageError::Backend(e.to_string()))?;
+
+		fs::rename(&temp_path, &path)
+			.await
+			.map_err(|e| StorageError::Backend(e.to_string()))?;
+
+		Ok(true)
+	}
+
+	async fn compare_and_swap(
+		&self,
+		key: &str,
+		expected: &[u8],
+		new_value: Vec<u8>,
+		ttl: Option<Duration>,
+	) -> Result<bool, StorageError> {
+		let path = self.get_file_path(key);
+
+		// Read current value
+		let current_data = match fs::read(&path).await {
+			Ok(data) => data,
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+				return Err(StorageError::NotFound(key.to_string()));
+			},
+			Err(e) => return Err(StorageError::Backend(e.to_string())),
+		};
+
+		// Parse header and get current value
+		let current_value = if let Ok(header) = FileHeader::deserialize(&current_data) {
+			if header.is_expired() {
+				return Err(StorageError::NotFound(key.to_string()));
+			}
+			if current_data.len() > FileHeader::SIZE {
+				&current_data[FileHeader::SIZE..]
+			} else {
+				&[]
+			}
+		} else {
+			// Legacy file without header
+			&current_data[..]
+		};
+
+		// Compare
+		if current_value != expected {
+			return Ok(false);
+		}
+
+		// Match - write new value
+		let ttl = ttl.unwrap_or_else(|| self.get_ttl_for_key(key));
+		let header = FileHeader::new(ttl);
+		let header_bytes = header.serialize();
+
+		let mut file_data = Vec::with_capacity(FileHeader::SIZE + new_value.len());
+		file_data.extend_from_slice(&header_bytes);
+		file_data.extend_from_slice(&new_value);
+
+		let temp_path = path.with_extension("tmp");
+		fs::write(&temp_path, file_data)
+			.await
+			.map_err(|e| StorageError::Backend(e.to_string()))?;
+
+		fs::rename(&temp_path, &path)
+			.await
+			.map_err(|e| StorageError::Backend(e.to_string()))?;
+
+		Ok(true)
+	}
+
+	async fn delete_if_exists(&self, key: &str) -> Result<bool, StorageError> {
+		let path = self.get_file_path(key);
+
+		match fs::remove_file(&path).await {
+			Ok(_) => {
+				// Also remove from indexes
+				let namespace = key.split(':').next().unwrap_or("");
+				self.remove_from_indexes(namespace, key).await?;
+				Ok(true)
+			},
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+			Err(e) => Err(StorageError::Backend(e.to_string())),
+		}
+	}
 }
 
 /// Configuration schema for FileStorage.
@@ -777,7 +907,7 @@ impl ConfigSchema for FileStorageSchema {
 pub fn create_storage(config: &toml::Value) -> Result<Box<dyn StorageInterface>, StorageError> {
 	// Validate configuration first
 	FileStorageSchema::validate_config(config)
-		.map_err(|e| StorageError::Configuration(format!("Invalid configuration: {}", e)))?;
+		.map_err(|e| StorageError::Configuration(format!("Invalid configuration: {e}")))?;
 
 	let storage_path = config
 		.get("storage_path")
@@ -804,8 +934,6 @@ impl solver_types::ImplementationRegistry for Registry {
 		create_storage
 	}
 }
-
-impl crate::StorageRegistry for Registry {}
 
 #[cfg(test)]
 mod tests {
@@ -1160,10 +1288,10 @@ mod tests {
 		let tasks = (0..10).map(|i| {
 			let storage = &storage;
 			async move {
-				let key = format!("orders:order{}", i);
+				let key = format!("orders:order{i}");
 				let indexes = StorageIndexes::new().with_field("batch", "test");
 				storage
-					.set_bytes(&key, format!("data{}", i).into_bytes(), Some(indexes), None)
+					.set_bytes(&key, format!("data{i}").into_bytes(), Some(indexes), None)
 					.await
 			}
 		});

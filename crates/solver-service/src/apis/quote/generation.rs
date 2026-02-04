@@ -416,8 +416,7 @@ impl QuoteGenerator {
 						.ethereum_chain_id()
 						.map_err(|e| {
 							QuoteError::InvalidRequest(format!(
-								"Invalid chain ID in asset address: {}",
-								e
+								"Invalid chain ID in asset address: {e}"
 							))
 						})?;
 				let domain_object = self
@@ -466,7 +465,7 @@ impl QuoteGenerator {
 			.ok_or_else(|| QuoteError::InvalidRequest("No requested inputs".to_string()))?
 			.asset
 			.ethereum_chain_id()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chain ID: {}", e)))?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chain ID: {e}")))?;
 
 		let destination_chain_id = request
 			.intent
@@ -475,7 +474,7 @@ impl QuoteGenerator {
 			.ok_or_else(|| QuoteError::InvalidRequest("No requested outputs".to_string()))?
 			.asset
 			.ethereum_chain_id()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chain ID: {}", e)))?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chain ID: {e}")))?;
 
 		// For escrow orders, get settlement that supports both chains
 		let (_settlement, input_oracle, output_oracle) = self
@@ -483,8 +482,7 @@ impl QuoteGenerator {
 			.get_any_settlement_for_chains(origin_chain_id, destination_chain_id)
 			.ok_or_else(|| {
 				QuoteError::InvalidRequest(format!(
-					"No suitable settlement available for escrow from chain {} to chain {}",
-					origin_chain_id, destination_chain_id
+					"No suitable settlement available for escrow from chain {origin_chain_id} to chain {destination_chain_id}"
 				))
 			})?;
 
@@ -498,8 +496,7 @@ impl QuoteGenerator {
 					.await
 			},
 			_ => Err(QuoteError::UnsupportedSettlement(format!(
-				"Unsupported escrow type: {:?}",
-				lock_type
+				"Unsupported escrow type: {lock_type:?}"
 			))),
 		}
 	}
@@ -515,7 +512,7 @@ impl QuoteGenerator {
 			.asset
 			.ethereum_chain_id()
 			.map_err(|e| {
-				QuoteError::InvalidRequest(format!("Invalid chain ID in asset address: {}", e))
+				QuoteError::InvalidRequest(format!("Invalid chain ID in asset address: {e}"))
 			})?;
 
 		// Build structured domain object for Permit2
@@ -575,9 +572,9 @@ impl QuoteGenerator {
 		let input_chain_id = first_input
 			.asset
 			.ethereum_chain_id()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input chain ID: {}", e)))?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input chain ID: {e}")))?;
 		let network = config.networks.get(&input_chain_id).ok_or_else(|| {
-			QuoteError::InvalidRequest(format!("Network {} not found in config", input_chain_id))
+			QuoteError::InvalidRequest(format!("Network {input_chain_id} not found in config"))
 		})?;
 		let input_settler = network.input_settler_address.clone();
 		let input_settler_address = format!(
@@ -605,7 +602,7 @@ impl QuoteGenerator {
 		let token_address = first_input
 			.asset
 			.ethereum_address()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid token address: {}", e)))?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid token address: {e}")))?;
 
 		// Build structured domain object for EIP-3009 token
 		let domain_object = self
@@ -622,7 +619,7 @@ impl QuoteGenerator {
 		let mut signatures_array = Vec::new();
 		for input in &request.intent.inputs {
 			let input_message = serde_json::json!({
-				"from": input.user.ethereum_address().map_err(|e| QuoteError::InvalidRequest(format!("Invalid Ethereum address: {}", e)))?,
+				"from": input.user.ethereum_address().map_err(|e| QuoteError::InvalidRequest(format!("Invalid Ethereum address: {e}")))?,
 				"to": input_settler_address,
 				"value": input.amount,
 				"validAfter": 0,
@@ -665,8 +662,7 @@ impl QuoteGenerator {
 				let output_chain_id = output.asset.ethereum_chain_id().unwrap_or(1);
 				let output_network = config.networks.get(&output_chain_id).ok_or_else(|| {
 					QuoteError::InvalidRequest(format!(
-						"Output chain {} not found in config",
-						output_chain_id
+						"Output chain {output_chain_id} not found in config"
 					))
 				})?;
 				let output_settler = &output_network.output_settler_address;
@@ -725,16 +721,16 @@ impl QuoteGenerator {
 		let input_chain_id = input
 			.asset
 			.ethereum_chain_id()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input chain ID: {}", e)))?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input chain ID: {e}")))?;
 		let input_network = config.networks.get(&input_chain_id).ok_or_else(|| {
-			QuoteError::InvalidRequest(format!("Network {} not found", input_chain_id))
+			QuoteError::InvalidRequest(format!("Network {input_chain_id} not found"))
 		})?;
 
 		// Build StandardOrder struct (same approach as intents script)
 		let user_addr = input
 			.user
 			.ethereum_address()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid user address: {}", e)))?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid user address: {e}")))?;
 		// Generate incremental nonce like direct intent (current timestamp in milliseconds)
 		let nonce = std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
@@ -746,7 +742,7 @@ impl QuoteGenerator {
 		let input_token = input
 			.asset
 			.ethereum_address()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input token: {}", e)))?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input token: {e}")))?;
 		// Input amount should be set after cost adjustment
 		let input_amount = input
 			.amount
@@ -766,11 +762,11 @@ impl QuoteGenerator {
 		let output_chain_id = output_info
 			.asset
 			.ethereum_chain_id()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output chain ID: {}", e)))?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output chain ID: {e}")))?;
 		let output_token = output_info
 			.asset
 			.ethereum_address()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output token: {}", e)))?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output token: {e}")))?;
 		let output_amount = output_info
 			.amount
 			.as_ref()
@@ -785,13 +781,12 @@ impl QuoteGenerator {
 		let recipient_addr = output_info
 			.receiver
 			.ethereum_address()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid recipient address: {}", e)))?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid recipient address: {e}")))?;
 
 		// Get output settler from config
 		let output_network = config.networks.get(&output_chain_id).ok_or_else(|| {
 			QuoteError::InvalidRequest(format!(
-				"Output network {} not found in config",
-				output_chain_id
+				"Output network {output_chain_id} not found in config"
 			))
 		})?;
 		let output_settler = output_network.output_settler_address.clone();
@@ -816,14 +811,29 @@ impl QuoteGenerator {
 
 		// Parse amounts
 		let input_amount_u256 = U256::from_str(&input_amount)
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input amount: {}", e)))?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid input amount: {e}")))?;
 		let output_amount_u256 = U256::from_str(&output_amount)
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output amount: {}", e)))?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output amount: {e}")))?;
 
 		// Convert input token address to bytes32 for inputs array
 		let mut input_token_bytes = [0u8; 32];
 		input_token_bytes[12..].copy_from_slice(&input_token.0[..]);
 		let input_token_u256 = U256::from_be_bytes(input_token_bytes);
+
+		// Parse callbackData from request if present
+		let callback_data_bytes = if let Some(ref calldata_hex) = output_info.calldata {
+			if calldata_hex.is_empty() || calldata_hex == "0x" {
+				vec![]
+			} else {
+				let hex_str = calldata_hex.trim_start_matches("0x");
+				hex::decode(hex_str).unwrap_or_else(|e| {
+					tracing::warn!("Failed to decode callbackData '{}': {}", calldata_hex, e);
+					vec![]
+				})
+			}
+		} else {
+			vec![]
+		};
 
 		// Build the StandardOrder
 		let order = StandardOrder {
@@ -841,7 +851,7 @@ impl QuoteGenerator {
 				token: output_token_bytes32,
 				amount: output_amount_u256,
 				recipient: recipient_bytes32,
-				callbackData: vec![].into(),
+				callbackData: callback_data_bytes.into(),
 				context: vec![].into(),
 			}],
 		};
@@ -897,9 +907,7 @@ impl QuoteGenerator {
 			.delivery_service
 			.contract_call(input_chain_id, tx)
 			.await
-			.map_err(|e| {
-				QuoteError::InvalidRequest(format!("Failed to compute order ID: {}", e))
-			})?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to compute order ID: {e}")))?;
 
 		// Convert the returned bytes to hex string
 		let order_id = format!("0x{}", alloy_primitives::hex::encode(&order_id_bytes));
@@ -950,7 +958,7 @@ impl QuoteGenerator {
 			.contract_call(chain_id, tx)
 			.await
 			.map_err(|e| {
-				QuoteError::InvalidRequest(format!("Failed to get domain separator: {}", e))
+				QuoteError::InvalidRequest(format!("Failed to get domain separator: {e}"))
 			})?;
 
 		// Convert the returned bytes to [u8; 32]
@@ -1006,7 +1014,7 @@ impl QuoteGenerator {
 		let user_address = request
 			.user
 			.ethereum_address()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid user address: {}", e)))?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid user address: {e}")))?;
 
 		// Get input chain ID from first available input
 		let origin_chain_id = request
@@ -1016,11 +1024,11 @@ impl QuoteGenerator {
 			.ok_or_else(|| QuoteError::InvalidRequest("No requested inputs".to_string()))?
 			.asset
 			.ethereum_chain_id()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chain ID: {}", e)))?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chain ID: {e}")))?;
 
 		// Get addresses from network configuration
 		let network = config.networks.get(&origin_chain_id).ok_or_else(|| {
-			QuoteError::InvalidRequest(format!("Network {} not found in config", origin_chain_id))
+			QuoteError::InvalidRequest(format!("Network {origin_chain_id} not found in config"))
 		})?;
 
 		// Get preferred settlement for TheCompact (prioritizes Direct settlement like escrow)
@@ -1029,8 +1037,7 @@ impl QuoteGenerator {
 			.get_any_settlement_for_chain(origin_chain_id)
 			.ok_or_else(|| {
 				QuoteError::InvalidRequest(format!(
-					"No suitable settlement available for TheCompact on chain {}",
-					origin_chain_id
+					"No suitable settlement available for TheCompact on chain {origin_chain_id}"
 				))
 			})?;
 
@@ -1039,7 +1046,7 @@ impl QuoteGenerator {
 		let mut inputs_array = Vec::new();
 		for input in &request.intent.inputs {
 			let token_address = input.asset.ethereum_address().map_err(|e| {
-				QuoteError::InvalidRequest(format!("Invalid input token address: {}", e))
+				QuoteError::InvalidRequest(format!("Invalid input token address: {e}"))
 			})?;
 
 			// Generate allocator lock tag from address (0x00 + last 11 bytes of address)
@@ -1055,9 +1062,9 @@ impl QuoteGenerator {
 
 			// Build token ID by concatenating allocator tag (12 bytes) + token address (20 bytes)
 			let token_address_hex = hex::encode(token_address.0);
-			let token_id_hex = format!("{}{}", allocator_tag, token_address_hex);
+			let token_id_hex = format!("{allocator_tag}{token_address_hex}");
 			let token_id = U256::from_str(&token_id_hex).map_err(|e| {
-				QuoteError::InvalidRequest(format!("Failed to create token ID: {}", e))
+				QuoteError::InvalidRequest(format!("Failed to create token ID: {e}"))
 			})?;
 
 			let amount = input.amount.as_ref().ok_or_else(|| {
@@ -1070,14 +1077,15 @@ impl QuoteGenerator {
 		let mut outputs_array = Vec::new();
 		for output in &request.intent.outputs {
 			let output_token_address = output.asset.ethereum_address().map_err(|e| {
-				QuoteError::InvalidRequest(format!("Invalid output token address: {}", e))
+				QuoteError::InvalidRequest(format!("Invalid output token address: {e}"))
 			})?;
 			let recipient_address = output.receiver.ethereum_address().map_err(|e| {
-				QuoteError::InvalidRequest(format!("Invalid recipient address: {}", e))
+				QuoteError::InvalidRequest(format!("Invalid recipient address: {e}"))
 			})?;
-			let output_chain_id = output.asset.ethereum_chain_id().map_err(|e| {
-				QuoteError::InvalidRequest(format!("Invalid output chain ID: {}", e))
-			})?;
+			let output_chain_id = output
+				.asset
+				.ethereum_chain_id()
+				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output chain ID: {e}")))?;
 
 			// Get preferred settlement for the output chain (prioritizes Direct settlement like escrow)
 			let (_output_settlement, _output_input_oracle, output_oracle) = self
@@ -1085,16 +1093,14 @@ impl QuoteGenerator {
 				.get_any_settlement_for_chain(output_chain_id)
 				.ok_or_else(|| {
 					QuoteError::InvalidRequest(format!(
-						"No suitable settlement available for output chain {}",
-						output_chain_id
+						"No suitable settlement available for output chain {output_chain_id}"
 					))
 				})?;
 
 			// Get output settler from config (like permit2 flow)
 			let dest_net = config.networks.get(&output_chain_id).ok_or_else(|| {
 				QuoteError::InvalidRequest(format!(
-					"Destination chain {} missing from networks config",
-					output_chain_id
+					"Destination chain {output_chain_id} missing from networks config"
 				))
 			})?;
 			let output_settler = bytes20_to_alloy_address(&dest_net.output_settler_address.0)
@@ -1103,7 +1109,7 @@ impl QuoteGenerator {
 			// Convert oracle address (like permit2 flow)
 			let output_oracle_address =
 				bytes20_to_alloy_address(&output_oracle.0).map_err(|e| {
-					QuoteError::InvalidRequest(format!("Invalid output oracle address: {}", e))
+					QuoteError::InvalidRequest(format!("Invalid output oracle address: {e}"))
 				})?;
 
 			// Build MandateOutput with proper oracle and settler addresses
@@ -1126,7 +1132,7 @@ impl QuoteGenerator {
 
 		// Use the selected oracle for input chain as the inputOracle (like permit2 flow)
 		let input_oracle_address = bytes20_to_alloy_address(&input_oracle.0).map_err(|e| {
-			QuoteError::InvalidRequest(format!("Invalid input oracle address: {}", e))
+			QuoteError::InvalidRequest(format!("Invalid input oracle address: {e}"))
 		})?;
 
 		// Build the EIP-712 message structure (like permit2 flow)
@@ -1246,11 +1252,10 @@ impl QuoteGenerator {
 			.delivery_service
 			.contract_call(chain_id, tx)
 			.await
-			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to get token name: {}", e)))?;
+			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to get token name: {e}")))?;
 
-		let name = nameCall::abi_decode_returns(&result).map_err(|e| {
-			QuoteError::InvalidRequest(format!("Failed to decode token name: {}", e))
-		})?;
+		let name = nameCall::abi_decode_returns(&result)
+			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to decode token name: {e}")))?;
 
 		Ok(name)
 	}
@@ -1267,7 +1272,7 @@ impl QuoteGenerator {
 		let permit2_address = PROTOCOL_REGISTRY
 			.get_permit2_address(chain_id)
 			.ok_or_else(|| {
-				QuoteError::InvalidRequest(format!("Permit2 not deployed on chain {}", chain_id))
+				QuoteError::InvalidRequest(format!("Permit2 not deployed on chain {chain_id}"))
 			})?;
 
 		// Build domain object similar to TheCompact and EIP-3009 structure
@@ -1491,7 +1496,7 @@ impl QuoteGenerator {
 	) -> Result<serde_json::Value, QuoteError> {
 		// Get TheCompact contract address from network config
 		let network = config.networks.get(&chain_id).ok_or_else(|| {
-			QuoteError::InvalidRequest(format!("Network {} not found in config", chain_id))
+			QuoteError::InvalidRequest(format!("Network {chain_id} not found in config"))
 		})?;
 
 		let the_compact_address = network.the_compact_address.as_ref().ok_or_else(|| {
@@ -2853,7 +2858,7 @@ mod tests {
 		config.networks.insert(1, network);
 
 		let result = generator.build_compact_domain_object(&config, 1).await;
-		println!("result: {:?}", result);
+		println!("result: {result:?}");
 
 		assert!(
 			matches!(result, Err(QuoteError::InvalidRequest(msg)) if msg.contains("TheCompact address not configured"))

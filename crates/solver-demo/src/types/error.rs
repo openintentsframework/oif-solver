@@ -150,13 +150,13 @@ pub enum Error {
 // Convenience conversions
 impl From<String> for Error {
 	fn from(msg: String) -> Self {
-		Error::Other(anyhow::anyhow!("{}", msg))
+		Error::Other(anyhow::anyhow!("{msg}"))
 	}
 }
 
 impl From<&'static str> for Error {
 	fn from(msg: &'static str) -> Self {
-		Error::Other(anyhow::anyhow!("{}", msg))
+		Error::Other(anyhow::anyhow!("{msg}"))
 	}
 }
 

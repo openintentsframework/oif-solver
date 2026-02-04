@@ -106,8 +106,8 @@ impl TransactionHandler {
 				settlement
 					.handle_transaction_confirmed(&order, tx_type, &receipt)
 					.await
-					.map_err(|e| {
-						TransactionError::Service(format!("Settlement callback failed: {}", e))
+					.map_err(|e: solver_settlement::SettlementError| {
+						TransactionError::Service(format!("Settlement callback failed: {e}"))
 					})?;
 			}
 		}
@@ -482,7 +482,7 @@ mod tests {
 				assert_eq!(order.id, "test_order_123");
 				assert_eq!(params.gas_price, U256::from(20_000_000_000u64));
 			},
-			_ => panic!("Expected Executing event, got: {:?}", event),
+			_ => panic!("Expected Executing event, got: {event:?}"),
 		}
 
 		// Verify order status was updated to Executing
@@ -597,7 +597,7 @@ mod tests {
 			SolverEvent::Settlement(SettlementEvent::PostFillReady { order_id }) => {
 				assert_eq!(order_id, "test_order_123");
 			},
-			_ => panic!("Expected PostFillReady event, got: {:?}", event),
+			_ => panic!("Expected PostFillReady event, got: {event:?}"),
 		}
 
 		// Verify order status was updated to Executed by checking the state machine
@@ -686,7 +686,7 @@ mod tests {
 				assert_eq!(order_id, "test_order_123");
 				assert_eq!(fill_tx_hash, TransactionHash(vec![0xab; 32]));
 			},
-			_ => panic!("Expected StartMonitoring event, got: {:?}", event),
+			_ => panic!("Expected StartMonitoring event, got: {event:?}"),
 		}
 
 		// Verify order status was updated to PostFilled
@@ -770,7 +770,7 @@ mod tests {
 			TransactionError::Service(msg) => {
 				assert!(msg.contains("Missing fill transaction hash"));
 			},
-			other => panic!("Expected Service error, got: {:?}", other),
+			other => panic!("Expected Service error, got: {other:?}"),
 		}
 	}
 
@@ -850,7 +850,7 @@ mod tests {
 			SolverEvent::Settlement(SettlementEvent::ClaimReady { order_id }) => {
 				assert_eq!(order_id, order_for_state.id);
 			},
-			_ => panic!("Expected ClaimReady event, got: {:?}", event),
+			_ => panic!("Expected ClaimReady event, got: {event:?}"),
 		}
 
 		// Verify order status was updated to PreClaimed
@@ -929,7 +929,7 @@ mod tests {
 			SolverEvent::Settlement(SettlementEvent::Completed { order_id }) => {
 				assert_eq!(order_id, "test_order_123");
 			},
-			_ => panic!("Expected Completed event, got: {:?}", event),
+			_ => panic!("Expected Completed event, got: {event:?}"),
 		}
 
 		// Verify order status was updated to Finalized and claim_tx_hash was set

@@ -57,10 +57,10 @@ impl Storage {
 		}
 
 		let file = std::fs::File::create(&path)
-			.map_err(|e| Error::StorageError(format!("Failed to create {}: {}", key, e)))?;
+			.map_err(|e| Error::StorageError(format!("Failed to create {key}: {e}")))?;
 
 		serde_json::to_writer_pretty(file, value)
-			.map_err(|e| Error::StorageError(format!("Failed to write {}: {}", key, e)))?;
+			.map_err(|e| Error::StorageError(format!("Failed to write {key}: {e}")))?;
 
 		Ok(())
 	}
@@ -79,14 +79,14 @@ impl Storage {
 		let path = self.path_for(key);
 
 		if !path.exists() {
-			return Err(Error::StorageError(format!("File not found: {}", key)));
+			return Err(Error::StorageError(format!("File not found: {key}")));
 		}
 
 		let file = std::fs::File::open(&path)
-			.map_err(|e| Error::StorageError(format!("Failed to open {}: {}", key, e)))?;
+			.map_err(|e| Error::StorageError(format!("Failed to open {key}: {e}")))?;
 
 		serde_json::from_reader(file)
-			.map_err(|e| Error::StorageError(format!("Failed to read {}: {}", key, e)))
+			.map_err(|e| Error::StorageError(format!("Failed to read {key}: {e}")))
 	}
 
 	/// Checks if a storage key exists
@@ -112,7 +112,7 @@ impl Storage {
 
 		if path.exists() {
 			std::fs::remove_file(&path)
-				.map_err(|e| Error::StorageError(format!("Failed to delete {}: {}", key, e)))?;
+				.map_err(|e| Error::StorageError(format!("Failed to delete {key}: {e}")))?;
 		}
 
 		Ok(())
@@ -126,7 +126,7 @@ impl Storage {
 	/// # Returns
 	/// Complete file path with .json extension
 	fn path_for(&self, key: &str) -> PathBuf {
-		self.root.join(format!("{}.json", key))
+		self.root.join(format!("{key}.json"))
 	}
 
 	/// Creates a new storage instance for a subdirectory
@@ -155,7 +155,7 @@ impl Storage {
 		let mut keys = Vec::new();
 
 		let entries = std::fs::read_dir(&*self.root)
-			.map_err(|e| Error::StorageError(format!("Failed to read directory: {}", e)))?;
+			.map_err(|e| Error::StorageError(format!("Failed to read directory: {e}")))?;
 
 		for entry in entries {
 			let entry = entry?;

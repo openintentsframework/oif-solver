@@ -54,7 +54,7 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 		let standard_order =
 			OifStandardOrder::try_from(&intent.order).map_err(|e| APIError::BadRequest {
 				error_type: ApiErrorType::OrderValidationFailed,
-				message: format!("Failed to convert order: {}", e),
+				message: format!("Failed to convert order: {e}"),
 				details: None,
 			})?;
 
@@ -67,7 +67,7 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 				.get(&origin_chain_id)
 				.ok_or_else(|| APIError::BadRequest {
 					error_type: ApiErrorType::OrderValidationFailed,
-					message: format!("Network {} not configured", origin_chain_id),
+					message: format!("Network {origin_chain_id} not configured"),
 					details: None,
 				})?;
 
@@ -156,7 +156,7 @@ impl SignatureValidationService {
 			.get(standard)
 			.ok_or_else(|| APIError::BadRequest {
 				error_type: ApiErrorType::OrderValidationFailed,
-				message: format!("No signature validator for standard: {}", standard),
+				message: format!("No signature validator for standard: {standard}"),
 				details: None,
 			})?;
 
@@ -506,11 +506,10 @@ mod tests {
 				assert!(
 					(message.contains("Invalid") && message.contains("signature"))
 						|| message.contains("Failed to recover public key"),
-					"unexpected error message: {}",
-					message
+					"unexpected error message: {message}"
 				);
 			},
-			Err(other) => panic!("unexpected error: {:?}", other),
+			Err(other) => panic!("unexpected error: {other:?}"),
 		}
 	}
 }

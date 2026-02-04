@@ -99,7 +99,7 @@ impl AnvilManager {
 		use crate::core::logging;
 		logging::verbose_operation(
 			"Starting Anvil process",
-			&format!("chain {} on port {}", chain, port),
+			&format!("chain {chain} on port {port}"),
 		);
 
 		// Build Anvil command to run in background
@@ -122,7 +122,7 @@ impl AnvilManager {
 		// Start the process and detach it
 		let child = cmd
 			.spawn()
-			.map_err(|e| Error::AnvilStartFailed(format!("Failed to start Anvil: {}", e)))?;
+			.map_err(|e| Error::AnvilStartFailed(format!("Failed to start Anvil: {e}")))?;
 
 		let pid = child.id();
 
@@ -134,7 +134,7 @@ impl AnvilManager {
 
 		logging::verbose_success(
 			"Anvil process started",
-			&format!("chain {} (PID: {})", chain, pid),
+			&format!("chain {chain} (PID: {pid})"),
 		);
 
 		Ok(())
@@ -186,7 +186,7 @@ impl AnvilManager {
 		self.ctx
 			.storage
 			.save("anvil_processes", &string_keyed_map)
-			.map_err(|e| Error::StorageError(format!("Failed to save processes: {}", e)))
+			.map_err(|e| Error::StorageError(format!("Failed to save processes: {e}")))
 	}
 
 	/// Check if a PID is still running
@@ -212,14 +212,14 @@ impl AnvilManager {
 	pub async fn wait_for_chain(&self, chain: ChainId) -> Result<()> {
 		let port = self.get_port(chain)?;
 
-		let url = format!("http://localhost:{}", port);
+		let url = format!("http://localhost:{port}");
 		let max_attempts = 30;
 		let mut attempts = 0;
 
 		while attempts < max_attempts {
 			// Try to connect
 			if self.check_chain_ready(&url).await {
-				logging::verbose_success("Chain ready", &format!("chain {}", chain));
+				logging::verbose_success("Chain ready", &format!("chain {chain}"));
 				return Ok(());
 			}
 
@@ -252,7 +252,7 @@ impl AnvilManager {
 	pub fn stop_all(&mut self) -> Result<()> {
 		let processes = self.load_running_processes();
 		for (chain, process) in processes {
-			logging::verbose_operation("Stopping Anvil chain", &format!("chain {}", chain));
+			logging::verbose_operation("Stopping Anvil chain", &format!("chain {chain}"));
 			self.kill_process(process.pid);
 		}
 		// Clear the stored processes
@@ -264,7 +264,7 @@ impl AnvilManager {
 	pub fn stop_chain(&mut self, chain: ChainId) -> Result<()> {
 		let mut processes = self.load_running_processes();
 		if let Some(process) = processes.remove(&chain) {
-			logging::verbose_operation("Stopping Anvil chain", &format!("chain {}", chain));
+			logging::verbose_operation("Stopping Anvil chain", &format!("chain {chain}"));
 			self.kill_process(process.pid);
 			self.save_running_processes(&processes)?;
 		}

@@ -54,7 +54,7 @@ impl Provider {
 	pub async fn new(chain: ChainId, rpc_url: &str) -> Result<Self> {
 		let url = rpc_url
 			.parse()
-			.map_err(|e| Error::RpcError(format!("Invalid RPC URL: {}", e)))?;
+			.map_err(|e| Error::RpcError(format!("Invalid RPC URL: {e}")))?;
 
 		let provider = ProviderBuilder::new().connect_http(url);
 
@@ -62,11 +62,11 @@ impl Provider {
 		provider
 			.get_chain_id()
 			.await
-			.map_err(|e| Error::RpcError(format!("Failed to connect to {}: {}", rpc_url, e)))?;
+			.map_err(|e| Error::RpcError(format!("Failed to connect to {rpc_url}: {e}")))?;
 
 		let rpc_url: reqwest::Url = rpc_url
 			.parse()
-			.map_err(|e| Error::RpcError(format!("Invalid RPC URL: {}", e)))?;
+			.map_err(|e| Error::RpcError(format!("Invalid RPC URL: {e}")))?;
 
 		Ok(Self {
 			inner: Arc::new(provider),
@@ -89,7 +89,7 @@ impl Provider {
 		self.inner
 			.get_balance(address)
 			.await
-			.map_err(|e| Error::RpcError(format!("Failed to get balance: {}", e)))
+			.map_err(|e| Error::RpcError(format!("Failed to get balance: {e}")))
 	}
 
 	/// Retrieve current block number from blockchain
@@ -103,7 +103,7 @@ impl Provider {
 		self.inner
 			.get_block_number()
 			.await
-			.map_err(|e| Error::RpcError(format!("Failed to get block number: {}", e)))
+			.map_err(|e| Error::RpcError(format!("Failed to get block number: {e}")))
 	}
 
 	/// Retrieve configured chain identifier
@@ -154,19 +154,17 @@ impl Provider {
 
 		// Serialize parameters to RawValue
 		let params = serde_json::to_string(&(address, bytecode)).map_err(|e| {
-			crate::types::error::Error::from(format!("Failed to serialize params: {}", e))
+			crate::types::error::Error::from(format!("Failed to serialize params: {e}"))
 		})?;
 		let raw_params = serde_json::value::RawValue::from_string(params).map_err(|e| {
-			crate::types::error::Error::from(format!("Failed to create RawValue: {}", e))
+			crate::types::error::Error::from(format!("Failed to create RawValue: {e}"))
 		})?;
 
 		let _response = self
 			.inner
 			.raw_request_dyn(Cow::Borrowed("anvil_setCode"), &raw_params)
 			.await
-			.map_err(|e| {
-				crate::types::error::Error::from(format!("anvil_setCode failed: {}", e))
-			})?;
+			.map_err(|e| crate::types::error::Error::from(format!("anvil_setCode failed: {e}")))?;
 		Ok(())
 	}
 
@@ -196,7 +194,7 @@ impl Provider {
 			.inner
 			.call(tx)
 			.await
-			.map_err(|e| Error::RpcError(format!("Contract call failed: {}", e)))?;
+			.map_err(|e| Error::RpcError(format!("Contract call failed: {e}")))?;
 
 		Ok(result.to_vec())
 	}
@@ -281,7 +279,7 @@ impl TxBuilder {
 				.inner
 				.estimate_gas(tx.clone())
 				.await
-				.map_err(|e| Error::RpcError(format!("Failed to estimate gas: {}", e)))?;
+				.map_err(|e| Error::RpcError(format!("Failed to estimate gas: {e}")))?;
 			tx.gas = Some(gas);
 		}
 
@@ -292,7 +290,7 @@ impl TxBuilder {
 				.inner
 				.get_gas_price()
 				.await
-				.map_err(|e| Error::RpcError(format!("Failed to get gas price: {}", e)))?;
+				.map_err(|e| Error::RpcError(format!("Failed to get gas price: {e}")))?;
 			tx.gas_price = Some(gas_price);
 		}
 
@@ -301,7 +299,7 @@ impl TxBuilder {
 			.inner
 			.send_transaction(tx)
 			.await
-			.map_err(|e| Error::RpcError(format!("Failed to send transaction: {}", e)))?;
+			.map_err(|e| Error::RpcError(format!("Failed to send transaction: {e}")))?;
 
 		Ok(*pending.tx_hash())
 	}
@@ -327,7 +325,7 @@ impl TxBuilder {
 				.inner
 				.get_transaction_receipt(hash)
 				.await
-				.map_err(|e| Error::RpcError(format!("Failed to get receipt: {}", e)))?
+				.map_err(|e| Error::RpcError(format!("Failed to get receipt: {e}")))?
 			{
 				return Ok(receipt);
 			}

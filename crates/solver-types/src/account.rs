@@ -35,7 +35,7 @@ impl<'de> Deserialize<'de> for Address {
 		let s = String::deserialize(deserializer)?;
 		let hex_str = s.trim_start_matches("0x");
 		let bytes = hex::decode(hex_str)
-			.map_err(|e| serde::de::Error::custom(format!("Invalid hex address: {}", e)))?;
+			.map_err(|e| serde::de::Error::custom(format!("Invalid hex address: {e}")))?;
 
 		// Validate address length (should be 20 bytes for Ethereum addresses)
 		if bytes.len() != 20 {
@@ -185,7 +185,7 @@ mod tests {
 	#[test]
 	fn test_address_display() {
 		let address = test_address("0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b");
-		let display_str = format!("{}", address);
+		let display_str = format!("{address}");
 		assert_eq!(display_str, "0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b");
 	}
 
@@ -327,7 +327,7 @@ mod tests {
 	fn test_signature_debug() {
 		let sig_bytes = vec![0xde, 0xad, 0xbe, 0xef];
 		let signature = Signature(sig_bytes);
-		let debug_str = format!("{:?}", signature);
+		let debug_str = format!("{signature:?}");
 		assert!(debug_str.contains("Signature"));
 	}
 
@@ -487,7 +487,7 @@ mod tests {
 			.gas_price_gwei(20)
 			.build();
 
-		let debug_str = format!("{:?}", tx);
+		let debug_str = format!("{tx:?}");
 		assert!(debug_str.contains("Transaction"));
 		assert!(debug_str.contains("chain_id: 1"));
 	}

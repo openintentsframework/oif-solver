@@ -44,6 +44,19 @@ pub struct GasUnits {
 	pub claim_units: u64,
 }
 
+/// Result of callback simulation
+#[derive(Debug, Clone)]
+pub struct CallbackSimulationResult {
+	/// Whether callback simulation passed (no revert detected)
+	pub success: bool,
+	/// Estimated gas units for the fill transaction (includes callback execution)
+	pub estimated_gas_units: u64,
+	/// Chain ID where the callback will be executed
+	pub chain_id: u64,
+	/// Whether the order has callback data
+	pub has_callback: bool,
+}
+
 /// Unified service for cost estimation and profitability calculation.
 pub struct CostProfitService {
 	/// Pricing service for USD conversions and asset pricing
@@ -164,14 +177,15 @@ impl CostProfitService {
 
 					for (input, input_amount) in known_inputs {
 						let input_chain_id = input.asset.ethereum_chain_id().map_err(|e| {
-							CostProfitError::Calculation(format!("Invalid input chain: {}", e))
+							CostProfitError::Calculation(format!("Invalid input chain: {e}"))
 						})?;
 						let input_addr = input.asset.ethereum_address().map_err(|e| {
-							CostProfitError::Calculation(format!("Invalid input address: {}", e))
+							CostProfitError::Calculation(format!("Invalid input address: {e}"))
 						})?;
 						let input_token = self
 							.token_manager
-							.get_token_info(input_chain_id, &Address(input_addr.0.to_vec()))?;
+							.get_token_info(input_chain_id, &Address(input_addr.0.to_vec()))
+							.await?;
 
 						// Convert raw amount to USD
 						let usd_value = Self::convert_raw_token_to_usd(
@@ -237,14 +251,15 @@ impl CostProfitService {
 
 					for (output, output_amount) in known_outputs {
 						let output_chain_id = output.asset.ethereum_chain_id().map_err(|e| {
-							CostProfitError::Calculation(format!("Invalid output chain: {}", e))
+							CostProfitError::Calculation(format!("Invalid output chain: {e}"))
 						})?;
 						let output_addr = output.asset.ethereum_address().map_err(|e| {
-							CostProfitError::Calculation(format!("Invalid output address: {}", e))
+							CostProfitError::Calculation(format!("Invalid output address: {e}"))
 						})?;
 						let output_token = self
 							.token_manager
-							.get_token_info(output_chain_id, &Address(output_addr.0.to_vec()))?;
+							.get_token_info(output_chain_id, &Address(output_addr.0.to_vec()))
+							.await?;
 
 						// Convert raw amount to USD
 						let usd_value = Self::convert_raw_token_to_usd(
@@ -328,6 +343,7 @@ impl CostProfitService {
 				let decimals = self
 					.token_manager
 					.get_token_info(chain_id, &Address(eth_addr.0.to_vec()))
+					.await
 					.ok()
 					.map(|info| info.decimals)
 					.unwrap_or(18);
@@ -345,6 +361,7 @@ impl CostProfitService {
 					let decimals = self
 						.token_manager
 						.get_token_info(chain_id, &Address(eth_addr.0.to_vec()))
+						.await
 						.ok()
 						.map(|info| info.decimals)
 						.unwrap_or(18);
@@ -562,7 +579,8 @@ impl CostProfitService {
 		dest_chain_id: u64,
 		gas_units: &GasUnits,
 	) -> Result<CostBreakdown, CostProfitError> {
-		let pricing = self.pricing_service.config();
+		// Read gas_buffer_bps from solver config (hot-reloadable)
+		let gas_buffer_bps_value = config.solver.gas_buffer_bps;
 
 		// Get gas prices
 		let origin_gp = self.get_chain_gas_price(origin_chain_id).await?;
@@ -601,9 +619,9 @@ impl CostProfitService {
 		)
 		.unwrap_or(Decimal::ZERO);
 
-		// Calculate gas buffer
+		// Calculate gas buffer using config value (hot-reloadable)
 		let gas_subtotal = gas_open + gas_fill + gas_claim;
-		let gas_buffer_bps = Decimal::new(pricing.gas_buffer_bps as i64, 0);
+		let gas_buffer_bps = Decimal::new(gas_buffer_bps_value as i64, 0);
 		let gas_buffer = (gas_subtotal * gas_buffer_bps) / Decimal::from(10000);
 
 		// Rate buffer (currently 0, placeholder for future)
@@ -656,10 +674,30 @@ impl CostProfitService {
 		order: &Order,
 		config: &Config,
 	) -> Result<CostBreakdown, CostProfitError> {
+		self.estimate_cost_for_order_with_gas(order, config, None)
+			.await
+	}
+
+	/// Estimates the cost for an order with an optional simulated fill gas override.
+	///
+	/// When `simulated_fill_gas` is provided (from `eth_estimateGas`), it will be used
+	/// instead of the config defaults. This provides accurate gas estimation for orders
+	/// with callbacks or complex fill logic.
+	///
+	/// # Arguments
+	/// * `order` - The order to estimate costs for
+	/// * `config` - Solver configuration
+	/// * `simulated_fill_gas` - Optional gas units from simulation (overrides config default)
+	pub async fn estimate_cost_for_order_with_gas(
+		&self,
+		order: &Order,
+		config: &Config,
+		simulated_fill_gas: Option<u64>,
+	) -> Result<CostBreakdown, CostProfitError> {
 		// Parse the order data based on its standard
 		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::InvalidRequest,
-			message: format!("Failed to parse order data: {}", e),
+			message: format!("Failed to parse order data: {e}"),
 			details: None,
 		})?;
 
@@ -680,10 +718,22 @@ impl CostProfitService {
 		// Extract flow key (lock_type) for gas config lookup
 		let flow_key = order_parsed.parse_lock_type();
 
-		// Estimate gas units
-		let gas_units = self
+		// Estimate gas units (may be overridden by simulated value)
+		let mut gas_units = self
 			.estimate_gas_units(order, &flow_key, config, origin_chain_id, dest_chain_id)
 			.await?;
+
+		// Override fill gas with simulated value if provided and non-zero
+		if let Some(simulated_gas) = simulated_fill_gas {
+			if simulated_gas > 0 {
+				tracing::info!(
+					"Using simulated fill gas: {} units (config default was: {} units)",
+					simulated_gas,
+					gas_units.fill_units
+				);
+				gas_units.fill_units = simulated_gas;
+			}
+		}
 
 		// Get inputs and outputs
 		let available_inputs = order_parsed.parse_available_inputs();
@@ -745,7 +795,7 @@ impl CostProfitService {
 		// Parse the order to get actual input/output amounts
 		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::InvalidRequest,
-			message: format!("Failed to parse order data: {}", e),
+			message: format!("Failed to parse order data: {e}"),
 			details: None,
 		})?;
 
@@ -758,7 +808,7 @@ impl CostProfitService {
 			.await
 			.map_err(|e| APIError::InternalServerError {
 				error_type: ApiErrorType::InternalError,
-				message: format!("Failed to calculate input USD value: {}", e),
+				message: format!("Failed to calculate input USD value: {e}"),
 			})?;
 
 		let total_output_value_usd = self
@@ -766,7 +816,7 @@ impl CostProfitService {
 			.await
 			.map_err(|e| APIError::InternalServerError {
 				error_type: ApiErrorType::InternalError,
-				message: format!("Failed to calculate output USD value: {}", e),
+				message: format!("Failed to calculate output USD value: {e}"),
 			})?;
 
 		// Operational cost is already available in the breakdown
@@ -922,8 +972,7 @@ impl CostProfitService {
 		// Check if actual profit meets minimum requirement
 		if !profit_validation_passed {
 			let error_msg = format!(
-				"Insufficient profit margin: {:.2}% < required {:.2}%",
-				actual_profit_margin, min_profitability_pct
+				"Insufficient profit margin: {actual_profit_margin:.2}% < required {min_profitability_pct:.2}%"
 			);
 			return Err(APIError::UnprocessableEntity {
 				error_type: ApiErrorType::InsufficientProfitability,
@@ -1034,7 +1083,7 @@ impl CostProfitService {
 		// Parse the order to get the destination chain ID
 		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::InvalidRequest,
-			message: format!("Failed to parse order data for fill tx: {}", e),
+			message: format!("Failed to parse order data for fill tx: {e}"),
 			details: None,
 		})?;
 		let dest_chain_ids = order_parsed.destination_chain_ids();
@@ -1069,7 +1118,7 @@ impl CostProfitService {
 		// Parse the order to get the origin chain ID
 		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::InvalidRequest,
-			message: format!("Failed to parse order data for claim tx: {}", e),
+			message: format!("Failed to parse order data for claim tx: {e}"),
 			details: None,
 		})?;
 		let chain_id = order_parsed.origin_chain_id();
@@ -1095,12 +1144,191 @@ impl CostProfitService {
 			.await
 			.map_err(|e| APIError::InternalServerError {
 				error_type: ApiErrorType::ServiceError,
-				message: format!("Failed to get chain data: {}", e),
+				message: format!("Failed to get chain data: {e}"),
 			})?;
 
 		match U256::from_str_radix(&chain_data.gas_price, 10) {
 			Ok(gas_price) => Ok(gas_price),
 			Err(_) => Ok(U256::from(DEFAULT_GAS_PRICE_WEI)),
+		}
+	}
+
+	/// Validates callback safety and simulates fill transaction gas for an order with callbackData.
+	///
+	/// This method performs:
+	/// 1. Whitelist validation for callback recipients
+	/// 2. Gas estimation via eth_estimateGas to detect reverts and get accurate gas costs
+	///
+	/// # Arguments
+	/// * `order` - The order to validate
+	/// * `fill_tx` - The fill transaction to simulate (generated by OrderService)
+	/// * `config` - Solver configuration
+	///
+	/// # Returns
+	/// * `CallbackSimulationResult` containing success status and estimated gas
+	pub async fn simulate_callback_and_estimate_gas(
+		&self,
+		order: &Order,
+		fill_tx: &Transaction,
+		config: &Config,
+	) -> Result<CallbackSimulationResult, CostProfitError> {
+		tracing::info!("🔍 Starting callback simulation for order {}", order.id);
+
+		let chain_id = fill_tx.chain_id;
+
+		// Parse order to check for callbacks
+		let order_data = order.parse_order_data().map_err(|e| {
+			CostProfitError::Calculation(format!("Failed to parse order data: {e}"))
+		})?;
+
+		let outputs = order_data.parse_requested_outputs();
+
+		// Currently only single-output orders are supported
+		if outputs.len() > 1 {
+			return Err(CostProfitError::Calculation(format!(
+				"Multiple outputs ({}) not supported. Only single-output orders can be processed",
+				outputs.len()
+			)));
+		}
+
+		let output = outputs
+			.first()
+			.ok_or_else(|| CostProfitError::Calculation("No outputs found in order".to_string()))?;
+
+		// Check if there's callback data
+		let has_callback = output
+			.calldata
+			.as_ref()
+			.is_some_and(|c| !c.is_empty() && c != "0x");
+
+		if !has_callback {
+			tracing::info!("✓ No callback data - using default gas estimate");
+			// For orders without callbacks, we still estimate gas but don't enforce whitelist
+			return self.estimate_fill_gas(fill_tx, chain_id, false).await;
+		}
+
+		tracing::info!("⚠️  Order has callback data: {:?}", output.calldata);
+
+		// Check if callback simulation is enabled
+		if !config.order.simulate_callbacks {
+			tracing::warn!(
+				"❌ Order has callback but callback simulation is disabled. \
+				Enable 'simulate_callbacks = true' in config to support callbacks."
+			);
+			return Err(CostProfitError::Config(
+				"Order has callback data but callback simulation is disabled. \
+				Callbacks are not supported when simulate_callbacks = false in config."
+					.to_string(),
+			));
+		}
+
+		// Extract recipient info for whitelist check
+		// The receiver is already an InteropAddress (EIP-7930 format)
+		let recipient_interop_hex = output.receiver.to_hex().to_lowercase();
+
+		let output_chain_id = output.receiver.ethereum_chain_id().map_err(|e| {
+			CostProfitError::Config(format!("Failed to extract chain ID from recipient: {e}"))
+		})?;
+
+		let recipient_eth_address = output
+			.receiver
+			.ethereum_address()
+			.map(|addr| format!("0x{}", alloy_primitives::hex::encode(addr)))
+			.unwrap_or_else(|_| "unknown".to_string());
+
+		// Check whitelist using EIP-7930 InteropAddress format
+		// Whitelist entries should be in EIP-7930 hex format (e.g., "0x0001000002210514...")
+		let is_whitelisted = config
+			.order
+			.callback_whitelist
+			.iter()
+			.any(|entry| entry.to_lowercase() == recipient_interop_hex);
+
+		if !is_whitelisted {
+			tracing::warn!(
+				"❌ Callback recipient {} (chain {}) is NOT whitelisted. InteropAddress: {}",
+				recipient_eth_address,
+				output_chain_id,
+				recipient_interop_hex
+			);
+			return Err(CostProfitError::Config(format!(
+				"Callback recipient {recipient_eth_address} on chain {output_chain_id} not in whitelist. Add '{recipient_interop_hex}' to order.callback_whitelist in config (EIP-7930 format)"
+			)));
+		}
+
+		tracing::info!(
+			"✅ Callback recipient {} (chain {}) is whitelisted - simulating gas",
+			recipient_eth_address,
+			output_chain_id
+		);
+
+		// Simulate the fill transaction to get accurate gas estimate
+		self.estimate_fill_gas(fill_tx, chain_id, true).await
+	}
+
+	/// Estimates gas for a fill transaction using eth_estimateGas.
+	///
+	/// This serves two purposes:
+	/// 1. Detects if the transaction would revert (callback execution failure)
+	/// 2. Gets accurate gas estimate including callback execution cost
+	async fn estimate_fill_gas(
+		&self,
+		fill_tx: &Transaction,
+		chain_id: u64,
+		has_callback: bool,
+	) -> Result<CallbackSimulationResult, CostProfitError> {
+		tracing::info!(
+			"📊 Estimating gas for fill transaction on chain {} (has_callback: {})",
+			chain_id,
+			has_callback
+		);
+
+		match self
+			.delivery_service
+			.estimate_gas(chain_id, fill_tx.clone())
+			.await
+		{
+			Ok(estimated_gas) => {
+				tracing::info!(
+					"✅ Gas estimation successful: {} units (has_callback: {})",
+					estimated_gas,
+					has_callback
+				);
+				Ok(CallbackSimulationResult {
+					success: true,
+					estimated_gas_units: estimated_gas,
+					chain_id,
+					has_callback,
+				})
+			},
+			Err(e) => {
+				let error_msg = e.to_string();
+				tracing::warn!("❌ Gas estimation failed (likely revert): {}", error_msg);
+
+				// Check if this is a revert error
+				if error_msg.contains("revert")
+					|| error_msg.contains("execution reverted")
+					|| error_msg.contains("out of gas")
+					|| error_msg.contains("insufficient funds")
+				{
+					Err(CostProfitError::Calculation(format!(
+						"Fill transaction simulation failed (callback would revert): {error_msg}"
+					)))
+				} else {
+					// For other errors (network issues, etc.), we might want to retry or use fallback
+					tracing::warn!(
+						"⚠️  Non-revert error during gas estimation, using fallback: {}",
+						error_msg
+					);
+					// Return success with 0 gas to signal fallback to config default
+					Ok(CallbackSimulationResult {
+						success: true,
+						estimated_gas_units: 0,
+						chain_id,
+						has_callback,
+					})
+				}
+			},
 		}
 	}
 
@@ -1114,8 +1342,7 @@ impl CostProfitService {
 		// Handle potential overflow for large decimals
 		if token_decimals > 28 {
 			return Err(format!(
-				"Token decimals {} exceeds maximum supported precision",
-				token_decimals
+				"Token decimals {token_decimals} exceeds maximum supported precision"
 			)
 			.into());
 		}
@@ -1123,7 +1350,7 @@ impl CostProfitService {
 		// Convert U256 to Decimal
 		let raw_amount_str = raw_amount.to_string();
 		let raw_amount_decimal = Decimal::from_str(&raw_amount_str)
-			.map_err(|e| format!("Failed to parse raw amount {}: {}", raw_amount_str, e))?;
+			.map_err(|e| format!("Failed to parse raw amount {raw_amount_str}: {e}"))?;
 
 		// Normalize amount by token decimals
 		let normalized_amount = match token_decimals {
@@ -1138,10 +1365,10 @@ impl CostProfitService {
 		let usd_amount_str = pricing_service
 			.convert_asset(token_symbol, "USD", &normalized_amount.to_string())
 			.await
-			.map_err(|e| format!("Failed to convert {} to USD: {}", token_symbol, e))?;
+			.map_err(|e| format!("Failed to convert {token_symbol} to USD: {e}"))?;
 
 		Decimal::from_str(&usd_amount_str)
-			.map_err(|e| format!("Failed to parse USD amount {}: {}", usd_amount_str, e).into())
+			.map_err(|e| format!("Failed to parse USD amount {usd_amount_str}: {e}").into())
 	}
 
 	/// Helper to calculate total USD value for a list of inputs
@@ -1153,16 +1380,18 @@ impl CostProfitService {
 
 		for input in inputs {
 			let chain_id = input.asset.ethereum_chain_id().map_err(|e| {
-				CostProfitError::Calculation(format!("Failed to get chain ID: {}", e))
+				CostProfitError::Calculation(format!("Failed to get chain ID: {e}"))
 			})?;
-			let ethereum_addr = input.asset.ethereum_address().map_err(|e| {
-				CostProfitError::Calculation(format!("Failed to get address: {}", e))
-			})?;
+			let ethereum_addr = input
+				.asset
+				.ethereum_address()
+				.map_err(|e| CostProfitError::Calculation(format!("Failed to get address: {e}")))?;
 			let token_address = Address(ethereum_addr.0.to_vec());
 
 			let token_info = self
 				.token_manager
-				.get_token_info(chain_id, &token_address)?;
+				.get_token_info(chain_id, &token_address)
+				.await?;
 
 			let usd_amount = Self::convert_raw_token_to_usd(
 				&input.amount,
@@ -1188,16 +1417,18 @@ impl CostProfitService {
 
 		for output in outputs {
 			let chain_id = output.asset.ethereum_chain_id().map_err(|e| {
-				CostProfitError::Calculation(format!("Failed to get chain ID: {}", e))
+				CostProfitError::Calculation(format!("Failed to get chain ID: {e}"))
 			})?;
-			let ethereum_addr = output.asset.ethereum_address().map_err(|e| {
-				CostProfitError::Calculation(format!("Failed to get address: {}", e))
-			})?;
+			let ethereum_addr = output
+				.asset
+				.ethereum_address()
+				.map_err(|e| CostProfitError::Calculation(format!("Failed to get address: {e}")))?;
 			let token_address = Address(ethereum_addr.0.to_vec());
 
 			let token_info = self
 				.token_manager
-				.get_token_info(chain_id, &token_address)?;
+				.get_token_info(chain_id, &token_address)
+				.await?;
 
 			let usd_amount = Self::convert_raw_token_to_usd(
 				&output.amount,
@@ -1223,15 +1454,16 @@ impl CostProfitService {
 		// Get token info
 		let chain_id = asset
 			.ethereum_chain_id()
-			.map_err(|e| CostProfitError::Calculation(format!("Failed to get chain ID: {}", e)))?;
+			.map_err(|e| CostProfitError::Calculation(format!("Failed to get chain ID: {e}")))?;
 		let ethereum_addr = asset.ethereum_address().map_err(|e| {
-			CostProfitError::Calculation(format!("Failed to get ethereum address: {}", e))
+			CostProfitError::Calculation(format!("Failed to get ethereum address: {e}"))
 		})?;
 		let token_address = Address(ethereum_addr.0.to_vec());
 
 		let token_info = self
 			.token_manager
-			.get_token_info(chain_id, &token_address)?;
+			.get_token_info(chain_id, &token_address)
+			.await?;
 
 		// Convert USD to token amount (normalized)
 		let token_amount_str = self
@@ -1246,7 +1478,7 @@ impl CostProfitService {
 			})?;
 
 		let token_amount_decimal = Decimal::from_str(&token_amount_str).map_err(|e| {
-			CostProfitError::Calculation(format!("Failed to parse token amount: {}", e))
+			CostProfitError::Calculation(format!("Failed to parse token amount: {e}"))
 		})?;
 
 		// Convert to smallest unit (apply decimals), rounding up to ensure we collect enough
@@ -1259,7 +1491,7 @@ impl CostProfitService {
 
 		// Convert to U256
 		let result = U256::from_str(&token_amount_ceiled.to_string()).map_err(|e| {
-			CostProfitError::Calculation(format!("Failed to convert ceiled amount to U256: {}", e))
+			CostProfitError::Calculation(format!("Failed to convert ceiled amount to U256: {e}"))
 		})?;
 
 		Ok(result)
@@ -1525,7 +1757,7 @@ mod tests {
 
 	fn create_mock_pricing_service() -> Arc<PricingService> {
 		let mock = MockPricingInterface::new();
-		Arc::new(PricingService::new(Box::new(mock)))
+		Arc::new(PricingService::new(Box::new(mock), Vec::new()))
 	}
 
 	fn create_mock_delivery_service() -> Arc<DeliveryService> {
@@ -1549,9 +1781,14 @@ mod tests {
 		mock_account
 			.expect_config_schema()
 			.returning(|| Box::new(solver_account::implementations::local::LocalWalletSchema));
-		mock_account
-			.expect_get_private_key()
-			.returning(|| solver_types::SecretString::from("0x1234567890abcdef"));
+		mock_account.expect_signer().returning(|| {
+			use alloy_signer_local::PrivateKeySigner;
+			let signer: PrivateKeySigner =
+				"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+					.parse()
+					.unwrap();
+			solver_account::AccountSigner::Local(signer)
+		});
 
 		Arc::new(AccountService::new(Box::new(mock_account)))
 	}
@@ -1623,7 +1860,7 @@ mod tests {
 			CostProfitError::Storage(_) => {
 				// Expected error type
 			},
-			other => panic!("Expected Storage error, got: {:?}", other),
+			other => panic!("Expected Storage error, got: {other:?}"),
 		}
 	}
 
@@ -1671,7 +1908,7 @@ mod tests {
 			.returning(|_| Box::pin(async move { Ok(12345u64) }));
 
 		// Create services with proper delivery implementations
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 
 		// Create delivery service with mock implementations for both chains
 		let mut delivery_implementations = HashMap::new();
@@ -1930,7 +2167,7 @@ mod tests {
 		));
 
 		// Create services
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 
 		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
@@ -2116,7 +2353,7 @@ mod tests {
 			.with(eq("OUTPUT"), eq("USD"), eq("3900"))
 			.returning(|_, _, _| Box::pin(async move { Ok("3900.0".to_string()) }));
 
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let delivery = create_mock_delivery_service();
 		let token_manager = create_mock_token_manager();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
@@ -2145,7 +2382,7 @@ mod tests {
 			.with(eq("OUTPUT"), eq("USD"), eq("3990"))
 			.returning(|_, _, _| Box::pin(async move { Ok("3990.0".to_string()) }));
 
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let delivery = create_mock_delivery_service();
 		let token_manager = create_mock_token_manager();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
@@ -2185,7 +2422,7 @@ mod tests {
 				assert!(actual_margin >= min_profitability_pct);
 			},
 			Err(e) => {
-				panic!("Expected success but got error: {:?}", e);
+				panic!("Expected success but got error: {e:?}");
 			},
 		}
 	}
@@ -2221,7 +2458,7 @@ mod tests {
 				assert_eq!(error_type, ApiErrorType::InsufficientProfitability);
 				assert!(message.contains("Insufficient profit margin"));
 			},
-			other => panic!("Expected UnprocessableEntity error, got: {:?}", other),
+			other => panic!("Expected UnprocessableEntity error, got: {other:?}"),
 		}
 	}
 
@@ -2431,7 +2668,7 @@ mod tests {
 			.expect_convert_asset()
 			.returning(|_, _, _| Box::pin(async move { Ok("0.0".to_string()) }));
 
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let delivery = create_mock_delivery_service();
 		let token_manager = create_mock_token_manager();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
@@ -2465,7 +2702,7 @@ mod tests {
 				assert_eq!(error_type, ApiErrorType::InvalidRequest);
 				assert!(message.contains("zero transaction value"));
 			},
-			other => panic!("Expected BadRequest error, got: {:?}", other),
+			other => panic!("Expected BadRequest error, got: {other:?}"),
 		}
 	}
 
@@ -2509,7 +2746,7 @@ mod tests {
 				assert_eq!(error_type, ApiErrorType::InvalidRequest);
 				assert!(message.contains("Failed to parse order data"));
 			},
-			other => panic!("Expected BadRequest error, got: {:?}", other),
+			other => panic!("Expected BadRequest error, got: {other:?}"),
 		}
 	}
 
@@ -2528,7 +2765,7 @@ mod tests {
 			})
 		});
 
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let delivery = create_mock_delivery_service();
 		let token_manager = create_mock_token_manager();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
@@ -2562,7 +2799,7 @@ mod tests {
 				assert_eq!(error_type, ApiErrorType::InternalError);
 				assert!(message.contains("Failed to calculate"));
 			},
-			other => panic!("Expected InternalServerError error, got: {:?}", other),
+			other => panic!("Expected InternalServerError error, got: {other:?}"),
 		}
 	}
 
@@ -2657,7 +2894,7 @@ mod tests {
 			.with(eq("OUTPUT"), eq("USD"), eq("3000"))
 			.returning(|_, _, _| Box::pin(async move { Ok("3000.0".to_string()) }));
 
-		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let delivery = create_mock_delivery_service();
 		let token_manager = create_mock_token_manager();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
@@ -2688,5 +2925,439 @@ mod tests {
 		let actual_margin = result.unwrap();
 		// Should be much higher than minimum
 		assert!(actual_margin > Decimal::from_str("20.0").unwrap());
+	}
+
+	// ============================================================================
+	// Callback Gas Simulation Tests
+	// ============================================================================
+
+	fn create_order_with_callback(callback_data: Vec<u8>) -> Order {
+		let eip7683_data = Eip7683OrderData {
+			user: "0x1111111111111111111111111111111111111111".to_string(),
+			nonce: U256::from(1),
+			origin_chain_id: U256::from(1),
+			expires: (current_timestamp() + 3600) as u32,
+			fill_deadline: (current_timestamp() + 300) as u32,
+			input_oracle: "0x0000000000000000000000000000000000000000".to_string(),
+			inputs: vec![[U256::from(1000), U256::from(1000000)]],
+			order_id: [1u8; 32],
+			gas_limit_overrides: GasLimitOverrides::default(),
+			outputs: vec![MandateOutput {
+				oracle: [0u8; 32],
+				settler: [0u8; 32],
+				token: [0u8; 32],
+				amount: U256::from(1000000),
+				recipient: U256::from_str("0x2222222222222222222222222222222222222222")
+					.unwrap()
+					.to_be_bytes(),
+				chain_id: U256::from(137),
+				call: callback_data,
+				context: vec![],
+			}],
+			raw_order_data: None,
+			signature: None,
+			sponsor: None,
+			lock_type: None,
+		};
+
+		Order {
+			id: "test_callback_order".to_string(),
+			standard: "eip7683".to_string(),
+			created_at: current_timestamp(),
+			updated_at: current_timestamp(),
+			status: OrderStatus::Created,
+			data: serde_json::to_value(eip7683_data).unwrap(),
+			solver_address: solver_types::Address([0xAB; 20].to_vec()),
+			quote_id: None,
+			input_chains: vec![ChainSettlerInfo {
+				chain_id: 1,
+				settler_address: solver_types::Address([0x11; 20].to_vec()),
+			}],
+			output_chains: vec![ChainSettlerInfo {
+				chain_id: 137,
+				settler_address: solver_types::Address([0x22; 20].to_vec()),
+			}],
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
+			claim_tx_hash: None,
+			fill_proof: None,
+		}
+	}
+
+	fn create_order_with_multiple_outputs() -> Order {
+		let eip7683_data = Eip7683OrderData {
+			user: "0x1111111111111111111111111111111111111111".to_string(),
+			nonce: U256::from(1),
+			origin_chain_id: U256::from(1),
+			expires: (current_timestamp() + 3600) as u32,
+			fill_deadline: (current_timestamp() + 300) as u32,
+			input_oracle: "0x0000000000000000000000000000000000000000".to_string(),
+			inputs: vec![[U256::from(1000), U256::from(1000000)]],
+			order_id: [1u8; 32],
+			gas_limit_overrides: GasLimitOverrides::default(),
+			outputs: vec![
+				MandateOutput {
+					oracle: [0u8; 32],
+					settler: [0u8; 32],
+					token: [0u8; 32],
+					amount: U256::from(500000),
+					recipient: U256::from_str("0x2222222222222222222222222222222222222222")
+						.unwrap()
+						.to_be_bytes(),
+					chain_id: U256::from(137),
+					call: vec![],
+					context: vec![],
+				},
+				MandateOutput {
+					oracle: [0u8; 32],
+					settler: [0u8; 32],
+					token: [0u8; 32],
+					amount: U256::from(500000),
+					recipient: U256::from_str("0x3333333333333333333333333333333333333333")
+						.unwrap()
+						.to_be_bytes(),
+					chain_id: U256::from(42161), // Different chain
+					call: vec![],
+					context: vec![],
+				},
+			],
+			raw_order_data: None,
+			signature: None,
+			sponsor: None,
+			lock_type: None,
+		};
+
+		Order {
+			id: "test_multi_output_order".to_string(),
+			standard: "eip7683".to_string(),
+			created_at: current_timestamp(),
+			updated_at: current_timestamp(),
+			status: OrderStatus::Created,
+			data: serde_json::to_value(eip7683_data).unwrap(),
+			solver_address: solver_types::Address([0xAB; 20].to_vec()),
+			quote_id: None,
+			input_chains: vec![ChainSettlerInfo {
+				chain_id: 1,
+				settler_address: solver_types::Address([0x11; 20].to_vec()),
+			}],
+			output_chains: vec![
+				ChainSettlerInfo {
+					chain_id: 137,
+					settler_address: solver_types::Address([0x22; 20].to_vec()),
+				},
+				ChainSettlerInfo {
+					chain_id: 42161,
+					settler_address: solver_types::Address([0x33; 20].to_vec()),
+				},
+			],
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
+			claim_tx_hash: None,
+			fill_proof: None,
+		}
+	}
+
+	fn create_test_fill_transaction() -> Transaction {
+		Transaction {
+			to: Some(solver_types::Address([0x22; 20].to_vec())),
+			data: vec![0xde, 0xad, 0xbe, 0xef],
+			value: U256::ZERO,
+			chain_id: 137,
+			nonce: None,
+			gas_limit: None,
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+		}
+	}
+
+	fn create_config_with_callback_whitelist(whitelist: Vec<String>) -> Config {
+		let mut config = create_test_config();
+		config.order.callback_whitelist = whitelist;
+		config.order.simulate_callbacks = true;
+		config
+	}
+
+	#[tokio::test]
+	async fn test_simulate_callback_no_callback_data() {
+		// Arrange
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+		mock_delivery
+			.expect_estimate_gas()
+			.returning(|_| Box::pin(async move { Ok(75000u64) }));
+
+		let mut delivery_implementations = HashMap::new();
+		delivery_implementations.insert(
+			137,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 137, 3600));
+
+		let mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let token_manager = create_mock_token_manager();
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let order = create_order_with_callback(vec![]); // Empty callback
+		let fill_tx = create_test_fill_transaction();
+		let config = create_config_with_callback_whitelist(vec![]);
+
+		// Act
+		let result = service
+			.simulate_callback_and_estimate_gas(&order, &fill_tx, &config)
+			.await;
+
+		// Assert
+		assert!(result.is_ok());
+		let simulation_result = result.unwrap();
+		assert!(!simulation_result.has_callback);
+		assert_eq!(simulation_result.estimated_gas_units, 75000);
+		assert_eq!(simulation_result.chain_id, 137);
+	}
+
+	#[tokio::test]
+	async fn test_simulate_callback_with_callback_data_whitelisted() {
+		// Arrange
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+		mock_delivery
+			.expect_estimate_gas()
+			.returning(|_| Box::pin(async move { Ok(95000u64) }));
+
+		let mut delivery_implementations = HashMap::new();
+		delivery_implementations.insert(
+			137,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 137, 3600));
+
+		let mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let token_manager = create_mock_token_manager();
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		// Callback data: some arbitrary bytes
+		let callback_data = vec![0xde, 0xad, 0xbe, 0xef];
+		let order = create_order_with_callback(callback_data);
+		let fill_tx = create_test_fill_transaction();
+
+		// Whitelist the recipient (chain 137, recipient from order)
+		// The recipient in the order is 0x2222...2222
+		// EIP-7930 format: Version(2) | ChainType(2) | ChainRefLen(1) | ChainRef | AddrLen(1) | Address
+		// For chain 137 (0x89): 0x0001 | 0x0000 | 0x01 | 0x89 | 0x14 | <20-byte address>
+		let whitelist =
+			vec!["0x000100000189142222222222222222222222222222222222222222".to_lowercase()];
+		let config = create_config_with_callback_whitelist(whitelist);
+
+		// Act
+		let result = service
+			.simulate_callback_and_estimate_gas(&order, &fill_tx, &config)
+			.await;
+
+		// Assert
+		assert!(result.is_ok());
+		let simulation_result = result.unwrap();
+		assert!(simulation_result.has_callback);
+		assert_eq!(simulation_result.estimated_gas_units, 95000);
+	}
+
+	#[tokio::test]
+	async fn test_simulate_callback_not_whitelisted() {
+		// Arrange
+		let mock_delivery = MockDeliveryInterface::new();
+		let mut delivery_implementations = HashMap::new();
+		delivery_implementations.insert(
+			137,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 137, 3600));
+
+		let mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let token_manager = create_mock_token_manager();
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let callback_data = vec![0xde, 0xad, 0xbe, 0xef];
+		let order = create_order_with_callback(callback_data);
+		let fill_tx = create_test_fill_transaction();
+
+		// Empty whitelist - recipient not whitelisted
+		let config = create_config_with_callback_whitelist(vec![]);
+
+		// Act
+		let result = service
+			.simulate_callback_and_estimate_gas(&order, &fill_tx, &config)
+			.await;
+
+		// Assert - should fail because recipient is not whitelisted
+		assert!(result.is_err());
+		let error = result.unwrap_err();
+		match error {
+			CostProfitError::Config(msg) => {
+				assert!(msg.contains("not in whitelist"));
+			},
+			other => panic!("Expected Config error, got: {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_simulate_callback_multiple_outputs_rejected() {
+		// Arrange
+		let mock_delivery = MockDeliveryInterface::new();
+		let mut delivery_implementations = HashMap::new();
+		delivery_implementations.insert(
+			137,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 137, 3600));
+
+		let mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let token_manager = create_mock_token_manager();
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let order = create_order_with_multiple_outputs();
+		let fill_tx = create_test_fill_transaction();
+		let config = create_config_with_callback_whitelist(vec![]);
+
+		// Act
+		let result = service
+			.simulate_callback_and_estimate_gas(&order, &fill_tx, &config)
+			.await;
+
+		// Assert - should fail because multiple outputs are not supported
+		assert!(result.is_err());
+		let error = result.unwrap_err();
+		match error {
+			CostProfitError::Calculation(msg) => {
+				assert!(msg.contains("Multiple outputs"));
+				assert!(msg.contains("not supported"));
+			},
+			other => panic!("Expected Calculation error, got: {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_simulate_callback_gas_estimation_failure_revert() {
+		// Arrange
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+		mock_delivery.expect_estimate_gas().returning(|_| {
+			Box::pin(async move {
+				Err(solver_delivery::DeliveryError::Network(
+					"execution reverted".to_string(),
+				))
+			})
+		});
+
+		let mut delivery_implementations = HashMap::new();
+		delivery_implementations.insert(
+			137,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 137, 3600));
+
+		let mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let token_manager = create_mock_token_manager();
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let callback_data = vec![0xde, 0xad, 0xbe, 0xef];
+		let order = create_order_with_callback(callback_data);
+		let fill_tx = create_test_fill_transaction();
+
+		// Whitelist the recipient
+		// EIP-7930 format for chain 137 (0x89): 0x0001 | 0x0000 | 0x01 | 0x89 | 0x14 | <address>
+		let whitelist =
+			vec!["0x000100000189142222222222222222222222222222222222222222".to_lowercase()];
+		let config = create_config_with_callback_whitelist(whitelist);
+
+		// Act
+		let result = service
+			.simulate_callback_and_estimate_gas(&order, &fill_tx, &config)
+			.await;
+
+		// Assert - should fail because callback would revert
+		assert!(result.is_err());
+		let error = result.unwrap_err();
+		match error {
+			CostProfitError::Calculation(msg) => {
+				assert!(msg.contains("callback would revert"));
+			},
+			other => panic!("Expected Calculation error, got: {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_simulate_callback_disabled_with_callback_data_rejected() {
+		// Arrange
+		let mock_delivery = MockDeliveryInterface::new();
+		let mut delivery_implementations = HashMap::new();
+		delivery_implementations.insert(
+			137,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 137, 3600));
+
+		let mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let token_manager = create_mock_token_manager();
+
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		// Order with callback data
+		let callback_data = vec![0xde, 0xad, 0xbe, 0xef];
+		let order = create_order_with_callback(callback_data);
+		let fill_tx = create_test_fill_transaction();
+
+		// Config with simulate_callbacks = false
+		let mut config = create_test_config();
+		config.order.simulate_callbacks = false;
+
+		// Act
+		let result = service
+			.simulate_callback_and_estimate_gas(&order, &fill_tx, &config)
+			.await;
+
+		// Assert - should fail because callbacks are not supported when simulation is disabled
+		assert!(result.is_err());
+		let error = result.unwrap_err();
+		match error {
+			CostProfitError::Config(msg) => {
+				assert!(msg.contains("callback simulation is disabled"));
+				assert!(msg.contains("not supported"));
+			},
+			other => panic!("Expected Config error, got: {other:?}"),
+		}
 	}
 }

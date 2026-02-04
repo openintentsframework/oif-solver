@@ -10,10 +10,12 @@ use axum::{
 	Json,
 };
 use serde::Serialize;
+use solver_config::Config;
 use solver_core::SolverEngine;
 use solver_types::with_0x_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Response structure for all supported tokens across all networks.
 #[derive(Debug, Serialize)]
@@ -46,17 +48,17 @@ pub struct TokenInfo {
 	pub decimals: u8,
 }
 
-/// Handles GET /api/tokens requests.
+/// Handles GET /api/v1/tokens requests.
 ///
 /// Returns all supported tokens across all configured networks.
 pub async fn get_tokens(State(solver): State<Arc<SolverEngine>>) -> Json<TokensResponse> {
-	let networks = solver.token_manager().get_networks();
+	let networks = solver.token_manager().get_networks().await;
 
 	let mut response = TokensResponse {
 		networks: HashMap::new(),
 	};
 
-	for (chain_id, network) in networks {
+	for (chain_id, network) in &networks {
 		response.networks.insert(
 			chain_id.to_string(),
 			NetworkTokens {
@@ -79,16 +81,81 @@ pub async fn get_tokens(State(solver): State<Arc<SolverEngine>>) -> Json<TokensR
 	Json(response)
 }
 
-/// Handles GET /api/tokens/{chain_id} requests.
+/// Handles GET /api/v1/tokens/{chain_id} requests.
 ///
 /// Returns supported tokens for a specific chain.
 pub async fn get_tokens_for_chain(
 	Path(chain_id): Path<u64>,
 	State(solver): State<Arc<SolverEngine>>,
 ) -> Result<Json<NetworkTokens>, StatusCode> {
-	let networks = solver.token_manager().get_networks();
+	let networks = solver.token_manager().get_networks().await;
 
 	match networks.get(&chain_id) {
+		Some(network) => Ok(Json(NetworkTokens {
+			chain_id,
+			input_settler: with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
+			output_settler: with_0x_prefix(&hex::encode(&network.output_settler_address.0)),
+			tokens: network
+				.tokens
+				.iter()
+				.map(|t| TokenInfo {
+					address: with_0x_prefix(&hex::encode(&t.address.0)),
+					symbol: t.symbol.clone(),
+					decimals: t.decimals,
+				})
+				.collect(),
+		})),
+		None => Err(StatusCode::NOT_FOUND),
+	}
+}
+
+/// Handles GET /api/v1/tokens requests using dynamic_config.
+///
+/// Returns all supported tokens across all configured networks.
+/// This version reads from dynamic_config to support hot reload.
+pub async fn get_tokens_from_config(
+	State(dynamic_config): State<Arc<RwLock<Config>>>,
+) -> Json<TokensResponse> {
+	let config = dynamic_config.read().await;
+
+	let mut response = TokensResponse {
+		networks: HashMap::new(),
+	};
+
+	for (chain_id, network) in &config.networks {
+		response.networks.insert(
+			chain_id.to_string(),
+			NetworkTokens {
+				chain_id: *chain_id,
+				input_settler: with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
+				output_settler: with_0x_prefix(&hex::encode(&network.output_settler_address.0)),
+				tokens: network
+					.tokens
+					.iter()
+					.map(|t| TokenInfo {
+						address: with_0x_prefix(&hex::encode(&t.address.0)),
+						symbol: t.symbol.clone(),
+						decimals: t.decimals,
+					})
+					.collect(),
+			},
+		);
+	}
+
+	Json(response)
+}
+
+/// Handles GET /api/v1/tokens/{chain_id} requests using dynamic_config.
+///
+/// Returns supported tokens for a specific chain.
+/// This version reads from dynamic_config to support hot reload.
+pub async fn get_tokens_for_chain_from_config(
+	Path(chain_id): Path<u64>,
+	State(dynamic_config): State<Arc<RwLock<Config>>>,
+) -> Result<Json<NetworkTokens>, StatusCode> {
+	let config = dynamic_config.read().await;
+
+	match config.networks.get(&chain_id) {
 		Some(network) => Ok(Json(NetworkTokens {
 			chain_id,
 			input_settler: with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
@@ -187,7 +254,7 @@ mod tests {
 	}
 
 	/// Creates a mock SolverEngine with test data for unit tests.
-	fn create_mock_solver_engine() -> Arc<SolverEngine> {
+	async fn create_mock_solver_engine() -> Arc<SolverEngine> {
 		let token_manager = create_mock_token_manager();
 
 		// Create minimal config for testing
@@ -196,33 +263,33 @@ mod tests {
 			id = "test-solver"
 			monitoring_timeout_seconds = 30
 			min_profitability_pct = 1.0
-			
+
 			[storage]
 			primary = "memory"
 			cleanup_interval_seconds = 3600
 			[storage.implementations.memory]
-			
+
 			[delivery]
 			min_confirmations = 1
 			[delivery.implementations]
-			
+
 			[account]
 			primary = "local"
 			[account.implementations.local]
 			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
-			
+
 			[discovery]
 			[discovery.implementations]
-			
+
 			[order]
 			[order.implementations]
 			[order.strategy]
 			primary = "simple"
 			[order.strategy.implementations.simple]
-			
+
 			[settlement]
 			[settlement.implementations]
-			
+
 			[networks.1]
 			chain_id = 1
 			input_settler_address = "0x1111111111111111111111111111111111111111"
@@ -249,6 +316,7 @@ mod tests {
 		.expect("Failed to parse account config");
 		let account = Arc::new(solver_account::AccountService::new(
 			solver_account::implementations::local::create_account(&account_config)
+				.await
 				.expect("Failed to create account"),
 		));
 
@@ -279,11 +347,16 @@ mod tests {
 		let pricing_impl =
 			solver_pricing::implementations::mock::create_mock_pricing(&pricing_config)
 				.expect("Failed to create mock pricing");
-		let pricing = Arc::new(solver_pricing::PricingService::new(pricing_impl));
+		let pricing = Arc::new(solver_pricing::PricingService::new(
+			pricing_impl,
+			Vec::new(),
+		));
 
 		let event_bus = solver_core::engine::event_bus::EventBus::new(100);
 
+		let dynamic_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
 		Arc::new(solver_core::SolverEngine::new(
+			dynamic_config,
 			config,
 			storage,
 			account,
@@ -300,7 +373,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_get_tokens_returns_all_networks() {
-		let solver = create_mock_solver_engine();
+		let solver = create_mock_solver_engine().await;
 		let response = get_tokens(State(solver)).await;
 
 		let tokens_response = response.0;
@@ -382,7 +455,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_get_tokens_for_chain_valid_chain_id() {
-		let solver = create_mock_solver_engine();
+		let solver = create_mock_solver_engine().await;
 		let response = get_tokens_for_chain(Path(1), State(solver)).await;
 
 		assert!(response.is_ok());
@@ -414,7 +487,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_get_tokens_for_chain_invalid_chain_id() {
-		let solver = create_mock_solver_engine();
+		let solver = create_mock_solver_engine().await;
 		let response = get_tokens_for_chain(Path(999), State(solver)).await;
 
 		assert!(response.is_err());
@@ -423,7 +496,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_get_tokens_for_chain_polygon() {
-		let solver = create_mock_solver_engine();
+		let solver = create_mock_solver_engine().await;
 		let response = get_tokens_for_chain(Path(137), State(solver)).await;
 
 		assert!(response.is_ok());
@@ -534,5 +607,165 @@ mod tests {
 		let address_already_prefixed = "0x1234567890123456789012345678901234567890";
 		let result = with_0x_prefix(address_already_prefixed);
 		assert_eq!(result, "0x1234567890123456789012345678901234567890");
+	}
+
+	/// Creates a test Config for testing `*_from_config` functions.
+	fn create_test_config() -> Config {
+		let config_toml = r#"
+			[solver]
+			id = "test-solver"
+			monitoring_timeout_seconds = 30
+			min_profitability_pct = 1.0
+
+			[storage]
+			primary = "memory"
+			cleanup_interval_seconds = 3600
+			[storage.implementations.memory]
+
+			[delivery]
+			min_confirmations = 1
+			[delivery.implementations]
+
+			[account]
+			primary = "local"
+			[account.implementations.local]
+			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
+
+			[discovery]
+			[discovery.implementations]
+
+			[order]
+			[order.implementations]
+			[order.strategy]
+			primary = "simple"
+			[order.strategy.implementations.simple]
+
+			[settlement]
+			[settlement.implementations]
+
+			[networks.1]
+			chain_id = 1
+			input_settler_address = "0x1111111111111111111111111111111111111111"
+			output_settler_address = "0x2222222222222222222222222222222222222222"
+			[[networks.1.rpc_urls]]
+			http = "http://localhost:8545"
+			[[networks.1.tokens]]
+			symbol = "USDC"
+			address = "0x3333333333333333333333333333333333333333"
+			decimals = 6
+			[[networks.1.tokens]]
+			symbol = "WETH"
+			address = "0x4444444444444444444444444444444444444444"
+			decimals = 18
+
+			[networks.137]
+			chain_id = 137
+			input_settler_address = "0x5555555555555555555555555555555555555555"
+			output_settler_address = "0x6666666666666666666666666666666666666666"
+			[[networks.137.rpc_urls]]
+			http = "http://localhost:8546"
+			[[networks.137.tokens]]
+			symbol = "USDC"
+			address = "0x7777777777777777777777777777777777777777"
+			decimals = 6
+		"#;
+		toml::from_str(config_toml).expect("Failed to parse test config")
+	}
+
+	#[tokio::test]
+	async fn test_get_tokens_from_config_returns_all_networks() {
+		let config = create_test_config();
+		let dynamic_config = Arc::new(RwLock::new(config));
+
+		let response = get_tokens_from_config(State(dynamic_config)).await;
+		let tokens_response = response.0;
+
+		// Should have 2 networks
+		assert_eq!(tokens_response.networks.len(), 2);
+
+		// Check Ethereum mainnet (chain ID 1)
+		let eth_network = tokens_response.networks.get("1").unwrap();
+		assert_eq!(eth_network.chain_id, 1);
+		assert_eq!(
+			eth_network.input_settler,
+			"0x1111111111111111111111111111111111111111"
+		);
+		assert_eq!(
+			eth_network.output_settler,
+			"0x2222222222222222222222222222222222222222"
+		);
+		assert_eq!(eth_network.tokens.len(), 2);
+
+		// Check tokens on Ethereum
+		let usdc = eth_network
+			.tokens
+			.iter()
+			.find(|t| t.symbol == "USDC")
+			.unwrap();
+		assert_eq!(usdc.decimals, 6);
+
+		let weth = eth_network
+			.tokens
+			.iter()
+			.find(|t| t.symbol == "WETH")
+			.unwrap();
+		assert_eq!(weth.decimals, 18);
+
+		// Check Polygon (chain ID 137)
+		let polygon_network = tokens_response.networks.get("137").unwrap();
+		assert_eq!(polygon_network.chain_id, 137);
+		assert_eq!(polygon_network.tokens.len(), 1);
+	}
+
+	#[tokio::test]
+	async fn test_get_tokens_for_chain_from_config_valid_chain() {
+		let config = create_test_config();
+		let dynamic_config = Arc::new(RwLock::new(config));
+
+		let response = get_tokens_for_chain_from_config(Path(1), State(dynamic_config)).await;
+
+		assert!(response.is_ok());
+		let network = response.unwrap().0;
+
+		assert_eq!(network.chain_id, 1);
+		assert_eq!(
+			network.input_settler,
+			"0x1111111111111111111111111111111111111111"
+		);
+		assert_eq!(
+			network.output_settler,
+			"0x2222222222222222222222222222222222222222"
+		);
+		assert_eq!(network.tokens.len(), 2);
+	}
+
+	#[tokio::test]
+	async fn test_get_tokens_for_chain_from_config_invalid_chain() {
+		let config = create_test_config();
+		let dynamic_config = Arc::new(RwLock::new(config));
+
+		let response = get_tokens_for_chain_from_config(Path(999), State(dynamic_config)).await;
+
+		assert!(response.is_err());
+		assert_eq!(response.unwrap_err(), StatusCode::NOT_FOUND);
+	}
+
+	#[tokio::test]
+	async fn test_get_tokens_for_chain_from_config_polygon() {
+		let config = create_test_config();
+		let dynamic_config = Arc::new(RwLock::new(config));
+
+		let response = get_tokens_for_chain_from_config(Path(137), State(dynamic_config)).await;
+
+		assert!(response.is_ok());
+		let network = response.unwrap().0;
+
+		assert_eq!(network.chain_id, 137);
+		assert_eq!(
+			network.input_settler,
+			"0x5555555555555555555555555555555555555555"
+		);
+		assert_eq!(network.tokens.len(), 1);
+		assert_eq!(network.tokens[0].symbol, "USDC");
 	}
 }

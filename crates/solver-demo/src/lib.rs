@@ -391,8 +391,7 @@ impl Context {
 				use crate::types::hex::Hex;
 				Hex::to_address(address_or_name).map_err(|_| {
 					Error::InvalidAddress(format!(
-						"Invalid address or unknown account name: {}",
-						address_or_name
+						"Invalid address or unknown account name: {address_or_name}"
 					))
 				})
 			},
@@ -412,24 +411,24 @@ impl Context {
 		// Check if it matches any of our known accounts
 		if let Ok(user_addr) = Hex::to_address(&self.config.accounts().user.address) {
 			if address == user_addr {
-				return format!("{} (user)", address);
+				return format!("{address} (user)");
 			}
 		}
 
 		if let Ok(solver_addr) = Hex::to_address(&self.config.accounts().solver.address) {
 			if address == solver_addr {
-				return format!("{} (solver)", address);
+				return format!("{address} (solver)");
 			}
 		}
 
 		if let Ok(recipient_addr) = Hex::to_address(&self.config.accounts().recipient.address) {
 			if address == recipient_addr {
-				return format!("{} (recipient)", address);
+				return format!("{address} (recipient)");
 			}
 		}
 
 		// Just return the address
-		format!("{}", address)
+		format!("{address}")
 	}
 
 	/// Get all available predefined account names

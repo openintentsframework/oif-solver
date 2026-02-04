@@ -272,8 +272,8 @@ mod tests {
 			Ok(SolverEvent::Settlement(SettlementEvent::PreClaimReady { order_id })) => {
 				assert_eq!(order_id, "test_order_123");
 			},
-			Ok(other) => panic!("Expected PreClaimReady event, got: {:?}", other),
-			Err(e) => panic!("Expected event but got error: {:?}", e),
+			Ok(other) => panic!("Expected PreClaimReady event, got: {other:?}"),
+			Err(e) => panic!("Expected event but got error: {e:?}"),
 		}
 	}
 

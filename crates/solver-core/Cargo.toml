@@ -27,6 +27,7 @@ toml = { workspace = true }
 tracing = "0.1"
 
 [dev-dependencies]
+alloy-signer-local = { workspace = true }
 mockall = { workspace = true }
 async-trait = { workspace = true }
 # Add testing feature only for tests

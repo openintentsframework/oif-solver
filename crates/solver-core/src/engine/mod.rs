@@ -31,7 +31,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::instrument;
 
 /// Errors that can occur during engine operations.
@@ -52,8 +52,10 @@ pub enum EngineError {
 /// Main solver engine that orchestrates the order execution lifecycle.
 #[derive(Clone)]
 pub struct SolverEngine {
-	/// Solver configuration.
-	pub(crate) config: Config,
+	/// Dynamic configuration that supports hot reload via admin API.
+	pub(crate) dynamic_config: Arc<RwLock<Config>>,
+	/// Static configuration snapshot taken at startup (services don't see hot reload changes).
+	pub(crate) static_config: Config,
 	/// Storage service for persisting state.
 	pub(crate) storage: Arc<StorageService>,
 	/// Account service for address and signing operations.
@@ -106,7 +108,8 @@ impl SolverEngine {
 	///
 	/// # Arguments
 	///
-	/// * `config` - Solver configuration settings
+	/// * `dynamic_config` - Dynamic configuration that supports hot reload via admin API
+	/// * `static_config` - Static configuration snapshot taken at startup (services don't see hot reload changes)
 	/// * `storage` - Storage service for persisting state
 	/// * `account` - Account service for address and signing operations
 	/// * `solver_address` - The solver's Ethereum address
@@ -119,7 +122,8 @@ impl SolverEngine {
 	/// * `token_manager` - Manager for token approvals and validation
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
-		config: Config,
+		dynamic_config: Arc<RwLock<Config>>,
+		static_config: Config,
 		storage: Arc<StorageService>,
 		account: Arc<AccountService>,
 		solver_address: Address,
@@ -150,7 +154,7 @@ impl SolverEngine {
 			solver_address,
 			token_manager.clone(),
 			cost_profit_service,
-			config.clone(),
+			dynamic_config.clone(), // Pass dynamic config for hot-reload support
 		));
 
 		let order_handler = Arc::new(OrderHandler::new(
@@ -175,11 +179,12 @@ impl SolverEngine {
 			storage.clone(),
 			state_machine.clone(),
 			event_bus.clone(),
-			config.solver.monitoring_timeout_seconds / 60, // Convert seconds to minutes
+			static_config.solver.monitoring_timeout_seconds / 60, // Convert seconds to minutes
 		));
 
 		Self {
-			config,
+			dynamic_config,
+			static_config,
 			storage,
 			account,
 			delivery,
@@ -289,7 +294,7 @@ impl SolverEngine {
 
 		// Start storage cleanup task
 		let storage = self.storage.clone();
-		let cleanup_interval_seconds = self.config.storage.cleanup_interval_seconds;
+		let cleanup_interval_seconds = self.static_config.storage.cleanup_interval_seconds;
 		let cleanup_interval = tokio::time::interval(Duration::from_secs(cleanup_interval_seconds));
 		tracing::info!(
 			"Starting storage cleanup service, will run every {} seconds",
@@ -324,7 +329,7 @@ impl SolverEngine {
 				Some(intent) = intent_rx.recv() => {
 					self.spawn_handler(&general_semaphore, move |engine| async move {
 						if let Err(e) = engine.intent_handler.handle(intent).await {
-							return Err(EngineError::Service(format!("Failed to handle intent: {}", e)));
+							return Err(EngineError::Service(format!("Failed to handle intent: {e}")));
 						}
 						Ok(())
 					})
@@ -339,7 +344,7 @@ impl SolverEngine {
 							self.spawn_handler(&transaction_semaphore, move |engine| async move {
 								let order_id = order.id.clone();
 								if let Err(e) = engine.order_handler.handle_preparation(intent.source, order, params).await {
-									let error_msg = format!("Failed to handle order preparation: {}", e);
+									let error_msg = format!("Failed to handle order preparation: {e}");
 									// Attempt to mark order as failed
 									if let Err(state_err) = engine.state_machine
 										.transition_order_status(&order_id, solver_types::OrderStatus::Failed(solver_types::TransactionType::Prepare, error_msg.clone()))
@@ -358,7 +363,7 @@ impl SolverEngine {
 							self.spawn_handler(&transaction_semaphore, move |engine| async move {
 								let order_id = order.id.clone();
 								if let Err(e) = engine.order_handler.handle_execution(order, params).await {
-									let error_msg = format!("Failed to handle order execution: {}", e);
+									let error_msg = format!("Failed to handle order execution: {e}");
 									// Attempt to mark order as failed
 									if let Err(state_err) = engine.state_machine
 										.transition_order_status(&order_id, solver_types::OrderStatus::Failed(solver_types::TransactionType::Fill, error_msg.clone()))
@@ -394,7 +399,7 @@ impl SolverEngine {
 							self.spawn_handler(&general_semaphore, move |engine| async move {
 								let order_id_clone = order_id.clone();
 								if let Err(e) = engine.transaction_handler.handle_confirmed(order_id, tx_hash, tx_type, receipt).await {
-									let error_msg = format!("Failed to handle transaction confirmation: {}", e);
+									let error_msg = format!("Failed to handle transaction confirmation: {e}");
 									// Attempt to mark order as failed with the transaction type from the event
 									if let Err(state_err) = engine.state_machine
 										.transition_order_status(&order_id_clone, solver_types::OrderStatus::Failed(tx_type, error_msg.clone()))
@@ -420,7 +425,7 @@ impl SolverEngine {
 							// Failure handling doesn't send transactions - use general semaphore
 							self.spawn_handler(&general_semaphore, move |engine| async move {
 								if let Err(e) = engine.transaction_handler.handle_failed(order_id, tx_hash, tx_type, error).await {
-									return Err(EngineError::Service(format!("Failed to handle transaction failure: {}", e)));
+									return Err(EngineError::Service(format!("Failed to handle transaction failure: {e}")));
 								}
 								Ok(())
 							})
@@ -432,7 +437,7 @@ impl SolverEngine {
 							self.spawn_handler(&transaction_semaphore, move |engine| async move {
 								let order_id_clone = order_id.clone();
 								if let Err(e) = engine.settlement_handler.handle_post_fill_ready(order_id).await {
-									let error_msg = format!("Failed to handle PostFillReady: {}", e);
+									let error_msg = format!("Failed to handle PostFillReady: {e}");
 									// Attempt to mark order as failed
 									if let Err(state_err) = engine.state_machine
 										.transition_order_status(&order_id_clone, solver_types::OrderStatus::Failed(solver_types::TransactionType::PostFill, error_msg.clone()))
@@ -452,7 +457,7 @@ impl SolverEngine {
 							self.spawn_handler(&transaction_semaphore, move |engine| async move {
 								let order_id_clone = order_id.clone();
 								if let Err(e) = engine.settlement_handler.handle_pre_claim_ready(order_id).await {
-									let error_msg = format!("Failed to handle PreClaimReady: {}", e);
+									let error_msg = format!("Failed to handle PreClaimReady: {e}");
 									// Attempt to mark order as failed
 									if let Err(state_err) = engine.state_machine
 										.transition_order_status(&order_id_clone, solver_types::OrderStatus::Failed(solver_types::TransactionType::PreClaim, error_msg.clone()))
@@ -477,7 +482,7 @@ impl SolverEngine {
 								Ok(order) => order,
 								Err(e) => {
 									tracing::error!("Failed to retrieve order {}: {}", order_id, e);
-									EngineError::Service(format!("Failed to retrieve order {}: {}", order_id, e));
+									EngineError::Service(format!("Failed to retrieve order {order_id}: {e}"));
 									continue;
 								}
 							};
@@ -494,7 +499,7 @@ impl SolverEngine {
 								// Claim sends a transaction - use transaction semaphore
 								self.spawn_handler(&transaction_semaphore, move |engine| async move {
 									if let Err(e) = engine.settlement_handler.process_claim_batch(&mut batch).await {
-										let error_msg = format!("Failed to process claim batch: {}", e);
+										let error_msg = format!("Failed to process claim batch: {e}");
 										// Attempt to mark all orders in batch as failed
 										for order_id in batch.iter() {
 											if let Err(state_err) = engine.state_machine
@@ -542,12 +547,20 @@ impl SolverEngine {
 		&self.event_bus
 	}
 
-	/// Returns a reference to the solver configuration.
+	/// Returns a reference to the static config (snapshot taken at startup).
 	///
-	/// Provides access to all configuration settings including network
-	/// parameters, timeouts, and service-specific settings.
+	/// Note: This returns the static snapshot, not the hot-reloadable config.
+	/// For hot-reloaded config values, use `dynamic_config()`.
 	pub fn config(&self) -> &Config {
-		&self.config
+		&self.static_config
+	}
+
+	/// Returns the dynamic config for hot reload support.
+	///
+	/// Use this when you need access to config values that may have been
+	/// updated via the admin API.
+	pub fn dynamic_config(&self) -> &Arc<RwLock<Config>> {
+		&self.dynamic_config
 	}
 
 	/// Returns a reference to the storage service.
@@ -641,7 +654,8 @@ mod tests {
 
 	// Helper function to create mock services for testing
 	#[allow(clippy::type_complexity)]
-	fn create_mock_services() -> (
+	async fn create_mock_services() -> (
+		Arc<RwLock<Config>>,
 		Config,
 		Arc<StorageService>,
 		Arc<AccountService>,
@@ -660,33 +674,33 @@ mod tests {
 			id = "test-solver"
 			monitoring_timeout_seconds = 30
 			min_profitability_pct = 1.0
-			
+
 			[storage]
 			primary = "memory"
 			cleanup_interval_seconds = 3600
 			[storage.implementations.memory]
-			
+
 			[delivery]
 			min_confirmations = 1
 			[delivery.implementations]
-			
+
 			[account]
 			primary = "local"
 			[account.implementations.local]
 			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
-			
+
 			[discovery]
 			[discovery.implementations]
-			
+
 			[order]
 			[order.implementations]
 			[order.strategy]
 			primary = "simple"
 			[order.strategy.implementations.simple]
-			
+
 			[settlement]
 			[settlement.implementations]
-			
+
 			[networks.1]
 			chain_id = 1
 			input_settler_address = "0x1111111111111111111111111111111111111111"
@@ -697,7 +711,7 @@ mod tests {
 			symbol = "TEST"
 			address = "0x3333333333333333333333333333333333333333"
 			decimals = 18
-			
+
 			[networks.2]
 			chain_id = 2
 			input_settler_address = "0x4444444444444444444444444444444444444444"
@@ -723,6 +737,7 @@ mod tests {
 		.expect("Failed to parse account config");
 		let account = Arc::new(AccountService::new(
 			solver_account::implementations::local::create_account(&account_config)
+				.await
 				.expect("Failed to create account"),
 		));
 
@@ -757,7 +772,10 @@ mod tests {
 		let pricing_impl =
 			solver_pricing::implementations::mock::create_mock_pricing(&pricing_config)
 				.expect("Failed to create mock pricing");
-		let pricing = Arc::new(solver_pricing::PricingService::new(pricing_impl));
+		let pricing = Arc::new(solver_pricing::PricingService::new(
+			pricing_impl,
+			Vec::new(),
+		));
 
 		let event_bus = EventBus::new(100);
 
@@ -769,7 +787,10 @@ mod tests {
 			account.clone(),
 		));
 
+		let dynamic_config = Arc::new(RwLock::new(config.clone()));
+
 		(
+			dynamic_config,
 			config,
 			storage,
 			account,
@@ -784,9 +805,10 @@ mod tests {
 		)
 	}
 
-	#[test]
-	fn test_solver_engine_new() {
+	#[tokio::test]
+	async fn test_solver_engine_new() {
 		let (
+			dynamic_config,
 			config,
 			storage,
 			account,
@@ -798,9 +820,10 @@ mod tests {
 			pricing,
 			event_bus,
 			token_manager,
-		) = create_mock_services();
+		) = create_mock_services().await;
 
 		let engine = SolverEngine::new(
+			dynamic_config,
 			config.clone(),
 			storage.clone(),
 			account.clone(),
@@ -831,6 +854,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_initialize_with_recovery_success() {
 		let (
+			dynamic_config,
 			config,
 			storage,
 			account,
@@ -842,9 +866,10 @@ mod tests {
 			pricing,
 			event_bus,
 			token_manager,
-		) = create_mock_services();
+		) = create_mock_services().await;
 
 		let engine = SolverEngine::new(
+			dynamic_config,
 			config,
 			storage,
 			account,
@@ -868,6 +893,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_initialize_with_recovery_handles_errors_gracefully() {
 		let (
+			dynamic_config,
 			config,
 			storage,
 			account,
@@ -879,9 +905,10 @@ mod tests {
 			pricing,
 			event_bus,
 			token_manager,
-		) = create_mock_services();
+		) = create_mock_services().await;
 
 		let engine = SolverEngine::new(
+			dynamic_config,
 			config,
 			storage,
 			account,
@@ -904,6 +931,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_spawn_handler_with_handler_error() {
 		let (
+			dynamic_config,
 			config,
 			storage,
 			account,
@@ -915,9 +943,10 @@ mod tests {
 			pricing,
 			event_bus,
 			token_manager,
-		) = create_mock_services();
+		) = create_mock_services().await;
 
 		let engine = SolverEngine::new(
+			dynamic_config,
 			config,
 			storage,
 			account,

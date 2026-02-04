@@ -17,6 +17,7 @@ A high-performance cross-chain solver implementation for the Open Intents Framew
 - [Quick Start](#quick-start)
 - [Docker](#docker)
 - [Configuration](#configuration)
+  - [AWS KMS Signing](#aws-kms-signing)
 - [API Reference](#api-reference)
 - [Testing and Development with solver-demo](#testing-and-development-with-solver-demo)
 - [Development](#development)
@@ -135,7 +136,7 @@ oif-solver/
 │   ├── solver-settlement/       # Settlement verification
 │   ├── solver-storage/          # State persistence
 │   └── solver-types/            # Shared types
-├── config/                      # Configuration examples
+├── config/                      # Seed overrides and demo settings
 └── scripts/                     # E2E testing and deployment scripts
 ```
 
@@ -163,6 +164,7 @@ oif-solver/
 - Evaluates order profitability against minimum thresholds
 - Generates fill and claim transactions
 - Manages order-specific logic for different protocols
+- Supports callback data for settlement notifications
 
 ### solver-delivery
 
@@ -181,14 +183,20 @@ oif-solver/
 ### solver-storage
 
 - Provides persistent storage for orders and state
-- Implements TTL (time-to-live) for temporary data
-- Supports different storage backends
+- Implements TTL (time-to-live) for automatic data expiration
+- Supports multiple storage backends:
+  - **Memory**: Fast, non-persistent (for testing)
+  - **File**: File-based persistence with custom binary format
+  - **Redis**: Production-ready with native TTL and connection pooling
+- Index-based querying for efficient lookups
 - Ensures data consistency across services
 
 ### solver-account
 
 - Manages private keys and signing operations
-- Supports different key management backends
+- Supports different key management backends:
+  - **Local**: Private key stored in memory (default)
+  - **AWS KMS**: Private key stored in AWS KMS HSM (feature-gated)
 - Provides secure signing for transactions
 - Handles address derivation
 
@@ -212,17 +220,18 @@ oif-solver/
 ## Quick Start
 
 ```bash
-# Build the project
-cargo build
+# 1. Start Redis
+redis-server
 
-# Run tests
-cargo test
+# 2. Set required environment variables
+export REDIS_URL=redis://localhost:6379
+export SOLVER_PRIVATE_KEY=your_64_hex_character_private_key
 
-# Run the solver service with info logs
-cargo run -- --config config/example.toml
+# 3. First run: Seed configuration from preset + deployment config
+cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
 
-# Run with debug logs for solver modules only
-RUST_LOG=solver_core=debug,solver_delivery=debug,info cargo run -- --config config/example.toml
+# 4. Subsequent runs: Configuration loads automatically from Redis
+cargo run --
 ```
 
 ## Docker
@@ -276,57 +285,219 @@ The container expects environment variables for sensitive configuration:
 |-------|---------|
 | `/app/config` | Configuration files (read-only recommended) |
 | `/app/data` | Persistent storage for solver state |
+See [docs/config-storage.md](docs/config-storage.md) for detailed documentation.
 
 ## Configuration
 
-The solver uses TOML configuration files with support for modular configuration through file includes.
+The solver uses Redis as the single source of truth for runtime configuration. Configuration is seeded once and then loaded from Redis on subsequent startups.
 
-### Modular Configuration (Recommended)
-
-Split your configuration into multiple files for better organization:
-
-```toml
-# config/main.toml - Main configuration file
-include = [
-    "networks.toml",  # Network and token configurations
-    "api.toml",       # API server settings
-    "storage.toml",   # Storage backend configuration
-    # ... other modules
-]
-
-[solver]
-id = "oif-solver-local"
-monitoring_timeout_seconds = 300
-```
-
-**Important**: Each top-level section must be unique across all files. Duplicate sections will cause an error.
-
-See `config/demo/` for a complete modular configuration example.
-
-### Single File Configuration
-
-You can also use a single configuration file. See [`config/demo.toml`](config/demo.toml) for a complete configuration example with all supported options.
-
-### Key Configuration Sections
-
-- **networks**: Defines supported chains with their settler contracts and available tokens
-- **storage**: Configures persistence backend with TTL for different data types
-- **account**: Manages signing keys for the solver (supports multiple accounts)
-- **delivery**: Handles transaction submission to multiple chains (supports per-network account mapping)
-- **discovery**: Sources for discovering new intents (on-chain events, off-chain APIs)
-- **order**: Execution strategy and protocol-specific settings
-- **pricing**: Configures pricing oracles for asset valuation and profitability calculations (supports mock and CoinGecko)
-- **settlement**: Configuration for claiming rewards and handling disputes
-- **api**: Optional REST API server for receiving off-chain intents
-
-### Running with Custom Configuration
+### Seeding Configuration
 
 ```bash
-# Using command line flag
-cargo run -- --config path/to/your/config.toml
+# Seed testnet configuration (using file)
+cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
 
-# Using environment variable
-CONFIG_FILE=path/to/your/config.toml cargo run
+# Seed mainnet configuration (using file)
+cargo run -- --seed mainnet --seed-overrides config/seed-overrides-mainnet.json
+
+# Or pass JSON directly (useful for deployment services)
+cargo run -- --seed testnet --seed-overrides '{"solver_id":"my-solver","networks":[{"chain_id":11155420,"tokens":[{"symbol":"USDC","address":"0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6","decimals":6}]},{"chain_id":84532,"tokens":[{"symbol":"USDC","address":"0x73c83DAcc74bB8a704717AC09703b959E74b9705","decimals":6}]}]}'
+
+# Force re-seed (overwrite existing)
+cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json --force-seed
+```
+
+### Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `REDIS_URL` | Yes | Redis connection URL (default: `redis://localhost:6379`) |
+| `SOLVER_PRIVATE_KEY` | Yes* | 64-character hex private key (without 0x prefix) |
+| `SOLVER_ID` | For loading | Solver ID to load from Redis (set after first seed) |
+
+\* Not required when using AWS KMS for signing (see [AWS KMS Signing](#aws-kms-signing) below).
+
+### Seed Overrides Format
+
+Create a JSON file specifying which networks and tokens to support (these override/extend the seed preset defaults):
+
+```json
+{
+  "solver_id": "my-solver-instance",
+  "networks": [
+    {
+      "chain_id": 11155420,
+      "tokens": [
+        {
+          "symbol": "USDC",
+          "address": "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6",
+          "decimals": 6
+        }
+      ]
+    },
+    {
+      "chain_id": 84532,
+      "tokens": [
+        {
+          "symbol": "USDC",
+          "address": "0x73c83DAcc74bB8a704717AC09703b959E74b9705",
+          "decimals": 6
+        }
+      ],
+      "rpc_urls": ["https://my-custom-rpc.com"]
+    }
+  ]
+}
+```
+
+**Note:** The `solver_id` field is optional but recommended. If provided, seeding becomes idempotent (re-running `--seed` with same config skips seeding). After seeding, set `SOLVER_ID` env var for subsequent runs.
+
+### Supported Networks
+
+**Testnet:**
+| Chain | Chain ID |
+|-------|----------|
+| Optimism Sepolia | 11155420 |
+| Base Sepolia | 84532 |
+
+**Mainnet:**
+| Chain | Chain ID |
+|-------|----------|
+| Optimism | 10 |
+| Base | 8453 |
+| Arbitrum | 42161 |
+
+### Running Redis
+
+```bash
+# Using Docker
+docker run -d --name redis -p 6379:6379 redis:latest
+
+# Or install locally
+redis-server
+```
+
+### AWS KMS Signing
+
+For production deployments requiring enhanced security, the solver supports AWS KMS for transaction signing. The private key never leaves the KMS hardware security module.
+
+#### Prerequisites
+
+1. **Create a KMS Key** (must be secp256k1 for Ethereum compatibility):
+
+```bash
+aws kms create-key \
+  --key-spec ECC_SECG_P256K1 \
+  --key-usage SIGN_VERIFY \
+  --description "OIF Solver signing key"
+```
+
+Note the `KeyId` from the output.
+
+2. **IAM Permissions** - Your AWS credentials need:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["kms:Sign", "kms:GetPublicKey"],
+    "Resource": "arn:aws:kms:REGION:ACCOUNT:key/KEY_ID"
+  }]
+}
+```
+
+#### Building with KMS Support
+
+```bash
+# Build with KMS feature enabled
+cargo build --release --features kms
+```
+
+#### Configuration
+
+Configure KMS in your seed overrides JSON:
+
+```json
+{
+  "solver_id": "my-solver",
+  "account": {
+    "primary": "kms",
+    "implementations": {
+      "kms": {
+        "key_id": "arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012",
+        "region": "us-east-1"
+      }
+    }
+  },
+  "networks": [...]
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `key_id` | Yes | KMS key ID or full ARN |
+| `region` | Yes | AWS region (e.g., `us-east-1`) |
+| `endpoint` | No | Custom endpoint URL (for LocalStack testing) |
+
+#### Running with KMS
+
+```bash
+# Set AWS credentials (or use IAM roles on EC2/ECS)
+export AWS_ACCESS_KEY_ID=your_access_key
+export AWS_SECRET_ACCESS_KEY=your_secret_key
+export AWS_REGION=us-east-1
+
+# Seed and run
+cargo run --features kms -- --seed testnet --seed-overrides config/seed-overrides-kms.json
+```
+
+#### Finding Your KMS Wallet Address
+
+The solver logs the wallet address at startup:
+
+```
+INFO solver_core::builder: Solver address initialized component="account" address=0x1234...abcd
+```
+
+You can also query the address directly using the AWS CLI:
+
+```bash
+# Get public key from KMS and derive Ethereum address
+aws kms get-public-key --key-id "your-key-id" --output text --query 'PublicKey' | \
+  base64 -d | openssl ec -pubin -inform DER -outform PEM 2>/dev/null | \
+  openssl ec -pubin -conv_form uncompressed -outform DER 2>/dev/null | \
+  tail -c 64 | keccak-256sum | tail -c 41 | sed 's/^/0x/'
+```
+
+Or use a simpler approach - run the solver once and it will display the address in the logs.
+
+#### LocalStack Testing
+
+For local development, you can test KMS integration with LocalStack:
+
+```bash
+# Start LocalStack
+docker run -d --name localstack -p 4566:4566 localstack/localstack
+
+# Create test key
+aws --endpoint-url=http://localhost:4566 kms create-key \
+  --key-spec ECC_SECG_P256K1 \
+  --key-usage SIGN_VERIFY
+
+# Configure with endpoint
+{
+  "account": {
+    "primary": "kms",
+    "implementations": {
+      "kms": {
+        "key_id": "your-localstack-key-id",
+        "region": "us-east-1",
+        "endpoint": "http://localhost:4566"
+      }
+    }
+  }
+}
 ```
 
 ## API Reference
@@ -337,12 +508,149 @@ The solver provides a REST API for interacting with the system and submitting of
 
 - **Orders API**: [`api-spec/orders-api.yaml`](api-spec/orders-api.yaml) - Submit and track cross-chain intent orders
 - **Tokens API**: [`api-spec/tokens-api.yaml`](api-spec/tokens-api.yaml) - Query supported tokens and networks
+- **Admin API**: [`docs/openapi-admin.json`](docs/openapi-admin.json) - Wallet-based admin operations (EIP-712 signed)
+
+### API Flows
+
+The following diagrams show the detailed RPC interactions for each API endpoint.
+
+#### Quote Request Flow
+
+**RPC calls:** 8 (EIP-3009) · 6 (ResourceLock) · 6 (Permit2)
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Solver
+    participant PricingAPI as Pricing API
+    participant OriginRPC as Origin Chain RPC
+    participant DestRPC as Dest Chain RPC
+    participant TokenRPC as Token Contract RPC
+    participant SettlerEscrow as InputSettlerEscrow
+    participant SettlerCompact as InputSettlerCompact
+
+    Client->>Solver: POST /api/v1/quotes
+    Note over Solver: Validate request, extract chain IDs
+
+    Note over Solver,DestRPC: Chain Data & Cost Context Calculation (parallel)
+    par Origin Chain Data
+        Solver->>OriginRPC: eth_gasPrice
+        Solver->>OriginRPC: eth_blockNumber
+        OriginRPC-->>Solver: gas price + block
+    and Dest Chain Data
+        Solver->>DestRPC: eth_gasPrice
+        Solver->>DestRPC: eth_blockNumber
+        DestRPC-->>Solver: gas price + block
+    and Token Pricing (HTTP)
+        Note over Solver,PricingAPI: Pricing source configured (CoinGecko or DefiLlama)
+        Solver->>PricingAPI: GET /simple/price or /prices/current
+        PricingAPI-->>Solver: price data (USD)
+    end
+    Note over Solver: Calculate cost context (gas costs, swap amounts, profit margins)
+
+    Note over Solver,DestRPC: Solver Balance Check
+    Solver->>DestRPC: eth_call ERC20 balanceOf(solver_address)
+    Note right of DestRPC: selector 0x70a08231
+    DestRPC-->>Solver: uint256 balance
+
+    Note over Solver: Custody Strategy Decision & Quote Generation
+    alt EIP-3009 Capability & Quote Generation
+        Solver->>OriginRPC: eth_call RECEIVE_WITH_AUTHORIZATION_TYPEHASH()
+        Note right of OriginRPC: selector 0x7f2eecc3
+        OriginRPC-->>Solver: bytes32 typehash (if supported)
+        Note over Solver,TokenRPC: EIP-3009 Domain Separator
+        Solver->>TokenRPC: eth_call token DOMAIN_SEPARATOR()
+        Note right of TokenRPC: selector 0x3644e515
+        TokenRPC-->>Solver: bytes32 domainSeparator
+        Note over Solver,SettlerEscrow: Order ID for Quote (Escrow)
+        Solver->>SettlerEscrow: eth_call orderIdentifier(order)
+        SettlerEscrow-->>Solver: bytes32 orderId
+        Note over Solver: Generate EIP-3009 Quote + EIP-712 typed data
+    else ResourceLock Quote Generation
+        Note over Solver,SettlerCompact: Order ID for Quote (Compact)
+        Solver->>SettlerCompact: eth_call orderIdentifier(order)
+        SettlerCompact-->>Solver: bytes32 orderId
+        Note over Solver: Generate ResourceLock Quote + EIP-712 typed data
+    else Permit2 Quote Generation
+        Note over Solver,SettlerEscrow: Order ID for Quote (Escrow)
+        Solver->>SettlerEscrow: eth_call orderIdentifier(order)
+        SettlerEscrow-->>Solver: bytes32 orderId
+        Note over Solver: Generate Permit2 Quote + EIP-712 typed data
+    end
+
+    Solver-->>Client: Quote Response with multiple options
+```
+
+#### Order Submission Flow
+
+**RPC calls:** 2 (EIP-3009) · 3 (ResourceLock) · 2 (Permit2)
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Solver
+    participant OriginRPC as Origin Chain RPC
+    participant TheCompact as TheCompact Contract
+    participant SettlerEscrow as InputSettlerEscrow
+    participant SettlerCompact as InputSettlerCompact
+    participant Discovery as Discovery Service
+
+    Client->>Solver: POST /api/v1/orders {order, signature}
+    Note over Solver: Parse order, detect lock_type
+
+    alt ResourceLock Order
+        Note over Solver,TheCompact: Signature Validation (EIP-712)
+        Solver->>TheCompact: eth_call TheCompact DOMAIN_SEPARATOR()
+        Note right of TheCompact: selector 0x3644e515
+        TheCompact-->>Solver: bytes32 domainSeparator
+        Note over Solver: EIP-712 hash + ecrecover
+        Note over Solver,TheCompact: Capacity Check (TheCompact deposit)
+        Solver->>TheCompact: eth_call TheCompact balanceOf(user, tokenId)
+        Note right of TheCompact: selector 0x00fdd58e
+        TheCompact-->>Solver: uint256 depositBalance
+        Note over Solver,SettlerCompact: Order ID Computation (Compact)
+        Solver->>SettlerCompact: eth_call orderIdentifier(order)
+        SettlerCompact-->>Solver: bytes32 orderId
+    else Permit2 Order
+        Note over Solver: Signature Recovery (EIP-712 ecrecover)
+        Note over Solver: Derive user address from signature
+        Note over Solver: Inject user into order payload
+        Note over Solver,OriginRPC: Capacity Check (Wallet)
+        Solver->>OriginRPC: eth_call ERC20 balanceOf(user)
+        Note right of OriginRPC: selector 0x70a08231
+        OriginRPC-->>Solver: uint256 walletBalance
+        Note over Solver,SettlerEscrow: Order ID Computation (Escrow)
+        Solver->>SettlerEscrow: eth_call orderIdentifier(order)
+        SettlerEscrow-->>Solver: bytes32 orderId
+    else EIP-3009 Order
+        Note over Solver: Signature Recovery (EIP-712 ecrecover)
+        Note over Solver: Derive user address from signature
+        Note over Solver: Inject user into order payload
+        Note over Solver,OriginRPC: Capacity Check (Wallet)
+        Solver->>OriginRPC: eth_call ERC20 balanceOf(user)
+        Note right of OriginRPC: selector 0x70a08231
+        OriginRPC-->>Solver: uint256 walletBalance
+        Note over Solver,SettlerEscrow: Order ID Computation (Escrow)
+        Solver->>SettlerEscrow: eth_call orderIdentifier(order)
+        SettlerEscrow-->>Solver: bytes32 orderId
+    end
+
+    Note over Solver,Discovery: Forward to Discovery Service
+    Solver->>Discovery: POST /intent {order, signature, quote_id?, origin_submission?}
+    alt Discovery Success
+        Discovery-->>Solver: PostOrderResponse {status: "received", order_id}
+        Solver-->>Client: 200 OK + PostOrderResponse
+    else Discovery Error
+        Discovery-->>Solver: PostOrderResponse {status: "error", message}
+        Solver-->>Client: 400/500 + PostOrderResponse
+    end
+```
 
 ### Available Endpoints
 
 #### Quotes
 
-- **POST `/api/quotes`** - Request price quotes for a cross-chain swap
+- **POST `/api/v1/quotes`** - Request price quotes for a cross-chain swap
   - Request body:
     ```json
     {
@@ -361,7 +669,7 @@ The solver provides a REST API for interacting with the system and submitting of
 
 #### Orders
 
-- **POST `/api/orders`** - Submit a new order (direct or from quote)
+- **POST `/api/v1/orders`** - Submit a new order (direct or from quote)
 
   - Quote acceptance:
     ```json
@@ -388,23 +696,102 @@ The solver provides a REST API for interacting with the system and submitting of
     }
     ```
 
-- **GET `/api/orders/{id}`** - Get order status and details
+- **GET `/api/v1/orders/{id}`** - Get order status and details
   - Returns complete order information including status, amounts, settlement data, and fill transaction
 
 #### Tokens
 
-- **GET `/api/tokens`** - Get all supported tokens across all networks
+- **GET `/api/v1/tokens`** - Get all supported tokens across all networks
 
   - Returns a map of chain IDs to network configurations with supported tokens
 
-- **GET `/api/tokens/{chain_id}`** - Get supported tokens for a specific chain
+- **GET `/api/v1/tokens/{chain_id}`** - Get supported tokens for a specific chain
   - Returns network configuration including settler addresses and token list
+
+#### Health
+
+- **GET `/health`** - Health check endpoint
+  - Returns solver health status including Redis connectivity and persistence info
+  - Response:
+    ```json
+    {
+      "status": "healthy",
+      "redis": {
+        "connected": true,
+        "persistence_enabled": true,
+        "rdb_enabled": true,
+        "aof_enabled": false
+      },
+      "solver_id": "my-solver",
+      "version": "0.1.0"
+    }
+    ```
+  - Status codes: `200 OK` (healthy), `503 Service Unavailable` (unhealthy)
+
+#### Admin API (Wallet-Based Authentication)
+
+The admin API enables authorized wallet addresses to perform administrative operations using EIP-712 signed messages. This provides secure, decentralized admin access without shared secrets.
+
+**Setup:** Configure admin addresses in your seed overrides or TOML config:
+
+```json
+{
+  "admin": {
+    "enabled": true,
+    "domain": "solver.example.com",
+    "chain_id": 1,
+    "admin_addresses": ["0xYourAdminWalletAddress"]
+  }
+}
+```
+
+**Endpoints:**
+
+- **GET `/api/v1/admin/nonce`** - Get a nonce for signing admin actions
+  - Response:
+    ```json
+    {
+      "nonce": "1706184000123456",
+      "expiresIn": 300,
+      "domain": "solver.example.com",
+      "chainId": 1
+    }
+    ```
+
+- **GET `/api/v1/admin/types`** - Get EIP-712 type definitions for client-side signing
+  - Returns domain and type definitions for all admin actions (AddToken, RemoveToken, etc.)
+
+- **POST `/api/v1/admin/tokens`** - Add a new token to a network
+  - Request body:
+    ```json
+    {
+      "signature": "0x...",
+      "contents": {
+        "chainId": 10,
+        "symbol": "USDC",
+        "tokenAddress": "0x...",
+        "decimals": 6,
+        "nonce": 1706184000123456,
+        "deadline": 1706184300
+      }
+    }
+    ```
+  - The signature must be an EIP-712 typed data signature from an authorized admin
+  - Changes are hot-reloaded immediately (no restart required)
+
+**Admin Action Flow:**
+
+1. Call `GET /api/v1/admin/nonce` to get a fresh nonce
+2. Call `GET /api/v1/admin/types` to get EIP-712 type definitions
+3. Construct the typed data with the nonce and a deadline
+4. Sign with your admin wallet (EIP-712)
+5. Submit the signed action to the appropriate endpoint
 
 ### Example Usage
 
 ```bash
 # Request a quote for a cross-chain swap
-curl -X POST http://localhost:3000/api/quotes \
+curl -X POST http://localhost:3000/api/v1/quotes \
   -H "Content-Type: application/json" \
   -d '{
     "user": "0x74...,
@@ -430,7 +817,7 @@ curl -X POST http://localhost:3000/api/quotes \
   }'
 
 # Accept a quote (submit order with quoteId)
-curl -X POST http://localhost:3000/api/orders \
+curl -X POST http://localhost:3000/api/v1/orders \
   -H "Content-Type: application/json" \
   -d '{
     "quoteId": "quote_abc123def456",
@@ -438,7 +825,7 @@ curl -X POST http://localhost:3000/api/orders \
   }'
 
 # Submit an order directly (without quote)
-curl -X POST http://localhost:3000/api/orders \
+curl -X POST http://localhost:3000/api/v1/orders \
   -H "Content-Type: application/json" \
   -d '{
     "order": {
@@ -458,13 +845,22 @@ curl -X POST http://localhost:3000/api/orders \
   }'
 
 # Check order status
-curl http://localhost:3000/api/orders/1fa518079ecf01372290adf75c55858771efcbcee080594cc8bc24e3309a3a09
+curl http://localhost:3000/api/v1/orders/1fa518079ecf01372290adf75c55858771efcbcee080594cc8bc24e3309a3a09
 
 # Get supported tokens for chain 31338
-curl http://localhost:3000/api/tokens/31338
+curl http://localhost:3000/api/v1/tokens/31338
 
 # Get all supported tokens
-curl http://localhost:3000/api/tokens
+curl http://localhost:3000/api/v1/tokens
+
+# Health check
+curl http://localhost:3000/health
+
+# Admin: Get nonce for signing
+curl http://localhost:3000/api/v1/admin/nonce
+
+# Admin: Get EIP-712 types for signing
+curl http://localhost:3000/api/v1/admin/types
 ```
 
 The API server is enabled by default on port 3000 when the solver is running. You can disable it or change the port in the configuration file.
@@ -475,16 +871,16 @@ The solver uses the `RUST_LOG` environment variable for fine-grained logging con
 
 ```bash
 # Show debug logs for solver modules only
-RUST_LOG=solver_core=debug,solver_delivery=debug,info cargo run -- --config config/demo.toml
+RUST_LOG=solver_core=debug,solver_delivery=debug,info cargo run
 
 # Reduce noise from external crates
-RUST_LOG=info,hyper=warn,alloy_provider=warn cargo run -- --config config/demo.toml
+RUST_LOG=info,hyper=warn,alloy_provider=warn cargo run
 
 # Debug specific modules
-RUST_LOG=solver_core=debug,solver_delivery=info,alloy=warn,hyper=warn cargo run -- --config config/demo.toml
+RUST_LOG=solver_core=debug,solver_delivery=info,alloy=warn,hyper=warn cargo run
 
 # Show all debug logs (very verbose)
-RUST_LOG=debug cargo run -- --config config/demo.toml
+RUST_LOG=debug cargo run
 ```
 
 Available log levels (from most to least verbose):
@@ -499,7 +895,7 @@ The `--log-level` flag acts as a fallback when `RUST_LOG` is not set:
 
 ```bash
 # Uses info level for all modules when RUST_LOG is not set
-cargo run -- --config config/demo.toml --log-level info
+cargo run -- --log-level info
 ```
 
 ## Testing and Development with solver-demo
@@ -516,6 +912,8 @@ The project includes a Rust-based CLI tool (`solver-demo`) for testing cross-cha
 
 ### Quick Start
 
+> **Note:** The solver-demo tool uses local Anvil chains for testing. The main solver binary uses Redis-based configuration for production deployments. See below for demo-specific setup.
+
 ```bash
 # 1. Initialize configuration and load it
 cargo run -p solver-demo -- init new config/demo.toml
@@ -528,8 +926,8 @@ cargo run -p solver-demo -- env start
 cargo run -p solver-demo -- env deploy --all
 cargo run -p solver-demo -- env setup
 
-# 4. In another terminal, start the solver
-cargo run --bin solver -- --config config/demo.toml
+# 4. In another terminal, the demo tests can be run without starting the main solver
+#    The solver-demo tool handles intent building, quoting, and submission for testing
 
 # 5. Build and test intents
 # Build an intent request
@@ -622,6 +1020,29 @@ cargo run -p solver-demo -- intent test <post-orders-file>
 - `--swap-type`: `exact-input` or `exact-output`
 - `--settlement`: `escrow` or `compact` (resource locks)
 - `--auth`: `permit2` or `eip3009` (for off-chain submission)
+- `--callback-recipient`: Address to receive callback after fill (optional)
+- `--callback-data`: Hex-encoded data to pass to callback (optional)
+
+**Example with Callback:**
+
+```bash
+# Build intent with callback for post-fill notification
+# - callback-recipient: MockCallbackExecutorWithFee contract on Base Sepolia
+# - callback-data: ABI-encoded address to receive the fee (0xd890aa4d1b1517a16f9c3d938d06721356e48b7d)
+oif-demo intent build \
+    --to-chain 84532 \
+    --from-chain 11155420 \
+    --from-token USDC \
+    --to-token USDC \
+    --swap-type exact-output \
+    --amount 1 \
+    --settlement escrow \
+    --auth permit2 \
+    --callback-recipient 0xf2a313a3Dc028295e1dFa3BEE34EaFD2f801C994 \
+    --callback-data 0x000000000000000000000000d890aa4d1b1517a16f9c3d938d06721356e48b7d
+```
+
+The callback recipient will be called after the fill transaction with the provided callback data. The solver simulates the callback during gas estimation to ensure it won't revert and to accurately estimate gas costs.
 
 #### Quote Operations
 
@@ -715,24 +1136,28 @@ The demo tool provides a complete workflow for setting up a test environment:
    - Registers allocator with TheCompact
    - Validates all approvals and registrations
 
-### Running the Solver
+### Running the Solver (Production)
 
-After setting up the environment, start the solver in a separate terminal:
+For production deployments, the solver uses Redis-based configuration:
 
 ```bash
 # Build the project
 cargo build
 
-# Run the solver with local configuration
-cargo run --bin solver -- --config config/demo.toml
+# Seed configuration (first run only)
+cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
+
+# Run the solver (loads config from Redis)
+export SOLVER_ID=your-solver-id  # Output from seeding step
+cargo run
 
 # Or with debug logs for debugging
-RUST_LOG=solver_core=debug,solver_delivery=info,info cargo run --bin solver -- --config config/demo.toml
+RUST_LOG=solver_core=debug,solver_delivery=info,info cargo run
 ```
 
 The solver will:
 
-- Connect to both local chains
+- Connect to configured chains
 - Start monitoring for new intents
 - Process discovered intents automatically
 

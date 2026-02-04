@@ -431,11 +431,11 @@ mod tests {
 				assert_eq!(params.priority_fee, Some(U256::from(2000000000u64))); // 2 gwei
 			},
 			ExecutionDecision::Skip(reason) => {
-				println!("Skip reason: {}", reason);
-				panic!("Expected Execute but got Skip: {}", reason);
+				println!("Skip reason: {reason}");
+				panic!("Expected Execute but got Skip: {reason}");
 			},
 			ExecutionDecision::Defer(duration) => {
-				println!("Defer duration: {:?}", duration);
+				println!("Defer duration: {duration:?}");
 				panic!("Expected Execute but got Defer");
 			},
 		}
@@ -504,11 +504,11 @@ mod tests {
 				assert_eq!(params.gas_price, U256::from(50000000000u64)); // Max gas price
 			},
 			ExecutionDecision::Skip(reason) => {
-				println!("Skip reason: {}", reason);
-				panic!("Expected Execute but got Skip: {}", reason);
+				println!("Skip reason: {reason}");
+				panic!("Expected Execute but got Skip: {reason}");
 			},
 			ExecutionDecision::Defer(duration) => {
-				println!("Defer duration: {:?}", duration);
+				println!("Defer duration: {duration:?}");
 				panic!("Expected Execute but got Defer");
 			},
 		}

@@ -64,7 +64,7 @@ impl MockPricing {
 			if let Ok(price_f64) = reverse_price.parse::<f64>() {
 				if price_f64 != 0.0 {
 					let inverse = 1.0 / price_f64;
-					Some((format!("{:.8}", inverse), true))
+					Some((format!("{inverse:.8}"), true))
 				} else {
 					None
 				}
@@ -108,14 +108,14 @@ impl PricingInterface for MockPricing {
 
 		let amount_f64 = amount
 			.parse::<f64>()
-			.map_err(|e| PricingError::InvalidData(format!("Invalid amount: {}", e)))?;
+			.map_err(|e| PricingError::InvalidData(format!("Invalid amount: {e}")))?;
 
 		// Direct conversion
 		let direct_pair = TradingPair::new(&from_upper, &to_upper);
 		if let Some((price, _)) = self.get_pair_price_internal(&direct_pair) {
 			let price_f64 = price
 				.parse::<f64>()
-				.map_err(|e| PricingError::InvalidData(format!("Invalid price: {}", e)))?;
+				.map_err(|e| PricingError::InvalidData(format!("Invalid price: {e}")))?;
 			return Ok((amount_f64 * price_f64).to_string());
 		}
 
@@ -129,10 +129,10 @@ impl PricingInterface for MockPricing {
 		) {
 			let from_price_f64 = from_usd_price
 				.parse::<f64>()
-				.map_err(|e| PricingError::InvalidData(format!("Invalid from price: {}", e)))?;
+				.map_err(|e| PricingError::InvalidData(format!("Invalid from price: {e}")))?;
 			let to_price_f64 = to_usd_price
 				.parse::<f64>()
-				.map_err(|e| PricingError::InvalidData(format!("Invalid to price: {}", e)))?;
+				.map_err(|e| PricingError::InvalidData(format!("Invalid to price: {e}")))?;
 
 			if to_price_f64 != 0.0 {
 				let conversion_rate = from_price_f64 / to_price_f64;
@@ -141,8 +141,7 @@ impl PricingInterface for MockPricing {
 		}
 
 		Err(PricingError::PriceNotAvailable(format!(
-			"No conversion path from {} to {}",
-			from_asset, to_asset
+			"No conversion path from {from_asset} to {to_asset}"
 		)))
 	}
 
@@ -157,18 +156,19 @@ impl PricingInterface for MockPricing {
 
 		let eth_amount_f64 = eth_amount_str
 			.parse::<f64>()
-			.map_err(|e| PricingError::InvalidData(format!("Invalid ETH amount: {}", e)))?;
+			.map_err(|e| PricingError::InvalidData(format!("Invalid ETH amount: {e}")))?;
 
 		// Convert ETH to target currency
 		let eth_pair = TradingPair::new("ETH", currency);
 		if let Some((price, _)) = self.get_pair_price_internal(&eth_pair) {
 			let price_f64 = price
 				.parse::<f64>()
-				.map_err(|e| PricingError::InvalidData(format!("Invalid price: {}", e)))?;
+				.map_err(|e| PricingError::InvalidData(format!("Invalid price: {e}")))?;
 			let result = eth_amount_f64 * price_f64;
-			Ok(format!("{:.2}", result))
+			// Use 8 decimal places to preserve precision for small gas costs
+			Ok(format!("{result:.8}"))
 		} else {
-			Err(PricingError::PriceNotAvailable(format!("ETH/{}", currency)))
+			Err(PricingError::PriceNotAvailable(format!("ETH/{currency}")))
 		}
 	}
 
@@ -179,14 +179,14 @@ impl PricingInterface for MockPricing {
 	) -> Result<String, PricingError> {
 		let currency_amount_f64 = currency_amount
 			.parse::<f64>()
-			.map_err(|e| PricingError::InvalidData(format!("Invalid currency amount: {}", e)))?;
+			.map_err(|e| PricingError::InvalidData(format!("Invalid currency amount: {e}")))?;
 
 		// Get ETH price in the given currency
 		let eth_pair = TradingPair::new("ETH", currency);
 		if let Some((price, _)) = self.get_pair_price_internal(&eth_pair) {
 			let eth_price_f64 = price
 				.parse::<f64>()
-				.map_err(|e| PricingError::InvalidData(format!("Invalid ETH price: {}", e)))?;
+				.map_err(|e| PricingError::InvalidData(format!("Invalid ETH price: {e}")))?;
 
 			if eth_price_f64 == 0.0 {
 				return Err(PricingError::InvalidData(
@@ -196,14 +196,14 @@ impl PricingInterface for MockPricing {
 
 			// Convert currency to ETH, then to wei using Alloy's parse_ether helper
 			let eth_amount = currency_amount_f64 / eth_price_f64;
-			let eth_amount_str = format!("{:.18}", eth_amount); // Use high precision for ETH
+			let eth_amount_str = format!("{eth_amount:.18}"); // Use high precision for ETH
 			let wei_amount = parse_ether(&eth_amount_str).map_err(|e| {
-				PricingError::InvalidData(format!("Failed to convert ETH to wei: {}", e))
+				PricingError::InvalidData(format!("Failed to convert ETH to wei: {e}"))
 			})?;
 
 			Ok(wei_amount.to_string())
 		} else {
-			Err(PricingError::PriceNotAvailable(format!("ETH/{}", currency)))
+			Err(PricingError::PriceNotAvailable(format!("ETH/{currency}")))
 		}
 	}
 }
@@ -220,7 +220,7 @@ impl ConfigSchema for MockPricingSchema {
 					// Validate pair format
 					if !pair.contains('/') {
 						return Err(ValidationError::InvalidValue {
-							field: format!("pair_prices.{}", pair),
+							field: format!("pair_prices.{pair}"),
 							message: "Pair must be in format 'BASE/QUOTE'".to_string(),
 						});
 					}
@@ -228,9 +228,9 @@ impl ConfigSchema for MockPricingSchema {
 					// Validate price is string
 					if price.as_str().is_none() {
 						return Err(ValidationError::TypeMismatch {
-							field: format!("pair_prices.{}", pair),
+							field: format!("pair_prices.{pair}"),
 							expected: "string".to_string(),
-							actual: format!("{:?}", price),
+							actual: format!("{price:?}"),
 						});
 					}
 				}
@@ -238,7 +238,7 @@ impl ConfigSchema for MockPricingSchema {
 				return Err(ValidationError::TypeMismatch {
 					field: "pair_prices".to_string(),
 					expected: "table".to_string(),
-					actual: format!("{:?}", pair_prices),
+					actual: format!("{pair_prices:?}"),
 				});
 			}
 		}
@@ -266,4 +266,113 @@ pub fn create_mock_pricing(
 	config: &toml::Value,
 ) -> Result<Box<dyn PricingInterface>, PricingError> {
 	Ok(Box::new(MockPricing::new(config)?))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn create_default_config() -> toml::Value {
+		toml::Value::Table(toml::map::Map::new())
+	}
+
+	#[tokio::test]
+	async fn test_wei_to_currency_precision() {
+		// Test that small gas costs are preserved with 8 decimal precision
+		let config = create_default_config();
+		let pricing = MockPricing::new(&config).unwrap();
+
+		// 167885103876 wei at ETH price of $4615.16 (MOCK_ETH_USD_PRICE)
+		// = 0.000000167885103876 ETH * 4615.16 = very small USD amount
+		let result = pricing
+			.wei_to_currency("167885103876", "USD")
+			.await
+			.unwrap();
+
+		// Should have 8 decimal places of precision, not rounded to $0.00
+		let value: f64 = result.parse().unwrap();
+		assert!(value > 0.0, "Small gas cost should not be zero");
+		assert!(value < 0.01, "Value should be less than 1 cent");
+
+		// Verify we have more than 2 decimal places of precision
+		assert!(
+			result.contains('.'),
+			"Result should have decimal point: {result}"
+		);
+		let decimal_places = result.split('.').nth(1).map(|s| s.len()).unwrap_or(0);
+		assert!(
+			decimal_places >= 4,
+			"Should have at least 4 decimal places for precision, got {decimal_places}: {result}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_wei_to_currency_larger_amounts() {
+		let config = create_default_config();
+		let pricing = MockPricing::new(&config).unwrap();
+
+		// 1 ETH in wei
+		let result = pricing
+			.wei_to_currency("1000000000000000000", "USD")
+			.await
+			.unwrap();
+
+		let value: f64 = result.parse().unwrap();
+		// Should be approximately $4615.16 (MOCK_ETH_USD_PRICE)
+		assert!(
+			value > 4000.0 && value < 5000.0,
+			"1 ETH should be between $4000-$5000, got {value}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_convert_asset_same_currency() {
+		let config = create_default_config();
+		let pricing = MockPricing::new(&config).unwrap();
+
+		// Same currency should return the same amount
+		let result = pricing.convert_asset("ETH", "ETH", "1.5").await.unwrap();
+		assert_eq!(result, "1.5");
+	}
+
+	#[tokio::test]
+	async fn test_convert_asset_through_usd() {
+		let config = create_default_config();
+		let pricing = MockPricing::new(&config).unwrap();
+
+		// ETH -> SOL conversion through USD
+		// ETH = $4615.16, SOL = $240.50, so 1 ETH ≈ 19.2 SOL
+		let result = pricing.convert_asset("ETH", "SOL", "1").await.unwrap();
+		let value: f64 = result.parse().unwrap();
+
+		assert!(
+			value > 15.0 && value < 25.0,
+			"1 ETH should be between 15-25 SOL, got {value}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_currency_to_wei() {
+		let config = create_default_config();
+		let pricing = MockPricing::new(&config).unwrap();
+
+		// Get the mock ETH price first
+		let eth_price: f64 = MOCK_ETH_USD_PRICE.parse().unwrap();
+
+		// Convert that USD amount to wei - should be approximately 1 ETH
+		let result = pricing
+			.currency_to_wei(&eth_price.to_string(), "USD")
+			.await
+			.unwrap();
+		let wei: u128 = result.parse().unwrap();
+
+		// Should be close to 1e18 (1 ETH)
+		let one_eth: u128 = 1_000_000_000_000_000_000;
+		let diff = wei.abs_diff(one_eth);
+		// Allow 1% tolerance
+		assert!(
+			diff < one_eth / 100,
+			"${eth_price} should be ~1 ETH (1e18 wei), got {wei} wei"
+		);
+	}
 }

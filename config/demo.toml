@@ -24,6 +24,17 @@ ttl_orders = 300                # 5 minutes
 ttl_intents = 120               # 2 minutes
 ttl_order_by_tx_hash = 300      # 5 minutes
 
+[storage.implementations.redis]
+redis_url = "redis://localhost:6379"
+key_prefix = "oif-solver"
+connection_timeout_ms = 5000
+db = 0
+ttl_orders = 300                # 5 minutes
+ttl_intents = 120               # 2 minutes
+ttl_order_by_tx_hash = 300      # 5 minutes
+ttl_quotes = 60                 # 1 minute
+ttl_settlement_messages = 600   # 10 minutes
+
 # ============================================================================
 # ACCOUNT
 # ============================================================================
@@ -60,6 +71,10 @@ network_ids = [31337]
 # ORDER
 # ============================================================================
 [order]
+simulate_callbacks = true
+callback_whitelist = [
+    "0x0001000002210514154c8bb598df835e9617c2cdcb8c84838bd329c6",  # MockCallbackExecutor on Base (EIP-7930 format)
+]
 
 [order.implementations.eip7683]
 

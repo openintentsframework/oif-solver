@@ -18,6 +18,8 @@ pub mod discovery;
 pub mod events;
 /// Network and token configuration types.
 pub mod networks;
+/// Operator configuration types for runtime storage in Redis.
+pub mod operator_config;
 /// Oracle-related types for settlement validation and routing.
 pub mod oracle;
 /// Order processing types including intents, orders, and execution contexts.
@@ -28,6 +30,8 @@ pub mod provider;
 pub mod registry;
 /// Secure string type for handling sensitive data.
 pub mod secret_string;
+/// Seed override types for initializing a new solver.
+pub mod seed_overrides;
 /// Standard-specific types for different cross-chain protocols.
 pub mod standards;
 /// Storage types for managing persistent data.
@@ -36,6 +40,8 @@ pub mod storage;
 pub mod utils;
 /// Configuration validation types for ensuring type-safe configurations.
 pub mod validation;
+/// Versioned wrapper for optimistic locking.
+pub mod versioned;
 
 // Cost types
 pub mod costs;
@@ -45,12 +51,18 @@ pub mod pricing;
 // Re-export all types for convenient access
 pub use account::*;
 pub use api::*;
-pub use auth::{AuthConfig, AuthScope, JwtClaims, RefreshTokenData};
+pub use auth::{AdminConfig, AuthConfig, AuthScope, JwtClaims, RefreshTokenData};
 pub use costs::{CostBreakdown, CostContext};
 pub use delivery::*;
 pub use discovery::*;
 pub use events::*;
 pub use networks::{NetworkConfig, NetworksConfig, TokenConfig};
+pub use operator_config::{
+	OperatorAccountConfig, OperatorAdminConfig, OperatorConfig, OperatorGasConfig,
+	OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig,
+	OperatorPricingConfig, OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSolverConfig,
+	OperatorToken,
+};
 pub use order::*;
 pub use pricing::*;
 pub use provider::{
@@ -59,6 +71,7 @@ pub use provider::{
 };
 pub use registry::ImplementationRegistry;
 pub use secret_string::SecretString;
+pub use seed_overrides::{AccountOverride, NetworkOverride, SeedOverrides, Token};
 pub use standards::{
 	eip7683::{Eip7683OrderData, MandateOutput as Eip7683Output},
 	eip7930::{InteropAddress, InteropAddressError},
@@ -71,3 +84,4 @@ pub use utils::{
 	MOCK_TOKA_USD_PRICE, MOCK_TOKB_USD_PRICE,
 };
 pub use validation::*;
+pub use versioned::Versioned;

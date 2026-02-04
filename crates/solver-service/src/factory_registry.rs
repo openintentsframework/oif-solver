@@ -12,19 +12,25 @@ use solver_order::{ExecutionStrategy, OrderError, OrderInterface, StrategyError}
 
 use solver_pricing::PricingInterface;
 use solver_settlement::{SettlementError, SettlementInterface};
-use solver_storage::{StorageError, StorageInterface};
+use solver_storage::StorageFactory;
 use solver_types::{NetworksConfig, PricingError};
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::RwLock;
 
 // Type aliases for factory functions
-pub type StorageFactory = fn(&toml::Value) -> Result<Box<dyn StorageInterface>, StorageError>;
-pub type AccountFactory = fn(&toml::Value) -> Result<Box<dyn AccountInterface>, AccountError>;
+pub type AccountFactory = for<'a> fn(
+	&'a toml::Value,
+) -> Pin<
+	Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + 'a>,
+>;
 pub type DeliveryFactory = fn(
 	&toml::Value,
 	&NetworksConfig,
-	&solver_types::SecretString,
-	&std::collections::HashMap<u64, solver_types::SecretString>,
+	&solver_account::AccountSigner,
+	&std::collections::HashMap<u64, solver_account::AccountSigner>,
 ) -> Result<Box<dyn DeliveryInterface>, DeliveryError>;
 pub type DiscoveryFactory =
 	fn(&toml::Value, &NetworksConfig) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError>;
@@ -196,45 +202,64 @@ macro_rules! build_factories {
 	}};
 }
 
-/// Build solver using registry and config
+/// Build solver using registry and dynamic config.
+///
+/// Note: Services created during build use a static snapshot of the config and will NOT
+/// see hot-reload changes. Only SolverEngine's `dynamic_config()` accessor provides
+/// access to hot-reloaded values.
 pub async fn build_solver_from_config(
-	config: Config,
+	dynamic_config: Arc<RwLock<Config>>,
 ) -> Result<SolverEngine, Box<dyn std::error::Error>> {
 	let registry = get_registry();
-	let builder = SolverBuilder::new(config.clone());
+	// Take a static snapshot for building services (they stay stale after hot reload)
+	let static_config = dynamic_config.read().await.clone();
+	let builder = SolverBuilder::new(dynamic_config, static_config.clone());
 
 	// Build factories for each component type using the macro
-	let storage_factories =
-		build_factories!(registry, config.storage.implementations, storage, "storage");
+	let storage_factories = build_factories!(
+		registry,
+		static_config.storage.implementations,
+		storage,
+		"storage"
+	);
 	let delivery_factories = build_factories!(
 		registry,
-		config.delivery.implementations,
+		static_config.delivery.implementations,
 		delivery,
 		"delivery"
 	);
 	let discovery_factories = build_factories!(
 		registry,
-		config.discovery.implementations,
+		static_config.discovery.implementations,
 		discovery,
 		"discovery"
 	);
-	let order_factories = build_factories!(registry, config.order.implementations, order, "order");
-	let pricing_factories = if let Some(pricing_config) = &config.pricing {
+	let order_factories = build_factories!(
+		registry,
+		static_config.order.implementations,
+		order,
+		"order"
+	);
+	let pricing_factories = if let Some(pricing_config) = &static_config.pricing {
 		build_factories!(registry, pricing_config.implementations, pricing, "pricing")
 	} else {
 		HashMap::new()
 	};
 	let settlement_factories = build_factories!(
 		registry,
-		config.settlement.implementations,
+		static_config.settlement.implementations,
 		settlement,
 		"settlement"
 	);
-	let account_factories =
-		build_factories!(registry, config.account.implementations, account, "account");
+	let account_factories = build_factories!(
+		registry,
+		static_config.account.implementations,
+		account,
+		"account"
+	);
 	let strategy_factories = build_factories!(
 		registry,
-		config.order.strategy.implementations,
+		static_config.order.strategy.implementations,
 		strategy,
 		"strategy"
 	);
@@ -314,7 +339,8 @@ mod tests {
 		"#;
 
 		let config: Config = toml::from_str(config_toml).expect("config parses");
-		let message = match build_solver_from_config(config).await {
+		let dynamic_config = Arc::new(RwLock::new(config));
+		let message = match build_solver_from_config(dynamic_config).await {
 			Ok(_) => panic!("expected failure"),
 			Err(error) => error.to_string(),
 		};

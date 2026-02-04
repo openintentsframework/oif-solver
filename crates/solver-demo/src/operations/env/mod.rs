@@ -168,7 +168,7 @@ impl EnvOps {
 				if !force && self.ctx.session.has_contracts(chain) {
 					logging::verbose_operation(
 						"Skipping chain",
-						&format!("{} (already deployed)", chain),
+						&format!("{chain} (already deployed)"),
 					);
 					false
 				} else {
@@ -189,7 +189,7 @@ impl EnvOps {
 			let deployer = self.deployer.clone();
 			let chain = *chain;
 
-			logging::verbose_operation("Starting deployment", &format!("chain {}", chain));
+			logging::verbose_operation("Starting deployment", &format!("chain {chain}"));
 			let handle = tokio::spawn(async move {
 				let addresses = deployer.deploy_to_chain(chain).await?;
 				Ok::<(ChainId, crate::types::session::ContractAddresses), Error>((chain, addresses))
@@ -202,7 +202,7 @@ impl EnvOps {
 		for handle in deployment_handles {
 			let (chain, addresses) = handle
 				.await
-				.map_err(|e| Error::Other(anyhow::anyhow!("Deployment task failed: {}", e)))??;
+				.map_err(|e| Error::Other(anyhow::anyhow!("Deployment task failed: {e}")))??;
 
 			// Store contract addresses in session
 			self.ctx
@@ -256,7 +256,7 @@ impl EnvOps {
 				}
 			}
 
-			logging::verbose_success("Deployment completed", &format!("chain {}", chain));
+			logging::verbose_success("Deployment completed", &format!("chain {chain}"));
 		}
 
 		Ok(())
@@ -299,7 +299,7 @@ impl EnvOps {
 
 			logging::verbose_success(
 				"Contract deployed",
-				&format!("{} on chain {} at {}", contract_name, chain, address),
+				&format!("{contract_name} on chain {chain} at {address}"),
 			);
 
 			// Handle TOML updates based on environment
@@ -311,17 +311,14 @@ impl EnvOps {
 				// Production: log that manual update is needed
 				logging::verbose_operation(
 					"Production deployment",
-					&format!(
-						"manual TOML update required for {} on chain {}",
-						contract_name, chain
-					),
+					&format!("manual TOML update required for {contract_name} on chain {chain}"),
 				);
 			}
 		}
 
 		logging::verbose_success(
 			"Single contract deployment",
-			&format!("{} completed successfully", contract_name),
+			&format!("{contract_name} completed successfully"),
 		);
 		Ok(())
 	}
@@ -355,7 +352,7 @@ impl EnvOps {
 			let ctx = self.ctx.clone();
 			let chain = *chain;
 
-			logging::verbose_operation("Setup starting", &format!("chain {}", chain));
+			logging::verbose_operation("Setup starting", &format!("chain {chain}"));
 			let handle = tokio::spawn(async move {
 				Self::setup_single_chain(ctx, chain, amount).await?;
 				Ok::<ChainId, crate::types::error::Error>(chain)
@@ -368,8 +365,8 @@ impl EnvOps {
 		for handle in setup_handles {
 			let chain = handle
 				.await
-				.map_err(|e| Error::Other(anyhow::anyhow!("Setup task failed: {}", e)))??;
-			logging::verbose_success("Chain setup completed", &format!("chain {}", chain));
+				.map_err(|e| Error::Other(anyhow::anyhow!("Setup task failed: {e}")))??;
+			logging::verbose_success("Chain setup completed", &format!("chain {chain}"));
 		}
 
 		logging::verbose_success(
@@ -396,7 +393,7 @@ impl EnvOps {
 
 		// Get contract addresses from session using the proper API
 		let contracts = ctx.session.contracts(chain).ok_or_else(|| {
-			crate::types::error::Error::from(format!("No contracts found for chain {}", chain))
+			crate::types::error::Error::from(format!("No contracts found for chain {chain}"))
 		})?;
 
 		// Get token addresses
@@ -404,8 +401,7 @@ impl EnvOps {
 		if tokens.is_empty() {
 			use crate::core::logging;
 			logging::warning(&format!(
-				"No tokens found for chain {}, skipping token operations",
-				chain
+				"No tokens found for chain {chain}, skipping token operations"
 			));
 			return Ok(());
 		}
@@ -418,7 +414,7 @@ impl EnvOps {
 
 			logging::verbose_operation(
 				"Minting tokens",
-				&format!("{} {} on chain {}", amount, symbol, chain),
+				&format!("{amount} {symbol} on chain {chain}"),
 			);
 
 			// Mint to user
@@ -435,14 +431,13 @@ impl EnvOps {
 					if let Some(tx_hash) = result.tx_hash {
 						logging::verbose_tech(
 							"User mint completed",
-							&format!("{} on chain {} (tx: {:?})", symbol, chain, tx_hash),
+							&format!("{symbol} on chain {chain} (tx: {tx_hash:?})"),
 						);
 					}
 				},
 				Err(e) => {
 					logging::warning(&format!(
-						"Failed to mint {} tokens to user on chain {}: {}",
-						symbol, chain, e
+						"Failed to mint {symbol} tokens to user on chain {chain}: {e}"
 					));
 					continue;
 				},
@@ -462,14 +457,13 @@ impl EnvOps {
 					if let Some(tx_hash) = result.tx_hash {
 						logging::verbose_tech(
 							"Solver mint completed",
-							&format!("{} on chain {} (tx: {:?})", symbol, chain, tx_hash),
+							&format!("{symbol} on chain {chain} (tx: {tx_hash:?})"),
 						);
 					}
 				},
 				Err(e) => {
 					logging::warning(&format!(
-						"Failed to mint {} tokens to solver on chain {}: {}",
-						symbol, chain, e
+						"Failed to mint {symbol} tokens to solver on chain {chain}: {e}"
 					));
 					continue;
 				},
@@ -477,7 +471,7 @@ impl EnvOps {
 
 			logging::verbose_success(
 				"Token minting completed",
-				&format!("{} on chain {}", symbol, chain),
+				&format!("{symbol} on chain {chain}"),
 			);
 		}
 
@@ -485,14 +479,14 @@ impl EnvOps {
 		if let Some(permit2_addr) = &contracts.permit2 {
 			let permit2_address = permit2_addr
 				.parse::<Address>()
-				.map_err(|e| Error::InvalidConfig(format!("Invalid permit2 address: {}", e)))?;
+				.map_err(|e| Error::InvalidConfig(format!("Invalid permit2 address: {e}")))?;
 
 			// Approve for all tokens
 			for symbol in tokens.keys() {
 				if let Some(_input_settler_addr) = &contracts.input_settler {
 					logging::verbose_operation(
 						"Approving token",
-						&format!("{} for Permit2 -> InputSettler on chain {}", symbol, chain),
+						&format!("{symbol} for Permit2 -> InputSettler on chain {chain}"),
 					);
 					match token_ops
 						.approve(chain, symbol, &permit2_address.to_string(), None)
@@ -502,14 +496,13 @@ impl EnvOps {
 							if let Some(tx_hash) = result.tx_hash {
 								logging::verbose_tech(
 									"InputSettler approval completed",
-									&format!("{} on chain {} (tx: {:?})", symbol, chain, tx_hash),
+									&format!("{symbol} on chain {chain} (tx: {tx_hash:?})"),
 								);
 							}
 						},
 						Err(e) => {
 							logging::warning(&format!(
-								"Failed to approve {} for Permit2 -> InputSettler on chain {}: {}",
-								symbol, chain, e
+								"Failed to approve {symbol} for Permit2 -> InputSettler on chain {chain}: {e}"
 							));
 						},
 					}
@@ -518,10 +511,7 @@ impl EnvOps {
 				if let Some(_input_settler_compact_addr) = &contracts.input_settler_compact {
 					logging::verbose_operation(
 						"Approving token",
-						&format!(
-							"{} for Permit2 -> InputSettlerCompact on chain {}",
-							symbol, chain
-						),
+						&format!("{symbol} for Permit2 -> InputSettlerCompact on chain {chain}"),
 					);
 					match token_ops
 						.approve(chain, symbol, &permit2_address.to_string(), None)
@@ -531,18 +521,18 @@ impl EnvOps {
 							if let Some(tx_hash) = result.tx_hash {
 								logging::verbose_tech(
 									"InputSettlerCompact approval completed",
-									&format!("{} on chain {} (tx: {:?})", symbol, chain, tx_hash),
+									&format!("{symbol} on chain {chain} (tx: {tx_hash:?})"),
 								);
 							}
 						},
 						Err(e) => {
-							logging::warning(&format!("Failed to approve {} for Permit2 -> InputSettlerCompact on chain {}: {}", symbol, chain, e));
+							logging::warning(&format!("Failed to approve {symbol} for Permit2 -> InputSettlerCompact on chain {chain}: {e}"));
 						},
 					}
 				}
 			}
 
-			logging::verbose_success("Permit2 allowances approved", &format!("chain {}", chain));
+			logging::verbose_success("Permit2 allowances approved", &format!("chain {chain}"));
 		}
 
 		// Register allocator with TheCompact
@@ -550,7 +540,7 @@ impl EnvOps {
 			if let Some(allocator_addr) = &contracts.allocator {
 				logging::verbose_operation(
 					"Registering allocator with TheCompact",
-					&format!("chain {}", chain),
+					&format!("chain {chain}"),
 				);
 				Self::register_allocator_with_compact_static(
 					&provider,
@@ -558,7 +548,7 @@ impl EnvOps {
 					allocator_addr,
 				)
 				.await?;
-				logging::verbose_success("Allocator registered", &format!("chain {}", chain));
+				logging::verbose_success("Allocator registered", &format!("chain {chain}"));
 			}
 		}
 
@@ -574,15 +564,15 @@ impl EnvOps {
 		// Parse addresses
 		let compact_address: Address = compact_addr
 			.parse()
-			.map_err(|e| Error::InvalidConfig(format!("Invalid compact address: {}", e)))?;
+			.map_err(|e| Error::InvalidConfig(format!("Invalid compact address: {e}")))?;
 		let allocator_address: Address = allocator_addr
 			.parse()
-			.map_err(|e| Error::InvalidConfig(format!("Invalid allocator address: {}", e)))?;
+			.map_err(|e| Error::InvalidConfig(format!("Invalid allocator address: {e}")))?;
 
 		// Create signer from solver's private key
 		let signer =
 			PrivateKeySigner::from_str(crate::constants::anvil_accounts::SOLVER_PRIVATE_KEY)
-				.map_err(|e| Error::InvalidConfig(format!("Invalid private key: {}", e)))?;
+				.map_err(|e| Error::InvalidConfig(format!("Invalid private key: {e}")))?;
 
 		// Build __registerAllocator transaction data using contracts helper
 		use crate::core::contracts::Contracts;
@@ -624,8 +614,7 @@ impl EnvOps {
 
 		if placeholder_address.is_none() {
 			logging::warning(&format!(
-				"No placeholder address found for key {} in session",
-				placeholder_key
+				"No placeholder address found for key {placeholder_key} in session"
 			));
 			return Ok(());
 		}
@@ -671,8 +660,7 @@ impl EnvOps {
 			}
 		} else {
 			return Err(Error::InvalidConfig(format!(
-				"Unknown placeholder key: {}",
-				placeholder_key
+				"Unknown placeholder key: {placeholder_key}"
 			)));
 		};
 
@@ -682,7 +670,7 @@ impl EnvOps {
 		// Replace the placeholder address with the actual address
 		// Look for both quoted and unquoted versions
 		let patterns_to_replace = [
-			format!("\"{}\"", placeholder_address),
+			format!("\"{placeholder_address}\""),
 			placeholder_address.clone(),
 		];
 
@@ -692,7 +680,7 @@ impl EnvOps {
 		for pattern in &patterns_to_replace {
 			if updated_content.contains(pattern) {
 				updated_content =
-					updated_content.replace(pattern, &format!("\"{}\"", actual_address));
+					updated_content.replace(pattern, &format!("\"{actual_address}\""));
 				replacement_made = true;
 			}
 		}
@@ -725,17 +713,17 @@ impl EnvOps {
 		// Map contract names to their placeholder keys based on the chain ID (numeric only)
 		let chain_id = chain.id();
 		let placeholder_key = match contract_name {
-			"InputSettler" => format!("{}{}", PLACEHOLDER_INPUT_SETTLER_PREFIX, chain_id),
-			"OutputSettler" => format!("{}{}", PLACEHOLDER_OUTPUT_SETTLER_PREFIX, chain_id),
-			"TheCompact" | "Compact" => format!("{}{}", PLACEHOLDER_COMPACT_PREFIX, chain_id),
+			"InputSettler" => format!("{PLACEHOLDER_INPUT_SETTLER_PREFIX}{chain_id}"),
+			"OutputSettler" => format!("{PLACEHOLDER_OUTPUT_SETTLER_PREFIX}{chain_id}"),
+			"TheCompact" | "Compact" => format!("{PLACEHOLDER_COMPACT_PREFIX}{chain_id}"),
 			"InputSettlerCompact" => {
-				format!("{}{}", PLACEHOLDER_INPUT_SETTLER_COMPACT_PREFIX, chain_id)
+				format!("{PLACEHOLDER_INPUT_SETTLER_COMPACT_PREFIX}{chain_id}")
 			},
-			"Allocator" => format!("{}{}", PLACEHOLDER_ALLOCATOR_PREFIX, chain_id),
-			"TokenA" | "TOKA" => format!("{}{}", PLACEHOLDER_TOKEN_A_PREFIX, chain_id),
-			"TokenB" | "TOKB" => format!("{}{}", PLACEHOLDER_TOKEN_B_PREFIX, chain_id),
-			"OracleInput" => format!("{}{}", ORACLE_PLACEHOLDER_INPUT_PREFIX, chain_id),
-			"OracleOutput" => format!("{}{}", ORACLE_PLACEHOLDER_OUTPUT_PREFIX, chain_id),
+			"Allocator" => format!("{PLACEHOLDER_ALLOCATOR_PREFIX}{chain_id}"),
+			"TokenA" | "TOKA" => format!("{PLACEHOLDER_TOKEN_A_PREFIX}{chain_id}"),
+			"TokenB" | "TOKB" => format!("{PLACEHOLDER_TOKEN_B_PREFIX}{chain_id}"),
+			"OracleInput" => format!("{ORACLE_PLACEHOLDER_INPUT_PREFIX}{chain_id}"),
+			"OracleOutput" => format!("{ORACLE_PLACEHOLDER_OUTPUT_PREFIX}{chain_id}"),
 			_ => return Ok(()), // Unknown contract, skip
 		};
 

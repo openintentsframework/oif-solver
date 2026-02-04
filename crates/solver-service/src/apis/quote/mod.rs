@@ -100,6 +100,10 @@ pub async fn process_quote_request(
 	// Use the new validation architecture to get ValidatedQuoteContext
 	let validated_context = QuoteValidator::validate_quote_request(&request, solver)?;
 
+	// Validate callback whitelist early for fail-fast behavior
+	// This prevents users from getting quotes they can't execute due to callback restrictions
+	QuoteValidator::validate_callback_whitelist(&request, config)?;
+
 	let cost_profit_service = solver_core::engine::cost_profit::CostProfitService::new(
 		solver.pricing().clone(),
 		solver.delivery().clone(),
@@ -110,17 +114,23 @@ pub async fn process_quote_request(
 	let cost_context = cost_profit_service
 		.calculate_cost_context(&request, &validated_context, config)
 		.await
-		.map_err(|e| QuoteError::Internal(format!("Failed to calculate cost context: {}", e)))?;
+		.map_err(|e| QuoteError::Internal(format!("Failed to calculate cost context: {e}")))?;
 
 	// Check solver capabilities: networks only (token support is enforced during collection below)
-	QuoteValidator::validate_supported_networks(&request, solver)?;
+	QuoteValidator::validate_supported_networks(&request, &config.networks)?;
 
 	// Validate and collect assets with cost-adjusted amounts
-	let _supported_inputs =
-		QuoteValidator::validate_and_collect_inputs_with_costs(&request, solver, &cost_context)?;
+	let _supported_inputs = QuoteValidator::validate_and_collect_inputs_with_costs(
+		&request,
+		&config.networks,
+		&cost_context,
+	)?;
 
-	let supported_outputs =
-		QuoteValidator::validate_and_collect_outputs_with_costs(&request, solver, &cost_context)?;
+	let supported_outputs = QuoteValidator::validate_and_collect_outputs_with_costs(
+		&request,
+		&config.networks,
+		&cost_context,
+	)?;
 
 	// Check destination balances for cost-adjusted output amounts
 	QuoteValidator::ensure_destination_balances_with_costs(
@@ -220,8 +230,7 @@ pub async fn get_quote_by_id(quote_id: &str, solver: &SolverEngine) -> Result<Qu
 		Err(e) => {
 			tracing::warn!("Failed to retrieve quote {}: {}", quote_id, e);
 			Err(QuoteError::InvalidRequest(format!(
-				"Quote not found: {}",
-				quote_id
+				"Quote not found: {quote_id}"
 			)))
 		},
 	}
@@ -241,7 +250,7 @@ pub async fn quote_exists(quote_id: &str, solver: &SolverEngine) -> Result<bool,
 		},
 		Err(e) => {
 			tracing::warn!("Failed to check quote existence {}: {}", quote_id, e);
-			Err(QuoteError::Internal(format!("Storage error: {}", e)))
+			Err(QuoteError::Internal(format!("Storage error: {e}")))
 		},
 	}
 }
@@ -348,7 +357,7 @@ mod tests {
 			&toml::Value::Table(toml::map::Map::new()),
 		)
 		.unwrap();
-		let pricing = Arc::new(PricingService::new(pricing_impl));
+		let pricing = Arc::new(PricingService::new(pricing_impl, Vec::new()));
 		let event_bus = EventBus::new(64);
 		let networks: solver_types::NetworksConfig = HashMap::new();
 		let token_manager = Arc::new(TokenManager::new(
@@ -357,7 +366,9 @@ mod tests {
 			account.clone(),
 		));
 
+		let dynamic_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
 		SolverEngine::new(
+			dynamic_config,
 			config,
 			storage,
 			account,

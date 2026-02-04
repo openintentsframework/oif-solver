@@ -38,6 +38,7 @@ impl EventBus {
 	///
 	/// Returns an error if there are no active subscribers, though
 	/// this is typically not a critical error in the solver context.
+	#[allow(clippy::result_large_err)]
 	pub fn publish(
 		&self,
 		event: SolverEvent,

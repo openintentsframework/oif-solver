@@ -152,6 +152,7 @@ mod tests {
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,
 			issuer: "test".to_string(),
+			admin: None,
 		};
 
 		let jwt_service = Arc::new(JwtService::new(config).unwrap());
@@ -165,7 +166,7 @@ mod tests {
 			.oneshot(
 				Request::builder()
 					.uri("/protected")
-					.header("Authorization", format!("Bearer {}", token))
+					.header("Authorization", format!("Bearer {token}"))
 					.body(Body::empty())
 					.unwrap(),
 			)
@@ -183,6 +184,7 @@ mod tests {
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,
 			issuer: "test".to_string(),
+			admin: None,
 		};
 
 		let jwt_service = Arc::new(JwtService::new(config).unwrap());
@@ -209,6 +211,7 @@ mod tests {
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,
 			issuer: "test".to_string(),
+			admin: None,
 		};
 
 		let jwt_service = Arc::new(JwtService::new(config).unwrap());
@@ -222,7 +225,7 @@ mod tests {
 			.oneshot(
 				Request::builder()
 					.uri("/protected")
-					.header("Authorization", format!("Bearer {}", token))
+					.header("Authorization", format!("Bearer {token}"))
 					.body(Body::empty())
 					.unwrap(),
 			)

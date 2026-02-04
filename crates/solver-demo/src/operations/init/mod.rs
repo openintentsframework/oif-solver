@@ -105,62 +105,62 @@ fn generate_placeholder_map(chain_ids: &[u64]) -> HashMap<String, String> {
 	for chain_id in chain_ids {
 		// Input settler
 		map.insert(
-			format!("{}{}", PLACEHOLDER_INPUT_SETTLER_PREFIX, chain_id),
-			format!("0x{:040x}", counter),
+			format!("{PLACEHOLDER_INPUT_SETTLER_PREFIX}{chain_id}"),
+			format!("0x{counter:040x}"),
 		);
 		counter += 1;
 
 		// Output settler
 		map.insert(
-			format!("{}{}", PLACEHOLDER_OUTPUT_SETTLER_PREFIX, chain_id),
-			format!("0x{:040x}", counter),
+			format!("{PLACEHOLDER_OUTPUT_SETTLER_PREFIX}{chain_id}"),
+			format!("0x{counter:040x}"),
 		);
 		counter += 1;
 
 		// Compact
 		map.insert(
-			format!("{}{}", PLACEHOLDER_COMPACT_PREFIX, chain_id),
-			format!("0x{:040x}", counter),
+			format!("{PLACEHOLDER_COMPACT_PREFIX}{chain_id}"),
+			format!("0x{counter:040x}"),
 		);
 		counter += 1;
 
 		// InputSettlerCompact
 		map.insert(
-			format!("{}{}", PLACEHOLDER_INPUT_SETTLER_COMPACT_PREFIX, chain_id),
-			format!("0x{:040x}", counter),
+			format!("{PLACEHOLDER_INPUT_SETTLER_COMPACT_PREFIX}{chain_id}"),
+			format!("0x{counter:040x}"),
 		);
 		counter += 1;
 
 		// Allocator
 		map.insert(
-			format!("{}{}", PLACEHOLDER_ALLOCATOR_PREFIX, chain_id),
-			format!("0x{:040x}", counter),
+			format!("{PLACEHOLDER_ALLOCATOR_PREFIX}{chain_id}"),
+			format!("0x{counter:040x}"),
 		);
 		counter += 1;
 
 		// Tokens
 		map.insert(
-			format!("{}{}", PLACEHOLDER_TOKEN_A_PREFIX, chain_id),
-			format!("0x{:040x}", counter),
+			format!("{PLACEHOLDER_TOKEN_A_PREFIX}{chain_id}"),
+			format!("0x{counter:040x}"),
 		);
 		counter += 1;
 
 		map.insert(
-			format!("{}{}", PLACEHOLDER_TOKEN_B_PREFIX, chain_id),
-			format!("0x{:040x}", counter),
+			format!("{PLACEHOLDER_TOKEN_B_PREFIX}{chain_id}"),
+			format!("0x{counter:040x}"),
 		);
 		counter += 1;
 
 		// Oracles
 		map.insert(
-			format!("{}{}", ORACLE_PLACEHOLDER_INPUT_PREFIX, chain_id),
-			format!("0x{:040x}", counter),
+			format!("{ORACLE_PLACEHOLDER_INPUT_PREFIX}{chain_id}"),
+			format!("0x{counter:040x}"),
 		);
 		counter += 1;
 
 		map.insert(
-			format!("{}{}", ORACLE_PLACEHOLDER_OUTPUT_PREFIX, chain_id),
-			format!("0x{:040x}", counter),
+			format!("{ORACLE_PLACEHOLDER_OUTPUT_PREFIX}{chain_id}"),
+			format!("0x{counter:040x}"),
 		);
 		counter += 1;
 	}
@@ -254,10 +254,11 @@ pub async fn load_config(path: &Path, is_local: bool) -> Result<()> {
 
 			// Extract token addresses
 			for token in &network.tokens {
-				let addr: Address =
-					token.address.to_string().parse().map_err(|e| {
-						Error::InvalidConfig(format!("Invalid token address: {}", e))
-					})?;
+				let addr: Address = token
+					.address
+					.to_string()
+					.parse()
+					.map_err(|e| Error::InvalidConfig(format!("Invalid token address: {e}")))?;
 				tokens.insert(token.symbol.clone(), (addr, token.decimals));
 			}
 			logging::verbose_tech(
@@ -269,13 +270,13 @@ pub async fn load_config(path: &Path, is_local: bool) -> Result<()> {
 			let parse_address = |addr: &solver_types::Address| -> Result<Address> {
 				addr.to_string()
 					.parse()
-					.map_err(|e| Error::InvalidConfig(format!("Invalid address: {}", e)))
+					.map_err(|e| Error::InvalidConfig(format!("Invalid address: {e}")))
 			};
 
 			// Canonical permit2 address (same on all networks)
 			let permit2_addr: Address = PERMIT2_ADDRESS
 				.parse()
-				.map_err(|e| Error::InvalidConfig(format!("Invalid permit2 address: {}", e)))?;
+				.map_err(|e| Error::InvalidConfig(format!("Invalid permit2 address: {e}")))?;
 
 			// Extract oracle addresses from settlement config
 			let input_oracle_addr =
@@ -323,7 +324,7 @@ pub async fn load_config(path: &Path, is_local: bool) -> Result<()> {
 
 	// Verbose details about what was loaded
 	logging::verbose_tech("Environment", if is_local { "Local" } else { "Production" });
-	logging::verbose_tech("Chains", &format!("{:?}", chains));
+	logging::verbose_tech("Chains", &format!("{chains:?}"));
 	logging::verbose_tech("Data directory", &config.data_dir().display().to_string());
 
 	Ok(())
@@ -421,8 +422,7 @@ fn generate_demo_config(
 
 	// Include files
 	config.push_str(&format!(
-		"include = [\"{}/networks.toml\", \"{}/api.toml\", \"{}/gas.toml\"]\n\n",
-		config_name, config_name, config_name
+		"include = [\"{config_name}/networks.toml\", \"{config_name}/api.toml\", \"{config_name}/gas.toml\"]\n\n"
 	));
 
 	// Solver configuration
@@ -496,7 +496,7 @@ fn add_account_config(config: &mut String) {
 	// Use SOLVER_PRIVATE_KEY from env or default Anvil key
 	let solver_key = std::env::var(env_vars::SOLVER_PRIVATE_KEY)
 		.unwrap_or_else(|_| anvil_accounts::SOLVER_PRIVATE_KEY.to_string());
-	config.push_str(&format!("private_key = \"{}\"\n\n", solver_key));
+	config.push_str(&format!("private_key = \"{solver_key}\"\n\n"));
 }
 
 fn add_delivery_config(config: &mut String, chain_ids: &[u64]) {
@@ -511,7 +511,7 @@ fn add_delivery_config(config: &mut String, chain_ids: &[u64]) {
 	config.push_str("min_confirmations = 1\n\n");
 
 	config.push_str("[delivery.implementations.evm_alloy]\n");
-	config.push_str(&format!("network_ids = {:?}\n\n", chain_ids));
+	config.push_str(&format!("network_ids = {chain_ids:?}\n\n"));
 }
 
 fn add_discovery_config(config: &mut String, chain_ids: &[u64]) {
@@ -525,7 +525,7 @@ fn add_discovery_config(config: &mut String, chain_ids: &[u64]) {
 	config.push_str("[discovery]\n\n");
 
 	config.push_str("[discovery.implementations.onchain_eip7683]\n");
-	config.push_str(&format!("network_ids = {:?}\n", chain_ids));
+	config.push_str(&format!("network_ids = {chain_ids:?}\n"));
 	config.push_str(
 		"polling_interval_secs = 0    # Use WebSocket subscriptions instead of polling\n\n",
 	);
@@ -601,7 +601,7 @@ fn add_settlement_config(
 
 	config.push_str("[settlement.implementations.direct]\n");
 	config.push_str("order = \"eip7683\"\n");
-	config.push_str(&format!("network_ids = {:?}\n", chain_ids));
+	config.push_str(&format!("network_ids = {chain_ids:?}\n"));
 	config.push_str("dispute_period_seconds = 1\n");
 	config.push_str("# Oracle selection strategy when multiple oracles are available (First, RoundRobin, Random)\n");
 	config.push_str("oracle_selection_strategy = \"First\"\n\n");
@@ -618,11 +618,11 @@ fn add_settlement_config(
 			config.push_str(", ");
 		}
 		let oracle_addr = placeholders
-			.get(&format!("ORACLE_PLACEHOLDER_INPUT_{}", chain_id))
+			.get(&format!("ORACLE_PLACEHOLDER_INPUT_{chain_id}"))
 			.ok_or_else(|| {
-				Error::InvalidConfig(format!("Missing ORACLE_PLACEHOLDER_INPUT_{}", chain_id))
+				Error::InvalidConfig(format!("Missing ORACLE_PLACEHOLDER_INPUT_{chain_id}"))
 			})?;
-		config.push_str(&format!("{} = [\n    \"{}\",\n]", chain_id, oracle_addr));
+		config.push_str(&format!("{chain_id} = [\n    \"{oracle_addr}\",\n]"));
 	}
 	config.push_str(" }\n");
 
@@ -634,11 +634,11 @@ fn add_settlement_config(
 			config.push_str(", ");
 		}
 		let oracle_addr = placeholders
-			.get(&format!("ORACLE_PLACEHOLDER_OUTPUT_{}", chain_id))
+			.get(&format!("ORACLE_PLACEHOLDER_OUTPUT_{chain_id}"))
 			.ok_or_else(|| {
-				Error::InvalidConfig(format!("Missing ORACLE_PLACEHOLDER_OUTPUT_{}", chain_id))
+				Error::InvalidConfig(format!("Missing ORACLE_PLACEHOLDER_OUTPUT_{chain_id}"))
 			})?;
-		config.push_str(&format!("{} = [\n    \"{}\",\n]", chain_id, oracle_addr));
+		config.push_str(&format!("{chain_id} = [\n    \"{oracle_addr}\",\n]"));
 	}
 	config.push_str(" }\n\n");
 
@@ -653,7 +653,7 @@ fn add_settlement_config(
 			.cloned()
 			.collect();
 		if !to_chains.is_empty() {
-			config.push_str(&format!("{} = {:?}\n", from_chain, to_chains));
+			config.push_str(&format!("{from_chain} = {to_chains:?}\n"));
 		}
 	}
 
@@ -673,83 +673,80 @@ fn generate_networks_config(
 
 	// Generate configuration for each chain
 	for (idx, chain_id) in chain_ids.iter().enumerate() {
-		config.push_str(&format!("[networks.{}]\n", chain_id));
+		config.push_str(&format!("[networks.{chain_id}]\n"));
 
 		// Contract addresses
 		let input_settler = placeholders
-			.get(&format!("PLACEHOLDER_INPUT_SETTLER_{}", chain_id))
+			.get(&format!("PLACEHOLDER_INPUT_SETTLER_{chain_id}"))
 			.ok_or_else(|| {
-				Error::InvalidConfig(format!("Missing PLACEHOLDER_INPUT_SETTLER_{}", chain_id))
+				Error::InvalidConfig(format!("Missing PLACEHOLDER_INPUT_SETTLER_{chain_id}"))
 			})?;
-		config.push_str(&format!("input_settler_address = \"{}\"\n", input_settler));
+		config.push_str(&format!("input_settler_address = \"{input_settler}\"\n"));
 
 		// InputSettlerCompact address
 		let input_settler_compact = placeholders
-			.get(&format!("PLACEHOLDER_INPUT_SETTLER_COMPACT_{}", chain_id))
+			.get(&format!("PLACEHOLDER_INPUT_SETTLER_COMPACT_{chain_id}"))
 			.ok_or_else(|| {
 				Error::InvalidConfig(format!(
-					"Missing PLACEHOLDER_INPUT_SETTLER_COMPACT_{}",
-					chain_id
+					"Missing PLACEHOLDER_INPUT_SETTLER_COMPACT_{chain_id}"
 				))
 			})?;
 		config.push_str(&format!(
-			"input_settler_compact_address = \"{}\"\n",
-			input_settler_compact
+			"input_settler_compact_address = \"{input_settler_compact}\"\n"
 		));
 
 		// TheCompact contract address
 		let compact = placeholders
-			.get(&format!("PLACEHOLDER_COMPACT_{}", chain_id))
+			.get(&format!("PLACEHOLDER_COMPACT_{chain_id}"))
 			.ok_or_else(|| {
-				Error::InvalidConfig(format!("Missing PLACEHOLDER_COMPACT_{}", chain_id))
+				Error::InvalidConfig(format!("Missing PLACEHOLDER_COMPACT_{chain_id}"))
 			})?;
-		config.push_str(&format!("the_compact_address = \"{}\"\n", compact));
+		config.push_str(&format!("the_compact_address = \"{compact}\"\n"));
 
 		let allocator = placeholders
-			.get(&format!("PLACEHOLDER_ALLOCATOR_{}", chain_id))
+			.get(&format!("PLACEHOLDER_ALLOCATOR_{chain_id}"))
 			.ok_or_else(|| {
-				Error::InvalidConfig(format!("Missing PLACEHOLDER_ALLOCATOR_{}", chain_id))
+				Error::InvalidConfig(format!("Missing PLACEHOLDER_ALLOCATOR_{chain_id}"))
 			})?;
-		config.push_str(&format!("allocator_address = \"{}\"\n", allocator));
+		config.push_str(&format!("allocator_address = \"{allocator}\"\n"));
 
 		let output_settler = placeholders
-			.get(&format!("PLACEHOLDER_OUTPUT_SETTLER_{}", chain_id))
+			.get(&format!("PLACEHOLDER_OUTPUT_SETTLER_{chain_id}"))
 			.ok_or_else(|| {
-				Error::InvalidConfig(format!("Missing PLACEHOLDER_OUTPUT_SETTLER_{}", chain_id))
+				Error::InvalidConfig(format!("Missing PLACEHOLDER_OUTPUT_SETTLER_{chain_id}"))
 			})?;
 		config.push_str(&format!(
-			"output_settler_address = \"{}\"\n\n",
-			output_settler
+			"output_settler_address = \"{output_settler}\"\n\n"
 		));
 
 		// RPC endpoints
 		config.push_str("# RPC endpoints with both HTTP and WebSocket URLs for each network\n");
-		config.push_str(&format!("[[networks.{}.rpc_urls]]\n", chain_id));
+		config.push_str(&format!("[[networks.{chain_id}.rpc_urls]]\n"));
 
 		let port = 8545 + idx;
-		config.push_str(&format!("http = \"http://localhost:{}\"\n", port));
-		config.push_str(&format!("ws = \"ws://localhost:{}\"\n\n", port));
+		config.push_str(&format!("http = \"http://localhost:{port}\"\n"));
+		config.push_str(&format!("ws = \"ws://localhost:{port}\"\n\n"));
 
 		// Token configurations
-		config.push_str(&format!("[[networks.{}.tokens]]\n", chain_id));
+		config.push_str(&format!("[[networks.{chain_id}.tokens]]\n"));
 		let token_a = placeholders
-			.get(&format!("PLACEHOLDER_TOKEN_A_{}", chain_id))
+			.get(&format!("PLACEHOLDER_TOKEN_A_{chain_id}"))
 			.ok_or_else(|| {
-				Error::InvalidConfig(format!("Missing PLACEHOLDER_TOKEN_A_{}", chain_id))
+				Error::InvalidConfig(format!("Missing PLACEHOLDER_TOKEN_A_{chain_id}"))
 			})?;
-		config.push_str(&format!("address = \"{}\"\n", token_a));
+		config.push_str(&format!("address = \"{token_a}\"\n"));
 		config.push_str("symbol = \"TOKA\"\n");
-		config.push_str(&format!("decimals = {}\n\n", DEFAULT_TOKEN_DECIMALS));
+		config.push_str(&format!("decimals = {DEFAULT_TOKEN_DECIMALS}\n\n"));
 
-		config.push_str(&format!("[[networks.{}.tokens]]\n", chain_id));
+		config.push_str(&format!("[[networks.{chain_id}.tokens]]\n"));
 		let token_b = placeholders
-			.get(&format!("PLACEHOLDER_TOKEN_B_{}", chain_id))
+			.get(&format!("PLACEHOLDER_TOKEN_B_{chain_id}"))
 			.ok_or_else(|| {
-				Error::InvalidConfig(format!("Missing PLACEHOLDER_TOKEN_B_{}", chain_id))
+				Error::InvalidConfig(format!("Missing PLACEHOLDER_TOKEN_B_{chain_id}"))
 			})?;
-		config.push_str(&format!("address = \"{}\"\n", token_b));
+		config.push_str(&format!("address = \"{token_b}\"\n"));
 		config.push_str("symbol = \"TOKB\"\n");
-		config.push_str(&format!("decimals = {}\n\n", DEFAULT_TOKEN_DECIMALS));
+		config.push_str(&format!("decimals = {DEFAULT_TOKEN_DECIMALS}\n\n"));
 	}
 
 	Ok(config)

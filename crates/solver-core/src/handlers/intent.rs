@@ -14,8 +14,8 @@ use solver_delivery::DeliveryService;
 use solver_order::OrderService;
 use solver_storage::StorageService;
 use solver_types::{
-	truncate_id, with_0x_prefix, Address, DiscoveryEvent, ExecutionDecision, Intent, OrderEvent,
-	SolverEvent, StorageKey,
+	truncate_id, with_0x_prefix, Address, DiscoveryEvent, Eip7683OrderData, ExecutionDecision,
+	ExecutionParams, Intent, OrderEvent, SolverEvent, StorageKey,
 };
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -51,7 +51,9 @@ pub struct IntentHandler {
 	solver_address: Address,
 	token_manager: Arc<TokenManager>,
 	cost_profit_service: Arc<CostProfitService>,
-	config: Config,
+	/// Dynamic config for hot-reload support.
+	/// Config changes via Admin API are immediately visible.
+	dynamic_config: Arc<RwLock<Config>>,
 	/// In-memory LRU cache for fast intent deduplication to prevent race conditions
 	/// Automatically evicts oldest entries when capacity is exceeded
 	processed_intents: Arc<RwLock<LruCache<String, ()>>>,
@@ -68,7 +70,7 @@ impl IntentHandler {
 		solver_address: Address,
 		token_manager: Arc<TokenManager>,
 		cost_profit_service: Arc<CostProfitService>,
-		config: Config,
+		dynamic_config: Arc<RwLock<Config>>,
 	) -> Self {
 		Self {
 			order_service,
@@ -79,7 +81,7 @@ impl IntentHandler {
 			solver_address,
 			token_manager,
 			cost_profit_service,
-			config,
+			dynamic_config,
 			processed_intents: Arc::new(RwLock::new(LruCache::new(
 				NonZeroUsize::new(10000).unwrap(),
 			))),
@@ -89,6 +91,10 @@ impl IntentHandler {
 	/// Handles a newly discovered intent.
 	#[instrument(skip_all, fields(order_id = %truncate_id(&intent.id)))]
 	pub async fn handle(&self, intent: Intent) -> Result<(), IntentError> {
+		// Clone config early to release lock before any async calls.
+		// This enables hot-reload: config changes via Admin API are picked up on next intent.
+		let config = self.dynamic_config.read().await.clone();
+
 		// Prevent duplicate order processing when multiple discovery modules for the same standard are active.
 		//
 		// When an off-chain 7683 order is submitted via the API, it triggers an `openFor` transaction
@@ -118,9 +124,7 @@ impl IntentHandler {
 			.storage
 			.exists(StorageKey::Intents.as_str(), &intent.id)
 			.await
-			.map_err(|e| {
-				IntentError::Storage(format!("Failed to check intent existence: {}", e))
-			})?;
+			.map_err(|e| IntentError::Storage(format!("Failed to check intent existence: {e}")))?;
 		if exists {
 			tracing::debug!("Duplicate intent detected in persistent storage, already processed");
 			return Ok(());
@@ -137,7 +141,7 @@ impl IntentHandler {
 			)
 			.await
 			.map_err(|e| {
-				IntentError::Storage(format!("Failed to store intent for deduplication: {}", e))
+				IntentError::Storage(format!("Failed to store intent for deduplication: {e}"))
 			})?;
 
 		tracing::info!("Discovered intent");
@@ -154,7 +158,7 @@ impl IntentHandler {
 				Box::pin(async move {
 					// Return the intent ID as bytes (it's already a hex string)
 					alloy_primitives::hex::decode(&id)
-						.map_err(|e| format!("Failed to decode intent ID: {}", e))
+						.map_err(|e| format!("Failed to decode intent ID: {e}"))
 				})
 			});
 
@@ -174,29 +178,86 @@ impl IntentHandler {
 			.await
 		{
 			Ok(order) => {
-				// Calculate cost estimation and validate profitability
+				// Step 1: Generate fill transaction and simulate to get accurate gas estimate
+				// This also validates callbacks won't revert
+				let default_params = ExecutionParams {
+					gas_price: alloy_primitives::U256::ZERO,
+					priority_fee: None,
+				};
+
+				let simulated_fill_gas = match self
+					.order_service
+					.generate_fill_transaction(&order, &default_params)
+					.await
+				{
+					Ok(fill_tx) => {
+						// Simulate the fill transaction to validate callbacks and get gas estimate
+						match self
+							.cost_profit_service
+							.simulate_callback_and_estimate_gas(&order, &fill_tx, &config)
+							.await
+						{
+							Ok(simulation_result) => {
+								if simulation_result.has_callback {
+									tracing::info!(
+										"✅ Callback simulation passed for order {} - estimated gas: {} units on chain {}",
+										order.id,
+										simulation_result.estimated_gas_units,
+										simulation_result.chain_id
+									);
+								}
+								// Use simulated gas if available, otherwise None (will use config default)
+								if simulation_result.estimated_gas_units > 0 {
+									Some(simulation_result.estimated_gas_units)
+								} else {
+									None
+								}
+							},
+							Err(e) => {
+								tracing::warn!("Order failed callback simulation: {}", e);
+								self.event_bus
+									.publish(SolverEvent::Order(OrderEvent::Skipped {
+										order_id: order.id.clone(),
+										reason: format!("Callback simulation failed: {e}"),
+									}))
+									.ok();
+								return Ok(());
+							},
+						}
+					},
+					Err(e) => {
+						// If fill transaction generation fails, skip the order
+						tracing::warn!("Failed to generate fill transaction for simulation: {}", e);
+						self.event_bus
+							.publish(SolverEvent::Order(OrderEvent::Skipped {
+								order_id: order.id.clone(),
+								reason: format!("Fill transaction generation failed: {e}"),
+							}))
+							.ok();
+						return Ok(());
+					},
+				};
+
+				// Step 2: Calculate cost estimation using simulated gas
 				let cost_estimate = match self
 					.cost_profit_service
-					.estimate_cost_for_order(&order, &self.config)
+					.estimate_cost_for_order_with_gas(&order, &config, simulated_fill_gas)
 					.await
 				{
 					Ok(estimate) => estimate,
 					Err(e) => {
 						tracing::warn!("Failed to calculate cost estimate: {}", e);
-						return Err(IntentError::Service(format!(
-							"Cost estimation failed: {}",
-							e
-						)));
+						return Err(IntentError::Service(format!("Cost estimation failed: {e}")));
 					},
 				};
 
-				// Validate profitability
+				// Step 3: Validate profitability with accurate gas costs
 				match self
 					.cost_profit_service
 					.validate_profitability(
 						&order,
 						&cost_estimate,
-						self.config.solver.min_profitability_pct,
+						config.solver.min_profitability_pct,
 						intent.quote_id.as_deref(),
 						&intent.source,
 					)
@@ -210,11 +271,29 @@ impl IntentHandler {
 						self.event_bus
 							.publish(SolverEvent::Order(OrderEvent::Skipped {
 								order_id: order.id.clone(),
-								reason: format!("Insufficient profitability: {}", e),
+								reason: format!("Insufficient profitability: {e}"),
 							}))
 							.ok();
 						return Ok(());
 					},
+				}
+
+				// Update order's gas_limit_overrides with simulated gas before storing
+				// This ensures the actual fill transaction uses the simulated gas limit
+				let mut order = order;
+				if let Some(simulated_gas) = simulated_fill_gas {
+					if let Ok(mut order_data) =
+						serde_json::from_value::<Eip7683OrderData>(order.data.clone())
+					{
+						order_data.gas_limit_overrides.fill_gas_limit = Some(simulated_gas);
+						if let Ok(updated_data) = serde_json::to_value(&order_data) {
+							order.data = updated_data;
+							tracing::debug!(
+								"Updated order gas_limit_overrides.fill_gas_limit to {} units",
+								simulated_gas
+							);
+						}
+					}
 				}
 
 				self.event_bus
@@ -235,7 +314,7 @@ impl IntentHandler {
 					self.delivery.clone(),
 					self.solver_address.clone(),
 					self.token_manager.clone(),
-					self.config.clone(),
+					config.clone(),
 				);
 				let context = builder
 					.build_execution_context(&intent)
@@ -323,8 +402,8 @@ mod tests {
 		Address(vec![0xab; 20])
 	}
 
-	fn create_test_config() -> Config {
-		ConfigBuilder::new().build()
+	fn create_test_config() -> Arc<RwLock<Config>> {
+		Arc::new(RwLock::new(ConfigBuilder::new().build()))
 	}
 
 	fn create_mock_cost_profit_service() -> Arc<CostProfitService> {
@@ -370,7 +449,7 @@ mod tests {
 			})
 		});
 
-		let pricing_service = Arc::new(PricingService::new(Box::new(mock_pricing)));
+		let pricing_service = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 
 		// Create mock delivery service with chain implementations
 		let mut delivery_impls = HashMap::new();
@@ -382,6 +461,9 @@ mod tests {
 		mock_delivery_1
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async move { Ok(1000000u64) }));
+		mock_delivery_1
+			.expect_estimate_gas()
+			.returning(|_| Box::pin(async move { Ok(200000u64) }));
 
 		let mut mock_delivery_137 = solver_delivery::MockDeliveryInterface::new();
 		mock_delivery_137
@@ -390,6 +472,9 @@ mod tests {
 		mock_delivery_137
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async move { Ok(1000000u64) }));
+		mock_delivery_137
+			.expect_estimate_gas()
+			.returning(|_| Box::pin(async move { Ok(200000u64) }));
 
 		delivery_impls.insert(
 			1u64,
@@ -478,6 +563,26 @@ mod tests {
 			.expect_validate_and_create_order()
 			.times(1)
 			.returning(move |_, _, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
+
+		// Add expectation for generate_fill_transaction (used for callback simulation)
+		mock_order_interface
+			.expect_generate_fill_transaction()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					Ok(solver_types::Transaction {
+						to: Some(solver_types::Address(vec![0u8; 20])),
+						data: vec![],
+						value: U256::ZERO,
+						chain_id: 137,
+						nonce: None,
+						gas_limit: Some(200000),
+						gas_price: None,
+						max_fee_per_gas: None,
+						max_priority_fee_per_gas: None,
+					})
+				})
+			});
 
 		mock_strategy
 			.expect_should_execute()
@@ -679,6 +784,26 @@ mod tests {
 			.times(1)
 			.returning(move |_, _, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
 
+		// Add expectation for generate_fill_transaction (used for callback simulation)
+		mock_order_interface
+			.expect_generate_fill_transaction()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					Ok(solver_types::Transaction {
+						to: Some(solver_types::Address(vec![0u8; 20])),
+						data: vec![],
+						value: U256::ZERO,
+						chain_id: 137,
+						nonce: None,
+						gas_limit: Some(200000),
+						gas_price: None,
+						max_fee_per_gas: None,
+						max_priority_fee_per_gas: None,
+					})
+				})
+			});
+
 		mock_strategy
 			.expect_should_execute()
 			.times(1)
@@ -749,6 +874,26 @@ mod tests {
 			.expect_validate_and_create_order()
 			.times(1)
 			.returning(move |_, _, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
+
+		// Add expectation for generate_fill_transaction (used for callback simulation)
+		mock_order_interface
+			.expect_generate_fill_transaction()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					Ok(solver_types::Transaction {
+						to: Some(solver_types::Address(vec![0u8; 20])),
+						data: vec![],
+						value: U256::ZERO,
+						chain_id: 137,
+						nonce: None,
+						gas_limit: Some(200000),
+						gas_price: None,
+						max_fee_per_gas: None,
+						max_priority_fee_per_gas: None,
+					})
+				})
+			});
 
 		mock_strategy
 			.expect_should_execute()
@@ -867,6 +1012,27 @@ mod tests {
 			.expect_validate_and_create_order()
 			.times(1)
 			.returning(move |_, _, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
+
+		// Add expectation for generate_fill_transaction (used for callback simulation)
+		mock_order_interface
+			.expect_generate_fill_transaction()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					Ok(solver_types::Transaction {
+						to: Some(solver_types::Address(vec![0u8; 20])),
+						data: vec![],
+						value: U256::ZERO,
+						chain_id: 137,
+						nonce: None,
+						gas_limit: Some(200000),
+						gas_price: None,
+						max_fee_per_gas: None,
+						max_priority_fee_per_gas: None,
+					})
+				})
+			});
+
 		mock_strategy.expect_should_execute().returning(|_, _| {
 			Box::pin(async move {
 				ExecutionDecision::Execute(ExecutionParams {

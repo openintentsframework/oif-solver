@@ -15,8 +15,11 @@ use solver_pricing::PricingService;
 use solver_settlement::{SettlementError, SettlementInterface, SettlementService};
 use solver_storage::{StorageError, StorageInterface, StorageService};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::RwLock;
 
 /// Errors that can occur during solver engine construction.
 ///
@@ -48,13 +51,24 @@ pub struct SolverFactories<SF, AF, DF, DIF, OF, PF, SEF, STF> {
 
 /// Builder for constructing a SolverEngine with pluggable implementations.
 pub struct SolverBuilder {
-	config: Config,
+	/// Dynamic configuration that supports hot reload via admin API.
+	dynamic_config: Arc<RwLock<Config>>,
+	/// Static configuration snapshot (services don't see hot reload changes).
+	static_config: Config,
 }
 
 impl SolverBuilder {
 	/// Creates a new SolverBuilder with the given configuration.
-	pub fn new(config: Config) -> Self {
-		Self { config }
+	///
+	/// The builder takes a static snapshot of the config for building services.
+	/// Services created from this snapshot will NOT see hot-reload changes.
+	/// Hot-reload is handled at the API layer (e.g., quote validation reads
+	/// networks directly from the dynamic config passed to handlers).
+	pub fn new(dynamic_config: Arc<RwLock<Config>>, static_config: Config) -> Self {
+		Self {
+			dynamic_config,
+			static_config,
+		}
 	}
 
 	/// Builds the SolverEngine using factories for each component type.
@@ -64,12 +78,16 @@ impl SolverBuilder {
 	) -> Result<SolverEngine, BuilderError>
 	where
 		SF: Fn(&toml::Value) -> Result<Box<dyn StorageInterface>, StorageError>,
-		AF: Fn(&toml::Value) -> Result<Box<dyn AccountInterface>, AccountError>,
+		for<'a> AF: Fn(
+			&'a toml::Value,
+		) -> Pin<
+			Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + 'a>,
+		>,
 		DF: Fn(
 			&toml::Value,
 			&solver_types::NetworksConfig,
-			&solver_types::SecretString,
-			&std::collections::HashMap<u64, solver_types::SecretString>,
+			&solver_account::AccountSigner,
+			&std::collections::HashMap<u64, solver_account::AccountSigner>,
 		) -> Result<Box<dyn DeliveryInterface>, DeliveryError>,
 		DIF: Fn(
 			&toml::Value,
@@ -92,13 +110,13 @@ impl SolverBuilder {
 	{
 		// Create storage implementations
 		let mut storage_impls = HashMap::new();
-		for (name, config) in &self.config.storage.implementations {
+		for (name, config) in &self.static_config.storage.implementations {
 			if let Some(factory) = factories.storage_factories.get(name) {
 				match factory(config) {
 					Ok(implementation) => {
 						// Validation already happened in the factory
 						storage_impls.insert(name.clone(), implementation);
-						let is_primary = &self.config.storage.primary == name;
+						let is_primary = &self.static_config.storage.primary == name;
 						tracing::info!(component = "storage", implementation = %name, enabled = %is_primary, "Loaded");
 					},
 					Err(e) => {
@@ -109,8 +127,7 @@ impl SolverBuilder {
 							"Failed to create storage implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create storage implementation '{}': {}",
-							name, e
+							"Failed to create storage implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -124,11 +141,10 @@ impl SolverBuilder {
 		}
 
 		// Get the primary storage implementation
-		let primary_storage = &self.config.storage.primary;
+		let primary_storage = &self.static_config.storage.primary;
 		let storage_backend = storage_impls.remove(primary_storage).ok_or_else(|| {
 			BuilderError::Config(format!(
-				"Primary storage '{}' failed to load or has invalid configuration",
-				primary_storage
+				"Primary storage '{primary_storage}' failed to load or has invalid configuration"
 			))
 		})?;
 
@@ -136,12 +152,12 @@ impl SolverBuilder {
 
 		// Create account implementations
 		let mut account_impls = HashMap::new();
-		for (name, config) in &self.config.account.implementations {
+		for (name, config) in &self.static_config.account.implementations {
 			if let Some(factory) = factories.account_factories.get(name) {
-				match factory(config) {
+				match factory(config).await {
 					Ok(implementation) => {
 						account_impls.insert(name.clone(), implementation);
-						let is_primary = &self.config.account.primary == name;
+						let is_primary = &self.static_config.account.primary == name;
 						tracing::info!(component = "account", implementation = %name, enabled = %is_primary, "Loaded");
 					},
 					Err(e) => {
@@ -152,8 +168,7 @@ impl SolverBuilder {
 							"Failed to create account implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create account implementation '{}': {}",
-							name, e
+							"Failed to create account implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -173,13 +188,12 @@ impl SolverBuilder {
 		}
 
 		// Get the primary account service
-		let primary_account = self.config.account.primary.as_str();
+		let primary_account = self.static_config.account.primary.as_str();
 		let account = account_services
 			.get(primary_account)
 			.ok_or_else(|| {
 				BuilderError::Config(format!(
-					"Primary account '{}' not found in loaded accounts",
-					primary_account
+					"Primary account '{primary_account}' not found in loaded accounts"
 				))
 			})?
 			.clone();
@@ -194,29 +208,35 @@ impl SolverBuilder {
 					"Failed to get solver address"
 				);
 				return Err(BuilderError::Config(format!(
-					"Failed to get solver address: {}",
-					e
+					"Failed to get solver address: {e}"
 				)));
 			},
 		};
 
+		// Log the solver address for operational visibility
+		tracing::info!(
+			component = "account",
+			address = %solver_address,
+			"Solver address initialized"
+		);
+
 		// Create delivery implementations
 		let mut delivery_implementations = std::collections::HashMap::new();
 
-		// Get the default private key from the primary account
-		let default_private_key = account.get_private_key();
+		// Get the default signer from the primary account
+		let default_signer = account.signer();
 
-		for (name, config) in &self.config.delivery.implementations {
+		for (name, config) in &self.static_config.delivery.implementations {
 			if let Some(factory) = factories.delivery_factories.get(name) {
 				// Parse per-network account mappings from config
-				let mut network_private_keys = HashMap::new();
+				let mut network_signers = HashMap::new();
 				if let Some(accounts_table) = config.get("accounts").and_then(|v| v.as_table()) {
 					for (network_id_str, account_name_value) in accounts_table {
 						if let Ok(network_id) = network_id_str.parse::<u64>() {
 							if let Some(account_name) = account_name_value.as_str() {
 								if let Some(account_service) = account_services.get(account_name) {
-									let private_key = account_service.get_private_key();
-									network_private_keys.insert(network_id, private_key);
+									let signer = account_service.signer();
+									network_signers.insert(network_id, signer);
 								} else {
 									tracing::warn!(
 										"Account '{}' not found, skipping",
@@ -230,9 +250,9 @@ impl SolverBuilder {
 
 				match factory(
 					config,
-					&self.config.networks,
-					&default_private_key,
-					&network_private_keys,
+					&self.static_config.networks,
+					&default_signer,
+					&network_signers,
 				) {
 					Ok(implementation) => {
 						// Extract network_ids from config to create the mapping
@@ -256,8 +276,7 @@ impl SolverBuilder {
 								"Missing network_ids configuration"
 							);
 							return Err(BuilderError::Config(format!(
-								"Delivery implementation '{}' missing network_ids configuration",
-								name
+								"Delivery implementation '{name}' missing network_ids configuration"
 							)));
 						}
 					},
@@ -269,8 +288,7 @@ impl SolverBuilder {
 							"Failed to create delivery implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create delivery implementation '{}': {}",
-							name, e
+							"Failed to create delivery implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -283,15 +301,15 @@ impl SolverBuilder {
 
 		let delivery = Arc::new(DeliveryService::new(
 			delivery_implementations,
-			self.config.delivery.min_confirmations,
-			self.config.solver.monitoring_timeout_seconds,
+			self.static_config.delivery.min_confirmations,
+			self.static_config.solver.monitoring_timeout_seconds,
 		));
 
 		// Create discovery implementations
 		let mut discovery_implementations = HashMap::new();
-		for (name, config) in &self.config.discovery.implementations {
+		for (name, config) in &self.static_config.discovery.implementations {
 			if let Some(factory) = factories.discovery_factories.get(name) {
-				match factory(config, &self.config.networks) {
+				match factory(config, &self.static_config.networks) {
 					Ok(implementation) => {
 						// Validation already happened in the factory
 						discovery_implementations.insert(name.clone(), implementation);
@@ -305,8 +323,7 @@ impl SolverBuilder {
 							"Failed to create discovery implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create discovery implementation '{}': {}",
-							name, e
+							"Failed to create discovery implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -323,9 +340,9 @@ impl SolverBuilder {
 
 		// Create settlement implementations first (needed for oracle routes)
 		let mut settlement_impls = HashMap::new();
-		for (name, config) in &self.config.settlement.implementations {
+		for (name, config) in &self.static_config.settlement.implementations {
 			if let Some(factory) = factories.settlement_factories.get(name) {
-				match factory(config, &self.config.networks, storage.clone()) {
+				match factory(config, &self.static_config.networks, storage.clone()) {
 					Ok(implementation) => {
 						// Validation already happened in the factory
 						settlement_impls.insert(name.clone(), implementation);
@@ -339,8 +356,7 @@ impl SolverBuilder {
 							"Failed to create settlement implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create settlement implementation '{}': {}",
-							name, e
+							"Failed to create settlement implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -353,12 +369,14 @@ impl SolverBuilder {
 
 		let settlement = Arc::new(SettlementService::new(
 			settlement_impls,
-			self.config.settlement.settlement_poll_interval_seconds,
+			self.static_config
+				.settlement
+				.settlement_poll_interval_seconds,
 		));
 
 		// Create pricing service
 		let pricing_config =
-			self.config.pricing.as_ref().ok_or_else(|| {
+			self.static_config.pricing.as_ref().ok_or_else(|| {
 				BuilderError::Config("Pricing configuration is required".to_string())
 			})?;
 
@@ -379,8 +397,7 @@ impl SolverBuilder {
 							"Failed to create pricing implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create pricing implementation '{}': {}",
-							name, e
+							"Failed to create pricing implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -391,11 +408,38 @@ impl SolverBuilder {
 		let primary_pricing = pricing_config.primary.as_str();
 		let pricing_impl = pricing_impls.remove(primary_pricing).ok_or_else(|| {
 			BuilderError::Config(format!(
-				"Primary pricing '{}' failed to load or has invalid configuration",
-				primary_pricing
+				"Primary pricing '{primary_pricing}' failed to load or has invalid configuration"
 			))
 		})?;
-		let pricing = Arc::new(PricingService::new(pricing_impl));
+
+		// Collect fallback implementations in order
+		let mut fallback_impls = Vec::new();
+		for fallback_name in &pricing_config.fallbacks {
+			if let Some(fallback_impl) = pricing_impls.remove(fallback_name) {
+				tracing::info!(
+					component = "pricing",
+					implementation = %fallback_name,
+					"Registered as fallback"
+				);
+				fallback_impls.push(fallback_impl);
+			} else {
+				tracing::warn!(
+					component = "pricing",
+					implementation = %fallback_name,
+					"Fallback pricing implementation not found or not configured"
+				);
+			}
+		}
+
+		if !fallback_impls.is_empty() {
+			tracing::info!(
+				component = "pricing",
+				primary = %primary_pricing,
+				fallback_count = %fallback_impls.len(),
+				"Pricing service initialized with fallbacks"
+			);
+		}
+		let pricing = Arc::new(PricingService::new(pricing_impl, fallback_impls));
 
 		// Build oracle routes from settlement implementations
 		let oracle_routes = settlement.build_oracle_routes();
@@ -406,9 +450,9 @@ impl SolverBuilder {
 
 		// Create order implementations (now with oracle routes)
 		let mut order_impls = HashMap::new();
-		for (name, config) in &self.config.order.implementations {
+		for (name, config) in &self.static_config.order.implementations {
 			if let Some(factory) = factories.order_factories.get(name) {
-				match factory(config, &self.config.networks, &oracle_routes) {
+				match factory(config, &self.static_config.networks, &oracle_routes) {
 					Ok(implementation) => {
 						// Validation already happened in the factory
 						order_impls.insert(name.clone(), implementation);
@@ -422,8 +466,7 @@ impl SolverBuilder {
 							"Failed to create order implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create order implementation '{}': {}",
-							name, e
+							"Failed to create order implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -436,12 +479,12 @@ impl SolverBuilder {
 
 		// Create strategy implementations
 		let mut strategy_impls = HashMap::new();
-		for (name, config) in &self.config.order.strategy.implementations {
+		for (name, config) in &self.static_config.order.strategy.implementations {
 			if let Some(factory) = factories.strategy_factories.get(name) {
 				match factory(config) {
 					Ok(implementation) => {
 						strategy_impls.insert(name.clone(), implementation);
-						let is_primary = &self.config.order.strategy.primary == name;
+						let is_primary = &self.static_config.order.strategy.primary == name;
 						tracing::info!(component = "strategy", implementation = %name, enabled = %is_primary, "Loaded");
 					},
 					Err(e) => {
@@ -452,8 +495,7 @@ impl SolverBuilder {
 							"Failed to create strategy implementation"
 						);
 						return Err(BuilderError::Config(format!(
-							"Failed to create strategy implementation '{}': {}",
-							name, e
+							"Failed to create strategy implementation '{name}': {e}"
 						)));
 					},
 				}
@@ -467,11 +509,10 @@ impl SolverBuilder {
 		}
 
 		// Use the primary strategy implementation
-		let primary_strategy = self.config.order.strategy.primary.as_str();
+		let primary_strategy = self.static_config.order.strategy.primary.as_str();
 		let strategy = strategy_impls.remove(primary_strategy).ok_or_else(|| {
 			BuilderError::Config(format!(
-				"Primary strategy '{}' failed to load or has invalid configuration",
-				primary_strategy
+				"Primary strategy '{primary_strategy}' failed to load or has invalid configuration"
 			))
 		})?;
 
@@ -479,7 +520,7 @@ impl SolverBuilder {
 
 		// Create and initialize the TokenManager
 		let token_manager = Arc::new(crate::engine::token_manager::TokenManager::new(
-			self.config.networks.clone(),
+			self.static_config.networks.clone(),
 			delivery.clone(),
 			account.clone(),
 		));
@@ -489,7 +530,7 @@ impl SolverBuilder {
 			Ok(()) => {
 				tracing::info!(
 					component = "token_manager",
-					networks = self.config.networks.len(),
+					networks = self.static_config.networks.len(),
 					"Token manager initialized with approvals"
 				);
 			},
@@ -500,8 +541,7 @@ impl SolverBuilder {
 					"Failed to ensure token approvals"
 				);
 				return Err(BuilderError::Config(format!(
-					"Failed to ensure token approvals: {}",
-					e
+					"Failed to ensure token approvals: {e}"
 				)));
 			},
 		}
@@ -533,7 +573,8 @@ impl SolverBuilder {
 		}
 
 		Ok(SolverEngine::new(
-			self.config,
+			self.dynamic_config,
+			self.static_config,
 			storage,
 			account,
 			solver_address,

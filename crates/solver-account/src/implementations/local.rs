@@ -3,7 +3,7 @@
 //! This module provides concrete implementations of the AccountInterface trait,
 //! currently supporting local private key wallets using the Alloy library.
 
-use crate::{AccountError, AccountInterface};
+use crate::{AccountError, AccountFactoryFuture, AccountInterface, AccountSigner};
 use alloy_consensus::TxLegacy;
 use alloy_network::TxSigner;
 use alloy_primitives::{Address as AlloyAddress, Bytes, TxKind};
@@ -34,7 +34,7 @@ impl LocalWallet {
 		// Parse the private key using Alloy's signer
 		let signer = private_key_hex
 			.parse::<PrivateKeySigner>()
-			.map_err(|e| AccountError::InvalidKey(format!("Invalid private key: {}", e)))?;
+			.map_err(|e| AccountError::InvalidKey(format!("Invalid private key: {e}")))?;
 
 		Ok(Self { signer })
 	}
@@ -130,25 +130,29 @@ impl AccountInterface for LocalWallet {
 			.signer
 			.sign_transaction(&mut legacy_tx)
 			.await
-			.map_err(|e| {
-				AccountError::SigningFailed(format!("Failed to sign transaction: {}", e))
-			})?;
+			.map_err(|e| AccountError::SigningFailed(format!("Failed to sign transaction: {e}")))?;
 
 		Ok(signature.into())
 	}
 
 	async fn sign_message(&self, message: &[u8]) -> Result<Signature, AccountError> {
 		// Use Alloy's signer to sign the message (handles EIP-191 internally)
-		let signature =
-			self.signer.sign_message(message).await.map_err(|e| {
-				AccountError::SigningFailed(format!("Failed to sign message: {}", e))
-			})?;
+		let signature = self
+			.signer
+			.sign_message(message)
+			.await
+			.map_err(|e| AccountError::SigningFailed(format!("Failed to sign message: {e}")))?;
 
 		Ok(signature.into())
 	}
 
+	fn signer(&self) -> AccountSigner {
+		AccountSigner::Local(self.signer.clone())
+	}
+
 	fn get_private_key(&self) -> SecretString {
-		self.get_private_key()
+		// Explicit call to inherent method to avoid ambiguity
+		LocalWallet::get_private_key(self)
 	}
 }
 
@@ -158,22 +162,26 @@ impl AccountInterface for LocalWallet {
 /// AccountInterface implementation. Currently only supports local wallets
 /// with a private_key configuration parameter.
 ///
+/// Returns an async future that resolves to the account implementation.
+///
 /// # Errors
 ///
 /// Returns an error if:
 /// - `private_key` is not provided in the configuration
 /// - The wallet creation fails
-pub fn create_account(config: &toml::Value) -> Result<Box<dyn AccountInterface>, AccountError> {
-	// Validate configuration first
-	LocalWalletSchema::validate_config(config)
-		.map_err(|e| AccountError::InvalidKey(format!("Invalid configuration: {}", e)))?;
+pub fn create_account(config: &toml::Value) -> AccountFactoryFuture<'_> {
+	Box::pin(async move {
+		// Validate configuration first
+		LocalWalletSchema::validate_config(config)
+			.map_err(|e| AccountError::InvalidKey(format!("Invalid configuration: {e}")))?;
 
-	let private_key = config
-		.get("private_key")
-		.and_then(|v| v.as_str())
-		.expect("private_key already validated");
+		let private_key = config
+			.get("private_key")
+			.and_then(|v| v.as_str())
+			.ok_or_else(|| AccountError::InvalidKey("private_key required".into()))?;
 
-	Ok(Box::new(LocalWallet::new(private_key)?))
+		Ok(Box::new(LocalWallet::new(private_key)?) as Box<dyn AccountInterface>)
+	})
 }
 
 /// Registry for the local account implementation.
@@ -329,24 +337,24 @@ mod tests {
 		assert!(!signature.0.is_empty());
 	}
 
-	#[test]
-	fn test_create_account_valid_config() {
+	#[tokio::test]
+	async fn test_create_account_valid_config() {
 		let config = create_test_config(TEST_PRIVATE_KEY);
-		let account = create_account(&config).unwrap();
+		let account = create_account(&config).await.unwrap();
 		assert!(!account.get_private_key().with_exposed(|s| s.is_empty()));
 	}
 
-	#[test]
-	fn test_create_account_invalid_config() {
+	#[tokio::test]
+	async fn test_create_account_invalid_config() {
 		let config = create_test_config(INVALID_PRIVATE_KEY);
-		let result = create_account(&config);
+		let result = create_account(&config).await;
 		assert!(result.is_err());
 	}
 
-	#[test]
-	fn test_create_account_missing_private_key() {
+	#[tokio::test]
+	async fn test_create_account_missing_private_key() {
 		let config = toml::Value::Table(HashMap::new().into_iter().collect());
-		let result = create_account(&config);
+		let result = create_account(&config).await;
 		assert!(result.is_err());
 	}
 
@@ -355,11 +363,11 @@ mod tests {
 		assert_eq!(Registry::NAME, "local");
 	}
 
-	#[test]
-	fn test_registry_factory() {
+	#[tokio::test]
+	async fn test_registry_factory() {
 		let factory = Registry::factory();
 		let config = create_test_config(TEST_PRIVATE_KEY);
-		let account = factory(&config).unwrap();
+		let account = factory(&config).await.unwrap();
 		assert!(!account.get_private_key().with_exposed(|s| s.is_empty()));
 	}
 
@@ -369,5 +377,35 @@ mod tests {
 		let schema = wallet.config_schema();
 		let config = create_test_config(TEST_PRIVATE_KEY);
 		assert!(schema.validate(&config).is_ok());
+	}
+
+	#[test]
+	fn test_account_interface_signer() {
+		let wallet = LocalWallet::new(TEST_PRIVATE_KEY).unwrap();
+		let signer = wallet.signer();
+
+		// Verify the signer is a Local variant and has the correct address
+		match signer {
+			crate::AccountSigner::Local(s) => {
+				// Verify address matches
+				let expected_address = alloy_signer::Signer::address(&wallet.signer);
+				let actual_address = alloy_signer::Signer::address(&s);
+				assert_eq!(expected_address, actual_address);
+			},
+			#[cfg(feature = "kms")]
+			_ => panic!("Expected Local signer"),
+		}
+	}
+
+	#[test]
+	fn test_account_interface_get_private_key_trait() {
+		use crate::AccountInterface;
+		let wallet = LocalWallet::new(TEST_PRIVATE_KEY).unwrap();
+		// Call through the trait to test the trait impl
+		let key = AccountInterface::get_private_key(&wallet);
+		key.with_exposed(|s| {
+			assert!(s.starts_with("0x"));
+			assert_eq!(s.len(), 66);
+		});
 	}
 }

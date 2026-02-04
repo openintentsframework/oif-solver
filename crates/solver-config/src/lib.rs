@@ -87,6 +87,10 @@ pub struct SolverConfig {
 	pub id: String,
 	/// Minimum profitability percentage required to execute orders.
 	pub min_profitability_pct: Decimal,
+	/// Gas buffer in basis points (e.g., 1000 = 10%).
+	/// Applied as safety margin on gas cost estimates.
+	#[serde(default = "default_gas_buffer_bps")]
+	pub gas_buffer_bps: u32,
 	/// Timeout in seconds for monitoring transactions.
 	/// Defaults to 28800 seconds (8 hours) if not specified.
 	#[serde(default = "default_monitoring_timeout_seconds")]
@@ -129,6 +133,11 @@ fn default_monitoring_timeout_seconds() -> u64 {
 	28800 // Default to 8 hours (480 minutes * 60 seconds)
 }
 
+/// Returns the default value for boolean flags (true).
+fn default_true() -> bool {
+	true
+}
+
 /// Configuration for account management.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AccountConfig {
@@ -154,6 +163,14 @@ pub struct OrderConfig {
 	pub implementations: HashMap<String, toml::Value>,
 	/// Strategy configuration for order execution.
 	pub strategy: StrategyConfig,
+	/// Whitelisted callback contract addresses in EIP-7930 InteropAddress format.
+	/// Format: EIP-7930 hex string e.g. "0x0001000002210514154c8bb598df835e9617c2cdcb8c84838bd329c6"
+	/// The format encodes: Version (2 bytes) | ChainType (2 bytes) | ChainRefLen (1 byte) | ChainRef | AddrLen (1 byte) | Address
+	#[serde(default)]
+	pub callback_whitelist: Vec<String>,
+	/// Enable gas simulation for callbacks before filling.
+	#[serde(default = "default_true")]
+	pub simulate_callbacks: bool,
 }
 
 /// Configuration for execution strategies.
@@ -263,8 +280,15 @@ pub struct GasFlowUnits {
 pub struct PricingConfig {
 	/// Which implementation to use as primary.
 	pub primary: String,
+	/// Fallback implementations to try if primary fails (in order).
+	#[serde(default)]
+	pub fallbacks: Vec<String>,
 	/// Map of pricing implementation names to their configurations.
 	pub implementations: HashMap<String, toml::Value>,
+}
+
+fn default_gas_buffer_bps() -> u32 {
+	1000 // 10%
 }
 
 /// Gas configuration mapping flow identifiers to gas unit overrides.
@@ -376,7 +400,7 @@ pub(crate) fn resolve_env_vars(input: &str) -> Result<String, ConfigError> {
 	}
 
 	let re = Regex::new(r"\$\{([A-Z_][A-Z0-9_]{0,127})(?::-([^}]{0,256}))?\}")
-		.map_err(|e| ConfigError::Parse(format!("Regex error: {}", e)))?;
+		.map_err(|e| ConfigError::Parse(format!("Regex error: {e}")))?;
 
 	let mut result = input.to_string();
 	let mut replacements = Vec::new();
@@ -393,8 +417,7 @@ pub(crate) fn resolve_env_vars(input: &str) -> Result<String, ConfigError> {
 					default.to_string()
 				} else {
 					return Err(ConfigError::Validation(format!(
-						"Environment variable '{}' not found",
-						var_name
+						"Environment variable '{var_name}' not found"
 					)));
 				}
 			},
@@ -429,7 +452,7 @@ impl Config {
 
 		let file_name = path_buf
 			.file_name()
-			.ok_or_else(|| ConfigError::Validation(format!("Invalid path: {}", path)))?;
+			.ok_or_else(|| ConfigError::Validation(format!("Invalid path: {path}")))?;
 		loader.load_config(file_name).await
 	}
 
@@ -464,20 +487,17 @@ impl Config {
 		for (chain_id, network) in &self.networks {
 			if network.input_settler_address.0.is_empty() {
 				return Err(ConfigError::Validation(format!(
-					"Network {} must have input_settler_address",
-					chain_id
+					"Network {chain_id} must have input_settler_address"
 				)));
 			}
 			if network.output_settler_address.0.is_empty() {
 				return Err(ConfigError::Validation(format!(
-					"Network {} must have output_settler_address",
-					chain_id
+					"Network {chain_id} must have output_settler_address"
 				)));
 			}
 			if network.tokens.is_empty() {
 				return Err(ConfigError::Validation(format!(
-					"Network {} must have at least 1 token configured",
-					chain_id
+					"Network {chain_id} must have at least 1 token configured"
 				)));
 			}
 		}
@@ -599,8 +619,7 @@ impl Config {
 				if let Some(ref discovery) = api.implementations.discovery {
 					if !self.discovery.implementations.contains_key(discovery) {
 						return Err(ConfigError::Validation(format!(
-							"API discovery implementation '{}' not found in discovery.implementations",
-							discovery
+							"API discovery implementation '{discovery}' not found in discovery.implementations"
 						)));
 					}
 				}
@@ -636,8 +655,7 @@ impl Config {
 				.and_then(|v| v.as_str())
 				.ok_or_else(|| {
 					ConfigError::Validation(format!(
-						"Settlement implementation '{}' missing 'order' field",
-						impl_name
+						"Settlement implementation '{impl_name}' missing 'order' field"
 					))
 				})?;
 
@@ -647,8 +665,7 @@ impl Config {
 				.and_then(|v| v.as_array())
 				.ok_or_else(|| {
 					ConfigError::Validation(format!(
-						"Settlement implementation '{}' missing 'network_ids' field",
-						impl_name
+						"Settlement implementation '{impl_name}' missing 'network_ids' field"
 					))
 				})?;
 
@@ -656,8 +673,7 @@ impl Config {
 			for network_value in network_ids {
 				let network_id = network_value.as_integer().ok_or_else(|| {
 					ConfigError::Validation(format!(
-						"Invalid network_id in settlement '{}'",
-						impl_name
+						"Invalid network_id in settlement '{impl_name}'"
 					))
 				})? as u64;
 
@@ -665,16 +681,14 @@ impl Config {
 
 				if let Some(existing) = coverage.insert(key.clone(), impl_name.clone()) {
 					return Err(ConfigError::Validation(format!(
-						"Duplicate settlement coverage for order '{}' on network {}: '{}' and '{}'",
-						order_standard, network_id, existing, impl_name
+						"Duplicate settlement coverage for order '{order_standard}' on network {network_id}: '{existing}' and '{impl_name}'"
 					)));
 				}
 
 				// Validate network exists in networks config
 				if !self.networks.contains_key(&network_id) {
 					return Err(ConfigError::Validation(format!(
-						"Settlement '{}' references network {} which doesn't exist in networks config",
-						impl_name, network_id
+						"Settlement '{impl_name}' references network {network_id} which doesn't exist in networks config"
 					)));
 				}
 			}
@@ -688,8 +702,7 @@ impl Config {
 
 			if !has_coverage {
 				return Err(ConfigError::Validation(format!(
-					"Order standard '{}' has no settlement implementations",
-					order_standard
+					"Order standard '{order_standard}' has no settlement implementations"
 				)));
 			}
 		}
@@ -897,8 +910,7 @@ network_ids = [2, 3]  # Network 2 overlaps with impl1
 			error_msg.contains("network 2")
 				&& error_msg.contains("impl1")
 				&& error_msg.contains("impl2"),
-			"Expected duplicate coverage error for network 2, got: {}",
-			err
+			"Expected duplicate coverage error for network 2, got: {err}"
 		);
 	}
 

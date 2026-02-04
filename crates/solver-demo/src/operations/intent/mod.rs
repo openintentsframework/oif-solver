@@ -75,7 +75,9 @@ impl IntentOps {
 		let to_token_addr = self.get_token_address(params.to_chain, &params.to_token)?;
 		let asset_output = self.create_interop_address(to_token_addr, params.to_chain)?;
 
-		let receiver = self.create_interop_address(recipient_addr, params.to_chain)?;
+		// Use callback_recipient if provided, otherwise use regular recipient
+		let output_recipient_addr = params.callback_recipient.unwrap_or(recipient_addr);
+		let receiver = self.create_interop_address(output_recipient_addr, params.to_chain)?;
 
 		let (origin_submission, lock) = match params.settlement {
 			SettlementType::Escrow => {
@@ -121,7 +123,7 @@ impl IntentOps {
 				receiver,
 				asset: asset_output,
 				amount: Some(params.amount.to_string()), // Use the specified amount as output
-				calldata: None,
+				calldata: params.callback_data.clone(),
 			};
 
 			(input, output)
@@ -138,7 +140,7 @@ impl IntentOps {
 				receiver,
 				asset: asset_output,
 				amount: params.min_amount.map(|a| a.to_string()), // Optional minimum output amount
-				calldata: None,
+				calldata: params.callback_data.clone(),
 			};
 
 			(input, output)
@@ -298,6 +300,8 @@ impl IntentOps {
 			exact_output,
 			settlement: settlement_type,
 			auth: auth_type,
+			callback_data: None,
+			callback_recipient: None,
 		})
 	}
 
@@ -337,8 +341,7 @@ impl IntentOps {
 
 		let standard_order = StandardOrder::try_from(&order.order).map_err(|e| {
 			crate::types::error::Error::InvalidConfig(format!(
-				"Failed to convert order to StandardOrder: {}",
-				e
+				"Failed to convert order to StandardOrder: {e}"
 			))
 		})?;
 
@@ -350,15 +353,14 @@ impl IntentOps {
 
 		logging::verbose_operation(
 			"Preparing on-chain submission",
-			&format!("chain {}", chain_id),
+			&format!("chain {chain_id}"),
 		);
 
 		// Get the input settler address for this chain
 		let input_settler_address = {
 			let contracts = self.ctx.contracts.read().map_err(|e| {
 				crate::types::error::Error::StorageError(format!(
-					"Failed to acquire contracts lock: {}",
-					e
+					"Failed to acquire contracts lock: {e}"
 				))
 			})?;
 			let addresses = contracts.addresses(chain).ok_or_else(|| {
@@ -402,8 +404,7 @@ impl IntentOps {
 				let open_data = {
 					let contracts = self.ctx.contracts.read().map_err(|e| {
 						crate::types::error::Error::StorageError(format!(
-							"Failed to acquire contracts lock: {}",
-							e
+							"Failed to acquire contracts lock: {e}"
 						))
 					})?;
 					contracts.input_settler_open(&standard_order)?
@@ -426,7 +427,7 @@ impl IntentOps {
 				logging::verbose_operation("Sending open transaction", "to input settler");
 				let tx_hash = tx_builder.send(open_request).await?;
 
-				logging::verbose_tech("Open transaction sent", &format!("{:?}", tx_hash));
+				logging::verbose_tech("Open transaction sent", &format!("{tx_hash:?}"));
 
 				// Wait for confirmation
 				let receipt = tx_builder.wait(tx_hash).await?;
@@ -447,7 +448,7 @@ impl IntentOps {
 				);
 
 				Ok(OnchainSubmissionResult {
-					tx_hash: format!("{:?}", tx_hash),
+					tx_hash: format!("{tx_hash:?}"),
 					order_id: None, // TODO: extract this from logs
 				})
 			},
@@ -482,7 +483,7 @@ impl IntentOps {
 				use crate::core::logging;
 				logging::verbose_operation(
 					"Preparing compact deposit",
-					&format!("chain {}, amount {}", chain_id, amount),
+					&format!("chain {chain_id}, amount {amount}"),
 				);
 
 				// Generate allocator lock tag from allocator address
@@ -586,7 +587,7 @@ impl IntentOps {
 		use crate::types::hex::Hex;
 		let token_address = Hex::to_address(token_str)?;
 		let amount = U256::from_str(amount_str).map_err(|e| {
-			crate::types::error::Error::InvalidAmount(format!("Failed to parse amount: {}", e))
+			crate::types::error::Error::InvalidAmount(format!("Failed to parse amount: {e}"))
 		})?;
 
 		Ok((token_address, amount))
@@ -614,8 +615,7 @@ impl IntentOps {
 		// Get allocator address for this chain
 		let contracts = self.ctx.contracts.read().map_err(|e| {
 			crate::types::error::Error::StorageError(format!(
-				"Failed to acquire contracts lock: {}",
-				e
+				"Failed to acquire contracts lock: {e}"
 			))
 		})?;
 
@@ -672,8 +672,7 @@ impl IntentOps {
 		let (compact_address, approve_data, deposit_data) = {
 			let contracts = self.ctx.contracts.read().map_err(|e| {
 				crate::types::error::Error::StorageError(format!(
-					"Failed to acquire contracts lock: {}",
-					e
+					"Failed to acquire contracts lock: {e}"
 				))
 			})?;
 			let addresses = contracts.addresses(chain).ok_or_else(|| {
@@ -721,16 +720,13 @@ impl IntentOps {
 		let tx_builder = TxBuilder::new(provider).with_signer(signer);
 
 		// Step 1: Approve TheCompact to spend tokens
-		logging::verbose_operation(
-			"Sending approval transaction",
-			&format!("amount: {}", amount),
-		);
+		logging::verbose_operation("Sending approval transaction", &format!("amount: {amount}"));
 		let approve_request = TransactionRequest::default()
 			.to(token)
 			.input(approve_data.into());
 
 		let approve_hash = tx_builder.send(approve_request).await?;
-		logging::verbose_tech("Approval transaction sent", &format!("{:?}", approve_hash));
+		logging::verbose_tech("Approval transaction sent", &format!("{approve_hash:?}"));
 
 		// Wait for approval to be mined before sending deposit
 		logging::verbose_operation("Waiting for confirmation", "approval transaction");
@@ -745,7 +741,7 @@ impl IntentOps {
 		logging::verbose_operation("Sending deposit transaction", "to TheCompact");
 		let deposit_hash = tx_builder.send(deposit_request).await?;
 
-		logging::verbose_tech("Deposit transaction sent", &format!("{:?}", deposit_hash));
+		logging::verbose_tech("Deposit transaction sent", &format!("{deposit_hash:?}"));
 
 		// Wait for confirmation
 		let receipt = tx_builder.wait(deposit_hash).await?;
@@ -880,7 +876,7 @@ impl IntentOps {
 				.approve(
 					chain,
 					&token_symbol,
-					&format!("{:?}", input_settler_address),
+					&format!("{input_settler_address:?}"),
 					Some(amount),
 				)
 				.await
@@ -958,8 +954,7 @@ impl FromStr for SettlementType {
 			"escrow" => Ok(Self::Escrow),
 			"compact" => Ok(Self::Compact),
 			_ => Err(crate::types::error::Error::InvalidConfig(format!(
-				"Invalid settlement type: {}. Use 'escrow' or 'compact'",
-				s
+				"Invalid settlement type: {s}. Use 'escrow' or 'compact'"
 			))),
 		}
 	}
@@ -981,8 +976,7 @@ impl FromStr for AuthType {
 			"permit2" => Ok(Self::Permit2),
 			"eip3009" => Ok(Self::Eip3009),
 			_ => Err(crate::types::error::Error::InvalidConfig(format!(
-				"Invalid auth type: {}. Use 'permit2' or 'eip3009'",
-				s
+				"Invalid auth type: {s}. Use 'permit2' or 'eip3009'"
 			))),
 		}
 	}
@@ -1002,6 +996,8 @@ pub struct IntentParams {
 	pub exact_output: bool,
 	pub settlement: SettlementType,
 	pub auth: Option<AuthType>,
+	pub callback_data: Option<String>,
+	pub callback_recipient: Option<Address>,
 }
 
 /// Order status information

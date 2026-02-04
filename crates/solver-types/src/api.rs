@@ -340,19 +340,19 @@ pub mod oif_versions {
 
 	// Order type constructors
 	pub fn escrow_order_type(version: &str) -> String {
-		format!("oif-escrow-{}", version)
+		format!("oif-escrow-{version}")
 	}
 
 	pub fn resource_lock_order_type(version: &str) -> String {
-		format!("oif-resource-lock-{}", version)
+		format!("oif-resource-lock-{version}")
 	}
 
 	pub fn eip3009_order_type(version: &str) -> String {
-		format!("oif-3009-{}", version)
+		format!("oif-3009-{version}")
 	}
 
 	pub fn generic_order_type(version: &str) -> String {
-		format!("oif-generic-{}", version)
+		format!("oif-generic-{version}")
 	}
 }
 
@@ -504,7 +504,7 @@ impl OifOrder {
 				let digest = match self {
 					OifOrder::OifEscrowV0 { payload } => {
 						crate::utils::eip712::reconstruct_permit2_digest(payload)
-							.map_err(|e| format!("Failed to reconstruct Permit2 digest: {}", e))?
+							.map_err(|e| format!("Failed to reconstruct Permit2 digest: {e}"))?
 					},
 					OifOrder::Oif3009V0 { payload, metadata } => {
 						// Extract domain_separator from metadata if available
@@ -514,7 +514,7 @@ impl OifOrder {
 							.and_then(|s| parse_bytes32_from_hex(s).ok());
 
 						crate::utils::eip712::reconstruct_eip3009_digest(payload, domain_separator)
-							.map_err(|e| format!("Failed to reconstruct EIP-3009 digest: {}", e))?
+							.map_err(|e| format!("Failed to reconstruct EIP-3009 digest: {e}"))?
 					},
 					_ => unreachable!(),
 				};
@@ -522,7 +522,7 @@ impl OifOrder {
 				// Recover user address from signature
 				let recovered =
 					crate::utils::eip712::ecrecover_user_from_signature(&digest, &signature_str)
-						.map_err(|e| format!("Failed to recover user from signature: {}", e))?;
+						.map_err(|e| format!("Failed to recover user from signature: {e}"))?;
 
 				// Convert AlloyAddress to our Address type (AlloyAddress implements AsRef<[u8]>)
 				Ok(recovered.into())
@@ -897,7 +897,7 @@ impl TryFrom<&QuoteInput> for OrderInput {
 	fn try_from(quote_input: &QuoteInput) -> Result<Self, Self::Error> {
 		let amount_u256 = if let Some(amount) = quote_input.amount.as_ref() {
 			U256::from_str(amount).map_err(|e| {
-				QuoteError::InvalidRequest(format!("Failed to parse amount '{}': {}", amount, e))
+				QuoteError::InvalidRequest(format!("Failed to parse amount '{amount}': {e}"))
 			})?
 		} else {
 			U256::ZERO
@@ -918,7 +918,7 @@ impl TryFrom<&QuoteOutput> for OrderOutput {
 	fn try_from(quote_output: &QuoteOutput) -> Result<Self, Self::Error> {
 		let amount_u256 = if let Some(amount) = quote_output.amount.as_ref() {
 			U256::from_str(amount).map_err(|e| {
-				QuoteError::InvalidRequest(format!("Failed to parse amount '{}': {}", amount, e))
+				QuoteError::InvalidRequest(format!("Failed to parse amount '{amount}': {e}"))
 			})?
 		} else {
 			U256::ZERO
@@ -1103,7 +1103,7 @@ impl TryFrom<(&Quote, &str, &str)> for PostOrderRequest {
 	fn try_from((quote, signature, standard): (&Quote, &str, &str)) -> Result<Self, Self::Error> {
 		match standard {
 			"eip7683" => Self::from_eip7683_quote(quote, signature),
-			_ => Err(format!("Unsupported standard: {}", standard).into()),
+			_ => Err(format!("Unsupported standard: {standard}").into()),
 		}
 	}
 }
@@ -1257,15 +1257,15 @@ impl APIError {
 impl fmt::Display for APIError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
-			APIError::BadRequest { message, .. } => write!(f, "Bad Request: {}", message),
+			APIError::BadRequest { message, .. } => write!(f, "Bad Request: {message}"),
 			APIError::UnprocessableEntity { message, .. } => {
-				write!(f, "Unprocessable Entity: {}", message)
+				write!(f, "Unprocessable Entity: {message}")
 			},
 			APIError::ServiceUnavailable { message, .. } => {
-				write!(f, "Service Unavailable: {}", message)
+				write!(f, "Service Unavailable: {message}")
 			},
 			APIError::InternalServerError { message, .. } => {
-				write!(f, "Internal Server Error: {}", message)
+				write!(f, "Internal Server Error: {message}")
 			},
 		}
 	}
@@ -1352,7 +1352,7 @@ impl From<QuoteError> for APIError {
 			},
 			QuoteError::UnsupportedAsset(asset) => APIError::UnprocessableEntity {
 				error_type: ApiErrorType::UnsupportedAsset,
-				message: format!("Asset not supported by solver: {}", asset),
+				message: format!("Asset not supported by solver: {asset}"),
 				details: Some(serde_json::json!({ "asset": asset })),
 			},
 			QuoteError::UnsupportedSettlement(msg) => APIError::UnprocessableEntity {
@@ -1372,11 +1372,11 @@ impl From<QuoteError> for APIError {
 			},
 			QuoteError::Internal(msg) => APIError::InternalServerError {
 				error_type: ApiErrorType::InternalError,
-				message: format!("An internal error occurred: {}", msg),
+				message: format!("An internal error occurred: {msg}"),
 			},
 			QuoteError::UnsupportedIntentType(msg) => APIError::BadRequest {
 				error_type: ApiErrorType::InvalidRequest,
-				message: format!("Unsupported intent type: {}", msg),
+				message: format!("Unsupported intent type: {msg}"),
 				details: None,
 			},
 			QuoteError::NoMatchingOrderType(msg) => APIError::UnprocessableEntity {
@@ -1401,7 +1401,7 @@ impl From<QuoteError> for APIError {
 			},
 			QuoteError::InvalidEip7930Address(msg) => APIError::BadRequest {
 				error_type: ApiErrorType::InvalidRequest,
-				message: format!("Invalid address format: {}", msg),
+				message: format!("Invalid address format: {msg}"),
 				details: None,
 			},
 			QuoteError::SwapTypeValidation(msg) => APIError::BadRequest {
@@ -1430,17 +1430,17 @@ impl From<GetOrderError> for APIError {
 		match order_error {
 			GetOrderError::NotFound(id) => APIError::BadRequest {
 				error_type: ApiErrorType::OrderNotFound,
-				message: format!("Order not found: {}", id),
+				message: format!("Order not found: {id}"),
 				details: Some(serde_json::json!({ "order_id": id })),
 			},
 			GetOrderError::InvalidId(id) => APIError::BadRequest {
 				error_type: ApiErrorType::InvalidOrderId,
-				message: format!("Invalid order ID format: {}", id),
+				message: format!("Invalid order ID format: {id}"),
 				details: Some(serde_json::json!({ "provided_id": id })),
 			},
 			GetOrderError::Internal(msg) => APIError::InternalServerError {
 				error_type: ApiErrorType::InternalError,
-				message: format!("An internal error occurred: {}", msg),
+				message: format!("An internal error occurred: {msg}"),
 			},
 		}
 	}
@@ -1469,11 +1469,7 @@ impl Quote {
 				// Use the EIP-7683 implementation of QuoteParsable
 				Ok(crate::Eip7683OrderData::quote_to_order_for_estimation(self))
 			},
-			_ => Err(format!(
-				"Unsupported order standard for quote conversion: {}",
-				standard
-			)
-			.into()),
+			_ => Err(format!("Unsupported order standard for quote conversion: {standard}").into()),
 		}
 	}
 }
@@ -2049,12 +2045,12 @@ mod tests {
 			asset: interop_address,
 			amount: U256::from(100),
 		};
-		let debug_str = format!("{:?}", asset_amount);
+		let debug_str = format!("{asset_amount:?}");
 		assert!(debug_str.contains("AssetAmount"));
 		assert!(debug_str.contains("InteropAddress"));
 
 		let lock_kind = LockKind::TheCompact;
-		let debug_str = format!("{:?}", lock_kind);
+		let debug_str = format!("{lock_kind:?}");
 		assert!(debug_str.contains("TheCompact"));
 
 		let api_error = APIError::BadRequest {
@@ -2062,7 +2058,7 @@ mod tests {
 			message: "Test message".to_string(),
 			details: None,
 		};
-		let debug_str = format!("{:?}", api_error);
+		let debug_str = format!("{api_error:?}");
 		assert!(debug_str.contains("BadRequest"));
 	}
 

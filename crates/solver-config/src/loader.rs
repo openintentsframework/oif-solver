@@ -92,9 +92,8 @@ impl ConfigLoader {
 			.await?;
 
 		// Convert to Config and validate
-		let config_str = toml::to_string(&combined_toml).map_err(|e| {
-			ConfigError::Parse(format!("Failed to serialize combined config: {}", e))
-		})?;
+		let config_str = toml::to_string(&combined_toml)
+			.map_err(|e| ConfigError::Parse(format!("Failed to serialize combined config: {e}")))?;
 		let config: Config = config_str.parse()?;
 
 		Ok(config)
