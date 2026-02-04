@@ -7,6 +7,9 @@
 //! This module is only available when the `kms` feature is enabled.
 
 use crate::{AccountError, AccountFactoryFuture, AccountInterface, AccountSigner};
+use alloy_consensus::TxLegacy;
+use alloy_network::TxSigner;
+use alloy_primitives::{Address as AlloyAddress, Bytes, TxKind};
 use alloy_signer_aws::AwsSigner;
 use async_trait::async_trait;
 use aws_sdk_kms::Client as KmsClient;
@@ -99,12 +102,39 @@ impl AccountInterface for KmsWallet {
 		Ok(Address(addr.as_slice().to_vec()))
 	}
 
-	async fn sign_transaction(&self, _tx: &Transaction) -> Result<Signature, AccountError> {
-		// Transaction signing is handled by EthereumWallet using signer()
-		// in the delivery layer, not through AccountInterface directly
-		Err(AccountError::Implementation(
-			"Use signer() with EthereumWallet for transaction signing".into(),
-		))
+	async fn sign_transaction(&self, tx: &Transaction) -> Result<Signature, AccountError> {
+		let to = if let Some(to_addr) = &tx.to {
+			if to_addr.0.len() != 20 {
+				return Err(AccountError::SigningFailed(
+					"Invalid address length".to_string(),
+				));
+			}
+			let mut addr_bytes = [0u8; 20];
+			addr_bytes.copy_from_slice(&to_addr.0);
+			TxKind::Call(AlloyAddress::from(addr_bytes))
+		} else {
+			TxKind::Create
+		};
+
+		let value = tx.value;
+
+		let mut legacy_tx = TxLegacy {
+			chain_id: Some(tx.chain_id),
+			nonce: tx.nonce.unwrap_or(0),
+			gas_price: tx.gas_price.unwrap_or(0),
+			gas_limit: tx.gas_limit.unwrap_or(0),
+			to,
+			value,
+			input: Bytes::from(tx.data.clone()),
+		};
+
+		let signature = self
+			.signer
+			.sign_transaction(&mut legacy_tx)
+			.await
+			.map_err(|e| AccountError::SigningFailed(format!("Failed to sign transaction: {e}")))?;
+
+		Ok(signature.into())
 	}
 
 	async fn sign_message(&self, message: &[u8]) -> Result<Signature, AccountError> {
@@ -150,7 +180,6 @@ pub fn create_account(config: &toml::Value) -> AccountFactoryFuture<'_> {
 			.and_then(|v| v.as_str())
 			.map(String::from);
 
-		// Direct async call - no more block_on!
 		let wallet = KmsWallet::new(key_id, region, endpoint).await?;
 
 		Ok(Box::new(wallet) as Box<dyn AccountInterface>)
