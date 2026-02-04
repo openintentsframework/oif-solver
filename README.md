@@ -241,7 +241,11 @@ The solver can be run in a Docker container for production deployments.
 ### Building the Image
 
 ```bash
+# Standard build (local wallet only)
 docker build -t oif-solver .
+
+# Build with KMS support (requires AWS credentials at runtime)
+docker build --build-arg FEATURES=kms -t oif-solver .
 ```
 
 ### Running the Container
@@ -250,41 +254,56 @@ docker build -t oif-solver .
 # Create a docker-compatible env file (removes 'export' prefixes if present)
 sed 's/^export //' .env > .env.docker
 
-# Run the solver
+# First run: Seed configuration to Redis
 docker run -it --rm \
   -p 3000:3000 \
   --env-file .env.docker \
   -v $(pwd)/config:/app/config:ro \
-  -v $(pwd)/data:/app/data \
-  oif-solver --config /app/config/testnet.toml
+  oif-solver --seed testnet --seed-overrides /app/config/seed-overrides-testnet.json
+
+# Subsequent runs: Load from Redis (set SOLVER_ID in .env.docker)
+docker run -it --rm \
+  -p 3000:3000 \
+  --env-file .env.docker \
+  oif-solver
+
+# Force re-seed (overwrite existing configuration)
+docker run -it --rm \
+  -p 3000:3000 \
+  --env-file .env.docker \
+  -v $(pwd)/config:/app/config:ro \
+  oif-solver --seed testnet --seed-overrides /app/config/seed-overrides-testnet.json --force-seed
 ```
 
-### Required Configuration
+### Docker Networking
 
-For Docker deployments, ensure your API config binds to `0.0.0.0` instead of `127.0.0.1`:
+The solver binds to `0.0.0.0:3000` by default, which works for Docker deployments.
 
-```toml
-# config/testnet/api.toml
-[api]
-host = "0.0.0.0"  # Required for Docker - allows external connections
-port = 3000
-```
+For Redis connectivity from within Docker:
+- **Docker Compose:** Use service name (e.g., `redis://redis:6379`)
+- **Host machine Redis:** Use `redis://host.docker.internal:6379` (Mac/Windows)
+- **External Redis:** Use full URL (e.g., `redis://your-redis-host:6379`)
 
 ### Environment Variables
 
-The container expects environment variables for sensitive configuration:
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `REDIS_URL` | Yes | Redis connection URL (e.g., `redis://redis:6379`) |
+| `SOLVER_ID` | For loading | Solver ID to load config from Redis (after first seed) |
+| `RUST_LOG` | No | Log level (default: `info`) |
+| `SOLVER_PRIVATE_KEY` | Conditional | Required for local wallet if no inline `private_key` in seed overrides |
+| `AWS_ACCESS_KEY_ID` | For KMS | AWS access key (if using KMS signer) |
+| `AWS_SECRET_ACCESS_KEY` | For KMS | AWS secret key (if using KMS signer) |
+| `AWS_REGION` | For KMS | AWS region (if using KMS signer, default: from config) |
 
-| Variable | Description |
-|----------|-------------|
-| `SOLVER_PRIVATE_KEY` | Private key for the solver account |
-| `RUST_LOG` | Log level (default: `info`) |
+**Note:** `SOLVER_PRIVATE_KEY` is required when using the local wallet without an inline `private_key` in seed overrides. Not needed if using KMS or providing `private_key` directly in the JSON.
 
 ### Volume Mounts
 
 | Mount | Purpose |
 |-------|---------|
-| `/app/config` | Configuration files (read-only recommended) |
-| `/app/data` | Persistent storage for solver state |
+| `/app/config` | Seed overrides JSON file (read-only, only needed for seeding) |
+
 See [docs/config-storage.md](docs/config-storage.md) for detailed documentation.
 
 ## Configuration
@@ -312,10 +331,10 @@ cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `REDIS_URL` | Yes | Redis connection URL (default: `redis://localhost:6379`) |
-| `SOLVER_PRIVATE_KEY` | Yes* | 64-character hex private key (without 0x prefix) |
+| `SOLVER_PRIVATE_KEY` | Conditional | 64-character hex private key (without 0x prefix) |
 | `SOLVER_ID` | For loading | Solver ID to load from Redis (set after first seed) |
 
-\* Not required when using AWS KMS for signing (see [AWS KMS Signing](#aws-kms-signing) below).
+`SOLVER_PRIVATE_KEY` is only required when using the local wallet without an inline `private_key` in seed overrides. Not needed if using KMS or providing `private_key` directly in the JSON.
 
 ### Seed Overrides Format
 
