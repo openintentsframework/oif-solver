@@ -13,6 +13,7 @@
 use axum::{extract::State, Json};
 use serde::Serialize;
 use solver_config::Config;
+use solver_core::engine::token_manager::TokenManager;
 use solver_storage::{
 	config_store::{ConfigStore, ConfigStoreError},
 	nonce_store::NonceStore,
@@ -38,6 +39,8 @@ pub struct AdminApiState {
 	pub dynamic_config: Arc<RwLock<Config>>,
 	/// Nonce store (concrete type, kept for rebuilding verifier).
 	pub nonce_store: Arc<NonceStore>,
+	/// Token manager for hot-reloading token configurations.
+	pub token_manager: Arc<TokenManager>,
 }
 
 impl AdminApiState {
@@ -184,13 +187,20 @@ pub async fn handle_add_token(
 	// 7. HOT RELOAD: Rebuild runtime Config from updated OperatorConfig
 	let new_config = build_runtime_config(&new_versioned.data)
 		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {e}")))?;
+
+	// 8. Update TokenManager with new networks configuration
+	// This ensures quotes and other token operations immediately see the new token
+	let new_networks = new_config.networks.clone();
+	state.token_manager.update_networks(new_networks).await;
+
+	// 9. Update dynamic_config
 	*state.dynamic_config.write().await = new_config;
 
 	tracing::info!(
 		version = new_versioned.version,
 		token = %request.contents.symbol,
 		chain_id = request.contents.chain_id,
-		"Token added and config hot-reloaded"
+		"Token added and config hot-reloaded (TokenManager updated)"
 	);
 
 	Ok(Json(AdminActionResponse {

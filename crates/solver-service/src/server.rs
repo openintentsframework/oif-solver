@@ -222,6 +222,8 @@ pub async fn start_server(
 							dynamic_config: dynamic_config.clone(),
 							// Store nonce_store for rebuilding verifier later
 							nonce_store,
+							// Token manager for hot-reloading token configurations
+							token_manager: solver.token_manager().clone(),
 						})
 					},
 					Err(e) => {

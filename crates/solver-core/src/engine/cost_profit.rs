@@ -184,7 +184,8 @@ impl CostProfitService {
 						})?;
 						let input_token = self
 							.token_manager
-							.get_token_info(input_chain_id, &Address(input_addr.0.to_vec()))?;
+							.get_token_info(input_chain_id, &Address(input_addr.0.to_vec()))
+							.await?;
 
 						// Convert raw amount to USD
 						let usd_value = Self::convert_raw_token_to_usd(
@@ -257,7 +258,8 @@ impl CostProfitService {
 						})?;
 						let output_token = self
 							.token_manager
-							.get_token_info(output_chain_id, &Address(output_addr.0.to_vec()))?;
+							.get_token_info(output_chain_id, &Address(output_addr.0.to_vec()))
+							.await?;
 
 						// Convert raw amount to USD
 						let usd_value = Self::convert_raw_token_to_usd(
@@ -341,6 +343,7 @@ impl CostProfitService {
 				let decimals = self
 					.token_manager
 					.get_token_info(chain_id, &Address(eth_addr.0.to_vec()))
+					.await
 					.ok()
 					.map(|info| info.decimals)
 					.unwrap_or(18);
@@ -358,6 +361,7 @@ impl CostProfitService {
 					let decimals = self
 						.token_manager
 						.get_token_info(chain_id, &Address(eth_addr.0.to_vec()))
+						.await
 						.ok()
 						.map(|info| info.decimals)
 						.unwrap_or(18);
@@ -1386,7 +1390,8 @@ impl CostProfitService {
 
 			let token_info = self
 				.token_manager
-				.get_token_info(chain_id, &token_address)?;
+				.get_token_info(chain_id, &token_address)
+				.await?;
 
 			let usd_amount = Self::convert_raw_token_to_usd(
 				&input.amount,
@@ -1422,7 +1427,8 @@ impl CostProfitService {
 
 			let token_info = self
 				.token_manager
-				.get_token_info(chain_id, &token_address)?;
+				.get_token_info(chain_id, &token_address)
+				.await?;
 
 			let usd_amount = Self::convert_raw_token_to_usd(
 				&output.amount,
@@ -1456,7 +1462,8 @@ impl CostProfitService {
 
 		let token_info = self
 			.token_manager
-			.get_token_info(chain_id, &token_address)?;
+			.get_token_info(chain_id, &token_address)
+			.await?;
 
 		// Convert USD to token amount (normalized)
 		let token_amount_str = self

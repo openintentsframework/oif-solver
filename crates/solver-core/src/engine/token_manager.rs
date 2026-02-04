@@ -28,6 +28,7 @@ use solver_types::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::RwLock;
 
 /// Errors that can occur during token management operations.
 #[derive(Debug, Error)]
@@ -62,10 +63,13 @@ pub enum TokenManagerError {
 /// - Providing token metadata and configuration lookups
 ///
 /// This struct is typically initialized once during solver startup and shared
-/// across all components that need token information.
+/// across all components that need token information. The networks configuration
+/// can be hot-reloaded via the `update_networks` method when tokens are added
+/// through the admin API.
 pub struct TokenManager {
 	/// Network configurations mapping chain IDs to their token and settler information.
-	networks: NetworksConfig,
+	/// Wrapped in RwLock to support hot-reload when tokens are added via admin API.
+	networks: Arc<RwLock<NetworksConfig>>,
 	/// Service for delivering transactions to various blockchain networks.
 	delivery: Arc<DeliveryService>,
 	/// Service for managing the solver's account and signatures.
@@ -86,10 +90,29 @@ impl TokenManager {
 		account: Arc<AccountService>,
 	) -> Self {
 		Self {
-			networks,
+			networks: Arc::new(RwLock::new(networks)),
 			delivery,
 			account,
 		}
+	}
+
+	/// Updates the networks configuration for hot-reload support.
+	///
+	/// This method is called when tokens are added via the admin API to ensure
+	/// the TokenManager has the latest token configurations without requiring
+	/// a solver restart.
+	///
+	/// # Arguments
+	///
+	/// * `new_networks` - The updated networks configuration
+	///
+	/// # Returns
+	///
+	/// Returns the old networks configuration, which can be used for diffing
+	/// to determine which tokens were added.
+	pub async fn update_networks(&self, new_networks: NetworksConfig) -> NetworksConfig {
+		let mut networks = self.networks.write().await;
+		std::mem::replace(&mut *networks, new_networks)
 	}
 
 	/// Ensures all configured tokens have MAX_UINT256 approval for their respective settlers.
@@ -113,7 +136,8 @@ impl TokenManager {
 		let max_uint256 = U256::MAX;
 		let max_uint256_str = max_uint256.to_string();
 
-		for (chain_id, network) in &self.networks {
+		let networks = self.networks.read().await;
+		for (chain_id, network) in networks.iter() {
 			for token in &network.tokens {
 				// Process input settler if not zero address
 				if network.input_settler_address.0 != [0u8; 20] {
@@ -249,7 +273,8 @@ impl TokenManager {
 		let solver_address_str = hex::encode(&solver_address.0);
 		let mut balances = HashMap::new();
 
-		for (chain_id, network) in &self.networks {
+		let networks = self.networks.read().await;
+		for (chain_id, network) in networks.iter() {
 			for token in &network.tokens {
 				let balance = self
 					.delivery
@@ -310,8 +335,9 @@ impl TokenManager {
 	/// # Returns
 	///
 	/// Returns `true` if the token is configured for the specified chain, `false` otherwise.
-	pub fn is_supported(&self, chain_id: u64, token_address: &Address) -> bool {
-		if let Some(network) = self.networks.get(&chain_id) {
+	pub async fn is_supported(&self, chain_id: u64, token_address: &Address) -> bool {
+		let networks = self.networks.read().await;
+		if let Some(network) = networks.get(&chain_id) {
 			network.tokens.iter().any(|t| t.address == *token_address)
 		} else {
 			false
@@ -329,13 +355,13 @@ impl TokenManager {
 	///
 	/// Returns the `TokenConfig` if the token is supported.
 	/// Returns an error if the network is not configured or the token is not supported.
-	pub fn get_token_info(
+	pub async fn get_token_info(
 		&self,
 		chain_id: u64,
 		token_address: &Address,
 	) -> Result<TokenConfig, TokenManagerError> {
-		let network = self
-			.networks
+		let networks = self.networks.read().await;
+		let network = networks
 			.get(&chain_id)
 			.ok_or(TokenManagerError::NetworkNotConfigured(chain_id))?;
 
@@ -359,8 +385,9 @@ impl TokenManager {
 	///
 	/// Returns a vector of `TokenConfig` for all tokens configured on the chain.
 	/// Returns an empty vector if the chain is not configured.
-	pub fn get_tokens_for_chain(&self, chain_id: u64) -> Vec<TokenConfig> {
-		self.networks
+	pub async fn get_tokens_for_chain(&self, chain_id: u64) -> Vec<TokenConfig> {
+		let networks = self.networks.read().await;
+		networks
 			.get(&chain_id)
 			.map(|n| n.tokens.clone())
 			.unwrap_or_default()
@@ -370,9 +397,10 @@ impl TokenManager {
 	///
 	/// # Returns
 	///
-	/// Returns a reference to the `NetworksConfig` containing all network and token configurations.
-	pub fn get_networks(&self) -> &NetworksConfig {
-		&self.networks
+	/// Returns a clone of the `NetworksConfig` containing all network and token configurations.
+	/// Note: This returns a clone since the networks are behind a RwLock for hot-reload support.
+	pub async fn get_networks(&self) -> NetworksConfig {
+		self.networks.read().await.clone()
 	}
 }
 
@@ -466,21 +494,22 @@ mod tests {
 		Arc::new(DeliveryService::new(implementations, 1, 20))
 	}
 
-	#[test]
-	fn test_new_token_manager() {
+	#[tokio::test]
+	async fn test_new_token_manager() {
 		let networks = create_test_networks_config();
 		let delivery = create_mock_delivery_service();
 		let account = create_mock_account_service();
 
 		let token_manager = TokenManager::new(networks.clone(), delivery, account);
 
-		assert_eq!(token_manager.networks.len(), 2);
-		assert!(token_manager.networks.contains_key(&1));
-		assert!(token_manager.networks.contains_key(&137));
+		let networks_read = token_manager.get_networks().await;
+		assert_eq!(networks_read.len(), 2);
+		assert!(networks_read.contains_key(&1));
+		assert!(networks_read.contains_key(&137));
 	}
 
-	#[test]
-	fn test_is_supported_existing_token() {
+	#[tokio::test]
+	async fn test_is_supported_existing_token() {
 		let networks = create_test_networks_config();
 
 		// Create simple mocks without complex setup since is_supported doesn't use them
@@ -497,12 +526,12 @@ mod tests {
 			solver_types::parse_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
 				.expect("Invalid USDC address");
 
-		assert!(token_manager.is_supported(1, &usdc_address));
-		assert!(token_manager.is_supported(137, &usdc_address));
+		assert!(token_manager.is_supported(1, &usdc_address).await);
+		assert!(token_manager.is_supported(137, &usdc_address).await);
 	}
 
-	#[test]
-	fn test_is_supported_non_existing_token() {
+	#[tokio::test]
+	async fn test_is_supported_non_existing_token() {
 		let networks = create_test_networks_config();
 		let delivery = create_mock_delivery_service();
 		let account = create_mock_account_service();
@@ -510,12 +539,12 @@ mod tests {
 
 		let unknown_address = parse_address("1111111111111111111111111111111111111111").unwrap();
 
-		assert!(!token_manager.is_supported(1, &unknown_address));
-		assert!(!token_manager.is_supported(137, &unknown_address));
+		assert!(!token_manager.is_supported(1, &unknown_address).await);
+		assert!(!token_manager.is_supported(137, &unknown_address).await);
 	}
 
-	#[test]
-	fn test_get_token_info_success() {
+	#[tokio::test]
+	async fn test_get_token_info_success() {
 		let networks = create_test_networks_config();
 		let delivery = create_mock_delivery_service();
 		let account = create_mock_account_service();
@@ -525,7 +554,7 @@ mod tests {
 			solver_types::parse_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
 				.expect("Invalid USDC address");
 
-		let result = token_manager.get_token_info(1, &usdc_address);
+		let result = token_manager.get_token_info(1, &usdc_address).await;
 		assert!(result.is_ok());
 
 		let token_config = result.unwrap();
@@ -534,8 +563,8 @@ mod tests {
 		assert_eq!(token_config.address, usdc_address);
 	}
 
-	#[test]
-	fn test_get_token_info_network_not_configured() {
+	#[tokio::test]
+	async fn test_get_token_info_network_not_configured() {
 		let networks = create_test_networks_config();
 		let delivery = create_mock_delivery_service();
 		let account = create_mock_account_service();
@@ -545,7 +574,7 @@ mod tests {
 			solver_types::parse_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
 				.expect("Invalid USDC address");
 
-		let result = token_manager.get_token_info(999, &usdc_address);
+		let result = token_manager.get_token_info(999, &usdc_address).await;
 		assert!(result.is_err());
 
 		match result.unwrap_err() {
@@ -554,19 +583,78 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn test_get_tokens_for_chain_existing_chain() {
+	#[tokio::test]
+	async fn test_get_tokens_for_chain_existing_chain() {
 		let networks = create_test_networks_config();
 		let delivery = create_mock_delivery_service();
 		let account = create_mock_account_service();
 		let token_manager = TokenManager::new(networks, delivery, account);
 
-		let tokens = token_manager.get_tokens_for_chain(1);
+		let tokens = token_manager.get_tokens_for_chain(1).await;
 		assert_eq!(tokens.len(), 2);
 
 		let symbols: Vec<&str> = tokens.iter().map(|t| t.symbol.as_str()).collect();
 		assert!(symbols.contains(&"USDC"));
 		assert!(symbols.contains(&"WETH"));
+	}
+
+	#[tokio::test]
+	async fn test_update_networks() {
+		let networks = create_test_networks_config();
+		let delivery = create_mock_delivery_service();
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		// Verify initial state
+		let initial_networks = token_manager.get_networks().await;
+		assert_eq!(initial_networks.len(), 2);
+
+		// Create new networks with an additional chain
+		let new_networks = NetworksConfigBuilder::new()
+			.add_network(
+				1,
+				NetworkConfigBuilder::new()
+					.add_token(
+						TokenConfigBuilder::new()
+							.address(
+								parse_address("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").unwrap(),
+							)
+							.symbol("USDC")
+							.decimals(6)
+							.build(),
+					)
+					.build(),
+			)
+			.add_network(
+				42161, // Arbitrum
+				NetworkConfigBuilder::new()
+					.add_token(
+						TokenConfigBuilder::new()
+							.address(
+								parse_address("0xaf88d065e77c8cc2239327c5edb3a432268e5831").unwrap(),
+							)
+							.symbol("USDC")
+							.decimals(6)
+							.build(),
+					)
+					.build(),
+			)
+			.build();
+
+		// Update networks
+		let old_networks = token_manager.update_networks(new_networks).await;
+
+		// Verify old networks were returned
+		assert_eq!(old_networks.len(), 2);
+		assert!(old_networks.contains_key(&1));
+		assert!(old_networks.contains_key(&137));
+
+		// Verify new networks are in place
+		let current_networks = token_manager.get_networks().await;
+		assert_eq!(current_networks.len(), 2);
+		assert!(current_networks.contains_key(&1));
+		assert!(current_networks.contains_key(&42161));
+		assert!(!current_networks.contains_key(&137));
 	}
 
 	#[tokio::test]

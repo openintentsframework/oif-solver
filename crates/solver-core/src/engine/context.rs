@@ -217,7 +217,7 @@ impl ContextBuilder {
 			}
 
 			// Get balances for common tokens on this chain
-			let common_tokens = self.get_common_tokens_for_chain(chain_id);
+			let common_tokens = self.get_common_tokens_for_chain(chain_id).await;
 			for token_address in common_tokens {
 				match self
 					.delivery
@@ -245,9 +245,10 @@ impl ContextBuilder {
 	/// Gets token addresses for a given chain from the token manager.
 	///
 	/// Returns addresses of tokens configured for this chain.
-	fn get_common_tokens_for_chain(&self, chain_id: u64) -> Vec<String> {
+	async fn get_common_tokens_for_chain(&self, chain_id: u64) -> Vec<String> {
 		self.token_manager
 			.get_tokens_for_chain(chain_id)
+			.await
 			.into_iter()
 			.map(|token| hex::encode(&token.address.0))
 			.collect()
@@ -499,18 +500,18 @@ mod tests {
 			.contains("Unsupported intent standard"));
 	}
 
-	#[test]
-	fn test_get_common_tokens_for_chain() {
+	#[tokio::test]
+	async fn test_get_common_tokens_for_chain() {
 		let context_builder = create_context_builder();
 
 		// Test with configured network (chain 1 has USDC and WETH)
-		let tokens_chain_1 = context_builder.get_common_tokens_for_chain(1);
+		let tokens_chain_1 = context_builder.get_common_tokens_for_chain(1).await;
 		assert_eq!(tokens_chain_1.len(), 2);
 		assert!(tokens_chain_1.contains(&"a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0".to_string()));
 		assert!(tokens_chain_1.contains(&"c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0".to_string()));
 
 		// Test with unconfigured network
-		let tokens_unknown = context_builder.get_common_tokens_for_chain(999);
+		let tokens_unknown = context_builder.get_common_tokens_for_chain(999).await;
 		assert_eq!(tokens_unknown.len(), 0);
 	}
 
