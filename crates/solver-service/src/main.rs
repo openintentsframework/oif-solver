@@ -184,6 +184,17 @@ async fn load_config(
 			);
 
 			let versioned = operator_store.get().await?;
+			// Log what account config is in storage
+			match &versioned.data.account {
+				Some(acc) => tracing::info!(
+					primary = %acc.primary,
+					implementations = ?acc.implementations.keys().collect::<Vec<_>>(),
+					"Loaded account config from storage"
+				),
+				None => {
+					tracing::info!("No account config in storage, will use default local wallet")
+				},
+			}
 			let config = build_runtime_config(&versioned.data)?;
 
 			tracing::info!("════════════════════════════════════════════════════════════");
@@ -203,6 +214,15 @@ async fn load_config(
 			operator_store.delete().await?;
 		}
 
+		// Log what account config will be stored
+		match &operator_config.account {
+			Some(acc) => tracing::info!(
+				primary = %acc.primary,
+				implementations = ?acc.implementations.keys().collect::<Vec<_>>(),
+				"Seeding account config to storage"
+			),
+			None => tracing::info!("No account override, seeding with default local wallet config"),
+		}
 		tracing::info!("Seeding OperatorConfig to storage");
 		let versioned = operator_store.seed(operator_config).await?;
 

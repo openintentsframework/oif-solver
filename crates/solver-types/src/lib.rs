@@ -58,9 +58,10 @@ pub use discovery::*;
 pub use events::*;
 pub use networks::{NetworkConfig, NetworksConfig, TokenConfig};
 pub use operator_config::{
-	OperatorAdminConfig, OperatorConfig, OperatorGasConfig, OperatorGasFlowUnits,
-	OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig, OperatorPricingConfig,
-	OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSolverConfig, OperatorToken,
+	OperatorAccountConfig, OperatorAdminConfig, OperatorConfig, OperatorGasConfig,
+	OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig,
+	OperatorPricingConfig, OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSolverConfig,
+	OperatorToken,
 };
 pub use order::*;
 pub use pricing::*;
@@ -70,7 +71,7 @@ pub use provider::{
 };
 pub use registry::ImplementationRegistry;
 pub use secret_string::SecretString;
-pub use seed_overrides::{NetworkOverride, SeedOverrides, Token};
+pub use seed_overrides::{AccountOverride, NetworkOverride, SeedOverrides, Token};
 pub use standards::{
 	eip7683::{Eip7683OrderData, MandateOutput as Eip7683Output},
 	eip7930::{InteropAddress, InteropAddressError},

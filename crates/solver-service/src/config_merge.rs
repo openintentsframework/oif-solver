@@ -31,10 +31,11 @@ use solver_config::{
 	StorageConfig, StrategyConfig,
 };
 use solver_types::{
-	networks::RpcEndpoint, NetworkConfig, NetworkOverride, NetworksConfig, OperatorAdminConfig,
-	OperatorConfig, OperatorGasConfig, OperatorGasFlowUnits, OperatorHyperlaneConfig,
-	OperatorNetworkConfig, OperatorOracleConfig, OperatorPricingConfig, OperatorRpcEndpoint,
-	OperatorSettlementConfig, OperatorSolverConfig, OperatorToken, SeedOverrides, TokenConfig,
+	networks::RpcEndpoint, AccountOverride, NetworkConfig, NetworkOverride, NetworksConfig,
+	OperatorAccountConfig, OperatorAdminConfig, OperatorConfig, OperatorGasConfig,
+	OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig,
+	OperatorPricingConfig, OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSolverConfig,
+	OperatorToken, SeedOverrides, TokenConfig,
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -130,7 +131,7 @@ pub fn merge_config(overrides: SeedOverrides, seed: &SeedConfig) -> Result<Confi
 		networks,
 		storage: build_storage_config(&seed.defaults, &solver_id),
 		delivery: build_delivery_config(&chain_ids, &seed.defaults),
-		account: build_account_config(&seed.defaults),
+		account: build_account_config(&seed.defaults, overrides.account.as_ref()),
 		discovery: build_discovery_config(&chain_ids, &seed.defaults),
 		order: build_order_config(&seed.defaults),
 		settlement: build_settlement_config(&chain_ids, seed),
@@ -260,6 +261,10 @@ pub fn merge_to_operator_config(
 			monitoring_timeout_seconds: seed.defaults.monitoring_timeout_seconds,
 		},
 		admin,
+		account: initializer.account.as_ref().map(|a| OperatorAccountConfig {
+			primary: a.primary.clone(),
+			implementations: a.implementations.clone(),
+		}),
 	})
 }
 
@@ -414,7 +419,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 		networks,
 		storage: build_storage_config_from_operator(&operator_config.solver_id),
 		delivery: build_delivery_config_from_operator(&chain_ids),
-		account: build_account_config_from_operator(),
+		account: build_account_config_from_operator(operator_config.account.as_ref()),
 		discovery: build_discovery_config_from_operator(&chain_ids),
 		order: build_order_config_from_operator(),
 		settlement: build_settlement_config_from_operator(operator_config),
@@ -533,8 +538,35 @@ fn build_delivery_config_from_operator(chain_ids: &[u64]) -> DeliveryConfig {
 	}
 }
 
-/// Builds AccountConfig from operator defaults.
-fn build_account_config_from_operator() -> AccountConfig {
+/// Builds AccountConfig from operator config.
+///
+/// If the operator config has an account configuration, uses that.
+/// Otherwise, defaults to local wallet with SOLVER_PRIVATE_KEY.
+fn build_account_config_from_operator(
+	account_config: Option<&OperatorAccountConfig>,
+) -> AccountConfig {
+	// If operator has account config, use it
+	if let Some(config) = account_config {
+		tracing::info!(
+			primary = %config.primary,
+			implementations = ?config.implementations.keys().collect::<Vec<_>>(),
+			"Using operator account config"
+		);
+		let mut implementations = HashMap::new();
+
+		for (name, json_value) in &config.implementations {
+			let toml_value = json_to_toml(json_value);
+			implementations.insert(name.clone(), toml_value);
+		}
+
+		return AccountConfig {
+			primary: config.primary.clone(),
+			implementations,
+		};
+	}
+
+	tracing::info!("No operator account config found, using default local wallet");
+	// Default: local wallet with private key from environment
 	let mut implementations = HashMap::new();
 
 	// Read private key from environment variable and trim whitespace
@@ -973,7 +1005,30 @@ fn build_delivery_config(chain_ids: &[u64], defaults: &SeedDefaults) -> Delivery
 }
 
 /// Builds the AccountConfig section.
-fn build_account_config(defaults: &SeedDefaults) -> AccountConfig {
+///
+/// If account_override is provided, only the specified implementations are included.
+/// Otherwise, defaults to local wallet with SOLVER_PRIVATE_KEY.
+fn build_account_config(
+	defaults: &SeedDefaults,
+	account_override: Option<&AccountOverride>,
+) -> AccountConfig {
+	// If account override is provided, use it instead of defaults
+	if let Some(override_config) = account_override {
+		let mut implementations = HashMap::new();
+
+		for (name, config) in &override_config.implementations {
+			// Convert serde_json::Value to toml::Value
+			let toml_value = json_to_toml(config);
+			implementations.insert(name.clone(), toml_value);
+		}
+
+		return AccountConfig {
+			primary: override_config.primary.clone(),
+			implementations,
+		};
+	}
+
+	// Default: local wallet with private key from environment
 	let mut implementations = HashMap::new();
 
 	// Read private key from environment variable and trim whitespace
@@ -987,6 +1042,32 @@ fn build_account_config(defaults: &SeedDefaults) -> AccountConfig {
 	AccountConfig {
 		primary: defaults.account_primary.to_string(),
 		implementations,
+	}
+}
+
+/// Converts a serde_json::Value to a toml::Value.
+fn json_to_toml(json: &serde_json::Value) -> toml::Value {
+	match json {
+		serde_json::Value::Null => toml::Value::String("".to_string()),
+		serde_json::Value::Bool(b) => toml::Value::Boolean(*b),
+		serde_json::Value::Number(n) => {
+			if let Some(i) = n.as_i64() {
+				toml::Value::Integer(i)
+			} else if let Some(f) = n.as_f64() {
+				toml::Value::Float(f)
+			} else {
+				toml::Value::String(n.to_string())
+			}
+		},
+		serde_json::Value::String(s) => toml::Value::String(s.clone()),
+		serde_json::Value::Array(arr) => toml::Value::Array(arr.iter().map(json_to_toml).collect()),
+		serde_json::Value::Object(obj) => {
+			let mut table = toml::map::Map::new();
+			for (k, v) in obj {
+				table.insert(k.clone(), json_to_toml(v));
+			}
+			toml::Value::Table(table)
+		},
 	}
 }
 
@@ -1431,6 +1512,9 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		})
 		.unwrap_or_default();
 
+	// Extract account config - only set if not using default local wallet
+	let account = extract_account_config(&config.account);
+
 	Ok(OperatorConfig {
 		solver_id: config.solver.id.clone(),
 		networks,
@@ -1446,7 +1530,53 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 			monitoring_timeout_seconds: config.solver.monitoring_timeout_seconds,
 		},
 		admin,
+		account,
 	})
+}
+
+/// Extracts account config from AccountConfig.
+/// Returns None if using default local wallet, Some(...) for other implementations.
+fn extract_account_config(account: &AccountConfig) -> Option<OperatorAccountConfig> {
+	// If primary is "local", return None to use default behavior
+	if account.primary == "local" {
+		return None;
+	}
+
+	// Convert toml implementations to JSON
+	let implementations = account
+		.implementations
+		.iter()
+		.map(|(name, toml_value)| {
+			let json_value = toml_to_json(toml_value);
+			(name.clone(), json_value)
+		})
+		.collect();
+
+	Some(OperatorAccountConfig {
+		primary: account.primary.clone(),
+		implementations,
+	})
+}
+
+/// Converts a toml::Value to a serde_json::Value.
+fn toml_to_json(toml: &toml::Value) -> serde_json::Value {
+	match toml {
+		toml::Value::String(s) => serde_json::Value::String(s.clone()),
+		toml::Value::Integer(i) => serde_json::Value::Number((*i).into()),
+		toml::Value::Float(f) => serde_json::Number::from_f64(*f)
+			.map(serde_json::Value::Number)
+			.unwrap_or(serde_json::Value::Null),
+		toml::Value::Boolean(b) => serde_json::Value::Bool(*b),
+		toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),
+		toml::Value::Array(arr) => serde_json::Value::Array(arr.iter().map(toml_to_json).collect()),
+		toml::Value::Table(table) => {
+			let map: serde_json::Map<String, serde_json::Value> = table
+				.iter()
+				.map(|(k, v)| (k.clone(), toml_to_json(v)))
+				.collect();
+			serde_json::Value::Object(map)
+		},
+	}
 }
 
 /// Extracts Hyperlane config from settlement toml config.
@@ -1630,6 +1760,7 @@ mod tests {
 					rpc_urls: Some(vec!["https://custom-rpc.example.com".to_string()]),
 				},
 			],
+			account: None,
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -1677,6 +1808,7 @@ mod tests {
 					rpc_urls: None,
 				},
 			],
+			account: None,
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -1710,6 +1842,7 @@ mod tests {
 					rpc_urls: None,
 				},
 			],
+			account: None,
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -1736,6 +1869,7 @@ mod tests {
 				}],
 				rpc_urls: None,
 			}],
+			account: None,
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -1798,6 +1932,7 @@ mod tests {
 					rpc_urls: None,
 				},
 			],
+			account: None,
 			admin: None,
 			min_profitability_pct: Some(Decimal::from_str("2.5").unwrap()), // Override: 2.5%
 			gas_buffer_bps: Some(1500),                                     // Override: 15%
@@ -1950,6 +2085,7 @@ mod tests {
 					rpc_urls: None,
 				},
 			],
+			account: None,
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -1987,6 +2123,7 @@ mod tests {
 					rpc_urls: None,
 				},
 			],
+			account: None,
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -2045,6 +2182,7 @@ mod tests {
 					rpc_urls: None,
 				},
 			],
+			account: None,
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -2078,6 +2216,7 @@ mod tests {
 					rpc_urls: None,
 				},
 			],
+			account: None,
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -2115,6 +2254,7 @@ mod tests {
 					rpc_urls: None,
 				},
 			],
+			account: None,
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -2141,6 +2281,7 @@ mod tests {
 				}],
 				rpc_urls: None,
 			}],
+			account: None,
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -2174,6 +2315,7 @@ mod tests {
 					rpc_urls: None,
 				},
 			],
+			account: None,
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -2211,6 +2353,7 @@ mod tests {
 					rpc_urls: None,
 				},
 			],
+			account: None,
 			admin: Some(AdminOverride {
 				enabled: true,
 				domain: "test.solver.com".to_string(),
@@ -2327,6 +2470,7 @@ mod tests {
 				monitoring_timeout_seconds: 30,
 			},
 			admin: OperatorAdminConfig::default(),
+			account: None,
 		};
 
 		// Add only one network
@@ -2649,5 +2793,104 @@ mod tests {
 		if let Some(val) = original_jwt {
 			env::set_var("JWT_SECRET", val);
 		}
+	}
+
+	#[test]
+	fn test_kms_account_override_full_flow() {
+		use solver_types::AccountOverride;
+
+		// Create overrides with KMS account configuration
+		let overrides = SeedOverrides {
+			solver_id: Some("kms-test-solver".to_string()),
+			networks: vec![
+				NetworkOverride {
+					chain_id: 11155420,
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "USDC".to_string(),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+				NetworkOverride {
+					chain_id: 84532,
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "USDC".to_string(),
+						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+			],
+			account: Some(AccountOverride {
+				primary: "kms".to_string(),
+				implementations: {
+					let mut map = std::collections::HashMap::new();
+					map.insert(
+						"kms".to_string(),
+						serde_json::json!({
+							"key_id": "test-key-id",
+							"region": "us-east-1"
+						}),
+					);
+					map
+				},
+			}),
+			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
+		};
+
+		// Step 1: merge_config should create Config with KMS account
+		let config = merge_config(overrides.clone(), &TESTNET_SEED).unwrap();
+
+		// Verify Config has KMS as primary (not local)
+		assert_eq!(
+			config.account.primary, "kms",
+			"Config primary should be 'kms'"
+		);
+		assert!(
+			config.account.implementations.contains_key("kms"),
+			"Config should have 'kms' implementation"
+		);
+		assert!(
+			!config.account.implementations.contains_key("local"),
+			"Config should NOT have 'local' implementation when using KMS"
+		);
+
+		// Step 2: config_to_operator_config should preserve account config
+		let op_config = config_to_operator_config(&config).unwrap();
+
+		// Verify OperatorConfig has account set (not None)
+		assert!(
+			op_config.account.is_some(),
+			"OperatorConfig.account should be Some for KMS"
+		);
+		let op_account = op_config.account.as_ref().unwrap();
+		assert_eq!(
+			op_account.primary, "kms",
+			"OperatorConfig account primary should be 'kms'"
+		);
+		assert!(
+			op_account.implementations.contains_key("kms"),
+			"OperatorConfig should have 'kms' implementation"
+		);
+
+		// Step 3: build_runtime_config should restore KMS account config
+		let runtime_config = build_runtime_config(&op_config).unwrap();
+
+		// Verify runtime Config has KMS (not local)
+		assert_eq!(
+			runtime_config.account.primary, "kms",
+			"Runtime config primary should be 'kms'"
+		);
+		assert!(
+			runtime_config.account.implementations.contains_key("kms"),
+			"Runtime config should have 'kms' implementation"
+		);
+		assert!(
+			!runtime_config.account.implementations.contains_key("local"),
+			"Runtime config should NOT have 'local' implementation"
+		);
 	}
 }

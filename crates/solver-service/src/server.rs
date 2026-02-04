@@ -272,15 +272,19 @@ pub async fn start_server(
 			.route("/tokens", post(handle_add_token))
 			.route("/fees", put(handle_update_fees))
 			.with_state(admin_state);
-		// If JWT auth is enabled, require admin-all scope for all admin endpoints.
-		if let Some(jwt) = &jwt_service {
-			admin_routes = admin_routes.layer(middleware::from_fn_with_state(
-				AuthState {
-					jwt_service: jwt.clone(),
-					required_scope: solver_types::AuthScope::AdminAll,
-				},
-				auth_middleware,
-			));
+		// Only apply JWT auth to admin routes if orders_require_auth is true
+		// (i.e., auth.enabled in config). Admin routes also have their own
+		// EIP-712 signature auth for admin actions.
+		if orders_require_auth {
+			if let Some(jwt) = &jwt_service {
+				admin_routes = admin_routes.layer(middleware::from_fn_with_state(
+					AuthState {
+						jwt_service: jwt.clone(),
+						required_scope: solver_types::AuthScope::AdminAll,
+					},
+					auth_middleware,
+				));
+			}
 		}
 		api_routes = api_routes.nest("/admin", admin_routes);
 		tracing::info!("Admin routes registered at /api/v1/admin/*");

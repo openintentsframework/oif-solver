@@ -56,6 +56,26 @@ pub struct OperatorConfig {
 
 	/// Admin authentication settings.
 	pub admin: OperatorAdminConfig,
+
+	/// Account signing backend configuration.
+	/// If None, defaults to local wallet with SOLVER_PRIVATE_KEY.
+	#[serde(default)]
+	pub account: Option<OperatorAccountConfig>,
+}
+
+/// Account configuration for signing backends.
+///
+/// Specifies which account implementation to use (e.g., "local", "kms")
+/// and any non-sensitive configuration parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorAccountConfig {
+	/// Primary account implementation to use (e.g., "local", "kms").
+	pub primary: String,
+
+	/// Implementation-specific configurations.
+	/// Keys are implementation names, values are their configuration.
+	/// Note: Sensitive values like private keys should come from environment variables.
+	pub implementations: HashMap<String, serde_json::Value>,
 }
 
 /// Per-network configuration including contracts, tokens, and RPCs.
@@ -526,6 +546,7 @@ mod tests {
 				nonce_ttl_seconds: 300,
 				admin_addresses: vec![test_address()],
 			},
+			account: None,
 		};
 
 		let json = serde_json::to_string_pretty(&config).unwrap();

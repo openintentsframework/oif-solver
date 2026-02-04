@@ -50,6 +50,11 @@ pub struct SeedOverrides {
 	/// Each network must exist in the seed configuration.
 	pub networks: Vec<NetworkOverride>,
 
+	/// Optional account configuration to override the default local wallet.
+	/// Use this to configure KMS or other account implementations.
+	#[serde(default)]
+	pub account: Option<AccountOverride>,
+
 	/// Optional admin configuration for wallet-based admin authentication.
 	/// If provided, enables admin API endpoints with EIP-712 signature auth.
 	#[serde(default)]
@@ -64,6 +69,20 @@ pub struct SeedOverrides {
 	/// If not set, uses default (1000 = 10%).
 	#[serde(default)]
 	pub gas_buffer_bps: Option<u32>,
+}
+
+/// Account configuration override for non-default signing backends.
+///
+/// Allows specifying which account implementation to use (e.g., "kms")
+/// and its configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountOverride {
+	/// Primary account implementation to use (e.g., "local", "kms").
+	pub primary: String,
+
+	/// Implementation-specific configurations.
+	/// Keys are implementation names, values are their configuration.
+	pub implementations: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Admin configuration for wallet-based admin authentication.
@@ -282,6 +301,7 @@ mod tests {
 					rpc_urls: None,
 				},
 			],
+			account: None,
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -300,6 +320,7 @@ mod tests {
 				tokens: vec![],
 				rpc_urls: None,
 			}],
+			account: None,
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -322,6 +343,7 @@ mod tests {
 				}],
 				rpc_urls: None,
 			}],
+			account: None,
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -369,6 +391,7 @@ mod tests {
 				}],
 				rpc_urls: Some(vec!["https://rpc.com".to_string()]),
 			}],
+			account: None,
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -447,5 +470,136 @@ mod tests {
 
 		assert_eq!(config.min_profitability_pct, None);
 		assert_eq!(config.gas_buffer_bps, None);
+	}
+
+	#[test]
+	fn test_parse_account_override() {
+		let json = r#"{
+            "solver_id": "kms-solver",
+            "account": {
+                "primary": "kms",
+                "implementations": {
+                    "kms": {
+                        "key_id": "1fa50595-bfee-45db-b333-fe906244231f",
+                        "region": "us-east-1"
+                    }
+                }
+            },
+            "networks": [
+                {
+                    "chain_id": 10,
+                    "tokens": [
+                        {"symbol": "USDC", "address": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85", "decimals": 6}
+                    ]
+                }
+            ]
+        }"#;
+
+		let config: SeedOverrides = serde_json::from_str(json).unwrap();
+
+		assert!(config.account.is_some());
+		let account = config.account.as_ref().unwrap();
+		assert_eq!(account.primary, "kms");
+		assert!(account.implementations.contains_key("kms"));
+
+		let kms_config = &account.implementations["kms"];
+		assert_eq!(
+			kms_config["key_id"].as_str().unwrap(),
+			"1fa50595-bfee-45db-b333-fe906244231f"
+		);
+		assert_eq!(kms_config["region"].as_str().unwrap(), "us-east-1");
+	}
+
+	#[test]
+	fn test_account_override_defaults_to_none() {
+		let json = r#"{
+            "networks": [
+                {
+                    "chain_id": 10,
+                    "tokens": [
+                        {"symbol": "USDC", "address": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85", "decimals": 6}
+                    ]
+                }
+            ]
+        }"#;
+
+		let config: SeedOverrides = serde_json::from_str(json).unwrap();
+		assert!(config.account.is_none());
+	}
+
+	#[test]
+	fn test_parse_full_kms_config_with_admin() {
+		// Test parsing a full config with all optional fields including account and admin
+		let json = r#"{
+            "solver_id": "test-kms-solver",
+            "account": {
+                "primary": "kms",
+                "implementations": {
+                    "kms": {
+                        "key_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        "region": "us-east-1"
+                    }
+                }
+            },
+            "networks": [
+                {
+                    "chain_id": 11155420,
+                    "tokens": [
+                        {
+                            "symbol": "USDC",
+                            "address": "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6",
+                            "decimals": 6
+                        }
+                    ]
+                },
+                {
+                    "chain_id": 84532,
+                    "tokens": [
+                        {
+                            "symbol": "USDC",
+                            "address": "0x73c83DAcc74bB8a704717AC09703b959E74b9705",
+                            "decimals": 6
+                        }
+                    ]
+                }
+            ],
+            "admin": {
+                "enabled": true,
+                "domain": "localhost",
+                "admin_addresses": ["0x33848cc530581B2CeFef58CC9D3c935311D4b940"]
+            }
+        }"#;
+
+		let config: SeedOverrides = serde_json::from_str(json).unwrap();
+
+		// Verify solver_id
+		assert_eq!(config.solver_id, Some("test-kms-solver".to_string()));
+
+		// Verify account
+		assert!(config.account.is_some(), "Account should be Some");
+		let account = config.account.as_ref().unwrap();
+		assert_eq!(account.primary, "kms");
+		assert!(account.implementations.contains_key("kms"));
+		assert!(
+			!account.implementations.contains_key("local"),
+			"Should NOT have local"
+		);
+		let kms_config = &account.implementations["kms"];
+		assert_eq!(
+			kms_config["key_id"].as_str().unwrap(),
+			"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+		);
+		assert_eq!(kms_config["region"].as_str().unwrap(), "us-east-1");
+
+		// Verify networks
+		assert_eq!(config.networks.len(), 2);
+		assert_eq!(config.networks[0].chain_id, 11155420);
+		assert_eq!(config.networks[1].chain_id, 84532);
+
+		// Verify admin
+		assert!(config.admin.is_some());
+		let admin = config.admin.as_ref().unwrap();
+		assert!(admin.enabled);
+		assert_eq!(admin.domain, "localhost");
 	}
 }
