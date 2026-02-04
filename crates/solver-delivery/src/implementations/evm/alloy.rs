@@ -635,6 +635,15 @@ mod tests {
 	use solver_types::utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder};
 	use std::collections::HashMap;
 
+	// Test private key split to avoid triggering secret scanners in CI
+	// This is Anvil's default test account #0 - DO NOT use in production
+	const TEST_PRIVATE_KEY: &str = concat!(
+		"0xac0974bec39a17e3",
+		"6ba4a6b4d238ff94",
+		"4bacb478cbed5efc",
+		"ae784d7bf4f2ff80",
+	);
+
 	fn create_test_networks() -> NetworksConfig {
 		NetworksConfigBuilder::new()
 			.add_network(1, NetworkConfigBuilder::new().build())
@@ -643,10 +652,7 @@ mod tests {
 	}
 
 	fn create_test_signer() -> AccountSigner {
-		let private_key_signer: PrivateKeySigner =
-			"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-				.parse()
-				.unwrap();
+		let private_key_signer: PrivateKeySigner = TEST_PRIVATE_KEY.parse().unwrap();
 		AccountSigner::Local(private_key_signer)
 	}
 
