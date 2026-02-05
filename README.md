@@ -288,7 +288,7 @@ For Redis connectivity from within Docker:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `REDIS_URL` | Yes | Redis connection URL (e.g., `redis://redis:6379`) |
+| `REDIS_URL` | Yes | Redis connection URL (for production, use managed services like AWS ElastiCache) |
 | `SOLVER_ID` | For loading | Solver ID to load config from Redis (after first seed) |
 | `RUST_LOG` | No | Log level (default: `info`) |
 | `SOLVER_PRIVATE_KEY` | Conditional | Required for local wallet if no inline `private_key` in seed overrides |
@@ -297,6 +297,8 @@ For Redis connectivity from within Docker:
 | `AWS_REGION` | For KMS | AWS region (if using KMS signer, default: from config) |
 
 **Note:** `SOLVER_PRIVATE_KEY` is required when using the local wallet without an inline `private_key` in seed overrides. Not needed if using KMS or providing `private_key` directly in the JSON.
+
+**AWS Credentials:** When running in AWS (ECS, EKS, EC2), use IAM roles instead of explicit credentials. The SDK automatically uses the instance/task role credentials. Only set `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for local development or non-AWS environments.
 
 ### Volume Mounts
 
@@ -330,7 +332,7 @@ cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json 
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `REDIS_URL` | Yes | Redis connection URL (default: `redis://localhost:6379`) |
+| `REDIS_URL` | Yes | Redis connection URL (default: `redis://localhost:6379`). For production, use managed services like AWS ElastiCache |
 | `SOLVER_PRIVATE_KEY` | Conditional | 64-character hex private key (without 0x prefix) |
 | `SOLVER_ID` | For loading | Solver ID to load from Redis (set after first seed) |
 
