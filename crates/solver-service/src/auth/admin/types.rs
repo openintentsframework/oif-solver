@@ -111,6 +111,17 @@ sol! {
 		uint256 nonce;
 		uint256 deadline;
 	}
+
+	/// Approve tokens for a specified spender
+	/// chainId = 0 means all chains, tokenAddress = 0x0 means all tokens
+	struct ApproveTokens {
+		uint256 chainId;
+		address tokenAddress;
+		address spender;
+		uint256 amount;
+		uint256 nonce;
+		uint256 deadline;
+	}
 }
 
 /// Request wrapper containing signature and contents.
@@ -269,6 +280,65 @@ impl UpdateFeeConfigContents {
 	}
 }
 
+/// ApproveTokens action contents
+///
+/// Used to trigger ERC20 approvals for tokens to a specified spender.
+/// - `chain_id = 0` means all chains
+/// - `token_address = 0x0` means all tokens on the selected chain(s)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApproveTokensContents {
+	pub chain_id: u64,
+	pub token_address: Address,
+	pub spender: Address,
+	/// Amount as decimal string (uint256). Use full max uint256 if needed.
+	pub amount: String,
+	#[serde(with = "string_or_number")]
+	pub nonce: u64,
+	#[serde(with = "string_or_number")]
+	pub deadline: u64,
+}
+
+impl ApproveTokensContents {
+	/// Convert to EIP-712 struct for hashing
+	pub fn to_eip712(&self) -> Result<ApproveTokens, AdminActionHashError> {
+		// Validate amount is not empty
+		if self.amount.is_empty() {
+			return Err(AdminActionHashError::InvalidAmount(
+				"amount cannot be empty".to_string(),
+			));
+		}
+
+		let amount = U256::from_str_radix(&self.amount, 10)
+			.map_err(|e| AdminActionHashError::InvalidAmount(e.to_string()))?;
+
+		Ok(ApproveTokens {
+			chainId: U256::from(self.chain_id),
+			tokenAddress: self.token_address,
+			spender: self.spender,
+			amount,
+			nonce: U256::from(self.nonce),
+			deadline: U256::from(self.deadline),
+		})
+	}
+
+	/// Compute the EIP-712 struct hash using Alloy's built-in support
+	pub fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
+		use alloy_sol_types::SolStruct;
+		Ok(self.to_eip712()?.eip712_hash_struct())
+	}
+
+	/// Check if this request approves all chains
+	pub fn is_all_chains(&self) -> bool {
+		self.chain_id == 0
+	}
+
+	/// Check if this request approves all tokens
+	pub fn is_all_tokens(&self) -> bool {
+		self.token_address == Address::ZERO
+	}
+}
+
 /// Trait for admin action contents that can compute their EIP-712 hash
 pub trait AdminAction {
 	/// Get the nonce from the action
@@ -356,6 +426,20 @@ impl AdminAction for UpdateFeeConfigContents {
 	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
 		// UpdateFeeConfig has no fallible parsing, always succeeds
 		Ok(UpdateFeeConfigContents::struct_hash(self))
+	}
+}
+
+impl AdminAction for ApproveTokensContents {
+	fn nonce(&self) -> u64 {
+		self.nonce
+	}
+
+	fn deadline(&self) -> u64 {
+		self.deadline
+	}
+
+	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
+		ApproveTokensContents::struct_hash(self)
 	}
 }
 
@@ -1020,5 +1104,212 @@ mod tests {
 		assert_eq!(request.contents.nonce, 1737925846892);
 		assert_eq!(request.contents.deadline, 1737929446);
 		assert_eq!(request.signature.len(), 65);
+	}
+
+	#[test]
+	fn test_approve_tokens_struct_hash() {
+		let contents = ApproveTokensContents {
+			chain_id: 10,
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			spender: Address::from_str("0x1111111111111111111111111111111111111111").unwrap(),
+			amount: "1000".to_string(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		let hash = contents.struct_hash().unwrap();
+		assert_eq!(hash.len(), 32);
+
+		// Same contents should produce same hash
+		let hash2 = contents.struct_hash().unwrap();
+		assert_eq!(hash, hash2);
+	}
+
+	#[test]
+	fn test_approve_tokens_admin_action_trait() {
+		let contents = ApproveTokensContents {
+			chain_id: 10,
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			spender: Address::from_str("0x1111111111111111111111111111111111111111").unwrap(),
+			amount: "1000".to_string(),
+			nonce: 42,
+			deadline: 1706184000,
+		};
+
+		assert_eq!(contents.nonce(), 42);
+		assert_eq!(contents.deadline(), 1706184000);
+
+		// struct_hash via trait should succeed
+		let hash = AdminAction::struct_hash(&contents);
+		assert!(hash.is_ok());
+	}
+
+	#[test]
+	fn test_approve_tokens_message_hash() {
+		let contents = ApproveTokensContents {
+			chain_id: 10,
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			spender: Address::from_str("0x1111111111111111111111111111111111111111").unwrap(),
+			amount: "1000".to_string(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		let hash = contents.message_hash(1).unwrap();
+		assert_eq!(hash.len(), 32);
+
+		// Different chain should produce different hash
+		let hash_other = contents.message_hash(10).unwrap();
+		assert_ne!(hash, hash_other);
+	}
+
+	#[test]
+	fn test_approve_tokens_serialization() {
+		let contents = ApproveTokensContents {
+			chain_id: 10,
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			spender: Address::from_str("0x1111111111111111111111111111111111111111").unwrap(),
+			amount: "1000".to_string(),
+			nonce: 12345,
+			deadline: 1706184000,
+		};
+
+		let json = serde_json::to_string(&contents).unwrap();
+		assert!(json.contains("\"chainId\":10"));
+		assert!(json.contains("\"tokenAddress\""));
+		assert!(json.contains("\"spender\""));
+		assert!(json.contains("\"amount\":\"1000\""));
+		assert!(json.contains("\"nonce\":12345"));
+		assert!(json.contains("\"deadline\":1706184000"));
+
+		// Round trip
+		let parsed: ApproveTokensContents = serde_json::from_str(&json).unwrap();
+		assert_eq!(parsed.chain_id, 10);
+		assert_eq!(parsed.nonce, 12345);
+	}
+
+	#[test]
+	fn test_approve_tokens_is_all_chains() {
+		let all_chains = ApproveTokensContents {
+			chain_id: 0,
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			spender: Address::from_str("0x1111111111111111111111111111111111111111").unwrap(),
+			amount: "1000".to_string(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+		assert!(all_chains.is_all_chains());
+
+		let specific_chain = ApproveTokensContents {
+			chain_id: 10,
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			spender: Address::from_str("0x1111111111111111111111111111111111111111").unwrap(),
+			amount: "1000".to_string(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+		assert!(!specific_chain.is_all_chains());
+	}
+
+	#[test]
+	fn test_approve_tokens_is_all_tokens() {
+		let all_tokens = ApproveTokensContents {
+			chain_id: 10,
+			token_address: Address::ZERO,
+			spender: Address::from_str("0x1111111111111111111111111111111111111111").unwrap(),
+			amount: "1000".to_string(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+		assert!(all_tokens.is_all_tokens());
+
+		let specific_token = ApproveTokensContents {
+			chain_id: 10,
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			spender: Address::from_str("0x1111111111111111111111111111111111111111").unwrap(),
+			amount: "1000".to_string(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+		assert!(!specific_token.is_all_tokens());
+	}
+
+	#[test]
+	fn test_approve_tokens_deserialize_with_string_nonce() {
+		let json = r#"{
+			"chainId": 10,
+			"tokenAddress": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
+			"spender": "0x1111111111111111111111111111111111111111",
+			"amount": "1000",
+			"nonce": "12345678901234567890",
+			"deadline": "1706184000"
+		}"#;
+
+		let contents: ApproveTokensContents = serde_json::from_str(json).unwrap();
+		assert_eq!(contents.chain_id, 10);
+		assert_eq!(
+			contents.spender,
+			Address::from_str("0x1111111111111111111111111111111111111111").unwrap()
+		);
+		assert_eq!(contents.amount, "1000");
+		assert_eq!(contents.nonce, 12345678901234567890u64);
+		assert_eq!(contents.deadline, 1706184000);
+	}
+
+	#[test]
+	fn test_approve_tokens_signed_request() {
+		let json = r#"{
+			"signature": "0xabababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab1b",
+			"contents": {
+				"chainId": 10,
+				"tokenAddress": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
+				"spender": "0x1111111111111111111111111111111111111111",
+				"amount": "1000",
+				"nonce": "1737925846892",
+				"deadline": "1737929446"
+			}
+		}"#;
+
+		let request: SignedAdminRequest<ApproveTokensContents> =
+			serde_json::from_str(json).unwrap();
+		assert_eq!(request.contents.chain_id, 10);
+		assert_eq!(request.contents.nonce, 1737925846892);
+		assert_eq!(request.contents.deadline, 1737929446);
+		assert_eq!(request.signature.len(), 65);
+	}
+
+	#[test]
+	fn test_approve_tokens_different_scopes_different_hash() {
+		let contents1 = ApproveTokensContents {
+			chain_id: 0,
+			token_address: Address::ZERO,
+			spender: Address::from_str("0x1111111111111111111111111111111111111111").unwrap(),
+			amount: "1000".to_string(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		let contents2 = ApproveTokensContents {
+			chain_id: 10,
+			token_address: Address::ZERO,
+			spender: Address::from_str("0x1111111111111111111111111111111111111111").unwrap(),
+			amount: "1000".to_string(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		let contents3 = ApproveTokensContents {
+			chain_id: 10,
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			spender: Address::from_str("0x1111111111111111111111111111111111111111").unwrap(),
+			amount: "1000".to_string(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		// Different scopes should produce different hashes
+		assert_ne!(contents1.struct_hash().unwrap(), contents2.struct_hash().unwrap());
+		assert_ne!(contents2.struct_hash().unwrap(), contents3.struct_hash().unwrap());
+		assert_ne!(contents1.struct_hash().unwrap(), contents3.struct_hash().unwrap());
 	}
 }

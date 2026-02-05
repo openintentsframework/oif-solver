@@ -10,7 +10,12 @@
 //!
 //! The signature must be an EIP-712 typed data signature from an authorized admin.
 
-use axum::{extract::State, Json};
+use axum::{
+	body::Body,
+	extract::{FromRequest, State},
+	http::Request,
+	Json,
+};
 use serde::Serialize;
 use solver_config::Config;
 use solver_core::engine::token_manager::TokenManager;
@@ -18,13 +23,15 @@ use solver_storage::{
 	config_store::{ConfigStore, ConfigStoreError},
 	nonce_store::NonceStore,
 };
-use solver_types::{AdminConfig, OperatorAdminConfig, OperatorConfig, OperatorToken};
+use solver_types::{
+	with_0x_prefix, AdminConfig, OperatorAdminConfig, OperatorConfig, OperatorToken,
+};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::auth::admin::{
-	AddTokenContents, AdminActionVerifier, AdminAuthError, SignedAdminRequest,
-	UpdateFeeConfigContents,
+	AddTokenContents, AdminActionVerifier, AdminAuthError, ApproveTokensContents,
+	RemoveTokenContents, SignedAdminRequest, UpdateFeeConfigContents, WithdrawContents,
 };
 use crate::config_merge::build_runtime_config;
 
@@ -41,6 +48,40 @@ pub struct AdminApiState {
 	pub nonce_store: Arc<NonceStore>,
 	/// Token manager for hot-reloading token configurations.
 	pub token_manager: Arc<TokenManager>,
+}
+
+/// Extractor that verifies an admin-signed request and returns the signer + contents.
+pub struct VerifiedAdmin<T> {
+	pub admin: solver_types::Address,
+	pub contents: T,
+}
+
+impl<T> FromRequest<AdminApiState> for VerifiedAdmin<T>
+where
+	T: crate::auth::admin::AdminAction + serde::de::DeserializeOwned + Send + Sync,
+{
+	type Rejection = AdminAuthError;
+
+	async fn from_request(
+		req: Request<Body>,
+		state: &AdminApiState,
+	) -> Result<Self, Self::Rejection> {
+		let Json(request) = Json::<SignedAdminRequest<T>>::from_request(req, state)
+			.await
+			.map_err(|e| {
+				AdminAuthError::InvalidMessage(format!("Invalid JSON request: {e}"))
+			})?;
+
+		let admin = {
+			let verifier = state.verifier.read().await;
+			verifier.verify(&request.contents, &request.signature).await?
+		};
+
+		Ok(Self {
+			admin: admin.into(),
+			contents: request.contents,
+		})
+	}
 }
 
 impl AdminApiState {
@@ -132,44 +173,36 @@ pub async fn handle_get_nonce(
 /// that the server will verify.
 pub async fn handle_add_token(
 	State(state): State<AdminApiState>,
-	Json(request): Json<SignedAdminRequest<AddTokenContents>>,
+	VerifiedAdmin { admin, contents }: VerifiedAdmin<AddTokenContents>,
 ) -> Result<Json<AdminActionResponse>, AdminAuthError> {
-	// 1. Verify the signature - acquire read lock, then release after verification
-	let admin = {
-		let verifier = state.verifier.read().await;
-		verifier
-			.verify(&request.contents, &request.signature)
-			.await?
-	};
-
-	// 2. Get current OperatorConfig from Redis
+	// 1. Get current OperatorConfig from Redis
 	let versioned = state.config_store.get().await.map_err(config_store_error)?;
 
 	// 3. Find network and add token
 	let mut operator_config = versioned.data;
 	let network = operator_config
 		.networks
-		.get_mut(&request.contents.chain_id)
+		.get_mut(&contents.chain_id)
 		.ok_or_else(|| {
 			AdminAuthError::InvalidMessage(format!(
 				"Network {} not found",
-				request.contents.chain_id
+				contents.chain_id
 			))
 		})?;
 
 	// 4. Check for duplicates
-	if network.has_token(&request.contents.token_address) {
+	if network.has_token(&contents.token_address) {
 		return Err(AdminAuthError::InvalidMessage(format!(
 			"Token {} already exists on chain {}",
-			request.contents.symbol, request.contents.chain_id
+			contents.symbol, contents.chain_id
 		)));
 	}
 
 	// 5. Add token to OperatorConfig
 	network.tokens.push(OperatorToken {
-		symbol: request.contents.symbol.clone(),
-		address: request.contents.token_address,
-		decimals: request.contents.decimals,
+		symbol: contents.symbol.clone(),
+		address: contents.token_address,
+		decimals: contents.decimals,
 	});
 
 	// 6. Save to Redis with optimistic locking
@@ -198,8 +231,8 @@ pub async fn handle_add_token(
 
 	tracing::info!(
 		version = new_versioned.version,
-		token = %request.contents.symbol,
-		chain_id = request.contents.chain_id,
+		token = %contents.symbol,
+		chain_id = contents.chain_id,
 		"Token added and config hot-reloaded (TokenManager updated)"
 	);
 
@@ -207,9 +240,9 @@ pub async fn handle_add_token(
 		success: true,
 		message: format!(
 			"Token {} added to chain {}",
-			request.contents.symbol, request.contents.chain_id
+			contents.symbol, contents.chain_id
 		),
-		admin: format!("{admin:?}"),
+		admin: with_0x_prefix(&hex::encode(&admin.0)),
 	}))
 }
 
@@ -234,45 +267,40 @@ pub async fn handle_add_token(
 /// - `minProfitabilityPct`: Minimum profitability as decimal string (e.g., "2.5" for 2.5%)
 pub async fn handle_update_fees(
 	State(state): State<AdminApiState>,
-	Json(request): Json<SignedAdminRequest<UpdateFeeConfigContents>>,
+	VerifiedAdmin {
+		admin,
+		contents: request,
+	}: VerifiedAdmin<UpdateFeeConfigContents>,
 ) -> Result<Json<AdminActionResponse>, AdminAuthError> {
 	use rust_decimal::Decimal;
 	use std::str::FromStr;
 
-	// 1. Verify the signature
-	let admin = {
-		let verifier = state.verifier.read().await;
-		verifier
-			.verify(&request.contents, &request.signature)
-			.await?
-	};
-
-	// 2. Validate min_profitability_pct is a valid decimal
+	// 1. Validate min_profitability_pct is a valid decimal
 	let min_profitability =
-		Decimal::from_str(&request.contents.min_profitability_pct).map_err(|_| {
+		Decimal::from_str(&request.min_profitability_pct).map_err(|_| {
 			AdminAuthError::InvalidMessage(format!(
 				"Invalid minProfitabilityPct: '{}' is not a valid decimal",
-				request.contents.min_profitability_pct
+				request.min_profitability_pct
 			))
 		})?;
 
-	// 3. Validate gas_buffer_bps is reasonable (0-10000 = 0-100%)
-	if request.contents.gas_buffer_bps > 10000 {
+	// 2. Validate gas_buffer_bps is reasonable (0-10000 = 0-100%)
+	if request.gas_buffer_bps > 10000 {
 		return Err(AdminAuthError::InvalidMessage(format!(
 			"Invalid gasBufferBps: {} exceeds maximum of 10000 (100%)",
-			request.contents.gas_buffer_bps
+			request.gas_buffer_bps
 		)));
 	}
 
-	// 4. Get current OperatorConfig from Redis
+	// 3. Get current OperatorConfig from Redis
 	let versioned = state.config_store.get().await.map_err(config_store_error)?;
 
-	// 5. Update fee configuration
+	// 4. Update fee configuration
 	let mut operator_config = versioned.data;
-	operator_config.solver.gas_buffer_bps = request.contents.gas_buffer_bps;
+	operator_config.solver.gas_buffer_bps = request.gas_buffer_bps;
 	operator_config.solver.min_profitability_pct = min_profitability;
 
-	// 6. Save to Redis with optimistic locking
+	// 5. Save to Redis with optimistic locking
 	let new_versioned = state
 		.config_store
 		.update(operator_config.clone(), versioned.version)
@@ -284,15 +312,15 @@ pub async fn handle_update_fees(
 			other => config_store_error(other),
 		})?;
 
-	// 7. HOT RELOAD: Rebuild runtime Config from updated OperatorConfig
+	// 6. HOT RELOAD: Rebuild runtime Config from updated OperatorConfig
 	let new_config = build_runtime_config(&new_versioned.data)
 		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {e}")))?;
 	*state.dynamic_config.write().await = new_config;
 
 	tracing::info!(
 		version = new_versioned.version,
-		gas_buffer_bps = request.contents.gas_buffer_bps,
-		min_profitability_pct = %request.contents.min_profitability_pct,
+		gas_buffer_bps = request.gas_buffer_bps,
+		min_profitability_pct = %request.min_profitability_pct,
 		"Fee configuration updated and config hot-reloaded"
 	);
 
@@ -300,9 +328,309 @@ pub async fn handle_update_fees(
 		success: true,
 		message: format!(
 			"Fee configuration updated: gasBufferBps={}, minProfitabilityPct={}",
-			request.contents.gas_buffer_bps, request.contents.min_profitability_pct
+			request.gas_buffer_bps, request.min_profitability_pct
 		),
-		admin: format!("{admin:?}"),
+		admin: with_0x_prefix(&hex::encode(&admin.0)),
+	}))
+}
+
+/// Response for fee configuration read.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeeConfigResponse {
+	pub min_profitability_pct: String,
+	pub gas_buffer_bps: u32,
+	pub monitoring_timeout_seconds: u64,
+}
+
+/// GET /api/v1/admin/fees
+///
+/// Returns current fee configuration.
+pub async fn handle_get_fees(State(state): State<AdminApiState>) -> Json<FeeConfigResponse> {
+	let config = state.dynamic_config.read().await;
+
+	Json(FeeConfigResponse {
+		min_profitability_pct: config.solver.min_profitability_pct.to_string(),
+		gas_buffer_bps: config.solver.gas_buffer_bps,
+		monitoring_timeout_seconds: config.solver.monitoring_timeout_seconds,
+	})
+}
+
+/// DELETE /api/v1/admin/tokens
+///
+/// Remove a token from a network's configuration.
+///
+/// The request body contains the EIP-712 signed RemoveToken action:
+/// ```json
+/// {
+///   "signature": "0x...",
+///   "contents": {
+///     "chainId": 10,
+///     "tokenAddress": "0x...",
+///     "nonce": 12345678901234,
+///     "deadline": 1706184000
+///   }
+/// }
+/// ```
+pub async fn handle_remove_token(
+	State(state): State<AdminApiState>,
+	VerifiedAdmin { admin, contents }: VerifiedAdmin<RemoveTokenContents>,
+) -> Result<Json<AdminActionResponse>, AdminAuthError> {
+	// 1. Get current OperatorConfig from Redis
+	let versioned = state.config_store.get().await.map_err(config_store_error)?;
+
+	// 3. Find network and remove token
+	let mut operator_config = versioned.data;
+	let network = operator_config
+		.networks
+		.get_mut(&contents.chain_id)
+		.ok_or_else(|| {
+			AdminAuthError::InvalidMessage(format!(
+				"Network {} not found",
+				contents.chain_id
+			))
+		})?;
+
+	// 4. Find and remove the token
+	let initial_len = network.tokens.len();
+	network
+		.tokens
+		.retain(|t| t.address != contents.token_address);
+
+	if network.tokens.len() == initial_len {
+		return Err(AdminAuthError::InvalidMessage(format!(
+			"Token {} not found on chain {}",
+			contents.token_address, contents.chain_id
+		)));
+	}
+
+	// 5. Save to Redis with optimistic locking
+	let new_versioned = state
+		.config_store
+		.update(operator_config.clone(), versioned.version)
+		.await
+		.map_err(|e| match e {
+			ConfigStoreError::VersionMismatch { .. } => {
+				AdminAuthError::Internal("Config was modified, please retry".to_string())
+			},
+			other => config_store_error(other),
+		})?;
+
+	// 6. HOT RELOAD: Rebuild runtime Config from updated OperatorConfig
+	let new_config = build_runtime_config(&new_versioned.data)
+		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {e}")))?;
+
+	// 7. Update TokenManager with new networks configuration
+	let new_networks = new_config.networks.clone();
+	state.token_manager.update_networks(new_networks).await;
+
+	// 8. Update dynamic_config
+	*state.dynamic_config.write().await = new_config;
+
+	tracing::info!(
+		version = new_versioned.version,
+		token = %contents.token_address,
+		chain_id = contents.chain_id,
+		"Token removed and config hot-reloaded (TokenManager updated)"
+	);
+
+	Ok(Json(AdminActionResponse {
+		success: true,
+		message: format!(
+			"Token {} removed from chain {}",
+			contents.token_address, contents.chain_id
+		),
+		admin: with_0x_prefix(&hex::encode(&admin.0)),
+	}))
+}
+
+/// Response for approve tokens action with details.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApproveTokensResponse {
+	pub success: bool,
+	pub message: String,
+	pub admin: String,
+	pub approved_count: usize,
+	pub chains_processed: Vec<u64>,
+}
+
+/// Response for withdrawal action.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WithdrawalResponse {
+	pub success: bool,
+	pub status: String,
+	pub message: String,
+	pub admin: String,
+	pub tx_hash: Option<String>,
+}
+
+/// POST /api/v1/admin/withdrawals
+///
+/// Submit a withdrawal transaction from the solver-managed account.
+pub async fn handle_withdrawal(
+	State(state): State<AdminApiState>,
+	VerifiedAdmin { admin, contents }: VerifiedAdmin<WithdrawContents>,
+) -> Result<Json<WithdrawalResponse>, AdminAuthError> {
+	use alloy_primitives::U256;
+
+	let withdraw = contents.to_eip712()?;
+	let recipient = solver_types::Address::from(contents.recipient);
+	let token = solver_types::Address::from(contents.token);
+
+	if withdraw.recipient == alloy_primitives::Address::ZERO {
+		return Err(AdminAuthError::InvalidMessage(
+			"Recipient cannot be zero address".to_string(),
+		));
+	}
+
+	if withdraw.amount == U256::ZERO {
+		return Err(AdminAuthError::InvalidMessage(
+			"Amount must be greater than zero".to_string(),
+		));
+	}
+
+	// Policy checks (allowlist only)
+	let versioned = state.config_store.get().await.map_err(config_store_error)?;
+	let policy = &versioned.data.admin.withdrawals;
+
+	if !policy.enabled {
+		return Err(AdminAuthError::NotAuthorized(
+			"Withdrawals are disabled".to_string(),
+		));
+	}
+
+	if !policy.allowed_recipients.is_empty()
+		&& !policy.allowed_recipients.contains(&contents.recipient)
+	{
+		return Err(AdminAuthError::NotAuthorized(
+			"Recipient not allowed".to_string(),
+		));
+	}
+
+	if !policy.allowed_tokens.is_empty() && !policy.allowed_tokens.contains(&contents.token) {
+		return Err(AdminAuthError::NotAuthorized("Token not allowed".to_string()));
+	}
+
+	// Balance check
+	let balance_str = state
+		.token_manager
+		.check_balance_any(contents.chain_id, &token)
+		.await
+		.map_err(|e| AdminAuthError::Internal(format!("Balance check failed: {e}")))?;
+
+	let balance = U256::from_str_radix(&balance_str, 10).map_err(|e| {
+		AdminAuthError::Internal(format!("Invalid balance value '{balance_str}': {e}"))
+	})?;
+
+	if balance < withdraw.amount {
+		return Err(AdminAuthError::InvalidMessage(
+			"Insufficient funds".to_string(),
+		));
+	}
+
+	let tx_hash = state
+		.token_manager
+		.withdraw_token(
+			contents.chain_id,
+			&token,
+			&recipient,
+			withdraw.amount,
+		)
+		.await
+		.map_err(|e| AdminAuthError::Internal(format!("Withdrawal failed: {e}")))?;
+
+	let tx_hash_hex = with_0x_prefix(&hex::encode(&tx_hash.0));
+
+	Ok(Json(WithdrawalResponse {
+		success: true,
+		status: "submitted".to_string(),
+		message: format!("Withdrawal submitted on chain {}", contents.chain_id),
+		admin: with_0x_prefix(&hex::encode(&admin.0)),
+		tx_hash: Some(tx_hash_hex),
+	}))
+}
+
+/// POST /api/v1/admin/tokens/approve
+///
+/// Trigger ERC-20 approvals for tokens to a specified spender.
+///
+/// Request body:
+/// ```json
+/// {
+///   "signature": "0x...",
+///   "contents": {
+///     "chainId": 10,        // 0 means all chains
+///     "tokenAddress": "0x...", // 0x0 means all tokens
+///     "spender": "0x...",  // address that will be approved
+///     "amount": "1000000", // uint256 as decimal string
+///     "nonce": 12345678901234,
+///     "deadline": 1706184000
+///   }
+/// }
+/// ```
+///
+/// Semantics:
+/// - `chainId = 0` and `tokenAddress = 0x0` → approve all tokens on all chains
+/// - `chainId = X`, `tokenAddress = 0x0` → approve all tokens on chain X
+/// - `chainId = X`, `tokenAddress = A` → approve token A on chain X
+pub async fn handle_approve_tokens(
+	State(state): State<AdminApiState>,
+	VerifiedAdmin { admin, contents }: VerifiedAdmin<ApproveTokensContents>,
+) -> Result<Json<ApproveTokensResponse>, AdminAuthError> {
+	// 1. Parse amount and determine the scope
+	let approve = contents.to_eip712()?;
+	let spender = solver_types::Address::from(approve.spender);
+
+	let token_filter = if contents.is_all_tokens() {
+		None
+	} else {
+		// Convert alloy_primitives::Address to solver_types::Address
+		Some(solver_types::Address::from(contents.token_address))
+	};
+
+	let (approved_count, chains_processed) = state
+		.token_manager
+		.ensure_approvals_for_spender_scope(
+			if contents.is_all_chains() {
+				None
+			} else {
+				Some(contents.chain_id)
+			},
+			token_filter,
+			spender,
+			approve.amount,
+		)
+		.await
+		.map_err(|e| AdminAuthError::Internal(format!("Approval failed: {e}")))?;
+
+	let scope_desc = match (
+		contents.is_all_chains(),
+		contents.is_all_tokens(),
+	) {
+		(true, true) => "all tokens on all chains".to_string(),
+		(true, false) => format!("token {} on all chains", contents.token_address),
+		(false, true) => format!("all tokens on chain {}", contents.chain_id),
+		(false, false) => format!(
+			"token {} on chain {}",
+			contents.token_address, contents.chain_id
+		),
+	};
+
+	tracing::info!(
+		approved_count,
+		chains = ?chains_processed,
+		scope = %scope_desc,
+		"Token approvals completed"
+	);
+
+	Ok(Json(ApproveTokensResponse {
+		success: true,
+		message: format!("Approved {approved_count} allowances ({scope_desc})"),
+		admin: with_0x_prefix(&hex::encode(&admin.0)),
+		approved_count,
+		chains_processed,
 	}))
 }
 
@@ -370,6 +698,19 @@ pub async fn handle_get_types(State(state): State<AdminApiState>) -> Json<Eip712
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use async_trait::async_trait;
+	use solver_account::{AccountInterface, AccountService, AccountSigner};
+	use solver_config::builders::config::ConfigBuilder;
+	use solver_delivery::{DeliveryInterface, DeliveryService, MockDeliveryInterface};
+	use solver_storage::{config_store::create_config_store, nonce_store::create_nonce_store};
+	use solver_storage::StoreConfig;
+	use solver_types::{
+		OperatorAdminConfig, OperatorConfig, OperatorGasConfig, OperatorGasFlowUnits,
+		OperatorHyperlaneConfig, OperatorOracleConfig, OperatorPricingConfig,
+		OperatorSettlementConfig, OperatorSolverConfig, OperatorWithdrawalsConfig, NetworksConfig,
+	};
+	use std::collections::HashMap;
+	use std::str::FromStr;
 
 	#[test]
 	fn test_nonce_response_serialization() {
@@ -546,6 +887,277 @@ mod tests {
 			},
 			_ => panic!("Expected Internal error"),
 		}
+	}
+
+	struct DummyAccount {
+		address: solver_types::Address,
+	}
+
+	#[async_trait]
+	impl AccountInterface for DummyAccount {
+		fn config_schema(&self) -> Box<dyn solver_types::ConfigSchema> {
+			Box::new(solver_account::implementations::local::LocalWalletSchema)
+		}
+
+		async fn address(&self) -> Result<solver_types::Address, solver_account::AccountError> {
+			Ok(self.address.clone())
+		}
+
+		async fn sign_transaction(
+			&self,
+			_tx: &solver_types::Transaction,
+		) -> Result<solver_types::Signature, solver_account::AccountError> {
+			Ok(solver_types::Signature(vec![0u8; 65]))
+		}
+
+		async fn sign_message(
+			&self,
+			_message: &[u8],
+		) -> Result<solver_types::Signature, solver_account::AccountError> {
+			Ok(solver_types::Signature(vec![0u8; 65]))
+		}
+
+		fn signer(&self) -> AccountSigner {
+			use alloy_signer_local::PrivateKeySigner;
+			let signer: PrivateKeySigner =
+				"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+					.parse()
+					.unwrap();
+			AccountSigner::Local(signer)
+		}
+	}
+
+	fn build_operator_config(
+		admin_address: alloy_primitives::Address,
+		withdrawals: OperatorWithdrawalsConfig,
+	) -> OperatorConfig {
+		OperatorConfig {
+			solver_id: "test-solver".to_string(),
+			networks: HashMap::new(),
+			settlement: OperatorSettlementConfig {
+				settlement_poll_interval_seconds: 3,
+				hyperlane: OperatorHyperlaneConfig {
+					default_gas_limit: 0,
+					message_timeout_seconds: 0,
+					finalization_required: false,
+					mailboxes: HashMap::new(),
+					igp_addresses: HashMap::new(),
+					oracles: OperatorOracleConfig {
+						input: HashMap::new(),
+						output: HashMap::new(),
+					},
+					routes: HashMap::new(),
+				},
+			},
+			gas: OperatorGasConfig {
+				resource_lock: OperatorGasFlowUnits::default(),
+				permit2_escrow: OperatorGasFlowUnits::default(),
+				eip3009_escrow: OperatorGasFlowUnits::default(),
+			},
+			pricing: OperatorPricingConfig {
+				primary: "coingecko".to_string(),
+				fallbacks: Vec::new(),
+				cache_duration_seconds: 60,
+				custom_prices: HashMap::new(),
+			},
+			solver: OperatorSolverConfig {
+				min_profitability_pct: rust_decimal::Decimal::ZERO,
+				gas_buffer_bps: 1000,
+				monitoring_timeout_seconds: 60,
+			},
+			admin: OperatorAdminConfig {
+				enabled: true,
+				domain: "test.example.com".to_string(),
+				chain_id: 1,
+				nonce_ttl_seconds: 300,
+				admin_addresses: vec![admin_address],
+				withdrawals,
+			},
+			account: None,
+		}
+	}
+
+	fn alloy_address(hex: &str) -> alloy_primitives::Address {
+		alloy_primitives::Address::from_str(hex).unwrap()
+	}
+
+	fn solver_address(hex: &str) -> solver_types::Address {
+		solver_types::Address::from(alloy_primitives::Address::from_str(hex).unwrap())
+	}
+
+	fn zero_alloy_address() -> alloy_primitives::Address {
+		alloy_primitives::Address::ZERO
+	}
+
+	fn create_delivery_service(balance: Option<&str>, expect_submit: bool) -> Arc<DeliveryService> {
+		let mut mock_delivery = MockDeliveryInterface::new();
+		if let Some(balance) = balance {
+			let balance_str = balance.to_string();
+			mock_delivery
+				.expect_get_balance()
+				.returning(move |_, _, _| {
+					let balance = balance_str.clone();
+					Box::pin(async move { Ok(balance) })
+				});
+		}
+		if expect_submit {
+			mock_delivery.expect_submit().returning(|_, _| {
+				Box::pin(async { Ok(solver_types::TransactionHash(vec![0x11; 32])) })
+			});
+		}
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+		implementations.insert(1, Arc::new(mock_delivery));
+
+		Arc::new(DeliveryService::new(implementations, 1, 30))
+	}
+
+	async fn create_admin_state(
+		balance: Option<&str>,
+		withdrawals: OperatorWithdrawalsConfig,
+		expect_submit: bool,
+	) -> AdminApiState {
+		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+		let admin_solver = solver_types::Address::from(admin_alloy);
+		let operator_config = build_operator_config(admin_alloy, withdrawals);
+
+		let config_store = create_config_store::<OperatorConfig>(
+			StoreConfig::Memory,
+			"test-solver".to_string(),
+		)
+		.unwrap();
+		config_store.seed(operator_config).await.unwrap();
+		let config_store: Arc<dyn solver_storage::config_store::ConfigStore<OperatorConfig>> =
+			Arc::from(config_store);
+
+		let nonce_store = Arc::new(
+			create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap(),
+		);
+		let verifier = AdminActionVerifier::new(
+			nonce_store.clone(),
+			AdminConfig {
+				enabled: true,
+				domain: "test.example.com".to_string(),
+				chain_id: Some(1),
+				nonce_ttl_seconds: 300,
+				admin_addresses: vec![admin_alloy],
+			},
+			1,
+		);
+
+		let account = Arc::new(AccountService::new(Box::new(DummyAccount {
+			address: admin_solver,
+		})));
+		let delivery = create_delivery_service(balance, expect_submit);
+		let token_manager = Arc::new(TokenManager::new(NetworksConfig::default(), delivery, account));
+		let dynamic_config = Arc::new(RwLock::new(ConfigBuilder::new().build()));
+
+		AdminApiState {
+			verifier: Arc::new(RwLock::new(verifier)),
+			config_store,
+			dynamic_config,
+			nonce_store,
+			token_manager,
+		}
+	}
+
+	#[tokio::test]
+	async fn test_withdraw_success() {
+		let recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: true,
+			allowed_recipients: vec![recipient],
+			allowed_tokens: vec![zero_alloy_address()],
+		};
+
+		let state = create_admin_state(Some("1000000000000000000"), withdrawals, true).await;
+		let contents = WithdrawContents {
+			chain_id: 1,
+			token: zero_alloy_address(),
+			amount: "100000000000000000".to_string(),
+			recipient,
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let response = handle_withdrawal(State(state), verified).await.unwrap();
+		assert!(response.success);
+		assert_eq!(response.status, "submitted");
+		assert!(response.tx_hash.as_ref().unwrap().starts_with("0x"));
+	}
+
+	#[tokio::test]
+	async fn test_withdraw_insufficient_funds() {
+		let recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: true,
+			allowed_recipients: vec![recipient],
+			allowed_tokens: vec![zero_alloy_address()],
+		};
+
+		let state = create_admin_state(Some("10"), withdrawals, false).await;
+		let contents = WithdrawContents {
+			chain_id: 1,
+			token: zero_alloy_address(),
+			amount: "100".to_string(),
+			recipient,
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let err = handle_withdrawal(State(state), verified).await.unwrap_err();
+		assert!(matches!(err, AdminAuthError::InvalidMessage(_)));
+	}
+
+	#[tokio::test]
+	async fn test_verified_admin_bad_signature() {
+		let recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: true,
+			allowed_recipients: vec![recipient],
+			allowed_tokens: vec![zero_alloy_address()],
+		};
+
+		let state = create_admin_state(None, withdrawals, false).await;
+		let verifier = state.verifier.read().await;
+		let nonce = verifier.generate_nonce().await.unwrap();
+
+		let contents = WithdrawContents {
+			chain_id: 1,
+			token: zero_alloy_address(),
+			amount: "1".to_string(),
+			recipient,
+			nonce,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let payload = serde_json::json!({
+			"signature": "0x12",
+			"contents": contents
+		});
+
+		let request = Request::builder()
+			.method("POST")
+			.uri("/admin/withdrawals")
+			.header("content-type", "application/json")
+			.body(Body::from(payload.to_string()))
+			.unwrap();
+
+		let result = VerifiedAdmin::<WithdrawContents>::from_request(request, &state).await;
+		assert!(matches!(result, Err(AdminAuthError::InvalidSignature(_))));
 	}
 
 	#[test]

@@ -768,6 +768,14 @@ pub fn admin_eip712_types() -> serde_json::Value {
 			{"name": "minProfitabilityPct", "type": "string"},
 			{"name": "nonce", "type": "uint256"},
 			{"name": "deadline", "type": "uint256"}
+		],
+		"ApproveTokens": [
+			{"name": "chainId", "type": "uint256"},
+			{"name": "tokenAddress", "type": "address"},
+			{"name": "spender", "type": "address"},
+			{"name": "amount", "type": "uint256"},
+			{"name": "nonce", "type": "uint256"},
+			{"name": "deadline", "type": "uint256"}
 		]
 	})
 }
@@ -1670,6 +1678,7 @@ mod tests {
 		assert!(obj.contains_key("AddAdmin"));
 		assert!(obj.contains_key("RemoveAdmin"));
 		assert!(obj.contains_key("UpdateFeeConfig"));
+		assert!(obj.contains_key("ApproveTokens"));
 	}
 
 	#[test]
@@ -1733,5 +1742,39 @@ mod tests {
 		let types1 = admin_eip712_types();
 		let types2 = admin_eip712_types();
 		assert_eq!(types1, types2);
+	}
+
+	#[test]
+	fn test_admin_eip712_types_approve_tokens_fields() {
+		let types = admin_eip712_types();
+		let approve_tokens = types["ApproveTokens"]
+			.as_array()
+			.expect("should be an array");
+
+		// ApproveTokens should have: chainId, tokenAddress, spender, amount, nonce, deadline
+		assert_eq!(approve_tokens.len(), 6);
+
+		let names: Vec<&str> = approve_tokens
+			.iter()
+			.map(|f| f["name"].as_str().unwrap())
+			.collect();
+		assert!(names.contains(&"chainId"));
+		assert!(names.contains(&"tokenAddress"));
+		assert!(names.contains(&"spender"));
+		assert!(names.contains(&"amount"));
+		assert!(names.contains(&"nonce"));
+		assert!(names.contains(&"deadline"));
+
+		// Check types
+		let types_map: std::collections::HashMap<&str, &str> = approve_tokens
+			.iter()
+			.map(|f| (f["name"].as_str().unwrap(), f["type"].as_str().unwrap()))
+			.collect();
+		assert_eq!(types_map["chainId"], "uint256");
+		assert_eq!(types_map["tokenAddress"], "address");
+		assert_eq!(types_map["spender"], "address");
+		assert_eq!(types_map["amount"], "uint256");
+		assert_eq!(types_map["nonce"], "uint256");
+		assert_eq!(types_map["deadline"], "uint256");
 	}
 }

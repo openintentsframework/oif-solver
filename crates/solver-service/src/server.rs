@@ -5,7 +5,9 @@
 
 use crate::{
 	apis::admin::{
-		handle_add_token, handle_get_nonce, handle_get_types, handle_update_fees, AdminApiState,
+		handle_add_token, handle_approve_tokens, handle_get_fees, handle_get_nonce,
+		handle_get_types, handle_remove_token, handle_update_fees, handle_withdrawal,
+		AdminApiState,
 	},
 	apis::health::handle_health,
 	apis::order::get_order_by_id,
@@ -20,7 +22,7 @@ use axum::{
 	http::StatusCode,
 	middleware,
 	response::{IntoResponse, Json},
-	routing::{get, post, put},
+	routing::{delete, get, post, put},
 	Router, ServiceExt,
 };
 use serde_json::Value;
@@ -272,6 +274,10 @@ pub async fn start_server(
 			.route("/nonce", get(handle_get_nonce))
 			.route("/types", get(handle_get_types))
 			.route("/tokens", post(handle_add_token))
+			.route("/tokens", delete(handle_remove_token))
+			.route("/tokens/approve", post(handle_approve_tokens))
+			.route("/withdrawals", post(handle_withdrawal))
+			.route("/fees", get(handle_get_fees))
 			.route("/fees", put(handle_update_fees))
 			.with_state(admin_state);
 		// Only apply JWT auth to admin routes if orders_require_auth is true

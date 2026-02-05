@@ -202,6 +202,86 @@ impl TokenManager {
 		Ok(())
 	}
 
+	/// Ensures approvals for a specific spender and amount across a token scope.
+	///
+	/// # Arguments
+	///
+	/// * `chain_id` - If Some, only process tokens on this chain. If None, process all chains.
+	/// * `token_address` - If Some, only process this specific token. If None, process all tokens.
+	/// * `spender` - Address to approve as spender.
+	/// * `amount` - Exact allowance amount to set (uint256).
+	///
+	/// # Returns
+	///
+	/// Returns a tuple of (approved_count, chains_processed) on success.
+	/// Returns an error if any approval transaction fails.
+	pub async fn ensure_approvals_for_spender_scope(
+		&self,
+		chain_id: Option<u64>,
+		token_address: Option<Address>,
+		spender: Address,
+		amount: U256,
+	) -> Result<(usize, Vec<u64>), TokenManagerError> {
+		let solver_address = self.account.get_address().await?;
+		let solver_address_str = with_0x_prefix(&hex::encode(&solver_address.0));
+
+		let networks = self.networks.read().await;
+		let mut approved_count = 0usize;
+		let mut chains_processed = Vec::new();
+
+		for (cid, network) in networks.iter() {
+			// Skip if chain filter is set and doesn't match
+			if let Some(filter_chain) = chain_id {
+				if *cid != filter_chain {
+					continue;
+				}
+			}
+
+			chains_processed.push(*cid);
+
+			for token in &network.tokens {
+				// Skip if token filter is set and doesn't match
+				if let Some(ref filter_token) = token_address {
+					if token.address != *filter_token {
+						continue;
+					}
+				}
+
+				let current_allowance = self
+					.delivery
+					.get_allowance(
+						*cid,
+						&solver_address_str,
+						&with_0x_prefix(&hex::encode(&spender.0)),
+						&with_0x_prefix(&hex::encode(&token.address.0)),
+					)
+					.await?;
+
+				let current_allowance_u256 = U256::from_str_radix(&current_allowance, 10)
+					.map_err(|e| {
+						TokenManagerError::ParseError(format!(
+							"Invalid allowance value '{current_allowance}': {e}"
+						))
+					})?;
+
+				// Set exact allowance if it doesn't match the requested amount
+				if current_allowance_u256 != amount {
+					tracing::info!(
+						"Setting approval for token {} on chain {} for spender {}",
+						token.symbol,
+						cid,
+						with_0x_prefix(&hex::encode(&spender.0))
+					);
+					self.submit_approval(*cid, &token.address, &spender, amount)
+						.await?;
+					approved_count += 1;
+				}
+			}
+		}
+
+		Ok((approved_count, chains_processed))
+	}
+
 	/// Submits an ERC20 approval transaction.
 	///
 	/// Creates and submits a transaction to approve the specified spender to transfer
@@ -211,7 +291,7 @@ impl TokenManager {
 	///
 	/// * `chain_id` - The blockchain network ID
 	/// * `token_address` - The ERC20 token contract address
-	/// * `spender` - The address being granted approval (settler contract)
+	/// * `spender` - The address being granted approval
 	/// * `amount` - The amount to approve (typically MAX_UINT256)
 	///
 	/// # Returns
@@ -323,6 +403,82 @@ impl TokenManager {
 			.await?;
 
 		Ok(balance)
+	}
+
+	/// Checks balance for a token address or native currency on a specific chain.
+	///
+	/// If `token_address` is the zero address, this returns the native token balance.
+	/// Otherwise, it returns the ERC-20 balance for the token.
+	pub async fn check_balance_any(
+		&self,
+		chain_id: u64,
+		token_address: &Address,
+	) -> Result<String, TokenManagerError> {
+		if token_address.0 == [0u8; 20] {
+			let solver_address = self.account.get_address().await?;
+			let solver_address_str = hex::encode(&solver_address.0);
+			let balance = self
+				.delivery
+				.get_balance(chain_id, &solver_address_str, None)
+				.await?;
+			return Ok(balance);
+		}
+
+		self.check_balance(chain_id, token_address).await
+	}
+
+	/// Transfers tokens or native currency from the solver account to a recipient.
+	///
+	/// If `token_address` is the zero address, this performs a native currency transfer.
+	/// Otherwise, it submits an ERC-20 `transfer(address,uint256)` transaction.
+	pub async fn withdraw_token(
+		&self,
+		chain_id: u64,
+		token_address: &Address,
+		recipient: &Address,
+		amount: U256,
+	) -> Result<TransactionHash, TokenManagerError> {
+		let tx = if token_address.0 == [0u8; 20] {
+			Transaction {
+				chain_id,
+				to: Some(recipient.clone()),
+				data: Vec::new(),
+				value: amount,
+				gas_limit: Some(21000),
+				gas_price: None,
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+				nonce: None,
+			}
+		} else {
+			// ERC20 transfer(address,uint256) selector: 0xa9059cbb
+			let selector = [0xa9, 0x05, 0x9c, 0xbb];
+			let mut call_data = Vec::new();
+			call_data.extend_from_slice(&selector);
+
+			// Add recipient address (32 bytes, left-padded with zeros)
+			call_data.extend_from_slice(&[0; 12]);
+			call_data.extend_from_slice(&recipient.0);
+
+			// Add amount (32 bytes)
+			let amount_bytes = amount.to_be_bytes::<32>();
+			call_data.extend_from_slice(&amount_bytes);
+
+			Transaction {
+				chain_id,
+				to: Some(token_address.clone()),
+				data: call_data,
+				value: U256::ZERO,
+				gas_limit: Some(100000),
+				gas_price: None,
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+				nonce: None,
+			}
+		};
+
+		let tx_hash = self.delivery.deliver(tx, None).await?;
+		Ok(tx_hash)
 	}
 
 	/// Checks if a token is supported on a specific chain.
