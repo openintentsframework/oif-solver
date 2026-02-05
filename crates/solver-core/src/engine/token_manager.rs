@@ -257,8 +257,8 @@ impl TokenManager {
 					)
 					.await?;
 
-				let current_allowance_u256 = U256::from_str_radix(&current_allowance, 10)
-					.map_err(|e| {
+				let current_allowance_u256 =
+					U256::from_str_radix(&current_allowance, 10).map_err(|e| {
 						TokenManagerError::ParseError(format!(
 							"Invalid allowance value '{current_allowance}': {e}"
 						))

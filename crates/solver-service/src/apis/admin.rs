@@ -68,13 +68,13 @@ where
 	) -> Result<Self, Self::Rejection> {
 		let Json(request) = Json::<SignedAdminRequest<T>>::from_request(req, state)
 			.await
-			.map_err(|e| {
-				AdminAuthError::InvalidMessage(format!("Invalid JSON request: {e}"))
-			})?;
+			.map_err(|e| AdminAuthError::InvalidMessage(format!("Invalid JSON request: {e}")))?;
 
 		let admin = {
 			let verifier = state.verifier.read().await;
-			verifier.verify(&request.contents, &request.signature).await?
+			verifier
+				.verify(&request.contents, &request.signature)
+				.await?
 		};
 
 		Ok(Self {
@@ -184,10 +184,7 @@ pub async fn handle_add_token(
 		.networks
 		.get_mut(&contents.chain_id)
 		.ok_or_else(|| {
-			AdminAuthError::InvalidMessage(format!(
-				"Network {} not found",
-				contents.chain_id
-			))
+			AdminAuthError::InvalidMessage(format!("Network {} not found", contents.chain_id))
 		})?;
 
 	// 4. Check for duplicates
@@ -276,13 +273,12 @@ pub async fn handle_update_fees(
 	use std::str::FromStr;
 
 	// 1. Validate min_profitability_pct is a valid decimal
-	let min_profitability =
-		Decimal::from_str(&request.min_profitability_pct).map_err(|_| {
-			AdminAuthError::InvalidMessage(format!(
-				"Invalid minProfitabilityPct: '{}' is not a valid decimal",
-				request.min_profitability_pct
-			))
-		})?;
+	let min_profitability = Decimal::from_str(&request.min_profitability_pct).map_err(|_| {
+		AdminAuthError::InvalidMessage(format!(
+			"Invalid minProfitabilityPct: '{}' is not a valid decimal",
+			request.min_profitability_pct
+		))
+	})?;
 
 	// 2. Validate gas_buffer_bps is reasonable (0-10000 = 0-100%)
 	if request.gas_buffer_bps > 10000 {
@@ -385,10 +381,7 @@ pub async fn handle_remove_token(
 		.networks
 		.get_mut(&contents.chain_id)
 		.ok_or_else(|| {
-			AdminAuthError::InvalidMessage(format!(
-				"Network {} not found",
-				contents.chain_id
-			))
+			AdminAuthError::InvalidMessage(format!("Network {} not found", contents.chain_id))
 		})?;
 
 	// 4. Find and remove the token
@@ -510,7 +503,9 @@ pub async fn handle_withdrawal(
 	}
 
 	if !policy.allowed_tokens.is_empty() && !policy.allowed_tokens.contains(&contents.token) {
-		return Err(AdminAuthError::NotAuthorized("Token not allowed".to_string()));
+		return Err(AdminAuthError::NotAuthorized(
+			"Token not allowed".to_string(),
+		));
 	}
 
 	// Balance check
@@ -532,12 +527,7 @@ pub async fn handle_withdrawal(
 
 	let tx_hash = state
 		.token_manager
-		.withdraw_token(
-			contents.chain_id,
-			&token,
-			&recipient,
-			withdraw.amount,
-		)
+		.withdraw_token(contents.chain_id, &token, &recipient, withdraw.amount)
 		.await
 		.map_err(|e| AdminAuthError::Internal(format!("Withdrawal failed: {e}")))?;
 
@@ -605,10 +595,7 @@ pub async fn handle_approve_tokens(
 		.await
 		.map_err(|e| AdminAuthError::Internal(format!("Approval failed: {e}")))?;
 
-	let scope_desc = match (
-		contents.is_all_chains(),
-		contents.is_all_tokens(),
-	) {
+	let scope_desc = match (contents.is_all_chains(), contents.is_all_tokens()) {
 		(true, true) => "all tokens on all chains".to_string(),
 		(true, false) => format!("token {} on all chains", contents.token_address),
 		(false, true) => format!("all tokens on chain {}", contents.chain_id),
@@ -702,12 +689,12 @@ mod tests {
 	use solver_account::{AccountInterface, AccountService, AccountSigner};
 	use solver_config::builders::config::ConfigBuilder;
 	use solver_delivery::{DeliveryInterface, DeliveryService, MockDeliveryInterface};
-	use solver_storage::{config_store::create_config_store, nonce_store::create_nonce_store};
 	use solver_storage::StoreConfig;
+	use solver_storage::{config_store::create_config_store, nonce_store::create_nonce_store};
 	use solver_types::{
-		OperatorAdminConfig, OperatorConfig, OperatorGasConfig, OperatorGasFlowUnits,
-		OperatorHyperlaneConfig, OperatorOracleConfig, OperatorPricingConfig,
-		OperatorSettlementConfig, OperatorSolverConfig, OperatorWithdrawalsConfig, NetworksConfig,
+		NetworksConfig, OperatorAdminConfig, OperatorConfig, OperatorGasConfig,
+		OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorOracleConfig, OperatorPricingConfig,
+		OperatorSettlementConfig, OperatorSolverConfig, OperatorWithdrawalsConfig,
 	};
 	use std::collections::HashMap;
 	use std::str::FromStr;
@@ -1024,18 +1011,15 @@ mod tests {
 		let admin_solver = solver_types::Address::from(admin_alloy);
 		let operator_config = build_operator_config(admin_alloy, withdrawals);
 
-		let config_store = create_config_store::<OperatorConfig>(
-			StoreConfig::Memory,
-			"test-solver".to_string(),
-		)
-		.unwrap();
+		let config_store =
+			create_config_store::<OperatorConfig>(StoreConfig::Memory, "test-solver".to_string())
+				.unwrap();
 		config_store.seed(operator_config).await.unwrap();
 		let config_store: Arc<dyn solver_storage::config_store::ConfigStore<OperatorConfig>> =
 			Arc::from(config_store);
 
-		let nonce_store = Arc::new(
-			create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap(),
-		);
+		let nonce_store =
+			Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
 		let verifier = AdminActionVerifier::new(
 			nonce_store.clone(),
 			AdminConfig {
@@ -1052,7 +1036,11 @@ mod tests {
 			address: admin_solver,
 		})));
 		let delivery = create_delivery_service(balance, expect_submit);
-		let token_manager = Arc::new(TokenManager::new(NetworksConfig::default(), delivery, account));
+		let token_manager = Arc::new(TokenManager::new(
+			NetworksConfig::default(),
+			delivery,
+			account,
+		));
 		let dynamic_config = Arc::new(RwLock::new(ConfigBuilder::new().build()));
 
 		AdminApiState {

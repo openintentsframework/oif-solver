@@ -1308,8 +1308,17 @@ mod tests {
 		};
 
 		// Different scopes should produce different hashes
-		assert_ne!(contents1.struct_hash().unwrap(), contents2.struct_hash().unwrap());
-		assert_ne!(contents2.struct_hash().unwrap(), contents3.struct_hash().unwrap());
-		assert_ne!(contents1.struct_hash().unwrap(), contents3.struct_hash().unwrap());
+		assert_ne!(
+			contents1.struct_hash().unwrap(),
+			contents2.struct_hash().unwrap()
+		);
+		assert_ne!(
+			contents2.struct_hash().unwrap(),
+			contents3.struct_hash().unwrap()
+		);
+		assert_ne!(
+			contents1.struct_hash().unwrap(),
+			contents3.struct_hash().unwrap()
+		);
 	}
 }
