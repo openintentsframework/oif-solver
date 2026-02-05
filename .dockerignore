@@ -26,6 +26,9 @@ scripts/
 # Local configuration (mount at runtime instead)
 config/*.local.toml
 
+# Seed overrides (may contain secrets - mount at runtime instead)
+config/seed-overrides*.json
+
 # CI/CD
 .github/
 .gitlab-ci.yml
