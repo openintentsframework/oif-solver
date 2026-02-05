@@ -603,7 +603,7 @@ fn build_discovery_config_from_operator(chain_ids: &[u64]) -> DiscoveryConfig {
 
 	// Offchain discovery - receives orders via HTTP API from aggregators
 	let offchain_config = toml_table(vec![
-		("api_host", toml::Value::String("127.0.0.1".to_string())),
+		("api_host", toml::Value::String("0.0.0.0".to_string())),
 		("api_port", toml::Value::Integer(8081)),
 		("network_ids", network_ids_array),
 	]);
@@ -853,7 +853,7 @@ fn build_api_config_from_operator(admin: &OperatorAdminConfig) -> ApiConfig {
 
 	ApiConfig {
 		enabled: true,
-		host: "127.0.0.1".to_string(),
+		host: "0.0.0.0".to_string(),
 		port: 3000,
 		timeout_seconds: 30,
 		max_request_size: 1024 * 1024, // 1MB
@@ -1094,7 +1094,7 @@ fn build_discovery_config(chain_ids: &[u64], defaults: &SeedDefaults) -> Discove
 
 	// Offchain discovery - receives orders via HTTP API from aggregators
 	let offchain_config = toml_table(vec![
-		("api_host", toml::Value::String("127.0.0.1".to_string())),
+		("api_host", toml::Value::String("0.0.0.0".to_string())),
 		("api_port", toml::Value::Integer(8081)),
 		("network_ids", network_ids_array),
 	]);
@@ -1336,7 +1336,7 @@ fn build_api_config(
 
 	ApiConfig {
 		enabled: true,
-		host: "127.0.0.1".to_string(),
+		host: "0.0.0.0".to_string(),
 		port: 3000,
 		timeout_seconds: 30,
 		max_request_size: 1024 * 1024, // 1MB
