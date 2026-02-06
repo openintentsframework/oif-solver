@@ -31,7 +31,7 @@ use clap::Parser;
 use solver_config::Config;
 use solver_service::{
 	build_solver_from_config,
-	config_merge::{build_runtime_config, config_to_operator_config, merge_config},
+	config_merge::{build_runtime_config, merge_to_operator_config},
 	seeds::SeedPreset,
 	server,
 };
@@ -161,10 +161,9 @@ async fn load_config(
 		// Parse seed overrides
 		let seed_overrides = parse_seed_overrides(seed_overrides_str)?;
 
-		// Merge seed + overrides to get Config, then convert to OperatorConfig
+		// Merge seed + overrides directly to OperatorConfig
 		tracing::info!("Merging seed overrides with {} seed", seed_name);
-		let merged_config = merge_config(seed_overrides, seed)?;
-		let operator_config = config_to_operator_config(&merged_config)?;
+		let operator_config = merge_to_operator_config(seed_overrides, seed)?;
 		let solver_id = operator_config.solver_id.clone();
 
 		// Create OperatorConfig store for seeding (not legacy Config store)

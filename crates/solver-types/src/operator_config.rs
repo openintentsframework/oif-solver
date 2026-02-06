@@ -275,6 +275,26 @@ pub struct OperatorAdminConfig {
 
 	/// Authorized admin wallet addresses.
 	pub admin_addresses: Vec<Address>,
+
+	/// Withdrawal policy for admin-initiated transfers.
+	#[serde(default)]
+	pub withdrawals: OperatorWithdrawalsConfig,
+}
+
+/// Withdrawal policy configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OperatorWithdrawalsConfig {
+	/// Whether withdrawals are enabled.
+	#[serde(default)]
+	pub enabled: bool,
+
+	/// Allowlisted recipient addresses (empty = allow all).
+	#[serde(default)]
+	pub allowed_recipients: Vec<Address>,
+
+	/// Allowlisted token addresses (empty = allow all, include 0x0 for native).
+	#[serde(default)]
+	pub allowed_tokens: Vec<Address>,
 }
 
 impl OperatorConfig {
@@ -361,6 +381,7 @@ impl Default for OperatorAdminConfig {
 			chain_id: 1,
 			nonce_ttl_seconds: 300,
 			admin_addresses: Vec::new(),
+			withdrawals: OperatorWithdrawalsConfig::default(),
 		}
 	}
 }
@@ -402,6 +423,7 @@ mod tests {
 			chain_id: 1,
 			nonce_ttl_seconds: 300,
 			admin_addresses: vec![test_address()],
+			withdrawals: OperatorWithdrawalsConfig::default(),
 		};
 
 		assert!(admin.is_authorized(&test_address()));
@@ -545,6 +567,7 @@ mod tests {
 				chain_id: 1,
 				nonce_ttl_seconds: 300,
 				admin_addresses: vec![test_address()],
+				withdrawals: OperatorWithdrawalsConfig::default(),
 			},
 			account: None,
 		};

@@ -35,7 +35,7 @@ use solver_types::{
 	OperatorAccountConfig, OperatorAdminConfig, OperatorConfig, OperatorGasConfig,
 	OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig,
 	OperatorPricingConfig, OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSolverConfig,
-	OperatorToken, SeedOverrides, TokenConfig,
+	OperatorToken, OperatorWithdrawalsConfig, SeedOverrides, TokenConfig,
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -209,6 +209,11 @@ pub fn merge_to_operator_config(
 			chain_id: admin_override.chain_id.unwrap_or(chain_ids[0]),
 			nonce_ttl_seconds: admin_override.nonce_ttl_seconds.unwrap_or(300),
 			admin_addresses: admin_override.admin_addresses.clone(),
+			withdrawals: OperatorWithdrawalsConfig {
+				enabled: admin_override.withdrawals.enabled,
+				allowed_recipients: admin_override.withdrawals.allowed_recipients.clone(),
+				allowed_tokens: admin_override.withdrawals.allowed_tokens.clone(),
+			},
 		},
 		None => OperatorAdminConfig::default(),
 	};
@@ -1509,6 +1514,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 				.unwrap_or(chain_ids.first().copied().unwrap_or(1)),
 			nonce_ttl_seconds: a.nonce_ttl_seconds,
 			admin_addresses: a.admin_addresses.clone(),
+			withdrawals: OperatorWithdrawalsConfig::default(),
 		})
 		.unwrap_or_default();
 
@@ -2360,6 +2366,7 @@ mod tests {
 				chain_id: Some(1),
 				nonce_ttl_seconds: Some(600),
 				admin_addresses: vec![address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")],
+				withdrawals: solver_types::seed_overrides::WithdrawalsOverride::default(),
 			}),
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -2737,6 +2744,7 @@ mod tests {
 			chain_id: 1,
 			nonce_ttl_seconds: 300,
 			admin_addresses: vec![address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")],
+			withdrawals: OperatorWithdrawalsConfig::default(),
 		};
 
 		let api = build_api_config_from_operator(&admin);
@@ -2757,6 +2765,7 @@ mod tests {
 			chain_id: 0,
 			nonce_ttl_seconds: 0,
 			admin_addresses: vec![],
+			withdrawals: OperatorWithdrawalsConfig::default(),
 		};
 
 		let api = build_api_config_from_operator(&admin);
@@ -2780,6 +2789,7 @@ mod tests {
 			chain_id: 1,
 			nonce_ttl_seconds: 300,
 			admin_addresses: vec![address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")],
+			withdrawals: OperatorWithdrawalsConfig::default(),
 		};
 		let api = build_api_config_from_operator(&admin);
 		let auth = api.auth.as_ref().unwrap();

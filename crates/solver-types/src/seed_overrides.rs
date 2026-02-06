@@ -109,10 +109,30 @@ pub struct AdminOverride {
 	/// Optional nonce TTL in seconds. Default: 300 (5 minutes).
 	#[serde(default)]
 	pub nonce_ttl_seconds: Option<u64>,
+
+	/// Withdrawal policy overrides.
+	#[serde(default)]
+	pub withdrawals: WithdrawalsOverride,
 }
 
 fn default_admin_enabled() -> bool {
 	true
+}
+
+/// Withdrawal policy overrides for admin withdrawals.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WithdrawalsOverride {
+	/// Whether withdrawals are enabled.
+	#[serde(default)]
+	pub enabled: bool,
+
+	/// Allowlisted recipient addresses (empty = allow all).
+	#[serde(default)]
+	pub allowed_recipients: Vec<Address>,
+
+	/// Allowlisted token addresses (empty = allow all, include 0x0 for native).
+	#[serde(default)]
+	pub allowed_tokens: Vec<Address>,
 }
 
 /// Helper module for Option<Decimal> serialization.
