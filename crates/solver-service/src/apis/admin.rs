@@ -1169,4 +1169,243 @@ mod tests {
 		assert!(optimism_json.contains("\"chainId\":10"));
 		assert_ne!(mainnet_json, optimism_json);
 	}
+
+	#[tokio::test]
+	async fn test_handle_get_fees() {
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: false,
+			allowed_recipients: vec![],
+			allowed_tokens: vec![],
+		};
+		let state = create_admin_state(None, withdrawals, false).await;
+		let response = handle_get_fees(State(state)).await;
+
+		// ConfigBuilder default values
+		assert!(response.gas_buffer_bps >= 0);
+		assert!(!response.min_profitability_pct.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_handle_get_nonce() {
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: false,
+			allowed_recipients: vec![],
+			allowed_tokens: vec![],
+		};
+		let state = create_admin_state(None, withdrawals, false).await;
+		let result = handle_get_nonce(State(state)).await;
+
+		assert!(result.is_ok());
+		let response = result.unwrap();
+		assert!(!response.nonce.is_empty());
+		assert_eq!(response.expires_in, 300);
+		assert_eq!(response.domain, "test.example.com");
+		assert_eq!(response.chain_id, 1);
+	}
+
+	#[tokio::test]
+	async fn test_handle_get_types() {
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: false,
+			allowed_recipients: vec![],
+			allowed_tokens: vec![],
+		};
+		let state = create_admin_state(None, withdrawals, false).await;
+		let response = handle_get_types(State(state)).await;
+
+		assert_eq!(response.domain.name, "OIF Solver Admin");
+		assert_eq!(response.domain.version, "1");
+		assert_eq!(response.domain.chain_id, 1);
+		assert!(response.types.is_object());
+	}
+
+	#[tokio::test]
+	async fn test_withdraw_disabled() {
+		let recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: false, // Disabled!
+			allowed_recipients: vec![recipient],
+			allowed_tokens: vec![zero_alloy_address()],
+		};
+
+		let state = create_admin_state(None, withdrawals, false).await;
+		let contents = WithdrawContents {
+			chain_id: 1,
+			token: zero_alloy_address(),
+			amount: "100".to_string(),
+			recipient,
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let err = handle_withdrawal(State(state), verified).await.unwrap_err();
+		assert!(matches!(err, AdminAuthError::NotAuthorized(_)));
+	}
+
+	#[tokio::test]
+	async fn test_withdraw_recipient_not_allowed() {
+		let allowed_recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
+		let other_recipient = alloy_address("0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC");
+
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: true,
+			allowed_recipients: vec![allowed_recipient], // Only this recipient allowed
+			allowed_tokens: vec![zero_alloy_address()],
+		};
+
+		let state = create_admin_state(None, withdrawals, false).await;
+		let contents = WithdrawContents {
+			chain_id: 1,
+			token: zero_alloy_address(),
+			amount: "100".to_string(),
+			recipient: other_recipient, // Different recipient!
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let err = handle_withdrawal(State(state), verified).await.unwrap_err();
+		assert!(matches!(err, AdminAuthError::NotAuthorized(_)));
+	}
+
+	#[tokio::test]
+	async fn test_withdraw_token_not_allowed() {
+		let recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
+		let allowed_token = alloy_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+		let other_token = alloy_address("0xdAC17F958D2ee523a2206206994597C13D831ec7");
+
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: true,
+			allowed_recipients: vec![recipient],
+			allowed_tokens: vec![allowed_token], // Only this token allowed
+		};
+
+		let state = create_admin_state(None, withdrawals, false).await;
+		let contents = WithdrawContents {
+			chain_id: 1,
+			token: other_token, // Different token!
+			amount: "100".to_string(),
+			recipient,
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let err = handle_withdrawal(State(state), verified).await.unwrap_err();
+		assert!(matches!(err, AdminAuthError::NotAuthorized(_)));
+	}
+
+	#[tokio::test]
+	async fn test_withdraw_zero_amount() {
+		let recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: true,
+			allowed_recipients: vec![],
+			allowed_tokens: vec![],
+		};
+
+		let state = create_admin_state(None, withdrawals, false).await;
+		let contents = WithdrawContents {
+			chain_id: 1,
+			token: zero_alloy_address(),
+			amount: "0".to_string(), // Zero amount!
+			recipient,
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let err = handle_withdrawal(State(state), verified).await.unwrap_err();
+		assert!(matches!(err, AdminAuthError::InvalidMessage(_)));
+	}
+
+	#[tokio::test]
+	async fn test_withdraw_zero_recipient() {
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: true,
+			allowed_recipients: vec![],
+			allowed_tokens: vec![],
+		};
+
+		let state = create_admin_state(None, withdrawals, false).await;
+		let contents = WithdrawContents {
+			chain_id: 1,
+			token: zero_alloy_address(),
+			amount: "100".to_string(),
+			recipient: zero_alloy_address(), // Zero recipient!
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let err = handle_withdrawal(State(state), verified).await.unwrap_err();
+		assert!(matches!(err, AdminAuthError::InvalidMessage(_)));
+	}
+
+	#[test]
+	fn test_fee_config_response_serialization() {
+		let response = FeeConfigResponse {
+			min_profitability_pct: "2.5".to_string(),
+			gas_buffer_bps: 1500,
+			monitoring_timeout_seconds: 60,
+		};
+
+		let json = serde_json::to_string(&response).unwrap();
+		assert!(json.contains("\"minProfitabilityPct\":\"2.5\""));
+		assert!(json.contains("\"gasBufferBps\":1500"));
+		assert!(json.contains("\"monitoringTimeoutSeconds\":60"));
+	}
+
+	#[test]
+	fn test_withdrawal_response_serialization() {
+		let response = WithdrawalResponse {
+			success: true,
+			status: "submitted".to_string(),
+			message: "Withdrawal submitted".to_string(),
+			admin: "0x1234".to_string(),
+			tx_hash: Some("0xabcd".to_string()),
+		};
+
+		let json = serde_json::to_string(&response).unwrap();
+		assert!(json.contains("\"success\":true"));
+		assert!(json.contains("\"status\":\"submitted\""));
+		assert!(json.contains("\"txHash\":\"0xabcd\""));
+	}
+
+	#[test]
+	fn test_approve_tokens_response_serialization() {
+		let response = ApproveTokensResponse {
+			success: true,
+			message: "Approved tokens".to_string(),
+			admin: "0x1234".to_string(),
+			approved_count: 5,
+			chains_processed: vec![1, 10, 137],
+		};
+
+		let json = serde_json::to_string(&response).unwrap();
+		assert!(json.contains("\"success\":true"));
+		assert!(json.contains("\"approvedCount\":5"));
+		assert!(json.contains("\"chainsProcessed\":[1,10,137]"));
+	}
 }
