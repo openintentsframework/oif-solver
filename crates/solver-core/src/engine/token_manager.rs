@@ -866,7 +866,10 @@ mod tests {
 		});
 
 		let mut implementations = HashMap::new();
-		implementations.insert(1, Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>);
+		implementations.insert(
+			1,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
 		let delivery = Arc::new(DeliveryService::new(implementations, 1, 20));
 
 		let account = create_mock_account_service();
@@ -907,7 +910,10 @@ mod tests {
 		});
 
 		let mut implementations = HashMap::new();
-		implementations.insert(1, Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>);
+		implementations.insert(
+			1,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
 		let delivery = Arc::new(DeliveryService::new(implementations, 1, 20));
 
 		let account = create_mock_account_service();
@@ -938,7 +944,10 @@ mod tests {
 		});
 
 		let mut implementations = HashMap::new();
-		implementations.insert(1, Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>);
+		implementations.insert(
+			1,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
 		let delivery = Arc::new(DeliveryService::new(implementations, 1, 20));
 
 		let account = create_mock_account_service();
@@ -976,7 +985,7 @@ mod tests {
 		// Network 999 is not configured in DeliveryService, so we get a DeliveryError
 		assert!(result.is_err());
 		match result.unwrap_err() {
-			TokenManagerError::DeliveryError(_) => {} // Expected
+			TokenManagerError::DeliveryError(_) => {}, // Expected
 			other => panic!("Expected DeliveryError, got {:?}", other),
 		}
 	}
