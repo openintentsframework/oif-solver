@@ -89,7 +89,8 @@ paths:
       operationId: getAdminBalances
       tags:
         - Admin
-      security: []
+      security:
+        - bearerAuth: []
       responses:
         "200":
           description: Solver balances

@@ -270,11 +270,10 @@ pub async fn start_server(
 
 	// Add admin routes if enabled
 	if let Some(admin_state) = admin_state {
-		let admin_public_routes = Router::new()
-			.route("/balances", get(handle_get_balances))
-			.route("/config", get(handle_get_config));
+		let admin_public_routes = Router::new().route("/config", get(handle_get_config));
 
 		let mut admin_protected_routes = Router::new()
+			.route("/balances", get(handle_get_balances))
 			.route("/nonce", get(handle_get_nonce))
 			.route("/types", get(handle_get_types))
 			.route("/tokens", post(handle_add_token))

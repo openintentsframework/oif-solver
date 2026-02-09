@@ -22,6 +22,7 @@ use solver_storage::{
 	config_store::{ConfigStore, ConfigStoreError},
 	nonce_store::NonceStore,
 };
+use solver_storage::redact_url_credentials;
 pub use solver_types::admin_api::{
 	AdminActionResponse, AdminConfigResponse, AdminConfigSummary, AdminNetworkResponse,
 	AdminSolverResponse, AdminTokenResponse, ApproveTokensResponse, BalancesResponse,
@@ -238,10 +239,10 @@ pub async fn handle_get_config(
 			let mut rpc_urls = Vec::new();
 			for rpc in &network.rpc_urls {
 				if !rpc.http.is_empty() {
-					rpc_urls.push(rpc.http.clone());
+					rpc_urls.push(redact_rpc_url(&rpc.http));
 				}
 				if let Some(ws) = &rpc.ws {
-					rpc_urls.push(ws.clone());
+					rpc_urls.push(redact_rpc_url(ws));
 				}
 			}
 
@@ -859,6 +860,77 @@ fn gas_config_response(gas: &solver_types::OperatorGasConfig) -> GasConfigRespon
 	}
 }
 
+fn redact_rpc_url(url: &str) -> String {
+	let redacted = redact_url_credentials(url);
+
+	let (before_fragment, fragment) = match redacted.split_once('#') {
+		Some((left, frag)) => (left, Some(frag)),
+		None => (redacted.as_str(), None),
+	};
+
+	let (before_query, query) = match before_fragment.split_once('?') {
+		Some((left, q)) => (left, Some(q)),
+		None => (before_fragment, None),
+	};
+
+	let mut base = redact_path_api_key(before_query);
+
+	if let Some(query) = query {
+		let redacted_query = redact_query_params(query);
+		base.push('?');
+		base.push_str(&redacted_query);
+	}
+
+	if let Some(fragment) = fragment {
+		base.push('#');
+		base.push_str(fragment);
+	}
+
+	base
+}
+
+fn redact_path_api_key(url: &str) -> String {
+	for marker in ["/v2/", "/v3/"] {
+		if let Some(idx) = url.find(marker) {
+			let start = idx + marker.len();
+			if start >= url.len() {
+				return url.to_string();
+			}
+			let end = url[start..]
+				.find('/')
+				.map(|offset| start + offset)
+				.unwrap_or(url.len());
+			if end > start {
+				return format!("{}[REDACTED]{}", &url[..start], &url[end..]);
+			}
+		}
+	}
+
+	url.to_string()
+}
+
+fn redact_query_params(query: &str) -> String {
+	let mut parts = Vec::new();
+	for pair in query.split('&') {
+		if pair.is_empty() {
+			continue;
+		}
+		let Some((key, value)) = pair.split_once('=') else {
+			parts.push(pair.to_string());
+			continue;
+		};
+		let key_lower = key.to_ascii_lowercase();
+		let should_redact = key_lower.contains("apikey")
+			|| key_lower.contains("api_key")
+			|| key_lower.contains("key")
+			|| key_lower.contains("token")
+			|| key_lower.contains("secret");
+		let safe_value = if should_redact { "[REDACTED]" } else { value };
+		parts.push(format!("{key}={safe_value}"));
+	}
+	parts.join("&")
+}
+
 /// Convert ConfigStoreError to AdminAuthError.
 fn config_store_error(err: ConfigStoreError) -> AdminAuthError {
 	match err {
@@ -989,6 +1061,26 @@ mod tests {
 		assert!(json.contains("\"name\":\"OIF Solver Admin\""));
 		assert!(json.contains("\"version\":\"1\""));
 		assert!(json.contains("\"chainId\":1"));
+	}
+
+	#[test]
+	fn test_redact_rpc_url_path_key() {
+		let url = "https://eth-mainnet.g.alchemy.com/v2/abc123";
+		let redacted = redact_rpc_url(url);
+		assert_eq!(
+			redacted,
+			"https://eth-mainnet.g.alchemy.com/v2/[REDACTED]"
+		);
+	}
+
+	#[test]
+	fn test_redact_rpc_url_query_key() {
+		let url = "https://example.com/rpc?apiKey=secret&chainId=1";
+		let redacted = redact_rpc_url(url);
+		assert_eq!(
+			redacted,
+			"https://example.com/rpc?apiKey=[REDACTED]&chainId=1"
+		);
 	}
 
 	#[test]
