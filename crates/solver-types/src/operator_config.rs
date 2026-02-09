@@ -287,14 +287,6 @@ pub struct OperatorWithdrawalsConfig {
 	/// Whether withdrawals are enabled.
 	#[serde(default)]
 	pub enabled: bool,
-
-	/// Allowlisted recipient addresses (empty = allow all).
-	#[serde(default)]
-	pub allowed_recipients: Vec<Address>,
-
-	/// Allowlisted token addresses (empty = allow all, include 0x0 for native).
-	#[serde(default)]
-	pub allowed_tokens: Vec<Address>,
 }
 
 impl OperatorConfig {

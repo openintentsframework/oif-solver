@@ -211,8 +211,6 @@ pub fn merge_to_operator_config(
 			admin_addresses: admin_override.admin_addresses.clone(),
 			withdrawals: OperatorWithdrawalsConfig {
 				enabled: admin_override.withdrawals.enabled,
-				allowed_recipients: admin_override.withdrawals.allowed_recipients.clone(),
-				allowed_tokens: admin_override.withdrawals.allowed_tokens.clone(),
 			},
 		},
 		None => OperatorAdminConfig::default(),

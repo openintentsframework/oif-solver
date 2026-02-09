@@ -484,27 +484,13 @@ pub async fn handle_withdrawal(
 		));
 	}
 
-	// Policy checks (allowlist only)
+	// Check if withdrawals are enabled
 	let versioned = state.config_store.get().await.map_err(config_store_error)?;
 	let policy = &versioned.data.admin.withdrawals;
 
 	if !policy.enabled {
 		return Err(AdminAuthError::NotAuthorized(
 			"Withdrawals are disabled".to_string(),
-		));
-	}
-
-	if !policy.allowed_recipients.is_empty()
-		&& !policy.allowed_recipients.contains(&contents.recipient)
-	{
-		return Err(AdminAuthError::NotAuthorized(
-			"Recipient not allowed".to_string(),
-		));
-	}
-
-	if !policy.allowed_tokens.is_empty() && !policy.allowed_tokens.contains(&contents.token) {
-		return Err(AdminAuthError::NotAuthorized(
-			"Token not allowed".to_string(),
 		));
 	}
 
@@ -1055,11 +1041,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_withdraw_success() {
 		let recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
-		let withdrawals = OperatorWithdrawalsConfig {
-			enabled: true,
-			allowed_recipients: vec![recipient],
-			allowed_tokens: vec![zero_alloy_address()],
-		};
+		let withdrawals = OperatorWithdrawalsConfig { enabled: true };
 
 		let state = create_admin_state(Some("1000000000000000000"), withdrawals, true).await;
 		let contents = WithdrawContents {
@@ -1085,11 +1067,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_withdraw_insufficient_funds() {
 		let recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
-		let withdrawals = OperatorWithdrawalsConfig {
-			enabled: true,
-			allowed_recipients: vec![recipient],
-			allowed_tokens: vec![zero_alloy_address()],
-		};
+		let withdrawals = OperatorWithdrawalsConfig { enabled: true };
 
 		let state = create_admin_state(Some("10"), withdrawals, false).await;
 		let contents = WithdrawContents {
@@ -1113,11 +1091,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_verified_admin_bad_signature() {
 		let recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
-		let withdrawals = OperatorWithdrawalsConfig {
-			enabled: true,
-			allowed_recipients: vec![recipient],
-			allowed_tokens: vec![zero_alloy_address()],
-		};
+		let withdrawals = OperatorWithdrawalsConfig { enabled: true };
 
 		let state = create_admin_state(None, withdrawals, false).await;
 		let verifier = state.verifier.read().await;
@@ -1172,11 +1146,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_handle_get_fees() {
-		let withdrawals = OperatorWithdrawalsConfig {
-			enabled: false,
-			allowed_recipients: vec![],
-			allowed_tokens: vec![],
-		};
+		let withdrawals = OperatorWithdrawalsConfig { enabled: false };
 		let state = create_admin_state(None, withdrawals, false).await;
 		let response = handle_get_fees(State(state)).await;
 
@@ -1187,11 +1157,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_handle_get_nonce() {
-		let withdrawals = OperatorWithdrawalsConfig {
-			enabled: false,
-			allowed_recipients: vec![],
-			allowed_tokens: vec![],
-		};
+		let withdrawals = OperatorWithdrawalsConfig { enabled: false };
 		let state = create_admin_state(None, withdrawals, false).await;
 		let result = handle_get_nonce(State(state)).await;
 
@@ -1205,11 +1171,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_handle_get_types() {
-		let withdrawals = OperatorWithdrawalsConfig {
-			enabled: false,
-			allowed_recipients: vec![],
-			allowed_tokens: vec![],
-		};
+		let withdrawals = OperatorWithdrawalsConfig { enabled: false };
 		let state = create_admin_state(None, withdrawals, false).await;
 		let response = handle_get_types(State(state)).await;
 
@@ -1222,77 +1184,12 @@ mod tests {
 	#[tokio::test]
 	async fn test_withdraw_disabled() {
 		let recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
-		let withdrawals = OperatorWithdrawalsConfig {
-			enabled: false, // Disabled!
-			allowed_recipients: vec![recipient],
-			allowed_tokens: vec![zero_alloy_address()],
-		};
+		let withdrawals = OperatorWithdrawalsConfig { enabled: false };
 
 		let state = create_admin_state(None, withdrawals, false).await;
 		let contents = WithdrawContents {
 			chain_id: 1,
 			token: zero_alloy_address(),
-			amount: "100".to_string(),
-			recipient,
-			nonce: 1,
-			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
-		};
-
-		let verified = VerifiedAdmin {
-			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
-			contents,
-		};
-
-		let err = handle_withdrawal(State(state), verified).await.unwrap_err();
-		assert!(matches!(err, AdminAuthError::NotAuthorized(_)));
-	}
-
-	#[tokio::test]
-	async fn test_withdraw_recipient_not_allowed() {
-		let allowed_recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
-		let other_recipient = alloy_address("0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC");
-
-		let withdrawals = OperatorWithdrawalsConfig {
-			enabled: true,
-			allowed_recipients: vec![allowed_recipient], // Only this recipient allowed
-			allowed_tokens: vec![zero_alloy_address()],
-		};
-
-		let state = create_admin_state(None, withdrawals, false).await;
-		let contents = WithdrawContents {
-			chain_id: 1,
-			token: zero_alloy_address(),
-			amount: "100".to_string(),
-			recipient: other_recipient, // Different recipient!
-			nonce: 1,
-			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
-		};
-
-		let verified = VerifiedAdmin {
-			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
-			contents,
-		};
-
-		let err = handle_withdrawal(State(state), verified).await.unwrap_err();
-		assert!(matches!(err, AdminAuthError::NotAuthorized(_)));
-	}
-
-	#[tokio::test]
-	async fn test_withdraw_token_not_allowed() {
-		let recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
-		let allowed_token = alloy_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
-		let other_token = alloy_address("0xdAC17F958D2ee523a2206206994597C13D831ec7");
-
-		let withdrawals = OperatorWithdrawalsConfig {
-			enabled: true,
-			allowed_recipients: vec![recipient],
-			allowed_tokens: vec![allowed_token], // Only this token allowed
-		};
-
-		let state = create_admin_state(None, withdrawals, false).await;
-		let contents = WithdrawContents {
-			chain_id: 1,
-			token: other_token, // Different token!
 			amount: "100".to_string(),
 			recipient,
 			nonce: 1,
@@ -1311,11 +1208,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_withdraw_zero_amount() {
 		let recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
-		let withdrawals = OperatorWithdrawalsConfig {
-			enabled: true,
-			allowed_recipients: vec![],
-			allowed_tokens: vec![],
-		};
+		let withdrawals = OperatorWithdrawalsConfig { enabled: true };
 
 		let state = create_admin_state(None, withdrawals, false).await;
 		let contents = WithdrawContents {
@@ -1338,11 +1231,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_withdraw_zero_recipient() {
-		let withdrawals = OperatorWithdrawalsConfig {
-			enabled: true,
-			allowed_recipients: vec![],
-			allowed_tokens: vec![],
-		};
+		let withdrawals = OperatorWithdrawalsConfig { enabled: true };
 
 		let state = create_admin_state(None, withdrawals, false).await;
 		let contents = WithdrawContents {
