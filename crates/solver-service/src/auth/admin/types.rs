@@ -218,6 +218,62 @@ impl RemoveTokenContents {
 	}
 }
 
+/// AddAdmin action contents
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddAdminContents {
+	pub new_admin: Address,
+	#[serde(with = "string_or_number")]
+	pub nonce: u64,
+	#[serde(with = "string_or_number")]
+	pub deadline: u64,
+}
+
+impl AddAdminContents {
+	/// Convert to EIP-712 struct for hashing
+	pub fn to_eip712(&self) -> AddAdmin {
+		AddAdmin {
+			newAdmin: self.new_admin,
+			nonce: U256::from(self.nonce),
+			deadline: U256::from(self.deadline),
+		}
+	}
+
+	/// Compute the EIP-712 struct hash using Alloy's built-in support
+	pub fn struct_hash(&self) -> FixedBytes<32> {
+		use alloy_sol_types::SolStruct;
+		self.to_eip712().eip712_hash_struct()
+	}
+}
+
+/// RemoveAdmin action contents
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveAdminContents {
+	pub admin_to_remove: Address,
+	#[serde(with = "string_or_number")]
+	pub nonce: u64,
+	#[serde(with = "string_or_number")]
+	pub deadline: u64,
+}
+
+impl RemoveAdminContents {
+	/// Convert to EIP-712 struct for hashing
+	pub fn to_eip712(&self) -> RemoveAdmin {
+		RemoveAdmin {
+			adminToRemove: self.admin_to_remove,
+			nonce: U256::from(self.nonce),
+			deadline: U256::from(self.deadline),
+		}
+	}
+
+	/// Compute the EIP-712 struct hash using Alloy's built-in support
+	pub fn struct_hash(&self) -> FixedBytes<32> {
+		use alloy_sol_types::SolStruct;
+		self.to_eip712().eip712_hash_struct()
+	}
+}
+
 /// Withdraw action contents
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -463,6 +519,34 @@ impl AdminAction for RemoveTokenContents {
 	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
 		// RemoveToken has no fallible parsing, always succeeds
 		Ok(RemoveTokenContents::struct_hash(self))
+	}
+}
+
+impl AdminAction for AddAdminContents {
+	fn nonce(&self) -> u64 {
+		self.nonce
+	}
+
+	fn deadline(&self) -> u64 {
+		self.deadline
+	}
+
+	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
+		Ok(AddAdminContents::struct_hash(self))
+	}
+}
+
+impl AdminAction for RemoveAdminContents {
+	fn nonce(&self) -> u64 {
+		self.nonce
+	}
+
+	fn deadline(&self) -> u64 {
+		self.deadline
+	}
+
+	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
+		Ok(RemoveAdminContents::struct_hash(self))
 	}
 }
 
@@ -824,6 +908,34 @@ mod tests {
 	}
 
 	#[test]
+	fn test_add_admin_struct_hash() {
+		let contents = AddAdminContents {
+			new_admin: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		let hash = contents.struct_hash();
+		assert_eq!(hash.len(), 32);
+		let hash2 = contents.struct_hash();
+		assert_eq!(hash, hash2);
+	}
+
+	#[test]
+	fn test_remove_admin_struct_hash() {
+		let contents = RemoveAdminContents {
+			admin_to_remove: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		let hash = contents.struct_hash();
+		assert_eq!(hash.len(), 32);
+		let hash2 = contents.struct_hash();
+		assert_eq!(hash, hash2);
+	}
+
+	#[test]
 	fn test_remove_token_admin_action_trait() {
 		let contents = RemoveTokenContents {
 			chain_id: 10,
@@ -836,6 +948,34 @@ mod tests {
 		assert_eq!(contents.deadline(), 1706184000);
 
 		// struct_hash via trait should succeed
+		let hash = AdminAction::struct_hash(&contents);
+		assert!(hash.is_ok());
+	}
+
+	#[test]
+	fn test_add_admin_admin_action_trait() {
+		let contents = AddAdminContents {
+			new_admin: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap(),
+			nonce: 42,
+			deadline: 1706184000,
+		};
+
+		assert_eq!(contents.nonce(), 42);
+		assert_eq!(contents.deadline(), 1706184000);
+		let hash = AdminAction::struct_hash(&contents);
+		assert!(hash.is_ok());
+	}
+
+	#[test]
+	fn test_remove_admin_admin_action_trait() {
+		let contents = RemoveAdminContents {
+			admin_to_remove: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap(),
+			nonce: 42,
+			deadline: 1706184000,
+		};
+
+		assert_eq!(contents.nonce(), 42);
+		assert_eq!(contents.deadline(), 1706184000);
 		let hash = AdminAction::struct_hash(&contents);
 		assert!(hash.is_ok());
 	}

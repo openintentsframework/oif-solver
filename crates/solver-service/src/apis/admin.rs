@@ -37,9 +37,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::auth::admin::{
-	AddTokenContents, AdminActionVerifier, AdminAuthError, ApproveTokensContents,
-	RemoveTokenContents, SignedAdminRequest, UpdateFeeConfigContents, UpdateGasConfigContents,
-	WithdrawContents,
+	AddAdminContents, AddTokenContents, AdminActionVerifier, AdminAuthError, ApproveTokensContents,
+	RemoveAdminContents, RemoveTokenContents, SignedAdminRequest, UpdateFeeConfigContents,
+	UpdateGasConfigContents, WithdrawContents,
 };
 use crate::config_merge::build_runtime_config;
 
@@ -299,6 +299,118 @@ pub async fn handle_get_gas(
 ) -> Result<Json<GasConfigResponse>, AdminAuthError> {
 	let versioned = state.config_store.get().await.map_err(config_store_error)?;
 	Ok(Json(gas_config_response(&versioned.data.gas)))
+}
+
+/// POST /api/v1/admin/admins
+///
+/// Add an admin address to the authorized list.
+pub async fn handle_add_admin(
+	State(state): State<AdminApiState>,
+	VerifiedAdmin { admin, contents }: VerifiedAdmin<AddAdminContents>,
+) -> Result<Json<AdminActionResponse>, AdminAuthError> {
+	if contents.new_admin == alloy_primitives::Address::ZERO {
+		return Err(AdminAuthError::InvalidMessage(
+			"Admin address cannot be zero".to_string(),
+		));
+	}
+
+	let versioned = state.config_store.get().await.map_err(config_store_error)?;
+	let mut operator_config = versioned.data;
+
+	if operator_config.admin.admin_addresses.contains(&contents.new_admin) {
+		return Err(AdminAuthError::InvalidMessage(
+			"Admin address already exists".to_string(),
+		));
+	}
+
+	operator_config
+		.admin
+		.admin_addresses
+		.push(contents.new_admin);
+
+	let new_versioned = state
+		.config_store
+		.update(operator_config.clone(), versioned.version)
+		.await
+		.map_err(|e| match e {
+			ConfigStoreError::VersionMismatch { .. } => {
+				AdminAuthError::Internal("Config was modified, please retry".to_string())
+			},
+			other => config_store_error(other),
+		})?;
+
+	let new_config = build_runtime_config(&new_versioned.data)
+		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {e}")))?;
+	*state.dynamic_config.write().await = new_config;
+
+	state.rebuild_verifier(&new_versioned.data.admin).await;
+
+	Ok(Json(AdminActionResponse {
+		success: true,
+		message: format!(
+			"Admin added: {}",
+			with_0x_prefix(&hex::encode(contents.new_admin.as_slice()))
+		),
+		admin: with_0x_prefix(&hex::encode(&admin.0)),
+	}))
+}
+
+/// DELETE /api/v1/admin/admins
+///
+/// Remove an admin address from the authorized list.
+pub async fn handle_remove_admin(
+	State(state): State<AdminApiState>,
+	VerifiedAdmin { admin, contents }: VerifiedAdmin<RemoveAdminContents>,
+) -> Result<Json<AdminActionResponse>, AdminAuthError> {
+	let versioned = state.config_store.get().await.map_err(config_store_error)?;
+	let mut operator_config = versioned.data;
+
+	if !operator_config
+		.admin
+		.admin_addresses
+		.contains(&contents.admin_to_remove)
+	{
+		return Err(AdminAuthError::InvalidMessage(
+			"Admin address not found".to_string(),
+		));
+	}
+
+	if operator_config.admin.admin_addresses.len() <= 1 {
+		return Err(AdminAuthError::InvalidMessage(
+			"Cannot remove the last admin".to_string(),
+		));
+	}
+
+	operator_config
+		.admin
+		.admin_addresses
+		.retain(|addr| addr != &contents.admin_to_remove);
+
+	let new_versioned = state
+		.config_store
+		.update(operator_config.clone(), versioned.version)
+		.await
+		.map_err(|e| match e {
+			ConfigStoreError::VersionMismatch { .. } => {
+				AdminAuthError::Internal("Config was modified, please retry".to_string())
+			},
+			other => config_store_error(other),
+		})?;
+
+	let new_config = build_runtime_config(&new_versioned.data)
+		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {e}")))?;
+	*state.dynamic_config.write().await = new_config;
+
+	state.rebuild_verifier(&new_versioned.data.admin).await;
+
+	Ok(Json(AdminActionResponse {
+		success: true,
+		message: format!(
+			"Admin removed: {}",
+			with_0x_prefix(&hex::encode(contents.admin_to_remove.as_slice()))
+		),
+		admin: with_0x_prefix(&hex::encode(&admin.0)),
+	}))
 }
 
 /// PUT /api/v1/admin/gas

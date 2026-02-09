@@ -128,6 +128,114 @@ paths:
               schema:
                 $ref: "#/components/schemas/AdminAuthErrorResponse"
 
+  /admin/admins:
+    post:
+      summary: Add an admin
+      description: |
+        Adds a new admin address to the authorized list.
+        Requires an EIP-712 signed request body.
+      operationId: addAdmin
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignedAdminRequestAddAdmin"
+            example:
+              signature: "0x..."
+              contents:
+                newAdmin: "0x1234567890abcdef1234567890abcdef12345678"
+                nonce: "12345678901234"
+                deadline: "1706184000"
+      responses:
+        "200":
+          description: Admin added
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminActionResponse"
+        "400":
+          description: Invalid request or message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "401":
+          description: Unauthorized (signature or JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+    delete:
+      summary: Remove an admin
+      description: |
+        Removes an admin address from the authorized list.
+        Requires an EIP-712 signed request body.
+      operationId: removeAdmin
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignedAdminRequestRemoveAdmin"
+            example:
+              signature: "0x..."
+              contents:
+                adminToRemove: "0x1234567890abcdef1234567890abcdef12345678"
+                nonce: "12345678901234"
+                deadline: "1706184000"
+      responses:
+        "200":
+          description: Admin removed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminActionResponse"
+        "400":
+          description: Invalid request or message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "401":
+          description: Unauthorized (signature or JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+
   /admin/tokens:
     post:
       summary: Add a token to a network
@@ -600,6 +708,39 @@ components:
         contents:
           $ref: "#/components/schemas/AddTokenContents"
 
+    SignedAdminRequestAddAdmin:
+      type: object
+      required:
+        - signature
+        - contents
+      properties:
+        signature:
+          type: string
+          description: Hex-encoded EIP-712 signature (65 bytes)
+          pattern: "^0x[a-fA-F0-9]+$"
+        contents:
+          $ref: "#/components/schemas/AddAdminContents"
+
+    AddAdminContents:
+      type: object
+      required:
+        - newAdmin
+        - nonce
+        - deadline
+      properties:
+        newAdmin:
+          type: string
+          pattern: "^0x[a-fA-F0-9]{40}$"
+          example: "0x1234567890abcdef1234567890abcdef12345678"
+        nonce:
+          type: string
+          description: Nonce as a string (number also accepted by server)
+          example: "12345678901234"
+        deadline:
+          type: string
+          description: Unix timestamp (seconds) as a string (number also accepted)
+          example: "1706184000"
+
     AddTokenContents:
       type: object
       required:
@@ -647,6 +788,39 @@ components:
           pattern: "^0x[a-fA-F0-9]+$"
         contents:
           $ref: "#/components/schemas/RemoveTokenContents"
+
+    SignedAdminRequestRemoveAdmin:
+      type: object
+      required:
+        - signature
+        - contents
+      properties:
+        signature:
+          type: string
+          description: Hex-encoded EIP-712 signature (65 bytes)
+          pattern: "^0x[a-fA-F0-9]+$"
+        contents:
+          $ref: "#/components/schemas/RemoveAdminContents"
+
+    RemoveAdminContents:
+      type: object
+      required:
+        - adminToRemove
+        - nonce
+        - deadline
+      properties:
+        adminToRemove:
+          type: string
+          pattern: "^0x[a-fA-F0-9]{40}$"
+          example: "0x1234567890abcdef1234567890abcdef12345678"
+        nonce:
+          type: string
+          description: Nonce as a string (number also accepted by server)
+          example: "12345678901234"
+        deadline:
+          type: string
+          description: Unix timestamp (seconds) as a string (number also accepted)
+          example: "1706184000"
 
     RemoveTokenContents:
       type: object
