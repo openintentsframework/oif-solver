@@ -2004,10 +2004,16 @@ mod tests {
 		assert_eq!(config.solver.gas_buffer_bps, 1000);
 
 		// Should use seed default commission_bps
-		assert_eq!(config.solver.commission_bps, TESTNET_SEED.defaults.commission_bps);
+		assert_eq!(
+			config.solver.commission_bps,
+			TESTNET_SEED.defaults.commission_bps
+		);
 
 		// Should use seed default rate_buffer_bps
-		assert_eq!(config.solver.rate_buffer_bps, TESTNET_SEED.defaults.rate_buffer_bps);
+		assert_eq!(
+			config.solver.rate_buffer_bps,
+			TESTNET_SEED.defaults.rate_buffer_bps
+		);
 	}
 
 	#[test]
@@ -2611,9 +2617,18 @@ mod tests {
 			op_config.solver.min_profitability_pct,
 			config.solver.min_profitability_pct
 		);
-		assert_eq!(op_config.solver.gas_buffer_bps, config.solver.gas_buffer_bps);
-		assert_eq!(op_config.solver.commission_bps, config.solver.commission_bps);
-		assert_eq!(op_config.solver.rate_buffer_bps, config.solver.rate_buffer_bps);
+		assert_eq!(
+			op_config.solver.gas_buffer_bps,
+			config.solver.gas_buffer_bps
+		);
+		assert_eq!(
+			op_config.solver.commission_bps,
+			config.solver.commission_bps
+		);
+		assert_eq!(
+			op_config.solver.rate_buffer_bps,
+			config.solver.rate_buffer_bps
+		);
 		assert_eq!(
 			op_config.solver.monitoring_timeout_seconds,
 			config.solver.monitoring_timeout_seconds

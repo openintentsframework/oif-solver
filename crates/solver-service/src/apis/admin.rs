@@ -24,9 +24,9 @@ use solver_storage::{
 };
 pub use solver_types::admin_api::{
 	AdminActionResponse, AdminConfigResponse, AdminConfigSummary, AdminNetworkResponse,
-	AdminSolverResponse, AdminTokenResponse, ApproveTokensResponse, BalancesResponse, ChainBalances,
-	Eip712Domain, Eip712TypeInfo, FeeConfigResponse, GasConfigResponse, GasFlowResponse,
-	NonceResponse, TokenBalance, WithdrawalResponse,
+	AdminSolverResponse, AdminTokenResponse, ApproveTokensResponse, BalancesResponse,
+	ChainBalances, Eip712Domain, Eip712TypeInfo, FeeConfigResponse, GasConfigResponse,
+	GasFlowResponse, NonceResponse, TokenBalance, WithdrawalResponse,
 };
 use solver_types::{
 	format_token_amount, with_0x_prefix, AdminConfig, OperatorAdminConfig, OperatorConfig,
@@ -159,7 +159,11 @@ pub async fn handle_get_balances(
 		let mut error: Option<String> = None;
 
 		for token in &network.tokens {
-			match state.token_manager.check_balance(chain_id, &token.address).await {
+			match state
+				.token_manager
+				.check_balance(chain_id, &token.address)
+				.await
+			{
 				Ok(balance) => {
 					let formatted = format_token_amount(&balance, token.decimals);
 					tokens.push(TokenBalance {
@@ -179,7 +183,11 @@ pub async fn handle_get_balances(
 		}
 
 		// Always include native balance
-		match state.token_manager.check_balance_any(chain_id, &zero_address).await {
+		match state
+			.token_manager
+			.check_balance_any(chain_id, &zero_address)
+			.await
+		{
 			Ok(balance) => {
 				let formatted = format_token_amount(&balance, 18);
 				tokens.push(TokenBalance {
@@ -249,8 +257,12 @@ pub async fn handle_get_config(
 						decimals: t.decimals,
 					})
 					.collect(),
-				input_settler: with_0x_prefix(&hex::encode(network.input_settler_address.as_slice())),
-				output_settler: with_0x_prefix(&hex::encode(network.output_settler_address.as_slice())),
+				input_settler: with_0x_prefix(&hex::encode(
+					network.input_settler_address.as_slice(),
+				)),
+				output_settler: with_0x_prefix(&hex::encode(
+					network.output_settler_address.as_slice(),
+				)),
 			}
 		})
 		.collect();
@@ -299,12 +311,7 @@ pub async fn handle_update_gas(
 	}: VerifiedAdmin<UpdateGasConfigContents>,
 ) -> Result<Json<AdminActionResponse>, AdminAuthError> {
 	// Validate bounds
-	fn validate_flow(
-		label: &str,
-		open: u64,
-		fill: u64,
-		claim: u64,
-	) -> Result<(), AdminAuthError> {
+	fn validate_flow(label: &str, open: u64, fill: u64, claim: u64) -> Result<(), AdminAuthError> {
 		if open > 500_000 {
 			return Err(AdminAuthError::InvalidMessage(format!(
 				"{label}.open too high"

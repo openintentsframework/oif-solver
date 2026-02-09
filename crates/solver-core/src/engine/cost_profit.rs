@@ -171,8 +171,7 @@ impl CostProfitService {
 				"rate_buffer_bps must be less than 10000".to_string(),
 			));
 		}
-		let rate_multiplier =
-			(Decimal::from(10000u32 - rate_buffer_bps)) / Decimal::from(10000u32);
+		let rate_multiplier = (Decimal::from(10000u32 - rate_buffer_bps)) / Decimal::from(10000u32);
 		let mut calculated_amounts = std::collections::HashMap::new();
 
 		match context.swap_type {
@@ -665,8 +664,8 @@ impl CostProfitService {
 		let transaction_value = total_input_value_usd.max(total_output_value_usd);
 		let min_profit =
 			(transaction_value * config.solver.min_profitability_pct) / Decimal::from(100);
-		let commission =
-			(transaction_value * Decimal::from(config.solver.commission_bps)) / Decimal::from(10000);
+		let commission = (transaction_value * Decimal::from(config.solver.commission_bps))
+			/ Decimal::from(10000);
 		let min_profit = min_profit + commission;
 
 		// Calculate operational cost (gas + buffers)

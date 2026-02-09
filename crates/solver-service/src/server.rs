@@ -7,8 +7,7 @@ use crate::{
 	apis::admin::{
 		handle_add_token, handle_approve_tokens, handle_get_balances, handle_get_config,
 		handle_get_fees, handle_get_gas, handle_get_nonce, handle_get_types, handle_remove_token,
-		handle_update_fees, handle_update_gas, handle_withdrawal,
-		AdminApiState,
+		handle_update_fees, handle_update_gas, handle_withdrawal, AdminApiState,
 	},
 	apis::health::handle_health,
 	apis::order::get_order_by_id,
@@ -292,15 +291,14 @@ pub async fn start_server(
 		// EIP-712 signature auth for admin actions.
 		if orders_require_auth {
 			if let Some(jwt) = &jwt_service {
-				admin_protected_routes = admin_protected_routes.layer(
-					middleware::from_fn_with_state(
+				admin_protected_routes =
+					admin_protected_routes.layer(middleware::from_fn_with_state(
 						AuthState {
 							jwt_service: jwt.clone(),
 							required_scope: solver_types::AuthScope::AdminAll,
 						},
 						auth_middleware,
-					),
-				);
+					));
 			}
 		}
 
