@@ -108,6 +108,23 @@ sol! {
 	struct UpdateFeeConfig {
 		uint32 gasBufferBps;
 		string minProfitabilityPct;
+		uint32 commissionBps;
+		uint32 rateBufferBps;
+		uint256 nonce;
+		uint256 deadline;
+	}
+
+	/// Update gas configuration (flow gas units)
+	struct UpdateGasConfig {
+		uint64 resourceLockOpen;
+		uint64 resourceLockFill;
+		uint64 resourceLockClaim;
+		uint64 permit2EscrowOpen;
+		uint64 permit2EscrowFill;
+		uint64 permit2EscrowClaim;
+		uint64 eip3009EscrowOpen;
+		uint64 eip3009EscrowFill;
+		uint64 eip3009EscrowClaim;
 		uint256 nonce;
 		uint256 deadline;
 	}
@@ -256,6 +273,10 @@ pub struct UpdateFeeConfigContents {
 	pub gas_buffer_bps: u32,
 	/// Minimum profitability percentage as a decimal string (e.g., "1.5" for 1.5%)
 	pub min_profitability_pct: String,
+	/// Commission in basis points (e.g., 20 = 0.20%)
+	pub commission_bps: u32,
+	/// Rate buffer in basis points (e.g., 14 = 0.14%)
+	pub rate_buffer_bps: u32,
 	#[serde(with = "string_or_number")]
 	pub nonce: u64,
 	#[serde(with = "string_or_number")]
@@ -268,6 +289,52 @@ impl UpdateFeeConfigContents {
 		UpdateFeeConfig {
 			gasBufferBps: self.gas_buffer_bps,
 			minProfitabilityPct: self.min_profitability_pct.clone(),
+			commissionBps: self.commission_bps,
+			rateBufferBps: self.rate_buffer_bps,
+			nonce: U256::from(self.nonce),
+			deadline: U256::from(self.deadline),
+		}
+	}
+
+	/// Compute the EIP-712 struct hash using Alloy's built-in support
+	pub fn struct_hash(&self) -> FixedBytes<32> {
+		use alloy_sol_types::SolStruct;
+		self.to_eip712().eip712_hash_struct()
+	}
+}
+
+/// UpdateGasConfig action contents
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateGasConfigContents {
+	pub resource_lock_open: u64,
+	pub resource_lock_fill: u64,
+	pub resource_lock_claim: u64,
+	pub permit2_escrow_open: u64,
+	pub permit2_escrow_fill: u64,
+	pub permit2_escrow_claim: u64,
+	pub eip3009_escrow_open: u64,
+	pub eip3009_escrow_fill: u64,
+	pub eip3009_escrow_claim: u64,
+	#[serde(with = "string_or_number")]
+	pub nonce: u64,
+	#[serde(with = "string_or_number")]
+	pub deadline: u64,
+}
+
+impl UpdateGasConfigContents {
+	/// Convert to EIP-712 struct for hashing
+	pub fn to_eip712(&self) -> UpdateGasConfig {
+		UpdateGasConfig {
+			resourceLockOpen: self.resource_lock_open,
+			resourceLockFill: self.resource_lock_fill,
+			resourceLockClaim: self.resource_lock_claim,
+			permit2EscrowOpen: self.permit2_escrow_open,
+			permit2EscrowFill: self.permit2_escrow_fill,
+			permit2EscrowClaim: self.permit2_escrow_claim,
+			eip3009EscrowOpen: self.eip3009_escrow_open,
+			eip3009EscrowFill: self.eip3009_escrow_fill,
+			eip3009EscrowClaim: self.eip3009_escrow_claim,
 			nonce: U256::from(self.nonce),
 			deadline: U256::from(self.deadline),
 		}
@@ -426,6 +493,21 @@ impl AdminAction for UpdateFeeConfigContents {
 	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
 		// UpdateFeeConfig has no fallible parsing, always succeeds
 		Ok(UpdateFeeConfigContents::struct_hash(self))
+	}
+}
+
+impl AdminAction for UpdateGasConfigContents {
+	fn nonce(&self) -> u64 {
+		self.nonce
+	}
+
+	fn deadline(&self) -> u64 {
+		self.deadline
+	}
+
+	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
+		// UpdateGasConfig has no fallible parsing, always succeeds
+		Ok(UpdateGasConfigContents::struct_hash(self))
 	}
 }
 
@@ -973,6 +1055,8 @@ mod tests {
 		let contents = UpdateFeeConfigContents {
 			gas_buffer_bps: 1500,
 			min_profitability_pct: "2.5".to_string(),
+			commission_bps: 20,
+			rate_buffer_bps: 14,
 			nonce: 1,
 			deadline: 1706184000,
 		};
@@ -990,6 +1074,8 @@ mod tests {
 		let contents1 = UpdateFeeConfigContents {
 			gas_buffer_bps: 1500,
 			min_profitability_pct: "2.5".to_string(),
+			commission_bps: 20,
+			rate_buffer_bps: 14,
 			nonce: 1,
 			deadline: 1706184000,
 		};
@@ -997,6 +1083,8 @@ mod tests {
 		let contents2 = UpdateFeeConfigContents {
 			gas_buffer_bps: 2000, // Different gas buffer
 			min_profitability_pct: "2.5".to_string(),
+			commission_bps: 20,
+			rate_buffer_bps: 14,
 			nonce: 1,
 			deadline: 1706184000,
 		};
@@ -1006,6 +1094,8 @@ mod tests {
 		let contents3 = UpdateFeeConfigContents {
 			gas_buffer_bps: 1500,
 			min_profitability_pct: "3.0".to_string(), // Different profitability
+			commission_bps: 20,
+			rate_buffer_bps: 14,
 			nonce: 1,
 			deadline: 1706184000,
 		};
@@ -1018,6 +1108,8 @@ mod tests {
 		let contents = UpdateFeeConfigContents {
 			gas_buffer_bps: 1000,
 			min_profitability_pct: "1.5".to_string(),
+			commission_bps: 20,
+			rate_buffer_bps: 14,
 			nonce: 42,
 			deadline: 1706184000,
 		};
@@ -1035,6 +1127,8 @@ mod tests {
 		let contents = UpdateFeeConfigContents {
 			gas_buffer_bps: 1500,
 			min_profitability_pct: "2.5".to_string(),
+			commission_bps: 20,
+			rate_buffer_bps: 14,
 			nonce: 1,
 			deadline: 1706184000,
 		};
@@ -1052,6 +1146,8 @@ mod tests {
 		let contents = UpdateFeeConfigContents {
 			gas_buffer_bps: 1500,
 			min_profitability_pct: "2.5".to_string(),
+			commission_bps: 20,
+			rate_buffer_bps: 14,
 			nonce: 12345,
 			deadline: 1706184000,
 		};
@@ -1059,6 +1155,8 @@ mod tests {
 		let json = serde_json::to_string(&contents).unwrap();
 		assert!(json.contains("\"gasBufferBps\":1500"));
 		assert!(json.contains("\"minProfitabilityPct\":\"2.5\""));
+		assert!(json.contains("\"commissionBps\":20"));
+		assert!(json.contains("\"rateBufferBps\":14"));
 		assert!(json.contains("\"nonce\":12345"));
 		assert!(json.contains("\"deadline\":1706184000"));
 
@@ -1074,6 +1172,8 @@ mod tests {
 		let json = r#"{
 			"gasBufferBps": 1500,
 			"minProfitabilityPct": "2.5",
+			"commissionBps": 20,
+			"rateBufferBps": 14,
 			"nonce": "12345678901234567890",
 			"deadline": "1706184000"
 		}"#;
@@ -1081,6 +1181,8 @@ mod tests {
 		let contents: UpdateFeeConfigContents = serde_json::from_str(json).unwrap();
 		assert_eq!(contents.gas_buffer_bps, 1500);
 		assert_eq!(contents.min_profitability_pct, "2.5");
+		assert_eq!(contents.commission_bps, 20);
+		assert_eq!(contents.rate_buffer_bps, 14);
 		assert_eq!(contents.nonce, 12345678901234567890u64);
 		assert_eq!(contents.deadline, 1706184000);
 	}
@@ -1092,6 +1194,8 @@ mod tests {
 			"contents": {
 				"gasBufferBps": 1500,
 				"minProfitabilityPct": "2.5",
+				"commissionBps": 20,
+				"rateBufferBps": 14,
 				"nonce": "1737925846892",
 				"deadline": "1737929446"
 			}
@@ -1101,6 +1205,8 @@ mod tests {
 			serde_json::from_str(json).unwrap();
 		assert_eq!(request.contents.gas_buffer_bps, 1500);
 		assert_eq!(request.contents.min_profitability_pct, "2.5");
+		assert_eq!(request.contents.commission_bps, 20);
+		assert_eq!(request.contents.rate_buffer_bps, 14);
 		assert_eq!(request.contents.nonce, 1737925846892);
 		assert_eq!(request.contents.deadline, 1737929446);
 		assert_eq!(request.signature.len(), 65);

@@ -8,6 +8,8 @@
 pub mod account;
 /// API types for HTTP endpoints and request/response structures.
 pub mod api;
+/// Admin API request/response types.
+pub mod admin_api;
 /// Authentication and authorization types.
 pub mod auth;
 /// Transaction delivery types for blockchain interactions.
@@ -51,6 +53,7 @@ pub mod pricing;
 // Re-export all types for convenient access
 pub use account::*;
 pub use api::*;
+pub use admin_api::*;
 pub use auth::{AdminConfig, AuthConfig, AuthScope, JwtClaims, RefreshTokenData};
 pub use costs::{CostBreakdown, CostContext};
 pub use delivery::*;

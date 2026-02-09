@@ -80,6 +80,10 @@ pub struct SeedDefaults {
 	// Solver settings
 	/// Minimum profitability percentage required to execute orders.
 	pub min_profitability_pct: Decimal,
+	/// Commission in basis points (e.g., 20 = 0.20%).
+	pub commission_bps: u32,
+	/// Rate buffer in basis points (e.g., 14 = 0.14%).
+	pub rate_buffer_bps: u32,
 	/// Timeout in seconds for monitoring transactions.
 	pub monitoring_timeout_seconds: u64,
 
@@ -151,6 +155,8 @@ pub struct GasFlowUnits {
 pub const COMMON_DEFAULTS: SeedDefaults = SeedDefaults {
 	// Solver
 	min_profitability_pct: Decimal::ONE,
+	commission_bps: 0, // Disabled by default for backward compatibility
+	rate_buffer_bps: 14,
 	monitoring_timeout_seconds: 28800, // 8 hours
 
 	// Storage

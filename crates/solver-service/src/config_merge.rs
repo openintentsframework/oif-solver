@@ -127,6 +127,8 @@ pub fn merge_config(overrides: SeedOverrides, seed: &SeedConfig) -> Result<Confi
 			&seed.defaults,
 			overrides.min_profitability_pct,
 			overrides.gas_buffer_bps,
+			overrides.commission_bps,
+			overrides.rate_buffer_bps,
 		),
 		networks,
 		storage: build_storage_config(&seed.defaults, &solver_id),
@@ -222,6 +224,12 @@ pub fn merge_to_operator_config(
 		.unwrap_or(seed.defaults.min_profitability_pct);
 
 	let gas_buffer_bps = initializer.gas_buffer_bps.unwrap_or(1000);
+	let commission_bps = initializer
+		.commission_bps
+		.unwrap_or(seed.defaults.commission_bps);
+	let rate_buffer_bps = initializer
+		.rate_buffer_bps
+		.unwrap_or(seed.defaults.rate_buffer_bps);
 
 	Ok(OperatorConfig {
 		solver_id,
@@ -261,6 +269,8 @@ pub fn merge_to_operator_config(
 		solver: OperatorSolverConfig {
 			min_profitability_pct,
 			gas_buffer_bps,
+			commission_bps,
+			rate_buffer_bps,
 			monitoring_timeout_seconds: seed.defaults.monitoring_timeout_seconds,
 		},
 		admin,
@@ -417,6 +427,8 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 			id: operator_config.solver_id.clone(),
 			min_profitability_pct: operator_config.solver.min_profitability_pct,
 			gas_buffer_bps: operator_config.solver.gas_buffer_bps,
+			commission_bps: operator_config.solver.commission_bps,
+			rate_buffer_bps: operator_config.solver.rate_buffer_bps,
 			monitoring_timeout_seconds: operator_config.solver.monitoring_timeout_seconds,
 		},
 		networks,
@@ -934,11 +946,15 @@ fn build_solver_config(
 	defaults: &SeedDefaults,
 	min_profitability_override: Option<Decimal>,
 	gas_buffer_bps_override: Option<u32>,
+	commission_bps_override: Option<u32>,
+	rate_buffer_bps_override: Option<u32>,
 ) -> SolverConfig {
 	SolverConfig {
 		id: solver_id.to_string(),
 		min_profitability_pct: min_profitability_override.unwrap_or(defaults.min_profitability_pct),
 		gas_buffer_bps: gas_buffer_bps_override.unwrap_or(1000),
+		commission_bps: commission_bps_override.unwrap_or(defaults.commission_bps),
+		rate_buffer_bps: rate_buffer_bps_override.unwrap_or(defaults.rate_buffer_bps),
 		monitoring_timeout_seconds: defaults.monitoring_timeout_seconds,
 	}
 }
@@ -1531,6 +1547,8 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		solver: OperatorSolverConfig {
 			min_profitability_pct: config.solver.min_profitability_pct,
 			gas_buffer_bps: config.solver.gas_buffer_bps,
+			commission_bps: config.solver.commission_bps,
+			rate_buffer_bps: config.solver.rate_buffer_bps,
 			monitoring_timeout_seconds: config.solver.monitoring_timeout_seconds,
 		},
 		admin,
@@ -1768,6 +1786,8 @@ mod tests {
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
 		}
 	}
 
@@ -1816,6 +1836,8 @@ mod tests {
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -1850,6 +1872,8 @@ mod tests {
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -1877,6 +1901,8 @@ mod tests {
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -1940,6 +1966,8 @@ mod tests {
 			admin: None,
 			min_profitability_pct: Some(Decimal::from_str("2.5").unwrap()), // Override: 2.5%
 			gas_buffer_bps: Some(1500),                                     // Override: 15%
+			commission_bps: Some(25),                                       // Override: 0.25%
+			rate_buffer_bps: Some(30),                                      // Override: 0.30%
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -1952,6 +1980,12 @@ mod tests {
 
 		// Verify gas_buffer_bps is applied
 		assert_eq!(config.solver.gas_buffer_bps, 1500);
+
+		// Verify commission_bps is applied
+		assert_eq!(config.solver.commission_bps, 25);
+
+		// Verify rate_buffer_bps is applied
+		assert_eq!(config.solver.rate_buffer_bps, 30);
 	}
 
 	#[test]
@@ -1968,6 +2002,12 @@ mod tests {
 
 		// Should use default gas_buffer_bps (1000 = 10%)
 		assert_eq!(config.solver.gas_buffer_bps, 1000);
+
+		// Should use seed default commission_bps
+		assert_eq!(config.solver.commission_bps, TESTNET_SEED.defaults.commission_bps);
+
+		// Should use seed default rate_buffer_bps
+		assert_eq!(config.solver.rate_buffer_bps, TESTNET_SEED.defaults.rate_buffer_bps);
 	}
 
 	#[test]
@@ -2093,6 +2133,8 @@ mod tests {
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -2131,6 +2173,8 @@ mod tests {
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -2190,6 +2234,8 @@ mod tests {
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -2224,6 +2270,8 @@ mod tests {
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -2262,6 +2310,8 @@ mod tests {
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -2289,6 +2339,8 @@ mod tests {
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -2323,6 +2375,8 @@ mod tests {
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -2368,6 +2422,8 @@ mod tests {
 			}),
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -2472,6 +2528,8 @@ mod tests {
 			solver: OperatorSolverConfig {
 				min_profitability_pct: Decimal::from_str("0.0").unwrap(),
 				gas_buffer_bps: 1000,
+				commission_bps: 20,
+				rate_buffer_bps: 14,
 				monitoring_timeout_seconds: 30,
 			},
 			admin: OperatorAdminConfig::default(),
@@ -2553,6 +2611,9 @@ mod tests {
 			op_config.solver.min_profitability_pct,
 			config.solver.min_profitability_pct
 		);
+		assert_eq!(op_config.solver.gas_buffer_bps, config.solver.gas_buffer_bps);
+		assert_eq!(op_config.solver.commission_bps, config.solver.commission_bps);
+		assert_eq!(op_config.solver.rate_buffer_bps, config.solver.rate_buffer_bps);
 		assert_eq!(
 			op_config.solver.monitoring_timeout_seconds,
 			config.solver.monitoring_timeout_seconds
@@ -2847,6 +2908,8 @@ mod tests {
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
 		};
 
 		// Step 1: merge_config should create Config with KMS account

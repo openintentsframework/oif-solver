@@ -91,6 +91,14 @@ pub struct SolverConfig {
 	/// Applied as safety margin on gas cost estimates.
 	#[serde(default = "default_gas_buffer_bps")]
 	pub gas_buffer_bps: u32,
+	/// Commission in basis points (e.g., 20 = 0.20%).
+	/// Added to solver profit requirement.
+	#[serde(default = "default_commission_bps")]
+	pub commission_bps: u32,
+	/// Rate buffer in basis points (e.g., 14 = 0.14%).
+	/// Applied to exchange rate to protect against price volatility.
+	#[serde(default = "default_rate_buffer_bps")]
+	pub rate_buffer_bps: u32,
 	/// Timeout in seconds for monitoring transactions.
 	/// Defaults to 28800 seconds (8 hours) if not specified.
 	#[serde(default = "default_monitoring_timeout_seconds")]
@@ -289,6 +297,14 @@ pub struct PricingConfig {
 
 fn default_gas_buffer_bps() -> u32 {
 	1000 // 10%
+}
+
+fn default_commission_bps() -> u32 {
+	0 // Disabled by default for backward compatibility
+}
+
+fn default_rate_buffer_bps() -> u32 {
+	14 // 0.14%
 }
 
 /// Gas configuration mapping flow identifiers to gas unit overrides.

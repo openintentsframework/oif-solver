@@ -427,6 +427,11 @@ impl TokenManager {
 		self.check_balance(chain_id, token_address).await
 	}
 
+	/// Returns the solver's address managed by the account service.
+	pub async fn get_solver_address(&self) -> Result<Address, TokenManagerError> {
+		Ok(self.account.get_address().await?)
+	}
+
 	/// Transfers tokens or native currency from the solver account to a recipient.
 	///
 	/// If `token_address` is the zero address, this performs a native currency transfer.

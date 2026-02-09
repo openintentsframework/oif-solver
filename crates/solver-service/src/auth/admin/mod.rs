@@ -21,6 +21,6 @@ pub use signature::{recover_from_hash, recover_personal_sign};
 pub use types::{
 	admin_domain_separator, AddTokenContents, AdminAction, AdminActionHashError,
 	ApproveTokensContents, RemoveTokenContents, SignedAdminRequest, UpdateFeeConfigContents,
-	WithdrawContents, ADMIN_DOMAIN_NAME, ADMIN_DOMAIN_VERSION,
+	UpdateGasConfigContents, WithdrawContents, ADMIN_DOMAIN_NAME, ADMIN_DOMAIN_VERSION,
 };
 pub use verify::AdminActionVerifier;

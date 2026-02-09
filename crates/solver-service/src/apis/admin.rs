@@ -16,22 +16,29 @@ use axum::{
 	http::Request,
 	Json,
 };
-use serde::Serialize;
 use solver_config::Config;
 use solver_core::engine::token_manager::TokenManager;
 use solver_storage::{
 	config_store::{ConfigStore, ConfigStoreError},
 	nonce_store::NonceStore,
 };
+pub use solver_types::admin_api::{
+	AdminActionResponse, AdminConfigResponse, AdminConfigSummary, AdminNetworkResponse,
+	AdminSolverResponse, AdminTokenResponse, ApproveTokensResponse, BalancesResponse, ChainBalances,
+	Eip712Domain, Eip712TypeInfo, FeeConfigResponse, GasConfigResponse, GasFlowResponse,
+	NonceResponse, TokenBalance, WithdrawalResponse,
+};
 use solver_types::{
-	with_0x_prefix, AdminConfig, OperatorAdminConfig, OperatorConfig, OperatorToken,
+	format_token_amount, with_0x_prefix, AdminConfig, OperatorAdminConfig, OperatorConfig,
+	OperatorToken,
 };
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::auth::admin::{
 	AddTokenContents, AdminActionVerifier, AdminAuthError, ApproveTokensContents,
-	RemoveTokenContents, SignedAdminRequest, UpdateFeeConfigContents, WithdrawContents,
+	RemoveTokenContents, SignedAdminRequest, UpdateFeeConfigContents, UpdateGasConfigContents,
+	WithdrawContents,
 };
 use crate::config_merge::build_runtime_config;
 
@@ -112,25 +119,6 @@ impl AdminApiState {
 	}
 }
 
-/// Response for nonce generation.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NonceResponse {
-	pub nonce: String,
-	pub expires_in: u64,
-	pub domain: String,
-	pub chain_id: u64,
-}
-
-/// Response for successful admin actions.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AdminActionResponse {
-	pub success: bool,
-	pub message: String,
-	pub admin: String,
-}
-
 /// GET /api/v1/admin/nonce
 ///
 /// Generate a nonce for signing admin actions.
@@ -146,6 +134,245 @@ pub async fn handle_get_nonce(
 		expires_in: verifier.nonce_ttl(),
 		domain: verifier.domain().to_string(),
 		chain_id: verifier.chain_id(),
+	}))
+}
+
+/// GET /api/v1/admin/balances
+///
+/// Returns solver token balances per configured network.
+pub async fn handle_get_balances(
+	State(state): State<AdminApiState>,
+) -> Result<Json<BalancesResponse>, AdminAuthError> {
+	let solver_address = state
+		.token_manager
+		.get_solver_address()
+		.await
+		.map_err(|e| AdminAuthError::Internal(format!("Failed to get solver address: {e}")))?;
+	let solver_address_hex = solver_address.to_string();
+
+	let networks = state.token_manager.get_networks().await;
+	let mut response_networks = std::collections::HashMap::new();
+	let zero_address = solver_types::Address(vec![0u8; 20]);
+
+	for (chain_id, network) in networks {
+		let mut tokens = Vec::new();
+		let mut error: Option<String> = None;
+
+		for token in &network.tokens {
+			match state.token_manager.check_balance(chain_id, &token.address).await {
+				Ok(balance) => {
+					let formatted = format_token_amount(&balance, token.decimals);
+					tokens.push(TokenBalance {
+						address: token.address.to_string(),
+						symbol: token.symbol.clone(),
+						decimals: token.decimals,
+						balance,
+						balance_formatted: formatted,
+					});
+				},
+				Err(e) => {
+					if error.is_none() {
+						error = Some(e.to_string());
+					}
+				},
+			}
+		}
+
+		// Always include native balance
+		match state.token_manager.check_balance_any(chain_id, &zero_address).await {
+			Ok(balance) => {
+				let formatted = format_token_amount(&balance, 18);
+				tokens.push(TokenBalance {
+					address: zero_address.to_string(),
+					symbol: "NATIVE".to_string(),
+					decimals: 18,
+					balance,
+					balance_formatted: formatted,
+				});
+			},
+			Err(e) => {
+				if error.is_none() {
+					error = Some(e.to_string());
+				}
+			},
+		}
+
+		response_networks.insert(
+			chain_id.to_string(),
+			ChainBalances {
+				chain_id,
+				tokens,
+				error,
+			},
+		);
+	}
+
+	Ok(Json(BalancesResponse {
+		solver_address: solver_address_hex,
+		networks: response_networks,
+	}))
+}
+
+/// GET /api/v1/admin/config
+///
+/// Returns a redacted view of the current operator configuration.
+pub async fn handle_get_config(
+	State(state): State<AdminApiState>,
+) -> Result<Json<AdminConfigResponse>, AdminAuthError> {
+	let versioned = state.config_store.get().await.map_err(config_store_error)?;
+	let operator_config = versioned.data;
+	let solver_id = operator_config.solver_id.clone();
+
+	let mut networks: Vec<AdminNetworkResponse> = operator_config
+		.networks
+		.values()
+		.map(|network| {
+			let mut rpc_urls = Vec::new();
+			for rpc in &network.rpc_urls {
+				if !rpc.http.is_empty() {
+					rpc_urls.push(rpc.http.clone());
+				}
+				if let Some(ws) = &rpc.ws {
+					rpc_urls.push(ws.clone());
+				}
+			}
+
+			AdminNetworkResponse {
+				chain_id: network.chain_id,
+				rpc_urls,
+				tokens: network
+					.tokens
+					.iter()
+					.map(|t| AdminTokenResponse {
+						symbol: t.symbol.clone(),
+						address: with_0x_prefix(&hex::encode(t.address.as_slice())),
+						decimals: t.decimals,
+					})
+					.collect(),
+				input_settler: with_0x_prefix(&hex::encode(network.input_settler_address.as_slice())),
+				output_settler: with_0x_prefix(&hex::encode(network.output_settler_address.as_slice())),
+			}
+		})
+		.collect();
+
+	networks.sort_by_key(|n| n.chain_id);
+
+	let gas = gas_config_response(&operator_config.gas);
+
+	Ok(Json(AdminConfigResponse {
+		solver_id,
+		networks,
+		solver: AdminSolverResponse {
+			min_profitability_pct: operator_config.solver.min_profitability_pct.to_string(),
+			gas_buffer_bps: operator_config.solver.gas_buffer_bps,
+			commission_bps: operator_config.solver.commission_bps,
+			rate_buffer_bps: operator_config.solver.rate_buffer_bps,
+		},
+		gas,
+		admin: AdminConfigSummary {
+			enabled: operator_config.admin.enabled,
+			domain: operator_config.admin.domain.clone(),
+			withdrawals_enabled: operator_config.admin.withdrawals.enabled,
+		},
+		version: versioned.version,
+	}))
+}
+
+/// GET /api/v1/admin/gas
+///
+/// Returns current gas unit configuration.
+pub async fn handle_get_gas(
+	State(state): State<AdminApiState>,
+) -> Result<Json<GasConfigResponse>, AdminAuthError> {
+	let versioned = state.config_store.get().await.map_err(config_store_error)?;
+	Ok(Json(gas_config_response(&versioned.data.gas)))
+}
+
+/// PUT /api/v1/admin/gas
+///
+/// Update gas unit configuration for flows.
+pub async fn handle_update_gas(
+	State(state): State<AdminApiState>,
+	VerifiedAdmin {
+		admin,
+		contents: request,
+	}: VerifiedAdmin<UpdateGasConfigContents>,
+) -> Result<Json<AdminActionResponse>, AdminAuthError> {
+	// Validate bounds
+	fn validate_flow(
+		label: &str,
+		open: u64,
+		fill: u64,
+		claim: u64,
+	) -> Result<(), AdminAuthError> {
+		if open > 500_000 {
+			return Err(AdminAuthError::InvalidMessage(format!(
+				"{label}.open too high"
+			)));
+		}
+		if fill > 1_000_000 {
+			return Err(AdminAuthError::InvalidMessage(format!(
+				"{label}.fill too high"
+			)));
+		}
+		if claim > 500_000 {
+			return Err(AdminAuthError::InvalidMessage(format!(
+				"{label}.claim too high"
+			)));
+		}
+		Ok(())
+	}
+
+	validate_flow(
+		"resourceLock",
+		request.resource_lock_open,
+		request.resource_lock_fill,
+		request.resource_lock_claim,
+	)?;
+	validate_flow(
+		"permit2Escrow",
+		request.permit2_escrow_open,
+		request.permit2_escrow_fill,
+		request.permit2_escrow_claim,
+	)?;
+	validate_flow(
+		"eip3009Escrow",
+		request.eip3009_escrow_open,
+		request.eip3009_escrow_fill,
+		request.eip3009_escrow_claim,
+	)?;
+
+	let versioned = state.config_store.get().await.map_err(config_store_error)?;
+	let mut operator_config = versioned.data;
+	operator_config.gas.resource_lock.open = request.resource_lock_open;
+	operator_config.gas.resource_lock.fill = request.resource_lock_fill;
+	operator_config.gas.resource_lock.claim = request.resource_lock_claim;
+	operator_config.gas.permit2_escrow.open = request.permit2_escrow_open;
+	operator_config.gas.permit2_escrow.fill = request.permit2_escrow_fill;
+	operator_config.gas.permit2_escrow.claim = request.permit2_escrow_claim;
+	operator_config.gas.eip3009_escrow.open = request.eip3009_escrow_open;
+	operator_config.gas.eip3009_escrow.fill = request.eip3009_escrow_fill;
+	operator_config.gas.eip3009_escrow.claim = request.eip3009_escrow_claim;
+
+	let new_versioned = state
+		.config_store
+		.update(operator_config.clone(), versioned.version)
+		.await
+		.map_err(|e| match e {
+			ConfigStoreError::VersionMismatch { .. } => {
+				AdminAuthError::Internal("Config was modified, please retry".to_string())
+			},
+			other => config_store_error(other),
+		})?;
+
+	let new_config = build_runtime_config(&new_versioned.data)
+		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {e}")))?;
+	*state.dynamic_config.write().await = new_config;
+
+	Ok(Json(AdminActionResponse {
+		success: true,
+		message: "Gas configuration updated".to_string(),
+		admin: with_0x_prefix(&hex::encode(&admin.0)),
 	}))
 }
 
@@ -245,7 +472,7 @@ pub async fn handle_add_token(
 
 /// PUT /api/v1/admin/fees
 ///
-/// Update fee configuration (gas buffer and minimum profitability).
+/// Update fee configuration (gas buffer, minimum profitability, commission, rate buffer).
 ///
 /// Request body:
 /// ```json
@@ -254,6 +481,8 @@ pub async fn handle_add_token(
 ///   "contents": {
 ///     "gasBufferBps": 1500,
 ///     "minProfitabilityPct": "2.5",
+///     "commissionBps": 20,
+///     "rateBufferBps": 14,
 ///     "nonce": 12345678901234,
 ///     "deadline": 1706184000
 ///   }
@@ -262,6 +491,8 @@ pub async fn handle_add_token(
 ///
 /// - `gasBufferBps`: Gas buffer in basis points (e.g., 1500 = 15%)
 /// - `minProfitabilityPct`: Minimum profitability as decimal string (e.g., "2.5" for 2.5%)
+/// - `commissionBps`: Commission in basis points (e.g., 20 = 0.20%)
+/// - `rateBufferBps`: Rate buffer in basis points (e.g., 14 = 0.14%)
 pub async fn handle_update_fees(
 	State(state): State<AdminApiState>,
 	VerifiedAdmin {
@@ -288,6 +519,22 @@ pub async fn handle_update_fees(
 		)));
 	}
 
+	// 2b. Validate commission_bps is reasonable (0-10000 = 0-100%)
+	if request.commission_bps > 10000 {
+		return Err(AdminAuthError::InvalidMessage(format!(
+			"Invalid commissionBps: {} exceeds maximum of 10000 (100%)",
+			request.commission_bps
+		)));
+	}
+
+	// 2c. Validate rate_buffer_bps is reasonable (<10000 to avoid zero rate)
+	if request.rate_buffer_bps >= 10000 {
+		return Err(AdminAuthError::InvalidMessage(format!(
+			"Invalid rateBufferBps: {} must be less than 10000",
+			request.rate_buffer_bps
+		)));
+	}
+
 	// 3. Get current OperatorConfig from Redis
 	let versioned = state.config_store.get().await.map_err(config_store_error)?;
 
@@ -295,6 +542,8 @@ pub async fn handle_update_fees(
 	let mut operator_config = versioned.data;
 	operator_config.solver.gas_buffer_bps = request.gas_buffer_bps;
 	operator_config.solver.min_profitability_pct = min_profitability;
+	operator_config.solver.commission_bps = request.commission_bps;
+	operator_config.solver.rate_buffer_bps = request.rate_buffer_bps;
 
 	// 5. Save to Redis with optimistic locking
 	let new_versioned = state
@@ -316,6 +565,8 @@ pub async fn handle_update_fees(
 	tracing::info!(
 		version = new_versioned.version,
 		gas_buffer_bps = request.gas_buffer_bps,
+		commission_bps = request.commission_bps,
+		rate_buffer_bps = request.rate_buffer_bps,
 		min_profitability_pct = %request.min_profitability_pct,
 		"Fee configuration updated and config hot-reloaded"
 	);
@@ -323,20 +574,14 @@ pub async fn handle_update_fees(
 	Ok(Json(AdminActionResponse {
 		success: true,
 		message: format!(
-			"Fee configuration updated: gasBufferBps={}, minProfitabilityPct={}",
-			request.gas_buffer_bps, request.min_profitability_pct
+			"Fee configuration updated: gasBufferBps={}, minProfitabilityPct={}, commissionBps={}, rateBufferBps={}",
+			request.gas_buffer_bps,
+			request.min_profitability_pct,
+			request.commission_bps,
+			request.rate_buffer_bps
 		),
 		admin: with_0x_prefix(&hex::encode(&admin.0)),
 	}))
-}
-
-/// Response for fee configuration read.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FeeConfigResponse {
-	pub min_profitability_pct: String,
-	pub gas_buffer_bps: u32,
-	pub monitoring_timeout_seconds: u64,
 }
 
 /// GET /api/v1/admin/fees
@@ -348,6 +593,8 @@ pub async fn handle_get_fees(State(state): State<AdminApiState>) -> Json<FeeConf
 	Json(FeeConfigResponse {
 		min_profitability_pct: config.solver.min_profitability_pct.to_string(),
 		gas_buffer_bps: config.solver.gas_buffer_bps,
+		commission_bps: config.solver.commission_bps,
+		rate_buffer_bps: config.solver.rate_buffer_bps,
 		monitoring_timeout_seconds: config.solver.monitoring_timeout_seconds,
 	})
 }
@@ -435,28 +682,6 @@ pub async fn handle_remove_token(
 		),
 		admin: with_0x_prefix(&hex::encode(&admin.0)),
 	}))
-}
-
-/// Response for approve tokens action with details.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ApproveTokensResponse {
-	pub success: bool,
-	pub message: String,
-	pub admin: String,
-	pub approved_count: usize,
-	pub chains_processed: Vec<u64>,
-}
-
-/// Response for withdrawal action.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WithdrawalResponse {
-	pub success: bool,
-	pub status: String,
-	pub message: String,
-	pub admin: String,
-	pub tx_hash: Option<String>,
 }
 
 /// POST /api/v1/admin/withdrawals
@@ -607,6 +832,26 @@ pub async fn handle_approve_tokens(
 	}))
 }
 
+fn gas_config_response(gas: &solver_types::OperatorGasConfig) -> GasConfigResponse {
+	GasConfigResponse {
+		resource_lock: GasFlowResponse {
+			open: gas.resource_lock.open,
+			fill: gas.resource_lock.fill,
+			claim: gas.resource_lock.claim,
+		},
+		permit2_escrow: GasFlowResponse {
+			open: gas.permit2_escrow.open,
+			fill: gas.permit2_escrow.fill,
+			claim: gas.permit2_escrow.claim,
+		},
+		eip3009_escrow: GasFlowResponse {
+			open: gas.eip3009_escrow.open,
+			fill: gas.eip3009_escrow.fill,
+			claim: gas.eip3009_escrow.claim,
+		},
+	}
+}
+
 /// Convert ConfigStoreError to AdminAuthError.
 fn config_store_error(err: ConfigStoreError) -> AdminAuthError {
 	match err {
@@ -629,23 +874,6 @@ fn config_store_error(err: ConfigStoreError) -> AdminAuthError {
 			AdminAuthError::Internal(format!("Configuration already exists: {msg}"))
 		},
 	}
-}
-
-/// EIP-712 type information for client-side signing.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Eip712TypeInfo {
-	pub domain: Eip712Domain,
-	pub types: serde_json::Value,
-}
-
-/// EIP-712 domain (without verifyingContract - off-chain verification)
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Eip712Domain {
-	pub name: String,
-	pub version: String,
-	pub chain_id: u64,
 }
 
 /// GET /api/v1/admin/types
@@ -936,6 +1164,8 @@ mod tests {
 			solver: OperatorSolverConfig {
 				min_profitability_pct: rust_decimal::Decimal::ZERO,
 				gas_buffer_bps: 1000,
+				commission_bps: 20,
+				rate_buffer_bps: 14,
 				monitoring_timeout_seconds: 60,
 			},
 			admin: OperatorAdminConfig {
@@ -1151,8 +1381,10 @@ mod tests {
 		let response = handle_get_fees(State(state)).await;
 
 		// ConfigBuilder default values
-		assert!(response.gas_buffer_bps >= 0);
-		assert!(!response.min_profitability_pct.is_empty());
+		assert_eq!(response.min_profitability_pct, "0");
+		assert_eq!(response.gas_buffer_bps, 1000);
+		assert_eq!(response.commission_bps, 0); // Disabled by default for backward compatibility
+		assert_eq!(response.rate_buffer_bps, 14);
 	}
 
 	#[tokio::test]
@@ -1257,12 +1489,16 @@ mod tests {
 		let response = FeeConfigResponse {
 			min_profitability_pct: "2.5".to_string(),
 			gas_buffer_bps: 1500,
+			commission_bps: 20,
+			rate_buffer_bps: 14,
 			monitoring_timeout_seconds: 60,
 		};
 
 		let json = serde_json::to_string(&response).unwrap();
 		assert!(json.contains("\"minProfitabilityPct\":\"2.5\""));
 		assert!(json.contains("\"gasBufferBps\":1500"));
+		assert!(json.contains("\"commissionBps\":20"));
+		assert!(json.contains("\"rateBufferBps\":14"));
 		assert!(json.contains("\"monitoringTimeoutSeconds\":60"));
 	}
 

@@ -456,7 +456,7 @@ The solver provides a REST API for interacting with the system and submitting of
 
 - **Orders API**: [`api-spec/orders-api.yaml`](api-spec/orders-api.yaml) - Submit and track cross-chain intent orders
 - **Tokens API**: [`api-spec/tokens-api.yaml`](api-spec/tokens-api.yaml) - Query supported tokens and networks
-- **Admin API**: [`docs/openapi-admin.json`](docs/openapi-admin.json) - Wallet-based admin operations (EIP-712 signed)
+- **Admin API**: [`api-spec/admin-api.yaml`](api-spec/admin-api.yaml) - Wallet-based admin operations (EIP-712 signed)
 
 ### API Flows
 
@@ -695,7 +695,9 @@ The admin API enables authorized wallet addresses to perform administrative oper
 
 **Endpoints:**
 
-- **GET `/api/v1/admin/nonce`** - Get a nonce for signing admin actions
+- **GET `/api/v1/admin/balances`** - Get solver balances by chain and token (public, read-only)
+- **GET `/api/v1/admin/config`** - Get current solver configuration snapshot (public, read-only)
+- **GET `/api/v1/admin/nonce`** - Get a nonce for signing admin actions (protected)
   - Response:
     ```json
     {
@@ -706,10 +708,10 @@ The admin API enables authorized wallet addresses to perform administrative oper
     }
     ```
 
-- **GET `/api/v1/admin/types`** - Get EIP-712 type definitions for client-side signing
+- **GET `/api/v1/admin/types`** - Get EIP-712 type definitions for client-side signing (protected)
   - Returns domain and type definitions for all admin actions (AddToken, RemoveToken, etc.)
 
-- **POST `/api/v1/admin/tokens`** - Add a new token to a network
+- **POST `/api/v1/admin/tokens`** - Add a new token to a network (protected)
   - Request body:
     ```json
     {
@@ -727,6 +729,14 @@ The admin API enables authorized wallet addresses to perform administrative oper
   - The signature must be an EIP-712 typed data signature from an authorized admin
   - Changes are hot-reloaded immediately (no restart required)
 
+- **DELETE `/api/v1/admin/tokens`** - Remove a token from a network (protected)
+- **POST `/api/v1/admin/tokens/approve`** - Approve token allowance for settlements (protected)
+- **POST `/api/v1/admin/withdrawals`** - Perform an admin withdrawal (protected)
+- **GET `/api/v1/admin/fees`** - Get fee configuration (protected)
+- **PUT `/api/v1/admin/fees`** - Update fee configuration (protected, EIP-712 signed)
+- **GET `/api/v1/admin/gas`** - Get gas configuration (protected)
+- **PUT `/api/v1/admin/gas`** - Update gas configuration (protected, EIP-712 signed)
+
 **Admin Action Flow:**
 
 1. Call `GET /api/v1/admin/nonce` to get a fresh nonce
@@ -734,6 +744,33 @@ The admin API enables authorized wallet addresses to perform administrative oper
 3. Construct the typed data with the nonce and a deadline
 4. Sign with your admin wallet (EIP-712)
 5. Submit the signed action to the appropriate endpoint
+
+**Note:** If API auth is enabled (`auth.enabled = true`), protected admin endpoints also require a JWT with `AdminAll` scope. Public endpoints remain unauthenticated.
+
+#### Fees and Profitability
+
+The solver enforces profitability via four configurable controls:
+
+- `min_profitability_pct`: Minimum profit as a percentage of transaction value
+- `commission_bps`: Additional profit requirement in bps of transaction value
+- `gas_buffer_bps`: Buffer applied to estimated gas costs in bps
+- `rate_buffer_bps`: Safety margin applied to market rates to protect against price movement
+
+How it’s applied:
+
+```text
+transaction_value = max(total_input_usd, total_output_usd)
+min_profit = transaction_value * min_profitability_pct / 100
+commission = transaction_value * commission_bps / 10_000
+required_profit = min_profit + commission
+```
+
+The rate buffer is applied during swap amount calculation:
+
+- ExactInput: `output_usd = market_output_usd * (1 - rate_buffer_bps/10_000)`
+- ExactOutput: `input_usd = market_input_usd / (1 - rate_buffer_bps/10_000)`
+
+Fee config can be set in seed overrides and updated at runtime via `PUT /api/v1/admin/fees`.
 
 ### Example Usage
 
@@ -809,6 +846,12 @@ curl http://localhost:3000/api/v1/admin/nonce
 
 # Admin: Get EIP-712 types for signing
 curl http://localhost:3000/api/v1/admin/types
+
+# Admin: Get solver balances (public)
+curl http://localhost:3000/api/v1/admin/balances
+
+# Admin: Get solver config snapshot (public)
+curl http://localhost:3000/api/v1/admin/config
 ```
 
 The API server is enabled by default on port 3000 when the solver is running. You can disable it or change the port in the configuration file.

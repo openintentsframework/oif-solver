@@ -20,6 +20,8 @@ pub struct ConfigBuilder {
 	monitoring_timeout_seconds: u64,
 	min_profitability_pct: Decimal,
 	gas_buffer_bps: u32,
+	commission_bps: u32,
+	rate_buffer_bps: u32,
 	storage_primary: String,
 	storage_cleanup_interval_seconds: u64,
 	min_confirmations: u64,
@@ -44,6 +46,8 @@ impl ConfigBuilder {
 			monitoring_timeout_seconds: 60,
 			min_profitability_pct: Decimal::ZERO,
 			gas_buffer_bps: 1000, // 10% default
+			commission_bps: 0,    // Disabled by default for backward compatibility
+			rate_buffer_bps: 14,  // 0.14% default
 			storage_primary: "memory".to_string(),
 			storage_cleanup_interval_seconds: 60,
 			min_confirmations: 1,
@@ -64,6 +68,18 @@ impl ConfigBuilder {
 	/// Sets the monitoring timeout in seconds.
 	pub fn monitoring_timeout_seconds(mut self, timeout: u64) -> Self {
 		self.monitoring_timeout_seconds = timeout;
+		self
+	}
+
+	/// Sets commission in basis points.
+	pub fn commission_bps(mut self, commission_bps: u32) -> Self {
+		self.commission_bps = commission_bps;
+		self
+	}
+
+	/// Sets rate buffer in basis points.
+	pub fn rate_buffer_bps(mut self, rate_buffer_bps: u32) -> Self {
+		self.rate_buffer_bps = rate_buffer_bps;
 		self
 	}
 
@@ -128,6 +144,8 @@ impl ConfigBuilder {
 				id: self.solver_id,
 				min_profitability_pct: self.min_profitability_pct,
 				gas_buffer_bps: self.gas_buffer_bps,
+				commission_bps: self.commission_bps,
+				rate_buffer_bps: self.rate_buffer_bps,
 				monitoring_timeout_seconds: self.monitoring_timeout_seconds,
 			},
 			networks: self.networks.unwrap_or_default(),

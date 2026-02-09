@@ -81,6 +81,52 @@ paths:
               schema:
                 $ref: "#/components/schemas/Eip712TypeInfo"
 
+  /admin/balances:
+    get:
+      summary: Get solver balances
+      description: |
+        Returns solver token balances per configured network, including native balance.
+      operationId: getAdminBalances
+      tags:
+        - Admin
+      security: []
+      responses:
+        "200":
+          description: Solver balances
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BalancesResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+
+  /admin/config:
+    get:
+      summary: Get operator configuration (redacted)
+      description: |
+        Returns a redacted view of the current operator configuration.
+      operationId: getAdminConfig
+      tags:
+        - Admin
+      security: []
+      responses:
+        "200":
+          description: Current operator configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminConfigResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+
   /admin/tokens:
     post:
       summary: Add a token to a network
@@ -256,7 +302,7 @@ paths:
     get:
       summary: Get fee configuration
       description: |
-        Returns current fee configuration (gas buffer and minimum profitability).
+        Returns current fee configuration (gas buffer, minimum profitability, commission, rate buffer).
       operationId: getAdminFees
       tags:
         - Admin
@@ -284,7 +330,7 @@ paths:
     put:
       summary: Update fee configuration
       description: |
-        Updates gas buffer and minimum profitability settings.
+        Updates gas buffer, minimum profitability, commission, and rate buffer settings.
         Requires an EIP-712 signed request body.
       operationId: updateAdminFees
       tags:
@@ -302,11 +348,104 @@ paths:
               contents:
                 gasBufferBps: 1500
                 minProfitabilityPct: "2.5"
+                commissionBps: 20
+                rateBufferBps: 14
                 nonce: "12345678901234"
                 deadline: "1706184000"
       responses:
         "200":
           description: Fee configuration updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminActionResponse"
+        "400":
+          description: Invalid request or message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "401":
+          description: Unauthorized (signature or JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+
+  /admin/gas:
+    get:
+      summary: Get gas configuration
+      description: |
+        Returns current gas unit configuration for all flows.
+      operationId: getAdminGas
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current gas configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GasConfigResponse"
+        "401":
+          description: Unauthorized (JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+    put:
+      summary: Update gas configuration
+      description: |
+        Updates gas unit overrides for all flows.
+        Requires an EIP-712 signed request body.
+      operationId: updateAdminGas
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignedAdminRequestUpdateGas"
+            example:
+              signature: "0x..."
+              contents:
+                resourceLockOpen: 50000
+                resourceLockFill: 150000
+                resourceLockClaim: 80000
+                permit2EscrowOpen: 60000
+                permit2EscrowFill: 160000
+                permit2EscrowClaim: 90000
+                eip3009EscrowOpen: 55000
+                eip3009EscrowFill: 155000
+                eip3009EscrowClaim: 85000
+                nonce: "12345678901234"
+                deadline: "1706184000"
+      responses:
+        "200":
+          description: Gas configuration updated
           content:
             application/json:
               schema:
@@ -613,6 +752,283 @@ components:
             format: int64
           example: [10]
 
+    BalancesResponse:
+      type: object
+      required:
+        - solverAddress
+        - networks
+      properties:
+        solverAddress:
+          type: string
+          example: "0x1234567890abcdef1234567890abcdef12345678"
+        networks:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/ChainBalances"
+
+    ChainBalances:
+      type: object
+      required:
+        - chainId
+        - tokens
+      properties:
+        chainId:
+          type: integer
+          format: int64
+          example: 84532
+        tokens:
+          type: array
+          items:
+            $ref: "#/components/schemas/TokenBalance"
+        error:
+          type: string
+          nullable: true
+          example: null
+
+    TokenBalance:
+      type: object
+      required:
+        - address
+        - symbol
+        - decimals
+        - balance
+        - balanceFormatted
+      properties:
+        address:
+          type: string
+          example: "0x0000000000000000000000000000000000000000"
+        symbol:
+          type: string
+          example: "USDC"
+        decimals:
+          type: integer
+          example: 6
+        balance:
+          type: string
+          example: "1000000000"
+        balanceFormatted:
+          type: string
+          example: "1000.00"
+
+    AdminConfigResponse:
+      type: object
+      required:
+        - solverId
+        - networks
+        - solver
+        - gas
+        - admin
+        - version
+      properties:
+        solverId:
+          type: string
+          example: "solver-abc123"
+        networks:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminNetworkResponse"
+        solver:
+          $ref: "#/components/schemas/AdminSolverResponse"
+        gas:
+          $ref: "#/components/schemas/GasConfigResponse"
+        admin:
+          $ref: "#/components/schemas/AdminConfigSummary"
+        version:
+          type: integer
+          format: int64
+          example: 3
+
+    AdminNetworkResponse:
+      type: object
+      required:
+        - chainId
+        - rpcUrls
+        - tokens
+        - inputSettler
+        - outputSettler
+      properties:
+        chainId:
+          type: integer
+          format: int64
+          example: 84532
+        rpcUrls:
+          type: array
+          items:
+            type: string
+          example: ["https://sepolia.optimism.io"]
+        tokens:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminTokenResponse"
+        inputSettler:
+          type: string
+          example: "0x0000000000000000000000000000000000000001"
+        outputSettler:
+          type: string
+          example: "0x0000000000000000000000000000000000000002"
+
+    AdminTokenResponse:
+      type: object
+      required:
+        - symbol
+        - address
+        - decimals
+      properties:
+        symbol:
+          type: string
+          example: "USDC"
+        address:
+          type: string
+          example: "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"
+        decimals:
+          type: integer
+          example: 6
+
+    AdminSolverResponse:
+      type: object
+      required:
+        - minProfitabilityPct
+        - gasBufferBps
+        - commissionBps
+        - rateBufferBps
+      properties:
+        minProfitabilityPct:
+          type: string
+          example: "1.0"
+        gasBufferBps:
+          type: integer
+          example: 1000
+        commissionBps:
+          type: integer
+          example: 20
+        rateBufferBps:
+          type: integer
+          example: 14
+
+    AdminConfigSummary:
+      type: object
+      required:
+        - enabled
+        - domain
+        - withdrawalsEnabled
+      properties:
+        enabled:
+          type: boolean
+          example: true
+        domain:
+          type: string
+          example: "localhost"
+        withdrawalsEnabled:
+          type: boolean
+          example: true
+
+    GasConfigResponse:
+      type: object
+      required:
+        - resourceLock
+        - permit2Escrow
+        - eip3009Escrow
+      properties:
+        resourceLock:
+          $ref: "#/components/schemas/GasFlowResponse"
+        permit2Escrow:
+          $ref: "#/components/schemas/GasFlowResponse"
+        eip3009Escrow:
+          $ref: "#/components/schemas/GasFlowResponse"
+
+    GasFlowResponse:
+      type: object
+      required:
+        - open
+        - fill
+        - claim
+      properties:
+        open:
+          type: integer
+          format: int64
+          example: 50000
+        fill:
+          type: integer
+          format: int64
+          example: 150000
+        claim:
+          type: integer
+          format: int64
+          example: 80000
+
+    SignedAdminRequestUpdateGas:
+      type: object
+      required:
+        - signature
+        - contents
+      properties:
+        signature:
+          type: string
+          description: Hex-encoded EIP-712 signature (65 bytes)
+          pattern: "^0x[a-fA-F0-9]+$"
+        contents:
+          $ref: "#/components/schemas/UpdateGasConfigContents"
+
+    UpdateGasConfigContents:
+      type: object
+      required:
+        - resourceLockOpen
+        - resourceLockFill
+        - resourceLockClaim
+        - permit2EscrowOpen
+        - permit2EscrowFill
+        - permit2EscrowClaim
+        - eip3009EscrowOpen
+        - eip3009EscrowFill
+        - eip3009EscrowClaim
+        - nonce
+        - deadline
+      properties:
+        resourceLockOpen:
+          type: integer
+          format: int64
+          example: 50000
+        resourceLockFill:
+          type: integer
+          format: int64
+          example: 150000
+        resourceLockClaim:
+          type: integer
+          format: int64
+          example: 80000
+        permit2EscrowOpen:
+          type: integer
+          format: int64
+          example: 60000
+        permit2EscrowFill:
+          type: integer
+          format: int64
+          example: 160000
+        permit2EscrowClaim:
+          type: integer
+          format: int64
+          example: 90000
+        eip3009EscrowOpen:
+          type: integer
+          format: int64
+          example: 55000
+        eip3009EscrowFill:
+          type: integer
+          format: int64
+          example: 155000
+        eip3009EscrowClaim:
+          type: integer
+          format: int64
+          example: 85000
+        nonce:
+          type: string
+          description: Nonce as a string (number also accepted by server)
+          example: "12345678901234"
+        deadline:
+          type: string
+          description: Unix timestamp (seconds) as a string (number also accepted)
+          example: "1706184000"
+
     SignedAdminRequestUpdateFees:
       type: object
       required:
@@ -631,6 +1047,8 @@ components:
       required:
         - gasBufferBps
         - minProfitabilityPct
+        - commissionBps
+        - rateBufferBps
         - nonce
         - deadline
       properties:
@@ -644,6 +1062,18 @@ components:
           type: string
           description: Minimum profitability percentage as a decimal string
           example: "2.5"
+        commissionBps:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          description: Commission in basis points
+          example: 20
+        rateBufferBps:
+          type: integer
+          minimum: 0
+          maximum: 9999
+          description: Rate buffer in basis points
+          example: 14
         nonce:
           type: string
           description: Nonce as a string (number also accepted by server)
@@ -734,6 +1164,8 @@ components:
       required:
         - minProfitabilityPct
         - gasBufferBps
+        - commissionBps
+        - rateBufferBps
         - monitoringTimeoutSeconds
       properties:
         minProfitabilityPct:
@@ -742,6 +1174,12 @@ components:
         gasBufferBps:
           type: integer
           example: 1500
+        commissionBps:
+          type: integer
+          example: 20
+        rateBufferBps:
+          type: integer
+          example: 14
         monitoringTimeoutSeconds:
           type: integer
           example: 28800

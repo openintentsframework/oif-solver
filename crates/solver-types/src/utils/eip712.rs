@@ -718,6 +718,7 @@ pub fn reconstruct_eip3009_digest(
 /// - AddAdmin
 /// - RemoveAdmin
 /// - UpdateFeeConfig
+/// - UpdateGasConfig
 pub fn admin_eip712_types() -> serde_json::Value {
 	serde_json::json!({
 		"EIP712Domain": [
@@ -766,6 +767,21 @@ pub fn admin_eip712_types() -> serde_json::Value {
 		"UpdateFeeConfig": [
 			{"name": "gasBufferBps", "type": "uint32"},
 			{"name": "minProfitabilityPct", "type": "string"},
+			{"name": "commissionBps", "type": "uint32"},
+			{"name": "rateBufferBps", "type": "uint32"},
+			{"name": "nonce", "type": "uint256"},
+			{"name": "deadline", "type": "uint256"}
+		],
+		"UpdateGasConfig": [
+			{"name": "resourceLockOpen", "type": "uint64"},
+			{"name": "resourceLockFill", "type": "uint64"},
+			{"name": "resourceLockClaim", "type": "uint64"},
+			{"name": "permit2EscrowOpen", "type": "uint64"},
+			{"name": "permit2EscrowFill", "type": "uint64"},
+			{"name": "permit2EscrowClaim", "type": "uint64"},
+			{"name": "eip3009EscrowOpen", "type": "uint64"},
+			{"name": "eip3009EscrowFill", "type": "uint64"},
+			{"name": "eip3009EscrowClaim", "type": "uint64"},
 			{"name": "nonce", "type": "uint256"},
 			{"name": "deadline", "type": "uint256"}
 		],
@@ -1678,6 +1694,7 @@ mod tests {
 		assert!(obj.contains_key("AddAdmin"));
 		assert!(obj.contains_key("RemoveAdmin"));
 		assert!(obj.contains_key("UpdateFeeConfig"));
+		assert!(obj.contains_key("UpdateGasConfig"));
 		assert!(obj.contains_key("ApproveTokens"));
 	}
 
@@ -1724,8 +1741,8 @@ mod tests {
 			.as_array()
 			.expect("should be an array");
 
-		// UpdateFeeConfig should have: gasBufferBps, minProfitabilityPct, nonce, deadline
-		assert_eq!(fee_config.len(), 4);
+		// UpdateFeeConfig should have: gasBufferBps, minProfitabilityPct, commissionBps, rateBufferBps, nonce, deadline
+		assert_eq!(fee_config.len(), 6);
 
 		let names: Vec<&str> = fee_config
 			.iter()
@@ -1733,6 +1750,35 @@ mod tests {
 			.collect();
 		assert!(names.contains(&"gasBufferBps"));
 		assert!(names.contains(&"minProfitabilityPct"));
+		assert!(names.contains(&"commissionBps"));
+		assert!(names.contains(&"rateBufferBps"));
+		assert!(names.contains(&"nonce"));
+		assert!(names.contains(&"deadline"));
+	}
+
+	#[test]
+	fn test_admin_eip712_types_update_gas_config_fields() {
+		let types = admin_eip712_types();
+		let gas_config = types["UpdateGasConfig"]
+			.as_array()
+			.expect("should be an array");
+
+		// UpdateGasConfig should have 11 fields
+		assert_eq!(gas_config.len(), 11);
+
+		let names: Vec<&str> = gas_config
+			.iter()
+			.map(|f| f["name"].as_str().unwrap())
+			.collect();
+		assert!(names.contains(&"resourceLockOpen"));
+		assert!(names.contains(&"resourceLockFill"));
+		assert!(names.contains(&"resourceLockClaim"));
+		assert!(names.contains(&"permit2EscrowOpen"));
+		assert!(names.contains(&"permit2EscrowFill"));
+		assert!(names.contains(&"permit2EscrowClaim"));
+		assert!(names.contains(&"eip3009EscrowOpen"));
+		assert!(names.contains(&"eip3009EscrowFill"));
+		assert!(names.contains(&"eip3009EscrowClaim"));
 		assert!(names.contains(&"nonce"));
 		assert!(names.contains(&"deadline"));
 	}
