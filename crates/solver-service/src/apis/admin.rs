@@ -18,11 +18,11 @@ use axum::{
 };
 use solver_config::Config;
 use solver_core::engine::token_manager::TokenManager;
+use solver_storage::redact_url_credentials;
 use solver_storage::{
 	config_store::{ConfigStore, ConfigStoreError},
 	nonce_store::NonceStore,
 };
-use solver_storage::redact_url_credentials;
 pub use solver_types::admin_api::{
 	AdminActionResponse, AdminConfigResponse, AdminConfigSummary, AdminNetworkResponse,
 	AdminSolverResponse, AdminTokenResponse, ApproveTokensResponse, BalancesResponse,
@@ -1067,10 +1067,7 @@ mod tests {
 	fn test_redact_rpc_url_path_key() {
 		let url = "https://eth-mainnet.g.alchemy.com/v2/abc123";
 		let redacted = redact_rpc_url(url);
-		assert_eq!(
-			redacted,
-			"https://eth-mainnet.g.alchemy.com/v2/[REDACTED]"
-		);
+		assert_eq!(redacted, "https://eth-mainnet.g.alchemy.com/v2/[REDACTED]");
 	}
 
 	#[test]
