@@ -317,7 +317,11 @@ pub async fn handle_add_admin(
 	let versioned = state.config_store.get().await.map_err(config_store_error)?;
 	let mut operator_config = versioned.data;
 
-	if operator_config.admin.admin_addresses.contains(&contents.new_admin) {
+	if operator_config
+		.admin
+		.admin_addresses
+		.contains(&contents.new_admin)
+	{
 		return Err(AdminAuthError::InvalidMessage(
 			"Admin address already exists".to_string(),
 		));

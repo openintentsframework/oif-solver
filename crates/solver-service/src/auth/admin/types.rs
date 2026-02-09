@@ -924,7 +924,8 @@ mod tests {
 	#[test]
 	fn test_remove_admin_struct_hash() {
 		let contents = RemoveAdminContents {
-			admin_to_remove: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap(),
+			admin_to_remove: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
+				.unwrap(),
 			nonce: 1,
 			deadline: 1706184000,
 		};
@@ -969,7 +970,8 @@ mod tests {
 	#[test]
 	fn test_remove_admin_admin_action_trait() {
 		let contents = RemoveAdminContents {
-			admin_to_remove: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap(),
+			admin_to_remove: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
+				.unwrap(),
 			nonce: 42,
 			deadline: 1706184000,
 		};
