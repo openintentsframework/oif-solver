@@ -6,10 +6,15 @@
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Serialize;
-use solver_storage::{check_storage_readiness, PersistencePolicy, ReadinessCheck, StoreConfig};
-use std::collections::HashMap;
+use solver_storage::{
+	check_storage_readiness, PersistencePolicy, ReadinessCheck, ReadinessStatus, StoreConfig,
+};
+use std::{
+	collections::HashMap,
+	time::{Duration, Instant},
+};
 
-use crate::server::AppState;
+use crate::server::{AppState, HealthCacheEntry};
 
 /// Full health check response with Redis status.
 #[derive(Serialize)]
@@ -57,6 +62,66 @@ pub struct StorageHealth {
 	/// Optional error message
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub error: Option<String>,
+}
+
+fn is_cache_fresh(cache_entry: &HealthCacheEntry, now: Instant, ttl: Duration) -> bool {
+	now.duration_since(cache_entry.checked_at) <= ttl
+}
+
+async fn get_cached_readiness(
+	health_cache: &tokio::sync::RwLock<Option<HealthCacheEntry>>,
+	refresh_lock: &tokio::sync::Mutex<()>,
+	health_cache_ttl: Duration,
+	health_check_timeout_ms: u64,
+	store_config: &StoreConfig,
+	policy: PersistencePolicy,
+) -> Result<ReadinessStatus, String> {
+	let now = Instant::now();
+	{
+		let cache = health_cache.read().await;
+		if let Some(cache_entry) = cache.as_ref() {
+			if is_cache_fresh(cache_entry, now, health_cache_ttl) {
+				tracing::debug!(
+					age_ms = now.duration_since(cache_entry.checked_at).as_millis() as u64,
+					ttl_ms = health_cache_ttl.as_millis() as u64,
+					"health readiness cache hit"
+				);
+				return cache_entry.readiness.clone();
+			}
+		}
+	}
+
+	// Serialize refreshes so concurrent probes don't trigger parallel readiness checks.
+	let _refresh_guard = refresh_lock.lock().await;
+
+	// Re-check cache after waiting for refresh lock in case another request already refreshed it.
+	let now = Instant::now();
+	{
+		let cache = health_cache.read().await;
+		if let Some(cache_entry) = cache.as_ref() {
+			if is_cache_fresh(cache_entry, now, health_cache_ttl) {
+				return cache_entry.readiness.clone();
+			}
+		}
+	}
+
+	tracing::debug!(
+		timeout_ms = health_check_timeout_ms,
+		ttl_ms = health_cache_ttl.as_millis() as u64,
+		"health readiness cache miss, refreshing"
+	);
+
+	let readiness = check_storage_readiness(store_config, policy, health_check_timeout_ms)
+		.await
+		.map_err(|e| e.to_string());
+
+	let mut cache = health_cache.write().await;
+	*cache = Some(HealthCacheEntry {
+		checked_at: Instant::now(),
+		readiness: readiness.clone(),
+	});
+
+	readiness
 }
 
 /// GET /health - Full health check endpoint.
@@ -107,7 +172,15 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 	};
 
 	let policy = PersistencePolicy::from_env();
-	let readiness = check_storage_readiness(&store_config, policy, 2000).await;
+	let readiness = get_cached_readiness(
+		&state.health_cache,
+		&state.health_cache_refresh_lock,
+		state.health_cache_ttl,
+		state.health_check_timeout_ms,
+		&store_config,
+		policy,
+	)
+	.await;
 
 	let mut redis_health: Option<RedisHealth> = None;
 	let storage_health = match readiness {
@@ -152,7 +225,7 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 			ready: false,
 			checks: Vec::new(),
 			details: HashMap::new(),
-			error: Some(e.to_string()),
+			error: Some(e),
 		},
 	};
 
@@ -182,6 +255,7 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use tokio::sync::{Mutex, RwLock};
 
 	#[test]
 	fn test_health_response_serialization_healthy() {
@@ -478,5 +552,75 @@ mod tests {
 		assert!(json.contains("\"passed\":false"));
 		assert!(json.contains("\"DISCONNECTED\""));
 		assert!(json.contains("Failed to connect to Redis"));
+	}
+
+	#[tokio::test]
+	async fn test_get_cached_readiness_returns_fresh_cached_value() {
+		let health_cache = RwLock::new(Some(HealthCacheEntry {
+			checked_at: Instant::now(),
+			readiness: Ok(ReadinessStatus {
+				backend_name: "Cached".to_string(),
+				is_ready: true,
+				checks: Vec::new(),
+				details: HashMap::new(),
+			}),
+		}));
+		let refresh_lock = Mutex::new(());
+		let store_config = StoreConfig::Redis {
+			url: "redis://10.255.255.1:6379".to_string(),
+		};
+
+		let result = get_cached_readiness(
+			&health_cache,
+			&refresh_lock,
+			Duration::from_secs(5),
+			100,
+			&store_config,
+			PersistencePolicy::WarnIfDisabled,
+		)
+		.await;
+
+		assert!(result.is_ok());
+		assert_eq!(result.unwrap().backend_name, "Cached");
+	}
+
+	#[tokio::test]
+	async fn test_get_cached_readiness_refreshes_stale_cache() {
+		let health_cache = RwLock::new(Some(HealthCacheEntry {
+			checked_at: Instant::now() - Duration::from_secs(10),
+			readiness: Ok(ReadinessStatus {
+				backend_name: "Stale".to_string(),
+				is_ready: true,
+				checks: Vec::new(),
+				details: HashMap::new(),
+			}),
+		}));
+		let refresh_lock = Mutex::new(());
+		let store_config = StoreConfig::Memory;
+
+		let result = get_cached_readiness(
+			&health_cache,
+			&refresh_lock,
+			Duration::from_millis(100),
+			100,
+			&store_config,
+			PersistencePolicy::WarnIfDisabled,
+		)
+		.await;
+
+		assert!(result.is_ok());
+		assert_eq!(result.unwrap().backend_name, "Memory");
+
+		let cached = health_cache.read().await;
+		let entry = cached.as_ref().expect("cache entry");
+		assert!(entry.readiness.is_ok());
+		assert_eq!(
+			entry
+				.readiness
+				.as_ref()
+				.expect("cached readiness")
+				.backend_name,
+			"Memory"
+		);
 	}
 }

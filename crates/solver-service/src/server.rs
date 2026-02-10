@@ -30,19 +30,34 @@ use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
 use solver_storage::{
-	config_store::create_config_store, nonce_store::create_nonce_store, StoreConfig,
+	config_store::create_config_store, create_storage_backend, nonce_store::create_nonce_store,
+	StoreConfig,
 };
 use solver_types::{
 	api::PostOrderRequest, standards::eip7683::interfaces::StandardOrder, APIError, Address,
 	ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse, OperatorConfig, Order,
 	OrderIdCallback, Transaction,
 };
-use std::{convert::TryInto, sync::Arc};
+use std::{
+	convert::TryInto,
+	sync::Arc,
+	time::{Duration, Instant},
+};
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tower_http::normalize_path::NormalizePath;
+
+const DEFAULT_HEALTH_CACHE_TTL_MS: u64 = 5000;
+const DEFAULT_HEALTH_CHECK_TIMEOUT_MS: u64 = 2000;
+
+/// Cached storage readiness snapshot used by the health endpoint.
+#[derive(Clone)]
+pub struct HealthCacheEntry {
+	pub checked_at: Instant,
+	pub readiness: Result<solver_storage::ReadinessStatus, String>,
+}
 
 /// Shared application state for the API server.
 #[derive(Clone)]
@@ -60,6 +75,32 @@ pub struct AppState {
 	pub jwt_service: Option<Arc<JwtService>>,
 	/// Signature validation service for different order standards.
 	pub signature_validation: Arc<SignatureValidationService>,
+	/// Cached readiness result to avoid per-request Redis reconnections.
+	pub health_cache: Arc<RwLock<Option<HealthCacheEntry>>>,
+	/// Guard to serialize readiness refreshes when cache expires.
+	pub health_cache_refresh_lock: Arc<Mutex<()>>,
+	/// Max age for cached readiness status.
+	pub health_cache_ttl: Duration,
+	/// Timeout for readiness checks.
+	pub health_check_timeout_ms: u64,
+}
+
+fn parse_positive_u64_env(var_name: &str, default: u64) -> u64 {
+	match std::env::var(var_name) {
+		Ok(raw) => match raw.parse::<u64>() {
+			Ok(value) if value > 0 => value,
+			_ => {
+				tracing::warn!(
+					var = %var_name,
+					value = %raw,
+					default,
+					"Invalid non-positive integer in environment, using default"
+				);
+				default
+			},
+		},
+		Err(_) => default,
+	}
 }
 
 /// Starts the HTTP server for the API.
@@ -131,6 +172,10 @@ pub async fn start_server(
 
 	// Initialize signature validation service
 	let signature_validation = Arc::new(SignatureValidationService::new());
+	let health_cache_ttl_ms =
+		parse_positive_u64_env("HEALTH_CACHE_TTL_MS", DEFAULT_HEALTH_CACHE_TTL_MS);
+	let health_check_timeout_ms =
+		parse_positive_u64_env("HEALTH_CHECK_TIMEOUT_MS", DEFAULT_HEALTH_CHECK_TIMEOUT_MS);
 
 	// Initialize admin API if enabled in config
 	let admin_state = if let Some(auth_config) = &api_config.auth {
@@ -159,13 +204,24 @@ pub async fn start_server(
 					},
 				};
 
+				// Share one storage backend for all admin Redis operations.
+				let admin_storage = match create_storage_backend(StoreConfig::Redis {
+					url: redis_url.clone(),
+				}) {
+					Ok(storage) => storage,
+					Err(e) => {
+						tracing::error!("Failed to create admin storage backend: {}", e);
+						return Err(Box::new(std::io::Error::other(format!(
+							"Admin storage error: {e}"
+						))));
+					},
+				};
+
 				// Create ConfigStore for OperatorConfig
 				let config_store: Arc<
 					dyn solver_storage::config_store::ConfigStore<OperatorConfig>,
 				> = match create_config_store::<OperatorConfig>(
-					StoreConfig::Redis {
-						url: redis_url.clone(),
-					},
+					StoreConfig::Storage(admin_storage.clone()),
 					format!("{solver_id}-operator"),
 				) {
 					Ok(store) => Arc::from(store),
@@ -201,7 +257,7 @@ pub async fn start_server(
 
 				// Create nonce store (concrete NonceStore type, not a trait)
 				match create_nonce_store(
-					StoreConfig::Redis { url: redis_url },
+					StoreConfig::Storage(admin_storage),
 					&solver_id,
 					admin_config.nonce_ttl_seconds,
 				) {
@@ -254,6 +310,10 @@ pub async fn start_server(
 		discovery_url,
 		jwt_service: jwt_service.clone(),
 		signature_validation,
+		health_cache: Arc::new(RwLock::new(None)),
+		health_cache_refresh_lock: Arc::new(Mutex::new(())),
+		health_cache_ttl: Duration::from_millis(health_cache_ttl_ms),
+		health_check_timeout_ms,
 	};
 
 	// Build the router with /api/v1 base path and quote endpoint
@@ -951,6 +1011,10 @@ mod tests {
 			discovery_url,
 			jwt_service: None,
 			signature_validation: Arc::new(SignatureValidationService::new()),
+			health_cache: Arc::new(RwLock::new(None)),
+			health_cache_refresh_lock: Arc::new(Mutex::new(())),
+			health_cache_ttl: Duration::from_millis(DEFAULT_HEALTH_CACHE_TTL_MS),
+			health_check_timeout_ms: DEFAULT_HEALTH_CHECK_TIMEOUT_MS,
 		}
 	}
 

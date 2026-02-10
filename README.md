@@ -292,6 +292,8 @@ For Redis connectivity from within Docker:
 | `SOLVER_ID` | For loading | Solver ID to load config from Redis (after first seed) |
 | `RUST_LOG` | No | Log level (default: `info`) |
 | `SOLVER_PRIVATE_KEY` | Conditional | Required for local wallet if no inline `private_key` in seed overrides |
+| `HEALTH_CACHE_TTL_MS` | No | Health readiness cache TTL in milliseconds (default: `5000`) |
+| `HEALTH_CHECK_TIMEOUT_MS` | No | Timeout per readiness check in milliseconds (default: `2000`) |
 | `AWS_ACCESS_KEY_ID` | For KMS | AWS access key (if using KMS signer) |
 | `AWS_SECRET_ACCESS_KEY` | For KMS | AWS secret key (if using KMS signer) |
 | `AWS_REGION` | For KMS | AWS region (if using KMS signer, default: from config) |
@@ -335,6 +337,8 @@ cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json 
 | `REDIS_URL` | Yes | Redis connection URL (default: `redis://localhost:6379`). For production, use managed services like AWS ElastiCache |
 | `SOLVER_PRIVATE_KEY` | Conditional | 64-character hex private key (without 0x prefix) |
 | `SOLVER_ID` | For loading | Solver ID to load from Redis (set after first seed) |
+| `HEALTH_CACHE_TTL_MS` | No | Health readiness cache TTL in milliseconds (default: `5000`) |
+| `HEALTH_CHECK_TIMEOUT_MS` | No | Timeout per readiness check in milliseconds (default: `2000`) |
 
 `SOLVER_PRIVATE_KEY` is only required when using the local wallet without an inline `private_key` in seed overrides. Not needed if using KMS or providing `private_key` directly in the JSON.
 
@@ -739,6 +743,8 @@ sequenceDiagram
 
 - **GET `/health`** - Health check endpoint
   - Returns solver health status including Redis connectivity and persistence info
+  - Readiness checks are cached to avoid per-request Redis connection churn
+  - Cache/timeout tuning: `HEALTH_CACHE_TTL_MS` (default `5000`), `HEALTH_CHECK_TIMEOUT_MS` (default `2000`)
   - Response:
     ```json
     {
