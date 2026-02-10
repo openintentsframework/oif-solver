@@ -1622,6 +1622,7 @@ mod tests {
 	fn create_test_config() -> Config {
 		ConfigBuilder::new()
 			.with_min_profitability_pct(Decimal::from_str("5.0").unwrap())
+			.rate_buffer_bps(0) // Disable rate buffer for tests with specific mock expectations
 			.build()
 	}
 	fn create_test_request(is_exact_input: bool) -> GetQuoteRequest {
