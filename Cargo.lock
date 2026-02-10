@@ -5164,6 +5164,7 @@ dependencies = [
  "jsonwebtoken",
  "mockall",
  "once_cell",
+ "regex",
  "reqwest",
  "rust_decimal",
  "secp256k1 0.31.1",

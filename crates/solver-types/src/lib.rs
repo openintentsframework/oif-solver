@@ -6,6 +6,8 @@
 
 /// Account-related types for managing solver identities and signatures.
 pub mod account;
+/// Admin API request/response types.
+pub mod admin_api;
 /// API types for HTTP endpoints and request/response structures.
 pub mod api;
 /// Authentication and authorization types.
@@ -50,6 +52,7 @@ pub mod pricing;
 
 // Re-export all types for convenient access
 pub use account::*;
+pub use admin_api::*;
 pub use api::*;
 pub use auth::{AdminConfig, AuthConfig, AuthScope, JwtClaims, RefreshTokenData};
 pub use costs::{CostBreakdown, CostContext};
@@ -61,7 +64,7 @@ pub use operator_config::{
 	OperatorAccountConfig, OperatorAdminConfig, OperatorConfig, OperatorGasConfig,
 	OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig,
 	OperatorPricingConfig, OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSolverConfig,
-	OperatorToken,
+	OperatorToken, OperatorWithdrawalsConfig,
 };
 pub use order::*;
 pub use pricing::*;

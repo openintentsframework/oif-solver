@@ -160,11 +160,18 @@ impl CostProfitService {
 		request: &solver_types::GetQuoteRequest,
 		context: &solver_types::ValidatedQuoteContext,
 		decimals_map: &std::collections::HashMap<InteropAddress, u8>,
+		rate_buffer_bps: u32,
 	) -> Result<
 		std::collections::HashMap<solver_types::InteropAddress, TokenAmountInfo>,
 		CostProfitError,
 	> {
 		use solver_types::SwapType;
+		if rate_buffer_bps >= 10000 {
+			return Err(CostProfitError::Calculation(
+				"rate_buffer_bps must be less than 10000".to_string(),
+			));
+		}
+		let rate_multiplier = (Decimal::from(10000u32 - rate_buffer_bps)) / Decimal::from(10000u32);
 		let mut calculated_amounts = std::collections::HashMap::new();
 
 		match context.swap_type {
@@ -227,8 +234,9 @@ impl CostProfitService {
 						};
 
 						// Convert USD to output token amount
+						let buffered_output_usd = final_output_usd * rate_multiplier;
 						let output_amount = self
-							.convert_usd_to_token_amount(final_output_usd, &output.asset)
+							.convert_usd_to_token_amount(buffered_output_usd, &output.asset)
 							.await?;
 						let decimals = decimals_map.get(&output.asset).copied().unwrap_or(18);
 						calculated_amounts.insert(
@@ -301,8 +309,15 @@ impl CostProfitService {
 						};
 
 						// Convert USD to input token amount
+						let buffered_input_usd = if rate_multiplier.is_zero() {
+							return Err(CostProfitError::Calculation(
+								"rate_buffer_bps too high".to_string(),
+							));
+						} else {
+							final_input_usd / rate_multiplier
+						};
 						let input_amount = self
-							.convert_usd_to_token_amount(final_input_usd, &input.asset)
+							.convert_usd_to_token_amount(buffered_input_usd, &input.asset)
 							.await?;
 						let decimals = decimals_map.get(&input.asset).copied().unwrap_or(18);
 						calculated_amounts.insert(
@@ -385,7 +400,12 @@ impl CostProfitService {
 
 		// Calculate base swap amounts FIRST to fill in missing values (now returns TokenAmountInfo)
 		let swap_amounts_with_info = self
-			.calculate_swap_amounts(request, context, &decimals_map)
+			.calculate_swap_amounts(
+				request,
+				context,
+				&decimals_map,
+				config.solver.rate_buffer_bps,
+			)
 			.await?;
 
 		// Use inputs and outputs from request
@@ -624,7 +644,8 @@ impl CostProfitService {
 		let gas_buffer_bps = Decimal::new(gas_buffer_bps_value as i64, 0);
 		let gas_buffer = (gas_subtotal * gas_buffer_bps) / Decimal::from(10000);
 
-		// Rate buffer (currently 0, placeholder for future)
+		// Rate buffer is applied in swap amount calculation (rate multiplier),
+		// so keep this component at zero to avoid double-charging.
 		let rate_buffer = Decimal::ZERO;
 
 		// Calculate input and output values in USD using helpers
@@ -643,6 +664,9 @@ impl CostProfitService {
 		let transaction_value = total_input_value_usd.max(total_output_value_usd);
 		let min_profit =
 			(transaction_value * config.solver.min_profitability_pct) / Decimal::from(100);
+		let commission = (transaction_value * Decimal::from(config.solver.commission_bps))
+			/ Decimal::from(10000);
+		let min_profit = min_profit + commission;
 
 		// Calculate operational cost (gas + buffers)
 		let operational_cost = gas_open + gas_fill + gas_claim + gas_buffer + rate_buffer;
@@ -1598,6 +1622,7 @@ mod tests {
 	fn create_test_config() -> Config {
 		ConfigBuilder::new()
 			.with_min_profitability_pct(Decimal::from_str("5.0").unwrap())
+			.rate_buffer_bps(0) // Disable rate buffer for tests with specific mock expectations
 			.build()
 	}
 	fn create_test_request(is_exact_input: bool) -> GetQuoteRequest {

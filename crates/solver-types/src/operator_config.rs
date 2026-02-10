@@ -250,12 +250,30 @@ pub struct OperatorSolverConfig {
 	#[serde(default = "default_gas_buffer_bps")]
 	pub gas_buffer_bps: u32,
 
+	/// Commission in basis points (e.g., 20 = 0.20%).
+	/// Added to solver profit requirement.
+	#[serde(default = "default_commission_bps")]
+	pub commission_bps: u32,
+
+	/// Rate buffer in basis points (e.g., 14 = 0.14%).
+	/// Applied to exchange rate to protect against price volatility.
+	#[serde(default = "default_rate_buffer_bps")]
+	pub rate_buffer_bps: u32,
+
 	/// Timeout in seconds for monitoring transactions.
 	pub monitoring_timeout_seconds: u64,
 }
 
 fn default_gas_buffer_bps() -> u32 {
 	1000 // 10%
+}
+
+fn default_commission_bps() -> u32 {
+	0 // Disabled by default for backward compatibility (was not used before)
+}
+
+fn default_rate_buffer_bps() -> u32 {
+	14 // 0.14%
 }
 
 /// Admin authentication settings.
@@ -275,6 +293,18 @@ pub struct OperatorAdminConfig {
 
 	/// Authorized admin wallet addresses.
 	pub admin_addresses: Vec<Address>,
+
+	/// Withdrawal policy for admin-initiated transfers.
+	#[serde(default)]
+	pub withdrawals: OperatorWithdrawalsConfig,
+}
+
+/// Withdrawal policy configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OperatorWithdrawalsConfig {
+	/// Whether withdrawals are enabled.
+	#[serde(default)]
+	pub enabled: bool,
 }
 
 impl OperatorConfig {
@@ -361,6 +391,7 @@ impl Default for OperatorAdminConfig {
 			chain_id: 1,
 			nonce_ttl_seconds: 300,
 			admin_addresses: Vec::new(),
+			withdrawals: OperatorWithdrawalsConfig::default(),
 		}
 	}
 }
@@ -402,6 +433,7 @@ mod tests {
 			chain_id: 1,
 			nonce_ttl_seconds: 300,
 			admin_addresses: vec![test_address()],
+			withdrawals: OperatorWithdrawalsConfig::default(),
 		};
 
 		assert!(admin.is_authorized(&test_address()));
@@ -537,6 +569,8 @@ mod tests {
 			solver: OperatorSolverConfig {
 				min_profitability_pct: Decimal::ONE,
 				gas_buffer_bps: 1000,
+				commission_bps: 20,
+				rate_buffer_bps: 14,
 				monitoring_timeout_seconds: 28800,
 			},
 			admin: OperatorAdminConfig {
@@ -545,6 +579,7 @@ mod tests {
 				chain_id: 1,
 				nonce_ttl_seconds: 300,
 				admin_addresses: vec![test_address()],
+				withdrawals: OperatorWithdrawalsConfig::default(),
 			},
 			account: None,
 		};

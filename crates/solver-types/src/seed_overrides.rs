@@ -69,6 +69,16 @@ pub struct SeedOverrides {
 	/// If not set, uses default (1000 = 10%).
 	#[serde(default)]
 	pub gas_buffer_bps: Option<u32>,
+
+	/// Commission in basis points (e.g., 20 = 0.20%).
+	/// If not set, uses default.
+	#[serde(default)]
+	pub commission_bps: Option<u32>,
+
+	/// Rate buffer in basis points (e.g., 14 = 0.14%).
+	/// If not set, uses default.
+	#[serde(default)]
+	pub rate_buffer_bps: Option<u32>,
 }
 
 /// Account configuration override for non-default signing backends.
@@ -109,10 +119,22 @@ pub struct AdminOverride {
 	/// Optional nonce TTL in seconds. Default: 300 (5 minutes).
 	#[serde(default)]
 	pub nonce_ttl_seconds: Option<u64>,
+
+	/// Withdrawal policy overrides.
+	#[serde(default)]
+	pub withdrawals: WithdrawalsOverride,
 }
 
 fn default_admin_enabled() -> bool {
 	true
+}
+
+/// Withdrawal policy overrides for admin withdrawals.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WithdrawalsOverride {
+	/// Whether withdrawals are enabled.
+	#[serde(default)]
+	pub enabled: bool,
 }
 
 /// Helper module for Option<Decimal> serialization.
@@ -305,6 +327,8 @@ mod tests {
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
 		};
 
 		let chain_ids = config.chain_ids();
@@ -324,6 +348,8 @@ mod tests {
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
 		};
 
 		assert!(config.has_chain(10));
@@ -347,6 +373,8 @@ mod tests {
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
 		};
 
 		let network = config.get_network(10);
@@ -395,6 +423,8 @@ mod tests {
 			admin: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
 		};
 
 		let json = serde_json::to_string(&config).unwrap();
@@ -417,7 +447,9 @@ mod tests {
                 }
             ],
             "min_profitability_pct": "2.5",
-            "gas_buffer_bps": 1500
+            "gas_buffer_bps": 1500,
+            "commission_bps": 20,
+            "rate_buffer_bps": 14
         }"#;
 
 		let config: SeedOverrides = serde_json::from_str(json).unwrap();
@@ -427,6 +459,8 @@ mod tests {
 			Some(Decimal::from_str("2.5").unwrap())
 		);
 		assert_eq!(config.gas_buffer_bps, Some(1500));
+		assert_eq!(config.commission_bps, Some(20));
+		assert_eq!(config.rate_buffer_bps, Some(14));
 	}
 
 	#[test]
@@ -451,6 +485,8 @@ mod tests {
 			Some(Decimal::from_str("3.0").unwrap())
 		);
 		assert_eq!(config.gas_buffer_bps, None);
+		assert_eq!(config.commission_bps, None);
+		assert_eq!(config.rate_buffer_bps, None);
 	}
 
 	#[test]
@@ -470,6 +506,8 @@ mod tests {
 
 		assert_eq!(config.min_profitability_pct, None);
 		assert_eq!(config.gas_buffer_bps, None);
+		assert_eq!(config.commission_bps, None);
+		assert_eq!(config.rate_buffer_bps, None);
 	}
 
 	#[test]

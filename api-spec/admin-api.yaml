@@ -1,0 +1,1408 @@
+openapi: 3.0.3
+info:
+  title: OIF Solver Admin API
+  description: |
+    Administrative endpoints for modifying solver configuration.
+
+    All admin write actions require an EIP-712 signed request payload. If JWT auth
+    is enabled, these endpoints also require the `admin-all` scope.
+  version: 1.0.0
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Local development server
+  - url: https://api.solver.example.com/api/v1
+    description: Production server (replace with actual URL)
+
+paths:
+  /admin/nonce:
+    get:
+      summary: Get admin nonce
+      description: |
+        Generates a nonce used to sign subsequent admin actions.
+        The nonce must be included in the signed request contents.
+      operationId: getAdminNonce
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Nonce generated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NonceResponse"
+              example:
+                nonce: "12345678901234567890"
+                expiresIn: 300
+                domain: "solver.example.com"
+                chainId: 1
+        "400":
+          description: Invalid request or nonce generation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "401":
+          description: Unauthorized (signature or JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+
+  /admin/types:
+    get:
+      summary: Get EIP-712 type definitions
+      description: |
+        Returns the EIP-712 domain and type definitions required for client-side
+        signing of admin actions.
+      operationId: getAdminTypes
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: EIP-712 domain and types
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Eip712TypeInfo"
+
+  /admin/balances:
+    get:
+      summary: Get solver balances
+      description: |
+        Returns solver token balances per configured network, including native balance.
+      operationId: getAdminBalances
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Solver balances
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BalancesResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+
+  /admin/config:
+    get:
+      summary: Get operator configuration (redacted)
+      description: |
+        Returns a redacted view of the current operator configuration.
+      operationId: getAdminConfig
+      tags:
+        - Admin
+      security: []
+      responses:
+        "200":
+          description: Current operator configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminConfigResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+
+  /admin/whitelist:
+    post:
+      summary: Add an admin
+      description: |
+        Adds a new admin address to the authorized list.
+        Requires an EIP-712 signed request body.
+      operationId: addAdmin
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignedAdminRequestAddAdmin"
+            example:
+              signature: "0x..."
+              contents:
+                newAdmin: "0x1234567890abcdef1234567890abcdef12345678"
+                nonce: "12345678901234"
+                deadline: "1706184000"
+      responses:
+        "200":
+          description: Admin added
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminActionResponse"
+        "400":
+          description: Invalid request or message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "401":
+          description: Unauthorized (signature or JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+    delete:
+      summary: Remove an admin
+      description: |
+        Removes an admin address from the authorized list.
+        Requires an EIP-712 signed request body.
+      operationId: removeAdmin
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignedAdminRequestRemoveAdmin"
+            example:
+              signature: "0x..."
+              contents:
+                adminToRemove: "0x1234567890abcdef1234567890abcdef12345678"
+                nonce: "12345678901234"
+                deadline: "1706184000"
+      responses:
+        "200":
+          description: Admin removed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminActionResponse"
+        "400":
+          description: Invalid request or message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "401":
+          description: Unauthorized (signature or JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+
+  /admin/tokens:
+    post:
+      summary: Add a token to a network
+      description: |
+        Adds a new token to the specified network's configuration.
+        Requires an EIP-712 signed request body.
+      operationId: addAdminToken
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignedAdminRequestAddToken"
+            example:
+              signature: "0x..."
+              contents:
+                chainId: 10
+                symbol: "USDC"
+                tokenAddress: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+                decimals: 6
+                nonce: "12345678901234"
+                deadline: "1706184000"
+      responses:
+        "200":
+          description: Token added
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminActionResponse"
+        "400":
+          description: Invalid request or message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "401":
+          description: Unauthorized (signature or JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+    delete:
+      summary: Remove a token from a network
+      description: |
+        Removes a token from the specified network's configuration.
+        Requires an EIP-712 signed request body.
+      operationId: removeAdminToken
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignedAdminRequestRemoveToken"
+            example:
+              signature: "0x..."
+              contents:
+                chainId: 10
+                tokenAddress: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+                nonce: "12345678901234"
+                deadline: "1706184000"
+      responses:
+        "200":
+          description: Token removed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminActionResponse"
+        "400":
+          description: Invalid request or message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "401":
+          description: Unauthorized (signature or JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+
+  /admin/tokens/approve:
+    post:
+      summary: Approve tokens for a spender
+      description: |
+        Triggers ERC-20 approvals for tokens to a specified spender.
+        Uses chainId=0 for all chains and tokenAddress=0x0 for all tokens.
+        Requires an EIP-712 signed request body.
+      operationId: approveAdminTokens
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignedAdminRequestApproveTokens"
+            example:
+              signature: "0x..."
+              contents:
+                chainId: 0
+                tokenAddress: "0x0000000000000000000000000000000000000000"
+                spender: "0x1234567890abcdef1234567890abcdef12345678"
+                amount: "1000000000000000000"
+                nonce: "12345678901234"
+                deadline: "1706184000"
+      responses:
+        "200":
+          description: Approvals processed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApproveTokensResponse"
+        "400":
+          description: Invalid request or message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "401":
+          description: Unauthorized (signature or JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+
+  /admin/fees:
+    get:
+      summary: Get fee configuration
+      description: |
+        Returns current fee configuration (gas buffer, minimum profitability, commission, rate buffer).
+      operationId: getAdminFees
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current fee configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FeeConfigResponse"
+        "401":
+          description: Unauthorized (JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+    put:
+      summary: Update fee configuration
+      description: |
+        Updates gas buffer, minimum profitability, commission, and rate buffer settings.
+        Requires an EIP-712 signed request body.
+      operationId: updateAdminFees
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignedAdminRequestUpdateFees"
+            example:
+              signature: "0x..."
+              contents:
+                gasBufferBps: 1500
+                minProfitabilityPct: "2.5"
+                commissionBps: 20
+                rateBufferBps: 14
+                nonce: "12345678901234"
+                deadline: "1706184000"
+      responses:
+        "200":
+          description: Fee configuration updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminActionResponse"
+        "400":
+          description: Invalid request or message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "401":
+          description: Unauthorized (signature or JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+
+  /admin/gas:
+    get:
+      summary: Get gas configuration
+      description: |
+        Returns current gas unit configuration for all flows.
+      operationId: getAdminGas
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current gas configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GasConfigResponse"
+        "401":
+          description: Unauthorized (JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+    put:
+      summary: Update gas configuration
+      description: |
+        Updates gas unit overrides for all flows.
+        Requires an EIP-712 signed request body.
+      operationId: updateAdminGas
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignedAdminRequestUpdateGas"
+            example:
+              signature: "0x..."
+              contents:
+                resourceLockOpen: 50000
+                resourceLockFill: 150000
+                resourceLockClaim: 80000
+                permit2EscrowOpen: 60000
+                permit2EscrowFill: 160000
+                permit2EscrowClaim: 90000
+                eip3009EscrowOpen: 55000
+                eip3009EscrowFill: 155000
+                eip3009EscrowClaim: 85000
+                nonce: "12345678901234"
+                deadline: "1706184000"
+      responses:
+        "200":
+          description: Gas configuration updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminActionResponse"
+        "400":
+          description: Invalid request or message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "401":
+          description: Unauthorized (signature or JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+
+  /admin/withdrawals:
+    post:
+      summary: Withdraw tokens
+      description: |
+        Submit a withdrawal transaction from the solver-managed account.
+        Supports native token withdrawal when token is 0x0.
+        Requires an EIP-712 signed request body.
+      operationId: withdrawAdminTokens
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignedAdminRequestWithdraw"
+            example:
+              signature: "0x..."
+              contents:
+                chainId: 10
+                token: "0x0000000000000000000000000000000000000000"
+                amount: "1000000000000000000"
+                recipient: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+                nonce: "12345678901234"
+                deadline: "1706184000"
+      responses:
+        "200":
+          description: Withdrawal submitted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WithdrawalResponse"
+        "400":
+          description: Invalid request or message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "401":
+          description: Unauthorized (signature or JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    NonceResponse:
+      type: object
+      required:
+        - nonce
+        - expiresIn
+        - domain
+        - chainId
+      properties:
+        nonce:
+          type: string
+          description: Nonce as a string to preserve precision
+          example: "12345678901234567890"
+        expiresIn:
+          type: integer
+          format: int64
+          description: Nonce time-to-live in seconds
+          example: 300
+        domain:
+          type: string
+          description: EIP-712 domain name
+          example: "solver.example.com"
+        chainId:
+          type: integer
+          format: int64
+          description: EIP-712 domain chain ID
+          example: 1
+
+    AdminActionResponse:
+      type: object
+      required:
+        - success
+        - message
+        - admin
+      properties:
+        success:
+          type: boolean
+          example: true
+        message:
+          type: string
+          example: "Token USDC added to chain 10"
+        admin:
+          type: string
+          description: Admin address
+          example: "0x1234567890abcdef1234567890abcdef12345678"
+
+    SignedAdminRequestAddToken:
+      type: object
+      required:
+        - signature
+        - contents
+      properties:
+        signature:
+          type: string
+          description: Hex-encoded EIP-712 signature (65 bytes)
+          pattern: "^0x[a-fA-F0-9]+$"
+        contents:
+          $ref: "#/components/schemas/AddTokenContents"
+
+    SignedAdminRequestAddAdmin:
+      type: object
+      required:
+        - signature
+        - contents
+      properties:
+        signature:
+          type: string
+          description: Hex-encoded EIP-712 signature (65 bytes)
+          pattern: "^0x[a-fA-F0-9]+$"
+        contents:
+          $ref: "#/components/schemas/AddAdminContents"
+
+    AddAdminContents:
+      type: object
+      required:
+        - newAdmin
+        - nonce
+        - deadline
+      properties:
+        newAdmin:
+          type: string
+          pattern: "^0x[a-fA-F0-9]{40}$"
+          example: "0x1234567890abcdef1234567890abcdef12345678"
+        nonce:
+          type: string
+          description: Nonce as a string (number also accepted by server)
+          example: "12345678901234"
+        deadline:
+          type: string
+          description: Unix timestamp (seconds) as a string (number also accepted)
+          example: "1706184000"
+
+    AddTokenContents:
+      type: object
+      required:
+        - chainId
+        - symbol
+        - tokenAddress
+        - decimals
+        - nonce
+        - deadline
+      properties:
+        chainId:
+          type: integer
+          format: int64
+          example: 10
+        symbol:
+          type: string
+          example: "USDC"
+        tokenAddress:
+          type: string
+          pattern: "^0x[a-fA-F0-9]{40}$"
+          example: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+        decimals:
+          type: integer
+          minimum: 0
+          maximum: 255
+          example: 6
+        nonce:
+          type: string
+          description: Nonce as a string (number also accepted by server)
+          example: "12345678901234"
+        deadline:
+          type: string
+          description: Unix timestamp (seconds) as a string (number also accepted)
+          example: "1706184000"
+
+    SignedAdminRequestRemoveToken:
+      type: object
+      required:
+        - signature
+        - contents
+      properties:
+        signature:
+          type: string
+          description: Hex-encoded EIP-712 signature (65 bytes)
+          pattern: "^0x[a-fA-F0-9]+$"
+        contents:
+          $ref: "#/components/schemas/RemoveTokenContents"
+
+    SignedAdminRequestRemoveAdmin:
+      type: object
+      required:
+        - signature
+        - contents
+      properties:
+        signature:
+          type: string
+          description: Hex-encoded EIP-712 signature (65 bytes)
+          pattern: "^0x[a-fA-F0-9]+$"
+        contents:
+          $ref: "#/components/schemas/RemoveAdminContents"
+
+    RemoveAdminContents:
+      type: object
+      required:
+        - adminToRemove
+        - nonce
+        - deadline
+      properties:
+        adminToRemove:
+          type: string
+          pattern: "^0x[a-fA-F0-9]{40}$"
+          example: "0x1234567890abcdef1234567890abcdef12345678"
+        nonce:
+          type: string
+          description: Nonce as a string (number also accepted by server)
+          example: "12345678901234"
+        deadline:
+          type: string
+          description: Unix timestamp (seconds) as a string (number also accepted)
+          example: "1706184000"
+
+    RemoveTokenContents:
+      type: object
+      required:
+        - chainId
+        - tokenAddress
+        - nonce
+        - deadline
+      properties:
+        chainId:
+          type: integer
+          format: int64
+          example: 10
+        tokenAddress:
+          type: string
+          pattern: "^0x[a-fA-F0-9]{40}$"
+          example: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+        nonce:
+          type: string
+          description: Nonce as a string (number also accepted by server)
+          example: "12345678901234"
+        deadline:
+          type: string
+          description: Unix timestamp (seconds) as a string (number also accepted)
+          example: "1706184000"
+
+    SignedAdminRequestApproveTokens:
+      type: object
+      required:
+        - signature
+        - contents
+      properties:
+        signature:
+          type: string
+          description: Hex-encoded EIP-712 signature (65 bytes)
+          pattern: "^0x[a-fA-F0-9]+$"
+        contents:
+          $ref: "#/components/schemas/ApproveTokensContents"
+
+    ApproveTokensContents:
+      type: object
+      required:
+        - chainId
+        - tokenAddress
+        - spender
+        - amount
+        - nonce
+        - deadline
+      properties:
+        chainId:
+          type: integer
+          format: int64
+          description: 0 means all chains
+          example: 0
+        tokenAddress:
+          type: string
+          description: 0x0 means all tokens on the selected chain(s)
+          pattern: "^0x[a-fA-F0-9]{40}$"
+          example: "0x0000000000000000000000000000000000000000"
+        spender:
+          type: string
+          description: Address to approve as spender
+          pattern: "^0x[a-fA-F0-9]{40}$"
+          example: "0x1234567890abcdef1234567890abcdef12345678"
+        amount:
+          type: string
+          description: Allowance amount as uint256 decimal string
+          example: "1000000000000000000"
+        nonce:
+          type: string
+          description: Nonce as a string (number also accepted by server)
+          example: "12345678901234"
+        deadline:
+          type: string
+          description: Unix timestamp (seconds) as a string (number also accepted)
+          example: "1706184000"
+
+    ApproveTokensResponse:
+      type: object
+      required:
+        - success
+        - message
+        - admin
+        - approvedCount
+        - chainsProcessed
+      properties:
+        success:
+          type: boolean
+          example: true
+        message:
+          type: string
+          example: "Approved 2 allowances (all tokens on chain 10)"
+        admin:
+          type: string
+          description: Admin address
+          example: "0x1234567890abcdef1234567890abcdef12345678"
+        approvedCount:
+          type: integer
+          example: 2
+        chainsProcessed:
+          type: array
+          items:
+            type: integer
+            format: int64
+          example: [10]
+
+    BalancesResponse:
+      type: object
+      required:
+        - solverAddress
+        - networks
+      properties:
+        solverAddress:
+          type: string
+          example: "0x1234567890abcdef1234567890abcdef12345678"
+        networks:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/ChainBalances"
+
+    ChainBalances:
+      type: object
+      required:
+        - chainId
+        - tokens
+      properties:
+        chainId:
+          type: integer
+          format: int64
+          example: 84532
+        tokens:
+          type: array
+          items:
+            $ref: "#/components/schemas/TokenBalance"
+        error:
+          type: string
+          nullable: true
+          example: null
+
+    TokenBalance:
+      type: object
+      required:
+        - address
+        - symbol
+        - decimals
+        - balance
+        - balanceFormatted
+      properties:
+        address:
+          type: string
+          example: "0x0000000000000000000000000000000000000000"
+        symbol:
+          type: string
+          example: "USDC"
+        decimals:
+          type: integer
+          example: 6
+        balance:
+          type: string
+          example: "1000000000"
+        balanceFormatted:
+          type: string
+          example: "1000.00"
+
+    AdminConfigResponse:
+      type: object
+      required:
+        - solverId
+        - networks
+        - solver
+        - gas
+        - admin
+        - version
+      properties:
+        solverId:
+          type: string
+          example: "solver-abc123"
+        networks:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminNetworkResponse"
+        solver:
+          $ref: "#/components/schemas/AdminSolverResponse"
+        gas:
+          $ref: "#/components/schemas/GasConfigResponse"
+        admin:
+          $ref: "#/components/schemas/AdminConfigSummary"
+        version:
+          type: integer
+          format: int64
+          example: 3
+
+    AdminNetworkResponse:
+      type: object
+      required:
+        - chainId
+        - rpcUrls
+        - tokens
+        - inputSettler
+        - outputSettler
+      properties:
+        chainId:
+          type: integer
+          format: int64
+          example: 84532
+        rpcUrls:
+          type: array
+          items:
+            type: string
+          example: ["https://sepolia.optimism.io"]
+        tokens:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminTokenResponse"
+        inputSettler:
+          type: string
+          example: "0x0000000000000000000000000000000000000001"
+        outputSettler:
+          type: string
+          example: "0x0000000000000000000000000000000000000002"
+
+    AdminTokenResponse:
+      type: object
+      required:
+        - symbol
+        - address
+        - decimals
+      properties:
+        symbol:
+          type: string
+          example: "USDC"
+        address:
+          type: string
+          example: "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"
+        decimals:
+          type: integer
+          example: 6
+
+    AdminSolverResponse:
+      type: object
+      required:
+        - minProfitabilityPct
+        - gasBufferBps
+        - commissionBps
+        - rateBufferBps
+      properties:
+        minProfitabilityPct:
+          type: string
+          example: "1.0"
+        gasBufferBps:
+          type: integer
+          example: 1000
+        commissionBps:
+          type: integer
+          example: 20
+        rateBufferBps:
+          type: integer
+          example: 14
+
+    AdminConfigSummary:
+      type: object
+      required:
+        - enabled
+        - domain
+        - withdrawalsEnabled
+      properties:
+        enabled:
+          type: boolean
+          example: true
+        domain:
+          type: string
+          example: "localhost"
+        withdrawalsEnabled:
+          type: boolean
+          example: true
+
+    GasConfigResponse:
+      type: object
+      required:
+        - resourceLock
+        - permit2Escrow
+        - eip3009Escrow
+      properties:
+        resourceLock:
+          $ref: "#/components/schemas/GasFlowResponse"
+        permit2Escrow:
+          $ref: "#/components/schemas/GasFlowResponse"
+        eip3009Escrow:
+          $ref: "#/components/schemas/GasFlowResponse"
+
+    GasFlowResponse:
+      type: object
+      required:
+        - open
+        - fill
+        - claim
+      properties:
+        open:
+          type: integer
+          format: int64
+          example: 50000
+        fill:
+          type: integer
+          format: int64
+          example: 150000
+        claim:
+          type: integer
+          format: int64
+          example: 80000
+
+    SignedAdminRequestUpdateGas:
+      type: object
+      required:
+        - signature
+        - contents
+      properties:
+        signature:
+          type: string
+          description: Hex-encoded EIP-712 signature (65 bytes)
+          pattern: "^0x[a-fA-F0-9]+$"
+        contents:
+          $ref: "#/components/schemas/UpdateGasConfigContents"
+
+    UpdateGasConfigContents:
+      type: object
+      required:
+        - resourceLockOpen
+        - resourceLockFill
+        - resourceLockClaim
+        - permit2EscrowOpen
+        - permit2EscrowFill
+        - permit2EscrowClaim
+        - eip3009EscrowOpen
+        - eip3009EscrowFill
+        - eip3009EscrowClaim
+        - nonce
+        - deadline
+      properties:
+        resourceLockOpen:
+          type: integer
+          format: int64
+          example: 50000
+        resourceLockFill:
+          type: integer
+          format: int64
+          example: 150000
+        resourceLockClaim:
+          type: integer
+          format: int64
+          example: 80000
+        permit2EscrowOpen:
+          type: integer
+          format: int64
+          example: 60000
+        permit2EscrowFill:
+          type: integer
+          format: int64
+          example: 160000
+        permit2EscrowClaim:
+          type: integer
+          format: int64
+          example: 90000
+        eip3009EscrowOpen:
+          type: integer
+          format: int64
+          example: 55000
+        eip3009EscrowFill:
+          type: integer
+          format: int64
+          example: 155000
+        eip3009EscrowClaim:
+          type: integer
+          format: int64
+          example: 85000
+        nonce:
+          type: string
+          description: Nonce as a string (number also accepted by server)
+          example: "12345678901234"
+        deadline:
+          type: string
+          description: Unix timestamp (seconds) as a string (number also accepted)
+          example: "1706184000"
+
+    SignedAdminRequestUpdateFees:
+      type: object
+      required:
+        - signature
+        - contents
+      properties:
+        signature:
+          type: string
+          description: Hex-encoded EIP-712 signature (65 bytes)
+          pattern: "^0x[a-fA-F0-9]+$"
+        contents:
+          $ref: "#/components/schemas/UpdateFeeConfigContents"
+
+    UpdateFeeConfigContents:
+      type: object
+      required:
+        - gasBufferBps
+        - minProfitabilityPct
+        - commissionBps
+        - rateBufferBps
+        - nonce
+        - deadline
+      properties:
+        gasBufferBps:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          description: Gas buffer in basis points
+          example: 1500
+        minProfitabilityPct:
+          type: string
+          description: Minimum profitability percentage as a decimal string
+          example: "2.5"
+        commissionBps:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          description: Commission in basis points
+          example: 20
+        rateBufferBps:
+          type: integer
+          minimum: 0
+          maximum: 9999
+          description: Rate buffer in basis points
+          example: 14
+        nonce:
+          type: string
+          description: Nonce as a string (number also accepted by server)
+          example: "12345678901234"
+        deadline:
+          type: string
+          description: Unix timestamp (seconds) as a string (number also accepted)
+          example: "1706184000"
+
+    SignedAdminRequestWithdraw:
+      type: object
+      required:
+        - signature
+        - contents
+      properties:
+        signature:
+          type: string
+          description: Hex-encoded EIP-712 signature (65 bytes)
+          pattern: "^0x[a-fA-F0-9]+$"
+        contents:
+          $ref: "#/components/schemas/WithdrawContents"
+
+    WithdrawContents:
+      type: object
+      required:
+        - chainId
+        - token
+        - amount
+        - recipient
+        - nonce
+        - deadline
+      properties:
+        chainId:
+          type: integer
+          format: int64
+          example: 10
+        token:
+          type: string
+          description: Token address (0x0 for native)
+          pattern: "^0x[a-fA-F0-9]{40}$"
+          example: "0x0000000000000000000000000000000000000000"
+        amount:
+          type: string
+          description: Amount to withdraw in smallest unit
+          example: "1000000000000000000"
+        recipient:
+          type: string
+          description: Recipient address
+          pattern: "^0x[a-fA-F0-9]{40}$"
+          example: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+        nonce:
+          type: string
+          description: Nonce as a string (number also accepted by server)
+          example: "12345678901234"
+        deadline:
+          type: string
+          description: Unix timestamp (seconds) as a string (number also accepted)
+          example: "1706184000"
+
+    WithdrawalResponse:
+      type: object
+      required:
+        - success
+        - status
+        - message
+        - admin
+      properties:
+        success:
+          type: boolean
+          example: true
+        status:
+          type: string
+          example: "submitted"
+        message:
+          type: string
+          example: "Withdrawal submitted on chain 10"
+        admin:
+          type: string
+          description: Admin address
+          example: "0x1234567890abcdef1234567890abcdef12345678"
+        txHash:
+          type: string
+          description: Transaction hash
+          example: "0xabc123..."
+
+    FeeConfigResponse:
+      type: object
+      required:
+        - minProfitabilityPct
+        - gasBufferBps
+        - commissionBps
+        - rateBufferBps
+        - monitoringTimeoutSeconds
+      properties:
+        minProfitabilityPct:
+          type: string
+          example: "2.5"
+        gasBufferBps:
+          type: integer
+          example: 1500
+        commissionBps:
+          type: integer
+          example: 20
+        rateBufferBps:
+          type: integer
+          example: 14
+        monitoringTimeoutSeconds:
+          type: integer
+          example: 28800
+
+    Eip712TypeInfo:
+      type: object
+      required:
+        - domain
+        - types
+      properties:
+        domain:
+          $ref: "#/components/schemas/Eip712Domain"
+        types:
+          type: object
+          description: EIP-712 type definitions
+          additionalProperties: true
+
+    Eip712Domain:
+      type: object
+      required:
+        - name
+        - version
+        - chainId
+      properties:
+        name:
+          type: string
+          example: "OIF Solver Admin"
+        version:
+          type: string
+          example: "1"
+        chainId:
+          type: integer
+          format: int64
+          example: 1
+
+    AdminAuthErrorResponse:
+      type: object
+      required:
+        - error
+        - error_description
+      properties:
+        error:
+          type: string
+          example: "invalid_signature"
+        error_description:
+          type: string
+          example: "Invalid signature: wrong length"
+
+tags:
+  - name: Admin
+    description: Administrative endpoints for updating solver configuration

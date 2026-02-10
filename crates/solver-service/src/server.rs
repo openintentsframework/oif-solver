@@ -5,7 +5,10 @@
 
 use crate::{
 	apis::admin::{
-		handle_add_token, handle_get_nonce, handle_get_types, handle_update_fees, AdminApiState,
+		handle_add_admin, handle_add_token, handle_approve_tokens, handle_get_balances,
+		handle_get_config, handle_get_fees, handle_get_gas, handle_get_nonce, handle_get_types,
+		handle_remove_admin, handle_remove_token, handle_update_fees, handle_update_gas,
+		handle_withdrawal, AdminApiState,
 	},
 	apis::health::handle_health,
 	apis::order::get_order_by_id,
@@ -20,7 +23,7 @@ use axum::{
 	http::StatusCode,
 	middleware,
 	response::{IntoResponse, Json},
-	routing::{get, post, put},
+	routing::{delete, get, post, put},
 	Router, ServiceExt,
 };
 use serde_json::Value;
@@ -268,26 +271,43 @@ pub async fn start_server(
 
 	// Add admin routes if enabled
 	if let Some(admin_state) = admin_state {
-		let mut admin_routes = Router::new()
+		let admin_public_routes = Router::new().route("/config", get(handle_get_config));
+
+		let mut admin_protected_routes = Router::new()
+			.route("/balances", get(handle_get_balances))
 			.route("/nonce", get(handle_get_nonce))
 			.route("/types", get(handle_get_types))
+			.route("/whitelist", post(handle_add_admin))
+			.route("/whitelist", delete(handle_remove_admin))
 			.route("/tokens", post(handle_add_token))
+			.route("/tokens", delete(handle_remove_token))
+			.route("/tokens/approve", post(handle_approve_tokens))
+			.route("/withdrawals", post(handle_withdrawal))
+			.route("/fees", get(handle_get_fees))
 			.route("/fees", put(handle_update_fees))
-			.with_state(admin_state);
-		// Only apply JWT auth to admin routes if orders_require_auth is true
+			.route("/gas", get(handle_get_gas))
+			.route("/gas", put(handle_update_gas));
+
+		// Only apply JWT auth to protected admin routes if orders_require_auth is true
 		// (i.e., auth.enabled in config). Admin routes also have their own
 		// EIP-712 signature auth for admin actions.
 		if orders_require_auth {
 			if let Some(jwt) = &jwt_service {
-				admin_routes = admin_routes.layer(middleware::from_fn_with_state(
-					AuthState {
-						jwt_service: jwt.clone(),
-						required_scope: solver_types::AuthScope::AdminAll,
-					},
-					auth_middleware,
-				));
+				admin_protected_routes =
+					admin_protected_routes.layer(middleware::from_fn_with_state(
+						AuthState {
+							jwt_service: jwt.clone(),
+							required_scope: solver_types::AuthScope::AdminAll,
+						},
+						auth_middleware,
+					));
 			}
 		}
+
+		let admin_routes = admin_public_routes
+			.merge(admin_protected_routes)
+			.with_state(admin_state);
+
 		api_routes = api_routes.nest("/admin", admin_routes);
 		tracing::info!("Admin routes registered at /api/v1/admin/*");
 	}

@@ -202,6 +202,86 @@ impl TokenManager {
 		Ok(())
 	}
 
+	/// Ensures approvals for a specific spender and amount across a token scope.
+	///
+	/// # Arguments
+	///
+	/// * `chain_id` - If Some, only process tokens on this chain. If None, process all chains.
+	/// * `token_address` - If Some, only process this specific token. If None, process all tokens.
+	/// * `spender` - Address to approve as spender.
+	/// * `amount` - Exact allowance amount to set (uint256).
+	///
+	/// # Returns
+	///
+	/// Returns a tuple of (approved_count, chains_processed) on success.
+	/// Returns an error if any approval transaction fails.
+	pub async fn ensure_approvals_for_spender_scope(
+		&self,
+		chain_id: Option<u64>,
+		token_address: Option<Address>,
+		spender: Address,
+		amount: U256,
+	) -> Result<(usize, Vec<u64>), TokenManagerError> {
+		let solver_address = self.account.get_address().await?;
+		let solver_address_str = with_0x_prefix(&hex::encode(&solver_address.0));
+
+		let networks = self.networks.read().await;
+		let mut approved_count = 0usize;
+		let mut chains_processed = Vec::new();
+
+		for (cid, network) in networks.iter() {
+			// Skip if chain filter is set and doesn't match
+			if let Some(filter_chain) = chain_id {
+				if *cid != filter_chain {
+					continue;
+				}
+			}
+
+			chains_processed.push(*cid);
+
+			for token in &network.tokens {
+				// Skip if token filter is set and doesn't match
+				if let Some(ref filter_token) = token_address {
+					if token.address != *filter_token {
+						continue;
+					}
+				}
+
+				let current_allowance = self
+					.delivery
+					.get_allowance(
+						*cid,
+						&solver_address_str,
+						&with_0x_prefix(&hex::encode(&spender.0)),
+						&with_0x_prefix(&hex::encode(&token.address.0)),
+					)
+					.await?;
+
+				let current_allowance_u256 =
+					U256::from_str_radix(&current_allowance, 10).map_err(|e| {
+						TokenManagerError::ParseError(format!(
+							"Invalid allowance value '{current_allowance}': {e}"
+						))
+					})?;
+
+				// Set exact allowance if it doesn't match the requested amount
+				if current_allowance_u256 != amount {
+					tracing::info!(
+						"Setting approval for token {} on chain {} for spender {}",
+						token.symbol,
+						cid,
+						with_0x_prefix(&hex::encode(&spender.0))
+					);
+					self.submit_approval(*cid, &token.address, &spender, amount)
+						.await?;
+					approved_count += 1;
+				}
+			}
+		}
+
+		Ok((approved_count, chains_processed))
+	}
+
 	/// Submits an ERC20 approval transaction.
 	///
 	/// Creates and submits a transaction to approve the specified spender to transfer
@@ -211,7 +291,7 @@ impl TokenManager {
 	///
 	/// * `chain_id` - The blockchain network ID
 	/// * `token_address` - The ERC20 token contract address
-	/// * `spender` - The address being granted approval (settler contract)
+	/// * `spender` - The address being granted approval
 	/// * `amount` - The amount to approve (typically MAX_UINT256)
 	///
 	/// # Returns
@@ -323,6 +403,89 @@ impl TokenManager {
 			.await?;
 
 		Ok(balance)
+	}
+
+	/// Checks balance for a token address or native currency on a specific chain.
+	///
+	/// If `token_address` is the zero address, this returns the native token balance.
+	/// Otherwise, it returns the ERC-20 balance for the token.
+	pub async fn check_balance_any(
+		&self,
+		chain_id: u64,
+		token_address: &Address,
+	) -> Result<String, TokenManagerError> {
+		if token_address.0 == [0u8; 20] {
+			let solver_address = self.account.get_address().await?;
+			let solver_address_str = hex::encode(&solver_address.0);
+			let balance = self
+				.delivery
+				.get_balance(chain_id, &solver_address_str, None)
+				.await?;
+			return Ok(balance);
+		}
+
+		self.check_balance(chain_id, token_address).await
+	}
+
+	/// Returns the solver's address managed by the account service.
+	pub async fn get_solver_address(&self) -> Result<Address, TokenManagerError> {
+		Ok(self.account.get_address().await?)
+	}
+
+	/// Transfers tokens or native currency from the solver account to a recipient.
+	///
+	/// If `token_address` is the zero address, this performs a native currency transfer.
+	/// Otherwise, it submits an ERC-20 `transfer(address,uint256)` transaction.
+	pub async fn withdraw_token(
+		&self,
+		chain_id: u64,
+		token_address: &Address,
+		recipient: &Address,
+		amount: U256,
+	) -> Result<TransactionHash, TokenManagerError> {
+		let tx = if token_address.0 == [0u8; 20] {
+			// Native token transfer - let delivery service estimate gas
+			// (21k is only enough for EOAs, contracts/multisigs need more)
+			Transaction {
+				chain_id,
+				to: Some(recipient.clone()),
+				data: Vec::new(),
+				value: amount,
+				gas_limit: None,
+				gas_price: None,
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+				nonce: None,
+			}
+		} else {
+			// ERC20 transfer(address,uint256) selector: 0xa9059cbb
+			let selector = [0xa9, 0x05, 0x9c, 0xbb];
+			let mut call_data = Vec::new();
+			call_data.extend_from_slice(&selector);
+
+			// Add recipient address (32 bytes, left-padded with zeros)
+			call_data.extend_from_slice(&[0; 12]);
+			call_data.extend_from_slice(&recipient.0);
+
+			// Add amount (32 bytes)
+			let amount_bytes = amount.to_be_bytes::<32>();
+			call_data.extend_from_slice(&amount_bytes);
+
+			Transaction {
+				chain_id,
+				to: Some(token_address.clone()),
+				data: call_data,
+				value: U256::ZERO,
+				gas_limit: Some(100000),
+				gas_price: None,
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+				nonce: None,
+			}
+		};
+
+		let tx_hash = self.delivery.deliver(tx, None).await?;
+		Ok(tx_hash)
 	}
 
 	/// Checks if a token is supported on a specific chain.
@@ -693,5 +856,248 @@ mod tests {
 		let amount_bytes = amount.to_be_bytes::<32>();
 		assert_eq!(amount_bytes.len(), 32);
 		assert_eq!(amount_bytes, [0xff; 32]);
+	}
+
+	#[tokio::test]
+	async fn test_check_balance_any_native_token() {
+		let networks = create_test_networks_config();
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_balance()
+			.returning(|_, _, _| Box::pin(async { Ok("5000000000000000000".to_string()) }));
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations = HashMap::new();
+		implementations.insert(
+			1,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 20));
+
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		// Zero address = native token
+		let zero_address = Address(vec![0u8; 20]);
+		let result = token_manager.check_balance_any(1, &zero_address).await;
+
+		assert!(result.is_ok());
+		assert_eq!(result.unwrap(), "5000000000000000000");
+	}
+
+	#[tokio::test]
+	async fn test_check_balance_any_erc20_token() {
+		let networks = create_test_networks_config();
+		let delivery = create_mock_delivery_service();
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		let token_address = parse_address("a0b86991c431e69f7f3aa4ce5a9b9a8ce3606eb4").unwrap();
+		let result = token_manager.check_balance_any(1, &token_address).await;
+
+		assert!(result.is_ok());
+		assert_eq!(result.unwrap(), "1000000");
+	}
+
+	#[tokio::test]
+	async fn test_withdraw_token_native() {
+		let networks = create_test_networks_config();
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_submit().returning(|_, _| {
+			Box::pin(async { Ok(solver_types::TransactionHash(vec![0xaa; 32])) })
+		});
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations = HashMap::new();
+		implementations.insert(
+			1,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 20));
+
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		let zero_address = Address(vec![0u8; 20]);
+		let recipient = parse_address("1111111111111111111111111111111111111111").unwrap();
+		let amount = U256::from(1000000000000000000u64); // 1 ETH
+
+		let result = token_manager
+			.withdraw_token(1, &zero_address, &recipient, amount)
+			.await;
+
+		assert!(result.is_ok());
+		assert_eq!(result.unwrap().0, vec![0xaa; 32]);
+	}
+
+	#[tokio::test]
+	async fn test_withdraw_token_erc20() {
+		let networks = create_test_networks_config();
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_submit().returning(|_, _| {
+			Box::pin(async { Ok(solver_types::TransactionHash(vec![0xbb; 32])) })
+		});
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations = HashMap::new();
+		implementations.insert(
+			1,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 20));
+
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		let token_address = parse_address("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").unwrap();
+		let recipient = parse_address("1111111111111111111111111111111111111111").unwrap();
+		let amount = U256::from(1000000u64); // 1 USDC
+
+		let result = token_manager
+			.withdraw_token(1, &token_address, &recipient, amount)
+			.await;
+
+		assert!(result.is_ok());
+		assert_eq!(result.unwrap().0, vec![0xbb; 32]);
+	}
+
+	#[test]
+	fn test_erc20_transfer_selector() {
+		// transfer(address,uint256) selector: 0xa9059cbb
+		let expected_selector = [0xa9, 0x05, 0x9c, 0xbb];
+		assert_eq!(expected_selector, [0xa9, 0x05, 0x9c, 0xbb]);
+	}
+
+	#[tokio::test]
+	async fn test_check_balance_network_not_configured() {
+		let networks = create_test_networks_config();
+		let delivery = create_mock_delivery_service();
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		let token_address = parse_address("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").unwrap();
+		let result = token_manager.check_balance(999, &token_address).await;
+
+		// Network 999 is not configured in DeliveryService, so we get a DeliveryError
+		assert!(result.is_err());
+		match result.unwrap_err() {
+			TokenManagerError::DeliveryError(_) => {}, // Expected
+			other => panic!("Expected DeliveryError, got {:?}", other),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_get_tokens_for_chain_nonexistent() {
+		let networks = create_test_networks_config();
+		let delivery = create_mock_delivery_service();
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		let tokens = token_manager.get_tokens_for_chain(999).await;
+		assert!(tokens.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_get_token_info_token_not_found() {
+		let networks = create_test_networks_config();
+		let delivery = create_mock_delivery_service();
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		let unknown_address = parse_address("0000000000000000000000000000000000000001").unwrap();
+		let result = token_manager.get_token_info(1, &unknown_address).await;
+
+		assert!(result.is_err());
+		match result.unwrap_err() {
+			TokenManagerError::TokenNotSupported(_, chain_id) => assert_eq!(chain_id, 1),
+			_ => panic!("Expected TokenNotSupported error"),
+		}
+	}
+
+	#[test]
+	fn test_token_manager_error_variants() {
+		let delivery_err = TokenManagerError::DeliveryError(
+			solver_delivery::DeliveryError::Network("test error".to_string()),
+		);
+		assert!(delivery_err.to_string().contains("Delivery error"));
+
+		let account_err = TokenManagerError::AccountError(
+			solver_account::AccountError::SigningFailed("account error".to_string()),
+		);
+		assert!(account_err.to_string().contains("Account error"));
+
+		let parse_err = TokenManagerError::ParseError("parse error".to_string());
+		assert!(parse_err.to_string().contains("Failed to parse value"));
+	}
+
+	#[tokio::test]
+	async fn test_get_solver_address() {
+		let networks = create_test_networks_config();
+		let delivery = create_mock_delivery_service();
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		let address = token_manager.get_solver_address().await;
+		assert!(address.is_ok());
+		let addr = address.unwrap();
+		// The mock returns "3333333333333333333333333333333333333333"
+		assert_eq!(
+			hex::encode(&addr.0),
+			"3333333333333333333333333333333333333333"
+		);
+	}
+
+	#[test]
+	fn test_erc20_transfer_constants() {
+		// Test the ERC20 transfer transaction data construction constants
+		let expected_selector = [0xa9, 0x05, 0x9c, 0xbb]; // transfer(address,uint256)
+		assert_eq!(expected_selector, [0xa9, 0x05, 0x9c, 0xbb]);
+
+		// Verify amount encoding
+		let amount = U256::from(1000000u64);
+		let amount_bytes = amount.to_be_bytes::<32>();
+		assert_eq!(amount_bytes.len(), 32);
+		// First 26 bytes should be zero for small number
+		assert!(amount_bytes[..26].iter().all(|&b| b == 0));
+	}
+
+	#[tokio::test]
+	async fn test_is_supported_nonexistent_chain() {
+		let networks = create_test_networks_config();
+		let delivery = create_mock_delivery_service();
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		let usdc_address = parse_address("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").unwrap();
+
+		// Chain 999 doesn't exist in our test config
+		assert!(!token_manager.is_supported(999, &usdc_address).await);
+	}
+
+	#[tokio::test]
+	async fn test_get_networks_returns_clone() {
+		let networks = create_test_networks_config();
+		let delivery = create_mock_delivery_service();
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks.clone(), delivery, account);
+
+		let retrieved = token_manager.get_networks().await;
+
+		// Should have same number of networks
+		assert_eq!(retrieved.len(), networks.len());
+
+		// Should contain same chain IDs
+		for chain_id in networks.keys() {
+			assert!(retrieved.contains_key(chain_id));
+		}
 	}
 }

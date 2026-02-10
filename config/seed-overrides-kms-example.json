@@ -1,0 +1,43 @@
+{
+  "solver_id": "my-kms-solver",
+  "account": {
+    "primary": "kms",
+    "implementations": {
+      "kms": {
+        "key_id": "your-kms-key-id-here",
+        "region": "us-east-1"
+      }
+    }
+  },
+  "networks": [
+    {
+      "chain_id": 11155420,
+      "tokens": [
+        {
+          "symbol": "USDC",
+          "address": "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6",
+          "decimals": 6
+        }
+      ]
+    },
+    {
+      "chain_id": 84532,
+      "tokens": [
+        {
+          "symbol": "USDC",
+          "address": "0x73c83DAcc74bB8a704717AC09703b959E74b9705",
+          "decimals": 6
+        }
+      ]
+    }
+  ],
+  "admin": {
+    "enabled": true,
+    "domain": "localhost",
+    "chain_id": 84532,
+    "admin_addresses": ["0xYourAdminAddress"],
+    "withdrawals": {
+      "enabled": true
+    }
+  }
+}
