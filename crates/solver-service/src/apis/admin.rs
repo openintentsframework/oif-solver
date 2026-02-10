@@ -16,6 +16,8 @@ use axum::{
 	http::Request,
 	Json,
 };
+use once_cell::sync::Lazy;
+use regex::Regex;
 use solver_config::Config;
 use solver_core::engine::token_manager::TokenManager;
 use solver_storage::redact_url_credentials;
@@ -301,7 +303,7 @@ pub async fn handle_get_gas(
 	Ok(Json(gas_config_response(&versioned.data.gas)))
 }
 
-/// POST /api/v1/admin/admins
+/// POST /api/v1/admin/whitelist
 ///
 /// Add an admin address to the authorized list.
 pub async fn handle_add_admin(
@@ -359,7 +361,7 @@ pub async fn handle_add_admin(
 	}))
 }
 
-/// DELETE /api/v1/admin/admins
+/// DELETE /api/v1/admin/whitelist
 ///
 /// Remove an admin address from the authorized list.
 pub async fn handle_remove_admin(
@@ -1005,46 +1007,32 @@ fn redact_rpc_url(url: &str) -> String {
 	base
 }
 
-fn redact_path_api_key(url: &str) -> String {
-	for marker in ["/v2/", "/v3/"] {
-		if let Some(idx) = url.find(marker) {
-			let start = idx + marker.len();
-			if start >= url.len() {
-				return url.to_string();
-			}
-			let end = url[start..]
-				.find('/')
-				.map(|offset| start + offset)
-				.unwrap_or(url.len());
-			if end > start {
-				return format!("{}[REDACTED]{}", &url[..start], &url[end..]);
-			}
-		}
-	}
+/// Regex to redact path segments after TLD that look like API keys.
+/// Matches: scheme://host.tld/path and redacts everything after the TLD.
+/// Examples:
+///   https://mainnet.infura.io/v3/abc123 -> https://mainnet.infura.io/[REDACTED]
+///   https://eth-mainnet.g.alchemy.com/v2/abc123 -> https://eth-mainnet.g.alchemy.com/[REDACTED]
+static PATH_API_KEY_REGEX: Lazy<Regex> = Lazy::new(|| {
+	// Match scheme://host.tld and capture it, then redact everything after
+	Regex::new(r"^(https?://[^/]+)/.*$").unwrap()
+});
 
-	url.to_string()
+fn redact_path_api_key(url: &str) -> String {
+	PATH_API_KEY_REGEX
+		.replace(url, "$1/[REDACTED]")
+		.into_owned()
 }
 
+/// Regex to match sensitive query parameters and redact their values.
+/// Matches: apikey, api_key, key, token, secret (case-insensitive) followed by =value
+static SENSITIVE_PARAM_REGEX: Lazy<Regex> = Lazy::new(|| {
+	Regex::new(r"(?i)((?:apikey|api_key|key|token|secret)=)[^&]*").unwrap()
+});
+
 fn redact_query_params(query: &str) -> String {
-	let mut parts = Vec::new();
-	for pair in query.split('&') {
-		if pair.is_empty() {
-			continue;
-		}
-		let Some((key, value)) = pair.split_once('=') else {
-			parts.push(pair.to_string());
-			continue;
-		};
-		let key_lower = key.to_ascii_lowercase();
-		let should_redact = key_lower.contains("apikey")
-			|| key_lower.contains("api_key")
-			|| key_lower.contains("key")
-			|| key_lower.contains("token")
-			|| key_lower.contains("secret");
-		let safe_value = if should_redact { "[REDACTED]" } else { value };
-		parts.push(format!("{key}={safe_value}"));
-	}
-	parts.join("&")
+	SENSITIVE_PARAM_REGEX
+		.replace_all(query, "$1[REDACTED]")
+		.into_owned()
 }
 
 /// Convert ConfigStoreError to AdminAuthError.
@@ -1181,19 +1169,36 @@ mod tests {
 
 	#[test]
 	fn test_redact_rpc_url_path_key() {
+		// Alchemy-style URL
 		let url = "https://eth-mainnet.g.alchemy.com/v2/abc123";
 		let redacted = redact_rpc_url(url);
-		assert_eq!(redacted, "https://eth-mainnet.g.alchemy.com/v2/[REDACTED]");
+		assert_eq!(redacted, "https://eth-mainnet.g.alchemy.com/[REDACTED]");
+
+		// Infura-style URL
+		let url = "https://mainnet.infura.io/v3/abc123";
+		let redacted = redact_rpc_url(url);
+		assert_eq!(redacted, "https://mainnet.infura.io/[REDACTED]");
+
+		// URL with no path - unchanged
+		let url = "https://eth.llamarpc.com";
+		let redacted = redact_rpc_url(url);
+		assert_eq!(redacted, "https://eth.llamarpc.com");
 	}
 
 	#[test]
 	fn test_redact_rpc_url_query_key() {
+		// Path is redacted, and query params with sensitive keys are also redacted
 		let url = "https://example.com/rpc?apiKey=secret&chainId=1";
 		let redacted = redact_rpc_url(url);
 		assert_eq!(
 			redacted,
-			"https://example.com/rpc?apiKey=[REDACTED]&chainId=1"
+			"https://example.com/[REDACTED]?apiKey=[REDACTED]&chainId=1"
 		);
+
+		// URL with only query params (no path)
+		let url = "https://example.com?apiKey=secret";
+		let redacted = redact_rpc_url(url);
+		assert_eq!(redacted, "https://example.com?apiKey=[REDACTED]");
 	}
 
 	#[test]

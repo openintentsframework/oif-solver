@@ -128,7 +128,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/AdminAuthErrorResponse"
 
-  /admin/admins:
+  /admin/whitelist:
     post:
       summary: Add an admin
       description: |
