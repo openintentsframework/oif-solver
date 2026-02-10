@@ -615,3 +615,353 @@ fn generate_demo_config(
 
 	serde_json::to_string_pretty(&config).map_err(Error::from)
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::core::{session::SessionStore, storage::Storage};
+	use serde_json::json;
+	use tempfile::TempDir;
+
+	use std::sync::{Mutex, OnceLock};
+
+	fn test_lock() -> &'static Mutex<()> {
+		static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+		LOCK.get_or_init(|| Mutex::new(()))
+	}
+
+	fn acquire_lock() -> std::sync::MutexGuard<'static, ()> {
+		match test_lock().lock() {
+			Ok(guard) => guard,
+			Err(poisoned) => poisoned.into_inner(),
+		}
+	}
+
+	struct EnvVarGuard {
+		key: &'static str,
+		original: Option<String>,
+	}
+
+	impl EnvVarGuard {
+		fn set(key: &'static str, value: Option<&str>) -> Self {
+			let original = std::env::var(key).ok();
+			match value {
+				Some(v) => std::env::set_var(key, v),
+				None => std::env::remove_var(key),
+			}
+			Self { key, original }
+		}
+	}
+
+	impl Drop for EnvVarGuard {
+		fn drop(&mut self) {
+			match self.original.as_deref() {
+				Some(v) => std::env::set_var(self.key, v),
+				None => std::env::remove_var(self.key),
+			}
+		}
+	}
+
+	struct CwdGuard {
+		original: PathBuf,
+	}
+
+	impl CwdGuard {
+		fn change_to(path: &Path) -> Self {
+			let original = std::env::current_dir().expect("read current dir");
+			std::env::set_current_dir(path).expect("switch current dir");
+			Self { original }
+		}
+	}
+
+	impl Drop for CwdGuard {
+		fn drop(&mut self) {
+			std::env::set_current_dir(&self.original).expect("restore current dir");
+		}
+	}
+
+	fn test_settlement_config(value: serde_json::Value) -> SettlementConfig {
+		serde_json::from_value(value).expect("valid settlement config fixture")
+	}
+
+	#[test]
+	fn generate_placeholder_map_has_expected_entries_and_sequence() {
+		let map = generate_placeholder_map(&[1, 10]);
+
+		assert_eq!(map.len(), 18);
+		assert_eq!(
+			map.get("PLACEHOLDER_INPUT_SETTLER_1"),
+			Some(&format!("0x{:040x}", PLACEHOLDER_START_COUNTER))
+		);
+		assert_eq!(
+			map.get("PLACEHOLDER_OUTPUT_SETTLER_1"),
+			Some(&format!("0x{:040x}", PLACEHOLDER_START_COUNTER + 1))
+		);
+		assert_eq!(
+			map.get("ORACLE_PLACEHOLDER_OUTPUT_1"),
+			Some(&format!("0x{:040x}", PLACEHOLDER_START_COUNTER + 8))
+		);
+		assert_eq!(
+			map.get("PLACEHOLDER_INPUT_SETTLER_10"),
+			Some(&format!("0x{:040x}", PLACEHOLDER_START_COUNTER + 9))
+		);
+	}
+
+	#[test]
+	fn get_input_and_output_oracle_for_chain_returns_expected_oracles() {
+		let settlement = test_settlement_config(json!({
+			"settlement_poll_interval_seconds": 3,
+			"implementations": {
+				"direct": {
+					"network_ids": [1, 2],
+					"oracles": {
+						"input": {
+							"1": ["0x1111111111111111111111111111111111111111"]
+						},
+						"output": {
+							"1": ["0x2222222222222222222222222222222222222222"]
+						}
+					}
+				}
+			}
+		}));
+
+		assert_eq!(
+			get_input_oracle_for_chain(&settlement, 1),
+			Some("0x1111111111111111111111111111111111111111".to_string())
+		);
+		assert_eq!(
+			get_output_oracle_for_chain(&settlement, 1),
+			Some("0x2222222222222222222222222222222222222222".to_string())
+		);
+		assert_eq!(get_input_oracle_for_chain(&settlement, 3), None);
+		assert_eq!(get_output_oracle_for_chain(&settlement, 3), None);
+	}
+
+	#[test]
+	fn get_oracle_for_chain_returns_none_for_malformed_shapes() {
+		let settlement = test_settlement_config(json!({
+			"settlement_poll_interval_seconds": 3,
+			"implementations": {
+				"direct": {
+					"network_ids": [1],
+					"oracles": {
+						"input": { "1": [123] },
+						"output": { "1": "not-an-array" }
+					}
+				}
+			}
+		}));
+
+		assert_eq!(get_input_oracle_for_chain(&settlement, 1), None);
+		assert_eq!(get_output_oracle_for_chain(&settlement, 1), None);
+	}
+
+	#[test]
+	fn generate_demo_config_builds_expected_networks_and_routes() {
+		let _lock = acquire_lock();
+		let placeholders = generate_placeholder_map(&[1, 10]);
+		let content = generate_demo_config(&[1, 10], "demo", &placeholders).expect("config json");
+		let parsed: serde_json::Value =
+			serde_json::from_str(&content).expect("valid generated json");
+
+		let networks = parsed["networks"]
+			.as_object()
+			.expect("networks object is present");
+		assert_eq!(networks.len(), 2);
+		assert_eq!(
+			parsed["networks"]["1"]["rpc_urls"][0]["http"],
+			"http://localhost:8545"
+		);
+		assert_eq!(
+			parsed["networks"]["10"]["rpc_urls"][0]["http"],
+			"http://localhost:8546"
+		);
+		assert_eq!(parsed["networks"]["1"]["tokens"][0]["symbol"], "TOKA");
+		assert_eq!(
+			parsed["settlement"]["implementations"]["direct"]["routes"]["1"],
+			json!([10])
+		);
+		assert_eq!(
+			parsed["settlement"]["implementations"]["direct"]["routes"]["10"],
+			json!([1])
+		);
+
+		let expected_solver_key = std::env::var(env_vars::SOLVER_PRIVATE_KEY)
+			.unwrap_or_else(|_| anvil_accounts::SOLVER_PRIVATE_KEY.to_string());
+		assert_eq!(
+			parsed["account"]["implementations"]["local"]["private_key"],
+			expected_solver_key
+		);
+	}
+
+	#[test]
+	fn generate_demo_config_uses_env_solver_private_key_when_present() {
+		let _lock = acquire_lock();
+		let _env_guard = EnvVarGuard::set(
+			env_vars::SOLVER_PRIVATE_KEY,
+			Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		);
+		let placeholders = generate_placeholder_map(&[1]);
+		let content = generate_demo_config(&[1], "demo", &placeholders).expect("config json");
+		let parsed: serde_json::Value =
+			serde_json::from_str(&content).expect("valid generated json");
+
+		assert_eq!(
+			parsed["account"]["implementations"]["local"]["private_key"],
+			"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		);
+	}
+
+	#[test]
+	fn generate_demo_config_returns_error_when_required_placeholder_missing() {
+		let mut placeholders = generate_placeholder_map(&[1]);
+		placeholders.remove("PLACEHOLDER_TOKEN_B_1");
+
+		let err = generate_demo_config(&[1], "demo", &placeholders).unwrap_err();
+		match err {
+			Error::InvalidConfig(message) => {
+				assert!(message.contains("Missing PLACEHOLDER_TOKEN_B_1"));
+			},
+			other => panic!("expected InvalidConfig, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn generate_demo_config_uses_zero_oracle_when_oracle_placeholder_missing() {
+		let mut placeholders = generate_placeholder_map(&[1]);
+		placeholders.remove("ORACLE_PLACEHOLDER_INPUT_1");
+		placeholders.remove("ORACLE_PLACEHOLDER_OUTPUT_1");
+
+		let content = generate_demo_config(&[1], "demo", &placeholders).expect("config json");
+		let parsed: serde_json::Value =
+			serde_json::from_str(&content).expect("valid generated json");
+
+		assert_eq!(
+			parsed["settlement"]["implementations"]["direct"]["oracles"]["input"]["1"],
+			json!(["0x0000000000000000000000000000000000000000"])
+		);
+		assert_eq!(
+			parsed["settlement"]["implementations"]["direct"]["oracles"]["output"]["1"],
+			json!(["0x0000000000000000000000000000000000000000"])
+		);
+	}
+
+	#[test]
+	fn generate_demo_config_empty_chains_uses_default_offchain_chain_id() {
+		let _lock = acquire_lock();
+		let content = generate_demo_config(&[], "demo", &HashMap::new()).expect("config json");
+		let parsed: serde_json::Value =
+			serde_json::from_str(&content).expect("valid generated json");
+
+		assert_eq!(
+			parsed["discovery"]["implementations"]["offchain_eip7683"]["network_ids"],
+			json!([31337])
+		);
+		assert_eq!(
+			parsed["delivery"]["implementations"]["evm_alloy"]["network_ids"],
+			json!([])
+		);
+	}
+
+	#[tokio::test]
+	async fn generate_new_config_creates_file_and_supports_force_overwrite() {
+		let _lock = acquire_lock();
+		let temp = TempDir::new().expect("temp dir");
+		let path = temp.path().join("configs").join("demo.json");
+
+		generate_new_config(&path, vec![1], false)
+			.await
+			.expect("initial create succeeds");
+		assert!(path.exists());
+
+		let parsed: serde_json::Value =
+			serde_json::from_str(&std::fs::read_to_string(&path).expect("read config"))
+				.expect("parse generated config");
+		assert!(parsed["networks"]["1"].is_object());
+
+		let exists_err = generate_new_config(&path, vec![1], false)
+			.await
+			.unwrap_err();
+		assert!(matches!(exists_err, Error::ConfigExists(_)));
+
+		generate_new_config(&path, vec![1, 10], true)
+			.await
+			.expect("force overwrite succeeds");
+		let overwritten: serde_json::Value =
+			serde_json::from_str(&std::fs::read_to_string(&path).expect("read overwritten config"))
+				.expect("parse overwritten config");
+		assert!(overwritten["networks"]["10"].is_object());
+	}
+
+	#[tokio::test]
+	async fn load_config_persists_session_with_chains_and_contracts() {
+		let _lock = acquire_lock();
+		let temp = TempDir::new().expect("temp dir");
+		let _cwd = CwdGuard::change_to(temp.path());
+
+		let path = temp.path().join("demo.json");
+		generate_new_config(&path, vec![1, 8453], false)
+			.await
+			.expect("generate config");
+
+		load_config(&path, true).await.expect("load config");
+
+		let storage_root = Path::new(".").join(".oif-demo");
+		let storage = Storage::new(&storage_root).expect("storage");
+		let session = SessionStore::load(storage).expect("session load");
+
+		assert_eq!(session.environment(), Environment::Local);
+		let mut chains = session.chains();
+		chains.sort_by_key(|chain| chain.id());
+		assert_eq!(
+			chains.iter().map(|chain| chain.id()).collect::<Vec<_>>(),
+			vec![1, 8453]
+		);
+
+		let contracts = session
+			.contracts(crate::types::chain::ChainId::from_u64(1))
+			.expect("contracts for chain 1");
+		assert!(contracts.input_settler.is_some());
+		assert!(contracts.output_settler.is_some());
+		assert!(contracts.permit2.is_some());
+		assert!(contracts.input_oracle.is_some());
+		assert!(contracts.output_oracle.is_some());
+		assert_eq!(contracts.tokens.len(), 2);
+		assert!(contracts.tokens.contains_key("TOKA"));
+		assert!(contracts.tokens.contains_key("TOKB"));
+	}
+
+	#[tokio::test]
+	async fn load_config_returns_error_for_invalid_token_address() {
+		let _lock = acquire_lock();
+		let temp = TempDir::new().expect("temp dir");
+		let _cwd = CwdGuard::change_to(temp.path());
+
+		let path = temp.path().join("demo.json");
+		generate_new_config(&path, vec![1], false)
+			.await
+			.expect("generate config");
+
+		let mut config_json: serde_json::Value =
+			serde_json::from_str(&std::fs::read_to_string(&path).expect("read config"))
+				.expect("parse config");
+		config_json["networks"]["1"]["tokens"][0]["address"] = json!("not-an-address");
+		std::fs::write(
+			&path,
+			serde_json::to_string_pretty(&config_json).expect("serialize config"),
+		)
+		.expect("write invalid config");
+
+		let err = load_config(&path, false).await.unwrap_err();
+		match err {
+			Error::InvalidConfig(message) => {
+				assert!(
+					message.to_lowercase().contains("address"),
+					"unexpected error message: {message}"
+				);
+			},
+			other => panic!("expected InvalidConfig, got {other:?}"),
+		}
+	}
+}
