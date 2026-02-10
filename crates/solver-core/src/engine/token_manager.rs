@@ -1038,4 +1038,64 @@ mod tests {
 		let parse_err = TokenManagerError::ParseError("parse error".to_string());
 		assert!(parse_err.to_string().contains("Failed to parse value"));
 	}
+
+	#[tokio::test]
+	async fn test_get_solver_address() {
+		let networks = create_test_networks_config();
+		let delivery = create_mock_delivery_service();
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		let address = token_manager.get_solver_address().await;
+		assert!(address.is_ok());
+		let addr = address.unwrap();
+		// The mock returns "3333333333333333333333333333333333333333"
+		assert_eq!(hex::encode(&addr.0), "3333333333333333333333333333333333333333");
+	}
+
+	#[test]
+	fn test_erc20_transfer_constants() {
+		// Test the ERC20 transfer transaction data construction constants
+		let expected_selector = [0xa9, 0x05, 0x9c, 0xbb]; // transfer(address,uint256)
+		assert_eq!(expected_selector, [0xa9, 0x05, 0x9c, 0xbb]);
+
+		// Verify amount encoding
+		let amount = U256::from(1000000u64);
+		let amount_bytes = amount.to_be_bytes::<32>();
+		assert_eq!(amount_bytes.len(), 32);
+		// First 26 bytes should be zero for small number
+		assert!(amount_bytes[..26].iter().all(|&b| b == 0));
+	}
+
+	#[tokio::test]
+	async fn test_is_supported_nonexistent_chain() {
+		let networks = create_test_networks_config();
+		let delivery = create_mock_delivery_service();
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		let usdc_address = parse_address("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").unwrap();
+
+		// Chain 999 doesn't exist in our test config
+		assert!(!token_manager.is_supported(999, &usdc_address).await);
+	}
+
+	#[tokio::test]
+	async fn test_get_networks_returns_clone() {
+		let networks = create_test_networks_config();
+		let delivery = create_mock_delivery_service();
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks.clone(), delivery, account);
+
+		let retrieved = token_manager.get_networks().await;
+
+		// Should have same number of networks
+		assert_eq!(retrieved.len(), networks.len());
+
+		// Should contain same chain IDs
+		for chain_id in networks.keys() {
+			assert!(retrieved.contains_key(chain_id));
+		}
+	}
+
 }

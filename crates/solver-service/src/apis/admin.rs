@@ -1749,4 +1749,196 @@ mod tests {
 		assert!(json.contains("\"approvedCount\":5"));
 		assert!(json.contains("\"chainsProcessed\":[1,10,137]"));
 	}
+
+	#[test]
+	fn test_redact_rpc_url_userinfo_credentials() {
+		// URL with username:password in userinfo
+		let url = "https://user:secretpassword@rpc.example.com/v1/abc123";
+		let redacted = redact_rpc_url(url);
+		// Credentials should be redacted, path should be redacted
+		assert!(!redacted.contains("secretpassword"));
+		assert!(redacted.contains("[REDACTED]"));
+	}
+
+	#[test]
+	fn test_redact_rpc_url_with_fragment() {
+		// URL with fragment (rarely used but should be preserved)
+		let url = "https://rpc.example.com/v1/key123#section";
+		let redacted = redact_rpc_url(url);
+		assert!(redacted.contains("#section"));
+		assert!(redacted.contains("[REDACTED]"));
+	}
+
+	#[test]
+	fn test_redact_query_params_various_keys() {
+		// Test various sensitive parameter names
+		let query = "apikey=secret1&api_key=secret2&key=secret3&token=secret4&secret=secret5&chainId=1";
+		let redacted = redact_query_params(query);
+		assert!(redacted.contains("apikey=[REDACTED]"));
+		assert!(redacted.contains("api_key=[REDACTED]"));
+		assert!(redacted.contains("key=[REDACTED]"));
+		assert!(redacted.contains("token=[REDACTED]"));
+		assert!(redacted.contains("secret=[REDACTED]"));
+		assert!(redacted.contains("chainId=1")); // Non-sensitive should be preserved
+	}
+
+	#[test]
+	fn test_redact_query_params_case_insensitive() {
+		// Test case insensitivity
+		let query = "APIKEY=secret1&ApiKey=secret2&TOKEN=secret3";
+		let redacted = redact_query_params(query);
+		assert!(redacted.contains("[REDACTED]"));
+		assert!(!redacted.contains("secret1"));
+		assert!(!redacted.contains("secret2"));
+		assert!(!redacted.contains("secret3"));
+	}
+
+	#[test]
+	fn test_redact_path_api_key_no_path() {
+		// URL with no path should remain unchanged
+		let url = "https://rpc.example.com";
+		let redacted = redact_path_api_key(url);
+		assert_eq!(redacted, url);
+	}
+
+	#[test]
+	fn test_redact_path_api_key_root_only() {
+		// URL with only root path
+		let url = "https://rpc.example.com/";
+		let redacted = redact_path_api_key(url);
+		assert_eq!(redacted, "https://rpc.example.com/[REDACTED]");
+	}
+
+	#[test]
+	fn test_gas_config_response_builder() {
+		use solver_types::{OperatorGasConfig, OperatorGasFlowUnits};
+
+		let gas_config = OperatorGasConfig {
+			resource_lock: OperatorGasFlowUnits {
+				open: 100_000,
+				fill: 200_000,
+				claim: 150_000,
+			},
+			permit2_escrow: OperatorGasFlowUnits {
+				open: 110_000,
+				fill: 210_000,
+				claim: 160_000,
+			},
+			eip3009_escrow: OperatorGasFlowUnits {
+				open: 120_000,
+				fill: 220_000,
+				claim: 170_000,
+			},
+		};
+
+		let response = gas_config_response(&gas_config);
+
+		assert_eq!(response.resource_lock.open, 100_000);
+		assert_eq!(response.resource_lock.fill, 200_000);
+		assert_eq!(response.resource_lock.claim, 150_000);
+		assert_eq!(response.permit2_escrow.open, 110_000);
+		assert_eq!(response.permit2_escrow.fill, 210_000);
+		assert_eq!(response.permit2_escrow.claim, 160_000);
+		assert_eq!(response.eip3009_escrow.open, 120_000);
+		assert_eq!(response.eip3009_escrow.fill, 220_000);
+		assert_eq!(response.eip3009_escrow.claim, 170_000);
+	}
+
+	#[test]
+	fn test_gas_config_response_serialization() {
+		let response = GasConfigResponse {
+			resource_lock: GasFlowResponse {
+				open: 100_000,
+				fill: 200_000,
+				claim: 150_000,
+			},
+			permit2_escrow: GasFlowResponse {
+				open: 110_000,
+				fill: 210_000,
+				claim: 160_000,
+			},
+			eip3009_escrow: GasFlowResponse {
+				open: 120_000,
+				fill: 220_000,
+				claim: 170_000,
+			},
+		};
+
+		let json = serde_json::to_string(&response).unwrap();
+		assert!(json.contains("\"resourceLock\""));
+		assert!(json.contains("\"permit2Escrow\""));
+		assert!(json.contains("\"eip3009Escrow\""));
+		assert!(json.contains("\"open\":100000"));
+		assert!(json.contains("\"fill\":200000"));
+		assert!(json.contains("\"claim\":150000"));
+	}
+
+	#[test]
+	fn test_balances_response_serialization() {
+		use std::collections::HashMap;
+
+		let mut networks = HashMap::new();
+		networks.insert(
+			"1".to_string(),
+			ChainBalances {
+				chain_id: 1,
+				tokens: vec![TokenBalance {
+					symbol: "USDC".to_string(),
+					address: "0x1234".to_string(),
+					decimals: 6,
+					balance: "1000000".to_string(),
+					balance_formatted: "1.00".to_string(),
+				}],
+				error: None,
+			},
+		);
+
+		let response = BalancesResponse {
+			solver_address: "0xabcd".to_string(),
+			networks,
+		};
+
+		let json = serde_json::to_string(&response).unwrap();
+		assert!(json.contains("\"solverAddress\":\"0xabcd\""));
+		assert!(json.contains("\"chainId\":1"));
+		assert!(json.contains("\"symbol\":\"USDC\""));
+		assert!(json.contains("\"balanceFormatted\":\"1.00\""));
+	}
+
+	#[test]
+	fn test_admin_config_summary_serialization() {
+		let summary = AdminConfigSummary {
+			enabled: true,
+			domain: "localhost".to_string(),
+			withdrawals_enabled: true,
+		};
+
+		let json = serde_json::to_string(&summary).unwrap();
+		assert!(json.contains("\"enabled\":true"));
+		assert!(json.contains("\"domain\":\"localhost\""));
+		assert!(json.contains("\"withdrawalsEnabled\":true"));
+	}
+
+	#[test]
+	fn test_admin_network_response_serialization() {
+		let network = AdminNetworkResponse {
+			chain_id: 10,
+			rpc_urls: vec![
+				"https://rpc.example.com/[REDACTED]".to_string(),
+			],
+			tokens: vec![AdminTokenResponse {
+				symbol: "USDC".to_string(),
+				address: "0x1234".to_string(),
+				decimals: 6,
+			}],
+			input_settler: "0xaaa".to_string(),
+			output_settler: "0xbbb".to_string(),
+		};
+
+		let json = serde_json::to_string(&network).unwrap();
+		assert!(json.contains("\"chainId\":10"));
+		assert!(json.contains("\"inputSettler\":\"0xaaa\""));
+		assert!(json.contains("\"outputSettler\":\"0xbbb\""));
+	}
+
 }
