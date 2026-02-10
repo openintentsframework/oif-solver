@@ -345,6 +345,10 @@ Create a JSON file specifying which networks and tokens to support (these overri
 ```json
 {
   "solver_id": "my-solver-instance",
+  "min_profitability_pct": "2.5",
+  "gas_buffer_bps": 1500,
+  "commission_bps": 20,
+  "rate_buffer_bps": 14,
   "networks": [
     {
       "chain_id": 11155420,
@@ -370,6 +374,8 @@ Create a JSON file specifying which networks and tokens to support (these overri
   ]
 }
 ```
+
+Optional fee overrides can be set at the top level: `min_profitability_pct` (decimal string), `gas_buffer_bps`, `commission_bps`, and `rate_buffer_bps` (basis points).
 
 **Note:** The `solver_id` field is optional but recommended. If provided, seeding becomes idempotent (re-running `--seed` with same config skips seeding). After seeding, set `SOLVER_ID` env var for subsequent runs.
 
@@ -761,14 +767,17 @@ The admin API enables authorized wallet addresses to perform administrative oper
     "enabled": true,
     "domain": "solver.example.com",
     "chain_id": 1,
-    "admin_addresses": ["0xYourAdminWalletAddress"]
+    "admin_addresses": ["0xYourAdminWalletAddress"],
+    "withdrawals": {
+      "enabled": true
+    }
   }
 }
 ```
 
 **Endpoints:**
 
-- **GET `/api/v1/admin/balances`** - Get solver balances by chain and token (public, read-only)
+- **GET `/api/v1/admin/balances`** - Get solver balances by chain and token (protected, read-only)
 - **GET `/api/v1/admin/config`** - Get current solver configuration snapshot (public, read-only)
 - **GET `/api/v1/admin/nonce`** - Get a nonce for signing admin actions (protected)
   - Response:
@@ -805,6 +814,8 @@ The admin API enables authorized wallet addresses to perform administrative oper
 - **DELETE `/api/v1/admin/tokens`** - Remove a token from a network (protected)
 - **POST `/api/v1/admin/tokens/approve`** - Approve token allowance for settlements (protected)
 - **POST `/api/v1/admin/withdrawals`** - Perform an admin withdrawal (protected)
+- **POST `/api/v1/admin/whitelist`** - Add a new admin (protected)
+- **DELETE `/api/v1/admin/whitelist`** - Remove an admin (protected)
 - **GET `/api/v1/admin/fees`** - Get fee configuration (protected)
 - **PUT `/api/v1/admin/fees`** - Update fee configuration (protected, EIP-712 signed)
 - **GET `/api/v1/admin/gas`** - Get gas configuration (protected)
@@ -819,6 +830,7 @@ The admin API enables authorized wallet addresses to perform administrative oper
 5. Submit the signed action to the appropriate endpoint
 
 **Note:** If API auth is enabled (`auth.enabled = true`), protected admin endpoints also require a JWT with `AdminAll` scope. Public endpoints remain unauthenticated.
+**Note:** Admin withdrawals require `admin.withdrawals.enabled = true` in config.
 
 #### Fees and Profitability
 
@@ -920,7 +932,7 @@ curl http://localhost:3000/api/v1/admin/nonce
 # Admin: Get EIP-712 types for signing
 curl http://localhost:3000/api/v1/admin/types
 
-# Admin: Get solver balances (public)
+# Admin: Get solver balances (protected)
 curl http://localhost:3000/api/v1/admin/balances
 
 # Admin: Get solver config snapshot (public)
