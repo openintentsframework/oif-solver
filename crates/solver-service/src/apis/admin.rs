@@ -1025,9 +1025,8 @@ fn redact_path_api_key(url: &str) -> String {
 
 /// Regex to match sensitive query parameters and redact their values.
 /// Matches: apikey, api_key, key, token, secret (case-insensitive) followed by =value
-static SENSITIVE_PARAM_REGEX: Lazy<Regex> = Lazy::new(|| {
-	Regex::new(r"(?i)((?:apikey|api_key|key|token|secret)=)[^&]*").unwrap()
-});
+static SENSITIVE_PARAM_REGEX: Lazy<Regex> =
+	Lazy::new(|| Regex::new(r"(?i)((?:apikey|api_key|key|token|secret)=)[^&]*").unwrap());
 
 fn redact_query_params(query: &str) -> String {
 	SENSITIVE_PARAM_REGEX
