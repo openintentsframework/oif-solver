@@ -21,7 +21,6 @@ solver-storage = { path = "../solver-storage" }
 solver-types = { path = "../solver-types" }
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["rt-multi-thread", "sync"] }
-toml = { workspace = true }
 tracing = "0.1"
 
 [features]

@@ -15,7 +15,6 @@ serde_json = "1.0"
 solver-types = { path = "../solver-types" }
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["sync", "time"] }
-toml = { workspace = true }
 tracing = "0.1"
 
 

@@ -149,22 +149,26 @@ impl Eip7683OrderImpl {
 ///
 /// # Required Configuration
 ///
-/// ```toml
-/// output_settler_address = "0x..."  # 42-char hex address
-/// input_settler_address = "0x..."   # 42-char hex address
+/// ```json
+/// {
+///   "output_settler_address": "0x...",
+///   "input_settler_address": "0x..."
+/// }
 /// ```
 pub struct Eip7683OrderSchema;
 
 impl Eip7683OrderSchema {
 	/// Static validation method for use before instance creation
-	pub fn validate_config(config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+	pub fn validate_config(
+		config: &serde_json::Value,
+	) -> Result<(), solver_types::ValidationError> {
 		let instance = Self;
 		instance.validate(config)
 	}
 }
 
 impl ConfigSchema for Eip7683OrderSchema {
-	fn validate(&self, config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+	fn validate(&self, config: &serde_json::Value) -> Result<(), solver_types::ValidationError> {
 		let schema = Schema::new(
 			// Required fields
 			vec![],
@@ -811,7 +815,7 @@ impl OrderInterface for Eip7683OrderImpl {
 ///
 /// Returns an error if networks configuration is invalid.
 pub fn create_order_impl(
-	config: &toml::Value,
+	config: &serde_json::Value,
 	networks: &NetworksConfig,
 	oracle_routes: &solver_types::oracle::OracleRoutes,
 ) -> Result<Box<dyn OrderInterface>, OrderError> {
@@ -1134,7 +1138,7 @@ mod tests {
 	#[test]
 	fn test_config_schema_validation() {
 		let schema = Eip7683OrderSchema;
-		let valid_config = toml::Value::Table(toml::map::Map::new());
+		let valid_config = serde_json::Value::Object(serde_json::Map::new());
 
 		let result = schema.validate(&valid_config);
 		assert!(result.is_ok());
@@ -1142,7 +1146,7 @@ mod tests {
 
 	#[test]
 	fn test_create_order_impl_factory() {
-		let config = toml::Value::Table(toml::map::Map::new());
+		let config = serde_json::Value::Object(serde_json::Map::new());
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
 

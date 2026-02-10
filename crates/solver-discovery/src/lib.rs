@@ -84,7 +84,7 @@ pub trait DiscoveryInterface: Send + Sync {
 /// This is the function signature that all discovery implementations must provide
 /// to create instances of their discovery interface.
 pub type DiscoveryFactory =
-	fn(&toml::Value, &NetworksConfig) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError>;
+	fn(&serde_json::Value, &NetworksConfig) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError>;
 
 /// Registry trait for discovery implementations.
 ///

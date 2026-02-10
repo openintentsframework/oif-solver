@@ -892,14 +892,16 @@ pub struct HyperlaneSettlementSchema;
 
 impl HyperlaneSettlementSchema {
 	/// Static validation method for use before instance creation
-	pub fn validate_config(config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+	pub fn validate_config(
+		config: &serde_json::Value,
+	) -> Result<(), solver_types::ValidationError> {
 		let instance = Self;
 		instance.validate(config)
 	}
 }
 
 impl ConfigSchema for HyperlaneSettlementSchema {
-	fn validate(&self, config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+	fn validate(&self, config: &serde_json::Value) -> Result<(), solver_types::ValidationError> {
 		let schema = Schema::new(
 			// Required fields
 			vec![
@@ -1318,11 +1320,11 @@ impl SettlementInterface for HyperlaneSettlement {
 
 /// Helper function to parse address tables from config
 fn parse_address_table(
-	table: &toml::Value,
+	table: &serde_json::Value,
 ) -> Result<HashMap<u64, solver_types::Address>, SettlementError> {
 	let mut result = HashMap::new();
 
-	if let Some(table) = table.as_table() {
+	if let Some(table) = table.as_object() {
 		for (chain_id_str, address_value) in table {
 			let chain_id = chain_id_str.parse::<u64>().map_err(|e| {
 				SettlementError::ValidationFailed(format!("Invalid chain ID '{chain_id_str}': {e}"))
@@ -1349,7 +1351,7 @@ fn parse_address_table(
 
 /// Factory function to create a Hyperlane settlement provider from configuration
 pub fn create_settlement(
-	config: &toml::Value,
+	config: &serde_json::Value,
 	networks: &NetworksConfig,
 	storage: Arc<StorageService>,
 ) -> Result<Box<dyn SettlementInterface>, SettlementError> {
@@ -1375,7 +1377,7 @@ pub fn create_settlement(
 
 	let default_gas_limit = config
 		.get("default_gas_limit")
-		.and_then(|v| v.as_integer())
+		.and_then(|v| v.as_i64())
 		.unwrap_or(500000) as u64;
 
 	// Create settlement service synchronously

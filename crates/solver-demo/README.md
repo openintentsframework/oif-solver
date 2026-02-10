@@ -91,8 +91,8 @@ alias oif-demo='cargo run --bin solver-demo --'
 #### 1. Initialize Environment
 ```bash
 # Create and load configuration
-oif-demo init new config/demo.toml --force
-oif-demo init load config/demo.toml --local
+oif-demo init new config/demo.json --force
+oif-demo init load config/demo.json --local
 
 # Start local chains
 oif-demo env start
@@ -170,7 +170,7 @@ oif-demo intent build \
 #### 1. Setup Environment
 ```bash
 # Load testnet configuration
-oif-demo init load config/testnet.toml
+oif-demo init load config/seed-overrides-testnet.json
 
 # List tokens and accounts
 oif-demo token list
@@ -489,17 +489,16 @@ Using simulated fill gas: 79850 units (config default was: 77298 units)
 
 Solvers can configure callback safety checks in their config file:
 
-```toml
-[order]
-# Whitelisted callback contract addresses in EIP-7930 InteropAddress format
-# Format: "0x" + Version(2 bytes) + ChainType(2 bytes) + ChainRefLen(1 byte) + ChainRef + AddrLen(1 byte) + Address
-callback_whitelist = [
-  "0x0001000002210514154c8bb598df835e9617c2cdcb8c84838bd329c6",  # Base (8453)
-  "0x0001000003014a3414154c8bb598df835e9617c2cdcb8c84838bd329c6",  # Base Sepolia (84532)
-]
-
-# Enable gas simulation for callbacks before filling (default: true)
-simulate_callbacks = true
+```json
+{
+  "order": {
+    "callback_whitelist": [
+      "0x0001000002210514154c8bb598df835e9617c2cdcb8c84838bd329c6",
+      "0x0001000003014a3414154c8bb598df835e9617c2cdcb8c84838bd329c6"
+    ],
+    "simulate_callbacks": true
+  }
+}
 ```
 
 **EIP-7930 InteropAddress Format:**

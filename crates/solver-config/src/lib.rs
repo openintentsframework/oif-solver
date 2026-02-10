@@ -1,17 +1,10 @@
 //! Configuration module for the OIF solver system.
 //!
 //! This module provides structures and utilities for managing solver configuration.
-//! It supports loading configuration from TOML files and provides validation to ensure
+//! It supports loading configuration from JSON files and provides validation to ensure
 //! all required configuration values are properly set.
-//!
-//! ## Modular Configuration Support
-//!
-//! Configurations can be split into multiple files for better organization:
-//! - Use `include = ["file1.toml", "file2.toml"]` to include other config files
-//! - Each top-level section must be unique across all files (no duplicates allowed)
 
 pub mod builders;
-mod loader;
 
 pub use builders::config::ConfigBuilder;
 
@@ -30,7 +23,7 @@ pub enum ConfigError {
 	/// Error that occurs during file I/O operations.
 	#[error("IO error: {0}")]
 	Io(#[from] std::io::Error),
-	/// Error that occurs when parsing TOML configuration.
+	/// Error that occurs when parsing JSON configuration.
 	#[error("Configuration error: {0}")]
 	Parse(String),
 	/// Error that occurs when configuration validation fails.
@@ -38,11 +31,9 @@ pub enum ConfigError {
 	Validation(String),
 }
 
-impl From<toml::de::Error> for ConfigError {
-	fn from(err: toml::de::Error) -> Self {
-		// Extract just the message without the huge input dump
-		let message = err.message().to_string();
-		ConfigError::Parse(message)
+impl From<serde_json::Error> for ConfigError {
+	fn from(err: serde_json::Error) -> Self {
+		ConfigError::Parse(err.to_string())
 	}
 }
 
@@ -111,7 +102,7 @@ pub struct StorageConfig {
 	/// Which implementation to use as primary.
 	pub primary: String,
 	/// Map of storage implementation names to their configurations.
-	pub implementations: HashMap<String, toml::Value>,
+	pub implementations: HashMap<String, serde_json::Value>,
 	/// Interval in seconds for cleaning up expired storage entries.
 	pub cleanup_interval_seconds: u64,
 }
@@ -120,8 +111,8 @@ pub struct StorageConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeliveryConfig {
 	/// Map of delivery implementation names to their configurations.
-	/// Each implementation has its own configuration format stored as raw TOML values.
-	pub implementations: HashMap<String, toml::Value>,
+	/// Each implementation has its own configuration format stored as raw JSON values.
+	pub implementations: HashMap<String, serde_json::Value>,
 	/// Minimum number of confirmations required for transactions.
 	/// Defaults to 3 confirmations if not specified.
 	#[serde(default = "default_confirmations")]
@@ -152,15 +143,15 @@ pub struct AccountConfig {
 	/// Which implementation to use as primary.
 	pub primary: String,
 	/// Map of account implementation names to their configurations.
-	pub implementations: HashMap<String, toml::Value>,
+	pub implementations: HashMap<String, serde_json::Value>,
 }
 
 /// Configuration for order discovery.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DiscoveryConfig {
 	/// Map of discovery implementation names to their configurations.
-	/// Each implementation has its own configuration format stored as raw TOML values.
-	pub implementations: HashMap<String, toml::Value>,
+	/// Each implementation has its own configuration format stored as raw JSON values.
+	pub implementations: HashMap<String, serde_json::Value>,
 }
 
 /// Configuration for order processing.
@@ -168,7 +159,7 @@ pub struct DiscoveryConfig {
 pub struct OrderConfig {
 	/// Map of order implementation names to their configurations.
 	/// Each implementation handles specific order types.
-	pub implementations: HashMap<String, toml::Value>,
+	pub implementations: HashMap<String, serde_json::Value>,
 	/// Strategy configuration for order execution.
 	pub strategy: StrategyConfig,
 	/// Whitelisted callback contract addresses in EIP-7930 InteropAddress format.
@@ -187,7 +178,7 @@ pub struct StrategyConfig {
 	/// Which strategy implementation to use as primary.
 	pub primary: String,
 	/// Map of strategy implementation names to their configurations.
-	pub implementations: HashMap<String, toml::Value>,
+	pub implementations: HashMap<String, serde_json::Value>,
 }
 
 /// Configuration for settlement operations.
@@ -195,7 +186,7 @@ pub struct StrategyConfig {
 pub struct SettlementConfig {
 	/// Map of settlement implementation names to their configurations.
 	/// Each implementation handles specific settlement mechanisms.
-	pub implementations: HashMap<String, toml::Value>,
+	pub implementations: HashMap<String, serde_json::Value>,
 	/// Poll interval in seconds for settlement readiness monitoring.
 	/// Defaults to 3 seconds if not specified.
 	#[serde(default = "default_settlement_poll_interval_seconds")]
@@ -292,7 +283,7 @@ pub struct PricingConfig {
 	#[serde(default)]
 	pub fallbacks: Vec<String>,
 	/// Map of pricing implementation names to their configurations.
-	pub implementations: HashMap<String, toml::Value>,
+	pub implementations: HashMap<String, serde_json::Value>,
 }
 
 fn default_gas_buffer_bps() -> u32 {
@@ -452,24 +443,12 @@ pub(crate) fn resolve_env_vars(input: &str) -> Result<String, ConfigError> {
 
 impl Config {
 	/// Loads configuration from a file with async environment variable resolution.
-	///
-	/// This method supports modular configuration through include directives:
-	/// - `include = ["file1.toml", "file2.toml"]` - Include specific files
-	///
-	/// Each top-level section must be unique across all configuration files.
-	///
-	/// Environment variables are loaded from .env files in the current working directory.
 	pub async fn from_file(path: &str) -> Result<Self, ConfigError> {
-		let path_buf = Path::new(path);
-		let base_dir = path_buf.parent().unwrap_or_else(|| Path::new("."));
-
-		// Create loader with config file's base directory for includes
-		let mut loader = loader::ConfigLoader::new(base_dir);
-
-		let file_name = path_buf
-			.file_name()
-			.ok_or_else(|| ConfigError::Validation(format!("Invalid path: {path}")))?;
-		loader.load_config(file_name).await
+		let content = tokio::fs::read_to_string(Path::new(path)).await?;
+		let resolved = resolve_env_vars(&content)?;
+		let config: Config = serde_json::from_str(&resolved)?;
+		config.validate()?;
+		Ok(config)
 	}
 
 	/// Validates the configuration to ensure all required fields are properly set.
@@ -687,7 +666,7 @@ impl Config {
 
 			// Check for duplicate coverage
 			for network_value in network_ids {
-				let network_id = network_value.as_integer().ok_or_else(|| {
+				let network_id = network_value.as_i64().ok_or_else(|| {
 					ConfigError::Validation(format!(
 						"Invalid network_id in settlement '{impl_name}'"
 					))
@@ -729,7 +708,7 @@ impl Config {
 
 /// Implementation of FromStr trait for Config to enable parsing from string.
 ///
-/// This allows configuration to be parsed from TOML strings using the standard
+/// This allows configuration to be parsed from JSON strings using the standard
 /// string parsing interface. Environment variables are resolved and the
 /// configuration is automatically validated after parsing.
 impl FromStr for Config {
@@ -737,7 +716,7 @@ impl FromStr for Config {
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
 		let resolved = resolve_env_vars(s)?;
-		let config: Config = toml::from_str(&resolved)?;
+		let config: Config = serde_json::from_str(&resolved)?;
 		config.validate()?;
 		Ok(config)
 	}
@@ -746,6 +725,79 @@ impl FromStr for Config {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use serde_json::json;
+
+	fn parse_json_fixture(value: serde_json::Value) -> Result<Config, ConfigError> {
+		let json_string =
+			serde_json::to_string(&value).map_err(|err| ConfigError::Parse(err.to_string()))?;
+		Config::from_str(&json_string)
+	}
+
+	fn test_network(chain_id: u32, rpc_url: &str) -> serde_json::Value {
+		json!({
+			"chain_id": chain_id,
+			"input_settler_address": "0x1234567890123456789012345678901234567890",
+			"output_settler_address": "0x0987654321098765432109876543210987654321",
+			"rpc_urls": [{ "http": rpc_url }],
+			"tokens": [{
+				"address": "0xabcdef1234567890abcdef1234567890abcdef12",
+				"symbol": "TEST",
+				"decimals": 18
+			}]
+		})
+	}
+
+	fn base_config_json(
+		networks: serde_json::Value,
+		order_implementations: serde_json::Value,
+		settlement_implementations: serde_json::Value,
+	) -> serde_json::Value {
+		json!({
+			"solver": {
+				"id": "test",
+				"monitoring_timeout_seconds": 300,
+				"min_profitability_pct": 5.0
+			},
+			"networks": networks,
+			"storage": {
+				"primary": "memory",
+				"cleanup_interval_seconds": 3600,
+				"implementations": {
+					"memory": {}
+				}
+			},
+			"delivery": {
+				"implementations": {
+					"test": {}
+				}
+			},
+			"account": {
+				"primary": "local",
+				"implementations": {
+					"local": {
+						"private_key": "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+					}
+				}
+			},
+			"discovery": {
+				"implementations": {
+					"test": {}
+				}
+			},
+			"order": {
+				"implementations": order_implementations,
+				"strategy": {
+					"primary": "simple",
+					"implementations": {
+						"simple": {}
+					}
+				}
+			},
+			"settlement": {
+				"implementations": settlement_implementations
+			}
+		})
+	}
 
 	#[test]
 	fn test_env_var_resolution() {
@@ -753,9 +805,9 @@ mod tests {
 		std::env::set_var("TEST_HOST", "localhost");
 		std::env::set_var("TEST_PORT", "5432");
 
-		let input = "host = \"${TEST_HOST}:${TEST_PORT}\"";
+		let input = r#"{"host":"${TEST_HOST}:${TEST_PORT}"}"#;
 		let result = resolve_env_vars(input).unwrap();
-		assert_eq!(result, "host = \"localhost:5432\"");
+		assert_eq!(result, r#"{"host":"localhost:5432"}"#);
 
 		// Clean up
 		std::env::remove_var("TEST_HOST");
@@ -764,14 +816,14 @@ mod tests {
 
 	#[test]
 	fn test_env_var_with_default() {
-		let input = "value = \"${MISSING_VAR:-default_value}\"";
+		let input = r#"{"value":"${MISSING_VAR:-default_value}"}"#;
 		let result = resolve_env_vars(input).unwrap();
-		assert_eq!(result, "value = \"default_value\"");
+		assert_eq!(result, r#"{"value":"default_value"}"#);
 	}
 
 	#[test]
 	fn test_missing_env_var_error() {
-		let input = "value = \"${MISSING_VAR}\"";
+		let input = r#"{"value":"${MISSING_VAR}"}"#;
 		let result = resolve_env_vars(input);
 		assert!(result.is_err());
 		assert!(result.unwrap_err().to_string().contains("MISSING_VAR"));
@@ -781,62 +833,62 @@ mod tests {
 	fn test_config_with_env_vars() {
 		// Set environment variable
 		std::env::set_var("TEST_SOLVER_ID", "test-solver");
-
-		let config_str = r#"
-[solver]
-id = "${TEST_SOLVER_ID}"
-monitoring_timeout_minutes = 5
-min_profitability_pct = 1.0
-
-[networks.1]
-input_settler_address = "0x1234567890123456789012345678901234567890"
-output_settler_address = "0x0987654321098765432109876543210987654321"
-[[networks.1.rpc_urls]]
-http = "http://localhost:8545"
-[[networks.1.tokens]]
-address = "0xabcdef1234567890abcdef1234567890abcdef12"
-symbol = "TEST"
-decimals = 18
-
-[networks.2]
-input_settler_address = "0x1234567890123456789012345678901234567890"
-output_settler_address = "0x0987654321098765432109876543210987654321"
-[[networks.2.rpc_urls]]
-http = "http://localhost:8546"
-[[networks.2.tokens]]
-address = "0xabcdef1234567890abcdef1234567890abcdef12"
-symbol = "TEST"
-decimals = 18
-
-[storage]
-primary = "memory"
-cleanup_interval_seconds = 3600
-[storage.implementations.memory]
-
-[delivery]
-[delivery.implementations.test]
-
-[account]
-primary = "local"
-[account.implementations.local]
-private_key = "${TEST_PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
-
-[discovery]
-[discovery.implementations.test]
-
-[order]
-[order.implementations.test]
-[order.strategy]
-primary = "simple"
-[order.strategy.implementations.simple]
-
-[settlement]
-[settlement.implementations.test]
-order = "test"
-network_ids = [1, 2]
-"#;
-
-		let config: Config = config_str.parse().unwrap();
+		let config = parse_json_fixture(json!({
+			"solver": {
+				"id": "${TEST_SOLVER_ID}",
+				"monitoring_timeout_seconds": 300,
+				"min_profitability_pct": 1.0
+			},
+			"networks": {
+				"1": test_network(1, "http://localhost:8545"),
+				"2": test_network(2, "http://localhost:8546")
+			},
+			"storage": {
+				"primary": "memory",
+				"cleanup_interval_seconds": 3600,
+				"implementations": {
+					"memory": {}
+				}
+			},
+			"delivery": {
+				"implementations": {
+					"test": {}
+				}
+			},
+			"account": {
+				"primary": "local",
+				"implementations": {
+					"local": {
+						"private_key": "${TEST_PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
+					}
+				}
+			},
+			"discovery": {
+				"implementations": {
+					"test": {}
+				}
+			},
+			"order": {
+				"implementations": {
+					"test": {}
+				},
+				"strategy": {
+					"primary": "simple",
+					"implementations": {
+						"simple": {}
+					}
+				}
+			},
+			"settlement": {
+				"implementations": {
+					"test": {
+						"order": "test",
+						"network_ids": [1, 2]
+					}
+				}
+			}
+		}))
+		.unwrap();
 		assert_eq!(config.solver.id, "test-solver");
 		assert_eq!(
 			config.solver.min_profitability_pct,
@@ -849,74 +901,26 @@ network_ids = [1, 2]
 
 	#[test]
 	fn test_duplicate_settlement_coverage_rejected() {
-		let config_str = r#"
-[solver]
-id = "test"
-monitoring_timeout_minutes = 5
-min_profitability_pct = 5.0  # Minimum profitability percentage required to execute orders
-
-[networks.1]
-input_settler_address = "0x1234567890123456789012345678901234567890"
-output_settler_address = "0x0987654321098765432109876543210987654321"
-[[networks.1.rpc_urls]]
-http = "http://localhost:8545"
-[[networks.1.tokens]]
-address = "0xabcdef1234567890abcdef1234567890abcdef12"
-symbol = "TEST"
-decimals = 18
-
-[networks.2]
-input_settler_address = "0x1234567890123456789012345678901234567890"
-output_settler_address = "0x0987654321098765432109876543210987654321"
-[[networks.2.rpc_urls]]
-http = "http://localhost:8546"
-[[networks.2.tokens]]
-address = "0xabcdef1234567890abcdef1234567890abcdef12"
-symbol = "TEST"
-decimals = 18
-
-[networks.3]
-input_settler_address = "0x1234567890123456789012345678901234567890"
-output_settler_address = "0x0987654321098765432109876543210987654321"
-[[networks.3.rpc_urls]]
-http = "http://localhost:8547"
-[[networks.3.tokens]]
-address = "0xabcdef1234567890abcdef1234567890abcdef12"
-symbol = "TEST"
-decimals = 18
-
-[storage]
-primary = "memory"
-cleanup_interval_seconds = 3600
-[storage.implementations.memory]
-
-[delivery]
-[delivery.implementations.test]
-
-[account]
-primary = "local"
-[account.implementations.local]
-private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-
-[discovery]
-[discovery.implementations.test]
-
-[order]
-[order.implementations.eip7683]
-[order.strategy]
-primary = "simple"
-[order.strategy.implementations.simple]
-
-[settlement.implementations.impl1]
-order = "eip7683"
-network_ids = [1, 2]
-
-[settlement.implementations.impl2]
-order = "eip7683"
-network_ids = [2, 3]  # Network 2 overlaps with impl1
-"#;
-
-		let result = Config::from_str(config_str);
+		let result = parse_json_fixture(base_config_json(
+			json!({
+				"1": test_network(1, "http://localhost:8545"),
+				"2": test_network(2, "http://localhost:8546"),
+				"3": test_network(3, "http://localhost:8547")
+			}),
+			json!({
+				"eip7683": {}
+			}),
+			json!({
+				"impl1": {
+					"order": "eip7683",
+					"network_ids": [1, 2]
+				},
+				"impl2": {
+					"order": "eip7683",
+					"network_ids": [2, 3]
+				}
+			}),
+		));
 		assert!(result.is_err());
 		let err = result.unwrap_err();
 		// The test should fail because network 2 is covered by both impl1 and impl2
@@ -932,60 +936,20 @@ network_ids = [2, 3]  # Network 2 overlaps with impl1
 
 	#[test]
 	fn test_missing_settlement_standard_rejected() {
-		let config_str = r#"
-[solver]
-id = "test"
-monitoring_timeout_minutes = 5
-min_profitability_pct = 5.0  # Minimum profitability percentage required to execute orders
-
-[networks.1]
-input_settler_address = "0x1234567890123456789012345678901234567890"
-output_settler_address = "0x0987654321098765432109876543210987654321"
-[[networks.1.rpc_urls]]
-http = "http://localhost:8545"
-[[networks.1.tokens]]
-address = "0xabcdef1234567890abcdef1234567890abcdef12"
-symbol = "TEST"
-decimals = 18
-
-[networks.2]
-input_settler_address = "0x1234567890123456789012345678901234567890"
-output_settler_address = "0x0987654321098765432109876543210987654321"
-[[networks.2.rpc_urls]]
-http = "http://localhost:8546"
-[[networks.2.tokens]]
-address = "0xabcdef1234567890abcdef1234567890abcdef12"
-symbol = "TEST"
-decimals = 18
-
-[storage]
-primary = "memory"
-cleanup_interval_seconds = 3600
-[storage.implementations.memory]
-
-[delivery]
-[delivery.implementations.test]
-
-[account]
-primary = "local"
-[account.implementations.local]
-private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-
-[discovery]
-[discovery.implementations.test]
-
-[order]
-[order.implementations.eip7683]
-[order.strategy]
-primary = "simple"
-[order.strategy.implementations.simple]
-
-[settlement.implementations.impl1]
-# Missing 'standard' field
-network_ids = [1, 2]
-"#;
-
-		let result = Config::from_str(config_str);
+		let result = parse_json_fixture(base_config_json(
+			json!({
+				"1": test_network(1, "http://localhost:8545"),
+				"2": test_network(2, "http://localhost:8546")
+			}),
+			json!({
+				"eip7683": {}
+			}),
+			json!({
+				"impl1": {
+					"network_ids": [1, 2]
+				}
+			}),
+		));
 		assert!(result.is_err());
 		let err = result.unwrap_err();
 		assert!(err.to_string().contains("missing 'order' field"));
@@ -993,60 +957,21 @@ network_ids = [1, 2]
 
 	#[test]
 	fn test_settlement_references_invalid_network() {
-		let config_str = r#"
-[solver]
-id = "test"
-monitoring_timeout_minutes = 5
-min_profitability_pct = 5.0  # Minimum profitability percentage required to execute orders
-
-[networks.1]
-input_settler_address = "0x1234567890123456789012345678901234567890"
-output_settler_address = "0x0987654321098765432109876543210987654321"
-[[networks.1.rpc_urls]]
-http = "http://localhost:8545"
-[[networks.1.tokens]]
-address = "0xabcdef1234567890abcdef1234567890abcdef12"
-symbol = "TEST"
-decimals = 18
-
-[networks.2]
-input_settler_address = "0x1234567890123456789012345678901234567890"
-output_settler_address = "0x0987654321098765432109876543210987654321"
-[[networks.2.rpc_urls]]
-http = "http://localhost:8546"
-[[networks.2.tokens]]
-address = "0xabcdef1234567890abcdef1234567890abcdef12"
-symbol = "TEST"
-decimals = 18
-
-[storage]
-primary = "memory"
-cleanup_interval_seconds = 3600
-[storage.implementations.memory]
-
-[delivery]
-[delivery.implementations.test]
-
-[account]
-primary = "local"
-[account.implementations.local]
-private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-
-[discovery]
-[discovery.implementations.test]
-
-[order]
-[order.implementations.eip7683]
-[order.strategy]
-primary = "simple"
-[order.strategy.implementations.simple]
-
-[settlement.implementations.impl1]
-order = "eip7683"
-network_ids = [1, 2, 999]  # Network 999 doesn't exist
-"#;
-
-		let result = Config::from_str(config_str);
+		let result = parse_json_fixture(base_config_json(
+			json!({
+				"1": test_network(1, "http://localhost:8545"),
+				"2": test_network(2, "http://localhost:8546")
+			}),
+			json!({
+				"eip7683": {}
+			}),
+			json!({
+				"impl1": {
+					"order": "eip7683",
+					"network_ids": [1, 2, 999]
+				}
+			}),
+		));
 		assert!(result.is_err());
 		let err = result.unwrap_err();
 		assert!(err
@@ -1056,61 +981,22 @@ network_ids = [1, 2, 999]  # Network 999 doesn't exist
 
 	#[test]
 	fn test_order_standard_without_settlement() {
-		let config_str = r#"
-[solver]
-id = "test"
-monitoring_timeout_minutes = 5
-min_profitability_pct = 5.0  # Minimum profitability percentage required to execute orders
-
-[networks.1]
-input_settler_address = "0x1234567890123456789012345678901234567890"
-output_settler_address = "0x0987654321098765432109876543210987654321"
-[[networks.1.rpc_urls]]
-http = "http://localhost:8545"
-[[networks.1.tokens]]
-address = "0xabcdef1234567890abcdef1234567890abcdef12"
-symbol = "TEST"
-decimals = 18
-
-[networks.2]
-input_settler_address = "0x1234567890123456789012345678901234567890"
-output_settler_address = "0x0987654321098765432109876543210987654321"
-[[networks.2.rpc_urls]]
-http = "http://localhost:8546"
-[[networks.2.tokens]]
-address = "0xabcdef1234567890abcdef1234567890abcdef12"
-symbol = "TEST"
-decimals = 18
-
-[storage]
-primary = "memory"
-cleanup_interval_seconds = 3600
-[storage.implementations.memory]
-
-[delivery]
-[delivery.implementations.test]
-
-[account]
-primary = "local"
-[account.implementations.local]
-private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-
-[discovery]
-[discovery.implementations.test]
-
-[order]
-[order.implementations.eip7683]
-[order.implementations.eip9999]  # Order standard with no settlement
-[order.strategy]
-primary = "simple"
-[order.strategy.implementations.simple]
-
-[settlement.implementations.impl1]
-order = "eip7683"  # Only covers eip7683, not eip9999
-network_ids = [1, 2]
-"#;
-
-		let result = Config::from_str(config_str);
+		let result = parse_json_fixture(base_config_json(
+			json!({
+				"1": test_network(1, "http://localhost:8545"),
+				"2": test_network(2, "http://localhost:8546")
+			}),
+			json!({
+				"eip7683": {},
+				"eip9999": {}
+			}),
+			json!({
+				"impl1": {
+					"order": "eip7683",
+					"network_ids": [1, 2]
+				}
+			}),
+		));
 		assert!(result.is_err());
 		let err = result.unwrap_err();
 		assert!(err

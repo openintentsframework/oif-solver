@@ -759,7 +759,7 @@ sequenceDiagram
 
 The admin API enables authorized wallet addresses to perform administrative operations using EIP-712 signed messages. This provides secure, decentralized admin access without shared secrets.
 
-**Setup:** Configure admin addresses in your seed overrides or TOML config:
+**Setup:** Configure admin addresses in your seed overrides JSON:
 
 ```json
 {
@@ -992,8 +992,8 @@ The project includes a Rust-based CLI tool (`solver-demo`) for testing cross-cha
 
 ```bash
 # 1. Initialize configuration and load it
-cargo run -p solver-demo -- init new config/demo.toml
-cargo run -p solver-demo -- init load config/demo.toml --local
+cargo run -p solver-demo -- init new config/demo.json
+cargo run -p solver-demo -- init load config/demo.json --local
 
 # 2. Start local environment (Anvil chains)
 cargo run -p solver-demo -- env start

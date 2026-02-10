@@ -181,7 +181,7 @@ pub trait DeliveryInterface: Send + Sync {
 /// This is the function signature that all delivery implementations must provide
 /// to create instances of their delivery interface.
 pub type DeliveryFactory = fn(
-	&toml::Value,
+	&serde_json::Value,
 	&NetworksConfig,
 	&solver_account::AccountSigner, // Default/primary signer
 	&HashMap<u64, solver_account::AccountSigner>, // Per-network signers

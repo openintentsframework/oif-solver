@@ -142,14 +142,16 @@ pub struct AlloyDeliverySchema;
 
 impl AlloyDeliverySchema {
 	/// Static validation method for use before instance creation
-	pub fn validate_config(config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+	pub fn validate_config(
+		config: &serde_json::Value,
+	) -> Result<(), solver_types::ValidationError> {
 		let instance = Self;
 		instance.validate(config)
 	}
 }
 
 impl ConfigSchema for AlloyDeliverySchema {
-	fn validate(&self, config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+	fn validate(&self, config: &serde_json::Value) -> Result<(), solver_types::ValidationError> {
 		let schema = Schema::new(
 			// Required fields
 			vec![Field::new(
@@ -178,7 +180,7 @@ impl ConfigSchema for AlloyDeliverySchema {
 				)),
 			)
 			.with_validator(|value| {
-				if let Some(table) = value.as_table() {
+				if let Some(table) = value.as_object() {
 					// Validate that keys are valid integers (network IDs)
 					// and values are strings (account names)
 					for (key, val) in table {
@@ -187,7 +189,7 @@ impl ConfigSchema for AlloyDeliverySchema {
 							return Err(format!("Invalid network ID in accounts: {key}"));
 						}
 						// Check value is a string
-						if !val.is_str() {
+						if val.as_str().is_none() {
 							return Err(format!("Account name for network {key} must be a string"));
 						}
 					}
@@ -574,7 +576,7 @@ async fn monitor_transaction(
 /// # Returns
 /// A boxed implementation of DeliveryInterface configured for the specified networks
 pub fn create_http_delivery(
-	config: &toml::Value,
+	config: &serde_json::Value,
 	networks: &NetworksConfig,
 	default_signer: &AccountSigner,
 	network_signers: &HashMap<u64, AccountSigner>,
@@ -589,7 +591,7 @@ pub fn create_http_delivery(
 		.and_then(|v| v.as_array())
 		.map(|arr| {
 			arr.iter()
-				.filter_map(|v| v.as_integer().map(|i| i as u64))
+				.filter_map(|v| v.as_i64().map(|i| i as u64))
 				.collect::<Vec<_>>()
 		})
 		.ok_or_else(|| DeliveryError::Network("network_ids is required".to_string()))?;
@@ -684,11 +686,11 @@ mod tests {
 	#[test]
 	fn test_config_schema_validation_valid() {
 		let schema = AlloyDeliverySchema;
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"network_ids".to_string(),
-				toml::Value::Array(vec![toml::Value::Integer(1)]),
+				serde_json::Value::Array(vec![serde_json::Value::from(1)]),
 			);
 			table
 		});
@@ -700,9 +702,9 @@ mod tests {
 	#[test]
 	fn test_config_schema_validation_empty_network_ids() {
 		let schema = AlloyDeliverySchema;
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
-			table.insert("network_ids".to_string(), toml::Value::Array(vec![]));
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
+			table.insert("network_ids".to_string(), serde_json::Value::Array(vec![]));
 			table
 		});
 
@@ -716,11 +718,11 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_create_http_delivery_success() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"network_ids".to_string(),
-				toml::Value::Array(vec![toml::Value::Integer(1)]),
+				serde_json::Value::Array(vec![serde_json::Value::from(1)]),
 			);
 			table
 		});
@@ -1012,7 +1014,7 @@ mod tests {
 		#[test]
 		fn test_config_missing_network_ids() {
 			let schema = AlloyDeliverySchema;
-			let config = toml::Value::Table(toml::map::Map::new());
+			let config = serde_json::Value::Object(serde_json::Map::new());
 
 			let result = schema.validate(&config);
 			assert!(result.is_err());
@@ -1021,11 +1023,11 @@ mod tests {
 		#[test]
 		fn test_config_network_ids_wrong_type() {
 			let schema = AlloyDeliverySchema;
-			let config = toml::Value::Table({
-				let mut table = toml::map::Map::new();
+			let config = serde_json::Value::Object({
+				let mut table = serde_json::Map::new();
 				table.insert(
 					"network_ids".to_string(),
-					toml::Value::String("not an array".to_string()),
+					serde_json::Value::String("not an array".to_string()),
 				);
 				table
 			});
@@ -1037,14 +1039,14 @@ mod tests {
 		#[test]
 		fn test_config_multiple_network_ids() {
 			let schema = AlloyDeliverySchema;
-			let config = toml::Value::Table({
-				let mut table = toml::map::Map::new();
+			let config = serde_json::Value::Object({
+				let mut table = serde_json::Map::new();
 				table.insert(
 					"network_ids".to_string(),
-					toml::Value::Array(vec![
-						toml::Value::Integer(1),
-						toml::Value::Integer(137),
-						toml::Value::Integer(42161),
+					serde_json::Value::Array(vec![
+						serde_json::Value::from(1),
+						serde_json::Value::from(137),
+						serde_json::Value::from(42161),
 					]),
 				);
 				table
@@ -1059,20 +1061,20 @@ mod tests {
 			let schema = AlloyDeliverySchema;
 
 			// Valid config should pass
-			let valid_config = toml::Value::Table({
-				let mut table = toml::map::Map::new();
+			let valid_config = serde_json::Value::Object({
+				let mut table = serde_json::Map::new();
 				table.insert(
 					"network_ids".to_string(),
-					toml::Value::Array(vec![toml::Value::Integer(1)]),
+					serde_json::Value::Array(vec![serde_json::Value::from(1)]),
 				);
 				table
 			});
 			assert!(schema.validate(&valid_config).is_ok());
 
 			// Invalid config (empty array) should fail
-			let invalid_config = toml::Value::Table({
-				let mut table = toml::map::Map::new();
-				table.insert("network_ids".to_string(), toml::Value::Array(vec![]));
+			let invalid_config = serde_json::Value::Object({
+				let mut table = serde_json::Map::new();
+				table.insert("network_ids".to_string(), serde_json::Value::Array(vec![]));
 				table
 			});
 			assert!(schema.validate(&invalid_config).is_err());
