@@ -1050,7 +1050,10 @@ mod tests {
 		assert!(address.is_ok());
 		let addr = address.unwrap();
 		// The mock returns "3333333333333333333333333333333333333333"
-		assert_eq!(hex::encode(&addr.0), "3333333333333333333333333333333333333333");
+		assert_eq!(
+			hex::encode(&addr.0),
+			"3333333333333333333333333333333333333333"
+		);
 	}
 
 	#[test]
@@ -1097,5 +1100,4 @@ mod tests {
 			assert!(retrieved.contains_key(chain_id));
 		}
 	}
-
 }

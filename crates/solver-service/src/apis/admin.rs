@@ -1772,7 +1772,8 @@ mod tests {
 	#[test]
 	fn test_redact_query_params_various_keys() {
 		// Test various sensitive parameter names
-		let query = "apikey=secret1&api_key=secret2&key=secret3&token=secret4&secret=secret5&chainId=1";
+		let query =
+			"apikey=secret1&api_key=secret2&key=secret3&token=secret4&secret=secret5&chainId=1";
 		let redacted = redact_query_params(query);
 		assert!(redacted.contains("apikey=[REDACTED]"));
 		assert!(redacted.contains("api_key=[REDACTED]"));
@@ -1923,9 +1924,7 @@ mod tests {
 	fn test_admin_network_response_serialization() {
 		let network = AdminNetworkResponse {
 			chain_id: 10,
-			rpc_urls: vec![
-				"https://rpc.example.com/[REDACTED]".to_string(),
-			],
+			rpc_urls: vec!["https://rpc.example.com/[REDACTED]".to_string()],
 			tokens: vec![AdminTokenResponse {
 				symbol: "USDC".to_string(),
 				address: "0x1234".to_string(),
@@ -1940,5 +1939,4 @@ mod tests {
 		assert!(json.contains("\"inputSettler\":\"0xaaa\""));
 		assert!(json.contains("\"outputSettler\":\"0xbbb\""));
 	}
-
 }
