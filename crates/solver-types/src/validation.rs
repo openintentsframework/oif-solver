@@ -56,7 +56,7 @@ pub enum FieldType {
 /// Validators are custom functions that can perform additional validation
 /// beyond type checking. They receive a TOML value and return an error
 /// message if validation fails.
-pub type FieldValidator = Box<dyn Fn(&toml::Value) -> Result<(), String> + Send + Sync>;
+pub type FieldValidator = Box<dyn Fn(&serde_json::Value) -> Result<(), String> + Send + Sync>;
 
 /// Represents a field in a configuration schema.
 ///
@@ -104,7 +104,7 @@ impl Field {
 	/// * `validator` - A closure that validates the field value
 	pub fn with_validator<F>(mut self, validator: F) -> Self
 	where
-		F: Fn(&toml::Value) -> Result<(), String> + Send + Sync + 'static,
+		F: Fn(&serde_json::Value) -> Result<(), String> + Send + Sync + 'static,
 	{
 		self.validator = Some(Box::new(validator));
 		self
@@ -159,13 +159,13 @@ impl Schema {
 	/// - A field has the wrong type
 	/// - A custom validator fails
 	/// - A nested schema validation fails
-	pub fn validate(&self, config: &toml::Value) -> Result<(), ValidationError> {
+	pub fn validate(&self, config: &serde_json::Value) -> Result<(), ValidationError> {
 		let table = config
-			.as_table()
+			.as_object()
 			.ok_or_else(|| ValidationError::TypeMismatch {
 				field: "root".to_string(),
-				expected: "table".to_string(),
-				actual: config.type_str().to_string(),
+				expected: "object".to_string(),
+				actual: json_type_name(config).to_string(),
 			})?;
 
 		// Check required fields
@@ -222,26 +222,26 @@ impl Schema {
 /// * `Err(ValidationError)` with details about the type mismatch
 fn validate_field_type(
 	field_name: &str,
-	value: &toml::Value,
+	value: &serde_json::Value,
 	expected_type: &FieldType,
 ) -> Result<(), ValidationError> {
 	match expected_type {
 		FieldType::String => {
-			if !value.is_str() {
+			if value.as_str().is_none() {
 				return Err(ValidationError::TypeMismatch {
 					field: field_name.to_string(),
 					expected: "string".to_string(),
-					actual: value.type_str().to_string(),
+					actual: json_type_name(value).to_string(),
 				});
 			}
 		},
 		FieldType::Integer { min, max } => {
 			let int_val = value
-				.as_integer()
+				.as_i64()
 				.ok_or_else(|| ValidationError::TypeMismatch {
 					field: field_name.to_string(),
 					expected: "integer".to_string(),
-					actual: value.type_str().to_string(),
+					actual: json_type_name(value).to_string(),
 				})?;
 
 			if let Some(min_val) = min {
@@ -263,11 +263,11 @@ fn validate_field_type(
 			}
 		},
 		FieldType::Boolean => {
-			if !value.is_bool() {
+			if value.as_bool().is_none() {
 				return Err(ValidationError::TypeMismatch {
 					field: field_name.to_string(),
 					expected: "boolean".to_string(),
-					actual: value.type_str().to_string(),
+					actual: json_type_name(value).to_string(),
 				});
 			}
 		},
@@ -277,7 +277,7 @@ fn validate_field_type(
 				.ok_or_else(|| ValidationError::TypeMismatch {
 					field: field_name.to_string(),
 					expected: "array".to_string(),
-					actual: value.type_str().to_string(),
+					actual: json_type_name(value).to_string(),
 				})?;
 
 			for (i, item) in array.iter().enumerate() {
@@ -310,26 +310,42 @@ fn validate_field_type(
 	Ok(())
 }
 
-/// Trait defining a configuration schema that can validate TOML values.
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+	match value {
+		serde_json::Value::Null => "null",
+		serde_json::Value::Bool(_) => "boolean",
+		serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
+		serde_json::Value::Number(_) => "number",
+		serde_json::Value::String(_) => "string",
+		serde_json::Value::Array(_) => "array",
+		serde_json::Value::Object(_) => "object",
+	}
+}
+
+/// Trait defining a configuration schema that can validate JSON values.
 ///
 /// Implement this trait to create custom configuration validators that can
 /// be used across different parts of the application. This is particularly
 /// useful for plugin systems or when you need polymorphic validation behavior.
 #[async_trait]
 pub trait ConfigSchema: Send + Sync {
-	/// Validates a TOML configuration value against this schema.
+	/// Validates a JSON configuration value against this schema.
 	///
 	/// This method should check:
 	/// - Required fields are present
 	/// - Field types are correct
 	/// - Values meet any constraints (ranges, patterns, etc.)
-	fn validate(&self, config: &toml::Value) -> Result<(), ValidationError>;
+	fn validate(&self, config: &serde_json::Value) -> Result<(), ValidationError>;
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use toml::Value;
+	use serde_json::Value;
+
+	fn parse_config(input: &str) -> Value {
+		serde_json::from_str(input).expect("test fixtures must be valid JSON")
+	}
 
 	#[test]
 	fn test_validation_error_display() {
@@ -384,7 +400,7 @@ mod tests {
 			},
 		)
 		.with_validator(|value| {
-			let port = value.as_integer().unwrap();
+			let port = value.as_i64().unwrap();
 			if port > 0 && port <= 65535 {
 				Ok(())
 			} else {
@@ -421,10 +437,10 @@ mod tests {
 	fn test_validate_string_field() {
 		let schema = Schema::new(vec![Field::new("name", FieldType::String)], vec![]);
 
-		let valid_config = toml::from_str(r#"name = "test""#).unwrap();
+		let valid_config = parse_config(r#"{"name":"test"}"#);
 		assert!(schema.validate(&valid_config).is_ok());
 
-		let invalid_config = toml::from_str(r#"name = 123"#).unwrap();
+		let invalid_config = parse_config(r#"{"name":123}"#);
 		let result = schema.validate(&invalid_config);
 		assert!(result.is_err());
 		assert!(matches!(
@@ -446,10 +462,10 @@ mod tests {
 			vec![],
 		);
 
-		let valid_config = toml::from_str(r#"port = 8080"#).unwrap();
+		let valid_config = parse_config(r#"{"port":8080}"#);
 		assert!(schema.validate(&valid_config).is_ok());
 
-		let too_small = toml::from_str(r#"port = 0"#).unwrap();
+		let too_small = parse_config(r#"{"port":0}"#);
 		let result = schema.validate(&too_small);
 		assert!(result.is_err());
 		assert!(matches!(
@@ -457,7 +473,7 @@ mod tests {
 			ValidationError::InvalidValue { .. }
 		));
 
-		let too_large = toml::from_str(r#"port = 70000"#).unwrap();
+		let too_large = parse_config(r#"{"port":70000}"#);
 		let result = schema.validate(&too_large);
 		assert!(result.is_err());
 		assert!(matches!(
@@ -470,10 +486,10 @@ mod tests {
 	fn test_validate_boolean_field() {
 		let schema = Schema::new(vec![Field::new("enabled", FieldType::Boolean)], vec![]);
 
-		let valid_config = toml::from_str(r#"enabled = true"#).unwrap();
+		let valid_config = parse_config(r#"{"enabled":true}"#);
 		assert!(schema.validate(&valid_config).is_ok());
 
-		let invalid_config = toml::from_str(r#"enabled = "yes""#).unwrap();
+		let invalid_config = parse_config(r#"{"enabled":"yes"}"#);
 		let result = schema.validate(&invalid_config);
 		assert!(result.is_err());
 		assert!(matches!(
@@ -492,10 +508,10 @@ mod tests {
 			vec![],
 		);
 
-		let valid_config = toml::from_str(r#"tags = ["tag1", "tag2"]"#).unwrap();
+		let valid_config = parse_config(r#"{"tags":["tag1","tag2"]}"#);
 		assert!(schema.validate(&valid_config).is_ok());
 
-		let invalid_config = toml::from_str(r#"tags = [1, 2, 3]"#).unwrap();
+		let invalid_config = parse_config(r#"{"tags":[1,2,3]}"#);
 		let result = schema.validate(&invalid_config);
 		assert!(result.is_err());
 		assert!(matches!(
@@ -522,23 +538,18 @@ mod tests {
 			vec![],
 		);
 
-		let valid_config = toml::from_str(
+		let valid_config = parse_config(
 			r#"
-			[database]
-			host = "localhost"
-			port = 5432
-		"#,
-		)
-		.unwrap();
+				{"database":{"host":"localhost","port":5432}}
+			"#,
+		);
 		assert!(schema.validate(&valid_config).is_ok());
 
-		let invalid_config = toml::from_str(
+		let invalid_config = parse_config(
 			r#"
-			[database]
-			port = 5432
-		"#,
-		)
-		.unwrap();
+				{"database":{"port":5432}}
+			"#,
+		);
 		let result = schema.validate(&invalid_config);
 		assert!(result.is_err());
 		assert!(matches!(
@@ -554,7 +565,7 @@ mod tests {
 			vec![],
 		);
 
-		let config = toml::from_str(r#"other_field = "value""#).unwrap();
+		let config = parse_config(r#"{"other_field":"value"}"#);
 		let result = schema.validate(&config);
 		assert!(result.is_err());
 
@@ -573,27 +584,23 @@ mod tests {
 		);
 
 		// Config without optional field should be valid
-		let config_without_optional = toml::from_str(r#"name = "test""#).unwrap();
+		let config_without_optional = parse_config(r#"{"name":"test"}"#);
 		assert!(schema.validate(&config_without_optional).is_ok());
 
 		// Config with valid optional field should be valid
-		let config_with_optional = toml::from_str(
+		let config_with_optional = parse_config(
 			r#"
-			name = "test"
-			enabled = true
-		"#,
-		)
-		.unwrap();
+				{"name":"test","enabled":true}
+			"#,
+		);
 		assert!(schema.validate(&config_with_optional).is_ok());
 
 		// Config with invalid optional field should fail
-		let config_with_invalid_optional = toml::from_str(
+		let config_with_invalid_optional = parse_config(
 			r#"
-			name = "test"
-			enabled = "yes"
-		"#,
-		)
-		.unwrap();
+				{"name":"test","enabled":"yes"}
+			"#,
+		);
 		let result = schema.validate(&config_with_invalid_optional);
 		assert!(result.is_err());
 	}
@@ -608,7 +615,7 @@ mod tests {
 			},
 		)
 		.with_validator(|value| {
-			let port = value.as_integer().unwrap();
+			let port = value.as_i64().unwrap();
 			if port > 1024 {
 				Ok(())
 			} else {
@@ -617,7 +624,7 @@ mod tests {
 		});
 
 		let schema = Schema::new(vec![field], vec![]);
-		let config = toml::from_str(r#"port = 8080"#).unwrap();
+		let config = parse_config(r#"{"port":8080}"#);
 		assert!(schema.validate(&config).is_ok());
 	}
 
@@ -631,7 +638,7 @@ mod tests {
 			},
 		)
 		.with_validator(|value| {
-			let port = value.as_integer().unwrap();
+			let port = value.as_i64().unwrap();
 			if port > 1024 {
 				Ok(())
 			} else {
@@ -640,7 +647,7 @@ mod tests {
 		});
 
 		let schema = Schema::new(vec![field], vec![]);
-		let config = toml::from_str(r#"port = 80"#).unwrap();
+		let config = parse_config(r#"{"port":80}"#);
 		let result = schema.validate(&config);
 		assert!(result.is_err());
 
@@ -678,10 +685,10 @@ mod tests {
 		);
 
 		// Valid values
-		let valid_configs = [r#"count = 0"#, r#"count = 50"#, r#"count = 100"#];
+		let valid_configs = [r#"{"count":0}"#, r#"{"count":50}"#, r#"{"count":100}"#];
 
 		for config_str in &valid_configs {
-			let config = toml::from_str(config_str).unwrap();
+			let config = parse_config(config_str);
 			assert!(
 				schema.validate(&config).is_ok(),
 				"Failed for config: {config_str}"
@@ -689,10 +696,10 @@ mod tests {
 		}
 
 		// Invalid values
-		let invalid_configs = [r#"count = -1"#, r#"count = 101"#];
+		let invalid_configs = [r#"{"count":-1}"#, r#"{"count":101}"#];
 
 		for config_str in &invalid_configs {
-			let config = toml::from_str(config_str).unwrap();
+			let config = parse_config(config_str);
 			let result = schema.validate(&config);
 			assert!(
 				result.is_err(),
@@ -718,10 +725,10 @@ mod tests {
 			vec![],
 		);
 
-		let valid_config = toml::from_str(r#"numbers = [1, 2, 3]"#).unwrap();
+		let valid_config = parse_config(r#"{"numbers":[1,2,3]}"#);
 		assert!(schema.validate(&valid_config).is_ok());
 
-		let invalid_config = toml::from_str(r#"numbers = [1, "two", 3]"#).unwrap();
+		let invalid_config = parse_config(r#"{"numbers":[1,"two",3]}"#);
 		let result = schema.validate(&invalid_config);
 		assert!(result.is_err());
 		assert!(matches!(
@@ -740,7 +747,7 @@ mod tests {
 			vec![],
 		);
 
-		let config = toml::from_str(r#"items = []"#).unwrap();
+		let config = parse_config(r#"{"items":[]}"#);
 		assert!(schema.validate(&config).is_ok());
 	}
 
@@ -756,13 +763,11 @@ mod tests {
 			vec![],
 		);
 
-		let invalid_config = toml::from_str(
+		let invalid_config = parse_config(
 			r#"
-			[config]
-			other_field = "value"
-		"#,
-		)
-		.unwrap();
+				{"config":{"other_field":"value"}}
+			"#,
+		);
 
 		let result = schema.validate(&invalid_config);
 		assert!(result.is_err());
@@ -804,17 +809,11 @@ mod tests {
 			vec![],
 		);
 
-		let valid_config = toml::from_str(
+		let valid_config = parse_config(
 			r#"
-			app_name = "my_app"
-			
-			[database]
-			host = "localhost"
-			port = 5432
-			timeout = 30
-		"#,
-		)
-		.unwrap();
+				{"app_name":"my_app","database":{"host":"localhost","port":5432,"timeout":30}}
+			"#,
+		);
 
 		assert!(schema.validate(&valid_config).is_ok());
 	}
@@ -833,7 +832,7 @@ mod tests {
 
 	#[async_trait]
 	impl ConfigSchema for TestConfigSchema {
-		fn validate(&self, config: &toml::Value) -> Result<(), ValidationError> {
+		fn validate(&self, config: &serde_json::Value) -> Result<(), ValidationError> {
 			self.schema.validate(config)
 		}
 	}
@@ -842,10 +841,10 @@ mod tests {
 	fn test_config_schema_trait() {
 		let config_schema = TestConfigSchema::new();
 
-		let valid_config = toml::from_str(r#"test_field = "value""#).unwrap();
+		let valid_config = parse_config(r#"{"test_field":"value"}"#);
 		assert!(config_schema.validate(&valid_config).is_ok());
 
-		let invalid_config = toml::from_str(r#"other_field = "value""#).unwrap();
+		let invalid_config = parse_config(r#"{"other_field":"value"}"#);
 		let result = config_schema.validate(&invalid_config);
 		assert!(result.is_err());
 		assert!(matches!(
@@ -867,10 +866,14 @@ mod tests {
 			vec![],
 		);
 
-		let configs = [r#"value = -1000"#, r#"value = 0"#, r#"value = 1000000"#];
+		let configs = [
+			r#"{"value":-1000}"#,
+			r#"{"value":0}"#,
+			r#"{"value":1000000}"#,
+		];
 
 		for config_str in &configs {
-			let config = toml::from_str(config_str).unwrap();
+			let config = parse_config(config_str);
 			assert!(schema.validate(&config).is_ok(), "Failed for: {config_str}");
 		}
 	}
@@ -890,17 +893,11 @@ mod tests {
 			vec![],
 		);
 
-		let valid_config = toml::from_str(
+		let valid_config = parse_config(
 			r#"
-			[[items]]
-			name = "item1"
-			enabled = true
-			
-			[[items]]
-			name = "item2"
-		"#,
-		)
-		.unwrap();
+				{"items":[{"name":"item1","enabled":true},{"name":"item2"}]}
+			"#,
+		);
 
 		assert!(schema.validate(&valid_config).is_ok());
 	}
@@ -914,13 +911,11 @@ mod tests {
 			vec![],
 		);
 
-		let config = toml::from_str(
+		let config = parse_config(
 			r#"
-			[outer]
-			inner = 123
-		"#,
-		)
-		.unwrap();
+				{"outer":{"inner":123}}
+			"#,
+		);
 
 		let result = schema.validate(&config);
 		assert!(result.is_err());

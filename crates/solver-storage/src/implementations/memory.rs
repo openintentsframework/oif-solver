@@ -14,7 +14,8 @@
 
 use crate::{QueryFilter, StorageError, StorageIndexes, StorageInterface};
 use async_trait::async_trait;
-use solver_types::{ConfigSchema, Schema, ValidationError};
+use serde::Deserialize;
+use solver_types::{ConfigSchema, ValidationError};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -217,19 +218,28 @@ impl StorageInterface for MemoryStorage {
 /// Configuration schema for MemoryStorage.
 pub struct MemoryStorageSchema;
 
+/// Dedicated typed configuration for in-memory storage.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryStorageConfig {}
+
+impl MemoryStorageConfig {
+	fn from_json(config: &serde_json::Value) -> Result<Self, ValidationError> {
+		serde_json::from_value(config.clone())
+			.map_err(|err| ValidationError::DeserializationError(err.to_string()))
+	}
+}
+
 impl MemoryStorageSchema {
 	/// Static validation method for use before instance creation
-	pub fn validate_config(config: &toml::Value) -> Result<(), ValidationError> {
-		let instance = Self;
-		instance.validate(config)
+	pub fn validate_config(config: &serde_json::Value) -> Result<(), ValidationError> {
+		MemoryStorageConfig::from_json(config).map(|_| ())
 	}
 }
 
 impl ConfigSchema for MemoryStorageSchema {
-	fn validate(&self, _config: &toml::Value) -> Result<(), ValidationError> {
-		// Memory storage has no required configuration
-		let schema = Schema::new(vec![], vec![]);
-		schema.validate(_config)
+	fn validate(&self, config: &serde_json::Value) -> Result<(), ValidationError> {
+		MemoryStorageConfig::from_json(config).map(|_| ())
 	}
 }
 
@@ -237,7 +247,9 @@ impl ConfigSchema for MemoryStorageSchema {
 ///
 /// Configuration parameters:
 /// - None required for memory storage
-pub fn create_storage(config: &toml::Value) -> Result<Box<dyn StorageInterface>, StorageError> {
+pub fn create_storage(
+	config: &serde_json::Value,
+) -> Result<Box<dyn StorageInterface>, StorageError> {
 	// Validate configuration first (even though memory storage has no config)
 	MemoryStorageSchema::validate_config(config)
 		.map_err(|e| StorageError::Configuration(format!("Invalid configuration: {e}")))?;
@@ -260,6 +272,26 @@ impl solver_types::ImplementationRegistry for Registry {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn test_schema_validation_valid_empty_config() {
+		let config = serde_json::Value::Object(serde_json::Map::new());
+		assert!(MemoryStorageSchema::validate_config(&config).is_ok());
+	}
+
+	#[test]
+	fn test_schema_validation_rejects_unknown_fields() {
+		let config = serde_json::json!({
+			"unexpected": "value"
+		});
+		assert!(MemoryStorageSchema::validate_config(&config).is_err());
+	}
+
+	#[test]
+	fn test_schema_validation_rejects_non_table_root() {
+		let config = serde_json::Value::String("not-a-table".to_string());
+		assert!(MemoryStorageSchema::validate_config(&config).is_err());
+	}
 
 	#[tokio::test]
 	async fn test_basic_operations() {

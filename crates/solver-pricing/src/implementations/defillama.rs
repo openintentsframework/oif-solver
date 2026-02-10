@@ -64,7 +64,7 @@ struct CoinPrice {
 
 impl DefiLlamaPricing {
 	/// Creates a new DefiLlamaPricing instance with configuration.
-	pub fn new(config: &toml::Value) -> Result<Self, PricingError> {
+	pub fn new(config: &serde_json::Value) -> Result<Self, PricingError> {
 		// Validate configuration first
 		let schema = DefiLlamaConfigSchema;
 		schema.validate(config).map_err(|e| {
@@ -79,7 +79,7 @@ impl DefiLlamaPricing {
 
 		let cache_duration = config
 			.get("cache_duration_seconds")
-			.and_then(|v| v.as_integer())
+			.and_then(|v| v.as_i64())
 			.unwrap_or(60) as u64;
 
 		// Build token ID map from shared defaults, adding "coingecko:" prefix for DeFiLlama API
@@ -89,7 +89,7 @@ impl DefiLlamaPricing {
 			.collect();
 
 		// Allow custom token mappings
-		if let Some(custom_tokens) = config.get("token_id_map").and_then(|v| v.as_table()) {
+		if let Some(custom_tokens) = config.get("token_id_map").and_then(|v| v.as_object()) {
 			for (symbol, id) in custom_tokens {
 				if let Some(id_str) = id.as_str() {
 					token_id_map.insert(symbol.to_uppercase(), id_str.to_string());
@@ -99,17 +99,17 @@ impl DefiLlamaPricing {
 
 		// Parse custom prices for tokens (useful for testing/demo)
 		let mut custom_prices = HashMap::new();
-		if let Some(prices_config) = config.get("custom_prices").and_then(|v| v.as_table()) {
+		if let Some(prices_config) = config.get("custom_prices").and_then(|v| v.as_object()) {
 			for (symbol, price) in prices_config {
 				let price_decimal = if let Some(price_str) = price.as_str() {
 					price_str.parse::<Decimal>().map_err(|e| {
 						PricingError::InvalidData(format!("Invalid custom price for {symbol}: {e}"))
 					})?
-				} else if let Some(price_num) = price.as_float() {
+				} else if let Some(price_num) = price.as_f64() {
 					Decimal::try_from(price_num).map_err(|e| {
 						PricingError::InvalidData(format!("Invalid custom price for {symbol}: {e}"))
 					})?
-				} else if let Some(price_int) = price.as_integer() {
+				} else if let Some(price_int) = price.as_i64() {
 					Decimal::from(price_int)
 				} else {
 					return Err(PricingError::InvalidData(format!(
@@ -441,7 +441,7 @@ impl PricingInterface for DefiLlamaPricing {
 pub struct DefiLlamaConfigSchema;
 
 impl ConfigSchema for DefiLlamaConfigSchema {
-	fn validate(&self, config: &toml::Value) -> Result<(), ValidationError> {
+	fn validate(&self, config: &serde_json::Value) -> Result<(), ValidationError> {
 		// Optional base URL
 		if let Some(base_url) = config.get("base_url") {
 			if base_url.as_str().is_none() {
@@ -455,7 +455,7 @@ impl ConfigSchema for DefiLlamaConfigSchema {
 
 		// Optional cache duration
 		if let Some(cache_duration) = config.get("cache_duration_seconds") {
-			if cache_duration.as_integer().is_none() {
+			if cache_duration.as_i64().is_none() {
 				return Err(ValidationError::TypeMismatch {
 					field: "cache_duration_seconds".to_string(),
 					expected: "integer".to_string(),
@@ -466,7 +466,7 @@ impl ConfigSchema for DefiLlamaConfigSchema {
 
 		// Optional token_id_map
 		if let Some(token_map) = config.get("token_id_map") {
-			if let Some(table) = token_map.as_table() {
+			if let Some(table) = token_map.as_object() {
 				for (symbol, id) in table {
 					if id.as_str().is_none() {
 						return Err(ValidationError::TypeMismatch {
@@ -487,14 +487,14 @@ impl ConfigSchema for DefiLlamaConfigSchema {
 
 		// Optional custom_prices
 		if let Some(custom_prices) = config.get("custom_prices") {
-			if let Some(table) = custom_prices.as_table() {
+			if let Some(table) = custom_prices.as_object() {
 				for (symbol, price) in table {
 					let is_valid = if let Some(price_str) = price.as_str() {
 						price_str.parse::<Decimal>().is_ok()
-					} else if let Some(price_num) = price.as_float() {
+					} else if let Some(price_num) = price.as_f64() {
 						Decimal::try_from(price_num).is_ok()
 					} else {
-						price.as_integer().is_some()
+						price.as_i64().is_some()
 					};
 
 					if !is_valid {
@@ -534,7 +534,7 @@ impl PricingRegistry for DefiLlamaPricingRegistry {}
 
 /// Factory function for creating DefiLlamaPricing instances.
 pub fn create_defillama_pricing(
-	config: &toml::Value,
+	config: &serde_json::Value,
 ) -> Result<Box<dyn PricingInterface>, PricingError> {
 	Ok(Box::new(DefiLlamaPricing::new(config)?))
 }
@@ -543,52 +543,43 @@ pub fn create_defillama_pricing(
 mod tests {
 	use super::*;
 
-	fn minimal_config() -> toml::Value {
-		toml::Value::Table(toml::map::Map::new())
+	fn minimal_config() -> serde_json::Value {
+		serde_json::Value::Object(serde_json::Map::new())
 	}
 
-	fn config_with_custom_prices() -> toml::Value {
-		toml::from_str(
-			r#"
-            cache_duration_seconds = 10
-            [custom_prices]
-            ETH = "3000.50"
-            BTC = "65000"
-        "#,
-		)
-		.unwrap()
+	fn config_with_custom_prices() -> serde_json::Value {
+		serde_json::json!({
+			"cache_duration_seconds": 10,
+			"custom_prices": {
+				"ETH": "3000.50",
+				"BTC": "65000"
+			}
+		})
 	}
 
-	fn config_with_custom_base_url() -> toml::Value {
-		toml::from_str(
-			r#"
-            base_url = "https://custom.llama.fi"
-            cache_duration_seconds = 120
-        "#,
-		)
-		.unwrap()
+	fn config_with_custom_base_url() -> serde_json::Value {
+		serde_json::json!({
+			"base_url": "https://custom.llama.fi",
+			"cache_duration_seconds": 120
+		})
 	}
 
-	fn config_with_custom_token_map() -> toml::Value {
-		toml::from_str(
-			r#"
-            [token_id_map]
-            MYTOKEN = "coingecko:my-custom-token"
-            CUSTOM = "coingecko:custom-coin"
-        "#,
-		)
-		.unwrap()
+	fn config_with_custom_token_map() -> serde_json::Value {
+		serde_json::json!({
+			"token_id_map": {
+				"MYTOKEN": "coingecko:my-custom-token",
+				"CUSTOM": "coingecko:custom-coin"
+			}
+		})
 	}
 
-	fn config_with_float_custom_prices() -> toml::Value {
-		toml::from_str(
-			r#"
-            [custom_prices]
-            ETH = 3000.123
-            SOL = 150
-        "#,
-		)
-		.unwrap()
+	fn config_with_float_custom_prices() -> serde_json::Value {
+		serde_json::json!({
+			"custom_prices": {
+				"ETH": 3000.123,
+				"SOL": 150
+			}
+		})
 	}
 
 	#[test]
@@ -710,13 +701,11 @@ mod tests {
 	#[test]
 	fn test_config_schema_invalid_custom_price() {
 		let schema = DefiLlamaConfigSchema;
-		let bad_config = toml::from_str(
-			r#"
-            [custom_prices]
-            ETH = "not_a_price"
-        "#,
-		)
-		.unwrap();
+		let bad_config = serde_json::json!({
+			"custom_prices": {
+				"ETH": "not_a_price"
+			}
+		});
 		assert!(schema.validate(&bad_config).is_err());
 	}
 
@@ -813,61 +802,47 @@ mod tests {
 	#[test]
 	fn test_config_schema_invalid_base_url_type() {
 		let schema = DefiLlamaConfigSchema;
-		let bad_config = toml::from_str(
-			r#"
-            base_url = 123
-        "#,
-		)
-		.unwrap();
+		let bad_config = serde_json::json!({
+			"base_url": 123
+		});
 		assert!(schema.validate(&bad_config).is_err());
 	}
 
 	#[test]
 	fn test_config_schema_invalid_cache_duration_type() {
 		let schema = DefiLlamaConfigSchema;
-		let bad_config = toml::from_str(
-			r#"
-            cache_duration_seconds = "not_a_number"
-        "#,
-		)
-		.unwrap();
+		let bad_config = serde_json::json!({
+			"cache_duration_seconds": "not_a_number"
+		});
 		assert!(schema.validate(&bad_config).is_err());
 	}
 
 	#[test]
 	fn test_config_schema_invalid_token_map_not_table() {
 		let schema = DefiLlamaConfigSchema;
-		let bad_config = toml::from_str(
-			r#"
-            token_id_map = "invalid"
-        "#,
-		)
-		.unwrap();
+		let bad_config = serde_json::json!({
+			"token_id_map": "invalid"
+		});
 		assert!(schema.validate(&bad_config).is_err());
 	}
 
 	#[test]
 	fn test_config_schema_invalid_token_map_value() {
 		let schema = DefiLlamaConfigSchema;
-		let bad_config = toml::from_str(
-			r#"
-            [token_id_map]
-            MYTOKEN = 123
-        "#,
-		)
-		.unwrap();
+		let bad_config = serde_json::json!({
+			"token_id_map": {
+				"MYTOKEN": 123
+			}
+		});
 		assert!(schema.validate(&bad_config).is_err());
 	}
 
 	#[test]
 	fn test_config_schema_invalid_custom_prices_not_table() {
 		let schema = DefiLlamaConfigSchema;
-		let bad_config = toml::from_str(
-			r#"
-            custom_prices = "invalid"
-        "#,
-		)
-		.unwrap();
+		let bad_config = serde_json::json!({
+			"custom_prices": "invalid"
+		});
 		assert!(schema.validate(&bad_config).is_err());
 	}
 
