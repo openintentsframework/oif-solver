@@ -1109,74 +1109,12 @@ mod tests {
 			other => panic!("expected InvalidConfig, got {other:?}"),
 		}
 	}
-}
 
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use alloy_primitives::Address;
-	use solver_service::{config_merge::merge_to_operator_config, seeds::SeedPreset};
-	use solver_storage::StoreConfig;
-	use solver_types::{NetworkOverride, SeedOverrides, Token};
-	use std::{
-		path::{Path, PathBuf},
-		str::FromStr,
-		sync::{Mutex, OnceLock},
-	};
-	use tempfile::TempDir;
+	fn test_seed_overrides(solver_id: &str) -> solver_types::SeedOverrides {
+		use alloy_primitives::Address;
+		use solver_types::{NetworkOverride, SeedOverrides, Token};
+		use std::str::FromStr;
 
-	fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-		static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-		LOCK.get_or_init(|| Mutex::new(()))
-			.lock()
-			.expect("failed to lock env mutex")
-	}
-
-	struct EnvVarGuard {
-		key: String,
-		previous: Option<String>,
-	}
-
-	impl EnvVarGuard {
-		fn set<K: Into<String>>(key: K, value: Option<&str>) -> Self {
-			let key = key.into();
-			let previous = std::env::var(&key).ok();
-			match value {
-				Some(v) => std::env::set_var(&key, v),
-				None => std::env::remove_var(&key),
-			}
-			Self { key, previous }
-		}
-	}
-
-	impl Drop for EnvVarGuard {
-		fn drop(&mut self) {
-			match &self.previous {
-				Some(value) => std::env::set_var(&self.key, value),
-				None => std::env::remove_var(&self.key),
-			}
-		}
-	}
-
-	struct CwdGuard {
-		previous: PathBuf,
-	}
-
-	impl CwdGuard {
-		fn change_to(path: &Path) -> Self {
-			let previous = std::env::current_dir().expect("failed to get current dir");
-			std::env::set_current_dir(path).expect("failed to set current dir");
-			Self { previous }
-		}
-	}
-
-	impl Drop for CwdGuard {
-		fn drop(&mut self) {
-			let _ = std::env::set_current_dir(&self.previous);
-		}
-	}
-
-	fn test_seed_overrides(solver_id: &str) -> SeedOverrides {
 		SeedOverrides {
 			solver_id: Some(solver_id.to_string()),
 			networks: vec![
@@ -1212,7 +1150,7 @@ mod tests {
 
 	#[test]
 	fn resolve_solver_id_prefers_explicit_value() {
-		let _lock = env_lock();
+		let _lock = acquire_lock();
 		let _guard = EnvVarGuard::set("SOLVER_ID", Some("from-env"));
 		let resolved =
 			resolve_solver_id(Some("explicit-solver".to_string())).expect("should resolve");
@@ -1221,7 +1159,7 @@ mod tests {
 
 	#[test]
 	fn resolve_solver_id_reads_env_fallback() {
-		let _lock = env_lock();
+		let _lock = acquire_lock();
 		let _guard = EnvVarGuard::set("SOLVER_ID", Some("from-env"));
 		let resolved = resolve_solver_id(None).expect("should resolve from env");
 		assert_eq!(resolved, "from-env");
@@ -1229,7 +1167,7 @@ mod tests {
 
 	#[test]
 	fn resolve_solver_id_errors_when_missing() {
-		let _lock = env_lock();
+		let _lock = acquire_lock();
 		let _guard = EnvVarGuard::set("SOLVER_ID", None);
 		let err = resolve_solver_id(None).expect_err("missing solver id should error");
 		let msg = err.to_string();
@@ -1238,7 +1176,10 @@ mod tests {
 
 	#[tokio::test]
 	async fn load_config_from_storage_file_backend_materializes_and_loads_session() {
-		let _lock = env_lock();
+		use solver_service::{config_merge::merge_to_operator_config, seeds::SeedPreset};
+		use solver_storage::StoreConfig;
+
+		let _lock = acquire_lock();
 		let temp_dir = TempDir::new().expect("temp dir");
 		let _cwd_guard = CwdGuard::change_to(temp_dir.path());
 
