@@ -1007,7 +1007,7 @@ cargo run -p solver-demo -- env setup
 
 # 5. Build and test intents
 # Build an intent request
-cargo run -p solver-demo -- intent build 31337 31338 TokenA TokenB 100 \
+cargo run -p solver-demo -- intent build --from-chain 31337 --to-chain 31338 --from-token TOKA --to-token TOKB --amount 100 \
     --swap-type exact-input --settlement escrow --auth permit2
 
 # Get quote and sign
@@ -1069,7 +1069,7 @@ cargo run -p solver-demo -- env setup [--chain <id>] [--amount <amount>]
 ```bash
 # Build an intent request
 # Format: intent build <from-chain> <to-chain> <from-token> <to-token> <amount>
-cargo run -p solver-demo -- intent build 31337 31338 TokenA TokenB 100 \
+cargo run -p solver-demo -- intent build --from-chain 31337 --to-chain 31338 --from-token TOKA --to-token TOKB --amount 100 \
     --swap-type exact-input \
     --settlement escrow \
     --auth permit2 \
