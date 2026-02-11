@@ -17,6 +17,12 @@ use crate::{
 };
 use alloy_primitives::Address;
 use solver_config::SettlementConfig;
+use solver_service::config_merge::build_runtime_config;
+use solver_storage::{
+	config_store::{create_config_store, ConfigStoreError},
+	StoreConfig,
+};
+use solver_types::OperatorConfig;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -87,6 +93,27 @@ impl InitOps {
 	pub async fn load(&self, path: PathBuf, is_local: bool) -> Result<()> {
 		// Delegate to the existing load_config function
 		load_config(&path, is_local).await
+	}
+
+	/// Load configuration from runtime storage (Redis/file/memory) and initialize session
+	///
+	/// # Arguments
+	/// * `solver_id` - Solver ID to load (falls back to `SOLVER_ID` env when None)
+	/// * `is_local` - Whether to initialize for local development environment
+	///
+	/// # Returns
+	/// Path to the generated runtime configuration file
+	///
+	/// # Errors
+	/// Returns Error if solver ID cannot be resolved, storage cannot be read,
+	/// config conversion fails, or session initialization fails.
+	#[instrument(skip(self))]
+	pub async fn load_from_storage(
+		&self,
+		solver_id: Option<String>,
+		is_local: bool,
+	) -> Result<PathBuf> {
+		load_config_from_storage(solver_id, is_local).await
 	}
 }
 
@@ -306,6 +333,124 @@ pub async fn load_config(path: &Path, is_local: bool) -> Result<()> {
 	logging::verbose_tech("Chains", &format!("{chains:?}"));
 	logging::verbose_tech("Data directory", &config.data_dir().display().to_string());
 
+	Ok(())
+}
+
+/// Load configuration from runtime storage and initialize session.
+///
+/// Reads `OperatorConfig` from the configured storage backend using the same key
+/// format as the solver service, converts it into runtime `Config`, materializes
+/// that config to `.oif-demo/config`, and then initializes session state.
+pub async fn load_config_from_storage(
+	solver_id: Option<String>,
+	is_local: bool,
+) -> Result<PathBuf> {
+	let solver_id = resolve_solver_id(solver_id)?;
+	let store_config = StoreConfig::from_env()
+		.map_err(|e| Error::InvalidConfig(format!("Failed to read storage configuration: {e}")))?;
+	let store_key = operator_config_store_key(&solver_id);
+
+	let config_store = create_config_store::<OperatorConfig>(store_config, store_key.clone())
+		.map_err(|e| {
+			Error::InvalidConfig(format!(
+				"Failed to create config store for solver '{solver_id}': {e}"
+			))
+		})?;
+
+	let versioned = config_store.get().await.map_err(|e| match e {
+		ConfigStoreError::NotFound(_) => Error::InvalidConfig(format!(
+			"Operator config not found in storage for solver '{solver_id}' (store key: {store_key})"
+		)),
+		other => Error::InvalidConfig(format!(
+			"Failed to load operator config from storage for solver '{solver_id}': {other}"
+		)),
+	})?;
+
+	let runtime_config = build_runtime_config(&versioned.data).map_err(|e| {
+		Error::InvalidConfig(format!(
+			"Failed to convert operator config to runtime config for solver '{solver_id}' (version {}): {e}",
+			versioned.version
+		))
+	})?;
+
+	let generated_config_path = generated_runtime_config_path(&solver_id);
+	materialize_runtime_config(&runtime_config, &generated_config_path)?;
+
+	load_config(&generated_config_path, is_local).await?;
+	Ok(generated_config_path)
+}
+
+fn resolve_solver_id(solver_id: Option<String>) -> Result<String> {
+	if let Some(id) = solver_id {
+		let trimmed = id.trim();
+		if trimmed.is_empty() {
+			return Err(Error::InvalidConfig(
+				"Solver ID cannot be empty".to_string(),
+			));
+		}
+		return Ok(trimmed.to_string());
+	}
+
+	let env_id = std::env::var("SOLVER_ID").map_err(|_| {
+		Error::InvalidConfig(
+			"Solver ID not provided. Use --solver-id <id> or set SOLVER_ID".to_string(),
+		)
+	})?;
+	let trimmed = env_id.trim();
+	if trimmed.is_empty() {
+		return Err(Error::InvalidConfig(
+			"SOLVER_ID is set but empty".to_string(),
+		));
+	}
+	Ok(trimmed.to_string())
+}
+
+fn operator_config_store_key(solver_id: &str) -> String {
+	format!("{solver_id}-operator")
+}
+
+fn generated_runtime_config_path(solver_id: &str) -> PathBuf {
+	let safe_solver_id = sanitize_solver_id_for_filename(solver_id);
+	PathBuf::from(".oif-demo")
+		.join("config")
+		.join(format!("{safe_solver_id}.json"))
+}
+
+fn sanitize_solver_id_for_filename(solver_id: &str) -> String {
+	let sanitized: String = solver_id
+		.chars()
+		.map(|c| {
+			if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+				c
+			} else {
+				'_'
+			}
+		})
+		.collect();
+
+	if sanitized.is_empty() {
+		"solver".to_string()
+	} else {
+		sanitized
+	}
+}
+
+fn materialize_runtime_config(
+	runtime_config: &solver_config::Config,
+	output_path: &Path,
+) -> Result<()> {
+	if let Some(parent) = output_path.parent() {
+		std::fs::create_dir_all(parent)?;
+	}
+
+	let json_content = serde_json::to_string_pretty(runtime_config).map_err(|e| {
+		Error::InvalidConfig(format!(
+			"Failed to serialize runtime config to JSON for {}: {e}",
+			output_path.display()
+		))
+	})?;
+
+	std::fs::write(output_path, json_content)?;
 	Ok(())
 }
 
@@ -963,5 +1108,176 @@ mod tests {
 			},
 			other => panic!("expected InvalidConfig, got {other:?}"),
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use alloy_primitives::Address;
+	use solver_service::{config_merge::merge_to_operator_config, seeds::SeedPreset};
+	use solver_storage::StoreConfig;
+	use solver_types::{NetworkOverride, SeedOverrides, Token};
+	use std::{
+		path::{Path, PathBuf},
+		str::FromStr,
+		sync::{Mutex, OnceLock},
+	};
+	use tempfile::TempDir;
+
+	fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+		static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+		LOCK.get_or_init(|| Mutex::new(()))
+			.lock()
+			.expect("failed to lock env mutex")
+	}
+
+	struct EnvVarGuard {
+		key: String,
+		previous: Option<String>,
+	}
+
+	impl EnvVarGuard {
+		fn set<K: Into<String>>(key: K, value: Option<&str>) -> Self {
+			let key = key.into();
+			let previous = std::env::var(&key).ok();
+			match value {
+				Some(v) => std::env::set_var(&key, v),
+				None => std::env::remove_var(&key),
+			}
+			Self { key, previous }
+		}
+	}
+
+	impl Drop for EnvVarGuard {
+		fn drop(&mut self) {
+			match &self.previous {
+				Some(value) => std::env::set_var(&self.key, value),
+				None => std::env::remove_var(&self.key),
+			}
+		}
+	}
+
+	struct CwdGuard {
+		previous: PathBuf,
+	}
+
+	impl CwdGuard {
+		fn change_to(path: &Path) -> Self {
+			let previous = std::env::current_dir().expect("failed to get current dir");
+			std::env::set_current_dir(path).expect("failed to set current dir");
+			Self { previous }
+		}
+	}
+
+	impl Drop for CwdGuard {
+		fn drop(&mut self) {
+			let _ = std::env::set_current_dir(&self.previous);
+		}
+	}
+
+	fn test_seed_overrides(solver_id: &str) -> SeedOverrides {
+		SeedOverrides {
+			solver_id: Some(solver_id.to_string()),
+			networks: vec![
+				NetworkOverride {
+					chain_id: 11155420,
+					tokens: vec![Token {
+						symbol: "USDC".to_string(),
+						address: Address::from_str("0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6")
+							.expect("valid token address"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+				NetworkOverride {
+					chain_id: 84532,
+					tokens: vec![Token {
+						symbol: "USDC".to_string(),
+						address: Address::from_str("0x73c83DAcc74bB8a704717AC09703b959E74b9705")
+							.expect("valid token address"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+			],
+			account: None,
+			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
+		}
+	}
+
+	#[test]
+	fn resolve_solver_id_prefers_explicit_value() {
+		let _lock = env_lock();
+		let _guard = EnvVarGuard::set("SOLVER_ID", Some("from-env"));
+		let resolved =
+			resolve_solver_id(Some("explicit-solver".to_string())).expect("should resolve");
+		assert_eq!(resolved, "explicit-solver");
+	}
+
+	#[test]
+	fn resolve_solver_id_reads_env_fallback() {
+		let _lock = env_lock();
+		let _guard = EnvVarGuard::set("SOLVER_ID", Some("from-env"));
+		let resolved = resolve_solver_id(None).expect("should resolve from env");
+		assert_eq!(resolved, "from-env");
+	}
+
+	#[test]
+	fn resolve_solver_id_errors_when_missing() {
+		let _lock = env_lock();
+		let _guard = EnvVarGuard::set("SOLVER_ID", None);
+		let err = resolve_solver_id(None).expect_err("missing solver id should error");
+		let msg = err.to_string();
+		assert!(msg.contains("Solver ID not provided"));
+	}
+
+	#[tokio::test]
+	async fn load_config_from_storage_file_backend_materializes_and_loads_session() {
+		let _lock = env_lock();
+		let temp_dir = TempDir::new().expect("temp dir");
+		let _cwd_guard = CwdGuard::change_to(temp_dir.path());
+
+		let store_path = temp_dir.path().join("store");
+		std::fs::create_dir_all(&store_path).expect("store dir");
+
+		let solver_id = "demo-storage-solver";
+		let seed = SeedPreset::Testnet.get_seed();
+		let operator_config = merge_to_operator_config(test_seed_overrides(solver_id), seed)
+			.expect("valid operator config");
+
+		let store = create_config_store::<OperatorConfig>(
+			StoreConfig::File {
+				path: store_path.to_string_lossy().to_string(),
+			},
+			operator_config_store_key(solver_id),
+		)
+		.expect("create config store");
+		store
+			.seed(operator_config)
+			.await
+			.expect("seed operator config");
+
+		let _backend_guard = EnvVarGuard::set("STORAGE_BACKEND", Some("file"));
+		let store_path_value = store_path.to_string_lossy().to_string();
+		let _path_guard = EnvVarGuard::set("STORAGE_PATH", Some(&store_path_value));
+		let _solver_guard = EnvVarGuard::set("SOLVER_ID", Some(solver_id));
+
+		let generated_path = load_config_from_storage(None, false)
+			.await
+			.expect("load config from storage");
+
+		assert!(generated_path.exists(), "generated config should exist");
+		assert!(Path::new(".oif-demo/session.json").exists());
+
+		let loaded = Config::load(&generated_path)
+			.await
+			.expect("load generated config");
+		assert_eq!(loaded.solver.solver.id, solver_id);
+		assert!(loaded.chains().len() >= 2);
 	}
 }

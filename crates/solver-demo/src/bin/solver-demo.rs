@@ -135,6 +135,30 @@ async fn handle_init(cmd: solver_demo::cli::commands::InitCommand) -> Result<()>
 				logging::next_step("Start environment with 'oif-demo env start'");
 			}
 		},
+		InitSubcommand::LoadStorage { solver_id, local } => {
+			let solver_id_hint = solver_id.clone().unwrap_or_else(|| "SOLVER_ID".to_string());
+			logging::operation_start(&format!(
+				"Loading configuration from storage for solver {}...",
+				solver_id_hint
+			));
+			logging::verbose_operation("Local mode", &local.to_string());
+
+			let init_ops = InitOps::without_context();
+			let generated_path = init_ops.load_from_storage(solver_id, local).await?;
+
+			let env_type = if local {
+				"local mode"
+			} else {
+				"production mode"
+			};
+			logging::success(&format!("Configuration loaded from storage ({env_type})"));
+			logging::info_kv("Generated config", &generated_path.display().to_string());
+			logging::success("Session initialized");
+
+			if local {
+				logging::next_step("Start environment with 'oif-demo env start'");
+			}
+		},
 	}
 
 	Ok(())
@@ -160,7 +184,7 @@ async fn handle_config() -> Result<()> {
 		Err(_) => {
 			logging::warning("No configuration loaded");
 			logging::next_step(
-				"Create with 'oif-demo init new <path>' or load with 'oif-demo init load <path>'",
+				"Create with 'oif-demo init new <path>', load file with 'oif-demo init load <path>', or load storage with 'oif-demo init load-storage --solver-id <id>'",
 			);
 		},
 	}

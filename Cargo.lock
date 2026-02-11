@@ -5094,6 +5094,8 @@ dependencies = [
  "serde_json",
  "solver-account",
  "solver-config",
+ "solver-service",
+ "solver-storage",
  "solver-types",
  "sysinfo",
  "tempfile",
