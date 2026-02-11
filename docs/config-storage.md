@@ -104,8 +104,6 @@ The seed overrides specify which networks and tokens your solver will support (t
 | `REDIS_URL` | Yes | `redis://localhost:6379` | Redis connection URL |
 | `SOLVER_PRIVATE_KEY` | Yes | - | 64-character hex private key (without 0x prefix) |
 | `SOLVER_ID` | For loading | - | Solver ID to load from Redis (required when not seeding) |
-| `HEALTH_CACHE_TTL_MS` | No | `5000` | Health readiness cache TTL in milliseconds |
-| `HEALTH_CHECK_TIMEOUT_MS` | No | `2000` | Timeout per readiness check in milliseconds |
 
 **Note:** After seeding, the solver outputs the `SOLVER_ID` to use for subsequent runs. Set this environment variable before running without `--seed`.
 
