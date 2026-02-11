@@ -138,8 +138,7 @@ async fn handle_init(cmd: solver_demo::cli::commands::InitCommand) -> Result<()>
 		InitSubcommand::LoadStorage { solver_id, local } => {
 			let solver_id_hint = solver_id.clone().unwrap_or_else(|| "SOLVER_ID".to_string());
 			logging::operation_start(&format!(
-				"Loading configuration from storage for solver {}...",
-				solver_id_hint
+				"Loading configuration from storage for solver {solver_id_hint}..."
 			));
 			logging::verbose_operation("Local mode", &local.to_string());
 
