@@ -63,6 +63,58 @@ pub struct AppState {
 	pub signature_validation: Arc<SignatureValidationService>,
 }
 
+fn create_admin_storage_backend(
+	redis_url: String,
+) -> Result<std::sync::Arc<dyn solver_storage::StorageInterface>, Box<dyn std::error::Error>> {
+	create_storage_backend(StoreConfig::Redis { url: redis_url }).map_err(|e| {
+		tracing::error!("Failed to create admin storage backend: {}", e);
+		Box::new(std::io::Error::other(format!("Admin storage error: {e}")))
+			as Box<dyn std::error::Error>
+	})
+}
+
+fn create_admin_config_store(
+	admin_storage: std::sync::Arc<dyn solver_storage::StorageInterface>,
+	solver_id: &str,
+) -> Result<
+	Arc<dyn solver_storage::config_store::ConfigStore<OperatorConfig>>,
+	Box<dyn std::error::Error>,
+> {
+	if solver_id.is_empty() {
+		return Err(Box::new(std::io::Error::other(
+			"Config store error: solver ID cannot be empty",
+		)));
+	}
+
+	create_config_store::<OperatorConfig>(
+		StoreConfig::Storage(admin_storage),
+		format!("{solver_id}-operator"),
+	)
+	.map(Arc::from)
+	.map_err(|e| {
+		tracing::error!("Failed to create operator config store: {}", e);
+		Box::new(std::io::Error::other(format!("Config store error: {e}")))
+			as Box<dyn std::error::Error>
+	})
+}
+
+fn create_admin_nonce_store(
+	admin_storage: std::sync::Arc<dyn solver_storage::StorageInterface>,
+	solver_id: &str,
+	nonce_ttl_seconds: u64,
+) -> Result<solver_storage::nonce_store::NonceStore, Box<dyn std::error::Error>> {
+	create_nonce_store(
+		StoreConfig::Storage(admin_storage),
+		solver_id,
+		nonce_ttl_seconds,
+	)
+	.map_err(|e| {
+		tracing::error!("Failed to initialize admin nonce store: {}", e);
+		Box::new(std::io::Error::other(format!("Nonce store error: {e}")))
+			as Box<dyn std::error::Error>
+	})
+}
+
 /// Starts the HTTP server for the API.
 ///
 /// This function creates and configures the HTTP server with routing,
@@ -161,33 +213,10 @@ pub async fn start_server(
 				};
 
 				// Share one storage backend for all admin Redis operations.
-				let admin_storage = match create_storage_backend(StoreConfig::Redis {
-					url: redis_url.clone(),
-				}) {
-					Ok(storage) => storage,
-					Err(e) => {
-						tracing::error!("Failed to create admin storage backend: {}", e);
-						return Err(Box::new(std::io::Error::other(format!(
-							"Admin storage error: {e}"
-						))));
-					},
-				};
+				let admin_storage = create_admin_storage_backend(redis_url.clone())?;
 
 				// Create ConfigStore for OperatorConfig
-				let config_store: Arc<
-					dyn solver_storage::config_store::ConfigStore<OperatorConfig>,
-				> = match create_config_store::<OperatorConfig>(
-					StoreConfig::Storage(admin_storage.clone()),
-					format!("{solver_id}-operator"),
-				) {
-					Ok(store) => Arc::from(store),
-					Err(e) => {
-						tracing::error!("Failed to create operator config store: {}", e);
-						return Err(Box::new(std::io::Error::other(format!(
-							"Config store error: {e}"
-						))));
-					},
-				};
+				let config_store = create_admin_config_store(admin_storage.clone(), &solver_id)?;
 
 				// Seed OperatorConfig if it doesn't exist
 				match config_store.exists().await {
@@ -212,8 +241,8 @@ pub async fn start_server(
 				}
 
 				// Create nonce store (concrete NonceStore type, not a trait)
-				match create_nonce_store(
-					StoreConfig::Storage(admin_storage),
+				match create_admin_nonce_store(
+					admin_storage,
 					&solver_id,
 					admin_config.nonce_ttl_seconds,
 				) {
@@ -833,7 +862,7 @@ mod tests {
 	use solver_pricing::PricingService;
 	use solver_settlement::SettlementService;
 	use solver_storage::implementations::memory::MemoryStorage;
-	use solver_storage::StorageService;
+	use solver_storage::{create_storage_backend, StorageService, StoreConfig};
 	use solver_types::api::{
 		OifOrder, OrderPayload, PostOrderRequest, PostOrderResponse, PostOrderResponseStatus,
 		SignatureType,
@@ -1008,6 +1037,75 @@ mod tests {
 				..
 			})
 		));
+	}
+
+	#[test]
+	fn create_admin_storage_backend_returns_error_for_invalid_redis_url() {
+		let err = match super::create_admin_storage_backend(String::new()) {
+			Ok(_) => panic!("expected invalid redis URL to fail"),
+			Err(err) => err,
+		};
+		assert!(err.to_string().contains("Admin storage error"));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn create_admin_config_store_accepts_shared_storage_backend() {
+		let shared_storage =
+			create_storage_backend(StoreConfig::Memory).expect("expected memory backend");
+		let config_store = super::create_admin_config_store(shared_storage, "test-solver")
+			.expect("expected config store initialization");
+
+		assert!(!config_store
+			.exists()
+			.await
+			.expect("expected config store exists check to succeed"));
+	}
+
+	#[test]
+	fn create_admin_config_store_returns_error_for_empty_solver_id() {
+		let shared_storage =
+			create_storage_backend(StoreConfig::Memory).expect("expected memory backend");
+		let err = match super::create_admin_config_store(shared_storage, "") {
+			Ok(_) => panic!("expected empty solver ID to fail"),
+			Err(err) => err,
+		};
+		assert!(err.to_string().contains("Config store error"));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn create_admin_nonce_store_accepts_shared_storage_backend() {
+		let shared_storage =
+			create_storage_backend(StoreConfig::Memory).expect("expected memory backend");
+		let nonce_store = super::create_admin_nonce_store(shared_storage, "test-solver", 300)
+			.expect("expected nonce store initialization");
+
+		let nonce = nonce_store
+			.generate()
+			.await
+			.expect("expected nonce generation");
+		assert!(nonce_store
+			.exists(nonce)
+			.await
+			.expect("expected nonce existence check"));
+		nonce_store
+			.consume(nonce)
+			.await
+			.expect("expected nonce consume");
+		assert!(!nonce_store
+			.exists(nonce)
+			.await
+			.expect("expected nonce existence check after consume"));
+	}
+
+	#[test]
+	fn create_admin_nonce_store_returns_error_for_empty_solver_id() {
+		let shared_storage =
+			create_storage_backend(StoreConfig::Memory).expect("expected memory backend");
+		let err = match super::create_admin_nonce_store(shared_storage, "", 300) {
+			Ok(_) => panic!("expected empty solver ID to fail"),
+			Err(err) => err,
+		};
+		assert!(err.to_string().contains("Nonce store error"));
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
