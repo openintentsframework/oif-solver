@@ -1210,11 +1210,15 @@ impl QuoteGenerator {
 			.get_token_name(&alloy_token_address, chain_id)
 			.await
 			.unwrap_or_else(|_| "Unknown Token".to_string());
+		let token_version = self
+			.get_token_eip712_version(&alloy_token_address, chain_id)
+			.await;
 
 		// Build domain object similar to TheCompact structure (without pre-computed domainSeparator)
 		// The client will compute the domainSeparator using these fields
 		Ok(serde_json::json!({
 			"name": token_name,
+			"version": token_version,
 			"chainId": chain_id.to_string(),
 			"verifyingContract": format!("0x{:040x}", alloy_token_address)
 		}))
@@ -1258,6 +1262,161 @@ impl QuoteGenerator {
 			.map_err(|e| QuoteError::InvalidRequest(format!("Failed to decode token name: {e}")))?;
 
 		Ok(name)
+	}
+
+	/// Get token EIP-712 version with graceful fallbacks.
+	async fn get_token_eip712_version(
+		&self,
+		token_address: &alloy_primitives::Address,
+		chain_id: u64,
+	) -> String {
+		if let Ok(version) = self
+			.get_token_eip712_version_via_eip5267(token_address, chain_id)
+			.await
+		{
+			return version;
+		}
+
+		if let Ok(version) = self
+			.get_token_eip712_version_via_version_call(token_address, chain_id)
+			.await
+		{
+			return version;
+		}
+
+		if let Some(version) = self.get_known_eip3009_token_version(token_address, chain_id) {
+			return version;
+		}
+
+		tracing::warn!(
+			chain_id,
+			token_address = %format!("0x{:040x}", token_address),
+			"Falling back to default EIP-712 version '1' for EIP-3009 token"
+		);
+
+		"1".to_string()
+	}
+
+	/// Resolve token EIP-712 version from EIP-5267 `eip712Domain()`.
+	async fn get_token_eip712_version_via_eip5267(
+		&self,
+		token_address: &alloy_primitives::Address,
+		chain_id: u64,
+	) -> Result<String, QuoteError> {
+		use alloy_sol_types::{sol, SolCall};
+
+		sol! {
+			function eip712Domain() external view returns (
+				bytes1 fields,
+				string name,
+				string version,
+				uint256 chainId,
+				address verifyingContract,
+				bytes32 salt,
+				uint256[] extensions
+			);
+		}
+
+		let tx = solver_types::Transaction {
+			to: Some(solver_types::Address(token_address.0.to_vec())),
+			data: eip712DomainCall {}.abi_encode(),
+			value: alloy_primitives::U256::ZERO,
+			chain_id,
+			nonce: None,
+			gas_limit: None,
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+		};
+
+		let result = self
+			.delivery_service
+			.contract_call(chain_id, tx)
+			.await
+			.map_err(|e| {
+				QuoteError::InvalidRequest(format!("Failed to get token EIP-712 domain: {e}"))
+			})?;
+
+		let domain = eip712DomainCall::abi_decode_returns(&result).map_err(|e| {
+			QuoteError::InvalidRequest(format!("Failed to decode token EIP-712 domain: {e}"))
+		})?;
+		let version = domain.version;
+
+		if version.trim().is_empty() {
+			return Err(QuoteError::InvalidRequest(
+				"Token EIP-712 version is empty".to_string(),
+			));
+		}
+
+		Ok(version)
+	}
+
+	/// Resolve token EIP-712 version from ERC20-like `version()` function.
+	async fn get_token_eip712_version_via_version_call(
+		&self,
+		token_address: &alloy_primitives::Address,
+		chain_id: u64,
+	) -> Result<String, QuoteError> {
+		use alloy_sol_types::{sol, SolCall};
+
+		sol! {
+			function version() external view returns (string);
+		}
+
+		let tx = solver_types::Transaction {
+			to: Some(solver_types::Address(token_address.0.to_vec())),
+			data: versionCall {}.abi_encode(),
+			value: alloy_primitives::U256::ZERO,
+			chain_id,
+			nonce: None,
+			gas_limit: None,
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+		};
+
+		let result = self
+			.delivery_service
+			.contract_call(chain_id, tx)
+			.await
+			.map_err(|e| {
+				QuoteError::InvalidRequest(format!("Failed to get token version(): {e}"))
+			})?;
+
+		let version = versionCall::abi_decode_returns(&result).map_err(|e| {
+			QuoteError::InvalidRequest(format!("Failed to decode token version(): {e}"))
+		})?;
+
+		if version.trim().is_empty() {
+			return Err(QuoteError::InvalidRequest(
+				"Token version() returned empty string".to_string(),
+			));
+		}
+
+		Ok(version)
+	}
+
+	/// Known EIP-3009 token versions for offline/testing fallbacks.
+	fn get_known_eip3009_token_version(
+		&self,
+		token_address: &alloy_primitives::Address,
+		chain_id: u64,
+	) -> Option<String> {
+		let token_hex = format!("0x{:040x}", token_address).to_ascii_lowercase();
+
+		match (chain_id, token_hex.as_str()) {
+			(1, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
+			| (10, "0x0b2c639c533813f4aa9d7837caf62653d097ff85")
+			| (137, "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359")
+			| (8453, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913")
+			| (42161, "0xaf88d065e77c8cc2239327c5edb3a432268e5831")
+			| (84532, "0x036cbd53842c5426634e7929541ec2318f3dcf7e")
+			| (421614, "0x75faf114eafb1bdbe2f0316df893fd58ce46aa4d")
+			| (11155111, "0x1c7d4b196cb0c7b01d743fbc6116a902379c7238")
+			| (11155420, "0x5fd84259d66cd46123540766be93dfe6d43130d7")
+			| (11155420, "0x191688b2ff5be8f0a5bcab3e819c900a810faaf6") => Some("2".to_string()),
+			_ => None,
+		}
 	}
 
 	/// Build structured domain object for Permit2
@@ -1474,6 +1633,7 @@ impl QuoteGenerator {
 		serde_json::json!({
 			"EIP712Domain": [
 				{"name": "name", "type": "string"},
+				{"name": "version", "type": "string"},
 				{"name": "chainId", "type": "uint256"},
 				{"name": "verifyingContract", "type": "address"}
 			],
@@ -1519,9 +1679,11 @@ impl QuoteGenerator {
 mod tests {
 	use super::*;
 	use crate::apis::quote::custody::CustodyDecision;
-	use alloy_primitives::address;
-	use alloy_primitives::U256;
+	use alloy_primitives::{address, Address as AlloyAddress, Bytes, FixedBytes, U256};
 	use solver_config::{ApiConfig, Config, ConfigBuilder, QuoteConfig, SettlementConfig};
+	use solver_delivery::{
+		DeliveryError, DeliveryInterface, DeliveryService, MockDeliveryInterface,
+	};
 	use solver_settlement::{MockSettlementInterface, SettlementInterface};
 	use solver_types::{
 		oif_versions, parse_address,
@@ -2403,6 +2565,20 @@ mod tests {
 		QuoteGenerator::new(settlement_service, delivery_service)
 	}
 
+	fn create_test_generator_with_mock_delivery(
+		chain_id: u64,
+		mock_delivery: MockDeliveryInterface,
+	) -> QuoteGenerator {
+		let settlement_service = create_test_settlement_service(true);
+		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+		implementations.insert(
+			chain_id,
+			Arc::new(mock_delivery) as Arc<dyn DeliveryInterface>,
+		);
+		let delivery_service = Arc::new(DeliveryService::new(implementations, 1, 60));
+		QuoteGenerator::new(settlement_service, delivery_service)
+	}
+
 	fn create_exact_input_request(
 		input_amount: Option<&str>,
 		output_amount: Option<&str>,
@@ -2811,6 +2987,10 @@ mod tests {
 		// Verify all required types are present
 		assert!(types_obj.contains_key("EIP712Domain"));
 		assert!(types_obj.contains_key("ReceiveWithAuthorization"));
+		let domain_type = types_obj["EIP712Domain"].as_array().unwrap();
+		assert_eq!(domain_type.len(), 4);
+		assert_eq!(domain_type[1]["name"], "version");
+		assert_eq!(domain_type[1]["type"], "string");
 
 		// Verify ReceiveWithAuthorization structure
 		let receive_auth_type = &types_obj["ReceiveWithAuthorization"];
@@ -2873,20 +3053,323 @@ mod tests {
 		let result = generator
 			.build_eip3009_domain_object(&token_address, 1)
 			.await;
+		assert!(result.is_ok());
+		let domain = result.unwrap();
+		assert!(domain.is_object());
+		let domain_obj = domain.as_object().unwrap();
+		assert!(domain_obj.contains_key("name"));
+		assert_eq!(domain_obj["version"], "1");
+		assert_eq!(domain_obj["chainId"], "1");
+		assert!(domain_obj.contains_key("verifyingContract"));
+	}
 
-		match result {
-			Ok(domain) => {
-				assert!(domain.is_object());
-				let domain_obj = domain.as_object().unwrap();
-				assert!(domain_obj.contains_key("name"));
-				assert_eq!(domain_obj["chainId"], "1");
-				assert!(domain_obj.contains_key("verifyingContract"));
-			},
-			Err(e) => {
-				// Expected if token name call fails
-				assert!(matches!(e, QuoteError::InvalidRequest(_)));
-			},
+	#[tokio::test]
+	async fn test_get_token_eip712_version_uses_eip5267() {
+		use alloy_sol_types::{sol, SolCall};
+
+		sol! {
+			function eip712Domain() external view returns (
+				bytes1 fields,
+				string name,
+				string version,
+				uint256 chainId,
+				address verifyingContract,
+				bytes32 salt,
+				uint256[] extensions
+			);
 		}
+
+		let eip712_selector = eip712DomainCall {}.abi_encode()[0..4].to_vec();
+		let eip712_response =
+			Bytes::from(eip712DomainCall::abi_encode_returns(&eip712DomainReturn {
+				fields: FixedBytes::<1>::from([0x1]),
+				name: "USD Coin".to_string(),
+				version: "2".to_string(),
+				chainId: U256::from(1u64),
+				verifyingContract: AlloyAddress::from([0x11; 20]),
+				salt: FixedBytes::<32>::from([0u8; 32]),
+				extensions: Vec::<U256>::new(),
+			}));
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_eth_call()
+			.times(1)
+			.returning(move |tx| {
+				let is_expected_selector = tx.data.starts_with(&eip712_selector);
+				assert!(
+					is_expected_selector,
+					"unexpected selector for eip712Domain()"
+				);
+				let response = eip712_response.clone();
+				Box::pin(async move { Ok(response) })
+			});
+
+		let generator = create_test_generator_with_mock_delivery(1, mock_delivery);
+		let token_address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+		let version = generator.get_token_eip712_version(&token_address, 1).await;
+
+		assert_eq!(version, "2");
+	}
+
+	#[tokio::test]
+	async fn test_get_token_eip712_version_falls_back_to_version_call() {
+		use alloy_sol_types::{sol, SolCall};
+
+		sol! {
+			function eip712Domain() external view returns (
+				bytes1 fields,
+				string name,
+				string version,
+				uint256 chainId,
+				address verifyingContract,
+				bytes32 salt,
+				uint256[] extensions
+			);
+			function version() external view returns (string);
+		}
+
+		let eip712_selector = eip712DomainCall {}.abi_encode()[0..4].to_vec();
+		let version_selector = versionCall {}.abi_encode()[0..4].to_vec();
+		let version_response = Bytes::from(versionCall::abi_encode_returns(&"7".to_string()));
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_eth_call()
+			.times(2)
+			.returning(move |tx| {
+				let is_eip712_selector = tx.data.starts_with(&eip712_selector);
+				let is_version_selector = tx.data.starts_with(&version_selector);
+				assert!(
+					is_eip712_selector || is_version_selector,
+					"unexpected selector"
+				);
+				let version_response = version_response.clone();
+				Box::pin(async move {
+					if is_eip712_selector {
+						Err(DeliveryError::Network(
+							"eip712Domain() not available".to_string(),
+						))
+					} else {
+						Ok(version_response)
+					}
+				})
+			});
+
+		let generator = create_test_generator_with_mock_delivery(1, mock_delivery);
+		let token_address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+		let version = generator.get_token_eip712_version(&token_address, 1).await;
+
+		assert_eq!(version, "7");
+	}
+
+	#[tokio::test]
+	async fn test_get_token_eip712_version_falls_back_to_known_registry() {
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_eth_call().times(2).returning(|_| {
+			Box::pin(async {
+				Err(DeliveryError::Network(
+					"version lookups unavailable".to_string(),
+				))
+			})
+		});
+
+		let generator = create_test_generator_with_mock_delivery(1, mock_delivery);
+		let token_address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+		let version = generator.get_token_eip712_version(&token_address, 1).await;
+
+		assert_eq!(version, "2");
+	}
+
+	#[tokio::test]
+	async fn test_get_token_eip712_version_via_eip5267_decode_error() {
+		use alloy_sol_types::{sol, SolCall};
+
+		sol! {
+			function eip712Domain() external view returns (
+				bytes1 fields,
+				string name,
+				string version,
+				uint256 chainId,
+				address verifyingContract,
+				bytes32 salt,
+				uint256[] extensions
+			);
+		}
+
+		let eip712_selector = eip712DomainCall {}.abi_encode()[0..4].to_vec();
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_eth_call()
+			.times(1)
+			.returning(move |tx| {
+				assert!(tx.data.starts_with(&eip712_selector));
+				Box::pin(async move { Ok(Bytes::from(vec![0u8; 4])) })
+			});
+
+		let generator = create_test_generator_with_mock_delivery(1, mock_delivery);
+		let token_address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+		let result = generator
+			.get_token_eip712_version_via_eip5267(&token_address, 1)
+			.await;
+
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(msg)) if msg.contains("decode token EIP-712 domain"))
+		);
+	}
+
+	#[tokio::test]
+	async fn test_get_token_eip712_version_via_eip5267_empty_version() {
+		use alloy_sol_types::{sol, SolCall};
+
+		sol! {
+			function eip712Domain() external view returns (
+				bytes1 fields,
+				string name,
+				string version,
+				uint256 chainId,
+				address verifyingContract,
+				bytes32 salt,
+				uint256[] extensions
+			);
+		}
+
+		let eip712_selector = eip712DomainCall {}.abi_encode()[0..4].to_vec();
+		let eip712_response =
+			Bytes::from(eip712DomainCall::abi_encode_returns(&eip712DomainReturn {
+				fields: FixedBytes::<1>::from([0x1]),
+				name: "USD Coin".to_string(),
+				version: "".to_string(),
+				chainId: U256::from(1u64),
+				verifyingContract: AlloyAddress::from([0x11; 20]),
+				salt: FixedBytes::<32>::from([0u8; 32]),
+				extensions: Vec::<U256>::new(),
+			}));
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_eth_call()
+			.times(1)
+			.returning(move |tx| {
+				assert!(tx.data.starts_with(&eip712_selector));
+				let response = eip712_response.clone();
+				Box::pin(async move { Ok(response) })
+			});
+
+		let generator = create_test_generator_with_mock_delivery(1, mock_delivery);
+		let token_address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+		let result = generator
+			.get_token_eip712_version_via_eip5267(&token_address, 1)
+			.await;
+
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(msg)) if msg.contains("version is empty"))
+		);
+	}
+
+	#[tokio::test]
+	async fn test_get_token_eip712_version_via_version_call_decode_error() {
+		use alloy_sol_types::{sol, SolCall};
+
+		sol! {
+			function version() external view returns (string);
+		}
+
+		let version_selector = versionCall {}.abi_encode()[0..4].to_vec();
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_eth_call()
+			.times(1)
+			.returning(move |tx| {
+				assert!(tx.data.starts_with(&version_selector));
+				Box::pin(async move { Ok(Bytes::from(vec![0u8; 4])) })
+			});
+
+		let generator = create_test_generator_with_mock_delivery(1, mock_delivery);
+		let token_address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+		let result = generator
+			.get_token_eip712_version_via_version_call(&token_address, 1)
+			.await;
+
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(msg)) if msg.contains("decode token version()"))
+		);
+	}
+
+	#[tokio::test]
+	async fn test_get_token_eip712_version_via_version_call_empty_string() {
+		use alloy_sol_types::{sol, SolCall};
+
+		sol! {
+			function version() external view returns (string);
+		}
+
+		let version_selector = versionCall {}.abi_encode()[0..4].to_vec();
+		let version_response = Bytes::from(versionCall::abi_encode_returns(&"".to_string()));
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_eth_call()
+			.times(1)
+			.returning(move |tx| {
+				assert!(tx.data.starts_with(&version_selector));
+				let response = version_response.clone();
+				Box::pin(async move { Ok(response) })
+			});
+
+		let generator = create_test_generator_with_mock_delivery(1, mock_delivery);
+		let token_address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+		let result = generator
+			.get_token_eip712_version_via_version_call(&token_address, 1)
+			.await;
+
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(msg)) if msg.contains("returned empty string"))
+		);
+	}
+
+	#[test]
+	fn test_get_known_eip3009_token_version_supported_mappings() {
+		let generator = create_test_generator();
+
+		let known_tokens = vec![
+			(1, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+			(10, "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"),
+			(137, "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"),
+			(8453, "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+			(42161, "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"),
+			(84532, "0x036CbD53842c5426634e7929541eC2318f3dCF7e"),
+			(421614, "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d"),
+			(11155111, "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"),
+			(11155420, "0x5fd84259d66Cd46123540766Be93DFE6D43130D7"),
+			(11155420, "0x191688b2ff5be8f0a5bcab3e819c900a810faaf6"),
+		];
+
+		for (chain_id, token) in known_tokens {
+			let parsed: AlloyAddress = token.parse().unwrap();
+			assert_eq!(
+				generator.get_known_eip3009_token_version(&parsed, chain_id),
+				Some("2".to_string())
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn test_get_token_eip712_version_falls_back_to_default() {
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_eth_call().times(2).returning(|_| {
+			Box::pin(async {
+				Err(DeliveryError::Network(
+					"version lookups unavailable".to_string(),
+				))
+			})
+		});
+
+		let generator = create_test_generator_with_mock_delivery(1, mock_delivery);
+		let token_address = address!("1111111111111111111111111111111111111111");
+		let version = generator.get_token_eip712_version(&token_address, 1).await;
+
+		assert_eq!(version, "1");
 	}
 
 	#[tokio::test]

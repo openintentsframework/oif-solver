@@ -627,6 +627,7 @@ pub fn reconstruct_eip3009_digest(
 		.get("verifyingContract")
 		.and_then(|v| v.as_str())
 		.ok_or("Missing verifyingContract")?;
+	let version = domain.get("version").and_then(|v| v.as_str());
 
 	// Extract message fields
 	let from_str = message
@@ -669,18 +670,34 @@ pub fn reconstruct_eip3009_digest(
 		FixedBytes::<32>::from(provided_domain_separator)
 	} else {
 		// Fallback: compute domain separator
-		let domain_type_hash = keccak256(
-			"EIP712Domain(string name,uint256 chainId,address verifyingContract)".as_bytes(),
-		);
 		let name_hash = keccak256(name.as_bytes());
 		let contract = hex_to_alloy_address(verifying_contract)?;
 
-		let mut domain_encoder = Eip712AbiEncoder::new();
-		domain_encoder.push_b256(&domain_type_hash);
-		domain_encoder.push_b256(&name_hash);
-		domain_encoder.push_u256(U256::from(chain_id));
-		domain_encoder.push_address(&contract);
-		keccak256(domain_encoder.finish())
+		if let Some(version) = version {
+			let domain_type_hash = keccak256(
+				"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+					.as_bytes(),
+			);
+			let version_hash = keccak256(version.as_bytes());
+
+			let mut domain_encoder = Eip712AbiEncoder::new();
+			domain_encoder.push_b256(&domain_type_hash);
+			domain_encoder.push_b256(&name_hash);
+			domain_encoder.push_b256(&version_hash);
+			domain_encoder.push_u256(U256::from(chain_id));
+			domain_encoder.push_address(&contract);
+			keccak256(domain_encoder.finish())
+		} else {
+			let domain_type_hash = keccak256(
+				"EIP712Domain(string name,uint256 chainId,address verifyingContract)".as_bytes(),
+			);
+			let mut domain_encoder = Eip712AbiEncoder::new();
+			domain_encoder.push_b256(&domain_type_hash);
+			domain_encoder.push_b256(&name_hash);
+			domain_encoder.push_u256(U256::from(chain_id));
+			domain_encoder.push_address(&contract);
+			keccak256(domain_encoder.finish())
+		}
 	};
 
 	// Compute struct hash for ReceiveWithAuthorization
@@ -1257,6 +1274,83 @@ mod tests {
 		// The result should be deterministic
 		let result2 = reconstruct_eip3009_digest(&payload, Some(domain_separator));
 		assert_eq!(result.unwrap(), result2.unwrap());
+	}
+
+	#[test]
+	fn test_reconstruct_eip3009_digest_with_domain_version_in_fallback() {
+		use crate::api::OrderPayload;
+		use serde_json::json;
+
+		let payload = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!({
+				"name": "USD Coin",
+				"version": "2",
+				"chainId": "1",
+				"verifyingContract": "0xA0b86a33E6441E13C7D3fE1D5D8B6C8A9A8E8E8E"
+			}),
+			primary_type: "ReceiveWithAuthorization".to_string(),
+			message: json!({
+				"from": "0x1234567890123456789012345678901234567890",
+				"to": "0x0987654321098765432109876543210987654321",
+				"value": "1000000000000000000",
+				"validAfter": 0,
+				"validBefore": 0,
+				"nonce": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+			}),
+			types: None,
+		};
+
+		let result = reconstruct_eip3009_digest(&payload, None);
+		assert!(result.is_ok());
+
+		let result2 = reconstruct_eip3009_digest(&payload, None);
+		assert_eq!(result.unwrap(), result2.unwrap());
+	}
+
+	#[test]
+	fn test_reconstruct_eip3009_digest_differs_when_version_present() {
+		use crate::api::OrderPayload;
+		use serde_json::json;
+
+		let base_message = json!({
+			"from": "0x1234567890123456789012345678901234567890",
+			"to": "0x0987654321098765432109876543210987654321",
+			"value": "1000000000000000000",
+			"validAfter": 0,
+			"validBefore": 0,
+			"nonce": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+		});
+
+		let payload_without_version = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!({
+				"name": "USD Coin",
+				"chainId": "1",
+				"verifyingContract": "0xA0b86a33E6441E13C7D3fE1D5D8B6C8A9A8E8E8E"
+			}),
+			primary_type: "ReceiveWithAuthorization".to_string(),
+			message: base_message.clone(),
+			types: None,
+		};
+
+		let payload_with_version = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!({
+				"name": "USD Coin",
+				"version": "2",
+				"chainId": "1",
+				"verifyingContract": "0xA0b86a33E6441E13C7D3fE1D5D8B6C8A9A8E8E8E"
+			}),
+			primary_type: "ReceiveWithAuthorization".to_string(),
+			message: base_message,
+			types: None,
+		};
+
+		let without_version = reconstruct_eip3009_digest(&payload_without_version, None).unwrap();
+		let with_version = reconstruct_eip3009_digest(&payload_with_version, None).unwrap();
+
+		assert_ne!(without_version, with_version);
 	}
 
 	#[test]
