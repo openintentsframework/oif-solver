@@ -279,6 +279,10 @@ components:
     TokenRequest:
       type: object
       description: Request payload for client credentials token issuance
+      required:
+        - grant_type
+        - client_id
+        - client_secret
       properties:
         grant_type:
           type: string

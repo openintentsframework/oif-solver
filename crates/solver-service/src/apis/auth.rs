@@ -603,7 +603,7 @@ fn parse_scopes(scopes: Option<Vec<String>>) -> Result<Vec<AuthScope>, String> {
 /// Parse scopes for public self-registration flow (admin scope not allowed).
 fn parse_public_scopes(scopes: Option<Vec<String>>) -> Result<Vec<AuthScope>, String> {
 	let scopes = parse_scopes(scopes)?;
-	if scopes.iter().any(|scope| *scope == AuthScope::AdminAll) {
+	if scopes.contains(&AuthScope::AdminAll) {
 		return Err("admin-all scope is not allowed on /auth/register".to_string());
 	}
 	Ok(scopes)
@@ -1348,5 +1348,216 @@ mod tests {
 		assert_eq!(deserialized.token_type, "Bearer");
 		assert_eq!(deserialized.scope, "admin-all");
 		assert_eq!(deserialized.expires_in, 900);
+	}
+
+	// Tests for helper functions
+	#[test]
+	fn test_extract_source_ip_from_x_forwarded_for() {
+		let mut headers = HeaderMap::new();
+		headers.insert("x-forwarded-for", HeaderValue::from_static("192.168.1.1, 10.0.0.1"));
+		assert_eq!(super::extract_source_ip(&headers), "192.168.1.1");
+	}
+
+	#[test]
+	fn test_extract_source_ip_from_x_real_ip() {
+		let mut headers = HeaderMap::new();
+		headers.insert("x-real-ip", HeaderValue::from_static("10.0.0.5"));
+		assert_eq!(super::extract_source_ip(&headers), "10.0.0.5");
+	}
+
+	#[test]
+	fn test_extract_source_ip_unknown_when_missing() {
+		let headers = HeaderMap::new();
+		assert_eq!(super::extract_source_ip(&headers), "unknown");
+	}
+
+	#[test]
+	fn test_extract_basic_credentials_valid() {
+		let mut headers = HeaderMap::new();
+		let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
+		headers.insert(
+			"authorization",
+			HeaderValue::from_str(&format!("Basic {encoded}")).unwrap(),
+		);
+		let result = super::extract_basic_credentials(&headers);
+		assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
+	}
+
+	#[test]
+	fn test_extract_basic_credentials_missing_header() {
+		let headers = HeaderMap::new();
+		assert_eq!(super::extract_basic_credentials(&headers), None);
+	}
+
+	#[test]
+	fn test_extract_basic_credentials_invalid_base64() {
+		let mut headers = HeaderMap::new();
+		headers.insert("authorization", HeaderValue::from_static("Basic !!!invalid!!!"));
+		assert_eq!(super::extract_basic_credentials(&headers), None);
+	}
+
+	#[test]
+	fn test_extract_basic_credentials_no_colon() {
+		let mut headers = HeaderMap::new();
+		let encoded = base64::engine::general_purpose::STANDARD.encode("nocolon");
+		headers.insert(
+			"authorization",
+			HeaderValue::from_str(&format!("Basic {encoded}")).unwrap(),
+		);
+		assert_eq!(super::extract_basic_credentials(&headers), None);
+	}
+
+	#[test]
+	fn test_extract_basic_credentials_empty_user() {
+		let mut headers = HeaderMap::new();
+		let encoded = base64::engine::general_purpose::STANDARD.encode(":password");
+		headers.insert(
+			"authorization",
+			HeaderValue::from_str(&format!("Basic {encoded}")).unwrap(),
+		);
+		assert_eq!(super::extract_basic_credentials(&headers), None);
+	}
+
+	#[test]
+	fn test_secrets_match_equal() {
+		assert!(super::secrets_match("secret123", "secret123"));
+	}
+
+	#[test]
+	fn test_secrets_match_different_length() {
+		assert!(!super::secrets_match("short", "longer_secret"));
+	}
+
+	#[test]
+	fn test_secrets_match_different_content() {
+		assert!(!super::secrets_match("secret123", "secret456"));
+	}
+
+	#[test]
+	fn test_prune_old_attempts_removes_expired() {
+		let mut attempts = VecDeque::from([100, 200, 300]);
+		super::prune_old_attempts(&mut attempts, 400);
+		// All entries older than 400 - 60 = 340 should be removed
+		assert_eq!(attempts.len(), 0);
+	}
+
+	#[test]
+	fn test_prune_old_attempts_keeps_recent() {
+		let mut attempts = VecDeque::from([350, 360, 370]);
+		super::prune_old_attempts(&mut attempts, 400);
+		// All entries are within 60 seconds of now
+		assert_eq!(attempts.len(), 3);
+	}
+
+	#[tokio::test]
+	async fn test_issue_client_token_missing_credentials() {
+		FAILED_AUTH_BY_CLIENT.clear();
+		FAILED_AUTH_BY_IP.clear();
+
+		let jwt_service = create_test_jwt_service_with(
+			true,
+			false,
+			"solver-admin",
+			Some("test-client-secret-at-least-32-chars"),
+		);
+		let headers = HeaderMap::new();
+		let request = TokenRequest {
+			grant_type: Some("client_credentials".to_string()),
+			client_id: None,
+			client_secret: None,
+			scope: Some("admin-all".to_string()),
+		};
+
+		let response = issue_client_token(
+			axum::extract::State(Some(jwt_service)),
+			headers,
+			Json(request),
+		)
+		.await;
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
+
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "invalid_client");
+	}
+
+	#[tokio::test]
+	async fn test_issue_client_token_unsupported_grant_type() {
+		FAILED_AUTH_BY_CLIENT.clear();
+		FAILED_AUTH_BY_IP.clear();
+
+		let jwt_service = create_test_jwt_service_with(
+			true,
+			false,
+			"solver-admin",
+			Some("test-client-secret-at-least-32-chars"),
+		);
+		let headers = HeaderMap::new();
+		let request = TokenRequest {
+			grant_type: Some("password".to_string()),
+			client_id: Some("solver-admin".to_string()),
+			client_secret: Some("test-client-secret-at-least-32-chars".to_string()),
+			scope: Some("admin-all".to_string()),
+		};
+
+		let response = issue_client_token(
+			axum::extract::State(Some(jwt_service)),
+			headers,
+			Json(request),
+		)
+		.await;
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "unsupported_grant_type");
+	}
+
+	#[tokio::test]
+	async fn test_issue_client_token_no_secret_configured() {
+		FAILED_AUTH_BY_CLIENT.clear();
+		FAILED_AUTH_BY_IP.clear();
+
+		let jwt_service = create_test_jwt_service_with(true, false, "solver-admin", None);
+		let headers = HeaderMap::new();
+		let request = TokenRequest {
+			grant_type: Some("client_credentials".to_string()),
+			client_id: Some("solver-admin".to_string()),
+			client_secret: Some("some-secret".to_string()),
+			scope: Some("admin-all".to_string()),
+		};
+
+		let response = issue_client_token(
+			axum::extract::State(Some(jwt_service)),
+			headers,
+			Json(request),
+		)
+		.await;
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
+
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(
+			json_body["error"],
+			"Client credentials authentication is not configured"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_issue_client_token_no_jwt_service() {
+		let headers = HeaderMap::new();
+		let request = TokenRequest::default();
+
+		let response =
+			issue_client_token(axum::extract::State(None), headers, Json(request)).await;
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
+
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "Authentication service is not configured");
 	}
 }
