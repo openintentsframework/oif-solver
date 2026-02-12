@@ -1354,7 +1354,10 @@ mod tests {
 	#[test]
 	fn test_extract_source_ip_from_x_forwarded_for() {
 		let mut headers = HeaderMap::new();
-		headers.insert("x-forwarded-for", HeaderValue::from_static("192.168.1.1, 10.0.0.1"));
+		headers.insert(
+			"x-forwarded-for",
+			HeaderValue::from_static("192.168.1.1, 10.0.0.1"),
+		);
 		assert_eq!(super::extract_source_ip(&headers), "192.168.1.1");
 	}
 
@@ -1392,7 +1395,10 @@ mod tests {
 	#[test]
 	fn test_extract_basic_credentials_invalid_base64() {
 		let mut headers = HeaderMap::new();
-		headers.insert("authorization", HeaderValue::from_static("Basic !!!invalid!!!"));
+		headers.insert(
+			"authorization",
+			HeaderValue::from_static("Basic !!!invalid!!!"),
+		);
 		assert_eq!(super::extract_basic_credentials(&headers), None);
 	}
 
@@ -1551,13 +1557,15 @@ mod tests {
 		let headers = HeaderMap::new();
 		let request = TokenRequest::default();
 
-		let response =
-			issue_client_token(axum::extract::State(None), headers, Json(request)).await;
+		let response = issue_client_token(axum::extract::State(None), headers, Json(request)).await;
 		let response_obj = response.into_response();
 		let (parts, body) = response_obj.into_parts();
 		assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
 
 		let json_body = extract_json_from_body(body).await;
-		assert_eq!(json_body["error"], "Authentication service is not configured");
+		assert_eq!(
+			json_body["error"],
+			"Authentication service is not configured"
+		);
 	}
 }
