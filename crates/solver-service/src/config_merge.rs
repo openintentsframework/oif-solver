@@ -138,7 +138,10 @@ pub fn merge_config(overrides: SeedOverrides, seed: &SeedConfig) -> Result<Confi
 		order: build_order_config(&seed.defaults),
 		settlement: build_settlement_config(&chain_ids, seed),
 		pricing: Some(build_pricing_config(&seed.defaults)),
-		api: Some(build_api_config(overrides.admin.as_ref(), overrides.auth_enabled)),
+		api: Some(build_api_config(
+			overrides.admin.as_ref(),
+			overrides.auth_enabled,
+		)),
 		gas: Some(build_gas_config(&seed.defaults)),
 	};
 
