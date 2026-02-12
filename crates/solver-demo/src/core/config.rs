@@ -53,8 +53,28 @@ impl Config {
 			return Err(Error::ConfigNotFound(path.to_path_buf()));
 		}
 
-		// Use SolverFullConfig::from_file to properly handle includes
-		let full_config = SolverFullConfig::from_file(path.to_str().unwrap()).await?;
+		let is_json = path
+			.extension()
+			.and_then(|ext| ext.to_str())
+			.is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+
+		let full_config = if is_json {
+			let content = std::fs::read_to_string(path).map_err(|e| {
+				Error::InvalidConfig(format!(
+					"Failed to read JSON config {}: {e}",
+					path.display()
+				))
+			})?;
+			serde_json::from_str::<SolverFullConfig>(&content).map_err(|e| {
+				Error::InvalidConfig(format!(
+					"Invalid JSON config format in {}: {e}",
+					path.display()
+				))
+			})?
+		} else {
+			// Use SolverFullConfig::from_file to properly handle includes
+			SolverFullConfig::from_file(path.to_str().unwrap()).await?
+		};
 
 		// Extract networks from the full config
 		let mut networks = HashMap::new();

@@ -510,20 +510,23 @@ fn build_storage_config_from_operator(solver_id: &str) -> StorageConfig {
 
 	// Redis implementation config
 	// Use solver_id as key_prefix to isolate storage per solver instance
-	let redis_config = toml_table(vec![
-		("redis_url", toml::Value::String(redis_url)),
-		("key_prefix", toml::Value::String(solver_id.to_string())),
-		("connection_timeout_ms", toml::Value::Integer(5000)),
-		("ttl_orders", toml::Value::Integer(0)),
-		("ttl_intents", toml::Value::Integer(86400)),
-		("ttl_order_by_tx_hash", toml::Value::Integer(86400)),
+	let redis_config = json_object(vec![
+		("redis_url", serde_json::Value::String(redis_url)),
+		(
+			"key_prefix",
+			serde_json::Value::String(solver_id.to_string()),
+		),
+		("connection_timeout_ms", int(5000)),
+		("ttl_orders", int(0)),
+		("ttl_intents", int(86400)),
+		("ttl_order_by_tx_hash", int(86400)),
 	]);
 	implementations.insert("redis".to_string(), redis_config);
 
 	// Memory implementation (fallback for testing)
 	implementations.insert(
 		"memory".to_string(),
-		toml::Value::Table(toml::map::Map::new()),
+		serde_json::Value::Object(serde_json::Map::new()),
 	);
 
 	StorageConfig {
@@ -537,14 +540,10 @@ fn build_storage_config_from_operator(solver_id: &str) -> StorageConfig {
 fn build_delivery_config_from_operator(chain_ids: &[u64]) -> DeliveryConfig {
 	let mut implementations = HashMap::new();
 
-	let network_ids_array = toml::Value::Array(
-		chain_ids
-			.iter()
-			.map(|id| toml::Value::Integer(*id as i64))
-			.collect(),
-	);
+	let network_ids_array =
+		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect());
 
-	let evm_alloy_config = toml_table(vec![("network_ids", network_ids_array)]);
+	let evm_alloy_config = json_object(vec![("network_ids", network_ids_array)]);
 	implementations.insert("evm_alloy".to_string(), evm_alloy_config);
 
 	DeliveryConfig {
@@ -570,8 +569,8 @@ fn build_account_config_from_operator(
 		let mut implementations = HashMap::new();
 
 		for (name, json_value) in &config.implementations {
-			let toml_value = json_to_toml(json_value);
-			implementations.insert(name.clone(), toml_value);
+			let impl_value = json_identity(json_value);
+			implementations.insert(name.clone(), impl_value);
 		}
 
 		return AccountConfig {
@@ -589,7 +588,10 @@ fn build_account_config_from_operator(
 		.map(|k| k.trim().to_string())
 		.unwrap_or_else(|_| "${SOLVER_PRIVATE_KEY}".to_string());
 
-	let local_config = toml_table(vec![("private_key", toml::Value::String(private_key))]);
+	let local_config = json_object(vec![(
+		"private_key",
+		serde_json::Value::String(private_key),
+	)]);
 	implementations.insert("local".to_string(), local_config);
 
 	AccountConfig {
@@ -602,24 +604,20 @@ fn build_account_config_from_operator(
 fn build_discovery_config_from_operator(chain_ids: &[u64]) -> DiscoveryConfig {
 	let mut implementations = HashMap::new();
 
-	let network_ids_array = toml::Value::Array(
-		chain_ids
-			.iter()
-			.map(|id| toml::Value::Integer(*id as i64))
-			.collect(),
-	);
+	let network_ids_array =
+		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect());
 
 	// Onchain discovery - polls chain for new orders
-	let onchain_config = toml_table(vec![
+	let onchain_config = json_object(vec![
 		("network_ids", network_ids_array.clone()),
-		("polling_interval_secs", toml::Value::Integer(5)),
+		("polling_interval_secs", int(5)),
 	]);
 	implementations.insert("onchain_eip7683".to_string(), onchain_config);
 
 	// Offchain discovery - receives orders via HTTP API from aggregators
-	let offchain_config = toml_table(vec![
-		("api_host", toml::Value::String("0.0.0.0".to_string())),
-		("api_port", toml::Value::Integer(8081)),
+	let offchain_config = json_object(vec![
+		("api_host", serde_json::Value::String("0.0.0.0".to_string())),
+		("api_port", int(8081)),
 		("network_ids", network_ids_array),
 	]);
 	implementations.insert("offchain_eip7683".to_string(), offchain_config);
@@ -634,13 +632,12 @@ fn build_order_config_from_operator() -> OrderConfig {
 	// EIP-7683 order implementation
 	implementations.insert(
 		"eip7683".to_string(),
-		toml::Value::Table(toml::map::Map::new()),
+		serde_json::Value::Object(serde_json::Map::new()),
 	);
 
 	// Strategy implementations
 	let mut strategy_implementations = HashMap::new();
-	let simple_strategy_config =
-		toml_table(vec![("max_gas_price_gwei", toml::Value::Integer(100))]);
+	let simple_strategy_config = json_object(vec![("max_gas_price_gwei", int(100))]);
 	strategy_implementations.insert("simple".to_string(), simple_strategy_config);
 
 	OrderConfig {
@@ -662,7 +659,7 @@ fn build_settlement_config_from_operator(operator_config: &OperatorConfig) -> Se
 	let hyperlane = &operator_config.settlement.hyperlane;
 	let chain_ids: Vec<u64> = operator_config.networks.keys().copied().collect();
 
-	let hyperlane_config = build_hyperlane_toml_from_operator(hyperlane, &chain_ids);
+	let hyperlane_config = build_hyperlane_json_from_operator(hyperlane, &chain_ids);
 	implementations.insert("hyperlane".to_string(), hyperlane_config);
 
 	SettlementConfig {
@@ -673,106 +670,106 @@ fn build_settlement_config_from_operator(operator_config: &OperatorConfig) -> Se
 	}
 }
 
-/// Builds Hyperlane toml config from OperatorHyperlaneConfig.
-fn build_hyperlane_toml_from_operator(
+/// Builds Hyperlane JSON config from OperatorHyperlaneConfig.
+fn build_hyperlane_json_from_operator(
 	hyperlane: &OperatorHyperlaneConfig,
 	chain_ids: &[u64],
-) -> toml::Value {
-	let mut table = toml::map::Map::new();
+) -> serde_json::Value {
+	let mut table = serde_json::Map::new();
 
 	// Basic settings
 	table.insert(
 		"order".to_string(),
-		toml::Value::String("eip7683".to_string()),
+		serde_json::Value::String("eip7683".to_string()),
 	);
 	table.insert(
 		"network_ids".to_string(),
-		toml::Value::Array(
-			chain_ids
-				.iter()
-				.map(|id| toml::Value::Integer(*id as i64))
-				.collect(),
-		),
+		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect()),
 	);
 	table.insert(
 		"default_gas_limit".to_string(),
-		toml::Value::Integer(hyperlane.default_gas_limit as i64),
+		int(hyperlane.default_gas_limit as i64),
 	);
 	table.insert(
 		"message_timeout_seconds".to_string(),
-		toml::Value::Integer(hyperlane.message_timeout_seconds as i64),
+		int(hyperlane.message_timeout_seconds as i64),
 	);
 	table.insert(
 		"finalization_required".to_string(),
-		toml::Value::Boolean(hyperlane.finalization_required),
+		serde_json::Value::Bool(hyperlane.finalization_required),
 	);
 
 	// Build oracles map
-	let mut input_oracles = toml::map::Map::new();
-	let mut output_oracles = toml::map::Map::new();
+	let mut input_oracles = serde_json::Map::new();
+	let mut output_oracles = serde_json::Map::new();
 
 	for (chain_id, oracles) in &hyperlane.oracles.input {
-		let oracle_array = toml::Value::Array(
+		let oracle_array = serde_json::Value::Array(
 			oracles
 				.iter()
-				.map(|addr| toml::Value::String(format!("0x{}", hex::encode(addr))))
+				.map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(addr))))
 				.collect(),
 		);
 		input_oracles.insert(chain_id.to_string(), oracle_array);
 	}
 
 	for (chain_id, oracles) in &hyperlane.oracles.output {
-		let oracle_array = toml::Value::Array(
+		let oracle_array = serde_json::Value::Array(
 			oracles
 				.iter()
-				.map(|addr| toml::Value::String(format!("0x{}", hex::encode(addr))))
+				.map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(addr))))
 				.collect(),
 		);
 		output_oracles.insert(chain_id.to_string(), oracle_array);
 	}
 
-	let mut oracles = toml::map::Map::new();
-	oracles.insert("input".to_string(), toml::Value::Table(input_oracles));
-	oracles.insert("output".to_string(), toml::Value::Table(output_oracles));
-	table.insert("oracles".to_string(), toml::Value::Table(oracles));
+	let mut oracles = serde_json::Map::new();
+	oracles.insert(
+		"input".to_string(),
+		serde_json::Value::Object(input_oracles),
+	);
+	oracles.insert(
+		"output".to_string(),
+		serde_json::Value::Object(output_oracles),
+	);
+	table.insert("oracles".to_string(), serde_json::Value::Object(oracles));
 
 	// Build routes
-	let mut routes = toml::map::Map::new();
+	let mut routes = serde_json::Map::new();
 	for (chain_id, destinations) in &hyperlane.routes {
-		let dest_array = toml::Value::Array(
-			destinations
-				.iter()
-				.map(|c| toml::Value::Integer(*c as i64))
-				.collect(),
-		);
+		let dest_array =
+			serde_json::Value::Array(destinations.iter().map(|c| int(*c as i64)).collect());
 		routes.insert(chain_id.to_string(), dest_array);
 	}
-	table.insert("routes".to_string(), toml::Value::Table(routes));
+	table.insert("routes".to_string(), serde_json::Value::Object(routes));
 
 	// Build mailboxes map
-	let mut mailboxes = toml::map::Map::new();
+	let mut mailboxes = serde_json::Map::new();
 	for (chain_id, addr) in &hyperlane.mailboxes {
 		mailboxes.insert(
 			chain_id.to_string(),
-			toml::Value::String(format!("0x{}", hex::encode(addr))),
+			serde_json::Value::String(format!("0x{}", hex::encode(addr))),
 		);
 	}
-	table.insert("mailboxes".to_string(), toml::Value::Table(mailboxes));
+	table.insert(
+		"mailboxes".to_string(),
+		serde_json::Value::Object(mailboxes),
+	);
 
 	// Build IGP addresses map
-	let mut igp_addresses = toml::map::Map::new();
+	let mut igp_addresses = serde_json::Map::new();
 	for (chain_id, addr) in &hyperlane.igp_addresses {
 		igp_addresses.insert(
 			chain_id.to_string(),
-			toml::Value::String(format!("0x{}", hex::encode(addr))),
+			serde_json::Value::String(format!("0x{}", hex::encode(addr))),
 		);
 	}
 	table.insert(
 		"igp_addresses".to_string(),
-		toml::Value::Table(igp_addresses),
+		serde_json::Value::Object(igp_addresses),
 	);
 
-	toml::Value::Table(table)
+	serde_json::Value::Object(table)
 }
 
 /// Builds PricingConfig from OperatorPricingConfig.
@@ -780,19 +777,19 @@ fn build_pricing_config_from_operator(pricing: &OperatorPricingConfig) -> Pricin
 	let mut implementations = HashMap::new();
 
 	// CoinGecko implementation
-	let coingecko_config = toml_table(vec![
+	let coingecko_config = json_object(vec![
 		(
 			"cache_duration_seconds",
-			toml::Value::Integer(pricing.cache_duration_seconds as i64),
+			int(pricing.cache_duration_seconds as i64),
 		),
-		("rate_limit_delay_ms", toml::Value::Integer(1200)),
+		("rate_limit_delay_ms", int(1200)),
 	]);
 	implementations.insert("coingecko".to_string(), coingecko_config);
 
 	// DefiLlama implementation
-	let defillama_config = toml_table(vec![(
+	let defillama_config = json_object(vec![(
 		"cache_duration_seconds",
-		toml::Value::Integer(pricing.cache_duration_seconds as i64),
+		int(pricing.cache_duration_seconds as i64),
 	)]);
 	implementations.insert("defillama".to_string(), defillama_config);
 
@@ -959,13 +956,17 @@ fn build_solver_config(
 	}
 }
 
-/// Helper to create a toml::Value::Table from key-value pairs
-fn toml_table(pairs: Vec<(&str, toml::Value)>) -> toml::Value {
-	let mut table = toml::map::Map::new();
+/// Helper to create a serde_json::Value::Object from key-value pairs
+fn json_object(pairs: Vec<(&str, serde_json::Value)>) -> serde_json::Value {
+	let mut table = serde_json::Map::new();
 	for (key, value) in pairs {
 		table.insert(key.to_string(), value);
 	}
-	toml::Value::Table(table)
+	serde_json::Value::Object(table)
+}
+
+fn int(value: i64) -> serde_json::Value {
+	serde_json::Value::Number(value.into())
 }
 
 /// Builds the StorageConfig section.
@@ -980,20 +981,23 @@ fn build_storage_config(defaults: &SeedDefaults, solver_id: &str) -> StorageConf
 
 	// Redis implementation config
 	// Use solver_id as key_prefix to isolate storage per solver instance
-	let redis_config = toml_table(vec![
-		("redis_url", toml::Value::String(redis_url)),
-		("key_prefix", toml::Value::String(solver_id.to_string())),
-		("connection_timeout_ms", toml::Value::Integer(5000)),
-		("ttl_orders", toml::Value::Integer(0)),
-		("ttl_intents", toml::Value::Integer(86400)),
-		("ttl_order_by_tx_hash", toml::Value::Integer(86400)),
+	let redis_config = json_object(vec![
+		("redis_url", serde_json::Value::String(redis_url)),
+		(
+			"key_prefix",
+			serde_json::Value::String(solver_id.to_string()),
+		),
+		("connection_timeout_ms", int(5000)),
+		("ttl_orders", int(0)),
+		("ttl_intents", int(86400)),
+		("ttl_order_by_tx_hash", int(86400)),
 	]);
 	implementations.insert("redis".to_string(), redis_config);
 
 	// Memory implementation (fallback for testing)
 	implementations.insert(
 		"memory".to_string(),
-		toml::Value::Table(toml::map::Map::new()),
+		serde_json::Value::Object(serde_json::Map::new()),
 	);
 
 	StorageConfig {
@@ -1007,14 +1011,10 @@ fn build_storage_config(defaults: &SeedDefaults, solver_id: &str) -> StorageConf
 fn build_delivery_config(chain_ids: &[u64], defaults: &SeedDefaults) -> DeliveryConfig {
 	let mut implementations = HashMap::new();
 
-	let network_ids_array = toml::Value::Array(
-		chain_ids
-			.iter()
-			.map(|id| toml::Value::Integer(*id as i64))
-			.collect(),
-	);
+	let network_ids_array =
+		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect());
 
-	let evm_alloy_config = toml_table(vec![("network_ids", network_ids_array)]);
+	let evm_alloy_config = json_object(vec![("network_ids", network_ids_array)]);
 	implementations.insert("evm_alloy".to_string(), evm_alloy_config);
 
 	DeliveryConfig {
@@ -1036,9 +1036,9 @@ fn build_account_config(
 		let mut implementations = HashMap::new();
 
 		for (name, config) in &override_config.implementations {
-			// Convert serde_json::Value to toml::Value
-			let toml_value = json_to_toml(config);
-			implementations.insert(name.clone(), toml_value);
+			// Convert serde_json::Value to serde_json::Value
+			let impl_value = json_identity(config);
+			implementations.insert(name.clone(), impl_value);
 		}
 
 		return AccountConfig {
@@ -1055,7 +1055,10 @@ fn build_account_config(
 		.map(|k| k.trim().to_string())
 		.unwrap_or_else(|_| "${SOLVER_PRIVATE_KEY}".to_string());
 
-	let local_config = toml_table(vec![("private_key", toml::Value::String(private_key))]);
+	let local_config = json_object(vec![(
+		"private_key",
+		serde_json::Value::String(private_key),
+	)]);
 	implementations.insert("local".to_string(), local_config);
 
 	AccountConfig {
@@ -1064,57 +1067,32 @@ fn build_account_config(
 	}
 }
 
-/// Converts a serde_json::Value to a toml::Value.
-fn json_to_toml(json: &serde_json::Value) -> toml::Value {
-	match json {
-		serde_json::Value::Null => toml::Value::String("".to_string()),
-		serde_json::Value::Bool(b) => toml::Value::Boolean(*b),
-		serde_json::Value::Number(n) => {
-			if let Some(i) = n.as_i64() {
-				toml::Value::Integer(i)
-			} else if let Some(f) = n.as_f64() {
-				toml::Value::Float(f)
-			} else {
-				toml::Value::String(n.to_string())
-			}
-		},
-		serde_json::Value::String(s) => toml::Value::String(s.clone()),
-		serde_json::Value::Array(arr) => toml::Value::Array(arr.iter().map(json_to_toml).collect()),
-		serde_json::Value::Object(obj) => {
-			let mut table = toml::map::Map::new();
-			for (k, v) in obj {
-				table.insert(k.clone(), json_to_toml(v));
-			}
-			toml::Value::Table(table)
-		},
-	}
+/// Converts a serde_json::Value to a serde_json::Value.
+fn json_identity(json: &serde_json::Value) -> serde_json::Value {
+	json.clone()
 }
 
 /// Builds the DiscoveryConfig section.
 fn build_discovery_config(chain_ids: &[u64], defaults: &SeedDefaults) -> DiscoveryConfig {
 	let mut implementations = HashMap::new();
 
-	let network_ids_array = toml::Value::Array(
-		chain_ids
-			.iter()
-			.map(|id| toml::Value::Integer(*id as i64))
-			.collect(),
-	);
+	let network_ids_array =
+		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect());
 
 	// Onchain discovery - polls chain for new orders
-	let onchain_config = toml_table(vec![
+	let onchain_config = json_object(vec![
 		("network_ids", network_ids_array.clone()),
 		(
 			"polling_interval_secs",
-			toml::Value::Integer(defaults.polling_interval_secs as i64),
+			int(defaults.polling_interval_secs as i64),
 		),
 	]);
 	implementations.insert("onchain_eip7683".to_string(), onchain_config);
 
 	// Offchain discovery - receives orders via HTTP API from aggregators
-	let offchain_config = toml_table(vec![
-		("api_host", toml::Value::String("0.0.0.0".to_string())),
-		("api_port", toml::Value::Integer(8081)),
+	let offchain_config = json_object(vec![
+		("api_host", serde_json::Value::String("0.0.0.0".to_string())),
+		("api_port", int(8081)),
 		("network_ids", network_ids_array),
 	]);
 	implementations.insert("offchain_eip7683".to_string(), offchain_config);
@@ -1129,14 +1107,14 @@ fn build_order_config(defaults: &SeedDefaults) -> OrderConfig {
 	// EIP-7683 order implementation
 	implementations.insert(
 		"eip7683".to_string(),
-		toml::Value::Table(toml::map::Map::new()),
+		serde_json::Value::Object(serde_json::Map::new()),
 	);
 
 	// Strategy implementations
 	let mut strategy_implementations = HashMap::new();
-	let simple_strategy_config = toml_table(vec![(
+	let simple_strategy_config = json_object(vec![(
 		"max_gas_price_gwei",
-		toml::Value::Integer(defaults.max_gas_price_gwei as i64),
+		int(defaults.max_gas_price_gwei as i64),
 	)]);
 	strategy_implementations.insert("simple".to_string(), simple_strategy_config);
 
@@ -1166,91 +1144,99 @@ fn build_settlement_config(chain_ids: &[u64], seed: &SeedConfig) -> SettlementCo
 }
 
 /// Builds the Hyperlane settlement configuration dynamically.
-fn build_hyperlane_config(chain_ids: &[u64], seed: &SeedConfig) -> toml::Value {
-	let mut table = toml::map::Map::new();
+fn build_hyperlane_config(chain_ids: &[u64], seed: &SeedConfig) -> serde_json::Value {
+	let mut table = serde_json::Map::new();
 
 	// Basic settings
 	table.insert(
 		"order".to_string(),
-		toml::Value::String("eip7683".to_string()),
+		serde_json::Value::String("eip7683".to_string()),
 	);
 	table.insert(
 		"network_ids".to_string(),
-		toml::Value::Array(
-			chain_ids
-				.iter()
-				.map(|id| toml::Value::Integer(*id as i64))
-				.collect(),
-		),
+		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect()),
 	);
 	table.insert(
 		"default_gas_limit".to_string(),
-		toml::Value::Integer(seed.defaults.hyperlane_default_gas_limit as i64),
+		int(seed.defaults.hyperlane_default_gas_limit as i64),
 	);
 	table.insert(
 		"message_timeout_seconds".to_string(),
-		toml::Value::Integer(seed.defaults.hyperlane_message_timeout_seconds as i64),
+		int(seed.defaults.hyperlane_message_timeout_seconds as i64),
 	);
 	table.insert(
 		"finalization_required".to_string(),
-		toml::Value::Boolean(seed.defaults.hyperlane_finalization_required),
+		serde_json::Value::Bool(seed.defaults.hyperlane_finalization_required),
 	);
 
 	// Build oracles map
-	let mut input_oracles = toml::map::Map::new();
-	let mut output_oracles = toml::map::Map::new();
+	let mut input_oracles = serde_json::Map::new();
+	let mut output_oracles = serde_json::Map::new();
 
 	for chain_id in chain_ids {
 		if let Some(network) = seed.get_network(*chain_id) {
 			let oracle_addr = format!("0x{}", hex::encode(network.hyperlane_oracle));
-			let oracle_array = toml::Value::Array(vec![toml::Value::String(oracle_addr.clone())]);
+			let oracle_array =
+				serde_json::Value::Array(vec![serde_json::Value::String(oracle_addr.clone())]);
 
 			input_oracles.insert(chain_id.to_string(), oracle_array.clone());
 			output_oracles.insert(chain_id.to_string(), oracle_array);
 		}
 	}
 
-	let mut oracles = toml::map::Map::new();
-	oracles.insert("input".to_string(), toml::Value::Table(input_oracles));
-	oracles.insert("output".to_string(), toml::Value::Table(output_oracles));
-	table.insert("oracles".to_string(), toml::Value::Table(oracles));
+	let mut oracles = serde_json::Map::new();
+	oracles.insert(
+		"input".to_string(),
+		serde_json::Value::Object(input_oracles),
+	);
+	oracles.insert(
+		"output".to_string(),
+		serde_json::Value::Object(output_oracles),
+	);
+	table.insert("oracles".to_string(), serde_json::Value::Object(oracles));
 
 	// Build routes - each chain can send to all other chains
-	let mut routes = toml::map::Map::new();
+	let mut routes = serde_json::Map::new();
 	for chain_id in chain_ids {
-		let other_chains: Vec<toml::Value> = chain_ids
+		let other_chains: Vec<serde_json::Value> = chain_ids
 			.iter()
 			.filter(|c| *c != chain_id)
-			.map(|c| toml::Value::Integer(*c as i64))
+			.map(|c| int(*c as i64))
 			.collect();
-		routes.insert(chain_id.to_string(), toml::Value::Array(other_chains));
+		routes.insert(chain_id.to_string(), serde_json::Value::Array(other_chains));
 	}
-	table.insert("routes".to_string(), toml::Value::Table(routes));
+	table.insert("routes".to_string(), serde_json::Value::Object(routes));
 
 	// Build mailboxes map
-	let mut mailboxes = toml::map::Map::new();
+	let mut mailboxes = serde_json::Map::new();
 	for chain_id in chain_ids {
 		if let Some(network) = seed.get_network(*chain_id) {
 			let mailbox_addr = format!("0x{}", hex::encode(network.hyperlane_mailbox));
-			mailboxes.insert(chain_id.to_string(), toml::Value::String(mailbox_addr));
+			mailboxes.insert(
+				chain_id.to_string(),
+				serde_json::Value::String(mailbox_addr),
+			);
 		}
 	}
-	table.insert("mailboxes".to_string(), toml::Value::Table(mailboxes));
+	table.insert(
+		"mailboxes".to_string(),
+		serde_json::Value::Object(mailboxes),
+	);
 
 	// Build IGP addresses map
-	let mut igp_addresses = toml::map::Map::new();
+	let mut igp_addresses = serde_json::Map::new();
 	for chain_id in chain_ids {
 		if let Some(network) = seed.get_network(*chain_id) {
 			let igp_addr = format!("0x{}", hex::encode(network.hyperlane_igp));
-			igp_addresses.insert(chain_id.to_string(), toml::Value::String(igp_addr));
+			igp_addresses.insert(chain_id.to_string(), serde_json::Value::String(igp_addr));
 		}
 	}
 	table.insert(
 		"igp_addresses".to_string(),
-		toml::Value::Table(igp_addresses),
+		serde_json::Value::Object(igp_addresses),
 	);
 
-	toml::Value::Table(table)
+	serde_json::Value::Object(table)
 }
 
 /// Builds the PricingConfig section.
@@ -1258,19 +1244,19 @@ fn build_pricing_config(defaults: &SeedDefaults) -> PricingConfig {
 	let mut implementations = HashMap::new();
 
 	// CoinGecko implementation
-	let coingecko_config = toml_table(vec![
+	let coingecko_config = json_object(vec![
 		(
 			"cache_duration_seconds",
-			toml::Value::Integer(defaults.cache_duration_seconds as i64),
+			int(defaults.cache_duration_seconds as i64),
 		),
-		("rate_limit_delay_ms", toml::Value::Integer(1200)),
+		("rate_limit_delay_ms", int(1200)),
 	]);
 	implementations.insert("coingecko".to_string(), coingecko_config);
 
 	// DefiLlama implementation
-	let defillama_config = toml_table(vec![(
+	let defillama_config = json_object(vec![(
 		"cache_duration_seconds",
-		toml::Value::Integer(defaults.cache_duration_seconds as i64),
+		int(defaults.cache_duration_seconds as i64),
 	)]);
 	implementations.insert("defillama".to_string(), defillama_config);
 
@@ -1377,7 +1363,7 @@ fn build_api_config(
 /// OperatorConfig for admin API persistence.
 ///
 /// Note: Some information (like Hyperlane addresses) may be incomplete
-/// as Config stores them in toml format. The function does best-effort
+/// as Config stores them as JSON values. The function does best-effort
 /// extraction.
 pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, MergeError> {
 	use alloy_primitives::Address;
@@ -1564,12 +1550,12 @@ fn extract_account_config(account: &AccountConfig) -> Option<OperatorAccountConf
 		return None;
 	}
 
-	// Convert toml implementations to JSON
+	// Convert implementation values to JSON
 	let implementations = account
 		.implementations
 		.iter()
-		.map(|(name, toml_value)| {
-			let json_value = toml_to_json(toml_value);
+		.map(|(name, impl_value)| {
+			let json_value = json_clone(impl_value);
 			(name.clone(), json_value)
 		})
 		.collect();
@@ -1580,35 +1566,19 @@ fn extract_account_config(account: &AccountConfig) -> Option<OperatorAccountConf
 	})
 }
 
-/// Converts a toml::Value to a serde_json::Value.
-fn toml_to_json(toml: &toml::Value) -> serde_json::Value {
-	match toml {
-		toml::Value::String(s) => serde_json::Value::String(s.clone()),
-		toml::Value::Integer(i) => serde_json::Value::Number((*i).into()),
-		toml::Value::Float(f) => serde_json::Number::from_f64(*f)
-			.map(serde_json::Value::Number)
-			.unwrap_or(serde_json::Value::Null),
-		toml::Value::Boolean(b) => serde_json::Value::Bool(*b),
-		toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),
-		toml::Value::Array(arr) => serde_json::Value::Array(arr.iter().map(toml_to_json).collect()),
-		toml::Value::Table(table) => {
-			let map: serde_json::Map<String, serde_json::Value> = table
-				.iter()
-				.map(|(k, v)| (k.clone(), toml_to_json(v)))
-				.collect();
-			serde_json::Value::Object(map)
-		},
-	}
+/// Converts a serde_json::Value to a serde_json::Value.
+fn json_clone(value: &serde_json::Value) -> serde_json::Value {
+	value.clone()
 }
 
-/// Extracts Hyperlane config from settlement toml config.
+/// Extracts Hyperlane config from settlement JSON config.
 fn extract_hyperlane_config(
 	settlement: &SettlementConfig,
 	chain_ids: &[u64],
 ) -> OperatorHyperlaneConfig {
 	use alloy_primitives::Address;
 
-	let hyperlane_toml = settlement.implementations.get("hyperlane");
+	let hyperlane_json = settlement.implementations.get("hyperlane");
 
 	// Helper to parse address from hex string
 	let parse_addr = |s: &str| -> Option<Address> {
@@ -1619,28 +1589,28 @@ fn extract_hyperlane_config(
 		})
 	};
 
-	let default_gas_limit = hyperlane_toml
+	let default_gas_limit = hyperlane_json
 		.and_then(|h| h.get("default_gas_limit"))
-		.and_then(|v| v.as_integer())
+		.and_then(|v| v.as_i64())
 		.unwrap_or(300_000) as u64;
 
-	let message_timeout_seconds = hyperlane_toml
+	let message_timeout_seconds = hyperlane_json
 		.and_then(|h| h.get("message_timeout_seconds"))
-		.and_then(|v| v.as_integer())
+		.and_then(|v| v.as_i64())
 		.unwrap_or(600) as u64;
 
-	let finalization_required = hyperlane_toml
+	let finalization_required = hyperlane_json
 		.and_then(|h| h.get("finalization_required"))
 		.and_then(|v| v.as_bool())
 		.unwrap_or(true);
 
 	// Extract mailboxes
 	let mut mailboxes = HashMap::new();
-	if let Some(toml_mailboxes) = hyperlane_toml
+	if let Some(json_mailboxes) = hyperlane_json
 		.and_then(|h| h.get("mailboxes"))
-		.and_then(|v| v.as_table())
+		.and_then(|v| v.as_object())
 	{
-		for (chain_id_str, addr_val) in toml_mailboxes {
+		for (chain_id_str, addr_val) in json_mailboxes {
 			if let (Ok(chain_id), Some(addr_str)) = (chain_id_str.parse::<u64>(), addr_val.as_str())
 			{
 				if let Some(addr) = parse_addr(addr_str) {
@@ -1652,11 +1622,11 @@ fn extract_hyperlane_config(
 
 	// Extract IGP addresses
 	let mut igp_addresses = HashMap::new();
-	if let Some(toml_igp) = hyperlane_toml
+	if let Some(json_igp) = hyperlane_json
 		.and_then(|h| h.get("igp_addresses"))
-		.and_then(|v| v.as_table())
+		.and_then(|v| v.as_object())
 	{
-		for (chain_id_str, addr_val) in toml_igp {
+		for (chain_id_str, addr_val) in json_igp {
 			if let (Ok(chain_id), Some(addr_str)) = (chain_id_str.parse::<u64>(), addr_val.as_str())
 			{
 				if let Some(addr) = parse_addr(addr_str) {
@@ -1669,11 +1639,11 @@ fn extract_hyperlane_config(
 	// Extract oracles
 	let mut input_oracles = HashMap::new();
 	let mut output_oracles = HashMap::new();
-	if let Some(toml_oracles) = hyperlane_toml
+	if let Some(json_oracles) = hyperlane_json
 		.and_then(|h| h.get("oracles"))
-		.and_then(|v| v.as_table())
+		.and_then(|v| v.as_object())
 	{
-		if let Some(input_table) = toml_oracles.get("input").and_then(|v| v.as_table()) {
+		if let Some(input_table) = json_oracles.get("input").and_then(|v| v.as_object()) {
 			for (chain_id_str, addrs_val) in input_table {
 				if let (Ok(chain_id), Some(addrs_array)) =
 					(chain_id_str.parse::<u64>(), addrs_val.as_array())
@@ -1688,7 +1658,7 @@ fn extract_hyperlane_config(
 				}
 			}
 		}
-		if let Some(output_table) = toml_oracles.get("output").and_then(|v| v.as_table()) {
+		if let Some(output_table) = json_oracles.get("output").and_then(|v| v.as_object()) {
 			for (chain_id_str, addrs_val) in output_table {
 				if let (Ok(chain_id), Some(addrs_array)) =
 					(chain_id_str.parse::<u64>(), addrs_val.as_array())
@@ -1707,17 +1677,17 @@ fn extract_hyperlane_config(
 
 	// Extract routes
 	let mut routes = HashMap::new();
-	if let Some(toml_routes) = hyperlane_toml
+	if let Some(json_routes) = hyperlane_json
 		.and_then(|h| h.get("routes"))
-		.and_then(|v| v.as_table())
+		.and_then(|v| v.as_object())
 	{
-		for (chain_id_str, dests_val) in toml_routes {
+		for (chain_id_str, dests_val) in json_routes {
 			if let (Ok(chain_id), Some(dests_array)) =
 				(chain_id_str.parse::<u64>(), dests_val.as_array())
 			{
 				let dests: Vec<u64> = dests_array
 					.iter()
-					.filter_map(|v| v.as_integer().map(|i| i as u64))
+					.filter_map(|v| v.as_i64().map(|i| i as u64))
 					.collect();
 				routes.insert(chain_id, dests);
 			}
@@ -2037,15 +2007,15 @@ mod tests {
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
 
 		let hyperlane = config.settlement.implementations.get("hyperlane").unwrap();
-		let routes = hyperlane.get("routes").unwrap().as_table().unwrap();
+		let routes = hyperlane.get("routes").unwrap().as_object().unwrap();
 
 		// Check Optimism Sepolia can send to Base Sepolia
 		let opt_routes = routes.get("11155420").unwrap().as_array().unwrap();
-		assert!(opt_routes.contains(&toml::Value::Integer(84532)));
+		assert!(opt_routes.contains(&int(84532)));
 
 		// Check Base Sepolia can send to Optimism Sepolia
 		let base_routes = routes.get("84532").unwrap().as_array().unwrap();
-		assert!(base_routes.contains(&toml::Value::Integer(11155420)));
+		assert!(base_routes.contains(&int(11155420)));
 	}
 
 	#[test]
@@ -2699,17 +2669,17 @@ mod tests {
 	// ===== Tests for helper functions =====
 
 	#[test]
-	fn test_toml_table_helper() {
-		let table = toml_table(vec![
-			("key1", toml::Value::String("value1".to_string())),
-			("key2", toml::Value::Integer(42)),
-			("key3", toml::Value::Boolean(true)),
+	fn test_json_object_helper() {
+		let table = json_object(vec![
+			("key1", serde_json::Value::String("value1".to_string())),
+			("key2", int(42)),
+			("key3", serde_json::Value::Bool(true)),
 		]);
 
-		assert!(table.is_table());
-		let t = table.as_table().unwrap();
+		assert!(table.is_object());
+		let t = table.as_object().unwrap();
 		assert_eq!(t.get("key1").unwrap().as_str().unwrap(), "value1");
-		assert_eq!(t.get("key2").unwrap().as_integer().unwrap(), 42);
+		assert_eq!(t.get("key2").unwrap().as_i64().unwrap(), 42);
 		assert!(t.get("key3").unwrap().as_bool().unwrap());
 	}
 

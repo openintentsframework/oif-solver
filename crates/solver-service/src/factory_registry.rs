@@ -22,30 +22,31 @@ use tokio::sync::RwLock;
 
 // Type aliases for factory functions
 pub type AccountFactory = for<'a> fn(
-	&'a toml::Value,
+	&'a serde_json::Value,
 ) -> Pin<
 	Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + 'a>,
 >;
 pub type DeliveryFactory = fn(
-	&toml::Value,
+	&serde_json::Value,
 	&NetworksConfig,
 	&solver_account::AccountSigner,
 	&std::collections::HashMap<u64, solver_account::AccountSigner>,
 ) -> Result<Box<dyn DeliveryInterface>, DeliveryError>;
 pub type DiscoveryFactory =
-	fn(&toml::Value, &NetworksConfig) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError>;
+	fn(&serde_json::Value, &NetworksConfig) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError>;
 pub type OrderFactory = fn(
-	&toml::Value,
+	&serde_json::Value,
 	&NetworksConfig,
 	&solver_types::oracle::OracleRoutes,
 ) -> Result<Box<dyn OrderInterface>, OrderError>;
-pub type PricingFactory = fn(&toml::Value) -> Result<Box<dyn PricingInterface>, PricingError>;
+pub type PricingFactory = fn(&serde_json::Value) -> Result<Box<dyn PricingInterface>, PricingError>;
 pub type SettlementFactory = fn(
-	&toml::Value,
+	&serde_json::Value,
 	&NetworksConfig,
 	std::sync::Arc<solver_storage::StorageService>,
 ) -> Result<Box<dyn SettlementInterface>, SettlementError>;
-pub type StrategyFactory = fn(&toml::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError>;
+pub type StrategyFactory =
+	fn(&serde_json::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError>;
 
 /// Global registry for all implementation factories
 #[derive(Default)]
@@ -292,53 +293,68 @@ mod tests {
 
 	#[tokio::test]
 	async fn build_solver_from_config_errors_on_unknown_delivery_impl() {
-		let config_toml = r#"
-			[solver]
-			id = "test-solver"
-			monitoring_timeout_seconds = 30
-			min_profitability_pct = 1.0
-
-			[storage]
-			primary = "memory"
-			cleanup_interval_seconds = 60
-			[storage.implementations.memory]
-
-			[delivery]
-			min_confirmations = 1
-			primary = "unknown"
-			[delivery.implementations]
-			unknown = {}
-
-			[account]
-			primary = "local"
-			[account.implementations.local]
-			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
-
-			[discovery]
-			[discovery.implementations]
-
-			[order]
-			[order.implementations]
-			[order.strategy]
-			primary = "simple"
-			[order.strategy.implementations.simple]
-
-			[settlement]
-			[settlement.implementations]
-
-			[networks.1]
-			chain_id = 1
-			input_settler_address = "0x0000000000000000000000000000000000000001"
-			output_settler_address = "0x0000000000000000000000000000000000000002"
-			[[networks.1.rpc_urls]]
-			http = "http://localhost:8545"
-			[[networks.1.tokens]]
-			symbol = "TEST"
-			address = "0x0000000000000000000000000000000000000003"
-			decimals = 18
-		"#;
-
-		let config: Config = toml::from_str(config_toml).expect("config parses");
+		let config: Config = serde_json::from_value(serde_json::json!({
+			"solver": {
+				"id": "test-solver",
+				"monitoring_timeout_seconds": 30,
+				"min_profitability_pct": 1.0
+			},
+			"storage": {
+				"primary": "memory",
+				"cleanup_interval_seconds": 60,
+				"implementations": {
+					"memory": {}
+				}
+			},
+			"delivery": {
+				"min_confirmations": 1,
+				"primary": "unknown",
+				"implementations": {
+					"unknown": {}
+				}
+			},
+			"account": {
+				"primary": "local",
+				"implementations": {
+					"local": {
+						"private_key": "0x1234567890123456789012345678901234567890123456789012345678901234"
+					}
+				}
+			},
+			"discovery": {
+				"implementations": {}
+			},
+			"order": {
+				"implementations": {},
+				"strategy": {
+					"primary": "simple",
+					"implementations": {
+						"simple": {}
+					}
+				}
+			},
+			"settlement": {
+				"implementations": {}
+			},
+			"networks": {
+				"1": {
+					"chain_id": 1,
+					"input_settler_address": "0x0000000000000000000000000000000000000001",
+					"output_settler_address": "0x0000000000000000000000000000000000000002",
+					"rpc_urls": [
+						{ "http": "http://localhost:8545" }
+					],
+					"tokens": [
+						{
+							"symbol": "TEST",
+							"address": "0x0000000000000000000000000000000000000003",
+							"decimals": 18
+						}
+					]
+				}
+			}
+		}))
+		.expect("config parses");
 		let dynamic_config = Arc::new(RwLock::new(config));
 		let message = match build_solver_from_config(dynamic_config).await {
 			Ok(_) => panic!("expected failure"),

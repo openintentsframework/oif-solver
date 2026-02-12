@@ -13,9 +13,10 @@ alloy-signer-local = { workspace = true }
 async-trait = "0.1"
 hex = "0.4"
 mockall = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 solver-types = { path = "../solver-types" }
 thiserror = "2.0.17"
-toml = { workspace = true }
 tokio = { workspace = true }
 
 # KMS dependencies (optional)

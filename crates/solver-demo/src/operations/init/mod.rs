@@ -17,6 +17,12 @@ use crate::{
 };
 use alloy_primitives::Address;
 use solver_config::SettlementConfig;
+use solver_service::config_merge::build_runtime_config;
+use solver_storage::{
+	config_store::{create_config_store, ConfigStoreError},
+	StoreConfig,
+};
+use solver_types::OperatorConfig;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -87,6 +93,27 @@ impl InitOps {
 	pub async fn load(&self, path: PathBuf, is_local: bool) -> Result<()> {
 		// Delegate to the existing load_config function
 		load_config(&path, is_local).await
+	}
+
+	/// Load configuration from runtime storage (Redis/file/memory) and initialize session
+	///
+	/// # Arguments
+	/// * `solver_id` - Solver ID to load (falls back to `SOLVER_ID` env when None)
+	/// * `is_local` - Whether to initialize for local development environment
+	///
+	/// # Returns
+	/// Path to the generated runtime configuration file
+	///
+	/// # Errors
+	/// Returns Error if solver ID cannot be resolved, storage cannot be read,
+	/// config conversion fails, or session initialization fails.
+	#[instrument(skip(self))]
+	pub async fn load_from_storage(
+		&self,
+		solver_id: Option<String>,
+		is_local: bool,
+	) -> Result<PathBuf> {
+		load_config_from_storage(solver_id, is_local).await
 	}
 }
 
@@ -189,29 +216,8 @@ pub async fn generate_new_config(path: &Path, chains: Vec<u64>, force: bool) -> 
 	// Generate configuration content using same format as original
 	let config_content = generate_demo_config(&chains, config_name, &placeholders)?;
 
-	// Write main config file
+	// Write single JSON config file
 	std::fs::write(path, config_content)?;
-
-	// Create includes directory
-	if let Some(parent) = path.parent() {
-		let include_dir = parent.join(config_name);
-		std::fs::create_dir_all(&include_dir)?;
-
-		// Write networks.toml
-		let networks_path = include_dir.join("networks.toml");
-		std::fs::write(
-			networks_path,
-			generate_networks_config(&chains, &placeholders)?,
-		)?;
-
-		// Write gas.toml
-		let gas_path = include_dir.join("gas.toml");
-		std::fs::write(gas_path, generate_gas_config()?)?;
-
-		// Write api.toml
-		let api_path = include_dir.join("api.toml");
-		std::fs::write(api_path, generate_api_config()?)?;
-	}
 
 	Ok(())
 }
@@ -330,6 +336,124 @@ pub async fn load_config(path: &Path, is_local: bool) -> Result<()> {
 	Ok(())
 }
 
+/// Load configuration from runtime storage and initialize session.
+///
+/// Reads `OperatorConfig` from the configured storage backend using the same key
+/// format as the solver service, converts it into runtime `Config`, materializes
+/// that config to `.oif-demo/config`, and then initializes session state.
+pub async fn load_config_from_storage(
+	solver_id: Option<String>,
+	is_local: bool,
+) -> Result<PathBuf> {
+	let solver_id = resolve_solver_id(solver_id)?;
+	let store_config = StoreConfig::from_env()
+		.map_err(|e| Error::InvalidConfig(format!("Failed to read storage configuration: {e}")))?;
+	let store_key = operator_config_store_key(&solver_id);
+
+	let config_store = create_config_store::<OperatorConfig>(store_config, store_key.clone())
+		.map_err(|e| {
+			Error::InvalidConfig(format!(
+				"Failed to create config store for solver '{solver_id}': {e}"
+			))
+		})?;
+
+	let versioned = config_store.get().await.map_err(|e| match e {
+		ConfigStoreError::NotFound(_) => Error::InvalidConfig(format!(
+			"Operator config not found in storage for solver '{solver_id}' (store key: {store_key})"
+		)),
+		other => Error::InvalidConfig(format!(
+			"Failed to load operator config from storage for solver '{solver_id}': {other}"
+		)),
+	})?;
+
+	let runtime_config = build_runtime_config(&versioned.data).map_err(|e| {
+		Error::InvalidConfig(format!(
+			"Failed to convert operator config to runtime config for solver '{solver_id}' (version {}): {e}",
+			versioned.version
+		))
+	})?;
+
+	let generated_config_path = generated_runtime_config_path(&solver_id);
+	materialize_runtime_config(&runtime_config, &generated_config_path)?;
+
+	load_config(&generated_config_path, is_local).await?;
+	Ok(generated_config_path)
+}
+
+fn resolve_solver_id(solver_id: Option<String>) -> Result<String> {
+	if let Some(id) = solver_id {
+		let trimmed = id.trim();
+		if trimmed.is_empty() {
+			return Err(Error::InvalidConfig(
+				"Solver ID cannot be empty".to_string(),
+			));
+		}
+		return Ok(trimmed.to_string());
+	}
+
+	let env_id = std::env::var("SOLVER_ID").map_err(|_| {
+		Error::InvalidConfig(
+			"Solver ID not provided. Use --solver-id <id> or set SOLVER_ID".to_string(),
+		)
+	})?;
+	let trimmed = env_id.trim();
+	if trimmed.is_empty() {
+		return Err(Error::InvalidConfig(
+			"SOLVER_ID is set but empty".to_string(),
+		));
+	}
+	Ok(trimmed.to_string())
+}
+
+fn operator_config_store_key(solver_id: &str) -> String {
+	format!("{solver_id}-operator")
+}
+
+fn generated_runtime_config_path(solver_id: &str) -> PathBuf {
+	let safe_solver_id = sanitize_solver_id_for_filename(solver_id);
+	PathBuf::from(".oif-demo")
+		.join("config")
+		.join(format!("{safe_solver_id}.json"))
+}
+
+fn sanitize_solver_id_for_filename(solver_id: &str) -> String {
+	let sanitized: String = solver_id
+		.chars()
+		.map(|c| {
+			if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+				c
+			} else {
+				'_'
+			}
+		})
+		.collect();
+
+	if sanitized.is_empty() {
+		"solver".to_string()
+	} else {
+		sanitized
+	}
+}
+
+fn materialize_runtime_config(
+	runtime_config: &solver_config::Config,
+	output_path: &Path,
+) -> Result<()> {
+	if let Some(parent) = output_path.parent() {
+		std::fs::create_dir_all(parent)?;
+	}
+
+	let json_content = serde_json::to_string_pretty(runtime_config).map_err(|e| {
+		Error::InvalidConfig(format!(
+			"Failed to serialize runtime config to JSON for {}: {e}",
+			output_path.display()
+		))
+	})?;
+
+	std::fs::write(output_path, json_content)?;
+	Ok(())
+}
+
 /// Gets input oracle address for the specified chain
 fn get_input_oracle_for_chain(
 	settlement_config: &SettlementConfig,
@@ -340,13 +464,13 @@ fn get_input_oracle_for_chain(
 			if let Some(network_ids) = network_ids_value.as_array() {
 				let has_chain = network_ids
 					.iter()
-					.any(|id| id.as_integer().is_some_and(|i| i as u64 == chain_id));
+					.any(|id| id.as_i64().is_some_and(|i| i as u64 == chain_id));
 
 				if has_chain {
 					if let Some(oracles_value) = impl_config.get("oracles") {
-						if let Some(oracles_table) = oracles_value.as_table() {
+						if let Some(oracles_table) = oracles_value.as_object() {
 							if let Some(input_value) = oracles_table.get("input") {
-								if let Some(input_table) = input_value.as_table() {
+								if let Some(input_table) = input_value.as_object() {
 									if let Some(oracles_array) =
 										input_table.get(&chain_id.to_string())
 									{
@@ -379,13 +503,13 @@ fn get_output_oracle_for_chain(
 			if let Some(network_ids) = network_ids_value.as_array() {
 				let has_chain = network_ids
 					.iter()
-					.any(|id| id.as_integer().is_some_and(|i| i as u64 == chain_id));
+					.any(|id| id.as_i64().is_some_and(|i| i as u64 == chain_id));
 
 				if has_chain {
 					if let Some(oracles_value) = impl_config.get("oracles") {
-						if let Some(oracles_table) = oracles_value.as_table() {
+						if let Some(oracles_table) = oracles_value.as_object() {
 							if let Some(output_value) = oracles_table.get("output") {
-								if let Some(output_table) = output_value.as_table() {
+								if let Some(output_table) = output_value.as_object() {
 									if let Some(oracles_array) =
 										output_table.get(&chain_id.to_string())
 									{
@@ -411,279 +535,24 @@ fn get_output_oracle_for_chain(
 /// Generate the main configuration file
 fn generate_demo_config(
 	chain_ids: &[u64],
-	config_name: &str,
+	_config_name: &str,
 	placeholders: &HashMap<String, String>,
 ) -> Result<String> {
-	let mut config = String::new();
-
-	// Header
-	config.push_str("# OIF Solver Configuration - Generated File\n");
-	config.push_str("# Generated with placeholder values for easy regex replacement\n\n");
-
-	// Include files
-	config.push_str(&format!(
-		"include = [\"{config_name}/networks.toml\", \"{config_name}/api.toml\", \"{config_name}/gas.toml\"]\n\n"
-	));
-
-	// Solver configuration
-	config.push_str("[solver]\n");
-	config.push_str("id = \"oif-solver-demo\"\n");
-	config.push_str("min_profitability_pct = 1.0\n");
-	config.push_str("monitoring_timeout_seconds = 28800\n\n");
-
-	// Storage configuration
-	add_storage_config(&mut config);
-
-	// Account configuration
-	add_account_config(&mut config);
-
-	// Delivery configuration
-	add_delivery_config(&mut config, chain_ids);
-
-	// Discovery configuration
-	add_discovery_config(&mut config, chain_ids);
-
-	// Order configuration
-	add_order_config(&mut config);
-
-	// Pricing configuration
-	add_pricing_config(&mut config);
-
-	// Settlement configuration
-	add_settlement_config(&mut config, chain_ids, placeholders)?;
-
-	Ok(config)
-}
-
-fn add_storage_config(config: &mut String) {
-	config.push_str(
-		"# ============================================================================\n",
-	);
-	config.push_str("# STORAGE\n");
-	config.push_str(
-		"# ============================================================================\n",
-	);
-	config.push_str("[storage]\n");
-	config.push_str("primary = \"file\"\n");
-	config.push_str("cleanup_interval_seconds = 60\n\n");
-
-	config.push_str("[storage.implementations.memory]\n");
-	config.push_str("# Memory storage has no configuration\n\n");
-
-	config.push_str("[storage.implementations.file]\n");
-	config.push_str("storage_path = \"./data/storage\"\n");
-	config.push_str("ttl_orders = 300                # 5 minutes\n");
-	config.push_str("ttl_intents = 120               # 2 minutes\n");
-	config.push_str("ttl_order_by_tx_hash = 300      # 5 minutes\n\n");
-}
-
-fn add_account_config(config: &mut String) {
-	// Load environment variables
-	let _ = dotenvy::dotenv();
-
-	config.push_str(
-		"# ============================================================================\n",
-	);
-	config.push_str("# ACCOUNT\n");
-	config.push_str(
-		"# ============================================================================\n",
-	);
-	config.push_str("[account]\n");
-	config.push_str("primary = \"local\"\n\n");
-
-	config.push_str("[account.implementations.local]\n");
-
-	// Use SOLVER_PRIVATE_KEY from env or default Anvil key
 	let solver_key = std::env::var(env_vars::SOLVER_PRIVATE_KEY)
 		.unwrap_or_else(|_| anvil_accounts::SOLVER_PRIVATE_KEY.to_string());
-	config.push_str(&format!("private_key = \"{solver_key}\"\n\n"));
-}
 
-fn add_delivery_config(config: &mut String, chain_ids: &[u64]) {
-	config.push_str(
-		"# ============================================================================\n",
-	);
-	config.push_str("# DELIVERY\n");
-	config.push_str(
-		"# ============================================================================\n",
-	);
-	config.push_str("[delivery]\n");
-	config.push_str("min_confirmations = 1\n\n");
-
-	config.push_str("[delivery.implementations.evm_alloy]\n");
-	config.push_str(&format!("network_ids = {chain_ids:?}\n\n"));
-}
-
-fn add_discovery_config(config: &mut String, chain_ids: &[u64]) {
-	config.push_str(
-		"# ============================================================================\n",
-	);
-	config.push_str("# DISCOVERY\n");
-	config.push_str(
-		"# ============================================================================\n",
-	);
-	config.push_str("[discovery]\n\n");
-
-	config.push_str("[discovery.implementations.onchain_eip7683]\n");
-	config.push_str(&format!("network_ids = {chain_ids:?}\n"));
-	config.push_str(
-		"polling_interval_secs = 0    # Use WebSocket subscriptions instead of polling\n\n",
-	);
-
-	config.push_str("[discovery.implementations.offchain_eip7683]\n");
-	config.push_str("api_host = \"127.0.0.1\"\n");
-	config.push_str("api_port = 8081\n");
-	config.push_str(&format!(
-		"network_ids = [{}]\n\n",
-		chain_ids.first().unwrap_or(&31337)
-	));
-}
-
-fn add_order_config(config: &mut String) {
-	config.push_str(
-		"# ============================================================================\n",
-	);
-	config.push_str("# ORDER\n");
-	config.push_str(
-		"# ============================================================================\n",
-	);
-	config.push_str("[order]\n\n");
-
-	config.push_str("[order.implementations.eip7683]\n\n");
-
-	config.push_str("[order.strategy]\n");
-	config.push_str("primary = \"simple\"\n\n");
-
-	config.push_str("[order.strategy.implementations.simple]\n");
-	config.push_str("max_gas_price_gwei = 100\n\n");
-}
-
-fn add_pricing_config(config: &mut String) {
-	config.push_str(
-		"# ============================================================================\n",
-	);
-	config.push_str("# PRICING\n");
-	config.push_str(
-		"# ============================================================================\n",
-	);
-	config.push_str("[pricing]\n");
-	config.push_str("primary = \"mock\"\n\n");
-
-	config.push_str("[pricing.implementations.mock]\n");
-	config.push_str("# Uses default ETH/USD price of 4615.16\n\n");
-
-	config.push_str("[pricing.implementations.coingecko]\n");
-	config.push_str("# Free tier configuration (no API key required)\n");
-	config.push_str("# api_key = \"CG-YOUR-API-KEY-HERE\"\n");
-	config.push_str("cache_duration_seconds = 60\n");
-	config.push_str("rate_limit_delay_ms = 1200\n\n");
-
-	config.push_str("# Custom prices for demo/test tokens (in USD)\n");
-	config.push_str("[pricing.implementations.coingecko.custom_prices]\n");
-	config.push_str("TOKA = \"200.00\"\n");
-	config.push_str("TOKB = \"195.00\"\n\n");
-}
-
-fn add_settlement_config(
-	config: &mut String,
-	chain_ids: &[u64],
-	placeholders: &HashMap<String, String>,
-) -> Result<()> {
-	config.push_str(
-		"# ============================================================================\n",
-	);
-	config.push_str("# SETTLEMENT\n");
-	config.push_str(
-		"# ============================================================================\n",
-	);
-	config.push_str("[settlement]\n");
-	config.push_str("settlement_poll_interval_seconds = 3\n\n");
-
-	config.push_str("[settlement.implementations.direct]\n");
-	config.push_str("order = \"eip7683\"\n");
-	config.push_str(&format!("network_ids = {chain_ids:?}\n"));
-	config.push_str("dispute_period_seconds = 1\n");
-	config.push_str("# Oracle selection strategy when multiple oracles are available (First, RoundRobin, Random)\n");
-	config.push_str("oracle_selection_strategy = \"First\"\n\n");
-
-	// Oracle configuration
-	config.push_str("# Oracle configuration with multiple oracle support\n");
-	config.push_str("[settlement.implementations.direct.oracles]\n");
-
-	// Input oracles
-	config.push_str("# Input oracles (on origin chains)\n");
-	config.push_str("input = { ");
-	for (i, chain_id) in chain_ids.iter().enumerate() {
-		if i > 0 {
-			config.push_str(", ");
-		}
-		let oracle_addr = placeholders
-			.get(&format!("ORACLE_PLACEHOLDER_INPUT_{chain_id}"))
-			.ok_or_else(|| {
-				Error::InvalidConfig(format!("Missing ORACLE_PLACEHOLDER_INPUT_{chain_id}"))
-			})?;
-		config.push_str(&format!("{chain_id} = [\n    \"{oracle_addr}\",\n]"));
-	}
-	config.push_str(" }\n");
-
-	// Output oracles
-	config.push_str("# Output oracles (on destination chains)\n");
-	config.push_str("output = { ");
-	for (i, chain_id) in chain_ids.iter().enumerate() {
-		if i > 0 {
-			config.push_str(", ");
-		}
-		let oracle_addr = placeholders
-			.get(&format!("ORACLE_PLACEHOLDER_OUTPUT_{chain_id}"))
-			.ok_or_else(|| {
-				Error::InvalidConfig(format!("Missing ORACLE_PLACEHOLDER_OUTPUT_{chain_id}"))
-			})?;
-		config.push_str(&format!("{chain_id} = [\n    \"{oracle_addr}\",\n]"));
-	}
-	config.push_str(" }\n\n");
-
-	// Valid routes
-	config.push_str("# Valid routes: from origin chain -> to destination chains\n");
-	config.push_str("[settlement.implementations.direct.routes]\n");
-
-	for from_chain in chain_ids {
-		let to_chains: Vec<u64> = chain_ids
-			.iter()
-			.filter(|&c| c != from_chain)
-			.cloned()
-			.collect();
-		if !to_chains.is_empty() {
-			config.push_str(&format!("{from_chain} = {to_chains:?}\n"));
-		}
-	}
-
-	Ok(())
-}
-
-/// Generate networks.toml configuration
-fn generate_networks_config(
-	chain_ids: &[u64],
-	placeholders: &HashMap<String, String>,
-) -> Result<String> {
-	let mut config = String::new();
-
-	// Header
-	config.push_str("# Network Configuration - Generated with Placeholders\n");
-	config.push_str("# Defines all supported blockchain networks and their tokens\n\n");
-
-	// Generate configuration for each chain
+	let mut networks = serde_json::Map::new();
 	for (idx, chain_id) in chain_ids.iter().enumerate() {
-		config.push_str(&format!("[networks.{chain_id}]\n"));
-
-		// Contract addresses
 		let input_settler = placeholders
 			.get(&format!("PLACEHOLDER_INPUT_SETTLER_{chain_id}"))
 			.ok_or_else(|| {
 				Error::InvalidConfig(format!("Missing PLACEHOLDER_INPUT_SETTLER_{chain_id}"))
 			})?;
-		config.push_str(&format!("input_settler_address = \"{input_settler}\"\n"));
-
-		// InputSettlerCompact address
+		let output_settler = placeholders
+			.get(&format!("PLACEHOLDER_OUTPUT_SETTLER_{chain_id}"))
+			.ok_or_else(|| {
+				Error::InvalidConfig(format!("Missing PLACEHOLDER_OUTPUT_SETTLER_{chain_id}"))
+			})?;
 		let input_settler_compact = placeholders
 			.get(&format!("PLACEHOLDER_INPUT_SETTLER_COMPACT_{chain_id}"))
 			.ok_or_else(|| {
@@ -691,124 +560,665 @@ fn generate_networks_config(
 					"Missing PLACEHOLDER_INPUT_SETTLER_COMPACT_{chain_id}"
 				))
 			})?;
-		config.push_str(&format!(
-			"input_settler_compact_address = \"{input_settler_compact}\"\n"
-		));
-
-		// TheCompact contract address
 		let compact = placeholders
 			.get(&format!("PLACEHOLDER_COMPACT_{chain_id}"))
 			.ok_or_else(|| {
 				Error::InvalidConfig(format!("Missing PLACEHOLDER_COMPACT_{chain_id}"))
 			})?;
-		config.push_str(&format!("the_compact_address = \"{compact}\"\n"));
-
 		let allocator = placeholders
 			.get(&format!("PLACEHOLDER_ALLOCATOR_{chain_id}"))
 			.ok_or_else(|| {
 				Error::InvalidConfig(format!("Missing PLACEHOLDER_ALLOCATOR_{chain_id}"))
 			})?;
-		config.push_str(&format!("allocator_address = \"{allocator}\"\n"));
-
-		let output_settler = placeholders
-			.get(&format!("PLACEHOLDER_OUTPUT_SETTLER_{chain_id}"))
-			.ok_or_else(|| {
-				Error::InvalidConfig(format!("Missing PLACEHOLDER_OUTPUT_SETTLER_{chain_id}"))
-			})?;
-		config.push_str(&format!(
-			"output_settler_address = \"{output_settler}\"\n\n"
-		));
-
-		// RPC endpoints
-		config.push_str("# RPC endpoints with both HTTP and WebSocket URLs for each network\n");
-		config.push_str(&format!("[[networks.{chain_id}.rpc_urls]]\n"));
-
-		let port = 8545 + idx;
-		config.push_str(&format!("http = \"http://localhost:{port}\"\n"));
-		config.push_str(&format!("ws = \"ws://localhost:{port}\"\n\n"));
-
-		// Token configurations
-		config.push_str(&format!("[[networks.{chain_id}.tokens]]\n"));
 		let token_a = placeholders
 			.get(&format!("PLACEHOLDER_TOKEN_A_{chain_id}"))
 			.ok_or_else(|| {
 				Error::InvalidConfig(format!("Missing PLACEHOLDER_TOKEN_A_{chain_id}"))
 			})?;
-		config.push_str(&format!("address = \"{token_a}\"\n"));
-		config.push_str("symbol = \"TOKA\"\n");
-		config.push_str(&format!("decimals = {DEFAULT_TOKEN_DECIMALS}\n\n"));
-
-		config.push_str(&format!("[[networks.{chain_id}.tokens]]\n"));
 		let token_b = placeholders
 			.get(&format!("PLACEHOLDER_TOKEN_B_{chain_id}"))
 			.ok_or_else(|| {
 				Error::InvalidConfig(format!("Missing PLACEHOLDER_TOKEN_B_{chain_id}"))
 			})?;
-		config.push_str(&format!("address = \"{token_b}\"\n"));
-		config.push_str("symbol = \"TOKB\"\n");
-		config.push_str(&format!("decimals = {DEFAULT_TOKEN_DECIMALS}\n\n"));
+
+		let port = 8545 + idx;
+		networks.insert(
+			chain_id.to_string(),
+			serde_json::json!({
+				"input_settler_address": input_settler,
+				"output_settler_address": output_settler,
+				"input_settler_compact_address": input_settler_compact,
+				"the_compact_address": compact,
+				"allocator_address": allocator,
+				"rpc_urls": [{
+					"http": format!("http://localhost:{port}"),
+					"ws": format!("ws://localhost:{port}")
+				}],
+				"tokens": [
+					{
+						"address": token_a,
+						"symbol": "TOKA",
+						"decimals": DEFAULT_TOKEN_DECIMALS
+					},
+					{
+						"address": token_b,
+						"symbol": "TOKB",
+						"decimals": DEFAULT_TOKEN_DECIMALS
+					}
+				]
+			}),
+		);
 	}
 
-	Ok(config)
+	let routes = chain_ids
+		.iter()
+		.map(|from| {
+			let to: Vec<u64> = chain_ids.iter().copied().filter(|c| c != from).collect();
+			(from.to_string(), serde_json::json!(to))
+		})
+		.collect::<serde_json::Map<String, serde_json::Value>>();
+
+	let input_oracles = chain_ids
+		.iter()
+		.map(|chain_id| {
+			let addr = placeholders
+				.get(&format!("ORACLE_PLACEHOLDER_INPUT_{chain_id}"))
+				.cloned()
+				.unwrap_or_else(|| "0x0000000000000000000000000000000000000000".to_string());
+			(chain_id.to_string(), serde_json::json!([addr]))
+		})
+		.collect::<serde_json::Map<String, serde_json::Value>>();
+
+	let output_oracles = chain_ids
+		.iter()
+		.map(|chain_id| {
+			let addr = placeholders
+				.get(&format!("ORACLE_PLACEHOLDER_OUTPUT_{chain_id}"))
+				.cloned()
+				.unwrap_or_else(|| "0x0000000000000000000000000000000000000000".to_string());
+			(chain_id.to_string(), serde_json::json!([addr]))
+		})
+		.collect::<serde_json::Map<String, serde_json::Value>>();
+
+	let first_chain = *chain_ids.first().unwrap_or(&31337);
+	let config = serde_json::json!({
+		"solver": {
+			"id": "oif-solver-demo",
+			"min_profitability_pct": "1.0",
+			"monitoring_timeout_seconds": 28800
+		},
+		"networks": serde_json::Value::Object(networks),
+		"storage": {
+			"primary": "file",
+			"cleanup_interval_seconds": 60,
+			"implementations": {
+				"memory": {},
+				"file": {
+					"storage_path": "./data/storage",
+					"ttl_orders": 300,
+					"ttl_intents": 120,
+					"ttl_order_by_tx_hash": 300
+				}
+			}
+		},
+		"account": {
+			"primary": "local",
+			"implementations": {
+				"local": { "private_key": solver_key }
+			}
+		},
+		"delivery": {
+			"min_confirmations": 1,
+			"implementations": {
+				"evm_alloy": { "network_ids": chain_ids }
+			}
+		},
+		"discovery": {
+			"implementations": {
+				"onchain_eip7683": {
+					"network_ids": chain_ids,
+					"polling_interval_secs": 0
+				},
+				"offchain_eip7683": {
+					"api_host": "127.0.0.1",
+					"api_port": 8081,
+					"network_ids": [first_chain]
+				}
+			}
+		},
+		"order": {
+			"implementations": {
+				"eip7683": {}
+			},
+			"strategy": {
+				"primary": "simple",
+				"implementations": {
+					"simple": {
+						"max_gas_price_gwei": 100
+					}
+				}
+			}
+		},
+		"pricing": {
+			"primary": "mock",
+			"implementations": {
+				"mock": {},
+				"coingecko": {
+					"cache_duration_seconds": 60,
+					"rate_limit_delay_ms": 1200,
+					"custom_prices": {
+						"TOKA": "200.00",
+						"TOKB": "195.00"
+					}
+				}
+			}
+		},
+		"settlement": {
+			"settlement_poll_interval_seconds": 3,
+			"implementations": {
+				"direct": {
+					"order": "eip7683",
+					"network_ids": chain_ids,
+					"dispute_period_seconds": 1,
+					"oracle_selection_strategy": "First",
+					"oracles": {
+						"input": serde_json::Value::Object(input_oracles),
+						"output": serde_json::Value::Object(output_oracles)
+					},
+					"routes": serde_json::Value::Object(routes)
+				}
+			}
+		},
+		"api": {
+			"enabled": true,
+			"host": "127.0.0.1",
+			"port": 3000,
+			"timeout_seconds": 30,
+			"max_request_size": 1048576,
+			"implementations": {
+				"discovery": "offchain_eip7683"
+			},
+			"auth": {
+				"enabled": true,
+				"jwt_secret": "${JWT_SECRET:-MySuperDuperSecureSecret123!}",
+				"access_token_expiry_hours": 1,
+				"refresh_token_expiry_hours": 720,
+				"issuer": "oif-solver-demo"
+			},
+			"quote": {
+				"validity_seconds": 60
+			}
+		},
+		"gas": {
+			"flows": {
+				"resource_lock": { "open": 0, "fill": 77298, "claim": 122793 },
+				"permit2_escrow": { "open": 146306, "fill": 77298, "claim": 60084 },
+				"eip3009_escrow": { "open": 130254, "fill": 77298, "claim": 60084 }
+			}
+		}
+	});
+
+	serde_json::to_string_pretty(&config).map_err(Error::from)
 }
 
-/// Generate gas.toml configuration
-fn generate_gas_config() -> Result<String> {
-	let mut config = String::new();
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::core::{session::SessionStore, storage::Storage};
+	use serde_json::json;
+	use tempfile::TempDir;
 
-	config.push_str("[gas]\n\n");
+	use std::sync::{Mutex, OnceLock};
 
-	config.push_str("[gas.flows.resource_lock]\n");
-	config.push_str("# Gas units captured by scripts/e2e/estimate_gas.sh on local anvil\n");
-	config.push_str("open = 0\n");
-	config.push_str("fill = 77298\n");
-	config.push_str("claim = 122793\n\n");
+	fn test_lock() -> &'static Mutex<()> {
+		static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+		LOCK.get_or_init(|| Mutex::new(()))
+	}
 
-	config.push_str("[gas.flows.permit2_escrow]\n");
-	config.push_str("# Gas units captured by scripts/e2e/estimate_gas.sh on local anvil\n");
-	config.push_str("open = 146306\n");
-	config.push_str("fill = 77298\n");
-	config.push_str("claim = 60084\n\n");
+	fn acquire_lock() -> std::sync::MutexGuard<'static, ()> {
+		match test_lock().lock() {
+			Ok(guard) => guard,
+			Err(poisoned) => poisoned.into_inner(),
+		}
+	}
 
-	config.push_str("[gas.flows.eip3009_escrow]\n");
-	config.push_str("# Gas units captured by scripts/e2e/estimate_gas.sh on local anvil\n");
-	config.push_str("open = 130254\n");
-	config.push_str("fill = 77298\n");
-	config.push_str("claim = 60084\n");
+	struct EnvVarGuard {
+		key: &'static str,
+		original: Option<String>,
+	}
 
-	Ok(config)
-}
+	impl EnvVarGuard {
+		fn set(key: &'static str, value: Option<&str>) -> Self {
+			let original = std::env::var(key).ok();
+			match value {
+				Some(v) => std::env::set_var(key, v),
+				None => std::env::remove_var(key),
+			}
+			Self { key, original }
+		}
+	}
 
-/// Generate api.toml configuration
-fn generate_api_config() -> Result<String> {
-	let mut config = String::new();
+	impl Drop for EnvVarGuard {
+		fn drop(&mut self) {
+			match self.original.as_deref() {
+				Some(v) => std::env::set_var(self.key, v),
+				None => std::env::remove_var(self.key),
+			}
+		}
+	}
 
-	config.push_str("# API Server Configuration\n");
-	config.push_str("# Configures the HTTP API for receiving off-chain intents\n\n");
+	struct CwdGuard {
+		original: PathBuf,
+	}
 
-	config.push_str("[api]\n");
-	config.push_str("enabled = true\n");
-	config.push_str("host = \"127.0.0.1\"\n");
-	config.push_str("port = 3000\n");
-	config.push_str("timeout_seconds = 30\n");
-	config.push_str("max_request_size = 1048576  # 1MB\n\n");
+	impl CwdGuard {
+		fn change_to(path: &Path) -> Self {
+			let original = std::env::current_dir().expect("read current dir");
+			std::env::set_current_dir(path).expect("switch current dir");
+			Self { original }
+		}
+	}
 
-	config.push_str("[api.implementations]\n");
-	config.push_str("discovery = \"offchain_eip7683\"\n\n");
+	impl Drop for CwdGuard {
+		fn drop(&mut self) {
+			std::env::set_current_dir(&self.original).expect("restore current dir");
+		}
+	}
 
-	config.push_str("# JWT Authentication Configuration\n");
-	config.push_str("[api.auth]\n");
-	config.push_str("enabled = true\n");
-	config.push_str("jwt_secret = \"${JWT_SECRET:-MySuperDuperSecureSecret123!}\"\n");
-	config.push_str("access_token_expiry_hours = 1\n");
-	config.push_str("refresh_token_expiry_hours = 720  # 30 days\n");
-	config.push_str("issuer = \"oif-solver-demo\"\n\n");
+	fn test_settlement_config(value: serde_json::Value) -> SettlementConfig {
+		serde_json::from_value(value).expect("valid settlement config fixture")
+	}
 
-	config.push_str("# Quote Configuration\n");
-	config.push_str("[api.quote]\n");
-	config.push_str("# Quote validity duration in seconds\n");
-	config.push_str("# Default is 20 seconds. Customize as needed:\n");
-	config.push_str("validity_seconds = 60  # 1 minute validity\n");
+	#[test]
+	fn generate_placeholder_map_has_expected_entries_and_sequence() {
+		let map = generate_placeholder_map(&[1, 10]);
 
-	Ok(config)
+		assert_eq!(map.len(), 18);
+		assert_eq!(
+			map.get("PLACEHOLDER_INPUT_SETTLER_1"),
+			Some(&format!("0x{:040x}", PLACEHOLDER_START_COUNTER))
+		);
+		assert_eq!(
+			map.get("PLACEHOLDER_OUTPUT_SETTLER_1"),
+			Some(&format!("0x{:040x}", PLACEHOLDER_START_COUNTER + 1))
+		);
+		assert_eq!(
+			map.get("ORACLE_PLACEHOLDER_OUTPUT_1"),
+			Some(&format!("0x{:040x}", PLACEHOLDER_START_COUNTER + 8))
+		);
+		assert_eq!(
+			map.get("PLACEHOLDER_INPUT_SETTLER_10"),
+			Some(&format!("0x{:040x}", PLACEHOLDER_START_COUNTER + 9))
+		);
+	}
+
+	#[test]
+	fn get_input_and_output_oracle_for_chain_returns_expected_oracles() {
+		let settlement = test_settlement_config(json!({
+			"settlement_poll_interval_seconds": 3,
+			"implementations": {
+				"direct": {
+					"network_ids": [1, 2],
+					"oracles": {
+						"input": {
+							"1": ["0x1111111111111111111111111111111111111111"]
+						},
+						"output": {
+							"1": ["0x2222222222222222222222222222222222222222"]
+						}
+					}
+				}
+			}
+		}));
+
+		assert_eq!(
+			get_input_oracle_for_chain(&settlement, 1),
+			Some("0x1111111111111111111111111111111111111111".to_string())
+		);
+		assert_eq!(
+			get_output_oracle_for_chain(&settlement, 1),
+			Some("0x2222222222222222222222222222222222222222".to_string())
+		);
+		assert_eq!(get_input_oracle_for_chain(&settlement, 3), None);
+		assert_eq!(get_output_oracle_for_chain(&settlement, 3), None);
+	}
+
+	#[test]
+	fn get_oracle_for_chain_returns_none_for_malformed_shapes() {
+		let settlement = test_settlement_config(json!({
+			"settlement_poll_interval_seconds": 3,
+			"implementations": {
+				"direct": {
+					"network_ids": [1],
+					"oracles": {
+						"input": { "1": [123] },
+						"output": { "1": "not-an-array" }
+					}
+				}
+			}
+		}));
+
+		assert_eq!(get_input_oracle_for_chain(&settlement, 1), None);
+		assert_eq!(get_output_oracle_for_chain(&settlement, 1), None);
+	}
+
+	#[test]
+	fn generate_demo_config_builds_expected_networks_and_routes() {
+		let _lock = acquire_lock();
+		let placeholders = generate_placeholder_map(&[1, 10]);
+		let content = generate_demo_config(&[1, 10], "demo", &placeholders).expect("config json");
+		let parsed: serde_json::Value =
+			serde_json::from_str(&content).expect("valid generated json");
+
+		let networks = parsed["networks"]
+			.as_object()
+			.expect("networks object is present");
+		assert_eq!(networks.len(), 2);
+		assert_eq!(
+			parsed["networks"]["1"]["rpc_urls"][0]["http"],
+			"http://localhost:8545"
+		);
+		assert_eq!(
+			parsed["networks"]["10"]["rpc_urls"][0]["http"],
+			"http://localhost:8546"
+		);
+		assert_eq!(parsed["networks"]["1"]["tokens"][0]["symbol"], "TOKA");
+		assert_eq!(
+			parsed["settlement"]["implementations"]["direct"]["routes"]["1"],
+			json!([10])
+		);
+		assert_eq!(
+			parsed["settlement"]["implementations"]["direct"]["routes"]["10"],
+			json!([1])
+		);
+
+		let expected_solver_key = std::env::var(env_vars::SOLVER_PRIVATE_KEY)
+			.unwrap_or_else(|_| anvil_accounts::SOLVER_PRIVATE_KEY.to_string());
+		assert_eq!(
+			parsed["account"]["implementations"]["local"]["private_key"],
+			expected_solver_key
+		);
+	}
+
+	#[test]
+	fn generate_demo_config_uses_env_solver_private_key_when_present() {
+		let _lock = acquire_lock();
+		let _env_guard = EnvVarGuard::set(
+			env_vars::SOLVER_PRIVATE_KEY,
+			Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		);
+		let placeholders = generate_placeholder_map(&[1]);
+		let content = generate_demo_config(&[1], "demo", &placeholders).expect("config json");
+		let parsed: serde_json::Value =
+			serde_json::from_str(&content).expect("valid generated json");
+
+		assert_eq!(
+			parsed["account"]["implementations"]["local"]["private_key"],
+			"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		);
+	}
+
+	#[test]
+	fn generate_demo_config_returns_error_when_required_placeholder_missing() {
+		let mut placeholders = generate_placeholder_map(&[1]);
+		placeholders.remove("PLACEHOLDER_TOKEN_B_1");
+
+		let err = generate_demo_config(&[1], "demo", &placeholders).unwrap_err();
+		match err {
+			Error::InvalidConfig(message) => {
+				assert!(message.contains("Missing PLACEHOLDER_TOKEN_B_1"));
+			},
+			other => panic!("expected InvalidConfig, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn generate_demo_config_uses_zero_oracle_when_oracle_placeholder_missing() {
+		let mut placeholders = generate_placeholder_map(&[1]);
+		placeholders.remove("ORACLE_PLACEHOLDER_INPUT_1");
+		placeholders.remove("ORACLE_PLACEHOLDER_OUTPUT_1");
+
+		let content = generate_demo_config(&[1], "demo", &placeholders).expect("config json");
+		let parsed: serde_json::Value =
+			serde_json::from_str(&content).expect("valid generated json");
+
+		assert_eq!(
+			parsed["settlement"]["implementations"]["direct"]["oracles"]["input"]["1"],
+			json!(["0x0000000000000000000000000000000000000000"])
+		);
+		assert_eq!(
+			parsed["settlement"]["implementations"]["direct"]["oracles"]["output"]["1"],
+			json!(["0x0000000000000000000000000000000000000000"])
+		);
+	}
+
+	#[test]
+	fn generate_demo_config_empty_chains_uses_default_offchain_chain_id() {
+		let _lock = acquire_lock();
+		let content = generate_demo_config(&[], "demo", &HashMap::new()).expect("config json");
+		let parsed: serde_json::Value =
+			serde_json::from_str(&content).expect("valid generated json");
+
+		assert_eq!(
+			parsed["discovery"]["implementations"]["offchain_eip7683"]["network_ids"],
+			json!([31337])
+		);
+		assert_eq!(
+			parsed["delivery"]["implementations"]["evm_alloy"]["network_ids"],
+			json!([])
+		);
+	}
+
+	#[tokio::test]
+	async fn generate_new_config_creates_file_and_supports_force_overwrite() {
+		let _lock = acquire_lock();
+		let temp = TempDir::new().expect("temp dir");
+		let path = temp.path().join("configs").join("demo.json");
+
+		generate_new_config(&path, vec![1], false)
+			.await
+			.expect("initial create succeeds");
+		assert!(path.exists());
+
+		let parsed: serde_json::Value =
+			serde_json::from_str(&std::fs::read_to_string(&path).expect("read config"))
+				.expect("parse generated config");
+		assert!(parsed["networks"]["1"].is_object());
+
+		let exists_err = generate_new_config(&path, vec![1], false)
+			.await
+			.unwrap_err();
+		assert!(matches!(exists_err, Error::ConfigExists(_)));
+
+		generate_new_config(&path, vec![1, 10], true)
+			.await
+			.expect("force overwrite succeeds");
+		let overwritten: serde_json::Value =
+			serde_json::from_str(&std::fs::read_to_string(&path).expect("read overwritten config"))
+				.expect("parse overwritten config");
+		assert!(overwritten["networks"]["10"].is_object());
+	}
+
+	#[tokio::test]
+	async fn load_config_persists_session_with_chains_and_contracts() {
+		let _lock = acquire_lock();
+		let temp = TempDir::new().expect("temp dir");
+		let _cwd = CwdGuard::change_to(temp.path());
+
+		let path = temp.path().join("demo.json");
+		generate_new_config(&path, vec![1, 8453], false)
+			.await
+			.expect("generate config");
+
+		load_config(&path, true).await.expect("load config");
+
+		let storage_root = Path::new(".").join(".oif-demo");
+		let storage = Storage::new(&storage_root).expect("storage");
+		let session = SessionStore::load(storage).expect("session load");
+
+		assert_eq!(session.environment(), Environment::Local);
+		let mut chains = session.chains();
+		chains.sort_by_key(|chain| chain.id());
+		assert_eq!(
+			chains.iter().map(|chain| chain.id()).collect::<Vec<_>>(),
+			vec![1, 8453]
+		);
+
+		let contracts = session
+			.contracts(crate::types::chain::ChainId::from_u64(1))
+			.expect("contracts for chain 1");
+		assert!(contracts.input_settler.is_some());
+		assert!(contracts.output_settler.is_some());
+		assert!(contracts.permit2.is_some());
+		assert!(contracts.input_oracle.is_some());
+		assert!(contracts.output_oracle.is_some());
+		assert_eq!(contracts.tokens.len(), 2);
+		assert!(contracts.tokens.contains_key("TOKA"));
+		assert!(contracts.tokens.contains_key("TOKB"));
+	}
+
+	#[tokio::test]
+	async fn load_config_returns_error_for_invalid_token_address() {
+		let _lock = acquire_lock();
+		let temp = TempDir::new().expect("temp dir");
+		let _cwd = CwdGuard::change_to(temp.path());
+
+		let path = temp.path().join("demo.json");
+		generate_new_config(&path, vec![1], false)
+			.await
+			.expect("generate config");
+
+		let mut config_json: serde_json::Value =
+			serde_json::from_str(&std::fs::read_to_string(&path).expect("read config"))
+				.expect("parse config");
+		config_json["networks"]["1"]["tokens"][0]["address"] = json!("not-an-address");
+		std::fs::write(
+			&path,
+			serde_json::to_string_pretty(&config_json).expect("serialize config"),
+		)
+		.expect("write invalid config");
+
+		let err = load_config(&path, false).await.unwrap_err();
+		match err {
+			Error::InvalidConfig(message) => {
+				assert!(
+					message.to_lowercase().contains("address"),
+					"unexpected error message: {message}"
+				);
+			},
+			other => panic!("expected InvalidConfig, got {other:?}"),
+		}
+	}
+
+	fn test_seed_overrides(solver_id: &str) -> solver_types::SeedOverrides {
+		use alloy_primitives::Address;
+		use solver_types::{NetworkOverride, SeedOverrides, Token};
+		use std::str::FromStr;
+
+		SeedOverrides {
+			solver_id: Some(solver_id.to_string()),
+			networks: vec![
+				NetworkOverride {
+					chain_id: 11155420,
+					tokens: vec![Token {
+						symbol: "USDC".to_string(),
+						address: Address::from_str("0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6")
+							.expect("valid token address"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+				NetworkOverride {
+					chain_id: 84532,
+					tokens: vec![Token {
+						symbol: "USDC".to_string(),
+						address: Address::from_str("0x73c83DAcc74bB8a704717AC09703b959E74b9705")
+							.expect("valid token address"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+			],
+			account: None,
+			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
+		}
+	}
+
+	#[test]
+	fn resolve_solver_id_prefers_explicit_value() {
+		let _lock = acquire_lock();
+		let _guard = EnvVarGuard::set("SOLVER_ID", Some("from-env"));
+		let resolved =
+			resolve_solver_id(Some("explicit-solver".to_string())).expect("should resolve");
+		assert_eq!(resolved, "explicit-solver");
+	}
+
+	#[test]
+	fn resolve_solver_id_reads_env_fallback() {
+		let _lock = acquire_lock();
+		let _guard = EnvVarGuard::set("SOLVER_ID", Some("from-env"));
+		let resolved = resolve_solver_id(None).expect("should resolve from env");
+		assert_eq!(resolved, "from-env");
+	}
+
+	#[test]
+	fn resolve_solver_id_errors_when_missing() {
+		let _lock = acquire_lock();
+		let _guard = EnvVarGuard::set("SOLVER_ID", None);
+		let err = resolve_solver_id(None).expect_err("missing solver id should error");
+		let msg = err.to_string();
+		assert!(msg.contains("Solver ID not provided"));
+	}
+
+	#[tokio::test]
+	async fn load_config_from_storage_file_backend_materializes_and_loads_session() {
+		use solver_service::{config_merge::merge_to_operator_config, seeds::SeedPreset};
+		use solver_storage::StoreConfig;
+
+		let _lock = acquire_lock();
+		let temp_dir = TempDir::new().expect("temp dir");
+		let _cwd_guard = CwdGuard::change_to(temp_dir.path());
+
+		let store_path = temp_dir.path().join("store");
+		std::fs::create_dir_all(&store_path).expect("store dir");
+
+		let solver_id = "demo-storage-solver";
+		let seed = SeedPreset::Testnet.get_seed();
+		let operator_config = merge_to_operator_config(test_seed_overrides(solver_id), seed)
+			.expect("valid operator config");
+
+		let store = create_config_store::<OperatorConfig>(
+			StoreConfig::File {
+				path: store_path.to_string_lossy().to_string(),
+			},
+			operator_config_store_key(solver_id),
+		)
+		.expect("create config store");
+		store
+			.seed(operator_config)
+			.await
+			.expect("seed operator config");
+
+		let _backend_guard = EnvVarGuard::set("STORAGE_BACKEND", Some("file"));
+		let store_path_value = store_path.to_string_lossy().to_string();
+		let _path_guard = EnvVarGuard::set("STORAGE_PATH", Some(&store_path_value));
+		let _solver_guard = EnvVarGuard::set("SOLVER_ID", Some(solver_id));
+
+		let generated_path = load_config_from_storage(None, false)
+			.await
+			.expect("load config from storage");
+
+		assert!(generated_path.exists(), "generated config should exist");
+		assert!(Path::new(".oif-demo/session.json").exists());
+
+		let loaded = Config::load(&generated_path)
+			.await
+			.expect("load generated config");
+		assert_eq!(loaded.solver.solver.id, solver_id);
+		assert!(loaded.chains().len() >= 2);
+	}
 }

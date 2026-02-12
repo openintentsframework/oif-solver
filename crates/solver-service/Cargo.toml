@@ -41,7 +41,6 @@ solver-types = { path = "../solver-types", features = ["oif-interfaces"] }
 subtle = "2.6"
 thiserror = "2.0.17"
 tokio = { version = "1.0", features = ["full"] }
-toml = { workspace = true }
 tower = "0.5"
 tower-http = { version = "0.6.6", features = ["cors", "normalize-path"] }
 tracing = "0.1"

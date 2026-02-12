@@ -642,7 +642,7 @@ mod tests {
 	use super::*;
 	use crate::engine::event_bus::EventBus;
 	use solver_account::AccountService;
-	use solver_config::Config;
+	use solver_config::{Config, ConfigBuilder};
 	use solver_delivery::DeliveryService;
 	use solver_discovery::DiscoveryService;
 	use solver_order::OrderService;
@@ -668,62 +668,7 @@ mod tests {
 		EventBus,
 		Arc<TokenManager>,
 	) {
-		// Create minimal config for testing
-		let config_toml = r#"
-			[solver]
-			id = "test-solver"
-			monitoring_timeout_seconds = 30
-			min_profitability_pct = 1.0
-
-			[storage]
-			primary = "memory"
-			cleanup_interval_seconds = 3600
-			[storage.implementations.memory]
-
-			[delivery]
-			min_confirmations = 1
-			[delivery.implementations]
-
-			[account]
-			primary = "local"
-			[account.implementations.local]
-			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
-
-			[discovery]
-			[discovery.implementations]
-
-			[order]
-			[order.implementations]
-			[order.strategy]
-			primary = "simple"
-			[order.strategy.implementations.simple]
-
-			[settlement]
-			[settlement.implementations]
-
-			[networks.1]
-			chain_id = 1
-			input_settler_address = "0x1111111111111111111111111111111111111111"
-			output_settler_address = "0x2222222222222222222222222222222222222222"
-			[[networks.1.rpc_urls]]
-			http = "http://localhost:8545"
-			[[networks.1.tokens]]
-			symbol = "TEST"
-			address = "0x3333333333333333333333333333333333333333"
-			decimals = 18
-
-			[networks.2]
-			chain_id = 2
-			input_settler_address = "0x4444444444444444444444444444444444444444"
-			output_settler_address = "0x5555555555555555555555555555555555555555"
-			[[networks.2.rpc_urls]]
-			http = "http://localhost:8546"
-			[[networks.2.tokens]]
-			symbol = "TEST2"
-			address = "0x6666666666666666666666666666666666666666"
-			decimals = 18
-		"#;
-		let config: Config = toml::from_str(config_toml).expect("Failed to parse test config");
+		let config: Config = ConfigBuilder::new().build();
 
 		// Create mock services using proper constructors
 		let storage = Arc::new(StorageService::new(Box::new(
@@ -731,10 +676,9 @@ mod tests {
 		)));
 
 		// Create account service with local wallet
-		let account_config = toml::from_str(
-			r#"private_key = "0x1234567890123456789012345678901234567890123456789012345678901234""#,
-		)
-		.expect("Failed to parse account config");
+		let account_config = serde_json::json!({
+			"private_key": "0x1234567890123456789012345678901234567890123456789012345678901234"
+		});
 		let account = Arc::new(AccountService::new(
 			solver_account::implementations::local::create_account(&account_config)
 				.await
@@ -755,7 +699,7 @@ mod tests {
 		let discovery = Arc::new(DiscoveryService::new(std::collections::HashMap::new()));
 
 		// Create order service - needs implementations and strategy
-		let strategy_config = toml::Value::Table(toml::value::Table::new());
+		let strategy_config = serde_json::Value::Object(serde_json::Map::new());
 		let strategy =
 			solver_order::implementations::strategies::simple::create_strategy(&strategy_config)
 				.expect("Failed to create strategy");
@@ -768,7 +712,7 @@ mod tests {
 		let settlement = Arc::new(SettlementService::new(std::collections::HashMap::new(), 20));
 
 		// Create pricing service with mock implementation
-		let pricing_config = toml::Value::Table(toml::value::Table::new());
+		let pricing_config = serde_json::Value::Object(serde_json::Map::new());
 		let pricing_impl =
 			solver_pricing::implementations::mock::create_mock_pricing(&pricing_config)
 				.expect("Failed to create mock pricing");

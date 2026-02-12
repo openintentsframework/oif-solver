@@ -302,6 +302,7 @@ mod tests {
 	use alloy_primitives::U256;
 	use mockall::predicate::eq;
 	use serde_json::json;
+	use serde_json::Value;
 	use solver_account::{implementations::local::LocalWallet, AccountService};
 	use solver_config::{Config, ConfigBuilder};
 	use solver_core::{engine::token_manager::TokenManager, EventBus, SolverEngine};
@@ -314,7 +315,6 @@ mod tests {
 	use solver_types::utils::tests::builders::OrderBuilder;
 	use solver_types::{order::Order, OrderStatus, TransactionHash};
 	use std::{collections::HashMap, sync::Arc};
-	use toml::Value;
 
 	const TEST_PK: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 	const TEST_ADDR: &str = "0x1234567890123456789012345678901234567890";
@@ -341,7 +341,7 @@ mod tests {
 		let providers: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> = HashMap::new();
 		let delivery = Arc::new(DeliveryService::new(providers, 1, 3));
 		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
-		let strategy = create_strategy(&Value::Table(toml::map::Map::new())).unwrap();
+		let strategy = create_strategy(&Value::Object(serde_json::Map::new())).unwrap();
 		let order = Arc::new(OrderService::new(HashMap::new(), strategy));
 		let settlement = Arc::new(SettlementService::new(HashMap::new(), 3));
 		let event_bus = EventBus::new(64);
@@ -354,7 +354,7 @@ mod tests {
 		let solver_address = addr();
 
 		// Create a mock pricing service for tests
-		let pricing_config = toml::Value::Table(toml::map::Map::new());
+		let pricing_config = serde_json::Value::Object(serde_json::Map::new());
 		let pricing_impl = mock::create_mock_pricing(&pricing_config).unwrap();
 		let pricing = Arc::new(PricingService::new(pricing_impl, Vec::new()));
 
