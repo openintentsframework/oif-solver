@@ -1186,9 +1186,10 @@ The demo tool generates files in the `.oif-demo/requests/` directory following a
 
 The demo tool provides a complete workflow for setting up a test environment:
 
-1. **Initialize Configuration** (`init new` / `init load`):
+1. **Initialize Configuration** (`init new` / `init load` / `init load-storage`):
 
    - Creates or loads solver configuration
+   - Can load runtime config directly from storage backend (`init load-storage`)
    - Sets up network definitions and RPC endpoints
    - Configures account keys and signing
    - Stores session data in `.oif-demo/` directory
