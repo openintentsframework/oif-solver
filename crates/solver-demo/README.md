@@ -169,8 +169,13 @@ oif-demo intent build \
 
 #### 1. Setup Environment
 ```bash
-# Load testnet configuration
-oif-demo init load config/seed-overrides-testnet.json
+# Load runtime configuration from the same storage backend used by solver-service
+export STORAGE_BACKEND=redis
+export REDIS_URL=redis://127.0.0.1:6379
+export SOLVER_ID=your-solver-id
+oif-demo init load-storage
+# or:
+oif-demo init load-storage --solver-id your-solver-id
 
 # List tokens and accounts
 oif-demo token list
@@ -265,6 +270,26 @@ oif-demo intent test ./.oif-demo/requests/post_orders.req.json
 
 ## Configuration
 
+### Load From Running Solver Storage
+
+`oif-demo init load-storage` reads the persisted `OperatorConfig` from the active
+storage backend (Redis/file/memory), converts it to runtime config, and initializes
+the demo session.
+
+```bash
+# Same backend variables used by solver-service
+export STORAGE_BACKEND=redis
+export REDIS_URL=redis://127.0.0.1:6379
+export SOLVER_ID=your-solver-id
+
+oif-demo init load-storage
+```
+
+Notes:
+- If `--solver-id` is omitted, `SOLVER_ID` is used.
+- The command looks up key `<SOLVER_ID>-operator`.
+- For cross-process usage, use `redis` or `file`; `memory` is process-local.
+
 ### Environment Variables (`.env`)
 ```bash
 # User Account (creates intents)
@@ -291,6 +316,9 @@ oif-demo init new <path> [--force] [--chains <chain_ids>]
 
 # Load configuration
 oif-demo init load <path> [--local]
+
+# Load configuration from storage backend
+oif-demo init load-storage [--solver-id <id>] [--local]
 ```
 
 ### Environment Commands
