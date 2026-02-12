@@ -1359,14 +1359,14 @@ fn build_api_config(
 			admin_addresses: admin.admin_addresses.clone(),
 		});
 
-		AuthConfig {
+		Some(AuthConfig {
 			enabled: auth_enabled.unwrap_or(false),
 			jwt_secret: SecretString::new(jwt_secret),
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720, // 30 days
 			issuer: "oif-solver".to_string(),
 			admin: admin_config,
-		}
+		})
 	} else {
 		None
 	};
