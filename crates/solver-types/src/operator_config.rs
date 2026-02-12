@@ -25,6 +25,7 @@
 //! config_store.update(config, version).await?;
 //! ```
 
+use crate::networks::NetworkType;
 use alloy_primitives::Address;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,10 @@ use std::collections::HashMap;
 pub struct OperatorConfig {
 	/// Unique solver instance identifier.
 	pub solver_id: String,
+
+	/// Optional human-readable solver name.
+	#[serde(default)]
+	pub solver_name: Option<String>,
 
 	/// Per-network configuration, keyed by chain ID.
 	pub networks: HashMap<u64, OperatorNetworkConfig>,
@@ -89,6 +94,10 @@ pub struct OperatorNetworkConfig {
 	/// Human-readable network name.
 	pub name: String,
 
+	/// Network role classification.
+	#[serde(default, rename = "type")]
+	pub network_type: NetworkType,
+
 	/// Tokens supported on this network.
 	pub tokens: Vec<OperatorToken>,
 
@@ -116,6 +125,10 @@ pub struct OperatorNetworkConfig {
 pub struct OperatorToken {
 	/// Token symbol (e.g., "USDC", "WETH").
 	pub symbol: String,
+
+	/// Optional human-readable token name (e.g., "USD Coin").
+	#[serde(default)]
+	pub name: Option<String>,
 
 	/// Token contract address.
 	pub address: Address,
@@ -413,6 +426,7 @@ mod tests {
 	fn test_operator_token_serialization() {
 		let token = OperatorToken {
 			symbol: "USDC".to_string(),
+			name: Some("USD Coin".to_string()),
 			address: test_token_address(),
 			decimals: 6,
 		};
@@ -421,6 +435,7 @@ mod tests {
 		let parsed: OperatorToken = serde_json::from_str(&json).unwrap();
 
 		assert_eq!(parsed.symbol, "USDC");
+		assert_eq!(parsed.name, Some("USD Coin".to_string()));
 		assert_eq!(parsed.decimals, 6);
 		assert_eq!(parsed.address, token.address);
 	}
@@ -461,14 +476,17 @@ mod tests {
 		let network = OperatorNetworkConfig {
 			chain_id: 10,
 			name: "optimism".to_string(),
+			network_type: NetworkType::Parent,
 			tokens: vec![
 				OperatorToken {
 					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
 					address: test_token_address(),
 					decimals: 6,
 				},
 				OperatorToken {
 					symbol: "WETH".to_string(),
+					name: Some("Wrapped Ether".to_string()),
 					address: test_address(),
 					decimals: 18,
 				},
@@ -512,6 +530,7 @@ mod tests {
 	fn test_operator_config_json_roundtrip() {
 		let config = OperatorConfig {
 			solver_id: "test-solver".to_string(),
+			solver_name: Some("Test Solver".to_string()),
 			networks: {
 				let mut networks = HashMap::new();
 				networks.insert(
@@ -519,8 +538,10 @@ mod tests {
 					OperatorNetworkConfig {
 						chain_id: 10,
 						name: "optimism".to_string(),
+						network_type: NetworkType::Parent,
 						tokens: vec![OperatorToken {
 							symbol: "USDC".to_string(),
+							name: Some("USD Coin".to_string()),
 							address: test_token_address(),
 							decimals: 6,
 						}],
@@ -588,6 +609,7 @@ mod tests {
 		let parsed: OperatorConfig = serde_json::from_str(&json).unwrap();
 
 		assert_eq!(parsed.solver_id, "test-solver");
+		assert_eq!(parsed.solver_name, Some("Test Solver".to_string()));
 		assert_eq!(parsed.networks.len(), 1);
 		assert!(parsed.networks.contains_key(&10));
 		assert_eq!(parsed.admin.admin_addresses.len(), 1);

@@ -322,7 +322,7 @@ cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
 cargo run -- --seed mainnet --seed-overrides config/seed-overrides-mainnet.json
 
 # Or pass JSON directly (useful for deployment services)
-cargo run -- --seed testnet --seed-overrides '{"solver_id":"my-solver","networks":[{"chain_id":11155420,"tokens":[{"symbol":"USDC","address":"0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6","decimals":6}]},{"chain_id":84532,"tokens":[{"symbol":"USDC","address":"0x73c83DAcc74bB8a704717AC09703b959E74b9705","decimals":6}]}]}'
+cargo run -- --seed testnet --seed-overrides '{"solver_id":"my-solver","solver_name":"My Testnet Solver","networks":[{"chain_id":11155420,"name":"optimism-sepolia","type":"parent","tokens":[{"symbol":"USDC","name":"USD Coin","address":"0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6","decimals":6}]},{"chain_id":84532,"name":"base-sepolia","type":"hub","tokens":[{"symbol":"USDC","name":"USD Coin","address":"0x73c83DAcc74bB8a704717AC09703b959E74b9705","decimals":6}]}]}'
 
 # Force re-seed (overwrite existing)
 cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json --force-seed
@@ -345,6 +345,7 @@ Create a JSON file specifying which networks and tokens to support (these overri
 ```json
 {
   "solver_id": "my-solver-instance",
+  "solver_name": "My Solver Instance",
   "min_profitability_pct": "2.5",
   "gas_buffer_bps": 1500,
   "commission_bps": 20,
@@ -352,9 +353,12 @@ Create a JSON file specifying which networks and tokens to support (these overri
   "networks": [
     {
       "chain_id": 11155420,
+      "name": "optimism-sepolia",
+      "type": "parent",
       "tokens": [
         {
           "symbol": "USDC",
+          "name": "USD Coin",
           "address": "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6",
           "decimals": 6
         }
@@ -362,9 +366,12 @@ Create a JSON file specifying which networks and tokens to support (these overri
     },
     {
       "chain_id": 84532,
+      "name": "base-sepolia",
+      "type": "hub",
       "tokens": [
         {
           "symbol": "USDC",
+          "name": "USD Coin",
           "address": "0x73c83DAcc74bB8a704717AC09703b959E74b9705",
           "decimals": 6
         }
@@ -376,6 +383,7 @@ Create a JSON file specifying which networks and tokens to support (these overri
 ```
 
 Optional fee overrides can be set at the top level: `min_profitability_pct` (decimal string), `gas_buffer_bps`, `commission_bps`, and `rate_buffer_bps` (basis points).
+Optional network types are: `parent`, `hub`, and `new`.
 
 **Note:** The `solver_id` field is optional but recommended. If provided, seeding becomes idempotent (re-running `--seed` with same config skips seeding). After seeding, set `SOLVER_ID` env var for subsequent runs.
 
@@ -730,10 +738,10 @@ sequenceDiagram
 
 - **GET `/api/v1/tokens`** - Get all supported tokens across all networks
 
-  - Returns a map of chain IDs to network configurations with supported tokens
+  - Returns a map of chain IDs to network configurations with supported tokens, including network `name`/`type` and token `name`
 
 - **GET `/api/v1/tokens/{chain_id}`** - Get supported tokens for a specific chain
-  - Returns network configuration including settler addresses and token list
+  - Returns network configuration (including `name`/`type`) and token list (including token `name`)
 
 #### Health
 
@@ -801,6 +809,7 @@ The admin API enables authorized wallet addresses to perform administrative oper
       "contents": {
         "chainId": 10,
         "symbol": "USDC",
+        "name": "USD Coin",
         "tokenAddress": "0x...",
         "decimals": 6,
         "nonce": 1706184000123456,
