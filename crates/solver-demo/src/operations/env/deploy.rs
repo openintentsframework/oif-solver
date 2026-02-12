@@ -264,7 +264,7 @@ impl ContractDeployer {
 	async fn deploy_permit2_from_bytecode(&self, provider: &Provider) -> Result<Address> {
 		// Read Permit2 bytecode from file
 		let bytecode_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-			.join("src/operations/env/data/permit2_bytecode.hex");
+			.join("data/permit2_bytecode.hex");
 
 		let bytecode_hex = std::fs::read_to_string(&bytecode_path)
 			.map_err(|e| Error::InvalidConfig(format!("Failed to read Permit2 bytecode: {e}")))?;
