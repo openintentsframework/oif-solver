@@ -6,16 +6,18 @@ info:
 
     ## Authentication Flow
 
-    1. **Client Registration**: POST /auth/register to obtain initial access and refresh tokens
-    2. **API Access**: Include access token in Authorization header: `Bearer <access_token>`
-    3. **Token Refresh**: When access token expires, POST /auth/refresh with refresh token to get new tokens
-    4. **Scope-Based Authorization**: Different endpoints require different scopes
+    1. **Privileged Client Auth**: POST /auth/token with `client_id + client_secret` to obtain admin access token
+    2. **Optional Public Registration**: POST /auth/register (if enabled) for non-admin scopes
+    3. **API Access**: Include access token in Authorization header: `Bearer <access_token>`
+    4. **Token Refresh**: For register-issued tokens, POST /auth/refresh with refresh token
+    5. **Scope-Based Authorization**: Different endpoints require different scopes
 
     ## Token Lifecycle
 
-    - **Access Tokens**: Short-lived (default 1 hour), used for API authentication
+    - **Access Tokens**: Short-lived, used for API authentication
+    - **Client Credentials Tokens**: Default 900 seconds, no refresh token
     - **Refresh Tokens**: Long-lived (default 30 days), used to obtain new access tokens
-    - **Token Rotation**: Each refresh invalidates the old refresh token and issues a new one
+    - **Token Rotation**: Refresh endpoint returns a new refresh token
 
     ## Scopes
 
@@ -26,8 +28,8 @@ info:
     ## Security Notes
 
     - Authentication is optional and configured per solver instance
-    - If authentication is disabled, all endpoints are publicly accessible
-    - Refresh tokens are single-use and automatically rotated on each refresh
+    - If `auth.enabled = false`, auth endpoints are unavailable
+    - `/auth/register` cannot issue `admin-all`
     - Client IDs must be between 3-100 characters
   version: 1.0.0
 servers:
@@ -37,12 +39,91 @@ servers:
     description: Production server (replace with actual URL)
 
 paths:
+  /auth/token:
+    post:
+      summary: Issue access token with client credentials
+      description: |
+        Issues an access token for privileged clients using `client_id + client_secret`.
+        This endpoint supports `grant_type=client_credentials` and only allows `admin-all`.
+
+        This flow returns an access token only (no refresh token). Clients should request
+        a new token when it expires.
+      operationId: issueClientToken
+      tags:
+        - Authentication
+      requestBody:
+        required: true
+        description: Client credentials token request
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TokenRequest"
+            example:
+              grant_type: "client_credentials"
+              client_id: "solver-admin"
+              client_secret: "replace-with-your-client-secret"
+              scope: "admin-all"
+      responses:
+        "200":
+          description: Access token issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+              example:
+                access_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                token_type: "Bearer"
+                expires_in: 900
+                scope: "admin-all"
+        "400":
+          description: Invalid grant_type or scope
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                unsupportedGrantType:
+                  value:
+                    error: "unsupported_grant_type"
+                    error_description: "grant_type must be client_credentials"
+                invalidScope:
+                  value:
+                    error: "invalid_scope"
+                    error_description: "only admin-all scope is supported by /auth/token"
+        "401":
+          description: Invalid client credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "invalid_client"
+                error_description: "invalid client credentials"
+        "429":
+          description: Too many failed authentication attempts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "too_many_requests"
+                error_description: "too many failed authentication attempts"
+        "503":
+          description: Authentication service unavailable or disabled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "Authentication service is not configured"
+
   /auth/register:
     post:
       summary: Register a new client
       description: |
         Allows clients to self-register and receive both access and refresh tokens
-        for API authentication. This endpoint is used for initial client onboarding.
+        for API authentication. This endpoint is optional and typically disabled
+        unless explicitly enabled by the solver operator.
 
         The access token has a short expiry (1 hour by default) and should be included
         in the Authorization header for subsequent API calls. The refresh token has a
@@ -50,6 +131,7 @@ paths:
         when the access token expires.
 
         If no scopes are provided, the client is granted basic read permissions (read-orders).
+        `admin-all` is not allowed on this endpoint.
       operationId: registerClient
       tags:
         - Authentication
@@ -72,12 +154,6 @@ paths:
                   client_id: "solver-integration"
                   client_name: "Solver Integration Service"
                   scopes: ["read-orders", "create-orders"]
-              adminAccess:
-                summary: Registration with admin access
-                value:
-                  client_id: "admin-dashboard"
-                  client_name: "Admin Dashboard"
-                  scopes: ["admin-all"]
       responses:
         "201":
           description: Client successfully registered
@@ -94,7 +170,7 @@ paths:
                 scopes: ["read-orders"]
                 token_type: "Bearer"
         "400":
-          description: Invalid request (empty or invalid client_id, invalid scopes)
+          description: Invalid request (empty or invalid client_id, invalid or privileged scopes)
           content:
             application/json:
               schema:
@@ -109,6 +185,17 @@ paths:
                 invalidScopes:
                   value:
                     error: "Invalid scopes: Unknown scope: invalid-scope"
+                privilegedScope:
+                  value:
+                    error: "Invalid scopes: admin-all scope is not allowed on /auth/register"
+        "403":
+          description: Public registration disabled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "Public client registration is disabled"
         "500":
           description: Failed to generate tokens (internal server error)
           content:
@@ -131,12 +218,7 @@ paths:
       summary: Refresh access token
       description: |
         Exchanges a valid refresh token for new access and refresh tokens.
-        The old refresh token is invalidated and cannot be reused.
-
-        This endpoint implements token rotation for enhanced security:
-        - Each refresh operation generates both a new access token and a new refresh token
-        - The old refresh token is immediately invalidated
-        - If the old refresh token is reused, the request will fail
+        This endpoint returns a new refresh token alongside the new access token.
 
         Use this endpoint when the access token expires (typically after 1 hour)
         to continue making authenticated API calls.
@@ -194,6 +276,52 @@ paths:
 
 components:
   schemas:
+    TokenRequest:
+      type: object
+      description: Request payload for client credentials token issuance
+      properties:
+        grant_type:
+          type: string
+          enum: ["client_credentials"]
+          description: Must be `client_credentials`
+          example: "client_credentials"
+        client_id:
+          type: string
+          description: Client identifier (used when Basic auth header is not provided)
+          example: "solver-admin"
+        client_secret:
+          type: string
+          description: Client secret (used when Basic auth header is not provided)
+          example: "replace-with-your-client-secret"
+        scope:
+          type: string
+          description: Requested scope; only `admin-all` is supported
+          example: "admin-all"
+
+    TokenResponse:
+      type: object
+      description: Response payload for successful client credentials token issuance
+      required:
+        - access_token
+        - token_type
+        - expires_in
+        - scope
+      properties:
+        access_token:
+          type: string
+          description: JWT access token
+          example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+        token_type:
+          type: string
+          example: "Bearer"
+        expires_in:
+          type: integer
+          description: Token lifetime in seconds
+          example: 900
+        scope:
+          type: string
+          example: "admin-all"
+
     RegisterRequest:
       type: object
       description: Request payload for client registration
@@ -219,10 +347,9 @@ components:
             Available scopes:
             - read-orders: Read access to order information
             - create-orders: Permission to create new orders
-            - admin-all: Full administrative access
           items:
             type: string
-            enum: ["read-orders", "create-orders", "admin-all"]
+            enum: ["read-orders", "create-orders", "read-quotes", "create-quotes"]
           example: ["read-orders", "create-orders"]
 
     RefreshRequest:
@@ -302,7 +429,7 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        JWT token obtained from /auth/register or /auth/refresh.
+        JWT token obtained from /auth/token, /auth/register, or /auth/refresh.
         Include in requests as: `Authorization: Bearer <access_token>`
 
 security:

@@ -20,7 +20,7 @@ use crate::{
 use alloy_primitives::U256;
 use axum::{
 	extract::{Extension, Path, State},
-	http::StatusCode,
+	http::{HeaderMap, StatusCode},
 	middleware,
 	response::{IntoResponse, Json},
 	routing::{delete, get, post, put},
@@ -265,6 +265,7 @@ pub async fn start_server(
 	// Add auth subroutes
 	let auth_routes = Router::new()
 		.route("/register", post(handle_auth_register))
+		.route("/token", post(handle_auth_token))
 		.route("/refresh", post(handle_auth_refresh));
 
 	api_routes = api_routes.nest("/auth", auth_routes);
@@ -461,6 +462,17 @@ async fn handle_auth_refresh(
 	Json(payload): Json<crate::apis::auth::RefreshRequest>,
 ) -> impl IntoResponse {
 	crate::apis::auth::refresh_token(State(state.jwt_service), Json(payload)).await
+}
+
+/// Handles POST /api/v1/auth/token requests.
+///
+/// Endpoint issues access tokens via client credentials.
+async fn handle_auth_token(
+	State(state): State<AppState>,
+	headers: HeaderMap,
+	Json(payload): Json<crate::apis::auth::TokenRequest>,
+) -> impl IntoResponse {
+	crate::apis::auth::issue_client_token(State(state.jwt_service), headers, Json(payload)).await
 }
 
 /// Handles POST /api/v1/orders requests.

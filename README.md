@@ -234,6 +234,35 @@ cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
 cargo run --
 ```
 
+### Auth Quickstart (when `auth_enabled = true`)
+
+If you enable API auth in your seed overrides (`"auth_enabled": true`), set:
+
+```bash
+export JWT_SECRET=replace_with_a_strong_random_value
+export AUTH_CLIENT_SECRET=replace_with_a_strong_random_value_at_least_32_chars
+
+# Optional
+export AUTH_CLIENT_ID=solver-admin
+export AUTH_PUBLIC_REGISTER_ENABLED=false
+```
+
+If `auth_enabled = false`, `AUTH_CLIENT_SECRET`, `AUTH_CLIENT_ID`, and
+`AUTH_PUBLIC_REGISTER_ENABLED` are ignored.
+
+Get an admin token:
+
+```bash
+curl -X POST http://localhost:3000/api/v1/auth/token \
+  -H "Content-Type: application/json" \
+  -d '{
+    "grant_type": "client_credentials",
+    "client_id": "solver-admin",
+    "client_secret": "replace_with_your_auth_client_secret",
+    "scope": "admin-all"
+  }'
+```
+
 ## Docker
 
 The solver can be run in a Docker container for production deployments.
@@ -829,7 +858,8 @@ The admin API enables authorized wallet addresses to perform administrative oper
 4. Sign with your admin wallet (EIP-712)
 5. Submit the signed action to the appropriate endpoint
 
-**Note:** If API auth is enabled (`auth.enabled = true`), protected admin endpoints also require a JWT with `AdminAll` scope. Public endpoints remain unauthenticated.
+**Note:** If API auth is enabled (`auth.enabled = true`), protected admin endpoints also require a JWT with `AdminAll` scope. Use `POST /api/v1/auth/token` with `client_id + client_secret` to obtain it.
+**Note:** `POST /api/v1/auth/register` never issues `admin-all` and is disabled by default unless `AUTH_PUBLIC_REGISTER_ENABLED=true`.
 **Note:** Admin withdrawals require `admin.withdrawals.enabled = true` in config.
 
 #### Fees and Profitability
@@ -926,14 +956,27 @@ curl http://localhost:3000/api/v1/tokens
 # Health check
 curl http://localhost:3000/health
 
-# Admin: Get nonce for signing
-curl http://localhost:3000/api/v1/admin/nonce
+# Admin: Get JWT for protected admin endpoints (when auth is enabled)
+TOKEN=$(curl -s -X POST http://localhost:3000/api/v1/auth/token \
+  -H "Content-Type: application/json" \
+  -d '{
+    "grant_type": "client_credentials",
+    "client_id": "solver-admin",
+    "client_secret": "replace_with_your_auth_client_secret",
+    "scope": "admin-all"
+  }' | jq -r '.access_token')
+
+# Admin: Get nonce for signing (protected)
+curl http://localhost:3000/api/v1/admin/nonce \
+  -H "Authorization: Bearer $TOKEN"
 
 # Admin: Get EIP-712 types for signing
-curl http://localhost:3000/api/v1/admin/types
+curl http://localhost:3000/api/v1/admin/types \
+  -H "Authorization: Bearer $TOKEN"
 
 # Admin: Get solver balances (protected)
-curl http://localhost:3000/api/v1/admin/balances
+curl http://localhost:3000/api/v1/admin/balances \
+  -H "Authorization: Bearer $TOKEN"
 
 # Admin: Get solver config snapshot (public)
 curl http://localhost:3000/api/v1/admin/config

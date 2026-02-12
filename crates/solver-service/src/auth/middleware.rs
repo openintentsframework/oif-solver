@@ -152,6 +152,9 @@ mod tests {
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,
 			issuer: "test".to_string(),
+			public_register_enabled: false,
+			token_client_id: "solver-admin".to_string(),
+			token_client_secret: None,
 			admin: None,
 		};
 
@@ -184,6 +187,9 @@ mod tests {
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,
 			issuer: "test".to_string(),
+			public_register_enabled: false,
+			token_client_id: "solver-admin".to_string(),
+			token_client_secret: None,
 			admin: None,
 		};
 
@@ -211,6 +217,9 @@ mod tests {
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,
 			issuer: "test".to_string(),
+			public_register_enabled: false,
+			token_client_id: "solver-admin".to_string(),
+			token_client_secret: None,
 			admin: None,
 		};
 

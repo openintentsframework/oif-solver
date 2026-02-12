@@ -1,14 +1,32 @@
 //! Authentication endpoints for JWT token management.
 //!
-//! This module provides endpoints for client registration and token refresh
-//! operations for API authentication.
+//! This module provides endpoints for client registration, client credentials
+//! token issuance, and token refresh operations for API authentication.
 
 use crate::auth::JwtService;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+	extract::State,
+	http::{HeaderMap, StatusCode},
+	response::IntoResponse,
+	Json,
+};
+use base64::Engine;
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use solver_types::AuthScope;
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
+use subtle::ConstantTimeEq;
+
+const TOKEN_DEFAULT_TTL_SECONDS: u32 = 900;
+const TOKEN_MAX_TTL_SECONDS: u32 = 3600;
+const TOKEN_RATE_LIMIT_PER_MINUTE: usize = 30;
+const TOKEN_RATE_LIMIT_IP_PER_MINUTE: usize = 120;
+const RATE_LIMIT_WINDOW_SECONDS: i64 = 60;
+
+static FAILED_AUTH_BY_CLIENT: Lazy<DashMap<String, VecDeque<i64>>> = Lazy::new(DashMap::new);
+static FAILED_AUTH_BY_IP: Lazy<DashMap<String, VecDeque<i64>>> = Lazy::new(DashMap::new);
 
 /// Request payload for client registration
 #[derive(Debug, Serialize, Deserialize)]
@@ -47,6 +65,32 @@ pub struct RefreshRequest {
 	pub refresh_token: String,
 }
 
+/// Request payload for client credentials token issuance.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TokenRequest {
+	/// OAuth2 grant type (must be "client_credentials")
+	pub grant_type: Option<String>,
+	/// Optional fallback client id when Authorization: Basic is not provided
+	pub client_id: Option<String>,
+	/// Optional fallback client secret when Authorization: Basic is not provided
+	pub client_secret: Option<String>,
+	/// Requested scope (pilot accepts only "admin-all")
+	pub scope: Option<String>,
+}
+
+/// Response payload for client credentials token issuance.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TokenResponse {
+	/// The generated access token
+	pub access_token: String,
+	/// Token type (always "Bearer")
+	pub token_type: String,
+	/// Access token lifetime in seconds
+	pub expires_in: u32,
+	/// Granted scope
+	pub scope: String,
+}
+
 /// Handles POST /api/v1/auth/register requests.
 ///
 /// This endpoint allows clients to self-register and receive both access and refresh tokens
@@ -69,6 +113,26 @@ pub async fn register_client(
 				.into_response();
 		},
 	};
+
+	if !jwt_service.config().enabled {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			Json(json!({
+				"error": "Authentication is disabled"
+			})),
+		)
+			.into_response();
+	}
+
+	if !jwt_service.config().public_register_enabled {
+		return (
+			StatusCode::FORBIDDEN,
+			Json(json!({
+				"error": "Public client registration is disabled"
+			})),
+		)
+			.into_response();
+	}
 
 	// Validate client_id
 	if request.client_id.is_empty() {
@@ -93,7 +157,7 @@ pub async fn register_client(
 	}
 
 	// Parse requested scopes or use defaults
-	let scopes = match parse_scopes(request.scopes) {
+	let scopes = match parse_public_scopes(request.scopes) {
 		Ok(scopes) => scopes,
 		Err(e) => {
 			return (
@@ -186,7 +250,6 @@ pub async fn register_client(
 /// Handles POST /api/v1/auth/refresh requests.
 ///
 /// This endpoint exchanges a valid refresh token for new access and refresh tokens.
-/// The old refresh token is invalidated and cannot be reused.
 pub async fn refresh_token(
 	State(jwt_service): State<Option<Arc<JwtService>>>,
 	Json(request): Json<RefreshRequest>,
@@ -204,6 +267,16 @@ pub async fn refresh_token(
 				.into_response();
 		},
 	};
+
+	if !jwt_service.config().enabled {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			Json(json!({
+				"error": "Authentication is disabled"
+			})),
+		)
+			.into_response();
+	}
 
 	// Validate refresh token is not empty
 	if request.refresh_token.is_empty() {
@@ -279,6 +352,243 @@ pub async fn refresh_token(
 	(StatusCode::OK, Json(response)).into_response()
 }
 
+/// Handles POST /api/v1/auth/token requests.
+///
+/// Issues an access token using client credentials. This endpoint is intended
+/// for privileged machine clients and issues access tokens only (no refresh token).
+pub async fn issue_client_token(
+	State(jwt_service): State<Option<Arc<JwtService>>>,
+	headers: HeaderMap,
+	Json(request): Json<TokenRequest>,
+) -> impl IntoResponse {
+	let jwt_service = match jwt_service {
+		Some(service) => service,
+		None => {
+			return (
+				StatusCode::SERVICE_UNAVAILABLE,
+				Json(json!({
+					"error": "Authentication service is not configured"
+				})),
+			)
+				.into_response();
+		},
+	};
+
+	if !jwt_service.config().enabled {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			Json(json!({
+				"error": "Authentication is disabled"
+			})),
+		)
+			.into_response();
+	}
+
+	let configured_secret = match jwt_service.config().token_client_secret.as_ref() {
+		Some(secret) => secret,
+		None => {
+			return (
+				StatusCode::SERVICE_UNAVAILABLE,
+				Json(json!({
+					"error": "Client credentials authentication is not configured"
+				})),
+			)
+				.into_response();
+		},
+	};
+
+	let grant_type = request
+		.grant_type
+		.as_deref()
+		.unwrap_or("client_credentials")
+		.trim();
+	if grant_type != "client_credentials" {
+		return oauth_error_response(
+			StatusCode::BAD_REQUEST,
+			"unsupported_grant_type",
+			"grant_type must be client_credentials",
+		);
+	}
+
+	let requested_scope = request.scope.as_deref().unwrap_or("admin-all").trim();
+	if requested_scope != "admin-all" {
+		return oauth_error_response(
+			StatusCode::BAD_REQUEST,
+			"invalid_scope",
+			"only admin-all scope is supported by /auth/token",
+		);
+	}
+
+	let (client_id, client_secret) = match extract_client_credentials(&headers, &request) {
+		Some(credentials) => credentials,
+		None => {
+			return oauth_error_response(
+				StatusCode::UNAUTHORIZED,
+				"invalid_client",
+				"missing client credentials",
+			);
+		},
+	};
+	let source_ip = extract_source_ip(&headers);
+	let now = chrono::Utc::now().timestamp();
+
+	if is_rate_limited(
+		&FAILED_AUTH_BY_CLIENT,
+		&client_id,
+		TOKEN_RATE_LIMIT_PER_MINUTE,
+		now,
+	) || is_rate_limited(
+		&FAILED_AUTH_BY_IP,
+		&source_ip,
+		TOKEN_RATE_LIMIT_IP_PER_MINUTE,
+		now,
+	) {
+		return oauth_error_response(
+			StatusCode::TOO_MANY_REQUESTS,
+			"too_many_requests",
+			"too many failed authentication attempts",
+		);
+	}
+
+	let valid_client_id = client_id == jwt_service.config().token_client_id;
+	let valid_secret =
+		configured_secret.with_exposed(|expected| secrets_match(&client_secret, expected));
+	if !valid_client_id || !valid_secret {
+		record_failed_attempt(&FAILED_AUTH_BY_CLIENT, &client_id, now);
+		record_failed_attempt(&FAILED_AUTH_BY_IP, &source_ip, now);
+		return oauth_error_response(
+			StatusCode::UNAUTHORIZED,
+			"invalid_client",
+			"invalid client credentials",
+		);
+	}
+
+	let expires_in = TOKEN_DEFAULT_TTL_SECONDS.min(TOKEN_MAX_TTL_SECONDS);
+	let access_token = match jwt_service.generate_access_token_with_ttl_seconds(
+		&client_id,
+		vec![AuthScope::AdminAll],
+		expires_in,
+	) {
+		Ok(token) => token,
+		Err(e) => {
+			tracing::error!("Failed to generate access token via /auth/token: {}", e);
+			return (
+				StatusCode::INTERNAL_SERVER_ERROR,
+				Json(json!({
+					"error": "Failed to generate access token"
+				})),
+			)
+				.into_response();
+		},
+	};
+
+	let response = TokenResponse {
+		access_token,
+		token_type: "Bearer".to_string(),
+		expires_in,
+		scope: "admin-all".to_string(),
+	};
+	(StatusCode::OK, Json(response)).into_response()
+}
+
+fn oauth_error_response(
+	status: StatusCode,
+	error: &str,
+	error_description: &str,
+) -> axum::response::Response {
+	(
+		status,
+		Json(json!({
+			"error": error,
+			"error_description": error_description
+		})),
+	)
+		.into_response()
+}
+
+fn extract_client_credentials(
+	headers: &HeaderMap,
+	request: &TokenRequest,
+) -> Option<(String, String)> {
+	if let Some(credentials) = extract_basic_credentials(headers) {
+		return Some(credentials);
+	}
+
+	let client_id = request.client_id.as_deref()?.trim();
+	let client_secret = request.client_secret.as_deref()?.trim();
+	if client_id.is_empty() || client_secret.is_empty() {
+		return None;
+	}
+
+	Some((client_id.to_string(), client_secret.to_string()))
+}
+
+fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
+	let header = headers.get("authorization")?.to_str().ok()?;
+	let encoded = header.strip_prefix("Basic ")?;
+	let decoded = base64::engine::general_purpose::STANDARD
+		.decode(encoded)
+		.ok()?;
+	let decoded = String::from_utf8(decoded).ok()?;
+	let (client_id, client_secret) = decoded.split_once(':')?;
+	if client_id.trim().is_empty() || client_secret.trim().is_empty() {
+		return None;
+	}
+	Some((client_id.to_string(), client_secret.to_string()))
+}
+
+fn extract_source_ip(headers: &HeaderMap) -> String {
+	headers
+		.get("x-forwarded-for")
+		.and_then(|v| v.to_str().ok())
+		.and_then(|v| v.split(',').next())
+		.map(str::trim)
+		.filter(|v| !v.is_empty())
+		.or_else(|| {
+			headers
+				.get("x-real-ip")
+				.and_then(|v| v.to_str().ok())
+				.map(str::trim)
+				.filter(|v| !v.is_empty())
+		})
+		.unwrap_or("unknown")
+		.to_string()
+}
+
+fn is_rate_limited(
+	store: &DashMap<String, VecDeque<i64>>,
+	key: &str,
+	limit: usize,
+	now: i64,
+) -> bool {
+	let mut attempts = store.entry(key.to_string()).or_default();
+	prune_old_attempts(&mut attempts, now);
+	attempts.len() >= limit
+}
+
+fn record_failed_attempt(store: &DashMap<String, VecDeque<i64>>, key: &str, now: i64) {
+	let mut attempts = store.entry(key.to_string()).or_default();
+	prune_old_attempts(&mut attempts, now);
+	attempts.push_back(now);
+}
+
+fn prune_old_attempts(attempts: &mut VecDeque<i64>, now: i64) {
+	while let Some(oldest) = attempts.front().copied() {
+		if now - oldest >= RATE_LIMIT_WINDOW_SECONDS {
+			attempts.pop_front();
+		} else {
+			break;
+		}
+	}
+}
+
+fn secrets_match(provided: &str, expected: &str) -> bool {
+	if provided.len() != expected.len() {
+		return false;
+	}
+	provided.as_bytes().ct_eq(expected.as_bytes()).into()
+}
+
 /// Parse string scopes into AuthScope enums
 fn parse_scopes(scopes: Option<Vec<String>>) -> Result<Vec<AuthScope>, String> {
 	// If no scopes provided, default to basic read permissions
@@ -290,26 +600,52 @@ fn parse_scopes(scopes: Option<Vec<String>>) -> Result<Vec<AuthScope>, String> {
 		.collect()
 }
 
+/// Parse scopes for public self-registration flow (admin scope not allowed).
+fn parse_public_scopes(scopes: Option<Vec<String>>) -> Result<Vec<AuthScope>, String> {
+	let scopes = parse_scopes(scopes)?;
+	if scopes.iter().any(|scope| *scope == AuthScope::AdminAll) {
+		return Err("admin-all scope is not allowed on /auth/register".to_string());
+	}
+	Ok(scopes)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::auth::JwtService;
-	use axum::http::StatusCode;
+	use axum::http::{HeaderMap, HeaderValue, StatusCode};
 	use serde_json::Value;
 	use solver_types::{AuthConfig, SecretString};
 	use std::sync::Arc;
 
 	// Helper function to create a test JWT service
-	fn create_test_jwt_service() -> Arc<JwtService> {
+	fn create_test_jwt_service_with(
+		auth_enabled: bool,
+		public_register_enabled: bool,
+		token_client_id: &str,
+		token_client_secret: Option<&str>,
+	) -> Arc<JwtService> {
 		let config = AuthConfig {
-			enabled: true,
+			enabled: auth_enabled,
 			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars-long"),
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,
 			issuer: "test-issuer".to_string(),
+			public_register_enabled,
+			token_client_id: token_client_id.to_string(),
+			token_client_secret: token_client_secret.map(SecretString::from),
 			admin: None,
 		};
 		Arc::new(JwtService::new(config).unwrap())
+	}
+
+	fn create_test_jwt_service() -> Arc<JwtService> {
+		create_test_jwt_service_with(
+			true,
+			true,
+			"solver-admin",
+			Some("test-client-secret-at-least-32-chars"),
+		)
 	}
 
 	// Helper function to extract JSON from response body
@@ -345,6 +681,16 @@ mod tests {
 		let input = Some(vec!["admin-all".to_string()]);
 		let scopes = parse_scopes(input).unwrap();
 		assert_eq!(scopes, vec![AuthScope::AdminAll]);
+	}
+
+	#[test]
+	fn test_parse_public_scopes_rejects_admin() {
+		let input = Some(vec!["admin-all".to_string()]);
+		let result = parse_public_scopes(input);
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.contains("admin-all scope is not allowed"));
 	}
 
 	#[test]
@@ -523,6 +869,77 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn test_register_client_rejects_admin_scope() {
+		let jwt_service = create_test_jwt_service();
+		let request = RegisterRequest {
+			client_id: "test-client".to_string(),
+			client_name: None,
+			scopes: Some(vec!["admin-all".to_string()]),
+		};
+
+		let response =
+			register_client(axum::extract::State(Some(jwt_service)), Json(request)).await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+
+		let json_body = extract_json_from_body(body).await;
+		assert!(json_body["error"]
+			.as_str()
+			.unwrap()
+			.contains("admin-all scope is not allowed"));
+	}
+
+	#[tokio::test]
+	async fn test_register_client_blocked_when_public_register_disabled() {
+		let jwt_service = create_test_jwt_service_with(
+			true,
+			false,
+			"admin-solver-test",
+			Some("test-client-secret-at-least-32-chars"),
+		);
+		let request = RegisterRequest {
+			client_id: "test-client".to_string(),
+			client_name: None,
+			scopes: None,
+		};
+
+		let response =
+			register_client(axum::extract::State(Some(jwt_service)), Json(request)).await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::FORBIDDEN);
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "Public client registration is disabled");
+	}
+
+	#[tokio::test]
+	async fn test_register_client_auth_disabled() {
+		let jwt_service = create_test_jwt_service_with(
+			false,
+			true,
+			"admin-solver-test",
+			Some("test-client-secret-at-least-32-chars"),
+		);
+		let request = RegisterRequest {
+			client_id: "test-client".to_string(),
+			client_name: None,
+			scopes: None,
+		};
+
+		let response =
+			register_client(axum::extract::State(Some(jwt_service)), Json(request)).await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "Authentication is disabled");
+	}
+
+	#[tokio::test]
 	async fn test_register_client_default_scopes() {
 		let jwt_service = create_test_jwt_service();
 		let request = RegisterRequest {
@@ -610,6 +1027,27 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn test_refresh_token_auth_disabled() {
+		let jwt_service = create_test_jwt_service_with(
+			false,
+			true,
+			"admin-solver-test",
+			Some("test-client-secret-at-least-32-chars"),
+		);
+		let request = RefreshRequest {
+			refresh_token: "some-token".to_string(),
+		};
+
+		let response = refresh_token(axum::extract::State(Some(jwt_service)), Json(request)).await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "Authentication is disabled");
+	}
+
+	#[tokio::test]
 	async fn test_refresh_token_invalid_token() {
 		let jwt_service = create_test_jwt_service();
 		let request = RefreshRequest {
@@ -624,6 +1062,226 @@ mod tests {
 
 		let json_body = extract_json_from_body(body).await;
 		assert_eq!(json_body["error"], "Invalid or expired refresh token");
+	}
+
+	#[tokio::test]
+	async fn test_issue_client_token_success_with_basic_auth() {
+		FAILED_AUTH_BY_CLIENT.clear();
+		FAILED_AUTH_BY_IP.clear();
+
+		let jwt_service = create_test_jwt_service_with(
+			true,
+			false,
+			"solver-admin",
+			Some("test-client-secret-at-least-32-chars"),
+		);
+
+		let mut headers = HeaderMap::new();
+		let basic = base64::engine::general_purpose::STANDARD
+			.encode("solver-admin:test-client-secret-at-least-32-chars");
+		headers.insert(
+			"authorization",
+			HeaderValue::from_str(&format!("Basic {basic}")).unwrap(),
+		);
+		headers.insert("x-real-ip", HeaderValue::from_static("127.0.0.1"));
+
+		let request = TokenRequest {
+			grant_type: Some("client_credentials".to_string()),
+			..Default::default()
+		};
+
+		let response = issue_client_token(
+			axum::extract::State(Some(jwt_service.clone())),
+			headers,
+			Json(request),
+		)
+		.await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::OK);
+
+		let json_body = extract_json_from_body(body).await;
+		let token_response: TokenResponse = serde_json::from_value(json_body).unwrap();
+		assert_eq!(token_response.token_type, "Bearer");
+		assert_eq!(token_response.scope, "admin-all");
+		assert_eq!(token_response.expires_in, TOKEN_DEFAULT_TTL_SECONDS);
+
+		let claims = jwt_service
+			.validate_token(&token_response.access_token)
+			.unwrap();
+		assert_eq!(claims.sub, "solver-admin");
+		assert_eq!(claims.scope, vec![AuthScope::AdminAll]);
+	}
+
+	#[tokio::test]
+	async fn test_issue_client_token_success_with_body_credentials() {
+		FAILED_AUTH_BY_CLIENT.clear();
+		FAILED_AUTH_BY_IP.clear();
+
+		let jwt_service = create_test_jwt_service_with(
+			true,
+			false,
+			"solver-admin",
+			Some("test-client-secret-at-least-32-chars"),
+		);
+		let headers = HeaderMap::new();
+		let request = TokenRequest {
+			grant_type: Some("client_credentials".to_string()),
+			client_id: Some("solver-admin".to_string()),
+			client_secret: Some("test-client-secret-at-least-32-chars".to_string()),
+			scope: Some("admin-all".to_string()),
+		};
+
+		let response = issue_client_token(
+			axum::extract::State(Some(jwt_service)),
+			headers,
+			Json(request),
+		)
+		.await;
+
+		let response_obj = response.into_response();
+		let (parts, _) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::OK);
+	}
+
+	#[tokio::test]
+	async fn test_issue_client_token_invalid_secret() {
+		FAILED_AUTH_BY_CLIENT.clear();
+		FAILED_AUTH_BY_IP.clear();
+
+		let jwt_service = create_test_jwt_service_with(
+			true,
+			false,
+			"solver-admin",
+			Some("test-client-secret-at-least-32-chars"),
+		);
+		let headers = HeaderMap::new();
+		let request = TokenRequest {
+			grant_type: Some("client_credentials".to_string()),
+			client_id: Some("solver-admin".to_string()),
+			client_secret: Some("wrong-secret".to_string()),
+			scope: Some("admin-all".to_string()),
+		};
+
+		let response = issue_client_token(
+			axum::extract::State(Some(jwt_service)),
+			headers,
+			Json(request),
+		)
+		.await;
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
+
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "invalid_client");
+	}
+
+	#[tokio::test]
+	async fn test_issue_client_token_invalid_scope() {
+		FAILED_AUTH_BY_CLIENT.clear();
+		FAILED_AUTH_BY_IP.clear();
+
+		let jwt_service = create_test_jwt_service_with(
+			true,
+			false,
+			"solver-admin",
+			Some("test-client-secret-at-least-32-chars"),
+		);
+		let headers = HeaderMap::new();
+		let request = TokenRequest {
+			grant_type: Some("client_credentials".to_string()),
+			client_id: Some("solver-admin".to_string()),
+			client_secret: Some("test-client-secret-at-least-32-chars".to_string()),
+			scope: Some("read-orders".to_string()),
+		};
+
+		let response = issue_client_token(
+			axum::extract::State(Some(jwt_service)),
+			headers,
+			Json(request),
+		)
+		.await;
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "invalid_scope");
+	}
+
+	#[tokio::test]
+	async fn test_issue_client_token_rate_limited_after_many_failures() {
+		FAILED_AUTH_BY_CLIENT.clear();
+		FAILED_AUTH_BY_IP.clear();
+
+		let jwt_service = create_test_jwt_service_with(
+			true,
+			false,
+			"solver-admin-rate-limit",
+			Some("test-client-secret-at-least-32-chars"),
+		);
+		let headers = HeaderMap::new();
+		let bad_request = TokenRequest {
+			grant_type: Some("client_credentials".to_string()),
+			client_id: Some("solver-admin-rate-limit".to_string()),
+			client_secret: Some("wrong-secret".to_string()),
+			scope: Some("admin-all".to_string()),
+		};
+
+		for _ in 0..TOKEN_RATE_LIMIT_PER_MINUTE {
+			let response = issue_client_token(
+				axum::extract::State(Some(jwt_service.clone())),
+				headers.clone(),
+				Json(bad_request.clone()),
+			)
+			.await;
+			let status = response.into_response().status();
+			assert_eq!(status, StatusCode::UNAUTHORIZED);
+		}
+
+		let response = issue_client_token(
+			axum::extract::State(Some(jwt_service)),
+			headers,
+			Json(bad_request),
+		)
+		.await;
+		let response_obj = response.into_response();
+		assert_eq!(response_obj.status(), StatusCode::TOO_MANY_REQUESTS);
+	}
+
+	#[tokio::test]
+	async fn test_issue_client_token_auth_disabled() {
+		FAILED_AUTH_BY_CLIENT.clear();
+		FAILED_AUTH_BY_IP.clear();
+
+		let jwt_service = create_test_jwt_service_with(
+			false,
+			false,
+			"solver-admin",
+			Some("test-client-secret-at-least-32-chars"),
+		);
+		let headers = HeaderMap::new();
+		let request = TokenRequest {
+			grant_type: Some("client_credentials".to_string()),
+			client_id: Some("solver-admin".to_string()),
+			client_secret: Some("test-client-secret-at-least-32-chars".to_string()),
+			scope: Some("admin-all".to_string()),
+		};
+
+		let response = issue_client_token(
+			axum::extract::State(Some(jwt_service)),
+			headers,
+			Json(request),
+		)
+		.await;
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
+
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "Authentication is disabled");
 	}
 
 	// Tests for request/response serialization
@@ -673,5 +1331,22 @@ mod tests {
 		let deserialized: RefreshRequest = serde_json::from_str(&json).unwrap();
 
 		assert_eq!(deserialized.refresh_token, "refresh-token");
+	}
+
+	#[test]
+	fn test_token_response_serialization() {
+		let response = TokenResponse {
+			access_token: "access-token".to_string(),
+			token_type: "Bearer".to_string(),
+			expires_in: 900,
+			scope: "admin-all".to_string(),
+		};
+
+		let json = serde_json::to_string(&response).unwrap();
+		let deserialized: TokenResponse = serde_json::from_str(&json).unwrap();
+
+		assert_eq!(deserialized.token_type, "Bearer");
+		assert_eq!(deserialized.scope, "admin-all");
+		assert_eq!(deserialized.expires_in, 900);
 	}
 }
