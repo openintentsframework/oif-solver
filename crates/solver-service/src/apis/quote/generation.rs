@@ -1402,7 +1402,7 @@ impl QuoteGenerator {
 		token_address: &alloy_primitives::Address,
 		chain_id: u64,
 	) -> Option<String> {
-		let token_hex = format!("0x{:040x}", token_address).to_ascii_lowercase();
+		let token_hex = format!("0x{token_address:040x}").to_ascii_lowercase();
 
 		match (chain_id, token_hex.as_str()) {
 			(1, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
