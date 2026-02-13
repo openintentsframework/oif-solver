@@ -190,6 +190,7 @@ mod tests {
 		let action = AddTokenContents {
 			chain_id: 10,
 			symbol: "USDC".to_string(),
+			name: None,
 			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
 			nonce,
@@ -233,6 +234,7 @@ mod tests {
 		let action = AddTokenContents {
 			chain_id: 10,
 			symbol: "USDC".to_string(),
+			name: None,
 			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
 			nonce,
@@ -269,6 +271,7 @@ mod tests {
 		let action = AddTokenContents {
 			chain_id: 10,
 			symbol: "USDC".to_string(),
+			name: None,
 			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
 			nonce,

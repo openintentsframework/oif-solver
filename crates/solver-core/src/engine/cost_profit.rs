@@ -1966,6 +1966,8 @@ mod tests {
 
 		// Add chain 1 with ETH token
 		let network_1 = solver_types::NetworkConfig {
+			name: Some("ethereum".to_string()),
+			network_type: solver_types::networks::NetworkType::Parent,
 			rpc_urls: vec![],
 			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
@@ -1979,6 +1981,7 @@ mod tests {
 				),
 				decimals: 18,
 				symbol: "ETH".to_string(),
+				name: Some("Ether".to_string()),
 			}],
 			input_settler_compact_address: None,
 			the_compact_address: None,
@@ -1988,6 +1991,8 @@ mod tests {
 
 		// Add chain 137 with USDC token
 		let network_137 = solver_types::NetworkConfig {
+			name: Some("polygon".to_string()),
+			network_type: solver_types::networks::NetworkType::Hub,
 			rpc_urls: vec![],
 			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
@@ -2001,6 +2006,7 @@ mod tests {
 				),
 				decimals: 6,
 				symbol: "USDC".to_string(),
+				name: Some("USD Coin".to_string()),
 			}],
 			input_settler_compact_address: None,
 			the_compact_address: None,
@@ -2143,6 +2149,8 @@ mod tests {
 
 		// Add chain 1 with ETH token
 		let network_1 = solver_types::NetworkConfig {
+			name: Some("ethereum".to_string()),
+			network_type: solver_types::networks::NetworkType::Parent,
 			rpc_urls: vec![],
 			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
@@ -2156,6 +2164,7 @@ mod tests {
 				),
 				decimals: 18,
 				symbol: "ETH".to_string(),
+				name: Some("Ether".to_string()),
 			}],
 			input_settler_compact_address: None,
 			the_compact_address: None,
@@ -2165,6 +2174,8 @@ mod tests {
 
 		// Add chain 137 with USDC token
 		let network_137 = solver_types::NetworkConfig {
+			name: Some("polygon".to_string()),
+			network_type: solver_types::networks::NetworkType::Hub,
 			rpc_urls: vec![],
 			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
@@ -2178,6 +2189,7 @@ mod tests {
 				),
 				decimals: 6,
 				symbol: "USDC".to_string(),
+				name: Some("USD Coin".to_string()),
 			}],
 			input_settler_compact_address: None,
 			the_compact_address: None,

@@ -258,6 +258,7 @@ paths:
               contents:
                 chainId: 10
                 symbol: "USDC"
+                name: "USD Coin"
                 tokenAddress: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
                 decimals: 6
                 nonce: "12345678901234"
@@ -758,6 +759,11 @@ components:
         symbol:
           type: string
           example: "USDC"
+        name:
+          type: string
+          nullable: true
+          description: Optional token display name metadata
+          example: "USD Coin"
         tokenAddress:
           type: string
           pattern: "^0x[a-fA-F0-9]{40}$"
@@ -975,6 +981,10 @@ components:
         symbol:
           type: string
           example: "USDC"
+        name:
+          type: string
+          nullable: true
+          example: "USD Coin"
         decimals:
           type: integer
           example: 6
@@ -998,6 +1008,10 @@ components:
         solverId:
           type: string
           example: "solver-abc123"
+        solverName:
+          type: string
+          nullable: true
+          example: "My Solver"
         networks:
           type: array
           items:
@@ -1017,6 +1031,8 @@ components:
       type: object
       required:
         - chainId
+        - name
+        - type
         - rpcUrls
         - tokens
         - inputSettler
@@ -1026,6 +1042,13 @@ components:
           type: integer
           format: int64
           example: 84532
+        name:
+          type: string
+          example: "base-sepolia"
+        type:
+          type: string
+          enum: ["parent", "hub", "new"]
+          example: "hub"
         rpcUrls:
           type: array
           items:
@@ -1052,6 +1075,10 @@ components:
         symbol:
           type: string
           example: "USDC"
+        name:
+          type: string
+          nullable: true
+          example: "USD Coin"
         address:
           type: string
           example: "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"

@@ -1233,6 +1233,8 @@ mod tests {
 		use solver_types::Address;
 
 		NetworkConfig {
+			name: Some("test-network".to_string()),
+			network_type: solver_types::networks::NetworkType::New,
 			rpc_urls: vec![RpcEndpoint::http_only("https://test.rpc".to_string())],
 			input_settler_address: if input_settler_empty {
 				Address(vec![]) // Empty address (empty vector)
@@ -1247,6 +1249,7 @@ mod tests {
 			tokens: vec![TokenConfig {
 				address: Address(vec![3u8; 20]),
 				symbol: "TEST".to_string(),
+				name: Some("Test Token".to_string()),
 				decimals: 18,
 			}],
 			input_settler_compact_address: None,
@@ -1577,6 +1580,7 @@ mod tests {
 				.map(|(i, addr)| TokenConfig {
 					address: Address(addr.as_slice().to_vec()),
 					symbol: format!("TOKEN{i}"),
+					name: Some(format!("Token {i}")),
 					decimals: 18,
 				})
 				.collect();
@@ -1584,6 +1588,8 @@ mod tests {
 			networks.insert(
 				chain_id,
 				NetworkConfig {
+					name: Some(format!("chain-{chain_id}")),
+					network_type: solver_types::networks::NetworkType::New,
 					rpc_urls: vec![RpcEndpoint::http_only("https://test.rpc".to_string())],
 					input_settler_address: Address(vec![1u8; 20]),
 					output_settler_address: Address(vec![2u8; 20]),

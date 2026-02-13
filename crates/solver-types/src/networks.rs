@@ -52,6 +52,16 @@ impl RpcEndpoint {
 	}
 }
 
+/// Classifies a network's role in the solver topology.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkType {
+	Parent,
+	Hub,
+	#[default]
+	New,
+}
+
 /// Configuration for a token on a specific network.
 ///
 /// Defines the essential properties of a token that the solver needs
@@ -66,6 +76,8 @@ impl RpcEndpoint {
 pub struct TokenConfig {
 	pub address: Address,
 	pub symbol: String,
+	#[serde(default)]
+	pub name: Option<String>,
 	pub decimals: u8,
 }
 
@@ -82,6 +94,12 @@ pub struct TokenConfig {
 /// * `tokens` - List of supported tokens on this network
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NetworkConfig {
+	/// Optional human-readable network name.
+	#[serde(default)]
+	pub name: Option<String>,
+	/// Network role classification.
+	#[serde(default, rename = "type")]
+	pub network_type: NetworkType,
 	pub rpc_urls: Vec<RpcEndpoint>,
 	pub input_settler_address: Address,
 	pub output_settler_address: Address,
