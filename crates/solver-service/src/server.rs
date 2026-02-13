@@ -19,8 +19,8 @@ use crate::{
 };
 use alloy_primitives::U256;
 use axum::{
-	extract::{Extension, Path, State},
-	http::StatusCode,
+	extract::{ConnectInfo, Extension, Path, State},
+	http::{HeaderMap, StatusCode},
 	middleware,
 	response::{IntoResponse, Json},
 	routing::{delete, get, post, put},
@@ -38,7 +38,7 @@ use solver_types::{
 	ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse, OperatorConfig, Order,
 	OrderIdCallback, Transaction,
 };
-use std::{convert::TryInto, sync::Arc};
+use std::{convert::TryInto, net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tower::ServiceBuilder;
@@ -306,15 +306,15 @@ pub async fn start_server(
 	// Add auth subroutes
 	let auth_routes = Router::new()
 		.route("/register", post(handle_auth_register))
+		.route("/token", post(handle_auth_token))
 		.route("/refresh", post(handle_auth_refresh));
 
 	api_routes = api_routes.nest("/auth", auth_routes);
 
 	// Add admin routes if enabled
 	if let Some(admin_state) = admin_state {
-		let admin_public_routes = Router::new().route("/config", get(handle_get_config));
-
 		let mut admin_protected_routes = Router::new()
+			.route("/config", get(handle_get_config))
 			.route("/balances", get(handle_get_balances))
 			.route("/nonce", get(handle_get_nonce))
 			.route("/types", get(handle_get_types))
@@ -345,9 +345,7 @@ pub async fn start_server(
 			}
 		}
 
-		let admin_routes = admin_public_routes
-			.merge(admin_protected_routes)
-			.with_state(admin_state);
+		let admin_routes = admin_protected_routes.with_state(admin_state);
 
 		api_routes = api_routes.nest("/admin", admin_routes);
 		tracing::info!("Admin routes registered at /api/v1/admin/*");
@@ -408,7 +406,10 @@ pub async fn start_server(
 
 	// Wrap the entire app with NormalizePath to handle trailing slashes
 	let app = NormalizePath::trim_trailing_slash(app);
-	let service = ServiceExt::<axum::http::Request<axum::body::Body>>::into_make_service(app);
+	let service =
+		ServiceExt::<axum::http::Request<axum::body::Body>>::into_make_service_with_connect_info::<
+			SocketAddr,
+		>(app);
 
 	axum::serve(listener, service).await?;
 
@@ -502,6 +503,24 @@ async fn handle_auth_refresh(
 	Json(payload): Json<crate::apis::auth::RefreshRequest>,
 ) -> impl IntoResponse {
 	crate::apis::auth::refresh_token(State(state.jwt_service), Json(payload)).await
+}
+
+/// Handles POST /api/v1/auth/token requests.
+///
+/// Endpoint issues access tokens via client credentials.
+async fn handle_auth_token(
+	State(state): State<AppState>,
+	headers: HeaderMap,
+	ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+	Json(payload): Json<crate::apis::auth::TokenRequest>,
+) -> impl IntoResponse {
+	crate::apis::auth::issue_client_token_with_peer(
+		State(state.jwt_service),
+		headers,
+		Some(peer_addr),
+		Json(payload),
+	)
+	.await
 }
 
 /// Handles POST /api/v1/orders requests.

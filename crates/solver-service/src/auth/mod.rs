@@ -82,11 +82,25 @@ impl JwtService {
 		client_id: &str,
 		scopes: Vec<AuthScope>,
 	) -> Result<String, AuthError> {
-		let expiry_hours = self.config.access_token_expiry_hours;
+		let expiry_seconds = self
+			.config
+			.access_token_expiry_hours
+			.saturating_mul(3600)
+			.max(1);
+		self.generate_access_token_with_ttl_seconds(client_id, scopes, expiry_seconds)
+	}
 
+	/// Generates a new access token for a client with custom TTL in seconds.
+	pub fn generate_access_token_with_ttl_seconds(
+		&self,
+		client_id: &str,
+		scopes: Vec<AuthScope>,
+		ttl_seconds: u32,
+	) -> Result<String, AuthError> {
+		let ttl_seconds = ttl_seconds.max(1);
 		let claims = JwtClaims {
 			sub: client_id.to_string(),
-			exp: (Utc::now() + Duration::hours(expiry_hours as i64)).timestamp(),
+			exp: (Utc::now() + Duration::seconds(ttl_seconds as i64)).timestamp(),
 			iat: Utc::now().timestamp(),
 			iss: self.config.issuer.clone(),
 			scope: scopes,
@@ -217,6 +231,9 @@ mod tests {
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,
 			issuer: "test-issuer".to_string(),
+			public_register_enabled: false,
+			token_client_id: "solver-admin".to_string(),
+			token_client_secret: None,
 			admin: None,
 		}
 	}

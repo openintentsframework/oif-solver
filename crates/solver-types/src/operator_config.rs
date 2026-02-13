@@ -57,6 +57,10 @@ pub struct OperatorConfig {
 	/// Admin authentication settings.
 	pub admin: OperatorAdminConfig,
 
+	/// Whether JWT auth is required for API routes.
+	#[serde(default)]
+	pub api_auth_enabled: bool,
+
 	/// Account signing backend configuration.
 	/// If None, defaults to local wallet with SOLVER_PRIVATE_KEY.
 	#[serde(default)]
@@ -581,6 +585,7 @@ mod tests {
 				admin_addresses: vec![test_address()],
 				withdrawals: OperatorWithdrawalsConfig::default(),
 			},
+			api_auth_enabled: false,
 			account: None,
 		};
 
