@@ -21,6 +21,7 @@
       ]
     }
   ],
+  "auth_enabled": false,
   "admin": {
     "enabled": true,
     "domain": "localhost",

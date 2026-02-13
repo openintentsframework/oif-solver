@@ -807,7 +807,7 @@ The admin API enables authorized wallet addresses to perform administrative oper
 **Endpoints:**
 
 - **GET `/api/v1/admin/balances`** - Get solver balances by chain and token (protected, read-only)
-- **GET `/api/v1/admin/config`** - Get current solver configuration snapshot (public, read-only)
+- **GET `/api/v1/admin/config`** - Get current solver configuration snapshot (protected, read-only)
 - **GET `/api/v1/admin/nonce`** - Get a nonce for signing admin actions (protected)
   - Response:
     ```json
@@ -858,7 +858,7 @@ The admin API enables authorized wallet addresses to perform administrative oper
 4. Sign with your admin wallet (EIP-712)
 5. Submit the signed action to the appropriate endpoint
 
-**Note:** If API auth is enabled (`auth.enabled = true`), protected admin endpoints also require a JWT with `AdminAll` scope. Use `POST /api/v1/auth/token` with `client_id + client_secret` to obtain it.
+**Note:** If API auth is enabled (`auth_enabled = true` in seed overrides, mapped to runtime `auth.enabled`), protected admin endpoints also require a JWT with `AdminAll` scope. Use `POST /api/v1/auth/token` with `client_id + client_secret` to obtain it.
 **Note:** `POST /api/v1/auth/register` never issues `admin-all` and is disabled by default unless `AUTH_PUBLIC_REGISTER_ENABLED=true`.
 **Note:** Admin withdrawals require `admin.withdrawals.enabled = true` in config.
 
@@ -978,8 +978,9 @@ curl http://localhost:3000/api/v1/admin/types \
 curl http://localhost:3000/api/v1/admin/balances \
   -H "Authorization: Bearer $TOKEN"
 
-# Admin: Get solver config snapshot (public)
-curl http://localhost:3000/api/v1/admin/config
+# Admin: Get solver config snapshot (protected)
+curl http://localhost:3000/api/v1/admin/config \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 The API server is enabled by default on port 3000 when the solver is running. You can disable it or change the port in the configuration file.

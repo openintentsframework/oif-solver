@@ -15,8 +15,9 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha3::{Digest, Sha3_256};
 use solver_types::AuthScope;
-use std::{collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
 use subtle::ConstantTimeEq;
 
 const TOKEN_DEFAULT_TTL_SECONDS: u32 = 900;
@@ -24,6 +25,8 @@ const TOKEN_MAX_TTL_SECONDS: u32 = 3600;
 const TOKEN_RATE_LIMIT_PER_MINUTE: usize = 30;
 const TOKEN_RATE_LIMIT_IP_PER_MINUTE: usize = 120;
 const RATE_LIMIT_WINDOW_SECONDS: i64 = 60;
+const MAX_RATE_LIMIT_KEYS: usize = 10_000;
+const MAX_FAILURE_EVENTS_PER_KEY: usize = 256;
 
 static FAILED_AUTH_BY_CLIENT: Lazy<DashMap<String, VecDeque<i64>>> = Lazy::new(DashMap::new);
 static FAILED_AUTH_BY_IP: Lazy<DashMap<String, VecDeque<i64>>> = Lazy::new(DashMap::new);
@@ -361,6 +364,18 @@ pub async fn issue_client_token(
 	headers: HeaderMap,
 	Json(request): Json<TokenRequest>,
 ) -> impl IntoResponse {
+	issue_client_token_with_peer(State(jwt_service), headers, None, Json(request)).await
+}
+
+/// Handles POST /api/v1/auth/token requests with optional peer address.
+///
+/// Used by HTTP handlers that can provide trusted socket peer metadata.
+pub async fn issue_client_token_with_peer(
+	State(jwt_service): State<Option<Arc<JwtService>>>,
+	headers: HeaderMap,
+	peer_addr: Option<SocketAddr>,
+	Json(request): Json<TokenRequest>,
+) -> impl IntoResponse {
 	let jwt_service = match jwt_service {
 		Some(service) => service,
 		None => {
@@ -397,11 +412,16 @@ pub async fn issue_client_token(
 		},
 	};
 
-	let grant_type = request
-		.grant_type
-		.as_deref()
-		.unwrap_or("client_credentials")
-		.trim();
+	let grant_type = match request.grant_type.as_deref() {
+		Some(grant_type) => grant_type.trim(),
+		None => {
+			return oauth_error_response(
+				StatusCode::BAD_REQUEST,
+				"unsupported_grant_type",
+				"grant_type must be client_credentials",
+			);
+		},
+	};
 	if grant_type != "client_credentials" {
 		return oauth_error_response(
 			StatusCode::BAD_REQUEST,
@@ -429,7 +449,7 @@ pub async fn issue_client_token(
 			);
 		},
 	};
-	let source_ip = extract_source_ip(&headers);
+	let source_ip = extract_source_ip(&headers, peer_addr);
 	let now = chrono::Utc::now().timestamp();
 
 	if is_rate_limited(
@@ -525,7 +545,14 @@ fn extract_client_credentials(
 
 fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
 	let header = headers.get("authorization")?.to_str().ok()?;
-	let encoded = header.strip_prefix("Basic ")?;
+	let (scheme, encoded) = header.split_once(' ')?;
+	if !scheme.eq_ignore_ascii_case("basic") {
+		return None;
+	}
+	let encoded = encoded.trim();
+	if encoded.is_empty() {
+		return None;
+	}
 	let decoded = base64::engine::general_purpose::STANDARD
 		.decode(encoded)
 		.ok()?;
@@ -537,22 +564,31 @@ fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
 	Some((client_id.to_string(), client_secret.to_string()))
 }
 
-fn extract_source_ip(headers: &HeaderMap) -> String {
-	headers
+fn extract_source_ip(headers: &HeaderMap, peer_addr: Option<SocketAddr>) -> String {
+	if let Some(ip) = headers
 		.get("x-forwarded-for")
 		.and_then(|v| v.to_str().ok())
 		.and_then(|v| v.split(',').next())
 		.map(str::trim)
 		.filter(|v| !v.is_empty())
-		.or_else(|| {
-			headers
-				.get("x-real-ip")
-				.and_then(|v| v.to_str().ok())
-				.map(str::trim)
-				.filter(|v| !v.is_empty())
-		})
-		.unwrap_or("unknown")
-		.to_string()
+	{
+		return ip.to_string();
+	}
+
+	if let Some(ip) = headers
+		.get("x-real-ip")
+		.and_then(|v| v.to_str().ok())
+		.map(str::trim)
+		.filter(|v| !v.is_empty())
+	{
+		return ip.to_string();
+	}
+
+	if let Some(addr) = peer_addr {
+		return addr.ip().to_string();
+	}
+
+	"unknown".to_string()
 }
 
 fn is_rate_limited(
@@ -561,15 +597,36 @@ fn is_rate_limited(
 	limit: usize,
 	now: i64,
 ) -> bool {
-	let mut attempts = store.entry(key.to_string()).or_default();
+	let Some(mut attempts) = store.get_mut(key) else {
+		return false;
+	};
+
 	prune_old_attempts(&mut attempts, now);
-	attempts.len() >= limit
+	let limited = attempts.len() >= limit;
+	let empty = attempts.is_empty();
+	drop(attempts);
+	if empty {
+		store.remove(key);
+	}
+
+	limited
 }
 
 fn record_failed_attempt(store: &DashMap<String, VecDeque<i64>>, key: &str, now: i64) {
+	if !store.contains_key(key) && store.len() >= MAX_RATE_LIMIT_KEYS {
+		cleanup_stale_rate_limit_keys(store, now);
+	}
+	if !store.contains_key(key) && store.len() >= MAX_RATE_LIMIT_KEYS {
+		tracing::warn!("Rate limit key capacity reached; skipping failure tracking");
+		return;
+	}
+
 	let mut attempts = store.entry(key.to_string()).or_default();
 	prune_old_attempts(&mut attempts, now);
 	attempts.push_back(now);
+	while attempts.len() > MAX_FAILURE_EVENTS_PER_KEY {
+		attempts.pop_front();
+	}
 }
 
 fn prune_old_attempts(attempts: &mut VecDeque<i64>, now: i64) {
@@ -583,10 +640,28 @@ fn prune_old_attempts(attempts: &mut VecDeque<i64>, now: i64) {
 }
 
 fn secrets_match(provided: &str, expected: &str) -> bool {
-	if provided.len() != expected.len() {
-		return false;
+	let provided_hash = Sha3_256::digest(provided.as_bytes());
+	let expected_hash = Sha3_256::digest(expected.as_bytes());
+	provided_hash
+		.as_slice()
+		.ct_eq(expected_hash.as_slice())
+		.into()
+}
+
+fn cleanup_stale_rate_limit_keys(store: &DashMap<String, VecDeque<i64>>, now: i64) {
+	let keys_to_remove: Vec<String> = store
+		.iter()
+		.filter_map(|entry| {
+			let latest = entry.value().back().copied();
+			match latest {
+				Some(ts) if now - ts < RATE_LIMIT_WINDOW_SECONDS => None,
+				_ => Some(entry.key().clone()),
+			}
+		})
+		.collect();
+	for key in keys_to_remove {
+		store.remove(&key);
 	}
-	provided.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
 /// Parse string scopes into AuthScope enums
@@ -615,6 +690,7 @@ mod tests {
 	use crate::auth::JwtService;
 	use axum::http::{HeaderMap, HeaderValue, StatusCode};
 	use serde_json::Value;
+	use serial_test::serial;
 	use solver_types::{AuthConfig, SecretString};
 	use std::sync::Arc;
 
@@ -1065,6 +1141,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial]
 	async fn test_issue_client_token_success_with_basic_auth() {
 		FAILED_AUTH_BY_CLIENT.clear();
 		FAILED_AUTH_BY_IP.clear();
@@ -1115,6 +1192,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial]
 	async fn test_issue_client_token_success_with_body_credentials() {
 		FAILED_AUTH_BY_CLIENT.clear();
 		FAILED_AUTH_BY_IP.clear();
@@ -1146,6 +1224,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial]
 	async fn test_issue_client_token_invalid_secret() {
 		FAILED_AUTH_BY_CLIENT.clear();
 		FAILED_AUTH_BY_IP.clear();
@@ -1179,6 +1258,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial]
 	async fn test_issue_client_token_invalid_scope() {
 		FAILED_AUTH_BY_CLIENT.clear();
 		FAILED_AUTH_BY_IP.clear();
@@ -1212,6 +1292,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial]
 	async fn test_issue_client_token_rate_limited_after_many_failures() {
 		FAILED_AUTH_BY_CLIENT.clear();
 		FAILED_AUTH_BY_IP.clear();
@@ -1252,6 +1333,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial]
 	async fn test_issue_client_token_auth_disabled() {
 		FAILED_AUTH_BY_CLIENT.clear();
 		FAILED_AUTH_BY_IP.clear();
@@ -1358,20 +1440,30 @@ mod tests {
 			"x-forwarded-for",
 			HeaderValue::from_static("192.168.1.1, 10.0.0.1"),
 		);
-		assert_eq!(super::extract_source_ip(&headers), "192.168.1.1");
+		assert_eq!(super::extract_source_ip(&headers, None), "192.168.1.1");
 	}
 
 	#[test]
 	fn test_extract_source_ip_from_x_real_ip() {
 		let mut headers = HeaderMap::new();
 		headers.insert("x-real-ip", HeaderValue::from_static("10.0.0.5"));
-		assert_eq!(super::extract_source_ip(&headers), "10.0.0.5");
+		assert_eq!(super::extract_source_ip(&headers, None), "10.0.0.5");
 	}
 
 	#[test]
 	fn test_extract_source_ip_unknown_when_missing() {
 		let headers = HeaderMap::new();
-		assert_eq!(super::extract_source_ip(&headers), "unknown");
+		assert_eq!(super::extract_source_ip(&headers, None), "unknown");
+	}
+
+	#[test]
+	fn test_extract_source_ip_falls_back_to_peer_addr() {
+		let headers = HeaderMap::new();
+		let peer_addr: std::net::SocketAddr = "203.0.113.11:3030".parse().unwrap();
+		assert_eq!(
+			super::extract_source_ip(&headers, Some(peer_addr)),
+			"203.0.113.11"
+		);
 	}
 
 	#[test]
@@ -1381,6 +1473,18 @@ mod tests {
 		headers.insert(
 			"authorization",
 			HeaderValue::from_str(&format!("Basic {encoded}")).unwrap(),
+		);
+		let result = super::extract_basic_credentials(&headers);
+		assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
+	}
+
+	#[test]
+	fn test_extract_basic_credentials_case_insensitive_scheme() {
+		let mut headers = HeaderMap::new();
+		let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
+		headers.insert(
+			"authorization",
+			HeaderValue::from_str(&format!("basic {encoded}")).unwrap(),
 		);
 		let result = super::extract_basic_credentials(&headers);
 		assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
@@ -1456,6 +1560,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial]
 	async fn test_issue_client_token_missing_credentials() {
 		FAILED_AUTH_BY_CLIENT.clear();
 		FAILED_AUTH_BY_IP.clear();
@@ -1489,6 +1594,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial]
 	async fn test_issue_client_token_unsupported_grant_type() {
 		FAILED_AUTH_BY_CLIENT.clear();
 		FAILED_AUTH_BY_IP.clear();
@@ -1522,6 +1628,41 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial]
+	async fn test_issue_client_token_missing_grant_type() {
+		FAILED_AUTH_BY_CLIENT.clear();
+		FAILED_AUTH_BY_IP.clear();
+
+		let jwt_service = create_test_jwt_service_with(
+			true,
+			false,
+			"solver-admin",
+			Some("test-client-secret-at-least-32-chars"),
+		);
+		let headers = HeaderMap::new();
+		let request = TokenRequest {
+			grant_type: None,
+			client_id: Some("solver-admin".to_string()),
+			client_secret: Some("test-client-secret-at-least-32-chars".to_string()),
+			scope: Some("admin-all".to_string()),
+		};
+
+		let response = issue_client_token(
+			axum::extract::State(Some(jwt_service)),
+			headers,
+			Json(request),
+		)
+		.await;
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "unsupported_grant_type");
+	}
+
+	#[tokio::test]
+	#[serial]
 	async fn test_issue_client_token_no_secret_configured() {
 		FAILED_AUTH_BY_CLIENT.clear();
 		FAILED_AUTH_BY_IP.clear();
@@ -1553,6 +1694,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial]
 	async fn test_issue_client_token_no_jwt_service() {
 		let headers = HeaderMap::new();
 		let request = TokenRequest::default();

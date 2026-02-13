@@ -281,8 +281,6 @@ components:
       description: Request payload for client credentials token issuance
       required:
         - grant_type
-        - client_id
-        - client_secret
       properties:
         grant_type:
           type: string
@@ -299,7 +297,7 @@ components:
           example: "replace-with-your-client-secret"
         scope:
           type: string
-          description: Requested scope; only `admin-all` is supported
+          description: Requested scope; only `admin-all` is supported. Defaults to `admin-all` when omitted.
           example: "admin-all"
 
     TokenResponse:
@@ -426,6 +424,10 @@ components:
           type: string
           description: Error message
           example: "Client ID cannot be empty"
+        error_description:
+          type: string
+          description: Additional error detail for OAuth-style auth responses
+          example: "grant_type must be client_credentials"
 
   securitySchemes:
     bearerAuth:
