@@ -59,7 +59,7 @@ pub struct OperatorConfig {
 
 	/// Whether JWT auth is required for API routes.
 	#[serde(default)]
-	pub api_auth_enabled: bool,
+	pub auth_enabled: bool,
 
 	/// Account signing backend configuration.
 	/// If None, defaults to local wallet with SOLVER_PRIVATE_KEY.
@@ -585,7 +585,7 @@ mod tests {
 				admin_addresses: vec![test_address()],
 				withdrawals: OperatorWithdrawalsConfig::default(),
 			},
-			api_auth_enabled: false,
+			auth_enabled: false,
 			account: None,
 		};
 

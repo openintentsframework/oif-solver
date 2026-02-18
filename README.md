@@ -258,8 +258,7 @@ curl -X POST http://localhost:3000/api/v1/auth/token \
   -d '{
     "grant_type": "client_credentials",
     "client_id": "solver-admin",
-    "client_secret": "replace_with_your_auth_client_secret",
-    "scope": "admin-all"
+    "client_secret": "replace_with_your_auth_client_secret"
   }'
 ```
 
@@ -962,8 +961,7 @@ TOKEN=$(curl -s -X POST http://localhost:3000/api/v1/auth/token \
   -d '{
     "grant_type": "client_credentials",
     "client_id": "solver-admin",
-    "client_secret": "replace_with_your_auth_client_secret",
-    "scope": "admin-all"
+    "client_secret": "replace_with_your_auth_client_secret"
   }' | jq -r '.access_token')
 
 # Admin: Get nonce for signing (protected)

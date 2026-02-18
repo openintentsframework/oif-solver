@@ -70,17 +70,15 @@ pub enum MergeError {
 
 fn parse_bool_env_var(name: &str, default: bool) -> Result<bool, MergeError> {
 	match std::env::var(name) {
-		Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
-			"1" | "true" | "yes" | "on" => Ok(true),
-			"0" | "false" | "no" | "off" => Ok(false),
-			_ => Err(MergeError::Validation(format!(
-				"Invalid boolean value for {name}: {raw}"
-			))),
-		},
+		Ok(raw) => raw.trim().to_ascii_lowercase().parse().map_err(|_| {
+			MergeError::Validation(format!(
+				"Invalid boolean value for {name}: {raw} (expected 'true' or 'false')"
+			))
+		}),
 		Err(std::env::VarError::NotPresent) => Ok(default),
-		Err(std::env::VarError::NotUnicode(_)) => Err(MergeError::Validation(format!(
-			"Invalid unicode value for {name}"
-		))),
+		Err(std::env::VarError::NotUnicode(_)) => {
+			Err(MergeError::Validation(format!("Invalid unicode value for {name}")))
+		}
 	}
 }
 
@@ -358,7 +356,7 @@ pub fn merge_to_operator_config(
 			monitoring_timeout_seconds: seed.defaults.monitoring_timeout_seconds,
 		},
 		admin,
-		api_auth_enabled: initializer.auth_enabled.unwrap_or(false),
+		auth_enabled: initializer.auth_enabled.unwrap_or(false),
 		account: initializer.account.as_ref().map(|a| OperatorAccountConfig {
 			primary: a.primary.clone(),
 			implementations: a.implementations.clone(),
@@ -526,7 +524,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 		pricing: Some(build_pricing_config_from_operator(&operator_config.pricing)),
 		api: Some(build_api_config_from_operator(
 			&operator_config.admin,
-			operator_config.api_auth_enabled,
+			operator_config.auth_enabled,
 		)?),
 		gas: Some(build_gas_config_from_operator(&operator_config.gas)),
 	};
@@ -1644,7 +1642,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		})
 		.unwrap_or_default();
 
-	let api_auth_enabled = config
+	let auth_enabled = config
 		.api
 		.as_ref()
 		.and_then(|api| api.auth.as_ref())
@@ -1671,7 +1669,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 			monitoring_timeout_seconds: config.solver.monitoring_timeout_seconds,
 		},
 		admin,
-		api_auth_enabled,
+		auth_enabled,
 		account,
 	})
 }
@@ -2672,7 +2670,7 @@ mod tests {
 				monitoring_timeout_seconds: 30,
 			},
 			admin: OperatorAdminConfig::default(),
-			api_auth_enabled: false,
+			auth_enabled: false,
 			account: None,
 		};
 

@@ -1392,7 +1392,7 @@ mod tests {
 				admin_addresses: vec![admin_address],
 				withdrawals,
 			},
-			api_auth_enabled: false,
+			auth_enabled: false,
 			account: None,
 		}
 	}
