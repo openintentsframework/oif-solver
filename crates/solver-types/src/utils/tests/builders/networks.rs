@@ -3,7 +3,7 @@
 //! Provides fluent APIs for constructing network configuration instances with
 //! proper validation and sensible defaults.
 
-use crate::networks::{NetworkConfig, NetworksConfig, RpcEndpoint, TokenConfig};
+use crate::networks::{NetworkConfig, NetworkType, NetworksConfig, RpcEndpoint, TokenConfig};
 use crate::{parse_address, Address};
 use std::collections::HashMap;
 
@@ -28,6 +28,7 @@ use std::collections::HashMap;
 pub struct TokenConfigBuilder {
 	address: Option<Address>,
 	symbol: Option<String>,
+	name: Option<String>,
 	decimals: Option<u8>,
 }
 
@@ -46,6 +47,7 @@ impl TokenConfigBuilder {
 					.expect("Invalid USDC address"),
 			),
 			symbol: Some("USDC".to_string()),
+			name: Some("USD Coin".to_string()),
 			decimals: Some(6),
 		}
 	}
@@ -68,6 +70,12 @@ impl TokenConfigBuilder {
 	/// Sets the token symbol.
 	pub fn symbol<S: Into<String>>(mut self, symbol: S) -> Self {
 		self.symbol = Some(symbol.into());
+		self
+	}
+
+	/// Sets the optional token name.
+	pub fn name<S: Into<String>>(mut self, name: S) -> Self {
+		self.name = Some(name.into());
 		self
 	}
 
@@ -111,6 +119,7 @@ impl TokenConfigBuilder {
 		Ok(TokenConfig {
 			address: self.address.unwrap(),
 			symbol: self.symbol.unwrap(),
+			name: self.name,
 			decimals: self.decimals.unwrap(),
 		})
 	}
@@ -135,6 +144,8 @@ impl TokenConfigBuilder {
 /// ```
 #[derive(Debug, Clone)]
 pub struct NetworkConfigBuilder {
+	name: Option<String>,
+	network_type: NetworkType,
 	rpc_urls: Vec<RpcEndpoint>,
 	input_settler_address: Option<Address>,
 	output_settler_address: Option<Address>,
@@ -154,6 +165,8 @@ impl NetworkConfigBuilder {
 	/// Creates a new `NetworkConfigBuilder` with default values.
 	pub fn new() -> Self {
 		Self {
+			name: None,
+			network_type: NetworkType::New,
 			rpc_urls: vec![RpcEndpoint::both(
 				"https://eth.llamarpc.com".to_string(),
 				"wss://eth.llamarpc.com".to_string(),
@@ -182,6 +195,18 @@ impl NetworkConfigBuilder {
 	/// Adds an RPC endpoint.
 	pub fn add_rpc_endpoint(mut self, endpoint: RpcEndpoint) -> Self {
 		self.rpc_urls.push(endpoint);
+		self
+	}
+
+	/// Sets the optional network name.
+	pub fn name<S: Into<String>>(mut self, name: S) -> Self {
+		self.name = Some(name.into());
+		self
+	}
+
+	/// Sets the network role classification.
+	pub fn network_type(mut self, network_type: NetworkType) -> Self {
+		self.network_type = network_type;
 		self
 	}
 
@@ -314,6 +339,8 @@ impl NetworkConfigBuilder {
 		self.validate()?;
 
 		Ok(NetworkConfig {
+			name: self.name,
+			network_type: self.network_type,
 			rpc_urls: self.rpc_urls,
 			input_settler_address: self.input_settler_address.unwrap(),
 			output_settler_address: self.output_settler_address.unwrap(),
