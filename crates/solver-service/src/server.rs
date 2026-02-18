@@ -30,7 +30,8 @@ use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
 use solver_storage::{
-	config_store::create_config_store, create_storage_backend,
+	config_store::create_config_store,
+	create_storage_backend,
 	nonce_store::{create_nonce_store, create_nonce_store_with_namespace, NonceStore},
 	StoreConfig,
 };
