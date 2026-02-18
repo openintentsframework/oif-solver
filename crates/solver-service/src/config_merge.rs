@@ -76,9 +76,9 @@ fn parse_bool_env_var(name: &str, default: bool) -> Result<bool, MergeError> {
 			))
 		}),
 		Err(std::env::VarError::NotPresent) => Ok(default),
-		Err(std::env::VarError::NotUnicode(_)) => {
-			Err(MergeError::Validation(format!("Invalid unicode value for {name}")))
-		}
+		Err(std::env::VarError::NotUnicode(_)) => Err(MergeError::Validation(format!(
+			"Invalid unicode value for {name}"
+		))),
 	}
 }
 
