@@ -1157,7 +1157,12 @@ mod tests {
 			"fillTransaction.hash must be a string"
 		);
 		assert!(
-			fill_tx.get("hash").unwrap().as_str().unwrap().starts_with("0x"),
+			fill_tx
+				.get("hash")
+				.unwrap()
+				.as_str()
+				.unwrap()
+				.starts_with("0x"),
 			"fillTransaction.hash must be 0x-prefixed"
 		);
 		assert!(
