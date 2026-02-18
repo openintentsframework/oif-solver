@@ -10,11 +10,14 @@
 //! ```json
 //! {
 //!   "solver_id": "my-solver-instance",
+//!   "solver_name": "My Solver Instance",
 //!   "networks": [
 //!     {
 //!       "chain_id": 10,
+//!       "name": "optimism",
+//!       "type": "parent",
 //!       "tokens": [
-//!         {"symbol": "USDC", "address": "0x...", "decimals": 6}
+//!         {"symbol": "USDC", "name": "USD Coin", "address": "0x...", "decimals": 6}
 //!       ],
 //!       "rpc_urls": ["https://user-rpc.com"]
 //!     }
@@ -30,6 +33,7 @@
 //! }
 //! ```
 
+use crate::networks::NetworkType;
 use alloy_primitives::Address;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -46,6 +50,10 @@ pub struct SeedOverrides {
 	/// Providing a consistent solver_id enables idempotent seeding.
 	#[serde(default)]
 	pub solver_id: Option<String>,
+
+	/// Optional human-readable solver name for display and identification.
+	#[serde(default)]
+	pub solver_name: Option<String>,
 
 	/// List of networks the solver should support.
 	/// Each network must exist in the seed configuration.
@@ -192,6 +200,14 @@ pub struct NetworkOverride {
 	/// Must exist in the seed configuration.
 	pub chain_id: u64,
 
+	/// Optional human-readable network name override.
+	#[serde(default)]
+	pub name: Option<String>,
+
+	/// Network role classification.
+	#[serde(default, rename = "type")]
+	pub network_type: Option<NetworkType>,
+
 	/// Tokens this solver will support on this network.
 	/// Required - different solvers support different tokens.
 	pub tokens: Vec<Token>,
@@ -207,6 +223,10 @@ pub struct NetworkOverride {
 pub struct Token {
 	/// Token symbol (e.g., "USDC", "WETH").
 	pub symbol: String,
+
+	/// Optional human-readable token name (e.g., "USD Coin").
+	#[serde(default)]
+	pub name: Option<String>,
 
 	/// Token contract address on this network.
 	pub address: Address,
@@ -317,14 +337,19 @@ mod tests {
 	fn test_chain_ids() {
 		let config = SeedOverrides {
 			solver_id: None,
+			solver_name: None,
 			networks: vec![
 				NetworkOverride {
 					chain_id: 10,
+					name: None,
+					network_type: None,
 					tokens: vec![],
 					rpc_urls: None,
 				},
 				NetworkOverride {
 					chain_id: 8453,
+					name: None,
+					network_type: None,
 					tokens: vec![],
 					rpc_urls: None,
 				},
@@ -346,8 +371,11 @@ mod tests {
 	fn test_has_chain() {
 		let config = SeedOverrides {
 			solver_id: None,
+			solver_name: None,
 			networks: vec![NetworkOverride {
 				chain_id: 10,
+				name: None,
+				network_type: None,
 				tokens: vec![],
 				rpc_urls: None,
 			}],
@@ -368,10 +396,14 @@ mod tests {
 	fn test_get_network() {
 		let config = SeedOverrides {
 			solver_id: None,
+			solver_name: None,
 			networks: vec![NetworkOverride {
 				chain_id: 10,
+				name: None,
+				network_type: None,
 				tokens: vec![Token {
 					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
 					address: test_address(),
 					decimals: 6,
 				}],
@@ -399,15 +431,20 @@ mod tests {
 			chain_id: 10,
 			tokens: vec![Token {
 				symbol: "USDC".to_string(),
+				name: Some("USD Coin".to_string()),
 				address: test_address(),
 				decimals: 6,
 			}],
+			name: None,
+			network_type: None,
 			rpc_urls: None,
 		};
 
 		let without_tokens = NetworkOverride {
 			chain_id: 10,
 			tokens: vec![],
+			name: None,
+			network_type: None,
 			rpc_urls: None,
 		};
 
@@ -419,10 +456,14 @@ mod tests {
 	fn test_json_roundtrip() {
 		let config = SeedOverrides {
 			solver_id: Some("test-solver".to_string()),
+			solver_name: Some("Test Solver".to_string()),
 			networks: vec![NetworkOverride {
 				chain_id: 10,
+				name: Some("optimism".to_string()),
+				network_type: Some(NetworkType::Parent),
 				tokens: vec![Token {
 					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
 					address: test_address(),
 					decimals: 6,
 				}],
@@ -440,8 +481,11 @@ mod tests {
 		let json = serde_json::to_string(&config).unwrap();
 		let parsed: SeedOverrides = serde_json::from_str(&json).unwrap();
 
+		assert_eq!(parsed.solver_name, Some("Test Solver".to_string()));
 		assert_eq!(parsed.networks.len(), 1);
 		assert_eq!(parsed.networks[0].chain_id, 10);
+		assert_eq!(parsed.networks[0].name, Some("optimism".to_string()));
+		assert_eq!(parsed.networks[0].network_type, Some(NetworkType::Parent));
 		assert_eq!(parsed.networks[0].tokens[0], config.networks[0].tokens[0]);
 	}
 

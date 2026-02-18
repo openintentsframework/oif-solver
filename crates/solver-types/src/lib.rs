@@ -59,7 +59,7 @@ pub use costs::{CostBreakdown, CostContext};
 pub use delivery::*;
 pub use discovery::*;
 pub use events::*;
-pub use networks::{NetworkConfig, NetworksConfig, TokenConfig};
+pub use networks::{NetworkConfig, NetworkType, NetworksConfig, TokenConfig};
 pub use operator_config::{
 	OperatorAccountConfig, OperatorAdminConfig, OperatorConfig, OperatorGasConfig,
 	OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig,

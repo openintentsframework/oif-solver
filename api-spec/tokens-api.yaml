@@ -34,25 +34,33 @@ paths:
                 networks:
                   "1":
                     chain_id: 1
+                    name: "ethereum"
+                    type: "parent"
                     input_settler: "0x1234567890abcdef1234567890abcdef12345678"
                     output_settler: "0xabcdef1234567890abcdef1234567890abcdef12"
                     tokens:
                       - address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
                         symbol: "USDC"
+                        name: "USD Coin"
                         decimals: 6
                       - address: "0xdac17f958d2ee523a2206206994597c13d831ec7"
                         symbol: "USDT"
+                        name: "Tether USD"
                         decimals: 6
                   "42161":
                     chain_id: 42161
+                    name: "arbitrum"
+                    type: "new"
                     input_settler: "0x9876543210fedcba9876543210fedcba98765432"
                     output_settler: "0xfedcba9876543210fedcba9876543210fedcba98"
                     tokens:
                       - address: "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
                         symbol: "USDC"
+                        name: "USD Coin"
                         decimals: 6
                       - address: "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"
                         symbol: "USDT"
+                        name: "Tether USD"
                         decimals: 6
 
   /tokens/{chain_id}:
@@ -83,14 +91,18 @@ paths:
                 $ref: "#/components/schemas/NetworkTokens"
               example:
                 chain_id: 1
+                name: "ethereum"
+                type: "parent"
                 input_settler: "0x1234567890abcdef1234567890abcdef12345678"
                 output_settler: "0xabcdef1234567890abcdef1234567890abcdef12"
                 tokens:
                   - address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
                     symbol: "USDC"
+                    name: "USD Coin"
                     decimals: 6
                   - address: "0xdac17f958d2ee523a2206206994597c13d831ec7"
                     symbol: "USDT"
+                    name: "Tether USD"
                     decimals: 6
         "404":
           description: Chain not supported by this solver
@@ -131,6 +143,16 @@ components:
           format: int64
           description: The blockchain network ID
           example: 1
+        name:
+          type: string
+          nullable: true
+          description: Optional human-readable network name
+          example: "ethereum"
+        type:
+          type: string
+          description: Network role classification
+          enum: ["parent", "hub", "new"]
+          example: "parent"
         input_settler:
           type: string
           pattern: "^0x[a-fA-F0-9]{40}$"
@@ -164,6 +186,11 @@ components:
           type: string
           description: Token symbol (e.g., "USDC", "USDT", "WETH")
           example: "USDC"
+        name:
+          type: string
+          nullable: true
+          description: Optional token name (e.g., "USD Coin")
+          example: "USD Coin"
         decimals:
           type: integer
           minimum: 0

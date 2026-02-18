@@ -172,6 +172,7 @@ pub async fn handle_get_balances(
 					tokens.push(TokenBalance {
 						address: token.address.to_string(),
 						symbol: token.symbol.clone(),
+						name: token.name.clone(),
 						decimals: token.decimals,
 						balance,
 						balance_formatted: formatted,
@@ -196,6 +197,7 @@ pub async fn handle_get_balances(
 				tokens.push(TokenBalance {
 					address: zero_address.to_string(),
 					symbol: "NATIVE".to_string(),
+					name: Some("Native Token".to_string()),
 					decimals: 18,
 					balance,
 					balance_formatted: formatted,
@@ -233,6 +235,7 @@ pub async fn handle_get_config(
 	let versioned = state.config_store.get().await.map_err(config_store_error)?;
 	let operator_config = versioned.data;
 	let solver_id = operator_config.solver_id.clone();
+	let solver_name = operator_config.solver_name.clone();
 
 	let mut networks: Vec<AdminNetworkResponse> = operator_config
 		.networks
@@ -250,12 +253,15 @@ pub async fn handle_get_config(
 
 			AdminNetworkResponse {
 				chain_id: network.chain_id,
+				name: network.name.clone(),
+				network_type: network.network_type,
 				rpc_urls,
 				tokens: network
 					.tokens
 					.iter()
 					.map(|t| AdminTokenResponse {
 						symbol: t.symbol.clone(),
+						name: t.name.clone(),
 						address: with_0x_prefix(&hex::encode(t.address.as_slice())),
 						decimals: t.decimals,
 					})
@@ -276,6 +282,7 @@ pub async fn handle_get_config(
 
 	Ok(Json(AdminConfigResponse {
 		solver_id,
+		solver_name,
 		networks,
 		solver: AdminSolverResponse {
 			min_profitability_pct: operator_config.solver.min_profitability_pct.to_string(),
@@ -551,6 +558,12 @@ pub async fn handle_add_token(
 	// 5. Add token to OperatorConfig
 	network.tokens.push(OperatorToken {
 		symbol: contents.symbol.clone(),
+		name: Some(
+			contents
+				.name
+				.clone()
+				.unwrap_or_else(|| contents.symbol.clone()),
+		),
 		address: contents.token_address,
 		decimals: contents.decimals,
 	});
@@ -1350,6 +1363,7 @@ mod tests {
 	) -> OperatorConfig {
 		OperatorConfig {
 			solver_id: "test-solver".to_string(),
+			solver_name: Some("Test Solver".to_string()),
 			networks: HashMap::new(),
 			settlement: OperatorSettlementConfig {
 				settlement_poll_interval_seconds: 3,
@@ -1886,6 +1900,7 @@ mod tests {
 				chain_id: 1,
 				tokens: vec![TokenBalance {
 					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
 					address: "0x1234".to_string(),
 					decimals: 6,
 					balance: "1000000".to_string(),
@@ -1925,9 +1940,12 @@ mod tests {
 	fn test_admin_network_response_serialization() {
 		let network = AdminNetworkResponse {
 			chain_id: 10,
+			name: "optimism".to_string(),
+			network_type: solver_types::networks::NetworkType::Parent,
 			rpc_urls: vec!["https://rpc.example.com/[REDACTED]".to_string()],
 			tokens: vec![AdminTokenResponse {
 				symbol: "USDC".to_string(),
+				name: Some("USD Coin".to_string()),
 				address: "0x1234".to_string(),
 				decimals: 6,
 			}],

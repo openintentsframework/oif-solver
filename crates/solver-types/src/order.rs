@@ -310,6 +310,32 @@ pub struct Settlement {
 	pub data: serde_json::Value,
 }
 
+/// Status of a fill transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FillTransactionStatus {
+	/// Fill transaction has been submitted but not yet confirmed.
+	Pending,
+	/// Fill transaction has been confirmed on-chain.
+	Executed,
+	/// Fill transaction failed.
+	Failed,
+}
+
+/// Transaction details for a fill operation.
+///
+/// Provides a well-defined shape for the `fillTransaction` field in order responses,
+/// making it easier for consumers to access fill transaction information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FillTransactionInfo {
+	/// The transaction hash of the fill operation.
+	pub hash: String,
+	/// The status of the fill transaction.
+	pub status: FillTransactionStatus,
+	/// Timestamp (Unix seconds) when the fill transaction was last updated.
+	pub timestamp: u64,
+}
+
 /// Order response for API endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderResponse {
@@ -317,10 +343,10 @@ pub struct OrderResponse {
 	pub id: String,
 	/// Current order status
 	pub status: OrderStatus,
-	/// Timestamp when this order was created
+	/// Timestamp when this order was created (Unix seconds)
 	#[serde(rename = "createdAt")]
 	pub created_at: u64,
-	/// Timestamp when this order was last updated
+	/// Timestamp when this order was last updated (Unix seconds)
 	#[serde(rename = "updatedAt")]
 	pub updated_at: u64,
 	/// Associated quote ID if available
@@ -336,7 +362,7 @@ pub struct OrderResponse {
 	pub settlement: Settlement,
 	/// Transaction details if order has been executed
 	#[serde(rename = "fillTransaction")]
-	pub fill_transaction: Option<serde_json::Value>,
+	pub fill_transaction: Option<FillTransactionInfo>,
 }
 
 /// Status of an order in the solver system.

@@ -25,6 +25,7 @@
 //! config_store.update(config, version).await?;
 //! ```
 
+use crate::networks::NetworkType;
 use alloy_primitives::Address;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,10 @@ use std::collections::HashMap;
 pub struct OperatorConfig {
 	/// Unique solver instance identifier.
 	pub solver_id: String,
+
+	/// Optional human-readable solver name.
+	#[serde(default)]
+	pub solver_name: Option<String>,
 
 	/// Per-network configuration, keyed by chain ID.
 	pub networks: HashMap<u64, OperatorNetworkConfig>,
@@ -91,7 +96,12 @@ pub struct OperatorNetworkConfig {
 	pub chain_id: u64,
 
 	/// Human-readable network name.
+	#[serde(default = "default_network_name")]
 	pub name: String,
+
+	/// Network role classification.
+	#[serde(default, rename = "type")]
+	pub network_type: NetworkType,
 
 	/// Tokens supported on this network.
 	pub tokens: Vec<OperatorToken>,
@@ -115,11 +125,19 @@ pub struct OperatorNetworkConfig {
 	pub allocator_address: Option<Address>,
 }
 
+fn default_network_name() -> String {
+	"unknown".to_string()
+}
+
 /// Token configuration for a network.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OperatorToken {
 	/// Token symbol (e.g., "USDC", "WETH").
 	pub symbol: String,
+
+	/// Optional human-readable token name (e.g., "USD Coin").
+	#[serde(default)]
+	pub name: Option<String>,
 
 	/// Token contract address.
 	pub address: Address,
@@ -417,6 +435,7 @@ mod tests {
 	fn test_operator_token_serialization() {
 		let token = OperatorToken {
 			symbol: "USDC".to_string(),
+			name: Some("USD Coin".to_string()),
 			address: test_token_address(),
 			decimals: 6,
 		};
@@ -425,6 +444,7 @@ mod tests {
 		let parsed: OperatorToken = serde_json::from_str(&json).unwrap();
 
 		assert_eq!(parsed.symbol, "USDC");
+		assert_eq!(parsed.name, Some("USD Coin".to_string()));
 		assert_eq!(parsed.decimals, 6);
 		assert_eq!(parsed.address, token.address);
 	}
@@ -465,14 +485,17 @@ mod tests {
 		let network = OperatorNetworkConfig {
 			chain_id: 10,
 			name: "optimism".to_string(),
+			network_type: NetworkType::Parent,
 			tokens: vec![
 				OperatorToken {
 					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
 					address: test_token_address(),
 					decimals: 6,
 				},
 				OperatorToken {
 					symbol: "WETH".to_string(),
+					name: Some("Wrapped Ether".to_string()),
 					address: test_address(),
 					decimals: 18,
 				},
@@ -516,6 +539,7 @@ mod tests {
 	fn test_operator_config_json_roundtrip() {
 		let config = OperatorConfig {
 			solver_id: "test-solver".to_string(),
+			solver_name: Some("Test Solver".to_string()),
 			networks: {
 				let mut networks = HashMap::new();
 				networks.insert(
@@ -523,8 +547,10 @@ mod tests {
 					OperatorNetworkConfig {
 						chain_id: 10,
 						name: "optimism".to_string(),
+						network_type: NetworkType::Parent,
 						tokens: vec![OperatorToken {
 							symbol: "USDC".to_string(),
+							name: Some("USD Coin".to_string()),
 							address: test_token_address(),
 							decimals: 6,
 						}],
@@ -593,9 +619,80 @@ mod tests {
 		let parsed: OperatorConfig = serde_json::from_str(&json).unwrap();
 
 		assert_eq!(parsed.solver_id, "test-solver");
+		assert_eq!(parsed.solver_name, Some("Test Solver".to_string()));
 		assert_eq!(parsed.networks.len(), 1);
 		assert!(parsed.networks.contains_key(&10));
 		assert_eq!(parsed.admin.admin_addresses.len(), 1);
 		assert_eq!(parsed.gas.resource_lock.fill, 77298);
+	}
+
+	#[test]
+	fn test_operator_config_deserializes_legacy_network_without_name() {
+		let json = serde_json::json!({
+			"solver_id": "legacy-solver",
+			"networks": {
+				"10": {
+					"chain_id": 10,
+					"tokens": [{
+						"symbol": "USDC",
+						"address": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
+						"decimals": 6
+					}],
+					"rpc_urls": [{
+						"http": "https://rpc.example.com",
+						"ws": null
+					}],
+					"input_settler_address": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+					"output_settler_address": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+					"input_settler_compact_address": null,
+					"the_compact_address": null,
+					"allocator_address": null
+				}
+			},
+			"settlement": {
+				"settlement_poll_interval_seconds": 10,
+				"hyperlane": {
+					"default_gas_limit": 300000,
+					"message_timeout_seconds": 600,
+					"finalization_required": true,
+					"mailboxes": {},
+					"igp_addresses": {},
+					"oracles": {"input": {}, "output": {}},
+					"routes": {}
+				}
+			},
+			"gas": {
+				"resource_lock": {"open": 0, "fill": 77298, "claim": 122793},
+				"permit2_escrow": {"open": 0, "fill": 0, "claim": 0},
+				"eip3009_escrow": {"open": 0, "fill": 0, "claim": 0}
+			},
+			"pricing": {
+				"primary": "coingecko",
+				"fallbacks": [],
+				"cache_duration_seconds": 60,
+				"custom_prices": {}
+			},
+			"solver": {
+				"min_profitability_pct": "1",
+				"gas_buffer_bps": 1000,
+				"commission_bps": 0,
+				"rate_buffer_bps": 14,
+				"monitoring_timeout_seconds": 28800
+			},
+			"admin": {
+				"enabled": false,
+				"domain": "",
+				"chain_id": 1,
+				"nonce_ttl_seconds": 300,
+				"admin_addresses": [],
+				"withdrawals": {"enabled": false}
+			},
+			"account": null
+		});
+
+		let parsed: OperatorConfig = serde_json::from_value(json).unwrap();
+		let network = parsed.networks.get(&10).unwrap();
+		assert_eq!(network.name, "unknown");
+		assert_eq!(network.network_type, NetworkType::New);
 	}
 }

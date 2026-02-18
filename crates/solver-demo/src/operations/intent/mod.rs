@@ -778,9 +778,7 @@ impl IntentOps {
 			.order
 			.fill_transaction
 			.as_ref()
-			.and_then(|tx| tx.get("hash"))
-			.and_then(|h| h.as_str())
-			.map(|s| s.to_string());
+			.map(|tx| tx.hash.clone());
 
 		Ok(OrderStatusInfo {
 			order_id: order_id.to_string(),

@@ -12,7 +12,7 @@ use axum::{
 use serde::Serialize;
 use solver_config::Config;
 use solver_core::SolverEngine;
-use solver_types::with_0x_prefix;
+use solver_types::{networks::NetworkType, with_0x_prefix};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -29,6 +29,11 @@ pub struct TokensResponse {
 pub struct NetworkTokens {
 	/// The blockchain network ID.
 	pub chain_id: u64,
+	/// Optional human-readable network name.
+	pub name: Option<String>,
+	/// Network role classification.
+	#[serde(rename = "type")]
+	pub network_type: NetworkType,
 	/// Input settler contract address.
 	pub input_settler: String,
 	/// Output settler contract address.
@@ -44,6 +49,8 @@ pub struct TokenInfo {
 	pub address: String,
 	/// Token symbol (e.g., "USDC", "USDT").
 	pub symbol: String,
+	/// Optional token name (e.g., "USD Coin").
+	pub name: Option<String>,
 	/// Number of decimal places for the token.
 	pub decimals: u8,
 }
@@ -63,6 +70,8 @@ pub async fn get_tokens(State(solver): State<Arc<SolverEngine>>) -> Json<TokensR
 			chain_id.to_string(),
 			NetworkTokens {
 				chain_id: *chain_id,
+				name: network.name.clone(),
+				network_type: network.network_type,
 				input_settler: with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
 				output_settler: with_0x_prefix(&hex::encode(&network.output_settler_address.0)),
 				tokens: network
@@ -71,6 +80,7 @@ pub async fn get_tokens(State(solver): State<Arc<SolverEngine>>) -> Json<TokensR
 					.map(|t| TokenInfo {
 						address: with_0x_prefix(&hex::encode(&t.address.0)),
 						symbol: t.symbol.clone(),
+						name: t.name.clone(),
 						decimals: t.decimals,
 					})
 					.collect(),
@@ -93,6 +103,8 @@ pub async fn get_tokens_for_chain(
 	match networks.get(&chain_id) {
 		Some(network) => Ok(Json(NetworkTokens {
 			chain_id,
+			name: network.name.clone(),
+			network_type: network.network_type,
 			input_settler: with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
 			output_settler: with_0x_prefix(&hex::encode(&network.output_settler_address.0)),
 			tokens: network
@@ -101,6 +113,7 @@ pub async fn get_tokens_for_chain(
 				.map(|t| TokenInfo {
 					address: with_0x_prefix(&hex::encode(&t.address.0)),
 					symbol: t.symbol.clone(),
+					name: t.name.clone(),
 					decimals: t.decimals,
 				})
 				.collect(),
@@ -127,6 +140,8 @@ pub async fn get_tokens_from_config(
 			chain_id.to_string(),
 			NetworkTokens {
 				chain_id: *chain_id,
+				name: network.name.clone(),
+				network_type: network.network_type,
 				input_settler: with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
 				output_settler: with_0x_prefix(&hex::encode(&network.output_settler_address.0)),
 				tokens: network
@@ -135,6 +150,7 @@ pub async fn get_tokens_from_config(
 					.map(|t| TokenInfo {
 						address: with_0x_prefix(&hex::encode(&t.address.0)),
 						symbol: t.symbol.clone(),
+						name: t.name.clone(),
 						decimals: t.decimals,
 					})
 					.collect(),
@@ -158,6 +174,8 @@ pub async fn get_tokens_for_chain_from_config(
 	match config.networks.get(&chain_id) {
 		Some(network) => Ok(Json(NetworkTokens {
 			chain_id,
+			name: network.name.clone(),
+			network_type: network.network_type,
 			input_settler: with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
 			output_settler: with_0x_prefix(&hex::encode(&network.output_settler_address.0)),
 			tokens: network
@@ -166,6 +184,7 @@ pub async fn get_tokens_for_chain_from_config(
 				.map(|t| TokenInfo {
 					address: with_0x_prefix(&hex::encode(&t.address.0)),
 					symbol: t.symbol.clone(),
+					name: t.name.clone(),
 					decimals: t.decimals,
 				})
 				.collect(),
@@ -181,7 +200,8 @@ mod tests {
 	use axum::extract::State;
 	use solver_core::engine::token_manager::TokenManager;
 	use solver_types::{
-		networks::RpcEndpoint, Address, NetworkConfig, NetworksConfig, TokenConfig,
+		networks::{NetworkType, RpcEndpoint},
+		Address, NetworkConfig, NetworksConfig, TokenConfig,
 	};
 	use std::collections::HashMap;
 
@@ -191,18 +211,21 @@ mod tests {
 		let usdc_token = TokenConfig {
 			address: Address(AlloyAddress::from([1u8; 20]).to_vec()),
 			symbol: "USDC".to_string(),
+			name: Some("USD Coin".to_string()),
 			decimals: 6,
 		};
 
 		let usdt_token = TokenConfig {
 			address: Address(AlloyAddress::from([2u8; 20]).to_vec()),
 			symbol: "USDT".to_string(),
+			name: Some("Tether USD".to_string()),
 			decimals: 6,
 		};
 
 		let weth_token = TokenConfig {
 			address: Address(AlloyAddress::from([3u8; 20]).to_vec()),
 			symbol: "WETH".to_string(),
+			name: Some("Wrapped Ether".to_string()),
 			decimals: 18,
 		};
 
@@ -213,6 +236,8 @@ mod tests {
 		networks.insert(
 			1,
 			NetworkConfig {
+				name: Some("ethereum".to_string()),
+				network_type: NetworkType::Parent,
 				rpc_urls: vec![RpcEndpoint::http_only(
 					"https://eth.example.com".to_string(),
 				)],
@@ -229,6 +254,8 @@ mod tests {
 		networks.insert(
 			137,
 			NetworkConfig {
+				name: Some("polygon".to_string()),
+				network_type: NetworkType::Hub,
 				rpc_urls: vec![RpcEndpoint::http_only(
 					"https://polygon.example.com".to_string(),
 				)],
@@ -530,11 +557,14 @@ mod tests {
 			"1".to_string(),
 			NetworkTokens {
 				chain_id: 1,
+				name: Some("ethereum".to_string()),
+				network_type: NetworkType::Parent,
 				input_settler: "0x1234567890123456789012345678901234567890".to_string(),
 				output_settler: "0x0987654321098765432109876543210987654321".to_string(),
 				tokens: vec![TokenInfo {
 					address: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
 					symbol: "TEST".to_string(),
+					name: Some("Test Token".to_string()),
 					decimals: 18,
 				}],
 			},
@@ -553,17 +583,21 @@ mod tests {
 	fn test_network_tokens_serialization() {
 		let network_tokens = NetworkTokens {
 			chain_id: 42,
+			name: Some("testnet".to_string()),
+			network_type: NetworkType::New,
 			input_settler: "0x1111111111111111111111111111111111111111".to_string(),
 			output_settler: "0x2222222222222222222222222222222222222222".to_string(),
 			tokens: vec![
 				TokenInfo {
 					address: "0x3333333333333333333333333333333333333333".to_string(),
 					symbol: "TOKEN1".to_string(),
+					name: Some("Token One".to_string()),
 					decimals: 6,
 				},
 				TokenInfo {
 					address: "0x4444444444444444444444444444444444444444".to_string(),
 					symbol: "TOKEN2".to_string(),
+					name: Some("Token Two".to_string()),
 					decimals: 18,
 				},
 			],
@@ -583,6 +617,7 @@ mod tests {
 		let token_info = TokenInfo {
 			address: "0x5555555555555555555555555555555555555555".to_string(),
 			symbol: "MYTOKEN".to_string(),
+			name: Some("My Token".to_string()),
 			decimals: 8,
 		};
 

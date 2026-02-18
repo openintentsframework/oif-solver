@@ -31,11 +31,12 @@ use solver_config::{
 	StorageConfig, StrategyConfig,
 };
 use solver_types::{
-	networks::RpcEndpoint, AccountOverride, NetworkConfig, NetworkOverride, NetworksConfig,
-	OperatorAccountConfig, OperatorAdminConfig, OperatorConfig, OperatorGasConfig,
-	OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig,
-	OperatorPricingConfig, OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSolverConfig,
-	OperatorToken, OperatorWithdrawalsConfig, SecretString, SeedOverrides, TokenConfig,
+	networks::{NetworkType, RpcEndpoint},
+	AccountOverride, NetworkConfig, NetworkOverride, NetworksConfig, OperatorAccountConfig,
+	OperatorAdminConfig, OperatorConfig, OperatorGasConfig, OperatorGasFlowUnits,
+	OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig, OperatorPricingConfig,
+	OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSolverConfig, OperatorToken,
+	OperatorWithdrawalsConfig, SecretString, SeedOverrides, TokenConfig,
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -314,7 +315,8 @@ pub fn merge_to_operator_config(
 		.unwrap_or(seed.defaults.rate_buffer_bps);
 
 	Ok(OperatorConfig {
-		solver_id,
+		solver_id: solver_id.clone(),
+		solver_name: Some(initializer.solver_name.clone().unwrap_or(solver_id)),
 		networks,
 		settlement: OperatorSettlementConfig {
 			settlement_poll_interval_seconds: seed.defaults.settlement_poll_interval_seconds,
@@ -407,6 +409,7 @@ fn build_operator_network_config(
 		.iter()
 		.map(|t| OperatorToken {
 			symbol: t.symbol.clone(),
+			name: Some(t.name.clone().unwrap_or_else(|| t.symbol.clone())),
 			address: t.address,
 			decimals: t.decimals,
 		})
@@ -414,7 +417,12 @@ fn build_operator_network_config(
 
 	OperatorNetworkConfig {
 		chain_id: override_.chain_id,
-		name: seed.name.to_string(),
+		name: override_
+			.name
+			.clone()
+			.filter(|n| !n.trim().is_empty())
+			.unwrap_or_else(|| seed.name.to_string()),
+		network_type: override_.network_type.unwrap_or(NetworkType::New),
 		tokens,
 		rpc_urls,
 		input_settler_address: seed.input_settler,
@@ -554,11 +562,14 @@ fn build_networks_from_operator_config(operator_config: &OperatorConfig) -> Netw
 			.map(|t| TokenConfig {
 				address: solver_types::Address(t.address.as_slice().to_vec()),
 				symbol: t.symbol.clone(),
+				name: t.name.clone(),
 				decimals: t.decimals,
 			})
 			.collect();
 
 		let network_config = NetworkConfig {
+			name: Some(op_network.name.clone()),
+			network_type: op_network.network_type,
 			rpc_urls,
 			input_settler_address: solver_types::Address(
 				op_network.input_settler_address.as_slice().to_vec(),
@@ -1023,11 +1034,20 @@ fn build_network_config(seed: &NetworkSeed, override_: &NetworkOverride) -> Netw
 		.map(|t| TokenConfig {
 			address: solver_types::Address(t.address.as_slice().to_vec()),
 			symbol: t.symbol.clone(),
+			name: Some(t.name.clone().unwrap_or_else(|| t.symbol.clone())),
 			decimals: t.decimals,
 		})
 		.collect();
 
 	NetworkConfig {
+		name: Some(
+			override_
+				.name
+				.clone()
+				.filter(|n| !n.trim().is_empty())
+				.unwrap_or_else(|| seed.name.to_string()),
+		),
+		network_type: override_.network_type.unwrap_or(NetworkType::New),
 		rpc_urls,
 		input_settler_address: solver_types::Address(seed.input_settler.as_slice().to_vec()),
 		output_settler_address: solver_types::Address(seed.output_settler.as_slice().to_vec()),
@@ -1504,6 +1524,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 				let addr_bytes: [u8; 20] = t.address.0.as_slice().try_into().unwrap_or([0u8; 20]);
 				OperatorToken {
 					symbol: t.symbol.clone(),
+					name: t.name.clone(),
 					address: Address::from(addr_bytes),
 					decimals: t.decimals,
 				}
@@ -1552,7 +1573,12 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 
 		let op_network = OperatorNetworkConfig {
 			chain_id: *chain_id,
-			name: format!("chain-{chain_id}"),
+			name: network_config
+				.name
+				.clone()
+				.filter(|n| !n.trim().is_empty())
+				.unwrap_or_else(|| format!("chain-{chain_id}")),
+			network_type: network_config.network_type,
 			tokens,
 			rpc_urls,
 			input_settler_address: Address::from(input_settler_bytes),
@@ -1654,6 +1680,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 
 	Ok(OperatorConfig {
 		solver_id: config.solver.id.clone(),
+		solver_name: Some(config.solver.id.clone()),
 		networks,
 		settlement: OperatorSettlementConfig {
 			settlement_poll_interval_seconds: config.settlement.settlement_poll_interval_seconds,
@@ -1880,11 +1907,15 @@ mod tests {
 	fn test_seed_overrides() -> SeedOverrides {
 		SeedOverrides {
 			solver_id: None,
+			solver_name: None,
 			networks: vec![
 				NetworkOverride {
 					chain_id: 11155420, // Optimism Sepolia
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
 						decimals: 6,
 					}],
@@ -1892,8 +1923,11 @@ mod tests {
 				},
 				NetworkOverride {
 					chain_id: 84532, // Base Sepolia
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
 						decimals: 6,
 					}],
@@ -1931,11 +1965,15 @@ mod tests {
 	fn test_merge_config_unknown_chain() {
 		let overrides = SeedOverrides {
 			solver_id: None,
+			solver_name: None,
 			networks: vec![
 				NetworkOverride {
 					chain_id: 999999, // Unknown chain
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "TEST".to_string(),
+						name: None,
 						address: address!("1111111111111111111111111111111111111111"),
 						decimals: 18,
 					}],
@@ -1943,8 +1981,11 @@ mod tests {
 				},
 				NetworkOverride {
 					chain_id: 11155420,
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
 						decimals: 6,
 					}],
@@ -1972,16 +2013,22 @@ mod tests {
 	fn test_merge_config_no_tokens() {
 		let overrides = SeedOverrides {
 			solver_id: None,
+			solver_name: None,
 			networks: vec![
 				NetworkOverride {
 					chain_id: 11155420,
+					name: None,
+					network_type: None,
 					tokens: vec![], // No tokens
 					rpc_urls: None,
 				},
 				NetworkOverride {
 					chain_id: 84532,
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
 						decimals: 6,
 					}],
@@ -2009,10 +2056,14 @@ mod tests {
 	fn test_merge_config_insufficient_networks() {
 		let overrides = SeedOverrides {
 			solver_id: None,
+			solver_name: None,
 			networks: vec![NetworkOverride {
 				chain_id: 11155420,
+				name: None,
+				network_type: None,
 				tokens: vec![solver_types::seed_overrides::Token {
 					symbol: "USDC".to_string(),
+					name: None,
 					address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
 					decimals: 6,
 				}],
@@ -2064,11 +2115,15 @@ mod tests {
 		// Create overrides with fee configuration
 		let overrides = SeedOverrides {
 			solver_id: Some("fee-test-solver".to_string()),
+			solver_name: None,
 			networks: vec![
 				NetworkOverride {
 					chain_id: 11155420,
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
 						decimals: 6,
 					}],
@@ -2076,8 +2131,11 @@ mod tests {
 				},
 				NetworkOverride {
 					chain_id: 84532,
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
 						decimals: 6,
 					}],
@@ -2238,11 +2296,15 @@ mod tests {
 	fn test_merge_config_duplicate_chain_ids() {
 		let overrides = SeedOverrides {
 			solver_id: None,
+			solver_name: None,
 			networks: vec![
 				NetworkOverride {
 					chain_id: 11155420,
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
 						decimals: 6,
 					}],
@@ -2250,8 +2312,11 @@ mod tests {
 				},
 				NetworkOverride {
 					chain_id: 11155420, // Duplicate!
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "DAI".to_string(),
+						name: None,
 						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
 						decimals: 18,
 					}],
@@ -2279,11 +2344,15 @@ mod tests {
 	fn test_custom_solver_id() {
 		let overrides = SeedOverrides {
 			solver_id: Some("my-custom-solver".to_string()),
+			solver_name: None,
 			networks: vec![
 				NetworkOverride {
 					chain_id: 11155420,
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
 						decimals: 6,
 					}],
@@ -2291,8 +2360,11 @@ mod tests {
 				},
 				NetworkOverride {
 					chain_id: 84532,
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
 						decimals: 6,
 					}],
@@ -2324,6 +2396,7 @@ mod tests {
 
 		// Check solver ID is auto-generated
 		assert!(op_config.solver_id.starts_with("solver-"));
+		assert_eq!(op_config.solver_name, Some(op_config.solver_id.clone()));
 
 		// Check networks
 		assert_eq!(op_config.networks.len(), 2);
@@ -2333,19 +2406,26 @@ mod tests {
 		// Check network details
 		let opt_network = op_config.networks.get(&11155420).unwrap();
 		assert_eq!(opt_network.chain_id, 11155420);
+		assert_eq!(opt_network.name, "optimism-sepolia");
+		assert_eq!(opt_network.network_type, NetworkType::New);
 		assert_eq!(opt_network.tokens.len(), 1);
 		assert_eq!(opt_network.tokens[0].symbol, "USDC");
+		assert_eq!(opt_network.tokens[0].name, Some("USDC".to_string()));
 	}
 
 	#[test]
 	fn test_merge_to_operator_config_with_custom_solver_id() {
 		let overrides = SeedOverrides {
 			solver_id: Some("my-operator-solver".to_string()),
+			solver_name: None,
 			networks: vec![
 				NetworkOverride {
 					chain_id: 11155420,
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
 						decimals: 6,
 					}],
@@ -2353,8 +2433,11 @@ mod tests {
 				},
 				NetworkOverride {
 					chain_id: 84532,
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
 						decimals: 6,
 					}],
@@ -2372,17 +2455,78 @@ mod tests {
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
 		assert_eq!(op_config.solver_id, "my-operator-solver");
+		assert_eq!(
+			op_config.solver_name,
+			Some("my-operator-solver".to_string())
+		);
+	}
+
+	#[test]
+	fn test_merge_to_operator_config_preserves_names_and_network_type() {
+		let overrides = SeedOverrides {
+			solver_id: Some("my-operator-solver".to_string()),
+			solver_name: Some("Operator Alpha".to_string()),
+			networks: vec![
+				NetworkOverride {
+					chain_id: 11155420,
+					name: Some("Optimism Sepolia Parent".to_string()),
+					network_type: Some(NetworkType::Parent),
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "USDC".to_string(),
+						name: Some("USD Coin".to_string()),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+				NetworkOverride {
+					chain_id: 84532,
+					name: Some("Base Sepolia Hub".to_string()),
+					network_type: Some(NetworkType::Hub),
+					tokens: vec![solver_types::seed_overrides::Token {
+						symbol: "USDC".to_string(),
+						name: Some("USD Coin".to_string()),
+						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
+						decimals: 6,
+					}],
+					rpc_urls: None,
+				},
+			],
+			account: None,
+			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
+		};
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		assert_eq!(op_config.solver_name, Some("Operator Alpha".to_string()));
+
+		let origin = op_config.networks.get(&11155420).unwrap();
+		assert_eq!(origin.name, "Optimism Sepolia Parent");
+		assert_eq!(origin.network_type, NetworkType::Parent);
+		assert_eq!(origin.tokens[0].name, Some("USD Coin".to_string()));
+
+		let destination = op_config.networks.get(&84532).unwrap();
+		assert_eq!(destination.name, "Base Sepolia Hub");
+		assert_eq!(destination.network_type, NetworkType::Hub);
+		assert_eq!(destination.tokens[0].name, Some("USD Coin".to_string()));
 	}
 
 	#[test]
 	fn test_merge_to_operator_config_unknown_chain() {
 		let overrides = SeedOverrides {
 			solver_id: None,
+			solver_name: None,
 			networks: vec![
 				NetworkOverride {
 					chain_id: 999999,
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "TEST".to_string(),
+						name: None,
 						address: address!("1111111111111111111111111111111111111111"),
 						decimals: 18,
 					}],
@@ -2390,8 +2534,11 @@ mod tests {
 				},
 				NetworkOverride {
 					chain_id: 11155420,
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
 						decimals: 6,
 					}],
@@ -2419,11 +2566,15 @@ mod tests {
 	fn test_merge_to_operator_config_duplicate_chain() {
 		let overrides = SeedOverrides {
 			solver_id: None,
+			solver_name: None,
 			networks: vec![
 				NetworkOverride {
 					chain_id: 11155420,
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
 						decimals: 6,
 					}],
@@ -2431,8 +2582,11 @@ mod tests {
 				},
 				NetworkOverride {
 					chain_id: 11155420, // Duplicate
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "DAI".to_string(),
+						name: None,
 						address: address!("1111111111111111111111111111111111111111"),
 						decimals: 18,
 					}],
@@ -2460,10 +2614,14 @@ mod tests {
 	fn test_merge_to_operator_config_insufficient_networks() {
 		let overrides = SeedOverrides {
 			solver_id: None,
+			solver_name: None,
 			networks: vec![NetworkOverride {
 				chain_id: 11155420,
+				name: None,
+				network_type: None,
 				tokens: vec![solver_types::seed_overrides::Token {
 					symbol: "USDC".to_string(),
+					name: None,
 					address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
 					decimals: 6,
 				}],
@@ -2490,16 +2648,22 @@ mod tests {
 	fn test_merge_to_operator_config_no_tokens() {
 		let overrides = SeedOverrides {
 			solver_id: None,
+			solver_name: None,
 			networks: vec![
 				NetworkOverride {
 					chain_id: 11155420,
+					name: None,
+					network_type: None,
 					tokens: vec![], // No tokens
 					rpc_urls: None,
 				},
 				NetworkOverride {
 					chain_id: 84532,
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
 						decimals: 6,
 					}],
@@ -2527,11 +2691,15 @@ mod tests {
 	fn test_merge_to_operator_config_with_admin() {
 		let overrides = SeedOverrides {
 			solver_id: Some("admin-test-solver".to_string()),
+			solver_name: None,
 			networks: vec![
 				NetworkOverride {
 					chain_id: 11155420,
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
 						decimals: 6,
 					}],
@@ -2539,8 +2707,11 @@ mod tests {
 				},
 				NetworkOverride {
 					chain_id: 84532,
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
 						decimals: 6,
 					}],
@@ -2635,6 +2806,7 @@ mod tests {
 		// Create an OperatorConfig with only 1 network (invalid)
 		let mut op_config = OperatorConfig {
 			solver_id: "test-solver".to_string(),
+			solver_name: Some("test-solver".to_string()),
 			networks: HashMap::new(),
 			settlement: OperatorSettlementConfig {
 				settlement_poll_interval_seconds: 60,
@@ -2680,6 +2852,7 @@ mod tests {
 			OperatorNetworkConfig {
 				chain_id: 1,
 				name: "test".to_string(),
+				network_type: NetworkType::New,
 				tokens: vec![],
 				rpc_urls: vec![],
 				input_settler_address: address!("0000000000000000000000000000000000000001"),
@@ -3082,11 +3255,15 @@ mod tests {
 		// Create overrides with KMS account configuration
 		let overrides = SeedOverrides {
 			solver_id: Some("kms-test-solver".to_string()),
+			solver_name: None,
 			networks: vec![
 				NetworkOverride {
 					chain_id: 11155420,
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
 						decimals: 6,
 					}],
@@ -3094,8 +3271,11 @@ mod tests {
 				},
 				NetworkOverride {
 					chain_id: 84532,
+					name: None,
+					network_type: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
 						decimals: 6,
 					}],
