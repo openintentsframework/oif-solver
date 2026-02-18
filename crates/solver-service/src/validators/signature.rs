@@ -359,6 +359,8 @@ mod tests {
 		};
 
 		let network_config = NetworkConfig {
+			name: Some("test-network".to_string()),
+			network_type: solver_types::networks::NetworkType::New,
 			rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
 			input_settler_address: address_from_hex(input_settler_hex),
 			output_settler_address: address_from_hex(output_settler_hex),
