@@ -10,6 +10,7 @@
 
 pub mod admin;
 pub mod middleware;
+pub mod siwe;
 
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};

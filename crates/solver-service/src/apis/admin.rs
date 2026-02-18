@@ -122,7 +122,7 @@ impl AdminApiState {
 	}
 }
 
-/// GET /api/v1/admin/nonce
+/// GET|POST /api/v1/admin/nonce
 ///
 /// Generate a nonce for signing admin actions.
 /// The nonce must be included in the action contents before signing.

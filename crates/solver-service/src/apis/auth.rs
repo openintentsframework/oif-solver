@@ -3,7 +3,7 @@
 //! This module provides endpoints for client registration, client credentials
 //! token issuance, and token refresh operations for API authentication.
 
-use crate::auth::JwtService;
+use crate::auth::{siwe::verify_siwe_signature, JwtService};
 use axum::{
 	extract::State,
 	http::{HeaderMap, StatusCode},
@@ -16,9 +16,12 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha3::{Digest, Sha3_256};
+use solver_config::Config;
+use solver_storage::nonce_store::NonceStore;
 use solver_types::AuthScope;
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
 use subtle::ConstantTimeEq;
+use tokio::sync::RwLock;
 
 const TOKEN_DEFAULT_TTL_SECONDS: u32 = 900;
 const TOKEN_MAX_TTL_SECONDS: u32 = 3600;
@@ -30,6 +33,17 @@ const MAX_FAILURE_EVENTS_PER_KEY: usize = 256;
 
 static FAILED_AUTH_BY_CLIENT: Lazy<DashMap<String, VecDeque<i64>>> = Lazy::new(DashMap::new);
 static FAILED_AUTH_BY_IP: Lazy<DashMap<String, VecDeque<i64>>> = Lazy::new(DashMap::new);
+
+/// Shared state for SIWE auth endpoints.
+#[derive(Clone)]
+pub struct SiweAuthState {
+	/// JWT service used for access token issuance.
+	pub jwt_service: Option<Arc<JwtService>>,
+	/// Dynamic runtime config containing auth/admin settings.
+	pub config: Arc<RwLock<Config>>,
+	/// Dedicated nonce store for SIWE flow.
+	pub siwe_nonce_store: Option<Arc<NonceStore>>,
+}
 
 /// Request payload for client registration
 #[derive(Debug, Serialize, Deserialize)]
@@ -92,6 +106,37 @@ pub struct TokenResponse {
 	pub expires_in: u32,
 	/// Granted scope
 	pub scope: String,
+}
+
+/// Request payload for SIWE nonce creation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiweNonceRequest {
+	/// Ethereum address that will sign the SIWE message.
+	pub address: String,
+}
+
+/// Response payload for SIWE nonce creation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiweNonceResponse {
+	/// Single-use nonce to include in SIWE message.
+	pub nonce: String,
+	/// Pre-built SIWE message to sign.
+	pub message: String,
+	/// Nonce validity in seconds.
+	pub expires_in: u64,
+	/// Expected SIWE domain.
+	pub domain: String,
+	/// Expected SIWE chain ID.
+	pub chain_id: u64,
+}
+
+/// Request payload for SIWE message verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiweVerifyRequest {
+	/// Full SIWE message.
+	pub message: String,
+	/// Ethereum personal_sign signature over the message.
+	pub signature: String,
 }
 
 /// Handles POST /api/v1/auth/register requests.
@@ -511,6 +556,356 @@ pub async fn issue_client_token_with_peer(
 	(StatusCode::OK, Json(response)).into_response()
 }
 
+/// Handles POST /api/v1/auth/siwe/nonce requests.
+///
+/// Generates a single-use SIWE nonce and returns a pre-built message to sign.
+pub async fn issue_siwe_nonce(
+	State(state): State<SiweAuthState>,
+	Json(request): Json<SiweNonceRequest>,
+) -> impl IntoResponse {
+	let (_jwt_service, nonce_store, runtime) = match siwe_dependencies(&state).await {
+		Ok(value) => value,
+		Err(response) => return response,
+	};
+
+	let address = match parse_eth_address(&request.address) {
+		Ok(address) => address,
+		Err(message) => {
+			return (
+				StatusCode::BAD_REQUEST,
+				Json(json!({
+					"error": message
+				})),
+			)
+				.into_response();
+		},
+	};
+
+	let nonce_id = match nonce_store.generate().await {
+		Ok(nonce) => nonce,
+		Err(e) => {
+			tracing::error!("Failed to generate SIWE nonce: {}", e);
+			return (
+				StatusCode::INTERNAL_SERVER_ERROR,
+				Json(json!({
+					"error": "Failed to generate SIWE nonce"
+				})),
+			)
+				.into_response();
+		},
+	};
+
+	let nonce = format_siwe_nonce(nonce_id);
+	let message = build_siwe_message(
+		&runtime.domain,
+		address,
+		runtime.chain_id,
+		&nonce,
+		runtime.nonce_ttl_seconds,
+	);
+
+	let response = SiweNonceResponse {
+		nonce,
+		message,
+		expires_in: runtime.nonce_ttl_seconds,
+		domain: runtime.domain,
+		chain_id: runtime.chain_id,
+	};
+
+	(StatusCode::OK, Json(response)).into_response()
+}
+
+/// Handles POST /api/v1/auth/siwe/verify requests.
+///
+/// Verifies a signed SIWE message and returns an admin JWT access token.
+pub async fn verify_siwe_token(
+	State(state): State<SiweAuthState>,
+	Json(request): Json<SiweVerifyRequest>,
+) -> impl IntoResponse {
+	let (jwt_service, nonce_store, runtime) = match siwe_dependencies(&state).await {
+		Ok(value) => value,
+		Err(response) => return response,
+	};
+
+	let siwe = match verify_siwe_signature(
+		&request.message,
+		&request.signature,
+		&runtime.domain,
+		runtime.chain_id,
+	) {
+		Ok(siwe) => siwe,
+		Err(e) => {
+			return (
+				StatusCode::UNAUTHORIZED,
+				Json(json!({
+					"error": e.to_string()
+				})),
+			)
+				.into_response();
+		},
+	};
+
+	let nonce_id = match parse_siwe_nonce(&siwe.nonce) {
+		Ok(nonce) => nonce,
+		Err(message) => {
+			return (
+				StatusCode::BAD_REQUEST,
+				Json(json!({
+					"error": message
+				})),
+			)
+				.into_response();
+		},
+	};
+
+	match nonce_store.consume(nonce_id).await {
+		Ok(()) => {},
+		Err(solver_storage::nonce_store::NonceError::NotFound) => {
+			return (
+				StatusCode::UNAUTHORIZED,
+				Json(json!({
+					"error": "Invalid or expired SIWE nonce"
+				})),
+			)
+				.into_response();
+		},
+		Err(e) => {
+			tracing::error!("Failed to consume SIWE nonce: {}", e);
+			return (
+				StatusCode::INTERNAL_SERVER_ERROR,
+				Json(json!({
+					"error": "Failed to validate SIWE nonce"
+				})),
+			)
+				.into_response();
+		},
+	}
+
+	if !runtime.admin_addresses.contains(&siwe.address) {
+		return (
+			StatusCode::FORBIDDEN,
+			Json(json!({
+				"error": "SIWE signer is not an authorized admin"
+			})),
+		)
+			.into_response();
+	}
+
+	let expires_in = TOKEN_DEFAULT_TTL_SECONDS.min(TOKEN_MAX_TTL_SECONDS);
+	let subject = siwe.address.to_string();
+	let access_token = match jwt_service.generate_access_token_with_ttl_seconds(
+		&subject,
+		vec![AuthScope::AdminAll],
+		expires_in,
+	) {
+		Ok(token) => token,
+		Err(e) => {
+			tracing::error!("Failed to generate SIWE access token: {}", e);
+			return (
+				StatusCode::INTERNAL_SERVER_ERROR,
+				Json(json!({
+					"error": "Failed to generate access token"
+				})),
+			)
+				.into_response();
+		},
+	};
+
+	let response = TokenResponse {
+		access_token,
+		token_type: "Bearer".to_string(),
+		expires_in,
+		scope: "admin-all".to_string(),
+	};
+
+	(StatusCode::OK, Json(response)).into_response()
+}
+
+struct SiweRuntimeConfig {
+	domain: String,
+	chain_id: u64,
+	nonce_ttl_seconds: u64,
+	admin_addresses: Vec<alloy_primitives::Address>,
+}
+
+async fn siwe_dependencies(
+	state: &SiweAuthState,
+) -> Result<(Arc<JwtService>, Arc<NonceStore>, SiweRuntimeConfig), axum::response::Response> {
+	let jwt_service = match &state.jwt_service {
+		Some(service) => service.clone(),
+		None => {
+			return Err((
+				StatusCode::SERVICE_UNAVAILABLE,
+				Json(json!({
+					"error": "Authentication service is not configured"
+				})),
+			)
+				.into_response());
+		},
+	};
+
+	if !jwt_service.config().enabled {
+		return Err((
+			StatusCode::SERVICE_UNAVAILABLE,
+			Json(json!({
+				"error": "Authentication is disabled"
+			})),
+		)
+			.into_response());
+	}
+
+	let nonce_store = match &state.siwe_nonce_store {
+		Some(store) => store.clone(),
+		None => {
+			return Err((
+				StatusCode::SERVICE_UNAVAILABLE,
+				Json(json!({
+					"error": "SIWE authentication is not configured"
+				})),
+			)
+				.into_response());
+		},
+	};
+
+	let runtime = match resolve_siwe_runtime_config(&state.config).await {
+		Ok(runtime) => runtime,
+		Err(response) => return Err(response),
+	};
+
+	Ok((jwt_service, nonce_store, runtime))
+}
+
+async fn resolve_siwe_runtime_config(
+	config: &Arc<RwLock<Config>>,
+) -> Result<SiweRuntimeConfig, axum::response::Response> {
+	let config = config.read().await;
+	let api_config = match config.api.as_ref() {
+		Some(api) => api,
+		None => {
+			return Err((
+				StatusCode::SERVICE_UNAVAILABLE,
+				Json(json!({
+					"error": "API authentication is not configured"
+				})),
+			)
+				.into_response());
+		},
+	};
+	let auth = match api_config.auth.as_ref() {
+		Some(auth) => auth,
+		None => {
+			return Err((
+				StatusCode::SERVICE_UNAVAILABLE,
+				Json(json!({
+					"error": "API authentication is not configured"
+				})),
+			)
+				.into_response());
+		},
+	};
+	let admin = match auth.admin.as_ref() {
+		Some(admin) if admin.enabled => admin,
+		_ => {
+			return Err((
+				StatusCode::SERVICE_UNAVAILABLE,
+				Json(json!({
+					"error": "SIWE admin authentication is disabled"
+				})),
+			)
+				.into_response());
+		},
+	};
+
+	let domain = admin.domain.trim().to_string();
+	if domain.is_empty() {
+		return Err((
+			StatusCode::SERVICE_UNAVAILABLE,
+			Json(json!({
+				"error": "SIWE domain is not configured"
+			})),
+		)
+			.into_response());
+	}
+
+	let chain_id = admin
+		.chain_id
+		.unwrap_or_else(|| config.networks.keys().next().copied().unwrap_or(1));
+
+	Ok(SiweRuntimeConfig {
+		domain,
+		chain_id,
+		nonce_ttl_seconds: admin.nonce_ttl_seconds,
+		admin_addresses: admin.admin_addresses.clone(),
+	})
+}
+
+fn parse_eth_address(raw: &str) -> Result<alloy_primitives::Address, String> {
+	let trimmed = raw.trim();
+	if trimmed.is_empty() {
+		return Err("Address cannot be empty".to_string());
+	}
+
+	let normalized = if let Some(stripped) = trimmed
+		.strip_prefix("0x")
+		.or_else(|| trimmed.strip_prefix("0X"))
+	{
+		format!("0x{stripped}")
+	} else {
+		format!("0x{trimmed}")
+	};
+
+	normalized
+		.parse::<alloy_primitives::Address>()
+		.map_err(|e| format!("Invalid Ethereum address: {e}"))
+}
+
+fn format_siwe_nonce(nonce: u64) -> String {
+	format!("{nonce:020}")
+}
+
+fn parse_siwe_nonce(nonce: &str) -> Result<u64, String> {
+	if nonce.len() < 8 {
+		return Err("SIWE nonce must be at least 8 characters".to_string());
+	}
+	if !nonce.chars().all(|c| c.is_ascii_digit()) {
+		return Err("SIWE nonce format is invalid".to_string());
+	}
+
+	nonce
+		.parse::<u64>()
+		.map_err(|_| "SIWE nonce format is invalid".to_string())
+}
+
+fn build_siwe_message(
+	domain: &str,
+	address: alloy_primitives::Address,
+	chain_id: u64,
+	nonce: &str,
+	nonce_ttl_seconds: u64,
+) -> String {
+	let issued_at = chrono::Utc::now();
+	let expiration_time = issued_at + chrono::Duration::seconds(nonce_ttl_seconds as i64);
+	let uri = if domain.starts_with("http://") || domain.starts_with("https://") {
+		domain.to_string()
+	} else {
+		format!("https://{domain}")
+	};
+
+	format!(
+		"{domain} wants you to sign in with your Ethereum account:\n\
+{address}\n\n\
+Sign in to OIF Solver Admin API\n\n\
+URI: {uri}\n\
+Version: 1\n\
+Chain ID: {chain_id}\n\
+Nonce: {nonce}\n\
+Issued At: {}\n\
+Expiration Time: {}\n",
+		issued_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+		expiration_time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+	)
+}
+
 fn oauth_error_response(
 	status: StatusCode,
 	error: &str,
@@ -691,8 +1086,10 @@ mod tests {
 	use axum::http::{HeaderMap, HeaderValue, StatusCode};
 	use serde_json::Value;
 	use serial_test::serial;
-	use solver_types::{AuthConfig, SecretString};
+	use solver_config::{ApiConfig, ApiImplementations, ConfigBuilder};
+	use solver_types::{AdminConfig, AuthConfig, SecretString};
 	use std::sync::Arc;
+	use tokio::sync::RwLock;
 
 	// Helper function to create a test JWT service
 	fn create_test_jwt_service_with(
@@ -1430,6 +1827,89 @@ mod tests {
 		assert_eq!(deserialized.token_type, "Bearer");
 		assert_eq!(deserialized.scope, "admin-all");
 		assert_eq!(deserialized.expires_in, 900);
+	}
+
+	#[test]
+	fn test_format_and_parse_siwe_nonce_roundtrip() {
+		let nonce = super::format_siwe_nonce(12345);
+		assert_eq!(nonce, "00000000000000012345");
+		assert_eq!(super::parse_siwe_nonce(&nonce).unwrap(), 12345);
+	}
+
+	#[test]
+	fn test_parse_siwe_nonce_rejects_short_or_non_numeric() {
+		assert!(super::parse_siwe_nonce("1234567").is_err());
+		assert!(super::parse_siwe_nonce("abc12345").is_err());
+	}
+
+	#[test]
+	fn test_build_siwe_message_contains_expected_fields() {
+		let address = "0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B"
+			.parse::<alloy_primitives::Address>()
+			.unwrap();
+		let message = super::build_siwe_message(
+			"solver.example.com",
+			address,
+			1,
+			"00000000000000012345",
+			300,
+		);
+
+		assert!(message.contains("solver.example.com wants you to sign in"));
+		assert!(message.contains("Chain ID: 1"));
+		assert!(message.contains("Nonce: 00000000000000012345"));
+		assert!(message.contains("URI: https://solver.example.com"));
+	}
+
+	#[tokio::test]
+	async fn test_resolve_siwe_runtime_config_uses_admin_address_list() {
+		let admin_1 = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+			.parse::<alloy_primitives::Address>()
+			.unwrap();
+		let admin_2 = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+			.parse::<alloy_primitives::Address>()
+			.unwrap();
+
+		let auth_config = AuthConfig {
+			enabled: true,
+			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars-long"),
+			access_token_expiry_hours: 1,
+			refresh_token_expiry_hours: 720,
+			issuer: "test-issuer".to_string(),
+			public_register_enabled: false,
+			token_client_id: "solver-admin".to_string(),
+			token_client_secret: Some(SecretString::from("client-secret-at-least-32-chars")),
+			admin: Some(AdminConfig {
+				enabled: true,
+				domain: "localhost".to_string(),
+				// Mirrors seed-overrides shape where chain_id can be omitted.
+				chain_id: None,
+				nonce_ttl_seconds: 300,
+				admin_addresses: vec![admin_1, admin_2],
+			}),
+		};
+
+		let mut config = ConfigBuilder::new().build();
+		config.api = Some(ApiConfig {
+			enabled: true,
+			host: "127.0.0.1".to_string(),
+			port: 3000,
+			timeout_seconds: 30,
+			max_request_size: 1024 * 1024,
+			implementations: ApiImplementations::default(),
+			rate_limiting: None,
+			cors: None,
+			auth: Some(auth_config),
+			quote: None,
+		});
+
+		let shared = Arc::new(RwLock::new(config));
+		let runtime = super::resolve_siwe_runtime_config(&shared).await.unwrap();
+
+		assert_eq!(runtime.domain, "localhost");
+		assert_eq!(runtime.nonce_ttl_seconds, 300);
+		assert_eq!(runtime.chain_id, 1); // fallback when chain_id is omitted
+		assert_eq!(runtime.admin_addresses, vec![admin_1, admin_2]);
 	}
 
 	// Tests for helper functions

@@ -99,6 +99,19 @@ pub fn create_nonce_store(
 	NonceStore::new(storage, solver_id, ttl_seconds)
 }
 
+/// Creates a nonce store with a custom namespace segment.
+///
+/// The resulting key pattern is `{solver_id}:{namespace}:nonce:{nonce}`.
+pub fn create_nonce_store_with_namespace(
+	config: StoreConfig,
+	solver_id: &str,
+	namespace: &str,
+	ttl_seconds: u64,
+) -> Result<NonceStore, NonceError> {
+	let storage = create_storage_backend(config)?;
+	NonceStore::new_with_namespace(storage, solver_id, namespace, ttl_seconds)
+}
+
 /// Convenience function for creating a Redis-backed nonce store.
 ///
 /// This mirrors the pattern of [`crate::config_store::create_redis_config_store`].
@@ -110,6 +123,22 @@ pub fn create_redis_nonce_store(
 	create_nonce_store(
 		StoreConfig::Redis { url: redis_url },
 		solver_id,
+		ttl_seconds,
+	)
+}
+
+/// Convenience function for creating a Redis-backed nonce store with
+/// a custom namespace segment.
+pub fn create_redis_nonce_store_with_namespace(
+	redis_url: String,
+	solver_id: &str,
+	namespace: &str,
+	ttl_seconds: u64,
+) -> Result<NonceStore, NonceError> {
+	create_nonce_store_with_namespace(
+		StoreConfig::Redis { url: redis_url },
+		solver_id,
+		namespace,
 		ttl_seconds,
 	)
 }
@@ -136,6 +165,8 @@ pub struct NonceStore {
 }
 
 impl NonceStore {
+	const DEFAULT_NAMESPACE: &'static str = "admin";
+
 	/// Create a new NonceStore with a storage backend.
 	///
 	/// Prefer using [`create_nonce_store`] or [`create_redis_nonce_store`]
@@ -155,16 +186,31 @@ impl NonceStore {
 		solver_id: &str,
 		ttl_seconds: u64,
 	) -> Result<Self, NonceError> {
+		Self::new_with_namespace(storage, solver_id, Self::DEFAULT_NAMESPACE, ttl_seconds)
+	}
+
+	/// Create a new NonceStore with a custom namespace segment.
+	pub fn new_with_namespace(
+		storage: Arc<dyn StorageInterface>,
+		solver_id: &str,
+		namespace: &str,
+		ttl_seconds: u64,
+	) -> Result<Self, NonceError> {
 		if solver_id.is_empty() {
 			return Err(NonceError::Configuration(
 				"Solver ID cannot be empty".to_string(),
+			));
+		}
+		if namespace.is_empty() {
+			return Err(NonceError::Configuration(
+				"Namespace cannot be empty".to_string(),
 			));
 		}
 
 		Ok(Self {
 			storage,
 			solver_id: solver_id.to_string(),
-			namespace: format!("{solver_id}:admin:nonce"),
+			namespace: format!("{solver_id}:{namespace}:nonce"),
 			ttl: Duration::from_secs(ttl_seconds),
 		})
 	}
@@ -287,6 +333,22 @@ mod tests {
 		let store = create_nonce_store(StoreConfig::Memory, "my-solver", 300).unwrap();
 		let key = store.nonce_key(12345);
 		assert_eq!(key, "my-solver:admin:nonce:12345");
+	}
+
+	#[test]
+	fn test_nonce_key_format_custom_namespace() {
+		let store =
+			create_nonce_store_with_namespace(StoreConfig::Memory, "my-solver", "siwe", 300)
+				.unwrap();
+		let key = store.nonce_key(12345);
+		assert_eq!(key, "my-solver:siwe:nonce:12345");
+	}
+
+	#[test]
+	fn test_new_empty_namespace() {
+		let storage = create_storage_backend(StoreConfig::Memory).unwrap();
+		let result = NonceStore::new_with_namespace(storage, "test-solver", "", 300);
+		assert!(matches!(result, Err(NonceError::Configuration(_))));
 	}
 
 	#[test]

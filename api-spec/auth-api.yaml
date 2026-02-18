@@ -7,15 +7,17 @@ info:
     ## Authentication Flow
 
     1. **Privileged Client Auth**: POST /auth/token with `client_id + client_secret` to obtain admin access token
-    2. **Optional Public Registration**: POST /auth/register (if enabled) for non-admin scopes
-    3. **API Access**: Include access token in Authorization header: `Bearer <access_token>`
-    4. **Token Refresh**: For register-issued tokens, POST /auth/refresh with refresh token
-    5. **Scope-Based Authorization**: Different endpoints require different scopes
+    2. **SIWE Admin Auth**: POST /auth/siwe/nonce then POST /auth/siwe/verify to obtain admin access token
+    3. **Optional Public Registration**: POST /auth/register (if enabled) for non-admin scopes
+    4. **API Access**: Include access token in Authorization header: `Bearer <access_token>`
+    5. **Token Refresh**: For register-issued tokens, POST /auth/refresh with refresh token
+    6. **Scope-Based Authorization**: Different endpoints require different scopes
 
     ## Token Lifecycle
 
     - **Access Tokens**: Short-lived, used for API authentication
     - **Client Credentials Tokens**: Default 900 seconds, no refresh token
+    - **SIWE Tokens**: Default 900 seconds, no refresh token
     - **Refresh Tokens**: Long-lived (default 30 days), used to obtain new access tokens
     - **Token Rotation**: Refresh endpoint returns a new refresh token
 
@@ -116,6 +118,139 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
               example:
                 error: "Authentication service is not configured"
+
+  /auth/siwe/nonce:
+    post:
+      summary: Create SIWE nonce and message
+      description: |
+        Creates a single-use SIWE nonce and returns a canonical message to sign.
+        This endpoint is intended for admin authentication via wallet signature.
+      operationId: issueSiweNonce
+      tags:
+        - Authentication
+      requestBody:
+        required: true
+        description: Address that will sign the SIWE message
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SiweNonceRequest"
+            example:
+              address: "0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B"
+      responses:
+        "200":
+          description: SIWE nonce generated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SiweNonceResponse"
+              example:
+                nonce: "00000000000001234567"
+                message: "solver.example.com wants you to sign in with your Ethereum account:\n0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B\n\nSign in to OIF Solver Admin API\n\nURI: https://solver.example.com\nVersion: 1\nChain ID: 1\nNonce: 00000000000001234567\nIssued At: 2026-02-18T12:00:00.000Z\nExpiration Time: 2026-02-18T12:05:00.000Z\n"
+                expires_in: 300
+                domain: "solver.example.com"
+                chain_id: 1
+        "400":
+          description: Invalid address
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "Invalid Ethereum address: invalid address checksum"
+        "500":
+          description: Failed to create nonce
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "Failed to generate SIWE nonce"
+        "503":
+          description: SIWE auth unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "SIWE authentication is not configured"
+
+  /auth/siwe/verify:
+    post:
+      summary: Verify SIWE message and issue admin token
+      description: |
+        Verifies the SIWE message signature, validates nonce/domain/chain, and issues
+        a JWT access token with `admin-all` scope. This flow returns an access token only.
+      operationId: verifySiweToken
+      tags:
+        - Authentication
+      requestBody:
+        required: true
+        description: Signed SIWE payload
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SiweVerifyRequest"
+            example:
+              message: "solver.example.com wants you to sign in with your Ethereum account:\n0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B\n\nSign in to OIF Solver Admin API\n\nURI: https://solver.example.com\nVersion: 1\nChain ID: 1\nNonce: 00000000000001234567\nIssued At: 2026-02-18T12:00:00.000Z\nExpiration Time: 2026-02-18T12:05:00.000Z\n"
+              signature: "0x..."
+      responses:
+        "200":
+          description: SIWE verified and admin token issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+              example:
+                access_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                token_type: "Bearer"
+                expires_in: 900
+                scope: "admin-all"
+        "400":
+          description: Invalid SIWE nonce format
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "SIWE nonce format is invalid"
+        "401":
+          description: Invalid signature or expired nonce/message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalidSignature:
+                  value:
+                    error: "SIWE signature recovery failed: Recovery failed: ..."
+                expiredNonce:
+                  value:
+                    error: "Invalid or expired SIWE nonce"
+        "403":
+          description: Valid signer but not in admin allowlist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "SIWE signer is not an authorized admin"
+        "500":
+          description: Failed to issue token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "Failed to generate access token"
+        "503":
+          description: SIWE auth unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "SIWE authentication is not configured"
 
   /auth/register:
     post:
@@ -324,6 +459,64 @@ components:
           type: string
           example: "admin-all"
 
+    SiweNonceRequest:
+      type: object
+      description: Request payload for SIWE nonce creation
+      required:
+        - address
+      properties:
+        address:
+          type: string
+          description: Ethereum address that will sign the SIWE message
+          example: "0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B"
+
+    SiweNonceResponse:
+      type: object
+      description: Response payload for SIWE nonce creation
+      required:
+        - nonce
+        - message
+        - expires_in
+        - domain
+        - chain_id
+      properties:
+        nonce:
+          type: string
+          description: Single-use SIWE nonce
+          example: "00000000000001234567"
+        message:
+          type: string
+          description: Canonical SIWE message to sign
+          example: "solver.example.com wants you to sign in with your Ethereum account:\n0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B\n\nSign in to OIF Solver Admin API\n\nURI: https://solver.example.com\nVersion: 1\nChain ID: 1\nNonce: 00000000000001234567\nIssued At: 2026-02-18T12:00:00.000Z\nExpiration Time: 2026-02-18T12:05:00.000Z\n"
+        expires_in:
+          type: integer
+          description: Nonce validity in seconds
+          example: 300
+        domain:
+          type: string
+          description: Expected SIWE domain
+          example: "solver.example.com"
+        chain_id:
+          type: integer
+          description: Expected SIWE chain ID
+          example: 1
+
+    SiweVerifyRequest:
+      type: object
+      description: Request payload for SIWE verification
+      required:
+        - message
+        - signature
+      properties:
+        message:
+          type: string
+          description: Full SIWE message that was signed
+          example: "solver.example.com wants you to sign in with your Ethereum account:\n0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B\n\nSign in to OIF Solver Admin API\n\nURI: https://solver.example.com\nVersion: 1\nChain ID: 1\nNonce: 00000000000001234567\nIssued At: 2026-02-18T12:00:00.000Z\nExpiration Time: 2026-02-18T12:05:00.000Z\n"
+        signature:
+          type: string
+          description: Hex-encoded 65-byte personal_sign signature
+          example: "0x..."
+
     RegisterRequest:
       type: object
       description: Request payload for client registration
@@ -435,7 +628,7 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        JWT token obtained from /auth/token, /auth/register, or /auth/refresh.
+        JWT token obtained from /auth/token, /auth/siwe/verify, /auth/register, or /auth/refresh.
         Include in requests as: `Authorization: Bearer <access_token>`
 
 security:

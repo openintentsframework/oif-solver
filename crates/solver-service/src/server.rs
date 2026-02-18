@@ -30,7 +30,9 @@ use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
 use solver_storage::{
-	config_store::create_config_store, nonce_store::create_nonce_store, StoreConfig,
+	config_store::create_config_store,
+	nonce_store::{create_nonce_store, create_nonce_store_with_namespace, NonceStore},
+	StoreConfig,
 };
 use solver_types::{
 	api::PostOrderRequest, standards::eip7683::interfaces::StandardOrder, APIError, Address,
@@ -58,6 +60,8 @@ pub struct AppState {
 	pub discovery_url: Option<String>,
 	/// JWT service for authentication (if configured).
 	pub jwt_service: Option<Arc<JwtService>>,
+	/// Dedicated nonce store for SIWE authentication (if configured).
+	pub siwe_nonce_store: Option<Arc<NonceStore>>,
 	/// Signature validation service for different order standards.
 	pub signature_validation: Arc<SignatureValidationService>,
 }
@@ -131,6 +135,7 @@ pub async fn start_server(
 
 	// Initialize signature validation service
 	let signature_validation = Arc::new(SignatureValidationService::new());
+	let mut siwe_nonce_store: Option<Arc<NonceStore>> = None;
 
 	// Initialize admin API if enabled in config
 	let admin_state = if let Some(auth_config) = &api_config.auth {
@@ -143,6 +148,23 @@ pub async fn start_server(
 				let chain_id = admin_config
 					.chain_id
 					.unwrap_or_else(|| config.networks.keys().next().copied().unwrap_or(1));
+
+				match create_nonce_store_with_namespace(
+					StoreConfig::Redis {
+						url: redis_url.clone(),
+					},
+					&solver_id,
+					"siwe",
+					admin_config.nonce_ttl_seconds,
+				) {
+					Ok(store) => {
+						siwe_nonce_store = Some(Arc::new(store));
+						tracing::info!("SIWE nonce store initialized");
+					},
+					Err(e) => {
+						tracing::error!("Failed to initialize SIWE nonce store: {}", e);
+					},
+				}
 
 				// Use the solver's dynamic_config for hot reload (same Arc!)
 				// This ensures admin API updates propagate to the solver engine.
@@ -253,6 +275,7 @@ pub async fn start_server(
 		http_client,
 		discovery_url,
 		jwt_service: jwt_service.clone(),
+		siwe_nonce_store,
 		signature_validation,
 	};
 
@@ -266,7 +289,9 @@ pub async fn start_server(
 	let auth_routes = Router::new()
 		.route("/register", post(handle_auth_register))
 		.route("/token", post(handle_auth_token))
-		.route("/refresh", post(handle_auth_refresh));
+		.route("/refresh", post(handle_auth_refresh))
+		.route("/siwe/nonce", post(handle_auth_siwe_nonce))
+		.route("/siwe/verify", post(handle_auth_siwe_verify));
 
 	api_routes = api_routes.nest("/auth", auth_routes);
 
@@ -275,7 +300,7 @@ pub async fn start_server(
 		let mut admin_protected_routes = Router::new()
 			.route("/config", get(handle_get_config))
 			.route("/balances", get(handle_get_balances))
-			.route("/nonce", get(handle_get_nonce))
+			.route("/nonce", get(handle_get_nonce).post(handle_get_nonce))
 			.route("/types", get(handle_get_types))
 			.route("/whitelist", post(handle_add_admin))
 			.route("/whitelist", delete(handle_remove_admin))
@@ -480,6 +505,38 @@ async fn handle_auth_token(
 		Json(payload),
 	)
 	.await
+}
+
+/// Handles POST /api/v1/auth/siwe/nonce requests.
+///
+/// Generates a SIWE nonce and canonical SIWE message for admin login.
+async fn handle_auth_siwe_nonce(
+	State(state): State<AppState>,
+	Json(payload): Json<crate::apis::auth::SiweNonceRequest>,
+) -> impl IntoResponse {
+	let siwe_state = crate::apis::auth::SiweAuthState {
+		jwt_service: state.jwt_service,
+		config: state.config,
+		siwe_nonce_store: state.siwe_nonce_store,
+	};
+
+	crate::apis::auth::issue_siwe_nonce(State(siwe_state), Json(payload)).await
+}
+
+/// Handles POST /api/v1/auth/siwe/verify requests.
+///
+/// Verifies SIWE signatures and returns admin-scoped JWT access token.
+async fn handle_auth_siwe_verify(
+	State(state): State<AppState>,
+	Json(payload): Json<crate::apis::auth::SiweVerifyRequest>,
+) -> impl IntoResponse {
+	let siwe_state = crate::apis::auth::SiweAuthState {
+		jwt_service: state.jwt_service,
+		config: state.config,
+		siwe_nonce_store: state.siwe_nonce_store,
+	};
+
+	crate::apis::auth::verify_siwe_token(State(siwe_state), Json(payload)).await
 }
 
 /// Handles POST /api/v1/orders requests.
@@ -969,6 +1026,7 @@ mod tests {
 			http_client,
 			discovery_url,
 			jwt_service: None,
+			siwe_nonce_store: None,
 			signature_validation: Arc::new(SignatureValidationService::new()),
 		}
 	}
