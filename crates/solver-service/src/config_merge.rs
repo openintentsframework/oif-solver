@@ -4674,33 +4674,33 @@ mod tests {
 				name: None,
 				address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
 				decimals: 6,
-				}],
-				rpc_urls: Some(vec![]),
-				input_settler_address: None,
-				output_settler_address: None,
-				input_settler_compact_address: None,
-				the_compact_address: None,
-				allocator_address: None,
-			};
+			}],
+			rpc_urls: Some(vec![]),
+			input_settler_address: None,
+			output_settler_address: None,
+			input_settler_compact_address: None,
+			the_compact_address: None,
+			allocator_address: None,
+		};
 
-			let network = build_operator_network_config(Some(network_seed), &override_).unwrap();
-			assert_eq!(network.name, network_seed.name);
-			assert_eq!(network.network_type, NetworkType::New);
-			assert_eq!(network.tokens[0].name, Some("USDC".to_string()));
-			assert_eq!(network.rpc_urls.len(), network_seed.default_rpc_urls.len());
-		}
+		let network = build_operator_network_config(Some(network_seed), &override_).unwrap();
+		assert_eq!(network.name, network_seed.name);
+		assert_eq!(network.network_type, NetworkType::New);
+		assert_eq!(network.tokens[0].name, Some("USDC".to_string()));
+		assert_eq!(network.rpc_urls.len(), network_seed.default_rpc_urls.len());
+	}
 
-		#[test]
-		fn test_build_operator_hyperlane_config_from_seed() {
-			let hyperlane =
-				build_operator_hyperlane_config_from_seed(&TESTNET_SEED, &[11155420, 84532]).unwrap();
-			assert!(hyperlane.mailboxes.contains_key(&11155420));
-			assert!(hyperlane.mailboxes.contains_key(&84532));
-			assert!(hyperlane.igp_addresses.contains_key(&11155420));
-			assert!(hyperlane.igp_addresses.contains_key(&84532));
-			assert_eq!(hyperlane.routes.get(&11155420), Some(&vec![84532]));
-			assert_eq!(hyperlane.routes.get(&84532), Some(&vec![11155420]));
-		}
+	#[test]
+	fn test_build_operator_hyperlane_config_from_seed() {
+		let hyperlane =
+			build_operator_hyperlane_config_from_seed(&TESTNET_SEED, &[11155420, 84532]).unwrap();
+		assert!(hyperlane.mailboxes.contains_key(&11155420));
+		assert!(hyperlane.mailboxes.contains_key(&84532));
+		assert!(hyperlane.igp_addresses.contains_key(&11155420));
+		assert!(hyperlane.igp_addresses.contains_key(&84532));
+		assert_eq!(hyperlane.routes.get(&11155420), Some(&vec![84532]));
+		assert_eq!(hyperlane.routes.get(&84532), Some(&vec![11155420]));
+	}
 
 	#[test]
 	#[serial]
