@@ -2494,6 +2494,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
