@@ -150,14 +150,12 @@ fn validate_seedless_settlement_requirements(
 			for chain_id in chain_ids {
 				if !hyperlane.mailboxes.contains_key(chain_id) {
 					return Err(MergeError::Validation(format!(
-						"seedless mode requires settlement.hyperlane.mailboxes for chain {}",
-						chain_id
+						"seedless mode requires settlement.hyperlane.mailboxes for chain {chain_id}"
 					)));
 				}
 				if !hyperlane.igp_addresses.contains_key(chain_id) {
 					return Err(MergeError::Validation(format!(
-						"seedless mode requires settlement.hyperlane.igp_addresses for chain {}",
-						chain_id
+						"seedless mode requires settlement.hyperlane.igp_addresses for chain {chain_id}"
 					)));
 				}
 
@@ -165,14 +163,12 @@ fn validate_seedless_settlement_requirements(
 					Some(oracles) if !oracles.is_empty() => {},
 					Some(_) => {
 						return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.hyperlane.oracles.input for chain {}",
-							chain_id
+							"seedless mode requires non-empty settlement.hyperlane.oracles.input for chain {chain_id}"
 						)))
 					},
 					None => {
 						return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.hyperlane.oracles.input for chain {}",
-							chain_id
+							"seedless mode requires settlement.hyperlane.oracles.input for chain {chain_id}"
 						)))
 					},
 				}
@@ -181,14 +177,12 @@ fn validate_seedless_settlement_requirements(
 					Some(oracles) if !oracles.is_empty() => {},
 					Some(_) => {
 						return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.hyperlane.oracles.output for chain {}",
-							chain_id
+							"seedless mode requires non-empty settlement.hyperlane.oracles.output for chain {chain_id}"
 						)))
 					},
 					None => {
 						return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.hyperlane.oracles.output for chain {}",
-							chain_id
+							"seedless mode requires settlement.hyperlane.oracles.output for chain {chain_id}"
 						)))
 					},
 				}
@@ -211,14 +205,12 @@ fn validate_seedless_settlement_requirements(
 					Some(oracles) if !oracles.is_empty() => {},
 					Some(_) => {
 						return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.direct.oracles.input for chain {}",
-							chain_id
+							"seedless mode requires non-empty settlement.direct.oracles.input for chain {chain_id}"
 						)))
 					},
 					None => {
 						return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.direct.oracles.input for chain {}",
-							chain_id
+							"seedless mode requires settlement.direct.oracles.input for chain {chain_id}"
 						)))
 					},
 				}
@@ -226,14 +218,12 @@ fn validate_seedless_settlement_requirements(
 					Some(oracles) if !oracles.is_empty() => {},
 					Some(_) => {
 						return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.direct.oracles.output for chain {}",
-							chain_id
+							"seedless mode requires non-empty settlement.direct.oracles.output for chain {chain_id}"
 						)))
 					},
 					None => {
 						return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.direct.oracles.output for chain {}",
-							chain_id
+							"seedless mode requires settlement.direct.oracles.output for chain {chain_id}"
 						)))
 					},
 				}
@@ -610,8 +600,7 @@ fn build_operator_hyperlane_config_from_seed(
 	for chain_id in chain_ids {
 		let network = seed.get_network(*chain_id).ok_or_else(|| {
 			MergeError::Validation(format!(
-				"Chain {} is not in seed; provide settlement.hyperlane override",
-				chain_id
+				"Chain {chain_id} is not in seed; provide settlement.hyperlane override"
 			))
 		})?;
 		mailboxes.insert(*chain_id, network.hyperlane_mailbox);
@@ -622,8 +611,7 @@ fn build_operator_hyperlane_config_from_seed(
 	for chain_id in chain_ids {
 		let network = seed.get_network(*chain_id).ok_or_else(|| {
 			MergeError::Validation(format!(
-				"Chain {} is not in seed; provide settlement.hyperlane override",
-				chain_id
+				"Chain {chain_id} is not in seed; provide settlement.hyperlane override"
 			))
 		})?;
 		igp_addresses.insert(*chain_id, network.hyperlane_igp);
@@ -635,8 +623,7 @@ fn build_operator_hyperlane_config_from_seed(
 	for chain_id in chain_ids {
 		let network = seed.get_network(*chain_id).ok_or_else(|| {
 			MergeError::Validation(format!(
-				"Chain {} is not in seed; provide settlement.hyperlane override",
-				chain_id
+				"Chain {chain_id} is not in seed; provide settlement.hyperlane override"
 			))
 		})?;
 		input_oracles.insert(*chain_id, vec![network.hyperlane_oracle]);
@@ -732,14 +719,12 @@ fn build_operator_hyperlane_config_from_override(
 	for chain_id in chain_ids {
 		if !override_cfg.mailboxes.contains_key(chain_id) {
 			return Err(MergeError::Validation(format!(
-				"settlement.hyperlane.mailboxes is missing chain {}",
-				chain_id
+				"settlement.hyperlane.mailboxes is missing chain {chain_id}"
 			)));
 		}
 		if !override_cfg.igp_addresses.contains_key(chain_id) {
 			return Err(MergeError::Validation(format!(
-				"settlement.hyperlane.igp_addresses is missing chain {}",
-				chain_id
+				"settlement.hyperlane.igp_addresses is missing chain {chain_id}"
 			)));
 		}
 		ensure_oracle_chain_entries(
