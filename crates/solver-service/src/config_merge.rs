@@ -66,6 +66,28 @@ pub enum MergeError {
 	Validation(String),
 }
 
+fn parse_bool_env_var(name: &str, default: bool) -> Result<bool, MergeError> {
+	match std::env::var(name) {
+		Ok(raw) => raw.trim().to_ascii_lowercase().parse().map_err(|_| {
+			MergeError::Validation(format!(
+				"Invalid boolean value for {name}: {raw} (expected 'true' or 'false')"
+			))
+		}),
+		Err(std::env::VarError::NotPresent) => Ok(default),
+		Err(std::env::VarError::NotUnicode(_)) => Err(MergeError::Validation(format!(
+			"Invalid unicode value for {name}"
+		))),
+	}
+}
+
+fn load_public_register_enabled(auth_enabled: bool) -> Result<bool, MergeError> {
+	if !auth_enabled {
+		return Ok(false);
+	}
+
+	parse_bool_env_var("AUTH_PUBLIC_REGISTER_ENABLED", false)
+}
+
 /// Merges seed overrides with a seed config to produce a complete Config.
 ///
 /// # Arguments
@@ -139,7 +161,10 @@ pub fn merge_config(overrides: SeedOverrides, seed: &SeedConfig) -> Result<Confi
 		order: build_order_config(&seed.defaults),
 		settlement: build_settlement_config(&chain_ids, seed),
 		pricing: Some(build_pricing_config(&seed.defaults)),
-		api: Some(build_api_config(overrides.admin.as_ref())),
+		api: Some(build_api_config(
+			overrides.admin.as_ref(),
+			overrides.auth_enabled,
+		)?),
 		gas: Some(build_gas_config(&seed.defaults)),
 	};
 
@@ -276,6 +301,7 @@ pub fn merge_to_operator_config(
 			monitoring_timeout_seconds: seed.defaults.monitoring_timeout_seconds,
 		},
 		admin,
+		auth_enabled: initializer.auth_enabled.unwrap_or(false),
 		account: initializer.account.as_ref().map(|a| OperatorAccountConfig {
 			primary: a.primary.clone(),
 			implementations: a.implementations.clone(),
@@ -447,7 +473,10 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 		order: build_order_config_from_operator(),
 		settlement: build_settlement_config_from_operator(operator_config),
 		pricing: Some(build_pricing_config_from_operator(&operator_config.pricing)),
-		api: Some(build_api_config_from_operator(&operator_config.admin)),
+		api: Some(build_api_config_from_operator(
+			&operator_config.admin,
+			operator_config.auth_enabled,
+		)?),
 		gas: Some(build_gas_config_from_operator(&operator_config.gas)),
 	};
 
@@ -849,8 +878,11 @@ fn build_gas_config_from_operator(gas: &OperatorGasConfig) -> GasConfig {
 }
 
 /// Builds ApiConfig from OperatorAdminConfig.
-fn build_api_config_from_operator(admin: &OperatorAdminConfig) -> ApiConfig {
-	let auth = if admin.enabled {
+fn build_api_config_from_operator(
+	admin: &OperatorAdminConfig,
+	auth_enabled: bool,
+) -> Result<ApiConfig, MergeError> {
+	let auth = if admin.enabled || auth_enabled {
 		// Read JWT secret from environment variable
 		let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| {
 			tracing::warn!(
@@ -858,26 +890,34 @@ fn build_api_config_from_operator(admin: &OperatorAdminConfig) -> ApiConfig {
 			);
 			uuid::Uuid::new_v4().to_string()
 		});
+		let public_register_enabled = load_public_register_enabled(auth_enabled)?;
 
-		Some(solver_types::AuthConfig {
-			enabled: false, // Don't require JWT for /orders - admin auth is separate
-			jwt_secret: solver_types::SecretString::new(jwt_secret),
-			access_token_expiry_hours: 1,
-			refresh_token_expiry_hours: 720, // 30 days
-			issuer: "oif-solver".to_string(),
-			admin: Some(solver_types::AdminConfig {
+		let admin_config = if admin.enabled {
+			Some(solver_types::AdminConfig {
 				enabled: admin.enabled,
 				domain: admin.domain.clone(),
 				chain_id: Some(admin.chain_id),
 				nonce_ttl_seconds: admin.nonce_ttl_seconds,
 				admin_addresses: admin.admin_addresses.clone(),
-			}),
+			})
+		} else {
+			None
+		};
+
+		Some(solver_types::AuthConfig {
+			enabled: auth_enabled,
+			jwt_secret: solver_types::SecretString::new(jwt_secret),
+			access_token_expiry_hours: 1,
+			refresh_token_expiry_hours: 720, // 30 days
+			issuer: "oif-solver".to_string(),
+			public_register_enabled,
+			admin: admin_config,
 		})
 	} else {
 		None
 	};
 
-	ApiConfig {
+	Ok(ApiConfig {
 		enabled: true,
 		host: "0.0.0.0".to_string(),
 		port: 3000,
@@ -890,7 +930,7 @@ fn build_api_config_from_operator(admin: &OperatorAdminConfig) -> ApiConfig {
 		cors: None,
 		auth,
 		quote: None,
-	}
+	})
 }
 
 /// Builds the NetworksConfig from seed overrides and seed data.
@@ -1342,11 +1382,12 @@ fn build_gas_config(defaults: &SeedDefaults) -> GasConfig {
 /// Builds the ApiConfig section with default values for HTTP API server.
 fn build_api_config(
 	admin_override: Option<&solver_types::seed_overrides::AdminOverride>,
-) -> ApiConfig {
-	// Build auth config if admin is configured
+	auth_enabled: Option<bool>,
+) -> Result<ApiConfig, MergeError> {
+	// Build auth config if admin is configured or auth is enabled
 	// Note: `auth.enabled` controls JWT requirement for /orders endpoint
 	// Admin auth (wallet signatures for /admin/*) is controlled separately by `auth.admin.enabled`
-	let auth = admin_override.map(|admin| {
+	let auth = if admin_override.is_some() || auth_enabled.unwrap_or(false) {
 		use solver_types::{AdminConfig, AuthConfig, SecretString};
 
 		// Read JWT secret from environment variable
@@ -1356,24 +1397,30 @@ fn build_api_config(
 			);
 			uuid::Uuid::new_v4().to_string()
 		});
+		let public_register_enabled = load_public_register_enabled(auth_enabled.unwrap_or(false))?;
 
-		AuthConfig {
-			enabled: false, // Don't require JWT for /orders - admin auth is separate
+		let admin_config = admin_override.map(|admin| AdminConfig {
+			enabled: admin.enabled,
+			domain: admin.domain.clone(),
+			chain_id: admin.chain_id,
+			nonce_ttl_seconds: admin.nonce_ttl_seconds.unwrap_or(300),
+			admin_addresses: admin.admin_addresses.clone(),
+		});
+
+		Some(AuthConfig {
+			enabled: auth_enabled.unwrap_or(false),
 			jwt_secret: SecretString::new(jwt_secret),
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720, // 30 days
 			issuer: "oif-solver".to_string(),
-			admin: Some(AdminConfig {
-				enabled: admin.enabled,
-				domain: admin.domain.clone(),
-				chain_id: admin.chain_id,
-				nonce_ttl_seconds: admin.nonce_ttl_seconds.unwrap_or(300),
-				admin_addresses: admin.admin_addresses.clone(),
-			}),
-		}
-	});
+			public_register_enabled,
+			admin: admin_config,
+		})
+	} else {
+		None
+	};
 
-	ApiConfig {
+	Ok(ApiConfig {
 		enabled: true,
 		host: "0.0.0.0".to_string(),
 		port: 3000,
@@ -1386,7 +1433,7 @@ fn build_api_config(
 		cors: None,
 		auth,
 		quote: None,
-	}
+	})
 }
 
 /// Converts an existing Config to OperatorConfig.
@@ -1558,6 +1605,13 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		})
 		.unwrap_or_default();
 
+	let auth_enabled = config
+		.api
+		.as_ref()
+		.and_then(|api| api.auth.as_ref())
+		.map(|auth| auth.enabled)
+		.unwrap_or(false);
+
 	// Extract account config - only set if not using default local wallet
 	let account = extract_account_config(&config.account);
 
@@ -1579,6 +1633,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 			monitoring_timeout_seconds: config.solver.monitoring_timeout_seconds,
 		},
 		admin,
+		auth_enabled,
 		account,
 	})
 }
@@ -1783,6 +1838,7 @@ mod tests {
 	use crate::seeds::TESTNET_SEED;
 	use alloy_primitives::address;
 	use rust_decimal::Decimal;
+	use serial_test::serial;
 	use solver_types::seed_overrides::AdminOverride;
 	use std::str::FromStr;
 
@@ -1818,6 +1874,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -1875,6 +1932,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -1917,6 +1975,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -1950,6 +2009,7 @@ mod tests {
 			}],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -2022,6 +2082,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: Some(Decimal::from_str("2.5").unwrap()), // Override: 2.5%
 			gas_buffer_bps: Some(1500),                                     // Override: 15%
 			commission_bps: Some(25),                                       // Override: 0.25%
@@ -2202,6 +2263,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -2249,6 +2311,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -2321,6 +2384,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -2368,6 +2432,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -2421,6 +2486,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -2468,6 +2534,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -2501,6 +2568,7 @@ mod tests {
 			}],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -2543,6 +2611,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -2597,6 +2666,7 @@ mod tests {
 				admin_addresses: vec![address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")],
 				withdrawals: solver_types::seed_overrides::WithdrawalsOverride::default(),
 			}),
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -2711,6 +2781,7 @@ mod tests {
 				monitoring_timeout_seconds: 30,
 			},
 			admin: OperatorAdminConfig::default(),
+			auth_enabled: false,
 			account: None,
 		};
 
@@ -2984,7 +3055,13 @@ mod tests {
 	}
 
 	#[test]
+	#[serial]
 	fn test_build_api_config_from_operator_admin_enabled() {
+		use std::env;
+
+		let original_public_register = env::var("AUTH_PUBLIC_REGISTER_ENABLED").ok();
+		env::set_var("AUTH_PUBLIC_REGISTER_ENABLED", "true");
+
 		let admin = OperatorAdminConfig {
 			enabled: true,
 			domain: "solver.example.com".to_string(),
@@ -2994,14 +3071,21 @@ mod tests {
 			withdrawals: OperatorWithdrawalsConfig::default(),
 		};
 
-		let api = build_api_config_from_operator(&admin);
+		let api = build_api_config_from_operator(&admin, true).unwrap();
 
 		assert!(api.enabled);
 		let auth = api.auth.as_ref().unwrap();
+		assert!(auth.enabled);
+		assert!(auth.public_register_enabled);
 		let admin_config = auth.admin.as_ref().unwrap();
 		assert!(admin_config.enabled);
 		assert_eq!(admin_config.domain, "solver.example.com");
 		assert_eq!(admin_config.chain_id, Some(1));
+
+		env::remove_var("AUTH_PUBLIC_REGISTER_ENABLED");
+		if let Some(val) = original_public_register {
+			env::set_var("AUTH_PUBLIC_REGISTER_ENABLED", val);
+		}
 	}
 
 	#[test]
@@ -3015,13 +3099,80 @@ mod tests {
 			withdrawals: OperatorWithdrawalsConfig::default(),
 		};
 
-		let api = build_api_config_from_operator(&admin);
+		let api = build_api_config_from_operator(&admin, false).unwrap();
 
 		assert!(api.enabled); // API is always enabled
 		assert!(api.auth.is_none()); // But auth is None when admin disabled
 	}
 
 	#[test]
+	#[serial]
+	fn test_parse_bool_env_var_uses_default_when_missing() {
+		let key = "TEST_PARSE_BOOL_MISSING";
+		std::env::remove_var(key);
+		let parsed = parse_bool_env_var(key, true).unwrap();
+		assert!(parsed);
+	}
+
+	#[test]
+	#[serial]
+	fn test_parse_bool_env_var_parses_case_insensitive_values() {
+		let key = "TEST_PARSE_BOOL_CASE";
+		std::env::set_var(key, "TrUe");
+		let parsed = parse_bool_env_var(key, false).unwrap();
+		assert!(parsed);
+		std::env::remove_var(key);
+	}
+
+	#[test]
+	#[serial]
+	fn test_parse_bool_env_var_rejects_invalid_value() {
+		let key = "TEST_PARSE_BOOL_INVALID";
+		std::env::set_var(key, "yes");
+		let err = parse_bool_env_var(key, false).unwrap_err();
+		std::env::remove_var(key);
+
+		assert!(matches!(err, MergeError::Validation(_)));
+		assert!(err.to_string().contains("Invalid boolean value"));
+	}
+
+	#[test]
+	fn test_build_operator_network_config_falls_back_to_seed_name_and_rpc() {
+		let network_seed = TESTNET_SEED
+			.get_network(11155420)
+			.expect("expected optimism sepolia in seed");
+		let override_ = NetworkOverride {
+			chain_id: 11155420,
+			name: Some("   ".to_string()),
+			network_type: None,
+			tokens: vec![solver_types::seed_overrides::Token {
+				symbol: "USDC".to_string(),
+				name: None,
+				address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+				decimals: 6,
+			}],
+			rpc_urls: Some(vec![]),
+		};
+
+		let network = build_operator_network_config(network_seed, &override_);
+		assert_eq!(network.name, network_seed.name);
+		assert_eq!(network.network_type, NetworkType::New);
+		assert_eq!(network.tokens[0].name, Some("USDC".to_string()));
+		assert_eq!(network.rpc_urls.len(), network_seed.default_rpc_urls.len());
+	}
+
+	#[test]
+	fn test_build_operator_hyperlane_config_skips_unknown_chain_metadata() {
+		let hyperlane = build_operator_hyperlane_config(&[11155420, 999999], &TESTNET_SEED);
+		assert!(hyperlane.mailboxes.contains_key(&11155420));
+		assert!(!hyperlane.mailboxes.contains_key(&999999));
+		assert!(hyperlane.igp_addresses.contains_key(&11155420));
+		assert!(!hyperlane.igp_addresses.contains_key(&999999));
+		assert!(hyperlane.routes.contains_key(&999999));
+	}
+
+	#[test]
+	#[serial]
 	fn test_jwt_secret_from_env_var() {
 		use std::env;
 
@@ -3038,7 +3189,7 @@ mod tests {
 			admin_addresses: vec![address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")],
 			withdrawals: OperatorWithdrawalsConfig::default(),
 		};
-		let api = build_api_config_from_operator(&admin);
+		let api = build_api_config_from_operator(&admin, false).unwrap();
 		let auth = api.auth.as_ref().unwrap();
 		assert_eq!(
 			auth.jwt_secret.expose_secret(),
@@ -3049,6 +3200,41 @@ mod tests {
 		env::remove_var("JWT_SECRET");
 		if let Some(val) = original_jwt {
 			env::set_var("JWT_SECRET", val);
+		}
+	}
+
+	#[test]
+	#[serial]
+	fn test_auth_enabled_defaults_public_register_disabled() {
+		use std::env;
+
+		let original = env::var("AUTH_PUBLIC_REGISTER_ENABLED").ok();
+		env::remove_var("AUTH_PUBLIC_REGISTER_ENABLED");
+
+		let admin = OperatorAdminConfig::default();
+		let api = build_api_config_from_operator(&admin, true).unwrap();
+		let auth = api.auth.as_ref().unwrap();
+		assert!(!auth.public_register_enabled);
+
+		if let Some(val) = original {
+			env::set_var("AUTH_PUBLIC_REGISTER_ENABLED", val);
+		}
+	}
+
+	#[test]
+	#[serial]
+	fn test_auth_disabled_ignores_public_register_env() {
+		use std::env;
+
+		let original = env::var("AUTH_PUBLIC_REGISTER_ENABLED").ok();
+		env::set_var("AUTH_PUBLIC_REGISTER_ENABLED", "true");
+
+		let enabled = load_public_register_enabled(false).unwrap();
+		assert!(!enabled);
+
+		env::remove_var("AUTH_PUBLIC_REGISTER_ENABLED");
+		if let Some(val) = original {
+			env::set_var("AUTH_PUBLIC_REGISTER_ENABLED", val);
 		}
 	}
 
@@ -3101,6 +3287,7 @@ mod tests {
 				},
 			}),
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,

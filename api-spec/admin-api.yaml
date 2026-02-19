@@ -61,6 +61,52 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AdminAuthErrorResponse"
+    post:
+      summary: Create admin nonce
+      description: |
+        Generates a nonce used to sign subsequent admin actions.
+        This endpoint is equivalent to `GET /admin/nonce`.
+      operationId: createAdminNonce
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Nonce generated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NonceResponse"
+              example:
+                nonce: "12345678901234567890"
+                expiresIn: 300
+                domain: "solver.example.com"
+                chainId: 1
+        "400":
+          description: Invalid request or nonce generation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "401":
+          description: Unauthorized (signature or JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
 
   /admin/types:
     get:

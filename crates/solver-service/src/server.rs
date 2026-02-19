@@ -30,7 +30,9 @@ use serde_json::Value;
 use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
 use solver_storage::{
-	config_store::create_config_store, create_storage_backend, nonce_store::create_nonce_store,
+	config_store::create_config_store,
+	create_storage_backend,
+	nonce_store::{create_nonce_store, create_nonce_store_with_namespace, NonceStore},
 	StoreConfig,
 };
 use solver_types::{
@@ -38,7 +40,7 @@ use solver_types::{
 	ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse, OperatorConfig, Order,
 	OrderIdCallback, Transaction,
 };
-use std::{convert::TryInto, sync::Arc};
+use std::{convert::TryInto, net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tower::ServiceBuilder;
@@ -59,6 +61,8 @@ pub struct AppState {
 	pub discovery_url: Option<String>,
 	/// JWT service for authentication (if configured).
 	pub jwt_service: Option<Arc<JwtService>>,
+	/// Dedicated nonce store for SIWE authentication (if configured).
+	pub siwe_nonce_store: Option<Arc<NonceStore>>,
 	/// Signature validation service for different order standards.
 	pub signature_validation: Arc<SignatureValidationService>,
 }
@@ -184,6 +188,7 @@ pub async fn start_server(
 
 	// Initialize signature validation service
 	let signature_validation = Arc::new(SignatureValidationService::new());
+	let mut siwe_nonce_store: Option<Arc<NonceStore>> = None;
 
 	// Initialize admin API if enabled in config
 	let admin_state = if let Some(auth_config) = &api_config.auth {
@@ -196,6 +201,23 @@ pub async fn start_server(
 				let chain_id = admin_config
 					.chain_id
 					.unwrap_or_else(|| config.networks.keys().next().copied().unwrap_or(1));
+
+				match create_nonce_store_with_namespace(
+					StoreConfig::Redis {
+						url: redis_url.clone(),
+					},
+					&solver_id,
+					"siwe",
+					admin_config.nonce_ttl_seconds,
+				) {
+					Ok(store) => {
+						siwe_nonce_store = Some(Arc::new(store));
+						tracing::info!("SIWE nonce store initialized");
+					},
+					Err(e) => {
+						tracing::error!("Failed to initialize SIWE nonce store: {}", e);
+					},
+				}
 
 				// Use the solver's dynamic_config for hot reload (same Arc!)
 				// This ensures admin API updates propagate to the solver engine.
@@ -294,6 +316,7 @@ pub async fn start_server(
 		http_client,
 		discovery_url,
 		jwt_service: jwt_service.clone(),
+		siwe_nonce_store,
 		signature_validation,
 	};
 
@@ -306,17 +329,18 @@ pub async fn start_server(
 	// Add auth subroutes
 	let auth_routes = Router::new()
 		.route("/register", post(handle_auth_register))
-		.route("/refresh", post(handle_auth_refresh));
+		.route("/refresh", post(handle_auth_refresh))
+		.route("/siwe/nonce", post(handle_auth_siwe_nonce))
+		.route("/siwe/verify", post(handle_auth_siwe_verify));
 
 	api_routes = api_routes.nest("/auth", auth_routes);
 
 	// Add admin routes if enabled
 	if let Some(admin_state) = admin_state {
-		let admin_public_routes = Router::new().route("/config", get(handle_get_config));
-
 		let mut admin_protected_routes = Router::new()
+			.route("/config", get(handle_get_config))
 			.route("/balances", get(handle_get_balances))
-			.route("/nonce", get(handle_get_nonce))
+			.route("/nonce", get(handle_get_nonce).post(handle_get_nonce))
 			.route("/types", get(handle_get_types))
 			.route("/whitelist", post(handle_add_admin))
 			.route("/whitelist", delete(handle_remove_admin))
@@ -345,9 +369,7 @@ pub async fn start_server(
 			}
 		}
 
-		let admin_routes = admin_public_routes
-			.merge(admin_protected_routes)
-			.with_state(admin_state);
+		let admin_routes = admin_protected_routes.with_state(admin_state);
 
 		api_routes = api_routes.nest("/admin", admin_routes);
 		tracing::info!("Admin routes registered at /api/v1/admin/*");
@@ -408,7 +430,10 @@ pub async fn start_server(
 
 	// Wrap the entire app with NormalizePath to handle trailing slashes
 	let app = NormalizePath::trim_trailing_slash(app);
-	let service = ServiceExt::<axum::http::Request<axum::body::Body>>::into_make_service(app);
+	let service =
+		ServiceExt::<axum::http::Request<axum::body::Body>>::into_make_service_with_connect_info::<
+			SocketAddr,
+		>(app);
 
 	axum::serve(listener, service).await?;
 
@@ -502,6 +527,38 @@ async fn handle_auth_refresh(
 	Json(payload): Json<crate::apis::auth::RefreshRequest>,
 ) -> impl IntoResponse {
 	crate::apis::auth::refresh_token(State(state.jwt_service), Json(payload)).await
+}
+
+/// Handles POST /api/v1/auth/siwe/nonce requests.
+///
+/// Generates a SIWE nonce and canonical SIWE message for admin login.
+async fn handle_auth_siwe_nonce(
+	State(state): State<AppState>,
+	Json(payload): Json<crate::apis::auth::SiweNonceRequest>,
+) -> impl IntoResponse {
+	let siwe_state = crate::apis::auth::SiweAuthState {
+		jwt_service: state.jwt_service,
+		config: state.config,
+		siwe_nonce_store: state.siwe_nonce_store,
+	};
+
+	crate::apis::auth::issue_siwe_nonce(State(siwe_state), Json(payload)).await
+}
+
+/// Handles POST /api/v1/auth/siwe/verify requests.
+///
+/// Verifies SIWE signatures and returns admin-scoped JWT access + refresh tokens.
+async fn handle_auth_siwe_verify(
+	State(state): State<AppState>,
+	Json(payload): Json<crate::apis::auth::SiweVerifyRequest>,
+) -> impl IntoResponse {
+	let siwe_state = crate::apis::auth::SiweAuthState {
+		jwt_service: state.jwt_service,
+		config: state.config,
+		siwe_nonce_store: state.siwe_nonce_store,
+	};
+
+	crate::apis::auth::verify_siwe_token(State(siwe_state), Json(payload)).await
 }
 
 /// Handles POST /api/v1/orders requests.
@@ -991,6 +1048,7 @@ mod tests {
 			http_client,
 			discovery_url,
 			jwt_service: None,
+			siwe_nonce_store: None,
 			signature_validation: Arc::new(SignatureValidationService::new()),
 		}
 	}
@@ -1106,6 +1164,69 @@ mod tests {
 			Err(err) => err,
 		};
 		assert!(err.to_string().contains("Nonce store error"));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn handle_auth_register_returns_service_unavailable_without_jwt_service() {
+		let state = build_test_app_state(None).await;
+		let response = super::handle_auth_register(
+			State(state),
+			Json(crate::apis::auth::RegisterRequest {
+				client_id: "test-client".to_string(),
+				client_name: None,
+				scopes: None,
+			}),
+		)
+		.await
+		.into_response();
+
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn handle_auth_refresh_returns_service_unavailable_without_jwt_service() {
+		let state = build_test_app_state(None).await;
+		let response = super::handle_auth_refresh(
+			State(state),
+			Json(crate::apis::auth::RefreshRequest {
+				refresh_token: "token".to_string(),
+			}),
+		)
+		.await
+		.into_response();
+
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn handle_auth_siwe_nonce_returns_service_unavailable_without_dependencies() {
+		let state = build_test_app_state(None).await;
+		let response = super::handle_auth_siwe_nonce(
+			State(state),
+			Json(crate::apis::auth::SiweNonceRequest {
+				address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".to_string(),
+			}),
+		)
+		.await
+		.into_response();
+
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn handle_auth_siwe_verify_returns_service_unavailable_without_dependencies() {
+		let state = build_test_app_state(None).await;
+		let response = super::handle_auth_siwe_verify(
+			State(state),
+			Json(crate::apis::auth::SiweVerifyRequest {
+				message: "message".to_string(),
+				signature: "signature".to_string(),
+			}),
+		)
+		.await
+		.into_response();
+
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
