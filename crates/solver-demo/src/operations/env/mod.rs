@@ -161,21 +161,43 @@ impl EnvOps {
 
 		use crate::core::logging;
 
-		// Filter chains that need deployment
-		let chains_to_deploy: Vec<ChainId> = chains
-			.into_iter()
-			.filter(|&chain| {
-				if !force && self.ctx.session.has_contracts(chain) {
-					logging::verbose_operation(
-						"Skipping chain",
-						&format!("{chain} (already deployed)"),
-					);
-					false
-				} else {
-					true
+		// Filter chains that need deployment, verifying on-chain code exists
+		let mut chains_to_deploy = Vec::new();
+		for chain in chains {
+			if force {
+				chains_to_deploy.push(chain);
+			} else if !self.ctx.session.has_contracts(chain) {
+				chains_to_deploy.push(chain);
+			} else {
+				// Session says contracts exist — verify on-chain code is present
+				let needs_deploy = match self.verify_contracts_onchain(chain).await {
+					Ok(true) => {
+						logging::verbose_operation(
+							"Skipping chain",
+							&format!("{chain} (contracts verified on-chain)"),
+						);
+						false
+					},
+					Ok(false) => {
+						logging::verbose_operation(
+							"Re-deploying chain",
+							&format!("{chain} (contracts in config but not found on-chain)"),
+						);
+						true
+					},
+					Err(_) => {
+						logging::verbose_operation(
+							"Re-deploying chain",
+							&format!("{chain} (could not verify on-chain)"),
+						);
+						true
+					},
+				};
+				if needs_deploy {
+					chains_to_deploy.push(chain);
 				}
-			})
-			.collect();
+			}
+		}
 
 		if chains_to_deploy.is_empty() {
 			logging::verbose_operation("Deployment status", "all chains already deployed");
@@ -260,6 +282,36 @@ impl EnvOps {
 		}
 
 		Ok(())
+	}
+
+	/// Verify that contracts actually have code on-chain for a given chain.
+	/// Returns `Ok(true)` if at least one key contract (input_settler) has code,
+	/// `Ok(false)` if the address exists but has no code (e.g., fresh Anvil).
+	async fn verify_contracts_onchain(&self, chain: ChainId) -> Result<bool> {
+		let contracts = self
+			.ctx
+			.session
+			.contracts(chain)
+			.ok_or_else(|| Error::ChainNotFound(chain))?;
+
+		// Check the input_settler as a representative contract
+		let address_to_check = contracts
+			.input_settler
+			.as_ref()
+			.ok_or_else(|| Error::InvalidConfig("No input_settler address".to_string()))?;
+
+		let addr: Address = address_to_check
+			.parse()
+			.map_err(|e| Error::InvalidConfig(format!("Invalid address: {e}")))?;
+
+		let provider = self.ctx.provider(chain).await?;
+		let code = provider
+			.inner()
+			.get_code_at(addr)
+			.await
+			.map_err(|e| Error::Other(anyhow::anyhow!("Failed to get code: {e}")))?;
+
+		Ok(!code.is_empty())
 	}
 
 	/// Deploy a single contract to specified chains
