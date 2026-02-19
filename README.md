@@ -873,7 +873,7 @@ Fee config can be set in seed overrides and updated at runtime via `PUT /api/v1/
 curl -X POST http://localhost:3000/api/v1/quotes \
   -H "Content-Type: application/json" \
   -d '{
-    "user": "0x74...,
+    "user": "0x74...",
     "intent": {
       "intentType": "oif-swap",
       "inputs": [{
@@ -992,14 +992,18 @@ The project includes a Rust-based CLI tool (`solver-demo`) for testing cross-cha
 ### Prerequisites
 
 - [Foundry](https://book.getfoundry.sh/getting-started/installation) (for Anvil and deployment)
-- Rust toolchain (stable, 1.86.0+)
-- Contract compilation tools (Foundry) (for deploying test contracts)
+- Rust toolchain (stable, 1.88.0+)
+- [OIF Contracts](https://github.com/openintentsframework/oif-contracts) compiled with `forge build` (the demo looks for artifacts in `oif-contracts/out/`)
 
 ### Quick Start
 
 > **Note:** The solver-demo tool uses local Anvil chains for testing. The main solver binary uses Redis-based configuration for production deployments. See below for demo-specific setup.
 
 ```bash
+# 0. Clone and build the OIF contracts (needed for local deployment)
+git clone https://github.com/openintentsframework/oif-contracts.git
+cd oif-contracts && forge build && cd ..
+
 # 1. Initialize configuration and load it
 cargo run -p solver-demo -- init new config/demo.toml
 cargo run -p solver-demo -- init load config/demo.toml --local
@@ -1027,7 +1031,7 @@ cargo run -p solver-demo -- quote sign .oif-demo/requests/get_quote.res.json
 cargo run -p solver-demo -- intent submit .oif-demo/requests/post_order.req.json
 
 # 6. Monitor token balances
-cargo run -p solver-demo -- token balance all
+cargo run -p solver-demo -- token balance
 ```
 
 > The demo tool requires the Permit2 contract bytecode file located at `crates/solver-demo/data/permit2_bytecode.hex`. This file contains the canonical Permit2 bytecode and is essential for deploying contracts to local Anvil chains. The bytecode is automatically used during the `env deploy` step.
@@ -1152,18 +1156,18 @@ cargo run -p solver-demo -- quote test <quote-requests-file>
 cargo run -p solver-demo -- token list [--chains <chain-ids>]
 
 # Mint tokens to an account
-cargo run -p solver-demo -- token mint <chain> <token> <amount> [--to <address>]
+cargo run -p solver-demo -- token mint --chain <chain> --token <token> --amount <amount> [--to <address>]
 
 # Approve token spending
-cargo run -p solver-demo -- token approve <chain> <token> <spender> <amount>
+cargo run -p solver-demo -- token approve --chain <chain> --token <token> --spender <spender> --amount <amount>
 
 # Check token balances
-cargo run -p solver-demo -- token balance <account> [--chains <chain-ids>]
-cargo run -p solver-demo -- token balance all  # All accounts
-cargo run -p solver-demo -- token balance user  # Just user account
+cargo run -p solver-demo -- token balance [--account <account>] [--chains <chain-ids>]
+cargo run -p solver-demo -- token balance                  # All accounts (default)
+cargo run -p solver-demo -- token balance --account user   # Just user account
 
 # Monitor balances with auto-refresh
-cargo run -p solver-demo -- token balance <account> --follow <seconds>
+cargo run -p solver-demo -- token balance [--account <account>] --follow <seconds>
 ```
 
 #### Account Management
