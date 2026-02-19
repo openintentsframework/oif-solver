@@ -11,15 +11,15 @@
 //! The signature must be an EIP-712 typed data signature from an authorized admin.
 
 use axum::{
+	Json,
 	body::Body,
 	extract::{FromRequest, State},
 	http::Request,
-	Json,
 };
 use once_cell::sync::Lazy;
 use regex::Regex;
 use solver_config::Config;
-use solver_core::engine::token_manager::TokenManager;
+use solver_core::engine::token_manager::{TokenManager, TokenManagerError};
 use solver_storage::redact_url_credentials;
 use solver_storage::{
 	config_store::{ConfigStore, ConfigStoreError},
@@ -32,8 +32,8 @@ pub use solver_types::admin_api::{
 	GasFlowResponse, NonceResponse, TokenBalance, WithdrawalResponse,
 };
 use solver_types::{
-	format_token_amount, with_0x_prefix, AdminConfig, OperatorAdminConfig, OperatorConfig,
-	OperatorToken,
+	AdminConfig, OperatorAdminConfig, OperatorConfig, OperatorToken, format_token_amount,
+	with_0x_prefix,
 };
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -583,6 +583,16 @@ pub async fn handle_add_token(
 	// 7. HOT RELOAD: Rebuild runtime Config from updated OperatorConfig
 	let new_config = build_runtime_config(&new_versioned.data)
 		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {e}")))?;
+	let network_config = new_config
+		.networks
+		.get(&contents.chain_id)
+		.cloned()
+		.ok_or_else(|| {
+			AdminAuthError::Internal(format!(
+				"Chain {} missing from rebuilt runtime config after token add",
+				contents.chain_id
+			))
+		})?;
 
 	// 8. Update TokenManager with new networks configuration
 	// This ensures quotes and other token operations immediately see the new token
@@ -592,11 +602,27 @@ pub async fn handle_add_token(
 	// 9. Update dynamic_config
 	*state.dynamic_config.write().await = new_config;
 
+	// 10. Ensure approvals for the newly added token on configured settlers.
+	let approvals_set = ensure_new_token_approvals(
+		state.token_manager.as_ref(),
+		contents.chain_id,
+		contents.token_address,
+		&network_config,
+	)
+	.await
+	.map_err(|e| {
+		AdminAuthError::Internal(format!(
+			"Token {} added to chain {}, but automatic approval setup failed: {e}. Retry via POST /api/v1/admin/tokens/approve",
+			contents.symbol, contents.chain_id
+		))
+	})?;
+
 	tracing::info!(
 		version = new_versioned.version,
 		token = %contents.symbol,
 		chain_id = contents.chain_id,
-		"Token added and config hot-reloaded (TokenManager updated)"
+		approvals_set,
+		"Token added, config hot-reloaded, and approvals synchronized"
 	);
 
 	Ok(Json(AdminActionResponse {
@@ -607,6 +633,44 @@ pub async fn handle_add_token(
 		),
 		admin: with_0x_prefix(&hex::encode(&admin.0)),
 	}))
+}
+
+async fn ensure_new_token_approvals(
+	token_manager: &TokenManager,
+	chain_id: u64,
+	token_address: alloy_primitives::Address,
+	network: &solver_types::NetworkConfig,
+) -> Result<usize, TokenManagerError> {
+	use alloy_primitives::U256;
+
+	let zero_address = solver_types::Address(vec![0u8; 20]);
+	let input_settler = network.input_settler_address.clone();
+	let output_settler = network.output_settler_address.clone();
+
+	let mut spenders = Vec::new();
+	if input_settler != zero_address {
+		spenders.push(input_settler.clone());
+	}
+	if output_settler != zero_address && output_settler != input_settler {
+		spenders.push(output_settler);
+	}
+
+	let token_address = solver_types::Address::from(token_address);
+	let mut approvals_set = 0usize;
+
+	for spender in spenders {
+		let (approved_count, _) = token_manager
+			.ensure_approvals_for_spender_scope(
+				Some(chain_id),
+				Some(token_address.clone()),
+				spender,
+				U256::MAX,
+			)
+			.await?;
+		approvals_set += approved_count;
+	}
+
+	Ok(approvals_set)
 }
 
 /// PUT /api/v1/admin/fees
@@ -1059,9 +1123,7 @@ fn config_store_error(err: ConfigStoreError) -> AdminAuthError {
 		ConfigStoreError::Serialization(msg) => {
 			AdminAuthError::Internal(format!("Serialization error: {msg}"))
 		},
-		ConfigStoreError::Backend(msg) => {
-			AdminAuthError::Internal(format!("Storage error: {msg}"))
-		},
+		ConfigStoreError::Backend(msg) => AdminAuthError::Internal(format!("Storage error: {msg}")),
 		ConfigStoreError::Configuration(msg) => {
 			AdminAuthError::Internal(format!("Configuration error: {msg}"))
 		},
@@ -1101,9 +1163,10 @@ mod tests {
 	use solver_storage::StoreConfig;
 	use solver_storage::{config_store::create_config_store, nonce_store::create_nonce_store};
 	use solver_types::{
-		NetworksConfig, OperatorAdminConfig, OperatorConfig, OperatorGasConfig,
-		OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorOracleConfig, OperatorPricingConfig,
-		OperatorSettlementConfig, OperatorSolverConfig, OperatorWithdrawalsConfig,
+		NetworkType, NetworksConfig, OperatorAdminConfig, OperatorConfig, OperatorGasConfig,
+		OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig,
+		OperatorPricingConfig, OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSolverConfig,
+		OperatorWithdrawalsConfig,
 	};
 	use std::collections::HashMap;
 	use std::str::FromStr;
@@ -1496,6 +1559,140 @@ mod tests {
 			nonce_store,
 			token_manager,
 		}
+	}
+
+	async fn create_admin_state_with_operator_config(
+		operator_config: OperatorConfig,
+		delivery: Arc<DeliveryService>,
+	) -> AdminApiState {
+		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+		let admin_solver = solver_types::Address::from(admin_alloy);
+
+		let config_store =
+			create_config_store::<OperatorConfig>(StoreConfig::Memory, "test-solver".to_string())
+				.unwrap();
+		config_store.seed(operator_config).await.unwrap();
+		let config_store: Arc<dyn solver_storage::config_store::ConfigStore<OperatorConfig>> =
+			Arc::from(config_store);
+
+		let nonce_store =
+			Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
+		let verifier = AdminActionVerifier::new(
+			nonce_store.clone(),
+			AdminConfig {
+				enabled: true,
+				domain: "test.example.com".to_string(),
+				chain_id: Some(1),
+				nonce_ttl_seconds: 300,
+				admin_addresses: vec![admin_alloy],
+			},
+			1,
+		);
+
+		let account = Arc::new(AccountService::new(Box::new(DummyAccount {
+			address: admin_solver,
+		})));
+		let token_manager = Arc::new(TokenManager::new(
+			NetworksConfig::default(),
+			delivery,
+			account,
+		));
+		let dynamic_config = Arc::new(RwLock::new(ConfigBuilder::new().build()));
+
+		AdminApiState {
+			verifier: Arc::new(RwLock::new(verifier)),
+			config_store,
+			dynamic_config,
+			nonce_store,
+			token_manager,
+		}
+	}
+
+	#[tokio::test]
+	async fn test_handle_add_token_triggers_approval_setup() {
+		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+		let mut operator_config =
+			build_operator_config(admin_alloy, OperatorWithdrawalsConfig { enabled: true });
+
+		operator_config.networks.insert(
+			1,
+			OperatorNetworkConfig {
+				chain_id: 1,
+				name: "chain-1".to_string(),
+				network_type: NetworkType::Parent,
+				tokens: vec![],
+				rpc_urls: vec![OperatorRpcEndpoint {
+					http: "http://localhost:8545".to_string(),
+					ws: None,
+				}],
+				input_settler_address: alloy_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: alloy_address("0x2222222222222222222222222222222222222222"),
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		operator_config.networks.insert(
+			137,
+			OperatorNetworkConfig {
+				chain_id: 137,
+				name: "chain-137".to_string(),
+				network_type: NetworkType::Hub,
+				tokens: vec![],
+				rpc_urls: vec![OperatorRpcEndpoint {
+					http: "http://localhost:8546".to_string(),
+					ws: None,
+				}],
+				input_settler_address: alloy_address("0x3333333333333333333333333333333333333333"),
+				output_settler_address: alloy_address("0x4444444444444444444444444444444444444444"),
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_allowance()
+			.times(2)
+			.returning(|_, _, _, _| Box::pin(async { Ok("0".to_string()) }));
+		mock_delivery.expect_submit().times(2).returning(|_, _| {
+			Box::pin(async { Ok(solver_types::TransactionHash(vec![0x11; 32])) })
+		});
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+		implementations.insert(1, Arc::new(mock_delivery));
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 30));
+
+		let state = create_admin_state_with_operator_config(operator_config, delivery).await;
+		let state_for_assert = state.clone();
+
+		let contents = AddTokenContents {
+			chain_id: 1,
+			symbol: "USDC".to_string(),
+			name: Some("USD Coin".to_string()),
+			token_address: alloy_address("0x5555555555555555555555555555555555555555"),
+			decimals: 6,
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let response = handle_add_token(State(state), verified).await.unwrap().0;
+		assert!(response.success);
+		assert!(response.message.contains("Token USDC added to chain 1"));
+
+		let versioned = state_for_assert.config_store.get().await.unwrap();
+		let network = versioned.data.networks.get(&1).unwrap();
+		assert_eq!(network.tokens.len(), 1);
+		assert_eq!(network.tokens[0].symbol, "USDC");
 	}
 
 	#[tokio::test]

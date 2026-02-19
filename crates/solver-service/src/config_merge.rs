@@ -31,12 +31,12 @@ use solver_config::{
 	StorageConfig, StrategyConfig,
 };
 use solver_types::{
-	networks::{NetworkType, RpcEndpoint},
 	AccountOverride, NetworkConfig, NetworkOverride, NetworksConfig, OperatorAccountConfig,
 	OperatorAdminConfig, OperatorConfig, OperatorGasConfig, OperatorGasFlowUnits,
 	OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig, OperatorPricingConfig,
 	OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSolverConfig, OperatorToken,
 	OperatorWithdrawalsConfig, SeedOverrides, TokenConfig,
+	networks::{NetworkType, RpcEndpoint},
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -50,6 +50,9 @@ pub enum MergeError {
 	UnknownChainId(u64, Vec<u64>),
 
 	/// No tokens were specified for a network.
+	///
+	/// Kept for backward compatibility with existing error handling/tests.
+	/// Empty token arrays are now allowed during boot.
 	#[error("No tokens specified for chain {0}")]
 	NoTokens(u64),
 
@@ -81,7 +84,6 @@ pub enum MergeError {
 ///
 /// Returns a `MergeError` if:
 /// - A requested chain ID is not supported by the seed
-/// - No tokens are specified for a network
 /// - Fewer than 2 networks are requested
 pub fn merge_config(overrides: SeedOverrides, seed: &SeedConfig) -> Result<Config, MergeError> {
 	// Check for duplicate chain IDs first (before the 2-network check)
@@ -98,7 +100,7 @@ pub fn merge_config(overrides: SeedOverrides, seed: &SeedConfig) -> Result<Confi
 		return Err(MergeError::InsufficientNetworks);
 	}
 
-	// Validate all chain IDs exist in seed and have tokens
+	// Validate all chain IDs exist in seed
 	let chain_ids: Vec<u64> = overrides.networks.iter().map(|n| n.chain_id).collect();
 	for network in &overrides.networks {
 		if !seed.supports_chain(network.chain_id) {
@@ -106,9 +108,6 @@ pub fn merge_config(overrides: SeedOverrides, seed: &SeedConfig) -> Result<Confi
 				network.chain_id,
 				seed.supported_chain_ids(),
 			));
-		}
-		if network.tokens.is_empty() {
-			return Err(MergeError::NoTokens(network.chain_id));
 		}
 	}
 
@@ -176,16 +175,13 @@ pub fn merge_to_operator_config(
 		return Err(MergeError::InsufficientNetworks);
 	}
 
-	// Validate all chain IDs exist in seed and have tokens
+	// Validate all chain IDs exist in seed
 	for network in &initializer.networks {
 		if !seed.supports_chain(network.chain_id) {
 			return Err(MergeError::UnknownChainId(
 				network.chain_id,
 				seed.supported_chain_ids(),
 			));
-		}
-		if network.tokens.is_empty() {
-			return Err(MergeError::NoTokens(network.chain_id));
 		}
 	}
 
@@ -1890,7 +1886,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_merge_config_no_tokens() {
+	fn test_merge_config_empty_tokens() {
 		let overrides = SeedOverrides {
 			solver_id: None,
 			solver_name: None,
@@ -1923,12 +1919,45 @@ mod tests {
 			rate_buffer_bps: None,
 		};
 
-		let result = merge_config(overrides, &TESTNET_SEED);
-		assert!(result.is_err());
-		assert!(matches!(
-			result.unwrap_err(),
-			MergeError::NoTokens(11155420)
-		));
+		let result = merge_config(overrides, &TESTNET_SEED).unwrap();
+		assert_eq!(result.networks.len(), 2);
+		assert_eq!(result.networks.get(&11155420).unwrap().tokens.len(), 0);
+		assert_eq!(result.networks.get(&84532).unwrap().tokens.len(), 1);
+	}
+
+	#[test]
+	fn test_merge_config_all_networks_empty_tokens() {
+		let overrides = SeedOverrides {
+			solver_id: None,
+			solver_name: None,
+			networks: vec![
+				NetworkOverride {
+					chain_id: 11155420,
+					name: None,
+					network_type: None,
+					tokens: vec![],
+					rpc_urls: None,
+				},
+				NetworkOverride {
+					chain_id: 84532,
+					name: None,
+					network_type: None,
+					tokens: vec![],
+					rpc_urls: None,
+				},
+			],
+			account: None,
+			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
+		};
+
+		let result = merge_config(overrides, &TESTNET_SEED).unwrap();
+		assert_eq!(result.networks.len(), 2);
+		assert_eq!(result.networks.get(&11155420).unwrap().tokens.len(), 0);
+		assert_eq!(result.networks.get(&84532).unwrap().tokens.len(), 0);
 	}
 
 	#[test]
@@ -2163,9 +2192,11 @@ mod tests {
 		assert!(insufficient.to_string().contains("At least 2 networks"));
 
 		let validation = MergeError::Validation("test error".to_string());
-		assert!(validation
-			.to_string()
-			.contains("Configuration validation failed"));
+		assert!(
+			validation
+				.to_string()
+				.contains("Configuration validation failed")
+		);
 		assert!(validation.to_string().contains("test error"));
 	}
 
@@ -2516,7 +2547,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_merge_to_operator_config_no_tokens() {
+	fn test_merge_to_operator_config_empty_tokens() {
 		let overrides = SeedOverrides {
 			solver_id: None,
 			solver_name: None,
@@ -2549,12 +2580,45 @@ mod tests {
 			rate_buffer_bps: None,
 		};
 
-		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
-		assert!(result.is_err());
-		assert!(matches!(
-			result.unwrap_err(),
-			MergeError::NoTokens(11155420)
-		));
+		let result = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		assert_eq!(result.networks.len(), 2);
+		assert_eq!(result.networks.get(&11155420).unwrap().tokens.len(), 0);
+		assert_eq!(result.networks.get(&84532).unwrap().tokens.len(), 1);
+	}
+
+	#[test]
+	fn test_merge_to_operator_config_all_networks_empty_tokens() {
+		let overrides = SeedOverrides {
+			solver_id: None,
+			solver_name: None,
+			networks: vec![
+				NetworkOverride {
+					chain_id: 11155420,
+					name: None,
+					network_type: None,
+					tokens: vec![],
+					rpc_urls: None,
+				},
+				NetworkOverride {
+					chain_id: 84532,
+					name: None,
+					network_type: None,
+					tokens: vec![],
+					rpc_urls: None,
+				},
+			],
+			account: None,
+			admin: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
+		};
+
+		let result = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		assert_eq!(result.networks.len(), 2);
+		assert_eq!(result.networks.get(&11155420).unwrap().tokens.len(), 0);
+		assert_eq!(result.networks.get(&84532).unwrap().tokens.len(), 0);
 	}
 
 	#[test]

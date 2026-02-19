@@ -3,7 +3,7 @@
 //! This module provides functionality to load configuration from multiple files
 //! and validate that sections are unique across files to prevent merge conflicts.
 
-use crate::{resolve_env_vars, Config, ConfigError};
+use crate::{Config, ConfigError, resolve_env_vars};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 

@@ -18,7 +18,7 @@ pub use builders::config::ConfigBuilder;
 use regex::Regex;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use solver_types::{networks::deserialize_networks, NetworksConfig};
+use solver_types::{NetworksConfig, networks::deserialize_networks};
 use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
@@ -511,11 +511,6 @@ impl Config {
 					"Network {chain_id} must have output_settler_address"
 				)));
 			}
-			if network.tokens.is_empty() {
-				return Err(ConfigError::Validation(format!(
-					"Network {chain_id} must have at least 1 token configured"
-				)));
-			}
 		}
 
 		// Validate storage config
@@ -848,6 +843,61 @@ network_ids = [1, 2]
 	}
 
 	#[test]
+	fn test_config_allows_empty_network_tokens() {
+		let config_str = r#"
+[solver]
+id = "test-empty-tokens"
+monitoring_timeout_minutes = 5
+min_profitability_pct = 1.0
+
+[networks.1]
+input_settler_address = "0x1234567890123456789012345678901234567890"
+output_settler_address = "0x0987654321098765432109876543210987654321"
+tokens = []
+[[networks.1.rpc_urls]]
+http = "http://localhost:8545"
+
+[networks.2]
+input_settler_address = "0x1234567890123456789012345678901234567890"
+output_settler_address = "0x0987654321098765432109876543210987654321"
+tokens = []
+[[networks.2.rpc_urls]]
+http = "http://localhost:8546"
+
+[storage]
+primary = "memory"
+cleanup_interval_seconds = 3600
+[storage.implementations.memory]
+
+[delivery]
+[delivery.implementations.test]
+
+[account]
+primary = "local"
+[account.implementations.local]
+private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+
+[discovery]
+[discovery.implementations.test]
+
+[order]
+[order.implementations.test]
+[order.strategy]
+primary = "simple"
+[order.strategy.implementations.simple]
+
+[settlement]
+[settlement.implementations.test]
+order = "test"
+network_ids = [1, 2]
+"#;
+
+		let config: Config = config_str.parse().expect("Config should parse");
+		assert_eq!(config.networks.get(&1).unwrap().tokens.len(), 0);
+		assert_eq!(config.networks.get(&2).unwrap().tokens.len(), 0);
+	}
+
+	#[test]
 	fn test_duplicate_settlement_coverage_rejected() {
 		let config_str = r#"
 [solver]
@@ -1049,9 +1099,10 @@ network_ids = [1, 2, 999]  # Network 999 doesn't exist
 		let result = Config::from_str(config_str);
 		assert!(result.is_err());
 		let err = result.unwrap_err();
-		assert!(err
-			.to_string()
-			.contains("references network 999 which doesn't exist"));
+		assert!(
+			err.to_string()
+				.contains("references network 999 which doesn't exist")
+		);
 	}
 
 	#[test]
@@ -1113,8 +1164,9 @@ network_ids = [1, 2]
 		let result = Config::from_str(config_str);
 		assert!(result.is_err());
 		let err = result.unwrap_err();
-		assert!(err
-			.to_string()
-			.contains("Order standard 'eip9999' has no settlement implementations"));
+		assert!(
+			err.to_string()
+				.contains("Order standard 'eip9999' has no settlement implementations")
+		);
 	}
 }

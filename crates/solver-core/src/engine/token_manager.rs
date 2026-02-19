@@ -19,11 +19,11 @@
 //! to their respective input and output settler contracts. This eliminates the need
 //! for per-transaction approvals and reduces gas costs during order execution.
 
-use alloy_primitives::{hex, U256};
+use alloy_primitives::{U256, hex};
 use solver_account::AccountService;
 use solver_delivery::DeliveryService;
 use solver_types::{
-	with_0x_prefix, Address, NetworksConfig, TokenConfig, Transaction, TransactionHash,
+	Address, NetworksConfig, TokenConfig, Transaction, TransactionHash, with_0x_prefix,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -820,6 +820,63 @@ mod tests {
 		assert!(current_networks.contains_key(&1));
 		assert!(current_networks.contains_key(&42161));
 		assert!(!current_networks.contains_key(&137));
+	}
+
+	#[tokio::test]
+	async fn test_ensure_approvals_noop_with_empty_tokens() {
+		let mut networks = NetworksConfig::new();
+		networks.insert(
+			1,
+			solver_types::NetworkConfig {
+				name: None,
+				network_type: solver_types::NetworkType::New,
+				rpc_urls: vec![],
+				input_settler_address: parse_address("0x1111111111111111111111111111111111111111")
+					.unwrap(),
+				output_settler_address: parse_address("0x2222222222222222222222222222222222222222")
+					.unwrap(),
+				tokens: vec![],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		networks.insert(
+			137,
+			solver_types::NetworkConfig {
+				name: None,
+				network_type: solver_types::NetworkType::New,
+				rpc_urls: vec![],
+				input_settler_address: parse_address("0x3333333333333333333333333333333333333333")
+					.unwrap(),
+				output_settler_address: parse_address("0x4444444444444444444444444444444444444444")
+					.unwrap(),
+				tokens: vec![],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_get_allowance().times(0);
+		mock_delivery.expect_submit().times(0);
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations = HashMap::new();
+		implementations.insert(
+			1,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 20));
+
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		let result = token_manager.ensure_approvals().await;
+		assert!(result.is_ok());
 	}
 
 	#[tokio::test]
