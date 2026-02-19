@@ -91,8 +91,8 @@ alias oif-demo='cargo run --bin solver-demo --'
 #### 1. Initialize Environment
 ```bash
 # Create and load configuration
-oif-demo init new config/demo.toml --force
-oif-demo init load config/demo.toml --local
+oif-demo init new config/demo.json --force
+oif-demo init load config/demo.json --local
 
 # Start local chains
 oif-demo env start
@@ -169,8 +169,13 @@ oif-demo intent build \
 
 #### 1. Setup Environment
 ```bash
-# Load testnet configuration
-oif-demo init load config/testnet.toml
+# Load runtime configuration from the same storage backend used by solver-service
+export STORAGE_BACKEND=redis
+export REDIS_URL=redis://127.0.0.1:6379
+export SOLVER_ID=your-solver-id
+oif-demo init load-storage
+# or:
+oif-demo init load-storage --solver-id your-solver-id
 
 # List tokens and accounts
 oif-demo token list
@@ -265,6 +270,26 @@ oif-demo intent test ./.oif-demo/requests/post_orders.req.json
 
 ## Configuration
 
+### Load From Running Solver Storage
+
+`oif-demo init load-storage` reads the persisted `OperatorConfig` from the active
+storage backend (Redis/file/memory), converts it to runtime config, and initializes
+the demo session.
+
+```bash
+# Same backend variables used by solver-service
+export STORAGE_BACKEND=redis
+export REDIS_URL=redis://127.0.0.1:6379
+export SOLVER_ID=your-solver-id
+
+oif-demo init load-storage
+```
+
+Notes:
+- If `--solver-id` is omitted, `SOLVER_ID` is used.
+- The command looks up key `<SOLVER_ID>-operator`.
+- For cross-process usage, use `redis` or `file`; `memory` is process-local.
+
 ### Environment Variables (`.env`)
 ```bash
 # User Account (creates intents)
@@ -291,6 +316,9 @@ oif-demo init new <path> [--force] [--chains <chain_ids>]
 
 # Load configuration
 oif-demo init load <path> [--local]
+
+# Load configuration from storage backend
+oif-demo init load-storage [--solver-id <id>] [--local]
 ```
 
 ### Environment Commands
@@ -489,17 +517,16 @@ Using simulated fill gas: 79850 units (config default was: 77298 units)
 
 Solvers can configure callback safety checks in their config file:
 
-```toml
-[order]
-# Whitelisted callback contract addresses in EIP-7930 InteropAddress format
-# Format: "0x" + Version(2 bytes) + ChainType(2 bytes) + ChainRefLen(1 byte) + ChainRef + AddrLen(1 byte) + Address
-callback_whitelist = [
-  "0x0001000002210514154c8bb598df835e9617c2cdcb8c84838bd329c6",  # Base (8453)
-  "0x0001000003014a3414154c8bb598df835e9617c2cdcb8c84838bd329c6",  # Base Sepolia (84532)
-]
-
-# Enable gas simulation for callbacks before filling (default: true)
-simulate_callbacks = true
+```json
+{
+  "order": {
+    "callback_whitelist": [
+      "0x0001000002210514154c8bb598df835e9617c2cdcb8c84838bd329c6",
+      "0x0001000003014a3414154c8bb598df835e9617c2cdcb8c84838bd329c6"
+    ],
+    "simulate_callbacks": true
+  }
+}
 ```
 
 **EIP-7930 InteropAddress Format:**

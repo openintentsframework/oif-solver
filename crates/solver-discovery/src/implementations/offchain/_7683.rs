@@ -786,14 +786,16 @@ pub struct Eip7683OffchainDiscoverySchema;
 
 impl Eip7683OffchainDiscoverySchema {
 	/// Static validation method for use before instance creation
-	pub fn validate_config(config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+	pub fn validate_config(
+		config: &serde_json::Value,
+	) -> Result<(), solver_types::ValidationError> {
 		let instance = Self;
 		instance.validate(config)
 	}
 }
 
 impl ConfigSchema for Eip7683OffchainDiscoverySchema {
-	fn validate(&self, config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+	fn validate(&self, config: &serde_json::Value) -> Result<(), solver_types::ValidationError> {
 		let schema = Schema::new(
 			// Required fields
 			vec![
@@ -881,7 +883,7 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 ///
 /// # Arguments
 ///
-/// * `config` - TOML configuration value containing service parameters
+/// * `config` - JSON configuration value containing service parameters
 /// * `networks` - Global networks configuration with RPC URLs and settler addresses
 ///
 /// # Returns
@@ -891,10 +893,12 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 /// # Configuration
 ///
 /// Expected configuration format:
-/// ```toml
-/// api_host = "0.0.0.0"         # optional, defaults to "0.0.0.0"
-/// api_port = 8081              # optional, defaults to 8081
-/// network_ids = [1, 10, 137]  # optional, defaults to all networks
+/// ```json
+/// {
+///   "api_host": "0.0.0.0",
+///   "api_port": 8081,
+///   "network_ids": [1, 10, 137]
+/// }
 /// ```
 ///
 /// # Errors
@@ -903,7 +907,7 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 /// - The networks configuration is invalid
 /// - The discovery service cannot be created
 pub fn create_discovery(
-	config: &toml::Value,
+	config: &serde_json::Value,
 	networks: &NetworksConfig,
 ) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError> {
 	// Validate configuration first
@@ -918,7 +922,7 @@ pub fn create_discovery(
 
 	let api_port = config
 		.get("api_port")
-		.and_then(|v| v.as_integer())
+		.and_then(|v| v.as_i64())
 		.unwrap_or(8081) as u16;
 
 	// Get network_ids from config, or default to all networks
@@ -927,7 +931,7 @@ pub fn create_discovery(
 		.and_then(|v| v.as_array())
 		.map(|arr| {
 			arr.iter()
-				.filter_map(|v| v.as_integer().map(|i| i as u64))
+				.filter_map(|v| v.as_i64().map(|i| i as u64))
 				.collect::<Vec<_>>()
 		})
 		.unwrap_or_else(|| networks.keys().cloned().collect());
@@ -1113,16 +1117,16 @@ mod tests {
 
 	#[test]
 	fn test_config_schema_validation_success() {
-		let config = toml::Value::Table({
-			let mut table = toml::value::Table::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"api_host".to_string(),
-				toml::Value::String("127.0.0.1".to_string()),
+				serde_json::Value::String("127.0.0.1".to_string()),
 			);
-			table.insert("api_port".to_string(), toml::Value::Integer(8080));
+			table.insert("api_port".to_string(), serde_json::Value::from(8080));
 			table.insert(
 				"network_ids".to_string(),
-				toml::Value::Array(vec![toml::Value::Integer(1)]),
+				serde_json::Value::Array(vec![serde_json::Value::from(1)]),
 			);
 			table
 		});
@@ -1133,11 +1137,11 @@ mod tests {
 
 	#[test]
 	fn test_config_schema_validation_missing_required() {
-		let config = toml::Value::Table({
-			let mut table = toml::value::Table::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"api_host".to_string(),
-				toml::Value::String("127.0.0.1".to_string()),
+				serde_json::Value::String("127.0.0.1".to_string()),
 			);
 			// Missing api_port and network_ids
 			table
@@ -1149,16 +1153,16 @@ mod tests {
 
 	#[test]
 	fn test_config_schema_validation_invalid_port() {
-		let config = toml::Value::Table({
-			let mut table = toml::value::Table::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"api_host".to_string(),
-				toml::Value::String("127.0.0.1".to_string()),
+				serde_json::Value::String("127.0.0.1".to_string()),
 			);
-			table.insert("api_port".to_string(), toml::Value::Integer(70000)); // Invalid port > 65535
+			table.insert("api_port".to_string(), serde_json::Value::from(70000)); // Invalid port > 65535
 			table.insert(
 				"network_ids".to_string(),
-				toml::Value::Array(vec![toml::Value::Integer(1)]),
+				serde_json::Value::Array(vec![serde_json::Value::from(1)]),
 			);
 			table
 		});
@@ -1169,16 +1173,16 @@ mod tests {
 
 	#[test]
 	fn test_create_discovery_factory_success() {
-		let config = toml::Value::Table({
-			let mut table = toml::value::Table::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"api_host".to_string(),
-				toml::Value::String("127.0.0.1".to_string()),
+				serde_json::Value::String("127.0.0.1".to_string()),
 			);
-			table.insert("api_port".to_string(), toml::Value::Integer(8080));
+			table.insert("api_port".to_string(), serde_json::Value::from(8080));
 			table.insert(
 				"network_ids".to_string(),
-				toml::Value::Array(vec![toml::Value::Integer(1)]),
+				serde_json::Value::Array(vec![serde_json::Value::from(1)]),
 			);
 			table
 		});
@@ -1190,17 +1194,17 @@ mod tests {
 
 	#[test]
 	fn test_create_discovery_factory_defaults() {
-		let config = toml::Value::Table({
-			let mut table = toml::value::Table::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			// Provide required fields but use values that will trigger defaults
 			table.insert(
 				"api_host".to_string(),
-				toml::Value::String("0.0.0.0".to_string()),
+				serde_json::Value::String("0.0.0.0".to_string()),
 			);
-			table.insert("api_port".to_string(), toml::Value::Integer(8081));
+			table.insert("api_port".to_string(), serde_json::Value::from(8081));
 			table.insert(
 				"network_ids".to_string(),
-				toml::Value::Array(vec![toml::Value::Integer(1)]),
+				serde_json::Value::Array(vec![serde_json::Value::from(1)]),
 			);
 			// Don't include auth_token to test that default (None) works
 			table

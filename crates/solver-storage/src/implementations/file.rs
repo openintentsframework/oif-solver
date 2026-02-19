@@ -134,15 +134,15 @@ pub struct TtlConfig {
 
 impl TtlConfig {
 	/// Creates TTL config from TOML configuration.
-	fn from_config(config: &toml::Value) -> Self {
+	fn from_config(config: &serde_json::Value) -> Self {
 		let mut ttls = HashMap::new();
 
-		if let Some(table) = config.as_table() {
+		if let Some(table) = config.as_object() {
 			for storage_key in StorageKey::all() {
 				let config_key = format!("ttl_{}", storage_key.as_str());
 				if let Some(ttl_value) = table
 					.get(&config_key)
-					.and_then(|v| v.as_integer())
+					.and_then(|v| v.as_i64())
 					.map(|v| v as u64)
 				{
 					ttls.insert(storage_key, Duration::from_secs(ttl_value));
@@ -862,14 +862,14 @@ pub struct FileStorageSchema;
 
 impl FileStorageSchema {
 	/// Static validation method for use before instance creation
-	pub fn validate_config(config: &toml::Value) -> Result<(), ValidationError> {
+	pub fn validate_config(config: &serde_json::Value) -> Result<(), ValidationError> {
 		let instance = Self;
 		instance.validate(config)
 	}
 }
 
 impl ConfigSchema for FileStorageSchema {
-	fn validate(&self, config: &toml::Value) -> Result<(), ValidationError> {
+	fn validate(&self, config: &serde_json::Value) -> Result<(), ValidationError> {
 		// Build TTL fields dynamically based on StorageKey variants
 		let mut optional_fields = vec![Field::new("storage_path", FieldType::String)];
 
@@ -904,7 +904,9 @@ impl ConfigSchema for FileStorageSchema {
 /// - `ttl_orders`: TTL in seconds for orders (default: 0)
 /// - `ttl_intents`: TTL in seconds for intents (default: 0)
 /// - `ttl_order_by_tx_hash`: TTL in seconds for order_by_tx_hash (default: 0)
-pub fn create_storage(config: &toml::Value) -> Result<Box<dyn StorageInterface>, StorageError> {
+pub fn create_storage(
+	config: &serde_json::Value,
+) -> Result<Box<dyn StorageInterface>, StorageError> {
 	// Validate configuration first
 	FileStorageSchema::validate_config(config)
 		.map_err(|e| StorageError::Configuration(format!("Invalid configuration: {e}")))?;
@@ -1227,26 +1229,26 @@ mod tests {
 		let schema = FileStorageSchema;
 
 		// Valid config
-		let valid_config = toml::Value::Table(toml::toml! {
-			storage_path = "/tmp/test"
-			ttl_orders = 3600
-			ttl_intents = 7200
+		let valid_config = serde_json::json!({
+			"storage_path": "/tmp/test",
+			"ttl_orders": 3600,
+			"ttl_intents": 7200,
 		});
 		assert!(schema.validate(&valid_config).is_ok());
 
 		// Invalid TTL (negative)
-		let invalid_config = toml::Value::Table(toml::toml! {
-			ttl_orders = -1
+		let invalid_config = serde_json::json!({
+			"ttl_orders": -1,
 		});
 		assert!(schema.validate(&invalid_config).is_err());
 	}
 
 	#[tokio::test]
 	async fn test_ttl_config_from_toml() {
-		let config = toml::Value::Table(toml::toml! {
-			ttl_orders = 3600
-			ttl_intents = 7200
-			ttl_quotes = 1800
+		let config = serde_json::json!({
+			"ttl_orders": 3600,
+			"ttl_intents": 7200,
+			"ttl_quotes": 1800,
 		});
 
 		let ttl_config = TtlConfig::from_config(&config);
@@ -1271,9 +1273,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_factory_function() {
-		let config = toml::Value::Table(toml::toml! {
-			storage_path = "/tmp/test_storage"
-			ttl_orders = 3600
+		let config = serde_json::json!({
+			"storage_path": "/tmp/test_storage",
+			"ttl_orders": 3600,
 		});
 
 		let storage = create_storage(&config).unwrap();

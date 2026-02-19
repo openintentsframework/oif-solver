@@ -61,7 +61,7 @@ struct SimplePriceResponse {
 
 impl CoinGeckoPricing {
 	/// Creates a new CoinGeckoPricing instance with configuration.
-	pub fn new(config: &toml::Value) -> Result<Self, PricingError> {
+	pub fn new(config: &serde_json::Value) -> Result<Self, PricingError> {
 		// Validate configuration first
 		let schema = CoinGeckoConfigSchema;
 		schema.validate(config).map_err(|e| {
@@ -86,12 +86,12 @@ impl CoinGeckoPricing {
 
 		let cache_duration = config
 			.get("cache_duration_seconds")
-			.and_then(|v| v.as_integer())
+			.and_then(|v| v.as_i64())
 			.unwrap_or(60) as u64; // Default 60 seconds cache
 
 		let rate_limit_delay_ms = config
 			.get("rate_limit_delay_ms")
-			.and_then(|v| v.as_integer())
+			.and_then(|v| v.as_i64())
 			.unwrap_or(if api_key.is_some() { 100 } else { 1200 }) as u64; // Pro: 100ms, Free: 1.2s
 
 		// Build token ID map from shared defaults
@@ -101,7 +101,7 @@ impl CoinGeckoPricing {
 			.collect();
 
 		// Allow custom token mappings
-		if let Some(custom_tokens) = config.get("token_id_map").and_then(|v| v.as_table()) {
+		if let Some(custom_tokens) = config.get("token_id_map").and_then(|v| v.as_object()) {
 			for (symbol, id) in custom_tokens {
 				if let Some(id_str) = id.as_str() {
 					token_id_map.insert(symbol.to_uppercase(), id_str.to_string());
@@ -111,17 +111,17 @@ impl CoinGeckoPricing {
 
 		// Parse custom prices for tokens (useful for testing/demo)
 		let mut custom_prices = HashMap::new();
-		if let Some(prices_config) = config.get("custom_prices").and_then(|v| v.as_table()) {
+		if let Some(prices_config) = config.get("custom_prices").and_then(|v| v.as_object()) {
 			for (symbol, price) in prices_config {
 				let price_decimal = if let Some(price_str) = price.as_str() {
 					price_str.parse::<Decimal>().map_err(|e| {
 						PricingError::InvalidData(format!("Invalid custom price for {symbol}: {e}"))
 					})?
-				} else if let Some(price_num) = price.as_float() {
+				} else if let Some(price_num) = price.as_f64() {
 					Decimal::try_from(price_num).map_err(|e| {
 						PricingError::InvalidData(format!("Invalid custom price for {symbol}: {e}"))
 					})?
-				} else if let Some(price_int) = price.as_integer() {
+				} else if let Some(price_int) = price.as_i64() {
 					Decimal::from(price_int)
 				} else {
 					return Err(PricingError::InvalidData(format!(
@@ -499,7 +499,7 @@ impl PricingInterface for CoinGeckoPricing {
 pub struct CoinGeckoConfigSchema;
 
 impl ConfigSchema for CoinGeckoConfigSchema {
-	fn validate(&self, config: &toml::Value) -> Result<(), ValidationError> {
+	fn validate(&self, config: &serde_json::Value) -> Result<(), ValidationError> {
 		// Optional API key
 		if let Some(api_key) = config.get("api_key") {
 			if api_key.as_str().is_none() {
@@ -524,7 +524,7 @@ impl ConfigSchema for CoinGeckoConfigSchema {
 
 		// Optional cache duration
 		if let Some(cache_duration) = config.get("cache_duration_seconds") {
-			if cache_duration.as_integer().is_none() {
+			if cache_duration.as_i64().is_none() {
 				return Err(ValidationError::TypeMismatch {
 					field: "cache_duration_seconds".to_string(),
 					expected: "integer".to_string(),
@@ -535,7 +535,7 @@ impl ConfigSchema for CoinGeckoConfigSchema {
 
 		// Optional rate limit delay
 		if let Some(delay) = config.get("rate_limit_delay_ms") {
-			if delay.as_integer().is_none() {
+			if delay.as_i64().is_none() {
 				return Err(ValidationError::TypeMismatch {
 					field: "rate_limit_delay_ms".to_string(),
 					expected: "integer".to_string(),
@@ -546,7 +546,7 @@ impl ConfigSchema for CoinGeckoConfigSchema {
 
 		// Optional token_id_map
 		if let Some(token_map) = config.get("token_id_map") {
-			if let Some(table) = token_map.as_table() {
+			if let Some(table) = token_map.as_object() {
 				for (symbol, id) in table {
 					if id.as_str().is_none() {
 						return Err(ValidationError::TypeMismatch {
@@ -567,15 +567,15 @@ impl ConfigSchema for CoinGeckoConfigSchema {
 
 		// Optional custom_prices
 		if let Some(custom_prices) = config.get("custom_prices") {
-			if let Some(table) = custom_prices.as_table() {
+			if let Some(table) = custom_prices.as_object() {
 				for (symbol, price) in table {
 					// Price can be string (parseable as Decimal), float, or integer
 					let is_valid = if let Some(price_str) = price.as_str() {
 						price_str.parse::<Decimal>().is_ok()
-					} else if let Some(price_num) = price.as_float() {
+					} else if let Some(price_num) = price.as_f64() {
 						Decimal::try_from(price_num).is_ok()
 					} else {
-						price.as_integer().is_some()
+						price.as_i64().is_some()
 					};
 
 					if !is_valid {
@@ -615,7 +615,7 @@ impl PricingRegistry for CoinGeckoPricingRegistry {}
 
 /// Factory function for creating CoinGeckoPricing instances.
 pub fn create_coingecko_pricing(
-	config: &toml::Value,
+	config: &serde_json::Value,
 ) -> Result<Box<dyn PricingInterface>, PricingError> {
 	Ok(Box::new(CoinGeckoPricing::new(config)?))
 }
@@ -625,20 +625,18 @@ mod tests {
 	use super::*;
 	use tokio;
 
-	fn minimal_config() -> toml::Value {
-		toml::Value::Table(toml::map::Map::new())
+	fn minimal_config() -> serde_json::Value {
+		serde_json::Value::Object(serde_json::Map::new())
 	}
 
-	fn config_with_custom_prices() -> toml::Value {
-		toml::from_str(
-			r#"
-            cache_duration_seconds = 10
-            [custom_prices]
-            ETH = "3000.50"
-            BTC = "65000"
-        "#,
-		)
-		.unwrap()
+	fn config_with_custom_prices() -> serde_json::Value {
+		serde_json::json!({
+			"cache_duration_seconds": 10,
+			"custom_prices": {
+				"ETH": "3000.50",
+				"BTC": "65000"
+			}
+		})
 	}
 
 	#[test]
@@ -651,7 +649,9 @@ mod tests {
 
 	#[test]
 	fn test_new_with_api_key() {
-		let config = toml::from_str(r#"api_key = "pro_key_123""#).unwrap();
+		let config = serde_json::json!({
+			"api_key": "pro_key_123"
+		});
 		let pricing = CoinGeckoPricing::new(&config).unwrap();
 		assert_eq!(pricing.base_url, "https://pro-api.coingecko.com/api/v3");
 		assert_eq!(pricing.rate_limit_delay_ms, 100);
@@ -766,20 +766,20 @@ mod tests {
 	#[test]
 	fn test_config_schema_invalid_api_key() {
 		let schema = CoinGeckoConfigSchema;
-		let bad_config = toml::from_str(r#"api_key = 123"#).unwrap();
+		let bad_config = serde_json::json!({
+			"api_key": 123
+		});
 		assert!(schema.validate(&bad_config).is_err());
 	}
 
 	#[test]
 	fn test_config_schema_invalid_custom_price() {
 		let schema = CoinGeckoConfigSchema;
-		let bad_config = toml::from_str(
-			r#"
-            [custom_prices]
-            ETH = "not_a_price"
-        "#,
-		)
-		.unwrap();
+		let bad_config = serde_json::json!({
+			"custom_prices": {
+				"ETH": "not_a_price"
+			}
+		});
 		assert!(schema.validate(&bad_config).is_err());
 	}
 

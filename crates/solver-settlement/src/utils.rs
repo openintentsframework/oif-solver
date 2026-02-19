@@ -1,26 +1,28 @@
 //! Common utilities for settlement implementations.
 //!
 //! This module provides shared utilities for parsing oracle configurations
-//! from TOML config files, used by all settlement implementations.
+//! from JSON config files, used by all settlement implementations.
 
 use crate::{OracleConfig, OracleSelectionStrategy, SettlementError};
 use solver_types::{utils::parse_address, Address};
 use std::collections::HashMap;
 
-/// Parse an oracle table from TOML configuration.
+/// Parse an oracle table from JSON configuration.
 ///
 /// Parses a table mapping chain IDs to arrays of oracle addresses.
 /// Expected format:
-/// ```toml
-/// 31337 = ["0x1111...", "0x2222..."]
-/// 31338 = ["0x3333..."]
+/// ```json
+/// {
+///   "31337": ["0x1111...", "0x2222..."],
+///   "31338": ["0x3333..."]
+/// }
 /// ```
 pub fn parse_oracle_table(
-	table: &toml::Value,
+	table: &serde_json::Value,
 ) -> Result<HashMap<u64, Vec<Address>>, SettlementError> {
 	let mut result = HashMap::new();
 
-	if let Some(table) = table.as_table() {
+	if let Some(table) = table.as_object() {
 		for (chain_id_str, oracles_value) in table {
 			let chain_id = chain_id_str.parse::<u64>().map_err(|e| {
 				SettlementError::ValidationFailed(format!("Invalid chain ID '{chain_id_str}': {e}"))
@@ -64,18 +66,22 @@ pub fn parse_oracle_table(
 	Ok(result)
 }
 
-/// Parse a routes table from TOML configuration.
+/// Parse a routes table from JSON configuration.
 ///
 /// Parses a table mapping source chain IDs to arrays of destination chain IDs.
 /// Expected format:
-/// ```toml
-/// 31337 = [31338, 31339]
-/// 31338 = [31337]
+/// ```json
+/// {
+///   "31337": [31338, 31339],
+///   "31338": [31337]
+/// }
 /// ```
-pub fn parse_routes_table(table: &toml::Value) -> Result<HashMap<u64, Vec<u64>>, SettlementError> {
+pub fn parse_routes_table(
+	table: &serde_json::Value,
+) -> Result<HashMap<u64, Vec<u64>>, SettlementError> {
 	let mut result = HashMap::new();
 
-	if let Some(table) = table.as_table() {
+	if let Some(table) = table.as_object() {
 		for (chain_id_str, destinations_value) in table {
 			let chain_id = chain_id_str.parse::<u64>().map_err(|e| {
 				SettlementError::ValidationFailed(format!("Invalid chain ID '{chain_id_str}': {e}"))
@@ -85,7 +91,7 @@ pub fn parse_routes_table(table: &toml::Value) -> Result<HashMap<u64, Vec<u64>>,
 				array
 					.iter()
 					.map(|v| {
-						v.as_integer().map(|i| i as u64).ok_or_else(|| {
+						v.as_i64().map(|i| i as u64).ok_or_else(|| {
 							SettlementError::ValidationFailed(format!(
 								"Destination chain ID must be integer for route from chain {chain_id}"
 							))
@@ -124,21 +130,23 @@ pub fn parse_selection_strategy(value: Option<&str>) -> OracleSelectionStrategy 
 	}
 }
 
-/// Parse a complete oracle configuration from TOML.
+/// Parse a complete oracle configuration from JSON.
 ///
 /// Expects a config structure like:
-/// ```toml
-/// [oracles]
-/// input = { 31337 = ["0x..."], 31338 = ["0x..."] }
-/// output = { 31337 = ["0x..."], 31338 = ["0x..."] }
-///
-/// [routes]
-/// 31337 = [31338]
-/// 31338 = [31337]
-///
-/// oracle_selection_strategy = "RoundRobin"  # Optional
+/// ```json
+/// {
+///   "oracles": {
+///     "input": { "31337": ["0x..."], "31338": ["0x..."] },
+///     "output": { "31337": ["0x..."], "31338": ["0x..."] }
+///   },
+///   "routes": {
+///     "31337": [31338],
+///     "31338": [31337]
+///   },
+///   "oracle_selection_strategy": "RoundRobin"
+/// }
 /// ```
-pub fn parse_oracle_config(config: &toml::Value) -> Result<OracleConfig, SettlementError> {
+pub fn parse_oracle_config(config: &serde_json::Value) -> Result<OracleConfig, SettlementError> {
 	// Parse oracles section
 	let oracles_table = config.get("oracles").ok_or_else(|| {
 		SettlementError::ValidationFailed("Missing 'oracles' section".to_string())
@@ -232,18 +240,22 @@ mod tests {
 
 	#[test]
 	fn test_parse_oracle_table_success() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"1".to_string(),
-				toml::Value::Array(vec![
-					toml::Value::String("0x1111111111111111111111111111111111111111".to_string()),
-					toml::Value::String("0x2222222222222222222222222222222222222222".to_string()),
+				serde_json::Value::Array(vec![
+					serde_json::Value::String(
+						"0x1111111111111111111111111111111111111111".to_string(),
+					),
+					serde_json::Value::String(
+						"0x2222222222222222222222222222222222222222".to_string(),
+					),
 				]),
 			);
 			table.insert(
 				"2".to_string(),
-				toml::Value::Array(vec![toml::Value::String(
+				serde_json::Value::Array(vec![serde_json::Value::String(
 					"0x3333333333333333333333333333333333333333".to_string(),
 				)]),
 			);
@@ -268,11 +280,11 @@ mod tests {
 
 	#[test]
 	fn test_parse_oracle_table_invalid_chain_id() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"invalid".to_string(),
-				toml::Value::Array(vec![toml::Value::String(
+				serde_json::Value::Array(vec![serde_json::Value::String(
 					"0x1111111111111111111111111111111111111111".to_string(),
 				)]),
 			);
@@ -288,11 +300,11 @@ mod tests {
 
 	#[test]
 	fn test_parse_oracle_table_not_array() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"1".to_string(),
-				toml::Value::String("not_array".to_string()),
+				serde_json::Value::String("not_array".to_string()),
 			);
 			table
 		});
@@ -306,9 +318,9 @@ mod tests {
 
 	#[test]
 	fn test_parse_oracle_table_empty_array() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
-			table.insert("1".to_string(), toml::Value::Array(vec![]));
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
+			table.insert("1".to_string(), serde_json::Value::Array(vec![]));
 			table
 		});
 
@@ -321,11 +333,11 @@ mod tests {
 
 	#[test]
 	fn test_parse_oracle_table_non_string_address() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"1".to_string(),
-				toml::Value::Array(vec![toml::Value::Integer(123)]),
+				serde_json::Value::Array(vec![serde_json::Value::from(123)]),
 			);
 			table
 		});
@@ -339,11 +351,13 @@ mod tests {
 
 	#[test]
 	fn test_parse_oracle_table_invalid_address() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"1".to_string(),
-				toml::Value::Array(vec![toml::Value::String("invalid_address".to_string())]),
+				serde_json::Value::Array(vec![serde_json::Value::String(
+					"invalid_address".to_string(),
+				)]),
 			);
 			table
 		});
@@ -357,15 +371,18 @@ mod tests {
 
 	#[test]
 	fn test_parse_routes_table_success() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"1".to_string(),
-				toml::Value::Array(vec![toml::Value::Integer(2), toml::Value::Integer(3)]),
+				serde_json::Value::Array(vec![
+					serde_json::Value::from(2),
+					serde_json::Value::from(3),
+				]),
 			);
 			table.insert(
 				"2".to_string(),
-				toml::Value::Array(vec![toml::Value::Integer(1)]),
+				serde_json::Value::Array(vec![serde_json::Value::from(1)]),
 			);
 			table
 		});
@@ -380,11 +397,11 @@ mod tests {
 
 	#[test]
 	fn test_parse_routes_table_invalid_chain_id() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"invalid".to_string(),
-				toml::Value::Array(vec![toml::Value::Integer(2)]),
+				serde_json::Value::Array(vec![serde_json::Value::from(2)]),
 			);
 			table
 		});
@@ -398,9 +415,9 @@ mod tests {
 
 	#[test]
 	fn test_parse_routes_table_not_array() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
-			table.insert("1".to_string(), toml::Value::Integer(2));
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
+			table.insert("1".to_string(), serde_json::Value::from(2));
 			table
 		});
 
@@ -413,9 +430,9 @@ mod tests {
 
 	#[test]
 	fn test_parse_routes_table_empty_array() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
-			table.insert("1".to_string(), toml::Value::Array(vec![]));
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
+			table.insert("1".to_string(), serde_json::Value::Array(vec![]));
 			table
 		});
 
@@ -428,11 +445,11 @@ mod tests {
 
 	#[test]
 	fn test_parse_routes_table_non_integer_destination() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"1".to_string(),
-				toml::Value::Array(vec![toml::Value::String("invalid".to_string())]),
+				serde_json::Value::Array(vec![serde_json::Value::String("invalid".to_string())]),
 			);
 			table
 		});
@@ -511,19 +528,19 @@ mod tests {
 
 	#[test]
 	fn test_parse_oracle_config_success() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"oracles".to_string(),
-				toml::Value::Table({
-					let mut oracles = toml::map::Map::new();
+				serde_json::Value::Object({
+					let mut oracles = serde_json::Map::new();
 					oracles.insert(
 						"input".to_string(),
-						toml::Value::Table({
-							let mut input = toml::map::Map::new();
+						serde_json::Value::Object({
+							let mut input = serde_json::Map::new();
 							input.insert(
 								"1".to_string(),
-								toml::Value::Array(vec![toml::Value::String(
+								serde_json::Value::Array(vec![serde_json::Value::String(
 									"0x1111111111111111111111111111111111111111".to_string(),
 								)]),
 							);
@@ -532,11 +549,11 @@ mod tests {
 					);
 					oracles.insert(
 						"output".to_string(),
-						toml::Value::Table({
-							let mut output = toml::map::Map::new();
+						serde_json::Value::Object({
+							let mut output = serde_json::Map::new();
 							output.insert(
 								"2".to_string(),
-								toml::Value::Array(vec![toml::Value::String(
+								serde_json::Value::Array(vec![serde_json::Value::String(
 									"0x2222222222222222222222222222222222222222".to_string(),
 								)]),
 							);
@@ -548,18 +565,18 @@ mod tests {
 			);
 			table.insert(
 				"routes".to_string(),
-				toml::Value::Table({
-					let mut routes = toml::map::Map::new();
+				serde_json::Value::Object({
+					let mut routes = serde_json::Map::new();
 					routes.insert(
 						"1".to_string(),
-						toml::Value::Array(vec![toml::Value::Integer(2)]),
+						serde_json::Value::Array(vec![serde_json::Value::from(2)]),
 					);
 					routes
 				}),
 			);
 			table.insert(
 				"oracle_selection_strategy".to_string(),
-				toml::Value::String("RoundRobin".to_string()),
+				serde_json::Value::String("RoundRobin".to_string()),
 			);
 			table
 		});
@@ -576,11 +593,11 @@ mod tests {
 
 	#[test]
 	fn test_parse_oracle_config_missing_oracles_section() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"routes".to_string(),
-				toml::Value::Table(toml::map::Map::new()),
+				serde_json::Value::Object(serde_json::Map::new()),
 			);
 			table
 		});
@@ -594,22 +611,22 @@ mod tests {
 
 	#[test]
 	fn test_parse_oracle_config_missing_input_oracles() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"oracles".to_string(),
-				toml::Value::Table({
-					let mut oracles = toml::map::Map::new();
+				serde_json::Value::Object({
+					let mut oracles = serde_json::Map::new();
 					oracles.insert(
 						"output".to_string(),
-						toml::Value::Table(toml::map::Map::new()),
+						serde_json::Value::Object(serde_json::Map::new()),
 					);
 					oracles
 				}),
 			);
 			table.insert(
 				"routes".to_string(),
-				toml::Value::Table(toml::map::Map::new()),
+				serde_json::Value::Object(serde_json::Map::new()),
 			);
 			table
 		});
@@ -623,22 +640,22 @@ mod tests {
 
 	#[test]
 	fn test_parse_oracle_config_missing_output_oracles() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"oracles".to_string(),
-				toml::Value::Table({
-					let mut oracles = toml::map::Map::new();
+				serde_json::Value::Object({
+					let mut oracles = serde_json::Map::new();
 					oracles.insert(
 						"input".to_string(),
-						toml::Value::Table(toml::map::Map::new()),
+						serde_json::Value::Object(serde_json::Map::new()),
 					);
 					oracles
 				}),
 			);
 			table.insert(
 				"routes".to_string(),
-				toml::Value::Table(toml::map::Map::new()),
+				serde_json::Value::Object(serde_json::Map::new()),
 			);
 			table
 		});
@@ -652,19 +669,19 @@ mod tests {
 
 	#[test]
 	fn test_parse_oracle_config_missing_routes() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"oracles".to_string(),
-				toml::Value::Table({
-					let mut oracles = toml::map::Map::new();
+				serde_json::Value::Object({
+					let mut oracles = serde_json::Map::new();
 					oracles.insert(
 						"input".to_string(),
-						toml::Value::Table(toml::map::Map::new()),
+						serde_json::Value::Object(serde_json::Map::new()),
 					);
 					oracles.insert(
 						"output".to_string(),
-						toml::Value::Table(toml::map::Map::new()),
+						serde_json::Value::Object(serde_json::Map::new()),
 					);
 					oracles
 				}),
@@ -681,19 +698,19 @@ mod tests {
 
 	#[test]
 	fn test_parse_oracle_config_default_strategy() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"oracles".to_string(),
-				toml::Value::Table({
-					let mut oracles = toml::map::Map::new();
+				serde_json::Value::Object({
+					let mut oracles = serde_json::Map::new();
 					oracles.insert(
 						"input".to_string(),
-						toml::Value::Table({
-							let mut input = toml::map::Map::new();
+						serde_json::Value::Object({
+							let mut input = serde_json::Map::new();
 							input.insert(
 								"1".to_string(),
-								toml::Value::Array(vec![toml::Value::String(
+								serde_json::Value::Array(vec![serde_json::Value::String(
 									"0x1111111111111111111111111111111111111111".to_string(),
 								)]),
 							);
@@ -702,11 +719,11 @@ mod tests {
 					);
 					oracles.insert(
 						"output".to_string(),
-						toml::Value::Table({
-							let mut output = toml::map::Map::new();
+						serde_json::Value::Object({
+							let mut output = serde_json::Map::new();
 							output.insert(
 								"2".to_string(),
-								toml::Value::Array(vec![toml::Value::String(
+								serde_json::Value::Array(vec![serde_json::Value::String(
 									"0x2222222222222222222222222222222222222222".to_string(),
 								)]),
 							);
@@ -718,11 +735,11 @@ mod tests {
 			);
 			table.insert(
 				"routes".to_string(),
-				toml::Value::Table({
-					let mut routes = toml::map::Map::new();
+				serde_json::Value::Object({
+					let mut routes = serde_json::Map::new();
 					routes.insert(
 						"1".to_string(),
-						toml::Value::Array(vec![toml::Value::Integer(2)]),
+						serde_json::Value::Array(vec![serde_json::Value::from(2)]),
 					);
 					routes
 				}),

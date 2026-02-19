@@ -134,10 +134,6 @@ pub enum Error {
 	#[error("JSON error: {0}")]
 	Json(#[from] serde_json::Error),
 
-	// TOML errors
-	#[error("TOML error: {0}")]
-	Toml(#[from] toml::de::Error),
-
 	// HTTP errors
 	#[error("HTTP error: {0}")]
 	Http(#[from] reqwest::Error),

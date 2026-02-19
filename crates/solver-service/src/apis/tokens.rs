@@ -284,52 +284,65 @@ mod tests {
 	async fn create_mock_solver_engine() -> Arc<SolverEngine> {
 		let token_manager = create_mock_token_manager();
 
-		// Create minimal config for testing
-		let config_toml = r#"
-			[solver]
-			id = "test-solver"
-			monitoring_timeout_seconds = 30
-			min_profitability_pct = 1.0
-
-			[storage]
-			primary = "memory"
-			cleanup_interval_seconds = 3600
-			[storage.implementations.memory]
-
-			[delivery]
-			min_confirmations = 1
-			[delivery.implementations]
-
-			[account]
-			primary = "local"
-			[account.implementations.local]
-			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
-
-			[discovery]
-			[discovery.implementations]
-
-			[order]
-			[order.implementations]
-			[order.strategy]
-			primary = "simple"
-			[order.strategy.implementations.simple]
-
-			[settlement]
-			[settlement.implementations]
-
-			[networks.1]
-			chain_id = 1
-			input_settler_address = "0x1111111111111111111111111111111111111111"
-			output_settler_address = "0x2222222222222222222222222222222222222222"
-			[[networks.1.rpc_urls]]
-			http = "http://localhost:8545"
-			[[networks.1.tokens]]
-			symbol = "TEST"
-			address = "0x3333333333333333333333333333333333333333"
-			decimals = 18
-		"#;
-		let config: solver_config::Config =
-			toml::from_str(config_toml).expect("Failed to parse test config");
+		let config: solver_config::Config = serde_json::from_value(serde_json::json!({
+			"solver": {
+				"id": "test-solver",
+				"monitoring_timeout_seconds": 30,
+				"min_profitability_pct": 1.0
+			},
+			"storage": {
+				"primary": "memory",
+				"cleanup_interval_seconds": 3600,
+				"implementations": {
+					"memory": {}
+				}
+			},
+			"delivery": {
+				"min_confirmations": 1,
+				"implementations": {}
+			},
+			"account": {
+				"primary": "local",
+				"implementations": {
+					"local": {
+						"private_key": "0x1234567890123456789012345678901234567890123456789012345678901234"
+					}
+				}
+			},
+			"discovery": {
+				"implementations": {}
+			},
+			"order": {
+				"implementations": {},
+				"strategy": {
+					"primary": "simple",
+					"implementations": {
+						"simple": {}
+					}
+				}
+			},
+			"settlement": {
+				"implementations": {}
+			},
+			"networks": {
+				"1": {
+					"chain_id": 1,
+					"input_settler_address": "0x1111111111111111111111111111111111111111",
+					"output_settler_address": "0x2222222222222222222222222222222222222222",
+					"rpc_urls": [
+						{ "http": "http://localhost:8545" }
+					],
+					"tokens": [
+						{
+							"symbol": "TEST",
+							"address": "0x3333333333333333333333333333333333333333",
+							"decimals": 18
+						}
+					]
+				}
+			}
+		}))
+		.expect("Failed to parse test config");
 
 		// Create mock services using proper constructors
 		let storage = Arc::new(solver_storage::StorageService::new(Box::new(
@@ -337,10 +350,9 @@ mod tests {
 		)));
 
 		// Create account service with local wallet
-		let account_config = toml::from_str(
-			r#"private_key = "0x1234567890123456789012345678901234567890123456789012345678901234""#,
-		)
-		.expect("Failed to parse account config");
+		let account_config = serde_json::json!({
+			"private_key": "0x1234567890123456789012345678901234567890123456789012345678901234"
+		});
 		let account = Arc::new(solver_account::AccountService::new(
 			solver_account::implementations::local::create_account(&account_config)
 				.await
@@ -357,7 +369,7 @@ mod tests {
 		let discovery = Arc::new(solver_discovery::DiscoveryService::new(HashMap::new()));
 
 		// Create order service - needs implementations and strategy
-		let strategy_config = toml::Value::Table(toml::value::Table::new());
+		let strategy_config = serde_json::Value::Object(serde_json::Map::new());
 		let strategy =
 			solver_order::implementations::strategies::simple::create_strategy(&strategy_config)
 				.expect("Failed to create strategy");
@@ -370,7 +382,7 @@ mod tests {
 		));
 
 		// Create pricing service with mock implementation
-		let pricing_config = toml::Value::Table(toml::value::Table::new());
+		let pricing_config = serde_json::Value::Object(serde_json::Map::new());
 		let pricing_impl =
 			solver_pricing::implementations::mock::create_mock_pricing(&pricing_config)
 				.expect("Failed to create mock pricing");
@@ -646,65 +658,85 @@ mod tests {
 
 	/// Creates a test Config for testing `*_from_config` functions.
 	fn create_test_config() -> Config {
-		let config_toml = r#"
-			[solver]
-			id = "test-solver"
-			monitoring_timeout_seconds = 30
-			min_profitability_pct = 1.0
-
-			[storage]
-			primary = "memory"
-			cleanup_interval_seconds = 3600
-			[storage.implementations.memory]
-
-			[delivery]
-			min_confirmations = 1
-			[delivery.implementations]
-
-			[account]
-			primary = "local"
-			[account.implementations.local]
-			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
-
-			[discovery]
-			[discovery.implementations]
-
-			[order]
-			[order.implementations]
-			[order.strategy]
-			primary = "simple"
-			[order.strategy.implementations.simple]
-
-			[settlement]
-			[settlement.implementations]
-
-			[networks.1]
-			chain_id = 1
-			input_settler_address = "0x1111111111111111111111111111111111111111"
-			output_settler_address = "0x2222222222222222222222222222222222222222"
-			[[networks.1.rpc_urls]]
-			http = "http://localhost:8545"
-			[[networks.1.tokens]]
-			symbol = "USDC"
-			address = "0x3333333333333333333333333333333333333333"
-			decimals = 6
-			[[networks.1.tokens]]
-			symbol = "WETH"
-			address = "0x4444444444444444444444444444444444444444"
-			decimals = 18
-
-			[networks.137]
-			chain_id = 137
-			input_settler_address = "0x5555555555555555555555555555555555555555"
-			output_settler_address = "0x6666666666666666666666666666666666666666"
-			[[networks.137.rpc_urls]]
-			http = "http://localhost:8546"
-			[[networks.137.tokens]]
-			symbol = "USDC"
-			address = "0x7777777777777777777777777777777777777777"
-			decimals = 6
-		"#;
-		toml::from_str(config_toml).expect("Failed to parse test config")
+		serde_json::from_value(serde_json::json!({
+			"solver": {
+				"id": "test-solver",
+				"monitoring_timeout_seconds": 30,
+				"min_profitability_pct": 1.0
+			},
+			"storage": {
+				"primary": "memory",
+				"cleanup_interval_seconds": 3600,
+				"implementations": {
+					"memory": {}
+				}
+			},
+			"delivery": {
+				"min_confirmations": 1,
+				"implementations": {}
+			},
+			"account": {
+				"primary": "local",
+				"implementations": {
+					"local": {
+						"private_key": "0x1234567890123456789012345678901234567890123456789012345678901234"
+					}
+				}
+			},
+			"discovery": {
+				"implementations": {}
+			},
+			"order": {
+				"implementations": {},
+				"strategy": {
+					"primary": "simple",
+					"implementations": {
+						"simple": {}
+					}
+				}
+			},
+			"settlement": {
+				"implementations": {}
+			},
+			"networks": {
+				"1": {
+					"chain_id": 1,
+					"input_settler_address": "0x1111111111111111111111111111111111111111",
+					"output_settler_address": "0x2222222222222222222222222222222222222222",
+					"rpc_urls": [
+						{ "http": "http://localhost:8545" }
+					],
+					"tokens": [
+						{
+							"symbol": "USDC",
+							"address": "0x3333333333333333333333333333333333333333",
+							"decimals": 6
+						},
+						{
+							"symbol": "WETH",
+							"address": "0x4444444444444444444444444444444444444444",
+							"decimals": 18
+						}
+					]
+				},
+				"137": {
+					"chain_id": 137,
+					"input_settler_address": "0x5555555555555555555555555555555555555555",
+					"output_settler_address": "0x6666666666666666666666666666666666666666",
+					"rpc_urls": [
+						{ "http": "http://localhost:8546" }
+					],
+					"tokens": [
+						{
+							"symbol": "USDC",
+							"address": "0x7777777777777777777777777777777777777777",
+							"decimals": 6
+						}
+					]
+				}
+			}
+		}))
+		.expect("Failed to parse test config")
 	}
 
 	#[tokio::test]

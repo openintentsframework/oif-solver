@@ -931,58 +931,71 @@ mod tests {
 	use wiremock::{Mock, MockServer, ResponseTemplate};
 
 	async fn build_test_solver_engine() -> Arc<SolverEngine> {
-		let config_toml = r#"
-			[solver]
-			id = "test-solver"
-			monitoring_timeout_seconds = 30
-			min_profitability_pct = 1.0
-
-			[storage]
-			primary = "memory"
-			cleanup_interval_seconds = 60
-			[storage.implementations.memory]
-
-			[delivery]
-			min_confirmations = 1
-			[delivery.implementations]
-
-			[account]
-			primary = "local"
-			[account.implementations.local]
-			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
-
-			[discovery]
-			[discovery.implementations]
-
-			[order]
-			[order.implementations]
-			[order.strategy]
-			primary = "simple"
-			[order.strategy.implementations.simple]
-
-			[settlement]
-			[settlement.implementations]
-
-			[networks.1]
-			chain_id = 1
-			input_settler_address = "0x0000000000000000000000000000000000000011"
-			output_settler_address = "0x0000000000000000000000000000000000000022"
-			[[networks.1.rpc_urls]]
-			http = "http://localhost:8545"
-			[[networks.1.tokens]]
-			symbol = "TEST"
-			address = "0x0000000000000000000000000000000000000033"
-			decimals = 18
-		"#;
-
-		let config: Config = toml::from_str(config_toml).expect("failed to parse test config");
+		let config: Config = serde_json::from_value(json!({
+			"solver": {
+				"id": "test-solver",
+				"monitoring_timeout_seconds": 30,
+				"min_profitability_pct": 1.0
+			},
+			"storage": {
+				"primary": "memory",
+				"cleanup_interval_seconds": 60,
+				"implementations": {
+					"memory": {}
+				}
+			},
+			"delivery": {
+				"min_confirmations": 1,
+				"implementations": {}
+			},
+			"account": {
+				"primary": "local",
+				"implementations": {
+					"local": {
+						"private_key": "0x1234567890123456789012345678901234567890123456789012345678901234"
+					}
+				}
+			},
+			"discovery": {
+				"implementations": {}
+			},
+			"order": {
+				"implementations": {},
+				"strategy": {
+					"primary": "simple",
+					"implementations": {
+						"simple": {}
+					}
+				}
+			},
+			"settlement": {
+				"implementations": {}
+			},
+			"networks": {
+				"1": {
+					"chain_id": 1,
+					"input_settler_address": "0x0000000000000000000000000000000000000011",
+					"output_settler_address": "0x0000000000000000000000000000000000000022",
+					"rpc_urls": [
+						{ "http": "http://localhost:8545" }
+					],
+					"tokens": [
+						{
+							"symbol": "TEST",
+							"address": "0x0000000000000000000000000000000000000033",
+							"decimals": 18
+						}
+					]
+				}
+			}
+		}))
+		.expect("failed to parse test config");
 
 		let storage = Arc::new(StorageService::new(Box::new(MemoryStorage::new())));
 
-		let account_config: toml::Value = toml::from_str(
-			r#"private_key = "0x1234567890123456789012345678901234567890123456789012345678901234""#,
-		)
-		.expect("failed to parse account config");
+		let account_config: serde_json::Value = json!({
+			"private_key": "0x1234567890123456789012345678901234567890123456789012345678901234"
+		});
 		let account_impl = solver_account::implementations::local::create_account(&account_config)
 			.await
 			.expect("failed to create account impl");
@@ -993,7 +1006,7 @@ mod tests {
 		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 10));
 		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
 
-		let strategy_config = toml::Value::Table(toml::value::Table::new());
+		let strategy_config = serde_json::Value::Object(serde_json::Map::new());
 		let strategy =
 			solver_order::implementations::strategies::simple::create_strategy(&strategy_config)
 				.expect("failed to create order strategy");
@@ -1001,7 +1014,7 @@ mod tests {
 
 		let settlement = Arc::new(SettlementService::new(HashMap::new(), 10));
 
-		let pricing_impl = create_mock_pricing(&toml::Value::Table(toml::value::Table::new()))
+		let pricing_impl = create_mock_pricing(&serde_json::Value::Object(serde_json::Map::new()))
 			.expect("failed to create mock pricing");
 		let pricing = Arc::new(PricingService::new(pricing_impl, Vec::new()));
 

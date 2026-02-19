@@ -10,9 +10,9 @@ use alloy_primitives::{Address as AlloyAddress, Bytes, TxKind};
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
+use serde::Deserialize;
 use solver_types::{
-	with_0x_prefix, Address, ConfigSchema, Field, FieldType, Schema, SecretString, Signature,
-	Transaction,
+	with_0x_prefix, Address, ConfigSchema, SecretString, Signature, Transaction, ValidationError,
 };
 
 /// Local wallet implementation using Alloy's signer.
@@ -24,6 +24,45 @@ use solver_types::{
 pub struct LocalWallet {
 	/// The underlying Alloy signer that handles cryptographic operations.
 	signer: PrivateKeySigner,
+}
+
+/// Dedicated typed configuration for local wallet accounts.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalWalletConfig {
+	private_key: String,
+}
+
+impl LocalWalletConfig {
+	fn from_json(config: &serde_json::Value) -> Result<Self, ValidationError> {
+		let parsed: Self = serde_json::from_value(config.clone())
+			.map_err(|err| ValidationError::DeserializationError(err.to_string()))?;
+		parsed.validate()?;
+		Ok(parsed)
+	}
+
+	fn validate(&self) -> Result<(), ValidationError> {
+		let key_without_prefix = self
+			.private_key
+			.strip_prefix("0x")
+			.unwrap_or(self.private_key.as_str());
+
+		if key_without_prefix.len() != 64 {
+			return Err(ValidationError::InvalidValue {
+				field: "private_key".to_string(),
+				message: "Private key must be 64 hex characters (32 bytes)".to_string(),
+			});
+		}
+
+		if hex::decode(key_without_prefix).is_err() {
+			return Err(ValidationError::InvalidValue {
+				field: "private_key".to_string(),
+				message: "Private key must be valid hexadecimal".to_string(),
+			});
+		}
+
+		Ok(())
+	}
 }
 
 impl LocalWallet {
@@ -50,42 +89,14 @@ pub struct LocalWalletSchema;
 
 impl LocalWalletSchema {
 	/// Static validation method for use before instance creation
-	pub fn validate_config(config: &toml::Value) -> Result<(), solver_types::ValidationError> {
-		let instance = Self;
-		instance.validate(config)
+	pub fn validate_config(config: &serde_json::Value) -> Result<(), ValidationError> {
+		LocalWalletConfig::from_json(config).map(|_| ())
 	}
 }
 
 impl ConfigSchema for LocalWalletSchema {
-	fn validate(&self, config: &toml::Value) -> Result<(), solver_types::ValidationError> {
-		let schema =
-			Schema::new(
-				// Required fields
-				vec![Field::new("private_key", FieldType::String).with_validator(
-					|value| match value.as_str() {
-						Some(key) => {
-							let key_without_prefix = key.strip_prefix("0x").unwrap_or(key);
-
-							if key_without_prefix.len() != 64 {
-								return Err(
-									"Private key must be 64 hex characters (32 bytes)".to_string()
-								);
-							}
-
-							if hex::decode(key_without_prefix).is_err() {
-								return Err("Private key must be valid hexadecimal".to_string());
-							}
-
-							Ok(())
-						},
-						None => Err("Expected string value for private_key".to_string()),
-					},
-				)],
-				// Optional fields
-				vec![],
-			);
-
-		schema.validate(config)
+	fn validate(&self, config: &serde_json::Value) -> Result<(), ValidationError> {
+		LocalWalletConfig::from_json(config).map(|_| ())
 	}
 }
 
@@ -169,18 +180,11 @@ impl AccountInterface for LocalWallet {
 /// Returns an error if:
 /// - `private_key` is not provided in the configuration
 /// - The wallet creation fails
-pub fn create_account(config: &toml::Value) -> AccountFactoryFuture<'_> {
+pub fn create_account(config: &serde_json::Value) -> AccountFactoryFuture<'_> {
 	Box::pin(async move {
-		// Validate configuration first
-		LocalWalletSchema::validate_config(config)
+		let parsed = LocalWalletConfig::from_json(config)
 			.map_err(|e| AccountError::InvalidKey(format!("Invalid configuration: {e}")))?;
-
-		let private_key = config
-			.get("private_key")
-			.and_then(|v| v.as_str())
-			.ok_or_else(|| AccountError::InvalidKey("private_key required".into()))?;
-
-		Ok(Box::new(LocalWallet::new(private_key)?) as Box<dyn AccountInterface>)
+		Ok(Box::new(LocalWallet::new(&parsed.private_key)?) as Box<dyn AccountInterface>)
 	})
 }
 
@@ -214,13 +218,13 @@ mod tests {
 	const INVALID_PRIVATE_KEY: &str = "invalid_key";
 	const SHORT_PRIVATE_KEY: &str = "1234";
 
-	fn create_test_config(private_key: &str) -> toml::Value {
+	fn create_test_config(private_key: &str) -> serde_json::Value {
 		let mut config = HashMap::new();
 		config.insert(
 			"private_key".to_string(),
-			toml::Value::String(private_key.to_string()),
+			serde_json::Value::String(private_key.to_string()),
 		);
-		toml::Value::Table(config.into_iter().collect())
+		serde_json::Value::Object(config.into_iter().collect())
 	}
 
 	fn create_test_transaction() -> Transaction {
@@ -285,7 +289,24 @@ mod tests {
 
 	#[test]
 	fn test_schema_validation_missing_private_key() {
-		let config = toml::Value::Table(HashMap::new().into_iter().collect());
+		let config = serde_json::Value::Object(HashMap::new().into_iter().collect());
+		let result = LocalWalletSchema::validate_config(&config);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_schema_validation_rejects_unknown_fields() {
+		let config = serde_json::json!({
+			"private_key": TEST_PRIVATE_KEY,
+			"unexpected": "value"
+		});
+		let result = LocalWalletSchema::validate_config(&config);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_schema_validation_rejects_non_table_root() {
+		let config = serde_json::Value::String(TEST_PRIVATE_KEY.to_string());
 		let result = LocalWalletSchema::validate_config(&config);
 		assert!(result.is_err());
 	}
@@ -353,7 +374,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_create_account_missing_private_key() {
-		let config = toml::Value::Table(HashMap::new().into_iter().collect());
+		let config = serde_json::Value::Object(HashMap::new().into_iter().collect());
 		let result = create_account(&config).await;
 		assert!(result.is_err());
 	}

@@ -49,7 +49,7 @@ pub trait PricingInterface: Send + Sync {
 }
 
 /// Type alias for pricing factory functions.
-pub type PricingFactory = fn(&toml::Value) -> Result<Box<dyn PricingInterface>, PricingError>;
+pub type PricingFactory = fn(&serde_json::Value) -> Result<Box<dyn PricingInterface>, PricingError>;
 
 /// Registry trait for pricing implementations.
 pub trait PricingRegistry: ImplementationRegistry<Factory = PricingFactory> {}
@@ -122,7 +122,7 @@ impl PricingConfig {
 	}
 
 	/// Builds pricing config from a TOML table (e.g. strategy implementation table)
-	pub fn from_table(table: &toml::Value) -> Self {
+	pub fn from_table(table: &serde_json::Value) -> Self {
 		let defaults = Self::default_values();
 		Self {
 			currency: table
@@ -132,11 +132,11 @@ impl PricingConfig {
 				.to_string(),
 			commission_bps: table
 				.get("commission_bps")
-				.and_then(|v| v.as_integer())
+				.and_then(|v| v.as_i64())
 				.unwrap_or(defaults.commission_bps as i64) as u32,
 			rate_buffer_bps: table
 				.get("rate_buffer_bps")
-				.and_then(|v| v.as_integer())
+				.and_then(|v| v.as_i64())
 				.unwrap_or(defaults.rate_buffer_bps as i64) as u32,
 			enable_live_gas_estimate: table
 				.get("enable_live_gas_estimate")
@@ -305,7 +305,7 @@ mod tests {
 
 	#[test]
 	fn test_pricing_config_from_empty_table() {
-		let table = toml::Value::Table(toml::map::Map::new());
+		let table = serde_json::Value::Object(serde_json::Map::new());
 		let config = PricingConfig::from_table(&table);
 		// Should use all defaults
 		assert_eq!(config.currency, "USD");
@@ -316,15 +316,12 @@ mod tests {
 
 	#[test]
 	fn test_pricing_config_from_table_with_values() {
-		let table: toml::Value = toml::from_str(
-			r#"
-			pricing_currency = "EUR"
-			commission_bps = 50
-			rate_buffer_bps = 25
-			enable_live_gas_estimate = true
-		"#,
-		)
-		.unwrap();
+		let table = serde_json::json!({
+			"pricing_currency": "EUR",
+			"commission_bps": 50,
+			"rate_buffer_bps": 25,
+			"enable_live_gas_estimate": true
+		});
 		let config = PricingConfig::from_table(&table);
 		assert_eq!(config.currency, "EUR");
 		assert_eq!(config.commission_bps, 50);
@@ -334,13 +331,10 @@ mod tests {
 
 	#[test]
 	fn test_pricing_config_from_table_partial_values() {
-		let table: toml::Value = toml::from_str(
-			r#"
-			pricing_currency = "GBP"
-			commission_bps = 30
-		"#,
-		)
-		.unwrap();
+		let table = serde_json::json!({
+			"pricing_currency": "GBP",
+			"commission_bps": 30
+		});
 		let config = PricingConfig::from_table(&table);
 		assert_eq!(config.currency, "GBP");
 		assert_eq!(config.commission_bps, 30);
@@ -375,7 +369,7 @@ mod tests {
 		use solver_types::ConfigSchema;
 
 		fn create_test_pricing() -> Box<dyn PricingInterface> {
-			let config = toml::Value::Table(toml::map::Map::new());
+			let config = serde_json::Value::Object(serde_json::Map::new());
 			create_mock_pricing(&config).unwrap()
 		}
 
@@ -385,7 +379,10 @@ mod tests {
 		struct FailingConfigSchema;
 
 		impl ConfigSchema for FailingConfigSchema {
-			fn validate(&self, _config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+			fn validate(
+				&self,
+				_config: &serde_json::Value,
+			) -> Result<(), solver_types::ValidationError> {
 				Ok(())
 			}
 		}

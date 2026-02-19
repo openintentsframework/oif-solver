@@ -231,9 +231,9 @@ impl EnvOps {
 				.session
 				.set_contract_addresses(chain, addresses.clone())?;
 
-			// Update TOML files with deployed addresses if in local mode
+			// Update JSON files with deployed addresses if in local mode
 			if self.ctx.is_local() {
-				// For each deployed contract, inject its address into the appropriate TOML file
+				// For each deployed contract, inject its address into the appropriate JSON file
 				if let Some(address) = addresses.input_settler {
 					self.replace_config_placeholders(chain, "InputSettler", address)
 						.await?;
@@ -354,16 +354,16 @@ impl EnvOps {
 				&format!("{contract_name} on chain {chain} at {address}"),
 			);
 
-			// Handle TOML updates based on environment
+			// Handle JSON updates based on environment
 			if self.ctx.is_local() {
-				// Local: automatically inject into TOML
+				// Local: automatically inject into JSON
 				self.replace_config_placeholders(chain, contract_name, address)
 					.await?;
 			} else {
 				// Production: log that manual update is needed
 				logging::verbose_operation(
 					"Production deployment",
-					&format!("manual TOML update required for {contract_name} on chain {chain}"),
+					&format!("manual JSON update required for {contract_name} on chain {chain}"),
 				);
 			}
 		}
@@ -649,9 +649,9 @@ impl EnvOps {
 		Ok(())
 	}
 
-	/// Inject a deployed contract address into the appropriate TOML config file
+	/// Inject a deployed contract address into the appropriate JSON config file
 	/// This function looks up the placeholder address and replaces it with the actual address
-	pub async fn inject_address_to_toml(
+	pub async fn inject_address_to_json(
 		&self,
 		placeholder_key: &str,
 		actual_address: &str,
@@ -673,7 +673,7 @@ impl EnvOps {
 
 		let placeholder_address = placeholder_address.unwrap();
 
-		// Determine which TOML file to update based on the placeholder prefix
+		// Determine which JSON file to update based on the placeholder prefix
 		let target_file = if placeholder_key.contains("SETTLEMENT") {
 			// Settlement domain goes in the main config file (settlement section)
 			if let Some(settlement_file) = config_sections.get("settlement") {
@@ -779,8 +779,8 @@ impl EnvOps {
 			_ => return Ok(()), // Unknown contract, skip
 		};
 
-		// Inject the address into the appropriate TOML file
-		self.inject_address_to_toml(&placeholder_key, &address.to_string())
+		// Inject the address into the appropriate JSON file
+		self.inject_address_to_json(&placeholder_key, &address.to_string())
 			.await
 	}
 }

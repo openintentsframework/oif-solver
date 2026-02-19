@@ -39,11 +39,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 solver-account = { path = "../solver-account" }
 solver-config = { path = "../solver-config" }
+solver-service = { path = "../solver-service" }
+solver-storage = { path = "../solver-storage" }
 solver-types = { path = "../solver-types" }
 sysinfo = "0.32"
 thiserror = "2"
 tokio = { version = "1.41", features = ["full"] }
-toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"

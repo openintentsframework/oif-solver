@@ -14,23 +14,28 @@
 //!
 //! # Configuration
 //!
-//! The Redis storage backend is configured via TOML:
+//! The Redis storage backend is configured via JSON:
 //!
-//! ```toml
-//! [storage]
-//! primary = "redis"
-//! cleanup_interval_seconds = 60
-//!
-//! [storage.implementations.redis]
-//! redis_url = "redis://localhost:6379"
-//! key_prefix = "oif-solver"
-//! connection_timeout_ms = 5000
-//! db = 0
-//! ttl_orders = 300                # 5 minutes
-//! ttl_intents = 120               # 2 minutes
-//! ttl_order_by_tx_hash = 300      # 5 minutes
-//! ttl_quotes = 60                 # 1 minute
-//! ttl_settlement_messages = 600   # 10 minutes
+//! ```json
+//! {
+//!   "storage": {
+//!     "primary": "redis",
+//!     "cleanup_interval_seconds": 60,
+//!     "implementations": {
+//!       "redis": {
+//!         "redis_url": "redis://localhost:6379",
+//!         "key_prefix": "oif-solver",
+//!         "connection_timeout_ms": 5000,
+//!         "db": 0,
+//!         "ttl_orders": 300,
+//!         "ttl_intents": 120,
+//!         "ttl_order_by_tx_hash": 300,
+//!         "ttl_quotes": 60,
+//!         "ttl_settlement_messages": 600
+//!       }
+//!     }
+//!   }
+//! }
 //! ```
 //!
 //! ## Configuration Options
@@ -122,15 +127,15 @@ impl TtlConfig {
 	}
 
 	/// Creates TTL config from TOML configuration.
-	fn from_config(config: &toml::Value) -> Self {
+	fn from_config(config: &serde_json::Value) -> Self {
 		let mut ttls = HashMap::new();
 
-		if let Some(table) = config.as_table() {
+		if let Some(table) = config.as_object() {
 			for storage_key in StorageKey::all() {
 				let config_key = format!("ttl_{}", storage_key.as_str());
 				if let Some(ttl_value) = table
 					.get(&config_key)
-					.and_then(|v| v.as_integer())
+					.and_then(|v| v.as_i64())
 					.map(|v| v as u64)
 				{
 					if ttl_value > 0 {
@@ -836,14 +841,14 @@ pub struct RedisStorageSchema;
 
 impl RedisStorageSchema {
 	/// Static validation method for use before instance creation.
-	pub fn validate_config(config: &toml::Value) -> Result<(), ValidationError> {
+	pub fn validate_config(config: &serde_json::Value) -> Result<(), ValidationError> {
 		let instance = Self;
 		instance.validate(config)
 	}
 }
 
 impl ConfigSchema for RedisStorageSchema {
-	fn validate(&self, config: &toml::Value) -> Result<(), ValidationError> {
+	fn validate(&self, config: &serde_json::Value) -> Result<(), ValidationError> {
 		// Build TTL fields dynamically based on StorageKey variants
 		// Note: redis_url is required, so it's not in optional_fields
 		let mut optional_fields = vec![
@@ -954,7 +959,9 @@ fn build_redis_url(redis_url: &str, db: u8) -> String {
 /// - `ttl_order_by_tx_hash`: TTL in seconds for order_by_tx_hash mappings (default: no expiration)
 /// - `ttl_quotes`: TTL in seconds for quotes (default: no expiration)
 /// - `ttl_settlement_messages`: TTL in seconds for settlement messages (default: no expiration)
-pub fn create_storage(config: &toml::Value) -> Result<Box<dyn StorageInterface>, StorageError> {
+pub fn create_storage(
+	config: &serde_json::Value,
+) -> Result<Box<dyn StorageInterface>, StorageError> {
 	// Validate configuration first
 	RedisStorageSchema::validate_config(config)
 		.map_err(|e| StorageError::Configuration(format!("Invalid configuration: {e}")))?;
@@ -972,13 +979,13 @@ pub fn create_storage(config: &toml::Value) -> Result<Box<dyn StorageInterface>,
 
 	let timeout_ms = config
 		.get("connection_timeout_ms")
-		.and_then(|v| v.as_integer())
+		.and_then(|v| v.as_i64())
 		.map(|v| v as u64)
 		.unwrap_or(DEFAULT_CONNECTION_TIMEOUT_MS);
 
 	let db = config
 		.get("db")
-		.and_then(|v| v.as_integer())
+		.and_then(|v| v.as_i64())
 		.map(|v| v as u8)
 		.unwrap_or(0);
 
@@ -1000,7 +1007,7 @@ pub fn create_storage(config: &toml::Value) -> Result<Box<dyn StorageInterface>,
 /// Use this when you need to create storage in an async context without blocking.
 /// This function also eagerly initializes the connection to verify connectivity.
 pub async fn create_storage_async(
-	config: &toml::Value,
+	config: &serde_json::Value,
 ) -> Result<Box<dyn StorageInterface>, StorageError> {
 	// Validate configuration first
 	RedisStorageSchema::validate_config(config)
@@ -1019,13 +1026,13 @@ pub async fn create_storage_async(
 
 	let timeout_ms = config
 		.get("connection_timeout_ms")
-		.and_then(|v| v.as_integer())
+		.and_then(|v| v.as_i64())
 		.map(|v| v as u64)
 		.unwrap_or(DEFAULT_CONNECTION_TIMEOUT_MS);
 
 	let db = config
 		.get("db")
-		.and_then(|v| v.as_integer())
+		.and_then(|v| v.as_i64())
 		.map(|v| v as u8)
 		.unwrap_or(0);
 
@@ -1061,11 +1068,11 @@ mod tests {
 
 	#[test]
 	fn test_ttl_config_from_toml() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379"
-			ttl_orders = 3600
-			ttl_intents = 7200
-			ttl_quotes = 1800
+		let config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
+			"ttl_orders": 3600,
+			"ttl_intents": 7200,
+			"ttl_quotes": 1800,
 		});
 
 		let ttl_config = TtlConfig::from_config(&config);
@@ -1087,10 +1094,10 @@ mod tests {
 
 	#[test]
 	fn test_ttl_config_zero_values() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379"
-			ttl_orders = 0
-			ttl_intents = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
+			"ttl_orders": 0,
+			"ttl_intents": 100,
 		});
 
 		let ttl_config = TtlConfig::from_config(&config);
@@ -1105,7 +1112,7 @@ mod tests {
 
 	#[test]
 	fn test_ttl_config_empty_config() {
-		let config = toml::Value::Table(toml::map::Map::new());
+		let config = serde_json::Value::Object(serde_json::Map::new());
 		let ttl_config = TtlConfig::from_config(&config);
 
 		// No TTLs should be configured
@@ -1119,7 +1126,7 @@ mod tests {
 	#[test]
 	fn test_ttl_config_non_table_value() {
 		// When config is not a table, should return empty TtlConfig
-		let config = toml::Value::String("not a table".to_string());
+		let config = serde_json::Value::String("not a table".to_string());
 		let ttl_config = TtlConfig::from_config(&config);
 
 		assert_eq!(ttl_config.get_ttl(StorageKey::Orders), None);
@@ -1127,12 +1134,12 @@ mod tests {
 
 	#[test]
 	fn test_ttl_config_all_storage_keys() {
-		let config = toml::Value::Table(toml::toml! {
-			ttl_orders = 100
-			ttl_intents = 200
-			ttl_order_by_tx_hash = 300
-			ttl_quotes = 400
-			ttl_settlement_messages = 500
+		let config = serde_json::json!({
+			"ttl_orders": 100,
+			"ttl_intents": 200,
+			"ttl_order_by_tx_hash": 300,
+			"ttl_quotes": 400,
+			"ttl_settlement_messages": 500,
 		});
 
 		let ttl_config = TtlConfig::from_config(&config);
@@ -1163,8 +1170,8 @@ mod tests {
 	fn test_ttl_config_negative_values_treated_as_zero() {
 		// Negative values in TOML are still i64, but we cast to u64
 		// This tests the behavior with edge values
-		let config = toml::Value::Table(toml::toml! {
-			ttl_orders = 1
+		let config = serde_json::json!({
+			"ttl_orders": 1,
 		});
 
 		let ttl_config = TtlConfig::from_config(&config);
@@ -1176,8 +1183,8 @@ mod tests {
 
 	#[test]
 	fn test_ttl_config_debug_impl() {
-		let config = toml::Value::Table(toml::toml! {
-			ttl_orders = 100
+		let config = serde_json::json!({
+			"ttl_orders": 100,
 		});
 		let ttl_config = TtlConfig::from_config(&config);
 
@@ -1191,7 +1198,7 @@ mod tests {
 
 	#[test]
 	fn test_redis_storage_new_valid() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let result = RedisStorage::new(
 			"redis://localhost:6379".to_string(),
 			5000,
@@ -1208,7 +1215,7 @@ mod tests {
 
 	#[test]
 	fn test_redis_storage_new_empty_prefix() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let result = RedisStorage::new(
 			"redis://localhost:6379".to_string(),
 			5000,
@@ -1224,7 +1231,7 @@ mod tests {
 
 	#[test]
 	fn test_redis_storage_new_empty_url() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let result = RedisStorage::new("".to_string(), 5000, "test".to_string(), ttl_config);
 
 		assert!(result.is_err());
@@ -1237,7 +1244,7 @@ mod tests {
 
 	#[test]
 	fn test_data_key_generation() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let storage = RedisStorage::new(
 			"redis://localhost:6379".to_string(),
 			5000,
@@ -1256,7 +1263,7 @@ mod tests {
 
 	#[test]
 	fn test_data_key_with_custom_prefix() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let storage = RedisStorage::new(
 			"redis://localhost:6379".to_string(),
 			5000,
@@ -1273,7 +1280,7 @@ mod tests {
 
 	#[test]
 	fn test_all_ids_key_generation() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let storage = RedisStorage::new(
 			"redis://localhost:6379".to_string(),
 			5000,
@@ -1289,7 +1296,7 @@ mod tests {
 
 	#[test]
 	fn test_index_key_generation_string_value() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let storage = RedisStorage::new(
 			"redis://localhost:6379".to_string(),
 			5000,
@@ -1307,7 +1314,7 @@ mod tests {
 
 	#[test]
 	fn test_index_key_generation_number_value() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let storage = RedisStorage::new(
 			"redis://localhost:6379".to_string(),
 			5000,
@@ -1325,7 +1332,7 @@ mod tests {
 
 	#[test]
 	fn test_index_key_generation_bool_value() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let storage = RedisStorage::new(
 			"redis://localhost:6379".to_string(),
 			5000,
@@ -1349,7 +1356,7 @@ mod tests {
 
 	#[test]
 	fn test_index_key_generation_complex_value() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let storage = RedisStorage::new(
 			"redis://localhost:6379".to_string(),
 			5000,
@@ -1372,7 +1379,7 @@ mod tests {
 
 	#[test]
 	fn test_index_key_generation_null_value() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let storage = RedisStorage::new(
 			"redis://localhost:6379".to_string(),
 			5000,
@@ -1390,7 +1397,7 @@ mod tests {
 
 	#[test]
 	fn test_index_meta_key_generation() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let storage = RedisStorage::new(
 			"redis://localhost:6379".to_string(),
 			5000,
@@ -1411,7 +1418,7 @@ mod tests {
 
 	#[test]
 	fn test_index_meta_key_with_custom_prefix() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let storage = RedisStorage::new(
 			"redis://localhost:6379".to_string(),
 			5000,
@@ -1430,8 +1437,8 @@ mod tests {
 
 	#[test]
 	fn test_get_ttl_for_key_orders() {
-		let config = toml::Value::Table(toml::toml! {
-			ttl_orders = 3600
+		let config = serde_json::json!({
+			"ttl_orders": 3600,
 		});
 		let ttl_config = TtlConfig::from_config(&config);
 		let storage = RedisStorage::new(
@@ -1450,8 +1457,8 @@ mod tests {
 
 	#[test]
 	fn test_get_ttl_for_key_intents() {
-		let config = toml::Value::Table(toml::toml! {
-			ttl_intents = 1800
+		let config = serde_json::json!({
+			"ttl_intents": 1800,
 		});
 		let ttl_config = TtlConfig::from_config(&config);
 		let storage = RedisStorage::new(
@@ -1470,8 +1477,8 @@ mod tests {
 
 	#[test]
 	fn test_get_ttl_for_key_no_ttl_configured() {
-		let config = toml::Value::Table(toml::toml! {
-			ttl_orders = 3600
+		let config = serde_json::json!({
+			"ttl_orders": 3600,
 		});
 		let ttl_config = TtlConfig::from_config(&config);
 		let storage = RedisStorage::new(
@@ -1488,8 +1495,8 @@ mod tests {
 
 	#[test]
 	fn test_get_ttl_for_key_unknown_namespace() {
-		let config = toml::Value::Table(toml::toml! {
-			ttl_orders = 3600
+		let config = serde_json::json!({
+			"ttl_orders": 3600,
 		});
 		let ttl_config = TtlConfig::from_config(&config);
 		let storage = RedisStorage::new(
@@ -1506,8 +1513,8 @@ mod tests {
 
 	#[test]
 	fn test_get_ttl_for_key_empty_key() {
-		let config = toml::Value::Table(toml::toml! {
-			ttl_orders = 3600
+		let config = serde_json::json!({
+			"ttl_orders": 3600,
 		});
 		let ttl_config = TtlConfig::from_config(&config);
 		let storage = RedisStorage::new(
@@ -1523,8 +1530,8 @@ mod tests {
 
 	#[test]
 	fn test_get_ttl_for_key_no_colon() {
-		let config = toml::Value::Table(toml::toml! {
-			ttl_orders = 3600
+		let config = serde_json::json!({
+			"ttl_orders": 3600,
 		});
 		let ttl_config = TtlConfig::from_config(&config);
 		let storage = RedisStorage::new(
@@ -1546,7 +1553,7 @@ mod tests {
 
 	#[test]
 	fn test_map_redis_error_type_error() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let storage = RedisStorage::new(
 			"redis://localhost:6379".to_string(),
 			5000,
@@ -1566,7 +1573,7 @@ mod tests {
 
 	#[test]
 	fn test_map_redis_error_auth_failed() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let storage = RedisStorage::new(
 			"redis://localhost:6379".to_string(),
 			5000,
@@ -1585,7 +1592,7 @@ mod tests {
 
 	#[test]
 	fn test_map_redis_error_io_error() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let storage = RedisStorage::new(
 			"redis://localhost:6379".to_string(),
 			5000,
@@ -1605,7 +1612,7 @@ mod tests {
 
 	#[test]
 	fn test_map_redis_error_generic() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let storage = RedisStorage::new(
 			"redis://localhost:6379".to_string(),
 			5000,
@@ -1630,12 +1637,12 @@ mod tests {
 	fn test_config_schema_validation_valid() {
 		let schema = RedisStorageSchema;
 
-		let valid_config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379"
-			key_prefix = "test"
-			connection_timeout_ms = 5000
-			db = 0
-			ttl_orders = 3600
+		let valid_config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
+			"key_prefix": "test",
+			"connection_timeout_ms": 5000,
+			"db": 0,
+			"ttl_orders": 3600,
 		});
 
 		assert!(schema.validate(&valid_config).is_ok());
@@ -1645,8 +1652,8 @@ mod tests {
 	fn test_config_schema_validation_missing_url() {
 		let schema = RedisStorageSchema;
 
-		let invalid_config = toml::Value::Table(toml::toml! {
-			key_prefix = "test"
+		let invalid_config = serde_json::json!({
+			"key_prefix": "test",
 		});
 
 		assert!(schema.validate(&invalid_config).is_err());
@@ -1657,9 +1664,9 @@ mod tests {
 		let schema = RedisStorageSchema;
 
 		// Timeout too low
-		let invalid_config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379"
-			connection_timeout_ms = 10
+		let invalid_config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
+			"connection_timeout_ms": 10,
 		});
 
 		assert!(schema.validate(&invalid_config).is_err());
@@ -1670,9 +1677,9 @@ mod tests {
 		let schema = RedisStorageSchema;
 
 		// Timeout too high (> 60000)
-		let invalid_config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379"
-			connection_timeout_ms = 100000
+		let invalid_config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
+			"connection_timeout_ms": 100000,
 		});
 
 		assert!(schema.validate(&invalid_config).is_err());
@@ -1683,9 +1690,9 @@ mod tests {
 		let schema = RedisStorageSchema;
 
 		// DB out of range (> 15)
-		let invalid_config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379"
-			db = 20
+		let invalid_config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
+			"db": 20,
 		});
 
 		assert!(schema.validate(&invalid_config).is_err());
@@ -1696,9 +1703,9 @@ mod tests {
 		let schema = RedisStorageSchema;
 
 		// DB negative
-		let invalid_config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379"
-			db = -1
+		let invalid_config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
+			"db": -1,
 		});
 
 		assert!(schema.validate(&invalid_config).is_err());
@@ -1709,8 +1716,8 @@ mod tests {
 		let schema = RedisStorageSchema;
 
 		// Only redis_url is required
-		let minimal_config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379"
+		let minimal_config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
 		});
 
 		assert!(schema.validate(&minimal_config).is_ok());
@@ -1720,13 +1727,13 @@ mod tests {
 	fn test_config_schema_validation_all_ttls() {
 		let schema = RedisStorageSchema;
 
-		let config_with_all_ttls = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379"
-			ttl_orders = 100
-			ttl_intents = 200
-			ttl_order_by_tx_hash = 300
-			ttl_quotes = 400
-			ttl_settlement_messages = 500
+		let config_with_all_ttls = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
+			"ttl_orders": 100,
+			"ttl_intents": 200,
+			"ttl_order_by_tx_hash": 300,
+			"ttl_quotes": 400,
+			"ttl_settlement_messages": 500,
 		});
 
 		assert!(schema.validate(&config_with_all_ttls).is_ok());
@@ -1734,13 +1741,13 @@ mod tests {
 
 	#[test]
 	fn test_config_schema_static_validate() {
-		let valid_config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379"
+		let valid_config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
 		});
 
 		assert!(RedisStorageSchema::validate_config(&valid_config).is_ok());
 
-		let invalid_config = toml::Value::Table(toml::map::Map::new());
+		let invalid_config = serde_json::Value::Object(serde_json::Map::new());
 		assert!(RedisStorageSchema::validate_config(&invalid_config).is_err());
 	}
 
@@ -1748,10 +1755,10 @@ mod tests {
 
 	#[test]
 	fn test_create_storage_valid_config() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379"
-			key_prefix = "test"
-			connection_timeout_ms = 5000
+		let config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
+			"key_prefix": "test",
+			"connection_timeout_ms": 5000,
 		});
 
 		let result = create_storage(&config);
@@ -1760,8 +1767,8 @@ mod tests {
 
 	#[test]
 	fn test_create_storage_default_prefix() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379"
+		let config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
 		});
 
 		let result = create_storage(&config);
@@ -1770,8 +1777,8 @@ mod tests {
 
 	#[test]
 	fn test_create_storage_default_timeout() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379"
+		let config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
 		});
 
 		let result = create_storage(&config);
@@ -1780,9 +1787,9 @@ mod tests {
 
 	#[test]
 	fn test_create_storage_with_db_number() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379"
-			db = 5
+		let config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
+			"db": 5,
 		});
 
 		let result = create_storage(&config);
@@ -1791,9 +1798,9 @@ mod tests {
 
 	#[test]
 	fn test_create_storage_url_already_has_db() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379/3"
-			db = 5
+		let config = serde_json::json!({
+			"redis_url": "redis://localhost:6379/3",
+			"db": 5,
 		});
 
 		// Should use the db from URL, not from config
@@ -1803,8 +1810,8 @@ mod tests {
 
 	#[test]
 	fn test_create_storage_missing_url() {
-		let config = toml::Value::Table(toml::toml! {
-			key_prefix = "test"
+		let config = serde_json::json!({
+			"key_prefix": "test",
 		});
 
 		let result = create_storage(&config);
@@ -1817,9 +1824,9 @@ mod tests {
 
 	#[test]
 	fn test_create_storage_invalid_timeout() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379"
-			connection_timeout_ms = 10
+		let config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
+			"connection_timeout_ms": 10,
 		});
 
 		let result = create_storage(&config);
@@ -1828,10 +1835,10 @@ mod tests {
 
 	#[test]
 	fn test_create_storage_with_ttl_config() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379"
-			ttl_orders = 3600
-			ttl_intents = 1800
+		let config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
+			"ttl_orders": 3600,
+			"ttl_intents": 1800,
 		});
 
 		let result = create_storage(&config);
@@ -1840,9 +1847,9 @@ mod tests {
 
 	#[test]
 	fn test_create_storage_url_with_trailing_slash() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379/"
-			db = 2
+		let config = serde_json::json!({
+			"redis_url": "redis://localhost:6379/",
+			"db": 2,
 		});
 
 		let result = create_storage(&config);
@@ -1853,7 +1860,7 @@ mod tests {
 
 	#[test]
 	fn test_redis_storage_debug() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let storage = RedisStorage::new(
 			"redis://localhost:6379".to_string(),
 			5000,
@@ -1881,8 +1888,8 @@ mod tests {
 	#[test]
 	fn test_registry_factory() {
 		let factory = Registry::factory();
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379"
+		let config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
 		});
 
 		let result = factory(&config);
@@ -1904,7 +1911,7 @@ mod tests {
 
 	#[test]
 	fn test_storage_interface_config_schema() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let storage = RedisStorage::new(
 			"redis://localhost:6379".to_string(),
 			5000,
@@ -1916,12 +1923,12 @@ mod tests {
 		let schema = storage.config_schema();
 
 		// Test that the schema validates correctly
-		let valid_config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379"
+		let valid_config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
 		});
 		assert!(schema.validate(&valid_config).is_ok());
 
-		let invalid_config = toml::Value::Table(toml::map::Map::new());
+		let invalid_config = serde_json::Value::Object(serde_json::Map::new());
 		assert!(schema.validate(&invalid_config).is_err());
 	}
 
@@ -1930,9 +1937,9 @@ mod tests {
 	#[test]
 	fn test_url_with_path_not_db() {
 		// URL that has a slash but the last segment is not a valid db number
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379/notanumber"
-			db = 5
+		let config = serde_json::json!({
+			"redis_url": "redis://localhost:6379/notanumber",
+			"db": 5,
 		});
 
 		// This should append db because "notanumber" is not a valid u8
@@ -1943,9 +1950,9 @@ mod tests {
 	#[test]
 	fn test_url_building_db_out_of_u8_range() {
 		// URL with a number larger than u8 max
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://localhost:6379/256"
-			db = 5
+		let config = serde_json::json!({
+			"redis_url": "redis://localhost:6379/256",
+			"db": 5,
 		});
 
 		// 256 is out of u8 range, so should append db
@@ -1990,9 +1997,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_get_bytes_connection_failure() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host:6379"
-			connection_timeout_ms = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://invalid-host:6379",
+			"connection_timeout_ms": 100,
 		});
 
 		let storage = create_storage(&config).unwrap();
@@ -2004,9 +2011,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_set_bytes_connection_failure() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host:6379"
-			connection_timeout_ms = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://invalid-host:6379",
+			"connection_timeout_ms": 100,
 		});
 
 		let storage = create_storage(&config).unwrap();
@@ -2020,9 +2027,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_set_bytes_with_indexes_connection_failure() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host:6379"
-			connection_timeout_ms = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://invalid-host:6379",
+			"connection_timeout_ms": 100,
 		});
 
 		let storage = create_storage(&config).unwrap();
@@ -2037,9 +2044,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_set_bytes_with_explicit_ttl_connection_failure() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host:6379"
-			connection_timeout_ms = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://invalid-host:6379",
+			"connection_timeout_ms": 100,
 		});
 
 		let storage = create_storage(&config).unwrap();
@@ -2058,9 +2065,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_delete_connection_failure() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host:6379"
-			connection_timeout_ms = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://invalid-host:6379",
+			"connection_timeout_ms": 100,
 		});
 
 		let storage = create_storage(&config).unwrap();
@@ -2072,9 +2079,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_exists_connection_failure() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host:6379"
-			connection_timeout_ms = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://invalid-host:6379",
+			"connection_timeout_ms": 100,
 		});
 
 		let storage = create_storage(&config).unwrap();
@@ -2086,9 +2093,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_query_all_connection_failure() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host:6379"
-			connection_timeout_ms = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://invalid-host:6379",
+			"connection_timeout_ms": 100,
 		});
 
 		let storage = create_storage(&config).unwrap();
@@ -2100,9 +2107,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_query_equals_connection_failure() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host:6379"
-			connection_timeout_ms = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://invalid-host:6379",
+			"connection_timeout_ms": 100,
 		});
 
 		let storage = create_storage(&config).unwrap();
@@ -2119,9 +2126,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_query_not_equals_connection_failure() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host:6379"
-			connection_timeout_ms = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://invalid-host:6379",
+			"connection_timeout_ms": 100,
 		});
 
 		let storage = create_storage(&config).unwrap();
@@ -2138,9 +2145,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_query_in_connection_failure() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host:6379"
-			connection_timeout_ms = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://invalid-host:6379",
+			"connection_timeout_ms": 100,
 		});
 
 		let storage = create_storage(&config).unwrap();
@@ -2160,9 +2167,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_query_not_in_connection_failure() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host:6379"
-			connection_timeout_ms = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://invalid-host:6379",
+			"connection_timeout_ms": 100,
 		});
 
 		let storage = create_storage(&config).unwrap();
@@ -2182,9 +2189,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_get_batch_connection_failure() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host:6379"
-			connection_timeout_ms = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://invalid-host:6379",
+			"connection_timeout_ms": 100,
 		});
 
 		let storage = create_storage(&config).unwrap();
@@ -2197,9 +2204,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_get_batch_empty_keys() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host:6379"
-			connection_timeout_ms = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://invalid-host:6379",
+			"connection_timeout_ms": 100,
 		});
 
 		let storage = create_storage(&config).unwrap();
@@ -2213,9 +2220,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_cleanup_expired_no_connection_needed() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host:6379"
-			connection_timeout_ms = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://invalid-host:6379",
+			"connection_timeout_ms": 100,
 		});
 
 		let storage = create_storage(&config).unwrap();
@@ -2243,8 +2250,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_create_storage_async_validation_failure() {
-		let invalid_config = toml::Value::Table(toml::toml! {
-			key_prefix = "test"
+		let invalid_config = serde_json::json!({
+			"key_prefix": "test",
 		});
 
 		let result = create_storage_async(&invalid_config).await;
@@ -2254,9 +2261,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_create_storage_async_connection_failure() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host:6379"
-			connection_timeout_ms = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://invalid-host:6379",
+			"connection_timeout_ms": 100,
 		});
 
 		let result = create_storage_async(&config).await;
@@ -2268,9 +2275,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_update_indexes_connection_failure() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host:6379"
-			connection_timeout_ms = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://invalid-host:6379",
+			"connection_timeout_ms": 100,
 		});
 
 		let ttl_config = TtlConfig::from_config(&config);
@@ -2293,9 +2300,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_update_indexes_with_ttl_connection_failure() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host:6379"
-			connection_timeout_ms = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://invalid-host:6379",
+			"connection_timeout_ms": 100,
 		});
 
 		let ttl_config = TtlConfig::from_config(&config);
@@ -2325,9 +2332,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_remove_from_indexes_connection_failure() {
-		let config = toml::Value::Table(toml::toml! {
-			redis_url = "redis://invalid-host:6379"
-			connection_timeout_ms = 100
+		let config = serde_json::json!({
+			"redis_url": "redis://invalid-host:6379",
+			"connection_timeout_ms": 100,
 		});
 
 		let ttl_config = TtlConfig::from_config(&config);
@@ -2349,7 +2356,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_get_connection_lazy_initialization() {
-		let ttl_config = TtlConfig::from_config(&toml::Value::Table(toml::map::Map::new()));
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
 		let storage = RedisStorage::new(
 			"redis://invalid-host:6379".to_string(),
 			100,

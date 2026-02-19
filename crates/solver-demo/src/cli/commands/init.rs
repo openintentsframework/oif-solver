@@ -45,4 +45,15 @@ pub enum InitSubcommand {
 		#[arg(long)]
 		local: bool,
 	},
+
+	/// Load configuration from storage backend (Redis/file/memory)
+	LoadStorage {
+		/// Solver ID to load (defaults to SOLVER_ID env var)
+		#[arg(long)]
+		solver_id: Option<String>,
+
+		/// Initialize for local environment
+		#[arg(long)]
+		local: bool,
+	},
 }

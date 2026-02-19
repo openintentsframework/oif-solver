@@ -13,41 +13,56 @@ use alloy_primitives::{Address as AlloyAddress, Bytes, TxKind};
 use alloy_signer_aws::AwsSigner;
 use async_trait::async_trait;
 use aws_sdk_kms::Client as KmsClient;
-use solver_types::{
-	Address, ConfigSchema, Field, FieldType, Schema, Signature, Transaction, ValidationError,
-};
+use serde::Deserialize;
+use solver_types::{Address, ConfigSchema, Signature, Transaction, ValidationError};
 
 /// Configuration schema for KMS wallet.
 pub struct KmsWalletSchema;
 
+/// Dedicated typed configuration for KMS-backed wallets.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KmsWalletConfig {
+	key_id: String,
+	region: String,
+	endpoint: Option<String>,
+}
+
+impl KmsWalletConfig {
+	fn from_json(config: &serde_json::Value) -> Result<Self, ValidationError> {
+		let parsed: Self = serde_json::from_value(config.clone())
+			.map_err(|err| ValidationError::DeserializationError(err.to_string()))?;
+		parsed.validate()?;
+		Ok(parsed)
+	}
+
+	fn validate(&self) -> Result<(), ValidationError> {
+		if self.key_id.trim().is_empty() {
+			return Err(ValidationError::InvalidValue {
+				field: "key_id".to_string(),
+				message: "key_id must be a non-empty string".to_string(),
+			});
+		}
+		if self.region.trim().is_empty() {
+			return Err(ValidationError::InvalidValue {
+				field: "region".to_string(),
+				message: "region must be a non-empty string".to_string(),
+			});
+		}
+		Ok(())
+	}
+}
+
 impl KmsWalletSchema {
 	/// Static validation method for use before instance creation.
-	pub fn validate_config(config: &toml::Value) -> Result<(), ValidationError> {
-		let schema = Self;
-		schema.validate(config)
+	pub fn validate_config(config: &serde_json::Value) -> Result<(), ValidationError> {
+		KmsWalletConfig::from_json(config).map(|_| ())
 	}
 }
 
 impl ConfigSchema for KmsWalletSchema {
-	fn validate(&self, config: &toml::Value) -> Result<(), ValidationError> {
-		let schema = Schema::new(
-			// Required fields
-			vec![
-				Field::new("key_id", FieldType::String).with_validator(|v| match v.as_str() {
-					Some(s) if !s.is_empty() => Ok(()),
-					_ => Err("key_id must be a non-empty string".to_string()),
-				}),
-				Field::new("region", FieldType::String).with_validator(|v| match v.as_str() {
-					Some(s) if !s.is_empty() => Ok(()),
-					_ => Err("region must be a non-empty string".to_string()),
-				}),
-			],
-			// Optional fields
-			vec![
-				Field::new("endpoint", FieldType::String), // For LocalStack testing
-			],
-		);
-		schema.validate(config)
+	fn validate(&self, config: &serde_json::Value) -> Result<(), ValidationError> {
+		KmsWalletConfig::from_json(config).map(|_| ())
 	}
 }
 
@@ -158,29 +173,11 @@ impl AccountInterface for KmsWallet {
 /// Factory function to create a KMS wallet from configuration.
 ///
 /// Returns an async future that initializes the KMS signer.
-pub fn create_account(config: &toml::Value) -> AccountFactoryFuture<'_> {
+pub fn create_account(config: &serde_json::Value) -> AccountFactoryFuture<'_> {
 	Box::pin(async move {
-		KmsWalletSchema::validate_config(config)
+		let parsed = KmsWalletConfig::from_json(config)
 			.map_err(|e| AccountError::InvalidKey(format!("Invalid configuration: {e}")))?;
-
-		let key_id = config
-			.get("key_id")
-			.and_then(|v| v.as_str())
-			.ok_or_else(|| AccountError::InvalidKey("key_id required".into()))?
-			.to_string();
-
-		let region = config
-			.get("region")
-			.and_then(|v| v.as_str())
-			.ok_or_else(|| AccountError::InvalidKey("region required".into()))?
-			.to_string();
-
-		let endpoint = config
-			.get("endpoint")
-			.and_then(|v| v.as_str())
-			.map(String::from);
-
-		let wallet = KmsWallet::new(key_id, region, endpoint).await?;
+		let wallet = KmsWallet::new(parsed.key_id, parsed.region, parsed.endpoint).await?;
 
 		Ok(Box::new(wallet) as Box<dyn AccountInterface>)
 	})

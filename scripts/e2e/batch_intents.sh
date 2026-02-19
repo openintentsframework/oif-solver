@@ -94,14 +94,13 @@ if ! jq empty "$INTENTS_FILE" 2>/dev/null; then
     exit 1
 fi
 
-if [ ! -f "config/testnet.toml" ] || [ ! -f "config/testnet/networks.toml" ]; then
+if [ ! -f "config/testnet.json" ]; then
     echo -e "${RED}❌ Testnet configuration not found!${NC}"
     exit 1
 fi
 
 # Configuration
-MAIN_CONFIG="config/testnet.toml"
-NETWORKS_CONFIG="config/testnet/networks.toml"
+MAIN_CONFIG="config/testnet.json"
 TESTNET_CONFIG="scripts/e2e/testnet-config.json"
 
 # Load environment variables from .env file if it exists
@@ -147,13 +146,13 @@ get_network_config() {
     
     case $config_type in
         "input_settler")
-            grep -A 5 "\[networks\.${chain_id}\]" $NETWORKS_CONFIG | grep 'input_settler_address = ' | cut -d'"' -f2
+            jq -r --arg chain_id "$chain_id" '.networks[$chain_id].input_settler_address // empty' "$MAIN_CONFIG"
             ;;
         "output_settler")
-            grep -A 5 "\[networks\.${chain_id}\]" $NETWORKS_CONFIG | grep 'output_settler_address = ' | cut -d'"' -f2
+            jq -r --arg chain_id "$chain_id" '.networks[$chain_id].output_settler_address // empty' "$MAIN_CONFIG"
             ;;
         "rpc_url")
-            awk "/\[\[networks\.${chain_id}\.rpc_urls\]\]/{f=1} f && /^http = /{print; exit}" $NETWORKS_CONFIG | cut -d'"' -f2
+            jq -r --arg chain_id "$chain_id" '.networks[$chain_id].rpc_urls[0].http // empty' "$MAIN_CONFIG"
             ;;
         "oracle")
             # Get oracle from any settlement configuration that supports this chain
