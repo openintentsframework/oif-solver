@@ -22,6 +22,7 @@
 //!       "rpc_urls": ["https://user-rpc.com"]
 //!     }
 //!   ],
+//!   "auth_enabled": true,
 //!   "min_profitability_pct": "2.0",
 //!   "gas_buffer_bps": 1500,
 //!   "admin": {
@@ -67,6 +68,11 @@ pub struct SeedOverrides {
 	/// If provided, enables admin API endpoints with EIP-712 signature auth.
 	#[serde(default)]
 	pub admin: Option<AdminOverride>,
+
+	/// Enable JWT authentication on API routes.
+	/// When true, orders and protected admin endpoints require a JWT.
+	#[serde(default)]
+	pub auth_enabled: Option<bool>,
 
 	/// Minimum profitability percentage (e.g., 1.0 = 1%).
 	/// If not set, uses seed default (typically 1.0%).
@@ -350,6 +356,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -374,6 +381,7 @@ mod tests {
 			}],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -403,6 +411,7 @@ mod tests {
 			}],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -462,6 +471,7 @@ mod tests {
 			}],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
