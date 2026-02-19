@@ -234,6 +234,50 @@ cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
 cargo run --
 ```
 
+### Auth Quickstart (when `auth_enabled = true`)
+
+If you enable API auth in your seed overrides (`"auth_enabled": true`), set:
+
+```bash
+export JWT_SECRET=replace_with_a_strong_random_value
+
+# Optional
+export AUTH_PUBLIC_REGISTER_ENABLED=false
+```
+
+If `auth_enabled = false`, `AUTH_PUBLIC_REGISTER_ENABLED` is ignored.
+
+Admin JWTs (`admin-all` scope) are obtained via SIWE wallet login:
+
+#### SIWE (admin wallet)
+
+```bash
+ADMIN_ADDRESS=0xYourAdminWalletAddress
+
+# 1) Request SIWE nonce + canonical message
+NONCE_RESPONSE=$(curl -s -X POST http://localhost:3000/api/v1/auth/siwe/nonce \
+  -H "Content-Type: application/json" \
+  -d "{\"address\":\"$ADMIN_ADDRESS\"}")
+
+SIWE_MESSAGE=$(echo "$NONCE_RESPONSE" | jq -r '.message')
+
+# 2) Sign SIWE_MESSAGE with your wallet and set SIWE_SIGNATURE (0x... 65-byte signature)
+SIWE_SIGNATURE=0x...
+
+# 3) Exchange signed message for JWT access + refresh tokens
+SIWE_TOKENS=$(curl -s -X POST http://localhost:3000/api/v1/auth/siwe/verify \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --arg message "$SIWE_MESSAGE" --arg signature "$SIWE_SIGNATURE" '{message: $message, signature: $signature}')")
+
+TOKEN=$(echo "$SIWE_TOKENS" | jq -r '.access_token')
+REFRESH_TOKEN=$(echo "$SIWE_TOKENS" | jq -r '.refresh_token')
+```
+
+SIWE-issued access tokens use the same JWT format as other auth flows and currently use
+`TOKEN_DEFAULT_TTL_SECONDS.min(TOKEN_MAX_TTL_SECONDS)` (900s with current constants).
+SIWE also returns a refresh token with the configured `refresh_token_expiry_hours`, and that
+refresh token is compatible with `POST /api/v1/auth/refresh`.
+
 ## Docker
 
 The solver can be run in a Docker container for production deployments.
@@ -543,7 +587,9 @@ The solver provides a REST API for interacting with the system and submitting of
 
 - **Orders API**: [`api-spec/orders-api.yaml`](api-spec/orders-api.yaml) - Submit and track cross-chain intent orders
 - **Tokens API**: [`api-spec/tokens-api.yaml`](api-spec/tokens-api.yaml) - Query supported tokens and networks
+- **Auth API**: [`api-spec/auth-api.yaml`](api-spec/auth-api.yaml) - JWT issuance flows (SIWE + register/refresh)
 - **Admin API**: [`api-spec/admin-api.yaml`](api-spec/admin-api.yaml) - Wallet-based admin operations (EIP-712 signed)
+- **Admin Auth Guide**: [`docs/admin-authentication.md`](docs/admin-authentication.md) - Practical auth + nonce flow guide
 
 ### API Flows
 
@@ -773,21 +819,19 @@ The admin API enables authorized wallet addresses to perform administrative oper
 {
   "admin": {
     "enabled": true,
-    "domain": "solver.example.com",
-    "chain_id": 1,
-    "admin_addresses": ["0xYourAdminWalletAddress"],
-    "withdrawals": {
-      "enabled": true
-    }
+    "domain": "localhost",
+    "admin_addresses": ["0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"]
   }
 }
 ```
 
+`admin_addresses` is a list. Any signer in this list is accepted for SIWE and EIP-712 admin auth checks.
+
 **Endpoints:**
 
 - **GET `/api/v1/admin/balances`** - Get solver balances by chain and token (protected, read-only)
-- **GET `/api/v1/admin/config`** - Get current solver configuration snapshot (public, read-only)
-- **GET `/api/v1/admin/nonce`** - Get a nonce for signing admin actions (protected)
+- **GET `/api/v1/admin/config`** - Get current solver configuration snapshot (protected, read-only)
+- **POST `/api/v1/admin/nonce`** (or GET alias) - Get a nonce for signing admin actions (protected)
   - Response:
     ```json
     {
@@ -832,13 +876,15 @@ The admin API enables authorized wallet addresses to perform administrative oper
 
 **Admin Action Flow:**
 
-1. Call `GET /api/v1/admin/nonce` to get a fresh nonce
+1. Call `POST /api/v1/admin/nonce` (or `GET` alias) to get a fresh nonce
 2. Call `GET /api/v1/admin/types` to get EIP-712 type definitions
 3. Construct the typed data with the nonce and a deadline
 4. Sign with your admin wallet (EIP-712)
 5. Submit the signed action to the appropriate endpoint
 
-**Note:** If API auth is enabled (`auth.enabled = true`), protected admin endpoints also require a JWT with `AdminAll` scope. Public endpoints remain unauthenticated.
+**Note:** If API auth is enabled (`auth_enabled = true` in seed overrides, mapped to runtime `auth.enabled`), protected admin endpoints also require a JWT with `AdminAll` scope. Use SIWE (`POST /api/v1/auth/siwe/nonce` + `POST /api/v1/auth/siwe/verify`) to obtain it.
+**Note:** `/api/v1/auth/siwe/nonce` is dedicated to SIWE login. `/api/v1/admin/nonce` is dedicated to EIP-712 admin action signing.
+**Note:** `POST /api/v1/auth/register` never issues `admin-all` and is disabled by default unless `AUTH_PUBLIC_REGISTER_ENABLED=true`.
 **Note:** Admin withdrawals require `admin.withdrawals.enabled = true` in config.
 
 #### Fees and Profitability
@@ -873,7 +919,7 @@ Fee config can be set in seed overrides and updated at runtime via `PUT /api/v1/
 curl -X POST http://localhost:3000/api/v1/quotes \
   -H "Content-Type: application/json" \
   -d '{
-    "user": "0x74...,
+    "user": "0x74...",
     "intent": {
       "intentType": "oif-swap",
       "inputs": [{
@@ -935,17 +981,24 @@ curl http://localhost:3000/api/v1/tokens
 # Health check
 curl http://localhost:3000/health
 
-# Admin: Get nonce for signing
-curl http://localhost:3000/api/v1/admin/nonce
+# Admin: Get JWT via SIWE (wallet login)
+# See docs/admin-authentication.md for a full SIWE example.
+
+# Admin: Get nonce for signing admin actions (protected)
+curl -X POST http://localhost:3000/api/v1/admin/nonce \
+  -H "Authorization: Bearer $TOKEN"
 
 # Admin: Get EIP-712 types for signing
-curl http://localhost:3000/api/v1/admin/types
+curl http://localhost:3000/api/v1/admin/types \
+  -H "Authorization: Bearer $TOKEN"
 
 # Admin: Get solver balances (protected)
-curl http://localhost:3000/api/v1/admin/balances
+curl http://localhost:3000/api/v1/admin/balances \
+  -H "Authorization: Bearer $TOKEN"
 
-# Admin: Get solver config snapshot (public)
-curl http://localhost:3000/api/v1/admin/config
+# Admin: Get solver config snapshot (protected)
+curl http://localhost:3000/api/v1/admin/config \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 The API server is enabled by default on port 3000 when the solver is running. You can disable it or change the port in the configuration file.
@@ -992,14 +1045,18 @@ The project includes a Rust-based CLI tool (`solver-demo`) for testing cross-cha
 ### Prerequisites
 
 - [Foundry](https://book.getfoundry.sh/getting-started/installation) (for Anvil and deployment)
-- Rust toolchain (stable, 1.86.0+)
-- Contract compilation tools (Foundry) (for deploying test contracts)
+- Rust toolchain (stable, 1.88.0+)
+- [OIF Contracts](https://github.com/openintentsframework/oif-contracts) compiled with `forge build` (the demo looks for artifacts in `oif-contracts/out/`)
 
 ### Quick Start
 
 > **Note:** The solver-demo tool uses local Anvil chains for testing. The main solver binary uses Redis-based configuration for production deployments. See below for demo-specific setup.
 
 ```bash
+# 0. Clone and build the OIF contracts (needed for local deployment)
+git clone https://github.com/openintentsframework/oif-contracts.git
+cd oif-contracts && forge build && cd ..
+
 # 1. Initialize configuration and load it
 cargo run -p solver-demo -- init new config/demo.toml
 cargo run -p solver-demo -- init load config/demo.toml --local
@@ -1027,7 +1084,7 @@ cargo run -p solver-demo -- quote sign .oif-demo/requests/get_quote.res.json
 cargo run -p solver-demo -- intent submit .oif-demo/requests/post_order.req.json
 
 # 6. Monitor token balances
-cargo run -p solver-demo -- token balance all
+cargo run -p solver-demo -- token balance
 ```
 
 > The demo tool requires the Permit2 contract bytecode file located at `crates/solver-demo/data/permit2_bytecode.hex`. This file contains the canonical Permit2 bytecode and is essential for deploying contracts to local Anvil chains. The bytecode is automatically used during the `env deploy` step.
@@ -1152,18 +1209,18 @@ cargo run -p solver-demo -- quote test <quote-requests-file>
 cargo run -p solver-demo -- token list [--chains <chain-ids>]
 
 # Mint tokens to an account
-cargo run -p solver-demo -- token mint <chain> <token> <amount> [--to <address>]
+cargo run -p solver-demo -- token mint --chain <chain> --token <token> --amount <amount> [--to <address>]
 
 # Approve token spending
-cargo run -p solver-demo -- token approve <chain> <token> <spender> <amount>
+cargo run -p solver-demo -- token approve --chain <chain> --token <token> --spender <spender> --amount <amount>
 
 # Check token balances
-cargo run -p solver-demo -- token balance <account> [--chains <chain-ids>]
-cargo run -p solver-demo -- token balance all  # All accounts
-cargo run -p solver-demo -- token balance user  # Just user account
+cargo run -p solver-demo -- token balance [--account <account>] [--chains <chain-ids>]
+cargo run -p solver-demo -- token balance                  # All accounts (default)
+cargo run -p solver-demo -- token balance --account user   # Just user account
 
 # Monitor balances with auto-refresh
-cargo run -p solver-demo -- token balance <account> --follow <seconds>
+cargo run -p solver-demo -- token balance [--account <account>] --follow <seconds>
 ```
 
 #### Account Management
