@@ -136,7 +136,7 @@ oif-solver/
 │   ├── solver-settlement/       # Settlement verification
 │   ├── solver-storage/          # State persistence
 │   └── solver-types/            # Shared types
-├── config/                      # Seed overrides and demo settings
+├── config/                      # Bootstrap config and demo settings
 └── scripts/                     # E2E testing and deployment scripts
 ```
 
@@ -227,8 +227,11 @@ redis-server
 export REDIS_URL=redis://localhost:6379
 export SOLVER_PRIVATE_KEY=your_64_hex_character_private_key
 
-# 3. First run: Seed configuration from preset + deployment config
-cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
+# 3. First run: Seed configuration (seedless mode)
+cargo run -- --bootstrap-config config/example.json
+
+# 3b. Optional: Seed with preset fallback values for known chains
+cargo run -- --seed testnet --bootstrap-config config/seed-overrides-testnet.json
 
 # 4. Subsequent runs: Configuration loads automatically from Redis
 cargo run --
@@ -259,7 +262,7 @@ docker run -it --rm \
   -p 3000:3000 \
   --env-file .env.docker \
   -v $(pwd)/config:/app/config:ro \
-  oif-solver --seed testnet --seed-overrides /app/config/seed-overrides-testnet.json
+  oif-solver --seed testnet --bootstrap-config /app/config/seed-overrides-testnet.json
 
 # Subsequent runs: Load from Redis (set SOLVER_ID in .env.docker)
 docker run -it --rm \
@@ -272,7 +275,7 @@ docker run -it --rm \
   -p 3000:3000 \
   --env-file .env.docker \
   -v $(pwd)/config:/app/config:ro \
-  oif-solver --seed testnet --seed-overrides /app/config/seed-overrides-testnet.json --force-seed
+  oif-solver --seed testnet --bootstrap-config /app/config/seed-overrides-testnet.json --force-seed
 ```
 
 ### Docker Networking
@@ -291,12 +294,12 @@ For Redis connectivity from within Docker:
 | `REDIS_URL` | Yes | Redis connection URL (for production, use managed services like AWS ElastiCache) |
 | `SOLVER_ID` | For loading | Solver ID to load config from Redis (after first seed) |
 | `RUST_LOG` | No | Log level (default: `info`) |
-| `SOLVER_PRIVATE_KEY` | Conditional | Required for local wallet if no inline `private_key` in seed overrides |
+| `SOLVER_PRIVATE_KEY` | Conditional | Required for local wallet if no inline `private_key` in bootstrap config |
 | `AWS_ACCESS_KEY_ID` | For KMS | AWS access key (if using KMS signer) |
 | `AWS_SECRET_ACCESS_KEY` | For KMS | AWS secret key (if using KMS signer) |
 | `AWS_REGION` | For KMS | AWS region (if using KMS signer, default: from config) |
 
-**Note:** `SOLVER_PRIVATE_KEY` is required when using the local wallet without an inline `private_key` in seed overrides. Not needed if using KMS or providing `private_key` directly in the JSON.
+**Note:** `SOLVER_PRIVATE_KEY` is required when using the local wallet without an inline `private_key` in bootstrap config. Not needed if using KMS or providing `private_key` directly in the JSON.
 
 **AWS Credentials:** When running in AWS (ECS, EKS, EC2), use IAM roles instead of explicit credentials. The SDK automatically uses the instance/task role credentials. Only set `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for local development or non-AWS environments.
 
@@ -304,7 +307,7 @@ For Redis connectivity from within Docker:
 
 | Mount | Purpose |
 |-------|---------|
-| `/app/config` | Seed overrides JSON file (read-only, only needed for seeding) |
+| `/app/config` | Bootstrap config JSON file (read-only, only needed for seeding) |
 
 See [docs/config-storage.md](docs/config-storage.md) for detailed documentation.
 
@@ -315,18 +318,27 @@ The solver uses Redis as the single source of truth for runtime configuration. C
 ### Seeding Configuration
 
 ```bash
-# Seed testnet configuration (using file)
-cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
+# Seedless bootstrap (all network + settlement values from JSON)
+cargo run -- --bootstrap-config config/example.json
 
-# Seed mainnet configuration (using file)
-cargo run -- --seed mainnet --seed-overrides config/seed-overrides-mainnet.json
+# Seed testnet configuration (uses testnet preset fallbacks where applicable)
+cargo run -- --seed testnet --bootstrap-config config/seed-overrides-testnet.json
+
+# Seed mainnet configuration (uses mainnet preset fallbacks where applicable)
+cargo run -- --seed mainnet --bootstrap-config config/seed-overrides-mainnet.json
+
+# Seed using a non-seeded networks JSON example
+cargo run -- --seed testnet --bootstrap-config config/non-seeded-networks-example.json
 
 # Or pass JSON directly (useful for deployment services)
-cargo run -- --seed testnet --seed-overrides '{"solver_id":"my-solver","solver_name":"My Testnet Solver","networks":[{"chain_id":11155420,"name":"optimism-sepolia","type":"parent","tokens":[{"symbol":"USDC","name":"USD Coin","address":"0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6","decimals":6}]},{"chain_id":84532,"name":"base-sepolia","type":"hub","tokens":[{"symbol":"USDC","name":"USD Coin","address":"0x73c83DAcc74bB8a704717AC09703b959E74b9705","decimals":6}]}]}'
+cargo run -- --seed testnet --bootstrap-config '{"solver_id":"my-solver","solver_name":"My Testnet Solver","networks":[{"chain_id":11155420,"name":"optimism-sepolia","type":"parent","tokens":[{"symbol":"USDC","name":"USD Coin","address":"0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6","decimals":6}]},{"chain_id":84532,"name":"base-sepolia","type":"hub","tokens":[{"symbol":"USDC","name":"USD Coin","address":"0x73c83DAcc74bB8a704717AC09703b959E74b9705","decimals":6}]}]}'
 
 # Force re-seed (overwrite existing)
-cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json --force-seed
+cargo run -- --seed testnet --bootstrap-config config/seed-overrides-testnet.json --force-seed
 ```
+
+Legacy alias support:
+- `--seed-overrides` is still accepted temporarily as a deprecated alias for `--bootstrap-config`.
 
 ### Environment Variables
 
@@ -336,11 +348,15 @@ cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json 
 | `SOLVER_PRIVATE_KEY` | Conditional | 64-character hex private key (without 0x prefix) |
 | `SOLVER_ID` | For loading | Solver ID to load from Redis (set after first seed) |
 
-`SOLVER_PRIVATE_KEY` is only required when using the local wallet without an inline `private_key` in seed overrides. Not needed if using KMS or providing `private_key` directly in the JSON.
+`SOLVER_PRIVATE_KEY` is only required when using the local wallet without an inline `private_key` in bootstrap config. Not needed if using KMS or providing `private_key` directly in the JSON.
 
-### Seed Overrides Format
+### Bootstrap Config Format
 
-Create a JSON file specifying which networks and tokens to support (these override/extend the seed preset defaults):
+Create a bootstrap JSON file specifying which networks to support. Networks can be:
+- Seeded networks (from the selected preset)
+- Non-seeded networks (new chain IDs) when full required fields are provided
+
+Token arrays may be empty at boot and can be populated later via admin APIs.
 
 ```json
 {
@@ -385,6 +401,29 @@ Create a JSON file specifying which networks and tokens to support (these overri
 Optional fee overrides can be set at the top level: `min_profitability_pct` (decimal string), `gas_buffer_bps`, `commission_bps`, and `rate_buffer_bps` (basis points).
 Optional network types are: `parent`, `hub`, and `new`.
 
+For non-seeded networks, the following fields are required per network:
+- `name`
+- `type`
+- `input_settler_address`
+- `output_settler_address`
+- `rpc_urls` (at least one URL)
+
+Compact addresses are optional:
+- `input_settler_compact_address`
+- `the_compact_address`
+- `allocator_address`
+
+### Settlement Selection (`settlement.type`)
+
+Settlement implementation is selected from bootstrap config JSON:
+- `hyperlane` (default when omitted)
+- `direct`
+
+When `settlement.type = "direct"`, `settlement.direct` is required.
+When `settlement.type = "hyperlane"` and you include non-seeded networks, provide `settlement.hyperlane` maps (`mailboxes`, `igp_addresses`, `oracles.input`, `oracles.output`) for all configured chains.
+
+See `config/non-seeded-networks-example.json` for a full non-seeded Hyperlane example (both chain IDs are non-seeded).
+
 **Note:** The `solver_id` field is optional but recommended. If provided, seeding becomes idempotent (re-running `--seed` with same config skips seeding). After seeding, set `SOLVER_ID` env var for subsequent runs.
 
 ### Supported Networks
@@ -401,6 +440,8 @@ Optional network types are: `parent`, `hub`, and `new`.
 | Optimism | 10 |
 | Base | 8453 |
 | Arbitrum | 42161 |
+
+These are preset-backed networks. You can also seed non-seeded chain IDs by providing the required non-seeded network fields and settlement overrides described above.
 
 ### Running Redis
 
@@ -451,7 +492,7 @@ cargo build --release --features kms
 
 #### Configuration
 
-Configure KMS in your seed overrides JSON:
+Configure KMS in your bootstrap config JSON:
 
 ```json
 {
@@ -484,7 +525,7 @@ export AWS_SECRET_ACCESS_KEY=your_secret_key
 export AWS_REGION=us-east-1
 
 # Seed and run
-cargo run --features kms -- --seed testnet --seed-overrides config/seed-overrides-kms.json
+cargo run --features kms -- --seed testnet --bootstrap-config config/seed-overrides-kms.json
 ```
 
 #### Finding Your KMS Wallet Address
@@ -767,7 +808,7 @@ sequenceDiagram
 
 The admin API enables authorized wallet addresses to perform administrative operations using EIP-712 signed messages. This provides secure, decentralized admin access without shared secrets.
 
-**Setup:** Configure admin addresses in your seed overrides or TOML config:
+**Setup:** Configure admin addresses in your bootstrap config or TOML config:
 
 ```json
 {
@@ -864,7 +905,7 @@ The rate buffer is applied during swap amount calculation:
 - ExactInput: `output_usd = market_output_usd * (1 - rate_buffer_bps/10_000)`
 - ExactOutput: `input_usd = market_input_usd / (1 - rate_buffer_bps/10_000)`
 
-Fee config can be set in seed overrides and updated at runtime via `PUT /api/v1/admin/fees`.
+Fee config can be set in bootstrap config and updated at runtime via `PUT /api/v1/admin/fees`.
 
 ### Example Usage
 
@@ -1230,7 +1271,7 @@ For production deployments, the solver uses Redis-based configuration:
 cargo build
 
 # Seed configuration (first run only)
-cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
+cargo run -- --seed testnet --bootstrap-config config/seed-overrides-testnet.json
 
 # Run the solver (loads config from Redis)
 export SOLVER_ID=your-solver-id  # Output from seeding step

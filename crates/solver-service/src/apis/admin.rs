@@ -1165,8 +1165,8 @@ mod tests {
 	use solver_types::{
 		NetworkType, NetworksConfig, OperatorAdminConfig, OperatorConfig, OperatorGasConfig,
 		OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig,
-		OperatorPricingConfig, OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSolverConfig,
-		OperatorWithdrawalsConfig,
+		OperatorPricingConfig, OperatorRpcEndpoint, OperatorSettlementConfig,
+		OperatorSettlementType, OperatorSolverConfig, OperatorWithdrawalsConfig,
 	};
 	use std::collections::HashMap;
 	use std::str::FromStr;
@@ -1430,7 +1430,8 @@ mod tests {
 			networks: HashMap::new(),
 			settlement: OperatorSettlementConfig {
 				settlement_poll_interval_seconds: 3,
-				hyperlane: OperatorHyperlaneConfig {
+				settlement_type: OperatorSettlementType::Hyperlane,
+				hyperlane: Some(OperatorHyperlaneConfig {
 					default_gas_limit: 0,
 					message_timeout_seconds: 0,
 					finalization_required: false,
@@ -1441,7 +1442,8 @@ mod tests {
 						output: HashMap::new(),
 					},
 					routes: HashMap::new(),
-				},
+				}),
+				direct: None,
 			},
 			gas: OperatorGasConfig {
 				resource_lock: OperatorGasFlowUnits::default(),
