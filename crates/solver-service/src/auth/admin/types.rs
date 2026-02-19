@@ -160,6 +160,10 @@ pub struct SignedAdminRequest<T> {
 pub struct AddTokenContents {
 	pub chain_id: u64,
 	pub symbol: String,
+	/// Optional display name metadata.
+	/// This is persisted in config but not included in the EIP-712 hash.
+	#[serde(default)]
+	pub name: Option<String>,
 	pub token_address: Address,
 	pub decimals: u8,
 	#[serde(with = "string_or_number")]
@@ -682,6 +686,7 @@ mod tests {
 		let contents = AddTokenContents {
 			chain_id: 10,
 			symbol: "USDC".to_string(),
+			name: None,
 			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
 			nonce: 1,
@@ -703,6 +708,7 @@ mod tests {
 		let contents = AddTokenContents {
 			chain_id: 10,
 			symbol: "USDC".to_string(),
+			name: None,
 			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
 			nonce: 1,
@@ -727,6 +733,7 @@ mod tests {
 		let contents = AddTokenContents {
 			chain_id: 10,
 			symbol: "USDC".to_string(),
+			name: None,
 			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
 			nonce: 1,
@@ -748,6 +755,7 @@ mod tests {
 			contents: AddTokenContents {
 				chain_id: 10,
 				symbol: "USDC".to_string(),
+				name: None,
 				token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85")
 					.unwrap(),
 				decimals: 6,
@@ -770,6 +778,7 @@ mod tests {
 		let contents = AddTokenContents {
 			chain_id: 10,
 			symbol: "USDC".to_string(),
+			name: None,
 			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
 			nonce: 42,
@@ -1053,6 +1062,7 @@ mod tests {
 		let contents = AddTokenContents {
 			chain_id: 10,
 			symbol: "USDC".to_string(),
+			name: None,
 			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
 			nonce: 1,
@@ -1117,6 +1127,7 @@ mod tests {
 			contents: AddTokenContents {
 				chain_id: 1,
 				symbol: "TEST".to_string(),
+				name: None,
 				token_address: Address::from_str("0x0000000000000000000000000000000000000001")
 					.unwrap(),
 				decimals: 18,
@@ -1174,6 +1185,7 @@ mod tests {
 		let contents1 = AddTokenContents {
 			chain_id: 10,
 			symbol: "USDC".to_string(),
+			name: None,
 			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
 			nonce: 1,
@@ -1183,6 +1195,7 @@ mod tests {
 		let contents2 = AddTokenContents {
 			chain_id: 10,
 			symbol: "USDT".to_string(), // Different symbol
+			name: None,
 			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
 			decimals: 6,
 			nonce: 1,

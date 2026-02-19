@@ -646,6 +646,8 @@ mod tests {
 
 		// Build config manually without TheCompact address (builder sets a default)
 		let network = NetworkConfig {
+			name: Some("test-network".to_string()),
+			network_type: solver_types::networks::NetworkType::New,
 			rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
 			input_settler_address: parse_address(TEST_SOLVER).unwrap(),
 			output_settler_address: parse_address(TEST_SOLVER).unwrap(),
