@@ -5,9 +5,9 @@
 
 use alloy_primitives::hex;
 use axum::{
-	Json,
 	extract::{Path, State},
 	http::StatusCode,
+	Json,
 };
 use serde::Serialize;
 use solver_config::Config;
@@ -200,8 +200,8 @@ mod tests {
 	use axum::extract::State;
 	use solver_core::engine::token_manager::TokenManager;
 	use solver_types::{
-		Address, NetworkConfig, NetworksConfig, TokenConfig,
 		networks::{NetworkType, RpcEndpoint},
+		Address, NetworkConfig, NetworksConfig, TokenConfig,
 	};
 	use std::collections::HashMap;
 
@@ -884,14 +884,12 @@ mod tests {
 
 		assert_eq!(tokens_response.networks.len(), 2);
 		assert!(tokens_response.networks.get("1").unwrap().tokens.is_empty());
-		assert!(
-			tokens_response
-				.networks
-				.get("137")
-				.unwrap()
-				.tokens
-				.is_empty()
-		);
+		assert!(tokens_response
+			.networks
+			.get("137")
+			.unwrap()
+			.tokens
+			.is_empty());
 	}
 
 	#[tokio::test]

@@ -19,11 +19,11 @@
 //! to their respective input and output settler contracts. This eliminates the need
 //! for per-transaction approvals and reduces gas costs during order execution.
 
-use alloy_primitives::{U256, hex};
+use alloy_primitives::{hex, U256};
 use solver_account::AccountService;
 use solver_delivery::DeliveryService;
 use solver_types::{
-	Address, NetworksConfig, TokenConfig, Transaction, TransactionHash, with_0x_prefix,
+	with_0x_prefix, Address, NetworksConfig, TokenConfig, Transaction, TransactionHash,
 };
 use std::collections::HashMap;
 use std::sync::Arc;

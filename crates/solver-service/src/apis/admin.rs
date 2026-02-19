@@ -11,10 +11,10 @@
 //! The signature must be an EIP-712 typed data signature from an authorized admin.
 
 use axum::{
-	Json,
 	body::Body,
 	extract::{FromRequest, State},
 	http::Request,
+	Json,
 };
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -32,8 +32,8 @@ pub use solver_types::admin_api::{
 	GasFlowResponse, NonceResponse, TokenBalance, WithdrawalResponse,
 };
 use solver_types::{
-	AdminConfig, OperatorAdminConfig, OperatorConfig, OperatorToken, format_token_amount,
-	with_0x_prefix,
+	format_token_amount, with_0x_prefix, AdminConfig, OperatorAdminConfig, OperatorConfig,
+	OperatorToken,
 };
 use std::sync::Arc;
 use tokio::sync::RwLock;

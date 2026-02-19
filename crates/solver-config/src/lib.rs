@@ -18,7 +18,7 @@ pub use builders::config::ConfigBuilder;
 use regex::Regex;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use solver_types::{NetworksConfig, networks::deserialize_networks};
+use solver_types::{networks::deserialize_networks, NetworksConfig};
 use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
@@ -1099,10 +1099,9 @@ network_ids = [1, 2, 999]  # Network 999 doesn't exist
 		let result = Config::from_str(config_str);
 		assert!(result.is_err());
 		let err = result.unwrap_err();
-		assert!(
-			err.to_string()
-				.contains("references network 999 which doesn't exist")
-		);
+		assert!(err
+			.to_string()
+			.contains("references network 999 which doesn't exist"));
 	}
 
 	#[test]
@@ -1164,9 +1163,8 @@ network_ids = [1, 2]
 		let result = Config::from_str(config_str);
 		assert!(result.is_err());
 		let err = result.unwrap_err();
-		assert!(
-			err.to_string()
-				.contains("Order standard 'eip9999' has no settlement implementations")
-		);
+		assert!(err
+			.to_string()
+			.contains("Order standard 'eip9999' has no settlement implementations"));
 	}
 }

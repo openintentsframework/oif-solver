@@ -31,12 +31,12 @@ use solver_config::{
 	StorageConfig, StrategyConfig,
 };
 use solver_types::{
+	networks::{NetworkType, RpcEndpoint},
 	AccountOverride, NetworkConfig, NetworkOverride, NetworksConfig, OperatorAccountConfig,
 	OperatorAdminConfig, OperatorConfig, OperatorGasConfig, OperatorGasFlowUnits,
 	OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig, OperatorPricingConfig,
 	OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSolverConfig, OperatorToken,
 	OperatorWithdrawalsConfig, SeedOverrides, TokenConfig,
-	networks::{NetworkType, RpcEndpoint},
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -2192,11 +2192,9 @@ mod tests {
 		assert!(insufficient.to_string().contains("At least 2 networks"));
 
 		let validation = MergeError::Validation("test error".to_string());
-		assert!(
-			validation
-				.to_string()
-				.contains("Configuration validation failed")
-		);
+		assert!(validation
+			.to_string()
+			.contains("Configuration validation failed"));
 		assert!(validation.to_string().contains("test error"));
 	}
 

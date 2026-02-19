@@ -5,7 +5,7 @@
 //! account, delivery, discovery, order implementations and
 //! settlement and execution strategies.
 
-use crate::engine::{SolverEngine, event_bus::EventBus};
+use crate::engine::{event_bus::EventBus, SolverEngine};
 use solver_account::{AccountError, AccountInterface, AccountService};
 use solver_config::Config;
 use solver_delivery::{DeliveryError, DeliveryInterface, DeliveryService};
