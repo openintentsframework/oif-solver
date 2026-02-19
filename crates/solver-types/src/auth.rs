@@ -111,13 +111,6 @@ pub struct AuthConfig {
 	/// Defaults to false for safer behavior.
 	#[serde(default = "default_public_register_enabled")]
 	pub public_register_enabled: bool,
-	/// Single client ID allowed to request privileged tokens via /auth/token.
-	#[serde(default = "default_token_client_id")]
-	pub token_client_id: String,
-	/// Secret associated with token_client_id.
-	/// If absent, /auth/token cannot issue privileged tokens.
-	#[serde(default)]
-	pub token_client_secret: Option<SecretString>,
 	/// Admin authentication configuration (optional)
 	/// If not present, admin authentication via wallet signatures is disabled
 	#[serde(default)]
@@ -126,10 +119,6 @@ pub struct AuthConfig {
 
 fn default_public_register_enabled() -> bool {
 	false
-}
-
-fn default_token_client_id() -> String {
-	"solver-admin".to_string()
 }
 
 /// Admin authentication configuration for wallet-based admin operations.
@@ -323,8 +312,6 @@ mod tests {
 
 		assert!(config.admin.is_some());
 		assert!(!config.public_register_enabled);
-		assert_eq!(config.token_client_id, "solver-admin");
-		assert!(config.token_client_secret.is_none());
 		let admin = config.admin.unwrap();
 		assert!(admin.enabled);
 		assert_eq!(admin.domain, "solver.example.com");
@@ -345,30 +332,21 @@ mod tests {
 
 		assert!(config.admin.is_none());
 		assert!(!config.public_register_enabled);
-		assert_eq!(config.token_client_id, "solver-admin");
-		assert!(config.token_client_secret.is_none());
 	}
 
 	#[test]
-	fn test_auth_config_with_client_credentials_fields() {
+	fn test_auth_config_with_public_register_enabled() {
 		let json = r#"{
 			"enabled": true,
 			"jwt_secret": "test-secret-at-least-32-characters-long",
 			"access_token_expiry_hours": 1,
 			"refresh_token_expiry_hours": 720,
 			"issuer": "oif-solver",
-			"public_register_enabled": true,
-			"token_client_id": "solver-admin",
-			"token_client_secret": "test-secret-value-at-least-32-chars"
+			"public_register_enabled": true
 		}"#;
 
 		let config: AuthConfig = serde_json::from_str(json).unwrap();
 
 		assert!(config.public_register_enabled);
-		assert_eq!(config.token_client_id, "solver-admin");
-		assert_eq!(
-			config.token_client_secret.unwrap().expose_secret(),
-			"test-secret-value-at-least-32-chars"
-		);
 	}
 }

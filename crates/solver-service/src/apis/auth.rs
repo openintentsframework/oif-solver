@@ -1,38 +1,20 @@
 //! Authentication endpoints for JWT token management.
 //!
-//! This module provides endpoints for client registration, client credentials
-//! token issuance, and token refresh operations for API authentication.
+//! This module provides endpoints for client registration, SIWE admin auth,
+//! and token refresh operations for API authentication.
 
 use crate::auth::{siwe::verify_siwe_signature, JwtService};
-use axum::{
-	extract::State,
-	http::{HeaderMap, StatusCode},
-	response::IntoResponse,
-	Json,
-};
-use base64::Engine;
-use dashmap::DashMap;
-use once_cell::sync::Lazy;
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha3::{Digest, Sha3_256};
 use solver_config::Config;
 use solver_storage::nonce_store::NonceStore;
 use solver_types::AuthScope;
-use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
-use subtle::ConstantTimeEq;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 const TOKEN_DEFAULT_TTL_SECONDS: u32 = 900;
 const TOKEN_MAX_TTL_SECONDS: u32 = 3600;
-const TOKEN_RATE_LIMIT_PER_MINUTE: usize = 30;
-const TOKEN_RATE_LIMIT_IP_PER_MINUTE: usize = 120;
-const RATE_LIMIT_WINDOW_SECONDS: i64 = 60;
-const MAX_RATE_LIMIT_KEYS: usize = 10_000;
-const MAX_FAILURE_EVENTS_PER_KEY: usize = 256;
-
-static FAILED_AUTH_BY_CLIENT: Lazy<DashMap<String, VecDeque<i64>>> = Lazy::new(DashMap::new);
-static FAILED_AUTH_BY_IP: Lazy<DashMap<String, VecDeque<i64>>> = Lazy::new(DashMap::new);
 
 /// Shared state for SIWE auth endpoints.
 #[derive(Clone)]
@@ -80,32 +62,6 @@ pub struct RegisterResponse {
 pub struct RefreshRequest {
 	/// The refresh token to exchange for new tokens
 	pub refresh_token: String,
-}
-
-/// Request payload for client credentials token issuance.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TokenRequest {
-	/// OAuth2 grant type (must be "client_credentials")
-	pub grant_type: Option<String>,
-	/// Optional fallback client id when Authorization: Basic is not provided
-	pub client_id: Option<String>,
-	/// Optional fallback client secret when Authorization: Basic is not provided
-	pub client_secret: Option<String>,
-	/// Requested scope (pilot accepts only "admin-all")
-	pub scope: Option<String>,
-}
-
-/// Response payload for client credentials token issuance.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TokenResponse {
-	/// The generated access token
-	pub access_token: String,
-	/// Token type (always "Bearer")
-	pub token_type: String,
-	/// Access token lifetime in seconds
-	pub expires_in: u32,
-	/// Granted scope
-	pub scope: String,
 }
 
 /// Request payload for SIWE nonce creation.
@@ -400,162 +356,6 @@ pub async fn refresh_token(
 	(StatusCode::OK, Json(response)).into_response()
 }
 
-/// Handles POST /api/v1/auth/token requests.
-///
-/// Issues an access token using client credentials. This endpoint is intended
-/// for privileged machine clients and issues access tokens only (no refresh token).
-pub async fn issue_client_token(
-	State(jwt_service): State<Option<Arc<JwtService>>>,
-	headers: HeaderMap,
-	Json(request): Json<TokenRequest>,
-) -> impl IntoResponse {
-	issue_client_token_with_peer(State(jwt_service), headers, None, Json(request)).await
-}
-
-/// Handles POST /api/v1/auth/token requests with optional peer address.
-///
-/// Used by HTTP handlers that can provide trusted socket peer metadata.
-pub async fn issue_client_token_with_peer(
-	State(jwt_service): State<Option<Arc<JwtService>>>,
-	headers: HeaderMap,
-	peer_addr: Option<SocketAddr>,
-	Json(request): Json<TokenRequest>,
-) -> impl IntoResponse {
-	let jwt_service = match jwt_service {
-		Some(service) => service,
-		None => {
-			return (
-				StatusCode::SERVICE_UNAVAILABLE,
-				Json(json!({
-					"error": "Authentication service is not configured"
-				})),
-			)
-				.into_response();
-		},
-	};
-
-	if !jwt_service.config().enabled {
-		return (
-			StatusCode::SERVICE_UNAVAILABLE,
-			Json(json!({
-				"error": "Authentication is disabled"
-			})),
-		)
-			.into_response();
-	}
-
-	let configured_secret = match jwt_service.config().token_client_secret.as_ref() {
-		Some(secret) => secret,
-		None => {
-			return (
-				StatusCode::SERVICE_UNAVAILABLE,
-				Json(json!({
-					"error": "Client credentials authentication is not configured"
-				})),
-			)
-				.into_response();
-		},
-	};
-
-	let grant_type = match request.grant_type.as_deref() {
-		Some(grant_type) => grant_type.trim(),
-		None => {
-			return oauth_error_response(
-				StatusCode::BAD_REQUEST,
-				"unsupported_grant_type",
-				"grant_type must be client_credentials",
-			);
-		},
-	};
-	if grant_type != "client_credentials" {
-		return oauth_error_response(
-			StatusCode::BAD_REQUEST,
-			"unsupported_grant_type",
-			"grant_type must be client_credentials",
-		);
-	}
-
-	let requested_scope = request.scope.as_deref().unwrap_or("admin-all").trim();
-	if requested_scope != "admin-all" {
-		return oauth_error_response(
-			StatusCode::BAD_REQUEST,
-			"invalid_scope",
-			"only admin-all scope is supported by /auth/token",
-		);
-	}
-
-	let (client_id, client_secret) = match extract_client_credentials(&headers, &request) {
-		Some(credentials) => credentials,
-		None => {
-			return oauth_error_response(
-				StatusCode::UNAUTHORIZED,
-				"invalid_client",
-				"missing client credentials",
-			);
-		},
-	};
-	let source_ip = extract_source_ip(&headers, peer_addr);
-	let now = chrono::Utc::now().timestamp();
-
-	if is_rate_limited(
-		&FAILED_AUTH_BY_CLIENT,
-		&client_id,
-		TOKEN_RATE_LIMIT_PER_MINUTE,
-		now,
-	) || is_rate_limited(
-		&FAILED_AUTH_BY_IP,
-		&source_ip,
-		TOKEN_RATE_LIMIT_IP_PER_MINUTE,
-		now,
-	) {
-		return oauth_error_response(
-			StatusCode::TOO_MANY_REQUESTS,
-			"too_many_requests",
-			"too many failed authentication attempts",
-		);
-	}
-
-	let valid_client_id = client_id == jwt_service.config().token_client_id;
-	let valid_secret =
-		configured_secret.with_exposed(|expected| secrets_match(&client_secret, expected));
-	if !valid_client_id || !valid_secret {
-		record_failed_attempt(&FAILED_AUTH_BY_CLIENT, &client_id, now);
-		record_failed_attempt(&FAILED_AUTH_BY_IP, &source_ip, now);
-		return oauth_error_response(
-			StatusCode::UNAUTHORIZED,
-			"invalid_client",
-			"invalid client credentials",
-		);
-	}
-
-	let expires_in = TOKEN_DEFAULT_TTL_SECONDS.min(TOKEN_MAX_TTL_SECONDS);
-	let access_token = match jwt_service.generate_access_token_with_ttl_seconds(
-		&client_id,
-		vec![AuthScope::AdminAll],
-		expires_in,
-	) {
-		Ok(token) => token,
-		Err(e) => {
-			tracing::error!("Failed to generate access token via /auth/token: {}", e);
-			return (
-				StatusCode::INTERNAL_SERVER_ERROR,
-				Json(json!({
-					"error": "Failed to generate access token"
-				})),
-			)
-				.into_response();
-		},
-	};
-
-	let response = TokenResponse {
-		access_token,
-		token_type: "Bearer".to_string(),
-		expires_in,
-		scope: "admin-all".to_string(),
-	};
-	(StatusCode::OK, Json(response)).into_response()
-}
-
 /// Handles POST /api/v1/auth/siwe/nonce requests.
 ///
 /// Generates a single-use SIWE nonce and returns a pre-built message to sign.
@@ -617,7 +417,7 @@ pub async fn issue_siwe_nonce(
 
 /// Handles POST /api/v1/auth/siwe/verify requests.
 ///
-/// Verifies a signed SIWE message and returns an admin JWT access token.
+/// Verifies a signed SIWE message and returns admin JWT access + refresh tokens.
 pub async fn verify_siwe_token(
 	State(state): State<SiweAuthState>,
 	Json(request): Json<SiweVerifyRequest>,
@@ -693,9 +493,10 @@ pub async fn verify_siwe_token(
 
 	let expires_in = TOKEN_DEFAULT_TTL_SECONDS.min(TOKEN_MAX_TTL_SECONDS);
 	let subject = siwe.address.to_string();
+	let scopes = vec![AuthScope::AdminAll];
 	let access_token = match jwt_service.generate_access_token_with_ttl_seconds(
 		&subject,
-		vec![AuthScope::AdminAll],
+		scopes.clone(),
 		expires_in,
 	) {
 		Ok(token) => token,
@@ -711,11 +512,39 @@ pub async fn verify_siwe_token(
 		},
 	};
 
-	let response = TokenResponse {
+	let refresh_token = match jwt_service
+		.generate_refresh_token(&subject, scopes.clone())
+		.await
+	{
+		Ok(token) => token,
+		Err(e) => {
+			tracing::error!("Failed to generate SIWE refresh token: {}", e);
+			return (
+				StatusCode::INTERNAL_SERVER_ERROR,
+				Json(json!({
+					"error": "Failed to generate refresh token"
+				})),
+			)
+				.into_response();
+		},
+	};
+
+	let access_token_expires_at = match jwt_service.validate_token(&access_token) {
+		Ok(claims) => claims.exp,
+		Err(_) => chrono::Utc::now().timestamp() + (expires_in as i64),
+	};
+
+	let refresh_token_expires_at = chrono::Utc::now().timestamp()
+		+ (jwt_service.config().refresh_token_expiry_hours as i64 * 3600);
+
+	let response = RegisterResponse {
 		access_token,
+		refresh_token,
+		client_id: subject,
+		access_token_expires_at,
+		refresh_token_expires_at,
+		scopes: scopes.iter().map(|s| s.to_string()).collect(),
 		token_type: "Bearer".to_string(),
-		expires_in,
-		scope: "admin-all".to_string(),
 	};
 
 	(StatusCode::OK, Json(response)).into_response()
@@ -906,159 +735,6 @@ Expiration Time: {}\n",
 	)
 }
 
-fn oauth_error_response(
-	status: StatusCode,
-	error: &str,
-	error_description: &str,
-) -> axum::response::Response {
-	(
-		status,
-		Json(json!({
-			"error": error,
-			"error_description": error_description
-		})),
-	)
-		.into_response()
-}
-
-fn extract_client_credentials(
-	headers: &HeaderMap,
-	request: &TokenRequest,
-) -> Option<(String, String)> {
-	if let Some(credentials) = extract_basic_credentials(headers) {
-		return Some(credentials);
-	}
-
-	let client_id = request.client_id.as_deref()?.trim();
-	let client_secret = request.client_secret.as_deref()?.trim();
-	if client_id.is_empty() || client_secret.is_empty() {
-		return None;
-	}
-
-	Some((client_id.to_string(), client_secret.to_string()))
-}
-
-fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
-	let header = headers.get("authorization")?.to_str().ok()?;
-	let (scheme, encoded) = header.split_once(' ')?;
-	if !scheme.eq_ignore_ascii_case("basic") {
-		return None;
-	}
-	let encoded = encoded.trim();
-	if encoded.is_empty() {
-		return None;
-	}
-	let decoded = base64::engine::general_purpose::STANDARD
-		.decode(encoded)
-		.ok()?;
-	let decoded = String::from_utf8(decoded).ok()?;
-	let (client_id, client_secret) = decoded.split_once(':')?;
-	if client_id.trim().is_empty() || client_secret.trim().is_empty() {
-		return None;
-	}
-	Some((client_id.to_string(), client_secret.to_string()))
-}
-
-fn extract_source_ip(headers: &HeaderMap, peer_addr: Option<SocketAddr>) -> String {
-	if let Some(ip) = headers
-		.get("x-forwarded-for")
-		.and_then(|v| v.to_str().ok())
-		.and_then(|v| v.split(',').next())
-		.map(str::trim)
-		.filter(|v| !v.is_empty())
-	{
-		return ip.to_string();
-	}
-
-	if let Some(ip) = headers
-		.get("x-real-ip")
-		.and_then(|v| v.to_str().ok())
-		.map(str::trim)
-		.filter(|v| !v.is_empty())
-	{
-		return ip.to_string();
-	}
-
-	if let Some(addr) = peer_addr {
-		return addr.ip().to_string();
-	}
-
-	"unknown".to_string()
-}
-
-fn is_rate_limited(
-	store: &DashMap<String, VecDeque<i64>>,
-	key: &str,
-	limit: usize,
-	now: i64,
-) -> bool {
-	let Some(mut attempts) = store.get_mut(key) else {
-		return false;
-	};
-
-	prune_old_attempts(&mut attempts, now);
-	let limited = attempts.len() >= limit;
-	let empty = attempts.is_empty();
-	drop(attempts);
-	if empty {
-		store.remove(key);
-	}
-
-	limited
-}
-
-fn record_failed_attempt(store: &DashMap<String, VecDeque<i64>>, key: &str, now: i64) {
-	if !store.contains_key(key) && store.len() >= MAX_RATE_LIMIT_KEYS {
-		cleanup_stale_rate_limit_keys(store, now);
-	}
-	if !store.contains_key(key) && store.len() >= MAX_RATE_LIMIT_KEYS {
-		tracing::warn!("Rate limit key capacity reached; skipping failure tracking");
-		return;
-	}
-
-	let mut attempts = store.entry(key.to_string()).or_default();
-	prune_old_attempts(&mut attempts, now);
-	attempts.push_back(now);
-	while attempts.len() > MAX_FAILURE_EVENTS_PER_KEY {
-		attempts.pop_front();
-	}
-}
-
-fn prune_old_attempts(attempts: &mut VecDeque<i64>, now: i64) {
-	while let Some(oldest) = attempts.front().copied() {
-		if now - oldest >= RATE_LIMIT_WINDOW_SECONDS {
-			attempts.pop_front();
-		} else {
-			break;
-		}
-	}
-}
-
-fn secrets_match(provided: &str, expected: &str) -> bool {
-	let provided_hash = Sha3_256::digest(provided.as_bytes());
-	let expected_hash = Sha3_256::digest(expected.as_bytes());
-	provided_hash
-		.as_slice()
-		.ct_eq(expected_hash.as_slice())
-		.into()
-}
-
-fn cleanup_stale_rate_limit_keys(store: &DashMap<String, VecDeque<i64>>, now: i64) {
-	let keys_to_remove: Vec<String> = store
-		.iter()
-		.filter_map(|entry| {
-			let latest = entry.value().back().copied();
-			match latest {
-				Some(ts) if now - ts < RATE_LIMIT_WINDOW_SECONDS => None,
-				_ => Some(entry.key().clone()),
-			}
-		})
-		.collect();
-	for key in keys_to_remove {
-		store.remove(&key);
-	}
-}
-
 /// Parse string scopes into AuthScope enums
 fn parse_scopes(scopes: Option<Vec<String>>) -> Result<Vec<AuthScope>, String> {
 	// If no scopes provided, default to basic read permissions
@@ -1083,10 +759,13 @@ fn parse_public_scopes(scopes: Option<Vec<String>>) -> Result<Vec<AuthScope>, St
 mod tests {
 	use super::*;
 	use crate::auth::JwtService;
-	use axum::http::{HeaderMap, HeaderValue, StatusCode};
+	use alloy_primitives::B256;
+	use alloy_signer::SignerSync;
+	use alloy_signer_local::PrivateKeySigner;
+	use axum::http::StatusCode;
 	use serde_json::Value;
-	use serial_test::serial;
 	use solver_config::{ApiConfig, ApiImplementations, ConfigBuilder};
+	use solver_storage::{nonce_store::create_nonce_store, StoreConfig};
 	use solver_types::{AdminConfig, AuthConfig, SecretString};
 	use std::sync::Arc;
 	use tokio::sync::RwLock;
@@ -1095,8 +774,6 @@ mod tests {
 	fn create_test_jwt_service_with(
 		auth_enabled: bool,
 		public_register_enabled: bool,
-		token_client_id: &str,
-		token_client_secret: Option<&str>,
 	) -> Arc<JwtService> {
 		let config = AuthConfig {
 			enabled: auth_enabled,
@@ -1105,19 +782,77 @@ mod tests {
 			refresh_token_expiry_hours: 720,
 			issuer: "test-issuer".to_string(),
 			public_register_enabled,
-			token_client_id: token_client_id.to_string(),
-			token_client_secret: token_client_secret.map(SecretString::from),
 			admin: None,
 		};
 		Arc::new(JwtService::new(config).unwrap())
 	}
 
 	fn create_test_jwt_service() -> Arc<JwtService> {
-		create_test_jwt_service_with(
-			true,
-			true,
-			"solver-admin",
-			Some("test-client-secret-at-least-32-chars"),
+		create_test_jwt_service_with(true, true)
+	}
+
+	fn create_test_siwe_signer() -> PrivateKeySigner {
+		PrivateKeySigner::from_bytes(&B256::from([0x42u8; 32])).expect("valid test private key")
+	}
+
+	fn create_test_siwe_state(
+		jwt_service: Option<Arc<JwtService>>,
+		admin_enabled: bool,
+		admin_addresses: Vec<alloy_primitives::Address>,
+		siwe_nonce_store: Option<Arc<NonceStore>>,
+	) -> SiweAuthState {
+		let auth_config = AuthConfig {
+			enabled: true,
+			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars-long"),
+			access_token_expiry_hours: 1,
+			refresh_token_expiry_hours: 720,
+			issuer: "test-issuer".to_string(),
+			public_register_enabled: false,
+			admin: Some(AdminConfig {
+				enabled: admin_enabled,
+				domain: "localhost".to_string(),
+				chain_id: Some(1),
+				nonce_ttl_seconds: 300,
+				admin_addresses,
+			}),
+		};
+
+		let mut config = ConfigBuilder::new().build();
+		config.api = Some(ApiConfig {
+			enabled: true,
+			host: "127.0.0.1".to_string(),
+			port: 3000,
+			timeout_seconds: 30,
+			max_request_size: 1024 * 1024,
+			implementations: ApiImplementations::default(),
+			rate_limiting: None,
+			cors: None,
+			auth: Some(auth_config),
+			quote: None,
+		});
+
+		SiweAuthState {
+			jwt_service,
+			config: Arc::new(RwLock::new(config)),
+			siwe_nonce_store,
+		}
+	}
+
+	async fn create_signed_siwe_verify_request(
+		nonce_store: &Arc<NonceStore>,
+		signer: &PrivateKeySigner,
+	) -> (SiweVerifyRequest, u64) {
+		let nonce_id = nonce_store.generate().await.unwrap();
+		let nonce = super::format_siwe_nonce(nonce_id);
+		let message = super::build_siwe_message("localhost", signer.address(), 1, &nonce, 300);
+		let signature = signer.sign_message_sync(message.as_bytes()).unwrap();
+
+		(
+			SiweVerifyRequest {
+				message,
+				signature: format!("0x{}", hex::encode(signature.as_bytes())),
+			},
+			nonce_id,
 		)
 	}
 
@@ -1366,12 +1101,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_register_client_blocked_when_public_register_disabled() {
-		let jwt_service = create_test_jwt_service_with(
-			true,
-			false,
-			"admin-solver-test",
-			Some("test-client-secret-at-least-32-chars"),
-		);
+		let jwt_service = create_test_jwt_service_with(true, false);
 		let request = RegisterRequest {
 			client_id: "test-client".to_string(),
 			client_name: None,
@@ -1390,12 +1120,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_register_client_auth_disabled() {
-		let jwt_service = create_test_jwt_service_with(
-			false,
-			true,
-			"admin-solver-test",
-			Some("test-client-secret-at-least-32-chars"),
-		);
+		let jwt_service = create_test_jwt_service_with(false, true);
 		let request = RegisterRequest {
 			client_id: "test-client".to_string(),
 			client_name: None,
@@ -1501,12 +1226,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_refresh_token_auth_disabled() {
-		let jwt_service = create_test_jwt_service_with(
-			false,
-			true,
-			"admin-solver-test",
-			Some("test-client-secret-at-least-32-chars"),
-		);
+		let jwt_service = create_test_jwt_service_with(false, true);
 		let request = RefreshRequest {
 			refresh_token: "some-token".to_string(),
 		};
@@ -1538,229 +1258,338 @@ mod tests {
 	}
 
 	#[tokio::test]
-	#[serial]
-	async fn test_issue_client_token_success_with_basic_auth() {
-		FAILED_AUTH_BY_CLIENT.clear();
-		FAILED_AUTH_BY_IP.clear();
+	async fn test_verify_siwe_token_returns_register_response_with_refresh_token() {
+		let jwt_service = create_test_jwt_service_with(true, false);
+		let signer = create_test_siwe_signer();
+		let nonce_store =
+			Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
+		let (request, nonce_id) = create_signed_siwe_verify_request(&nonce_store, &signer).await;
+		let signer_address = signer.address();
 
-		let jwt_service = create_test_jwt_service_with(
+		let state = create_test_siwe_state(
+			Some(jwt_service.clone()),
 			true,
-			false,
-			"solver-admin",
-			Some("test-client-secret-at-least-32-chars"),
+			vec![signer_address],
+			Some(nonce_store.clone()),
 		);
 
-		let mut headers = HeaderMap::new();
-		let basic = base64::engine::general_purpose::STANDARD
-			.encode("solver-admin:test-client-secret-at-least-32-chars");
-		headers.insert(
-			"authorization",
-			HeaderValue::from_str(&format!("Basic {basic}")).unwrap(),
-		);
-		headers.insert("x-real-ip", HeaderValue::from_static("127.0.0.1"));
-
-		let request = TokenRequest {
-			grant_type: Some("client_credentials".to_string()),
-			..Default::default()
-		};
-
-		let response = issue_client_token(
-			axum::extract::State(Some(jwt_service.clone())),
-			headers,
-			Json(request),
-		)
-		.await;
-
+		let response = verify_siwe_token(State(state), Json(request)).await;
 		let response_obj = response.into_response();
 		let (parts, body) = response_obj.into_parts();
 		assert_eq!(parts.status, StatusCode::OK);
 
 		let json_body = extract_json_from_body(body).await;
-		let token_response: TokenResponse = serde_json::from_value(json_body).unwrap();
-		assert_eq!(token_response.token_type, "Bearer");
-		assert_eq!(token_response.scope, "admin-all");
-		assert_eq!(token_response.expires_in, TOKEN_DEFAULT_TTL_SECONDS);
+		let register_response: RegisterResponse = serde_json::from_value(json_body).unwrap();
+		assert_eq!(register_response.client_id, signer_address.to_string());
+		assert_eq!(register_response.token_type, "Bearer");
+		assert_eq!(register_response.scopes, vec!["admin-all"]);
+		assert!(!register_response.access_token.is_empty());
+		assert!(!register_response.refresh_token.is_empty());
 
-		let claims = jwt_service
-			.validate_token(&token_response.access_token)
+		let access_claims = jwt_service
+			.validate_token(&register_response.access_token)
 			.unwrap();
-		assert_eq!(claims.sub, "solver-admin");
-		assert_eq!(claims.scope, vec![AuthScope::AdminAll]);
+		assert_eq!(access_claims.sub, signer_address.to_string());
+		assert_eq!(access_claims.scope, vec![AuthScope::AdminAll]);
+
+		let refresh_claims = jwt_service
+			.validate_token(&register_response.refresh_token)
+			.unwrap();
+		assert_eq!(refresh_claims.sub, signer_address.to_string());
+		assert_eq!(refresh_claims.scope, vec![AuthScope::AdminAll]);
+		assert!(refresh_claims.nonce.is_some());
+
+		let reuse = nonce_store.consume(nonce_id).await;
+		assert!(matches!(
+			reuse,
+			Err(solver_storage::nonce_store::NonceError::NotFound)
+		));
 	}
 
 	#[tokio::test]
-	#[serial]
-	async fn test_issue_client_token_success_with_body_credentials() {
-		FAILED_AUTH_BY_CLIENT.clear();
-		FAILED_AUTH_BY_IP.clear();
+	async fn test_verify_siwe_token_refresh_token_can_be_used_with_auth_refresh() {
+		let jwt_service = create_test_jwt_service_with(true, false);
+		let signer = create_test_siwe_signer();
+		let nonce_store =
+			Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
+		let (request, _nonce_id) = create_signed_siwe_verify_request(&nonce_store, &signer).await;
+		let signer_address = signer.address();
 
-		let jwt_service = create_test_jwt_service_with(
+		let state = create_test_siwe_state(
+			Some(jwt_service.clone()),
 			true,
-			false,
-			"solver-admin",
-			Some("test-client-secret-at-least-32-chars"),
+			vec![signer_address],
+			Some(nonce_store),
 		);
-		let headers = HeaderMap::new();
-		let request = TokenRequest {
-			grant_type: Some("client_credentials".to_string()),
-			client_id: Some("solver-admin".to_string()),
-			client_secret: Some("test-client-secret-at-least-32-chars".to_string()),
-			scope: Some("admin-all".to_string()),
-		};
 
-		let response = issue_client_token(
-			axum::extract::State(Some(jwt_service)),
-			headers,
-			Json(request),
+		let verify_response = verify_siwe_token(State(state), Json(request)).await;
+		let verify_response_obj = verify_response.into_response();
+		let (verify_parts, verify_body) = verify_response_obj.into_parts();
+		assert_eq!(verify_parts.status, StatusCode::OK);
+
+		let verify_json = extract_json_from_body(verify_body).await;
+		let siwe_tokens: RegisterResponse = serde_json::from_value(verify_json).unwrap();
+		let original_refresh_token = siwe_tokens.refresh_token.clone();
+		assert_eq!(siwe_tokens.scopes, vec!["admin-all"]);
+
+		let refresh_response = refresh_token(
+			State(Some(jwt_service.clone())),
+			Json(RefreshRequest {
+				refresh_token: original_refresh_token.clone(),
+			}),
 		)
 		.await;
 
-		let response_obj = response.into_response();
-		let (parts, _) = response_obj.into_parts();
-		assert_eq!(parts.status, StatusCode::OK);
+		let refresh_response_obj = refresh_response.into_response();
+		let (refresh_parts, refresh_body) = refresh_response_obj.into_parts();
+		assert_eq!(refresh_parts.status, StatusCode::OK);
+
+		let refresh_json = extract_json_from_body(refresh_body).await;
+		let refreshed_tokens: RegisterResponse = serde_json::from_value(refresh_json).unwrap();
+		assert_eq!(refreshed_tokens.client_id, signer_address.to_string());
+		assert_eq!(refreshed_tokens.scopes, vec!["admin-all"]);
+		assert_ne!(refreshed_tokens.refresh_token, original_refresh_token);
+
+		let refreshed_access_claims = jwt_service
+			.validate_token(&refreshed_tokens.access_token)
+			.unwrap();
+		assert_eq!(refreshed_access_claims.sub, signer_address.to_string());
+		assert_eq!(refreshed_access_claims.scope, vec![AuthScope::AdminAll]);
+
+		let refreshed_refresh_claims = jwt_service
+			.validate_token(&refreshed_tokens.refresh_token)
+			.unwrap();
+		assert_eq!(refreshed_refresh_claims.sub, signer_address.to_string());
+		assert_eq!(refreshed_refresh_claims.scope, vec![AuthScope::AdminAll]);
 	}
 
 	#[tokio::test]
-	#[serial]
-	async fn test_issue_client_token_invalid_secret() {
-		FAILED_AUTH_BY_CLIENT.clear();
-		FAILED_AUTH_BY_IP.clear();
-
-		let jwt_service = create_test_jwt_service_with(
-			true,
-			false,
-			"solver-admin",
-			Some("test-client-secret-at-least-32-chars"),
-		);
-		let headers = HeaderMap::new();
-		let request = TokenRequest {
-			grant_type: Some("client_credentials".to_string()),
-			client_id: Some("solver-admin".to_string()),
-			client_secret: Some("wrong-secret".to_string()),
-			scope: Some("admin-all".to_string()),
+	async fn test_verify_siwe_token_auth_disabled() {
+		let jwt_service = create_test_jwt_service_with(false, false);
+		let nonce_store =
+			Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
+		let state = create_test_siwe_state(Some(jwt_service), true, vec![], Some(nonce_store));
+		let request = SiweVerifyRequest {
+			message: String::new(),
+			signature: String::new(),
 		};
 
-		let response = issue_client_token(
-			axum::extract::State(Some(jwt_service)),
-			headers,
-			Json(request),
-		)
-		.await;
-		let response_obj = response.into_response();
-		let (parts, body) = response_obj.into_parts();
-		assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
-
-		let json_body = extract_json_from_body(body).await;
-		assert_eq!(json_body["error"], "invalid_client");
-	}
-
-	#[tokio::test]
-	#[serial]
-	async fn test_issue_client_token_invalid_scope() {
-		FAILED_AUTH_BY_CLIENT.clear();
-		FAILED_AUTH_BY_IP.clear();
-
-		let jwt_service = create_test_jwt_service_with(
-			true,
-			false,
-			"solver-admin",
-			Some("test-client-secret-at-least-32-chars"),
-		);
-		let headers = HeaderMap::new();
-		let request = TokenRequest {
-			grant_type: Some("client_credentials".to_string()),
-			client_id: Some("solver-admin".to_string()),
-			client_secret: Some("test-client-secret-at-least-32-chars".to_string()),
-			scope: Some("read-orders".to_string()),
-		};
-
-		let response = issue_client_token(
-			axum::extract::State(Some(jwt_service)),
-			headers,
-			Json(request),
-		)
-		.await;
-		let response_obj = response.into_response();
-		let (parts, body) = response_obj.into_parts();
-		assert_eq!(parts.status, StatusCode::BAD_REQUEST);
-
-		let json_body = extract_json_from_body(body).await;
-		assert_eq!(json_body["error"], "invalid_scope");
-	}
-
-	#[tokio::test]
-	#[serial]
-	async fn test_issue_client_token_rate_limited_after_many_failures() {
-		FAILED_AUTH_BY_CLIENT.clear();
-		FAILED_AUTH_BY_IP.clear();
-
-		let jwt_service = create_test_jwt_service_with(
-			true,
-			false,
-			"solver-admin-rate-limit",
-			Some("test-client-secret-at-least-32-chars"),
-		);
-		let headers = HeaderMap::new();
-		let bad_request = TokenRequest {
-			grant_type: Some("client_credentials".to_string()),
-			client_id: Some("solver-admin-rate-limit".to_string()),
-			client_secret: Some("wrong-secret".to_string()),
-			scope: Some("admin-all".to_string()),
-		};
-
-		for _ in 0..TOKEN_RATE_LIMIT_PER_MINUTE {
-			let response = issue_client_token(
-				axum::extract::State(Some(jwt_service.clone())),
-				headers.clone(),
-				Json(bad_request.clone()),
-			)
-			.await;
-			let status = response.into_response().status();
-			assert_eq!(status, StatusCode::UNAUTHORIZED);
-		}
-
-		let response = issue_client_token(
-			axum::extract::State(Some(jwt_service)),
-			headers,
-			Json(bad_request),
-		)
-		.await;
-		let response_obj = response.into_response();
-		assert_eq!(response_obj.status(), StatusCode::TOO_MANY_REQUESTS);
-	}
-
-	#[tokio::test]
-	#[serial]
-	async fn test_issue_client_token_auth_disabled() {
-		FAILED_AUTH_BY_CLIENT.clear();
-		FAILED_AUTH_BY_IP.clear();
-
-		let jwt_service = create_test_jwt_service_with(
-			false,
-			false,
-			"solver-admin",
-			Some("test-client-secret-at-least-32-chars"),
-		);
-		let headers = HeaderMap::new();
-		let request = TokenRequest {
-			grant_type: Some("client_credentials".to_string()),
-			client_id: Some("solver-admin".to_string()),
-			client_secret: Some("test-client-secret-at-least-32-chars".to_string()),
-			scope: Some("admin-all".to_string()),
-		};
-
-		let response = issue_client_token(
-			axum::extract::State(Some(jwt_service)),
-			headers,
-			Json(request),
-		)
-		.await;
+		let response = verify_siwe_token(State(state), Json(request)).await;
 		let response_obj = response.into_response();
 		let (parts, body) = response_obj.into_parts();
 		assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
 
 		let json_body = extract_json_from_body(body).await;
 		assert_eq!(json_body["error"], "Authentication is disabled");
+	}
+
+	#[tokio::test]
+	async fn test_issue_siwe_nonce_success() {
+		let jwt_service = create_test_jwt_service_with(true, false);
+		let signer = create_test_siwe_signer();
+		let nonce_store =
+			Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
+		let state = create_test_siwe_state(
+			Some(jwt_service),
+			true,
+			vec![signer.address()],
+			Some(nonce_store.clone()),
+		);
+
+		let response = issue_siwe_nonce(
+			State(state),
+			Json(SiweNonceRequest {
+				address: signer.address().to_string(),
+			}),
+		)
+		.await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::OK);
+
+		let json_body = extract_json_from_body(body).await;
+		let nonce_response: SiweNonceResponse = serde_json::from_value(json_body).unwrap();
+		assert_eq!(nonce_response.domain, "localhost");
+		assert_eq!(nonce_response.chain_id, 1);
+		assert_eq!(nonce_response.expires_in, 300);
+		assert!(nonce_response
+			.message
+			.contains(&format!("Nonce: {}", nonce_response.nonce)));
+
+		let nonce_id = super::parse_siwe_nonce(&nonce_response.nonce).unwrap();
+		assert!(nonce_store.exists(nonce_id).await.unwrap());
+	}
+
+	#[tokio::test]
+	async fn test_issue_siwe_nonce_invalid_address() {
+		let jwt_service = create_test_jwt_service_with(true, false);
+		let nonce_store =
+			Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
+		let state = create_test_siwe_state(Some(jwt_service), true, vec![], Some(nonce_store));
+
+		let response = issue_siwe_nonce(
+			State(state),
+			Json(SiweNonceRequest {
+				address: "not-an-address".to_string(),
+			}),
+		)
+		.await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+		let json_body = extract_json_from_body(body).await;
+		assert!(json_body["error"]
+			.as_str()
+			.unwrap()
+			.contains("Invalid Ethereum address"));
+	}
+
+	#[tokio::test]
+	async fn test_issue_siwe_nonce_missing_nonce_store() {
+		let jwt_service = create_test_jwt_service_with(true, false);
+		let signer = create_test_siwe_signer();
+		let state = create_test_siwe_state(Some(jwt_service), true, vec![], None);
+
+		let response = issue_siwe_nonce(
+			State(state),
+			Json(SiweNonceRequest {
+				address: signer.address().to_string(),
+			}),
+		)
+		.await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "SIWE authentication is not configured");
+	}
+
+	#[tokio::test]
+	async fn test_issue_siwe_nonce_admin_disabled() {
+		let jwt_service = create_test_jwt_service_with(true, false);
+		let signer = create_test_siwe_signer();
+		let nonce_store =
+			Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
+		let state = create_test_siwe_state(Some(jwt_service), false, vec![], Some(nonce_store));
+
+		let response = issue_siwe_nonce(
+			State(state),
+			Json(SiweNonceRequest {
+				address: signer.address().to_string(),
+			}),
+		)
+		.await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "SIWE admin authentication is disabled");
+	}
+
+	#[tokio::test]
+	async fn test_verify_siwe_token_missing_nonce_store() {
+		let jwt_service = create_test_jwt_service_with(true, false);
+		let state = create_test_siwe_state(Some(jwt_service), true, vec![], None);
+
+		let response = verify_siwe_token(
+			State(state),
+			Json(SiweVerifyRequest {
+				message: String::new(),
+				signature: String::new(),
+			}),
+		)
+		.await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "SIWE authentication is not configured");
+	}
+
+	#[tokio::test]
+	async fn test_verify_siwe_token_rejects_non_allowlisted_signer() {
+		let jwt_service = create_test_jwt_service_with(true, false);
+		let signer = create_test_siwe_signer();
+		let nonce_store =
+			Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
+		let (request, _nonce_id) = create_signed_siwe_verify_request(&nonce_store, &signer).await;
+
+		let state = create_test_siwe_state(
+			Some(jwt_service),
+			true,
+			vec![], // signer intentionally not allowlisted
+			Some(nonce_store),
+		);
+
+		let response = verify_siwe_token(State(state), Json(request)).await;
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::FORBIDDEN);
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "SIWE signer is not an authorized admin");
+	}
+
+	#[tokio::test]
+	async fn test_verify_siwe_token_invalid_nonce_format() {
+		let jwt_service = create_test_jwt_service_with(true, false);
+		let signer = create_test_siwe_signer();
+		let nonce_store =
+			Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
+		let bad_nonce = "abc12345";
+		let message = super::build_siwe_message("localhost", signer.address(), 1, bad_nonce, 300);
+		let signature = signer.sign_message_sync(message.as_bytes()).unwrap();
+		let request = SiweVerifyRequest {
+			message,
+			signature: format!("0x{}", hex::encode(signature.as_bytes())),
+		};
+
+		let state = create_test_siwe_state(
+			Some(jwt_service),
+			true,
+			vec![signer.address()],
+			Some(nonce_store),
+		);
+
+		let response = verify_siwe_token(State(state), Json(request)).await;
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "SIWE nonce format is invalid");
+	}
+
+	#[tokio::test]
+	async fn test_verify_siwe_token_nonce_not_found() {
+		let jwt_service = create_test_jwt_service_with(true, false);
+		let signer = create_test_siwe_signer();
+		let nonce_store =
+			Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
+		let nonce = super::format_siwe_nonce(999_999_999);
+		let message = super::build_siwe_message("localhost", signer.address(), 1, &nonce, 300);
+		let signature = signer.sign_message_sync(message.as_bytes()).unwrap();
+		let request = SiweVerifyRequest {
+			message,
+			signature: format!("0x{}", hex::encode(signature.as_bytes())),
+		};
+
+		let state = create_test_siwe_state(
+			Some(jwt_service),
+			true,
+			vec![signer.address()],
+			Some(nonce_store),
+		);
+
+		let response = verify_siwe_token(State(state), Json(request)).await;
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(json_body["error"], "Invalid or expired SIWE nonce");
 	}
 
 	// Tests for request/response serialization
@@ -1813,23 +1642,6 @@ mod tests {
 	}
 
 	#[test]
-	fn test_token_response_serialization() {
-		let response = TokenResponse {
-			access_token: "access-token".to_string(),
-			token_type: "Bearer".to_string(),
-			expires_in: 900,
-			scope: "admin-all".to_string(),
-		};
-
-		let json = serde_json::to_string(&response).unwrap();
-		let deserialized: TokenResponse = serde_json::from_str(&json).unwrap();
-
-		assert_eq!(deserialized.token_type, "Bearer");
-		assert_eq!(deserialized.scope, "admin-all");
-		assert_eq!(deserialized.expires_in, 900);
-	}
-
-	#[test]
 	fn test_format_and_parse_siwe_nonce_roundtrip() {
 		let nonce = super::format_siwe_nonce(12345);
 		assert_eq!(nonce, "00000000000000012345");
@@ -1877,8 +1689,6 @@ mod tests {
 			refresh_token_expiry_hours: 720,
 			issuer: "test-issuer".to_string(),
 			public_register_enabled: false,
-			token_client_id: "solver-admin".to_string(),
-			token_client_secret: Some(SecretString::from("client-secret-at-least-32-chars")),
 			admin: Some(AdminConfig {
 				enabled: true,
 				domain: "localhost".to_string(),
@@ -1910,284 +1720,5 @@ mod tests {
 		assert_eq!(runtime.nonce_ttl_seconds, 300);
 		assert_eq!(runtime.chain_id, 1); // fallback when chain_id is omitted
 		assert_eq!(runtime.admin_addresses, vec![admin_1, admin_2]);
-	}
-
-	// Tests for helper functions
-	#[test]
-	fn test_extract_source_ip_from_x_forwarded_for() {
-		let mut headers = HeaderMap::new();
-		headers.insert(
-			"x-forwarded-for",
-			HeaderValue::from_static("192.168.1.1, 10.0.0.1"),
-		);
-		assert_eq!(super::extract_source_ip(&headers, None), "192.168.1.1");
-	}
-
-	#[test]
-	fn test_extract_source_ip_from_x_real_ip() {
-		let mut headers = HeaderMap::new();
-		headers.insert("x-real-ip", HeaderValue::from_static("10.0.0.5"));
-		assert_eq!(super::extract_source_ip(&headers, None), "10.0.0.5");
-	}
-
-	#[test]
-	fn test_extract_source_ip_unknown_when_missing() {
-		let headers = HeaderMap::new();
-		assert_eq!(super::extract_source_ip(&headers, None), "unknown");
-	}
-
-	#[test]
-	fn test_extract_source_ip_falls_back_to_peer_addr() {
-		let headers = HeaderMap::new();
-		let peer_addr: std::net::SocketAddr = "203.0.113.11:3030".parse().unwrap();
-		assert_eq!(
-			super::extract_source_ip(&headers, Some(peer_addr)),
-			"203.0.113.11"
-		);
-	}
-
-	#[test]
-	fn test_extract_basic_credentials_valid() {
-		let mut headers = HeaderMap::new();
-		let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
-		headers.insert(
-			"authorization",
-			HeaderValue::from_str(&format!("Basic {encoded}")).unwrap(),
-		);
-		let result = super::extract_basic_credentials(&headers);
-		assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
-	}
-
-	#[test]
-	fn test_extract_basic_credentials_case_insensitive_scheme() {
-		let mut headers = HeaderMap::new();
-		let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
-		headers.insert(
-			"authorization",
-			HeaderValue::from_str(&format!("basic {encoded}")).unwrap(),
-		);
-		let result = super::extract_basic_credentials(&headers);
-		assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
-	}
-
-	#[test]
-	fn test_extract_basic_credentials_missing_header() {
-		let headers = HeaderMap::new();
-		assert_eq!(super::extract_basic_credentials(&headers), None);
-	}
-
-	#[test]
-	fn test_extract_basic_credentials_invalid_base64() {
-		let mut headers = HeaderMap::new();
-		headers.insert(
-			"authorization",
-			HeaderValue::from_static("Basic !!!invalid!!!"),
-		);
-		assert_eq!(super::extract_basic_credentials(&headers), None);
-	}
-
-	#[test]
-	fn test_extract_basic_credentials_no_colon() {
-		let mut headers = HeaderMap::new();
-		let encoded = base64::engine::general_purpose::STANDARD.encode("nocolon");
-		headers.insert(
-			"authorization",
-			HeaderValue::from_str(&format!("Basic {encoded}")).unwrap(),
-		);
-		assert_eq!(super::extract_basic_credentials(&headers), None);
-	}
-
-	#[test]
-	fn test_extract_basic_credentials_empty_user() {
-		let mut headers = HeaderMap::new();
-		let encoded = base64::engine::general_purpose::STANDARD.encode(":password");
-		headers.insert(
-			"authorization",
-			HeaderValue::from_str(&format!("Basic {encoded}")).unwrap(),
-		);
-		assert_eq!(super::extract_basic_credentials(&headers), None);
-	}
-
-	#[test]
-	fn test_secrets_match_equal() {
-		assert!(super::secrets_match("secret123", "secret123"));
-	}
-
-	#[test]
-	fn test_secrets_match_different_length() {
-		assert!(!super::secrets_match("short", "longer_secret"));
-	}
-
-	#[test]
-	fn test_secrets_match_different_content() {
-		assert!(!super::secrets_match("secret123", "secret456"));
-	}
-
-	#[test]
-	fn test_prune_old_attempts_removes_expired() {
-		let mut attempts = VecDeque::from([100, 200, 300]);
-		super::prune_old_attempts(&mut attempts, 400);
-		// All entries older than 400 - 60 = 340 should be removed
-		assert_eq!(attempts.len(), 0);
-	}
-
-	#[test]
-	fn test_prune_old_attempts_keeps_recent() {
-		let mut attempts = VecDeque::from([350, 360, 370]);
-		super::prune_old_attempts(&mut attempts, 400);
-		// All entries are within 60 seconds of now
-		assert_eq!(attempts.len(), 3);
-	}
-
-	#[tokio::test]
-	#[serial]
-	async fn test_issue_client_token_missing_credentials() {
-		FAILED_AUTH_BY_CLIENT.clear();
-		FAILED_AUTH_BY_IP.clear();
-
-		let jwt_service = create_test_jwt_service_with(
-			true,
-			false,
-			"solver-admin",
-			Some("test-client-secret-at-least-32-chars"),
-		);
-		let headers = HeaderMap::new();
-		let request = TokenRequest {
-			grant_type: Some("client_credentials".to_string()),
-			client_id: None,
-			client_secret: None,
-			scope: Some("admin-all".to_string()),
-		};
-
-		let response = issue_client_token(
-			axum::extract::State(Some(jwt_service)),
-			headers,
-			Json(request),
-		)
-		.await;
-		let response_obj = response.into_response();
-		let (parts, body) = response_obj.into_parts();
-		assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
-
-		let json_body = extract_json_from_body(body).await;
-		assert_eq!(json_body["error"], "invalid_client");
-	}
-
-	#[tokio::test]
-	#[serial]
-	async fn test_issue_client_token_unsupported_grant_type() {
-		FAILED_AUTH_BY_CLIENT.clear();
-		FAILED_AUTH_BY_IP.clear();
-
-		let jwt_service = create_test_jwt_service_with(
-			true,
-			false,
-			"solver-admin",
-			Some("test-client-secret-at-least-32-chars"),
-		);
-		let headers = HeaderMap::new();
-		let request = TokenRequest {
-			grant_type: Some("password".to_string()),
-			client_id: Some("solver-admin".to_string()),
-			client_secret: Some("test-client-secret-at-least-32-chars".to_string()),
-			scope: Some("admin-all".to_string()),
-		};
-
-		let response = issue_client_token(
-			axum::extract::State(Some(jwt_service)),
-			headers,
-			Json(request),
-		)
-		.await;
-		let response_obj = response.into_response();
-		let (parts, body) = response_obj.into_parts();
-		assert_eq!(parts.status, StatusCode::BAD_REQUEST);
-
-		let json_body = extract_json_from_body(body).await;
-		assert_eq!(json_body["error"], "unsupported_grant_type");
-	}
-
-	#[tokio::test]
-	#[serial]
-	async fn test_issue_client_token_missing_grant_type() {
-		FAILED_AUTH_BY_CLIENT.clear();
-		FAILED_AUTH_BY_IP.clear();
-
-		let jwt_service = create_test_jwt_service_with(
-			true,
-			false,
-			"solver-admin",
-			Some("test-client-secret-at-least-32-chars"),
-		);
-		let headers = HeaderMap::new();
-		let request = TokenRequest {
-			grant_type: None,
-			client_id: Some("solver-admin".to_string()),
-			client_secret: Some("test-client-secret-at-least-32-chars".to_string()),
-			scope: Some("admin-all".to_string()),
-		};
-
-		let response = issue_client_token(
-			axum::extract::State(Some(jwt_service)),
-			headers,
-			Json(request),
-		)
-		.await;
-		let response_obj = response.into_response();
-		let (parts, body) = response_obj.into_parts();
-		assert_eq!(parts.status, StatusCode::BAD_REQUEST);
-
-		let json_body = extract_json_from_body(body).await;
-		assert_eq!(json_body["error"], "unsupported_grant_type");
-	}
-
-	#[tokio::test]
-	#[serial]
-	async fn test_issue_client_token_no_secret_configured() {
-		FAILED_AUTH_BY_CLIENT.clear();
-		FAILED_AUTH_BY_IP.clear();
-
-		let jwt_service = create_test_jwt_service_with(true, false, "solver-admin", None);
-		let headers = HeaderMap::new();
-		let request = TokenRequest {
-			grant_type: Some("client_credentials".to_string()),
-			client_id: Some("solver-admin".to_string()),
-			client_secret: Some("some-secret".to_string()),
-			scope: Some("admin-all".to_string()),
-		};
-
-		let response = issue_client_token(
-			axum::extract::State(Some(jwt_service)),
-			headers,
-			Json(request),
-		)
-		.await;
-		let response_obj = response.into_response();
-		let (parts, body) = response_obj.into_parts();
-		assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
-
-		let json_body = extract_json_from_body(body).await;
-		assert_eq!(
-			json_body["error"],
-			"Client credentials authentication is not configured"
-		);
-	}
-
-	#[tokio::test]
-	#[serial]
-	async fn test_issue_client_token_no_jwt_service() {
-		let headers = HeaderMap::new();
-		let request = TokenRequest::default();
-
-		let response = issue_client_token(axum::extract::State(None), headers, Json(request)).await;
-		let response_obj = response.into_response();
-		let (parts, body) = response_obj.into_parts();
-		assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
-
-		let json_body = extract_json_from_body(body).await;
-		assert_eq!(
-			json_body["error"],
-			"Authentication service is not configured"
-		);
 	}
 }

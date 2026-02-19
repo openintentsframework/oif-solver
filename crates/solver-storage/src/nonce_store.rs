@@ -454,6 +454,34 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn test_nonce_isolation_between_namespaces() {
+		let storage = create_storage_backend(StoreConfig::Memory).unwrap();
+
+		let admin_store = create_nonce_store_with_namespace(
+			StoreConfig::Storage(Arc::clone(&storage)),
+			"solver1",
+			"admin",
+			300,
+		)
+		.unwrap();
+		let siwe_store = create_nonce_store_with_namespace(
+			StoreConfig::Storage(Arc::clone(&storage)),
+			"solver1",
+			"siwe",
+			300,
+		)
+		.unwrap();
+
+		let nonce = admin_store.generate().await.unwrap();
+		assert!(admin_store.exists(nonce).await.unwrap());
+		assert!(!siwe_store.exists(nonce).await.unwrap());
+		assert!(matches!(
+			siwe_store.consume(nonce).await,
+			Err(NonceError::NotFound)
+		));
+	}
+
+	#[tokio::test]
 	async fn test_multiple_nonces() {
 		let store = create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap();
 
@@ -487,5 +515,31 @@ mod tests {
 		// Should fail at connection time (lazy), not at creation time
 		// The error depends on the implementation details
 		assert!(result.is_ok() || result.is_err());
+	}
+
+	#[test]
+	fn test_create_redis_nonce_store_with_namespace_convenience() {
+		let store = create_redis_nonce_store_with_namespace(
+			"redis://localhost:6379".to_string(),
+			"test-solver",
+			"siwe",
+			300,
+		)
+		.expect("expected redis nonce store to initialize lazily");
+
+		let key = store.nonce_key(42);
+		assert_eq!(key, "test-solver:siwe:nonce:42");
+	}
+
+	#[test]
+	fn test_nonce_error_from_storage_error_variants() {
+		let not_found = NonceError::from(StorageError::NotFound("x".to_string()));
+		assert!(matches!(not_found, NonceError::NotFound));
+
+		let config = NonceError::from(StorageError::Configuration("bad".to_string()));
+		assert!(matches!(config, NonceError::Configuration(msg) if msg == "bad"));
+
+		let backend = NonceError::from(StorageError::Backend("boom".to_string()));
+		assert!(matches!(backend, NonceError::Storage(msg) if msg.contains("boom")));
 	}
 }

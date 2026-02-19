@@ -36,14 +36,11 @@ use solver_types::{
 	OperatorAdminConfig, OperatorConfig, OperatorGasConfig, OperatorGasFlowUnits,
 	OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig, OperatorPricingConfig,
 	OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSolverConfig, OperatorToken,
-	OperatorWithdrawalsConfig, SecretString, SeedOverrides, TokenConfig,
+	OperatorWithdrawalsConfig, SeedOverrides, TokenConfig,
 };
 use std::collections::HashMap;
 use thiserror::Error;
 use uuid::Uuid;
-
-const DEFAULT_AUTH_TOKEN_CLIENT_ID: &str = "solver-admin";
-const AUTH_CLIENT_SECRET_MIN_LENGTH: usize = 32;
 
 /// Errors that can occur during configuration merge.
 #[derive(Debug, Error)]
@@ -83,66 +80,12 @@ fn parse_bool_env_var(name: &str, default: bool) -> Result<bool, MergeError> {
 	}
 }
 
-fn load_client_credentials_env(
-	auth_enabled: bool,
-) -> Result<(bool, String, Option<SecretString>), MergeError> {
-	// Important behavior for single-solver setup:
-	// when auth is disabled, client credential env vars are ignored.
+fn load_public_register_enabled(auth_enabled: bool) -> Result<bool, MergeError> {
 	if !auth_enabled {
-		return Ok((false, DEFAULT_AUTH_TOKEN_CLIENT_ID.to_string(), None));
+		return Ok(false);
 	}
 
-	let token_client_id = match std::env::var("AUTH_CLIENT_ID") {
-		Ok(client_id) => {
-			let trimmed = client_id.trim();
-			if trimmed.is_empty() {
-				DEFAULT_AUTH_TOKEN_CLIENT_ID.to_string()
-			} else {
-				trimmed.to_string()
-			}
-		},
-		Err(std::env::VarError::NotPresent) => DEFAULT_AUTH_TOKEN_CLIENT_ID.to_string(),
-		Err(std::env::VarError::NotUnicode(_)) => {
-			return Err(MergeError::Validation(
-				"Invalid unicode value for AUTH_CLIENT_ID".to_string(),
-			));
-		},
-	};
-
-	let token_client_secret = match std::env::var("AUTH_CLIENT_SECRET") {
-		Ok(secret) => {
-			if secret.len() < AUTH_CLIENT_SECRET_MIN_LENGTH {
-				return Err(MergeError::Validation(format!(
-					"AUTH_CLIENT_SECRET must be at least {AUTH_CLIENT_SECRET_MIN_LENGTH} characters"
-				)));
-			}
-			Some(SecretString::new(secret))
-		},
-		Err(std::env::VarError::NotPresent) => {
-			return Err(MergeError::Validation(
-				"AUTH_CLIENT_SECRET is required when auth.enabled = true".to_string(),
-			));
-		},
-		Err(std::env::VarError::NotUnicode(_)) => {
-			return Err(MergeError::Validation(
-				"Invalid unicode value for AUTH_CLIENT_SECRET".to_string(),
-			));
-		},
-	};
-
-	let public_register_enabled = parse_bool_env_var("AUTH_PUBLIC_REGISTER_ENABLED", false)?;
-
-	tracing::info!(
-		token_client_id = %token_client_id,
-		public_register_enabled,
-		"Configured client credentials auth"
-	);
-
-	Ok((
-		public_register_enabled,
-		token_client_id,
-		token_client_secret,
-	))
+	parse_bool_env_var("AUTH_PUBLIC_REGISTER_ENABLED", false)
 }
 
 /// Merges seed overrides with a seed config to produce a complete Config.
@@ -947,8 +890,7 @@ fn build_api_config_from_operator(
 			);
 			uuid::Uuid::new_v4().to_string()
 		});
-		let (public_register_enabled, token_client_id, token_client_secret) =
-			load_client_credentials_env(auth_enabled)?;
+		let public_register_enabled = load_public_register_enabled(auth_enabled)?;
 
 		let admin_config = if admin.enabled {
 			Some(solver_types::AdminConfig {
@@ -969,8 +911,6 @@ fn build_api_config_from_operator(
 			refresh_token_expiry_hours: 720, // 30 days
 			issuer: "oif-solver".to_string(),
 			public_register_enabled,
-			token_client_id,
-			token_client_secret,
 			admin: admin_config,
 		})
 	} else {
@@ -1457,8 +1397,7 @@ fn build_api_config(
 			);
 			uuid::Uuid::new_v4().to_string()
 		});
-		let (public_register_enabled, token_client_id, token_client_secret) =
-			load_client_credentials_env(auth_enabled.unwrap_or(false))?;
+		let public_register_enabled = load_public_register_enabled(auth_enabled.unwrap_or(false))?;
 
 		let admin_config = admin_override.map(|admin| AdminConfig {
 			enabled: admin.enabled,
@@ -1475,8 +1414,6 @@ fn build_api_config(
 			refresh_token_expiry_hours: 720, // 30 days
 			issuer: "oif-solver".to_string(),
 			public_register_enabled,
-			token_client_id,
-			token_client_secret,
 			admin: admin_config,
 		})
 	} else {
@@ -1901,6 +1838,7 @@ mod tests {
 	use crate::seeds::TESTNET_SEED;
 	use alloy_primitives::address;
 	use rust_decimal::Decimal;
+	use serial_test::serial;
 	use solver_types::seed_overrides::AdminOverride;
 	use std::str::FromStr;
 
@@ -3117,18 +3055,11 @@ mod tests {
 	}
 
 	#[test]
+	#[serial]
 	fn test_build_api_config_from_operator_admin_enabled() {
 		use std::env;
 
-		let original_client_secret = env::var("AUTH_CLIENT_SECRET").ok();
-		let original_client_id = env::var("AUTH_CLIENT_ID").ok();
 		let original_public_register = env::var("AUTH_PUBLIC_REGISTER_ENABLED").ok();
-
-		env::set_var(
-			"AUTH_CLIENT_SECRET",
-			"test-client-secret-at-least-32-characters",
-		);
-		env::set_var("AUTH_CLIENT_ID", "solver-admin");
 		env::set_var("AUTH_PUBLIC_REGISTER_ENABLED", "true");
 
 		let admin = OperatorAdminConfig {
@@ -3145,23 +3076,13 @@ mod tests {
 		assert!(api.enabled);
 		let auth = api.auth.as_ref().unwrap();
 		assert!(auth.enabled);
-		assert_eq!(auth.token_client_id, "solver-admin");
-		assert!(auth.token_client_secret.is_some());
 		assert!(auth.public_register_enabled);
 		let admin_config = auth.admin.as_ref().unwrap();
 		assert!(admin_config.enabled);
 		assert_eq!(admin_config.domain, "solver.example.com");
 		assert_eq!(admin_config.chain_id, Some(1));
 
-		env::remove_var("AUTH_CLIENT_SECRET");
-		env::remove_var("AUTH_CLIENT_ID");
 		env::remove_var("AUTH_PUBLIC_REGISTER_ENABLED");
-		if let Some(val) = original_client_secret {
-			env::set_var("AUTH_CLIENT_SECRET", val);
-		}
-		if let Some(val) = original_client_id {
-			env::set_var("AUTH_CLIENT_ID", val);
-		}
 		if let Some(val) = original_public_register {
 			env::set_var("AUTH_PUBLIC_REGISTER_ENABLED", val);
 		}
@@ -3185,6 +3106,73 @@ mod tests {
 	}
 
 	#[test]
+	#[serial]
+	fn test_parse_bool_env_var_uses_default_when_missing() {
+		let key = "TEST_PARSE_BOOL_MISSING";
+		std::env::remove_var(key);
+		let parsed = parse_bool_env_var(key, true).unwrap();
+		assert!(parsed);
+	}
+
+	#[test]
+	#[serial]
+	fn test_parse_bool_env_var_parses_case_insensitive_values() {
+		let key = "TEST_PARSE_BOOL_CASE";
+		std::env::set_var(key, "TrUe");
+		let parsed = parse_bool_env_var(key, false).unwrap();
+		assert!(parsed);
+		std::env::remove_var(key);
+	}
+
+	#[test]
+	#[serial]
+	fn test_parse_bool_env_var_rejects_invalid_value() {
+		let key = "TEST_PARSE_BOOL_INVALID";
+		std::env::set_var(key, "yes");
+		let err = parse_bool_env_var(key, false).unwrap_err();
+		std::env::remove_var(key);
+
+		assert!(matches!(err, MergeError::Validation(_)));
+		assert!(err.to_string().contains("Invalid boolean value"));
+	}
+
+	#[test]
+	fn test_build_operator_network_config_falls_back_to_seed_name_and_rpc() {
+		let network_seed = TESTNET_SEED
+			.get_network(11155420)
+			.expect("expected optimism sepolia in seed");
+		let override_ = NetworkOverride {
+			chain_id: 11155420,
+			name: Some("   ".to_string()),
+			network_type: None,
+			tokens: vec![solver_types::seed_overrides::Token {
+				symbol: "USDC".to_string(),
+				name: None,
+				address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+				decimals: 6,
+			}],
+			rpc_urls: Some(vec![]),
+		};
+
+		let network = build_operator_network_config(network_seed, &override_);
+		assert_eq!(network.name, network_seed.name);
+		assert_eq!(network.network_type, NetworkType::New);
+		assert_eq!(network.tokens[0].name, Some("USDC".to_string()));
+		assert_eq!(network.rpc_urls.len(), network_seed.default_rpc_urls.len());
+	}
+
+	#[test]
+	fn test_build_operator_hyperlane_config_skips_unknown_chain_metadata() {
+		let hyperlane = build_operator_hyperlane_config(&[11155420, 999999], &TESTNET_SEED);
+		assert!(hyperlane.mailboxes.contains_key(&11155420));
+		assert!(!hyperlane.mailboxes.contains_key(&999999));
+		assert!(hyperlane.igp_addresses.contains_key(&11155420));
+		assert!(!hyperlane.igp_addresses.contains_key(&999999));
+		assert!(hyperlane.routes.contains_key(&999999));
+	}
+
+	#[test]
+	#[serial]
 	fn test_jwt_secret_from_env_var() {
 		use std::env;
 
@@ -3207,7 +3195,6 @@ mod tests {
 			auth.jwt_secret.expose_secret(),
 			"test-jwt-secret-from-env-var-32ch"
 		);
-		assert!(auth.token_client_secret.is_none());
 
 		// Restore original env var
 		env::remove_var("JWT_SECRET");
@@ -3217,35 +3204,37 @@ mod tests {
 	}
 
 	#[test]
-	fn test_auth_enabled_requires_client_secret() {
+	#[serial]
+	fn test_auth_enabled_defaults_public_register_disabled() {
 		use std::env;
 
-		let original = env::var("AUTH_CLIENT_SECRET").ok();
-		env::remove_var("AUTH_CLIENT_SECRET");
+		let original = env::var("AUTH_PUBLIC_REGISTER_ENABLED").ok();
+		env::remove_var("AUTH_PUBLIC_REGISTER_ENABLED");
 
 		let admin = OperatorAdminConfig::default();
-		let result = build_api_config_from_operator(&admin, true);
-		assert!(matches!(result, Err(MergeError::Validation(_))));
+		let api = build_api_config_from_operator(&admin, true).unwrap();
+		let auth = api.auth.as_ref().unwrap();
+		assert!(!auth.public_register_enabled);
 
 		if let Some(val) = original {
-			env::set_var("AUTH_CLIENT_SECRET", val);
+			env::set_var("AUTH_PUBLIC_REGISTER_ENABLED", val);
 		}
 	}
 
 	#[test]
-	fn test_auth_disabled_ignores_client_secret_env() {
+	#[serial]
+	fn test_auth_disabled_ignores_public_register_env() {
 		use std::env;
 
-		let original = env::var("AUTH_CLIENT_SECRET").ok();
-		env::set_var("AUTH_CLIENT_SECRET", "short");
+		let original = env::var("AUTH_PUBLIC_REGISTER_ENABLED").ok();
+		env::set_var("AUTH_PUBLIC_REGISTER_ENABLED", "true");
 
-		let admin = OperatorAdminConfig::default();
-		let api = build_api_config_from_operator(&admin, false).unwrap();
-		assert!(api.auth.is_none());
+		let enabled = load_public_register_enabled(false).unwrap();
+		assert!(!enabled);
 
-		env::remove_var("AUTH_CLIENT_SECRET");
+		env::remove_var("AUTH_PUBLIC_REGISTER_ENABLED");
 		if let Some(val) = original {
-			env::set_var("AUTH_CLIENT_SECRET", val);
+			env::set_var("AUTH_PUBLIC_REGISTER_ENABLED", val);
 		}
 	}
 

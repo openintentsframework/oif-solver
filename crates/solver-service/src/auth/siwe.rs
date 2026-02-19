@@ -362,4 +362,130 @@ Issued At: {}\n",
 			.expect_err("expected expiry failure");
 		assert!(matches!(err, SiweError::Expired));
 	}
+
+	#[test]
+	fn parse_rejects_invalid_header() {
+		let message = "invalid header\n0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B\n";
+		let err = SiweMessage::parse(message).expect_err("expected invalid header");
+		assert!(matches!(err, SiweError::InvalidHeader));
+	}
+
+	#[test]
+	fn parse_rejects_invalid_chain_id_format() {
+		let message = "solver.example.com wants you to sign in with your Ethereum account:\n\
+0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B\n\n\
+Sign in to OIF Solver Admin API\n\n\
+URI: https://solver.example.com\n\
+Version: 1\n\
+Chain ID: not-a-number\n\
+Nonce: 00000000000000012345\n\
+Issued At: 2026-02-18T12:00:00.000Z\n";
+		let err = SiweMessage::parse(message).expect_err("expected invalid chain id");
+		assert!(matches!(err, SiweError::InvalidFieldFormat { field, .. } if field == "Chain ID"));
+	}
+
+	#[test]
+	fn parse_rejects_missing_required_fields() {
+		let message = "solver.example.com wants you to sign in with your Ethereum account:\n\
+0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B\n\n\
+Version: 1\n\
+Chain ID: 1\n\
+Nonce: 00000000000000012345\n\
+Issued At: 2026-02-18T12:00:00.000Z\n";
+		let err = SiweMessage::parse(message).expect_err("expected missing URI field");
+		assert!(matches!(err, SiweError::MissingField("URI")));
+	}
+
+	#[test]
+	fn verify_siwe_signature_rejects_unsupported_version() {
+		let signer = test_signer();
+		let now = Utc::now();
+		let message = format!(
+			"solver.example.com wants you to sign in with your Ethereum account:\n\
+{}\n\n\
+Sign in to OIF Solver Admin API\n\n\
+URI: https://solver.example.com\n\
+Version: 2\n\
+Chain ID: 1\n\
+Nonce: 00000000000000012345\n\
+Issued At: {}\n\
+Expiration Time: {}\n",
+			signer.address(),
+			now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+			(now + Duration::minutes(5)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+		);
+		let signature = signer.sign_message_sync(message.as_bytes()).unwrap();
+		let signature_hex = format!("0x{}", hex::encode(signature.as_bytes()));
+
+		let err = verify_siwe_signature(&message, &signature_hex, "solver.example.com", 1)
+			.expect_err("expected unsupported version");
+		assert!(matches!(err, SiweError::UnsupportedVersion(v) if v == "2"));
+	}
+
+	#[test]
+	fn verify_siwe_signature_rejects_not_before_in_future() {
+		let signer = test_signer();
+		let now = Utc::now();
+		let message = format!(
+			"solver.example.com wants you to sign in with your Ethereum account:\n\
+{}\n\n\
+Sign in to OIF Solver Admin API\n\n\
+URI: https://solver.example.com\n\
+Version: 1\n\
+Chain ID: 1\n\
+Nonce: 00000000000000012345\n\
+Issued At: {}\n\
+Not Before: {}\n\
+Expiration Time: {}\n",
+			signer.address(),
+			now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+			(now + Duration::minutes(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+			(now + Duration::minutes(5)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+		);
+		let signature = signer.sign_message_sync(message.as_bytes()).unwrap();
+		let signature_hex = format!("0x{}", hex::encode(signature.as_bytes()));
+
+		let err = verify_siwe_signature(&message, &signature_hex, "solver.example.com", 1)
+			.expect_err("expected not yet valid");
+		assert!(matches!(err, SiweError::NotYetValid));
+	}
+
+	#[test]
+	fn verify_siwe_signature_rejects_invalid_signature_format() {
+		let signer = test_signer();
+		let now = Utc::now();
+		let message = build_message(
+			"solver.example.com",
+			&signer.address().to_string(),
+			1,
+			"00000000000000012345",
+			now,
+			Some(now + Duration::minutes(5)),
+		);
+
+		let err = verify_siwe_signature(&message, "0x1234", "solver.example.com", 1)
+			.expect_err("expected invalid signature format");
+		assert!(matches!(err, SiweError::InvalidSignature(_)));
+	}
+
+	#[test]
+	fn verify_siwe_signature_rejects_signer_mismatch() {
+		let signer_a = test_signer();
+		let signer_b = PrivateKeySigner::from_bytes(&B256::from([0x24u8; 32])).unwrap();
+		let now = Utc::now();
+		let message = build_message(
+			"solver.example.com",
+			&signer_a.address().to_string(),
+			1,
+			"00000000000000012345",
+			now,
+			Some(now + Duration::minutes(5)),
+		);
+		let signature = signer_b.sign_message_sync(message.as_bytes()).unwrap();
+		let signature_hex = format!("0x{}", hex::encode(signature.as_bytes()));
+
+		let err = verify_siwe_signature(&message, &signature_hex, "solver.example.com", 1)
+			.expect_err("expected signer mismatch");
+		assert!(matches!(err, SiweError::AddressMismatch { .. }));
+	}
 }

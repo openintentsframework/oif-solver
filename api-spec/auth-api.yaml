@@ -6,18 +6,17 @@ info:
 
     ## Authentication Flow
 
-    1. **Privileged Client Auth**: POST /auth/token with `client_id + client_secret` to obtain admin access token
-    2. **SIWE Admin Auth**: POST /auth/siwe/nonce then POST /auth/siwe/verify to obtain admin access token
-    3. **Optional Public Registration**: POST /auth/register (if enabled) for non-admin scopes
-    4. **API Access**: Include access token in Authorization header: `Bearer <access_token>`
-    5. **Token Refresh**: For register-issued tokens, POST /auth/refresh with refresh token
-    6. **Scope-Based Authorization**: Different endpoints require different scopes
+    1. **SIWE Admin Auth**: POST /auth/siwe/nonce then POST /auth/siwe/verify to obtain admin access + refresh tokens
+    2. **Optional Public Registration**: POST /auth/register (if enabled) for non-admin scopes
+    3. **API Access**: Include access token in Authorization header: `Bearer <access_token>`
+    4. **Token Refresh**: For register-issued or SIWE-issued tokens, POST /auth/refresh with refresh token
+    5. **Scope-Based Authorization**: Different endpoints require different scopes
 
     ## Token Lifecycle
 
     - **Access Tokens**: Short-lived, used for API authentication
-    - **Client Credentials Tokens**: Default 900 seconds, no refresh token
-    - **SIWE Tokens**: Default 900 seconds, no refresh token
+    - **SIWE Access Tokens**: Default 900 seconds (with current constants)
+    - **SIWE Refresh Tokens**: Issued by /auth/siwe/verify and compatible with /auth/refresh
     - **Refresh Tokens**: Long-lived (default 30 days), used to obtain new access tokens
     - **Token Rotation**: Refresh endpoint returns a new refresh token
 
@@ -41,84 +40,6 @@ servers:
     description: Production server (replace with actual URL)
 
 paths:
-  /auth/token:
-    post:
-      summary: Issue access token with client credentials
-      description: |
-        Issues an access token for privileged clients using `client_id + client_secret`.
-        This endpoint supports `grant_type=client_credentials` and only allows `admin-all`.
-
-        This flow returns an access token only (no refresh token). Clients should request
-        a new token when it expires.
-      operationId: issueClientToken
-      tags:
-        - Authentication
-      requestBody:
-        required: true
-        description: Client credentials token request
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/TokenRequest"
-            example:
-              grant_type: "client_credentials"
-              client_id: "solver-admin"
-              client_secret: "replace-with-your-client-secret"
-              scope: "admin-all"
-      responses:
-        "200":
-          description: Access token issued
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/TokenResponse"
-              example:
-                access_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-                token_type: "Bearer"
-                expires_in: 900
-                scope: "admin-all"
-        "400":
-          description: Invalid grant_type or scope
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              examples:
-                unsupportedGrantType:
-                  value:
-                    error: "unsupported_grant_type"
-                    error_description: "grant_type must be client_credentials"
-                invalidScope:
-                  value:
-                    error: "invalid_scope"
-                    error_description: "only admin-all scope is supported by /auth/token"
-        "401":
-          description: Invalid client credentials
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example:
-                error: "invalid_client"
-                error_description: "invalid client credentials"
-        "429":
-          description: Too many failed authentication attempts
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example:
-                error: "too_many_requests"
-                error_description: "too many failed authentication attempts"
-        "503":
-          description: Authentication service unavailable or disabled
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example:
-                error: "Authentication service is not configured"
-
   /auth/siwe/nonce:
     post:
       summary: Create SIWE nonce and message
@@ -177,10 +98,10 @@ paths:
 
   /auth/siwe/verify:
     post:
-      summary: Verify SIWE message and issue admin token
+      summary: Verify SIWE message and issue admin tokens
       description: |
         Verifies the SIWE message signature, validates nonce/domain/chain, and issues
-        a JWT access token with `admin-all` scope. This flow returns an access token only.
+        JWT access + refresh tokens with `admin-all` scope.
       operationId: verifySiweToken
       tags:
         - Authentication
@@ -196,16 +117,19 @@ paths:
               signature: "0x..."
       responses:
         "200":
-          description: SIWE verified and admin token issued
+          description: SIWE verified and admin tokens issued
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/TokenResponse"
+                $ref: "#/components/schemas/RegisterResponse"
               example:
                 access_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                refresh_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                client_id: "0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B"
                 token_type: "Bearer"
-                expires_in: 900
-                scope: "admin-all"
+                access_token_expires_at: 1771463174
+                refresh_token_expires_at: 1774051574
+                scopes: ["admin-all"]
         "400":
           description: Invalid SIWE nonce format
           content:
@@ -241,8 +165,13 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
-              example:
-                error: "Failed to generate access token"
+              examples:
+                accessTokenError:
+                  value:
+                    error: "Failed to generate access token"
+                refreshTokenError:
+                  value:
+                    error: "Failed to generate refresh token"
         "503":
           description: SIWE auth unavailable
           content:
@@ -355,8 +284,8 @@ paths:
         Exchanges a valid refresh token for new access and refresh tokens.
         This endpoint returns a new refresh token alongside the new access token.
 
-        Use this endpoint when the access token expires (typically after 1 hour)
-        to continue making authenticated API calls.
+        Use this endpoint when an access token from `/auth/register` or
+        `/auth/siwe/verify` expires to continue making authenticated API calls.
       operationId: refreshToken
       tags:
         - Authentication
@@ -411,54 +340,6 @@ paths:
 
 components:
   schemas:
-    TokenRequest:
-      type: object
-      description: Request payload for client credentials token issuance
-      required:
-        - grant_type
-      properties:
-        grant_type:
-          type: string
-          enum: ["client_credentials"]
-          description: Must be `client_credentials`
-          example: "client_credentials"
-        client_id:
-          type: string
-          description: Client identifier (used when Basic auth header is not provided)
-          example: "solver-admin"
-        client_secret:
-          type: string
-          description: Client secret (used when Basic auth header is not provided)
-          example: "replace-with-your-client-secret"
-        scope:
-          type: string
-          description: Requested scope; only `admin-all` is supported. Defaults to `admin-all` when omitted.
-          example: "admin-all"
-
-    TokenResponse:
-      type: object
-      description: Response payload for successful client credentials token issuance
-      required:
-        - access_token
-        - token_type
-        - expires_in
-        - scope
-      properties:
-        access_token:
-          type: string
-          description: JWT access token
-          example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-        token_type:
-          type: string
-          example: "Bearer"
-        expires_in:
-          type: integer
-          description: Token lifetime in seconds
-          example: 900
-        scope:
-          type: string
-          example: "admin-all"
-
     SiweNonceRequest:
       type: object
       description: Request payload for SIWE nonce creation
@@ -560,7 +441,7 @@ components:
 
     RegisterResponse:
       type: object
-      description: Response payload for successful registration or refresh
+      description: Response payload for successful registration, SIWE verify, or refresh
       required:
         - access_token
         - refresh_token
@@ -619,8 +500,8 @@ components:
           example: "Client ID cannot be empty"
         error_description:
           type: string
-          description: Additional error detail for OAuth-style auth responses
-          example: "grant_type must be client_credentials"
+          description: Additional error detail
+          example: "Invalid or expired refresh token"
 
   securitySchemes:
     bearerAuth:
@@ -628,7 +509,7 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        JWT token obtained from /auth/token, /auth/siwe/verify, /auth/register, or /auth/refresh.
+        JWT token obtained from /auth/siwe/verify, /auth/register, or /auth/refresh.
         Include in requests as: `Authorization: Bearer <access_token>`
 
 security:

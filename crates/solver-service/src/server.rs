@@ -19,8 +19,8 @@ use crate::{
 };
 use alloy_primitives::U256;
 use axum::{
-	extract::{ConnectInfo, Extension, Path, State},
-	http::{HeaderMap, StatusCode},
+	extract::{Extension, Path, State},
+	http::StatusCode,
 	middleware,
 	response::{IntoResponse, Json},
 	routing::{delete, get, post, put},
@@ -329,7 +329,6 @@ pub async fn start_server(
 	// Add auth subroutes
 	let auth_routes = Router::new()
 		.route("/register", post(handle_auth_register))
-		.route("/token", post(handle_auth_token))
 		.route("/refresh", post(handle_auth_refresh))
 		.route("/siwe/nonce", post(handle_auth_siwe_nonce))
 		.route("/siwe/verify", post(handle_auth_siwe_verify));
@@ -530,24 +529,6 @@ async fn handle_auth_refresh(
 	crate::apis::auth::refresh_token(State(state.jwt_service), Json(payload)).await
 }
 
-/// Handles POST /api/v1/auth/token requests.
-///
-/// Endpoint issues access tokens via client credentials.
-async fn handle_auth_token(
-	State(state): State<AppState>,
-	headers: HeaderMap,
-	ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-	Json(payload): Json<crate::apis::auth::TokenRequest>,
-) -> impl IntoResponse {
-	crate::apis::auth::issue_client_token_with_peer(
-		State(state.jwt_service),
-		headers,
-		Some(peer_addr),
-		Json(payload),
-	)
-	.await
-}
-
 /// Handles POST /api/v1/auth/siwe/nonce requests.
 ///
 /// Generates a SIWE nonce and canonical SIWE message for admin login.
@@ -566,7 +547,7 @@ async fn handle_auth_siwe_nonce(
 
 /// Handles POST /api/v1/auth/siwe/verify requests.
 ///
-/// Verifies SIWE signatures and returns admin-scoped JWT access token.
+/// Verifies SIWE signatures and returns admin-scoped JWT access + refresh tokens.
 async fn handle_auth_siwe_verify(
 	State(state): State<AppState>,
 	Json(payload): Json<crate::apis::auth::SiweVerifyRequest>,
@@ -1183,6 +1164,69 @@ mod tests {
 			Err(err) => err,
 		};
 		assert!(err.to_string().contains("Nonce store error"));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn handle_auth_register_returns_service_unavailable_without_jwt_service() {
+		let state = build_test_app_state(None).await;
+		let response = super::handle_auth_register(
+			State(state),
+			Json(crate::apis::auth::RegisterRequest {
+				client_id: "test-client".to_string(),
+				client_name: None,
+				scopes: None,
+			}),
+		)
+		.await
+		.into_response();
+
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn handle_auth_refresh_returns_service_unavailable_without_jwt_service() {
+		let state = build_test_app_state(None).await;
+		let response = super::handle_auth_refresh(
+			State(state),
+			Json(crate::apis::auth::RefreshRequest {
+				refresh_token: "token".to_string(),
+			}),
+		)
+		.await
+		.into_response();
+
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn handle_auth_siwe_nonce_returns_service_unavailable_without_dependencies() {
+		let state = build_test_app_state(None).await;
+		let response = super::handle_auth_siwe_nonce(
+			State(state),
+			Json(crate::apis::auth::SiweNonceRequest {
+				address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".to_string(),
+			}),
+		)
+		.await
+		.into_response();
+
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn handle_auth_siwe_verify_returns_service_unavailable_without_dependencies() {
+		let state = build_test_app_state(None).await;
+		let response = super::handle_auth_siwe_verify(
+			State(state),
+			Json(crate::apis::auth::SiweVerifyRequest {
+				message: "message".to_string(),
+				signature: "signature".to_string(),
+			}),
+		)
+		.await
+		.into_response();
+
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

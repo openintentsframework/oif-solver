@@ -240,34 +240,16 @@ If you enable API auth in your seed overrides (`"auth_enabled": true`), set:
 
 ```bash
 export JWT_SECRET=replace_with_a_strong_random_value
-export AUTH_CLIENT_SECRET=replace_with_a_strong_random_value_at_least_32_chars
 
 # Optional
-export AUTH_CLIENT_ID=solver-admin
 export AUTH_PUBLIC_REGISTER_ENABLED=false
 ```
 
-If `auth_enabled = false`, `AUTH_CLIENT_SECRET`, `AUTH_CLIENT_ID`, and
-`AUTH_PUBLIC_REGISTER_ENABLED` are ignored.
+If `auth_enabled = false`, `AUTH_PUBLIC_REGISTER_ENABLED` is ignored.
 
-Admin JWTs (`admin-all` scope) can be obtained in two ways:
+Admin JWTs (`admin-all` scope) are obtained via SIWE wallet login:
 
-1. Client credentials (`POST /api/v1/auth/token`)
-2. SIWE wallet login (`POST /api/v1/auth/siwe/nonce` + `POST /api/v1/auth/siwe/verify`)
-
-#### Option A: client credentials
-
-```bash
-TOKEN=$(curl -s -X POST http://localhost:3000/api/v1/auth/token \
-  -H "Content-Type: application/json" \
-  -d '{
-    "grant_type": "client_credentials",
-    "client_id": "solver-admin",
-    "client_secret": "replace_with_your_auth_client_secret"
-  }' | jq -r '.access_token')
-```
-
-#### Option B: SIWE (admin wallet)
+#### SIWE (admin wallet)
 
 ```bash
 ADMIN_ADDRESS=0xYourAdminWalletAddress
@@ -282,15 +264,19 @@ SIWE_MESSAGE=$(echo "$NONCE_RESPONSE" | jq -r '.message')
 # 2) Sign SIWE_MESSAGE with your wallet and set SIWE_SIGNATURE (0x... 65-byte signature)
 SIWE_SIGNATURE=0x...
 
-# 3) Exchange signed message for JWT
-TOKEN=$(curl -s -X POST http://localhost:3000/api/v1/auth/siwe/verify \
+# 3) Exchange signed message for JWT access + refresh tokens
+SIWE_TOKENS=$(curl -s -X POST http://localhost:3000/api/v1/auth/siwe/verify \
   -H "Content-Type: application/json" \
-  -d "$(jq -n --arg message "$SIWE_MESSAGE" --arg signature "$SIWE_SIGNATURE" '{message: $message, signature: $signature}')" \
-  | jq -r '.access_token')
+  -d "$(jq -n --arg message "$SIWE_MESSAGE" --arg signature "$SIWE_SIGNATURE" '{message: $message, signature: $signature}')")
+
+TOKEN=$(echo "$SIWE_TOKENS" | jq -r '.access_token')
+REFRESH_TOKEN=$(echo "$SIWE_TOKENS" | jq -r '.refresh_token')
 ```
 
-SIWE-issued tokens use the same JWT format as `/auth/token`, have a default TTL of 900s,
-and do not include refresh tokens.
+SIWE-issued access tokens use the same JWT format as other auth flows and currently use
+`TOKEN_DEFAULT_TTL_SECONDS.min(TOKEN_MAX_TTL_SECONDS)` (900s with current constants).
+SIWE also returns a refresh token with the configured `refresh_token_expiry_hours`, and that
+refresh token is compatible with `POST /api/v1/auth/refresh`.
 
 ## Docker
 
@@ -601,7 +587,7 @@ The solver provides a REST API for interacting with the system and submitting of
 
 - **Orders API**: [`api-spec/orders-api.yaml`](api-spec/orders-api.yaml) - Submit and track cross-chain intent orders
 - **Tokens API**: [`api-spec/tokens-api.yaml`](api-spec/tokens-api.yaml) - Query supported tokens and networks
-- **Auth API**: [`api-spec/auth-api.yaml`](api-spec/auth-api.yaml) - JWT issuance flows (client credentials and SIWE)
+- **Auth API**: [`api-spec/auth-api.yaml`](api-spec/auth-api.yaml) - JWT issuance flows (SIWE + register/refresh)
 - **Admin API**: [`api-spec/admin-api.yaml`](api-spec/admin-api.yaml) - Wallet-based admin operations (EIP-712 signed)
 - **Admin Auth Guide**: [`docs/admin-authentication.md`](docs/admin-authentication.md) - Practical auth + nonce flow guide
 
@@ -896,7 +882,7 @@ The admin API enables authorized wallet addresses to perform administrative oper
 4. Sign with your admin wallet (EIP-712)
 5. Submit the signed action to the appropriate endpoint
 
-**Note:** If API auth is enabled (`auth_enabled = true` in seed overrides, mapped to runtime `auth.enabled`), protected admin endpoints also require a JWT with `AdminAll` scope. Use `POST /api/v1/auth/token` or SIWE (`POST /api/v1/auth/siwe/nonce` + `POST /api/v1/auth/siwe/verify`) to obtain it.
+**Note:** If API auth is enabled (`auth_enabled = true` in seed overrides, mapped to runtime `auth.enabled`), protected admin endpoints also require a JWT with `AdminAll` scope. Use SIWE (`POST /api/v1/auth/siwe/nonce` + `POST /api/v1/auth/siwe/verify`) to obtain it.
 **Note:** `/api/v1/auth/siwe/nonce` is dedicated to SIWE login. `/api/v1/admin/nonce` is dedicated to EIP-712 admin action signing.
 **Note:** `POST /api/v1/auth/register` never issues `admin-all` and is disabled by default unless `AUTH_PUBLIC_REGISTER_ENABLED=true`.
 **Note:** Admin withdrawals require `admin.withdrawals.enabled = true` in config.
@@ -995,16 +981,7 @@ curl http://localhost:3000/api/v1/tokens
 # Health check
 curl http://localhost:3000/health
 
-# Admin: Option A - get JWT via client credentials
-TOKEN=$(curl -s -X POST http://localhost:3000/api/v1/auth/token \
-  -H "Content-Type: application/json" \
-  -d '{
-    "grant_type": "client_credentials",
-    "client_id": "solver-admin",
-    "client_secret": "replace_with_your_auth_client_secret"
-  }' | jq -r '.access_token')
-
-# Admin: Option B - get JWT via SIWE (wallet login)
+# Admin: Get JWT via SIWE (wallet login)
 # See docs/admin-authentication.md for a full SIWE example.
 
 # Admin: Get nonce for signing admin actions (protected)
