@@ -164,9 +164,7 @@ impl EnvOps {
 		// Filter chains that need deployment, verifying on-chain code exists
 		let mut chains_to_deploy = Vec::new();
 		for chain in chains {
-			if force {
-				chains_to_deploy.push(chain);
-			} else if !self.ctx.session.has_contracts(chain) {
+			if force || !self.ctx.session.has_contracts(chain) {
 				chains_to_deploy.push(chain);
 			} else {
 				// Session says contracts exist — verify on-chain code is present

@@ -17,21 +17,25 @@
 //! # First run: seed configuration to storage (Redis by default)
 //! export REDIS_URL="redis://localhost:6379"
 //! export SOLVER_PRIVATE_KEY="your_64_hex_character_private_key"
-//! solver --seed testnet --seed-overrides '{"networks":[...]}'
+//! solver --seed testnet --bootstrap-config '{"networks":[...]}'
+//! # or seedless:
+//! solver --bootstrap-config '{"networks":[...]}'
 //!
 //! # Subsequent runs: load from storage
 //! export SOLVER_ID="your-solver-id"
 //! solver
 //!
 //! # Force re-seed (overwrite existing configuration)
-//! solver --seed testnet --seed-overrides '{"networks":[...]}' --force-seed
+//! solver --seed testnet --bootstrap-config '{"networks":[...]}' --force-seed
 //! ```
 
 use clap::Parser;
 use solver_config::Config;
 use solver_service::{
 	build_solver_from_config,
-	config_merge::{build_runtime_config, merge_to_operator_config},
+	config_merge::{
+		build_runtime_config, merge_to_operator_config, merge_to_operator_config_seedless,
+	},
 	seeds::SeedPreset,
 	server,
 };
@@ -46,14 +50,18 @@ use tokio::sync::RwLock;
 struct Args {
 	/// Seed preset to use (mainnet, testnet)
 	///
-	/// Use this with --seed-overrides to seed initial configuration to storage.
+	/// Use this with --bootstrap-config to seed initial configuration to storage.
 	#[arg(long)]
 	seed: Option<String>,
 
-	/// Seed overrides (JSON string or path to JSON file)
+	/// Bootstrap configuration (JSON string or path to JSON file)
 	///
 	/// Contains the networks and tokens this solver should support.
 	/// These values override/extend the seed preset defaults.
+	#[arg(long)]
+	bootstrap_config: Option<String>,
+
+	/// Deprecated alias for --bootstrap-config (kept for backward compatibility).
 	#[arg(long)]
 	seed_overrides: Option<String>,
 
@@ -147,23 +155,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Load configuration based on command-line arguments.
 ///
-/// Configuration is loaded from storage, optionally seeding first with --seed + --seed-overrides.
+/// Configuration is loaded from storage, optionally seeding first with:
+/// - --bootstrap-config (seedless)
+/// - --seed + --bootstrap-config (seed-backed)
 async fn load_config(
 	args: &Args,
 	store_config: StoreConfig,
 ) -> Result<Config, Box<dyn std::error::Error>> {
+	let bootstrap_source = resolve_bootstrap_config_source(args)
+		.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+	validate_seeding_args(args, bootstrap_source.is_some())
+		.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
 	// Handle seeding if requested
-	if let (Some(seed_name), Some(seed_overrides_str)) = (&args.seed, &args.seed_overrides) {
-		// Parse seed preset
-		let seed_preset: SeedPreset = seed_name.parse()?;
-		let seed = seed_preset.get_seed();
+	if let Some((bootstrap_config_input, used_deprecated_alias)) = bootstrap_source {
+		if used_deprecated_alias {
+			tracing::warn!("WARN: --seed-overrides is deprecated, use --bootstrap-config instead");
+		}
 
-		// Parse seed overrides
-		let seed_overrides = parse_seed_overrides(seed_overrides_str)?;
+		// Parse bootstrap config
+		let seed_overrides = parse_seed_overrides(&bootstrap_config_input)?;
 
-		// Merge seed + overrides directly to OperatorConfig
-		tracing::info!("Merging seed overrides with {} seed", seed_name);
-		let operator_config = merge_to_operator_config(seed_overrides, seed)?;
+		let operator_config = if let Some(seed_name) = &args.seed {
+			// Parse seed preset
+			let seed_preset: SeedPreset = seed_name.parse()?;
+			let seed = seed_preset.get_seed();
+
+			// Merge seed + bootstrap config directly to OperatorConfig
+			tracing::info!("Merging bootstrap config with {} seed", seed_name);
+			merge_to_operator_config(seed_overrides, seed)?
+		} else {
+			tracing::info!("Merging bootstrap config in seedless mode using COMMON_DEFAULTS");
+			merge_to_operator_config_seedless(seed_overrides)?
+		};
 		let solver_id = operator_config.solver_id.clone();
 
 		// Create OperatorConfig store for seeding (not legacy Config store)
@@ -247,8 +271,9 @@ async fn load_config(
 	// 2. Error out because we don't know which config to load
 	let solver_id = std::env::var("SOLVER_ID").map_err(|_| {
 		"No configuration source specified. Use one of:\n\
-         1. --seed <preset> --seed-overrides <json> to seed new configuration\n\
-         2. Set SOLVER_ID environment variable to load existing configuration from storage"
+         1. --bootstrap-config <json> to seed new configuration (seedless mode)\n\
+         2. --seed <preset> --bootstrap-config <json> to seed with preset fallback\n\
+         3. Set SOLVER_ID environment variable to load existing configuration from storage"
 	})?;
 
 	tracing::info!(
@@ -265,7 +290,7 @@ async fn load_config(
 	if !operator_store.exists().await? {
 		return Err(format!(
 			"OperatorConfig not found in storage for solver '{solver_id}'. \
-			Run with --seed <preset> to initialize configuration first."
+			Run with --bootstrap-config <json> (optionally with --seed <preset>) to initialize configuration first."
 		)
 		.into());
 	}
@@ -291,7 +316,7 @@ async fn load_config(
 	})
 }
 
-/// Parse seed overrides from a JSON string or file path.
+/// Parse bootstrap config from a JSON string or file path.
 fn parse_seed_overrides(input: &str) -> Result<SeedOverrides, Box<dyn std::error::Error>> {
 	// Try as file path first
 	if std::path::Path::new(input).exists() {
@@ -301,4 +326,97 @@ fn parse_seed_overrides(input: &str) -> Result<SeedOverrides, Box<dyn std::error
 
 	// Treat as JSON string
 	Ok(serde_json::from_str(input)?)
+}
+
+/// Resolve the bootstrap config source, supporting deprecated --seed-overrides alias.
+fn resolve_bootstrap_config_source(args: &Args) -> Result<Option<(String, bool)>, String> {
+	match (&args.bootstrap_config, &args.seed_overrides) {
+		(Some(_), Some(_)) => Err(
+			"Use only one bootstrap flag: --bootstrap-config (preferred) or --seed-overrides \
+			 (deprecated alias)."
+				.to_string(),
+		),
+		(Some(value), None) => Ok(Some((value.clone(), false))),
+		(None, Some(value)) => Ok(Some((value.clone(), true))),
+		(None, None) => Ok(None),
+	}
+}
+
+/// Validate seeding-related CLI argument combinations.
+fn validate_seeding_args(args: &Args, has_bootstrap_source: bool) -> Result<(), String> {
+	if args.force_seed && !has_bootstrap_source {
+		return Err(
+			"--force-seed requires --bootstrap-config (or deprecated --seed-overrides)."
+				.to_string(),
+		);
+	}
+
+	if args.seed.is_some() && !has_bootstrap_source {
+		return Err(
+			"--seed requires --bootstrap-config (or deprecated --seed-overrides).".to_string(),
+		);
+	}
+
+	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn base_args() -> Args {
+		Args {
+			seed: None,
+			bootstrap_config: None,
+			seed_overrides: None,
+			force_seed: false,
+			log_level: "info".to_string(),
+		}
+	}
+
+	#[test]
+	fn test_resolve_bootstrap_config_source_prefers_bootstrap_flag() {
+		let mut args = base_args();
+		args.bootstrap_config = Some("config/example.json".to_string());
+
+		let source = resolve_bootstrap_config_source(&args).unwrap();
+		assert_eq!(source, Some(("config/example.json".to_string(), false)));
+	}
+
+	#[test]
+	fn test_resolve_bootstrap_config_source_supports_deprecated_alias() {
+		let mut args = base_args();
+		args.seed_overrides = Some("config/legacy.json".to_string());
+
+		let source = resolve_bootstrap_config_source(&args).unwrap();
+		assert_eq!(source, Some(("config/legacy.json".to_string(), true)));
+	}
+
+	#[test]
+	fn test_resolve_bootstrap_config_source_rejects_both_flags() {
+		let mut args = base_args();
+		args.bootstrap_config = Some("config/example.json".to_string());
+		args.seed_overrides = Some("config/legacy.json".to_string());
+
+		let err = resolve_bootstrap_config_source(&args).unwrap_err();
+		assert!(err.contains("Use only one bootstrap flag"));
+	}
+
+	#[test]
+	fn test_validate_seeding_args_seed_requires_bootstrap_config() {
+		let mut args = base_args();
+		args.seed = Some("testnet".to_string());
+
+		let err = validate_seeding_args(&args, false).unwrap_err();
+		assert!(err.contains("--seed requires --bootstrap-config"));
+	}
+
+	#[test]
+	fn test_validate_seeding_args_force_seed_requires_bootstrap_config() {
+		let mut args = base_args();
+		args.force_seed = true;
+
+		let err = validate_seeding_args(&args, false).unwrap_err();
+		assert!(err.contains("--force-seed requires --bootstrap-config"));
+	}
 }

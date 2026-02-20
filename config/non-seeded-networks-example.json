@@ -1,0 +1,62 @@
+{
+  "solver_id": "oif-non-seeded-1234-test",
+  "solver_name": "OIF Non-Seeded 1234 Test",
+  "networks": [
+    {
+      "chain_id": 1234,
+      "name": "test-l2",
+      "type": "new",
+      "rpc_urls": ["https://qweasd.com"],
+      "input_settler_address": "0x1111111111111111111111111111111111111111",
+      "output_settler_address": "0x2222222222222222222222222222222222222222",
+      "input_settler_compact_address": "0x3333333333333333333333333333333333333333",
+      "the_compact_address": "0x4444444444444444444444444444444444444444",
+      "allocator_address": "0x5555555555555555555555555555555555555555",
+      "tokens": []
+    },
+    {
+      "chain_id": 1235,
+      "name": "test-hub-l2",
+      "type": "hub",
+      "rpc_urls": ["https://qweasd-hub.com"],
+      "input_settler_address": "0x6666666666666666666666666666666666666666",
+      "output_settler_address": "0x7777777777777777777777777777777777777777",
+      "input_settler_compact_address": "0x8888888888888888888888888888888888888888",
+      "the_compact_address": "0x9999999999999999999999999999999999999999",
+      "allocator_address": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "tokens": []
+    }
+  ],
+  "admin": {
+    "enabled": true,
+    "domain": "localhost",
+    "admin_addresses": ["0x3333333351e46fe70247B7082Ae505c85daBeC7c"]
+  },
+  "settlement": {
+    "type": "hyperlane",
+    "hyperlane": {
+      "mailboxes": {
+        "1234": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "1235": "0xcccccccccccccccccccccccccccccccccccccccc"
+      },
+      "igp_addresses": {
+        "1234": "0xdddddddddddddddddddddddddddddddddddddddd",
+        "1235": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "oracles": {
+        "input": {
+          "1234": ["0x1212121212121212121212121212121212121212"],
+          "1235": ["0x3434343434343434343434343434343434343434"]
+        },
+        "output": {
+          "1234": ["0x1212121212121212121212121212121212121212"],
+          "1235": ["0x3434343434343434343434343434343434343434"]
+        }
+      },
+      "routes": {
+        "1234": [1235],
+        "1235": [1234]
+      }
+    }
+  }
+}

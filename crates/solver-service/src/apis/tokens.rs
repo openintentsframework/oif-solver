@@ -280,10 +280,64 @@ mod tests {
 		Arc::new(TokenManager::new(networks, delivery, account))
 	}
 
-	/// Creates a mock SolverEngine with test data for unit tests.
-	async fn create_mock_solver_engine() -> Arc<SolverEngine> {
-		let token_manager = create_mock_token_manager();
+	/// Creates a mock TokenManager where one network has no configured tokens.
+	fn create_mock_token_manager_with_empty_network() -> Arc<TokenManager> {
+		let mut networks = NetworksConfig::new();
 
+		networks.insert(
+			1,
+			NetworkConfig {
+				name: Some("ethereum".to_string()),
+				network_type: NetworkType::Parent,
+				rpc_urls: vec![RpcEndpoint::http_only(
+					"https://eth.example.com".to_string(),
+				)],
+				input_settler_address: Address(AlloyAddress::from([10u8; 20]).to_vec()),
+				output_settler_address: Address(AlloyAddress::from([11u8; 20]).to_vec()),
+				tokens: vec![TokenConfig {
+					address: Address(AlloyAddress::from([1u8; 20]).to_vec()),
+					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
+					decimals: 6,
+				}],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+
+		networks.insert(
+			42161,
+			NetworkConfig {
+				name: Some("arbitrum".to_string()),
+				network_type: NetworkType::Hub,
+				rpc_urls: vec![RpcEndpoint::http_only(
+					"https://arb.example.com".to_string(),
+				)],
+				input_settler_address: Address(AlloyAddress::from([30u8; 20]).to_vec()),
+				output_settler_address: Address(AlloyAddress::from([31u8; 20]).to_vec()),
+				tokens: vec![],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+
+		let delivery = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 20));
+		let account = Arc::new(solver_account::AccountService::new(Box::new(
+			solver_account::implementations::local::LocalWallet::new(
+				"0x1234567890123456789012345678901234567890123456789012345678901234",
+			)
+			.unwrap(),
+		)));
+
+		Arc::new(TokenManager::new(networks, delivery, account))
+	}
+
+	/// Creates a mock SolverEngine with test data for unit tests.
+	async fn create_mock_solver_engine_with_token_manager(
+		token_manager: Arc<TokenManager>,
+	) -> Arc<SolverEngine> {
 		// Create minimal config for testing
 		let config_toml = r#"
 			[solver]
@@ -398,6 +452,10 @@ mod tests {
 		))
 	}
 
+	async fn create_mock_solver_engine() -> Arc<SolverEngine> {
+		create_mock_solver_engine_with_token_manager(create_mock_token_manager()).await
+	}
+
 	#[tokio::test]
 	async fn test_get_tokens_returns_all_networks() {
 		let solver = create_mock_solver_engine().await;
@@ -478,6 +536,18 @@ mod tests {
 			"0x0202020202020202020202020202020202020202"
 		);
 		assert_eq!(usdt_token.decimals, 6);
+	}
+
+	#[tokio::test]
+	async fn test_get_tokens_returns_empty_array_for_network_without_tokens() {
+		let token_manager = create_mock_token_manager_with_empty_network();
+		let solver = create_mock_solver_engine_with_token_manager(token_manager).await;
+		let response = get_tokens(State(solver)).await;
+		let tokens_response = response.0;
+
+		let arbitrum = tokens_response.networks.get("42161").unwrap();
+		assert_eq!(arbitrum.chain_id, 42161);
+		assert!(arbitrum.tokens.is_empty());
 	}
 
 	#[tokio::test]
@@ -707,6 +777,58 @@ mod tests {
 		toml::from_str(config_toml).expect("Failed to parse test config")
 	}
 
+	fn create_test_config_with_empty_tokens() -> Config {
+		let config_toml = r#"
+			[solver]
+			id = "test-solver"
+			monitoring_timeout_seconds = 30
+			min_profitability_pct = 1.0
+
+			[storage]
+			primary = "memory"
+			cleanup_interval_seconds = 3600
+			[storage.implementations.memory]
+
+			[delivery]
+			min_confirmations = 1
+			[delivery.implementations]
+
+			[account]
+			primary = "local"
+			[account.implementations.local]
+			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
+
+			[discovery]
+			[discovery.implementations]
+
+			[order]
+			[order.implementations]
+			[order.strategy]
+			primary = "simple"
+			[order.strategy.implementations.simple]
+
+			[settlement]
+			[settlement.implementations]
+
+			[networks.1]
+			chain_id = 1
+			input_settler_address = "0x1111111111111111111111111111111111111111"
+			output_settler_address = "0x2222222222222222222222222222222222222222"
+			tokens = []
+			[[networks.1.rpc_urls]]
+			http = "http://localhost:8545"
+
+			[networks.137]
+			chain_id = 137
+			input_settler_address = "0x5555555555555555555555555555555555555555"
+			output_settler_address = "0x6666666666666666666666666666666666666666"
+			tokens = []
+			[[networks.137.rpc_urls]]
+			http = "http://localhost:8546"
+		"#;
+		toml::from_str(config_toml).expect("Failed to parse test config with empty tokens")
+	}
+
 	#[tokio::test]
 	async fn test_get_tokens_from_config_returns_all_networks() {
 		let config = create_test_config();
@@ -750,6 +872,24 @@ mod tests {
 		let polygon_network = tokens_response.networks.get("137").unwrap();
 		assert_eq!(polygon_network.chain_id, 137);
 		assert_eq!(polygon_network.tokens.len(), 1);
+	}
+
+	#[tokio::test]
+	async fn test_get_tokens_from_config_returns_empty_token_arrays() {
+		let config = create_test_config_with_empty_tokens();
+		let dynamic_config = Arc::new(RwLock::new(config));
+
+		let response = get_tokens_from_config(State(dynamic_config)).await;
+		let tokens_response = response.0;
+
+		assert_eq!(tokens_response.networks.len(), 2);
+		assert!(tokens_response.networks.get("1").unwrap().tokens.is_empty());
+		assert!(tokens_response
+			.networks
+			.get("137")
+			.unwrap()
+			.tokens
+			.is_empty());
 	}
 
 	#[tokio::test]
@@ -802,5 +942,18 @@ mod tests {
 		);
 		assert_eq!(network.tokens.len(), 1);
 		assert_eq!(network.tokens[0].symbol, "USDC");
+	}
+
+	#[tokio::test]
+	async fn test_get_tokens_for_chain_from_config_empty_tokens() {
+		let config = create_test_config_with_empty_tokens();
+		let dynamic_config = Arc::new(RwLock::new(config));
+
+		let response = get_tokens_for_chain_from_config(Path(137), State(dynamic_config)).await;
+		assert!(response.is_ok());
+
+		let network = response.unwrap().0;
+		assert_eq!(network.chain_id, 137);
+		assert!(network.tokens.is_empty());
 	}
 }

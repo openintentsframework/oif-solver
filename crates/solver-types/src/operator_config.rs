@@ -177,8 +177,30 @@ pub struct OperatorSettlementConfig {
 	/// Interval in seconds for polling settlement status.
 	pub settlement_poll_interval_seconds: u64,
 
+	/// Selected settlement implementation type.
+	#[serde(default = "default_settlement_type")]
+	pub settlement_type: OperatorSettlementType,
+
 	/// Hyperlane-specific settlement configuration.
-	pub hyperlane: OperatorHyperlaneConfig,
+	#[serde(default)]
+	pub hyperlane: Option<OperatorHyperlaneConfig>,
+
+	/// Direct settlement configuration.
+	#[serde(default)]
+	pub direct: Option<OperatorDirectConfig>,
+}
+
+/// Selected settlement implementation type.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OperatorSettlementType {
+	#[default]
+	Hyperlane,
+	Direct,
+}
+
+fn default_settlement_type() -> OperatorSettlementType {
+	OperatorSettlementType::Hyperlane
 }
 
 /// Hyperlane cross-chain messaging configuration.
@@ -214,6 +236,38 @@ pub struct OperatorOracleConfig {
 
 	/// Output oracle addresses per chain.
 	pub output: HashMap<u64, Vec<Address>>,
+}
+
+/// Oracle selection strategy for direct settlement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum OperatorOracleSelectionStrategy {
+	#[default]
+	First,
+	RoundRobin,
+	Random,
+}
+
+/// Direct settlement configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorDirectConfig {
+	/// Dispute period duration in seconds.
+	#[serde(default = "default_dispute_period_seconds")]
+	pub dispute_period_seconds: u64,
+
+	/// Oracle addresses for input and output verification.
+	pub oracles: OperatorOracleConfig,
+
+	/// Valid routes: source chain -> destination chains.
+	pub routes: HashMap<u64, Vec<u64>>,
+
+	/// Strategy for selecting an oracle.
+	#[serde(default)]
+	pub oracle_selection_strategy: OperatorOracleSelectionStrategy,
+}
+
+fn default_dispute_period_seconds() -> u64 {
+	300
 }
 
 /// Gas estimation settings per flow type.
@@ -568,7 +622,8 @@ mod tests {
 			},
 			settlement: OperatorSettlementConfig {
 				settlement_poll_interval_seconds: 10,
-				hyperlane: OperatorHyperlaneConfig {
+				settlement_type: OperatorSettlementType::Hyperlane,
+				hyperlane: Some(OperatorHyperlaneConfig {
 					default_gas_limit: 300_000,
 					message_timeout_seconds: 600,
 					finalization_required: true,
@@ -579,7 +634,8 @@ mod tests {
 						output: HashMap::new(),
 					},
 					routes: HashMap::new(),
-				},
+				}),
+				direct: None,
 			},
 			gas: OperatorGasConfig {
 				resource_lock: OperatorGasFlowUnits {
@@ -624,6 +680,12 @@ mod tests {
 		assert!(parsed.networks.contains_key(&10));
 		assert_eq!(parsed.admin.admin_addresses.len(), 1);
 		assert_eq!(parsed.gas.resource_lock.fill, 77298);
+		assert_eq!(
+			parsed.settlement.settlement_type,
+			OperatorSettlementType::Hyperlane
+		);
+		assert!(parsed.settlement.hyperlane.is_some());
+		assert!(parsed.settlement.direct.is_none());
 	}
 
 	#[test]
@@ -694,5 +756,10 @@ mod tests {
 		let network = parsed.networks.get(&10).unwrap();
 		assert_eq!(network.name, "unknown");
 		assert_eq!(network.network_type, NetworkType::New);
+		assert_eq!(
+			parsed.settlement.settlement_type,
+			OperatorSettlementType::Hyperlane
+		);
+		assert!(parsed.settlement.hyperlane.is_some());
 	}
 }
