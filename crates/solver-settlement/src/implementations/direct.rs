@@ -5,13 +5,16 @@
 //! readiness checks using simple transaction receipt verification without
 //! complex attestation mechanisms.
 
-use crate::{utils::parse_oracle_config, OracleConfig, SettlementError, SettlementInterface};
+use crate::{
+	utils::{create_providers_for_chains, parse_oracle_config},
+	OracleConfig, SettlementError, SettlementInterface,
+};
 use alloy_primitives::{hex, FixedBytes, U256};
 use alloy_provider::{DynProvider, Provider};
 use async_trait::async_trait;
 use solver_types::{
-	create_http_provider, with_0x_prefix, ConfigSchema, Field, FieldType, FillProof,
-	NetworksConfig, Order, ProviderError, Schema, Transaction, TransactionHash, TransactionReceipt,
+	with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, NetworksConfig, Order, Schema,
+	Transaction, TransactionHash, TransactionReceipt,
 };
 use std::collections::HashMap;
 
@@ -38,28 +41,14 @@ impl DirectSettlement {
 		oracle_config: OracleConfig,
 		dispute_period_seconds: u64,
 	) -> Result<Self, SettlementError> {
-		// Create RPC providers for each network that has oracles configured
-		let mut providers = HashMap::new();
-
 		// Collect unique network IDs from input and output oracles
-		let mut all_network_ids: Vec<u64> = oracle_config
+		let all_network_ids: Vec<u64> = oracle_config
 			.input_oracles
 			.keys()
 			.chain(oracle_config.output_oracles.keys())
 			.copied()
 			.collect();
-		all_network_ids.sort_unstable();
-		all_network_ids.dedup();
-
-		for network_id in all_network_ids {
-			let provider = create_http_provider(network_id, networks).map_err(|e| match e {
-				ProviderError::NetworkConfig(msg) => SettlementError::ValidationFailed(msg),
-				ProviderError::Connection(msg) => SettlementError::ValidationFailed(msg),
-				ProviderError::InvalidUrl(msg) => SettlementError::ValidationFailed(msg),
-			})?;
-
-			providers.insert(network_id, provider);
-		}
+		let providers = create_providers_for_chains(&all_network_ids, networks)?;
 
 		Ok(Self {
 			providers,

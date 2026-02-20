@@ -1442,8 +1442,10 @@ mod tests {
 						output: HashMap::new(),
 					},
 					routes: HashMap::new(),
+					intent_min_expiry_seconds: None,
 				}),
 				direct: None,
+				broadcaster: None,
 			},
 			gas: OperatorGasConfig {
 				resource_lock: OperatorGasFlowUnits::default(),
