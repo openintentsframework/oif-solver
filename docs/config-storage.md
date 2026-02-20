@@ -103,9 +103,10 @@ Bootstrap config specifies which networks your solver will support. Networks can
 | `networks[].tokens[].address` | Yes | Token contract address |
 | `networks[].tokens[].decimals` | Yes | Token decimals |
 | `networks[].rpc_urls` | No | Custom RPC URLs (falls back to seed defaults) |
-| `settlement.type` | No | `"hyperlane"` (default) or `"direct"` |
+| `settlement.type` | No | `"hyperlane"` (default), `"direct"`, or `"broadcaster"` |
 | `settlement.hyperlane` | Conditional | Required for non-seeded chains when `settlement.type = "hyperlane"` |
 | `settlement.direct` | Conditional | Required when `settlement.type = "direct"` |
+| `settlement.broadcaster` | Conditional | Required when `settlement.type = "broadcaster"` |
 
 ### Required Fields For Non-Seeded Networks
 
@@ -124,6 +125,16 @@ Optional per-network fields:
 ### Settlement Examples
 
 `hyperlane` is the default settlement type when `settlement` is omitted.
+
+Intent expiry and settlement timing configuration is documented in:
+
+- `docs/oracles/settlement-timing-configuration.md`
+
+The key `intent_min_expiry_seconds` uses the same field name across:
+
+- `settlement.hyperlane.intent_min_expiry_seconds`
+- `settlement.direct.intent_min_expiry_seconds`
+- `settlement.broadcaster.intent_min_expiry_seconds`
 
 See `config/non-seeded-networks-example.json` for a full non-seeded Hyperlane example (both chain IDs are non-seeded).
 
