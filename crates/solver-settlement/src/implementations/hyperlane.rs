@@ -3,7 +3,13 @@
 //! This module provides a settlement implementation using Hyperlane's cross-chain
 //! messaging protocol for oracle attestations.
 
-use crate::{utils::parse_oracle_config, OracleConfig, SettlementError, SettlementInterface};
+use crate::{
+	utils::{
+		address_to_bytes32, check_is_proven, create_providers_for_chains, parse_address_table,
+		parse_oracle_config, SettlementMessageTracker,
+	},
+	OracleConfig, SettlementError, SettlementInterface,
+};
 use alloy_primitives::{hex, FixedBytes, U256};
 use alloy_provider::{DynProvider, Provider};
 use alloy_sol_types::{sol, SolCall};
@@ -12,13 +18,11 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use solver_storage::StorageService;
 use solver_types::{
-	create_http_provider, with_0x_prefix, ConfigSchema, Field, FieldType, FillProof,
-	InteropAddress, NetworksConfig, Order, OrderOutput, ProviderError, Schema, StorageKey,
-	Transaction, TransactionHash, TransactionReceipt, TransactionType,
+	with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, InteropAddress, NetworksConfig,
+	Order, OrderOutput, Schema, Transaction, TransactionHash, TransactionReceipt, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// Custom serialization for U256
 mod u256_serde {
@@ -329,9 +333,7 @@ struct HyperlaneMessageState {
 /// Message tracker for managing Hyperlane messages with automatic persistence
 #[derive(Clone)]
 pub struct MessageTracker {
-	storage: Arc<StorageService>,
-	/// Cache of recently accessed messages (order_id -> state)
-	cache: Arc<RwLock<HashMap<String, HyperlaneMessageState>>>,
+	tracker: SettlementMessageTracker<HyperlaneMessageState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,43 +368,15 @@ struct DeliveredMessage {
 
 impl MessageTracker {
 	/// Create a new MessageTracker with storage support
-	pub async fn new(storage: Arc<StorageService>) -> Self {
+	pub fn new(storage: Arc<StorageService>) -> Self {
 		Self {
-			storage,
-			cache: Arc::new(RwLock::new(HashMap::new())),
+			tracker: SettlementMessageTracker::new(storage, "hyperlane"),
 		}
-	}
-
-	/// Generate storage key for a specific order
-	fn storage_key(order_id: &str) -> String {
-		format!("hyperlane:{order_id}")
 	}
 
 	/// Load message state for a specific order
 	async fn load_message(&self, order_id: &str) -> Option<HyperlaneMessageState> {
-		// Check cache first
-		{
-			let cache = self.cache.read().await;
-			if let Some(state) = cache.get(order_id) {
-				return Some(state.clone());
-			}
-		}
-
-		// Try to load from storage
-		let key = Self::storage_key(order_id);
-		match self
-			.storage
-			.retrieve::<HyperlaneMessageState>(StorageKey::SettlementMessages.as_str(), &key)
-			.await
-		{
-			Ok(state) => {
-				// Update cache
-				let mut cache = self.cache.write().await;
-				cache.insert(order_id.to_string(), state.clone());
-				Some(state)
-			},
-			Err(_) => None,
-		}
+		self.tracker.load(order_id).await
 	}
 
 	/// Save message state for a specific order
@@ -411,8 +385,6 @@ impl MessageTracker {
 		order_id: &str,
 		state: &HyperlaneMessageState,
 	) -> Result<(), SettlementError> {
-		let key = Self::storage_key(order_id);
-
 		// Save to storage with TTL (7 days after message is delivered)
 		let ttl = if state.delivered.is_some() {
 			Some(std::time::Duration::from_secs(7 * 24 * 60 * 60))
@@ -420,24 +392,7 @@ impl MessageTracker {
 			None // No TTL for pending messages
 		};
 
-		self.storage
-			.store_with_ttl(
-				StorageKey::SettlementMessages.as_str(),
-				&key,
-				state,
-				None, // No indexes needed
-				ttl,
-			)
-			.await
-			.map_err(|e| {
-				SettlementError::ValidationFailed(format!("Failed to persist message state: {e}"))
-			})?;
-
-		// Update cache
-		let mut cache = self.cache.write().await;
-		cache.insert(order_id.to_string(), state.clone());
-
-		Ok(())
+		self.tracker.save(order_id, state, ttl).await
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -587,31 +542,15 @@ impl HyperlaneSettlement {
 		let provider = self.providers.get(&oracle_chain).ok_or_else(|| {
 			SettlementError::ValidationFailed(format!("No provider for chain {oracle_chain}"))
 		})?;
-
-		// Build the call
-		let call_data = IHyperlaneOracle::isProvenCall {
-			remoteChainId: U256::from(remote_chain),
-			remoteOracle: FixedBytes::<32>::from(remote_oracle),
-			application: FixedBytes::<32>::from(application),
-			dataHash: FixedBytes::<32>::from(payload_hash),
-		};
-
-		// Execute eth_call
-		let request = alloy_rpc_types::eth::transaction::TransactionRequest {
-			to: Some(alloy_primitives::TxKind::Call(
-				alloy_primitives::Address::from_slice(&oracle_address.0),
-			)),
-			input: call_data.abi_encode().into(),
-			..Default::default()
-		};
-
-		let result = provider.call(request).await.map_err(|e| {
-			SettlementError::ValidationFailed(format!("Failed to call isProven: {e}"))
-		})?;
-
-		// Decode boolean (last byte of 32-byte result)
-		let is_proven = result.len() >= 32 && result[31] != 0;
-		Ok(is_proven)
+		check_is_proven(
+			provider,
+			&oracle_address,
+			remote_chain,
+			remote_oracle,
+			application,
+			payload_hash,
+		)
+		.await
 	}
 
 	/// Check if a Hyperlane message has been delivered
@@ -672,11 +611,8 @@ impl HyperlaneSettlement {
 			.clone();
 
 		// Convert to bytes32 format
-		let mut remote_oracle_bytes = [0u8; 32];
-		remote_oracle_bytes[12..].copy_from_slice(&output_oracle.0);
-
-		let mut application_bytes = [0u8; 32];
-		application_bytes[12..].copy_from_slice(&application.0);
+		let remote_oracle_bytes = address_to_bytes32(&output_oracle);
+		let application_bytes = address_to_bytes32(&application);
 
 		let is_proven = self
 			.is_payload_proven(
@@ -762,28 +698,14 @@ impl HyperlaneSettlement {
 		default_gas_limit: u64,
 		storage: Arc<StorageService>,
 	) -> Result<Self, SettlementError> {
-		// Create RPC providers for each network that has oracles configured
-		let mut providers = HashMap::new();
-
 		// Collect unique network IDs from input and output oracles
-		let mut all_network_ids: Vec<u64> = oracle_config
+		let all_network_ids: Vec<u64> = oracle_config
 			.input_oracles
 			.keys()
 			.chain(oracle_config.output_oracles.keys())
 			.copied()
 			.collect();
-		all_network_ids.sort_unstable();
-		all_network_ids.dedup();
-
-		for network_id in &all_network_ids {
-			let provider = create_http_provider(*network_id, networks).map_err(|e| match e {
-				ProviderError::NetworkConfig(msg) => SettlementError::ValidationFailed(msg),
-				ProviderError::Connection(msg) => SettlementError::ValidationFailed(msg),
-				ProviderError::InvalidUrl(msg) => SettlementError::ValidationFailed(msg),
-			})?;
-
-			providers.insert(*network_id, provider);
-		}
+		let providers = create_providers_for_chains(&all_network_ids, networks)?;
 
 		// Validate mailbox addresses are configured for all oracle chains
 		for chain_id in &all_network_ids {
@@ -795,7 +717,7 @@ impl HyperlaneSettlement {
 		}
 
 		// Create message tracker with storage
-		let message_tracker = MessageTracker::new(storage).await;
+		let message_tracker = MessageTracker::new(storage);
 
 		Ok(Self {
 			providers,
@@ -1314,37 +1236,6 @@ impl SettlementInterface for HyperlaneSettlement {
 		}
 		Ok(())
 	}
-}
-
-/// Helper function to parse address tables from config
-fn parse_address_table(
-	table: &toml::Value,
-) -> Result<HashMap<u64, solver_types::Address>, SettlementError> {
-	let mut result = HashMap::new();
-
-	if let Some(table) = table.as_table() {
-		for (chain_id_str, address_value) in table {
-			let chain_id = chain_id_str.parse::<u64>().map_err(|e| {
-				SettlementError::ValidationFailed(format!("Invalid chain ID '{chain_id_str}': {e}"))
-			})?;
-
-			let address_str = address_value.as_str().ok_or_else(|| {
-				SettlementError::ValidationFailed(format!(
-					"Address must be string for chain {chain_id}"
-				))
-			})?;
-
-			let address = solver_types::utils::parse_address(address_str).map_err(|e| {
-				SettlementError::ValidationFailed(format!(
-					"Invalid address for chain {chain_id}: {e}"
-				))
-			})?;
-
-			result.insert(chain_id, address);
-		}
-	}
-
-	Ok(result)
 }
 
 /// Factory function to create a Hyperlane settlement provider from configuration

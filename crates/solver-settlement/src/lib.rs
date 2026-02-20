@@ -18,6 +18,7 @@ use thiserror::Error;
 
 /// Re-export implementations
 pub mod implementations {
+	pub mod broadcaster;
 	pub mod direct;
 	pub mod hyperlane;
 }
@@ -37,6 +38,21 @@ pub enum SettlementError {
 	/// Error that occurs when a fill doesn't match order requirements.
 	#[error("Fill does not match order requirements")]
 	FillMismatch,
+	/// Failed to generate storage proof data required for broadcaster verification.
+	#[error("Proof generation failed for chain {source_chain}: {reason}")]
+	ProofGenerationFailed { source_chain: u64, reason: String },
+	/// Proof generation attempted before configured finality threshold was met.
+	#[error("Finality not reached: required {required_blocks} blocks, current {current_blocks}")]
+	FinalityNotReached {
+		required_blocks: u64,
+		current_blocks: u64,
+	},
+	/// External prover/proof service is unavailable.
+	#[error("Prover unavailable: {0}")]
+	ProverUnavailable(String),
+	/// Slot derivation mismatch detected between expected and proved slot.
+	#[error("Slot derivation mismatch")]
+	SlotDerivationMismatch,
 }
 
 /// Strategy for selecting oracles when multiple are available
@@ -258,11 +274,15 @@ pub trait SettlementRegistry: ImplementationRegistry<Factory = SettlementFactory
 /// Returns a vector of (name, factory) tuples for all available settlement implementations.
 /// This is used by the factory registry to automatically register all implementations.
 pub fn get_all_implementations() -> Vec<(&'static str, SettlementFactory)> {
-	use implementations::{direct, hyperlane};
+	use implementations::{broadcaster, direct, hyperlane};
 
 	vec![
 		(direct::Registry::NAME, direct::Registry::factory()),
 		(hyperlane::Registry::NAME, hyperlane::Registry::factory()),
+		(
+			broadcaster::Registry::NAME,
+			broadcaster::Registry::factory(),
+		),
 	]
 }
 
