@@ -276,8 +276,7 @@ fn estimate_broadcaster_expiry_buffer_seconds(
 	Some((
 		required_window,
 		format!(
-			"proof_wait={}s + finality={}s + proof_timeout={}s + poll_window={}s + safety={}s",
-			proof_wait, max_finality_seconds, proof_timeout, poll_window, safety_buffer
+			"proof_wait={proof_wait}s + finality={max_finality_seconds}s + proof_timeout={proof_timeout}s + poll_window={poll_window}s + safety={safety_buffer}s"
 		),
 	))
 }
@@ -461,8 +460,7 @@ impl IntentHandler {
 					{
 						if expires_remaining < required_window {
 							let reason = format!(
-								"Insufficient settlement window: expires_in={}s required={}s ({})",
-								expires_remaining, required_window, breakdown
+								"Insufficient settlement window: expires_in={expires_remaining}s required={required_window}s ({breakdown})"
 							);
 							tracing::warn!(order_id = %order.id, %reason, "Skipping order");
 							self.event_bus

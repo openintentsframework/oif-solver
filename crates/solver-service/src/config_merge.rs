@@ -1619,7 +1619,7 @@ fn build_broadcaster_toml_from_operator(
 	for (chain_id, id) in &broadcaster.broadcaster_ids {
 		broadcaster_ids.insert(
 			chain_id.to_string(),
-			toml::Value::String(format!("{:#x}", id)),
+			toml::Value::String(format!("{id:#x}")),
 		);
 	}
 	table.insert(

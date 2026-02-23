@@ -139,19 +139,21 @@ fn extract_fill_details_from_logs(
 	);
 
 	for log in logs {
-		if log.topics.len() >= 2 && log.topics[0].0 == output_filled_signature {
-			if log.topics[1].0 == *order_id && log.data.len() >= 64 {
-				let mut solver = [0u8; 32];
-				solver.copy_from_slice(&log.data[0..32]);
-				let timestamp_bytes = &log.data[32..64];
-				let timestamp = u32::from_be_bytes([
-					timestamp_bytes[28],
-					timestamp_bytes[29],
-					timestamp_bytes[30],
-					timestamp_bytes[31],
-				]);
-				return Ok((solver, timestamp));
-			}
+		if log.topics.len() >= 2
+			&& log.topics[0].0 == output_filled_signature
+			&& log.topics[1].0 == *order_id
+			&& log.data.len() >= 64
+		{
+			let mut solver = [0u8; 32];
+			solver.copy_from_slice(&log.data[0..32]);
+			let timestamp_bytes = &log.data[32..64];
+			let timestamp = u32::from_be_bytes([
+				timestamp_bytes[28],
+				timestamp_bytes[29],
+				timestamp_bytes[30],
+				timestamp_bytes[31],
+			]);
+			return Ok((solver, timestamp));
 		}
 	}
 
@@ -263,12 +265,17 @@ fn parse_u64_table(table: &toml::Value) -> Result<HashMap<u64, u64>, SettlementE
 			let chain_id = chain_id_str.parse::<u64>().map_err(|e| {
 				SettlementError::ValidationFailed(format!("Invalid chain ID '{chain_id_str}': {e}"))
 			})?;
-			let parsed = value.as_integer().ok_or_else(|| {
+			let raw_value = value.as_integer().ok_or_else(|| {
 				SettlementError::ValidationFailed(format!(
 					"Integer value required for chain {chain_id}"
 				))
-			})? as u64;
-			result.insert(chain_id, parsed);
+			})?;
+			if raw_value < 0 {
+				return Err(SettlementError::ValidationFailed(format!(
+					"Integer value must be non-negative for chain {chain_id}"
+				)));
+			}
+			result.insert(chain_id, raw_value as u64);
 		}
 	}
 	Ok(result)
