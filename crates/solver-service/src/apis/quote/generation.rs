@@ -1121,7 +1121,7 @@ impl QuoteGenerator {
 			outputs_array.push(serde_json::json!({
 				"oracle": solver_types::utils::address_to_bytes32_hex(&output_oracle_address),
 				"settler": solver_types::utils::address_to_bytes32_hex(&output_settler),
-				"chainId": output_chain_id.to_string(),
+				"chainId": output_chain_id,
 				"token": solver_types::utils::address_to_bytes32_hex(&output_token_address),
 				"amount": amount.clone(),
 				"recipient": solver_types::utils::address_to_bytes32_hex(&recipient_address),
@@ -1142,7 +1142,7 @@ impl QuoteGenerator {
 			"domain": {
 				"name": "TheCompact",
 				"version": "1",
-				"chainId": origin_chain_id.to_string(),
+				"chainId": origin_chain_id,
 				"verifyingContract": format!("{:#x}", alloy_primitives::Address::from_slice(&network.the_compact_address.as_ref().unwrap().0))
 			},
 			"primaryType": "BatchCompact",
@@ -1219,7 +1219,7 @@ impl QuoteGenerator {
 		Ok(serde_json::json!({
 			"name": token_name,
 			"version": token_version,
-			"chainId": chain_id.to_string(),
+			"chainId": chain_id,
 			"verifyingContract": format!("0x{:040x}", alloy_token_address)
 		}))
 	}
@@ -1437,7 +1437,7 @@ impl QuoteGenerator {
 		// Build domain object similar to TheCompact and EIP-3009 structure
 		Ok(serde_json::json!({
 			"name": "Permit2",
-			"chainId": chain_id.to_string(),
+			"chainId": chain_id,
 			"verifyingContract": format!("0x{:040x}", permit2_address)
 		}))
 	}
@@ -1669,7 +1669,7 @@ impl QuoteGenerator {
 		Ok(serde_json::json!({
 			"name": "The Compact",
 			"version": "1",
-			"chainId": chain_id.to_string(),
+			"chainId": chain_id,
 			"verifyingContract": format!("{:#x}", contract_address)
 		}))
 	}
@@ -2238,6 +2238,20 @@ mod tests {
 		assert!(message_obj.contains_key("mandate"));
 		assert!(message_obj.contains_key("nonce"));
 		assert!(message_obj.contains_key("expires"));
+
+		let mandate = message_obj
+			.get("mandate")
+			.and_then(|m| m.as_object())
+			.expect("mandate should be present");
+		let outputs = mandate
+			.get("outputs")
+			.and_then(|o| o.as_array())
+			.expect("mandate.outputs should be present");
+		let first_output = outputs
+			.first()
+			.expect("at least one output should be present");
+		assert!(first_output["chainId"].is_u64());
+		assert_eq!(first_output["chainId"], 137);
 	}
 
 	#[test]
@@ -3017,7 +3031,7 @@ mod tests {
 				let domain_obj = domain.as_object().unwrap();
 				assert_eq!(domain_obj["name"], "The Compact");
 				assert_eq!(domain_obj["version"], "1");
-				assert_eq!(domain_obj["chainId"], "1");
+				assert_eq!(domain_obj["chainId"], 1);
 				assert!(domain_obj.contains_key("verifyingContract"));
 			},
 			Err(e) => {
@@ -3059,7 +3073,7 @@ mod tests {
 		let domain_obj = domain.as_object().unwrap();
 		assert!(domain_obj.contains_key("name"));
 		assert_eq!(domain_obj["version"], "1");
-		assert_eq!(domain_obj["chainId"], "1");
+		assert_eq!(domain_obj["chainId"], 1);
 		assert!(domain_obj.contains_key("verifyingContract"));
 	}
 

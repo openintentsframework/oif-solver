@@ -67,7 +67,7 @@ paths:
                       signatureType: "eip712"
                       domain:
                         name: "Permit2"
-                        chainId: "1"
+                        chainId: 1
                         verifyingContract: "0x000000000022D473030F116dDEE9F6B43aC78BA3"
                       primaryType: "PermitBatchWitnessTransferFrom"
                       message:
