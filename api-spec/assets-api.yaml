@@ -1,9 +1,9 @@
 openapi: 3.0.3
 info:
-  title: OIF Solver Tokens API
+  title: OIF Solver Assets API
   description: |
-    API endpoints for querying supported tokens and networks configured in the OIF Solver.
-    These endpoints allow third-party services to discover which tokens and networks
+    API endpoints for querying supported assets and networks configured in the OIF Solver.
+    These endpoints allow third-party services to discover which assets and networks
     the solver supports for executing cross-chain intents.
   version: 1.0.0
 servers:
@@ -13,23 +13,23 @@ servers:
     description: Production server (replace with actual URL)
 
 paths:
-  /tokens:
+  /assets:
     get:
-      summary: Get all supported tokens
+      summary: Get all supported assets
       description: |
-        Returns all supported tokens across all configured networks.
+        Returns all supported assets across all configured networks.
         This endpoint provides a comprehensive view of the solver's capabilities,
-        showing which tokens can be used for intents on each supported blockchain.
-      operationId: getAllTokens
+        showing which assets can be used for intents on each supported blockchain.
+      operationId: getAllAssets
       tags:
-        - Tokens
+        - Assets
       responses:
         "200":
-          description: Successful response with all supported tokens
+          description: Successful response with all supported assets
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/TokensResponse"
+                $ref: "#/components/schemas/AssetsResponse"
               example:
                 networks:
                   "1":
@@ -38,7 +38,7 @@ paths:
                     type: "parent"
                     input_settler: "0x1234567890abcdef1234567890abcdef12345678"
                     output_settler: "0xabcdef1234567890abcdef1234567890abcdef12"
-                    tokens:
+                    assets:
                       - address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
                         symbol: "USDC"
                         name: "USD Coin"
@@ -53,7 +53,7 @@ paths:
                     type: "new"
                     input_settler: "0x9876543210fedcba9876543210fedcba98765432"
                     output_settler: "0xfedcba9876543210fedcba9876543210fedcba98"
-                    tokens:
+                    assets:
                       - address: "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
                         symbol: "USDC"
                         name: "USD Coin"
@@ -63,16 +63,16 @@ paths:
                         name: "Tether USD"
                         decimals: 6
 
-  /tokens/{chain_id}:
+  /assets/{chain_id}:
     get:
-      summary: Get tokens for specific chain
+      summary: Get assets for specific chain
       description: |
-        Returns supported tokens for a specific blockchain network.
+        Returns supported assets for a specific blockchain network.
         Use this endpoint to check if the solver supports a particular chain
-        and which tokens are available for intents on that chain.
-      operationId: getTokensForChain
+        and which assets are available for intents on that chain.
+      operationId: getAssetsForChain
       tags:
-        - Tokens
+        - Assets
       parameters:
         - name: chain_id
           in: path
@@ -84,18 +84,18 @@ paths:
             example: 1
       responses:
         "200":
-          description: Successful response with tokens for the specified chain
+          description: Successful response with assets for the specified chain
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/NetworkTokens"
+                $ref: "#/components/schemas/NetworkAssets"
               example:
                 chain_id: 1
                 name: "ethereum"
                 type: "parent"
                 input_settler: "0x1234567890abcdef1234567890abcdef12345678"
                 output_settler: "0xabcdef1234567890abcdef1234567890abcdef12"
-                tokens:
+                assets:
                   - address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
                     symbol: "USDC"
                     name: "USD Coin"
@@ -117,26 +117,26 @@ paths:
 
 components:
   schemas:
-    TokensResponse:
+    AssetsResponse:
       type: object
-      description: Response containing all supported tokens across all networks
+      description: Response containing all supported assets across all networks
       required:
         - networks
       properties:
         networks:
           type: object
-          description: Map of chain ID (as string) to network token information
+          description: Map of chain ID (as string) to network asset information
           additionalProperties:
-            $ref: "#/components/schemas/NetworkTokens"
+            $ref: "#/components/schemas/NetworkAssets"
 
-    NetworkTokens:
+    NetworkAssets:
       type: object
-      description: Token information for a specific blockchain network
+      description: Asset information for a specific blockchain network
       required:
         - chain_id
         - input_settler
         - output_settler
-        - tokens
+        - assets
       properties:
         chain_id:
           type: integer
@@ -163,15 +163,15 @@ components:
           pattern: "^0x[a-fA-F0-9]{40}$"
           description: Output settler contract address for this network
           example: "0xabcdef1234567890abcdef1234567890abcdef12"
-        tokens:
+        assets:
           type: array
-          description: List of supported tokens on this network
+          description: List of supported assets on this network
           items:
-            $ref: "#/components/schemas/TokenInfo"
+            $ref: "#/components/schemas/AssetInfo"
 
-    TokenInfo:
+    AssetInfo:
       type: object
-      description: Information about a specific token
+      description: Information about a specific asset
       required:
         - address
         - symbol
@@ -180,26 +180,26 @@ components:
         address:
           type: string
           pattern: "^0x[a-fA-F0-9]{40}$"
-          description: Token contract address
+          description: Asset contract address
           example: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
         symbol:
           type: string
-          description: Token symbol (e.g., "USDC", "USDT", "WETH")
+          description: Asset symbol (e.g., "USDC", "USDT", "WETH")
           example: "USDC"
         name:
           type: string
           nullable: true
-          description: Optional token name (e.g., "USD Coin")
+          description: Optional asset name (e.g., "USD Coin")
           example: "USD Coin"
         decimals:
           type: integer
           minimum: 0
           maximum: 255
-          description: Number of decimal places for the token
+          description: Number of decimal places for the asset
           example: 6
 
 tags:
-  - name: Tokens
+  - name: Assets
     description: |
-      Endpoints for querying supported tokens and networks.
-      Use these endpoints to discover solver supported network-token routes.
+      Endpoints for querying supported assets and networks.
+      Use these endpoints to discover solver supported network-asset routes.
