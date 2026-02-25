@@ -64,6 +64,21 @@ sol! {
 		uint256 deadline;
 	}
 
+	/// A single token item for batch additions
+	struct AddTokenItem {
+		uint256 chainId;
+		string symbol;
+		address tokenAddress;
+		uint8 decimals;
+	}
+
+	/// Add multiple tokens in one admin action
+	struct AddTokens {
+		AddTokenItem[] tokens;
+		uint256 nonce;
+		uint256 deadline;
+	}
+
 	/// Remove a token from a network
 	struct RemoveToken {
 		uint256 chainId;
@@ -186,6 +201,60 @@ impl AddTokenContents {
 	}
 
 	/// Compute the EIP-712 struct hash using Alloy's built-in support
+	pub fn struct_hash(&self) -> FixedBytes<32> {
+		use alloy_sol_types::SolStruct;
+		self.to_eip712().eip712_hash_struct()
+	}
+}
+
+/// AddToken item contents for batch token addition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddTokenItemContents {
+	pub chain_id: u64,
+	pub symbol: String,
+	/// Optional display name metadata.
+	/// This is persisted in config but not included in the EIP-712 hash.
+	#[serde(default)]
+	pub name: Option<String>,
+	pub token_address: Address,
+	pub decimals: u8,
+}
+
+impl AddTokenItemContents {
+	/// Convert to EIP-712 struct for hashing.
+	pub fn to_eip712(&self) -> AddTokenItem {
+		AddTokenItem {
+			chainId: U256::from(self.chain_id),
+			symbol: self.symbol.clone(),
+			tokenAddress: self.token_address,
+			decimals: self.decimals,
+		}
+	}
+}
+
+/// AddTokens action contents (batch add).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddTokensContents {
+	pub tokens: Vec<AddTokenItemContents>,
+	#[serde(with = "string_or_number")]
+	pub nonce: u64,
+	#[serde(with = "string_or_number")]
+	pub deadline: u64,
+}
+
+impl AddTokensContents {
+	/// Convert to EIP-712 struct for hashing.
+	pub fn to_eip712(&self) -> AddTokens {
+		AddTokens {
+			tokens: self.tokens.iter().map(|token| token.to_eip712()).collect(),
+			nonce: U256::from(self.nonce),
+			deadline: U256::from(self.deadline),
+		}
+	}
+
+	/// Compute the EIP-712 struct hash using Alloy's built-in support.
 	pub fn struct_hash(&self) -> FixedBytes<32> {
 		use alloy_sol_types::SolStruct;
 		self.to_eip712().eip712_hash_struct()
@@ -511,6 +580,20 @@ impl AdminAction for AddTokenContents {
 	}
 }
 
+impl AdminAction for AddTokensContents {
+	fn nonce(&self) -> u64 {
+		self.nonce
+	}
+
+	fn deadline(&self) -> u64 {
+		self.deadline
+	}
+
+	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
+		Ok(AddTokensContents::struct_hash(self))
+	}
+}
+
 impl AdminAction for RemoveTokenContents {
 	fn nonce(&self) -> u64 {
 		self.nonce
@@ -746,6 +829,100 @@ mod tests {
 		// Different chain should produce different hash
 		let hash_other = contents.message_hash(10).unwrap();
 		assert_ne!(hash, hash_other);
+	}
+
+	#[test]
+	fn test_add_tokens_struct_hash() {
+		let contents = AddTokensContents {
+			tokens: vec![
+				AddTokenItemContents {
+					chain_id: 10,
+					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
+					token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85")
+						.unwrap(),
+					decimals: 6,
+				},
+				AddTokenItemContents {
+					chain_id: 10,
+					symbol: "USDT".to_string(),
+					name: Some("Tether USD".to_string()),
+					token_address: Address::from_str("0xdAC17F958D2ee523a2206206994597C13D831ec7")
+						.unwrap(),
+					decimals: 6,
+				},
+			],
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		let hash = contents.struct_hash();
+		let hash2 = contents.struct_hash();
+		assert_eq!(hash.len(), 32);
+		assert_eq!(hash, hash2);
+	}
+
+	#[test]
+	fn test_add_tokens_message_hash_order_sensitive() {
+		let token_a = AddTokenItemContents {
+			chain_id: 10,
+			symbol: "USDC".to_string(),
+			name: Some("USD Coin".to_string()),
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			decimals: 6,
+		};
+		let token_b = AddTokenItemContents {
+			chain_id: 10,
+			symbol: "USDT".to_string(),
+			name: Some("Tether USD".to_string()),
+			token_address: Address::from_str("0xdAC17F958D2ee523a2206206994597C13D831ec7").unwrap(),
+			decimals: 6,
+		};
+
+		let contents_1 = AddTokensContents {
+			tokens: vec![token_a.clone(), token_b.clone()],
+			nonce: 99,
+			deadline: 1706184000,
+		};
+		let contents_2 = AddTokensContents {
+			tokens: vec![token_b, token_a],
+			nonce: 99,
+			deadline: 1706184000,
+		};
+
+		let hash_1 = contents_1.message_hash(1).unwrap();
+		let hash_2 = contents_2.message_hash(1).unwrap();
+		assert_ne!(hash_1, hash_2);
+	}
+
+	#[test]
+	fn test_add_tokens_contents_deserialization_from_json() {
+		let json = r#"{
+			"tokens": [
+				{
+					"chainId": 10,
+					"symbol": "USDC",
+					"name": "USD Coin",
+					"tokenAddress": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
+					"decimals": 6
+				},
+				{
+					"chainId": 137,
+					"symbol": "USDT",
+					"tokenAddress": "0xc2132D05D31c914a87C6611C10748AaCBfA6fD92",
+					"decimals": 6
+				}
+			],
+			"nonce": "12345678901234",
+			"deadline": "1706184000"
+		}"#;
+
+		let contents: AddTokensContents = serde_json::from_str(json).unwrap();
+		assert_eq!(contents.tokens.len(), 2);
+		assert_eq!(contents.tokens[0].name.as_deref(), Some("USD Coin"));
+		assert_eq!(contents.tokens[1].name, None);
+		assert_eq!(contents.nonce, 12345678901234);
+		assert_eq!(contents.deadline, 1706184000);
 	}
 
 	#[test]

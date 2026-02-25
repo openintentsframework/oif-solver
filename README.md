@@ -904,6 +904,8 @@ The admin API enables authorized wallet addresses to perform administrative oper
     ```
   - The signature must be an EIP-712 typed data signature from an authorized admin
   - Changes are hot-reloaded immediately (no restart required)
+- **POST `/api/v1/admin/tokens/batch`** - Add multiple tokens in one signed request (protected)
+  - `contents.tokens` contains 2-50 entries with `chainId`, `symbol`, `name` (optional), `tokenAddress`, and `decimals`
 
 - **DELETE `/api/v1/admin/tokens`** - Remove a token from a network (protected)
 - **POST `/api/v1/admin/tokens/approve`** - Approve token allowance for settlements (protected)
