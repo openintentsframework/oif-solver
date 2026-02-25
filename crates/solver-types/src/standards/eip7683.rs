@@ -424,7 +424,11 @@ impl interfaces::StandardOrder {
 
 		let origin_chain_id = domain
 			.get("chainId")
-			.and_then(|c| c.as_str().and_then(|s| s.parse::<u64>().ok()))
+			.and_then(|c| {
+				c.as_str()
+					.and_then(|s| s.parse::<u64>().ok())
+					.or_else(|| c.as_u64())
+			})
 			.map(U256::from)
 			.ok_or("Missing chainId in domain")?;
 
@@ -798,8 +802,11 @@ impl interfaces::StandardOrder {
 		// Extract origin chain ID from domain
 		let origin_chain_id = domain
 			.get("chainId")
-			.and_then(|c| c.as_str())
-			.and_then(|s| s.parse::<u64>().ok())
+			.and_then(|c| {
+				c.as_str()
+					.and_then(|s| s.parse::<u64>().ok())
+					.or_else(|| c.as_u64())
+			})
 			.map(U256::from)
 			.unwrap_or(U256::from(1));
 
@@ -1163,6 +1170,116 @@ mod tests {
 
 		let resource_lock: LockType = serde_json::from_str("\"resource_lock\"").unwrap();
 		assert_eq!(resource_lock, LockType::ResourceLock);
+	}
+
+	#[cfg(feature = "oif-interfaces")]
+	#[test]
+	fn test_from_permit2_accepts_numeric_domain_chain_id() {
+		use crate::api::{OrderPayload, SignatureType};
+		use crate::OifOrder;
+		use std::convert::TryFrom;
+
+		let payload = OrderPayload {
+			signature_type: SignatureType::Eip712,
+			domain: serde_json::json!({
+				"name": "Permit2",
+				"chainId": 1,
+				"verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+			}),
+			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
+			message: serde_json::json!({
+				"user": "0x1111111111111111111111111111111111111111",
+				"permitted": [
+					{
+						"token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+						"amount": "1000"
+					}
+				],
+				"nonce": "1",
+				"deadline": "2",
+				"witness": {
+					"expires": 3,
+					"inputOracle": "0x2222222222222222222222222222222222222222",
+					"outputs": [
+						{
+							"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
+							"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
+							"chainId": 137,
+							"token": "0x000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+							"amount": "900",
+							"recipient": "0x0000000000000000000000005555555555555555555555555555555555555555",
+							"callbackData": "0x",
+							"context": "0x"
+						}
+					]
+				}
+			}),
+			types: None,
+		};
+
+		let order = OifOrder::OifEscrowV0 { payload };
+		let standard_order = interfaces::StandardOrder::try_from(&order)
+			.expect("numeric domain chainId should be accepted for permit2 payload");
+
+		assert_eq!(standard_order.originChainId, U256::from(1u64));
+		assert_eq!(standard_order.outputs.len(), 1);
+		assert_eq!(standard_order.outputs[0].chainId, U256::from(137u64));
+	}
+
+	#[cfg(feature = "oif-interfaces")]
+	#[test]
+	fn test_from_batch_compact_accepts_numeric_domain_chain_id() {
+		use crate::api::{OrderPayload, SignatureType};
+		use crate::OifOrder;
+		use std::convert::TryFrom;
+
+		let payload = OrderPayload {
+			signature_type: SignatureType::Eip712,
+			domain: serde_json::json!({
+				"name": "The Compact",
+				"version": "1",
+				"chainId": 1,
+				"verifyingContract": "0x6666666666666666666666666666666666666666"
+			}),
+			primary_type: "BatchCompact".to_string(),
+			message: serde_json::json!({
+				"sponsor": "0x1111111111111111111111111111111111111111",
+				"nonce": "1",
+				"expires": "3",
+				"commitments": [
+					{
+						"lockTag": "0x0102030405060708090a0b0c",
+						"token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+						"amount": "1000"
+					}
+				],
+				"mandate": {
+					"fillDeadline": "2",
+					"inputOracle": "0x2222222222222222222222222222222222222222",
+					"outputs": [
+						{
+							"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
+							"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
+							"chainId": 137,
+							"token": "0x000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+							"amount": "900",
+							"recipient": "0x0000000000000000000000005555555555555555555555555555555555555555",
+							"callbackData": "0x",
+							"context": "0x"
+						}
+					]
+				}
+			}),
+			types: None,
+		};
+
+		let order = OifOrder::OifResourceLockV0 { payload };
+		let standard_order = interfaces::StandardOrder::try_from(&order)
+			.expect("numeric domain chainId should be accepted for compact payload");
+
+		assert_eq!(standard_order.originChainId, U256::from(1u64));
+		assert_eq!(standard_order.outputs.len(), 1);
+		assert_eq!(standard_order.outputs[0].chainId, U256::from(137u64));
 	}
 
 	#[test]

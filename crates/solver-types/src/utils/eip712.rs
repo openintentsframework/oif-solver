@@ -138,9 +138,12 @@ pub fn reconstruct_permit2_digest(
 	// 1. Compute domain hash
 	let chain_id = domain
 		.get("chainId")
-		.and_then(|c| c.as_str())
-		.ok_or("Missing chainId")?
-		.parse::<u64>()?;
+		.and_then(|c| {
+			c.as_str()
+				.and_then(|s| s.parse::<u64>().ok())
+				.or_else(|| c.as_u64())
+		})
+		.ok_or("Missing or invalid chainId")?;
 	let name = domain
 		.get("name")
 		.and_then(|n| n.as_str())
@@ -1143,6 +1146,28 @@ mod tests {
 
 		let result = reconstruct_permit2_digest(&payload);
 		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_reconstruct_permit2_digest_accepts_numeric_domain_chain_id() {
+		use crate::api::OrderPayload;
+		use serde_json::json;
+
+		let payload = OrderPayload {
+			signature_type: crate::api::SignatureType::Eip712,
+			domain: json!({
+				"name": "Permit2",
+				"chainId": 1,
+				"verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+			}),
+			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
+			message: json!(null),
+			types: None,
+		};
+
+		let result = reconstruct_permit2_digest(&payload);
+		assert!(result.is_err());
+		assert!(result.unwrap_err().to_string().contains("Missing message"));
 	}
 
 	#[test]
