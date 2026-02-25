@@ -10,15 +10,19 @@
 //! ```json
 //! {
 //!   "solver_id": "my-solver-instance",
+//!   "solver_name": "My Solver Instance",
 //!   "networks": [
 //!     {
 //!       "chain_id": 10,
+//!       "name": "optimism",
+//!       "type": "parent",
 //!       "tokens": [
-//!         {"symbol": "USDC", "address": "0x...", "decimals": 6}
+//!         {"symbol": "USDC", "name": "USD Coin", "address": "0x...", "decimals": 6}
 //!       ],
 //!       "rpc_urls": ["https://user-rpc.com"]
 //!     }
 //!   ],
+//!   "auth_enabled": true,
 //!   "min_profitability_pct": "2.0",
 //!   "gas_buffer_bps": 1500,
 //!   "admin": {
@@ -29,9 +33,11 @@
 //! }
 //! ```
 
+use crate::networks::NetworkType;
 use alloy_primitives::Address;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Seed overrides received from UI/CLI for deploying a new solver.
 ///
@@ -46,9 +52,22 @@ pub struct SeedOverrides {
 	#[serde(default)]
 	pub solver_id: Option<String>,
 
+	/// Optional human-readable solver name for display and identification.
+	#[serde(default)]
+	pub solver_name: Option<String>,
+
 	/// List of networks the solver should support.
 	/// Each network must exist in the seed configuration.
 	pub networks: Vec<NetworkOverride>,
+
+	/// Optional settlement override.
+	/// If omitted, defaults to Hyperlane.
+	#[serde(default)]
+	pub settlement: Option<SettlementOverride>,
+
+	/// Optional routing defaults for fallback route generation.
+	#[serde(default)]
+	pub routing_defaults: Option<RoutingDefaults>,
 
 	/// Optional account configuration to override the default local wallet.
 	/// Use this to configure KMS or other account implementations.
@@ -59,6 +78,11 @@ pub struct SeedOverrides {
 	/// If provided, enables admin API endpoints with EIP-712 signature auth.
 	#[serde(default)]
 	pub admin: Option<AdminOverride>,
+
+	/// Enable JWT authentication on API routes.
+	/// When true, orders and protected admin endpoints require a JWT.
+	#[serde(default)]
+	pub auth_enabled: Option<bool>,
 
 	/// Minimum profitability percentage (e.g., 1.0 = 1%).
 	/// If not set, uses seed default (typically 1.0%).
@@ -79,6 +103,121 @@ pub struct SeedOverrides {
 	/// If not set, uses default.
 	#[serde(default)]
 	pub rate_buffer_bps: Option<u32>,
+}
+
+/// Supported settlement type overrides.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SettlementTypeOverride {
+	#[default]
+	Hyperlane,
+	Direct,
+}
+
+fn default_settlement_type_override() -> SettlementTypeOverride {
+	SettlementTypeOverride::Hyperlane
+}
+
+/// Settlement override payload from initializer JSON.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettlementOverride {
+	/// Settlement implementation type.
+	#[serde(default = "default_settlement_type_override", rename = "type")]
+	pub settlement_type: SettlementTypeOverride,
+
+	/// Hyperlane settlement configuration override.
+	#[serde(default)]
+	pub hyperlane: Option<HyperlaneSettlementOverride>,
+
+	/// Direct settlement configuration override.
+	#[serde(default)]
+	pub direct: Option<DirectSettlementOverride>,
+}
+
+/// Oracle map overrides used by settlement implementations.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OracleOverrides {
+	/// Input oracle addresses by chain ID.
+	#[serde(default)]
+	pub input: HashMap<u64, Vec<Address>>,
+
+	/// Output oracle addresses by chain ID.
+	#[serde(default)]
+	pub output: HashMap<u64, Vec<Address>>,
+}
+
+/// Hyperlane settlement override payload.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HyperlaneSettlementOverride {
+	/// Mailbox addresses by chain ID.
+	#[serde(default)]
+	pub mailboxes: HashMap<u64, Address>,
+
+	/// IGP addresses by chain ID.
+	#[serde(default)]
+	pub igp_addresses: HashMap<u64, Address>,
+
+	/// Oracle maps.
+	#[serde(default)]
+	pub oracles: OracleOverrides,
+
+	/// Route map: source chain -> destination chains.
+	#[serde(default)]
+	pub routes: HashMap<u64, Vec<u64>>,
+
+	/// Optional default gas limit override.
+	#[serde(default)]
+	pub default_gas_limit: Option<u64>,
+
+	/// Optional message timeout override.
+	#[serde(default)]
+	pub message_timeout_seconds: Option<u64>,
+
+	/// Optional finalization required override.
+	#[serde(default)]
+	pub finalization_required: Option<bool>,
+}
+
+/// Direct settlement override payload.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DirectSettlementOverride {
+	/// Oracle maps.
+	#[serde(default)]
+	pub oracles: OracleOverrides,
+
+	/// Route map: source chain -> destination chains.
+	#[serde(default)]
+	pub routes: HashMap<u64, Vec<u64>>,
+
+	/// Optional dispute period in seconds.
+	#[serde(default)]
+	pub dispute_period_seconds: Option<u64>,
+
+	/// Optional oracle selection strategy.
+	#[serde(default)]
+	pub oracle_selection_strategy: Option<OracleSelectionStrategyOverride>,
+}
+
+/// Oracle selection strategy override.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum OracleSelectionStrategyOverride {
+	#[default]
+	First,
+	RoundRobin,
+	Random,
+}
+
+/// Routing fallback defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RoutingDefaults {
+	/// Optional preferred parent chain ID.
+	#[serde(default)]
+	pub parent_chain_id: Option<u64>,
+
+	/// Optional preferred hub chain ID.
+	#[serde(default)]
+	pub hub_chain_id: Option<u64>,
 }
 
 /// Account configuration override for non-default signing backends.
@@ -186,6 +325,14 @@ pub struct NetworkOverride {
 	/// Must exist in the seed configuration.
 	pub chain_id: u64,
 
+	/// Optional human-readable network name override.
+	#[serde(default)]
+	pub name: Option<String>,
+
+	/// Network role classification.
+	#[serde(default, rename = "type")]
+	pub network_type: Option<NetworkType>,
+
 	/// Tokens this solver will support on this network.
 	/// Required - different solvers support different tokens.
 	pub tokens: Vec<Token>,
@@ -194,6 +341,26 @@ pub struct NetworkOverride {
 	/// If not provided, defaults from the seed will be used.
 	#[serde(default)]
 	pub rpc_urls: Option<Vec<String>>,
+
+	/// Optional input settler override.
+	#[serde(default)]
+	pub input_settler_address: Option<Address>,
+
+	/// Optional output settler override.
+	#[serde(default)]
+	pub output_settler_address: Option<Address>,
+
+	/// Optional compact input settler override.
+	#[serde(default)]
+	pub input_settler_compact_address: Option<Address>,
+
+	/// Optional The Compact contract override.
+	#[serde(default)]
+	pub the_compact_address: Option<Address>,
+
+	/// Optional allocator override.
+	#[serde(default)]
+	pub allocator_address: Option<Address>,
 }
 
 /// Token configuration for a specific network.
@@ -201,6 +368,10 @@ pub struct NetworkOverride {
 pub struct Token {
 	/// Token symbol (e.g., "USDC", "WETH").
 	pub symbol: String,
+
+	/// Optional human-readable token name (e.g., "USD Coin").
+	#[serde(default)]
+	pub name: Option<String>,
 
 	/// Token contract address on this network.
 	pub address: Address,
@@ -223,6 +394,14 @@ impl SeedOverrides {
 	/// Get the network override for a specific chain.
 	pub fn get_network(&self, chain_id: u64) -> Option<&NetworkOverride> {
 		self.networks.iter().find(|n| n.chain_id == chain_id)
+	}
+
+	/// Get settlement type override, defaulting to Hyperlane.
+	pub fn settlement_type(&self) -> SettlementTypeOverride {
+		self.settlement
+			.as_ref()
+			.map(|s| s.settlement_type)
+			.unwrap_or_default()
 	}
 }
 
@@ -311,24 +490,42 @@ mod tests {
 	fn test_chain_ids() {
 		let config = SeedOverrides {
 			solver_id: None,
+			solver_name: None,
 			networks: vec![
 				NetworkOverride {
 					chain_id: 10,
+					name: None,
+					network_type: None,
 					tokens: vec![],
 					rpc_urls: None,
+					input_settler_address: None,
+					output_settler_address: None,
+					input_settler_compact_address: None,
+					the_compact_address: None,
+					allocator_address: None,
 				},
 				NetworkOverride {
 					chain_id: 8453,
+					name: None,
+					network_type: None,
 					tokens: vec![],
 					rpc_urls: None,
+					input_settler_address: None,
+					output_settler_address: None,
+					input_settler_compact_address: None,
+					the_compact_address: None,
+					allocator_address: None,
 				},
 			],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			settlement: None,
+			routing_defaults: None,
 		};
 
 		let chain_ids = config.chain_ids();
@@ -339,17 +536,28 @@ mod tests {
 	fn test_has_chain() {
 		let config = SeedOverrides {
 			solver_id: None,
+			solver_name: None,
 			networks: vec![NetworkOverride {
 				chain_id: 10,
+				name: None,
+				network_type: None,
 				tokens: vec![],
 				rpc_urls: None,
+				input_settler_address: None,
+				output_settler_address: None,
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
 			}],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			settlement: None,
+			routing_defaults: None,
 		};
 
 		assert!(config.has_chain(10));
@@ -360,21 +568,33 @@ mod tests {
 	fn test_get_network() {
 		let config = SeedOverrides {
 			solver_id: None,
+			solver_name: None,
 			networks: vec![NetworkOverride {
 				chain_id: 10,
+				name: None,
+				network_type: None,
 				tokens: vec![Token {
 					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
 					address: test_address(),
 					decimals: 6,
 				}],
 				rpc_urls: None,
+				input_settler_address: None,
+				output_settler_address: None,
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
 			}],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			settlement: None,
+			routing_defaults: None,
 		};
 
 		let network = config.get_network(10);
@@ -390,16 +610,31 @@ mod tests {
 			chain_id: 10,
 			tokens: vec![Token {
 				symbol: "USDC".to_string(),
+				name: Some("USD Coin".to_string()),
 				address: test_address(),
 				decimals: 6,
 			}],
+			name: None,
+			network_type: None,
 			rpc_urls: None,
+			input_settler_address: None,
+			output_settler_address: None,
+			input_settler_compact_address: None,
+			the_compact_address: None,
+			allocator_address: None,
 		};
 
 		let without_tokens = NetworkOverride {
 			chain_id: 10,
 			tokens: vec![],
+			name: None,
+			network_type: None,
 			rpc_urls: None,
+			input_settler_address: None,
+			output_settler_address: None,
+			input_settler_compact_address: None,
+			the_compact_address: None,
+			allocator_address: None,
 		};
 
 		assert!(with_tokens.has_tokens());
@@ -410,28 +645,43 @@ mod tests {
 	fn test_json_roundtrip() {
 		let config = SeedOverrides {
 			solver_id: Some("test-solver".to_string()),
+			solver_name: Some("Test Solver".to_string()),
 			networks: vec![NetworkOverride {
 				chain_id: 10,
+				name: Some("optimism".to_string()),
+				network_type: Some(NetworkType::Parent),
 				tokens: vec![Token {
 					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
 					address: test_address(),
 					decimals: 6,
 				}],
 				rpc_urls: Some(vec!["https://rpc.com".to_string()]),
+				input_settler_address: None,
+				output_settler_address: None,
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
 			}],
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			settlement: None,
+			routing_defaults: None,
 		};
 
 		let json = serde_json::to_string(&config).unwrap();
 		let parsed: SeedOverrides = serde_json::from_str(&json).unwrap();
 
+		assert_eq!(parsed.solver_name, Some("Test Solver".to_string()));
 		assert_eq!(parsed.networks.len(), 1);
 		assert_eq!(parsed.networks[0].chain_id, 10);
+		assert_eq!(parsed.networks[0].name, Some("optimism".to_string()));
+		assert_eq!(parsed.networks[0].network_type, Some(NetworkType::Parent));
 		assert_eq!(parsed.networks[0].tokens[0], config.networks[0].tokens[0]);
 	}
 

@@ -107,10 +107,18 @@ pub struct AuthConfig {
 	pub refresh_token_expiry_hours: u32,
 	/// JWT issuer identifier
 	pub issuer: String,
+	/// Whether public self-registration endpoint is enabled.
+	/// Defaults to false for safer behavior.
+	#[serde(default = "default_public_register_enabled")]
+	pub public_register_enabled: bool,
 	/// Admin authentication configuration (optional)
 	/// If not present, admin authentication via wallet signatures is disabled
 	#[serde(default)]
 	pub admin: Option<AdminConfig>,
+}
+
+fn default_public_register_enabled() -> bool {
+	false
 }
 
 /// Admin authentication configuration for wallet-based admin operations.
@@ -303,6 +311,7 @@ mod tests {
 		let config: AuthConfig = serde_json::from_str(json).unwrap();
 
 		assert!(config.admin.is_some());
+		assert!(!config.public_register_enabled);
 		let admin = config.admin.unwrap();
 		assert!(admin.enabled);
 		assert_eq!(admin.domain, "solver.example.com");
@@ -322,5 +331,22 @@ mod tests {
 		let config: AuthConfig = serde_json::from_str(json).unwrap();
 
 		assert!(config.admin.is_none());
+		assert!(!config.public_register_enabled);
+	}
+
+	#[test]
+	fn test_auth_config_with_public_register_enabled() {
+		let json = r#"{
+			"enabled": true,
+			"jwt_secret": "test-secret-at-least-32-characters-long",
+			"access_token_expiry_hours": 1,
+			"refresh_token_expiry_hours": 720,
+			"issuer": "oif-solver",
+			"public_register_enabled": true
+		}"#;
+
+		let config: AuthConfig = serde_json::from_str(json).unwrap();
+
+		assert!(config.public_register_enabled);
 	}
 }

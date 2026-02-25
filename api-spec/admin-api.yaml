@@ -61,6 +61,52 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AdminAuthErrorResponse"
+    post:
+      summary: Create admin nonce
+      description: |
+        Generates a nonce used to sign subsequent admin actions.
+        This endpoint is equivalent to `GET /admin/nonce`.
+      operationId: createAdminNonce
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Nonce generated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NonceResponse"
+              example:
+                nonce: "12345678901234567890"
+                expiresIn: 300
+                domain: "solver.example.com"
+                chainId: 1
+        "400":
+          description: Invalid request or nonce generation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "401":
+          description: Unauthorized (signature or JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
 
   /admin/types:
     get:
@@ -258,6 +304,7 @@ paths:
               contents:
                 chainId: 10
                 symbol: "USDC"
+                name: "USD Coin"
                 tokenAddress: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
                 decimals: 6
                 nonce: "12345678901234"
@@ -265,6 +312,71 @@ paths:
       responses:
         "200":
           description: Token added
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminActionResponse"
+        "400":
+          description: Invalid request or message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "401":
+          description: Unauthorized (signature or JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+
+  /admin/tokens/batch:
+    post:
+      summary: Add multiple tokens to networks
+      description: |
+        Adds 2 or more tokens to network configurations in a single signed request.
+        Requires an EIP-712 signed request body.
+      operationId: addAdminTokensBatch
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignedAdminRequestAddTokens"
+            example:
+              signature: "0x..."
+              contents:
+                tokens:
+                  - chainId: 10
+                    symbol: "USDC"
+                    name: "USD Coin"
+                    tokenAddress: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+                    decimals: 6
+                  - chainId: 10
+                    symbol: "USDT"
+                    name: "Tether USD"
+                    tokenAddress: "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+                    decimals: 6
+                nonce: "12345678901234"
+                deadline: "1706184000"
+      responses:
+        "200":
+          description: Tokens added
           content:
             application/json:
               schema:
@@ -708,6 +820,19 @@ components:
         contents:
           $ref: "#/components/schemas/AddTokenContents"
 
+    SignedAdminRequestAddTokens:
+      type: object
+      required:
+        - signature
+        - contents
+      properties:
+        signature:
+          type: string
+          description: Hex-encoded EIP-712 signature (65 bytes)
+          pattern: "^0x[a-fA-F0-9]+$"
+        contents:
+          $ref: "#/components/schemas/AddTokensContents"
+
     SignedAdminRequestAddAdmin:
       type: object
       required:
@@ -758,6 +883,11 @@ components:
         symbol:
           type: string
           example: "USDC"
+        name:
+          type: string
+          nullable: true
+          description: Optional token display name metadata
+          example: "USD Coin"
         tokenAddress:
           type: string
           pattern: "^0x[a-fA-F0-9]{40}$"
@@ -767,6 +897,58 @@ components:
           minimum: 0
           maximum: 255
           example: 6
+        nonce:
+          type: string
+          description: Nonce as a string (number also accepted by server)
+          example: "12345678901234"
+        deadline:
+          type: string
+          description: Unix timestamp (seconds) as a string (number also accepted)
+          example: "1706184000"
+
+    AddTokenItemContents:
+      type: object
+      required:
+        - chainId
+        - symbol
+        - tokenAddress
+        - decimals
+      properties:
+        chainId:
+          type: integer
+          format: int64
+          example: 10
+        symbol:
+          type: string
+          example: "USDC"
+        name:
+          type: string
+          nullable: true
+          description: Optional token display name metadata
+          example: "USD Coin"
+        tokenAddress:
+          type: string
+          pattern: "^0x[a-fA-F0-9]{40}$"
+          example: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+        decimals:
+          type: integer
+          minimum: 0
+          maximum: 255
+          example: 6
+
+    AddTokensContents:
+      type: object
+      required:
+        - tokens
+        - nonce
+        - deadline
+      properties:
+        tokens:
+          type: array
+          minItems: 2
+          maxItems: 50
+          items:
+            $ref: "#/components/schemas/AddTokenItemContents"
         nonce:
           type: string
           description: Nonce as a string (number also accepted by server)
@@ -975,6 +1157,10 @@ components:
         symbol:
           type: string
           example: "USDC"
+        name:
+          type: string
+          nullable: true
+          example: "USD Coin"
         decimals:
           type: integer
           example: 6
@@ -998,6 +1184,10 @@ components:
         solverId:
           type: string
           example: "solver-abc123"
+        solverName:
+          type: string
+          nullable: true
+          example: "My Solver"
         networks:
           type: array
           items:
@@ -1017,6 +1207,8 @@ components:
       type: object
       required:
         - chainId
+        - name
+        - type
         - rpcUrls
         - tokens
         - inputSettler
@@ -1026,6 +1218,13 @@ components:
           type: integer
           format: int64
           example: 84532
+        name:
+          type: string
+          example: "base-sepolia"
+        type:
+          type: string
+          enum: ["parent", "hub", "new"]
+          example: "hub"
         rpcUrls:
           type: array
           items:
@@ -1052,6 +1251,10 @@ components:
         symbol:
           type: string
           example: "USDC"
+        name:
+          type: string
+          nullable: true
+          example: "USD Coin"
         address:
           type: string
           example: "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"

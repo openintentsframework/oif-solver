@@ -6,16 +6,19 @@ info:
 
     ## Authentication Flow
 
-    1. **Client Registration**: POST /auth/register to obtain initial access and refresh tokens
-    2. **API Access**: Include access token in Authorization header: `Bearer <access_token>`
-    3. **Token Refresh**: When access token expires, POST /auth/refresh with refresh token to get new tokens
-    4. **Scope-Based Authorization**: Different endpoints require different scopes
+    1. **SIWE Admin Auth**: POST /auth/siwe/nonce then POST /auth/siwe/verify to obtain admin access + refresh tokens
+    2. **Optional Public Registration**: POST /auth/register (if enabled) for non-admin scopes
+    3. **API Access**: Include access token in Authorization header: `Bearer <access_token>`
+    4. **Token Refresh**: For register-issued or SIWE-issued tokens, POST /auth/refresh with refresh token
+    5. **Scope-Based Authorization**: Different endpoints require different scopes
 
     ## Token Lifecycle
 
-    - **Access Tokens**: Short-lived (default 1 hour), used for API authentication
+    - **Access Tokens**: Short-lived, used for API authentication
+    - **SIWE Access Tokens**: Default 900 seconds (with current constants)
+    - **SIWE Refresh Tokens**: Issued by /auth/siwe/verify and compatible with /auth/refresh
     - **Refresh Tokens**: Long-lived (default 30 days), used to obtain new access tokens
-    - **Token Rotation**: Each refresh invalidates the old refresh token and issues a new one
+    - **Token Rotation**: Refresh endpoint returns a new refresh token
 
     ## Scopes
 
@@ -26,8 +29,8 @@ info:
     ## Security Notes
 
     - Authentication is optional and configured per solver instance
-    - If authentication is disabled, all endpoints are publicly accessible
-    - Refresh tokens are single-use and automatically rotated on each refresh
+    - If `auth.enabled = false`, auth endpoints are unavailable
+    - `/auth/register` cannot issue `admin-all`
     - Client IDs must be between 3-100 characters
   version: 1.0.0
 servers:
@@ -37,12 +40,154 @@ servers:
     description: Production server (replace with actual URL)
 
 paths:
+  /auth/siwe/nonce:
+    post:
+      summary: Create SIWE nonce and message
+      description: |
+        Creates a single-use SIWE nonce and returns a canonical message to sign.
+        This endpoint is intended for admin authentication via wallet signature.
+      operationId: issueSiweNonce
+      tags:
+        - Authentication
+      requestBody:
+        required: true
+        description: Address that will sign the SIWE message
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SiweNonceRequest"
+            example:
+              address: "0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B"
+      responses:
+        "200":
+          description: SIWE nonce generated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SiweNonceResponse"
+              example:
+                nonce: "00000000000001234567"
+                message: "solver.example.com wants you to sign in with your Ethereum account:\n0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B\n\nSign in to OIF Solver Admin API\n\nURI: https://solver.example.com\nVersion: 1\nChain ID: 1\nNonce: 00000000000001234567\nIssued At: 2026-02-18T12:00:00.000Z\nExpiration Time: 2026-02-18T12:05:00.000Z\n"
+                expires_in: 300
+                domain: "solver.example.com"
+                chain_id: 1
+        "400":
+          description: Invalid address
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "Invalid Ethereum address: invalid address checksum"
+        "500":
+          description: Failed to create nonce
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "Failed to generate SIWE nonce"
+        "503":
+          description: SIWE auth unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "SIWE authentication is not configured"
+
+  /auth/siwe/verify:
+    post:
+      summary: Verify SIWE message and issue admin tokens
+      description: |
+        Verifies the SIWE message signature, validates nonce/domain/chain, and issues
+        JWT access + refresh tokens with `admin-all` scope.
+      operationId: verifySiweToken
+      tags:
+        - Authentication
+      requestBody:
+        required: true
+        description: Signed SIWE payload
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SiweVerifyRequest"
+            example:
+              message: "solver.example.com wants you to sign in with your Ethereum account:\n0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B\n\nSign in to OIF Solver Admin API\n\nURI: https://solver.example.com\nVersion: 1\nChain ID: 1\nNonce: 00000000000001234567\nIssued At: 2026-02-18T12:00:00.000Z\nExpiration Time: 2026-02-18T12:05:00.000Z\n"
+              signature: "0x..."
+      responses:
+        "200":
+          description: SIWE verified and admin tokens issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisterResponse"
+              example:
+                access_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                refresh_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                client_id: "0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B"
+                token_type: "Bearer"
+                access_token_expires_at: 1771463174
+                refresh_token_expires_at: 1774051574
+                scopes: ["admin-all"]
+        "400":
+          description: Invalid SIWE nonce format
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "SIWE nonce format is invalid"
+        "401":
+          description: Invalid signature or expired nonce/message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalidSignature:
+                  value:
+                    error: "SIWE signature recovery failed: Recovery failed: ..."
+                expiredNonce:
+                  value:
+                    error: "Invalid or expired SIWE nonce"
+        "403":
+          description: Valid signer but not in admin allowlist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "SIWE signer is not an authorized admin"
+        "500":
+          description: Failed to issue token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                accessTokenError:
+                  value:
+                    error: "Failed to generate access token"
+                refreshTokenError:
+                  value:
+                    error: "Failed to generate refresh token"
+        "503":
+          description: SIWE auth unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "SIWE authentication is not configured"
+
   /auth/register:
     post:
       summary: Register a new client
       description: |
         Allows clients to self-register and receive both access and refresh tokens
-        for API authentication. This endpoint is used for initial client onboarding.
+        for API authentication. This endpoint is optional and typically disabled
+        unless explicitly enabled by the solver operator.
 
         The access token has a short expiry (1 hour by default) and should be included
         in the Authorization header for subsequent API calls. The refresh token has a
@@ -50,6 +195,7 @@ paths:
         when the access token expires.
 
         If no scopes are provided, the client is granted basic read permissions (read-orders).
+        `admin-all` is not allowed on this endpoint.
       operationId: registerClient
       tags:
         - Authentication
@@ -72,12 +218,6 @@ paths:
                   client_id: "solver-integration"
                   client_name: "Solver Integration Service"
                   scopes: ["read-orders", "create-orders"]
-              adminAccess:
-                summary: Registration with admin access
-                value:
-                  client_id: "admin-dashboard"
-                  client_name: "Admin Dashboard"
-                  scopes: ["admin-all"]
       responses:
         "201":
           description: Client successfully registered
@@ -94,7 +234,7 @@ paths:
                 scopes: ["read-orders"]
                 token_type: "Bearer"
         "400":
-          description: Invalid request (empty or invalid client_id, invalid scopes)
+          description: Invalid request (empty or invalid client_id, invalid or privileged scopes)
           content:
             application/json:
               schema:
@@ -109,6 +249,17 @@ paths:
                 invalidScopes:
                   value:
                     error: "Invalid scopes: Unknown scope: invalid-scope"
+                privilegedScope:
+                  value:
+                    error: "Invalid scopes: admin-all scope is not allowed on /auth/register"
+        "403":
+          description: Public registration disabled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "Public client registration is disabled"
         "500":
           description: Failed to generate tokens (internal server error)
           content:
@@ -131,15 +282,10 @@ paths:
       summary: Refresh access token
       description: |
         Exchanges a valid refresh token for new access and refresh tokens.
-        The old refresh token is invalidated and cannot be reused.
+        This endpoint returns a new refresh token alongside the new access token.
 
-        This endpoint implements token rotation for enhanced security:
-        - Each refresh operation generates both a new access token and a new refresh token
-        - The old refresh token is immediately invalidated
-        - If the old refresh token is reused, the request will fail
-
-        Use this endpoint when the access token expires (typically after 1 hour)
-        to continue making authenticated API calls.
+        Use this endpoint when an access token from `/auth/register` or
+        `/auth/siwe/verify` expires to continue making authenticated API calls.
       operationId: refreshToken
       tags:
         - Authentication
@@ -194,6 +340,64 @@ paths:
 
 components:
   schemas:
+    SiweNonceRequest:
+      type: object
+      description: Request payload for SIWE nonce creation
+      required:
+        - address
+      properties:
+        address:
+          type: string
+          description: Ethereum address that will sign the SIWE message
+          example: "0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B"
+
+    SiweNonceResponse:
+      type: object
+      description: Response payload for SIWE nonce creation
+      required:
+        - nonce
+        - message
+        - expires_in
+        - domain
+        - chain_id
+      properties:
+        nonce:
+          type: string
+          description: Single-use SIWE nonce
+          example: "00000000000001234567"
+        message:
+          type: string
+          description: Canonical SIWE message to sign
+          example: "solver.example.com wants you to sign in with your Ethereum account:\n0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B\n\nSign in to OIF Solver Admin API\n\nURI: https://solver.example.com\nVersion: 1\nChain ID: 1\nNonce: 00000000000001234567\nIssued At: 2026-02-18T12:00:00.000Z\nExpiration Time: 2026-02-18T12:05:00.000Z\n"
+        expires_in:
+          type: integer
+          description: Nonce validity in seconds
+          example: 300
+        domain:
+          type: string
+          description: Expected SIWE domain
+          example: "solver.example.com"
+        chain_id:
+          type: integer
+          description: Expected SIWE chain ID
+          example: 1
+
+    SiweVerifyRequest:
+      type: object
+      description: Request payload for SIWE verification
+      required:
+        - message
+        - signature
+      properties:
+        message:
+          type: string
+          description: Full SIWE message that was signed
+          example: "solver.example.com wants you to sign in with your Ethereum account:\n0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B\n\nSign in to OIF Solver Admin API\n\nURI: https://solver.example.com\nVersion: 1\nChain ID: 1\nNonce: 00000000000001234567\nIssued At: 2026-02-18T12:00:00.000Z\nExpiration Time: 2026-02-18T12:05:00.000Z\n"
+        signature:
+          type: string
+          description: Hex-encoded 65-byte personal_sign signature
+          example: "0x..."
+
     RegisterRequest:
       type: object
       description: Request payload for client registration
@@ -219,10 +423,9 @@ components:
             Available scopes:
             - read-orders: Read access to order information
             - create-orders: Permission to create new orders
-            - admin-all: Full administrative access
           items:
             type: string
-            enum: ["read-orders", "create-orders", "admin-all"]
+            enum: ["read-orders", "create-orders", "read-quotes", "create-quotes"]
           example: ["read-orders", "create-orders"]
 
     RefreshRequest:
@@ -238,7 +441,7 @@ components:
 
     RegisterResponse:
       type: object
-      description: Response payload for successful registration or refresh
+      description: Response payload for successful registration, SIWE verify, or refresh
       required:
         - access_token
         - refresh_token
@@ -295,6 +498,10 @@ components:
           type: string
           description: Error message
           example: "Client ID cannot be empty"
+        error_description:
+          type: string
+          description: Additional error detail
+          example: "Invalid or expired refresh token"
 
   securitySchemes:
     bearerAuth:
@@ -302,7 +509,7 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        JWT token obtained from /auth/register or /auth/refresh.
+        JWT token obtained from /auth/siwe/verify, /auth/register, or /auth/refresh.
         Include in requests as: `Authorization: Bearer <access_token>`
 
 security:

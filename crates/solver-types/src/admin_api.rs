@@ -1,5 +1,6 @@
 //! Types for the admin API request/response payloads.
 
+use crate::networks::NetworkType;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -45,6 +46,7 @@ pub struct ChainBalances {
 pub struct TokenBalance {
 	pub address: String,
 	pub symbol: String,
+	pub name: Option<String>,
 	pub decimals: u8,
 	pub balance: String,
 	pub balance_formatted: String,
@@ -73,6 +75,7 @@ pub struct GasFlowResponse {
 #[serde(rename_all = "camelCase")]
 pub struct AdminConfigResponse {
 	pub solver_id: String,
+	pub solver_name: Option<String>,
 	pub networks: Vec<AdminNetworkResponse>,
 	pub solver: AdminSolverResponse,
 	pub gas: GasConfigResponse,
@@ -84,6 +87,9 @@ pub struct AdminConfigResponse {
 #[serde(rename_all = "camelCase")]
 pub struct AdminNetworkResponse {
 	pub chain_id: u64,
+	pub name: String,
+	#[serde(rename = "type")]
+	pub network_type: NetworkType,
 	pub rpc_urls: Vec<String>,
 	pub tokens: Vec<AdminTokenResponse>,
 	pub input_settler: String,
@@ -94,6 +100,7 @@ pub struct AdminNetworkResponse {
 #[serde(rename_all = "camelCase")]
 pub struct AdminTokenResponse {
 	pub symbol: String,
+	pub name: Option<String>,
 	pub address: String,
 	pub decimals: u8,
 }

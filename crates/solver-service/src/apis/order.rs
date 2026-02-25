@@ -8,8 +8,9 @@ use axum::extract::{Extension, Path};
 use solver_core::SolverEngine;
 use solver_types::{
 	bytes32_to_address, standards::eip7930::InteropAddress, utils::conversion::parse_address,
-	with_0x_prefix, AssetAmount, GetOrderError, GetOrderResponse, Order, OrderResponse,
-	OrderStatus, Settlement, SettlementType, StorageKey, TransactionType,
+	with_0x_prefix, AssetAmount, FillTransactionInfo, FillTransactionStatus, GetOrderError,
+	GetOrderResponse, Order, OrderResponse, OrderStatus, Settlement, SettlementType, StorageKey,
+	TransactionType,
 };
 
 /// Handles GET /orders/{id} requests.
@@ -242,9 +243,9 @@ async fn convert_eip7683_order_to_response(
 			| OrderStatus::PostFilled
 			| OrderStatus::PreClaimed
 			| OrderStatus::Settled
-			| OrderStatus::Finalized => "executed",
+			| OrderStatus::Finalized => FillTransactionStatus::Executed,
 			// Fill transaction is in progress
-			OrderStatus::Executing => "pending",
+			OrderStatus::Executing => FillTransactionStatus::Pending,
 			// These states shouldn't have a fill_tx_hash, but if they do, log warning
 			OrderStatus::Created | OrderStatus::Pending => {
 				tracing::warn!(
@@ -252,29 +253,29 @@ async fn convert_eip7683_order_to_response(
 					status = ?order.status,
 					"Unexpected fill_tx_hash in pre-execution state"
 				);
-				"pending"
+				FillTransactionStatus::Pending
 			},
 			// Fill transaction failed
-			OrderStatus::Failed(TransactionType::Fill, _) => "failed",
+			OrderStatus::Failed(TransactionType::Fill, _) => FillTransactionStatus::Failed,
 			// Prepare failed - shouldn't have fill_tx_hash
 			OrderStatus::Failed(TransactionType::Prepare, _) => {
 				tracing::warn!(
 					order_id = %order.id,
 					"Unexpected fill_tx_hash when prepare transaction failed"
 				);
-				"failed"
+				FillTransactionStatus::Failed
 			},
 			// Fill succeeded but later transaction failed
 			OrderStatus::Failed(TransactionType::PostFill, _)
 			| OrderStatus::Failed(TransactionType::PreClaim, _)
-			| OrderStatus::Failed(TransactionType::Claim, _) => "executed",
+			| OrderStatus::Failed(TransactionType::Claim, _) => FillTransactionStatus::Executed,
 		};
 
-		serde_json::json!({
-			"hash": with_0x_prefix(&alloy_primitives::hex::encode(&fill_tx_hash.0)),
-			"status": tx_status,
-			"timestamp": order.updated_at
-		})
+		FillTransactionInfo {
+			hash: with_0x_prefix(&alloy_primitives::hex::encode(&fill_tx_hash.0)),
+			status: tx_status,
+			timestamp: order.updated_at,
+		}
 	});
 
 	let response = OrderResponse {
@@ -515,10 +516,7 @@ mod tests {
 
 		// fill tx
 		let fill_tx = resp.fill_transaction.expect("has fill tx");
-		assert_eq!(
-			fill_tx.get("status").and_then(|v| v.as_str()),
-			Some("executed")
-		);
+		assert_eq!(fill_tx.status, FillTransactionStatus::Executed);
 	}
 
 	#[tokio::test]
@@ -556,10 +554,7 @@ mod tests {
 		// Keep a fill_tx_hash
 		let resp = convert_order_to_response(order).await.expect("ok");
 		let fill_tx = resp.fill_transaction.expect("has fill tx");
-		assert_eq!(
-			fill_tx.get("status").and_then(|v| v.as_str()),
-			Some("pending")
-		);
+		assert_eq!(fill_tx.status, FillTransactionStatus::Pending);
 	}
 
 	#[tokio::test]
@@ -960,31 +955,31 @@ mod tests {
 	#[tokio::test]
 	async fn test_convert_order_to_response_different_order_statuses() {
 		let test_cases = vec![
-			(OrderStatus::Executing, "pending"),
-			(OrderStatus::PostFilled, "executed"),
-			(OrderStatus::PreClaimed, "executed"),
-			(OrderStatus::Settled, "executed"),
-			(OrderStatus::Finalized, "executed"),
-			(OrderStatus::Pending, "pending"),
+			(OrderStatus::Executing, FillTransactionStatus::Pending),
+			(OrderStatus::PostFilled, FillTransactionStatus::Executed),
+			(OrderStatus::PreClaimed, FillTransactionStatus::Executed),
+			(OrderStatus::Settled, FillTransactionStatus::Executed),
+			(OrderStatus::Finalized, FillTransactionStatus::Executed),
+			(OrderStatus::Pending, FillTransactionStatus::Pending),
 			(
 				OrderStatus::Failed(TransactionType::Fill, "Fill failed".to_string()),
-				"failed",
+				FillTransactionStatus::Failed,
 			),
 			(
 				OrderStatus::Failed(TransactionType::Prepare, "Prepare failed".to_string()),
-				"failed",
+				FillTransactionStatus::Failed,
 			),
 			(
 				OrderStatus::Failed(TransactionType::PostFill, "PostFill failed".to_string()),
-				"executed",
+				FillTransactionStatus::Executed,
 			),
 			(
 				OrderStatus::Failed(TransactionType::PreClaim, "PreClaim failed".to_string()),
-				"executed",
+				FillTransactionStatus::Executed,
 			),
 			(
 				OrderStatus::Failed(TransactionType::Claim, "Claim failed".to_string()),
-				"executed",
+				FillTransactionStatus::Executed,
 			),
 		];
 
@@ -994,8 +989,7 @@ mod tests {
 
 			if let Some(fill_tx) = resp.fill_transaction {
 				assert_eq!(
-					fill_tx.get("status").and_then(|v| v.as_str()),
-					Some(expected_tx_status),
+					fill_tx.status, expected_tx_status,
 					"Status mismatch for {:?}",
 					resp.status
 				);
@@ -1132,5 +1126,52 @@ mod tests {
 		assert!(settlement_data.get("signature").unwrap().is_null());
 		assert!(settlement_data.get("nonce").unwrap().is_null());
 		assert!(settlement_data.get("expires").unwrap().is_null());
+	}
+
+	#[tokio::test]
+	async fn test_order_response_json_serialization_matches_oif_specs() {
+		// Verify that the JSON serialization matches the oif-specs GetOrderResponse type:
+		// - createdAt and updatedAt must be numbers (Unix seconds), not ISO strings
+		// - fillTransaction must have a well-defined shape with a `hash` field
+		let order = create_test_eip7683_order("order-json-check", OrderStatus::Executed);
+		let resp = convert_order_to_response(order).await.expect("ok");
+
+		let json = serde_json::to_value(&resp).expect("serialize");
+
+		// createdAt and updatedAt must be numbers (not strings)
+		assert!(
+			json.get("createdAt").unwrap().is_number(),
+			"createdAt must be a number (Unix seconds), got: {}",
+			json.get("createdAt").unwrap()
+		);
+		assert!(
+			json.get("updatedAt").unwrap().is_number(),
+			"updatedAt must be a number (Unix seconds), got: {}",
+			json.get("updatedAt").unwrap()
+		);
+
+		// fillTransaction must have a typed `hash` field (string)
+		let fill_tx = json.get("fillTransaction").unwrap();
+		assert!(
+			fill_tx.get("hash").unwrap().is_string(),
+			"fillTransaction.hash must be a string"
+		);
+		assert!(
+			fill_tx
+				.get("hash")
+				.unwrap()
+				.as_str()
+				.unwrap()
+				.starts_with("0x"),
+			"fillTransaction.hash must be 0x-prefixed"
+		);
+		assert!(
+			fill_tx.get("status").unwrap().is_string(),
+			"fillTransaction.status must be a string"
+		);
+		assert!(
+			fill_tx.get("timestamp").unwrap().is_number(),
+			"fillTransaction.timestamp must be a number (Unix seconds)"
+		);
 	}
 }

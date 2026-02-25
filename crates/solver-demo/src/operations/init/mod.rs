@@ -1117,30 +1117,50 @@ mod tests {
 
 		SeedOverrides {
 			solver_id: Some(solver_id.to_string()),
+			solver_name: None,
 			networks: vec![
 				NetworkOverride {
 					chain_id: 11155420,
+					name: None,
+					network_type: None,
 					tokens: vec![Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: Address::from_str("0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6")
 							.expect("valid token address"),
 						decimals: 6,
 					}],
 					rpc_urls: None,
+					input_settler_address: None,
+					output_settler_address: None,
+					input_settler_compact_address: None,
+					the_compact_address: None,
+					allocator_address: None,
 				},
 				NetworkOverride {
 					chain_id: 84532,
+					name: None,
+					network_type: None,
 					tokens: vec![Token {
 						symbol: "USDC".to_string(),
+						name: None,
 						address: Address::from_str("0x73c83DAcc74bB8a704717AC09703b959E74b9705")
 							.expect("valid token address"),
 						decimals: 6,
 					}],
 					rpc_urls: None,
+					input_settler_address: None,
+					output_settler_address: None,
+					input_settler_compact_address: None,
+					the_compact_address: None,
+					allocator_address: None,
 				},
 			],
+			settlement: None,
+			routing_defaults: None,
 			account: None,
 			admin: None,
+			auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,

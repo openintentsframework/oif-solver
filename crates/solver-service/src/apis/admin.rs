@@ -19,7 +19,7 @@ use axum::{
 use once_cell::sync::Lazy;
 use regex::Regex;
 use solver_config::Config;
-use solver_core::engine::token_manager::TokenManager;
+use solver_core::engine::token_manager::{TokenManager, TokenManagerError};
 use solver_storage::redact_url_credentials;
 use solver_storage::{
 	config_store::{ConfigStore, ConfigStoreError},
@@ -39,9 +39,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::auth::admin::{
-	AddAdminContents, AddTokenContents, AdminActionVerifier, AdminAuthError, ApproveTokensContents,
-	RemoveAdminContents, RemoveTokenContents, SignedAdminRequest, UpdateFeeConfigContents,
-	UpdateGasConfigContents, WithdrawContents,
+	AddAdminContents, AddTokenContents, AddTokensContents, AdminActionVerifier, AdminAuthError,
+	ApproveTokensContents, RemoveAdminContents, RemoveTokenContents, SignedAdminRequest,
+	UpdateFeeConfigContents, UpdateGasConfigContents, WithdrawContents,
 };
 use crate::config_merge::build_runtime_config;
 
@@ -122,7 +122,7 @@ impl AdminApiState {
 	}
 }
 
-/// GET /api/v1/admin/nonce
+/// GET|POST /api/v1/admin/nonce
 ///
 /// Generate a nonce for signing admin actions.
 /// The nonce must be included in the action contents before signing.
@@ -172,6 +172,7 @@ pub async fn handle_get_balances(
 					tokens.push(TokenBalance {
 						address: token.address.to_string(),
 						symbol: token.symbol.clone(),
+						name: token.name.clone(),
 						decimals: token.decimals,
 						balance,
 						balance_formatted: formatted,
@@ -196,6 +197,7 @@ pub async fn handle_get_balances(
 				tokens.push(TokenBalance {
 					address: zero_address.to_string(),
 					symbol: "NATIVE".to_string(),
+					name: Some("Native Token".to_string()),
 					decimals: 18,
 					balance,
 					balance_formatted: formatted,
@@ -233,6 +235,7 @@ pub async fn handle_get_config(
 	let versioned = state.config_store.get().await.map_err(config_store_error)?;
 	let operator_config = versioned.data;
 	let solver_id = operator_config.solver_id.clone();
+	let solver_name = operator_config.solver_name.clone();
 
 	let mut networks: Vec<AdminNetworkResponse> = operator_config
 		.networks
@@ -250,12 +253,15 @@ pub async fn handle_get_config(
 
 			AdminNetworkResponse {
 				chain_id: network.chain_id,
+				name: network.name.clone(),
+				network_type: network.network_type,
 				rpc_urls,
 				tokens: network
 					.tokens
 					.iter()
 					.map(|t| AdminTokenResponse {
 						symbol: t.symbol.clone(),
+						name: t.name.clone(),
 						address: with_0x_prefix(&hex::encode(t.address.as_slice())),
 						decimals: t.decimals,
 					})
@@ -276,6 +282,7 @@ pub async fn handle_get_config(
 
 	Ok(Json(AdminConfigResponse {
 		solver_id,
+		solver_name,
 		networks,
 		solver: AdminSolverResponse {
 			min_profitability_pct: operator_config.solver.min_profitability_pct.to_string(),
@@ -528,62 +535,21 @@ pub async fn handle_add_token(
 	State(state): State<AdminApiState>,
 	VerifiedAdmin { admin, contents }: VerifiedAdmin<AddTokenContents>,
 ) -> Result<Json<AdminActionResponse>, AdminAuthError> {
-	// 1. Get current OperatorConfig from Redis
-	let versioned = state.config_store.get().await.map_err(config_store_error)?;
-
-	// 3. Find network and add token
-	let mut operator_config = versioned.data;
-	let network = operator_config
-		.networks
-		.get_mut(&contents.chain_id)
-		.ok_or_else(|| {
-			AdminAuthError::InvalidMessage(format!("Network {} not found", contents.chain_id))
-		})?;
-
-	// 4. Check for duplicates
-	if network.has_token(&contents.token_address) {
-		return Err(AdminAuthError::InvalidMessage(format!(
-			"Token {} already exists on chain {}",
-			contents.symbol, contents.chain_id
-		)));
-	}
-
-	// 5. Add token to OperatorConfig
-	network.tokens.push(OperatorToken {
+	let additions = vec![TokenAdditionRequest {
+		chain_id: contents.chain_id,
 		symbol: contents.symbol.clone(),
-		address: contents.token_address,
+		name: contents.name.clone(),
+		token_address: contents.token_address,
 		decimals: contents.decimals,
-	});
-
-	// 6. Save to Redis with optimistic locking
-	let new_versioned = state
-		.config_store
-		.update(operator_config.clone(), versioned.version)
-		.await
-		.map_err(|e| match e {
-			ConfigStoreError::VersionMismatch { .. } => {
-				AdminAuthError::Internal("Config was modified, please retry".to_string())
-			},
-			other => config_store_error(other),
-		})?;
-
-	// 7. HOT RELOAD: Rebuild runtime Config from updated OperatorConfig
-	let new_config = build_runtime_config(&new_versioned.data)
-		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {e}")))?;
-
-	// 8. Update TokenManager with new networks configuration
-	// This ensures quotes and other token operations immediately see the new token
-	let new_networks = new_config.networks.clone();
-	state.token_manager.update_networks(new_networks).await;
-
-	// 9. Update dynamic_config
-	*state.dynamic_config.write().await = new_config;
+	}];
+	let (version, approvals_set) = process_token_additions(&state, &additions).await?;
 
 	tracing::info!(
-		version = new_versioned.version,
+		version,
 		token = %contents.symbol,
 		chain_id = contents.chain_id,
-		"Token added and config hot-reloaded (TokenManager updated)"
+		approvals_set,
+		"Token added, config hot-reloaded, and approvals synchronized"
 	);
 
 	Ok(Json(AdminActionResponse {
@@ -594,6 +560,276 @@ pub async fn handle_add_token(
 		),
 		admin: with_0x_prefix(&hex::encode(&admin.0)),
 	}))
+}
+
+/// POST /api/v1/admin/tokens/batch
+///
+/// Add multiple new tokens to network configurations in a single signed action.
+pub async fn handle_add_tokens(
+	State(state): State<AdminApiState>,
+	VerifiedAdmin { admin, contents }: VerifiedAdmin<AddTokensContents>,
+) -> Result<Json<AdminActionResponse>, AdminAuthError> {
+	if contents.tokens.len() < MIN_BATCH_ADD_TOKENS {
+		return Err(AdminAuthError::InvalidMessage(format!(
+			"Batch token add requires at least {MIN_BATCH_ADD_TOKENS} tokens"
+		)));
+	}
+	if contents.tokens.len() > MAX_BATCH_ADD_TOKENS {
+		return Err(AdminAuthError::InvalidMessage(format!(
+			"Batch token add supports up to {MAX_BATCH_ADD_TOKENS} tokens"
+		)));
+	}
+
+	let token_count = contents.tokens.len();
+	let additions: Vec<TokenAdditionRequest> = contents
+		.tokens
+		.into_iter()
+		.map(|token| TokenAdditionRequest {
+			chain_id: token.chain_id,
+			symbol: token.symbol,
+			name: token.name,
+			token_address: token.token_address,
+			decimals: token.decimals,
+		})
+		.collect();
+	let (version, approvals_set) = process_token_additions(&state, &additions).await?;
+
+	tracing::info!(
+		version,
+		token_count,
+		approvals_set,
+		"Batch tokens added, config hot-reloaded, and approvals synchronized"
+	);
+
+	Ok(Json(AdminActionResponse {
+		success: true,
+		message: format!("Added {token_count} tokens"),
+		admin: with_0x_prefix(&hex::encode(&admin.0)),
+	}))
+}
+
+const MIN_BATCH_ADD_TOKENS: usize = 2;
+const MAX_BATCH_ADD_TOKENS: usize = 50;
+
+#[derive(Debug, Clone)]
+struct TokenAdditionRequest {
+	chain_id: u64,
+	symbol: String,
+	name: Option<String>,
+	token_address: alloy_primitives::Address,
+	decimals: u8,
+}
+
+#[derive(Debug)]
+struct TokenApprovalSyncFailure {
+	chain_id: u64,
+	symbol: String,
+	token_address: alloy_primitives::Address,
+	error: String,
+}
+
+fn validate_and_apply_token_additions(
+	operator_config: &mut OperatorConfig,
+	additions: &[TokenAdditionRequest],
+) -> Result<(), AdminAuthError> {
+	let mut seen = std::collections::HashSet::new();
+	for addition in additions {
+		let key = (addition.chain_id, addition.token_address);
+		if !seen.insert(key) {
+			return Err(AdminAuthError::InvalidMessage(format!(
+				"Duplicate token {} on chain {} in request payload",
+				addition.token_address, addition.chain_id
+			)));
+		}
+	}
+
+	for addition in additions {
+		let network = operator_config
+			.networks
+			.get(&addition.chain_id)
+			.ok_or_else(|| {
+				AdminAuthError::InvalidMessage(format!("Network {} not found", addition.chain_id))
+			})?;
+		if network.has_token(&addition.token_address) {
+			return Err(AdminAuthError::InvalidMessage(format!(
+				"Token {} already exists on chain {}",
+				addition.symbol, addition.chain_id
+			)));
+		}
+	}
+
+	for addition in additions {
+		let network = operator_config
+			.networks
+			.get_mut(&addition.chain_id)
+			.ok_or_else(|| {
+				AdminAuthError::InvalidMessage(format!("Network {} not found", addition.chain_id))
+			})?;
+		network.tokens.push(OperatorToken {
+			symbol: addition.symbol.clone(),
+			name: Some(
+				addition
+					.name
+					.clone()
+					.unwrap_or_else(|| addition.symbol.clone()),
+			),
+			address: addition.token_address,
+			decimals: addition.decimals,
+		});
+	}
+
+	Ok(())
+}
+
+async fn persist_and_hot_reload_operator_config(
+	state: &AdminApiState,
+	operator_config: OperatorConfig,
+	expected_version: u64,
+) -> Result<(u64, Config), AdminAuthError> {
+	let new_versioned = state
+		.config_store
+		.update(operator_config, expected_version)
+		.await
+		.map_err(|e| match e {
+			ConfigStoreError::VersionMismatch { .. } => {
+				AdminAuthError::Internal("Config was modified, please retry".to_string())
+			},
+			other => config_store_error(other),
+		})?;
+
+	let new_config = build_runtime_config(&new_versioned.data)
+		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {e}")))?;
+
+	state
+		.token_manager
+		.update_networks(new_config.networks.clone())
+		.await;
+	*state.dynamic_config.write().await = new_config.clone();
+
+	Ok((new_versioned.version, new_config))
+}
+
+async fn sync_approvals_for_added_tokens(
+	state: &AdminApiState,
+	additions: &[TokenAdditionRequest],
+	new_config: &Config,
+) -> Result<usize, Vec<TokenApprovalSyncFailure>> {
+	let mut approvals_set = 0usize;
+	let mut failures = Vec::new();
+
+	for addition in additions {
+		let Some(network_config) = new_config.networks.get(&addition.chain_id) else {
+			failures.push(TokenApprovalSyncFailure {
+				chain_id: addition.chain_id,
+				symbol: addition.symbol.clone(),
+				token_address: addition.token_address,
+				error: format!(
+					"Chain {} missing from rebuilt runtime config after token add",
+					addition.chain_id
+				),
+			});
+			continue;
+		};
+
+		match ensure_new_token_approvals(
+			state.token_manager.as_ref(),
+			addition.chain_id,
+			addition.token_address,
+			network_config,
+		)
+		.await
+		{
+			Ok(count) => approvals_set += count,
+			Err(e) => failures.push(TokenApprovalSyncFailure {
+				chain_id: addition.chain_id,
+				symbol: addition.symbol.clone(),
+				token_address: addition.token_address,
+				error: e.to_string(),
+			}),
+		}
+	}
+
+	if failures.is_empty() {
+		Ok(approvals_set)
+	} else {
+		Err(failures)
+	}
+}
+
+fn format_approval_failures(failures: &[TokenApprovalSyncFailure]) -> String {
+	failures
+		.iter()
+		.map(|failure| {
+			format!(
+				"{}:{} ({}) - {}",
+				failure.chain_id, failure.token_address, failure.symbol, failure.error
+			)
+		})
+		.collect::<Vec<_>>()
+		.join("; ")
+}
+
+async fn process_token_additions(
+	state: &AdminApiState,
+	additions: &[TokenAdditionRequest],
+) -> Result<(u64, usize), AdminAuthError> {
+	let versioned = state.config_store.get().await.map_err(config_store_error)?;
+	let mut operator_config = versioned.data;
+
+	validate_and_apply_token_additions(&mut operator_config, additions)?;
+
+	let (version, new_config) =
+		persist_and_hot_reload_operator_config(state, operator_config, versioned.version).await?;
+
+	let approvals_set = sync_approvals_for_added_tokens(state, additions, &new_config)
+		.await
+		.map_err(|failures| {
+			AdminAuthError::Internal(format!(
+				"Added {} token(s), but automatic approval setup failed for: {}. Retry via POST /api/v1/admin/tokens/approve",
+				additions.len(),
+				format_approval_failures(&failures)
+			))
+		})?;
+
+	Ok((version, approvals_set))
+}
+
+async fn ensure_new_token_approvals(
+	token_manager: &TokenManager,
+	chain_id: u64,
+	token_address: alloy_primitives::Address,
+	network: &solver_types::NetworkConfig,
+) -> Result<usize, TokenManagerError> {
+	use alloy_primitives::U256;
+
+	let zero_address = solver_types::Address(vec![0u8; 20]);
+	let input_settler = network.input_settler_address.clone();
+	let output_settler = network.output_settler_address.clone();
+
+	let mut spenders = Vec::new();
+	if input_settler != zero_address {
+		spenders.push(input_settler.clone());
+	}
+	if output_settler != zero_address && output_settler != input_settler {
+		spenders.push(output_settler);
+	}
+
+	let token_address = solver_types::Address::from(token_address);
+	let mut approvals_set = 0usize;
+
+	for spender in spenders {
+		let (approved_count, _) = token_manager
+			.ensure_approvals_for_spender_scope(
+				Some(chain_id),
+				Some(token_address.clone()),
+				spender,
+				U256::MAX,
+			)
+			.await?;
+		approvals_set += approved_count;
+	}
+
+	Ok(approvals_set)
 }
 
 /// PUT /api/v1/admin/fees
@@ -1046,9 +1282,7 @@ fn config_store_error(err: ConfigStoreError) -> AdminAuthError {
 		ConfigStoreError::Serialization(msg) => {
 			AdminAuthError::Internal(format!("Serialization error: {msg}"))
 		},
-		ConfigStoreError::Backend(msg) => {
-			AdminAuthError::Internal(format!("Storage error: {msg}"))
-		},
+		ConfigStoreError::Backend(msg) => AdminAuthError::Internal(format!("Storage error: {msg}")),
 		ConfigStoreError::Configuration(msg) => {
 			AdminAuthError::Internal(format!("Configuration error: {msg}"))
 		},
@@ -1088,9 +1322,10 @@ mod tests {
 	use solver_storage::StoreConfig;
 	use solver_storage::{config_store::create_config_store, nonce_store::create_nonce_store};
 	use solver_types::{
-		NetworksConfig, OperatorAdminConfig, OperatorConfig, OperatorGasConfig,
-		OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorOracleConfig, OperatorPricingConfig,
-		OperatorSettlementConfig, OperatorSolverConfig, OperatorWithdrawalsConfig,
+		NetworkType, NetworksConfig, OperatorAdminConfig, OperatorConfig, OperatorGasConfig,
+		OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig,
+		OperatorPricingConfig, OperatorRpcEndpoint, OperatorSettlementConfig,
+		OperatorSettlementType, OperatorSolverConfig, OperatorWithdrawalsConfig,
 	};
 	use std::collections::HashMap;
 	use std::str::FromStr;
@@ -1350,10 +1585,12 @@ mod tests {
 	) -> OperatorConfig {
 		OperatorConfig {
 			solver_id: "test-solver".to_string(),
+			solver_name: Some("Test Solver".to_string()),
 			networks: HashMap::new(),
 			settlement: OperatorSettlementConfig {
 				settlement_poll_interval_seconds: 3,
-				hyperlane: OperatorHyperlaneConfig {
+				settlement_type: OperatorSettlementType::Hyperlane,
+				hyperlane: Some(OperatorHyperlaneConfig {
 					default_gas_limit: 0,
 					message_timeout_seconds: 0,
 					finalization_required: false,
@@ -1364,7 +1601,8 @@ mod tests {
 						output: HashMap::new(),
 					},
 					routes: HashMap::new(),
-				},
+				}),
+				direct: None,
 			},
 			gas: OperatorGasConfig {
 				resource_lock: OperatorGasFlowUnits::default(),
@@ -1392,6 +1630,7 @@ mod tests {
 				admin_addresses: vec![admin_address],
 				withdrawals,
 			},
+			auth_enabled: false,
 			account: None,
 		}
 	}
@@ -1482,6 +1721,422 @@ mod tests {
 			nonce_store,
 			token_manager,
 		}
+	}
+
+	async fn create_admin_state_with_operator_config(
+		operator_config: OperatorConfig,
+		delivery: Arc<DeliveryService>,
+	) -> AdminApiState {
+		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+		let admin_solver = solver_types::Address::from(admin_alloy);
+
+		let config_store =
+			create_config_store::<OperatorConfig>(StoreConfig::Memory, "test-solver".to_string())
+				.unwrap();
+		config_store.seed(operator_config).await.unwrap();
+		let config_store: Arc<dyn solver_storage::config_store::ConfigStore<OperatorConfig>> =
+			Arc::from(config_store);
+
+		let nonce_store =
+			Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
+		let verifier = AdminActionVerifier::new(
+			nonce_store.clone(),
+			AdminConfig {
+				enabled: true,
+				domain: "test.example.com".to_string(),
+				chain_id: Some(1),
+				nonce_ttl_seconds: 300,
+				admin_addresses: vec![admin_alloy],
+			},
+			1,
+		);
+
+		let account = Arc::new(AccountService::new(Box::new(DummyAccount {
+			address: admin_solver,
+		})));
+		let token_manager = Arc::new(TokenManager::new(
+			NetworksConfig::default(),
+			delivery,
+			account,
+		));
+		let dynamic_config = Arc::new(RwLock::new(ConfigBuilder::new().build()));
+
+		AdminApiState {
+			verifier: Arc::new(RwLock::new(verifier)),
+			config_store,
+			dynamic_config,
+			nonce_store,
+			token_manager,
+		}
+	}
+
+	#[tokio::test]
+	async fn test_handle_add_token_triggers_approval_setup() {
+		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+		let mut operator_config =
+			build_operator_config(admin_alloy, OperatorWithdrawalsConfig { enabled: true });
+
+		operator_config.networks.insert(
+			1,
+			OperatorNetworkConfig {
+				chain_id: 1,
+				name: "chain-1".to_string(),
+				network_type: NetworkType::Parent,
+				tokens: vec![],
+				rpc_urls: vec![OperatorRpcEndpoint {
+					http: "http://localhost:8545".to_string(),
+					ws: None,
+				}],
+				input_settler_address: alloy_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: alloy_address("0x2222222222222222222222222222222222222222"),
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		operator_config.networks.insert(
+			137,
+			OperatorNetworkConfig {
+				chain_id: 137,
+				name: "chain-137".to_string(),
+				network_type: NetworkType::Hub,
+				tokens: vec![],
+				rpc_urls: vec![OperatorRpcEndpoint {
+					http: "http://localhost:8546".to_string(),
+					ws: None,
+				}],
+				input_settler_address: alloy_address("0x3333333333333333333333333333333333333333"),
+				output_settler_address: alloy_address("0x4444444444444444444444444444444444444444"),
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_allowance()
+			.times(2)
+			.returning(|_, _, _, _| Box::pin(async { Ok("0".to_string()) }));
+		mock_delivery.expect_submit().times(2).returning(|_, _| {
+			Box::pin(async { Ok(solver_types::TransactionHash(vec![0x11; 32])) })
+		});
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+		implementations.insert(1, Arc::new(mock_delivery));
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 30));
+
+		let state = create_admin_state_with_operator_config(operator_config, delivery).await;
+		let state_for_assert = state.clone();
+
+		let contents = AddTokenContents {
+			chain_id: 1,
+			symbol: "USDC".to_string(),
+			name: Some("USD Coin".to_string()),
+			token_address: alloy_address("0x5555555555555555555555555555555555555555"),
+			decimals: 6,
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let response = handle_add_token(State(state), verified).await.unwrap().0;
+		assert!(response.success);
+		assert!(response.message.contains("Token USDC added to chain 1"));
+
+		let versioned = state_for_assert.config_store.get().await.unwrap();
+		let network = versioned.data.networks.get(&1).unwrap();
+		assert_eq!(network.tokens.len(), 1);
+		assert_eq!(network.tokens[0].symbol, "USDC");
+	}
+
+	#[tokio::test]
+	async fn test_handle_add_tokens_triggers_approval_setup() {
+		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+		let mut operator_config =
+			build_operator_config(admin_alloy, OperatorWithdrawalsConfig { enabled: true });
+
+		operator_config.networks.insert(
+			1,
+			OperatorNetworkConfig {
+				chain_id: 1,
+				name: "chain-1".to_string(),
+				network_type: NetworkType::Parent,
+				tokens: vec![],
+				rpc_urls: vec![OperatorRpcEndpoint {
+					http: "http://localhost:8545".to_string(),
+					ws: None,
+				}],
+				input_settler_address: alloy_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: alloy_address("0x2222222222222222222222222222222222222222"),
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		operator_config.networks.insert(
+			137,
+			OperatorNetworkConfig {
+				chain_id: 137,
+				name: "chain-137".to_string(),
+				network_type: NetworkType::Hub,
+				tokens: vec![],
+				rpc_urls: vec![OperatorRpcEndpoint {
+					http: "http://localhost:8546".to_string(),
+					ws: None,
+				}],
+				input_settler_address: alloy_address("0x3333333333333333333333333333333333333333"),
+				output_settler_address: alloy_address("0x4444444444444444444444444444444444444444"),
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_allowance()
+			.times(4)
+			.returning(|_, _, _, _| Box::pin(async { Ok("0".to_string()) }));
+		mock_delivery.expect_submit().times(4).returning(|_, _| {
+			Box::pin(async { Ok(solver_types::TransactionHash(vec![0x11; 32])) })
+		});
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+		implementations.insert(1, Arc::new(mock_delivery));
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 30));
+
+		let state = create_admin_state_with_operator_config(operator_config, delivery).await;
+		let state_for_assert = state.clone();
+
+		let contents = AddTokensContents {
+			tokens: vec![
+				crate::auth::admin::AddTokenItemContents {
+					chain_id: 1,
+					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
+					token_address: alloy_address("0x5555555555555555555555555555555555555555"),
+					decimals: 6,
+				},
+				crate::auth::admin::AddTokenItemContents {
+					chain_id: 1,
+					symbol: "USDT".to_string(),
+					name: Some("Tether USD".to_string()),
+					token_address: alloy_address("0x6666666666666666666666666666666666666666"),
+					decimals: 6,
+				},
+			],
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let response = handle_add_tokens(State(state), verified).await.unwrap().0;
+		assert!(response.success);
+		assert_eq!(response.message, "Added 2 tokens");
+
+		let versioned = state_for_assert.config_store.get().await.unwrap();
+		let network = versioned.data.networks.get(&1).unwrap();
+		assert_eq!(network.tokens.len(), 2);
+		assert_eq!(network.tokens[0].symbol, "USDC");
+		assert_eq!(network.tokens[1].symbol, "USDT");
+	}
+
+	#[tokio::test]
+	async fn test_handle_add_tokens_rejects_small_batch() {
+		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+		let mut operator_config =
+			build_operator_config(admin_alloy, OperatorWithdrawalsConfig { enabled: true });
+		operator_config.networks.insert(
+			1,
+			OperatorNetworkConfig {
+				chain_id: 1,
+				name: "chain-1".to_string(),
+				network_type: NetworkType::Parent,
+				tokens: vec![],
+				rpc_urls: vec![OperatorRpcEndpoint {
+					http: "http://localhost:8545".to_string(),
+					ws: None,
+				}],
+				input_settler_address: alloy_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: alloy_address("0x2222222222222222222222222222222222222222"),
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+
+		let delivery = create_delivery_service(None, false);
+		let state = create_admin_state_with_operator_config(operator_config, delivery).await;
+
+		let contents = AddTokensContents {
+			tokens: vec![crate::auth::admin::AddTokenItemContents {
+				chain_id: 1,
+				symbol: "USDC".to_string(),
+				name: Some("USD Coin".to_string()),
+				token_address: alloy_address("0x5555555555555555555555555555555555555555"),
+				decimals: 6,
+			}],
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let err = match handle_add_tokens(State(state), verified).await {
+			Err(err) => err,
+			Ok(_) => panic!("Expected small batch to fail"),
+		};
+		assert!(matches!(err, AdminAuthError::InvalidMessage(_)));
+		assert!(format!("{err}").contains("at least 2"));
+	}
+
+	#[tokio::test]
+	async fn test_handle_add_tokens_rejects_duplicate_payload_entries() {
+		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+		let mut operator_config =
+			build_operator_config(admin_alloy, OperatorWithdrawalsConfig { enabled: true });
+		operator_config.networks.insert(
+			1,
+			OperatorNetworkConfig {
+				chain_id: 1,
+				name: "chain-1".to_string(),
+				network_type: NetworkType::Parent,
+				tokens: vec![],
+				rpc_urls: vec![OperatorRpcEndpoint {
+					http: "http://localhost:8545".to_string(),
+					ws: None,
+				}],
+				input_settler_address: alloy_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: alloy_address("0x2222222222222222222222222222222222222222"),
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+
+		let delivery = create_delivery_service(None, false);
+		let state = create_admin_state_with_operator_config(operator_config, delivery).await;
+		let state_for_assert = state.clone();
+		let duplicate_address = alloy_address("0x5555555555555555555555555555555555555555");
+
+		let contents = AddTokensContents {
+			tokens: vec![
+				crate::auth::admin::AddTokenItemContents {
+					chain_id: 1,
+					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
+					token_address: duplicate_address,
+					decimals: 6,
+				},
+				crate::auth::admin::AddTokenItemContents {
+					chain_id: 1,
+					symbol: "USDCv2".to_string(),
+					name: Some("USD Coin v2".to_string()),
+					token_address: duplicate_address,
+					decimals: 6,
+				},
+			],
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let err = match handle_add_tokens(State(state), verified).await {
+			Err(err) => err,
+			Ok(_) => panic!("Expected duplicate payload entries to fail"),
+		};
+		assert!(matches!(err, AdminAuthError::InvalidMessage(_)));
+		assert!(format!("{err}").contains("Duplicate token"));
+
+		let versioned = state_for_assert.config_store.get().await.unwrap();
+		assert_eq!(versioned.data.networks.get(&1).unwrap().tokens.len(), 0);
+	}
+
+	#[tokio::test]
+	async fn test_handle_add_tokens_atomic_validation() {
+		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+		let mut operator_config =
+			build_operator_config(admin_alloy, OperatorWithdrawalsConfig { enabled: true });
+		operator_config.networks.insert(
+			1,
+			OperatorNetworkConfig {
+				chain_id: 1,
+				name: "chain-1".to_string(),
+				network_type: NetworkType::Parent,
+				tokens: vec![],
+				rpc_urls: vec![OperatorRpcEndpoint {
+					http: "http://localhost:8545".to_string(),
+					ws: None,
+				}],
+				input_settler_address: alloy_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: alloy_address("0x2222222222222222222222222222222222222222"),
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+
+		let delivery = create_delivery_service(None, false);
+		let state = create_admin_state_with_operator_config(operator_config, delivery).await;
+		let state_for_assert = state.clone();
+
+		let contents = AddTokensContents {
+			tokens: vec![
+				crate::auth::admin::AddTokenItemContents {
+					chain_id: 1,
+					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
+					token_address: alloy_address("0x5555555555555555555555555555555555555555"),
+					decimals: 6,
+				},
+				crate::auth::admin::AddTokenItemContents {
+					chain_id: 999,
+					symbol: "USDT".to_string(),
+					name: Some("Tether USD".to_string()),
+					token_address: alloy_address("0x6666666666666666666666666666666666666666"),
+					decimals: 6,
+				},
+			],
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let err = match handle_add_tokens(State(state), verified).await {
+			Err(err) => err,
+			Ok(_) => panic!("Expected validation failure for unknown chain"),
+		};
+		assert!(matches!(err, AdminAuthError::InvalidMessage(_)));
+		assert!(format!("{err}").contains("Network 999 not found"));
+
+		let versioned = state_for_assert.config_store.get().await.unwrap();
+		assert_eq!(versioned.data.networks.get(&1).unwrap().tokens.len(), 0);
 	}
 
 	#[tokio::test]
@@ -1885,6 +2540,7 @@ mod tests {
 				chain_id: 1,
 				tokens: vec![TokenBalance {
 					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
 					address: "0x1234".to_string(),
 					decimals: 6,
 					balance: "1000000".to_string(),
@@ -1924,9 +2580,12 @@ mod tests {
 	fn test_admin_network_response_serialization() {
 		let network = AdminNetworkResponse {
 			chain_id: 10,
+			name: "optimism".to_string(),
+			network_type: solver_types::networks::NetworkType::Parent,
 			rpc_urls: vec!["https://rpc.example.com/[REDACTED]".to_string()],
 			tokens: vec![AdminTokenResponse {
 				symbol: "USDC".to_string(),
+				name: Some("USD Coin".to_string()),
 				address: "0x1234".to_string(),
 				decimals: 6,
 			}],

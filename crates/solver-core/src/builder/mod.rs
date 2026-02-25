@@ -296,7 +296,9 @@ impl SolverBuilder {
 		}
 
 		if delivery_implementations.is_empty() {
-			tracing::warn!("No delivery implementations available - solver will not be able to submit any transactions");
+			tracing::warn!(
+				"No delivery implementations available - solver will not be able to submit any transactions"
+			);
 		}
 
 		let delivery = Arc::new(DeliveryService::new(
@@ -364,7 +366,9 @@ impl SolverBuilder {
 		}
 
 		if settlement_impls.is_empty() {
-			tracing::warn!("No settlement implementations available - solver will not be able to monitor and claim settlements");
+			tracing::warn!(
+				"No settlement implementations available - solver will not be able to monitor and claim settlements"
+			);
 		}
 
 		let settlement = Arc::new(SettlementService::new(
@@ -474,7 +478,9 @@ impl SolverBuilder {
 		}
 
 		if order_impls.is_empty() {
-			tracing::warn!("No order implementations available - solver will not be able to process any orders");
+			tracing::warn!(
+				"No order implementations available - solver will not be able to process any orders"
+			);
 		}
 
 		// Create strategy implementations
@@ -524,6 +530,26 @@ impl SolverBuilder {
 			delivery.clone(),
 			account.clone(),
 		));
+
+		let empty_token_networks: Vec<u64> = self
+			.static_config
+			.networks
+			.iter()
+			.filter_map(|(chain_id, network)| network.tokens.is_empty().then_some(*chain_id))
+			.collect();
+		if !empty_token_networks.is_empty() {
+			if empty_token_networks.len() == self.static_config.networks.len() {
+				tracing::warn!(
+					chains = ?empty_token_networks,
+					"All configured networks have zero tokens; solver started, but quotes and fills remain unavailable until tokens are added"
+				);
+			} else {
+				tracing::warn!(
+					chains = ?empty_token_networks,
+					"Some configured networks have zero tokens; quote support is limited for those chains until tokens are added"
+				);
+			}
+		}
 
 		// Ensure all token approvals are set
 		match token_manager.ensure_approvals().await {

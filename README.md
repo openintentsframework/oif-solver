@@ -136,7 +136,7 @@ oif-solver/
 │   ├── solver-settlement/       # Settlement verification
 │   ├── solver-storage/          # State persistence
 │   └── solver-types/            # Shared types
-├── config/                      # Seed overrides and demo settings
+├── config/                      # Bootstrap config and demo settings
 └── scripts/                     # E2E testing and deployment scripts
 ```
 
@@ -227,12 +227,59 @@ redis-server
 export REDIS_URL=redis://localhost:6379
 export SOLVER_PRIVATE_KEY=your_64_hex_character_private_key
 
-# 3. First run: Seed configuration from preset + deployment config
-cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
+# 3. First run: Seed configuration (seedless mode)
+cargo run -- --bootstrap-config config/example.json
+
+# 3b. Optional: Seed with preset fallback values for known chains
+cargo run -- --seed testnet --bootstrap-config config/seed-overrides-testnet.json
 
 # 4. Subsequent runs: Configuration loads automatically from Redis
 cargo run --
 ```
+
+### Auth Quickstart (when `auth_enabled = true`)
+
+If you enable API auth in your seed overrides (`"auth_enabled": true`), set:
+
+```bash
+export JWT_SECRET=replace_with_a_strong_random_value
+
+# Optional
+export AUTH_PUBLIC_REGISTER_ENABLED=false
+```
+
+If `auth_enabled = false`, `AUTH_PUBLIC_REGISTER_ENABLED` is ignored.
+
+Admin JWTs (`admin-all` scope) are obtained via SIWE wallet login:
+
+#### SIWE (admin wallet)
+
+```bash
+ADMIN_ADDRESS=0xYourAdminWalletAddress
+
+# 1) Request SIWE nonce + canonical message
+NONCE_RESPONSE=$(curl -s -X POST http://localhost:3000/api/v1/auth/siwe/nonce \
+  -H "Content-Type: application/json" \
+  -d "{\"address\":\"$ADMIN_ADDRESS\"}")
+
+SIWE_MESSAGE=$(echo "$NONCE_RESPONSE" | jq -r '.message')
+
+# 2) Sign SIWE_MESSAGE with your wallet and set SIWE_SIGNATURE (0x... 65-byte signature)
+SIWE_SIGNATURE=0x...
+
+# 3) Exchange signed message for JWT access + refresh tokens
+SIWE_TOKENS=$(curl -s -X POST http://localhost:3000/api/v1/auth/siwe/verify \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --arg message "$SIWE_MESSAGE" --arg signature "$SIWE_SIGNATURE" '{message: $message, signature: $signature}')")
+
+TOKEN=$(echo "$SIWE_TOKENS" | jq -r '.access_token')
+REFRESH_TOKEN=$(echo "$SIWE_TOKENS" | jq -r '.refresh_token')
+```
+
+SIWE-issued access tokens use the same JWT format as other auth flows and currently use
+`TOKEN_DEFAULT_TTL_SECONDS.min(TOKEN_MAX_TTL_SECONDS)` (900s with current constants).
+SIWE also returns a refresh token with the configured `refresh_token_expiry_hours`, and that
+refresh token is compatible with `POST /api/v1/auth/refresh`.
 
 ## Docker
 
@@ -259,7 +306,7 @@ docker run -it --rm \
   -p 3000:3000 \
   --env-file .env.docker \
   -v $(pwd)/config:/app/config:ro \
-  oif-solver --seed testnet --seed-overrides /app/config/seed-overrides-testnet.json
+  oif-solver --seed testnet --bootstrap-config /app/config/seed-overrides-testnet.json
 
 # Subsequent runs: Load from Redis (set SOLVER_ID in .env.docker)
 docker run -it --rm \
@@ -272,7 +319,7 @@ docker run -it --rm \
   -p 3000:3000 \
   --env-file .env.docker \
   -v $(pwd)/config:/app/config:ro \
-  oif-solver --seed testnet --seed-overrides /app/config/seed-overrides-testnet.json --force-seed
+  oif-solver --seed testnet --bootstrap-config /app/config/seed-overrides-testnet.json --force-seed
 ```
 
 ### Docker Networking
@@ -291,12 +338,12 @@ For Redis connectivity from within Docker:
 | `REDIS_URL` | Yes | Redis connection URL (for production, use managed services like AWS ElastiCache) |
 | `SOLVER_ID` | For loading | Solver ID to load config from Redis (after first seed) |
 | `RUST_LOG` | No | Log level (default: `info`) |
-| `SOLVER_PRIVATE_KEY` | Conditional | Required for local wallet if no inline `private_key` in seed overrides |
+| `SOLVER_PRIVATE_KEY` | Conditional | Required for local wallet if no inline `private_key` in bootstrap config |
 | `AWS_ACCESS_KEY_ID` | For KMS | AWS access key (if using KMS signer) |
 | `AWS_SECRET_ACCESS_KEY` | For KMS | AWS secret key (if using KMS signer) |
 | `AWS_REGION` | For KMS | AWS region (if using KMS signer, default: from config) |
 
-**Note:** `SOLVER_PRIVATE_KEY` is required when using the local wallet without an inline `private_key` in seed overrides. Not needed if using KMS or providing `private_key` directly in the JSON.
+**Note:** `SOLVER_PRIVATE_KEY` is required when using the local wallet without an inline `private_key` in bootstrap config. Not needed if using KMS or providing `private_key` directly in the JSON.
 
 **AWS Credentials:** When running in AWS (ECS, EKS, EC2), use IAM roles instead of explicit credentials. The SDK automatically uses the instance/task role credentials. Only set `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for local development or non-AWS environments.
 
@@ -304,7 +351,7 @@ For Redis connectivity from within Docker:
 
 | Mount | Purpose |
 |-------|---------|
-| `/app/config` | Seed overrides JSON file (read-only, only needed for seeding) |
+| `/app/config` | Bootstrap config JSON file (read-only, only needed for seeding) |
 
 See [docs/config-storage.md](docs/config-storage.md) for detailed documentation.
 
@@ -315,18 +362,27 @@ The solver uses Redis as the single source of truth for runtime configuration. C
 ### Seeding Configuration
 
 ```bash
-# Seed testnet configuration (using file)
-cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
+# Seedless bootstrap (all network + settlement values from JSON)
+cargo run -- --bootstrap-config config/example.json
 
-# Seed mainnet configuration (using file)
-cargo run -- --seed mainnet --seed-overrides config/seed-overrides-mainnet.json
+# Seed testnet configuration (uses testnet preset fallbacks where applicable)
+cargo run -- --seed testnet --bootstrap-config config/seed-overrides-testnet.json
+
+# Seed mainnet configuration (uses mainnet preset fallbacks where applicable)
+cargo run -- --seed mainnet --bootstrap-config config/seed-overrides-mainnet.json
+
+# Seed using a non-seeded networks JSON example
+cargo run -- --seed testnet --bootstrap-config config/non-seeded-networks-example.json
 
 # Or pass JSON directly (useful for deployment services)
-cargo run -- --seed testnet --seed-overrides '{"solver_id":"my-solver","networks":[{"chain_id":11155420,"tokens":[{"symbol":"USDC","address":"0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6","decimals":6}]},{"chain_id":84532,"tokens":[{"symbol":"USDC","address":"0x73c83DAcc74bB8a704717AC09703b959E74b9705","decimals":6}]}]}'
+cargo run -- --seed testnet --bootstrap-config '{"solver_id":"my-solver","solver_name":"My Testnet Solver","networks":[{"chain_id":11155420,"name":"optimism-sepolia","type":"parent","tokens":[{"symbol":"USDC","name":"USD Coin","address":"0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6","decimals":6}]},{"chain_id":84532,"name":"base-sepolia","type":"hub","tokens":[{"symbol":"USDC","name":"USD Coin","address":"0x73c83DAcc74bB8a704717AC09703b959E74b9705","decimals":6}]}]}'
 
 # Force re-seed (overwrite existing)
-cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json --force-seed
+cargo run -- --seed testnet --bootstrap-config config/seed-overrides-testnet.json --force-seed
 ```
+
+Legacy alias support:
+- `--seed-overrides` is still accepted temporarily as a deprecated alias for `--bootstrap-config`.
 
 ### Environment Variables
 
@@ -336,15 +392,20 @@ cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json 
 | `SOLVER_PRIVATE_KEY` | Conditional | 64-character hex private key (without 0x prefix) |
 | `SOLVER_ID` | For loading | Solver ID to load from Redis (set after first seed) |
 
-`SOLVER_PRIVATE_KEY` is only required when using the local wallet without an inline `private_key` in seed overrides. Not needed if using KMS or providing `private_key` directly in the JSON.
+`SOLVER_PRIVATE_KEY` is only required when using the local wallet without an inline `private_key` in bootstrap config. Not needed if using KMS or providing `private_key` directly in the JSON.
 
-### Seed Overrides Format
+### Bootstrap Config Format
 
-Create a JSON file specifying which networks and tokens to support (these override/extend the seed preset defaults):
+Create a bootstrap JSON file specifying which networks to support. Networks can be:
+- Seeded networks (from the selected preset)
+- Non-seeded networks (new chain IDs) when full required fields are provided
+
+Token arrays may be empty at boot and can be populated later via admin APIs.
 
 ```json
 {
   "solver_id": "my-solver-instance",
+  "solver_name": "My Solver Instance",
   "min_profitability_pct": "2.5",
   "gas_buffer_bps": 1500,
   "commission_bps": 20,
@@ -352,9 +413,12 @@ Create a JSON file specifying which networks and tokens to support (these overri
   "networks": [
     {
       "chain_id": 11155420,
+      "name": "optimism-sepolia",
+      "type": "parent",
       "tokens": [
         {
           "symbol": "USDC",
+          "name": "USD Coin",
           "address": "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6",
           "decimals": 6
         }
@@ -362,9 +426,12 @@ Create a JSON file specifying which networks and tokens to support (these overri
     },
     {
       "chain_id": 84532,
+      "name": "base-sepolia",
+      "type": "hub",
       "tokens": [
         {
           "symbol": "USDC",
+          "name": "USD Coin",
           "address": "0x73c83DAcc74bB8a704717AC09703b959E74b9705",
           "decimals": 6
         }
@@ -376,6 +443,30 @@ Create a JSON file specifying which networks and tokens to support (these overri
 ```
 
 Optional fee overrides can be set at the top level: `min_profitability_pct` (decimal string), `gas_buffer_bps`, `commission_bps`, and `rate_buffer_bps` (basis points).
+Optional network types are: `parent`, `hub`, and `new`.
+
+For non-seeded networks, the following fields are required per network:
+- `name`
+- `type`
+- `input_settler_address`
+- `output_settler_address`
+- `rpc_urls` (at least one URL)
+
+Compact addresses are optional:
+- `input_settler_compact_address`
+- `the_compact_address`
+- `allocator_address`
+
+### Settlement Selection (`settlement.type`)
+
+Settlement implementation is selected from bootstrap config JSON:
+- `hyperlane` (default when omitted)
+- `direct`
+
+When `settlement.type = "direct"`, `settlement.direct` is required.
+When `settlement.type = "hyperlane"` and you include non-seeded networks, provide `settlement.hyperlane` maps (`mailboxes`, `igp_addresses`, `oracles.input`, `oracles.output`) for all configured chains.
+
+See `config/non-seeded-networks-example.json` for a full non-seeded Hyperlane example (both chain IDs are non-seeded).
 
 **Note:** The `solver_id` field is optional but recommended. If provided, seeding becomes idempotent (re-running `--seed` with same config skips seeding). After seeding, set `SOLVER_ID` env var for subsequent runs.
 
@@ -393,6 +484,8 @@ Optional fee overrides can be set at the top level: `min_profitability_pct` (dec
 | Optimism | 10 |
 | Base | 8453 |
 | Arbitrum | 42161 |
+
+These are preset-backed networks. You can also seed non-seeded chain IDs by providing the required non-seeded network fields and settlement overrides described above.
 
 ### Running Redis
 
@@ -443,7 +536,7 @@ cargo build --release --features kms
 
 #### Configuration
 
-Configure KMS in your seed overrides JSON:
+Configure KMS in your bootstrap config JSON:
 
 ```json
 {
@@ -476,7 +569,7 @@ export AWS_SECRET_ACCESS_KEY=your_secret_key
 export AWS_REGION=us-east-1
 
 # Seed and run
-cargo run --features kms -- --seed testnet --seed-overrides config/seed-overrides-kms.json
+cargo run --features kms -- --seed testnet --bootstrap-config config/seed-overrides-kms.json
 ```
 
 #### Finding Your KMS Wallet Address
@@ -535,7 +628,9 @@ The solver provides a REST API for interacting with the system and submitting of
 
 - **Orders API**: [`api-spec/orders-api.yaml`](api-spec/orders-api.yaml) - Submit and track cross-chain intent orders
 - **Tokens API**: [`api-spec/tokens-api.yaml`](api-spec/tokens-api.yaml) - Query supported tokens and networks
+- **Auth API**: [`api-spec/auth-api.yaml`](api-spec/auth-api.yaml) - JWT issuance flows (SIWE + register/refresh)
 - **Admin API**: [`api-spec/admin-api.yaml`](api-spec/admin-api.yaml) - Wallet-based admin operations (EIP-712 signed)
+- **Admin Auth Guide**: [`docs/admin-authentication.md`](docs/admin-authentication.md) - Practical auth + nonce flow guide
 
 ### API Flows
 
@@ -730,10 +825,10 @@ sequenceDiagram
 
 - **GET `/api/v1/tokens`** - Get all supported tokens across all networks
 
-  - Returns a map of chain IDs to network configurations with supported tokens
+  - Returns a map of chain IDs to network configurations with supported tokens, including network `name`/`type` and token `name`
 
 - **GET `/api/v1/tokens/{chain_id}`** - Get supported tokens for a specific chain
-  - Returns network configuration including settler addresses and token list
+  - Returns network configuration (including `name`/`type`) and token list (including token `name`)
 
 #### Health
 
@@ -759,27 +854,25 @@ sequenceDiagram
 
 The admin API enables authorized wallet addresses to perform administrative operations using EIP-712 signed messages. This provides secure, decentralized admin access without shared secrets.
 
-**Setup:** Configure admin addresses in your seed overrides JSON:
+**Setup:** Configure admin addresses in your bootstrap config, TOML config, or seed overrides JSON:
 
 ```json
 {
   "admin": {
     "enabled": true,
-    "domain": "solver.example.com",
-    "chain_id": 1,
-    "admin_addresses": ["0xYourAdminWalletAddress"],
-    "withdrawals": {
-      "enabled": true
-    }
+    "domain": "localhost",
+    "admin_addresses": ["0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"]
   }
 }
 ```
 
+`admin_addresses` is a list. Any signer in this list is accepted for SIWE and EIP-712 admin auth checks.
+
 **Endpoints:**
 
 - **GET `/api/v1/admin/balances`** - Get solver balances by chain and token (protected, read-only)
-- **GET `/api/v1/admin/config`** - Get current solver configuration snapshot (public, read-only)
-- **GET `/api/v1/admin/nonce`** - Get a nonce for signing admin actions (protected)
+- **GET `/api/v1/admin/config`** - Get current solver configuration snapshot (protected, read-only)
+- **POST `/api/v1/admin/nonce`** (or GET alias) - Get a nonce for signing admin actions (protected)
   - Response:
     ```json
     {
@@ -801,6 +894,7 @@ The admin API enables authorized wallet addresses to perform administrative oper
       "contents": {
         "chainId": 10,
         "symbol": "USDC",
+        "name": "USD Coin",
         "tokenAddress": "0x...",
         "decimals": 6,
         "nonce": 1706184000123456,
@@ -810,6 +904,8 @@ The admin API enables authorized wallet addresses to perform administrative oper
     ```
   - The signature must be an EIP-712 typed data signature from an authorized admin
   - Changes are hot-reloaded immediately (no restart required)
+- **POST `/api/v1/admin/tokens/batch`** - Add multiple tokens in one signed request (protected)
+  - `contents.tokens` contains 2-50 entries with `chainId`, `symbol`, `name` (optional), `tokenAddress`, and `decimals`
 
 - **DELETE `/api/v1/admin/tokens`** - Remove a token from a network (protected)
 - **POST `/api/v1/admin/tokens/approve`** - Approve token allowance for settlements (protected)
@@ -823,13 +919,15 @@ The admin API enables authorized wallet addresses to perform administrative oper
 
 **Admin Action Flow:**
 
-1. Call `GET /api/v1/admin/nonce` to get a fresh nonce
+1. Call `POST /api/v1/admin/nonce` (or `GET` alias) to get a fresh nonce
 2. Call `GET /api/v1/admin/types` to get EIP-712 type definitions
 3. Construct the typed data with the nonce and a deadline
 4. Sign with your admin wallet (EIP-712)
 5. Submit the signed action to the appropriate endpoint
 
-**Note:** If API auth is enabled (`auth.enabled = true`), protected admin endpoints also require a JWT with `AdminAll` scope. Public endpoints remain unauthenticated.
+**Note:** If API auth is enabled (`auth_enabled = true` in seed overrides, mapped to runtime `auth.enabled`), protected admin endpoints also require a JWT with `AdminAll` scope. Use SIWE (`POST /api/v1/auth/siwe/nonce` + `POST /api/v1/auth/siwe/verify`) to obtain it.
+**Note:** `/api/v1/auth/siwe/nonce` is dedicated to SIWE login. `/api/v1/admin/nonce` is dedicated to EIP-712 admin action signing.
+**Note:** `POST /api/v1/auth/register` never issues `admin-all` and is disabled by default unless `AUTH_PUBLIC_REGISTER_ENABLED=true`.
 **Note:** Admin withdrawals require `admin.withdrawals.enabled = true` in config.
 
 #### Fees and Profitability
@@ -855,7 +953,7 @@ The rate buffer is applied during swap amount calculation:
 - ExactInput: `output_usd = market_output_usd * (1 - rate_buffer_bps/10_000)`
 - ExactOutput: `input_usd = market_input_usd / (1 - rate_buffer_bps/10_000)`
 
-Fee config can be set in seed overrides and updated at runtime via `PUT /api/v1/admin/fees`.
+Fee config can be set in bootstrap config and updated at runtime via `PUT /api/v1/admin/fees`.
 
 ### Example Usage
 
@@ -864,7 +962,7 @@ Fee config can be set in seed overrides and updated at runtime via `PUT /api/v1/
 curl -X POST http://localhost:3000/api/v1/quotes \
   -H "Content-Type: application/json" \
   -d '{
-    "user": "0x74...,
+    "user": "0x74...",
     "intent": {
       "intentType": "oif-swap",
       "inputs": [{
@@ -926,17 +1024,24 @@ curl http://localhost:3000/api/v1/tokens
 # Health check
 curl http://localhost:3000/health
 
-# Admin: Get nonce for signing
-curl http://localhost:3000/api/v1/admin/nonce
+# Admin: Get JWT via SIWE (wallet login)
+# See docs/admin-authentication.md for a full SIWE example.
+
+# Admin: Get nonce for signing admin actions (protected)
+curl -X POST http://localhost:3000/api/v1/admin/nonce \
+  -H "Authorization: Bearer $TOKEN"
 
 # Admin: Get EIP-712 types for signing
-curl http://localhost:3000/api/v1/admin/types
+curl http://localhost:3000/api/v1/admin/types \
+  -H "Authorization: Bearer $TOKEN"
 
 # Admin: Get solver balances (protected)
-curl http://localhost:3000/api/v1/admin/balances
+curl http://localhost:3000/api/v1/admin/balances \
+  -H "Authorization: Bearer $TOKEN"
 
-# Admin: Get solver config snapshot (public)
-curl http://localhost:3000/api/v1/admin/config
+# Admin: Get solver config snapshot (protected)
+curl http://localhost:3000/api/v1/admin/config \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 The API server is enabled by default on port 3000 when the solver is running. You can disable it or change the port in the configuration file.
@@ -983,14 +1088,18 @@ The project includes a Rust-based CLI tool (`solver-demo`) for testing cross-cha
 ### Prerequisites
 
 - [Foundry](https://book.getfoundry.sh/getting-started/installation) (for Anvil and deployment)
-- Rust toolchain (stable, 1.86.0+)
-- Contract compilation tools (Foundry) (for deploying test contracts)
+- Rust toolchain (stable, 1.88.0+)
+- [OIF Contracts](https://github.com/openintentsframework/oif-contracts) compiled with `forge build` (the demo looks for artifacts in `oif-contracts/out/`)
 
 ### Quick Start
 
 > **Note:** The solver-demo tool uses local Anvil chains for testing. The main solver binary uses Redis-based configuration for production deployments. See below for demo-specific setup.
 
 ```bash
+# 0. Clone and build the OIF contracts (needed for local deployment)
+git clone https://github.com/openintentsframework/oif-contracts.git
+cd oif-contracts && forge build && cd ..
+
 # 1. Initialize configuration and load it
 cargo run -p solver-demo -- init new config/demo.json
 cargo run -p solver-demo -- init load config/demo.json --local
@@ -1007,7 +1116,7 @@ cargo run -p solver-demo -- env setup
 
 # 5. Build and test intents
 # Build an intent request
-cargo run -p solver-demo -- intent build 31337 31338 TokenA TokenB 100 \
+cargo run -p solver-demo -- intent build --from-chain 31337 --to-chain 31338 --from-token TOKA --to-token TOKB --amount 100 \
     --swap-type exact-input --settlement escrow --auth permit2
 
 # Get quote and sign
@@ -1018,7 +1127,7 @@ cargo run -p solver-demo -- quote sign .oif-demo/requests/get_quote.res.json
 cargo run -p solver-demo -- intent submit .oif-demo/requests/post_order.req.json
 
 # 6. Monitor token balances
-cargo run -p solver-demo -- token balance all
+cargo run -p solver-demo -- token balance
 ```
 
 > The demo tool requires the Permit2 contract bytecode file located at `crates/solver-demo/data/permit2_bytecode.hex`. This file contains the canonical Permit2 bytecode and is essential for deploying contracts to local Anvil chains. The bytecode is automatically used during the `env deploy` step.
@@ -1069,7 +1178,7 @@ cargo run -p solver-demo -- env setup [--chain <id>] [--amount <amount>]
 ```bash
 # Build an intent request
 # Format: intent build <from-chain> <to-chain> <from-token> <to-token> <amount>
-cargo run -p solver-demo -- intent build 31337 31338 TokenA TokenB 100 \
+cargo run -p solver-demo -- intent build --from-chain 31337 --to-chain 31338 --from-token TOKA --to-token TOKB --amount 100 \
     --swap-type exact-input \
     --settlement escrow \
     --auth permit2 \
@@ -1143,18 +1252,18 @@ cargo run -p solver-demo -- quote test <quote-requests-file>
 cargo run -p solver-demo -- token list [--chains <chain-ids>]
 
 # Mint tokens to an account
-cargo run -p solver-demo -- token mint <chain> <token> <amount> [--to <address>]
+cargo run -p solver-demo -- token mint --chain <chain> --token <token> --amount <amount> [--to <address>]
 
 # Approve token spending
-cargo run -p solver-demo -- token approve <chain> <token> <spender> <amount>
+cargo run -p solver-demo -- token approve --chain <chain> --token <token> --spender <spender> --amount <amount>
 
 # Check token balances
-cargo run -p solver-demo -- token balance <account> [--chains <chain-ids>]
-cargo run -p solver-demo -- token balance all  # All accounts
-cargo run -p solver-demo -- token balance user  # Just user account
+cargo run -p solver-demo -- token balance [--account <account>] [--chains <chain-ids>]
+cargo run -p solver-demo -- token balance                  # All accounts (default)
+cargo run -p solver-demo -- token balance --account user   # Just user account
 
 # Monitor balances with auto-refresh
-cargo run -p solver-demo -- token balance <account> --follow <seconds>
+cargo run -p solver-demo -- token balance [--account <account>] --follow <seconds>
 ```
 
 #### Account Management
@@ -1222,7 +1331,7 @@ For production deployments, the solver uses Redis-based configuration:
 cargo build
 
 # Seed configuration (first run only)
-cargo run -- --seed testnet --seed-overrides config/seed-overrides-testnet.json
+cargo run -- --seed testnet --bootstrap-config config/seed-overrides-testnet.json
 
 # Run the solver (loads config from Redis)
 export SOLVER_ID=your-solver-id  # Output from seeding step
