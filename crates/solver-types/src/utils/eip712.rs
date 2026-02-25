@@ -732,6 +732,8 @@ pub fn reconstruct_eip3009_digest(
 /// A `serde_json::Value` containing all admin action type definitions:
 /// - EIP712Domain
 /// - AddToken
+/// - AddTokenItem
+/// - AddTokens
 /// - RemoveToken
 /// - Withdraw
 /// - UpdateNetwork
@@ -751,6 +753,17 @@ pub fn admin_eip712_types() -> serde_json::Value {
 			{"name": "symbol", "type": "string"},
 			{"name": "tokenAddress", "type": "address"},
 			{"name": "decimals", "type": "uint8"},
+			{"name": "nonce", "type": "uint256"},
+			{"name": "deadline", "type": "uint256"}
+		],
+		"AddTokenItem": [
+			{"name": "chainId", "type": "uint256"},
+			{"name": "symbol", "type": "string"},
+			{"name": "tokenAddress", "type": "address"},
+			{"name": "decimals", "type": "uint8"}
+		],
+		"AddTokens": [
+			{"name": "tokens", "type": "AddTokenItem[]"},
 			{"name": "nonce", "type": "uint256"},
 			{"name": "deadline", "type": "uint256"}
 		],
@@ -1807,6 +1820,8 @@ mod tests {
 		// Check all expected type definitions exist
 		assert!(obj.contains_key("EIP712Domain"));
 		assert!(obj.contains_key("AddToken"));
+		assert!(obj.contains_key("AddTokenItem"));
+		assert!(obj.contains_key("AddTokens"));
 		assert!(obj.contains_key("RemoveToken"));
 		assert!(obj.contains_key("Withdraw"));
 		assert!(obj.contains_key("UpdateNetwork"));
@@ -1851,6 +1866,34 @@ mod tests {
 		assert!(names.contains(&"decimals"));
 		assert!(names.contains(&"nonce"));
 		assert!(names.contains(&"deadline"));
+	}
+
+	#[test]
+	fn test_admin_eip712_types_add_tokens_fields() {
+		let types = admin_eip712_types();
+		let add_token_item = types["AddTokenItem"]
+			.as_array()
+			.expect("should be an array");
+		let add_tokens = types["AddTokens"].as_array().expect("should be an array");
+
+		assert_eq!(add_token_item.len(), 4);
+		assert_eq!(add_tokens.len(), 3);
+
+		let item_field_names: Vec<&str> = add_token_item
+			.iter()
+			.map(|field| field["name"].as_str().unwrap())
+			.collect();
+		assert!(item_field_names.contains(&"chainId"));
+		assert!(item_field_names.contains(&"symbol"));
+		assert!(item_field_names.contains(&"tokenAddress"));
+		assert!(item_field_names.contains(&"decimals"));
+
+		let tokens_type = add_tokens
+			.iter()
+			.find(|field| field["name"] == "tokens")
+			.and_then(|field| field["type"].as_str())
+			.unwrap();
+		assert_eq!(tokens_type, "AddTokenItem[]");
 	}
 
 	#[test]
