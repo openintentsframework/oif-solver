@@ -346,10 +346,13 @@ impl QuoteGenerator {
 		custody_decision: &CustodyDecision,
 	) -> Result<Quote, QuoteError> {
 		let quote_id = Uuid::new_v4().to_string();
-		let order = match custody_decision {
+		let (order, settlement_name) = match custody_decision {
 			CustodyDecision::ResourceLock { lock } => {
-				self.generate_resource_lock_order(request, config, lock)
-					.await?
+				let order = self
+					.generate_resource_lock_order(request, config, lock)
+					.await?;
+				// Resource lock orders don't have a settlement name (handled differently)
+				(order, None)
 			},
 			CustodyDecision::Escrow { lock_type } => {
 				self.generate_escrow_order(request, config, lock_type)
@@ -381,6 +384,7 @@ impl QuoteGenerator {
 			quote_id,
 			provider: Some("oif-solver".to_string()),
 			preview: QuotePreview::from_order_and_user(&order, &request.user),
+			settlement_name,
 		})
 	}
 
@@ -450,12 +454,13 @@ impl QuoteGenerator {
 		Ok(order)
 	}
 
+	/// Generates an escrow order and returns it along with the selected settlement name.
 	async fn generate_escrow_order(
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
 		lock_type: &LockType,
-	) -> Result<OifOrder, QuoteError> {
+	) -> Result<(OifOrder, Option<String>), QuoteError> {
 		// Extract chain from first output to find appropriate settlement
 		// TODO: Implement support for multiple destination chains
 		let origin_chain_id = request
@@ -477,28 +482,38 @@ impl QuoteGenerator {
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chain ID: {e}")))?;
 
 		// For escrow orders, get settlement that supports both chains
-		let (_settlement, input_oracle, output_oracle) = self
+		let (selected_settlement, _settlement, input_oracle, output_oracle) = self
 			.settlement_service
-			.get_any_settlement_for_chains(origin_chain_id, destination_chain_id)
+			.get_any_settlement_for_chains_with_name(origin_chain_id, destination_chain_id)
 			.ok_or_else(|| {
 				QuoteError::InvalidRequest(format!(
 					"No suitable settlement available for escrow from chain {origin_chain_id} to chain {destination_chain_id}"
 				))
 			})?;
+		tracing::debug!(
+			origin_chain_id,
+			destination_chain_id,
+			settlement = selected_settlement,
+			"Selected settlement for escrow quote"
+		);
 
-		match lock_type {
+		let order = match lock_type {
 			LockType::Permit2Escrow => {
 				self.generate_permit2_order(request, config, input_oracle, output_oracle)
-					.await
+					.await?
 			},
 			LockType::Eip3009Escrow => {
 				self.generate_eip3009_order(request, config, input_oracle, output_oracle)
-					.await
+					.await?
 			},
-			_ => Err(QuoteError::UnsupportedSettlement(format!(
-				"Unsupported escrow type: {lock_type:?}"
-			))),
-		}
+			_ => {
+				return Err(QuoteError::UnsupportedSettlement(format!(
+					"Unsupported escrow type: {lock_type:?}"
+				)))
+			},
+		};
+
+		Ok((order, Some(selected_settlement.to_string())))
 	}
 
 	async fn generate_permit2_order(
@@ -1032,14 +1047,19 @@ impl QuoteGenerator {
 		})?;
 
 		// Get preferred settlement for TheCompact (prioritizes Direct settlement like escrow)
-		let (_input_settlement, input_oracle, _output_oracle) = self
+		let (selected_input_settlement, _input_settlement, input_oracle, _output_oracle) = self
 			.settlement_service
-			.get_any_settlement_for_chain(origin_chain_id)
+			.get_any_settlement_for_chain_with_name(origin_chain_id)
 			.ok_or_else(|| {
 				QuoteError::InvalidRequest(format!(
 					"No suitable settlement available for TheCompact on chain {origin_chain_id}"
 				))
 			})?;
+		tracing::debug!(
+			chain_id = origin_chain_id,
+			settlement = selected_input_settlement,
+			"Selected settlement for resource-lock input chain"
+		);
 
 		// Convert inputs to the format expected by TheCompact
 		// For ResourceLock orders, we need to build the proper token IDs and amounts
@@ -1088,14 +1108,24 @@ impl QuoteGenerator {
 				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output chain ID: {e}")))?;
 
 			// Get preferred settlement for the output chain (prioritizes Direct settlement like escrow)
-			let (_output_settlement, _output_input_oracle, output_oracle) = self
+			let (
+				selected_output_settlement,
+				_output_settlement,
+				_output_input_oracle,
+				output_oracle,
+			) = self
 				.settlement_service
-				.get_any_settlement_for_chain(output_chain_id)
+				.get_any_settlement_for_chain_with_name(output_chain_id)
 				.ok_or_else(|| {
 					QuoteError::InvalidRequest(format!(
 						"No suitable settlement available for output chain {output_chain_id}"
 					))
 				})?;
+			tracing::debug!(
+				chain_id = output_chain_id,
+				settlement = selected_output_settlement,
+				"Selected settlement for resource-lock output chain"
+			);
 
 			// Get output settler from config (like permit2 flow)
 			let dest_net = config.networks.get(&output_chain_id).ok_or_else(|| {
@@ -1715,6 +1745,7 @@ mod tests {
 		// Create settlement configuration with domain
 		let settlement_config = SettlementConfig {
 			implementations: HashMap::new(),
+			implementation_order: Vec::new(),
 			settlement_poll_interval_seconds: 3,
 		};
 
@@ -2296,6 +2327,7 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
+				settlement_name: None,
 			},
 			Quote {
 				order: OifOrder::OifEscrowV0 {
@@ -2317,6 +2349,7 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
+				settlement_name: None,
 			},
 			Quote {
 				order: OifOrder::OifEscrowV0 {
@@ -2338,6 +2371,7 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
+				settlement_name: None,
 			},
 		];
 
@@ -2377,6 +2411,7 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
+				settlement_name: None,
 			},
 			Quote {
 				order: OifOrder::OifEscrowV0 {
@@ -2398,6 +2433,7 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
+				settlement_name: None,
 			},
 		];
 
@@ -2855,12 +2891,15 @@ mod tests {
 			.await;
 
 		match result {
-			Ok(order) => match order {
-				OifOrder::OifEscrowV0 { payload } => {
-					assert_eq!(payload.signature_type, SignatureType::Eip712);
-					assert_eq!(payload.primary_type, "PermitBatchWitnessTransferFrom");
-				},
-				_ => panic!("Expected OifEscrowV0 order"),
+			Ok((order, settlement_name)) => {
+				assert!(settlement_name.is_some());
+				match order {
+					OifOrder::OifEscrowV0 { payload } => {
+						assert_eq!(payload.signature_type, SignatureType::Eip712);
+						assert_eq!(payload.primary_type, "PermitBatchWitnessTransferFrom");
+					},
+					_ => panic!("Expected OifEscrowV0 order"),
+				}
 			},
 			Err(e) => {
 				// Expected due to missing settlement or configuration
@@ -2883,12 +2922,15 @@ mod tests {
 			.await;
 
 		match result {
-			Ok(order) => match order {
-				OifOrder::Oif3009V0 { payload, .. } => {
-					assert_eq!(payload.signature_type, SignatureType::Eip712);
-					assert_eq!(payload.primary_type, "ReceiveWithAuthorization");
-				},
-				_ => panic!("Expected Oif3009V0 order"),
+			Ok((order, settlement_name)) => {
+				assert!(settlement_name.is_some());
+				match order {
+					OifOrder::Oif3009V0 { payload, .. } => {
+						assert_eq!(payload.signature_type, SignatureType::Eip712);
+						assert_eq!(payload.primary_type, "ReceiveWithAuthorization");
+					},
+					_ => panic!("Expected Oif3009V0 order"),
+				}
 			},
 			Err(e) => {
 				// Expected due to missing settlement or contract calls failing

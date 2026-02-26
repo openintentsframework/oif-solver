@@ -1016,6 +1016,7 @@ impl QuoteParsable for Eip7683OrderData {
 			pre_claim_tx_hash: None,
 			claim_tx_hash: None,
 			fill_proof: None,
+			settlement_name: None,
 		}
 	}
 }

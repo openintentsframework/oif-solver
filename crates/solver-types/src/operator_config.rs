@@ -181,6 +181,11 @@ pub struct OperatorSettlementConfig {
 	#[serde(default = "default_settlement_type")]
 	pub settlement_type: OperatorSettlementType,
 
+	/// Optional ordered settlement preference for runtime selection.
+	/// When omitted, runtime falls back to `[settlement_type]`.
+	#[serde(default)]
+	pub priority: Option<Vec<OperatorSettlementType>>,
+
 	/// Hyperlane-specific settlement configuration.
 	#[serde(default)]
 	pub hyperlane: Option<OperatorHyperlaneConfig>,
@@ -702,6 +707,7 @@ mod tests {
 			settlement: OperatorSettlementConfig {
 				settlement_poll_interval_seconds: 10,
 				settlement_type: OperatorSettlementType::Hyperlane,
+				priority: None,
 				hyperlane: Some(OperatorHyperlaneConfig {
 					default_gas_limit: 300_000,
 					message_timeout_seconds: 600,
@@ -765,6 +771,7 @@ mod tests {
 			parsed.settlement.settlement_type,
 			OperatorSettlementType::Hyperlane
 		);
+		assert!(parsed.settlement.priority.is_none());
 		assert!(parsed.settlement.hyperlane.is_some());
 		assert!(parsed.settlement.direct.is_none());
 	}

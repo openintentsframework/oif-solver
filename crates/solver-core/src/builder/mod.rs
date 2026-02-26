@@ -342,8 +342,30 @@ impl SolverBuilder {
 
 		// Create settlement implementations first (needed for oracle routes)
 		let mut settlement_impls = HashMap::new();
-		for (name, config) in &self.static_config.settlement.implementations {
-			if let Some(factory) = factories.settlement_factories.get(name) {
+		let mut configured_order = self.static_config.settlement.implementation_order.clone();
+		if configured_order.is_empty() {
+			configured_order = self
+				.static_config
+				.settlement
+				.implementations
+				.keys()
+				.cloned()
+				.collect();
+			configured_order.sort();
+		}
+
+		let mut load_order = configured_order.clone();
+		for name in self.static_config.settlement.implementations.keys() {
+			if !load_order.contains(name) {
+				load_order.push(name.clone());
+			}
+		}
+
+		for name in load_order {
+			let Some(config) = self.static_config.settlement.implementations.get(&name) else {
+				continue;
+			};
+			if let Some(factory) = factories.settlement_factories.get(&name) {
 				match factory(config, &self.static_config.networks, storage.clone()) {
 					Ok(implementation) => {
 						// Validation already happened in the factory
@@ -371,8 +393,9 @@ impl SolverBuilder {
 			);
 		}
 
-		let settlement = Arc::new(SettlementService::new(
+		let settlement = Arc::new(SettlementService::new_with_order(
 			settlement_impls,
+			configured_order,
 			self.static_config
 				.settlement
 				.settlement_poll_interval_seconds,

@@ -126,6 +126,11 @@ pub struct SettlementOverride {
 	#[serde(default = "default_settlement_type_override", rename = "type")]
 	pub settlement_type: SettlementTypeOverride,
 
+	/// Optional ordered settlement preference for runtime selection.
+	/// When omitted, runtime falls back to `[type]`.
+	#[serde(default)]
+	pub priority: Option<Vec<SettlementTypeOverride>>,
+
 	/// Hyperlane settlement configuration override.
 	#[serde(default)]
 	pub hyperlane: Option<HyperlaneSettlementOverride>,
@@ -477,6 +482,20 @@ impl SeedOverrides {
 			.as_ref()
 			.map(|s| s.settlement_type)
 			.unwrap_or_default()
+	}
+
+	/// Get ordered settlement preference, defaulting to `[settlement_type()]`.
+	pub fn settlement_priority(&self) -> Vec<SettlementTypeOverride> {
+		if let Some(priority) = self
+			.settlement
+			.as_ref()
+			.and_then(|s| s.priority.as_ref())
+			.filter(|priority| !priority.is_empty())
+		{
+			return priority.clone();
+		}
+
+		vec![self.settlement_type()]
 	}
 }
 
@@ -985,6 +1004,7 @@ mod tests {
             ],
             "settlement": {
                 "type": "broadcaster",
+                "priority": ["broadcaster", "hyperlane"],
                 "broadcaster": {
                     "oracles": {
                         "input": {
@@ -1021,6 +1041,13 @@ mod tests {
 		assert_eq!(
 			config.settlement_type(),
 			SettlementTypeOverride::Broadcaster
+		);
+		assert_eq!(
+			config.settlement_priority(),
+			vec![
+				SettlementTypeOverride::Broadcaster,
+				SettlementTypeOverride::Hyperlane
+			]
 		);
 		let broadcaster = config
 			.settlement

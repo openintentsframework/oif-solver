@@ -432,8 +432,46 @@ impl IntentHandler {
 				})
 			});
 
-		// Validate and create order using the unified method
-		let intent_data = Some(intent.data.clone());
+		// Validate and create order using the unified method.
+		// For quote-derived intents, enrich intent data with the persisted quote settlement binding.
+		let mut intent_data_value = intent.data.clone();
+		if let Some(quote_id) = intent.quote_id.as_deref() {
+			match self
+				.storage
+				.retrieve::<solver_types::QuoteWithCostContext>(
+					StorageKey::Quotes.as_str(),
+					quote_id,
+				)
+				.await
+			{
+				Ok(quote_with_context) => {
+					if let Some(settlement_name) = quote_with_context.quote.settlement_name {
+						if let Some(intent_obj) = intent_data_value.as_object_mut() {
+							// Preserve both key styles for compatibility with current parsers.
+							intent_obj.insert(
+								"settlement_name".to_string(),
+								serde_json::Value::String(settlement_name.clone()),
+							);
+							intent_obj.insert(
+								"settlementName".to_string(),
+								serde_json::Value::String(settlement_name),
+							);
+						}
+					}
+				},
+				Err(solver_storage::StorageError::NotFound(_)) => {
+					tracing::debug!(%quote_id, "No stored quote context found for intent");
+				},
+				Err(error) => {
+					tracing::warn!(
+						%quote_id,
+						%error,
+						"Failed to retrieve quote context for intent settlement binding"
+					);
+				},
+			}
+		}
+		let intent_data = Some(intent_data_value);
 		match self
 			.order_service
 			.validate_and_create_order(

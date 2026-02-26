@@ -763,6 +763,11 @@ impl OrderInterface for Eip7683OrderImpl {
 		order_data.order_id = order_id_array;
 		order_data.lock_type = Some(lock_type);
 		order_data.raw_order_data = Some(alloy_primitives::hex::encode_prefixed(order_bytes));
+		let settlement_name = intent_data.as_ref().and_then(|data| {
+			data.get("settlement_name")
+				.and_then(|value| value.as_str())
+				.or_else(|| data.get("settlementName").and_then(|value| value.as_str()))
+		});
 
 		// Create generic Order
 		Ok(Order {
@@ -785,6 +790,7 @@ impl OrderInterface for Eip7683OrderImpl {
 			post_fill_tx_hash: None,
 			pre_claim_tx_hash: None,
 			fill_proof: None,
+			settlement_name: settlement_name.map(|name| name.to_string()),
 		})
 	}
 }

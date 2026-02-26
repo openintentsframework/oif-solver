@@ -134,143 +134,158 @@ fn validate_seedless_settlement_requirements(
 	initializer: &SeedOverrides,
 	chain_ids: &[u64],
 ) -> Result<(), MergeError> {
-	match initializer.settlement_type() {
-		SettlementTypeOverride::Hyperlane => {
-			let hyperlane = initializer
-				.settlement
-				.as_ref()
-				.and_then(|s| s.hyperlane.as_ref())
-				.ok_or_else(|| {
-					MergeError::Validation(
-						"seedless mode requires explicit settlement.hyperlane configuration"
-							.to_string(),
-					)
-				})?;
+	let mut seen = HashSet::new();
+	for settlement_type in initializer.settlement_priority() {
+		let settlement_name = match settlement_type {
+			SettlementTypeOverride::Hyperlane => "hyperlane",
+			SettlementTypeOverride::Direct => "direct",
+			SettlementTypeOverride::Broadcaster => "broadcaster",
+		};
+		if !seen.insert(settlement_name) {
+			return Err(MergeError::Validation(format!(
+				"seedless mode settlement.priority contains duplicate entry '{settlement_name}'"
+			)));
+		}
 
-			for chain_id in chain_ids {
-				if !hyperlane.mailboxes.contains_key(chain_id) {
-					return Err(MergeError::Validation(format!(
-						"seedless mode requires settlement.hyperlane.mailboxes for chain {chain_id}"
-					)));
-				}
-				if !hyperlane.igp_addresses.contains_key(chain_id) {
-					return Err(MergeError::Validation(format!(
-						"seedless mode requires settlement.hyperlane.igp_addresses for chain {chain_id}"
-					)));
-				}
-
-				match hyperlane.oracles.input.get(chain_id) {
-					Some(oracles) if !oracles.is_empty() => {},
-					Some(_) => {
-						return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.hyperlane.oracles.input for chain {chain_id}"
-						)))
-					},
-					None => {
-						return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.hyperlane.oracles.input for chain {chain_id}"
-						)))
-					},
-				}
-
-				match hyperlane.oracles.output.get(chain_id) {
-					Some(oracles) if !oracles.is_empty() => {},
-					Some(_) => {
-						return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.hyperlane.oracles.output for chain {chain_id}"
-						)))
-					},
-					None => {
-						return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.hyperlane.oracles.output for chain {chain_id}"
-						)))
-					},
-				}
-			}
-		},
-		SettlementTypeOverride::Direct => {
-			let direct = initializer
-				.settlement
-				.as_ref()
-				.and_then(|s| s.direct.as_ref())
-				.ok_or_else(|| {
-					MergeError::Validation(
-						"seedless mode requires settlement.direct when settlement.type is 'direct'"
-							.to_string(),
-					)
-				})?;
-
-			for chain_id in chain_ids {
-				match direct.oracles.input.get(chain_id) {
-					Some(oracles) if !oracles.is_empty() => {},
-					Some(_) => {
-						return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.direct.oracles.input for chain {chain_id}"
-						)))
-					},
-					None => {
-						return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.direct.oracles.input for chain {chain_id}"
-						)))
-					},
-				}
-				match direct.oracles.output.get(chain_id) {
-					Some(oracles) if !oracles.is_empty() => {},
-					Some(_) => {
-						return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.direct.oracles.output for chain {chain_id}"
-						)))
-					},
-					None => {
-						return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.direct.oracles.output for chain {chain_id}"
-						)))
-					},
-				}
-			}
-		},
-		SettlementTypeOverride::Broadcaster => {
-			let broadcaster = initializer
-				.settlement
-				.as_ref()
-				.and_then(|s| s.broadcaster.as_ref())
-				.ok_or_else(|| {
-					MergeError::Validation(
-							"seedless mode requires settlement.broadcaster when settlement.type is 'broadcaster'"
+		match settlement_type {
+			SettlementTypeOverride::Hyperlane => {
+				let hyperlane = initializer
+					.settlement
+					.as_ref()
+					.and_then(|s| s.hyperlane.as_ref())
+					.ok_or_else(|| {
+						MergeError::Validation(
+							"seedless mode requires explicit settlement.hyperlane configuration"
 								.to_string(),
 						)
-				})?;
+					})?;
 
-			if broadcaster
-				.proof_service_url
-				.as_ref()
-				.is_none_or(|url| url.trim().is_empty())
-			{
-				return Err(MergeError::Validation(
-					"seedless mode requires settlement.broadcaster.proof_service_url".to_string(),
-				));
-			}
+				for chain_id in chain_ids {
+					if !hyperlane.mailboxes.contains_key(chain_id) {
+						return Err(MergeError::Validation(format!(
+						"seedless mode requires settlement.hyperlane.mailboxes for chain {chain_id}"
+					)));
+					}
+					if !hyperlane.igp_addresses.contains_key(chain_id) {
+						return Err(MergeError::Validation(format!(
+						"seedless mode requires settlement.hyperlane.igp_addresses for chain {chain_id}"
+					)));
+					}
 
-			let routes = if broadcaster.routes.is_empty() {
-				build_full_mesh_routes(chain_ids)
-			} else {
-				validate_routes(
-					&broadcaster.routes,
-					chain_ids,
-					"seedless mode settlement.broadcaster.routes",
+					match hyperlane.oracles.input.get(chain_id) {
+						Some(oracles) if !oracles.is_empty() => {},
+						Some(_) => {
+							return Err(MergeError::Validation(format!(
+							"seedless mode requires non-empty settlement.hyperlane.oracles.input for chain {chain_id}"
+						)))
+						},
+						None => {
+							return Err(MergeError::Validation(format!(
+							"seedless mode requires settlement.hyperlane.oracles.input for chain {chain_id}"
+						)))
+						},
+					}
+
+					match hyperlane.oracles.output.get(chain_id) {
+						Some(oracles) if !oracles.is_empty() => {},
+						Some(_) => {
+							return Err(MergeError::Validation(format!(
+							"seedless mode requires non-empty settlement.hyperlane.oracles.output for chain {chain_id}"
+						)))
+						},
+						None => {
+							return Err(MergeError::Validation(format!(
+							"seedless mode requires settlement.hyperlane.oracles.output for chain {chain_id}"
+						)))
+						},
+					}
+				}
+			},
+			SettlementTypeOverride::Direct => {
+				let direct = initializer
+					.settlement
+					.as_ref()
+					.and_then(|s| s.direct.as_ref())
+					.ok_or_else(|| {
+						MergeError::Validation(
+						"seedless mode requires settlement.direct when 'direct' is included in settlement.priority"
+							.to_string(),
+					)
+					})?;
+
+				for chain_id in chain_ids {
+					match direct.oracles.input.get(chain_id) {
+						Some(oracles) if !oracles.is_empty() => {},
+						Some(_) => {
+							return Err(MergeError::Validation(format!(
+							"seedless mode requires non-empty settlement.direct.oracles.input for chain {chain_id}"
+						)))
+						},
+						None => {
+							return Err(MergeError::Validation(format!(
+							"seedless mode requires settlement.direct.oracles.input for chain {chain_id}"
+						)))
+						},
+					}
+					match direct.oracles.output.get(chain_id) {
+						Some(oracles) if !oracles.is_empty() => {},
+						Some(_) => {
+							return Err(MergeError::Validation(format!(
+							"seedless mode requires non-empty settlement.direct.oracles.output for chain {chain_id}"
+						)))
+						},
+						None => {
+							return Err(MergeError::Validation(format!(
+							"seedless mode requires settlement.direct.oracles.output for chain {chain_id}"
+						)))
+						},
+					}
+				}
+			},
+			SettlementTypeOverride::Broadcaster => {
+				let broadcaster = initializer
+					.settlement
+					.as_ref()
+					.and_then(|s| s.broadcaster.as_ref())
+					.ok_or_else(|| {
+						MergeError::Validation(
+							"seedless mode requires settlement.broadcaster when 'broadcaster' is included in settlement.priority"
+								.to_string(),
+						)
+					})?;
+
+				if broadcaster
+					.proof_service_url
+					.as_ref()
+					.is_none_or(|url| url.trim().is_empty())
+				{
+					return Err(MergeError::Validation(
+						"seedless mode requires settlement.broadcaster.proof_service_url"
+							.to_string(),
+					));
+				}
+
+				let routes = if broadcaster.routes.is_empty() {
+					build_full_mesh_routes(chain_ids)
+				} else {
+					validate_routes(
+						&broadcaster.routes,
+						chain_ids,
+						"seedless mode settlement.broadcaster.routes",
+					)?;
+					broadcaster.routes.clone()
+				};
+				validate_broadcaster_route_dependencies(
+					&broadcaster.oracles.input,
+					&broadcaster.oracles.output,
+					&routes,
+					&broadcaster.broadcaster_addresses,
+					&broadcaster.receiver_addresses,
+					&broadcaster.broadcaster_ids,
+					"seedless mode settlement.broadcaster",
 				)?;
-				broadcaster.routes.clone()
-			};
-			validate_broadcaster_route_dependencies(
-				&broadcaster.oracles.input,
-				&broadcaster.oracles.output,
-				&routes,
-				&broadcaster.broadcaster_addresses,
-				&broadcaster.receiver_addresses,
-				&broadcaster.broadcaster_ids,
-				"seedless mode settlement.broadcaster",
-			)?;
-		},
+			},
+		}
 	}
 
 	Ok(())
@@ -580,63 +595,107 @@ fn build_operator_settlement_config(
 	seed: &SeedConfig,
 	chain_ids: &[u64],
 ) -> Result<OperatorSettlementConfig, MergeError> {
-	let settlement_type = initializer.settlement_type();
-
-	match settlement_type {
-		SettlementTypeOverride::Hyperlane => {
-			let hyperlane = build_operator_hyperlane_config(initializer, seed, chain_ids)?;
-			Ok(OperatorSettlementConfig {
-				settlement_poll_interval_seconds: seed.defaults.settlement_poll_interval_seconds,
-				settlement_type: OperatorSettlementType::Hyperlane,
-				hyperlane: Some(hyperlane),
-				direct: None,
-				broadcaster: None,
-			})
-		},
-		SettlementTypeOverride::Direct => {
-			let direct_override = initializer
-				.settlement
-				.as_ref()
-				.and_then(|s| s.direct.as_ref())
-				.ok_or_else(|| {
-					MergeError::Validation(
-						"settlement.type is 'direct' but settlement.direct is missing".to_string(),
-					)
-				})?;
-
-			let direct = build_operator_direct_config_from_override(direct_override, chain_ids)?;
-			Ok(OperatorSettlementConfig {
-				settlement_poll_interval_seconds: seed.defaults.settlement_poll_interval_seconds,
-				settlement_type: OperatorSettlementType::Direct,
-				hyperlane: None,
-				direct: Some(direct),
-				broadcaster: None,
-			})
-		},
-		SettlementTypeOverride::Broadcaster => {
-			let broadcaster_override = initializer
-				.settlement
-				.as_ref()
-				.and_then(|s| s.broadcaster.as_ref())
-				.ok_or_else(|| {
-					MergeError::Validation(
-						"settlement.type is 'broadcaster' but settlement.broadcaster is missing"
-							.to_string(),
-					)
-				})?;
-
-			let broadcaster =
-				build_operator_broadcaster_config_from_override(broadcaster_override, chain_ids)?;
-
-			Ok(OperatorSettlementConfig {
-				settlement_poll_interval_seconds: seed.defaults.settlement_poll_interval_seconds,
-				settlement_type: OperatorSettlementType::Broadcaster,
-				hyperlane: None,
-				direct: None,
-				broadcaster: Some(broadcaster),
-			})
-		},
+	let mut settlement_priority = initializer.settlement_priority();
+	if settlement_priority.is_empty() {
+		settlement_priority.push(initializer.settlement_type());
 	}
+
+	let mut seen = HashSet::new();
+	for settlement_type in &settlement_priority {
+		let name = match settlement_type {
+			SettlementTypeOverride::Hyperlane => "hyperlane",
+			SettlementTypeOverride::Direct => "direct",
+			SettlementTypeOverride::Broadcaster => "broadcaster",
+		};
+		if !seen.insert(name) {
+			return Err(MergeError::Validation(format!(
+				"settlement.priority contains duplicate entry '{name}'"
+			)));
+		}
+	}
+
+	let primary_settlement = *settlement_priority
+		.first()
+		.ok_or_else(|| MergeError::Validation("settlement priority cannot be empty".to_string()))?;
+
+	let mut hyperlane = None;
+	let mut direct = None;
+	let mut broadcaster = None;
+
+	for settlement_type in &settlement_priority {
+		match settlement_type {
+			SettlementTypeOverride::Hyperlane => {
+				if hyperlane.is_none() {
+					hyperlane = Some(build_operator_hyperlane_config(
+						initializer,
+						seed,
+						chain_ids,
+					)?);
+				}
+			},
+			SettlementTypeOverride::Direct => {
+				if direct.is_none() {
+					let direct_override = initializer
+						.settlement
+						.as_ref()
+						.and_then(|s| s.direct.as_ref())
+						.ok_or_else(|| {
+							MergeError::Validation(
+								"settlement.direct is missing (required when included in settlement priority)"
+									.to_string(),
+							)
+						})?;
+					direct = Some(build_operator_direct_config_from_override(
+						direct_override,
+						chain_ids,
+					)?);
+				}
+			},
+			SettlementTypeOverride::Broadcaster => {
+				if broadcaster.is_none() {
+					let broadcaster_override = initializer
+						.settlement
+						.as_ref()
+						.and_then(|s| s.broadcaster.as_ref())
+						.ok_or_else(|| {
+							MergeError::Validation(
+								"settlement.broadcaster is missing (required when included in settlement priority)"
+									.to_string(),
+							)
+						})?;
+					broadcaster = Some(build_operator_broadcaster_config_from_override(
+						broadcaster_override,
+						chain_ids,
+					)?);
+				}
+			},
+		}
+	}
+
+	let settlement_type = match primary_settlement {
+		SettlementTypeOverride::Hyperlane => OperatorSettlementType::Hyperlane,
+		SettlementTypeOverride::Direct => OperatorSettlementType::Direct,
+		SettlementTypeOverride::Broadcaster => OperatorSettlementType::Broadcaster,
+	};
+	let priority = Some(
+		settlement_priority
+			.into_iter()
+			.map(|settlement| match settlement {
+				SettlementTypeOverride::Hyperlane => OperatorSettlementType::Hyperlane,
+				SettlementTypeOverride::Direct => OperatorSettlementType::Direct,
+				SettlementTypeOverride::Broadcaster => OperatorSettlementType::Broadcaster,
+			})
+			.collect(),
+	);
+
+	Ok(OperatorSettlementConfig {
+		settlement_poll_interval_seconds: seed.defaults.settlement_poll_interval_seconds,
+		settlement_type,
+		priority,
+		hyperlane,
+		direct,
+		broadcaster,
+	})
 }
 
 /// Builds the Hyperlane configuration for OperatorConfig.
@@ -1257,49 +1316,77 @@ fn build_settlement_config_from_operator(
 	chain_ids: &[u64],
 ) -> Result<SettlementConfig, MergeError> {
 	let mut implementations = HashMap::new();
+	let settlement_priority = operator_config
+		.settlement
+		.priority
+		.clone()
+		.filter(|priority| !priority.is_empty())
+		.unwrap_or_else(|| vec![operator_config.settlement.settlement_type]);
 
-	match operator_config.settlement.settlement_type {
-		OperatorSettlementType::Hyperlane => {
-			let hyperlane = operator_config
-				.settlement
-				.hyperlane
-				.as_ref()
-				.ok_or_else(|| {
+	let mut implementation_order = Vec::new();
+	let mut seen = HashSet::new();
+	for settlement_type in settlement_priority {
+		let implementation_name = match settlement_type {
+			OperatorSettlementType::Hyperlane => "hyperlane",
+			OperatorSettlementType::Direct => "direct",
+			OperatorSettlementType::Broadcaster => "broadcaster",
+		};
+		if !seen.insert(implementation_name) {
+			return Err(MergeError::Validation(format!(
+				"Duplicate settlement implementation '{implementation_name}' in settlement priority"
+			)));
+		}
+
+		match settlement_type {
+			OperatorSettlementType::Hyperlane => {
+				let hyperlane = operator_config
+					.settlement
+					.hyperlane
+					.as_ref()
+					.ok_or_else(|| {
+						MergeError::Validation(
+							"settlement.hyperlane is missing (required when included in settlement priority)"
+								.to_string(),
+						)
+					})?;
+				let hyperlane_config = build_hyperlane_toml_from_operator(hyperlane, chain_ids);
+				implementations.insert("hyperlane".to_string(), hyperlane_config);
+				implementation_order.push("hyperlane".to_string());
+			},
+			OperatorSettlementType::Direct => {
+				let direct = operator_config.settlement.direct.as_ref().ok_or_else(|| {
 					MergeError::Validation(
-						"settlement_type is hyperlane but settlement.hyperlane is missing"
+						"settlement.direct is missing (required when included in settlement priority)"
 							.to_string(),
 					)
 				})?;
-			let hyperlane_config = build_hyperlane_toml_from_operator(hyperlane, chain_ids);
-			implementations.insert("hyperlane".to_string(), hyperlane_config);
-		},
-		OperatorSettlementType::Direct => {
-			let direct = operator_config.settlement.direct.as_ref().ok_or_else(|| {
-				MergeError::Validation(
-					"settlement_type is direct but settlement.direct is missing".to_string(),
-				)
-			})?;
-			let direct_config = build_direct_toml_from_operator(direct, chain_ids);
-			implementations.insert("direct".to_string(), direct_config);
-		},
-		OperatorSettlementType::Broadcaster => {
-			let broadcaster = operator_config
-				.settlement
-				.broadcaster
-				.as_ref()
-				.ok_or_else(|| {
-					MergeError::Validation(
-						"settlement_type is broadcaster but settlement.broadcaster is missing"
-							.to_string(),
-					)
-				})?;
-			let broadcaster_config = build_broadcaster_toml_from_operator(broadcaster, chain_ids);
-			implementations.insert("broadcaster".to_string(), broadcaster_config);
-		},
+				let direct_config = build_direct_toml_from_operator(direct, chain_ids);
+				implementations.insert("direct".to_string(), direct_config);
+				implementation_order.push("direct".to_string());
+			},
+			OperatorSettlementType::Broadcaster => {
+				let broadcaster =
+					operator_config
+						.settlement
+						.broadcaster
+						.as_ref()
+						.ok_or_else(|| {
+							MergeError::Validation(
+								"settlement.broadcaster is missing (required when included in settlement priority)"
+									.to_string(),
+						)
+						})?;
+				let broadcaster_config =
+					build_broadcaster_toml_from_operator(broadcaster, chain_ids);
+				implementations.insert("broadcaster".to_string(), broadcaster_config);
+				implementation_order.push("broadcaster".to_string());
+			},
+		}
 	}
 
 	Ok(SettlementConfig {
 		implementations,
+		implementation_order,
 		settlement_poll_interval_seconds: operator_config
 			.settlement
 			.settlement_poll_interval_seconds,
@@ -1893,33 +1980,88 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		networks.insert(*chain_id, op_network);
 	}
 
-	// Extract selected settlement implementation from runtime config.
-	let (settlement_type, hyperlane, direct, broadcaster) = if config
-		.settlement
-		.implementations
-		.contains_key("broadcaster")
-	{
-		(
-			OperatorSettlementType::Broadcaster,
-			None,
-			None,
-			Some(extract_broadcaster_config(&config.settlement, &chain_ids)),
-		)
-	} else if config.settlement.implementations.contains_key("direct") {
-		(
-			OperatorSettlementType::Direct,
-			None,
-			Some(extract_direct_config(&config.settlement, &chain_ids)),
-			None,
-		)
+	// Extract settlement implementations and priority from runtime config.
+	let mut ordered_implementations = if !config.settlement.implementation_order.is_empty() {
+		config.settlement.implementation_order.clone()
 	} else {
-		(
-			OperatorSettlementType::Hyperlane,
-			Some(extract_hyperlane_config(&config.settlement, &chain_ids)),
-			None,
-			None,
-		)
+		let mut keys: Vec<String> = config.settlement.implementations.keys().cloned().collect();
+		keys.sort();
+		keys
 	};
+
+	if ordered_implementations.is_empty() {
+		if config
+			.settlement
+			.implementations
+			.contains_key("broadcaster")
+		{
+			ordered_implementations.push("broadcaster".to_string());
+		}
+		if config.settlement.implementations.contains_key("hyperlane") {
+			ordered_implementations.push("hyperlane".to_string());
+		}
+		if config.settlement.implementations.contains_key("direct") {
+			ordered_implementations.push("direct".to_string());
+		}
+	}
+
+	let mut settlement_priority = Vec::new();
+	let mut seen = HashSet::new();
+	let mut hyperlane = None;
+	let mut direct = None;
+	let mut broadcaster = None;
+
+	for implementation in ordered_implementations {
+		if !config
+			.settlement
+			.implementations
+			.contains_key(&implementation)
+		{
+			continue;
+		}
+		if !seen.insert(implementation.clone()) {
+			continue;
+		}
+
+		match implementation.as_str() {
+			"broadcaster" => {
+				settlement_priority.push(OperatorSettlementType::Broadcaster);
+				broadcaster = Some(extract_broadcaster_config(&config.settlement, &chain_ids));
+			},
+			"hyperlane" => {
+				settlement_priority.push(OperatorSettlementType::Hyperlane);
+				hyperlane = Some(extract_hyperlane_config(&config.settlement, &chain_ids));
+			},
+			"direct" => {
+				settlement_priority.push(OperatorSettlementType::Direct);
+				direct = Some(extract_direct_config(&config.settlement, &chain_ids));
+			},
+			_ => {},
+		}
+	}
+
+	if settlement_priority.is_empty() {
+		if config
+			.settlement
+			.implementations
+			.contains_key("broadcaster")
+		{
+			settlement_priority.push(OperatorSettlementType::Broadcaster);
+			broadcaster = Some(extract_broadcaster_config(&config.settlement, &chain_ids));
+		} else if config.settlement.implementations.contains_key("direct") {
+			settlement_priority.push(OperatorSettlementType::Direct);
+			direct = Some(extract_direct_config(&config.settlement, &chain_ids));
+		} else {
+			settlement_priority.push(OperatorSettlementType::Hyperlane);
+			hyperlane = Some(extract_hyperlane_config(&config.settlement, &chain_ids));
+		}
+	}
+
+	let settlement_type = settlement_priority
+		.first()
+		.copied()
+		.unwrap_or(OperatorSettlementType::Hyperlane);
+	let settlement_priority = Some(settlement_priority);
 
 	// Extract gas config
 	let gas = config
@@ -2012,6 +2154,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		settlement: OperatorSettlementConfig {
 			settlement_poll_interval_seconds: config.settlement.settlement_poll_interval_seconds,
 			settlement_type,
+			priority: settlement_priority,
 			hyperlane,
 			direct,
 			broadcaster,
@@ -3434,6 +3577,7 @@ mod tests {
 			],
 			settlement: Some(solver_types::SettlementOverride {
 				settlement_type: SettlementTypeOverride::Hyperlane,
+				priority: None,
 				hyperlane: Some(HyperlaneSettlementOverride {
 					mailboxes: HashMap::from([
 						(
@@ -3562,6 +3706,7 @@ mod tests {
 			],
 			settlement: Some(solver_types::SettlementOverride {
 				settlement_type: SettlementTypeOverride::Hyperlane,
+				priority: None,
 				hyperlane: Some(HyperlaneSettlementOverride {
 					mailboxes: HashMap::from([
 						(
@@ -3797,6 +3942,7 @@ mod tests {
 			],
 			settlement: Some(solver_types::SettlementOverride {
 				settlement_type: SettlementTypeOverride::Direct,
+				priority: None,
 				hyperlane: None,
 				direct: Some(DirectSettlementOverride {
 					oracles: solver_types::OracleOverrides {
@@ -3891,6 +4037,7 @@ mod tests {
 			],
 			settlement: Some(solver_types::SettlementOverride {
 				settlement_type: SettlementTypeOverride::Broadcaster,
+				priority: None,
 				hyperlane: None,
 				direct: None,
 				broadcaster: Some(BroadcasterSettlementOverride {
@@ -3957,6 +4104,292 @@ mod tests {
 	}
 
 	#[test]
+	fn test_merge_to_operator_config_seedless_multi_settlement_priority_success() {
+		let chain_a = 812001u64;
+		let chain_b = 812002u64;
+		let overrides = SeedOverrides {
+			solver_id: Some("seedless-multi-settlement".to_string()),
+			solver_name: None,
+			networks: vec![
+				NetworkOverride {
+					chain_id: chain_a,
+					name: Some("seedless-a".to_string()),
+					network_type: Some(NetworkType::Parent),
+					tokens: vec![],
+					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
+					input_settler_address: Some(address!(
+						"1111111111111111111111111111111111111111"
+					)),
+					output_settler_address: Some(address!(
+						"2222222222222222222222222222222222222222"
+					)),
+					input_settler_compact_address: None,
+					the_compact_address: None,
+					allocator_address: None,
+				},
+				NetworkOverride {
+					chain_id: chain_b,
+					name: Some("seedless-b".to_string()),
+					network_type: Some(NetworkType::Hub),
+					tokens: vec![],
+					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
+					input_settler_address: Some(address!(
+						"3333333333333333333333333333333333333333"
+					)),
+					output_settler_address: Some(address!(
+						"4444444444444444444444444444444444444444"
+					)),
+					input_settler_compact_address: None,
+					the_compact_address: None,
+					allocator_address: None,
+				},
+			],
+			settlement: Some(solver_types::SettlementOverride {
+				settlement_type: SettlementTypeOverride::Broadcaster,
+				priority: Some(vec![
+					SettlementTypeOverride::Broadcaster,
+					SettlementTypeOverride::Hyperlane,
+				]),
+				hyperlane: Some(HyperlaneSettlementOverride {
+					mailboxes: HashMap::from([
+						(
+							chain_a,
+							address!("5555555555555555555555555555555555555555"),
+						),
+						(
+							chain_b,
+							address!("6666666666666666666666666666666666666666"),
+						),
+					]),
+					igp_addresses: HashMap::from([
+						(
+							chain_a,
+							address!("7777777777777777777777777777777777777777"),
+						),
+						(
+							chain_b,
+							address!("8888888888888888888888888888888888888888"),
+						),
+					]),
+					oracles: solver_types::OracleOverrides {
+						input: HashMap::from([
+							(
+								chain_a,
+								vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+							),
+							(
+								chain_b,
+								vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")],
+							),
+						]),
+						output: HashMap::from([
+							(
+								chain_a,
+								vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+							),
+							(
+								chain_b,
+								vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")],
+							),
+						]),
+					},
+					routes: HashMap::new(),
+					default_gas_limit: Some(300_000),
+					message_timeout_seconds: Some(600),
+					finalization_required: Some(true),
+					intent_min_expiry_seconds: None,
+				}),
+				direct: None,
+				broadcaster: Some(BroadcasterSettlementOverride {
+					oracles: solver_types::OracleOverrides {
+						input: HashMap::from([(
+							chain_a,
+							vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+						)]),
+						output: HashMap::from([(
+							chain_b,
+							vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")],
+						)]),
+					},
+					routes: HashMap::from([(chain_a, vec![chain_b])]),
+					broadcaster_addresses: HashMap::from([(
+						chain_b,
+						address!("cccccccccccccccccccccccccccccccccccccccc"),
+					)]),
+					receiver_addresses: HashMap::from([(
+						chain_a,
+						address!("dddddddddddddddddddddddddddddddddddddddd"),
+					)]),
+					broadcaster_ids: HashMap::from([(
+						chain_b,
+						alloy_primitives::B256::from([0x11; 32]),
+					)]),
+					proof_service_url: Some("http://localhost:9090".to_string()),
+					proof_wait_time_seconds: Some(45),
+					storage_proof_timeout_seconds: Some(20),
+					default_finality_blocks: Some(15),
+					finality_blocks: HashMap::new(),
+					chain_block_time_seconds: HashMap::new(),
+					intent_safety_buffer_seconds: None,
+					intent_min_expiry_seconds: None,
+					oracle_selection_strategy: Some(OracleSelectionStrategyOverride::First),
+				}),
+			}),
+			routing_defaults: None,
+			account: None,
+			admin: None,
+			auth_enabled: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
+		};
+
+		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
+		assert_eq!(
+			op_config.settlement.settlement_type,
+			OperatorSettlementType::Broadcaster
+		);
+		assert_eq!(
+			op_config.settlement.priority,
+			Some(vec![
+				OperatorSettlementType::Broadcaster,
+				OperatorSettlementType::Hyperlane,
+			])
+		);
+		assert!(op_config.settlement.broadcaster.is_some());
+		assert!(op_config.settlement.hyperlane.is_some());
+
+		let runtime = build_runtime_config(&op_config).unwrap();
+		assert_eq!(
+			runtime.settlement.implementation_order,
+			vec!["broadcaster".to_string(), "hyperlane".to_string()]
+		);
+		assert!(runtime
+			.settlement
+			.implementations
+			.contains_key("broadcaster"));
+		assert!(runtime.settlement.implementations.contains_key("hyperlane"));
+	}
+
+	#[test]
+	fn test_merge_to_operator_config_seedless_rejects_duplicate_settlement_priority() {
+		let chain_a = 813001u64;
+		let chain_b = 813002u64;
+		let overrides = SeedOverrides {
+			solver_id: Some("seedless-duplicate-priority".to_string()),
+			solver_name: None,
+			networks: vec![
+				NetworkOverride {
+					chain_id: chain_a,
+					name: Some("seedless-a".to_string()),
+					network_type: Some(NetworkType::Parent),
+					tokens: vec![],
+					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
+					input_settler_address: Some(address!(
+						"1111111111111111111111111111111111111111"
+					)),
+					output_settler_address: Some(address!(
+						"2222222222222222222222222222222222222222"
+					)),
+					input_settler_compact_address: None,
+					the_compact_address: None,
+					allocator_address: None,
+				},
+				NetworkOverride {
+					chain_id: chain_b,
+					name: Some("seedless-b".to_string()),
+					network_type: Some(NetworkType::Hub),
+					tokens: vec![],
+					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
+					input_settler_address: Some(address!(
+						"3333333333333333333333333333333333333333"
+					)),
+					output_settler_address: Some(address!(
+						"4444444444444444444444444444444444444444"
+					)),
+					input_settler_compact_address: None,
+					the_compact_address: None,
+					allocator_address: None,
+				},
+			],
+			settlement: Some(solver_types::SettlementOverride {
+				settlement_type: SettlementTypeOverride::Hyperlane,
+				priority: Some(vec![
+					SettlementTypeOverride::Hyperlane,
+					SettlementTypeOverride::Hyperlane,
+				]),
+				hyperlane: Some(HyperlaneSettlementOverride {
+					mailboxes: HashMap::from([
+						(
+							chain_a,
+							address!("5555555555555555555555555555555555555555"),
+						),
+						(
+							chain_b,
+							address!("6666666666666666666666666666666666666666"),
+						),
+					]),
+					igp_addresses: HashMap::from([
+						(
+							chain_a,
+							address!("7777777777777777777777777777777777777777"),
+						),
+						(
+							chain_b,
+							address!("8888888888888888888888888888888888888888"),
+						),
+					]),
+					oracles: solver_types::OracleOverrides {
+						input: HashMap::from([
+							(
+								chain_a,
+								vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+							),
+							(
+								chain_b,
+								vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")],
+							),
+						]),
+						output: HashMap::from([
+							(
+								chain_a,
+								vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+							),
+							(
+								chain_b,
+								vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")],
+							),
+						]),
+					},
+					routes: HashMap::new(),
+					default_gas_limit: Some(300_000),
+					message_timeout_seconds: Some(600),
+					finalization_required: Some(true),
+					intent_min_expiry_seconds: None,
+				}),
+				direct: None,
+				broadcaster: None,
+			}),
+			routing_defaults: None,
+			account: None,
+			admin: None,
+			auth_enabled: None,
+			min_profitability_pct: None,
+			gas_buffer_bps: None,
+			commission_bps: None,
+			rate_buffer_bps: None,
+		};
+
+		let result = merge_to_operator_config_seedless(overrides);
+		assert!(matches!(
+			result.unwrap_err(),
+			MergeError::Validation(msg)
+				if msg.contains("settlement.priority contains duplicate entry 'hyperlane'")
+		));
+	}
+
+	#[test]
 	fn test_merge_to_operator_config_seedless_broadcaster_missing_source_receiver_fails() {
 		let chain_a = 820001u64;
 		let chain_b = 820002u64;
@@ -3999,6 +4432,7 @@ mod tests {
 			],
 			settlement: Some(solver_types::SettlementOverride {
 				settlement_type: SettlementTypeOverride::Broadcaster,
+				priority: None,
 				hyperlane: None,
 				direct: None,
 				broadcaster: Some(BroadcasterSettlementOverride {
@@ -4096,6 +4530,7 @@ mod tests {
 			],
 			settlement: Some(solver_types::SettlementOverride {
 				settlement_type: SettlementTypeOverride::Hyperlane,
+				priority: None,
 				hyperlane: Some(HyperlaneSettlementOverride {
 					mailboxes: HashMap::from([
 						(
@@ -4174,6 +4609,7 @@ mod tests {
 		let mut overrides = test_seed_overrides();
 		overrides.settlement = Some(solver_types::SettlementOverride {
 			settlement_type: SettlementTypeOverride::Direct,
+			priority: None,
 			hyperlane: None,
 			direct: None,
 			broadcaster: None,
@@ -4190,6 +4626,7 @@ mod tests {
 		let mut overrides = test_seed_overrides();
 		overrides.settlement = Some(solver_types::SettlementOverride {
 			settlement_type: SettlementTypeOverride::Direct,
+			priority: None,
 			hyperlane: None,
 			direct: Some(DirectSettlementOverride {
 				oracles: solver_types::OracleOverrides {
@@ -4600,6 +5037,7 @@ mod tests {
 			settlement: OperatorSettlementConfig {
 				settlement_poll_interval_seconds: 60,
 				settlement_type: OperatorSettlementType::Hyperlane,
+				priority: None,
 				hyperlane: Some(OperatorHyperlaneConfig {
 					default_gas_limit: 300000,
 					message_timeout_seconds: 600,

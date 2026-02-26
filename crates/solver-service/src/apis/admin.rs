@@ -1431,6 +1431,7 @@ mod tests {
 			settlement: OperatorSettlementConfig {
 				settlement_poll_interval_seconds: 3,
 				settlement_type: OperatorSettlementType::Hyperlane,
+				priority: None,
 				hyperlane: Some(OperatorHyperlaneConfig {
 					default_gas_limit: 0,
 					message_timeout_seconds: 0,
