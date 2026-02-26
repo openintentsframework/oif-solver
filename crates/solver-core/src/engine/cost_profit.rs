@@ -1766,6 +1766,7 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
+				settlement_name: None,
 			},
 			cost_context: CostContext {
 				cost_breakdown: create_test_cost_breakdown(),
@@ -2314,6 +2315,7 @@ mod tests {
 			pre_claim_tx_hash: None,
 			claim_tx_hash: None,
 			fill_proof: None,
+			settlement_name: None,
 		}
 	}
 
@@ -2528,6 +2530,7 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
+				settlement_name: None,
 			},
 			cost_context: create_cost_context_with_swap_type(SwapType::ExactInput),
 		};
@@ -2591,6 +2594,7 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
+				settlement_name: None,
 			},
 			cost_context: create_cost_context_with_swap_type(SwapType::ExactOutput),
 		};
@@ -3021,6 +3025,7 @@ mod tests {
 			pre_claim_tx_hash: None,
 			claim_tx_hash: None,
 			fill_proof: None,
+			settlement_name: None,
 		}
 	}
 
@@ -3097,6 +3102,7 @@ mod tests {
 			pre_claim_tx_hash: None,
 			claim_tx_hash: None,
 			fill_proof: None,
+			settlement_name: None,
 		}
 	}
 

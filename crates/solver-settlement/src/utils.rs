@@ -4,8 +4,29 @@
 //! from TOML config files, used by all settlement implementations.
 
 use crate::{OracleConfig, OracleSelectionStrategy, SettlementError};
-use solver_types::{utils::parse_address, Address};
+use alloy_primitives::{FixedBytes, B256, U256};
+use alloy_provider::{DynProvider, Provider};
+use alloy_sol_types::{sol, SolCall};
+use serde::{de::DeserializeOwned, Serialize};
+use solver_storage::StorageService;
+use solver_types::{
+	create_http_provider, utils::parse_address, Address, NetworksConfig, ProviderError, StorageKey,
+};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
+
+sol! {
+	interface IBaseInputOracle {
+		function isProven(
+			uint256 remoteChainId,
+			bytes32 remoteOracle,
+			bytes32 application,
+			bytes32 dataHash
+		) external view returns (bool);
+	}
+}
 
 /// Parse an oracle table from TOML configuration.
 ///
@@ -173,6 +194,204 @@ pub fn parse_oracle_config(config: &toml::Value) -> Result<OracleConfig, Settlem
 		routes,
 		selection_strategy,
 	})
+}
+
+/// Parse a table mapping chain IDs to single addresses.
+pub fn parse_address_table(table: &toml::Value) -> Result<HashMap<u64, Address>, SettlementError> {
+	let mut result = HashMap::new();
+
+	if let Some(table) = table.as_table() {
+		for (chain_id_str, address_value) in table {
+			let chain_id = chain_id_str.parse::<u64>().map_err(|e| {
+				SettlementError::ValidationFailed(format!("Invalid chain ID '{chain_id_str}': {e}"))
+			})?;
+
+			let address_str = address_value.as_str().ok_or_else(|| {
+				SettlementError::ValidationFailed(format!(
+					"Address must be string for chain {chain_id}"
+				))
+			})?;
+
+			let address = parse_address(address_str).map_err(|e| {
+				SettlementError::ValidationFailed(format!(
+					"Invalid address for chain {chain_id}: {e}"
+				))
+			})?;
+
+			result.insert(chain_id, address);
+		}
+	}
+
+	Ok(result)
+}
+
+/// Parse a table mapping chain IDs to bytes32 values.
+pub fn parse_b256_table(table: &toml::Value) -> Result<HashMap<u64, B256>, SettlementError> {
+	let mut result = HashMap::new();
+
+	if let Some(table) = table.as_table() {
+		for (chain_id_str, value) in table {
+			let chain_id = chain_id_str.parse::<u64>().map_err(|e| {
+				SettlementError::ValidationFailed(format!("Invalid chain ID '{chain_id_str}': {e}"))
+			})?;
+
+			let value_str = value.as_str().ok_or_else(|| {
+				SettlementError::ValidationFailed(format!(
+					"Value must be string for chain {chain_id}"
+				))
+			})?;
+
+			let parsed = value_str.parse::<B256>().map_err(|e| {
+				SettlementError::ValidationFailed(format!(
+					"Invalid bytes32 value for chain {chain_id}: {e}"
+				))
+			})?;
+
+			result.insert(chain_id, parsed);
+		}
+	}
+
+	Ok(result)
+}
+
+/// Create strict HTTP providers for all given chains.
+pub fn create_providers_for_chains(
+	chain_ids: &[u64],
+	networks: &NetworksConfig,
+) -> Result<HashMap<u64, DynProvider>, SettlementError> {
+	let mut unique_chain_ids = chain_ids.to_vec();
+	unique_chain_ids.sort_unstable();
+	unique_chain_ids.dedup();
+
+	let mut providers = HashMap::new();
+	for chain_id in unique_chain_ids {
+		let provider = create_http_provider(chain_id, networks).map_err(|e| match e {
+			ProviderError::NetworkConfig(msg) => SettlementError::ValidationFailed(msg),
+			ProviderError::Connection(msg) => SettlementError::ValidationFailed(msg),
+			ProviderError::InvalidUrl(msg) => SettlementError::ValidationFailed(msg),
+		})?;
+		providers.insert(chain_id, provider);
+	}
+
+	Ok(providers)
+}
+
+/// Convert a 20-byte solver address to a right-aligned bytes32 value.
+pub fn address_to_bytes32(address: &Address) -> [u8; 32] {
+	let mut out = [0u8; 32];
+	if address.0.len() == 20 {
+		out[12..32].copy_from_slice(&address.0);
+	}
+	out
+}
+
+/// Generic helper to call BaseInputOracle.isProven().
+pub async fn check_is_proven(
+	provider: &DynProvider,
+	oracle_address: &Address,
+	remote_chain_id: u64,
+	remote_oracle: [u8; 32],
+	application: [u8; 32],
+	data_hash: [u8; 32],
+) -> Result<bool, SettlementError> {
+	let call_data = IBaseInputOracle::isProvenCall {
+		remoteChainId: U256::from(remote_chain_id),
+		remoteOracle: FixedBytes::<32>::from(remote_oracle),
+		application: FixedBytes::<32>::from(application),
+		dataHash: FixedBytes::<32>::from(data_hash),
+	};
+
+	let request = alloy_rpc_types::eth::transaction::TransactionRequest {
+		to: Some(alloy_primitives::TxKind::Call(
+			alloy_primitives::Address::from_slice(&oracle_address.0),
+		)),
+		input: call_data.abi_encode().into(),
+		..Default::default()
+	};
+
+	let result = provider
+		.call(request)
+		.await
+		.map_err(|e| SettlementError::ValidationFailed(format!("Failed to call isProven: {e}")))?;
+
+	Ok(result.len() >= 32 && result[31] != 0)
+}
+
+/// Generic storage-backed settlement message tracker.
+#[derive(Clone)]
+pub struct SettlementMessageTracker<S>
+where
+	S: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+	storage: Arc<StorageService>,
+	namespace: &'static str,
+	cache: Arc<RwLock<HashMap<String, S>>>,
+}
+
+impl<S> SettlementMessageTracker<S>
+where
+	S: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+	pub fn new(storage: Arc<StorageService>, namespace: &'static str) -> Self {
+		Self {
+			storage,
+			namespace,
+			cache: Arc::new(RwLock::new(HashMap::new())),
+		}
+	}
+
+	fn storage_key(&self, order_id: &str) -> String {
+		format!("{}:{order_id}", self.namespace)
+	}
+
+	pub async fn load(&self, order_id: &str) -> Option<S> {
+		{
+			let cache = self.cache.read().await;
+			if let Some(state) = cache.get(order_id) {
+				return Some(state.clone());
+			}
+		}
+
+		let key = self.storage_key(order_id);
+		match self
+			.storage
+			.retrieve::<S>(StorageKey::SettlementMessages.as_str(), &key)
+			.await
+		{
+			Ok(state) => {
+				let mut cache = self.cache.write().await;
+				cache.insert(order_id.to_string(), state.clone());
+				Some(state)
+			},
+			Err(_) => None,
+		}
+	}
+
+	pub async fn save(
+		&self,
+		order_id: &str,
+		state: &S,
+		ttl: Option<Duration>,
+	) -> Result<(), SettlementError> {
+		let key = self.storage_key(order_id);
+
+		self.storage
+			.store_with_ttl(
+				StorageKey::SettlementMessages.as_str(),
+				&key,
+				state,
+				None,
+				ttl,
+			)
+			.await
+			.map_err(|e| {
+				SettlementError::ValidationFailed(format!("Failed to persist message state: {e}"))
+			})?;
+
+		let mut cache = self.cache.write().await;
+		cache.insert(order_id.to_string(), state.clone());
+		Ok(())
+	}
 }
 
 /// Validate that all routes reference chains with configured oracles.

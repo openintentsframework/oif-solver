@@ -18,6 +18,7 @@ use thiserror::Error;
 
 /// Re-export implementations
 pub mod implementations {
+	pub mod broadcaster;
 	pub mod direct;
 	pub mod hyperlane;
 }
@@ -37,6 +38,21 @@ pub enum SettlementError {
 	/// Error that occurs when a fill doesn't match order requirements.
 	#[error("Fill does not match order requirements")]
 	FillMismatch,
+	/// Failed to generate storage proof data required for broadcaster verification.
+	#[error("Proof generation failed for chain {source_chain}: {reason}")]
+	ProofGenerationFailed { source_chain: u64, reason: String },
+	/// Proof generation attempted before configured finality threshold was met.
+	#[error("Finality not reached: required {required_blocks} blocks, current {current_blocks}")]
+	FinalityNotReached {
+		required_blocks: u64,
+		current_blocks: u64,
+	},
+	/// External prover/proof service is unavailable.
+	#[error("Prover unavailable: {0}")]
+	ProverUnavailable(String),
+	/// Slot derivation mismatch detected between expected and proved slot.
+	#[error("Slot derivation mismatch")]
+	SlotDerivationMismatch,
 }
 
 /// Strategy for selecting oracles when multiple are available
@@ -258,11 +274,15 @@ pub trait SettlementRegistry: ImplementationRegistry<Factory = SettlementFactory
 /// Returns a vector of (name, factory) tuples for all available settlement implementations.
 /// This is used by the factory registry to automatically register all implementations.
 pub fn get_all_implementations() -> Vec<(&'static str, SettlementFactory)> {
-	use implementations::{direct, hyperlane};
+	use implementations::{broadcaster, direct, hyperlane};
 
 	vec![
 		(direct::Registry::NAME, direct::Registry::factory()),
 		(hyperlane::Registry::NAME, hyperlane::Registry::factory()),
+		(
+			broadcaster::Registry::NAME,
+			broadcaster::Registry::factory(),
+		),
 	]
 }
 
@@ -271,6 +291,8 @@ pub struct SettlementService {
 	/// Map of implementation names to their instances.
 	/// Keys are implementation type names (e.g., "direct", "optimistic").
 	implementations: HashMap<String, Box<dyn SettlementInterface>>,
+	/// Deterministic priority order for settlement selection.
+	implementation_order: Vec<String>,
 	/// Track order count for round-robin selection
 	selection_counter: Arc<AtomicU64>,
 	/// Poll interval for settlement monitoring in seconds
@@ -287,8 +309,37 @@ impl SettlementService {
 		implementations: HashMap<String, Box<dyn SettlementInterface>>,
 		poll_interval_seconds: u64,
 	) -> Self {
+		let mut implementation_order: Vec<String> = implementations.keys().cloned().collect();
+		implementation_order.sort();
+
+		Self::new_with_order(implementations, implementation_order, poll_interval_seconds)
+	}
+
+	/// Creates a new SettlementService with an explicit implementation order.
+	pub fn new_with_order(
+		implementations: HashMap<String, Box<dyn SettlementInterface>>,
+		implementation_order: Vec<String>,
+		poll_interval_seconds: u64,
+	) -> Self {
+		let mut seen = std::collections::HashSet::new();
+		let mut normalized_order = Vec::new();
+		for name in implementation_order {
+			if implementations.contains_key(&name) && seen.insert(name.clone()) {
+				normalized_order.push(name);
+			}
+		}
+
+		let mut remaining: Vec<String> = implementations
+			.keys()
+			.filter(|name| !seen.contains(*name))
+			.cloned()
+			.collect();
+		remaining.sort();
+		normalized_order.extend(remaining);
+
 		Self {
 			implementations,
+			implementation_order: normalized_order,
 			selection_counter: Arc::new(AtomicU64::new(0)),
 			poll_interval_seconds,
 		}
@@ -301,16 +352,28 @@ impl SettlementService {
 		self.implementations.get(name).map(|b| b.as_ref())
 	}
 
+	/// Get the configured implementation priority order.
+	pub fn implementation_order(&self) -> &[String] {
+		&self.implementation_order
+	}
+
 	/// Get the configured poll interval for settlement monitoring
 	pub fn poll_interval_seconds(&self) -> u64 {
 		self.poll_interval_seconds
 	}
 
 	/// Build oracle routes from all settlement implementations.
+	///
+	/// Routes from all settlements are merged together. If multiple settlements
+	/// share the same input oracle, their output routes are combined rather than
+	/// overwritten. This ensures all valid routes are available for quote generation.
 	pub fn build_oracle_routes(&self) -> OracleRoutes {
-		let mut supported_routes = HashMap::new();
+		let mut supported_routes: HashMap<OracleInfo, Vec<OracleInfo>> = HashMap::new();
 
-		for settlement in self.implementations.values() {
+		for name in &self.implementation_order {
+			let Some(settlement) = self.implementations.get(name) else {
+				continue;
+			};
 			let config = settlement.oracle_config();
 
 			// For each input oracle
@@ -321,26 +384,25 @@ impl SettlementService {
 						oracle: input_oracle.clone(),
 					};
 
-					let mut valid_outputs = Vec::new();
-
 					// Add all valid output destinations
 					if let Some(dest_chains) = config.routes.get(input_chain) {
 						for dest_chain in dest_chains {
 							// Add all output oracles on that destination
 							if let Some(output_oracles) = config.output_oracles.get(dest_chain) {
 								for output_oracle in output_oracles {
-									valid_outputs.push(OracleInfo {
+									let output_info = OracleInfo {
 										chain_id: *dest_chain,
 										oracle: output_oracle.clone(),
-									});
+									};
+									// Merge routes: get or create the entry, then add if not present
+									let outputs =
+										supported_routes.entry(input_info.clone()).or_default();
+									if !outputs.contains(&output_info) {
+										outputs.push(output_info);
+									}
 								}
 							}
 						}
-					}
-
-					// Only insert if there are valid routes from this input oracle
-					if !valid_outputs.is_empty() {
-						supported_routes.insert(input_info, valid_outputs);
 					}
 				}
 			}
@@ -356,7 +418,10 @@ impl SettlementService {
 		oracle_address: &Address,
 		is_input: bool,
 	) -> Result<&dyn SettlementInterface, SettlementError> {
-		for settlement in self.implementations.values() {
+		for name in &self.implementation_order {
+			let Some(settlement) = self.implementations.get(name) else {
+				continue;
+			};
 			if is_input {
 				if settlement.is_input_oracle_supported(chain_id, oracle_address) {
 					return Ok(settlement.as_ref());
@@ -377,11 +442,29 @@ impl SettlementService {
 		)))
 	}
 
-	/// Find settlement for an order based on its oracles.
+	/// Find settlement for an order based on its persisted settlement name or oracles.
+	///
+	/// If the order has a persisted `settlement_name`, that binding is used to ensure
+	/// consistent settlement handling throughout the order lifecycle, even if runtime
+	/// configuration changes. Otherwise, falls back to oracle-based lookup.
 	pub fn find_settlement_for_order(
 		&self,
 		order: &Order,
 	) -> Result<&dyn SettlementInterface, SettlementError> {
+		// Prefer persisted settlement name if available (ensures consistent binding)
+		if let Some(ref name) = order.settlement_name {
+			if let Some(settlement) = self.implementations.get(name) {
+				return Ok(settlement.as_ref());
+			}
+			// Settlement name was persisted but implementation no longer exists
+			tracing::warn!(
+				order_id = %order.id,
+				settlement_name = %name,
+				"Persisted settlement implementation not found, falling back to oracle lookup"
+			);
+		}
+
+		// Fall back to oracle-based lookup
 		let order_data = order
 			.parse_order_data()
 			.map_err(|e| SettlementError::ValidationFailed(e.to_string()))?;
@@ -395,76 +478,81 @@ impl SettlementService {
 	}
 
 	/// Get any settlement that supports a given chain (for quote generation).
+	/// Returns settlement implementation name, settlement, input oracle, and output oracle.
+	pub fn get_any_settlement_for_chain_with_name(
+		&self,
+		chain_id: u64,
+	) -> Option<(&str, &dyn SettlementInterface, Address, Address)> {
+		let context = self.selection_counter.fetch_add(1, Ordering::Relaxed);
+
+		for name in &self.implementation_order {
+			let Some(settlement) = self.implementations.get(name) else {
+				continue;
+			};
+			let settlement = settlement.as_ref();
+			let input_oracles = settlement.oracle_config().input_oracles.get(&chain_id);
+			let output_oracles = settlement.oracle_config().output_oracles.get(&chain_id);
+
+			if (input_oracles.is_none() || input_oracles.is_some_and(|oracles| oracles.is_empty()))
+				&& (output_oracles.is_none()
+					|| output_oracles.is_some_and(|oracles| oracles.is_empty()))
+			{
+				continue;
+			}
+
+			let input_oracle = if let Some(oracles) = input_oracles {
+				if !oracles.is_empty() {
+					settlement.select_oracle(oracles, Some(context))?
+				} else {
+					Address(vec![0u8; 20])
+				}
+			} else {
+				Address(vec![0u8; 20])
+			};
+
+			let output_oracle = if let Some(oracles) = output_oracles {
+				if !oracles.is_empty() {
+					settlement.select_oracle(oracles, Some(context + 1))?
+				} else {
+					Address(vec![0u8; 20])
+				}
+			} else {
+				Address(vec![0u8; 20])
+			};
+
+			return Some((name.as_str(), settlement, input_oracle, output_oracle));
+		}
+
+		None
+	}
+
+	/// Get any settlement that supports a given chain (for quote generation).
 	/// Returns settlement, input oracle, and output oracle for consistency.
 	pub fn get_any_settlement_for_chain(
 		&self,
 		chain_id: u64,
 	) -> Option<(&dyn SettlementInterface, Address, Address)> {
-		// Collect all settlements that support this chain with their oracles
-		let mut available_settlements = Vec::new();
-
-		for settlement in self.implementations.values() {
-			let input_oracles = settlement.oracle_config().input_oracles.get(&chain_id);
-			let output_oracles = settlement.oracle_config().output_oracles.get(&chain_id);
-
-			// Need at least one type of oracle for this chain
-			if (input_oracles.is_some() && !input_oracles.unwrap().is_empty())
-				|| (output_oracles.is_some() && !output_oracles.unwrap().is_empty())
-			{
-				available_settlements.push((
-					settlement.as_ref(),
-					input_oracles.cloned(),
-					output_oracles.cloned(),
-				));
-			}
-		}
-
-		if available_settlements.is_empty() {
-			return None;
-		}
-
-		// Get selection context for deterministic oracle selection
-		let context = self.selection_counter.fetch_add(1, Ordering::Relaxed);
-
-		// Use first available settlement
-		let (settlement, input_oracles, output_oracles) = &available_settlements[0];
-
-		// Select input oracle if available
-		let input_oracle = if let Some(oracles) = input_oracles {
-			if !oracles.is_empty() {
-				settlement.select_oracle(oracles, Some(context))?
-			} else {
-				Address(vec![0u8; 20]) // Default if no input oracle
-			}
-		} else {
-			Address(vec![0u8; 20]) // Default if no input oracle
-		};
-
-		// Select output oracle if available
-		let output_oracle = if let Some(oracles) = output_oracles {
-			if !oracles.is_empty() {
-				settlement.select_oracle(oracles, Some(context))?
-			} else {
-				Address(vec![0u8; 20]) // Default if no output oracle
-			}
-		} else {
-			Address(vec![0u8; 20]) // Default if no output oracle
-		};
-
-		Some((*settlement, input_oracle, output_oracle))
+		self.get_any_settlement_for_chain_with_name(chain_id).map(
+			|(_, settlement, input_oracle, output_oracle)| {
+				(settlement, input_oracle, output_oracle)
+			},
+		)
 	}
 
 	/// Get any settlement that supports both origin and destination chains (for cross-chain quote generation).
-	/// Returns settlement, input oracle for origin chain, and output oracle for destination chain.
-	pub fn get_any_settlement_for_chains(
+	/// Returns settlement implementation name, settlement, input oracle for origin chain, and output oracle for destination chain.
+	pub fn get_any_settlement_for_chains_with_name(
 		&self,
 		origin_chain_id: u64,
 		destination_chain_id: u64,
-	) -> Option<(&dyn SettlementInterface, Address, Address)> {
-		// Collect all settlements that support both chains
-		let mut available_settlements = Vec::new();
+	) -> Option<(&str, &dyn SettlementInterface, Address, Address)> {
+		let context = self.selection_counter.fetch_add(1, Ordering::Relaxed);
 
-		for settlement in self.implementations.values() {
+		for name in &self.implementation_order {
+			let Some(settlement) = self.implementations.get(name) else {
+				continue;
+			};
+			let settlement = settlement.as_ref();
 			let input_oracles = settlement
 				.oracle_config()
 				.input_oracles
@@ -474,37 +562,36 @@ impl SettlementService {
 				.output_oracles
 				.get(&destination_chain_id);
 
-			// Need both input oracle for origin and output oracle for destination
-			if input_oracles.is_some()
-				&& !input_oracles.unwrap().is_empty()
-				&& output_oracles.is_some()
-				&& !output_oracles.unwrap().is_empty()
-			{
-				available_settlements.push((
-					settlement.as_ref(),
-					input_oracles.cloned().unwrap(),
-					output_oracles.cloned().unwrap(),
-				));
+			let Some(input_oracles) = input_oracles else {
+				continue;
+			};
+			let Some(output_oracles) = output_oracles else {
+				continue;
+			};
+			if input_oracles.is_empty() || output_oracles.is_empty() {
+				continue;
 			}
+
+			let input_oracle = settlement.select_oracle(input_oracles, Some(context))?;
+			let output_oracle = settlement.select_oracle(output_oracles, Some(context + 1))?;
+
+			return Some((name.as_str(), settlement, input_oracle, output_oracle));
 		}
 
-		if available_settlements.is_empty() {
-			return None;
-		}
+		None
+	}
 
-		// Get selection context for deterministic oracle selection
-		let context = self.selection_counter.fetch_add(1, Ordering::Relaxed);
-
-		// Use first available settlement
-		let (settlement, input_oracles, output_oracles) = &available_settlements[0];
-
-		// Select input oracle for origin chain
-		let input_oracle = settlement.select_oracle(input_oracles, Some(context))?;
-
-		// Select output oracle for destination chain
-		let output_oracle = settlement.select_oracle(output_oracles, Some(context + 1))?;
-
-		Some((*settlement, input_oracle, output_oracle))
+	/// Get any settlement that supports both origin and destination chains (for cross-chain quote generation).
+	/// Returns settlement, input oracle for origin chain, and output oracle for destination chain.
+	pub fn get_any_settlement_for_chains(
+		&self,
+		origin_chain_id: u64,
+		destination_chain_id: u64,
+	) -> Option<(&dyn SettlementInterface, Address, Address)> {
+		self.get_any_settlement_for_chains_with_name(origin_chain_id, destination_chain_id)
+			.map(|(_, settlement, input_oracle, output_oracle)| {
+				(settlement, input_oracle, output_oracle)
+			})
 	}
 
 	/// Gets attestation for a filled order using the appropriate settlement implementation.

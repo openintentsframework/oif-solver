@@ -315,6 +315,7 @@ mod tests {
 
 		let settlement_config = SettlementConfig {
 			implementations: HashMap::new(),
+			implementation_order: Vec::new(),
 			settlement_poll_interval_seconds: 3,
 		};
 

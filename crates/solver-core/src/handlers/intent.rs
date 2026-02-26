@@ -14,8 +14,8 @@ use solver_delivery::DeliveryService;
 use solver_order::OrderService;
 use solver_storage::StorageService;
 use solver_types::{
-	truncate_id, with_0x_prefix, Address, DiscoveryEvent, Eip7683OrderData, ExecutionDecision,
-	ExecutionParams, Intent, OrderEvent, SolverEvent, StorageKey,
+	current_timestamp, truncate_id, with_0x_prefix, Address, DiscoveryEvent, Eip7683OrderData,
+	ExecutionDecision, ExecutionParams, Intent, OrderEvent, SolverEvent, StorageKey,
 };
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -57,6 +57,276 @@ pub struct IntentHandler {
 	/// In-memory LRU cache for fast intent deduplication to prevent race conditions
 	/// Automatically evicts oldest entries when capacity is exceeded
 	processed_intents: Arc<RwLock<LruCache<String, ()>>>,
+}
+
+const DEFAULT_BROADCASTER_PROOF_WAIT_SECONDS: u64 = 30;
+const DEFAULT_BROADCASTER_PROOF_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_BROADCASTER_FINALITY_BLOCKS: u64 = 20;
+const DEFAULT_SETTLEMENT_SAFETY_BUFFER_SECONDS: u64 = 90;
+const DEFAULT_BLOCK_TIME_SECONDS: u64 = 12;
+
+fn parse_optional_u64(value: Option<&toml::Value>, default_value: u64) -> u64 {
+	value
+		.and_then(|v| v.as_integer())
+		.map(|v| v.max(0) as u64)
+		.unwrap_or(default_value)
+}
+
+fn parse_chain_u64_table(value: Option<&toml::Value>) -> std::collections::HashMap<u64, u64> {
+	let mut parsed = std::collections::HashMap::new();
+	let Some(table) = value.and_then(|v| v.as_table()) else {
+		return parsed;
+	};
+
+	for (chain_id, raw_value) in table {
+		if let (Ok(chain_id), Some(raw_int)) = (chain_id.parse::<u64>(), raw_value.as_integer()) {
+			parsed.insert(chain_id, raw_int.max(0) as u64);
+		}
+	}
+
+	parsed
+}
+
+fn parse_chain_address_table(
+	value: Option<&toml::Value>,
+) -> std::collections::HashMap<u64, Vec<Address>> {
+	let mut parsed = std::collections::HashMap::new();
+	let Some(table) = value.and_then(|v| v.as_table()) else {
+		return parsed;
+	};
+
+	for (chain_id, entries) in table {
+		let Ok(chain_id) = chain_id.parse::<u64>() else {
+			continue;
+		};
+		let Some(entries) = entries.as_array() else {
+			continue;
+		};
+
+		let addresses: Vec<Address> = entries
+			.iter()
+			.filter_map(|entry| entry.as_str())
+			.filter_map(|entry| solver_types::utils::parse_address(entry).ok())
+			.collect();
+		if !addresses.is_empty() {
+			parsed.insert(chain_id, addresses);
+		}
+	}
+
+	parsed
+}
+
+fn parse_routes_table(value: Option<&toml::Value>) -> std::collections::HashMap<u64, Vec<u64>> {
+	let mut parsed = std::collections::HashMap::new();
+	let Some(table) = value.and_then(|v| v.as_table()) else {
+		return parsed;
+	};
+
+	for (chain_id, entries) in table {
+		let Ok(chain_id) = chain_id.parse::<u64>() else {
+			continue;
+		};
+		let Some(entries) = entries.as_array() else {
+			continue;
+		};
+
+		let destinations: Vec<u64> = entries
+			.iter()
+			.filter_map(|entry| entry.as_integer())
+			.map(|entry| entry.max(0) as u64)
+			.collect();
+		if !destinations.is_empty() {
+			parsed.insert(chain_id, destinations);
+		}
+	}
+
+	parsed
+}
+
+fn parse_oracle_table(
+	cfg_table: &toml::map::Map<String, toml::Value>,
+	key: &str,
+) -> std::collections::HashMap<u64, Vec<Address>> {
+	parse_chain_address_table(
+		cfg_table
+			.get("oracles")
+			.and_then(|v| v.as_table())
+			.and_then(|oracles| oracles.get(key)),
+	)
+}
+
+fn implementation_supports_order(
+	cfg_table: &toml::map::Map<String, toml::Value>,
+	order_data: &Eip7683OrderData,
+	input_oracle: &Address,
+) -> bool {
+	let origin_chain = order_data.origin_chain_id.to::<u64>();
+	let cross_chain_outputs: Vec<u64> = order_data
+		.outputs
+		.iter()
+		.map(|output| output.chain_id.to::<u64>())
+		.filter(|destination| *destination != origin_chain)
+		.collect();
+
+	if cross_chain_outputs.is_empty() {
+		return false;
+	}
+
+	let input_oracles = parse_oracle_table(cfg_table, "input");
+	let output_oracles = parse_oracle_table(cfg_table, "output");
+	let routes = parse_routes_table(cfg_table.get("routes"));
+
+	let Some(source_input_oracles) = input_oracles.get(&origin_chain) else {
+		return false;
+	};
+	if !source_input_oracles.contains(input_oracle) {
+		return false;
+	}
+
+	let Some(route_destinations) = routes.get(&origin_chain) else {
+		return false;
+	};
+	for destination in cross_chain_outputs {
+		if !route_destinations.contains(&destination) {
+			return false;
+		}
+		if output_oracles
+			.get(&destination)
+			.is_none_or(|oracles| oracles.is_empty())
+		{
+			return false;
+		}
+	}
+
+	true
+}
+
+fn estimated_block_time_seconds(
+	chain_id: u64,
+	chain_block_times: &std::collections::HashMap<u64, u64>,
+) -> u64 {
+	if let Some(custom) = chain_block_times.get(&chain_id) {
+		return (*custom).max(1);
+	}
+	match chain_id {
+		// OP Stack networks (mainnets + major testnets)
+		10 | 11155420 | 8453 | 84532 | 7777777 => 2,
+		// Arbitrum One + Arbitrum Sepolia
+		42161 | 421614 => 2,
+		// Conservative fallback for unknown chains.
+		_ => DEFAULT_BLOCK_TIME_SECONDS,
+	}
+}
+
+fn estimate_broadcaster_expiry_buffer_seconds(
+	order_data: &Eip7683OrderData,
+	cfg_table: &toml::map::Map<String, toml::Value>,
+	poll_interval_seconds: u64,
+) -> Option<(u64, String)> {
+	let proof_wait = parse_optional_u64(
+		cfg_table.get("proof_wait_time_seconds"),
+		DEFAULT_BROADCASTER_PROOF_WAIT_SECONDS,
+	);
+	let proof_timeout = parse_optional_u64(
+		cfg_table.get("storage_proof_timeout_seconds"),
+		DEFAULT_BROADCASTER_PROOF_TIMEOUT_SECONDS,
+	);
+	let default_finality_blocks = parse_optional_u64(
+		cfg_table.get("default_finality_blocks"),
+		DEFAULT_BROADCASTER_FINALITY_BLOCKS,
+	);
+	let finality_blocks = parse_chain_u64_table(cfg_table.get("finality_blocks"));
+	let chain_block_times = parse_chain_u64_table(cfg_table.get("chain_block_time_seconds"));
+	let safety_buffer = parse_optional_u64(
+		cfg_table.get("intent_safety_buffer_seconds"),
+		DEFAULT_SETTLEMENT_SAFETY_BUFFER_SECONDS,
+	);
+
+	let origin_chain = order_data.origin_chain_id.to::<u64>();
+	let mut max_finality_seconds = 0u64;
+	let mut has_cross_chain_output = false;
+	for output in &order_data.outputs {
+		let destination_chain = output.chain_id.to::<u64>();
+		if destination_chain == origin_chain {
+			continue;
+		}
+		has_cross_chain_output = true;
+		let blocks = finality_blocks
+			.get(&destination_chain)
+			.copied()
+			.unwrap_or(default_finality_blocks);
+		let chain_finality_seconds = blocks.saturating_mul(estimated_block_time_seconds(
+			destination_chain,
+			&chain_block_times,
+		));
+		max_finality_seconds = max_finality_seconds.max(chain_finality_seconds);
+	}
+
+	if !has_cross_chain_output {
+		return None;
+	}
+
+	let poll_window = poll_interval_seconds.saturating_mul(2);
+	let required_window = proof_wait
+		.saturating_add(max_finality_seconds)
+		.saturating_add(proof_timeout)
+		.saturating_add(poll_window)
+		.saturating_add(safety_buffer);
+
+	Some((
+		required_window,
+		format!(
+			"proof_wait={proof_wait}s + finality={max_finality_seconds}s + proof_timeout={proof_timeout}s + poll_window={poll_window}s + safety={safety_buffer}s"
+		),
+	))
+}
+
+fn estimate_required_expiry_window_seconds(
+	order_data: &Eip7683OrderData,
+	config: &Config,
+) -> Option<(u64, String)> {
+	let input_oracle = solver_types::utils::parse_address(&order_data.input_oracle).ok()?;
+	let poll_interval = config.settlement.settlement_poll_interval_seconds;
+	let mut matches: Vec<(u64, String)> = Vec::new();
+
+	for (implementation_name, implementation_cfg) in &config.settlement.implementations {
+		let Some(cfg_table) = implementation_cfg.as_table() else {
+			continue;
+		};
+
+		if !implementation_supports_order(cfg_table, order_data, &input_oracle) {
+			continue;
+		}
+
+		if let Some(explicit_min_expiry_seconds) = cfg_table
+			.get("intent_min_expiry_seconds")
+			.and_then(|value| value.as_integer())
+		{
+			let required_window = explicit_min_expiry_seconds.max(0) as u64;
+			matches.push((
+				required_window,
+				format!(
+					"{implementation_name}: explicit intent_min_expiry_seconds={required_window}s"
+				),
+			));
+			continue;
+		}
+
+		if implementation_name == "broadcaster" {
+			if let Some((required_window, breakdown)) =
+				estimate_broadcaster_expiry_buffer_seconds(order_data, cfg_table, poll_interval)
+			{
+				matches.push((
+					required_window,
+					format!("{implementation_name}: {breakdown}"),
+				));
+			}
+		}
+	}
+
+	matches
+		.into_iter()
+		.max_by_key(|(required_window, _)| *required_window)
 }
 
 impl IntentHandler {
@@ -162,8 +432,46 @@ impl IntentHandler {
 				})
 			});
 
-		// Validate and create order using the unified method
-		let intent_data = Some(intent.data.clone());
+		// Validate and create order using the unified method.
+		// For quote-derived intents, enrich intent data with the persisted quote settlement binding.
+		let mut intent_data_value = intent.data.clone();
+		if let Some(quote_id) = intent.quote_id.as_deref() {
+			match self
+				.storage
+				.retrieve::<solver_types::QuoteWithCostContext>(
+					StorageKey::Quotes.as_str(),
+					quote_id,
+				)
+				.await
+			{
+				Ok(quote_with_context) => {
+					if let Some(settlement_name) = quote_with_context.quote.settlement_name {
+						if let Some(intent_obj) = intent_data_value.as_object_mut() {
+							// Preserve both key styles for compatibility with current parsers.
+							intent_obj.insert(
+								"settlement_name".to_string(),
+								serde_json::Value::String(settlement_name.clone()),
+							);
+							intent_obj.insert(
+								"settlementName".to_string(),
+								serde_json::Value::String(settlement_name),
+							);
+						}
+					}
+				},
+				Err(solver_storage::StorageError::NotFound(_)) => {
+					tracing::debug!(%quote_id, "No stored quote context found for intent");
+				},
+				Err(error) => {
+					tracing::warn!(
+						%quote_id,
+						%error,
+						"Failed to retrieve quote context for intent settlement binding"
+					);
+				},
+			}
+		}
+		let intent_data = Some(intent_data_value);
 		match self
 			.order_service
 			.validate_and_create_order(
@@ -178,6 +486,32 @@ impl IntentHandler {
 			.await
 		{
 			Ok(order) => {
+				// Settlement-aware acceptance gate:
+				// Skip orders that do not leave enough time to reach claim/finalize safely.
+				if let Ok(order_data) =
+					serde_json::from_value::<Eip7683OrderData>(order.data.clone())
+				{
+					let now = current_timestamp() as u32;
+					let expires_remaining = order_data.expires.saturating_sub(now) as u64;
+					if let Some((required_window, breakdown)) =
+						estimate_required_expiry_window_seconds(&order_data, &config)
+					{
+						if expires_remaining < required_window {
+							let reason = format!(
+								"Insufficient settlement window: expires_in={expires_remaining}s required={required_window}s ({breakdown})"
+							);
+							tracing::warn!(order_id = %order.id, %reason, "Skipping order");
+							self.event_bus
+								.publish(SolverEvent::Order(OrderEvent::Skipped {
+									order_id: order.id.clone(),
+									reason,
+								}))
+								.ok();
+							return Ok(());
+						}
+					}
+				}
+
 				// Step 1: Generate fill transaction and simulate to get accurate gas estimate
 				// This also validates callbacks won't revert
 				let default_params = ExecutionParams {
@@ -398,12 +732,151 @@ mod tests {
 			.build()
 	}
 
+	fn create_test_order_with_expires_in(expires_in_seconds: u32) -> Order {
+		let mut order_data = Eip7683OrderDataBuilder::new().build();
+		let now = current_timestamp() as u32;
+		order_data.expires = now.saturating_add(expires_in_seconds);
+		order_data.fill_deadline = now.saturating_add(expires_in_seconds.saturating_sub(1));
+
+		OrderBuilder::new()
+			.with_id("test_intent_123".to_string())
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.build()
+	}
+
 	fn create_test_address() -> Address {
 		Address(vec![0xab; 20])
 	}
 
 	fn create_test_config() -> Arc<RwLock<Config>> {
 		Arc::new(RwLock::new(ConfigBuilder::new().build()))
+	}
+
+	fn create_test_config_with_broadcaster() -> Arc<RwLock<Config>> {
+		let mut config = ConfigBuilder::new().build();
+		let mut broadcaster = toml::map::Map::new();
+		broadcaster.insert(
+			"oracles".to_string(),
+			toml::Value::Table({
+				let mut oracles = toml::map::Map::new();
+				oracles.insert(
+					"input".to_string(),
+					toml::Value::Table({
+						let mut input = toml::map::Map::new();
+						input.insert(
+							"1".to_string(),
+							toml::Value::Array(vec![toml::Value::String(
+								"0x0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A".to_string(),
+							)]),
+						);
+						input
+					}),
+				);
+				oracles.insert(
+					"output".to_string(),
+					toml::Value::Table({
+						let mut output = toml::map::Map::new();
+						output.insert(
+							"137".to_string(),
+							toml::Value::Array(vec![toml::Value::String(
+								"0x1111111111111111111111111111111111111111".to_string(),
+							)]),
+						);
+						output
+					}),
+				);
+				oracles
+			}),
+		);
+		broadcaster.insert(
+			"routes".to_string(),
+			toml::Value::Table({
+				let mut routes = toml::map::Map::new();
+				routes.insert(
+					"1".to_string(),
+					toml::Value::Array(vec![toml::Value::Integer(137)]),
+				);
+				routes
+			}),
+		);
+		broadcaster.insert(
+			"proof_wait_time_seconds".to_string(),
+			toml::Value::Integer(30),
+		);
+		broadcaster.insert(
+			"storage_proof_timeout_seconds".to_string(),
+			toml::Value::Integer(30),
+		);
+		broadcaster.insert(
+			"default_finality_blocks".to_string(),
+			toml::Value::Integer(20),
+		);
+		config
+			.settlement
+			.implementations
+			.insert("broadcaster".to_string(), toml::Value::Table(broadcaster));
+		Arc::new(RwLock::new(config))
+	}
+
+	fn create_test_config_with_hyperlane_min_window(
+		min_window_seconds: u64,
+	) -> Arc<RwLock<Config>> {
+		let mut config = ConfigBuilder::new().build();
+		let mut hyperlane = toml::map::Map::new();
+		hyperlane.insert(
+			"oracles".to_string(),
+			toml::Value::Table({
+				let mut oracles = toml::map::Map::new();
+				oracles.insert(
+					"input".to_string(),
+					toml::Value::Table({
+						let mut input = toml::map::Map::new();
+						input.insert(
+							"1".to_string(),
+							toml::Value::Array(vec![toml::Value::String(
+								"0x0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A".to_string(),
+							)]),
+						);
+						input
+					}),
+				);
+				oracles.insert(
+					"output".to_string(),
+					toml::Value::Table({
+						let mut output = toml::map::Map::new();
+						output.insert(
+							"137".to_string(),
+							toml::Value::Array(vec![toml::Value::String(
+								"0x1111111111111111111111111111111111111111".to_string(),
+							)]),
+						);
+						output
+					}),
+				);
+				oracles
+			}),
+		);
+		hyperlane.insert(
+			"routes".to_string(),
+			toml::Value::Table({
+				let mut routes = toml::map::Map::new();
+				routes.insert(
+					"1".to_string(),
+					toml::Value::Array(vec![toml::Value::Integer(137)]),
+				);
+				routes
+			}),
+		);
+		hyperlane.insert(
+			"intent_min_expiry_seconds".to_string(),
+			toml::Value::Integer(min_window_seconds as i64),
+		);
+
+		config
+			.settlement
+			.implementations
+			.insert("hyperlane".to_string(), toml::Value::Table(hyperlane));
+		Arc::new(RwLock::new(config))
 	}
 
 	fn create_mock_cost_profit_service() -> Arc<CostProfitService> {
@@ -756,6 +1229,163 @@ mod tests {
 
 		let result = handler.handle(intent).await;
 		assert!(result.is_ok()); // Handler doesn't fail on validation errors
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_skip_due_to_broadcaster_expiry_budget() {
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_order_interface = MockOrderInterface::new();
+		let mut mock_strategy = MockExecutionStrategy::new();
+
+		let intent = create_test_intent();
+		let solver_address = create_test_address();
+
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:test_intent_123"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+
+		// Only the intent should be stored (order is skipped before order storage).
+		mock_storage
+			.expect_set_bytes()
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		mock_order_interface
+			.expect_validate_and_create_order()
+			.times(1)
+			.returning(move |_, _, _, _, _, _| {
+				Box::pin(async move { Ok(create_test_order_with_expires_in(60)) })
+			});
+
+		// Skip happens before simulation + strategy execution.
+		mock_order_interface
+			.expect_generate_fill_transaction()
+			.times(0);
+		mock_strategy.expect_should_execute().times(0);
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order_interface) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(mock_strategy),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let config = create_test_config_with_broadcaster();
+		let cost_profit_service = create_mock_cost_profit_service();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+		);
+
+		let result = handler.handle(intent).await;
+		assert!(result.is_ok());
+
+		match receiver.recv().await.unwrap() {
+			SolverEvent::Order(OrderEvent::Skipped { reason, .. }) => {
+				assert!(reason.contains("Insufficient settlement window"));
+				assert!(reason.contains("broadcaster:"));
+			},
+			other => panic!("Expected OrderEvent::Skipped, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_skip_due_to_explicit_settlement_min_window() {
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_order_interface = MockOrderInterface::new();
+		let mut mock_strategy = MockExecutionStrategy::new();
+
+		let intent = create_test_intent();
+		let solver_address = create_test_address();
+
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:test_intent_123"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+		mock_storage
+			.expect_set_bytes()
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		mock_order_interface
+			.expect_validate_and_create_order()
+			.times(1)
+			.returning(move |_, _, _, _, _, _| {
+				Box::pin(async move { Ok(create_test_order_with_expires_in(100)) })
+			});
+		mock_order_interface
+			.expect_generate_fill_transaction()
+			.times(0);
+		mock_strategy.expect_should_execute().times(0);
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order_interface) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(mock_strategy),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let config = create_test_config_with_hyperlane_min_window(500);
+		let cost_profit_service = create_mock_cost_profit_service();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+		);
+
+		let result = handler.handle(intent).await;
+		assert!(result.is_ok());
+
+		match receiver.recv().await.unwrap() {
+			SolverEvent::Order(OrderEvent::Skipped { reason, .. }) => {
+				assert!(reason.contains("Insufficient settlement window"));
+				assert!(reason.contains("hyperlane: explicit intent_min_expiry_seconds=500s"));
+			},
+			other => panic!("Expected OrderEvent::Skipped, got {other:?}"),
+		}
 	}
 
 	#[tokio::test]

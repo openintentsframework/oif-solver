@@ -1590,6 +1590,7 @@ mod tests {
 			settlement: OperatorSettlementConfig {
 				settlement_poll_interval_seconds: 3,
 				settlement_type: OperatorSettlementType::Hyperlane,
+				priority: None,
 				hyperlane: Some(OperatorHyperlaneConfig {
 					default_gas_limit: 0,
 					message_timeout_seconds: 0,
@@ -1601,8 +1602,10 @@ mod tests {
 						output: HashMap::new(),
 					},
 					routes: HashMap::new(),
+					intent_min_expiry_seconds: None,
 				}),
 				direct: None,
+				broadcaster: None,
 			},
 			gas: OperatorGasConfig {
 				resource_lock: OperatorGasFlowUnits::default(),

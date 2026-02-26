@@ -26,7 +26,7 @@
 //! ```
 
 use crate::networks::NetworkType;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -181,6 +181,11 @@ pub struct OperatorSettlementConfig {
 	#[serde(default = "default_settlement_type")]
 	pub settlement_type: OperatorSettlementType,
 
+	/// Optional ordered settlement preference for runtime selection.
+	/// When omitted, runtime falls back to `[settlement_type]`.
+	#[serde(default)]
+	pub priority: Option<Vec<OperatorSettlementType>>,
+
 	/// Hyperlane-specific settlement configuration.
 	#[serde(default)]
 	pub hyperlane: Option<OperatorHyperlaneConfig>,
@@ -188,6 +193,10 @@ pub struct OperatorSettlementConfig {
 	/// Direct settlement configuration.
 	#[serde(default)]
 	pub direct: Option<OperatorDirectConfig>,
+
+	/// Broadcaster settlement configuration.
+	#[serde(default)]
+	pub broadcaster: Option<OperatorBroadcasterConfig>,
 }
 
 /// Selected settlement implementation type.
@@ -197,6 +206,7 @@ pub enum OperatorSettlementType {
 	#[default]
 	Hyperlane,
 	Direct,
+	Broadcaster,
 }
 
 fn default_settlement_type() -> OperatorSettlementType {
@@ -226,6 +236,10 @@ pub struct OperatorHyperlaneConfig {
 
 	/// Valid routes: source chain → [destination chains].
 	pub routes: HashMap<u64, Vec<u64>>,
+
+	/// Optional minimum required `expires` window (seconds) for accepting intents.
+	#[serde(default)]
+	pub intent_min_expiry_seconds: Option<u64>,
 }
 
 /// Oracle addresses for cross-chain verification.
@@ -264,10 +278,80 @@ pub struct OperatorDirectConfig {
 	/// Strategy for selecting an oracle.
 	#[serde(default)]
 	pub oracle_selection_strategy: OperatorOracleSelectionStrategy,
+
+	/// Optional minimum required `expires` window (seconds) for accepting intents.
+	#[serde(default)]
+	pub intent_min_expiry_seconds: Option<u64>,
+}
+
+/// Broadcaster settlement configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorBroadcasterConfig {
+	/// Oracle addresses for input and output verification.
+	pub oracles: OperatorOracleConfig,
+
+	/// Valid routes: source chain -> destination chains.
+	pub routes: HashMap<u64, Vec<u64>>,
+
+	/// Broadcaster contract addresses by destination chain ID.
+	pub broadcaster_addresses: HashMap<u64, Address>,
+
+	/// Receiver contract addresses by source chain ID.
+	pub receiver_addresses: HashMap<u64, Address>,
+
+	/// Broadcaster IDs by remote chain ID.
+	pub broadcaster_ids: HashMap<u64, B256>,
+
+	/// External proof service base URL.
+	pub proof_service_url: String,
+
+	/// Minimum delay after fill before trying to generate proofs.
+	#[serde(default = "default_proof_wait_time_seconds")]
+	pub proof_wait_time_seconds: u64,
+
+	/// Timeout for proof service requests.
+	#[serde(default = "default_storage_proof_timeout_seconds")]
+	pub storage_proof_timeout_seconds: u64,
+
+	/// Default finality blocks before proof generation.
+	#[serde(default = "default_broadcaster_finality_blocks")]
+	pub default_finality_blocks: u64,
+
+	/// Per-chain finality block overrides.
+	#[serde(default)]
+	pub finality_blocks: HashMap<u64, u64>,
+
+	/// Optional per-chain block time overrides in seconds (for intent admission budgeting).
+	#[serde(default)]
+	pub chain_block_time_seconds: HashMap<u64, u64>,
+
+	/// Optional additional safety buffer in seconds (for intent admission budgeting).
+	#[serde(default)]
+	pub intent_safety_buffer_seconds: Option<u64>,
+
+	/// Optional minimum required `expires` window (seconds) for accepting intents.
+	#[serde(default)]
+	pub intent_min_expiry_seconds: Option<u64>,
+
+	/// Strategy for selecting an oracle.
+	#[serde(default)]
+	pub oracle_selection_strategy: OperatorOracleSelectionStrategy,
 }
 
 fn default_dispute_period_seconds() -> u64 {
 	300
+}
+
+fn default_proof_wait_time_seconds() -> u64 {
+	30
+}
+
+fn default_storage_proof_timeout_seconds() -> u64 {
+	30
+}
+
+fn default_broadcaster_finality_blocks() -> u64 {
+	20
 }
 
 /// Gas estimation settings per flow type.
@@ -623,6 +707,7 @@ mod tests {
 			settlement: OperatorSettlementConfig {
 				settlement_poll_interval_seconds: 10,
 				settlement_type: OperatorSettlementType::Hyperlane,
+				priority: None,
 				hyperlane: Some(OperatorHyperlaneConfig {
 					default_gas_limit: 300_000,
 					message_timeout_seconds: 600,
@@ -634,8 +719,10 @@ mod tests {
 						output: HashMap::new(),
 					},
 					routes: HashMap::new(),
+					intent_min_expiry_seconds: None,
 				}),
 				direct: None,
+				broadcaster: None,
 			},
 			gas: OperatorGasConfig {
 				resource_lock: OperatorGasFlowUnits {
@@ -684,6 +771,7 @@ mod tests {
 			parsed.settlement.settlement_type,
 			OperatorSettlementType::Hyperlane
 		);
+		assert!(parsed.settlement.priority.is_none());
 		assert!(parsed.settlement.hyperlane.is_some());
 		assert!(parsed.settlement.direct.is_none());
 	}

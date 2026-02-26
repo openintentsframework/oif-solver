@@ -34,7 +34,7 @@
 //! ```
 
 use crate::networks::NetworkType;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -112,6 +112,7 @@ pub enum SettlementTypeOverride {
 	#[default]
 	Hyperlane,
 	Direct,
+	Broadcaster,
 }
 
 fn default_settlement_type_override() -> SettlementTypeOverride {
@@ -125,6 +126,11 @@ pub struct SettlementOverride {
 	#[serde(default = "default_settlement_type_override", rename = "type")]
 	pub settlement_type: SettlementTypeOverride,
 
+	/// Optional ordered settlement preference for runtime selection.
+	/// When omitted, runtime falls back to `[type]`.
+	#[serde(default)]
+	pub priority: Option<Vec<SettlementTypeOverride>>,
+
 	/// Hyperlane settlement configuration override.
 	#[serde(default)]
 	pub hyperlane: Option<HyperlaneSettlementOverride>,
@@ -132,6 +138,10 @@ pub struct SettlementOverride {
 	/// Direct settlement configuration override.
 	#[serde(default)]
 	pub direct: Option<DirectSettlementOverride>,
+
+	/// Broadcaster settlement configuration override.
+	#[serde(default)]
+	pub broadcaster: Option<BroadcasterSettlementOverride>,
 }
 
 /// Oracle map overrides used by settlement implementations.
@@ -176,6 +186,10 @@ pub struct HyperlaneSettlementOverride {
 	/// Optional finalization required override.
 	#[serde(default)]
 	pub finalization_required: Option<bool>,
+
+	/// Optional minimum required `expires` window (seconds) for accepting intents.
+	#[serde(default)]
+	pub intent_min_expiry_seconds: Option<u64>,
 }
 
 /// Direct settlement override payload.
@@ -192,6 +206,72 @@ pub struct DirectSettlementOverride {
 	/// Optional dispute period in seconds.
 	#[serde(default)]
 	pub dispute_period_seconds: Option<u64>,
+
+	/// Optional oracle selection strategy.
+	#[serde(default)]
+	pub oracle_selection_strategy: Option<OracleSelectionStrategyOverride>,
+
+	/// Optional minimum required `expires` window (seconds) for accepting intents.
+	#[serde(default)]
+	pub intent_min_expiry_seconds: Option<u64>,
+}
+
+/// Broadcaster settlement override payload.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BroadcasterSettlementOverride {
+	/// Oracle maps.
+	#[serde(default)]
+	pub oracles: OracleOverrides,
+
+	/// Route map: source chain -> destination chains.
+	#[serde(default)]
+	pub routes: HashMap<u64, Vec<u64>>,
+
+	/// Broadcaster contract addresses by chain ID.
+	/// These are expected on destination/output chains (where PostFill runs).
+	#[serde(default)]
+	pub broadcaster_addresses: HashMap<u64, Address>,
+
+	/// Receiver contract addresses by chain ID.
+	/// These are expected on origin/input chains (where PreClaim runs).
+	#[serde(default)]
+	pub receiver_addresses: HashMap<u64, Address>,
+
+	/// Broadcaster IDs by remote chain ID (receiver perspective).
+	#[serde(default)]
+	pub broadcaster_ids: HashMap<u64, B256>,
+
+	/// External proof service base URL.
+	#[serde(default)]
+	pub proof_service_url: Option<String>,
+
+	/// Minimum delay after fill before trying to generate proofs.
+	#[serde(default)]
+	pub proof_wait_time_seconds: Option<u64>,
+
+	/// Timeout for proof service requests.
+	#[serde(default)]
+	pub storage_proof_timeout_seconds: Option<u64>,
+
+	/// Default finality blocks before proof generation.
+	#[serde(default)]
+	pub default_finality_blocks: Option<u64>,
+
+	/// Per-chain finality block overrides.
+	#[serde(default)]
+	pub finality_blocks: HashMap<u64, u64>,
+
+	/// Optional per-chain block time overrides in seconds (for intent admission budgeting).
+	#[serde(default)]
+	pub chain_block_time_seconds: HashMap<u64, u64>,
+
+	/// Optional additional safety buffer in seconds (for intent admission budgeting).
+	#[serde(default)]
+	pub intent_safety_buffer_seconds: Option<u64>,
+
+	/// Optional minimum required `expires` window (seconds) for accepting intents.
+	#[serde(default)]
+	pub intent_min_expiry_seconds: Option<u64>,
 
 	/// Optional oracle selection strategy.
 	#[serde(default)]
@@ -402,6 +482,20 @@ impl SeedOverrides {
 			.as_ref()
 			.map(|s| s.settlement_type)
 			.unwrap_or_default()
+	}
+
+	/// Get ordered settlement preference, defaulting to `[settlement_type()]`.
+	pub fn settlement_priority(&self) -> Vec<SettlementTypeOverride> {
+		if let Some(priority) = self
+			.settlement
+			.as_ref()
+			.and_then(|s| s.priority.as_ref())
+			.filter(|priority| !priority.is_empty())
+		{
+			return priority.clone();
+		}
+
+		vec![self.settlement_type()]
 	}
 }
 
@@ -889,5 +983,82 @@ mod tests {
 		let admin = config.admin.as_ref().unwrap();
 		assert!(admin.enabled);
 		assert_eq!(admin.domain, "localhost");
+	}
+
+	#[test]
+	fn test_parse_broadcaster_settlement_override() {
+		let json = r#"{
+            "networks": [
+                {
+                    "chain_id": 11155420,
+                    "tokens": [
+                        {"symbol": "USDC", "address": "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6", "decimals": 6}
+                    ]
+                },
+                {
+                    "chain_id": 84532,
+                    "tokens": [
+                        {"symbol": "USDC", "address": "0x73c83DAcc74bB8a704717AC09703b959E74b9705", "decimals": 6}
+                    ]
+                }
+            ],
+            "settlement": {
+                "type": "broadcaster",
+                "priority": ["broadcaster", "hyperlane"],
+                "broadcaster": {
+                    "oracles": {
+                        "input": {
+                            "11155420": ["0x1111111111111111111111111111111111111111"],
+                            "84532": ["0x2222222222222222222222222222222222222222"]
+                        },
+                        "output": {
+                            "11155420": ["0x3333333333333333333333333333333333333333"],
+                            "84532": ["0x4444444444444444444444444444444444444444"]
+                        }
+                    },
+                    "routes": {
+                        "11155420": [84532],
+                        "84532": [11155420]
+                    },
+                    "broadcaster_addresses": {
+                        "11155420": "0x5555555555555555555555555555555555555555",
+                        "84532": "0x6666666666666666666666666666666666666666"
+                    },
+                    "receiver_addresses": {
+                        "11155420": "0x7777777777777777777777777777777777777777",
+                        "84532": "0x8888888888888888888888888888888888888888"
+                    },
+                    "broadcaster_ids": {
+                        "11155420": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "84532": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    },
+                    "proof_service_url": "http://localhost:9090"
+                }
+            }
+        }"#;
+
+		let config: SeedOverrides = serde_json::from_str(json).unwrap();
+		assert_eq!(
+			config.settlement_type(),
+			SettlementTypeOverride::Broadcaster
+		);
+		assert_eq!(
+			config.settlement_priority(),
+			vec![
+				SettlementTypeOverride::Broadcaster,
+				SettlementTypeOverride::Hyperlane
+			]
+		);
+		let broadcaster = config
+			.settlement
+			.as_ref()
+			.and_then(|s| s.broadcaster.as_ref())
+			.expect("broadcaster config");
+		assert_eq!(
+			broadcaster.proof_service_url.as_deref(),
+			Some("http://localhost:9090")
+		);
+		assert!(broadcaster.broadcaster_addresses.contains_key(&11155420));
+		assert!(broadcaster.receiver_addresses.contains_key(&84532));
 	}
 }
