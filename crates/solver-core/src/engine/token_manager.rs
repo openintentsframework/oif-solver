@@ -222,9 +222,6 @@ impl TokenManager {
 		spender: Address,
 		amount: U256,
 	) -> Result<(usize, Vec<u64>), TokenManagerError> {
-		let solver_address = self.account.get_address().await?;
-		let solver_address_str = with_0x_prefix(&hex::encode(&solver_address.0));
-
 		let networks = self.networks.read().await;
 		let mut approved_count = 0usize;
 		let mut chains_processed = Vec::new();
@@ -247,39 +244,63 @@ impl TokenManager {
 					}
 				}
 
-				let current_allowance = self
-					.delivery
-					.get_allowance(
-						*cid,
-						&solver_address_str,
-						&with_0x_prefix(&hex::encode(&spender.0)),
-						&with_0x_prefix(&hex::encode(&token.address.0)),
-					)
-					.await?;
-
-				let current_allowance_u256 =
-					U256::from_str_radix(&current_allowance, 10).map_err(|e| {
-						TokenManagerError::ParseError(format!(
-							"Invalid allowance value '{current_allowance}': {e}"
-						))
-					})?;
-
-				// Set exact allowance if it doesn't match the requested amount
-				if current_allowance_u256 != amount {
-					tracing::info!(
-						"Setting approval for token {} on chain {} for spender {}",
-						token.symbol,
-						cid,
-						with_0x_prefix(&hex::encode(&spender.0))
-					);
-					self.submit_approval(*cid, &token.address, &spender, amount)
-						.await?;
+				if self
+					.ensure_token_approval(*cid, &token.address, &spender, amount)
+					.await?
+				{
 					approved_count += 1;
 				}
 			}
 		}
 
 		Ok((approved_count, chains_processed))
+	}
+
+	/// Ensures a specific token has an exact allowance for a spender on a chain.
+	///
+	/// # Returns
+	///
+	/// Returns `Ok(true)` when an approval transaction was submitted, `Ok(false)` when
+	/// the current allowance already matches `amount`.
+	pub async fn ensure_token_approval(
+		&self,
+		chain_id: u64,
+		token_address: &Address,
+		spender: &Address,
+		amount: U256,
+	) -> Result<bool, TokenManagerError> {
+		let solver_address = self.account.get_address().await?;
+		let solver_address_str = with_0x_prefix(&hex::encode(&solver_address.0));
+
+		let current_allowance = self
+			.delivery
+			.get_allowance(
+				chain_id,
+				&solver_address_str,
+				&with_0x_prefix(&hex::encode(&spender.0)),
+				&with_0x_prefix(&hex::encode(&token_address.0)),
+			)
+			.await?;
+
+		let current_allowance_u256 = U256::from_str_radix(&current_allowance, 10).map_err(|e| {
+			TokenManagerError::ParseError(format!(
+				"Invalid allowance value '{current_allowance}': {e}"
+			))
+		})?;
+
+		if current_allowance_u256 != amount {
+			tracing::info!(
+				chain_id,
+				token = %with_0x_prefix(&hex::encode(&token_address.0)),
+				spender = %with_0x_prefix(&hex::encode(&spender.0)),
+				"Setting approval for specific token and spender"
+			);
+			self.submit_approval(chain_id, token_address, spender, amount)
+				.await?;
+			return Ok(true);
+		}
+
+		Ok(false)
 	}
 
 	/// Submits an ERC20 approval transaction.
