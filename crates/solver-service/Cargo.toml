@@ -5,6 +5,10 @@ edition = "2021"
 rust-version.workspace = true
 default-run = "solver"
 
+[lib]
+name = "solver_service"
+path = "src/lib.rs"
+
 [[bin]]
 name = "solver"
 path = "src/main.rs"
