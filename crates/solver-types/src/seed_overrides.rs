@@ -276,6 +276,9 @@ pub struct BroadcasterSettlementOverride {
 	/// Optional oracle selection strategy.
 	#[serde(default)]
 	pub oracle_selection_strategy: Option<OracleSelectionStrategyOverride>,
+	/// Optional L1→L2 block-hash pusher directions.
+	#[serde(default)]
+	pub pusher_directions: Vec<crate::operator_config::OperatorPusherDirectionConfig>,
 }
 
 /// Oracle selection strategy override.

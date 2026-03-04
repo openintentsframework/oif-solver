@@ -13,10 +13,12 @@ use solver_order::OrderService;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
 use solver_types::{
-	truncate_id, DeliveryEvent, Order, SettlementEvent, SolverEvent, StorageKey, TransactionHash,
-	TransactionType,
+	truncate_id, DeliveryEvent, NetworksConfig, Order, SettlementEvent, SolverEvent, StorageKey,
+	TransactionHash, TransactionType,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use thiserror::Error;
 use tracing::instrument;
 
@@ -49,6 +51,8 @@ pub struct SettlementHandler {
 	state_machine: Arc<OrderStateMachine>,
 	event_bus: EventBus,
 	monitoring_timeout_minutes: u64,
+	networks: NetworksConfig,
+	push_cooldowns: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
 }
 
 impl SettlementHandler {
@@ -60,6 +64,7 @@ impl SettlementHandler {
 		state_machine: Arc<OrderStateMachine>,
 		event_bus: EventBus,
 		monitoring_timeout_minutes: u64,
+		networks: NetworksConfig,
 	) -> Self {
 		Self {
 			settlement,
@@ -69,6 +74,8 @@ impl SettlementHandler {
 			state_machine,
 			event_bus,
 			monitoring_timeout_minutes,
+			networks,
+			push_cooldowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
 		}
 	}
 
@@ -79,6 +86,9 @@ impl SettlementHandler {
 			self.state_machine.clone(),
 			self.event_bus.clone(),
 			self.monitoring_timeout_minutes,
+			self.delivery.clone(),
+			self.networks.clone(),
+			self.push_cooldowns.clone(),
 		);
 
 		tokio::spawn(async move {
@@ -546,6 +556,7 @@ mod tests {
 			state_machine,
 			event_bus,
 			30,
+			HashMap::new(), // networks — empty for handler unit tests
 		);
 
 		(handler, event_rx)

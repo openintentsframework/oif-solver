@@ -1,0 +1,138 @@
+{
+  "solver_id": "<your solver address>-1",
+  "solver_name": "OIF Testnet Broadcaster Example",
+  "min_profitability_pct": "1.0",
+  "gas_buffer_bps": 1000,
+  "commission_bps": 20,
+  "rate_buffer_bps": 14,
+  "networks": [
+    {
+      "chain_id": 11155420,
+      "name": "optimism-sepolia",
+      "type": "parent",
+      "rpc_urls": ["https://opt-sepolia.g.alchemy.com/v2/<your-alchemy-key>"],
+      "input_settler_address": "0x1F0b9d6984f5f9187Db70469085f7935453b815F",
+      "output_settler_address": "0x923aa6CC898540092616f97cA770FFb8080354Fc",
+      "input_settler_compact_address": "0x086e28545bB8494C6041225922A705877AE5362A",
+      "the_compact_address": "0x00000000000000171ede64904551eedf3c6c9788",
+      "allocator_address": "0x565466528d126141ddb5c7d558803f79d9b66a6d",
+      "tokens": [
+        {
+          "symbol": "USDC",
+          "name": "USD Coin",
+          "address": "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6",
+          "decimals": 6
+        }
+      ]
+    },
+    {
+      "chain_id": 84532,
+      "name": "base-sepolia",
+      "type": "hub",
+      "rpc_urls": ["https://base-sepolia.g.alchemy.com/v2/<your-alchemy-key>"],
+      "input_settler_address": "0x6C0428cc521CC418A8842d46d413F5F96775c67B",
+      "output_settler_address": "0xC450A11afb68731833BE13225A88ecdad7D7Ed52",
+      "input_settler_compact_address": "0xa7B995442F909849F96B5ED07ff7f58E57a41fc9",
+      "the_compact_address": "0x00000000000000171ede64904551eedf3c6c9788",
+      "allocator_address": "0x04bb6e565f0067e0411528e2d3a55a712d9a8b32",
+      "tokens": [
+        {
+          "symbol": "USDC",
+          "name": "USD Coin",
+          "address": "0x73c83DAcc74bB8a704717AC09703b959E74b9705",
+          "decimals": 6
+        }
+      ]
+    }
+  ],
+  "settlement": {
+    "type": "broadcaster",
+    "broadcaster": {
+      "oracles": {
+        "input": {
+          "11155420": ["0x1DFEe033B3c9DB3E0D672cae5e73FAdBE6BbB35E"],
+          "84532": ["0x739088B1485034730C9Ac782a2EC879e6181cB5b"]
+        },
+        "output": {
+          "11155420": ["0x1DFEe033B3c9DB3E0D672cae5e73FAdBE6BbB35E"],
+          "84532": ["0x739088B1485034730C9Ac782a2EC879e6181cB5b"]
+        }
+      },
+      "routes": {
+        "11155420": [84532],
+        "84532": [11155420]
+      },
+      "broadcaster_addresses": {
+        "11155420": "0xF9716C26eE9d083dF7c2Bd8539428b0De4c46294",
+        "84532": "0xed5aC10B9921B324534CD31A997C59109E0a5A92"
+      },
+      "receiver_addresses": {
+        "11155420": "0x9809e577BD2112976D0A42412dE3ffF79150eAB5",
+        "84532": "0x16a88638903dD5427832Db807745042b9F8B418f"
+      },
+      "broadcaster_ids": {
+        "84532": "0x6e64df2d1c670f6b66585ddb95f7ca698ac53e99cc9e9c292d1480a6013f4f85",
+        "11155420": "0xa7eccbbb7df12e1eec6f8b81ee70865a76b5ee033f13b158490c4e069c703c9c"
+      },
+      "proof_service_url": "http://localhost:3003",
+      "proof_wait_time_seconds": 300,
+      "_pusher_directions_comment": "Optional. Add one entry per L1->L2 direction that requires proactive block hash pushing. Only needed when proof generation depends on an L1 block hash buffer on L2 (e.g. ETH->OP, ETH->ARB, ETH->Linea). See docs/oracles/pusher-setup-guide.md.",
+      "pusher_directions": [
+        {
+          "_comment": "Example: ETH Sepolia -> OP Sepolia (OpStack variant)",
+          "pusher_address": "0x<IPusher contract address on L1>",
+          "buffer_address": "0x<IBuffer contract address on L2>",
+          "push_cooldown_seconds": 600,
+          "l2_params": {
+            "type": "op_stack",
+            "gas_limit": 200000
+          },
+          "_optional_overrides": {
+            "l1_chain_id": "defaults to routing_defaults.parent_chain_id",
+            "l2_chain_id": "defaults to inferred from routes",
+            "batch_size": "defaults to 256",
+            "label": "defaults to l1_chain_id-to-l2_chain_id"
+          }
+        },
+        {
+          "_comment": "Example: ETH Sepolia -> ARB Sepolia (Arbitrum variant)",
+          "pusher_address": "0x<IArbitrumPusher contract address on L1>",
+          "buffer_address": "0x<IBuffer contract address on ARB L2>",
+          "push_cooldown_seconds": 3600,
+          "batch_size": 256,
+          "l2_params": {
+            "type": "arbitrum",
+            "inbox": "0x<RetryableTx inbox address on ARB>",
+            "gas_price_bid": 100000000,
+            "gas_limit": 16000000,
+            "submission_cost": 1000000000000000,
+            "is_erc20_inbox": false
+          }
+        }
+      ]
+    }
+  },
+  "routing_defaults": {
+    "parent_chain_id": 11155420,
+    "hub_chain_id": 84532
+  },
+  "admin": {
+    "enabled": true,
+    "domain": "localhost",
+    "chain_id": 84532,
+    "nonce_ttl_seconds": 300,
+    "admin_addresses": ["0x<your admin wallet address>"],
+    "withdrawals": {
+      "enabled": false
+    }
+  },
+  "account": {
+    "primary": "kms",
+    "implementations": {
+      "kms": {
+        "key_id": "<your KMS key ID>",
+        "region": "<your AWS region>"
+      }
+    }
+  }
+}

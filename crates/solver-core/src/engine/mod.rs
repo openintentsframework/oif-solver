@@ -8,6 +8,7 @@ pub mod context;
 pub mod cost_profit;
 pub mod event_bus;
 pub mod lifecycle;
+pub mod pusher;
 pub mod token_manager;
 
 use self::{cost_profit::CostProfitService, token_manager::TokenManager};
@@ -180,6 +181,7 @@ impl SolverEngine {
 			state_machine.clone(),
 			event_bus.clone(),
 			static_config.solver.monitoring_timeout_seconds / 60, // Convert seconds to minutes
+			static_config.networks.clone(),
 		));
 
 		Self {
@@ -529,7 +531,7 @@ impl SolverEngine {
 		}
 
 		// Cleanup
-		cleanup_handle.abort(); // Stop the cleanup task
+		cleanup_handle.abort();
 
 		self.discovery
 			.stop_all()

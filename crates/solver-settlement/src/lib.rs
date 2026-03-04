@@ -8,8 +8,8 @@
 use async_trait::async_trait;
 use solver_types::{
 	oracle::{OracleInfo, OracleRoutes},
-	Address, ConfigSchema, FillProof, ImplementationRegistry, NetworksConfig, Order, Transaction,
-	TransactionHash, TransactionReceipt, TransactionType,
+	Address, ConfigSchema, FillProof, ImplementationRegistry, NetworksConfig, Order,
+	PusherL2Params, Transaction, TransactionHash, TransactionReceipt, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,6 +53,39 @@ pub enum SettlementError {
 	/// Slot derivation mismatch detected between expected and proved slot.
 	#[error("Slot derivation mismatch")]
 	SlotDerivationMismatch,
+}
+
+/// Direction for pushing L1 block hashes into an L2 buffer contract.
+///
+/// Each direction describes one L1→L2 pair managed by an IPusher contract.
+/// A push is triggered order-by-order when the monitor detects the L2 buffer
+/// has not yet indexed the L1 block where that order's PostFill broadcast was
+/// confirmed (`buffer_newest < required_block`).
+///
+/// For Arbitrum L2s the deployed pusher always covers the latest `batch_size`
+/// L1 blocks (`block.number - batch_size .. block.number`), so a single push
+/// is sufficient as long as the required block is within that window.
+/// For generic IPusher chains the push starts at `buffer_newest + 1`.
+#[derive(Debug, Clone)]
+pub struct PusherDirection {
+	/// Human-readable label used in logs (e.g., "11155111-to-84532").
+	pub label: String,
+	/// Chain ID of the L1 chain where the pusher contract is deployed.
+	pub l1_chain_id: u64,
+	/// Address of the IPusher contract on L1.
+	pub pusher_address: Address,
+	/// Chain ID of the L2 chain that holds the block-hash buffer.
+	pub l2_chain_id: u64,
+	/// Address of the IBuffer contract on L2.
+	pub buffer_address: Address,
+	/// Number of block hashes pushed per call.
+	/// For Arbitrum: defines the look-back window (`block.number - batch_size`).
+	/// For generic chains: number of sequential blocks pushed from the buffer head.
+	pub batch_size: u64,
+	/// Minimum seconds between consecutive pushes for this direction.
+	pub push_cooldown_seconds: u64,
+	/// Chain-specific L2 parameters for building the push transaction.
+	pub l2_params: PusherL2Params,
 }
 
 /// Strategy for selecting oracles when multiple are available
@@ -237,6 +270,16 @@ pub trait SettlementInterface: Send + Sync {
 		Ok(None)
 	}
 
+	/// Check whether the L2 block-hash buffer needs to be advanced for this order.
+	///
+	/// Returns `Some((direction, required_block))` when the settlement knows which
+	/// L1→L2 pusher direction corresponds to this order's fill chain and which L1
+	/// block number must be present in the L2 buffer before a storage proof can be
+	/// generated. Returns `None` (the default) when no buffer push is required.
+	async fn buffer_coverage_check(&self, _order: &Order) -> Option<(PusherDirection, u64)> {
+		None
+	}
+
 	/// Called after certain transaction types are confirmed on-chain.
 	/// Allows settlements to handle transaction receipts for protocol-specific needs.
 	/// For Hyperlane: extracts message IDs from PostFill transaction receipts.
@@ -360,6 +403,18 @@ impl SettlementService {
 	/// Get the configured poll interval for settlement monitoring
 	pub fn poll_interval_seconds(&self) -> u64 {
 		self.poll_interval_seconds
+	}
+
+	/// Check whether the L2 block-hash buffer needs to be advanced for an order.
+	///
+	/// Delegates to the settlement implementation bound to this order.
+	/// Returns `None` if the order has no associated settlement or the settlement
+	/// does not require a buffer push.
+	pub async fn buffer_coverage_check(&self, order: &Order) -> Option<(PusherDirection, u64)> {
+		self.find_settlement_for_order(order)
+			.ok()?
+			.buffer_coverage_check(order)
+			.await
 	}
 
 	/// Build oracle routes from all settlement implementations.
@@ -645,5 +700,17 @@ impl SettlementService {
 		implementation
 			.generate_pre_claim_transaction(order, fill_proof)
 			.await
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_settlement_service_new_empty() {
+		let service = SettlementService::new(HashMap::new(), 20);
+		assert_eq!(service.poll_interval_seconds(), 20);
+		assert!(service.implementation_order().is_empty());
 	}
 }

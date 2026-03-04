@@ -284,6 +284,80 @@ pub struct OperatorDirectConfig {
 	pub intent_min_expiry_seconds: Option<u64>,
 }
 
+/// Chain-specific L2 transaction parameters for the block-hash pusher.
+///
+/// Each variant maps to a specific pusher ABI:
+/// - `Arbitrum` → `IArbitrumPusher.pushHashes(inbox, batchSize, gasPriceBid, gasLimit, submissionCost, isERC20Inbox)`
+/// - `OpStack`  → `IPusher.pushHashes(buffer, firstBlock, batchSize, abi.encode(uint32 gasLimit))`, `msg.value = 0`
+/// - `Linea`    → `IPusher.pushHashes(buffer, firstBlock, batchSize, abi.encode(uint256 fee))`, `msg.value = fee`
+/// - `Raw`      → `IPusher.pushHashes(buffer, firstBlock, batchSize, data)`, `msg.value = value_wei`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PusherL2Params {
+	/// Arbitrum Inbox-based pushing (e.g. ETH → ARB direction).
+	Arbitrum {
+		inbox: Address,
+		gas_price_bid: u64,
+		gas_limit: u64,
+		submission_cost: u64,
+		#[serde(default)]
+		is_erc20_inbox: bool,
+	},
+	/// OP Stack chains (Optimism, Base, etc.): `msg.value = 0`,
+	/// `l2TransactionData = abi.encode(uint32 gasLimit)`.
+	OpStack { gas_limit: u32 },
+	/// Linea L1→L2 bridge: `msg.value = fee`,
+	/// `l2TransactionData = abi.encode(uint256 fee)`.
+	Linea { fee: u64 },
+	/// Raw fallback for chains not yet typed (Scroll, ZkSync, unknown).
+	/// `data` is the exact "0x"-prefixed hex for `l2TransactionData`.
+	/// `value_wei` is the exact `msg.value` in wei (defaults to 0 if omitted).
+	Raw {
+		data: String,
+		#[serde(default)]
+		value_wei: Option<u64>,
+	},
+}
+
+/// Configuration for a single L1→L2 block-hash pusher direction, stored in
+/// `OperatorBroadcasterConfig.pusher_directions`.
+///
+/// All fields mirror the `pusher_directions` array entries accepted by the
+/// broadcaster settlement config schema.  `l1_chain_id`, `l2_chain_id`,
+/// `label`, and `batch_size` are optional; defaults are resolved by
+/// `parse_pusher_directions` in the settlement crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorPusherDirectionConfig {
+	/// L1 pusher contract address.
+	pub pusher_address: Address,
+	/// L2 buffer contract address.
+	pub buffer_address: Address,
+	/// Minimum seconds between consecutive pushes for this direction.
+	pub push_cooldown_seconds: u64,
+	/// Typed L2 parameters for the pusher. Preferred over `l2_transaction_data`.
+	/// When both are present, `l2_params` takes precedence.
+	#[serde(default)]
+	pub l2_params: Option<PusherL2Params>,
+	/// Deprecated: raw hex-encoded L2 transaction data (chain-specific).
+	/// Used only when `l2_params` is absent. Will be removed in Phase 2.
+	#[serde(default)]
+	pub l2_transaction_data: Option<String>,
+	/// Human-readable label (default: "{l1_chain_id}-to-{l2_chain_id}").
+	#[serde(default)]
+	pub label: Option<String>,
+	/// L1 source chain ID (inferred from oracle routes if absent).
+	#[serde(default)]
+	pub l1_chain_id: Option<u64>,
+	/// L2 destination chain ID (inferred from oracle routes if absent).
+	#[serde(default)]
+	pub l2_chain_id: Option<u64>,
+	/// Number of L1 block hashes to push per transaction (default: 256).
+	/// For Arbitrum: defines the look-back window (`block.number - batch_size`).
+	/// For generic chains: sequential blocks pushed from the buffer head.
+	#[serde(default)]
+	pub batch_size: Option<u64>,
+}
+
 /// Broadcaster settlement configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperatorBroadcasterConfig {
@@ -336,6 +410,9 @@ pub struct OperatorBroadcasterConfig {
 	/// Strategy for selecting an oracle.
 	#[serde(default)]
 	pub oracle_selection_strategy: OperatorOracleSelectionStrategy,
+	/// Optional L1→L2 block-hash pusher directions for the background push task.
+	#[serde(default)]
+	pub pusher_directions: Vec<OperatorPusherDirectionConfig>,
 }
 
 fn default_dispute_period_seconds() -> u64 {

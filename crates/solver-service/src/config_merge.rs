@@ -1045,6 +1045,7 @@ fn build_operator_broadcaster_config_from_override(
 		intent_safety_buffer_seconds: override_cfg.intent_safety_buffer_seconds,
 		intent_min_expiry_seconds: override_cfg.intent_min_expiry_seconds,
 		oracle_selection_strategy: selection_strategy,
+		pusher_directions: override_cfg.pusher_directions.clone(),
 	})
 }
 
@@ -1731,6 +1732,53 @@ fn build_broadcaster_toml_from_operator(
 		"chain_block_time_seconds".to_string(),
 		toml::Value::Table(chain_block_time_seconds),
 	);
+
+	if !broadcaster.pusher_directions.is_empty() {
+		let dirs: Vec<toml::Value> = broadcaster
+			.pusher_directions
+			.iter()
+			.map(|d| {
+				let mut t = toml::map::Map::new();
+				t.insert(
+					"pusher_address".to_string(),
+					toml::Value::String(format!("0x{}", hex::encode(d.pusher_address))),
+				);
+				t.insert(
+					"buffer_address".to_string(),
+					toml::Value::String(format!("0x{}", hex::encode(d.buffer_address))),
+				);
+				t.insert(
+					"push_cooldown_seconds".to_string(),
+					toml::Value::Integer(d.push_cooldown_seconds as i64),
+				);
+				// Prefer l2_params (typed); fall back to l2_transaction_data (legacy).
+				if let Some(ref l2_params) = d.l2_params {
+					let l2_params_val = toml::Value::try_from(l2_params)
+						.expect("PusherL2Params is always TOML-serializable");
+					t.insert("l2_params".to_string(), l2_params_val);
+				} else if let Some(ref hex_data) = d.l2_transaction_data {
+					t.insert(
+						"l2_transaction_data".to_string(),
+						toml::Value::String(hex_data.clone()),
+					);
+				}
+				if let Some(label) = &d.label {
+					t.insert("label".to_string(), toml::Value::String(label.clone()));
+				}
+				if let Some(v) = d.l1_chain_id {
+					t.insert("l1_chain_id".to_string(), toml::Value::Integer(v as i64));
+				}
+				if let Some(v) = d.l2_chain_id {
+					t.insert("l2_chain_id".to_string(), toml::Value::Integer(v as i64));
+				}
+				if let Some(v) = d.batch_size {
+					t.insert("batch_size".to_string(), toml::Value::Integer(v as i64));
+				}
+					toml::Value::Table(t)
+			})
+			.collect();
+		table.insert("pusher_directions".to_string(), toml::Value::Array(dirs));
+	}
 
 	toml::Value::Table(table)
 }
@@ -2702,6 +2750,7 @@ fn extract_broadcaster_config(
 		intent_safety_buffer_seconds,
 		intent_min_expiry_seconds,
 		oracle_selection_strategy,
+		pusher_directions: vec![],
 	}
 }
 
@@ -4073,6 +4122,7 @@ mod tests {
 					intent_safety_buffer_seconds: None,
 					intent_min_expiry_seconds: None,
 					oracle_selection_strategy: Some(OracleSelectionStrategyOverride::First),
+					pusher_directions: vec![],
 				}),
 			}),
 			routing_defaults: None,
@@ -4233,6 +4283,7 @@ mod tests {
 					intent_safety_buffer_seconds: None,
 					intent_min_expiry_seconds: None,
 					oracle_selection_strategy: Some(OracleSelectionStrategyOverride::First),
+					pusher_directions: vec![],
 				}),
 			}),
 			routing_defaults: None,
@@ -4465,6 +4516,7 @@ mod tests {
 					intent_safety_buffer_seconds: None,
 					intent_min_expiry_seconds: None,
 					oracle_selection_strategy: None,
+					pusher_directions: vec![],
 				}),
 			}),
 			routing_defaults: None,

@@ -6,22 +6,31 @@
 
 use crate::engine::event_bus::EventBus;
 use crate::state::OrderStateMachine;
+use solver_delivery::DeliveryService;
 use solver_settlement::SettlementService;
 use solver_types::{
-	truncate_id, Order, OrderStatus, SettlementEvent, SolverEvent, TransactionHash,
+	truncate_id, NetworksConfig, Order, OrderStatus, SettlementEvent, SolverEvent, TransactionHash,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Monitor for tracking settlement readiness of filled orders.
 ///
 /// The SettlementMonitor watches filled orders to determine when they are ready
 /// for claiming by retrieving attestations and checking claim conditions periodically
 /// until the order is claimable or a timeout is reached.
+///
+/// On each poll it also checks whether the L2 block-hash buffer needs to be
+/// advanced (via `push_if_needed`) before a storage proof can be generated.
 pub struct SettlementMonitor {
 	settlement: Arc<SettlementService>,
 	state_machine: Arc<OrderStateMachine>,
 	event_bus: EventBus,
 	timeout_minutes: u64,
+	delivery: Arc<DeliveryService>,
+	networks: NetworksConfig,
+	push_cooldowns: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
 }
 
 impl SettlementMonitor {
@@ -30,12 +39,18 @@ impl SettlementMonitor {
 		state_machine: Arc<OrderStateMachine>,
 		event_bus: EventBus,
 		timeout_minutes: u64,
+		delivery: Arc<DeliveryService>,
+		networks: NetworksConfig,
+		push_cooldowns: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
 	) -> Self {
 		Self {
 			settlement,
 			state_machine,
 			event_bus,
 			timeout_minutes,
+			delivery,
+			networks,
+			push_cooldowns,
 		}
 	}
 
@@ -95,6 +110,20 @@ impl SettlementMonitor {
 				break;
 			}
 
+			// Check whether the L2 buffer needs to be advanced for this order.
+			if let Some((direction, required_block)) =
+				self.settlement.buffer_coverage_check(&order).await
+			{
+				crate::engine::pusher::push_if_needed(
+					&direction,
+					required_block,
+					&self.delivery,
+					&self.networks,
+					&self.push_cooldowns,
+				)
+				.await;
+			}
+
 			// Check if we can claim
 			if settlement.can_claim(&order, &fill_proof).await {
 				// Update status to Settled
@@ -122,14 +151,16 @@ impl SettlementMonitor {
 mod tests {
 	use super::*;
 	use mockall::predicate::eq;
+	use solver_delivery::DeliveryService;
 	use solver_settlement::{
 		MockSettlementInterface, OracleConfig, OracleSelectionStrategy, SettlementService,
 	};
 	use solver_storage::{MockStorageInterface, StorageService};
 	use solver_types::{
-		utils::tests::builders::OrderBuilder, FillProof, Order, SettlementEvent, SolverEvent,
+		utils::tests::builders::OrderBuilder, FillProof, NetworksConfig, Order, SettlementEvent,
+		SolverEvent,
 	};
-	use std::{collections::HashMap, sync::Arc, time::Duration};
+	use std::{collections::HashMap, sync::Arc, time::{Duration, Instant}};
 	use tokio::sync::broadcast;
 
 	fn create_test_order() -> Order {
@@ -180,7 +211,19 @@ mod tests {
 		let event_bus = EventBus::new(100);
 		let receiver = event_bus.subscribe();
 
-		let monitor = SettlementMonitor::new(settlement, state_machine, event_bus, timeout_minutes);
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let networks: NetworksConfig = HashMap::new();
+		let push_cooldowns = Arc::new(tokio::sync::Mutex::new(HashMap::<String, Instant>::new()));
+
+		let monitor = SettlementMonitor::new(
+			settlement,
+			state_machine,
+			event_bus,
+			timeout_minutes,
+			delivery,
+			networks,
+			push_cooldowns,
+		);
 
 		(monitor, receiver)
 	}
@@ -193,9 +236,20 @@ mod tests {
 		)));
 		let state_machine = Arc::new(OrderStateMachine::new(storage));
 		let event_bus = EventBus::new(100);
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let networks: NetworksConfig = HashMap::new();
+		let push_cooldowns = Arc::new(tokio::sync::Mutex::new(HashMap::<String, Instant>::new()));
 		let timeout_minutes = 30;
 
-		let monitor = SettlementMonitor::new(settlement, state_machine, event_bus, timeout_minutes);
+		let monitor = SettlementMonitor::new(
+			settlement,
+			state_machine,
+			event_bus,
+			timeout_minutes,
+			delivery,
+			networks,
+			push_cooldowns,
+		);
 
 		assert_eq!(monitor.timeout_minutes, 30);
 	}
@@ -229,6 +283,11 @@ mod tests {
 					.expect_get_attestation()
 					.times(1)
 					.returning(|_, _| Box::pin(async move { Ok(create_test_fill_proof()) }));
+
+				settlement
+					.expect_buffer_coverage_check()
+					.times(1)
+					.returning(|_| Box::pin(async { None }));
 
 				settlement
 					.expect_can_claim()

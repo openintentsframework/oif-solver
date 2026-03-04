@@ -1571,14 +1571,42 @@ impl QuoteGenerator {
 
 	/// Gets the expires duration from configuration.
 	///
-	/// Returns the configured expires seconds from api.quote config or default.
+	/// Returns the configured expires seconds from api.quote config.
+	///
+	/// If api.quote is not configured, this falls back to the larger of:
+	/// - QuoteConfig default expires
+	/// - settlement implementation `intent_min_expiry_seconds` (when present)
+	///
+	/// This keeps quote expiry aligned with settlement admission guards so
+	/// broadcaster intents are not rejected immediately for short windows.
 	fn get_expires_seconds(&self, config: &Config) -> u64 {
-		config
+		if let Some(expires_seconds) = config
 			.api
 			.as_ref()
 			.and_then(|api| api.quote.as_ref())
 			.map(|quote| quote.expires_seconds)
-			.unwrap_or_else(|| QuoteConfig::default().expires_seconds)
+		{
+			return expires_seconds;
+		}
+
+		let default_expires = QuoteConfig::default().expires_seconds;
+		let settlement_min_expiry = config
+			.settlement
+			.implementations
+			.values()
+			.filter_map(|implementation| {
+				implementation
+					.as_table()
+					.and_then(|table| table.get("intent_min_expiry_seconds"))
+					.and_then(|value| value.as_integer())
+					.map(|seconds| seconds as u64)
+			})
+			.max()
+			.unwrap_or(0);
+
+		let admission_safe_expires =
+			settlement_min_expiry.saturating_add(self.get_fill_deadline_seconds(config));
+		default_expires.max(admission_safe_expires)
 	}
 
 	/// Generates EIP-712 types definition for Permit2 orders

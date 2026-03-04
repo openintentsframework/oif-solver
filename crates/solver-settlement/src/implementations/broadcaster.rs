@@ -8,7 +8,7 @@ use crate::{
 		address_to_bytes32, check_is_proven, create_providers_for_chains, parse_address_table,
 		parse_b256_table, parse_oracle_config, SettlementMessageTracker,
 	},
-	OracleConfig, SettlementError, SettlementInterface,
+	OracleConfig, PusherDirection, SettlementError, SettlementInterface,
 };
 use alloy_primitives::{hex, FixedBytes, B256, U256};
 use alloy_provider::{DynProvider, Provider};
@@ -19,7 +19,8 @@ use sha3::{Digest, Keccak256};
 use solver_storage::StorageService;
 use solver_types::{
 	with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, InteropAddress, NetworksConfig,
-	Order, OrderOutput, Schema, Transaction, TransactionHash, TransactionReceipt, TransactionType,
+	Order, OrderOutput, PusherL2Params, Schema, Transaction, TransactionHash, TransactionReceipt,
+	TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -287,6 +288,9 @@ struct BroadcasterSubmission {
 	destination_chain: u64,
 	submission_tx_hash: TransactionHash,
 	submission_timestamp: u64,
+	/// Block number on destination chain where the message was broadcast (PostFill tx block)
+	#[serde(default)]
+	submission_block_number: Option<u64>,
 	#[serde(with = "hex::serde")]
 	payload_hash: [u8; 32],
 	#[serde(with = "hex::serde")]
@@ -406,6 +410,9 @@ struct ProofRequest {
 	message: String,
 	message_slot: String,
 	broadcaster_id: String,
+	/// Minimum block number on remote chain that the proof must cover (PostFill tx block)
+	#[serde(skip_serializing_if = "Option::is_none")]
+	min_remote_block: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -431,6 +438,7 @@ pub struct BroadcasterSettlement {
 	finality_blocks: HashMap<u64, u64>,
 	message_tracker: Arc<BroadcasterMessageTracker>,
 	http_client: reqwest::Client,
+	pusher_directions: Vec<PusherDirection>,
 }
 
 impl BroadcasterSettlement {
@@ -447,6 +455,7 @@ impl BroadcasterSettlement {
 		default_finality_blocks: u64,
 		finality_blocks: HashMap<u64, u64>,
 		storage: Arc<StorageService>,
+		pusher_directions: Vec<PusherDirection>,
 	) -> Result<Self, SettlementError> {
 		let mut all_network_ids: Vec<u64> = oracle_config
 			.input_oracles
@@ -506,6 +515,7 @@ impl BroadcasterSettlement {
 			finality_blocks,
 			message_tracker: Arc::new(BroadcasterMessageTracker::new(storage)),
 			http_client,
+			pusher_directions,
 		})
 	}
 
@@ -532,7 +542,7 @@ impl BroadcasterSettlement {
 
 	fn proof_endpoint(&self) -> String {
 		format!(
-			"{}/v1/broadcaster/proof",
+			"{}/api/v1/broadcaster/proof",
 			self.proof_service_url.trim_end_matches('/')
 		)
 	}
@@ -667,6 +677,7 @@ impl BroadcasterSettlement {
 			message: with_0x_prefix(&hex::encode(submission.message)),
 			message_slot: with_0x_prefix(&hex::encode(message_slot)),
 			broadcaster_id: broadcaster_id.to_string(),
+			min_remote_block: submission.submission_block_number,
 		};
 
 		let response = self
@@ -817,6 +828,12 @@ impl ConfigSchema for BroadcasterSettlementSchema {
 					"finality_blocks",
 					FieldType::Table(Schema::new(vec![], vec![])),
 				),
+				// Sub-field validation is intentionally skipped here; it is performed
+				// inside parse_pusher_directions() after the schema check passes.
+				Field::new(
+					"pusher_directions",
+					FieldType::Array(Box::new(FieldType::Table(Schema::new(vec![], vec![])))),
+				),
 			],
 		);
 		schema.validate(config)
@@ -831,6 +848,20 @@ impl SettlementInterface for BroadcasterSettlement {
 
 	fn config_schema(&self) -> Box<dyn ConfigSchema> {
 		Box::new(BroadcasterSettlementSchema)
+	}
+
+	async fn buffer_coverage_check(&self, order: &Order) -> Option<(PusherDirection, u64)> {
+		// load() returns Option<BroadcasterMessageState> — None means no submission yet.
+		let state = self.message_tracker.load(&order.id).await?;
+		let submission = state.submission?;
+		let required_block = submission.submission_block_number?;
+		// Fill chain = destination_chain (where the PostFill broadcast was confirmed).
+		// Claim chain = source_chain (where the receiver oracle lives).
+		let direction = self.pusher_directions.iter().find(|d| {
+			d.l1_chain_id == submission.destination_chain
+				&& d.l2_chain_id == submission.source_chain
+		})?;
+		Some((direction.clone(), required_block))
 	}
 
 	async fn get_attestation(
@@ -1128,7 +1159,7 @@ impl SettlementInterface for BroadcasterSettlement {
 			value: U256::ZERO,
 			chain_id: source_chain,
 			nonce: None,
-			gas_limit: Some(1200000),
+			gas_limit: Some(5000000),
 			gas_price: None,
 			max_fee_per_gas: None,
 			max_priority_fee_per_gas: None,
@@ -1185,6 +1216,7 @@ impl SettlementInterface for BroadcasterSettlement {
 							destination_chain,
 							submission_tx_hash: receipt.hash.clone(),
 							submission_timestamp: now_seconds(),
+							submission_block_number: Some(receipt.block_number),
 							payload_hash,
 							message: computed_message,
 							message_data,
@@ -1201,6 +1233,316 @@ impl SettlementInterface for BroadcasterSettlement {
 		}
 
 		Ok(())
+	}
+}
+
+/// Reject negative TOML integers and cast to u64.
+///
+/// TOML integers are `i64`; casting a negative value with `as u64` silently
+/// wraps to a huge number.  This helper makes the rejection explicit.
+fn parse_nonneg_u64(raw: i64, field: &str, index: usize) -> Result<u64, SettlementError> {
+	if raw < 0 {
+		Err(SettlementError::ValidationFailed(format!(
+			"pusher_directions[{index}].{field} must be non-negative, got {raw}"
+		)))
+	} else {
+		Ok(raw as u64)
+	}
+}
+
+/// Parse pusher directions from TOML configuration.
+///
+/// Reads the optional `pusher_directions` array from config. For each entry,
+/// required fields are `pusher_address`, `buffer_address`, `push_cooldown_seconds`,
+/// and either `l2_params` (typed, preferred) or `l2_transaction_data` (legacy hex).
+///
+/// `l1_chain_id` / `l2_chain_id` are optional **only** when the oracle config
+/// contains exactly one route with exactly one destination — an unambiguous
+/// mapping.  They are required when multiple routes or destinations are present.
+///
+/// All integer fields must be non-negative.  Labels must be unique across
+/// all entries in the array.
+fn parse_pusher_directions(
+	config: &toml::Value,
+	oracle_config: &OracleConfig,
+) -> Result<Vec<PusherDirection>, SettlementError> {
+	let Some(directions_value) = config.get("pusher_directions") else {
+		return Ok(vec![]);
+	};
+
+	let directions_array = directions_value.as_array().ok_or_else(|| {
+		SettlementError::ValidationFailed("pusher_directions must be an array".into())
+	})?;
+
+	// Infer default chain IDs only when there is exactly one unambiguous route.
+	// Multiple source chains or multiple destinations make the mapping ambiguous,
+	// so we require explicit values in those cases.
+	let (default_l1_chain_id, default_l2_chain_id) =
+		if oracle_config.routes.len() == 1 {
+			let (&l1, dests) = oracle_config.routes.iter().next().unwrap();
+			let l2 = if dests.len() == 1 { Some(dests[0]) } else { None };
+			(Some(l1), l2)
+		} else {
+			(None, None)
+		};
+
+	let directions: Vec<PusherDirection> = directions_array
+		.iter()
+		.enumerate()
+		.map(|(i, entry)| {
+			// ── chain IDs ────────────────────────────────────────────────────
+			let l1_chain_id = if let Some(v) = entry.get("l1_chain_id") {
+				let raw = v.as_integer().ok_or_else(|| {
+					SettlementError::ValidationFailed(format!(
+						"pusher_directions[{i}].l1_chain_id must be integer"
+					))
+				})?;
+				parse_nonneg_u64(raw, "l1_chain_id", i)?
+			} else {
+				default_l1_chain_id.ok_or_else(|| {
+					SettlementError::ValidationFailed(format!(
+						"pusher_directions[{i}].l1_chain_id is required \
+                         (multiple routes configured — no unambiguous default)"
+					))
+				})?
+			};
+
+			let l2_chain_id = if let Some(v) = entry.get("l2_chain_id") {
+				let raw = v.as_integer().ok_or_else(|| {
+					SettlementError::ValidationFailed(format!(
+						"pusher_directions[{i}].l2_chain_id must be integer"
+					))
+				})?;
+				parse_nonneg_u64(raw, "l2_chain_id", i)?
+			} else {
+				default_l2_chain_id.ok_or_else(|| {
+					SettlementError::ValidationFailed(format!(
+						"pusher_directions[{i}].l2_chain_id is required \
+                         (multiple destinations configured — no unambiguous default)"
+					))
+				})?
+			};
+
+			// ── addresses ────────────────────────────────────────────────────
+			let pusher_addr_str = entry
+				.get("pusher_address")
+				.and_then(|v| v.as_str())
+				.ok_or_else(|| {
+					SettlementError::ValidationFailed(format!(
+						"pusher_directions[{i}].pusher_address is required"
+					))
+				})?;
+			let pusher_address =
+				solver_types::utils::parse_address(pusher_addr_str).map_err(|e| {
+					SettlementError::ValidationFailed(format!(
+						"pusher_directions[{i}].pusher_address invalid: {e}"
+					))
+				})?;
+
+			let buffer_addr_str = entry
+				.get("buffer_address")
+				.and_then(|v| v.as_str())
+				.ok_or_else(|| {
+					SettlementError::ValidationFailed(format!(
+						"pusher_directions[{i}].buffer_address is required"
+					))
+				})?;
+			let buffer_address =
+				solver_types::utils::parse_address(buffer_addr_str).map_err(|e| {
+					SettlementError::ValidationFailed(format!(
+						"pusher_directions[{i}].buffer_address invalid: {e}"
+					))
+				})?;
+
+			// ── required integer fields ───────────────────────────────────────
+			let cooldown_raw = entry
+				.get("push_cooldown_seconds")
+				.and_then(|v| v.as_integer())
+				.ok_or_else(|| {
+					SettlementError::ValidationFailed(format!(
+						"pusher_directions[{i}].push_cooldown_seconds is required"
+					))
+				})?;
+			let push_cooldown_seconds =
+				parse_nonneg_u64(cooldown_raw, "push_cooldown_seconds", i)?;
+
+			// ── l2_params (typed, preferred) / l2_transaction_data (legacy) ──
+			let l2_params = if let Some(l2_params_val) = entry.get("l2_params") {
+				// New typed path.
+				let params: PusherL2Params =
+					l2_params_val.clone().try_into().map_err(|e| {
+						SettlementError::ValidationFailed(format!(
+							"pusher_directions[{i}].l2_params invalid: {e}"
+						))
+					})?;
+				validate_l2_params_chain_match(&params, l2_chain_id, i)?;
+				params
+			} else if let Some(hex_str) = entry
+				.get("l2_transaction_data")
+				.and_then(|v| v.as_str())
+			{
+				// Legacy hex fallback — warn and infer typed variant from chain ID.
+				tracing::warn!(
+					index = i,
+					"pusher_directions[{i}].l2_transaction_data is deprecated; \
+					 use l2_params instead"
+				);
+				infer_l2_params_from_hex(hex_str, l2_chain_id, i)?
+			} else {
+				return Err(SettlementError::ValidationFailed(format!(
+					"pusher_directions[{i}]: either l2_params or l2_transaction_data \
+					 is required"
+				)));
+			};
+
+			// ── optional integer fields ───────────────────────────────────────
+			let batch_size = match entry.get("batch_size").and_then(|v| v.as_integer()) {
+				Some(raw) => parse_nonneg_u64(raw, "batch_size", i)?,
+				None => 256,
+			};
+
+			// ── label ─────────────────────────────────────────────────────────
+			let default_label = format!("{l1_chain_id}-to-{l2_chain_id}");
+			let label = entry
+				.get("label")
+				.and_then(|v| v.as_str())
+				.unwrap_or(&default_label)
+				.to_string();
+
+			Ok(PusherDirection {
+				label,
+				l1_chain_id,
+				pusher_address,
+				l2_chain_id,
+				buffer_address,
+				batch_size,
+				push_cooldown_seconds,
+				l2_params,
+			})
+		})
+		.collect::<Result<_, _>>()?;
+
+	// Duplicate labels cause incorrect cooldown throttling in the pusher task.
+	let mut seen_labels = std::collections::HashSet::new();
+	for d in &directions {
+		if !seen_labels.insert(d.label.as_str()) {
+			return Err(SettlementError::ValidationFailed(format!(
+				"pusher_directions: duplicate label {:?} — all labels must be unique",
+				d.label
+			)));
+		}
+	}
+
+	Ok(directions)
+}
+
+/// Validate that the `PusherL2Params` variant is appropriate for `l2_chain_id`.
+///
+/// `Raw` is allowed on any chain (explicit override).  All typed variants are
+/// restricted to their known chain IDs to catch configuration mistakes early.
+fn validate_l2_params_chain_match(
+	l2_params: &PusherL2Params,
+	l2_chain_id: u64,
+	i: usize,
+) -> Result<(), SettlementError> {
+	let valid = match l2_params {
+		PusherL2Params::Arbitrum { .. } => matches!(l2_chain_id, 42161 | 421614),
+		PusherL2Params::Linea { .. } => matches!(l2_chain_id, 59144 | 59141),
+		PusherL2Params::OpStack { .. } => matches!(l2_chain_id, 10 | 8453 | 11155420 | 84532),
+		PusherL2Params::Raw { .. } => true,
+	};
+	if !valid {
+		let type_name = match l2_params {
+			PusherL2Params::Arbitrum { .. } => "arbitrum",
+			PusherL2Params::Linea { .. } => "linea",
+			PusherL2Params::OpStack { .. } => "op_stack",
+			PusherL2Params::Raw { .. } => "raw",
+		};
+		return Err(SettlementError::ValidationFailed(format!(
+			"pusher_directions[{i}].l2_params type \"{type_name}\" is not valid \
+			 for l2_chain_id {l2_chain_id}"
+		)));
+	}
+	Ok(())
+}
+
+/// Convert a legacy hex `l2_transaction_data` string to a typed `PusherL2Params`
+/// by inferring the variant from `l2_chain_id`.
+///
+/// Overflow guard: each ABI word is 32 bytes; we read only the low 8 bytes as
+/// `u64`.  Values that exceed 64 bits are silently truncated.  In practice gas
+/// parameters and fees never approach 2^64 wei (~18.4 ETH per gas), so this is safe.
+fn infer_l2_params_from_hex(
+	hex_str: &str,
+	l2_chain_id: u64,
+	i: usize,
+) -> Result<PusherL2Params, SettlementError> {
+	let data = hex::decode(hex_str.trim_start_matches("0x")).map_err(|e| {
+		SettlementError::ValidationFailed(format!(
+			"pusher_directions[{i}].l2_transaction_data invalid hex: {e}"
+		))
+	})?;
+
+	/// Read a u64 from the low 8 bytes of a 32-byte ABI word at `offset`.
+	/// Returns 0 if `data` is too short.
+	/// Overflow guard: the high 24 bytes of the word are discarded.
+	fn read_u64(data: &[u8], offset: usize) -> u64 {
+		let end = offset + 32;
+		if data.len() < end {
+			return 0;
+		}
+		// Low 8 bytes of the 32-byte word (overflow guard: high 24 bytes discarded).
+		let mut buf = [0u8; 8];
+		buf.copy_from_slice(&data[offset + 24..end]);
+		u64::from_be_bytes(buf)
+	}
+
+	match l2_chain_id {
+		// Arbitrum mainnet / Sepolia: 5-word ABI encoding.
+		// word 0: inbox address (bytes 12–31), words 1–3: gas params, word 4: isERC20
+		42161 | 421614 => {
+			if data.len() < 160 {
+				return Err(SettlementError::ValidationFailed(format!(
+					"pusher_directions[{i}]: ARB l2_transaction_data must be \
+					 160 bytes, got {}",
+					data.len()
+				)));
+			}
+			let inbox = alloy_primitives::Address::from_slice(&data[12..32]);
+			let gas_price_bid = read_u64(&data, 32);
+			let gas_limit = read_u64(&data, 64);
+			let submission_cost = read_u64(&data, 96);
+			let is_erc20_inbox = data[159] != 0;
+			Ok(PusherL2Params::Arbitrum {
+				inbox,
+				gas_price_bid,
+				gas_limit,
+				submission_cost,
+				is_erc20_inbox,
+			})
+		},
+		// Linea mainnet / testnet: first 32 bytes = fee.
+		59144 | 59141 => {
+			let fee = read_u64(&data, 0);
+			Ok(PusherL2Params::Linea { fee })
+		},
+		// OP Stack: first 32 bytes encodes a uint32 gasLimit.
+		10 | 8453 | 11155420 | 84532 => {
+			let gas_limit = if data.len() >= 32 {
+				// ABI uint32 is right-aligned in 32 bytes; read low 4 bytes.
+				let mut buf = [0u8; 4];
+				buf.copy_from_slice(&data[28..32]);
+				u32::from_be_bytes(buf)
+			} else {
+				0
+			};
+			Ok(PusherL2Params::OpStack { gas_limit })
+		},
+		// Unknown chain: pass data through as Raw with no msg.value.
+		_ => Ok(PusherL2Params::Raw {
+			data: format!("0x{}", hex::encode(&data)),
+			value_wei: None,
+		}),
 	}
 }
 
@@ -1250,6 +1592,8 @@ pub fn create_settlement(
 		.unwrap_or(&empty_finality_table);
 	let finality_blocks = parse_u64_table(finality_table)?;
 
+	let pusher_directions = parse_pusher_directions(config, &oracle_config)?;
+
 	let settlement = tokio::task::block_in_place(|| {
 		tokio::runtime::Handle::current().block_on(async {
 			BroadcasterSettlement::new(
@@ -1264,6 +1608,7 @@ pub fn create_settlement(
 				default_finality_blocks,
 				finality_blocks,
 				storage,
+				pusher_directions,
 			)
 			.await
 		})
@@ -1285,3 +1630,481 @@ impl solver_types::ImplementationRegistry for Registry {
 }
 
 impl crate::SettlementRegistry for Registry {}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::OracleSelectionStrategy;
+
+	// ── helpers ─────────────────────────────────────────────────────────────
+
+	fn make_oracle_config(routes: HashMap<u64, Vec<u64>>) -> OracleConfig {
+		let mut input_oracles = HashMap::new();
+		let mut output_oracles = HashMap::new();
+		for (&src, dests) in &routes {
+			input_oracles.insert(src, vec![solver_types::Address(vec![0u8; 20])]);
+			for &dst in dests {
+				output_oracles.insert(dst, vec![solver_types::Address(vec![0u8; 20])]);
+			}
+		}
+		OracleConfig {
+			input_oracles,
+			output_oracles,
+			routes,
+			selection_strategy: OracleSelectionStrategy::First,
+		}
+	}
+
+	fn oracle_config_eth_to_op() -> OracleConfig {
+		let mut routes = HashMap::new();
+		routes.insert(11155111u64, vec![84532u64]);
+		make_oracle_config(routes)
+	}
+
+	fn empty_oracle_config() -> OracleConfig {
+		make_oracle_config(HashMap::new())
+	}
+
+	/// Build an inline TOML table for a `PusherL2Params::OpStack` variant.
+	fn op_stack_l2_params() -> toml::Value {
+		let mut l2p = toml::map::Map::new();
+		l2p.insert("type".into(), toml::Value::String("op_stack".into()));
+		l2p.insert("gas_limit".into(), toml::Value::Integer(200000));
+		toml::Value::Table(l2p)
+	}
+
+	/// Build an inline TOML table for a `PusherL2Params::Arbitrum` variant.
+	fn arb_l2_params() -> toml::Value {
+		let mut l2p = toml::map::Map::new();
+		l2p.insert("type".into(), toml::Value::String("arbitrum".into()));
+		l2p.insert(
+			"inbox".into(),
+			toml::Value::String("0xaAe29B0366299461418F5324a79Afc425BE5ae21".into()),
+		);
+		l2p.insert("gas_price_bid".into(), toml::Value::Integer(100_000_000));
+		l2p.insert("gas_limit".into(), toml::Value::Integer(16_000_000));
+		l2p.insert("submission_cost".into(), toml::Value::Integer(1_000_000_000_000_000i64));
+		l2p.insert("is_erc20_inbox".into(), toml::Value::Boolean(false));
+		toml::Value::Table(l2p)
+	}
+
+	/// Build a minimal valid TOML entry for one pusher direction (no chain IDs).
+	/// Uses OpStack l2_params (compatible with the default eth-to-op oracle route).
+	fn valid_entry_no_chains() -> toml::Value {
+		let mut t = toml::map::Map::new();
+		t.insert(
+			"pusher_address".into(),
+			toml::Value::String("0x1111111111111111111111111111111111111111".into()),
+		);
+		t.insert(
+			"buffer_address".into(),
+			toml::Value::String("0x2222222222222222222222222222222222222222".into()),
+		);
+		t.insert("push_cooldown_seconds".into(), toml::Value::Integer(3600));
+		t.insert("l2_params".into(), op_stack_l2_params());
+		toml::Value::Table(t)
+	}
+
+	fn config_with_directions(entries: Vec<toml::Value>) -> toml::Value {
+		let mut root = toml::map::Map::new();
+		root.insert("pusher_directions".into(), toml::Value::Array(entries));
+		toml::Value::Table(root)
+	}
+
+	// ── absence / empty ──────────────────────────────────────────────────────
+
+	#[test]
+	fn test_no_pusher_directions_key_returns_empty() {
+		let config = toml::Value::Table(toml::map::Map::new());
+		let result = parse_pusher_directions(&config, &empty_oracle_config()).unwrap();
+		assert!(result.is_empty());
+	}
+
+	#[test]
+	fn test_empty_pusher_directions_array_returns_empty() {
+		let config = config_with_directions(vec![]);
+		let result = parse_pusher_directions(&config, &empty_oracle_config()).unwrap();
+		assert!(result.is_empty());
+	}
+
+	// ── defaults inferred from routes ────────────────────────────────────────
+
+	#[test]
+	fn test_defaults_inferred_from_routes() {
+		let config = config_with_directions(vec![valid_entry_no_chains()]);
+		let result = parse_pusher_directions(&config, &oracle_config_eth_to_op()).unwrap();
+		assert_eq!(result.len(), 1);
+		let d = &result[0];
+		assert_eq!(d.l1_chain_id, 11155111);
+		assert_eq!(d.l2_chain_id, 84532);
+		// Default batch_size = 256
+		assert_eq!(d.batch_size, 256);
+		// Default label = "<l1>-to-<l2>"
+		assert_eq!(d.label, "11155111-to-84532");
+		assert_eq!(d.push_cooldown_seconds, 3600);
+		// l2_params should be OpStack (inferred via legacy path for OP chain 84532)
+		assert!(
+			matches!(d.l2_params, PusherL2Params::OpStack { .. }),
+			"expected OpStack variant, got {:?}", d.l2_params
+		);
+	}
+
+	// ── all fields explicit ──────────────────────────────────────────────────
+
+	#[test]
+	fn test_all_fields_explicit() {
+		let mut entry = toml::map::Map::new();
+		entry.insert("l1_chain_id".into(), toml::Value::Integer(1));
+		entry.insert("l2_chain_id".into(), toml::Value::Integer(10)); // Optimism mainnet
+		entry.insert(
+			"pusher_address".into(),
+			toml::Value::String("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()),
+		);
+		entry.insert(
+			"buffer_address".into(),
+			toml::Value::String("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into()),
+		);
+		entry.insert("push_cooldown_seconds".into(), toml::Value::Integer(7200));
+		entry.insert("l2_params".into(), op_stack_l2_params());
+		entry.insert("batch_size".into(), toml::Value::Integer(512));
+		entry.insert("label".into(), toml::Value::String("mainnet-to-op".into()));
+
+		let config = config_with_directions(vec![toml::Value::Table(entry)]);
+		let result = parse_pusher_directions(&config, &empty_oracle_config()).unwrap();
+		assert_eq!(result.len(), 1);
+		let d = &result[0];
+		assert_eq!(d.l1_chain_id, 1);
+		assert_eq!(d.l2_chain_id, 10);
+		assert_eq!(d.batch_size, 512);
+		assert_eq!(d.label, "mainnet-to-op");
+		assert_eq!(d.push_cooldown_seconds, 7200);
+		assert_eq!(d.l2_params, PusherL2Params::OpStack { gas_limit: 200000 });
+	}
+
+	// ── arb l2 chain id with typed arbitrum params ───────────────────────────
+
+	#[test]
+	fn test_arb_l2_chain_id_parses_successfully() {
+		let mut entry = toml::map::Map::new();
+		entry.insert("l1_chain_id".into(), toml::Value::Integer(11155111));
+		entry.insert("l2_chain_id".into(), toml::Value::Integer(421614)); // ARB Sepolia
+		entry.insert(
+			"pusher_address".into(),
+			toml::Value::String("0x1111111111111111111111111111111111111111".into()),
+		);
+		entry.insert(
+			"buffer_address".into(),
+			toml::Value::String("0x2222222222222222222222222222222222222222".into()),
+		);
+		entry.insert("push_cooldown_seconds".into(), toml::Value::Integer(3600));
+		entry.insert("l2_params".into(), arb_l2_params());
+
+		let config = config_with_directions(vec![toml::Value::Table(entry)]);
+		let result = parse_pusher_directions(&config, &empty_oracle_config()).unwrap();
+		assert_eq!(result.len(), 1);
+		assert_eq!(result[0].l2_chain_id, 421614);
+		assert!(matches!(result[0].l2_params, PusherL2Params::Arbitrum { .. }));
+	}
+
+	// ── multiple directions ──────────────────────────────────────────────────
+
+	#[test]
+	fn test_multiple_directions() {
+		let mut routes = HashMap::new();
+		routes.insert(1u64, vec![10u64, 8453u64]);
+		let oracle_config = make_oracle_config(routes);
+
+		// Two destinations → l2_chain_id is ambiguous; both entries must be explicit.
+		// l1_chain_id may still be inferred (1 unambiguous source key).
+		let mut entry_a = valid_entry_no_chains();
+		let mut entry_b = valid_entry_no_chains();
+		if let toml::Value::Table(ref mut t) = entry_a {
+			t.insert("l2_chain_id".into(), toml::Value::Integer(10));
+			t.insert("label".into(), toml::Value::String("eth-to-op".into()));
+		}
+		if let toml::Value::Table(ref mut t) = entry_b {
+			t.insert("l2_chain_id".into(), toml::Value::Integer(8453));
+			t.insert("label".into(), toml::Value::String("eth-to-base".into()));
+		}
+		let config = config_with_directions(vec![entry_a, entry_b]);
+		let result = parse_pusher_directions(&config, &oracle_config).unwrap();
+		assert_eq!(result.len(), 2);
+		assert_eq!(result[0].l1_chain_id, 1); // inferred from single route key
+		assert_eq!(result[0].l2_chain_id, 10);
+		assert_eq!(result[0].label, "eth-to-op");
+		assert_eq!(result[1].l2_chain_id, 8453);
+		assert_eq!(result[1].label, "eth-to-base");
+	}
+
+	#[test]
+	fn test_l2_chain_id_required_when_multiple_destinations() {
+		let mut routes = HashMap::new();
+		routes.insert(1u64, vec![10u64, 8453u64]); // 2 dests — ambiguous
+		let oracle_config = make_oracle_config(routes);
+
+		// Entry has no l2_chain_id — should fail because default is ambiguous.
+		let config = config_with_directions(vec![valid_entry_no_chains()]);
+		let err = parse_pusher_directions(&config, &oracle_config).unwrap_err();
+		let msg = err.to_string();
+		assert!(msg.contains("l2_chain_id"), "unexpected msg: {msg}");
+		assert!(msg.contains("multiple destinations"), "unexpected msg: {msg}");
+	}
+
+	// ── required-field missing errors ────────────────────────────────────────
+
+	#[test]
+	fn test_missing_pusher_address() {
+		let mut t = toml::map::Map::new();
+		t.insert(
+			"buffer_address".into(),
+			toml::Value::String("0x2222222222222222222222222222222222222222".into()),
+		);
+		t.insert("push_cooldown_seconds".into(), toml::Value::Integer(3600));
+		t.insert("l2_params".into(), op_stack_l2_params());
+		let config = config_with_directions(vec![toml::Value::Table(t)]);
+
+		let err = parse_pusher_directions(&config, &oracle_config_eth_to_op()).unwrap_err();
+		let msg = err.to_string();
+		assert!(msg.contains("pusher_address"), "unexpected msg: {msg}");
+	}
+
+	#[test]
+	fn test_missing_buffer_address() {
+		let mut t = toml::map::Map::new();
+		t.insert(
+			"pusher_address".into(),
+			toml::Value::String("0x1111111111111111111111111111111111111111".into()),
+		);
+		t.insert("push_cooldown_seconds".into(), toml::Value::Integer(3600));
+		t.insert("l2_params".into(), op_stack_l2_params());
+		let config = config_with_directions(vec![toml::Value::Table(t)]);
+
+		let err = parse_pusher_directions(&config, &oracle_config_eth_to_op()).unwrap_err();
+		let msg = err.to_string();
+		assert!(msg.contains("buffer_address"), "unexpected msg: {msg}");
+	}
+
+	#[test]
+	fn test_missing_push_cooldown_seconds() {
+		let mut t = toml::map::Map::new();
+		t.insert(
+			"pusher_address".into(),
+			toml::Value::String("0x1111111111111111111111111111111111111111".into()),
+		);
+		t.insert(
+			"buffer_address".into(),
+			toml::Value::String("0x2222222222222222222222222222222222222222".into()),
+		);
+		t.insert("l2_params".into(), op_stack_l2_params());
+		let config = config_with_directions(vec![toml::Value::Table(t)]);
+
+		let err = parse_pusher_directions(&config, &oracle_config_eth_to_op()).unwrap_err();
+		let msg = err.to_string();
+		assert!(msg.contains("push_cooldown_seconds"), "unexpected msg: {msg}");
+	}
+
+	#[test]
+	fn test_missing_l2_params_and_l2_transaction_data() {
+		// Neither l2_params nor l2_transaction_data → should fail.
+		let mut t = toml::map::Map::new();
+		t.insert(
+			"pusher_address".into(),
+			toml::Value::String("0x1111111111111111111111111111111111111111".into()),
+		);
+		t.insert(
+			"buffer_address".into(),
+			toml::Value::String("0x2222222222222222222222222222222222222222".into()),
+		);
+		t.insert("push_cooldown_seconds".into(), toml::Value::Integer(3600));
+		let config = config_with_directions(vec![toml::Value::Table(t)]);
+
+		let err = parse_pusher_directions(&config, &oracle_config_eth_to_op()).unwrap_err();
+		let msg = err.to_string();
+		assert!(
+			msg.contains("l2_params") || msg.contains("l2_transaction_data"),
+			"unexpected msg: {msg}"
+		);
+	}
+
+	// ── invalid-value errors ─────────────────────────────────────────────────
+
+	#[test]
+	fn test_invalid_l2_params() {
+		// l2_params present but with an unknown "type" value → parse error.
+		let mut t = toml::map::Map::new();
+		t.insert(
+			"pusher_address".into(),
+			toml::Value::String("0x1111111111111111111111111111111111111111".into()),
+		);
+		t.insert(
+			"buffer_address".into(),
+			toml::Value::String("0x2222222222222222222222222222222222222222".into()),
+		);
+		t.insert("push_cooldown_seconds".into(), toml::Value::Integer(3600));
+		let mut l2p = toml::map::Map::new();
+		l2p.insert("type".into(), toml::Value::String("unknown_chain_type".into()));
+		t.insert("l2_params".into(), toml::Value::Table(l2p));
+		let config = config_with_directions(vec![toml::Value::Table(t)]);
+
+		let err = parse_pusher_directions(&config, &oracle_config_eth_to_op()).unwrap_err();
+		let msg = err.to_string();
+		assert!(msg.contains("l2_params"), "unexpected msg: {msg}");
+	}
+
+	#[test]
+	fn test_invalid_hex_l2_transaction_data_legacy() {
+		// Legacy path: l2_transaction_data with invalid hex → should fail.
+		let mut t = toml::map::Map::new();
+		t.insert(
+			"pusher_address".into(),
+			toml::Value::String("0x1111111111111111111111111111111111111111".into()),
+		);
+		t.insert(
+			"buffer_address".into(),
+			toml::Value::String("0x2222222222222222222222222222222222222222".into()),
+		);
+		t.insert("push_cooldown_seconds".into(), toml::Value::Integer(3600));
+		t.insert("l2_transaction_data".into(), toml::Value::String("0xnothex!".into()));
+		let config = config_with_directions(vec![toml::Value::Table(t)]);
+
+		let err = parse_pusher_directions(&config, &oracle_config_eth_to_op()).unwrap_err();
+		let msg = err.to_string();
+		assert!(msg.contains("l2_transaction_data"), "unexpected msg: {msg}");
+		assert!(msg.contains("invalid hex"), "expected 'invalid hex' in: {msg}");
+	}
+
+	#[test]
+	fn test_invalid_pusher_address_format() {
+		let mut t = toml::map::Map::new();
+		t.insert("pusher_address".into(), toml::Value::String("not-an-address".into()));
+		t.insert(
+			"buffer_address".into(),
+			toml::Value::String("0x2222222222222222222222222222222222222222".into()),
+		);
+		t.insert("push_cooldown_seconds".into(), toml::Value::Integer(3600));
+		t.insert("l2_params".into(), op_stack_l2_params());
+		let config = config_with_directions(vec![toml::Value::Table(t)]);
+
+		let err = parse_pusher_directions(&config, &oracle_config_eth_to_op()).unwrap_err();
+		let msg = err.to_string();
+		assert!(msg.contains("pusher_address"), "unexpected msg: {msg}");
+		assert!(msg.contains("invalid"), "expected 'invalid' in: {msg}");
+	}
+
+	// ── chain/variant validation ──────────────────────────────────────────────
+
+	#[test]
+	fn test_l2_params_chain_mismatch_op_stack_on_arb() {
+		// OpStack variant on ARB chain ID should be rejected.
+		let mut entry = toml::map::Map::new();
+		entry.insert("l1_chain_id".into(), toml::Value::Integer(11155111));
+		entry.insert("l2_chain_id".into(), toml::Value::Integer(421614)); // ARB Sepolia
+		entry.insert(
+			"pusher_address".into(),
+			toml::Value::String("0x1111111111111111111111111111111111111111".into()),
+		);
+		entry.insert(
+			"buffer_address".into(),
+			toml::Value::String("0x2222222222222222222222222222222222222222".into()),
+		);
+		entry.insert("push_cooldown_seconds".into(), toml::Value::Integer(3600));
+		entry.insert("l2_params".into(), op_stack_l2_params()); // OpStack on ARB → wrong
+		let config = config_with_directions(vec![toml::Value::Table(entry)]);
+
+		let err = parse_pusher_directions(&config, &empty_oracle_config()).unwrap_err();
+		let msg = err.to_string();
+		assert!(
+			msg.contains("op_stack") && msg.contains("421614"),
+			"unexpected msg: {msg}"
+		);
+	}
+
+	#[test]
+	fn test_l2_params_raw_allowed_on_any_chain() {
+		// Raw variant should be accepted on any chain ID.
+		let mut entry = toml::map::Map::new();
+		entry.insert("l1_chain_id".into(), toml::Value::Integer(1));
+		entry.insert("l2_chain_id".into(), toml::Value::Integer(42161)); // ARB mainnet
+		entry.insert(
+			"pusher_address".into(),
+			toml::Value::String("0x1111111111111111111111111111111111111111".into()),
+		);
+		entry.insert(
+			"buffer_address".into(),
+			toml::Value::String("0x2222222222222222222222222222222222222222".into()),
+		);
+		entry.insert("push_cooldown_seconds".into(), toml::Value::Integer(3600));
+		let mut l2p = toml::map::Map::new();
+		l2p.insert("type".into(), toml::Value::String("raw".into()));
+		l2p.insert("data".into(), toml::Value::String("0xdeadbeef".into()));
+		entry.insert("l2_params".into(), toml::Value::Table(l2p));
+		let config = config_with_directions(vec![toml::Value::Table(entry)]);
+
+		let result = parse_pusher_directions(&config, &empty_oracle_config()).unwrap();
+		assert_eq!(result.len(), 1);
+		assert!(matches!(result[0].l2_params, PusherL2Params::Raw { .. }));
+	}
+
+	// ── legacy l2_transaction_data fallback ───────────────────────────────────
+
+	#[test]
+	fn test_l2_transaction_data_legacy_fallback_op_stack() {
+		// Old hex string on OP chain → inferred as OpStack variant.
+		// The abi.encode(uint32(200000)) = 28 zero bytes + 4 bytes of 200000.
+		let gas_limit: u32 = 200000; // 0x30D40
+		let mut abi_word = [0u8; 32];
+		abi_word[28..32].copy_from_slice(&gas_limit.to_be_bytes());
+		let hex_data = format!("0x{}", hex::encode(abi_word));
+
+		let mut entry = valid_entry_no_chains();
+		if let toml::Value::Table(ref mut t) = entry {
+			// Override l2_params with legacy field to test the fallback.
+			t.remove("l2_params");
+			t.insert("l2_transaction_data".into(), toml::Value::String(hex_data));
+		}
+		let config = config_with_directions(vec![entry]);
+		let result = parse_pusher_directions(&config, &oracle_config_eth_to_op()).unwrap();
+		assert_eq!(result.len(), 1);
+		assert_eq!(result[0].l2_params, PusherL2Params::OpStack { gas_limit });
+	}
+
+	#[test]
+	fn test_l2_transaction_data_legacy_no_0x_prefix() {
+		// Legacy hex without 0x prefix should still be accepted.
+		let mut entry = valid_entry_no_chains();
+		if let toml::Value::Table(ref mut t) = entry {
+			t.remove("l2_params");
+			t.insert("l2_transaction_data".into(), toml::Value::String("deadbeef".into()));
+		}
+		// deadbeef → 4 bytes, chain 84532 → OpStack, gas_limit from low 4 bytes of 32-byte word.
+		// 4 bytes is shorter than 32 → gas_limit defaults to 0.
+		let config = config_with_directions(vec![entry]);
+		let result = parse_pusher_directions(&config, &oracle_config_eth_to_op()).unwrap();
+		assert_eq!(result.len(), 1);
+		assert_eq!(result[0].l2_params, PusherL2Params::OpStack { gas_limit: 0 });
+	}
+
+	// ── chain-id inference failures ──────────────────────────────────────────
+
+	#[test]
+	fn test_l1_chain_id_required_when_routes_empty() {
+		let config = config_with_directions(vec![valid_entry_no_chains()]);
+		let err = parse_pusher_directions(&config, &empty_oracle_config()).unwrap_err();
+		let msg = err.to_string();
+		assert!(msg.contains("l1_chain_id"), "unexpected msg: {msg}");
+	}
+
+	#[test]
+	fn test_l2_chain_id_required_when_routes_empty_but_l1_explicit() {
+		let mut entry = valid_entry_no_chains();
+		if let toml::Value::Table(ref mut t) = entry {
+			t.insert("l1_chain_id".into(), toml::Value::Integer(1));
+			// l2_chain_id intentionally omitted
+		}
+		let config = config_with_directions(vec![entry]);
+		let err = parse_pusher_directions(&config, &empty_oracle_config()).unwrap_err();
+		let msg = err.to_string();
+		assert!(msg.contains("l2_chain_id"), "unexpected msg: {msg}");
+	}
+
+}
