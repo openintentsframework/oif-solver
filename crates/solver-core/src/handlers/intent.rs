@@ -17,6 +17,7 @@ use solver_types::{
 	truncate_id, with_0x_prefix, Address, DiscoveryEvent, Eip7683OrderData, ExecutionDecision,
 	ExecutionParams, Intent, OrderEvent, SolverEvent, StorageKey,
 };
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use thiserror::Error;
@@ -57,6 +58,9 @@ pub struct IntentHandler {
 	/// In-memory LRU cache for fast intent deduplication to prevent race conditions
 	/// Automatically evicts oldest entries when capacity is exceeded
 	processed_intents: Arc<RwLock<LruCache<String, ()>>>,
+	/// OFAC-sanctioned Ethereum addresses (lowercase hex with 0x prefix).
+	/// Loaded once at startup from `config.solver.ofac_list` if set.
+	ofac_addresses: HashSet<String>,
 }
 
 impl IntentHandler {
@@ -72,6 +76,17 @@ impl IntentHandler {
 		cost_profit_service: Arc<CostProfitService>,
 		dynamic_config: Arc<RwLock<Config>>,
 	) -> Self {
+		let static_config = dynamic_config.blocking_read().clone();
+		let ofac_addresses = Self::load_ofac_list(static_config.solver.ofac_list.as_deref());
+		if static_config
+			.solver
+			.ofac_list
+			.as_deref()
+			.is_some_and(|p| !p.is_empty())
+			&& ofac_addresses.is_empty()
+		{
+			tracing::warn!("OFAC sanctions list could not be loaded. Enforcement is DISABLED!");
+		}
 		Self {
 			order_service,
 			storage,
@@ -85,6 +100,40 @@ impl IntentHandler {
 			processed_intents: Arc::new(RwLock::new(LruCache::new(
 				NonZeroUsize::new(10000).unwrap(),
 			))),
+			ofac_addresses,
+		}
+	}
+
+	/// Load OFAC-sanctioned addresses from a JSON file.
+	///
+	/// Returns an empty set if no path is configured, the file is missing,
+	/// or the file cannot be parsed. All addresses are stored in lowercase.
+	fn load_ofac_list(path: Option<&str>) -> HashSet<String> {
+		let path = match path {
+			Some(p) if !p.is_empty() => p,
+			_ => return HashSet::new(),
+		};
+		match std::fs::read_to_string(path) {
+			Ok(content) => match serde_json::from_str::<Vec<String>>(&content) {
+				Ok(addrs) => {
+					let set: HashSet<String> =
+						addrs.into_iter().map(|a| a.to_lowercase()).collect();
+					tracing::info!(
+						path = %path,
+						count = %set.len(),
+						"Loaded OFAC sanctions list"
+					);
+					set
+				},
+				Err(e) => {
+					tracing::warn!(path = %path, error = %e, "Failed to parse OFAC list");
+					HashSet::new()
+				},
+			},
+			Err(e) => {
+				tracing::warn!(path = %path, error = %e, "Failed to read OFAC list");
+				HashSet::new()
+			},
 		}
 	}
 
@@ -128,6 +177,52 @@ impl IntentHandler {
 		if exists {
 			tracing::debug!("Duplicate intent detected in persistent storage, already processed");
 			return Ok(());
+		}
+
+		// OFAC sanctions check — runs before storing to avoid polluting the dedup cache
+		// with addresses that will always be rejected.
+		if !self.ofac_addresses.is_empty() {
+			if let Ok(order_data) = serde_json::from_value::<Eip7683OrderData>(intent.data.clone())
+			{
+				// Check the order sender (user field).
+				let user_addr = order_data.user.to_lowercase();
+				if self.ofac_addresses.contains(&user_addr) {
+					tracing::warn!(
+						intent_id = %intent.id,
+						address = %user_addr,
+						"Intent rejected: sender is on OFAC sanctions list"
+					);
+					self.event_bus
+						.publish(SolverEvent::Discovery(DiscoveryEvent::IntentRejected {
+							intent_id: intent.id,
+							reason: "Sender address is on OFAC sanctions list".to_string(),
+						}))
+						.ok();
+					return Ok(());
+				}
+				// Check every output recipient.
+				for output in &order_data.outputs {
+					// recipient is bytes32; the Ethereum address occupies the last 20 bytes.
+					let addr_bytes = &output.recipient[12..];
+					let hex_str: String =
+						addr_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+					let recipient_addr = format!("0x{}", hex_str);
+					if self.ofac_addresses.contains(&recipient_addr) {
+						tracing::warn!(
+							intent_id = %intent.id,
+							address = %recipient_addr,
+							"Intent rejected: recipient is on OFAC sanctions list"
+						);
+						self.event_bus
+							.publish(SolverEvent::Discovery(DiscoveryEvent::IntentRejected {
+								intent_id: intent.id,
+								reason: "Recipient address is on OFAC sanctions list".to_string(),
+							}))
+							.ok();
+						return Ok(());
+					}
+				}
+			}
 		}
 
 		// Store intent immediately to prevent race conditions with duplicate discovery
