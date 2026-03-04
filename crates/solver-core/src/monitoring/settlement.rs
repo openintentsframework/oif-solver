@@ -160,7 +160,11 @@ mod tests {
 		utils::tests::builders::OrderBuilder, FillProof, NetworksConfig, Order, SettlementEvent,
 		SolverEvent,
 	};
-	use std::{collections::HashMap, sync::Arc, time::{Duration, Instant}};
+	use std::{
+		collections::HashMap,
+		sync::Arc,
+		time::{Duration, Instant},
+	};
 	use tokio::sync::broadcast;
 
 	fn create_test_order() -> Order {

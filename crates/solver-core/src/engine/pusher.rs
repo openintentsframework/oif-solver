@@ -55,7 +55,10 @@ sol! {
 }
 
 /// Read the newest block number stored in an L2 buffer contract.
-async fn read_buffer_newest(provider: &DynProvider, buffer_addr: &solver_types::Address) -> Result<u64, String> {
+async fn read_buffer_newest(
+	provider: &DynProvider,
+	buffer_addr: &solver_types::Address,
+) -> Result<u64, String> {
 	let call_data = IBuffer::newestBlockNumberCall {};
 	let request = alloy_rpc_types::eth::transaction::TransactionRequest {
 		to: Some(alloy_primitives::TxKind::Call(
@@ -88,12 +91,13 @@ fn derive_msg_value(l2_params: &PusherL2Params) -> U256 {
 	match l2_params {
 		PusherL2Params::OpStack { .. } => U256::ZERO,
 		PusherL2Params::Linea { fee } => U256::from(*fee),
-		PusherL2Params::Arbitrum { gas_price_bid, gas_limit, submission_cost, .. } => {
-			U256::from(*gas_limit) * U256::from(*gas_price_bid) + U256::from(*submission_cost)
-		},
-		PusherL2Params::Raw { value_wei, .. } => {
-			value_wei.map(U256::from).unwrap_or(U256::ZERO)
-		},
+		PusherL2Params::Arbitrum {
+			gas_price_bid,
+			gas_limit,
+			submission_cost,
+			..
+		} => U256::from(*gas_limit) * U256::from(*gas_price_bid) + U256::from(*submission_cost),
+		PusherL2Params::Raw { value_wei, .. } => value_wei.map(U256::from).unwrap_or(U256::ZERO),
 	}
 }
 
@@ -207,25 +211,29 @@ pub async fn push_if_needed(
 
 	// Step 2: read buffer newest — before reserving cooldown so transient errors
 	// don't consume the cooldown slot.
-	let providers =
-		match create_providers_for_chains(&[direction.l1_chain_id, direction.l2_chain_id], networks)
-		{
-			Ok(p) => p,
-			Err(e) => {
-				tracing::error!(error = %e, "Failed to create providers for push check");
-				return;
-			},
-		};
+	let providers = match create_providers_for_chains(
+		&[direction.l1_chain_id, direction.l2_chain_id],
+		networks,
+	) {
+		Ok(p) => p,
+		Err(e) => {
+			tracing::error!(error = %e, "Failed to create providers for push check");
+			return;
+		},
+	};
 
-	let buffer_newest =
-		match read_buffer_newest(&providers[&direction.l2_chain_id], &direction.buffer_address).await
-		{
-			Ok(n) => n,
-			Err(e) => {
-				tracing::warn!(error = %e, label = %direction.label, "Failed to read buffer newest");
-				return;
-			},
-		};
+	let buffer_newest = match read_buffer_newest(
+		&providers[&direction.l2_chain_id],
+		&direction.buffer_address,
+	)
+	.await
+	{
+		Ok(n) => n,
+		Err(e) => {
+			tracing::warn!(error = %e, label = %direction.label, "Failed to read buffer newest");
+			return;
+		},
+	};
 
 	// Step 3: buffer already covers the required block — nothing to do.
 	if buffer_newest >= required_block {
@@ -287,20 +295,28 @@ mod tests {
 
 	#[test]
 	fn test_derive_msg_value_op_stack() {
-		assert_eq!(derive_msg_value(&PusherL2Params::OpStack { gas_limit: 200000 }), U256::ZERO);
+		assert_eq!(
+			derive_msg_value(&PusherL2Params::OpStack { gas_limit: 200000 }),
+			U256::ZERO
+		);
 	}
 
 	#[test]
 	fn test_derive_msg_value_linea() {
 		assert_eq!(
-			derive_msg_value(&PusherL2Params::Linea { fee: 1_000_000_000_000_000 }),
+			derive_msg_value(&PusherL2Params::Linea {
+				fee: 1_000_000_000_000_000
+			}),
 			U256::from(1_000_000_000_000_000u64)
 		);
 	}
 
 	#[test]
 	fn test_derive_msg_value_linea_zero() {
-		assert_eq!(derive_msg_value(&PusherL2Params::Linea { fee: 0 }), U256::ZERO);
+		assert_eq!(
+			derive_msg_value(&PusherL2Params::Linea { fee: 0 }),
+			U256::ZERO
+		);
 	}
 
 	#[test]
@@ -327,7 +343,10 @@ mod tests {
 
 	#[test]
 	fn test_derive_msg_value_raw_no_value() {
-		let p = PusherL2Params::Raw { data: "0x".to_string(), value_wei: None };
+		let p = PusherL2Params::Raw {
+			data: "0x".to_string(),
+			value_wei: None,
+		};
 		assert_eq!(derive_msg_value(&p), U256::ZERO);
 	}
 }

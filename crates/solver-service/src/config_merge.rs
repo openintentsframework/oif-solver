@@ -1774,7 +1774,7 @@ fn build_broadcaster_toml_from_operator(
 				if let Some(v) = d.batch_size {
 					t.insert("batch_size".to_string(), toml::Value::Integer(v as i64));
 				}
-					toml::Value::Table(t)
+				toml::Value::Table(t)
 			})
 			.collect();
 		table.insert("pusher_directions".to_string(), toml::Value::Array(dirs));

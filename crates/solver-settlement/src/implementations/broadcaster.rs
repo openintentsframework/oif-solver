@@ -1277,14 +1277,17 @@ fn parse_pusher_directions(
 	// Infer default chain IDs only when there is exactly one unambiguous route.
 	// Multiple source chains or multiple destinations make the mapping ambiguous,
 	// so we require explicit values in those cases.
-	let (default_l1_chain_id, default_l2_chain_id) =
-		if oracle_config.routes.len() == 1 {
-			let (&l1, dests) = oracle_config.routes.iter().next().unwrap();
-			let l2 = if dests.len() == 1 { Some(dests[0]) } else { None };
-			(Some(l1), l2)
+	let (default_l1_chain_id, default_l2_chain_id) = if oracle_config.routes.len() == 1 {
+		let (&l1, dests) = oracle_config.routes.iter().next().unwrap();
+		let l2 = if dests.len() == 1 {
+			Some(dests[0])
 		} else {
-			(None, None)
+			None
 		};
+		(Some(l1), l2)
+	} else {
+		(None, None)
+	};
 
 	let directions: Vec<PusherDirection> = directions_array
 		.iter()
@@ -1363,23 +1366,19 @@ fn parse_pusher_directions(
 						"pusher_directions[{i}].push_cooldown_seconds is required"
 					))
 				})?;
-			let push_cooldown_seconds =
-				parse_nonneg_u64(cooldown_raw, "push_cooldown_seconds", i)?;
+			let push_cooldown_seconds = parse_nonneg_u64(cooldown_raw, "push_cooldown_seconds", i)?;
 
 			// ── l2_params (typed, preferred) / l2_transaction_data (legacy) ──
 			let l2_params = if let Some(l2_params_val) = entry.get("l2_params") {
 				// New typed path.
-				let params: PusherL2Params =
-					l2_params_val.clone().try_into().map_err(|e| {
-						SettlementError::ValidationFailed(format!(
-							"pusher_directions[{i}].l2_params invalid: {e}"
-						))
-					})?;
+				let params: PusherL2Params = l2_params_val.clone().try_into().map_err(|e| {
+					SettlementError::ValidationFailed(format!(
+						"pusher_directions[{i}].l2_params invalid: {e}"
+					))
+				})?;
 				validate_l2_params_chain_match(&params, l2_chain_id, i)?;
 				params
-			} else if let Some(hex_str) = entry
-				.get("l2_transaction_data")
-				.and_then(|v| v.as_str())
+			} else if let Some(hex_str) = entry.get("l2_transaction_data").and_then(|v| v.as_str())
 			{
 				// Legacy hex fallback — warn and infer typed variant from chain ID.
 				tracing::warn!(
@@ -1683,7 +1682,10 @@ mod tests {
 		);
 		l2p.insert("gas_price_bid".into(), toml::Value::Integer(100_000_000));
 		l2p.insert("gas_limit".into(), toml::Value::Integer(16_000_000));
-		l2p.insert("submission_cost".into(), toml::Value::Integer(1_000_000_000_000_000i64));
+		l2p.insert(
+			"submission_cost".into(),
+			toml::Value::Integer(1_000_000_000_000_000i64),
+		);
 		l2p.insert("is_erc20_inbox".into(), toml::Value::Boolean(false));
 		toml::Value::Table(l2p)
 	}
@@ -1745,7 +1747,8 @@ mod tests {
 		// l2_params should be OpStack (inferred via legacy path for OP chain 84532)
 		assert!(
 			matches!(d.l2_params, PusherL2Params::OpStack { .. }),
-			"expected OpStack variant, got {:?}", d.l2_params
+			"expected OpStack variant, got {:?}",
+			d.l2_params
 		);
 	}
 
@@ -1803,7 +1806,10 @@ mod tests {
 		let result = parse_pusher_directions(&config, &empty_oracle_config()).unwrap();
 		assert_eq!(result.len(), 1);
 		assert_eq!(result[0].l2_chain_id, 421614);
-		assert!(matches!(result[0].l2_params, PusherL2Params::Arbitrum { .. }));
+		assert!(matches!(
+			result[0].l2_params,
+			PusherL2Params::Arbitrum { .. }
+		));
 	}
 
 	// ── multiple directions ──────────────────────────────────────────────────
@@ -1847,7 +1853,10 @@ mod tests {
 		let err = parse_pusher_directions(&config, &oracle_config).unwrap_err();
 		let msg = err.to_string();
 		assert!(msg.contains("l2_chain_id"), "unexpected msg: {msg}");
-		assert!(msg.contains("multiple destinations"), "unexpected msg: {msg}");
+		assert!(
+			msg.contains("multiple destinations"),
+			"unexpected msg: {msg}"
+		);
 	}
 
 	// ── required-field missing errors ────────────────────────────────────────
@@ -1900,7 +1909,10 @@ mod tests {
 
 		let err = parse_pusher_directions(&config, &oracle_config_eth_to_op()).unwrap_err();
 		let msg = err.to_string();
-		assert!(msg.contains("push_cooldown_seconds"), "unexpected msg: {msg}");
+		assert!(
+			msg.contains("push_cooldown_seconds"),
+			"unexpected msg: {msg}"
+		);
 	}
 
 	#[test]
@@ -1942,7 +1954,10 @@ mod tests {
 		);
 		t.insert("push_cooldown_seconds".into(), toml::Value::Integer(3600));
 		let mut l2p = toml::map::Map::new();
-		l2p.insert("type".into(), toml::Value::String("unknown_chain_type".into()));
+		l2p.insert(
+			"type".into(),
+			toml::Value::String("unknown_chain_type".into()),
+		);
 		t.insert("l2_params".into(), toml::Value::Table(l2p));
 		let config = config_with_directions(vec![toml::Value::Table(t)]);
 
@@ -1964,19 +1979,28 @@ mod tests {
 			toml::Value::String("0x2222222222222222222222222222222222222222".into()),
 		);
 		t.insert("push_cooldown_seconds".into(), toml::Value::Integer(3600));
-		t.insert("l2_transaction_data".into(), toml::Value::String("0xnothex!".into()));
+		t.insert(
+			"l2_transaction_data".into(),
+			toml::Value::String("0xnothex!".into()),
+		);
 		let config = config_with_directions(vec![toml::Value::Table(t)]);
 
 		let err = parse_pusher_directions(&config, &oracle_config_eth_to_op()).unwrap_err();
 		let msg = err.to_string();
 		assert!(msg.contains("l2_transaction_data"), "unexpected msg: {msg}");
-		assert!(msg.contains("invalid hex"), "expected 'invalid hex' in: {msg}");
+		assert!(
+			msg.contains("invalid hex"),
+			"expected 'invalid hex' in: {msg}"
+		);
 	}
 
 	#[test]
 	fn test_invalid_pusher_address_format() {
 		let mut t = toml::map::Map::new();
-		t.insert("pusher_address".into(), toml::Value::String("not-an-address".into()));
+		t.insert(
+			"pusher_address".into(),
+			toml::Value::String("not-an-address".into()),
+		);
 		t.insert(
 			"buffer_address".into(),
 			toml::Value::String("0x2222222222222222222222222222222222222222".into()),
@@ -2074,14 +2098,20 @@ mod tests {
 		let mut entry = valid_entry_no_chains();
 		if let toml::Value::Table(ref mut t) = entry {
 			t.remove("l2_params");
-			t.insert("l2_transaction_data".into(), toml::Value::String("deadbeef".into()));
+			t.insert(
+				"l2_transaction_data".into(),
+				toml::Value::String("deadbeef".into()),
+			);
 		}
 		// deadbeef → 4 bytes, chain 84532 → OpStack, gas_limit from low 4 bytes of 32-byte word.
 		// 4 bytes is shorter than 32 → gas_limit defaults to 0.
 		let config = config_with_directions(vec![entry]);
 		let result = parse_pusher_directions(&config, &oracle_config_eth_to_op()).unwrap();
 		assert_eq!(result.len(), 1);
-		assert_eq!(result[0].l2_params, PusherL2Params::OpStack { gas_limit: 0 });
+		assert_eq!(
+			result[0].l2_params,
+			PusherL2Params::OpStack { gas_limit: 0 }
+		);
 	}
 
 	// ── chain-id inference failures ──────────────────────────────────────────
@@ -2106,5 +2136,4 @@ mod tests {
 		let msg = err.to_string();
 		assert!(msg.contains("l2_chain_id"), "unexpected msg: {msg}");
 	}
-
 }
