@@ -854,7 +854,7 @@ sequenceDiagram
 
 The admin API enables authorized wallet addresses to perform administrative operations using EIP-712 signed messages. This provides secure, decentralized admin access without shared secrets.
 
-**Setup:** Configure admin addresses in your bootstrap config or TOML config:
+**Setup:** Configure admin addresses in your bootstrap config, TOML config, or seed overrides JSON:
 
 ```json
 {
@@ -1101,8 +1101,8 @@ git clone https://github.com/openintentsframework/oif-contracts.git
 cd oif-contracts && forge build && cd ..
 
 # 1. Initialize configuration and load it
-cargo run -p solver-demo -- init new config/demo.toml
-cargo run -p solver-demo -- init load config/demo.toml --local
+cargo run -p solver-demo -- init new config/demo.json
+cargo run -p solver-demo -- init load config/demo.json --local
 
 # 2. Start local environment (Anvil chains)
 cargo run -p solver-demo -- env start
@@ -1295,9 +1295,10 @@ The demo tool generates files in the `.oif-demo/requests/` directory following a
 
 The demo tool provides a complete workflow for setting up a test environment:
 
-1. **Initialize Configuration** (`init new` / `init load`):
+1. **Initialize Configuration** (`init new` / `init load` / `init load-storage`):
 
    - Creates or loads solver configuration
+   - Can load runtime config directly from storage backend (`init load-storage`)
    - Sets up network definitions and RPC endpoints
    - Configures account keys and signing
    - Stores session data in `.oif-demo/` directory

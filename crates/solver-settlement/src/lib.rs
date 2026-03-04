@@ -242,7 +242,7 @@ pub trait SettlementInterface: Send + Sync {
 /// Storage is required for Hyperlane implementation to persist message tracker state
 /// across restarts. Other implementations may not require storage.
 pub type SettlementFactory = fn(
-	&toml::Value,
+	&serde_json::Value,
 	&NetworksConfig,
 	Arc<solver_storage::StorageService>,
 ) -> Result<Box<dyn SettlementInterface>, SettlementError>;
