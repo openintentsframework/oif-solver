@@ -184,7 +184,7 @@ Optional fields with defaults — only set these if you need to override:
 After starting the solver, confirm the pusher task is working:
 
 **Check buffer lag in logs:**
-```
+```text
 buffer_lag_blocks direction=eth-to-arb-sepolia lag=45
 ```
 

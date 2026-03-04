@@ -36,9 +36,9 @@ use solver_types::{
 	NetworkConfig, NetworkOverride, NetworksConfig, OperatorAccountConfig, OperatorAdminConfig,
 	OperatorBroadcasterConfig, OperatorConfig, OperatorDirectConfig, OperatorGasConfig,
 	OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig,
-	OperatorOracleSelectionStrategy, OperatorPricingConfig, OperatorRpcEndpoint,
-	OperatorPusherDirectionConfig, OperatorSettlementConfig, OperatorSettlementType,
-	OperatorSolverConfig, OperatorToken, OperatorWithdrawalsConfig, PusherL2Params, SeedOverrides,
+	OperatorOracleSelectionStrategy, OperatorPricingConfig, OperatorPusherDirectionConfig,
+	OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSettlementType, OperatorSolverConfig,
+	OperatorToken, OperatorWithdrawalsConfig, PusherL2Params, SeedOverrides,
 	SettlementTypeOverride, TokenConfig,
 };
 use std::collections::{HashMap, HashSet};
@@ -2789,12 +2789,9 @@ fn extract_pusher_directions(
 		.filter_map(|entry| {
 			let t = entry.as_table()?;
 
-			let pusher_address =
-				parse_hex_addr(t.get("pusher_address")?.as_str()?)?;
-			let buffer_address =
-				parse_hex_addr(t.get("buffer_address")?.as_str()?)?;
-			let push_cooldown_seconds =
-				t.get("push_cooldown_seconds")?.as_integer()?.max(0) as u64;
+			let pusher_address = parse_hex_addr(t.get("pusher_address")?.as_str()?)?;
+			let buffer_address = parse_hex_addr(t.get("buffer_address")?.as_str()?)?;
+			let push_cooldown_seconds = t.get("push_cooldown_seconds")?.as_integer()?.max(0) as u64;
 
 			let l2_params = t
 				.get("l2_params")
@@ -2804,14 +2801,22 @@ fn extract_pusher_directions(
 				.and_then(|v| v.as_str())
 				.map(|s| s.to_string());
 
-			let label =
-				t.get("label").and_then(|v| v.as_str()).map(|s| s.to_string());
-			let l1_chain_id =
-				t.get("l1_chain_id").and_then(|v| v.as_integer()).map(|i| i as u64);
-			let l2_chain_id =
-				t.get("l2_chain_id").and_then(|v| v.as_integer()).map(|i| i as u64);
-			let batch_size =
-				t.get("batch_size").and_then(|v| v.as_integer()).map(|i| i as u64);
+			let label = t
+				.get("label")
+				.and_then(|v| v.as_str())
+				.map(|s| s.to_string());
+			let l1_chain_id = t
+				.get("l1_chain_id")
+				.and_then(|v| v.as_integer())
+				.map(|i| i as u64);
+			let l2_chain_id = t
+				.get("l2_chain_id")
+				.and_then(|v| v.as_integer())
+				.map(|i| i as u64);
+			let batch_size = t
+				.get("batch_size")
+				.and_then(|v| v.as_integer())
+				.map(|i| i as u64);
 
 			Some(OperatorPusherDirectionConfig {
 				pusher_address,
@@ -5697,9 +5702,8 @@ gas_limit = 200000
 			Some(PusherL2Params::OpStack { gas_limit: 200000 })
 		);
 		// Verify addresses were parsed correctly
-		let expected_pusher = alloy_primitives::address!(
-			"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-		);
+		let expected_pusher =
+			alloy_primitives::address!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
 		assert_eq!(d.pusher_address, expected_pusher);
 	}
 

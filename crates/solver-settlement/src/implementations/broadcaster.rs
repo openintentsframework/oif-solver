@@ -836,11 +836,17 @@ impl ConfigSchema for BroadcasterSettlementSchema {
 				),
 				Field::new(
 					"intent_safety_buffer_seconds",
-					FieldType::Integer { min: Some(0), max: Some(3600) },
+					FieldType::Integer {
+						min: Some(0),
+						max: Some(3600),
+					},
 				),
 				Field::new(
 					"intent_min_expiry_seconds",
-					FieldType::Integer { min: Some(0), max: Some(86400) },
+					FieldType::Integer {
+						min: Some(0),
+						max: Some(86400),
+					},
 				),
 				// Sub-field validation is intentionally skipped here; it is performed
 				// inside parse_pusher_directions() after the schema check passes.
@@ -2165,8 +2171,7 @@ mod tests {
 		let hex_str = format!("0x{}", hex::encode(&data));
 		let result = infer_l2_params_from_hex(&hex_str, 421614, 0).unwrap();
 
-		let expected_inbox =
-			alloy_primitives::Address::from_slice(&inbox_bytes);
+		let expected_inbox = alloy_primitives::Address::from_slice(&inbox_bytes);
 		assert_eq!(
 			result,
 			PusherL2Params::Arbitrum {

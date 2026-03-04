@@ -339,12 +339,15 @@ mod tests {
 		let direction = make_direction(PusherL2Params::OpStack { gas_limit });
 		let tx = build_push_tx(&direction, 50).expect("should build");
 		assert_eq!(tx.value, U256::ZERO);
-		let decoded =
-			IPusher::pushHashesCall::abi_decode(&tx.data).expect("abi_decode failed");
+		let decoded = IPusher::pushHashesCall::abi_decode(&tx.data).expect("abi_decode failed");
 		let l2_data = decoded.l2TransactionData.as_ref();
 		assert_eq!(l2_data.len(), 32);
 		assert_eq!(&l2_data[0..28], &[0u8; 28], "high bytes must be zero");
-		assert_eq!(&l2_data[28..32], &gas_limit.to_be_bytes(), "gas_limit bytes mismatch");
+		assert_eq!(
+			&l2_data[28..32],
+			&gas_limit.to_be_bytes(),
+			"gas_limit bytes mismatch"
+		);
 		assert_eq!(decoded.firstBlockNumber, U256::from(50u64));
 		assert_eq!(decoded.batchSize, U256::from(256u64));
 	}
@@ -358,9 +361,11 @@ mod tests {
 		});
 		let tx = build_push_tx(&direction, 1).expect("should build");
 		assert_eq!(tx.value, U256::from(12345u64));
-		let decoded =
-			IPusher::pushHashesCall::abi_decode(&tx.data).expect("abi_decode failed");
-		assert_eq!(decoded.l2TransactionData.as_ref(), &[0xde, 0xad, 0xbe, 0xef]);
+		let decoded = IPusher::pushHashesCall::abi_decode(&tx.data).expect("abi_decode failed");
+		assert_eq!(
+			decoded.l2TransactionData.as_ref(),
+			&[0xde, 0xad, 0xbe, 0xef]
+		);
 	}
 
 	#[test]
@@ -369,7 +374,10 @@ mod tests {
 			data: "0xZZZZ".to_string(),
 			value_wei: None,
 		});
-		assert!(build_push_tx(&direction, 1).is_none(), "invalid hex must return None");
+		assert!(
+			build_push_tx(&direction, 1).is_none(),
+			"invalid hex must return None"
+		);
 	}
 
 	#[test]
@@ -451,8 +459,7 @@ mod tests {
 		assert_eq!(tx.value, U256::from(fee));
 
 		// Decode the call data to inspect l2TransactionData
-		let decoded =
-			IPusher::pushHashesCall::abi_decode(&tx.data).expect("decode failed");
+		let decoded = IPusher::pushHashesCall::abi_decode(&tx.data).expect("decode failed");
 		let l2_data = decoded.l2TransactionData.as_ref();
 
 		// Must be exactly 32 bytes (ABI uint256)
