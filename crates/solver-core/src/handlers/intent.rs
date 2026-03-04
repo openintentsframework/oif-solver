@@ -284,12 +284,19 @@ fn estimate_broadcaster_expiry_buffer_seconds(
 fn estimate_required_expiry_window_seconds(
 	order_data: &Eip7683OrderData,
 	config: &Config,
+	pinned_settlement_name: Option<&str>,
 ) -> Option<(u64, String)> {
 	let input_oracle = solver_types::utils::parse_address(&order_data.input_oracle).ok()?;
 	let poll_interval = config.settlement.settlement_poll_interval_seconds;
 	let mut matches: Vec<(u64, String)> = Vec::new();
 
 	for (implementation_name, implementation_cfg) in &config.settlement.implementations {
+		if let Some(pinned) = pinned_settlement_name {
+			if implementation_name != pinned {
+				continue;
+			}
+		}
+
 		let Some(cfg_table) = implementation_cfg.as_table() else {
 			continue;
 		};
@@ -494,8 +501,11 @@ impl IntentHandler {
 					let now = current_timestamp() as u32;
 					let expires_remaining = order_data.expires.saturating_sub(now) as u64;
 					if let Some((required_window, breakdown)) =
-						estimate_required_expiry_window_seconds(&order_data, &config)
-					{
+						estimate_required_expiry_window_seconds(
+							&order_data,
+							&config,
+							order.settlement_name.as_deref(),
+						) {
 						if expires_remaining < required_window {
 							let reason = format!(
 								"Insufficient settlement window: expires_in={expires_remaining}s required={required_window}s ({breakdown})"
@@ -877,6 +887,166 @@ mod tests {
 			.implementations
 			.insert("hyperlane".to_string(), toml::Value::Table(hyperlane));
 		Arc::new(RwLock::new(config))
+	}
+
+	fn create_test_config_with_broadcaster_and_hyperlane_min_window(
+		hyperlane_min_window_seconds: u64,
+	) -> Config {
+		let mut config = ConfigBuilder::new().build();
+
+		let mut broadcaster = toml::map::Map::new();
+		broadcaster.insert(
+			"oracles".to_string(),
+			toml::Value::Table({
+				let mut oracles = toml::map::Map::new();
+				oracles.insert(
+					"input".to_string(),
+					toml::Value::Table({
+						let mut input = toml::map::Map::new();
+						input.insert(
+							"1".to_string(),
+							toml::Value::Array(vec![toml::Value::String(
+								"0x0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A".to_string(),
+							)]),
+						);
+						input
+					}),
+				);
+				oracles.insert(
+					"output".to_string(),
+					toml::Value::Table({
+						let mut output = toml::map::Map::new();
+						output.insert(
+							"137".to_string(),
+							toml::Value::Array(vec![toml::Value::String(
+								"0x1111111111111111111111111111111111111111".to_string(),
+							)]),
+						);
+						output
+					}),
+				);
+				oracles
+			}),
+		);
+		broadcaster.insert(
+			"routes".to_string(),
+			toml::Value::Table({
+				let mut routes = toml::map::Map::new();
+				routes.insert(
+					"1".to_string(),
+					toml::Value::Array(vec![toml::Value::Integer(137)]),
+				);
+				routes
+			}),
+		);
+		broadcaster.insert(
+			"proof_wait_time_seconds".to_string(),
+			toml::Value::Integer(30),
+		);
+		broadcaster.insert(
+			"storage_proof_timeout_seconds".to_string(),
+			toml::Value::Integer(30),
+		);
+		broadcaster.insert(
+			"default_finality_blocks".to_string(),
+			toml::Value::Integer(20),
+		);
+
+		let mut hyperlane = toml::map::Map::new();
+		hyperlane.insert(
+			"oracles".to_string(),
+			toml::Value::Table({
+				let mut oracles = toml::map::Map::new();
+				oracles.insert(
+					"input".to_string(),
+					toml::Value::Table({
+						let mut input = toml::map::Map::new();
+						input.insert(
+							"1".to_string(),
+							toml::Value::Array(vec![toml::Value::String(
+								"0x0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A".to_string(),
+							)]),
+						);
+						input
+					}),
+				);
+				oracles.insert(
+					"output".to_string(),
+					toml::Value::Table({
+						let mut output = toml::map::Map::new();
+						output.insert(
+							"137".to_string(),
+							toml::Value::Array(vec![toml::Value::String(
+								"0x1111111111111111111111111111111111111111".to_string(),
+							)]),
+						);
+						output
+					}),
+				);
+				oracles
+			}),
+		);
+		hyperlane.insert(
+			"routes".to_string(),
+			toml::Value::Table({
+				let mut routes = toml::map::Map::new();
+				routes.insert(
+					"1".to_string(),
+					toml::Value::Array(vec![toml::Value::Integer(137)]),
+				);
+				routes
+			}),
+		);
+		hyperlane.insert(
+			"intent_min_expiry_seconds".to_string(),
+			toml::Value::Integer(hyperlane_min_window_seconds as i64),
+		);
+
+		config
+			.settlement
+			.implementations
+			.insert("broadcaster".to_string(), toml::Value::Table(broadcaster));
+		config
+			.settlement
+			.implementations
+			.insert("hyperlane".to_string(), toml::Value::Table(hyperlane));
+
+		config
+	}
+
+	#[test]
+	fn test_estimate_required_expiry_window_respects_pinned_settlement() {
+		let config = create_test_config_with_broadcaster_and_hyperlane_min_window(500);
+
+		let order_data = Eip7683OrderDataBuilder::new().build();
+
+		let pinned_broadcaster =
+			estimate_required_expiry_window_seconds(&order_data, &config, Some("broadcaster"))
+				.expect("expected broadcaster estimate");
+		let unpinned = estimate_required_expiry_window_seconds(&order_data, &config, None)
+			.expect("expected unpinned estimate");
+
+		assert!(
+			pinned_broadcaster.1.contains("broadcaster"),
+			"expected broadcaster breakdown when pinned, got {}",
+			pinned_broadcaster.1
+		);
+		assert!(
+			!pinned_broadcaster.1.contains("hyperlane"),
+			"pinned estimate should not use hyperlane window: {}",
+			pinned_broadcaster.1
+		);
+		assert!(
+			unpinned.0 >= 500,
+			"unpinned estimate should include hyperlane explicit min window, got {}",
+			unpinned.0
+		);
+		assert!(
+			pinned_broadcaster.0 < unpinned.0,
+			"pinned broadcaster estimate should be below unpinned max window: pinned={}, unpinned={}",
+			pinned_broadcaster.0,
+			unpinned.0
+		);
 	}
 
 	fn create_mock_cost_profit_service() -> Arc<CostProfitService> {

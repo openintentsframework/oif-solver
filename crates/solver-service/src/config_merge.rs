@@ -2289,12 +2289,14 @@ fn extract_hyperlane_config(
 	let default_gas_limit = hyperlane_toml
 		.and_then(|h| h.get("default_gas_limit"))
 		.and_then(|v| v.as_integer())
-		.unwrap_or(300_000) as u64;
+		.unwrap_or(300_000)
+		.max(0) as u64;
 
 	let message_timeout_seconds = hyperlane_toml
 		.and_then(|h| h.get("message_timeout_seconds"))
 		.and_then(|v| v.as_integer())
-		.unwrap_or(600) as u64;
+		.unwrap_or(600)
+		.max(0) as u64;
 
 	let finalization_required = hyperlane_toml
 		.and_then(|h| h.get("finalization_required"))
@@ -2388,7 +2390,7 @@ fn extract_hyperlane_config(
 			{
 				let dests: Vec<u64> = dests_array
 					.iter()
-					.filter_map(|v| v.as_integer().map(|i| i as u64))
+					.filter_map(|v| v.as_integer().map(|i| i.max(0) as u64))
 					.collect();
 				routes.insert(chain_id, dests);
 			}
@@ -2440,7 +2442,8 @@ fn extract_direct_config(settlement: &SettlementConfig, chain_ids: &[u64]) -> Op
 	let dispute_period_seconds = direct_toml
 		.and_then(|d| d.get("dispute_period_seconds"))
 		.and_then(|v| v.as_integer())
-		.unwrap_or(300) as u64;
+		.unwrap_or(300)
+		.max(0) as u64;
 
 	let oracle_selection_strategy = direct_toml
 		.and_then(|d| d.get("oracle_selection_strategy"))
@@ -2506,7 +2509,7 @@ fn extract_direct_config(settlement: &SettlementConfig, chain_ids: &[u64]) -> Op
 			{
 				let dests: Vec<u64> = dests_array
 					.iter()
-					.filter_map(|v| v.as_integer().map(|i| i as u64))
+					.filter_map(|v| v.as_integer().map(|i| i.max(0) as u64))
 					.collect();
 				routes.insert(chain_id, dests);
 			}
@@ -2649,7 +2652,7 @@ fn extract_broadcaster_config(
 			{
 				let dests: Vec<u64> = dests_array
 					.iter()
-					.filter_map(|v| v.as_integer().map(|i| i as u64))
+					.filter_map(|v| v.as_integer().map(|i| i.max(0) as u64))
 					.collect();
 				routes.insert(chain_id, dests);
 			}
@@ -2721,7 +2724,7 @@ fn extract_broadcaster_config(
 			if let (Ok(chain_id), Some(blocks)) =
 				(chain_id_str.parse::<u64>(), blocks_value.as_integer())
 			{
-				finality_blocks.insert(chain_id, blocks as u64);
+				finality_blocks.insert(chain_id, blocks.max(0) as u64);
 			}
 		}
 	}
@@ -2734,7 +2737,7 @@ fn extract_broadcaster_config(
 			if let (Ok(chain_id), Some(seconds)) =
 				(chain_id_str.parse::<u64>(), seconds_value.as_integer())
 			{
-				chain_block_time_seconds.insert(chain_id, seconds as u64);
+				chain_block_time_seconds.insert(chain_id, seconds.max(0) as u64);
 			}
 		}
 	}
@@ -2808,15 +2811,15 @@ fn extract_pusher_directions(
 			let l1_chain_id = t
 				.get("l1_chain_id")
 				.and_then(|v| v.as_integer())
-				.map(|i| i as u64);
+				.map(|i| i.max(0) as u64);
 			let l2_chain_id = t
 				.get("l2_chain_id")
 				.and_then(|v| v.as_integer())
-				.map(|i| i as u64);
+				.map(|i| i.max(0) as u64);
 			let batch_size = t
 				.get("batch_size")
 				.and_then(|v| v.as_integer())
-				.map(|i| i as u64);
+				.map(|i| i.max(0) as u64);
 
 			Some(OperatorPusherDirectionConfig {
 				pusher_address,

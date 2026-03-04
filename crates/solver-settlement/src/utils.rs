@@ -8,7 +8,7 @@ use alloy_primitives::{FixedBytes, B256, U256};
 use alloy_provider::{DynProvider, Provider};
 use alloy_sol_types::{sol, SolCall};
 use serde::{de::DeserializeOwned, Serialize};
-use solver_storage::StorageService;
+use solver_storage::{StorageError, StorageService};
 use solver_types::{
 	create_http_provider, utils::parse_address, Address, NetworksConfig, ProviderError, StorageKey,
 };
@@ -344,11 +344,11 @@ where
 		format!("{}:{order_id}", self.namespace)
 	}
 
-	pub async fn load(&self, order_id: &str) -> Option<S> {
+	pub async fn load(&self, order_id: &str) -> Result<Option<S>, SettlementError> {
 		{
 			let cache = self.cache.read().await;
 			if let Some(state) = cache.get(order_id) {
-				return Some(state.clone());
+				return Ok(Some(state.clone()));
 			}
 		}
 
@@ -361,17 +361,13 @@ where
 			Ok(state) => {
 				let mut cache = self.cache.write().await;
 				cache.insert(order_id.to_string(), state.clone());
-				Some(state)
+				Ok(Some(state))
 			},
-			Err(e) => {
-				tracing::warn!(
-					namespace = %self.namespace,
-					key = %key,
-					error = %e,
-					"Storage retrieval failed; treating as missing entry"
-				);
-				None
-			},
+			Err(StorageError::NotFound(_)) => Ok(None),
+			Err(e) => Err(SettlementError::ValidationFailed(format!(
+				"Failed to load settlement message state for namespace '{}' key '{}': {e}",
+				self.namespace, key
+			))),
 		}
 	}
 

@@ -375,7 +375,10 @@ impl MessageTracker {
 	}
 
 	/// Load message state for a specific order
-	async fn load_message(&self, order_id: &str) -> Option<HyperlaneMessageState> {
+	async fn load_message(
+		&self,
+		order_id: &str,
+	) -> Result<Option<HyperlaneMessageState>, SettlementError> {
 		self.tracker.load(order_id).await
 	}
 
@@ -427,6 +430,11 @@ impl MessageTracker {
 		let mut state = self
 			.load_message(&order_id)
 			.await
+			.map_err(|e| {
+				SettlementError::ValidationFailed(format!(
+					"Failed to load hyperlane submission state for order {order_id}: {e}"
+				))
+			})?
 			.unwrap_or(HyperlaneMessageState {
 				submitted: None,
 				delivered: None,
@@ -456,7 +464,7 @@ impl MessageTracker {
 		payload_hash: [u8; 32],
 	) -> Result<(), SettlementError> {
 		// Load existing state
-		let mut state = self.load_message(&order_id).await.ok_or_else(|| {
+		let mut state = self.load_message(&order_id).await?.ok_or_else(|| {
 			SettlementError::ValidationFailed("Message not found in tracker".to_string())
 		})?;
 
@@ -479,7 +487,7 @@ impl MessageTracker {
 	}
 
 	pub async fn get_message_id(&self, order_id: &str) -> Option<[u8; 32]> {
-		let state = self.load_message(order_id).await?;
+		let state = self.load_message(order_id).await.ok()??;
 		state.submitted.map(|m| m.message_id)
 	}
 }
@@ -562,14 +570,19 @@ impl HyperlaneSettlement {
 		let order_id = &order.id;
 
 		// Load message state
-		let mut state =
-			self.message_tracker
-				.load_message(order_id)
-				.await
-				.unwrap_or(HyperlaneMessageState {
-					submitted: None,
-					delivered: None,
-				});
+		let mut state = self
+			.message_tracker
+			.load_message(order_id)
+			.await
+			.map_err(|e| {
+				SettlementError::ValidationFailed(format!(
+					"Failed to load hyperlane message state for order {order_id}: {e}"
+				))
+			})?
+			.unwrap_or(HyperlaneMessageState {
+				submitted: None,
+				delivered: None,
+			});
 
 		// Already delivered?
 		if state.delivered.is_some() {

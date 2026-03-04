@@ -338,7 +338,10 @@ impl BroadcasterMessageTracker {
 		}
 	}
 
-	async fn load(&self, order_id: &str) -> Option<BroadcasterMessageState> {
+	async fn load(
+		&self,
+		order_id: &str,
+	) -> Result<Option<BroadcasterMessageState>, SettlementError> {
 		self.tracker.load(order_id).await
 	}
 
@@ -363,6 +366,11 @@ impl BroadcasterMessageTracker {
 		let mut state = self
 			.load(order_id)
 			.await
+			.map_err(|e| {
+				SettlementError::ValidationFailed(format!(
+					"Failed to load broadcaster submission state for order {order_id}: {e}"
+				))
+			})?
 			.unwrap_or(BroadcasterMessageState {
 				submission: None,
 				proof: None,
@@ -381,6 +389,11 @@ impl BroadcasterMessageTracker {
 		let mut state = self
 			.load(order_id)
 			.await
+			.map_err(|e| {
+				SettlementError::ValidationFailed(format!(
+					"Failed to load broadcaster proof state for order {order_id}: {e}"
+				))
+			})?
 			.unwrap_or(BroadcasterMessageState {
 				submission: None,
 				proof: None,
@@ -394,6 +407,11 @@ impl BroadcasterMessageTracker {
 		let mut state = self
 			.load(order_id)
 			.await
+			.map_err(|e| {
+				SettlementError::ValidationFailed(format!(
+					"Failed to load broadcaster verification state for order {order_id}: {e}"
+				))
+			})?
 			.unwrap_or(BroadcasterMessageState {
 				submission: None,
 				proof: None,
@@ -876,7 +894,14 @@ impl SettlementInterface for BroadcasterSettlement {
 
 	async fn buffer_coverage_check(&self, order: &Order) -> Option<(PusherDirection, u64)> {
 		// load() returns Option<BroadcasterMessageState> — None means no submission yet.
-		let state = self.message_tracker.load(&order.id).await?;
+		let state = match self.message_tracker.load(&order.id).await {
+			Ok(Some(state)) => state,
+			Ok(None) => return None,
+			Err(e) => {
+				tracing::warn!(order_id = %order.id, error = %e, "Failed to load broadcaster state");
+				return None;
+			},
+		};
 		let submission = state.submission?;
 		let required_block = submission.submission_block_number?;
 		// Fill chain = destination_chain (where the PostFill broadcast was confirmed).
@@ -964,9 +989,13 @@ impl SettlementInterface for BroadcasterSettlement {
 		};
 
 		let state = match self.message_tracker.load(&order.id).await {
-			Some(state) => state,
-			None => {
+			Ok(Some(state)) => state,
+			Ok(None) => {
 				tracing::debug!(order_id = %order.id, "No broadcaster submission state yet");
+				return false;
+			},
+			Err(e) => {
+				tracing::warn!(order_id = %order.id, error = %e, "Failed to load broadcaster state");
 				return false;
 			},
 		};
@@ -1140,7 +1169,7 @@ impl SettlementInterface for BroadcasterSettlement {
 				))
 			})?;
 
-		let state = self.message_tracker.load(&order.id).await.ok_or_else(|| {
+		let state = self.message_tracker.load(&order.id).await?.ok_or_else(|| {
 			SettlementError::ValidationFailed("No broadcaster state found".into())
 		})?;
 		let submission = state
