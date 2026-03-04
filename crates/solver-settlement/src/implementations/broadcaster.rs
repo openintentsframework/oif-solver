@@ -449,7 +449,7 @@ pub struct BroadcasterSettlement {
 
 impl BroadcasterSettlement {
 	#[allow(clippy::too_many_arguments)]
-	pub async fn new(
+	pub fn new(
 		networks: &NetworksConfig,
 		oracle_config: OracleConfig,
 		broadcaster_addresses: HashMap<u64, solver_types::Address>,
@@ -832,6 +832,10 @@ impl ConfigSchema for BroadcasterSettlementSchema {
 				),
 				Field::new(
 					"finality_blocks",
+					FieldType::Table(Schema::new(vec![], vec![])),
+				),
+				Field::new(
+					"chain_block_time_seconds",
 					FieldType::Table(Schema::new(vec![], vec![])),
 				),
 				Field::new(
@@ -1229,12 +1233,15 @@ impl SettlementInterface for BroadcasterSettlement {
 				let message_data =
 					encode_message_data(address_to_bytes32(&output_settler), &payloads)?;
 				let computed_message = compute_broadcaster_message(&output_settler, &payloads);
-				if let Some(actual_message) =
-					self.extract_message_from_broadcast_logs(&receipt.logs, &output_oracle)
-				{
-					if actual_message != computed_message {
-						return Err(SettlementError::SlotDerivationMismatch);
-					}
+				let actual_message = self
+					.extract_message_from_broadcast_logs(&receipt.logs, &output_oracle)
+					.ok_or_else(|| {
+						SettlementError::ValidationFailed(
+							"MessageBroadcast event not found in PostFill receipt".to_string(),
+						)
+					})?;
+				if actual_message != computed_message {
+					return Err(SettlementError::SlotDerivationMismatch);
 				}
 
 				self.message_tracker
@@ -1622,25 +1629,20 @@ pub fn create_settlement(
 
 	let pusher_directions = parse_pusher_directions(config, &oracle_config)?;
 
-	let settlement = tokio::task::block_in_place(|| {
-		tokio::runtime::Handle::current().block_on(async {
-			BroadcasterSettlement::new(
-				networks,
-				oracle_config,
-				broadcaster_addresses,
-				receiver_addresses,
-				broadcaster_ids,
-				proof_service_url,
-				proof_wait_time_seconds,
-				storage_proof_timeout_seconds,
-				default_finality_blocks,
-				finality_blocks,
-				storage,
-				pusher_directions,
-			)
-			.await
-		})
-	})?;
+	let settlement = BroadcasterSettlement::new(
+		networks,
+		oracle_config,
+		broadcaster_addresses,
+		receiver_addresses,
+		broadcaster_ids,
+		proof_service_url,
+		proof_wait_time_seconds,
+		storage_proof_timeout_seconds,
+		default_finality_blocks,
+		finality_blocks,
+		storage,
+		pusher_directions,
+	)?;
 
 	Ok(Box::new(settlement))
 }
