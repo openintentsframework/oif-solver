@@ -137,9 +137,10 @@ fn build_push_tx(direction: &PusherDirection, first_block: u64) -> Option<Transa
 			.abi_encode()
 		},
 		PusherL2Params::Linea { fee } => {
-			// l2TransactionData = abi.encode(uint256 fee) = 32-byte big-endian uint256
+			// l2TransactionData = abi.encode(uint256 fee) = 32-byte big-endian uint256.
+			// fee is u64 (8 bytes); right-align in the 32-byte word at [24..32].
 			let mut l2_tx_data = [0u8; 32];
-			l2_tx_data[16..32].copy_from_slice(&fee.to_be_bytes());
+			l2_tx_data[24..32].copy_from_slice(&fee.to_be_bytes());
 			IPusher::pushHashesCall {
 				buffer: alloy_primitives::Address::from_slice(&direction.buffer_address.0),
 				firstBlockNumber: U256::from(first_block),
@@ -293,6 +294,84 @@ pub async fn push_if_needed(
 mod tests {
 	use super::*;
 
+	fn make_direction(l2_params: PusherL2Params) -> PusherDirection {
+		PusherDirection {
+			label: "test".to_string(),
+			l1_chain_id: 1,
+			l2_chain_id: 59144,
+			pusher_address: solver_types::Address(vec![0xAA; 20]),
+			buffer_address: solver_types::Address(vec![0xBB; 20]),
+			push_cooldown_seconds: 600,
+			batch_size: 256,
+			l2_params,
+		}
+	}
+
+	#[test]
+	fn test_build_push_tx_arb() {
+		use alloy_sol_types::SolCall;
+		let inbox = alloy_primitives::Address::from([0x11u8; 20]);
+		let direction = make_direction(PusherL2Params::Arbitrum {
+			inbox,
+			gas_price_bid: 100_000_000,
+			gas_limit: 16_000_000,
+			submission_cost: 1_000_000_000_000_000,
+			is_erc20_inbox: false,
+		});
+		let tx = build_push_tx(&direction, 100).expect("should build");
+		// msg.value = gas_limit * gas_price_bid + submission_cost
+		assert_eq!(tx.value, U256::from(2_600_000_000_000_000u64));
+		assert_eq!(tx.chain_id, 1);
+		let decoded =
+			IArbitrumPusher::pushHashesCall::abi_decode(&tx.data).expect("abi_decode failed");
+		assert_eq!(decoded.inbox, inbox);
+		assert_eq!(decoded.batchSize, U256::from(256u64));
+		assert_eq!(decoded.gasPriceBid, U256::from(100_000_000u64));
+		assert_eq!(decoded.gasLimit, U256::from(16_000_000u64));
+		assert_eq!(decoded.submissionCost, U256::from(1_000_000_000_000_000u64));
+		assert!(!decoded.isERC20Inbox);
+	}
+
+	#[test]
+	fn test_build_push_tx_op_stack() {
+		use alloy_sol_types::SolCall;
+		let gas_limit: u32 = 200_000;
+		let direction = make_direction(PusherL2Params::OpStack { gas_limit });
+		let tx = build_push_tx(&direction, 50).expect("should build");
+		assert_eq!(tx.value, U256::ZERO);
+		let decoded =
+			IPusher::pushHashesCall::abi_decode(&tx.data).expect("abi_decode failed");
+		let l2_data = decoded.l2TransactionData.as_ref();
+		assert_eq!(l2_data.len(), 32);
+		assert_eq!(&l2_data[0..28], &[0u8; 28], "high bytes must be zero");
+		assert_eq!(&l2_data[28..32], &gas_limit.to_be_bytes(), "gas_limit bytes mismatch");
+		assert_eq!(decoded.firstBlockNumber, U256::from(50u64));
+		assert_eq!(decoded.batchSize, U256::from(256u64));
+	}
+
+	#[test]
+	fn test_build_push_tx_raw_valid() {
+		use alloy_sol_types::SolCall;
+		let direction = make_direction(PusherL2Params::Raw {
+			data: "0xdeadbeef".to_string(),
+			value_wei: Some(12345),
+		});
+		let tx = build_push_tx(&direction, 1).expect("should build");
+		assert_eq!(tx.value, U256::from(12345u64));
+		let decoded =
+			IPusher::pushHashesCall::abi_decode(&tx.data).expect("abi_decode failed");
+		assert_eq!(decoded.l2TransactionData.as_ref(), &[0xde, 0xad, 0xbe, 0xef]);
+	}
+
+	#[test]
+	fn test_build_push_tx_raw_invalid_hex() {
+		let direction = make_direction(PusherL2Params::Raw {
+			data: "0xZZZZ".to_string(),
+			value_wei: None,
+		});
+		assert!(build_push_tx(&direction, 1).is_none(), "invalid hex must return None");
+	}
+
 	#[test]
 	fn test_derive_msg_value_op_stack() {
 		assert_eq!(
@@ -348,5 +427,39 @@ mod tests {
 			value_wei: None,
 		};
 		assert_eq!(derive_msg_value(&p), U256::ZERO);
+	}
+
+	#[test]
+	fn test_build_push_tx_linea_encoding() {
+		use alloy_sol_types::SolCall;
+		let fee: u64 = 1_000_000_000_000_000; // 0.001 ETH
+
+		let direction = PusherDirection {
+			label: "test".to_string(),
+			l1_chain_id: 1,
+			l2_chain_id: 59144,
+			pusher_address: solver_types::Address(vec![0xAA; 20]),
+			buffer_address: solver_types::Address(vec![0xBB; 20]),
+			push_cooldown_seconds: 600,
+			batch_size: 256,
+			l2_params: PusherL2Params::Linea { fee },
+		};
+
+		let tx = build_push_tx(&direction, 100).expect("should build");
+
+		// msg.value must equal fee
+		assert_eq!(tx.value, U256::from(fee));
+
+		// Decode the call data to inspect l2TransactionData
+		let decoded =
+			IPusher::pushHashesCall::abi_decode(&tx.data).expect("decode failed");
+		let l2_data = decoded.l2TransactionData.as_ref();
+
+		// Must be exactly 32 bytes (ABI uint256)
+		assert_eq!(l2_data.len(), 32, "l2TransactionData must be 32 bytes");
+		// High 24 bytes must be zero
+		assert_eq!(&l2_data[0..24], &[0u8; 24], "high bytes must be zero");
+		// Low 8 bytes must encode fee big-endian
+		assert_eq!(&l2_data[24..32], &fee.to_be_bytes(), "fee bytes mismatch");
 	}
 }

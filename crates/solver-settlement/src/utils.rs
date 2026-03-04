@@ -363,7 +363,15 @@ where
 				cache.insert(order_id.to_string(), state.clone());
 				Some(state)
 			},
-			Err(_) => None,
+			Err(e) => {
+				tracing::warn!(
+					namespace = %self.namespace,
+					key = %key,
+					error = %e,
+					"Storage retrieval failed; treating as missing entry"
+				);
+				None
+			},
 		}
 	}
 

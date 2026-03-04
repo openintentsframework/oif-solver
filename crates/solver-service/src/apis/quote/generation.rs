@@ -461,6 +461,13 @@ impl QuoteGenerator {
 		config: &Config,
 		lock_type: &LockType,
 	) -> Result<(OifOrder, Option<String>), QuoteError> {
+		// Validate lock type before doing any expensive lookups.
+		if !matches!(lock_type, LockType::Permit2Escrow | LockType::Eip3009Escrow) {
+			return Err(QuoteError::UnsupportedSettlement(format!(
+				"Unsupported escrow type: {lock_type:?}"
+			)));
+		}
+
 		// Extract chain from first output to find appropriate settlement
 		// TODO: Implement support for multiple destination chains
 		let origin_chain_id = request
@@ -502,14 +509,11 @@ impl QuoteGenerator {
 				self.generate_permit2_order(request, config, input_oracle, output_oracle)
 					.await?
 			},
-			LockType::Eip3009Escrow => {
+			// Permit2Escrow and Eip3009Escrow are the only variants that reach
+			// here; the early-return guard above rules out all other lock types.
+			_ => {
 				self.generate_eip3009_order(request, config, input_oracle, output_oracle)
 					.await?
-			},
-			_ => {
-				return Err(QuoteError::UnsupportedSettlement(format!(
-					"Unsupported escrow type: {lock_type:?}"
-				)))
 			},
 		};
 
@@ -1580,13 +1584,15 @@ impl QuoteGenerator {
 	/// This keeps quote expiry aligned with settlement admission guards so
 	/// broadcaster intents are not rejected immediately for short windows.
 	fn get_expires_seconds(&self, config: &Config) -> u64 {
+		let fill_deadline = self.get_fill_deadline_seconds(config);
 		if let Some(expires_seconds) = config
 			.api
 			.as_ref()
 			.and_then(|api| api.quote.as_ref())
 			.map(|quote| quote.expires_seconds)
 		{
-			return expires_seconds;
+			// Clamp to fill deadline so quotes never expire before they can be filled.
+			return expires_seconds.max(fill_deadline);
 		}
 
 		let default_expires = QuoteConfig::default().expires_seconds;
@@ -1599,7 +1605,8 @@ impl QuoteGenerator {
 					.as_table()
 					.and_then(|table| table.get("intent_min_expiry_seconds"))
 					.and_then(|value| value.as_integer())
-					.map(|seconds| seconds as u64)
+					// Guard against negative TOML values before casting to u64.
+					.map(|seconds| seconds.max(0) as u64)
 			})
 			.max()
 			.unwrap_or(0);

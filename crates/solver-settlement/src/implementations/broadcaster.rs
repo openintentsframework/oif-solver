@@ -240,17 +240,23 @@ fn compute_broadcaster_message(source: &solver_types::Address, payloads: &[Vec<u
 	let payload_hashes_digest = hash_payload_hashes(&payload_hashes);
 
 	// keccak256(abi.encode(address, bytes32))
+	// Guard: only copy if address is exactly 20 bytes; zero-pad otherwise.
 	let mut encoded = [0u8; 64];
-	encoded[12..32].copy_from_slice(&source.0);
+	if source.0.len() == 20 {
+		encoded[12..32].copy_from_slice(&source.0);
+	}
 	encoded[32..64].copy_from_slice(&payload_hashes_digest);
 	keccak256(&encoded)
 }
 
 fn compute_message_slot(message: [u8; 32], publisher: &solver_types::Address) -> [u8; 32] {
 	// keccak256(abi.encode(message, publisher))
+	// Guard: only copy if address is exactly 20 bytes; zero-pad otherwise.
 	let mut encoded = [0u8; 64];
 	encoded[0..32].copy_from_slice(&message);
-	encoded[44..64].copy_from_slice(&publisher.0);
+	if publisher.0.len() == 20 {
+		encoded[44..64].copy_from_slice(&publisher.0);
+	}
 	keccak256(&encoded)
 }
 
@@ -828,6 +834,14 @@ impl ConfigSchema for BroadcasterSettlementSchema {
 					"finality_blocks",
 					FieldType::Table(Schema::new(vec![], vec![])),
 				),
+				Field::new(
+					"intent_safety_buffer_seconds",
+					FieldType::Integer { min: Some(0), max: Some(3600) },
+				),
+				Field::new(
+					"intent_min_expiry_seconds",
+					FieldType::Integer { min: Some(0), max: Some(86400) },
+				),
 				// Sub-field validation is intentionally skipped here; it is performed
 				// inside parse_pusher_directions() after the schema check passes.
 				Field::new(
@@ -1053,8 +1067,17 @@ impl SettlementInterface for BroadcasterSettlement {
 		if output_oracles.is_empty() {
 			return Ok(None);
 		}
+		// Derive a deterministic selection context from the order ID so that
+		// RoundRobin/Random strategies pick the same oracle for the same order
+		// across retries (avoids non-deterministic post-fill routing).
+		let oracle_hint = {
+			let hash = keccak256(order.id.as_bytes());
+			let mut buf = [0u8; 8];
+			buf.copy_from_slice(&hash[..8]);
+			u64::from_be_bytes(buf)
+		};
 		let output_oracle = self
-			.select_oracle(&output_oracles, None)
+			.select_oracle(&output_oracles, Some(oracle_hint))
 			.ok_or_else(|| SettlementError::ValidationFailed("Failed to select oracle".into()))?;
 
 		let output_settler = order
@@ -2111,6 +2134,109 @@ mod tests {
 		assert_eq!(
 			result[0].l2_params,
 			PusherL2Params::OpStack { gas_limit: 0 }
+		);
+	}
+
+	// ── infer_l2_params_from_hex ─────────────────────────────────────────────
+
+	#[test]
+	fn test_infer_l2_params_arb_chain_valid() {
+		// Build a 160-byte ARB ABI encoding:
+		// word 0 (bytes 0..32): inbox address in bytes 12..32
+		// word 1 (bytes 32..64): gas_price_bid
+		// word 2 (bytes 64..96): gas_limit
+		// word 3 (bytes 96..128): submission_cost
+		// word 4 (bytes 128..160): isERC20 flag
+		let mut data = vec![0u8; 160];
+		// inbox at bytes 12..32
+		let inbox_bytes = [0xAAu8; 20];
+		data[12..32].copy_from_slice(&inbox_bytes);
+		// gas_price_bid = 100_000_000 at word 1 (offset 32), low 8 bytes = offset 56..64
+		let gpb: u64 = 100_000_000;
+		data[56..64].copy_from_slice(&gpb.to_be_bytes());
+		// gas_limit = 16_000_000 at word 2 (offset 64), low 8 bytes = offset 88..96
+		let gl: u64 = 16_000_000;
+		data[88..96].copy_from_slice(&gl.to_be_bytes());
+		// submission_cost = 1_000_000_000_000_000 at word 3 (offset 96), low 8 bytes = offset 120..128
+		let sc: u64 = 1_000_000_000_000_000;
+		data[120..128].copy_from_slice(&sc.to_be_bytes());
+		// is_erc20_inbox = false (byte 159 = 0)
+
+		let hex_str = format!("0x{}", hex::encode(&data));
+		let result = infer_l2_params_from_hex(&hex_str, 421614, 0).unwrap();
+
+		let expected_inbox =
+			alloy_primitives::Address::from_slice(&inbox_bytes);
+		assert_eq!(
+			result,
+			PusherL2Params::Arbitrum {
+				inbox: expected_inbox,
+				gas_price_bid: gpb,
+				gas_limit: gl,
+				submission_cost: sc,
+				is_erc20_inbox: false,
+			}
+		);
+	}
+
+	#[test]
+	fn test_infer_l2_params_arb_chain_too_short() {
+		// ARB chain but only 32 bytes → must error
+		let data = vec![0u8; 32];
+		let hex_str = format!("0x{}", hex::encode(&data));
+		let err = infer_l2_params_from_hex(&hex_str, 421614, 0).unwrap_err();
+		assert!(
+			err.to_string().contains("160 bytes"),
+			"expected 160-byte error, got: {err}"
+		);
+	}
+
+	#[test]
+	fn test_infer_l2_params_linea_chain() {
+		// 32-byte ABI word encoding fee = 1_000_000_000_000_000.
+		// read_u64 reads low 8 bytes (offset 24..32).
+		let fee: u64 = 1_000_000_000_000_000;
+		let mut data = vec![0u8; 32];
+		data[24..32].copy_from_slice(&fee.to_be_bytes());
+		let hex_str = format!("0x{}", hex::encode(&data));
+		let result = infer_l2_params_from_hex(&hex_str, 59144, 0).unwrap();
+		assert_eq!(result, PusherL2Params::Linea { fee });
+	}
+
+	#[test]
+	fn test_infer_l2_params_unknown_chain_returns_raw() {
+		let data = vec![0xDEu8, 0xAD, 0xBE, 0xEF];
+		let hex_str = format!("0x{}", hex::encode(&data));
+		let result = infer_l2_params_from_hex(&hex_str, 1, 0).unwrap();
+		assert_eq!(
+			result,
+			PusherL2Params::Raw {
+				data: "0xdeadbeef".to_string(),
+				value_wei: None,
+			}
+		);
+	}
+
+	// ── validate_l2_params_chain_match ───────────────────────────────────────
+
+	#[test]
+	fn test_validate_l2_params_chain_match_linea_valid() {
+		let params = PusherL2Params::Linea { fee: 0 };
+		assert!(validate_l2_params_chain_match(&params, 59144, 0).is_ok());
+		assert!(validate_l2_params_chain_match(&params, 59141, 0).is_ok());
+	}
+
+	#[test]
+	fn test_validate_l2_params_chain_mismatch_linea_on_op_chain() {
+		let params = PusherL2Params::Linea { fee: 0 };
+		let err = validate_l2_params_chain_match(&params, 84532, 0).unwrap_err();
+		assert!(
+			err.to_string().contains("linea"),
+			"expected type name in error: {err}"
+		);
+		assert!(
+			err.to_string().contains("84532"),
+			"expected chain_id in error: {err}"
 		);
 	}
 

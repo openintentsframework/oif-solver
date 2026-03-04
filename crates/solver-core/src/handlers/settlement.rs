@@ -56,6 +56,7 @@ pub struct SettlementHandler {
 }
 
 impl SettlementHandler {
+	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		settlement: Arc<SettlementService>,
 		order_service: Arc<OrderService>,

@@ -37,8 +37,9 @@ use solver_types::{
 	OperatorBroadcasterConfig, OperatorConfig, OperatorDirectConfig, OperatorGasConfig,
 	OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig,
 	OperatorOracleSelectionStrategy, OperatorPricingConfig, OperatorRpcEndpoint,
-	OperatorSettlementConfig, OperatorSettlementType, OperatorSolverConfig, OperatorToken,
-	OperatorWithdrawalsConfig, SeedOverrides, SettlementTypeOverride, TokenConfig,
+	OperatorPusherDirectionConfig, OperatorSettlementConfig, OperatorSettlementType,
+	OperatorSolverConfig, OperatorToken, OperatorWithdrawalsConfig, PusherL2Params, SeedOverrides,
+	SettlementTypeOverride, TokenConfig,
 };
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -2557,23 +2558,29 @@ fn extract_broadcaster_config(
 	let proof_service_url = broadcaster_toml
 		.and_then(|b| b.get("proof_service_url"))
 		.and_then(|v| v.as_str())
+		// proof_service_url is a required field validated by BroadcasterSettlementSchema;
+		// this fallback is only reached in unit tests or if schema validation is bypassed.
 		.unwrap_or("http://localhost:9090")
 		.to_string();
 
 	let proof_wait_time_seconds = broadcaster_toml
 		.and_then(|b| b.get("proof_wait_time_seconds"))
 		.and_then(|v| v.as_integer())
-		.unwrap_or(30) as u64;
+		// Guard against negative TOML integers before casting to u64.
+		.unwrap_or(30)
+		.max(0) as u64;
 
 	let storage_proof_timeout_seconds = broadcaster_toml
 		.and_then(|b| b.get("storage_proof_timeout_seconds"))
 		.and_then(|v| v.as_integer())
-		.unwrap_or(30) as u64;
+		.unwrap_or(30)
+		.max(0) as u64;
 
 	let default_finality_blocks = broadcaster_toml
 		.and_then(|b| b.get("default_finality_blocks"))
 		.and_then(|v| v.as_integer())
-		.unwrap_or(20) as u64;
+		.unwrap_or(20)
+		.max(0) as u64;
 	let intent_safety_buffer_seconds = broadcaster_toml
 		.and_then(|b| b.get("intent_safety_buffer_seconds"))
 		.and_then(|v| v.as_integer())
@@ -2750,8 +2757,75 @@ fn extract_broadcaster_config(
 		intent_safety_buffer_seconds,
 		intent_min_expiry_seconds,
 		oracle_selection_strategy,
-		pusher_directions: vec![],
+		pusher_directions: extract_pusher_directions(broadcaster_toml),
 	}
+}
+
+/// Parse the `pusher_directions` array from a broadcaster TOML table back into
+/// `OperatorPusherDirectionConfig` values.  Entries that are missing required
+/// fields (`pusher_address`, `buffer_address`, `push_cooldown_seconds`) or
+/// whose `l2_params` table cannot be deserialized are silently skipped.
+fn extract_pusher_directions(
+	broadcaster_toml: Option<&toml::Value>,
+) -> Vec<OperatorPusherDirectionConfig> {
+	let array = match broadcaster_toml
+		.and_then(|b| b.get("pusher_directions"))
+		.and_then(|v| v.as_array())
+	{
+		Some(a) => a,
+		None => return vec![],
+	};
+
+	let parse_hex_addr = |s: &str| -> Option<alloy_primitives::Address> {
+		let s = s.strip_prefix("0x").unwrap_or(s);
+		hex::decode(s)
+			.ok()
+			.filter(|b| b.len() == 20)
+			.map(|b| alloy_primitives::Address::from_slice(&b))
+	};
+
+	array
+		.iter()
+		.filter_map(|entry| {
+			let t = entry.as_table()?;
+
+			let pusher_address =
+				parse_hex_addr(t.get("pusher_address")?.as_str()?)?;
+			let buffer_address =
+				parse_hex_addr(t.get("buffer_address")?.as_str()?)?;
+			let push_cooldown_seconds =
+				t.get("push_cooldown_seconds")?.as_integer()?.max(0) as u64;
+
+			let l2_params = t
+				.get("l2_params")
+				.and_then(|v| v.clone().try_into::<PusherL2Params>().ok());
+			let l2_transaction_data = t
+				.get("l2_transaction_data")
+				.and_then(|v| v.as_str())
+				.map(|s| s.to_string());
+
+			let label =
+				t.get("label").and_then(|v| v.as_str()).map(|s| s.to_string());
+			let l1_chain_id =
+				t.get("l1_chain_id").and_then(|v| v.as_integer()).map(|i| i as u64);
+			let l2_chain_id =
+				t.get("l2_chain_id").and_then(|v| v.as_integer()).map(|i| i as u64);
+			let batch_size =
+				t.get("batch_size").and_then(|v| v.as_integer()).map(|i| i as u64);
+
+			Some(OperatorPusherDirectionConfig {
+				pusher_address,
+				buffer_address,
+				push_cooldown_seconds,
+				l2_params,
+				l2_transaction_data,
+				label,
+				l1_chain_id,
+				l2_chain_id,
+				batch_size,
+			})
+		})
+		.collect()
 }
 
 #[cfg(test)]
@@ -5587,6 +5661,67 @@ mod tests {
 		if let Some(val) = original {
 			env::set_var("AUTH_PUBLIC_REGISTER_ENABLED", val);
 		}
+	}
+
+	#[test]
+	fn test_extract_pusher_directions_round_trip() {
+		// Build a TOML table that looks like what operator_config_to_toml produces
+		// for a broadcaster with one OpStack pusher direction.
+		let toml_str = r#"
+[broadcaster]
+[[broadcaster.pusher_directions]]
+pusher_address = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+buffer_address = "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+push_cooldown_seconds = 600
+label = "eth-to-op"
+l1_chain_id = 11155111
+l2_chain_id = 11155420
+batch_size = 128
+
+[broadcaster.pusher_directions.l2_params]
+type = "op_stack"
+gas_limit = 200000
+"#;
+		let val: toml::Value = toml::from_str(toml_str).unwrap();
+		let broadcaster_toml = val.get("broadcaster");
+		let dirs = extract_pusher_directions(broadcaster_toml);
+		assert_eq!(dirs.len(), 1);
+		let d = &dirs[0];
+		assert_eq!(d.label.as_deref(), Some("eth-to-op"));
+		assert_eq!(d.l1_chain_id, Some(11155111));
+		assert_eq!(d.l2_chain_id, Some(11155420));
+		assert_eq!(d.push_cooldown_seconds, 600);
+		assert_eq!(d.batch_size, Some(128));
+		assert_eq!(
+			d.l2_params,
+			Some(PusherL2Params::OpStack { gas_limit: 200000 })
+		);
+		// Verify addresses were parsed correctly
+		let expected_pusher = alloy_primitives::address!(
+			"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+		);
+		assert_eq!(d.pusher_address, expected_pusher);
+	}
+
+	#[test]
+	fn test_extract_pusher_directions_empty_when_missing() {
+		let val: toml::Value = toml::from_str("[broadcaster]\n").unwrap();
+		let dirs = extract_pusher_directions(val.get("broadcaster"));
+		assert!(dirs.is_empty());
+	}
+
+	#[test]
+	fn test_extract_pusher_directions_skips_invalid_entries() {
+		// Entry with missing pusher_address → should be skipped (filter_map returns None)
+		let toml_str = r#"
+[broadcaster]
+[[broadcaster.pusher_directions]]
+buffer_address = "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+push_cooldown_seconds = 600
+"#;
+		let val: toml::Value = toml::from_str(toml_str).unwrap();
+		let dirs = extract_pusher_directions(val.get("broadcaster"));
+		assert!(dirs.is_empty(), "invalid entry should be skipped");
 	}
 
 	#[test]

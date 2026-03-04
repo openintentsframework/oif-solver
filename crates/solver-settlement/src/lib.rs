@@ -511,12 +511,14 @@ impl SettlementService {
 			if let Some(settlement) = self.implementations.get(name) {
 				return Ok(settlement.as_ref());
 			}
-			// Settlement name was persisted but implementation no longer exists
-			tracing::warn!(
-				order_id = %order.id,
-				settlement_name = %name,
-				"Persisted settlement implementation not found, falling back to oracle lookup"
-			);
+			// Settlement name was persisted but implementation no longer exists.
+			// Do NOT fall back: silently routing through a different settlement
+			// could produce a wrong proof or double-settle an order.
+			return Err(SettlementError::ValidationFailed(format!(
+				"Persisted settlement '{name}' for order {} is no longer available; \
+				 cannot route through a different implementation",
+				order.id
+			)));
 		}
 
 		// Fall back to oracle-based lookup
