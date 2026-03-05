@@ -260,6 +260,13 @@ fn compute_message_slot(message: [u8; 32], publisher: &solver_types::Address) ->
 	keccak256(&encoded)
 }
 
+fn order_id_to_selection_context(order_id: &str) -> u64 {
+	let hash = keccak256(order_id.as_bytes());
+	let mut buf = [0u8; 8];
+	buf.copy_from_slice(&hash[..8]);
+	u64::from_be_bytes(buf)
+}
+
 fn parse_hex_bytes(label: &str, value: &str) -> Result<Vec<u8>, SettlementError> {
 	hex::decode(value.trim_start_matches("0x"))
 		.map_err(|e| SettlementError::ValidationFailed(format!("Invalid hex for {label}: {e}")))
@@ -932,11 +939,7 @@ impl SettlementInterface for BroadcasterSettlement {
 			)));
 		}
 
-		let order_id_hash = keccak256(order.id.as_bytes());
-		let selection_context =
-			u64::from_be_bytes(order_id_hash[0..8].try_into().map_err(|_| {
-				SettlementError::ValidationFailed("Failed to convert hash bytes".to_string())
-			})?);
+		let selection_context = order_id_to_selection_context(&order.id);
 		let oracle_address = self
 			.select_oracle(&oracle_addresses, Some(selection_context))
 			.ok_or_else(|| {
@@ -1005,15 +1008,19 @@ impl SettlementInterface for BroadcasterSettlement {
 			None => return false,
 		};
 
-		let input_oracle = match self.select_oracle(&self.get_input_oracles(source_chain), None) {
-			Some(oracle) => oracle,
-			None => return false,
-		};
-		let output_oracle =
-			match self.select_oracle(&self.get_output_oracles(destination_chain), None) {
+		let selection_context = order_id_to_selection_context(&order.id);
+		let input_oracle =
+			match self.select_oracle(&self.get_input_oracles(source_chain), Some(selection_context)) {
 				Some(oracle) => oracle,
 				None => return false,
 			};
+		let output_oracle = submission.remote_oracle.clone();
+		if !self
+			.get_output_oracles(destination_chain)
+			.contains(&output_oracle)
+		{
+			return false;
+		}
 
 		let provider = match self.providers.get(&source_chain) {
 			Some(provider) => provider,
@@ -1109,12 +1116,7 @@ impl SettlementInterface for BroadcasterSettlement {
 		// Derive a deterministic selection context from the order ID so that
 		// RoundRobin/Random strategies pick the same oracle for the same order
 		// across retries (avoids non-deterministic post-fill routing).
-		let oracle_hint = {
-			let hash = keccak256(order.id.as_bytes());
-			let mut buf = [0u8; 8];
-			buf.copy_from_slice(&hash[..8]);
-			u64::from_be_bytes(buf)
-		};
+			let oracle_hint = order_id_to_selection_context(&order.id);
 		let output_oracle = self
 			.select_oracle(&output_oracles, Some(oracle_hint))
 			.ok_or_else(|| SettlementError::ValidationFailed("Failed to select oracle".into()))?;
@@ -1154,33 +1156,37 @@ impl SettlementInterface for BroadcasterSettlement {
 	) -> Result<Option<Transaction>, SettlementError> {
 		let (source_chain, destination_chain) = Self::source_and_destination_chain(order)?;
 
-		let input_oracle = self
-			.select_oracle(&self.get_input_oracles(source_chain), None)
-			.ok_or_else(|| {
-				SettlementError::ValidationFailed(format!(
-					"No input oracle configured for chain {source_chain}"
-				))
-			})?;
-		let output_oracle = self
-			.select_oracle(&self.get_output_oracles(destination_chain), None)
-			.ok_or_else(|| {
-				SettlementError::ValidationFailed(format!(
-					"No output oracle configured for chain {destination_chain}"
-				))
-			})?;
-
 		let state = self.message_tracker.load(&order.id).await?.ok_or_else(|| {
 			SettlementError::ValidationFailed("No broadcaster state found".into())
 		})?;
 		let submission = state
 			.submission
+			.clone()
 			.ok_or_else(|| SettlementError::ValidationFailed("No submission state found".into()))?;
+		let output_oracle = submission.remote_oracle.clone();
+		if !self
+			.get_output_oracles(destination_chain)
+			.contains(&output_oracle)
+		{
+			return Err(SettlementError::ValidationFailed(format!(
+				"Stored output oracle not configured for chain {destination_chain}"
+			)));
+		}
+
+		let selection_context = order_id_to_selection_context(&order.id);
+		let input_oracle = self
+			.select_oracle(&self.get_input_oracles(source_chain), Some(selection_context))
+			.ok_or_else(|| {
+				SettlementError::ValidationFailed(format!(
+					"No input oracle configured for chain {source_chain}"
+				))
+			})?;
 
 		// If already proven, no pre-claim tx needed.
 		let provider = self.providers.get(&source_chain).ok_or_else(|| {
 			SettlementError::ValidationFailed(format!("No provider for chain {source_chain}"))
 		})?;
-		if check_is_proven(
+		match check_is_proven(
 			provider,
 			&input_oracle,
 			destination_chain,
@@ -1189,9 +1195,19 @@ impl SettlementInterface for BroadcasterSettlement {
 			submission.payload_hash,
 		)
 		.await
-		.unwrap_or(false)
 		{
-			return Ok(None);
+			Ok(true) => return Ok(None),
+			Ok(false) => {},
+			Err(e) => {
+				tracing::warn!(
+					order_id = %order.id,
+					error = %e,
+					"isProven check failed in pre-claim path; will retry"
+				);
+				return Err(SettlementError::ValidationFailed(format!(
+					"isProven RPC error: {e}"
+				)));
+			},
 		}
 
 		let proof = state
@@ -1235,13 +1251,14 @@ impl SettlementInterface for BroadcasterSettlement {
 		receipt: &TransactionReceipt,
 	) -> Result<(), SettlementError> {
 		match tx_type {
-			TransactionType::PostFill => {
-				let (source_chain, destination_chain) = Self::source_and_destination_chain(order)?;
-				let output_oracle = self
-					.select_oracle(&self.get_output_oracles(destination_chain), None)
-					.ok_or_else(|| {
-						SettlementError::ValidationFailed(format!(
-							"No output oracle configured for chain {destination_chain}"
+				TransactionType::PostFill => {
+					let (source_chain, destination_chain) = Self::source_and_destination_chain(order)?;
+					let oracle_hint = order_id_to_selection_context(&order.id);
+					let output_oracle = self
+						.select_oracle(&self.get_output_oracles(destination_chain), Some(oracle_hint))
+						.ok_or_else(|| {
+							SettlementError::ValidationFailed(format!(
+								"No output oracle configured for chain {destination_chain}"
 						))
 					})?;
 
@@ -1488,11 +1505,18 @@ fn parse_pusher_directions(
 
 	// Duplicate labels cause incorrect cooldown throttling in the pusher task.
 	let mut seen_labels = std::collections::HashSet::new();
+	let mut seen_pairs = std::collections::HashSet::new();
 	for d in &directions {
 		if !seen_labels.insert(d.label.as_str()) {
 			return Err(SettlementError::ValidationFailed(format!(
 				"pusher_directions: duplicate label {:?} — all labels must be unique",
 				d.label
+			)));
+		}
+		if !seen_pairs.insert((d.l1_chain_id, d.l2_chain_id)) {
+			return Err(SettlementError::ValidationFailed(format!(
+				"pusher_directions: duplicate (l1_chain_id={}, l2_chain_id={}) pair",
+				d.l1_chain_id, d.l2_chain_id
 			)));
 		}
 	}
@@ -1874,8 +1898,8 @@ mod tests {
 
 	// ── multiple directions ──────────────────────────────────────────────────
 
-	#[test]
-	fn test_multiple_directions() {
+		#[test]
+		fn test_multiple_directions() {
 		let mut routes = HashMap::new();
 		routes.insert(1u64, vec![10u64, 8453u64]);
 		let oracle_config = make_oracle_config(routes);
@@ -1898,9 +1922,54 @@ mod tests {
 		assert_eq!(result[0].l1_chain_id, 1); // inferred from single route key
 		assert_eq!(result[0].l2_chain_id, 10);
 		assert_eq!(result[0].label, "eth-to-op");
-		assert_eq!(result[1].l2_chain_id, 8453);
-		assert_eq!(result[1].label, "eth-to-base");
-	}
+			assert_eq!(result[1].l2_chain_id, 8453);
+			assert_eq!(result[1].label, "eth-to-base");
+		}
+
+		#[test]
+		fn test_parse_pusher_directions_rejects_duplicate_chain_pair() {
+			let mut entry_a = toml::map::Map::new();
+			entry_a.insert("l1_chain_id".into(), toml::Value::Integer(1));
+			entry_a.insert("l2_chain_id".into(), toml::Value::Integer(10));
+			entry_a.insert(
+				"pusher_address".into(),
+				toml::Value::String("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()),
+			);
+			entry_a.insert(
+				"buffer_address".into(),
+				toml::Value::String("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into()),
+			);
+			entry_a.insert("push_cooldown_seconds".into(), toml::Value::Integer(3600));
+			entry_a.insert("l2_params".into(), op_stack_l2_params());
+			entry_a.insert("label".into(), toml::Value::String("a".into()));
+
+			let mut entry_b = toml::map::Map::new();
+			entry_b.insert("l1_chain_id".into(), toml::Value::Integer(1));
+			entry_b.insert("l2_chain_id".into(), toml::Value::Integer(10));
+			entry_b.insert(
+				"pusher_address".into(),
+				toml::Value::String("0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC".into()),
+			);
+			entry_b.insert(
+				"buffer_address".into(),
+				toml::Value::String("0xDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD".into()),
+			);
+			entry_b.insert("push_cooldown_seconds".into(), toml::Value::Integer(3600));
+			entry_b.insert("l2_params".into(), op_stack_l2_params());
+			entry_b.insert("label".into(), toml::Value::String("b".into()));
+
+			let config = config_with_directions(vec![
+				toml::Value::Table(entry_a),
+				toml::Value::Table(entry_b),
+			]);
+
+			let err = parse_pusher_directions(&config, &empty_oracle_config()).unwrap_err();
+			let msg = err.to_string();
+			assert!(
+				msg.contains("duplicate (l1_chain_id=1, l2_chain_id=10)"),
+				"unexpected msg: {msg}"
+			);
+		}
 
 	#[test]
 	fn test_l2_chain_id_required_when_multiple_destinations() {

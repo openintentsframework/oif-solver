@@ -192,22 +192,26 @@ pub trait SettlementInterface: Send + Sync {
 				let index = (context as usize) % oracles.len();
 				oracles.get(index).cloned()
 			},
-			OracleSelectionStrategy::Random => {
-				use std::collections::hash_map::RandomState;
-				use std::hash::BuildHasher;
+				OracleSelectionStrategy::Random => {
+					let context = selection_context.unwrap_or_else(|| {
+						std::time::SystemTime::now()
+							.duration_since(std::time::UNIX_EPOCH)
+							.map(|d| d.as_nanos() as u64)
+							.unwrap_or(0)
+					});
 
-				let context = selection_context.unwrap_or_else(|| {
-					std::time::SystemTime::now()
-						.duration_since(std::time::UNIX_EPOCH)
-						.map(|d| d.as_secs())
-						.unwrap_or(0)
-				});
-
-				let index = (RandomState::new().hash_one(context) as usize) % oracles.len();
-				oracles.get(index).cloned()
-			},
+					// Stable FNV-1a hash over the context bytes so the same context
+					// always maps to the same oracle across calls and processes.
+					let mut hash: u64 = 0xcbf29ce484222325;
+					for byte in context.to_le_bytes() {
+						hash ^= u64::from(byte);
+						hash = hash.wrapping_mul(0x00000100000001b3);
+					}
+					let index = (hash as usize) % oracles.len();
+					oracles.get(index).cloned()
+				},
+			}
 		}
-	}
 
 	/// Returns the configuration schema for this settlement implementation.
 	///
@@ -622,15 +626,18 @@ impl SettlementService {
 			let Some(input_oracles) = input_oracles else {
 				continue;
 			};
-			let Some(output_oracles) = output_oracles else {
-				continue;
-			};
-			if input_oracles.is_empty() || output_oracles.is_empty() {
-				continue;
-			}
+				let Some(output_oracles) = output_oracles else {
+					continue;
+				};
+				if input_oracles.is_empty() || output_oracles.is_empty() {
+					continue;
+				}
+				if !settlement.is_route_supported(origin_chain_id, destination_chain_id) {
+					continue;
+				}
 
-			let input_oracle = settlement.select_oracle(input_oracles, Some(context))?;
-			let output_oracle = settlement.select_oracle(output_oracles, Some(context + 1))?;
+				let input_oracle = settlement.select_oracle(input_oracles, Some(context))?;
+				let output_oracle = settlement.select_oracle(output_oracles, Some(context + 1))?;
 
 			return Some((name.as_str(), settlement, input_oracle, output_oracle));
 		}
@@ -708,11 +715,177 @@ impl SettlementService {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use async_trait::async_trait;
+	use solver_types::ConfigSchema;
+
+	struct TestSchema;
+
+	impl ConfigSchema for TestSchema {
+		fn validate(
+			&self,
+			_config: &toml::Value,
+		) -> Result<(), solver_types::ValidationError> {
+			Ok(())
+		}
+	}
+
+	struct TestSettlement {
+		config: OracleConfig,
+	}
+
+	#[async_trait]
+	impl SettlementInterface for TestSettlement {
+		fn oracle_config(&self) -> &OracleConfig {
+			&self.config
+		}
+
+		fn config_schema(&self) -> Box<dyn ConfigSchema> {
+			Box::new(TestSchema)
+		}
+
+		async fn get_attestation(
+			&self,
+			_order: &Order,
+			_tx_hash: &TransactionHash,
+		) -> Result<FillProof, SettlementError> {
+			Err(SettlementError::ValidationFailed(
+				"not used in tests".to_string(),
+			))
+		}
+
+		async fn can_claim(&self, _order: &Order, _fill_proof: &FillProof) -> bool {
+			false
+		}
+	}
+
+	fn addr(byte: u8) -> Address {
+		Address(vec![byte; 20])
+	}
 
 	#[test]
 	fn test_settlement_service_new_empty() {
 		let service = SettlementService::new(HashMap::new(), 20);
 		assert_eq!(service.poll_interval_seconds(), 20);
 		assert!(service.implementation_order().is_empty());
+	}
+
+	#[test]
+	fn test_random_strategy_same_context_same_oracle() {
+		let settlement = TestSettlement {
+			config: OracleConfig {
+				input_oracles: HashMap::new(),
+				output_oracles: HashMap::new(),
+				routes: HashMap::new(),
+				selection_strategy: OracleSelectionStrategy::Random,
+			},
+		};
+		let oracles = vec![addr(1), addr(2), addr(3)];
+
+		let selected = settlement.select_oracle(&oracles, Some(42)).unwrap();
+		for _ in 0..1000 {
+			assert_eq!(
+				selected,
+				settlement.select_oracle(&oracles, Some(42)).unwrap()
+			);
+		}
+	}
+
+	#[test]
+	fn test_random_strategy_distributes_across_oracles() {
+		let settlement = TestSettlement {
+			config: OracleConfig {
+				input_oracles: HashMap::new(),
+				output_oracles: HashMap::new(),
+				routes: HashMap::new(),
+				selection_strategy: OracleSelectionStrategy::Random,
+			},
+		};
+		let oracles = vec![addr(1), addr(2), addr(3)];
+		let mut seen = [false; 3];
+
+		for context in 0u64..10_000 {
+			let selected = settlement.select_oracle(&oracles, Some(context)).unwrap();
+			let idx = oracles
+				.iter()
+				.position(|o| o == &selected)
+				.expect("selected oracle must come from candidates");
+			seen[idx] = true;
+			if seen.iter().all(|v| *v) {
+				break;
+			}
+		}
+
+		assert!(
+			seen.iter().all(|v| *v),
+			"expected all candidate oracles to be selected across contexts"
+		);
+	}
+
+	#[test]
+	fn test_settlement_selection_rejects_unsupported_route() {
+		let mut input_oracles = HashMap::new();
+		input_oracles.insert(11155420, vec![addr(1)]);
+		input_oracles.insert(84532, vec![addr(2)]);
+		let mut output_oracles = HashMap::new();
+		output_oracles.insert(11155420, vec![addr(3)]);
+		output_oracles.insert(84532, vec![addr(4)]);
+		let mut routes = HashMap::new();
+		routes.insert(84532, vec![11155420]); // reverse only
+
+		let settlement = TestSettlement {
+			config: OracleConfig {
+				input_oracles,
+				output_oracles,
+				routes,
+				selection_strategy: OracleSelectionStrategy::First,
+			},
+		};
+		let service = SettlementService::new(
+			HashMap::from([(
+				"test".to_string(),
+				Box::new(settlement) as Box<dyn SettlementInterface>,
+			)]),
+			20,
+		);
+
+		assert!(
+			service
+				.get_any_settlement_for_chains_with_name(11155420, 84532)
+				.is_none(),
+			"unsupported route should not be selected"
+		);
+	}
+
+	#[test]
+	fn test_settlement_selection_accepts_supported_route() {
+		let mut input_oracles = HashMap::new();
+		input_oracles.insert(11155420, vec![addr(1)]);
+		let mut output_oracles = HashMap::new();
+		output_oracles.insert(84532, vec![addr(4)]);
+		let mut routes = HashMap::new();
+		routes.insert(11155420, vec![84532]);
+
+		let settlement = TestSettlement {
+			config: OracleConfig {
+				input_oracles,
+				output_oracles,
+				routes,
+				selection_strategy: OracleSelectionStrategy::First,
+			},
+		};
+		let service = SettlementService::new(
+			HashMap::from([(
+				"test".to_string(),
+				Box::new(settlement) as Box<dyn SettlementInterface>,
+			)]),
+			20,
+		);
+
+		assert!(
+			service
+				.get_any_settlement_for_chains_with_name(11155420, 84532)
+				.is_some(),
+			"supported route should be selected"
+		);
 	}
 }

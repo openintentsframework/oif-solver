@@ -1862,6 +1862,7 @@ mod tests {
 		}
 
 		let mut mock_settlement = MockSettlementInterface::new();
+		let route_support = routes.clone();
 		mock_settlement
 			.expect_oracle_config()
 			.return_const(solver_settlement::OracleConfig {
@@ -1869,6 +1870,13 @@ mod tests {
 				output_oracles,
 				routes,
 				selection_strategy: solver_settlement::OracleSelectionStrategy::First,
+			});
+		mock_settlement
+			.expect_is_route_supported()
+			.returning(move |input_chain, output_chain| {
+				route_support
+					.get(&input_chain)
+					.is_some_and(|outputs| outputs.contains(&output_chain))
 			});
 
 		if with_oracles {

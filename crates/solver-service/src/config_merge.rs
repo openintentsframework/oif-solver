@@ -2073,10 +2073,10 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		}
 
 		match implementation.as_str() {
-			"broadcaster" => {
-				settlement_priority.push(OperatorSettlementType::Broadcaster);
-				broadcaster = Some(extract_broadcaster_config(&config.settlement, &chain_ids));
-			},
+				"broadcaster" => {
+					settlement_priority.push(OperatorSettlementType::Broadcaster);
+					broadcaster = Some(extract_broadcaster_config(&config.settlement, &chain_ids)?);
+				},
 			"hyperlane" => {
 				settlement_priority.push(OperatorSettlementType::Hyperlane);
 				hyperlane = Some(extract_hyperlane_config(&config.settlement, &chain_ids));
@@ -2096,7 +2096,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 			.contains_key("broadcaster")
 		{
 			settlement_priority.push(OperatorSettlementType::Broadcaster);
-			broadcaster = Some(extract_broadcaster_config(&config.settlement, &chain_ids));
+			broadcaster = Some(extract_broadcaster_config(&config.settlement, &chain_ids)?);
 		} else if config.settlement.implementations.contains_key("direct") {
 			settlement_priority.push(OperatorSettlementType::Direct);
 			direct = Some(extract_direct_config(&config.settlement, &chain_ids));
@@ -2543,7 +2543,7 @@ fn extract_direct_config(settlement: &SettlementConfig, chain_ids: &[u64]) -> Op
 fn extract_broadcaster_config(
 	settlement: &SettlementConfig,
 	chain_ids: &[u64],
-) -> OperatorBroadcasterConfig {
+) -> Result<OperatorBroadcasterConfig, MergeError> {
 	use alloy_primitives::{Address, B256};
 
 	let broadcaster_toml = settlement.implementations.get("broadcaster");
@@ -2742,7 +2742,7 @@ fn extract_broadcaster_config(
 		}
 	}
 
-	OperatorBroadcasterConfig {
+	Ok(OperatorBroadcasterConfig {
 		oracles: OperatorOracleConfig {
 			input: input_oracles,
 			output: output_oracles,
@@ -2760,23 +2760,23 @@ fn extract_broadcaster_config(
 		intent_safety_buffer_seconds,
 		intent_min_expiry_seconds,
 		oracle_selection_strategy,
-		pusher_directions: extract_pusher_directions(broadcaster_toml),
-	}
+		pusher_directions: extract_pusher_directions(broadcaster_toml)?,
+	})
 }
 
 /// Parse the `pusher_directions` array from a broadcaster TOML table back into
-/// `OperatorPusherDirectionConfig` values.  Entries that are missing required
-/// fields (`pusher_address`, `buffer_address`, `push_cooldown_seconds`) or
-/// whose `l2_params` table cannot be deserialized are silently skipped.
+/// `OperatorPusherDirectionConfig` values.
+///
+/// Malformed entries return a hard validation error with the exact array index.
 fn extract_pusher_directions(
 	broadcaster_toml: Option<&toml::Value>,
-) -> Vec<OperatorPusherDirectionConfig> {
+) -> Result<Vec<OperatorPusherDirectionConfig>, MergeError> {
 	let array = match broadcaster_toml
 		.and_then(|b| b.get("pusher_directions"))
 		.and_then(|v| v.as_array())
 	{
 		Some(a) => a,
-		None => return vec![],
+		None => return Ok(vec![]),
 	};
 
 	let parse_hex_addr = |s: &str| -> Option<alloy_primitives::Address> {
@@ -2787,53 +2787,128 @@ fn extract_pusher_directions(
 			.map(|b| alloy_primitives::Address::from_slice(&b))
 	};
 
-	array
-		.iter()
-		.filter_map(|entry| {
-			let t = entry.as_table()?;
+	let mut out = Vec::with_capacity(array.len());
+	for (i, entry) in array.iter().enumerate() {
+		let t = entry.as_table().ok_or_else(|| {
+			MergeError::Validation(format!("pusher_directions[{i}] must be a TOML table"))
+		})?;
 
-			let pusher_address = parse_hex_addr(t.get("pusher_address")?.as_str()?)?;
-			let buffer_address = parse_hex_addr(t.get("buffer_address")?.as_str()?)?;
-			let push_cooldown_seconds = t.get("push_cooldown_seconds")?.as_integer()?.max(0) as u64;
+		let pusher_address_str = t
+			.get("pusher_address")
+			.and_then(|v| v.as_str())
+			.ok_or_else(|| {
+				MergeError::Validation(format!(
+					"pusher_directions[{i}].pusher_address is required and must be a string"
+				))
+			})?;
+		let pusher_address = parse_hex_addr(pusher_address_str).ok_or_else(|| {
+			MergeError::Validation(format!(
+				"pusher_directions[{i}].pusher_address is not a valid 20-byte hex address"
+			))
+		})?;
 
-			let l2_params = t
-				.get("l2_params")
-				.and_then(|v| v.clone().try_into::<PusherL2Params>().ok());
-			let l2_transaction_data = t
-				.get("l2_transaction_data")
-				.and_then(|v| v.as_str())
-				.map(|s| s.to_string());
+		let buffer_address_str = t
+			.get("buffer_address")
+			.and_then(|v| v.as_str())
+			.ok_or_else(|| {
+				MergeError::Validation(format!(
+					"pusher_directions[{i}].buffer_address is required and must be a string"
+				))
+			})?;
+		let buffer_address = parse_hex_addr(buffer_address_str).ok_or_else(|| {
+			MergeError::Validation(format!(
+				"pusher_directions[{i}].buffer_address is not a valid 20-byte hex address"
+			))
+		})?;
 
-			let label = t
-				.get("label")
-				.and_then(|v| v.as_str())
-				.map(|s| s.to_string());
-			let l1_chain_id = t
-				.get("l1_chain_id")
-				.and_then(|v| v.as_integer())
-				.map(|i| i.max(0) as u64);
-			let l2_chain_id = t
-				.get("l2_chain_id")
-				.and_then(|v| v.as_integer())
-				.map(|i| i.max(0) as u64);
-			let batch_size = t
-				.get("batch_size")
-				.and_then(|v| v.as_integer())
-				.map(|i| i.max(0) as u64);
+		let push_cooldown_raw = t
+			.get("push_cooldown_seconds")
+			.and_then(|v| v.as_integer())
+			.ok_or_else(|| {
+				MergeError::Validation(format!(
+					"pusher_directions[{i}].push_cooldown_seconds is required and must be an integer"
+				))
+			})?;
+		let push_cooldown_seconds = push_cooldown_raw.max(0) as u64;
 
-			Some(OperatorPusherDirectionConfig {
-				pusher_address,
-				buffer_address,
-				push_cooldown_seconds,
-				l2_params,
-				l2_transaction_data,
-				label,
-				l1_chain_id,
-				l2_chain_id,
-				batch_size,
+		let l2_params = match t.get("l2_params") {
+			Some(v) => Some(v.clone().try_into::<PusherL2Params>().map_err(|e| {
+				MergeError::Validation(format!(
+					"pusher_directions[{i}].l2_params failed to parse: {e}"
+				))
+			})?),
+			None => None,
+		};
+		let l2_transaction_data = t
+			.get("l2_transaction_data")
+			.and_then(|v| v.as_str())
+			.map(|s| s.to_string());
+
+		if l2_params.is_none() && l2_transaction_data.is_none() {
+			return Err(MergeError::Validation(format!(
+				"pusher_directions[{i}] requires either l2_params or l2_transaction_data"
+			)));
+		}
+
+		let label = t
+			.get("label")
+			.map(|v| {
+				v.as_str().ok_or_else(|| {
+					MergeError::Validation(format!(
+						"pusher_directions[{i}].label must be a string when present"
+					))
+				})
 			})
-		})
-		.collect()
+			.transpose()?
+			.map(str::to_string);
+		let l1_chain_id = t
+			.get("l1_chain_id")
+			.map(|v| {
+				v.as_integer().ok_or_else(|| {
+					MergeError::Validation(format!(
+						"pusher_directions[{i}].l1_chain_id must be an integer when present"
+					))
+				})
+			})
+			.transpose()?
+			.map(|x| x.max(0) as u64);
+		let l2_chain_id = t
+			.get("l2_chain_id")
+			.map(|v| {
+				v.as_integer().ok_or_else(|| {
+					MergeError::Validation(format!(
+						"pusher_directions[{i}].l2_chain_id must be an integer when present"
+					))
+				})
+			})
+			.transpose()?
+			.map(|x| x.max(0) as u64);
+		let batch_size = t
+			.get("batch_size")
+			.map(|v| {
+				v.as_integer().ok_or_else(|| {
+					MergeError::Validation(format!(
+						"pusher_directions[{i}].batch_size must be an integer when present"
+					))
+				})
+			})
+			.transpose()?
+			.map(|x| x.max(0) as u64);
+
+		out.push(OperatorPusherDirectionConfig {
+			pusher_address,
+			buffer_address,
+			push_cooldown_seconds,
+			l2_params,
+			l2_transaction_data,
+			label,
+			l1_chain_id,
+			l2_chain_id,
+			batch_size,
+		});
+	}
+
+	Ok(out)
 }
 
 #[cfg(test)]
@@ -5692,7 +5767,7 @@ gas_limit = 200000
 "#;
 		let val: toml::Value = toml::from_str(toml_str).unwrap();
 		let broadcaster_toml = val.get("broadcaster");
-		let dirs = extract_pusher_directions(broadcaster_toml);
+		let dirs = extract_pusher_directions(broadcaster_toml).unwrap();
 		assert_eq!(dirs.len(), 1);
 		let d = &dirs[0];
 		assert_eq!(d.label.as_deref(), Some("eth-to-op"));
@@ -5713,13 +5788,13 @@ gas_limit = 200000
 	#[test]
 	fn test_extract_pusher_directions_empty_when_missing() {
 		let val: toml::Value = toml::from_str("[broadcaster]\n").unwrap();
-		let dirs = extract_pusher_directions(val.get("broadcaster"));
+		let dirs = extract_pusher_directions(val.get("broadcaster")).unwrap();
 		assert!(dirs.is_empty());
 	}
 
 	#[test]
-	fn test_extract_pusher_directions_skips_invalid_entries() {
-		// Entry with missing pusher_address → should be skipped (filter_map returns None)
+	fn test_extract_pusher_directions_fails_on_invalid_entry() {
+		// Entry with missing pusher_address should fail hard with index context.
 		let toml_str = r#"
 [broadcaster]
 [[broadcaster.pusher_directions]]
@@ -5727,8 +5802,36 @@ buffer_address = "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 push_cooldown_seconds = 600
 "#;
 		let val: toml::Value = toml::from_str(toml_str).unwrap();
-		let dirs = extract_pusher_directions(val.get("broadcaster"));
-		assert!(dirs.is_empty(), "invalid entry should be skipped");
+		let err = extract_pusher_directions(val.get("broadcaster")).unwrap_err();
+		assert!(
+			err.to_string().contains("pusher_directions[0].pusher_address"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[test]
+	fn test_extract_pusher_directions_fails_when_any_entry_is_invalid() {
+		let toml_str = r#"
+[broadcaster]
+[[broadcaster.pusher_directions]]
+pusher_address = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+buffer_address = "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+push_cooldown_seconds = 600
+
+[broadcaster.pusher_directions.l2_params]
+type = "op_stack"
+gas_limit = 200000
+
+[[broadcaster.pusher_directions]]
+buffer_address = "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+push_cooldown_seconds = 600
+"#;
+		let val: toml::Value = toml::from_str(toml_str).unwrap();
+		let err = extract_pusher_directions(val.get("broadcaster")).unwrap_err();
+		assert!(
+			err.to_string().contains("pusher_directions[1].pusher_address"),
+			"unexpected error: {err}"
+		);
 	}
 
 	#[test]
