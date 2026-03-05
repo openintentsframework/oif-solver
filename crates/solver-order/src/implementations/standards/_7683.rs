@@ -662,15 +662,13 @@ impl OrderInterface for Eip7683OrderImpl {
 
 			if output_oracle == [0u8; 32] {
 				return Err(OrderError::ValidationFailed(format!(
-					"Zero oracle not allowed for cross-chain output at index {} on chain {}",
-					output_index, dest_chain
+					"Zero oracle not allowed for cross-chain output at index {output_index} on chain {dest_chain}"
 				)));
 			}
 
 			if output_oracle[..12].iter().any(|&byte| byte != 0) {
 				return Err(OrderError::ValidationFailed(format!(
-						"Output oracle has dirty upper bytes for cross-chain output at index {} on chain {}",
-						output_index, dest_chain
+						"Output oracle has dirty upper bytes for cross-chain output at index {output_index} on chain {dest_chain}"
 					)));
 			}
 
