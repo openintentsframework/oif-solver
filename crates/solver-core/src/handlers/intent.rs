@@ -78,13 +78,7 @@ impl IntentHandler {
 	) -> Self {
 		let static_config = dynamic_config.blocking_read().clone();
 		let ofac_addresses = Self::load_ofac_list(static_config.solver.ofac_list.as_deref());
-		if static_config
-			.solver
-			.ofac_list
-			.as_deref()
-			.is_some_and(|p| !p.is_empty())
-			&& ofac_addresses.is_empty()
-		{
+		if ofac_addresses.is_empty() {
 			tracing::warn!("OFAC sanctions list could not be loaded. Enforcement is DISABLED!");
 		}
 		Self {
