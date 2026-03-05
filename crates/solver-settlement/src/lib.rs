@@ -192,26 +192,26 @@ pub trait SettlementInterface: Send + Sync {
 				let index = (context as usize) % oracles.len();
 				oracles.get(index).cloned()
 			},
-				OracleSelectionStrategy::Random => {
-					let context = selection_context.unwrap_or_else(|| {
-						std::time::SystemTime::now()
-							.duration_since(std::time::UNIX_EPOCH)
-							.map(|d| d.as_nanos() as u64)
-							.unwrap_or(0)
-					});
+			OracleSelectionStrategy::Random => {
+				let context = selection_context.unwrap_or_else(|| {
+					std::time::SystemTime::now()
+						.duration_since(std::time::UNIX_EPOCH)
+						.map(|d| d.as_nanos() as u64)
+						.unwrap_or(0)
+				});
 
-					// Stable FNV-1a hash over the context bytes so the same context
-					// always maps to the same oracle across calls and processes.
-					let mut hash: u64 = 0xcbf29ce484222325;
-					for byte in context.to_le_bytes() {
-						hash ^= u64::from(byte);
-						hash = hash.wrapping_mul(0x00000100000001b3);
-					}
-					let index = (hash as usize) % oracles.len();
-					oracles.get(index).cloned()
-				},
-			}
+				// Stable FNV-1a hash over the context bytes so the same context
+				// always maps to the same oracle across calls and processes.
+				let mut hash: u64 = 0xcbf29ce484222325;
+				for byte in context.to_le_bytes() {
+					hash ^= u64::from(byte);
+					hash = hash.wrapping_mul(0x00000100000001b3);
+				}
+				let index = (hash as usize) % oracles.len();
+				oracles.get(index).cloned()
+			},
 		}
+	}
 
 	/// Returns the configuration schema for this settlement implementation.
 	///
@@ -626,18 +626,18 @@ impl SettlementService {
 			let Some(input_oracles) = input_oracles else {
 				continue;
 			};
-				let Some(output_oracles) = output_oracles else {
-					continue;
-				};
-				if input_oracles.is_empty() || output_oracles.is_empty() {
-					continue;
-				}
-				if !settlement.is_route_supported(origin_chain_id, destination_chain_id) {
-					continue;
-				}
+			let Some(output_oracles) = output_oracles else {
+				continue;
+			};
+			if input_oracles.is_empty() || output_oracles.is_empty() {
+				continue;
+			}
+			if !settlement.is_route_supported(origin_chain_id, destination_chain_id) {
+				continue;
+			}
 
-				let input_oracle = settlement.select_oracle(input_oracles, Some(context))?;
-				let output_oracle = settlement.select_oracle(output_oracles, Some(context + 1))?;
+			let input_oracle = settlement.select_oracle(input_oracles, Some(context))?;
+			let output_oracle = settlement.select_oracle(output_oracles, Some(context + 1))?;
 
 			return Some((name.as_str(), settlement, input_oracle, output_oracle));
 		}
@@ -721,10 +721,7 @@ mod tests {
 	struct TestSchema;
 
 	impl ConfigSchema for TestSchema {
-		fn validate(
-			&self,
-			_config: &toml::Value,
-		) -> Result<(), solver_types::ValidationError> {
+		fn validate(&self, _config: &toml::Value) -> Result<(), solver_types::ValidationError> {
 			Ok(())
 		}
 	}

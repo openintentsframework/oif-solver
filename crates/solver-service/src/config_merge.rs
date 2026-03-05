@@ -2073,10 +2073,10 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		}
 
 		match implementation.as_str() {
-				"broadcaster" => {
-					settlement_priority.push(OperatorSettlementType::Broadcaster);
-					broadcaster = Some(extract_broadcaster_config(&config.settlement, &chain_ids)?);
-				},
+			"broadcaster" => {
+				settlement_priority.push(OperatorSettlementType::Broadcaster);
+				broadcaster = Some(extract_broadcaster_config(&config.settlement, &chain_ids)?);
+			},
 			"hyperlane" => {
 				settlement_priority.push(OperatorSettlementType::Hyperlane);
 				hyperlane = Some(extract_hyperlane_config(&config.settlement, &chain_ids));
@@ -5804,7 +5804,8 @@ push_cooldown_seconds = 600
 		let val: toml::Value = toml::from_str(toml_str).unwrap();
 		let err = extract_pusher_directions(val.get("broadcaster")).unwrap_err();
 		assert!(
-			err.to_string().contains("pusher_directions[0].pusher_address"),
+			err.to_string()
+				.contains("pusher_directions[0].pusher_address"),
 			"unexpected error: {err}"
 		);
 	}
@@ -5829,7 +5830,8 @@ push_cooldown_seconds = 600
 		let val: toml::Value = toml::from_str(toml_str).unwrap();
 		let err = extract_pusher_directions(val.get("broadcaster")).unwrap_err();
 		assert!(
-			err.to_string().contains("pusher_directions[1].pusher_address"),
+			err.to_string()
+				.contains("pusher_directions[1].pusher_address"),
 			"unexpected error: {err}"
 		);
 	}
