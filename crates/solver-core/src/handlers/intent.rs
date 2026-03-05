@@ -76,7 +76,7 @@ impl IntentHandler {
 		cost_profit_service: Arc<CostProfitService>,
 		dynamic_config: Arc<RwLock<Config>>,
 	) -> Self {
-		let static_config = dynamic_config.blocking_read().clone();
+		let static_config = tokio::task::block_in_place(|| dynamic_config.blocking_read().clone());
 		let ofac_addresses = Self::load_ofac_list(static_config.solver.ofac_list.as_deref());
 		if ofac_addresses.is_empty() {
 			tracing::warn!("OFAC sanctions list could not be loaded. Enforcement is DISABLED!");
