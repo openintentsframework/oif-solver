@@ -38,8 +38,8 @@ pub struct NetworkTokens {
 	pub input_settler: String,
 	/// Output settler contract address.
 	pub output_settler: String,
-	/// List of supported tokens on this network.
-	pub tokens: Vec<TokenInfo>,
+	/// List of supported assets on this network.
+	pub assets: Vec<TokenInfo>,
 }
 
 /// Information about a specific token.
@@ -55,10 +55,10 @@ pub struct TokenInfo {
 	pub decimals: u8,
 }
 
-/// Handles GET /api/v1/tokens requests.
+/// Handles GET /api/v1/assets requests.
 ///
-/// Returns all supported tokens across all configured networks.
-pub async fn get_tokens(State(solver): State<Arc<SolverEngine>>) -> Json<TokensResponse> {
+/// Returns all supported assets across all configured networks.
+pub async fn get_assets(State(solver): State<Arc<SolverEngine>>) -> Json<TokensResponse> {
 	let networks = solver.token_manager().get_networks().await;
 
 	let mut response = TokensResponse {
@@ -74,7 +74,7 @@ pub async fn get_tokens(State(solver): State<Arc<SolverEngine>>) -> Json<TokensR
 				network_type: network.network_type,
 				input_settler: with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
 				output_settler: with_0x_prefix(&hex::encode(&network.output_settler_address.0)),
-				tokens: network
+				assets: network
 					.tokens
 					.iter()
 					.map(|t| TokenInfo {
@@ -91,10 +91,10 @@ pub async fn get_tokens(State(solver): State<Arc<SolverEngine>>) -> Json<TokensR
 	Json(response)
 }
 
-/// Handles GET /api/v1/tokens/{chain_id} requests.
+/// Handles GET /api/v1/assets/{chain_id} requests.
 ///
-/// Returns supported tokens for a specific chain.
-pub async fn get_tokens_for_chain(
+/// Returns supported assets for a specific chain.
+pub async fn get_assets_for_chain(
 	Path(chain_id): Path<u64>,
 	State(solver): State<Arc<SolverEngine>>,
 ) -> Result<Json<NetworkTokens>, StatusCode> {
@@ -107,7 +107,7 @@ pub async fn get_tokens_for_chain(
 			network_type: network.network_type,
 			input_settler: with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
 			output_settler: with_0x_prefix(&hex::encode(&network.output_settler_address.0)),
-			tokens: network
+			assets: network
 				.tokens
 				.iter()
 				.map(|t| TokenInfo {
@@ -122,11 +122,11 @@ pub async fn get_tokens_for_chain(
 	}
 }
 
-/// Handles GET /api/v1/tokens requests using dynamic_config.
+/// Handles GET /api/v1/assets requests using dynamic_config.
 ///
-/// Returns all supported tokens across all configured networks.
+/// Returns all supported assets across all configured networks.
 /// This version reads from dynamic_config to support hot reload.
-pub async fn get_tokens_from_config(
+pub async fn get_assets_from_config(
 	State(dynamic_config): State<Arc<RwLock<Config>>>,
 ) -> Json<TokensResponse> {
 	let config = dynamic_config.read().await;
@@ -144,7 +144,7 @@ pub async fn get_tokens_from_config(
 				network_type: network.network_type,
 				input_settler: with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
 				output_settler: with_0x_prefix(&hex::encode(&network.output_settler_address.0)),
-				tokens: network
+				assets: network
 					.tokens
 					.iter()
 					.map(|t| TokenInfo {
@@ -161,11 +161,11 @@ pub async fn get_tokens_from_config(
 	Json(response)
 }
 
-/// Handles GET /api/v1/tokens/{chain_id} requests using dynamic_config.
+/// Handles GET /api/v1/assets/{chain_id} requests using dynamic_config.
 ///
-/// Returns supported tokens for a specific chain.
+/// Returns supported assets for a specific chain.
 /// This version reads from dynamic_config to support hot reload.
-pub async fn get_tokens_for_chain_from_config(
+pub async fn get_assets_for_chain_from_config(
 	Path(chain_id): Path<u64>,
 	State(dynamic_config): State<Arc<RwLock<Config>>>,
 ) -> Result<Json<NetworkTokens>, StatusCode> {
@@ -178,7 +178,7 @@ pub async fn get_tokens_for_chain_from_config(
 			network_type: network.network_type,
 			input_settler: with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
 			output_settler: with_0x_prefix(&hex::encode(&network.output_settler_address.0)),
-			tokens: network
+			assets: network
 				.tokens
 				.iter()
 				.map(|t| TokenInfo {
@@ -457,17 +457,17 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_get_tokens_returns_all_networks() {
+	async fn test_get_assets_returns_all_networks() {
 		let solver = create_mock_solver_engine().await;
-		let response = get_tokens(State(solver)).await;
+		let response = get_assets(State(solver)).await;
 
-		let tokens_response = response.0;
+		let assets_response = response.0;
 
 		// Should have 2 networks
-		assert_eq!(tokens_response.networks.len(), 2);
+		assert_eq!(assets_response.networks.len(), 2);
 
 		// Check Ethereum mainnet (chain ID 1)
-		let eth_network = tokens_response.networks.get("1").unwrap();
+		let eth_network = assets_response.networks.get("1").unwrap();
 		assert_eq!(eth_network.chain_id, 1);
 		assert_eq!(
 			eth_network.input_settler,
@@ -477,11 +477,11 @@ mod tests {
 			eth_network.output_settler,
 			"0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
 		);
-		assert_eq!(eth_network.tokens.len(), 2);
+		assert_eq!(eth_network.assets.len(), 2);
 
-		// Check tokens on Ethereum
+		// Check assets on Ethereum
 		let usdc_token = eth_network
-			.tokens
+			.assets
 			.iter()
 			.find(|t| t.symbol == "USDC")
 			.unwrap();
@@ -492,7 +492,7 @@ mod tests {
 		assert_eq!(usdc_token.decimals, 6);
 
 		let weth_token = eth_network
-			.tokens
+			.assets
 			.iter()
 			.find(|t| t.symbol == "WETH")
 			.unwrap();
@@ -503,7 +503,7 @@ mod tests {
 		assert_eq!(weth_token.decimals, 18);
 
 		// Check Polygon (chain ID 137)
-		let polygon_network = tokens_response.networks.get("137").unwrap();
+		let polygon_network = assets_response.networks.get("137").unwrap();
 		assert_eq!(polygon_network.chain_id, 137);
 		assert_eq!(
 			polygon_network.input_settler,
@@ -513,11 +513,11 @@ mod tests {
 			polygon_network.output_settler,
 			"0x1515151515151515151515151515151515151515"
 		);
-		assert_eq!(polygon_network.tokens.len(), 2);
+		assert_eq!(polygon_network.assets.len(), 2);
 
-		// Check tokens on Polygon
+		// Check assets on Polygon
 		let usdc_token = polygon_network
-			.tokens
+			.assets
 			.iter()
 			.find(|t| t.symbol == "USDC")
 			.unwrap();
@@ -527,7 +527,7 @@ mod tests {
 		);
 
 		let usdt_token = polygon_network
-			.tokens
+			.assets
 			.iter()
 			.find(|t| t.symbol == "USDT")
 			.unwrap();
@@ -539,39 +539,39 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_get_tokens_returns_empty_array_for_network_without_tokens() {
+	async fn test_get_assets_returns_empty_array_for_network_without_assets() {
 		let token_manager = create_mock_token_manager_with_empty_network();
 		let solver = create_mock_solver_engine_with_token_manager(token_manager).await;
-		let response = get_tokens(State(solver)).await;
-		let tokens_response = response.0;
+		let response = get_assets(State(solver)).await;
+		let assets_response = response.0;
 
-		let arbitrum = tokens_response.networks.get("42161").unwrap();
+		let arbitrum = assets_response.networks.get("42161").unwrap();
 		assert_eq!(arbitrum.chain_id, 42161);
-		assert!(arbitrum.tokens.is_empty());
+		assert!(arbitrum.assets.is_empty());
 	}
 
 	#[tokio::test]
-	async fn test_get_tokens_for_chain_valid_chain_id() {
+	async fn test_get_assets_for_chain_valid_chain_id() {
 		let solver = create_mock_solver_engine().await;
-		let response = get_tokens_for_chain(Path(1), State(solver)).await;
+		let response = get_assets_for_chain(Path(1), State(solver)).await;
 
 		assert!(response.is_ok());
-		let network_tokens = response.unwrap().0;
+		let network_assets = response.unwrap().0;
 
-		assert_eq!(network_tokens.chain_id, 1);
+		assert_eq!(network_assets.chain_id, 1);
 		assert_eq!(
-			network_tokens.input_settler,
+			network_assets.input_settler,
 			"0x0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
 		);
 		assert_eq!(
-			network_tokens.output_settler,
+			network_assets.output_settler,
 			"0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
 		);
-		assert_eq!(network_tokens.tokens.len(), 2);
+		assert_eq!(network_assets.assets.len(), 2);
 
-		// Verify token details
-		let usdc_token = network_tokens
-			.tokens
+		// Verify asset details
+		let usdc_token = network_assets
+			.assets
 			.iter()
 			.find(|t| t.symbol == "USDC")
 			.unwrap();
@@ -583,36 +583,36 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_get_tokens_for_chain_invalid_chain_id() {
+	async fn test_get_assets_for_chain_invalid_chain_id() {
 		let solver = create_mock_solver_engine().await;
-		let response = get_tokens_for_chain(Path(999), State(solver)).await;
+		let response = get_assets_for_chain(Path(999), State(solver)).await;
 
 		assert!(response.is_err());
 		assert_eq!(response.unwrap_err(), StatusCode::NOT_FOUND);
 	}
 
 	#[tokio::test]
-	async fn test_get_tokens_for_chain_polygon() {
+	async fn test_get_assets_for_chain_polygon() {
 		let solver = create_mock_solver_engine().await;
-		let response = get_tokens_for_chain(Path(137), State(solver)).await;
+		let response = get_assets_for_chain(Path(137), State(solver)).await;
 
 		assert!(response.is_ok());
-		let network_tokens = response.unwrap().0;
+		let network_assets = response.unwrap().0;
 
-		assert_eq!(network_tokens.chain_id, 137);
+		assert_eq!(network_assets.chain_id, 137);
 		assert_eq!(
-			network_tokens.input_settler,
+			network_assets.input_settler,
 			"0x1414141414141414141414141414141414141414"
 		);
 		assert_eq!(
-			network_tokens.output_settler,
+			network_assets.output_settler,
 			"0x1515151515151515151515151515151515151515"
 		);
-		assert_eq!(network_tokens.tokens.len(), 2);
+		assert_eq!(network_assets.assets.len(), 2);
 
 		// Should have USDC and USDT
-		let symbols: Vec<&str> = network_tokens
-			.tokens
+		let symbols: Vec<&str> = network_assets
+			.assets
 			.iter()
 			.map(|t| t.symbol.as_str())
 			.collect();
@@ -621,7 +621,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_tokens_response_serialization() {
+	fn test_assets_response_serialization() {
 		let mut networks = HashMap::new();
 		networks.insert(
 			"1".to_string(),
@@ -631,7 +631,7 @@ mod tests {
 				network_type: NetworkType::Parent,
 				input_settler: "0x1234567890123456789012345678901234567890".to_string(),
 				output_settler: "0x0987654321098765432109876543210987654321".to_string(),
-				tokens: vec![TokenInfo {
+				assets: vec![TokenInfo {
 					address: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
 					symbol: "TEST".to_string(),
 					name: Some("Test Token".to_string()),
@@ -650,14 +650,14 @@ mod tests {
 	}
 
 	#[test]
-	fn test_network_tokens_serialization() {
-		let network_tokens = NetworkTokens {
+	fn test_network_assets_serialization() {
+		let network_assets = NetworkTokens {
 			chain_id: 42,
 			name: Some("testnet".to_string()),
 			network_type: NetworkType::New,
 			input_settler: "0x1111111111111111111111111111111111111111".to_string(),
 			output_settler: "0x2222222222222222222222222222222222222222".to_string(),
-			tokens: vec![
+			assets: vec![
 				TokenInfo {
 					address: "0x3333333333333333333333333333333333333333".to_string(),
 					symbol: "TOKEN1".to_string(),
@@ -674,7 +674,7 @@ mod tests {
 		};
 
 		// Test that it can be serialized to JSON
-		let json = serde_json::to_string(&network_tokens).unwrap();
+		let json = serde_json::to_string(&network_assets).unwrap();
 		assert!(json.contains("\"chain_id\":42"));
 		assert!(json.contains("\"TOKEN1\""));
 		assert!(json.contains("\"TOKEN2\""));
@@ -830,18 +830,18 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_get_tokens_from_config_returns_all_networks() {
+	async fn test_get_assets_from_config_returns_all_networks() {
 		let config = create_test_config();
 		let dynamic_config = Arc::new(RwLock::new(config));
 
-		let response = get_tokens_from_config(State(dynamic_config)).await;
-		let tokens_response = response.0;
+		let response = get_assets_from_config(State(dynamic_config)).await;
+		let assets_response = response.0;
 
 		// Should have 2 networks
-		assert_eq!(tokens_response.networks.len(), 2);
+		assert_eq!(assets_response.networks.len(), 2);
 
 		// Check Ethereum mainnet (chain ID 1)
-		let eth_network = tokens_response.networks.get("1").unwrap();
+		let eth_network = assets_response.networks.get("1").unwrap();
 		assert_eq!(eth_network.chain_id, 1);
 		assert_eq!(
 			eth_network.input_settler,
@@ -851,53 +851,53 @@ mod tests {
 			eth_network.output_settler,
 			"0x2222222222222222222222222222222222222222"
 		);
-		assert_eq!(eth_network.tokens.len(), 2);
+		assert_eq!(eth_network.assets.len(), 2);
 
-		// Check tokens on Ethereum
+		// Check assets on Ethereum
 		let usdc = eth_network
-			.tokens
+			.assets
 			.iter()
 			.find(|t| t.symbol == "USDC")
 			.unwrap();
 		assert_eq!(usdc.decimals, 6);
 
 		let weth = eth_network
-			.tokens
+			.assets
 			.iter()
 			.find(|t| t.symbol == "WETH")
 			.unwrap();
 		assert_eq!(weth.decimals, 18);
 
 		// Check Polygon (chain ID 137)
-		let polygon_network = tokens_response.networks.get("137").unwrap();
+		let polygon_network = assets_response.networks.get("137").unwrap();
 		assert_eq!(polygon_network.chain_id, 137);
-		assert_eq!(polygon_network.tokens.len(), 1);
+		assert_eq!(polygon_network.assets.len(), 1);
 	}
 
 	#[tokio::test]
-	async fn test_get_tokens_from_config_returns_empty_token_arrays() {
+	async fn test_get_assets_from_config_returns_empty_asset_arrays() {
 		let config = create_test_config_with_empty_tokens();
 		let dynamic_config = Arc::new(RwLock::new(config));
 
-		let response = get_tokens_from_config(State(dynamic_config)).await;
-		let tokens_response = response.0;
+		let response = get_assets_from_config(State(dynamic_config)).await;
+		let assets_response = response.0;
 
-		assert_eq!(tokens_response.networks.len(), 2);
-		assert!(tokens_response.networks.get("1").unwrap().tokens.is_empty());
-		assert!(tokens_response
+		assert_eq!(assets_response.networks.len(), 2);
+		assert!(assets_response.networks.get("1").unwrap().assets.is_empty());
+		assert!(assets_response
 			.networks
 			.get("137")
 			.unwrap()
-			.tokens
+			.assets
 			.is_empty());
 	}
 
 	#[tokio::test]
-	async fn test_get_tokens_for_chain_from_config_valid_chain() {
+	async fn test_get_assets_for_chain_from_config_valid_chain() {
 		let config = create_test_config();
 		let dynamic_config = Arc::new(RwLock::new(config));
 
-		let response = get_tokens_for_chain_from_config(Path(1), State(dynamic_config)).await;
+		let response = get_assets_for_chain_from_config(Path(1), State(dynamic_config)).await;
 
 		assert!(response.is_ok());
 		let network = response.unwrap().0;
@@ -911,26 +911,26 @@ mod tests {
 			network.output_settler,
 			"0x2222222222222222222222222222222222222222"
 		);
-		assert_eq!(network.tokens.len(), 2);
+		assert_eq!(network.assets.len(), 2);
 	}
 
 	#[tokio::test]
-	async fn test_get_tokens_for_chain_from_config_invalid_chain() {
+	async fn test_get_assets_for_chain_from_config_invalid_chain() {
 		let config = create_test_config();
 		let dynamic_config = Arc::new(RwLock::new(config));
 
-		let response = get_tokens_for_chain_from_config(Path(999), State(dynamic_config)).await;
+		let response = get_assets_for_chain_from_config(Path(999), State(dynamic_config)).await;
 
 		assert!(response.is_err());
 		assert_eq!(response.unwrap_err(), StatusCode::NOT_FOUND);
 	}
 
 	#[tokio::test]
-	async fn test_get_tokens_for_chain_from_config_polygon() {
+	async fn test_get_assets_for_chain_from_config_polygon() {
 		let config = create_test_config();
 		let dynamic_config = Arc::new(RwLock::new(config));
 
-		let response = get_tokens_for_chain_from_config(Path(137), State(dynamic_config)).await;
+		let response = get_assets_for_chain_from_config(Path(137), State(dynamic_config)).await;
 
 		assert!(response.is_ok());
 		let network = response.unwrap().0;
@@ -940,20 +940,20 @@ mod tests {
 			network.input_settler,
 			"0x5555555555555555555555555555555555555555"
 		);
-		assert_eq!(network.tokens.len(), 1);
-		assert_eq!(network.tokens[0].symbol, "USDC");
+		assert_eq!(network.assets.len(), 1);
+		assert_eq!(network.assets[0].symbol, "USDC");
 	}
 
 	#[tokio::test]
-	async fn test_get_tokens_for_chain_from_config_empty_tokens() {
+	async fn test_get_assets_for_chain_from_config_empty_assets() {
 		let config = create_test_config_with_empty_tokens();
 		let dynamic_config = Arc::new(RwLock::new(config));
 
-		let response = get_tokens_for_chain_from_config(Path(137), State(dynamic_config)).await;
+		let response = get_assets_for_chain_from_config(Path(137), State(dynamic_config)).await;
 		assert!(response.is_ok());
 
 		let network = response.unwrap().0;
 		assert_eq!(network.chain_id, 137);
-		assert!(network.tokens.is_empty());
+		assert!(network.assets.is_empty());
 	}
 }
