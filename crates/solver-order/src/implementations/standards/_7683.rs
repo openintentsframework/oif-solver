@@ -314,6 +314,20 @@ impl OrderInterface for Eip7683OrderImpl {
 				OrderError::ValidationFailed("No cross-chain output found".to_string())
 			})?;
 
+		// Defense in depth: cross-chain outputs must have a canonical non-zero oracle.
+		if output.oracle == [0u8; 32] {
+			return Err(OrderError::ValidationFailed(format!(
+				"Zero oracle not allowed for cross-chain output on chain {}",
+				output.chain_id.to::<u64>()
+			)));
+		}
+		if output.oracle[..12].iter().any(|&byte| byte != 0) {
+			return Err(OrderError::ValidationFailed(format!(
+				"Output oracle has dirty upper bytes for cross-chain output on chain {}",
+				output.chain_id.to::<u64>()
+			)));
+		}
+
 		// Get the output settler address from the order
 		let dest_chain_id = output.chain_id.to::<u64>();
 		let output_chain = order
@@ -427,6 +441,22 @@ impl OrderInterface for Eip7683OrderImpl {
 			.outputs
 			.iter()
 			.map(|output| -> Result<SolMandateOutput, OrderError> {
+				if output.chain_id != order_data.origin_chain_id {
+					// Defense in depth for claim calldata construction.
+					if output.oracle == [0u8; 32] {
+						return Err(OrderError::ValidationFailed(format!(
+							"Zero oracle not allowed for cross-chain output on chain {}",
+							output.chain_id.to::<u64>()
+						)));
+					}
+					if output.oracle[..12].iter().any(|&byte| byte != 0) {
+						return Err(OrderError::ValidationFailed(format!(
+								"Output oracle has dirty upper bytes for cross-chain output on chain {}",
+								output.chain_id.to::<u64>()
+							)));
+					}
+				}
+
 				// Use the oracle value from the original order
 				let oracle_bytes32 = FixedBytes::<32>::from(output.oracle);
 
@@ -613,7 +643,7 @@ impl OrderInterface for Eip7683OrderImpl {
 			supported_outputs.iter().map(|info| info.chain_id).collect();
 
 		// Single pass validation for all outputs
-		for output in &standard_order.outputs {
+		for (output_index, output) in standard_order.outputs.iter().enumerate() {
 			let dest_chain = output.chainId.to::<u64>();
 
 			// Skip same-chain outputs as they don't need cross-chain routes
@@ -628,31 +658,34 @@ impl OrderInterface for Eip7683OrderImpl {
 				)));
 			}
 
-			// If a specific output oracle is specified, validate it
-			if output.oracle != [0u8; 32] {
-				// Check if this specific output oracle is compatible with input oracle
-				// Use address normalization to compare regardless of padding format
-				let mut found_compatible = false;
-				for supported in supported_outputs.iter() {
-					if supported.chain_id == dest_chain {
-						let addresses_match = solver_types::utils::conversion::addresses_equal(
-							&supported.oracle.0,
-							output.oracle.as_slice(),
-						);
-						if addresses_match {
-							found_compatible = true;
-							break;
-						}
-					}
-				}
-				let is_compatible = found_compatible;
+			let output_oracle = output.oracle.0;
 
-				if !is_compatible {
-					return Err(OrderError::ValidationFailed(format!(
+			if output_oracle == [0u8; 32] {
+				return Err(OrderError::ValidationFailed(format!(
+					"Zero oracle not allowed for cross-chain output at index {output_index} on chain {dest_chain}"
+				)));
+			}
+
+			if output_oracle[..12].iter().any(|&byte| byte != 0) {
+				return Err(OrderError::ValidationFailed(format!(
+						"Output oracle has dirty upper bytes for cross-chain output at index {output_index} on chain {dest_chain}"
+					)));
+			}
+
+			// Check if this specific output oracle is compatible with input oracle.
+			// Output oracle is a clean bytes32 address, so exact lower-20-byte match is required.
+			let output_oracle_address = &output_oracle[12..32];
+			let is_compatible = supported_outputs.iter().any(|supported| {
+				supported.chain_id == dest_chain
+					&& supported.oracle.0.len() == 20
+					&& supported.oracle.0.as_slice() == output_oracle_address
+			});
+
+			if !is_compatible {
+				return Err(OrderError::ValidationFailed(format!(
 						"Output oracle {:?} on chain {} is not compatible with input oracle {:?} on chain {}",
 						output.oracle, dest_chain, input_oracle, origin_chain
 					)));
-				}
 			}
 		}
 
@@ -878,7 +911,11 @@ mod tests {
 	}
 
 	fn create_test_order_data() -> Eip7683OrderData {
-		Eip7683OrderDataBuilder::new().build()
+		let mut order_data = Eip7683OrderDataBuilder::new().build();
+		let mut output_oracle = [0u8; 32];
+		output_oracle[12..32].copy_from_slice(&[11u8; 20]);
+		order_data.outputs[0].oracle = output_oracle;
+		order_data
 	}
 
 	fn create_test_intent(order_data: Eip7683OrderData, source: &str) -> Intent {
@@ -896,6 +933,8 @@ mod tests {
 		use solver_types::current_timestamp;
 
 		let current_time = current_timestamp() as u32;
+		let mut output_oracle = [0u8; 32];
+		output_oracle[12..32].copy_from_slice(&[11u8; 20]);
 		interfaces::StandardOrder {
 			user: AlloyAddress::from([0x11; 20]),
 			nonce: U256::from(123),
@@ -905,7 +944,7 @@ mod tests {
 			inputOracle: AlloyAddress::from([10u8; 20]), // Matches test oracle routes
 			inputs: vec![[U256::from(100), U256::from(200)]],
 			outputs: vec![interfaces::SolMandateOutput {
-				oracle: B256::from([11u8; 32]), // Matches test oracle routes
+				oracle: B256::from(output_oracle), // Canonical bytes32 form of supported output oracle
 				settler: B256::from([0x44; 32]),
 				chainId: U256::from(137), // Cross-chain output
 				token: B256::from([0x55; 32]),
@@ -1061,6 +1100,62 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn test_generate_fill_transaction_rejects_zero_oracle_for_cross_chain_output() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut order_data = create_test_order_data();
+		order_data.outputs[0].oracle = [0u8; 32];
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_solver_address(Address(vec![99u8; 20]))
+			.with_quote_id(Some("test-quote".to_string()))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![137])
+			.build();
+		let params = ExecutionParams {
+			gas_price: U256::ZERO,
+			priority_fee: None,
+		};
+
+		let result = order_impl.generate_fill_transaction(&order, &params).await;
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Zero oracle not allowed for cross-chain output"));
+	}
+
+	#[tokio::test]
+	async fn test_generate_fill_transaction_rejects_dirty_oracle_upper_bytes() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut order_data = create_test_order_data();
+		order_data.outputs[0].oracle[0] = 0xAA;
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_solver_address(Address(vec![99u8; 20]))
+			.with_quote_id(Some("test-quote".to_string()))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![137])
+			.build();
+		let params = ExecutionParams {
+			gas_price: U256::ZERO,
+			priority_fee: None,
+		};
+
+		let result = order_impl.generate_fill_transaction(&order, &params).await;
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Output oracle has dirty upper bytes"));
+	}
+
+	#[tokio::test]
 	async fn test_generate_claim_transaction_escrow() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
@@ -1129,6 +1224,39 @@ mod tests {
 		assert_eq!(tx.chain_id, 1); // origin chain
 		assert_eq!(tx.to, Some(Address(vec![0x11; 20])));
 		assert!(!tx.data.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_generate_claim_transaction_rejects_dirty_oracle_upper_bytes() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut order_data = create_test_order_data();
+		order_data.outputs[0].oracle[0] = 0xAA;
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_solver_address(Address(vec![99u8; 20]))
+			.with_quote_id(Some("test-quote".to_string()))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![137])
+			.build();
+		let fill_proof = FillProof {
+			tx_hash: TransactionHash(hex::decode("abcd").unwrap()),
+			block_number: 12345,
+			attestation_data: Some(b"proof".to_vec()),
+			filled_timestamp: 123456789,
+			oracle_address: "0x0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B".to_string(),
+		};
+
+		let result = order_impl
+			.generate_claim_transaction(&order, &fill_proof)
+			.await;
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Output oracle has dirty upper bytes"));
 	}
 
 	#[test]
@@ -1313,8 +1441,10 @@ mod tests {
 		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let mut standard_order = create_valid_standard_order();
-		// Use incompatible output oracle (different from what's supported)
-		standard_order.outputs[0].oracle = alloy_primitives::B256::from([0x99; 32]);
+		// Use incompatible but clean output oracle (different from what's supported)
+		let mut incompatible_oracle = [0u8; 32];
+		incompatible_oracle[12..32].copy_from_slice(&[0x99; 20]);
+		standard_order.outputs[0].oracle = alloy_primitives::B256::from(incompatible_oracle);
 		let order_bytes = encode_standard_order(&standard_order);
 
 		let result = order_impl.validate_order(&order_bytes).await;
@@ -1325,18 +1455,44 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_validate_order_zero_output_oracle_allowed() {
+	async fn test_validate_order_rejects_zero_output_oracle_for_cross_chain() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
 		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let mut standard_order = create_valid_standard_order();
-		// Use zero oracle (should be allowed - means any compatible oracle can be used)
+		// Zero oracle is not allowed for cross-chain outputs.
 		standard_order.outputs[0].oracle = alloy_primitives::B256::from([0x00; 32]);
 		let order_bytes = encode_standard_order(&standard_order);
 
 		let result = order_impl.validate_order(&order_bytes).await;
-		assert!(result.is_ok());
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Zero oracle not allowed for cross-chain output"));
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_rejects_dirty_output_oracle_upper_bytes() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		// Dirty upper bytes, but lower 20 bytes still match the supported oracle.
+		let mut dirty_oracle = [0u8; 32];
+		dirty_oracle[0..12].copy_from_slice(&[0xAA; 12]);
+		dirty_oracle[12..32].copy_from_slice(&[11u8; 20]);
+		standard_order.outputs[0].oracle = alloy_primitives::B256::from(dirty_oracle);
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.to_string()
+			.contains("Output oracle has dirty upper bytes"));
 	}
 
 	#[tokio::test]
@@ -1742,9 +1898,11 @@ mod tests {
 		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let mut standard_order = create_valid_standard_order();
+		let mut arbitrum_oracle = [0u8; 32];
+		arbitrum_oracle[12..32].copy_from_slice(&[12u8; 20]);
 		// Add a second output on a different destination chain (Arbitrum)
 		standard_order.outputs.push(interfaces::SolMandateOutput {
-			oracle: alloy_primitives::B256::from([12u8; 32]), // Different oracle for Arbitrum
+			oracle: alloy_primitives::B256::from(arbitrum_oracle), // Different oracle for Arbitrum
 			settler: alloy_primitives::B256::from([0x44; 32]),
 			chainId: U256::from(42161), // Arbitrum chain ID (different from first output)
 			token: alloy_primitives::B256::from([0x77; 32]),
