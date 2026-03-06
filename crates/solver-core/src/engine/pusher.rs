@@ -469,4 +469,37 @@ mod tests {
 		// Low 8 bytes must encode fee big-endian
 		assert_eq!(&l2_data[24..32], &fee.to_be_bytes(), "fee bytes mismatch");
 	}
+
+	#[tokio::test]
+	async fn test_push_if_needed_skips_when_cooldown_active() {
+		let direction = make_direction(PusherL2Params::Raw {
+			data: "0x".to_string(),
+			value_wei: None,
+		});
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let cooldowns = Arc::new(tokio::sync::Mutex::new(HashMap::<String, Instant>::from([
+			(direction.label.clone(), Instant::now()),
+		])));
+
+		push_if_needed(&direction, 12345, &delivery, &HashMap::new(), &cooldowns).await;
+
+		let guard = cooldowns.lock().await;
+		assert_eq!(guard.len(), 1);
+		assert!(guard.contains_key("test"));
+	}
+
+	#[tokio::test]
+	async fn test_push_if_needed_returns_on_provider_creation_failure() {
+		let direction = make_direction(PusherL2Params::Raw {
+			data: "0x".to_string(),
+			value_wei: None,
+		});
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let cooldowns = Arc::new(tokio::sync::Mutex::new(HashMap::<String, Instant>::new()));
+
+		push_if_needed(&direction, 12345, &delivery, &HashMap::new(), &cooldowns).await;
+
+		let guard = cooldowns.lock().await;
+		assert!(guard.is_empty());
+	}
 }

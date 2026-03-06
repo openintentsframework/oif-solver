@@ -5263,6 +5263,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

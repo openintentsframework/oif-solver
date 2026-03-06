@@ -88,6 +88,39 @@ pub struct PusherDirection {
 	pub l2_params: PusherL2Params,
 }
 
+#[derive(Debug, Clone)]
+pub enum WaitingReason {
+	Unknown,
+	NoSubmissionState,
+	WaitingForProofDelay {
+		until: u64,
+	},
+	WaitingForFinality {
+		current_block: u64,
+		required_block: u64,
+	},
+	ProofNotCommittedYet,
+	ProofServiceNotReady,
+	RpcUnavailable,
+	StorageUnavailable,
+}
+
+#[derive(Debug, Clone)]
+pub enum ActionRequired {
+	BufferBehind {
+		direction: PusherDirection,
+		required_block: u64,
+	},
+}
+
+#[derive(Debug, Clone)]
+pub enum SettlementReadiness {
+	Ready,
+	Waiting(WaitingReason),
+	NeedsAction(ActionRequired),
+	PermanentFailure(String),
+}
+
 /// Strategy for selecting oracles when multiple are available
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OracleSelectionStrategy {
@@ -233,6 +266,16 @@ pub trait SettlementInterface: Send + Sync {
 		tx_hash: &TransactionHash,
 	) -> Result<FillProof, SettlementError>;
 
+	/// Attempts to recover already-submitted post-fill state when local solver state
+	/// is missing or incomplete.
+	///
+	/// Returns `Ok(true)` when the settlement found and reconstructed existing
+	/// post-fill state, `Ok(false)` when nothing was recovered, and `Err(...)` for
+	/// settlement-specific recovery failures.
+	async fn recover_post_fill_state(&self, _order: &Order) -> Result<bool, SettlementError> {
+		Ok(false)
+	}
+
 	/// Checks if the solver can claim rewards for this fill.
 	///
 	/// This method should check on-chain conditions such as:
@@ -241,6 +284,18 @@ pub trait SettlementInterface: Send + Sync {
 	/// - Solver permissions
 	/// - Reward availability
 	async fn can_claim(&self, order: &Order, fill_proof: &FillProof) -> bool;
+
+	/// Returns detailed settlement readiness information for this order/fill pair.
+	///
+	/// The default implementation preserves compatibility for settlements that only
+	/// implement `can_claim()`.
+	async fn readiness(&self, order: &Order, fill_proof: &FillProof) -> SettlementReadiness {
+		if self.can_claim(order, fill_proof).await {
+			SettlementReadiness::Ready
+		} else {
+			SettlementReadiness::Waiting(WaitingReason::Unknown)
+		}
+	}
 
 	/// Generates a transaction to execute after fill confirmation (optional).
 	///
@@ -419,6 +474,21 @@ impl SettlementService {
 			.ok()?
 			.buffer_coverage_check(order)
 			.await
+	}
+
+	/// Attempts to recover already-broadcast post-fill state for an order.
+	pub async fn recover_post_fill_state(&self, order: &Order) -> Result<bool, SettlementError> {
+		self.find_settlement_for_order(order)?
+			.recover_post_fill_state(order)
+			.await
+	}
+
+	/// Returns typed settlement readiness for an order/fill pair.
+	pub async fn readiness(&self, order: &Order, fill_proof: &FillProof) -> SettlementReadiness {
+		match self.find_settlement_for_order(order) {
+			Ok(implementation) => implementation.readiness(order, fill_proof).await,
+			Err(e) => SettlementReadiness::PermanentFailure(e.to_string()),
+		}
 	}
 
 	/// Build oracle routes from all settlement implementations.
@@ -716,7 +786,8 @@ impl SettlementService {
 mod tests {
 	use super::*;
 	use async_trait::async_trait;
-	use solver_types::ConfigSchema;
+	use solver_types::utils::tests::builders::OrderBuilder;
+	use solver_types::{ConfigSchema, TransactionReceipt};
 
 	struct TestSchema;
 
@@ -728,6 +799,15 @@ mod tests {
 
 	struct TestSettlement {
 		config: OracleConfig,
+		can_claim: bool,
+		attestation: Option<FillProof>,
+		attestation_should_fail: bool,
+		recover_post_fill: bool,
+		recover_post_fill_should_fail: bool,
+		readiness_override: Option<SettlementReadiness>,
+		buffer_coverage: Option<(PusherDirection, u64)>,
+		post_fill_tx: Option<Transaction>,
+		pre_claim_tx: Option<Transaction>,
 	}
 
 	#[async_trait]
@@ -745,18 +825,105 @@ mod tests {
 			_order: &Order,
 			_tx_hash: &TransactionHash,
 		) -> Result<FillProof, SettlementError> {
-			Err(SettlementError::ValidationFailed(
-				"not used in tests".to_string(),
-			))
+			if self.attestation_should_fail {
+				return Err(SettlementError::ValidationFailed(
+					"attestation failed".to_string(),
+				));
+			}
+
+			self.attestation
+				.clone()
+				.ok_or_else(|| SettlementError::ValidationFailed("attestation missing".to_string()))
 		}
 
 		async fn can_claim(&self, _order: &Order, _fill_proof: &FillProof) -> bool {
-			false
+			self.can_claim
+		}
+
+		async fn recover_post_fill_state(&self, _order: &Order) -> Result<bool, SettlementError> {
+			if self.recover_post_fill_should_fail {
+				return Err(SettlementError::ValidationFailed(
+					"recovery failed".to_string(),
+				));
+			}
+			Ok(self.recover_post_fill)
+		}
+
+		async fn readiness(&self, order: &Order, fill_proof: &FillProof) -> SettlementReadiness {
+			if let Some(readiness) = self.readiness_override.clone() {
+				readiness
+			} else {
+				let _ = (order, fill_proof);
+				if self.can_claim {
+					SettlementReadiness::Ready
+				} else {
+					SettlementReadiness::Waiting(WaitingReason::Unknown)
+				}
+			}
+		}
+
+		async fn buffer_coverage_check(&self, _order: &Order) -> Option<(PusherDirection, u64)> {
+			self.buffer_coverage.clone()
+		}
+
+		async fn generate_post_fill_transaction(
+			&self,
+			_order: &Order,
+			_fill_receipt: &TransactionReceipt,
+		) -> Result<Option<Transaction>, SettlementError> {
+			Ok(self.post_fill_tx.clone())
+		}
+
+		async fn generate_pre_claim_transaction(
+			&self,
+			_order: &Order,
+			_fill_proof: &FillProof,
+		) -> Result<Option<Transaction>, SettlementError> {
+			Ok(self.pre_claim_tx.clone())
 		}
 	}
 
 	fn addr(byte: u8) -> Address {
 		Address(vec![byte; 20])
+	}
+
+	fn sample_fill_proof() -> FillProof {
+		FillProof {
+			tx_hash: TransactionHash(vec![0xaa; 32]),
+			block_number: 1,
+			attestation_data: None,
+			filled_timestamp: 1,
+			oracle_address: "0x1234567890123456789012345678901234567890".into(),
+		}
+	}
+
+	fn sample_tx(chain_id: u64) -> Transaction {
+		Transaction {
+			to: Some(addr(0x55)),
+			data: vec![0xde, 0xad, 0xbe, 0xef],
+			value: alloy_primitives::U256::ZERO,
+			chain_id,
+			nonce: None,
+			gas_limit: None,
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+		}
+	}
+
+	fn make_test_settlement(config: OracleConfig) -> TestSettlement {
+		TestSettlement {
+			config,
+			can_claim: false,
+			attestation: Some(sample_fill_proof()),
+			attestation_should_fail: false,
+			recover_post_fill: false,
+			recover_post_fill_should_fail: false,
+			readiness_override: None,
+			buffer_coverage: None,
+			post_fill_tx: None,
+			pre_claim_tx: None,
+		}
 	}
 
 	#[test]
@@ -767,15 +934,49 @@ mod tests {
 	}
 
 	#[test]
+	fn test_new_with_order_filters_unknown_names_and_appends_remaining() {
+		let alpha = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		let beta = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+
+		let service = SettlementService::new_with_order(
+			HashMap::from([
+				(
+					"alpha".to_string(),
+					Box::new(alpha) as Box<dyn SettlementInterface>,
+				),
+				(
+					"beta".to_string(),
+					Box::new(beta) as Box<dyn SettlementInterface>,
+				),
+			]),
+			vec!["missing".into(), "beta".into(), "beta".into()],
+			15,
+		);
+
+		assert_eq!(
+			service.implementation_order(),
+			&["beta".to_string(), "alpha".to_string()]
+		);
+	}
+
+	#[test]
 	fn test_random_strategy_same_context_same_oracle() {
-		let settlement = TestSettlement {
-			config: OracleConfig {
-				input_oracles: HashMap::new(),
-				output_oracles: HashMap::new(),
-				routes: HashMap::new(),
-				selection_strategy: OracleSelectionStrategy::Random,
-			},
-		};
+		let settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::Random,
+		});
 		let oracles = vec![addr(1), addr(2), addr(3)];
 
 		let selected = settlement.select_oracle(&oracles, Some(42)).unwrap();
@@ -789,14 +990,12 @@ mod tests {
 
 	#[test]
 	fn test_random_strategy_distributes_across_oracles() {
-		let settlement = TestSettlement {
-			config: OracleConfig {
-				input_oracles: HashMap::new(),
-				output_oracles: HashMap::new(),
-				routes: HashMap::new(),
-				selection_strategy: OracleSelectionStrategy::Random,
-			},
-		};
+		let settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::Random,
+		});
 		let oracles = vec![addr(1), addr(2), addr(3)];
 		let mut seen = [false; 3];
 
@@ -829,14 +1028,12 @@ mod tests {
 		let mut routes = HashMap::new();
 		routes.insert(84532, vec![11155420]); // reverse only
 
-		let settlement = TestSettlement {
-			config: OracleConfig {
-				input_oracles,
-				output_oracles,
-				routes,
-				selection_strategy: OracleSelectionStrategy::First,
-			},
-		};
+		let settlement = make_test_settlement(OracleConfig {
+			input_oracles,
+			output_oracles,
+			routes,
+			selection_strategy: OracleSelectionStrategy::First,
+		});
 		let service = SettlementService::new(
 			HashMap::from([(
 				"test".to_string(),
@@ -862,14 +1059,12 @@ mod tests {
 		let mut routes = HashMap::new();
 		routes.insert(11155420, vec![84532]);
 
-		let settlement = TestSettlement {
-			config: OracleConfig {
-				input_oracles,
-				output_oracles,
-				routes,
-				selection_strategy: OracleSelectionStrategy::First,
-			},
-		};
+		let settlement = make_test_settlement(OracleConfig {
+			input_oracles,
+			output_oracles,
+			routes,
+			selection_strategy: OracleSelectionStrategy::First,
+		});
 		let service = SettlementService::new(
 			HashMap::from([(
 				"test".to_string(),
@@ -883,6 +1078,404 @@ mod tests {
 				.get_any_settlement_for_chains_with_name(11155420, 84532)
 				.is_some(),
 			"supported route should be selected"
+		);
+	}
+
+	#[test]
+	fn test_support_helpers_cover_route_and_oracle_lookups() {
+		let settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::from([(1u64, vec![addr(0x11)])]),
+			output_oracles: HashMap::from([(10u64, vec![addr(0x22)])]),
+			routes: HashMap::from([(1u64, vec![10u64])]),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+
+		assert!(settlement.is_route_supported(1, 10));
+		assert!(!settlement.is_route_supported(10, 1));
+		assert!(settlement.is_input_oracle_supported(1, &addr(0x11)));
+		assert!(settlement.is_output_oracle_supported(10, &addr(0x22)));
+		assert_eq!(settlement.get_input_oracles(1), vec![addr(0x11)]);
+		assert_eq!(settlement.get_output_oracles(10), vec![addr(0x22)]);
+		assert!(settlement.select_oracle(&[], Some(0)).is_none());
+	}
+
+	#[test]
+	fn test_round_robin_selection_uses_context() {
+		let settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::RoundRobin,
+		});
+		let oracles = vec![addr(1), addr(2), addr(3)];
+
+		assert_eq!(settlement.select_oracle(&oracles, Some(0)), Some(addr(1)));
+		assert_eq!(settlement.select_oracle(&oracles, Some(1)), Some(addr(2)));
+		assert_eq!(settlement.select_oracle(&oracles, Some(2)), Some(addr(3)));
+		assert_eq!(settlement.select_oracle(&oracles, Some(3)), Some(addr(1)));
+	}
+
+	#[tokio::test]
+	async fn test_default_readiness_returns_ready_when_can_claim_is_true() {
+		let mut settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		settlement.can_claim = true;
+		let order = OrderBuilder::new().build();
+		let fill_proof = sample_fill_proof();
+
+		let readiness = settlement.readiness(&order, &fill_proof).await;
+		assert!(matches!(readiness, SettlementReadiness::Ready));
+	}
+
+	#[tokio::test]
+	async fn test_default_readiness_returns_unknown_waiting_when_can_claim_is_false() {
+		let settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		let order = OrderBuilder::new().build();
+		let fill_proof = sample_fill_proof();
+
+		let readiness = settlement.readiness(&order, &fill_proof).await;
+		assert!(matches!(
+			readiness,
+			SettlementReadiness::Waiting(WaitingReason::Unknown)
+		));
+	}
+
+	#[test]
+	fn test_find_settlement_for_order_uses_persisted_settlement_name() {
+		let settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		let service = SettlementService::new(
+			HashMap::from([(
+				"bound".to_string(),
+				Box::new(settlement) as Box<dyn SettlementInterface>,
+			)]),
+			20,
+		);
+		let order = OrderBuilder::new()
+			.with_settlement_name(Some("bound"))
+			.build();
+
+		assert!(service.find_settlement_for_order(&order).is_ok());
+	}
+
+	#[test]
+	fn test_find_settlement_for_order_missing_persisted_settlement_errors() {
+		let service = SettlementService::new(HashMap::new(), 20);
+		let order = OrderBuilder::new()
+			.with_settlement_name(Some("missing"))
+			.build();
+
+		let err = match service.find_settlement_for_order(&order) {
+			Ok(_) => panic!("missing persisted binding should error"),
+			Err(err) => err,
+		};
+		assert!(
+			err.to_string().contains("Persisted settlement 'missing'"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[test]
+	fn test_find_settlement_for_order_falls_back_to_oracle_lookup() {
+		let input_oracle = addr(0x11);
+		let settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::from([(1u64, vec![input_oracle.clone()])]),
+			output_oracles: HashMap::from([(10u64, vec![addr(0x22)])]),
+			routes: HashMap::from([(1u64, vec![10u64])]),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		let service = SettlementService::new(
+			HashMap::from([(
+				"fallback".to_string(),
+				Box::new(settlement) as Box<dyn SettlementInterface>,
+			)]),
+			20,
+		);
+		let order = OrderBuilder::new()
+			.with_data(serde_json::json!({
+				"order_id": vec![0u8; 32],
+				"user": "0x1234567890123456789012345678901234567890",
+				"nonce": "1",
+				"origin_chain_id": "1",
+				"expires": 100,
+				"fill_deadline": 50,
+				"input_oracle": solver_types::with_0x_prefix(&alloy_primitives::hex::encode(&input_oracle.0)),
+				"inputs": [],
+				"outputs": [],
+				"gas_limit_overrides": {}
+			}))
+			.build();
+
+		assert!(service.find_settlement_for_order(&order).is_ok());
+	}
+
+	#[test]
+	fn test_get_returns_bound_settlement() {
+		let settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		let service = SettlementService::new(
+			HashMap::from([(
+				"bound".to_string(),
+				Box::new(settlement) as Box<dyn SettlementInterface>,
+			)]),
+			20,
+		);
+
+		assert!(service.get("bound").is_some());
+		assert!(service.get("missing").is_none());
+	}
+
+	#[test]
+	fn test_get_any_settlement_for_chains_returns_bound_route_and_oracles() {
+		let settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::from([(1u64, vec![addr(0x11)])]),
+			output_oracles: HashMap::from([(10u64, vec![addr(0x22)])]),
+			routes: HashMap::from([(1u64, vec![10u64])]),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		let service = SettlementService::new(
+			HashMap::from([(
+				"bound".to_string(),
+				Box::new(settlement) as Box<dyn SettlementInterface>,
+			)]),
+			20,
+		);
+
+		let (_settlement, input_oracle, output_oracle) =
+			service.get_any_settlement_for_chains(1, 10).unwrap();
+		assert_eq!(input_oracle, addr(0x11));
+		assert_eq!(output_oracle, addr(0x22));
+		assert!(service.get_any_settlement_for_chains(10, 1).is_none());
+	}
+
+	#[test]
+	fn test_build_oracle_routes_merges_outputs_across_settlements() {
+		let a = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::from([(1u64, vec![addr(0x11)])]),
+			output_oracles: HashMap::from([(10u64, vec![addr(0x21)])]),
+			routes: HashMap::from([(1u64, vec![10u64])]),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		let b = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::from([(1u64, vec![addr(0x11)])]),
+			output_oracles: HashMap::from([(10u64, vec![addr(0x22)])]),
+			routes: HashMap::from([(1u64, vec![10u64])]),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		let service = SettlementService::new(
+			HashMap::from([
+				("a".to_string(), Box::new(a) as Box<dyn SettlementInterface>),
+				("b".to_string(), Box::new(b) as Box<dyn SettlementInterface>),
+			]),
+			20,
+		);
+
+		let routes = service.build_oracle_routes();
+		let outputs = routes
+			.supported_routes
+			.get(&solver_types::oracle::OracleInfo {
+				chain_id: 1,
+				oracle: addr(0x11),
+			})
+			.unwrap();
+		assert_eq!(outputs.len(), 2);
+		assert!(outputs.iter().any(|out| out.oracle == addr(0x21)));
+		assert!(outputs.iter().any(|out| out.oracle == addr(0x22)));
+	}
+
+	#[test]
+	fn test_get_settlement_for_oracle_supports_input_and_output_lookup() {
+		let settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::from([(1u64, vec![addr(0x11)])]),
+			output_oracles: HashMap::from([(10u64, vec![addr(0x22)])]),
+			routes: HashMap::from([(1u64, vec![10u64])]),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		let service = SettlementService::new(
+			HashMap::from([(
+				"test".to_string(),
+				Box::new(settlement) as Box<dyn SettlementInterface>,
+			)]),
+			20,
+		);
+
+		assert!(service
+			.get_settlement_for_oracle(1, &addr(0x11), true)
+			.is_ok());
+		assert!(service
+			.get_settlement_for_oracle(10, &addr(0x22), false)
+			.is_ok());
+		assert!(service
+			.get_settlement_for_oracle(10, &addr(0x99), false)
+			.is_err());
+	}
+
+	#[test]
+	fn test_get_any_settlement_for_chain_with_name_uses_available_side() {
+		let settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::from([(1u64, vec![addr(0x11)])]),
+			output_oracles: HashMap::new(),
+			routes: HashMap::from([(1u64, vec![10u64])]),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		let service = SettlementService::new(
+			HashMap::from([(
+				"test".to_string(),
+				Box::new(settlement) as Box<dyn SettlementInterface>,
+			)]),
+			20,
+		);
+
+		let (name, _settlement, input_oracle, output_oracle) =
+			service.get_any_settlement_for_chain_with_name(1).unwrap();
+		assert_eq!(name, "test");
+		assert_eq!(input_oracle, addr(0x11));
+		assert_eq!(output_oracle, Address(vec![0u8; 20]));
+	}
+
+	#[tokio::test]
+	async fn test_buffer_coverage_check_recover_readiness_and_can_claim_delegate() {
+		let direction = PusherDirection {
+			label: "eth-to-arb".into(),
+			l1_chain_id: 11155111,
+			pusher_address: addr(0x31),
+			l2_chain_id: 421614,
+			buffer_address: addr(0x32),
+			batch_size: 256,
+			push_cooldown_seconds: 60,
+			l2_params: PusherL2Params::Raw {
+				data: "0x".into(),
+				value_wei: None,
+			},
+		};
+		let mut settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		settlement.buffer_coverage = Some((direction.clone(), 123));
+		settlement.recover_post_fill = true;
+		settlement.readiness_override = Some(SettlementReadiness::Waiting(
+			WaitingReason::ProofServiceNotReady,
+		));
+		settlement.can_claim = true;
+		let service = SettlementService::new(
+			HashMap::from([(
+				"bound".to_string(),
+				Box::new(settlement) as Box<dyn SettlementInterface>,
+			)]),
+			20,
+		);
+		let order = OrderBuilder::new()
+			.with_settlement_name(Some("bound"))
+			.build();
+		let fill_proof = sample_fill_proof();
+
+		match service.buffer_coverage_check(&order).await {
+			Some((actual_direction, actual_block)) => {
+				assert_eq!(actual_direction.label, direction.label);
+				assert_eq!(actual_direction.l1_chain_id, direction.l1_chain_id);
+				assert_eq!(actual_direction.l2_chain_id, direction.l2_chain_id);
+				assert_eq!(actual_block, 123);
+			},
+			None => panic!("expected buffer coverage result"),
+		}
+		assert!(service.recover_post_fill_state(&order).await.unwrap());
+		assert!(matches!(
+			service.readiness(&order, &fill_proof).await,
+			SettlementReadiness::Waiting(WaitingReason::ProofServiceNotReady)
+		));
+		assert!(service.can_claim(&order, &fill_proof).await);
+	}
+
+	#[tokio::test]
+	async fn test_readiness_and_can_claim_handle_missing_settlement_binding() {
+		let service = SettlementService::new(HashMap::new(), 20);
+		let order = OrderBuilder::new()
+			.with_settlement_name(Some("missing"))
+			.build();
+		let fill_proof = sample_fill_proof();
+
+		assert!(matches!(
+			service.readiness(&order, &fill_proof).await,
+			SettlementReadiness::PermanentFailure(_)
+		));
+		assert!(!service.can_claim(&order, &fill_proof).await);
+		assert!(service.buffer_coverage_check(&order).await.is_none());
+	}
+
+	#[tokio::test]
+	async fn test_get_attestation_and_transaction_generation_delegate() {
+		let mut settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		settlement.post_fill_tx = Some(sample_tx(10));
+		settlement.pre_claim_tx = Some(sample_tx(11));
+		let service = SettlementService::new(
+			HashMap::from([(
+				"bound".to_string(),
+				Box::new(settlement) as Box<dyn SettlementInterface>,
+			)]),
+			20,
+		);
+		let order = OrderBuilder::new()
+			.with_settlement_name(Some("bound"))
+			.build();
+		let fill_proof = sample_fill_proof();
+		let receipt = TransactionReceipt {
+			hash: TransactionHash(vec![0x44; 32]),
+			block_number: 123,
+			success: true,
+			logs: vec![],
+			block_timestamp: None,
+		};
+
+		assert_eq!(
+			service
+				.get_attestation(&order, &TransactionHash(vec![0x11; 32]))
+				.await
+				.unwrap()
+				.tx_hash,
+			sample_fill_proof().tx_hash
+		);
+		assert_eq!(
+			service
+				.generate_post_fill_transaction(&order, &receipt)
+				.await
+				.unwrap()
+				.unwrap()
+				.chain_id,
+			10
+		);
+		assert_eq!(
+			service
+				.generate_pre_claim_transaction(&order, &fill_proof)
+				.await
+				.unwrap()
+				.unwrap()
+				.chain_id,
+			11
 		);
 	}
 }

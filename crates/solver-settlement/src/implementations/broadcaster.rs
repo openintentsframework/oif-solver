@@ -8,19 +8,21 @@ use crate::{
 		address_to_bytes32, check_is_proven, create_providers_for_chains, parse_address_table,
 		parse_b256_table, parse_oracle_config, SettlementMessageTracker,
 	},
-	OracleConfig, PusherDirection, SettlementError, SettlementInterface,
+	OracleConfig, PusherDirection, SettlementError, SettlementInterface, SettlementReadiness,
+	WaitingReason,
 };
 use alloy_primitives::{hex, FixedBytes, B256, U256};
 use alloy_provider::{DynProvider, Provider};
-use alloy_sol_types::{sol, SolCall};
+use alloy_rpc_types::{BlockNumberOrTag, Filter};
+use alloy_sol_types::{sol, SolCall, SolEvent};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use solver_storage::StorageService;
 use solver_types::{
-	with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, InteropAddress, NetworksConfig,
-	Order, OrderOutput, PusherL2Params, Schema, Transaction, TransactionHash, TransactionReceipt,
-	TransactionType,
+	bytes32_to_address, parse_address, with_0x_prefix, ConfigSchema, Eip7683OrderData, Field,
+	FieldType, FillProof, InteropAddress, NetworksConfig, Order, OrderOutput, PusherL2Params,
+	Schema, Transaction, TransactionHash, TransactionReceipt, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,6 +55,8 @@ fn now_seconds() -> u64 {
 		.map(|d| d.as_secs())
 		.unwrap_or(0)
 }
+
+const POST_FILL_RECOVERY_SCAN_BLOCKS: u64 = 256;
 
 /// Helper to compute keccak256 hash.
 fn keccak256(data: &[u8]) -> [u8; 32] {
@@ -260,11 +264,52 @@ fn compute_message_slot(message: [u8; 32], publisher: &solver_types::Address) ->
 	keccak256(&encoded)
 }
 
-fn order_id_to_selection_context(order_id: &str) -> u64 {
-	let hash = keccak256(order_id.as_bytes());
-	let mut buf = [0u8; 8];
-	buf.copy_from_slice(&hash[..8]);
-	u64::from_be_bytes(buf)
+fn parse_eip7683_order_data(order: &Order) -> Result<Eip7683OrderData, SettlementError> {
+	if order.standard != "eip7683" {
+		return Err(SettlementError::ValidationFailed(format!(
+			"Broadcaster settlement only supports eip7683 orders, got '{}'",
+			order.standard
+		)));
+	}
+
+	serde_json::from_value(order.data.clone()).map_err(|e| {
+		SettlementError::ValidationFailed(format!("Failed to parse broadcaster order data: {e}"))
+	})
+}
+
+fn parse_bound_input_oracle(order: &Order) -> Result<solver_types::Address, SettlementError> {
+	let order_data = parse_eip7683_order_data(order)?;
+	parse_address(&order_data.input_oracle).map_err(|e| {
+		SettlementError::ValidationFailed(format!("Invalid order-bound input oracle: {e}"))
+	})
+}
+
+fn parse_bound_output_oracle(
+	order: &Order,
+	destination_chain: u64,
+) -> Result<solver_types::Address, SettlementError> {
+	let order_data = parse_eip7683_order_data(order)?;
+	let output = order_data
+		.outputs
+		.iter()
+		.find(|output| output.chain_id.to::<u64>() == destination_chain)
+		.ok_or_else(|| {
+			SettlementError::ValidationFailed(format!(
+				"No order output found for destination chain {destination_chain}"
+			))
+		})?;
+
+	if output.oracle == [0u8; 32] {
+		return Err(SettlementError::ValidationFailed(format!(
+			"Order output oracle is zero for destination chain {destination_chain}; \
+			 broadcaster requires an order-bound output oracle"
+		)));
+	}
+
+	let oracle_hex = bytes32_to_address(&output.oracle);
+	parse_address(&oracle_hex).map_err(|e| {
+		SettlementError::ValidationFailed(format!("Invalid order-bound output oracle: {e}"))
+	})
 }
 
 fn parse_hex_bytes(label: &str, value: &str) -> Result<Vec<u8>, SettlementError> {
@@ -464,7 +509,6 @@ pub struct BroadcasterSettlement {
 	broadcaster_ids: HashMap<u64, B256>,
 	proof_service_url: String,
 	proof_wait_time_seconds: u64,
-	storage_proof_timeout_seconds: u64,
 	default_finality_blocks: u64,
 	finality_blocks: HashMap<u64, u64>,
 	message_tracker: Arc<BroadcasterMessageTracker>,
@@ -473,6 +517,38 @@ pub struct BroadcasterSettlement {
 }
 
 impl BroadcasterSettlement {
+	fn validate_multi_oracle_strategy_guard(
+		oracle_config: &OracleConfig,
+	) -> Result<(), SettlementError> {
+		if matches!(
+			oracle_config.selection_strategy,
+			crate::OracleSelectionStrategy::RoundRobin | crate::OracleSelectionStrategy::Random
+		) {
+			for (chain_id, oracles) in &oracle_config.input_oracles {
+				if oracles.len() > 1 {
+					return Err(SettlementError::ValidationFailed(format!(
+						"Broadcaster settlement does not yet support multiple input oracles on chain \
+						 {chain_id} with {:?} selection; configure a single oracle or switch to \
+						 First until order-bound oracle binding is fully enforced",
+						oracle_config.selection_strategy
+					)));
+				}
+			}
+			for (chain_id, oracles) in &oracle_config.output_oracles {
+				if oracles.len() > 1 {
+					return Err(SettlementError::ValidationFailed(format!(
+						"Broadcaster settlement does not yet support multiple output oracles on chain \
+						 {chain_id} with {:?} selection; configure a single oracle or switch to \
+						 First until order-bound oracle binding is fully enforced",
+						oracle_config.selection_strategy
+					)));
+				}
+			}
+		}
+
+		Ok(())
+	}
+
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		networks: &NetworksConfig,
@@ -488,6 +564,8 @@ impl BroadcasterSettlement {
 		storage: Arc<StorageService>,
 		pusher_directions: Vec<PusherDirection>,
 	) -> Result<Self, SettlementError> {
+		Self::validate_multi_oracle_strategy_guard(&oracle_config)?;
+
 		let mut all_network_ids: Vec<u64> = oracle_config
 			.input_oracles
 			.keys()
@@ -541,7 +619,6 @@ impl BroadcasterSettlement {
 			broadcaster_ids,
 			proof_service_url,
 			proof_wait_time_seconds,
-			storage_proof_timeout_seconds,
 			default_finality_blocks,
 			finality_blocks,
 			message_tracker: Arc::new(BroadcasterMessageTracker::new(storage)),
@@ -576,6 +653,82 @@ impl BroadcasterSettlement {
 			"{}/api/v1/broadcaster/proof",
 			self.proof_service_url.trim_end_matches('/')
 		)
+	}
+
+	fn validate_bound_input_oracle(
+		&self,
+		order: &Order,
+		source_chain: u64,
+	) -> Result<solver_types::Address, SettlementError> {
+		let input_oracle = parse_bound_input_oracle(order)?;
+		if !self.is_input_oracle_supported(source_chain, &input_oracle) {
+			return Err(SettlementError::ValidationFailed(format!(
+				"Order-bound input oracle is not configured for source chain {source_chain}"
+			)));
+		}
+		Ok(input_oracle)
+	}
+
+	fn validate_bound_output_oracle(
+		&self,
+		order: &Order,
+		destination_chain: u64,
+	) -> Result<solver_types::Address, SettlementError> {
+		let output_oracle = parse_bound_output_oracle(order, destination_chain)?;
+		if !self.is_output_oracle_supported(destination_chain, &output_oracle) {
+			return Err(SettlementError::ValidationFailed(format!(
+				"Order-bound output oracle is not configured for destination chain {destination_chain}"
+			)));
+		}
+		Ok(output_oracle)
+	}
+
+	async fn build_submission_from_post_fill_receipt(
+		&self,
+		order: &Order,
+		receipt: &TransactionReceipt,
+		output_oracle: solver_types::Address,
+	) -> Result<BroadcasterSubmission, SettlementError> {
+		let (source_chain, destination_chain) = Self::source_and_destination_chain(order)?;
+		let output_settler = order
+			.output_chains
+			.first()
+			.ok_or_else(|| SettlementError::ValidationFailed("No output chain".into()))?
+			.settler_address
+			.clone();
+
+		let fill_logs = self
+			.fetch_fill_receipt_logs(order, destination_chain)
+			.await?;
+		let fill_payload = self.parse_fill_payload_from_logs(order, &fill_logs)?;
+		let payload_hash = keccak256(&fill_payload);
+		let payloads = vec![fill_payload];
+
+		let message_data = encode_message_data(address_to_bytes32(&output_settler), &payloads)?;
+		let computed_message = compute_broadcaster_message(&output_settler, &payloads);
+		let actual_message = self
+			.extract_message_from_broadcast_logs(&receipt.logs, &output_oracle)
+			.ok_or_else(|| {
+				SettlementError::ValidationFailed(
+					"MessageBroadcast event not found in PostFill receipt".to_string(),
+				)
+			})?;
+		if actual_message != computed_message {
+			return Err(SettlementError::SlotDerivationMismatch);
+		}
+
+		Ok(BroadcasterSubmission {
+			source_chain,
+			destination_chain,
+			submission_tx_hash: receipt.hash.clone(),
+			submission_timestamp: now_seconds(),
+			submission_block_number: Some(receipt.block_number),
+			payload_hash,
+			message: computed_message,
+			message_data,
+			application: output_settler,
+			remote_oracle: output_oracle,
+		})
 	}
 
 	fn parse_fill_payload_from_logs(
@@ -643,6 +796,28 @@ impl BroadcasterSettlement {
 		Ok(logs)
 	}
 
+	async fn fetch_transaction_receipt(
+		&self,
+		chain_id: u64,
+		tx_hash: &TransactionHash,
+		label: &str,
+	) -> Result<Option<TransactionReceipt>, SettlementError> {
+		let provider = self.providers.get(&chain_id).ok_or_else(|| {
+			SettlementError::ValidationFailed(format!("No provider for chain {chain_id}"))
+		})?;
+
+		let receipt = provider
+			.get_transaction_receipt(FixedBytes::<32>::from_slice(&tx_hash.0))
+			.await
+			.map_err(|e| {
+				SettlementError::ValidationFailed(format!(
+					"Failed to get {label} receipt on chain {chain_id}: {e}"
+				))
+			})?;
+
+		Ok(receipt.as_ref().map(TransactionReceipt::from))
+	}
+
 	fn extract_message_from_broadcast_logs(
 		&self,
 		logs: &[solver_types::Log],
@@ -664,6 +839,263 @@ impl BroadcasterSettlement {
 			}
 		}
 		None
+	}
+
+	async fn recover_submission_from_post_fill_tx(
+		&self,
+		order: &Order,
+		output_oracle: solver_types::Address,
+		post_fill_tx_hash: &TransactionHash,
+	) -> Result<Option<BroadcasterSubmission>, SettlementError> {
+		let (_, destination_chain) = Self::source_and_destination_chain(order)?;
+		let receipt = self
+			.fetch_transaction_receipt(destination_chain, post_fill_tx_hash, "post-fill")
+			.await?;
+		let Some(receipt) = receipt else {
+			return Ok(None);
+		};
+
+		self.build_submission_from_post_fill_receipt(order, &receipt, output_oracle)
+			.await
+			.map(Some)
+	}
+
+	async fn recover_submission_from_log_scan(
+		&self,
+		order: &Order,
+		output_oracle: solver_types::Address,
+	) -> Result<Option<BroadcasterSubmission>, SettlementError> {
+		let (_, destination_chain) = Self::source_and_destination_chain(order)?;
+		let fill_tx_hash = order.fill_tx_hash.as_ref().ok_or_else(|| {
+			SettlementError::ValidationFailed(
+				"Missing fill transaction hash: required for broadcaster recovery".into(),
+			)
+		})?;
+		let provider = self.providers.get(&destination_chain).ok_or_else(|| {
+			SettlementError::ValidationFailed(format!("No provider for chain {destination_chain}"))
+		})?;
+		let fill_receipt = self
+			.fetch_transaction_receipt(destination_chain, fill_tx_hash, "fill")
+			.await?
+			.ok_or_else(|| {
+				SettlementError::ValidationFailed(
+					"Fill transaction not found during broadcaster recovery".into(),
+				)
+			})?;
+		let current_block = provider.get_block_number().await.map_err(|e| {
+			SettlementError::ValidationFailed(format!(
+				"Failed to get current block for broadcaster recovery: {e}"
+			))
+		})?;
+		let from_block = fill_receipt.block_number;
+		let max_scan_block = from_block.saturating_add(POST_FILL_RECOVERY_SCAN_BLOCKS);
+		if current_block > max_scan_block {
+			return Err(SettlementError::ValidationFailed(format!(
+				"Missing post-fill transaction hash and recovery scan window exhausted \
+				 (from block {from_block} to {max_scan_block}, current {current_block})"
+			)));
+		}
+
+		let filter = Filter::new()
+			.address(vec![alloy_primitives::Address::from_slice(
+				&output_oracle.0,
+			)])
+			.event_signature(vec![MessageBroadcast::SIGNATURE_HASH])
+			.from_block(from_block)
+			.to_block(current_block);
+		let logs = provider.get_logs(&filter).await.map_err(|e| {
+			SettlementError::ValidationFailed(format!(
+				"Failed to scan broadcaster logs for recovery: {e}"
+			))
+		})?;
+
+		for log in logs {
+			let publisher_matches = log
+				.topics()
+				.get(2)
+				.map(|topic| solver_types::Address(topic.0[12..].to_vec()) == output_oracle)
+				.unwrap_or(false);
+			if !publisher_matches {
+				continue;
+			}
+
+			let Some(tx_hash) = log.transaction_hash else {
+				continue;
+			};
+			let candidate_hash = TransactionHash(tx_hash.0.to_vec());
+			if let Some(receipt) = self
+				.fetch_transaction_receipt(destination_chain, &candidate_hash, "post-fill")
+				.await?
+			{
+				if let Ok(submission) = self
+					.build_submission_from_post_fill_receipt(order, &receipt, output_oracle.clone())
+					.await
+				{
+					return Ok(Some(submission));
+				}
+			}
+		}
+
+		Ok(None)
+	}
+
+	async fn try_recover_submission(
+		&self,
+		order: &Order,
+	) -> Result<Option<BroadcasterSubmission>, SettlementError> {
+		let (_, destination_chain) = Self::source_and_destination_chain(order)?;
+		let output_oracle = self.validate_bound_output_oracle(order, destination_chain)?;
+
+		if let Some(post_fill_tx_hash) = order.post_fill_tx_hash.as_ref() {
+			if let Some(submission) = self
+				.recover_submission_from_post_fill_tx(
+					order,
+					output_oracle.clone(),
+					post_fill_tx_hash,
+				)
+				.await?
+			{
+				return Ok(Some(submission));
+			}
+		}
+
+		self.recover_submission_from_log_scan(order, output_oracle)
+			.await
+	}
+
+	async fn load_or_recover_state(
+		&self,
+		order: &Order,
+	) -> Result<Option<BroadcasterMessageState>, SettlementError> {
+		let state = self.message_tracker.load(&order.id).await?;
+		if state
+			.as_ref()
+			.and_then(|state| state.submission.as_ref())
+			.is_some()
+		{
+			return Ok(state);
+		}
+
+		let Some(submission) = self.try_recover_submission(order).await? else {
+			return Ok(state);
+		};
+
+		self.message_tracker
+			.track_submission(&order.id, submission)
+			.await?;
+		self.message_tracker.load(&order.id).await
+	}
+
+	async fn readiness_internal(
+		&self,
+		order: &Order,
+		fill_proof: &FillProof,
+	) -> SettlementReadiness {
+		let (source_chain, destination_chain) = match Self::source_and_destination_chain(order) {
+			Ok(chains) => chains,
+			Err(e) => return SettlementReadiness::PermanentFailure(e.to_string()),
+		};
+
+		let state = match self.load_or_recover_state(order).await {
+			Ok(Some(state)) => state,
+			Ok(None) => return SettlementReadiness::Waiting(WaitingReason::NoSubmissionState),
+			Err(e) => return SettlementReadiness::PermanentFailure(e.to_string()),
+		};
+
+		let submission = match state.submission.as_ref() {
+			Some(submission) => submission,
+			None => return SettlementReadiness::Waiting(WaitingReason::NoSubmissionState),
+		};
+
+		let input_oracle = match self.validate_bound_input_oracle(order, source_chain) {
+			Ok(oracle) => oracle,
+			Err(e) => return SettlementReadiness::PermanentFailure(e.to_string()),
+		};
+		let output_oracle = submission.remote_oracle.clone();
+		if !self.is_output_oracle_supported(destination_chain, &output_oracle) {
+			return SettlementReadiness::PermanentFailure(format!(
+				"Stored output oracle is not configured for destination chain {destination_chain}"
+			));
+		}
+
+		let provider = match self.providers.get(&source_chain) {
+			Some(provider) => provider,
+			None => {
+				return SettlementReadiness::PermanentFailure(format!(
+					"No provider configured for source chain {source_chain}"
+				));
+			},
+		};
+
+		let remote_oracle = address_to_bytes32(&output_oracle);
+		let application = address_to_bytes32(&submission.application);
+		match check_is_proven(
+			provider,
+			&input_oracle,
+			destination_chain,
+			remote_oracle,
+			application,
+			submission.payload_hash,
+		)
+		.await
+		{
+			Ok(true) => {
+				if let Err(e) = self.message_tracker.mark_verified(&order.id).await {
+					tracing::warn!(
+						order_id = %order.id,
+						error = %e,
+						"Failed to persist verified status"
+					);
+				}
+				return SettlementReadiness::Ready;
+			},
+			Ok(false) => {},
+			Err(_) => return SettlementReadiness::Waiting(WaitingReason::RpcUnavailable),
+		};
+
+		let proof_ready_at = fill_proof
+			.filled_timestamp
+			.saturating_add(self.proof_wait_time_seconds);
+		let now = now_seconds();
+		if now < proof_ready_at {
+			return SettlementReadiness::Waiting(WaitingReason::WaitingForProofDelay {
+				until: proof_ready_at,
+			});
+		}
+
+		let destination_provider = match self.providers.get(&destination_chain) {
+			Some(provider) => provider,
+			None => {
+				return SettlementReadiness::PermanentFailure(format!(
+					"No provider configured for destination chain {destination_chain}"
+				));
+			},
+		};
+		let current_destination_block = match destination_provider.get_block_number().await {
+			Ok(block) => block,
+			Err(_) => return SettlementReadiness::Waiting(WaitingReason::RpcUnavailable),
+		};
+		let required_finality_block = fill_proof
+			.block_number
+			.saturating_add(self.finality_blocks_for(destination_chain));
+		if current_destination_block < required_finality_block {
+			return SettlementReadiness::Waiting(WaitingReason::WaitingForFinality {
+				current_block: current_destination_block,
+				required_block: required_finality_block,
+			});
+		}
+
+		if state.proof.is_some() {
+			return SettlementReadiness::Ready;
+		}
+
+		match self
+			.generate_and_store_proof(order, source_chain, destination_chain, submission)
+			.await
+		{
+			Ok(_) => SettlementReadiness::Ready,
+			Err(_) => SettlementReadiness::Waiting(WaitingReason::ProofServiceNotReady),
+		}
 	}
 
 	async fn generate_and_store_proof(
@@ -901,7 +1333,7 @@ impl SettlementInterface for BroadcasterSettlement {
 
 	async fn buffer_coverage_check(&self, order: &Order) -> Option<(PusherDirection, u64)> {
 		// load() returns Option<BroadcasterMessageState> — None means no submission yet.
-		let state = match self.message_tracker.load(&order.id).await {
+		let state = match self.load_or_recover_state(order).await {
 			Ok(Some(state)) => state,
 			Ok(None) => return None,
 			Err(e) => {
@@ -931,22 +1363,7 @@ impl SettlementInterface for BroadcasterSettlement {
 				"No provider configured for chain {destination_chain}"
 			))
 		})?;
-
-		let oracle_addresses = self.get_input_oracles(source_chain);
-		if oracle_addresses.is_empty() {
-			return Err(SettlementError::ValidationFailed(format!(
-				"No input oracle configured for chain {source_chain}"
-			)));
-		}
-
-		let selection_context = order_id_to_selection_context(&order.id);
-		let oracle_address = self
-			.select_oracle(&oracle_addresses, Some(selection_context))
-			.ok_or_else(|| {
-				SettlementError::ValidationFailed(format!(
-					"Failed to select oracle for chain {source_chain}"
-				))
-			})?;
+		let oracle_address = self.validate_bound_input_oracle(order, source_chain)?;
 
 		let receipt = provider
 			.get_transaction_receipt(FixedBytes::<32>::from_slice(&tx_hash.0))
@@ -964,7 +1381,7 @@ impl SettlementInterface for BroadcasterSettlement {
 
 		let tx_block = receipt.block_number.unwrap_or(0);
 		let block = provider
-			.get_block_by_number(alloy_rpc_types::BlockNumberOrTag::Number(tx_block))
+			.get_block_by_number(BlockNumberOrTag::Number(tx_block))
 			.await
 			.map_err(|e| SettlementError::ValidationFailed(format!("Failed to get block: {e}")))?;
 
@@ -982,126 +1399,24 @@ impl SettlementInterface for BroadcasterSettlement {
 		})
 	}
 
+	async fn recover_post_fill_state(&self, order: &Order) -> Result<bool, SettlementError> {
+		Ok(self
+			.load_or_recover_state(order)
+			.await?
+			.as_ref()
+			.and_then(|state| state.submission.as_ref())
+			.is_some())
+	}
+
 	async fn can_claim(&self, order: &Order, fill_proof: &FillProof) -> bool {
-		let (source_chain, destination_chain) = match Self::source_and_destination_chain(order) {
-			Ok(chains) => chains,
-			Err(e) => {
-				tracing::error!(order_id = %order.id, error = %e, "Invalid order chains");
-				return false;
-			},
-		};
-
-		let state = match self.message_tracker.load(&order.id).await {
-			Ok(Some(state)) => state,
-			Ok(None) => {
-				tracing::debug!(order_id = %order.id, "No broadcaster submission state yet");
-				return false;
-			},
-			Err(e) => {
-				tracing::warn!(order_id = %order.id, error = %e, "Failed to load broadcaster state");
-				return false;
-			},
-		};
-
-		let submission = match state.submission.as_ref() {
-			Some(submission) => submission,
-			None => return false,
-		};
-
-		let selection_context = order_id_to_selection_context(&order.id);
-		let input_oracle = match self.select_oracle(
-			&self.get_input_oracles(source_chain),
-			Some(selection_context),
-		) {
-			Some(oracle) => oracle,
-			None => return false,
-		};
-		let output_oracle = submission.remote_oracle.clone();
-		if !self
-			.get_output_oracles(destination_chain)
-			.contains(&output_oracle)
-		{
-			return false;
-		}
-
-		let provider = match self.providers.get(&source_chain) {
-			Some(provider) => provider,
-			None => return false,
-		};
-
-		let remote_oracle = address_to_bytes32(&output_oracle);
-		let application = address_to_bytes32(&submission.application);
-		let is_proven = match check_is_proven(
-			provider,
-			&input_oracle,
-			destination_chain,
-			remote_oracle,
-			application,
-			submission.payload_hash,
+		matches!(
+			self.readiness_internal(order, fill_proof).await,
+			SettlementReadiness::Ready
 		)
-		.await
-		{
-			Ok(proven) => proven,
-			Err(e) => {
-				tracing::debug!(order_id = %order.id, error = %e, "isProven check failed");
-				return false;
-			},
-		};
+	}
 
-		if is_proven {
-			if let Err(e) = self.message_tracker.mark_verified(&order.id).await {
-				tracing::warn!(order_id = %order.id, error = %e, "Failed to persist verified status");
-			}
-			return true;
-		}
-
-		// Wait a minimum time before proof generation.
-		let now = now_seconds();
-		if now
-			< fill_proof
-				.filled_timestamp
-				.saturating_add(self.proof_wait_time_seconds)
-		{
-			return false;
-		}
-
-		// Wait for chain finality before generating proofs.
-		let destination_provider = match self.providers.get(&destination_chain) {
-			Some(provider) => provider,
-			None => return false,
-		};
-		let current_destination_block = match destination_provider.get_block_number().await {
-			Ok(block) => block,
-			Err(_) => return false,
-		};
-		let required_finality_block = fill_proof
-			.block_number
-			.saturating_add(self.finality_blocks_for(destination_chain));
-		if current_destination_block < required_finality_block {
-			return false;
-		}
-
-		// Proof already available and ready to submit.
-		if state.proof.is_some() {
-			return true;
-		}
-
-		// Try proof generation in the monitor loop; return false if unavailable so we retry.
-		match self
-			.generate_and_store_proof(order, source_chain, destination_chain, submission)
-			.await
-		{
-			Ok(_) => true,
-			Err(e) => {
-				tracing::warn!(
-					order_id = %order.id,
-					error = %e,
-					timeout_secs = self.storage_proof_timeout_seconds,
-					"Broadcaster proof generation not ready"
-				);
-				false
-			},
-		}
+	async fn readiness(&self, order: &Order, fill_proof: &FillProof) -> SettlementReadiness {
+		self.readiness_internal(order, fill_proof).await
 	}
 
 	async fn generate_post_fill_transaction(
@@ -1110,18 +1425,7 @@ impl SettlementInterface for BroadcasterSettlement {
 		fill_receipt: &TransactionReceipt,
 	) -> Result<Option<Transaction>, SettlementError> {
 		let (_, destination_chain) = Self::source_and_destination_chain(order)?;
-
-		let output_oracles = self.get_output_oracles(destination_chain);
-		if output_oracles.is_empty() {
-			return Ok(None);
-		}
-		// Derive a deterministic selection context from the order ID so that
-		// RoundRobin/Random strategies pick the same oracle for the same order
-		// across retries (avoids non-deterministic post-fill routing).
-		let oracle_hint = order_id_to_selection_context(&order.id);
-		let output_oracle = self
-			.select_oracle(&output_oracles, Some(oracle_hint))
-			.ok_or_else(|| SettlementError::ValidationFailed("Failed to select oracle".into()))?;
+		let output_oracle = self.validate_bound_output_oracle(order, destination_chain)?;
 
 		let output_settler = order
 			.output_chains
@@ -1158,7 +1462,7 @@ impl SettlementInterface for BroadcasterSettlement {
 	) -> Result<Option<Transaction>, SettlementError> {
 		let (source_chain, destination_chain) = Self::source_and_destination_chain(order)?;
 
-		let state = self.message_tracker.load(&order.id).await?.ok_or_else(|| {
+		let state = self.load_or_recover_state(order).await?.ok_or_else(|| {
 			SettlementError::ValidationFailed("No broadcaster state found".into())
 		})?;
 		let submission = state
@@ -1175,17 +1479,7 @@ impl SettlementInterface for BroadcasterSettlement {
 			)));
 		}
 
-		let selection_context = order_id_to_selection_context(&order.id);
-		let input_oracle = self
-			.select_oracle(
-				&self.get_input_oracles(source_chain),
-				Some(selection_context),
-			)
-			.ok_or_else(|| {
-				SettlementError::ValidationFailed(format!(
-					"No input oracle configured for chain {source_chain}"
-				))
-			})?;
+		let input_oracle = self.validate_bound_input_oracle(order, source_chain)?;
 
 		// If already proven, no pre-claim tx needed.
 		let provider = self.providers.get(&source_chain).ok_or_else(|| {
@@ -1257,63 +1551,13 @@ impl SettlementInterface for BroadcasterSettlement {
 	) -> Result<(), SettlementError> {
 		match tx_type {
 			TransactionType::PostFill => {
-				let (source_chain, destination_chain) = Self::source_and_destination_chain(order)?;
-				let oracle_hint = order_id_to_selection_context(&order.id);
-				let output_oracle = self
-					.select_oracle(
-						&self.get_output_oracles(destination_chain),
-						Some(oracle_hint),
-					)
-					.ok_or_else(|| {
-						SettlementError::ValidationFailed(format!(
-							"No output oracle configured for chain {destination_chain}"
-						))
-					})?;
-
-				let output_settler = order
-					.output_chains
-					.first()
-					.ok_or_else(|| SettlementError::ValidationFailed("No output chain".into()))?
-					.settler_address
-					.clone();
-
-				let fill_logs = self
-					.fetch_fill_receipt_logs(order, destination_chain)
+				let (_, destination_chain) = Self::source_and_destination_chain(order)?;
+				let output_oracle = self.validate_bound_output_oracle(order, destination_chain)?;
+				let submission = self
+					.build_submission_from_post_fill_receipt(order, receipt, output_oracle)
 					.await?;
-				let fill_payload = self.parse_fill_payload_from_logs(order, &fill_logs)?;
-				let payload_hash = keccak256(&fill_payload);
-				let payloads = vec![fill_payload];
-
-				let message_data =
-					encode_message_data(address_to_bytes32(&output_settler), &payloads)?;
-				let computed_message = compute_broadcaster_message(&output_settler, &payloads);
-				let actual_message = self
-					.extract_message_from_broadcast_logs(&receipt.logs, &output_oracle)
-					.ok_or_else(|| {
-						SettlementError::ValidationFailed(
-							"MessageBroadcast event not found in PostFill receipt".to_string(),
-						)
-					})?;
-				if actual_message != computed_message {
-					return Err(SettlementError::SlotDerivationMismatch);
-				}
-
 				self.message_tracker
-					.track_submission(
-						&order.id,
-						BroadcasterSubmission {
-							source_chain,
-							destination_chain,
-							submission_tx_hash: receipt.hash.clone(),
-							submission_timestamp: now_seconds(),
-							submission_block_number: Some(receipt.block_number),
-							payload_hash,
-							message: computed_message,
-							message_data,
-							application: output_settler,
-							remote_oracle: output_oracle,
-						},
-					)
+					.track_submission(&order.id, submission)
 					.await?;
 			},
 			TransactionType::PreClaim => {
@@ -1726,8 +1970,80 @@ impl crate::SettlementRegistry for Registry {}
 mod tests {
 	use super::*;
 	use crate::OracleSelectionStrategy;
+	use solver_types::standards::eip7683::MandateOutput;
+	use solver_types::utils::tests::builders::{
+		Eip7683OrderDataBuilder, MandateOutputBuilder, OrderBuilder,
+	};
+	use solver_types::TransactionReceipt;
+	use wiremock::matchers::{method, path};
+	use wiremock::{Mock, MockServer, ResponseTemplate};
 
 	// ── helpers ─────────────────────────────────────────────────────────────
+
+	fn test_storage() -> Arc<StorageService> {
+		Arc::new(StorageService::new(Box::new(
+			solver_storage::implementations::memory::MemoryStorage::new(),
+		)))
+	}
+
+	fn test_settlement(oracle_config: OracleConfig) -> BroadcasterSettlement {
+		BroadcasterSettlement {
+			providers: HashMap::new(),
+			oracle_config,
+			broadcaster_addresses: HashMap::new(),
+			receiver_addresses: HashMap::new(),
+			broadcaster_ids: HashMap::new(),
+			proof_service_url: "http://proof-service/".into(),
+			proof_wait_time_seconds: 1800,
+			default_finality_blocks: 20,
+			finality_blocks: HashMap::from([(421614, 64)]),
+			message_tracker: Arc::new(BroadcasterMessageTracker::new(test_storage())),
+			http_client: reqwest::Client::new(),
+			pusher_directions: vec![],
+		}
+	}
+
+	fn test_settlement_with_proof_service(
+		oracle_config: OracleConfig,
+		proof_service_url: String,
+	) -> BroadcasterSettlement {
+		BroadcasterSettlement {
+			providers: HashMap::new(),
+			oracle_config,
+			broadcaster_addresses: HashMap::new(),
+			receiver_addresses: HashMap::new(),
+			broadcaster_ids: HashMap::new(),
+			proof_service_url,
+			proof_wait_time_seconds: 1800,
+			default_finality_blocks: 20,
+			finality_blocks: HashMap::from([(421614, 64)]),
+			message_tracker: Arc::new(BroadcasterMessageTracker::new(test_storage())),
+			http_client: reqwest::Client::new(),
+			pusher_directions: vec![],
+		}
+	}
+
+	fn make_eip7683_order_data(
+		input_oracle: &solver_types::Address,
+		outputs: Vec<MandateOutput>,
+	) -> serde_json::Value {
+		let data = Eip7683OrderDataBuilder::new()
+			.origin_chain_id(U256::from(1u64))
+			.input_oracle(with_0x_prefix(&hex::encode(&input_oracle.0)))
+			.outputs(outputs)
+			.build();
+		serde_json::to_value(data).unwrap()
+	}
+
+	fn make_output(destination_chain: u64, output_oracle: [u8; 32]) -> MandateOutput {
+		MandateOutputBuilder::new()
+			.oracle(output_oracle)
+			.chain_id(U256::from(destination_chain))
+			.token([0x11; 32])
+			.amount(U256::from(42u64))
+			.recipient([0x22; 32])
+			.build()
+	}
 
 	fn make_oracle_config(routes: HashMap<u64, Vec<u64>>) -> OracleConfig {
 		let mut input_oracles = HashMap::new();
@@ -1803,6 +2119,780 @@ mod tests {
 		let mut root = toml::map::Map::new();
 		root.insert("pusher_directions".into(), toml::Value::Array(entries));
 		toml::Value::Table(root)
+	}
+
+	#[test]
+	fn test_order_id_to_bytes32_handles_hex_and_ascii_inputs() {
+		let hex_id = order_id_to_bytes32(
+			"0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+		);
+		assert_eq!(hex_id[0], 0x01);
+		assert_eq!(hex_id[31], 0x20);
+
+		let ascii_id = order_id_to_bytes32("abc");
+		assert_eq!(&ascii_id[29..32], b"abc");
+	}
+
+	#[test]
+	fn test_extract_fill_details_from_logs_success() {
+		let order_id = [0xabu8; 32];
+		let mut data = vec![0x11; 32];
+		let mut timestamp_word = [0u8; 32];
+		timestamp_word[28..32].copy_from_slice(&123u32.to_be_bytes());
+		data.extend_from_slice(&timestamp_word);
+		let log = solver_types::Log {
+			address: solver_types::Address(vec![0x55; 20]),
+			topics: vec![
+				solver_types::H256(keccak256(
+					b"OutputFilled(bytes32,bytes32,uint32,(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes),uint256)",
+				)),
+				solver_types::H256(order_id),
+			],
+			data,
+		};
+
+		let (solver, timestamp) = extract_fill_details_from_logs(&[log], &order_id).unwrap();
+		assert_eq!(solver, [0x11; 32]);
+		assert_eq!(timestamp, 123);
+	}
+
+	#[test]
+	fn test_extract_fill_details_from_logs_missing_event_errors() {
+		let err = extract_fill_details_from_logs(&[], &[0u8; 32]).unwrap_err();
+		assert!(err.to_string().contains("No OutputFilled event"));
+	}
+
+	#[test]
+	fn test_encode_fill_description_rejects_oversized_call_data() {
+		let err = encode_fill_description(
+			[0x11; 32],
+			[0x22; 32],
+			1,
+			[0x33; 32],
+			U256::from(1u64),
+			[0x44; 32],
+			vec![0u8; (u16::MAX as usize) + 1],
+			vec![],
+		)
+		.unwrap_err();
+		assert!(err.to_string().contains("Call data too large"));
+	}
+
+	#[test]
+	fn test_encode_message_data_rejects_too_many_payloads() {
+		let payloads = vec![Vec::<u8>::new(); (u16::MAX as usize) + 1];
+		let err = encode_message_data([0x11; 32], &payloads).unwrap_err();
+		assert!(err.to_string().contains("Too many payloads"));
+	}
+
+	#[test]
+	fn test_encode_message_data_rejects_oversized_payload() {
+		let err =
+			encode_message_data([0x11; 32], &[vec![0u8; (u16::MAX as usize) + 1]]).unwrap_err();
+		assert!(err.to_string().contains("Payload too large"));
+	}
+
+	#[test]
+	fn test_extract_message_from_broadcast_logs_matches_expected_publisher() {
+		let settlement = test_settlement(empty_oracle_config());
+		let expected_publisher = solver_types::Address(vec![0x77; 20]);
+		let expected_message = [0x99; 32];
+		let log = solver_types::Log {
+			address: solver_types::Address(vec![0x55; 20]),
+			topics: vec![
+				solver_types::H256(keccak256(b"MessageBroadcast(bytes32,address)")),
+				solver_types::H256(expected_message),
+				solver_types::H256(address_to_bytes32(&expected_publisher)),
+			],
+			data: vec![],
+		};
+
+		assert_eq!(
+			settlement.extract_message_from_broadcast_logs(&[log], &expected_publisher),
+			Some(expected_message)
+		);
+	}
+
+	#[test]
+	fn test_extract_message_from_broadcast_logs_ignores_wrong_publisher() {
+		let settlement = test_settlement(empty_oracle_config());
+		let expected_publisher = solver_types::Address(vec![0x77; 20]);
+		let log = solver_types::Log {
+			address: solver_types::Address(vec![0x55; 20]),
+			topics: vec![
+				solver_types::H256(keccak256(b"MessageBroadcast(bytes32,address)")),
+				solver_types::H256([0x99; 32]),
+				solver_types::H256(address_to_bytes32(&solver_types::Address(vec![0x88; 20]))),
+			],
+			data: vec![],
+		};
+
+		assert_eq!(
+			settlement.extract_message_from_broadcast_logs(&[log], &expected_publisher),
+			None
+		);
+	}
+
+	#[test]
+	fn test_source_and_destination_chain_rejects_missing_output_chain() {
+		let order = OrderBuilder::new().with_output_chains(vec![]).build();
+		let err = BroadcasterSettlement::source_and_destination_chain(&order).unwrap_err();
+		assert!(err.to_string().contains("No output chains"));
+	}
+
+	#[test]
+	fn test_finality_blocks_for_uses_override_and_default() {
+		let settlement = test_settlement(empty_oracle_config());
+		assert_eq!(settlement.finality_blocks_for(421614), 64);
+		assert_eq!(settlement.finality_blocks_for(11155111), 20);
+	}
+
+	#[test]
+	fn test_proof_endpoint_trims_trailing_slash() {
+		let settlement = test_settlement(empty_oracle_config());
+		assert_eq!(
+			settlement.proof_endpoint(),
+			"http://proof-service/api/v1/broadcaster/proof"
+		);
+	}
+
+	#[test]
+	fn test_validate_multi_oracle_strategy_guard_rejects_random_multi_oracle() {
+		let oracle_config = OracleConfig {
+			input_oracles: HashMap::from([(
+				1u64,
+				vec![
+					solver_types::Address(vec![1; 20]),
+					solver_types::Address(vec![2; 20]),
+				],
+			)]),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::Random,
+		};
+
+		let err = BroadcasterSettlement::validate_multi_oracle_strategy_guard(&oracle_config)
+			.unwrap_err();
+		assert!(err
+			.to_string()
+			.contains("does not yet support multiple input oracles"));
+	}
+
+	#[test]
+	fn test_validate_bound_input_oracle_success() {
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let order = OrderBuilder::new()
+			.with_data(make_eip7683_order_data(
+				&input_oracle,
+				vec![make_output(137, [0u8; 32])],
+			))
+			.build();
+		let oracle_config = OracleConfig {
+			input_oracles: HashMap::from([(1u64, vec![input_oracle.clone()])]),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		};
+		let settlement = test_settlement(oracle_config);
+
+		assert_eq!(
+			settlement.validate_bound_input_oracle(&order, 1).unwrap(),
+			input_oracle
+		);
+	}
+
+	#[test]
+	fn test_validate_bound_output_oracle_success() {
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let output_oracle = solver_types::Address(vec![0x44; 20]);
+		let order = OrderBuilder::new()
+			.with_data(make_eip7683_order_data(
+				&input_oracle,
+				vec![make_output(137, address_to_bytes32(&output_oracle))],
+			))
+			.build();
+		let oracle_config = OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::from([(137u64, vec![output_oracle.clone()])]),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		};
+		let settlement = test_settlement(oracle_config);
+
+		assert_eq!(
+			settlement
+				.validate_bound_output_oracle(&order, 137)
+				.unwrap(),
+			output_oracle
+		);
+	}
+
+	#[test]
+	fn test_validate_bound_output_oracle_rejects_zero_oracle() {
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let order = OrderBuilder::new()
+			.with_data(make_eip7683_order_data(
+				&input_oracle,
+				vec![make_output(137, [0u8; 32])],
+			))
+			.build();
+		let settlement = test_settlement(empty_oracle_config());
+
+		let err = settlement
+			.validate_bound_output_oracle(&order, 137)
+			.unwrap_err();
+		assert!(err.to_string().contains("output oracle is zero"));
+	}
+
+	#[test]
+	fn test_parse_u64_table_rejects_negative_values() {
+		let table = toml::Value::Table(toml::toml! { "1" = -1 });
+		let err = parse_u64_table(&table).unwrap_err();
+		assert!(err.to_string().contains("must be non-negative"));
+	}
+
+	#[test]
+	fn test_extract_output_details_rejects_missing_outputs() {
+		let order = OrderBuilder::new()
+			.with_data(serde_json::json!({
+				"order_id": vec![0u8; 32],
+				"user": "0x1234567890123456789012345678901234567890",
+				"nonce": "1",
+				"origin_chain_id": "1",
+				"expires": 100,
+				"fill_deadline": 50,
+				"input_oracle": "0x1234567890123456789012345678901234567890",
+				"inputs": [],
+				"outputs": [],
+				"gas_limit_overrides": {}
+			}))
+			.build();
+
+		let err = match extract_output_details(&order) {
+			Ok(_) => panic!("missing outputs should error"),
+			Err(err) => err,
+		};
+		assert!(err.to_string().contains("No outputs found in order"));
+	}
+
+	#[test]
+	fn test_parse_eip7683_order_data_rejects_wrong_standard() {
+		let order = OrderBuilder::new().with_standard("hyperlane").build();
+		let err = parse_eip7683_order_data(&order).unwrap_err();
+		assert!(err.to_string().contains("only supports eip7683 orders"));
+	}
+
+	#[test]
+	fn test_parse_bound_input_oracle_rejects_invalid_address() {
+		let data = serde_json::json!({
+			"order_id": vec![0u8; 32],
+			"user": "0x1234567890123456789012345678901234567890",
+			"nonce": "1",
+			"origin_chain_id": "1",
+			"expires": 100,
+			"fill_deadline": 50,
+			"input_oracle": "not-an-address",
+			"inputs": [],
+			"outputs": [],
+			"gas_limit_overrides": {}
+		});
+		let order = OrderBuilder::new().with_data(data).build();
+
+		let err = parse_bound_input_oracle(&order).unwrap_err();
+		assert!(err.to_string().contains("Invalid order-bound input oracle"));
+	}
+
+	#[test]
+	fn test_parse_bound_output_oracle_rejects_missing_destination() {
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let order = OrderBuilder::new()
+			.with_data(make_eip7683_order_data(
+				&input_oracle,
+				vec![make_output(10, [0x44; 32])],
+			))
+			.build();
+
+		let err = parse_bound_output_oracle(&order, 137).unwrap_err();
+		assert!(err.to_string().contains("No order output found"));
+	}
+
+	#[test]
+	fn test_parse_hex_bytes_rejects_invalid_hex() {
+		let err = parse_hex_bytes("storage_proof", "0xz1").unwrap_err();
+		assert!(err.to_string().contains("Invalid hex for storage_proof"));
+	}
+
+	#[test]
+	fn test_compute_hashes_zero_pad_invalid_address_lengths() {
+		let message =
+			compute_broadcaster_message(&solver_types::Address(vec![0x11; 19]), &[vec![1]]);
+		let slot = compute_message_slot(message, &solver_types::Address(vec![0x22; 19]));
+		assert_ne!(message, [0u8; 32]);
+		assert_ne!(slot, [0u8; 32]);
+	}
+
+	#[tokio::test]
+	async fn test_generate_post_fill_transaction_builds_submit_call() {
+		use alloy_sol_types::SolCall;
+
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let output_oracle = solver_types::Address(vec![0x44; 20]);
+		let order = OrderBuilder::new()
+			.with_input_chain_ids(vec![421614])
+			.with_output_chain_ids(vec![11155111])
+			.with_data(make_eip7683_order_data(
+				&input_oracle,
+				vec![make_output(11155111, address_to_bytes32(&output_oracle))],
+			))
+			.build();
+		let oracle_config = OracleConfig {
+			input_oracles: HashMap::from([(421614u64, vec![input_oracle])]),
+			output_oracles: HashMap::from([(11155111u64, vec![output_oracle.clone()])]),
+			routes: HashMap::from([(421614u64, vec![11155111u64])]),
+			selection_strategy: OracleSelectionStrategy::First,
+		};
+		let settlement = test_settlement(oracle_config);
+
+		let mut event_data = vec![0x11; 32];
+		let mut timestamp_word = [0u8; 32];
+		timestamp_word[28..32].copy_from_slice(&123u32.to_be_bytes());
+		event_data.extend_from_slice(&timestamp_word);
+		let receipt = TransactionReceipt {
+			hash: TransactionHash(vec![0xaa; 32]),
+			block_number: 7,
+			success: true,
+			logs: vec![solver_types::Log {
+				address: output_oracle.clone(),
+				topics: vec![
+					solver_types::H256(keccak256(
+						b"OutputFilled(bytes32,bytes32,uint32,(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes),uint256)",
+					)),
+					solver_types::H256(order_id_to_bytes32(&order.id)),
+				],
+				data: event_data,
+			}],
+			block_timestamp: None,
+		};
+
+		let tx = settlement
+			.generate_post_fill_transaction(&order, &receipt)
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(tx.to, Some(output_oracle.clone()));
+		let decoded = IBroadcasterOracle::submitCall::abi_decode(&tx.data).unwrap();
+		assert_eq!(
+			decoded.source,
+			alloy_primitives::Address::from_slice(&order.output_chains[0].settler_address.0)
+		);
+		assert_eq!(decoded.payloads.len(), 1);
+	}
+
+	#[tokio::test]
+	async fn test_generate_and_store_proof_success() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(path("/api/v1/broadcaster/proof"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+				"route": ["0x1111111111111111111111111111111111111111"],
+				"bhpInputs": ["0xdeadbeef"],
+				"storageProof": "0xcafe"
+			})))
+			.mount(&server)
+			.await;
+
+		let mut settlement =
+			test_settlement_with_proof_service(empty_oracle_config(), server.uri());
+		settlement
+			.broadcaster_addresses
+			.insert(11155111, solver_types::Address(vec![0x41; 20]));
+		settlement
+			.receiver_addresses
+			.insert(421614, solver_types::Address(vec![0x42; 20]));
+		settlement
+			.broadcaster_ids
+			.insert(11155111, B256::from([0x43; 32]));
+
+		let order = OrderBuilder::new().with_id("proof-order").build();
+		let submission = BroadcasterSubmission {
+			source_chain: 421614,
+			destination_chain: 11155111,
+			submission_tx_hash: TransactionHash(vec![0x55; 32]),
+			submission_timestamp: 1,
+			submission_block_number: Some(999),
+			payload_hash: [0x66; 32],
+			message: [0x77; 32],
+			message_data: vec![0x88],
+			application: solver_types::Address(vec![0x99; 20]),
+			remote_oracle: solver_types::Address(vec![0xaa; 20]),
+		};
+
+		settlement
+			.generate_and_store_proof(&order, 421614, 11155111, &submission)
+			.await
+			.unwrap();
+
+		let state = settlement
+			.message_tracker
+			.load(&order.id)
+			.await
+			.unwrap()
+			.unwrap();
+		let proof = state.proof.unwrap();
+		assert_eq!(proof.route.len(), 1);
+		assert_eq!(proof.route[0], solver_types::Address(vec![0x11; 20]));
+		assert_eq!(proof.bhp_inputs, vec![vec![0xde, 0xad, 0xbe, 0xef]]);
+		assert_eq!(proof.storage_proof, vec![0xca, 0xfe]);
+	}
+
+	#[tokio::test]
+	async fn test_generate_and_store_proof_rejects_non_success_response() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(path("/api/v1/broadcaster/proof"))
+			.respond_with(ResponseTemplate::new(503).set_body_string("not ready"))
+			.mount(&server)
+			.await;
+
+		let mut settlement =
+			test_settlement_with_proof_service(empty_oracle_config(), server.uri());
+		settlement
+			.broadcaster_addresses
+			.insert(11155111, solver_types::Address(vec![0x41; 20]));
+		settlement
+			.receiver_addresses
+			.insert(421614, solver_types::Address(vec![0x42; 20]));
+		settlement
+			.broadcaster_ids
+			.insert(11155111, B256::from([0x43; 32]));
+
+		let order = OrderBuilder::new().with_id("proof-order").build();
+		let submission = BroadcasterSubmission {
+			source_chain: 421614,
+			destination_chain: 11155111,
+			submission_tx_hash: TransactionHash(vec![0x55; 32]),
+			submission_timestamp: 1,
+			submission_block_number: Some(999),
+			payload_hash: [0x66; 32],
+			message: [0x77; 32],
+			message_data: vec![0x88],
+			application: solver_types::Address(vec![0x99; 20]),
+			remote_oracle: solver_types::Address(vec![0xaa; 20]),
+		};
+
+		let err = settlement
+			.generate_and_store_proof(&order, 421614, 11155111, &submission)
+			.await
+			.unwrap_err();
+		assert!(err.to_string().contains("503"));
+	}
+
+	#[tokio::test]
+	async fn test_generate_and_store_proof_rejects_invalid_route_and_length_mismatch() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(path("/api/v1/broadcaster/proof"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+				"route": ["not-an-address"],
+				"bhpInputs": ["0xdeadbeef"],
+				"storageProof": "0xcafe"
+			})))
+			.mount(&server)
+			.await;
+
+		let mut settlement =
+			test_settlement_with_proof_service(empty_oracle_config(), server.uri());
+		settlement
+			.broadcaster_addresses
+			.insert(11155111, solver_types::Address(vec![0x41; 20]));
+		settlement
+			.receiver_addresses
+			.insert(421614, solver_types::Address(vec![0x42; 20]));
+		settlement
+			.broadcaster_ids
+			.insert(11155111, B256::from([0x43; 32]));
+
+		let order = OrderBuilder::new().with_id("proof-order").build();
+		let submission = BroadcasterSubmission {
+			source_chain: 421614,
+			destination_chain: 11155111,
+			submission_tx_hash: TransactionHash(vec![0x55; 32]),
+			submission_timestamp: 1,
+			submission_block_number: Some(999),
+			payload_hash: [0x66; 32],
+			message: [0x77; 32],
+			message_data: vec![0x88],
+			application: solver_types::Address(vec![0x99; 20]),
+			remote_oracle: solver_types::Address(vec![0xaa; 20]),
+		};
+
+		let err = settlement
+			.generate_and_store_proof(&order, 421614, 11155111, &submission)
+			.await
+			.unwrap_err();
+		assert!(err.to_string().contains("invalid route address"));
+
+		server.reset().await;
+		Mock::given(method("POST"))
+			.and(path("/api/v1/broadcaster/proof"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+				"route": ["0x1111111111111111111111111111111111111111", "0x2222222222222222222222222222222222222222"],
+				"bhpInputs": ["0xdeadbeef"],
+				"storageProof": "0xcafe"
+			})))
+			.mount(&server)
+			.await;
+
+		let err = settlement
+			.generate_and_store_proof(&order, 421614, 11155111, &submission)
+			.await
+			.unwrap_err();
+		assert!(err.to_string().contains("route/bhp_inputs length mismatch"));
+	}
+
+	#[tokio::test]
+	async fn test_buffer_coverage_check_and_recover_post_fill_state_use_tracker() {
+		let direction = PusherDirection {
+			label: "eth-to-arb".into(),
+			l1_chain_id: 11155111,
+			pusher_address: solver_types::Address(vec![0x31; 20]),
+			l2_chain_id: 421614,
+			buffer_address: solver_types::Address(vec![0x32; 20]),
+			batch_size: 256,
+			push_cooldown_seconds: 60,
+			l2_params: PusherL2Params::Raw {
+				data: "0x".into(),
+				value_wei: None,
+			},
+		};
+		let settlement = BroadcasterSettlement {
+			pusher_directions: vec![direction.clone()],
+			..test_settlement(empty_oracle_config())
+		};
+		let order = OrderBuilder::new().with_id("tracked-order").build();
+		let submission = BroadcasterSubmission {
+			source_chain: 421614,
+			destination_chain: 11155111,
+			submission_tx_hash: TransactionHash(vec![0x55; 32]),
+			submission_timestamp: 1,
+			submission_block_number: Some(12345),
+			payload_hash: [0x66; 32],
+			message: [0x77; 32],
+			message_data: vec![0x88],
+			application: solver_types::Address(vec![0x99; 20]),
+			remote_oracle: solver_types::Address(vec![0xaa; 20]),
+		};
+
+		settlement
+			.message_tracker
+			.track_submission(&order.id, submission)
+			.await
+			.unwrap();
+
+		match settlement.buffer_coverage_check(&order).await {
+			Some((actual_direction, actual_block)) => {
+				assert_eq!(actual_direction.label, direction.label);
+				assert_eq!(actual_direction.l1_chain_id, direction.l1_chain_id);
+				assert_eq!(actual_direction.l2_chain_id, direction.l2_chain_id);
+				assert_eq!(actual_block, 12345);
+			},
+			None => panic!("expected buffer coverage direction"),
+		}
+		assert!(settlement.recover_post_fill_state(&order).await.unwrap());
+	}
+
+	#[tokio::test]
+	async fn test_handle_transaction_confirmed_pre_claim_marks_verified() {
+		let settlement = test_settlement(empty_oracle_config());
+		let order = OrderBuilder::new().with_id("verified-order").build();
+		let receipt = TransactionReceipt {
+			hash: TransactionHash(vec![0x77; 32]),
+			block_number: 1,
+			success: true,
+			logs: vec![],
+			block_timestamp: None,
+		};
+
+		settlement
+			.handle_transaction_confirmed(&order, TransactionType::PreClaim, &receipt)
+			.await
+			.unwrap();
+
+		let state = settlement
+			.message_tracker
+			.load(&order.id)
+			.await
+			.unwrap()
+			.unwrap();
+		assert!(state.verified.is_some());
+	}
+
+	#[tokio::test]
+	async fn test_get_attestation_rejects_missing_provider() {
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let order = OrderBuilder::new()
+			.with_input_chain_ids(vec![11155111])
+			.with_output_chain_ids(vec![421614])
+			.with_data(make_eip7683_order_data(
+				&input_oracle,
+				vec![make_output(421614, [0u8; 32])],
+			))
+			.build();
+		let settlement = test_settlement(OracleConfig {
+			input_oracles: HashMap::from([(11155111u64, vec![input_oracle])]),
+			output_oracles: HashMap::new(),
+			routes: HashMap::from([(11155111u64, vec![421614u64])]),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+
+		let err = settlement
+			.get_attestation(&order, &TransactionHash(vec![0xaa; 32]))
+			.await
+			.unwrap_err();
+		assert!(err.to_string().contains("No provider configured"));
+	}
+
+	#[tokio::test]
+	async fn test_readiness_rejects_unsupported_stored_output_oracle() {
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let configured_output_oracle = solver_types::Address(vec![0x44; 20]);
+		let stored_output_oracle = solver_types::Address(vec![0x55; 20]);
+		let order = OrderBuilder::new()
+			.with_id("readiness-order")
+			.with_input_chain_ids(vec![421614])
+			.with_output_chain_ids(vec![11155111])
+			.with_data(make_eip7683_order_data(
+				&input_oracle,
+				vec![make_output(
+					11155111,
+					address_to_bytes32(&configured_output_oracle),
+				)],
+			))
+			.build();
+		let settlement = test_settlement(OracleConfig {
+			input_oracles: HashMap::from([(421614u64, vec![input_oracle])]),
+			output_oracles: HashMap::from([(11155111u64, vec![configured_output_oracle])]),
+			routes: HashMap::from([(421614u64, vec![11155111u64])]),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		settlement
+			.message_tracker
+			.track_submission(
+				&order.id,
+				BroadcasterSubmission {
+					source_chain: 421614,
+					destination_chain: 11155111,
+					submission_tx_hash: TransactionHash(vec![0x55; 32]),
+					submission_timestamp: 1,
+					submission_block_number: Some(12345),
+					payload_hash: [0x66; 32],
+					message: [0x77; 32],
+					message_data: vec![0x88],
+					application: solver_types::Address(vec![0x99; 20]),
+					remote_oracle: stored_output_oracle,
+				},
+			)
+			.await
+			.unwrap();
+
+		let readiness = settlement
+			.readiness(
+				&order,
+				&FillProof {
+					tx_hash: TransactionHash(vec![0xaa; 32]),
+					block_number: 1,
+					oracle_address: with_0x_prefix(&hex::encode(vec![0x33; 20])),
+					attestation_data: None,
+					filled_timestamp: now_seconds(),
+				},
+			)
+			.await;
+
+		assert!(matches!(
+			readiness,
+			SettlementReadiness::PermanentFailure(ref msg)
+				if msg.contains("Stored output oracle is not configured")
+		));
+	}
+
+	#[tokio::test]
+	async fn test_readiness_rejects_missing_source_provider() {
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let output_oracle = solver_types::Address(vec![0x44; 20]);
+		let order = OrderBuilder::new()
+			.with_id("readiness-provider-order")
+			.with_input_chain_ids(vec![421614])
+			.with_output_chain_ids(vec![11155111])
+			.with_data(make_eip7683_order_data(
+				&input_oracle,
+				vec![make_output(11155111, address_to_bytes32(&output_oracle))],
+			))
+			.build();
+		let settlement = test_settlement(OracleConfig {
+			input_oracles: HashMap::from([(421614u64, vec![input_oracle.clone()])]),
+			output_oracles: HashMap::from([(11155111u64, vec![output_oracle.clone()])]),
+			routes: HashMap::from([(421614u64, vec![11155111u64])]),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		settlement
+			.message_tracker
+			.track_submission(
+				&order.id,
+				BroadcasterSubmission {
+					source_chain: 421614,
+					destination_chain: 11155111,
+					submission_tx_hash: TransactionHash(vec![0x55; 32]),
+					submission_timestamp: 1,
+					submission_block_number: Some(12345),
+					payload_hash: [0x66; 32],
+					message: [0x77; 32],
+					message_data: vec![0x88],
+					application: solver_types::Address(vec![0x99; 20]),
+					remote_oracle: output_oracle,
+				},
+			)
+			.await
+			.unwrap();
+
+		let fill_proof = FillProof {
+			tx_hash: TransactionHash(vec![0xaa; 32]),
+			block_number: 1,
+			oracle_address: with_0x_prefix(&hex::encode(&input_oracle.0)),
+			attestation_data: None,
+			filled_timestamp: now_seconds(),
+		};
+
+		assert!(matches!(
+			settlement.readiness(&order, &fill_proof).await,
+			SettlementReadiness::PermanentFailure(ref msg)
+				if msg.contains("No provider configured for source chain 421614")
+		));
+		assert!(!settlement.can_claim(&order, &fill_proof).await);
+	}
+
+	#[tokio::test]
+	async fn test_generate_and_store_proof_validates_missing_config_entries() {
+		let server = MockServer::start().await;
+		let settlement = test_settlement_with_proof_service(empty_oracle_config(), server.uri());
+		let order = OrderBuilder::new().with_id("proof-config-order").build();
+		let submission = BroadcasterSubmission {
+			source_chain: 421614,
+			destination_chain: 11155111,
+			submission_tx_hash: TransactionHash(vec![0x55; 32]),
+			submission_timestamp: 1,
+			submission_block_number: Some(999),
+			payload_hash: [0x66; 32],
+			message: [0x77; 32],
+			message_data: vec![0x88],
+			application: solver_types::Address(vec![0x99; 20]),
+			remote_oracle: solver_types::Address(vec![0xaa; 20]),
+		};
+
+		let err = settlement
+			.generate_and_store_proof(&order, 421614, 11155111, &submission)
+			.await
+			.unwrap_err();
+		assert!(err.to_string().contains("No broadcaster configured"));
 	}
 
 	// ── absence / empty ──────────────────────────────────────────────────────
