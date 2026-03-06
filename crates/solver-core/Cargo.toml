@@ -6,6 +6,9 @@ rust-version.workspace = true
 
 [dependencies]
 alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-provider = { workspace = true }
+alloy-rpc-types = { workspace = true }
+alloy-sol-types = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 lru = "0.16"
 once_cell = "1.19"

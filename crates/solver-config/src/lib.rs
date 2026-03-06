@@ -19,7 +19,7 @@ use regex::Regex;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use solver_types::{networks::deserialize_networks, NetworksConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use thiserror::Error;
@@ -196,6 +196,10 @@ pub struct SettlementConfig {
 	/// Map of settlement implementation names to their configurations.
 	/// Each implementation handles specific settlement mechanisms.
 	pub implementations: HashMap<String, toml::Value>,
+	/// Optional deterministic implementation preference order.
+	/// Names must match keys in `implementations`.
+	#[serde(default)]
+	pub implementation_order: Vec<String>,
 	/// Poll interval in seconds for settlement readiness monitoring.
 	/// Defaults to 3 seconds if not specified.
 	#[serde(default = "default_settlement_poll_interval_seconds")]
@@ -609,6 +613,21 @@ impl Config {
 			return Err(ConfigError::Validation(
 				"At least one settlement implementation required".into(),
 			));
+		}
+		if !self.settlement.implementation_order.is_empty() {
+			let mut seen = HashSet::new();
+			for implementation in &self.settlement.implementation_order {
+				if !seen.insert(implementation) {
+					return Err(ConfigError::Validation(format!(
+						"Duplicate settlement implementation in implementation_order: '{implementation}'"
+					)));
+				}
+				if !self.settlement.implementations.contains_key(implementation) {
+					return Err(ConfigError::Validation(format!(
+						"Settlement implementation_order references unknown implementation '{implementation}'"
+					)));
+				}
+			}
 		}
 
 		// Validate settlement poll interval (1-monitoring_timeout_seconds)

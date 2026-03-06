@@ -443,6 +443,7 @@ mod tests {
 				inputs: vec![],
 				outputs: vec![],
 			},
+			settlement_name: None,
 		}
 	}
 

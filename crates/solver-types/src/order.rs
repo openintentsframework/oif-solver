@@ -225,6 +225,11 @@ pub struct Order {
 	/// Fill proof data when available.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub fill_proof: Option<FillProof>,
+	/// Settlement implementation name selected at order creation time.
+	/// Used for all lifecycle operations to ensure consistent settlement handling
+	/// even if runtime configuration changes.
+	#[serde(skip_serializing_if = "Option::is_none", default)]
+	pub settlement_name: Option<String>,
 }
 
 impl Order {

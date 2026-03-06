@@ -5017,7 +5017,10 @@ name = "solver-core"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types",
  "alloy-signer-local",
+ "alloy-sol-types",
  "async-trait",
  "chrono",
  "lru 0.16.1",
@@ -5260,6 +5263,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

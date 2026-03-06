@@ -26,6 +26,7 @@ pub struct OrderBuilder {
 	pre_claim_tx_hash: Option<TransactionHash>,
 	claim_tx_hash: Option<TransactionHash>,
 	fill_proof: Option<FillProof>,
+	settlement_name: Option<String>,
 }
 
 impl Default for OrderBuilder {
@@ -67,6 +68,7 @@ impl Default for OrderBuilder {
 			pre_claim_tx_hash: None,
 			claim_tx_hash: None,
 			fill_proof: None,
+			settlement_name: None,
 		}
 	}
 }
@@ -210,6 +212,12 @@ impl OrderBuilder {
 		self
 	}
 
+	/// Sets the settlement name.
+	pub fn with_settlement_name<S: Into<String>>(mut self, name: Option<S>) -> Self {
+		self.settlement_name = name.map(|s| s.into());
+		self
+	}
+
 	/// Convenience method to create an executed order with fill transaction and proof.
 	pub fn executed_with_fill(mut self, tx_hash: TransactionHash, block_number: u64) -> Self {
 		let timestamp = self.updated_at;
@@ -251,6 +259,7 @@ impl OrderBuilder {
 			pre_claim_tx_hash: self.pre_claim_tx_hash,
 			claim_tx_hash: self.claim_tx_hash,
 			fill_proof: self.fill_proof,
+			settlement_name: self.settlement_name,
 		}
 	}
 }

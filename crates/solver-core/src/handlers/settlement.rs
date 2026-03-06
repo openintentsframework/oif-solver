@@ -13,10 +13,12 @@ use solver_order::OrderService;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
 use solver_types::{
-	truncate_id, DeliveryEvent, Order, SettlementEvent, SolverEvent, StorageKey, TransactionHash,
-	TransactionType,
+	truncate_id, DeliveryEvent, NetworksConfig, Order, SettlementEvent, SolverEvent, StorageKey,
+	TransactionHash, TransactionType,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use thiserror::Error;
 use tracing::instrument;
 
@@ -49,9 +51,12 @@ pub struct SettlementHandler {
 	state_machine: Arc<OrderStateMachine>,
 	event_bus: EventBus,
 	monitoring_timeout_minutes: u64,
+	networks: NetworksConfig,
+	push_cooldowns: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
 }
 
 impl SettlementHandler {
+	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		settlement: Arc<SettlementService>,
 		order_service: Arc<OrderService>,
@@ -60,6 +65,7 @@ impl SettlementHandler {
 		state_machine: Arc<OrderStateMachine>,
 		event_bus: EventBus,
 		monitoring_timeout_minutes: u64,
+		networks: NetworksConfig,
 	) -> Self {
 		Self {
 			settlement,
@@ -69,6 +75,8 @@ impl SettlementHandler {
 			state_machine,
 			event_bus,
 			monitoring_timeout_minutes,
+			networks,
+			push_cooldowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
 		}
 	}
 
@@ -79,6 +87,9 @@ impl SettlementHandler {
 			self.state_machine.clone(),
 			self.event_bus.clone(),
 			self.monitoring_timeout_minutes,
+			self.delivery.clone(),
+			self.networks.clone(),
+			self.push_cooldowns.clone(),
 		);
 
 		tokio::spawn(async move {
@@ -100,6 +111,27 @@ impl SettlementHandler {
 		let fill_tx_hash = order.fill_tx_hash.clone().ok_or_else(|| {
 			SettlementError::Service("Order missing fill transaction hash".to_string())
 		})?;
+
+		// If the post-fill was already submitted before a crash, recover the persisted
+		// broadcaster state and continue with monitoring instead of resubmitting.
+		let recovered = self
+			.settlement
+			.recover_post_fill_state(&order)
+			.await
+			.map_err(|e| SettlementError::Service(e.to_string()))?;
+		if recovered {
+			tracing::info!(
+				order_id = %truncate_id(&order_id),
+				"Recovered existing post-fill state, proceeding to settlement monitoring"
+			);
+			self.event_bus
+				.publish(SolverEvent::Settlement(SettlementEvent::StartMonitoring {
+					order_id,
+					fill_tx_hash,
+				}))
+				.ok();
+			return Ok(());
+		}
 
 		// Get the destination chain for the fill
 		let chain_id = order
@@ -546,6 +578,7 @@ mod tests {
 			state_machine,
 			event_bus,
 			30,
+			HashMap::new(), // networks — empty for handler unit tests
 		);
 
 		(handler, event_rx)
@@ -656,8 +689,13 @@ mod tests {
 				mock_settlement
 					.expect_is_input_oracle_supported()
 					.with(eq(1u64), eq(default_order_oracle_address()))
-					.times(1)
+					.times(2)
 					.returning(|_, _| true);
+
+				mock_settlement
+					.expect_recover_post_fill_state()
+					.times(1)
+					.returning(|_| Box::pin(async move { Ok(false) }));
 
 				// Mock settlement service methods
 				mock_settlement
@@ -715,14 +753,19 @@ mod tests {
 				mock_settlement
 					.expect_is_input_oracle_supported()
 					.with(eq(1u64), eq(default_order_oracle_address()))
-					.times(1)
+					.times(2)
 					.returning(|_, _| true);
 
 				mock_settlement
-					.expect_generate_post_fill_transaction()
+					.expect_recover_post_fill_state()
 					.times(1)
-					// Return None to indicate no transaction needed
-					.returning(|_, _| Box::pin(async move { Ok(None) }));
+					.returning(|_| Box::pin(async move { Ok(false) }));
+
+				mock_settlement
+						.expect_generate_post_fill_transaction()
+						.times(1)
+						// Return None to indicate no transaction needed
+						.returning(|_, _| Box::pin(async move { Ok(None) }));
 			},
 			|mock_delivery| {
 				mock_delivery
@@ -743,6 +786,104 @@ mod tests {
 			.await;
 
 		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_handle_post_fill_ready_recovered_submission_skips_resubmit() {
+		let (handler, mut receiver) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(1)
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_standard("eip7683")
+							.with_fill_tx_hash(Some(TransactionHash(vec![0x11; 32])))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+			},
+			|mock_settlement| {
+				mock_settlement
+					.expect_is_input_oracle_supported()
+					.with(eq(1u64), eq(default_order_oracle_address()))
+					.times(1)
+					.returning(|_, _| true);
+
+				mock_settlement
+					.expect_recover_post_fill_state()
+					.times(1)
+					.returning(|_| Box::pin(async move { Ok(true) }));
+			},
+			|_mock_delivery| {},
+			|_mock_order| {},
+		)
+		.await;
+
+		let result = handler
+			.handle_post_fill_ready("test_order_123".to_string())
+			.await;
+
+		assert!(result.is_ok());
+		match receiver.try_recv() {
+			Ok(SolverEvent::Settlement(SettlementEvent::StartMonitoring {
+				order_id,
+				fill_tx_hash,
+			})) => {
+				assert_eq!(order_id, "test_order_123");
+				assert_eq!(fill_tx_hash, TransactionHash(vec![0x11; 32]));
+			},
+			Ok(other) => panic!("Expected StartMonitoring event, got: {other:?}"),
+			Err(e) => panic!("Expected StartMonitoring event but got error: {e:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_handle_post_fill_ready_recovery_error_propagates() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(1)
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_standard("eip7683")
+							.with_fill_tx_hash(Some(TransactionHash(vec![0x11; 32])))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+			},
+			|mock_settlement| {
+				mock_settlement
+					.expect_is_input_oracle_supported()
+					.with(eq(1u64), eq(default_order_oracle_address()))
+					.times(1)
+					.returning(|_, _| true);
+
+				mock_settlement
+					.expect_recover_post_fill_state()
+					.times(1)
+					.returning(|_| {
+						Box::pin(async move {
+							Err(solver_settlement::SettlementError::ValidationFailed(
+								"tracker recovery failed".to_string(),
+							))
+						})
+					});
+			},
+			|_mock_delivery| {},
+			|_mock_order| {},
+		)
+		.await;
+
+		let result = handler
+			.handle_post_fill_ready("test_order_123".to_string())
+			.await;
+
+		assert!(result.is_err());
+		assert!(matches!(result.unwrap_err(), SettlementError::Service(_)));
 	}
 
 	#[tokio::test]
