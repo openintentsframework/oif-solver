@@ -896,55 +896,31 @@ mod tests {
 
 	#[test]
 	fn test_config_allows_empty_network_tokens() {
-		let config_str = r#"
-[solver]
-id = "test-empty-tokens"
-monitoring_timeout_minutes = 5
-min_profitability_pct = 1.0
+		fn empty_token_network(rpc_url: &str) -> serde_json::Value {
+			json!({
+				"input_settler_address": "0x1234567890123456789012345678901234567890",
+				"output_settler_address": "0x0987654321098765432109876543210987654321",
+				"rpc_urls": [{ "http": rpc_url }],
+				"tokens": []
+			})
+		}
 
-[networks.1]
-input_settler_address = "0x1234567890123456789012345678901234567890"
-output_settler_address = "0x0987654321098765432109876543210987654321"
-tokens = []
-[[networks.1.rpc_urls]]
-http = "http://localhost:8545"
-
-[networks.2]
-input_settler_address = "0x1234567890123456789012345678901234567890"
-output_settler_address = "0x0987654321098765432109876543210987654321"
-tokens = []
-[[networks.2.rpc_urls]]
-http = "http://localhost:8546"
-
-[storage]
-primary = "memory"
-cleanup_interval_seconds = 3600
-[storage.implementations.memory]
-
-[delivery]
-[delivery.implementations.test]
-
-[account]
-primary = "local"
-[account.implementations.local]
-private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-
-[discovery]
-[discovery.implementations.test]
-
-[order]
-[order.implementations.test]
-[order.strategy]
-primary = "simple"
-[order.strategy.implementations.simple]
-
-[settlement]
-[settlement.implementations.test]
-order = "test"
-network_ids = [1, 2]
-"#;
-
-		let config: Config = config_str.parse().expect("Config should parse");
+		let config = parse_json_fixture(base_config_json(
+			json!({
+				"1": empty_token_network("http://localhost:8545"),
+				"2": empty_token_network("http://localhost:8546")
+			}),
+			json!({
+				"test": {}
+			}),
+			json!({
+				"test": {
+					"order": "test",
+					"network_ids": [1, 2]
+				}
+			}),
+		))
+		.expect("Config should parse");
 		assert_eq!(config.networks.get(&1).unwrap().tokens.len(), 0);
 		assert_eq!(config.networks.get(&2).unwrap().tokens.len(), 0);
 	}
