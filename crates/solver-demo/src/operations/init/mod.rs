@@ -836,7 +836,7 @@ mod tests {
 		assert_eq!(map.len(), 18);
 		assert_eq!(
 			map.get("PLACEHOLDER_INPUT_SETTLER_1"),
-			Some(&format!("0x{:040x}", PLACEHOLDER_START_COUNTER))
+			Some(&format!("0x{PLACEHOLDER_START_COUNTER:040x}"))
 		);
 		assert_eq!(
 			map.get("PLACEHOLDER_OUTPUT_SETTLER_1"),
@@ -1010,6 +1010,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[allow(clippy::await_holding_lock)]
 	async fn generate_new_config_creates_file_and_supports_force_overwrite() {
 		let _lock = acquire_lock();
 		let temp = TempDir::new().expect("temp dir");
@@ -1040,6 +1041,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[allow(clippy::await_holding_lock)]
 	async fn load_config_persists_session_with_chains_and_contracts() {
 		let _lock = acquire_lock();
 		let temp = TempDir::new().expect("temp dir");
@@ -1078,6 +1080,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[allow(clippy::await_holding_lock)]
 	async fn load_config_returns_error_for_invalid_token_address() {
 		let _lock = acquire_lock();
 		let temp = TempDir::new().expect("temp dir");
@@ -1175,6 +1178,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[allow(clippy::await_holding_lock)]
 	async fn load_config_from_storage_file_backend_materializes_and_loads_session() {
 		use solver_service::{config_merge::merge_to_operator_config, seeds::SeedPreset};
 		use solver_storage::StoreConfig;
