@@ -990,7 +990,7 @@ fn build_account_config_from_operator(
 		let mut implementations = HashMap::new();
 
 		for (name, json_value) in &config.implementations {
-			let impl_value = json_identity(json_value);
+			let impl_value = json_value.clone();
 			implementations.insert(name.clone(), impl_value);
 		}
 
@@ -1091,7 +1091,7 @@ fn build_settlement_config_from_operator(
 							.to_string(),
 					)
 				})?;
-			let hyperlane_config = build_hyperlane_toml_from_operator(hyperlane, chain_ids);
+			let hyperlane_config = build_hyperlane_json_from_operator(hyperlane, chain_ids);
 			implementations.insert("hyperlane".to_string(), hyperlane_config);
 		},
 		OperatorSettlementType::Direct => {
@@ -1215,79 +1215,76 @@ fn build_hyperlane_json_from_operator(
 	serde_json::Value::Object(table)
 }
 
-/// Builds direct settlement toml config from OperatorDirectConfig.
+/// Builds direct settlement JSON config from OperatorDirectConfig.
 fn build_direct_toml_from_operator(
 	direct: &OperatorDirectConfig,
 	chain_ids: &[u64],
-) -> toml::Value {
-	let mut table = toml::map::Map::new();
+) -> serde_json::Value {
+	let mut table = serde_json::Map::new();
 
 	table.insert(
 		"order".to_string(),
-		toml::Value::String("eip7683".to_string()),
+		serde_json::Value::String("eip7683".to_string()),
 	);
 	table.insert(
 		"network_ids".to_string(),
-		toml::Value::Array(
-			chain_ids
-				.iter()
-				.map(|id| toml::Value::Integer(*id as i64))
-				.collect(),
-		),
+		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect()),
 	);
 	table.insert(
 		"dispute_period_seconds".to_string(),
-		toml::Value::Integer(direct.dispute_period_seconds as i64),
+		int(direct.dispute_period_seconds as i64),
 	);
 	table.insert(
 		"oracle_selection_strategy".to_string(),
-		toml::Value::String(match direct.oracle_selection_strategy {
+		serde_json::Value::String(match direct.oracle_selection_strategy {
 			OperatorOracleSelectionStrategy::First => "First".to_string(),
 			OperatorOracleSelectionStrategy::RoundRobin => "RoundRobin".to_string(),
 			OperatorOracleSelectionStrategy::Random => "Random".to_string(),
 		}),
 	);
 
-	let mut input_oracles = toml::map::Map::new();
+	let mut input_oracles = serde_json::Map::new();
 	for (chain_id, oracles) in &direct.oracles.input {
-		let oracle_array = toml::Value::Array(
+		let oracle_array = serde_json::Value::Array(
 			oracles
 				.iter()
-				.map(|addr| toml::Value::String(format!("0x{}", hex::encode(addr))))
+				.map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(addr))))
 				.collect(),
 		);
 		input_oracles.insert(chain_id.to_string(), oracle_array);
 	}
 
-	let mut output_oracles = toml::map::Map::new();
+	let mut output_oracles = serde_json::Map::new();
 	for (chain_id, oracles) in &direct.oracles.output {
-		let oracle_array = toml::Value::Array(
+		let oracle_array = serde_json::Value::Array(
 			oracles
 				.iter()
-				.map(|addr| toml::Value::String(format!("0x{}", hex::encode(addr))))
+				.map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(addr))))
 				.collect(),
 		);
 		output_oracles.insert(chain_id.to_string(), oracle_array);
 	}
 
-	let mut oracles = toml::map::Map::new();
-	oracles.insert("input".to_string(), toml::Value::Table(input_oracles));
-	oracles.insert("output".to_string(), toml::Value::Table(output_oracles));
-	table.insert("oracles".to_string(), toml::Value::Table(oracles));
+	let mut oracles = serde_json::Map::new();
+	oracles.insert(
+		"input".to_string(),
+		serde_json::Value::Object(input_oracles),
+	);
+	oracles.insert(
+		"output".to_string(),
+		serde_json::Value::Object(output_oracles),
+	);
+	table.insert("oracles".to_string(), serde_json::Value::Object(oracles));
 
-	let mut routes = toml::map::Map::new();
+	let mut routes = serde_json::Map::new();
 	for (chain_id, destinations) in &direct.routes {
-		let dest_array = toml::Value::Array(
-			destinations
-				.iter()
-				.map(|c| toml::Value::Integer(*c as i64))
-				.collect(),
-		);
+		let dest_array =
+			serde_json::Value::Array(destinations.iter().map(|c| int(*c as i64)).collect());
 		routes.insert(chain_id.to_string(), dest_array);
 	}
-	table.insert("routes".to_string(), toml::Value::Table(routes));
+	table.insert("routes".to_string(), serde_json::Value::Object(routes));
 
-	toml::Value::Table(table)
+	serde_json::Value::Object(table)
 }
 
 /// Builds PricingConfig from OperatorPricingConfig.
@@ -1419,392 +1416,6 @@ fn json_object(pairs: Vec<(&str, serde_json::Value)>) -> serde_json::Value {
 
 fn int(value: i64) -> serde_json::Value {
 	serde_json::Value::Number(value.into())
-}
-
-/// Builds the StorageConfig section.
-///
-/// Uses `solver_id` as the Redis key prefix to isolate storage per solver instance.
-fn build_storage_config(defaults: &SeedDefaults, solver_id: &str) -> StorageConfig {
-	let mut implementations = HashMap::new();
-
-	// Read Redis URL from environment variable with default fallback
-	let redis_url =
-		std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
-
-	// Redis implementation config
-	// Use solver_id as key_prefix to isolate storage per solver instance
-	let redis_config = json_object(vec![
-		("redis_url", serde_json::Value::String(redis_url)),
-		(
-			"key_prefix",
-			serde_json::Value::String(solver_id.to_string()),
-		),
-		("connection_timeout_ms", int(5000)),
-		("ttl_orders", int(0)),
-		("ttl_intents", int(86400)),
-		("ttl_order_by_tx_hash", int(86400)),
-	]);
-	implementations.insert("redis".to_string(), redis_config);
-
-	// Memory implementation (fallback for testing)
-	implementations.insert(
-		"memory".to_string(),
-		serde_json::Value::Object(serde_json::Map::new()),
-	);
-
-	StorageConfig {
-		primary: defaults.storage_primary.to_string(),
-		implementations,
-		cleanup_interval_seconds: defaults.cleanup_interval_seconds,
-	}
-}
-
-/// Builds the DeliveryConfig section.
-fn build_delivery_config(chain_ids: &[u64], defaults: &SeedDefaults) -> DeliveryConfig {
-	let mut implementations = HashMap::new();
-
-	let network_ids_array =
-		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect());
-
-	let evm_alloy_config = json_object(vec![("network_ids", network_ids_array)]);
-	implementations.insert("evm_alloy".to_string(), evm_alloy_config);
-
-	DeliveryConfig {
-		implementations,
-		min_confirmations: defaults.min_confirmations,
-	}
-}
-
-/// Builds the AccountConfig section.
-///
-/// If account_override is provided, only the specified implementations are included.
-/// Otherwise, defaults to local wallet with SOLVER_PRIVATE_KEY.
-fn build_account_config(
-	defaults: &SeedDefaults,
-	account_override: Option<&AccountOverride>,
-) -> AccountConfig {
-	// If account override is provided, use it instead of defaults
-	if let Some(override_config) = account_override {
-		let mut implementations = HashMap::new();
-
-		for (name, config) in &override_config.implementations {
-			// Convert serde_json::Value to serde_json::Value
-			let impl_value = json_identity(config);
-			implementations.insert(name.clone(), impl_value);
-		}
-
-		return AccountConfig {
-			primary: override_config.primary.clone(),
-			implementations,
-		};
-	}
-
-	// Default: local wallet with private key from environment
-	let mut implementations = HashMap::new();
-
-	// Read private key from environment variable and trim whitespace
-	let private_key = std::env::var("SOLVER_PRIVATE_KEY")
-		.map(|k| k.trim().to_string())
-		.unwrap_or_else(|_| "${SOLVER_PRIVATE_KEY}".to_string());
-
-	let local_config = json_object(vec![(
-		"private_key",
-		serde_json::Value::String(private_key),
-	)]);
-	implementations.insert("local".to_string(), local_config);
-
-	AccountConfig {
-		primary: defaults.account_primary.to_string(),
-		implementations,
-	}
-}
-
-/// Converts a serde_json::Value to a serde_json::Value.
-fn json_identity(json: &serde_json::Value) -> serde_json::Value {
-	json.clone()
-}
-
-/// Builds the DiscoveryConfig section.
-fn build_discovery_config(chain_ids: &[u64], defaults: &SeedDefaults) -> DiscoveryConfig {
-	let mut implementations = HashMap::new();
-
-	let network_ids_array =
-		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect());
-
-	// Onchain discovery - polls chain for new orders
-	let onchain_config = json_object(vec![
-		("network_ids", network_ids_array.clone()),
-		(
-			"polling_interval_secs",
-			int(defaults.polling_interval_secs as i64),
-		),
-	]);
-	implementations.insert("onchain_eip7683".to_string(), onchain_config);
-
-	// Offchain discovery - receives orders via HTTP API from aggregators
-	let offchain_config = json_object(vec![
-		("api_host", serde_json::Value::String("0.0.0.0".to_string())),
-		("api_port", int(8081)),
-		("network_ids", network_ids_array),
-	]);
-	implementations.insert("offchain_eip7683".to_string(), offchain_config);
-
-	DiscoveryConfig { implementations }
-}
-
-/// Builds the OrderConfig section.
-fn build_order_config(defaults: &SeedDefaults) -> OrderConfig {
-	let mut implementations = HashMap::new();
-
-	// EIP-7683 order implementation
-	implementations.insert(
-		"eip7683".to_string(),
-		serde_json::Value::Object(serde_json::Map::new()),
-	);
-
-	// Strategy implementations
-	let mut strategy_implementations = HashMap::new();
-	let simple_strategy_config = json_object(vec![(
-		"max_gas_price_gwei",
-		int(defaults.max_gas_price_gwei as i64),
-	)]);
-	strategy_implementations.insert("simple".to_string(), simple_strategy_config);
-
-	OrderConfig {
-		implementations,
-		strategy: StrategyConfig {
-			primary: defaults.order_strategy_primary.to_string(),
-			implementations: strategy_implementations,
-		},
-		callback_whitelist: Vec::new(),
-		simulate_callbacks: defaults.simulate_callbacks,
-	}
-}
-
-/// Builds the SettlementConfig section including Hyperlane configuration.
-fn build_settlement_config(chain_ids: &[u64], seed: &SeedConfig) -> SettlementConfig {
-	let mut implementations = HashMap::new();
-
-	// Build Hyperlane settlement config
-	let hyperlane_config = build_hyperlane_config(chain_ids, seed);
-	implementations.insert("hyperlane".to_string(), hyperlane_config);
-
-	SettlementConfig {
-		implementations,
-		settlement_poll_interval_seconds: seed.defaults.settlement_poll_interval_seconds,
-	}
-}
-
-/// Builds the Hyperlane settlement configuration dynamically.
-fn build_hyperlane_config(chain_ids: &[u64], seed: &SeedConfig) -> serde_json::Value {
-	let mut table = serde_json::Map::new();
-
-	// Basic settings
-	table.insert(
-		"order".to_string(),
-		serde_json::Value::String("eip7683".to_string()),
-	);
-	table.insert(
-		"network_ids".to_string(),
-		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect()),
-	);
-	table.insert(
-		"default_gas_limit".to_string(),
-		int(seed.defaults.hyperlane_default_gas_limit as i64),
-	);
-	table.insert(
-		"message_timeout_seconds".to_string(),
-		int(seed.defaults.hyperlane_message_timeout_seconds as i64),
-	);
-	table.insert(
-		"finalization_required".to_string(),
-		serde_json::Value::Bool(seed.defaults.hyperlane_finalization_required),
-	);
-
-	// Build oracles map
-	let mut input_oracles = serde_json::Map::new();
-	let mut output_oracles = serde_json::Map::new();
-
-	for chain_id in chain_ids {
-		if let Some(network) = seed.get_network(*chain_id) {
-			let oracle_addr = format!("0x{}", hex::encode(network.hyperlane_oracle));
-			let oracle_array =
-				serde_json::Value::Array(vec![serde_json::Value::String(oracle_addr.clone())]);
-
-			input_oracles.insert(chain_id.to_string(), oracle_array.clone());
-			output_oracles.insert(chain_id.to_string(), oracle_array);
-		}
-	}
-
-	let mut oracles = serde_json::Map::new();
-	oracles.insert(
-		"input".to_string(),
-		serde_json::Value::Object(input_oracles),
-	);
-	oracles.insert(
-		"output".to_string(),
-		serde_json::Value::Object(output_oracles),
-	);
-	table.insert("oracles".to_string(), serde_json::Value::Object(oracles));
-
-	// Build routes - each chain can send to all other chains
-	let mut routes = serde_json::Map::new();
-	for chain_id in chain_ids {
-		let other_chains: Vec<serde_json::Value> = chain_ids
-			.iter()
-			.filter(|c| *c != chain_id)
-			.map(|c| int(*c as i64))
-			.collect();
-		routes.insert(chain_id.to_string(), serde_json::Value::Array(other_chains));
-	}
-	table.insert("routes".to_string(), serde_json::Value::Object(routes));
-
-	// Build mailboxes map
-	let mut mailboxes = serde_json::Map::new();
-	for chain_id in chain_ids {
-		if let Some(network) = seed.get_network(*chain_id) {
-			let mailbox_addr = format!("0x{}", hex::encode(network.hyperlane_mailbox));
-			mailboxes.insert(
-				chain_id.to_string(),
-				serde_json::Value::String(mailbox_addr),
-			);
-		}
-	}
-	table.insert(
-		"mailboxes".to_string(),
-		serde_json::Value::Object(mailboxes),
-	);
-
-	// Build IGP addresses map
-	let mut igp_addresses = serde_json::Map::new();
-	for chain_id in chain_ids {
-		if let Some(network) = seed.get_network(*chain_id) {
-			let igp_addr = format!("0x{}", hex::encode(network.hyperlane_igp));
-			igp_addresses.insert(chain_id.to_string(), serde_json::Value::String(igp_addr));
-		}
-	}
-	table.insert(
-		"igp_addresses".to_string(),
-		serde_json::Value::Object(igp_addresses),
-	);
-
-	serde_json::Value::Object(table)
-}
-
-/// Builds the PricingConfig section.
-fn build_pricing_config(defaults: &SeedDefaults) -> PricingConfig {
-	let mut implementations = HashMap::new();
-
-	// CoinGecko implementation
-	let coingecko_config = json_object(vec![
-		(
-			"cache_duration_seconds",
-			int(defaults.cache_duration_seconds as i64),
-		),
-		("rate_limit_delay_ms", int(1200)),
-	]);
-	implementations.insert("coingecko".to_string(), coingecko_config);
-
-	// DefiLlama implementation
-	let defillama_config = json_object(vec![(
-		"cache_duration_seconds",
-		int(defaults.cache_duration_seconds as i64),
-	)]);
-	implementations.insert("defillama".to_string(), defillama_config);
-
-	PricingConfig {
-		primary: defaults.pricing_primary.to_string(),
-		fallbacks: defaults
-			.pricing_fallbacks
-			.iter()
-			.map(|s| s.to_string())
-			.collect(),
-		implementations,
-	}
-}
-
-/// Builds the GasConfig section with flow-specific gas units.
-fn build_gas_config(defaults: &SeedDefaults) -> GasConfig {
-	let mut flows = HashMap::new();
-
-	flows.insert(
-		"resource_lock".to_string(),
-		GasFlowUnits {
-			open: Some(defaults.gas_resource_lock.open),
-			fill: Some(defaults.gas_resource_lock.fill),
-			claim: Some(defaults.gas_resource_lock.claim),
-		},
-	);
-
-	flows.insert(
-		"permit2_escrow".to_string(),
-		GasFlowUnits {
-			open: Some(defaults.gas_permit2_escrow.open),
-			fill: Some(defaults.gas_permit2_escrow.fill),
-			claim: Some(defaults.gas_permit2_escrow.claim),
-		},
-	);
-
-	flows.insert(
-		"eip3009_escrow".to_string(),
-		GasFlowUnits {
-			open: Some(defaults.gas_eip3009_escrow.open),
-			fill: Some(defaults.gas_eip3009_escrow.fill),
-			claim: Some(defaults.gas_eip3009_escrow.claim),
-		},
-	);
-
-	GasConfig { flows }
-}
-
-/// Builds the ApiConfig section with default values for HTTP API server.
-fn build_api_config(
-	admin_override: Option<&solver_types::seed_overrides::AdminOverride>,
-) -> ApiConfig {
-	// Build auth config if admin is configured
-	// Note: `auth.enabled` controls JWT requirement for /orders endpoint
-	// Admin auth (wallet signatures for /admin/*) is controlled separately by `auth.admin.enabled`
-	let auth = admin_override.map(|admin| {
-		use solver_types::{AdminConfig, AuthConfig, SecretString};
-
-		// Read JWT secret from environment variable
-		let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| {
-			tracing::warn!(
-				"JWT_SECRET not set - using random secret. Tokens will be invalid after restart!"
-			);
-			uuid::Uuid::new_v4().to_string()
-		});
-
-		AuthConfig {
-			enabled: false, // Don't require JWT for /orders - admin auth is separate
-			jwt_secret: SecretString::new(jwt_secret),
-			access_token_expiry_hours: 1,
-			refresh_token_expiry_hours: 720, // 30 days
-			issuer: "oif-solver".to_string(),
-			admin: Some(AdminConfig {
-				enabled: admin.enabled,
-				domain: admin.domain.clone(),
-				chain_id: admin.chain_id,
-				nonce_ttl_seconds: admin.nonce_ttl_seconds.unwrap_or(300),
-				admin_addresses: admin.admin_addresses.clone(),
-			}),
-		}
-	});
-
-	ApiConfig {
-		enabled: true,
-		host: "0.0.0.0".to_string(),
-		port: 3000,
-		timeout_seconds: 30,
-		max_request_size: 1024 * 1024, // 1MB
-		implementations: ApiImplementations {
-			discovery: Some("offchain_eip7683".to_string()),
-		},
-		rate_limiting: None,
-		cors: None,
-		auth,
-		quote: None,
-	}
 }
 
 /// Converts an existing Config to OperatorConfig.
@@ -2219,7 +1830,7 @@ fn extract_direct_config(settlement: &SettlementConfig, chain_ids: &[u64]) -> Op
 
 	let dispute_period_seconds = direct_toml
 		.and_then(|d| d.get("dispute_period_seconds"))
-		.and_then(|v| v.as_integer())
+		.and_then(|v| v.as_i64())
 		.unwrap_or(300) as u64;
 
 	let oracle_selection_strategy = direct_toml
@@ -2236,9 +1847,9 @@ fn extract_direct_config(settlement: &SettlementConfig, chain_ids: &[u64]) -> Op
 	let mut output_oracles = HashMap::new();
 	if let Some(toml_oracles) = direct_toml
 		.and_then(|d| d.get("oracles"))
-		.and_then(|v| v.as_table())
+		.and_then(|v| v.as_object())
 	{
-		if let Some(input_table) = toml_oracles.get("input").and_then(|v| v.as_table()) {
+		if let Some(input_table) = toml_oracles.get("input").and_then(|v| v.as_object()) {
 			for (chain_id_str, addrs_val) in input_table {
 				if let (Ok(chain_id), Some(addrs_array)) =
 					(chain_id_str.parse::<u64>(), addrs_val.as_array())
@@ -2254,7 +1865,7 @@ fn extract_direct_config(settlement: &SettlementConfig, chain_ids: &[u64]) -> Op
 			}
 		}
 
-		if let Some(output_table) = toml_oracles.get("output").and_then(|v| v.as_table()) {
+		if let Some(output_table) = toml_oracles.get("output").and_then(|v| v.as_object()) {
 			for (chain_id_str, addrs_val) in output_table {
 				if let (Ok(chain_id), Some(addrs_array)) =
 					(chain_id_str.parse::<u64>(), addrs_val.as_array())
@@ -2274,7 +1885,7 @@ fn extract_direct_config(settlement: &SettlementConfig, chain_ids: &[u64]) -> Op
 	let mut routes = HashMap::new();
 	if let Some(toml_routes) = direct_toml
 		.and_then(|d| d.get("routes"))
-		.and_then(|v| v.as_table())
+		.and_then(|v| v.as_object())
 	{
 		for (chain_id_str, dests_val) in toml_routes {
 			if let (Ok(chain_id), Some(dests_array)) =
@@ -2282,7 +1893,7 @@ fn extract_direct_config(settlement: &SettlementConfig, chain_ids: &[u64]) -> Op
 			{
 				let dests: Vec<u64> = dests_array
 					.iter()
-					.filter_map(|v| v.as_integer().map(|i| i as u64))
+					.filter_map(|v| v.as_i64().map(|i| i as u64))
 					.collect();
 				routes.insert(chain_id, dests);
 			}
