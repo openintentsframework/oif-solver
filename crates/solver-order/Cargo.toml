@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 
+[features]
+testing = ["mockall"]
+
 [dependencies]
 alloy-dyn-abi = { workspace = true }
 alloy-primitives = { workspace = true }
@@ -19,9 +22,6 @@ thiserror = "2.0"
 toml = { workspace = true }
 tracing = "0.1"
 uuid = { version = "1.8", features = ["v4", "serde"] }
-
-[features]
-testing = ["mockall"]
 
 [dev-dependencies]
 tokio = { workspace = true }

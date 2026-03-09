@@ -58,9 +58,9 @@ pub struct IntentHandler {
 	/// In-memory LRU cache for fast intent deduplication to prevent race conditions
 	/// Automatically evicts oldest entries when capacity is exceeded
 	processed_intents: Arc<RwLock<LruCache<String, ()>>>,
-	/// OFAC-sanctioned Ethereum addresses (lowercase hex with 0x prefix).
-	/// Loaded once at startup from `config.solver.ofac_list` if set.
-	ofac_addresses: HashSet<String>,
+	/// Denied Ethereum addresses (lowercase hex with 0x prefix).
+	/// Loaded once at startup from `config.solver.deny_list` if set.
+	denied_addresses: HashSet<String>,
 }
 
 impl IntentHandler {
@@ -77,9 +77,9 @@ impl IntentHandler {
 		dynamic_config: Arc<RwLock<Config>>,
 	) -> Self {
 		let static_config = tokio::task::block_in_place(|| dynamic_config.blocking_read().clone());
-		let ofac_addresses = Self::load_ofac_list(static_config.solver.ofac_list.as_deref());
-		if ofac_addresses.is_empty() {
-			tracing::warn!("OFAC sanctions list could not be loaded. Enforcement is DISABLED!");
+		let denied_addresses = Self::load_deny_list(static_config.solver.deny_list.as_deref());
+		if denied_addresses.is_empty() {
+			tracing::warn!("Deny List could not be loaded. Enforcement is DISABLED!");
 		}
 		Self {
 			order_service,
@@ -94,15 +94,15 @@ impl IntentHandler {
 			processed_intents: Arc::new(RwLock::new(LruCache::new(
 				NonZeroUsize::new(10000).unwrap(),
 			))),
-			ofac_addresses,
+			denied_addresses,
 		}
 	}
 
-	/// Load OFAC-sanctioned addresses from a JSON file.
+	/// Load denied addresses from a JSON file.
 	///
 	/// Returns an empty set if no path is configured, the file is missing,
 	/// or the file cannot be parsed. All addresses are stored in lowercase.
-	fn load_ofac_list(path: Option<&str>) -> HashSet<String> {
+	fn load_deny_list(path: Option<&str>) -> HashSet<String> {
 		let path = match path {
 			Some(p) if !p.is_empty() => p,
 			_ => return HashSet::new(),
@@ -115,17 +115,17 @@ impl IntentHandler {
 					tracing::info!(
 						path = %path,
 						count = %set.len(),
-						"Loaded OFAC sanctions list"
+						"Deny list was found"
 					);
 					set
 				},
 				Err(e) => {
-					tracing::warn!(path = %path, error = %e, "Failed to parse OFAC list");
+					tracing::warn!(path = %path, error = %e, "Failed to parse deny list");
 					HashSet::new()
 				},
 			},
 			Err(e) => {
-				tracing::warn!(path = %path, error = %e, "Failed to read OFAC list");
+				tracing::warn!(path = %path, error = %e, "Failed to read deny list");
 				HashSet::new()
 			},
 		}
@@ -173,23 +173,23 @@ impl IntentHandler {
 			return Ok(());
 		}
 
-		// OFAC sanctions check — runs before storing to avoid polluting the dedup cache
+		// Deny list check — runs before storing to avoid polluting the dedup cache
 		// with addresses that will always be rejected.
-		if !self.ofac_addresses.is_empty() {
+		if !self.denied_addresses.is_empty() {
 			if let Ok(order_data) = serde_json::from_value::<Eip7683OrderData>(intent.data.clone())
 			{
 				// Check the order sender (user field).
 				let user_addr = order_data.user.to_lowercase();
-				if self.ofac_addresses.contains(&user_addr) {
+				if self.denied_addresses.contains(&user_addr) {
 					tracing::warn!(
 						intent_id = %intent.id,
 						address = %user_addr,
-						"Intent rejected: sender is on OFAC sanctions list"
+						"Intent rejected: sender is on deny list"
 					);
 					self.event_bus
 						.publish(SolverEvent::Discovery(DiscoveryEvent::IntentRejected {
 							intent_id: intent.id,
-							reason: "Sender address is on OFAC sanctions list".to_string(),
+							reason: "Sender address is on deny list".to_string(),
 						}))
 						.ok();
 					return Ok(());
@@ -198,19 +198,18 @@ impl IntentHandler {
 				for output in &order_data.outputs {
 					// recipient is bytes32; the Ethereum address occupies the last 20 bytes.
 					let addr_bytes = &output.recipient[12..];
-					let hex_str: String =
-						addr_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+					let hex_str: String = addr_bytes.iter().map(|b| format!("{:02x}", b)).collect();
 					let recipient_addr = format!("0x{}", hex_str);
-					if self.ofac_addresses.contains(&recipient_addr) {
+					if self.denied_addresses.contains(&recipient_addr) {
 						tracing::warn!(
 							intent_id = %intent.id,
 							address = %recipient_addr,
-							"Intent rejected: recipient is on OFAC sanctions list"
+							"Intent rejected: recipient is on deny list"
 						);
 						self.event_bus
 							.publish(SolverEvent::Discovery(DiscoveryEvent::IntentRejected {
 								intent_id: intent.id,
-								reason: "Recipient address is on OFAC sanctions list".to_string(),
+								reason: "Recipient address is on deny list".to_string(),
 							}))
 							.ok();
 						return Ok(());

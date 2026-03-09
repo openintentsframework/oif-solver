@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 
+[features]
+testing = ["mockall"]
+
 [dependencies]
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -25,11 +28,8 @@ toml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
-[features]
-testing = ["mockall"]
-
 [dev-dependencies]
-tempfile = { workspace = true }
 futures = { workspace = true }
-uuid = { workspace = true }
 rust_decimal = { workspace = true }
+tempfile = { workspace = true }
+uuid = { workspace = true }

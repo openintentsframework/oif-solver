@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 
+[features]
+testing = ["mockall"]
+
 [dependencies]
 alloy-primitives = { workspace = true }
 async-trait = "0.1.73"
@@ -17,7 +20,3 @@ thiserror = "2.0"
 tokio = { version = "1.0", features = ["sync", "time"] }
 toml = { workspace = true }
 tracing = "0.1"
-
-
-[features]
-testing = ["mockall"]

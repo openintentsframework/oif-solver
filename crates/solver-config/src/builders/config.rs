@@ -147,7 +147,7 @@ impl ConfigBuilder {
 				commission_bps: self.commission_bps,
 				rate_buffer_bps: self.rate_buffer_bps,
 				monitoring_timeout_seconds: self.monitoring_timeout_seconds,
-				ofac_list: None,
+				deny_list: None,
 			},
 			networks: self.networks.unwrap_or_default(),
 			storage: StorageConfig {
