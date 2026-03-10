@@ -490,8 +490,9 @@ mod tests {
 		Address(vec![0xab; 20])
 	}
 
-	fn create_test_config() -> Arc<RwLock<Config>> {
-		Arc::new(RwLock::new(ConfigBuilder::new().build()))
+	fn create_test_config() -> (Arc<RwLock<Config>>, Config) {
+		let config = ConfigBuilder::new().build();
+		(Arc::new(RwLock::new(config.clone())), config)
 	}
 
 	fn create_mock_cost_profit_service() -> Arc<CostProfitService> {
@@ -707,7 +708,7 @@ mod tests {
 			))),
 		));
 		let cost_profit_service = create_mock_cost_profit_service();
-		let config = create_test_config();
+		let (config, static_config) = create_test_config();
 
 		let handler = IntentHandler::new(
 			order_service,
@@ -719,6 +720,7 @@ mod tests {
 			token_manager,
 			cost_profit_service,
 			config,
+			&static_config,
 		);
 
 		let result = handler.handle(intent).await;
@@ -758,7 +760,7 @@ mod tests {
 			))),
 		));
 		let cost_profit_service = create_mock_cost_profit_service();
-		let config = create_test_config();
+		let (config, static_config) = create_test_config();
 
 		let handler = IntentHandler::new(
 			order_service,
@@ -770,6 +772,7 @@ mod tests {
 			token_manager,
 			cost_profit_service,
 			config,
+			&static_config,
 		);
 
 		let result = handler.handle(intent).await;
@@ -826,7 +829,7 @@ mod tests {
 				MockAccountInterface::new(),
 			))),
 		));
-		let config = create_test_config();
+		let (config, static_config) = create_test_config();
 
 		let cost_profit_service = create_mock_cost_profit_service();
 
@@ -840,6 +843,7 @@ mod tests {
 			token_manager,
 			cost_profit_service,
 			config,
+			&static_config,
 		);
 
 		let result = handler.handle(intent).await;
@@ -917,7 +921,7 @@ mod tests {
 				MockAccountInterface::new(),
 			))),
 		));
-		let config = create_test_config();
+		let (config, static_config) = create_test_config();
 
 		let cost_profit_service = create_mock_cost_profit_service();
 
@@ -931,6 +935,7 @@ mod tests {
 			token_manager,
 			cost_profit_service,
 			config,
+			&static_config,
 		);
 
 		let result = handler.handle(intent).await;
@@ -1008,7 +1013,7 @@ mod tests {
 				MockAccountInterface::new(),
 			))),
 		));
-		let config = create_test_config();
+		let (config, static_config) = create_test_config();
 
 		let cost_profit_service = create_mock_cost_profit_service();
 
@@ -1022,6 +1027,7 @@ mod tests {
 			token_manager,
 			cost_profit_service,
 			config,
+			&static_config,
 		);
 
 		let result = handler.handle(intent).await;
@@ -1059,7 +1065,7 @@ mod tests {
 				MockAccountInterface::new(),
 			))),
 		));
-		let config = create_test_config();
+		let (config, static_config) = create_test_config();
 
 		let cost_profit_service = create_mock_cost_profit_service();
 
@@ -1073,6 +1079,7 @@ mod tests {
 			token_manager,
 			cost_profit_service,
 			config,
+			&static_config,
 		);
 
 		let result = handler.handle(intent).await;
@@ -1148,7 +1155,7 @@ mod tests {
 				MockAccountInterface::new(),
 			))),
 		));
-		let config = create_test_config();
+		let (config, static_config) = create_test_config();
 
 		// Subscribe to events before creating handler
 		let mut receiver = event_bus.subscribe();
@@ -1165,6 +1172,7 @@ mod tests {
 			token_manager,
 			cost_profit_service,
 			config,
+			&static_config,
 		);
 
 		// Handle intent and check events
