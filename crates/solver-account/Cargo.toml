@@ -22,6 +22,8 @@ aws-config = { workspace = true, optional = true }
 aws-sdk-kms = { workspace = true, optional = true }
 hex = "0.4"
 mockall = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 solver-types = { path = "../solver-types" }
 thiserror = "2.0.17"
 tokio = { workspace = true }
