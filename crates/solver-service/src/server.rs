@@ -1013,7 +1013,7 @@ mod tests {
 				.expect("failed to create order strategy");
 		let order = Arc::new(OrderService::new(HashMap::new(), strategy));
 
-		let settlement = Arc::new(SettlementService::new(HashMap::new(), 10));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 10));
 
 		let pricing_impl = create_mock_pricing(&serde_json::Value::Object(serde_json::Map::new()))
 			.expect("failed to create mock pricing");

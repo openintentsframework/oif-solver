@@ -788,7 +788,7 @@ mod tests {
 				.expect("Failed to create strategy");
 		let order = Arc::new(OrderService::new(HashMap::new(), strategy));
 
-		let settlement = Arc::new(SettlementService::new(HashMap::new(), 20));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
 
 		let pricing_config = serde_json::Value::Object(serde_json::Map::new());
 		let pricing_impl =
