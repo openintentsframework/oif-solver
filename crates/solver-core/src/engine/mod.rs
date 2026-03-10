@@ -155,6 +155,7 @@ impl SolverEngine {
 			token_manager.clone(),
 			cost_profit_service,
 			dynamic_config.clone(), // Pass dynamic config for hot-reload support
+			&static_config,         // Pass static config for deny list loading
 		));
 
 		let order_handler = Arc::new(OrderHandler::new(
