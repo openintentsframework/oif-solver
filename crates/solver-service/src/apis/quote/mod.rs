@@ -289,52 +289,65 @@ mod tests {
 
 	/// Creates a minimal SolverEngine for testing
 	fn create_test_solver_engine() -> SolverEngine {
-		// Create minimal config for testing
-		let config_toml = r#"
-			[solver]
-			id = "test-solver"
-			monitoring_timeout_seconds = 30
-			min_profitability_pct = 1.0
-			
-			[storage]
-			primary = "memory"
-			cleanup_interval_seconds = 3600
-			[storage.implementations.memory]
-			
-			[delivery]
-			min_confirmations = 1
-			[delivery.implementations]
-			
-			[account]
-			primary = "local"
-			[account.implementations.local]
-			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
-			
-			[discovery]
-			[discovery.implementations]
-			
-			[order]
-			[order.implementations]
-			[order.strategy]
-			primary = "simple"
-			[order.strategy.implementations.simple]
-			
-			[settlement]
-			[settlement.implementations]
-			
-			[networks.1]
-			chain_id = 1
-			input_settler_address = "0x1111111111111111111111111111111111111111"
-			output_settler_address = "0x2222222222222222222222222222222222222222"
-			[[networks.1.rpc_urls]]
-			http = "http://localhost:8545"
-			[[networks.1.tokens]]
-			symbol = "TEST"
-			address = "0x3333333333333333333333333333333333333333"
-			decimals = 18
-		"#;
-		let config: solver_config::Config =
-			toml::from_str(config_toml).expect("Failed to parse test config");
+		let config: solver_config::Config = serde_json::from_value(serde_json::json!({
+			"solver": {
+				"id": "test-solver",
+				"monitoring_timeout_seconds": 30,
+				"min_profitability_pct": 1.0
+			},
+			"storage": {
+				"primary": "memory",
+				"cleanup_interval_seconds": 3600,
+				"implementations": {
+					"memory": {}
+				}
+			},
+			"delivery": {
+				"min_confirmations": 1,
+				"implementations": {}
+			},
+			"account": {
+				"primary": "local",
+				"implementations": {
+					"local": {
+						"private_key": "0x1234567890123456789012345678901234567890123456789012345678901234"
+					}
+				}
+			},
+			"discovery": {
+				"implementations": {}
+			},
+			"order": {
+				"implementations": {},
+				"strategy": {
+					"primary": "simple",
+					"implementations": {
+						"simple": {}
+					}
+				}
+			},
+			"settlement": {
+				"implementations": {}
+			},
+			"networks": {
+				"1": {
+					"chain_id": 1,
+					"input_settler_address": "0x1111111111111111111111111111111111111111",
+					"output_settler_address": "0x2222222222222222222222222222222222222222",
+					"rpc_urls": [
+						{ "http": "http://localhost:8545" }
+					],
+					"tokens": [
+						{
+							"symbol": "TEST",
+							"address": "0x3333333333333333333333333333333333333333",
+							"decimals": 18
+						}
+					]
+				}
+			}
+		}))
+		.expect("Failed to parse test config");
 
 		// Create mock services
 		let storage = create_test_storage();
@@ -348,13 +361,13 @@ mod tests {
 		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
 		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
 		let strategy = solver_order::implementations::strategies::simple::create_strategy(
-			&toml::Value::Table(toml::map::Map::new()),
+			&serde_json::Value::Object(serde_json::Map::new()),
 		)
 		.unwrap();
 		let order = Arc::new(OrderService::new(HashMap::new(), strategy));
 		let settlement = Arc::new(SettlementService::new(HashMap::new(), 3));
 		let pricing_impl = solver_pricing::implementations::mock::create_mock_pricing(
-			&toml::Value::Table(toml::map::Map::new()),
+			&serde_json::Value::Object(serde_json::Map::new()),
 		)
 		.unwrap();
 		let pricing = Arc::new(PricingService::new(pricing_impl, Vec::new()));

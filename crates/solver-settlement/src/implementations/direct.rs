@@ -74,14 +74,16 @@ pub struct DirectSettlementSchema;
 
 impl DirectSettlementSchema {
 	/// Static validation method for use before instance creation
-	pub fn validate_config(config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+	pub fn validate_config(
+		config: &serde_json::Value,
+	) -> Result<(), solver_types::ValidationError> {
 		let instance = Self;
 		instance.validate(config)
 	}
 }
 
 impl ConfigSchema for DirectSettlementSchema {
-	fn validate(&self, config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+	fn validate(&self, config: &serde_json::Value) -> Result<(), solver_types::ValidationError> {
 		let schema = Schema::new(
 			// Required fields
 			vec![
@@ -350,7 +352,7 @@ impl SettlementInterface for DirectSettlement {
 /// Optional configuration parameters:
 /// - `oracle_selection_strategy`: Strategy for oracle selection (default: round-robin)
 pub fn create_settlement(
-	config: &toml::Value,
+	config: &serde_json::Value,
 	networks: &NetworksConfig,
 	_storage: std::sync::Arc<solver_storage::StorageService>,
 ) -> Result<Box<dyn SettlementInterface>, SettlementError> {
@@ -363,7 +365,7 @@ pub fn create_settlement(
 
 	let dispute_period_seconds = config
 		.get("dispute_period_seconds")
-		.and_then(|v| v.as_integer())
+		.and_then(|v| v.as_i64())
 		.unwrap_or(300) as u64; // 5 minutes default
 
 	// Create settlement service synchronously
@@ -471,30 +473,30 @@ mod tests {
 	#[test]
 	fn test_config_schema_validation_valid() {
 		let schema = DirectSettlementSchema;
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"dispute_period_seconds".to_string(),
-				toml::Value::Integer(300),
+				serde_json::Value::from(300),
 			);
 			table.insert(
 				"oracles".to_string(),
-				toml::Value::Table({
-					let mut oracles = toml::map::Map::new();
+				serde_json::Value::Object({
+					let mut oracles = serde_json::Map::new();
 					oracles.insert(
 						"input".to_string(),
-						toml::Value::Table(toml::map::Map::new()),
+						serde_json::Value::Object(serde_json::Map::new()),
 					);
 					oracles.insert(
 						"output".to_string(),
-						toml::Value::Table(toml::map::Map::new()),
+						serde_json::Value::Object(serde_json::Map::new()),
 					);
 					oracles
 				}),
 			);
 			table.insert(
 				"routes".to_string(),
-				toml::Value::Table(toml::map::Map::new()),
+				serde_json::Value::Object(serde_json::Map::new()),
 			);
 			table
 		});
@@ -506,27 +508,27 @@ mod tests {
 	#[test]
 	fn test_config_schema_validation_missing_required_field() {
 		let schema = DirectSettlementSchema;
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			// Missing dispute_period_seconds
 			table.insert(
 				"oracles".to_string(),
-				toml::Value::Table({
-					let mut oracles = toml::map::Map::new();
+				serde_json::Value::Object({
+					let mut oracles = serde_json::Map::new();
 					oracles.insert(
 						"input".to_string(),
-						toml::Value::Table(toml::map::Map::new()),
+						serde_json::Value::Object(serde_json::Map::new()),
 					);
 					oracles.insert(
 						"output".to_string(),
-						toml::Value::Table(toml::map::Map::new()),
+						serde_json::Value::Object(serde_json::Map::new()),
 					);
 					oracles
 				}),
 			);
 			table.insert(
 				"routes".to_string(),
-				toml::Value::Table(toml::map::Map::new()),
+				serde_json::Value::Object(serde_json::Map::new()),
 			);
 			table
 		});
@@ -538,30 +540,30 @@ mod tests {
 	#[test]
 	fn test_config_schema_validation_invalid_dispute_period() {
 		let schema = DirectSettlementSchema;
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"dispute_period_seconds".to_string(),
-				toml::Value::Integer(100000), // Too large
+				serde_json::Value::from(100000), // Too large
 			);
 			table.insert(
 				"oracles".to_string(),
-				toml::Value::Table({
-					let mut oracles = toml::map::Map::new();
+				serde_json::Value::Object({
+					let mut oracles = serde_json::Map::new();
 					oracles.insert(
 						"input".to_string(),
-						toml::Value::Table(toml::map::Map::new()),
+						serde_json::Value::Object(serde_json::Map::new()),
 					);
 					oracles.insert(
 						"output".to_string(),
-						toml::Value::Table(toml::map::Map::new()),
+						serde_json::Value::Object(serde_json::Map::new()),
 					);
 					oracles
 				}),
 			);
 			table.insert(
 				"routes".to_string(),
-				toml::Value::Table(toml::map::Map::new()),
+				serde_json::Value::Object(serde_json::Map::new()),
 			);
 			table
 		});
@@ -572,30 +574,30 @@ mod tests {
 
 	#[test]
 	fn test_static_config_validation() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"dispute_period_seconds".to_string(),
-				toml::Value::Integer(300),
+				serde_json::Value::from(300),
 			);
 			table.insert(
 				"oracles".to_string(),
-				toml::Value::Table({
-					let mut oracles = toml::map::Map::new();
+				serde_json::Value::Object({
+					let mut oracles = serde_json::Map::new();
 					oracles.insert(
 						"input".to_string(),
-						toml::Value::Table(toml::map::Map::new()),
+						serde_json::Value::Object(serde_json::Map::new()),
 					);
 					oracles.insert(
 						"output".to_string(),
-						toml::Value::Table(toml::map::Map::new()),
+						serde_json::Value::Object(serde_json::Map::new()),
 					);
 					oracles
 				}),
 			);
 			table.insert(
 				"routes".to_string(),
-				toml::Value::Table(toml::map::Map::new()),
+				serde_json::Value::Object(serde_json::Map::new()),
 			);
 			table
 		});
@@ -606,23 +608,23 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_create_settlement_success() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"dispute_period_seconds".to_string(),
-				toml::Value::Integer(300),
+				serde_json::Value::from(300),
 			);
 			table.insert(
 				"oracles".to_string(),
-				toml::Value::Table({
-					let mut oracles = toml::map::Map::new();
+				serde_json::Value::Object({
+					let mut oracles = serde_json::Map::new();
 					oracles.insert(
 						"input".to_string(),
-						toml::Value::Table({
-							let mut input = toml::map::Map::new();
+						serde_json::Value::Object({
+							let mut input = serde_json::Map::new();
 							input.insert(
 								"1".to_string(),
-								toml::Value::Array(vec![toml::Value::String(
+								serde_json::Value::Array(vec![serde_json::Value::String(
 									"0x1111111111111111111111111111111111111111".to_string(),
 								)]),
 							);
@@ -631,11 +633,11 @@ mod tests {
 					);
 					oracles.insert(
 						"output".to_string(),
-						toml::Value::Table({
-							let mut output = toml::map::Map::new();
+						serde_json::Value::Object({
+							let mut output = serde_json::Map::new();
 							output.insert(
 								"2".to_string(),
-								toml::Value::Array(vec![toml::Value::String(
+								serde_json::Value::Array(vec![serde_json::Value::String(
 									"0x2222222222222222222222222222222222222222".to_string(),
 								)]),
 							);
@@ -647,12 +649,12 @@ mod tests {
 			);
 			table.insert(
 				"routes".to_string(),
-				toml::Value::Table({
-					let mut routes = toml::map::Map::new();
+				serde_json::Value::Object({
+					let mut routes = serde_json::Map::new();
 					// Fix: Use correct routes format - chain_id -> [destination_chain_ids]
 					routes.insert(
 						"1".to_string(),
-						toml::Value::Array(vec![toml::Value::Integer(2)]),
+						serde_json::Value::Array(vec![serde_json::Value::from(2)]),
 					);
 					routes
 				}),
@@ -668,12 +670,12 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_create_settlement_invalid_config() {
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			// Missing required fields
 			table.insert(
 				"dispute_period_seconds".to_string(),
-				toml::Value::Integer(300),
+				serde_json::Value::from(300),
 			);
 			table
 		});
@@ -717,30 +719,30 @@ mod tests {
 		let schema = settlement.config_schema();
 
 		// Test valid config
-		let valid_config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let valid_config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"dispute_period_seconds".to_string(),
-				toml::Value::Integer(300),
+				serde_json::Value::from(300),
 			);
 			table.insert(
 				"oracles".to_string(),
-				toml::Value::Table({
-					let mut oracles = toml::map::Map::new();
+				serde_json::Value::Object({
+					let mut oracles = serde_json::Map::new();
 					oracles.insert(
 						"input".to_string(),
-						toml::Value::Table(toml::map::Map::new()),
+						serde_json::Value::Object(serde_json::Map::new()),
 					);
 					oracles.insert(
 						"output".to_string(),
-						toml::Value::Table(toml::map::Map::new()),
+						serde_json::Value::Object(serde_json::Map::new()),
 					);
 					oracles
 				}),
 			);
 			table.insert(
 				"routes".to_string(),
-				toml::Value::Table(toml::map::Map::new()),
+				serde_json::Value::Object(serde_json::Map::new()),
 			);
 			table
 		});
@@ -760,23 +762,23 @@ mod tests {
 		let factory = Registry::factory();
 
 		// Test that factory function exists and has correct type
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"dispute_period_seconds".to_string(),
-				toml::Value::Integer(300),
+				serde_json::Value::from(300),
 			);
 			table.insert(
 				"oracles".to_string(),
-				toml::Value::Table({
-					let mut oracles = toml::map::Map::new();
+				serde_json::Value::Object({
+					let mut oracles = serde_json::Map::new();
 					oracles.insert(
 						"input".to_string(),
-						toml::Value::Table({
-							let mut input = toml::map::Map::new();
+						serde_json::Value::Object({
+							let mut input = serde_json::Map::new();
 							input.insert(
 								"1".to_string(),
-								toml::Value::Array(vec![toml::Value::String(
+								serde_json::Value::Array(vec![serde_json::Value::String(
 									"0x1111111111111111111111111111111111111111".to_string(),
 								)]),
 							);
@@ -785,11 +787,11 @@ mod tests {
 					);
 					oracles.insert(
 						"output".to_string(),
-						toml::Value::Table({
-							let mut output = toml::map::Map::new();
+						serde_json::Value::Object({
+							let mut output = serde_json::Map::new();
 							output.insert(
 								"2".to_string(),
-								toml::Value::Array(vec![toml::Value::String(
+								serde_json::Value::Array(vec![serde_json::Value::String(
 									"0x2222222222222222222222222222222222222222".to_string(),
 								)]),
 							);
@@ -801,12 +803,12 @@ mod tests {
 			);
 			table.insert(
 				"routes".to_string(),
-				toml::Value::Table({
-					let mut routes = toml::map::Map::new();
+				serde_json::Value::Object({
+					let mut routes = serde_json::Map::new();
 					// Fix: routes expects chain_id -> [destination_chain_ids]
 					routes.insert(
 						"1".to_string(),
-						toml::Value::Array(vec![toml::Value::Integer(2)]),
+						serde_json::Value::Array(vec![serde_json::Value::from(2)]),
 					);
 					routes
 				}),
@@ -838,34 +840,34 @@ mod tests {
 	#[test]
 	fn test_config_with_optional_fields() {
 		let schema = DirectSettlementSchema;
-		let config = toml::Value::Table({
-			let mut table = toml::map::Map::new();
+		let config = serde_json::Value::Object({
+			let mut table = serde_json::Map::new();
 			table.insert(
 				"dispute_period_seconds".to_string(),
-				toml::Value::Integer(300),
+				serde_json::Value::from(300),
 			);
 			table.insert(
 				"oracles".to_string(),
-				toml::Value::Table({
-					let mut oracles = toml::map::Map::new();
+				serde_json::Value::Object({
+					let mut oracles = serde_json::Map::new();
 					oracles.insert(
 						"input".to_string(),
-						toml::Value::Table(toml::map::Map::new()),
+						serde_json::Value::Object(serde_json::Map::new()),
 					);
 					oracles.insert(
 						"output".to_string(),
-						toml::Value::Table(toml::map::Map::new()),
+						serde_json::Value::Object(serde_json::Map::new()),
 					);
 					oracles
 				}),
 			);
 			table.insert(
 				"routes".to_string(),
-				toml::Value::Table(toml::map::Map::new()),
+				serde_json::Value::Object(serde_json::Map::new()),
 			);
 			table.insert(
 				"oracle_selection_strategy".to_string(),
-				toml::Value::String("round_robin".to_string()),
+				serde_json::Value::String("round_robin".to_string()),
 			);
 			table
 		});
