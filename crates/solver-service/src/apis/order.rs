@@ -344,7 +344,7 @@ mod tests {
 		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
 		let strategy = create_strategy(&Value::Object(serde_json::Map::new())).unwrap();
 		let order = Arc::new(OrderService::new(HashMap::new(), strategy));
-		let settlement = Arc::new(SettlementService::new(HashMap::new(), 3));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 3));
 		let event_bus = EventBus::new(64);
 		let networks: solver_types::NetworksConfig = HashMap::new();
 		let token_manager = Arc::new(TokenManager::new(

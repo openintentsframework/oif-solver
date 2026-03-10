@@ -5009,7 +5009,10 @@ name = "solver-core"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types",
  "alloy-signer-local",
+ "alloy-sol-types",
  "async-trait",
  "chrono",
  "lru 0.16.1",
@@ -5241,11 +5244,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha3",
+ "solver-delivery",
  "solver-storage",
  "solver-types",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

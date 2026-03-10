@@ -365,7 +365,7 @@ mod tests {
 		)
 		.unwrap();
 		let order = Arc::new(OrderService::new(HashMap::new(), strategy));
-		let settlement = Arc::new(SettlementService::new(HashMap::new(), 3));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 3));
 		let pricing_impl = solver_pricing::implementations::mock::create_mock_pricing(
 			&serde_json::Value::Object(serde_json::Map::new()),
 		)
@@ -456,6 +456,7 @@ mod tests {
 				inputs: vec![],
 				outputs: vec![],
 			},
+			settlement_name: None,
 		}
 	}
 

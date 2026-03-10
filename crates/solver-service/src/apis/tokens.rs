@@ -432,6 +432,7 @@ mod tests {
 		// Create settlement service - using empty implementations map for testing
 		let settlement = Arc::new(solver_settlement::SettlementService::new(
 			HashMap::new(),
+			String::new(),
 			20,
 		));
 
