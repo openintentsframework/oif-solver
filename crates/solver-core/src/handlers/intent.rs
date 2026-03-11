@@ -12,10 +12,11 @@ use lru::LruCache;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
 use solver_order::OrderService;
+use solver_settlement::admission::estimate_required_expiry_window_seconds;
 use solver_storage::StorageService;
 use solver_types::{
-	truncate_id, with_0x_prefix, Address, DiscoveryEvent, Eip7683OrderData, ExecutionDecision,
-	ExecutionParams, Intent, OrderEvent, SolverEvent, StorageKey,
+	current_timestamp, truncate_id, with_0x_prefix, Address, DiscoveryEvent, Eip7683OrderData,
+	ExecutionDecision, ExecutionParams, Intent, OrderEvent, SolverEvent, StorageKey,
 };
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -162,8 +163,46 @@ impl IntentHandler {
 				})
 			});
 
-		// Validate and create order using the unified method
-		let intent_data = Some(intent.data.clone());
+		// Validate and create order using the unified method.
+		// For quote-derived intents, enrich intent data with the persisted quote settlement binding.
+		let mut intent_data_value = intent.data.clone();
+		if let Some(quote_id) = intent.quote_id.as_deref() {
+			match self
+				.storage
+				.retrieve::<solver_types::QuoteWithCostContext>(
+					StorageKey::Quotes.as_str(),
+					quote_id,
+				)
+				.await
+			{
+				Ok(quote_with_context) => {
+					if let Some(settlement_name) = quote_with_context.quote.settlement_name {
+						if let Some(intent_obj) = intent_data_value.as_object_mut() {
+							// Preserve both key styles for compatibility with current parsers.
+							intent_obj.insert(
+								"settlement_name".to_string(),
+								serde_json::Value::String(settlement_name.clone()),
+							);
+							intent_obj.insert(
+								"settlementName".to_string(),
+								serde_json::Value::String(settlement_name),
+							);
+						}
+					}
+				},
+				Err(solver_storage::StorageError::NotFound(_)) => {
+					tracing::debug!(%quote_id, "No stored quote context found for intent");
+				},
+				Err(error) => {
+					tracing::warn!(
+						%quote_id,
+						%error,
+						"Failed to retrieve quote context for intent settlement binding"
+					);
+				},
+			}
+		}
+		let intent_data = Some(intent_data_value);
 		match self
 			.order_service
 			.validate_and_create_order(
@@ -178,6 +217,36 @@ impl IntentHandler {
 			.await
 		{
 			Ok(order) => {
+				// Settlement-aware acceptance gate:
+				// Skip orders that do not leave enough time to reach claim/finalize safely.
+				if let Ok(order_data) =
+					serde_json::from_value::<Eip7683OrderData>(order.data.clone())
+				{
+					let now = current_timestamp() as u32;
+					let expires_remaining = order_data.expires.saturating_sub(now) as u64;
+					if let Some((required_window, breakdown)) =
+						estimate_required_expiry_window_seconds(
+							&order_data,
+							&config.settlement.implementations,
+							config.settlement.settlement_poll_interval_seconds,
+							order.settlement_name.as_deref(),
+						) {
+						if expires_remaining < required_window {
+							let reason = format!(
+								"Insufficient settlement window: expires_in={expires_remaining}s required={required_window}s ({breakdown})"
+							);
+							tracing::warn!(order_id = %order.id, %reason, "Skipping order");
+							self.event_bus
+								.publish(SolverEvent::Order(OrderEvent::Skipped {
+									order_id: order.id.clone(),
+									reason,
+								}))
+								.ok();
+							return Ok(());
+						}
+					}
+				}
+
 				// Step 1: Generate fill transaction and simulate to get accurate gas estimate
 				// This also validates callbacks won't revert
 				let default_params = ExecutionParams {
@@ -372,6 +441,7 @@ mod tests {
 	use crate::engine::token_manager::TokenManager;
 	use alloy_primitives::U256;
 	use mockall::predicate::*;
+	use serde_json::json;
 	use solver_account::MockAccountInterface;
 	use solver_config::ConfigBuilder;
 	use solver_delivery::DeliveryService;
@@ -398,12 +468,167 @@ mod tests {
 			.build()
 	}
 
+	fn create_test_order_with_expires_in(expires_in_seconds: u32) -> Order {
+		let mut order_data = Eip7683OrderDataBuilder::new().build();
+		let now = current_timestamp() as u32;
+		order_data.expires = now.saturating_add(expires_in_seconds);
+		order_data.fill_deadline = now.saturating_add(expires_in_seconds.saturating_sub(1));
+
+		OrderBuilder::new()
+			.with_id("test_intent_123".to_string())
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.build()
+	}
+
 	fn create_test_address() -> Address {
 		Address(vec![0xab; 20])
 	}
 
 	fn create_test_config() -> Arc<RwLock<Config>> {
 		Arc::new(RwLock::new(ConfigBuilder::new().build()))
+	}
+
+	fn create_test_config_with_broadcaster() -> Arc<RwLock<Config>> {
+		let mut config = ConfigBuilder::new().build();
+		let broadcaster = json!({
+			"oracles": {
+				"input": {
+					"1": ["0x0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A"]
+				},
+				"output": {
+					"137": ["0x1111111111111111111111111111111111111111"]
+				}
+			},
+			"routes": {
+				"1": [137]
+			},
+			"proof_wait_time_seconds": 30,
+			"storage_proof_timeout_seconds": 30,
+			"default_finality_blocks": 20
+		});
+		config
+			.settlement
+			.implementations
+			.insert("broadcaster".to_string(), broadcaster);
+		Arc::new(RwLock::new(config))
+	}
+
+	fn create_test_config_with_hyperlane_min_window(
+		min_window_seconds: u64,
+	) -> Arc<RwLock<Config>> {
+		let mut config = ConfigBuilder::new().build();
+		let hyperlane = json!({
+			"oracles": {
+				"input": {
+					"1": ["0x0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A"]
+				},
+				"output": {
+					"137": ["0x1111111111111111111111111111111111111111"]
+				}
+			},
+			"routes": {
+				"1": [137]
+			},
+			"intent_min_expiry_seconds": min_window_seconds
+		});
+
+		config
+			.settlement
+			.implementations
+			.insert("hyperlane".to_string(), hyperlane);
+		Arc::new(RwLock::new(config))
+	}
+
+	fn create_test_config_with_broadcaster_and_hyperlane_min_window(
+		hyperlane_min_window_seconds: u64,
+	) -> Config {
+		let mut config = ConfigBuilder::new().build();
+
+		let broadcaster = json!({
+			"oracles": {
+				"input": {
+					"1": ["0x0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A"]
+				},
+				"output": {
+					"137": ["0x1111111111111111111111111111111111111111"]
+				}
+			},
+			"routes": {
+				"1": [137]
+			},
+			"proof_wait_time_seconds": 30,
+			"storage_proof_timeout_seconds": 30,
+			"default_finality_blocks": 20
+		});
+		let hyperlane = json!({
+			"oracles": {
+				"input": {
+					"1": ["0x0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A"]
+				},
+				"output": {
+					"137": ["0x1111111111111111111111111111111111111111"]
+				}
+			},
+			"routes": {
+				"1": [137]
+			},
+			"intent_min_expiry_seconds": hyperlane_min_window_seconds
+		});
+
+		config
+			.settlement
+			.implementations
+			.insert("broadcaster".to_string(), broadcaster);
+		config
+			.settlement
+			.implementations
+			.insert("hyperlane".to_string(), hyperlane);
+
+		config
+	}
+
+	#[test]
+	fn test_estimate_required_expiry_window_respects_pinned_settlement() {
+		let config = create_test_config_with_broadcaster_and_hyperlane_min_window(500);
+
+		let order_data = Eip7683OrderDataBuilder::new().build();
+
+		let pinned_broadcaster = estimate_required_expiry_window_seconds(
+			&order_data,
+			&config.settlement.implementations,
+			config.settlement.settlement_poll_interval_seconds,
+			Some("broadcaster"),
+		)
+		.expect("expected broadcaster estimate");
+		let unpinned = estimate_required_expiry_window_seconds(
+			&order_data,
+			&config.settlement.implementations,
+			config.settlement.settlement_poll_interval_seconds,
+			None,
+		)
+		.expect("expected unpinned estimate");
+
+		assert!(
+			pinned_broadcaster.1.contains("broadcaster"),
+			"expected broadcaster breakdown when pinned, got {}",
+			pinned_broadcaster.1
+		);
+		assert!(
+			!pinned_broadcaster.1.contains("hyperlane"),
+			"pinned estimate should not use hyperlane window: {}",
+			pinned_broadcaster.1
+		);
+		assert!(
+			unpinned.0 >= 500,
+			"unpinned estimate should include hyperlane explicit min window, got {}",
+			unpinned.0
+		);
+		assert!(
+			pinned_broadcaster.0 < unpinned.0,
+			"pinned broadcaster estimate should be below unpinned max window: pinned={}, unpinned={}",
+			pinned_broadcaster.0,
+			unpinned.0
+		);
 	}
 
 	fn create_mock_cost_profit_service() -> Arc<CostProfitService> {
@@ -756,6 +981,163 @@ mod tests {
 
 		let result = handler.handle(intent).await;
 		assert!(result.is_ok()); // Handler doesn't fail on validation errors
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_skip_due_to_broadcaster_expiry_budget() {
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_order_interface = MockOrderInterface::new();
+		let mut mock_strategy = MockExecutionStrategy::new();
+
+		let intent = create_test_intent();
+		let solver_address = create_test_address();
+
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:test_intent_123"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+
+		// Only the intent should be stored (order is skipped before order storage).
+		mock_storage
+			.expect_set_bytes()
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		mock_order_interface
+			.expect_validate_and_create_order()
+			.times(1)
+			.returning(move |_, _, _, _, _, _| {
+				Box::pin(async move { Ok(create_test_order_with_expires_in(60)) })
+			});
+
+		// Skip happens before simulation + strategy execution.
+		mock_order_interface
+			.expect_generate_fill_transaction()
+			.times(0);
+		mock_strategy.expect_should_execute().times(0);
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order_interface) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(mock_strategy),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let config = create_test_config_with_broadcaster();
+		let cost_profit_service = create_mock_cost_profit_service();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+		);
+
+		let result = handler.handle(intent).await;
+		assert!(result.is_ok());
+
+		match receiver.recv().await.unwrap() {
+			SolverEvent::Order(OrderEvent::Skipped { reason, .. }) => {
+				assert!(reason.contains("Insufficient settlement window"));
+				assert!(reason.contains("broadcaster:"));
+			},
+			other => panic!("Expected OrderEvent::Skipped, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_skip_due_to_explicit_settlement_min_window() {
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_order_interface = MockOrderInterface::new();
+		let mut mock_strategy = MockExecutionStrategy::new();
+
+		let intent = create_test_intent();
+		let solver_address = create_test_address();
+
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:test_intent_123"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+		mock_storage
+			.expect_set_bytes()
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		mock_order_interface
+			.expect_validate_and_create_order()
+			.times(1)
+			.returning(move |_, _, _, _, _, _| {
+				Box::pin(async move { Ok(create_test_order_with_expires_in(100)) })
+			});
+		mock_order_interface
+			.expect_generate_fill_transaction()
+			.times(0);
+		mock_strategy.expect_should_execute().times(0);
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order_interface) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(mock_strategy),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let config = create_test_config_with_hyperlane_min_window(500);
+		let cost_profit_service = create_mock_cost_profit_service();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+		);
+
+		let result = handler.handle(intent).await;
+		assert!(result.is_ok());
+
+		match receiver.recv().await.unwrap() {
+			SolverEvent::Order(OrderEvent::Skipped { reason, .. }) => {
+				assert!(reason.contains("Insufficient settlement window"));
+				assert!(reason.contains("hyperlane: explicit intent_min_expiry_seconds=500s"));
+			},
+			other => panic!("Expected OrderEvent::Skipped, got {other:?}"),
+		}
 	}
 
 	#[tokio::test]

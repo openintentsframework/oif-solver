@@ -31,6 +31,49 @@ use solver_types::{
 	GetQuoteRequest, QuoteError,
 };
 
+fn settlement_min_expiry_seconds(config: &Config) -> u64 {
+	config
+		.settlement
+		.implementations
+		.values()
+		.filter_map(|implementation| {
+			implementation
+				.as_object()
+				.and_then(|table| table.get("intent_min_expiry_seconds"))
+				.and_then(|value| value.as_i64())
+				.filter(|seconds| *seconds >= 0)
+				.map(|seconds| seconds as u64)
+		})
+		.max()
+		.unwrap_or(0)
+}
+
+fn quote_fill_deadline_seconds(config: &Config) -> u64 {
+	config
+		.api
+		.as_ref()
+		.and_then(|api| api.quote.as_ref())
+		.map(|quote| quote.fill_deadline_seconds)
+		.unwrap_or_else(|| QuoteConfig::default().fill_deadline_seconds)
+}
+
+fn quote_expires_seconds(config: &Config) -> u64 {
+	if let Some(expires_seconds) = config
+		.api
+		.as_ref()
+		.and_then(|api| api.quote.as_ref())
+		.map(|quote| quote.expires_seconds)
+	{
+		return expires_seconds;
+	}
+
+	let admission_safe_expires =
+		settlement_min_expiry_seconds(config).saturating_add(quote_fill_deadline_seconds(config));
+	QuoteConfig::default()
+		.expires_seconds
+		.max(admission_safe_expires)
+}
+
 pub fn build_permit2_batch_witness_digest(
 	request: &GetQuoteRequest,
 	config: &Config,
@@ -119,39 +162,17 @@ pub fn build_permit2_batch_witness_digest(
 		// If user specifies min_valid_until, use it as fillDeadline
 		min_valid_until
 	} else {
-		let fill_deadline_seconds = config
-			.api
-			.as_ref()
-			.and_then(|api| api.quote.as_ref())
-			.map(|quote| quote.fill_deadline_seconds)
-			.unwrap_or_else(|| QuoteConfig::default().fill_deadline_seconds);
-		now_secs + fill_deadline_seconds
+		now_secs + quote_fill_deadline_seconds(config)
 	};
 
 	// expires (witness expires): Time to finalize/claim on origin chain (default 10 minutes, must be > fillDeadline)
 	let expires_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until {
 		// If user specifies min_valid_until, add buffer for expires
-		let fill_deadline_seconds = config
-			.api
-			.as_ref()
-			.and_then(|api| api.quote.as_ref())
-			.map(|quote| quote.fill_deadline_seconds)
-			.unwrap_or_else(|| QuoteConfig::default().fill_deadline_seconds);
-		let expires_seconds = config
-			.api
-			.as_ref()
-			.and_then(|api| api.quote.as_ref())
-			.map(|quote| quote.expires_seconds)
-			.unwrap_or_else(|| QuoteConfig::default().expires_seconds);
+		let fill_deadline_seconds = quote_fill_deadline_seconds(config);
+		let expires_seconds = quote_expires_seconds(config);
 		min_valid_until + (expires_seconds - fill_deadline_seconds)
 	} else {
-		let expires_seconds = config
-			.api
-			.as_ref()
-			.and_then(|api| api.quote.as_ref())
-			.map(|quote| quote.expires_seconds)
-			.unwrap_or_else(|| QuoteConfig::default().expires_seconds);
-		now_secs + expires_seconds
+		now_secs + quote_expires_seconds(config)
 	};
 
 	let deadline_secs: U256 = U256::from(fill_deadline_timestamp);
@@ -315,6 +336,7 @@ mod tests {
 
 		let settlement_config = SettlementConfig {
 			implementations: HashMap::new(),
+			primary: String::new(),
 			settlement_poll_interval_seconds: 3,
 		};
 
