@@ -146,13 +146,14 @@ pub async fn process_quote_request(
 	let delivery_service = solver.delivery();
 	let quote_generator = QuoteGenerator::new(settlement_service.clone(), delivery_service.clone());
 
-	let quotes = quote_generator
+	let quote_pairs = quote_generator
 		.generate_quotes_with_costs(&request, &validated_context, &cost_context, config)
 		.await?;
 
-	// Persist quotes and cost contexts
-	store_quotes(solver, &quotes, &cost_context).await;
+	// Persist quotes and cost contexts (including settlement_name internally)
+	store_quotes(solver, &quote_pairs, &cost_context).await;
 
+	let quotes: Vec<Quote> = quote_pairs.into_iter().map(|(q, _)| q).collect();
 	info!("Generated and stored {} quote options", quotes.len());
 
 	Ok(GetQuoteResponse { quotes })
@@ -162,14 +163,18 @@ pub async fn process_quote_request(
 ///
 /// Each quote is stored together with its cost context as a QuoteWithCostContext structure.
 /// Storage errors are logged but do not fail the request.
-async fn store_quotes(solver: &SolverEngine, quotes: &[Quote], cost_context: &CostContext) {
+async fn store_quotes(
+	solver: &SolverEngine,
+	quotes: &[(Quote, Option<String>)],
+	cost_context: &CostContext,
+) {
 	let storage = solver.storage();
 	let now = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
 		.unwrap_or_default()
 		.as_secs();
 
-	for quote in quotes {
+	for (quote, settlement_name) in quotes {
 		// Calculate TTL from valid_until timestamp
 		let ttl = if quote.valid_until > now {
 			Duration::from_secs(quote.valid_until - now)
@@ -182,6 +187,7 @@ async fn store_quotes(solver: &SolverEngine, quotes: &[Quote], cost_context: &Co
 		let quote_with_context = QuoteWithCostContext {
 			quote: quote.clone(),
 			cost_context: cost_context.clone(),
+			settlement_name: settlement_name.clone(),
 		};
 
 		// Store the combined structure in a single I/O operation
@@ -456,7 +462,6 @@ mod tests {
 				inputs: vec![],
 				outputs: vec![],
 			},
-			settlement_name: None,
 		}
 	}
 
@@ -491,13 +496,14 @@ mod tests {
 		QuoteWithCostContext {
 			quote: create_test_quote(),
 			cost_context: create_test_cost_context(),
+			settlement_name: None,
 		}
 	}
 
 	#[tokio::test]
 	async fn test_store_quotes_success() {
 		let solver = create_test_solver_engine();
-		let quotes = vec![create_test_quote()];
+		let quotes = vec![(create_test_quote(), None)];
 		let cost_context = create_test_cost_context();
 
 		// Test the actual store_quotes function
@@ -516,7 +522,7 @@ mod tests {
 		let mut quote = create_test_quote();
 		// Set quote to be already expired
 		quote.valid_until = current_timestamp() - 100;
-		let quotes = vec![quote];
+		let quotes = vec![(quote, None)];
 		let cost_context = create_test_cost_context();
 
 		// Test the actual store_quotes function with expired quote

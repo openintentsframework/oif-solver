@@ -176,7 +176,7 @@ impl IntentHandler {
 				.await
 			{
 				Ok(quote_with_context) => {
-					if let Some(settlement_name) = quote_with_context.quote.settlement_name {
+					if let Some(settlement_name) = quote_with_context.settlement_name {
 						if let Some(intent_obj) = intent_data_value.as_object_mut() {
 							// Preserve both key styles for compatibility with current parsers.
 							intent_obj.insert(

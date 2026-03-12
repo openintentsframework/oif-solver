@@ -1766,7 +1766,6 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
-				settlement_name: None,
 			},
 			cost_context: CostContext {
 				cost_breakdown: create_test_cost_breakdown(),
@@ -1778,6 +1777,7 @@ mod tests {
 				swap_amounts: HashMap::new(),
 				adjusted_amounts: HashMap::new(),
 			},
+			settlement_name: None,
 		}
 	}
 
@@ -2530,9 +2530,9 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
-				settlement_name: None,
 			},
 			cost_context: create_cost_context_with_swap_type(SwapType::ExactInput),
+			settlement_name: None,
 		};
 
 		mock_storage
@@ -2594,9 +2594,9 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
-				settlement_name: None,
 			},
 			cost_context: create_cost_context_with_swap_type(SwapType::ExactOutput),
+			settlement_name: None,
 		};
 
 		mock_storage

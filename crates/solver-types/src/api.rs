@@ -1093,14 +1093,6 @@ pub struct Quote {
 	pub provider: Option<String>,
 	/// Informational amounts for UX/display, must be verified against the order
 	pub preview: QuotePreview,
-	/// Settlement implementation name selected at quote time.
-	/// Used to ensure consistent settlement handling throughout order lifecycle.
-	#[serde(
-		rename = "settlementName",
-		skip_serializing_if = "Option::is_none",
-		default
-	)]
-	pub settlement_name: Option<String>,
 }
 
 /// Implementation to convert Quote with signature and standard to PostOrderRequest
@@ -1490,6 +1482,11 @@ pub struct QuoteWithCostContext {
 	pub quote: Quote,
 	/// The associated cost context from quote generation
 	pub cost_context: crate::costs::CostContext,
+	/// Settlement implementation name selected at quote time.
+	/// Kept internal (not exposed in API responses) to ensure consistent
+	/// settlement handling throughout order lifecycle.
+	#[serde(skip_serializing_if = "Option::is_none", default)]
+	pub settlement_name: Option<String>,
 }
 
 #[cfg(test)]
@@ -1734,7 +1731,6 @@ mod tests {
 					calldata: None,
 				}],
 			},
-			settlement_name: None,
 		};
 
 		let json = serde_json::to_string(&quote).unwrap();
@@ -1771,7 +1767,6 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
-				settlement_name: None,
 			}],
 		};
 
