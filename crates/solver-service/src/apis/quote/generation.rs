@@ -1539,14 +1539,12 @@ impl QuoteGenerator {
 		preference: &Option<QuotePreference>,
 	) {
 		match preference {
-			Some(QuotePreference::Speed) => {
-				quotes.sort_by(|(a, _), (b, _)| match (a.eta, b.eta) {
-					(Some(eta_a), Some(eta_b)) => eta_a.cmp(&eta_b),
-					(Some(_), None) => std::cmp::Ordering::Less,
-					(None, Some(_)) => std::cmp::Ordering::Greater,
-					(None, None) => std::cmp::Ordering::Equal,
-				})
-			},
+			Some(QuotePreference::Speed) => quotes.sort_by(|(a, _), (b, _)| match (a.eta, b.eta) {
+				(Some(eta_a), Some(eta_b)) => eta_a.cmp(&eta_b),
+				(Some(_), None) => std::cmp::Ordering::Less,
+				(None, Some(_)) => std::cmp::Ordering::Greater,
+				(None, None) => std::cmp::Ordering::Equal,
+			}),
 			Some(QuotePreference::InputPriority) => {},
 			Some(QuotePreference::Price) | Some(QuotePreference::TrustMinimization) | None => {},
 		}
@@ -2438,8 +2436,7 @@ mod tests {
 
 		let mut pairs: Vec<(Quote, Option<String>)> =
 			quotes.into_iter().map(|q| (q, None)).collect();
-		generator
-			.sort_quotes_by_preference_pairs(&mut pairs, &Some(QuotePreference::Speed));
+		generator.sort_quotes_by_preference_pairs(&mut pairs, &Some(QuotePreference::Speed));
 
 		// Should be sorted by ETA ascending (fastest first)
 		assert_eq!(pairs[0].0.eta, Some(100));
@@ -2504,22 +2501,17 @@ mod tests {
 		let original_order: Vec<String> = pairs.iter().map(|(q, _)| q.quote_id.clone()).collect();
 
 		// Test that other preferences don't change order
+		generator.sort_quotes_by_preference_pairs(&mut pairs, &Some(QuotePreference::Price));
+		assert_eq!(pairs[0].0.quote_id, original_order[0]);
+		assert_eq!(pairs[1].0.quote_id, original_order[1]);
+
 		generator
-			.sort_quotes_by_preference_pairs(&mut pairs, &Some(QuotePreference::Price));
+			.sort_quotes_by_preference_pairs(&mut pairs, &Some(QuotePreference::TrustMinimization));
 		assert_eq!(pairs[0].0.quote_id, original_order[0]);
 		assert_eq!(pairs[1].0.quote_id, original_order[1]);
 
-		generator.sort_quotes_by_preference_pairs(
-			&mut pairs,
-			&Some(QuotePreference::TrustMinimization),
-		);
-		assert_eq!(pairs[0].0.quote_id, original_order[0]);
-		assert_eq!(pairs[1].0.quote_id, original_order[1]);
-
-		generator.sort_quotes_by_preference_pairs(
-			&mut pairs,
-			&Some(QuotePreference::InputPriority),
-		);
+		generator
+			.sort_quotes_by_preference_pairs(&mut pairs, &Some(QuotePreference::InputPriority));
 		assert_eq!(pairs[0].0.quote_id, original_order[0]);
 		assert_eq!(pairs[1].0.quote_id, original_order[1]);
 
