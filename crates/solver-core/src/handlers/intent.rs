@@ -169,10 +169,7 @@ impl IntentHandler {
 		if let Some(quote_id) = intent.quote_id.as_deref() {
 			match self
 				.storage
-				.retrieve::<solver_types::QuoteWithCostContext>(
-					StorageKey::Quotes.as_str(),
-					quote_id,
-				)
+				.retrieve::<solver_types::StoredQuote>(StorageKey::Quotes.as_str(), quote_id)
 				.await
 			{
 				Ok(quote_with_context) => {
