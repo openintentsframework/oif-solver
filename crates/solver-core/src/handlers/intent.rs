@@ -169,14 +169,11 @@ impl IntentHandler {
 		if let Some(quote_id) = intent.quote_id.as_deref() {
 			match self
 				.storage
-				.retrieve::<solver_types::QuoteWithCostContext>(
-					StorageKey::Quotes.as_str(),
-					quote_id,
-				)
+				.retrieve::<solver_types::StoredQuote>(StorageKey::Quotes.as_str(), quote_id)
 				.await
 			{
 				Ok(quote_with_context) => {
-					if let Some(settlement_name) = quote_with_context.quote.settlement_name {
+					if let Some(settlement_name) = quote_with_context.settlement_name {
 						if let Some(intent_obj) = intent_data_value.as_object_mut() {
 							// Preserve both key styles for compatibility with current parsers.
 							intent_obj.insert(
