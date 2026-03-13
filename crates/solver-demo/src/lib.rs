@@ -242,16 +242,14 @@ impl Context {
 		let data_dir = std::path::Path::new(".oif-demo");
 		if !data_dir.exists() {
 			return Err(Error::InvalidConfig(
-				"No configuration loaded. Run 'cargo run -p solver-demo -- init load <path>' first"
-					.to_string(),
+				"No configuration loaded. Run 'cargo run -p solver-demo -- init load <path>' or 'cargo run -p solver-demo -- init load-storage --solver-id <id>' first".to_string(),
 			));
 		}
 
 		let storage = Storage::new(data_dir)?;
 		if !storage.exists("session") {
 			return Err(Error::InvalidConfig(
-				"No session found. Run 'cargo run -p solver-demo init load <path>' first"
-					.to_string(),
+				"No session found. Run 'cargo run -p solver-demo init load <path>' or 'cargo run -p solver-demo init load-storage --solver-id <id>' first".to_string(),
 			));
 		}
 
@@ -259,21 +257,19 @@ impl Context {
 		let session_store = SessionStore::load(storage.clone())?;
 		let config_path = session_store.config_path().ok_or_else(|| {
 			Error::InvalidConfig(
-				"No config path stored. Run 'cargo run -p solver-demo init load <path>' first"
-					.to_string(),
+				"No config path stored. Run 'cargo run -p solver-demo init load <path>' or 'cargo run -p solver-demo init load-storage --solver-id <id>' first".to_string(),
 			)
 		})?;
 
 		if config_path.as_os_str().is_empty() {
 			return Err(Error::InvalidConfig(
-				"No config path stored. Run 'cargo run -p solver-demo init load <path>' first"
-					.to_string(),
+				"No config path stored. Run 'cargo run -p solver-demo init load <path>' or 'cargo run -p solver-demo init load-storage --solver-id <id>' first".to_string(),
 			));
 		}
 
 		if !config_path.exists() {
 			return Err(Error::InvalidConfig(format!(
-				"Config file not found: {}. Run 'cargo run -p solver-demo init load <path>' again",
+				"Config file not found: {}. Run 'cargo run -p solver-demo init load <path>' or 'cargo run -p solver-demo init load-storage --solver-id <id>' again",
 				config_path.display()
 			)));
 		}

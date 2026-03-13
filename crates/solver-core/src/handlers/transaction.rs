@@ -364,7 +364,7 @@ mod tests {
 		let handler = TransactionHandler::new(
 			storage,
 			state_machine,
-			Arc::new(SettlementService::new(HashMap::new(), 20)),
+			Arc::new(SettlementService::new(HashMap::new(), String::new(), 20)),
 			event_bus,
 		);
 

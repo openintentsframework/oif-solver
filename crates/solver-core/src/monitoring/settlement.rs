@@ -6,9 +6,10 @@
 
 use crate::engine::event_bus::EventBus;
 use crate::state::OrderStateMachine;
-use solver_settlement::SettlementService;
+use solver_delivery::DeliveryService;
+use solver_settlement::{ActionRequired, SettlementReadiness, SettlementService};
 use solver_types::{
-	truncate_id, Order, OrderStatus, SettlementEvent, SolverEvent, TransactionHash,
+	truncate_id, NetworksConfig, Order, OrderStatus, SettlementEvent, SolverEvent, TransactionHash,
 };
 use std::sync::Arc;
 
@@ -17,11 +18,16 @@ use std::sync::Arc;
 /// The SettlementMonitor watches filled orders to determine when they are ready
 /// for claiming by retrieving attestations and checking claim conditions periodically
 /// until the order is claimable or a timeout is reached.
+///
+/// On each poll it also checks whether the L2 block-hash buffer needs to be
+/// advanced (via `push_if_needed`) before a storage proof can be generated.
 pub struct SettlementMonitor {
 	settlement: Arc<SettlementService>,
 	state_machine: Arc<OrderStateMachine>,
 	event_bus: EventBus,
 	timeout_minutes: u64,
+	delivery: Arc<DeliveryService>,
+	networks: NetworksConfig,
 }
 
 impl SettlementMonitor {
@@ -30,12 +36,16 @@ impl SettlementMonitor {
 		state_machine: Arc<OrderStateMachine>,
 		event_bus: EventBus,
 		timeout_minutes: u64,
+		delivery: Arc<DeliveryService>,
+		networks: NetworksConfig,
 	) -> Self {
 		Self {
 			settlement,
 			state_machine,
 			event_bus,
 			timeout_minutes,
+			delivery,
+			networks,
 		}
 	}
 
@@ -95,21 +105,65 @@ impl SettlementMonitor {
 				break;
 			}
 
-			// Check if we can claim
-			if settlement.can_claim(&order, &fill_proof).await {
-				// Update status to Settled
-				self.state_machine
-					.transition_order_status(&order.id, OrderStatus::Settled)
-					.await
-					.ok();
+			// Check whether the L2 buffer needs to be advanced for this order.
+			if let Some((direction, required_block)) =
+				self.settlement.buffer_coverage_check(&order).await
+			{
+				self.settlement
+					.push_if_needed(&direction, required_block, &self.delivery, &self.networks)
+					.await;
+			}
 
-				// Emit PreClaimReady event - handler will generate transaction if needed
-				self.event_bus
-					.publish(SolverEvent::Settlement(SettlementEvent::PreClaimReady {
-						order_id: order.id,
-					}))
-					.ok();
-				break;
+			match settlement.readiness(&order, &fill_proof).await {
+				SettlementReadiness::Ready => {
+					// Update status to Settled
+					self.state_machine
+						.transition_order_status(&order.id, OrderStatus::Settled)
+						.await
+						.ok();
+
+					// Emit PreClaimReady event - handler will generate transaction if needed
+					self.event_bus
+						.publish(SolverEvent::Settlement(SettlementEvent::PreClaimReady {
+							order_id: order.id,
+						}))
+						.ok();
+					break;
+				},
+				SettlementReadiness::Waiting(reason) => match &reason {
+					solver_settlement::WaitingReason::ProofServiceNotReady
+					| solver_settlement::WaitingReason::RpcUnavailable
+					| solver_settlement::WaitingReason::StorageUnavailable => {
+						tracing::warn!(
+							order_id = %truncate_id(&order.id),
+							?reason,
+							"Settlement blocked by infrastructure issue"
+						);
+					},
+					_ => {
+						tracing::debug!(
+							order_id = %truncate_id(&order.id),
+							?reason,
+							"Settlement not ready yet"
+						);
+					},
+				},
+				SettlementReadiness::NeedsAction(ActionRequired::BufferBehind {
+					direction,
+					required_block,
+				}) => {
+					self.settlement
+						.push_if_needed(&direction, required_block, &self.delivery, &self.networks)
+						.await;
+				},
+				SettlementReadiness::PermanentFailure(error) => {
+					tracing::error!(
+						order_id = %truncate_id(&order.id),
+						error = %error,
+						"Settlement monitoring hit a permanent failure"
+					);
+					break;
+				},
 			}
 
 			// Wait before next check
@@ -122,12 +176,15 @@ impl SettlementMonitor {
 mod tests {
 	use super::*;
 	use mockall::predicate::eq;
+	use solver_delivery::DeliveryService;
 	use solver_settlement::{
-		MockSettlementInterface, OracleConfig, OracleSelectionStrategy, SettlementService,
+		MockSettlementInterface, OracleConfig, OracleSelectionStrategy, SettlementReadiness,
+		SettlementService,
 	};
 	use solver_storage::{MockStorageInterface, StorageService};
 	use solver_types::{
-		utils::tests::builders::OrderBuilder, FillProof, Order, SettlementEvent, SolverEvent,
+		utils::tests::builders::OrderBuilder, FillProof, NetworksConfig, Order, SettlementEvent,
+		SolverEvent,
 	};
 	use std::{collections::HashMap, sync::Arc, time::Duration};
 	use tokio::sync::broadcast;
@@ -172,6 +229,7 @@ mod tests {
 				"eip7683".to_string(),
 				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
 			)]),
+			"eip7683".to_string(),
 			20,
 		));
 
@@ -180,22 +238,41 @@ mod tests {
 		let event_bus = EventBus::new(100);
 		let receiver = event_bus.subscribe();
 
-		let monitor = SettlementMonitor::new(settlement, state_machine, event_bus, timeout_minutes);
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let networks: NetworksConfig = HashMap::new();
+
+		let monitor = SettlementMonitor::new(
+			settlement,
+			state_machine,
+			event_bus,
+			timeout_minutes,
+			delivery,
+			networks,
+		);
 
 		(monitor, receiver)
 	}
 
 	#[test]
 	fn test_new_settlement_monitor() {
-		let settlement = Arc::new(SettlementService::new(HashMap::new(), 20));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
 		let storage = Arc::new(StorageService::new(Box::new(
 			solver_storage::implementations::memory::MemoryStorage::new(),
 		)));
 		let state_machine = Arc::new(OrderStateMachine::new(storage));
 		let event_bus = EventBus::new(100);
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let networks: NetworksConfig = HashMap::new();
 		let timeout_minutes = 30;
 
-		let monitor = SettlementMonitor::new(settlement, state_machine, event_bus, timeout_minutes);
+		let monitor = SettlementMonitor::new(
+			settlement,
+			state_machine,
+			event_bus,
+			timeout_minutes,
+			delivery,
+			networks,
+		);
 
 		assert_eq!(monitor.timeout_minutes, 30);
 	}
@@ -231,9 +308,14 @@ mod tests {
 					.returning(|_, _| Box::pin(async move { Ok(create_test_fill_proof()) }));
 
 				settlement
-					.expect_can_claim()
+					.expect_buffer_coverage_check()
 					.times(1)
-					.returning(|_, _| Box::pin(async move { true }));
+					.returning(|_| Box::pin(async { None }));
+
+				settlement
+					.expect_readiness()
+					.times(1)
+					.returning(|_, _| Box::pin(async move { SettlementReadiness::Ready }));
 			},
 			|storage| {
 				// Mock exists check
@@ -404,6 +486,168 @@ mod tests {
 		assert!(
 			result.is_err(),
 			"Should not receive any events on storage error"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_monitor_claim_readiness_permanent_failure_emits_no_event() {
+		let order = create_test_order();
+		let tx_hash = create_test_tx_hash();
+
+		let (monitor, mut receiver) = create_test_monitor_with_mocks(
+			|settlement| {
+				settlement
+					.expect_oracle_config()
+					.return_const(OracleConfig {
+						input_oracles: std::collections::HashMap::new(),
+						output_oracles: std::collections::HashMap::new(),
+						routes: std::collections::HashMap::new(),
+						selection_strategy: OracleSelectionStrategy::RoundRobin,
+					});
+
+				settlement
+					.expect_is_input_oracle_supported()
+					.return_const(true);
+
+				settlement
+					.expect_is_output_oracle_supported()
+					.return_const(true);
+
+				settlement
+					.expect_get_attestation()
+					.times(1)
+					.returning(|_, _| Box::pin(async move { Ok(create_test_fill_proof()) }));
+
+				settlement
+					.expect_buffer_coverage_check()
+					.times(1)
+					.returning(|_| Box::pin(async { None }));
+
+				settlement.expect_readiness().times(1).returning(|_, _| {
+					Box::pin(async move {
+						SettlementReadiness::PermanentFailure("misconfigured proof path".into())
+					})
+				});
+			},
+			|storage| {
+				storage
+					.expect_exists()
+					.with(eq("orders:test_order_123"))
+					.returning(|_| Box::pin(async move { Ok(true) }));
+				storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.returning({
+						let order = order.clone();
+						move |_| {
+							let order = order.clone();
+							Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+						}
+					});
+				storage
+					.expect_set_bytes()
+					.times(1)
+					.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+			},
+			1,
+		)
+		.await;
+
+		monitor.monitor_claim_readiness(order, tx_hash).await;
+
+		let result = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
+		assert!(
+			result.is_err(),
+			"Permanent settlement failure should not emit settlement events"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_monitor_claim_readiness_buffer_action_then_failure_emits_no_event() {
+		let order = create_test_order();
+		let tx_hash = create_test_tx_hash();
+
+		let (monitor, mut receiver) = create_test_monitor_with_mocks(
+			|settlement| {
+				settlement
+					.expect_oracle_config()
+					.return_const(OracleConfig {
+						input_oracles: std::collections::HashMap::new(),
+						output_oracles: std::collections::HashMap::new(),
+						routes: std::collections::HashMap::new(),
+						selection_strategy: OracleSelectionStrategy::RoundRobin,
+					});
+
+				settlement
+					.expect_is_input_oracle_supported()
+					.return_const(true);
+
+				settlement
+					.expect_is_output_oracle_supported()
+					.return_const(true);
+
+				settlement
+					.expect_get_attestation()
+					.times(1)
+					.returning(|_, _| Box::pin(async move { Ok(create_test_fill_proof()) }));
+
+				let direction = solver_settlement::PusherDirection {
+					label: "eth-to-arb-sepolia".into(),
+					l1_chain_id: 11155111,
+					pusher_address: solver_types::Address(vec![0x11; 20]),
+					l2_chain_id: 421614,
+					buffer_address: solver_types::Address(vec![0x22; 20]),
+					batch_size: 256,
+					push_cooldown_seconds: 60,
+					l2_params: solver_types::PusherL2Params::Raw {
+						data: "0x".into(),
+						value_wei: None,
+					},
+				};
+				settlement
+					.expect_buffer_coverage_check()
+					.times(1)
+					.returning(move |_| {
+						let direction = direction.clone();
+						Box::pin(async move { Some((direction, 12345)) })
+					});
+
+				settlement.expect_readiness().times(1).returning(|_, _| {
+					Box::pin(async move {
+						SettlementReadiness::PermanentFailure("buffer still unavailable".into())
+					})
+				});
+			},
+			|storage| {
+				storage
+					.expect_exists()
+					.with(eq("orders:test_order_123"))
+					.returning(|_| Box::pin(async move { Ok(true) }));
+				storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.returning({
+						let order = order.clone();
+						move |_| {
+							let order = order.clone();
+							Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+						}
+					});
+				storage
+					.expect_set_bytes()
+					.times(1)
+					.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+			},
+			1,
+		)
+		.await;
+
+		monitor.monitor_claim_readiness(order, tx_hash).await;
+
+		let result = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
+		assert!(
+			result.is_err(),
+			"Buffer action branch should not emit settlement events on failure"
 		);
 	}
 }
