@@ -152,7 +152,7 @@ pub fn parse_address(hex_str: &str) -> Result<Address, String> {
 			// Other missing zeros cases - pad to 64 chars (32 bytes)
 			format!("{hex_clean:0>64}")
 		},
-		_ => hex_clean.to_string(),
+		_ => format!("{hex_clean:0>40}"), // pad short/odd-length to 20-byte address
 	};
 
 	hex::decode(&padded_hex)
