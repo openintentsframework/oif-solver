@@ -181,6 +181,7 @@ impl SolverEngine {
 			state_machine.clone(),
 			event_bus.clone(),
 			static_config.solver.monitoring_timeout_seconds / 60, // Convert seconds to minutes
+			static_config.networks.clone(),
 		));
 
 		Self {
@@ -530,7 +531,7 @@ impl SolverEngine {
 		}
 
 		// Cleanup
-		cleanup_handle.abort(); // Stop the cleanup task
+		cleanup_handle.abort();
 
 		self.discovery
 			.stop_all()
@@ -710,7 +711,11 @@ mod tests {
 		));
 
 		// Create settlement service - using empty implementations map for testing
-		let settlement = Arc::new(SettlementService::new(std::collections::HashMap::new(), 20));
+		let settlement = Arc::new(SettlementService::new(
+			std::collections::HashMap::new(),
+			String::new(),
+			20,
+		));
 
 		// Create pricing service with mock implementation
 		let pricing_config = serde_json::Value::Object(serde_json::Map::new());

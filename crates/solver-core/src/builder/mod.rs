@@ -340,13 +340,14 @@ impl SolverBuilder {
 
 		let discovery = Arc::new(DiscoveryService::new(discovery_implementations));
 
-		// Create settlement implementations first (needed for oracle routes)
+		// Create settlement implementations (needed for oracle routes)
 		let mut settlement_impls = HashMap::new();
+		let primary = self.static_config.settlement.primary.clone();
+
 		for (name, config) in &self.static_config.settlement.implementations {
 			if let Some(factory) = factories.settlement_factories.get(name) {
 				match factory(config, &self.static_config.networks, storage.clone()) {
 					Ok(implementation) => {
-						// Validation already happened in the factory
 						settlement_impls.insert(name.clone(), implementation);
 						tracing::info!(component = "settlement", implementation = %name, "Loaded");
 					},
@@ -369,10 +370,15 @@ impl SolverBuilder {
 			tracing::warn!(
 				"No settlement implementations available - solver will not be able to monitor and claim settlements"
 			);
+		} else if !primary.is_empty() && !settlement_impls.contains_key(&primary) {
+			return Err(BuilderError::Config(format!(
+				"Settlement primary '{primary}' not found in loaded implementations"
+			)));
 		}
 
 		let settlement = Arc::new(SettlementService::new(
 			settlement_impls,
+			primary,
 			self.static_config
 				.settlement
 				.settlement_poll_interval_seconds,

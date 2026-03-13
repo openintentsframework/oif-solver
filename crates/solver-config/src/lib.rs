@@ -192,6 +192,10 @@ pub struct SettlementConfig {
 	/// Map of settlement implementation names to their configurations.
 	/// Each implementation handles specific settlement mechanisms.
 	pub implementations: HashMap<String, serde_json::Value>,
+	/// The primary settlement implementation name. Must exist in `implementations`.
+	/// All new quotes and unbound orders use this implementation exclusively.
+	#[serde(default)]
+	pub primary: String,
 	/// Poll interval in seconds for settlement readiness monitoring.
 	/// Defaults to 3 seconds if not specified.
 	#[serde(default = "default_settlement_poll_interval_seconds")]
@@ -594,6 +598,21 @@ impl Config {
 				"At least one settlement implementation required".into(),
 			));
 		}
+		if self.settlement.primary.is_empty() {
+			return Err(ConfigError::Validation(
+				"settlement.primary must be set".into(),
+			));
+		}
+		if !self
+			.settlement
+			.implementations
+			.contains_key(&self.settlement.primary)
+		{
+			return Err(ConfigError::Validation(format!(
+				"settlement.primary '{}' not found in settlement.implementations",
+				self.settlement.primary
+			)));
+		}
 
 		// Validate settlement poll interval (1-monitoring_timeout_seconds)
 		// Settlement can be slower, especially for cross-chain
@@ -752,6 +771,11 @@ mod tests {
 		order_implementations: serde_json::Value,
 		settlement_implementations: serde_json::Value,
 	) -> serde_json::Value {
+		let settlement_primary = settlement_implementations
+			.as_object()
+			.and_then(|implementations| implementations.keys().next().cloned())
+			.unwrap_or_default();
+
 		json!({
 			"solver": {
 				"id": "test",
@@ -794,7 +818,8 @@ mod tests {
 				}
 			},
 			"settlement": {
-				"implementations": settlement_implementations
+				"implementations": settlement_implementations,
+				"primary": settlement_primary
 			}
 		})
 	}
@@ -878,17 +903,18 @@ mod tests {
 						"simple": {}
 					}
 				}
-			},
-			"settlement": {
-				"implementations": {
-					"test": {
-						"order": "test",
-						"network_ids": [1, 2]
+				},
+				"settlement": {
+					"primary": "test",
+					"implementations": {
+						"test": {
+							"order": "test",
+							"network_ids": [1, 2]
+						}
 					}
 				}
-			}
-		}))
-		.unwrap();
+			}))
+			.unwrap();
 		assert_eq!(config.solver.id, "test-solver");
 		assert_eq!(
 			config.solver.min_profitability_pct,
@@ -919,10 +945,10 @@ mod tests {
 				"test": {}
 			}),
 			json!({
-				"test": {
-					"order": "test",
-					"network_ids": [1, 2]
-				}
+			"test": {
+				"order": "test",
+				"network_ids": [1, 2]
+			}
 			}),
 		))
 		.expect("Config should parse");
@@ -942,13 +968,13 @@ mod tests {
 				"eip7683": {}
 			}),
 			json!({
-				"impl1": {
-					"order": "eip7683",
-					"network_ids": [1, 2]
-				},
-				"impl2": {
-					"order": "eip7683",
-					"network_ids": [2, 3]
+			"impl1": {
+				"order": "eip7683",
+				"network_ids": [1, 2]
+			},
+			"impl2": {
+				"order": "eip7683",
+				"network_ids": [2, 3]
 				}
 			}),
 		));
@@ -976,8 +1002,8 @@ mod tests {
 				"eip7683": {}
 			}),
 			json!({
-				"impl1": {
-					"network_ids": [1, 2]
+			"impl1": {
+				"network_ids": [1, 2]
 				}
 			}),
 		));
@@ -997,9 +1023,9 @@ mod tests {
 				"eip7683": {}
 			}),
 			json!({
-				"impl1": {
-					"order": "eip7683",
-					"network_ids": [1, 2, 999]
+			"impl1": {
+				"order": "eip7683",
+				"network_ids": [1, 2, 999]
 				}
 			}),
 		));
@@ -1022,9 +1048,9 @@ mod tests {
 				"eip9999": {}
 			}),
 			json!({
-				"impl1": {
-					"order": "eip7683",
-					"network_ids": [1, 2]
+			"impl1": {
+				"order": "eip7683",
+				"network_ids": [1, 2]
 				}
 			}),
 		));
