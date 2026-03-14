@@ -78,10 +78,20 @@ impl IntentHandler {
 		dynamic_config: Arc<RwLock<Config>>,
 		static_config: &Config,
 	) -> Self {
-		let denied_addresses = Self::load_deny_list(static_config.solver.deny_list.as_deref());
-		if denied_addresses.is_empty() {
-			tracing::warn!("Deny List could not be loaded. Enforcement is DISABLED!");
-		}
+		let deny_list_configured = static_config.solver.deny_list.is_some();
+		let denied_addresses = match Self::load_deny_list(static_config.solver.deny_list.as_deref())
+		{
+			Ok(set) => {
+				if set.is_empty() && !deny_list_configured {
+					tracing::warn!("No deny list configured. Enforcement is disabled.");
+				}
+				set
+			},
+			Err(e) => {
+				// Fail closed: a configured deny list that can't be loaded is a hard error.
+				panic!("Deny list is configured but could not be loaded (fail-closed): {e}");
+			},
+		};
 		Self {
 			order_service,
 			storage,
@@ -101,35 +111,26 @@ impl IntentHandler {
 
 	/// Load denied addresses from a JSON file.
 	///
-	/// Returns an empty set if no path is configured, the file is missing,
-	/// or the file cannot be parsed. All addresses are stored in lowercase.
-	fn load_deny_list(path: Option<&str>) -> HashSet<String> {
+	/// - If no path is configured, returns `Ok(empty set)` (feature not in use).
+	/// - If a path is configured but the file is missing or malformed, returns `Err`
+	///   so the caller can fail closed.
+	/// All addresses are stored in lowercase.
+	fn load_deny_list(path: Option<&str>) -> Result<HashSet<String>, String> {
 		let path = match path {
 			Some(p) if !p.is_empty() => p,
-			_ => return HashSet::new(),
+			_ => return Ok(HashSet::new()),
 		};
-		match std::fs::read_to_string(path) {
-			Ok(content) => match serde_json::from_str::<Vec<String>>(&content) {
-				Ok(addrs) => {
-					let set: HashSet<String> =
-						addrs.into_iter().map(|a| a.to_lowercase()).collect();
-					tracing::info!(
-						path = %path,
-						count = %set.len(),
-						"Deny list was found"
-					);
-					set
-				},
-				Err(e) => {
-					tracing::warn!(path = %path, error = %e, "Failed to parse deny list");
-					HashSet::new()
-				},
-			},
-			Err(e) => {
-				tracing::warn!(path = %path, error = %e, "Failed to read deny list");
-				HashSet::new()
-			},
-		}
+		let content = std::fs::read_to_string(path)
+			.map_err(|e| format!("Failed to read deny list at '{path}': {e}"))?;
+		let addrs: Vec<String> = serde_json::from_str(&content)
+			.map_err(|e| format!("Failed to parse deny list at '{path}': {e}"))?;
+		let set: HashSet<String> = addrs.into_iter().map(|a| a.to_lowercase()).collect();
+		tracing::info!(
+			path = %path,
+			count = %set.len(),
+			"Deny list loaded"
+		);
+		Ok(set)
 	}
 
 	/// Handles a newly discovered intent.
@@ -1130,6 +1131,7 @@ mod tests {
 			))),
 		));
 		let config = create_test_config_with_broadcaster();
+		let static_config = config.read().await.clone();
 		let cost_profit_service = create_mock_cost_profit_service();
 
 		let handler = IntentHandler::new(
@@ -1142,6 +1144,7 @@ mod tests {
 			token_manager,
 			cost_profit_service,
 			config,
+			&static_config,
 		);
 
 		let result = handler.handle(intent).await;
@@ -1206,6 +1209,7 @@ mod tests {
 			))),
 		));
 		let config = create_test_config_with_hyperlane_min_window(500);
+		let static_config = config.read().await.clone();
 		let cost_profit_service = create_mock_cost_profit_service();
 
 		let handler = IntentHandler::new(
@@ -1218,6 +1222,7 @@ mod tests {
 			token_manager,
 			cost_profit_service,
 			config,
+			&static_config,
 		);
 
 		let result = handler.handle(intent).await;
@@ -1580,5 +1585,99 @@ mod tests {
 			},
 			_ => panic!("Expected Preparing event"),
 		}
+	}
+
+	// ── Deny-list unit tests ────────────────────────────────────────────
+
+	#[test]
+	fn test_load_deny_list_no_path_returns_empty() {
+		let result = IntentHandler::load_deny_list(None);
+		assert!(result.is_ok());
+		assert!(result.unwrap().is_empty());
+	}
+
+	#[test]
+	fn test_load_deny_list_empty_path_returns_empty() {
+		let result = IntentHandler::load_deny_list(Some(""));
+		assert!(result.is_ok());
+		assert!(result.unwrap().is_empty());
+	}
+
+	#[test]
+	fn test_load_deny_list_valid_file() {
+		let dir = tempfile::tempdir().unwrap();
+		let file_path = dir.path().join("deny.json");
+		std::fs::write(
+			&file_path,
+			r#"["0xABC123def456789012345678901234567890abcd","0x1111111111111111111111111111111111111111"]"#,
+		)
+		.unwrap();
+
+		let result =
+			IntentHandler::load_deny_list(Some(file_path.to_str().unwrap()));
+		assert!(result.is_ok());
+		let set = result.unwrap();
+		assert_eq!(set.len(), 2);
+		// All addresses should be lowercased
+		assert!(set.contains("0xabc123def456789012345678901234567890abcd"));
+		assert!(set.contains("0x1111111111111111111111111111111111111111"));
+	}
+
+	#[test]
+	fn test_load_deny_list_missing_file_returns_error() {
+		let result =
+			IntentHandler::load_deny_list(Some("/nonexistent/path/deny.json"));
+		assert!(result.is_err());
+		assert!(result.unwrap_err().contains("Failed to read deny list"));
+	}
+
+	#[test]
+	fn test_load_deny_list_malformed_json_returns_error() {
+		let dir = tempfile::tempdir().unwrap();
+		let file_path = dir.path().join("bad.json");
+		std::fs::write(&file_path, "not valid json").unwrap();
+
+		let result =
+			IntentHandler::load_deny_list(Some(file_path.to_str().unwrap()));
+		assert!(result.is_err());
+		assert!(result.unwrap_err().contains("Failed to parse deny list"));
+	}
+
+	#[test]
+	fn test_denied_addresses_sender_hit() {
+		// Verify that a sender address present in the deny list is detected.
+		let dir = tempfile::tempdir().unwrap();
+		let file_path = dir.path().join("deny.json");
+		let denied_addr = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+		std::fs::write(&file_path, format!(r#"["{denied_addr}"]"#)).unwrap();
+
+		let set =
+			IntentHandler::load_deny_list(Some(file_path.to_str().unwrap())).unwrap();
+		assert!(set.contains(denied_addr));
+	}
+
+	#[test]
+	fn test_denied_addresses_recipient_hit() {
+		// Simulate recipient extraction: bytes32 where the last 20 bytes are the address.
+		let dir = tempfile::tempdir().unwrap();
+		let file_path = dir.path().join("deny.json");
+		let denied_addr = "0x1234567890abcdef1234567890abcdef12345678";
+		std::fs::write(&file_path, format!(r#"["{denied_addr}"]"#)).unwrap();
+
+		let set =
+			IntentHandler::load_deny_list(Some(file_path.to_str().unwrap())).unwrap();
+
+		// Construct a bytes32 recipient with the address in the last 20 bytes
+		let mut recipient = [0u8; 32];
+		let addr_bytes =
+			hex::decode("1234567890abcdef1234567890abcdef12345678").unwrap();
+		recipient[12..].copy_from_slice(&addr_bytes);
+
+		// Extract using the same logic as the handler
+		let addr_bytes = &recipient[12..];
+		let hex_str: String = addr_bytes.iter().map(|b| format!("{b:02x}")).collect();
+		let recipient_addr = format!("0x{hex_str}");
+
+		assert!(set.contains(&recipient_addr));
 	}
 }

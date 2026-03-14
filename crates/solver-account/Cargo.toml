@@ -27,7 +27,6 @@ serde_json = { workspace = true }
 solver-types = { path = "../solver-types" }
 thiserror = "2.0.17"
 tokio = { workspace = true }
-toml = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

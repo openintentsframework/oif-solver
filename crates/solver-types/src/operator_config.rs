@@ -499,6 +499,12 @@ pub struct OperatorSolverConfig {
 
 	/// Timeout in seconds for monitoring transactions.
 	pub monitoring_timeout_seconds: u64,
+
+	/// Optional path to a JSON file containing denied Ethereum addresses.
+	/// The file must contain a JSON array of lowercase hex strings (e.g. `["0xabc...", ...]`).
+	/// When set, any intent whose sender or recipient appears in the list is rejected.
+	#[serde(default)]
+	pub deny_list: Option<String>,
 }
 
 fn default_gas_buffer_bps() -> u32 {
@@ -822,6 +828,7 @@ mod tests {
 				commission_bps: 20,
 				rate_buffer_bps: 14,
 				monitoring_timeout_seconds: 28800,
+				deny_list: None,
 			},
 			admin: OperatorAdminConfig {
 				enabled: true,

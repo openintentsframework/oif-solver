@@ -1624,6 +1624,7 @@ mod tests {
 				commission_bps: 20,
 				rate_buffer_bps: 14,
 				monitoring_timeout_seconds: 60,
+				deny_list: None,
 			},
 			admin: OperatorAdminConfig {
 				enabled: true,
