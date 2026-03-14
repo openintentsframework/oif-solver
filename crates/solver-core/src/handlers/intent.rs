@@ -18,6 +18,7 @@ use solver_types::{
 	current_timestamp, truncate_id, with_0x_prefix, Address, DiscoveryEvent, Eip7683OrderData,
 	ExecutionDecision, ExecutionParams, Intent, OrderEvent, SolverEvent, StorageKey,
 };
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use thiserror::Error;
@@ -58,6 +59,9 @@ pub struct IntentHandler {
 	/// In-memory LRU cache for fast intent deduplication to prevent race conditions
 	/// Automatically evicts oldest entries when capacity is exceeded
 	processed_intents: Arc<RwLock<LruCache<String, ()>>>,
+	/// Denied Ethereum addresses (lowercase hex with 0x prefix).
+	/// Loaded once at startup from `config.solver.deny_list` if set.
+	denied_addresses: HashSet<String>,
 }
 
 impl IntentHandler {
@@ -72,7 +76,22 @@ impl IntentHandler {
 		token_manager: Arc<TokenManager>,
 		cost_profit_service: Arc<CostProfitService>,
 		dynamic_config: Arc<RwLock<Config>>,
+		static_config: &Config,
 	) -> Self {
+		let deny_list_configured = static_config.solver.deny_list.is_some();
+		let denied_addresses = match Self::load_deny_list(static_config.solver.deny_list.as_deref())
+		{
+			Ok(set) => {
+				if set.is_empty() && !deny_list_configured {
+					tracing::warn!("No deny list configured. Enforcement is disabled.");
+				}
+				set
+			},
+			Err(e) => {
+				// Fail closed: a configured deny list that can't be loaded is a hard error.
+				panic!("Deny list is configured but could not be loaded (fail-closed): {e}");
+			},
+		};
 		Self {
 			order_service,
 			storage,
@@ -86,7 +105,32 @@ impl IntentHandler {
 			processed_intents: Arc::new(RwLock::new(LruCache::new(
 				NonZeroUsize::new(10000).unwrap(),
 			))),
+			denied_addresses,
 		}
+	}
+
+	/// Load denied addresses from a JSON file.
+	///
+	/// - If no path is configured, returns `Ok(empty set)` (feature not in use).
+	/// - If a path is configured but the file is missing or malformed, returns `Err`
+	///   so the caller can fail closed.
+	/// All addresses are stored in lowercase.
+	fn load_deny_list(path: Option<&str>) -> Result<HashSet<String>, String> {
+		let path = match path {
+			Some(p) if !p.is_empty() => p,
+			_ => return Ok(HashSet::new()),
+		};
+		let content = std::fs::read_to_string(path)
+			.map_err(|e| format!("Failed to read deny list at '{path}': {e}"))?;
+		let addrs: Vec<String> = serde_json::from_str(&content)
+			.map_err(|e| format!("Failed to parse deny list at '{path}': {e}"))?;
+		let set: HashSet<String> = addrs.into_iter().map(|a| a.to_lowercase()).collect();
+		tracing::info!(
+			path = %path,
+			count = %set.len(),
+			"Deny list loaded"
+		);
+		Ok(set)
 	}
 
 	/// Handles a newly discovered intent.
@@ -129,6 +173,51 @@ impl IntentHandler {
 		if exists {
 			tracing::debug!("Duplicate intent detected in persistent storage, already processed");
 			return Ok(());
+		}
+
+		// Deny list check — runs before storing to avoid polluting the dedup cache
+		// with addresses that will always be rejected.
+		if !self.denied_addresses.is_empty() {
+			if let Ok(order_data) = serde_json::from_value::<Eip7683OrderData>(intent.data.clone())
+			{
+				// Check the order sender (user field).
+				let user_addr = order_data.user.to_lowercase();
+				if self.denied_addresses.contains(&user_addr) {
+					tracing::warn!(
+						intent_id = %intent.id,
+						address = %user_addr,
+						"Intent rejected: sender is on deny list"
+					);
+					self.event_bus
+						.publish(SolverEvent::Discovery(DiscoveryEvent::IntentRejected {
+							intent_id: intent.id,
+							reason: "Sender address is on deny list".to_string(),
+						}))
+						.ok();
+					return Ok(());
+				}
+				// Check every output recipient.
+				for output in &order_data.outputs {
+					// recipient is bytes32; the Ethereum address occupies the last 20 bytes.
+					let addr_bytes = &output.recipient[12..];
+					let hex_str: String = addr_bytes.iter().map(|b| format!("{b:02x}")).collect();
+					let recipient_addr = format!("0x{hex_str}");
+					if self.denied_addresses.contains(&recipient_addr) {
+						tracing::warn!(
+							intent_id = %intent.id,
+							address = %recipient_addr,
+							"Intent rejected: recipient is on deny list"
+						);
+						self.event_bus
+							.publish(SolverEvent::Discovery(DiscoveryEvent::IntentRejected {
+								intent_id: intent.id,
+								reason: "Recipient address is on deny list".to_string(),
+							}))
+							.ok();
+						return Ok(());
+					}
+				}
+			}
 		}
 
 		// Store intent immediately to prevent race conditions with duplicate discovery
@@ -484,8 +573,9 @@ mod tests {
 		Address(vec![0xab; 20])
 	}
 
-	fn create_test_config() -> Arc<RwLock<Config>> {
-		Arc::new(RwLock::new(ConfigBuilder::new().build()))
+	fn create_test_config() -> (Arc<RwLock<Config>>, Config) {
+		let config = ConfigBuilder::new().build();
+		(Arc::new(RwLock::new(config.clone())), config)
 	}
 
 	fn create_test_config_with_broadcaster() -> Arc<RwLock<Config>> {
@@ -844,7 +934,7 @@ mod tests {
 			))),
 		));
 		let cost_profit_service = create_mock_cost_profit_service();
-		let config = create_test_config();
+		let (config, static_config) = create_test_config();
 
 		let handler = IntentHandler::new(
 			order_service,
@@ -856,6 +946,7 @@ mod tests {
 			token_manager,
 			cost_profit_service,
 			config,
+			&static_config,
 		);
 
 		let result = handler.handle(intent).await;
@@ -895,7 +986,7 @@ mod tests {
 			))),
 		));
 		let cost_profit_service = create_mock_cost_profit_service();
-		let config = create_test_config();
+		let (config, static_config) = create_test_config();
 
 		let handler = IntentHandler::new(
 			order_service,
@@ -907,6 +998,7 @@ mod tests {
 			token_manager,
 			cost_profit_service,
 			config,
+			&static_config,
 		);
 
 		let result = handler.handle(intent).await;
@@ -963,7 +1055,7 @@ mod tests {
 				MockAccountInterface::new(),
 			))),
 		));
-		let config = create_test_config();
+		let (config, static_config) = create_test_config();
 
 		let cost_profit_service = create_mock_cost_profit_service();
 
@@ -977,6 +1069,7 @@ mod tests {
 			token_manager,
 			cost_profit_service,
 			config,
+			&static_config,
 		);
 
 		let result = handler.handle(intent).await;
@@ -1038,6 +1131,7 @@ mod tests {
 			))),
 		));
 		let config = create_test_config_with_broadcaster();
+		let static_config = config.read().await.clone();
 		let cost_profit_service = create_mock_cost_profit_service();
 
 		let handler = IntentHandler::new(
@@ -1050,6 +1144,7 @@ mod tests {
 			token_manager,
 			cost_profit_service,
 			config,
+			&static_config,
 		);
 
 		let result = handler.handle(intent).await;
@@ -1114,6 +1209,7 @@ mod tests {
 			))),
 		));
 		let config = create_test_config_with_hyperlane_min_window(500);
+		let static_config = config.read().await.clone();
 		let cost_profit_service = create_mock_cost_profit_service();
 
 		let handler = IntentHandler::new(
@@ -1126,6 +1222,7 @@ mod tests {
 			token_manager,
 			cost_profit_service,
 			config,
+			&static_config,
 		);
 
 		let result = handler.handle(intent).await;
@@ -1211,7 +1308,7 @@ mod tests {
 				MockAccountInterface::new(),
 			))),
 		));
-		let config = create_test_config();
+		let (config, static_config) = create_test_config();
 
 		let cost_profit_service = create_mock_cost_profit_service();
 
@@ -1225,6 +1322,7 @@ mod tests {
 			token_manager,
 			cost_profit_service,
 			config,
+			&static_config,
 		);
 
 		let result = handler.handle(intent).await;
@@ -1302,7 +1400,7 @@ mod tests {
 				MockAccountInterface::new(),
 			))),
 		));
-		let config = create_test_config();
+		let (config, static_config) = create_test_config();
 
 		let cost_profit_service = create_mock_cost_profit_service();
 
@@ -1316,6 +1414,7 @@ mod tests {
 			token_manager,
 			cost_profit_service,
 			config,
+			&static_config,
 		);
 
 		let result = handler.handle(intent).await;
@@ -1353,7 +1452,7 @@ mod tests {
 				MockAccountInterface::new(),
 			))),
 		));
-		let config = create_test_config();
+		let (config, static_config) = create_test_config();
 
 		let cost_profit_service = create_mock_cost_profit_service();
 
@@ -1367,6 +1466,7 @@ mod tests {
 			token_manager,
 			cost_profit_service,
 			config,
+			&static_config,
 		);
 
 		let result = handler.handle(intent).await;
@@ -1442,7 +1542,7 @@ mod tests {
 				MockAccountInterface::new(),
 			))),
 		));
-		let config = create_test_config();
+		let (config, static_config) = create_test_config();
 
 		// Subscribe to events before creating handler
 		let mut receiver = event_bus.subscribe();
@@ -1459,6 +1559,7 @@ mod tests {
 			token_manager,
 			cost_profit_service,
 			config,
+			&static_config,
 		);
 
 		// Handle intent and check events
@@ -1484,5 +1585,99 @@ mod tests {
 			},
 			_ => panic!("Expected Preparing event"),
 		}
+	}
+
+	// ── Deny-list unit tests ────────────────────────────────────────────
+
+	#[test]
+	fn test_load_deny_list_no_path_returns_empty() {
+		let result = IntentHandler::load_deny_list(None);
+		assert!(result.is_ok());
+		assert!(result.unwrap().is_empty());
+	}
+
+	#[test]
+	fn test_load_deny_list_empty_path_returns_empty() {
+		let result = IntentHandler::load_deny_list(Some(""));
+		assert!(result.is_ok());
+		assert!(result.unwrap().is_empty());
+	}
+
+	#[test]
+	fn test_load_deny_list_valid_file() {
+		let dir = tempfile::tempdir().unwrap();
+		let file_path = dir.path().join("deny.json");
+		std::fs::write(
+			&file_path,
+			r#"["0xABC123def456789012345678901234567890abcd","0x1111111111111111111111111111111111111111"]"#,
+		)
+		.unwrap();
+
+		let result =
+			IntentHandler::load_deny_list(Some(file_path.to_str().unwrap()));
+		assert!(result.is_ok());
+		let set = result.unwrap();
+		assert_eq!(set.len(), 2);
+		// All addresses should be lowercased
+		assert!(set.contains("0xabc123def456789012345678901234567890abcd"));
+		assert!(set.contains("0x1111111111111111111111111111111111111111"));
+	}
+
+	#[test]
+	fn test_load_deny_list_missing_file_returns_error() {
+		let result =
+			IntentHandler::load_deny_list(Some("/nonexistent/path/deny.json"));
+		assert!(result.is_err());
+		assert!(result.unwrap_err().contains("Failed to read deny list"));
+	}
+
+	#[test]
+	fn test_load_deny_list_malformed_json_returns_error() {
+		let dir = tempfile::tempdir().unwrap();
+		let file_path = dir.path().join("bad.json");
+		std::fs::write(&file_path, "not valid json").unwrap();
+
+		let result =
+			IntentHandler::load_deny_list(Some(file_path.to_str().unwrap()));
+		assert!(result.is_err());
+		assert!(result.unwrap_err().contains("Failed to parse deny list"));
+	}
+
+	#[test]
+	fn test_denied_addresses_sender_hit() {
+		// Verify that a sender address present in the deny list is detected.
+		let dir = tempfile::tempdir().unwrap();
+		let file_path = dir.path().join("deny.json");
+		let denied_addr = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+		std::fs::write(&file_path, format!(r#"["{denied_addr}"]"#)).unwrap();
+
+		let set =
+			IntentHandler::load_deny_list(Some(file_path.to_str().unwrap())).unwrap();
+		assert!(set.contains(denied_addr));
+	}
+
+	#[test]
+	fn test_denied_addresses_recipient_hit() {
+		// Simulate recipient extraction: bytes32 where the last 20 bytes are the address.
+		let dir = tempfile::tempdir().unwrap();
+		let file_path = dir.path().join("deny.json");
+		let denied_addr = "0x1234567890abcdef1234567890abcdef12345678";
+		std::fs::write(&file_path, format!(r#"["{denied_addr}"]"#)).unwrap();
+
+		let set =
+			IntentHandler::load_deny_list(Some(file_path.to_str().unwrap())).unwrap();
+
+		// Construct a bytes32 recipient with the address in the last 20 bytes
+		let mut recipient = [0u8; 32];
+		let addr_bytes =
+			hex::decode("1234567890abcdef1234567890abcdef12345678").unwrap();
+		recipient[12..].copy_from_slice(&addr_bytes);
+
+		// Extract using the same logic as the handler
+		let addr_bytes = &recipient[12..];
+		let hex_str: String = addr_bytes.iter().map(|b| format!("{b:02x}")).collect();
+		let recipient_addr = format!("0x{hex_str}");
+
+		assert!(set.contains(&recipient_addr));
 	}
 }

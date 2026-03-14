@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 
+[features]
+testing = ["mockall"]
+
 [dependencies]
 alloy-consensus = { workspace = true }
 alloy-network = { workspace = true }
@@ -27,6 +30,3 @@ solver-types = { path = "../solver-types" }
 thiserror = "2.0.17"
 tokio = { version = "1.0", features = ["rt-multi-thread"] }
 tracing = "0.1"
-
-[features]
-testing = ["mockall"]

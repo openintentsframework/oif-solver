@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 
+[features]
+testing = ["mockall"]
+
 [dependencies]
 alloy-primitives = { workspace = true }
 alloy-provider = { workspace = true }
@@ -23,9 +26,6 @@ solver-types = { path = "../solver-types" }
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["rt-multi-thread", "sync"] }
 tracing = "0.1"
-
-[features]
-testing = ["mockall"]
 
 [dev-dependencies]
 wiremock = "0.5"
