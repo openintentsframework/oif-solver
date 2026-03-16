@@ -1023,9 +1023,7 @@ impl QuoteParsable for Eip7683OrderData {
 			pre_claim_tx_hash: None,
 			claim_tx_hash: None,
 			fill_proof: None,
-			// Propagate the settlement binding from the quote so that
-			// estimation orders use the same settlement as real orders.
-			settlement_name: quote.settlement_name.clone(),
+			settlement_name: None,
 		}
 	}
 }

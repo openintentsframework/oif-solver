@@ -1,6 +1,23 @@
 //! Storage-related types for the solver system.
 
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+
+/// Internal quote record persisted in storage.
+///
+/// This keeps quote-specific runtime metadata out of the external API types
+/// while still allowing quote acceptance and cost lookup to recover the
+/// original settlement binding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredQuote {
+	/// The externally visible quote data.
+	pub quote: crate::Quote,
+	/// The associated cost context from quote generation.
+	pub cost_context: crate::costs::CostContext,
+	/// Settlement implementation name selected at quote time.
+	#[serde(skip_serializing_if = "Option::is_none", default)]
+	pub settlement_name: Option<String>,
+}
 
 /// Storage keys for different data collections.
 ///
