@@ -1515,7 +1515,7 @@ mod tests {
 		let witness_user = "0x1111111111111111111111111111111111111111";
 		let secret = SecretKey::from_byte_array([0x31u8; 32]).expect("valid secret");
 		let sponsor = address_from_secret(&secret);
-		assert_ne!(format!("{:#x}", sponsor), witness_user);
+		assert_ne!(format!("{sponsor:#x}"), witness_user);
 
 		let request = sample_permit2_request_with_witness_user(witness_user, &secret);
 		let payload = to_value(&request).expect("serialize request");
