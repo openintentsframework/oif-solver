@@ -1613,8 +1613,7 @@ mod tests {
 		)
 		.unwrap();
 
-		let result =
-			IntentHandler::load_deny_list(Some(file_path.to_str().unwrap()));
+		let result = IntentHandler::load_deny_list(Some(file_path.to_str().unwrap()));
 		assert!(result.is_ok());
 		let set = result.unwrap();
 		assert_eq!(set.len(), 2);
@@ -1625,8 +1624,7 @@ mod tests {
 
 	#[test]
 	fn test_load_deny_list_missing_file_returns_error() {
-		let result =
-			IntentHandler::load_deny_list(Some("/nonexistent/path/deny.json"));
+		let result = IntentHandler::load_deny_list(Some("/nonexistent/path/deny.json"));
 		assert!(result.is_err());
 		assert!(result.unwrap_err().contains("Failed to read deny list"));
 	}
@@ -1637,8 +1635,7 @@ mod tests {
 		let file_path = dir.path().join("bad.json");
 		std::fs::write(&file_path, "not valid json").unwrap();
 
-		let result =
-			IntentHandler::load_deny_list(Some(file_path.to_str().unwrap()));
+		let result = IntentHandler::load_deny_list(Some(file_path.to_str().unwrap()));
 		assert!(result.is_err());
 		assert!(result.unwrap_err().contains("Failed to parse deny list"));
 	}
@@ -1651,8 +1648,7 @@ mod tests {
 		let denied_addr = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
 		std::fs::write(&file_path, format!(r#"["{denied_addr}"]"#)).unwrap();
 
-		let set =
-			IntentHandler::load_deny_list(Some(file_path.to_str().unwrap())).unwrap();
+		let set = IntentHandler::load_deny_list(Some(file_path.to_str().unwrap())).unwrap();
 		assert!(set.contains(denied_addr));
 	}
 
@@ -1664,13 +1660,11 @@ mod tests {
 		let denied_addr = "0x1234567890abcdef1234567890abcdef12345678";
 		std::fs::write(&file_path, format!(r#"["{denied_addr}"]"#)).unwrap();
 
-		let set =
-			IntentHandler::load_deny_list(Some(file_path.to_str().unwrap())).unwrap();
+		let set = IntentHandler::load_deny_list(Some(file_path.to_str().unwrap())).unwrap();
 
 		// Construct a bytes32 recipient with the address in the last 20 bytes
 		let mut recipient = [0u8; 32];
-		let addr_bytes =
-			hex::decode("1234567890abcdef1234567890abcdef12345678").unwrap();
+		let addr_bytes = hex::decode("1234567890abcdef1234567890abcdef12345678").unwrap();
 		recipient[12..].copy_from_slice(&addr_bytes);
 
 		// Extract using the same logic as the handler
