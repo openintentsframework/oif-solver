@@ -114,7 +114,7 @@ impl IntentHandler {
 	/// - If no path is configured, returns `Ok(empty set)` (feature not in use).
 	/// - If a path is configured but the file is missing or malformed, returns `Err`
 	///   so the caller can fail closed.
-	/// All addresses are stored in lowercase.
+	///   All addresses are stored in lowercase.
 	fn load_deny_list(path: Option<&str>) -> Result<HashSet<String>, String> {
 		let path = match path {
 			Some(p) if !p.is_empty() => p,
