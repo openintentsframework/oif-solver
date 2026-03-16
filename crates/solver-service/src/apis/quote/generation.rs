@@ -1642,6 +1642,7 @@ impl QuoteGenerator {
 				{"name": "context", "type": "bytes"}
 			],
 			"Permit2Witness": [
+				{"name": "user", "type": "address"},
 				{"name": "expires", "type": "uint32"},
 				{"name": "inputOracle", "type": "address"},
 				{"name": "outputs", "type": "MandateOutput[]"}
@@ -3661,6 +3662,13 @@ mod tests {
 			Ok(message) => {
 				assert!(message.is_object());
 				let message_obj = message.as_object().unwrap();
+				let expected_user = format!(
+					"0x{:x}",
+					request
+						.user
+						.ethereum_address()
+						.expect("quote request should contain an ethereum user")
+				);
 
 				// Verify required Permit2 message fields
 				assert!(message_obj.contains_key("permitted"));
@@ -3668,6 +3676,14 @@ mod tests {
 				assert!(message_obj.contains_key("nonce"));
 				assert!(message_obj.contains_key("deadline"));
 				assert!(message_obj.contains_key("witness"));
+				assert!(!message_obj.contains_key("user"));
+				assert_eq!(
+					message_obj
+						.get("witness")
+						.and_then(|w| w.get("user"))
+						.and_then(|u| u.as_str()),
+					Some(expected_user.as_str())
+				);
 			},
 			Err(e) => {
 				// Expected if permit2 module dependencies are missing

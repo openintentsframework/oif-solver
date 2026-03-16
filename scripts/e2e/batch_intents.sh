@@ -281,7 +281,7 @@ process_intent() {
     local mandate_output_type="MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)"
     local mandate_output_type_hash=$(cast keccak "$mandate_output_type")
     
-    local permit2_witness_type="Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)${mandate_output_type}"
+    local permit2_witness_type="Permit2Witness(address user,uint32 expires,address inputOracle,MandateOutput[] outputs)${mandate_output_type}"
     local permit2_witness_type_hash=$(cast keccak "$permit2_witness_type")
     
     local token_permissions_type="TokenPermissions(address token,uint256 amount)"
@@ -307,8 +307,9 @@ process_intent() {
     local mandate_output_hash=$(cast keccak "$mandate_output_encoded")
     local outputs_hash=$(cast keccak "$mandate_output_hash")
     
-    local permit2_witness_encoded=$(cast abi-encode "f(bytes32,uint32,address,bytes32)" \
+    local permit2_witness_encoded=$(cast abi-encode "f(bytes32,address,uint32,address,bytes32)" \
         "$permit2_witness_type_hash" \
+        "$USER_ADDR" \
         "$expiry" \
         "$oracle" \
         "$outputs_hash")
@@ -321,7 +322,7 @@ process_intent() {
     local token_perm_hash=$(cast keccak "$token_perm_encoded")
     
     # Final hash
-    local witness_type_string="Permit2Witness witness)${mandate_output_type}${token_permissions_type}Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)"
+    local witness_type_string="Permit2Witness witness)${mandate_output_type}${token_permissions_type}Permit2Witness(address user,uint32 expires,address inputOracle,MandateOutput[] outputs)"
     local permit_batch_witness_string="PermitBatchWitnessTransferFrom(TokenPermissions[] permitted,address spender,uint256 nonce,uint256 deadline,${witness_type_string}"
     local permit_batch_witness_type_hash=$(cast keccak "$permit_batch_witness_string")
     

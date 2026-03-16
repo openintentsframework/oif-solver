@@ -225,9 +225,16 @@ pub fn build_permit2_batch_witness_digest(
 
 	let outputs_hash = keccak256(mandate_output_hash.as_slice());
 
+	// Resolve user address for the witness
+	let user_address = request
+		.user
+		.ethereum_address()
+		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid user address: {e}")))?;
+
 	// Permit2Witness hash
 	let mut enc = Eip712AbiEncoder::new();
 	enc.push_b256(&permit2_witness_type_hash);
+	enc.push_address(&user_address);
 	enc.push_u32(expires_secs);
 	enc.push_address(&input_oracle);
 	enc.push_b256(&outputs_hash);
@@ -282,6 +289,7 @@ pub fn build_permit2_batch_witness_digest(
 		"nonce": nonce_ms.to_string(),
 		"deadline": deadline_secs.to_string(),
 		"witness": {
+			"user": format!("0x{:x}", user_address),
 			"expires": expires_secs,
 			"inputOracle": format!("0x{:x}", input_oracle),
 			"outputs": [{
