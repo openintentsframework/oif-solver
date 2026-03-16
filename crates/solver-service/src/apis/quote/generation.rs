@@ -91,7 +91,7 @@ impl QuoteGenerator {
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
-	) -> Result<Vec<Quote>, QuoteError> {
+	) -> Result<Vec<(Quote, Option<String>)>, QuoteError> {
 		let mut quotes = Vec::new();
 		for input in &request.intent.inputs {
 			let order_input: OrderInput = input.try_into()?;
@@ -99,17 +99,17 @@ impl QuoteGenerator {
 				.custody_strategy
 				.decide_custody(&order_input, request.intent.origin_submission.as_ref())
 				.await?;
-			if let Ok(quote) = self
+			if let Ok(result) = self
 				.generate_quote_for_settlement(request, config, &custody_decision)
 				.await
 			{
-				quotes.push(quote);
+				quotes.push(result);
 			}
 		}
 		if quotes.is_empty() {
 			return Err(QuoteError::InsufficientLiquidity);
 		}
-		self.sort_quotes_by_preference(&mut quotes, &request.intent.preference);
+		self.sort_quotes_by_preference_pairs(&mut quotes, &request.intent.preference);
 		Ok(quotes)
 	}
 
@@ -120,7 +120,7 @@ impl QuoteGenerator {
 		context: &ValidatedQuoteContext,
 		cost_context: &CostContext,
 		config: &Config,
-	) -> Result<Vec<Quote>, QuoteError> {
+	) -> Result<Vec<(Quote, Option<String>)>, QuoteError> {
 		// Build a new request with swap amounts and cost adjustments from CostContext
 		let adjusted_request = self.build_cost_adjusted_request(request, context, cost_context)?;
 
@@ -344,7 +344,7 @@ impl QuoteGenerator {
 		request: &GetQuoteRequest,
 		config: &Config,
 		custody_decision: &CustodyDecision,
-	) -> Result<Quote, QuoteError> {
+	) -> Result<(Quote, Option<String>), QuoteError> {
 		let quote_id = Uuid::new_v4().to_string();
 		let (order, settlement_name) = match custody_decision {
 			CustodyDecision::ResourceLock { lock } => {
@@ -375,7 +375,7 @@ impl QuoteGenerator {
 		// Get partial fill preference from request or default to false
 		let partial_fill = request.intent.partial_fill.unwrap_or(false);
 
-		Ok(Quote {
+		let quote = Quote {
 			order: order.clone(),
 			failure_handling,
 			partial_fill,
@@ -384,8 +384,9 @@ impl QuoteGenerator {
 			quote_id,
 			provider: Some("oif-solver".to_string()),
 			preview: QuotePreview::from_order_and_user(&order, &request.user),
-			settlement_name,
-		})
+		};
+
+		Ok((quote, settlement_name))
 	}
 
 	async fn generate_resource_lock_order(
@@ -1532,13 +1533,13 @@ impl QuoteGenerator {
 		}
 	}
 
-	fn sort_quotes_by_preference(
+	fn sort_quotes_by_preference_pairs(
 		&self,
-		quotes: &mut [Quote],
+		quotes: &mut [(Quote, Option<String>)],
 		preference: &Option<QuotePreference>,
 	) {
 		match preference {
-			Some(QuotePreference::Speed) => quotes.sort_by(|a, b| match (a.eta, b.eta) {
+			Some(QuotePreference::Speed) => quotes.sort_by(|(a, _), (b, _)| match (a.eta, b.eta) {
 				(Some(eta_a), Some(eta_b)) => eta_a.cmp(&eta_b),
 				(Some(_), None) => std::cmp::Ordering::Less,
 				(None, Some(_)) => std::cmp::Ordering::Greater,
@@ -2108,10 +2109,10 @@ mod tests {
 
 		// Should succeed since we have properly configured oracles
 		assert!(result.is_ok());
-		let quotes = result.unwrap();
-		assert!(!quotes.is_empty());
+		let pairs = result.unwrap();
+		assert!(!pairs.is_empty());
 
-		let quote = &quotes[0];
+		let quote = &pairs[0].0;
 		assert_eq!(quote.provider, Some("oif-solver".to_string()));
 		assert!(quote.valid_until > 0);
 		assert!(quote.eta.is_some());
@@ -2367,7 +2368,7 @@ mod tests {
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 
-		let mut quotes = vec![
+		let quotes = vec![
 			Quote {
 				order: OifOrder::OifEscrowV0 {
 					payload: OrderPayload {
@@ -2388,7 +2389,6 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
-				settlement_name: None,
 			},
 			Quote {
 				order: OifOrder::OifEscrowV0 {
@@ -2410,7 +2410,6 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
-				settlement_name: None,
 			},
 			Quote {
 				order: OifOrder::OifEscrowV0 {
@@ -2432,16 +2431,17 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
-				settlement_name: None,
 			},
 		];
 
-		generator.sort_quotes_by_preference(&mut quotes, &Some(QuotePreference::Speed));
+		let mut pairs: Vec<(Quote, Option<String>)> =
+			quotes.into_iter().map(|q| (q, None)).collect();
+		generator.sort_quotes_by_preference_pairs(&mut pairs, &Some(QuotePreference::Speed));
 
 		// Should be sorted by ETA ascending (fastest first)
-		assert_eq!(quotes[0].eta, Some(100));
-		assert_eq!(quotes[1].eta, Some(200));
-		assert_eq!(quotes[2].eta, None); // None should be last
+		assert_eq!(pairs[0].0.eta, Some(100));
+		assert_eq!(pairs[1].0.eta, Some(200));
+		assert_eq!(pairs[2].0.eta, None); // None should be last
 	}
 
 	#[test]
@@ -2451,7 +2451,7 @@ mod tests {
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 
-		let mut quotes = vec![
+		let quotes = vec![
 			Quote {
 				order: OifOrder::OifEscrowV0 {
 					payload: OrderPayload {
@@ -2472,7 +2472,6 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
-				settlement_name: None,
 			},
 			Quote {
 				order: OifOrder::OifEscrowV0 {
@@ -2494,28 +2493,31 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
-				settlement_name: None,
 			},
 		];
 
-		let original_order = quotes.clone();
+		let mut pairs: Vec<(Quote, Option<String>)> =
+			quotes.into_iter().map(|q| (q, None)).collect();
+		let original_order: Vec<String> = pairs.iter().map(|(q, _)| q.quote_id.clone()).collect();
 
 		// Test that other preferences don't change order
-		generator.sort_quotes_by_preference(&mut quotes, &Some(QuotePreference::Price));
-		assert_eq!(quotes[0].quote_id, original_order[0].quote_id);
-		assert_eq!(quotes[1].quote_id, original_order[1].quote_id);
+		generator.sort_quotes_by_preference_pairs(&mut pairs, &Some(QuotePreference::Price));
+		assert_eq!(pairs[0].0.quote_id, original_order[0]);
+		assert_eq!(pairs[1].0.quote_id, original_order[1]);
 
-		generator.sort_quotes_by_preference(&mut quotes, &Some(QuotePreference::TrustMinimization));
-		assert_eq!(quotes[0].quote_id, original_order[0].quote_id);
-		assert_eq!(quotes[1].quote_id, original_order[1].quote_id);
+		generator
+			.sort_quotes_by_preference_pairs(&mut pairs, &Some(QuotePreference::TrustMinimization));
+		assert_eq!(pairs[0].0.quote_id, original_order[0]);
+		assert_eq!(pairs[1].0.quote_id, original_order[1]);
 
-		generator.sort_quotes_by_preference(&mut quotes, &Some(QuotePreference::InputPriority));
-		assert_eq!(quotes[0].quote_id, original_order[0].quote_id);
-		assert_eq!(quotes[1].quote_id, original_order[1].quote_id);
+		generator
+			.sort_quotes_by_preference_pairs(&mut pairs, &Some(QuotePreference::InputPriority));
+		assert_eq!(pairs[0].0.quote_id, original_order[0]);
+		assert_eq!(pairs[1].0.quote_id, original_order[1]);
 
-		generator.sort_quotes_by_preference(&mut quotes, &None);
-		assert_eq!(quotes[0].quote_id, original_order[0].quote_id);
-		assert_eq!(quotes[1].quote_id, original_order[1].quote_id);
+		generator.sort_quotes_by_preference_pairs(&mut pairs, &None);
+		assert_eq!(pairs[0].0.quote_id, original_order[0]);
+		assert_eq!(pairs[1].0.quote_id, original_order[1]);
 	}
 
 	#[test]
@@ -2557,7 +2559,7 @@ mod tests {
 			.await;
 
 		match result {
-			Ok(quote) => {
+			Ok((quote, _settlement_name)) => {
 				assert!(!quote.quote_id.is_empty());
 				assert_eq!(quote.provider, Some("oif-solver".to_string()));
 				assert!(quote.valid_until > 0);
@@ -2595,7 +2597,7 @@ mod tests {
 			.await;
 
 		match result {
-			Ok(quote) => {
+			Ok((quote, _settlement_name)) => {
 				assert!(!quote.quote_id.is_empty());
 				assert_eq!(quote.provider, Some("oif-solver".to_string()));
 				assert!(quote.valid_until > 0);
@@ -3504,8 +3506,8 @@ mod tests {
 		let result = generator.generate_quotes(&request, &config).await;
 
 		match result {
-			Ok(quotes) => {
-				let quote = &quotes[0];
+			Ok(pairs) => {
+				let quote = &pairs[0].0;
 				assert_eq!(quote.failure_handling, FailureHandlingMode::RefundClaim);
 				assert!(quote.partial_fill);
 			},
@@ -3530,8 +3532,8 @@ mod tests {
 		let result = generator.generate_quotes(&request, &config).await;
 
 		match result {
-			Ok(quotes) => {
-				let quote = &quotes[0];
+			Ok(pairs) => {
+				let quote = &pairs[0].0;
 				assert_eq!(quote.failure_handling, FailureHandlingMode::RefundClaim);
 			},
 			Err(_) => {
@@ -3575,8 +3577,8 @@ mod tests {
 		let result = generator.generate_quotes(&request, &config).await;
 
 		match result {
-			Ok(quotes) => {
-				let quote = &quotes[0];
+			Ok(pairs) => {
+				let quote = &pairs[0].0;
 				// Should use min_valid_until for expiry calculation
 				assert!(quote.valid_until >= 1234567890);
 			},

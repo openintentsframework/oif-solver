@@ -76,8 +76,7 @@ pub use validation::QuoteValidator;
 use solver_config::Config;
 use solver_core::SolverEngine;
 use solver_types::{
-	CostContext, GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, QuoteWithCostContext,
-	StorageKey,
+	CostContext, GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, StorageKey, StoredQuote,
 };
 
 use std::time::Duration;
@@ -146,13 +145,14 @@ pub async fn process_quote_request(
 	let delivery_service = solver.delivery();
 	let quote_generator = QuoteGenerator::new(settlement_service.clone(), delivery_service.clone());
 
-	let quotes = quote_generator
+	let quote_pairs = quote_generator
 		.generate_quotes_with_costs(&request, &validated_context, &cost_context, config)
 		.await?;
 
-	// Persist quotes and cost contexts
-	store_quotes(solver, &quotes, &cost_context).await;
+	// Persist quotes and cost contexts (including settlement_name internally)
+	store_quotes(solver, &quote_pairs, &cost_context).await;
 
+	let quotes: Vec<Quote> = quote_pairs.into_iter().map(|(q, _)| q).collect();
 	info!("Generated and stored {} quote options", quotes.len());
 
 	Ok(GetQuoteResponse { quotes })
@@ -160,16 +160,20 @@ pub async fn process_quote_request(
 
 /// Stores generated quotes with their cost contexts.
 ///
-/// Each quote is stored together with its cost context as a QuoteWithCostContext structure.
+/// Each quote is stored together with its cost context as a StoredQuote record.
 /// Storage errors are logged but do not fail the request.
-async fn store_quotes(solver: &SolverEngine, quotes: &[Quote], cost_context: &CostContext) {
+async fn store_quotes(
+	solver: &SolverEngine,
+	quotes: &[(Quote, Option<String>)],
+	cost_context: &CostContext,
+) {
 	let storage = solver.storage();
 	let now = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
 		.unwrap_or_default()
 		.as_secs();
 
-	for quote in quotes {
+	for (quote, settlement_name) in quotes {
 		// Calculate TTL from valid_until timestamp
 		let ttl = if quote.valid_until > now {
 			Duration::from_secs(quote.valid_until - now)
@@ -179,9 +183,10 @@ async fn store_quotes(solver: &SolverEngine, quotes: &[Quote], cost_context: &Co
 		};
 
 		// Create combined structure with quote and cost context
-		let quote_with_context = QuoteWithCostContext {
+		let quote_with_context = StoredQuote {
 			quote: quote.clone(),
 			cost_context: cost_context.clone(),
+			settlement_name: settlement_name.clone(),
 		};
 
 		// Store the combined structure in a single I/O operation
@@ -220,7 +225,7 @@ pub async fn get_quote_by_id(quote_id: &str, solver: &SolverEngine) -> Result<Qu
 	let storage = solver.storage();
 
 	match storage
-		.retrieve::<QuoteWithCostContext>(StorageKey::Quotes.as_str(), quote_id)
+		.retrieve::<StoredQuote>(StorageKey::Quotes.as_str(), quote_id)
 		.await
 	{
 		Ok(quote_with_context) => {
@@ -272,8 +277,8 @@ mod tests {
 	use solver_types::{
 		current_timestamp, oif_versions, Address, CostBreakdown, CostContext, FailureHandlingMode,
 		GetQuoteRequest, IntentRequest, IntentType, InteropAddress, OifOrder, OrderPayload, Quote,
-		QuoteError, QuoteInput, QuoteOutput, QuotePreference, QuotePreview, QuoteWithCostContext,
-		SignatureType, StorageKey, SwapType,
+		QuoteError, QuoteInput, QuoteOutput, QuotePreference, QuotePreview, SignatureType,
+		StorageKey, StoredQuote, SwapType,
 	};
 	use std::collections::HashMap;
 	use std::sync::Arc;
@@ -456,7 +461,6 @@ mod tests {
 				inputs: vec![],
 				outputs: vec![],
 			},
-			settlement_name: None,
 		}
 	}
 
@@ -486,18 +490,19 @@ mod tests {
 		}
 	}
 
-	/// Creates a test quote with cost context
-	fn create_test_quote_with_context() -> QuoteWithCostContext {
-		QuoteWithCostContext {
+	/// Creates a test stored quote record.
+	fn create_test_stored_quote() -> StoredQuote {
+		StoredQuote {
 			quote: create_test_quote(),
 			cost_context: create_test_cost_context(),
+			settlement_name: None,
 		}
 	}
 
 	#[tokio::test]
 	async fn test_store_quotes_success() {
 		let solver = create_test_solver_engine();
-		let quotes = vec![create_test_quote()];
+		let quotes = vec![(create_test_quote(), None)];
 		let cost_context = create_test_cost_context();
 
 		// Test the actual store_quotes function
@@ -516,7 +521,7 @@ mod tests {
 		let mut quote = create_test_quote();
 		// Set quote to be already expired
 		quote.valid_until = current_timestamp() - 100;
-		let quotes = vec![quote];
+		let quotes = vec![(quote, None)];
 		let cost_context = create_test_cost_context();
 
 		// Test the actual store_quotes function with expired quote
@@ -532,7 +537,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_get_quote_by_id_success() {
 		let solver = create_test_solver_engine();
-		let quote_with_context = create_test_quote_with_context();
+		let stored_quote = create_test_stored_quote();
 
 		// Store the quote first using direct storage access (setup)
 		solver
@@ -540,7 +545,7 @@ mod tests {
 			.store(
 				StorageKey::Quotes.as_str(),
 				TEST_QUOTE_ID,
-				&quote_with_context,
+				&stored_quote,
 				None,
 			)
 			.await
@@ -568,7 +573,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_quote_exists_true() {
 		let solver = create_test_solver_engine();
-		let quote_with_context = create_test_quote_with_context();
+		let stored_quote = create_test_stored_quote();
 
 		// Store the quote first using direct storage access (setup)
 		solver
@@ -576,7 +581,7 @@ mod tests {
 			.store(
 				StorageKey::Quotes.as_str(),
 				TEST_QUOTE_ID,
-				&quote_with_context,
+				&stored_quote,
 				None,
 			)
 			.await
@@ -599,12 +604,12 @@ mod tests {
 	}
 
 	#[test]
-	fn test_quote_with_cost_context_serialization() {
-		let quote_with_context = create_test_quote_with_context();
+	fn test_stored_quote_serialization() {
+		let stored_quote = create_test_stored_quote();
 
 		// Test that the structure can be serialized/deserialized
-		let serialized = serde_json::to_string(&quote_with_context).expect("Should serialize");
-		let deserialized: QuoteWithCostContext =
+		let serialized = serde_json::to_string(&stored_quote).expect("Should serialize");
+		let deserialized: StoredQuote =
 			serde_json::from_str(&serialized).expect("Should deserialize");
 
 		assert_eq!(deserialized.quote.quote_id, TEST_QUOTE_ID);
