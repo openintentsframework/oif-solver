@@ -87,17 +87,17 @@ impl CostProfitService {
 
 	/// Retrieves a stored cost context by quote ID.
 	///
-	/// This function looks up the QuoteWithCostContext and extracts the cost context.
+	/// This function looks up the StoredQuote and extracts the cost context.
 	/// Quotes and their contexts are automatically expired based on their TTL.
 	pub async fn get_cost_context_by_quote_id(
 		&self,
 		quote_id: &str,
 	) -> Result<CostContext, CostProfitError> {
-		use solver_types::QuoteWithCostContext;
+		use solver_types::StoredQuote;
 
 		match self
 			.storage_service
-			.retrieve::<QuoteWithCostContext>(StorageKey::Quotes.as_str(), quote_id)
+			.retrieve::<StoredQuote>(StorageKey::Quotes.as_str(), quote_id)
 			.await
 		{
 			Ok(quote_with_context) => {
@@ -1573,8 +1573,8 @@ mod tests {
 		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
 		ChainSettlerInfo, CostContext, Eip7683OrderData, FailureHandlingMode, GetQuoteRequest,
 		IntentRequest, IntentType, InteropAddress, NetworksConfig, OifOrder, OrderPayload,
-		OrderStatus, Quote, QuoteInput, QuoteOutput, QuotePreference, QuoteWithCostContext,
-		SignatureType, SwapType, ValidatedQuoteContext,
+		OrderStatus, Quote, QuoteInput, QuoteOutput, QuotePreference, SignatureType, StoredQuote,
+		SwapType, ValidatedQuoteContext,
 	};
 	use std::collections::HashMap;
 	use std::str::FromStr;
@@ -1744,8 +1744,8 @@ mod tests {
 		}
 	}
 
-	fn create_test_quote_with_cost_context() -> QuoteWithCostContext {
-		QuoteWithCostContext {
+	fn create_test_stored_quote() -> StoredQuote {
+		StoredQuote {
 			quote: Quote {
 				order: OifOrder::OifEscrowV0 {
 					payload: OrderPayload {
@@ -1766,7 +1766,6 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
-				settlement_name: None,
 			},
 			cost_context: CostContext {
 				cost_breakdown: create_test_cost_breakdown(),
@@ -1778,6 +1777,7 @@ mod tests {
 				swap_amounts: HashMap::new(),
 				adjusted_amounts: HashMap::new(),
 			},
+			settlement_name: None,
 		}
 	}
 
@@ -1823,15 +1823,15 @@ mod tests {
 	async fn test_get_cost_context_by_quote_id_success() {
 		// Arrange
 		let mut mock_storage = MockStorageInterface::new();
-		let test_quote_with_context = create_test_quote_with_cost_context();
-		let expected_cost_context = test_quote_with_context.cost_context.clone();
+		let test_stored_quote = create_test_stored_quote();
+		let expected_cost_context = test_stored_quote.cost_context.clone();
 
 		mock_storage
 			.expect_get_bytes()
 			.with(eq("quotes:test_quote_123"))
 			.times(1)
 			.returning(move |_| {
-				let serialized = serde_json::to_vec(&test_quote_with_context).unwrap();
+				let serialized = serde_json::to_vec(&test_stored_quote).unwrap();
 				Box::pin(async move { Ok(serialized) })
 			});
 
@@ -2509,7 +2509,7 @@ mod tests {
 	async fn test_validate_profitability_exact_input_with_context() {
 		// Arrange
 		let mut mock_storage = MockStorageInterface::new();
-		let test_quote_with_context = QuoteWithCostContext {
+		let test_stored_quote = StoredQuote {
 			quote: Quote {
 				order: OifOrder::OifEscrowV0 {
 					payload: OrderPayload {
@@ -2530,16 +2530,16 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
-				settlement_name: None,
 			},
 			cost_context: create_cost_context_with_swap_type(SwapType::ExactInput),
+			settlement_name: None,
 		};
 
 		mock_storage
 			.expect_get_bytes()
 			.with(eq("quotes:test_quote_exact_input"))
 			.returning(move |_| {
-				let serialized = serde_json::to_vec(&test_quote_with_context).unwrap();
+				let serialized = serde_json::to_vec(&test_stored_quote).unwrap();
 				Box::pin(async move { Ok(serialized) })
 			});
 
@@ -2573,7 +2573,7 @@ mod tests {
 	async fn test_validate_profitability_exact_output_with_context() {
 		// Arrange
 		let mut mock_storage = MockStorageInterface::new();
-		let test_quote_with_context = QuoteWithCostContext {
+		let test_stored_quote = StoredQuote {
 			quote: Quote {
 				order: OifOrder::OifEscrowV0 {
 					payload: OrderPayload {
@@ -2594,16 +2594,16 @@ mod tests {
 					inputs: vec![],
 					outputs: vec![],
 				},
-				settlement_name: None,
 			},
 			cost_context: create_cost_context_with_swap_type(SwapType::ExactOutput),
+			settlement_name: None,
 		};
 
 		mock_storage
 			.expect_get_bytes()
 			.with(eq("quotes:test_quote_exact_output"))
 			.returning(move |_| {
-				let serialized = serde_json::to_vec(&test_quote_with_context).unwrap();
+				let serialized = serde_json::to_vec(&test_stored_quote).unwrap();
 				Box::pin(async move { Ok(serialized) })
 			});
 

@@ -323,8 +323,8 @@ pub async fn start_server(
 	// Build the router with /api/v1 base path and quote endpoint
 	let mut api_routes = Router::new()
 		.route("/quotes", post(handle_quote))
-		.route("/tokens", get(handle_get_tokens))
-		.route("/tokens/{chain_id}", get(handle_get_tokens_for_chain));
+		.route("/assets", get(handle_get_assets))
+		.route("/assets/{chain_id}", get(handle_get_assets_for_chain));
 
 	// Add auth subroutes
 	let auth_routes = Router::new()
@@ -485,25 +485,25 @@ async fn handle_get_order_by_id(
 	}
 }
 
-/// Handles GET /api/v1/tokens requests.
+/// Handles GET /api/v1/assets requests.
 ///
-/// Returns all supported tokens across all configured networks.
-async fn handle_get_tokens(
+/// Returns all supported assets across all configured networks.
+async fn handle_get_assets(
 	State(state): State<AppState>,
 ) -> Json<crate::apis::tokens::TokensResponse> {
 	// Use shared config to support hot reload from admin API
-	crate::apis::tokens::get_tokens_from_config(State(state.config)).await
+	crate::apis::tokens::get_assets_from_config(State(state.config)).await
 }
 
-/// Handles GET /api/v1/tokens/{chain_id} requests.
+/// Handles GET /api/v1/assets/{chain_id} requests.
 ///
-/// Returns supported tokens for a specific chain.
-async fn handle_get_tokens_for_chain(
+/// Returns supported assets for a specific chain.
+async fn handle_get_assets_for_chain(
 	Path(chain_id): Path<u64>,
 	State(state): State<AppState>,
 ) -> Result<Json<crate::apis::tokens::NetworkTokens>, StatusCode> {
 	// Use shared config to support hot reload from admin API
-	crate::apis::tokens::get_tokens_for_chain_from_config(
+	crate::apis::tokens::get_assets_for_chain_from_config(
 		Path(chain_id),
 		State(state.config.clone()),
 	)
