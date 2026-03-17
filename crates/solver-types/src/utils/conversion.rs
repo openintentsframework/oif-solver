@@ -716,22 +716,15 @@ mod tests {
 
 	#[test]
 	fn test_parse_address_empty_input() {
-		assert_eq!(
-			parse_address("").unwrap_err(),
-			"Address cannot be empty"
-		);
+		assert_eq!(parse_address("").unwrap_err(), "Address cannot be empty");
 		// "0x" with nothing after is also empty after stripping prefix
-		assert_eq!(
-			parse_address("0x").unwrap_err(),
-			"Address cannot be empty"
-		);
+		assert_eq!(parse_address("0x").unwrap_err(), "Address cannot be empty");
 	}
 
 	#[test]
 	fn test_parse_address_standard_20_byte() {
 		// Standard 40-char hex address with 0x prefix
-		let result =
-			parse_address("0x5fbdb2315678afecb367f032d93f642f64180aa3").unwrap();
+		let result = parse_address("0x5fbdb2315678afecb367f032d93f642f64180aa3").unwrap();
 		assert_eq!(
 			hex::encode(&result.0),
 			"5fbdb2315678afecb367f032d93f642f64180aa3"
@@ -741,10 +734,9 @@ mod tests {
 	#[test]
 	fn test_parse_address_32_byte_left_padded() {
 		// 64-char hex (bytes32, address in last 20 bytes)
-		let result = parse_address(
-			"0x0000000000000000000000005fbdb2315678afecb367f032d93f642f64180aa3",
-		)
-		.unwrap();
+		let result =
+			parse_address("0x0000000000000000000000005fbdb2315678afecb367f032d93f642f64180aa3")
+				.unwrap();
 		assert_eq!(
 			hex::encode(&result.0),
 			"5fbdb2315678afecb367f032d93f642f64180aa3"
@@ -775,8 +767,7 @@ mod tests {
 
 	#[test]
 	fn test_parse_address_without_0x_prefix() {
-		let result =
-			parse_address("5fbdb2315678afecb367f032d93f642f64180aa3").unwrap();
+		let result = parse_address("5fbdb2315678afecb367f032d93f642f64180aa3").unwrap();
 		assert_eq!(
 			hex::encode(&result.0),
 			"5fbdb2315678afecb367f032d93f642f64180aa3"
