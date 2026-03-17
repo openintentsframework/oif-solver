@@ -1348,7 +1348,6 @@ mod tests {
 					calldata: None,
 				}],
 			},
-			settlement_name: None,
 		};
 
 		let standard_order = interfaces::StandardOrder::try_from(&quote)
