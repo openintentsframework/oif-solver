@@ -432,12 +432,19 @@ impl interfaces::StandardOrder {
 			.map(U256::from)
 			.ok_or("Missing chainId in domain")?;
 
-		// Extract spender as the user address (the entity that will receive the permit)
-		// Extract the recovered user address from the injected message field
-		let user_str = message_data
+		// Extract witness data
+		let witness = message_data
+			.get("witness")
+			.and_then(|w| w.as_object())
+			.ok_or("Missing 'witness' object in EIP-712 message")?;
+
+		// Permit2 v2 signs the logical order user inside the witness payload.
+		// Keep the legacy top-level lookup as a fallback for older test fixtures.
+		let user_str = witness
 			.get("user")
 			.and_then(|u| u.as_str())
-			.ok_or("Missing user in EIP-712 data (should be injected by ecrecover)")?;
+			.or_else(|| message_data.get("user").and_then(|u| u.as_str()))
+			.ok_or("Missing user in Permit2 witness data")?;
 		let user_address = hex_to_alloy_address(user_str)?;
 		// Extract nonce
 		let nonce_str = message_data
@@ -452,12 +459,6 @@ impl interfaces::StandardOrder {
 			.and_then(|d| d.as_str())
 			.ok_or("Missing deadline in EIP-712 data")?;
 		let fill_deadline = deadline_str.parse::<u32>()?;
-
-		// Extract witness data
-		let witness = message_data
-			.get("witness")
-			.and_then(|w| w.as_object())
-			.ok_or("Missing 'witness' object in EIP-712 message")?;
 
 		// Extract expires from witness (or use deadline as fallback)
 		let expires = witness
@@ -1189,7 +1190,6 @@ mod tests {
 			}),
 			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
 			message: serde_json::json!({
-				"user": "0x1111111111111111111111111111111111111111",
 				"permitted": [
 					{
 						"token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
@@ -1199,6 +1199,7 @@ mod tests {
 				"nonce": "1",
 				"deadline": "2",
 				"witness": {
+					"user": "0x1111111111111111111111111111111111111111",
 					"expires": 3,
 					"inputOracle": "0x2222222222222222222222222222222222222222",
 					"outputs": [
@@ -1223,8 +1224,139 @@ mod tests {
 			.expect("numeric domain chainId should be accepted for permit2 payload");
 
 		assert_eq!(standard_order.originChainId, U256::from(1u64));
+		assert_eq!(
+			format!("{:#x}", standard_order.user),
+			"0x1111111111111111111111111111111111111111"
+		);
 		assert_eq!(standard_order.outputs.len(), 1);
 		assert_eq!(standard_order.outputs[0].chainId, U256::from(137u64));
+	}
+
+	#[cfg(feature = "oif-interfaces")]
+	#[test]
+	fn test_from_permit2_prefers_witness_user_over_legacy_message_user() {
+		use crate::api::{OrderPayload, SignatureType};
+		use crate::OifOrder;
+		use std::convert::TryFrom;
+
+		let payload = OrderPayload {
+			signature_type: SignatureType::Eip712,
+			domain: serde_json::json!({
+				"name": "Permit2",
+				"chainId": "1",
+				"verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+			}),
+			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
+			message: serde_json::json!({
+				"user": "0x9999999999999999999999999999999999999999",
+				"permitted": [
+					{
+						"token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+						"amount": "1000"
+					}
+				],
+				"nonce": "1",
+				"deadline": "2",
+				"witness": {
+					"user": "0x1111111111111111111111111111111111111111",
+					"expires": 3,
+					"inputOracle": "0x2222222222222222222222222222222222222222",
+					"outputs": []
+				}
+			}),
+			types: None,
+		};
+
+		let order = OifOrder::OifEscrowV0 { payload };
+		let standard_order = interfaces::StandardOrder::try_from(&order)
+			.expect("permit2 payload should parse using witness user");
+
+		assert_eq!(
+			format!("{:#x}", standard_order.user),
+			"0x1111111111111111111111111111111111111111"
+		);
+	}
+
+	#[cfg(feature = "oif-interfaces")]
+	#[test]
+	fn test_quote_standard_order_conversion_uses_permit2_witness_user() {
+		use crate::api::{
+			FailureHandlingMode, OrderPayload, Quote, QuoteInput, QuoteOutput, QuotePreview,
+			SignatureType,
+		};
+		use crate::standards::eip7930::InteropAddress;
+		use crate::OifOrder;
+		use alloy_primitives::address;
+		use std::convert::TryFrom;
+
+		let quote = Quote {
+			order: OifOrder::OifEscrowV0 {
+				payload: OrderPayload {
+					signature_type: SignatureType::Eip712,
+					domain: serde_json::json!({
+						"name": "Permit2",
+						"chainId": "1",
+						"verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+					}),
+					primary_type: "PermitBatchWitnessTransferFrom".to_string(),
+					message: serde_json::json!({
+						"permitted": [{
+							"token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+							"amount": "1000"
+						}],
+						"nonce": "1",
+						"deadline": "2",
+						"witness": {
+							"user": "0x1111111111111111111111111111111111111111",
+							"expires": 3,
+							"inputOracle": "0x2222222222222222222222222222222222222222",
+							"outputs": []
+						}
+					}),
+					types: None,
+				},
+			},
+			failure_handling: FailureHandlingMode::RefundAutomatic,
+			partial_fill: false,
+			valid_until: 1234567890,
+			eta: Some(120),
+			quote_id: "quote_123".to_string(),
+			provider: Some("test".to_string()),
+			preview: QuotePreview {
+				inputs: vec![QuoteInput {
+					user: InteropAddress::new_ethereum(
+						1,
+						address!("1111111111111111111111111111111111111111"),
+					),
+					asset: InteropAddress::new_ethereum(
+						1,
+						address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+					),
+					amount: Some("1000".to_string()),
+					lock: None,
+				}],
+				outputs: vec![QuoteOutput {
+					receiver: InteropAddress::new_ethereum(
+						42161,
+						address!("2222222222222222222222222222222222222222"),
+					),
+					asset: InteropAddress::new_ethereum(
+						42161,
+						address!("3333333333333333333333333333333333333333"),
+					),
+					amount: Some("900".to_string()),
+					calldata: None,
+				}],
+			},
+		};
+
+		let standard_order = interfaces::StandardOrder::try_from(&quote)
+			.expect("permit2 quote should parse using witness user");
+
+		assert_eq!(
+			format!("{:#x}", standard_order.user),
+			"0x1111111111111111111111111111111111111111"
+		);
 	}
 
 	#[cfg(feature = "oif-interfaces")]
