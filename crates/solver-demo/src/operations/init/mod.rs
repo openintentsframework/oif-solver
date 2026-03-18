@@ -1168,6 +1168,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 		}
 	}
 

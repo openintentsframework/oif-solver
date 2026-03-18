@@ -103,6 +103,12 @@ pub struct SeedOverrides {
 	/// If not set, uses default.
 	#[serde(default)]
 	pub rate_buffer_bps: Option<u32>,
+
+	/// Timeout in seconds for monitoring settlement/claim readiness.
+	/// If not set, uses seed default (28800 = 8 hours).
+	/// Optimistic-rollup routes may need much larger values (e.g., 864000 = 10 days).
+	#[serde(default)]
+	pub monitoring_timeout_seconds: Option<u64>,
 }
 
 /// Supported settlement type overrides.
