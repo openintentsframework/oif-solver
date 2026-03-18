@@ -17,7 +17,7 @@ pub const DOMAIN_TYPE: &str = "EIP712Domain(string name,uint256 chainId,address 
 pub const NAME_PERMIT2: &str = "Permit2";
 pub const MANDATE_OUTPUT_TYPE: &str = "MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)";
 pub const PERMIT2_WITNESS_TYPE: &str =
-	"Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)";
+	"Permit2Witness(address user,uint32 expires,address inputOracle,MandateOutput[] outputs)";
 pub const TOKEN_PERMISSIONS_TYPE: &str = "TokenPermissions(address token,uint256 amount)";
 pub const PERMIT_BATCH_WITNESS_TYPE: &str =
 	"PermitBatchWitnessTransferFrom(TokenPermissions[] permitted,address spender,uint256 nonce,uint256 deadline,Permit2Witness witness)";
@@ -159,7 +159,7 @@ pub fn reconstruct_permit2_digest(
 	// 2. Compute struct hash for PermitBatchWitnessTransferFrom
 
 	// Type hash for the main struct
-	let permit_type = "PermitBatchWitnessTransferFrom(TokenPermissions[] permitted,address spender,uint256 nonce,uint256 deadline,Permit2Witness witness)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)TokenPermissions(address token,uint256 amount)";
+	let permit_type = "PermitBatchWitnessTransferFrom(TokenPermissions[] permitted,address spender,uint256 nonce,uint256 deadline,Permit2Witness witness)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)Permit2Witness(address user,uint32 expires,address inputOracle,MandateOutput[] outputs)TokenPermissions(address token,uint256 amount)";
 	let type_hash = keccak256(permit_type.as_bytes());
 
 	// Extract message fields
@@ -321,9 +321,15 @@ pub fn reconstruct_permit2_digest(
 	let outputs_hash = keccak256(outputs_encoder.finish());
 
 	// Build witness struct hash
-	let witness_type_hash = keccak256("Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)".as_bytes());
+	let witness_type_hash = keccak256("Permit2Witness(address user,uint32 expires,address inputOracle,MandateOutput[] outputs)MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)".as_bytes());
+	let user_str = witness
+		.get("user")
+		.and_then(|u| u.as_str())
+		.ok_or("Missing witness user")?;
+	let user = hex_to_alloy_address(user_str)?;
 	let mut witness_encoder = Eip712AbiEncoder::new();
 	witness_encoder.push_b256(&witness_type_hash);
+	witness_encoder.push_address(&user);
 	witness_encoder.push_u32(expires);
 	witness_encoder.push_address(&oracle);
 	witness_encoder.push_b256(&outputs_hash);
@@ -1136,6 +1142,7 @@ mod tests {
 				"deadline": "1234567890",
 				"permitted": [],
 				"witness": {
+					"user": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
 					"expires": 1234567890,
 					"inputOracle": "0x1234567890123456789012345678901234567890",
 					"outputs": []
@@ -1442,6 +1449,7 @@ mod tests {
 					"amount": "1000000000000000000"
 				}],
 				"witness": {
+					"user": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
 					"expires": 1234567890,
 					"inputOracle": "0x1234567890123456789012345678901234567890",
 					"outputs": [{
@@ -1622,6 +1630,7 @@ mod tests {
 				"deadline": "1234567890",
 				"permitted": [], // Empty array
 				"witness": {
+					"user": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
 					"expires": 1234567890,
 					"inputOracle": "0x1234567890123456789012345678901234567890",
 					"outputs": [] // Empty array
@@ -1689,6 +1698,7 @@ mod tests {
 					"amount": "1000000000000000000"
 				}],
 				"witness": {
+					"user": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
 					"expires": 1234567890,
 					"inputOracle": "0x1234567890123456789012345678901234567890",
 					"outputs": [{
@@ -1736,6 +1746,7 @@ mod tests {
 					"amount": large_amount
 				}],
 				"witness": {
+					"user": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
 					"expires": 1234567890,
 					"inputOracle": "0x1234567890123456789012345678901234567890",
 					"outputs": [{
@@ -1780,6 +1791,7 @@ mod tests {
 					"amount": "1000000000000000000"
 				}],
 				"witness": {
+					"user": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
 					"expires": 1234567890,
 					"inputOracle": "0x1234567890123456789012345678901234567890",
 					"outputs": [{
