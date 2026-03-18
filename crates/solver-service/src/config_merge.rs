@@ -452,7 +452,7 @@ pub fn merge_to_operator_config(
 			commission_bps,
 			rate_buffer_bps,
 			monitoring_timeout_seconds: seed.defaults.monitoring_timeout_seconds,
-			deny_list: None,
+			deny_list: initializer.deny_list.clone(),
 		},
 		admin,
 		auth_enabled: initializer.auth_enabled.unwrap_or(false),

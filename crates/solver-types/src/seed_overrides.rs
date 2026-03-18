@@ -103,6 +103,12 @@ pub struct SeedOverrides {
 	/// If not set, uses default.
 	#[serde(default)]
 	pub rate_buffer_bps: Option<u32>,
+
+	/// Path to a JSON file containing a list of denied Ethereum addresses.
+	/// Loaded once at startup — not hot-reloaded.
+	/// If not set, deny list enforcement is disabled.
+	#[serde(default)]
+	pub deny_list: Option<String>,
 }
 
 /// Supported settlement type overrides.
