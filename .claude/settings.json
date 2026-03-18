@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(grep -rn \"deny_list\\\\|denylist\" --include=*.rs /Users/chef/Desktop/oif-solver/)",
-      "Bash(grep -rn \"OrderConfig\\\\|callback\" --include=*.rs /Users/chef/Desktop/oif-solver/crates/solver-config/src/)",
-      "Bash(grep -rn \"deny_list\\\\|deny_addresses\\\\|blocked_addresses\\\\|operator_deny\" /Users/chef/Desktop/oif-solver/crates/ --include=*.rs)"
-    ]
-  }
-}
