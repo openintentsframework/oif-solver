@@ -8,7 +8,7 @@ use crate::engine::event_bus::EventBus;
 use crate::state::OrderStateMachine;
 use alloy_primitives::hex;
 use solver_delivery::DeliveryService;
-use solver_settlement::SettlementService;
+use solver_settlement::{SettlementReadiness, SettlementService};
 use solver_storage::{QueryFilter, StorageService};
 use solver_types::{
 	with_0x_prefix, Intent, Order, OrderEvent, OrderStatus, SettlementEvent, SolverEvent,
@@ -35,6 +35,7 @@ pub enum RecoveryError {
 ///
 /// This enum represents the different states an order can be in after
 /// comparing its stored state with the actual blockchain state during recovery.
+#[derive(Debug)]
 enum ReconcileResult {
 	/// Order needs initial execution (no transactions yet)
 	NeedsExecution,
@@ -374,8 +375,23 @@ impl RecoveryService {
 							fill_proof: order.fill_proof.clone(),
 						});
 					} else {
-						// Need to process post-fill and get attestation
-						return Ok(ReconcileResult::NeedsPostFill);
+						// Fill is confirmed but local post-fill state may be missing due to a
+						// crash after submission. Recover it before deciding to resubmit.
+						match self.settlement.recover_post_fill_state(order).await {
+							Ok(true) => return Ok(ReconcileResult::NeedsMonitoring),
+							Ok(false) => {
+								// Need to process post-fill and get attestation
+								return Ok(ReconcileResult::NeedsPostFill);
+							},
+							Err(e) => {
+								tracing::error!(
+									order_id = %order.id,
+									error = %e,
+									"Failed to recover existing post-fill state during recovery"
+								);
+								return Err(RecoveryError::Settlement(e.to_string()));
+							},
+						}
 					}
 				},
 				Ok(false) => {
@@ -604,27 +620,50 @@ impl RecoveryService {
 				tracing::info!("Order {} is settled", order.id);
 
 				if let Some(proof) = fill_proof {
-					// We have the proof, check if we can claim
-					if self.settlement.can_claim(&order, &proof).await {
-						// Ready to claim, emit PreClaimReady event
-						// The handler will determine if pre-claim transaction is needed
-						self.event_bus
-							.publish(SolverEvent::Settlement(SettlementEvent::PreClaimReady {
-								order_id: order.id,
-							}))
-							.ok();
-					} else {
-						// Not ready to claim yet, continue monitoring
-						if let Some(fill_tx_hash) = order.fill_tx_hash.clone() {
+					match self.settlement.readiness(&order, &proof).await {
+						SettlementReadiness::Ready => {
+							// Ready to claim, emit PreClaimReady event
+							// The handler will determine if pre-claim transaction is needed
 							self.event_bus
-								.publish(SolverEvent::Settlement(
-									SettlementEvent::StartMonitoring {
-										order_id: order.id.clone(),
-										fill_tx_hash,
-									},
-								))
+								.publish(SolverEvent::Settlement(SettlementEvent::PreClaimReady {
+									order_id: order.id,
+								}))
 								.ok();
-						}
+						},
+						SettlementReadiness::Waiting(_) | SettlementReadiness::NeedsAction(_) => {
+							// Not ready to claim yet, continue monitoring
+							if let Some(fill_tx_hash) = order.fill_tx_hash.clone() {
+								self.event_bus
+									.publish(SolverEvent::Settlement(
+										SettlementEvent::StartMonitoring {
+											order_id: order.id.clone(),
+											fill_tx_hash,
+										},
+									))
+									.ok();
+							}
+						},
+						SettlementReadiness::PermanentFailure(error) => {
+							tracing::error!(
+								order_id = %order.id,
+								error = %error,
+								"Permanent settlement failure during recovery"
+							);
+							if let Err(e) = self
+								.state_machine
+								.transition_order_status(
+									&order.id,
+									OrderStatus::Failed(TransactionType::PreClaim, error),
+								)
+								.await
+							{
+								tracing::error!(
+									"Failed to update order {} status after settlement failure: {}",
+									order.id,
+									e
+								);
+							}
+						},
 					}
 				} else {
 					// No proof yet, need to get attestation first
@@ -644,26 +683,49 @@ impl RecoveryService {
 			ReconcileResult::NeedsClaim { fill_proof } => {
 				// Fill confirmed, check if ready to claim
 				if let Some(proof) = fill_proof {
-					// We have the proof, check if we can claim
-					if self.settlement.can_claim(&order, &proof).await {
-						tracing::info!("Order {} ready for claiming", order.id);
-						self.event_bus
-							.publish(SolverEvent::Settlement(SettlementEvent::ClaimReady {
-								order_id: order.id,
-							}))
-							.ok();
-					} else {
-						// Not ready to claim yet, emit event to spawn monitor
-						if let Some(fill_tx_hash) = order.fill_tx_hash.clone() {
+					match self.settlement.readiness(&order, &proof).await {
+						SettlementReadiness::Ready => {
+							tracing::info!("Order {} ready for claiming", order.id);
 							self.event_bus
-								.publish(SolverEvent::Settlement(
-									SettlementEvent::StartMonitoring {
-										order_id: order.id.clone(),
-										fill_tx_hash,
-									},
-								))
+								.publish(SolverEvent::Settlement(SettlementEvent::ClaimReady {
+									order_id: order.id,
+								}))
 								.ok();
-						}
+						},
+						SettlementReadiness::Waiting(_) | SettlementReadiness::NeedsAction(_) => {
+							// Not ready to claim yet, emit event to spawn monitor
+							if let Some(fill_tx_hash) = order.fill_tx_hash.clone() {
+								self.event_bus
+									.publish(SolverEvent::Settlement(
+										SettlementEvent::StartMonitoring {
+											order_id: order.id.clone(),
+											fill_tx_hash,
+										},
+									))
+									.ok();
+							}
+						},
+						SettlementReadiness::PermanentFailure(error) => {
+							tracing::error!(
+								order_id = %order.id,
+								error = %error,
+								"Permanent settlement failure during claim recovery"
+							);
+							if let Err(e) = self
+								.state_machine
+								.transition_order_status(
+									&order.id,
+									OrderStatus::Failed(TransactionType::Claim, error),
+								)
+								.await
+							{
+								tracing::error!(
+									"Failed to update order {} status after settlement failure: {}",
+									order.id,
+									e
+								);
+							}
+						},
 					}
 				} else {
 					// No proof yet, emit event to spawn monitor to get it
@@ -801,6 +863,7 @@ mod tests {
 	use super::*;
 	use mockall::predicate::*;
 	use solver_delivery::MockDeliveryInterface;
+	use solver_settlement::MockSettlementInterface;
 	use solver_storage::MockStorageInterface;
 	use solver_types::{
 		utils::tests::builders::{IntentBuilder, OrderBuilder},
@@ -857,7 +920,7 @@ mod tests {
 		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
@@ -905,7 +968,7 @@ mod tests {
 		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
@@ -967,7 +1030,7 @@ mod tests {
 		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
@@ -993,7 +1056,7 @@ mod tests {
 		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
@@ -1044,7 +1107,7 @@ mod tests {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
@@ -1097,7 +1160,7 @@ mod tests {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
@@ -1112,6 +1175,181 @@ mod tests {
 			},
 			_ => panic!("Expected NeedsClaim"),
 		}
+	}
+
+	#[tokio::test]
+	async fn test_reconcile_with_blockchain_recovers_existing_post_fill_state() {
+		let mut mock_delivery = MockDeliveryInterface::new();
+		let mut mock_settlement = MockSettlementInterface::new();
+		let mut order = create_test_order_with_status(OrderStatus::Executed);
+		order.fill_tx_hash = Some(TransactionHash(vec![0xbb; 32]));
+		order.settlement_name = Some("eip7683".to_string());
+
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(TransactionHash(vec![0xbb; 32])), eq(137u64))
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async {
+					Ok(solver_types::TransactionReceipt {
+						hash: TransactionHash(vec![0xbb; 32]),
+						block_number: 12345,
+						success: true,
+						block_timestamp: None,
+						logs: vec![],
+					})
+				})
+			});
+
+		mock_settlement
+			.expect_recover_post_fill_state()
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(true) }));
+
+		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
+			HashMap::from([(
+				137u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]);
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
+
+		let mock_storage = MockStorageInterface::new();
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]);
+		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
+		let event_bus = EventBus::new(100);
+
+		let recovery_service =
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+
+		let result = recovery_service.reconcile_with_blockchain(&order).await;
+		assert!(result.is_ok());
+
+		match result.unwrap() {
+			ReconcileResult::NeedsMonitoring => {},
+			other => panic!("Expected NeedsMonitoring, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_reconcile_with_blockchain_post_fill_recovery_miss_needs_post_fill() {
+		let mut mock_delivery = MockDeliveryInterface::new();
+		let mut mock_settlement = MockSettlementInterface::new();
+		let mut order = create_test_order_with_status(OrderStatus::Executed);
+		order.fill_tx_hash = Some(TransactionHash(vec![0xbb; 32]));
+		order.settlement_name = Some("eip7683".to_string());
+
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(TransactionHash(vec![0xbb; 32])), eq(137u64))
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async {
+					Ok(solver_types::TransactionReceipt {
+						hash: TransactionHash(vec![0xbb; 32]),
+						block_number: 12345,
+						success: true,
+						block_timestamp: None,
+						logs: vec![],
+					})
+				})
+			});
+
+		mock_settlement
+			.expect_recover_post_fill_state()
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+
+		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
+			HashMap::from([(
+				137u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]);
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
+
+		let mock_storage = MockStorageInterface::new();
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]);
+		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
+		let event_bus = EventBus::new(100);
+
+		let recovery_service =
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+
+		let result = recovery_service.reconcile_with_blockchain(&order).await;
+		assert!(result.is_ok());
+		assert!(matches!(result.unwrap(), ReconcileResult::NeedsPostFill));
+	}
+
+	#[tokio::test]
+	async fn test_reconcile_with_blockchain_post_fill_recovery_error_propagates() {
+		let mut mock_delivery = MockDeliveryInterface::new();
+		let mut mock_settlement = MockSettlementInterface::new();
+		let mut order = create_test_order_with_status(OrderStatus::Executed);
+		order.fill_tx_hash = Some(TransactionHash(vec![0xbb; 32]));
+		order.settlement_name = Some("eip7683".to_string());
+
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(TransactionHash(vec![0xbb; 32])), eq(137u64))
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async {
+					Ok(solver_types::TransactionReceipt {
+						hash: TransactionHash(vec![0xbb; 32]),
+						block_number: 12345,
+						success: true,
+						block_timestamp: None,
+						logs: vec![],
+					})
+				})
+			});
+
+		mock_settlement
+			.expect_recover_post_fill_state()
+			.times(1)
+			.returning(|_| {
+				Box::pin(async move {
+					Err(solver_settlement::SettlementError::ValidationFailed(
+						"recovery window exhausted".to_string(),
+					))
+				})
+			});
+
+		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
+			HashMap::from([(
+				137u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]);
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
+
+		let mock_storage = MockStorageInterface::new();
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]);
+		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
+		let event_bus = EventBus::new(100);
+
+		let recovery_service =
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+
+		let result = recovery_service.reconcile_with_blockchain(&order).await;
+		assert!(result.is_err());
+		assert!(matches!(result.unwrap_err(), RecoveryError::Settlement(_)));
 	}
 
 	#[tokio::test]
@@ -1149,7 +1387,7 @@ mod tests {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
@@ -1199,7 +1437,7 @@ mod tests {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
 
 		let recovery_service =
@@ -1250,7 +1488,7 @@ mod tests {
 		// which should trigger spawn_settlement_monitor instead of publishing ClaimReady
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
 
 		// Subscribe to events
@@ -1309,7 +1547,7 @@ mod tests {
 		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
-		let settlement = Arc::new(SettlementService::new(settlement_impls, 20));
+		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
 
 		// Subscribe to events
@@ -1334,6 +1572,133 @@ mod tests {
 			},
 			_ => panic!("Expected Order::Executing event"),
 		}
+	}
+
+	#[tokio::test]
+	async fn test_publish_recovery_event_needs_pre_claim_waiting_starts_monitoring() {
+		let mut mock_settlement = MockSettlementInterface::new();
+		let mut order = create_test_order_with_status(OrderStatus::Executed);
+		order.settlement_name = Some("eip7683".to_string());
+		order.fill_tx_hash = Some(TransactionHash(vec![0xbb; 32]));
+
+		mock_settlement
+			.expect_readiness()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					SettlementReadiness::Waiting(
+						solver_settlement::WaitingReason::ProofServiceNotReady,
+					)
+				})
+			});
+
+		let storage = Arc::new(StorageService::new(Box::new(
+			solver_storage::implementations::memory::MemoryStorage::new(),
+		)));
+		storage
+			.store(StorageKey::Orders.as_str(), &order.id, &order, None)
+			.await
+			.unwrap();
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]);
+		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+
+		let recovery_service =
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+
+		recovery_service
+			.publish_recovery_event(
+				order,
+				ReconcileResult::NeedsPreClaim {
+					fill_proof: Some(create_test_fill_proof()),
+				},
+			)
+			.await;
+
+		match receiver.try_recv().unwrap() {
+			SolverEvent::Settlement(SettlementEvent::StartMonitoring {
+				order_id,
+				fill_tx_hash,
+			}) => {
+				assert_eq!(order_id, "test_order_123");
+				assert_eq!(fill_tx_hash, TransactionHash(vec![0xbb; 32]));
+			},
+			other => panic!("Expected StartMonitoring event, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_publish_recovery_event_needs_claim_permanent_failure_marks_order_failed() {
+		let mut mock_settlement = MockSettlementInterface::new();
+		let mut order = create_test_order_with_status(OrderStatus::Settled);
+		order.settlement_name = Some("eip7683".to_string());
+		order.fill_tx_hash = Some(TransactionHash(vec![0xbb; 32]));
+		order.pre_claim_tx_hash = Some(TransactionHash(vec![0xcc; 32]));
+
+		mock_settlement
+			.expect_readiness()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					SettlementReadiness::PermanentFailure("proof permanently invalid".into())
+				})
+			});
+
+		let storage = Arc::new(StorageService::new(Box::new(
+			solver_storage::implementations::memory::MemoryStorage::new(),
+		)));
+		storage
+			.store(StorageKey::Orders.as_str(), &order.id, &order, None)
+			.await
+			.unwrap();
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]);
+		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+		);
+
+		recovery_service
+			.publish_recovery_event(
+				order.clone(),
+				ReconcileResult::NeedsClaim {
+					fill_proof: Some(create_test_fill_proof()),
+				},
+			)
+			.await;
+
+		assert!(
+			receiver.try_recv().is_err(),
+			"Permanent failure should not emit follow-up events"
+		);
+
+		let updated: Order = storage
+			.retrieve(StorageKey::Orders.as_str(), &order.id)
+			.await
+			.unwrap();
+		assert!(matches!(
+			updated.status,
+			OrderStatus::Failed(TransactionType::Claim, _)
+		));
 	}
 
 	#[tokio::test]

@@ -462,9 +462,11 @@ Compact addresses are optional:
 Settlement implementation is selected from bootstrap config JSON:
 - `hyperlane` (default when omitted)
 - `direct`
+- `broadcaster`
 
 When `settlement.type = "direct"`, `settlement.direct` is required.
 When `settlement.type = "hyperlane"` and you include non-seeded networks, provide `settlement.hyperlane` maps (`mailboxes`, `igp_addresses`, `oracles.input`, `oracles.output`) for all configured chains.
+When `settlement.type = "broadcaster"`, `settlement.broadcaster` is required with `oracles`, `routes`, `broadcaster_addresses`, `receiver_addresses`, and `broadcaster_ids`. Optionally include `pusher_directions` for proactive L1 block hash pushing (required for ETH→ARB, ETH→OP, and ETH→Linea directions). Each pusher direction takes a typed `l2_params` object (`type: "arbitrum"`, `"op_stack"`, `"linea"`, or `"raw"`). See `config/example-broadcaster.json` and `docs/oracles/pusher-setup-guide.md` for details.
 
 See `config/non-seeded-networks-example.json` for a full non-seeded Hyperlane example (both chain IDs are non-seeded).
 
@@ -627,7 +629,7 @@ The solver provides a REST API for interacting with the system and submitting of
 ### API Specifications
 
 - **Orders API**: [`api-spec/orders-api.yaml`](api-spec/orders-api.yaml) - Submit and track cross-chain intent orders
-- **Tokens API**: [`api-spec/tokens-api.yaml`](api-spec/tokens-api.yaml) - Query supported tokens and networks
+- **Assets API**: [`api-spec/assets-api.yaml`](api-spec/assets-api.yaml) - Query supported assets and networks
 - **Auth API**: [`api-spec/auth-api.yaml`](api-spec/auth-api.yaml) - JWT issuance flows (SIWE + register/refresh)
 - **Admin API**: [`api-spec/admin-api.yaml`](api-spec/admin-api.yaml) - Wallet-based admin operations (EIP-712 signed)
 - **Admin Auth Guide**: [`docs/admin-authentication.md`](docs/admin-authentication.md) - Practical auth + nonce flow guide
@@ -821,14 +823,14 @@ sequenceDiagram
 - **GET `/api/v1/orders/{id}`** - Get order status and details
   - Returns complete order information including status, amounts, settlement data, and fill transaction
 
-#### Tokens
+#### Assets
 
-- **GET `/api/v1/tokens`** - Get all supported tokens across all networks
+- **GET `/api/v1/assets`** - Get all supported assets across all networks
 
-  - Returns a map of chain IDs to network configurations with supported tokens, including network `name`/`type` and token `name`
+  - Returns a map of chain IDs to network configurations with supported assets, including network `name`/`type` and asset `name`
 
-- **GET `/api/v1/tokens/{chain_id}`** - Get supported tokens for a specific chain
-  - Returns network configuration (including `name`/`type`) and token list (including token `name`)
+- **GET `/api/v1/assets/{chain_id}`** - Get supported assets for a specific chain
+  - Returns network configuration (including `name`/`type`) and asset list (including asset `name`)
 
 #### Health
 
@@ -854,7 +856,7 @@ sequenceDiagram
 
 The admin API enables authorized wallet addresses to perform administrative operations using EIP-712 signed messages. This provides secure, decentralized admin access without shared secrets.
 
-**Setup:** Configure admin addresses in your bootstrap config or TOML config:
+**Setup:** Configure admin addresses in your seed overrides JSON:
 
 ```json
 {
@@ -1015,11 +1017,11 @@ curl -X POST http://localhost:3000/api/v1/orders \
 # Check order status
 curl http://localhost:3000/api/v1/orders/1fa518079ecf01372290adf75c55858771efcbcee080594cc8bc24e3309a3a09
 
-# Get supported tokens for chain 31338
-curl http://localhost:3000/api/v1/tokens/31338
+# Get supported assets for chain 31338
+curl http://localhost:3000/api/v1/assets/31338
 
-# Get all supported tokens
-curl http://localhost:3000/api/v1/tokens
+# Get all supported assets
+curl http://localhost:3000/api/v1/assets
 
 # Health check
 curl http://localhost:3000/health
@@ -1101,8 +1103,8 @@ git clone https://github.com/openintentsframework/oif-contracts.git
 cd oif-contracts && forge build && cd ..
 
 # 1. Initialize configuration and load it
-cargo run -p solver-demo -- init new config/demo.toml
-cargo run -p solver-demo -- init load config/demo.toml --local
+cargo run -p solver-demo -- init new config/demo.json
+cargo run -p solver-demo -- init load config/demo.json --local
 
 # 2. Start local environment (Anvil chains)
 cargo run -p solver-demo -- env start
@@ -1295,9 +1297,10 @@ The demo tool generates files in the `.oif-demo/requests/` directory following a
 
 The demo tool provides a complete workflow for setting up a test environment:
 
-1. **Initialize Configuration** (`init new` / `init load`):
+1. **Initialize Configuration** (`init new` / `init load` / `init load-storage`):
 
    - Creates or loads solver configuration
+   - Can load runtime config directly from storage backend (`init load-storage`)
    - Sets up network definitions and RPC endpoints
    - Configures account keys and signing
    - Stores session data in `.oif-demo/` directory

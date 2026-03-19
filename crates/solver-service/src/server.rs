@@ -323,8 +323,8 @@ pub async fn start_server(
 	// Build the router with /api/v1 base path and quote endpoint
 	let mut api_routes = Router::new()
 		.route("/quotes", post(handle_quote))
-		.route("/tokens", get(handle_get_tokens))
-		.route("/tokens/{chain_id}", get(handle_get_tokens_for_chain));
+		.route("/assets", get(handle_get_assets))
+		.route("/assets/{chain_id}", get(handle_get_assets_for_chain));
 
 	// Add auth subroutes
 	let auth_routes = Router::new()
@@ -485,25 +485,25 @@ async fn handle_get_order_by_id(
 	}
 }
 
-/// Handles GET /api/v1/tokens requests.
+/// Handles GET /api/v1/assets requests.
 ///
-/// Returns all supported tokens across all configured networks.
-async fn handle_get_tokens(
+/// Returns all supported assets across all configured networks.
+async fn handle_get_assets(
 	State(state): State<AppState>,
 ) -> Json<crate::apis::tokens::TokensResponse> {
 	// Use shared config to support hot reload from admin API
-	crate::apis::tokens::get_tokens_from_config(State(state.config)).await
+	crate::apis::tokens::get_assets_from_config(State(state.config)).await
 }
 
-/// Handles GET /api/v1/tokens/{chain_id} requests.
+/// Handles GET /api/v1/assets/{chain_id} requests.
 ///
-/// Returns supported tokens for a specific chain.
-async fn handle_get_tokens_for_chain(
+/// Returns supported assets for a specific chain.
+async fn handle_get_assets_for_chain(
 	Path(chain_id): Path<u64>,
 	State(state): State<AppState>,
 ) -> Result<Json<crate::apis::tokens::NetworkTokens>, StatusCode> {
 	// Use shared config to support hot reload from admin API
-	crate::apis::tokens::get_tokens_for_chain_from_config(
+	crate::apis::tokens::get_assets_for_chain_from_config(
 		Path(chain_id),
 		State(state.config.clone()),
 	)
@@ -599,14 +599,14 @@ async fn handle_order(
 
 /// Extracts a PostOrderRequest from the incoming payload.
 /// Handles both quote acceptances (with quoteId) and direct submissions.
-/// Also injects the recovered user address for Permit2 orders that require ecrecover.
+/// Also performs early sponsor recovery for Permit2 orders that require ecrecover.
 async fn extract_intent_request(
 	payload: Value,
 	state: &AppState,
 	standard: &str,
 ) -> Result<PostOrderRequest, APIError> {
 	// Check if this is a quote acceptance (has quoteId)
-	let mut intent = if payload.get("quoteId").and_then(|v| v.as_str()).is_some() {
+	let intent = if payload.get("quoteId").and_then(|v| v.as_str()).is_some() {
 		// Quote acceptance path
 		create_intent_from_quote(payload, state, standard).await?
 	} else {
@@ -614,11 +614,10 @@ async fn extract_intent_request(
 		create_intent_from_payload(payload)?
 	};
 
-	// If this order requires ecrecover, we need to inject the recovered user
-	// into the order message so the discovery service can process it correctly
+	// Recover the sponsor early so malformed Permit2 signatures fail fast before
+	// the order reaches downstream validation and discovery.
 	if intent.order.requires_ecrecover() {
-		// Extract sponsor address from the order
-		let sponsor = intent
+		intent
 			.order
 			.extract_sponsor(Some(&intent.signature))
 			.map_err(|e| APIError::BadRequest {
@@ -626,17 +625,6 @@ async fn extract_intent_request(
 				message: format!("Failed to extract sponsor: {e}"),
 				details: None,
 			})?;
-
-		// Inject the recovered user into Permit2 orders
-		if let solver_types::OifOrder::OifEscrowV0 { payload } = &mut intent.order {
-			// Permit2 orders need 'user' field injected after signature recovery
-			if let Some(message_obj) = payload.message.as_object_mut() {
-				message_obj.insert(
-					"user".to_string(),
-					serde_json::Value::String(sponsor.to_string()),
-				);
-			}
-		}
 	}
 
 	Ok(intent)
@@ -718,7 +706,6 @@ async fn validate_intent_request(
 	let lock_type_str = lock_type.as_str();
 
 	// Convert to StandardOrder and encode
-	// Note: The user injection for Permit2 orders is already done in extract_intent_request
 	let standard_order =
 		StandardOrder::try_from(&intent.order).map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
@@ -905,9 +892,11 @@ async fn forward_to_discovery_service(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use alloy_primitives::hex;
 	use axum::body;
 	use axum::http::StatusCode;
 	use reqwest::Client;
+	use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 	use serde_json::{json, to_value};
 	use solver_account::AccountService;
 	use solver_config::Config;
@@ -925,65 +914,80 @@ mod tests {
 		OifOrder, OrderPayload, PostOrderRequest, PostOrderResponse, PostOrderResponseStatus,
 		SignatureType,
 	};
+	use solver_types::standards::eip7683::interfaces::StandardOrder as OifStandardOrder;
 	use solver_types::{APIError, Address, ApiErrorType};
 	use std::collections::HashMap;
+	use std::convert::TryFrom;
 	use std::sync::Arc;
 	use wiremock::matchers::{method, path};
 	use wiremock::{Mock, MockServer, ResponseTemplate};
 
 	async fn build_test_solver_engine() -> Arc<SolverEngine> {
-		let config_toml = r#"
-			[solver]
-			id = "test-solver"
-			monitoring_timeout_seconds = 30
-			min_profitability_pct = 1.0
-
-			[storage]
-			primary = "memory"
-			cleanup_interval_seconds = 60
-			[storage.implementations.memory]
-
-			[delivery]
-			min_confirmations = 1
-			[delivery.implementations]
-
-			[account]
-			primary = "local"
-			[account.implementations.local]
-			private_key = "0x1234567890123456789012345678901234567890123456789012345678901234"
-
-			[discovery]
-			[discovery.implementations]
-
-			[order]
-			[order.implementations]
-			[order.strategy]
-			primary = "simple"
-			[order.strategy.implementations.simple]
-
-			[settlement]
-			[settlement.implementations]
-
-			[networks.1]
-			chain_id = 1
-			input_settler_address = "0x0000000000000000000000000000000000000011"
-			output_settler_address = "0x0000000000000000000000000000000000000022"
-			[[networks.1.rpc_urls]]
-			http = "http://localhost:8545"
-			[[networks.1.tokens]]
-			symbol = "TEST"
-			address = "0x0000000000000000000000000000000000000033"
-			decimals = 18
-		"#;
-
-		let config: Config = toml::from_str(config_toml).expect("failed to parse test config");
+		let config: Config = serde_json::from_value(json!({
+			"solver": {
+				"id": "test-solver",
+				"monitoring_timeout_seconds": 30,
+				"min_profitability_pct": 1.0
+			},
+			"storage": {
+				"primary": "memory",
+				"cleanup_interval_seconds": 60,
+				"implementations": {
+					"memory": {}
+				}
+			},
+			"delivery": {
+				"min_confirmations": 1,
+				"implementations": {}
+			},
+			"account": {
+				"primary": "local",
+				"implementations": {
+					"local": {
+						"private_key": "0x1234567890123456789012345678901234567890123456789012345678901234"
+					}
+				}
+			},
+			"discovery": {
+				"implementations": {}
+			},
+			"order": {
+				"implementations": {},
+				"strategy": {
+					"primary": "simple",
+					"implementations": {
+						"simple": {}
+					}
+				}
+			},
+			"settlement": {
+				"implementations": {}
+			},
+			"networks": {
+				"1": {
+					"chain_id": 1,
+					"input_settler_address": "0x0000000000000000000000000000000000000011",
+					"output_settler_address": "0x0000000000000000000000000000000000000022",
+					"rpc_urls": [
+						{ "http": "http://localhost:8545" }
+					],
+					"tokens": [
+						{
+							"symbol": "TEST",
+							"address": "0x0000000000000000000000000000000000000033",
+							"decimals": 18
+						}
+					]
+				}
+			}
+		}))
+		.expect("failed to parse test config");
 
 		let storage = Arc::new(StorageService::new(Box::new(MemoryStorage::new())));
 
-		let account_config: toml::Value = toml::from_str(
-			r#"private_key = "0x1234567890123456789012345678901234567890123456789012345678901234""#,
-		)
-		.expect("failed to parse account config");
+		let account_config: serde_json::Value = json!({
+			"private_key": "0x1234567890123456789012345678901234567890123456789012345678901234"
+		});
 		let account_impl = solver_account::implementations::local::create_account(&account_config)
 			.await
 			.expect("failed to create account impl");
@@ -994,15 +998,15 @@ mod tests {
 		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 10));
 		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
 
-		let strategy_config = toml::Value::Table(toml::value::Table::new());
+		let strategy_config = serde_json::Value::Object(serde_json::Map::new());
 		let strategy =
 			solver_order::implementations::strategies::simple::create_strategy(&strategy_config)
 				.expect("failed to create order strategy");
 		let order = Arc::new(OrderService::new(HashMap::new(), strategy));
 
-		let settlement = Arc::new(SettlementService::new(HashMap::new(), 10));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 10));
 
-		let pricing_impl = create_mock_pricing(&toml::Value::Table(toml::value::Table::new()))
+		let pricing_impl = create_mock_pricing(&serde_json::Value::Object(serde_json::Map::new()))
 			.expect("failed to create mock pricing");
 		let pricing = Arc::new(PricingService::new(pricing_impl, Vec::new()));
 
@@ -1080,6 +1084,76 @@ mod tests {
 		PostOrderRequest {
 			order: OifOrder::OifEscrowV0 { payload },
 			signature: alloy_primitives::Bytes::from(vec![0u8; 65]),
+			quote_id: None,
+			origin_submission: None,
+		}
+	}
+
+	fn address_from_secret(secret: &SecretKey) -> alloy_primitives::Address {
+		let secp = Secp256k1::new();
+		let public_key = PublicKey::from_secret_key(&secp, secret);
+		let public_key_bytes = public_key.serialize_uncompressed();
+		let user_hash = alloy_primitives::keccak256(&public_key_bytes[1..]);
+		alloy_primitives::Address::from_slice(&user_hash[12..])
+	}
+
+	fn sign_permit2_payload(payload: &OrderPayload, secret: &SecretKey) -> alloy_primitives::Bytes {
+		let digest = solver_types::utils::eip712::reconstruct_permit2_digest(payload)
+			.expect("permit2 digest should reconstruct");
+		let secp = Secp256k1::new();
+		let message = Message::from_digest(digest);
+		let signature = secp.sign_ecdsa_recoverable(message, secret);
+		let (recovery_id, sig_bytes) = signature.serialize_compact();
+		let mut bytes = Vec::with_capacity(65);
+		bytes.extend_from_slice(&sig_bytes);
+		bytes.push(i32::from(recovery_id) as u8);
+		alloy_primitives::Bytes::from(bytes)
+	}
+
+	fn sample_permit2_request_with_witness_user(
+		witness_user: &str,
+		secret: &SecretKey,
+	) -> PostOrderRequest {
+		let payload = OrderPayload {
+			signature_type: SignatureType::Eip712,
+			domain: json!({
+				"name": "Permit2",
+				"chainId": "1",
+				"verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+			}),
+			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
+			message: json!({
+				"permitted": [{
+					"token": "0x0000000000000000000000000000000000000033",
+					"amount": "1000"
+				}],
+				"spender": "0x0000000000000000000000000000000000000011",
+				"nonce": "1",
+				"deadline": "1700000100",
+				"witness": {
+					"user": witness_user,
+					"expires": 1700000000u64,
+					"inputOracle": "0x2222222222222222222222222222222222222222",
+					"outputs": [{
+						"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
+						"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
+						"chainId": 42161,
+						"token": "0x0000000000000000000000000000000000000000000000000000000000000033",
+						"amount": "900",
+						"recipient": "0x0000000000000000000000005555555555555555555555555555555555555555",
+						"callbackData": "0x",
+						"context": "0x"
+					}]
+				}
+			}),
+			types: None,
+		};
+
+		PostOrderRequest {
+			order: OifOrder::OifEscrowV0 {
+				payload: payload.clone(),
+			},
+			signature: sign_permit2_payload(&payload, secret),
 			quote_id: None,
 			origin_submission: None,
 		}
@@ -1433,5 +1507,49 @@ mod tests {
 				..
 			}
 		));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn extract_intent_request_preserves_witness_user_for_permit2_orders() {
+		let state = build_test_app_state(None).await;
+		let witness_user = "0x1111111111111111111111111111111111111111";
+		let secret = SecretKey::from_byte_array([0x31u8; 32]).expect("valid secret");
+		let sponsor = address_from_secret(&secret);
+		assert_ne!(format!("{sponsor:#x}"), witness_user);
+
+		let request = sample_permit2_request_with_witness_user(witness_user, &secret);
+		let payload = to_value(&request).expect("serialize request");
+
+		let result = super::extract_intent_request(payload, &state, "eip7683")
+			.await
+			.expect("expected successful extraction");
+
+		let OifOrder::OifEscrowV0 { payload } = &result.order else {
+			panic!("expected permit2 order");
+		};
+		assert_eq!(
+			payload
+				.message
+				.get("witness")
+				.and_then(|w| w.get("user"))
+				.and_then(|u| u.as_str()),
+			Some(witness_user)
+		);
+		assert!(
+			payload.message.get("user").is_none(),
+			"permit2 acceptance should not rewrite the logical order user"
+		);
+
+		let standard_order =
+			OifStandardOrder::try_from(&result.order).expect("standard order conversion");
+		assert_eq!(format!("{:#x}", standard_order.user), witness_user);
+		assert_ne!(
+			format!("{:#x}", standard_order.user),
+			format!("{:#x}", sponsor)
+		);
+		assert_eq!(
+			hex::encode(result.signature.as_ref()),
+			hex::encode(request.signature.as_ref())
+		);
 	}
 }

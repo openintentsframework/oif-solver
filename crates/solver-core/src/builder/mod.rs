@@ -77,36 +77,36 @@ impl SolverBuilder {
 		factories: SolverFactories<SF, AF, DF, DIF, OF, PF, SEF, STF>,
 	) -> Result<SolverEngine, BuilderError>
 	where
-		SF: Fn(&toml::Value) -> Result<Box<dyn StorageInterface>, StorageError>,
+		SF: Fn(&serde_json::Value) -> Result<Box<dyn StorageInterface>, StorageError>,
 		for<'a> AF: Fn(
-			&'a toml::Value,
+			&'a serde_json::Value,
 		) -> Pin<
 			Box<dyn Future<Output = Result<Box<dyn AccountInterface>, AccountError>> + Send + 'a>,
 		>,
 		DF: Fn(
-			&toml::Value,
+			&serde_json::Value,
 			&solver_types::NetworksConfig,
 			&solver_account::AccountSigner,
 			&std::collections::HashMap<u64, solver_account::AccountSigner>,
 		) -> Result<Box<dyn DeliveryInterface>, DeliveryError>,
 		DIF: Fn(
-			&toml::Value,
+			&serde_json::Value,
 			&solver_types::NetworksConfig,
 		) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError>,
 		OF: Fn(
-			&toml::Value,
+			&serde_json::Value,
 			&solver_types::NetworksConfig,
 			&solver_types::oracle::OracleRoutes,
 		) -> Result<Box<dyn OrderInterface>, OrderError>,
 		PF: Fn(
-			&toml::Value,
+			&serde_json::Value,
 		) -> Result<Box<dyn solver_pricing::PricingInterface>, solver_types::PricingError>,
 		SEF: Fn(
-			&toml::Value,
+			&serde_json::Value,
 			&solver_types::NetworksConfig,
 			Arc<StorageService>,
 		) -> Result<Box<dyn SettlementInterface>, SettlementError>,
-		STF: Fn(&toml::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError>,
+		STF: Fn(&serde_json::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError>,
 	{
 		// Create storage implementations
 		let mut storage_impls = HashMap::new();
@@ -230,7 +230,7 @@ impl SolverBuilder {
 			if let Some(factory) = factories.delivery_factories.get(name) {
 				// Parse per-network account mappings from config
 				let mut network_signers = HashMap::new();
-				if let Some(accounts_table) = config.get("accounts").and_then(|v| v.as_table()) {
+				if let Some(accounts_table) = config.get("accounts").and_then(|v| v.as_object()) {
 					for (network_id_str, account_name_value) in accounts_table {
 						if let Ok(network_id) = network_id_str.parse::<u64>() {
 							if let Some(account_name) = account_name_value.as_str() {
@@ -262,7 +262,7 @@ impl SolverBuilder {
 							let implementation_arc: Arc<dyn DeliveryInterface> =
 								implementation.into();
 							for network_id_value in network_ids {
-								if let Some(network_id) = network_id_value.as_integer() {
+								if let Some(network_id) = network_id_value.as_i64() {
 									let network_id = network_id as u64;
 									delivery_implementations
 										.insert(network_id, implementation_arc.clone());
@@ -340,13 +340,14 @@ impl SolverBuilder {
 
 		let discovery = Arc::new(DiscoveryService::new(discovery_implementations));
 
-		// Create settlement implementations first (needed for oracle routes)
+		// Create settlement implementations (needed for oracle routes)
 		let mut settlement_impls = HashMap::new();
+		let primary = self.static_config.settlement.primary.clone();
+
 		for (name, config) in &self.static_config.settlement.implementations {
 			if let Some(factory) = factories.settlement_factories.get(name) {
 				match factory(config, &self.static_config.networks, storage.clone()) {
 					Ok(implementation) => {
-						// Validation already happened in the factory
 						settlement_impls.insert(name.clone(), implementation);
 						tracing::info!(component = "settlement", implementation = %name, "Loaded");
 					},
@@ -369,10 +370,15 @@ impl SolverBuilder {
 			tracing::warn!(
 				"No settlement implementations available - solver will not be able to monitor and claim settlements"
 			);
+		} else if !primary.is_empty() && !settlement_impls.contains_key(&primary) {
+			return Err(BuilderError::Config(format!(
+				"Settlement primary '{primary}' not found in loaded implementations"
+			)));
 		}
 
 		let settlement = Arc::new(SettlementService::new(
 			settlement_impls,
+			primary,
 			self.static_config
 				.settlement
 				.settlement_poll_interval_seconds,

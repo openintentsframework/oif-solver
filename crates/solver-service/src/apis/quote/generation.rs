@@ -91,7 +91,7 @@ impl QuoteGenerator {
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
-	) -> Result<Vec<Quote>, QuoteError> {
+	) -> Result<Vec<(Quote, Option<String>)>, QuoteError> {
 		let mut quotes = Vec::new();
 		for input in &request.intent.inputs {
 			let order_input: OrderInput = input.try_into()?;
@@ -99,17 +99,17 @@ impl QuoteGenerator {
 				.custody_strategy
 				.decide_custody(&order_input, request.intent.origin_submission.as_ref())
 				.await?;
-			if let Ok(quote) = self
+			if let Ok(result) = self
 				.generate_quote_for_settlement(request, config, &custody_decision)
 				.await
 			{
-				quotes.push(quote);
+				quotes.push(result);
 			}
 		}
 		if quotes.is_empty() {
 			return Err(QuoteError::InsufficientLiquidity);
 		}
-		self.sort_quotes_by_preference(&mut quotes, &request.intent.preference);
+		self.sort_quotes_by_preference_pairs(&mut quotes, &request.intent.preference);
 		Ok(quotes)
 	}
 
@@ -120,7 +120,7 @@ impl QuoteGenerator {
 		context: &ValidatedQuoteContext,
 		cost_context: &CostContext,
 		config: &Config,
-	) -> Result<Vec<Quote>, QuoteError> {
+	) -> Result<Vec<(Quote, Option<String>)>, QuoteError> {
 		// Build a new request with swap amounts and cost adjustments from CostContext
 		let adjusted_request = self.build_cost_adjusted_request(request, context, cost_context)?;
 
@@ -344,12 +344,15 @@ impl QuoteGenerator {
 		request: &GetQuoteRequest,
 		config: &Config,
 		custody_decision: &CustodyDecision,
-	) -> Result<Quote, QuoteError> {
+	) -> Result<(Quote, Option<String>), QuoteError> {
 		let quote_id = Uuid::new_v4().to_string();
-		let order = match custody_decision {
+		let (order, settlement_name) = match custody_decision {
 			CustodyDecision::ResourceLock { lock } => {
-				self.generate_resource_lock_order(request, config, lock)
-					.await?
+				let order = self
+					.generate_resource_lock_order(request, config, lock)
+					.await?;
+				// Resource lock orders don't have a settlement name (handled differently)
+				(order, None)
 			},
 			CustodyDecision::Escrow { lock_type } => {
 				self.generate_escrow_order(request, config, lock_type)
@@ -372,7 +375,7 @@ impl QuoteGenerator {
 		// Get partial fill preference from request or default to false
 		let partial_fill = request.intent.partial_fill.unwrap_or(false);
 
-		Ok(Quote {
+		let quote = Quote {
 			order: order.clone(),
 			failure_handling,
 			partial_fill,
@@ -381,7 +384,9 @@ impl QuoteGenerator {
 			quote_id,
 			provider: Some("oif-solver".to_string()),
 			preview: QuotePreview::from_order_and_user(&order, &request.user),
-		})
+		};
+
+		Ok((quote, settlement_name))
 	}
 
 	async fn generate_resource_lock_order(
@@ -450,12 +455,20 @@ impl QuoteGenerator {
 		Ok(order)
 	}
 
+	/// Generates an escrow order and returns it along with the selected settlement name.
 	async fn generate_escrow_order(
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
 		lock_type: &LockType,
-	) -> Result<OifOrder, QuoteError> {
+	) -> Result<(OifOrder, Option<String>), QuoteError> {
+		// Validate lock type before doing any expensive lookups.
+		if !matches!(lock_type, LockType::Permit2Escrow | LockType::Eip3009Escrow) {
+			return Err(QuoteError::UnsupportedSettlement(format!(
+				"Unsupported escrow type: {lock_type:?}"
+			)));
+		}
+
 		// Extract chain from first output to find appropriate settlement
 		// TODO: Implement support for multiple destination chains
 		let origin_chain_id = request
@@ -477,28 +490,35 @@ impl QuoteGenerator {
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid chain ID: {e}")))?;
 
 		// For escrow orders, get settlement that supports both chains
-		let (_settlement, input_oracle, output_oracle) = self
+		let (selected_settlement, _settlement, input_oracle, output_oracle) = self
 			.settlement_service
-			.get_any_settlement_for_chains(origin_chain_id, destination_chain_id)
+			.get_any_settlement_for_chains_with_name(origin_chain_id, destination_chain_id)
 			.ok_or_else(|| {
 				QuoteError::InvalidRequest(format!(
 					"No suitable settlement available for escrow from chain {origin_chain_id} to chain {destination_chain_id}"
 				))
 			})?;
+		tracing::debug!(
+			origin_chain_id,
+			destination_chain_id,
+			settlement = selected_settlement,
+			"Selected settlement for escrow quote"
+		);
 
-		match lock_type {
+		let order = match lock_type {
 			LockType::Permit2Escrow => {
 				self.generate_permit2_order(request, config, input_oracle, output_oracle)
-					.await
+					.await?
 			},
-			LockType::Eip3009Escrow => {
+			// Permit2Escrow and Eip3009Escrow are the only variants that reach
+			// here; the early-return guard above rules out all other lock types.
+			_ => {
 				self.generate_eip3009_order(request, config, input_oracle, output_oracle)
-					.await
+					.await?
 			},
-			_ => Err(QuoteError::UnsupportedSettlement(format!(
-				"Unsupported escrow type: {lock_type:?}"
-			))),
-		}
+		};
+
+		Ok((order, Some(selected_settlement.to_string())))
 	}
 
 	async fn generate_permit2_order(
@@ -1032,14 +1052,19 @@ impl QuoteGenerator {
 		})?;
 
 		// Get preferred settlement for TheCompact (prioritizes Direct settlement like escrow)
-		let (_input_settlement, input_oracle, _output_oracle) = self
+		let (selected_input_settlement, _input_settlement, input_oracle, _output_oracle) = self
 			.settlement_service
-			.get_any_settlement_for_chain(origin_chain_id)
+			.get_any_settlement_for_chain_with_name(origin_chain_id)
 			.ok_or_else(|| {
 				QuoteError::InvalidRequest(format!(
 					"No suitable settlement available for TheCompact on chain {origin_chain_id}"
 				))
 			})?;
+		tracing::debug!(
+			chain_id = origin_chain_id,
+			settlement = selected_input_settlement,
+			"Selected settlement for resource-lock input chain"
+		);
 
 		// Convert inputs to the format expected by TheCompact
 		// For ResourceLock orders, we need to build the proper token IDs and amounts
@@ -1088,14 +1113,24 @@ impl QuoteGenerator {
 				.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output chain ID: {e}")))?;
 
 			// Get preferred settlement for the output chain (prioritizes Direct settlement like escrow)
-			let (_output_settlement, _output_input_oracle, output_oracle) = self
+			let (
+				selected_output_settlement,
+				_output_settlement,
+				_output_input_oracle,
+				output_oracle,
+			) = self
 				.settlement_service
-				.get_any_settlement_for_chain(output_chain_id)
+				.get_any_settlement_for_chain_with_name(output_chain_id)
 				.ok_or_else(|| {
 					QuoteError::InvalidRequest(format!(
 						"No suitable settlement available for output chain {output_chain_id}"
 					))
 				})?;
+			tracing::debug!(
+				chain_id = output_chain_id,
+				settlement = selected_output_settlement,
+				"Selected settlement for resource-lock output chain"
+			);
 
 			// Get output settler from config (like permit2 flow)
 			let dest_net = config.networks.get(&output_chain_id).ok_or_else(|| {
@@ -1498,13 +1533,13 @@ impl QuoteGenerator {
 		}
 	}
 
-	fn sort_quotes_by_preference(
+	fn sort_quotes_by_preference_pairs(
 		&self,
-		quotes: &mut [Quote],
+		quotes: &mut [(Quote, Option<String>)],
 		preference: &Option<QuotePreference>,
 	) {
 		match preference {
-			Some(QuotePreference::Speed) => quotes.sort_by(|a, b| match (a.eta, b.eta) {
+			Some(QuotePreference::Speed) => quotes.sort_by(|(a, _), (b, _)| match (a.eta, b.eta) {
 				(Some(eta_a), Some(eta_b)) => eta_a.cmp(&eta_b),
 				(Some(_), None) => std::cmp::Ordering::Less,
 				(None, Some(_)) => std::cmp::Ordering::Greater,
@@ -1541,14 +1576,45 @@ impl QuoteGenerator {
 
 	/// Gets the expires duration from configuration.
 	///
-	/// Returns the configured expires seconds from api.quote config or default.
+	/// Returns the configured expires seconds from api.quote config.
+	///
+	/// If api.quote is not configured, this falls back to the larger of:
+	/// - QuoteConfig default expires
+	/// - settlement implementation `intent_min_expiry_seconds` (when present)
+	///
+	/// This keeps quote expiry aligned with settlement admission guards so
+	/// broadcaster intents are not rejected immediately for short windows.
 	fn get_expires_seconds(&self, config: &Config) -> u64 {
-		config
+		let fill_deadline = self.get_fill_deadline_seconds(config);
+		if let Some(expires_seconds) = config
 			.api
 			.as_ref()
 			.and_then(|api| api.quote.as_ref())
 			.map(|quote| quote.expires_seconds)
-			.unwrap_or_else(|| QuoteConfig::default().expires_seconds)
+		{
+			// Clamp to fill deadline so quotes never expire before they can be filled.
+			return expires_seconds.max(fill_deadline);
+		}
+
+		let default_expires = QuoteConfig::default().expires_seconds;
+		let settlement_min_expiry: u64 = config
+			.settlement
+			.implementations
+			.values()
+			.filter_map(|implementation| {
+				implementation
+					.as_object()
+					.and_then(|table| table.get("intent_min_expiry_seconds"))
+					.and_then(|value| value.as_i64())
+					.filter(|seconds| *seconds >= 0)
+					.map(|seconds| seconds as u64)
+			})
+			.max()
+			.unwrap_or(0);
+
+		let admission_safe_expires =
+			settlement_min_expiry.saturating_add(self.get_fill_deadline_seconds(config));
+		default_expires.max(admission_safe_expires)
 	}
 
 	/// Generates EIP-712 types definition for Permit2 orders
@@ -1577,6 +1643,7 @@ impl QuoteGenerator {
 				{"name": "context", "type": "bytes"}
 			],
 			"Permit2Witness": [
+				{"name": "user", "type": "address"},
 				{"name": "expires", "type": "uint32"},
 				{"name": "inputOracle", "type": "address"},
 				{"name": "outputs", "type": "MandateOutput[]"}
@@ -1715,6 +1782,7 @@ mod tests {
 		// Create settlement configuration with domain
 		let settlement_config = SettlementConfig {
 			implementations: HashMap::new(),
+			primary: String::new(),
 			settlement_poll_interval_seconds: 3,
 		};
 
@@ -1796,6 +1864,7 @@ mod tests {
 		}
 
 		let mut mock_settlement = MockSettlementInterface::new();
+		let route_support = routes.clone();
 		mock_settlement
 			.expect_oracle_config()
 			.return_const(solver_settlement::OracleConfig {
@@ -1803,6 +1872,13 @@ mod tests {
 				output_oracles,
 				routes,
 				selection_strategy: solver_settlement::OracleSelectionStrategy::First,
+			});
+		mock_settlement
+			.expect_is_route_supported()
+			.returning(move |input_chain, output_chain| {
+				route_support
+					.get(&input_chain)
+					.is_some_and(|outputs| outputs.contains(&output_chain))
 			});
 
 		if with_oracles {
@@ -1815,7 +1891,11 @@ mod tests {
 		let mut implementations: HashMap<String, Box<dyn SettlementInterface>> = HashMap::new();
 		implementations.insert("test".to_string(), Box::new(mock_settlement));
 
-		Arc::new(SettlementService::new(implementations, 3))
+		Arc::new(SettlementService::new(
+			implementations,
+			"test".to_string(),
+			3,
+		))
 	}
 
 	fn create_exact_output_request(
@@ -2030,10 +2110,10 @@ mod tests {
 
 		// Should succeed since we have properly configured oracles
 		assert!(result.is_ok());
-		let quotes = result.unwrap();
-		assert!(!quotes.is_empty());
+		let pairs = result.unwrap();
+		assert!(!pairs.is_empty());
 
-		let quote = &quotes[0];
+		let quote = &pairs[0].0;
 		assert_eq!(quote.provider, Some("oif-solver".to_string()));
 		assert!(quote.valid_until > 0);
 		assert!(quote.eta.is_some());
@@ -2289,7 +2369,7 @@ mod tests {
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 
-		let mut quotes = vec![
+		let quotes = vec![
 			Quote {
 				order: OifOrder::OifEscrowV0 {
 					payload: OrderPayload {
@@ -2355,12 +2435,14 @@ mod tests {
 			},
 		];
 
-		generator.sort_quotes_by_preference(&mut quotes, &Some(QuotePreference::Speed));
+		let mut pairs: Vec<(Quote, Option<String>)> =
+			quotes.into_iter().map(|q| (q, None)).collect();
+		generator.sort_quotes_by_preference_pairs(&mut pairs, &Some(QuotePreference::Speed));
 
 		// Should be sorted by ETA ascending (fastest first)
-		assert_eq!(quotes[0].eta, Some(100));
-		assert_eq!(quotes[1].eta, Some(200));
-		assert_eq!(quotes[2].eta, None); // None should be last
+		assert_eq!(pairs[0].0.eta, Some(100));
+		assert_eq!(pairs[1].0.eta, Some(200));
+		assert_eq!(pairs[2].0.eta, None); // None should be last
 	}
 
 	#[test]
@@ -2370,7 +2452,7 @@ mod tests {
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 
-		let mut quotes = vec![
+		let quotes = vec![
 			Quote {
 				order: OifOrder::OifEscrowV0 {
 					payload: OrderPayload {
@@ -2415,24 +2497,28 @@ mod tests {
 			},
 		];
 
-		let original_order = quotes.clone();
+		let mut pairs: Vec<(Quote, Option<String>)> =
+			quotes.into_iter().map(|q| (q, None)).collect();
+		let original_order: Vec<String> = pairs.iter().map(|(q, _)| q.quote_id.clone()).collect();
 
 		// Test that other preferences don't change order
-		generator.sort_quotes_by_preference(&mut quotes, &Some(QuotePreference::Price));
-		assert_eq!(quotes[0].quote_id, original_order[0].quote_id);
-		assert_eq!(quotes[1].quote_id, original_order[1].quote_id);
+		generator.sort_quotes_by_preference_pairs(&mut pairs, &Some(QuotePreference::Price));
+		assert_eq!(pairs[0].0.quote_id, original_order[0]);
+		assert_eq!(pairs[1].0.quote_id, original_order[1]);
 
-		generator.sort_quotes_by_preference(&mut quotes, &Some(QuotePreference::TrustMinimization));
-		assert_eq!(quotes[0].quote_id, original_order[0].quote_id);
-		assert_eq!(quotes[1].quote_id, original_order[1].quote_id);
+		generator
+			.sort_quotes_by_preference_pairs(&mut pairs, &Some(QuotePreference::TrustMinimization));
+		assert_eq!(pairs[0].0.quote_id, original_order[0]);
+		assert_eq!(pairs[1].0.quote_id, original_order[1]);
 
-		generator.sort_quotes_by_preference(&mut quotes, &Some(QuotePreference::InputPriority));
-		assert_eq!(quotes[0].quote_id, original_order[0].quote_id);
-		assert_eq!(quotes[1].quote_id, original_order[1].quote_id);
+		generator
+			.sort_quotes_by_preference_pairs(&mut pairs, &Some(QuotePreference::InputPriority));
+		assert_eq!(pairs[0].0.quote_id, original_order[0]);
+		assert_eq!(pairs[1].0.quote_id, original_order[1]);
 
-		generator.sort_quotes_by_preference(&mut quotes, &None);
-		assert_eq!(quotes[0].quote_id, original_order[0].quote_id);
-		assert_eq!(quotes[1].quote_id, original_order[1].quote_id);
+		generator.sort_quotes_by_preference_pairs(&mut pairs, &None);
+		assert_eq!(pairs[0].0.quote_id, original_order[0]);
+		assert_eq!(pairs[1].0.quote_id, original_order[1]);
 	}
 
 	#[test]
@@ -2474,7 +2560,7 @@ mod tests {
 			.await;
 
 		match result {
-			Ok(quote) => {
+			Ok((quote, _settlement_name)) => {
 				assert!(!quote.quote_id.is_empty());
 				assert_eq!(quote.provider, Some("oif-solver".to_string()));
 				assert!(quote.valid_until > 0);
@@ -2512,7 +2598,7 @@ mod tests {
 			.await;
 
 		match result {
-			Ok(quote) => {
+			Ok((quote, _settlement_name)) => {
 				assert!(!quote.quote_id.is_empty());
 				assert_eq!(quote.provider, Some("oif-solver".to_string()));
 				assert!(quote.valid_until > 0);
@@ -2869,12 +2955,15 @@ mod tests {
 			.await;
 
 		match result {
-			Ok(order) => match order {
-				OifOrder::OifEscrowV0 { payload } => {
-					assert_eq!(payload.signature_type, SignatureType::Eip712);
-					assert_eq!(payload.primary_type, "PermitBatchWitnessTransferFrom");
-				},
-				_ => panic!("Expected OifEscrowV0 order"),
+			Ok((order, settlement_name)) => {
+				assert!(settlement_name.is_some());
+				match order {
+					OifOrder::OifEscrowV0 { payload } => {
+						assert_eq!(payload.signature_type, SignatureType::Eip712);
+						assert_eq!(payload.primary_type, "PermitBatchWitnessTransferFrom");
+					},
+					_ => panic!("Expected OifEscrowV0 order"),
+				}
 			},
 			Err(e) => {
 				// Expected due to missing settlement or configuration
@@ -2897,12 +2986,15 @@ mod tests {
 			.await;
 
 		match result {
-			Ok(order) => match order {
-				OifOrder::Oif3009V0 { payload, .. } => {
-					assert_eq!(payload.signature_type, SignatureType::Eip712);
-					assert_eq!(payload.primary_type, "ReceiveWithAuthorization");
-				},
-				_ => panic!("Expected Oif3009V0 order"),
+			Ok((order, settlement_name)) => {
+				assert!(settlement_name.is_some());
+				match order {
+					OifOrder::Oif3009V0 { payload, .. } => {
+						assert_eq!(payload.signature_type, SignatureType::Eip712);
+						assert_eq!(payload.primary_type, "ReceiveWithAuthorization");
+					},
+					_ => panic!("Expected Oif3009V0 order"),
+				}
 			},
 			Err(e) => {
 				// Expected due to missing settlement or contract calls failing
@@ -3415,8 +3507,8 @@ mod tests {
 		let result = generator.generate_quotes(&request, &config).await;
 
 		match result {
-			Ok(quotes) => {
-				let quote = &quotes[0];
+			Ok(pairs) => {
+				let quote = &pairs[0].0;
 				assert_eq!(quote.failure_handling, FailureHandlingMode::RefundClaim);
 				assert!(quote.partial_fill);
 			},
@@ -3441,8 +3533,8 @@ mod tests {
 		let result = generator.generate_quotes(&request, &config).await;
 
 		match result {
-			Ok(quotes) => {
-				let quote = &quotes[0];
+			Ok(pairs) => {
+				let quote = &pairs[0].0;
 				assert_eq!(quote.failure_handling, FailureHandlingMode::RefundClaim);
 			},
 			Err(_) => {
@@ -3486,8 +3578,8 @@ mod tests {
 		let result = generator.generate_quotes(&request, &config).await;
 
 		match result {
-			Ok(quotes) => {
-				let quote = &quotes[0];
+			Ok(pairs) => {
+				let quote = &pairs[0].0;
 				// Should use min_valid_until for expiry calculation
 				assert!(quote.valid_until >= 1234567890);
 			},
@@ -3572,6 +3664,13 @@ mod tests {
 			Ok(message) => {
 				assert!(message.is_object());
 				let message_obj = message.as_object().unwrap();
+				let expected_user = format!(
+					"0x{:x}",
+					request
+						.user
+						.ethereum_address()
+						.expect("quote request should contain an ethereum user")
+				);
 
 				// Verify required Permit2 message fields
 				assert!(message_obj.contains_key("permitted"));
@@ -3579,6 +3678,14 @@ mod tests {
 				assert!(message_obj.contains_key("nonce"));
 				assert!(message_obj.contains_key("deadline"));
 				assert!(message_obj.contains_key("witness"));
+				assert!(!message_obj.contains_key("user"));
+				assert_eq!(
+					message_obj
+						.get("witness")
+						.and_then(|w| w.get("user"))
+						.and_then(|u| u.as_str()),
+					Some(expected_user.as_str())
+				);
 			},
 			Err(e) => {
 				// Expected if permit2 module dependencies are missing

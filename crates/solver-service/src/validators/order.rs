@@ -359,9 +359,9 @@ mod tests {
 		)));
 		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 3));
 		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
-		let strategy = create_strategy(&toml::Value::Table(toml::map::Map::new())).unwrap();
+		let strategy = create_strategy(&serde_json::Value::Object(serde_json::Map::new())).unwrap();
 		let order = Arc::new(OrderService::new(HashMap::new(), strategy));
-		let settlement = Arc::new(SettlementService::new(HashMap::new(), 3));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 3));
 		let event_bus = EventBus::new(32);
 		let token_manager = Arc::new(TokenManager::new(
 			networks,
@@ -369,7 +369,7 @@ mod tests {
 			account.clone(),
 		));
 		let pricing_impl =
-			mock::create_mock_pricing(&toml::Value::Table(toml::map::Map::new())).unwrap();
+			mock::create_mock_pricing(&serde_json::Value::Object(serde_json::Map::new())).unwrap();
 		let pricing = Arc::new(PricingService::new(pricing_impl, Vec::new()));
 		let solver_address = solver_types::parse_address(TEST_SOLVER).unwrap();
 

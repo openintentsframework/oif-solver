@@ -103,7 +103,7 @@ pub type AccountFactoryFuture<'a> =
 ///
 /// The `for<'a>` higher-ranked trait bound ensures the returned future
 /// borrows the config safely for its entire lifetime.
-pub type AccountFactory = for<'a> fn(&'a toml::Value) -> AccountFactoryFuture<'a>;
+pub type AccountFactory = for<'a> fn(&'a serde_json::Value) -> AccountFactoryFuture<'a>;
 
 /// Registry trait for account implementations.
 ///
@@ -182,6 +182,13 @@ impl AccountService {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use serde_json::json;
+
+	fn local_account_config() -> serde_json::Value {
+		json!({
+			"private_key": "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+		})
+	}
 
 	#[test]
 	fn test_account_error_display() {
@@ -206,10 +213,7 @@ mod tests {
 	async fn test_account_service_new() {
 		use implementations::local::create_account;
 
-		let config: toml::Value = toml::from_str(
-			r#"private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80""#,
-		)
-		.unwrap();
+		let config = local_account_config();
 		let account = create_account(&config).await.unwrap();
 		let service = AccountService::new(account);
 		// Just verify it can be created
@@ -220,10 +224,7 @@ mod tests {
 	async fn test_account_service_get_address() {
 		use implementations::local::create_account;
 
-		let config: toml::Value = toml::from_str(
-			r#"private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80""#,
-		)
-		.unwrap();
+		let config = local_account_config();
 		let account = create_account(&config).await.unwrap();
 		let service = AccountService::new(account);
 
@@ -236,10 +237,7 @@ mod tests {
 		use alloy_primitives::U256;
 		use implementations::local::create_account;
 
-		let config: toml::Value = toml::from_str(
-			r#"private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80""#,
-		)
-		.unwrap();
+		let config = local_account_config();
 		let account = create_account(&config).await.unwrap();
 		let service = AccountService::new(account);
 
@@ -264,10 +262,7 @@ mod tests {
 	async fn test_account_service_get_private_key() {
 		use implementations::local::create_account;
 
-		let config: toml::Value = toml::from_str(
-			r#"private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80""#,
-		)
-		.unwrap();
+		let config = local_account_config();
 		let account = create_account(&config).await.unwrap();
 		let service = AccountService::new(account);
 
@@ -282,10 +277,7 @@ mod tests {
 	async fn test_account_service_signer() {
 		use implementations::local::create_account;
 
-		let config: toml::Value = toml::from_str(
-			r#"private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80""#,
-		)
-		.unwrap();
+		let config = local_account_config();
 		let account = create_account(&config).await.unwrap();
 		let service = AccountService::new(account);
 
