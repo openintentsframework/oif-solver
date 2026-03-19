@@ -20,3 +20,6 @@ tracing = "0.1"
 
 [features]
 testing = ["mockall"]
+
+[dev-dependencies]
+wiremock = "0.5"
