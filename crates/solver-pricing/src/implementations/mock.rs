@@ -13,7 +13,6 @@ use solver_types::{
 	MOCK_TOKB_USD_PRICE,
 };
 use std::collections::HashMap;
-use toml;
 
 /// Mock pricing implementation with fixed asset prices.
 pub struct MockPricing {
@@ -23,7 +22,7 @@ pub struct MockPricing {
 
 impl MockPricing {
 	/// Creates a new MockPricing instance with configuration.
-	pub fn new(config: &toml::Value) -> Result<Self, PricingError> {
+	pub fn new(config: &serde_json::Value) -> Result<Self, PricingError> {
 		let mut pair_prices = HashMap::new();
 
 		// Default prices
@@ -36,7 +35,7 @@ impl MockPricing {
 		pair_prices.insert("TOKB/USD".to_string(), MOCK_TOKB_USD_PRICE.to_string());
 
 		// Allow configuration overrides
-		if let Some(prices) = config.get("pair_prices").and_then(|v| v.as_table()) {
+		if let Some(prices) = config.get("pair_prices").and_then(|v| v.as_object()) {
 			for (pair, price) in prices {
 				if let Some(price_str) = price.as_str() {
 					pair_prices.insert(pair.to_uppercase(), price_str.to_string());
@@ -212,10 +211,10 @@ impl PricingInterface for MockPricing {
 pub struct MockPricingSchema;
 
 impl ConfigSchema for MockPricingSchema {
-	fn validate(&self, config: &toml::Value) -> Result<(), ValidationError> {
+	fn validate(&self, config: &serde_json::Value) -> Result<(), ValidationError> {
 		// Optional pair_prices validation
 		if let Some(pair_prices) = config.get("pair_prices") {
-			if let Some(table) = pair_prices.as_table() {
+			if let Some(table) = pair_prices.as_object() {
 				for (pair, price) in table {
 					// Validate pair format
 					if !pair.contains('/') {
@@ -263,7 +262,7 @@ impl PricingRegistry for MockPricingRegistry {}
 
 /// Factory function for creating MockPricing instances.
 pub fn create_mock_pricing(
-	config: &toml::Value,
+	config: &serde_json::Value,
 ) -> Result<Box<dyn PricingInterface>, PricingError> {
 	Ok(Box::new(MockPricing::new(config)?))
 }
@@ -272,8 +271,8 @@ pub fn create_mock_pricing(
 mod tests {
 	use super::*;
 
-	fn create_default_config() -> toml::Value {
-		toml::Value::Table(toml::map::Map::new())
+	fn create_default_config() -> serde_json::Value {
+		serde_json::Value::Object(serde_json::Map::new())
 	}
 
 	#[tokio::test]

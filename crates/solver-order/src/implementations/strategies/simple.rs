@@ -36,7 +36,7 @@ impl SimpleStrategy {
 pub struct SimpleStrategySchema;
 
 impl ConfigSchema for SimpleStrategySchema {
-	fn validate(&self, config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+	fn validate(&self, config: &serde_json::Value) -> Result<(), solver_types::ValidationError> {
 		let schema = Schema::new(
 			// Required fields
 			vec![],
@@ -176,7 +176,9 @@ impl ExecutionStrategy for SimpleStrategy {
 ///
 /// Configuration parameters:
 /// - `max_gas_price_gwei`: Maximum gas price in gwei (default: 100)
-pub fn create_strategy(config: &toml::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError> {
+pub fn create_strategy(
+	config: &serde_json::Value,
+) -> Result<Box<dyn ExecutionStrategy>, StrategyError> {
 	// Validate configuration using the schema
 	let schema = SimpleStrategySchema;
 	schema
@@ -185,7 +187,7 @@ pub fn create_strategy(config: &toml::Value) -> Result<Box<dyn ExecutionStrategy
 
 	let max_gas_price = config
 		.get("max_gas_price_gwei")
-		.and_then(|v| v.as_integer())
+		.and_then(|v| v.as_i64())
 		.unwrap_or(100) as u64;
 
 	Ok(Box::new(SimpleStrategy::new(max_gas_price)))
@@ -314,19 +316,22 @@ mod tests {
 		let schema = SimpleStrategySchema;
 
 		// Valid empty config
-		let valid_config = toml::Value::Table(toml::map::Map::new());
+		let valid_config = serde_json::Value::Object(serde_json::Map::new());
 		assert!(schema.validate(&valid_config).is_ok());
 
 		// Valid config with max_gas_price_gwei
-		let mut config_map = toml::map::Map::new();
-		config_map.insert("max_gas_price_gwei".to_string(), toml::Value::Integer(100));
-		let valid_config = toml::Value::Table(config_map);
+		let mut config_map = serde_json::Map::new();
+		config_map.insert(
+			"max_gas_price_gwei".to_string(),
+			serde_json::Value::from(100),
+		);
+		let valid_config = serde_json::Value::Object(config_map);
 		assert!(schema.validate(&valid_config).is_ok());
 
 		// Invalid config with zero gas price
-		let mut config_map = toml::map::Map::new();
-		config_map.insert("max_gas_price_gwei".to_string(), toml::Value::Integer(0));
-		let invalid_config = toml::Value::Table(config_map);
+		let mut config_map = serde_json::Map::new();
+		config_map.insert("max_gas_price_gwei".to_string(), serde_json::Value::from(0));
+		let invalid_config = serde_json::Value::Object(config_map);
 		assert!(schema.validate(&invalid_config).is_err());
 	}
 
@@ -560,21 +565,24 @@ mod tests {
 	#[test]
 	fn test_create_strategy_factory() {
 		// Test with default config
-		let config = toml::Value::Table(toml::map::Map::new());
+		let config = serde_json::Value::Object(serde_json::Map::new());
 		let result = create_strategy(&config);
 		assert!(result.is_ok());
 
 		// Test with custom max gas price
-		let mut config_map = toml::map::Map::new();
-		config_map.insert("max_gas_price_gwei".to_string(), toml::Value::Integer(75));
-		let config = toml::Value::Table(config_map);
+		let mut config_map = serde_json::Map::new();
+		config_map.insert(
+			"max_gas_price_gwei".to_string(),
+			serde_json::Value::from(75),
+		);
+		let config = serde_json::Value::Object(config_map);
 		let result = create_strategy(&config);
 		assert!(result.is_ok());
 
 		// Test with invalid config
-		let mut config_map = toml::map::Map::new();
-		config_map.insert("max_gas_price_gwei".to_string(), toml::Value::Integer(0));
-		let config = toml::Value::Table(config_map);
+		let mut config_map = serde_json::Map::new();
+		config_map.insert("max_gas_price_gwei".to_string(), serde_json::Value::from(0));
+		let config = serde_json::Value::Object(config_map);
 		let result = create_strategy(&config);
 		assert!(result.is_err());
 	}

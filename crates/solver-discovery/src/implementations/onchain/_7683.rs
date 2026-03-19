@@ -423,14 +423,16 @@ pub struct Eip7683DiscoverySchema;
 
 impl Eip7683DiscoverySchema {
 	/// Static validation method for use before instance creation
-	pub fn validate_config(config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+	pub fn validate_config(
+		config: &serde_json::Value,
+	) -> Result<(), solver_types::ValidationError> {
 		let instance = Self;
 		instance.validate(config)
 	}
 }
 
 impl ConfigSchema for Eip7683DiscoverySchema {
-	fn validate(&self, config: &toml::Value) -> Result<(), solver_types::ValidationError> {
+	fn validate(&self, config: &serde_json::Value) -> Result<(), solver_types::ValidationError> {
 		let schema = Schema::new(
 			// Required fields
 			vec![Field::new(
@@ -571,7 +573,7 @@ impl DiscoveryInterface for Eip7683Discovery {
 /// - Any network_id is not found in the networks configuration
 /// - The discovery service cannot be created (e.g., connection failure)
 pub fn create_discovery(
-	config: &toml::Value,
+	config: &serde_json::Value,
 	networks: &NetworksConfig,
 ) -> Result<Box<dyn DiscoveryInterface>, DiscoveryError> {
 	// Validate configuration first
@@ -584,7 +586,7 @@ pub fn create_discovery(
 		.and_then(|v| v.as_array())
 		.map(|arr| {
 			arr.iter()
-				.filter_map(|v| v.as_integer().map(|i| i as u64))
+				.filter_map(|v| v.as_i64().map(|i| i as u64))
 				.collect::<Vec<_>>()
 		})
 		.ok_or_else(|| DiscoveryError::ValidationError("network_ids is required".to_string()))?;
@@ -597,7 +599,7 @@ pub fn create_discovery(
 
 	let polling_interval_secs = config
 		.get("polling_interval_secs")
-		.and_then(|v| v.as_integer())
+		.and_then(|v| v.as_i64())
 		.map(|v| v as u64);
 
 	// Create discovery service synchronously
@@ -631,7 +633,6 @@ mod tests {
 	use alloy_rpc_types::Log;
 	use solver_types::utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder};
 	use solver_types::NetworksConfig;
-	use std::collections::HashMap;
 	use tokio::sync::mpsc;
 
 	// Helper function to create a test networks config
@@ -698,14 +699,10 @@ mod tests {
 
 	#[test]
 	fn test_config_schema_validation_valid() {
-		let config = toml::Value::try_from(HashMap::from([
-			(
-				"network_ids",
-				toml::Value::Array(vec![toml::Value::Integer(1)]),
-			),
-			("polling_interval_secs", toml::Value::Integer(5)),
-		]))
-		.unwrap();
+		let config = serde_json::json!({
+			"network_ids": [1],
+			"polling_interval_secs": 5
+		});
 
 		let result = Eip7683DiscoverySchema::validate_config(&config);
 		assert!(result.is_ok());
@@ -713,11 +710,9 @@ mod tests {
 
 	#[test]
 	fn test_config_schema_validation_missing_network_ids() {
-		let config = toml::Value::try_from(HashMap::from([(
-			"polling_interval_secs",
-			toml::Value::Integer(5),
-		)]))
-		.unwrap();
+		let config = serde_json::json!({
+			"polling_interval_secs": 5
+		});
 
 		let result = Eip7683DiscoverySchema::validate_config(&config);
 		assert!(result.is_err());
@@ -725,9 +720,9 @@ mod tests {
 
 	#[test]
 	fn test_config_schema_validation_empty_network_ids() {
-		let config =
-			toml::Value::try_from(HashMap::from([("network_ids", toml::Value::Array(vec![]))]))
-				.unwrap();
+		let config = serde_json::json!({
+			"network_ids": []
+		});
 
 		let result = Eip7683DiscoverySchema::validate_config(&config);
 		assert!(result.is_err());
@@ -735,17 +730,10 @@ mod tests {
 
 	#[test]
 	fn test_config_schema_validation_invalid_polling_interval() {
-		let config = toml::Value::try_from(HashMap::from([
-			(
-				"network_ids",
-				toml::Value::Array(vec![toml::Value::Integer(1)]),
-			),
-			(
-				"polling_interval_secs",
-				toml::Value::Integer((MAX_POLLING_INTERVAL_SECS + 100) as i64),
-			),
-		]))
-		.unwrap();
+		let config = serde_json::json!({
+			"network_ids": [1],
+			"polling_interval_secs": (MAX_POLLING_INTERVAL_SECS + 100)
+		});
 
 		let result = Eip7683DiscoverySchema::validate_config(&config);
 		assert!(result.is_err());
@@ -753,14 +741,10 @@ mod tests {
 
 	#[test]
 	fn test_config_schema_validation_websocket_mode() {
-		let config = toml::Value::try_from(HashMap::from([
-			(
-				"network_ids",
-				toml::Value::Array(vec![toml::Value::Integer(1)]),
-			),
-			("polling_interval_secs", toml::Value::Integer(0)), // WebSocket mode
-		]))
-		.unwrap();
+		let config = serde_json::json!({
+			"network_ids": [1],
+			"polling_interval_secs": 0
+		}); // WebSocket mode
 
 		let result = Eip7683DiscoverySchema::validate_config(&config);
 		assert!(result.is_ok());
@@ -954,11 +938,9 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_create_discovery_invalid_config() {
-		let config = toml::Value::try_from(HashMap::from([
-			("polling_interval_secs", toml::Value::Integer(5)),
-			// Missing network_ids
-		]))
-		.unwrap();
+		let config = serde_json::json!({
+			"polling_interval_secs": 5
+		}); // Missing network_ids
 
 		let networks = create_test_networks();
 		let result = create_discovery(&config, &networks);
@@ -973,9 +955,9 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_create_discovery_empty_network_ids() {
-		let config =
-			toml::Value::try_from(HashMap::from([("network_ids", toml::Value::Array(vec![]))]))
-				.unwrap();
+		let config = serde_json::json!({
+			"network_ids": []
+		});
 
 		let networks = create_test_networks();
 		let result = create_discovery(&config, &networks);

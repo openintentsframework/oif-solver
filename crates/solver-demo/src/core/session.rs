@@ -48,41 +48,12 @@ fn build_config_sections_mapping(config_path: &Path) -> HashMap<String, PathBuf>
 	// Always map "main" to the main config file
 	sections.insert("main".to_string(), config_path.to_path_buf());
 
-	// Try to read and parse the main config file
+	// Try to read and parse the main JSON config file.
 	if let Ok(content) = std::fs::read_to_string(config_path) {
-		if let Ok(main_config) = toml::from_str::<toml::Value>(&content) {
-			// Check for includes array
-			if let Some(includes) = main_config.get("include").and_then(|v| v.as_array()) {
-				let config_dir = config_path.parent().unwrap_or(Path::new("."));
-
-				for include_value in includes {
-					if let Some(include_path_str) = include_value.as_str() {
-						let include_path = config_dir.join(include_path_str);
-
-						// Read the included file and determine what sections it contains
-						if let Ok(include_content) = std::fs::read_to_string(&include_path) {
-							if let Ok(include_config) =
-								toml::from_str::<toml::Value>(&include_content)
-							{
-								// Map each top-level section in the included file
-								if let Some(table) = include_config.as_table() {
-									for section_name in table.keys() {
-										sections.insert(section_name.clone(), include_path.clone());
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-
-			// Also map sections that are directly in the main config file
-			if let Some(table) = main_config.as_table() {
+		if let Ok(main_config) = serde_json::from_str::<serde_json::Value>(&content) {
+			if let Some(table) = main_config.as_object() {
 				for section_name in table.keys() {
-					// Don't override if already mapped to an include file
-					if !sections.contains_key(section_name) && section_name != "include" {
-						sections.insert(section_name.clone(), config_path.to_path_buf());
-					}
+					sections.insert(section_name.clone(), config_path.to_path_buf());
 				}
 			}
 		}

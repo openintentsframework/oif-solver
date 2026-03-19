@@ -255,7 +255,7 @@ pub trait StorageInterface: Send + Sync {
 ///
 /// This is the function signature that all storage implementations must provide
 /// to create instances of their storage interface.
-pub type StorageFactory = fn(&toml::Value) -> Result<Box<dyn StorageInterface>, StorageError>;
+pub type StorageFactory = fn(&serde_json::Value) -> Result<Box<dyn StorageInterface>, StorageError>;
 
 /// Get all registered storage implementations.
 ///
