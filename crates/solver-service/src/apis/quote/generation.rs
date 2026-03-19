@@ -3536,10 +3536,8 @@ mod tests {
 	async fn test_resolve_quote_flow_keys_prefers_eip3009_for_mainnet_usdc() {
 		let generator = create_test_generator();
 		let mut request = create_test_request();
-		request.intent.inputs[0].asset = InteropAddress::new_ethereum(
-			1,
-			address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
-		);
+		request.intent.inputs[0].asset =
+			InteropAddress::new_ethereum(1, address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"));
 
 		let flow_keys = generator.resolve_quote_flow_keys(&request).await.unwrap();
 
@@ -3550,10 +3548,8 @@ mod tests {
 	async fn test_resolve_quote_flow_keys_collects_mixed_escrow_flows() {
 		let generator = create_test_generator();
 		let mut request = create_test_request();
-		request.intent.inputs[0].asset = InteropAddress::new_ethereum(
-			1,
-			address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
-		);
+		request.intent.inputs[0].asset =
+			InteropAddress::new_ethereum(1, address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"));
 		request.intent.inputs.push(QuoteInput {
 			user: InteropAddress::new_ethereum(
 				1,
@@ -3571,10 +3567,7 @@ mod tests {
 
 		assert_eq!(
 			flow_keys,
-			vec![
-				"eip3009_escrow".to_string(),
-				"permit2_escrow".to_string()
-			]
+			vec!["eip3009_escrow".to_string(), "permit2_escrow".to_string()]
 		);
 	}
 

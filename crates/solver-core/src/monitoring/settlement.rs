@@ -139,10 +139,9 @@ impl SettlementMonitor {
 							until.saturating_sub(current_timestamp()).max(1);
 						let remaining_monitoring_time =
 							monitoring_timeout.saturating_sub(start_time.elapsed());
-						next_check_delay = tokio::time::Duration::from_secs(
-							remaining_proof_delay_secs,
-						)
-						.min(remaining_monitoring_time);
+						next_check_delay =
+							tokio::time::Duration::from_secs(remaining_proof_delay_secs)
+								.min(remaining_monitoring_time);
 
 						tracing::debug!(
 							order_id = %truncate_id(&order.id),
