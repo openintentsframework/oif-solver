@@ -3,6 +3,7 @@
 Purpose:
 - Explain how the solver decides if an intent has enough time left to be accepted.
 - Document the JSON fields to tune timing for `hyperlane`, `direct`, and `broadcaster`.
+- Distinguish intent admission timing from post-fill settlement monitoring timeout.
 
 ## 1) How intent time gating works
 
@@ -18,6 +19,12 @@ For each matching implementation, it computes a required window and applies:
 If more than one implementation matches, solver uses the **maximum** required window.
 
 Code path: `crates/solver-core/src/handlers/intent.rs`
+
+Important:
+- Intent admission windows do not control how long the solver keeps polling after fill.
+- Post-fill settlement monitoring is governed by top-level `monitoring_timeout_seconds` in bootstrap JSON, persisted as `solver.monitoring_timeout_seconds` in runtime config.
+- If `monitoring_timeout_seconds` is too small, the solver can accept and fill an intent but stop monitoring before the route becomes claimable.
+- For week-scale broadcaster proofs such as Arbitrum L2 -> L1, use a monitoring timeout that exceeds the operational claim delay, for example `864000` seconds (10 days).
 
 ## 2) Common field name across oracles
 

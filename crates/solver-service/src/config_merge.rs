@@ -412,6 +412,9 @@ pub fn merge_to_operator_config(
 	let rate_buffer_bps = initializer
 		.rate_buffer_bps
 		.unwrap_or(seed.defaults.rate_buffer_bps);
+	let monitoring_timeout_seconds = initializer
+		.monitoring_timeout_seconds
+		.unwrap_or(seed.defaults.monitoring_timeout_seconds);
 
 	Ok(OperatorConfig {
 		solver_id: solver_id.clone(),
@@ -451,7 +454,7 @@ pub fn merge_to_operator_config(
 			gas_buffer_bps,
 			commission_bps,
 			rate_buffer_bps,
-			monitoring_timeout_seconds: seed.defaults.monitoring_timeout_seconds,
+			monitoring_timeout_seconds,
 		},
 		admin,
 		auth_enabled: initializer.auth_enabled.unwrap_or(false),
@@ -2955,6 +2958,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
 		}
@@ -3025,6 +3029,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
 		};
@@ -3079,6 +3084,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
 		};
@@ -3127,6 +3133,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
 		};
@@ -3166,6 +3173,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
 		};
@@ -3251,6 +3259,7 @@ mod tests {
 			gas_buffer_bps: Some(1500),                                     // Override: 15%
 			commission_bps: Some(25),                                       // Override: 0.25%
 			rate_buffer_bps: Some(30),                                      // Override: 0.30%
+			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
 		};
@@ -3271,6 +3280,16 @@ mod tests {
 
 		// Verify rate_buffer_bps is applied
 		assert_eq!(config.solver.rate_buffer_bps, 30);
+	}
+
+	#[test]
+	fn test_merge_config_applies_monitoring_timeout_override() {
+		let mut overrides = test_seed_overrides();
+		overrides.monitoring_timeout_seconds = Some(864_000);
+
+		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
+
+		assert_eq!(config.solver.monitoring_timeout_seconds, 864_000);
 	}
 
 	#[test]
@@ -3445,6 +3464,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
 		};
@@ -3505,6 +3525,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
 		};
@@ -3590,6 +3611,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
 		};
@@ -3650,6 +3672,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
 		};
@@ -3716,6 +3739,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
 		};
@@ -3834,6 +3858,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -3960,6 +3985,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4024,6 +4050,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4082,6 +4109,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4175,6 +4203,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4277,6 +4306,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4438,6 +4468,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4571,6 +4602,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4668,6 +4700,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4787,6 +4820,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4935,6 +4969,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
 		};
@@ -4976,6 +5011,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
 		};
@@ -5031,6 +5067,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
 		};
@@ -5079,6 +5116,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
 		};
@@ -5144,6 +5182,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
 		};
@@ -5891,6 +5930,7 @@ mod tests {
 			gas_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
+			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
 		};

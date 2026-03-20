@@ -547,12 +547,16 @@ impl Config {
 			));
 		}
 
-		// Validate monitoring timeout is reasonable (between 30 seconds and 8 hours)
+		// Validate monitoring timeout is reasonable (between 30 seconds and 14 days).
+		// Optimistic-rollup broadcaster routes (e.g. Arbitrum L2→L1) require the
+		// solver to monitor for claim readiness across the full challenge period
+		// (~7 days), so the upper bound must accommodate week-scale timeouts.
 		if self.solver.monitoring_timeout_seconds < 30
-			|| self.solver.monitoring_timeout_seconds > 28800
+			|| self.solver.monitoring_timeout_seconds > 1_209_600
 		{
 			return Err(ConfigError::Validation(
-				"monitoring_timeout_seconds must be between 30 and 28800 seconds".into(),
+				"monitoring_timeout_seconds must be between 30 and 1209600 seconds (14 days)"
+					.into(),
 			));
 		}
 
