@@ -1,18 +1,18 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/solver-types",
-    "crates/solver-core",
-    "crates/solver-config",
-    "crates/solver-storage",
     "crates/solver-account",
+    "crates/solver-config",
+    "crates/solver-core",
     "crates/solver-delivery",
+    "crates/solver-demo",
     "crates/solver-discovery",
     "crates/solver-order",
-    "crates/solver-settlement",
     "crates/solver-pricing",
     "crates/solver-service",
-    "crates/solver-demo",
+    "crates/solver-settlement",
+    "crates/solver-storage",
+    "crates/solver-types",
 ]
 default-members = ["crates/solver-service", "crates/solver-demo"]
 
@@ -48,6 +48,11 @@ anyhow = "1.0"
 arc-swap = "1.7"
 async-stream = "0.3"
 async-trait = "0.1"
+
+# AWS dependencies (for KMS signer)
+# Minimum versions that fix CVE GHSA-g59m-gf8j-gjf5 (region validation flaw)
+aws-config = "1.8"
+aws-sdk-kms = "1.93"
 axum = "0.8.4"
 backoff = { version = "0.4", features = ["tokio"] }
 bytes = "1.8"
@@ -74,11 +79,6 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 validator = { version = "0.20", features = ["derive"] }
-
-# AWS dependencies (for KMS signer)
-# Minimum versions that fix CVE GHSA-g59m-gf8j-gjf5 (region validation flaw)
-aws-config = "1.8"
-aws-sdk-kms = "1.93"
 
 [profile.release]
 opt-level = 3

@@ -30,12 +30,14 @@ tracing = "0.1"
 
 [dev-dependencies]
 alloy-signer-local = { workspace = true }
-mockall = { workspace = true }
 async-trait = { workspace = true }
+hex = { workspace = true }
+mockall = { workspace = true }
+solver-account = { path = "../solver-account", features = ["testing"] }
 # Add testing feature only for tests
 solver-delivery = { path = "../solver-delivery", features = ["testing"] }
-solver-storage = { path = "../solver-storage", features = ["testing"] }
 solver-order = { path = "../solver-order", features = ["testing"] }
-solver-account = { path = "../solver-account", features = ["testing"] }
-solver-settlement = { path = "../solver-settlement", features = ["testing"] }
 solver-pricing = { path = "../solver-pricing", features = ["testing"] }
+solver-settlement = { path = "../solver-settlement", features = ["testing"] }
+solver-storage = { path = "../solver-storage", features = ["testing"] }
+tempfile = { workspace = true }
