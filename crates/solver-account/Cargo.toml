@@ -4,13 +4,22 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 
+[features]
+testing = ["mockall"]
+kms = ["alloy-signer-aws", "aws-config", "aws-sdk-kms"]
+
 [dependencies]
 alloy-consensus = { workspace = true }
 alloy-network = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-signer = { workspace = true }
+
+# KMS dependencies (optional)
+alloy-signer-aws = { workspace = true, optional = true }
 alloy-signer-local = { workspace = true }
 async-trait = "0.1"
+aws-config = { workspace = true, optional = true }
+aws-sdk-kms = { workspace = true, optional = true }
 hex = "0.4"
 mockall = { workspace = true, optional = true }
 serde = { workspace = true }
@@ -18,15 +27,6 @@ serde_json = { workspace = true }
 solver-types = { path = "../solver-types" }
 thiserror = "2.0.17"
 tokio = { workspace = true }
-
-# KMS dependencies (optional)
-alloy-signer-aws = { workspace = true, optional = true }
-aws-config = { workspace = true, optional = true }
-aws-sdk-kms = { workspace = true, optional = true }
-
-[features]
-testing = ["mockall"]
-kms = ["alloy-signer-aws", "aws-config", "aws-sdk-kms"]
 
 [dev-dependencies]
 tokio = { workspace = true }

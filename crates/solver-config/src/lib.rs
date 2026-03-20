@@ -94,6 +94,11 @@ pub struct SolverConfig {
 	/// Defaults to 28800 seconds (8 hours) if not specified.
 	#[serde(default = "default_monitoring_timeout_seconds")]
 	pub monitoring_timeout_seconds: u64,
+	/// Optional path to a JSON file containing denied Ethereum addresses.
+	/// The file must contain a JSON array of lowercase hex strings (e.g. ["0xabc...", ...]).
+	/// When set, any intent whose sender or recipient appears in the list is silently dropped.
+	#[serde(default)]
+	pub deny_list: Option<String>,
 }
 
 /// Configuration for the storage backend.
