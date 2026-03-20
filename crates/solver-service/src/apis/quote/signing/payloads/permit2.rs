@@ -151,6 +151,11 @@ pub fn build_permit2_batch_witness_digest(
 	// Use the pre-selected oracle address
 	let input_oracle = bytes20_to_alloy_address(&input_oracle.0)
 		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid oracle address: {e}")))?;
+	let output_oracle_address = bytes20_to_alloy_address(&output_oracle.0)
+		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid output oracle address: {e}")))?;
+	let output_oracle_bytes32 = B256::from(solver_types::utils::address_to_bytes32(
+		&output_oracle_address,
+	));
 
 	// Nonce and deadlines
 	let now_secs = chrono::Utc::now().timestamp() as u64;
@@ -213,7 +218,7 @@ pub fn build_permit2_batch_witness_digest(
 	// MandateOutput hash
 	let mut enc = Eip712AbiEncoder::new();
 	enc.push_b256(&mandate_output_type_hash);
-	enc.push_b256(&B256::ZERO);
+	enc.push_b256(&output_oracle_bytes32);
 	enc.push_address(&output_settler);
 	enc.push_u256(U256::from(dest_chain_id));
 	enc.push_address(&dest_token);
@@ -225,9 +230,16 @@ pub fn build_permit2_batch_witness_digest(
 
 	let outputs_hash = keccak256(mandate_output_hash.as_slice());
 
+	// Resolve user address for the witness
+	let user_address = request
+		.user
+		.ethereum_address()
+		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid user address: {e}")))?;
+
 	// Permit2Witness hash
 	let mut enc = Eip712AbiEncoder::new();
 	enc.push_b256(&permit2_witness_type_hash);
+	enc.push_address(&user_address);
 	enc.push_u32(expires_secs);
 	enc.push_address(&input_oracle);
 	enc.push_b256(&outputs_hash);
@@ -282,10 +294,11 @@ pub fn build_permit2_batch_witness_digest(
 		"nonce": nonce_ms.to_string(),
 		"deadline": deadline_secs.to_string(),
 		"witness": {
+			"user": format!("0x{:x}", user_address),
 			"expires": expires_secs,
 			"inputOracle": format!("0x{:x}", input_oracle),
 			"outputs": [{
-				"oracle": solver_types::utils::address_to_bytes32_hex(&bytes20_to_alloy_address(&output_oracle.0).map_err(QuoteError::InvalidRequest)?),
+				"oracle": solver_types::utils::address_to_bytes32_hex(&output_oracle_address),
 				"settler": solver_types::utils::address_to_bytes32_hex(&output_settler),
 				"chainId": dest_chain_id,
 				"token": solver_types::utils::address_to_bytes32_hex(&dest_token),
@@ -294,7 +307,7 @@ pub fn build_permit2_batch_witness_digest(
 				"callbackData": output.calldata.as_ref().unwrap_or(&"0x".to_string()).clone(),
 				"context": "0x"
 			}]
-		}
+			}
 	});
 
 	Ok((final_digest, message_json))
@@ -309,7 +322,7 @@ mod tests {
 		parse_address,
 		standards::eip7930::InteropAddress,
 		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
-		IntentRequest, IntentType, QuoteInput, QuoteOutput,
+		IntentRequest, IntentType, OrderPayload, QuoteInput, QuoteOutput, SignatureType,
 	};
 	use std::collections::HashMap;
 
@@ -457,6 +470,46 @@ mod tests {
 		assert!(output["token"].is_string());
 		assert!(output["amount"].is_string());
 		assert!(output["recipient"].is_string());
+	}
+
+	#[test]
+	fn test_build_permit2_batch_witness_digest_matches_emitted_payload() {
+		let config = create_test_config();
+		let request = create_test_quote_request();
+		let input_oracle_address =
+			parse_address("0x1999999999999999999999999999999999999999").unwrap();
+		let output_oracle_address =
+			parse_address("0x2999999999999999999999999999999999999999").unwrap();
+
+		let (digest, message_json) = build_permit2_batch_witness_digest(
+			&request,
+			&config,
+			input_oracle_address,
+			output_oracle_address,
+		)
+		.expect("Expected successful digest generation");
+
+		let payload = OrderPayload {
+			signature_type: SignatureType::Eip712,
+			domain: message_json["signing"]["domain"].clone(),
+			primary_type: message_json["signing"]["primaryType"]
+				.as_str()
+				.expect("primaryType should be present")
+				.to_string(),
+			message: serde_json::json!({
+				"permitted": message_json["permitted"].clone(),
+				"spender": message_json["spender"].clone(),
+				"nonce": message_json["nonce"].clone(),
+				"deadline": message_json["deadline"].clone(),
+				"witness": message_json["witness"].clone(),
+			}),
+			types: None,
+		};
+
+		let reconstructed = solver_types::utils::reconstruct_permit2_digest(&payload)
+			.expect("digest should reconstruct from emitted payload");
+
+		assert_eq!(digest.0, reconstructed);
 	}
 
 	#[test]
