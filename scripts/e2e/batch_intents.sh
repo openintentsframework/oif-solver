@@ -271,7 +271,8 @@ process_intent() {
     
     # Build StandardOrder
     local standard_order_abi_type='f((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]))'
-    local order_data=$(cast abi-encode "$standard_order_abi_type" \
+    local order_data
+    order_data=$(cast abi-encode "$standard_order_abi_type" \
         "(${USER_ADDR},${nonce},${origin_chain},${expiry},${fill_deadline},${oracle},[[$origin_token_addr,$input_amount]],[($oracle_bytes32,$output_settler_bytes32,${dest_chain},$dest_token_bytes32,$output_amount,$recipient_bytes32,0x,0x)])")
     
     # Generate EIP-712 signature
@@ -279,22 +280,30 @@ process_intent() {
     
     # Type hashes
     local mandate_output_type="MandateOutput(bytes32 oracle,bytes32 settler,uint256 chainId,bytes32 token,uint256 amount,bytes32 recipient,bytes callbackData,bytes context)"
-    local mandate_output_type_hash=$(cast keccak "$mandate_output_type")
+    local mandate_output_type_hash
+    mandate_output_type_hash=$(cast keccak "$mandate_output_type")
     
-    local permit2_witness_type="Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)${mandate_output_type}"
-    local permit2_witness_type_hash=$(cast keccak "$permit2_witness_type")
+    local permit2_witness_type="Permit2Witness(address user,uint32 expires,address inputOracle,MandateOutput[] outputs)${mandate_output_type}"
+    local permit2_witness_type_hash
+    permit2_witness_type_hash=$(cast keccak "$permit2_witness_type")
     
     local token_permissions_type="TokenPermissions(address token,uint256 amount)"
-    local token_permissions_type_hash=$(cast keccak "$token_permissions_type")
+    local token_permissions_type_hash
+    token_permissions_type_hash=$(cast keccak "$token_permissions_type")
     
     # Domain separator
-    local domain_type_hash=$(cast keccak "EIP712Domain(string name,uint256 chainId,address verifyingContract)")
-    local permit2_name_hash=$(cast keccak "Permit2")
-    local domain_separator=$(cast abi-encode "f(bytes32,bytes32,uint256,address)" "$domain_type_hash" "$permit2_name_hash" "$origin_chain" "$PERMIT2_ADDRESS")
-    local domain_separator_hash=$(cast keccak "$domain_separator")
+    local domain_type_hash
+    domain_type_hash=$(cast keccak "EIP712Domain(string name,uint256 chainId,address verifyingContract)")
+    local permit2_name_hash
+    permit2_name_hash=$(cast keccak "Permit2")
+    local domain_separator
+    domain_separator=$(cast abi-encode "f(bytes32,bytes32,uint256,address)" "$domain_type_hash" "$permit2_name_hash" "$origin_chain" "$PERMIT2_ADDRESS")
+    local domain_separator_hash
+    domain_separator_hash=$(cast keccak "$domain_separator")
     
     # Build hashes
-    local mandate_output_encoded=$(cast abi-encode "f(bytes32,bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes32,bytes32)" \
+    local mandate_output_encoded
+    mandate_output_encoded=$(cast abi-encode "f(bytes32,bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes32,bytes32)" \
         "$mandate_output_type_hash" \
         "$oracle_bytes32" \
         "$output_settler_bytes32" \
@@ -304,39 +313,51 @@ process_intent() {
         "$recipient_bytes32" \
         "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470" \
         "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
-    local mandate_output_hash=$(cast keccak "$mandate_output_encoded")
-    local outputs_hash=$(cast keccak "$mandate_output_hash")
+    local mandate_output_hash
+    mandate_output_hash=$(cast keccak "$mandate_output_encoded")
+    local outputs_hash
+    outputs_hash=$(cast keccak "$mandate_output_hash")
     
-    local permit2_witness_encoded=$(cast abi-encode "f(bytes32,uint32,address,bytes32)" \
+    local permit2_witness_encoded
+    permit2_witness_encoded=$(cast abi-encode "f(bytes32,address,uint32,address,bytes32)" \
         "$permit2_witness_type_hash" \
+        "$USER_ADDR" \
         "$expiry" \
         "$oracle" \
         "$outputs_hash")
-    local permit2_witness_hash=$(cast keccak "$permit2_witness_encoded")
+    local permit2_witness_hash
+    permit2_witness_hash=$(cast keccak "$permit2_witness_encoded")
     
-    local token_perm_encoded=$(cast abi-encode "f(bytes32,address,uint256)" \
+    local token_perm_encoded
+    token_perm_encoded=$(cast abi-encode "f(bytes32,address,uint256)" \
         "$token_permissions_type_hash" \
         "$origin_token_addr" \
         "$input_amount")
-    local token_perm_hash=$(cast keccak "$token_perm_encoded")
+    local token_perm_hash
+    token_perm_hash=$(cast keccak "$token_perm_encoded")
     
-    # Final hash
-    local witness_type_string="Permit2Witness witness)${mandate_output_type}${token_permissions_type}Permit2Witness(uint32 expires,address inputOracle,MandateOutput[] outputs)"
+    # Keep the dependent type order aligned with the Rust signer.
+    local witness_type_string="Permit2Witness witness)${mandate_output_type}Permit2Witness(address user,uint32 expires,address inputOracle,MandateOutput[] outputs)${token_permissions_type}"
     local permit_batch_witness_string="PermitBatchWitnessTransferFrom(TokenPermissions[] permitted,address spender,uint256 nonce,uint256 deadline,${witness_type_string}"
-    local permit_batch_witness_type_hash=$(cast keccak "$permit_batch_witness_string")
+    local permit_batch_witness_type_hash
+    permit_batch_witness_type_hash=$(cast keccak "$permit_batch_witness_string")
     
-    local permitted_array_hash=$(cast keccak "$token_perm_hash")
-    local main_struct_encoded=$(cast abi-encode "f(bytes32,bytes32,address,uint256,uint256,bytes32)" \
+    local permitted_array_hash
+    permitted_array_hash=$(cast keccak "$token_perm_hash")
+    local main_struct_encoded
+    main_struct_encoded=$(cast abi-encode "f(bytes32,bytes32,address,uint256,uint256,bytes32)" \
         "$permit_batch_witness_type_hash" \
         "$permitted_array_hash" \
         "$origin_input_settler" \
         "$nonce" \
         "$fill_deadline" \
         "$permit2_witness_hash")
-    local main_struct_hash=$(cast keccak "$main_struct_encoded")
+    local main_struct_hash
+    main_struct_hash=$(cast keccak "$main_struct_encoded")
     
     local digest="0x1901${domain_separator_hash:2}${main_struct_hash:2}"
-    local final_digest=$(cast keccak "$digest")
+    local final_digest
+    final_digest=$(cast keccak "$digest")
     
     # Sign
     local signature=$(cast wallet sign --no-hash --private-key "$USER_PRIVATE_KEY" "$final_digest" 2>/dev/null)
