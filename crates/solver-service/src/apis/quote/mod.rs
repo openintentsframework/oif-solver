@@ -103,6 +103,14 @@ pub async fn process_quote_request(
 	// This prevents users from getting quotes they can't execute due to callback restrictions
 	QuoteValidator::validate_callback_whitelist(&request, config)?;
 
+	// Check solver capabilities: networks only (token support is enforced during collection below)
+	QuoteValidator::validate_supported_networks(&request, &config.networks)?;
+
+	let settlement_service = solver.settlement();
+	let delivery_service = solver.delivery();
+	let quote_generator = QuoteGenerator::new(settlement_service.clone(), delivery_service.clone());
+	let resolved_flow_keys = quote_generator.resolve_quote_flow_keys(&request).await?;
+
 	let cost_profit_service = solver_core::engine::cost_profit::CostProfitService::new(
 		solver.pricing().clone(),
 		solver.delivery().clone(),
@@ -111,12 +119,14 @@ pub async fn process_quote_request(
 	);
 
 	let cost_context = cost_profit_service
-		.calculate_cost_context(&request, &validated_context, config)
+		.calculate_cost_context_for_flow_keys(
+			&request,
+			&validated_context,
+			config,
+			&resolved_flow_keys,
+		)
 		.await
 		.map_err(|e| QuoteError::Internal(format!("Failed to calculate cost context: {e}")))?;
-
-	// Check solver capabilities: networks only (token support is enforced during collection below)
-	QuoteValidator::validate_supported_networks(&request, &config.networks)?;
 
 	// Validate and collect assets with cost-adjusted amounts
 	let _supported_inputs = QuoteValidator::validate_and_collect_inputs_with_costs(
@@ -139,11 +149,6 @@ pub async fn process_quote_request(
 		&cost_context,
 	)
 	.await?;
-
-	// Generate quotes using the business logic layer with embedded costs
-	let settlement_service = solver.settlement();
-	let delivery_service = solver.delivery();
-	let quote_generator = QuoteGenerator::new(settlement_service.clone(), delivery_service.clone());
 
 	let quote_pairs = quote_generator
 		.generate_quotes_with_costs(&request, &validated_context, &cost_context, config)

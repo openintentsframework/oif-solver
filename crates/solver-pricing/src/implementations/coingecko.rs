@@ -19,7 +19,7 @@ use solver_types::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::debug;
 
 /// Cache entry for price data
@@ -42,14 +42,16 @@ pub struct CoinGeckoPricing {
 	price_cache: Arc<RwLock<HashMap<String, PriceCacheEntry>>>,
 	/// Cache duration in seconds
 	cache_duration: u64,
+	/// Per-key mutexes to collapse concurrent cache misses for the same asset pair.
+	price_fetch_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 	/// Map of token symbols to CoinGecko IDs
 	token_id_map: HashMap<String, String>,
 	/// Custom fixed prices for tokens (useful for testing/demo)
 	custom_prices: HashMap<String, String>,
 	/// Rate limit delay in milliseconds
 	rate_limit_delay_ms: u64,
-	/// Last API call timestamp
-	last_api_call: Arc<RwLock<Option<u64>>>,
+	/// Reserved timestamp for the next outbound CoinGecko API call.
+	next_api_call_at_ms: Arc<Mutex<u64>>,
 }
 
 /// CoinGecko API response for simple price endpoint
@@ -172,36 +174,67 @@ impl CoinGeckoPricing {
 			base_url,
 			price_cache: Arc::new(RwLock::new(HashMap::new())),
 			cache_duration,
+			price_fetch_locks: Arc::new(Mutex::new(HashMap::new())),
 			token_id_map,
 			custom_prices,
 			rate_limit_delay_ms,
-			last_api_call: Arc::new(RwLock::new(None)),
+			next_api_call_at_ms: Arc::new(Mutex::new(0)),
 		})
 	}
 
 	/// Apply rate limiting
 	async fn apply_rate_limit(&self) {
-		let mut last_call = self.last_api_call.write().await;
-
-		if let Some(last_timestamp) = *last_call {
+		let delay_ms = {
+			let mut next_api_call_at_ms = self.next_api_call_at_ms.lock().await;
 			let now = SystemTime::now()
 				.duration_since(UNIX_EPOCH)
 				.unwrap()
 				.as_millis() as u64;
+			let scheduled_at = (*next_api_call_at_ms).max(now);
+			*next_api_call_at_ms = scheduled_at.saturating_add(self.rate_limit_delay_ms);
+			scheduled_at.saturating_sub(now)
+		};
 
-			let elapsed = now - last_timestamp;
-			if elapsed < self.rate_limit_delay_ms {
-				let delay = self.rate_limit_delay_ms - elapsed;
-				tokio::time::sleep(Duration::from_millis(delay)).await;
-			}
+		if delay_ms > 0 {
+			tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+		}
+	}
+
+	async fn get_cached_price_if_fresh(&self, cache_key: &str) -> Option<String> {
+		let cache = self.price_cache.read().await;
+		let entry = cache.get(cache_key)?;
+		let now = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap()
+			.as_secs();
+		if now.saturating_sub(entry.timestamp) < self.cache_duration {
+			debug!("Using cached price for {}: ${}", cache_key, entry.price);
+			return Some(entry.price.clone());
 		}
 
-		*last_call = Some(
-			SystemTime::now()
-				.duration_since(UNIX_EPOCH)
-				.unwrap()
-				.as_millis() as u64,
+		None
+	}
+
+	async fn cache_price(&self, cache_key: &str, price: String) {
+		let mut cache = self.price_cache.write().await;
+		cache.insert(
+			cache_key.to_string(),
+			PriceCacheEntry {
+				price,
+				timestamp: SystemTime::now()
+					.duration_since(UNIX_EPOCH)
+					.unwrap()
+					.as_secs(),
+			},
 		);
+	}
+
+	async fn get_price_fetch_lock(&self, cache_key: &str) -> Arc<Mutex<()>> {
+		let mut locks = self.price_fetch_locks.lock().await;
+		locks
+			.entry(cache_key.to_string())
+			.or_insert_with(|| Arc::new(Mutex::new(())))
+			.clone()
 	}
 
 	/// Get CoinGecko ID for a token symbol
@@ -258,19 +291,8 @@ impl CoinGeckoPricing {
 		let cache_key = format!("{}/{}", token.to_uppercase(), vs_currency.to_uppercase());
 
 		// Check cache first
-		{
-			let cache = self.price_cache.read().await;
-			if let Some(entry) = cache.get(&cache_key) {
-				let now = SystemTime::now()
-					.duration_since(UNIX_EPOCH)
-					.unwrap()
-					.as_secs();
-
-				if now - entry.timestamp < self.cache_duration {
-					debug!("Using cached price for {}: ${}", cache_key, entry.price);
-					return Ok(entry.price.clone());
-				}
-			}
+		if let Some(price) = self.get_cached_price_if_fresh(&cache_key).await {
+			return Ok(price);
 		}
 
 		// Always fetch in USD
@@ -287,21 +309,17 @@ impl CoinGeckoPricing {
 				"Returning custom price for {}: ${}",
 				token_upper, custom_price
 			);
-			// Update cache
-			{
-				let mut cache = self.price_cache.write().await;
-				cache.insert(
-					cache_key.clone(),
-					PriceCacheEntry {
-						price: custom_price.clone(),
-						timestamp: SystemTime::now()
-							.duration_since(UNIX_EPOCH)
-							.unwrap()
-							.as_secs(),
-					},
-				);
-			}
+			self.cache_price(&cache_key, custom_price.clone()).await;
 			return Ok(custom_price.clone());
+		}
+
+		let fetch_lock = self.get_price_fetch_lock(&cache_key).await;
+		let _fetch_guard = fetch_lock.lock().await;
+
+		// Another task may have fetched this price while we waited for the
+		// per-key lock, so check the cache again before going to CoinGecko.
+		if let Some(price) = self.get_cached_price_if_fresh(&cache_key).await {
+			return Ok(price);
 		}
 
 		// Fetch from API
@@ -320,21 +338,7 @@ impl CoinGeckoPricing {
 			.ok_or_else(|| PricingError::PriceNotAvailable(format!("{token}/USD")))?;
 
 		let price_str = price.to_string();
-
-		// Update cache
-		{
-			let mut cache = self.price_cache.write().await;
-			cache.insert(
-				cache_key.clone(),
-				PriceCacheEntry {
-					price: price_str.clone(),
-					timestamp: SystemTime::now()
-						.duration_since(UNIX_EPOCH)
-						.unwrap()
-						.as_secs(),
-				},
-			);
-		}
+		self.cache_price(&cache_key, price_str.clone()).await;
 
 		debug!("Fetched and cached price for {}: ${}", cache_key, price_str);
 		Ok(price_str)
@@ -623,7 +627,10 @@ pub fn create_coingecko_pricing(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::{sync::Arc, time::Duration};
 	use tokio;
+	use wiremock::matchers::{method, path, query_param};
+	use wiremock::{Mock, MockServer, ResponseTemplate};
 
 	fn minimal_config() -> serde_json::Value {
 		serde_json::Value::Object(serde_json::Map::new())
@@ -703,6 +710,51 @@ mod tests {
 		let pricing = CoinGeckoPricing::new(&config_with_custom_prices()).unwrap();
 		let result = pricing.get_price("ETH", "USD").await.unwrap();
 		assert_eq!(result, "3000.50");
+	}
+
+	#[tokio::test]
+	async fn test_concurrent_cold_misses_share_single_fetch() {
+		let server = MockServer::start().await;
+		Mock::given(method("GET"))
+			.and(path("/simple/price"))
+			.and(query_param("ids", "ethereum"))
+			.and(query_param("vs_currencies", "usd"))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_delay(Duration::from_millis(100))
+					.set_body_json(serde_json::json!({
+						"ethereum": {
+							"usd": 2120.06
+						}
+					})),
+			)
+			.expect(1)
+			.mount(&server)
+			.await;
+
+		let pricing = Arc::new(
+			CoinGeckoPricing::new(&serde_json::json!({
+				"base_url": server.uri(),
+				"cache_duration_seconds": 60,
+				"rate_limit_delay_ms": 0
+			}))
+			.unwrap(),
+		);
+
+		let first = {
+			let pricing = pricing.clone();
+			tokio::spawn(async move { pricing.get_price("ETH", "USD").await.unwrap() })
+		};
+		let second = {
+			let pricing = pricing.clone();
+			tokio::spawn(async move { pricing.get_price("ETH", "USD").await.unwrap() })
+		};
+
+		let first_result = first.await.unwrap();
+		let second_result = second.await.unwrap();
+
+		assert_eq!(first_result, "2120.06");
+		assert_eq!(second_result, "2120.06");
 	}
 
 	#[tokio::test]

@@ -395,6 +395,18 @@ impl CostProfitService {
 		context: &solver_types::ValidatedQuoteContext,
 		config: &Config,
 	) -> Result<CostContext, CostProfitError> {
+		let flow_keys = request.flow_key().into_iter().collect::<Vec<_>>();
+		self.calculate_cost_context_for_flow_keys(request, context, config, &flow_keys)
+			.await
+	}
+
+	pub async fn calculate_cost_context_for_flow_keys(
+		&self,
+		request: &solver_types::GetQuoteRequest,
+		context: &solver_types::ValidatedQuoteContext,
+		config: &Config,
+		flow_keys: &[String],
+	) -> Result<CostContext, CostProfitError> {
 		// Get all token decimals upfront
 		let decimals_map = self.get_all_token_decimals(request).await;
 
@@ -433,10 +445,8 @@ impl CostProfitService {
 				details: None,
 			})?;
 
-		// Determine flow key from the request structure
-		let flow_key = request.flow_key();
 		let (open_units, fill_units, claim_units) =
-			estimate_gas_units_from_config(&flow_key, config, 150000, 150000, 150000);
+			estimate_gas_units_from_flow_keys(flow_keys, config, 150000, 150000, 150000);
 
 		// Get gas units for cost calculation
 		let gas_units = GasUnits {
@@ -602,42 +612,23 @@ impl CostProfitService {
 		// Read gas_buffer_bps from solver config (hot-reloadable)
 		let gas_buffer_bps_value = config.solver.gas_buffer_bps;
 
-		// Get gas prices
-		let origin_gp = self.get_chain_gas_price(origin_chain_id).await?;
-		let dest_gp = self.get_chain_gas_price(dest_chain_id).await?;
+		// Gas reads are independent and only need eth_gasPrice.
+		let (origin_gp, dest_gp) = tokio::try_join!(
+			self.get_chain_gas_price(origin_chain_id),
+			self.get_chain_gas_price(dest_chain_id),
+		)?;
 
 		// Calculate gas costs in wei
 		let open_cost_wei = origin_gp.saturating_mul(U256::from(gas_units.open_units));
 		let fill_cost_wei = dest_gp.saturating_mul(U256::from(gas_units.fill_units));
 		let claim_cost_wei = origin_gp.saturating_mul(U256::from(gas_units.claim_units));
 
-		// Convert to USD
-		let gas_open = Decimal::from_str(
-			&self
-				.pricing_service
-				.wei_to_currency(&open_cost_wei.to_string(), "USD")
-				.await
-				.unwrap_or_else(|_| "0".to_string()),
-		)
-		.unwrap_or(Decimal::ZERO);
-
-		let gas_fill = Decimal::from_str(
-			&self
-				.pricing_service
-				.wei_to_currency(&fill_cost_wei.to_string(), "USD")
-				.await
-				.unwrap_or_else(|_| "0".to_string()),
-		)
-		.unwrap_or(Decimal::ZERO);
-
-		let gas_claim = Decimal::from_str(
-			&self
-				.pricing_service
-				.wei_to_currency(&claim_cost_wei.to_string(), "USD")
-				.await
-				.unwrap_or_else(|_| "0".to_string()),
-		)
-		.unwrap_or(Decimal::ZERO);
+		// Price conversions are independent as well.
+		let (gas_open, gas_fill, gas_claim) = tokio::join!(
+			self.wei_to_usd_or_zero(&open_cost_wei),
+			self.wei_to_usd_or_zero(&fill_cost_wei),
+			self.wei_to_usd_or_zero(&claim_cost_wei),
+		);
 
 		// Calculate gas buffer using config value (hot-reloadable)
 		let gas_subtotal = gas_open + gas_fill + gas_claim;
@@ -648,9 +639,11 @@ impl CostProfitService {
 		// so keep this component at zero to avoid double-charging.
 		let rate_buffer = Decimal::ZERO;
 
-		// Calculate input and output values in USD using helpers
-		let total_input_value_usd = self.calculate_inputs_usd_value(inputs).await?;
-		let total_output_value_usd = self.calculate_outputs_usd_value(outputs).await?;
+		// Input and output valuations do not depend on each other.
+		let (total_input_value_usd, total_output_value_usd) = tokio::try_join!(
+			self.calculate_inputs_usd_value(inputs),
+			self.calculate_outputs_usd_value(outputs),
+		)?;
 
 		// Calculate spread and base price
 		let spread = total_input_value_usd - total_output_value_usd;
@@ -1162,19 +1155,29 @@ impl CostProfitService {
 
 	/// Gets the gas price for a specific chain
 	async fn get_chain_gas_price(&self, chain_id: u64) -> Result<U256, APIError> {
-		let chain_data = self
+		let gas_price = self
 			.delivery_service
-			.get_chain_data(chain_id)
+			.get_gas_price(chain_id)
 			.await
 			.map_err(|e| APIError::InternalServerError {
 				error_type: ApiErrorType::ServiceError,
-				message: format!("Failed to get chain data: {e}"),
+				message: format!("Failed to get gas price: {e}"),
 			})?;
 
-		match U256::from_str_radix(&chain_data.gas_price, 10) {
+		match U256::from_str_radix(&gas_price, 10) {
 			Ok(gas_price) => Ok(gas_price),
 			Err(_) => Ok(U256::from(DEFAULT_GAS_PRICE_WEI)),
 		}
+	}
+
+	async fn wei_to_usd_or_zero(&self, value_wei: &U256) -> Decimal {
+		let usd_value = self
+			.pricing_service
+			.wei_to_currency(&value_wei.to_string(), "USD")
+			.await
+			.unwrap_or_else(|_| "0".to_string());
+
+		Decimal::from_str(&usd_value).unwrap_or(Decimal::ZERO)
 	}
 
 	/// Validates callback safety and simulates fill transaction gas for an order with callbackData.
@@ -1552,6 +1555,52 @@ pub fn estimate_gas_units_from_config(
 	tracing::warn!(
 		"No gas config found for flow {:?}, using fallback estimates",
 		flow_key
+	);
+
+	(fallback_open, fallback_fill, fallback_claim)
+}
+
+pub fn estimate_gas_units_from_flow_keys(
+	flow_keys: &[String],
+	config: &Config,
+	fallback_open: u64,
+	fallback_fill: u64,
+	fallback_claim: u64,
+) -> (u64, u64, u64) {
+	if flow_keys.is_empty() {
+		return (fallback_open, fallback_fill, fallback_claim);
+	}
+
+	if let Some(gcfg) = config.gas.as_ref() {
+		tracing::debug!(
+			"Available gas flows: {:?}",
+			gcfg.flows.keys().collect::<Vec<_>>()
+		);
+
+		let mut found = false;
+		let mut open = fallback_open;
+		let mut fill = fallback_fill;
+		let mut claim = fallback_claim;
+
+		for flow in flow_keys {
+			if let Some(units) = gcfg.flows.get(flow.as_str()) {
+				found = true;
+				open = open.max(units.open.unwrap_or(fallback_open));
+				fill = fill.max(units.fill.unwrap_or(fallback_fill));
+				claim = claim.max(units.claim.unwrap_or(fallback_claim));
+			} else {
+				tracing::warn!("Flow '{}' not found in gas config flows", flow);
+			}
+		}
+
+		if found {
+			return (open, fill, claim);
+		}
+	}
+
+	tracing::warn!(
+		"No gas config found for flows {:?}, using fallback estimates",
+		flow_keys
 	);
 
 	(fallback_open, fallback_fill, fallback_claim)

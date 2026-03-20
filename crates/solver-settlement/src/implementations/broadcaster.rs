@@ -1027,6 +1027,16 @@ impl BroadcasterSettlement {
 			},
 		};
 
+		let proof_ready_at = fill_proof
+			.filled_timestamp
+			.saturating_add(self.proof_wait_time_seconds);
+		let now = now_seconds();
+		if now < proof_ready_at {
+			return SettlementReadiness::Waiting(WaitingReason::WaitingForProofDelay {
+				until: proof_ready_at,
+			});
+		}
+
 		let remote_oracle = address_to_bytes32(&output_oracle);
 		let application = address_to_bytes32(&submission.application);
 		match check_is_proven(
@@ -1052,16 +1062,6 @@ impl BroadcasterSettlement {
 			Ok(false) => {},
 			Err(_) => return SettlementReadiness::Waiting(WaitingReason::RpcUnavailable),
 		};
-
-		let proof_ready_at = fill_proof
-			.filled_timestamp
-			.saturating_add(self.proof_wait_time_seconds);
-		let now = now_seconds();
-		if now < proof_ready_at {
-			return SettlementReadiness::Waiting(WaitingReason::WaitingForProofDelay {
-				until: proof_ready_at,
-			});
-		}
 
 		let destination_provider = match self.providers.get(&destination_chain) {
 			Some(provider) => provider,
@@ -1272,7 +1272,7 @@ impl ConfigSchema for BroadcasterSettlementSchema {
 					"proof_wait_time_seconds",
 					FieldType::Integer {
 						min: Some(0),
-						max: Some(3600),
+						max: Some(1_209_600), // 14 days for optimistic-rollup proof windows
 					},
 				),
 				Field::new(
@@ -1308,7 +1308,7 @@ impl ConfigSchema for BroadcasterSettlementSchema {
 					"intent_min_expiry_seconds",
 					FieldType::Integer {
 						min: Some(0),
-						max: Some(86400),
+						max: Some(1_209_600), // 14 days to cover proof delay plus safety margin
 					},
 				),
 				// Sub-field validation is intentionally skipped here; it is performed
@@ -1974,11 +1974,12 @@ mod tests {
 	use super::*;
 	use crate::OracleSelectionStrategy;
 	use serde_json::json;
+	use solver_types::networks::RpcEndpoint;
 	use solver_types::standards::eip7683::MandateOutput;
 	use solver_types::utils::tests::builders::{
 		Eip7683OrderDataBuilder, MandateOutputBuilder, OrderBuilder,
 	};
-	use solver_types::TransactionReceipt;
+	use solver_types::{NetworkConfig, NetworkType, TransactionReceipt};
 	use wiremock::matchers::{method, path};
 	use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2074,6 +2075,28 @@ mod tests {
 
 	fn empty_oracle_config() -> OracleConfig {
 		make_oracle_config(HashMap::new())
+	}
+
+	fn test_networks_with_http(chain_ids: &[u64], url: &str) -> NetworksConfig {
+		chain_ids
+			.iter()
+			.map(|chain_id| {
+				(
+					*chain_id,
+					NetworkConfig {
+						name: Some(format!("chain-{chain_id}")),
+						network_type: NetworkType::New,
+						rpc_urls: vec![RpcEndpoint::http_only(url.to_string())],
+						input_settler_address: solver_types::Address(vec![0x11; 20]),
+						output_settler_address: solver_types::Address(vec![0x22; 20]),
+						tokens: vec![],
+						input_settler_compact_address: None,
+						the_compact_address: None,
+						allocator_address: None,
+					},
+				)
+			})
+			.collect()
 	}
 
 	/// Build an inline JSON object for a `PusherL2Params::OpStack` variant.
@@ -2860,6 +2883,85 @@ mod tests {
 				if msg.contains("No provider configured for source chain 421614")
 		));
 		assert!(!settlement.can_claim(&order, &fill_proof).await);
+	}
+
+	#[tokio::test]
+	async fn test_readiness_skips_is_proven_before_proof_delay() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+				"jsonrpc": "2.0",
+				"id": 1,
+				"result": "0x"
+			})))
+			.expect(0)
+			.mount(&server)
+			.await;
+
+		let source_chain = 421614u64;
+		let destination_chain = 11155111u64;
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let output_oracle = solver_types::Address(vec![0x44; 20]);
+		let order = OrderBuilder::new()
+			.with_id("proof-delay-short-circuit-order")
+			.with_input_chain_ids(vec![source_chain])
+			.with_output_chain_ids(vec![destination_chain])
+			.with_data(make_eip7683_order_data(
+				&input_oracle,
+				vec![make_output(
+					destination_chain,
+					address_to_bytes32(&output_oracle),
+				)],
+			))
+			.build();
+		let oracle_config = OracleConfig {
+			input_oracles: HashMap::from([(source_chain, vec![input_oracle.clone()])]),
+			output_oracles: HashMap::from([(destination_chain, vec![output_oracle.clone()])]),
+			routes: HashMap::from([(source_chain, vec![destination_chain])]),
+			selection_strategy: OracleSelectionStrategy::First,
+		};
+		let networks = test_networks_with_http(&[source_chain], &server.uri());
+		let settlement = BroadcasterSettlement {
+			providers: create_providers_for_chains(&[source_chain], &networks).unwrap(),
+			..test_settlement(oracle_config)
+		};
+		settlement
+			.message_tracker
+			.track_submission(
+				&order.id,
+				BroadcasterSubmission {
+					source_chain,
+					destination_chain,
+					submission_tx_hash: TransactionHash(vec![0x55; 32]),
+					submission_timestamp: 1,
+					submission_block_number: Some(12345),
+					payload_hash: [0x66; 32],
+					message: [0x77; 32],
+					message_data: vec![0x88],
+					application: solver_types::Address(vec![0x99; 20]),
+					remote_oracle: output_oracle,
+				},
+			)
+			.await
+			.unwrap();
+
+		let readiness = settlement
+			.readiness(
+				&order,
+				&FillProof {
+					tx_hash: TransactionHash(vec![0xaa; 32]),
+					block_number: 1,
+					oracle_address: with_0x_prefix(&hex::encode(&input_oracle.0)),
+					attestation_data: None,
+					filled_timestamp: now_seconds(),
+				},
+			)
+			.await;
+
+		assert!(matches!(
+			readiness,
+			SettlementReadiness::Waiting(WaitingReason::WaitingForProofDelay { .. })
+		));
 	}
 
 	#[tokio::test]
