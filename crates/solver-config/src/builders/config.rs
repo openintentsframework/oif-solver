@@ -30,6 +30,7 @@ pub struct ConfigBuilder {
 	api: Option<ApiConfig>,
 	settlement: Option<SettlementConfig>,
 	networks: Option<NetworksConfig>,
+	deny_list: Option<String>,
 }
 
 impl Default for ConfigBuilder {
@@ -56,6 +57,7 @@ impl ConfigBuilder {
 			api: None,
 			settlement: None,
 			networks: None,
+			deny_list: None,
 		}
 	}
 
@@ -131,6 +133,12 @@ impl ConfigBuilder {
 		self
 	}
 
+	/// Sets the deny list file path.
+	pub fn deny_list(mut self, path: String) -> Self {
+		self.deny_list = Some(path);
+		self
+	}
+
 	/// Sets the minimum profitability percentage.
 	pub fn with_min_profitability_pct(mut self, min_profitability_pct: Decimal) -> Self {
 		self.min_profitability_pct = min_profitability_pct;
@@ -147,6 +155,7 @@ impl ConfigBuilder {
 				commission_bps: self.commission_bps,
 				rate_buffer_bps: self.rate_buffer_bps,
 				monitoring_timeout_seconds: self.monitoring_timeout_seconds,
+				deny_list: self.deny_list,
 			},
 			networks: self.networks.unwrap_or_default(),
 			storage: StorageConfig {
