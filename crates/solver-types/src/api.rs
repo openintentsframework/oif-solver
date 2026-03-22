@@ -1316,6 +1316,8 @@ pub mod u256_serde {
 pub enum QuoteError {
 	#[error("Invalid request: {0}")]
 	InvalidRequest(String),
+	#[error("Unsupported quote shape: {0}")]
+	UnsupportedQuoteShape(String),
 	#[error("Unsupported asset: {0}")]
 	UnsupportedAsset(String),
 	#[error("Unsupported settlement: {0}")]
@@ -1346,6 +1348,11 @@ impl From<QuoteError> for APIError {
 	fn from(quote_error: QuoteError) -> Self {
 		match quote_error {
 			QuoteError::InvalidRequest(msg) => APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: msg,
+				details: None,
+			},
+			QuoteError::UnsupportedQuoteShape(msg) => APIError::BadRequest {
 				error_type: ApiErrorType::InvalidRequest,
 				message: msg,
 				details: None,
@@ -1938,6 +1945,10 @@ mod tests {
 				"Invalid request: bad format",
 			),
 			(
+				QuoteError::UnsupportedQuoteShape("multi-input".to_string()),
+				"Unsupported quote shape: multi-input",
+			),
+			(
 				QuoteError::UnsupportedAsset("ETH".to_string()),
 				"Unsupported asset: ETH",
 			),
@@ -1967,6 +1978,10 @@ mod tests {
 	#[test]
 	fn test_quote_error_to_api_error() {
 		let quote_error = QuoteError::InvalidRequest("Invalid amount".to_string());
+		let api_error: APIError = quote_error.into();
+		assert_eq!(api_error.status_code(), 400);
+
+		let quote_error = QuoteError::UnsupportedQuoteShape("multi-input".to_string());
 		let api_error: APIError = quote_error.into();
 		assert_eq!(api_error.status_code(), 400);
 

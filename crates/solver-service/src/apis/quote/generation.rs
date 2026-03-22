@@ -63,7 +63,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 /// Quote generation engine with settlement service integration.
-pub struct QuoteGenerator {
+pub(crate) struct QuoteGenerator {
 	custody_strategy: CustodyStrategy,
 	/// Reference to settlement service for implementation lookup.
 	settlement_service: Arc<SettlementService>,
@@ -77,13 +77,19 @@ pub struct QuoteGenerator {
 	eip3009_domain_separators: DashMap<(u64, [u8; 20]), [u8; 32]>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedQuoteRequest {
+	pub(crate) custody_decision: CustodyDecision,
+	pub(crate) flow_key: String,
+}
+
 impl QuoteGenerator {
 	/// Creates a new quote generator.
 	///
 	/// # Arguments
 	/// * `settlement_service` - Service managing settlement implementations
 	/// * `delivery_service` - Service for making contract calls
-	pub fn new(
+	pub(crate) fn new(
 		settlement_service: Arc<SettlementService>,
 		delivery_service: Arc<DeliveryService>,
 	) -> Self {
@@ -97,60 +103,118 @@ impl QuoteGenerator {
 		}
 	}
 
-	pub async fn generate_quotes(
+	#[cfg_attr(not(test), allow(dead_code))]
+	async fn generate_quotes(
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
 	) -> Result<Vec<(Quote, Option<String>)>, QuoteError> {
-		let mut quotes = Vec::new();
-		for input in &request.intent.inputs {
-			let order_input: OrderInput = input.try_into()?;
-			let custody_decision = self
-				.custody_strategy
-				.decide_custody(&order_input, request.intent.origin_submission.as_ref())
-				.await?;
-			if let Ok(result) = self
-				.generate_quote_for_settlement(request, config, &custody_decision)
-				.await
-			{
-				quotes.push(result);
-			}
+		if request.intent.inputs.is_empty() {
+			return Err(QuoteError::InsufficientLiquidity);
 		}
+
+		let resolved_request = self.resolve_quote_request(request).await?;
+		self.generate_quotes_for_resolved_request(request, config, &resolved_request)
+			.await
+	}
+
+	async fn generate_quotes_for_resolved_request(
+		&self,
+		request: &GetQuoteRequest,
+		config: &Config,
+		resolved_request: &ResolvedQuoteRequest,
+	) -> Result<Vec<(Quote, Option<String>)>, QuoteError> {
+		let mut quotes = Vec::new();
+
+		if let Ok(result) = self
+			.generate_quote_for_settlement(request, config, &resolved_request.custody_decision)
+			.await
+		{
+			quotes.push(result);
+		}
+
 		if quotes.is_empty() {
 			return Err(QuoteError::InsufficientLiquidity);
 		}
+
 		self.sort_quotes_by_preference_pairs(&mut quotes, &request.intent.preference);
 		Ok(quotes)
 	}
 
+	pub(crate) async fn resolve_quote_request(
+		&self,
+		request: &GetQuoteRequest,
+	) -> Result<ResolvedQuoteRequest, QuoteError> {
+		// Phase 1 safety guard: current quote builders anchor request metadata on
+		// the first input, so multi-input requests can produce unusable orders.
+		if request.intent.inputs.len() > 1 {
+			return Err(QuoteError::UnsupportedQuoteShape(
+				"multi-input quote requests are not supported yet".to_string(),
+			));
+		}
+
+		let input = request
+			.intent
+			.inputs
+			.first()
+			.ok_or_else(|| QuoteError::InvalidRequest("No requested inputs".to_string()))?;
+		let order_input: OrderInput = input.try_into()?;
+		let custody_decision = self
+			.custody_strategy
+			.decide_custody(&order_input, request.intent.origin_submission.as_ref())
+			.await?;
+		let flow_key = Self::flow_key_for_custody_decision(&custody_decision)?;
+
+		Ok(ResolvedQuoteRequest {
+			custody_decision,
+			flow_key,
+		})
+	}
+
+	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) async fn resolve_quote_flow_keys(
 		&self,
 		request: &GetQuoteRequest,
 	) -> Result<Vec<String>, QuoteError> {
-		let mut flow_keys = Vec::new();
-
-		for input in &request.intent.inputs {
-			let order_input: OrderInput = input.try_into()?;
-			let custody_decision = self
-				.custody_strategy
-				.decide_custody(&order_input, request.intent.origin_submission.as_ref())
-				.await?;
-			let flow_key = Self::flow_key_for_custody_decision(&custody_decision)?;
-			if !flow_keys.contains(&flow_key) {
-				flow_keys.push(flow_key);
-			}
+		if request.intent.inputs.is_empty() {
+			return Ok(Vec::new());
 		}
 
-		Ok(flow_keys)
+		let resolved_request = self.resolve_quote_request(request).await?;
+		Ok(vec![resolved_request.flow_key])
 	}
 
 	/// Generate quotes with costs already embedded in the amounts.
-	pub async fn generate_quotes_with_costs(
+	#[cfg_attr(not(test), allow(dead_code))]
+	async fn generate_quotes_with_costs(
 		&self,
 		request: &GetQuoteRequest,
 		context: &ValidatedQuoteContext,
 		cost_context: &CostContext,
 		config: &Config,
+	) -> Result<Vec<(Quote, Option<String>)>, QuoteError> {
+		if request.intent.inputs.is_empty() {
+			return Err(QuoteError::InsufficientLiquidity);
+		}
+
+		let resolved_request = self.resolve_quote_request(request).await?;
+		self.generate_quotes_with_costs_resolved(
+			request,
+			context,
+			cost_context,
+			config,
+			&resolved_request,
+		)
+		.await
+	}
+
+	pub(crate) async fn generate_quotes_with_costs_resolved(
+		&self,
+		request: &GetQuoteRequest,
+		context: &ValidatedQuoteContext,
+		cost_context: &CostContext,
+		config: &Config,
+		resolved_request: &ResolvedQuoteRequest,
 	) -> Result<Vec<(Quote, Option<String>)>, QuoteError> {
 		// Build a new request with swap amounts and cost adjustments from CostContext
 		let adjusted_request = self.build_cost_adjusted_request(request, context, cost_context)?;
@@ -162,7 +226,9 @@ impl QuoteGenerator {
 		self.validate_swap_amount_constraints(&adjusted_request, context)?;
 
 		// Generate quotes using the adjusted request
-		let quotes = self.generate_quotes(&adjusted_request, config).await?;
+		let quotes = self
+			.generate_quotes_for_resolved_request(&adjusted_request, config, resolved_request)
+			.await?;
 
 		Ok(quotes)
 	}
@@ -2859,6 +2925,51 @@ mod tests {
 		}
 	}
 
+	#[tokio::test]
+	async fn test_generate_quotes_with_costs_rejects_multi_input_requests() {
+		let generator = create_test_generator();
+		let mut request = create_exact_input_request(Some("1000000000000000000"), None);
+		request.intent.inputs.push(QuoteInput {
+			user: InteropAddress::new_ethereum(
+				1,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			asset: InteropAddress::new_ethereum(
+				1,
+				address!("C0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
+			),
+			amount: Some(U256::from(500).to_string()),
+			lock: None,
+		});
+		let context = create_validated_quote_context(SwapType::ExactInput);
+		let cost_context = create_cost_context();
+		let config = create_test_config();
+
+		let result = generator
+			.generate_quotes_with_costs(&request, &context, &cost_context, &config)
+			.await;
+
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedQuoteShape(msg)) if msg.contains("multi-input"))
+		);
+	}
+
+	#[tokio::test]
+	async fn test_generate_quotes_with_costs_rejects_empty_inputs() {
+		let generator = create_test_generator();
+		let mut request = create_exact_input_request(Some("1000000000000000000"), None);
+		request.intent.inputs.clear();
+		let context = create_validated_quote_context(SwapType::ExactInput);
+		let cost_context = create_cost_context();
+		let config = create_test_config();
+
+		let result = generator
+			.generate_quotes_with_costs(&request, &context, &cost_context, &config)
+			.await;
+
+		assert!(matches!(result, Err(QuoteError::InsufficientLiquidity)));
+	}
+
 	#[test]
 	fn test_build_cost_adjusted_request_exact_input() {
 		let generator = create_test_generator();
@@ -3545,7 +3656,23 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_resolve_quote_flow_keys_collects_mixed_escrow_flows() {
+	async fn test_resolve_quote_request_single_input_permit2() {
+		let generator = create_test_generator();
+		let request = create_exact_input_request(Some("1000"), None);
+
+		let resolved_request = generator.resolve_quote_request(&request).await.unwrap();
+
+		assert_eq!(resolved_request.flow_key, "permit2_escrow");
+		assert!(matches!(
+			resolved_request.custody_decision,
+			CustodyDecision::Escrow {
+				lock_type: LockType::Permit2Escrow
+			}
+		));
+	}
+
+	#[tokio::test]
+	async fn test_resolve_quote_flow_keys_rejects_multi_input_requests() {
 		let generator = create_test_generator();
 		let mut request = create_test_request();
 		request.intent.inputs[0].asset =
@@ -3563,12 +3690,22 @@ mod tests {
 			lock: None,
 		});
 
-		let flow_keys = generator.resolve_quote_flow_keys(&request).await.unwrap();
+		let result = generator.resolve_quote_flow_keys(&request).await;
 
-		assert_eq!(
-			flow_keys,
-			vec!["eip3009_escrow".to_string(), "permit2_escrow".to_string()]
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedQuoteShape(msg)) if msg.contains("multi-input"))
 		);
+	}
+
+	#[tokio::test]
+	async fn test_resolve_quote_flow_keys_returns_empty_for_empty_inputs() {
+		let generator = create_test_generator();
+		let mut request = create_test_request();
+		request.intent.inputs.clear();
+
+		let result = generator.resolve_quote_flow_keys(&request).await.unwrap();
+
+		assert!(result.is_empty());
 	}
 
 	#[tokio::test]
@@ -3927,7 +4064,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_generate_quotes_multiple_inputs() {
+	async fn test_generate_quotes_rejects_multi_input_requests() {
 		let generator = create_test_generator();
 		let config = create_test_config();
 
@@ -3948,16 +4085,9 @@ mod tests {
 
 		let result = generator.generate_quotes(&request, &config).await;
 
-		// Should generate quotes for each input
-		match result {
-			Ok(quotes) => {
-				// Should have quotes for multiple inputs (up to 2)
-				assert!(!quotes.is_empty());
-			},
-			Err(_) => {
-				// Expected due to missing settlement configuration
-			},
-		}
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedQuoteShape(msg)) if msg.contains("multi-input"))
+		);
 	}
 
 	#[tokio::test]
