@@ -126,16 +126,10 @@ impl QuoteGenerator {
 	) -> Result<Vec<(Quote, Option<String>)>, QuoteError> {
 		let mut quotes = Vec::new();
 
-		if let Ok(result) = self
+		let result = self
 			.generate_quote_for_settlement(request, config, &resolved_request.custody_decision)
-			.await
-		{
-			quotes.push(result);
-		}
-
-		if quotes.is_empty() {
-			return Err(QuoteError::InsufficientLiquidity);
-		}
+			.await?;
+		quotes.push(result);
 
 		self.sort_quotes_by_preference_pairs(&mut quotes, &request.intent.preference);
 		Ok(quotes)
@@ -1352,7 +1346,9 @@ impl QuoteGenerator {
 			self.get_cached_token_name(&alloy_token_address, chain_id),
 			self.get_token_eip712_version(&alloy_token_address, chain_id),
 		);
-		let token_name = token_name.unwrap_or_else(|_| "Unknown Token".to_string());
+		let token_name = token_name.map_err(|e| {
+			QuoteError::InvalidRequest(format!("Failed to fetch EIP-3009 token name: {e}"))
+		})?;
 
 		// Build domain object similar to TheCompact structure (without pre-computed domainSeparator)
 		// The client will compute the domainSeparator using these fields
@@ -2282,8 +2278,23 @@ mod tests {
 
 		let result = generator.generate_quotes(&request, &config).await;
 
-		// Should fail with insufficient liquidity since our mock settlement has no oracles configured
-		assert!(matches!(result, Err(QuoteError::InsufficientLiquidity)));
+		assert!(matches!(result, Err(QuoteError::InvalidRequest(msg))
+			if msg.contains("No suitable settlement available")));
+	}
+
+	#[tokio::test]
+	async fn test_generate_quotes_propagates_generation_error() {
+		let settlement_service = create_test_settlement_service(false);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let config = create_test_config();
+		let request = create_test_request();
+
+		let result = generator.generate_quotes(&request, &config).await;
+
+		assert!(matches!(result, Err(QuoteError::InvalidRequest(msg))
+			if msg.contains("No suitable settlement available")));
 	}
 
 	#[tokio::test]
@@ -3336,8 +3347,32 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_build_eip3009_domain_object() {
-		let generator = create_test_generator();
-		let token_address = [0x42; 20];
+		use alloy_sol_types::{sol, SolCall};
+
+		sol! {
+			function name() external view returns (string);
+		}
+
+		let name_selector = nameCall {}.abi_encode()[0..4].to_vec();
+		let name_response = Bytes::from(nameCall::abi_encode_returns(&"USD Coin".to_string()));
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_eth_call()
+			.times(1)
+			.returning(move |tx| {
+				assert!(tx.data.starts_with(&name_selector));
+				let response = name_response.clone();
+				Box::pin(async move { Ok(response) })
+			});
+
+		let generator = create_test_generator_with_mock_delivery(1, mock_delivery);
+		let token_address = parse_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+			.unwrap()
+			.0
+			.clone()
+			.try_into()
+			.unwrap();
 
 		let result = generator
 			.build_eip3009_domain_object(&token_address, 1)
@@ -3347,9 +3382,32 @@ mod tests {
 		assert!(domain.is_object());
 		let domain_obj = domain.as_object().unwrap();
 		assert!(domain_obj.contains_key("name"));
-		assert_eq!(domain_obj["version"], "1");
+		assert_eq!(domain_obj["name"], "USD Coin");
+		assert_eq!(domain_obj["version"], "2");
 		assert_eq!(domain_obj["chainId"], 1);
 		assert!(domain_obj.contains_key("verifyingContract"));
+	}
+
+	#[tokio::test]
+	async fn test_build_eip3009_domain_object_fails_when_token_name_unavailable() {
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_eth_call().times(3).returning(|_| {
+			Box::pin(async {
+				Err(DeliveryError::Network(
+					"name and version lookups unavailable".to_string(),
+				))
+			})
+		});
+
+		let generator = create_test_generator_with_mock_delivery(1, mock_delivery);
+		let token_address = [0x42; 20];
+
+		let result = generator
+			.build_eip3009_domain_object(&token_address, 1)
+			.await;
+
+		assert!(matches!(result, Err(QuoteError::InvalidRequest(msg))
+			if msg.contains("Failed to fetch EIP-3009 token name")));
 	}
 
 	#[tokio::test]
