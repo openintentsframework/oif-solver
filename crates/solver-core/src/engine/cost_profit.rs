@@ -395,6 +395,18 @@ impl CostProfitService {
 		context: &solver_types::ValidatedQuoteContext,
 		config: &Config,
 	) -> Result<CostContext, CostProfitError> {
+		let flow_keys = request.flow_key().into_iter().collect::<Vec<_>>();
+		self.calculate_cost_context_for_flow_keys(request, context, config, &flow_keys)
+			.await
+	}
+
+	pub async fn calculate_cost_context_for_flow_keys(
+		&self,
+		request: &solver_types::GetQuoteRequest,
+		context: &solver_types::ValidatedQuoteContext,
+		config: &Config,
+		flow_keys: &[String],
+	) -> Result<CostContext, CostProfitError> {
 		// Get all token decimals upfront
 		let decimals_map = self.get_all_token_decimals(request).await;
 
@@ -433,10 +445,8 @@ impl CostProfitService {
 				details: None,
 			})?;
 
-		// Determine flow key from the request structure
-		let flow_key = request.flow_key();
 		let (open_units, fill_units, claim_units) =
-			estimate_gas_units_from_config(&flow_key, config, 150000, 150000, 150000);
+			estimate_gas_units_from_flow_keys(flow_keys, config, 150000, 150000, 150000);
 
 		// Get gas units for cost calculation
 		let gas_units = GasUnits {
@@ -602,42 +612,23 @@ impl CostProfitService {
 		// Read gas_buffer_bps from solver config (hot-reloadable)
 		let gas_buffer_bps_value = config.solver.gas_buffer_bps;
 
-		// Get gas prices
-		let origin_gp = self.get_chain_gas_price(origin_chain_id).await?;
-		let dest_gp = self.get_chain_gas_price(dest_chain_id).await?;
+		// Gas reads are independent and only need eth_gasPrice.
+		let (origin_gp, dest_gp) = tokio::try_join!(
+			self.get_chain_gas_price(origin_chain_id),
+			self.get_chain_gas_price(dest_chain_id),
+		)?;
 
 		// Calculate gas costs in wei
 		let open_cost_wei = origin_gp.saturating_mul(U256::from(gas_units.open_units));
 		let fill_cost_wei = dest_gp.saturating_mul(U256::from(gas_units.fill_units));
 		let claim_cost_wei = origin_gp.saturating_mul(U256::from(gas_units.claim_units));
 
-		// Convert to USD
-		let gas_open = Decimal::from_str(
-			&self
-				.pricing_service
-				.wei_to_currency(&open_cost_wei.to_string(), "USD")
-				.await
-				.unwrap_or_else(|_| "0".to_string()),
-		)
-		.unwrap_or(Decimal::ZERO);
-
-		let gas_fill = Decimal::from_str(
-			&self
-				.pricing_service
-				.wei_to_currency(&fill_cost_wei.to_string(), "USD")
-				.await
-				.unwrap_or_else(|_| "0".to_string()),
-		)
-		.unwrap_or(Decimal::ZERO);
-
-		let gas_claim = Decimal::from_str(
-			&self
-				.pricing_service
-				.wei_to_currency(&claim_cost_wei.to_string(), "USD")
-				.await
-				.unwrap_or_else(|_| "0".to_string()),
-		)
-		.unwrap_or(Decimal::ZERO);
+		// Price conversions are independent as well.
+		let (gas_open, gas_fill, gas_claim) = tokio::try_join!(
+			self.wei_to_usd(&open_cost_wei),
+			self.wei_to_usd(&fill_cost_wei),
+			self.wei_to_usd(&claim_cost_wei),
+		)?;
 
 		// Calculate gas buffer using config value (hot-reloadable)
 		let gas_subtotal = gas_open + gas_fill + gas_claim;
@@ -648,9 +639,11 @@ impl CostProfitService {
 		// so keep this component at zero to avoid double-charging.
 		let rate_buffer = Decimal::ZERO;
 
-		// Calculate input and output values in USD using helpers
-		let total_input_value_usd = self.calculate_inputs_usd_value(inputs).await?;
-		let total_output_value_usd = self.calculate_outputs_usd_value(outputs).await?;
+		// Input and output valuations do not depend on each other.
+		let (total_input_value_usd, total_output_value_usd) = tokio::try_join!(
+			self.calculate_inputs_usd_value(inputs),
+			self.calculate_outputs_usd_value(outputs),
+		)?;
 
 		// Calculate spread and base price
 		let spread = total_input_value_usd - total_output_value_usd;
@@ -1162,19 +1155,32 @@ impl CostProfitService {
 
 	/// Gets the gas price for a specific chain
 	async fn get_chain_gas_price(&self, chain_id: u64) -> Result<U256, APIError> {
-		let chain_data = self
+		let gas_price = self
 			.delivery_service
-			.get_chain_data(chain_id)
+			.get_gas_price(chain_id)
 			.await
 			.map_err(|e| APIError::InternalServerError {
 				error_type: ApiErrorType::ServiceError,
-				message: format!("Failed to get chain data: {e}"),
+				message: format!("Failed to get gas price: {e}"),
 			})?;
 
-		match U256::from_str_radix(&chain_data.gas_price, 10) {
+		match U256::from_str_radix(&gas_price, 10) {
 			Ok(gas_price) => Ok(gas_price),
 			Err(_) => Ok(U256::from(DEFAULT_GAS_PRICE_WEI)),
 		}
+	}
+
+	async fn wei_to_usd(&self, value_wei: &U256) -> Result<Decimal, CostProfitError> {
+		let usd_value = self
+			.pricing_service
+			.wei_to_currency(&value_wei.to_string(), "USD")
+			.await
+			.map_err(|e| {
+				CostProfitError::Calculation(format!("Failed to convert wei to USD: {e}"))
+			})?;
+
+		Decimal::from_str(&usd_value)
+			.map_err(|e| CostProfitError::Calculation(format!("Failed to parse USD value: {e}")))
 	}
 
 	/// Validates callback safety and simulates fill transaction gas for an order with callbackData.
@@ -1552,6 +1558,60 @@ pub fn estimate_gas_units_from_config(
 	tracing::warn!(
 		"No gas config found for flow {:?}, using fallback estimates",
 		flow_key
+	);
+
+	(fallback_open, fallback_fill, fallback_claim)
+}
+
+pub fn estimate_gas_units_from_flow_keys(
+	flow_keys: &[String],
+	config: &Config,
+	fallback_open: u64,
+	fallback_fill: u64,
+	fallback_claim: u64,
+) -> (u64, u64, u64) {
+	if flow_keys.is_empty() {
+		return (fallback_open, fallback_fill, fallback_claim);
+	}
+
+	if let Some(gcfg) = config.gas.as_ref() {
+		tracing::debug!(
+			"Available gas flows: {:?}",
+			gcfg.flows.keys().collect::<Vec<_>>()
+		);
+
+		let mut found = false;
+		let mut open: Option<u64> = None;
+		let mut fill: Option<u64> = None;
+		let mut claim: Option<u64> = None;
+
+		for flow in flow_keys {
+			if let Some(units) = gcfg.flows.get(flow.as_str()) {
+				found = true;
+				let candidate_open = units.open.unwrap_or(fallback_open);
+				let candidate_fill = units.fill.unwrap_or(fallback_fill);
+				let candidate_claim = units.claim.unwrap_or(fallback_claim);
+
+				open = Some(open.map_or(candidate_open, |current| current.max(candidate_open)));
+				fill = Some(fill.map_or(candidate_fill, |current| current.max(candidate_fill)));
+				claim = Some(claim.map_or(candidate_claim, |current| current.max(candidate_claim)));
+			} else {
+				tracing::warn!("Flow '{}' not found in gas config flows", flow);
+			}
+		}
+
+		if found {
+			return (
+				open.unwrap_or(fallback_open),
+				fill.unwrap_or(fallback_fill),
+				claim.unwrap_or(fallback_claim),
+			);
+		}
+	}
+
+	tracing::warn!(
+		"No gas config found for flows {:?}, using fallback estimates",
+		flow_keys
 	);
 
 	(fallback_open, fallback_fill, fallback_claim)
@@ -2057,6 +2117,140 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn test_calculate_cost_context_fails_when_gas_pricing_conversion_fails() {
+		let mut mock_pricing = MockPricingInterface::new();
+		let mut mock_delivery = MockDeliveryInterface::new();
+		let mock_storage = MockStorageInterface::new();
+
+		mock_pricing
+			.expect_convert_asset()
+			.returning(|from, to, amount| {
+				let from = from.to_string();
+				let to = to.to_string();
+				let amount_f64: f64 = amount.parse().unwrap_or(0.0);
+				Box::pin(async move {
+					match (from.as_str(), to.as_str()) {
+						("ETH", "USD") => Ok((amount_f64 * ETH_USD_PRICE).to_string()),
+						("USD", "ETH") => Ok((amount_f64 / ETH_USD_PRICE).to_string()),
+						("USDC", "USD") => Ok((amount_f64 * USDC_USD_PRICE).to_string()),
+						("USD", "USDC") => Ok((amount_f64 / USDC_USD_PRICE).to_string()),
+						_ => Ok("1.0".to_string()),
+					}
+				})
+			});
+		mock_pricing.expect_wei_to_currency().returning(|_, _| {
+			Box::pin(async move {
+				Err(solver_types::PricingError::PriceNotAvailable(
+					"ETH/USD".to_string(),
+				))
+			})
+		});
+
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+		mock_delivery
+			.expect_get_gas_price()
+			.returning(|_| Box::pin(async move { Ok("20000000000".to_string()) }));
+		mock_delivery
+			.expect_get_block_number()
+			.returning(|_| Box::pin(async move { Ok(12345u64) }));
+
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
+
+		let mut delivery_implementations = HashMap::new();
+		delivery_implementations.insert(
+			1,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+
+		let mut mock_delivery_137 = MockDeliveryInterface::new();
+		mock_delivery_137.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+		mock_delivery_137
+			.expect_get_gas_price()
+			.returning(|_| Box::pin(async move { Ok("20000000000".to_string()) }));
+		mock_delivery_137
+			.expect_get_block_number()
+			.returning(|_| Box::pin(async move { Ok(12345u64) }));
+
+		delivery_implementations.insert(
+			137,
+			Arc::new(mock_delivery_137) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 1, 3600));
+
+		let mut networks = solver_types::NetworksConfig::new();
+		let network_1 = solver_types::NetworkConfig {
+			name: Some("ethereum".to_string()),
+			network_type: solver_types::networks::NetworkType::Parent,
+			rpc_urls: vec![],
+			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
+			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
+			tokens: vec![solver_types::TokenConfig {
+				address: solver_types::Address(
+					[
+						0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
+						0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+					]
+					.to_vec(),
+				),
+				decimals: 18,
+				symbol: "ETH".to_string(),
+				name: Some("Ether".to_string()),
+			}],
+			input_settler_compact_address: None,
+			the_compact_address: None,
+			allocator_address: None,
+		};
+		networks.insert(1, network_1);
+
+		let network_137 = solver_types::NetworkConfig {
+			name: Some("polygon".to_string()),
+			network_type: solver_types::networks::NetworkType::Hub,
+			rpc_urls: vec![],
+			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
+			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
+			tokens: vec![solver_types::TokenConfig {
+				address: solver_types::Address(
+					[
+						0xB0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
+						0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+					]
+					.to_vec(),
+				),
+				decimals: 6,
+				symbol: "USDC".to_string(),
+				name: Some("USD Coin".to_string()),
+			}],
+			input_settler_compact_address: None,
+			the_compact_address: None,
+			allocator_address: None,
+		};
+		networks.insert(137, network_137);
+
+		let token_manager = Arc::new(TokenManager::new(
+			networks,
+			delivery.clone(),
+			create_mock_account_service(),
+		));
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+
+		let request = create_test_request(true);
+		let context = create_test_validated_context(true);
+		let config = create_test_config();
+
+		let result = service
+			.calculate_cost_context(&request, &context, &config)
+			.await;
+
+		assert!(matches!(result, Err(CostProfitError::Calculation(_))));
+	}
+
+	#[tokio::test]
 	async fn test_calculate_cost_context_exact_output() {
 		// Arrange
 		let mut mock_pricing = MockPricingInterface::new();
@@ -2250,6 +2444,31 @@ mod tests {
 				}
 			}
 		}
+	}
+
+	#[test]
+	fn test_estimate_gas_units_from_flow_keys_respects_lower_configured_values() {
+		let mut config = create_test_config();
+		config.gas = Some(solver_config::GasConfig {
+			flows: HashMap::from([(
+				"permit2_escrow".to_string(),
+				solver_config::GasFlowUnits {
+					open: Some(100_000),
+					fill: Some(110_000),
+					claim: Some(120_000),
+				},
+			)]),
+		});
+
+		let (open, fill, claim) = estimate_gas_units_from_flow_keys(
+			&["permit2_escrow".to_string()],
+			&config,
+			150_000,
+			150_000,
+			150_000,
+		);
+
+		assert_eq!((open, fill, claim), (100_000, 110_000, 120_000));
 	}
 
 	// ============================================================================

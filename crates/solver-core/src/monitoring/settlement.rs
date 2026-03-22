@@ -9,7 +9,8 @@ use crate::state::OrderStateMachine;
 use solver_delivery::DeliveryService;
 use solver_settlement::{ActionRequired, SettlementReadiness, SettlementService};
 use solver_types::{
-	truncate_id, NetworksConfig, Order, OrderStatus, SettlementEvent, SolverEvent, TransactionHash,
+	current_timestamp, truncate_id, NetworksConfig, Order, OrderStatus, SettlementEvent,
+	SolverEvent, TransactionHash,
 };
 use std::sync::Arc;
 
@@ -114,6 +115,8 @@ impl SettlementMonitor {
 					.await;
 			}
 
+			let mut next_check_delay = check_interval;
+
 			match settlement.readiness(&order, &fill_proof).await {
 				SettlementReadiness::Ready => {
 					// Update status to Settled
@@ -131,6 +134,22 @@ impl SettlementMonitor {
 					break;
 				},
 				SettlementReadiness::Waiting(reason) => match &reason {
+					solver_settlement::WaitingReason::WaitingForProofDelay { until } => {
+						let remaining_proof_delay_secs =
+							until.saturating_sub(current_timestamp()).max(1);
+						let remaining_monitoring_time =
+							monitoring_timeout.saturating_sub(start_time.elapsed());
+						next_check_delay =
+							tokio::time::Duration::from_secs(remaining_proof_delay_secs)
+								.min(remaining_monitoring_time);
+
+						tracing::debug!(
+							order_id = %truncate_id(&order.id),
+							?reason,
+							sleep_secs = next_check_delay.as_secs(),
+							"Settlement waiting on proof delay; backing off monitor"
+						);
+					},
 					solver_settlement::WaitingReason::ProofServiceNotReady
 					| solver_settlement::WaitingReason::RpcUnavailable
 					| solver_settlement::WaitingReason::StorageUnavailable => {
@@ -167,7 +186,9 @@ impl SettlementMonitor {
 			}
 
 			// Wait before next check
-			tokio::time::sleep(check_interval).await;
+			if !next_check_delay.is_zero() {
+				tokio::time::sleep(next_check_delay).await;
+			}
 		}
 	}
 }
