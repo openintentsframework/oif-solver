@@ -9,7 +9,7 @@ use crate::{
 use alloy_network::EthereumWallet;
 use alloy_primitives::{Address, Bytes, FixedBytes, U256};
 use alloy_provider::{
-	fillers::{ChainIdFiller, GasFiller, NonceFiller, SimpleNonceManager},
+	fillers::{CachedNonceManager, ChainIdFiller, GasFiller, NonceFiller},
 	DynProvider, Provider, ProviderBuilder,
 };
 use alloy_rpc_client::RpcClient;
@@ -106,9 +106,10 @@ impl AlloyDelivery {
 			// Create RPC client with retry capabilities
 			let client = RpcClient::builder().layer(retry_layer).http(url);
 
-			// Create provider with simple nonce management and retry capabilities
+			// Cache nonces locally so back-to-back startup approvals do not reuse a stale
+			// pending nonce while the RPC is still catching up.
 			let provider = ProviderBuilder::new()
-				.filler(NonceFiller::new(SimpleNonceManager::default()))
+				.filler(NonceFiller::<CachedNonceManager>::cached())
 				.filler(GasFiller)
 				.filler(ChainIdFiller::default())
 				.wallet(wallet)

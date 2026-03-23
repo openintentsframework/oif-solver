@@ -19,3 +19,6 @@ solver-types = { path = "../solver-types" }
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["sync", "time"] }
 tracing = "0.1"
+
+[dev-dependencies]
+wiremock = "0.5"

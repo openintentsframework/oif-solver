@@ -50,6 +50,7 @@
 
 use super::custody::{CustodyDecision, CustodyStrategy};
 use alloy_primitives::U256;
+use dashmap::DashMap;
 use solver_config::{Config, QuoteConfig};
 use solver_delivery::DeliveryService;
 use solver_settlement::SettlementService;
@@ -62,12 +63,24 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 /// Quote generation engine with settlement service integration.
-pub struct QuoteGenerator {
+pub(crate) struct QuoteGenerator {
 	custody_strategy: CustodyStrategy,
 	/// Reference to settlement service for implementation lookup.
 	settlement_service: Arc<SettlementService>,
 	/// Reference to delivery service for contract calls.
 	delivery_service: Arc<DeliveryService>,
+	/// Cached EIP-3009 token names keyed by (chain_id, token_address).
+	eip3009_token_names: DashMap<(u64, [u8; 20]), String>,
+	/// Cached EIP-3009 token versions keyed by (chain_id, token_address).
+	eip3009_token_versions: DashMap<(u64, [u8; 20]), String>,
+	/// Cached EIP-3009 domain separators keyed by (chain_id, token_address).
+	eip3009_domain_separators: DashMap<(u64, [u8; 20]), [u8; 32]>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedQuoteRequest {
+	pub(crate) custody_decision: CustodyDecision,
+	pub(crate) flow_key: String,
 }
 
 impl QuoteGenerator {
@@ -76,7 +89,7 @@ impl QuoteGenerator {
 	/// # Arguments
 	/// * `settlement_service` - Service managing settlement implementations
 	/// * `delivery_service` - Service for making contract calls
-	pub fn new(
+	pub(crate) fn new(
 		settlement_service: Arc<SettlementService>,
 		delivery_service: Arc<DeliveryService>,
 	) -> Self {
@@ -84,42 +97,118 @@ impl QuoteGenerator {
 			custody_strategy: CustodyStrategy::new(delivery_service.clone()),
 			settlement_service,
 			delivery_service,
+			eip3009_token_names: DashMap::new(),
+			eip3009_token_versions: DashMap::new(),
+			eip3009_domain_separators: DashMap::new(),
 		}
 	}
 
-	pub async fn generate_quotes(
+	#[cfg_attr(not(test), allow(dead_code))]
+	async fn generate_quotes(
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
 	) -> Result<Vec<(Quote, Option<String>)>, QuoteError> {
-		let mut quotes = Vec::new();
-		for input in &request.intent.inputs {
-			let order_input: OrderInput = input.try_into()?;
-			let custody_decision = self
-				.custody_strategy
-				.decide_custody(&order_input, request.intent.origin_submission.as_ref())
-				.await?;
-			if let Ok(result) = self
-				.generate_quote_for_settlement(request, config, &custody_decision)
-				.await
-			{
-				quotes.push(result);
-			}
-		}
-		if quotes.is_empty() {
+		if request.intent.inputs.is_empty() {
 			return Err(QuoteError::InsufficientLiquidity);
 		}
+
+		let resolved_request = self.resolve_quote_request(request).await?;
+		self.generate_quotes_for_resolved_request(request, config, &resolved_request)
+			.await
+	}
+
+	async fn generate_quotes_for_resolved_request(
+		&self,
+		request: &GetQuoteRequest,
+		config: &Config,
+		resolved_request: &ResolvedQuoteRequest,
+	) -> Result<Vec<(Quote, Option<String>)>, QuoteError> {
+		let mut quotes = Vec::new();
+
+		let result = self
+			.generate_quote_for_settlement(request, config, &resolved_request.custody_decision)
+			.await?;
+		quotes.push(result);
+
 		self.sort_quotes_by_preference_pairs(&mut quotes, &request.intent.preference);
 		Ok(quotes)
 	}
 
+	pub(crate) async fn resolve_quote_request(
+		&self,
+		request: &GetQuoteRequest,
+	) -> Result<ResolvedQuoteRequest, QuoteError> {
+		// Phase 1 safety guard: current quote builders anchor request metadata on
+		// the first input, so multi-input requests can produce unusable orders.
+		if request.intent.inputs.len() > 1 {
+			return Err(QuoteError::UnsupportedQuoteShape(
+				"multi-input quote requests are not supported yet".to_string(),
+			));
+		}
+
+		let input = request
+			.intent
+			.inputs
+			.first()
+			.ok_or_else(|| QuoteError::InvalidRequest("No requested inputs".to_string()))?;
+		let order_input: OrderInput = input.try_into()?;
+		let custody_decision = self
+			.custody_strategy
+			.decide_custody(&order_input, request.intent.origin_submission.as_ref())
+			.await?;
+		let flow_key = Self::flow_key_for_custody_decision(&custody_decision)?;
+
+		Ok(ResolvedQuoteRequest {
+			custody_decision,
+			flow_key,
+		})
+	}
+
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) async fn resolve_quote_flow_keys(
+		&self,
+		request: &GetQuoteRequest,
+	) -> Result<Vec<String>, QuoteError> {
+		if request.intent.inputs.is_empty() {
+			return Ok(Vec::new());
+		}
+
+		let resolved_request = self.resolve_quote_request(request).await?;
+		Ok(vec![resolved_request.flow_key])
+	}
+
 	/// Generate quotes with costs already embedded in the amounts.
-	pub async fn generate_quotes_with_costs(
+	#[cfg_attr(not(test), allow(dead_code))]
+	async fn generate_quotes_with_costs(
 		&self,
 		request: &GetQuoteRequest,
 		context: &ValidatedQuoteContext,
 		cost_context: &CostContext,
 		config: &Config,
+	) -> Result<Vec<(Quote, Option<String>)>, QuoteError> {
+		if request.intent.inputs.is_empty() {
+			return Err(QuoteError::InsufficientLiquidity);
+		}
+
+		let resolved_request = self.resolve_quote_request(request).await?;
+		self.generate_quotes_with_costs_resolved(
+			request,
+			context,
+			cost_context,
+			config,
+			&resolved_request,
+		)
+		.await
+	}
+
+	pub(crate) async fn generate_quotes_with_costs_resolved(
+		&self,
+		request: &GetQuoteRequest,
+		context: &ValidatedQuoteContext,
+		cost_context: &CostContext,
+		config: &Config,
+		resolved_request: &ResolvedQuoteRequest,
 	) -> Result<Vec<(Quote, Option<String>)>, QuoteError> {
 		// Build a new request with swap amounts and cost adjustments from CostContext
 		let adjusted_request = self.build_cost_adjusted_request(request, context, cost_context)?;
@@ -131,7 +220,9 @@ impl QuoteGenerator {
 		self.validate_swap_amount_constraints(&adjusted_request, context)?;
 
 		// Generate quotes using the adjusted request
-		let quotes = self.generate_quotes(&adjusted_request, config).await?;
+		let quotes = self
+			.generate_quotes_for_resolved_request(&adjusted_request, config, resolved_request)
+			.await?;
 
 		Ok(quotes)
 	}
@@ -288,6 +379,21 @@ impl QuoteGenerator {
 		}
 
 		Ok(())
+	}
+
+	fn flow_key_for_custody_decision(
+		custody_decision: &CustodyDecision,
+	) -> Result<String, QuoteError> {
+		match custody_decision {
+			CustodyDecision::ResourceLock { .. } => Ok("resource_lock".to_string()),
+			CustodyDecision::Escrow { lock_type } => match lock_type {
+				LockType::Permit2Escrow => Ok("permit2_escrow".to_string()),
+				LockType::Eip3009Escrow => Ok("eip3009_escrow".to_string()),
+				_ => Err(QuoteError::UnsupportedSettlement(format!(
+					"Unsupported escrow type: {lock_type:?}"
+				))),
+			},
+		}
 	}
 
 	/// Validate that no amounts are zero after adjustment
@@ -601,38 +707,27 @@ impl QuoteGenerator {
 			"0x{:040x}",
 			alloy_primitives::Address::from_slice(&input_settler.0)
 		);
+		let token_address = first_input
+			.asset
+			.ethereum_address()
+			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid token address: {e}")))?;
 
 		// Set fillDeadline for order
 		let fill_deadline = fill_deadline_timestamp as u32;
 		let expires = expires_timestamp as u32;
 
-		// Calculate the correct orderIdentifier using the contract
-		let (nonce_u64, order_identifier) = self
-			.compute_eip3009_order_identifier(
+		let ((nonce_u64, order_identifier), domain_object, domain_separator) = tokio::try_join!(
+			self.compute_eip3009_order_identifier(
 				request,
 				config,
 				&input_oracle,
 				&output_oracle,
 				fill_deadline,
 				expires,
-			)
-			.await?;
-
-		// Get token address for domain information
-		let token_address = first_input
-			.asset
-			.ethereum_address()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid token address: {e}")))?;
-
-		// Build structured domain object for EIP-3009 token
-		let domain_object = self
-			.build_eip3009_domain_object(&token_address, input_chain_id)
-			.await?;
-
-		// Get the domain separator from the contract
-		let domain_separator = self
-			.get_eip3009_domain_separator(&token_address, input_chain_id)
-			.await?;
+			),
+			self.build_eip3009_domain_object(&token_address, input_chain_id),
+			self.get_eip3009_domain_separator(&token_address, input_chain_id),
+		)?;
 
 		// For EIP-3009, we need to generate signature templates for each input
 		// since the contract expects one signature per input
@@ -951,6 +1046,11 @@ impl QuoteGenerator {
 	) -> Result<[u8; 32], QuoteError> {
 		use alloy_sol_types::SolCall;
 
+		let cache_key = Self::eip3009_cache_key(chain_id, token_address);
+		if let Some(cached) = self.eip3009_domain_separators.get(&cache_key) {
+			return Ok(*cached);
+		}
+
 		// Define the DOMAIN_SEPARATOR function
 		alloy_sol_types::sol! {
 			function DOMAIN_SEPARATOR() external view returns (bytes32);
@@ -991,6 +1091,8 @@ impl QuoteGenerator {
 
 		let mut domain_separator = [0u8; 32];
 		domain_separator.copy_from_slice(&domain_separator_bytes);
+		self.eip3009_domain_separators
+			.insert(cache_key, domain_separator);
 
 		Ok(domain_separator)
 	}
@@ -1240,14 +1342,13 @@ impl QuoteGenerator {
 	) -> Result<serde_json::Value, QuoteError> {
 		let alloy_token_address = alloy_primitives::Address::from_slice(token_address);
 
-		// Try to get token name
-		let token_name = self
-			.get_token_name(&alloy_token_address, chain_id)
-			.await
-			.unwrap_or_else(|_| "Unknown Token".to_string());
-		let token_version = self
-			.get_token_eip712_version(&alloy_token_address, chain_id)
-			.await;
+		let (token_name, token_version) = tokio::join!(
+			self.get_cached_token_name(&alloy_token_address, chain_id),
+			self.get_token_eip712_version(&alloy_token_address, chain_id),
+		);
+		let token_name = token_name.map_err(|e| {
+			QuoteError::InvalidRequest(format!("Failed to fetch EIP-3009 token name: {e}"))
+		})?;
 
 		// Build domain object similar to TheCompact structure (without pre-computed domainSeparator)
 		// The client will compute the domainSeparator using these fields
@@ -1299,16 +1400,44 @@ impl QuoteGenerator {
 		Ok(name)
 	}
 
+	async fn get_cached_token_name(
+		&self,
+		token_address: &alloy_primitives::Address,
+		chain_id: u64,
+	) -> Result<String, QuoteError> {
+		let cache_key = Self::eip3009_cache_key(chain_id, &token_address.0);
+		if let Some(cached) = self.eip3009_token_names.get(&cache_key) {
+			return Ok(cached.clone());
+		}
+
+		let name = self.get_token_name(token_address, chain_id).await?;
+		self.eip3009_token_names.insert(cache_key, name.clone());
+		Ok(name)
+	}
+
 	/// Get token EIP-712 version with graceful fallbacks.
 	async fn get_token_eip712_version(
 		&self,
 		token_address: &alloy_primitives::Address,
 		chain_id: u64,
 	) -> String {
+		let cache_key = Self::eip3009_cache_key(chain_id, &token_address.0);
+		if let Some(cached) = self.eip3009_token_versions.get(&cache_key) {
+			return cached.clone();
+		}
+
+		if let Some(version) = self.get_known_eip3009_token_version(token_address, chain_id) {
+			self.eip3009_token_versions
+				.insert(cache_key, version.clone());
+			return version;
+		}
+
 		if let Ok(version) = self
 			.get_token_eip712_version_via_eip5267(token_address, chain_id)
 			.await
 		{
+			self.eip3009_token_versions
+				.insert(cache_key, version.clone());
 			return version;
 		}
 
@@ -1316,10 +1445,8 @@ impl QuoteGenerator {
 			.get_token_eip712_version_via_version_call(token_address, chain_id)
 			.await
 		{
-			return version;
-		}
-
-		if let Some(version) = self.get_known_eip3009_token_version(token_address, chain_id) {
+			self.eip3009_token_versions
+				.insert(cache_key, version.clone());
 			return version;
 		}
 
@@ -1329,7 +1456,14 @@ impl QuoteGenerator {
 			"Falling back to default EIP-712 version '1' for EIP-3009 token"
 		);
 
-		"1".to_string()
+		let fallback = "1".to_string();
+		self.eip3009_token_versions
+			.insert(cache_key, fallback.clone());
+		fallback
+	}
+
+	fn eip3009_cache_key(chain_id: u64, token_address: &[u8; 20]) -> (u64, [u8; 20]) {
+		(chain_id, *token_address)
 	}
 
 	/// Resolve token EIP-712 version from EIP-5267 `eip712Domain()`.
@@ -2144,8 +2278,23 @@ mod tests {
 
 		let result = generator.generate_quotes(&request, &config).await;
 
-		// Should fail with insufficient liquidity since our mock settlement has no oracles configured
-		assert!(matches!(result, Err(QuoteError::InsufficientLiquidity)));
+		assert!(matches!(result, Err(QuoteError::InvalidRequest(msg))
+			if msg.contains("No suitable settlement available")));
+	}
+
+	#[tokio::test]
+	async fn test_generate_quotes_propagates_generation_error() {
+		let settlement_service = create_test_settlement_service(false);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let config = create_test_config();
+		let request = create_test_request();
+
+		let result = generator.generate_quotes(&request, &config).await;
+
+		assert!(matches!(result, Err(QuoteError::InvalidRequest(msg))
+			if msg.contains("No suitable settlement available")));
 	}
 
 	#[tokio::test]
@@ -2787,6 +2936,51 @@ mod tests {
 		}
 	}
 
+	#[tokio::test]
+	async fn test_generate_quotes_with_costs_rejects_multi_input_requests() {
+		let generator = create_test_generator();
+		let mut request = create_exact_input_request(Some("1000000000000000000"), None);
+		request.intent.inputs.push(QuoteInput {
+			user: InteropAddress::new_ethereum(
+				1,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			asset: InteropAddress::new_ethereum(
+				1,
+				address!("C0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
+			),
+			amount: Some(U256::from(500).to_string()),
+			lock: None,
+		});
+		let context = create_validated_quote_context(SwapType::ExactInput);
+		let cost_context = create_cost_context();
+		let config = create_test_config();
+
+		let result = generator
+			.generate_quotes_with_costs(&request, &context, &cost_context, &config)
+			.await;
+
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedQuoteShape(msg)) if msg.contains("multi-input"))
+		);
+	}
+
+	#[tokio::test]
+	async fn test_generate_quotes_with_costs_rejects_empty_inputs() {
+		let generator = create_test_generator();
+		let mut request = create_exact_input_request(Some("1000000000000000000"), None);
+		request.intent.inputs.clear();
+		let context = create_validated_quote_context(SwapType::ExactInput);
+		let cost_context = create_cost_context();
+		let config = create_test_config();
+
+		let result = generator
+			.generate_quotes_with_costs(&request, &context, &cost_context, &config)
+			.await;
+
+		assert!(matches!(result, Err(QuoteError::InsufficientLiquidity)));
+	}
+
 	#[test]
 	fn test_build_cost_adjusted_request_exact_input() {
 		let generator = create_test_generator();
@@ -3153,8 +3347,32 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_build_eip3009_domain_object() {
-		let generator = create_test_generator();
-		let token_address = [0x42; 20];
+		use alloy_sol_types::{sol, SolCall};
+
+		sol! {
+			function name() external view returns (string);
+		}
+
+		let name_selector = nameCall {}.abi_encode()[0..4].to_vec();
+		let name_response = Bytes::from(nameCall::abi_encode_returns(&"USD Coin".to_string()));
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_eth_call()
+			.times(1)
+			.returning(move |tx| {
+				assert!(tx.data.starts_with(&name_selector));
+				let response = name_response.clone();
+				Box::pin(async move { Ok(response) })
+			});
+
+		let generator = create_test_generator_with_mock_delivery(1, mock_delivery);
+		let token_address = parse_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+			.unwrap()
+			.0
+			.clone()
+			.try_into()
+			.unwrap();
 
 		let result = generator
 			.build_eip3009_domain_object(&token_address, 1)
@@ -3164,9 +3382,32 @@ mod tests {
 		assert!(domain.is_object());
 		let domain_obj = domain.as_object().unwrap();
 		assert!(domain_obj.contains_key("name"));
-		assert_eq!(domain_obj["version"], "1");
+		assert_eq!(domain_obj["name"], "USD Coin");
+		assert_eq!(domain_obj["version"], "2");
 		assert_eq!(domain_obj["chainId"], 1);
 		assert!(domain_obj.contains_key("verifyingContract"));
+	}
+
+	#[tokio::test]
+	async fn test_build_eip3009_domain_object_fails_when_token_name_unavailable() {
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_eth_call().times(3).returning(|_| {
+			Box::pin(async {
+				Err(DeliveryError::Network(
+					"name and version lookups unavailable".to_string(),
+				))
+			})
+		});
+
+		let generator = create_test_generator_with_mock_delivery(1, mock_delivery);
+		let token_address = [0x42; 20];
+
+		let result = generator
+			.build_eip3009_domain_object(&token_address, 1)
+			.await;
+
+		assert!(matches!(result, Err(QuoteError::InvalidRequest(msg))
+			if msg.contains("Failed to fetch EIP-3009 token name")));
 	}
 
 	#[tokio::test]
@@ -3212,7 +3453,7 @@ mod tests {
 			});
 
 		let generator = create_test_generator_with_mock_delivery(1, mock_delivery);
-		let token_address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+		let token_address = address!("1111111111111111111111111111111111111111");
 		let version = generator.get_token_eip712_version(&token_address, 1).await;
 
 		assert_eq!(version, "2");
@@ -3263,7 +3504,7 @@ mod tests {
 			});
 
 		let generator = create_test_generator_with_mock_delivery(1, mock_delivery);
-		let token_address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+		let token_address = address!("1111111111111111111111111111111111111111");
 		let version = generator.get_token_eip712_version(&token_address, 1).await;
 
 		assert_eq!(version, "7");
@@ -3272,7 +3513,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_get_token_eip712_version_falls_back_to_known_registry() {
 		let mut mock_delivery = MockDeliveryInterface::new();
-		mock_delivery.expect_eth_call().times(2).returning(|_| {
+		mock_delivery.expect_eth_call().times(0).returning(|_| {
 			Box::pin(async {
 				Err(DeliveryError::Network(
 					"version lookups unavailable".to_string(),
@@ -3458,6 +3699,71 @@ mod tests {
 				Some("2".to_string())
 			);
 		}
+	}
+
+	#[tokio::test]
+	async fn test_resolve_quote_flow_keys_prefers_eip3009_for_mainnet_usdc() {
+		let generator = create_test_generator();
+		let mut request = create_test_request();
+		request.intent.inputs[0].asset =
+			InteropAddress::new_ethereum(1, address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"));
+
+		let flow_keys = generator.resolve_quote_flow_keys(&request).await.unwrap();
+
+		assert_eq!(flow_keys, vec!["eip3009_escrow".to_string()]);
+	}
+
+	#[tokio::test]
+	async fn test_resolve_quote_request_single_input_permit2() {
+		let generator = create_test_generator();
+		let request = create_exact_input_request(Some("1000"), None);
+
+		let resolved_request = generator.resolve_quote_request(&request).await.unwrap();
+
+		assert_eq!(resolved_request.flow_key, "permit2_escrow");
+		assert!(matches!(
+			resolved_request.custody_decision,
+			CustodyDecision::Escrow {
+				lock_type: LockType::Permit2Escrow
+			}
+		));
+	}
+
+	#[tokio::test]
+	async fn test_resolve_quote_flow_keys_rejects_multi_input_requests() {
+		let generator = create_test_generator();
+		let mut request = create_test_request();
+		request.intent.inputs[0].asset =
+			InteropAddress::new_ethereum(1, address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"));
+		request.intent.inputs.push(QuoteInput {
+			user: InteropAddress::new_ethereum(
+				1,
+				address!("1111111111111111111111111111111111111111"),
+			),
+			asset: InteropAddress::new_ethereum(
+				1,
+				address!("C0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C"),
+			),
+			amount: Some(U256::from(500).to_string()),
+			lock: None,
+		});
+
+		let result = generator.resolve_quote_flow_keys(&request).await;
+
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedQuoteShape(msg)) if msg.contains("multi-input"))
+		);
+	}
+
+	#[tokio::test]
+	async fn test_resolve_quote_flow_keys_returns_empty_for_empty_inputs() {
+		let generator = create_test_generator();
+		let mut request = create_test_request();
+		request.intent.inputs.clear();
+
+		let result = generator.resolve_quote_flow_keys(&request).await.unwrap();
+
+		assert!(result.is_empty());
 	}
 
 	#[tokio::test]
@@ -3816,7 +4122,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_generate_quotes_multiple_inputs() {
+	async fn test_generate_quotes_rejects_multi_input_requests() {
 		let generator = create_test_generator();
 		let config = create_test_config();
 
@@ -3837,16 +4143,9 @@ mod tests {
 
 		let result = generator.generate_quotes(&request, &config).await;
 
-		// Should generate quotes for each input
-		match result {
-			Ok(quotes) => {
-				// Should have quotes for multiple inputs (up to 2)
-				assert!(!quotes.is_empty());
-			},
-			Err(_) => {
-				// Expected due to missing settlement configuration
-			},
-		}
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedQuoteShape(msg)) if msg.contains("multi-input"))
+		);
 	}
 
 	#[tokio::test]
