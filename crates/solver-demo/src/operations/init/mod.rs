@@ -1169,6 +1169,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			deny_list: None,
 		}
 	}
 
