@@ -65,6 +65,7 @@ Bootstrap config specifies which networks your solver will support. Networks can
 ```json
 {
   "solver_id": "my-solver-instance",
+  "monitoring_timeout_seconds": 864000,
   "networks": [
     {
       "chain_id": 11155420,
@@ -96,6 +97,7 @@ Bootstrap config specifies which networks your solver will support. Networks can
 | Field | Required | Description |
 |-------|----------|-------------|
 | `solver_id` | No | Unique solver identifier. If provided, enables idempotent seeding. If omitted, a UUID is generated. |
+| `monitoring_timeout_seconds` | No | Top-level solver monitoring timeout in seconds. Controls how long post-fill settlement monitoring keeps polling for claim readiness. Valid range: `30` to `1209600` seconds. Defaults to seed/common default (`28800`). Long-latency broadcaster routes may need values like `864000` (10 days). |
 | `networks` | Yes | Array of networks to support |
 | `networks[].chain_id` | Yes | Chain ID (seeded or non-seeded) |
 | `networks[].tokens` | Yes | Tokens for this network (can be empty at boot) |
@@ -129,6 +131,11 @@ Optional per-network fields:
 Intent expiry and settlement timing configuration is documented in:
 
 - `docs/oracles/settlement-timing-configuration.md`
+
+For broadcaster routes with slow proof availability, tune both:
+
+- `monitoring_timeout_seconds` for the post-fill claimability loop
+- settlement timing fields such as `settlement.broadcaster.proof_wait_time_seconds` and `settlement.broadcaster.intent_min_expiry_seconds`
 
 The key `intent_min_expiry_seconds` uses the same field name across:
 

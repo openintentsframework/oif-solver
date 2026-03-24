@@ -552,12 +552,16 @@ impl Config {
 			));
 		}
 
-		// Validate monitoring timeout is reasonable (between 30 seconds and 8 hours)
+		// Validate monitoring timeout is reasonable (between 30 seconds and 14 days).
+		// Optimistic-rollup broadcaster routes (e.g. Arbitrum L2→L1) require the
+		// solver to monitor for claim readiness across the full challenge period
+		// (~7 days), so the upper bound must accommodate week-scale timeouts.
 		if self.solver.monitoring_timeout_seconds < 30
-			|| self.solver.monitoring_timeout_seconds > 28800
+			|| self.solver.monitoring_timeout_seconds > 1_209_600
 		{
 			return Err(ConfigError::Validation(
-				"monitoring_timeout_seconds must be between 30 and 28800 seconds".into(),
+				"monitoring_timeout_seconds must be between 30 and 1209600 seconds (14 days)"
+					.into(),
 			));
 		}
 
@@ -1059,5 +1063,73 @@ mod tests {
 		assert!(err
 			.to_string()
 			.contains("Order standard 'eip9999' has no settlement implementations"));
+	}
+
+	#[test]
+	fn test_monitoring_timeout_accepts_lower_and_upper_bounds() {
+		let networks = json!({
+			"1": test_network(1, "http://localhost:8545"),
+			"2": test_network(2, "http://localhost:8546")
+		});
+		let order_implementations = json!({
+			"test": {}
+		});
+		let settlement_implementations = json!({
+			"test": {
+				"order": "test",
+				"network_ids": [1, 2]
+			}
+		});
+
+		let mut lower_bound = base_config_json(
+			networks.clone(),
+			order_implementations.clone(),
+			settlement_implementations.clone(),
+		);
+		lower_bound["solver"]["monitoring_timeout_seconds"] = json!(30);
+		assert!(parse_json_fixture(lower_bound).is_ok());
+
+		let mut upper_bound =
+			base_config_json(networks, order_implementations, settlement_implementations);
+		upper_bound["solver"]["monitoring_timeout_seconds"] = json!(1_209_600);
+		assert!(parse_json_fixture(upper_bound).is_ok());
+	}
+
+	#[test]
+	fn test_monitoring_timeout_rejects_values_outside_extended_range() {
+		let networks = json!({
+			"1": test_network(1, "http://localhost:8545"),
+			"2": test_network(2, "http://localhost:8546")
+		});
+		let order_implementations = json!({
+			"test": {}
+		});
+		let settlement_implementations = json!({
+			"test": {
+				"order": "test",
+				"network_ids": [1, 2]
+			}
+		});
+
+		let mut too_small = base_config_json(
+			networks.clone(),
+			order_implementations.clone(),
+			settlement_implementations.clone(),
+		);
+		too_small["solver"]["monitoring_timeout_seconds"] = json!(29);
+		assert!(matches!(
+			parse_json_fixture(too_small),
+			Err(ConfigError::Validation(message))
+				if message.contains("monitoring_timeout_seconds")
+		));
+
+		let mut too_large =
+			base_config_json(networks, order_implementations, settlement_implementations);
+		too_large["solver"]["monitoring_timeout_seconds"] = json!(1_209_601);
+		assert!(matches!(
+			parse_json_fixture(too_large),
+			Err(ConfigError::Validation(message))
+				if message.contains("monitoring_timeout_seconds")
+		));
 	}
 }

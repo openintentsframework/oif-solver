@@ -1069,7 +1069,7 @@ mod tests {
 		assert!(result.is_err());
 		match result.unwrap_err() {
 			TokenManagerError::DeliveryError(_) => {}, // Expected
-			other => panic!("Expected DeliveryError, got {:?}", other),
+			other => panic!("Expected DeliveryError, got {other:?}"),
 		}
 	}
 
