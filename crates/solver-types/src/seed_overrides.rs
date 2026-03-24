@@ -109,6 +109,11 @@ pub struct SeedOverrides {
 	/// Optimistic-rollup routes may need much larger values (e.g., 864000 = 10 days).
 	#[serde(default)]
 	pub monitoring_timeout_seconds: Option<u64>,
+	/// Path to a JSON file containing a list of denied Ethereum addresses.
+	/// Loaded once at startup — not hot-reloaded.
+	/// If not set, deny list enforcement is disabled.
+	#[serde(default)]
+	pub deny_list: Option<String>,
 }
 
 /// Supported settlement type overrides.
@@ -630,6 +635,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			deny_list: None,
 		};
 
 		let chain_ids = config.chain_ids();
@@ -663,6 +669,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			deny_list: None,
 		};
 
 		assert!(config.has_chain(10));
@@ -701,6 +708,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			deny_list: None,
 		};
 
 		let network = config.get_network(10);
@@ -779,6 +787,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			deny_list: None,
 		};
 
 		let json = serde_json::to_string(&config).unwrap();

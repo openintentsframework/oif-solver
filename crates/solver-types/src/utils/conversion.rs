@@ -140,7 +140,15 @@ pub fn parse_bytes32_from_hex(hex_str: &str) -> Result<[u8; 32], Box<dyn std::er
 /// * `Ok(Address)` if the string is a valid address
 /// * `Err(String)` with error description if parsing fails
 pub fn parse_address(hex_str: &str) -> Result<Address, String> {
+	if hex_str.is_empty() {
+		return Err("Address cannot be empty".to_string());
+	}
+
 	let hex_clean = without_0x_prefix(hex_str);
+
+	if hex_clean.is_empty() {
+		return Err("Address cannot be empty".to_string());
+	}
 
 	// Handle U256 hex that's missing leading zeros (common with EIP-7683 inputs)
 	// U256 serialization drops leading zeros, so "0x8ad..." (31 bytes) should be "0x08ad..." (32 bytes)
@@ -152,7 +160,7 @@ pub fn parse_address(hex_str: &str) -> Result<Address, String> {
 			// Other missing zeros cases - pad to 64 chars (32 bytes)
 			format!("{hex_clean:0>64}")
 		},
-		_ => hex_clean.to_string(),
+		_ => format!("{hex_clean:0>40}"), // pad short/odd-length to 20-byte address
 	};
 
 	hex::decode(&padded_hex)
@@ -704,6 +712,73 @@ mod tests {
 		// Test with 3 decimal places
 		let value = Decimal::from_str("1.23456").unwrap();
 		assert_eq!(ceil_dp(value, 3).to_string(), "1.235");
+	}
+
+	#[test]
+	fn test_parse_address_empty_input() {
+		assert_eq!(parse_address("").unwrap_err(), "Address cannot be empty");
+		// "0x" with nothing after is also empty after stripping prefix
+		assert_eq!(parse_address("0x").unwrap_err(), "Address cannot be empty");
+	}
+
+	#[test]
+	fn test_parse_address_standard_20_byte() {
+		// Standard 40-char hex address with 0x prefix
+		let result = parse_address("0x5fbdb2315678afecb367f032d93f642f64180aa3").unwrap();
+		assert_eq!(
+			hex::encode(&result.0),
+			"5fbdb2315678afecb367f032d93f642f64180aa3"
+		);
+	}
+
+	#[test]
+	fn test_parse_address_32_byte_left_padded() {
+		// 64-char hex (bytes32, address in last 20 bytes)
+		let result =
+			parse_address("0x0000000000000000000000005fbdb2315678afecb367f032d93f642f64180aa3")
+				.unwrap();
+		assert_eq!(
+			hex::encode(&result.0),
+			"5fbdb2315678afecb367f032d93f642f64180aa3"
+		);
+	}
+
+	#[test]
+	fn test_parse_address_31_byte_missing_leading_zero() {
+		// 62-char hex (U256 dropped a leading zero byte) — padded to 32 bytes
+		let result =
+			parse_address("0x000000000000000000000005fbdb2315678afecb367f032d93f642f64180aa3")
+				.unwrap();
+		assert_eq!(
+			hex::encode(&result.0),
+			"5fbdb2315678afecb367f032d93f642f64180aa3"
+		);
+	}
+
+	#[test]
+	fn test_parse_address_short_odd_length_padded_to_address() {
+		// Fewer than 40 chars, odd-length — padded left to 40 chars (20 bytes)
+		let result = parse_address("0x1").unwrap();
+		assert_eq!(
+			hex::encode(&result.0),
+			"0000000000000000000000000000000000000001"
+		);
+	}
+
+	#[test]
+	fn test_parse_address_without_0x_prefix() {
+		let result = parse_address("5fbdb2315678afecb367f032d93f642f64180aa3").unwrap();
+		assert_eq!(
+			hex::encode(&result.0),
+			"5fbdb2315678afecb367f032d93f642f64180aa3"
+		);
+	}
+
+	#[test]
+	fn test_parse_address_invalid_hex_characters() {
+		let result = parse_address("0xGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG");
+		assert!(result.is_err());
+		assert!(result.unwrap_err().contains("Invalid hex"));
 	}
 
 	#[test]

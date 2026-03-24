@@ -68,8 +68,9 @@ pub mod registry;
 pub mod signing;
 pub mod validation;
 
-// Re-export main functionality
-pub use generation::QuoteGenerator;
+use self::generation::QuoteGenerator;
+
+// Re-export quote helpers
 pub use signing::payloads::permit2;
 pub use validation::QuoteValidator;
 
@@ -103,6 +104,15 @@ pub async fn process_quote_request(
 	// This prevents users from getting quotes they can't execute due to callback restrictions
 	QuoteValidator::validate_callback_whitelist(&request, config)?;
 
+	// Check solver capabilities: networks only (token support is enforced during collection below)
+	QuoteValidator::validate_supported_networks(&request, &config.networks)?;
+
+	let settlement_service = solver.settlement();
+	let delivery_service = solver.delivery();
+	let quote_generator = QuoteGenerator::new(settlement_service.clone(), delivery_service.clone());
+	let resolved_request = quote_generator.resolve_quote_request(&request).await?;
+	let resolved_flow_keys = vec![resolved_request.flow_key.clone()];
+
 	let cost_profit_service = solver_core::engine::cost_profit::CostProfitService::new(
 		solver.pricing().clone(),
 		solver.delivery().clone(),
@@ -111,12 +121,14 @@ pub async fn process_quote_request(
 	);
 
 	let cost_context = cost_profit_service
-		.calculate_cost_context(&request, &validated_context, config)
+		.calculate_cost_context_for_flow_keys(
+			&request,
+			&validated_context,
+			config,
+			&resolved_flow_keys,
+		)
 		.await
 		.map_err(|e| QuoteError::Internal(format!("Failed to calculate cost context: {e}")))?;
-
-	// Check solver capabilities: networks only (token support is enforced during collection below)
-	QuoteValidator::validate_supported_networks(&request, &config.networks)?;
 
 	// Validate and collect assets with cost-adjusted amounts
 	let _supported_inputs = QuoteValidator::validate_and_collect_inputs_with_costs(
@@ -140,13 +152,14 @@ pub async fn process_quote_request(
 	)
 	.await?;
 
-	// Generate quotes using the business logic layer with embedded costs
-	let settlement_service = solver.settlement();
-	let delivery_service = solver.delivery();
-	let quote_generator = QuoteGenerator::new(settlement_service.clone(), delivery_service.clone());
-
 	let quote_pairs = quote_generator
-		.generate_quotes_with_costs(&request, &validated_context, &cost_context, config)
+		.generate_quotes_with_costs_resolved(
+			&request,
+			&validated_context,
+			&cost_context,
+			config,
+			&resolved_request,
+		)
 		.await?;
 
 	// Persist quotes and cost contexts (including settlement_name internally)
@@ -265,20 +278,22 @@ mod tests {
 	use super::*;
 	use alloy_primitives::Address as AlloyAddress;
 	use solver_account::AccountService;
+	use solver_config::{ApiConfig, ConfigBuilder, QuoteConfig, SettlementConfig};
 	use solver_core::engine::event_bus::EventBus;
 	use solver_core::engine::token_manager::TokenManager;
 	use solver_core::SolverEngine;
-	use solver_delivery::DeliveryService;
+	use solver_delivery::{DeliveryInterface, DeliveryService, MockDeliveryInterface};
 	use solver_discovery::DiscoveryService;
 	use solver_order::OrderService;
 	use solver_pricing::PricingService;
-	use solver_settlement::SettlementService;
+	use solver_settlement::{MockSettlementInterface, SettlementInterface, SettlementService};
 	use solver_storage::{implementations::memory::MemoryStorage, StorageService};
 	use solver_types::{
-		current_timestamp, oif_versions, Address, CostBreakdown, CostContext, FailureHandlingMode,
-		GetQuoteRequest, IntentRequest, IntentType, InteropAddress, OifOrder, OrderPayload, Quote,
-		QuoteError, QuoteInput, QuoteOutput, QuotePreference, QuotePreview, SignatureType,
-		StorageKey, StoredQuote, SwapType,
+		current_timestamp, oif_versions, parse_address, Address, AuthScheme, CostBreakdown,
+		CostContext, FailureHandlingMode, GetQuoteRequest, IntentRequest, IntentType,
+		InteropAddress, OifOrder, OrderPayload, OriginMode, OriginSubmission, Quote, QuoteError,
+		QuoteInput, QuoteOutput, QuotePreference, QuotePreview, SignatureType, StorageKey,
+		StoredQuote, SwapType,
 	};
 	use std::collections::HashMap;
 	use std::sync::Arc;
@@ -434,6 +449,247 @@ mod tests {
 			},
 			supported_types: vec![oif_versions::escrow_order_type("v0")],
 		}
+	}
+
+	fn create_quote_processing_request() -> GetQuoteRequest {
+		let user_addr = AlloyAddress::from([0x11; 20]);
+		let receiver_addr = AlloyAddress::from([0x22; 20]);
+
+		GetQuoteRequest {
+			user: InteropAddress::new_ethereum(1, user_addr),
+			intent: IntentRequest {
+				intent_type: IntentType::OifSwap,
+				inputs: vec![QuoteInput {
+					user: InteropAddress::new_ethereum(1, user_addr),
+					asset: InteropAddress::new_ethereum(
+						1,
+						AlloyAddress::from_slice(
+							&parse_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+								.unwrap()
+								.0,
+						),
+					),
+					amount: Some("1000000000".to_string()), // 1,000 USDC
+					lock: None,
+				}],
+				outputs: vec![QuoteOutput {
+					receiver: InteropAddress::new_ethereum(137, receiver_addr),
+					asset: InteropAddress::new_ethereum(
+						137,
+						AlloyAddress::from_slice(
+							&parse_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+								.unwrap()
+								.0,
+						),
+					),
+					amount: None,
+					calldata: None,
+				}],
+				swap_type: Some(SwapType::ExactInput),
+				min_valid_until: None,
+				preference: Some(QuotePreference::Speed),
+				origin_submission: Some(OriginSubmission {
+					mode: OriginMode::User,
+					schemes: Some(vec![AuthScheme::Permit2]),
+				}),
+				failure_handling: None,
+				partial_fill: Some(false),
+				metadata: None,
+			},
+			supported_types: vec![oif_versions::escrow_order_type("v0")],
+		}
+	}
+
+	fn create_quote_processing_config() -> solver_config::Config {
+		let api_config = ApiConfig {
+			enabled: true,
+			host: "127.0.0.1".to_string(),
+			port: 8080,
+			timeout_seconds: 30,
+			max_request_size: 1_048_576,
+			implementations: Default::default(),
+			rate_limiting: None,
+			cors: None,
+			auth: None,
+			quote: Some(QuoteConfig {
+				validity_seconds: 60,
+				fill_deadline_seconds: 300,
+				expires_seconds: 600,
+			}),
+		};
+
+		let settlement_config = SettlementConfig {
+			implementations: HashMap::new(),
+			primary: "test".to_string(),
+			settlement_poll_interval_seconds: 3,
+		};
+
+		let mut networks = solver_types::NetworksConfig::new();
+		networks.insert(
+			1,
+			solver_types::NetworkConfig {
+				name: Some("ethereum".to_string()),
+				network_type: solver_types::networks::NetworkType::Parent,
+				rpc_urls: vec![],
+				input_settler_address: parse_address("0x1111111111111111111111111111111111111111")
+					.unwrap(),
+				output_settler_address: parse_address("0x2222222222222222222222222222222222222222")
+					.unwrap(),
+				tokens: vec![solver_types::TokenConfig {
+					address: parse_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48").unwrap(),
+					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
+					decimals: 6,
+				}],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		networks.insert(
+			137,
+			solver_types::NetworkConfig {
+				name: Some("polygon".to_string()),
+				network_type: solver_types::networks::NetworkType::Hub,
+				rpc_urls: vec![],
+				input_settler_address: parse_address("0x3333333333333333333333333333333333333333")
+					.unwrap(),
+				output_settler_address: parse_address("0x4444444444444444444444444444444444444444")
+					.unwrap(),
+				tokens: vec![solver_types::TokenConfig {
+					address: parse_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174").unwrap(),
+					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
+					decimals: 6,
+				}],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+
+		ConfigBuilder::new()
+			.api(Some(api_config))
+			.settlement(settlement_config)
+			.networks(networks)
+			.build()
+	}
+
+	fn create_quote_processing_settlement_service() -> Arc<SettlementService> {
+		let mut input_oracles = HashMap::new();
+		let mut output_oracles = HashMap::new();
+		let mut routes = HashMap::new();
+
+		input_oracles.insert(1, vec![Address(vec![0xaa; 20])]);
+		input_oracles.insert(137, vec![Address(vec![0xcc; 20])]);
+		output_oracles.insert(1, vec![Address(vec![0xbb; 20])]);
+		output_oracles.insert(137, vec![Address(vec![0xdd; 20])]);
+		routes.insert(1, vec![137]);
+		routes.insert(137, vec![1]);
+
+		let mut mock_settlement = MockSettlementInterface::new();
+		let route_support = routes.clone();
+		mock_settlement
+			.expect_oracle_config()
+			.return_const(solver_settlement::OracleConfig {
+				input_oracles,
+				output_oracles,
+				routes,
+				selection_strategy: solver_settlement::OracleSelectionStrategy::First,
+			});
+		mock_settlement
+			.expect_is_route_supported()
+			.returning(move |input_chain, output_chain| {
+				route_support
+					.get(&input_chain)
+					.is_some_and(|outputs| outputs.contains(&output_chain))
+			});
+		mock_settlement
+			.expect_select_oracle()
+			.returning(|oracles, _context| oracles.first().cloned());
+
+		let mut implementations: HashMap<String, Box<dyn SettlementInterface>> = HashMap::new();
+		implementations.insert("test".to_string(), Box::new(mock_settlement));
+
+		Arc::new(SettlementService::new(
+			implementations,
+			"test".to_string(),
+			3,
+		))
+	}
+
+	fn create_quote_processing_solver_engine() -> SolverEngine {
+		let config = create_quote_processing_config();
+
+		let mut delivery_implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+
+		let mut mock_delivery_1 = MockDeliveryInterface::new();
+		mock_delivery_1
+			.expect_get_gas_price()
+			.returning(|_| Box::pin(async move { Ok("1000000000".to_string()) }));
+		mock_delivery_1
+			.expect_get_balance()
+			.returning(|_, _, _| Box::pin(async move { Ok("5000000000".to_string()) }));
+		delivery_implementations.insert(1, Arc::new(mock_delivery_1) as Arc<dyn DeliveryInterface>);
+
+		let mut mock_delivery_137 = MockDeliveryInterface::new();
+		mock_delivery_137
+			.expect_get_gas_price()
+			.returning(|_| Box::pin(async move { Ok("1000000000".to_string()) }));
+		mock_delivery_137
+			.expect_get_balance()
+			.returning(|_, _, _| Box::pin(async move { Ok("5000000000".to_string()) }));
+		delivery_implementations.insert(
+			137,
+			Arc::new(mock_delivery_137) as Arc<dyn DeliveryInterface>,
+		);
+
+		let storage = create_test_storage();
+		let account = Arc::new(AccountService::new(Box::new(
+			solver_account::implementations::local::LocalWallet::new(
+				"0x1234567890123456789012345678901234567890123456789012345678901234",
+			)
+			.unwrap(),
+		)));
+		let solver_address = Address([0xAB; 20].to_vec());
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 1, 20));
+		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
+		let strategy = solver_order::implementations::strategies::simple::create_strategy(
+			&serde_json::Value::Object(serde_json::Map::new()),
+		)
+		.unwrap();
+		let order = Arc::new(OrderService::new(HashMap::new(), strategy));
+		let settlement = create_quote_processing_settlement_service();
+		let pricing_impl =
+			solver_pricing::implementations::mock::create_mock_pricing(&serde_json::json!({
+				"pair_prices": {
+					"USDC/USD": "1.0"
+				}
+			}))
+			.unwrap();
+		let pricing = Arc::new(PricingService::new(pricing_impl, Vec::new()));
+		let event_bus = EventBus::new(64);
+		let token_manager = Arc::new(TokenManager::new(
+			config.networks.clone(),
+			delivery.clone(),
+			account.clone(),
+		));
+
+		let dynamic_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
+		SolverEngine::new(
+			dynamic_config,
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+		)
 	}
 
 	/// Creates a test quote
@@ -650,5 +906,56 @@ mod tests {
 		assert_eq!(request.intent.swap_type, Some(SwapType::ExactInput));
 		assert_eq!(request.intent.preference, Some(QuotePreference::Speed));
 		assert_eq!(request.supported_types.len(), 1);
+	}
+
+	#[tokio::test]
+	async fn test_process_quote_request_rejects_multi_input_shape() {
+		let solver = create_test_solver_engine();
+		let mut request = create_test_quote_request();
+		let user_addr = AlloyAddress::from([0x11; 20]);
+		let second_input_token_addr = AlloyAddress::from([0xC0; 20]);
+		let output_token_addr = AlloyAddress::from([0xB0; 20]);
+
+		request.intent.inputs.push(QuoteInput {
+			user: InteropAddress::new_ethereum(1, user_addr),
+			asset: InteropAddress::new_ethereum(1, second_input_token_addr),
+			amount: Some("500000000000000000".to_string()),
+			lock: None,
+		});
+		request.intent.outputs[0] = QuoteOutput {
+			receiver: InteropAddress::new_ethereum(1, AlloyAddress::from([0x22; 20])),
+			asset: InteropAddress::new_ethereum(1, output_token_addr),
+			amount: Some("950000000000000000".to_string()),
+			calldata: None,
+		};
+
+		let config_guard = solver.dynamic_config().read().await;
+		let result = process_quote_request(request, &solver, &config_guard).await;
+		drop(config_guard);
+
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedQuoteShape(msg)) if msg.contains("multi-input"))
+		);
+	}
+
+	#[tokio::test]
+	async fn test_process_quote_request_single_input_success() {
+		let solver = create_quote_processing_solver_engine();
+		let request = create_quote_processing_request();
+
+		let config_guard = solver.dynamic_config().read().await;
+		let result = process_quote_request(request, &solver, &config_guard).await;
+		drop(config_guard);
+
+		assert!(
+			result.is_ok(),
+			"expected quote generation to succeed: {result:?}"
+		);
+
+		let response = result.unwrap();
+		assert_eq!(response.quotes.len(), 1);
+		assert_eq!(response.quotes[0].provider.as_deref(), Some("oif-solver"));
+		assert_eq!(response.quotes[0].eta, Some(96));
+		assert!(!response.quotes[0].quote_id.is_empty());
 	}
 }

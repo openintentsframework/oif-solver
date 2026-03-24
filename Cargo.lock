@@ -5015,6 +5015,7 @@ dependencies = [
  "alloy-sol-types",
  "async-trait",
  "chrono",
+ "hex",
  "lru 0.16.1",
  "mockall",
  "once_cell",
@@ -5030,6 +5031,7 @@ dependencies = [
  "solver-settlement",
  "solver-storage",
  "solver-types",
+ "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -5176,6 +5178,7 @@ dependencies = [
  "thiserror 2.0.17",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
