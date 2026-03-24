@@ -1059,4 +1059,72 @@ mod tests {
 			.to_string()
 			.contains("Order standard 'eip9999' has no settlement implementations"));
 	}
+
+	#[test]
+	fn test_monitoring_timeout_accepts_lower_and_upper_bounds() {
+		let networks = json!({
+			"1": test_network(1, "http://localhost:8545"),
+			"2": test_network(2, "http://localhost:8546")
+		});
+		let order_implementations = json!({
+			"test": {}
+		});
+		let settlement_implementations = json!({
+			"test": {
+				"order": "test",
+				"network_ids": [1, 2]
+			}
+		});
+
+		let mut lower_bound = base_config_json(
+			networks.clone(),
+			order_implementations.clone(),
+			settlement_implementations.clone(),
+		);
+		lower_bound["solver"]["monitoring_timeout_seconds"] = json!(30);
+		assert!(parse_json_fixture(lower_bound).is_ok());
+
+		let mut upper_bound =
+			base_config_json(networks, order_implementations, settlement_implementations);
+		upper_bound["solver"]["monitoring_timeout_seconds"] = json!(1_209_600);
+		assert!(parse_json_fixture(upper_bound).is_ok());
+	}
+
+	#[test]
+	fn test_monitoring_timeout_rejects_values_outside_extended_range() {
+		let networks = json!({
+			"1": test_network(1, "http://localhost:8545"),
+			"2": test_network(2, "http://localhost:8546")
+		});
+		let order_implementations = json!({
+			"test": {}
+		});
+		let settlement_implementations = json!({
+			"test": {
+				"order": "test",
+				"network_ids": [1, 2]
+			}
+		});
+
+		let mut too_small = base_config_json(
+			networks.clone(),
+			order_implementations.clone(),
+			settlement_implementations.clone(),
+		);
+		too_small["solver"]["monitoring_timeout_seconds"] = json!(29);
+		assert!(matches!(
+			parse_json_fixture(too_small),
+			Err(ConfigError::Validation(message))
+				if message.contains("monitoring_timeout_seconds")
+		));
+
+		let mut too_large =
+			base_config_json(networks, order_implementations, settlement_implementations);
+		too_large["solver"]["monitoring_timeout_seconds"] = json!(1_209_601);
+		assert!(matches!(
+			parse_json_fixture(too_large),
+			Err(ConfigError::Validation(message))
+				if message.contains("monitoring_timeout_seconds")
+		));
+	}
 }

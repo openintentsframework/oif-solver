@@ -3293,6 +3293,18 @@ mod tests {
 	}
 
 	#[test]
+	fn test_merge_config_uses_seed_default_monitoring_timeout() {
+		let overrides = test_seed_overrides();
+
+		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
+
+		assert_eq!(
+			config.solver.monitoring_timeout_seconds,
+			TESTNET_SEED.defaults.monitoring_timeout_seconds
+		);
+	}
+
+	#[test]
 	fn test_merge_config_uses_defaults_when_no_fee_overrides() {
 		// Test seed overrides without fee configuration uses seed defaults
 		let overrides = test_seed_overrides();
