@@ -1170,6 +1170,7 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			deny_list: None,
+			rebalance: None,
 		}
 	}
 

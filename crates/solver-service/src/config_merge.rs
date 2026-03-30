@@ -26,8 +26,8 @@
 use crate::seeds::types::{NetworkSeed, SeedConfig, COMMON_DEFAULTS};
 use solver_config::{
 	AccountConfig, ApiConfig, ApiImplementations, Config, DeliveryConfig, DiscoveryConfig,
-	GasConfig, GasFlowUnits, OrderConfig, PricingConfig, SettlementConfig, SolverConfig,
-	StorageConfig, StrategyConfig,
+	GasConfig, GasFlowUnits, OrderConfig, PricingConfig, RebalanceConfig, RebalancePairConfig,
+	RebalancePairSideConfig, SettlementConfig, SolverConfig, StorageConfig, StrategyConfig,
 };
 use solver_types::seed_overrides::OracleSelectionStrategyOverride;
 use solver_types::{
@@ -38,7 +38,8 @@ use solver_types::{
 	OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig,
 	OperatorOracleSelectionStrategy, OperatorPricingConfig, OperatorPusherDirectionConfig,
 	OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSettlementType, OperatorSolverConfig,
-	OperatorToken, OperatorWithdrawalsConfig, PusherL2Params, SeedOverrides,
+	OperatorRebalanceConfig, OperatorRebalancePairConfig, OperatorToken,
+	OperatorWithdrawalsConfig, PusherL2Params, RebalancePairSide, SeedOverrides,
 	SettlementTypeOverride, TokenConfig,
 };
 use std::collections::{HashMap, HashSet};
@@ -477,6 +478,7 @@ pub fn merge_to_operator_config(
 			primary: a.primary.clone(),
 			implementations: a.implementations.clone(),
 		}),
+		rebalance: initializer.rebalance.clone(),
 	})
 }
 
@@ -1115,6 +1117,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 			operator_config.auth_enabled,
 		)?),
 		gas: Some(build_gas_config_from_operator(&operator_config.gas)),
+		rebalance: build_rebalance_config_from_operator(operator_config.rebalance.as_ref()),
 	};
 
 	Ok(config)
@@ -2232,6 +2235,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		admin,
 		auth_enabled,
 		account,
+		rebalance: extract_rebalance_config(config.rebalance.as_ref()),
 	})
 }
 
@@ -2256,6 +2260,101 @@ fn extract_account_config(account: &AccountConfig) -> Option<OperatorAccountConf
 	Some(OperatorAccountConfig {
 		primary: account.primary.clone(),
 		implementations,
+	})
+}
+
+/// Builds runtime RebalanceConfig from OperatorRebalanceConfig.
+fn build_rebalance_config_from_operator(
+	rebalance: Option<&OperatorRebalanceConfig>,
+) -> Option<RebalanceConfig> {
+	let rebalance = rebalance?;
+
+	let pairs = rebalance
+		.pairs
+		.iter()
+		.map(|p| RebalancePairConfig {
+			symbol: p.symbol.clone(),
+			chain_a: RebalancePairSideConfig {
+				chain_id: p.chain_a.chain_id,
+				token_address: format!("0x{}", hex::encode(p.chain_a.token_address.as_slice())),
+				oft_address: format!("0x{}", hex::encode(p.chain_a.oft_address.as_slice())),
+			},
+			chain_b: RebalancePairSideConfig {
+				chain_id: p.chain_b.chain_id,
+				token_address: format!("0x{}", hex::encode(p.chain_b.token_address.as_slice())),
+				oft_address: format!("0x{}", hex::encode(p.chain_b.oft_address.as_slice())),
+			},
+			target_balance_a: p.target_balance_a.clone(),
+			target_balance_b: p.target_balance_b.clone(),
+			deviation_band_bps: p.deviation_band_bps,
+			max_bridge_amount: p.max_bridge_amount.clone(),
+		})
+		.collect();
+
+	Some(RebalanceConfig {
+		enabled: rebalance.enabled,
+		implementation: rebalance.implementation.clone(),
+		monitor_interval_seconds: rebalance.monitor_interval_seconds,
+		cooldown_seconds: rebalance.cooldown_seconds,
+		max_pending_transfers: rebalance.max_pending_transfers,
+		min_native_gas_reserve: rebalance.min_native_gas_reserve.clone(),
+		max_fee_bps: rebalance.max_fee_bps,
+		pairs,
+		bridge_config: rebalance.bridge_config.clone(),
+	})
+}
+
+/// Extracts OperatorRebalanceConfig from runtime RebalanceConfig.
+fn extract_rebalance_config(
+	rebalance: Option<&RebalanceConfig>,
+) -> Option<OperatorRebalanceConfig> {
+	use alloy_primitives::Address;
+
+	let rebalance = rebalance?;
+
+	let parse_addr = |s: &str| -> Address {
+		let s = s.strip_prefix("0x").unwrap_or(s);
+		hex::decode(s)
+			.ok()
+			.and_then(|bytes| {
+				let arr: [u8; 20] = bytes.try_into().ok()?;
+				Some(Address::from(arr))
+			})
+			.unwrap_or_default()
+	};
+
+	let pairs = rebalance
+		.pairs
+		.iter()
+		.map(|p| OperatorRebalancePairConfig {
+			symbol: p.symbol.clone(),
+			chain_a: RebalancePairSide {
+				chain_id: p.chain_a.chain_id,
+				token_address: parse_addr(&p.chain_a.token_address),
+				oft_address: parse_addr(&p.chain_a.oft_address),
+			},
+			chain_b: RebalancePairSide {
+				chain_id: p.chain_b.chain_id,
+				token_address: parse_addr(&p.chain_b.token_address),
+				oft_address: parse_addr(&p.chain_b.oft_address),
+			},
+			target_balance_a: p.target_balance_a.clone(),
+			target_balance_b: p.target_balance_b.clone(),
+			deviation_band_bps: p.deviation_band_bps,
+			max_bridge_amount: p.max_bridge_amount.clone(),
+		})
+		.collect();
+
+	Some(OperatorRebalanceConfig {
+		enabled: rebalance.enabled,
+		implementation: rebalance.implementation.clone(),
+		monitor_interval_seconds: rebalance.monitor_interval_seconds,
+		cooldown_seconds: rebalance.cooldown_seconds,
+		max_pending_transfers: rebalance.max_pending_transfers,
+		min_native_gas_reserve: rebalance.min_native_gas_reserve.clone(),
+		max_fee_bps: rebalance.max_fee_bps,
+		pairs,
+		bridge_config: rebalance.bridge_config.clone(),
 	})
 }
 
@@ -2983,6 +3082,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		}
 	}
 
@@ -3055,6 +3155,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -3111,6 +3212,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -3161,6 +3263,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -3202,6 +3305,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -3289,6 +3393,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -3507,6 +3612,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -3569,6 +3675,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -3656,6 +3763,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -3718,6 +3826,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -3786,6 +3895,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -3904,6 +4014,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -4032,6 +4143,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4098,6 +4210,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4158,6 +4271,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4253,6 +4367,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4357,6 +4472,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4520,6 +4636,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4655,6 +4772,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4754,6 +4872,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4875,6 +4994,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5027,6 +5147,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -5070,6 +5191,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -5127,6 +5249,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -5177,6 +5300,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -5244,6 +5368,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -5367,6 +5492,7 @@ mod tests {
 			admin: OperatorAdminConfig::default(),
 			auth_enabled: false,
 			account: None,
+			rebalance: None,
 		};
 
 		// Add only one network
@@ -6061,6 +6187,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		// Step 1: merge_config should create Config with KMS account
