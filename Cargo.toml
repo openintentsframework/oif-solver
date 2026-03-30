@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/solver-account",
+    "crates/solver-bridge",
     "crates/solver-config",
     "crates/solver-core",
     "crates/solver-delivery",

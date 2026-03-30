@@ -24,9 +24,9 @@ Automated cross-chain rebalancing. The admin configures a target balance and tol
 | Bridge Protocol | LayerZero V2 OFT | Vaultbridge tokens (vbUSDC) are native OFTs on Katana; official Katana recommendation |
 | Crate Pattern | New `solver-bridge` crate | Mirrors `solver-settlement` pattern; clean separation of concerns |
 | Trait Design | `BridgeInterface` for N chains | Pluggable backends; MVP implements LayerZero only |
-| Threshold Model | Target + deviation band (bps) | Single config per token; flexible balancing |
-| Balance Calculation | On-chain balance - pending fills + pending claims | Ignores speculative quotes; accounts for confirmed obligations |
-| Transfer FSM | 3-state: Submitted -> Relaying -> Completed/Failed | Simple, sufficient for fire-and-forget OFT sends |
+| Threshold Model | Target + deviation band (bps) per pair | Pair-based config; canonical unit normalization for vault shares |
+| Balance Calculation | Conservative: on-chain balance minus outbound bridge transfers | Deviation band absorbs normal order activity; no reservation ledger needed for MVP |
+| Transfer FSM | 4-state + redemption: Submitted -> Relaying -> [PendingRedemption] -> Completed/Failed | Handles vault share redemption leg for Katana->Ethereum direction |
 | Persistence | Redis via StorageService | Transfers survive solver restarts; consistent with existing patterns |
 | Direction (MVP) | Bilateral (2 chains) | Interface supports N chains; algorithm handles only the 2-chain case |
 
@@ -102,7 +102,8 @@ Vaultbridge combines ERC-4626 yield vaults with LayerZero OFT:
 | USDC Vault Bridge | Ethereum | `0x53E82ABbb12638F09d9e624578ccB666217a765e` |
 | Share OFT Adapter | Ethereum | `0xb5bADA33542a05395d504a25885e02503A957Bb3` |
 | OVault Composer | Ethereum | `0x8A35897fda9E024d2aC20a937193e099679eC477` |
-| Share OFT (vbUSDC) | Katana | `0x807275727Dd3E640c5F2b5DE7d1eC72B4Dd293C0` |
+| vbUSDC (token) | Katana | `0x203A662b0BD271A6ed5a60EdFbd04bFce608FD36` |
+| Share OFT (LZ transport) | Katana | `0x807275727Dd3E640c5F2b5DE7d1eC72B4Dd293C0` |
 
 ### LayerZero Endpoint IDs
 
@@ -119,8 +120,11 @@ Vaultbridge combines ERC-4626 yield vaults with LayerZero OFT:
    msg.value = fee.nativeFee
 3. Track via MessagingReceipt.guid
 4. ~4-5 min: vault shares auto-unlock at OFT Adapter on Ethereum
-5. approve(VaultBridge, shares)  on vault share token (Ethereum)
-6. vault.redeem(shares, solver, solver)  on ERC-4626 vault -> returns USDC
+5. vault.redeem(shares, solver, solver)  on ERC-4626 vault -> returns USDC
+   NOTE: Standard ERC-4626 redeem() where owner == msg.sender does not
+   require a separate approve(). Verify against the actual VaultBridge ABI
+   before implementation — if the vault is behind a wrapper, approval may
+   be needed.
 ```
 
 **Important:** Step 4 only unlocks vault shares, NOT USDC. Steps 5-6 are required to convert shares back to spendable USDC. The `LayerZeroBridge` implementation must handle the full sequence: after detecting that shares arrived on Ethereum (transfer enters `Relaying` -> shares confirmed on-chain), it must submit a second transaction to redeem the vault shares. This means the Katana->Ethereum direction involves **two on-chain transactions on Ethereum** (one automatic unlock by LZ, one explicit redeem by the solver), and the transfer is only `Completed` after the redeem tx confirms.
@@ -328,16 +332,22 @@ pub enum RebalanceTrigger {
 pub struct PendingBridgeTransfer {
     pub id: String,                       // UUID
     pub transfer_id: BridgeTransferId,
-    pub token_symbol: String,
-    pub token_address: Address,
-    pub amount: String,                   // decimal string
+    pub pair_symbol: String,              // e.g., "USDC" — identifies the rebalance pair
     pub source_chain: u64,
     pub dest_chain: u64,
+    pub amount: String,                   // decimal string in source token units
+    pub amount_normalized: String,        // decimal string in canonical units (see unit normalization)
     pub status: BridgeTransferStatus,
     pub created_at: u64,                  // unix timestamp
     pub updated_at: u64,
     pub trigger: RebalanceTrigger,
     pub fee_paid: Option<String>,         // native gas paid for LZ fee
+    /// For Katana->Ethereum: tx hash of the vault redeem() call on Ethereum.
+    /// Set when transitioning to PendingRedemption. On restart, if status is
+    /// PendingRedemption and this is Some, the monitor polls this receipt
+    /// instead of re-submitting (prevents double-redeem).
+    /// If PendingRedemption and this is None, shares arrived but redeem not yet submitted.
+    pub redeem_tx_hash: Option<String>,
 }
 ```
 
@@ -462,9 +472,11 @@ pub struct RebalanceMonitor {
 }
 
 // Cooldown is persisted in Redis, NOT in-memory, so it survives restarts.
-// Key: "{solver_id}-bridge:cooldown:{chain_id}:{token_address}"
+// Key: "{solver_id}-bridge:cooldown:{pair_symbol}"
 // Value: unix timestamp of last rebalance trigger
 // TTL: cooldown_seconds (auto-expires when cooldown elapses)
+// Scoped per PAIR (not per chain/token), since only one direction
+// can be active per pair at a time.
 
 impl RebalanceMonitor {
     /// Main polling loop. Runs until shutdown signal.
@@ -489,23 +501,35 @@ impl RebalanceMonitor {
 }
 ```
 
-**Threshold logic (per pair):**
+**Unit normalization:**
 
-For each pair (e.g., USDC: chain_a=Ethereum, chain_b=Katana):
+USDC (6 decimals) and vbUSDC (vault shares) are different units. The vault exchange rate drifts as yield accrues, so `1 vbUSDC != 1 USDC`. All threshold comparisons and bridge amounts must use a **canonical unit** (USDC) to be meaningful.
+
+Before each threshold check, the monitor normalizes balances:
+```
+balance_a_canonical = balance_a                                    // already USDC
+balance_b_canonical = vault.previewRedeem(balance_b)               // vbUSDC -> USDC equivalent
+```
+
+`target_balance_a` and `target_balance_b` are both expressed in **canonical units** (USDC) in the config. `max_bridge_amount` is also in canonical units.
+
+When computing the actual bridge amount for Ethereum->Katana, use `vault.previewDeposit(usdc_amount)` to determine how many vbUSDC shares will result. For Katana->Ethereum, use `vault.previewRedeem(shares)` to determine USDC output.
+
+**Threshold logic (per pair, all in canonical units):**
 
 ```
 For each side (A and B):
   lower_bound = target_balance_{side} * (10000 - deviation_band_bps) / 10000
   upper_bound = target_balance_{side} * (10000 + deviation_band_bps) / 10000
 
-  if balance_{side} < lower_bound:
-      deficit = target_balance_{side} - balance_{side}
-      amount = min(deficit, max_bridge_amount)
+  if balance_{side}_canonical < lower_bound:
+      deficit = target_balance_{side} - balance_{side}_canonical
+      amount = min(deficit, max_bridge_amount)    // in canonical units
       bridge from OTHER side -> this side
 
-  if balance_{side} > upper_bound:
-      surplus = balance_{side} - target_balance_{side}
-      amount = min(surplus, max_bridge_amount)
+  if balance_{side}_canonical > upper_bound:
+      surplus = balance_{side}_canonical - target_balance_{side}
+      amount = min(surplus, max_bridge_amount)    // in canonical units
       bridge from this side -> OTHER side
 ```
 
@@ -646,7 +670,7 @@ pub struct BridgeConfig {
         },
         "chain_b": {
           "chain_id": 747474,
-          "token_address": "0x807275727Dd3E640c5F2b5DE7d1eC72B4Dd293C0",
+          "token_address": "0x203A662b0BD271A6ed5a60EdFbd04bFce608FD36",
           "oft_address": "0x807275727Dd3E640c5F2b5DE7d1eC72B4Dd293C0"
         },
         "target_balance_a": "5000000000",
@@ -710,11 +734,11 @@ sol! {
         uint256 deadline;
     }
 
-    /// Manually trigger a single rebalance operation
+    /// Manually trigger a single rebalance operation (identified by pair symbol + direction)
     struct TriggerRebalance {
+        string symbol;
         uint256 sourceChain;
         uint256 destChain;
-        address token;
         uint256 amount;
         uint256 nonce;
         uint256 deadline;
@@ -738,27 +762,51 @@ pub struct RebalanceConfigResponse {
     pub monitor_interval_seconds: u64,
     pub cooldown_seconds: u64,
     pub max_pending_transfers: u32,
-    pub chains: Vec<ChainRebalanceConfigResponse>,
+    pub pairs: Vec<PairConfigResponse>,
+}
+
+pub struct PairConfigResponse {
+    pub symbol: String,
+    pub chain_a: PairSideResponse,
+    pub chain_b: PairSideResponse,
+    pub target_balance_a: String,    // canonical units
+    pub target_balance_b: String,    // canonical units
+    pub deviation_band_bps: u32,
+    pub max_bridge_amount: String,   // canonical units
+}
+
+pub struct PairSideResponse {
+    pub chain_id: u64,
+    pub token_address: String,
+    pub oft_address: String,
 }
 
 /// GET /status response
 pub struct RebalanceStatusResponse {
-    pub tokens: Vec<TokenRebalanceStatus>,
+    pub pairs: Vec<PairRebalanceStatus>,
     pub active_transfers: usize,
     pub last_check: Option<String>,  // ISO 8601
 }
 
-pub struct TokenRebalanceStatus {
-    pub chain_id: u64,
-    pub token_symbol: String,
-    pub token_address: String,
-    pub current_balance: String,
-    pub target_balance: String,
+pub struct PairRebalanceStatus {
+    pub symbol: String,
+    /// Chain A status
+    pub chain_a: PairSideStatus,
+    /// Chain B status
+    pub chain_b: PairSideStatus,
     pub deviation_band_bps: u32,
+    /// Direction needed, if any: "a_to_b" | "b_to_a" | null
+    pub direction_needed: Option<String>,
+}
+
+pub struct PairSideStatus {
+    pub chain_id: u64,
+    pub current_balance: String,         // raw token units
+    pub current_balance_canonical: String, // normalized to canonical units
+    pub target_balance: String,          // canonical units
     pub lower_bound: String,
     pub upper_bound: String,
     pub within_band: bool,
-    pub direction_needed: Option<String>,  // "inbound" | "outbound"
 }
 
 /// GET /transfers response
@@ -963,7 +1011,7 @@ Layout (top to bottom):
 
 | Component | Description |
 |-----------|-------------|
-| `BridgeOperationStatusBadge` | 4-state badge (Submitted/Relaying/Completed/Failed); Relaying pulses amber |
+| `BridgeOperationStatusBadge` | 5-state badge (Submitted/Relaying/PendingRedemption/Completed/Failed); Relaying + PendingRedemption pulse amber |
 | `ActiveOperationsCard` | Table: Token, Amount, Direction, Status, Created, Updated |
 | `AutoRebalanceStatusBar` | Thin card: enabled dot, last check, next check |
 | `ThresholdConfigCard` | Form per token: target, deviation, max amount; EIP-712 save |

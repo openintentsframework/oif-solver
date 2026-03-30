@@ -114,6 +114,11 @@ pub struct SeedOverrides {
 	/// If not set, deny list enforcement is disabled.
 	#[serde(default)]
 	pub deny_list: Option<String>,
+
+	/// Optional cross-chain rebalancing configuration.
+	/// If provided, enables the rebalance monitor and admin endpoints.
+	#[serde(default)]
+	pub rebalance: Option<crate::OperatorRebalanceConfig>,
 }
 
 /// Supported settlement type overrides.

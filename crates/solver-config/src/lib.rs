@@ -69,6 +69,9 @@ pub struct Config {
 	/// Optional gas configuration for precomputed/overridden gas units by flow.
 	#[serde(default)]
 	pub gas: Option<GasConfig>,
+	/// Optional cross-chain rebalancing configuration.
+	#[serde(default)]
+	pub rebalance: Option<RebalanceConfig>,
 }
 
 /// Configuration specific to the solver instance.
@@ -313,6 +316,66 @@ pub struct GasConfig {
 	/// Map of flow key -> GasFlowUnits
 	/// Example keys: "permit2_escrow", "resource_lock"
 	pub flows: HashMap<String, GasFlowUnits>,
+}
+
+/// Runtime rebalancing configuration.
+///
+/// Built from `OperatorRebalanceConfig` during `build_runtime_config()`.
+/// Policy fields are hot-reloadable; transport fields are static at startup.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RebalanceConfig {
+	/// Whether auto-rebalancing is enabled.
+	pub enabled: bool,
+	/// Bridge implementation name (e.g., "layerzero_vaultbridge").
+	pub implementation: String,
+	/// Monitor polling interval in seconds.
+	pub monitor_interval_seconds: u64,
+	/// Cooldown between auto-rebalances for the same pair (seconds).
+	pub cooldown_seconds: u64,
+	/// Maximum concurrent bridge transfers.
+	pub max_pending_transfers: u32,
+	/// Minimum native gas per chain (keyed by chain ID, decimal string in wei).
+	#[serde(default)]
+	pub min_native_gas_reserve: HashMap<u64, String>,
+	/// Maximum bridge fee in bps relative to transfer amount.
+	#[serde(default)]
+	pub max_fee_bps: Option<u32>,
+	/// Rebalance pairs (cross-chain asset pairs).
+	#[serde(default)]
+	pub pairs: Vec<RebalancePairConfig>,
+	/// Implementation-specific transport config (opaque JSON).
+	#[serde(default)]
+	pub bridge_config: Option<serde_json::Value>,
+}
+
+/// Runtime pair configuration (mirror of OperatorRebalancePairConfig).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RebalancePairConfig {
+	/// Pair label (e.g., "USDC").
+	pub symbol: String,
+	/// Chain A side of the pair.
+	pub chain_a: RebalancePairSideConfig,
+	/// Chain B side of the pair.
+	pub chain_b: RebalancePairSideConfig,
+	/// Target balance for chain A (decimal string in base units).
+	pub target_balance_a: String,
+	/// Target balance for chain B (decimal string in base units).
+	pub target_balance_b: String,
+	/// Acceptable deviation in basis points (e.g., 2000 = +/-20%).
+	pub deviation_band_bps: u32,
+	/// Maximum amount per bridge operation (decimal string).
+	pub max_bridge_amount: String,
+}
+
+/// One side of a runtime rebalance pair.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RebalancePairSideConfig {
+	/// Chain ID.
+	pub chain_id: u64,
+	/// Token contract address on this chain (hex string with 0x prefix).
+	pub token_address: String,
+	/// OFT contract address on this chain (hex string with 0x prefix).
+	pub oft_address: String,
 }
 
 /// Configuration for quote generation parameters.

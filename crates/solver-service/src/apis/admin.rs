@@ -1636,6 +1636,7 @@ mod tests {
 			},
 			auth_enabled: false,
 			account: None,
+			rebalance: None,
 		}
 	}
 
