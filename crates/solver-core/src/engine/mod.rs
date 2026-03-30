@@ -332,10 +332,7 @@ impl SolverEngine {
 		// Spawn rebalance monitor if bridge service is configured and enabled
 		let rebalance_handle = if let Some(bridge_service) = &self.bridge_service {
 			let config = self.dynamic_config.read().await;
-			let enabled = config
-				.rebalance
-				.as_ref()
-				.map_or(false, |r| r.enabled);
+			let enabled = config.rebalance.as_ref().map_or(false, |r| r.enabled);
 			drop(config);
 
 			if enabled {
@@ -353,7 +350,9 @@ impl SolverEngine {
 				// Log config guardrail warnings
 				if let Some(rebalance_config) = self.dynamic_config.read().await.rebalance.as_ref()
 				{
-					for warning in solver_bridge::monitor::validate_rebalance_config(rebalance_config) {
+					for warning in
+						solver_bridge::monitor::validate_rebalance_config(rebalance_config)
+					{
 						tracing::warn!("Rebalance config: {}", warning);
 					}
 				}

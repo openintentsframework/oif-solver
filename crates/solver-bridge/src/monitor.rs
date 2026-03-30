@@ -157,7 +157,9 @@ impl RebalanceMonitor {
 						.await?;
 					continue;
 				},
-				BridgeTransferStatus::PendingRedemption if age > PENDING_REDEMPTION_TIMEOUT_SECS => {
+				BridgeTransferStatus::PendingRedemption
+					if age > PENDING_REDEMPTION_TIMEOUT_SECS =>
+				{
 					tracing::warn!(
 						transfer_id = %transfer.id,
 						pair = %transfer.pair_symbol,
@@ -187,9 +189,9 @@ impl RebalanceMonitor {
 					self.bridge_service
 						.update_transfer(
 							&mut transfer,
-							BridgeTransferStatus::NeedsIntervention(
-								format!("Vault redeem failed after {retries} attempts"),
-							),
+							BridgeTransferStatus::NeedsIntervention(format!(
+								"Vault redeem failed after {retries} attempts"
+							)),
 						)
 						.await?;
 					continue;
@@ -255,11 +257,7 @@ impl RebalanceMonitor {
 			}
 
 			// Check cooldown
-			if self
-				.bridge_service
-				.is_cooldown_active(&pair.symbol)
-				.await?
-			{
+			if self.bridge_service.is_cooldown_active(&pair.symbol).await? {
 				tracing::debug!(pair = %pair.symbol, "Cooldown active, skipping");
 				continue;
 			}
@@ -300,8 +298,7 @@ impl RebalanceMonitor {
 			// Parse thresholds (all in nominal units)
 			let target_a = U256::from_str_radix(&pair.target_balance_a, 10).unwrap_or(U256::ZERO);
 			let target_b = U256::from_str_radix(&pair.target_balance_b, 10).unwrap_or(U256::ZERO);
-			let max_amount =
-				U256::from_str_radix(&pair.max_bridge_amount, 10).unwrap_or(U256::MAX);
+			let max_amount = U256::from_str_radix(&pair.max_bridge_amount, 10).unwrap_or(U256::MAX);
 
 			let band = U256::from(pair.deviation_band_bps);
 			let bps_base = U256::from(10_000u64);
@@ -489,17 +486,16 @@ impl RebalanceMonitor {
 	}
 
 	/// Query native gas balance on a chain.
-	async fn get_native_balance(
-		&self,
-		chain_id: u64,
-	) -> Result<U256, crate::BridgeError> {
+	async fn get_native_balance(&self, chain_id: u64) -> Result<U256, crate::BridgeError> {
 		let solver_address = "0x0000000000000000000000000000000000000000"; // TODO: get from account service
 
 		let balance_str = self
 			.delivery
 			.get_balance(chain_id, solver_address, None)
 			.await
-			.map_err(|e| crate::BridgeError::Delivery(format!("Native balance query failed: {e}")))?;
+			.map_err(|e| {
+				crate::BridgeError::Delivery(format!("Native balance query failed: {e}"))
+			})?;
 
 		U256::from_str_radix(&balance_str, 10)
 			.map_err(|e| crate::BridgeError::Delivery(format!("Invalid balance value: {e}")))
@@ -530,8 +526,7 @@ pub fn validate_rebalance_config(config: &RebalanceConfig) -> Vec<String> {
 		}
 
 		let target_a = U256::from_str_radix(&pair.target_balance_a, 10).unwrap_or(U256::ZERO);
-		let max_amount =
-			U256::from_str_radix(&pair.max_bridge_amount, 10).unwrap_or(U256::ZERO);
+		let max_amount = U256::from_str_radix(&pair.max_bridge_amount, 10).unwrap_or(U256::ZERO);
 
 		if !max_amount.is_zero() && max_amount > target_a && !target_a.is_zero() {
 			warnings.push(format!(

@@ -7,7 +7,9 @@
 pub mod contracts;
 pub mod types;
 
-use crate::types::{BridgeDepositResult, BridgeRequest, BridgeTransferStatus, PendingBridgeTransfer};
+use crate::types::{
+	BridgeDepositResult, BridgeRequest, BridgeTransferStatus, PendingBridgeTransfer,
+};
 use crate::{BridgeError, BridgeInterface};
 use alloy_primitives::{Address, U256};
 use alloy_sol_types::SolCall;
@@ -45,7 +47,9 @@ impl LayerZeroVaultBridge {
 			.get(&chain_id)
 			.copied()
 			.ok_or_else(|| {
-				BridgeError::Config(format!("No LayerZero endpoint ID configured for chain {chain_id}"))
+				BridgeError::Config(format!(
+					"No LayerZero endpoint ID configured for chain {chain_id}"
+				))
 			})
 	}
 
@@ -133,8 +137,12 @@ impl LayerZeroVaultBridge {
 		let oft_address = request.source_token; // On Katana, source_token is vbUSDC = the OFT
 
 		// Build SendParam
-		let send_param =
-			self.build_send_param(dest_eid, &self.solver_address, request.amount, request.min_amount);
+		let send_param = self.build_send_param(
+			dest_eid,
+			&self.solver_address,
+			request.amount,
+			request.min_amount,
+		);
 
 		// Quote the fee
 		let native_fee = self
@@ -213,7 +221,9 @@ impl LayerZeroVaultBridge {
 		};
 
 		let approve_tx = Transaction {
-			to: Some(solver_types::Address(request.source_token.as_slice().to_vec())),
+			to: Some(solver_types::Address(
+				request.source_token.as_slice().to_vec(),
+			)),
 			data: approve_call.abi_encode(),
 			value: U256::ZERO,
 			chain_id: request.source_chain,
@@ -264,13 +274,9 @@ impl LayerZeroVaultBridge {
 			max_priority_fee_per_gas: None,
 		};
 
-		let tx_hash = self
-			.delivery
-			.deliver(bridge_tx, None)
-			.await
-			.map_err(|e| {
-				BridgeError::TransactionFailed(format!("Composer depositAndSend failed: {e}"))
-			})?;
+		let tx_hash = self.delivery.deliver(bridge_tx, None).await.map_err(|e| {
+			BridgeError::TransactionFailed(format!("Composer depositAndSend failed: {e}"))
+		})?;
 
 		let tx_hash_hex = format!("0x{}", hex::encode(&tx_hash.0));
 		tracing::info!(
@@ -345,7 +351,11 @@ impl BridgeInterface for LayerZeroVaultBridge {
 						.map_err(|e| BridgeError::Config(format!("Invalid tx hash: {e}")))?;
 					let tx_hash_obj = solver_types::TransactionHash(hash_bytes);
 
-					match self.delivery.get_receipt(&tx_hash_obj, transfer.source_chain).await {
+					match self
+						.delivery
+						.get_receipt(&tx_hash_obj, transfer.source_chain)
+						.await
+					{
 						Ok(receipt) => {
 							if receipt.success {
 								Ok(BridgeTransferStatus::Relaying)
@@ -379,10 +389,16 @@ impl BridgeInterface for LayerZeroVaultBridge {
 				if let Some(redeem_hash) = &transfer.redeem_tx_hash {
 					let hash_bytes =
 						hex::decode(redeem_hash.strip_prefix("0x").unwrap_or(redeem_hash))
-							.map_err(|e| BridgeError::Config(format!("Invalid redeem tx hash: {e}")))?;
+							.map_err(|e| {
+								BridgeError::Config(format!("Invalid redeem tx hash: {e}"))
+							})?;
 					let tx_hash_obj = solver_types::TransactionHash(hash_bytes);
 
-					match self.delivery.get_receipt(&tx_hash_obj, transfer.dest_chain).await {
+					match self
+						.delivery
+						.get_receipt(&tx_hash_obj, transfer.dest_chain)
+						.await
+					{
 						Ok(receipt) => {
 							if receipt.success {
 								Ok(BridgeTransferStatus::Completed)
@@ -418,8 +434,12 @@ impl BridgeInterface for LayerZeroVaultBridge {
 			request.source_token
 		};
 
-		let send_param =
-			self.build_send_param(dest_eid, &self.solver_address, request.amount, request.min_amount);
+		let send_param = self.build_send_param(
+			dest_eid,
+			&self.solver_address,
+			request.amount,
+			request.min_amount,
+		);
 
 		self.quote_send(request.source_chain, &oft_address, &send_param)
 			.await
@@ -439,6 +459,8 @@ pub fn create_bridge(
 	let solver_address = Address::ZERO;
 
 	Ok(Box::new(LayerZeroVaultBridge::new(
-		config, delivery, solver_address,
+		config,
+		delivery,
+		solver_address,
 	)))
 }

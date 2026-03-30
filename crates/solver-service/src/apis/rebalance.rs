@@ -163,12 +163,18 @@ pub async fn handle_get_rebalance_config(
 					symbol: p.symbol.clone(),
 					chain_a: PairSideConfigResponse {
 						chain_id: p.chain_a.chain_id,
-						token_address: format!("0x{}", hex::encode(p.chain_a.token_address.as_slice())),
+						token_address: format!(
+							"0x{}",
+							hex::encode(p.chain_a.token_address.as_slice())
+						),
 						oft_address: format!("0x{}", hex::encode(p.chain_a.oft_address.as_slice())),
 					},
 					chain_b: PairSideConfigResponse {
 						chain_id: p.chain_b.chain_id,
-						token_address: format!("0x{}", hex::encode(p.chain_b.token_address.as_slice())),
+						token_address: format!(
+							"0x{}",
+							hex::encode(p.chain_b.token_address.as_slice())
+						),
 						oft_address: format!("0x{}", hex::encode(p.chain_b.oft_address.as_slice())),
 					},
 					target_balance_a: p.target_balance_a.clone(),
@@ -196,10 +202,7 @@ pub async fn handle_get_rebalance_status(
 	State(state): State<AdminApiState>,
 ) -> Result<Json<RebalanceStatusResponse>, axum::http::StatusCode> {
 	let active_transfers = if let Some(bridge_service) = &state.bridge_service {
-		bridge_service
-			.active_transfer_count()
-			.await
-			.unwrap_or(0)
+		bridge_service.active_transfer_count().await.unwrap_or(0)
 	} else {
 		0
 	};
