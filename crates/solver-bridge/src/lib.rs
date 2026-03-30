@@ -167,7 +167,10 @@ impl BridgeService {
 		&self,
 		pair_symbol: &str,
 	) -> Result<Vec<PendingBridgeTransfer>, BridgeError> {
-		Ok(self.storage.get_active_transfers_for_pair(pair_symbol).await?)
+		Ok(self
+			.storage
+			.get_active_transfers_for_pair(pair_symbol)
+			.await?)
 	}
 
 	/// Get completed/failed transfer history.

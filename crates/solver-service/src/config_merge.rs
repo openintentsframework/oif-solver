@@ -37,8 +37,8 @@ use solver_types::{
 	OperatorBroadcasterConfig, OperatorConfig, OperatorDirectConfig, OperatorGasConfig,
 	OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig,
 	OperatorOracleSelectionStrategy, OperatorPricingConfig, OperatorPusherDirectionConfig,
-	OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSettlementType, OperatorSolverConfig,
-	OperatorRebalanceConfig, OperatorRebalancePairConfig, OperatorToken,
+	OperatorRebalanceConfig, OperatorRebalancePairConfig, OperatorRpcEndpoint,
+	OperatorSettlementConfig, OperatorSettlementType, OperatorSolverConfig, OperatorToken,
 	OperatorWithdrawalsConfig, PusherL2Params, RebalancePairSide, SeedOverrides,
 	SettlementTypeOverride, TokenConfig,
 };

@@ -82,31 +82,26 @@ impl BridgeStorage {
 				.await
 		} else {
 			self.storage
-				.store(
-					&self.namespace(),
-					&transfer.id,
-					transfer,
-					Some(indexes),
-				)
+				.store(&self.namespace(), &transfer.id, transfer, Some(indexes))
 				.await
 		}
 	}
 
 	/// Retrieve a transfer by ID.
-	pub async fn get_transfer(
-		&self,
-		id: &str,
-	) -> Result<PendingBridgeTransfer, StorageError> {
+	pub async fn get_transfer(&self, id: &str) -> Result<PendingBridgeTransfer, StorageError> {
 		self.storage.retrieve(&self.namespace(), id).await
 	}
 
 	/// Get all active (non-terminal) transfers.
-	pub async fn get_active_transfers(
-		&self,
-	) -> Result<Vec<PendingBridgeTransfer>, StorageError> {
+	pub async fn get_active_transfers(&self) -> Result<Vec<PendingBridgeTransfer>, StorageError> {
 		let mut active = Vec::new();
 
-		for status in &["submitted", "relaying", "pending_redemption", "needs_intervention"] {
+		for status in &[
+			"submitted",
+			"relaying",
+			"pending_redemption",
+			"needs_intervention",
+		] {
 			let filter = QueryFilter::Equals(
 				"status".to_string(),
 				serde_json::Value::String(status.to_string()),
