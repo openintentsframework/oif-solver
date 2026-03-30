@@ -58,6 +58,8 @@ pub struct AdminApiState {
 	pub nonce_store: Arc<NonceStore>,
 	/// Token manager for hot-reloading token configurations.
 	pub token_manager: Arc<TokenManager>,
+	/// Optional bridge service for rebalancing operations.
+	pub bridge_service: Option<Arc<solver_bridge::BridgeService>>,
 }
 
 /// Extractor that verifies an admin-signed request and returns the signer + contents.
@@ -1725,6 +1727,7 @@ mod tests {
 			dynamic_config,
 			nonce_store,
 			token_manager,
+			bridge_service: None,
 		}
 	}
 
@@ -1772,6 +1775,7 @@ mod tests {
 			dynamic_config,
 			nonce_store,
 			token_manager,
+			bridge_service: None,
 		}
 	}
 

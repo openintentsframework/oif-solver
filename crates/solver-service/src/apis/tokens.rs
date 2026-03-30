@@ -462,6 +462,7 @@ mod tests {
 			pricing,
 			event_bus,
 			token_manager,
+			None,
 		))
 	}
 

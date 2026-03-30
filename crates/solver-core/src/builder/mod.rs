@@ -617,6 +617,7 @@ impl SolverBuilder {
 			pricing,
 			EventBus::new(1000),
 			token_manager,
+			None,
 		))
 	}
 }

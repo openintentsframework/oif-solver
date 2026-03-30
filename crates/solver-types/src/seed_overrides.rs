@@ -641,6 +641,7 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			deny_list: None,
+			rebalance: None,
 		};
 
 		let chain_ids = config.chain_ids();
@@ -675,6 +676,7 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			deny_list: None,
+			rebalance: None,
 		};
 
 		assert!(config.has_chain(10));
@@ -714,6 +716,7 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			deny_list: None,
+			rebalance: None,
 		};
 
 		let network = config.get_network(10);
@@ -793,6 +796,7 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			deny_list: None,
+			rebalance: None,
 		};
 
 		let json = serde_json::to_string(&config).unwrap();

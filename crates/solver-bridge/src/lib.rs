@@ -275,8 +275,8 @@ impl BridgeService {
 
 /// Returns all registered bridge implementations.
 pub fn get_all_implementations() -> Vec<(&'static str, BridgeFactory)> {
-	vec![
-		// LayerZero VaultBridge will be registered here once implemented
-		// ("layerzero_vaultbridge", implementations::layerzero_vaultbridge::create_bridge),
-	]
+	vec![(
+		"layerzero_vaultbridge",
+		implementations::layerzero_vaultbridge::create_bridge,
+	)]
 }
