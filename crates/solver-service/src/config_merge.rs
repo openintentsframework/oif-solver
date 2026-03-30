@@ -306,6 +306,20 @@ fn parse_bool_env_var(name: &str, default: bool) -> Result<bool, MergeError> {
 	}
 }
 
+fn parse_u16_env_var(name: &str, default: u16) -> Result<u16, MergeError> {
+	match std::env::var(name) {
+		Ok(raw) => raw.trim().parse::<u16>().map_err(|_| {
+			MergeError::Validation(format!(
+				"Invalid integer value for {name}: {raw} (expected 0-65535)"
+			))
+		}),
+		Err(std::env::VarError::NotPresent) => Ok(default),
+		Err(std::env::VarError::NotUnicode(_)) => Err(MergeError::Validation(format!(
+			"Invalid unicode value for {name}"
+		))),
+	}
+}
+
 fn load_public_register_enabled(auth_enabled: bool) -> Result<bool, MergeError> {
 	if !auth_enabled {
 		return Ok(false);
@@ -1269,6 +1283,8 @@ fn build_discovery_config_from_operator(chain_ids: &[u64]) -> DiscoveryConfig {
 
 	let network_ids_array =
 		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect());
+	let offchain_api_port = parse_u16_env_var("OFFCHAIN_DISCOVERY_API_PORT", 8081)
+		.expect("OFFCHAIN_DISCOVERY_API_PORT must be a valid port");
 
 	// Onchain discovery - polls chain for new orders
 	let onchain_config = json_object(vec![
@@ -1280,7 +1296,7 @@ fn build_discovery_config_from_operator(chain_ids: &[u64]) -> DiscoveryConfig {
 	// Offchain discovery - receives orders via HTTP API from aggregators
 	let offchain_config = json_object(vec![
 		("api_host", serde_json::Value::String("0.0.0.0".to_string())),
-		("api_port", int(8081)),
+		("api_port", int(offchain_api_port as i64)),
 		("network_ids", network_ids_array),
 	]);
 	implementations.insert("offchain_eip7683".to_string(), offchain_config);
@@ -1854,6 +1870,8 @@ fn build_api_config_from_operator(
 	admin: &OperatorAdminConfig,
 	auth_enabled: bool,
 ) -> Result<ApiConfig, MergeError> {
+	let api_port =
+		parse_u16_env_var("SOLVER_API_PORT", 3000).expect("SOLVER_API_PORT must be a valid port");
 	let auth = if admin.enabled || auth_enabled {
 		// Read JWT secret from environment variable
 		let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| {
@@ -1892,7 +1910,7 @@ fn build_api_config_from_operator(
 	Ok(ApiConfig {
 		enabled: true,
 		host: "0.0.0.0".to_string(),
-		port: 3000,
+		port: api_port,
 		timeout_seconds: 30,
 		max_request_size: 1024 * 1024, // 1MB
 		implementations: ApiImplementations {
@@ -5547,6 +5565,26 @@ mod tests {
 	}
 
 	#[test]
+	#[serial]
+	fn test_build_discovery_config_from_operator_uses_env_port_override() {
+		let key = "OFFCHAIN_DISCOVERY_API_PORT";
+		let original = std::env::var(key).ok();
+		std::env::set_var(key, "8082");
+
+		let chain_ids = vec![1, 10];
+		let discovery = build_discovery_config_from_operator(&chain_ids);
+		let offchain = discovery.implementations.get("offchain_eip7683").unwrap();
+		let api_port = offchain.get("api_port").unwrap().as_i64().unwrap();
+
+		assert_eq!(api_port, 8082);
+
+		std::env::remove_var(key);
+		if let Some(val) = original {
+			std::env::set_var(key, val);
+		}
+	}
+
+	#[test]
 	fn test_build_order_config_from_operator() {
 		let order = build_order_config_from_operator();
 
@@ -5673,6 +5711,32 @@ mod tests {
 
 	#[test]
 	#[serial]
+	fn test_build_api_config_from_operator_uses_env_port_override() {
+		let key = "SOLVER_API_PORT";
+		let original = std::env::var(key).ok();
+		std::env::set_var(key, "3001");
+
+		let admin = OperatorAdminConfig {
+			enabled: false,
+			domain: "".to_string(),
+			chain_id: 0,
+			nonce_ttl_seconds: 0,
+			admin_addresses: vec![],
+			withdrawals: OperatorWithdrawalsConfig::default(),
+		};
+
+		let api = build_api_config_from_operator(&admin, false).unwrap();
+
+		assert_eq!(api.port, 3001);
+
+		std::env::remove_var(key);
+		if let Some(val) = original {
+			std::env::set_var(key, val);
+		}
+	}
+
+	#[test]
+	#[serial]
 	fn test_parse_bool_env_var_uses_default_when_missing() {
 		let key = "TEST_PARSE_BOOL_MISSING";
 		std::env::remove_var(key);
@@ -5700,6 +5764,27 @@ mod tests {
 
 		assert!(matches!(err, MergeError::Validation(_)));
 		assert!(err.to_string().contains("Invalid boolean value"));
+	}
+
+	#[test]
+	#[serial]
+	fn test_parse_u16_env_var_uses_default_when_missing() {
+		let key = "TEST_PARSE_U16_MISSING";
+		std::env::remove_var(key);
+		let parsed = parse_u16_env_var(key, 8081).unwrap();
+		assert_eq!(parsed, 8081);
+	}
+
+	#[test]
+	#[serial]
+	fn test_parse_u16_env_var_rejects_invalid_value() {
+		let key = "TEST_PARSE_U16_INVALID";
+		std::env::set_var(key, "not-a-port");
+		let err = parse_u16_env_var(key, 8081).unwrap_err();
+		std::env::remove_var(key);
+
+		assert!(matches!(err, MergeError::Validation(_)));
+		assert!(err.to_string().contains("Invalid integer value"));
 	}
 
 	#[test]
