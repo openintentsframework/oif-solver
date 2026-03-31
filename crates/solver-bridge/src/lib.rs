@@ -167,10 +167,7 @@ impl BridgeService {
 		&self,
 		pair_id: &str,
 	) -> Result<Vec<PendingBridgeTransfer>, BridgeError> {
-		Ok(self
-			.storage
-			.get_active_transfers_for_pair(pair_id)
-			.await?)
+		Ok(self.storage.get_active_transfers_for_pair(pair_id).await?)
 	}
 
 	/// Get completed/failed transfer history.
@@ -200,11 +197,7 @@ impl BridgeService {
 	}
 
 	/// Set a cooldown for a pair.
-	pub async fn set_cooldown(
-		&self,
-		pair_id: &str,
-		ttl_seconds: u64,
-	) -> Result<(), BridgeError> {
+	pub async fn set_cooldown(&self, pair_id: &str, ttl_seconds: u64) -> Result<(), BridgeError> {
 		Ok(self.storage.set_cooldown(pair_id, ttl_seconds).await?)
 	}
 

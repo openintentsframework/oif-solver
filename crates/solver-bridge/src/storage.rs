@@ -163,11 +163,7 @@ impl BridgeStorage {
 	}
 
 	/// Set a cooldown for a pair with the given TTL.
-	pub async fn set_cooldown(
-		&self,
-		pair_id: &str,
-		ttl_seconds: u64,
-	) -> Result<(), StorageError> {
+	pub async fn set_cooldown(&self, pair_id: &str, ttl_seconds: u64) -> Result<(), StorageError> {
 		let now = std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
 			.unwrap_or_default()
