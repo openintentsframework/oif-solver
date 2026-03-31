@@ -142,7 +142,7 @@ impl BridgeService {
 
 		// Create and persist the transfer record
 		let transfer = PendingBridgeTransfer::new(
-			request.pair_symbol.clone(),
+			request.pair_id.clone(),
 			request.source_chain,
 			request.dest_chain,
 			request.amount.to_string(),
@@ -165,11 +165,11 @@ impl BridgeService {
 	/// Get active transfers for a specific pair.
 	pub async fn get_active_transfers_for_pair(
 		&self,
-		pair_symbol: &str,
+		pair_id: &str,
 	) -> Result<Vec<PendingBridgeTransfer>, BridgeError> {
 		Ok(self
 			.storage
-			.get_active_transfers_for_pair(pair_symbol)
+			.get_active_transfers_for_pair(pair_id)
 			.await?)
 	}
 
@@ -195,17 +195,17 @@ impl BridgeService {
 	}
 
 	/// Check if a cooldown is active for a pair.
-	pub async fn is_cooldown_active(&self, pair_symbol: &str) -> Result<bool, BridgeError> {
-		Ok(self.storage.is_cooldown_active(pair_symbol).await?)
+	pub async fn is_cooldown_active(&self, pair_id: &str) -> Result<bool, BridgeError> {
+		Ok(self.storage.is_cooldown_active(pair_id).await?)
 	}
 
 	/// Set a cooldown for a pair.
 	pub async fn set_cooldown(
 		&self,
-		pair_symbol: &str,
+		pair_id: &str,
 		ttl_seconds: u64,
 	) -> Result<(), BridgeError> {
-		Ok(self.storage.set_cooldown(pair_symbol, ttl_seconds).await?)
+		Ok(self.storage.set_cooldown(pair_id, ttl_seconds).await?)
 	}
 
 	/// Update and persist a transfer's status.

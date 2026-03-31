@@ -614,9 +614,10 @@ fn default_max_pending() -> u32 {
 /// For MVP: USDC on Ethereum <-> vbUSDC on Katana.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperatorRebalancePairConfig {
-	/// Human-readable pair label (e.g., "USDC"). Used as pair identifier in
-	/// cooldown keys, API responses, and EIP-712 actions.
-	pub symbol: String,
+	/// Unique, operator-chosen identifier for this pair (e.g., "usdc-eth-katana").
+	/// Used as the key for cooldowns, transfer lookups, storage indexes, and API responses.
+	/// Must be unique across all configured pairs.
+	pub pair_id: String,
 
 	/// Chain A side of the pair (e.g., Ethereum).
 	pub chain_a: RebalancePairSide,
@@ -940,6 +941,7 @@ mod tests {
 			},
 			auth_enabled: false,
 			account: None,
+			rebalance: None,
 		};
 
 		let json = serde_json::to_string_pretty(&config).unwrap();

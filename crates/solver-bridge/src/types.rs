@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 /// Typed request for a bridge operation.
 #[derive(Debug, Clone)]
 pub struct BridgeRequest {
-	/// Pair symbol (e.g., "USDC").
-	pub pair_symbol: String,
+	/// Canonical pair ID (e.g., "USDC:1:747474").
+	pub pair_id: String,
 	/// Source chain ID.
 	pub source_chain: u64,
 	/// Destination chain ID.
@@ -88,8 +88,8 @@ pub struct PendingBridgeTransfer {
 	// --- public fields ---
 	/// Unique transfer ID (UUID).
 	pub id: String,
-	/// Identifies the rebalance pair (e.g., "USDC").
-	pub pair_symbol: String,
+	/// Canonical pair ID (e.g., "USDC:1:747474"). Direction-independent.
+	pub pair_id: String,
 	/// Source chain ID.
 	pub source_chain: u64,
 	/// Destination chain ID.
@@ -131,7 +131,7 @@ pub struct PendingBridgeTransfer {
 impl PendingBridgeTransfer {
 	/// Create a new transfer record in Submitted state.
 	pub fn new(
-		pair_symbol: String,
+		pair_id: String,
 		source_chain: u64,
 		dest_chain: u64,
 		amount: String,
@@ -147,7 +147,7 @@ impl PendingBridgeTransfer {
 
 		Self {
 			id: uuid::Uuid::new_v4().to_string(),
-			pair_symbol,
+			pair_id,
 			source_chain,
 			dest_chain,
 			amount,

@@ -1117,7 +1117,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 			operator_config.auth_enabled,
 		)?),
 		gas: Some(build_gas_config_from_operator(&operator_config.gas)),
-		rebalance: build_rebalance_config_from_operator(operator_config.rebalance.as_ref()),
+		rebalance: build_rebalance_config_from_operator(operator_config.rebalance.as_ref())?,
 	};
 
 	Ok(config)
@@ -2266,14 +2266,30 @@ fn extract_account_config(account: &AccountConfig) -> Option<OperatorAccountConf
 /// Builds runtime RebalanceConfig from OperatorRebalanceConfig.
 fn build_rebalance_config_from_operator(
 	rebalance: Option<&OperatorRebalanceConfig>,
-) -> Option<RebalanceConfig> {
-	let rebalance = rebalance?;
+) -> Result<Option<RebalanceConfig>, MergeError> {
+	let rebalance = match rebalance {
+		Some(r) => r,
+		None => return Ok(None),
+	};
+
+	// Validate no duplicate pair_ids — fail loudly so the operator fixes the config.
+	{
+		let mut seen = std::collections::HashSet::new();
+		for p in &rebalance.pairs {
+			if !seen.insert(p.pair_id.clone()) {
+				return Err(MergeError::Validation(format!(
+					"Duplicate rebalance pair_id '{}'. Each pair must have a unique pair_id.",
+					p.pair_id
+				)));
+			}
+		}
+	}
 
 	let pairs = rebalance
 		.pairs
 		.iter()
 		.map(|p| RebalancePairConfig {
-			symbol: p.symbol.clone(),
+			pair_id: p.pair_id.clone(),
 			chain_a: RebalancePairSideConfig {
 				chain_id: p.chain_a.chain_id,
 				token_address: format!("0x{}", hex::encode(p.chain_a.token_address.as_slice())),
@@ -2291,7 +2307,7 @@ fn build_rebalance_config_from_operator(
 		})
 		.collect();
 
-	Some(RebalanceConfig {
+	Ok(Some(RebalanceConfig {
 		enabled: rebalance.enabled,
 		implementation: rebalance.implementation.clone(),
 		monitor_interval_seconds: rebalance.monitor_interval_seconds,
@@ -2301,7 +2317,7 @@ fn build_rebalance_config_from_operator(
 		max_fee_bps: rebalance.max_fee_bps,
 		pairs,
 		bridge_config: rebalance.bridge_config.clone(),
-	})
+	}))
 }
 
 /// Extracts OperatorRebalanceConfig from runtime RebalanceConfig.
@@ -2327,7 +2343,7 @@ fn extract_rebalance_config(
 		.pairs
 		.iter()
 		.map(|p| OperatorRebalancePairConfig {
-			symbol: p.symbol.clone(),
+			pair_id: p.pair_id.clone(),
 			chain_a: RebalancePairSide {
 				chain_id: p.chain_a.chain_id,
 				token_address: parse_addr(&p.chain_a.token_address),

@@ -6,6 +6,9 @@
 //! 2. Checks balances against configured thresholds
 //! 3. Auto-triggers rebalance when thresholds are breached (respecting safety guards)
 //!
+//! When implemented, use `pair.pair_id` (operator-chosen unique key) for
+//! cooldowns, transfer lookups, and any pair-level state.
+//!
 //! TODO: Implement full threshold checking and auto-trigger logic.
 
 use crate::BridgeService;

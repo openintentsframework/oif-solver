@@ -351,8 +351,8 @@ pub struct RebalanceConfig {
 /// Runtime pair configuration (mirror of OperatorRebalancePairConfig).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RebalancePairConfig {
-	/// Pair label (e.g., "USDC").
-	pub symbol: String,
+	/// Unique, operator-chosen identifier for this pair (e.g., "usdc-eth-katana").
+	pub pair_id: String,
 	/// Chain A side of the pair.
 	pub chain_a: RebalancePairSideConfig,
 	/// Chain B side of the pair.
@@ -1194,5 +1194,74 @@ mod tests {
 			Err(ConfigError::Validation(message))
 				if message.contains("monitoring_timeout_seconds")
 		));
+	}
+
+	#[test]
+	fn test_pair_id_is_explicit_config_field() {
+		let pair = RebalancePairConfig {
+			pair_id: "usdc-eth-katana".to_string(),
+			chain_a: RebalancePairSideConfig {
+				chain_id: 1,
+				token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+				oft_address: "0x0000000000000000000000000000000000000001".to_string(),
+			},
+			chain_b: RebalancePairSideConfig {
+				chain_id: 747474,
+				token_address: "0x0000000000000000000000000000000000000002".to_string(),
+				oft_address: "0x0000000000000000000000000000000000000003".to_string(),
+			},
+			target_balance_a: "1000000".to_string(),
+			target_balance_b: "1000000".to_string(),
+			deviation_band_bps: 2000,
+			max_bridge_amount: "500000".to_string(),
+		};
+
+		// pair_id is the value set by the operator, not derived
+		assert_eq!(pair.pair_id, "usdc-eth-katana");
+	}
+
+	#[test]
+	fn test_same_symbol_different_tokens_can_coexist_with_distinct_pair_ids() {
+		// Two USDC variants on the same chain pair (e.g., native USDC vs bridged eUSDC)
+		// can coexist as long as the operator gives them different pair_ids.
+		let native_usdc = RebalancePairConfig {
+			pair_id: "usdc-native-eth-arb".to_string(),
+			chain_a: RebalancePairSideConfig {
+				chain_id: 1,
+				token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+				oft_address: "0x0000000000000000000000000000000000000001".to_string(),
+			},
+			chain_b: RebalancePairSideConfig {
+				chain_id: 42161,
+				token_address: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831".to_string(),
+				oft_address: "0x0000000000000000000000000000000000000002".to_string(),
+			},
+			target_balance_a: "1000000".to_string(),
+			target_balance_b: "1000000".to_string(),
+			deviation_band_bps: 2000,
+			max_bridge_amount: "500000".to_string(),
+		};
+
+		let bridged_usdc = RebalancePairConfig {
+			pair_id: "usdc-bridged-eth-arb".to_string(),
+			chain_a: RebalancePairSideConfig {
+				chain_id: 1,
+				token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+				oft_address: "0x0000000000000000000000000000000000000003".to_string(),
+			},
+			chain_b: RebalancePairSideConfig {
+				chain_id: 42161,
+				// Different token address — bridged variant
+				token_address: "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8".to_string(),
+				oft_address: "0x0000000000000000000000000000000000000004".to_string(),
+			},
+			target_balance_a: "1000000".to_string(),
+			target_balance_b: "1000000".to_string(),
+			deviation_band_bps: 2000,
+			max_bridge_amount: "500000".to_string(),
+		};
+
+		// Distinct pair_ids — no collision
+		assert_ne!(native_usdc.pair_id, bridged_usdc.pair_id);
 	}
 }

@@ -1,7 +1,7 @@
 //! Bridge transfer persistence helpers.
 //!
 //! Stores and queries `PendingBridgeTransfer` records in Redis via `StorageService`.
-//! Transfers are indexed by status, pair_symbol, source/dest chain, and trigger
+//! Transfers are indexed by status, pair_id, source/dest chain, and trigger
 //! so that active/history queries do not require scanning every key.
 
 use crate::types::{BridgeTransferStatus, PendingBridgeTransfer};
@@ -57,7 +57,7 @@ impl BridgeStorage {
 
 		StorageIndexes::new()
 			.with_field("status", status_str)
-			.with_field("pair_symbol", &transfer.pair_symbol)
+			.with_field("pair_id", &transfer.pair_id)
 			.with_field("source_chain", transfer.source_chain)
 			.with_field("dest_chain", transfer.dest_chain)
 			.with_field("trigger", trigger_str)
@@ -117,12 +117,12 @@ impl BridgeStorage {
 	/// Get active transfers for a specific pair.
 	pub async fn get_active_transfers_for_pair(
 		&self,
-		pair_symbol: &str,
+		pair_id: &str,
 	) -> Result<Vec<PendingBridgeTransfer>, StorageError> {
 		let all_active = self.get_active_transfers().await?;
 		Ok(all_active
 			.into_iter()
-			.filter(|t| t.pair_symbol == pair_symbol)
+			.filter(|t| t.pair_id == pair_id)
 			.collect())
 	}
 
@@ -156,16 +156,16 @@ impl BridgeStorage {
 	}
 
 	/// Check if a cooldown is active for a pair.
-	pub async fn is_cooldown_active(&self, pair_symbol: &str) -> Result<bool, StorageError> {
+	pub async fn is_cooldown_active(&self, pair_id: &str) -> Result<bool, StorageError> {
 		self.storage
-			.exists(&self.cooldown_namespace(), pair_symbol)
+			.exists(&self.cooldown_namespace(), pair_id)
 			.await
 	}
 
 	/// Set a cooldown for a pair with the given TTL.
 	pub async fn set_cooldown(
 		&self,
-		pair_symbol: &str,
+		pair_id: &str,
 		ttl_seconds: u64,
 	) -> Result<(), StorageError> {
 		let now = std::time::SystemTime::now()
@@ -176,7 +176,7 @@ impl BridgeStorage {
 		self.storage
 			.store_with_ttl(
 				&self.cooldown_namespace(),
-				pair_symbol,
+				pair_id,
 				&serde_json::json!({ "set_at": now }),
 				None,
 				Some(Duration::from_secs(ttl_seconds)),
