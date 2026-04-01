@@ -58,6 +58,12 @@ pub struct AdminApiState {
 	pub nonce_store: Arc<NonceStore>,
 	/// Token manager for hot-reloading token configurations.
 	pub token_manager: Arc<TokenManager>,
+	/// Bridge service for cross-chain rebalancing.
+	pub bridge_service: Option<Arc<solver_bridge::BridgeService>>,
+	/// The solver's address as a hex string (used by rebalance status endpoint).
+	pub solver_address: String,
+	/// Delivery service for balance queries (used by rebalance status endpoint).
+	pub delivery: Arc<solver_delivery::DeliveryService>,
 }
 
 /// Extractor that verifies an admin-signed request and returns the signer + contents.
@@ -1714,7 +1720,7 @@ mod tests {
 		let delivery = create_delivery_service(balance, expect_submit);
 		let token_manager = Arc::new(TokenManager::new(
 			NetworksConfig::default(),
-			delivery,
+			delivery.clone(),
 			account,
 		));
 		let dynamic_config = Arc::new(RwLock::new(ConfigBuilder::new().build()));
@@ -1725,6 +1731,9 @@ mod tests {
 			dynamic_config,
 			nonce_store,
 			token_manager,
+			bridge_service: None,
+			solver_address: "0x0000000000000000000000000000000000000000".to_string(),
+			delivery,
 		}
 	}
 
@@ -1761,7 +1770,7 @@ mod tests {
 		})));
 		let token_manager = Arc::new(TokenManager::new(
 			NetworksConfig::default(),
-			delivery,
+			delivery.clone(),
 			account,
 		));
 		let dynamic_config = Arc::new(RwLock::new(ConfigBuilder::new().build()));
@@ -1772,6 +1781,9 @@ mod tests {
 			dynamic_config,
 			nonce_store,
 			token_manager,
+			bridge_service: None,
+			solver_address: "0x0000000000000000000000000000000000000000".to_string(),
+			delivery,
 		}
 	}
 

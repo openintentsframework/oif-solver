@@ -1,3 +1,3 @@
 //! Bridge implementation modules.
 
-pub mod layerzero_vaultbridge;
+pub mod layerzero;

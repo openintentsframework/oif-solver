@@ -75,6 +75,19 @@ impl From<&AlloyReceipt> for TransactionReceipt {
 	}
 }
 
+/// Filter parameters for querying event logs.
+#[derive(Debug, Clone)]
+pub struct LogFilter {
+	/// Contract address to filter logs from.
+	pub address: Address,
+	/// Block to start scanning from (inclusive).
+	pub from_block: u64,
+	/// Block to scan to (inclusive). None = latest.
+	pub to_block: Option<u64>,
+	/// Topic filters. topic[0] = event signature. None entries are wildcards.
+	pub topics: Vec<Option<H256>>,
+}
+
 /// Chain data structure containing current blockchain state information.
 ///
 /// This structure provides a snapshot of blockchain state at a specific point in time,

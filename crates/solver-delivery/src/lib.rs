@@ -8,8 +8,8 @@ use alloy_primitives::Bytes;
 use async_trait::async_trait;
 use solver_types::events::TransactionType;
 use solver_types::{
-	ChainData, ConfigSchema, ImplementationRegistry, NetworksConfig, Transaction, TransactionHash,
-	TransactionReceipt,
+	ChainData, ConfigSchema, ImplementationRegistry, Log, LogFilter, NetworksConfig, Transaction,
+	TransactionHash, TransactionReceipt,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -174,6 +174,15 @@ pub trait DeliveryInterface: Send + Sync {
 	/// This performs an eth_call RPC to read data from smart contracts
 	/// or simulate transaction execution without submitting to the blockchain.
 	async fn eth_call(&self, tx: Transaction) -> Result<Bytes, DeliveryError>;
+
+	/// Queries event logs matching the given filter.
+	///
+	/// Used for scanning chain events (e.g., detecting token arrivals on destination chain).
+	async fn get_logs(
+		&self,
+		chain_id: u64,
+		filter: LogFilter,
+	) -> Result<Vec<Log>, DeliveryError>;
 }
 
 /// Type alias for delivery factory functions.
@@ -411,5 +420,19 @@ impl DeliveryService {
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
 		implementation.eth_call(tx).await
+	}
+
+	/// Queries event logs matching the given filter on a specific chain.
+	pub async fn get_logs(
+		&self,
+		chain_id: u64,
+		filter: LogFilter,
+	) -> Result<Vec<Log>, DeliveryError> {
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
+
+		implementation.get_logs(chain_id, filter).await
 	}
 }

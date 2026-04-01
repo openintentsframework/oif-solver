@@ -4,24 +4,45 @@ use alloy_primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 
 /// Typed request for a bridge operation.
+///
+/// Separates ERC-20/share tokens (used for approve/balance) from OFT contracts
+/// (used for quoteSend/send). This prevents the PR #315 bug where the two were confused.
 #[derive(Debug, Clone)]
 pub struct BridgeRequest {
-	/// Canonical pair ID (e.g., "USDC:1:747474").
+	/// Operator-chosen pair ID (e.g., "usdc-eth-katana").
 	pub pair_id: String,
 	/// Source chain ID.
 	pub source_chain: u64,
 	/// Destination chain ID.
 	pub dest_chain: u64,
-	/// Source token address on the source chain.
+	/// ERC-20/share token on source chain — used for approve() and balanceOf().
 	pub source_token: Address,
-	/// Destination token address on the destination chain.
+	/// OFT contract on source chain — used for quoteSend() and send().
+	pub source_oft: Address,
+	/// ERC-20/share token on destination chain — for balance verification.
 	pub dest_token: Address,
+	/// OFT contract on destination chain — for event scanning.
+	pub dest_oft: Address,
 	/// Amount to bridge in source token units.
 	pub amount: U256,
 	/// Minimum amount to receive (slippage floor).
 	pub min_amount: Option<U256>,
 	/// Recipient address on the destination chain.
 	pub recipient: Address,
+}
+
+/// Metadata needed for the delivery detection and redeem completion path.
+/// Must be provided by the caller (monitor or admin API) when initiating a transfer.
+#[derive(Debug, Clone)]
+pub struct TransferMetadata {
+	/// Destination token/share contract address (for Transfer event scanning).
+	pub dest_token_address: String,
+	/// Destination OFT contract address.
+	pub dest_oft_address: String,
+	/// Whether this is a Composer flow (ETH→Katana) vs OFT send (Katana→ETH).
+	pub is_composer_flow: bool,
+	/// Vault address on destination chain (only needed for Katana→ETH redeem path).
+	pub vault_address: Option<String>,
 }
 
 /// Result from initiating a bridge transfer.
@@ -126,6 +147,15 @@ pub struct PendingBridgeTransfer {
 	pub dest_scan_from_block: Option<u64>,
 	/// Last scanned destination block (resume scanning from here).
 	pub last_scanned_dest_block: Option<u64>,
+	/// Destination token/share contract address (for Transfer event scanning).
+	pub dest_token_address: Option<String>,
+	/// Destination OFT contract address.
+	pub dest_oft_address: Option<String>,
+	/// Whether this is a Composer flow (ETH→Katana: true) or OFT send (Katana→ETH: false).
+	/// Determines whether delivery is terminal (Completed) or needs redeem (PendingRedemption).
+	pub is_composer_flow: Option<bool>,
+	/// Vault address on destination chain (for ERC-4626 redeem, Katana→ETH only).
+	pub vault_address: Option<String>,
 }
 
 impl PendingBridgeTransfer {
@@ -165,6 +195,10 @@ impl PendingBridgeTransfer {
 			source_confirmed_block: None,
 			dest_scan_from_block: None,
 			last_scanned_dest_block: None,
+			dest_token_address: None,
+			dest_oft_address: None,
+			is_composer_flow: None,
+			vault_address: None,
 		}
 	}
 

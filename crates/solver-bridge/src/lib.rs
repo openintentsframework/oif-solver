@@ -13,6 +13,7 @@
 pub mod implementations;
 pub mod monitor;
 pub mod storage;
+pub mod threshold;
 pub mod types;
 
 use crate::storage::BridgeStorage;
@@ -98,9 +99,12 @@ pub trait BridgeInterface: Send + Sync {
 }
 
 /// Bridge factory function type (mirrors the solver's pluggable factory pattern).
+/// The `Address` parameter is the solver's on-chain address, required for
+/// constructing bridges that need to approve tokens or check balances.
 pub type BridgeFactory = fn(
 	&serde_json::Value,
 	Arc<solver_delivery::DeliveryService>,
+	alloy_primitives::Address,
 ) -> Result<Box<dyn BridgeInterface>, BridgeError>;
 
 /// Orchestrates bridge implementations and manages transfer lifecycle.
@@ -134,6 +138,7 @@ impl BridgeService {
 		bridge_impl: &str,
 		request: &BridgeRequest,
 		trigger: RebalanceTrigger,
+		metadata: types::TransferMetadata,
 	) -> Result<PendingBridgeTransfer, BridgeError> {
 		let bridge = self.get_implementation(bridge_impl)?;
 
@@ -149,6 +154,11 @@ impl BridgeService {
 			None, // message_guid set after submission
 			None, // fee_paid set after confirmation
 		);
+		// Populate metadata for delivery detection and redeem path
+		transfer.dest_token_address = Some(metadata.dest_token_address);
+		transfer.dest_oft_address = Some(metadata.dest_oft_address);
+		transfer.is_composer_flow = Some(metadata.is_composer_flow);
+		transfer.vault_address = metadata.vault_address;
 		self.storage.save_transfer(&transfer).await?;
 
 		// Execute the bridge transfer
@@ -279,8 +289,5 @@ impl BridgeService {
 
 /// Returns all registered bridge implementations.
 pub fn get_all_implementations() -> Vec<(&'static str, BridgeFactory)> {
-	vec![
-		// LayerZero VaultBridge will be registered here once implemented
-		// ("layerzero_vaultbridge", implementations::layerzero_vaultbridge::create_bridge),
-	]
+	vec![("layerzero", implementations::layerzero::create_bridge)]
 }

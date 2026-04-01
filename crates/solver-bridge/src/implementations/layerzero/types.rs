@@ -1,14 +1,12 @@
-//! LayerZero VaultBridge-specific configuration and types.
-//!
-//! TODO: Add driver-specific types.
+//! LayerZero bridge-specific configuration and types.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// LayerZero VaultBridge transport configuration.
+/// LayerZero bridge transport configuration.
 /// Deserialized from `bridge_config` JSON in `OperatorRebalanceConfig`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LayerZeroVaultBridgeConfig {
+pub struct LayerZeroBridgeConfig {
 	/// Maps chain_id -> LayerZero endpoint ID (EID).
 	pub endpoint_ids: HashMap<u64, u32>,
 

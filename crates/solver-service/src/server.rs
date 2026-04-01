@@ -290,6 +290,9 @@ pub async fn start_server(
 							nonce_store,
 							// Token manager for hot-reloading token configurations
 							token_manager: solver.token_manager().clone(),
+							bridge_service: solver.bridge_service().cloned(),
+							solver_address: solver.solver_address_hex(),
+							delivery: solver.delivery().clone(),
 						})
 					},
 					Err(e) => {
@@ -353,6 +356,15 @@ pub async fn start_server(
 			.route("/fees", put(handle_update_fees))
 			.route("/gas", get(handle_get_gas))
 			.route("/gas", put(handle_update_gas));
+
+		let rebalance_routes = axum::Router::new()
+			.route("/config", axum::routing::get(crate::apis::rebalance::handle_get_rebalance_config))
+			.route("/status", axum::routing::get(crate::apis::rebalance::handle_get_rebalance_status))
+			.route("/transfers", axum::routing::get(crate::apis::rebalance::handle_get_rebalance_transfers))
+			.route("/trigger", axum::routing::post(crate::apis::rebalance::handle_trigger_rebalance))
+			.route("/transfers/{id}/resolve", axum::routing::post(crate::apis::rebalance::handle_resolve_transfer));
+
+		admin_protected_routes = admin_protected_routes.nest("/rebalance", rebalance_routes);
 
 		// Only apply JWT auth to protected admin routes if orders_require_auth is true
 		// (i.e., auth.enabled in config). Admin routes also have their own
@@ -1032,6 +1044,7 @@ mod tests {
 			pricing,
 			event_bus,
 			token_manager,
+			None,
 		);
 
 		Arc::new(engine)
