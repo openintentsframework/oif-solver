@@ -1309,4 +1309,116 @@ mod tests {
 		// Distinct pair_ids — no collision
 		assert_ne!(native_usdc.pair_id, bridged_usdc.pair_id);
 	}
+
+	fn base_rebalance_config_json() -> serde_json::Value {
+		let mut config = base_config_json(
+			json!({
+				"1": test_network(1, "http://localhost:8545"),
+				"747474": test_network(747474, "http://localhost:9545")
+			}),
+			json!({ "test": {} }),
+			json!({
+				"test": {
+					"order": "test",
+					"network_ids": [1, 747474]
+				}
+			}),
+		);
+
+		config["rebalance"] = json!({
+			"enabled": true,
+			"implementation": "layerzero",
+			"monitor_interval_seconds": 15,
+			"cooldown_seconds": 60,
+			"max_pending_transfers": 3,
+			"pairs": [{
+				"pair_id": "eth-katana",
+				"chain_a": {
+					"chain_id": 1,
+					"token_address": "0x1111111111111111111111111111111111111111",
+					"oft_address": "0x2222222222222222222222222222222222222222"
+				},
+				"chain_b": {
+					"chain_id": 747474,
+					"token_address": "0x3333333333333333333333333333333333333333",
+					"oft_address": "0x4444444444444444444444444444444444444444"
+				},
+				"target_balance_a": "1000000",
+				"target_balance_b": "1000000",
+				"deviation_band_bps": 2000,
+				"max_bridge_amount": "500000"
+			}]
+		});
+		config
+	}
+
+	#[test]
+	fn test_rebalance_enabled_requires_non_empty_implementation() {
+		let mut config = base_rebalance_config_json();
+		config["rebalance"]["implementation"] = json!("");
+
+		let result = parse_json_fixture(config);
+		assert!(matches!(
+			result,
+			Err(ConfigError::Validation(message))
+				if message.contains("Rebalance implementation cannot be empty when enabled")
+		));
+	}
+
+	#[test]
+	fn test_rebalance_requires_non_zero_intervals_and_pending_limit() {
+		let mut zero_monitor = base_rebalance_config_json();
+		zero_monitor["rebalance"]["monitor_interval_seconds"] = json!(0);
+		assert!(matches!(
+			parse_json_fixture(zero_monitor),
+			Err(ConfigError::Validation(message))
+				if message.contains("monitor_interval_seconds")
+		));
+
+		let mut zero_cooldown = base_rebalance_config_json();
+		zero_cooldown["rebalance"]["cooldown_seconds"] = json!(0);
+		assert!(matches!(
+			parse_json_fixture(zero_cooldown),
+			Err(ConfigError::Validation(message))
+				if message.contains("cooldown_seconds")
+		));
+
+		let mut zero_pending = base_rebalance_config_json();
+		zero_pending["rebalance"]["max_pending_transfers"] = json!(0);
+		assert!(matches!(
+			parse_json_fixture(zero_pending),
+			Err(ConfigError::Validation(message))
+				if message.contains("max_pending_transfers")
+		));
+	}
+
+	#[test]
+	fn test_rebalance_rejects_empty_pair_id() {
+		let mut config = base_rebalance_config_json();
+		config["rebalance"]["pairs"][0]["pair_id"] = json!("");
+
+		let result = parse_json_fixture(config);
+		assert!(matches!(
+			result,
+			Err(ConfigError::Validation(message))
+				if message.contains("pair_id cannot be empty")
+		));
+	}
+
+	#[test]
+	fn test_rebalance_rejects_duplicate_pair_ids() {
+		let mut config = base_rebalance_config_json();
+		let duplicate = config["rebalance"]["pairs"][0].clone();
+		config["rebalance"]["pairs"]
+			.as_array_mut()
+			.unwrap()
+			.push(duplicate);
+
+		let result = parse_json_fixture(config);
+		assert!(matches!(
+			result,
+			Err(ConfigError::Validation(message))
+				if message.contains("Duplicate rebalance pair_id")
+		));
+	}
 }

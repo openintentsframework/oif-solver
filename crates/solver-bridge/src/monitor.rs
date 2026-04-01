@@ -552,6 +552,7 @@ impl RebalanceMonitor {
 				let source_oft = Self::parse_address(&source_side.oft_address)?;
 				let dest_token = Self::parse_address(&dest_side.token_address)?;
 				let dest_oft = Self::parse_address(&dest_side.oft_address)?;
+				let recipient = Self::parse_address(solver_address)?;
 
 				let request = BridgeRequest {
 					pair_id: pair.pair_id.clone(),
@@ -563,7 +564,7 @@ impl RebalanceMonitor {
 					dest_oft,
 					amount: analysis.suggested_amount,
 					min_amount: None,
-					recipient: Address::ZERO,
+					recipient,
 				};
 
 				tracing::info!(
@@ -633,7 +634,7 @@ impl RebalanceMonitor {
 		Ok(())
 	}
 
-	fn parse_address(addr: &str) -> Result<Address, crate::BridgeError> {
+fn parse_address(addr: &str) -> Result<Address, crate::BridgeError> {
 		let hex_str = addr.strip_prefix("0x").unwrap_or(addr);
 		let bytes = hex::decode(hex_str)
 			.map_err(|e| crate::BridgeError::Config(format!("Invalid address: {e}")))?;
@@ -641,5 +642,465 @@ impl RebalanceMonitor {
 			.try_into()
 			.map_err(|_| crate::BridgeError::Config("Address must be 20 bytes".to_string()))?;
 		Ok(Address::from(arr))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::test_support::{pending_transfer, rebalance_config};
+	use crate::{BridgeDepositResult, BridgeInterface};
+	use async_trait::async_trait;
+	use solver_config::ConfigBuilder;
+	use solver_delivery::{DeliveryService, MockDeliveryInterface};
+	use solver_storage::implementations::file::{FileStorage, TtlConfig};
+	use solver_storage::StorageService;
+	use solver_types::{
+		Address as DeliveryAddress, H256, Log, LogFilter, Transaction, TransactionHash,
+	};
+	use std::collections::{HashMap, VecDeque};
+	use std::fs;
+	use std::sync::{Arc, Mutex};
+	use tokio::sync::{RwLock, Semaphore};
+	use uuid::Uuid;
+
+	const SOLVER_ADDRESS: &str = "0x5555555555555555555555555555555555555555";
+
+	#[derive(Default)]
+	struct StubBridge {
+		bridge_asset_results: Mutex<VecDeque<Result<BridgeDepositResult, crate::BridgeError>>>,
+		check_status_results: Mutex<VecDeque<Result<BridgeTransferStatus, crate::BridgeError>>>,
+		recorded_requests: Arc<Mutex<Vec<crate::types::BridgeRequest>>>,
+	}
+
+	#[async_trait]
+	impl BridgeInterface for StubBridge {
+		fn supported_routes(&self) -> Vec<(u64, u64)> {
+			vec![(1, 747474), (747474, 1)]
+		}
+
+		async fn bridge_asset(
+			&self,
+			request: &crate::types::BridgeRequest,
+		) -> Result<BridgeDepositResult, crate::BridgeError> {
+			self.recorded_requests.lock().unwrap().push(request.clone());
+			self.bridge_asset_results
+				.lock()
+				.unwrap()
+				.pop_front()
+				.unwrap_or_else(|| {
+					Ok(BridgeDepositResult {
+						tx_hash: "0xfeedbeef".to_string(),
+						message_guid: None,
+						estimated_arrival: None,
+					})
+				})
+		}
+
+		async fn check_status(
+			&self,
+			transfer: &crate::types::PendingBridgeTransfer,
+		) -> Result<BridgeTransferStatus, crate::BridgeError> {
+			self.check_status_results
+				.lock()
+				.unwrap()
+				.pop_front()
+				.unwrap_or_else(|| Ok(transfer.status.clone()))
+		}
+
+		async fn estimate_fee(
+			&self,
+			_request: &crate::types::BridgeRequest,
+		) -> Result<U256, crate::BridgeError> {
+			Ok(U256::ZERO)
+		}
+	}
+
+	fn make_storage() -> Arc<StorageService> {
+		let base_path = std::env::temp_dir().join(format!("solver-monitor-test-{}", Uuid::new_v4()));
+		fs::create_dir_all(&base_path).unwrap();
+		Arc::new(StorageService::new(Box::new(FileStorage::new(
+			base_path,
+			TtlConfig::default(),
+		))))
+	}
+
+	fn make_delivery(mock: MockDeliveryInterface) -> Arc<DeliveryService> {
+		let shared = Arc::new(mock);
+		Arc::new(DeliveryService::new(
+			HashMap::from([
+				(
+					1_u64,
+					shared.clone() as Arc<dyn solver_delivery::DeliveryInterface>,
+				),
+				(
+					747474_u64,
+					shared as Arc<dyn solver_delivery::DeliveryInterface>,
+				),
+			]),
+			3,
+			300,
+		))
+	}
+
+	fn make_monitor(
+		bridge: Arc<dyn BridgeInterface>,
+		delivery: Arc<DeliveryService>,
+		storage: Arc<StorageService>,
+		rebalance: solver_config::RebalanceConfig,
+	) -> (Arc<crate::BridgeService>, RebalanceMonitor) {
+		let bridge_service = Arc::new(crate::BridgeService::new(
+			HashMap::from([("mock-bridge".to_string(), bridge)]),
+			storage.clone(),
+			"solver-a".to_string(),
+		));
+		let mut config = ConfigBuilder::new().solver_id("solver-a".to_string()).build();
+		config.rebalance = Some(rebalance);
+		let monitor = RebalanceMonitor::new(
+			bridge_service.clone(),
+			delivery,
+			Arc::new(RwLock::new(config)),
+			storage,
+			Arc::new(Semaphore::new(1)),
+			SOLVER_ADDRESS.to_string(),
+		);
+		(bridge_service, monitor)
+	}
+
+	fn transfer_event_signature() -> [u8; 32] {
+		alloy_primitives::keccak256(b"Transfer(address,address,uint256)").0
+	}
+
+	fn topic_for_address(addr: &str) -> H256 {
+		let bytes = hex::decode(addr.strip_prefix("0x").unwrap_or(addr)).unwrap();
+		let mut topic = [0u8; 32];
+		topic[12..].copy_from_slice(&bytes);
+		H256(topic)
+	}
+
+	fn delivery_address(hex_addr: &str) -> DeliveryAddress {
+		DeliveryAddress(hex::decode(hex_addr.strip_prefix("0x").unwrap_or(hex_addr)).unwrap())
+	}
+
+	fn amount_data(amount: U256) -> Vec<u8> {
+		let mut buf = [0u8; 32];
+		amount.to_be_bytes::<32>().iter().enumerate().for_each(|(i, b)| {
+			buf[i] = *b;
+		});
+		buf.to_vec()
+	}
+
+	fn transfer_log(token: &str, from: &str, to: &str, amount: U256) -> Log {
+		Log {
+			address: delivery_address(token),
+			topics: vec![
+				H256(transfer_event_signature()),
+				topic_for_address(from),
+				topic_for_address(to),
+			],
+			data: amount_data(amount),
+		}
+	}
+
+	fn current_timestamp() -> u64 {
+		std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_secs()
+	}
+
+	fn fresh_transfer(status: BridgeTransferStatus) -> crate::types::PendingBridgeTransfer {
+		let mut transfer = pending_transfer(status);
+		let now = current_timestamp();
+		transfer.created_at = now;
+		transfer.updated_at = now;
+		transfer
+	}
+
+	#[tokio::test]
+	async fn test_submitted_timeout_moves_to_needs_intervention() {
+		let storage = make_storage();
+		let delivery = make_delivery(MockDeliveryInterface::new());
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) =
+			make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let mut transfer = pending_transfer(BridgeTransferStatus::Submitted);
+		transfer.updated_at = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_secs()
+			- SUBMITTED_TIMEOUT_SECS
+			- 1;
+		bridge_service.storage().save_transfer(&transfer).await.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(matches!(
+			stored.status,
+			BridgeTransferStatus::NeedsIntervention(ref reason)
+				if reason.contains("Submitted tx not confirmed")
+		));
+		assert_eq!(
+			stored.status_before_intervention,
+			Some(BridgeTransferStatus::Submitted)
+		);
+	}
+
+	#[tokio::test]
+	async fn test_pending_redemption_failed_receipt_increments_failure_count_and_stays_pending() {
+		let storage = make_storage();
+		let delivery = make_delivery(MockDeliveryInterface::new());
+		let bridge = Arc::new(StubBridge {
+			check_status_results: Mutex::new(VecDeque::from([Ok(
+				BridgeTransferStatus::Failed("Redeem transaction reverted".to_string()),
+			)])),
+			..Default::default()
+		}) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) =
+			make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let transfer = fresh_transfer(BridgeTransferStatus::PendingRedemption);
+		bridge_service.storage().save_transfer(&transfer).await.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(matches!(stored.status, BridgeTransferStatus::PendingRedemption));
+		assert_eq!(stored.failure_count, 1);
+		assert!(stored.redeem_tx_hash.is_none());
+	}
+
+	#[tokio::test]
+	async fn test_relaying_detects_delivery_only_when_amount_within_bounds() {
+		let storage = make_storage();
+		let expected_token = "0x3333333333333333333333333333333333333333".to_string();
+		let expected_token_for_logs = expected_token.clone();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_logs().times(1).returning(move |_chain_id, filter: LogFilter| {
+			assert_eq!(filter.address, delivery_address(&expected_token_for_logs));
+			assert_eq!(filter.topics().len(), 3);
+			assert_eq!(filter.topics()[0], Some(H256(transfer_event_signature())));
+			assert_eq!(filter.topics()[2], Some(topic_for_address(SOLVER_ADDRESS)));
+			let low = transfer_log(
+				&expected_token_for_logs,
+				"0x1111111111111111111111111111111111111111",
+				SOLVER_ADDRESS,
+				U256::from(949_999u64),
+			);
+			let ok = transfer_log(
+				&expected_token_for_logs,
+				"0x1111111111111111111111111111111111111111",
+				SOLVER_ADDRESS,
+				U256::from(1_000_000u64),
+			);
+			Box::pin(async move { Ok(vec![low, ok]) })
+		});
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) =
+			make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let mut transfer = fresh_transfer(BridgeTransferStatus::Relaying);
+		transfer.dest_scan_from_block = Some(100);
+		transfer.dest_token_address = Some(expected_token.clone());
+		transfer.is_composer_flow = Some(false);
+		bridge_service.storage().save_transfer(&transfer).await.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(matches!(stored.status, BridgeTransferStatus::PendingRedemption));
+		assert_eq!(stored.received_shares.as_deref(), Some("1000000"));
+	}
+
+	#[tokio::test]
+	async fn test_relaying_ignores_transfer_above_max_tolerance() {
+		let storage = make_storage();
+		let expected_token = "0x3333333333333333333333333333333333333333".to_string();
+		let expected_token_for_logs = expected_token.clone();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_logs().times(1).returning(move |_chain_id, _filter| {
+			let high = transfer_log(
+				&expected_token_for_logs,
+				"0x1111111111111111111111111111111111111111",
+				SOLVER_ADDRESS,
+				U256::from(1_100_000u64),
+			);
+			Box::pin(async move { Ok(vec![high]) })
+		});
+		mock.expect_get_block_number()
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(150) }));
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) =
+			make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let mut transfer = fresh_transfer(BridgeTransferStatus::Relaying);
+		transfer.dest_scan_from_block = Some(100);
+		transfer.dest_token_address = Some(expected_token);
+		transfer.is_composer_flow = Some(false);
+		bridge_service.storage().save_transfer(&transfer).await.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(matches!(stored.status, BridgeTransferStatus::Relaying));
+		assert_eq!(stored.last_scanned_dest_block, Some(150));
+		assert!(stored.received_shares.is_none());
+	}
+
+	#[tokio::test]
+	async fn test_composer_flow_completes_while_oft_flow_enters_pending_redemption() {
+		let expected_token = "0x3333333333333333333333333333333333333333".to_string();
+		let amount = U256::from(1_000_000u64);
+
+		for (is_composer, expected_status) in [
+			(true, BridgeTransferStatus::Completed),
+			(false, BridgeTransferStatus::PendingRedemption),
+		] {
+			let storage = make_storage();
+			let mut mock = MockDeliveryInterface::new();
+			let expected_token_inner = expected_token.clone();
+			mock.expect_get_logs().times(1).returning(move |_chain_id, _filter| {
+				let log = transfer_log(
+					&expected_token_inner,
+					"0x1111111111111111111111111111111111111111",
+					SOLVER_ADDRESS,
+					amount,
+				);
+				Box::pin(async move { Ok(vec![log]) })
+			});
+			let delivery = make_delivery(mock);
+			let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+			let (bridge_service, monitor) =
+				make_monitor(bridge, delivery, storage, rebalance_config());
+
+			let mut transfer = fresh_transfer(BridgeTransferStatus::Relaying);
+			transfer.id = format!("flow-{is_composer}");
+			transfer.dest_scan_from_block = Some(100);
+			transfer.dest_token_address = Some(expected_token.clone());
+			transfer.is_composer_flow = Some(is_composer);
+			bridge_service.storage().save_transfer(&transfer).await.unwrap();
+
+			monitor
+				.advance_pending_transfers(&rebalance_config())
+				.await
+				.unwrap();
+
+			let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+			assert_eq!(stored.status, expected_status);
+		}
+	}
+
+	#[tokio::test]
+	async fn test_pending_redemption_submits_redeem_once_and_persists_hash() {
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_submit().times(1).returning(|tx: Transaction, _tracking| {
+			assert_eq!(tx.chain_id, 747474);
+			let to = tx.to.expect("redeem tx recipient");
+			assert_eq!(
+				Address::from_slice(&to.0),
+				Address::from_slice(
+					&hex::decode("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap()
+				)
+			);
+			Box::pin(async move { Ok(TransactionHash(vec![0x77; 32])) })
+		});
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) =
+			make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let mut transfer = fresh_transfer(BridgeTransferStatus::PendingRedemption);
+		transfer.vault_address = Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+		transfer.received_shares = Some("12345".to_string());
+		bridge_service.storage().save_transfer(&transfer).await.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert_eq!(
+			stored.redeem_tx_hash.as_deref(),
+			Some("0x7777777777777777777777777777777777777777777777777777777777777777")
+		);
+	}
+
+	#[tokio::test]
+	async fn test_check_thresholds_builds_direction_aware_request_and_uses_solver_address() {
+		let storage = make_storage();
+		let recorded = Arc::new(Mutex::new(Vec::new()));
+		let bridge = Arc::new(StubBridge {
+			recorded_requests: recorded.clone(),
+			..Default::default()
+		}) as Arc<dyn BridgeInterface>;
+
+		let solver_address = SOLVER_ADDRESS.to_string();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_balance().times(2).returning(move |address, token, chain_id| {
+			assert_eq!(address, solver_address);
+			match (chain_id, token) {
+				(1, Some("0x1111111111111111111111111111111111111111")) => {
+					Box::pin(async move { Ok("500000".to_string()) })
+				},
+				(747474, Some("0x3333333333333333333333333333333333333333")) => {
+					Box::pin(async move { Ok("1500000".to_string()) })
+				},
+				other => panic!("unexpected balance query: {other:?}"),
+			}
+		});
+		let delivery = make_delivery(mock);
+		let mut rebalance = rebalance_config();
+		rebalance.bridge_config = Some(serde_json::json!({
+			"composer_addresses": {},
+			"vault_addresses": { "1": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+		}));
+		let (bridge_service, monitor) =
+			make_monitor(bridge, delivery, storage, rebalance.clone());
+
+		monitor.check_thresholds_and_trigger(&rebalance).await.unwrap();
+
+		let requests = recorded.lock().unwrap();
+		assert_eq!(requests.len(), 1);
+		let request = &requests[0];
+		assert_eq!(request.source_chain, 747474);
+		assert_eq!(request.dest_chain, 1);
+		assert_eq!(request.source_token, Address::from([0x33; 20]));
+		assert_eq!(request.source_oft, Address::from([0x44; 20]));
+		assert_eq!(request.dest_token, Address::from([0x11; 20]));
+		assert_eq!(request.dest_oft, Address::from([0x22; 20]));
+		assert_eq!(request.recipient, Address::from([0x55; 20]));
+
+		let active = bridge_service.get_active_transfers().await.unwrap();
+		assert_eq!(active.len(), 1);
+		assert_eq!(active[0].pair_id, "eth-katana");
+		assert_eq!(
+			active[0].dest_token_address.as_deref(),
+			Some("0x1111111111111111111111111111111111111111")
+		);
+		assert_eq!(
+			active[0].vault_address.as_deref(),
+			Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+		);
+		assert_eq!(active[0].is_composer_flow, Some(false));
+		assert!(bridge_service.is_cooldown_active("eth-katana").await.unwrap());
 	}
 }

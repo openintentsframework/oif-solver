@@ -360,7 +360,12 @@ pub async fn start_server(
 		let rebalance_routes = axum::Router::new()
 			.route(
 				"/config",
-				axum::routing::get(crate::apis::rebalance::handle_get_rebalance_config),
+				axum::routing::get(crate::apis::rebalance::handle_get_rebalance_config)
+					.put(crate::apis::rebalance::handle_update_rebalance_config),
+			)
+			.route(
+				"/config/threshold",
+				axum::routing::put(crate::apis::rebalance::handle_update_rebalance_threshold),
 			)
 			.route(
 				"/status",

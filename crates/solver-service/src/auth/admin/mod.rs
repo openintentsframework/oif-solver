@@ -21,7 +21,9 @@ pub use signature::{recover_from_hash, recover_personal_sign};
 pub use types::{
 	admin_domain_separator, AddAdminContents, AddTokenContents, AddTokenItemContents,
 	AddTokensContents, AdminAction, AdminActionHashError, ApproveTokensContents,
-	RemoveAdminContents, RemoveTokenContents, SignedAdminRequest, UpdateFeeConfigContents,
-	UpdateGasConfigContents, WithdrawContents, ADMIN_DOMAIN_NAME, ADMIN_DOMAIN_VERSION,
+	RemoveAdminContents, RemoveTokenContents, ResolveTransferContents, SignedAdminRequest,
+	TriggerRebalanceContents, UpdateFeeConfigContents, UpdateGasConfigContents,
+	UpdateRebalanceConfigContents, UpdateRebalanceThresholdContents, WithdrawContents,
+	ADMIN_DOMAIN_NAME, ADMIN_DOMAIN_VERSION,
 };
 pub use verify::AdminActionVerifier;
