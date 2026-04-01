@@ -1108,7 +1108,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 		storage: build_storage_config_from_operator(&operator_config.solver_id),
 		delivery: build_delivery_config_from_operator(&chain_ids),
 		account: build_account_config_from_operator(operator_config.account.as_ref()),
-		discovery: build_discovery_config_from_operator(&chain_ids),
+		discovery: build_discovery_config_from_operator(&chain_ids)?,
 		order: build_order_config_from_operator(),
 		settlement: build_settlement_config_from_operator(operator_config, &chain_ids)?,
 		pricing: Some(build_pricing_config_from_operator(&operator_config.pricing)),
@@ -1281,13 +1281,14 @@ fn build_account_config_from_operator(
 }
 
 /// Builds DiscoveryConfig from operator config.
-fn build_discovery_config_from_operator(chain_ids: &[u64]) -> DiscoveryConfig {
+fn build_discovery_config_from_operator(
+	chain_ids: &[u64],
+) -> Result<DiscoveryConfig, MergeError> {
 	let mut implementations = HashMap::new();
 
 	let network_ids_array =
 		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect());
-	let offchain_api_port = parse_u16_env_var("OFFCHAIN_DISCOVERY_API_PORT", 8081)
-		.expect("OFFCHAIN_DISCOVERY_API_PORT must be a valid port");
+	let offchain_api_port = parse_u16_env_var("OFFCHAIN_DISCOVERY_API_PORT", 8081)?;
 
 	// Onchain discovery - polls chain for new orders
 	let onchain_config = json_object(vec![
@@ -1304,7 +1305,7 @@ fn build_discovery_config_from_operator(chain_ids: &[u64]) -> DiscoveryConfig {
 	]);
 	implementations.insert("offchain_eip7683".to_string(), offchain_config);
 
-	DiscoveryConfig { implementations }
+	Ok(DiscoveryConfig { implementations })
 }
 
 /// Builds OrderConfig from operator defaults.
@@ -1874,7 +1875,7 @@ fn build_api_config_from_operator(
 	auth_enabled: bool,
 ) -> Result<ApiConfig, MergeError> {
 	let api_port =
-		parse_u16_env_var("SOLVER_API_PORT", 3000).expect("SOLVER_API_PORT must be a valid port");
+		parse_u16_env_var("SOLVER_API_PORT", 3000)?;
 	let auth = if admin.enabled || auth_enabled {
 		// Read JWT secret from environment variable
 		let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| {
@@ -2235,7 +2236,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		admin,
 		auth_enabled,
 		account,
-		rebalance: extract_rebalance_config(config.rebalance.as_ref()),
+		rebalance: extract_rebalance_config(config.rebalance.as_ref())?,
 	})
 }
 
@@ -2323,45 +2324,52 @@ fn build_rebalance_config_from_operator(
 /// Extracts OperatorRebalanceConfig from runtime RebalanceConfig.
 fn extract_rebalance_config(
 	rebalance: Option<&RebalanceConfig>,
-) -> Option<OperatorRebalanceConfig> {
+) -> Result<Option<OperatorRebalanceConfig>, MergeError> {
 	use alloy_primitives::Address;
 
-	let rebalance = rebalance?;
-
-	let parse_addr = |s: &str| -> Address {
-		let s = s.strip_prefix("0x").unwrap_or(s);
-		hex::decode(s)
-			.ok()
-			.and_then(|bytes| {
-				let arr: [u8; 20] = bytes.try_into().ok()?;
-				Some(Address::from(arr))
-			})
-			.unwrap_or_default()
+	let rebalance = match rebalance {
+		Some(r) => r,
+		None => return Ok(None),
 	};
 
-	let pairs = rebalance
-		.pairs
-		.iter()
-		.map(|p| OperatorRebalancePairConfig {
+	let parse_addr = |s: &str, field: &str, pair_id: &str| -> Result<Address, MergeError> {
+		let hex_str = s.strip_prefix("0x").unwrap_or(s);
+		let bytes = hex::decode(hex_str).map_err(|e| {
+			MergeError::Validation(format!(
+				"Rebalance pair '{pair_id}': invalid hex in {field}: {e}"
+			))
+		})?;
+		let arr: [u8; 20] = bytes.try_into().map_err(|b: Vec<u8>| {
+			MergeError::Validation(format!(
+				"Rebalance pair '{pair_id}': {field} must be 20 bytes, got {}",
+				b.len()
+			))
+		})?;
+		Ok(Address::from(arr))
+	};
+
+	let mut pairs = Vec::with_capacity(rebalance.pairs.len());
+	for p in &rebalance.pairs {
+		pairs.push(OperatorRebalancePairConfig {
 			pair_id: p.pair_id.clone(),
 			chain_a: RebalancePairSide {
 				chain_id: p.chain_a.chain_id,
-				token_address: parse_addr(&p.chain_a.token_address),
-				oft_address: parse_addr(&p.chain_a.oft_address),
+				token_address: parse_addr(&p.chain_a.token_address, "chain_a.token_address", &p.pair_id)?,
+				oft_address: parse_addr(&p.chain_a.oft_address, "chain_a.oft_address", &p.pair_id)?,
 			},
 			chain_b: RebalancePairSide {
 				chain_id: p.chain_b.chain_id,
-				token_address: parse_addr(&p.chain_b.token_address),
-				oft_address: parse_addr(&p.chain_b.oft_address),
+				token_address: parse_addr(&p.chain_b.token_address, "chain_b.token_address", &p.pair_id)?,
+				oft_address: parse_addr(&p.chain_b.oft_address, "chain_b.oft_address", &p.pair_id)?,
 			},
 			target_balance_a: p.target_balance_a.clone(),
 			target_balance_b: p.target_balance_b.clone(),
 			deviation_band_bps: p.deviation_band_bps,
 			max_bridge_amount: p.max_bridge_amount.clone(),
-		})
-		.collect();
+		});
+	}
 
-	Some(OperatorRebalanceConfig {
+	Ok(Some(OperatorRebalanceConfig {
 		enabled: rebalance.enabled,
 		implementation: rebalance.implementation.clone(),
 		monitor_interval_seconds: rebalance.monitor_interval_seconds,
@@ -2371,7 +2379,7 @@ fn extract_rebalance_config(
 		max_fee_bps: rebalance.max_fee_bps,
 		pairs,
 		bridge_config: rebalance.bridge_config.clone(),
-	})
+	}))
 }
 
 /// Converts a serde_json::Value to a serde_json::Value.
@@ -5697,7 +5705,7 @@ mod tests {
 	#[test]
 	fn test_build_discovery_config_from_operator() {
 		let chain_ids = vec![1, 10];
-		let discovery = build_discovery_config_from_operator(&chain_ids);
+		let discovery = build_discovery_config_from_operator(&chain_ids).unwrap();
 
 		assert!(discovery.implementations.contains_key("onchain_eip7683"));
 		assert!(discovery.implementations.contains_key("offchain_eip7683"));
@@ -5714,7 +5722,7 @@ mod tests {
 		std::env::set_var(key, "8082");
 
 		let chain_ids = vec![1, 10];
-		let discovery = build_discovery_config_from_operator(&chain_ids);
+		let discovery = build_discovery_config_from_operator(&chain_ids).unwrap();
 		let offchain = discovery.implementations.get("offchain_eip7683").unwrap();
 		let api_port = offchain.get("api_port").unwrap().as_i64().unwrap();
 
