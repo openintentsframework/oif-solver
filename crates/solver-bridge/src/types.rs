@@ -160,6 +160,7 @@ pub struct PendingBridgeTransfer {
 
 impl PendingBridgeTransfer {
 	/// Create a new transfer record in Submitted state.
+	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		pair_id: String,
 		source_chain: u64,
@@ -220,5 +221,98 @@ impl PendingBridgeTransfer {
 
 		self.status = new_status;
 		self.updated_at = now;
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn transfer_with_status(status: BridgeTransferStatus) -> PendingBridgeTransfer {
+		let mut transfer = PendingBridgeTransfer::new(
+			"eth-katana".to_string(),
+			1,
+			747474,
+			"1000000".to_string(),
+			RebalanceTrigger::Auto,
+			None,
+			None,
+			None,
+		);
+		transfer.status = status;
+		transfer.updated_at = 1;
+		transfer
+	}
+
+	#[test]
+	fn test_transition_to_needs_intervention_preserves_original_status() {
+		let mut transfer = transfer_with_status(BridgeTransferStatus::Relaying);
+
+		transfer.transition_to(BridgeTransferStatus::NeedsIntervention(
+			"monitor timeout".to_string(),
+		));
+
+		assert!(matches!(
+			transfer.status,
+			BridgeTransferStatus::NeedsIntervention(_)
+		));
+		assert_eq!(
+			transfer.status_before_intervention,
+			Some(BridgeTransferStatus::Relaying)
+		);
+	}
+
+	#[test]
+	fn test_transition_to_needs_intervention_does_not_overwrite_previous_status() {
+		let mut transfer = transfer_with_status(BridgeTransferStatus::PendingRedemption);
+
+		transfer.transition_to(BridgeTransferStatus::NeedsIntervention(
+			"first intervention".to_string(),
+		));
+		transfer.transition_to(BridgeTransferStatus::NeedsIntervention(
+			"second intervention".to_string(),
+		));
+
+		assert!(matches!(
+			transfer.status,
+			BridgeTransferStatus::NeedsIntervention(ref reason) if reason == "second intervention"
+		));
+		assert_eq!(
+			transfer.status_before_intervention,
+			Some(BridgeTransferStatus::PendingRedemption)
+		);
+	}
+
+	#[test]
+	fn test_transition_to_is_terminal_and_blocks_pair_matrix() {
+		let cases = [
+			(BridgeTransferStatus::Submitted, false, true),
+			(BridgeTransferStatus::Relaying, false, true),
+			(BridgeTransferStatus::PendingRedemption, false, true),
+			(BridgeTransferStatus::Completed, true, false),
+			(BridgeTransferStatus::Failed("boom".to_string()), true, false),
+			(
+				BridgeTransferStatus::NeedsIntervention("pause".to_string()),
+				false,
+				true,
+			),
+		];
+
+		for (status, is_terminal, blocks_pair) in cases {
+			assert_eq!(status.is_terminal(), is_terminal, "{status:?}");
+			assert_eq!(status.blocks_pair(), blocks_pair, "{status:?}");
+		}
+	}
+
+	#[test]
+	fn test_transition_to_updates_updated_at_timestamp() {
+		let mut transfer = transfer_with_status(BridgeTransferStatus::Submitted);
+		let previous_updated_at = transfer.updated_at;
+
+		transfer.transition_to(BridgeTransferStatus::Completed);
+
+		assert!(matches!(transfer.status, BridgeTransferStatus::Completed));
+		assert_ne!(transfer.updated_at, previous_updated_at);
+		assert!(transfer.updated_at > previous_updated_at);
 	}
 }

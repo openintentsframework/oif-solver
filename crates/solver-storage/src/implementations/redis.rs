@@ -338,6 +338,28 @@ impl RedisStorage {
 	) -> Result<(), StorageError> {
 		let client = self.get_connection().await?;
 		let mut conn = client.as_ref().clone();
+		let index_meta_key = self.index_meta_key(key);
+
+		// If this key already had index memberships, remove it from the old sets first.
+		// This keeps same-ID overwrites from lingering in stale status buckets.
+		let existing_index_keys: Vec<String> = conn
+			.smembers(&index_meta_key)
+			.await
+			.map_err(|e| self.map_redis_error(e, "update_indexes_get_existing_meta"))?;
+
+		for idx_key in &existing_index_keys {
+			let _: () = conn
+				.srem(idx_key, key)
+				.await
+				.map_err(|e| self.map_redis_error(e, "update_indexes_remove_existing_field"))?;
+		}
+
+		if !existing_index_keys.is_empty() {
+			let _: () = conn
+				.del(&index_meta_key)
+				.await
+				.map_err(|e| self.map_redis_error(e, "update_indexes_delete_existing_meta"))?;
+		}
 
 		// Add to all-IDs set for the namespace
 		let all_ids_key = self.all_ids_key(namespace);
@@ -363,7 +385,6 @@ impl RedisStorage {
 		}
 
 		// Track index keys for this data key (for cleanup on delete)
-		let index_meta_key = self.index_meta_key(key);
 		let mut index_keys_for_meta: Vec<String> = Vec::new();
 
 		// Add to field-specific indexes

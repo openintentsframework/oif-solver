@@ -13,6 +13,8 @@
 pub mod implementations;
 pub mod monitor;
 pub mod storage;
+#[cfg(test)]
+mod test_support;
 pub mod threshold;
 pub mod types;
 
@@ -290,4 +292,482 @@ impl BridgeService {
 /// Returns all registered bridge implementations.
 pub fn get_all_implementations() -> Vec<(&'static str, BridgeFactory)> {
 	vec![("layerzero", implementations::layerzero::create_bridge)]
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::test_support::{bridge_request, pending_transfer, storage_service_from_mock};
+	use solver_storage::{MockStorageInterface, StorageError};
+	use std::sync::{Arc, Mutex};
+
+	#[derive(Default)]
+	struct TestBridge {
+		bridge_asset_result: Mutex<Option<Result<BridgeDepositResult, BridgeError>>>,
+		check_status_result: Mutex<Option<Result<BridgeTransferStatus, BridgeError>>>,
+		estimate_fee_result: Mutex<Option<Result<U256, BridgeError>>>,
+		events: Option<Arc<Mutex<Vec<&'static str>>>>,
+	}
+
+	impl TestBridge {
+		fn new() -> Self {
+			Self::default()
+		}
+	}
+
+	#[async_trait]
+	impl BridgeInterface for TestBridge {
+		fn supported_routes(&self) -> Vec<(u64, u64)> {
+			vec![(1, 747474)]
+		}
+
+		async fn bridge_asset(
+			&self,
+			_request: &BridgeRequest,
+		) -> Result<BridgeDepositResult, BridgeError> {
+			if let Some(events) = &self.events {
+				let mut events = events.lock().unwrap();
+				assert_eq!(events.as_slice(), ["save1"]);
+				events.push("bridge_asset");
+			}
+
+			self.bridge_asset_result
+				.lock()
+				.unwrap()
+				.take()
+				.expect("bridge_asset_result not configured")
+		}
+
+		async fn check_status(
+			&self,
+			_transfer: &PendingBridgeTransfer,
+		) -> Result<BridgeTransferStatus, BridgeError> {
+			self.check_status_result
+				.lock()
+				.unwrap()
+				.take()
+				.expect("check_status_result not configured")
+		}
+
+		async fn estimate_fee(&self, _request: &BridgeRequest) -> Result<U256, BridgeError> {
+			self.estimate_fee_result
+				.lock()
+				.unwrap()
+				.take()
+				.expect("estimate_fee_result not configured")
+		}
+	}
+
+	fn make_service(
+		bridge: Arc<dyn BridgeInterface>,
+		storage: MockStorageInterface,
+	) -> BridgeService {
+		let implementations = HashMap::from([("mock-bridge".to_string(), bridge)]);
+		BridgeService::new(
+			implementations,
+			storage_service_from_mock(storage),
+			"solver-a".to_string(),
+		)
+	}
+
+	fn bridge_metadata() -> types::TransferMetadata {
+		types::TransferMetadata {
+			dest_token_address: "0x3333333333333333333333333333333333333333".to_string(),
+			dest_oft_address: "0x4444444444444444444444444444444444444444".to_string(),
+			is_composer_flow: true,
+			vault_address: None,
+		}
+	}
+
+	fn configured_deposit_result() -> BridgeDepositResult {
+		BridgeDepositResult {
+			tx_hash: "0xabc123".to_string(),
+			message_guid: Some("guid-1".to_string()),
+			estimated_arrival: Some(1_700_000_100),
+		}
+	}
+
+	fn assert_intent_transfer(transfer: &PendingBridgeTransfer) {
+		assert!(matches!(transfer.status, BridgeTransferStatus::Submitted));
+		assert!(transfer.tx_hash.is_none());
+		assert!(transfer.message_guid.is_none());
+	}
+
+	fn assert_submitted_with_result(transfer: &PendingBridgeTransfer) {
+		assert!(matches!(transfer.status, BridgeTransferStatus::Submitted));
+		assert_eq!(transfer.tx_hash.as_deref(), Some("0xabc123"));
+		assert_eq!(transfer.message_guid.as_deref(), Some("guid-1"));
+	}
+
+	fn transfer_json(transfer: &PendingBridgeTransfer) -> Vec<u8> {
+		serde_json::to_vec(transfer).unwrap()
+	}
+
+	#[tokio::test]
+	async fn test_rebalance_token_persists_intent_before_bridge_asset() {
+		let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+		let first_saved = Arc::new(Mutex::new(None));
+		let second_saved = Arc::new(Mutex::new(None));
+		let request = bridge_request();
+		let mut storage = MockStorageInterface::new();
+		{
+			let events = events.clone();
+			let first_saved = first_saved.clone();
+			let second_saved = second_saved.clone();
+			storage
+				.expect_set_bytes()
+				.times(2)
+				.returning(move |_key, value, _indexes, _ttl| {
+					let events = events.clone();
+					let first_saved = first_saved.clone();
+					let second_saved = second_saved.clone();
+					Box::pin(async move {
+						let mut events = events.lock().unwrap();
+						let transfer: PendingBridgeTransfer =
+							serde_json::from_slice(&value).unwrap();
+						if events.is_empty() {
+							assert_intent_transfer(&transfer);
+							*first_saved.lock().unwrap() = Some(transfer);
+							events.push("save1");
+							Ok(())
+						} else {
+							assert_eq!(events.as_slice(), ["save1", "bridge_asset"]);
+							assert_eq!(
+								first_saved
+									.lock()
+									.unwrap()
+									.as_ref()
+									.expect("first save missing")
+									.id,
+								transfer.id
+							);
+							assert_submitted_with_result(&transfer);
+							*second_saved.lock().unwrap() = Some(transfer);
+							events.push("save2");
+							Ok(())
+						}
+					})
+				});
+		}
+
+		let bridge = Arc::new(TestBridge {
+			bridge_asset_result: Mutex::new(Some(Ok(configured_deposit_result()))),
+			check_status_result: Mutex::new(None),
+			estimate_fee_result: Mutex::new(None),
+			events: Some(events.clone()),
+		});
+		let bridge: Arc<dyn BridgeInterface> = bridge;
+		let service = make_service(bridge, storage);
+		let result = service
+			.rebalance_token(
+				"mock-bridge",
+				&request,
+				RebalanceTrigger::Auto,
+				bridge_metadata(),
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(result.tx_hash.as_deref(), Some("0xabc123"));
+		assert_eq!(result.message_guid.as_deref(), Some("guid-1"));
+		assert_eq!(
+			events.lock().unwrap().as_slice(),
+			["save1", "bridge_asset", "save2"]
+		);
+		assert_intent_transfer(first_saved.lock().unwrap().as_ref().unwrap());
+		assert_submitted_with_result(second_saved.lock().unwrap().as_ref().unwrap());
+	}
+
+	#[tokio::test]
+	async fn test_rebalance_token_returns_error_if_second_save_fails_but_first_intent_exists() {
+		let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+		let first_saved = Arc::new(Mutex::new(None));
+		let request = bridge_request();
+		let mut storage = MockStorageInterface::new();
+		{
+			let events = events.clone();
+			let first_saved = first_saved.clone();
+			storage
+				.expect_set_bytes()
+				.times(2)
+				.returning(move |_key, value, _indexes, _ttl| {
+					let events = events.clone();
+					let first_saved = first_saved.clone();
+					Box::pin(async move {
+						let mut events = events.lock().unwrap();
+						let transfer: PendingBridgeTransfer =
+							serde_json::from_slice(&value).unwrap();
+						if events.is_empty() {
+							assert_intent_transfer(&transfer);
+							*first_saved.lock().unwrap() = Some(transfer);
+							events.push("save1");
+							Ok(())
+						} else {
+							assert_eq!(events.as_slice(), ["save1", "bridge_asset"]);
+							assert_eq!(
+								first_saved
+									.lock()
+									.unwrap()
+									.as_ref()
+									.expect("first save missing")
+									.id,
+								transfer.id
+							);
+							assert_submitted_with_result(&transfer);
+							events.push("save2");
+							Err(StorageError::Backend("second save failed".to_string()))
+						}
+					})
+				});
+		}
+
+		let bridge = Arc::new(TestBridge {
+			bridge_asset_result: Mutex::new(Some(Ok(configured_deposit_result()))),
+			check_status_result: Mutex::new(None),
+			estimate_fee_result: Mutex::new(None),
+			events: Some(events.clone()),
+		});
+		let bridge: Arc<dyn BridgeInterface> = bridge;
+		let service = make_service(bridge, storage);
+		let result = service
+			.rebalance_token(
+				"mock-bridge",
+				&request,
+				RebalanceTrigger::Auto,
+				bridge_metadata(),
+			)
+			.await;
+
+		assert_eq!(
+			events.lock().unwrap().as_slice(),
+			["save1", "bridge_asset", "save2"]
+		);
+		assert!(
+			matches!(result, Err(BridgeError::Storage(msg)) if msg.contains("second save failed"))
+		);
+	}
+
+	#[tokio::test]
+	async fn test_get_transfer_maps_not_found_without_collapsing_other_storage_errors() {
+		let mut storage = MockStorageInterface::new();
+		storage.expect_get_bytes().times(2).returning(|key| {
+			let key = key.to_string();
+			if key.ends_with(":missing") {
+				Box::pin(async move { Err(StorageError::NotFound(key)) })
+			} else {
+				Box::pin(async move { Err(StorageError::Backend("boom".to_string())) })
+			}
+		});
+
+		let service = make_service(Arc::new(TestBridge::new()), storage);
+
+		let missing = service.get_transfer("missing").await.unwrap_err();
+		assert!(matches!(missing, BridgeError::TransferNotFound(id) if id == "missing"));
+
+		let backend = service.get_transfer("backend").await.unwrap_err();
+		assert!(
+			matches!(backend, BridgeError::Storage(msg) if msg.contains("Backend error: boom"))
+		);
+	}
+
+	#[tokio::test]
+	async fn test_resolve_transfer_mark_completed_transitions_to_completed() {
+		let transfer = pending_transfer(BridgeTransferStatus::NeedsIntervention(
+			"timeout".to_string(),
+		));
+		let saved = Arc::new(Mutex::new(None));
+		let mut storage = MockStorageInterface::new();
+		{
+			let expected_transfer = transfer.clone();
+			storage.expect_get_bytes().returning(move |_| {
+				let expected_transfer = expected_transfer.clone();
+				Box::pin(async move { Ok(transfer_json(&expected_transfer)) })
+			});
+		}
+		{
+			let saved = saved.clone();
+			storage
+				.expect_set_bytes()
+				.returning(move |_key, value, _indexes, _ttl| {
+					let transfer: PendingBridgeTransfer = serde_json::from_slice(&value).unwrap();
+					*saved.lock().unwrap() = Some(transfer);
+					Box::pin(async move { Ok(()) })
+				});
+		}
+
+		let service = make_service(Arc::new(TestBridge::new()), storage);
+		let resolved = service
+			.resolve_transfer(&transfer.id, "mark_completed", "done")
+			.await
+			.unwrap();
+
+		assert!(matches!(resolved.status, BridgeTransferStatus::Completed));
+		let saved = saved.lock().unwrap().clone().unwrap();
+		assert!(matches!(saved.status, BridgeTransferStatus::Completed));
+	}
+
+	#[tokio::test]
+	async fn test_resolve_transfer_mark_failed_transitions_to_failed() {
+		let transfer = pending_transfer(BridgeTransferStatus::NeedsIntervention(
+			"timeout".to_string(),
+		));
+		let saved = Arc::new(Mutex::new(None));
+		let mut storage = MockStorageInterface::new();
+		{
+			let expected_transfer = transfer.clone();
+			storage.expect_get_bytes().returning(move |_| {
+				let expected_transfer = expected_transfer.clone();
+				Box::pin(async move { Ok(transfer_json(&expected_transfer)) })
+			});
+		}
+		{
+			let saved = saved.clone();
+			storage
+				.expect_set_bytes()
+				.returning(move |_key, value, _indexes, _ttl| {
+					let transfer: PendingBridgeTransfer = serde_json::from_slice(&value).unwrap();
+					*saved.lock().unwrap() = Some(transfer);
+					Box::pin(async move { Ok(()) })
+				});
+		}
+
+		let service = make_service(Arc::new(TestBridge::new()), storage);
+		let resolved = service
+			.resolve_transfer(&transfer.id, "mark_failed", "done")
+			.await
+			.unwrap();
+
+		assert!(matches!(resolved.status, BridgeTransferStatus::Failed(_)));
+		let saved = saved.lock().unwrap().clone().unwrap();
+		assert!(matches!(saved.status, BridgeTransferStatus::Failed(_)));
+	}
+
+	#[tokio::test]
+	async fn test_resolve_transfer_retry_restores_status_before_intervention() {
+		let mut transfer = pending_transfer(BridgeTransferStatus::NeedsIntervention(
+			"timeout".to_string(),
+		));
+		transfer.status_before_intervention = Some(BridgeTransferStatus::Relaying);
+		transfer.failure_count = 3;
+		let saved = Arc::new(Mutex::new(None));
+		let mut storage = MockStorageInterface::new();
+		{
+			let expected_transfer = transfer.clone();
+			storage.expect_get_bytes().returning(move |_| {
+				let expected_transfer = expected_transfer.clone();
+				Box::pin(async move { Ok(transfer_json(&expected_transfer)) })
+			});
+		}
+		{
+			let saved = saved.clone();
+			storage
+				.expect_set_bytes()
+				.returning(move |_key, value, _indexes, _ttl| {
+					let transfer: PendingBridgeTransfer = serde_json::from_slice(&value).unwrap();
+					*saved.lock().unwrap() = Some(transfer);
+					Box::pin(async move { Ok(()) })
+				});
+		}
+
+		let service = make_service(Arc::new(TestBridge::new()), storage);
+		let resolved = service
+			.resolve_transfer(&transfer.id, "retry", "retrying")
+			.await
+			.unwrap();
+
+		assert!(matches!(resolved.status, BridgeTransferStatus::Relaying));
+		assert_eq!(resolved.failure_count, 0);
+		let saved = saved.lock().unwrap().clone().unwrap();
+		assert!(matches!(saved.status, BridgeTransferStatus::Relaying));
+		assert_eq!(saved.failure_count, 0);
+		assert!(saved.status_before_intervention.is_none());
+	}
+
+	#[tokio::test]
+	async fn test_resolve_transfer_retry_defaults_to_relaying_without_previous_status() {
+		let mut transfer = pending_transfer(BridgeTransferStatus::NeedsIntervention(
+			"timeout".to_string(),
+		));
+		transfer.status_before_intervention = None;
+		let saved = Arc::new(Mutex::new(None));
+		let mut storage = MockStorageInterface::new();
+		{
+			let expected_transfer = transfer.clone();
+			storage.expect_get_bytes().returning(move |_| {
+				let expected_transfer = expected_transfer.clone();
+				Box::pin(async move { Ok(transfer_json(&expected_transfer)) })
+			});
+		}
+		{
+			let saved = saved.clone();
+			storage
+				.expect_set_bytes()
+				.returning(move |_key, value, _indexes, _ttl| {
+					let transfer: PendingBridgeTransfer = serde_json::from_slice(&value).unwrap();
+					*saved.lock().unwrap() = Some(transfer);
+					Box::pin(async move { Ok(()) })
+				});
+		}
+
+		let service = make_service(Arc::new(TestBridge::new()), storage);
+		let resolved = service
+			.resolve_transfer(&transfer.id, "retry", "retrying")
+			.await
+			.unwrap();
+
+		assert!(matches!(resolved.status, BridgeTransferStatus::Relaying));
+		assert_eq!(resolved.failure_count, 0);
+		let saved = saved.lock().unwrap().clone().unwrap();
+		assert!(matches!(saved.status, BridgeTransferStatus::Relaying));
+	}
+
+	#[tokio::test]
+	async fn test_resolve_transfer_rejects_non_intervention_transfer() {
+		let transfer = pending_transfer(BridgeTransferStatus::Submitted);
+		let mut storage = MockStorageInterface::new();
+		{
+			let expected_transfer = transfer.clone();
+			storage.expect_get_bytes().returning(move |_| {
+				let expected_transfer = expected_transfer.clone();
+				Box::pin(async move { Ok(transfer_json(&expected_transfer)) })
+			});
+		}
+		storage.expect_set_bytes().times(0);
+
+		let service = make_service(Arc::new(TestBridge::new()), storage);
+		let err = service
+			.resolve_transfer(&transfer.id, "mark_completed", "nope")
+			.await
+			.unwrap_err();
+
+		assert!(
+			matches!(err, BridgeError::InvalidTransition(msg) if msg.contains("not NeedsIntervention"))
+		);
+	}
+
+	#[tokio::test]
+	async fn test_resolve_transfer_rejects_unknown_resolution_without_saving() {
+		let transfer = pending_transfer(BridgeTransferStatus::NeedsIntervention(
+			"timeout".to_string(),
+		));
+		let mut storage = MockStorageInterface::new();
+		{
+			let expected_transfer = transfer.clone();
+			storage.expect_get_bytes().returning(move |_| {
+				let expected_transfer = expected_transfer.clone();
+				Box::pin(async move { Ok(transfer_json(&expected_transfer)) })
+			});
+		}
+		storage.expect_set_bytes().times(0);
+
+		let service = make_service(Arc::new(TestBridge::new()), storage);
+		let err = service
+			.resolve_transfer(&transfer.id, "unknown_resolution", "noop")
+			.await
+			.unwrap_err();
+
+		assert!(
+			matches!(err, BridgeError::InvalidTransition(msg) if msg.contains("Unknown resolution"))
+		);
+	}
 }

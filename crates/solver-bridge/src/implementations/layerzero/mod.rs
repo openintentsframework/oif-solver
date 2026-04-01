@@ -403,3 +403,304 @@ fn parse_address(s: &str) -> Result<Address, BridgeError> {
 		.map_err(|_| BridgeError::Config(format!("Address must be 20 bytes: {s}")))?;
 	Ok(Address::from(arr))
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::test_support::bridge_request;
+	use alloy_primitives::{Address, U256};
+	use serde_json::json;
+	use solver_delivery::MockDeliveryInterface;
+	use solver_types::{Transaction, TransactionHash, TransactionReceipt};
+	use std::collections::HashMap;
+	use std::sync::{Arc, Mutex};
+
+	fn solver_address() -> Address {
+		Address::from([0xAA; 20])
+	}
+
+	fn zero_address() -> Address {
+		Address::ZERO
+	}
+
+	fn bridge_config(composer: Option<Address>) -> serde_json::Value {
+		let mut composer_addresses = serde_json::Map::new();
+		if let Some(addr) = composer {
+			composer_addresses.insert("1".to_string(), json!(format!("0x{}", hex::encode(addr.as_slice()))));
+		}
+
+		json!({
+			"endpoint_ids": {
+				"1": 100,
+				"747474": 200
+			},
+			"lz_receive_gas": 200000u128,
+			"composer_addresses": composer_addresses,
+			"vault_addresses": {}
+		})
+	}
+
+	fn bridge_with_two_chain_delivery(
+		mock: MockDeliveryInterface,
+		composer: Option<Address>,
+	) -> LayerZeroBridge {
+		let shared = Arc::new(mock);
+		LayerZeroBridge {
+			delivery: Arc::new(DeliveryService::new(
+				HashMap::from([
+					(1_u64, shared.clone() as Arc<dyn solver_delivery::DeliveryInterface>),
+					(
+						747474_u64,
+						shared.clone() as Arc<dyn solver_delivery::DeliveryInterface>,
+					),
+				]),
+				3,
+				300,
+			)),
+			config: serde_json::from_value(bridge_config(composer)).unwrap(),
+			solver_address: solver_address(),
+		}
+	}
+
+	fn tx_to(tx: &Transaction) -> Address {
+		tx.to
+			.as_ref()
+			.map(|addr| Address::from_slice(addr.0.as_slice()))
+			.expect("transaction should have a recipient")
+	}
+
+	fn decode_submit<T: alloy_sol_types::SolCall>(tx: &Transaction) -> T {
+		T::abi_decode(&tx.data).expect("failed to decode call data")
+	}
+
+	fn quote_fee_bytes(native_fee: U256) -> Vec<u8> {
+		contracts::quoteSendCall::abi_encode_returns(&contracts::MessagingFee {
+			nativeFee: native_fee,
+			lzTokenFee: U256::ZERO,
+		})
+	}
+
+	#[tokio::test]
+	async fn test_bridge_via_composer_approves_source_token_and_calls_deposit_and_send_on_composer() {
+		let request = bridge_request();
+		let composer = Address::from([0xCC; 20]);
+		let fee = U256::from(12345u64);
+		let submitted = Arc::new(Mutex::new(Vec::<Transaction>::new()));
+		let mut mock = MockDeliveryInterface::new();
+
+		{
+			let submitted = submitted.clone();
+			mock.expect_submit().times(2).returning(move |tx, _| {
+				let submitted = submitted.clone();
+				Box::pin(async move {
+					submitted.lock().unwrap().push(tx.clone());
+					Ok(TransactionHash(vec![0x11; 32]))
+				})
+			});
+		}
+
+		let expected_oft = request.source_oft;
+		mock.expect_eth_call().returning(move |tx| {
+			assert_eq!(
+				tx.to.as_ref().map(|addr| Address::from_slice(addr.0.as_slice())),
+				Some(expected_oft)
+			);
+			Box::pin(async move { Ok(alloy_primitives::Bytes::from(quote_fee_bytes(fee))) })
+		});
+
+		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
+		let result = bridge.bridge_asset(&request).await.unwrap();
+
+		assert_eq!(result.tx_hash, format!("0x{}", hex::encode(vec![0x11; 32])));
+		let submitted = submitted.lock().unwrap();
+		assert_eq!(submitted.len(), 2);
+
+		assert_eq!(tx_to(&submitted[0]), request.source_token);
+		let approve_call: contracts::approveCall = decode_submit(&submitted[0]);
+		assert_eq!(approve_call.spender, composer);
+		assert_eq!(approve_call.amount, request.amount);
+
+		assert_eq!(tx_to(&submitted[1]), composer);
+		let deposit_call: contracts::depositAndSendCall = decode_submit(&submitted[1]);
+		assert_eq!(deposit_call.refundAddress, solver_address());
+		assert_eq!(deposit_call.to, contracts::address_to_bytes32(solver_address()));
+		assert_eq!(deposit_call.dstEid, 200);
+		assert_eq!(deposit_call.fee.nativeFee, fee);
+	}
+
+	#[tokio::test]
+	async fn test_bridge_via_oft_send_approves_source_token_and_calls_send_on_source_oft() {
+		let request = bridge_request();
+		let fee = U256::from(12345u64);
+		let submitted = Arc::new(Mutex::new(Vec::<Transaction>::new()));
+		let mut mock = MockDeliveryInterface::new();
+
+		{
+			let submitted = submitted.clone();
+			mock.expect_submit().times(2).returning(move |tx, _| {
+				let submitted = submitted.clone();
+				Box::pin(async move {
+					submitted.lock().unwrap().push(tx.clone());
+					Ok(TransactionHash(vec![0x22; 32]))
+				})
+			});
+		}
+
+		let expected_oft = request.source_oft;
+		mock.expect_eth_call().returning(move |tx| {
+			assert_eq!(
+				tx.to.as_ref().map(|addr| Address::from_slice(addr.0.as_slice())),
+				Some(expected_oft)
+			);
+			Box::pin(async move { Ok(alloy_primitives::Bytes::from(quote_fee_bytes(fee))) })
+		});
+
+		let bridge = bridge_with_two_chain_delivery(mock, None);
+		let result = bridge.bridge_asset(&request).await.unwrap();
+
+		assert_eq!(result.tx_hash, format!("0x{}", hex::encode(vec![0x22; 32])));
+		let submitted = submitted.lock().unwrap();
+		assert_eq!(submitted.len(), 2);
+
+		assert_eq!(tx_to(&submitted[0]), request.source_token);
+		let approve_call: contracts::approveCall = decode_submit(&submitted[0]);
+		assert_eq!(approve_call.spender, request.source_oft);
+		assert_eq!(approve_call.amount, request.amount);
+
+		assert_eq!(tx_to(&submitted[1]), request.source_oft);
+		let send_call: contracts::sendCall = decode_submit(&submitted[1]);
+		assert_eq!(send_call.refundAddress, solver_address());
+		assert_eq!(send_call.sendParam.to, contracts::address_to_bytes32(solver_address()));
+		assert_eq!(send_call.sendParam.dstEid, 200);
+		assert_eq!(send_call.fee.nativeFee, fee);
+	}
+
+	#[tokio::test]
+	async fn test_check_status_submitted_becomes_relaying_on_successful_receipt() {
+		let transfer = crate::test_support::pending_transfer(BridgeTransferStatus::Submitted);
+		let mut transfer = transfer;
+		transfer.tx_hash = Some("0x01".to_string());
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_receipt().returning(|_, _| {
+			Box::pin(async move {
+				Ok(TransactionReceipt {
+					hash: TransactionHash(vec![0x01; 32]),
+					block_number: 42,
+					success: true,
+					logs: vec![],
+					block_timestamp: None,
+				})
+			})
+		});
+
+		let bridge = bridge_with_two_chain_delivery(mock, None);
+		let status = bridge.check_status(&transfer).await.unwrap();
+		assert!(matches!(status, BridgeTransferStatus::Relaying));
+	}
+
+	#[tokio::test]
+	async fn test_check_status_submitted_becomes_failed_on_reverted_receipt() {
+		let transfer = crate::test_support::pending_transfer(BridgeTransferStatus::Submitted);
+		let mut transfer = transfer;
+		transfer.tx_hash = Some("0x02".to_string());
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_receipt().returning(|_, _| {
+			Box::pin(async move {
+				Ok(TransactionReceipt {
+					hash: TransactionHash(vec![0x02; 32]),
+					block_number: 42,
+					success: false,
+					logs: vec![],
+					block_timestamp: None,
+				})
+			})
+		});
+
+		let bridge = bridge_with_two_chain_delivery(mock, None);
+		let status = bridge.check_status(&transfer).await.unwrap();
+		assert!(matches!(status, BridgeTransferStatus::Failed(reason) if reason == "Source transaction reverted"));
+	}
+
+	#[tokio::test]
+	async fn test_check_status_pending_redemption_becomes_completed_on_successful_redeem_receipt() {
+		let mut transfer = crate::test_support::pending_transfer(BridgeTransferStatus::PendingRedemption);
+		transfer.redeem_tx_hash = Some("0x03".to_string());
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_receipt().returning(|_, _| {
+			Box::pin(async move {
+				Ok(TransactionReceipt {
+					hash: TransactionHash(vec![0x03; 32]),
+					block_number: 43,
+					success: true,
+					logs: vec![],
+					block_timestamp: None,
+				})
+			})
+		});
+
+		let bridge = bridge_with_two_chain_delivery(mock, None);
+		let status = bridge.check_status(&transfer).await.unwrap();
+		assert!(matches!(status, BridgeTransferStatus::Completed));
+	}
+
+	#[tokio::test]
+	async fn test_check_status_pending_redemption_returns_failed_on_reverted_redeem_receipt() {
+		let mut transfer = crate::test_support::pending_transfer(BridgeTransferStatus::PendingRedemption);
+		transfer.redeem_tx_hash = Some("0x04".to_string());
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_receipt().returning(|_, _| {
+			Box::pin(async move {
+				Ok(TransactionReceipt {
+					hash: TransactionHash(vec![0x04; 32]),
+					block_number: 43,
+					success: false,
+					logs: vec![],
+					block_timestamp: None,
+				})
+			})
+		});
+
+		let bridge = bridge_with_two_chain_delivery(mock, None);
+		let status = bridge.check_status(&transfer).await.unwrap();
+		assert!(matches!(status, BridgeTransferStatus::Failed(reason) if reason == "Redeem transaction reverted"));
+	}
+
+	#[test]
+	fn test_create_bridge_rejects_zero_solver_address() {
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_submit().times(0);
+		mock.expect_get_receipt().times(0);
+		mock.expect_eth_call().times(0);
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(1_u64, Arc::new(mock) as Arc<dyn solver_delivery::DeliveryInterface>)]),
+			3,
+			300,
+		));
+
+		let result = create_bridge(&bridge_config(Some(Address::from([0xCC; 20]))), delivery, zero_address());
+		assert!(matches!(result, Err(BridgeError::Config(msg)) if msg.contains("zero solver address")));
+	}
+
+	#[tokio::test]
+	async fn test_estimate_fee_uses_the_same_directional_contract_as_bridge_asset() {
+		let request = bridge_request();
+		let fee = U256::from(777u64);
+		let call_target = Arc::new(Mutex::new(None));
+		let mut mock = MockDeliveryInterface::new();
+		{
+			let call_target = call_target.clone();
+			mock.expect_eth_call().returning(move |tx| {
+				*call_target.lock().unwrap() = Some(tx.clone());
+				Box::pin(async move { Ok(alloy_primitives::Bytes::from(quote_fee_bytes(fee))) })
+			});
+		}
+
+		let bridge = bridge_with_two_chain_delivery(mock, Some(Address::from([0xCC; 20])));
+		let quoted = bridge.estimate_fee(&request).await.unwrap();
+
+		assert_eq!(quoted, fee);
+		let tx = call_target.lock().unwrap().clone().expect("missing contract call");
+		assert_eq!(tx_to(&tx), request.source_oft);
+		assert_ne!(tx_to(&tx), request.source_token);
+	}
+}

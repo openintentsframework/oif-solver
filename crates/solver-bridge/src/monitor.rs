@@ -441,7 +441,7 @@ impl RebalanceMonitor {
 				.delivery
 				.get_balance(
 					pair.chain_a.chain_id,
-					&solver_address,
+					solver_address,
 					Some(&pair.chain_a.token_address),
 				)
 				.await;
@@ -449,7 +449,7 @@ impl RebalanceMonitor {
 				.delivery
 				.get_balance(
 					pair.chain_b.chain_id,
-					&solver_address,
+					solver_address,
 					Some(&pair.chain_b.token_address),
 				)
 				.await;
@@ -554,13 +554,13 @@ impl RebalanceMonitor {
 					.bridge_config
 					.as_ref()
 					.and_then(|bc| bc.get("composer_addresses"))
-					.and_then(|ca| ca.get(&source_side.chain_id.to_string()))
+					.and_then(|ca| ca.get(source_side.chain_id.to_string()))
 					.is_some();
 				let vault_addr = config
 					.bridge_config
 					.as_ref()
 					.and_then(|bc| bc.get("vault_addresses"))
-					.and_then(|va| va.get(&dest_side.chain_id.to_string()))
+					.and_then(|va| va.get(dest_side.chain_id.to_string()))
 					.and_then(|v| v.as_str())
 					.map(|s| s.to_string());
 
