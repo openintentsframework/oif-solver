@@ -475,24 +475,24 @@ pub async fn handle_trigger_rebalance(
 		.and_then(|bc| bc.get("composer_addresses"))
 		.and_then(|ca| ca.get(request.source_chain.to_string()))
 		.is_some();
-		let vault_addr = rebalance_config
-			.bridge_config
-			.as_ref()
-			.and_then(|bc| bc.get("vault_addresses"))
-			.and_then(|va| va.get(dest_side.chain_id.to_string()))
-			.and_then(|v| v.as_str())
-			.map(|s| s.to_string());
+	let vault_addr = rebalance_config
+		.bridge_config
+		.as_ref()
+		.and_then(|bc| bc.get("vault_addresses"))
+		.and_then(|va| va.get(dest_side.chain_id.to_string()))
+		.and_then(|v| v.as_str())
+		.map(|s| s.to_string());
 
-		if !is_composer && vault_addr.is_none() {
-			return Err(AdminAuthError::InvalidMessage(
-				"missing vault address for non-composer destination".to_string(),
-			));
-		}
+	if !is_composer && vault_addr.is_none() {
+		return Err(AdminAuthError::InvalidMessage(
+			"missing vault address for non-composer destination".to_string(),
+		));
+	}
 
-		let metadata = solver_bridge::types::TransferMetadata {
-			dest_token_address: dest_side.token_address.to_string(),
-			dest_oft_address: dest_side.oft_address.to_string(),
-			is_composer_flow: is_composer,
+	let metadata = solver_bridge::types::TransferMetadata {
+		dest_token_address: dest_side.token_address.to_string(),
+		dest_oft_address: dest_side.oft_address.to_string(),
+		is_composer_flow: is_composer,
 		vault_address: vault_addr,
 	};
 
@@ -1217,8 +1217,8 @@ mod tests {
 		);
 	}
 
-		#[tokio::test]
-		async fn test_handle_trigger_rebalance_populates_transfer_metadata_for_manual_path() {
+	#[tokio::test]
+	async fn test_handle_trigger_rebalance_populates_transfer_metadata_for_manual_path() {
 		let bridge_service = make_bridge_service(Arc::new(Mutex::new(Vec::new())));
 		let state = make_admin_state(
 			sample_operator_config(),
@@ -1260,54 +1260,50 @@ mod tests {
 			transfer.vault_address.as_deref(),
 			Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 		);
-			assert_eq!(transfer.is_composer_flow, Some(false));
-			assert_eq!(transfer.trigger, RebalanceTrigger::Manual);
-		}
+		assert_eq!(transfer.is_composer_flow, Some(false));
+		assert_eq!(transfer.trigger, RebalanceTrigger::Manual);
+	}
 
-		#[tokio::test]
-		async fn test_handle_trigger_rebalance_rejects_non_composer_route_without_vault() {
-			let mut operator_config = sample_operator_config();
-			operator_config
-				.rebalance
-				.as_mut()
-				.unwrap()
-				.bridge_config = Some(serde_json::json!({
-					"composer_addresses": {},
-					"vault_addresses": {}
-				}));
-			let bridge_service = make_bridge_service(Arc::new(Mutex::new(Vec::new())));
-			let state = make_admin_state(
-				operator_config,
-				create_delivery_service(|_, _, _| Ok("0".to_string())),
-				Some(bridge_service),
-			)
-			.await;
+	#[tokio::test]
+	async fn test_handle_trigger_rebalance_rejects_non_composer_route_without_vault() {
+		let mut operator_config = sample_operator_config();
+		operator_config.rebalance.as_mut().unwrap().bridge_config = Some(serde_json::json!({
+			"composer_addresses": {},
+			"vault_addresses": {}
+		}));
+		let bridge_service = make_bridge_service(Arc::new(Mutex::new(Vec::new())));
+		let state = make_admin_state(
+			operator_config,
+			create_delivery_service(|_, _, _| Ok("0".to_string())),
+			Some(bridge_service),
+		)
+		.await;
 
-			let result = handle_trigger_rebalance(
-				axum::extract::State(state),
-				crate::apis::admin::VerifiedAdmin {
-					admin: solver_types::Address::from(alloy_address(SOLVER_ADDRESS)),
-					contents: TriggerRebalanceContents {
-						pair_id: "eth-katana".to_string(),
-						source_chain: 747474,
-						dest_chain: 1,
-						amount: "12345".to_string(),
-						nonce: 1,
-						deadline: 2,
-					},
+		let result = handle_trigger_rebalance(
+			axum::extract::State(state),
+			crate::apis::admin::VerifiedAdmin {
+				admin: solver_types::Address::from(alloy_address(SOLVER_ADDRESS)),
+				contents: TriggerRebalanceContents {
+					pair_id: "eth-katana".to_string(),
+					source_chain: 747474,
+					dest_chain: 1,
+					amount: "12345".to_string(),
+					nonce: 1,
+					deadline: 2,
 				},
-			)
-			.await;
+			},
+		)
+		.await;
 
-			assert!(matches!(
-				result,
-				Err(AdminAuthError::InvalidMessage(msg))
-					if msg == "missing vault address for non-composer destination"
-			));
-		}
+		assert!(matches!(
+			result,
+			Err(AdminAuthError::InvalidMessage(msg))
+				if msg == "missing vault address for non-composer destination"
+		));
+	}
 
-		#[tokio::test]
-		async fn test_handle_resolve_transfer_propagates_success_response() {
+	#[tokio::test]
+	async fn test_handle_resolve_transfer_propagates_success_response() {
 		let bridge_service = make_bridge_service(Arc::new(Mutex::new(Vec::new())));
 		let mut transfer = solver_bridge::types::PendingBridgeTransfer::new(
 			"eth-katana".to_string(),

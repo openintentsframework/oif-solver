@@ -109,25 +109,25 @@ pub fn analyze_pair(
 		let a_headroom = balance_a.saturating_sub(side_a.lower_bound);
 		let amount = side_b.deficit.min(max_bridge_amount).min(a_headroom);
 		(Some(RebalanceDirection::AToB), amount)
-		} else if balance_a > side_a.upper_bound {
-			// Side A has surplus — bridge from A to B, but never overfund B past its upper bound
-			let receiver_headroom = side_b.upper_bound.saturating_sub(balance_b);
-			let amount = side_a.surplus.min(max_bridge_amount).min(receiver_headroom);
-			if amount.is_zero() {
-				(None, U256::ZERO)
-			} else {
-				(Some(RebalanceDirection::AToB), amount)
-			}
-		} else if balance_b > side_b.upper_bound {
-			// Side B has surplus — bridge from B to A, but never overfund A past its upper bound
-			let receiver_headroom = side_a.upper_bound.saturating_sub(balance_a);
-			let amount = side_b.surplus.min(max_bridge_amount).min(receiver_headroom);
-			if amount.is_zero() {
-				(None, U256::ZERO)
-			} else {
-				(Some(RebalanceDirection::BToA), amount)
-			}
+	} else if balance_a > side_a.upper_bound {
+		// Side A has surplus — bridge from A to B, but never overfund B past its upper bound
+		let receiver_headroom = side_b.upper_bound.saturating_sub(balance_b);
+		let amount = side_a.surplus.min(max_bridge_amount).min(receiver_headroom);
+		if amount.is_zero() {
+			(None, U256::ZERO)
 		} else {
+			(Some(RebalanceDirection::AToB), amount)
+		}
+	} else if balance_b > side_b.upper_bound {
+		// Side B has surplus — bridge from B to A, but never overfund A past its upper bound
+		let receiver_headroom = side_a.upper_bound.saturating_sub(balance_a);
+		let amount = side_b.surplus.min(max_bridge_amount).min(receiver_headroom);
+		if amount.is_zero() {
+			(None, U256::ZERO)
+		} else {
+			(Some(RebalanceDirection::BToA), amount)
+		}
+	} else {
 		// Both within band
 		(None, U256::ZERO)
 	};
@@ -260,45 +260,45 @@ mod tests {
 		assert_eq!(analysis.suggested_amount, U256::from(200u64));
 	}
 
-		#[test]
-		fn test_analyze_pair_surplus_triggers_rebalance() {
-			let analysis = analyze_pair(
-				U256::from(1500u64), // A above upper (1200)
-				U256::from(1000u64), // B within band
+	#[test]
+	fn test_analyze_pair_surplus_triggers_rebalance() {
+		let analysis = analyze_pair(
+			U256::from(1500u64), // A above upper (1200)
+			U256::from(1000u64), // B within band
 			U256::from(1000u64),
 			U256::from(1000u64),
 			2000,
 			U256::from(10000u64),
 		);
-			assert_eq!(analysis.direction_needed, Some(RebalanceDirection::AToB));
-			assert_eq!(analysis.suggested_amount, U256::from(200u64)); // capped by B headroom to upper bound
-		}
-
-		#[test]
-		fn test_analyze_pair_surplus_does_not_rebalance_when_both_sides_above_upper_bound() {
-			let analysis = analyze_pair(
-				U256::from(1300u64),
-				U256::from(1250u64),
-				U256::from(1000u64),
-				U256::from(1000u64),
-				2000,
-				U256::from(500u64),
-			);
-			assert_eq!(analysis.direction_needed, None);
-			assert_eq!(analysis.suggested_amount, U256::ZERO);
-		}
-
-		#[test]
-		fn test_analyze_pair_surplus_caps_by_receiver_headroom() {
-			let analysis = analyze_pair(
-				U256::from(1500u64),
-				U256::from(1150u64),
-				U256::from(1000u64),
-				U256::from(1000u64),
-				2000,
-				U256::from(500u64),
-			);
-			assert_eq!(analysis.direction_needed, Some(RebalanceDirection::AToB));
-			assert_eq!(analysis.suggested_amount, U256::from(50u64));
-		}
+		assert_eq!(analysis.direction_needed, Some(RebalanceDirection::AToB));
+		assert_eq!(analysis.suggested_amount, U256::from(200u64)); // capped by B headroom to upper bound
 	}
+
+	#[test]
+	fn test_analyze_pair_surplus_does_not_rebalance_when_both_sides_above_upper_bound() {
+		let analysis = analyze_pair(
+			U256::from(1300u64),
+			U256::from(1250u64),
+			U256::from(1000u64),
+			U256::from(1000u64),
+			2000,
+			U256::from(500u64),
+		);
+		assert_eq!(analysis.direction_needed, None);
+		assert_eq!(analysis.suggested_amount, U256::ZERO);
+	}
+
+	#[test]
+	fn test_analyze_pair_surplus_caps_by_receiver_headroom() {
+		let analysis = analyze_pair(
+			U256::from(1500u64),
+			U256::from(1150u64),
+			U256::from(1000u64),
+			U256::from(1000u64),
+			2000,
+			U256::from(500u64),
+		);
+		assert_eq!(analysis.direction_needed, Some(RebalanceDirection::AToB));
+		assert_eq!(analysis.suggested_amount, U256::from(50u64));
+	}
+}

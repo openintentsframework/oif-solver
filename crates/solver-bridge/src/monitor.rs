@@ -589,27 +589,27 @@ impl RebalanceMonitor {
 					.and_then(|bc| bc.get("composer_addresses"))
 					.and_then(|ca| ca.get(source_side.chain_id.to_string()))
 					.is_some();
-					let vault_addr = config
-						.bridge_config
-						.as_ref()
-						.and_then(|bc| bc.get("vault_addresses"))
-						.and_then(|va| va.get(dest_side.chain_id.to_string()))
-						.and_then(|v| v.as_str())
-						.map(|s| s.to_string());
+				let vault_addr = config
+					.bridge_config
+					.as_ref()
+					.and_then(|bc| bc.get("vault_addresses"))
+					.and_then(|va| va.get(dest_side.chain_id.to_string()))
+					.and_then(|v| v.as_str())
+					.map(|s| s.to_string());
 
-					if !is_composer && vault_addr.is_none() {
-						tracing::warn!(
-							pair = %pair.pair_id,
-							dest_chain = dest_side.chain_id,
-							"Skipping auto-rebalance: missing vault address for non-composer flow"
-						);
-						continue;
-					}
+				if !is_composer && vault_addr.is_none() {
+					tracing::warn!(
+						pair = %pair.pair_id,
+						dest_chain = dest_side.chain_id,
+						"Skipping auto-rebalance: missing vault address for non-composer flow"
+					);
+					continue;
+				}
 
-					let metadata = crate::types::TransferMetadata {
-						dest_token_address: dest_side.token_address.clone(),
-						dest_oft_address: dest_side.oft_address.clone(),
-						is_composer_flow: is_composer,
+				let metadata = crate::types::TransferMetadata {
+					dest_token_address: dest_side.token_address.clone(),
+					dest_oft_address: dest_side.oft_address.clone(),
+					is_composer_flow: is_composer,
 					vault_address: vault_addr,
 				};
 
@@ -1094,7 +1094,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-		async fn test_check_thresholds_builds_direction_aware_request_and_uses_solver_address() {
+	async fn test_check_thresholds_builds_direction_aware_request_and_uses_solver_address() {
 		let storage = make_storage();
 		let recorded = Arc::new(Mutex::new(Vec::new()));
 		let bridge = Arc::new(StubBridge {
@@ -1126,17 +1126,17 @@ mod tests {
 		}));
 		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance.clone());
 
-			monitor
-				.check_thresholds_and_trigger(&rebalance)
-				.await
-				.unwrap();
+		monitor
+			.check_thresholds_and_trigger(&rebalance)
+			.await
+			.unwrap();
 
-			let requests = {
-				let requests = recorded.lock().unwrap();
-				requests.clone()
-			};
-			assert_eq!(requests.len(), 1);
-			let request = &requests[0];
+		let requests = {
+			let requests = recorded.lock().unwrap();
+			requests.clone()
+		};
+		assert_eq!(requests.len(), 1);
+		let request = &requests[0];
 		assert_eq!(request.source_chain, 747474);
 		assert_eq!(request.dest_chain, 1);
 		assert_eq!(request.source_token, Address::from([0x33; 20]));
@@ -1157,59 +1157,59 @@ mod tests {
 			Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 		);
 		assert_eq!(active[0].is_composer_flow, Some(false));
-			assert!(bridge_service
-				.is_cooldown_active("eth-katana")
-				.await
-				.unwrap());
-		}
-
-		#[tokio::test]
-		async fn test_check_thresholds_skips_non_composer_route_without_vault() {
-			let storage = make_storage();
-			let recorded = Arc::new(Mutex::new(Vec::new()));
-			let bridge = Arc::new(StubBridge {
-				recorded_requests: recorded.clone(),
-				..Default::default()
-			}) as Arc<dyn BridgeInterface>;
-
-			let solver_address = SOLVER_ADDRESS.to_string();
-			let mut mock = MockDeliveryInterface::new();
-			mock.expect_get_balance()
-				.times(2)
-				.returning(move |address, token, chain_id| {
-					assert_eq!(address, solver_address);
-					match (chain_id, token) {
-						(1, Some("0x1111111111111111111111111111111111111111")) => {
-							Box::pin(async move { Ok("500000".to_string()) })
-						},
-						(747474, Some("0x3333333333333333333333333333333333333333")) => {
-							Box::pin(async move { Ok("1500000".to_string()) })
-						},
-						other => panic!("unexpected balance query: {other:?}"),
-					}
-				});
-			let delivery = make_delivery(mock);
-			let rebalance = rebalance_config();
-			let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance.clone());
-
-			monitor
-				.check_thresholds_and_trigger(&rebalance)
-				.await
-				.unwrap();
-
-			let requests = {
-				let requests = recorded.lock().unwrap();
-				requests.clone()
-			};
-			assert!(requests.is_empty());
-			assert!(bridge_service
-				.get_active_transfers()
-				.await
-				.unwrap()
-				.is_empty());
-			assert!(!bridge_service
-				.is_cooldown_active("eth-katana")
-				.await
-				.unwrap());
-		}
+		assert!(bridge_service
+			.is_cooldown_active("eth-katana")
+			.await
+			.unwrap());
 	}
+
+	#[tokio::test]
+	async fn test_check_thresholds_skips_non_composer_route_without_vault() {
+		let storage = make_storage();
+		let recorded = Arc::new(Mutex::new(Vec::new()));
+		let bridge = Arc::new(StubBridge {
+			recorded_requests: recorded.clone(),
+			..Default::default()
+		}) as Arc<dyn BridgeInterface>;
+
+		let solver_address = SOLVER_ADDRESS.to_string();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_balance()
+			.times(2)
+			.returning(move |address, token, chain_id| {
+				assert_eq!(address, solver_address);
+				match (chain_id, token) {
+					(1, Some("0x1111111111111111111111111111111111111111")) => {
+						Box::pin(async move { Ok("500000".to_string()) })
+					},
+					(747474, Some("0x3333333333333333333333333333333333333333")) => {
+						Box::pin(async move { Ok("1500000".to_string()) })
+					},
+					other => panic!("unexpected balance query: {other:?}"),
+				}
+			});
+		let delivery = make_delivery(mock);
+		let rebalance = rebalance_config();
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance.clone());
+
+		monitor
+			.check_thresholds_and_trigger(&rebalance)
+			.await
+			.unwrap();
+
+		let requests = {
+			let requests = recorded.lock().unwrap();
+			requests.clone()
+		};
+		assert!(requests.is_empty());
+		assert!(bridge_service
+			.get_active_transfers()
+			.await
+			.unwrap()
+			.is_empty());
+		assert!(!bridge_service
+			.is_cooldown_active("eth-katana")
+			.await
+			.unwrap());
+	}
+}

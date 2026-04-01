@@ -158,49 +158,49 @@ impl BridgeService {
 		);
 		// Populate metadata for delivery detection and redeem path
 		transfer.dest_token_address = Some(metadata.dest_token_address);
-			transfer.dest_oft_address = Some(metadata.dest_oft_address);
-			transfer.is_composer_flow = Some(metadata.is_composer_flow);
-			transfer.vault_address = metadata.vault_address;
-			self.storage.save_transfer(&transfer).await?;
+		transfer.dest_oft_address = Some(metadata.dest_oft_address);
+		transfer.is_composer_flow = Some(metadata.is_composer_flow);
+		transfer.vault_address = metadata.vault_address;
+		self.storage.save_transfer(&transfer).await?;
 
-			// Execute the bridge transfer
-			let result = match bridge.bridge_asset(request).await {
-				Ok(result) => result,
-				Err(err) => {
-					transfer.transition_to(BridgeTransferStatus::Failed(err.to_string()));
-					if let Err(save_err) = self.storage.save_transfer(&transfer).await {
-						tracing::warn!(
-							transfer_id = %transfer.id,
-							error = %save_err,
-							"Failed to persist failed bridge transfer after bridge_asset error"
-						);
-					}
-					return Err(err);
-				},
-			};
-
-			// Update the record with the tx hash and message GUID
-			transfer.tx_hash = Some(result.tx_hash);
-			transfer.message_guid = result.message_guid;
-			transfer.updated_at = std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.unwrap_or_default()
-				.as_secs();
-			if let Err(save_err) = self.storage.save_transfer(&transfer).await {
-				let reason = format!("post-submit persistence failed: {save_err}");
-				transfer.transition_to(BridgeTransferStatus::NeedsIntervention(reason));
-				if let Err(repair_err) = self.storage.save_transfer(&transfer).await {
+		// Execute the bridge transfer
+		let result = match bridge.bridge_asset(request).await {
+			Ok(result) => result,
+			Err(err) => {
+				transfer.transition_to(BridgeTransferStatus::Failed(err.to_string()));
+				if let Err(save_err) = self.storage.save_transfer(&transfer).await {
 					tracing::warn!(
 						transfer_id = %transfer.id,
-						error = %repair_err,
-						"Failed to persist NeedsIntervention bridge transfer after save failure"
+						error = %save_err,
+						"Failed to persist failed bridge transfer after bridge_asset error"
 					);
 				}
-				return Err(BridgeError::Storage(save_err.to_string()));
-			}
+				return Err(err);
+			},
+		};
 
-			Ok(transfer)
+		// Update the record with the tx hash and message GUID
+		transfer.tx_hash = Some(result.tx_hash);
+		transfer.message_guid = result.message_guid;
+		transfer.updated_at = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_secs();
+		if let Err(save_err) = self.storage.save_transfer(&transfer).await {
+			let reason = format!("post-submit persistence failed: {save_err}");
+			transfer.transition_to(BridgeTransferStatus::NeedsIntervention(reason));
+			if let Err(repair_err) = self.storage.save_transfer(&transfer).await {
+				tracing::warn!(
+					transfer_id = %transfer.id,
+					error = %repair_err,
+					"Failed to persist NeedsIntervention bridge transfer after save failure"
+				);
+			}
+			return Err(BridgeError::Storage(save_err.to_string()));
 		}
+
+		Ok(transfer)
+	}
 
 	/// Get all active (non-terminal) transfers.
 	pub async fn get_active_transfers(&self) -> Result<Vec<PendingBridgeTransfer>, BridgeError> {
@@ -417,23 +417,23 @@ mod tests {
 		assert!(transfer.message_guid.is_none());
 	}
 
-		fn assert_submitted_with_result(transfer: &PendingBridgeTransfer) {
-			assert!(matches!(transfer.status, BridgeTransferStatus::Submitted));
-			assert_eq!(transfer.tx_hash.as_deref(), Some("0xabc123"));
-			assert_eq!(transfer.message_guid.as_deref(), Some("guid-1"));
-		}
+	fn assert_submitted_with_result(transfer: &PendingBridgeTransfer) {
+		assert!(matches!(transfer.status, BridgeTransferStatus::Submitted));
+		assert_eq!(transfer.tx_hash.as_deref(), Some("0xabc123"));
+		assert_eq!(transfer.message_guid.as_deref(), Some("guid-1"));
+	}
 
-		fn assert_failed_transfer(transfer: &PendingBridgeTransfer, reason_substring: &str) {
-			assert!(
-				matches!(&transfer.status, BridgeTransferStatus::Failed(reason) if reason.contains(reason_substring))
-			);
-			assert!(transfer.tx_hash.is_none());
-			assert!(transfer.message_guid.is_none());
-		}
+	fn assert_failed_transfer(transfer: &PendingBridgeTransfer, reason_substring: &str) {
+		assert!(
+			matches!(&transfer.status, BridgeTransferStatus::Failed(reason) if reason.contains(reason_substring))
+		);
+		assert!(transfer.tx_hash.is_none());
+		assert!(transfer.message_guid.is_none());
+	}
 
-		fn transfer_json(transfer: &PendingBridgeTransfer) -> Vec<u8> {
-			serde_json::to_vec(transfer).unwrap()
-		}
+	fn transfer_json(transfer: &PendingBridgeTransfer) -> Vec<u8> {
+		serde_json::to_vec(transfer).unwrap()
+	}
 
 	#[tokio::test]
 	async fn test_rebalance_token_persists_intent_before_bridge_asset() {
@@ -510,138 +510,138 @@ mod tests {
 		assert_submitted_with_result(second_saved.lock().unwrap().as_ref().unwrap());
 	}
 
-		#[tokio::test]
-		async fn test_rebalance_token_persists_failed_state_when_bridge_asset_fails() {
-			let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
-			let first_saved = Arc::new(Mutex::new(None));
-			let failed_saved = Arc::new(Mutex::new(None));
-			let request = bridge_request();
-			let mut storage = MockStorageInterface::new();
-			{
-				let events = events.clone();
-				let first_saved = first_saved.clone();
-				let failed_saved = failed_saved.clone();
-				storage
-					.expect_set_bytes()
-					.times(2)
-					.returning(move |_key, value, _indexes, _ttl| {
-						let events = events.clone();
-						let first_saved = first_saved.clone();
-						let failed_saved = failed_saved.clone();
-						Box::pin(async move {
-							let mut events = events.lock().unwrap();
-							let transfer: PendingBridgeTransfer =
-								serde_json::from_slice(&value).unwrap();
-							if events.is_empty() {
-								assert_intent_transfer(&transfer);
-								*first_saved.lock().unwrap() = Some(transfer);
-								events.push("save1");
-								Ok(())
-							} else {
-								assert_eq!(events.as_slice(), ["save1", "bridge_asset"]);
-								assert_failed_transfer(&transfer, "bridge send failed");
-								*failed_saved.lock().unwrap() = Some(transfer);
-								events.push("save2");
-								Ok(())
-							}
-						})
-					});
-			}
-
-			let bridge = Arc::new(TestBridge {
-				bridge_asset_result: Mutex::new(Some(Err(BridgeError::TransactionFailed(
-					"bridge send failed".to_string(),
-				)))),
-				check_status_result: Mutex::new(None),
-				estimate_fee_result: Mutex::new(None),
-				events: Some(events.clone()),
-			});
-			let bridge: Arc<dyn BridgeInterface> = bridge;
-			let service = make_service(bridge, storage);
-			let result = service
-				.rebalance_token(
-					"mock-bridge",
-					&request,
-					RebalanceTrigger::Auto,
-					bridge_metadata(),
-				)
-				.await;
-
-			assert_eq!(
-				events.lock().unwrap().as_slice(),
-				["save1", "bridge_asset", "save2"]
-			);
-			assert!(matches!(
-				result,
-				Err(BridgeError::TransactionFailed(msg)) if msg.contains("bridge send failed")
-			));
-			assert_intent_transfer(first_saved.lock().unwrap().as_ref().unwrap());
-			assert_failed_transfer(
-				failed_saved.lock().unwrap().as_ref().unwrap(),
-				"bridge send failed",
-			);
+	#[tokio::test]
+	async fn test_rebalance_token_persists_failed_state_when_bridge_asset_fails() {
+		let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+		let first_saved = Arc::new(Mutex::new(None));
+		let failed_saved = Arc::new(Mutex::new(None));
+		let request = bridge_request();
+		let mut storage = MockStorageInterface::new();
+		{
+			let events = events.clone();
+			let first_saved = first_saved.clone();
+			let failed_saved = failed_saved.clone();
+			storage
+				.expect_set_bytes()
+				.times(2)
+				.returning(move |_key, value, _indexes, _ttl| {
+					let events = events.clone();
+					let first_saved = first_saved.clone();
+					let failed_saved = failed_saved.clone();
+					Box::pin(async move {
+						let mut events = events.lock().unwrap();
+						let transfer: PendingBridgeTransfer =
+							serde_json::from_slice(&value).unwrap();
+						if events.is_empty() {
+							assert_intent_transfer(&transfer);
+							*first_saved.lock().unwrap() = Some(transfer);
+							events.push("save1");
+							Ok(())
+						} else {
+							assert_eq!(events.as_slice(), ["save1", "bridge_asset"]);
+							assert_failed_transfer(&transfer, "bridge send failed");
+							*failed_saved.lock().unwrap() = Some(transfer);
+							events.push("save2");
+							Ok(())
+						}
+					})
+				});
 		}
 
-		#[tokio::test]
-		async fn test_rebalance_token_persists_intervention_state_when_second_save_fails() {
-			let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
-			let first_saved = Arc::new(Mutex::new(None));
-			let repaired_saved = Arc::new(Mutex::new(None));
-			let request = bridge_request();
-			let mut storage = MockStorageInterface::new();
-			{
-				let events = events.clone();
-				let first_saved = first_saved.clone();
-				let repaired_saved = repaired_saved.clone();
-				storage
-					.expect_set_bytes()
-					.times(3)
-					.returning(move |_key, value, _indexes, _ttl| {
-						let events = events.clone();
-						let first_saved = first_saved.clone();
-						let repaired_saved = repaired_saved.clone();
-						Box::pin(async move {
-							let mut events = events.lock().unwrap();
-							let transfer: PendingBridgeTransfer =
-								serde_json::from_slice(&value).unwrap();
-							if events.is_empty() {
-								assert_intent_transfer(&transfer);
-								*first_saved.lock().unwrap() = Some(transfer);
-								events.push("save1");
-								Ok(())
-							} else if events.as_slice() == ["save1", "bridge_asset"] {
-								assert_eq!(
-									first_saved
-										.lock()
-										.unwrap()
-										.as_ref()
-										.expect("first save missing")
-										.id,
-									transfer.id
-								);
-								assert_submitted_with_result(&transfer);
-								events.push("save2");
-								Err(StorageError::Backend("second save failed".to_string()))
-							} else {
-								assert_eq!(events.as_slice(), ["save1", "bridge_asset", "save2"]);
-								assert!(matches!(
-									&transfer.status,
-									BridgeTransferStatus::NeedsIntervention(reason)
-										if reason.contains("post-submit persistence failed")
-								));
-								assert_eq!(transfer.tx_hash.as_deref(), Some("0xabc123"));
-								assert_eq!(transfer.message_guid.as_deref(), Some("guid-1"));
-								assert_eq!(
-									transfer.status_before_intervention,
-									Some(BridgeTransferStatus::Submitted)
-								);
-								*repaired_saved.lock().unwrap() = Some(transfer);
-								events.push("save3");
-								Ok(())
-							}
-						})
-					});
-			}
+		let bridge = Arc::new(TestBridge {
+			bridge_asset_result: Mutex::new(Some(Err(BridgeError::TransactionFailed(
+				"bridge send failed".to_string(),
+			)))),
+			check_status_result: Mutex::new(None),
+			estimate_fee_result: Mutex::new(None),
+			events: Some(events.clone()),
+		});
+		let bridge: Arc<dyn BridgeInterface> = bridge;
+		let service = make_service(bridge, storage);
+		let result = service
+			.rebalance_token(
+				"mock-bridge",
+				&request,
+				RebalanceTrigger::Auto,
+				bridge_metadata(),
+			)
+			.await;
+
+		assert_eq!(
+			events.lock().unwrap().as_slice(),
+			["save1", "bridge_asset", "save2"]
+		);
+		assert!(matches!(
+			result,
+			Err(BridgeError::TransactionFailed(msg)) if msg.contains("bridge send failed")
+		));
+		assert_intent_transfer(first_saved.lock().unwrap().as_ref().unwrap());
+		assert_failed_transfer(
+			failed_saved.lock().unwrap().as_ref().unwrap(),
+			"bridge send failed",
+		);
+	}
+
+	#[tokio::test]
+	async fn test_rebalance_token_persists_intervention_state_when_second_save_fails() {
+		let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+		let first_saved = Arc::new(Mutex::new(None));
+		let repaired_saved = Arc::new(Mutex::new(None));
+		let request = bridge_request();
+		let mut storage = MockStorageInterface::new();
+		{
+			let events = events.clone();
+			let first_saved = first_saved.clone();
+			let repaired_saved = repaired_saved.clone();
+			storage
+				.expect_set_bytes()
+				.times(3)
+				.returning(move |_key, value, _indexes, _ttl| {
+					let events = events.clone();
+					let first_saved = first_saved.clone();
+					let repaired_saved = repaired_saved.clone();
+					Box::pin(async move {
+						let mut events = events.lock().unwrap();
+						let transfer: PendingBridgeTransfer =
+							serde_json::from_slice(&value).unwrap();
+						if events.is_empty() {
+							assert_intent_transfer(&transfer);
+							*first_saved.lock().unwrap() = Some(transfer);
+							events.push("save1");
+							Ok(())
+						} else if events.as_slice() == ["save1", "bridge_asset"] {
+							assert_eq!(
+								first_saved
+									.lock()
+									.unwrap()
+									.as_ref()
+									.expect("first save missing")
+									.id,
+								transfer.id
+							);
+							assert_submitted_with_result(&transfer);
+							events.push("save2");
+							Err(StorageError::Backend("second save failed".to_string()))
+						} else {
+							assert_eq!(events.as_slice(), ["save1", "bridge_asset", "save2"]);
+							assert!(matches!(
+								&transfer.status,
+								BridgeTransferStatus::NeedsIntervention(reason)
+									if reason.contains("post-submit persistence failed")
+							));
+							assert_eq!(transfer.tx_hash.as_deref(), Some("0xabc123"));
+							assert_eq!(transfer.message_guid.as_deref(), Some("guid-1"));
+							assert_eq!(
+								transfer.status_before_intervention,
+								Some(BridgeTransferStatus::Submitted)
+							);
+							*repaired_saved.lock().unwrap() = Some(transfer);
+							events.push("save3");
+							Ok(())
+						}
+					})
+				});
+		}
 
 		let bridge = Arc::new(TestBridge {
 			bridge_asset_result: Mutex::new(Some(Ok(configured_deposit_result()))),
@@ -660,23 +660,23 @@ mod tests {
 			)
 			.await;
 
-			assert_eq!(
-				events.lock().unwrap().as_slice(),
-				["save1", "bridge_asset", "save2", "save3"]
-			);
-			assert!(
-				matches!(result, Err(BridgeError::Storage(msg)) if msg.contains("second save failed"))
-			);
-			assert_intent_transfer(first_saved.lock().unwrap().as_ref().unwrap());
-			let repaired = repaired_saved.lock().unwrap().clone().unwrap();
-			assert!(matches!(
-				repaired.status,
-				BridgeTransferStatus::NeedsIntervention(ref reason)
-					if reason.contains("post-submit persistence failed")
-			));
-			assert_eq!(repaired.tx_hash.as_deref(), Some("0xabc123"));
-			assert_eq!(repaired.message_guid.as_deref(), Some("guid-1"));
-		}
+		assert_eq!(
+			events.lock().unwrap().as_slice(),
+			["save1", "bridge_asset", "save2", "save3"]
+		);
+		assert!(
+			matches!(result, Err(BridgeError::Storage(msg)) if msg.contains("second save failed"))
+		);
+		assert_intent_transfer(first_saved.lock().unwrap().as_ref().unwrap());
+		let repaired = repaired_saved.lock().unwrap().clone().unwrap();
+		assert!(matches!(
+			repaired.status,
+			BridgeTransferStatus::NeedsIntervention(ref reason)
+				if reason.contains("post-submit persistence failed")
+		));
+		assert_eq!(repaired.tx_hash.as_deref(), Some("0xabc123"));
+		assert_eq!(repaired.message_guid.as_deref(), Some("guid-1"));
+	}
 
 	#[tokio::test]
 	async fn test_get_transfer_maps_not_found_without_collapsing_other_storage_errors() {
