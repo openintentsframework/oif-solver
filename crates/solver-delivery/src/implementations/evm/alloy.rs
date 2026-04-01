@@ -513,7 +513,7 @@ impl DeliveryInterface for AlloyDelivery {
 		}
 
 		// Apply topic filters for precise event matching
-		for (i, topic) in filter.topics.iter().enumerate() {
+		for (i, topic) in filter.topics().iter().enumerate() {
 			if let Some(t) = topic {
 				let topic_hash = alloy_primitives::FixedBytes::<32>::from(t.0);
 				match i {

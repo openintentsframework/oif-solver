@@ -268,18 +268,18 @@ impl RebalanceMonitor {
 							.copy_from_slice(&solver_bytes[..solver_bytes.len().min(32)]);
 					}
 
-					let filter = solver_types::LogFilter {
-						address: solver_types::Address(addr_bytes),
-						from_block: transfer
+					let filter = solver_types::LogFilter::new(
+						solver_types::Address(addr_bytes),
+						transfer
 							.last_scanned_dest_block
 							.unwrap_or(transfer.dest_scan_from_block.unwrap()),
-						to_block: None,
-						topics: vec![
+						None,
+						vec![
 							Some(solver_types::H256(transfer_sig)),
 							None,                                   // topic1: from (any)
 							Some(solver_types::H256(solver_topic)), // topic2: to = solver
 						],
-					};
+					);
 
 					match self.delivery.get_logs(transfer.dest_chain, filter).await {
 						Ok(logs) => {
@@ -296,9 +296,14 @@ impl RebalanceMonitor {
 								value >= min_expected && value <= max_expected
 							});
 
-							if matched.is_some() {
+							if let Some(matched_log) = matched {
+								// Store actual received shares from the Transfer event
+								let received = U256::from_be_slice(&matched_log.data[..32]);
+								transfer.received_shares = Some(received.to_string());
+
 								tracing::info!(
 									transfer_id = %transfer.id,
+									received_shares = %received,
 									"Delivery detected on destination chain"
 								);
 								let new_status = if transfer.is_composer_flow == Some(true) {
@@ -343,10 +348,29 @@ impl RebalanceMonitor {
 						},
 					};
 
-					// Build redeem calldata: redeem(shares, receiver=solver, owner=solver)
-					// Use the transfer amount as shares (for MVP, 1:1 with bridged amount)
-					let shares = U256::from_str_radix(&transfer.amount, 10).unwrap_or(U256::ZERO);
-					if !shares.is_zero() {
+					// Use the actual received shares from the Transfer event, not the bridged amount.
+					// After slippage/fees, the received shares may differ from transfer.amount.
+					let shares = match &transfer.received_shares {
+						Some(s) => match U256::from_str_radix(s, 10) {
+							Ok(v) if !v.is_zero() => v,
+							Ok(_) => {
+								tracing::warn!(transfer_id = %transfer.id, "Received shares is zero");
+								continue;
+							},
+							Err(e) => {
+								tracing::warn!(transfer_id = %transfer.id, "Invalid received_shares: {e}");
+								continue;
+							},
+						},
+						None => {
+							tracing::debug!(
+								transfer_id = %transfer.id,
+								"No received_shares yet, waiting for delivery scan"
+							);
+							continue;
+						},
+					};
+					{
 						use alloy_sol_types::SolCall;
 						let redeem_data =
 							crate::implementations::layerzero::contracts::redeemCall {
@@ -367,6 +391,15 @@ impl RebalanceMonitor {
 							max_fee_per_gas: None,
 							max_priority_fee_per_gas: None,
 						};
+
+						// Acquire semaphore just before submitting — don't hold it during
+						// the preceding calldata building.
+						let _permit =
+							self.transaction_semaphore.acquire().await.map_err(|e| {
+								crate::BridgeError::TransactionFailed(format!(
+									"Failed to acquire semaphore for redeem: {e}"
+								))
+							})?;
 
 						match self.delivery.deliver(redeem_tx, None).await {
 							Ok(tx_hash) => {

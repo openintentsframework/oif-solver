@@ -238,9 +238,17 @@ mod tests {
 		storage.save_transfer(&failed).await.unwrap();
 		storage.save_transfer(&active).await.unwrap();
 
-		assert!(file_expires_at(&base_path, &storage_key(&storage.namespace(), "completed-1")) > 0);
+		assert!(
+			file_expires_at(
+				&base_path,
+				&storage_key(&storage.namespace(), "completed-1")
+			) > 0
+		);
 		assert!(file_expires_at(&base_path, &storage_key(&storage.namespace(), "failed-1")) > 0);
-		assert_eq!(file_expires_at(&base_path, &storage_key(&storage.namespace(), "active-1")), 0);
+		assert_eq!(
+			file_expires_at(&base_path, &storage_key(&storage.namespace(), "active-1")),
+			0
+		);
 	}
 
 	#[tokio::test]
@@ -265,10 +273,9 @@ mod tests {
 		assert!(transfers
 			.iter()
 			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::Submitted)));
-		assert!(transfers.iter().any(|transfer| matches!(
-			transfer.status,
-			BridgeTransferStatus::NeedsIntervention(_)
-		)));
+		assert!(transfers
+			.iter()
+			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::NeedsIntervention(_))));
 	}
 
 	#[tokio::test]
@@ -297,15 +304,15 @@ mod tests {
 			.unwrap();
 
 		assert_eq!(transfers.len(), 2);
-		assert!(transfers.iter().all(|transfer| transfer.pair_id == "eth-katana"));
-		assert!(transfers.iter().any(|transfer| matches!(
-			transfer.status,
-			BridgeTransferStatus::Submitted
-		)));
-		assert!(transfers.iter().any(|transfer| matches!(
-			transfer.status,
-			BridgeTransferStatus::NeedsIntervention(_)
-		)));
+		assert!(transfers
+			.iter()
+			.all(|transfer| transfer.pair_id == "eth-katana"));
+		assert!(transfers
+			.iter()
+			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::Submitted)));
+		assert!(transfers
+			.iter()
+			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::NeedsIntervention(_))));
 	}
 
 	#[tokio::test]
@@ -349,7 +356,10 @@ mod tests {
 			.unwrap();
 		assert_eq!(relaying.len(), 1);
 		assert_eq!(relaying[0].0, "lifecycle-1");
-		assert!(matches!(relaying[0].1.status, BridgeTransferStatus::Relaying));
+		assert!(matches!(
+			relaying[0].1.status,
+			BridgeTransferStatus::Relaying
+		));
 		assert_eq!(
 			file_expires_at(
 				&base_path,
@@ -371,16 +381,21 @@ mod tests {
 			.unwrap();
 		assert_eq!(completed.len(), 1);
 		assert_eq!(completed[0].0, "lifecycle-1");
-		assert!(matches!(completed[0].1.status, BridgeTransferStatus::Completed));
+		assert!(matches!(
+			completed[0].1.status,
+			BridgeTransferStatus::Completed
+		));
 		assert!(storage.get_active_transfers().await.unwrap().is_empty());
 
 		let history = storage.get_transfer_history(10).await.unwrap();
 		assert_eq!(history.len(), 1);
 		assert!(matches!(history[0].status, BridgeTransferStatus::Completed));
-		assert!(file_expires_at(
-			&base_path,
-			&storage_key(&storage.namespace(), "lifecycle-1")
-		) > 0);
+		assert!(
+			file_expires_at(
+				&base_path,
+				&storage_key(&storage.namespace(), "lifecycle-1")
+			) > 0
+		);
 	}
 
 	#[tokio::test]
@@ -407,9 +422,7 @@ mod tests {
 			history.iter().map(|t| t.updated_at).collect::<Vec<_>>(),
 			vec![30, 20, 10]
 		);
-		assert!(history
-			.iter()
-			.all(|transfer| transfer.status.is_terminal()));
+		assert!(history.iter().all(|transfer| transfer.status.is_terminal()));
 	}
 
 	#[tokio::test]

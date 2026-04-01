@@ -381,20 +381,16 @@ pub async fn start_server(
 
 		admin_protected_routes = admin_protected_routes.nest("/rebalance", rebalance_routes);
 
-		// Only apply JWT auth to protected admin routes if orders_require_auth is true
-		// (i.e., auth.enabled in config). Admin routes also have their own
-		// EIP-712 signature auth for admin actions.
-		if orders_require_auth {
-			if let Some(jwt) = &jwt_service {
-				admin_protected_routes =
-					admin_protected_routes.layer(middleware::from_fn_with_state(
-						AuthState {
-							jwt_service: jwt.clone(),
-							required_scope: solver_types::AuthScope::AdminAll,
-						},
-						auth_middleware,
-					));
-			}
+		// Admin routes always require JWT authentication, regardless of order auth settings.
+		if let Some(jwt) = &jwt_service {
+			admin_protected_routes =
+				admin_protected_routes.layer(middleware::from_fn_with_state(
+					AuthState {
+						jwt_service: jwt.clone(),
+						required_scope: solver_types::AuthScope::AdminAll,
+					},
+					auth_middleware,
+				));
 		}
 
 		let admin_routes = admin_protected_routes.with_state(admin_state);

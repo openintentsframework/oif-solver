@@ -78,7 +78,10 @@ pub fn rebalance_config() -> RebalanceConfig {
 }
 
 pub fn delivery_service_from_mock(mock: MockDeliveryInterface) -> Arc<DeliveryService> {
-	let implementations = HashMap::from([(1_u64, Arc::new(mock) as Arc<dyn solver_delivery::DeliveryInterface>)]);
+	let implementations = HashMap::from([(
+		1_u64,
+		Arc::new(mock) as Arc<dyn solver_delivery::DeliveryInterface>,
+	)]);
 	Arc::new(DeliveryService::new(implementations, 3, 300))
 }
 

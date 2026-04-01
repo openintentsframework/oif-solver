@@ -52,7 +52,9 @@ pub fn evaluate_threshold(
 	target_balance: U256,
 	deviation_band_bps: u32,
 ) -> ThresholdResult {
-	let band = U256::from(deviation_band_bps);
+	// Clamp band to [0, 10000] to prevent U256 underflow on (base - band)
+	let clamped_bps = deviation_band_bps.min(BPS_BASE as u32);
+	let band = U256::from(clamped_bps);
 	let base = U256::from(BPS_BASE);
 
 	let lower_bound = target_balance * (base - band) / base;
@@ -98,11 +100,14 @@ pub fn analyze_pair(
 		(None, U256::ZERO)
 	} else if balance_a < side_a.lower_bound && balance_b > side_b.lower_bound {
 		// Side A needs funds — bridge from B to A
-		let amount = side_a.deficit.min(max_bridge_amount);
+		// Cap by what B can donate without going below its own lower bound
+		let b_headroom = balance_b.saturating_sub(side_b.lower_bound);
+		let amount = side_a.deficit.min(max_bridge_amount).min(b_headroom);
 		(Some(RebalanceDirection::BToA), amount)
 	} else if balance_b < side_b.lower_bound && balance_a > side_a.lower_bound {
 		// Side B needs funds — bridge from A to B
-		let amount = side_b.deficit.min(max_bridge_amount);
+		let a_headroom = balance_a.saturating_sub(side_a.lower_bound);
+		let amount = side_b.deficit.min(max_bridge_amount).min(a_headroom);
 		(Some(RebalanceDirection::AToB), amount)
 	} else if balance_a > side_a.upper_bound {
 		// Side A has surplus — bridge from A to B
@@ -188,21 +193,23 @@ mod tests {
 			U256::from(10000u64),
 		);
 		assert_eq!(analysis.direction_needed, Some(RebalanceDirection::BToA));
-		assert_eq!(analysis.suggested_amount, U256::from(500u64)); // deficit
+		// deficit=500, B headroom=1000-800=200 → capped at 200
+		assert_eq!(analysis.suggested_amount, U256::from(200u64));
 	}
 
 	#[test]
 	fn test_analyze_pair_respects_max_bridge_amount() {
+		// B has lots of headroom (2000, lower=800, headroom=1200), max=150 is the binding constraint
 		let analysis = analyze_pair(
 			U256::from(500u64),
-			U256::from(1000u64),
+			U256::from(2000u64),
 			U256::from(1000u64),
 			U256::from(1000u64),
 			2000,
-			U256::from(200u64), // max = 200
+			U256::from(150u64), // max = 150
 		);
 		assert_eq!(analysis.direction_needed, Some(RebalanceDirection::BToA));
-		assert_eq!(analysis.suggested_amount, U256::from(200u64)); // capped
+		assert_eq!(analysis.suggested_amount, U256::from(150u64)); // capped by max
 	}
 
 	#[test]
@@ -217,6 +224,30 @@ mod tests {
 		);
 		assert!(analysis.both_sides_low);
 		assert_eq!(analysis.direction_needed, None);
+	}
+
+	#[test]
+	fn test_evaluate_threshold_clamps_excessive_bps() {
+		let result = evaluate_threshold(U256::from(1000u64), U256::from(1000u64), 15000);
+		// deviation_band_bps = 15000 (>100%) should be clamped to 10000
+		assert_eq!(result.lower_bound, U256::ZERO);
+		assert_eq!(result.upper_bound, U256::from(2000u64));
+	}
+
+	#[test]
+	fn test_analyze_pair_caps_by_donor_headroom() {
+		// A needs 500 (deficit), B has 1000 with lower bound 800 → B can donate 200
+		let analysis = analyze_pair(
+			U256::from(500u64),
+			U256::from(1000u64),
+			U256::from(1000u64),
+			U256::from(1000u64),
+			2000,
+			U256::from(10000u64),
+		);
+		assert_eq!(analysis.direction_needed, Some(RebalanceDirection::BToA));
+		// B headroom = 1000 - 800 = 200; deficit = 500; min(500, 10000, 200) = 200
+		assert_eq!(analysis.suggested_amount, U256::from(200u64));
 	}
 
 	#[test]

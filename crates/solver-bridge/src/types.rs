@@ -79,7 +79,28 @@ pub enum BridgeTransferStatus {
 	NeedsIntervention(String),
 }
 
+impl std::fmt::Display for BridgeTransferStatus {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Submitted => write!(f, "submitted"),
+			Self::Relaying => write!(f, "relaying"),
+			Self::PendingRedemption => write!(f, "pending_redemption"),
+			Self::Completed => write!(f, "completed"),
+			Self::Failed(_) => write!(f, "failed"),
+			Self::NeedsIntervention(_) => write!(f, "needs_intervention"),
+		}
+	}
+}
+
 impl BridgeTransferStatus {
+	/// Returns the reason string for statuses that carry one.
+	pub fn reason(&self) -> Option<&str> {
+		match self {
+			Self::Failed(r) | Self::NeedsIntervention(r) => Some(r),
+			_ => None,
+		}
+	}
+
 	/// Whether this status is terminal (no further transitions expected).
 	pub fn is_terminal(&self) -> bool {
 		matches!(self, Self::Completed | Self::Failed(_))
@@ -98,6 +119,15 @@ pub enum RebalanceTrigger {
 	Auto,
 	/// Triggered by admin API manual trigger.
 	Manual,
+}
+
+impl std::fmt::Display for RebalanceTrigger {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Auto => write!(f, "auto"),
+			Self::Manual => write!(f, "manual"),
+		}
+	}
 }
 
 /// Persistent transfer record stored in Redis.
@@ -156,6 +186,9 @@ pub struct PendingBridgeTransfer {
 	pub is_composer_flow: Option<bool>,
 	/// Vault address on destination chain (for ERC-4626 redeem, Katana→ETH only).
 	pub vault_address: Option<String>,
+	/// Actual shares received on destination (decoded from Transfer event).
+	/// Used for vault redeem — may differ from `amount` due to slippage/fees.
+	pub received_shares: Option<String>,
 }
 
 impl PendingBridgeTransfer {
@@ -200,6 +233,7 @@ impl PendingBridgeTransfer {
 			dest_oft_address: None,
 			is_composer_flow: None,
 			vault_address: None,
+			received_shares: None,
 		}
 	}
 
@@ -290,7 +324,11 @@ mod tests {
 			(BridgeTransferStatus::Relaying, false, true),
 			(BridgeTransferStatus::PendingRedemption, false, true),
 			(BridgeTransferStatus::Completed, true, false),
-			(BridgeTransferStatus::Failed("boom".to_string()), true, false),
+			(
+				BridgeTransferStatus::Failed("boom".to_string()),
+				true,
+				false,
+			),
 			(
 				BridgeTransferStatus::NeedsIntervention("pause".to_string()),
 				false,

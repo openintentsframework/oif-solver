@@ -90,6 +90,8 @@ pub struct BridgeOperationResponse {
 	pub destination_chain_id: u64,
 	pub amount: String,
 	pub status: String,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub status_reason: Option<String>,
 	pub trigger: String,
 	pub created_at: u64,
 	pub updated_at: u64,
@@ -194,7 +196,10 @@ pub async fn handle_get_rebalance_status(
 	State(state): State<AdminApiState>,
 ) -> Result<Json<RebalanceStatusResponse>, axum::http::StatusCode> {
 	let active_transfers = if let Some(bridge_service) = &state.bridge_service {
-		bridge_service.active_transfer_count().await.unwrap_or(0)
+		bridge_service
+			.active_transfer_count()
+			.await
+			.map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
 	} else {
 		0
 	};
@@ -225,14 +230,41 @@ pub async fn handle_get_rebalance_status(
 
 				match (balance_a_result, balance_b_result) {
 					(Ok(bal_a_str), Ok(bal_b_str)) => {
-						let bal_a = U256::from_str_radix(&bal_a_str, 10).unwrap_or(U256::ZERO);
-						let bal_b = U256::from_str_radix(&bal_b_str, 10).unwrap_or(U256::ZERO);
-						let target_a =
-							U256::from_str_radix(&pair.target_balance_a, 10).unwrap_or(U256::ZERO);
-						let target_b =
-							U256::from_str_radix(&pair.target_balance_b, 10).unwrap_or(U256::ZERO);
-						let max_amount =
-							U256::from_str_radix(&pair.max_bridge_amount, 10).unwrap_or(U256::MAX);
+						let bal_a = match U256::from_str_radix(&bal_a_str, 10) {
+							Ok(v) => v,
+							Err(e) => {
+								pair_statuses.push(error_pair_status(pair, format!("Failed to parse balance_a: {e}")));
+								continue;
+							}
+						};
+						let bal_b = match U256::from_str_radix(&bal_b_str, 10) {
+							Ok(v) => v,
+							Err(e) => {
+								pair_statuses.push(error_pair_status(pair, format!("Failed to parse balance_b: {e}")));
+								continue;
+							}
+						};
+						let target_a = match U256::from_str_radix(&pair.target_balance_a, 10) {
+							Ok(v) => v,
+							Err(e) => {
+								pair_statuses.push(error_pair_status(pair, format!("Failed to parse target_balance_a: {e}")));
+								continue;
+							}
+						};
+						let target_b = match U256::from_str_radix(&pair.target_balance_b, 10) {
+							Ok(v) => v,
+							Err(e) => {
+								pair_statuses.push(error_pair_status(pair, format!("Failed to parse target_balance_b: {e}")));
+								continue;
+							}
+						};
+						let max_amount = match U256::from_str_radix(&pair.max_bridge_amount, 10) {
+							Ok(v) => v,
+							Err(e) => {
+								pair_statuses.push(error_pair_status(pair, format!("Failed to parse max_bridge_amount: {e}")));
+								continue;
+							}
+						};
 
 						let analysis = analyze_pair(
 							bal_a,
@@ -250,16 +282,25 @@ pub async fn handle_get_rebalance_status(
 							});
 
 						let cooldown_active = if let Some(bs) = &state.bridge_service {
-							bs.is_cooldown_active(&pair.pair_id).await.unwrap_or(false)
+							match bs.is_cooldown_active(&pair.pair_id).await {
+								Ok(v) => v,
+								Err(e) => {
+									pair_statuses.push(error_pair_status(pair, format!("Cooldown check failed: {e}")));
+									continue;
+								}
+							}
 						} else {
 							false
 						};
 
 						let active_transfer_id = if let Some(bs) = &state.bridge_service {
-							bs.get_active_transfers_for_pair(&pair.pair_id)
-								.await
-								.ok()
-								.and_then(|t| t.first().map(|t| t.id.clone()))
+							match bs.get_active_transfers_for_pair(&pair.pair_id).await {
+								Ok(transfers) => transfers.first().map(|t| t.id.clone()),
+								Err(e) => {
+									pair_statuses.push(error_pair_status(pair, format!("Active transfer query failed: {e}")));
+									continue;
+								}
+							}
 						} else {
 							None
 						};
@@ -291,31 +332,7 @@ pub async fn handle_get_rebalance_status(
 						});
 					},
 					(Err(e), _) | (_, Err(e)) => {
-						pair_statuses.push(PairRebalanceStatus {
-							pair_id: pair.pair_id.clone(),
-							chain_a: PairSideStatus {
-								chain_id: pair.chain_a.chain_id,
-								current_balance: "0".to_string(),
-								target_balance: pair.target_balance_a.clone(),
-								lower_bound: "0".to_string(),
-								upper_bound: "0".to_string(),
-								within_band: false,
-							},
-							chain_b: PairSideStatus {
-								chain_id: pair.chain_b.chain_id,
-								current_balance: "0".to_string(),
-								target_balance: pair.target_balance_b.clone(),
-								lower_bound: "0".to_string(),
-								upper_bound: "0".to_string(),
-								within_band: false,
-							},
-							deviation_band_bps: pair.deviation_band_bps,
-							direction_needed: None,
-							suggested_amount: "0".to_string(),
-							cooldown_active: false,
-							active_transfer_id: None,
-							error: Some(format!("Balance query failed: {e}")),
-						});
+						pair_statuses.push(error_pair_status(pair, format!("Balance query failed: {e}")));
 					},
 				}
 			}
@@ -342,11 +359,11 @@ pub async fn handle_get_rebalance_transfers(
 	let active = bridge_service
 		.get_active_transfers()
 		.await
-		.unwrap_or_default();
+		.map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 	let history = bridge_service
 		.get_transfer_history(50)
 		.await
-		.unwrap_or_default();
+		.map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
 	Ok(Json(RebalanceTransfersResponse {
 		active: active.iter().map(to_operation_response).collect(),
@@ -391,6 +408,10 @@ pub async fn handle_trigger_rebalance(
 		return Err(axum::http::StatusCode::BAD_REQUEST);
 	};
 
+	if request.dest_chain != dest_side.chain_id {
+		return Err(axum::http::StatusCode::BAD_REQUEST);
+	}
+
 	let amount = U256::from_str_radix(&request.amount, 10)
 		.map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
 
@@ -412,13 +433,13 @@ pub async fn handle_trigger_rebalance(
 		.bridge_config
 		.as_ref()
 		.and_then(|bc| bc.get("composer_addresses"))
-		.and_then(|ca| ca.get(&request.source_chain.to_string()))
+		.and_then(|ca| ca.get(request.source_chain.to_string()))
 		.is_some();
 	let vault_addr = rebalance_config
 		.bridge_config
 		.as_ref()
 		.and_then(|bc| bc.get("vault_addresses"))
-		.and_then(|va| va.get(&request.dest_chain.to_string()))
+		.and_then(|va| va.get(request.dest_chain.to_string()))
 		.and_then(|v| v.as_str())
 		.map(|s| s.to_string());
 
@@ -472,7 +493,7 @@ pub async fn handle_resolve_transfer(
 			success: true,
 			message: format!("Transfer resolved: {}", request.resolution),
 			transfer_id: transfer.id,
-			new_status: format!("{:?}", transfer.status),
+			new_status: transfer.status.to_string(),
 		})),
 		Err(e) => Ok(Json(ResolveTransferResponse {
 			success: false,
@@ -483,6 +504,34 @@ pub async fn handle_resolve_transfer(
 	}
 }
 
+fn error_pair_status(pair: &solver_types::OperatorRebalancePairConfig, error_msg: String) -> PairRebalanceStatus {
+	PairRebalanceStatus {
+		pair_id: pair.pair_id.clone(),
+		chain_a: PairSideStatus {
+			chain_id: pair.chain_a.chain_id,
+			current_balance: "0".to_string(),
+			target_balance: pair.target_balance_a.clone(),
+			lower_bound: "0".to_string(),
+			upper_bound: "0".to_string(),
+			within_band: false,
+		},
+		chain_b: PairSideStatus {
+			chain_id: pair.chain_b.chain_id,
+			current_balance: "0".to_string(),
+			target_balance: pair.target_balance_b.clone(),
+			lower_bound: "0".to_string(),
+			upper_bound: "0".to_string(),
+			within_band: false,
+		},
+		deviation_band_bps: pair.deviation_band_bps,
+		direction_needed: None,
+		suggested_amount: "0".to_string(),
+		cooldown_active: false,
+		active_transfer_id: None,
+		error: Some(error_msg),
+	}
+}
+
 fn to_operation_response(t: &PendingBridgeTransfer) -> BridgeOperationResponse {
 	BridgeOperationResponse {
 		id: t.id.clone(),
@@ -490,8 +539,9 @@ fn to_operation_response(t: &PendingBridgeTransfer) -> BridgeOperationResponse {
 		source_chain_id: t.source_chain,
 		destination_chain_id: t.dest_chain,
 		amount: t.amount.clone(),
-		status: format!("{:?}", t.status),
-		trigger: format!("{:?}", t.trigger),
+		status: t.status.to_string(),
+		status_reason: t.status.reason().map(String::from),
+		trigger: t.trigger.to_string(),
 		created_at: t.created_at,
 		updated_at: t.updated_at,
 		tx_hash: t.tx_hash.clone(),
