@@ -2070,8 +2070,7 @@ mod tests {
 			deadline: 1706184000,
 		};
 		let trigger_json = serde_json::to_string(&trigger).unwrap();
-		let parsed_trigger: TriggerRebalanceContents =
-			serde_json::from_str(&trigger_json).unwrap();
+		let parsed_trigger: TriggerRebalanceContents = serde_json::from_str(&trigger_json).unwrap();
 		assert_eq!(parsed_trigger.pair_id, "eth-katana");
 		assert_eq!(parsed_trigger.source_chain, 1);
 		assert_eq!(parsed_trigger.dest_chain, 747474);
@@ -2084,8 +2083,7 @@ mod tests {
 			deadline: 1706184000,
 		};
 		let resolve_json = serde_json::to_string(&resolve).unwrap();
-		let parsed_resolve: ResolveTransferContents =
-			serde_json::from_str(&resolve_json).unwrap();
+		let parsed_resolve: ResolveTransferContents = serde_json::from_str(&resolve_json).unwrap();
 		assert_eq!(parsed_resolve.transfer_id, "transfer-1");
 		assert_eq!(parsed_resolve.resolution, "retry");
 		assert_eq!(parsed_resolve.reason, "operator requested retry");

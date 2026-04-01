@@ -407,20 +407,20 @@ pub async fn handle_trigger_rebalance(
 		contents: request,
 	}: VerifiedAdmin<TriggerRebalanceContents>,
 ) -> Result<Json<TriggerRebalanceResponse>, AdminAuthError> {
-	let bridge_service = state
-		.bridge_service
-		.as_ref()
-		.ok_or_else(|| {
-			AdminAuthError::InvalidMessage("Bridge service not available".to_string())
+	let bridge_service = state.bridge_service.as_ref().ok_or_else(|| {
+		AdminAuthError::InvalidMessage("Bridge service not available".to_string())
+	})?;
+
+	let versioned = state
+		.config_store
+		.get()
+		.await
+		.map_err(|e| AdminAuthError::InvalidMessage(format!("Config store error: {e}")))?;
+
+	let rebalance_config =
+		versioned.data.rebalance.as_ref().ok_or_else(|| {
+			AdminAuthError::InvalidMessage("Rebalance not configured".to_string())
 		})?;
-
-	let versioned = state.config_store.get().await.map_err(|e| {
-		AdminAuthError::InvalidMessage(format!("Config store error: {e}"))
-	})?;
-
-	let rebalance_config = versioned.data.rebalance.as_ref().ok_or_else(|| {
-		AdminAuthError::InvalidMessage("Rebalance not configured".to_string())
-	})?;
 
 	let pair = rebalance_config
 		.pairs
@@ -450,9 +450,10 @@ pub async fn handle_trigger_rebalance(
 	let amount = U256::from_str_radix(&request.amount, 10).map_err(|_| {
 		AdminAuthError::InvalidMessage(format!("Invalid amount: {}", request.amount))
 	})?;
-	let recipient: alloy_primitives::Address = state.solver_address.parse().map_err(|e| {
-		AdminAuthError::InvalidMessage(format!("Invalid solver address: {e}"))
-	})?;
+	let recipient: alloy_primitives::Address = state
+		.solver_address
+		.parse()
+		.map_err(|e| AdminAuthError::InvalidMessage(format!("Invalid solver address: {e}")))?;
 
 	let bridge_request = solver_bridge::types::BridgeRequest {
 		pair_id: request.pair_id.clone(),
@@ -562,9 +563,11 @@ pub async fn handle_update_rebalance_config(
 ) -> Result<Json<solver_types::admin_api::AdminActionResponse>, AdminAuthError> {
 	use crate::config_merge::build_runtime_config;
 
-	let versioned = state.config_store.get().await.map_err(|e| {
-		AdminAuthError::Internal(format!("Config store error: {e}"))
-	})?;
+	let versioned = state
+		.config_store
+		.get()
+		.await
+		.map_err(|e| AdminAuthError::Internal(format!("Config store error: {e}")))?;
 
 	let mut operator_config = versioned.data;
 
@@ -620,15 +623,18 @@ pub async fn handle_update_rebalance_threshold(
 ) -> Result<Json<solver_types::admin_api::AdminActionResponse>, AdminAuthError> {
 	use crate::config_merge::build_runtime_config;
 
-	let versioned = state.config_store.get().await.map_err(|e| {
-		AdminAuthError::Internal(format!("Config store error: {e}"))
-	})?;
+	let versioned = state
+		.config_store
+		.get()
+		.await
+		.map_err(|e| AdminAuthError::Internal(format!("Config store error: {e}")))?;
 
 	let mut operator_config = versioned.data;
 
-	let rebalance = operator_config.rebalance.as_mut().ok_or_else(|| {
-		AdminAuthError::InvalidMessage("Rebalance not configured".to_string())
-	})?;
+	let rebalance = operator_config
+		.rebalance
+		.as_mut()
+		.ok_or_else(|| AdminAuthError::InvalidMessage("Rebalance not configured".to_string()))?;
 
 	let pair = rebalance
 		.pairs
@@ -744,15 +750,14 @@ mod tests {
 	use solver_storage::implementations::file::{FileStorage, TtlConfig};
 	use solver_storage::{
 		config_store::create_config_store, config_store::ConfigStore,
-		nonce_store::create_nonce_store, StoreConfig, StorageService,
+		nonce_store::create_nonce_store, StorageService, StoreConfig,
 	};
 	use solver_types::{
 		AdminConfig, NetworkType, NetworksConfig, OperatorAdminConfig, OperatorConfig,
 		OperatorGasConfig, OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorNetworkConfig,
 		OperatorOracleConfig, OperatorPricingConfig, OperatorRebalanceConfig,
 		OperatorRebalancePairConfig, OperatorRpcEndpoint, OperatorSettlementConfig,
-		OperatorSettlementType, OperatorSolverConfig, OperatorWithdrawalsConfig,
-		RebalancePairSide,
+		OperatorSettlementType, OperatorSolverConfig, OperatorWithdrawalsConfig, RebalancePairSide,
 	};
 	use std::collections::HashMap;
 	use std::str::FromStr;
@@ -773,7 +778,10 @@ mod tests {
 			vec![(1, 747474), (747474, 1)]
 		}
 
-		async fn bridge_asset(&self, request: &BridgeRequest) -> Result<BridgeDepositResult, BridgeError> {
+		async fn bridge_asset(
+			&self,
+			request: &BridgeRequest,
+		) -> Result<BridgeDepositResult, BridgeError> {
 			self.recorded_requests.lock().unwrap().push(request.clone());
 			Ok(BridgeDepositResult {
 				tx_hash: "0xabc123".to_string(),
@@ -840,7 +848,8 @@ mod tests {
 	}
 
 	fn make_bridge_storage() -> Arc<StorageService> {
-		let base_path = std::env::temp_dir().join(format!("solver-rebalance-api-test-{}", Uuid::new_v4()));
+		let base_path =
+			std::env::temp_dir().join(format!("solver-rebalance-api-test-{}", Uuid::new_v4()));
 		std::fs::create_dir_all(&base_path).unwrap();
 		Arc::new(StorageService::new(Box::new(FileStorage::new(
 			base_path,
@@ -856,10 +865,12 @@ mod tests {
 			+ 'static,
 	{
 		let mut mock_delivery = MockDeliveryInterface::new();
-		mock_delivery.expect_get_balance().returning(move |address, token, chain_id| {
-			let result = balance_fn(address, token, chain_id);
-			Box::pin(async move { result })
-		});
+		mock_delivery
+			.expect_get_balance()
+			.returning(move |address, token, chain_id| {
+				let result = balance_fn(address, token, chain_id);
+				Box::pin(async move { result })
+			});
 		let shared = Arc::new(mock_delivery);
 		let implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::from([
 			(1_u64, shared.clone() as Arc<dyn DeliveryInterface>),
@@ -881,9 +892,15 @@ mod tests {
 						name: "ethereum".to_string(),
 						network_type: NetworkType::Parent,
 						tokens: vec![],
-						rpc_urls: vec![OperatorRpcEndpoint::http_only("http://localhost:8545".to_string())],
-						input_settler_address: alloy_address("0x1111111111111111111111111111111111111111"),
-						output_settler_address: alloy_address("0x2222222222222222222222222222222222222222"),
+						rpc_urls: vec![OperatorRpcEndpoint::http_only(
+							"http://localhost:8545".to_string(),
+						)],
+						input_settler_address: alloy_address(
+							"0x1111111111111111111111111111111111111111",
+						),
+						output_settler_address: alloy_address(
+							"0x2222222222222222222222222222222222222222",
+						),
 						input_settler_compact_address: None,
 						the_compact_address: None,
 						allocator_address: None,
@@ -896,9 +913,15 @@ mod tests {
 						name: "katana".to_string(),
 						network_type: NetworkType::New,
 						tokens: vec![],
-						rpc_urls: vec![OperatorRpcEndpoint::http_only("http://localhost:9545".to_string())],
-						input_settler_address: alloy_address("0x3333333333333333333333333333333333333333"),
-						output_settler_address: alloy_address("0x4444444444444444444444444444444444444444"),
+						rpc_urls: vec![OperatorRpcEndpoint::http_only(
+							"http://localhost:9545".to_string(),
+						)],
+						input_settler_address: alloy_address(
+							"0x3333333333333333333333333333333333333333",
+						),
+						output_settler_address: alloy_address(
+							"0x4444444444444444444444444444444444444444",
+						),
 						input_settler_compact_address: None,
 						the_compact_address: None,
 						allocator_address: None,
@@ -992,15 +1015,14 @@ mod tests {
 		delivery: Arc<DeliveryService>,
 		bridge_service: Option<Arc<BridgeService>>,
 	) -> AdminApiState {
-		let config_store = create_config_store::<OperatorConfig>(
-			StoreConfig::Memory,
-			"test-solver".to_string(),
-		)
-		.unwrap();
+		let config_store =
+			create_config_store::<OperatorConfig>(StoreConfig::Memory, "test-solver".to_string())
+				.unwrap();
 		config_store.seed(operator_config).await.unwrap();
 		let config_store: Arc<dyn ConfigStore<OperatorConfig>> = Arc::from(config_store);
 
-		let nonce_store = Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
+		let nonce_store =
+			Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
 		let verifier = AdminActionVerifier::new(
 			nonce_store.clone(),
 			AdminConfig {
@@ -1086,7 +1108,8 @@ mod tests {
 			}
 		});
 		let bridge_service = make_bridge_service(Arc::new(Mutex::new(Vec::new())));
-		let state = make_admin_state(sample_operator_config(), delivery, Some(bridge_service)).await;
+		let state =
+			make_admin_state(sample_operator_config(), delivery, Some(bridge_service)).await;
 
 		let Json(response) = handle_get_rebalance_status(axum::extract::State(state))
 			.await
@@ -1132,8 +1155,7 @@ mod tests {
 		)
 		.await;
 
-		let err = handle_get_rebalance_transfers(axum::extract::State(state))
-			.await;
+		let err = handle_get_rebalance_transfers(axum::extract::State(state)).await;
 		assert!(matches!(
 			err,
 			Err(axum::http::StatusCode::SERVICE_UNAVAILABLE)
@@ -1156,12 +1178,12 @@ mod tests {
 			crate::apis::admin::VerifiedAdmin {
 				admin: solver_types::Address::from(alloy_address(SOLVER_ADDRESS)),
 				contents: TriggerRebalanceContents {
-				pair_id: "eth-katana".to_string(),
-				source_chain: 747474,
-				dest_chain: 1,
-				amount: "12345".to_string(),
-				nonce: 1,
-				deadline: 2,
+					pair_id: "eth-katana".to_string(),
+					source_chain: 747474,
+					dest_chain: 1,
+					amount: "12345".to_string(),
+					nonce: 1,
+					deadline: 2,
 				},
 			},
 		)
@@ -1178,7 +1200,10 @@ mod tests {
 			request.source_token,
 			alloy_primitives::Address::from([0x33; 20])
 		);
-		assert_eq!(request.dest_token, alloy_primitives::Address::from([0x11; 20]));
+		assert_eq!(
+			request.dest_token,
+			alloy_primitives::Address::from([0x11; 20])
+		);
 		assert_eq!(request.amount, U256::from(12345u64));
 		assert_eq!(
 			request.recipient,
@@ -1201,12 +1226,12 @@ mod tests {
 			crate::apis::admin::VerifiedAdmin {
 				admin: solver_types::Address::from(alloy_address(SOLVER_ADDRESS)),
 				contents: TriggerRebalanceContents {
-				pair_id: "eth-katana".to_string(),
-				source_chain: 747474,
-				dest_chain: 1,
-				amount: "12345".to_string(),
-				nonce: 1,
-				deadline: 2,
+					pair_id: "eth-katana".to_string(),
+					source_chain: 747474,
+					dest_chain: 1,
+					amount: "12345".to_string(),
+					nonce: 1,
+					deadline: 2,
 				},
 			},
 		)
@@ -1248,7 +1273,11 @@ mod tests {
 		);
 		transfer.status = BridgeTransferStatus::NeedsIntervention("manual".to_string());
 		transfer.status_before_intervention = Some(BridgeTransferStatus::Relaying);
-		bridge_service.storage().save_transfer(&transfer).await.unwrap();
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
 		let transfer_id = transfer.id.clone();
 
 		let state = make_admin_state(
@@ -1264,11 +1293,11 @@ mod tests {
 			crate::apis::admin::VerifiedAdmin {
 				admin: solver_types::Address::from(alloy_address(SOLVER_ADDRESS)),
 				contents: ResolveTransferContents {
-				transfer_id: transfer_id.clone(),
-				resolution: "mark_completed".to_string(),
-				reason: "done".to_string(),
-				nonce: 1,
-				deadline: 2,
+					transfer_id: transfer_id.clone(),
+					resolution: "mark_completed".to_string(),
+					reason: "done".to_string(),
+					nonce: 1,
+					deadline: 2,
 				},
 			},
 		)
@@ -1295,11 +1324,11 @@ mod tests {
 			crate::apis::admin::VerifiedAdmin {
 				admin: solver_types::Address::from(alloy_address(SOLVER_ADDRESS)),
 				contents: ResolveTransferContents {
-				transfer_id: "missing".to_string(),
-				resolution: "mark_completed".to_string(),
-				reason: "done".to_string(),
-				nonce: 1,
-				deadline: 2,
+					transfer_id: "missing".to_string(),
+					resolution: "mark_completed".to_string(),
+					reason: "done".to_string(),
+					nonce: 1,
+					deadline: 2,
 				},
 			},
 		)
