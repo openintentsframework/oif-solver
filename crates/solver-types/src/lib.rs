@@ -64,9 +64,10 @@ pub use operator_config::{
 	OperatorAccountConfig, OperatorAdminConfig, OperatorBroadcasterConfig, OperatorConfig,
 	OperatorDirectConfig, OperatorGasConfig, OperatorGasFlowUnits, OperatorHyperlaneConfig,
 	OperatorNetworkConfig, OperatorOracleConfig, OperatorOracleSelectionStrategy,
-	OperatorPricingConfig, OperatorPusherDirectionConfig, OperatorRpcEndpoint,
-	OperatorSettlementConfig, OperatorSettlementType, OperatorSolverConfig, OperatorToken,
-	OperatorWithdrawalsConfig, PusherL2Params,
+	OperatorPricingConfig, OperatorPusherDirectionConfig, OperatorRebalanceConfig,
+	OperatorRebalancePairConfig, OperatorRpcEndpoint, OperatorSettlementConfig,
+	OperatorSettlementType, OperatorSolverConfig, OperatorToken, OperatorWithdrawalsConfig,
+	PusherL2Params, RebalancePairSide,
 };
 pub use order::*;
 pub use pricing::*;

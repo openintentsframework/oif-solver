@@ -114,6 +114,11 @@ pub struct SeedOverrides {
 	/// If not set, deny list enforcement is disabled.
 	#[serde(default)]
 	pub deny_list: Option<String>,
+
+	/// Optional cross-chain rebalancing configuration.
+	/// If provided, enables the rebalance monitor and admin endpoints.
+	#[serde(default)]
+	pub rebalance: Option<crate::OperatorRebalanceConfig>,
 }
 
 /// Supported settlement type overrides.
@@ -636,6 +641,7 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			deny_list: None,
+			rebalance: None,
 		};
 
 		let chain_ids = config.chain_ids();
@@ -670,6 +676,7 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			deny_list: None,
+			rebalance: None,
 		};
 
 		assert!(config.has_chain(10));
@@ -709,6 +716,7 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			deny_list: None,
+			rebalance: None,
 		};
 
 		let network = config.get_network(10);
@@ -788,6 +796,7 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			deny_list: None,
+			rebalance: None,
 		};
 
 		let json = serde_json::to_string(&config).unwrap();

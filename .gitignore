@@ -33,6 +33,7 @@ data/
 .logs/
 snapshots/
 .oif-demo/
+.worktrees/
 
 # Contracts
 oif-contracts/

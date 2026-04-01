@@ -1,0 +1,25 @@
+[package]
+name = "solver-bridge"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+
+[features]
+testing = ["mockall"]
+
+[dependencies]
+alloy-primitives = { workspace = true }
+alloy-sol-types = { workspace = true }
+async-trait = "0.1"
+hex = { workspace = true }
+mockall = { workspace = true, optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+solver-config = { path = "../solver-config" }
+solver-delivery = { path = "../solver-delivery" }
+solver-storage = { path = "../solver-storage" }
+solver-types = { path = "../solver-types" }
+thiserror = "2.0"
+tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+uuid = { workspace = true }

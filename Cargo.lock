@@ -4990,6 +4990,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "solver-bridge"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
+ "async-trait",
+ "hex",
+ "mockall",
+ "serde",
+ "serde_json",
+ "solver-config",
+ "solver-delivery",
+ "solver-storage",
+ "solver-types",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "solver-config"
 version = "0.1.0"
 dependencies = [

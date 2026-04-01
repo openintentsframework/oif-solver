@@ -69,6 +69,9 @@ pub struct Config {
 	/// Optional gas configuration for precomputed/overridden gas units by flow.
 	#[serde(default)]
 	pub gas: Option<GasConfig>,
+	/// Optional cross-chain rebalancing configuration.
+	#[serde(default)]
+	pub rebalance: Option<RebalanceConfig>,
 }
 
 /// Configuration specific to the solver instance.
@@ -313,6 +316,66 @@ pub struct GasConfig {
 	/// Map of flow key -> GasFlowUnits
 	/// Example keys: "permit2_escrow", "resource_lock"
 	pub flows: HashMap<String, GasFlowUnits>,
+}
+
+/// Runtime rebalancing configuration.
+///
+/// Built from `OperatorRebalanceConfig` during `build_runtime_config()`.
+/// Policy fields are hot-reloadable; transport fields are static at startup.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RebalanceConfig {
+	/// Whether auto-rebalancing is enabled.
+	pub enabled: bool,
+	/// Bridge implementation name (e.g., "layerzero_vaultbridge").
+	pub implementation: String,
+	/// Monitor polling interval in seconds.
+	pub monitor_interval_seconds: u64,
+	/// Cooldown between auto-rebalances for the same pair (seconds).
+	pub cooldown_seconds: u64,
+	/// Maximum concurrent bridge transfers.
+	pub max_pending_transfers: u32,
+	/// Minimum native gas per chain (keyed by chain ID, decimal string in wei).
+	#[serde(default)]
+	pub min_native_gas_reserve: HashMap<u64, String>,
+	/// Maximum bridge fee in bps relative to transfer amount.
+	#[serde(default)]
+	pub max_fee_bps: Option<u32>,
+	/// Rebalance pairs (cross-chain asset pairs).
+	#[serde(default)]
+	pub pairs: Vec<RebalancePairConfig>,
+	/// Implementation-specific transport config (opaque JSON).
+	#[serde(default)]
+	pub bridge_config: Option<serde_json::Value>,
+}
+
+/// Runtime pair configuration (mirror of OperatorRebalancePairConfig).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RebalancePairConfig {
+	/// Unique, operator-chosen identifier for this pair (e.g., "usdc-eth-katana").
+	pub pair_id: String,
+	/// Chain A side of the pair.
+	pub chain_a: RebalancePairSideConfig,
+	/// Chain B side of the pair.
+	pub chain_b: RebalancePairSideConfig,
+	/// Target balance for chain A (decimal string in base units).
+	pub target_balance_a: String,
+	/// Target balance for chain B (decimal string in base units).
+	pub target_balance_b: String,
+	/// Acceptable deviation in basis points (e.g., 2000 = +/-20%).
+	pub deviation_band_bps: u32,
+	/// Maximum amount per bridge operation (decimal string).
+	pub max_bridge_amount: String,
+}
+
+/// One side of a runtime rebalance pair.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RebalancePairSideConfig {
+	/// Chain ID.
+	pub chain_id: u64,
+	/// Token contract address on this chain (hex string with 0x prefix).
+	pub token_address: String,
+	/// OFT contract address on this chain (hex string with 0x prefix).
+	pub oft_address: String,
 }
 
 /// Configuration for quote generation parameters.
@@ -646,6 +709,51 @@ impl Config {
 
 		// Validate settlement configurations and coverage
 		self.validate_settlement_coverage()?;
+
+		// Validate rebalance config if present
+		if let Some(ref rebalance) = self.rebalance {
+			if rebalance.enabled {
+				if rebalance.implementation.is_empty() {
+					return Err(ConfigError::Validation(
+						"Rebalance implementation cannot be empty when enabled".into(),
+					));
+				}
+				if rebalance.monitor_interval_seconds == 0 {
+					return Err(ConfigError::Validation(
+						"Rebalance monitor_interval_seconds must be > 0".into(),
+					));
+				}
+				if rebalance.cooldown_seconds == 0 {
+					return Err(ConfigError::Validation(
+						"Rebalance cooldown_seconds must be > 0".into(),
+					));
+				}
+				if rebalance.max_pending_transfers == 0 {
+					return Err(ConfigError::Validation(
+						"Rebalance max_pending_transfers must be > 0 when enabled".into(),
+					));
+				}
+				if rebalance.pairs.is_empty() {
+					return Err(ConfigError::Validation(
+						"Rebalance must have at least one pair when enabled".into(),
+					));
+				}
+				let mut seen_ids = std::collections::HashSet::new();
+				for pair in &rebalance.pairs {
+					if pair.pair_id.is_empty() {
+						return Err(ConfigError::Validation(
+							"Rebalance pair_id cannot be empty".into(),
+						));
+					}
+					if !seen_ids.insert(&pair.pair_id) {
+						return Err(ConfigError::Validation(format!(
+							"Duplicate rebalance pair_id: '{}'",
+							pair.pair_id
+						)));
+					}
+				}
+			}
+		}
 
 		Ok(())
 	}
@@ -1131,5 +1239,74 @@ mod tests {
 			Err(ConfigError::Validation(message))
 				if message.contains("monitoring_timeout_seconds")
 		));
+	}
+
+	#[test]
+	fn test_pair_id_is_explicit_config_field() {
+		let pair = RebalancePairConfig {
+			pair_id: "usdc-eth-katana".to_string(),
+			chain_a: RebalancePairSideConfig {
+				chain_id: 1,
+				token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+				oft_address: "0x0000000000000000000000000000000000000001".to_string(),
+			},
+			chain_b: RebalancePairSideConfig {
+				chain_id: 747474,
+				token_address: "0x0000000000000000000000000000000000000002".to_string(),
+				oft_address: "0x0000000000000000000000000000000000000003".to_string(),
+			},
+			target_balance_a: "1000000".to_string(),
+			target_balance_b: "1000000".to_string(),
+			deviation_band_bps: 2000,
+			max_bridge_amount: "500000".to_string(),
+		};
+
+		// pair_id is the value set by the operator, not derived
+		assert_eq!(pair.pair_id, "usdc-eth-katana");
+	}
+
+	#[test]
+	fn test_same_symbol_different_tokens_can_coexist_with_distinct_pair_ids() {
+		// Two USDC variants on the same chain pair (e.g., native USDC vs bridged eUSDC)
+		// can coexist as long as the operator gives them different pair_ids.
+		let native_usdc = RebalancePairConfig {
+			pair_id: "usdc-native-eth-arb".to_string(),
+			chain_a: RebalancePairSideConfig {
+				chain_id: 1,
+				token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+				oft_address: "0x0000000000000000000000000000000000000001".to_string(),
+			},
+			chain_b: RebalancePairSideConfig {
+				chain_id: 42161,
+				token_address: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831".to_string(),
+				oft_address: "0x0000000000000000000000000000000000000002".to_string(),
+			},
+			target_balance_a: "1000000".to_string(),
+			target_balance_b: "1000000".to_string(),
+			deviation_band_bps: 2000,
+			max_bridge_amount: "500000".to_string(),
+		};
+
+		let bridged_usdc = RebalancePairConfig {
+			pair_id: "usdc-bridged-eth-arb".to_string(),
+			chain_a: RebalancePairSideConfig {
+				chain_id: 1,
+				token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+				oft_address: "0x0000000000000000000000000000000000000003".to_string(),
+			},
+			chain_b: RebalancePairSideConfig {
+				chain_id: 42161,
+				// Different token address — bridged variant
+				token_address: "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8".to_string(),
+				oft_address: "0x0000000000000000000000000000000000000004".to_string(),
+			},
+			target_balance_a: "1000000".to_string(),
+			target_balance_b: "1000000".to_string(),
+			deviation_band_bps: 2000,
+			max_bridge_amount: "500000".to_string(),
+		};
+
+		// Distinct pair_ids — no collision
+		assert_ne!(native_usdc.pair_id, bridged_usdc.pair_id);
 	}
 }

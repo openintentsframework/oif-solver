@@ -70,6 +70,11 @@ pub struct OperatorConfig {
 	/// If None, defaults to local wallet with SOLVER_PRIVATE_KEY.
 	#[serde(default)]
 	pub account: Option<OperatorAccountConfig>,
+
+	/// Cross-chain rebalancing configuration.
+	/// If None, rebalancing is disabled.
+	#[serde(default)]
+	pub rebalance: Option<OperatorRebalanceConfig>,
 }
 
 /// Account configuration for signing backends.
@@ -550,6 +555,102 @@ pub struct OperatorWithdrawalsConfig {
 	pub enabled: bool,
 }
 
+/// Cross-chain rebalancing configuration.
+///
+/// Policy fields (enabled, thresholds, intervals) are hot-reloadable via admin API.
+/// Transport wiring (implementation, bridge_config) is static and requires a restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRebalanceConfig {
+	/// Master switch for auto-rebalancing.
+	pub enabled: bool,
+
+	/// Which bridge backend to use (e.g., "layerzero_vaultbridge").
+	/// Static — requires restart to change.
+	pub implementation: String,
+
+	/// How often the monitor checks balances (seconds).
+	#[serde(default = "default_monitor_interval")]
+	pub monitor_interval_seconds: u64,
+
+	/// Minimum time between auto-rebalances for the same pair (seconds).
+	#[serde(default = "default_cooldown")]
+	pub cooldown_seconds: u64,
+
+	/// Maximum concurrent bridge transfers across all pairs.
+	#[serde(default = "default_max_pending")]
+	pub max_pending_transfers: u32,
+
+	/// Minimum native gas balance per chain (keyed by chain ID, decimal string in wei).
+	/// The monitor skips rebalancing from a chain if its native balance is below this.
+	#[serde(default)]
+	pub min_native_gas_reserve: HashMap<u64, String>,
+
+	/// Maximum acceptable bridge fee in basis points relative to the transfer amount.
+	/// If the quoted fee exceeds this, the auto-rebalance is skipped.
+	#[serde(default)]
+	pub max_fee_bps: Option<u32>,
+
+	/// Cross-chain rebalance pairs. Each pair is one logical asset across two chains.
+	#[serde(default)]
+	pub pairs: Vec<OperatorRebalancePairConfig>,
+
+	/// Implementation-specific transport config (e.g., LayerZero endpoint IDs, composer addresses).
+	/// Static — requires restart to change. Deserialized by the bridge implementation.
+	#[serde(default)]
+	pub bridge_config: Option<serde_json::Value>,
+}
+
+fn default_monitor_interval() -> u64 {
+	60
+}
+fn default_cooldown() -> u64 {
+	3600
+}
+fn default_max_pending() -> u32 {
+	3
+}
+
+/// A rebalance pair represents ONE logical asset bridged between TWO chains.
+/// For MVP: USDC on Ethereum <-> vbUSDC on Katana.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRebalancePairConfig {
+	/// Unique, operator-chosen identifier for this pair (e.g., "usdc-eth-katana").
+	/// Used as the key for cooldowns, transfer lookups, storage indexes, and API responses.
+	/// Must be unique across all configured pairs.
+	pub pair_id: String,
+
+	/// Chain A side of the pair (e.g., Ethereum).
+	pub chain_a: RebalancePairSide,
+
+	/// Chain B side of the pair (e.g., Katana).
+	pub chain_b: RebalancePairSide,
+
+	/// Target balance for chain A in nominal units (decimal string in base units).
+	pub target_balance_a: String,
+
+	/// Target balance for chain B in nominal units (decimal string in base units).
+	pub target_balance_b: String,
+
+	/// Acceptable deviation in basis points (e.g., 2000 = +/-20%).
+	pub deviation_band_bps: u32,
+
+	/// Maximum amount per bridge operation (decimal string in nominal units).
+	pub max_bridge_amount: String,
+}
+
+/// One side of a rebalance pair.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebalancePairSide {
+	/// Chain ID (e.g., 1 for Ethereum, 747474 for Katana).
+	pub chain_id: u64,
+
+	/// Token contract address on this chain (balance-bearing ERC-20).
+	pub token_address: Address,
+
+	/// OFT contract address on this chain (LayerZero transport contract).
+	pub oft_address: Address,
+}
+
 impl OperatorConfig {
 	/// Get a network configuration by chain ID.
 	pub fn get_network(&self, chain_id: u64) -> Option<&OperatorNetworkConfig> {
@@ -840,6 +941,7 @@ mod tests {
 			},
 			auth_enabled: false,
 			account: None,
+			rebalance: None,
 		};
 
 		let json = serde_json::to_string_pretty(&config).unwrap();

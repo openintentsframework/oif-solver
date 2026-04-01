@@ -26,8 +26,8 @@
 use crate::seeds::types::{NetworkSeed, SeedConfig, COMMON_DEFAULTS};
 use solver_config::{
 	AccountConfig, ApiConfig, ApiImplementations, Config, DeliveryConfig, DiscoveryConfig,
-	GasConfig, GasFlowUnits, OrderConfig, PricingConfig, SettlementConfig, SolverConfig,
-	StorageConfig, StrategyConfig,
+	GasConfig, GasFlowUnits, OrderConfig, PricingConfig, RebalanceConfig, RebalancePairConfig,
+	RebalancePairSideConfig, SettlementConfig, SolverConfig, StorageConfig, StrategyConfig,
 };
 use solver_types::seed_overrides::OracleSelectionStrategyOverride;
 use solver_types::{
@@ -37,8 +37,9 @@ use solver_types::{
 	OperatorBroadcasterConfig, OperatorConfig, OperatorDirectConfig, OperatorGasConfig,
 	OperatorGasFlowUnits, OperatorHyperlaneConfig, OperatorNetworkConfig, OperatorOracleConfig,
 	OperatorOracleSelectionStrategy, OperatorPricingConfig, OperatorPusherDirectionConfig,
-	OperatorRpcEndpoint, OperatorSettlementConfig, OperatorSettlementType, OperatorSolverConfig,
-	OperatorToken, OperatorWithdrawalsConfig, PusherL2Params, SeedOverrides,
+	OperatorRebalanceConfig, OperatorRebalancePairConfig, OperatorRpcEndpoint,
+	OperatorSettlementConfig, OperatorSettlementType, OperatorSolverConfig, OperatorToken,
+	OperatorWithdrawalsConfig, PusherL2Params, RebalancePairSide, SeedOverrides,
 	SettlementTypeOverride, TokenConfig,
 };
 use std::collections::{HashMap, HashSet};
@@ -306,6 +307,20 @@ fn parse_bool_env_var(name: &str, default: bool) -> Result<bool, MergeError> {
 	}
 }
 
+fn parse_u16_env_var(name: &str, default: u16) -> Result<u16, MergeError> {
+	match std::env::var(name) {
+		Ok(raw) => raw.trim().parse::<u16>().map_err(|_| {
+			MergeError::Validation(format!(
+				"Invalid integer value for {name}: {raw} (expected 0-65535)"
+			))
+		}),
+		Err(std::env::VarError::NotPresent) => Ok(default),
+		Err(std::env::VarError::NotUnicode(_)) => Err(MergeError::Validation(format!(
+			"Invalid unicode value for {name}"
+		))),
+	}
+}
+
 fn load_public_register_enabled(auth_enabled: bool) -> Result<bool, MergeError> {
 	if !auth_enabled {
 		return Ok(false);
@@ -463,6 +478,7 @@ pub fn merge_to_operator_config(
 			primary: a.primary.clone(),
 			implementations: a.implementations.clone(),
 		}),
+		rebalance: initializer.rebalance.clone(),
 	})
 }
 
@@ -1092,7 +1108,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 		storage: build_storage_config_from_operator(&operator_config.solver_id),
 		delivery: build_delivery_config_from_operator(&chain_ids),
 		account: build_account_config_from_operator(operator_config.account.as_ref()),
-		discovery: build_discovery_config_from_operator(&chain_ids),
+		discovery: build_discovery_config_from_operator(&chain_ids)?,
 		order: build_order_config_from_operator(),
 		settlement: build_settlement_config_from_operator(operator_config, &chain_ids)?,
 		pricing: Some(build_pricing_config_from_operator(&operator_config.pricing)),
@@ -1101,6 +1117,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 			operator_config.auth_enabled,
 		)?),
 		gas: Some(build_gas_config_from_operator(&operator_config.gas)),
+		rebalance: build_rebalance_config_from_operator(operator_config.rebalance.as_ref())?,
 	};
 
 	Ok(config)
@@ -1264,11 +1281,12 @@ fn build_account_config_from_operator(
 }
 
 /// Builds DiscoveryConfig from operator config.
-fn build_discovery_config_from_operator(chain_ids: &[u64]) -> DiscoveryConfig {
+fn build_discovery_config_from_operator(chain_ids: &[u64]) -> Result<DiscoveryConfig, MergeError> {
 	let mut implementations = HashMap::new();
 
 	let network_ids_array =
 		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect());
+	let offchain_api_port = parse_u16_env_var("OFFCHAIN_DISCOVERY_API_PORT", 8081)?;
 
 	// Onchain discovery - polls chain for new orders
 	let onchain_config = json_object(vec![
@@ -1280,12 +1298,12 @@ fn build_discovery_config_from_operator(chain_ids: &[u64]) -> DiscoveryConfig {
 	// Offchain discovery - receives orders via HTTP API from aggregators
 	let offchain_config = json_object(vec![
 		("api_host", serde_json::Value::String("0.0.0.0".to_string())),
-		("api_port", int(8081)),
+		("api_port", int(offchain_api_port as i64)),
 		("network_ids", network_ids_array),
 	]);
 	implementations.insert("offchain_eip7683".to_string(), offchain_config);
 
-	DiscoveryConfig { implementations }
+	Ok(DiscoveryConfig { implementations })
 }
 
 /// Builds OrderConfig from operator defaults.
@@ -1854,6 +1872,7 @@ fn build_api_config_from_operator(
 	admin: &OperatorAdminConfig,
 	auth_enabled: bool,
 ) -> Result<ApiConfig, MergeError> {
+	let api_port = parse_u16_env_var("SOLVER_API_PORT", 3000)?;
 	let auth = if admin.enabled || auth_enabled {
 		// Read JWT secret from environment variable
 		let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| {
@@ -1892,7 +1911,7 @@ fn build_api_config_from_operator(
 	Ok(ApiConfig {
 		enabled: true,
 		host: "0.0.0.0".to_string(),
-		port: 3000,
+		port: api_port,
 		timeout_seconds: 30,
 		max_request_size: 1024 * 1024, // 1MB
 		implementations: ApiImplementations {
@@ -2214,6 +2233,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		admin,
 		auth_enabled,
 		account,
+		rebalance: extract_rebalance_config(config.rebalance.as_ref())?,
 	})
 }
 
@@ -2239,6 +2259,132 @@ fn extract_account_config(account: &AccountConfig) -> Option<OperatorAccountConf
 		primary: account.primary.clone(),
 		implementations,
 	})
+}
+
+/// Builds runtime RebalanceConfig from OperatorRebalanceConfig.
+fn build_rebalance_config_from_operator(
+	rebalance: Option<&OperatorRebalanceConfig>,
+) -> Result<Option<RebalanceConfig>, MergeError> {
+	let rebalance = match rebalance {
+		Some(r) => r,
+		None => return Ok(None),
+	};
+
+	// Validate no duplicate pair_ids — fail loudly so the operator fixes the config.
+	{
+		let mut seen = std::collections::HashSet::new();
+		for p in &rebalance.pairs {
+			if !seen.insert(p.pair_id.clone()) {
+				return Err(MergeError::Validation(format!(
+					"Duplicate rebalance pair_id '{}'. Each pair must have a unique pair_id.",
+					p.pair_id
+				)));
+			}
+		}
+	}
+
+	let pairs = rebalance
+		.pairs
+		.iter()
+		.map(|p| RebalancePairConfig {
+			pair_id: p.pair_id.clone(),
+			chain_a: RebalancePairSideConfig {
+				chain_id: p.chain_a.chain_id,
+				token_address: format!("0x{}", hex::encode(p.chain_a.token_address.as_slice())),
+				oft_address: format!("0x{}", hex::encode(p.chain_a.oft_address.as_slice())),
+			},
+			chain_b: RebalancePairSideConfig {
+				chain_id: p.chain_b.chain_id,
+				token_address: format!("0x{}", hex::encode(p.chain_b.token_address.as_slice())),
+				oft_address: format!("0x{}", hex::encode(p.chain_b.oft_address.as_slice())),
+			},
+			target_balance_a: p.target_balance_a.clone(),
+			target_balance_b: p.target_balance_b.clone(),
+			deviation_band_bps: p.deviation_band_bps,
+			max_bridge_amount: p.max_bridge_amount.clone(),
+		})
+		.collect();
+
+	Ok(Some(RebalanceConfig {
+		enabled: rebalance.enabled,
+		implementation: rebalance.implementation.clone(),
+		monitor_interval_seconds: rebalance.monitor_interval_seconds,
+		cooldown_seconds: rebalance.cooldown_seconds,
+		max_pending_transfers: rebalance.max_pending_transfers,
+		min_native_gas_reserve: rebalance.min_native_gas_reserve.clone(),
+		max_fee_bps: rebalance.max_fee_bps,
+		pairs,
+		bridge_config: rebalance.bridge_config.clone(),
+	}))
+}
+
+/// Extracts OperatorRebalanceConfig from runtime RebalanceConfig.
+fn extract_rebalance_config(
+	rebalance: Option<&RebalanceConfig>,
+) -> Result<Option<OperatorRebalanceConfig>, MergeError> {
+	use alloy_primitives::Address;
+
+	let rebalance = match rebalance {
+		Some(r) => r,
+		None => return Ok(None),
+	};
+
+	let parse_addr = |s: &str, field: &str, pair_id: &str| -> Result<Address, MergeError> {
+		let hex_str = s.strip_prefix("0x").unwrap_or(s);
+		let bytes = hex::decode(hex_str).map_err(|e| {
+			MergeError::Validation(format!(
+				"Rebalance pair '{pair_id}': invalid hex in {field}: {e}"
+			))
+		})?;
+		let arr: [u8; 20] = bytes.try_into().map_err(|b: Vec<u8>| {
+			MergeError::Validation(format!(
+				"Rebalance pair '{pair_id}': {field} must be 20 bytes, got {}",
+				b.len()
+			))
+		})?;
+		Ok(Address::from(arr))
+	};
+
+	let mut pairs = Vec::with_capacity(rebalance.pairs.len());
+	for p in &rebalance.pairs {
+		pairs.push(OperatorRebalancePairConfig {
+			pair_id: p.pair_id.clone(),
+			chain_a: RebalancePairSide {
+				chain_id: p.chain_a.chain_id,
+				token_address: parse_addr(
+					&p.chain_a.token_address,
+					"chain_a.token_address",
+					&p.pair_id,
+				)?,
+				oft_address: parse_addr(&p.chain_a.oft_address, "chain_a.oft_address", &p.pair_id)?,
+			},
+			chain_b: RebalancePairSide {
+				chain_id: p.chain_b.chain_id,
+				token_address: parse_addr(
+					&p.chain_b.token_address,
+					"chain_b.token_address",
+					&p.pair_id,
+				)?,
+				oft_address: parse_addr(&p.chain_b.oft_address, "chain_b.oft_address", &p.pair_id)?,
+			},
+			target_balance_a: p.target_balance_a.clone(),
+			target_balance_b: p.target_balance_b.clone(),
+			deviation_band_bps: p.deviation_band_bps,
+			max_bridge_amount: p.max_bridge_amount.clone(),
+		});
+	}
+
+	Ok(Some(OperatorRebalanceConfig {
+		enabled: rebalance.enabled,
+		implementation: rebalance.implementation.clone(),
+		monitor_interval_seconds: rebalance.monitor_interval_seconds,
+		cooldown_seconds: rebalance.cooldown_seconds,
+		max_pending_transfers: rebalance.max_pending_transfers,
+		min_native_gas_reserve: rebalance.min_native_gas_reserve.clone(),
+		max_fee_bps: rebalance.max_fee_bps,
+		pairs,
+		bridge_config: rebalance.bridge_config.clone(),
+	}))
 }
 
 /// Converts a serde_json::Value to a serde_json::Value.
@@ -2965,6 +3111,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		}
 	}
 
@@ -3037,6 +3184,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -3093,6 +3241,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -3143,6 +3292,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -3184,6 +3334,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -3271,6 +3422,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -3489,6 +3641,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -3551,6 +3704,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -3638,6 +3792,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -3700,6 +3855,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -3768,6 +3924,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -3886,6 +4043,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -4014,6 +4172,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4080,6 +4239,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4140,6 +4300,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4235,6 +4396,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4339,6 +4501,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4502,6 +4665,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4637,6 +4801,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4736,6 +4901,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4857,6 +5023,7 @@ mod tests {
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5009,6 +5176,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -5052,6 +5220,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -5109,6 +5278,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -5159,6 +5329,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -5226,6 +5397,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -5349,6 +5521,7 @@ mod tests {
 			admin: OperatorAdminConfig::default(),
 			auth_enabled: false,
 			account: None,
+			rebalance: None,
 		};
 
 		// Add only one network
@@ -5537,13 +5710,33 @@ mod tests {
 	#[test]
 	fn test_build_discovery_config_from_operator() {
 		let chain_ids = vec![1, 10];
-		let discovery = build_discovery_config_from_operator(&chain_ids);
+		let discovery = build_discovery_config_from_operator(&chain_ids).unwrap();
 
 		assert!(discovery.implementations.contains_key("onchain_eip7683"));
 		assert!(discovery.implementations.contains_key("offchain_eip7683"));
 
 		let onchain = discovery.implementations.get("onchain_eip7683").unwrap();
 		assert!(onchain.get("polling_interval_secs").is_some());
+	}
+
+	#[test]
+	#[serial]
+	fn test_build_discovery_config_from_operator_uses_env_port_override() {
+		let key = "OFFCHAIN_DISCOVERY_API_PORT";
+		let original = std::env::var(key).ok();
+		std::env::set_var(key, "8082");
+
+		let chain_ids = vec![1, 10];
+		let discovery = build_discovery_config_from_operator(&chain_ids).unwrap();
+		let offchain = discovery.implementations.get("offchain_eip7683").unwrap();
+		let api_port = offchain.get("api_port").unwrap().as_i64().unwrap();
+
+		assert_eq!(api_port, 8082);
+
+		std::env::remove_var(key);
+		if let Some(val) = original {
+			std::env::set_var(key, val);
+		}
 	}
 
 	#[test]
@@ -5673,6 +5866,32 @@ mod tests {
 
 	#[test]
 	#[serial]
+	fn test_build_api_config_from_operator_uses_env_port_override() {
+		let key = "SOLVER_API_PORT";
+		let original = std::env::var(key).ok();
+		std::env::set_var(key, "3001");
+
+		let admin = OperatorAdminConfig {
+			enabled: false,
+			domain: "".to_string(),
+			chain_id: 0,
+			nonce_ttl_seconds: 0,
+			admin_addresses: vec![],
+			withdrawals: OperatorWithdrawalsConfig::default(),
+		};
+
+		let api = build_api_config_from_operator(&admin, false).unwrap();
+
+		assert_eq!(api.port, 3001);
+
+		std::env::remove_var(key);
+		if let Some(val) = original {
+			std::env::set_var(key, val);
+		}
+	}
+
+	#[test]
+	#[serial]
 	fn test_parse_bool_env_var_uses_default_when_missing() {
 		let key = "TEST_PARSE_BOOL_MISSING";
 		std::env::remove_var(key);
@@ -5700,6 +5919,27 @@ mod tests {
 
 		assert!(matches!(err, MergeError::Validation(_)));
 		assert!(err.to_string().contains("Invalid boolean value"));
+	}
+
+	#[test]
+	#[serial]
+	fn test_parse_u16_env_var_uses_default_when_missing() {
+		let key = "TEST_PARSE_U16_MISSING";
+		std::env::remove_var(key);
+		let parsed = parse_u16_env_var(key, 8081).unwrap();
+		assert_eq!(parsed, 8081);
+	}
+
+	#[test]
+	#[serial]
+	fn test_parse_u16_env_var_rejects_invalid_value() {
+		let key = "TEST_PARSE_U16_INVALID";
+		std::env::set_var(key, "not-a-port");
+		let err = parse_u16_env_var(key, 8081).unwrap_err();
+		std::env::remove_var(key);
+
+		assert!(matches!(err, MergeError::Validation(_)));
+		assert!(err.to_string().contains("Invalid integer value"));
 	}
 
 	#[test]
@@ -5976,6 +6216,7 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			settlement: None,
 			routing_defaults: None,
+			rebalance: None,
 		};
 
 		// Step 1: merge_config should create Config with KMS account
