@@ -178,11 +178,7 @@ pub trait DeliveryInterface: Send + Sync {
 	/// Queries event logs matching the given filter.
 	///
 	/// Used for scanning chain events (e.g., detecting token arrivals on destination chain).
-	async fn get_logs(
-		&self,
-		chain_id: u64,
-		filter: LogFilter,
-	) -> Result<Vec<Log>, DeliveryError>;
+	async fn get_logs(&self, chain_id: u64, filter: LogFilter) -> Result<Vec<Log>, DeliveryError>;
 }
 
 /// Type alias for delivery factory functions.

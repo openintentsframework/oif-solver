@@ -189,9 +189,9 @@ impl RebalanceMonitor {
 					self.bridge_service
 						.update_transfer(
 							&mut transfer,
-							BridgeTransferStatus::NeedsIntervention(
-								format!("Vault redeem failed after {retries} attempts"),
-							),
+							BridgeTransferStatus::NeedsIntervention(format!(
+								"Vault redeem failed after {retries} attempts"
+							)),
 						)
 						.await?;
 					continue;
@@ -229,10 +229,7 @@ impl RebalanceMonitor {
 					if matches!(new_status, BridgeTransferStatus::Relaying)
 						&& transfer.dest_scan_from_block.is_none()
 					{
-						if let Ok(block) = self
-							.delivery
-							.get_block_number(transfer.dest_chain)
-							.await
+						if let Ok(block) = self.delivery.get_block_number(transfer.dest_chain).await
 						{
 							transfer.dest_scan_from_block = Some(block);
 						}
@@ -250,23 +247,25 @@ impl RebalanceMonitor {
 				&& transfer.dest_token_address.is_some()
 			{
 				let dest_token_addr = transfer.dest_token_address.as_ref().unwrap();
-				let dest_token_hex =
-					dest_token_addr.strip_prefix("0x").unwrap_or(dest_token_addr);
+				let dest_token_hex = dest_token_addr
+					.strip_prefix("0x")
+					.unwrap_or(dest_token_addr);
 
 				if let Ok(addr_bytes) = hex::decode(dest_token_hex) {
 					// Transfer event topic0 = keccak256("Transfer(address,address,uint256)")
-					let transfer_sig: [u8; 32] = alloy_primitives::keccak256(
-						b"Transfer(address,address,uint256)",
-					)
-					.0;
+					let transfer_sig: [u8; 32] =
+						alloy_primitives::keccak256(b"Transfer(address,address,uint256)").0;
 
 					// topic2 = solver address (left-padded to 32 bytes)
-					let solver_hex =
-						self.solver_address.strip_prefix("0x").unwrap_or(&self.solver_address);
+					let solver_hex = self
+						.solver_address
+						.strip_prefix("0x")
+						.unwrap_or(&self.solver_address);
 					let mut solver_topic = [0u8; 32];
 					if let Ok(solver_bytes) = hex::decode(solver_hex) {
 						let start = 32 - solver_bytes.len().min(32);
-						solver_topic[start..].copy_from_slice(&solver_bytes[..solver_bytes.len().min(32)]);
+						solver_topic[start..]
+							.copy_from_slice(&solver_bytes[..solver_bytes.len().min(32)]);
 					}
 
 					let filter = solver_types::LogFilter {
@@ -277,7 +276,7 @@ impl RebalanceMonitor {
 						to_block: None,
 						topics: vec![
 							Some(solver_types::H256(transfer_sig)),
-							None, // topic1: from (any)
+							None,                                   // topic1: from (any)
 							Some(solver_types::H256(solver_topic)), // topic2: to = solver
 						],
 					};
@@ -302,12 +301,11 @@ impl RebalanceMonitor {
 									transfer_id = %transfer.id,
 									"Delivery detected on destination chain"
 								);
-								let new_status =
-									if transfer.is_composer_flow == Some(true) {
-										BridgeTransferStatus::Completed
-									} else {
-										BridgeTransferStatus::PendingRedemption
-									};
+								let new_status = if transfer.is_composer_flow == Some(true) {
+									BridgeTransferStatus::Completed
+								} else {
+									BridgeTransferStatus::PendingRedemption
+								};
 								self.bridge_service
 									.update_transfer(&mut transfer, new_status)
 									.await?;
@@ -347,8 +345,7 @@ impl RebalanceMonitor {
 
 					// Build redeem calldata: redeem(shares, receiver=solver, owner=solver)
 					// Use the transfer amount as shares (for MVP, 1:1 with bridged amount)
-					let shares =
-						U256::from_str_radix(&transfer.amount, 10).unwrap_or(U256::ZERO);
+					let shares = U256::from_str_radix(&transfer.amount, 10).unwrap_or(U256::ZERO);
 					if !shares.is_zero() {
 						use alloy_sol_types::SolCall;
 						let redeem_data =
@@ -395,7 +392,10 @@ impl RebalanceMonitor {
 
 			// Persist last_status_poll_at
 			transfer.last_status_poll_at = Some(now);
-			self.bridge_service.storage().save_transfer(&transfer).await?;
+			self.bridge_service
+				.storage()
+				.save_transfer(&transfer)
+				.await?;
 		}
 
 		Ok(())
@@ -419,7 +419,11 @@ impl RebalanceMonitor {
 		let solver_address = &self.solver_address;
 
 		for pair in &config.pairs {
-			if self.bridge_service.is_cooldown_active(&pair.pair_id).await? {
+			if self
+				.bridge_service
+				.is_cooldown_active(&pair.pair_id)
+				.await?
+			{
 				tracing::debug!(pair = %pair.pair_id, "Cooldown active, skipping");
 				continue;
 			}
@@ -546,11 +550,15 @@ impl RebalanceMonitor {
 				})?;
 
 				// Build metadata for delivery detection and redeem path
-				let is_composer = config.bridge_config.as_ref()
+				let is_composer = config
+					.bridge_config
+					.as_ref()
 					.and_then(|bc| bc.get("composer_addresses"))
 					.and_then(|ca| ca.get(&source_side.chain_id.to_string()))
 					.is_some();
-				let vault_addr = config.bridge_config.as_ref()
+				let vault_addr = config
+					.bridge_config
+					.as_ref()
 					.and_then(|bc| bc.get("vault_addresses"))
 					.and_then(|va| va.get(&dest_side.chain_id.to_string()))
 					.and_then(|v| v.as_str())
@@ -565,7 +573,12 @@ impl RebalanceMonitor {
 
 				match self
 					.bridge_service
-					.rebalance_token(&config.implementation, &request, RebalanceTrigger::Auto, metadata)
+					.rebalance_token(
+						&config.implementation,
+						&request,
+						RebalanceTrigger::Auto,
+						metadata,
+					)
 					.await
 				{
 					Ok(transfer) => {

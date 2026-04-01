@@ -216,33 +216,23 @@ pub async fn handle_get_rebalance_status(
 				let token_b_str = pair.chain_b.token_address.to_string();
 				let balance_a_result = state
 					.delivery
-					.get_balance(
-						pair.chain_a.chain_id,
-						solver_address,
-						Some(&token_a_str),
-					)
+					.get_balance(pair.chain_a.chain_id, solver_address, Some(&token_a_str))
 					.await;
 				let balance_b_result = state
 					.delivery
-					.get_balance(
-						pair.chain_b.chain_id,
-						solver_address,
-						Some(&token_b_str),
-					)
+					.get_balance(pair.chain_b.chain_id, solver_address, Some(&token_b_str))
 					.await;
 
 				match (balance_a_result, balance_b_result) {
 					(Ok(bal_a_str), Ok(bal_b_str)) => {
-						let bal_a =
-							U256::from_str_radix(&bal_a_str, 10).unwrap_or(U256::ZERO);
-						let bal_b =
-							U256::from_str_radix(&bal_b_str, 10).unwrap_or(U256::ZERO);
-						let target_a = U256::from_str_radix(&pair.target_balance_a, 10)
-							.unwrap_or(U256::ZERO);
-						let target_b = U256::from_str_radix(&pair.target_balance_b, 10)
-							.unwrap_or(U256::ZERO);
-						let max_amount = U256::from_str_radix(&pair.max_bridge_amount, 10)
-							.unwrap_or(U256::MAX);
+						let bal_a = U256::from_str_radix(&bal_a_str, 10).unwrap_or(U256::ZERO);
+						let bal_b = U256::from_str_radix(&bal_b_str, 10).unwrap_or(U256::ZERO);
+						let target_a =
+							U256::from_str_radix(&pair.target_balance_a, 10).unwrap_or(U256::ZERO);
+						let target_b =
+							U256::from_str_radix(&pair.target_balance_b, 10).unwrap_or(U256::ZERO);
+						let max_amount =
+							U256::from_str_radix(&pair.max_bridge_amount, 10).unwrap_or(U256::MAX);
 
 						let analysis = analyze_pair(
 							bal_a,
@@ -418,11 +408,15 @@ pub async fn handle_trigger_rebalance(
 	};
 
 	// Build metadata for delivery detection and redeem path
-	let is_composer = rebalance_config.bridge_config.as_ref()
+	let is_composer = rebalance_config
+		.bridge_config
+		.as_ref()
 		.and_then(|bc| bc.get("composer_addresses"))
 		.and_then(|ca| ca.get(&request.source_chain.to_string()))
 		.is_some();
-	let vault_addr = rebalance_config.bridge_config.as_ref()
+	let vault_addr = rebalance_config
+		.bridge_config
+		.as_ref()
 		.and_then(|bc| bc.get("vault_addresses"))
 		.and_then(|va| va.get(&request.dest_chain.to_string()))
 		.and_then(|v| v.as_str())

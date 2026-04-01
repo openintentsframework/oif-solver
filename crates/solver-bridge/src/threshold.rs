@@ -66,8 +66,16 @@ pub fn evaluate_threshold(
 		lower_bound,
 		upper_bound,
 		within_band,
-		deficit: if current_balance < target_balance { deficit } else { U256::ZERO },
-		surplus: if current_balance > target_balance { surplus } else { U256::ZERO },
+		deficit: if current_balance < target_balance {
+			deficit
+		} else {
+			U256::ZERO
+		},
+		surplus: if current_balance > target_balance {
+			surplus
+		} else {
+			U256::ZERO
+		},
 	}
 }
 
@@ -138,11 +146,7 @@ mod tests {
 
 	#[test]
 	fn test_evaluate_threshold_below_lower() {
-		let result = evaluate_threshold(
-			U256::from(700u64),
-			U256::from(1000u64),
-			2000,
-		);
+		let result = evaluate_threshold(U256::from(700u64), U256::from(1000u64), 2000);
 		assert!(!result.within_band);
 		assert_eq!(result.deficit, U256::from(300u64));
 		assert_eq!(result.surplus, U256::ZERO);
@@ -150,11 +154,7 @@ mod tests {
 
 	#[test]
 	fn test_evaluate_threshold_above_upper() {
-		let result = evaluate_threshold(
-			U256::from(1300u64),
-			U256::from(1000u64),
-			2000,
-		);
+		let result = evaluate_threshold(U256::from(1300u64), U256::from(1000u64), 2000);
 		assert!(!result.within_band);
 		assert_eq!(result.deficit, U256::ZERO);
 		assert_eq!(result.surplus, U256::from(300u64));
@@ -163,9 +163,12 @@ mod tests {
 	#[test]
 	fn test_analyze_pair_both_within_band() {
 		let analysis = analyze_pair(
-			U256::from(1000u64), U256::from(1000u64),
-			U256::from(1000u64), U256::from(1000u64),
-			2000, U256::from(500u64),
+			U256::from(1000u64),
+			U256::from(1000u64),
+			U256::from(1000u64),
+			U256::from(1000u64),
+			2000,
+			U256::from(500u64),
 		);
 		assert!(analysis.side_a.within_band);
 		assert!(analysis.side_b.within_band);
@@ -179,8 +182,10 @@ mod tests {
 		let analysis = analyze_pair(
 			U256::from(500u64),  // A below lower (800)
 			U256::from(1000u64), // B within band
-			U256::from(1000u64), U256::from(1000u64),
-			2000, U256::from(10000u64),
+			U256::from(1000u64),
+			U256::from(1000u64),
+			2000,
+			U256::from(10000u64),
 		);
 		assert_eq!(analysis.direction_needed, Some(RebalanceDirection::BToA));
 		assert_eq!(analysis.suggested_amount, U256::from(500u64)); // deficit
@@ -191,8 +196,10 @@ mod tests {
 		let analysis = analyze_pair(
 			U256::from(500u64),
 			U256::from(1000u64),
-			U256::from(1000u64), U256::from(1000u64),
-			2000, U256::from(200u64), // max = 200
+			U256::from(1000u64),
+			U256::from(1000u64),
+			2000,
+			U256::from(200u64), // max = 200
 		);
 		assert_eq!(analysis.direction_needed, Some(RebalanceDirection::BToA));
 		assert_eq!(analysis.suggested_amount, U256::from(200u64)); // capped
@@ -203,8 +210,10 @@ mod tests {
 		let analysis = analyze_pair(
 			U256::from(500u64),
 			U256::from(500u64),
-			U256::from(1000u64), U256::from(1000u64),
-			2000, U256::from(10000u64),
+			U256::from(1000u64),
+			U256::from(1000u64),
+			2000,
+			U256::from(10000u64),
 		);
 		assert!(analysis.both_sides_low);
 		assert_eq!(analysis.direction_needed, None);
@@ -215,8 +224,10 @@ mod tests {
 		let analysis = analyze_pair(
 			U256::from(1500u64), // A above upper (1200)
 			U256::from(1000u64), // B within band
-			U256::from(1000u64), U256::from(1000u64),
-			2000, U256::from(10000u64),
+			U256::from(1000u64),
+			U256::from(1000u64),
+			2000,
+			U256::from(10000u64),
 		);
 		assert_eq!(analysis.direction_needed, Some(RebalanceDirection::AToB));
 		assert_eq!(analysis.suggested_amount, U256::from(500u64)); // surplus

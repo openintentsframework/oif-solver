@@ -32,12 +32,7 @@ fn to_solver_addr(addr: Address) -> solver_types::Address {
 }
 
 /// Build a solver_types Transaction for contract calls.
-fn build_tx(
-	chain_id: u64,
-	to: Address,
-	data: Vec<u8>,
-	value: U256,
-) -> solver_types::Transaction {
+fn build_tx(chain_id: u64, to: Address, data: Vec<u8>, value: U256) -> solver_types::Transaction {
 	// Convert U256 to solver_types U256 via bytes
 	solver_types::Transaction {
 		to: Some(to_solver_addr(to)),
@@ -76,11 +71,8 @@ impl LayerZeroBridge {
 
 	#[allow(dead_code)]
 	fn get_vault(&self, chain_id: u64) -> Result<Address, BridgeError> {
-		let addr_str = self
-			.config
-			.vault_addresses
-			.get(&chain_id)
-			.ok_or_else(|| {
+		let addr_str =
+			self.config.vault_addresses.get(&chain_id).ok_or_else(|| {
 				BridgeError::Config(format!("No Vault address for chain {chain_id}"))
 			})?;
 		parse_address(addr_str)
@@ -143,11 +135,8 @@ impl LayerZeroBridge {
 		.abi_encode();
 
 		let deposit_tx = build_tx(request.source_chain, composer_addr, deposit_data, fee);
-		let tx_hash = self
-			.delivery
-			.deliver(deposit_tx, None)
-			.await
-			.map_err(|e| {
+		let tx_hash =
+			self.delivery.deliver(deposit_tx, None).await.map_err(|e| {
 				BridgeError::TransactionFailed(format!("depositAndSend failed: {e}"))
 			})?;
 
@@ -166,8 +155,9 @@ impl LayerZeroBridge {
 		let dest_eid = self.get_eid(request.dest_chain)?;
 		let to_bytes32 = address_to_bytes32(self.solver_address);
 		let extra_options = self.build_extra_options();
-		let min_amount =
-			request.min_amount.unwrap_or(request.amount * U256::from(95) / U256::from(100));
+		let min_amount = request
+			.min_amount
+			.unwrap_or(request.amount * U256::from(95) / U256::from(100));
 
 		// Step 1: Approve shares to OFT
 		let approve_data = contracts::approveCall {
@@ -261,9 +251,8 @@ impl BridgeInterface for LayerZeroBridge {
 		match &transfer.status {
 			BridgeTransferStatus::Submitted => {
 				if let Some(tx_hash) = &transfer.tx_hash {
-					let hash_bytes =
-						hex::decode(tx_hash.strip_prefix("0x").unwrap_or(tx_hash))
-							.map_err(|e| BridgeError::Config(format!("Invalid tx hash: {e}")))?;
+					let hash_bytes = hex::decode(tx_hash.strip_prefix("0x").unwrap_or(tx_hash))
+						.map_err(|e| BridgeError::Config(format!("Invalid tx hash: {e}")))?;
 					let tx_hash_obj = solver_types::TransactionHash(hash_bytes);
 
 					match self
@@ -336,8 +325,9 @@ impl BridgeInterface for LayerZeroBridge {
 		let dest_eid = self.get_eid(request.dest_chain)?;
 		let to_bytes32 = address_to_bytes32(self.solver_address);
 		let extra_options = self.build_extra_options();
-		let min_amount =
-			request.min_amount.unwrap_or(request.amount * U256::from(95) / U256::from(100));
+		let min_amount = request
+			.min_amount
+			.unwrap_or(request.amount * U256::from(95) / U256::from(100));
 
 		let send_param = contracts::SendParam {
 			dstEid: dest_eid,

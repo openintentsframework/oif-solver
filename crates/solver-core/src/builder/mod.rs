@@ -607,13 +607,10 @@ impl SolverBuilder {
 		// Construct BridgeService if rebalance is configured and enabled
 		let bridge_service = if let Some(ref rebalance) = self.static_config.rebalance {
 			if rebalance.enabled {
-				let alloy_addr =
-					alloy_primitives::Address::from_slice(&solver_address.0);
+				let alloy_addr = alloy_primitives::Address::from_slice(&solver_address.0);
 
 				let bridge_config = rebalance.bridge_config.as_ref().ok_or_else(|| {
-					BuilderError::Config(
-						"Rebalance enabled but bridge_config is missing".into(),
-					)
+					BuilderError::Config("Rebalance enabled but bridge_config is missing".into())
 				})?;
 
 				let registered = solver_bridge::get_all_implementations();
@@ -628,13 +625,11 @@ impl SolverBuilder {
 						))
 					})?;
 
-				let impl_ = factory(bridge_config, delivery.clone(), alloy_addr).map_err(
-					|e| {
-						BuilderError::Config(format!(
-							"Failed to create bridge implementation '{target}': {e}"
-						))
-					},
-				)?;
+				let impl_ = factory(bridge_config, delivery.clone(), alloy_addr).map_err(|e| {
+					BuilderError::Config(format!(
+						"Failed to create bridge implementation '{target}': {e}"
+					))
+				})?;
 
 				let mut impls = std::collections::HashMap::new();
 				impls.insert(target.clone(), std::sync::Arc::from(impl_));

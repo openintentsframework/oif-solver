@@ -358,11 +358,26 @@ pub async fn start_server(
 			.route("/gas", put(handle_update_gas));
 
 		let rebalance_routes = axum::Router::new()
-			.route("/config", axum::routing::get(crate::apis::rebalance::handle_get_rebalance_config))
-			.route("/status", axum::routing::get(crate::apis::rebalance::handle_get_rebalance_status))
-			.route("/transfers", axum::routing::get(crate::apis::rebalance::handle_get_rebalance_transfers))
-			.route("/trigger", axum::routing::post(crate::apis::rebalance::handle_trigger_rebalance))
-			.route("/transfers/{id}/resolve", axum::routing::post(crate::apis::rebalance::handle_resolve_transfer));
+			.route(
+				"/config",
+				axum::routing::get(crate::apis::rebalance::handle_get_rebalance_config),
+			)
+			.route(
+				"/status",
+				axum::routing::get(crate::apis::rebalance::handle_get_rebalance_status),
+			)
+			.route(
+				"/transfers",
+				axum::routing::get(crate::apis::rebalance::handle_get_rebalance_transfers),
+			)
+			.route(
+				"/trigger",
+				axum::routing::post(crate::apis::rebalance::handle_trigger_rebalance),
+			)
+			.route(
+				"/transfers/{id}/resolve",
+				axum::routing::post(crate::apis::rebalance::handle_resolve_transfer),
+			);
 
 		admin_protected_routes = admin_protected_routes.nest("/rebalance", rebalance_routes);
 
