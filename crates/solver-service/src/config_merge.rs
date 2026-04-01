@@ -1281,9 +1281,7 @@ fn build_account_config_from_operator(
 }
 
 /// Builds DiscoveryConfig from operator config.
-fn build_discovery_config_from_operator(
-	chain_ids: &[u64],
-) -> Result<DiscoveryConfig, MergeError> {
+fn build_discovery_config_from_operator(chain_ids: &[u64]) -> Result<DiscoveryConfig, MergeError> {
 	let mut implementations = HashMap::new();
 
 	let network_ids_array =
@@ -1874,8 +1872,7 @@ fn build_api_config_from_operator(
 	admin: &OperatorAdminConfig,
 	auth_enabled: bool,
 ) -> Result<ApiConfig, MergeError> {
-	let api_port =
-		parse_u16_env_var("SOLVER_API_PORT", 3000)?;
+	let api_port = parse_u16_env_var("SOLVER_API_PORT", 3000)?;
 	let auth = if admin.enabled || auth_enabled {
 		// Read JWT secret from environment variable
 		let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| {
@@ -2354,12 +2351,20 @@ fn extract_rebalance_config(
 			pair_id: p.pair_id.clone(),
 			chain_a: RebalancePairSide {
 				chain_id: p.chain_a.chain_id,
-				token_address: parse_addr(&p.chain_a.token_address, "chain_a.token_address", &p.pair_id)?,
+				token_address: parse_addr(
+					&p.chain_a.token_address,
+					"chain_a.token_address",
+					&p.pair_id,
+				)?,
 				oft_address: parse_addr(&p.chain_a.oft_address, "chain_a.oft_address", &p.pair_id)?,
 			},
 			chain_b: RebalancePairSide {
 				chain_id: p.chain_b.chain_id,
-				token_address: parse_addr(&p.chain_b.token_address, "chain_b.token_address", &p.pair_id)?,
+				token_address: parse_addr(
+					&p.chain_b.token_address,
+					"chain_b.token_address",
+					&p.pair_id,
+				)?,
 				oft_address: parse_addr(&p.chain_b.oft_address, "chain_b.oft_address", &p.pair_id)?,
 			},
 			target_balance_a: p.target_balance_a.clone(),
