@@ -426,7 +426,10 @@ mod tests {
 	fn bridge_config(composer: Option<Address>) -> serde_json::Value {
 		let mut composer_addresses = serde_json::Map::new();
 		if let Some(addr) = composer {
-			composer_addresses.insert("1".to_string(), json!(format!("0x{}", hex::encode(addr.as_slice()))));
+			composer_addresses.insert(
+				"1".to_string(),
+				json!(format!("0x{}", hex::encode(addr.as_slice()))),
+			);
 		}
 
 		json!({
@@ -448,7 +451,10 @@ mod tests {
 		LayerZeroBridge {
 			delivery: Arc::new(DeliveryService::new(
 				HashMap::from([
-					(1_u64, shared.clone() as Arc<dyn solver_delivery::DeliveryInterface>),
+					(
+						1_u64,
+						shared.clone() as Arc<dyn solver_delivery::DeliveryInterface>,
+					),
 					(
 						747474_u64,
 						shared.clone() as Arc<dyn solver_delivery::DeliveryInterface>,
@@ -481,7 +487,8 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_bridge_via_composer_approves_source_token_and_calls_deposit_and_send_on_composer() {
+	async fn test_bridge_via_composer_approves_source_token_and_calls_deposit_and_send_on_composer()
+	{
 		let request = bridge_request();
 		let composer = Address::from([0xCC; 20]);
 		let fee = U256::from(12345u64);
@@ -502,7 +509,9 @@ mod tests {
 		let expected_oft = request.source_oft;
 		mock.expect_eth_call().returning(move |tx| {
 			assert_eq!(
-				tx.to.as_ref().map(|addr| Address::from_slice(addr.0.as_slice())),
+				tx.to
+					.as_ref()
+					.map(|addr| Address::from_slice(addr.0.as_slice())),
 				Some(expected_oft)
 			);
 			Box::pin(async move { Ok(alloy_primitives::Bytes::from(quote_fee_bytes(fee))) })
@@ -523,7 +532,10 @@ mod tests {
 		assert_eq!(tx_to(&submitted[1]), composer);
 		let deposit_call: contracts::depositAndSendCall = decode_submit(&submitted[1]);
 		assert_eq!(deposit_call.refundAddress, solver_address());
-		assert_eq!(deposit_call.to, contracts::address_to_bytes32(solver_address()));
+		assert_eq!(
+			deposit_call.to,
+			contracts::address_to_bytes32(solver_address())
+		);
 		assert_eq!(deposit_call.dstEid, 200);
 		assert_eq!(deposit_call.fee.nativeFee, fee);
 	}
@@ -549,7 +561,9 @@ mod tests {
 		let expected_oft = request.source_oft;
 		mock.expect_eth_call().returning(move |tx| {
 			assert_eq!(
-				tx.to.as_ref().map(|addr| Address::from_slice(addr.0.as_slice())),
+				tx.to
+					.as_ref()
+					.map(|addr| Address::from_slice(addr.0.as_slice())),
 				Some(expected_oft)
 			);
 			Box::pin(async move { Ok(alloy_primitives::Bytes::from(quote_fee_bytes(fee))) })
@@ -570,7 +584,10 @@ mod tests {
 		assert_eq!(tx_to(&submitted[1]), request.source_oft);
 		let send_call: contracts::sendCall = decode_submit(&submitted[1]);
 		assert_eq!(send_call.refundAddress, solver_address());
-		assert_eq!(send_call.sendParam.to, contracts::address_to_bytes32(solver_address()));
+		assert_eq!(
+			send_call.sendParam.to,
+			contracts::address_to_bytes32(solver_address())
+		);
 		assert_eq!(send_call.sendParam.dstEid, 200);
 		assert_eq!(send_call.fee.nativeFee, fee);
 	}
@@ -618,12 +635,15 @@ mod tests {
 
 		let bridge = bridge_with_two_chain_delivery(mock, None);
 		let status = bridge.check_status(&transfer).await.unwrap();
-		assert!(matches!(status, BridgeTransferStatus::Failed(reason) if reason == "Source transaction reverted"));
+		assert!(
+			matches!(status, BridgeTransferStatus::Failed(reason) if reason == "Source transaction reverted")
+		);
 	}
 
 	#[tokio::test]
 	async fn test_check_status_pending_redemption_becomes_completed_on_successful_redeem_receipt() {
-		let mut transfer = crate::test_support::pending_transfer(BridgeTransferStatus::PendingRedemption);
+		let mut transfer =
+			crate::test_support::pending_transfer(BridgeTransferStatus::PendingRedemption);
 		transfer.redeem_tx_hash = Some("0x03".to_string());
 		let mut mock = MockDeliveryInterface::new();
 		mock.expect_get_receipt().returning(|_, _| {
@@ -645,7 +665,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_check_status_pending_redemption_returns_failed_on_reverted_redeem_receipt() {
-		let mut transfer = crate::test_support::pending_transfer(BridgeTransferStatus::PendingRedemption);
+		let mut transfer =
+			crate::test_support::pending_transfer(BridgeTransferStatus::PendingRedemption);
 		transfer.redeem_tx_hash = Some("0x04".to_string());
 		let mut mock = MockDeliveryInterface::new();
 		mock.expect_get_receipt().returning(|_, _| {
@@ -662,7 +683,9 @@ mod tests {
 
 		let bridge = bridge_with_two_chain_delivery(mock, None);
 		let status = bridge.check_status(&transfer).await.unwrap();
-		assert!(matches!(status, BridgeTransferStatus::Failed(reason) if reason == "Redeem transaction reverted"));
+		assert!(
+			matches!(status, BridgeTransferStatus::Failed(reason) if reason == "Redeem transaction reverted")
+		);
 	}
 
 	#[test]
@@ -672,13 +695,22 @@ mod tests {
 		mock.expect_get_receipt().times(0);
 		mock.expect_eth_call().times(0);
 		let delivery = Arc::new(DeliveryService::new(
-			HashMap::from([(1_u64, Arc::new(mock) as Arc<dyn solver_delivery::DeliveryInterface>)]),
+			HashMap::from([(
+				1_u64,
+				Arc::new(mock) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
 			3,
 			300,
 		));
 
-		let result = create_bridge(&bridge_config(Some(Address::from([0xCC; 20]))), delivery, zero_address());
-		assert!(matches!(result, Err(BridgeError::Config(msg)) if msg.contains("zero solver address")));
+		let result = create_bridge(
+			&bridge_config(Some(Address::from([0xCC; 20]))),
+			delivery,
+			zero_address(),
+		);
+		assert!(
+			matches!(result, Err(BridgeError::Config(msg)) if msg.contains("zero solver address"))
+		);
 	}
 
 	#[tokio::test]
@@ -699,7 +731,11 @@ mod tests {
 		let quoted = bridge.estimate_fee(&request).await.unwrap();
 
 		assert_eq!(quoted, fee);
-		let tx = call_target.lock().unwrap().clone().expect("missing contract call");
+		let tx = call_target
+			.lock()
+			.unwrap()
+			.clone()
+			.expect("missing contract call");
 		assert_eq!(tx_to(&tx), request.source_oft);
 		assert_ne!(tx_to(&tx), request.source_token);
 	}

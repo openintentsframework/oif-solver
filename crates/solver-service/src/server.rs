@@ -383,14 +383,13 @@ pub async fn start_server(
 
 		// Admin routes always require JWT authentication, regardless of order auth settings.
 		if let Some(jwt) = &jwt_service {
-			admin_protected_routes =
-				admin_protected_routes.layer(middleware::from_fn_with_state(
-					AuthState {
-						jwt_service: jwt.clone(),
-						required_scope: solver_types::AuthScope::AdminAll,
-					},
-					auth_middleware,
-				));
+			admin_protected_routes = admin_protected_routes.layer(middleware::from_fn_with_state(
+				AuthState {
+					jwt_service: jwt.clone(),
+					required_scope: solver_types::AuthScope::AdminAll,
+				},
+				auth_middleware,
+			));
 		}
 
 		let admin_routes = admin_protected_routes.with_state(admin_state);

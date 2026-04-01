@@ -394,12 +394,11 @@ impl RebalanceMonitor {
 
 						// Acquire semaphore just before submitting — don't hold it during
 						// the preceding calldata building.
-						let _permit =
-							self.transaction_semaphore.acquire().await.map_err(|e| {
-								crate::BridgeError::TransactionFailed(format!(
-									"Failed to acquire semaphore for redeem: {e}"
-								))
-							})?;
+						let _permit = self.transaction_semaphore.acquire().await.map_err(|e| {
+							crate::BridgeError::TransactionFailed(format!(
+								"Failed to acquire semaphore for redeem: {e}"
+							))
+						})?;
 
 						match self.delivery.deliver(redeem_tx, None).await {
 							Ok(tx_hash) => {

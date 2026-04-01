@@ -233,37 +233,52 @@ pub async fn handle_get_rebalance_status(
 						let bal_a = match U256::from_str_radix(&bal_a_str, 10) {
 							Ok(v) => v,
 							Err(e) => {
-								pair_statuses.push(error_pair_status(pair, format!("Failed to parse balance_a: {e}")));
+								pair_statuses.push(error_pair_status(
+									pair,
+									format!("Failed to parse balance_a: {e}"),
+								));
 								continue;
-							}
+							},
 						};
 						let bal_b = match U256::from_str_radix(&bal_b_str, 10) {
 							Ok(v) => v,
 							Err(e) => {
-								pair_statuses.push(error_pair_status(pair, format!("Failed to parse balance_b: {e}")));
+								pair_statuses.push(error_pair_status(
+									pair,
+									format!("Failed to parse balance_b: {e}"),
+								));
 								continue;
-							}
+							},
 						};
 						let target_a = match U256::from_str_radix(&pair.target_balance_a, 10) {
 							Ok(v) => v,
 							Err(e) => {
-								pair_statuses.push(error_pair_status(pair, format!("Failed to parse target_balance_a: {e}")));
+								pair_statuses.push(error_pair_status(
+									pair,
+									format!("Failed to parse target_balance_a: {e}"),
+								));
 								continue;
-							}
+							},
 						};
 						let target_b = match U256::from_str_radix(&pair.target_balance_b, 10) {
 							Ok(v) => v,
 							Err(e) => {
-								pair_statuses.push(error_pair_status(pair, format!("Failed to parse target_balance_b: {e}")));
+								pair_statuses.push(error_pair_status(
+									pair,
+									format!("Failed to parse target_balance_b: {e}"),
+								));
 								continue;
-							}
+							},
 						};
 						let max_amount = match U256::from_str_radix(&pair.max_bridge_amount, 10) {
 							Ok(v) => v,
 							Err(e) => {
-								pair_statuses.push(error_pair_status(pair, format!("Failed to parse max_bridge_amount: {e}")));
+								pair_statuses.push(error_pair_status(
+									pair,
+									format!("Failed to parse max_bridge_amount: {e}"),
+								));
 								continue;
-							}
+							},
 						};
 
 						let analysis = analyze_pair(
@@ -285,9 +300,12 @@ pub async fn handle_get_rebalance_status(
 							match bs.is_cooldown_active(&pair.pair_id).await {
 								Ok(v) => v,
 								Err(e) => {
-									pair_statuses.push(error_pair_status(pair, format!("Cooldown check failed: {e}")));
+									pair_statuses.push(error_pair_status(
+										pair,
+										format!("Cooldown check failed: {e}"),
+									));
 									continue;
-								}
+								},
 							}
 						} else {
 							false
@@ -297,9 +315,12 @@ pub async fn handle_get_rebalance_status(
 							match bs.get_active_transfers_for_pair(&pair.pair_id).await {
 								Ok(transfers) => transfers.first().map(|t| t.id.clone()),
 								Err(e) => {
-									pair_statuses.push(error_pair_status(pair, format!("Active transfer query failed: {e}")));
+									pair_statuses.push(error_pair_status(
+										pair,
+										format!("Active transfer query failed: {e}"),
+									));
 									continue;
-								}
+								},
 							}
 						} else {
 							None
@@ -332,7 +353,10 @@ pub async fn handle_get_rebalance_status(
 						});
 					},
 					(Err(e), _) | (_, Err(e)) => {
-						pair_statuses.push(error_pair_status(pair, format!("Balance query failed: {e}")));
+						pair_statuses.push(error_pair_status(
+							pair,
+							format!("Balance query failed: {e}"),
+						));
 					},
 				}
 			}
@@ -504,7 +528,10 @@ pub async fn handle_resolve_transfer(
 	}
 }
 
-fn error_pair_status(pair: &solver_types::OperatorRebalancePairConfig, error_msg: String) -> PairRebalanceStatus {
+fn error_pair_status(
+	pair: &solver_types::OperatorRebalancePairConfig,
+	error_msg: String,
+) -> PairRebalanceStatus {
 	PairRebalanceStatus {
 		pair_id: pair.pair_id.clone(),
 		chain_a: PairSideStatus {
