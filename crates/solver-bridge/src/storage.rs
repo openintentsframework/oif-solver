@@ -64,6 +64,10 @@ impl BridgeStorage {
 	}
 
 	/// Store a new or updated transfer.
+	///
+	/// Terminal transfers (Completed, Failed) get a TTL so they auto-expire.
+	/// Non-terminal transfers (including NeedsIntervention) have no TTL because
+	/// they require admin resolution and must not silently disappear.
 	pub async fn save_transfer(
 		&self,
 		transfer: &PendingBridgeTransfer,

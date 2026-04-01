@@ -137,21 +137,30 @@ impl BridgeService {
 	) -> Result<PendingBridgeTransfer, BridgeError> {
 		let bridge = self.get_implementation(bridge_impl)?;
 
-		// Execute the bridge transfer
-		let result = bridge.bridge_asset(request).await?;
-
-		// Create and persist the transfer record
-		let transfer = PendingBridgeTransfer::new(
+		// Persist the transfer intent BEFORE sending funds.
+		// If bridge_asset succeeds but save fails, we'd have an untracked transfer.
+		let mut transfer = PendingBridgeTransfer::new(
 			request.pair_id.clone(),
 			request.source_chain,
 			request.dest_chain,
 			request.amount.to_string(),
 			trigger,
-			Some(result.tx_hash),
-			result.message_guid,
-			None, // fee_paid set later after confirmation
+			None, // tx_hash set after submission
+			None, // message_guid set after submission
+			None, // fee_paid set after confirmation
 		);
+		self.storage.save_transfer(&transfer).await?;
 
+		// Execute the bridge transfer
+		let result = bridge.bridge_asset(request).await?;
+
+		// Update the record with the tx hash and message GUID
+		transfer.tx_hash = Some(result.tx_hash);
+		transfer.message_guid = result.message_guid;
+		transfer.updated_at = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_secs();
 		self.storage.save_transfer(&transfer).await?;
 
 		Ok(transfer)
@@ -180,10 +189,12 @@ impl BridgeService {
 
 	/// Get a single transfer by ID.
 	pub async fn get_transfer(&self, id: &str) -> Result<PendingBridgeTransfer, BridgeError> {
-		self.storage
-			.get_transfer(id)
-			.await
-			.map_err(|_| BridgeError::TransferNotFound(id.to_string()))
+		self.storage.get_transfer(id).await.map_err(|e| match e {
+			solver_storage::StorageError::NotFound(_) => {
+				BridgeError::TransferNotFound(id.to_string())
+			},
+			other => BridgeError::Storage(other.to_string()),
+		})
 	}
 
 	/// Count active (non-terminal) transfers.

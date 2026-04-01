@@ -710,6 +710,51 @@ impl Config {
 		// Validate settlement configurations and coverage
 		self.validate_settlement_coverage()?;
 
+		// Validate rebalance config if present
+		if let Some(ref rebalance) = self.rebalance {
+			if rebalance.enabled {
+				if rebalance.implementation.is_empty() {
+					return Err(ConfigError::Validation(
+						"Rebalance implementation cannot be empty when enabled".into(),
+					));
+				}
+				if rebalance.monitor_interval_seconds == 0 {
+					return Err(ConfigError::Validation(
+						"Rebalance monitor_interval_seconds must be > 0".into(),
+					));
+				}
+				if rebalance.cooldown_seconds == 0 {
+					return Err(ConfigError::Validation(
+						"Rebalance cooldown_seconds must be > 0".into(),
+					));
+				}
+				if rebalance.max_pending_transfers == 0 {
+					return Err(ConfigError::Validation(
+						"Rebalance max_pending_transfers must be > 0 when enabled".into(),
+					));
+				}
+				if rebalance.pairs.is_empty() {
+					return Err(ConfigError::Validation(
+						"Rebalance must have at least one pair when enabled".into(),
+					));
+				}
+				let mut seen_ids = std::collections::HashSet::new();
+				for pair in &rebalance.pairs {
+					if pair.pair_id.is_empty() {
+						return Err(ConfigError::Validation(
+							"Rebalance pair_id cannot be empty".into(),
+						));
+					}
+					if !seen_ids.insert(&pair.pair_id) {
+						return Err(ConfigError::Validation(format!(
+							"Duplicate rebalance pair_id: '{}'",
+							pair.pair_id
+						)));
+					}
+				}
+			}
+		}
+
 		Ok(())
 	}
 

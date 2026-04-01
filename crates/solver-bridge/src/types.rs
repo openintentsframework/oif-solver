@@ -175,8 +175,12 @@ impl PendingBridgeTransfer {
 			.unwrap_or_default()
 			.as_secs();
 
-		// If transitioning to NeedsIntervention, save the previous status
-		if matches!(new_status, BridgeTransferStatus::NeedsIntervention(_)) {
+		// If transitioning to NeedsIntervention, save the previous status —
+		// but only if we're not already in NeedsIntervention (avoid overwriting
+		// the original recoverable state with another NeedsIntervention value).
+		if matches!(new_status, BridgeTransferStatus::NeedsIntervention(_))
+			&& !matches!(self.status, BridgeTransferStatus::NeedsIntervention(_))
+		{
 			self.status_before_intervention = Some(self.status.clone());
 		}
 
