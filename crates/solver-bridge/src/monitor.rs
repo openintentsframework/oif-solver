@@ -235,8 +235,19 @@ impl RebalanceMonitor {
 				_ => {},
 			}
 
-			// Poll bridge implementation for status update
-			let new_status = bridge_impl.check_status(&transfer).await?;
+			// Poll bridge implementation for status update.
+			// Isolate per-transfer errors so one flaky RPC doesn't block all others.
+			let new_status = match bridge_impl.check_status(&transfer).await {
+				Ok(status) => status,
+				Err(e) => {
+					tracing::warn!(
+						transfer_id = %transfer.id,
+						pair = %transfer.pair_id,
+						"check_status failed, skipping transfer this tick: {e}"
+					);
+					continue;
+				},
+			};
 			if new_status != transfer.status {
 				// Handle PendingRedemption retry: if driver reports Failed for a
 				// redeem attempt, don't apply the Failed status — increment
@@ -1274,5 +1285,47 @@ mod tests {
 			.is_cooldown_active("eth-katana")
 			.await
 			.unwrap());
+	}
+
+	#[tokio::test]
+	async fn test_failed_tick_does_not_update_last_check_at() {
+		let storage = make_storage();
+		let solver_address = SOLVER_ADDRESS.to_string();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_balance()
+			.times(2)
+			.returning(move |address, token, chain_id| {
+				assert_eq!(address, solver_address);
+				match (chain_id, token) {
+					(1, Some("0x1111111111111111111111111111111111111111")) => {
+						Box::pin(async move { Ok("500000".to_string()) })
+					},
+					(747474, Some("0x3333333333333333333333333333333333333333")) => {
+						Box::pin(async move { Ok("1500000".to_string()) })
+					},
+					other => panic!("unexpected balance query: {other:?}"),
+				}
+			});
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let mut rebalance = rebalance_config();
+		rebalance.monitor_interval_seconds = 1;
+		rebalance.pairs[0].chain_a.token_address = "not-an-address".to_string();
+		let (_bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance);
+		let status = monitor.monitor_status.clone();
+
+		let (tx, rx) = tokio::sync::watch::channel(false);
+		let handle = tokio::spawn(monitor.run(rx));
+
+		tokio::time::sleep(Duration::from_millis(1100)).await;
+		tokio::task::yield_now().await;
+
+		let status_guard = status.read().await;
+		assert!(status_guard.last_check_at.is_none());
+		assert!(status_guard.next_check_at.is_some());
+		drop(status_guard);
+
+		let _ = tx.send(true);
+		let _ = handle.await;
 	}
 }
