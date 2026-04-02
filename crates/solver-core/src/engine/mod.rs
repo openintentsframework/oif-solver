@@ -93,7 +93,8 @@ pub struct SolverEngine {
 	pub(crate) settlement_handler: Arc<SettlementHandler>,
 	/// Bridge service for cross-chain rebalancing
 	pub(crate) bridge_service: Option<Arc<solver_bridge::BridgeService>>,
-	pub(crate) rebalance_monitor_status: Arc<tokio::sync::RwLock<solver_bridge::monitor::RebalanceMonitorStatus>>,
+	pub(crate) rebalance_monitor_status:
+		Arc<tokio::sync::RwLock<solver_bridge::monitor::RebalanceMonitorStatus>>,
 	/// The solver's Ethereum address.
 	pub(crate) solver_address: solver_types::Address,
 }

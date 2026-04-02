@@ -309,8 +309,7 @@ pub async fn handle_get_rebalance_status(
 							match bs.is_cooldown_active(&pair.pair_id).await {
 								Ok(v) => v,
 								Err(e) => {
-									bridge_error =
-										Some(format!("Cooldown check failed: {e}"));
+									bridge_error = Some(format!("Cooldown check failed: {e}"));
 									false
 								},
 							}
@@ -322,8 +321,7 @@ pub async fn handle_get_rebalance_status(
 							match bs.get_active_transfers_for_pair(&pair.pair_id).await {
 								Ok(transfers) => transfers.first().map(|t| t.id.clone()),
 								Err(e) => {
-									let msg =
-										format!("Active transfer query failed: {e}");
+									let msg = format!("Active transfer query failed: {e}");
 									bridge_error = Some(match bridge_error {
 										Some(existing) => format!("{existing}; {msg}"),
 										None => msg,
@@ -1075,7 +1073,9 @@ mod tests {
 			bridge_service,
 			solver_address: SOLVER_ADDRESS.to_string(),
 			delivery,
-			rebalance_monitor_status: Arc::new(tokio::sync::RwLock::new(solver_bridge::monitor::RebalanceMonitorStatus::default())),
+			rebalance_monitor_status: Arc::new(tokio::sync::RwLock::new(
+				solver_bridge::monitor::RebalanceMonitorStatus::default(),
+			)),
 		}
 	}
 

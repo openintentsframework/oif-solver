@@ -65,7 +65,8 @@ pub struct AdminApiState {
 	/// Delivery service for balance queries (used by rebalance status endpoint).
 	pub delivery: Arc<solver_delivery::DeliveryService>,
 	/// Shared monitor timing state for rebalance status API.
-	pub rebalance_monitor_status: Arc<tokio::sync::RwLock<solver_bridge::monitor::RebalanceMonitorStatus>>,
+	pub rebalance_monitor_status:
+		Arc<tokio::sync::RwLock<solver_bridge::monitor::RebalanceMonitorStatus>>,
 }
 
 /// Extractor that verifies an admin-signed request and returns the signer + contents.
@@ -1736,7 +1737,9 @@ mod tests {
 			bridge_service: None,
 			solver_address: "0x0000000000000000000000000000000000000000".to_string(),
 			delivery,
-			rebalance_monitor_status: Arc::new(tokio::sync::RwLock::new(solver_bridge::monitor::RebalanceMonitorStatus::default())),
+			rebalance_monitor_status: Arc::new(tokio::sync::RwLock::new(
+				solver_bridge::monitor::RebalanceMonitorStatus::default(),
+			)),
 		}
 	}
 
@@ -1787,7 +1790,9 @@ mod tests {
 			bridge_service: None,
 			solver_address: "0x0000000000000000000000000000000000000000".to_string(),
 			delivery,
-			rebalance_monitor_status: Arc::new(tokio::sync::RwLock::new(solver_bridge::monitor::RebalanceMonitorStatus::default())),
+			rebalance_monitor_status: Arc::new(tokio::sync::RwLock::new(
+				solver_bridge::monitor::RebalanceMonitorStatus::default(),
+			)),
 		}
 	}
 
