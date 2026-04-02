@@ -50,6 +50,8 @@ pub struct PairSideConfigResponse {
 pub struct RebalanceStatusResponse {
 	pub pairs: Vec<PairRebalanceStatus>,
 	pub active_transfers: usize,
+	pub last_check_at: Option<u64>,
+	pub next_check_at: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -300,15 +302,16 @@ pub async fn handle_get_rebalance_status(
 								RebalanceDirection::BToA => "b_to_a".to_string(),
 							});
 
+						// Bridge lookups — use safe defaults on failure, preserve computed analysis
+						let mut bridge_error: Option<String> = None;
+
 						let cooldown_active = if let Some(bs) = &state.bridge_service {
 							match bs.is_cooldown_active(&pair.pair_id).await {
 								Ok(v) => v,
 								Err(e) => {
-									pair_statuses.push(error_pair_status(
-										pair,
-										format!("Cooldown check failed: {e}"),
-									));
-									continue;
+									bridge_error =
+										Some(format!("Cooldown check failed: {e}"));
+									false
 								},
 							}
 						} else {
@@ -319,11 +322,13 @@ pub async fn handle_get_rebalance_status(
 							match bs.get_active_transfers_for_pair(&pair.pair_id).await {
 								Ok(transfers) => transfers.first().map(|t| t.id.clone()),
 								Err(e) => {
-									pair_statuses.push(error_pair_status(
-										pair,
-										format!("Active transfer query failed: {e}"),
-									));
-									continue;
+									let msg =
+										format!("Active transfer query failed: {e}");
+									bridge_error = Some(match bridge_error {
+										Some(existing) => format!("{existing}; {msg}"),
+										None => msg,
+									});
+									None
 								},
 							}
 						} else {
@@ -353,7 +358,7 @@ pub async fn handle_get_rebalance_status(
 							suggested_amount: analysis.suggested_amount.to_string(),
 							cooldown_active,
 							active_transfer_id,
-							error: None,
+							error: bridge_error,
 						});
 					},
 					(Err(e), _) | (_, Err(e)) => {
@@ -369,9 +374,13 @@ pub async fn handle_get_rebalance_status(
 		None => Vec::new(),
 	};
 
+	let monitor_status = state.rebalance_monitor_status.read().await;
+
 	Ok(Json(RebalanceStatusResponse {
 		pairs,
 		active_transfers,
+		last_check_at: monitor_status.last_check_at,
+		next_check_at: monitor_status.next_check_at,
 	}))
 }
 
@@ -591,14 +600,16 @@ pub async fn handle_update_rebalance_config(
 		},
 	}
 
-	let new_versioned = state
+	// Validate BEFORE persisting — reject invalid config without touching storage
+	let new_config = build_runtime_config(&operator_config)
+		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {e}")))?;
+
+	let _new_versioned = state
 		.config_store
 		.update(operator_config, versioned.version)
 		.await
 		.map_err(|e| AdminAuthError::Internal(format!("Config store update failed: {e}")))?;
 
-	let new_config = build_runtime_config(&new_versioned.data)
-		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {e}")))?;
 	*state.dynamic_config.write().await = new_config;
 
 	tracing::info!(
@@ -655,14 +666,16 @@ pub async fn handle_update_rebalance_threshold(
 	pair.deviation_band_bps = request.deviation_band_bps as u32;
 	pair.max_bridge_amount = request.max_bridge_amount.clone();
 
-	let new_versioned = state
+	// Validate BEFORE persisting — reject invalid config without touching storage
+	let new_config = build_runtime_config(&operator_config)
+		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {e}")))?;
+
+	let _new_versioned = state
 		.config_store
 		.update(operator_config, versioned.version)
 		.await
 		.map_err(|e| AdminAuthError::Internal(format!("Config store update failed: {e}")))?;
 
-	let new_config = build_runtime_config(&new_versioned.data)
-		.map_err(|e| AdminAuthError::Internal(format!("Invalid config: {e}")))?;
 	*state.dynamic_config.write().await = new_config;
 
 	tracing::info!(
@@ -1062,6 +1075,7 @@ mod tests {
 			bridge_service,
 			solver_address: SOLVER_ADDRESS.to_string(),
 			delivery,
+			rebalance_monitor_status: Arc::new(tokio::sync::RwLock::new(solver_bridge::monitor::RebalanceMonitorStatus::default())),
 		}
 	}
 

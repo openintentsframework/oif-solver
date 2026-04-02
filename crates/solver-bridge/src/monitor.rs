@@ -32,6 +32,16 @@ const PENDING_REDEMPTION_TIMEOUT_SECS: u64 = 24 * 3600;
 const MAX_REDEEM_RETRIES: u32 = 3;
 
 /// Background rebalance monitor.
+/// Shared monitor timing state, readable by the admin status API.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RebalanceMonitorStatus {
+	/// Unix timestamp of the last completed tick (None if never ran).
+	pub last_check_at: Option<u64>,
+	/// Unix timestamp of the next scheduled tick (None if disabled).
+	pub next_check_at: Option<u64>,
+}
+
 pub struct RebalanceMonitor {
 	bridge_service: Arc<BridgeService>,
 	delivery: Arc<solver_delivery::DeliveryService>,
@@ -40,6 +50,7 @@ pub struct RebalanceMonitor {
 	storage: Arc<StorageService>,
 	transaction_semaphore: Arc<Semaphore>,
 	solver_address: String,
+	monitor_status: Arc<RwLock<RebalanceMonitorStatus>>,
 }
 
 impl RebalanceMonitor {
@@ -50,6 +61,7 @@ impl RebalanceMonitor {
 		storage: Arc<StorageService>,
 		transaction_semaphore: Arc<Semaphore>,
 		solver_address: String,
+		monitor_status: Arc<RwLock<RebalanceMonitorStatus>>,
 	) -> Self {
 		Self {
 			bridge_service,
@@ -58,6 +70,7 @@ impl RebalanceMonitor {
 			storage,
 			transaction_semaphore,
 			solver_address,
+			monitor_status,
 		}
 	}
 
@@ -66,19 +79,42 @@ impl RebalanceMonitor {
 		tracing::info!("Rebalance monitor started");
 
 		loop {
-			let interval_seconds = {
+			let (interval_seconds, rebalance_enabled) = {
 				let config = self.dynamic_config.read().await;
-				config
-					.rebalance
-					.as_ref()
-					.map(|r| r.monitor_interval_seconds)
-					.unwrap_or(60)
+				match config.rebalance.as_ref() {
+					Some(r) if r.enabled => (r.monitor_interval_seconds, true),
+					_ => (60, false),
+				}
 			};
+
+			// Only report next_check_at when rebalance is enabled
+			{
+				let now = std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.unwrap_or_default()
+					.as_secs();
+				let mut status = self.monitor_status.write().await;
+				status.next_check_at = if rebalance_enabled {
+					Some(now + interval_seconds)
+				} else {
+					None
+				};
+			}
 
 			tokio::select! {
 				_ = tokio::time::sleep(Duration::from_secs(interval_seconds)) => {
-					if let Err(e) = self.tick().await {
-						tracing::warn!("Rebalance monitor tick failed: {}", e);
+					match self.tick().await {
+						Ok(()) => {
+							let now = std::time::SystemTime::now()
+								.duration_since(std::time::UNIX_EPOCH)
+								.unwrap_or_default()
+								.as_secs();
+							let mut status = self.monitor_status.write().await;
+							status.last_check_at = Some(now);
+						},
+						Err(e) => {
+							tracing::warn!("Rebalance monitor tick failed: {}", e);
+						},
 					}
 				}
 				_ = shutdown.changed() => {
@@ -238,6 +274,20 @@ impl RebalanceMonitor {
 					self.bridge_service
 						.update_transfer(&mut transfer, new_status)
 						.await?;
+				}
+			}
+
+			// Retry dest_scan_from_block if it was never set (transient RPC failure on transition)
+			if matches!(transfer.status, BridgeTransferStatus::Relaying)
+				&& transfer.dest_scan_from_block.is_none()
+			{
+				if let Ok(block) = self.delivery.get_block_number(transfer.dest_chain).await {
+					transfer.dest_scan_from_block = Some(block);
+					tracing::info!(
+						transfer_id = %transfer.id,
+						block,
+						"Destination scan anchor seeded on retry"
+					);
 				}
 			}
 
@@ -488,8 +538,20 @@ impl RebalanceMonitor {
 
 			let (balance_a, balance_b) = match (balance_a, balance_b) {
 				(Ok(a), Ok(b)) => {
-					let a = U256::from_str_radix(&a, 10).unwrap_or(U256::ZERO);
-					let b = U256::from_str_radix(&b, 10).unwrap_or(U256::ZERO);
+					let a = match U256::from_str_radix(&a, 10) {
+						Ok(v) => v,
+						Err(e) => {
+							tracing::warn!(pair = %pair.pair_id, "Failed to parse balance_a '{a}': {e}");
+							continue;
+						},
+					};
+					let b = match U256::from_str_radix(&b, 10) {
+						Ok(v) => v,
+						Err(e) => {
+							tracing::warn!(pair = %pair.pair_id, "Failed to parse balance_b '{b}': {e}");
+							continue;
+						},
+					};
 					(a, b)
 				},
 				(Err(e), _) | (_, Err(e)) => {
@@ -775,6 +837,7 @@ mod tests {
 			storage,
 			Arc::new(Semaphore::new(1)),
 			SOLVER_ADDRESS.to_string(),
+			Arc::new(RwLock::new(RebalanceMonitorStatus::default())),
 		);
 		(bridge_service, monitor)
 	}

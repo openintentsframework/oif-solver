@@ -93,6 +93,7 @@ pub struct SolverEngine {
 	pub(crate) settlement_handler: Arc<SettlementHandler>,
 	/// Bridge service for cross-chain rebalancing
 	pub(crate) bridge_service: Option<Arc<solver_bridge::BridgeService>>,
+	pub(crate) rebalance_monitor_status: Arc<tokio::sync::RwLock<solver_bridge::monitor::RebalanceMonitorStatus>>,
 	/// The solver's Ethereum address.
 	pub(crate) solver_address: solver_types::Address,
 }
@@ -211,6 +212,9 @@ impl SolverEngine {
 			settlement_handler,
 			bridge_service,
 			solver_address: solver_address_stored,
+			rebalance_monitor_status: Arc::new(tokio::sync::RwLock::new(
+				solver_bridge::monitor::RebalanceMonitorStatus::default(),
+			)),
 		}
 	}
 
@@ -344,6 +348,7 @@ impl SolverEngine {
 				self.storage.clone(),
 				transaction_semaphore.clone(),
 				solver_addr_hex,
+				self.rebalance_monitor_status.clone(),
 			);
 			let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 			let handle = tokio::spawn(async move { monitor.run(shutdown_rx).await });
@@ -648,6 +653,13 @@ impl SolverEngine {
 	/// Returns a reference to the bridge service, if configured.
 	pub fn bridge_service(&self) -> Option<&Arc<solver_bridge::BridgeService>> {
 		self.bridge_service.as_ref()
+	}
+
+	/// Returns the shared rebalance monitor status for the admin API.
+	pub fn rebalance_monitor_status(
+		&self,
+	) -> &Arc<tokio::sync::RwLock<solver_bridge::monitor::RebalanceMonitorStatus>> {
+		&self.rebalance_monitor_status
 	}
 
 	/// Returns the solver address as a hex string with 0x prefix.

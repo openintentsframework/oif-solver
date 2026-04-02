@@ -293,6 +293,7 @@ pub async fn start_server(
 							bridge_service: solver.bridge_service().cloned(),
 							solver_address: solver.solver_address_hex(),
 							delivery: solver.delivery().clone(),
+							rebalance_monitor_status: solver.rebalance_monitor_status().clone(),
 						})
 					},
 					Err(e) => {
