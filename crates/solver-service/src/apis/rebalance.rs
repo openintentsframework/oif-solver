@@ -415,14 +415,14 @@ pub async fn handle_trigger_rebalance(
 	}: VerifiedAdmin<TriggerRebalanceContents>,
 ) -> Result<Json<TriggerRebalanceResponse>, AdminAuthError> {
 	let bridge_service = state.bridge_service.as_ref().ok_or_else(|| {
-		AdminAuthError::InvalidMessage("Bridge service not available".to_string())
+		AdminAuthError::Internal("Bridge service not available".to_string())
 	})?;
 
 	let versioned = state
 		.config_store
 		.get()
 		.await
-		.map_err(|e| AdminAuthError::InvalidMessage(format!("Config store error: {e}")))?;
+		.map_err(|e| AdminAuthError::Internal(format!("Config store error: {e}")))?;
 
 	let rebalance_config =
 		versioned.data.rebalance.as_ref().ok_or_else(|| {
@@ -457,10 +457,15 @@ pub async fn handle_trigger_rebalance(
 	let amount = U256::from_str_radix(&request.amount, 10).map_err(|_| {
 		AdminAuthError::InvalidMessage(format!("Invalid amount: {}", request.amount))
 	})?;
+	if amount.is_zero() {
+		return Err(AdminAuthError::InvalidMessage(
+			"amount must be greater than 0".to_string(),
+		));
+	}
 	let recipient: alloy_primitives::Address = state
 		.solver_address
 		.parse()
-		.map_err(|e| AdminAuthError::InvalidMessage(format!("Invalid solver address: {e}")))?;
+		.map_err(|e| AdminAuthError::Internal(format!("Invalid solver address: {e}")))?;
 
 	let bridge_request = solver_bridge::types::BridgeRequest {
 		pair_id: request.pair_id.clone(),
@@ -537,7 +542,7 @@ pub async fn handle_resolve_transfer(
 	}: VerifiedAdmin<ResolveTransferContents>,
 ) -> Result<Json<ResolveTransferResponse>, AdminAuthError> {
 	let bridge_service = state.bridge_service.as_ref().ok_or_else(|| {
-		AdminAuthError::InvalidMessage("Bridge service not available".to_string())
+		AdminAuthError::Internal("Bridge service not available".to_string())
 	})?;
 
 	// Verify the transfer_id in the path matches the signed payload
@@ -1317,6 +1322,105 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn test_handle_trigger_rebalance_rejects_zero_amount() {
+		let recorded = Arc::new(Mutex::new(Vec::new()));
+		let bridge_service = make_bridge_service(recorded.clone());
+		let state = make_admin_state(
+			sample_operator_config(),
+			create_delivery_service(|_, _, _| Ok("0".to_string())),
+			Some(bridge_service),
+		)
+		.await;
+
+		let result = handle_trigger_rebalance(
+			axum::extract::State(state),
+			crate::apis::admin::VerifiedAdmin {
+				admin: solver_types::Address::from(alloy_address(SOLVER_ADDRESS)),
+				contents: TriggerRebalanceContents {
+					pair_id: "eth-katana".to_string(),
+					source_chain: 747474,
+					dest_chain: 1,
+					amount: "0".to_string(),
+					nonce: 1,
+					deadline: 2,
+				},
+			},
+		)
+		.await;
+
+		assert!(matches!(
+			result,
+			Err(AdminAuthError::InvalidMessage(msg)) if msg == "amount must be greater than 0"
+		));
+		assert!(recorded.lock().unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_handle_trigger_rebalance_reports_backend_faults_as_internal() {
+		let state = make_admin_state(
+			sample_operator_config(),
+			create_delivery_service(|_, _, _| Ok("0".to_string())),
+			None,
+		)
+		.await;
+
+		let result = handle_trigger_rebalance(
+			axum::extract::State(state),
+			crate::apis::admin::VerifiedAdmin {
+				admin: solver_types::Address::from(alloy_address(SOLVER_ADDRESS)),
+				contents: TriggerRebalanceContents {
+					pair_id: "eth-katana".to_string(),
+					source_chain: 747474,
+					dest_chain: 1,
+					amount: "12345".to_string(),
+					nonce: 1,
+					deadline: 2,
+				},
+			},
+		)
+		.await;
+
+		assert!(matches!(
+			result,
+			Err(AdminAuthError::Internal(msg)) if msg == "Bridge service not available"
+		));
+	}
+
+	#[tokio::test]
+	async fn test_handle_trigger_rebalance_reports_invalid_solver_address_as_internal() {
+		let recorded = Arc::new(Mutex::new(Vec::new()));
+		let bridge_service = make_bridge_service(recorded);
+		let mut state = make_admin_state(
+			sample_operator_config(),
+			create_delivery_service(|_, _, _| Ok("0".to_string())),
+			Some(bridge_service),
+		)
+		.await;
+		state.solver_address = "not-an-address".to_string();
+
+		let result = handle_trigger_rebalance(
+			axum::extract::State(state),
+			crate::apis::admin::VerifiedAdmin {
+				admin: solver_types::Address::from(alloy_address(SOLVER_ADDRESS)),
+				contents: TriggerRebalanceContents {
+					pair_id: "eth-katana".to_string(),
+					source_chain: 747474,
+					dest_chain: 1,
+					amount: "12345".to_string(),
+					nonce: 1,
+					deadline: 2,
+				},
+			},
+		)
+		.await;
+
+		assert!(matches!(
+			result,
+			Err(AdminAuthError::Internal(msg)) if msg.starts_with("Invalid solver address:")
+		));
+	}
+
+	#[tokio::test]
 	async fn test_handle_resolve_transfer_propagates_success_response() {
 		let bridge_service = make_bridge_service(Arc::new(Mutex::new(Vec::new())));
 		let mut transfer = solver_bridge::types::PendingBridgeTransfer::new(
@@ -1394,7 +1498,7 @@ mod tests {
 
 		assert!(matches!(
 			err,
-			Err(AdminAuthError::InvalidMessage(msg)) if msg == "Bridge service not available"
+			Err(AdminAuthError::Internal(msg)) if msg == "Bridge service not available"
 		));
 	}
 }

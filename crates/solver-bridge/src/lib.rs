@@ -264,7 +264,7 @@ impl BridgeService {
 		&self,
 		transfer_id: &str,
 		resolution: &str,
-		_reason: &str,
+		reason: &str,
 	) -> Result<PendingBridgeTransfer, BridgeError> {
 		let mut transfer = self.get_transfer(transfer_id).await?;
 
@@ -302,6 +302,8 @@ impl BridgeService {
 				)));
 			},
 		}
+
+		transfer.resolution_reason = Some(reason.to_string());
 
 		self.storage.save_transfer(&transfer).await?;
 		Ok(transfer)
@@ -733,8 +735,10 @@ mod tests {
 			.unwrap();
 
 		assert!(matches!(resolved.status, BridgeTransferStatus::Completed));
+		assert_eq!(resolved.resolution_reason.as_deref(), Some("done"));
 		let saved = saved.lock().unwrap().clone().unwrap();
 		assert!(matches!(saved.status, BridgeTransferStatus::Completed));
+		assert_eq!(saved.resolution_reason.as_deref(), Some("done"));
 	}
 
 	#[tokio::test]
@@ -769,8 +773,10 @@ mod tests {
 			.unwrap();
 
 		assert!(matches!(resolved.status, BridgeTransferStatus::Failed(_)));
+		assert_eq!(resolved.resolution_reason.as_deref(), Some("done"));
 		let saved = saved.lock().unwrap().clone().unwrap();
 		assert!(matches!(saved.status, BridgeTransferStatus::Failed(_)));
+		assert_eq!(saved.resolution_reason.as_deref(), Some("done"));
 	}
 
 	#[tokio::test]
@@ -808,10 +814,12 @@ mod tests {
 
 		assert!(matches!(resolved.status, BridgeTransferStatus::Relaying));
 		assert_eq!(resolved.failure_count, 0);
+		assert_eq!(resolved.resolution_reason.as_deref(), Some("retrying"));
 		let saved = saved.lock().unwrap().clone().unwrap();
 		assert!(matches!(saved.status, BridgeTransferStatus::Relaying));
 		assert_eq!(saved.failure_count, 0);
 		assert!(saved.status_before_intervention.is_none());
+		assert_eq!(saved.resolution_reason.as_deref(), Some("retrying"));
 	}
 
 	#[tokio::test]

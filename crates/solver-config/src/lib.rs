@@ -733,6 +733,12 @@ impl Config {
 						"Rebalance max_pending_transfers must be > 0 when enabled".into(),
 					));
 				}
+				if rebalance.bridge_config.is_none() {
+					return Err(ConfigError::Validation(
+						"Rebalance bridge_config must be present when rebalance is enabled"
+							.into(),
+					));
+				}
 				if rebalance.pairs.is_empty() {
 					return Err(ConfigError::Validation(
 						"Rebalance must have at least one pair when enabled".into(),
@@ -1331,6 +1337,10 @@ mod tests {
 			"monitor_interval_seconds": 15,
 			"cooldown_seconds": 60,
 			"max_pending_transfers": 3,
+			"bridge_config": {
+				"composer_addresses": {},
+				"vault_addresses": { "1": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+			},
 			"pairs": [{
 				"pair_id": "eth-katana",
 				"chain_a": {
@@ -1389,6 +1399,19 @@ mod tests {
 			parse_json_fixture(zero_pending),
 			Err(ConfigError::Validation(message))
 				if message.contains("max_pending_transfers")
+		));
+	}
+
+	#[test]
+	fn test_rebalance_enabled_requires_bridge_config() {
+		let mut config = base_rebalance_config_json();
+		config["rebalance"]["bridge_config"] = serde_json::Value::Null;
+
+		let result = parse_json_fixture(config);
+		assert!(matches!(
+			result,
+			Err(ConfigError::Validation(message))
+				if message.contains("bridge_config must be present when rebalance is enabled")
 		));
 	}
 

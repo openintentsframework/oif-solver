@@ -189,6 +189,8 @@ pub struct PendingBridgeTransfer {
 	/// Actual shares received on destination (decoded from Transfer event).
 	/// Used for vault redeem — may differ from `amount` due to slippage/fees.
 	pub received_shares: Option<String>,
+	/// Operator-provided reason when a transfer is manually resolved.
+	pub resolution_reason: Option<String>,
 }
 
 impl PendingBridgeTransfer {
@@ -234,6 +236,7 @@ impl PendingBridgeTransfer {
 			is_composer_flow: None,
 			vault_address: None,
 			received_shares: None,
+			resolution_reason: None,
 		}
 	}
 
