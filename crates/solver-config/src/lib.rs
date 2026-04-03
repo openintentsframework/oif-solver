@@ -735,8 +735,7 @@ impl Config {
 				}
 				if rebalance.bridge_config.is_none() {
 					return Err(ConfigError::Validation(
-						"Rebalance bridge_config must be present when rebalance is enabled"
-							.into(),
+						"Rebalance bridge_config must be present when rebalance is enabled".into(),
 					));
 				}
 				if rebalance.pairs.is_empty() {

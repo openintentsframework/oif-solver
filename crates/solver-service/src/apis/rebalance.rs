@@ -414,9 +414,10 @@ pub async fn handle_trigger_rebalance(
 		contents: request,
 	}: VerifiedAdmin<TriggerRebalanceContents>,
 ) -> Result<Json<TriggerRebalanceResponse>, AdminAuthError> {
-	let bridge_service = state.bridge_service.as_ref().ok_or_else(|| {
-		AdminAuthError::Internal("Bridge service not available".to_string())
-	})?;
+	let bridge_service = state
+		.bridge_service
+		.as_ref()
+		.ok_or_else(|| AdminAuthError::Internal("Bridge service not available".to_string()))?;
 
 	let versioned = state
 		.config_store
@@ -541,9 +542,10 @@ pub async fn handle_resolve_transfer(
 		contents: request,
 	}: VerifiedAdmin<ResolveTransferContents>,
 ) -> Result<Json<ResolveTransferResponse>, AdminAuthError> {
-	let bridge_service = state.bridge_service.as_ref().ok_or_else(|| {
-		AdminAuthError::Internal("Bridge service not available".to_string())
-	})?;
+	let bridge_service = state
+		.bridge_service
+		.as_ref()
+		.ok_or_else(|| AdminAuthError::Internal("Bridge service not available".to_string()))?;
 
 	// Verify the transfer_id in the path matches the signed payload
 	if transfer_id != request.transfer_id {
