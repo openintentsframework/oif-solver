@@ -19,6 +19,7 @@ A high-performance cross-chain solver implementation for the Open Intents Framew
 - [Configuration](#configuration)
   - [AWS KMS Signing](#aws-kms-signing)
 - [API Reference](#api-reference)
+- [Cross-Chain Rebalancing](#cross-chain-rebalancing)
 - [Testing and Development with solver-demo](#testing-and-development-with-solver-demo)
 - [Development](#development)
 - [License](#license)
@@ -633,6 +634,7 @@ The solver provides a REST API for interacting with the system and submitting of
 - **Auth API**: [`api-spec/auth-api.yaml`](api-spec/auth-api.yaml) - JWT issuance flows (SIWE + register/refresh)
 - **Admin API**: [`api-spec/admin-api.yaml`](api-spec/admin-api.yaml) - Wallet-based admin operations (EIP-712 signed)
 - **Admin Auth Guide**: [`docs/admin-authentication.md`](docs/admin-authentication.md) - Practical auth + nonce flow guide
+- **Rebalance API**: [`api-spec/rebalance-api.yaml`](api-spec/rebalance-api.yaml) - Cross-chain rebalancing endpoints (EIP-712 signed)
 
 ### API Flows
 
@@ -1080,6 +1082,19 @@ The `--log-level` flag acts as a fallback when `RUST_LOG` is not set:
 # Uses info level for all modules when RUST_LOG is not set
 cargo run -- --log-level info
 ```
+
+## Cross-Chain Rebalancing
+
+The solver includes automated cross-chain token rebalancing. A background monitor checks balances at a configurable interval and automatically bridges tokens when they drift outside a target band.
+
+**Key features:**
+- Threshold-based auto-trigger with configurable target balance and deviation band per pair
+- Safety guards: cooldowns, max concurrent transfers, per-pair locking, transaction serialization
+- Manual trigger and admin resolution via EIP-712 signed API endpoints
+- 6-state transfer lifecycle with automatic escalation to NeedsIntervention on timeouts
+- Runtime config updates via PUT endpoints (hot-reload without restart)
+
+**Quick start:** Add a `rebalance` section to your bootstrap config. See [`docs/rebalance.md`](docs/rebalance.md) for the full config reference, and [`api-spec/rebalance-api.yaml`](api-spec/rebalance-api.yaml) for the OpenAPI spec.
 
 ## Testing and Development with solver-demo
 
