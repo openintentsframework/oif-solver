@@ -91,6 +91,12 @@ pub struct SolverEngine {
 	pub(crate) transaction_handler: Arc<TransactionHandler>,
 	/// Settlement handler
 	pub(crate) settlement_handler: Arc<SettlementHandler>,
+	/// Bridge service for cross-chain rebalancing
+	pub(crate) bridge_service: Option<Arc<solver_bridge::BridgeService>>,
+	pub(crate) rebalance_monitor_status:
+		Arc<tokio::sync::RwLock<solver_bridge::monitor::RebalanceMonitorStatus>>,
+	/// The solver's Ethereum address.
+	pub(crate) solver_address: solver_types::Address,
 }
 
 /// Number of orders to batch together for claim operations.
@@ -120,6 +126,7 @@ impl SolverEngine {
 	/// * `pricing` - Service for asset price conversion
 	/// * `event_bus` - Event bus for inter-service communication
 	/// * `token_manager` - Manager for token approvals and validation
+	/// * `bridge_service` - Optional bridge service for cross-chain rebalancing
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		dynamic_config: Arc<RwLock<Config>>,
@@ -134,7 +141,10 @@ impl SolverEngine {
 		pricing: Arc<PricingService>,
 		event_bus: event_bus::EventBus,
 		token_manager: Arc<TokenManager>,
+		bridge_service: Option<Arc<solver_bridge::BridgeService>>,
 	) -> Self {
+		let solver_address_stored = solver_address.clone();
+
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 
 		// Create CostProfitService for cost estimation and profitability validation
@@ -201,6 +211,11 @@ impl SolverEngine {
 			order_handler,
 			transaction_handler,
 			settlement_handler,
+			bridge_service,
+			solver_address: solver_address_stored,
+			rebalance_monitor_status: Arc::new(tokio::sync::RwLock::new(
+				solver_bridge::monitor::RebalanceMonitorStatus::default(),
+			)),
 		}
 	}
 
@@ -324,6 +339,25 @@ impl SolverEngine {
 		// Transaction events need to be serialized to avoid nonce conflicts
 		let transaction_semaphore = Arc::new(Semaphore::new(1)); // Serialize transaction submissions
 		let general_semaphore = Arc::new(Semaphore::new(100)); // Allow concurrent non-tx operations
+
+		let rebalance_handle = if let Some(bridge_service) = &self.bridge_service {
+			let solver_addr_hex = format!("0x{}", hex::encode(&self.solver_address.0));
+			let monitor = solver_bridge::monitor::RebalanceMonitor::new(
+				bridge_service.clone(),
+				self.delivery.clone(),
+				self.dynamic_config.clone(),
+				self.storage.clone(),
+				transaction_semaphore.clone(),
+				solver_addr_hex,
+				self.rebalance_monitor_status.clone(),
+			);
+			let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+			let handle = tokio::spawn(async move { monitor.run(shutdown_rx).await });
+			tracing::info!("Rebalance monitor started");
+			Some((handle, shutdown_tx))
+		} else {
+			None
+		};
 
 		loop {
 			tokio::select! {
@@ -533,6 +567,12 @@ impl SolverEngine {
 		// Cleanup
 		cleanup_handle.abort();
 
+		if let Some((handle, shutdown_tx)) = rebalance_handle {
+			let _ = shutdown_tx.send(true);
+			handle.abort();
+			tracing::info!("Rebalance monitor stopped");
+		}
+
 		self.discovery
 			.stop_all()
 			.await
@@ -609,6 +649,23 @@ impl SolverEngine {
 	/// Returns a reference to the pricing service.
 	pub fn pricing(&self) -> &Arc<PricingService> {
 		&self.pricing
+	}
+
+	/// Returns a reference to the bridge service, if configured.
+	pub fn bridge_service(&self) -> Option<&Arc<solver_bridge::BridgeService>> {
+		self.bridge_service.as_ref()
+	}
+
+	/// Returns the shared rebalance monitor status for the admin API.
+	pub fn rebalance_monitor_status(
+		&self,
+	) -> &Arc<tokio::sync::RwLock<solver_bridge::monitor::RebalanceMonitorStatus>> {
+		&self.rebalance_monitor_status
+	}
+
+	/// Returns the solver address as a hex string with 0x prefix.
+	pub fn solver_address_hex(&self) -> String {
+		format!("0x{}", hex::encode(&self.solver_address.0))
 	}
 
 	/// Helper method to spawn handler tasks with semaphore-based concurrency control.
@@ -785,6 +842,7 @@ mod tests {
 			pricing.clone(),
 			event_bus.clone(),
 			token_manager.clone(),
+			None,
 		);
 
 		// Verify the engine was constructed properly by testing its accessors
@@ -831,6 +889,7 @@ mod tests {
 			pricing,
 			event_bus,
 			token_manager,
+			None,
 		);
 
 		// This test assumes the RecoveryService will return empty results for memory storage
@@ -870,6 +929,7 @@ mod tests {
 			pricing,
 			event_bus,
 			token_manager,
+			None,
 		);
 
 		// Even if recovery fails internally, the method should return Ok with empty Vec
@@ -908,6 +968,7 @@ mod tests {
 			pricing,
 			event_bus,
 			token_manager,
+			None,
 		);
 
 		let semaphore = Arc::new(Semaphore::new(1));

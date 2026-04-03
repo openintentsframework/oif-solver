@@ -604,6 +604,53 @@ impl SolverBuilder {
 			},
 		}
 
+		// Construct BridgeService if rebalance is configured and enabled
+		let bridge_service = if let Some(ref rebalance) = self.static_config.rebalance {
+			if rebalance.enabled {
+				let alloy_addr = alloy_primitives::Address::from_slice(&solver_address.0);
+
+				let bridge_config = rebalance.bridge_config.as_ref().ok_or_else(|| {
+					BuilderError::Config("Rebalance enabled but bridge_config is missing".into())
+				})?;
+
+				let registered = solver_bridge::get_all_implementations();
+				let target = &rebalance.implementation;
+				let (_, factory) = registered
+					.iter()
+					.find(|(name, _)| *name == target.as_str())
+					.ok_or_else(|| {
+						BuilderError::Config(format!(
+							"Rebalance implementation '{target}' not registered. Available: {:?}",
+							registered.iter().map(|(n, _)| n).collect::<Vec<_>>()
+						))
+					})?;
+
+				let impl_ = factory(bridge_config, delivery.clone(), alloy_addr).map_err(|e| {
+					BuilderError::Config(format!(
+						"Failed to create bridge implementation '{target}': {e}"
+					))
+				})?;
+
+				let mut impls = std::collections::HashMap::new();
+				impls.insert(target.clone(), std::sync::Arc::from(impl_));
+
+				tracing::info!(
+					implementation = target,
+					"Bridge service initialized for rebalancing"
+				);
+
+				Some(std::sync::Arc::new(solver_bridge::BridgeService::new(
+					impls,
+					storage.clone(),
+					self.static_config.solver.id.clone(),
+				)))
+			} else {
+				None
+			}
+		} else {
+			None
+		};
+
 		Ok(SolverEngine::new(
 			self.dynamic_config,
 			self.static_config,
@@ -617,6 +664,7 @@ impl SolverBuilder {
 			pricing,
 			EventBus::new(1000),
 			token_manager,
+			bridge_service,
 		))
 	}
 }

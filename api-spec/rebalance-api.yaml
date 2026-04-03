@@ -1,0 +1,492 @@
+openapi: 3.0.3
+info:
+  title: OIF Solver Rebalance API
+  description: |
+    Admin endpoints for cross-chain token rebalancing.
+
+    Read endpoints (GET) require JWT with `admin-all` scope.
+    Write endpoints (POST, PUT) require EIP-712 signed payloads.
+    All endpoints are under `/api/v1/admin/rebalance/`.
+  version: 1.0.0
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Local development server
+
+paths:
+  /admin/rebalance/config:
+    get:
+      summary: Get rebalance configuration
+      description: Returns the current rebalance config including all pairs, thresholds, and global settings.
+      operationId: getRebalanceConfig
+      tags:
+        - Rebalance
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current rebalance configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RebalanceConfigResponse"
+        "401":
+          description: Unauthorized
+        "500":
+          description: Internal server error
+
+    put:
+      summary: Update global rebalance settings
+      description: |
+        Update enabled state, cooldown, and max pending transfers.
+        Requires EIP-712 signature. Config is validated before persisting.
+      operationId: updateRebalanceConfig
+      tags:
+        - Rebalance
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignedUpdateRebalanceConfigRequest"
+      responses:
+        "200":
+          description: Config updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminActionResponse"
+        "401":
+          description: Unauthorized or invalid signature
+
+  /admin/rebalance/config/threshold:
+    put:
+      summary: Update per-pair thresholds
+      description: |
+        Update target balances, deviation band, and max bridge amount for a specific pair.
+        Requires EIP-712 signature. Config is validated before persisting.
+      operationId: updateRebalanceThreshold
+      tags:
+        - Rebalance
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignedUpdateRebalanceThresholdRequest"
+      responses:
+        "200":
+          description: Threshold updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminActionResponse"
+        "401":
+          description: Unauthorized or invalid signature
+
+  /admin/rebalance/status:
+    get:
+      summary: Get rebalance status
+      description: |
+        Returns real-time balance vs threshold analysis for each configured pair.
+        Includes current balances, bounds, direction needed, cooldown state,
+        active transfer IDs, and monitor freshness timestamps.
+      operationId: getRebalanceStatus
+      tags:
+        - Rebalance
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current rebalance status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RebalanceStatusResponse"
+
+  /admin/rebalance/transfers:
+    get:
+      summary: Get rebalance transfers
+      description: Returns active (in-progress) and recent historical transfers.
+      operationId: getRebalanceTransfers
+      tags:
+        - Rebalance
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Active and historical transfers
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RebalanceTransfersResponse"
+
+  /admin/rebalance/trigger:
+    post:
+      summary: Manually trigger a rebalance
+      description: |
+        Initiate a manual cross-chain rebalance for a specific pair and direction.
+        Requires EIP-712 signature. The pair must exist in config and the route
+        must be valid (non-composer routes require a vault address).
+      operationId: triggerRebalance
+      tags:
+        - Rebalance
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignedTriggerRebalanceRequest"
+      responses:
+        "200":
+          description: Rebalance result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TriggerRebalanceResponse"
+        "401":
+          description: Unauthorized or invalid signature
+
+  /admin/rebalance/transfers/{transferId}/resolve:
+    post:
+      summary: Resolve a stuck transfer
+      description: |
+        Resolve a transfer in NeedsIntervention state. Three resolutions available:
+        mark_completed, mark_failed, or retry.
+        Requires EIP-712 signature. The transfer_id in the path must match the signed payload.
+      operationId: resolveTransfer
+      tags:
+        - Rebalance
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: transferId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignedResolveTransferRequest"
+      responses:
+        "200":
+          description: Resolution result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResolveTransferResponse"
+        "401":
+          description: Unauthorized or invalid signature
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    RebalanceConfigResponse:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        implementation:
+          type: string
+          example: "layerzero"
+        monitorIntervalSeconds:
+          type: integer
+        cooldownSeconds:
+          type: integer
+        maxPendingTransfers:
+          type: integer
+        pairs:
+          type: array
+          items:
+            $ref: "#/components/schemas/PairConfig"
+
+    PairConfig:
+      type: object
+      properties:
+        pairId:
+          type: string
+          example: "usdc-eth-arb"
+        chainA:
+          $ref: "#/components/schemas/PairSideConfig"
+        chainB:
+          $ref: "#/components/schemas/PairSideConfig"
+        targetBalanceA:
+          type: string
+          description: Target balance in base units (decimal string)
+          example: "10000000"
+        targetBalanceB:
+          type: string
+          example: "10000000"
+        deviationBandBps:
+          type: integer
+          description: Acceptable deviation in basis points (2000 = +/-20%)
+          example: 2000
+        maxBridgeAmount:
+          type: string
+          example: "5000000"
+
+    PairSideConfig:
+      type: object
+      properties:
+        chainId:
+          type: integer
+          example: 1
+        tokenAddress:
+          type: string
+          example: "0x<token_address>"
+        oftAddress:
+          type: string
+          example: "0x<oft_address>"
+
+    RebalanceStatusResponse:
+      type: object
+      properties:
+        pairs:
+          type: array
+          items:
+            $ref: "#/components/schemas/PairRebalanceStatus"
+        activeTransfers:
+          type: integer
+        lastCheckAt:
+          type: integer
+          nullable: true
+          description: Unix timestamp of last successful monitor tick (null if never ran)
+        nextCheckAt:
+          type: integer
+          nullable: true
+          description: Unix timestamp of next scheduled tick (null if disabled)
+
+    PairRebalanceStatus:
+      type: object
+      properties:
+        pairId:
+          type: string
+        chainA:
+          $ref: "#/components/schemas/PairSideStatus"
+        chainB:
+          $ref: "#/components/schemas/PairSideStatus"
+        deviationBandBps:
+          type: integer
+        directionNeeded:
+          type: string
+          nullable: true
+          enum: [a_to_b, b_to_a]
+        suggestedAmount:
+          type: string
+        cooldownActive:
+          type: boolean
+        activeTransferId:
+          type: string
+          nullable: true
+        error:
+          type: string
+          nullable: true
+          description: Error message if balance/bridge queries failed for this pair
+
+    PairSideStatus:
+      type: object
+      properties:
+        chainId:
+          type: integer
+        currentBalance:
+          type: string
+        targetBalance:
+          type: string
+        lowerBound:
+          type: string
+        upperBound:
+          type: string
+        withinBand:
+          type: boolean
+
+    RebalanceTransfersResponse:
+      type: object
+      properties:
+        active:
+          type: array
+          items:
+            $ref: "#/components/schemas/BridgeOperation"
+        history:
+          type: array
+          items:
+            $ref: "#/components/schemas/BridgeOperation"
+
+    BridgeOperation:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        pairId:
+          type: string
+        sourceChainId:
+          type: integer
+        destinationChainId:
+          type: integer
+        amount:
+          type: string
+        status:
+          type: string
+          enum: [submitted, relaying, pending_redemption, completed, failed, needs_intervention]
+        statusReason:
+          type: string
+          nullable: true
+          description: Reason for failed or needs_intervention status
+        trigger:
+          type: string
+          enum: [auto, manual]
+        createdAt:
+          type: integer
+          description: Unix timestamp
+        updatedAt:
+          type: integer
+        txHash:
+          type: string
+          nullable: true
+        messageGuid:
+          type: string
+          nullable: true
+        redeemTxHash:
+          type: string
+          nullable: true
+        feePaid:
+          type: string
+          nullable: true
+
+    TriggerRebalanceResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        operationId:
+          type: string
+          nullable: true
+        txHash:
+          type: string
+          nullable: true
+
+    ResolveTransferResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        transferId:
+          type: string
+        newStatus:
+          type: string
+
+    AdminActionResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        admin:
+          type: string
+
+    SignedTriggerRebalanceRequest:
+      type: object
+      required: [contents, signature]
+      properties:
+        contents:
+          type: object
+          properties:
+            pairId:
+              type: string
+            sourceChain:
+              type: integer
+            destChain:
+              type: integer
+            amount:
+              type: string
+            nonce:
+              type: integer
+            deadline:
+              type: integer
+        signature:
+          type: string
+          description: EIP-712 signature hex string
+
+    SignedResolveTransferRequest:
+      type: object
+      required: [contents, signature]
+      properties:
+        contents:
+          type: object
+          properties:
+            transferId:
+              type: string
+            resolution:
+              type: string
+              enum: [mark_completed, mark_failed, retry]
+            reason:
+              type: string
+            nonce:
+              type: integer
+            deadline:
+              type: integer
+        signature:
+          type: string
+
+    SignedUpdateRebalanceConfigRequest:
+      type: object
+      required: [contents, signature]
+      properties:
+        contents:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+            cooldownSeconds:
+              type: integer
+            maxPendingTransfers:
+              type: integer
+            nonce:
+              type: integer
+            deadline:
+              type: integer
+        signature:
+          type: string
+
+    SignedUpdateRebalanceThresholdRequest:
+      type: object
+      required: [contents, signature]
+      properties:
+        contents:
+          type: object
+          properties:
+            pairId:
+              type: string
+            targetBalanceA:
+              type: string
+            targetBalanceB:
+              type: string
+            deviationBandBps:
+              type: integer
+            maxBridgeAmount:
+              type: string
+            nonce:
+              type: integer
+            deadline:
+              type: integer
+        signature:
+          type: string

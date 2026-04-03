@@ -23,3 +23,8 @@ thiserror = "2.0"
 tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 uuid = { workspace = true }
+
+[dev-dependencies]
+solver-delivery = { path = "../solver-delivery", features = ["testing"] }
+solver-storage = { path = "../solver-storage", features = ["testing"] }
+tokio = { workspace = true }

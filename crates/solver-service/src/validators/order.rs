@@ -235,6 +235,7 @@ mod tests {
 		networks::RpcEndpoint,
 		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
 		validation::ConfigSchema,
+		Log, LogFilter,
 	};
 	use std::{collections::HashMap, sync::Arc};
 
@@ -330,6 +331,10 @@ mod tests {
 				.map(Bytes::from)
 				.ok_or_else(|| DeliveryError::Network("contract response not set".to_string()))
 		}
+
+		async fn get_logs(&self, _: u64, _: LogFilter) -> Result<Vec<Log>, DeliveryError> {
+			Ok(vec![])
+		}
 	}
 
 	fn build_networks(chain_id: u64, compact_address: &str) -> solver_types::NetworksConfig {
@@ -387,6 +392,7 @@ mod tests {
 			pricing,
 			event_bus,
 			token_manager,
+			None,
 		)
 	}
 

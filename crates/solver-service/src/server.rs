@@ -290,6 +290,10 @@ pub async fn start_server(
 							nonce_store,
 							// Token manager for hot-reloading token configurations
 							token_manager: solver.token_manager().clone(),
+							bridge_service: solver.bridge_service().cloned(),
+							solver_address: solver.solver_address_hex(),
+							delivery: solver.delivery().clone(),
+							rebalance_monitor_status: solver.rebalance_monitor_status().clone(),
 						})
 					},
 					Err(e) => {
@@ -354,20 +358,44 @@ pub async fn start_server(
 			.route("/gas", get(handle_get_gas))
 			.route("/gas", put(handle_update_gas));
 
-		// Only apply JWT auth to protected admin routes if orders_require_auth is true
-		// (i.e., auth.enabled in config). Admin routes also have their own
-		// EIP-712 signature auth for admin actions.
-		if orders_require_auth {
-			if let Some(jwt) = &jwt_service {
-				admin_protected_routes =
-					admin_protected_routes.layer(middleware::from_fn_with_state(
-						AuthState {
-							jwt_service: jwt.clone(),
-							required_scope: solver_types::AuthScope::AdminAll,
-						},
-						auth_middleware,
-					));
-			}
+		let rebalance_routes = axum::Router::new()
+			.route(
+				"/config",
+				axum::routing::get(crate::apis::rebalance::handle_get_rebalance_config)
+					.put(crate::apis::rebalance::handle_update_rebalance_config),
+			)
+			.route(
+				"/config/threshold",
+				axum::routing::put(crate::apis::rebalance::handle_update_rebalance_threshold),
+			)
+			.route(
+				"/status",
+				axum::routing::get(crate::apis::rebalance::handle_get_rebalance_status),
+			)
+			.route(
+				"/transfers",
+				axum::routing::get(crate::apis::rebalance::handle_get_rebalance_transfers),
+			)
+			.route(
+				"/trigger",
+				axum::routing::post(crate::apis::rebalance::handle_trigger_rebalance),
+			)
+			.route(
+				"/transfers/{id}/resolve",
+				axum::routing::post(crate::apis::rebalance::handle_resolve_transfer),
+			);
+
+		admin_protected_routes = admin_protected_routes.nest("/rebalance", rebalance_routes);
+
+		// Admin routes always require JWT authentication, regardless of order auth settings.
+		if let Some(jwt) = &jwt_service {
+			admin_protected_routes = admin_protected_routes.layer(middleware::from_fn_with_state(
+				AuthState {
+					jwt_service: jwt.clone(),
+					required_scope: solver_types::AuthScope::AdminAll,
+				},
+				auth_middleware,
+			));
 		}
 
 		let admin_routes = admin_protected_routes.with_state(admin_state);
@@ -1032,6 +1060,7 @@ mod tests {
 			pricing,
 			event_bus,
 			token_manager,
+			None,
 		);
 
 		Arc::new(engine)

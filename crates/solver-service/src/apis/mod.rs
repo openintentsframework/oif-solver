@@ -8,4 +8,5 @@ pub mod auth;
 pub mod health;
 pub mod order;
 pub mod quote;
+pub mod rebalance;
 pub mod tokens;

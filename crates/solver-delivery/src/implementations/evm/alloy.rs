@@ -496,6 +496,50 @@ impl DeliveryInterface for AlloyDelivery {
 
 		Ok(result)
 	}
+
+	async fn get_logs(
+		&self,
+		chain_id: u64,
+		filter: solver_types::LogFilter,
+	) -> Result<Vec<solver_types::Log>, DeliveryError> {
+		let provider = self.get_provider(chain_id)?;
+
+		let mut alloy_filter = alloy_rpc_types::Filter::new()
+			.address(alloy_primitives::Address::from_slice(&filter.address.0))
+			.from_block(filter.from_block);
+
+		if let Some(to) = filter.to_block {
+			alloy_filter = alloy_filter.to_block(to);
+		}
+
+		// Apply topic filters for precise event matching
+		for (i, topic) in filter.topics().iter().enumerate() {
+			if let Some(t) = topic {
+				let topic_hash = alloy_primitives::FixedBytes::<32>::from(t.0);
+				match i {
+					0 => alloy_filter = alloy_filter.event_signature(topic_hash),
+					1 => alloy_filter = alloy_filter.topic1(topic_hash),
+					2 => alloy_filter = alloy_filter.topic2(topic_hash),
+					3 => alloy_filter = alloy_filter.topic3(topic_hash),
+					_ => {},
+				}
+			}
+		}
+
+		let logs = provider
+			.get_logs(&alloy_filter)
+			.await
+			.map_err(|e| DeliveryError::Network(format!("get_logs failed: {e}")))?;
+
+		Ok(logs
+			.into_iter()
+			.map(|l| solver_types::Log {
+				address: solver_types::Address(l.address().as_slice().to_vec()),
+				topics: l.topics().iter().map(|t| solver_types::H256(t.0)).collect(),
+				data: l.data().data.to_vec(),
+			})
+			.collect())
+	}
 }
 
 /// Monitors a pending transaction for confirmation or timeout.

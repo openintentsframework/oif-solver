@@ -75,6 +75,48 @@ impl From<&AlloyReceipt> for TransactionReceipt {
 	}
 }
 
+/// Filter parameters for querying event logs.
+/// Topics are capped at 4 (Ethereum RPC limit) via the constructor.
+#[derive(Debug, Clone)]
+pub struct LogFilter {
+	/// Contract address to filter logs from.
+	pub address: Address,
+	/// Block to start scanning from (inclusive).
+	pub from_block: u64,
+	/// Block to scan to (inclusive). None = latest.
+	pub to_block: Option<u64>,
+	/// Topic filters (private — enforced via constructor).
+	topics: Vec<Option<H256>>,
+}
+
+impl LogFilter {
+	/// Create a new log filter. Topics beyond 4 are truncated with a warning.
+	pub fn new(
+		address: Address,
+		from_block: u64,
+		to_block: Option<u64>,
+		topics: Vec<Option<H256>>,
+	) -> Self {
+		let topics = if topics.len() > 4 {
+			tracing::warn!("LogFilter topics truncated from {} to 4", topics.len());
+			topics.into_iter().take(4).collect()
+		} else {
+			topics
+		};
+		Self {
+			address,
+			from_block,
+			to_block,
+			topics,
+		}
+	}
+
+	/// Access the topic filters.
+	pub fn topics(&self) -> &[Option<H256>] {
+		&self.topics
+	}
+}
+
 /// Chain data structure containing current blockchain state information.
 ///
 /// This structure provides a snapshot of blockchain state at a specific point in time,

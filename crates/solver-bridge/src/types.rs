@@ -4,24 +4,45 @@ use alloy_primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 
 /// Typed request for a bridge operation.
+///
+/// Separates ERC-20/share tokens (used for approve/balance) from OFT contracts
+/// (used for quoteSend/send). This prevents the PR #315 bug where the two were confused.
 #[derive(Debug, Clone)]
 pub struct BridgeRequest {
-	/// Canonical pair ID (e.g., "USDC:1:747474").
+	/// Operator-chosen pair ID (e.g., "usdc-eth-katana").
 	pub pair_id: String,
 	/// Source chain ID.
 	pub source_chain: u64,
 	/// Destination chain ID.
 	pub dest_chain: u64,
-	/// Source token address on the source chain.
+	/// ERC-20/share token on source chain — used for approve() and balanceOf().
 	pub source_token: Address,
-	/// Destination token address on the destination chain.
+	/// OFT contract on source chain — used for quoteSend() and send().
+	pub source_oft: Address,
+	/// ERC-20/share token on destination chain — for balance verification.
 	pub dest_token: Address,
+	/// OFT contract on destination chain — for event scanning.
+	pub dest_oft: Address,
 	/// Amount to bridge in source token units.
 	pub amount: U256,
 	/// Minimum amount to receive (slippage floor).
 	pub min_amount: Option<U256>,
 	/// Recipient address on the destination chain.
 	pub recipient: Address,
+}
+
+/// Metadata needed for the delivery detection and redeem completion path.
+/// Must be provided by the caller (monitor or admin API) when initiating a transfer.
+#[derive(Debug, Clone)]
+pub struct TransferMetadata {
+	/// Destination token/share contract address (for Transfer event scanning).
+	pub dest_token_address: String,
+	/// Destination OFT contract address.
+	pub dest_oft_address: String,
+	/// Whether this is a Composer flow (ETH→Katana) vs OFT send (Katana→ETH).
+	pub is_composer_flow: bool,
+	/// Vault address on destination chain (only needed for Katana→ETH redeem path).
+	pub vault_address: Option<String>,
 }
 
 /// Result from initiating a bridge transfer.
@@ -58,7 +79,28 @@ pub enum BridgeTransferStatus {
 	NeedsIntervention(String),
 }
 
+impl std::fmt::Display for BridgeTransferStatus {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Submitted => write!(f, "submitted"),
+			Self::Relaying => write!(f, "relaying"),
+			Self::PendingRedemption => write!(f, "pending_redemption"),
+			Self::Completed => write!(f, "completed"),
+			Self::Failed(_) => write!(f, "failed"),
+			Self::NeedsIntervention(_) => write!(f, "needs_intervention"),
+		}
+	}
+}
+
 impl BridgeTransferStatus {
+	/// Returns the reason string for statuses that carry one.
+	pub fn reason(&self) -> Option<&str> {
+		match self {
+			Self::Failed(r) | Self::NeedsIntervention(r) => Some(r),
+			_ => None,
+		}
+	}
+
 	/// Whether this status is terminal (no further transitions expected).
 	pub fn is_terminal(&self) -> bool {
 		matches!(self, Self::Completed | Self::Failed(_))
@@ -77,6 +119,15 @@ pub enum RebalanceTrigger {
 	Auto,
 	/// Triggered by admin API manual trigger.
 	Manual,
+}
+
+impl std::fmt::Display for RebalanceTrigger {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Auto => write!(f, "auto"),
+			Self::Manual => write!(f, "manual"),
+		}
+	}
 }
 
 /// Persistent transfer record stored in Redis.
@@ -126,10 +177,25 @@ pub struct PendingBridgeTransfer {
 	pub dest_scan_from_block: Option<u64>,
 	/// Last scanned destination block (resume scanning from here).
 	pub last_scanned_dest_block: Option<u64>,
+	/// Destination token/share contract address (for Transfer event scanning).
+	pub dest_token_address: Option<String>,
+	/// Destination OFT contract address.
+	pub dest_oft_address: Option<String>,
+	/// Whether this is a Composer flow (ETH→Katana: true) or OFT send (Katana→ETH: false).
+	/// Determines whether delivery is terminal (Completed) or needs redeem (PendingRedemption).
+	pub is_composer_flow: Option<bool>,
+	/// Vault address on destination chain (for ERC-4626 redeem, Katana→ETH only).
+	pub vault_address: Option<String>,
+	/// Actual shares received on destination (decoded from Transfer event).
+	/// Used for vault redeem — may differ from `amount` due to slippage/fees.
+	pub received_shares: Option<String>,
+	/// Operator-provided reason when a transfer is manually resolved.
+	pub resolution_reason: Option<String>,
 }
 
 impl PendingBridgeTransfer {
 	/// Create a new transfer record in Submitted state.
+	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		pair_id: String,
 		source_chain: u64,
@@ -165,6 +231,12 @@ impl PendingBridgeTransfer {
 			source_confirmed_block: None,
 			dest_scan_from_block: None,
 			last_scanned_dest_block: None,
+			dest_token_address: None,
+			dest_oft_address: None,
+			is_composer_flow: None,
+			vault_address: None,
+			received_shares: None,
+			resolution_reason: None,
 		}
 	}
 
@@ -186,5 +258,102 @@ impl PendingBridgeTransfer {
 
 		self.status = new_status;
 		self.updated_at = now;
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn transfer_with_status(status: BridgeTransferStatus) -> PendingBridgeTransfer {
+		let mut transfer = PendingBridgeTransfer::new(
+			"eth-katana".to_string(),
+			1,
+			747474,
+			"1000000".to_string(),
+			RebalanceTrigger::Auto,
+			None,
+			None,
+			None,
+		);
+		transfer.status = status;
+		transfer.updated_at = 1;
+		transfer
+	}
+
+	#[test]
+	fn test_transition_to_needs_intervention_preserves_original_status() {
+		let mut transfer = transfer_with_status(BridgeTransferStatus::Relaying);
+
+		transfer.transition_to(BridgeTransferStatus::NeedsIntervention(
+			"monitor timeout".to_string(),
+		));
+
+		assert!(matches!(
+			transfer.status,
+			BridgeTransferStatus::NeedsIntervention(_)
+		));
+		assert_eq!(
+			transfer.status_before_intervention,
+			Some(BridgeTransferStatus::Relaying)
+		);
+	}
+
+	#[test]
+	fn test_transition_to_needs_intervention_does_not_overwrite_previous_status() {
+		let mut transfer = transfer_with_status(BridgeTransferStatus::PendingRedemption);
+
+		transfer.transition_to(BridgeTransferStatus::NeedsIntervention(
+			"first intervention".to_string(),
+		));
+		transfer.transition_to(BridgeTransferStatus::NeedsIntervention(
+			"second intervention".to_string(),
+		));
+
+		assert!(matches!(
+			transfer.status,
+			BridgeTransferStatus::NeedsIntervention(ref reason) if reason == "second intervention"
+		));
+		assert_eq!(
+			transfer.status_before_intervention,
+			Some(BridgeTransferStatus::PendingRedemption)
+		);
+	}
+
+	#[test]
+	fn test_transition_to_is_terminal_and_blocks_pair_matrix() {
+		let cases = [
+			(BridgeTransferStatus::Submitted, false, true),
+			(BridgeTransferStatus::Relaying, false, true),
+			(BridgeTransferStatus::PendingRedemption, false, true),
+			(BridgeTransferStatus::Completed, true, false),
+			(
+				BridgeTransferStatus::Failed("boom".to_string()),
+				true,
+				false,
+			),
+			(
+				BridgeTransferStatus::NeedsIntervention("pause".to_string()),
+				false,
+				true,
+			),
+		];
+
+		for (status, is_terminal, blocks_pair) in cases {
+			assert_eq!(status.is_terminal(), is_terminal, "{status:?}");
+			assert_eq!(status.blocks_pair(), blocks_pair, "{status:?}");
+		}
+	}
+
+	#[test]
+	fn test_transition_to_updates_updated_at_timestamp() {
+		let mut transfer = transfer_with_status(BridgeTransferStatus::Submitted);
+		let previous_updated_at = transfer.updated_at;
+
+		transfer.transition_to(BridgeTransferStatus::Completed);
+
+		assert!(matches!(transfer.status, BridgeTransferStatus::Completed));
+		assert_ne!(transfer.updated_at, previous_updated_at);
+		assert!(transfer.updated_at > previous_updated_at);
 	}
 }

@@ -1104,6 +1104,54 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn test_indexing_supports_bridge_namespaces_and_overwrite_updates_memberships() {
+		let (storage, _temp_dir) = create_test_storage();
+
+		let namespace = "solver-a-bridge-transfer";
+		let key = "solver-a-bridge-transfer:transfer-1";
+
+		let submitted_indexes = StorageIndexes::new().with_field("status", "submitted");
+		let relaying_indexes = StorageIndexes::new().with_field("status", "relaying");
+
+		storage
+			.set_bytes(key, b"submitted".to_vec(), Some(submitted_indexes), None)
+			.await
+			.unwrap();
+
+		let submitted = storage
+			.query(
+				namespace,
+				QueryFilter::Equals("status".to_string(), serde_json::json!("submitted")),
+			)
+			.await
+			.unwrap();
+		assert_eq!(submitted, vec![key.to_string()]);
+
+		storage
+			.set_bytes(key, b"relaying".to_vec(), Some(relaying_indexes), None)
+			.await
+			.unwrap();
+
+		let submitted = storage
+			.query(
+				namespace,
+				QueryFilter::Equals("status".to_string(), serde_json::json!("submitted")),
+			)
+			.await
+			.unwrap();
+		assert!(submitted.is_empty());
+
+		let relaying = storage
+			.query(
+				namespace,
+				QueryFilter::Equals("status".to_string(), serde_json::json!("relaying")),
+			)
+			.await
+			.unwrap();
+		assert_eq!(relaying, vec![key.to_string()]);
+	}
+
+	#[tokio::test]
 	async fn test_index_cleanup_on_delete() {
 		let (storage, _temp_dir) = create_test_storage();
 

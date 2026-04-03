@@ -748,6 +748,234 @@ mod string_or_number {
 	}
 }
 
+// --- Rebalance Admin Action Types ---
+
+sol! {
+	struct TriggerRebalance {
+		string pairId;
+		uint256 sourceChain;
+		uint256 destChain;
+		uint256 amount;
+		uint256 nonce;
+		uint256 deadline;
+	}
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerRebalanceContents {
+	pub pair_id: String,
+	#[serde(with = "string_or_number")]
+	pub source_chain: u64,
+	#[serde(with = "string_or_number")]
+	pub dest_chain: u64,
+	pub amount: String,
+	#[serde(with = "string_or_number")]
+	pub nonce: u64,
+	#[serde(with = "string_or_number")]
+	pub deadline: u64,
+}
+
+impl TriggerRebalanceContents {
+	pub fn to_eip712(&self) -> Result<TriggerRebalance, AdminActionHashError> {
+		let amount = U256::from_str_radix(&self.amount, 10)
+			.map_err(|_| AdminActionHashError::InvalidAmount(self.amount.clone()))?;
+		Ok(TriggerRebalance {
+			pairId: self.pair_id.clone(),
+			sourceChain: U256::from(self.source_chain),
+			destChain: U256::from(self.dest_chain),
+			amount,
+			nonce: U256::from(self.nonce),
+			deadline: U256::from(self.deadline),
+		})
+	}
+
+	pub fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
+		use alloy_sol_types::SolStruct;
+		Ok(self.to_eip712()?.eip712_hash_struct())
+	}
+}
+
+impl AdminAction for TriggerRebalanceContents {
+	fn nonce(&self) -> u64 {
+		self.nonce
+	}
+	fn deadline(&self) -> u64 {
+		self.deadline
+	}
+	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
+		TriggerRebalanceContents::struct_hash(self)
+	}
+}
+
+sol! {
+	struct ResolveTransfer {
+		string transferId;
+		string resolution;
+		string reason;
+		uint256 nonce;
+		uint256 deadline;
+	}
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveTransferContents {
+	pub transfer_id: String,
+	pub resolution: String,
+	pub reason: String,
+	#[serde(with = "string_or_number")]
+	pub nonce: u64,
+	#[serde(with = "string_or_number")]
+	pub deadline: u64,
+}
+
+impl ResolveTransferContents {
+	pub fn to_eip712(&self) -> ResolveTransfer {
+		ResolveTransfer {
+			transferId: self.transfer_id.clone(),
+			resolution: self.resolution.clone(),
+			reason: self.reason.clone(),
+			nonce: U256::from(self.nonce),
+			deadline: U256::from(self.deadline),
+		}
+	}
+
+	pub fn struct_hash(&self) -> FixedBytes<32> {
+		use alloy_sol_types::SolStruct;
+		self.to_eip712().eip712_hash_struct()
+	}
+}
+
+impl AdminAction for ResolveTransferContents {
+	fn nonce(&self) -> u64 {
+		self.nonce
+	}
+	fn deadline(&self) -> u64 {
+		self.deadline
+	}
+	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
+		Ok(ResolveTransferContents::struct_hash(self))
+	}
+}
+
+sol! {
+	struct UpdateRebalanceConfig {
+		bool enabled;
+		uint256 cooldownSeconds;
+		uint256 maxPendingTransfers;
+		uint256 nonce;
+		uint256 deadline;
+	}
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRebalanceConfigContents {
+	pub enabled: bool,
+	#[serde(with = "string_or_number")]
+	pub cooldown_seconds: u64,
+	#[serde(with = "string_or_number")]
+	pub max_pending_transfers: u64,
+	#[serde(with = "string_or_number")]
+	pub nonce: u64,
+	#[serde(with = "string_or_number")]
+	pub deadline: u64,
+}
+
+impl UpdateRebalanceConfigContents {
+	pub fn to_eip712(&self) -> UpdateRebalanceConfig {
+		UpdateRebalanceConfig {
+			enabled: self.enabled,
+			cooldownSeconds: U256::from(self.cooldown_seconds),
+			maxPendingTransfers: U256::from(self.max_pending_transfers),
+			nonce: U256::from(self.nonce),
+			deadline: U256::from(self.deadline),
+		}
+	}
+
+	pub fn struct_hash(&self) -> FixedBytes<32> {
+		use alloy_sol_types::SolStruct;
+		self.to_eip712().eip712_hash_struct()
+	}
+}
+
+impl AdminAction for UpdateRebalanceConfigContents {
+	fn nonce(&self) -> u64 {
+		self.nonce
+	}
+	fn deadline(&self) -> u64 {
+		self.deadline
+	}
+	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
+		Ok(UpdateRebalanceConfigContents::struct_hash(self))
+	}
+}
+
+sol! {
+	struct UpdateRebalanceThreshold {
+		string pairId;
+		uint256 targetBalanceA;
+		uint256 targetBalanceB;
+		uint256 deviationBandBps;
+		uint256 maxBridgeAmount;
+		uint256 nonce;
+		uint256 deadline;
+	}
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRebalanceThresholdContents {
+	pub pair_id: String,
+	pub target_balance_a: String,
+	pub target_balance_b: String,
+	#[serde(with = "string_or_number")]
+	pub deviation_band_bps: u64,
+	pub max_bridge_amount: String,
+	#[serde(with = "string_or_number")]
+	pub nonce: u64,
+	#[serde(with = "string_or_number")]
+	pub deadline: u64,
+}
+
+impl UpdateRebalanceThresholdContents {
+	pub fn to_eip712(&self) -> Result<UpdateRebalanceThreshold, AdminActionHashError> {
+		let target_a = U256::from_str_radix(&self.target_balance_a, 10)
+			.map_err(|_| AdminActionHashError::InvalidAmount(self.target_balance_a.clone()))?;
+		let target_b = U256::from_str_radix(&self.target_balance_b, 10)
+			.map_err(|_| AdminActionHashError::InvalidAmount(self.target_balance_b.clone()))?;
+		let max_amount = U256::from_str_radix(&self.max_bridge_amount, 10)
+			.map_err(|_| AdminActionHashError::InvalidAmount(self.max_bridge_amount.clone()))?;
+		Ok(UpdateRebalanceThreshold {
+			pairId: self.pair_id.clone(),
+			targetBalanceA: target_a,
+			targetBalanceB: target_b,
+			deviationBandBps: U256::from(self.deviation_band_bps),
+			maxBridgeAmount: max_amount,
+			nonce: U256::from(self.nonce),
+			deadline: U256::from(self.deadline),
+		})
+	}
+
+	pub fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
+		use alloy_sol_types::SolStruct;
+		Ok(self.to_eip712()?.eip712_hash_struct())
+	}
+}
+
+impl AdminAction for UpdateRebalanceThresholdContents {
+	fn nonce(&self) -> u64 {
+		self.nonce
+	}
+	fn deadline(&self) -> u64 {
+		self.deadline
+	}
+	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
+		UpdateRebalanceThresholdContents::struct_hash(self)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1758,5 +1986,106 @@ mod tests {
 			contents1.struct_hash().unwrap(),
 			contents3.struct_hash().unwrap()
 		);
+	}
+
+	#[test]
+	fn test_update_rebalance_config_struct_hash() {
+		let contents = UpdateRebalanceConfigContents {
+			enabled: true,
+			cooldown_seconds: 3600,
+			max_pending_transfers: 3,
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		let hash = contents.struct_hash();
+		assert_eq!(hash.len(), 32);
+		assert_eq!(hash, contents.struct_hash());
+	}
+
+	#[test]
+	fn test_update_rebalance_config_admin_action_trait() {
+		let contents = UpdateRebalanceConfigContents {
+			enabled: true,
+			cooldown_seconds: 3600,
+			max_pending_transfers: 3,
+			nonce: 42,
+			deadline: 1706184000,
+		};
+
+		assert_eq!(contents.nonce(), 42);
+		assert_eq!(contents.deadline(), 1706184000);
+		assert!(AdminAction::struct_hash(&contents).is_ok());
+	}
+
+	#[test]
+	fn test_update_rebalance_threshold_struct_hash() {
+		let contents = UpdateRebalanceThresholdContents {
+			pair_id: "eth-katana".to_string(),
+			target_balance_a: "1000000".to_string(),
+			target_balance_b: "2000000".to_string(),
+			deviation_band_bps: 2000,
+			max_bridge_amount: "500000".to_string(),
+			nonce: 1,
+			deadline: 1706184000,
+		};
+
+		let hash = contents.struct_hash().unwrap();
+		assert_eq!(hash.len(), 32);
+		assert_eq!(hash, contents.struct_hash().unwrap());
+	}
+
+	#[test]
+	fn test_update_rebalance_threshold_serializes_camel_case_fields() {
+		let contents = UpdateRebalanceThresholdContents {
+			pair_id: "eth-katana".to_string(),
+			target_balance_a: "1000000".to_string(),
+			target_balance_b: "2000000".to_string(),
+			deviation_band_bps: 2000,
+			max_bridge_amount: "500000".to_string(),
+			nonce: 7,
+			deadline: 1706184000,
+		};
+
+		let json = serde_json::to_string(&contents).unwrap();
+		assert!(json.contains("\"pairId\":\"eth-katana\""));
+		assert!(json.contains("\"targetBalanceA\":\"1000000\""));
+		assert!(json.contains("\"targetBalanceB\":\"2000000\""));
+		assert!(json.contains("\"deviationBandBps\":2000"));
+		assert!(json.contains("\"maxBridgeAmount\":\"500000\""));
+
+		let parsed: UpdateRebalanceThresholdContents = serde_json::from_str(&json).unwrap();
+		assert_eq!(parsed.pair_id, "eth-katana");
+		assert_eq!(parsed.deviation_band_bps, 2000);
+	}
+
+	#[test]
+	fn test_trigger_and_resolve_rebalance_contents_roundtrip_json() {
+		let trigger = TriggerRebalanceContents {
+			pair_id: "eth-katana".to_string(),
+			source_chain: 1,
+			dest_chain: 747474,
+			amount: "12345".to_string(),
+			nonce: 11,
+			deadline: 1706184000,
+		};
+		let trigger_json = serde_json::to_string(&trigger).unwrap();
+		let parsed_trigger: TriggerRebalanceContents = serde_json::from_str(&trigger_json).unwrap();
+		assert_eq!(parsed_trigger.pair_id, "eth-katana");
+		assert_eq!(parsed_trigger.source_chain, 1);
+		assert_eq!(parsed_trigger.dest_chain, 747474);
+
+		let resolve = ResolveTransferContents {
+			transfer_id: "transfer-1".to_string(),
+			resolution: "retry".to_string(),
+			reason: "operator requested retry".to_string(),
+			nonce: 12,
+			deadline: 1706184000,
+		};
+		let resolve_json = serde_json::to_string(&resolve).unwrap();
+		let parsed_resolve: ResolveTransferContents = serde_json::from_str(&resolve_json).unwrap();
+		assert_eq!(parsed_resolve.transfer_id, "transfer-1");
+		assert_eq!(parsed_resolve.resolution, "retry");
+		assert_eq!(parsed_resolve.reason, "operator requested retry");
 	}
 }

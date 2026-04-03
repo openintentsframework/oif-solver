@@ -6271,4 +6271,134 @@ mod tests {
 			"Runtime config should NOT have 'local' implementation"
 		);
 	}
+
+	#[test]
+	fn test_build_rebalance_config_from_operator_rejects_duplicate_pair_ids() {
+		let rebalance = solver_types::OperatorRebalanceConfig {
+			enabled: true,
+			implementation: "layerzero".to_string(),
+			monitor_interval_seconds: 15,
+			cooldown_seconds: 60,
+			max_pending_transfers: 3,
+			min_native_gas_reserve: HashMap::new(),
+			max_fee_bps: Some(100),
+			pairs: vec![
+				solver_types::OperatorRebalancePairConfig {
+					pair_id: "eth-katana".to_string(),
+					chain_a: solver_types::RebalancePairSide {
+						chain_id: 1,
+						token_address: address!("1111111111111111111111111111111111111111"),
+						oft_address: address!("2222222222222222222222222222222222222222"),
+					},
+					chain_b: solver_types::RebalancePairSide {
+						chain_id: 747474,
+						token_address: address!("3333333333333333333333333333333333333333"),
+						oft_address: address!("4444444444444444444444444444444444444444"),
+					},
+					target_balance_a: "1000000".to_string(),
+					target_balance_b: "1000000".to_string(),
+					deviation_band_bps: 2000,
+					max_bridge_amount: "500000".to_string(),
+				},
+				solver_types::OperatorRebalancePairConfig {
+					pair_id: "eth-katana".to_string(),
+					chain_a: solver_types::RebalancePairSide {
+						chain_id: 1,
+						token_address: address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+						oft_address: address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+					},
+					chain_b: solver_types::RebalancePairSide {
+						chain_id: 8453,
+						token_address: address!("cccccccccccccccccccccccccccccccccccccccc"),
+						oft_address: address!("dddddddddddddddddddddddddddddddddddddddd"),
+					},
+					target_balance_a: "1000000".to_string(),
+					target_balance_b: "1000000".to_string(),
+					deviation_band_bps: 2000,
+					max_bridge_amount: "500000".to_string(),
+				},
+			],
+			bridge_config: None,
+		};
+
+		let err = build_rebalance_config_from_operator(Some(&rebalance)).unwrap_err();
+		assert!(matches!(err, MergeError::Validation(_)));
+		assert!(err
+			.to_string()
+			.contains("Duplicate rebalance pair_id 'eth-katana'"));
+	}
+
+	#[test]
+	fn test_extract_rebalance_config_rejects_invalid_token_address_with_field_name() {
+		let rebalance = solver_config::RebalanceConfig {
+			enabled: true,
+			implementation: "layerzero".to_string(),
+			monitor_interval_seconds: 15,
+			cooldown_seconds: 60,
+			max_pending_transfers: 3,
+			min_native_gas_reserve: HashMap::new(),
+			max_fee_bps: Some(100),
+			pairs: vec![solver_config::RebalancePairConfig {
+				pair_id: "eth-katana".to_string(),
+				chain_a: solver_config::RebalancePairSideConfig {
+					chain_id: 1,
+					token_address: "0x1234".to_string(),
+					oft_address: "0x2222222222222222222222222222222222222222".to_string(),
+				},
+				chain_b: solver_config::RebalancePairSideConfig {
+					chain_id: 747474,
+					token_address: "0x3333333333333333333333333333333333333333".to_string(),
+					oft_address: "0x4444444444444444444444444444444444444444".to_string(),
+				},
+				target_balance_a: "1000000".to_string(),
+				target_balance_b: "1000000".to_string(),
+				deviation_band_bps: 2000,
+				max_bridge_amount: "500000".to_string(),
+			}],
+			bridge_config: None,
+		};
+
+		let err = extract_rebalance_config(Some(&rebalance)).unwrap_err();
+		assert!(matches!(err, MergeError::Validation(_)));
+		assert!(err
+			.to_string()
+			.contains("Rebalance pair 'eth-katana': chain_a.token_address must be 20 bytes"));
+	}
+
+	#[test]
+	fn test_extract_rebalance_config_rejects_invalid_oft_address_with_field_name() {
+		let rebalance = solver_config::RebalanceConfig {
+			enabled: true,
+			implementation: "layerzero".to_string(),
+			monitor_interval_seconds: 15,
+			cooldown_seconds: 60,
+			max_pending_transfers: 3,
+			min_native_gas_reserve: HashMap::new(),
+			max_fee_bps: Some(100),
+			pairs: vec![solver_config::RebalancePairConfig {
+				pair_id: "eth-katana".to_string(),
+				chain_a: solver_config::RebalancePairSideConfig {
+					chain_id: 1,
+					token_address: "0x1111111111111111111111111111111111111111".to_string(),
+					oft_address: "0x2222222222222222222222222222222222222222".to_string(),
+				},
+				chain_b: solver_config::RebalancePairSideConfig {
+					chain_id: 747474,
+					token_address: "0x3333333333333333333333333333333333333333".to_string(),
+					oft_address: "zzzz".to_string(),
+				},
+				target_balance_a: "1000000".to_string(),
+				target_balance_b: "1000000".to_string(),
+				deviation_band_bps: 2000,
+				max_bridge_amount: "500000".to_string(),
+			}],
+			bridge_config: None,
+		};
+
+		let err = extract_rebalance_config(Some(&rebalance)).unwrap_err();
+		assert!(matches!(err, MergeError::Validation(_)));
+		assert!(err
+			.to_string()
+			.contains("Rebalance pair 'eth-katana': invalid hex in chain_b.oft_address"));
+	}
 }
