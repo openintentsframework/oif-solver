@@ -36,6 +36,7 @@ impl Default for ProtocolRegistry {
 
 		// Standard deployments at canonical address
 		registry.add_permit2_deployment(1, PERMIT2_CANONICAL); // Ethereum Mainnet
+		registry.add_permit2_deployment(747474, PERMIT2_CANONICAL); // Katana Mainnet
 		registry.add_permit2_deployment(137, PERMIT2_CANONICAL); // Polygon
 		registry.add_permit2_deployment(42161, PERMIT2_CANONICAL); // Arbitrum One
 		registry.add_permit2_deployment(10, PERMIT2_CANONICAL); // Optimism
@@ -204,6 +205,7 @@ mod tests {
 		let registry = ProtocolRegistry::default();
 
 		assert!(registry.supports_permit2(1)); // Mainnet
+		assert!(registry.supports_permit2(747474)); // Katana mainnet
 		assert!(registry.supports_permit2(137)); // Polygon
 		assert!(!registry.supports_permit2(999)); // Unknown chain
 	}
