@@ -497,6 +497,23 @@ impl DeliveryInterface for AlloyDelivery {
 		Ok(result)
 	}
 
+	async fn tx_exists(
+		&self,
+		hash: &solver_types::TransactionHash,
+		chain_id: u64,
+	) -> Result<bool, DeliveryError> {
+		let provider = self.get_provider(chain_id)?;
+		let tx_hash = alloy_primitives::FixedBytes::<32>::from_slice(&hash.0);
+
+		match provider.get_transaction_by_hash(tx_hash).await {
+			Ok(Some(_)) => Ok(true),
+			Ok(None) => Ok(false),
+			Err(e) => Err(DeliveryError::Network(format!(
+				"Failed to check transaction on chain {chain_id}: {e}"
+			))),
+		}
+	}
+
 	async fn get_logs(
 		&self,
 		chain_id: u64,

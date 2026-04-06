@@ -332,6 +332,14 @@ mod tests {
 				.ok_or_else(|| DeliveryError::Network("contract response not set".to_string()))
 		}
 
+		async fn tx_exists(
+			&self,
+			_: &solver_types::TransactionHash,
+			_: u64,
+		) -> Result<bool, DeliveryError> {
+			Ok(false)
+		}
+
 		async fn get_logs(&self, _: u64, _: LogFilter) -> Result<Vec<Log>, DeliveryError> {
 			Ok(vec![])
 		}

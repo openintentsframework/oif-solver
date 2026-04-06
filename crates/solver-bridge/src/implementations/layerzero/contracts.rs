@@ -22,7 +22,7 @@ sol! {
 }
 
 // --- LayerZero OFT + OVault Composer ---
-// Combined into one sol! block so types are shared.
+// Combined into one sol! block so types are shared across interfaces.
 
 sol! {
 	struct SendParam {
@@ -51,29 +51,35 @@ sol! {
 		uint256 amountReceivedLD;
 	}
 
-	// IOFT methods
-	function quoteSend(
-		SendParam calldata sendParam,
-		bool payInLzToken
-	) external view returns (MessagingFee msgFee);
+	interface IOFT {
+		function quoteSend(
+			SendParam calldata sendParam,
+			bool payInLzToken
+		) external view returns (MessagingFee msgFee);
 
-	function send(
-		SendParam calldata sendParam,
-		MessagingFee calldata fee,
-		address refundAddress
-	) external payable returns (MessagingReceipt msgReceipt, OFTReceipt oftReceipt);
+		function send(
+			SendParam calldata sendParam,
+			MessagingFee calldata fee,
+			address refundAddress
+		) external payable returns (MessagingReceipt msgReceipt, OFTReceipt oftReceipt);
 
-	function token() external view returns (address);
+		function token() external view returns (address);
+	}
 
-	// IOVaultComposer method (Ethereum → Katana: deposit + bridge)
-	function depositAndSend(
-		uint256 assets,
-		uint32 dstEid,
-		bytes32 to,
-		bytes calldata extraOptions,
-		MessagingFee calldata fee,
-		address refundAddress
-	) external payable returns (MessagingReceipt msgReceipt);
+	interface IVaultComposerSync {
+		function depositAndSend(
+			uint256 assetAmount,
+			SendParam calldata sendParam,
+			address refundAddress
+		) external payable returns (MessagingReceipt msgReceipt);
+
+		function quoteSend(
+			address from,
+			address targetOft,
+			uint256 vaultInAmount,
+			SendParam calldata sendParam
+		) external view returns (MessagingFee msgFee);
+	}
 }
 
 /// Left-pad a 20-byte address to bytes32 for SendParam.to.

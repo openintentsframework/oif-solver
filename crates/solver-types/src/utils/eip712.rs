@@ -831,6 +831,37 @@ pub fn admin_eip712_types() -> serde_json::Value {
 			{"name": "amount", "type": "uint256"},
 			{"name": "nonce", "type": "uint256"},
 			{"name": "deadline", "type": "uint256"}
+		],
+		"TriggerRebalance": [
+			{"name": "pairId", "type": "string"},
+			{"name": "sourceChain", "type": "uint256"},
+			{"name": "destChain", "type": "uint256"},
+			{"name": "amount", "type": "uint256"},
+			{"name": "nonce", "type": "uint256"},
+			{"name": "deadline", "type": "uint256"}
+		],
+		"ResolveTransfer": [
+			{"name": "transferId", "type": "string"},
+			{"name": "resolution", "type": "string"},
+			{"name": "reason", "type": "string"},
+			{"name": "nonce", "type": "uint256"},
+			{"name": "deadline", "type": "uint256"}
+		],
+		"UpdateRebalanceConfig": [
+			{"name": "enabled", "type": "bool"},
+			{"name": "cooldownSeconds", "type": "uint256"},
+			{"name": "maxPendingTransfers", "type": "uint256"},
+			{"name": "nonce", "type": "uint256"},
+			{"name": "deadline", "type": "uint256"}
+		],
+		"UpdateRebalanceThreshold": [
+			{"name": "pairId", "type": "string"},
+			{"name": "targetBalanceA", "type": "uint256"},
+			{"name": "targetBalanceB", "type": "uint256"},
+			{"name": "deviationBandBps", "type": "uint256"},
+			{"name": "maxBridgeAmount", "type": "uint256"},
+			{"name": "nonce", "type": "uint256"},
+			{"name": "deadline", "type": "uint256"}
 		]
 	})
 }

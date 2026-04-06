@@ -175,6 +175,16 @@ pub trait DeliveryInterface: Send + Sync {
 	/// or simulate transaction execution without submitting to the blockchain.
 	async fn eth_call(&self, tx: Transaction) -> Result<Bytes, DeliveryError>;
 
+	/// Checks whether a transaction exists in the mempool or on-chain.
+	///
+	/// Returns `Ok(true)` if the tx is visible (pending or mined), `Ok(false)` if
+	/// the node has no record of it (dropped/evicted).
+	async fn tx_exists(
+		&self,
+		hash: &TransactionHash,
+		chain_id: u64,
+	) -> Result<bool, DeliveryError>;
+
 	/// Queries event logs matching the given filter.
 	///
 	/// Used for scanning chain events (e.g., detecting token arrivals on destination chain).
@@ -416,6 +426,20 @@ impl DeliveryService {
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
 		implementation.eth_call(tx).await
+	}
+
+	/// Checks whether a transaction exists in the mempool or on-chain.
+	pub async fn tx_exists(
+		&self,
+		hash: &TransactionHash,
+		chain_id: u64,
+	) -> Result<bool, DeliveryError> {
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
+
+		implementation.tx_exists(hash, chain_id).await
 	}
 
 	/// Queries event logs matching the given filter on a specific chain.

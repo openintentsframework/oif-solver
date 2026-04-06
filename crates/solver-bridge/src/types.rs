@@ -191,6 +191,13 @@ pub struct PendingBridgeTransfer {
 	pub received_shares: Option<String>,
 	/// Operator-provided reason when a transfer is manually resolved.
 	pub resolution_reason: Option<String>,
+	/// Number of consecutive polls where the source tx was not found on-chain.
+	/// Used to distinguish "pending in mempool" from "dropped/evicted".
+	#[serde(default)]
+	pub submitted_missing_checks: u32,
+	/// Unix timestamp when the source tx was first observed missing.
+	#[serde(default)]
+	pub submitted_missing_since: Option<u64>,
 }
 
 impl PendingBridgeTransfer {
@@ -237,6 +244,8 @@ impl PendingBridgeTransfer {
 			vault_address: None,
 			received_shares: None,
 			resolution_reason: None,
+			submitted_missing_checks: 0,
+			submitted_missing_since: None,
 		}
 	}
 

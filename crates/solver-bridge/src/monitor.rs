@@ -248,6 +248,79 @@ impl RebalanceMonitor {
 					continue;
 				},
 			};
+			// Track submitted-missing checks for dropped tx detection.
+			// Only increment when the driver explicitly signals "tx not found" via
+			// a Failed status containing "Source transaction not found". Do NOT
+			// increment on normal Submitted→Submitted (tx still pending in mempool).
+			if matches!(transfer.status, BridgeTransferStatus::Submitted) {
+				match &new_status {
+					BridgeTransferStatus::Failed(reason)
+						if reason.contains("Source transaction not found") =>
+					{
+						transfer.submitted_missing_checks += 1;
+						if transfer.submitted_missing_since.is_none() {
+							transfer.submitted_missing_since = Some(now);
+						}
+						if transfer.submitted_missing_checks < 3 {
+							// Not enough misses yet — stay Submitted, don't apply Failed
+							tracing::debug!(
+								transfer_id = %transfer.id,
+								checks = transfer.submitted_missing_checks,
+								"Source tx not found, will recheck"
+							);
+							// Don't apply the Failed status — let it retry
+							transfer.last_status_poll_at = Some(now);
+							self.bridge_service.storage().save_transfer(&transfer).await?;
+							continue;
+						}
+						// 3+ misses — let the Failed status apply below
+					},
+					BridgeTransferStatus::Submitted => {
+						// Normal pending — don't touch the counter
+					},
+					_ => {
+						// Moving to a new state — reset counters
+						transfer.submitted_missing_checks = 0;
+						transfer.submitted_missing_since = None;
+					},
+				}
+			}
+
+			// Handle auto-triggered transfers with dropped source txs — fail fast
+			if matches!(&transfer.trigger, RebalanceTrigger::Auto)
+				&& matches!(&new_status, BridgeTransferStatus::Failed(reason) if reason.contains("Source transaction missing"))
+			{
+				tracing::warn!(
+					transfer_id = %transfer.id,
+					pair = %transfer.pair_id,
+					"Auto-rebalance source tx dropped, failing fast for retry"
+				);
+				self.bridge_service
+					.update_transfer(&mut transfer, new_status)
+					.await?;
+				continue;
+			}
+
+			// Manual transfers with dropped source txs go to NeedsIntervention
+			if matches!(&transfer.trigger, RebalanceTrigger::Manual)
+				&& matches!(&new_status, BridgeTransferStatus::Failed(reason) if reason.contains("Source transaction missing"))
+			{
+				tracing::warn!(
+					transfer_id = %transfer.id,
+					pair = %transfer.pair_id,
+					"Manual trigger source tx dropped, escalating to NeedsIntervention"
+				);
+				self.bridge_service
+					.update_transfer(
+						&mut transfer,
+						BridgeTransferStatus::NeedsIntervention(
+							"Manual transfer source tx missing from chain".to_string(),
+						),
+					)
+					.await?;
+				continue;
+			}
+
 			if new_status != transfer.status {
 				// Handle PendingRedemption retry: if driver reports Failed for a
 				// redeem attempt, don't apply the Failed status — increment
@@ -282,6 +355,15 @@ impl RebalanceMonitor {
 						}
 					}
 
+					// Set cooldown when source tx confirms (Submitted → Relaying)
+					if matches!(&transfer.status, BridgeTransferStatus::Submitted)
+						&& matches!(new_status, BridgeTransferStatus::Relaying)
+					{
+						self.bridge_service
+							.set_cooldown(&transfer.pair_id, config.cooldown_seconds)
+							.await?;
+					}
+
 					self.bridge_service
 						.update_transfer(&mut transfer, new_status)
 						.await?;
@@ -302,12 +384,23 @@ impl RebalanceMonitor {
 				}
 			}
 
-			// Delivery detection: scan destination chain for Transfer events
+			// Delivery detection: scan destination chain for Transfer events.
+			// For composer flows (ETH→Katana): shares arrive at dest_token (vbUSDC on Katana).
+			// For non-composer flows (Katana→ETH): shares arrive at the vault contract on
+			// Ethereum (vault share token emits ERC-20 Transfer), NOT at the OFT Adapter
+			// (which emits OFTReceived, not Transfer) and NOT at the final USDC token.
+			let scan_address = if transfer.is_composer_flow == Some(true) {
+				transfer.dest_token_address.as_ref()
+			} else {
+				// Non-composer: vault share token emits Transfer when shares are unlocked
+				transfer.vault_address.as_ref().or(transfer.dest_token_address.as_ref())
+			};
+
 			if matches!(transfer.status, BridgeTransferStatus::Relaying)
 				&& transfer.dest_scan_from_block.is_some()
-				&& transfer.dest_token_address.is_some()
+				&& scan_address.is_some()
 			{
-				let dest_token_addr = transfer.dest_token_address.as_ref().unwrap();
+				let dest_token_addr = scan_address.unwrap();
 				let dest_token_hex = dest_token_addr
 					.strip_prefix("0x")
 					.unwrap_or(dest_token_addr);
@@ -702,9 +795,8 @@ impl RebalanceMonitor {
 							pair = %pair.pair_id,
 							"Auto-rebalance initiated"
 						);
-						self.bridge_service
-							.set_cooldown(&pair.pair_id, config.cooldown_seconds)
-							.await?;
+						// Cooldown is set after source tx confirms (Submitted → Relaying),
+						// not on initiation. This allows fast retry if the source tx is dropped.
 					},
 					Err(e) => {
 						tracing::error!(pair = %pair.pair_id, "Auto-rebalance failed: {e}");
@@ -1231,7 +1323,9 @@ mod tests {
 			Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 		);
 		assert_eq!(active[0].is_composer_flow, Some(false));
-		assert!(bridge_service
+		// Cooldown is now set after source tx confirms (Submitted → Relaying),
+		// not on initiation. So it should NOT be active yet.
+		assert!(!bridge_service
 			.is_cooldown_active("eth-katana")
 			.await
 			.unwrap());

@@ -32,15 +32,19 @@ fn to_solver_addr(addr: Address) -> solver_types::Address {
 }
 
 /// Build a solver_types Transaction for contract calls.
+/// Default gas limit for bridge transactions. LayerZero OFT send() and
+/// Composer depositAndSend() involve internal cross-chain endpoint calls
+/// that can exceed eth_estimateGas results. 500k is a safe upper bound.
+const BRIDGE_TX_GAS_LIMIT: u64 = 500_000;
+
 fn build_tx(chain_id: u64, to: Address, data: Vec<u8>, value: U256) -> solver_types::Transaction {
-	// Convert U256 to solver_types U256 via bytes
 	solver_types::Transaction {
 		to: Some(to_solver_addr(to)),
 		data,
 		value,
 		chain_id,
 		nonce: None,
-		gas_limit: None,
+		gas_limit: Some(BRIDGE_TX_GAS_LIMIT),
 		gas_price: None,
 		max_fee_per_gas: None,
 		max_priority_fee_per_gas: None,
@@ -87,6 +91,43 @@ impl LayerZeroBridge {
 		self.config.composer_addresses.contains_key(&source_chain)
 	}
 
+	/// Submit a transaction and poll for receipt confirmation.
+	async fn submit_and_confirm(
+		&self,
+		tx: solver_types::Transaction,
+		label: &str,
+	) -> Result<solver_types::TransactionHash, BridgeError> {
+		let chain_id = tx.chain_id;
+		let hash = self
+			.delivery
+			.deliver(tx, None)
+			.await
+			.map_err(|e| BridgeError::TransactionFailed(format!("{label} submit failed: {e}")))?;
+
+		for attempt in 1..=12 {
+			match self.delivery.get_receipt(&hash, chain_id).await {
+				Ok(receipt) => {
+					if receipt.success {
+						return Ok(hash);
+					} else {
+						return Err(BridgeError::TransactionFailed(format!(
+							"{label} reverted on-chain"
+						)));
+					}
+				},
+				Err(_) if attempt < 12 => {
+					tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+				},
+				Err(e) => {
+					return Err(BridgeError::TransactionFailed(format!(
+						"{label} receipt not found after 12 attempts: {e}"
+					)));
+				},
+			}
+		}
+		unreachable!()
+	}
+
 	/// ETH → Katana: approve USDC to Composer, then call depositAndSend.
 	async fn bridge_via_composer(
 		&self,
@@ -96,6 +137,9 @@ impl LayerZeroBridge {
 		let dest_eid = self.get_eid(request.dest_chain)?;
 		let to_bytes32 = address_to_bytes32(self.solver_address);
 		let extra_options = self.build_extra_options();
+		let min_amount = request
+			.min_amount
+			.unwrap_or(request.amount * U256::from(95) / U256::from(100));
 
 		// Step 1: Approve USDC to Composer
 		let approve_data = contracts::approveCall {
@@ -110,26 +154,26 @@ impl LayerZeroBridge {
 			approve_data,
 			U256::ZERO,
 		);
-		self.delivery
-			.deliver(approve_tx, None)
-			.await
-			.map_err(|e| BridgeError::TransactionFailed(format!("Approve failed: {e}")))?;
+		self.submit_and_confirm(approve_tx, "Composer approve")
+			.await?;
 
 		// Step 2: Estimate fee
 		let fee = self.estimate_fee(request).await?;
 
 		// Step 3: depositAndSend on Composer
-		let messaging_fee = contracts::MessagingFee {
-			nativeFee: fee,
-			lzTokenFee: U256::ZERO,
-		};
-
-		let deposit_data = contracts::depositAndSendCall {
-			assets: request.amount,
+		let send_param = contracts::SendParam {
 			dstEid: dest_eid,
 			to: to_bytes32.into(),
+			amountLD: request.amount,
+			minAmountLD: min_amount,
 			extraOptions: extra_options.into(),
-			fee: messaging_fee,
+			composeMsg: Vec::new().into(),
+			oftCmd: Vec::new().into(),
+		};
+
+		let deposit_data = contracts::IVaultComposerSync::depositAndSendCall {
+			assetAmount: request.amount,
+			sendParam: send_param,
 			refundAddress: self.solver_address,
 		}
 		.abi_encode();
@@ -172,10 +216,7 @@ impl LayerZeroBridge {
 			approve_data,
 			U256::ZERO,
 		);
-		self.delivery
-			.deliver(approve_tx, None)
-			.await
-			.map_err(|e| BridgeError::TransactionFailed(format!("Approve failed: {e}")))?;
+		self.submit_and_confirm(approve_tx, "OFT approve").await?;
 
 		// Step 2: Estimate fee
 		let fee = self.estimate_fee(request).await?;
@@ -196,7 +237,7 @@ impl LayerZeroBridge {
 			lzTokenFee: U256::ZERO,
 		};
 
-		let send_data = contracts::sendCall {
+		let send_data = contracts::IOFT::sendCall {
 			sendParam: send_param,
 			fee: messaging_fee,
 			refundAddress: self.solver_address,
@@ -269,12 +310,37 @@ impl BridgeInterface for LayerZeroBridge {
 								))
 							}
 						},
-						Err(e) => {
-							tracing::debug!(
-								transfer_id = %transfer.id,
-								"Receipt not yet available: {e}"
-							);
-							Ok(BridgeTransferStatus::Submitted)
+						Err(_) => {
+							// No receipt — check if tx is still in mempool or was dropped
+							match self
+								.delivery
+								.tx_exists(&tx_hash_obj, transfer.source_chain)
+								.await
+							{
+								Ok(true) => {
+									// Tx exists (pending or in mempool) — keep waiting
+									tracing::debug!(
+										transfer_id = %transfer.id,
+										"Source tx pending, receipt not yet available"
+									);
+									Ok(BridgeTransferStatus::Submitted)
+								},
+								Ok(false) => {
+									// Tx not found on chain — signal to monitor for threshold tracking.
+									// The monitor decides whether enough misses have accumulated to fail.
+									Ok(BridgeTransferStatus::Failed(
+										"Source transaction not found".to_string(),
+									))
+								},
+								Err(e) => {
+									// RPC error — don't make a decision, stay Submitted
+									tracing::debug!(
+										transfer_id = %transfer.id,
+										"tx_exists check failed: {e}"
+									);
+									Ok(BridgeTransferStatus::Submitted)
+								},
+							}
 						},
 					}
 				} else {
@@ -339,30 +405,64 @@ impl BridgeInterface for LayerZeroBridge {
 			oftCmd: Vec::new().into(),
 		};
 
-		let quote_data = contracts::quoteSendCall {
-			sendParam: send_param,
-			payInLzToken: false,
+		if self.is_composer_flow(request.source_chain) {
+			// Composer has its own quoteSend with different params
+			let quote_data = contracts::IVaultComposerSync::quoteSendCall {
+				from: self.solver_address,
+				targetOft: request.source_oft,
+				vaultInAmount: request.amount,
+				sendParam: send_param,
+			}
+			.abi_encode();
+
+			let call_tx = build_tx(
+				request.source_chain,
+				self.get_composer(request.source_chain)?,
+				quote_data,
+				U256::ZERO,
+			);
+
+			let result = self
+				.delivery
+				.contract_call(request.source_chain, call_tx)
+				.await
+				.map_err(|e| BridgeError::FeeEstimation(format!("quoteSend failed: {e}")))?;
+
+			let decoded =
+				contracts::IVaultComposerSync::quoteSendCall::abi_decode_returns(&result)
+					.map_err(|e| {
+						BridgeError::FeeEstimation(format!("Failed to decode fee: {e}"))
+					})?;
+
+			Ok(decoded.nativeFee)
+		} else {
+			// Direct OFT quoteSend
+			let quote_data = contracts::IOFT::quoteSendCall {
+				sendParam: send_param,
+				payInLzToken: false,
+			}
+			.abi_encode();
+
+			let call_tx = build_tx(
+				request.source_chain,
+				request.source_oft,
+				quote_data,
+				U256::ZERO,
+			);
+
+			let result = self
+				.delivery
+				.contract_call(request.source_chain, call_tx)
+				.await
+				.map_err(|e| BridgeError::FeeEstimation(format!("quoteSend failed: {e}")))?;
+
+			let decoded = contracts::IOFT::quoteSendCall::abi_decode_returns(&result)
+				.map_err(|e| {
+					BridgeError::FeeEstimation(format!("Failed to decode fee: {e}"))
+				})?;
+
+			Ok(decoded.nativeFee)
 		}
-		.abi_encode();
-
-		let call_tx = build_tx(
-			request.source_chain,
-			request.source_oft,
-			quote_data,
-			U256::ZERO,
-		);
-
-		let result = self
-			.delivery
-			.contract_call(request.source_chain, call_tx)
-			.await
-			.map_err(|e| BridgeError::FeeEstimation(format!("quoteSend failed: {e}")))?;
-
-		let decoded = contracts::quoteSendCall::abi_decode_returns(&result)
-			.map_err(|e| BridgeError::FeeEstimation(format!("Failed to decode fee: {e}")))?;
-
-		// quoteSend returns (MessagingFee), the decoded struct has the fee directly
-		Ok(decoded.nativeFee)
 	}
 }
 
@@ -479,11 +579,20 @@ mod tests {
 		T::abi_decode(&tx.data).expect("failed to decode call data")
 	}
 
-	fn quote_fee_bytes(native_fee: U256) -> Vec<u8> {
-		contracts::quoteSendCall::abi_encode_returns(&contracts::MessagingFee {
+	fn oft_quote_fee_bytes(native_fee: U256) -> Vec<u8> {
+		contracts::IOFT::quoteSendCall::abi_encode_returns(&contracts::MessagingFee {
 			nativeFee: native_fee,
 			lzTokenFee: U256::ZERO,
 		})
+	}
+
+	fn composer_quote_fee_bytes(native_fee: U256) -> Vec<u8> {
+		contracts::IVaultComposerSync::quoteSendCall::abi_encode_returns(
+			&contracts::MessagingFee {
+				nativeFee: native_fee,
+				lzTokenFee: U256::ZERO,
+			},
+		)
 	}
 
 	#[tokio::test]
@@ -506,15 +615,31 @@ mod tests {
 			});
 		}
 
-		let expected_oft = request.source_oft;
+		// submit_and_confirm polls get_receipt for the approve tx
+		mock.expect_get_receipt().returning(|_, _| {
+			Box::pin(async move {
+				Ok(TransactionReceipt {
+					hash: TransactionHash(vec![0x11; 32]),
+					block_number: 1,
+					success: true,
+					logs: vec![],
+					block_timestamp: None,
+				})
+			})
+		});
+
+		let expected_composer = composer;
 		mock.expect_eth_call().returning(move |tx| {
+			// Composer flow calls quoteSend on the composer address
 			assert_eq!(
 				tx.to
 					.as_ref()
 					.map(|addr| Address::from_slice(addr.0.as_slice())),
-				Some(expected_oft)
+				Some(expected_composer)
 			);
-			Box::pin(async move { Ok(alloy_primitives::Bytes::from(quote_fee_bytes(fee))) })
+			Box::pin(async move {
+				Ok(alloy_primitives::Bytes::from(composer_quote_fee_bytes(fee)))
+			})
 		});
 
 		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
@@ -530,14 +655,15 @@ mod tests {
 		assert_eq!(approve_call.amount, request.amount);
 
 		assert_eq!(tx_to(&submitted[1]), composer);
-		let deposit_call: contracts::depositAndSendCall = decode_submit(&submitted[1]);
+		let deposit_call: contracts::IVaultComposerSync::depositAndSendCall =
+			decode_submit(&submitted[1]);
 		assert_eq!(deposit_call.refundAddress, solver_address());
+		assert_eq!(deposit_call.assetAmount, request.amount);
+		assert_eq!(deposit_call.sendParam.dstEid, 200);
 		assert_eq!(
-			deposit_call.to,
+			deposit_call.sendParam.to,
 			contracts::address_to_bytes32(solver_address())
 		);
-		assert_eq!(deposit_call.dstEid, 200);
-		assert_eq!(deposit_call.fee.nativeFee, fee);
 	}
 
 	#[tokio::test]
@@ -558,6 +684,19 @@ mod tests {
 			});
 		}
 
+		// submit_and_confirm polls get_receipt for the approve tx
+		mock.expect_get_receipt().returning(|_, _| {
+			Box::pin(async move {
+				Ok(TransactionReceipt {
+					hash: TransactionHash(vec![0x22; 32]),
+					block_number: 1,
+					success: true,
+					logs: vec![],
+					block_timestamp: None,
+				})
+			})
+		});
+
 		let expected_oft = request.source_oft;
 		mock.expect_eth_call().returning(move |tx| {
 			assert_eq!(
@@ -566,7 +705,9 @@ mod tests {
 					.map(|addr| Address::from_slice(addr.0.as_slice())),
 				Some(expected_oft)
 			);
-			Box::pin(async move { Ok(alloy_primitives::Bytes::from(quote_fee_bytes(fee))) })
+			Box::pin(async move {
+				Ok(alloy_primitives::Bytes::from(oft_quote_fee_bytes(fee)))
+			})
 		});
 
 		let bridge = bridge_with_two_chain_delivery(mock, None);
@@ -582,7 +723,7 @@ mod tests {
 		assert_eq!(approve_call.amount, request.amount);
 
 		assert_eq!(tx_to(&submitted[1]), request.source_oft);
-		let send_call: contracts::sendCall = decode_submit(&submitted[1]);
+		let send_call: contracts::IOFT::sendCall = decode_submit(&submitted[1]);
 		assert_eq!(send_call.refundAddress, solver_address());
 		assert_eq!(
 			send_call.sendParam.to,
@@ -714,20 +855,23 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_estimate_fee_uses_the_same_directional_contract_as_bridge_asset() {
+	async fn test_estimate_fee_composer_calls_composer_address() {
 		let request = bridge_request();
 		let fee = U256::from(777u64);
+		let composer = Address::from([0xCC; 20]);
 		let call_target = Arc::new(Mutex::new(None));
 		let mut mock = MockDeliveryInterface::new();
 		{
 			let call_target = call_target.clone();
 			mock.expect_eth_call().returning(move |tx| {
 				*call_target.lock().unwrap() = Some(tx.clone());
-				Box::pin(async move { Ok(alloy_primitives::Bytes::from(quote_fee_bytes(fee))) })
+				Box::pin(async move {
+					Ok(alloy_primitives::Bytes::from(composer_quote_fee_bytes(fee)))
+				})
 			});
 		}
 
-		let bridge = bridge_with_two_chain_delivery(mock, Some(Address::from([0xCC; 20])));
+		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
 		let quoted = bridge.estimate_fee(&request).await.unwrap();
 
 		assert_eq!(quoted, fee);
@@ -736,7 +880,36 @@ mod tests {
 			.unwrap()
 			.clone()
 			.expect("missing contract call");
+		// Composer flow: quoteSend is called on the composer contract
+		assert_eq!(tx_to(&tx), composer);
+	}
+
+	#[tokio::test]
+	async fn test_estimate_fee_oft_calls_source_oft() {
+		let request = bridge_request();
+		let fee = U256::from(888u64);
+		let call_target = Arc::new(Mutex::new(None));
+		let mut mock = MockDeliveryInterface::new();
+		{
+			let call_target = call_target.clone();
+			mock.expect_eth_call().returning(move |tx| {
+				*call_target.lock().unwrap() = Some(tx.clone());
+				Box::pin(async move {
+					Ok(alloy_primitives::Bytes::from(oft_quote_fee_bytes(fee)))
+				})
+			});
+		}
+
+		let bridge = bridge_with_two_chain_delivery(mock, None);
+		let quoted = bridge.estimate_fee(&request).await.unwrap();
+
+		assert_eq!(quoted, fee);
+		let tx = call_target
+			.lock()
+			.unwrap()
+			.clone()
+			.expect("missing contract call");
+		// OFT flow: quoteSend is called on source_oft
 		assert_eq!(tx_to(&tx), request.source_oft);
-		assert_ne!(tx_to(&tx), request.source_token);
 	}
 }
