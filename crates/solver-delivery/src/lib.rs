@@ -179,11 +179,8 @@ pub trait DeliveryInterface: Send + Sync {
 	///
 	/// Returns `Ok(true)` if the tx is visible (pending or mined), `Ok(false)` if
 	/// the node has no record of it (dropped/evicted).
-	async fn tx_exists(
-		&self,
-		hash: &TransactionHash,
-		chain_id: u64,
-	) -> Result<bool, DeliveryError>;
+	async fn tx_exists(&self, hash: &TransactionHash, chain_id: u64)
+		-> Result<bool, DeliveryError>;
 
 	/// Queries event logs matching the given filter.
 	///

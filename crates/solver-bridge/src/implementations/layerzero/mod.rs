@@ -98,11 +98,10 @@ impl LayerZeroBridge {
 		label: &str,
 	) -> Result<solver_types::TransactionHash, BridgeError> {
 		let chain_id = tx.chain_id;
-		let hash = self
-			.delivery
-			.deliver(tx, None)
-			.await
-			.map_err(|e| BridgeError::TransactionFailed(format!("{label} submit failed: {e}")))?;
+		let hash =
+			self.delivery.deliver(tx, None).await.map_err(|e| {
+				BridgeError::TransactionFailed(format!("{label} submit failed: {e}"))
+			})?;
 
 		for attempt in 1..=12 {
 			match self.delivery.get_receipt(&hash, chain_id).await {
@@ -428,11 +427,8 @@ impl BridgeInterface for LayerZeroBridge {
 				.await
 				.map_err(|e| BridgeError::FeeEstimation(format!("quoteSend failed: {e}")))?;
 
-			let decoded =
-				contracts::IVaultComposerSync::quoteSendCall::abi_decode_returns(&result)
-					.map_err(|e| {
-						BridgeError::FeeEstimation(format!("Failed to decode fee: {e}"))
-					})?;
+			let decoded = contracts::IVaultComposerSync::quoteSendCall::abi_decode_returns(&result)
+				.map_err(|e| BridgeError::FeeEstimation(format!("Failed to decode fee: {e}")))?;
 
 			Ok(decoded.nativeFee)
 		} else {
@@ -457,9 +453,7 @@ impl BridgeInterface for LayerZeroBridge {
 				.map_err(|e| BridgeError::FeeEstimation(format!("quoteSend failed: {e}")))?;
 
 			let decoded = contracts::IOFT::quoteSendCall::abi_decode_returns(&result)
-				.map_err(|e| {
-					BridgeError::FeeEstimation(format!("Failed to decode fee: {e}"))
-				})?;
+				.map_err(|e| BridgeError::FeeEstimation(format!("Failed to decode fee: {e}")))?;
 
 			Ok(decoded.nativeFee)
 		}
@@ -587,12 +581,10 @@ mod tests {
 	}
 
 	fn composer_quote_fee_bytes(native_fee: U256) -> Vec<u8> {
-		contracts::IVaultComposerSync::quoteSendCall::abi_encode_returns(
-			&contracts::MessagingFee {
-				nativeFee: native_fee,
-				lzTokenFee: U256::ZERO,
-			},
-		)
+		contracts::IVaultComposerSync::quoteSendCall::abi_encode_returns(&contracts::MessagingFee {
+			nativeFee: native_fee,
+			lzTokenFee: U256::ZERO,
+		})
 	}
 
 	#[tokio::test]
@@ -637,9 +629,9 @@ mod tests {
 					.map(|addr| Address::from_slice(addr.0.as_slice())),
 				Some(expected_composer)
 			);
-			Box::pin(async move {
-				Ok(alloy_primitives::Bytes::from(composer_quote_fee_bytes(fee)))
-			})
+			Box::pin(
+				async move { Ok(alloy_primitives::Bytes::from(composer_quote_fee_bytes(fee))) },
+			)
 		});
 
 		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
@@ -705,9 +697,7 @@ mod tests {
 					.map(|addr| Address::from_slice(addr.0.as_slice())),
 				Some(expected_oft)
 			);
-			Box::pin(async move {
-				Ok(alloy_primitives::Bytes::from(oft_quote_fee_bytes(fee)))
-			})
+			Box::pin(async move { Ok(alloy_primitives::Bytes::from(oft_quote_fee_bytes(fee))) })
 		});
 
 		let bridge = bridge_with_two_chain_delivery(mock, None);
@@ -865,9 +855,9 @@ mod tests {
 			let call_target = call_target.clone();
 			mock.expect_eth_call().returning(move |tx| {
 				*call_target.lock().unwrap() = Some(tx.clone());
-				Box::pin(async move {
-					Ok(alloy_primitives::Bytes::from(composer_quote_fee_bytes(fee)))
-				})
+				Box::pin(
+					async move { Ok(alloy_primitives::Bytes::from(composer_quote_fee_bytes(fee))) },
+				)
 			});
 		}
 
@@ -894,9 +884,7 @@ mod tests {
 			let call_target = call_target.clone();
 			mock.expect_eth_call().returning(move |tx| {
 				*call_target.lock().unwrap() = Some(tx.clone());
-				Box::pin(async move {
-					Ok(alloy_primitives::Bytes::from(oft_quote_fee_bytes(fee)))
-				})
+				Box::pin(async move { Ok(alloy_primitives::Bytes::from(oft_quote_fee_bytes(fee))) })
 			});
 		}
 

@@ -270,7 +270,10 @@ impl RebalanceMonitor {
 							);
 							// Don't apply the Failed status — let it retry
 							transfer.last_status_poll_at = Some(now);
-							self.bridge_service.storage().save_transfer(&transfer).await?;
+							self.bridge_service
+								.storage()
+								.save_transfer(&transfer)
+								.await?;
 							continue;
 						}
 						// 3+ misses — let the Failed status apply below
@@ -393,7 +396,10 @@ impl RebalanceMonitor {
 				transfer.dest_token_address.as_ref()
 			} else {
 				// Non-composer: vault share token emits Transfer when shares are unlocked
-				transfer.vault_address.as_ref().or(transfer.dest_token_address.as_ref())
+				transfer
+					.vault_address
+					.as_ref()
+					.or(transfer.dest_token_address.as_ref())
 			};
 
 			if matches!(transfer.status, BridgeTransferStatus::Relaying)
