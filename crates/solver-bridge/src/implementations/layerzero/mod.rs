@@ -31,20 +31,30 @@ fn to_solver_addr(addr: Address) -> solver_types::Address {
 	solver_types::Address(addr.as_slice().to_vec())
 }
 
-/// Build a solver_types Transaction for contract calls.
-/// Default gas limit for bridge transactions. LayerZero OFT send() and
-/// Composer depositAndSend() involve internal cross-chain endpoint calls
-/// that can exceed eth_estimateGas results. 500k is a safe upper bound.
-const BRIDGE_TX_GAS_LIMIT: u64 = 500_000;
+/// OFT send() is still kept on a fixed gas limit to avoid changing the
+/// Katana -> Ethereum path while fixing the composer-only regression.
+const OFT_BRIDGE_TX_GAS_LIMIT: u64 = 500_000;
+/// Add 25% headroom on top of the estimated composer gas.
+const COMPOSER_GAS_BUFFER_BPS: u64 = 2_500;
+/// If estimateGas fails, still submit with a higher cap than the old 500k.
+const COMPOSER_FALLBACK_GAS_LIMIT: u64 = 1_200_000;
+/// Guardrail against a pathological estimate response.
+const COMPOSER_MAX_GAS_LIMIT: u64 = 2_000_000;
 
-fn build_tx(chain_id: u64, to: Address, data: Vec<u8>, value: U256) -> solver_types::Transaction {
+fn build_tx(
+	chain_id: u64,
+	to: Address,
+	data: Vec<u8>,
+	value: U256,
+	gas_limit: Option<u64>,
+) -> solver_types::Transaction {
 	solver_types::Transaction {
 		to: Some(to_solver_addr(to)),
 		data,
 		value,
 		chain_id,
 		nonce: None,
-		gas_limit: Some(BRIDGE_TX_GAS_LIMIT),
+		gas_limit,
 		gas_price: None,
 		max_fee_per_gas: None,
 		max_priority_fee_per_gas: None,
@@ -89,6 +99,28 @@ impl LayerZeroBridge {
 	/// Returns true if source chain has a composer (ETH→Katana path).
 	fn is_composer_flow(&self, source_chain: u64) -> bool {
 		self.config.composer_addresses.contains_key(&source_chain)
+	}
+
+	async fn resolve_composer_gas_limit(
+		&self,
+		chain_id: u64,
+		tx: solver_types::Transaction,
+	) -> u64 {
+		match self.delivery.estimate_gas(chain_id, tx).await {
+			Ok(estimated) => estimated
+				.saturating_mul(10_000 + COMPOSER_GAS_BUFFER_BPS)
+				.saturating_div(10_000)
+				.min(COMPOSER_MAX_GAS_LIMIT),
+			Err(e) => {
+				tracing::info!(
+					chain_id,
+					fallback_gas_limit = COMPOSER_FALLBACK_GAS_LIMIT,
+					error = %e,
+					"Falling back to fixed composer gas limit after estimate_gas failure"
+				);
+				COMPOSER_FALLBACK_GAS_LIMIT
+			},
+		}
 	}
 
 	/// Submit a transaction and poll for receipt confirmation.
@@ -152,6 +184,7 @@ impl LayerZeroBridge {
 			request.source_token,
 			approve_data,
 			U256::ZERO,
+			Some(OFT_BRIDGE_TX_GAS_LIMIT),
 		);
 		self.submit_and_confirm(approve_tx, "Composer approve")
 			.await?;
@@ -177,7 +210,18 @@ impl LayerZeroBridge {
 		}
 		.abi_encode();
 
-		let deposit_tx = build_tx(request.source_chain, composer_addr, deposit_data, fee);
+		let deposit_tx = build_tx(
+			request.source_chain,
+			composer_addr,
+			deposit_data,
+			fee,
+			None,
+		);
+		let composer_gas_limit = self
+			.resolve_composer_gas_limit(request.source_chain, deposit_tx.clone())
+			.await;
+		let mut deposit_tx = deposit_tx;
+		deposit_tx.gas_limit = Some(composer_gas_limit);
 		let tx_hash =
 			self.delivery.deliver(deposit_tx, None).await.map_err(|e| {
 				BridgeError::TransactionFailed(format!("depositAndSend failed: {e}"))
@@ -214,6 +258,7 @@ impl LayerZeroBridge {
 			request.source_token,
 			approve_data,
 			U256::ZERO,
+			Some(OFT_BRIDGE_TX_GAS_LIMIT),
 		);
 		self.submit_and_confirm(approve_tx, "OFT approve").await?;
 
@@ -243,7 +288,13 @@ impl LayerZeroBridge {
 		}
 		.abi_encode();
 
-		let send_tx = build_tx(request.source_chain, request.source_oft, send_data, fee);
+		let send_tx = build_tx(
+			request.source_chain,
+			request.source_oft,
+			send_data,
+			fee,
+			Some(OFT_BRIDGE_TX_GAS_LIMIT),
+		);
 		let tx_hash = self
 			.delivery
 			.deliver(send_tx, None)
@@ -419,6 +470,7 @@ impl BridgeInterface for LayerZeroBridge {
 				self.get_composer(request.source_chain)?,
 				quote_data,
 				U256::ZERO,
+				None,
 			);
 
 			let result = self
@@ -444,6 +496,7 @@ impl BridgeInterface for LayerZeroBridge {
 				request.source_oft,
 				quote_data,
 				U256::ZERO,
+				None,
 			);
 
 			let result = self
@@ -504,7 +557,7 @@ mod tests {
 	use crate::test_support::bridge_request;
 	use alloy_primitives::{Address, U256};
 	use serde_json::json;
-	use solver_delivery::MockDeliveryInterface;
+	use solver_delivery::{DeliveryError, MockDeliveryInterface};
 	use solver_types::{Transaction, TransactionHash, TransactionReceipt};
 	use std::collections::HashMap;
 	use std::sync::{Arc, Mutex};
@@ -633,6 +686,12 @@ mod tests {
 				async move { Ok(alloy_primitives::Bytes::from(composer_quote_fee_bytes(fee))) },
 			)
 		});
+		mock.expect_estimate_gas().times(1).returning(move |tx| {
+			assert_eq!(tx_to(&tx), composer);
+			assert_eq!(tx.value, fee);
+			assert_eq!(tx.gas_limit, None);
+			Box::pin(async move { Ok(900_000) })
+		});
 
 		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
 		let result = bridge.bridge_asset(&request).await.unwrap();
@@ -656,6 +715,127 @@ mod tests {
 			deposit_call.sendParam.to,
 			contracts::address_to_bytes32(solver_address())
 		);
+		assert_eq!(submitted[1].gas_limit, Some(1_125_000));
+	}
+
+	#[tokio::test]
+	async fn test_bridge_via_composer_uses_estimated_gas_with_buffer() {
+		let request = bridge_request();
+		let composer = Address::from([0xCC; 20]);
+		let fee = U256::from(12345u64);
+		let submitted = Arc::new(Mutex::new(Vec::<Transaction>::new()));
+		let mut mock = MockDeliveryInterface::new();
+
+		{
+			let submitted = submitted.clone();
+			mock.expect_submit().times(2).returning(move |tx, _| {
+				let submitted = submitted.clone();
+				Box::pin(async move {
+					submitted.lock().unwrap().push(tx.clone());
+					Ok(TransactionHash(vec![0x33; 32]))
+				})
+			});
+		}
+
+		mock.expect_get_receipt().returning(|_, _| {
+			Box::pin(async move {
+				Ok(TransactionReceipt {
+					hash: TransactionHash(vec![0x33; 32]),
+					block_number: 1,
+					success: true,
+					logs: vec![],
+					block_timestamp: None,
+				})
+			})
+		});
+
+		let expected_composer = composer;
+		mock.expect_eth_call().returning(move |tx| {
+			assert_eq!(
+				tx.to
+					.as_ref()
+					.map(|addr| Address::from_slice(addr.0.as_slice())),
+				Some(expected_composer)
+			);
+			Box::pin(
+				async move { Ok(alloy_primitives::Bytes::from(composer_quote_fee_bytes(fee))) },
+			)
+		});
+
+		let expected_composer = composer;
+		mock.expect_estimate_gas().times(1).returning(move |tx| {
+			assert_eq!(tx.value, fee);
+			assert_eq!(tx.gas_limit, None);
+			assert_eq!(tx_to(&tx), expected_composer);
+			let deposit_call: contracts::IVaultComposerSync::depositAndSendCall =
+				decode_submit(&tx);
+			assert_eq!(deposit_call.assetAmount, request.amount);
+			Box::pin(async move { Ok(900_000) })
+		});
+
+		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
+		bridge.bridge_asset(&request).await.unwrap();
+
+		let submitted = submitted.lock().unwrap();
+		assert_eq!(submitted.len(), 2);
+		assert_eq!(submitted[1].gas_limit, Some(1_125_000));
+	}
+
+	#[tokio::test]
+	async fn test_bridge_via_composer_falls_back_when_estimate_gas_fails() {
+		let request = bridge_request();
+		let composer = Address::from([0xCC; 20]);
+		let fee = U256::from(12345u64);
+		let submitted = Arc::new(Mutex::new(Vec::<Transaction>::new()));
+		let mut mock = MockDeliveryInterface::new();
+
+		{
+			let submitted = submitted.clone();
+			mock.expect_submit().times(2).returning(move |tx, _| {
+				let submitted = submitted.clone();
+				Box::pin(async move {
+					submitted.lock().unwrap().push(tx.clone());
+					Ok(TransactionHash(vec![0x44; 32]))
+				})
+			});
+		}
+
+		mock.expect_get_receipt().returning(|_, _| {
+			Box::pin(async move {
+				Ok(TransactionReceipt {
+					hash: TransactionHash(vec![0x44; 32]),
+					block_number: 1,
+					success: true,
+					logs: vec![],
+					block_timestamp: None,
+				})
+			})
+		});
+
+		let expected_composer = composer;
+		mock.expect_eth_call().returning(move |tx| {
+			assert_eq!(
+				tx.to
+					.as_ref()
+					.map(|addr| Address::from_slice(addr.0.as_slice())),
+				Some(expected_composer)
+			);
+			Box::pin(
+				async move { Ok(alloy_primitives::Bytes::from(composer_quote_fee_bytes(fee))) },
+			)
+		});
+
+		mock.expect_estimate_gas().times(1).returning(|tx| {
+			assert_eq!(tx.gas_limit, None);
+			Box::pin(async move { Err(DeliveryError::Network("boom".to_string())) })
+		});
+
+		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
+		bridge.bridge_asset(&request).await.unwrap();
+
+		let submitted = submitted.lock().unwrap();
+		assert_eq!(submitted.len(), 2);
+		assert_eq!(submitted[1].gas_limit, Some(1_200_000));
 	}
 
 	#[tokio::test]
@@ -721,6 +901,56 @@ mod tests {
 		);
 		assert_eq!(send_call.sendParam.dstEid, 200);
 		assert_eq!(send_call.fee.nativeFee, fee);
+	}
+
+	#[tokio::test]
+	async fn test_bridge_via_oft_send_keeps_fixed_gas_limit() {
+		let request = bridge_request();
+		let fee = U256::from(12345u64);
+		let submitted = Arc::new(Mutex::new(Vec::<Transaction>::new()));
+		let mut mock = MockDeliveryInterface::new();
+
+		{
+			let submitted = submitted.clone();
+			mock.expect_submit().times(2).returning(move |tx, _| {
+				let submitted = submitted.clone();
+				Box::pin(async move {
+					submitted.lock().unwrap().push(tx.clone());
+					Ok(TransactionHash(vec![0x55; 32]))
+				})
+			});
+		}
+
+		mock.expect_get_receipt().returning(|_, _| {
+			Box::pin(async move {
+				Ok(TransactionReceipt {
+					hash: TransactionHash(vec![0x55; 32]),
+					block_number: 1,
+					success: true,
+					logs: vec![],
+					block_timestamp: None,
+				})
+			})
+		});
+
+		let expected_oft = request.source_oft;
+		mock.expect_eth_call().returning(move |tx| {
+			assert_eq!(
+				tx.to
+					.as_ref()
+					.map(|addr| Address::from_slice(addr.0.as_slice())),
+				Some(expected_oft)
+			);
+			Box::pin(async move { Ok(alloy_primitives::Bytes::from(oft_quote_fee_bytes(fee))) })
+		});
+		mock.expect_estimate_gas().times(0);
+
+		let bridge = bridge_with_two_chain_delivery(mock, None);
+		bridge.bridge_asset(&request).await.unwrap();
+
+		let submitted = submitted.lock().unwrap();
+		assert_eq!(submitted.len(), 2);
+		assert_eq!(submitted[1].gas_limit, Some(500_000));
 	}
 
 	#[tokio::test]
