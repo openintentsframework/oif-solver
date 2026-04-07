@@ -210,13 +210,7 @@ impl LayerZeroBridge {
 		}
 		.abi_encode();
 
-		let deposit_tx = build_tx(
-			request.source_chain,
-			composer_addr,
-			deposit_data,
-			fee,
-			None,
-		);
+		let deposit_tx = build_tx(request.source_chain, composer_addr, deposit_data, fee, None);
 		let composer_gas_limit = self
 			.resolve_composer_gas_limit(request.source_chain, deposit_tx.clone())
 			.await;
