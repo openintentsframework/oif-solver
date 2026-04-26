@@ -198,6 +198,13 @@ pub struct PendingBridgeTransfer {
 	/// Unix timestamp when the source tx was first observed missing.
 	#[serde(default)]
 	pub submitted_missing_since: Option<u64>,
+	/// Number of consecutive polls where the stored redeem tx was not found on-chain.
+	/// Mirrors `submitted_missing_checks` for the destination-side vault redeem.
+	#[serde(default)]
+	pub redeem_missing_checks: u32,
+	/// Unix timestamp when the redeem tx was first observed missing.
+	#[serde(default)]
+	pub redeem_missing_since: Option<u64>,
 }
 
 impl PendingBridgeTransfer {
@@ -246,6 +253,8 @@ impl PendingBridgeTransfer {
 			resolution_reason: None,
 			submitted_missing_checks: 0,
 			submitted_missing_since: None,
+			redeem_missing_checks: 0,
+			redeem_missing_since: None,
 		}
 	}
 

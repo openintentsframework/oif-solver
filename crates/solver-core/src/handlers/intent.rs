@@ -140,6 +140,14 @@ impl IntentHandler {
 		// This enables hot-reload: config changes via Admin API are picked up on next intent.
 		let config = self.dynamic_config.read().await.clone();
 
+		// Normalize the intent id at the lookup boundary so that in-memory dedupe,
+		// the storage existence check, and the storage write all use the same key.
+		// Discovery sources may emit ids with or without the `0x` prefix; without
+		// this normalization the cross-restart `exists` check could miss an intent
+		// that `store` had written under the prefixed form, allowing a duplicate
+		// `store_order` to overwrite an active order's tx hashes.
+		let dedup_id = with_0x_prefix(&intent.id);
+
 		// Prevent duplicate order processing when multiple discovery modules for the same standard are active.
 		//
 		// When an off-chain 7683 order is submitted via the API, it triggers an `openFor` transaction
@@ -153,21 +161,21 @@ impl IntentHandler {
 		// This provides atomic check-and-insert for intent IDs
 		{
 			let mut processed = self.processed_intents.write().await;
-			if processed.contains(&intent.id) {
+			if processed.contains(&dedup_id) {
 				tracing::debug!(
 					"Duplicate intent detected in memory cache, already being processed"
 				);
 				return Ok(());
 			}
 			// Atomically claim this intent ID (LRU will auto-evict oldest if at capacity)
-			processed.put(intent.id.clone(), ());
+			processed.put(dedup_id.clone(), ());
 		}
 
 		// Fallback check against persistent storage for cross-restart deduplication
 		// This handles cases where the service was restarted between intent discovery
 		let exists = self
 			.storage
-			.exists(StorageKey::Intents.as_str(), &intent.id)
+			.exists(StorageKey::Intents.as_str(), &dedup_id)
 			.await
 			.map_err(|e| IntentError::Storage(format!("Failed to check intent existence: {e}")))?;
 		if exists {
@@ -220,15 +228,11 @@ impl IntentHandler {
 			}
 		}
 
-		// Store intent immediately to prevent race conditions with duplicate discovery
-		// This claims the intent ID slot before we start the potentially slow validation process
+		// Store intent immediately to prevent race conditions with duplicate discovery.
+		// This claims the intent ID slot before we start the potentially slow validation process.
+		// `dedup_id` is the same canonicalized key the existence check used above.
 		self.storage
-			.store(
-				StorageKey::Intents.as_str(),
-				&with_0x_prefix(&intent.id),
-				&intent,
-				None,
-			)
+			.store(StorageKey::Intents.as_str(), &dedup_id, &intent, None)
 			.await
 			.map_err(|e| {
 				IntentError::Storage(format!("Failed to store intent for deduplication: {e}"))
@@ -458,13 +462,13 @@ impl IntentHandler {
 					}))
 					.ok();
 
-				// Store order
-				self.state_machine
-					.store_order(&order)
-					.await
-					.map_err(|e| IntentError::Storage(e.to_string()))?;
-
-				// Check execution strategy
+				// Run the execution decision BEFORE persisting the order. On Execute,
+				// we attach `execution_params` to the order so it lands in storage
+				// already resumable from `NeedsExecution`; on Skip, we don't store
+				// the order at all (no terminal Skipped status exists, and recovery
+				// would otherwise classify it as NeedsExecution + missing params and
+				// strand it). Defer keeps its prior behavior — stored without params —
+				// pending a separate fix for the Defer recovery path.
 				let builder = ContextBuilder::new(
 					self.delivery.clone(),
 					self.solver_address.clone(),
@@ -477,6 +481,11 @@ impl IntentHandler {
 					.map_err(|e| IntentError::Service(e.to_string()))?;
 				match self.order_service.should_execute(&order, &context).await {
 					ExecutionDecision::Execute(params) => {
+						order.execution_params = Some(params.clone());
+						self.state_machine
+							.store_order(&order)
+							.await
+							.map_err(|e| IntentError::Storage(e.to_string()))?;
 						self.event_bus
 							.publish(SolverEvent::Order(OrderEvent::Preparing {
 								intent: intent.clone(),
@@ -494,6 +503,10 @@ impl IntentHandler {
 							.ok();
 					},
 					ExecutionDecision::Defer(duration) => {
+						self.state_machine
+							.store_order(&order)
+							.await
+							.map_err(|e| IntentError::Storage(e.to_string()))?;
 						self.event_bus
 							.publish(SolverEvent::Order(OrderEvent::Deferred {
 								order_id: order.id,
@@ -862,7 +875,7 @@ mod tests {
 		// Setup expectations
 		mock_storage
 			.expect_exists()
-			.with(eq("intents:test_intent_123"))
+			.with(eq("intents:0xtest_intent_123"))
 			.times(1)
 			.returning(|_| Box::pin(async move { Ok(false) }));
 
@@ -960,7 +973,7 @@ mod tests {
 		// Setup expectations - intent already exists
 		mock_storage
 			.expect_exists()
-			.with(eq("intents:test_intent_123"))
+			.with(eq("intents:0xtest_intent_123"))
 			.times(1)
 			.returning(|_| Box::pin(async move { Ok(true) }));
 
@@ -1003,6 +1016,331 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn test_handle_intent_dedupes_with_prefixed_storage_key_for_unprefixed_input() {
+		// Cross-restart dedupe must be tolerant of `0x` prefix variance from
+		// discovery sources. The handler normalizes intent.id at lookup time so
+		// that the storage `exists` check uses the same key that `store` writes
+		// under. Without normalization, an intent stored under "0xabc..." would
+		// not be found when the next discovery emits "abc..." and the handler
+		// would proceed to overwrite the existing order.
+		let mut mock_storage = MockStorageInterface::new();
+		let intent = create_test_intent(); // id = "test_intent_123" (no 0x prefix)
+		let solver_address = create_test_address();
+
+		// `exists` MUST be called with the prefixed key, matching how `store` writes it.
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:0xtest_intent_123"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(true) }));
+
+		// Dedupe path: handler returns early; no further storage writes.
+		mock_storage.expect_set_bytes().times(0);
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::new(),
+			Box::new(MockExecutionStrategy::new()),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let cost_profit_service = create_mock_cost_profit_service();
+		let (config, static_config) = create_test_config();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+			&static_config,
+		);
+
+		let result = handler.handle(intent).await;
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_dedupes_when_input_id_already_has_0x_prefix() {
+		// Symmetric case: an incoming intent whose id is *already* prefixed must
+		// look up under the same canonical key as the unprefixed form. This proves
+		// the normalization is idempotent.
+		let mut mock_storage = MockStorageInterface::new();
+		let intent = IntentBuilder::new()
+			.with_id("0xtest_intent_123".to_string())
+			.build();
+		let solver_address = create_test_address();
+
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:0xtest_intent_123"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(true) }));
+		mock_storage.expect_set_bytes().times(0);
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::new(),
+			Box::new(MockExecutionStrategy::new()),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let cost_profit_service = create_mock_cost_profit_service();
+		let (config, static_config) = create_test_config();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+			&static_config,
+		);
+
+		let result = handler.handle(intent).await;
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_execute_stores_order_with_execution_params_attached() {
+		// When should_execute returns Execute(params), the order MUST be persisted
+		// with execution_params already attached. Otherwise a crash between
+		// store_order and the prepare handler's params write strands the order on
+		// recovery (NeedsExecution + missing params, no resumption path).
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_order_interface = MockOrderInterface::new();
+		let mut mock_strategy = MockExecutionStrategy::new();
+
+		let intent = create_test_intent();
+		let solver_address = create_test_address();
+
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:0xtest_intent_123"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+
+		// Intent write: any bytes, must happen once.
+		mock_storage
+			.expect_set_bytes()
+			.withf(|key: &str, _: &Vec<u8>, _, _| key.starts_with("intents:"))
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		// Order write: MUST contain execution_params. Otherwise no expectation
+		// matches and mockall panics.
+		mock_storage
+			.expect_set_bytes()
+			.withf(|key: &str, bytes: &Vec<u8>, _, _| {
+				if !key.starts_with("orders:") {
+					return false;
+				}
+				matches!(
+					serde_json::from_slice::<Order>(bytes),
+					Ok(o) if o.execution_params.is_some()
+				)
+			})
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		mock_order_interface
+			.expect_validate_and_create_order()
+			.times(1)
+			.returning(move |_, _, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
+		mock_order_interface
+			.expect_generate_fill_transaction()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					Ok(solver_types::Transaction {
+						to: Some(solver_types::Address(vec![0u8; 20])),
+						data: vec![],
+						value: U256::ZERO,
+						chain_id: 137,
+						nonce: None,
+						gas_limit: Some(200000),
+						gas_price: None,
+						max_fee_per_gas: None,
+						max_priority_fee_per_gas: None,
+					})
+				})
+			});
+
+		mock_strategy
+			.expect_should_execute()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					ExecutionDecision::Execute(ExecutionParams {
+						gas_price: U256::from(20000000000u64),
+						priority_fee: Some(U256::from(1000u64)),
+					})
+				})
+			});
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order_interface) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(mock_strategy),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let cost_profit_service = create_mock_cost_profit_service();
+		let (config, static_config) = create_test_config();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+			&static_config,
+		);
+
+		let result = handler.handle(intent).await;
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_skip_does_not_store_order() {
+		// The Skip path does not write to the Orders namespace. A stored skipped
+		// order would sit in Created with no execution_params and trip the
+		// recovery NeedsExecution + missing-params strand path the same way a
+		// crashed Execute path used to.
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_order_interface = MockOrderInterface::new();
+		let mut mock_strategy = MockExecutionStrategy::new();
+
+		let intent = create_test_intent();
+		let solver_address = create_test_address();
+
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:0xtest_intent_123"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+
+		// Only the intent should be persisted; no Orders write.
+		mock_storage
+			.expect_set_bytes()
+			.withf(|key: &str, _: &Vec<u8>, _, _| key.starts_with("intents:"))
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		// Any write to "orders:" is a regression — fail-match so mockall panics.
+		mock_storage
+			.expect_set_bytes()
+			.withf(|key: &str, _: &Vec<u8>, _, _| key.starts_with("orders:"))
+			.times(0);
+
+		mock_order_interface
+			.expect_validate_and_create_order()
+			.times(1)
+			.returning(move |_, _, _, _, _, _| Box::pin(async move { Ok(create_test_order()) }));
+		mock_order_interface
+			.expect_generate_fill_transaction()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					Ok(solver_types::Transaction {
+						to: Some(solver_types::Address(vec![0u8; 20])),
+						data: vec![],
+						value: U256::ZERO,
+						chain_id: 137,
+						nonce: None,
+						gas_limit: Some(200000),
+						gas_price: None,
+						max_fee_per_gas: None,
+						max_priority_fee_per_gas: None,
+					})
+				})
+			});
+
+		mock_strategy
+			.expect_should_execute()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move { ExecutionDecision::Skip("Insufficient balance".to_string()) })
+			});
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order_interface) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(mock_strategy),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let cost_profit_service = create_mock_cost_profit_service();
+		let (config, static_config) = create_test_config();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+			&static_config,
+		);
+
+		let result = handler.handle(intent).await;
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
 	async fn test_handle_intent_validation_failure() {
 		let mut mock_storage = MockStorageInterface::new();
 		let mut mock_order_interface = MockOrderInterface::new();
@@ -1013,7 +1351,7 @@ mod tests {
 		// Setup expectations
 		mock_storage
 			.expect_exists()
-			.with(eq("intents:test_intent_123"))
+			.with(eq("intents:0xtest_intent_123"))
 			.times(1)
 			.returning(|_| Box::pin(async move { Ok(false) }));
 
@@ -1084,7 +1422,7 @@ mod tests {
 
 		mock_storage
 			.expect_exists()
-			.with(eq("intents:test_intent_123"))
+			.with(eq("intents:0xtest_intent_123"))
 			.times(1)
 			.returning(|_| Box::pin(async move { Ok(false) }));
 
@@ -1167,7 +1505,7 @@ mod tests {
 
 		mock_storage
 			.expect_exists()
-			.with(eq("intents:test_intent_123"))
+			.with(eq("intents:0xtest_intent_123"))
 			.times(1)
 			.returning(|_| Box::pin(async move { Ok(false) }));
 		mock_storage
@@ -1246,13 +1584,15 @@ mod tests {
 		// Setup expectations
 		mock_storage
 			.expect_exists()
-			.with(eq("intents:test_intent_123"))
+			.with(eq("intents:0xtest_intent_123"))
 			.times(1)
 			.returning(|_| Box::pin(async move { Ok(false) }));
 
+		// Skip path stores only the intent (no order write).
+		// See test_handle_intent_skip_does_not_store_order for the strict per-call assertion.
 		mock_storage
 			.expect_set_bytes()
-			.times(2) // Once for intent, once for order
+			.times(1)
 			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
 
 		mock_order_interface
@@ -1338,7 +1678,7 @@ mod tests {
 		// Setup expectations
 		mock_storage
 			.expect_exists()
-			.with(eq("intents:test_intent_123"))
+			.with(eq("intents:0xtest_intent_123"))
 			.times(1)
 			.returning(|_| Box::pin(async move { Ok(false) }));
 
@@ -1428,7 +1768,7 @@ mod tests {
 		// Setup expectations - storage fails
 		mock_storage
 			.expect_exists()
-			.with(eq("intents:test_intent_123"))
+			.with(eq("intents:0xtest_intent_123"))
 			.times(1)
 			.returning(|_| {
 				Box::pin(async move { Err(StorageError::Backend("Database down".to_string())) })

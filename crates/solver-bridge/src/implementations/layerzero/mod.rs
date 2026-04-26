@@ -421,7 +421,46 @@ impl BridgeInterface for LayerZeroBridge {
 								))
 							}
 						},
-						Err(_) => Ok(BridgeTransferStatus::PendingRedemption),
+						Err(_) => {
+							// Receipt unavailable — distinguish "still pending in
+							// mempool" from "stored hash refers to a tx that never
+							// propagated / was dropped". The latter must surface so
+							// the monitor can clear the stale hash and resubmit;
+							// otherwise the transfer stays stuck waiting on a hash
+							// that will never resolve.
+							match self
+								.delivery
+								.tx_exists(&tx_hash_obj, transfer.dest_chain)
+								.await
+							{
+								Ok(true) => {
+									tracing::debug!(
+										transfer_id = %transfer.id,
+										redeem_tx_hash = %redeem_hash,
+										"Redeem tx pending, receipt not yet available"
+									);
+									Ok(BridgeTransferStatus::PendingRedemption)
+								},
+								Ok(false) => {
+									tracing::warn!(
+										transfer_id = %transfer.id,
+										redeem_tx_hash = %redeem_hash,
+										"Redeem tx hash not found on chain"
+									);
+									Ok(BridgeTransferStatus::Failed(
+										"Redeem transaction not found".to_string(),
+									))
+								},
+								Err(e) => {
+									tracing::debug!(
+										transfer_id = %transfer.id,
+										redeem_tx_hash = %redeem_hash,
+										"redeem tx_exists check failed: {e}"
+									);
+									Ok(BridgeTransferStatus::PendingRedemption)
+								},
+							}
+						},
 					}
 				} else {
 					Ok(BridgeTransferStatus::PendingRedemption)
@@ -1040,6 +1079,99 @@ mod tests {
 		let status = bridge.check_status(&transfer).await.unwrap();
 		assert!(
 			matches!(status, BridgeTransferStatus::Failed(reason) if reason == "Redeem transaction reverted")
+		);
+	}
+
+	#[tokio::test]
+	async fn test_check_status_pending_redemption_reports_missing_redeem_tx() {
+		// When the redeem receipt lookup fails AND tx_exists confirms the tx is
+		// not on chain, surface a structured "Redeem transaction not found"
+		// signal so the monitor can clear the stale hash and resubmit.
+		let mut transfer =
+			crate::test_support::pending_transfer(BridgeTransferStatus::PendingRedemption);
+		transfer.redeem_tx_hash =
+			Some("0x0505050505050505050505050505050505050505050505050505050505050505".to_string());
+
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_receipt().returning(|_, _| {
+			Box::pin(async move {
+				Err(solver_delivery::DeliveryError::Network(
+					"receipt not found".to_string(),
+				))
+			})
+		});
+		mock.expect_tx_exists()
+			.returning(|_, _| Box::pin(async move { Ok(false) }));
+
+		let bridge = bridge_with_two_chain_delivery(mock, None);
+		let status = bridge.check_status(&transfer).await.unwrap();
+
+		assert!(
+			matches!(&status, BridgeTransferStatus::Failed(reason) if reason == "Redeem transaction not found"),
+			"expected Failed(\"Redeem transaction not found\"), got {status:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_check_status_pending_redemption_waits_when_redeem_tx_exists_without_receipt() {
+		// Receipt missing but tx_exists == true means the redeem tx is sitting
+		// in the mempool — keep waiting in PendingRedemption.
+		let mut transfer =
+			crate::test_support::pending_transfer(BridgeTransferStatus::PendingRedemption);
+		transfer.redeem_tx_hash =
+			Some("0x0606060606060606060606060606060606060606060606060606060606060606".to_string());
+
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_receipt().returning(|_, _| {
+			Box::pin(async move {
+				Err(solver_delivery::DeliveryError::Network(
+					"receipt not found".to_string(),
+				))
+			})
+		});
+		mock.expect_tx_exists()
+			.returning(|_, _| Box::pin(async move { Ok(true) }));
+
+		let bridge = bridge_with_two_chain_delivery(mock, None);
+		let status = bridge.check_status(&transfer).await.unwrap();
+
+		assert!(
+			matches!(status, BridgeTransferStatus::PendingRedemption),
+			"expected PendingRedemption, got {status:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_check_status_pending_redemption_stays_unknown_when_redeem_tx_exists_check_errors() {
+		// If tx_exists itself errors, treat the state as unknown and stay in
+		// PendingRedemption rather than escalating to a missing-tx failure.
+		let mut transfer =
+			crate::test_support::pending_transfer(BridgeTransferStatus::PendingRedemption);
+		transfer.redeem_tx_hash =
+			Some("0x0707070707070707070707070707070707070707070707070707070707070707".to_string());
+
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_receipt().returning(|_, _| {
+			Box::pin(async move {
+				Err(solver_delivery::DeliveryError::Network(
+					"receipt not found".to_string(),
+				))
+			})
+		});
+		mock.expect_tx_exists().returning(|_, _| {
+			Box::pin(async move {
+				Err(solver_delivery::DeliveryError::Network(
+					"rpc unavailable".to_string(),
+				))
+			})
+		});
+
+		let bridge = bridge_with_two_chain_delivery(mock, None);
+		let status = bridge.check_status(&transfer).await.unwrap();
+
+		assert!(
+			matches!(status, BridgeTransferStatus::PendingRedemption),
+			"expected PendingRedemption, got {status:?}"
 		);
 	}
 

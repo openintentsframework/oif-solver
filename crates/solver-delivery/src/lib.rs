@@ -19,6 +19,7 @@ use thiserror::Error;
 pub mod implementations {
 	pub mod evm {
 		pub mod alloy;
+		pub mod nonce;
 	}
 }
 
@@ -31,6 +32,11 @@ pub enum DeliveryError {
 	/// Error that occurs when a transaction execution fails.
 	#[error("Transaction failed: {0}")]
 	TransactionFailed(String),
+	/// Submission failed with `nonce too low` after a one-shot resync retry.
+	/// Callers (e.g. bridge monitor) should treat this as transient nonce drift,
+	/// not a business failure: do not increment failure counters.
+	#[error("Nonce too low after resync retry: {0}")]
+	NonceTooLow(String),
 	/// Error that occurs when no suitable implementation is available for the operation.
 	#[error("No implementation available")]
 	NoImplementationAvailable,

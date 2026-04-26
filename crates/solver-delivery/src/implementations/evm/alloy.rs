@@ -3,13 +3,14 @@
 //! This module provides concrete implementations of the DeliveryInterface trait,
 //! supporting blockchain transaction submission and monitoring using the Alloy library.
 
+use crate::implementations::evm::nonce::{is_nonce_too_low_error, ResettableNonceManager};
 use crate::{
 	DeliveryError, DeliveryInterface, TransactionMonitoringEvent, TransactionTrackingWithConfig,
 };
 use alloy_network::EthereumWallet;
 use alloy_primitives::{Address, Bytes, FixedBytes, U256};
 use alloy_provider::{
-	fillers::{CachedNonceManager, ChainIdFiller, GasFiller, NonceFiller},
+	fillers::{ChainIdFiller, GasFiller},
 	DynProvider, Provider, ProviderBuilder,
 };
 use alloy_rpc_client::RpcClient;
@@ -32,6 +33,13 @@ use std::collections::HashMap;
 pub struct AlloyDelivery {
 	/// Alloy providers for each supported network.
 	providers: HashMap<u64, DynProvider>,
+	/// Resettable nonce manager per chain. Replaces Alloy's opaque
+	/// `CachedNonceManager` so we can resync the local cache from chain
+	/// after a `nonce too low` submission error.
+	nonce_managers: HashMap<u64, ResettableNonceManager>,
+	/// Signer address per chain — needed to call `eth_getTransactionCount(from, "pending")`
+	/// for the resync path. The signer itself stays inside the provider's wallet filler.
+	signer_addresses: HashMap<u64, Address>,
 }
 
 impl AlloyDelivery {
@@ -54,6 +62,8 @@ impl AlloyDelivery {
 		}
 
 		let mut providers = HashMap::new();
+		let mut nonce_managers = HashMap::new();
+		let mut signer_addresses = HashMap::new();
 
 		for network_id in &network_ids {
 			// Get network configuration
@@ -81,6 +91,7 @@ impl AlloyDelivery {
 
 			// Create signer with chain ID
 			let chain_signer = signer.with_chain_id(Some(*network_id));
+			let signer_address = chain_signer.address();
 			let wallet = EthereumWallet::from(chain_signer);
 
 			// Configure retry layer for handling network errors, rate limits, and execution reverts
@@ -106,10 +117,10 @@ impl AlloyDelivery {
 			// Create RPC client with retry capabilities
 			let client = RpcClient::builder().layer(retry_layer).http(url);
 
-			// Cache nonces locally so back-to-back startup approvals do not reuse a stale
-			// pending nonce while the RPC is still catching up.
+			// Build the provider WITHOUT a NonceFiller — we own nonce assignment via
+			// `ResettableNonceManager` so we can resync from chain after a
+			// `nonce too low` submission error. `submit()` sets `tx.nonce` explicitly.
 			let provider = ProviderBuilder::new()
-				.filler(NonceFiller::<CachedNonceManager>::cached())
 				.filler(GasFiller)
 				.filler(ChainIdFiller::default())
 				.wallet(wallet)
@@ -122,9 +133,15 @@ impl AlloyDelivery {
 			// Use type erasure to simplify the provider type
 			let dyn_provider = provider.erased();
 			providers.insert(*network_id, dyn_provider);
+			nonce_managers.insert(*network_id, ResettableNonceManager::new());
+			signer_addresses.insert(*network_id, signer_address);
 		}
 
-		Ok(Self { providers })
+		Ok(Self {
+			providers,
+			nonce_managers,
+			signer_addresses,
+		})
 	}
 
 	/// Gets the provider for a specific chain ID.
@@ -132,6 +149,68 @@ impl AlloyDelivery {
 		self.providers.get(&chain_id).ok_or_else(|| {
 			DeliveryError::Network(format!("No provider configured for chain ID {chain_id}"))
 		})
+	}
+
+	/// Gets the nonce manager for a specific chain ID.
+	fn get_nonce_manager(&self, chain_id: u64) -> Result<&ResettableNonceManager, DeliveryError> {
+		self.nonce_managers.get(&chain_id).ok_or_else(|| {
+			DeliveryError::Network(format!("No nonce manager configured for chain ID {chain_id}"))
+		})
+	}
+
+	/// Gets the signer address for a specific chain ID.
+	fn get_signer_address(&self, chain_id: u64) -> Result<Address, DeliveryError> {
+		self.signer_addresses.get(&chain_id).copied().ok_or_else(|| {
+			DeliveryError::Network(format!("No signer configured for chain ID {chain_id}"))
+		})
+	}
+
+	/// Returns the next nonce to use for `from` on `chain_id`, taking it from the
+	/// resettable cache. On first use for an address, fetches `pending` from chain
+	/// to seed the cache.
+	async fn next_nonce_for(
+		&self,
+		chain_id: u64,
+		from: Address,
+	) -> Result<u64, DeliveryError> {
+		let mgr = self.get_nonce_manager(chain_id)?;
+		if let Some(n) = mgr.take_next(from) {
+			return Ok(n);
+		}
+		// First use for this address — seed from chain pending and take.
+		let provider = self.get_provider(chain_id)?;
+		let pending = provider
+			.get_transaction_count(from)
+			.pending()
+			.await
+			.map_err(|e| DeliveryError::Network(format!("Failed to fetch pending nonce: {e}")))?;
+		mgr.set_next_nonce(from, pending);
+		Ok(mgr
+			.take_next(from)
+			.expect("nonce just seeded via set_next_nonce"))
+	}
+
+	/// Resync the local nonce manager from chain pending and return the next
+	/// nonce to use for the resync retry. Advances the cache past whatever
+	/// the chain already knows about.
+	async fn resync_nonce_for(
+		&self,
+		chain_id: u64,
+		from: Address,
+	) -> Result<u64, DeliveryError> {
+		let provider = self.get_provider(chain_id)?;
+		let pending = provider
+			.get_transaction_count(from)
+			.pending()
+			.await
+			.map_err(|e| {
+				DeliveryError::Network(format!("Failed to fetch pending nonce for resync: {e}"))
+			})?;
+		let mgr = self.get_nonce_manager(chain_id)?;
+		mgr.set_next_nonce(from, pending);
+		Ok(mgr
+			.take_next(from)
+			.expect("nonce just seeded via set_next_nonce"))
 	}
 }
 
@@ -221,36 +300,103 @@ impl DeliveryInterface for AlloyDelivery {
 
 		// Get the appropriate provider for this chain
 		let provider = self.get_provider(chain_id)?;
+		let from = self.get_signer_address(chain_id)?;
 
-		// Convert solver transaction to alloy transaction request
-		let request: TransactionRequest = tx.clone().into();
+		// Fill nonce from the resettable manager if the caller didn't pass one.
+		// We own nonce assignment now (no NonceFiller), so this is the only place
+		// the local nonce counter advances on the happy path.
+		let mut tx_attempt = tx.clone();
+		if tx_attempt.nonce.is_none() {
+			tx_attempt.nonce = Some(self.next_nonce_for(chain_id, from).await?);
+		}
+		let request: TransactionRequest = tx_attempt.clone().into();
 
 		// Log request details for debugging
 		if tracking.is_some() {
 			tracing::debug!(
-				"Sending transaction with monitoring on chain {}: to={:?}, value={:?}, data_len={}, gas_limit={:?}",
+				"Sending transaction with monitoring on chain {}: to={:?}, value={:?}, data_len={}, gas_limit={:?}, nonce={:?}",
 				chain_id,
 				request.to,
 				request.value,
 				request.input.input().map(|d| d.len()).unwrap_or(0),
-				request.gas
+				request.gas,
+				request.nonce
 			);
 		} else {
 			tracing::debug!(
-				"Sending transaction on chain {}: to={:?}, value={:?}, data_len={}, gas_limit={:?}",
+				"Sending transaction on chain {}: to={:?}, value={:?}, data_len={}, gas_limit={:?}, nonce={:?}",
 				chain_id,
 				request.to,
 				request.value,
 				request.input.input().map(|d| d.len()).unwrap_or(0),
-				request.gas
+				request.gas,
+				request.nonce
 			);
 		}
 
-		// Send transaction - the provider's wallet will handle signing
-		let pending_tx = provider.send_transaction(request).await.map_err(|e| {
-			tracing::error!("Transaction submission failed on chain {}: {}", chain_id, e);
-			DeliveryError::Network(format!("Failed to send transaction: {e}"))
-		})?;
+		// First attempt. On `nonce too low`, resync the local cache from chain
+		// pending and retry once with the resynced nonce.
+		let pending_tx = match provider.send_transaction(request).await {
+			Ok(p) => p,
+			Err(first_err) => {
+				let first_err_str = first_err.to_string();
+				if !is_nonce_too_low_error(&first_err_str) {
+					tracing::error!(
+						"Transaction submission failed on chain {}: {}",
+						chain_id,
+						first_err
+					);
+					return Err(DeliveryError::Network(format!(
+						"Failed to send transaction: {first_err}"
+					)));
+				}
+
+				tracing::warn!(
+					chain_id,
+					attempted_nonce = ?tx_attempt.nonce,
+					error = %first_err,
+					"Nonce too low on first submission attempt; resyncing local nonce cache from chain"
+				);
+
+				let retry_nonce = self.resync_nonce_for(chain_id, from).await?;
+				let mut retry_tx = tx;
+				retry_tx.nonce = Some(retry_nonce);
+				let retry_request: TransactionRequest = retry_tx.into();
+
+				match provider.send_transaction(retry_request).await {
+					Ok(p) => {
+						tracing::info!(
+							chain_id,
+							retry_nonce,
+							"Resynced nonce retry succeeded"
+						);
+						p
+					},
+					Err(retry_err) => {
+						let retry_err_str = retry_err.to_string();
+						if is_nonce_too_low_error(&retry_err_str) {
+							tracing::error!(
+								chain_id,
+								retry_nonce,
+								error = %retry_err,
+								"Resynced nonce retry still failed with nonce too low — surfacing structured error"
+							);
+							return Err(DeliveryError::NonceTooLow(format!(
+								"Chain {chain_id}: retry with resynced nonce {retry_nonce} still failed: {retry_err}"
+							)));
+						}
+						tracing::error!(
+							"Resynced nonce retry failed on chain {}: {}",
+							chain_id,
+							retry_err
+						);
+						return Err(DeliveryError::Network(format!(
+							"Resynced nonce retry failed: {retry_err}"
+						)));
+					},
+				}
+			},
+		};
 
 		// Get the transaction hash
 		let tx_hash = *pending_tx.tx_hash();

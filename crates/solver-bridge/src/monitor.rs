@@ -325,6 +325,57 @@ impl RebalanceMonitor {
 			}
 
 			if new_status != transfer.status {
+				// Stale-redeem-hash recovery: a stored redeem_tx_hash that the
+				// driver reports as "not found" on chain is not a redeem business
+				// failure — it's most likely a tx that never propagated or was
+				// dropped from the mempool. Track consecutive missing checks; below
+				// the threshold, keep the hash and wait. At threshold, clear the
+				// hash so the next tick can resubmit via the existing
+				// `redeem_tx_hash.is_none()` path. Do NOT increment failure_count
+				// for this signal.
+				if matches!(&transfer.status, BridgeTransferStatus::PendingRedemption)
+					&& matches!(
+						&new_status,
+						BridgeTransferStatus::Failed(reason)
+							if reason.contains("Redeem transaction not found")
+					) {
+					transfer.redeem_missing_checks += 1;
+					if transfer.redeem_missing_since.is_none() {
+						transfer.redeem_missing_since = Some(now);
+					}
+
+					if transfer.redeem_missing_checks < 3 {
+						tracing::debug!(
+							transfer_id = %transfer.id,
+							checks = transfer.redeem_missing_checks,
+							"Redeem tx not found, will recheck before resubmitting"
+						);
+						transfer.last_status_poll_at = Some(now);
+						self.bridge_service
+							.storage()
+							.save_transfer(&transfer)
+							.await?;
+						continue;
+					}
+
+					tracing::warn!(
+						transfer_id = %transfer.id,
+						pair = %transfer.pair_id,
+						redeem_tx_hash = ?transfer.redeem_tx_hash,
+						checks = transfer.redeem_missing_checks,
+						"Redeem tx hash remained missing; clearing stale hash for resubmission"
+					);
+					transfer.redeem_tx_hash = None;
+					transfer.redeem_missing_checks = 0;
+					transfer.redeem_missing_since = None;
+					transfer.last_status_poll_at = Some(now);
+					self.bridge_service
+						.storage()
+						.save_transfer(&transfer)
+						.await?;
+					continue;
+				}
+
 				// Handle PendingRedemption retry: if driver reports Failed for a
 				// redeem attempt, don't apply the Failed status — increment
 				// failure_count and stay PendingRedemption for retry.
@@ -365,6 +416,16 @@ impl RebalanceMonitor {
 						self.bridge_service
 							.set_cooldown(&transfer.pair_id, config.cooldown_seconds)
 							.await?;
+					}
+
+					// Reset redeem-missing counters when leaving PendingRedemption
+					// successfully (e.g. → Completed). Without this, stale counter
+					// values from a previous miss streak would carry over.
+					if matches!(&transfer.status, BridgeTransferStatus::PendingRedemption)
+						&& !matches!(&new_status, BridgeTransferStatus::PendingRedemption)
+					{
+						transfer.redeem_missing_checks = 0;
+						transfer.redeem_missing_since = None;
 					}
 
 					self.bridge_service
@@ -567,6 +628,19 @@ impl RebalanceMonitor {
 								tracing::info!(
 									transfer_id = %transfer.id,
 									"Vault redeem submitted"
+								);
+							},
+							// Residual nonce drift after the delivery layer's resync retry.
+							// This is transient — the next monitor tick will retry once the
+							// nonce manager has caught up. Do NOT count it as a redeem
+							// business failure; leaving failure_count untouched keeps the
+							// transfer in PendingRedemption instead of escalating to
+							// NeedsIntervention.
+							Err(solver_delivery::DeliveryError::NonceTooLow(reason)) => {
+								tracing::warn!(
+									transfer_id = %transfer.id,
+									reason = %reason,
+									"Redeem submission hit residual nonce-drift after resync; will retry next tick"
 								);
 							},
 							Err(e) => {
@@ -832,7 +906,7 @@ mod tests {
 	use crate::{BridgeDepositResult, BridgeInterface};
 	use async_trait::async_trait;
 	use solver_config::ConfigBuilder;
-	use solver_delivery::{DeliveryService, MockDeliveryInterface};
+	use solver_delivery::{DeliveryError, DeliveryService, MockDeliveryInterface};
 	use solver_storage::implementations::file::{FileStorage, TtlConfig};
 	use solver_storage::StorageService;
 	use solver_types::{
@@ -1221,6 +1295,171 @@ mod tests {
 			let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
 			assert_eq!(stored.status, expected_status);
 		}
+	}
+
+	#[tokio::test]
+	async fn test_pending_redemption_missing_redeem_tx_waits_before_resubmit() {
+		// Below the missing-tx threshold (3 consecutive misses) the monitor
+		// must keep the existing redeem_tx_hash and increment its missing
+		// counter without touching failure_count. Otherwise a single transient
+		// "tx not found" reading would burn a retry slot and discard a hash
+		// that may still be in the mempool.
+		let storage = make_storage();
+		let delivery = make_delivery(MockDeliveryInterface::new());
+		let bridge = Arc::new(StubBridge {
+			check_status_results: Mutex::new(VecDeque::from([Ok(BridgeTransferStatus::Failed(
+				"Redeem transaction not found".to_string(),
+			))])),
+			..Default::default()
+		}) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let mut transfer = fresh_transfer(BridgeTransferStatus::PendingRedemption);
+		transfer.redeem_tx_hash = Some(
+			"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+		);
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(matches!(stored.status, BridgeTransferStatus::PendingRedemption));
+		assert_eq!(stored.redeem_missing_checks, 1);
+		assert!(stored.redeem_missing_since.is_some());
+		assert_eq!(stored.failure_count, 0);
+		assert!(stored.redeem_tx_hash.is_some());
+	}
+
+	#[tokio::test]
+	async fn test_pending_redemption_missing_redeem_tx_clears_hash_after_three_misses() {
+		// Once the missing-tx counter reaches the threshold, clear the stale
+		// redeem_tx_hash and reset counters so the next monitor tick can
+		// resubmit through the existing redeem_tx_hash.is_none() path. This
+		// is the recovery path for a hash that was persisted but never
+		// propagated / was dropped.
+		let storage = make_storage();
+		let delivery = make_delivery(MockDeliveryInterface::new());
+		let bridge = Arc::new(StubBridge {
+			check_status_results: Mutex::new(VecDeque::from([Ok(BridgeTransferStatus::Failed(
+				"Redeem transaction not found".to_string(),
+			))])),
+			..Default::default()
+		}) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let mut transfer = fresh_transfer(BridgeTransferStatus::PendingRedemption);
+		transfer.redeem_tx_hash = Some(
+			"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+		);
+		transfer.redeem_missing_checks = 2;
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(matches!(stored.status, BridgeTransferStatus::PendingRedemption));
+		assert_eq!(stored.redeem_missing_checks, 0);
+		assert!(stored.redeem_missing_since.is_none());
+		assert_eq!(stored.failure_count, 0);
+		assert!(stored.redeem_tx_hash.is_none());
+	}
+
+	#[tokio::test]
+	async fn test_pending_redemption_nonce_too_low_does_not_increment_failure_count() {
+		// A residual `DeliveryError::NonceTooLow` indicates transient nonce drift,
+		// not a redeem business failure. The monitor must leave the transfer in
+		// PendingRedemption with failure_count unchanged so the next monitor tick
+		// can retry after the nonce manager has resynced.
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_submit().times(1).returning(|_tx, _tracking| {
+			Box::pin(async move {
+				Err(DeliveryError::NonceTooLow(
+					"chain pending advanced past local cache".to_string(),
+				))
+			})
+		});
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let mut transfer = fresh_transfer(BridgeTransferStatus::PendingRedemption);
+		transfer.vault_address = Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+		transfer.received_shares = Some("12345".to_string());
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert_eq!(
+			stored.failure_count, 0,
+			"NonceTooLow must not increment failure_count"
+		);
+		assert!(
+			stored.redeem_tx_hash.is_none(),
+			"No tx hash should be persisted on NonceTooLow"
+		);
+		assert!(
+			matches!(stored.status, BridgeTransferStatus::PendingRedemption),
+			"Status should remain PendingRedemption, got {:?}",
+			stored.status
+		);
+	}
+
+	#[tokio::test]
+	async fn test_pending_redemption_network_error_still_increments_failure_count() {
+		// Regression check: a generic DeliveryError::Network from the redeem
+		// submission is still a real business failure and must increment
+		// failure_count as before.
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_submit().times(1).returning(|_tx, _tracking| {
+			Box::pin(async move {
+				Err(DeliveryError::Network("connection refused".to_string()))
+			})
+		});
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let mut transfer = fresh_transfer(BridgeTransferStatus::PendingRedemption);
+		transfer.vault_address = Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+		transfer.received_shares = Some("12345".to_string());
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert_eq!(stored.failure_count, 1);
+		assert!(stored.redeem_tx_hash.is_none());
 	}
 
 	#[tokio::test]

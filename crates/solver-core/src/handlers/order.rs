@@ -143,20 +143,20 @@ impl OrderHandler {
 				.await
 				.map_err(|e| OrderError::Storage(e.to_string()))?;
 
-			// Update order with execution params and prepare tx hash
+			// `execution_params` are already persisted on the order by the time
+			// this event fires; only the prepare tx hash and status need updating here.
 			self.state_machine
 				.update_order_with(&order.id, |o| {
-					o.execution_params = Some(params.clone());
 					o.status = OrderStatus::Pending;
 					o.prepare_tx_hash = Some(prepare_tx_hash);
 				})
 				.await
 				.map_err(|e| OrderError::State(e.to_string()))?;
 		} else {
-			// No preparation needed (on-chain intent), go directly to Executing
+			// No preparation needed (on-chain intent), go directly to Executing.
+			// `execution_params` are already persisted on the order at this point.
 			self.state_machine
 				.update_order_with(&order.id, |o| {
-					o.execution_params = Some(params.clone());
 					o.status = OrderStatus::Executing;
 				})
 				.await
