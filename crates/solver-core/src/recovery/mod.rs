@@ -57,9 +57,15 @@ enum ReconcileResult {
 	Failed(TransactionType),
 	/// Reconciliation could not determine the on-chain state of a tx
 	/// (RPC transport error, provider returning a non-deterministic lookup
-	/// failure, tx not yet visible). Recovery must leave the order's status
-	/// untouched and retry on the next recovery tick — this is *not* a
-	/// terminal failure.
+	/// failure, tx not yet visible). The order's status is left untouched
+	/// and no resume event is published — this is *not* a terminal failure.
+	///
+	/// Recovery currently runs only at engine startup (see
+	/// `SolverEngine::initialize_with_recovery`); there is no in-process
+	/// periodic re-reconciliation. An order whose reconciliation returns
+	/// `Unknown` will be re-reconciled on the next solver restart, when the
+	/// RPC may have recovered. This is preferred over `Failed` because the
+	/// stranded state is recoverable; `Failed` is terminal.
 	Unknown,
 	/// Order is finalized
 	Finalized,
@@ -313,9 +319,9 @@ impl RecoveryService {
 					return Ok(ReconcileResult::Failed(TransactionType::Claim));
 				},
 				Err(e) => {
-					// Could not determine on-chain state. Treat as transient and
-					// retry on the next recovery tick — do NOT terminally fail the
-					// order on RPC blips.
+					// Could not determine on-chain state. Surface as Unknown so the
+					// order is not terminally failed on a transient RPC blip; see
+					// the `ReconcileResult::Unknown` doc for retry semantics.
 					tracing::warn!(
 						"Could not get claim transaction status; treating as Unknown: {}",
 						e
@@ -422,8 +428,8 @@ impl RecoveryService {
 					return Ok(ReconcileResult::Failed(TransactionType::Fill));
 				},
 				Err(e) => {
-					// Could not determine on-chain state. Treat as transient and
-					// retry on the next recovery tick.
+					// Could not determine on-chain state. Surface as Unknown so the
+					// order is not terminally failed; see `ReconcileResult::Unknown`.
 					tracing::warn!(
 						"Could not get fill transaction status; treating as Unknown: {}",
 						e
@@ -452,8 +458,8 @@ impl RecoveryService {
 					return Ok(ReconcileResult::Failed(TransactionType::Prepare));
 				},
 				Err(e) => {
-					// Could not determine on-chain state. Treat as transient and
-					// retry on the next recovery tick.
+					// Could not determine on-chain state. Surface as Unknown so the
+					// order is not terminally failed; see `ReconcileResult::Unknown`.
 					tracing::warn!(
 						"Could not get prepare transaction status; treating as Unknown: {}",
 						e
@@ -534,7 +540,8 @@ impl RecoveryService {
 			},
 			ReconcileResult::Unknown => {
 				// RPC could not determine on-chain state. Don't transition;
-				// keep the order's current status and let the next recovery tick retry.
+				// keep the order's current status. Re-reconciliation happens
+				// on the next solver restart's recovery pass.
 				order.status.clone()
 			},
 		};
@@ -785,9 +792,10 @@ impl RecoveryService {
 			ReconcileResult::Unknown => {
 				// RPC error or non-deterministic lookup failure during
 				// reconciliation. Do not publish any progress event, do not
-				// transition status — the next recovery tick will retry.
+				// transition status. The order remains in its current state
+				// until the next solver restart's recovery pass re-reconciles.
 				tracing::warn!(
-					"Order {} reconciliation indeterminate; will retry on next recovery tick",
+					"Order {} reconciliation indeterminate; deferring until next solver restart",
 					order.id
 				);
 			},
@@ -1490,9 +1498,9 @@ mod tests {
 	async fn test_reconcile_with_blockchain_rpc_error_returns_unknown_not_failed() {
 		// A transient RPC error or tx-not-found must NOT terminally fail the
 		// order. Recovery should return Unknown so the caller leaves the order
-		// in its current status and retries on the next recovery tick.
-		// Without this, RPC blips during recovery convert healthy in-flight
-		// orders into terminal Failed orders.
+		// in its current status; the next solver restart's recovery pass will
+		// re-reconcile. Without this, RPC blips during recovery convert healthy
+		// in-flight orders into terminal Failed orders.
 		let mut mock_delivery = MockDeliveryInterface::new();
 		let mut order = create_test_order_with_status(OrderStatus::Executed);
 		order.prepare_tx_hash = Some(TransactionHash(vec![0xaa; 32]));
