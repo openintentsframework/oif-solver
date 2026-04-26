@@ -1142,7 +1142,8 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_check_status_pending_redemption_stays_unknown_when_redeem_tx_exists_check_errors() {
+	async fn test_check_status_pending_redemption_stays_unknown_when_redeem_tx_exists_check_errors()
+	{
 		// If tx_exists itself errors, treat the state as unknown and stay in
 		// PendingRedemption rather than escalating to a missing-tx failure.
 		let mut transfer =

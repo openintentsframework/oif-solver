@@ -154,25 +154,26 @@ impl AlloyDelivery {
 	/// Gets the nonce manager for a specific chain ID.
 	fn get_nonce_manager(&self, chain_id: u64) -> Result<&ResettableNonceManager, DeliveryError> {
 		self.nonce_managers.get(&chain_id).ok_or_else(|| {
-			DeliveryError::Network(format!("No nonce manager configured for chain ID {chain_id}"))
+			DeliveryError::Network(format!(
+				"No nonce manager configured for chain ID {chain_id}"
+			))
 		})
 	}
 
 	/// Gets the signer address for a specific chain ID.
 	fn get_signer_address(&self, chain_id: u64) -> Result<Address, DeliveryError> {
-		self.signer_addresses.get(&chain_id).copied().ok_or_else(|| {
-			DeliveryError::Network(format!("No signer configured for chain ID {chain_id}"))
-		})
+		self.signer_addresses
+			.get(&chain_id)
+			.copied()
+			.ok_or_else(|| {
+				DeliveryError::Network(format!("No signer configured for chain ID {chain_id}"))
+			})
 	}
 
 	/// Returns the next nonce to use for `from` on `chain_id`, taking it from the
 	/// resettable cache. On first use for an address, fetches `pending` from chain
 	/// to seed the cache.
-	async fn next_nonce_for(
-		&self,
-		chain_id: u64,
-		from: Address,
-	) -> Result<u64, DeliveryError> {
+	async fn next_nonce_for(&self, chain_id: u64, from: Address) -> Result<u64, DeliveryError> {
 		let mgr = self.get_nonce_manager(chain_id)?;
 		if let Some(n) = mgr.take_next(from) {
 			return Ok(n);
@@ -193,11 +194,7 @@ impl AlloyDelivery {
 	/// Resync the local nonce manager from chain pending and return the next
 	/// nonce to use for the resync retry. Advances the cache past whatever
 	/// the chain already knows about.
-	async fn resync_nonce_for(
-		&self,
-		chain_id: u64,
-		from: Address,
-	) -> Result<u64, DeliveryError> {
+	async fn resync_nonce_for(&self, chain_id: u64, from: Address) -> Result<u64, DeliveryError> {
 		let provider = self.get_provider(chain_id)?;
 		let pending = provider
 			.get_transaction_count(from)
@@ -365,11 +362,7 @@ impl DeliveryInterface for AlloyDelivery {
 
 				match provider.send_transaction(retry_request).await {
 					Ok(p) => {
-						tracing::info!(
-							chain_id,
-							retry_nonce,
-							"Resynced nonce retry succeeded"
-						);
+						tracing::info!(chain_id, retry_nonce, "Resynced nonce retry succeeded");
 						p
 					},
 					Err(retry_err) => {

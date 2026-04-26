@@ -149,15 +149,23 @@ mod tests {
 	fn is_nonce_too_low_error_matches_common_phrasings() {
 		assert!(is_nonce_too_low_error("nonce too low"));
 		assert!(is_nonce_too_low_error("Nonce too low"));
-		assert!(is_nonce_too_low_error("transaction underpriced: nonce too low: ..."));
-		assert!(is_nonce_too_low_error("nonce is too low for sender 0xabc..."));
-		assert!(is_nonce_too_low_error("ERROR: nonce too low (have 121, want 124)"));
+		assert!(is_nonce_too_low_error(
+			"transaction underpriced: nonce too low: ..."
+		));
+		assert!(is_nonce_too_low_error(
+			"nonce is too low for sender 0xabc..."
+		));
+		assert!(is_nonce_too_low_error(
+			"ERROR: nonce too low (have 121, want 124)"
+		));
 	}
 
 	#[test]
 	fn is_nonce_too_low_error_rejects_unrelated_messages() {
 		assert!(!is_nonce_too_low_error("connection refused"));
-		assert!(!is_nonce_too_low_error("replacement transaction underpriced"));
+		assert!(!is_nonce_too_low_error(
+			"replacement transaction underpriced"
+		));
 		assert!(!is_nonce_too_low_error("insufficient funds for gas"));
 		assert!(!is_nonce_too_low_error("execution reverted"));
 		assert!(!is_nonce_too_low_error(""));

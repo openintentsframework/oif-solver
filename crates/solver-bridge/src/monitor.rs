@@ -1315,9 +1315,8 @@ mod tests {
 		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
 
 		let mut transfer = fresh_transfer(BridgeTransferStatus::PendingRedemption);
-		transfer.redeem_tx_hash = Some(
-			"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-		);
+		transfer.redeem_tx_hash =
+			Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
 		bridge_service
 			.storage()
 			.save_transfer(&transfer)
@@ -1330,7 +1329,10 @@ mod tests {
 			.unwrap();
 
 		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
-		assert!(matches!(stored.status, BridgeTransferStatus::PendingRedemption));
+		assert!(matches!(
+			stored.status,
+			BridgeTransferStatus::PendingRedemption
+		));
 		assert_eq!(stored.redeem_missing_checks, 1);
 		assert!(stored.redeem_missing_since.is_some());
 		assert_eq!(stored.failure_count, 0);
@@ -1355,9 +1357,8 @@ mod tests {
 		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
 
 		let mut transfer = fresh_transfer(BridgeTransferStatus::PendingRedemption);
-		transfer.redeem_tx_hash = Some(
-			"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-		);
+		transfer.redeem_tx_hash =
+			Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string());
 		transfer.redeem_missing_checks = 2;
 		bridge_service
 			.storage()
@@ -1371,7 +1372,10 @@ mod tests {
 			.unwrap();
 
 		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
-		assert!(matches!(stored.status, BridgeTransferStatus::PendingRedemption));
+		assert!(matches!(
+			stored.status,
+			BridgeTransferStatus::PendingRedemption
+		));
 		assert_eq!(stored.redeem_missing_checks, 0);
 		assert!(stored.redeem_missing_since.is_none());
 		assert_eq!(stored.failure_count, 0);
@@ -1435,9 +1439,7 @@ mod tests {
 		let storage = make_storage();
 		let mut mock = MockDeliveryInterface::new();
 		mock.expect_submit().times(1).returning(|_tx, _tracking| {
-			Box::pin(async move {
-				Err(DeliveryError::Network("connection refused".to_string()))
-			})
+			Box::pin(async move { Err(DeliveryError::Network("connection refused".to_string())) })
 		});
 		let delivery = make_delivery(mock);
 		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
