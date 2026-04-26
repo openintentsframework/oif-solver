@@ -32,6 +32,8 @@
 //! - **Intent Verification**: Oracle addresses for settlement validation
 //! - **Amount Authorization**: Explicit token amounts and recipients
 
+pub mod exclusivity;
+
 pub mod payloads {
 	pub mod permit2;
 }

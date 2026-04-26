@@ -109,7 +109,11 @@ pub async fn process_quote_request(
 
 	let settlement_service = solver.settlement();
 	let delivery_service = solver.delivery();
-	let quote_generator = QuoteGenerator::new(settlement_service.clone(), delivery_service.clone());
+	let quote_generator = QuoteGenerator::new(
+		settlement_service.clone(),
+		delivery_service.clone(),
+		solver.solver_address().clone(),
+	);
 	let resolved_request = quote_generator.resolve_quote_request(&request).await?;
 	let resolved_flow_keys = vec![resolved_request.flow_key.clone()];
 
@@ -516,6 +520,7 @@ mod tests {
 				validity_seconds: 60,
 				fill_deadline_seconds: 300,
 				expires_seconds: 600,
+				exclusivity: None,
 			}),
 		};
 
@@ -959,5 +964,90 @@ mod tests {
 		assert_eq!(response.quotes[0].provider.as_deref(), Some("oif-solver"));
 		assert_eq!(response.quotes[0].eta, Some(96));
 		assert!(!response.quotes[0].quote_id.is_empty());
+	}
+
+	/// Reads `outputs[0].context` from a Permit2 EIP-712 message produced by the
+	/// quote pipeline. Returns the raw hex string (e.g. `"0x"` or `"0xe0..."`).
+	fn permit2_output_context_hex(quote: &Quote) -> String {
+		let payload = match &quote.order {
+			OifOrder::OifEscrowV0 { payload, .. } => payload,
+			other => panic!("expected Permit2 escrow order, got {other:?}"),
+		};
+		payload
+			.message
+			.get("witness")
+			.and_then(|w| w.get("outputs"))
+			.and_then(|os| os.as_array())
+			.and_then(|os| os.first())
+			.and_then(|o| o.get("context"))
+			.and_then(|c| c.as_str())
+			.expect("outputs[0].context")
+			.to_string()
+	}
+
+	#[tokio::test]
+	async fn process_quote_request_default_path_emits_empty_context() {
+		// Default config has no `exclusivity` block. The full pipeline must
+		// produce a `0x` context so existing callers see no behavior change.
+		let solver = create_quote_processing_solver_engine();
+		let request = create_quote_processing_request();
+
+		let config_guard = solver.dynamic_config().read().await;
+		let response = process_quote_request(request, &solver, &config_guard)
+			.await
+			.expect("default-path quote should succeed");
+		drop(config_guard);
+
+		assert_eq!(response.quotes.len(), 1);
+		assert_eq!(permit2_output_context_hex(&response.quotes[0]), "0x");
+	}
+
+	#[tokio::test]
+	async fn process_quote_request_optional_with_metadata_emits_exclusive_context() {
+		use solver_config::{ExclusivityConfig, ExclusivityMode};
+
+		let solver = create_quote_processing_solver_engine();
+		// Inject `optional` policy and a per-request opt-in.
+		{
+			let mut cfg = solver.dynamic_config().write().await;
+			cfg.api
+				.as_mut()
+				.unwrap()
+				.quote
+				.as_mut()
+				.unwrap()
+				.exclusivity = Some(ExclusivityConfig {
+				mode: ExclusivityMode::Optional,
+				default_seconds: 60,
+				max_seconds: 300,
+			});
+		}
+		let mut request = create_quote_processing_request();
+		request.intent.metadata = Some(serde_json::json!({
+			"exclusivity": { "durationSeconds": 90 }
+		}));
+
+		let config_guard = solver.dynamic_config().read().await;
+		let response = process_quote_request(request, &solver, &config_guard)
+			.await
+			.expect("opted-in quote should succeed");
+		drop(config_guard);
+
+		let ctx = permit2_output_context_hex(&response.quotes[0]);
+		assert!(
+			ctx.starts_with("0xe0"),
+			"context must carry the 0xe0 marker, got {ctx}",
+		);
+		// 0x prefix + 37 bytes * 2 hex chars
+		assert_eq!(ctx.len(), 2 + (1 + 32 + 4) * 2);
+		// Decode and confirm `exclusiveFor` matches the solver's address (the
+		// engine's solver_address is whatever LocalWallet derived from the
+		// fixture private key — we just verify the context shape and that the
+		// 20-byte slice is non-zero).
+		let raw = hex::decode(ctx.trim_start_matches("0x")).unwrap();
+		assert_eq!(raw[0], 0xe0);
+		assert_ne!(&raw[13..33], &[0u8; 20]);
+		// Solver address bytes must match the engine's configured fill address.
+		assert_eq!(&raw[13..33], &solver.solver_address().0[..]);
 	}
 }
