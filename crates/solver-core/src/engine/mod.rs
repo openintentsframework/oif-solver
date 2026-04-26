@@ -668,6 +668,11 @@ impl SolverEngine {
 		format!("0x{}", hex::encode(&self.solver_address.0))
 	}
 
+	/// Returns the solver address as raw bytes.
+	pub fn solver_address(&self) -> &solver_types::Address {
+		&self.solver_address
+	}
+
 	/// Helper method to spawn handler tasks with semaphore-based concurrency control.
 	///
 	/// This method:

@@ -378,6 +378,64 @@ pub struct RebalancePairSideConfig {
 	pub oft_address: String,
 }
 
+/// Server policy for exclusive (limit-order) context on generated quotes.
+///
+/// When enabled, the solver populates `MandateOutput.context` with
+/// `0xe0 || bytes32(solver_address) || uint32(startTime)` so that the
+/// settlement contract reserves the fill for this solver until `startTime`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExclusivityMode {
+	/// Never set exclusive context. Default. Back-compatible.
+	Disabled,
+	/// Set exclusive context only when the request opts in via metadata.
+	Optional,
+	/// Always set exclusive context.
+	Required,
+}
+
+impl Default for ExclusivityMode {
+	fn default() -> Self {
+		Self::Disabled
+	}
+}
+
+/// Configuration for exclusive-fill quotes.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExclusivityConfig {
+	#[serde(default)]
+	pub mode: ExclusivityMode,
+	/// Duration applied when the request does not specify one. Must be > 0.
+	#[serde(default = "default_exclusivity_default_seconds")]
+	pub default_seconds: u32,
+	/// Hard cap accepted from per-request overrides. Must be >= default_seconds.
+	#[serde(default = "default_exclusivity_max_seconds")]
+	pub max_seconds: u32,
+}
+
+fn default_exclusivity_default_seconds() -> u32 {
+	60
+}
+fn default_exclusivity_max_seconds() -> u32 {
+	300
+}
+
+impl ExclusivityConfig {
+	/// Validates the exclusivity configuration. Called from `Config::validate`
+	/// at startup so misconfiguration fails fast; deserialization is
+	/// intentionally side-effect-free.
+	pub fn validate(&self) -> Result<(), String> {
+		if self.default_seconds == 0 {
+			return Err("exclusivity.default_seconds must be > 0".to_string());
+		}
+		if self.max_seconds < self.default_seconds {
+			return Err("exclusivity.max_seconds must be >= default_seconds".to_string());
+		}
+		Ok(())
+	}
+}
+
 /// Configuration for quote generation parameters.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct QuoteConfig {
@@ -393,6 +451,9 @@ pub struct QuoteConfig {
 	/// Defaults to 600 seconds (10 minutes) if not specified.
 	#[serde(default = "default_expires_seconds")]
 	pub expires_seconds: u64,
+	/// Optional exclusive-fill policy. When absent, behaves as `disabled`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub exclusivity: Option<ExclusivityConfig>,
 }
 
 impl Default for QuoteConfig {
@@ -401,6 +462,7 @@ impl Default for QuoteConfig {
 			validity_seconds: default_quote_validity_seconds(),
 			fill_deadline_seconds: default_fill_deadline_seconds(),
 			expires_seconds: default_expires_seconds(),
+			exclusivity: None,
 		}
 	}
 }
@@ -703,6 +765,13 @@ impl Config {
 							"API discovery implementation '{discovery}' not found in discovery.implementations"
 						)));
 					}
+				}
+			}
+			// Validate exclusivity policy if configured. Apply regardless of
+			// api.enabled because it's still a configuration error.
+			if let Some(ref quote) = api.quote {
+				if let Some(ref ex) = quote.exclusivity {
+					ex.validate().map_err(ConfigError::Validation)?;
 				}
 			}
 		}
@@ -1442,5 +1511,53 @@ mod tests {
 			Err(ConfigError::Validation(message))
 				if message.contains("Duplicate rebalance pair_id")
 		));
+	}
+
+	#[test]
+	fn exclusivity_config_defaults_to_disabled() {
+		let cfg: super::QuoteConfig = serde_json::from_value(json!({})).unwrap();
+		assert!(cfg.exclusivity.is_none());
+	}
+
+	#[test]
+	fn exclusivity_config_parses_required() {
+		let cfg: super::QuoteConfig = serde_json::from_value(json!({
+			"validity_seconds": 60,
+			"fill_deadline_seconds": 300,
+			"expires_seconds": 600,
+			"exclusivity": {
+				"mode": "required",
+				"default_seconds": 60,
+				"max_seconds": 300
+			}
+		}))
+		.unwrap();
+		let ex = cfg.exclusivity.expect("exclusivity present");
+		assert!(matches!(ex.mode, super::ExclusivityMode::Required));
+		assert_eq!(ex.default_seconds, 60);
+		assert_eq!(ex.max_seconds, 300);
+	}
+
+	#[test]
+	fn exclusivity_config_validate_rejects_zero_default() {
+		// Deserialization is intentionally side-effect-free. Validation is
+		// surfaced via ExclusivityConfig::validate() and is invoked from
+		// Config::validate() at startup.
+		let cfg: super::QuoteConfig = serde_json::from_value(json!({
+			"exclusivity": { "mode": "optional", "default_seconds": 0, "max_seconds": 60 }
+		}))
+		.expect("parse ok");
+		let err = cfg.exclusivity.expect("present").validate().unwrap_err();
+		assert!(err.contains("default_seconds"));
+	}
+
+	#[test]
+	fn exclusivity_config_validate_rejects_max_below_default() {
+		let cfg: super::QuoteConfig = serde_json::from_value(json!({
+			"exclusivity": { "mode": "required", "default_seconds": 120, "max_seconds": 60 }
+		}))
+		.expect("parse ok");
+		let err = cfg.exclusivity.expect("present").validate().unwrap_err();
+		assert!(err.contains("max_seconds"));
 	}
 }

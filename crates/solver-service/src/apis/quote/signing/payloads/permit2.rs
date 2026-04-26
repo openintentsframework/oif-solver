@@ -19,6 +19,7 @@
 //! - **Oracle Integration**: Embeds oracle addresses for settlement verification
 
 use crate::apis::quote::registry::PROTOCOL_REGISTRY;
+use crate::apis::quote::signing::exclusivity::{encode_exclusive_context, ExclusivityParams};
 use alloy_primitives::{keccak256, B256, U256};
 use serde_json::json;
 use solver_config::{Config, QuoteConfig};
@@ -79,6 +80,8 @@ pub fn build_permit2_batch_witness_digest(
 	config: &Config,
 	input_oracle: solver_types::Address,
 	output_oracle: solver_types::Address,
+	solver_address: &solver_types::Address,
+	exclusivity: Option<ExclusivityParams>,
 ) -> Result<(B256, serde_json::Value), QuoteError> {
 	// TODO: Implement support for multi-input/outputs
 	let input = &request.intent.inputs[0];
@@ -199,6 +202,22 @@ pub fn build_permit2_batch_witness_digest(
 
 	let empty_bytes_hash = keccak256([]);
 
+	// Build optional exclusive context (FulfilmentLib.sol 0xe0 marker). Empty
+	// when exclusivity is disabled, preserving the legacy hash bit-for-bit.
+	let context_bytes: Vec<u8> = exclusivity
+		.map(|p| encode_exclusive_context(solver_address, p.start_time))
+		.unwrap_or_default();
+	let context_hash = if context_bytes.is_empty() {
+		empty_bytes_hash
+	} else {
+		keccak256(&context_bytes)
+	};
+	let context_hex = if context_bytes.is_empty() {
+		"0x".to_string()
+	} else {
+		format!("0x{}", hex::encode(&context_bytes))
+	};
+
 	// Parse callbackData from request if present
 	let callback_data_bytes = if let Some(ref calldata_hex) = output.calldata {
 		if calldata_hex.is_empty() || calldata_hex == "0x" {
@@ -225,7 +244,7 @@ pub fn build_permit2_batch_witness_digest(
 	enc.push_u256(output_amount);
 	enc.push_address(&recipient);
 	enc.push_b256(&callback_data_hash);
-	enc.push_b256(&empty_bytes_hash); // context remains empty
+	enc.push_b256(&context_hash);
 	let mandate_output_hash = keccak256(enc.finish());
 
 	let outputs_hash = keccak256(mandate_output_hash.as_slice());
@@ -305,7 +324,7 @@ pub fn build_permit2_batch_witness_digest(
 				"amount": output_amount.to_string(),
 				"recipient": solver_types::utils::address_to_bytes32_hex(&recipient),
 				"callbackData": output.calldata.as_ref().unwrap_or(&"0x".to_string()).clone(),
-				"context": "0x"
+				"context": context_hex
 			}]
 			}
 	});
@@ -322,12 +341,16 @@ mod tests {
 		parse_address,
 		standards::eip7930::InteropAddress,
 		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
-		IntentRequest, IntentType, OrderPayload, QuoteInput, QuoteOutput, SignatureType,
+		Address, IntentRequest, IntentType, OrderPayload, QuoteInput, QuoteOutput, SignatureType,
 	};
 	use std::collections::HashMap;
 
 	const TEST_CHAIN_ID_1: u64 = 1; // Ethereum mainnet
 	const TEST_CHAIN_ID_137: u64 = 137; // Polygon
+
+	fn test_solver_address() -> Address {
+		Address(vec![0xAB; 20])
+	}
 
 	fn create_test_config() -> Config {
 		let api_config = ApiConfig {
@@ -344,6 +367,7 @@ mod tests {
 				validity_seconds: 60,       // 1 minute
 				fill_deadline_seconds: 300, // 5 minutes
 				expires_seconds: 600,       // 10 minutes
+				exclusivity: None,
 			}),
 		};
 
@@ -427,6 +451,8 @@ mod tests {
 			&config,
 			input_oracle_address,
 			output_oracle_address,
+			&test_solver_address(),
+			None,
 		);
 
 		assert!(result.is_ok(), "Expected successful digest generation");
@@ -486,6 +512,8 @@ mod tests {
 			&config,
 			input_oracle_address,
 			output_oracle_address,
+			&test_solver_address(),
+			None,
 		)
 		.expect("Expected successful digest generation");
 
@@ -527,6 +555,8 @@ mod tests {
 			&config,
 			input_oracle_address,
 			output_oracle_address,
+			&test_solver_address(),
+			None,
 		);
 
 		assert!(result.is_err());
@@ -560,6 +590,8 @@ mod tests {
 			&config,
 			input_oracle_address,
 			output_oracle_address,
+			&test_solver_address(),
+			None,
 		);
 
 		assert!(result.is_err());
@@ -593,6 +625,8 @@ mod tests {
 			&config,
 			input_oracle_address,
 			output_oracle_address,
+			&test_solver_address(),
+			None,
 		);
 
 		assert!(result.is_err());
@@ -639,6 +673,8 @@ mod tests {
 			&config,
 			input_oracle_address,
 			output_oracle_address,
+			&test_solver_address(),
+			None,
 		);
 
 		// This will likely fail because Permit2 is not deployed on chain 56
@@ -669,6 +705,8 @@ mod tests {
 			&config,
 			input_oracle_address,
 			output_oracle_address,
+			&test_solver_address(),
+			None,
 		);
 
 		assert!(result.is_ok());
@@ -706,6 +744,8 @@ mod tests {
 			&config,
 			input_oracle_address.clone(),
 			output_oracle_address.clone(),
+			&test_solver_address(),
+			None,
 		);
 
 		// Wait a moment to ensure different timestamp
@@ -716,6 +756,8 @@ mod tests {
 			&config,
 			input_oracle_address,
 			output_oracle_address,
+			&test_solver_address(),
+			None,
 		);
 
 		assert!(result1.is_ok());
@@ -745,6 +787,8 @@ mod tests {
 			&config,
 			input_oracle_address,
 			output_oracle_address,
+			&test_solver_address(),
+			None,
 		);
 
 		assert!(result.is_ok());
@@ -788,5 +832,63 @@ mod tests {
 		let recipient = output["recipient"].as_str().unwrap();
 		assert!(recipient.starts_with("0x"));
 		assert_eq!(recipient.len(), 66);
+	}
+
+	#[test]
+	fn digest_changes_when_exclusive_context_applied() {
+		use crate::apis::quote::signing::exclusivity::{
+			encode_exclusive_context, ExclusivityParams,
+		};
+
+		let cfg = create_test_config();
+		let request = create_test_quote_request();
+		let input_oracle = parse_address("0x1999999999999999999999999999999999999999").unwrap();
+		let output_oracle = parse_address("0x2999999999999999999999999999999999999999").unwrap();
+		let solver_addr = test_solver_address();
+
+		let (digest_no_excl, msg_no_excl) = build_permit2_batch_witness_digest(
+			&request,
+			&cfg,
+			input_oracle.clone(),
+			output_oracle.clone(),
+			&solver_addr,
+			None,
+		)
+		.unwrap();
+
+		let params = ExclusivityParams {
+			start_time: 1_000_000,
+		};
+		let (digest_excl, msg_excl) = build_permit2_batch_witness_digest(
+			&request,
+			&cfg,
+			input_oracle,
+			output_oracle,
+			&solver_addr,
+			Some(params),
+		)
+		.unwrap();
+
+		assert_ne!(
+			digest_no_excl, digest_excl,
+			"context must influence the digest"
+		);
+
+		let expected_ctx = format!(
+			"0x{}",
+			hex::encode(encode_exclusive_context(&solver_addr, 1_000_000))
+		);
+		assert_eq!(
+			msg_excl["witness"]["outputs"][0]["context"]
+				.as_str()
+				.unwrap(),
+			expected_ctx,
+		);
+		assert_eq!(
+			msg_no_excl["witness"]["outputs"][0]["context"]
+				.as_str()
+				.unwrap(),
+			"0x"
+		);
 	}
 }

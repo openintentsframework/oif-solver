@@ -69,6 +69,9 @@ pub(crate) struct QuoteGenerator {
 	settlement_service: Arc<SettlementService>,
 	/// Reference to delivery service for contract calls.
 	delivery_service: Arc<DeliveryService>,
+	/// Solver's on-chain fill address. Used as `exclusiveFor` when emitting
+	/// exclusive `MandateOutput.context` (FulfilmentLib.sol 0xe0 marker).
+	solver_address: solver_types::Address,
 	/// Cached EIP-3009 token names keyed by (chain_id, token_address).
 	eip3009_token_names: DashMap<(u64, [u8; 20]), String>,
 	/// Cached EIP-3009 token versions keyed by (chain_id, token_address).
@@ -89,14 +92,17 @@ impl QuoteGenerator {
 	/// # Arguments
 	/// * `settlement_service` - Service managing settlement implementations
 	/// * `delivery_service` - Service for making contract calls
+	/// * `solver_address` - Solver's on-chain fill address used for exclusive fills
 	pub(crate) fn new(
 		settlement_service: Arc<SettlementService>,
 		delivery_service: Arc<DeliveryService>,
+		solver_address: solver_types::Address,
 	) -> Self {
 		Self {
 			custody_strategy: CustodyStrategy::new(delivery_service.clone()),
 			settlement_service,
 			delivery_service,
+			solver_address,
 			eip3009_token_names: DashMap::new(),
 			eip3009_token_versions: DashMap::new(),
 			eip3009_domain_separators: DashMap::new(),
@@ -716,7 +722,7 @@ impl QuoteGenerator {
 		let fill_deadline = fill_deadline_timestamp as u32;
 		let expires = expires_timestamp as u32;
 
-		let ((nonce_u64, order_identifier), domain_object, domain_separator) = tokio::try_join!(
+		let ((nonce_u64, order_identifier, context_bytes), domain_object, domain_separator) = tokio::try_join!(
 			self.compute_eip3009_order_identifier(
 				request,
 				config,
@@ -728,6 +734,11 @@ impl QuoteGenerator {
 			self.build_eip3009_domain_object(&token_address, input_chain_id),
 			self.get_eip3009_domain_separator(&token_address, input_chain_id),
 		)?;
+		let context_hex = if context_bytes.is_empty() {
+			"0x".to_string()
+		} else {
+			format!("0x{}", hex::encode(&context_bytes))
+		};
 
 		// For EIP-3009, we need to generate signature templates for each input
 		// since the contract expects one signature per input
@@ -789,6 +800,7 @@ impl QuoteGenerator {
 					"receiver": output.receiver.to_string(),
 					"oracle": format!("0x{:040x}", alloy_primitives::Address::from_slice(&output_oracle.0)),
 					"settler": format!("0x{:040x}", alloy_primitives::Address::from_slice(&output_settler.0)),
+					"context": context_hex.clone(),
 				}))
 			}).collect::<Result<Vec<_>, _>>()?
 		});
@@ -818,12 +830,32 @@ impl QuoteGenerator {
 		output_oracle: &solver_types::Address,
 		fill_deadline: u32,
 		expires: u32,
-	) -> Result<(u64, String), QuoteError> {
+	) -> Result<(u64, String, Vec<u8>), QuoteError> {
 		// Build the StandardOrder struct for encoding
+		use crate::apis::quote::signing::exclusivity::{
+			encode_exclusive_context, resolve_exclusivity,
+		};
 		use alloy_primitives::U256;
 		use alloy_sol_types::SolCall;
 		use solver_types::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
 		use std::str::FromStr;
+
+		// Resolve optional exclusive-fill context. The context bytes go into
+		// outputs[0].context so the contract-computed orderIdentifier (and
+		// thus the user's signed `nonce`) binds to the exclusive marker.
+		let context_bytes: Vec<u8> = {
+			let now_secs = chrono::Utc::now().timestamp() as u64;
+			let excl_cfg = config
+				.api
+				.as_ref()
+				.and_then(|a| a.quote.as_ref())
+				.and_then(|q| q.exclusivity.as_ref());
+			let exclusivity =
+				resolve_exclusivity(excl_cfg, request.intent.metadata.as_ref(), now_secs)?;
+			exclusivity
+				.map(|p| encode_exclusive_context(&self.solver_address, p.start_time))
+				.unwrap_or_default()
+		};
 
 		// Define just the orderIdentifier function since we're reusing the structs
 		alloy_sol_types::sol! {
@@ -967,7 +999,7 @@ impl QuoteGenerator {
 				amount: output_amount_u256,
 				recipient: recipient_bytes32,
 				callbackData: callback_data_bytes.into(),
-				context: vec![].into(),
+				context: context_bytes.clone().into(),
 			}],
 		};
 
@@ -1035,7 +1067,7 @@ impl QuoteGenerator {
 
 		tracing::debug!("Successfully computed order ID: {}", order_id);
 
-		Ok((nonce, order_id))
+		Ok((nonce, order_id, context_bytes))
 	}
 
 	/// Get the DOMAIN_SEPARATOR from an EIP-3009 token contract
@@ -1200,6 +1232,29 @@ impl QuoteGenerator {
 			inputs_array.push(serde_json::json!([token_id.to_string(), amount.clone(),]));
 		}
 
+		// Resolve optional exclusive context (FulfilmentLib.sol 0xe0 marker).
+		// Same context applies to every MandateOutput in the BatchCompact.
+		let context_hex = {
+			use crate::apis::quote::signing::exclusivity::{
+				encode_exclusive_context, resolve_exclusivity,
+			};
+			let now_secs = chrono::Utc::now().timestamp() as u64;
+			let excl_cfg = config
+				.api
+				.as_ref()
+				.and_then(|a| a.quote.as_ref())
+				.and_then(|q| q.exclusivity.as_ref());
+			let exclusivity =
+				resolve_exclusivity(excl_cfg, request.intent.metadata.as_ref(), now_secs)?;
+			match exclusivity {
+				Some(p) => format!(
+					"0x{}",
+					hex::encode(encode_exclusive_context(&self.solver_address, p.start_time))
+				),
+				None => "0x".to_string(),
+			}
+		};
+
 		// Convert outputs to MandateOutput format
 		let mut outputs_array = Vec::new();
 		for output in &request.intent.outputs {
@@ -1263,7 +1318,7 @@ impl QuoteGenerator {
 				"amount": amount.clone(),
 				"recipient": solver_types::utils::address_to_bytes32_hex(&recipient_address),
 				"callbackData": output.calldata.as_ref().unwrap_or(&"0x".to_string()).clone(),
-				"context": "0x" // Context is typically empty for standard flows
+				"context": context_hex.clone(),
 			}));
 		}
 
@@ -1620,10 +1675,26 @@ impl QuoteGenerator {
 		output_oracle: solver_types::Address,
 	) -> Result<serde_json::Value, QuoteError> {
 		use crate::apis::quote::permit2::build_permit2_batch_witness_digest;
+		use crate::apis::quote::signing::exclusivity::resolve_exclusivity;
+
+		let now_secs = chrono::Utc::now().timestamp() as u64;
+		let excl_cfg = config
+			.api
+			.as_ref()
+			.and_then(|a| a.quote.as_ref())
+			.and_then(|q| q.exclusivity.as_ref());
+		let exclusivity =
+			resolve_exclusivity(excl_cfg, request.intent.metadata.as_ref(), now_secs)?;
 
 		// Generate the complete message structure
-		let (_final_digest, message_obj) =
-			build_permit2_batch_witness_digest(request, config, input_oracle, output_oracle)?;
+		let (_final_digest, message_obj) = build_permit2_batch_witness_digest(
+			request,
+			config,
+			input_oracle,
+			output_oracle,
+			&self.solver_address,
+			exclusivity,
+		)?;
 
 		// Extract only the EIP-712 message fields (no metadata like "signing", "digest")
 		let permitted = message_obj
@@ -1910,6 +1981,7 @@ mod tests {
 				validity_seconds: 60,
 				fill_deadline_seconds: 300,
 				expires_seconds: 600,
+				exclusivity: None,
 			}),
 		};
 
@@ -1976,6 +2048,10 @@ mod tests {
 			},
 			supported_types: vec![oif_versions::escrow_order_type("v0")],
 		}
+	}
+
+	fn test_solver_address() -> solver_types::Address {
+		solver_types::Address(vec![0xAB; 20])
 	}
 
 	fn create_test_settlement_service(with_oracles: bool) -> Arc<SettlementService> {
@@ -2236,7 +2312,8 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let generator =
+			QuoteGenerator::new(settlement_service, delivery_service, test_solver_address());
 		let config = create_test_config();
 		let request = create_test_request();
 
@@ -2272,7 +2349,8 @@ mod tests {
 		let settlement_service = create_test_settlement_service(false);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let generator =
+			QuoteGenerator::new(settlement_service, delivery_service, test_solver_address());
 		let config = create_test_config();
 		let request = create_test_request();
 
@@ -2287,7 +2365,8 @@ mod tests {
 		let settlement_service = create_test_settlement_service(false);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let generator =
+			QuoteGenerator::new(settlement_service, delivery_service, test_solver_address());
 		let config = create_test_config();
 		let request = create_test_request();
 
@@ -2302,7 +2381,8 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let generator =
+			QuoteGenerator::new(settlement_service, delivery_service, test_solver_address());
 		let config = create_test_config();
 
 		// Create request with no available inputs
@@ -2346,7 +2426,8 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let generator =
+			QuoteGenerator::new(settlement_service, delivery_service, test_solver_address());
 		let config = create_test_config();
 		let request = create_test_request();
 
@@ -2386,7 +2467,11 @@ mod tests {
 			.get_any_settlement_for_chain(137)
 			.expect("Should have settlement for test chain");
 
-		let generator = QuoteGenerator::new(settlement_service.clone(), delivery_service);
+		let generator = QuoteGenerator::new(
+			settlement_service.clone(),
+			delivery_service,
+			test_solver_address(),
+		);
 		let config = create_test_config();
 		let request = create_test_request();
 
@@ -2433,7 +2518,8 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let generator =
+			QuoteGenerator::new(settlement_service, delivery_service, test_solver_address());
 		let request = create_test_request();
 		let params = serde_json::json!({"test": "value"});
 		let mut config = create_test_config();
@@ -2481,6 +2567,133 @@ mod tests {
 			.expect("at least one output should be present");
 		assert!(first_output["chainId"].is_u64());
 		assert_eq!(first_output["chainId"], 137);
+
+		// Default config has exclusivity disabled, so context must stay empty.
+		assert_eq!(first_output["context"], "0x");
+	}
+
+	#[tokio::test]
+	async fn eip3009_order_identifier_uses_exclusive_context() {
+		use alloy_primitives::Bytes;
+		use alloy_sol_types::SolCall;
+		use solver_config::{ExclusivityConfig, ExclusivityMode};
+
+		// Mirror the orderIdentifier signature so we can decode captured calldata.
+		alloy_sol_types::sol! {
+			function orderIdentifier((address,uint256,uint256,uint32,uint32,address,uint256[2][],(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes)[]) memory order) external pure returns (bytes32);
+		}
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		// Return a non-zero bytes32 so the function returns Ok and we capture
+		// the encoded calldata for assertion.
+		mock_delivery.expect_eth_call().times(1).returning(|tx| {
+			let captured = tx.data.clone();
+			let response = Bytes::from(vec![1u8; 32]);
+			Box::pin(async move {
+				// Decode the call and verify outputs[0].context is the 0xe0 marker.
+				let call = orderIdentifierCall::abi_decode(&captured)
+					.expect("decode orderIdentifier call");
+				let outputs = &call.order.7;
+				assert_eq!(outputs.len(), 1, "expected one output");
+				// MandateOutput tuple: (oracle, settler, chainId, token, amount, recipient, callbackData, context)
+				let context_bytes = &outputs[0].7;
+				assert_eq!(context_bytes.len(), 1 + 32 + 4);
+				assert_eq!(context_bytes[0], 0xe0);
+				Ok(response)
+			})
+		});
+
+		let generator = create_test_generator_with_mock_delivery(1, mock_delivery);
+		let mut config = create_test_config();
+		config
+			.api
+			.as_mut()
+			.unwrap()
+			.quote
+			.as_mut()
+			.unwrap()
+			.exclusivity = Some(ExclusivityConfig {
+			mode: ExclusivityMode::Required,
+			default_seconds: 60,
+			max_seconds: 300,
+		});
+		let request = create_test_request();
+		let input_oracle = solver_types::Address(vec![0x11; 20]);
+		let output_oracle = solver_types::Address(vec![0x22; 20]);
+
+		let (_nonce, order_id, ctx_bytes) = generator
+			.compute_eip3009_order_identifier(
+				&request,
+				&config,
+				&input_oracle,
+				&output_oracle,
+				0,
+				0,
+			)
+			.await
+			.expect("orderIdentifier should succeed");
+		assert_ne!(
+			order_id,
+			"0x0000000000000000000000000000000000000000000000000000000000000000"
+		);
+		assert_eq!(ctx_bytes.len(), 1 + 32 + 4);
+		assert_eq!(ctx_bytes[0], 0xe0);
+		// exclusiveFor is bytes [13..33]
+		assert_eq!(&ctx_bytes[13..33], &test_solver_address().0[..]);
+	}
+
+	#[tokio::test]
+	async fn compact_mandate_emits_exclusive_context_when_required() {
+		use solver_config::{ExclusivityConfig, ExclusivityMode};
+
+		let settlement_service = create_test_settlement_service(true);
+		let delivery_service =
+			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
+		let generator =
+			QuoteGenerator::new(settlement_service, delivery_service, test_solver_address());
+		let request = create_test_request();
+		let params = serde_json::json!({"test": "value"});
+
+		let mut config = create_test_config();
+		config
+			.api
+			.as_mut()
+			.unwrap()
+			.quote
+			.as_mut()
+			.unwrap()
+			.exclusivity = Some(ExclusivityConfig {
+			mode: ExclusivityMode::Required,
+			default_seconds: 60,
+			max_seconds: 300,
+		});
+		let bsc_network = NetworkConfigBuilder::new()
+			.input_settler_address(
+				parse_address("0x5555555555555555555555555555555555555555").unwrap(),
+			)
+			.output_settler_address(
+				parse_address("0x6666666666666666666666666666666666666666").unwrap(),
+			)
+			.allocator_address(parse_address("0x7777777777777777777777777777777777777777").unwrap())
+			.build();
+		config.networks.insert(56, bsc_network);
+
+		let result = generator
+			.build_compact_message(&request, &config, &params)
+			.await
+			.unwrap();
+		let outputs = result["mandate"]["outputs"].as_array().unwrap();
+		let ctx = outputs[0]["context"].as_str().unwrap();
+		assert!(
+			ctx.starts_with("0xe0"),
+			"context must carry the 0xe0 marker, got {ctx}",
+		);
+		// 0x prefix + 37 bytes * 2 hex chars
+		assert_eq!(ctx.len(), 2 + (1 + 32 + 4) * 2);
+		// Decode and verify exclusiveFor is the solver address (last 20 of bytes32 region).
+		let raw = hex::decode(ctx.trim_start_matches("0x")).unwrap();
+		assert_eq!(raw[0], 0xe0);
+		assert_eq!(&raw[13..33], &test_solver_address().0[..]);
 	}
 
 	#[test]
@@ -2488,7 +2701,8 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let generator =
+			QuoteGenerator::new(settlement_service, delivery_service, test_solver_address());
 
 		// Test speed preference
 		let speed_eta = generator.calculate_eta(&Some(QuotePreference::Speed));
@@ -2516,7 +2730,8 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let generator =
+			QuoteGenerator::new(settlement_service, delivery_service, test_solver_address());
 
 		let quotes = vec![
 			Quote {
@@ -2599,7 +2814,8 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let generator =
+			QuoteGenerator::new(settlement_service, delivery_service, test_solver_address());
 
 		let quotes = vec![
 			Quote {
@@ -2675,7 +2891,8 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let generator =
+			QuoteGenerator::new(settlement_service, delivery_service, test_solver_address());
 
 		// Test with configured validity
 		let config = create_test_config();
@@ -2693,7 +2910,8 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let generator =
+			QuoteGenerator::new(settlement_service, delivery_service, test_solver_address());
 		let config = create_test_config();
 		let request = create_test_request();
 
@@ -2734,7 +2952,8 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let generator =
+			QuoteGenerator::new(settlement_service, delivery_service, test_solver_address());
 		let config = create_test_config();
 		let request = create_test_request();
 
@@ -2811,7 +3030,7 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		QuoteGenerator::new(settlement_service, delivery_service)
+		QuoteGenerator::new(settlement_service, delivery_service, test_solver_address())
 	}
 
 	fn create_test_generator_with_mock_delivery(
@@ -2825,7 +3044,7 @@ mod tests {
 			Arc::new(mock_delivery) as Arc<dyn DeliveryInterface>,
 		);
 		let delivery_service = Arc::new(DeliveryService::new(implementations, 1, 60));
-		QuoteGenerator::new(settlement_service, delivery_service)
+		QuoteGenerator::new(settlement_service, delivery_service, test_solver_address())
 	}
 
 	fn create_exact_input_request(
@@ -3094,7 +3313,11 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service.clone(), delivery_service);
+		let generator = QuoteGenerator::new(
+			settlement_service.clone(),
+			delivery_service,
+			test_solver_address(),
+		);
 		let config = create_test_config();
 		let request = create_test_request();
 
@@ -3140,7 +3363,8 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let generator =
+			QuoteGenerator::new(settlement_service, delivery_service, test_solver_address());
 		let config = create_test_config();
 		let request = create_test_request();
 
@@ -3171,7 +3395,8 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let generator =
+			QuoteGenerator::new(settlement_service, delivery_service, test_solver_address());
 		let config = create_test_config();
 		let request = create_test_request();
 
@@ -3202,7 +3427,8 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let generator =
+			QuoteGenerator::new(settlement_service, delivery_service, test_solver_address());
 		let config = create_test_config();
 		let request = create_test_request();
 
@@ -3219,7 +3445,8 @@ mod tests {
 		let settlement_service = create_test_settlement_service(false); // No oracles
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let generator =
+			QuoteGenerator::new(settlement_service, delivery_service, test_solver_address());
 		let config = create_test_config();
 		let request = create_test_request();
 
@@ -4050,7 +4277,8 @@ mod tests {
 		let settlement_service = create_test_settlement_service(true);
 		let delivery_service =
 			Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 60));
-		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let generator =
+			QuoteGenerator::new(settlement_service, delivery_service, test_solver_address());
 		let config = create_test_config();
 		let request = create_test_request();
 

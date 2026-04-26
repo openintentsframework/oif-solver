@@ -749,6 +749,19 @@ impl interfaces::StandardOrder {
 					})
 					.map_err(|e| format!("Invalid settler address '{settler_str}': {e}"))?;
 
+				// Optional exclusive-fill context (FulfilmentLib.sol 0xe0 marker).
+				// Default to empty when absent, preserving the legacy non-exclusive flow.
+				let context_str = output_obj
+					.get("context")
+					.and_then(|c| c.as_str())
+					.unwrap_or("0x");
+				let context_bytes = if context_str == "0x" || context_str.is_empty() {
+					Vec::new()
+				} else {
+					hex::decode(context_str.trim_start_matches("0x"))
+						.map_err(|e| format!("Invalid context hex '{context_str}': {e}"))?
+				};
+
 				sol_outputs.push(SolMandateOutput {
 					oracle: oracle_bytes.into(),
 					settler: settler_bytes.into(),
@@ -757,7 +770,7 @@ impl interfaces::StandardOrder {
 					amount,
 					recipient: recipient_bytes.into(),
 					callbackData: Vec::new().into(),
-					context: Vec::new().into(),
+					context: context_bytes.into(),
 				});
 			}
 		}
@@ -1742,5 +1755,77 @@ mod tests {
 		// This should fail deserialization since hex_string deserializer expects valid hex
 		let result: Result<MandateOutput, _> = serde_json::from_str(json);
 		assert!(result.is_err());
+	}
+
+	#[cfg(feature = "oif-interfaces")]
+	#[test]
+	fn standard_order_roundtrip_preserves_exclusive_context() {
+		// Build the OifOrder::Oif3009V0 metadata with an exclusive 0xe0 context
+		// and confirm StandardOrder reconstruction reads it back verbatim.
+		use crate::api::{OrderPayload, SignatureType};
+		use crate::standards::eip7930::InteropAddress;
+		use crate::OifOrder;
+		use alloy_primitives::address;
+		use std::convert::TryFrom;
+
+		// 1 (tag) + 32 (bytes32 exclusiveFor) + 4 (uint32 startTime) = 37 bytes.
+		let exclusive_context_hex = format!(
+			"0x{}{}{}",
+			"e0",
+			"00000000000000000000000099999999999999999999999999999999999999aa",
+			"0000003c", // startTime = 60
+		);
+		let exclusive_context_bytes =
+			hex::decode(exclusive_context_hex.trim_start_matches("0x")).unwrap();
+
+		let user_addr = address!("1111111111111111111111111111111111111111");
+		let token_addr_in = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+		let token_addr_out = address!("2791bca1f2de4661ed88a30c99a7a9449aa84174");
+		let user_interop = InteropAddress::new_ethereum(1, user_addr).to_hex();
+		let in_asset = InteropAddress::new_ethereum(1, token_addr_in).to_hex();
+		let out_asset = InteropAddress::new_ethereum(137, token_addr_out).to_hex();
+		let recipient = InteropAddress::new_ethereum(137, user_addr).to_hex();
+
+		let payload = OrderPayload {
+			signature_type: SignatureType::Eip712,
+			domain: serde_json::json!({}),
+			primary_type: "ReceiveWithAuthorization".to_string(),
+			message: serde_json::json!({}),
+			types: None,
+		};
+		let metadata = serde_json::json!({
+			"user": user_interop,
+			"nonce": 1,
+			"originChainId": 1,
+			"expires": 100,
+			"fillDeadline": 50,
+			"inputOracle": "0x2222222222222222222222222222222222222222",
+			"inputs": [{
+				"chainId": 1,
+				"asset": in_asset,
+				"amount": "1000",
+				"user": user_interop,
+			}],
+			"outputs": [{
+				"chainId": 137,
+				"asset": out_asset,
+				"amount": "900",
+				"receiver": recipient,
+				"oracle": "0x3333333333333333333333333333333333333333",
+				"settler": "0x4444444444444444444444444444444444444444",
+				"context": exclusive_context_hex,
+			}]
+		});
+
+		let order = OifOrder::Oif3009V0 { payload, metadata };
+		let standard_order = interfaces::StandardOrder::try_from(&order)
+			.expect("3009 reconstruction should succeed");
+
+		assert_eq!(standard_order.outputs.len(), 1);
+		assert_eq!(
+			standard_order.outputs[0].context.to_vec(),
+			exclusive_context_bytes
+		);
+		assert_eq!(standard_order.outputs[0].context[0], 0xe0);
 	}
 }
