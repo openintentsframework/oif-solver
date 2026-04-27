@@ -402,15 +402,7 @@ impl RebalanceMonitor {
 					.or(transfer.dest_token_address.as_ref())
 			};
 
-			let should_scan_for_delivery =
-				matches!(transfer.status, BridgeTransferStatus::Relaying)
-					|| (matches!(transfer.status, BridgeTransferStatus::NeedsIntervention(_))
-						&& matches!(
-							transfer.status_before_intervention,
-							Some(BridgeTransferStatus::Relaying)
-						));
-
-			if should_scan_for_delivery
+			if matches!(transfer.status, BridgeTransferStatus::Relaying)
 				&& transfer.dest_scan_from_block.is_some()
 				&& scan_address.is_some()
 			{
@@ -1117,58 +1109,6 @@ mod tests {
 		let mut transfer = fresh_transfer(BridgeTransferStatus::Relaying);
 		transfer.dest_scan_from_block = Some(100);
 		transfer.dest_token_address = Some(expected_token.clone());
-		transfer.is_composer_flow = Some(false);
-		bridge_service
-			.storage()
-			.save_transfer(&transfer)
-			.await
-			.unwrap();
-
-		monitor
-			.advance_pending_transfers(&rebalance_config())
-			.await
-			.unwrap();
-
-		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
-		assert!(matches!(
-			stored.status,
-			BridgeTransferStatus::PendingRedemption
-		));
-		assert_eq!(stored.received_shares.as_deref(), Some("1000000"));
-	}
-
-	#[tokio::test]
-	async fn test_needs_intervention_from_relaying_recovers_late_delivery() {
-		let storage = make_storage();
-		let expected_token = "0x3333333333333333333333333333333333333333".to_string();
-		let expected_token_for_logs = expected_token.clone();
-		let mut mock = MockDeliveryInterface::new();
-		mock.expect_get_logs()
-			.times(1)
-			.returning(move |_chain_id, filter: LogFilter| {
-				assert_eq!(filter.address, delivery_address(&expected_token_for_logs));
-				assert_eq!(filter.topics().len(), 3);
-				assert_eq!(filter.topics()[0], Some(H256(transfer_event_signature())));
-				assert_eq!(filter.topics()[2], Some(topic_for_address(SOLVER_ADDRESS)));
-				let log = transfer_log(
-					&expected_token_for_logs,
-					"0x1111111111111111111111111111111111111111",
-					SOLVER_ADDRESS,
-					U256::from(1_000_000u64),
-				);
-				Box::pin(async move { Ok(vec![log]) })
-			});
-		let delivery = make_delivery(mock);
-		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
-		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
-
-		let mut transfer = fresh_transfer(BridgeTransferStatus::NeedsIntervention(
-			"LayerZero delivery not detected after 30 min".to_string(),
-		));
-		transfer.status_before_intervention = Some(BridgeTransferStatus::Relaying);
-		transfer.dest_scan_from_block = Some(100);
-		transfer.last_scanned_dest_block = Some(120);
-		transfer.dest_token_address = Some(expected_token);
 		transfer.is_composer_flow = Some(false);
 		bridge_service
 			.storage()

@@ -256,54 +256,6 @@ impl DeliveryInterface for AlloyDelivery {
 		let tx_hash = *pending_tx.tx_hash();
 		let tx_hash_obj = TransactionHash(tx_hash.0.to_vec());
 
-		tracing::info!(
-			chain_id,
-			tx_hash = %tx_hash,
-			"RPC accepted transaction hash; checking propagation"
-		);
-
-		let provider_check = provider.clone();
-		tokio::spawn(async move {
-			for delay_secs in [2_u64, 5, 15, 30] {
-				tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-
-				match provider_check.get_transaction_by_hash(tx_hash).await {
-					Ok(Some(tx)) => {
-						tracing::info!(
-							chain_id,
-							tx_hash = %tx_hash,
-							tx = ?tx,
-							"Transaction is visible from RPC"
-						);
-						return;
-					},
-					Ok(None) => {
-						tracing::warn!(
-							chain_id,
-							tx_hash = %tx_hash,
-							delay_secs,
-							"Transaction still not visible from RPC after send"
-						);
-					},
-					Err(e) => {
-						tracing::warn!(
-							chain_id,
-							tx_hash = %tx_hash,
-							delay_secs,
-							error = %e,
-							"Failed checking transaction visibility"
-						);
-					},
-				}
-			}
-
-			tracing::error!(
-				chain_id,
-				tx_hash = %tx_hash,
-				"RPC returned tx hash but transaction never became visible; likely dropped or not propagated by RPC provider"
-			);
-		});
-
 		// If tracking is provided, set up monitoring
 		if let Some(tracking) = tracking {
 			let tx_hash_clone = tx_hash_obj.clone();
