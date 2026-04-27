@@ -27,7 +27,8 @@ use crate::seeds::types::{NetworkSeed, SeedConfig, COMMON_DEFAULTS};
 use solver_config::{
 	AccountConfig, ApiConfig, ApiImplementations, Config, DeliveryConfig, DiscoveryConfig,
 	GasConfig, GasFlowUnits, OrderConfig, PricingConfig, RebalanceConfig, RebalancePairConfig,
-	RebalancePairSideConfig, SettlementConfig, SolverConfig, StorageConfig, StrategyConfig,
+	RebalancePairSideConfig, SettlementConfig, SolverConfig, SolverIngressMode, StorageConfig,
+	StrategyConfig,
 };
 use solver_types::seed_overrides::OracleSelectionStrategyOverride;
 use solver_types::{
@@ -1092,18 +1093,11 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 
 	// Build networks config from OperatorConfig
 	let networks = build_networks_from_operator_config(operator_config);
+	let ingress_mode_override = solver_ingress_mode_from_env()?;
 
 	// Build the full config
 	let config = Config {
-		solver: SolverConfig {
-			id: operator_config.solver_id.clone(),
-			min_profitability_pct: operator_config.solver.min_profitability_pct,
-			gas_buffer_bps: operator_config.solver.gas_buffer_bps,
-			commission_bps: operator_config.solver.commission_bps,
-			rate_buffer_bps: operator_config.solver.rate_buffer_bps,
-			monitoring_timeout_seconds: operator_config.solver.monitoring_timeout_seconds,
-			deny_list: operator_config.solver.deny_list.clone(),
-		},
+		solver: build_solver_config_from_operator(operator_config, ingress_mode_override),
 		networks,
 		storage: build_storage_config_from_operator(&operator_config.solver_id),
 		delivery: build_delivery_config_from_operator(&chain_ids),
@@ -1121,6 +1115,42 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 	};
 
 	Ok(config)
+}
+
+fn parse_solver_ingress_mode(raw: &str) -> Result<SolverIngressMode, MergeError> {
+	match raw.trim().to_ascii_lowercase().as_str() {
+		"" | "active" => Ok(SolverIngressMode::Active),
+		"intake_disabled" => Ok(SolverIngressMode::IntakeDisabled),
+		other => Err(MergeError::Validation(format!(
+			"Invalid SOLVER_INGRESS_MODE value '{other}'. Expected 'active' or 'intake_disabled'"
+		))),
+	}
+}
+
+fn solver_ingress_mode_from_env() -> Result<Option<SolverIngressMode>, MergeError> {
+	match std::env::var("SOLVER_INGRESS_MODE") {
+		Ok(raw) => Ok(Some(parse_solver_ingress_mode(&raw)?)),
+		Err(std::env::VarError::NotPresent) => Ok(None),
+		Err(std::env::VarError::NotUnicode(_)) => Err(MergeError::Validation(
+			"Invalid unicode value for SOLVER_INGRESS_MODE".to_string(),
+		)),
+	}
+}
+
+fn build_solver_config_from_operator(
+	operator_config: &OperatorConfig,
+	ingress_mode_override: Option<SolverIngressMode>,
+) -> SolverConfig {
+	SolverConfig {
+		id: operator_config.solver_id.clone(),
+		min_profitability_pct: operator_config.solver.min_profitability_pct,
+		gas_buffer_bps: operator_config.solver.gas_buffer_bps,
+		commission_bps: operator_config.solver.commission_bps,
+		rate_buffer_bps: operator_config.solver.rate_buffer_bps,
+		monitoring_timeout_seconds: operator_config.solver.monitoring_timeout_seconds,
+		deny_list: operator_config.solver.deny_list.clone(),
+		ingress_mode: ingress_mode_override.unwrap_or_default(),
+	}
 }
 
 /// Builds NetworksConfig from OperatorConfig.
@@ -3113,6 +3143,49 @@ mod tests {
 			routing_defaults: None,
 			rebalance: None,
 		}
+	}
+
+	#[test]
+	fn test_parse_solver_ingress_mode_accepts_active() {
+		assert_eq!(
+			parse_solver_ingress_mode("active").unwrap(),
+			solver_config::SolverIngressMode::Active
+		);
+	}
+
+	#[test]
+	fn test_parse_solver_ingress_mode_accepts_intake_disabled() {
+		assert_eq!(
+			parse_solver_ingress_mode("intake_disabled").unwrap(),
+			solver_config::SolverIngressMode::IntakeDisabled
+		);
+	}
+
+	#[test]
+	fn test_parse_solver_ingress_mode_rejects_unknown_value() {
+		let err = parse_solver_ingress_mode("paused").unwrap_err();
+		assert!(err.to_string().contains("SOLVER_INGRESS_MODE"));
+		assert!(err.to_string().contains("active"));
+		assert!(err.to_string().contains("intake_disabled"));
+	}
+
+	#[test]
+	fn test_build_solver_config_from_operator_applies_ingress_mode_override() {
+		let overrides = test_seed_overrides();
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		let solver = build_solver_config_from_operator(
+			&op_config,
+			Some(solver_config::SolverIngressMode::IntakeDisabled),
+		);
+
+		assert_eq!(
+			solver.ingress_mode,
+			solver_config::SolverIngressMode::IntakeDisabled
+		);
+		assert_eq!(
+			solver.min_profitability_pct,
+			op_config.solver.min_profitability_pct
+		);
 	}
 
 	#[test]

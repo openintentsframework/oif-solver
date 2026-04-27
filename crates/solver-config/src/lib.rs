@@ -102,6 +102,32 @@ pub struct SolverConfig {
 	/// When set, any intent whose sender or recipient appears in the list is silently dropped.
 	#[serde(default)]
 	pub deny_list: Option<String>,
+	/// Runtime ingress mode controlling whether new solver intake is accepted.
+	#[serde(default)]
+	pub ingress_mode: SolverIngressMode,
+}
+
+/// Runtime ingress mode for accepting new solver work.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SolverIngressMode {
+	/// Normal operation: accept new quotes, orders, and discovered intents.
+	#[default]
+	Active,
+	/// Stop accepting new work while allowing in-flight work to complete.
+	IntakeDisabled,
+}
+
+impl SolverIngressMode {
+	pub fn is_intake_disabled(self) -> bool {
+		matches!(self, Self::IntakeDisabled)
+	}
+}
+
+impl SolverConfig {
+	pub fn is_intake_disabled(&self) -> bool {
+		self.ingress_mode.is_intake_disabled()
+	}
 }
 
 /// Configuration for the storage backend.
@@ -881,6 +907,28 @@ mod tests {
 				"decimals": 18
 			}]
 		})
+	}
+
+	#[test]
+	fn test_solver_ingress_mode_defaults_to_active() {
+		let config = ConfigBuilder::new().build();
+
+		assert_eq!(config.solver.ingress_mode, SolverIngressMode::Active);
+		assert!(!config.solver.is_intake_disabled());
+	}
+
+	#[test]
+	fn test_solver_ingress_mode_deserializes_intake_disabled() {
+		let solver: SolverConfig = serde_json::from_value(json!({
+			"id": "test-solver",
+			"min_profitability_pct": "1",
+			"monitoring_timeout_seconds": 30,
+			"ingress_mode": "intake_disabled"
+		}))
+		.expect("solver config should deserialize");
+
+		assert_eq!(solver.ingress_mode, SolverIngressMode::IntakeDisabled);
+		assert!(solver.is_intake_disabled());
 	}
 
 	fn base_config_json(

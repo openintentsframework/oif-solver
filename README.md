@@ -340,6 +340,7 @@ For Redis connectivity from within Docker:
 | `SOLVER_ID` | For loading | Solver ID to load config from Redis (after first seed) |
 | `RUST_LOG` | No | Log level (default: `info`) |
 | `SOLVER_PRIVATE_KEY` | Conditional | Required for local wallet if no inline `private_key` in bootstrap config |
+| `SOLVER_INGRESS_MODE` | No | Set to `intake_disabled` to reject new quotes, orders, and discovered intents while keeping in-flight work and admin withdrawals available |
 | `AWS_ACCESS_KEY_ID` | For KMS | AWS access key (if using KMS signer) |
 | `AWS_SECRET_ACCESS_KEY` | For KMS | AWS secret key (if using KMS signer) |
 | `AWS_REGION` | For KMS | AWS region (if using KMS signer, default: from config) |
@@ -392,8 +393,24 @@ Legacy alias support:
 | `REDIS_URL` | Yes | Redis connection URL (default: `redis://localhost:6379`). For production, use managed services like AWS ElastiCache |
 | `SOLVER_PRIVATE_KEY` | Conditional | 64-character hex private key (without 0x prefix) |
 | `SOLVER_ID` | For loading | Solver ID to load from Redis (set after first seed) |
+| `SOLVER_INGRESS_MODE` | No | `active` by default; set `intake_disabled` to stop accepting new solver work |
 
 `SOLVER_PRIVATE_KEY` is only required when using the local wallet without an inline `private_key` in bootstrap config. Not needed if using KMS or providing `private_key` directly in the JSON.
+
+### Intake Disabled Mode
+
+Set `SOLVER_INGRESS_MODE=intake_disabled` at startup to stop accepting new solver work without shutting down the process.
+
+When enabled, the solver rejects:
+
+- `POST /api/v1/quotes`
+- `POST /api/v1/orders` quote acceptances
+- `POST /api/v1/orders` direct submissions
+- newly discovered on-chain/off-chain intents
+
+The solver continues processing already accepted orders and settlement events. Health checks, asset reads, admin balance reads, and admin withdrawals remain available.
+
+Use this for custody-cap operations where OpenZeppelin must stop new intake without receiving Polygon admin withdrawal permissions. Restore normal operation by restarting/redeploying with `SOLVER_INGRESS_MODE=active` or with the variable unset.
 
 ### Bootstrap Config Format
 
