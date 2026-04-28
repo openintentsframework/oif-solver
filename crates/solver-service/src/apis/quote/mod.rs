@@ -92,7 +92,7 @@ pub async fn process_quote_request(
 	solver: &SolverEngine,
 	config: &Config,
 ) -> Result<GetQuoteResponse, QuoteError> {
-	crate::validators::intake::ensure_quote_intake_enabled(config)?;
+	crate::validators::intake::ensure_intake_enabled::<QuoteError>(config)?;
 
 	info!(
 		"Processing quote request with {} inputs",

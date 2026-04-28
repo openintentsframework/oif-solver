@@ -609,7 +609,9 @@ async fn handle_order(
 
 	{
 		let config = state.config.read().await;
-		if let Err(api_error) = crate::validators::intake::ensure_order_intake_enabled(&config) {
+		if let Err(api_error) =
+			crate::validators::intake::ensure_intake_enabled::<APIError>(&config)
+		{
 			return api_error.into_response();
 		}
 	}
