@@ -1,5 +1,5 @@
 use solver_config::Config;
-use solver_types::{APIError, ApiErrorType, QuoteError};
+use solver_types::{APIError, QuoteError};
 
 pub fn ensure_quote_intake_enabled(config: &Config) -> Result<(), QuoteError> {
 	if config.solver.is_intake_disabled() {
@@ -10,18 +10,9 @@ pub fn ensure_quote_intake_enabled(config: &Config) -> Result<(), QuoteError> {
 
 pub fn ensure_order_intake_enabled(config: &Config) -> Result<(), APIError> {
 	if config.solver.is_intake_disabled() {
-		return Err(intake_disabled_api_error());
+		return Err(QuoteError::SolverIntakeDisabled.into());
 	}
 	Ok(())
-}
-
-pub fn intake_disabled_api_error() -> APIError {
-	APIError::ServiceUnavailable {
-		error_type: ApiErrorType::SolverIntakeDisabled,
-		message: "Solver intake is disabled; new quotes and orders are temporarily unavailable"
-			.to_string(),
-		retry_after: None,
-	}
 }
 
 #[cfg(test)]

@@ -140,6 +140,8 @@ impl IntentHandler {
 		// This enables hot-reload: config changes via Admin API are picked up on next intent.
 		let config = self.dynamic_config.read().await.clone();
 
+		// Backstop for intake disabled mode on discovery paths. HTTP quote/order
+		// intake is rejected earlier in solver-service.
 		if config.solver.is_intake_disabled() {
 			tracing::warn!(
 				intent_id = %intent.id,

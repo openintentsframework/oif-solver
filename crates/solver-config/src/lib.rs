@@ -119,7 +119,7 @@ pub enum SolverIngressMode {
 }
 
 impl SolverIngressMode {
-	pub fn is_intake_disabled(self) -> bool {
+	pub fn is_intake_disabled(&self) -> bool {
 		matches!(self, Self::IntakeDisabled)
 	}
 }

@@ -3154,6 +3154,16 @@ mod tests {
 	}
 
 	#[test]
+	fn test_parse_solver_ingress_mode_treats_empty_and_whitespace_as_active() {
+		for value in ["", " ", "\t\n"] {
+			assert_eq!(
+				parse_solver_ingress_mode(value).unwrap(),
+				solver_config::SolverIngressMode::Active
+			);
+		}
+	}
+
+	#[test]
 	fn test_parse_solver_ingress_mode_accepts_intake_disabled() {
 		assert_eq!(
 			parse_solver_ingress_mode("intake_disabled").unwrap(),
