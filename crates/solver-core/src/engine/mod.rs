@@ -105,6 +105,18 @@ pub struct SolverEngine {
 /// submitting claim transactions to reduce gas costs.
 static CLAIM_BATCH: usize = 1;
 
+/// Returns true when the error string indicates a transient post-fill failure
+/// — one that may succeed on a later attempt without any code or order
+/// changes. Marking such orders as `Failed` would lock in a real loss
+/// because the Fill has already settled on chain; only the claim half
+/// remains, and it just needs another attempt with a healthier signer.
+///
+/// Currently identifies:
+/// - Insufficient native gas (balance changes outside the solver's view).
+fn is_transient_postfill_error(error_msg: &str) -> bool {
+	error_msg.contains("Insufficient native gas")
+}
+
 impl SolverEngine {
 	/// Creates a new solver engine with the given services.
 	///
@@ -474,7 +486,22 @@ impl SolverEngine {
 								let order_id_clone = order_id.clone();
 								if let Err(e) = engine.settlement_handler.handle_post_fill_ready(order_id).await {
 									let error_msg = format!("Failed to handle PostFillReady: {e}");
-									// Attempt to mark order as failed
+									// Discriminate transient errors from permanent ones.
+									// "Insufficient native gas" is the textbook transient: balance
+									// changes outside the solver's view, and marking Failed here
+									// would lock in a real loss (Fill already settled on chain;
+									// we just need to top up to claim). Leave the order in
+									// `Executed` so the next restart's recovery retries.
+									if is_transient_postfill_error(&error_msg) {
+										tracing::warn!(
+											order_id = %order_id_clone,
+											error = %error_msg,
+											"PostFill failed with a transient error; leaving order \
+											in Executed for the next recovery cycle to retry"
+										);
+										return Err(EngineError::Service(error_msg));
+									}
+									// Permanent failure → mark order Failed.
 									if let Err(state_err) = engine.state_machine
 										.transition_order_status(&order_id_clone, solver_types::OrderStatus::Failed(solver_types::TransactionType::PostFill, error_msg.clone()))
 										.await
