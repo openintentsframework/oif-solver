@@ -140,6 +140,22 @@ impl IntentHandler {
 		// This enables hot-reload: config changes via Admin API are picked up on next intent.
 		let config = self.dynamic_config.read().await.clone();
 
+		// Backstop for intake disabled mode on discovery paths. HTTP quote/order
+		// intake is rejected earlier in solver-service.
+		if config.solver.is_intake_disabled() {
+			tracing::warn!(
+				intent_id = %intent.id,
+				"Intent rejected because solver intake is disabled"
+			);
+			self.event_bus
+				.publish(SolverEvent::Discovery(DiscoveryEvent::IntentRejected {
+					intent_id: intent.id,
+					reason: "Solver intake is disabled".to_string(),
+				}))
+				.ok();
+			return Ok(());
+		}
+
 		// Prevent duplicate order processing when multiple discovery modules for the same standard are active.
 		//
 		// When an off-chain 7683 order is submitted via the API, it triggers an `openFor` transaction
@@ -537,7 +553,7 @@ mod tests {
 	use solver_types::utils::tests::builders::{
 		Eip7683OrderDataBuilder, IntentBuilder, OrderBuilder,
 	};
-	use solver_types::{Address, ExecutionParams, Intent, Order, SolverEvent};
+	use solver_types::{Address, DiscoveryEvent, ExecutionParams, Intent, Order, SolverEvent};
 	use std::collections::HashMap;
 	use std::sync::Arc;
 	use std::time::Duration;
@@ -1000,6 +1016,64 @@ mod tests {
 
 		let result = handler.handle(intent).await;
 		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_rejects_before_storage_when_intake_disabled() {
+		let mut mock_storage = MockStorageInterface::new();
+		mock_storage.expect_exists().times(0);
+		mock_storage.expect_set_bytes().times(0);
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::new(),
+			Box::new(MockExecutionStrategy::new()),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let mut event_receiver = event_bus.subscribe();
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let cost_profit_service = create_mock_cost_profit_service();
+		let (config, static_config) = create_test_config();
+		config.write().await.solver.ingress_mode = solver_config::SolverIngressMode::IntakeDisabled;
+		let intent = create_test_intent();
+		let intent_id = intent.id.clone();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			create_test_address(),
+			token_manager,
+			cost_profit_service,
+			config,
+			&static_config,
+		);
+
+		handler
+			.handle(intent)
+			.await
+			.expect("handler should not error");
+
+		let event = tokio::time::timeout(Duration::from_millis(100), event_receiver.recv())
+			.await
+			.expect("expected rejection event")
+			.expect("event bus should return event");
+
+		assert!(matches!(
+			event,
+			SolverEvent::Discovery(DiscoveryEvent::IntentRejected { intent_id: id, reason })
+				if id == intent_id && reason.contains("intake")
+		));
 	}
 
 	#[tokio::test]

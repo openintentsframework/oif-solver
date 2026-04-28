@@ -92,6 +92,8 @@ pub async fn process_quote_request(
 	solver: &SolverEngine,
 	config: &Config,
 ) -> Result<GetQuoteResponse, QuoteError> {
+	crate::validators::intake::ensure_intake_enabled::<QuoteError>(config)?;
+
 	info!(
 		"Processing quote request with {} inputs",
 		request.intent.inputs.len()
@@ -938,6 +940,18 @@ mod tests {
 		assert!(
 			matches!(result, Err(QuoteError::UnsupportedQuoteShape(msg)) if msg.contains("multi-input"))
 		);
+	}
+
+	#[tokio::test]
+	async fn test_process_quote_request_rejects_when_intake_disabled() {
+		let solver = create_test_solver_engine();
+		let request = create_test_quote_request();
+		let mut config = solver.dynamic_config().read().await.clone();
+		config.solver.ingress_mode = solver_config::SolverIngressMode::IntakeDisabled;
+
+		let result = process_quote_request(request, &solver, &config).await;
+
+		assert!(matches!(result, Err(QuoteError::SolverIntakeDisabled)));
 	}
 
 	#[tokio::test]
