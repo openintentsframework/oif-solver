@@ -322,12 +322,22 @@ fn default_rate_buffer_bps() -> u32 {
 	14 // 0.14%
 }
 
+fn default_live_fill_estimate_enabled() -> bool {
+	true
+}
+
 /// Gas configuration mapping flow identifiers to gas unit overrides.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GasConfig {
 	/// Map of flow key -> GasFlowUnits
 	/// Example keys: "permit2_escrow", "resource_lock"
 	pub flows: HashMap<String, GasFlowUnits>,
+	/// When true, quote-time pricing performs `eth_estimateGas` for the fill leg
+	/// and uses the result instead of `flows.<key>.fill`. Other legs stay static.
+	/// Defaults to true; flip to false via the admin API to disable the live path
+	/// on a chain where eth_estimateGas is unreliable.
+	#[serde(default = "default_live_fill_estimate_enabled")]
+	pub live_fill_estimate_enabled: bool,
 }
 
 /// Runtime rebalancing configuration.

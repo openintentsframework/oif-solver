@@ -452,6 +452,7 @@ pub fn merge_to_operator_config(
 				fill: seed.defaults.gas_eip3009_escrow.fill,
 				claim: seed.defaults.gas_eip3009_escrow.claim,
 			},
+			live_fill_estimate_enabled: true,
 		},
 		pricing: OperatorPricingConfig {
 			primary: seed.defaults.pricing_primary.to_string(),
@@ -1865,7 +1866,10 @@ fn build_gas_config_from_operator(gas: &OperatorGasConfig) -> GasConfig {
 		},
 	);
 
-	GasConfig { flows }
+	GasConfig {
+		flows,
+		live_fill_estimate_enabled: gas.live_fill_estimate_enabled,
+	}
 }
 
 /// Builds ApiConfig from OperatorAdminConfig.
@@ -2157,11 +2161,13 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 					claim: f.claim.unwrap_or(0),
 				})
 				.unwrap_or_default(),
+			live_fill_estimate_enabled: g.live_fill_estimate_enabled,
 		})
 		.unwrap_or(OperatorGasConfig {
 			resource_lock: OperatorGasFlowUnits::default(),
 			permit2_escrow: OperatorGasFlowUnits::default(),
 			eip3009_escrow: OperatorGasFlowUnits::default(),
+			live_fill_estimate_enabled: true,
 		});
 
 	// Extract pricing config
@@ -5504,6 +5510,7 @@ mod tests {
 				resource_lock: OperatorGasFlowUnits::default(),
 				permit2_escrow: OperatorGasFlowUnits::default(),
 				eip3009_escrow: OperatorGasFlowUnits::default(),
+				live_fill_estimate_enabled: true,
 			},
 			pricing: OperatorPricingConfig {
 				primary: "coingecko".to_string(),
@@ -5781,6 +5788,7 @@ mod tests {
 				fill: 800,
 				claim: 900,
 			},
+			live_fill_estimate_enabled: true,
 		};
 
 		let gas = build_gas_config_from_operator(&op_gas);

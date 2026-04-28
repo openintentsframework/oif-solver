@@ -436,6 +436,10 @@ fn default_broadcaster_finality_blocks() -> u64 {
 	20
 }
 
+fn default_live_fill_estimate_enabled() -> bool {
+	true
+}
+
 /// Gas estimation settings per flow type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperatorGasConfig {
@@ -447,6 +451,12 @@ pub struct OperatorGasConfig {
 
 	/// Gas units for EIP-3009 escrow flow.
 	pub eip3009_escrow: OperatorGasFlowUnits,
+
+	/// When true, quote-time pricing performs `eth_estimateGas` for the fill
+	/// leg and uses the result instead of the configured per-flow `fill` units.
+	/// Other legs (open/claim) stay static. Defaults to `true`.
+	#[serde(default = "default_live_fill_estimate_enabled")]
+	pub live_fill_estimate_enabled: bool,
 }
 
 /// Gas units for each step in an order flow.
@@ -916,6 +926,7 @@ mod tests {
 				},
 				permit2_escrow: OperatorGasFlowUnits::default(),
 				eip3009_escrow: OperatorGasFlowUnits::default(),
+				live_fill_estimate_enabled: true,
 			},
 			pricing: OperatorPricingConfig {
 				primary: "coingecko".to_string(),

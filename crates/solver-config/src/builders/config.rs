@@ -201,6 +201,7 @@ impl ConfigBuilder {
 			api: self.api,
 			gas: Some(GasConfig {
 				flows: HashMap::new(),
+				live_fill_estimate_enabled: true,
 			}),
 			rebalance: None,
 		}

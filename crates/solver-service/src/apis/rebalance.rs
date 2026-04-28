@@ -991,6 +991,7 @@ mod tests {
 				resource_lock: OperatorGasFlowUnits::default(),
 				permit2_escrow: OperatorGasFlowUnits::default(),
 				eip3009_escrow: OperatorGasFlowUnits::default(),
+				live_fill_estimate_enabled: true,
 			},
 			pricing: OperatorPricingConfig {
 				primary: "coingecko".to_string(),

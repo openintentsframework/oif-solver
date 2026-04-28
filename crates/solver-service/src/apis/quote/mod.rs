@@ -135,12 +135,14 @@ pub async fn process_quote_request(
 		solver.storage().clone(),
 	);
 
+	let solver_address = solver.solver_address().clone();
 	let cost_context = cost_profit_service
 		.calculate_cost_context_for_flow_keys(
 			&request,
 			&validated_context,
 			config,
 			&resolved_flow_keys,
+			&solver_address,
 		)
 		.await
 		.map_err(|e| QuoteError::Internal(format!("Failed to calculate cost context: {e}")))?;
@@ -664,6 +666,16 @@ mod tests {
 		mock_delivery_137
 			.expect_get_balance()
 			.returning(|_, _, _| Box::pin(async move { Ok("5000000000".to_string()) }));
+		// Quote-time live fill estimation: return an error so the cost path
+		// silently falls back to the static `flows.<key>.fill` default. This
+		// preserves the test's pre-live-estimate behavior.
+		mock_delivery_137.expect_estimate_gas().returning(|_| {
+			Box::pin(async move {
+				Err(solver_delivery::DeliveryError::Network(
+					"test mock: live estimate unavailable".into(),
+				))
+			})
+		});
 		delivery_implementations.insert(
 			137,
 			Arc::new(mock_delivery_137) as Arc<dyn DeliveryInterface>,
