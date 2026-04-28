@@ -679,6 +679,7 @@ pub enum ApiErrorType {
 	UnsupportedSettlement,
 	InsufficientLiquidity,
 	SolverCapacityExceeded,
+	SolverIntakeDisabled,
 
 	// Order retrieval errors
 	OrderNotFound,
@@ -1326,6 +1327,8 @@ pub enum QuoteError {
 	InsufficientLiquidity,
 	#[error("Solver capacity exceeded")]
 	SolverCapacityExceeded,
+	#[error("Solver intake is disabled")]
+	SolverIntakeDisabled,
 	#[error("Internal error: {0}")]
 	Internal(String),
 	#[error("Unsupported intent type: {0}")]
@@ -1376,6 +1379,13 @@ impl From<QuoteError> for APIError {
 				error_type: ApiErrorType::SolverCapacityExceeded,
 				message: "Solver capacity exceeded, please try again later".to_string(),
 				retry_after: Some(60), // Suggest retry after 60 seconds
+			},
+			QuoteError::SolverIntakeDisabled => APIError::ServiceUnavailable {
+				error_type: ApiErrorType::SolverIntakeDisabled,
+				message:
+					"Solver intake is disabled; new quotes and orders are temporarily unavailable"
+						.to_string(),
+				retry_after: None,
 			},
 			QuoteError::Internal(msg) => APIError::InternalServerError {
 				error_type: ApiErrorType::InternalError,
@@ -1998,6 +2008,17 @@ mod tests {
 		let quote_error = QuoteError::Internal("DB connection failed".to_string());
 		let api_error: APIError = quote_error.into();
 		assert_eq!(api_error.status_code(), 500);
+	}
+
+	#[test]
+	fn test_quote_error_intake_disabled_maps_to_503() {
+		let api_error: APIError = QuoteError::SolverIntakeDisabled.into();
+
+		assert_eq!(api_error.status_code(), 503);
+		let response = api_error.to_error_response();
+		assert_eq!(response.error, "SOLVER_INTAKE_DISABLED");
+		assert!(response.message.contains("intake"));
+		assert_eq!(response.retry_after, None);
 	}
 
 	#[test]

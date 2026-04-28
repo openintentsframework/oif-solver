@@ -607,6 +607,15 @@ async fn handle_order(
 		);
 	}
 
+	{
+		let config = state.config.read().await;
+		if let Err(api_error) =
+			crate::validators::intake::ensure_intake_enabled::<APIError>(&config)
+		{
+			return api_error.into_response();
+		}
+	}
+
 	// Extract standard, default to eip7683
 	let standard = "eip7683";
 
@@ -943,7 +952,7 @@ mod tests {
 		SignatureType,
 	};
 	use solver_types::standards::eip7683::interfaces::StandardOrder as OifStandardOrder;
-	use solver_types::{APIError, Address, ApiErrorType};
+	use solver_types::{APIError, Address, ApiErrorType, ErrorResponse};
 	use std::collections::HashMap;
 	use std::convert::TryFrom;
 	use std::sync::Arc;
@@ -1085,6 +1094,13 @@ mod tests {
 			siwe_nonce_store: None,
 			signature_validation: Arc::new(SignatureValidationService::new()),
 		}
+	}
+
+	async fn build_intake_disabled_test_app_state(discovery_url: Option<String>) -> AppState {
+		let state = build_test_app_state(discovery_url).await;
+		state.config.write().await.solver.ingress_mode =
+			solver_config::SolverIngressMode::IntakeDisabled;
+		state
 	}
 
 	fn sample_post_order_request() -> PostOrderRequest {
@@ -1351,6 +1367,40 @@ mod tests {
 			.as_deref()
 			.unwrap_or_default()
 			.contains("Intent submission service not configured"));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn handle_order_rejects_direct_submission_when_intake_disabled() {
+		let state = build_intake_disabled_test_app_state(None).await;
+		let payload = to_value(sample_post_order_request()).expect("serialize request");
+
+		let response = super::handle_order(State(state), None, Json(payload)).await;
+
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+		let body_bytes = body::to_bytes(response.into_body(), usize::MAX)
+			.await
+			.expect("body");
+		let parsed: ErrorResponse = serde_json::from_slice(&body_bytes).expect("parse body");
+		assert_eq!(parsed.error, "SOLVER_INTAKE_DISABLED");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn handle_order_rejects_quote_acceptance_before_quote_lookup_when_intake_disabled() {
+		let state = build_intake_disabled_test_app_state(None).await;
+		let payload = json!({
+			"quoteId": "missing-quote-that-must-not-be-looked-up",
+			"signature": "0x1234"
+		});
+
+		let response = super::handle_order(State(state), None, Json(payload)).await;
+
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+		let body_bytes = body::to_bytes(response.into_body(), usize::MAX)
+			.await
+			.expect("body");
+		let parsed: ErrorResponse = serde_json::from_slice(&body_bytes).expect("parse body");
+		assert_eq!(parsed.error, "SOLVER_INTAKE_DISABLED");
+		assert!(parsed.message.contains("intake"));
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
