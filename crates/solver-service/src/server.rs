@@ -1023,7 +1023,7 @@ mod tests {
 
 		let solver_address = Address(vec![0x11; 20]);
 
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 10));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 10, 60));
 		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
 
 		let strategy_config = serde_json::Value::Object(serde_json::Map::new());

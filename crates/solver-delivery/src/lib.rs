@@ -37,9 +37,35 @@ pub enum DeliveryError {
 	/// not a business failure: do not increment failure counters.
 	#[error("Nonce too low after resync retry: {0}")]
 	NonceTooLow(String),
+	/// Signer does not have enough native gas token to cover the transaction's
+	/// up-front reservation (`gas_limit * fee_per_gas + value`).
+	///
+	/// Boxed to keep `DeliveryError` small — the struct has 9 fields and would
+	/// otherwise make every `Result<_, DeliveryError>` heavy enough to trip
+	/// `clippy::result_large_err`.
+	#[error(transparent)]
+	InsufficientNativeGas(Box<InsufficientNativeGasInfo>),
 	/// Error that occurs when no suitable implementation is available for the operation.
 	#[error("No implementation available")]
 	NoImplementationAvailable,
+}
+
+/// Detailed payload for `DeliveryError::InsufficientNativeGas`. Stored boxed
+/// so the parent enum stays small (see `clippy::result_large_err`).
+#[derive(Debug, Error)]
+#[error(
+	"Insufficient native gas on chain {chain_id} for signer {signer}: balance {balance_wei} wei, required {required_wei} wei, shortfall {shortfall_wei} wei"
+)]
+pub struct InsufficientNativeGasInfo {
+	pub chain_id: u64,
+	pub signer: String,
+	pub balance_wei: String,
+	pub required_wei: String,
+	pub shortfall_wei: String,
+	pub gas_limit: Option<u64>,
+	pub max_fee_per_gas: Option<u128>,
+	pub gas_price: Option<u128>,
+	pub value_wei: String,
 }
 
 /// Callback for transaction monitoring events
@@ -61,6 +87,17 @@ pub enum TransactionMonitoringEvent {
 		tx_hash: TransactionHash,
 		tx_type: TransactionType,
 		error: String,
+	},
+	/// Live confirmation watcher gave up before reaching `min_confirmations`.
+	/// The transaction's on-chain status is unknown to the monitor — it may
+	/// have confirmed after the deadline, or may have been dropped. The order
+	/// MUST stay in its current status; startup recovery will reconcile via
+	/// direct chain query.
+	Indeterminate {
+		id: String, // order_id in case of intents
+		tx_hash: TransactionHash,
+		tx_type: TransactionType,
+		reason: String,
 	},
 }
 
@@ -90,8 +127,11 @@ pub struct TransactionTrackingWithConfig {
 	pub tracking: TransactionTracking,
 	/// Minimum confirmations required before considering transaction confirmed
 	pub min_confirmations: u64,
-	/// Timeout in seconds for monitoring the transaction
+	/// Timeout in seconds for settlement-readiness monitoring (long window).
 	pub monitoring_timeout_seconds: u64,
+	/// Timeout in seconds for live tx-confirmation polling (short window).
+	/// Distinct from `monitoring_timeout_seconds`; see `DeliveryConfig`.
+	pub tx_confirmation_timeout_seconds: u64,
 }
 
 /// Trait defining the interface for transaction delivery implementations.
@@ -230,8 +270,10 @@ pub struct DeliveryService {
 	implementations: std::collections::HashMap<u64, Arc<dyn DeliveryInterface>>,
 	/// Default number of confirmations required for transactions.
 	min_confirmations: u64,
-	/// Timeout for transaction monitoring in seconds.
+	/// Timeout for settlement-readiness monitoring in seconds (long window).
 	monitoring_timeout_seconds: u64,
+	/// Timeout for live tx-confirmation polling in seconds (short window).
+	tx_confirmation_timeout_seconds: u64,
 }
 
 impl DeliveryService {
@@ -243,11 +285,13 @@ impl DeliveryService {
 		implementations: std::collections::HashMap<u64, Arc<dyn DeliveryInterface>>,
 		min_confirmations: u64,
 		monitoring_timeout_seconds: u64,
+		tx_confirmation_timeout_seconds: u64,
 	) -> Self {
 		Self {
 			implementations,
 			min_confirmations,
 			monitoring_timeout_seconds,
+			tx_confirmation_timeout_seconds,
 		}
 	}
 
@@ -275,6 +319,7 @@ impl DeliveryService {
 			tracking: t,
 			min_confirmations: self.min_confirmations,
 			monitoring_timeout_seconds: self.monitoring_timeout_seconds,
+			tx_confirmation_timeout_seconds: self.tx_confirmation_timeout_seconds,
 		});
 		implementation.submit(tx, enhanced_tracking).await
 	}

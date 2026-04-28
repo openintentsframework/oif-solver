@@ -109,6 +109,25 @@ impl OrderHandler {
 						}))
 						.ok();
 				},
+				TransactionMonitoringEvent::Indeterminate {
+					id: order_id,
+					tx_hash,
+					tx_type,
+					reason,
+				} => {
+					// Live tx watcher could not determine on-chain state within
+					// the confirmation deadline. Order is left in its current
+					// status; startup recovery will reconcile via direct chain
+					// query. Do NOT publish a `TransactionFailed` event — that
+					// would terminally fail the order.
+					tracing::warn!(
+						%order_id,
+						?tx_hash,
+						?tx_type,
+						%reason,
+						"Live tx monitor indeterminate; order left in current status"
+					);
+				},
 			});
 
 			let tracking = TransactionTracking {
@@ -219,6 +238,20 @@ impl OrderHandler {
 						error,
 					}))
 					.ok();
+			},
+			TransactionMonitoringEvent::Indeterminate {
+				id: order_id,
+				tx_hash,
+				tx_type,
+				reason,
+			} => {
+				tracing::warn!(
+					%order_id,
+					?tx_hash,
+					?tx_type,
+					%reason,
+					"Live tx monitor indeterminate; order left in current status"
+				);
 			},
 		});
 
@@ -339,6 +372,7 @@ mod tests {
 			)]),
 			1,
 			20,
+			60,
 		));
 
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));

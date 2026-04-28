@@ -184,6 +184,20 @@ impl SettlementHandler {
 							}))
 							.ok();
 					},
+					TransactionMonitoringEvent::Indeterminate {
+						id: order_id_inner,
+						tx_hash,
+						tx_type,
+						reason,
+					} => {
+						tracing::warn!(
+							%order_id_inner,
+							?tx_hash,
+							?tx_type,
+							%reason,
+							"Live tx monitor indeterminate; order left in current status"
+						);
+					},
 				});
 
 				let tracking = TransactionTracking {
@@ -314,6 +328,20 @@ impl SettlementHandler {
 							}))
 							.ok();
 					},
+					TransactionMonitoringEvent::Indeterminate {
+						id: order_id_inner,
+						tx_hash,
+						tx_type,
+						reason,
+					} => {
+						tracing::warn!(
+							%order_id_inner,
+							?tx_hash,
+							?tx_type,
+							%reason,
+							"Live tx monitor indeterminate; order left in current status"
+						);
+					},
 				});
 
 				let tracking = TransactionTracking {
@@ -432,6 +460,20 @@ impl SettlementHandler {
 						}))
 						.ok();
 				},
+				TransactionMonitoringEvent::Indeterminate {
+					id: order_id_inner,
+					tx_hash,
+					tx_type,
+					reason,
+				} => {
+					tracing::warn!(
+						%order_id_inner,
+						?tx_hash,
+						?tx_type,
+						%reason,
+						"Live tx monitor indeterminate; order left in current status"
+					);
+				},
 			});
 
 			let tracking = TransactionTracking {
@@ -548,6 +590,7 @@ mod tests {
 			)]),
 			1,
 			20,
+			60,
 		));
 		let order_service = Arc::new(OrderService::new(
 			HashMap::from([(

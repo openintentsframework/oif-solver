@@ -4,6 +4,7 @@
 //! to avoid duplication and make it easy to add new chains/tokens.
 
 use alloy_primitives::{Address, U256};
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use solver_delivery::DeliveryService;
 use solver_types::Transaction;
@@ -22,6 +23,8 @@ pub struct ProtocolRegistry {
 	permit2_deployments: HashMap<u64, Address>,
 	/// EIP-3009 capable tokens by chain ID
 	eip3009_tokens: HashMap<u64, HashSet<Address>>,
+	/// Runtime cache for RPC-detected EIP-3009 support, including negative results.
+	eip3009_detection_cache: DashMap<(u64, Address), bool>,
 }
 
 impl Default for ProtocolRegistry {
@@ -29,6 +32,7 @@ impl Default for ProtocolRegistry {
 		let mut registry = Self {
 			permit2_deployments: HashMap::new(),
 			eip3009_tokens: HashMap::new(),
+			eip3009_detection_cache: DashMap::new(),
 		};
 
 		// Configure Permit2 deployments (using canonical address for most chains)
@@ -125,10 +129,18 @@ impl ProtocolRegistry {
 			return true;
 		}
 
+		if let Some(cached) = self.eip3009_detection_cache.get(&(chain_id, token_address)) {
+			return *cached;
+		}
+
 		// Detect via RPC using function selector
-		self.detect_eip3009_via_rpc(chain_id, token_address, delivery_service)
+		let detected = self
+			.detect_eip3009_via_rpc(chain_id, token_address, delivery_service)
 			.await
-			.unwrap_or(false)
+			.unwrap_or(false);
+		self.eip3009_detection_cache
+			.insert((chain_id, token_address), detected);
+		detected
 	}
 
 	/// Detects EIP-3009 support by checking for RECEIVE_WITH_AUTHORIZATION_TYPEHASH constant
@@ -199,6 +211,10 @@ pub struct TokenCapabilities {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use solver_delivery::{
+		DeliveryError, DeliveryInterface, DeliveryService, MockDeliveryInterface,
+	};
+	use std::{collections::HashMap, sync::Arc};
 
 	#[test]
 	fn test_permit2_availability() {
@@ -239,5 +255,32 @@ mod tests {
 			.unwrap();
 		assert!(!registry.supports_eip3009(1, random_token));
 		assert!(!registry.supports_eip3009(31337, random_token)); // Random token shouldn't be supported
+	}
+
+	#[tokio::test]
+	async fn caches_negative_eip3009_rpc_detection() {
+		let registry = ProtocolRegistry::default();
+		let token: Address = "0x1111111111111111111111111111111111111111"
+			.parse()
+			.unwrap();
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_eth_call().times(1).returning(|_| {
+			Box::pin(async { Err(DeliveryError::Network("unsupported selector".to_string())) })
+		});
+
+		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+		implementations.insert(1, Arc::new(mock_delivery));
+		let delivery_service = Arc::new(DeliveryService::new(implementations, 1, 60, 60));
+
+		let first = registry
+			.supports_eip3009_with_rpc(1, token, delivery_service.clone())
+			.await;
+		let second = registry
+			.supports_eip3009_with_rpc(1, token, delivery_service)
+			.await;
+
+		assert!(!first);
+		assert!(!second);
 	}
 }

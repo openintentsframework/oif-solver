@@ -145,6 +145,16 @@ Transfers in `needs_intervention` lock the pair and require admin action via `PO
 | `mark_failed` | Funds are confirmed lost or unrecoverable |
 | `retry` | Resets failure count and restores previous status for the monitor to re-attempt |
 
+### Insufficient Native Gas
+
+If a transfer enters `needs_intervention` with a reason containing `Insufficient native gas`, the solver did not submit the transaction. The signer address did not have enough native gas token to cover the up-front reservation:
+
+```text
+gas_limit * max_fee_per_gas + value
+```
+
+Top up the solver EOA on the source chain, then use the resolve endpoint with `retry` for the affected transfer. The `statusReason` includes the current balance, required wei, and shortfall wei.
+
 ## API Endpoints
 
 All under `/api/v1/admin/rebalance/`. See `api-spec/rebalance-api.yaml` for the full OpenAPI spec.

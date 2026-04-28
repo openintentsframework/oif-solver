@@ -162,7 +162,7 @@ mod tests {
 
 	/// Creates a mock DeliveryService for testing
 	fn create_mock_delivery_service() -> Arc<DeliveryService> {
-		Arc::new(DeliveryService::new(HashMap::new(), 1, 20))
+		Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60))
 	}
 
 	/// Creates a test OrderInput with the given asset address and chain ID

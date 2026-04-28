@@ -779,7 +779,7 @@ mod tests {
 		));
 
 		let solver_address = Address(vec![1u8; 20]);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
 
 		let strategy_config = serde_json::Value::Object(serde_json::Map::new());

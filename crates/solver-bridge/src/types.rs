@@ -205,6 +205,58 @@ pub struct PendingBridgeTransfer {
 	/// Unix timestamp when the redeem tx was first observed missing.
 	#[serde(default)]
 	pub redeem_missing_since: Option<u64>,
+	/// Approve tx hash on the source chain (Composer or OFT approve). Persisted
+	/// immediately after broadcast so a slow approve confirmation does not lose
+	/// the only useful recovery pointer.
+	#[serde(default)]
+	pub approve_tx_hash: Option<String>,
+	/// Number of consecutive polls where the stored approve tx was not found on-chain.
+	/// Mirrors `submitted_missing_checks` for the source-side allowance step.
+	#[serde(default)]
+	pub approve_missing_checks: u32,
+	/// Unix timestamp when the approve tx was first observed missing.
+	#[serde(default)]
+	pub approve_missing_since: Option<u64>,
+	/// Unix timestamp when the FIRST approve was broadcast for this transfer
+	/// (set by `rebalance_token` when persisting the first `approve_tx_hash`,
+	/// preserved across re-broadcasts). Used to enforce an absolute approve-phase
+	/// timeout (`APPROVE_PHASE_TIMEOUT_SECS`) so a low-gas approve cannot stay
+	/// pending forever just because `tx_exists` keeps returning true. Distinct
+	/// from `updated_at`, which the monitor refreshes on every persist.
+	#[serde(default)]
+	pub approve_submitted_at: Option<u64>,
+	/// Marker that this transfer was once in the approve phase. Set when
+	/// `approve_tx_hash` is first persisted. Stays `true` even after a stale
+	/// hash is cleared. Lets the monitor distinguish "never broadcast"
+	/// (impossible-state branch) from "broadcast then cleared, awaiting
+	/// re-broadcast" (recovery branch).
+	#[serde(default)]
+	pub approve_was_broadcast: bool,
+	/// Crash-window guard for the deposit phase. Set to `true` AND persisted
+	/// immediately BEFORE calling `bridge.bridge_asset` for the deposit.
+	/// On `Ok` the same save that writes `tx_hash` leaves this `true`; on
+	/// `Err(ApprovePending)` it is rolled back to `false` (no deposit was
+	/// attempted — only a fresh approve broadcast). The monitor escalates to
+	/// `NeedsIntervention` if it sees `bridge_submit_attempted == true &&
+	/// tx_hash.is_none()`, because the deposit MAY have broadcast and we have
+	/// no hash to recover with — auto-retrying could double-spend.
+	#[serde(default)]
+	pub bridge_submit_attempted: bool,
+	/// Source-side ERC-20/share token (canonical "0x…" form). Used by the
+	/// allowance precheck helper. Snapshot at submission time — config can
+	/// change after the transfer starts; we resume from this snapshot.
+	#[serde(default)]
+	pub source_token_address: Option<String>,
+	/// OFT contract on source chain (used as `spender` in OFT-send flow).
+	#[serde(default)]
+	pub source_oft_address: Option<String>,
+	/// Recipient address on the destination chain.
+	#[serde(default)]
+	pub recipient_address: Option<String>,
+	/// Minimum amount to receive (slippage floor). Decimal string of `U256`,
+	/// matches `BridgeRequest::min_amount` semantics. `None` means no floor.
+	#[serde(default)]
+	pub min_amount: Option<String>,
 }
 
 impl PendingBridgeTransfer {
@@ -255,6 +307,16 @@ impl PendingBridgeTransfer {
 			submitted_missing_since: None,
 			redeem_missing_checks: 0,
 			redeem_missing_since: None,
+			approve_tx_hash: None,
+			approve_missing_checks: 0,
+			approve_missing_since: None,
+			approve_submitted_at: None,
+			approve_was_broadcast: false,
+			bridge_submit_attempted: false,
+			source_token_address: None,
+			source_oft_address: None,
+			recipient_address: None,
+			min_amount: None,
 		}
 	}
 

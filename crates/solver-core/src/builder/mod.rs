@@ -6,6 +6,7 @@
 //! settlement and execution strategies.
 
 use crate::engine::{event_bus::EventBus, SolverEngine};
+use alloy_primitives::U256;
 use solver_account::{AccountError, AccountInterface, AccountService};
 use solver_config::Config;
 use solver_delivery::{DeliveryError, DeliveryInterface, DeliveryService};
@@ -20,6 +21,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
+
+fn native_gas_reserve_shortfall(balance: U256, configured_reserve: U256) -> Option<U256> {
+	(balance < configured_reserve).then(|| configured_reserve.saturating_sub(balance))
+}
 
 /// Errors that can occur during solver engine construction.
 ///
@@ -305,6 +310,7 @@ impl SolverBuilder {
 			delivery_implementations,
 			self.static_config.delivery.min_confirmations,
 			self.static_config.solver.monitoring_timeout_seconds,
+			self.static_config.delivery.tx_confirmation_timeout_seconds,
 		));
 
 		// Create discovery implementations
@@ -604,6 +610,64 @@ impl SolverBuilder {
 			},
 		}
 
+		if let Some(ref rebalance) = self.static_config.rebalance {
+			if rebalance.enabled {
+				let solver_address_str = solver_address.to_string();
+				for (chain_id, reserve_wei) in &rebalance.min_native_gas_reserve {
+					let configured_reserve = match U256::from_str_radix(reserve_wei, 10) {
+						Ok(value) => value,
+						Err(e) => {
+							tracing::warn!(
+								chain_id,
+								configured_min_native_gas_reserve_wei = %reserve_wei,
+								error = %e,
+								"Invalid min_native_gas_reserve value; skipping low native gas warning"
+							);
+							continue;
+						},
+					};
+
+					match delivery
+						.get_balance(*chain_id, &solver_address_str, None)
+						.await
+					{
+						Ok(balance_wei) => match U256::from_str_radix(&balance_wei, 10) {
+							Ok(balance) => {
+								if let Some(shortfall) =
+									native_gas_reserve_shortfall(balance, configured_reserve)
+								{
+									tracing::warn!(
+										chain_id,
+										signer = %solver_address_str,
+										balance_wei = %balance,
+										configured_min_native_gas_reserve_wei = %configured_reserve,
+										shortfall_wei = %shortfall,
+										"Low native gas balance for rebalance signer"
+									);
+								}
+							},
+							Err(e) => {
+								tracing::warn!(
+									chain_id,
+									balance_wei = %balance_wei,
+									error = %e,
+									"Could not parse native balance for rebalance gas reserve warning"
+								);
+							},
+						},
+						Err(e) => {
+							tracing::warn!(
+								chain_id,
+								signer = %solver_address_str,
+								error = %e,
+								"Could not read native balance for rebalance gas reserve warning"
+							);
+						},
+					}
+				}
+			}
+		}
+
 		// Construct BridgeService if rebalance is configured and enabled
 		let bridge_service = if let Some(ref rebalance) = self.static_config.rebalance {
 			if rebalance.enabled {
@@ -666,5 +730,29 @@ impl SolverBuilder {
 			token_manager,
 			bridge_service,
 		))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn native_gas_reserve_shortfall_warns_when_balance_is_below_configured_reserve() {
+		let shortfall = native_gas_reserve_shortfall(U256::from(10u64), U256::from(30u64));
+
+		assert_eq!(shortfall, Some(U256::from(20u64)));
+	}
+
+	#[test]
+	fn native_gas_reserve_shortfall_is_none_when_balance_meets_configured_reserve() {
+		assert_eq!(
+			native_gas_reserve_shortfall(U256::from(30u64), U256::from(30u64)),
+			None
+		);
+		assert_eq!(
+			native_gas_reserve_shortfall(U256::from(31u64), U256::from(30u64)),
+			None
+		);
 	}
 }

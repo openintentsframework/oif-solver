@@ -1848,7 +1848,7 @@ mod tests {
 
 	fn create_mock_delivery_service() -> Arc<DeliveryService> {
 		let implementations = HashMap::new();
-		Arc::new(DeliveryService::new(implementations, 1, 3600))
+		Arc::new(DeliveryService::new(implementations, 1, 3600, 60))
 	}
 
 	fn create_mock_token_manager() -> Arc<TokenManager> {
@@ -2020,7 +2020,7 @@ mod tests {
 			Arc::new(mock_delivery_137) as Arc<dyn solver_delivery::DeliveryInterface>,
 		);
 
-		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 1, 3600));
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 1, 3600, 60));
 
 		// Create proper token manager with required tokens
 		let mut networks = solver_types::NetworksConfig::new();
@@ -2180,7 +2180,7 @@ mod tests {
 			Arc::new(mock_delivery_137) as Arc<dyn solver_delivery::DeliveryInterface>,
 		);
 
-		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 1, 3600));
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 1, 3600, 60));
 
 		let mut networks = solver_types::NetworksConfig::new();
 		let network_1 = solver_types::NetworkConfig {
@@ -2337,7 +2337,7 @@ mod tests {
 			Arc::new(mock_delivery_137) as Arc<dyn solver_delivery::DeliveryInterface>,
 		);
 
-		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 1, 3600));
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 1, 3600, 60));
 
 		// Create proper token manager with required tokens
 		let mut networks = solver_types::NetworksConfig::new();
@@ -3362,7 +3362,12 @@ mod tests {
 			137,
 			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 		);
-		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 137, 3600));
+		let delivery = Arc::new(DeliveryService::new(
+			delivery_implementations,
+			137,
+			3600,
+			60,
+		));
 
 		let mock_pricing = MockPricingInterface::new();
 		let mock_storage = MockStorageInterface::new();
@@ -3405,7 +3410,12 @@ mod tests {
 			137,
 			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 		);
-		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 137, 3600));
+		let delivery = Arc::new(DeliveryService::new(
+			delivery_implementations,
+			137,
+			3600,
+			60,
+		));
 
 		let mock_pricing = MockPricingInterface::new();
 		let mock_storage = MockStorageInterface::new();
@@ -3449,7 +3459,12 @@ mod tests {
 			137,
 			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 		);
-		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 137, 3600));
+		let delivery = Arc::new(DeliveryService::new(
+			delivery_implementations,
+			137,
+			3600,
+			60,
+		));
 
 		let mock_pricing = MockPricingInterface::new();
 		let mock_storage = MockStorageInterface::new();
@@ -3491,7 +3506,12 @@ mod tests {
 			137,
 			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 		);
-		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 137, 3600));
+		let delivery = Arc::new(DeliveryService::new(
+			delivery_implementations,
+			137,
+			3600,
+			60,
+		));
 
 		let mock_pricing = MockPricingInterface::new();
 		let mock_storage = MockStorageInterface::new();
@@ -3542,7 +3562,12 @@ mod tests {
 			137,
 			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 		);
-		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 137, 3600));
+		let delivery = Arc::new(DeliveryService::new(
+			delivery_implementations,
+			137,
+			3600,
+			60,
+		));
 
 		let mock_pricing = MockPricingInterface::new();
 		let mock_storage = MockStorageInterface::new();
@@ -3587,7 +3612,12 @@ mod tests {
 			137,
 			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 		);
-		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 137, 3600));
+		let delivery = Arc::new(DeliveryService::new(
+			delivery_implementations,
+			137,
+			3600,
+			60,
+		));
 
 		let mock_pricing = MockPricingInterface::new();
 		let mock_storage = MockStorageInterface::new();

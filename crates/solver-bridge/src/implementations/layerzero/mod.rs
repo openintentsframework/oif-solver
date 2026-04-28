@@ -34,12 +34,31 @@ fn to_solver_addr(addr: Address) -> solver_types::Address {
 /// OFT send() is still kept on a fixed gas limit to avoid changing the
 /// Katana -> Ethereum path while fixing the composer-only regression.
 const OFT_BRIDGE_TX_GAS_LIMIT: u64 = 500_000;
+/// Gas limit for ERC-20 `approve` txs. A real approve costs ~46k gas; 100k
+/// gives ~2× headroom. The wider `OFT_BRIDGE_TX_GAS_LIMIT` was historically
+/// reused for approves, but every signed tx forces the RPC to reserve
+/// `gas_limit × max_fee_per_gas` of native balance — so a 500k limit
+/// reservation is ~5× more native ETH than the operation actually needs.
+/// On a thin balance, this can push the reservation above on-hand funds and
+/// cause the upstream pool to silently drop the tx (returning a hash but
+/// never propagating).
+const ERC20_APPROVE_GAS_LIMIT: u64 = 100_000;
 /// Add 25% headroom on top of the estimated composer gas.
 const COMPOSER_GAS_BUFFER_BPS: u64 = 2_500;
 /// If estimateGas fails, still submit with a higher cap than the old 500k.
 const COMPOSER_FALLBACK_GAS_LIMIT: u64 = 1_200_000;
 /// Guardrail against a pathological estimate response.
 const COMPOSER_MAX_GAS_LIMIT: u64 = 2_000_000;
+/// Historical submit-and-confirm receipt polling budget.
+#[cfg(not(test))]
+const SUBMIT_CONFIRM_ATTEMPTS: u32 = 12;
+#[cfg(test)]
+const SUBMIT_CONFIRM_ATTEMPTS: u32 = 3;
+/// Historical submit-and-confirm receipt polling interval.
+#[cfg(not(test))]
+const SUBMIT_CONFIRM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const SUBMIT_CONFIRM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
 
 fn build_tx(
 	chain_id: u64,
@@ -58,6 +77,16 @@ fn build_tx(
 		gas_price: None,
 		max_fee_per_gas: None,
 		max_priority_fee_per_gas: None,
+	}
+}
+
+fn map_delivery_error(label: &str, error: solver_delivery::DeliveryError) -> BridgeError {
+	let msg = format!("{label} submit failed: {error}");
+	match error {
+		solver_delivery::DeliveryError::InsufficientNativeGas(_) => {
+			BridgeError::InsufficientNativeGas(msg)
+		},
+		_ => BridgeError::TransactionFailed(msg),
 	}
 }
 
@@ -130,12 +159,13 @@ impl LayerZeroBridge {
 		label: &str,
 	) -> Result<solver_types::TransactionHash, BridgeError> {
 		let chain_id = tx.chain_id;
-		let hash =
-			self.delivery.deliver(tx, None).await.map_err(|e| {
-				BridgeError::TransactionFailed(format!("{label} submit failed: {e}"))
-			})?;
+		let hash = self
+			.delivery
+			.deliver(tx, None)
+			.await
+			.map_err(|e| map_delivery_error(label, e))?;
 
-		for attempt in 1..=12 {
+		for attempt in 1..=SUBMIT_CONFIRM_ATTEMPTS {
 			match self.delivery.get_receipt(&hash, chain_id).await {
 				Ok(receipt) => {
 					if receipt.success {
@@ -146,12 +176,12 @@ impl LayerZeroBridge {
 						)));
 					}
 				},
-				Err(_) if attempt < 12 => {
-					tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+				Err(_) if attempt < SUBMIT_CONFIRM_ATTEMPTS => {
+					tokio::time::sleep(SUBMIT_CONFIRM_INTERVAL).await;
 				},
 				Err(e) => {
 					return Err(BridgeError::TransactionFailed(format!(
-						"{label} receipt not found after 12 attempts: {e}"
+						"{label} receipt not found after {SUBMIT_CONFIRM_ATTEMPTS} attempts: {e}"
 					)));
 				},
 			}
@@ -159,7 +189,13 @@ impl LayerZeroBridge {
 		unreachable!()
 	}
 
-	/// ETH → Katana: approve USDC to Composer, then call depositAndSend.
+	/// ETH → Katana: approve USDC to Composer (skipping when the existing
+	/// allowance is already sufficient), then call depositAndSend.
+	///
+	/// The approve phase intentionally uses the historical synchronous
+	/// submit-and-confirm path. A timed-out approve is a pre-deposit failure,
+	/// not a durable bridge attempt, so it should not leave the transfer in an
+	/// approval-resume loop.
 	async fn bridge_via_composer(
 		&self,
 		request: &BridgeRequest,
@@ -172,22 +208,48 @@ impl LayerZeroBridge {
 			.min_amount
 			.unwrap_or(request.amount * U256::from(95) / U256::from(100));
 
-		// Step 1: Approve USDC to Composer
-		let approve_data = contracts::approveCall {
-			spender: composer_addr,
-			amount: request.amount,
-		}
-		.abi_encode();
-
-		let approve_tx = build_tx(
-			request.source_chain,
-			request.source_token,
-			approve_data,
-			U256::ZERO,
-			Some(OFT_BRIDGE_TX_GAS_LIMIT),
-		);
-		self.submit_and_confirm(approve_tx, "Composer approve")
+		// Step 1: allowance precheck. If we already have enough allowance,
+		// skip approve entirely.
+		let current_allowance = self
+			.read_allowance(
+				request.source_chain,
+				request.source_token,
+				self.solver_address,
+				composer_addr,
+			)
 			.await?;
+
+		if current_allowance >= request.amount {
+			tracing::info!(
+				chain_id = request.source_chain,
+				current_allowance = %current_allowance,
+				requested = %request.amount,
+				"Allowance already sufficient; skipping Composer approve"
+			);
+		} else {
+			let approve_data = contracts::approveCall {
+				spender: composer_addr,
+				amount: request.amount,
+			}
+			.abi_encode();
+
+			let approve_tx = build_tx(
+				request.source_chain,
+				request.source_token,
+				approve_data,
+				U256::ZERO,
+				Some(ERC20_APPROVE_GAS_LIMIT),
+			);
+
+			self.submit_and_confirm(approve_tx, "Composer approve")
+				.await
+				.map_err(|e| match e {
+					BridgeError::InsufficientNativeGas(_) => e,
+					other => BridgeError::ApproveSubmitFailed {
+						error: other.to_string(),
+					},
+				})?;
+		}
 
 		// Step 2: Estimate fee
 		let fee = self.estimate_fee(request).await?;
@@ -216,10 +278,11 @@ impl LayerZeroBridge {
 			.await;
 		let mut deposit_tx = deposit_tx;
 		deposit_tx.gas_limit = Some(composer_gas_limit);
-		let tx_hash =
-			self.delivery.deliver(deposit_tx, None).await.map_err(|e| {
-				BridgeError::TransactionFailed(format!("depositAndSend failed: {e}"))
-			})?;
+		let tx_hash = self
+			.delivery
+			.deliver(deposit_tx, None)
+			.await
+			.map_err(|e| map_delivery_error("depositAndSend", e))?;
 
 		Ok(BridgeDepositResult {
 			tx_hash: format!("0x{}", hex::encode(&tx_hash.0)),
@@ -228,7 +291,13 @@ impl LayerZeroBridge {
 		})
 	}
 
-	/// Katana → ETH: approve shares to OFT, then call send().
+	/// Katana → ETH: approve shares to OFT (skipping when the existing
+	/// allowance is already sufficient), then call send().
+	///
+	/// The approve phase intentionally uses the historical synchronous
+	/// submit-and-confirm path. A timed-out approve is a pre-deposit failure,
+	/// not a durable bridge attempt, so it should not leave the transfer in an
+	/// approval-resume loop.
 	async fn bridge_via_oft_send(
 		&self,
 		request: &BridgeRequest,
@@ -240,21 +309,48 @@ impl LayerZeroBridge {
 			.min_amount
 			.unwrap_or(request.amount * U256::from(95) / U256::from(100));
 
-		// Step 1: Approve shares to OFT
-		let approve_data = contracts::approveCall {
-			spender: request.source_oft,
-			amount: request.amount,
-		}
-		.abi_encode();
+		// Step 1: allowance precheck. If we already have enough allowance,
+		// skip approve entirely.
+		let current_allowance = self
+			.read_allowance(
+				request.source_chain,
+				request.source_token,
+				self.solver_address,
+				request.source_oft,
+			)
+			.await?;
 
-		let approve_tx = build_tx(
-			request.source_chain,
-			request.source_token,
-			approve_data,
-			U256::ZERO,
-			Some(OFT_BRIDGE_TX_GAS_LIMIT),
-		);
-		self.submit_and_confirm(approve_tx, "OFT approve").await?;
+		if current_allowance >= request.amount {
+			tracing::info!(
+				chain_id = request.source_chain,
+				current_allowance = %current_allowance,
+				requested = %request.amount,
+				"Allowance already sufficient; skipping OFT approve"
+			);
+		} else {
+			let approve_data = contracts::approveCall {
+				spender: request.source_oft,
+				amount: request.amount,
+			}
+			.abi_encode();
+
+			let approve_tx = build_tx(
+				request.source_chain,
+				request.source_token,
+				approve_data,
+				U256::ZERO,
+				Some(ERC20_APPROVE_GAS_LIMIT),
+			);
+
+			self.submit_and_confirm(approve_tx, "OFT approve")
+				.await
+				.map_err(|e| match e {
+					BridgeError::InsufficientNativeGas(_) => e,
+					other => BridgeError::ApproveSubmitFailed {
+						error: other.to_string(),
+					},
+				})?;
+		}
 
 		// Step 2: Estimate fee
 		let fee = self.estimate_fee(request).await?;
@@ -293,12 +389,44 @@ impl LayerZeroBridge {
 			.delivery
 			.deliver(send_tx, None)
 			.await
-			.map_err(|e| BridgeError::TransactionFailed(format!("OFT send failed: {e}")))?;
+			.map_err(|e| map_delivery_error("OFT send", e))?;
 
 		Ok(BridgeDepositResult {
 			tx_hash: format!("0x{}", hex::encode(&tx_hash.0)),
 			message_guid: None,
 			estimated_arrival: None,
+		})
+	}
+
+	/// Reads the ERC-20 allowance for `owner -> spender` on `token` via the
+	/// public `DeliveryService::get_allowance` API.
+	///
+	/// Wraps the decimal string return value as `U256` so callers can compare
+	/// it directly against `request.amount`. No raw `eth_call` and no new ABI
+	/// binding — the bridge defers ERC-20 ABI encoding/decoding to the delivery
+	/// layer.
+	async fn read_allowance(
+		&self,
+		chain_id: u64,
+		token: alloy_primitives::Address,
+		owner: alloy_primitives::Address,
+		spender: alloy_primitives::Address,
+	) -> Result<U256, BridgeError> {
+		// Format addresses in the canonical "0x…" form get_allowance expects.
+		let owner_str = format!("0x{}", hex::encode(owner.as_slice()));
+		let spender_str = format!("0x{}", hex::encode(spender.as_slice()));
+		let token_str = format!("0x{}", hex::encode(token.as_slice()));
+
+		let allowance_str = self
+			.delivery
+			.get_allowance(chain_id, &owner_str, &spender_str, &token_str)
+			.await
+			.map_err(|e| BridgeError::TransactionFailed(format!("get_allowance failed: {e}")))?;
+
+		U256::from_str_radix(&allowance_str, 10).map_err(|e| {
+			BridgeError::TransactionFailed(format!(
+				"get_allowance returned non-numeric '{allowance_str}': {e}"
+			))
 		})
 	}
 }
@@ -642,6 +770,7 @@ mod tests {
 				]),
 				3,
 				300,
+				60,
 			)),
 			config: serde_json::from_value(bridge_config(composer)).unwrap(),
 			solver_address: solver_address(),
@@ -682,6 +811,10 @@ mod tests {
 		let submitted = Arc::new(Mutex::new(Vec::<Transaction>::new()));
 		let mut mock = MockDeliveryInterface::new();
 
+		// Allowance precheck returns 0 -> approve path is exercised.
+		mock.expect_get_allowance()
+			.returning(|_, _, _, _| Box::pin(async move { Ok("0".to_string()) }));
+
 		{
 			let submitted = submitted.clone();
 			mock.expect_submit().times(2).returning(move |tx, _| {
@@ -693,7 +826,7 @@ mod tests {
 			});
 		}
 
-		// submit_and_confirm polls get_receipt for the approve tx
+		// Approve receipt poll
 		mock.expect_get_receipt().returning(|_, _| {
 			Box::pin(async move {
 				Ok(TransactionReceipt {
@@ -759,6 +892,9 @@ mod tests {
 		let submitted = Arc::new(Mutex::new(Vec::<Transaction>::new()));
 		let mut mock = MockDeliveryInterface::new();
 
+		mock.expect_get_allowance()
+			.returning(|_, _, _, _| Box::pin(async move { Ok("0".to_string()) }));
+
 		{
 			let submitted = submitted.clone();
 			mock.expect_submit().times(2).returning(move |tx, _| {
@@ -822,6 +958,9 @@ mod tests {
 		let submitted = Arc::new(Mutex::new(Vec::<Transaction>::new()));
 		let mut mock = MockDeliveryInterface::new();
 
+		mock.expect_get_allowance()
+			.returning(|_, _, _, _| Box::pin(async move { Ok("0".to_string()) }));
+
 		{
 			let submitted = submitted.clone();
 			mock.expect_submit().times(2).returning(move |tx, _| {
@@ -877,6 +1016,11 @@ mod tests {
 		let fee = U256::from(12345u64);
 		let submitted = Arc::new(Mutex::new(Vec::<Transaction>::new()));
 		let mut mock = MockDeliveryInterface::new();
+
+		// Allowance precheck: zero -> proceed with approve.
+		mock.expect_get_allowance()
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok("0".to_string()) }));
 
 		{
 			let submitted = submitted.clone();
@@ -942,6 +1086,11 @@ mod tests {
 		let fee = U256::from(12345u64);
 		let submitted = Arc::new(Mutex::new(Vec::<Transaction>::new()));
 		let mut mock = MockDeliveryInterface::new();
+
+		// Allowance precheck: zero -> proceed with approve.
+		mock.expect_get_allowance()
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok("0".to_string()) }));
 
 		{
 			let submitted = submitted.clone();
@@ -1189,6 +1338,7 @@ mod tests {
 			)]),
 			3,
 			300,
+			60,
 		));
 
 		let result = create_bridge(
@@ -1256,5 +1406,217 @@ mod tests {
 			.expect("missing contract call");
 		// OFT flow: quoteSend is called on source_oft
 		assert_eq!(tx_to(&tx), request.source_oft);
+	}
+
+	#[tokio::test]
+	async fn read_allowance_returns_value_from_delivery_get_allowance() {
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_allowance()
+			.times(1)
+			.returning(|owner, spender, token, _chain_id| {
+				// Sanity-check the arg formatting expected by the production helper.
+				assert!(owner.starts_with("0x"));
+				assert!(spender.starts_with("0x"));
+				assert!(token.starts_with("0x"));
+				// 2.5 USDC = 2_500_000 (6 decimals), as a decimal string.
+				Box::pin(async move { Ok("2500000".to_string()) })
+			});
+
+		let bridge = bridge_with_two_chain_delivery(mock, None);
+
+		let token = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+			.parse()
+			.unwrap();
+		let owner = "0x33848cc530581b2cefef58cc9d3c935311d4b940"
+			.parse()
+			.unwrap();
+		let spender = "0x0000000000000000000000000000000000000001"
+			.parse()
+			.unwrap();
+
+		let allowance = bridge
+			.read_allowance(1, token, owner, spender)
+			.await
+			.unwrap();
+		assert_eq!(allowance, U256::from(2_500_000u64));
+	}
+
+	#[tokio::test]
+	async fn bridge_via_composer_skips_approve_when_allowance_sufficient() {
+		let composer = Address::from([0xCC; 20]);
+		let mut mock = MockDeliveryInterface::new();
+
+		// (1) Allowance precheck: huge value -> skip approve.
+		mock.expect_get_allowance()
+			.times(1)
+			.returning(|_, _, _, _| {
+				Box::pin(async move { Ok("999999999999999999999999".to_string()) })
+			});
+
+		// (2) eth_call covers ONLY the quoteSend (allowance no longer eth_call).
+		mock.expect_eth_call().times(1).returning(|_tx| {
+			let fee = contracts::MessagingFee {
+				nativeFee: U256::from(1u64),
+				lzTokenFee: U256::ZERO,
+			};
+			let bytes = contracts::IVaultComposerSync::quoteSendCall::abi_encode_returns(&fee);
+			Box::pin(async move { Ok(alloy_primitives::Bytes::from(bytes)) })
+		});
+
+		// (3) Deposit submit -- no approve submit.
+		mock.expect_submit()
+			.times(1)
+			.returning(|_, _| Box::pin(async move { Ok(TransactionHash(vec![0xde; 32])) }));
+		mock.expect_estimate_gas()
+			.returning(|_| Box::pin(async move { Ok(800_000u64) }));
+
+		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
+		let request = bridge_request();
+
+		let result = bridge.bridge_via_composer(&request).await;
+		assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+	}
+
+	#[tokio::test]
+	async fn bridge_via_composer_returns_approve_submit_failed_on_receipt_timeout() {
+		let composer = Address::from([0xCC; 20]);
+		let mut mock = MockDeliveryInterface::new();
+
+		mock.expect_get_allowance()
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok("0".to_string()) }));
+
+		let approve_hash = TransactionHash(vec![0xaa; 32]);
+		let approve_hash_clone = approve_hash.clone();
+		mock.expect_submit().times(1).returning(move |_, _| {
+			let h = approve_hash_clone.clone();
+			Box::pin(async move { Ok(h) })
+		});
+		mock.expect_get_receipt().returning(|_, _| {
+			Box::pin(async move { Err(DeliveryError::Network("not found".into())) })
+		});
+
+		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
+		let request = bridge_request();
+
+		let result = bridge.bridge_via_composer(&request).await;
+		let err = result.expect_err("expected Err");
+		match err {
+			BridgeError::ApproveSubmitFailed { error } => {
+				assert!(
+					error.contains("Composer approve receipt not found after"),
+					"unexpected error: {error}"
+				);
+			},
+			other => panic!("expected ApproveSubmitFailed, got {:?}", other),
+		}
+	}
+
+	#[test]
+	fn map_delivery_error_preserves_insufficient_native_gas() {
+		let err = DeliveryError::InsufficientNativeGas(Box::new(
+			solver_delivery::InsufficientNativeGasInfo {
+				chain_id: 1,
+				signer: "0xsolver".to_string(),
+				balance_wei: "10".to_string(),
+				required_wei: "30".to_string(),
+				shortfall_wei: "20".to_string(),
+				gas_limit: Some(100_000),
+				max_fee_per_gas: Some(2_000_000_000),
+				gas_price: None,
+				value_wei: "0".to_string(),
+			},
+		));
+
+		let bridge_error = map_delivery_error("Composer approve", err);
+
+		assert!(matches!(
+			bridge_error,
+			BridgeError::InsufficientNativeGas(reason)
+				if reason.contains("Composer approve submit failed")
+					&& reason.contains("shortfall 20 wei")
+		));
+	}
+
+	#[test]
+	fn map_delivery_error_preserves_transaction_failed_for_other_errors() {
+		let bridge_error = map_delivery_error(
+			"Composer approve",
+			DeliveryError::Network("rpc down".into()),
+		);
+
+		assert!(matches!(
+			bridge_error,
+			BridgeError::TransactionFailed(reason)
+				if reason.contains("Composer approve submit failed")
+					&& reason.contains("rpc down")
+		));
+	}
+
+	#[tokio::test]
+	async fn bridge_via_oft_send_skips_approve_when_allowance_sufficient() {
+		let mut mock = MockDeliveryInterface::new();
+
+		// (1) Allowance precheck: huge value -> skip approve.
+		mock.expect_get_allowance()
+			.times(1)
+			.returning(|_, _, _, _| {
+				Box::pin(async move { Ok("999999999999999999999999".to_string()) })
+			});
+
+		// (2) eth_call covers ONLY the OFT quoteSend (allowance no longer eth_call).
+		mock.expect_eth_call().times(1).returning(|_tx| {
+			let fee = contracts::MessagingFee {
+				nativeFee: U256::from(1u64),
+				lzTokenFee: U256::ZERO,
+			};
+			let bytes = contracts::IOFT::quoteSendCall::abi_encode_returns(&fee);
+			Box::pin(async move { Ok(alloy_primitives::Bytes::from(bytes)) })
+		});
+
+		// (3) Send submit -- no approve submit.
+		mock.expect_submit()
+			.times(1)
+			.returning(|_, _| Box::pin(async move { Ok(TransactionHash(vec![0xde; 32])) }));
+
+		let bridge = bridge_with_two_chain_delivery(mock, None);
+		let request = bridge_request();
+
+		let result = bridge.bridge_via_oft_send(&request).await;
+		assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+	}
+
+	#[tokio::test]
+	async fn bridge_via_oft_send_returns_approve_submit_failed_on_receipt_timeout() {
+		let mut mock = MockDeliveryInterface::new();
+
+		mock.expect_get_allowance()
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok("0".to_string()) }));
+
+		let approve_hash = TransactionHash(vec![0xaa; 32]);
+		let approve_hash_clone = approve_hash.clone();
+		mock.expect_submit().times(1).returning(move |_, _| {
+			let h = approve_hash_clone.clone();
+			Box::pin(async move { Ok(h) })
+		});
+		mock.expect_get_receipt().returning(|_, _| {
+			Box::pin(async move { Err(DeliveryError::Network("not found".into())) })
+		});
+
+		let bridge = bridge_with_two_chain_delivery(mock, None);
+		let request = bridge_request();
+
+		let result = bridge.bridge_via_oft_send(&request).await;
+		let err = result.expect_err("expected Err");
+		match err {
+			BridgeError::ApproveSubmitFailed { error } => {
+				assert!(
+					error.contains("OFT approve receipt not found after"),
+					"unexpected error: {error}"
+				);
+			},
+			other => panic!("expected ApproveSubmitFailed, got {:?}", other),
+		}
 	}
 }

@@ -810,7 +810,7 @@ mod tests {
 			Arc::new(mock_delivery_137) as Arc<dyn solver_delivery::DeliveryInterface>,
 		);
 
-		let delivery_service = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
+		let delivery_service = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
 
 		// Create tokens that match the test order data exactly
 		let input_token = solver_types::utils::tests::builders::TokenConfigBuilder::new()
@@ -935,7 +935,7 @@ mod tests {
 		let event_bus = EventBus::new(100);
 
 		// Create mock delivery service and token manager
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(), // empty networks config
 			delivery.clone(),
@@ -987,7 +987,7 @@ mod tests {
 		));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let event_bus = EventBus::new(100);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(),
 			delivery.clone(),
@@ -1044,7 +1044,7 @@ mod tests {
 		));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let event_bus = EventBus::new(100);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(),
 			delivery.clone(),
@@ -1097,7 +1097,7 @@ mod tests {
 		));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let event_bus = EventBus::new(100);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(),
 			delivery.clone(),
@@ -1212,7 +1212,7 @@ mod tests {
 		));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let event_bus = EventBus::new(100);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(),
 			delivery.clone(),
@@ -1312,7 +1312,7 @@ mod tests {
 		));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let event_bus = EventBus::new(100);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(),
 			delivery.clone(),
@@ -1382,7 +1382,7 @@ mod tests {
 		));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let event_bus = EventBus::new(100);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(),
 			delivery.clone(),
@@ -1457,7 +1457,7 @@ mod tests {
 		let event_bus = EventBus::new(100);
 		let mut receiver = event_bus.subscribe();
 
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(),
 			delivery.clone(),
@@ -1535,7 +1535,7 @@ mod tests {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let event_bus = EventBus::new(100);
 		let mut receiver = event_bus.subscribe();
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(),
 			delivery.clone(),
@@ -1637,7 +1637,7 @@ mod tests {
 		));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let event_bus = EventBus::new(100);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(),
 			delivery.clone(),
@@ -1729,7 +1729,7 @@ mod tests {
 		));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let event_bus = EventBus::new(100);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(),
 			delivery.clone(),
@@ -1781,7 +1781,7 @@ mod tests {
 		));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let event_bus = EventBus::new(100);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(),
 			delivery.clone(),
@@ -1871,7 +1871,7 @@ mod tests {
 		));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let event_bus = EventBus::new(100);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let token_manager = Arc::new(TokenManager::new(
 			Default::default(),
 			delivery.clone(),

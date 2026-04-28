@@ -35,6 +35,35 @@ impl ResettableNonceManager {
 		*entry
 	}
 
+	/// Replace the next-to-hand-out nonce for `address` exactly.
+	/// Use only after reading authoritative chain state; unlike
+	/// `set_next_nonce`, this may move the local cache backward to recover
+	/// from ghost broadcasts that advanced only the in-process counter.
+	pub fn reset_next_nonce(&self, address: Address, next: u64) -> u64 {
+		let mut cache = self.cache.lock().expect("nonce cache mutex poisoned");
+		cache.insert(address, next);
+		next
+	}
+
+	/// Reconcile the local next nonce with chain `pending`.
+	/// Moves forward when the chain has advanced and backward when local-only
+	/// ghost broadcasts made the cache run ahead of chain state.
+	pub fn reconcile_with_chain_pending(
+		&self,
+		address: Address,
+		chain_pending: u64,
+	) -> (Option<u64>, u64) {
+		let mut cache = self.cache.lock().expect("nonce cache mutex poisoned");
+		let before = cache.get(&address).copied();
+		let reconciled = match before {
+			Some(local) if local > chain_pending => chain_pending,
+			Some(local) => local.max(chain_pending),
+			None => chain_pending,
+		};
+		cache.insert(address, reconciled);
+		(before, reconciled)
+	}
+
 	/// Take the next nonce and advance the counter.
 	/// Returns `None` if no nonce has been cached yet for this address —
 	/// callers should fetch chain-pending and call `set_next_nonce` first.
@@ -131,6 +160,50 @@ mod tests {
 
 		assert_eq!(mgr.take_next(ADDR), Some(124));
 		assert_eq!(mgr.peek(ADDR), Some(125));
+	}
+
+	#[test]
+	fn reset_next_nonce_can_recover_from_local_cache_ahead_of_chain() {
+		let mgr = ResettableNonceManager::new();
+		mgr.set_next_nonce(ADDR, 139);
+		assert_eq!(mgr.take_next(ADDR), Some(139));
+		assert_eq!(mgr.take_next(ADDR), Some(140));
+		assert_eq!(mgr.peek(ADDR), Some(141));
+
+		// Chain pending is still 139 because the locally handed-out txs were
+		// ghost broadcasts. A real resync must be allowed to move backward.
+		assert_eq!(mgr.reset_next_nonce(ADDR, 139), 139);
+
+		assert_eq!(mgr.take_next(ADDR), Some(139));
+		assert_eq!(mgr.peek(ADDR), Some(140));
+	}
+
+	#[test]
+	fn reconcile_with_chain_pending_moves_backward_when_local_cache_is_ahead() {
+		let mgr = ResettableNonceManager::new();
+		mgr.set_next_nonce(ADDR, 141);
+
+		assert_eq!(
+			mgr.reconcile_with_chain_pending(ADDR, 139),
+			(Some(141), 139)
+		);
+
+		assert_eq!(mgr.take_next(ADDR), Some(139));
+		assert_eq!(mgr.peek(ADDR), Some(140));
+	}
+
+	#[test]
+	fn reconcile_with_chain_pending_moves_forward_when_chain_is_ahead() {
+		let mgr = ResettableNonceManager::new();
+		mgr.set_next_nonce(ADDR, 139);
+
+		assert_eq!(
+			mgr.reconcile_with_chain_pending(ADDR, 142),
+			(Some(139), 142)
+		);
+
+		assert_eq!(mgr.take_next(ADDR), Some(142));
+		assert_eq!(mgr.peek(ADDR), Some(143));
 	}
 
 	#[test]

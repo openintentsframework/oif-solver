@@ -125,6 +125,13 @@ pub struct DeliveryConfig {
 	/// Defaults to 3 confirmations if not specified.
 	#[serde(default = "default_confirmations")]
 	pub min_confirmations: u64,
+	/// Maximum time to wait for a submitted transaction to reach the configured
+	/// confirmation depth before surfacing an indeterminate result. Distinct
+	/// from `solver.monitoring_timeout_seconds`, which governs settlement-
+	/// readiness windows. The polling tx-confirmation watcher uses this; the
+	/// settlement readiness loop continues to use `monitoring_timeout_seconds`.
+	#[serde(default = "default_tx_confirmation_timeout_seconds")]
+	pub tx_confirmation_timeout_seconds: u64,
 }
 
 /// Returns the default number of confirmations required.
@@ -133,6 +140,11 @@ pub struct DeliveryConfig {
 /// when no explicit confirmation count is configured.
 fn default_confirmations() -> u64 {
 	3 // Default to 3 confirmations
+}
+
+/// Returns the default tx-confirmation timeout in seconds.
+fn default_tx_confirmation_timeout_seconds() -> u64 {
+	600 // 10 minutes — long enough for slow chains, short enough to surface stuck txs quickly
 }
 
 /// Returns the default monitoring timeout in seconds.
@@ -612,6 +624,18 @@ impl Config {
 		if self.delivery.min_confirmations > 100 {
 			return Err(ConfigError::Validation(
 				"min_confirmations cannot exceed 100".into(),
+			));
+		}
+
+		// Validate tx_confirmation_timeout_seconds is within reasonable bounds.
+		// Lower bound (30s) prevents busy-loop / spammy retries; upper bound (3600s)
+		// keeps this distinct from settlement-readiness windows, which use the
+		// separate `solver.monitoring_timeout_seconds` field.
+		if self.delivery.tx_confirmation_timeout_seconds < 30
+			|| self.delivery.tx_confirmation_timeout_seconds > 3600
+		{
+			return Err(ConfigError::Validation(
+				"tx_confirmation_timeout_seconds must be between 30 and 3600 seconds".into(),
 			));
 		}
 

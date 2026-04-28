@@ -269,7 +269,12 @@ mod tests {
 		);
 
 		// Create minimal mock services for TokenManager
-		let delivery = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(solver_delivery::DeliveryService::new(
+			HashMap::new(),
+			1,
+			20,
+			60,
+		));
 		let account = Arc::new(solver_account::AccountService::new(Box::new(
 			solver_account::implementations::local::LocalWallet::new(
 				"0x1234567890123456789012345678901234567890123456789012345678901234",
@@ -323,7 +328,12 @@ mod tests {
 			},
 		);
 
-		let delivery = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(solver_delivery::DeliveryService::new(
+			HashMap::new(),
+			1,
+			20,
+			60,
+		));
 		let account = Arc::new(solver_account::AccountService::new(Box::new(
 			solver_account::implementations::local::LocalWallet::new(
 				"0x1234567890123456789012345678901234567890123456789012345678901234",
@@ -417,7 +427,12 @@ mod tests {
 		let solver_address = Address(vec![1u8; 20]);
 
 		// Create delivery service - using empty implementations map for testing
-		let delivery = Arc::new(solver_delivery::DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(solver_delivery::DeliveryService::new(
+			HashMap::new(),
+			1,
+			20,
+			60,
+		));
 
 		// Create discovery service - using empty implementations map for testing
 		let discovery = Arc::new(solver_discovery::DiscoveryService::new(HashMap::new()));
