@@ -22,8 +22,7 @@ use std::time::Duration;
 
 /// Seed node URL. Override via `REDIS_CLUSTER_TEST_URL` env var.
 fn cluster_url() -> String {
-	std::env::var("REDIS_CLUSTER_TEST_URL")
-		.unwrap_or_else(|_| "redis://127.0.0.1:7100".to_string())
+	std::env::var("REDIS_CLUSTER_TEST_URL").unwrap_or_else(|_| "redis://127.0.0.1:7100".to_string())
 }
 
 fn make_storage(prefix: &str) -> Arc<RedisStorage> {

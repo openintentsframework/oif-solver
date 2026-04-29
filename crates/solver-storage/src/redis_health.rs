@@ -135,9 +135,7 @@ pub async fn check_redis_health(
 			.await
 			.map_err(|e| RedisHealthError::CheckFailed(e.to_string()))?;
 		map.into_values().next().ok_or_else(|| {
-			RedisHealthError::CheckFailed(
-				"Cluster INFO returned no node responses".to_string(),
-			)
+			RedisHealthError::CheckFailed("Cluster INFO returned no node responses".to_string())
 		})?
 	} else {
 		let client = redis::Client::open(redis_url)

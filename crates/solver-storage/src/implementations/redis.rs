@@ -399,27 +399,53 @@ impl RedisStorage {
 
 		// If this key already had index memberships, remove it from the old sets first.
 		// This keeps same-ID overwrites from lingering in stale status buckets.
-		let existing_index_keys: Vec<String> = dispatch_redis!(self, conn, "update_indexes_get_existing_meta", smembers(&index_meta_key));
+		let existing_index_keys: Vec<String> = dispatch_redis!(
+			self,
+			conn,
+			"update_indexes_get_existing_meta",
+			smembers(&index_meta_key)
+		);
 
 		for idx_key in &existing_index_keys {
-			let _: () = dispatch_redis!(self, conn, "update_indexes_remove_existing_field", srem(idx_key, key));
+			let _: () = dispatch_redis!(
+				self,
+				conn,
+				"update_indexes_remove_existing_field",
+				srem(idx_key, key)
+			);
 		}
 
 		if !existing_index_keys.is_empty() {
-			let _: () = dispatch_redis!(self, conn, "update_indexes_delete_existing_meta", del(&index_meta_key));
+			let _: () = dispatch_redis!(
+				self,
+				conn,
+				"update_indexes_delete_existing_meta",
+				del(&index_meta_key)
+			);
 		}
 
 		// Add to all-IDs set for the namespace
 		let all_ids_key = self.all_ids_key(namespace);
-		let _: () = dispatch_redis!(self, conn, "update_indexes_add_all", sadd(&all_ids_key, key));
+		let _: () = dispatch_redis!(
+			self,
+			conn,
+			"update_indexes_add_all",
+			sadd(&all_ids_key, key)
+		);
 
 		// Set TTL on the all-IDs set if configured
 		if let Some(ttl) = ttl {
 			// Get current TTL and only set if not already set or if new TTL is longer
-			let current_ttl: i64 = dispatch_redis!(self, conn, "update_indexes_get_ttl", ttl(&all_ids_key));
+			let current_ttl: i64 =
+				dispatch_redis!(self, conn, "update_indexes_get_ttl", ttl(&all_ids_key));
 
 			if current_ttl < 0 || (current_ttl as u64) < ttl.as_secs() {
-				let _: () = dispatch_redis!(self, conn, "update_indexes_expire_all", expire(&all_ids_key, ttl.as_secs() as i64));
+				let _: () = dispatch_redis!(
+					self,
+					conn,
+					"update_indexes_expire_all",
+					expire(&all_ids_key, ttl.as_secs() as i64)
+				);
 			}
 		}
 
@@ -429,17 +455,28 @@ impl RedisStorage {
 		// Add to field-specific indexes
 		for (field, value) in &indexes.fields {
 			let index_key = self.index_key(namespace, field, value);
-			let _: () = dispatch_redis!(self, conn, "update_indexes_add_field", sadd(&index_key, key));
+			let _: () = dispatch_redis!(
+				self,
+				conn,
+				"update_indexes_add_field",
+				sadd(&index_key, key)
+			);
 
 			// Track this index key for cleanup
 			index_keys_for_meta.push(index_key.clone());
 
 			// Set TTL on index key
 			if let Some(ttl) = ttl {
-				let current_ttl: i64 = dispatch_redis!(self, conn, "update_indexes_get_field_ttl", ttl(&index_key));
+				let current_ttl: i64 =
+					dispatch_redis!(self, conn, "update_indexes_get_field_ttl", ttl(&index_key));
 
 				if current_ttl < 0 || (current_ttl as u64) < ttl.as_secs() {
-					let _: () = dispatch_redis!(self, conn, "update_indexes_expire_field", expire(&index_key, ttl.as_secs() as i64));
+					let _: () = dispatch_redis!(
+						self,
+						conn,
+						"update_indexes_expire_field",
+						expire(&index_key, ttl.as_secs() as i64)
+					);
 				}
 			}
 		}
@@ -447,12 +484,22 @@ impl RedisStorage {
 		// Store index metadata (which index keys reference this data key)
 		if !index_keys_for_meta.is_empty() {
 			for idx_key in &index_keys_for_meta {
-				let _: () = dispatch_redis!(self, conn, "update_indexes_add_meta", sadd(&index_meta_key, idx_key));
+				let _: () = dispatch_redis!(
+					self,
+					conn,
+					"update_indexes_add_meta",
+					sadd(&index_meta_key, idx_key)
+				);
 			}
 
 			// Set TTL on index metadata key
 			if let Some(ttl) = ttl {
-				let _: () = dispatch_redis!(self, conn, "update_indexes_expire_meta", expire(&index_meta_key, ttl.as_secs() as i64));
+				let _: () = dispatch_redis!(
+					self,
+					conn,
+					"update_indexes_expire_meta",
+					expire(&index_meta_key, ttl.as_secs() as i64)
+				);
 			}
 		}
 
@@ -471,22 +518,38 @@ impl RedisStorage {
 
 		// Remove from all-IDs set
 		let all_ids_key = self.all_ids_key(namespace);
-		let _: () = dispatch_redis!(self, conn, "remove_from_indexes_all", srem(&all_ids_key, key));
+		let _: () = dispatch_redis!(
+			self,
+			conn,
+			"remove_from_indexes_all",
+			srem(&all_ids_key, key)
+		);
 
 		// Get index metadata to find all field-specific index keys
 		let index_meta_key = self.index_meta_key(key);
-		let index_keys: Vec<String> = dispatch_redis!(self, conn, "remove_from_indexes_get_meta", smembers(&index_meta_key));
+		let index_keys: Vec<String> = dispatch_redis!(
+			self,
+			conn,
+			"remove_from_indexes_get_meta",
+			smembers(&index_meta_key)
+		);
 
 		// Remove this key from all field-specific index sets
 		let mut removed_count = 0;
 		for idx_key in &index_keys {
-			let _: () = dispatch_redis!(self, conn, "remove_from_indexes_field", srem(idx_key, key));
+			let _: () =
+				dispatch_redis!(self, conn, "remove_from_indexes_field", srem(idx_key, key));
 			removed_count += 1;
 		}
 
 		// Delete the index metadata key itself
 		if !index_keys.is_empty() {
-			let _: () = dispatch_redis!(self, conn, "remove_from_indexes_del_meta", del(&index_meta_key));
+			let _: () = dispatch_redis!(
+				self,
+				conn,
+				"remove_from_indexes_del_meta",
+				del(&index_meta_key)
+			);
 		}
 
 		debug!(key = %key, namespace = %namespace, removed_indexes = removed_count, "removed from indexes");
@@ -542,7 +605,12 @@ impl StorageInterface for RedisStorage {
 		// Store data with or without TTL
 		match effective_ttl {
 			Some(ttl) if !ttl.is_zero() => {
-				let _: () = dispatch_redis!(self, conn, "set_bytes_ex", set_ex(&redis_key, &value, ttl.as_secs()));
+				let _: () = dispatch_redis!(
+					self,
+					conn,
+					"set_bytes_ex",
+					set_ex(&redis_key, &value, ttl.as_secs())
+				);
 				debug!(key = %key, ttl_secs = ttl.as_secs(), "stored data with TTL");
 			},
 			_ => {
@@ -613,9 +681,15 @@ impl StorageInterface for RedisStorage {
 				let all_ids_key = self.all_ids_key(namespace);
 				let index_key = self.index_key(namespace, &field, &value);
 
-				let all_ids: Vec<String> = dispatch_redis!(self, conn, "query_not_equals_all", smembers(&all_ids_key));
+				let all_ids: Vec<String> =
+					dispatch_redis!(self, conn, "query_not_equals_all", smembers(&all_ids_key));
 
-				let excluded_ids: Vec<String> = dispatch_redis!(self, conn, "query_not_equals_excluded", smembers(&index_key));
+				let excluded_ids: Vec<String> = dispatch_redis!(
+					self,
+					conn,
+					"query_not_equals_excluded",
+					smembers(&index_key)
+				);
 
 				let excluded_set: std::collections::HashSet<_> = excluded_ids.into_iter().collect();
 				all_ids
@@ -629,7 +703,8 @@ impl StorageInterface for RedisStorage {
 
 				for value in values {
 					let index_key = self.index_key(namespace, &field, &value);
-					let ids: Vec<String> = dispatch_redis!(self, conn, "query_in", smembers(&index_key));
+					let ids: Vec<String> =
+						dispatch_redis!(self, conn, "query_in", smembers(&index_key));
 					result_ids.extend(ids);
 				}
 
@@ -638,12 +713,14 @@ impl StorageInterface for RedisStorage {
 			QueryFilter::NotIn(field, values) => {
 				// Get all IDs, then filter out those in any of the value sets
 				let all_ids_key = self.all_ids_key(namespace);
-				let all_ids: Vec<String> = dispatch_redis!(self, conn, "query_not_in_all", smembers(&all_ids_key));
+				let all_ids: Vec<String> =
+					dispatch_redis!(self, conn, "query_not_in_all", smembers(&all_ids_key));
 
 				let mut excluded_ids = std::collections::HashSet::new();
 				for value in values {
 					let index_key = self.index_key(namespace, &field, &value);
-					let ids: Vec<String> = dispatch_redis!(self, conn, "query_not_in_excluded", smembers(&index_key));
+					let ids: Vec<String> =
+						dispatch_redis!(self, conn, "query_not_in_excluded", smembers(&index_key));
 					excluded_ids.extend(ids);
 				}
 
@@ -660,7 +737,8 @@ impl StorageInterface for RedisStorage {
 			Vec::new()
 		} else {
 			let redis_keys: Vec<String> = keys.iter().map(|k| self.data_key(k)).collect();
-			let results: Vec<Option<Vec<u8>>> = dispatch_redis!(self, conn, "query_validate", mget(&redis_keys));
+			let results: Vec<Option<Vec<u8>>> =
+				dispatch_redis!(self, conn, "query_validate", mget(&redis_keys));
 			keys.into_iter()
 				.zip(results)
 				.filter_map(|(k, v)| v.map(|_| k))
@@ -681,7 +759,8 @@ impl StorageInterface for RedisStorage {
 		let redis_keys: Vec<String> = keys.iter().map(|k| self.data_key(k)).collect();
 
 		// Use MGET for efficient batch retrieval
-		let values: Vec<Option<Vec<u8>>> = dispatch_redis!(self, conn, "get_batch", mget(&redis_keys));
+		let values: Vec<Option<Vec<u8>>> =
+			dispatch_redis!(self, conn, "get_batch", mget(&redis_keys));
 
 		let mut results = Vec::new();
 		for (i, value) in values.into_iter().enumerate() {
@@ -724,22 +803,26 @@ impl StorageInterface for RedisStorage {
 			// SET key value NX EX seconds - returns "OK" if set, nil if key exists
 			let secs = ttl.as_secs();
 			let reply: Option<String> = match &mut conn {
-				RedisConn::Standalone(c) => redis::cmd("SET")
-					.arg(&redis_key)
-					.arg(&value)
-					.arg("NX")
-					.arg("EX")
-					.arg(secs)
-					.query_async(c)
-					.await,
-				RedisConn::Cluster(c) => redis::cmd("SET")
-					.arg(&redis_key)
-					.arg(&value)
-					.arg("NX")
-					.arg("EX")
-					.arg(secs)
-					.query_async(c)
-					.await,
+				RedisConn::Standalone(c) => {
+					redis::cmd("SET")
+						.arg(&redis_key)
+						.arg(&value)
+						.arg("NX")
+						.arg("EX")
+						.arg(secs)
+						.query_async(c)
+						.await
+				},
+				RedisConn::Cluster(c) => {
+					redis::cmd("SET")
+						.arg(&redis_key)
+						.arg(&value)
+						.arg("NX")
+						.arg("EX")
+						.arg(secs)
+						.query_async(c)
+						.await
+				},
 			}
 			.map_err(|e| self.map_redis_error(e, "set_nx"))?;
 			reply.is_some()
@@ -796,20 +879,24 @@ impl StorageInterface for RedisStorage {
 		let ttl_secs = ttl.map(|d| d.as_secs() as i64).unwrap_or(0);
 
 		let result: i64 = match &mut conn {
-			RedisConn::Standalone(c) => script
-				.key(&redis_key)
-				.arg(expected)
-				.arg(&new_value)
-				.arg(ttl_secs)
-				.invoke_async(c)
-				.await,
-			RedisConn::Cluster(c) => script
-				.key(&redis_key)
-				.arg(expected)
-				.arg(&new_value)
-				.arg(ttl_secs)
-				.invoke_async(c)
-				.await,
+			RedisConn::Standalone(c) => {
+				script
+					.key(&redis_key)
+					.arg(expected)
+					.arg(&new_value)
+					.arg(ttl_secs)
+					.invoke_async(c)
+					.await
+			},
+			RedisConn::Cluster(c) => {
+				script
+					.key(&redis_key)
+					.arg(expected)
+					.arg(&new_value)
+					.arg(ttl_secs)
+					.invoke_async(c)
+					.await
+			},
 		}
 		.map_err(|e| self.map_redis_error(e, "compare_and_swap"))?;
 
@@ -939,9 +1026,7 @@ pub async fn initialize_redis_connection(
 				"Redis cluster connection timeout after {timeout_ms}ms"
 			))
 		})?
-		.map_err(|e| {
-			StorageError::Backend(format!("Failed to create cluster connection: {e}"))
-		})?;
+		.map_err(|e| StorageError::Backend(format!("Failed to create cluster connection: {e}")))?;
 		RedisConn::Cluster(cluster_conn)
 	} else {
 		let redis_client = redis::Client::open(redis_url).map_err(|e| {
