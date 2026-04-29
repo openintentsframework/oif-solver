@@ -7,8 +7,8 @@ use crate::{
 	apis::admin::{
 		handle_add_admin, handle_add_token, handle_add_tokens, handle_approve_tokens,
 		handle_get_balances, handle_get_config, handle_get_fees, handle_get_gas, handle_get_nonce,
-		handle_get_types, handle_remove_admin, handle_remove_token, handle_update_fees,
-		handle_update_gas, handle_withdrawal, AdminApiState,
+		handle_get_types, handle_get_whitelist, handle_remove_admin, handle_remove_token,
+		handle_update_fees, handle_update_gas, handle_withdrawal, AdminApiState,
 	},
 	apis::health::handle_health,
 	apis::order::get_order_by_id,
@@ -346,8 +346,12 @@ pub async fn start_server(
 			.route("/balances", get(handle_get_balances))
 			.route("/nonce", get(handle_get_nonce).post(handle_get_nonce))
 			.route("/types", get(handle_get_types))
-			.route("/whitelist", post(handle_add_admin))
-			.route("/whitelist", delete(handle_remove_admin))
+			.route(
+				"/whitelist",
+				get(handle_get_whitelist)
+					.post(handle_add_admin)
+					.delete(handle_remove_admin),
+			)
 			.route("/tokens/batch", post(handle_add_tokens))
 			.route("/tokens", post(handle_add_token))
 			.route("/tokens", delete(handle_remove_token))
