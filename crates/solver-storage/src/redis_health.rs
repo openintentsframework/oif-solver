@@ -9,11 +9,11 @@
 //! use solver_storage::redis_health::{check_redis_health, check_redis_health_strict};
 //!
 //! // Basic check (uses INFO command, always works)
-//! let info = check_redis_health("redis://localhost:6379", 5000).await?;
+//! let info = check_redis_health("redis://localhost:6379", 5000, false).await?;
 //! println!("RDB: {}, AOF: {}", info.rdb_enabled, info.aof_enabled);
 //!
 //! // Strict check (tries CONFIG GET, falls back to INFO if denied)
-//! let info = check_redis_health_strict("redis://localhost:6379", 5000).await?;
+//! let info = check_redis_health_strict("redis://localhost:6379", 5000, false).await?;
 //! ```
 
 use std::collections::HashMap;
@@ -101,7 +101,7 @@ impl RedisPersistenceInfo {
 /// # Example
 ///
 /// ```rust,ignore
-/// let info = check_redis_health("redis://localhost:6379", 5000).await?;
+/// let info = check_redis_health("redis://localhost:6379", 5000, false).await?;
 /// if info.has_persistence() {
 ///     println!("Persistence is enabled");
 /// }
@@ -114,8 +114,6 @@ pub async fn check_redis_health(
 	let info: String = if cluster_mode {
 		// In cluster mode, INFO is non-routable and the cluster client fans
 		// it out to every master, returning a `map<node_addr, info_string>`.
-		// We pick any one node's reply — that's enough for the readiness
-		// signal (per-shard reporting is out of scope).
 		let cluster_client = redis::cluster::ClusterClient::new(vec![redis_url])
 			.map_err(|e| RedisHealthError::ConnectionFailed(e.to_string()))?;
 		let mut conn = tokio::time::timeout(
@@ -134,9 +132,7 @@ pub async fn check_redis_health(
 			.query_async(&mut conn)
 			.await
 			.map_err(|e| RedisHealthError::CheckFailed(e.to_string()))?;
-		map.into_values().next().ok_or_else(|| {
-			RedisHealthError::CheckFailed("Cluster INFO returned no node responses".to_string())
-		})?
+		return parse_cluster_info_persistence(map);
 	} else {
 		let client = redis::Client::open(redis_url)
 			.map_err(|e| RedisHealthError::ConnectionFailed(e.to_string()))?;
@@ -157,6 +153,63 @@ pub async fn check_redis_health(
 	};
 
 	parse_info_persistence(&info)
+}
+
+fn parse_cluster_info_persistence(
+	responses: HashMap<String, String>,
+) -> Result<RedisPersistenceInfo, RedisHealthError> {
+	if responses.is_empty() {
+		return Err(RedisHealthError::CheckFailed(
+			"Cluster INFO returned no node responses".to_string(),
+		));
+	}
+
+	let mut parsed = Vec::with_capacity(responses.len());
+	let mut entries: Vec<_> = responses.into_iter().collect();
+	entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+	for (node, info) in entries {
+		let parsed_info = parse_info_persistence(&info).map_err(|e| {
+			RedisHealthError::CheckFailed(format!("Cluster INFO parse failed for {node}: {e}"))
+		})?;
+		parsed.push((node, parsed_info));
+	}
+
+	let (baseline_node, baseline) = parsed
+		.first()
+		.expect("non-empty parsed responses after empty check");
+	let mismatches: Vec<String> = parsed
+		.iter()
+		.filter(|(_, info)| !same_persistence_state(info, baseline))
+		.map(|(node, info)| format!("{node}={}", persistence_signature(info)))
+		.collect();
+
+	if !mismatches.is_empty() {
+		return Err(RedisHealthError::CheckFailed(format!(
+			"Cluster INFO persistence mismatch; baseline {baseline_node}={}, mismatches: {}",
+			persistence_signature(baseline),
+			mismatches.join("; ")
+		)));
+	}
+
+	Ok(baseline.clone())
+}
+
+fn same_persistence_state(left: &RedisPersistenceInfo, right: &RedisPersistenceInfo) -> bool {
+	left.rdb_enabled == right.rdb_enabled
+		&& left.aof_enabled == right.aof_enabled
+		&& left.rdb_last_bgsave_status == right.rdb_last_bgsave_status
+		&& left.aof_last_rewrite_status == right.aof_last_rewrite_status
+}
+
+fn persistence_signature(info: &RedisPersistenceInfo) -> String {
+	format!(
+		"rdb={},aof={},rdb_status={},aof_status={}",
+		info.rdb_enabled,
+		info.aof_enabled,
+		info.rdb_last_bgsave_status,
+		info.aof_last_rewrite_status
+	)
 }
 
 /// Check Redis persistence using CONFIG GET command (stricter but may be blocked).
@@ -540,6 +593,62 @@ aof_enabled:0
 		assert!(!result.aof_enabled);
 		assert!(!result.rdb_enabled);
 		assert!(!result.has_persistence());
+	}
+
+	#[test]
+	fn test_parse_cluster_info_persistence_requires_node_responses() {
+		let err = parse_cluster_info_persistence(HashMap::new()).unwrap_err();
+		assert!(format!("{err}").contains("no node responses"));
+	}
+
+	#[test]
+	fn test_parse_cluster_info_persistence_accepts_matching_nodes() {
+		let mut responses = HashMap::new();
+		let info = r#"
+# Persistence
+rdb_last_save_time:1706500000
+rdb_last_bgsave_status:ok
+aof_enabled:1
+aof_last_rewrite_status:ok
+"#;
+		responses.insert("127.0.0.1:7100".to_string(), info.to_string());
+		responses.insert("127.0.0.1:7101".to_string(), info.to_string());
+
+		let result = parse_cluster_info_persistence(responses).unwrap();
+		assert!(result.rdb_enabled);
+		assert!(result.aof_enabled);
+	}
+
+	#[test]
+	fn test_parse_cluster_info_persistence_rejects_mismatched_nodes() {
+		let mut responses = HashMap::new();
+		responses.insert(
+			"127.0.0.1:7100".to_string(),
+			r#"
+# Persistence
+rdb_last_save_time:1706500000
+rdb_last_bgsave_status:ok
+aof_enabled:1
+aof_last_rewrite_status:ok
+"#
+			.to_string(),
+		);
+		responses.insert(
+			"127.0.0.1:7101".to_string(),
+			r#"
+# Persistence
+rdb_last_save_time:0
+rdb_last_bgsave_status:err
+aof_enabled:0
+aof_last_rewrite_status:unknown
+"#
+			.to_string(),
+		);
+
+		let err = parse_cluster_info_persistence(responses).unwrap_err();
+		let msg = format!("{err}");
+		assert!(msg.contains("persistence mismatch"));
+		assert!(msg.contains("127.0.0.1:7101"));
 	}
 
 	#[test]

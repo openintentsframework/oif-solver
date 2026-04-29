@@ -85,7 +85,7 @@
 //! docker run -d --name redis-stack -p 6379:6379 redis/redis-stack-server:latest
 //! ```
 
-use crate::{QueryFilter, StorageError, StorageIndexes, StorageInterface};
+use crate::{redact_url_credentials, QueryFilter, StorageError, StorageIndexes, StorageInterface};
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use redis::cluster_async::ClusterConnection;
@@ -217,7 +217,7 @@ pub struct RedisStorage {
 	/// TTL configuration for different storage keys.
 	ttl_config: TtlConfig,
 	/// When true, use the Redis Cluster client and force every key into a
-	/// single hash slot via the `{<key_prefix>}` hash tag (Task 5).
+	/// single hash slot via the `{<key_prefix>}` hash tag.
 	cluster_mode: bool,
 }
 
@@ -1044,7 +1044,8 @@ pub async fn initialize_redis_connection(
 		RedisConn::Standalone(connection_manager)
 	};
 
-	debug!(redis_url = %redis_url, cluster_mode = cluster_mode, "redis connection established");
+	let redacted_url = redact_url_credentials(redis_url);
+	debug!(redis_url = %redacted_url, cluster_mode = cluster_mode, "redis connection established");
 	Ok(Arc::new(conn))
 }
 
@@ -1063,6 +1064,31 @@ fn build_redis_url(redis_url: &str, db: u8) -> String {
 		// Append database number
 		format!("{}/{}", redis_url.trim_end_matches('/'), db)
 	}
+}
+
+fn resolve_redis_url_or_err(
+	config: &serde_json::Value,
+	redis_url: &str,
+	db: u8,
+) -> Result<(String, bool), StorageError> {
+	let cluster_mode = config
+		.get("cluster_mode")
+		.and_then(|v| v.as_bool())
+		.unwrap_or(false);
+
+	if cluster_mode && db != 0 {
+		return Err(StorageError::Configuration(
+			"cluster mode requires db=0 (Redis Cluster only supports database 0)".to_string(),
+		));
+	}
+
+	let full_redis_url = if cluster_mode {
+		redis_url.to_string()
+	} else {
+		build_redis_url(redis_url, db)
+	};
+
+	Ok((full_redis_url, cluster_mode))
 }
 
 /// Factory function to create a Redis storage backend from configuration.
@@ -1107,24 +1133,7 @@ pub fn create_storage(
 		.map(|v| v as u8)
 		.unwrap_or(0);
 
-	let cluster_mode = config
-		.get("cluster_mode")
-		.and_then(|v| v.as_bool())
-		.unwrap_or(false);
-
-	if cluster_mode && db != 0 {
-		return Err(StorageError::Configuration(
-			"cluster mode requires db=0 (Redis Cluster only supports database 0)".to_string(),
-		));
-	}
-
-	// In cluster mode, do NOT append `/db` to the URL — the Redis Cluster
-	// protocol does not support DB selection.
-	let full_redis_url = if cluster_mode {
-		redis_url.to_string()
-	} else {
-		build_redis_url(redis_url, db)
-	};
+	let (full_redis_url, cluster_mode) = resolve_redis_url_or_err(config, redis_url, db)?;
 	let ttl_config = TtlConfig::from_config(config);
 
 	// Create storage with lazy connection initialization
@@ -1172,22 +1181,7 @@ pub async fn create_storage_async(
 		.map(|v| v as u8)
 		.unwrap_or(0);
 
-	let cluster_mode = config
-		.get("cluster_mode")
-		.and_then(|v| v.as_bool())
-		.unwrap_or(false);
-
-	if cluster_mode && db != 0 {
-		return Err(StorageError::Configuration(
-			"cluster mode requires db=0 (Redis Cluster only supports database 0)".to_string(),
-		));
-	}
-
-	let full_redis_url = if cluster_mode {
-		redis_url.to_string()
-	} else {
-		build_redis_url(redis_url, db)
-	};
+	let (full_redis_url, cluster_mode) = resolve_redis_url_or_err(config, redis_url, db)?;
 	let ttl_config = TtlConfig::from_config(config);
 
 	let storage = RedisStorage::new(
@@ -2002,6 +1996,42 @@ mod tests {
 		});
 		let result = create_storage(&config);
 		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_resolve_redis_url_standalone_appends_db() {
+		let config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
+			"db": 2,
+		});
+		let (url, cluster_mode) =
+			resolve_redis_url_or_err(&config, "redis://localhost:6379", 2).unwrap();
+		assert_eq!(url, "redis://localhost:6379/2");
+		assert!(!cluster_mode);
+	}
+
+	#[test]
+	fn test_resolve_redis_url_cluster_mode_keeps_seed_url() {
+		let config = serde_json::json!({
+			"redis_url": "redis://127.0.0.1:7100",
+			"cluster_mode": true,
+			"db": 0,
+		});
+		let (url, cluster_mode) =
+			resolve_redis_url_or_err(&config, "redis://127.0.0.1:7100", 0).unwrap();
+		assert_eq!(url, "redis://127.0.0.1:7100");
+		assert!(cluster_mode);
+	}
+
+	#[test]
+	fn test_resolve_redis_url_cluster_mode_rejects_nonzero_db() {
+		let config = serde_json::json!({
+			"redis_url": "redis://127.0.0.1:7100",
+			"cluster_mode": true,
+			"db": 1,
+		});
+		let err = resolve_redis_url_or_err(&config, "redis://127.0.0.1:7100", 1).unwrap_err();
+		assert!(format!("{err}").contains("cluster mode requires db=0"));
 	}
 
 	#[test]

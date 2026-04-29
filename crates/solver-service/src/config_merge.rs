@@ -3094,7 +3094,31 @@ mod tests {
 	use rust_decimal::Decimal;
 	use serial_test::serial;
 	use solver_types::seed_overrides::AdminOverride;
+	use std::ffi::OsString;
 	use std::str::FromStr;
+
+	struct EnvVarGuard {
+		key: &'static str,
+		value: Option<OsString>,
+	}
+
+	impl EnvVarGuard {
+		fn capture(key: &'static str) -> Self {
+			Self {
+				key,
+				value: std::env::var_os(key),
+			}
+		}
+	}
+
+	impl Drop for EnvVarGuard {
+		fn drop(&mut self) {
+			match &self.value {
+				Some(value) => std::env::set_var(self.key, value),
+				None => std::env::remove_var(self.key),
+			}
+		}
+	}
 
 	fn test_seed_overrides() -> SeedOverrides {
 		SeedOverrides {
@@ -5843,6 +5867,7 @@ mod tests {
 	#[test]
 	#[serial_test::serial(env_redis)]
 	fn test_build_storage_config_from_operator_includes_cluster_mode_default_false() {
+		let _guard = EnvVarGuard::capture("REDIS_CLUSTER_MODE");
 		std::env::remove_var("REDIS_CLUSTER_MODE");
 		let storage = build_storage_config_from_operator("test-solver");
 		let redis_config = storage.implementations.get("redis").unwrap();
@@ -5859,6 +5884,7 @@ mod tests {
 	#[test]
 	#[serial_test::serial(env_redis)]
 	fn test_build_storage_config_from_operator_propagates_cluster_mode_true() {
+		let _guard = EnvVarGuard::capture("REDIS_CLUSTER_MODE");
 		std::env::set_var("REDIS_CLUSTER_MODE", "true");
 		let storage = build_storage_config_from_operator("test-solver");
 		let redis_config = storage.implementations.get("redis").unwrap();
@@ -5867,7 +5893,6 @@ mod tests {
 			.and_then(|v| v.as_bool())
 			.unwrap();
 		assert!(cluster_mode);
-		std::env::remove_var("REDIS_CLUSTER_MODE");
 	}
 
 	#[test]

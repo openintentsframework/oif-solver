@@ -1,17 +1,22 @@
 //! Integration tests for cluster-mode Redis storage.
 //!
-//! Run against the local 3-node cluster from `docker-compose.cluster.yml`:
+//! Run against the local single-shard cluster from `docker-compose.cluster.yml`:
 //! ```sh
 //!   docker compose -f docker-compose.cluster.yml up -d
 //!   cargo test -p solver-storage --features cluster-tests --test redis_cluster_integration
 //! ```
 //!
 //! The default seed URL is `redis://127.0.0.1:7100` — port 7000 conflicts
-//! with macOS AirPlay Receiver, hence the 7100-7102 range. Override with
-//! `REDIS_CLUSTER_TEST_URL` if your harness uses different ports.
+//! with macOS AirPlay Receiver, hence the 7100 default. Override with
+//! `REDIS_CLUSTER_TEST_URL` if your harness uses a different port.
 //!
 //! These tests are gated behind the `cluster-tests` feature so that default
 //! `cargo test` runs (without Docker) skip them.
+//!
+//! The local harness is intentionally single-shard; production uses AWS
+//! MemoryDB. These tests verify the cluster client path and the single-slot
+//! key-tag invariant. They do not prove CROSSSLOT behavior: a multi-shard
+//! Redis Cluster is needed to enforce that class of failures locally.
 
 #![cfg(feature = "cluster-tests")]
 
@@ -42,6 +47,30 @@ fn unique_prefix(suffix: &str) -> String {
 	format!("oif-test-{}-{}", uuid::Uuid::new_v4(), suffix)
 }
 
+#[test]
+#[serial_test::serial(cluster_test_url_env)]
+fn cluster_url_defaults_to_7100() {
+	let original = std::env::var_os("REDIS_CLUSTER_TEST_URL");
+	std::env::remove_var("REDIS_CLUSTER_TEST_URL");
+	assert_eq!(cluster_url(), "redis://127.0.0.1:7100");
+	match original {
+		Some(value) => std::env::set_var("REDIS_CLUSTER_TEST_URL", value),
+		None => std::env::remove_var("REDIS_CLUSTER_TEST_URL"),
+	}
+}
+
+#[test]
+#[serial_test::serial(cluster_test_url_env)]
+fn cluster_url_honors_env_override() {
+	let original = std::env::var_os("REDIS_CLUSTER_TEST_URL");
+	std::env::set_var("REDIS_CLUSTER_TEST_URL", "redis://127.0.0.1:7200");
+	assert_eq!(cluster_url(), "redis://127.0.0.1:7200");
+	match original {
+		Some(value) => std::env::set_var("REDIS_CLUSTER_TEST_URL", value),
+		None => std::env::remove_var("REDIS_CLUSTER_TEST_URL"),
+	}
+}
+
 #[tokio::test]
 async fn cluster_set_get_roundtrip() {
 	let storage = make_storage(&unique_prefix("setget"));
@@ -56,8 +85,8 @@ async fn cluster_set_get_roundtrip() {
 
 #[tokio::test]
 async fn cluster_get_batch_mget_works() {
-	// Proves MGET across 5 keys does NOT raise CROSSSLOT in cluster mode —
-	// regression guard for the single-slot hash tag (see spec §4.3).
+	// Smoke-tests `MGET` through the cluster client end-to-end. This runs
+	// against a single-shard cluster, so CROSSSLOT is not reachable locally.
 	let storage = make_storage(&unique_prefix("mget"));
 	for i in 0..5_u8 {
 		storage
@@ -141,7 +170,7 @@ async fn cluster_check_redis_health_succeeds() {
 	use solver_storage::redis_health::check_redis_health;
 	let info = check_redis_health(&cluster_url(), 5000, true)
 		.await
-		.expect("cluster INFO must succeed against the local 3-node cluster");
+		.expect("cluster INFO must succeed against the local single-shard cluster");
 	// The local Docker harness enables AOF (`--appendonly yes`); persistence
 	// is reported via INFO regardless of whether RDB or AOF is on, so just
 	// assert we got a parseable response.

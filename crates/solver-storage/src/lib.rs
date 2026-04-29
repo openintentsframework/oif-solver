@@ -411,7 +411,12 @@ pub fn create_storage_backend(
 pub fn parse_redis_cluster_mode_env() -> bool {
 	std::env::var("REDIS_CLUSTER_MODE")
 		.ok()
-		.map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+		.map(|v| {
+			matches!(
+				v.trim().to_ascii_lowercase().as_str(),
+				"1" | "true" | "yes" | "on"
+			)
+		})
 		.unwrap_or(false)
 }
 
@@ -781,7 +786,7 @@ mod tests {
 	#[test]
 	#[serial_test::serial(env_redis)]
 	fn test_parse_redis_cluster_mode_env_accepts_true_synonyms() {
-		for v in ["1", "true", "TRUE", "True", "yes", "on"] {
+		for v in ["1", "true", "TRUE", "True", "yes", "on", " true "] {
 			std::env::set_var("REDIS_CLUSTER_MODE", v);
 			assert!(
 				parse_redis_cluster_mode_env(),

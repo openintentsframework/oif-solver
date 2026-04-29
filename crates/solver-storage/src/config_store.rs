@@ -505,6 +505,16 @@ mod integration_tests {
 		store.delete().await.unwrap();
 	}
 
+	#[test]
+	fn test_create_redis_config_store_convenience_accepts_cluster_mode() {
+		let result = create_redis_config_store::<TestConfig>(
+			"redis://localhost:6379".to_string(),
+			unique_solver_id(),
+			true,
+		);
+		assert!(result.is_ok());
+	}
+
 	// ==================== Memory Backend Tests (No Redis Required) ====================
 
 	#[tokio::test]
