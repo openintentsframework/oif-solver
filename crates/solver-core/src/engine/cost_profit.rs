@@ -7,7 +7,7 @@
 
 use crate::engine::token_manager::{TokenManager, TokenManagerError};
 use alloy_primitives::{FixedBytes, B256, U256};
-use alloy_sol_types::SolCall;
+use alloy_sol_types::{sol, SolCall};
 use rust_decimal::Decimal;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
@@ -48,6 +48,117 @@ fn address20_to_bytes32(addr20: &[u8]) -> FixedBytes<32> {
 	let len = addr20.len().min(20);
 	buf[32 - len..].copy_from_slice(&addr20[..len]);
 	FixedBytes::<32>::from(buf)
+}
+
+sol! {
+	interface IHyperlaneOracleForQuote {
+		function submit(
+			uint32 destinationDomain,
+			address recipientOracle,
+			uint256 gasLimit,
+			bytes calldata customMetadata,
+			address source,
+			bytes[] calldata payloads
+		) external payable;
+
+		function quoteGasPayment(
+			uint32 destinationDomain,
+			address recipientOracle,
+			uint256 gasLimit,
+			bytes calldata customMetadata,
+			address source,
+			bytes[] calldata payloads
+		) external view returns (uint256);
+	}
+}
+
+fn quote_hyperlane_message_gas_limit(payload_size: usize) -> U256 {
+	let base_gas = 200000usize;
+	let gas_per_byte = 16usize;
+	let buffer = 100000usize;
+
+	U256::from(base_gas + (payload_size * gas_per_byte) + buffer)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_quote_hyperlane_fill_description(
+	solver_identifier: [u8; 32],
+	order_id: [u8; 32],
+	timestamp: u32,
+	token: [u8; 32],
+	amount: U256,
+	recipient: [u8; 32],
+	call_data: Vec<u8>,
+	context: Vec<u8>,
+) -> Result<Vec<u8>, APIError> {
+	if call_data.len() > u16::MAX as usize {
+		return Err(APIError::BadRequest {
+			error_type: ApiErrorType::InvalidRequest,
+			message: "Quote output calldata is too large for Hyperlane fill description".into(),
+			details: None,
+		});
+	}
+	if context.len() > u16::MAX as usize {
+		return Err(APIError::BadRequest {
+			error_type: ApiErrorType::InvalidRequest,
+			message: "Quote output context is too large for Hyperlane fill description".into(),
+			details: None,
+		});
+	}
+
+	let mut payload =
+		Vec::with_capacity(32 + 32 + 4 + 32 + 32 + 32 + 2 + call_data.len() + 2 + context.len());
+	payload.extend_from_slice(&solver_identifier);
+	payload.extend_from_slice(&order_id);
+	payload.extend_from_slice(&timestamp.to_be_bytes());
+	payload.extend_from_slice(&token);
+	payload.extend_from_slice(&amount.to_be_bytes::<32>());
+	payload.extend_from_slice(&recipient);
+	payload.extend_from_slice(&(call_data.len() as u16).to_be_bytes());
+	payload.extend_from_slice(&call_data);
+	payload.extend_from_slice(&(context.len() as u16).to_be_bytes());
+	payload.extend_from_slice(&context);
+	Ok(payload)
+}
+
+fn hyperlane_config_for_quote(config: &Config) -> Option<&serde_json::Value> {
+	let configured = config
+		.settlement
+		.implementations
+		.get(&config.settlement.primary)
+		.or_else(|| config.settlement.implementations.get("hyperlane"))?;
+
+	if configured.get("oracles").is_some() {
+		Some(configured)
+	} else {
+		configured.get("hyperlane")
+	}
+}
+
+fn first_hyperlane_oracle_for_quote(
+	hyperlane_config: &serde_json::Value,
+	direction: &str,
+	chain_id: u64,
+) -> Result<Option<Address>, APIError> {
+	let Some(value) = hyperlane_config
+		.get("oracles")
+		.and_then(|oracles| oracles.get(direction))
+		.and_then(|by_chain| by_chain.get(chain_id.to_string()))
+		.and_then(|addresses| addresses.as_array())
+		.and_then(|addresses| addresses.first())
+	else {
+		return Ok(None);
+	};
+
+	serde_json::from_value::<Address>(value.clone())
+		.map(Some)
+		.map_err(|e| APIError::BadRequest {
+			error_type: ApiErrorType::InvalidRequest,
+			message: format!(
+				"Invalid Hyperlane {direction} oracle address for chain {chain_id}: {e}"
+			),
+			details: None,
+		})
 }
 
 /// Parameters for gas unit calculations
@@ -480,11 +591,10 @@ impl CostProfitService {
 			claim_units,
 		};
 
-		// Optional: live-estimate the fill leg against the destination chain so
-		// quote-time cost matches what the validator will compute from the
-		// simulated fill at intent time. `open` and `claim` stay static — they
-		// can't be safely simulated pre-fill (open needs the user's permit; claim
-		// needs the Hyperlane proof of fill).
+		// Optional: live-estimate destination-chain legs against the destination
+		// chain so quote-time costs track the transactions the solver will send.
+		// `open` and `claim` stay static — they can't be safely simulated pre-fill
+		// (open needs the user's permit; claim needs the Hyperlane proof of fill).
 		let live_estimate_enabled = config
 			.gas
 			.as_ref()
@@ -521,6 +631,45 @@ impl CostProfitService {
 						chain_id = dest_chain_id,
 						error = %e,
 						"Skipping live fill estimate: failed to build synthetic fill tx"
+					);
+				},
+			}
+
+			match self
+				.build_post_fill_tx_for_quote(
+					request,
+					&swap_amounts_with_info,
+					config,
+					solver_address,
+				)
+				.await
+			{
+				Ok(Some(post_fill_tx)) => {
+					if let Some(live_units) = self
+						.try_live_post_fill_estimate(dest_chain_id, &post_fill_tx)
+						.await
+					{
+						tracing::info!(
+							chain_id = dest_chain_id,
+							static_units = gas_units.post_fill_units,
+							live_units,
+							"Quote-time post-fill gas estimated live"
+						);
+						gas_units.post_fill_units = live_units;
+					}
+					// None ⇒ fall through with static units (helper logged the reason).
+				},
+				Ok(None) => {
+					tracing::debug!(
+						chain_id = dest_chain_id,
+						"Skipping live post-fill estimate: no quote-time post-fill tx required"
+					);
+				},
+				Err(e) => {
+					tracing::warn!(
+						chain_id = dest_chain_id,
+						error = %e,
+						"Skipping live post-fill estimate: failed to build synthetic post-fill tx"
 					);
 				},
 			}
@@ -1239,6 +1388,42 @@ impl CostProfitService {
 		}
 	}
 
+	async fn try_live_post_fill_estimate(
+		&self,
+		dest_chain_id: u64,
+		post_fill_tx: &Transaction,
+	) -> Option<u64> {
+		match self
+			.delivery_service
+			.estimate_gas(dest_chain_id, post_fill_tx.clone())
+			.await
+		{
+			Ok(units) if units > 0 => {
+				tracing::debug!(
+					chain_id = dest_chain_id,
+					units,
+					"Live post-fill gas estimation succeeded"
+				);
+				Some(units)
+			},
+			Ok(_) => {
+				tracing::warn!(
+					chain_id = dest_chain_id,
+					"Live post-fill gas estimation returned zero; falling back to static default"
+				);
+				None
+			},
+			Err(e) => {
+				tracing::warn!(
+					chain_id = dest_chain_id,
+					error = %e,
+					"Live post-fill gas estimation failed; falling back to static default"
+				);
+				None
+			},
+		}
+	}
+
 	/// Build a synthetic fill `Transaction` from a resolved quote request, suitable
 	/// for `eth_estimateGas` against the destination chain's OutputSettler.
 	///
@@ -1403,6 +1588,205 @@ impl CostProfitService {
 			max_fee_per_gas: None,
 			max_priority_fee_per_gas: None,
 		})
+	}
+
+	/// Build a synthetic Hyperlane post-fill `submit(...)` transaction for
+	/// quote-time `eth_estimateGas`.
+	///
+	/// This mirrors `HyperlaneSettlement::generate_post_fill_transaction` for the
+	/// parts that determine gas units: selected output oracle, recipient input
+	/// oracle, source output settler, message gas limit, and fill-description
+	/// payload shape. It also performs the same `quoteGasPayment(...)` call and
+	/// attaches the resulting `value`, because some oracle deployments require
+	/// the payment even during `eth_estimateGas`.
+	async fn build_post_fill_tx_for_quote(
+		&self,
+		request: &GetQuoteRequest,
+		resolved_amounts: &std::collections::HashMap<InteropAddress, TokenAmountInfo>,
+		config: &Config,
+		solver_address: &Address,
+	) -> Result<Option<Transaction>, APIError> {
+		let Some(hyperlane_config) = hyperlane_config_for_quote(config) else {
+			return Ok(None);
+		};
+
+		let input = request
+			.intent
+			.inputs
+			.first()
+			.ok_or_else(|| APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: "Quote request has no inputs".into(),
+				details: None,
+			})?;
+		let output = request
+			.intent
+			.outputs
+			.first()
+			.ok_or_else(|| APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: "Quote request has no outputs".into(),
+				details: None,
+			})?;
+
+		let origin_chain_id =
+			input
+				.asset
+				.ethereum_chain_id()
+				.map_err(|e| APIError::BadRequest {
+					error_type: ApiErrorType::MissingChainId,
+					message: format!("Failed to derive origin chain id: {e}"),
+					details: None,
+				})?;
+		let dest_chain_id = output
+			.asset
+			.ethereum_chain_id()
+			.map_err(|e| APIError::BadRequest {
+				error_type: ApiErrorType::MissingChainId,
+				message: format!("Failed to derive destination chain id: {e}"),
+				details: None,
+			})?;
+
+		let Some(oracle_address) =
+			first_hyperlane_oracle_for_quote(hyperlane_config, "output", dest_chain_id)?
+		else {
+			return Ok(None);
+		};
+		let Some(recipient_oracle) =
+			first_hyperlane_oracle_for_quote(hyperlane_config, "input", origin_chain_id)?
+		else {
+			return Ok(None);
+		};
+
+		let network = config
+			.networks
+			.get(&dest_chain_id)
+			.ok_or_else(|| APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: format!(
+					"Network {dest_chain_id} not configured; cannot build post-fill tx for quote"
+				),
+				details: None,
+			})?;
+		let output_settler = network.output_settler_address.clone();
+
+		let amount: U256 = resolved_amounts
+			.get(&output.asset)
+			.map(|info| info.amount)
+			.ok_or_else(|| APIError::InternalServerError {
+				error_type: ApiErrorType::InternalError,
+				message: format!(
+					"Missing resolved swap amount for output asset on chain {dest_chain_id}; \
+					build_post_fill_tx_for_quote must run after calculate_swap_amounts"
+				),
+			})?;
+
+		let token_addr = output
+			.asset
+			.ethereum_address()
+			.map_err(|e| APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: format!("Output asset is not an EVM address: {e}"),
+				details: None,
+			})?;
+		let recipient_addr =
+			output
+				.receiver
+				.ethereum_address()
+				.map_err(|e| APIError::BadRequest {
+					error_type: ApiErrorType::InvalidRequest,
+					message: format!("Output receiver is not an EVM address: {e}"),
+					details: None,
+				})?;
+		let token_bytes32 = address20_to_bytes32(token_addr.as_slice());
+		let recipient_bytes32 = address20_to_bytes32(recipient_addr.as_slice());
+
+		let callback_data_bytes: Vec<u8> = match output.calldata.as_deref() {
+			None => Vec::new(),
+			Some(s) if s.is_empty() || s == "0x" => Vec::new(),
+			Some(s) => {
+				alloy_primitives::hex::decode(s.trim_start_matches("0x")).unwrap_or_else(|e| {
+					tracing::warn!(
+						error = %e,
+						"Failed to decode QuoteOutput.calldata for quote-time post-fill estimate; treating as empty"
+					);
+					Vec::new()
+				})
+			},
+		};
+
+		let mut solver_identifier = [0u8; 32];
+		solver_identifier.copy_from_slice(address20_to_bytes32(&solver_address.0).as_slice());
+		let mut token = [0u8; 32];
+		token.copy_from_slice(token_bytes32.as_slice());
+		let mut recipient = [0u8; 32];
+		recipient.copy_from_slice(recipient_bytes32.as_slice());
+
+		let fill_description = encode_quote_hyperlane_fill_description(
+			solver_identifier,
+			[0u8; 32],
+			current_timestamp().min(u32::MAX as u64) as u32,
+			token,
+			amount,
+			recipient,
+			callback_data_bytes,
+			vec![],
+		)?;
+		let payloads = vec![fill_description];
+		let total_payload_size: usize = payloads.iter().map(|p| p.len()).sum();
+		let message_gas_limit = quote_hyperlane_message_gas_limit(total_payload_size);
+
+		let quote_call_data = IHyperlaneOracleForQuote::quoteGasPaymentCall {
+			destinationDomain: origin_chain_id as u32,
+			recipientOracle: alloy_primitives::Address::from_slice(&recipient_oracle.0),
+			gasLimit: message_gas_limit,
+			customMetadata: vec![].into(),
+			source: alloy_primitives::Address::from_slice(&output_settler.0),
+			payloads: payloads.clone().into_iter().map(Into::into).collect(),
+		};
+		let gas_payment = self
+			.delivery_service
+			.contract_call(
+				dest_chain_id,
+				Transaction {
+					to: Some(oracle_address.clone()),
+					data: quote_call_data.abi_encode(),
+					value: U256::ZERO,
+					chain_id: dest_chain_id,
+					nonce: None,
+					gas_limit: None,
+					gas_price: None,
+					max_fee_per_gas: None,
+					max_priority_fee_per_gas: None,
+				},
+			)
+			.await
+			.map_err(|e| APIError::InternalServerError {
+				error_type: ApiErrorType::ServiceError,
+				message: format!("Failed to quote Hyperlane post-fill gas payment: {e}"),
+			})?;
+		let gas_payment = U256::from_be_slice(gas_payment.as_ref());
+
+		let call_data = IHyperlaneOracleForQuote::submitCall {
+			destinationDomain: origin_chain_id as u32,
+			recipientOracle: alloy_primitives::Address::from_slice(&recipient_oracle.0),
+			gasLimit: message_gas_limit,
+			customMetadata: vec![].into(),
+			source: alloy_primitives::Address::from_slice(&output_settler.0),
+			payloads: payloads.into_iter().map(Into::into).collect(),
+		};
+
+		Ok(Some(Transaction {
+			to: Some(oracle_address),
+			data: call_data.abi_encode(),
+			value: gas_payment,
+			chain_id: dest_chain_id,
+			nonce: None,
+			gas_limit: None,
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+		}))
 	}
 
 	/// Build fill transaction for gas estimation
@@ -4409,6 +4793,13 @@ mod tests {
 		mock_dest
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async move { Ok(12345u64) }));
+		mock_dest.expect_eth_call().returning(|_| {
+			Box::pin(async move {
+				Ok(alloy_primitives::Bytes::from(
+					U256::from(1u64).to_be_bytes::<32>().to_vec(),
+				))
+			})
+		});
 		let result_for_mock = dest_estimate_units;
 		mock_dest.expect_estimate_gas().returning(move |_| {
 			let r = result_for_mock;
@@ -4532,6 +4923,22 @@ mod tests {
 			},
 		);
 		config.networks = networks;
+		config.settlement.primary = "hyperlane".to_string();
+		config.settlement.implementations.insert(
+			"hyperlane".to_string(),
+			serde_json::json!({
+				"oracles": {
+					"input": {
+						"1": ["0x1111111111111111111111111111111111111111"],
+						"137": ["0x2222222222222222222222222222222222222222"]
+					},
+					"output": {
+						"1": ["0x1111111111111111111111111111111111111111"],
+						"137": ["0x2222222222222222222222222222222222222222"]
+					}
+				}
+			}),
+		);
 		if let Some(g) = config.gas.as_mut() {
 			g.live_fill_estimate_enabled = live_enabled;
 		}
@@ -4640,6 +5047,64 @@ mod tests {
 			"live-estimate gas_fill ({}) should exceed static gas_fill ({}) by ~100×",
 			ctx_live.cost_breakdown.gas_fill,
 			ctx_static.cost_breakdown.gas_fill,
+		);
+	}
+
+	#[tokio::test]
+	async fn cost_context_uses_live_post_fill_units_when_enabled() {
+		let live_units: u64 = 5_000_000;
+		let service = cost_profit_service_for_live_estimate(Some(live_units));
+		let mut config = config_for_live_estimate(true);
+		config.gas = Some(solver_config::GasConfig {
+			flows: HashMap::from([(
+				"permit2_escrow".to_string(),
+				solver_config::GasFlowUnits {
+					open: Some(0),
+					fill: Some(0),
+					post_fill: Some(50_000),
+					pre_claim: Some(0),
+					claim: Some(0),
+				},
+			)]),
+			live_fill_estimate_enabled: true,
+		});
+
+		let request = create_test_request(true);
+		let context = create_test_validated_context(true);
+		let solver = Address([0xAB; 20].to_vec());
+
+		let ctx_live = service
+			.calculate_cost_context_for_flow_keys(
+				&request,
+				&context,
+				&config,
+				&["permit2_escrow".to_string()],
+				&solver,
+			)
+			.await
+			.expect("live-estimate cost context should compute");
+
+		let service_static = cost_profit_service_for_live_estimate(Some(live_units));
+		let mut config_static = config.clone();
+		if let Some(g) = config_static.gas.as_mut() {
+			g.live_fill_estimate_enabled = false;
+		}
+		let ctx_static = service_static
+			.calculate_cost_context_for_flow_keys(
+				&request,
+				&context,
+				&config_static,
+				&["permit2_escrow".to_string()],
+				&solver,
+			)
+			.await
+			.expect("static-only cost context should compute");
+
+		assert!(
+			ctx_live.cost_breakdown.gas_post_fill > ctx_static.cost_breakdown.gas_post_fill,
+			"live-estimate gas_post_fill ({}) should exceed static gas_post_fill ({})",
+			ctx_live.cost_breakdown.gas_post_fill,
+			ctx_static.cost_breakdown.gas_post_fill,
 		);
 	}
 
