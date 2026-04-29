@@ -7,7 +7,7 @@ use rust_decimal::Decimal;
 
 use crate::{
 	AccountConfig, ApiConfig, Config, DeliveryConfig, DiscoveryConfig, GasConfig, NetworksConfig,
-	OrderConfig, SettlementConfig, SolverConfig, StorageConfig, StrategyConfig,
+	OrderConfig, SettlementConfig, SolverConfig, SolverIngressMode, StorageConfig, StrategyConfig,
 };
 use std::collections::HashMap;
 
@@ -164,6 +164,7 @@ impl ConfigBuilder {
 				rate_buffer_bps: self.rate_buffer_bps,
 				monitoring_timeout_seconds: self.monitoring_timeout_seconds,
 				deny_list: self.deny_list,
+				ingress_mode: SolverIngressMode::Active,
 			},
 			networks: self.networks.unwrap_or_default(),
 			storage: StorageConfig {
