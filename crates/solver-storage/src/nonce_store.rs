@@ -119,9 +119,13 @@ pub fn create_redis_nonce_store(
 	redis_url: String,
 	solver_id: &str,
 	ttl_seconds: u64,
+	cluster_mode: bool,
 ) -> Result<NonceStore, NonceError> {
 	create_nonce_store(
-		StoreConfig::Redis { url: redis_url },
+		StoreConfig::Redis {
+			url: redis_url,
+			cluster_mode,
+		},
 		solver_id,
 		ttl_seconds,
 	)
@@ -134,9 +138,13 @@ pub fn create_redis_nonce_store_with_namespace(
 	solver_id: &str,
 	namespace: &str,
 	ttl_seconds: u64,
+	cluster_mode: bool,
 ) -> Result<NonceStore, NonceError> {
 	create_nonce_store_with_namespace(
-		StoreConfig::Redis { url: redis_url },
+		StoreConfig::Redis {
+			url: redis_url,
+			cluster_mode,
+		},
 		solver_id,
 		namespace,
 		ttl_seconds,
@@ -365,6 +373,7 @@ mod tests {
 	fn test_config_debug_redacts_credentials() {
 		let config = StoreConfig::Redis {
 			url: "redis://:secretpassword@localhost:6379".to_string(),
+			cluster_mode: false,
 		};
 		let debug_str = format!("{config:?}");
 		assert!(!debug_str.contains("secretpassword"));
@@ -510,8 +519,12 @@ mod tests {
 	#[test]
 	fn test_create_redis_nonce_store_convenience() {
 		// This will fail because there's no Redis, but it tests the API
-		let result =
-			create_redis_nonce_store("redis://invalid-host:6379".to_string(), "test-solver", 300);
+		let result = create_redis_nonce_store(
+			"redis://invalid-host:6379".to_string(),
+			"test-solver",
+			300,
+			false,
+		);
 		// Should fail at connection time (lazy), not at creation time
 		// The error depends on the implementation details
 		assert!(result.is_ok() || result.is_err());
@@ -524,6 +537,7 @@ mod tests {
 			"test-solver",
 			"siwe",
 			300,
+			false,
 		)
 		.expect("expected redis nonce store to initialize lazily");
 

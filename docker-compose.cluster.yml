@@ -1,0 +1,45 @@
+# Local single-node Redis Cluster for testing cluster-mode code paths.
+# NOT for production. AWS MemoryDB is the production target.
+#
+# Why single-node: a 1-shard Redis Cluster speaks the same cluster protocol
+# (CLUSTER SLOTS, slot routing, MOVED redirects on topology change) as a
+# multi-shard cluster, so the application's cluster-mode code path is fully
+# exercised. A 3-node local cluster on Docker Desktop for Mac runs into
+# `cluster-announce-ip` cross-namespace issues with no clean fix that
+# survives between Linux and Mac. Production matches: single-shard MemoryDB.
+#
+# Usage:
+#   docker compose -f docker-compose.cluster.yml up -d
+#   docker compose -f docker-compose.cluster.yml down -v
+#
+# Default port: 7100 (avoids macOS AirPlay on 7000). Override:
+#   REDIS_CLUSTER_PORT=7200 docker compose -f docker-compose.cluster.yml up -d
+#   REDIS_CLUSTER_TEST_URL=redis://127.0.0.1:7200 \
+#     cargo test -p solver-storage --features cluster-tests \
+#     --test redis_cluster_integration
+
+services:
+  redis-1:
+    image: redis:7-alpine
+    container_name: oif-redis-cluster-1
+    ports:
+      - "${REDIS_CLUSTER_PORT:-7100}:${REDIS_CLUSTER_PORT:-7100}"
+    command: >
+      redis-server
+      --port ${REDIS_CLUSTER_PORT:-7100}
+      --cluster-enabled yes
+      --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000
+      --appendonly yes
+
+  cluster-init:
+    image: redis:7-alpine
+    depends_on: [redis-1]
+    network_mode: host
+    environment:
+      REDIS_CLUSTER_PORT: "${REDIS_CLUSTER_PORT:-7100}"
+    entrypoint:
+      - sh
+      - -c
+      - sleep 3 && redis-cli -p $$REDIS_CLUSTER_PORT cluster addslots $$(seq 0 16383)
+    restart: "no"

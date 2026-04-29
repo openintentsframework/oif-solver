@@ -113,6 +113,9 @@ pub struct ReadinessConfig {
 	pub require_persistence: bool,
 	/// Connection timeout in milliseconds
 	pub timeout_ms: u64,
+	/// When true, use the Redis Cluster client for the readiness probe
+	/// (required for AWS MemoryDB).
+	pub cluster_mode: bool,
 }
 
 impl Default for ReadinessConfig {
@@ -120,6 +123,7 @@ impl Default for ReadinessConfig {
 		Self {
 			require_persistence: false,
 			timeout_ms: 5000,
+			cluster_mode: false,
 		}
 	}
 }
@@ -160,11 +164,12 @@ pub async fn check_storage_readiness(
 	timeout_ms: u64,
 ) -> Result<ReadinessStatus, ReadinessError> {
 	match config {
-		StoreConfig::Redis { url } => {
+		StoreConfig::Redis { url, cluster_mode } => {
 			let checker = RedisReadiness::new();
 			let readiness_config = ReadinessConfig {
 				require_persistence: policy.requires_persistence(),
 				timeout_ms,
+				cluster_mode: *cluster_mode,
 			};
 			checker.check(url, &readiness_config).await
 		},

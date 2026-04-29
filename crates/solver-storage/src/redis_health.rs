@@ -16,6 +16,7 @@
 //! let info = check_redis_health_strict("redis://localhost:6379", 5000).await?;
 //! ```
 
+use std::collections::HashMap;
 use thiserror::Error;
 
 /// Errors that can occur during Redis health checks.
@@ -108,29 +109,55 @@ impl RedisPersistenceInfo {
 pub async fn check_redis_health(
 	redis_url: &str,
 	timeout_ms: u64,
+	cluster_mode: bool,
 ) -> Result<RedisPersistenceInfo, RedisHealthError> {
-	// 1. Establish connection
-	let client = redis::Client::open(redis_url)
-		.map_err(|e| RedisHealthError::ConnectionFailed(e.to_string()))?;
-
-	let mut conn = tokio::time::timeout(
-		std::time::Duration::from_millis(timeout_ms),
-		client.get_multiplexed_async_connection(),
-	)
-	.await
-	.map_err(|_| {
-		RedisHealthError::ConnectionFailed(format!("Connection timeout after {timeout_ms}ms"))
-	})?
-	.map_err(|e| RedisHealthError::ConnectionFailed(e.to_string()))?;
-
-	// 2. Get persistence info via INFO command (always allowed)
-	let info: String = redis::cmd("INFO")
-		.arg("persistence")
-		.query_async(&mut conn)
+	let info: String = if cluster_mode {
+		// In cluster mode, INFO is non-routable and the cluster client fans
+		// it out to every master, returning a `map<node_addr, info_string>`.
+		// We pick any one node's reply — that's enough for the readiness
+		// signal (per-shard reporting is out of scope).
+		let cluster_client = redis::cluster::ClusterClient::new(vec![redis_url])
+			.map_err(|e| RedisHealthError::ConnectionFailed(e.to_string()))?;
+		let mut conn = tokio::time::timeout(
+			std::time::Duration::from_millis(timeout_ms),
+			cluster_client.get_async_connection(),
+		)
 		.await
-		.map_err(|e| RedisHealthError::CheckFailed(e.to_string()))?;
+		.map_err(|_| {
+			RedisHealthError::ConnectionFailed(format!(
+				"Cluster connection timeout after {timeout_ms}ms"
+			))
+		})?
+		.map_err(|e| RedisHealthError::ConnectionFailed(e.to_string()))?;
+		let map: HashMap<String, String> = redis::cmd("INFO")
+			.arg("persistence")
+			.query_async(&mut conn)
+			.await
+			.map_err(|e| RedisHealthError::CheckFailed(e.to_string()))?;
+		map.into_values().next().ok_or_else(|| {
+			RedisHealthError::CheckFailed(
+				"Cluster INFO returned no node responses".to_string(),
+			)
+		})?
+	} else {
+		let client = redis::Client::open(redis_url)
+			.map_err(|e| RedisHealthError::ConnectionFailed(e.to_string()))?;
+		let mut conn = tokio::time::timeout(
+			std::time::Duration::from_millis(timeout_ms),
+			client.get_multiplexed_async_connection(),
+		)
+		.await
+		.map_err(|_| {
+			RedisHealthError::ConnectionFailed(format!("Connection timeout after {timeout_ms}ms"))
+		})?
+		.map_err(|e| RedisHealthError::ConnectionFailed(e.to_string()))?;
+		redis::cmd("INFO")
+			.arg("persistence")
+			.query_async(&mut conn)
+			.await
+			.map_err(|e| RedisHealthError::CheckFailed(e.to_string()))?
+	};
 
-	// 3. Parse persistence info from INFO output
 	parse_info_persistence(&info)
 }
 
@@ -156,7 +183,14 @@ pub async fn check_redis_health(
 pub async fn check_redis_health_strict(
 	redis_url: &str,
 	timeout_ms: u64,
+	cluster_mode: bool,
 ) -> Result<RedisPersistenceInfo, RedisHealthError> {
+	if cluster_mode {
+		// CONFIG GET is unsafe in cluster mode (commands are slot-routed and
+		// CONFIG semantics aren't uniform across nodes). Use INFO directly.
+		return check_redis_health(redis_url, timeout_ms, true).await;
+	}
+
 	// 1. Establish connection
 	let client = redis::Client::open(redis_url)
 		.map_err(|e| RedisHealthError::ConnectionFailed(e.to_string()))?;
