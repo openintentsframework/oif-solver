@@ -468,6 +468,14 @@ pub struct OperatorGasFlowUnits {
 	/// Gas units for fill step.
 	pub fill: u64,
 
+	/// Gas units for post-fill settlement step.
+	#[serde(default)]
+	pub post_fill: u64,
+
+	/// Gas units for pre-claim settlement step.
+	#[serde(default)]
+	pub pre_claim: u64,
+
 	/// Gas units for claim/finalize step.
 	pub claim: u64,
 }
@@ -922,6 +930,8 @@ mod tests {
 				resource_lock: OperatorGasFlowUnits {
 					open: 0,
 					fill: 77298,
+					post_fill: 300_000,
+					pre_claim: 0,
 					claim: 122793,
 				},
 				permit2_escrow: OperatorGasFlowUnits::default(),

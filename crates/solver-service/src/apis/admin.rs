@@ -446,7 +446,14 @@ pub async fn handle_update_gas(
 	}: VerifiedAdmin<UpdateGasConfigContents>,
 ) -> Result<Json<AdminActionResponse>, AdminAuthError> {
 	// Validate bounds
-	fn validate_flow(label: &str, open: u64, fill: u64, claim: u64) -> Result<(), AdminAuthError> {
+	fn validate_flow(
+		label: &str,
+		open: u64,
+		fill: u64,
+		post_fill: u64,
+		pre_claim: u64,
+		claim: u64,
+	) -> Result<(), AdminAuthError> {
 		if open > 500_000 {
 			return Err(AdminAuthError::InvalidMessage(format!(
 				"{label}.open too high"
@@ -455,6 +462,16 @@ pub async fn handle_update_gas(
 		if fill > 1_000_000 {
 			return Err(AdminAuthError::InvalidMessage(format!(
 				"{label}.fill too high"
+			)));
+		}
+		if post_fill > 1_000_000 {
+			return Err(AdminAuthError::InvalidMessage(format!(
+				"{label}.postFill too high"
+			)));
+		}
+		if pre_claim > 5_000_000 {
+			return Err(AdminAuthError::InvalidMessage(format!(
+				"{label}.preClaim too high"
 			)));
 		}
 		if claim > 500_000 {
@@ -469,18 +486,24 @@ pub async fn handle_update_gas(
 		"resourceLock",
 		request.resource_lock_open,
 		request.resource_lock_fill,
+		request.resource_lock_post_fill,
+		request.resource_lock_pre_claim,
 		request.resource_lock_claim,
 	)?;
 	validate_flow(
 		"permit2Escrow",
 		request.permit2_escrow_open,
 		request.permit2_escrow_fill,
+		request.permit2_escrow_post_fill,
+		request.permit2_escrow_pre_claim,
 		request.permit2_escrow_claim,
 	)?;
 	validate_flow(
 		"eip3009Escrow",
 		request.eip3009_escrow_open,
 		request.eip3009_escrow_fill,
+		request.eip3009_escrow_post_fill,
+		request.eip3009_escrow_pre_claim,
 		request.eip3009_escrow_claim,
 	)?;
 
@@ -488,12 +511,18 @@ pub async fn handle_update_gas(
 	let mut operator_config = versioned.data;
 	operator_config.gas.resource_lock.open = request.resource_lock_open;
 	operator_config.gas.resource_lock.fill = request.resource_lock_fill;
+	operator_config.gas.resource_lock.post_fill = request.resource_lock_post_fill;
+	operator_config.gas.resource_lock.pre_claim = request.resource_lock_pre_claim;
 	operator_config.gas.resource_lock.claim = request.resource_lock_claim;
 	operator_config.gas.permit2_escrow.open = request.permit2_escrow_open;
 	operator_config.gas.permit2_escrow.fill = request.permit2_escrow_fill;
+	operator_config.gas.permit2_escrow.post_fill = request.permit2_escrow_post_fill;
+	operator_config.gas.permit2_escrow.pre_claim = request.permit2_escrow_pre_claim;
 	operator_config.gas.permit2_escrow.claim = request.permit2_escrow_claim;
 	operator_config.gas.eip3009_escrow.open = request.eip3009_escrow_open;
 	operator_config.gas.eip3009_escrow.fill = request.eip3009_escrow_fill;
+	operator_config.gas.eip3009_escrow.post_fill = request.eip3009_escrow_post_fill;
+	operator_config.gas.eip3009_escrow.pre_claim = request.eip3009_escrow_pre_claim;
 	operator_config.gas.eip3009_escrow.claim = request.eip3009_escrow_claim;
 
 	let new_versioned = state
@@ -1208,16 +1237,22 @@ fn gas_config_response(gas: &solver_types::OperatorGasConfig) -> GasConfigRespon
 		resource_lock: GasFlowResponse {
 			open: gas.resource_lock.open,
 			fill: gas.resource_lock.fill,
+			post_fill: gas.resource_lock.post_fill,
+			pre_claim: gas.resource_lock.pre_claim,
 			claim: gas.resource_lock.claim,
 		},
 		permit2_escrow: GasFlowResponse {
 			open: gas.permit2_escrow.open,
 			fill: gas.permit2_escrow.fill,
+			post_fill: gas.permit2_escrow.post_fill,
+			pre_claim: gas.permit2_escrow.pre_claim,
 			claim: gas.permit2_escrow.claim,
 		},
 		eip3009_escrow: GasFlowResponse {
 			open: gas.eip3009_escrow.open,
 			fill: gas.eip3009_escrow.fill,
+			post_fill: gas.eip3009_escrow.post_fill,
+			pre_claim: gas.eip3009_escrow.pre_claim,
 			claim: gas.eip3009_escrow.claim,
 		},
 	}
@@ -2704,16 +2739,22 @@ mod tests {
 			resource_lock: OperatorGasFlowUnits {
 				open: 100_000,
 				fill: 200_000,
+				post_fill: 300_000,
+				pre_claim: 40_000,
 				claim: 150_000,
 			},
 			permit2_escrow: OperatorGasFlowUnits {
 				open: 110_000,
 				fill: 210_000,
+				post_fill: 310_000,
+				pre_claim: 41_000,
 				claim: 160_000,
 			},
 			eip3009_escrow: OperatorGasFlowUnits {
 				open: 120_000,
 				fill: 220_000,
+				post_fill: 320_000,
+				pre_claim: 42_000,
 				claim: 170_000,
 			},
 			live_fill_estimate_enabled: true,
@@ -2723,12 +2764,18 @@ mod tests {
 
 		assert_eq!(response.resource_lock.open, 100_000);
 		assert_eq!(response.resource_lock.fill, 200_000);
+		assert_eq!(response.resource_lock.post_fill, 300_000);
+		assert_eq!(response.resource_lock.pre_claim, 40_000);
 		assert_eq!(response.resource_lock.claim, 150_000);
 		assert_eq!(response.permit2_escrow.open, 110_000);
 		assert_eq!(response.permit2_escrow.fill, 210_000);
+		assert_eq!(response.permit2_escrow.post_fill, 310_000);
+		assert_eq!(response.permit2_escrow.pre_claim, 41_000);
 		assert_eq!(response.permit2_escrow.claim, 160_000);
 		assert_eq!(response.eip3009_escrow.open, 120_000);
 		assert_eq!(response.eip3009_escrow.fill, 220_000);
+		assert_eq!(response.eip3009_escrow.post_fill, 320_000);
+		assert_eq!(response.eip3009_escrow.pre_claim, 42_000);
 		assert_eq!(response.eip3009_escrow.claim, 170_000);
 	}
 
@@ -2738,16 +2785,22 @@ mod tests {
 			resource_lock: GasFlowResponse {
 				open: 100_000,
 				fill: 200_000,
+				post_fill: 300_000,
+				pre_claim: 40_000,
 				claim: 150_000,
 			},
 			permit2_escrow: GasFlowResponse {
 				open: 110_000,
 				fill: 210_000,
+				post_fill: 310_000,
+				pre_claim: 41_000,
 				claim: 160_000,
 			},
 			eip3009_escrow: GasFlowResponse {
 				open: 120_000,
 				fill: 220_000,
+				post_fill: 320_000,
+				pre_claim: 42_000,
 				claim: 170_000,
 			},
 		};
@@ -2758,6 +2811,8 @@ mod tests {
 		assert!(json.contains("\"eip3009Escrow\""));
 		assert!(json.contains("\"open\":100000"));
 		assert!(json.contains("\"fill\":200000"));
+		assert!(json.contains("\"postFill\":300000"));
+		assert!(json.contains("\"preClaim\":40000"));
 		assert!(json.contains("\"claim\":150000"));
 	}
 

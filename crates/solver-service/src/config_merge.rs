@@ -441,16 +441,22 @@ pub fn merge_to_operator_config(
 			resource_lock: OperatorGasFlowUnits {
 				open: seed.defaults.gas_resource_lock.open,
 				fill: seed.defaults.gas_resource_lock.fill,
+				post_fill: seed.defaults.gas_resource_lock.post_fill,
+				pre_claim: seed.defaults.gas_resource_lock.pre_claim,
 				claim: seed.defaults.gas_resource_lock.claim,
 			},
 			permit2_escrow: OperatorGasFlowUnits {
 				open: seed.defaults.gas_permit2_escrow.open,
 				fill: seed.defaults.gas_permit2_escrow.fill,
+				post_fill: seed.defaults.gas_permit2_escrow.post_fill,
+				pre_claim: seed.defaults.gas_permit2_escrow.pre_claim,
 				claim: seed.defaults.gas_permit2_escrow.claim,
 			},
 			eip3009_escrow: OperatorGasFlowUnits {
 				open: seed.defaults.gas_eip3009_escrow.open,
 				fill: seed.defaults.gas_eip3009_escrow.fill,
+				post_fill: seed.defaults.gas_eip3009_escrow.post_fill,
+				pre_claim: seed.defaults.gas_eip3009_escrow.pre_claim,
 				claim: seed.defaults.gas_eip3009_escrow.claim,
 			},
 			live_fill_estimate_enabled: true,
@@ -1878,6 +1884,8 @@ fn build_gas_config_from_operator(gas: &OperatorGasConfig) -> GasConfig {
 		GasFlowUnits {
 			open: Some(gas.resource_lock.open),
 			fill: Some(gas.resource_lock.fill),
+			post_fill: Some(gas.resource_lock.post_fill),
+			pre_claim: Some(gas.resource_lock.pre_claim),
 			claim: Some(gas.resource_lock.claim),
 		},
 	);
@@ -1887,6 +1895,8 @@ fn build_gas_config_from_operator(gas: &OperatorGasConfig) -> GasConfig {
 		GasFlowUnits {
 			open: Some(gas.permit2_escrow.open),
 			fill: Some(gas.permit2_escrow.fill),
+			post_fill: Some(gas.permit2_escrow.post_fill),
+			pre_claim: Some(gas.permit2_escrow.pre_claim),
 			claim: Some(gas.permit2_escrow.claim),
 		},
 	);
@@ -1896,6 +1906,8 @@ fn build_gas_config_from_operator(gas: &OperatorGasConfig) -> GasConfig {
 		GasFlowUnits {
 			open: Some(gas.eip3009_escrow.open),
 			fill: Some(gas.eip3009_escrow.fill),
+			post_fill: Some(gas.eip3009_escrow.post_fill),
+			pre_claim: Some(gas.eip3009_escrow.pre_claim),
 			claim: Some(gas.eip3009_escrow.claim),
 		},
 	);
@@ -2174,6 +2186,8 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 				.map(|f| OperatorGasFlowUnits {
 					open: f.open.unwrap_or(0),
 					fill: f.fill.unwrap_or(0),
+					post_fill: f.post_fill.unwrap_or(0),
+					pre_claim: f.pre_claim.unwrap_or(0),
 					claim: f.claim.unwrap_or(0),
 				})
 				.unwrap_or_default(),
@@ -2183,6 +2197,8 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 				.map(|f| OperatorGasFlowUnits {
 					open: f.open.unwrap_or(0),
 					fill: f.fill.unwrap_or(0),
+					post_fill: f.post_fill.unwrap_or(0),
+					pre_claim: f.pre_claim.unwrap_or(0),
 					claim: f.claim.unwrap_or(0),
 				})
 				.unwrap_or_default(),
@@ -2192,6 +2208,8 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 				.map(|f| OperatorGasFlowUnits {
 					open: f.open.unwrap_or(0),
 					fill: f.fill.unwrap_or(0),
+					post_fill: f.post_fill.unwrap_or(0),
+					pre_claim: f.pre_claim.unwrap_or(0),
 					claim: f.claim.unwrap_or(0),
 				})
 				.unwrap_or_default(),
@@ -5851,16 +5869,22 @@ mod tests {
 			resource_lock: OperatorGasFlowUnits {
 				open: 100,
 				fill: 200,
+				post_fill: 250,
+				pre_claim: 275,
 				claim: 300,
 			},
 			permit2_escrow: OperatorGasFlowUnits {
 				open: 400,
 				fill: 500,
+				post_fill: 550,
+				pre_claim: 575,
 				claim: 600,
 			},
 			eip3009_escrow: OperatorGasFlowUnits {
 				open: 700,
 				fill: 800,
+				post_fill: 850,
+				pre_claim: 875,
 				claim: 900,
 			},
 			live_fill_estimate_enabled: true,

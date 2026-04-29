@@ -54,6 +54,8 @@ fn address20_to_bytes32(addr20: &[u8]) -> FixedBytes<32> {
 pub struct GasUnits {
 	pub open_units: u64,
 	pub fill_units: u64,
+	pub post_fill_units: u64,
+	pub pre_claim_units: u64,
 	pub claim_units: u64,
 }
 
@@ -466,13 +468,15 @@ impl CostProfitService {
 				details: None,
 			})?;
 
-		let (open_units, fill_units, claim_units) =
-			estimate_gas_units_from_flow_keys(flow_keys, config, 150000, 150000, 150000);
+		let (open_units, fill_units, post_fill_units, pre_claim_units, claim_units) =
+			estimate_gas_units_from_flow_keys(flow_keys, config, 150000, 150000, 300000, 0, 150000);
 
 		// Get gas units for cost calculation
 		let mut gas_units = GasUnits {
 			open_units,
 			fill_units,
+			post_fill_units,
+			pre_claim_units,
 			claim_units,
 		};
 
@@ -614,9 +618,12 @@ impl CostProfitService {
 		let mut execution_costs_by_chain = std::collections::HashMap::new();
 		execution_costs_by_chain.insert(
 			origin_chain_id,
-			cost_breakdown.gas_open + cost_breakdown.gas_claim,
+			cost_breakdown.gas_open + cost_breakdown.gas_pre_claim + cost_breakdown.gas_claim,
 		);
-		execution_costs_by_chain.insert(dest_chain_id, cost_breakdown.gas_fill);
+		execution_costs_by_chain.insert(
+			dest_chain_id,
+			cost_breakdown.gas_fill + cost_breakdown.gas_post_fill,
+		);
 
 		// Calculate adjusted amounts (swap amounts +/- costs based on swap type)
 		let mut adjusted_amounts = std::collections::HashMap::new();
@@ -688,17 +695,21 @@ impl CostProfitService {
 		// Calculate gas costs in wei
 		let open_cost_wei = origin_gp.saturating_mul(U256::from(gas_units.open_units));
 		let fill_cost_wei = dest_gp.saturating_mul(U256::from(gas_units.fill_units));
+		let post_fill_cost_wei = dest_gp.saturating_mul(U256::from(gas_units.post_fill_units));
+		let pre_claim_cost_wei = origin_gp.saturating_mul(U256::from(gas_units.pre_claim_units));
 		let claim_cost_wei = origin_gp.saturating_mul(U256::from(gas_units.claim_units));
 
 		// Price conversions are independent as well.
-		let (gas_open, gas_fill, gas_claim) = tokio::try_join!(
+		let (gas_open, gas_fill, gas_post_fill, gas_pre_claim, gas_claim) = tokio::try_join!(
 			self.wei_to_usd(&open_cost_wei),
 			self.wei_to_usd(&fill_cost_wei),
+			self.wei_to_usd(&post_fill_cost_wei),
+			self.wei_to_usd(&pre_claim_cost_wei),
 			self.wei_to_usd(&claim_cost_wei),
 		)?;
 
 		// Calculate gas buffer using config value (hot-reloadable)
-		let gas_subtotal = gas_open + gas_fill + gas_claim;
+		let gas_subtotal = gas_open + gas_fill + gas_post_fill + gas_pre_claim + gas_claim;
 		let gas_buffer_bps = Decimal::new(gas_buffer_bps_value as i64, 0);
 		let gas_buffer = (gas_subtotal * gas_buffer_bps) / Decimal::from(10000);
 
@@ -729,7 +740,12 @@ impl CostProfitService {
 		let min_profit = min_profit + commission;
 
 		// Calculate operational cost (gas + buffers)
-		let operational_cost = gas_open + gas_fill + gas_claim + gas_buffer + rate_buffer;
+		let operational_cost =
+			gas_open
+				+ gas_fill + gas_post_fill
+				+ gas_pre_claim
+				+ gas_claim + gas_buffer
+				+ rate_buffer;
 
 		// Calculate subtotal (actual costs only, excluding profit)
 		let subtotal = operational_cost + base_price;
@@ -740,6 +756,8 @@ impl CostProfitService {
 		Ok(CostBreakdown {
 			gas_open,
 			gas_fill,
+			gas_post_fill,
+			gas_pre_claim,
 			gas_claim,
 			gas_buffer,
 			rate_buffer,
@@ -1109,8 +1127,8 @@ impl CostProfitService {
 		let enable_live_gas_estimate = false;
 
 		// Get base units from config
-		let (open_units, mut fill_units, mut claim_units) =
-			estimate_gas_units_from_config(flow_key, config, 0, 0, 0);
+		let (open_units, mut fill_units, post_fill_units, pre_claim_units, mut claim_units) =
+			estimate_gas_units_from_config(flow_key, config, 0, 0, 0, 0, 0);
 
 		// Live estimation if enabled
 		if enable_live_gas_estimate {
@@ -1172,6 +1190,8 @@ impl CostProfitService {
 		Ok(GasUnits {
 			open_units,
 			fill_units,
+			post_fill_units,
+			pre_claim_units,
 			claim_units,
 		})
 	}
@@ -1830,8 +1850,10 @@ pub fn estimate_gas_units_from_config(
 	config: &Config,
 	fallback_open: u64,
 	fallback_fill: u64,
+	fallback_post_fill: u64,
+	fallback_pre_claim: u64,
 	fallback_claim: u64,
-) -> (u64, u64, u64) {
+) -> (u64, u64, u64, u64, u64) {
 	if let Some(gcfg) = config.gas.as_ref() {
 		tracing::debug!(
 			"Available gas flows: {:?}",
@@ -1844,8 +1866,10 @@ pub fn estimate_gas_units_from_config(
 		if let Some(units) = gcfg.flows.get(flow) {
 			let open = units.open.unwrap_or(fallback_open);
 			let fill = units.fill.unwrap_or(fallback_fill);
+			let post_fill = units.post_fill.unwrap_or(fallback_post_fill);
+			let pre_claim = units.pre_claim.unwrap_or(fallback_pre_claim);
 			let claim = units.claim.unwrap_or(fallback_claim);
-			return (open, fill, claim);
+			return (open, fill, post_fill, pre_claim, claim);
 		} else {
 			tracing::warn!("Flow '{}' not found in gas config flows", flow);
 		}
@@ -1856,7 +1880,13 @@ pub fn estimate_gas_units_from_config(
 		flow_key
 	);
 
-	(fallback_open, fallback_fill, fallback_claim)
+	(
+		fallback_open,
+		fallback_fill,
+		fallback_post_fill,
+		fallback_pre_claim,
+		fallback_claim,
+	)
 }
 
 pub fn estimate_gas_units_from_flow_keys(
@@ -1864,10 +1894,18 @@ pub fn estimate_gas_units_from_flow_keys(
 	config: &Config,
 	fallback_open: u64,
 	fallback_fill: u64,
+	fallback_post_fill: u64,
+	fallback_pre_claim: u64,
 	fallback_claim: u64,
-) -> (u64, u64, u64) {
+) -> (u64, u64, u64, u64, u64) {
 	if flow_keys.is_empty() {
-		return (fallback_open, fallback_fill, fallback_claim);
+		return (
+			fallback_open,
+			fallback_fill,
+			fallback_post_fill,
+			fallback_pre_claim,
+			fallback_claim,
+		);
 	}
 
 	if let Some(gcfg) = config.gas.as_ref() {
@@ -1879,6 +1917,8 @@ pub fn estimate_gas_units_from_flow_keys(
 		let mut found = false;
 		let mut open: Option<u64> = None;
 		let mut fill: Option<u64> = None;
+		let mut post_fill: Option<u64> = None;
+		let mut pre_claim: Option<u64> = None;
 		let mut claim: Option<u64> = None;
 
 		for flow in flow_keys {
@@ -1886,10 +1926,18 @@ pub fn estimate_gas_units_from_flow_keys(
 				found = true;
 				let candidate_open = units.open.unwrap_or(fallback_open);
 				let candidate_fill = units.fill.unwrap_or(fallback_fill);
+				let candidate_post_fill = units.post_fill.unwrap_or(fallback_post_fill);
+				let candidate_pre_claim = units.pre_claim.unwrap_or(fallback_pre_claim);
 				let candidate_claim = units.claim.unwrap_or(fallback_claim);
 
 				open = Some(open.map_or(candidate_open, |current| current.max(candidate_open)));
 				fill = Some(fill.map_or(candidate_fill, |current| current.max(candidate_fill)));
+				post_fill = Some(post_fill.map_or(candidate_post_fill, |current| {
+					current.max(candidate_post_fill)
+				}));
+				pre_claim = Some(pre_claim.map_or(candidate_pre_claim, |current| {
+					current.max(candidate_pre_claim)
+				}));
 				claim = Some(claim.map_or(candidate_claim, |current| current.max(candidate_claim)));
 			} else {
 				tracing::warn!("Flow '{}' not found in gas config flows", flow);
@@ -1900,6 +1948,8 @@ pub fn estimate_gas_units_from_flow_keys(
 			return (
 				open.unwrap_or(fallback_open),
 				fill.unwrap_or(fallback_fill),
+				post_fill.unwrap_or(fallback_post_fill),
+				pre_claim.unwrap_or(fallback_pre_claim),
 				claim.unwrap_or(fallback_claim),
 			);
 		}
@@ -1910,7 +1960,13 @@ pub fn estimate_gas_units_from_flow_keys(
 		flow_keys
 	);
 
-	(fallback_open, fallback_fill, fallback_claim)
+	(
+		fallback_open,
+		fallback_fill,
+		fallback_post_fill,
+		fallback_pre_claim,
+		fallback_claim,
+	)
 }
 
 #[cfg(test)]
@@ -2088,6 +2144,8 @@ mod tests {
 		CostBreakdown {
 			gas_open: Decimal::from_str("0.01").unwrap(),
 			gas_fill: Decimal::from_str("0.02").unwrap(),
+			gas_post_fill: Decimal::ZERO,
+			gas_pre_claim: Decimal::ZERO,
 			gas_claim: Decimal::from_str("0.01").unwrap(),
 			gas_buffer: Decimal::from_str("0.004").unwrap(),
 			rate_buffer: Decimal::ZERO,
@@ -2751,21 +2809,143 @@ mod tests {
 				solver_config::GasFlowUnits {
 					open: Some(100_000),
 					fill: Some(110_000),
+					post_fill: Some(0),
+					pre_claim: Some(0),
 					claim: Some(120_000),
 				},
 			)]),
 			live_fill_estimate_enabled: true,
 		});
 
-		let (open, fill, claim) = estimate_gas_units_from_flow_keys(
+		let (open, fill, post_fill, pre_claim, claim) = estimate_gas_units_from_flow_keys(
 			&["permit2_escrow".to_string()],
 			&config,
 			150_000,
 			150_000,
 			150_000,
+			150_000,
+			150_000,
 		);
 
-		assert_eq!((open, fill, claim), (100_000, 110_000, 120_000));
+		assert_eq!(
+			(open, fill, post_fill, pre_claim, claim),
+			(100_000, 110_000, 0, 0, 120_000)
+		);
+	}
+
+	#[test]
+	fn test_estimate_gas_units_from_flow_keys_includes_optional_settlement_steps() {
+		let mut config = create_test_config();
+		config.gas = Some(solver_config::GasConfig {
+			flows: HashMap::from([(
+				"permit2_escrow".to_string(),
+				solver_config::GasFlowUnits {
+					open: Some(100_000),
+					fill: Some(110_000),
+					post_fill: Some(300_000),
+					pre_claim: Some(40_000),
+					claim: Some(120_000),
+				},
+			)]),
+			live_fill_estimate_enabled: true,
+		});
+
+		let (open, fill, post_fill, pre_claim, claim) = estimate_gas_units_from_flow_keys(
+			&["permit2_escrow".to_string()],
+			&config,
+			150_000,
+			150_000,
+			150_000,
+			0,
+			150_000,
+		);
+
+		assert_eq!(
+			(open, fill, post_fill, pre_claim, claim),
+			(100_000, 110_000, 300_000, 40_000, 120_000)
+		);
+	}
+
+	#[tokio::test]
+	async fn test_calculate_total_cost_includes_optional_settlement_gas() {
+		let mut mock_pricing = MockPricingInterface::new();
+		mock_pricing
+			.expect_wei_to_currency()
+			.times(5)
+			.returning(|wei, _| {
+				let wei = wei.to_string();
+				Box::pin(async move { Ok(wei) })
+			});
+
+		let mut origin_delivery = MockDeliveryInterface::new();
+		origin_delivery
+			.expect_get_gas_price()
+			.returning(|_| Box::pin(async move { Ok("10".to_string()) }));
+		origin_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut destination_delivery = MockDeliveryInterface::new();
+		destination_delivery
+			.expect_get_gas_price()
+			.returning(|_| Box::pin(async move { Ok("100".to_string()) }));
+		destination_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([
+				(
+					1,
+					Arc::new(origin_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+				),
+				(
+					2,
+					Arc::new(destination_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+				),
+			]),
+			1,
+			3600,
+			60,
+		));
+		let token_manager = Arc::new(TokenManager::new(
+			create_test_networks_config(),
+			delivery.clone(),
+			create_mock_account_service(),
+		));
+		let service = CostProfitService::new(
+			Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new())),
+			delivery,
+			token_manager,
+			Arc::new(StorageService::new(Box::new(MockStorageInterface::new()))),
+		);
+
+		let config = create_test_config();
+		let breakdown = service
+			.calculate_total_cost(
+				&[],
+				&[],
+				&config,
+				1,
+				2,
+				&GasUnits {
+					open_units: 1,
+					fill_units: 2,
+					post_fill_units: 3,
+					pre_claim_units: 4,
+					claim_units: 5,
+				},
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(breakdown.gas_open, Decimal::from(10));
+		assert_eq!(breakdown.gas_fill, Decimal::from(200));
+		assert_eq!(breakdown.gas_post_fill, Decimal::from(300));
+		assert_eq!(breakdown.gas_pre_claim, Decimal::from(40));
+		assert_eq!(breakdown.gas_claim, Decimal::from(50));
+		assert_eq!(breakdown.gas_buffer, Decimal::from(60));
+		assert_eq!(breakdown.operational_cost, Decimal::from(660));
 	}
 
 	// ============================================================================
@@ -2860,6 +3040,8 @@ mod tests {
 		CostBreakdown {
 			gas_open: Decimal::from_str("0.01").unwrap(),
 			gas_fill: Decimal::from_str("0.02").unwrap(),
+			gas_post_fill: Decimal::ZERO,
+			gas_pre_claim: Decimal::ZERO,
 			gas_claim: Decimal::from_str("0.01").unwrap(),
 			gas_buffer: Decimal::from_str("0.004").unwrap(),
 			rate_buffer: Decimal::ZERO,
@@ -4369,6 +4551,8 @@ mod tests {
 				solver_config::GasFlowUnits {
 					open: Some(0),
 					fill: Some(50_000),
+					post_fill: Some(0),
+					pre_claim: Some(0),
 					claim: Some(0),
 				},
 			)]),
@@ -4410,6 +4594,8 @@ mod tests {
 				solver_config::GasFlowUnits {
 					open: Some(0),
 					fill: Some(50_000),
+					post_fill: Some(0),
+					pre_claim: Some(0),
 					claim: Some(0),
 				},
 			)]),
@@ -4469,6 +4655,8 @@ mod tests {
 				solver_config::GasFlowUnits {
 					open: Some(0),
 					fill: Some(50_000),
+					post_fill: Some(0),
+					pre_claim: Some(0),
 					claim: Some(0),
 				},
 			)]),
@@ -4706,6 +4894,8 @@ mod tests {
 				solver_config::GasFlowUnits {
 					open: Some(0),
 					fill: Some(50_000),
+					post_fill: Some(0),
+					pre_claim: Some(0),
 					claim: Some(0),
 				},
 			)]),

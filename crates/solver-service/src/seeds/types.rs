@@ -147,6 +147,10 @@ pub struct GasFlowUnits {
 	pub open: u64,
 	/// Gas units for fill step.
 	pub fill: u64,
+	/// Gas units for post-fill settlement step.
+	pub post_fill: u64,
+	/// Gas units for pre-claim settlement step.
+	pub pre_claim: u64,
 	/// Gas units for claim/finalize step.
 	pub claim: u64,
 }
@@ -197,16 +201,22 @@ pub const COMMON_DEFAULTS: SeedDefaults = SeedDefaults {
 	gas_resource_lock: GasFlowUnits {
 		open: 0,
 		fill: 100_000,
+		post_fill: 300_000,
+		pre_claim: 0,
 		claim: 122793,
 	},
 	gas_permit2_escrow: GasFlowUnits {
 		open: 146306,
 		fill: 100_000,
+		post_fill: 300_000,
+		pre_claim: 0,
 		claim: 60084,
 	},
 	gas_eip3009_escrow: GasFlowUnits {
 		open: 130254,
 		fill: 100_000,
+		post_fill: 300_000,
+		pre_claim: 0,
 		claim: 60084,
 	},
 };

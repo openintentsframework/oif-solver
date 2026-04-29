@@ -319,6 +319,10 @@ pub struct GasFlowUnits {
 	pub open: Option<u64>,
 	/// Optional override for fill step gas units
 	pub fill: Option<u64>,
+	/// Optional override for post-fill settlement step gas units
+	pub post_fill: Option<u64>,
+	/// Optional override for pre-claim settlement step gas units
+	pub pre_claim: Option<u64>,
 	/// Optional override for claim/finalize step gas units
 	#[serde(alias = "finalize")] // allow "finalize" as an alias in config
 	pub claim: Option<u64>,

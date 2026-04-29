@@ -133,12 +133,18 @@ sol! {
 	struct UpdateGasConfig {
 		uint64 resourceLockOpen;
 		uint64 resourceLockFill;
+		uint64 resourceLockPostFill;
+		uint64 resourceLockPreClaim;
 		uint64 resourceLockClaim;
 		uint64 permit2EscrowOpen;
 		uint64 permit2EscrowFill;
+		uint64 permit2EscrowPostFill;
+		uint64 permit2EscrowPreClaim;
 		uint64 permit2EscrowClaim;
 		uint64 eip3009EscrowOpen;
 		uint64 eip3009EscrowFill;
+		uint64 eip3009EscrowPostFill;
+		uint64 eip3009EscrowPreClaim;
 		uint64 eip3009EscrowClaim;
 		uint256 nonce;
 		uint256 deadline;
@@ -438,12 +444,18 @@ impl UpdateFeeConfigContents {
 pub struct UpdateGasConfigContents {
 	pub resource_lock_open: u64,
 	pub resource_lock_fill: u64,
+	pub resource_lock_post_fill: u64,
+	pub resource_lock_pre_claim: u64,
 	pub resource_lock_claim: u64,
 	pub permit2_escrow_open: u64,
 	pub permit2_escrow_fill: u64,
+	pub permit2_escrow_post_fill: u64,
+	pub permit2_escrow_pre_claim: u64,
 	pub permit2_escrow_claim: u64,
 	pub eip3009_escrow_open: u64,
 	pub eip3009_escrow_fill: u64,
+	pub eip3009_escrow_post_fill: u64,
+	pub eip3009_escrow_pre_claim: u64,
 	pub eip3009_escrow_claim: u64,
 	#[serde(with = "string_or_number")]
 	pub nonce: u64,
@@ -457,12 +469,18 @@ impl UpdateGasConfigContents {
 		UpdateGasConfig {
 			resourceLockOpen: self.resource_lock_open,
 			resourceLockFill: self.resource_lock_fill,
+			resourceLockPostFill: self.resource_lock_post_fill,
+			resourceLockPreClaim: self.resource_lock_pre_claim,
 			resourceLockClaim: self.resource_lock_claim,
 			permit2EscrowOpen: self.permit2_escrow_open,
 			permit2EscrowFill: self.permit2_escrow_fill,
+			permit2EscrowPostFill: self.permit2_escrow_post_fill,
+			permit2EscrowPreClaim: self.permit2_escrow_pre_claim,
 			permit2EscrowClaim: self.permit2_escrow_claim,
 			eip3009EscrowOpen: self.eip3009_escrow_open,
 			eip3009EscrowFill: self.eip3009_escrow_fill,
+			eip3009EscrowPostFill: self.eip3009_escrow_post_fill,
+			eip3009EscrowPreClaim: self.eip3009_escrow_pre_claim,
 			eip3009EscrowClaim: self.eip3009_escrow_claim,
 			nonce: U256::from(self.nonce),
 			deadline: U256::from(self.deadline),

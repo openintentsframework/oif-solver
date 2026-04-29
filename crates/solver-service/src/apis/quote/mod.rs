@@ -766,8 +766,10 @@ mod tests {
 	fn create_test_cost_context() -> CostContext {
 		CostContext {
 			cost_breakdown: CostBreakdown {
-				gas_open: rust_decimal::Decimal::new(1, 2),   // 0.01
-				gas_fill: rust_decimal::Decimal::new(2, 2),   // 0.02
+				gas_open: rust_decimal::Decimal::new(1, 2), // 0.01
+				gas_fill: rust_decimal::Decimal::new(2, 2), // 0.02
+				gas_post_fill: rust_decimal::Decimal::ZERO,
+				gas_pre_claim: rust_decimal::Decimal::ZERO,
 				gas_claim: rust_decimal::Decimal::new(1, 2),  // 0.01
 				gas_buffer: rust_decimal::Decimal::new(4, 3), // 0.004
 				rate_buffer: rust_decimal::Decimal::ZERO,
