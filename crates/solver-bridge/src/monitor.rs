@@ -1203,6 +1203,19 @@ impl RebalanceMonitor {
 			.save_transfer(transfer)
 			.await?;
 
+		// Intentional: the permit is held across the entire `bridge_asset`
+		// call, which internally broadcasts the deposit *and* polls for
+		// receipt confirmation (~12 × 5 s = 60 s worst case). The redeem path
+		// at line ~829 uses a narrower acquire+broadcast pattern because
+		// `delivery.deliver()` returns immediately after submit; bridge
+		// implementations bundle submit+confirm in `bridge_asset`, so without
+		// a trait-level split we can't narrow without breaking the API
+		// contract. Serializing here is acceptable: the resume path is rare
+		// (only after an approve completes), and the alternative — letting
+		// concurrent submissions race during confirmation — risks nonce
+		// collisions on the same signer. Tracked as follow-up: split
+		// `bridge_asset` into `bridge_submit` + `bridge_confirm` so this
+		// site can acquire only around `bridge_submit`.
 		let _permit = self.transaction_semaphore.acquire().await.map_err(|e| {
 			crate::BridgeError::TransactionFailed(format!(
 				"Failed to acquire semaphore for bridge resume: {e}"

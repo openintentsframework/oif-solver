@@ -276,8 +276,10 @@ impl AlloyDelivery {
 	}
 
 	/// Returns the next nonce to use for `from` on `chain_id`, taking it from the
-	/// resettable cache. On first use for an address, fetches `pending` from chain
-	/// to seed the cache.
+	/// resettable cache. Every call samples chain `pending`, but normal allocation
+	/// is monotonic: a stale RPC pending nonce must not move the local cache
+	/// backward and reissue a nonce already handed out by this process. Backward
+	/// reset is reserved for the explicit `nonce too low` resync path.
 	async fn next_nonce_for(&self, chain_id: u64, from: Address) -> Result<u64, DeliveryError> {
 		let provider = self.get_provider(chain_id)?;
 		let pending = provider
@@ -286,8 +288,8 @@ impl AlloyDelivery {
 			.await
 			.map_err(|e| DeliveryError::Network(format!("Failed to fetch pending nonce: {e}")))?;
 		let mgr = self.get_nonce_manager(chain_id)?;
-		let (previous_local_next_nonce, local_next_nonce) =
-			mgr.reconcile_with_chain_pending(from, pending);
+		let previous_local_next_nonce = mgr.peek(from);
+		let local_next_nonce = mgr.set_next_nonce(from, pending);
 		tracing::debug!(
 			chain_id,
 			signer = %from,

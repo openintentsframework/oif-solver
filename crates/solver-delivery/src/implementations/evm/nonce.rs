@@ -12,7 +12,10 @@ use std::sync::{Arc, Mutex};
 ///
 /// `set_next_nonce` and `take_next` are the only mutators. The cache only
 /// advances; downward updates are rejected to avoid re-handing-out a nonce
-/// that has already been used in-process.
+/// that has already been used in-process. This cache is still needed even when
+/// callers sample chain `pending` before allocation: RPC pending nonce can lag
+/// immediately after a successful submit, so chain state alone can reissue the
+/// previous nonce inside one process.
 #[derive(Debug, Default, Clone)]
 pub struct ResettableNonceManager {
 	cache: Arc<Mutex<HashMap<Address, u64>>>,
@@ -71,7 +74,7 @@ impl ResettableNonceManager {
 		let mut cache = self.cache.lock().expect("nonce cache mutex poisoned");
 		let n = cache.get_mut(&address)?;
 		let taken = *n;
-		*n = taken + 1;
+		*n = taken.checked_add(1)?;
 		Some(taken)
 	}
 
@@ -125,6 +128,15 @@ mod tests {
 	fn take_next_on_empty_cache_returns_none() {
 		let mgr = ResettableNonceManager::new();
 		assert_eq!(mgr.take_next(ADDR), None);
+	}
+
+	#[test]
+	fn take_next_returns_none_without_wrapping_at_u64_max() {
+		let mgr = ResettableNonceManager::new();
+		mgr.set_next_nonce(ADDR, u64::MAX);
+
+		assert_eq!(mgr.take_next(ADDR), None);
+		assert_eq!(mgr.peek(ADDR), Some(u64::MAX));
 	}
 
 	#[test]

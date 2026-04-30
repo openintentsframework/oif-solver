@@ -112,15 +112,6 @@ impl LayerZeroBridge {
 		parse_address(addr_str)
 	}
 
-	#[allow(dead_code)]
-	fn get_vault(&self, chain_id: u64) -> Result<Address, BridgeError> {
-		let addr_str =
-			self.config.vault_addresses.get(&chain_id).ok_or_else(|| {
-				BridgeError::Config(format!("No Vault address for chain {chain_id}"))
-			})?;
-		parse_address(addr_str)
-	}
-
 	fn build_extra_options(&self) -> Vec<u8> {
 		encode_lz_receive_option(self.config.lz_receive_gas)
 	}
