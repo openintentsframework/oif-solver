@@ -301,6 +301,8 @@ pub enum StoreConfig {
 	Redis {
 		/// Redis connection URL (e.g., "redis://localhost:6379")
 		url: String,
+		/// When true, use the Redis Cluster client (required for AWS MemoryDB).
+		cluster_mode: bool,
 	},
 	/// Create a file-based storage (useful for single-instance deployments)
 	File {
@@ -315,9 +317,12 @@ impl std::fmt::Debug for StoreConfig {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			StoreConfig::Storage(_) => f.debug_struct("Storage").finish_non_exhaustive(),
-			StoreConfig::Redis { url } => {
+			StoreConfig::Redis { url, cluster_mode } => {
 				let redacted = redact_url_credentials(url);
-				f.debug_struct("Redis").field("url", &redacted).finish()
+				f.debug_struct("Redis")
+					.field("url", &redacted)
+					.field("cluster_mode", cluster_mode)
+					.finish()
 			},
 			StoreConfig::File { path } => f.debug_struct("File").field("path", path).finish(),
 			StoreConfig::Memory => f.debug_struct("Memory").finish(),
@@ -338,7 +343,8 @@ impl StoreConfig {
 			"redis" => {
 				let url = std::env::var("REDIS_URL")
 					.unwrap_or_else(|_| "redis://localhost:6379".to_string());
-				Ok(StoreConfig::Redis { url })
+				let cluster_mode = parse_redis_cluster_mode_env();
+				Ok(StoreConfig::Redis { url, cluster_mode })
 			},
 			"file" => {
 				let path =
@@ -374,8 +380,14 @@ pub fn create_storage_backend(
 ) -> Result<std::sync::Arc<dyn StorageInterface>, StorageError> {
 	match config {
 		StoreConfig::Storage(s) => Ok(s),
-		StoreConfig::Redis { url } => {
-			let storage = implementations::redis::RedisStorage::with_url(url)?;
+		StoreConfig::Redis { url, cluster_mode } => {
+			let storage = implementations::redis::RedisStorage::new(
+				url,
+				implementations::redis::DEFAULT_CONNECTION_TIMEOUT_MS,
+				implementations::redis::DEFAULT_KEY_PREFIX.to_string(),
+				implementations::redis::TtlConfig::default(),
+				cluster_mode,
+			)?;
 			Ok(std::sync::Arc::new(storage))
 		},
 		StoreConfig::File { path } => {
@@ -389,6 +401,23 @@ pub fn create_storage_backend(
 			Ok(std::sync::Arc::new(storage))
 		},
 	}
+}
+
+/// Parses the `REDIS_CLUSTER_MODE` environment variable as a boolean.
+///
+/// Accepts `1`, `true`, `yes`, `on` (case-insensitive) as `true`. Any other
+/// value, or an unset variable, returns `false`. Single source of truth for
+/// every Redis instantiation path in this repo.
+pub fn parse_redis_cluster_mode_env() -> bool {
+	std::env::var("REDIS_CLUSTER_MODE")
+		.ok()
+		.map(|v| {
+			matches!(
+				v.trim().to_ascii_lowercase().as_str(),
+				"1" | "true" | "yes" | "on"
+			)
+		})
+		.unwrap_or(false)
 }
 
 /// Redacts credentials (userinfo) from a URL to prevent leaking secrets in logs.
@@ -604,27 +633,30 @@ mod tests {
 	use super::*;
 
 	#[test]
+	#[serial_test::serial(env_redis)]
 	fn test_store_config_from_env_redis_default() {
 		std::env::remove_var("STORAGE_BACKEND");
 		std::env::remove_var("REDIS_URL");
 
 		let config = StoreConfig::from_env().unwrap();
 		match config {
-			StoreConfig::Redis { url } => {
+			StoreConfig::Redis { url, cluster_mode } => {
 				assert_eq!(url, "redis://localhost:6379");
+				assert!(!cluster_mode);
 			},
 			_ => panic!("Expected Redis config"),
 		}
 	}
 
 	#[test]
+	#[serial_test::serial(env_redis)]
 	fn test_store_config_from_env_redis_custom_url() {
 		std::env::set_var("STORAGE_BACKEND", "redis");
 		std::env::set_var("REDIS_URL", "redis://custom:6380");
 
 		let config = StoreConfig::from_env().unwrap();
 		match config {
-			StoreConfig::Redis { url } => {
+			StoreConfig::Redis { url, .. } => {
 				assert_eq!(url, "redis://custom:6380");
 			},
 			_ => panic!("Expected Redis config"),
@@ -635,6 +667,7 @@ mod tests {
 	}
 
 	#[test]
+	#[serial_test::serial(env_redis)]
 	fn test_store_config_from_env_file_default_path() {
 		std::env::set_var("STORAGE_BACKEND", "file");
 		std::env::remove_var("STORAGE_PATH");
@@ -651,6 +684,7 @@ mod tests {
 	}
 
 	#[test]
+	#[serial_test::serial(env_redis)]
 	fn test_store_config_from_env_file_custom_path() {
 		std::env::set_var("STORAGE_BACKEND", "file");
 		std::env::set_var("STORAGE_PATH", "/custom/path");
@@ -668,6 +702,7 @@ mod tests {
 	}
 
 	#[test]
+	#[serial_test::serial(env_redis)]
 	fn test_store_config_from_env_memory() {
 		std::env::set_var("STORAGE_BACKEND", "memory");
 
@@ -678,6 +713,7 @@ mod tests {
 	}
 
 	#[test]
+	#[serial_test::serial(env_redis)]
 	fn test_store_config_from_env_unsupported() {
 		std::env::set_var("STORAGE_BACKEND", "unsupported");
 
@@ -694,11 +730,83 @@ mod tests {
 	fn test_store_config_debug_redis() {
 		let config = StoreConfig::Redis {
 			url: "redis://:secret@localhost:6379".to_string(),
+			cluster_mode: false,
 		};
 		let debug_str = format!("{config:?}");
 		// Should redact credentials
 		assert!(debug_str.contains("[REDACTED]"));
 		assert!(!debug_str.contains("secret"));
+	}
+
+	#[test]
+	#[serial_test::serial(env_redis)]
+	fn test_store_config_from_env_redis_cluster_mode_default_false() {
+		std::env::remove_var("STORAGE_BACKEND");
+		std::env::remove_var("REDIS_URL");
+		std::env::remove_var("REDIS_CLUSTER_MODE");
+
+		let cfg = StoreConfig::from_env().unwrap();
+		match cfg {
+			StoreConfig::Redis { url, cluster_mode } => {
+				assert_eq!(url, "redis://localhost:6379");
+				assert!(!cluster_mode);
+			},
+			other => panic!("expected Redis variant, got {other:?}"),
+		}
+	}
+
+	#[test]
+	#[serial_test::serial(env_redis)]
+	fn test_store_config_from_env_redis_cluster_mode_true() {
+		std::env::set_var("STORAGE_BACKEND", "redis");
+		std::env::set_var(
+			"REDIS_URL",
+			"rediss://clustercfg.example.memorydb.amazonaws.com:6379",
+		);
+		std::env::set_var("REDIS_CLUSTER_MODE", "true");
+
+		let cfg = StoreConfig::from_env().unwrap();
+		match cfg {
+			StoreConfig::Redis { cluster_mode, .. } => assert!(cluster_mode),
+			other => panic!("expected Redis variant, got {other:?}"),
+		}
+
+		std::env::remove_var("STORAGE_BACKEND");
+		std::env::remove_var("REDIS_URL");
+		std::env::remove_var("REDIS_CLUSTER_MODE");
+	}
+
+	#[test]
+	#[serial_test::serial(env_redis)]
+	fn test_parse_redis_cluster_mode_env_unset_returns_false() {
+		std::env::remove_var("REDIS_CLUSTER_MODE");
+		assert!(!parse_redis_cluster_mode_env());
+	}
+
+	#[test]
+	#[serial_test::serial(env_redis)]
+	fn test_parse_redis_cluster_mode_env_accepts_true_synonyms() {
+		for v in ["1", "true", "TRUE", "True", "yes", "on", " true "] {
+			std::env::set_var("REDIS_CLUSTER_MODE", v);
+			assert!(
+				parse_redis_cluster_mode_env(),
+				"value '{v}' should parse as true"
+			);
+		}
+		std::env::remove_var("REDIS_CLUSTER_MODE");
+	}
+
+	#[test]
+	#[serial_test::serial(env_redis)]
+	fn test_parse_redis_cluster_mode_env_rejects_other() {
+		for v in ["0", "false", "no", "off", "garbage", ""] {
+			std::env::set_var("REDIS_CLUSTER_MODE", v);
+			assert!(
+				!parse_redis_cluster_mode_env(),
+				"value '{v}' should parse as false"
+			);
+		}
+		std::env::remove_var("REDIS_CLUSTER_MODE");
 	}
 
 	#[test]

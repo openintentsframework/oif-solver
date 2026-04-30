@@ -69,8 +69,13 @@ pub struct AppState {
 
 fn create_admin_storage_backend(
 	redis_url: String,
+	cluster_mode: bool,
 ) -> Result<std::sync::Arc<dyn solver_storage::StorageInterface>, Box<dyn std::error::Error>> {
-	create_storage_backend(StoreConfig::Redis { url: redis_url }).map_err(|e| {
+	create_storage_backend(StoreConfig::Redis {
+		url: redis_url,
+		cluster_mode,
+	})
+	.map_err(|e| {
 		tracing::error!("Failed to create admin storage backend: {}", e);
 		Box::new(std::io::Error::other(format!("Admin storage error: {e}")))
 			as Box<dyn std::error::Error>
@@ -196,6 +201,7 @@ pub async fn start_server(
 			if admin_config.enabled {
 				let redis_url = std::env::var("REDIS_URL")
 					.unwrap_or_else(|_| "redis://localhost:6379".to_string());
+				let cluster_mode = solver_storage::parse_redis_cluster_mode_env();
 				let solver_id = config.solver.id.clone();
 				// Use explicit chain_id from admin config, or fall back to first network
 				let chain_id = admin_config
@@ -205,6 +211,7 @@ pub async fn start_server(
 				match create_nonce_store_with_namespace(
 					StoreConfig::Redis {
 						url: redis_url.clone(),
+						cluster_mode,
 					},
 					&solver_id,
 					"siwe",
@@ -235,7 +242,7 @@ pub async fn start_server(
 				};
 
 				// Share one storage backend for all admin Redis operations.
-				let admin_storage = create_admin_storage_backend(redis_url.clone())?;
+				let admin_storage = create_admin_storage_backend(redis_url.clone(), cluster_mode)?;
 
 				// Create ConfigStore for OperatorConfig
 				let config_store = create_admin_config_store(admin_storage.clone(), &solver_id)?;
@@ -1219,7 +1226,7 @@ mod tests {
 
 	#[test]
 	fn create_admin_storage_backend_returns_error_for_invalid_redis_url() {
-		let err = match super::create_admin_storage_backend(String::new()) {
+		let err = match super::create_admin_storage_backend(String::new(), false) {
 			Ok(_) => panic!("expected invalid redis URL to fail"),
 			Err(err) => err,
 		};
