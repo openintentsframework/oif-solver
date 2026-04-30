@@ -851,15 +851,13 @@ impl DeliveryInterface for AlloyDelivery {
 						// we never reset without authoritative chain state.
 						let mgr = self.get_nonce_manager(chain_id)?;
 						let cache_before = mgr.peek(from);
-						let pending_result =
-							provider.get_transaction_count(from).pending().await;
+						let pending_result = provider.get_transaction_count(from).pending().await;
 						let (pending_opt, fetch_err): (Option<u64>, Option<String>) =
 							match pending_result {
 								Ok(p) => (Some(p), None),
 								Err(e) => (None, Some(e.to_string())),
 							};
-						let cache_after =
-							apply_nonce_cache_action(mgr, from, action, pending_opt);
+						let cache_after = apply_nonce_cache_action(mgr, from, action, pending_opt);
 						if let Some(pending) = pending_opt {
 							tracing::warn!(
 								chain_id,
@@ -1613,7 +1611,10 @@ mod tests {
 	fn nonce_action_for_outcome_maps_correctly() {
 		use NonceCacheAction::*;
 		use SubmissionOutcome::*;
-		assert_eq!(nonce_action_for_outcome(DefinitelyRejected), AttemptRollback);
+		assert_eq!(
+			nonce_action_for_outcome(DefinitelyRejected),
+			AttemptRollback
+		);
 		assert_eq!(nonce_action_for_outcome(Replacement), Keep);
 		assert_eq!(nonce_action_for_outcome(Ambiguous), Keep);
 		assert_eq!(nonce_action_for_outcome(NonceTooLow), NonceTooLowRetry);
@@ -1628,7 +1629,11 @@ mod tests {
 		assert_eq!(mgr.peek(signer), Some(101));
 
 		let after = apply_nonce_cache_action(&mgr, signer, AttemptRollback, Some(100));
-		assert_eq!(after, Some(100), "cache must reset to authoritative pending");
+		assert_eq!(
+			after,
+			Some(100),
+			"cache must reset to authoritative pending"
+		);
 		assert_eq!(mgr.peek(signer), Some(100));
 	}
 

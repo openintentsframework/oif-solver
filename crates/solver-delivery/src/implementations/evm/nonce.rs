@@ -378,13 +378,34 @@ mod tests {
 			classify_submission_outcome("insufficient funds for gas * price + value"),
 			DefinitelyRejected
 		);
-		assert_eq!(classify_submission_outcome("intrinsic gas too low"), DefinitelyRejected);
-		assert_eq!(classify_submission_outcome("nonce too high"), DefinitelyRejected);
-		assert_eq!(classify_submission_outcome("invalid sender"), DefinitelyRejected);
-		assert_eq!(classify_submission_outcome("invalid signature"), DefinitelyRejected);
-		assert_eq!(classify_submission_outcome("invalid chain id"), DefinitelyRejected);
-		assert_eq!(classify_submission_outcome("txpool is full"), DefinitelyRejected);
-		assert_eq!(classify_submission_outcome("exceeds block gas limit"), DefinitelyRejected);
+		assert_eq!(
+			classify_submission_outcome("intrinsic gas too low"),
+			DefinitelyRejected
+		);
+		assert_eq!(
+			classify_submission_outcome("nonce too high"),
+			DefinitelyRejected
+		);
+		assert_eq!(
+			classify_submission_outcome("invalid sender"),
+			DefinitelyRejected
+		);
+		assert_eq!(
+			classify_submission_outcome("invalid signature"),
+			DefinitelyRejected
+		);
+		assert_eq!(
+			classify_submission_outcome("invalid chain id"),
+			DefinitelyRejected
+		);
+		assert_eq!(
+			classify_submission_outcome("txpool is full"),
+			DefinitelyRejected
+		);
+		assert_eq!(
+			classify_submission_outcome("exceeds block gas limit"),
+			DefinitelyRejected
+		);
 		assert_eq!(
 			classify_submission_outcome("transaction type not supported"),
 			DefinitelyRejected
@@ -408,17 +429,17 @@ mod tests {
 			classify_submission_outcome("transaction underpriced"),
 			Replacement
 		);
-		assert_eq!(
-			classify_submission_outcome("already known"),
-			Replacement
-		);
+		assert_eq!(classify_submission_outcome("already known"), Replacement);
 	}
 
 	#[test]
 	fn classify_submission_outcome_ambiguous_transport() {
 		use SubmissionOutcome::*;
 		assert_eq!(classify_submission_outcome("connection timeout"), Ambiguous);
-		assert_eq!(classify_submission_outcome("connection reset by peer"), Ambiguous);
+		assert_eq!(
+			classify_submission_outcome("connection reset by peer"),
+			Ambiguous
+		);
 		assert_eq!(
 			classify_submission_outcome("server returned status 503: service unavailable"),
 			Ambiguous
@@ -427,8 +448,14 @@ mod tests {
 			classify_submission_outcome("server returned status 502: bad gateway"),
 			Ambiguous
 		);
-		assert_eq!(classify_submission_outcome("failed to decode response"), Ambiguous);
-		assert_eq!(classify_submission_outcome("Max retries exceeded"), Ambiguous);
+		assert_eq!(
+			classify_submission_outcome("failed to decode response"),
+			Ambiguous
+		);
+		assert_eq!(
+			classify_submission_outcome("Max retries exceeded"),
+			Ambiguous
+		);
 		assert_eq!(classify_submission_outcome(""), Ambiguous);
 		assert_eq!(classify_submission_outcome("unknown error"), Ambiguous);
 	}
