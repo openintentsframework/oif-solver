@@ -132,6 +132,10 @@ Submitted --> Relaying --> PendingRedemption --> Completed   (OFT send + vault r
 | Per-pair lock | Only one active transfer per pair_id at a time |
 | Transaction semaphore | Bridge and redeem transactions are serialized to prevent nonce conflicts |
 | Timeout escalation | Transfers stuck >30 min (Submitted/Relaying) or >24h (PendingRedemption) escalate to NeedsIntervention |
+| Approve-phase timeout | An approve tx that has been broadcast (or has a stored hash) but never advances the bridge phase within `APPROVE_PHASE_TIMEOUT_SECS` (1h) escalates to NeedsIntervention. Guard fires on `approve_was_broadcast OR approve_tx_hash.is_some()` so a stored hash with the flag unset cannot bypass the timeout. |
+| Allowance precheck fallback | A transient RPC failure during the pre-broadcast allowance read defaults to `0` and falls through to approve, instead of escalating. ERC-20 approve is a *set* operation — a redundant approve is a safe operational fallback. |
+| Malformed approve hash | If `approve_tx_hash` is stored but cannot be decoded as 32 hex bytes, the monitor escalates to NeedsIntervention rather than retrying — corrupt state must not be auto-recovered. |
+| Nonce-cache rollback | When `eth_sendRawTransaction` returns a definite rejection (e.g. plain `transaction underpriced`, `insufficient funds`), the delivery layer resets the local nonce cache to the chain's `pending` count instead of leaving it advanced. Prevents the next tx from colliding on a phantom nonce. |
 | Redeem retry limit | 3 consecutive redeem failures escalate to NeedsIntervention |
 | Non-composer vault guard | Routes without a vault address are rejected for non-composer flows |
 

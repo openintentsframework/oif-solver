@@ -404,6 +404,13 @@ impl BridgeService {
 			},
 			"retry" => {
 				transfer.failure_count = 0;
+				// Clear the deposit crash-window marker. The operator's explicit
+				// retry implies they've checked the chain and confirmed no
+				// deposit was broadcast — without this the monitor's crash-window
+				// guard (status==Submitted && tx_hash==None && bridge_submit_attempted)
+				// would immediately re-escalate the transfer back to
+				// NeedsIntervention on the next tick.
+				transfer.bridge_submit_attempted = false;
 				if let Some(prev_status) = transfer.status_before_intervention.take() {
 					transfer.status = prev_status;
 				} else {
@@ -1438,6 +1445,65 @@ mod tests {
 		assert_eq!(resolved.failure_count, 0);
 		let saved = saved.lock().unwrap().clone().unwrap();
 		assert!(matches!(saved.status, BridgeTransferStatus::Relaying));
+	}
+
+	#[tokio::test]
+	async fn test_resolve_transfer_retry_clears_bridge_submit_attempted_marker() {
+		// Regression for the retry-loop bug: a transfer escalated to
+		// NeedsIntervention via the deposit crash-window (Submitted +
+		// tx_hash=None + bridge_submit_attempted=true) must, after an admin
+		// retry, come back with bridge_submit_attempted=false. Otherwise the
+		// monitor's crash-window guard would re-escalate it on the next tick,
+		// looping forever.
+		let mut transfer = pending_transfer(BridgeTransferStatus::NeedsIntervention(
+			"deposit crash window".to_string(),
+		));
+		transfer.status_before_intervention = Some(BridgeTransferStatus::Submitted);
+		transfer.bridge_submit_attempted = true;
+		transfer.tx_hash = None;
+		let saved = Arc::new(Mutex::new(None));
+		let mut storage = MockStorageInterface::new();
+		{
+			let expected_transfer = transfer.clone();
+			storage.expect_get_bytes().returning(move |_| {
+				let expected_transfer = expected_transfer.clone();
+				Box::pin(async move { Ok(transfer_json(&expected_transfer)) })
+			});
+		}
+		{
+			let saved = saved.clone();
+			storage
+				.expect_set_bytes()
+				.returning(move |_key, value, _indexes, _ttl| {
+					let transfer: PendingBridgeTransfer = serde_json::from_slice(&value).unwrap();
+					*saved.lock().unwrap() = Some(transfer);
+					Box::pin(async move { Ok(()) })
+				});
+		}
+
+		let service = make_service(Arc::new(TestBridge::new()), storage);
+		let resolved = service
+			.resolve_transfer(
+				&transfer.id,
+				"retry",
+				"operator confirmed no deposit broadcast",
+			)
+			.await
+			.unwrap();
+
+		// Returned-by-the-call view: status restored, marker cleared.
+		assert!(matches!(resolved.status, BridgeTransferStatus::Submitted));
+		assert!(
+			!resolved.bridge_submit_attempted,
+			"retry must clear bridge_submit_attempted to break the crash-window loop"
+		);
+		assert!(resolved.tx_hash.is_none());
+
+		// Persisted view (what the monitor will read next tick): same shape.
+		let saved = saved.lock().unwrap().clone().unwrap();
+		assert!(matches!(saved.status, BridgeTransferStatus::Submitted));
+		assert!(!saved.bridge_submit_attempted);
+		assert!(saved.tx_hash.is_none());
 	}
 
 	#[tokio::test]

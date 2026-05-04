@@ -3,7 +3,9 @@
 //! This module provides concrete implementations of the DeliveryInterface trait,
 //! supporting blockchain transaction submission and monitoring using the Alloy library.
 
-use crate::implementations::evm::nonce::{is_nonce_too_low_error, ResettableNonceManager};
+use crate::implementations::evm::nonce::{
+	classify_submission_outcome, ResettableNonceManager, SubmissionOutcome,
+};
 use crate::{
 	DeliveryError, DeliveryInterface, InsufficientNativeGasInfo, TransactionMonitoringEvent,
 	TransactionTrackingWithConfig,
@@ -33,6 +35,27 @@ use std::time::{Duration, Instant};
 const TX_CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const ETHEREUM_MAINNET_CHAIN_ID: u64 = 1;
 const MAINNET_PRIORITY_FEE_FLOOR_WEI: u128 = 2_000_000_000;
+
+/// Drift-monitor parameters. The monitor periodically compares local nonce
+/// cache against chain pending. Some lead is normal during in-flight
+/// broadcasts; only SUSTAINED drift indicates a possible cache leak.
+///
+/// IMPORTANT: this monitor is OBSERVABILITY ONLY. It does not mutate the
+/// cache, retry transactions, or change any runtime behavior. Its only
+/// effect is structured tracing events.
+///
+/// Type discipline: thresholds compared against `cache_lead()` are `i128`
+/// to match its return type. Tick counts are `u32`. No mixed-integer
+/// comparisons should appear anywhere in this monitor — if you find one,
+/// fix the constant's type, not the comparison site.
+const NONCE_DRIFT_POLL_INTERVAL_SECS: u64 = 60;
+/// Per-tick drift threshold. lead < this → trace-level event (normal).
+/// `i128` to match `cache_lead` return type.
+const NONCE_DRIFT_WARN_THRESHOLD: i128 = 3;
+/// Consecutive ticks over threshold before WARN escalation. `u32`.
+const NONCE_DRIFT_WARN_AFTER_TICKS: u32 = 5; // ~5 minutes at 60s interval
+/// Consecutive ticks over threshold before ERROR escalation. `u32`.
+const NONCE_DRIFT_ERROR_AFTER_TICKS: u32 = 15; // ~15 minutes
 
 /// Outcome of polling for a transaction's confirmation.
 ///
@@ -119,6 +142,193 @@ pub struct AlloyDelivery {
 	/// Signer address per chain — needed to call `eth_getTransactionCount(from, "pending")`
 	/// for the resync path. The signer itself stays inside the provider's wallet filler.
 	signer_addresses: HashMap<u64, Address>,
+}
+
+/// What the broadcast wrapper should do with the local nonce cache,
+/// given a classified submission outcome. Pure decision, no I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonceCacheAction {
+	/// Tx accepted (or kept-advanced for replacement / ambiguous outcomes) —
+	/// keep cache advanced as-is.
+	Keep,
+	/// Tx provably rejected pre-pool. Caller should attempt to fetch
+	/// chain pending and call `reset_next_nonce`. If the fetch fails,
+	/// caller MUST fall back to `Keep` — we don't roll back without
+	/// authoritative chain state.
+	AttemptRollback,
+	/// Caller should run the existing nonce_too_low resync-and-retry path.
+	NonceTooLowRetry,
+}
+
+/// Pure outcome → action mapping. No I/O, easy to unit-test.
+fn nonce_action_for_outcome(outcome: SubmissionOutcome) -> NonceCacheAction {
+	match outcome {
+		SubmissionOutcome::DefinitelyRejected => NonceCacheAction::AttemptRollback,
+		SubmissionOutcome::NonceTooLow => NonceCacheAction::NonceTooLowRetry,
+		SubmissionOutcome::Replacement | SubmissionOutcome::Ambiguous => NonceCacheAction::Keep,
+	}
+}
+
+/// Applies a `NonceCacheAction` to the cache. The `chain_pending` argument
+/// represents the *result* of the rollback-time fetch: `Some(pending)` if
+/// the fetch succeeded, `None` if it failed (or we never attempted it).
+///
+/// Returns the cache value after applying the action, for tracing.
+///
+/// Pure synchronous helper so the rollback invariant is unit-testable
+/// without spinning up a provider or async runtime.
+///
+/// **Visibility:** intentionally `fn` (private to this module), not `pub`.
+/// This is delivery-layer policy glue — it encodes how the alloy broadcast
+/// wrapper reacts to a classified submission outcome. It is NOT part of the
+/// nonce-manager public API. If another module ever needs to invoke this
+/// policy, the right move is to surface a higher-level operation on the
+/// nonce manager (e.g. `try_rollback_to_chain_pending`), not export this
+/// helper directly.
+fn apply_nonce_cache_action(
+	mgr: &ResettableNonceManager,
+	signer: Address,
+	action: NonceCacheAction,
+	chain_pending: Option<u64>,
+) -> Option<u64> {
+	match action {
+		NonceCacheAction::Keep => mgr.peek(signer),
+		NonceCacheAction::AttemptRollback => match chain_pending {
+			Some(pending) => Some(mgr.reset_next_nonce(signer, pending)),
+			// No authoritative chain state — KEEP advanced. We never reset
+			// the cache without a successful pending-fetch.
+			None => mgr.peek(signer),
+		},
+		// The nonce_too_low path has its own existing resync-and-retry; the
+		// helper short-circuits to a no-op here so callers can't accidentally
+		// invoke double-handling. Production code paths that classify as
+		// NonceTooLow MUST take the existing retry branch, not this helper.
+		NonceCacheAction::NonceTooLowRetry => mgr.peek(signer),
+	}
+}
+
+/// Drift event severity, derived purely from the consecutive-ticks count.
+/// Pure data type for unit testability — no I/O, no logging logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriftSeverity {
+	Normal,
+	Warn,
+	Error,
+}
+
+/// Decide the drift event severity from the consecutive-ticks count.
+/// Pure function for unit testability.
+fn drift_severity_for_ticks(ticks_over_threshold: u32) -> DriftSeverity {
+	if ticks_over_threshold >= NONCE_DRIFT_ERROR_AFTER_TICKS {
+		DriftSeverity::Error
+	} else if ticks_over_threshold >= NONCE_DRIFT_WARN_AFTER_TICKS {
+		DriftSeverity::Warn
+	} else {
+		DriftSeverity::Normal
+	}
+}
+
+/// Spawn the passive nonce-drift monitor. Polls each (chain, signer)
+/// every `NONCE_DRIFT_POLL_INTERVAL_SECS`, computes `cache_lead`, and emits
+/// a tracing event escalating from trace → warn → error as drift sustains.
+///
+/// MUTATIONS: none. The monitor never resets, retries, or modifies the
+/// cache. Its sole effect is logs.
+///
+/// SHUTDOWN: this monitor runs for the lifetime of the process. The
+/// surrounding `AlloyDelivery` does not currently expose a shutdown channel
+/// for delivery-spawned tasks, and adding one would ripple through several
+/// call sites for no observability gain. Drift checks are cheap (one RPC
+/// call per chain per minute), so the cost of running until process exit is
+/// negligible. If a shutdown channel is later added to delivery, plumb a
+/// `tokio::sync::watch::Receiver<bool>` here and bias the `select!` on it.
+fn spawn_nonce_drift_monitor(
+	nonce_managers: HashMap<u64, ResettableNonceManager>,
+	signer_addresses: HashMap<u64, Address>,
+	providers: HashMap<u64, DynProvider>,
+) {
+	tokio::spawn(async move {
+		let mut consecutive: HashMap<(u64, Address), u32> = HashMap::new();
+		let mut interval =
+			tokio::time::interval(Duration::from_secs(NONCE_DRIFT_POLL_INTERVAL_SECS));
+		// Skip the immediate first tick so we don't poll before providers have
+		// settled — `tokio::time::interval` fires at t=0 by default.
+		interval.tick().await;
+		loop {
+			interval.tick().await;
+			for (chain_id, mgr) in &nonce_managers {
+				let Some(signer) = signer_addresses.get(chain_id) else {
+					continue;
+				};
+				let Some(provider) = providers.get(chain_id) else {
+					continue;
+				};
+				let pending = match provider.get_transaction_count(*signer).pending().await {
+					Ok(p) => p,
+					Err(e) => {
+						tracing::trace!(
+							chain_id = *chain_id,
+							signer = %signer,
+							error = %e,
+							"drift monitor: failed to fetch chain pending; skipping this tick"
+						);
+						continue;
+					},
+				};
+				let lead = mgr.cache_lead(*signer, pending);
+				let key = (*chain_id, *signer);
+
+				if lead < NONCE_DRIFT_WARN_THRESHOLD {
+					consecutive.remove(&key);
+					tracing::trace!(
+						chain_id = *chain_id,
+						signer = %signer,
+						cache_lead = lead as i64,
+						chain_pending = pending,
+						"nonce drift within tolerance"
+					);
+					continue;
+				}
+
+				// Drift is over threshold this tick.
+				let count = consecutive.entry(key).or_insert(0);
+				*count = count.saturating_add(1);
+				match drift_severity_for_ticks(*count) {
+					DriftSeverity::Normal => {
+						tracing::trace!(
+							chain_id = *chain_id,
+							signer = %signer,
+							cache_lead = lead as i64,
+							chain_pending = pending,
+							consecutive_ticks = *count,
+							"nonce drift over threshold (not yet sustained)"
+						);
+					},
+					DriftSeverity::Warn => {
+						tracing::warn!(
+							chain_id = *chain_id,
+							signer = %signer,
+							cache_lead = lead as i64,
+							chain_pending = pending,
+							consecutive_ticks = *count,
+							"nonce drift sustained — possible cache leak"
+						);
+					},
+					DriftSeverity::Error => {
+						tracing::error!(
+							chain_id = *chain_id,
+							signer = %signer,
+							cache_lead = lead as i64,
+							chain_pending = pending,
+							consecutive_ticks = *count,
+							"nonce drift sustained for {} ticks — almost certainly a cache leak; investigate",
+							*count
+						);
+					},
+				}
+			}
+		}
+	});
 }
 
 impl AlloyDelivery {
@@ -242,6 +452,17 @@ impl AlloyDelivery {
 			signer_addresses.insert(*network_id, signer_address);
 		}
 
+		// Spawn the passive nonce-drift monitor. The monitor is observability
+		// only — it never mutates the cache, retries transactions, or affects
+		// runtime behavior. `ResettableNonceManager` is `Clone` and shares its
+		// inner cache via `Arc<Mutex<_>>`, and `DynProvider` is also clone-
+		// shareable, so the spawned task observes the same live state.
+		spawn_nonce_drift_monitor(
+			nonce_managers.clone(),
+			signer_addresses.clone(),
+			providers.clone(),
+		);
+
 		Ok(Self {
 			providers,
 			nonce_managers,
@@ -276,8 +497,10 @@ impl AlloyDelivery {
 	}
 
 	/// Returns the next nonce to use for `from` on `chain_id`, taking it from the
-	/// resettable cache. On first use for an address, fetches `pending` from chain
-	/// to seed the cache.
+	/// resettable cache. Every call samples chain `pending`, but normal allocation
+	/// is monotonic: a stale RPC pending nonce must not move the local cache
+	/// backward and reissue a nonce already handed out by this process. Backward
+	/// reset is reserved for the explicit `nonce too low` resync path.
 	async fn next_nonce_for(&self, chain_id: u64, from: Address) -> Result<u64, DeliveryError> {
 		let provider = self.get_provider(chain_id)?;
 		let pending = provider
@@ -286,8 +509,8 @@ impl AlloyDelivery {
 			.await
 			.map_err(|e| DeliveryError::Network(format!("Failed to fetch pending nonce: {e}")))?;
 		let mgr = self.get_nonce_manager(chain_id)?;
-		let (previous_local_next_nonce, local_next_nonce) =
-			mgr.reconcile_with_chain_pending(from, pending);
+		let previous_local_next_nonce = mgr.peek(from);
+		let local_next_nonce = mgr.set_next_nonce(from, pending);
 		tracing::debug!(
 			chain_id,
 			signer = %from,
@@ -296,9 +519,19 @@ impl AlloyDelivery {
 			local_next_nonce,
 			"Reconciled EVM delivery nonce cache"
 		);
-		Ok(mgr
+		let nonce_taken = mgr
 			.take_next(from)
-			.expect("nonce just reconciled via reconcile_with_chain_pending"))
+			.expect("nonce just reconciled via reconcile_with_chain_pending");
+		tracing::debug!(
+			chain_id,
+			signer = %from,
+			chain_pending = pending,
+			local_before = ?previous_local_next_nonce,
+			nonce_used = nonce_taken,
+			local_after = nonce_taken + 1,
+			"allocated nonce for broadcast"
+		);
+		Ok(nonce_taken)
 	}
 
 	/// Resync the local nonce manager from chain pending and return the next
@@ -543,60 +776,189 @@ impl DeliveryInterface for AlloyDelivery {
 			);
 		}
 
-		// First attempt. On `nonce too low`, resync the local cache from chain
-		// pending and retry once with the resynced nonce.
+		// First attempt. Classify any submission error into one of four buckets
+		// (NonceTooLow / DefinitelyRejected / Replacement / Ambiguous) and act
+		// on the local nonce cache accordingly. See `nonce_action_for_outcome`
+		// and `apply_nonce_cache_action`.
 		let pending_tx = match provider.send_transaction(request).await {
-			Ok(p) => p,
+			Ok(p) => {
+				tracing::debug!(
+					chain_id,
+					signer = %from,
+					nonce_used = ?tx_attempt.nonce,
+					tx_hash = %p.tx_hash(),
+					"tx submitted; nonce committed"
+				);
+				p
+			},
 			Err(first_err) => {
 				let first_err_str = first_err.to_string();
-				if !is_nonce_too_low_error(&first_err_str) {
-					tracing::error!(
-						"Transaction submission failed on chain {}: {}",
-						chain_id,
-						first_err
-					);
-					return Err(DeliveryError::Network(format!(
-						"Failed to send transaction: {first_err}"
-					)));
-				}
-
-				tracing::warn!(
-					chain_id,
-					attempted_nonce = ?tx_attempt.nonce,
-					error = %first_err,
-					"Nonce too low on first submission attempt; resyncing local nonce cache from chain"
-				);
-
-				let retry_nonce = self.resync_nonce_for(chain_id, from).await?;
-				let mut retry_tx = tx_attempt.clone();
-				retry_tx.nonce = Some(retry_nonce);
-				let retry_request: TransactionRequest = retry_tx.into();
-
-				match provider.send_transaction(retry_request).await {
-					Ok(p) => {
-						tracing::info!(chain_id, retry_nonce, "Resynced nonce retry succeeded");
-						p
-					},
-					Err(retry_err) => {
-						let retry_err_str = retry_err.to_string();
-						if is_nonce_too_low_error(&retry_err_str) {
-							tracing::error!(
-								chain_id,
-								retry_nonce,
-								error = %retry_err,
-								"Resynced nonce retry still failed with nonce too low — surfacing structured error"
-							);
-							return Err(DeliveryError::NonceTooLow(format!(
-								"Chain {chain_id}: retry with resynced nonce {retry_nonce} still failed: {retry_err}"
-							)));
-						}
-						tracing::error!(
-							"Resynced nonce retry failed on chain {}: {}",
+				let outcome = classify_submission_outcome(&first_err_str);
+				match nonce_action_for_outcome(outcome) {
+					NonceCacheAction::NonceTooLowRetry => {
+						// EXISTING path — resync local cache from chain
+						// pending and retry once with the resynced nonce.
+						tracing::warn!(
 							chain_id,
-							retry_err
+							signer = %from,
+							nonce_used = ?tx_attempt.nonce,
+							error = %first_err,
+							"submission failed: nonce too low; resyncing and retrying"
+						);
+
+						let retry_nonce = self.resync_nonce_for(chain_id, from).await?;
+						let mut retry_tx = tx_attempt.clone();
+						retry_tx.nonce = Some(retry_nonce);
+						let retry_request: TransactionRequest = retry_tx.into();
+
+						match provider.send_transaction(retry_request).await {
+							Ok(p) => {
+								tracing::info!(
+									chain_id,
+									retry_nonce,
+									"Resynced nonce retry succeeded"
+								);
+								p
+							},
+							Err(retry_err) => {
+								let retry_err_str = retry_err.to_string();
+								let retry_outcome = classify_submission_outcome(&retry_err_str);
+								match nonce_action_for_outcome(retry_outcome) {
+									NonceCacheAction::NonceTooLowRetry => {
+										tracing::error!(
+											chain_id,
+											retry_nonce,
+											error = %retry_err,
+											"Resynced nonce retry still failed with nonce too low — surfacing structured error"
+										);
+										let message = format!(
+											"Chain {chain_id}: retry with resynced nonce {retry_nonce} still failed: {retry_err}"
+										);
+										return Err(DeliveryError::NonceTooLow(message));
+									},
+									action @ NonceCacheAction::AttemptRollback => {
+										let mgr = self.get_nonce_manager(chain_id)?;
+										let cache_before = mgr.peek(from);
+										let pending_result =
+											provider.get_transaction_count(from).pending().await;
+										let (pending_opt, fetch_err): (
+											Option<u64>,
+											Option<String>,
+										) = match pending_result {
+											Ok(p) => (Some(p), None),
+											Err(e) => (None, Some(e.to_string())),
+										};
+										let cache_after = apply_nonce_cache_action(
+											mgr,
+											from,
+											action,
+											pending_opt,
+										);
+										if let Some(pending) = pending_opt {
+											tracing::warn!(
+												chain_id,
+												signer = %from,
+												retry_nonce,
+												chain_pending = pending,
+												cache_before = ?cache_before,
+												cache_after = ?cache_after,
+												error = %retry_err_str,
+												"resynced retry rejected pre-pool; nonce cache rolled back to chain pending"
+											);
+										} else {
+											tracing::warn!(
+												chain_id,
+												signer = %from,
+												retry_nonce,
+												cache_before = ?cache_before,
+												cache_after = ?cache_after,
+												error = %retry_err_str,
+												pending_fetch_error = ?fetch_err,
+												"resynced retry rejected pre-pool BUT chain-pending fetch failed; nonce cache kept advanced"
+											);
+										}
+									},
+									action @ NonceCacheAction::Keep => {
+										let mgr = self.get_nonce_manager(chain_id)?;
+										let cache_after =
+											apply_nonce_cache_action(mgr, from, action, None);
+										tracing::warn!(
+											chain_id,
+											signer = %from,
+											retry_nonce,
+											cache_after = ?cache_after,
+											outcome = ?retry_outcome,
+											error = %retry_err_str,
+											"resynced retry failed; nonce cache kept advanced (replacement-class or ambiguous error)"
+										);
+									},
+								}
+								tracing::error!(
+									"Resynced nonce retry failed on chain {}: {}",
+									chain_id,
+									retry_err
+								);
+								return Err(DeliveryError::Network(format!(
+									"Resynced nonce retry failed: {retry_err}"
+								)));
+							},
+						}
+					},
+					action @ NonceCacheAction::AttemptRollback => {
+						// Try to fetch authoritative chain pending. The helper
+						// `apply_nonce_cache_action` enforces the invariant: on
+						// Some(pending) it resets, on None it KEEPS the cache —
+						// we never reset without authoritative chain state.
+						let mgr = self.get_nonce_manager(chain_id)?;
+						let cache_before = mgr.peek(from);
+						let pending_result = provider.get_transaction_count(from).pending().await;
+						let (pending_opt, fetch_err): (Option<u64>, Option<String>) =
+							match pending_result {
+								Ok(p) => (Some(p), None),
+								Err(e) => (None, Some(e.to_string())),
+							};
+						let cache_after = apply_nonce_cache_action(mgr, from, action, pending_opt);
+						if let Some(pending) = pending_opt {
+							tracing::warn!(
+								chain_id,
+								signer = %from,
+								nonce_used = ?tx_attempt.nonce,
+								chain_pending = pending,
+								cache_before = ?cache_before,
+								cache_after = ?cache_after,
+								error = %first_err_str,
+								"tx rejected pre-pool; nonce cache rolled back to chain pending"
+							);
+						} else {
+							tracing::warn!(
+								chain_id,
+								signer = %from,
+								nonce_used = ?tx_attempt.nonce,
+								cache_before = ?cache_before,
+								cache_after = ?cache_after,
+								error = %first_err_str,
+								pending_fetch_error = ?fetch_err,
+								"tx rejected pre-pool BUT chain-pending fetch failed; nonce cache kept advanced (no authoritative state)"
+							);
+						}
+						return Err(DeliveryError::Network(format!(
+							"Failed to send transaction: {first_err}"
+						)));
+					},
+					action @ NonceCacheAction::Keep => {
+						let mgr = self.get_nonce_manager(chain_id)?;
+						let cache_after = apply_nonce_cache_action(mgr, from, action, None);
+						tracing::warn!(
+							chain_id,
+							signer = %from,
+							nonce_used = ?tx_attempt.nonce,
+							cache_after = ?cache_after,
+							outcome = ?outcome,
+							error = %first_err_str,
+							"tx submission did not accept; nonce cache kept advanced (replacement-class or ambiguous error)"
 						);
 						return Err(DeliveryError::Network(format!(
-							"Resynced nonce retry failed: {retry_err}"
+							"Failed to send transaction: {first_err}"
 						)));
 					},
 				}
@@ -1304,6 +1666,90 @@ mod tests {
 	// Note: Full integration tests require a running blockchain (anvil/hardhat).
 	// The tests below focus on the logic paths using real RPCs where possible.
 	// ========================================================================
+
+	#[test]
+	fn nonce_action_for_outcome_maps_correctly() {
+		use NonceCacheAction::*;
+		use SubmissionOutcome::*;
+		assert_eq!(
+			nonce_action_for_outcome(DefinitelyRejected),
+			AttemptRollback
+		);
+		assert_eq!(nonce_action_for_outcome(Replacement), Keep);
+		assert_eq!(nonce_action_for_outcome(Ambiguous), Keep);
+		assert_eq!(nonce_action_for_outcome(NonceTooLow), NonceTooLowRetry);
+	}
+
+	#[test]
+	fn apply_nonce_cache_action_rollback_with_pending_resets_cache() {
+		use NonceCacheAction::*;
+		let mgr = ResettableNonceManager::new();
+		let signer = Address::ZERO;
+		mgr.reset_next_nonce(signer, 101);
+		assert_eq!(mgr.peek(signer), Some(101));
+
+		let after = apply_nonce_cache_action(&mgr, signer, AttemptRollback, Some(100));
+		assert_eq!(
+			after,
+			Some(100),
+			"cache must reset to authoritative pending"
+		);
+		assert_eq!(mgr.peek(signer), Some(100));
+	}
+
+	#[test]
+	fn apply_nonce_cache_action_rollback_without_pending_keeps_cache() {
+		use NonceCacheAction::*;
+		let mgr = ResettableNonceManager::new();
+		let signer = Address::ZERO;
+		mgr.reset_next_nonce(signer, 101);
+
+		let after = apply_nonce_cache_action(&mgr, signer, AttemptRollback, None);
+		assert_eq!(
+			after,
+			Some(101),
+			"no authoritative chain state → cache must NOT be reset"
+		);
+		assert_eq!(mgr.peek(signer), Some(101));
+	}
+
+	#[test]
+	fn apply_nonce_cache_action_keep_does_not_mutate() {
+		use NonceCacheAction::*;
+		let mgr = ResettableNonceManager::new();
+		let signer = Address::ZERO;
+		mgr.reset_next_nonce(signer, 101);
+
+		let after = apply_nonce_cache_action(&mgr, signer, Keep, Some(95));
+		assert_eq!(after, Some(101));
+		assert_eq!(mgr.peek(signer), Some(101), "Keep must not touch the cache");
+	}
+
+	#[test]
+	fn apply_nonce_cache_action_nonce_too_low_is_noop() {
+		use NonceCacheAction::*;
+		let mgr = ResettableNonceManager::new();
+		let signer = Address::ZERO;
+		mgr.reset_next_nonce(signer, 101);
+
+		// The NonceTooLow path is handled by the existing retry branch; the
+		// helper must not double-handle it.
+		let after = apply_nonce_cache_action(&mgr, signer, NonceTooLowRetry, Some(50));
+		assert_eq!(after, Some(101));
+		assert_eq!(mgr.peek(signer), Some(101));
+	}
+
+	#[test]
+	fn drift_severity_escalates_with_sustained_ticks() {
+		use DriftSeverity::*;
+		assert_eq!(drift_severity_for_ticks(0), Normal);
+		assert_eq!(drift_severity_for_ticks(1), Normal);
+		assert_eq!(drift_severity_for_ticks(4), Normal);
+		assert_eq!(drift_severity_for_ticks(5), Warn);
+		assert_eq!(drift_severity_for_ticks(14), Warn);
+		assert_eq!(drift_severity_for_ticks(15), Error);
+		assert_eq!(drift_severity_for_ticks(100), Error);
+	}
 
 	mod monitor_transaction_tests {
 		use super::*;

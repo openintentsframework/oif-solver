@@ -1228,6 +1228,7 @@ fn build_storage_config_from_operator(solver_id: &str) -> StorageConfig {
 	// Read Redis URL from environment variable with default fallback
 	let redis_url =
 		std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+	let cluster_mode = solver_storage::parse_redis_cluster_mode_env();
 
 	// Redis implementation config
 	// Use solver_id as key_prefix to isolate storage per solver instance
@@ -1238,6 +1239,7 @@ fn build_storage_config_from_operator(solver_id: &str) -> StorageConfig {
 			serde_json::Value::String(solver_id.to_string()),
 		),
 		("connection_timeout_ms", int(5000)),
+		("cluster_mode", serde_json::Value::Bool(cluster_mode)),
 		("ttl_orders", int(0)),
 		("ttl_intents", int(86400)),
 		("ttl_order_by_tx_hash", int(86400)),
@@ -3117,7 +3119,31 @@ mod tests {
 	use rust_decimal::Decimal;
 	use serial_test::serial;
 	use solver_types::seed_overrides::AdminOverride;
+	use std::ffi::OsString;
 	use std::str::FromStr;
+
+	struct EnvVarGuard {
+		key: &'static str,
+		value: Option<OsString>,
+	}
+
+	impl EnvVarGuard {
+		fn capture(key: &'static str) -> Self {
+			Self {
+				key,
+				value: std::env::var_os(key),
+			}
+		}
+	}
+
+	impl Drop for EnvVarGuard {
+		fn drop(&mut self) {
+			match &self.value {
+				Some(value) => std::env::set_var(self.key, value),
+				None => std::env::remove_var(self.key),
+			}
+		}
+	}
 
 	fn test_seed_overrides() -> SeedOverrides {
 		SeedOverrides {
@@ -5850,6 +5876,7 @@ mod tests {
 	}
 
 	#[test]
+	#[serial_test::serial(env_redis)]
 	fn test_build_storage_config_from_operator() {
 		let storage = build_storage_config_from_operator("test-solver");
 
@@ -5861,6 +5888,37 @@ mod tests {
 		let redis_config = storage.implementations.get("redis").unwrap();
 		let key_prefix = redis_config.get("key_prefix").unwrap().as_str().unwrap();
 		assert_eq!(key_prefix, "test-solver");
+	}
+
+	#[test]
+	#[serial_test::serial(env_redis)]
+	fn test_build_storage_config_from_operator_includes_cluster_mode_default_false() {
+		let _guard = EnvVarGuard::capture("REDIS_CLUSTER_MODE");
+		std::env::remove_var("REDIS_CLUSTER_MODE");
+		let storage = build_storage_config_from_operator("test-solver");
+		let redis_config = storage.implementations.get("redis").unwrap();
+		let cluster_mode = redis_config
+			.get("cluster_mode")
+			.and_then(|v| v.as_bool())
+			.expect("cluster_mode field must be present in generated redis config");
+		assert!(
+			!cluster_mode,
+			"default must be false when REDIS_CLUSTER_MODE unset"
+		);
+	}
+
+	#[test]
+	#[serial_test::serial(env_redis)]
+	fn test_build_storage_config_from_operator_propagates_cluster_mode_true() {
+		let _guard = EnvVarGuard::capture("REDIS_CLUSTER_MODE");
+		std::env::set_var("REDIS_CLUSTER_MODE", "true");
+		let storage = build_storage_config_from_operator("test-solver");
+		let redis_config = storage.implementations.get("redis").unwrap();
+		let cluster_mode = redis_config
+			.get("cluster_mode")
+			.and_then(|v| v.as_bool())
+			.unwrap();
+		assert!(cluster_mode);
 	}
 
 	#[test]
