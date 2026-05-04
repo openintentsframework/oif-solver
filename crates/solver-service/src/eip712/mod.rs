@@ -181,7 +181,7 @@ mod tests {
 	fn delivery_service_from_mock(mock: MockDeliveryInterface) -> Arc<DeliveryService> {
 		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
 		implementations.insert(1, Arc::new(mock) as Arc<dyn DeliveryInterface>);
-		Arc::new(DeliveryService::new(implementations, 1, 30))
+		Arc::new(DeliveryService::new(implementations, 1, 30, 60))
 	}
 
 	fn delivery_service_with_success(response: Bytes) -> Arc<DeliveryService> {

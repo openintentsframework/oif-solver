@@ -82,7 +82,7 @@ pub fn delivery_service_from_mock(mock: MockDeliveryInterface) -> Arc<DeliverySe
 		1_u64,
 		Arc::new(mock) as Arc<dyn solver_delivery::DeliveryInterface>,
 	)]);
-	Arc::new(DeliveryService::new(implementations, 3, 300))
+	Arc::new(DeliveryService::new(implementations, 3, 300, 60))
 }
 
 pub fn storage_service_from_mock(mock: MockStorageInterface) -> Arc<StorageService> {

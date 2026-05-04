@@ -53,8 +53,20 @@ enum ReconcileResult {
 	NeedsClaim {
 		fill_proof: Option<solver_types::FillProof>,
 	},
-	/// Transaction failed
+	/// Transaction failed (confirmed receipt with status = 0).
 	Failed(TransactionType),
+	/// Reconciliation could not determine the on-chain state of a tx
+	/// (RPC transport error, provider returning a non-deterministic lookup
+	/// failure, tx not yet visible). The order's status is left untouched
+	/// and no resume event is published — this is *not* a terminal failure.
+	///
+	/// Recovery currently runs only at engine startup (see
+	/// `SolverEngine::initialize_with_recovery`); there is no in-process
+	/// periodic re-reconciliation. An order whose reconciliation returns
+	/// `Unknown` will be re-reconciled on the next solver restart, when the
+	/// RPC may have recovered. This is preferred over `Failed` because the
+	/// stranded state is recoverable; `Failed` is terminal.
+	Unknown,
 	/// Order is finalized
 	Finalized,
 }
@@ -307,13 +319,14 @@ impl RecoveryService {
 					return Ok(ReconcileResult::Failed(TransactionType::Claim));
 				},
 				Err(e) => {
-					// Could not get status - network issue, node problem, etc.
-					// Fail the transaction since we can't determine its state
-					tracing::error!(
-						"Could not get claim transaction status, marking as failed: {}",
+					// Could not determine on-chain state. Surface as Unknown so the
+					// order is not terminally failed on a transient RPC blip; see
+					// the `ReconcileResult::Unknown` doc for retry semantics.
+					tracing::warn!(
+						"Could not get claim transaction status; treating as Unknown: {}",
 						e
 					);
-					return Ok(ReconcileResult::Failed(TransactionType::Claim));
+					return Ok(ReconcileResult::Unknown);
 				},
 			}
 		}
@@ -335,7 +348,13 @@ impl RecoveryService {
 					});
 				},
 				Ok(false) => return Ok(ReconcileResult::Failed(TransactionType::PreClaim)),
-				Err(_) => return Ok(ReconcileResult::Failed(TransactionType::PreClaim)),
+				Err(e) => {
+					tracing::warn!(
+						"Could not get pre-claim transaction status; treating as Unknown: {}",
+						e
+					);
+					return Ok(ReconcileResult::Unknown);
+				},
 			}
 		}
 
@@ -354,7 +373,13 @@ impl RecoveryService {
 					return Ok(ReconcileResult::NeedsMonitoring);
 				},
 				Ok(false) => return Ok(ReconcileResult::Failed(TransactionType::PostFill)),
-				Err(_) => return Ok(ReconcileResult::Failed(TransactionType::PostFill)),
+				Err(e) => {
+					tracing::warn!(
+						"Could not get post-fill transaction status; treating as Unknown: {}",
+						e
+					);
+					return Ok(ReconcileResult::Unknown);
+				},
 			}
 		}
 
@@ -403,13 +428,13 @@ impl RecoveryService {
 					return Ok(ReconcileResult::Failed(TransactionType::Fill));
 				},
 				Err(e) => {
-					// Could not get status - network issue, node problem, etc.
-					// Fail the transaction since we can't determine its state
-					tracing::error!(
-						"Could not get fill transaction status, marking as failed: {}",
+					// Could not determine on-chain state. Surface as Unknown so the
+					// order is not terminally failed; see `ReconcileResult::Unknown`.
+					tracing::warn!(
+						"Could not get fill transaction status; treating as Unknown: {}",
 						e
 					);
-					return Ok(ReconcileResult::Failed(TransactionType::Fill));
+					return Ok(ReconcileResult::Unknown);
 				},
 			}
 		}
@@ -433,13 +458,13 @@ impl RecoveryService {
 					return Ok(ReconcileResult::Failed(TransactionType::Prepare));
 				},
 				Err(e) => {
-					// Could not get status - network issue, node problem, etc.
-					// Fail the transaction since we can't determine its state
-					tracing::error!(
-						"Could not get prepare transaction status, marking as failed: {}",
+					// Could not determine on-chain state. Surface as Unknown so the
+					// order is not terminally failed; see `ReconcileResult::Unknown`.
+					tracing::warn!(
+						"Could not get prepare transaction status; treating as Unknown: {}",
 						e
 					);
-					return Ok(ReconcileResult::Failed(TransactionType::Prepare));
+					return Ok(ReconcileResult::Unknown);
 				},
 			}
 		}
@@ -512,6 +537,12 @@ impl RecoveryService {
 			ReconcileResult::Failed(tx_type) => {
 				// Failed at some stage
 				OrderStatus::Failed(*tx_type, "Blockchain reconciliation failed".to_string())
+			},
+			ReconcileResult::Unknown => {
+				// RPC could not determine on-chain state. Don't transition;
+				// keep the order's current status. Re-reconciliation happens
+				// on the next solver restart's recovery pass.
+				order.status.clone()
 			},
 		};
 
@@ -758,6 +789,17 @@ impl RecoveryService {
 				}
 			},
 
+			ReconcileResult::Unknown => {
+				// RPC error or non-deterministic lookup failure during
+				// reconciliation. Do not publish any progress event, do not
+				// transition status. The order remains in its current state
+				// until the next solver restart's recovery pass re-reconciles.
+				tracing::warn!(
+					"Order {} reconciliation indeterminate; deferring until next solver restart",
+					order.id
+				);
+			},
+
 			ReconcileResult::Finalized => {
 				tracing::info!("Order {} already finalized", order.id);
 				// Ensure proper state transitions to reach Finalized
@@ -917,7 +959,7 @@ mod tests {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
 			HashMap::new();
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
@@ -965,7 +1007,7 @@ mod tests {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
 			HashMap::new();
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
@@ -1027,7 +1069,7 @@ mod tests {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
 			HashMap::new();
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
@@ -1053,7 +1095,7 @@ mod tests {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
 			HashMap::new();
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
@@ -1100,7 +1142,7 @@ mod tests {
 				1u64,
 				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 			)]);
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
 
 		let mock_storage = MockStorageInterface::new();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
@@ -1153,7 +1195,7 @@ mod tests {
 				1u64, // Use chain 1 for pre-claim transaction
 				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 			)]);
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
 
 		let mock_storage = MockStorageInterface::new();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
@@ -1211,7 +1253,7 @@ mod tests {
 				137u64,
 				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 			)]);
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
 
 		let mock_storage = MockStorageInterface::new();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
@@ -1270,7 +1312,7 @@ mod tests {
 				137u64,
 				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 			)]);
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
 
 		let mock_storage = MockStorageInterface::new();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
@@ -1331,7 +1373,7 @@ mod tests {
 				137u64,
 				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 			)]);
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
 
 		let mock_storage = MockStorageInterface::new();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
@@ -1380,7 +1422,7 @@ mod tests {
 				1u64,
 				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 			)]);
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
 
 		let mock_storage = MockStorageInterface::new();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
@@ -1430,7 +1472,7 @@ mod tests {
 				1u64,
 				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
 			)]);
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
 
 		let mock_storage = MockStorageInterface::new();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
@@ -1449,6 +1491,57 @@ mod tests {
 		match result.unwrap() {
 			ReconcileResult::Failed(TransactionType::Prepare) => {},
 			_ => panic!("Expected Failed(Prepare)"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_reconcile_with_blockchain_rpc_error_returns_unknown_not_failed() {
+		// A transient RPC error or tx-not-found must NOT terminally fail the
+		// order. Recovery should return Unknown so the caller leaves the order
+		// in its current status; the next solver restart's recovery pass will
+		// re-reconcile. Without this, RPC blips during recovery convert healthy
+		// in-flight orders into terminal Failed orders.
+		let mut mock_delivery = MockDeliveryInterface::new();
+		let mut order = create_test_order_with_status(OrderStatus::Executed);
+		order.prepare_tx_hash = Some(TransactionHash(vec![0xaa; 32]));
+
+		// Simulate a transport-level RPC error.
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(TransactionHash(vec![0xaa; 32])), eq(1u64))
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async {
+					Err(solver_delivery::DeliveryError::Network(
+						"connection reset by peer".to_string(),
+					))
+				})
+			});
+
+		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
+			HashMap::from([(
+				1u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]);
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
+
+		let mock_storage = MockStorageInterface::new();
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::new();
+		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
+		let event_bus = EventBus::new(100);
+
+		let recovery_service =
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+
+		let result = recovery_service.reconcile_with_blockchain(&order).await;
+		assert!(result.is_ok());
+
+		match result.unwrap() {
+			ReconcileResult::Unknown => {},
+			other => panic!("Expected Unknown for RPC error, got {other:?}"),
 		}
 	}
 
@@ -1482,7 +1575,7 @@ mod tests {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
 			HashMap::new();
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
 
 		// Create empty settlement service - this will cause can_claim to return false,
 		// which should trigger spawn_settlement_monitor instead of publishing ClaimReady
@@ -1544,7 +1637,7 @@ mod tests {
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
 		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
 			HashMap::new();
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
@@ -1600,7 +1693,7 @@ mod tests {
 			.await
 			.unwrap();
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::from([(
 				"eip7683".to_string(),
@@ -1659,7 +1752,7 @@ mod tests {
 			.await
 			.unwrap();
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
 			HashMap::from([(
 				"eip7683".to_string(),

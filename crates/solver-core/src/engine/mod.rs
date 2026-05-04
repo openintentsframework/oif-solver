@@ -752,6 +752,7 @@ mod tests {
 			std::collections::HashMap::new(),
 			1,
 			20,
+			60,
 		));
 
 		// Create discovery service - using empty implementations map for testing

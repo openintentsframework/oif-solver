@@ -1684,7 +1684,7 @@ mod tests {
 		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
 		implementations.insert(1, Arc::new(mock_delivery));
 
-		Arc::new(DeliveryService::new(implementations, 1, 30))
+		Arc::new(DeliveryService::new(implementations, 1, 30, 60))
 	}
 
 	async fn create_admin_state(
@@ -1853,7 +1853,7 @@ mod tests {
 
 		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
 		implementations.insert(1, Arc::new(mock_delivery));
-		let delivery = Arc::new(DeliveryService::new(implementations, 1, 30));
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 30, 60));
 
 		let state = create_admin_state_with_operator_config(operator_config, delivery).await;
 		let state_for_assert = state.clone();
@@ -1940,7 +1940,7 @@ mod tests {
 
 		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
 		implementations.insert(1, Arc::new(mock_delivery));
-		let delivery = Arc::new(DeliveryService::new(implementations, 1, 30));
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 30, 60));
 
 		let state = create_admin_state_with_operator_config(operator_config, delivery).await;
 		let state_for_assert = state.clone();
@@ -2043,7 +2043,7 @@ mod tests {
 
 		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
 		implementations.insert(1, Arc::new(mock_delivery));
-		let delivery = Arc::new(DeliveryService::new(implementations, 1, 30));
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 30, 60));
 
 		let state = create_admin_state_with_operator_config(operator_config, delivery).await;
 		let state_for_assert = state.clone();
@@ -2144,7 +2144,7 @@ mod tests {
 
 		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
 		implementations.insert(1, Arc::new(mock_delivery));
-		let delivery = Arc::new(DeliveryService::new(implementations, 1, 30));
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 30, 60));
 
 		let state = create_admin_state_with_operator_config(operator_config, delivery).await;
 		let state_for_assert = state.clone();

@@ -80,7 +80,7 @@ use solver_types::{
 	CostContext, GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, StorageKey, StoredQuote,
 };
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::info;
 
 /// Processes a quote request and returns available quote options.
@@ -92,7 +92,22 @@ pub async fn process_quote_request(
 	solver: &SolverEngine,
 	config: &Config,
 ) -> Result<GetQuoteResponse, QuoteError> {
+	// Reject early when intake is disabled — cheaper than starting a timer
+	// or any other work.
 	crate::validators::intake::ensure_intake_enabled::<QuoteError>(config)?;
+
+	let quote_started_at = Instant::now();
+	let mut stage_started_at = quote_started_at;
+	let mut log_stage = |stage: &'static str| {
+		let now = Instant::now();
+		info!(
+			stage,
+			stage_elapsed_ms = now.duration_since(stage_started_at).as_millis(),
+			total_elapsed_ms = now.duration_since(quote_started_at).as_millis(),
+			"Quote processing stage completed"
+		);
+		stage_started_at = now;
+	};
 
 	info!(
 		"Processing quote request with {} inputs",
@@ -108,12 +123,14 @@ pub async fn process_quote_request(
 
 	// Check solver capabilities: networks only (token support is enforced during collection below)
 	QuoteValidator::validate_supported_networks(&request, &config.networks)?;
+	log_stage("validation");
 
 	let settlement_service = solver.settlement();
 	let delivery_service = solver.delivery();
 	let quote_generator = QuoteGenerator::new(settlement_service.clone(), delivery_service.clone());
 	let resolved_request = quote_generator.resolve_quote_request(&request).await?;
 	let resolved_flow_keys = vec![resolved_request.flow_key.clone()];
+	log_stage("resolve_quote_request");
 
 	let cost_profit_service = solver_core::engine::cost_profit::CostProfitService::new(
 		solver.pricing().clone(),
@@ -131,6 +148,7 @@ pub async fn process_quote_request(
 		)
 		.await
 		.map_err(|e| QuoteError::Internal(format!("Failed to calculate cost context: {e}")))?;
+	log_stage("cost_context");
 
 	// Validate and collect assets with cost-adjusted amounts
 	let _supported_inputs = QuoteValidator::validate_and_collect_inputs_with_costs(
@@ -144,6 +162,7 @@ pub async fn process_quote_request(
 		&config.networks,
 		&cost_context,
 	)?;
+	log_stage("collect_assets");
 
 	// Check destination balances for cost-adjusted output amounts
 	QuoteValidator::ensure_destination_balances_with_costs(
@@ -153,6 +172,7 @@ pub async fn process_quote_request(
 		&cost_context,
 	)
 	.await?;
+	log_stage("destination_balance_check");
 
 	let quote_pairs = quote_generator
 		.generate_quotes_with_costs_resolved(
@@ -163,12 +183,18 @@ pub async fn process_quote_request(
 			&resolved_request,
 		)
 		.await?;
+	log_stage("generate_quotes");
 
 	// Persist quotes and cost contexts (including settlement_name internally)
 	store_quotes(solver, &quote_pairs, &cost_context).await;
+	log_stage("store_quotes");
 
 	let quotes: Vec<Quote> = quote_pairs.into_iter().map(|(q, _)| q).collect();
-	info!("Generated and stored {} quote options", quotes.len());
+	info!(
+		quote_count = quotes.len(),
+		total_elapsed_ms = quote_started_at.elapsed().as_millis(),
+		"Generated and stored quote options"
+	);
 
 	Ok(GetQuoteResponse { quotes })
 }
@@ -380,7 +406,7 @@ mod tests {
 			.unwrap(),
 		)));
 		let solver_address = Address([0xAB; 20].to_vec());
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
 		let strategy = solver_order::implementations::strategies::simple::create_strategy(
 			&serde_json::Value::Object(serde_json::Map::new()),
@@ -655,7 +681,7 @@ mod tests {
 			.unwrap(),
 		)));
 		let solver_address = Address([0xAB; 20].to_vec());
-		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 1, 20));
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 1, 20, 60));
 		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
 		let strategy = solver_order::implementations::strategies::simple::create_strategy(
 			&serde_json::Value::Object(serde_json::Map::new()),

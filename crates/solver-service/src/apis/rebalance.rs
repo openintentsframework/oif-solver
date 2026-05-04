@@ -105,6 +105,15 @@ pub struct BridgeOperationResponse {
 	pub message_guid: Option<String>,
 	pub redeem_tx_hash: Option<String>,
 	pub fee_paid: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub approve_tx_hash: Option<String>,
+	pub approve_missing_checks: u32,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub approve_missing_since: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub approve_submitted_at: Option<u64>,
+	pub approve_was_broadcast: bool,
+	pub bridge_submit_attempted: bool,
 }
 
 #[derive(Serialize)]
@@ -753,6 +762,12 @@ fn to_operation_response(t: &PendingBridgeTransfer) -> BridgeOperationResponse {
 		message_guid: t.message_guid.clone(),
 		redeem_tx_hash: t.redeem_tx_hash.clone(),
 		fee_paid: t.fee_paid.clone(),
+		approve_tx_hash: t.approve_tx_hash.clone(),
+		approve_missing_checks: t.approve_missing_checks,
+		approve_missing_since: t.approve_missing_since,
+		approve_submitted_at: t.approve_submitted_at,
+		approve_was_broadcast: t.approve_was_broadcast,
+		bridge_submit_attempted: t.bridge_submit_attempted,
 	}
 }
 
@@ -900,7 +915,7 @@ mod tests {
 			(1_u64, shared.clone() as Arc<dyn DeliveryInterface>),
 			(747474_u64, shared as Arc<dyn DeliveryInterface>),
 		]);
-		Arc::new(DeliveryService::new(implementations, 1, 30))
+		Arc::new(DeliveryService::new(implementations, 1, 30, 60))
 	}
 
 	fn sample_operator_config() -> OperatorConfig {
@@ -1502,5 +1517,31 @@ mod tests {
 			err,
 			Err(AdminAuthError::Internal(msg)) if msg == "Bridge service not available"
 		));
+	}
+
+	#[test]
+	fn to_operation_response_exposes_insufficient_native_gas_status_reason() {
+		let reason = "Insufficient native gas on chain 1 for signer 0xsolver: balance 10 wei, required 30 wei, shortfall 20 wei";
+		let mut transfer = solver_bridge::types::PendingBridgeTransfer::new(
+			"eth-katana".to_string(),
+			1,
+			747474,
+			"1000000".to_string(),
+			RebalanceTrigger::Auto,
+			None,
+			None,
+			None,
+		);
+		transfer.status = BridgeTransferStatus::NeedsIntervention(reason.to_string());
+
+		let response = to_operation_response(&transfer);
+		let status_reason = response
+			.status_reason
+			.as_deref()
+			.expect("needs_intervention should carry a reason");
+
+		assert_eq!(response.status, "needs_intervention");
+		assert!(status_reason.contains("Insufficient native gas"));
+		assert!(status_reason.contains("shortfall 20 wei"));
 	}
 }

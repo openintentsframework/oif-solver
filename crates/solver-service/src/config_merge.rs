@@ -1265,6 +1265,7 @@ fn build_delivery_config_from_operator(chain_ids: &[u64]) -> DeliveryConfig {
 	DeliveryConfig {
 		implementations,
 		min_confirmations: 3,
+		tx_confirmation_timeout_seconds: 600,
 	}
 }
 
@@ -3661,7 +3662,7 @@ mod tests {
 
 		let resource_lock = gas.flows.get("resource_lock").unwrap();
 		assert_eq!(resource_lock.open, Some(0));
-		assert_eq!(resource_lock.fill, Some(77298));
+		assert_eq!(resource_lock.fill, Some(100_000));
 		assert_eq!(resource_lock.claim, Some(122793));
 	}
 

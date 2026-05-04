@@ -370,7 +370,7 @@ mod tests {
 		let account = Arc::new(AccountService::new(Box::new(
 			LocalWallet::new(TEST_PK).unwrap(),
 		)));
-		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 3));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 3, 60));
 		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
 		let strategy = create_strategy(&serde_json::Value::Object(serde_json::Map::new())).unwrap();
 		let order = Arc::new(OrderService::new(HashMap::new(), strategy));
