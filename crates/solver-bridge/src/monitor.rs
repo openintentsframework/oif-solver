@@ -216,17 +216,12 @@ impl RebalanceMonitor {
 				&& {
 					let approve_phase_started =
 						transfer.approve_was_broadcast || transfer.approve_tx_hash.is_some();
-					let phase_start = transfer
-						.approve_submitted_at
-						.unwrap_or(transfer.created_at);
+					let phase_start = transfer.approve_submitted_at.unwrap_or(transfer.created_at);
 					approve_phase_started
 						&& now.saturating_sub(phase_start) > APPROVE_PHASE_TIMEOUT_SECS
 				} {
-				let phase_age = now.saturating_sub(
-					transfer
-						.approve_submitted_at
-						.unwrap_or(transfer.created_at),
-				);
+				let phase_age = now
+					.saturating_sub(transfer.approve_submitted_at.unwrap_or(transfer.created_at));
 				tracing::warn!(
 					transfer_id = %transfer.id,
 					pair = %transfer.pair_id,
@@ -286,24 +281,25 @@ impl RebalanceMonitor {
 				&& transfer.approve_tx_hash.is_some()
 			{
 				let approve_hash_str = transfer.approve_tx_hash.clone().unwrap();
-				let approve_hash_bytes =
-					match hex::decode(approve_hash_str.trim_start_matches("0x")) {
-						Ok(b) if b.len() == 32 => solver_types::TransactionHash(b),
-						Ok(b) => {
-							// Valid hex but wrong length. Transaction hashes are
-							// exactly 32 bytes by definition; anything else is a
-							// malformed record. No future tick can heal a persisted
-							// bad-length hash, so escalate immediately rather than
-							// passing the malformed bytes to the RPC layer where the
-							// failure mode is provider-dependent.
-							let actual_len = b.len();
-							tracing::error!(
-								transfer_id = %transfer.id,
-								approve_tx_hash = %approve_hash_str,
-								actual_byte_len = actual_len,
-								"approve_tx_hash decoded but length != 32; escalating to NeedsIntervention"
-							);
-							self.bridge_service
+				let approve_hash_bytes = match hex::decode(
+					approve_hash_str.trim_start_matches("0x"),
+				) {
+					Ok(b) if b.len() == 32 => solver_types::TransactionHash(b),
+					Ok(b) => {
+						// Valid hex but wrong length. Transaction hashes are
+						// exactly 32 bytes by definition; anything else is a
+						// malformed record. No future tick can heal a persisted
+						// bad-length hash, so escalate immediately rather than
+						// passing the malformed bytes to the RPC layer where the
+						// failure mode is provider-dependent.
+						let actual_len = b.len();
+						tracing::error!(
+							transfer_id = %transfer.id,
+							approve_tx_hash = %approve_hash_str,
+							actual_byte_len = actual_len,
+							"approve_tx_hash decoded but length != 32; escalating to NeedsIntervention"
+						);
+						self.bridge_service
 								.update_transfer(
 									&mut transfer,
 									BridgeTransferStatus::NeedsIntervention(format!(
@@ -311,20 +307,20 @@ impl RebalanceMonitor {
 									)),
 								)
 								.await?;
-							continue;
-						},
-						Err(_) => {
-							// A malformed (non-hex / odd-length) hash will fail every
-							// future tick — there's no path forward from a parse
-							// failure. Escalate so an operator can inspect the
-							// persisted record. Without this, the transfer loops
-							// silently with the same warn log every tick until restart.
-							tracing::error!(
-								transfer_id = %transfer.id,
-								approve_tx_hash = %approve_hash_str,
-								"Invalid approve_tx_hash format; escalating to NeedsIntervention"
-							);
-							self.bridge_service
+						continue;
+					},
+					Err(_) => {
+						// A malformed (non-hex / odd-length) hash will fail every
+						// future tick — there's no path forward from a parse
+						// failure. Escalate so an operator can inspect the
+						// persisted record. Without this, the transfer loops
+						// silently with the same warn log every tick until restart.
+						tracing::error!(
+							transfer_id = %transfer.id,
+							approve_tx_hash = %approve_hash_str,
+							"Invalid approve_tx_hash format; escalating to NeedsIntervention"
+						);
+						self.bridge_service
 								.update_transfer(
 									&mut transfer,
 									BridgeTransferStatus::NeedsIntervention(format!(
@@ -332,9 +328,9 @@ impl RebalanceMonitor {
 									)),
 								)
 								.await?;
-							continue;
-						},
-					};
+						continue;
+					},
+				};
 
 				match self
 					.delivery

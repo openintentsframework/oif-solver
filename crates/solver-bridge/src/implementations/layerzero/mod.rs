@@ -1174,13 +1174,15 @@ mod tests {
 
 		// Allowance precheck FAILS with a transient RPC error. The bridge must
 		// fall through to approve (treating the unknown allowance as 0).
-		mock.expect_get_allowance().times(1).returning(|_, _, _, _| {
-			Box::pin(async move {
-				Err(DeliveryError::Network(
-					"transient gateway timeout".to_string(),
-				))
-			})
-		});
+		mock.expect_get_allowance()
+			.times(1)
+			.returning(|_, _, _, _| {
+				Box::pin(async move {
+					Err(DeliveryError::Network(
+						"transient gateway timeout".to_string(),
+					))
+				})
+			});
 
 		{
 			let submitted = submitted.clone();
@@ -1213,7 +1215,9 @@ mod tests {
 					.map(|addr| Address::from_slice(addr.0.as_slice())),
 				Some(expected_composer)
 			);
-			Box::pin(async move { Ok(alloy_primitives::Bytes::from(composer_quote_fee_bytes(fee))) })
+			Box::pin(
+				async move { Ok(alloy_primitives::Bytes::from(composer_quote_fee_bytes(fee))) },
+			)
 		});
 		mock.expect_estimate_gas()
 			.times(1)
@@ -1249,13 +1253,15 @@ mod tests {
 		let mut mock = MockDeliveryInterface::new();
 
 		// Allowance precheck FAILS with a transient RPC error.
-		mock.expect_get_allowance().times(1).returning(|_, _, _, _| {
-			Box::pin(async move {
-				Err(DeliveryError::Network(
-					"transient gateway timeout".to_string(),
-				))
-			})
-		});
+		mock.expect_get_allowance()
+			.times(1)
+			.returning(|_, _, _, _| {
+				Box::pin(async move {
+					Err(DeliveryError::Network(
+						"transient gateway timeout".to_string(),
+					))
+				})
+			});
 
 		{
 			let submitted = submitted.clone();
