@@ -885,6 +885,10 @@ fn spawn_solver(
 		.env("STORAGE_BACKEND", "file")
 		.env("STORAGE_PATH", working_dir.join("data/storage"))
 		.env("SOLVER_PRIVATE_KEY", SOLVER_PRIVATE_KEY)
+		// Use mock pricing so the cost-estimation step doesn't try to reach
+		// CoinGecko for our fake TOKA/TOKB. The mock impl has TOKA/USD and
+		// TOKB/USD prices baked in — see `MockPricing::new`.
+		.env("PRICING_PRIMARY", "mock")
 		.env("RUST_LOG", rust_log)
 		.stdout(stdout_file)
 		.stderr(stderr_file)
