@@ -1690,7 +1690,7 @@ mod tests {
 					"unexpected error: {error}"
 				);
 			},
-			other => panic!("expected ApproveSubmitFailed, got {:?}", other),
+			other => panic!("expected ApproveSubmitFailed, got {other:?}"),
 		}
 	}
 
@@ -1798,7 +1798,7 @@ mod tests {
 					"unexpected error: {error}"
 				);
 			},
-			other => panic!("expected ApproveSubmitFailed, got {:?}", other),
+			other => panic!("expected ApproveSubmitFailed, got {other:?}"),
 		}
 	}
 }
