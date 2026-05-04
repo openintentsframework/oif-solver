@@ -1,0 +1,38 @@
+[package]
+name = "solver-e2e-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Test-only crate. Excluded from `default-members`. Run with:
+#   cargo test -p solver-e2e-tests -- --ignored --test-threads=1
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# We use solver-types directly to construct the solver's bootstrap config
+# (`SeedOverrides`) with typed Rust values rather than hand-rolled JSON. That
+# was the source of the previous "expected a sequence" parse failure.
+solver-types = { path = "../solver-types" }
+
+# Direct alloy access for: deploys, contract calls, log polling, event ABI
+# decoding. We deliberately avoid `solver-delivery`/`solver-discovery` here —
+# their sol! types are private to the impl module and we'd have to redeclare
+# them anyway, so going straight to alloy is simpler.
+alloy-contract = { workspace = true }
+alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-provider = { workspace = true }
+alloy-rpc-types = { workspace = true }
+alloy-signer = { workspace = true }
+alloy-signer-local = { workspace = true }
+alloy-sol-types = { workspace = true }
+alloy-network = { workspace = true }
+
+anyhow = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

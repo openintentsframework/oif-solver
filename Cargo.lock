@@ -5179,6 +5179,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "solver-e2e-tests"
+version = "0.1.0"
+dependencies = [
+ "alloy-contract",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types",
+ "alloy-signer",
+ "alloy-signer-local",
+ "alloy-sol-types",
+ "anyhow",
+ "hex",
+ "serde",
+ "serde_json",
+ "solver-types",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "solver-order"
 version = "0.1.0"
 dependencies = [

@@ -8,6 +8,7 @@ members = [
     "crates/solver-delivery",
     "crates/solver-demo",
     "crates/solver-discovery",
+    "crates/solver-e2e-tests",
     "crates/solver-order",
     "crates/solver-pricing",
     "crates/solver-service",
