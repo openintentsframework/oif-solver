@@ -477,7 +477,7 @@ mod tests {
 			data: "0x".to_string(),
 			value_wei: None,
 		});
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let cooldowns = Arc::new(tokio::sync::Mutex::new(HashMap::<String, Instant>::from([
 			(direction.label.clone(), Instant::now()),
 		])));
@@ -495,7 +495,7 @@ mod tests {
 			data: "0x".to_string(),
 			value_wei: None,
 		});
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let cooldowns = Arc::new(tokio::sync::Mutex::new(HashMap::<String, Instant>::new()));
 
 		push_if_needed(&direction, 12345, &delivery, &HashMap::new(), &cooldowns).await;

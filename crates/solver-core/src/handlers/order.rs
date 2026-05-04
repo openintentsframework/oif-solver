@@ -109,6 +109,25 @@ impl OrderHandler {
 						}))
 						.ok();
 				},
+				TransactionMonitoringEvent::Indeterminate {
+					id: order_id,
+					tx_hash,
+					tx_type,
+					reason,
+				} => {
+					// Live tx watcher could not determine on-chain state within
+					// the confirmation deadline. Order is left in its current
+					// status; startup recovery will reconcile via direct chain
+					// query. Do NOT publish a `TransactionFailed` event — that
+					// would terminally fail the order.
+					tracing::warn!(
+						%order_id,
+						?tx_hash,
+						?tx_type,
+						%reason,
+						"Live tx monitor indeterminate; order left in current status"
+					);
+				},
 			});
 
 			let tracking = TransactionTracking {
@@ -143,20 +162,20 @@ impl OrderHandler {
 				.await
 				.map_err(|e| OrderError::Storage(e.to_string()))?;
 
-			// Update order with execution params and prepare tx hash
+			// `execution_params` are already persisted on the order by the time
+			// this event fires; only the prepare tx hash and status need updating here.
 			self.state_machine
 				.update_order_with(&order.id, |o| {
-					o.execution_params = Some(params.clone());
 					o.status = OrderStatus::Pending;
 					o.prepare_tx_hash = Some(prepare_tx_hash);
 				})
 				.await
 				.map_err(|e| OrderError::State(e.to_string()))?;
 		} else {
-			// No preparation needed (on-chain intent), go directly to Executing
+			// No preparation needed (on-chain intent), go directly to Executing.
+			// `execution_params` are already persisted on the order at this point.
 			self.state_machine
 				.update_order_with(&order.id, |o| {
-					o.execution_params = Some(params.clone());
 					o.status = OrderStatus::Executing;
 				})
 				.await
@@ -219,6 +238,20 @@ impl OrderHandler {
 						error,
 					}))
 					.ok();
+			},
+			TransactionMonitoringEvent::Indeterminate {
+				id: order_id,
+				tx_hash,
+				tx_type,
+				reason,
+			} => {
+				tracing::warn!(
+					%order_id,
+					?tx_hash,
+					?tx_type,
+					%reason,
+					"Live tx monitor indeterminate; order left in current status"
+				);
 			},
 		});
 
@@ -339,6 +372,7 @@ mod tests {
 			)]),
 			1,
 			20,
+			60,
 		));
 
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));

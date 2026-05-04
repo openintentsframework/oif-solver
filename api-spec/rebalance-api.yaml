@@ -345,7 +345,10 @@ components:
         statusReason:
           type: string
           nullable: true
-          description: Reason for failed or needs_intervention status
+          description: >
+            Reason for failed or needs_intervention status. Operators should
+            display this directly. May include insufficient native gas details
+            such as signer balance, required wei, and shortfall wei.
         trigger:
           type: string
           enum: [auto, manual]

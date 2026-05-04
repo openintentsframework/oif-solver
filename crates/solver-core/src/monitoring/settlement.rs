@@ -259,7 +259,7 @@ mod tests {
 		let event_bus = EventBus::new(100);
 		let receiver = event_bus.subscribe();
 
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let networks: NetworksConfig = HashMap::new();
 
 		let monitor = SettlementMonitor::new(
@@ -282,7 +282,7 @@ mod tests {
 		)));
 		let state_machine = Arc::new(OrderStateMachine::new(storage));
 		let event_bus = EventBus::new(100);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let networks: NetworksConfig = HashMap::new();
 		let timeout_minutes = 30;
 

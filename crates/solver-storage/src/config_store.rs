@@ -184,7 +184,7 @@ where
 	}
 
 	// Validate Redis URL if provided
-	if let StoreConfig::Redis { ref url } = config {
+	if let StoreConfig::Redis { ref url, .. } = config {
 		if url.is_empty() {
 			return Err(ConfigStoreError::Configuration(
 				"Redis URL cannot be empty".to_string(),
@@ -203,11 +203,18 @@ where
 pub fn create_redis_config_store<T>(
 	redis_url: String,
 	solver_id: String,
+	cluster_mode: bool,
 ) -> Result<Box<dyn ConfigStore<T>>, ConfigStoreError>
 where
 	T: Serialize + for<'de> Deserialize<'de> + Send + Sync + Clone + 'static,
 {
-	create_config_store(StoreConfig::Redis { url: redis_url }, solver_id)
+	create_config_store(
+		StoreConfig::Redis {
+			url: redis_url,
+			cluster_mode,
+		},
+		solver_id,
+	)
 }
 
 // =============================================================================
@@ -458,6 +465,7 @@ mod integration_tests {
 		let store = create_config_store::<TestConfig>(
 			StoreConfig::Redis {
 				url: "redis://localhost:6379".to_string(),
+				cluster_mode: false,
 			},
 			solver_id.clone(),
 		)
@@ -483,6 +491,7 @@ mod integration_tests {
 		let store = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
+			false,
 		)
 		.unwrap();
 
@@ -494,6 +503,16 @@ mod integration_tests {
 
 		// Cleanup
 		store.delete().await.unwrap();
+	}
+
+	#[test]
+	fn test_create_redis_config_store_convenience_accepts_cluster_mode() {
+		let result = create_redis_config_store::<TestConfig>(
+			"redis://localhost:6379".to_string(),
+			unique_solver_id(),
+			true,
+		);
+		assert!(result.is_ok());
 	}
 
 	// ==================== Memory Backend Tests (No Redis Required) ====================
@@ -640,6 +659,7 @@ mod integration_tests {
 		// Test Redis configuration
 		let redis_config = StoreConfig::Redis {
 			url: "redis://localhost:6379".to_string(),
+			cluster_mode: false,
 		};
 
 		// Should be cloneable and debuggable
@@ -649,6 +669,7 @@ mod integration_tests {
 		// Test that we can create different configurations
 		let redis_config2 = StoreConfig::Redis {
 			url: "redis://remote:6379".to_string(),
+			cluster_mode: false,
 		};
 
 		assert_ne!(format!("{redis_config:?}"), format!("{:?}", redis_config2));
@@ -678,8 +699,11 @@ mod integration_tests {
 	#[tokio::test]
 	async fn test_redis_config_validation() {
 		// Test empty URL
-		let result =
-			create_redis_config_store::<TestConfig>("".to_string(), "test-solver".to_string());
+		let result = create_redis_config_store::<TestConfig>(
+			"".to_string(),
+			"test-solver".to_string(),
+			false,
+		);
 		assert!(result.is_err());
 		if let Err(error) = result {
 			assert!(matches!(error, ConfigStoreError::Configuration(_)));
@@ -689,6 +713,7 @@ mod integration_tests {
 		let result = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			"".to_string(),
+			false,
 		);
 		assert!(result.is_err());
 		if let Err(error) = result {
@@ -699,6 +724,7 @@ mod integration_tests {
 		let result = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			"test-solver".to_string(),
+			false,
 		);
 		assert!(result.is_ok());
 	}
@@ -710,6 +736,7 @@ mod integration_tests {
 		let store = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
+			false,
 		)
 		.unwrap();
 
@@ -735,6 +762,7 @@ mod integration_tests {
 		let store = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
+			false,
 		)
 		.unwrap();
 
@@ -768,11 +796,13 @@ mod integration_tests {
 		let store1 = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
+			false,
 		)
 		.unwrap();
 		let store2 = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
+			false,
 		)
 		.unwrap();
 
@@ -833,11 +863,13 @@ mod integration_tests {
 		let store1 = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver1_id.clone(),
+			false,
 		)
 		.unwrap();
 		let store2 = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver2_id.clone(),
+			false,
 		)
 		.unwrap();
 
@@ -885,6 +917,7 @@ mod integration_tests {
 		let store = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
+			false,
 		)
 		.expect("Failed to create store");
 
@@ -932,6 +965,7 @@ mod integration_tests {
 		let store = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
+			false,
 		)
 		.unwrap();
 
@@ -981,6 +1015,7 @@ mod integration_tests {
 		let store = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
+			false,
 		)
 		.unwrap();
 
@@ -1001,6 +1036,7 @@ mod integration_tests {
 		let store = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
+			false,
 		)
 		.unwrap();
 
@@ -1031,6 +1067,7 @@ mod integration_tests {
 		let store1 = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
+			false,
 		)
 		.unwrap();
 
@@ -1047,6 +1084,7 @@ mod integration_tests {
 		let store2 = create_redis_config_store::<TestConfig>(
 			"redis://localhost:6379".to_string(),
 			solver_id.clone(),
+			false,
 		)
 		.unwrap();
 

@@ -189,19 +189,24 @@ pub const COMMON_DEFAULTS: SeedDefaults = SeedDefaults {
 	hyperlane_finalization_required: true,
 
 	// Gas flows
+	// `fill` is intentionally widened above the historical 77_298 baseline:
+	// quote-time pricing uses these static defaults (no eth_estimateGas), while
+	// intent-time validation overrides `fill` with the live simulated value. A
+	// ceiling that comfortably covers typical simulated fills keeps the two paths
+	// consistent so we don't issue quotes the validator would later reject.
 	gas_resource_lock: GasFlowUnits {
 		open: 0,
-		fill: 77298,
+		fill: 100_000,
 		claim: 122793,
 	},
 	gas_permit2_escrow: GasFlowUnits {
 		open: 146306,
-		fill: 77298,
+		fill: 100_000,
 		claim: 60084,
 	},
 	gas_eip3009_escrow: GasFlowUnits {
 		open: 130254,
-		fill: 77298,
+		fill: 100_000,
 		claim: 60084,
 	},
 };
@@ -300,11 +305,11 @@ mod tests {
 	#[test]
 	fn test_gas_flow_units() {
 		assert_eq!(COMMON_DEFAULTS.gas_resource_lock.open, 0);
-		assert_eq!(COMMON_DEFAULTS.gas_resource_lock.fill, 77298);
+		assert_eq!(COMMON_DEFAULTS.gas_resource_lock.fill, 100_000);
 		assert_eq!(COMMON_DEFAULTS.gas_resource_lock.claim, 122793);
 
 		assert_eq!(COMMON_DEFAULTS.gas_permit2_escrow.open, 146306);
-		assert_eq!(COMMON_DEFAULTS.gas_permit2_escrow.fill, 77298);
+		assert_eq!(COMMON_DEFAULTS.gas_permit2_escrow.fill, 100_000);
 		assert_eq!(COMMON_DEFAULTS.gas_permit2_escrow.claim, 60084);
 	}
 }

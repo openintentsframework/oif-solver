@@ -85,9 +85,10 @@
 //! docker run -d --name redis-stack -p 6379:6379 redis/redis-stack-server:latest
 //! ```
 
-use crate::{QueryFilter, StorageError, StorageIndexes, StorageInterface};
+use crate::{redact_url_credentials, QueryFilter, StorageError, StorageIndexes, StorageInterface};
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
+use redis::cluster_async::ClusterConnection;
 use redis::{AsyncCommands, RedisError};
 use solver_types::{ConfigSchema, Field, FieldType, Schema, StorageKey, ValidationError};
 use std::collections::HashMap;
@@ -97,11 +98,43 @@ use tokio::sync::OnceCell;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
+/// Wraps either a standalone or cluster Redis connection.
+///
+/// Both inner types implement `redis::aio::ConnectionLike`. Call sites in this
+/// module dispatch via `match` so they can call typed `AsyncCommands` methods
+/// (`mget`, `sadd`, `Script::invoke_async`, raw `cmd(...)`) on the right
+/// variant.
+#[derive(Clone)]
+pub enum RedisConn {
+	Standalone(ConnectionManager),
+	Cluster(ClusterConnection),
+}
+
+/// Dispatches a single async Redis call across both `RedisConn` variants and
+/// maps the resulting error with a per-operation context string. The context
+/// is the diagnostic tag preserved in `Redis operation '<context>' failed: ...`
+/// — keep it short and stable, callers grep for it during incidents.
+///
+/// Usage:
+/// ```ignore
+/// let _: () = dispatch_redis!(self, conn, "update_indexes_add_field",
+///     sadd(&index_key, key));
+/// ```
+macro_rules! dispatch_redis {
+	($self:ident, $conn:expr, $context:expr, $($call:tt)+) => {{
+		let result = match &mut $conn {
+			RedisConn::Standalone(c) => c.$($call)+.await,
+			RedisConn::Cluster(c) => c.$($call)+.await,
+		};
+		result.map_err(|e| $self.map_redis_error(e, $context))?
+	}};
+}
+
 /// Default connection timeout in milliseconds.
-const DEFAULT_CONNECTION_TIMEOUT_MS: u64 = 5000;
+pub const DEFAULT_CONNECTION_TIMEOUT_MS: u64 = 5000;
 
 /// Default Redis key prefix.
-const DEFAULT_KEY_PREFIX: &str = "oif-solver";
+pub const DEFAULT_KEY_PREFIX: &str = "oif-solver";
 
 /// Suffix for the index key that tracks all IDs in a namespace.
 const ALL_IDS_SUFFIX: &str = "_all";
@@ -172,8 +205,9 @@ impl Default for TtlConfig {
 /// The connection is lazily initialized on first use to ensure it's created
 /// within the correct tokio runtime context.
 pub struct RedisStorage {
-	/// Redis connection manager (lazily initialized).
-	client: OnceCell<Arc<ConnectionManager>>,
+	/// Redis connection (lazily initialized). Variant determined by
+	/// `cluster_mode`.
+	client: OnceCell<Arc<RedisConn>>,
 	/// Redis URL for connection.
 	redis_url: String,
 	/// Connection timeout in milliseconds.
@@ -182,6 +216,9 @@ pub struct RedisStorage {
 	key_prefix: String,
 	/// TTL configuration for different storage keys.
 	ttl_config: TtlConfig,
+	/// When true, use the Redis Cluster client and force every key into a
+	/// single hash slot via the `{<key_prefix>}` hash tag.
+	cluster_mode: bool,
 }
 
 impl RedisStorage {
@@ -205,6 +242,7 @@ impl RedisStorage {
 			DEFAULT_CONNECTION_TIMEOUT_MS,
 			DEFAULT_KEY_PREFIX.to_string(),
 			TtlConfig::default(),
+			false,
 		)
 	}
 
@@ -221,6 +259,7 @@ impl RedisStorage {
 		timeout_ms: u64,
 		key_prefix: String,
 		ttl_config: TtlConfig,
+		cluster_mode: bool,
 	) -> Result<Self, StorageError> {
 		if key_prefix.is_empty() {
 			return Err(StorageError::Configuration(
@@ -240,17 +279,31 @@ impl RedisStorage {
 			timeout_ms,
 			key_prefix,
 			ttl_config,
+			cluster_mode,
 		})
 	}
 
-	/// Gets or initializes the Redis connection manager.
-	async fn get_connection(&self) -> Result<Arc<ConnectionManager>, StorageError> {
+	/// Gets or initializes the Redis connection.
+	async fn get_connection(&self) -> Result<Arc<RedisConn>, StorageError> {
 		self.client
 			.get_or_try_init(|| async {
-				initialize_redis_connection(&self.redis_url, self.timeout_ms).await
+				initialize_redis_connection(&self.redis_url, self.timeout_ms, self.cluster_mode)
+					.await
 			})
 			.await
 			.cloned()
+	}
+
+	/// Returns the key prefix wrapped in a Redis Cluster hash tag in cluster
+	/// mode (`{<prefix>}`), or the bare prefix otherwise. All key builders
+	/// MUST go through this so every key produced by this struct lands on a
+	/// single hash slot when cluster mode is active.
+	fn tagged_prefix(&self) -> String {
+		if self.cluster_mode {
+			format!("{{{}}}", self.key_prefix)
+		} else {
+			self.key_prefix.clone()
+		}
 	}
 
 	/// Generates the Redis key for storing data.
@@ -258,14 +311,14 @@ impl RedisStorage {
 	/// Format: `{prefix}:{namespace}:{id}` -> `{prefix}:{key}`
 	/// Since key already contains `namespace:id`, we just prefix it.
 	fn data_key(&self, key: &str) -> String {
-		format!("{}:{}", self.key_prefix, key)
+		format!("{}:{}", self.tagged_prefix(), key)
 	}
 
 	/// Generates the Redis key for tracking all IDs in a namespace.
 	///
 	/// Format: `{prefix}:{namespace}:_all`
 	fn all_ids_key(&self, namespace: &str) -> String {
-		format!("{}:{}:{}", self.key_prefix, namespace, ALL_IDS_SUFFIX)
+		format!("{}:{}:{}", self.tagged_prefix(), namespace, ALL_IDS_SUFFIX)
 	}
 
 	/// Generates the Redis key for a field index.
@@ -281,7 +334,11 @@ impl RedisStorage {
 		};
 		format!(
 			"{}:{}:{}:{}:{}",
-			self.key_prefix, namespace, INDEX_SUFFIX, field, value_str
+			self.tagged_prefix(),
+			namespace,
+			INDEX_SUFFIX,
+			field,
+			value_str
 		)
 	}
 
@@ -292,7 +349,7 @@ impl RedisStorage {
 	///
 	/// Format: `{prefix}:{key}:_idx_meta`
 	fn index_meta_key(&self, key: &str) -> String {
-		format!("{}:{}:{}", self.key_prefix, key, INDEX_META_SUFFIX)
+		format!("{}:{}:{}", self.tagged_prefix(), key, INDEX_META_SUFFIX)
 	}
 
 	/// Gets the TTL for a given key based on its namespace.
@@ -342,45 +399,53 @@ impl RedisStorage {
 
 		// If this key already had index memberships, remove it from the old sets first.
 		// This keeps same-ID overwrites from lingering in stale status buckets.
-		let existing_index_keys: Vec<String> = conn
-			.smembers(&index_meta_key)
-			.await
-			.map_err(|e| self.map_redis_error(e, "update_indexes_get_existing_meta"))?;
+		let existing_index_keys: Vec<String> = dispatch_redis!(
+			self,
+			conn,
+			"update_indexes_get_existing_meta",
+			smembers(&index_meta_key)
+		);
 
 		for idx_key in &existing_index_keys {
-			let _: () = conn
-				.srem(idx_key, key)
-				.await
-				.map_err(|e| self.map_redis_error(e, "update_indexes_remove_existing_field"))?;
+			let _: () = dispatch_redis!(
+				self,
+				conn,
+				"update_indexes_remove_existing_field",
+				srem(idx_key, key)
+			);
 		}
 
 		if !existing_index_keys.is_empty() {
-			let _: () = conn
-				.del(&index_meta_key)
-				.await
-				.map_err(|e| self.map_redis_error(e, "update_indexes_delete_existing_meta"))?;
+			let _: () = dispatch_redis!(
+				self,
+				conn,
+				"update_indexes_delete_existing_meta",
+				del(&index_meta_key)
+			);
 		}
 
 		// Add to all-IDs set for the namespace
 		let all_ids_key = self.all_ids_key(namespace);
-		let _: () = conn
-			.sadd(&all_ids_key, key)
-			.await
-			.map_err(|e| self.map_redis_error(e, "update_indexes_add_all"))?;
+		let _: () = dispatch_redis!(
+			self,
+			conn,
+			"update_indexes_add_all",
+			sadd(&all_ids_key, key)
+		);
 
 		// Set TTL on the all-IDs set if configured
 		if let Some(ttl) = ttl {
 			// Get current TTL and only set if not already set or if new TTL is longer
-			let current_ttl: i64 = conn
-				.ttl(&all_ids_key)
-				.await
-				.map_err(|e| self.map_redis_error(e, "update_indexes_get_ttl"))?;
+			let current_ttl: i64 =
+				dispatch_redis!(self, conn, "update_indexes_get_ttl", ttl(&all_ids_key));
 
 			if current_ttl < 0 || (current_ttl as u64) < ttl.as_secs() {
-				let _: () = conn
-					.expire(&all_ids_key, ttl.as_secs() as i64)
-					.await
-					.map_err(|e| self.map_redis_error(e, "update_indexes_expire_all"))?;
+				let _: () = dispatch_redis!(
+					self,
+					conn,
+					"update_indexes_expire_all",
+					expire(&all_ids_key, ttl.as_secs() as i64)
+				);
 			}
 		}
 
@@ -390,26 +455,28 @@ impl RedisStorage {
 		// Add to field-specific indexes
 		for (field, value) in &indexes.fields {
 			let index_key = self.index_key(namespace, field, value);
-			let _: () = conn
-				.sadd(&index_key, key)
-				.await
-				.map_err(|e| self.map_redis_error(e, "update_indexes_add_field"))?;
+			let _: () = dispatch_redis!(
+				self,
+				conn,
+				"update_indexes_add_field",
+				sadd(&index_key, key)
+			);
 
 			// Track this index key for cleanup
 			index_keys_for_meta.push(index_key.clone());
 
 			// Set TTL on index key
 			if let Some(ttl) = ttl {
-				let current_ttl: i64 = conn
-					.ttl(&index_key)
-					.await
-					.map_err(|e| self.map_redis_error(e, "update_indexes_get_field_ttl"))?;
+				let current_ttl: i64 =
+					dispatch_redis!(self, conn, "update_indexes_get_field_ttl", ttl(&index_key));
 
 				if current_ttl < 0 || (current_ttl as u64) < ttl.as_secs() {
-					let _: () = conn
-						.expire(&index_key, ttl.as_secs() as i64)
-						.await
-						.map_err(|e| self.map_redis_error(e, "update_indexes_expire_field"))?;
+					let _: () = dispatch_redis!(
+						self,
+						conn,
+						"update_indexes_expire_field",
+						expire(&index_key, ttl.as_secs() as i64)
+					);
 				}
 			}
 		}
@@ -417,18 +484,22 @@ impl RedisStorage {
 		// Store index metadata (which index keys reference this data key)
 		if !index_keys_for_meta.is_empty() {
 			for idx_key in &index_keys_for_meta {
-				let _: () = conn
-					.sadd(&index_meta_key, idx_key)
-					.await
-					.map_err(|e| self.map_redis_error(e, "update_indexes_add_meta"))?;
+				let _: () = dispatch_redis!(
+					self,
+					conn,
+					"update_indexes_add_meta",
+					sadd(&index_meta_key, idx_key)
+				);
 			}
 
 			// Set TTL on index metadata key
 			if let Some(ttl) = ttl {
-				let _: () = conn
-					.expire(&index_meta_key, ttl.as_secs() as i64)
-					.await
-					.map_err(|e| self.map_redis_error(e, "update_indexes_expire_meta"))?;
+				let _: () = dispatch_redis!(
+					self,
+					conn,
+					"update_indexes_expire_meta",
+					expire(&index_meta_key, ttl.as_secs() as i64)
+				);
 			}
 		}
 
@@ -447,34 +518,38 @@ impl RedisStorage {
 
 		// Remove from all-IDs set
 		let all_ids_key = self.all_ids_key(namespace);
-		let _: () = conn
-			.srem(&all_ids_key, key)
-			.await
-			.map_err(|e| self.map_redis_error(e, "remove_from_indexes_all"))?;
+		let _: () = dispatch_redis!(
+			self,
+			conn,
+			"remove_from_indexes_all",
+			srem(&all_ids_key, key)
+		);
 
 		// Get index metadata to find all field-specific index keys
 		let index_meta_key = self.index_meta_key(key);
-		let index_keys: Vec<String> = conn
-			.smembers(&index_meta_key)
-			.await
-			.map_err(|e| self.map_redis_error(e, "remove_from_indexes_get_meta"))?;
+		let index_keys: Vec<String> = dispatch_redis!(
+			self,
+			conn,
+			"remove_from_indexes_get_meta",
+			smembers(&index_meta_key)
+		);
 
 		// Remove this key from all field-specific index sets
 		let mut removed_count = 0;
 		for idx_key in &index_keys {
-			let _: () = conn
-				.srem(idx_key, key)
-				.await
-				.map_err(|e| self.map_redis_error(e, "remove_from_indexes_field"))?;
+			let _: () =
+				dispatch_redis!(self, conn, "remove_from_indexes_field", srem(idx_key, key));
 			removed_count += 1;
 		}
 
 		// Delete the index metadata key itself
 		if !index_keys.is_empty() {
-			let _: () = conn
-				.del(&index_meta_key)
-				.await
-				.map_err(|e| self.map_redis_error(e, "remove_from_indexes_del_meta"))?;
+			let _: () = dispatch_redis!(
+				self,
+				conn,
+				"remove_from_indexes_del_meta",
+				del(&index_meta_key)
+			);
 		}
 
 		debug!(key = %key, namespace = %namespace, removed_indexes = removed_count, "removed from indexes");
@@ -499,10 +574,7 @@ impl StorageInterface for RedisStorage {
 		let client = self.get_connection().await?;
 		let mut conn = client.as_ref().clone();
 
-		let result: Option<Vec<u8>> = conn
-			.get(&redis_key)
-			.await
-			.map_err(|e| self.map_redis_error(e, "get_bytes"))?;
+		let result: Option<Vec<u8>> = dispatch_redis!(self, conn, "get_bytes", get(&redis_key));
 
 		match result {
 			Some(data) => {
@@ -533,17 +605,16 @@ impl StorageInterface for RedisStorage {
 		// Store data with or without TTL
 		match effective_ttl {
 			Some(ttl) if !ttl.is_zero() => {
-				let _: () = conn
-					.set_ex(&redis_key, &value, ttl.as_secs())
-					.await
-					.map_err(|e| self.map_redis_error(e, "set_bytes_ex"))?;
+				let _: () = dispatch_redis!(
+					self,
+					conn,
+					"set_bytes_ex",
+					set_ex(&redis_key, &value, ttl.as_secs())
+				);
 				debug!(key = %key, ttl_secs = ttl.as_secs(), "stored data with TTL");
 			},
 			_ => {
-				let _: () = conn
-					.set(&redis_key, &value)
-					.await
-					.map_err(|e| self.map_redis_error(e, "set_bytes"))?;
+				let _: () = dispatch_redis!(self, conn, "set_bytes", set(&redis_key, &value));
 				debug!(key = %key, "stored data without TTL");
 			},
 		}
@@ -563,10 +634,7 @@ impl StorageInterface for RedisStorage {
 		let client = self.get_connection().await?;
 		let mut conn = client.as_ref().clone();
 
-		let deleted: i64 = conn
-			.del(&redis_key)
-			.await
-			.map_err(|e| self.map_redis_error(e, "delete"))?;
+		let deleted: i64 = dispatch_redis!(self, conn, "delete", del(&redis_key));
 
 		if deleted > 0 {
 			// Remove from indexes
@@ -585,10 +653,7 @@ impl StorageInterface for RedisStorage {
 		let client = self.get_connection().await?;
 		let mut conn = client.as_ref().clone();
 
-		let exists: bool = conn
-			.exists(&redis_key)
-			.await
-			.map_err(|e| self.map_redis_error(e, "exists"))?;
+		let exists: bool = dispatch_redis!(self, conn, "exists", exists(&redis_key));
 
 		Ok(exists)
 	}
@@ -605,30 +670,26 @@ impl StorageInterface for RedisStorage {
 			QueryFilter::All => {
 				// Get all IDs from the namespace's all-IDs set
 				let all_ids_key = self.all_ids_key(namespace);
-				conn.smembers(&all_ids_key)
-					.await
-					.map_err(|e| self.map_redis_error(e, "query_all"))?
+				dispatch_redis!(self, conn, "query_all", smembers(&all_ids_key))
 			},
 			QueryFilter::Equals(field, value) => {
 				let index_key = self.index_key(namespace, &field, &value);
-				conn.smembers(&index_key)
-					.await
-					.map_err(|e| self.map_redis_error(e, "query_equals"))?
+				dispatch_redis!(self, conn, "query_equals", smembers(&index_key))
 			},
 			QueryFilter::NotEquals(field, value) => {
 				// Get all IDs, then filter out those that match the value
 				let all_ids_key = self.all_ids_key(namespace);
 				let index_key = self.index_key(namespace, &field, &value);
 
-				let all_ids: Vec<String> = conn
-					.smembers(&all_ids_key)
-					.await
-					.map_err(|e| self.map_redis_error(e, "query_not_equals_all"))?;
+				let all_ids: Vec<String> =
+					dispatch_redis!(self, conn, "query_not_equals_all", smembers(&all_ids_key));
 
-				let excluded_ids: Vec<String> = conn
-					.smembers(&index_key)
-					.await
-					.map_err(|e| self.map_redis_error(e, "query_not_equals_excluded"))?;
+				let excluded_ids: Vec<String> = dispatch_redis!(
+					self,
+					conn,
+					"query_not_equals_excluded",
+					smembers(&index_key)
+				);
 
 				let excluded_set: std::collections::HashSet<_> = excluded_ids.into_iter().collect();
 				all_ids
@@ -642,10 +703,8 @@ impl StorageInterface for RedisStorage {
 
 				for value in values {
 					let index_key = self.index_key(namespace, &field, &value);
-					let ids: Vec<String> = conn
-						.smembers(&index_key)
-						.await
-						.map_err(|e| self.map_redis_error(e, "query_in"))?;
+					let ids: Vec<String> =
+						dispatch_redis!(self, conn, "query_in", smembers(&index_key));
 					result_ids.extend(ids);
 				}
 
@@ -654,18 +713,14 @@ impl StorageInterface for RedisStorage {
 			QueryFilter::NotIn(field, values) => {
 				// Get all IDs, then filter out those in any of the value sets
 				let all_ids_key = self.all_ids_key(namespace);
-				let all_ids: Vec<String> = conn
-					.smembers(&all_ids_key)
-					.await
-					.map_err(|e| self.map_redis_error(e, "query_not_in_all"))?;
+				let all_ids: Vec<String> =
+					dispatch_redis!(self, conn, "query_not_in_all", smembers(&all_ids_key));
 
 				let mut excluded_ids = std::collections::HashSet::new();
 				for value in values {
 					let index_key = self.index_key(namespace, &field, &value);
-					let ids: Vec<String> = conn
-						.smembers(&index_key)
-						.await
-						.map_err(|e| self.map_redis_error(e, "query_not_in_excluded"))?;
+					let ids: Vec<String> =
+						dispatch_redis!(self, conn, "query_not_in_excluded", smembers(&index_key));
 					excluded_ids.extend(ids);
 				}
 
@@ -682,10 +737,8 @@ impl StorageInterface for RedisStorage {
 			Vec::new()
 		} else {
 			let redis_keys: Vec<String> = keys.iter().map(|k| self.data_key(k)).collect();
-			let results: Vec<Option<Vec<u8>>> = conn
-				.mget(&redis_keys)
-				.await
-				.map_err(|e| self.map_redis_error(e, "query_validate"))?;
+			let results: Vec<Option<Vec<u8>>> =
+				dispatch_redis!(self, conn, "query_validate", mget(&redis_keys));
 			keys.into_iter()
 				.zip(results)
 				.filter_map(|(k, v)| v.map(|_| k))
@@ -706,10 +759,8 @@ impl StorageInterface for RedisStorage {
 		let redis_keys: Vec<String> = keys.iter().map(|k| self.data_key(k)).collect();
 
 		// Use MGET for efficient batch retrieval
-		let values: Vec<Option<Vec<u8>>> = conn
-			.mget(&redis_keys)
-			.await
-			.map_err(|e| self.map_redis_error(e, "get_batch"))?;
+		let values: Vec<Option<Vec<u8>>> =
+			dispatch_redis!(self, conn, "get_batch", mget(&redis_keys));
 
 		let mut results = Vec::new();
 		for (i, value) in values.into_iter().enumerate() {
@@ -750,21 +801,34 @@ impl StorageInterface for RedisStorage {
 
 		let result: bool = if let Some(ttl) = ttl {
 			// SET key value NX EX seconds - returns "OK" if set, nil if key exists
-			let reply: Option<String> = redis::cmd("SET")
-				.arg(&redis_key)
-				.arg(&value)
-				.arg("NX")
-				.arg("EX")
-				.arg(ttl.as_secs())
-				.query_async(&mut conn)
-				.await
-				.map_err(|e| self.map_redis_error(e, "set_nx"))?;
+			let secs = ttl.as_secs();
+			let reply: Option<String> = match &mut conn {
+				RedisConn::Standalone(c) => {
+					redis::cmd("SET")
+						.arg(&redis_key)
+						.arg(&value)
+						.arg("NX")
+						.arg("EX")
+						.arg(secs)
+						.query_async(c)
+						.await
+				},
+				RedisConn::Cluster(c) => {
+					redis::cmd("SET")
+						.arg(&redis_key)
+						.arg(&value)
+						.arg("NX")
+						.arg("EX")
+						.arg(secs)
+						.query_async(c)
+						.await
+				},
+			}
+			.map_err(|e| self.map_redis_error(e, "set_nx"))?;
 			reply.is_some()
 		} else {
 			// SETNX returns true if set, false if key exists
-			conn.set_nx(&redis_key, &value)
-				.await
-				.map_err(|e| self.map_redis_error(e, "set_nx"))?
+			dispatch_redis!(self, conn, "set_nx", set_nx(&redis_key, &value))
 		};
 
 		debug!(key = %key, set = result, "set_nx operation");
@@ -814,14 +878,27 @@ impl StorageInterface for RedisStorage {
 
 		let ttl_secs = ttl.map(|d| d.as_secs() as i64).unwrap_or(0);
 
-		let result: i64 = script
-			.key(&redis_key)
-			.arg(expected)
-			.arg(&new_value)
-			.arg(ttl_secs)
-			.invoke_async(&mut conn)
-			.await
-			.map_err(|e| self.map_redis_error(e, "compare_and_swap"))?;
+		let result: i64 = match &mut conn {
+			RedisConn::Standalone(c) => {
+				script
+					.key(&redis_key)
+					.arg(expected)
+					.arg(&new_value)
+					.arg(ttl_secs)
+					.invoke_async(c)
+					.await
+			},
+			RedisConn::Cluster(c) => {
+				script
+					.key(&redis_key)
+					.arg(expected)
+					.arg(&new_value)
+					.arg(ttl_secs)
+					.invoke_async(c)
+					.await
+			},
+		}
+		.map_err(|e| self.map_redis_error(e, "compare_and_swap"))?;
 
 		match result {
 			1 => {
@@ -846,10 +923,7 @@ impl StorageInterface for RedisStorage {
 		let redis_key = self.data_key(key);
 
 		// DEL returns count of deleted keys (0 or 1 for single key)
-		let deleted: i64 = conn
-			.del(&redis_key)
-			.await
-			.map_err(|e| self.map_redis_error(e, "delete_if_exists"))?;
+		let deleted: i64 = dispatch_redis!(self, conn, "delete_if_exists", del(&redis_key));
 
 		let existed = deleted > 0;
 		debug!(key = %key, existed, "delete_if_exists operation");
@@ -888,6 +962,7 @@ impl ConfigSchema for RedisStorageSchema {
 					max: Some(15),
 				},
 			),
+			Field::new("cluster_mode", FieldType::Boolean),
 		];
 
 		// Add TTL fields for each StorageKey
@@ -935,20 +1010,43 @@ impl ConfigSchema for RedisStorageSchema {
 pub async fn initialize_redis_connection(
 	redis_url: &str,
 	timeout_ms: u64,
-) -> Result<Arc<ConnectionManager>, StorageError> {
-	let redis_client = redis::Client::open(redis_url)
-		.map_err(|e| StorageError::Configuration(format!("Failed to create Redis client: {e}")))?;
+	cluster_mode: bool,
+) -> Result<Arc<RedisConn>, StorageError> {
+	let conn = if cluster_mode {
+		let cluster_client = redis::cluster::ClusterClient::new(vec![redis_url]).map_err(|e| {
+			StorageError::Configuration(format!("Failed to create Redis cluster client: {e}"))
+		})?;
+		let cluster_conn = timeout(
+			Duration::from_millis(timeout_ms),
+			cluster_client.get_async_connection(),
+		)
+		.await
+		.map_err(|_| {
+			StorageError::Backend(format!(
+				"Redis cluster connection timeout after {timeout_ms}ms"
+			))
+		})?
+		.map_err(|e| StorageError::Backend(format!("Failed to create cluster connection: {e}")))?;
+		RedisConn::Cluster(cluster_conn)
+	} else {
+		let redis_client = redis::Client::open(redis_url).map_err(|e| {
+			StorageError::Configuration(format!("Failed to create Redis client: {e}"))
+		})?;
+		let connection_manager = timeout(
+			Duration::from_millis(timeout_ms),
+			ConnectionManager::new(redis_client),
+		)
+		.await
+		.map_err(|_| {
+			StorageError::Backend(format!("Redis connection timeout after {timeout_ms}ms"))
+		})?
+		.map_err(|e| StorageError::Backend(format!("Failed to create connection manager: {e}")))?;
+		RedisConn::Standalone(connection_manager)
+	};
 
-	let connection_manager = timeout(
-		Duration::from_millis(timeout_ms),
-		ConnectionManager::new(redis_client),
-	)
-	.await
-	.map_err(|_| StorageError::Backend(format!("Redis connection timeout after {timeout_ms}ms")))?
-	.map_err(|e| StorageError::Backend(format!("Failed to create connection manager: {e}")))?;
-
-	debug!(redis_url = %redis_url, "redis connection established");
-	Ok(Arc::new(connection_manager))
+	let redacted_url = redact_url_credentials(redis_url);
+	debug!(redis_url = %redacted_url, cluster_mode = cluster_mode, "redis connection established");
+	Ok(Arc::new(conn))
 }
 
 /// Builds full Redis URL with database number appended if not already present.
@@ -966,6 +1064,31 @@ fn build_redis_url(redis_url: &str, db: u8) -> String {
 		// Append database number
 		format!("{}/{}", redis_url.trim_end_matches('/'), db)
 	}
+}
+
+fn resolve_redis_url_or_err(
+	config: &serde_json::Value,
+	redis_url: &str,
+	db: u8,
+) -> Result<(String, bool), StorageError> {
+	let cluster_mode = config
+		.get("cluster_mode")
+		.and_then(|v| v.as_bool())
+		.unwrap_or(false);
+
+	if cluster_mode && db != 0 {
+		return Err(StorageError::Configuration(
+			"cluster mode requires db=0 (Redis Cluster only supports database 0)".to_string(),
+		));
+	}
+
+	let full_redis_url = if cluster_mode {
+		redis_url.to_string()
+	} else {
+		build_redis_url(redis_url, db)
+	};
+
+	Ok((full_redis_url, cluster_mode))
 }
 
 /// Factory function to create a Redis storage backend from configuration.
@@ -1010,7 +1133,7 @@ pub fn create_storage(
 		.map(|v| v as u8)
 		.unwrap_or(0);
 
-	let full_redis_url = build_redis_url(redis_url, db);
+	let (full_redis_url, cluster_mode) = resolve_redis_url_or_err(config, redis_url, db)?;
 	let ttl_config = TtlConfig::from_config(config);
 
 	// Create storage with lazy connection initialization
@@ -1020,6 +1143,7 @@ pub fn create_storage(
 		timeout_ms,
 		key_prefix,
 		ttl_config,
+		cluster_mode,
 	)?))
 }
 
@@ -1057,10 +1181,16 @@ pub async fn create_storage_async(
 		.map(|v| v as u8)
 		.unwrap_or(0);
 
-	let full_redis_url = build_redis_url(redis_url, db);
+	let (full_redis_url, cluster_mode) = resolve_redis_url_or_err(config, redis_url, db)?;
 	let ttl_config = TtlConfig::from_config(config);
 
-	let storage = RedisStorage::new(full_redis_url, timeout_ms, key_prefix, ttl_config)?;
+	let storage = RedisStorage::new(
+		full_redis_url,
+		timeout_ms,
+		key_prefix,
+		ttl_config,
+		cluster_mode,
+	)?;
 
 	// Eagerly initialize connection to verify it works
 	storage.get_connection().await?;
@@ -1225,6 +1355,7 @@ mod tests {
 			5000,
 			"test".to_string(),
 			ttl_config,
+			false,
 		);
 
 		assert!(result.is_ok());
@@ -1242,6 +1373,7 @@ mod tests {
 			5000,
 			"".to_string(),
 			ttl_config,
+			false,
 		);
 
 		assert!(result.is_err());
@@ -1253,7 +1385,7 @@ mod tests {
 	#[test]
 	fn test_redis_storage_new_empty_url() {
 		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
-		let result = RedisStorage::new("".to_string(), 5000, "test".to_string(), ttl_config);
+		let result = RedisStorage::new("".to_string(), 5000, "test".to_string(), ttl_config, false);
 
 		assert!(result.is_err());
 		let err = result.unwrap_err();
@@ -1271,6 +1403,7 @@ mod tests {
 			5000,
 			"oif-solver".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1290,6 +1423,7 @@ mod tests {
 			5000,
 			"my-custom-prefix".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1307,6 +1441,7 @@ mod tests {
 			5000,
 			"oif-solver".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1323,6 +1458,7 @@ mod tests {
 			5000,
 			"oif-solver".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1341,6 +1477,7 @@ mod tests {
 			5000,
 			"oif-solver".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1359,6 +1496,7 @@ mod tests {
 			5000,
 			"oif-solver".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1383,6 +1521,7 @@ mod tests {
 			5000,
 			"oif-solver".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1406,6 +1545,7 @@ mod tests {
 			5000,
 			"oif-solver".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1424,6 +1564,7 @@ mod tests {
 			5000,
 			"oif-solver".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1445,6 +1586,7 @@ mod tests {
 			5000,
 			"my-prefix".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1467,6 +1609,7 @@ mod tests {
 			5000,
 			"test".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1487,6 +1630,7 @@ mod tests {
 			5000,
 			"test".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1507,6 +1651,7 @@ mod tests {
 			5000,
 			"test".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1525,6 +1670,7 @@ mod tests {
 			5000,
 			"test".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1543,6 +1689,7 @@ mod tests {
 			5000,
 			"test".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1560,6 +1707,7 @@ mod tests {
 			5000,
 			"test".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1580,6 +1728,7 @@ mod tests {
 			5000,
 			"test".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1600,6 +1749,7 @@ mod tests {
 			5000,
 			"test".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1619,6 +1769,7 @@ mod tests {
 			5000,
 			"test".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1639,6 +1790,7 @@ mod tests {
 			5000,
 			"test".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1807,6 +1959,129 @@ mod tests {
 	}
 
 	#[test]
+	fn test_create_storage_cluster_mode_rejects_nonzero_db() {
+		let config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
+			"cluster_mode": true,
+			"db": 3,
+		});
+		let result = create_storage(&config);
+		match result {
+			Err(e) => {
+				let err = format!("{e}");
+				assert!(
+					err.contains("cluster mode") && err.contains("db"),
+					"error message should mention cluster mode and db, got: {err}"
+				);
+			},
+			Ok(_) => panic!("cluster_mode=true with db=3 must error"),
+		}
+	}
+
+	#[test]
+	fn test_create_storage_cluster_mode_accepts_db_zero() {
+		let config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
+			"cluster_mode": true,
+			"db": 0,
+		});
+		let result = create_storage(&config);
+		assert!(result.is_ok(), "cluster_mode=true with db=0 must validate");
+	}
+
+	#[test]
+	fn test_create_storage_cluster_mode_default_false() {
+		let config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
+		});
+		let result = create_storage(&config);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_resolve_redis_url_standalone_appends_db() {
+		let config = serde_json::json!({
+			"redis_url": "redis://localhost:6379",
+			"db": 2,
+		});
+		let (url, cluster_mode) =
+			resolve_redis_url_or_err(&config, "redis://localhost:6379", 2).unwrap();
+		assert_eq!(url, "redis://localhost:6379/2");
+		assert!(!cluster_mode);
+	}
+
+	#[test]
+	fn test_resolve_redis_url_cluster_mode_keeps_seed_url() {
+		let config = serde_json::json!({
+			"redis_url": "redis://127.0.0.1:7100",
+			"cluster_mode": true,
+			"db": 0,
+		});
+		let (url, cluster_mode) =
+			resolve_redis_url_or_err(&config, "redis://127.0.0.1:7100", 0).unwrap();
+		assert_eq!(url, "redis://127.0.0.1:7100");
+		assert!(cluster_mode);
+	}
+
+	#[test]
+	fn test_resolve_redis_url_cluster_mode_rejects_nonzero_db() {
+		let config = serde_json::json!({
+			"redis_url": "redis://127.0.0.1:7100",
+			"cluster_mode": true,
+			"db": 1,
+		});
+		let err = resolve_redis_url_or_err(&config, "redis://127.0.0.1:7100", 1).unwrap_err();
+		assert!(format!("{err}").contains("cluster mode requires db=0"));
+	}
+
+	#[test]
+	fn test_keys_share_hash_tag_in_cluster_mode() {
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"oif-solver".to_string(),
+			TtlConfig::default(),
+			true,
+		)
+		.unwrap();
+
+		let expected_prefix = "{oif-solver}";
+		let data = storage.data_key("abc123");
+		let all_ids = storage.all_ids_key("orders");
+		let idx = storage.index_key("orders", "status", &serde_json::json!("pending"));
+		let meta = storage.index_meta_key("abc123");
+
+		for k in [&data, &all_ids, &idx, &meta] {
+			assert!(
+				k.starts_with(expected_prefix),
+				"key '{k}' must start with hash tag '{expected_prefix}' in cluster mode"
+			);
+		}
+
+		// Cluster mode preserves the existing suffixes — only the prefix is wrapped.
+		assert!(all_ids.ends_with(":_all"));
+		assert!(idx.contains(":_index:"));
+		assert!(meta.ends_with(":_idx_meta"));
+	}
+
+	#[test]
+	fn test_keys_in_standalone_mode_are_unchanged() {
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"oif-solver".to_string(),
+			TtlConfig::default(),
+			false,
+		)
+		.unwrap();
+
+		// Regression guard: byte-identical to current behaviour.
+		assert_eq!(storage.data_key("abc"), "oif-solver:abc");
+		assert_eq!(storage.all_ids_key("orders"), "oif-solver:orders:_all");
+		assert_eq!(storage.index_meta_key("abc"), "oif-solver:abc:_idx_meta");
+	}
+
+	#[test]
 	fn test_create_storage_with_db_number() {
 		let config = serde_json::json!({
 			"redis_url": "redis://localhost:6379",
@@ -1887,6 +2162,7 @@ mod tests {
 			5000,
 			"test-prefix".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -1938,6 +2214,7 @@ mod tests {
 			5000,
 			"test".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -2256,7 +2533,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_initialize_redis_connection_invalid_url() {
-		let result = initialize_redis_connection("invalid://url", 100).await;
+		let result = initialize_redis_connection("invalid://url", 100, false).await;
 		assert!(result.is_err());
 		assert!(matches!(result, Err(StorageError::Configuration(_))));
 	}
@@ -2264,7 +2541,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_initialize_redis_connection_timeout() {
 		// Use a non-routable IP to trigger timeout
-		let result = initialize_redis_connection("redis://10.255.255.1:6379", 100).await;
+		let result = initialize_redis_connection("redis://10.255.255.1:6379", 100, false).await;
 		assert!(result.is_err());
 		assert!(matches!(result, Err(StorageError::Backend(_))));
 	}
@@ -2307,6 +2584,7 @@ mod tests {
 			100,
 			"test".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -2332,6 +2610,7 @@ mod tests {
 			100,
 			"test".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -2364,6 +2643,7 @@ mod tests {
 			100,
 			"test".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 
@@ -2383,6 +2663,7 @@ mod tests {
 			100,
 			"test".to_string(),
 			ttl_config,
+			false,
 		)
 		.unwrap();
 

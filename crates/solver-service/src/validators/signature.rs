@@ -213,7 +213,7 @@ mod tests {
 	) -> Arc<DeliveryService> {
 		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
 		implementations.insert(chain_id, Arc::new(mock) as Arc<dyn DeliveryInterface>);
-		Arc::new(DeliveryService::new(implementations, 1, 30))
+		Arc::new(DeliveryService::new(implementations, 1, 30, 60))
 	}
 
 	fn address_from_hex(hex_str: &str) -> Address {

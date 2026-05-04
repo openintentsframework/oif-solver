@@ -25,6 +25,7 @@ pub struct ConfigBuilder {
 	storage_primary: String,
 	storage_cleanup_interval_seconds: u64,
 	min_confirmations: u64,
+	tx_confirmation_timeout_seconds: u64,
 	account_primary: String,
 	strategy_primary: String,
 	api: Option<ApiConfig>,
@@ -52,6 +53,7 @@ impl ConfigBuilder {
 			storage_primary: "memory".to_string(),
 			storage_cleanup_interval_seconds: 60,
 			min_confirmations: 1,
+			tx_confirmation_timeout_seconds: 600,
 			account_primary: "local".to_string(),
 			strategy_primary: "simple".to_string(),
 			api: None,
@@ -100,6 +102,12 @@ impl ConfigBuilder {
 	/// Sets the minimum confirmations for delivery.
 	pub fn min_confirmations(mut self, confirmations: u64) -> Self {
 		self.min_confirmations = confirmations;
+		self
+	}
+
+	/// Sets the tx-confirmation timeout in seconds for the live delivery monitor.
+	pub fn tx_confirmation_timeout_seconds(mut self, secs: u64) -> Self {
+		self.tx_confirmation_timeout_seconds = secs;
 		self
 	}
 
@@ -167,6 +175,7 @@ impl ConfigBuilder {
 			delivery: DeliveryConfig {
 				implementations: HashMap::new(),
 				min_confirmations: self.min_confirmations,
+				tx_confirmation_timeout_seconds: self.tx_confirmation_timeout_seconds,
 			},
 			account: AccountConfig {
 				primary: self.account_primary,

@@ -22,6 +22,12 @@ use tokio::sync::{watch, RwLock, Semaphore};
 /// Timeout for Submitted state before NeedsIntervention.
 const SUBMITTED_TIMEOUT_SECS: u64 = 30 * 60;
 
+/// Absolute upper bound on the approve phase. Catches a low-gas approve that
+/// stays in the mempool forever (tx_exists keeps returning true). After this,
+/// the only safe action is admin intervention — automatic fee bumping is
+/// deferred (requires Fix 3 / TxAttempt outbox).
+const APPROVE_PHASE_TIMEOUT_SECS: u64 = 60 * 60; // 1 hour
+
 /// Timeout for Relaying state before NeedsIntervention.
 const RELAYING_TIMEOUT_SECS: u64 = 30 * 60;
 
@@ -30,6 +36,10 @@ const PENDING_REDEMPTION_TIMEOUT_SECS: u64 = 24 * 3600;
 
 /// Max retries for PendingRedemption before NeedsIntervention.
 const MAX_REDEEM_RETRIES: u32 = 3;
+
+fn is_source_transaction_missing(reason: &str) -> bool {
+	reason.contains("Source transaction not found") || reason.contains("Source transaction missing")
+}
 
 /// Background rebalance monitor.
 /// Shared monitor timing state, readable by the admin status API.
@@ -158,6 +168,266 @@ impl RebalanceMonitor {
 		for mut transfer in active {
 			let age = now.saturating_sub(transfer.updated_at);
 
+			// (0) DEPOSIT CRASH-WINDOW GUARD — HIGHEST priority.
+			// We marked the transfer "about to call bridge_asset" but never persisted
+			// a tx_hash. The deposit may have broadcast on-chain at a nonce we'll never
+			// re-derive. Auto-retry would risk a second deposit. Escalate to admin.
+			if matches!(transfer.status, BridgeTransferStatus::Submitted)
+				&& transfer.tx_hash.is_none()
+				&& transfer.bridge_submit_attempted
+			{
+				tracing::warn!(
+					transfer_id = %transfer.id,
+					pair = %transfer.pair_id,
+					"Deposit crash window detected (bridge_submit_attempted=true, tx_hash=None); escalating"
+				);
+				self.bridge_service
+					.update_transfer(
+						&mut transfer,
+						BridgeTransferStatus::NeedsIntervention(
+							"bridge submit attempted but tx_hash not persisted; possible double-deposit risk if auto-retried"
+								.to_string(),
+						),
+					)
+					.await?;
+				continue;
+			}
+
+			// (d) Approve-phase absolute timeout. Catches a low-gas approve that sits in
+			// the mempool indefinitely with tx_exists==true. Without this rule, the
+			// "still pending" branch below would loop forever.
+			//
+			// Two bypass paths the previous shape allowed:
+			//
+			// 1. approve_submitted_at == None: `.unwrap_or(false)` made the timestamp
+			//    comparison fail-open. Older serialized records or any partial-metadata
+			//    write skipped the timeout entirely.
+			//
+			// 2. approve_tx_hash == Some(valid) && approve_was_broadcast == false: the
+			//    guard required approve_was_broadcast, and the mid-flight approve branch
+			//    runs first and `continue`s every tick. The stale-hash counter only
+			//    increments when tx_exists() returns Ok(false) — so a slow underpriced
+			//    approve where tx_exists() == Ok(true) indefinitely had no escalation.
+			//
+			// Fix both at once: derive "phase started" from EITHER signal, and "phase
+			// start time" with a fallback to created_at.
+			if matches!(transfer.status, BridgeTransferStatus::Submitted)
+				&& transfer.tx_hash.is_none()
+				&& {
+					let approve_phase_started =
+						transfer.approve_was_broadcast || transfer.approve_tx_hash.is_some();
+					let phase_start = transfer.approve_submitted_at.unwrap_or(transfer.created_at);
+					approve_phase_started
+						&& now.saturating_sub(phase_start) > APPROVE_PHASE_TIMEOUT_SECS
+				} {
+				let phase_age = now
+					.saturating_sub(transfer.approve_submitted_at.unwrap_or(transfer.created_at));
+				tracing::warn!(
+					transfer_id = %transfer.id,
+					pair = %transfer.pair_id,
+					approve_phase_age_secs = phase_age,
+					approve_was_broadcast = transfer.approve_was_broadcast,
+					approve_tx_hash_present = transfer.approve_tx_hash.is_some(),
+					approve_submitted_at = ?transfer.approve_submitted_at,
+					"Approve phase exceeded absolute timeout; escalating to NeedsIntervention"
+				);
+				self.bridge_service
+					.update_transfer(
+						&mut transfer,
+						BridgeTransferStatus::NeedsIntervention(format!(
+							"approve phase exceeded {APPROVE_PHASE_TIMEOUT_SECS}s without confirmation; possible underpriced tx"
+						)),
+					)
+					.await?;
+				continue;
+			}
+
+			// (e) Impossible-state invariant — transfer was created but NEVER had an
+			// approve broadcast AND never marked an attempted bridge submit. Both `!`
+			// guards are critical: cleared-hash recovery (`approve_was_broadcast == true`)
+			// is excluded by the first; the deposit crash window
+			// (`bridge_submit_attempted == true`) is excluded by the second (handled by
+			// branch (0) above).
+			if matches!(transfer.status, BridgeTransferStatus::Submitted)
+				&& transfer.tx_hash.is_none()
+				&& transfer.approve_tx_hash.is_none()
+				&& !transfer.approve_was_broadcast
+				&& !transfer.bridge_submit_attempted
+				&& now.saturating_sub(transfer.created_at) > 300
+			{
+				tracing::warn!(
+					transfer_id = %transfer.id,
+					pair = %transfer.pair_id,
+					age_secs = now.saturating_sub(transfer.created_at),
+					"Transfer in impossible state; escalating"
+				);
+				self.bridge_service
+					.update_transfer(
+						&mut transfer,
+						BridgeTransferStatus::NeedsIntervention(
+							"approve never broadcast — likely crashed before bridge_asset returned"
+								.to_string(),
+						),
+					)
+					.await?;
+				continue;
+			}
+
+			// (a) Mid-flight approve handling: status Submitted, tx_hash None, and we
+			// have an approve hash to re-check. Placed BEFORE the SUBMITTED_TIMEOUT
+			// match below so a slow-but-honest approve is not reaped by the 30-min timeout.
+			if matches!(transfer.status, BridgeTransferStatus::Submitted)
+				&& transfer.tx_hash.is_none()
+				&& transfer.approve_tx_hash.is_some()
+			{
+				let approve_hash_str = transfer.approve_tx_hash.clone().unwrap();
+				let approve_hash_bytes = match hex::decode(
+					approve_hash_str.trim_start_matches("0x"),
+				) {
+					Ok(b) if b.len() == 32 => solver_types::TransactionHash(b),
+					Ok(b) => {
+						// Valid hex but wrong length. Transaction hashes are
+						// exactly 32 bytes by definition; anything else is a
+						// malformed record. No future tick can heal a persisted
+						// bad-length hash, so escalate immediately rather than
+						// passing the malformed bytes to the RPC layer where the
+						// failure mode is provider-dependent.
+						let actual_len = b.len();
+						tracing::error!(
+							transfer_id = %transfer.id,
+							approve_tx_hash = %approve_hash_str,
+							actual_byte_len = actual_len,
+							"approve_tx_hash decoded but length != 32; escalating to NeedsIntervention"
+						);
+						self.bridge_service
+								.update_transfer(
+									&mut transfer,
+									BridgeTransferStatus::NeedsIntervention(format!(
+										"invalid approve_tx_hash length: got {actual_len} bytes, want 32 (persisted: {approve_hash_str})"
+									)),
+								)
+								.await?;
+						continue;
+					},
+					Err(_) => {
+						// A malformed (non-hex / odd-length) hash will fail every
+						// future tick — there's no path forward from a parse
+						// failure. Escalate so an operator can inspect the
+						// persisted record. Without this, the transfer loops
+						// silently with the same warn log every tick until restart.
+						tracing::error!(
+							transfer_id = %transfer.id,
+							approve_tx_hash = %approve_hash_str,
+							"Invalid approve_tx_hash format; escalating to NeedsIntervention"
+						);
+						self.bridge_service
+								.update_transfer(
+									&mut transfer,
+									BridgeTransferStatus::NeedsIntervention(format!(
+										"invalid approve_tx_hash format ({approve_hash_str}); cannot decode as hex — operator must inspect persisted record"
+									)),
+								)
+								.await?;
+						continue;
+					},
+				};
+
+				match self
+					.delivery
+					.get_receipt(&approve_hash_bytes, transfer.source_chain)
+					.await
+				{
+					Ok(receipt) if receipt.success => {
+						// (b) Approve confirmed. Reset miss counters, run bridge_asset.
+						tracing::info!(
+							transfer_id = %transfer.id,
+							approve_hash = %approve_hash_str,
+							"Approve confirmed; resuming bridge_asset for deposit"
+						);
+						transfer.approve_missing_checks = 0;
+						transfer.approve_missing_since = None;
+						self.run_bridge_asset_after_approve(
+							&mut transfer,
+							bridge_impl.as_ref(),
+							now,
+						)
+						.await?;
+						continue;
+					},
+					Ok(_receipt) => {
+						// status == false → revert. Mark Failed.
+						tracing::warn!(
+							transfer_id = %transfer.id,
+							"Approve reverted on chain"
+						);
+						self.bridge_service
+							.update_transfer(
+								&mut transfer,
+								BridgeTransferStatus::Failed(
+									"approve reverted on chain".to_string(),
+								),
+							)
+							.await?;
+						continue;
+					},
+					Err(_) => {
+						// Receipt not yet available. Check if the tx is on chain at all.
+						match self
+							.delivery
+							.tx_exists(&approve_hash_bytes, transfer.source_chain)
+							.await
+						{
+							Ok(false) => {
+								// (c) Stale-hash retry: definitively not on chain.
+								transfer.approve_missing_checks += 1;
+								if transfer.approve_missing_since.is_none() {
+									transfer.approve_missing_since = Some(now);
+								}
+								if transfer.approve_missing_checks >= 3 {
+									tracing::warn!(
+										transfer_id = %transfer.id,
+										approve_hash = %approve_hash_str,
+										"Approve hash remained missing; clearing AND re-running bridge_asset"
+									);
+									// Clear stale hash. Preserve approve_was_broadcast +
+									// approve_submitted_at so absolute cap measures whole phase.
+									transfer.approve_tx_hash = None;
+									transfer.approve_missing_checks = 0;
+									transfer.approve_missing_since = None;
+									// Same-tick retry — actually retry, do not just clear.
+									self.run_bridge_asset_after_approve(
+										&mut transfer,
+										bridge_impl.as_ref(),
+										now,
+									)
+									.await?;
+									continue;
+								}
+								// Below threshold — persist counter without refreshing
+								// updated_at (the absolute cap is the upper bound; we
+								// don't want a periodic refresh to keep an underpriced
+								// tx alive forever).
+								self.bridge_service
+									.storage()
+									.save_transfer(&transfer)
+									.await?;
+								continue;
+							},
+							_ => {
+								// tx_exists returned Ok(true) or Err — still pending in mempool.
+								// Do NOT refresh updated_at; the absolute approve-phase cap
+								// (rule d) is the authoritative upper bound.
+								tracing::debug!(
+									transfer_id = %transfer.id,
+									"Approve still pending in mempool"
+								);
+								continue;
+							},
+						}
+					},
+				}
+			}
+
 			// Timeout checks
 			match &transfer.status {
 				BridgeTransferStatus::Submitted if age > SUBMITTED_TIMEOUT_SECS => {
@@ -250,12 +520,12 @@ impl RebalanceMonitor {
 			};
 			// Track submitted-missing checks for dropped tx detection.
 			// Only increment when the driver explicitly signals "tx not found" via
-			// a Failed status containing "Source transaction not found". Do NOT
+			// a Failed status containing source transaction missing/not found. Do NOT
 			// increment on normal Submitted→Submitted (tx still pending in mempool).
 			if matches!(transfer.status, BridgeTransferStatus::Submitted) {
 				match &new_status {
 					BridgeTransferStatus::Failed(reason)
-						if reason.contains("Source transaction not found") =>
+						if is_source_transaction_missing(reason) =>
 					{
 						transfer.submitted_missing_checks += 1;
 						if transfer.submitted_missing_since.is_none() {
@@ -291,7 +561,7 @@ impl RebalanceMonitor {
 
 			// Handle auto-triggered transfers with dropped source txs — fail fast
 			if matches!(&transfer.trigger, RebalanceTrigger::Auto)
-				&& matches!(&new_status, BridgeTransferStatus::Failed(reason) if reason.contains("Source transaction missing"))
+				&& matches!(&new_status, BridgeTransferStatus::Failed(reason) if is_source_transaction_missing(reason))
 			{
 				tracing::warn!(
 					transfer_id = %transfer.id,
@@ -306,7 +576,7 @@ impl RebalanceMonitor {
 
 			// Manual transfers with dropped source txs go to NeedsIntervention
 			if matches!(&transfer.trigger, RebalanceTrigger::Manual)
-				&& matches!(&new_status, BridgeTransferStatus::Failed(reason) if reason.contains("Source transaction missing"))
+				&& matches!(&new_status, BridgeTransferStatus::Failed(reason) if is_source_transaction_missing(reason))
 			{
 				tracing::warn!(
 					transfer_id = %transfer.id,
@@ -325,6 +595,57 @@ impl RebalanceMonitor {
 			}
 
 			if new_status != transfer.status {
+				// Stale-redeem-hash recovery: a stored redeem_tx_hash that the
+				// driver reports as "not found" on chain is not a redeem business
+				// failure — it's most likely a tx that never propagated or was
+				// dropped from the mempool. Track consecutive missing checks; below
+				// the threshold, keep the hash and wait. At threshold, clear the
+				// hash so the next tick can resubmit via the existing
+				// `redeem_tx_hash.is_none()` path. Do NOT increment failure_count
+				// for this signal.
+				if matches!(&transfer.status, BridgeTransferStatus::PendingRedemption)
+					&& matches!(
+						&new_status,
+						BridgeTransferStatus::Failed(reason)
+							if reason.contains("Redeem transaction not found")
+					) {
+					transfer.redeem_missing_checks += 1;
+					if transfer.redeem_missing_since.is_none() {
+						transfer.redeem_missing_since = Some(now);
+					}
+
+					if transfer.redeem_missing_checks < 3 {
+						tracing::debug!(
+							transfer_id = %transfer.id,
+							checks = transfer.redeem_missing_checks,
+							"Redeem tx not found, will recheck before resubmitting"
+						);
+						transfer.last_status_poll_at = Some(now);
+						self.bridge_service
+							.storage()
+							.save_transfer(&transfer)
+							.await?;
+						continue;
+					}
+
+					tracing::warn!(
+						transfer_id = %transfer.id,
+						pair = %transfer.pair_id,
+						redeem_tx_hash = ?transfer.redeem_tx_hash,
+						checks = transfer.redeem_missing_checks,
+						"Redeem tx hash remained missing; clearing stale hash for resubmission"
+					);
+					transfer.redeem_tx_hash = None;
+					transfer.redeem_missing_checks = 0;
+					transfer.redeem_missing_since = None;
+					transfer.last_status_poll_at = Some(now);
+					self.bridge_service
+						.storage()
+						.save_transfer(&transfer)
+						.await?;
+					continue;
+				}
+
 				// Handle PendingRedemption retry: if driver reports Failed for a
 				// redeem attempt, don't apply the Failed status — increment
 				// failure_count and stay PendingRedemption for retry.
@@ -365,6 +686,16 @@ impl RebalanceMonitor {
 						self.bridge_service
 							.set_cooldown(&transfer.pair_id, config.cooldown_seconds)
 							.await?;
+					}
+
+					// Reset redeem-missing counters when leaving PendingRedemption
+					// successfully (e.g. → Completed). Without this, stale counter
+					// values from a previous miss streak would carry over.
+					if matches!(&transfer.status, BridgeTransferStatus::PendingRedemption)
+						&& !matches!(&new_status, BridgeTransferStatus::PendingRedemption)
+					{
+						transfer.redeem_missing_checks = 0;
+						transfer.redeem_missing_since = None;
 					}
 
 					self.bridge_service
@@ -567,6 +898,19 @@ impl RebalanceMonitor {
 								tracing::info!(
 									transfer_id = %transfer.id,
 									"Vault redeem submitted"
+								);
+							},
+							// Residual nonce drift after the delivery layer's resync retry.
+							// This is transient — the next monitor tick will retry once the
+							// nonce manager has caught up. Do NOT count it as a redeem
+							// business failure; leaving failure_count untouched keeps the
+							// transfer in PendingRedemption instead of escalating to
+							// NeedsIntervention.
+							Err(solver_delivery::DeliveryError::NonceTooLow(reason)) => {
+								tracing::warn!(
+									transfer_id = %transfer.id,
+									reason = %reason,
+									"Redeem submission hit residual nonce-drift after resync; will retry next tick"
 								);
 							},
 							Err(e) => {
@@ -823,6 +1167,200 @@ impl RebalanceMonitor {
 			.map_err(|_| crate::BridgeError::Config("Address must be 20 bytes".to_string()))?;
 		Ok(Address::from(arr))
 	}
+
+	/// Reconstruct a `BridgeRequest` from a transfer's persisted fields.
+	/// Used by the resume-after-approve path so the monitor can re-run
+	/// `bridge_asset` with the same shape as the original submission, even
+	/// across solver restarts and config changes.
+	fn reconstruct_bridge_request(
+		transfer: &crate::types::PendingBridgeTransfer,
+	) -> Result<crate::types::BridgeRequest, String> {
+		let source_token_str = transfer
+			.source_token_address
+			.as_deref()
+			.ok_or("missing source_token_address (pre-Task-1 transfer?)")?;
+		let source_oft_str = transfer
+			.source_oft_address
+			.as_deref()
+			.ok_or("missing source_oft_address")?;
+		let dest_token_str = transfer
+			.dest_token_address
+			.as_deref()
+			.ok_or("missing dest_token_address")?;
+		let dest_oft_str = transfer
+			.dest_oft_address
+			.as_deref()
+			.ok_or("missing dest_oft_address")?;
+		let recipient_str = transfer
+			.recipient_address
+			.as_deref()
+			.ok_or("missing recipient_address")?;
+
+		let source_token = Self::parse_address(source_token_str).map_err(|e| e.to_string())?;
+		let source_oft = Self::parse_address(source_oft_str).map_err(|e| e.to_string())?;
+		let dest_token = Self::parse_address(dest_token_str).map_err(|e| e.to_string())?;
+		let dest_oft = Self::parse_address(dest_oft_str).map_err(|e| e.to_string())?;
+		let recipient = Self::parse_address(recipient_str).map_err(|e| e.to_string())?;
+
+		let amount = U256::from_str_radix(&transfer.amount, 10)
+			.map_err(|e| format!("invalid amount: {e}"))?;
+		let min_amount = transfer
+			.min_amount
+			.as_deref()
+			.map(|s| U256::from_str_radix(s, 10))
+			.transpose()
+			.map_err(|e| format!("invalid min_amount: {e}"))?;
+
+		Ok(crate::types::BridgeRequest {
+			pair_id: transfer.pair_id.clone(),
+			source_chain: transfer.source_chain,
+			dest_chain: transfer.dest_chain,
+			source_token,
+			source_oft,
+			dest_token,
+			dest_oft,
+			amount,
+			min_amount,
+			recipient,
+		})
+	}
+
+	/// Reconstruct a `BridgeRequest` from a transfer's persisted fields and
+	/// call `bridge.bridge_asset`. Mirrors `rebalance_token`'s error handling
+	/// so the confirmed-approve resume path AND the stale-hash retry path
+	/// share one canonical implementation.
+	async fn run_bridge_asset_after_approve(
+		&self,
+		transfer: &mut crate::types::PendingBridgeTransfer,
+		bridge_impl: &dyn crate::BridgeInterface,
+		now: u64,
+	) -> Result<(), crate::BridgeError> {
+		let request = match Self::reconstruct_bridge_request(transfer) {
+			Ok(r) => r,
+			Err(reason) => {
+				tracing::error!(
+					transfer_id = %transfer.id,
+					reason = %reason,
+					"BridgeRequest reconstruction failed; escalating"
+				);
+				self.bridge_service
+					.update_transfer(
+						transfer,
+						crate::types::BridgeTransferStatus::NeedsIntervention(format!(
+							"Cannot resume bridge: {reason}"
+						)),
+					)
+					.await?;
+				return Ok(());
+			},
+		};
+
+		// CRASH-WINDOW GUARD: persist marker BEFORE the bridge_asset call.
+		transfer.bridge_submit_attempted = true;
+		self.bridge_service
+			.storage()
+			.save_transfer(transfer)
+			.await?;
+
+		// Intentional: the permit is held across the entire `bridge_asset`
+		// call, which internally broadcasts the deposit *and* polls for
+		// receipt confirmation (~12 × 5 s = 60 s worst case). The redeem path
+		// at line ~829 uses a narrower acquire+broadcast pattern because
+		// `delivery.deliver()` returns immediately after submit; bridge
+		// implementations bundle submit+confirm in `bridge_asset`, so without
+		// a trait-level split we can't narrow without breaking the API
+		// contract. Serializing here is acceptable: the resume path is rare
+		// (only after an approve completes), and the alternative — letting
+		// concurrent submissions race during confirmation — risks nonce
+		// collisions on the same signer. Tracked as follow-up: split
+		// `bridge_asset` into `bridge_submit` + `bridge_confirm` so this
+		// site can acquire only around `bridge_submit`.
+		let _permit = self.transaction_semaphore.acquire().await.map_err(|e| {
+			crate::BridgeError::TransactionFailed(format!(
+				"Failed to acquire semaphore for bridge resume: {e}"
+			))
+		})?;
+
+		match bridge_impl.bridge_asset(&request).await {
+			Ok(result) => {
+				transfer.tx_hash = Some(result.tx_hash);
+				transfer.message_guid = result.message_guid;
+				transfer.updated_at = now;
+				self.bridge_service
+					.storage()
+					.save_transfer(transfer)
+					.await?;
+				Ok(())
+			},
+			Err(crate::BridgeError::ApprovePending { tx_hash }) => {
+				// Allowance still insufficient — implementation re-broadcast approve.
+				// No deposit was attempted. Roll back the marker.
+				// Preserve approve_was_broadcast and approve_submitted_at so the
+				// absolute cap continues measuring the same approve phase.
+				transfer.bridge_submit_attempted = false; // ROLLBACK
+				transfer.approve_tx_hash = Some(tx_hash);
+				transfer.updated_at = now;
+				self.bridge_service
+					.storage()
+					.save_transfer(transfer)
+					.await?;
+				Ok(())
+			},
+			Err(crate::BridgeError::ApproveReverted { tx_hash, error }) => {
+				// Approve reverted on resume — no deposit. Roll back marker.
+				transfer.bridge_submit_attempted = false; // ROLLBACK
+				transfer.approve_tx_hash = Some(tx_hash.clone());
+				self.bridge_service
+					.update_transfer(
+						transfer,
+						crate::types::BridgeTransferStatus::Failed(format!(
+							"approve reverted on resume (tx {tx_hash}): {error}"
+						)),
+					)
+					.await?;
+				Ok(())
+			},
+			Err(crate::BridgeError::ApproveSubmitFailed { error }) => {
+				transfer.bridge_submit_attempted = false; // ROLLBACK
+				self.bridge_service
+					.update_transfer(
+						transfer,
+						crate::types::BridgeTransferStatus::Failed(format!(
+							"approve failed before deposit attempt: {error}"
+						)),
+					)
+					.await?;
+				Ok(())
+			},
+			Err(crate::BridgeError::InsufficientNativeGas(reason)) => {
+				// Pre-broadcast failure: no deposit/source tx was submitted.
+				// Keep the pair locked in NeedsIntervention with a clear operator
+				// reason, but do not abort the whole monitor tick.
+				transfer.bridge_submit_attempted = false;
+				self.bridge_service
+					.update_transfer(
+						transfer,
+						crate::types::BridgeTransferStatus::NeedsIntervention(reason),
+					)
+					.await?;
+				Ok(())
+			},
+			Err(e) => {
+				// Generic error — we don't know if deposit broadcast or not.
+				// KEEP marker set so branch (0) catches this on next tick.
+				tracing::warn!(
+					transfer_id = %transfer.id,
+					error = %e,
+					"bridge_asset failed on resume; marker stays set, next tick will escalate"
+				);
+				self.bridge_service
+					.storage()
+					.save_transfer(transfer)
+					.await?;
+				Ok(())
+			},
+		}
+	}
 }
 
 #[cfg(test)]
@@ -832,11 +1370,12 @@ mod tests {
 	use crate::{BridgeDepositResult, BridgeInterface};
 	use async_trait::async_trait;
 	use solver_config::ConfigBuilder;
-	use solver_delivery::{DeliveryService, MockDeliveryInterface};
+	use solver_delivery::{DeliveryError, DeliveryService, MockDeliveryInterface};
 	use solver_storage::implementations::file::{FileStorage, TtlConfig};
 	use solver_storage::StorageService;
 	use solver_types::{
-		Address as DeliveryAddress, Log, LogFilter, Transaction, TransactionHash, H256,
+		Address as DeliveryAddress, Log, LogFilter, Transaction, TransactionHash,
+		TransactionReceipt, H256,
 	};
 	use std::collections::{HashMap, VecDeque};
 	use std::fs;
@@ -921,6 +1460,7 @@ mod tests {
 			]),
 			3,
 			300,
+			60,
 		))
 	}
 
@@ -1013,6 +1553,11 @@ mod tests {
 		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
 
 		let mut transfer = pending_transfer(BridgeTransferStatus::Submitted);
+		// Deposit was broadcast (tx_hash present) but never advanced past Submitted.
+		// This isolates the SUBMITTED_TIMEOUT branch from the new impossible-state /
+		// mid-flight-approve / crash-window branches (which all require tx_hash.is_none()).
+		transfer.tx_hash =
+			Some("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string());
 		transfer.updated_at = std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
 			.unwrap()
@@ -1073,6 +1618,46 @@ mod tests {
 		));
 		assert_eq!(stored.failure_count, 1);
 		assert!(stored.redeem_tx_hash.is_none());
+	}
+
+	#[tokio::test]
+	async fn test_manual_source_tx_not_found_escalates_to_needs_intervention_after_threshold() {
+		let storage = make_storage();
+		let delivery = make_delivery(MockDeliveryInterface::new());
+		let bridge = Arc::new(StubBridge {
+			check_status_results: Mutex::new(VecDeque::from([Ok(BridgeTransferStatus::Failed(
+				"Source transaction not found".to_string(),
+			))])),
+			..Default::default()
+		}) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let mut transfer = fresh_transfer(BridgeTransferStatus::Submitted);
+		transfer.trigger = RebalanceTrigger::Manual;
+		transfer.tx_hash =
+			Some("0xabababababababababababababababababababababababababababababababab".to_string());
+		transfer.submitted_missing_checks = 2;
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(
+			matches!(
+				&stored.status,
+				BridgeTransferStatus::NeedsIntervention(reason)
+					if reason.contains("Manual transfer source tx missing")
+			),
+			"unexpected status: {:?}",
+			stored.status
+		);
 	}
 
 	#[tokio::test]
@@ -1221,6 +1806,173 @@ mod tests {
 			let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
 			assert_eq!(stored.status, expected_status);
 		}
+	}
+
+	#[tokio::test]
+	async fn test_pending_redemption_missing_redeem_tx_waits_before_resubmit() {
+		// Below the missing-tx threshold (3 consecutive misses) the monitor
+		// must keep the existing redeem_tx_hash and increment its missing
+		// counter without touching failure_count. Otherwise a single transient
+		// "tx not found" reading would burn a retry slot and discard a hash
+		// that may still be in the mempool.
+		let storage = make_storage();
+		let delivery = make_delivery(MockDeliveryInterface::new());
+		let bridge = Arc::new(StubBridge {
+			check_status_results: Mutex::new(VecDeque::from([Ok(BridgeTransferStatus::Failed(
+				"Redeem transaction not found".to_string(),
+			))])),
+			..Default::default()
+		}) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let mut transfer = fresh_transfer(BridgeTransferStatus::PendingRedemption);
+		transfer.redeem_tx_hash =
+			Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(matches!(
+			stored.status,
+			BridgeTransferStatus::PendingRedemption
+		));
+		assert_eq!(stored.redeem_missing_checks, 1);
+		assert!(stored.redeem_missing_since.is_some());
+		assert_eq!(stored.failure_count, 0);
+		assert!(stored.redeem_tx_hash.is_some());
+	}
+
+	#[tokio::test]
+	async fn test_pending_redemption_missing_redeem_tx_clears_hash_after_three_misses() {
+		// Once the missing-tx counter reaches the threshold, clear the stale
+		// redeem_tx_hash and reset counters so the next monitor tick can
+		// resubmit through the existing redeem_tx_hash.is_none() path. This
+		// is the recovery path for a hash that was persisted but never
+		// propagated / was dropped.
+		let storage = make_storage();
+		let delivery = make_delivery(MockDeliveryInterface::new());
+		let bridge = Arc::new(StubBridge {
+			check_status_results: Mutex::new(VecDeque::from([Ok(BridgeTransferStatus::Failed(
+				"Redeem transaction not found".to_string(),
+			))])),
+			..Default::default()
+		}) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let mut transfer = fresh_transfer(BridgeTransferStatus::PendingRedemption);
+		transfer.redeem_tx_hash =
+			Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string());
+		transfer.redeem_missing_checks = 2;
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(matches!(
+			stored.status,
+			BridgeTransferStatus::PendingRedemption
+		));
+		assert_eq!(stored.redeem_missing_checks, 0);
+		assert!(stored.redeem_missing_since.is_none());
+		assert_eq!(stored.failure_count, 0);
+		assert!(stored.redeem_tx_hash.is_none());
+	}
+
+	#[tokio::test]
+	async fn test_pending_redemption_nonce_too_low_does_not_increment_failure_count() {
+		// A residual `DeliveryError::NonceTooLow` indicates transient nonce drift,
+		// not a redeem business failure. The monitor must leave the transfer in
+		// PendingRedemption with failure_count unchanged so the next monitor tick
+		// can retry after the nonce manager has resynced.
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_submit().times(1).returning(|_tx, _tracking| {
+			Box::pin(async move {
+				Err(DeliveryError::NonceTooLow(
+					"chain pending advanced past local cache".to_string(),
+				))
+			})
+		});
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let mut transfer = fresh_transfer(BridgeTransferStatus::PendingRedemption);
+		transfer.vault_address = Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+		transfer.received_shares = Some("12345".to_string());
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert_eq!(
+			stored.failure_count, 0,
+			"NonceTooLow must not increment failure_count"
+		);
+		assert!(
+			stored.redeem_tx_hash.is_none(),
+			"No tx hash should be persisted on NonceTooLow"
+		);
+		assert!(
+			matches!(stored.status, BridgeTransferStatus::PendingRedemption),
+			"Status should remain PendingRedemption, got {:?}",
+			stored.status
+		);
+	}
+
+	#[tokio::test]
+	async fn test_pending_redemption_network_error_still_increments_failure_count() {
+		// Regression check: a generic DeliveryError::Network from the redeem
+		// submission is still a real business failure and must increment
+		// failure_count as before.
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_submit().times(1).returning(|_tx, _tracking| {
+			Box::pin(async move { Err(DeliveryError::Network("connection refused".to_string())) })
+		});
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let mut transfer = fresh_transfer(BridgeTransferStatus::PendingRedemption);
+		transfer.vault_address = Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+		transfer.received_shares = Some("12345".to_string());
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert_eq!(stored.failure_count, 1);
+		assert!(stored.redeem_tx_hash.is_none());
 	}
 
 	#[tokio::test]
@@ -1427,5 +2179,942 @@ mod tests {
 
 		let _ = tx.send(true);
 		let _ = handle.await;
+	}
+
+	// ----------------------------------------------------------------------
+	// Task 7: monitor approve-durability behavioral branches.
+	// ----------------------------------------------------------------------
+
+	const APPROVE_HASH: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+	const NEW_APPROVE_HASH: &str =
+		"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+	const DEPOSIT_HASH: &str = "0xdededededededededededededededededededededededededededededededede";
+
+	/// Build a transfer pre-seeded with all the source/dest fields the resume
+	/// path needs to reconstruct a `BridgeRequest`.
+	fn resumable_transfer(now: u64) -> crate::types::PendingBridgeTransfer {
+		let mut t = pending_transfer(BridgeTransferStatus::Submitted);
+		t.created_at = now;
+		t.updated_at = now;
+		// pair_id "eth-katana" maps source_chain=1 → dest_chain=747474 in
+		// rebalance_config(); chain_a has token=0x11.., oft=0x22..; chain_b has
+		// token=0x33.., oft=0x44.. — keep these in sync with the pair config.
+		t.source_token_address = Some("0x1111111111111111111111111111111111111111".to_string());
+		t.source_oft_address = Some("0x2222222222222222222222222222222222222222".to_string());
+		t.dest_token_address = Some("0x3333333333333333333333333333333333333333".to_string());
+		t.dest_oft_address = Some("0x4444444444444444444444444444444444444444".to_string());
+		t.recipient_address = Some(SOLVER_ADDRESS.to_string());
+		t
+	}
+
+	fn ok_receipt() -> TransactionReceipt {
+		TransactionReceipt {
+			hash: TransactionHash(vec![0xaa; 32]),
+			block_number: 100,
+			success: true,
+			logs: vec![],
+			block_timestamp: None,
+		}
+	}
+
+	fn reverted_receipt() -> TransactionReceipt {
+		TransactionReceipt {
+			hash: TransactionHash(vec![0xaa; 32]),
+			block_number: 100,
+			success: false,
+			logs: vec![],
+			block_timestamp: None,
+		}
+	}
+
+	#[tokio::test]
+	async fn monitor_escalates_deposit_crash_window_without_running_bridge_asset() {
+		// (0) Crash-window guard: bridge_submit_attempted=true + tx_hash=None must
+		// escalate BEFORE any other branch — including the approve-confirmed resume —
+		// to avoid a possible double-deposit.
+		let storage = make_storage();
+		// Mock should NOT see any get_receipt call (crash-window fires first).
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_receipt().times(0);
+		let delivery = make_delivery(mock);
+		// Bridge stub asserts bridge_asset is never invoked.
+		let recorded = Arc::new(Mutex::new(Vec::new()));
+		let bridge = Arc::new(StubBridge {
+			recorded_requests: recorded.clone(),
+			..Default::default()
+		}) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let now = current_timestamp();
+		let mut transfer = resumable_transfer(now);
+		transfer.tx_hash = None;
+		transfer.approve_tx_hash = Some(APPROVE_HASH.to_string());
+		transfer.approve_was_broadcast = true;
+		transfer.approve_submitted_at = Some(now - 60);
+		transfer.bridge_submit_attempted = true; // ← the marker
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(
+			matches!(
+				&stored.status,
+				BridgeTransferStatus::NeedsIntervention(reason)
+					if reason.contains("bridge submit attempted")
+						&& reason.contains("tx_hash not persisted")
+			),
+			"unexpected status: {:?}",
+			stored.status
+		);
+		assert!(
+			recorded.lock().unwrap().is_empty(),
+			"bridge_asset must NOT be called by the crash-window branch"
+		);
+	}
+
+	#[tokio::test]
+	async fn monitor_does_not_treat_fresh_transfer_as_crash_window() {
+		// A brand-new transfer with bridge_submit_attempted=false (default) must
+		// NOT be escalated by the crash-window guard, even if the rest of the
+		// fields look like an in-flight approve state.
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_receipt()
+			.times(1)
+			.returning(|_, _| Box::pin(async move { Ok(ok_receipt()) }));
+		let delivery = make_delivery(mock);
+		let recorded = Arc::new(Mutex::new(Vec::new()));
+		let bridge = Arc::new(StubBridge {
+			bridge_asset_results: Mutex::new(VecDeque::from([Ok(BridgeDepositResult {
+				tx_hash: DEPOSIT_HASH.to_string(),
+				message_guid: None,
+				estimated_arrival: None,
+			})])),
+			recorded_requests: recorded.clone(),
+			..Default::default()
+		}) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let now = current_timestamp();
+		let mut transfer = resumable_transfer(now);
+		transfer.tx_hash = None;
+		transfer.approve_tx_hash = Some(APPROVE_HASH.to_string());
+		transfer.approve_was_broadcast = true;
+		transfer.approve_submitted_at = Some(now - 60);
+		transfer.bridge_submit_attempted = false; // ← NOT a crash window
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(
+			matches!(stored.status, BridgeTransferStatus::Submitted),
+			"unexpected status: {:?}",
+			stored.status
+		);
+		assert_eq!(stored.tx_hash.as_deref(), Some(DEPOSIT_HASH));
+		assert!(stored.bridge_submit_attempted);
+		assert_eq!(recorded.lock().unwrap().len(), 1);
+	}
+
+	#[tokio::test]
+	async fn monitor_resumes_bridge_when_approve_confirms() {
+		// (b) Approve receipt success → reconstruct BridgeRequest from the
+		// persisted source/dest fields → call bridge_asset → persist tx_hash.
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_receipt()
+			.times(1)
+			.returning(|_, _| Box::pin(async move { Ok(ok_receipt()) }));
+		let delivery = make_delivery(mock);
+		let recorded = Arc::new(Mutex::new(Vec::new()));
+		let bridge = Arc::new(StubBridge {
+			bridge_asset_results: Mutex::new(VecDeque::from([Ok(BridgeDepositResult {
+				tx_hash: DEPOSIT_HASH.to_string(),
+				message_guid: None,
+				estimated_arrival: None,
+			})])),
+			recorded_requests: recorded.clone(),
+			..Default::default()
+		}) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let now = current_timestamp();
+		let mut transfer = resumable_transfer(now);
+		transfer.tx_hash = None;
+		transfer.approve_tx_hash = Some(APPROVE_HASH.to_string());
+		transfer.approve_was_broadcast = true;
+		transfer.approve_submitted_at = Some(now - 60);
+		transfer.approve_missing_checks = 0;
+		transfer.bridge_submit_attempted = false;
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(matches!(stored.status, BridgeTransferStatus::Submitted));
+		assert_eq!(stored.tx_hash.as_deref(), Some(DEPOSIT_HASH));
+		assert_eq!(stored.approve_missing_checks, 0);
+		assert!(stored.bridge_submit_attempted);
+
+		// Validate the reconstructed BridgeRequest matches the source/dest fields.
+		let recorded = recorded.lock().unwrap();
+		assert_eq!(recorded.len(), 1);
+		let request = &recorded[0];
+		assert_eq!(request.pair_id, transfer.pair_id);
+		assert_eq!(request.source_chain, 1);
+		assert_eq!(request.dest_chain, 747474);
+		assert_eq!(request.source_token, Address::from([0x11; 20]));
+		assert_eq!(request.source_oft, Address::from([0x22; 20]));
+		assert_eq!(request.dest_token, Address::from([0x33; 20]));
+		assert_eq!(request.dest_oft, Address::from([0x44; 20]));
+		assert_eq!(request.recipient, Address::from([0x55; 20]));
+		assert_eq!(request.amount, U256::from(1_000_000u64));
+	}
+
+	#[tokio::test]
+	async fn monitor_clears_stale_approve_hash_and_retries_bridge_asset_same_tick() {
+		// (c) Stale-hash retry must (a) clear stale hash and (b) actually rerun
+		// bridge_asset in the same tick — leaving approve_was_broadcast intact.
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_receipt().times(1).returning(|_, _| {
+			Box::pin(async move {
+				Err(solver_delivery::DeliveryError::Network(
+					"receipt not found".to_string(),
+				))
+			})
+		});
+		mock.expect_tx_exists()
+			.times(1)
+			.returning(|_, _| Box::pin(async move { Ok(false) }));
+		let delivery = make_delivery(mock);
+		let recorded = Arc::new(Mutex::new(Vec::new()));
+		let bridge = Arc::new(StubBridge {
+			bridge_asset_results: Mutex::new(VecDeque::from([Ok(BridgeDepositResult {
+				tx_hash: DEPOSIT_HASH.to_string(),
+				message_guid: None,
+				estimated_arrival: None,
+			})])),
+			recorded_requests: recorded.clone(),
+			..Default::default()
+		}) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let now = current_timestamp();
+		let mut transfer = resumable_transfer(now);
+		transfer.tx_hash = None;
+		transfer.approve_tx_hash = Some(APPROVE_HASH.to_string());
+		transfer.approve_was_broadcast = true;
+		transfer.approve_submitted_at = Some(now - 60);
+		transfer.approve_missing_checks = 2; // one more miss → threshold
+		transfer.bridge_submit_attempted = false;
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(matches!(stored.status, BridgeTransferStatus::Submitted));
+		assert!(
+			stored.approve_tx_hash.is_none(),
+			"stale hash should be cleared"
+		);
+		assert_eq!(stored.approve_missing_checks, 0);
+		assert_eq!(stored.tx_hash.as_deref(), Some(DEPOSIT_HASH));
+		assert!(
+			stored.approve_was_broadcast,
+			"approve_was_broadcast must be preserved"
+		);
+		assert_eq!(
+			recorded.lock().unwrap().len(),
+			1,
+			"bridge_asset should be called exactly once in the same tick"
+		);
+	}
+
+	#[tokio::test]
+	async fn monitor_stale_approve_retry_persists_new_approve_pending_hash() {
+		// Companion to the previous test: bridge_asset on retry returns
+		// ApprovePending → persist new approve hash, roll back the marker, leave
+		// approve_was_broadcast and approve_submitted_at intact.
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_receipt().times(1).returning(|_, _| {
+			Box::pin(async move {
+				Err(solver_delivery::DeliveryError::Network(
+					"receipt not found".to_string(),
+				))
+			})
+		});
+		mock.expect_tx_exists()
+			.times(1)
+			.returning(|_, _| Box::pin(async move { Ok(false) }));
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge {
+			bridge_asset_results: Mutex::new(VecDeque::from([Err(
+				crate::BridgeError::ApprovePending {
+					tx_hash: NEW_APPROVE_HASH.to_string(),
+				},
+			)])),
+			..Default::default()
+		}) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let now = current_timestamp();
+		let original_phase_start = now - 60;
+		let mut transfer = resumable_transfer(now);
+		transfer.tx_hash = None;
+		transfer.approve_tx_hash = Some(APPROVE_HASH.to_string());
+		transfer.approve_was_broadcast = true;
+		transfer.approve_submitted_at = Some(original_phase_start);
+		transfer.approve_missing_checks = 2;
+		transfer.bridge_submit_attempted = false;
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(matches!(stored.status, BridgeTransferStatus::Submitted));
+		assert_eq!(stored.tx_hash, None);
+		assert_eq!(stored.approve_tx_hash.as_deref(), Some(NEW_APPROVE_HASH));
+		assert_eq!(stored.approve_missing_checks, 0);
+		assert!(stored.approve_was_broadcast);
+		assert_eq!(
+			stored.approve_submitted_at,
+			Some(original_phase_start),
+			"approve_submitted_at must NOT be refreshed; it measures the original phase"
+		);
+		assert!(
+			!stored.bridge_submit_attempted,
+			"bridge_submit_attempted must be rolled back on ApprovePending"
+		);
+	}
+
+	#[tokio::test]
+	async fn monitor_marks_failed_when_approve_reverts_on_chain() {
+		// Approve receipt with success=false → mark Failed("approve reverted on chain").
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_receipt()
+			.times(1)
+			.returning(|_, _| Box::pin(async move { Ok(reverted_receipt()) }));
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let now = current_timestamp();
+		let mut transfer = resumable_transfer(now);
+		transfer.tx_hash = None;
+		transfer.approve_tx_hash = Some(APPROVE_HASH.to_string());
+		transfer.approve_was_broadcast = true;
+		transfer.approve_submitted_at = Some(now - 60);
+		transfer.bridge_submit_attempted = false;
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(
+			matches!(
+				&stored.status,
+				BridgeTransferStatus::Failed(reason) if reason == "approve reverted on chain"
+			),
+			"unexpected status: {:?}",
+			stored.status
+		);
+	}
+
+	#[tokio::test]
+	async fn monitor_keeps_bridge_submit_marker_on_generic_error_then_escalates_next_tick() {
+		// Tick 1: get_receipt → success=true; bridge_asset → generic Err.
+		//   Expect status Submitted, bridge_submit_attempted=TRUE (kept set).
+		// Tick 2: branch (0) crash-window fires before any RPC.
+		//   Expect status NeedsIntervention; bridge_asset NOT called again.
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		// get_receipt is only called on the first tick; the second tick short-circuits
+		// at branch (0).
+		mock.expect_get_receipt()
+			.times(1)
+			.returning(|_, _| Box::pin(async move { Ok(ok_receipt()) }));
+		let delivery = make_delivery(mock);
+
+		let recorded = Arc::new(Mutex::new(Vec::new()));
+		let bridge = Arc::new(StubBridge {
+			bridge_asset_results: Mutex::new(VecDeque::from([Err(
+				crate::BridgeError::TransactionFailed("rpc blip".to_string()),
+			)])),
+			recorded_requests: recorded.clone(),
+			..Default::default()
+		}) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let now = current_timestamp();
+		let mut transfer = resumable_transfer(now);
+		transfer.tx_hash = None;
+		transfer.approve_tx_hash = Some(APPROVE_HASH.to_string());
+		transfer.approve_was_broadcast = true;
+		transfer.approve_submitted_at = Some(now - 60);
+		transfer.bridge_submit_attempted = false;
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		// Tick 1
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+		let after_first = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(matches!(
+			after_first.status,
+			BridgeTransferStatus::Submitted
+		));
+		assert!(after_first.tx_hash.is_none());
+		assert!(
+			after_first.bridge_submit_attempted,
+			"marker must stay set on generic Err"
+		);
+		assert_eq!(recorded.lock().unwrap().len(), 1);
+
+		// Tick 2: crash-window guard fires before any RPC.
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+		let after_second = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(
+			matches!(
+				&after_second.status,
+				BridgeTransferStatus::NeedsIntervention(reason)
+					if reason.contains("bridge submit attempted")
+			),
+			"unexpected status: {:?}",
+			after_second.status
+		);
+		assert_eq!(
+			recorded.lock().unwrap().len(),
+			1,
+			"bridge_asset must be called exactly once across both ticks"
+		);
+	}
+
+	#[tokio::test]
+	async fn monitor_marks_needs_intervention_on_insufficient_native_gas_after_approve() {
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_receipt()
+			.times(1)
+			.returning(|_, _| Box::pin(async move { Ok(ok_receipt()) }));
+		let delivery = make_delivery(mock);
+
+		let recorded = Arc::new(Mutex::new(Vec::new()));
+		let bridge = Arc::new(StubBridge {
+			bridge_asset_results: Mutex::new(VecDeque::from([Err(
+				crate::BridgeError::InsufficientNativeGas(
+					"Insufficient native gas on chain 1 for signer 0xsolver: balance 10 wei, required 30 wei, shortfall 20 wei".to_string(),
+				),
+			)])),
+			recorded_requests: recorded.clone(),
+			..Default::default()
+		}) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let now = current_timestamp();
+		let mut transfer = resumable_transfer(now);
+		transfer.tx_hash = None;
+		transfer.approve_tx_hash = Some(APPROVE_HASH.to_string());
+		transfer.approve_was_broadcast = true;
+		transfer.approve_submitted_at = Some(now - 60);
+		transfer.bridge_submit_attempted = false;
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(
+			matches!(
+				&stored.status,
+				BridgeTransferStatus::NeedsIntervention(reason)
+					if reason.contains("Insufficient native gas")
+						&& reason.contains("shortfall 20 wei")
+			),
+			"unexpected status: {:?}",
+			stored.status
+		);
+		assert!(
+			!stored.bridge_submit_attempted,
+			"pre-broadcast insufficient gas must roll back the crash-window marker"
+		);
+		assert_eq!(recorded.lock().unwrap().len(), 1);
+	}
+
+	#[tokio::test]
+	async fn monitor_escalates_when_approve_phase_exceeds_timeout() {
+		// (d) Approve-phase absolute timeout fires BEFORE the mid-flight branch,
+		// so get_receipt is never called.
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_receipt().times(0);
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let now = current_timestamp();
+		let mut transfer = resumable_transfer(now);
+		transfer.tx_hash = None;
+		transfer.approve_tx_hash = Some(APPROVE_HASH.to_string());
+		transfer.approve_was_broadcast = true;
+		transfer.approve_submitted_at = Some(now - APPROVE_PHASE_TIMEOUT_SECS - 1);
+		transfer.bridge_submit_attempted = false;
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(
+			matches!(
+				&stored.status,
+				BridgeTransferStatus::NeedsIntervention(reason)
+					if reason.contains("approve phase exceeded")
+			),
+			"unexpected status: {:?}",
+			stored.status
+		);
+	}
+
+	#[tokio::test]
+	async fn monitor_escalates_approve_timeout_when_approve_submitted_at_is_missing() {
+		// (d) Bypass #2 regression: a transfer with approve_was_broadcast=true
+		// but approve_submitted_at=None must NOT skip the timeout. Without the
+		// fix, .unwrap_or(false) made the timestamp comparison fail-open and
+		// such records bypassed escalation forever.
+		//
+		// With the fix: the guard falls back to created_at. With created_at
+		// well past timeout, branch (d) fires.
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		// Branch (d) fires before the mid-flight branch, so get_receipt isn't called.
+		mock.expect_get_receipt().times(0);
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let now = current_timestamp();
+		let mut transfer = resumable_transfer(now);
+		transfer.tx_hash = None;
+		transfer.approve_tx_hash = None; // no hash, but flag is set
+		transfer.approve_was_broadcast = true;
+		transfer.approve_submitted_at = None; // ← the trap
+		transfer.bridge_submit_attempted = false;
+		transfer.created_at = now - APPROVE_PHASE_TIMEOUT_SECS - 60;
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(
+			matches!(
+				&stored.status,
+				BridgeTransferStatus::NeedsIntervention(reason)
+					if reason.contains("approve phase exceeded")
+			),
+			"missing approve_submitted_at must not bypass timeout; got {:?}",
+			stored.status
+		);
+	}
+
+	#[tokio::test]
+	async fn monitor_escalates_approve_timeout_when_hash_set_but_broadcast_flag_false() {
+		// (d) Bypass #1 regression: a transfer with approve_tx_hash=Some(valid)
+		// but approve_was_broadcast=false must STILL be subject to the timeout.
+		// Without the fix, the guard required approve_was_broadcast and the
+		// mid-flight approve branch ran first, looping every tick. The stale-
+		// hash counter only increments on tx_exists()==Ok(false), so a slow
+		// underpriced approve where tx_exists()==Ok(true) indefinitely had no
+		// escalation path.
+		//
+		// With the fix: "approve phase started" is derived from EITHER signal,
+		// so this transfer escalates via branch (d).
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		// Branch (d) fires before the mid-flight branch, so the receipt /
+		// tx_exists calls aren't reached.
+		mock.expect_get_receipt().times(0);
+		mock.expect_tx_exists().times(0);
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let now = current_timestamp();
+		let mut transfer = resumable_transfer(now);
+		transfer.tx_hash = None;
+		transfer.approve_tx_hash = Some(APPROVE_HASH.to_string()); // valid 32-byte hex
+		transfer.approve_was_broadcast = false; // ← the trap
+		transfer.approve_submitted_at = None;
+		transfer.bridge_submit_attempted = false;
+		transfer.created_at = now - APPROVE_PHASE_TIMEOUT_SECS - 60;
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(
+			matches!(
+				&stored.status,
+				BridgeTransferStatus::NeedsIntervention(reason)
+					if reason.contains("approve phase exceeded")
+			),
+			"approve_tx_hash set but flag false must not bypass timeout; got {:?}",
+			stored.status
+		);
+	}
+
+	#[tokio::test]
+	async fn monitor_escalates_when_approve_tx_hash_is_non_hex() {
+		// Mid-flight branch: a non-hex approve_tx_hash will fail every tick
+		// forever. With the fix, escalate immediately to NeedsIntervention
+		// instead of looping silently.
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		// We never reach the receipt fetch — escalation happens at parse time.
+		mock.expect_get_receipt().times(0);
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let now = current_timestamp();
+		let mut transfer = resumable_transfer(now);
+		transfer.tx_hash = None;
+		transfer.approve_tx_hash = Some("0xZZZZ-not-hex".to_string());
+		transfer.approve_was_broadcast = true;
+		transfer.approve_submitted_at = Some(now);
+		transfer.bridge_submit_attempted = false;
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		match &stored.status {
+			BridgeTransferStatus::NeedsIntervention(reason) => {
+				assert!(
+					reason.to_lowercase().contains("approve_tx_hash")
+						&& reason.to_lowercase().contains("format"),
+					"expected reason to mention approve_tx_hash format; got: {reason}"
+				);
+			},
+			other => panic!("expected NeedsIntervention, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn monitor_escalates_when_approve_tx_hash_is_odd_length_hex() {
+		// Odd-length hex: hex::decode returns Err. Same escalation path as
+		// non-hex.
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_receipt().times(0);
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let now = current_timestamp();
+		let mut transfer = resumable_transfer(now);
+		transfer.tx_hash = None;
+		transfer.approve_tx_hash = Some("0xabc".to_string()); // 3 hex chars
+		transfer.approve_was_broadcast = true;
+		transfer.approve_submitted_at = Some(now);
+		transfer.bridge_submit_attempted = false;
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		match &stored.status {
+			BridgeTransferStatus::NeedsIntervention(reason) => {
+				assert!(
+					reason.to_lowercase().contains("approve_tx_hash")
+						&& reason.to_lowercase().contains("format"),
+					"expected reason to mention approve_tx_hash format; got: {reason}"
+				);
+			},
+			other => panic!("expected NeedsIntervention, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn monitor_escalates_when_approve_tx_hash_is_wrong_length() {
+		// Valid hex but only 2 bytes — hex::decode succeeds but
+		// TransactionHash is malformed. Without the length check, the
+		// 2-byte vec would be passed to delivery.get_receipt where the RPC
+		// layer's behavior is provider-dependent (most return a transient
+		// error that the existing branch treats as "not yet confirmed",
+		// causing the same silent-loop pattern). Escalate immediately.
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_receipt().times(0);
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let now = current_timestamp();
+		let mut transfer = resumable_transfer(now);
+		transfer.tx_hash = None;
+		transfer.approve_tx_hash = Some("0xaabb".to_string()); // 2 bytes
+		transfer.approve_was_broadcast = true;
+		transfer.approve_submitted_at = Some(now);
+		transfer.bridge_submit_attempted = false;
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		match &stored.status {
+			BridgeTransferStatus::NeedsIntervention(reason) => {
+				assert!(
+					reason.to_lowercase().contains("approve_tx_hash")
+						&& reason.to_lowercase().contains("length")
+						&& reason.contains("2"),
+					"expected reason to mention approve_tx_hash length with byte count; got: {reason}"
+				);
+			},
+			other => panic!("expected NeedsIntervention, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn monitor_escalates_impossible_submitted_state_to_needs_intervention() {
+		// (e) Impossible-state invariant: never-broadcast transfer >5min old.
+		let storage = make_storage();
+		let mock = MockDeliveryInterface::new();
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let now = current_timestamp();
+		let mut transfer = resumable_transfer(now);
+		transfer.tx_hash = None;
+		transfer.approve_tx_hash = None;
+		transfer.approve_was_broadcast = false;
+		transfer.bridge_submit_attempted = false;
+		transfer.created_at = now - 600;
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(
+			matches!(
+				&stored.status,
+				BridgeTransferStatus::NeedsIntervention(reason)
+					if reason.contains("approve never broadcast")
+			),
+			"unexpected status: {:?}",
+			stored.status
+		);
+	}
+
+	#[tokio::test]
+	async fn monitor_does_not_escalate_when_approve_was_broadcast_then_cleared() {
+		// (e) The impossible-state branch's `!approve_was_broadcast` guard must
+		// exclude the cleared-hash recovery state. With approve_was_broadcast=true
+		// and approve_tx_hash=None, the transfer falls through impossible-state and
+		// the mid-flight-approve branch is also skipped (no hash to re-check), so
+		// the transfer is not escalated by Task 7's branches. Adapt the test from
+		// the plan's "retry path runs bridge_asset" framing — the actual point of
+		// the test is the invariant: approve_was_broadcast=true means impossible-state
+		// must NOT fire.
+		let storage = make_storage();
+		let mock = MockDeliveryInterface::new();
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let now = current_timestamp();
+		let mut transfer = resumable_transfer(now);
+		transfer.tx_hash = None;
+		transfer.approve_tx_hash = None;
+		transfer.approve_was_broadcast = true; // ← cleared-hash window
+		transfer.bridge_submit_attempted = false;
+		transfer.created_at = now - 600; // older than the impossible-state threshold
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(
+			matches!(stored.status, BridgeTransferStatus::Submitted),
+			"impossible-state branch must NOT fire when approve_was_broadcast=true; got {:?}",
+			stored.status
+		);
+		// And the cleared-hash window is preserved across the tick.
+		assert!(stored.approve_tx_hash.is_none());
+		assert!(stored.approve_was_broadcast);
+	}
+
+	#[tokio::test]
+	async fn monitor_does_not_apply_submitted_timeout_to_mid_flight_approve() {
+		// Regression: a slow-but-honest approve under the absolute cap must NOT be
+		// reaped by the existing 30-min Submitted timeout. Also verifies that
+		// updated_at is NOT refreshed on the "still pending in mempool" branch.
+		let storage = make_storage();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_receipt().times(1).returning(|_, _| {
+			Box::pin(async move {
+				Err(solver_delivery::DeliveryError::Network(
+					"receipt not found".to_string(),
+				))
+			})
+		});
+		mock.expect_tx_exists()
+			.times(1)
+			.returning(|_, _| Box::pin(async move { Ok(true) }));
+		let delivery = make_delivery(mock);
+		let bridge = Arc::new(StubBridge::default()) as Arc<dyn BridgeInterface>;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance_config());
+
+		let now = current_timestamp();
+		let mut transfer = resumable_transfer(now);
+		transfer.tx_hash = None;
+		transfer.approve_tx_hash = Some(APPROVE_HASH.to_string());
+		transfer.approve_was_broadcast = true;
+		transfer.approve_submitted_at = Some(now - 60); // well under the 1h cap
+		transfer.approve_missing_checks = 0;
+		transfer.bridge_submit_attempted = false;
+		// Would normally trip the 30-min Submitted timeout, but the mid-flight branch
+		// fires first.
+		let stale_updated_at = now - SUBMITTED_TIMEOUT_SECS - 1;
+		transfer.updated_at = stale_updated_at;
+		bridge_service
+			.storage()
+			.save_transfer(&transfer)
+			.await
+			.unwrap();
+
+		monitor
+			.advance_pending_transfers(&rebalance_config())
+			.await
+			.unwrap();
+
+		let stored = bridge_service.get_transfer(&transfer.id).await.unwrap();
+		assert!(
+			matches!(stored.status, BridgeTransferStatus::Submitted),
+			"unexpected status: {:?}",
+			stored.status
+		);
+		assert_eq!(stored.approve_tx_hash.as_deref(), Some(APPROVE_HASH));
+		assert_eq!(stored.approve_missing_checks, 0);
+		assert_eq!(
+			stored.updated_at, stale_updated_at,
+			"updated_at must NOT be refreshed by the 'still pending' branch"
+		);
 	}
 }

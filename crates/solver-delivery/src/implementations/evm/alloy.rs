@@ -3,13 +3,17 @@
 //! This module provides concrete implementations of the DeliveryInterface trait,
 //! supporting blockchain transaction submission and monitoring using the Alloy library.
 
+use crate::implementations::evm::nonce::{
+	classify_submission_outcome, ResettableNonceManager, SubmissionOutcome,
+};
 use crate::{
-	DeliveryError, DeliveryInterface, TransactionMonitoringEvent, TransactionTrackingWithConfig,
+	DeliveryError, DeliveryInterface, InsufficientNativeGasInfo, TransactionMonitoringEvent,
+	TransactionTrackingWithConfig,
 };
 use alloy_network::EthereumWallet;
-use alloy_primitives::{Address, Bytes, FixedBytes, U256};
+use alloy_primitives::{Address, Bytes, FixedBytes, B256, U256};
 use alloy_provider::{
-	fillers::{CachedNonceManager, ChainIdFiller, GasFiller, NonceFiller},
+	fillers::{ChainIdFiller, GasFiller},
 	DynProvider, Provider, ProviderBuilder,
 };
 use alloy_rpc_client::RpcClient;
@@ -23,6 +27,105 @@ use solver_types::{
 	TransactionHash, TransactionReceipt,
 };
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+/// Interval between receipt-polling attempts inside `monitor_transaction`.
+/// 2 seconds matches typical Ethereum mainnet block time and is short enough
+/// not to materially delay confirmation reporting on faster chains.
+const TX_CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const ETHEREUM_MAINNET_CHAIN_ID: u64 = 1;
+const MAINNET_PRIORITY_FEE_FLOOR_WEI: u128 = 2_000_000_000;
+
+/// Drift-monitor parameters. The monitor periodically compares local nonce
+/// cache against chain pending. Some lead is normal during in-flight
+/// broadcasts; only SUSTAINED drift indicates a possible cache leak.
+///
+/// IMPORTANT: this monitor is OBSERVABILITY ONLY. It does not mutate the
+/// cache, retry transactions, or change any runtime behavior. Its only
+/// effect is structured tracing events.
+///
+/// Type discipline: thresholds compared against `cache_lead()` are `i128`
+/// to match its return type. Tick counts are `u32`. No mixed-integer
+/// comparisons should appear anywhere in this monitor — if you find one,
+/// fix the constant's type, not the comparison site.
+const NONCE_DRIFT_POLL_INTERVAL_SECS: u64 = 60;
+/// Per-tick drift threshold. lead < this → trace-level event (normal).
+/// `i128` to match `cache_lead` return type.
+const NONCE_DRIFT_WARN_THRESHOLD: i128 = 3;
+/// Consecutive ticks over threshold before WARN escalation. `u32`.
+const NONCE_DRIFT_WARN_AFTER_TICKS: u32 = 5; // ~5 minutes at 60s interval
+/// Consecutive ticks over threshold before ERROR escalation. `u32`.
+const NONCE_DRIFT_ERROR_AFTER_TICKS: u32 = 15; // ~15 minutes
+
+/// Outcome of polling for a transaction's confirmation.
+///
+/// `Indeterminate` is intentionally distinct from `Reverted` so the spawned
+/// monitor task can map a confirmation-deadline expiry to
+/// `TransactionMonitoringEvent::Indeterminate` (non-terminal) instead of
+/// `TransactionMonitoringEvent::Failed` (terminal). A `Failed` event would
+/// transition the order to `OrderStatus::Failed(_, _)`, which startup
+/// recovery skips at `crates/solver-core/src/recovery/mod.rs:148-154` —
+/// permanently losing an order whose tx may yet confirm on chain.
+enum PollOutcome {
+	Confirmed(TransactionReceipt),
+	Reverted(String),
+	Indeterminate(String),
+}
+
+fn should_apply_mainnet_priority_fee_floor(tx: &SolverTransaction) -> bool {
+	tx.chain_id == ETHEREUM_MAINNET_CHAIN_ID
+		&& tx.gas_price.is_none()
+		&& (tx.max_fee_per_gas.is_none()
+			|| tx
+				.max_priority_fee_per_gas
+				.is_none_or(|priority| priority < MAINNET_PRIORITY_FEE_FLOOR_WEI))
+}
+
+fn apply_mainnet_priority_fee_floor(
+	tx: &mut SolverTransaction,
+	estimated_max_fee_per_gas: u128,
+) -> bool {
+	if !should_apply_mainnet_priority_fee_floor(tx) {
+		return false;
+	}
+
+	let priority_fee = tx
+		.max_priority_fee_per_gas
+		.unwrap_or_default()
+		.max(MAINNET_PRIORITY_FEE_FLOOR_WEI);
+	let min_max_fee = estimated_max_fee_per_gas.saturating_add(priority_fee);
+	let max_fee = tx
+		.max_fee_per_gas
+		.unwrap_or_default()
+		.max(min_max_fee)
+		.max(priority_fee);
+
+	tx.max_priority_fee_per_gas = Some(priority_fee);
+	tx.max_fee_per_gas = Some(max_fee);
+	true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeGasBudget {
+	gas_budget_wei: U256,
+	required_wei: U256,
+}
+
+fn native_gas_budget_wei(tx: &SolverTransaction) -> Option<NativeGasBudget> {
+	let gas_limit = tx.gas_limit?;
+	let fee_per_gas = tx.max_fee_per_gas.or(tx.gas_price)?;
+	let gas_budget_wei = U256::from(gas_limit).saturating_mul(U256::from(fee_per_gas));
+	let required_wei = gas_budget_wei.saturating_add(tx.value);
+
+	Some(NativeGasBudget {
+		gas_budget_wei,
+		required_wei,
+	})
+}
+
+fn native_gas_shortfall(balance: U256, required: U256) -> Option<U256> {
+	(balance < required).then(|| required.saturating_sub(balance))
+}
 
 /// Alloy-based EVM delivery implementation.
 ///
@@ -32,6 +135,200 @@ use std::collections::HashMap;
 pub struct AlloyDelivery {
 	/// Alloy providers for each supported network.
 	providers: HashMap<u64, DynProvider>,
+	/// Resettable nonce manager per chain. Replaces Alloy's opaque
+	/// `CachedNonceManager` so we can resync the local cache from chain
+	/// after a `nonce too low` submission error.
+	nonce_managers: HashMap<u64, ResettableNonceManager>,
+	/// Signer address per chain — needed to call `eth_getTransactionCount(from, "pending")`
+	/// for the resync path. The signer itself stays inside the provider's wallet filler.
+	signer_addresses: HashMap<u64, Address>,
+}
+
+/// What the broadcast wrapper should do with the local nonce cache,
+/// given a classified submission outcome. Pure decision, no I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonceCacheAction {
+	/// Tx accepted (or kept-advanced for replacement / ambiguous outcomes) —
+	/// keep cache advanced as-is.
+	Keep,
+	/// Tx provably rejected pre-pool. Caller should attempt to fetch
+	/// chain pending and call `reset_next_nonce`. If the fetch fails,
+	/// caller MUST fall back to `Keep` — we don't roll back without
+	/// authoritative chain state.
+	AttemptRollback,
+	/// Caller should run the existing nonce_too_low resync-and-retry path.
+	NonceTooLowRetry,
+}
+
+/// Pure outcome → action mapping. No I/O, easy to unit-test.
+fn nonce_action_for_outcome(outcome: SubmissionOutcome) -> NonceCacheAction {
+	match outcome {
+		SubmissionOutcome::DefinitelyRejected => NonceCacheAction::AttemptRollback,
+		SubmissionOutcome::NonceTooLow => NonceCacheAction::NonceTooLowRetry,
+		SubmissionOutcome::Replacement | SubmissionOutcome::Ambiguous => NonceCacheAction::Keep,
+	}
+}
+
+/// Applies a `NonceCacheAction` to the cache. The `chain_pending` argument
+/// represents the *result* of the rollback-time fetch: `Some(pending)` if
+/// the fetch succeeded, `None` if it failed (or we never attempted it).
+///
+/// Returns the cache value after applying the action, for tracing.
+///
+/// Pure synchronous helper so the rollback invariant is unit-testable
+/// without spinning up a provider or async runtime.
+///
+/// **Visibility:** intentionally `fn` (private to this module), not `pub`.
+/// This is delivery-layer policy glue — it encodes how the alloy broadcast
+/// wrapper reacts to a classified submission outcome. It is NOT part of the
+/// nonce-manager public API. If another module ever needs to invoke this
+/// policy, the right move is to surface a higher-level operation on the
+/// nonce manager (e.g. `try_rollback_to_chain_pending`), not export this
+/// helper directly.
+fn apply_nonce_cache_action(
+	mgr: &ResettableNonceManager,
+	signer: Address,
+	action: NonceCacheAction,
+	chain_pending: Option<u64>,
+) -> Option<u64> {
+	match action {
+		NonceCacheAction::Keep => mgr.peek(signer),
+		NonceCacheAction::AttemptRollback => match chain_pending {
+			Some(pending) => Some(mgr.reset_next_nonce(signer, pending)),
+			// No authoritative chain state — KEEP advanced. We never reset
+			// the cache without a successful pending-fetch.
+			None => mgr.peek(signer),
+		},
+		// The nonce_too_low path has its own existing resync-and-retry; the
+		// helper short-circuits to a no-op here so callers can't accidentally
+		// invoke double-handling. Production code paths that classify as
+		// NonceTooLow MUST take the existing retry branch, not this helper.
+		NonceCacheAction::NonceTooLowRetry => mgr.peek(signer),
+	}
+}
+
+/// Drift event severity, derived purely from the consecutive-ticks count.
+/// Pure data type for unit testability — no I/O, no logging logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriftSeverity {
+	Normal,
+	Warn,
+	Error,
+}
+
+/// Decide the drift event severity from the consecutive-ticks count.
+/// Pure function for unit testability.
+fn drift_severity_for_ticks(ticks_over_threshold: u32) -> DriftSeverity {
+	if ticks_over_threshold >= NONCE_DRIFT_ERROR_AFTER_TICKS {
+		DriftSeverity::Error
+	} else if ticks_over_threshold >= NONCE_DRIFT_WARN_AFTER_TICKS {
+		DriftSeverity::Warn
+	} else {
+		DriftSeverity::Normal
+	}
+}
+
+/// Spawn the passive nonce-drift monitor. Polls each (chain, signer)
+/// every `NONCE_DRIFT_POLL_INTERVAL_SECS`, computes `cache_lead`, and emits
+/// a tracing event escalating from trace → warn → error as drift sustains.
+///
+/// MUTATIONS: none. The monitor never resets, retries, or modifies the
+/// cache. Its sole effect is logs.
+///
+/// SHUTDOWN: this monitor runs for the lifetime of the process. The
+/// surrounding `AlloyDelivery` does not currently expose a shutdown channel
+/// for delivery-spawned tasks, and adding one would ripple through several
+/// call sites for no observability gain. Drift checks are cheap (one RPC
+/// call per chain per minute), so the cost of running until process exit is
+/// negligible. If a shutdown channel is later added to delivery, plumb a
+/// `tokio::sync::watch::Receiver<bool>` here and bias the `select!` on it.
+fn spawn_nonce_drift_monitor(
+	nonce_managers: HashMap<u64, ResettableNonceManager>,
+	signer_addresses: HashMap<u64, Address>,
+	providers: HashMap<u64, DynProvider>,
+) {
+	tokio::spawn(async move {
+		let mut consecutive: HashMap<(u64, Address), u32> = HashMap::new();
+		let mut interval =
+			tokio::time::interval(Duration::from_secs(NONCE_DRIFT_POLL_INTERVAL_SECS));
+		// Skip the immediate first tick so we don't poll before providers have
+		// settled — `tokio::time::interval` fires at t=0 by default.
+		interval.tick().await;
+		loop {
+			interval.tick().await;
+			for (chain_id, mgr) in &nonce_managers {
+				let Some(signer) = signer_addresses.get(chain_id) else {
+					continue;
+				};
+				let Some(provider) = providers.get(chain_id) else {
+					continue;
+				};
+				let pending = match provider.get_transaction_count(*signer).pending().await {
+					Ok(p) => p,
+					Err(e) => {
+						tracing::trace!(
+							chain_id = *chain_id,
+							signer = %signer,
+							error = %e,
+							"drift monitor: failed to fetch chain pending; skipping this tick"
+						);
+						continue;
+					},
+				};
+				let lead = mgr.cache_lead(*signer, pending);
+				let key = (*chain_id, *signer);
+
+				if lead < NONCE_DRIFT_WARN_THRESHOLD {
+					consecutive.remove(&key);
+					tracing::trace!(
+						chain_id = *chain_id,
+						signer = %signer,
+						cache_lead = lead as i64,
+						chain_pending = pending,
+						"nonce drift within tolerance"
+					);
+					continue;
+				}
+
+				// Drift is over threshold this tick.
+				let count = consecutive.entry(key).or_insert(0);
+				*count = count.saturating_add(1);
+				match drift_severity_for_ticks(*count) {
+					DriftSeverity::Normal => {
+						tracing::trace!(
+							chain_id = *chain_id,
+							signer = %signer,
+							cache_lead = lead as i64,
+							chain_pending = pending,
+							consecutive_ticks = *count,
+							"nonce drift over threshold (not yet sustained)"
+						);
+					},
+					DriftSeverity::Warn => {
+						tracing::warn!(
+							chain_id = *chain_id,
+							signer = %signer,
+							cache_lead = lead as i64,
+							chain_pending = pending,
+							consecutive_ticks = *count,
+							"nonce drift sustained — possible cache leak"
+						);
+					},
+					DriftSeverity::Error => {
+						tracing::error!(
+							chain_id = *chain_id,
+							signer = %signer,
+							cache_lead = lead as i64,
+							chain_pending = pending,
+							consecutive_ticks = *count,
+							"nonce drift sustained for {} ticks — almost certainly a cache leak; investigate",
+							*count
+						);
+					},
+				}
+			}
+		}
+	});
 }
 
 impl AlloyDelivery {
@@ -54,6 +351,8 @@ impl AlloyDelivery {
 		}
 
 		let mut providers = HashMap::new();
+		let mut nonce_managers = HashMap::new();
+		let mut signer_addresses = HashMap::new();
 
 		for network_id in &network_ids {
 			// Get network configuration
@@ -81,6 +380,7 @@ impl AlloyDelivery {
 
 			// Create signer with chain ID
 			let chain_signer = signer.with_chain_id(Some(*network_id));
+			let signer_address = chain_signer.address();
 			let wallet = EthereumWallet::from(chain_signer);
 
 			// Configure retry layer for handling network errors, rate limits, and execution reverts
@@ -106,10 +406,10 @@ impl AlloyDelivery {
 			// Create RPC client with retry capabilities
 			let client = RpcClient::builder().layer(retry_layer).http(url);
 
-			// Cache nonces locally so back-to-back startup approvals do not reuse a stale
-			// pending nonce while the RPC is still catching up.
+			// Build the provider WITHOUT a NonceFiller — we own nonce assignment via
+			// `ResettableNonceManager` so we can resync from chain after a
+			// `nonce too low` submission error. `submit()` sets `tx.nonce` explicitly.
 			let provider = ProviderBuilder::new()
-				.filler(NonceFiller::<CachedNonceManager>::cached())
 				.filler(GasFiller)
 				.filler(ChainIdFiller::default())
 				.wallet(wallet)
@@ -121,10 +421,53 @@ impl AlloyDelivery {
 
 			// Use type erasure to simplify the provider type
 			let dyn_provider = provider.erased();
+			match (
+				dyn_provider.get_transaction_count(signer_address).await,
+				dyn_provider
+					.get_transaction_count(signer_address)
+					.pending()
+					.await,
+			) {
+				(Ok(latest), Ok(pending)) => {
+					tracing::info!(
+						chain_id = *network_id,
+						signer = %signer_address,
+						latest_nonce = latest,
+						pending_nonce = pending,
+						"Initialized EVM delivery nonce state"
+					);
+				},
+				(latest_result, pending_result) => {
+					tracing::warn!(
+						chain_id = *network_id,
+						signer = %signer_address,
+						latest_error = ?latest_result.err(),
+						pending_error = ?pending_result.err(),
+						"Could not read initial EVM delivery nonce state"
+					);
+				},
+			}
 			providers.insert(*network_id, dyn_provider);
+			nonce_managers.insert(*network_id, ResettableNonceManager::new());
+			signer_addresses.insert(*network_id, signer_address);
 		}
 
-		Ok(Self { providers })
+		// Spawn the passive nonce-drift monitor. The monitor is observability
+		// only — it never mutates the cache, retries transactions, or affects
+		// runtime behavior. `ResettableNonceManager` is `Clone` and shares its
+		// inner cache via `Arc<Mutex<_>>`, and `DynProvider` is also clone-
+		// shareable, so the spawned task observes the same live state.
+		spawn_nonce_drift_monitor(
+			nonce_managers.clone(),
+			signer_addresses.clone(),
+			providers.clone(),
+		);
+
+		Ok(Self {
+			providers,
+			nonce_managers,
+			signer_addresses,
+		})
 	}
 
 	/// Gets the provider for a specific chain ID.
@@ -132,6 +475,90 @@ impl AlloyDelivery {
 		self.providers.get(&chain_id).ok_or_else(|| {
 			DeliveryError::Network(format!("No provider configured for chain ID {chain_id}"))
 		})
+	}
+
+	/// Gets the nonce manager for a specific chain ID.
+	fn get_nonce_manager(&self, chain_id: u64) -> Result<&ResettableNonceManager, DeliveryError> {
+		self.nonce_managers.get(&chain_id).ok_or_else(|| {
+			DeliveryError::Network(format!(
+				"No nonce manager configured for chain ID {chain_id}"
+			))
+		})
+	}
+
+	/// Gets the signer address for a specific chain ID.
+	fn get_signer_address(&self, chain_id: u64) -> Result<Address, DeliveryError> {
+		self.signer_addresses
+			.get(&chain_id)
+			.copied()
+			.ok_or_else(|| {
+				DeliveryError::Network(format!("No signer configured for chain ID {chain_id}"))
+			})
+	}
+
+	/// Returns the next nonce to use for `from` on `chain_id`, taking it from the
+	/// resettable cache. Every call samples chain `pending`, but normal allocation
+	/// is monotonic: a stale RPC pending nonce must not move the local cache
+	/// backward and reissue a nonce already handed out by this process. Backward
+	/// reset is reserved for the explicit `nonce too low` resync path.
+	async fn next_nonce_for(&self, chain_id: u64, from: Address) -> Result<u64, DeliveryError> {
+		let provider = self.get_provider(chain_id)?;
+		let pending = provider
+			.get_transaction_count(from)
+			.pending()
+			.await
+			.map_err(|e| DeliveryError::Network(format!("Failed to fetch pending nonce: {e}")))?;
+		let mgr = self.get_nonce_manager(chain_id)?;
+		let previous_local_next_nonce = mgr.peek(from);
+		let local_next_nonce = mgr.set_next_nonce(from, pending);
+		tracing::debug!(
+			chain_id,
+			signer = %from,
+			chain_pending_nonce = pending,
+			previous_local_next_nonce = ?previous_local_next_nonce,
+			local_next_nonce,
+			"Reconciled EVM delivery nonce cache"
+		);
+		let nonce_taken = mgr
+			.take_next(from)
+			.expect("nonce just reconciled via reconcile_with_chain_pending");
+		tracing::debug!(
+			chain_id,
+			signer = %from,
+			chain_pending = pending,
+			local_before = ?previous_local_next_nonce,
+			nonce_used = nonce_taken,
+			local_after = nonce_taken + 1,
+			"allocated nonce for broadcast"
+		);
+		Ok(nonce_taken)
+	}
+
+	/// Resync the local nonce manager from chain pending and return the next
+	/// nonce to use for the resync retry. Advances the cache past whatever
+	/// the chain already knows about.
+	async fn resync_nonce_for(&self, chain_id: u64, from: Address) -> Result<u64, DeliveryError> {
+		let provider = self.get_provider(chain_id)?;
+		let pending = provider
+			.get_transaction_count(from)
+			.pending()
+			.await
+			.map_err(|e| {
+				DeliveryError::Network(format!("Failed to fetch pending nonce for resync: {e}"))
+			})?;
+		let mgr = self.get_nonce_manager(chain_id)?;
+		let before = mgr.peek(from);
+		mgr.reset_next_nonce(from, pending);
+		tracing::warn!(
+			chain_id,
+			signer = %from,
+			previous_local_next_nonce = ?before,
+			chain_pending_nonce = pending,
+			"Reset EVM delivery nonce cache from chain pending"
+		);
+		Ok(mgr
+			.take_next(from)
+			.expect("nonce just reset via reset_next_nonce"))
 	}
 }
 
@@ -221,54 +648,388 @@ impl DeliveryInterface for AlloyDelivery {
 
 		// Get the appropriate provider for this chain
 		let provider = self.get_provider(chain_id)?;
+		let from = self.get_signer_address(chain_id)?;
 
-		// Convert solver transaction to alloy transaction request
-		let request: TransactionRequest = tx.clone().into();
+		let mut tx_attempt = tx.clone();
+		if should_apply_mainnet_priority_fee_floor(&tx_attempt) {
+			let estimate = provider.estimate_eip1559_fees().await.map_err(|e| {
+				DeliveryError::Network(format!("Failed to estimate EIP-1559 fees: {e}"))
+			})?;
+			if apply_mainnet_priority_fee_floor(&mut tx_attempt, estimate.max_fee_per_gas) {
+				tracing::info!(
+					chain_id,
+					nonce = ?tx_attempt.nonce,
+					max_fee_per_gas = ?tx_attempt.max_fee_per_gas,
+					max_priority_fee_per_gas = ?tx_attempt.max_priority_fee_per_gas,
+					"Applied Ethereum mainnet priority fee floor"
+				);
+			}
+		}
+
+		// PRE-SUBMIT DIAGNOSTIC SNAPSHOT.
+		// Captures the signer's native balance and chain pending nonce before
+		// `eth_sendRawTransaction`, plus the up-front native token reservation
+		// that the RPC will require. If the balance read succeeds and the
+		// signer cannot cover `gas_limit × fee_per_gas + value`, return before
+		// consuming a nonce from the local cache.
+		let native_gas_budget = native_gas_budget_wei(&tx_attempt);
+		let pre_submit_balance = match provider.get_balance(from).await {
+			Ok(balance) => Some(balance),
+			Err(e) => {
+				tracing::warn!(
+					chain_id,
+					signer = %from,
+					error = %e,
+					"Could not read native balance for gas preflight; proceeding without affordability check"
+				);
+				None
+			},
+		};
+		let pre_submit_pending = provider.get_transaction_count(from).pending().await.ok();
+		let native_shortfall = match (pre_submit_balance, native_gas_budget.as_ref()) {
+			(Some(balance), Some(budget)) => native_gas_shortfall(balance, budget.required_wei),
+			_ => None,
+		};
+		if let (Some(balance), Some(budget), Some(shortfall)) = (
+			pre_submit_balance,
+			native_gas_budget.as_ref(),
+			native_shortfall,
+		) {
+			tracing::error!(
+				chain_id,
+				signer = %from,
+				balance_wei = %balance,
+				required_wei = %budget.required_wei,
+				shortfall_wei = %shortfall,
+				gas_budget_wei = %budget.gas_budget_wei,
+				value_wei = %tx_attempt.value,
+				gas_limit = ?tx_attempt.gas_limit,
+				gas_price = ?tx_attempt.gas_price,
+				max_fee_per_gas = ?tx_attempt.max_fee_per_gas,
+				max_priority_fee_per_gas = ?tx_attempt.max_priority_fee_per_gas,
+				"Insufficient native gas for transaction preflight; top up signer before retrying"
+			);
+			return Err(DeliveryError::InsufficientNativeGas(Box::new(
+				InsufficientNativeGasInfo {
+					chain_id,
+					signer: from.to_string(),
+					balance_wei: balance.to_string(),
+					required_wei: budget.required_wei.to_string(),
+					shortfall_wei: shortfall.to_string(),
+					gas_limit: tx_attempt.gas_limit,
+					max_fee_per_gas: tx_attempt.max_fee_per_gas,
+					gas_price: tx_attempt.gas_price,
+					value_wei: tx_attempt.value.to_string(),
+				},
+			)));
+		}
+		let balance_below_required = match (pre_submit_balance, native_gas_budget.as_ref()) {
+			(Some(balance), Some(budget)) => Some(balance < budget.required_wei),
+			_ => None,
+		};
+		tracing::debug!(
+			chain_id,
+			signer = %from,
+			pending_nonce = ?pre_submit_pending,
+			tx_nonce = ?tx_attempt.nonce,
+			balance_wei = ?pre_submit_balance.map(|b| b.to_string()),
+			gas_limit = ?tx_attempt.gas_limit,
+			value_wei = %tx_attempt.value,
+			gas_price = ?tx_attempt.gas_price,
+			max_fee_per_gas = ?tx_attempt.max_fee_per_gas,
+			max_priority_fee_per_gas = ?tx_attempt.max_priority_fee_per_gas,
+			gas_budget_wei = ?native_gas_budget.as_ref().map(|b| b.gas_budget_wei.to_string()),
+			required_wei = ?native_gas_budget.as_ref().map(|b| b.required_wei.to_string()),
+			shortfall_wei = ?native_shortfall.map(|b| b.to_string()),
+			balance_below_required = ?balance_below_required,
+			"PRE-SUBMIT diagnostic snapshot"
+		);
+
+		// Fill nonce from the resettable manager only after preflight succeeds.
+		// Insufficient native gas must not advance the local nonce cache.
+		if tx_attempt.nonce.is_none() {
+			tx_attempt.nonce = Some(self.next_nonce_for(chain_id, from).await?);
+		}
+
+		let request: TransactionRequest = tx_attempt.clone().into();
 
 		// Log request details for debugging
 		if tracking.is_some() {
 			tracing::debug!(
-				"Sending transaction with monitoring on chain {}: to={:?}, value={:?}, data_len={}, gas_limit={:?}",
+				"Sending transaction with monitoring on chain {}: to={:?}, value={:?}, data_len={}, gas_limit={:?}, nonce={:?}",
 				chain_id,
 				request.to,
 				request.value,
 				request.input.input().map(|d| d.len()).unwrap_or(0),
-				request.gas
+				request.gas,
+				request.nonce
 			);
 		} else {
 			tracing::debug!(
-				"Sending transaction on chain {}: to={:?}, value={:?}, data_len={}, gas_limit={:?}",
+				"Sending transaction on chain {}: to={:?}, value={:?}, data_len={}, gas_limit={:?}, nonce={:?}",
 				chain_id,
 				request.to,
 				request.value,
 				request.input.input().map(|d| d.len()).unwrap_or(0),
-				request.gas
+				request.gas,
+				request.nonce
 			);
 		}
 
-		// Send transaction - the provider's wallet will handle signing
-		let pending_tx = provider.send_transaction(request).await.map_err(|e| {
-			tracing::error!("Transaction submission failed on chain {}: {}", chain_id, e);
-			DeliveryError::Network(format!("Failed to send transaction: {e}"))
-		})?;
+		// First attempt. Classify any submission error into one of four buckets
+		// (NonceTooLow / DefinitelyRejected / Replacement / Ambiguous) and act
+		// on the local nonce cache accordingly. See `nonce_action_for_outcome`
+		// and `apply_nonce_cache_action`.
+		let pending_tx = match provider.send_transaction(request).await {
+			Ok(p) => {
+				tracing::debug!(
+					chain_id,
+					signer = %from,
+					nonce_used = ?tx_attempt.nonce,
+					tx_hash = %p.tx_hash(),
+					"tx submitted; nonce committed"
+				);
+				p
+			},
+			Err(first_err) => {
+				let first_err_str = first_err.to_string();
+				let outcome = classify_submission_outcome(&first_err_str);
+				match nonce_action_for_outcome(outcome) {
+					NonceCacheAction::NonceTooLowRetry => {
+						// EXISTING path — resync local cache from chain
+						// pending and retry once with the resynced nonce.
+						tracing::warn!(
+							chain_id,
+							signer = %from,
+							nonce_used = ?tx_attempt.nonce,
+							error = %first_err,
+							"submission failed: nonce too low; resyncing and retrying"
+						);
+
+						let retry_nonce = self.resync_nonce_for(chain_id, from).await?;
+						let mut retry_tx = tx_attempt.clone();
+						retry_tx.nonce = Some(retry_nonce);
+						let retry_request: TransactionRequest = retry_tx.into();
+
+						match provider.send_transaction(retry_request).await {
+							Ok(p) => {
+								tracing::info!(
+									chain_id,
+									retry_nonce,
+									"Resynced nonce retry succeeded"
+								);
+								p
+							},
+							Err(retry_err) => {
+								let retry_err_str = retry_err.to_string();
+								let retry_outcome = classify_submission_outcome(&retry_err_str);
+								match nonce_action_for_outcome(retry_outcome) {
+									NonceCacheAction::NonceTooLowRetry => {
+										tracing::error!(
+											chain_id,
+											retry_nonce,
+											error = %retry_err,
+											"Resynced nonce retry still failed with nonce too low — surfacing structured error"
+										);
+										let message = format!(
+											"Chain {chain_id}: retry with resynced nonce {retry_nonce} still failed: {retry_err}"
+										);
+										return Err(DeliveryError::NonceTooLow(message));
+									},
+									action @ NonceCacheAction::AttemptRollback => {
+										let mgr = self.get_nonce_manager(chain_id)?;
+										let cache_before = mgr.peek(from);
+										let pending_result =
+											provider.get_transaction_count(from).pending().await;
+										let (pending_opt, fetch_err): (
+											Option<u64>,
+											Option<String>,
+										) = match pending_result {
+											Ok(p) => (Some(p), None),
+											Err(e) => (None, Some(e.to_string())),
+										};
+										let cache_after = apply_nonce_cache_action(
+											mgr,
+											from,
+											action,
+											pending_opt,
+										);
+										if let Some(pending) = pending_opt {
+											tracing::warn!(
+												chain_id,
+												signer = %from,
+												retry_nonce,
+												chain_pending = pending,
+												cache_before = ?cache_before,
+												cache_after = ?cache_after,
+												error = %retry_err_str,
+												"resynced retry rejected pre-pool; nonce cache rolled back to chain pending"
+											);
+										} else {
+											tracing::warn!(
+												chain_id,
+												signer = %from,
+												retry_nonce,
+												cache_before = ?cache_before,
+												cache_after = ?cache_after,
+												error = %retry_err_str,
+												pending_fetch_error = ?fetch_err,
+												"resynced retry rejected pre-pool BUT chain-pending fetch failed; nonce cache kept advanced"
+											);
+										}
+									},
+									action @ NonceCacheAction::Keep => {
+										let mgr = self.get_nonce_manager(chain_id)?;
+										let cache_after =
+											apply_nonce_cache_action(mgr, from, action, None);
+										tracing::warn!(
+											chain_id,
+											signer = %from,
+											retry_nonce,
+											cache_after = ?cache_after,
+											outcome = ?retry_outcome,
+											error = %retry_err_str,
+											"resynced retry failed; nonce cache kept advanced (replacement-class or ambiguous error)"
+										);
+									},
+								}
+								tracing::error!(
+									"Resynced nonce retry failed on chain {}: {}",
+									chain_id,
+									retry_err
+								);
+								return Err(DeliveryError::Network(format!(
+									"Resynced nonce retry failed: {retry_err}"
+								)));
+							},
+						}
+					},
+					action @ NonceCacheAction::AttemptRollback => {
+						// Try to fetch authoritative chain pending. The helper
+						// `apply_nonce_cache_action` enforces the invariant: on
+						// Some(pending) it resets, on None it KEEPS the cache —
+						// we never reset without authoritative chain state.
+						let mgr = self.get_nonce_manager(chain_id)?;
+						let cache_before = mgr.peek(from);
+						let pending_result = provider.get_transaction_count(from).pending().await;
+						let (pending_opt, fetch_err): (Option<u64>, Option<String>) =
+							match pending_result {
+								Ok(p) => (Some(p), None),
+								Err(e) => (None, Some(e.to_string())),
+							};
+						let cache_after = apply_nonce_cache_action(mgr, from, action, pending_opt);
+						if let Some(pending) = pending_opt {
+							tracing::warn!(
+								chain_id,
+								signer = %from,
+								nonce_used = ?tx_attempt.nonce,
+								chain_pending = pending,
+								cache_before = ?cache_before,
+								cache_after = ?cache_after,
+								error = %first_err_str,
+								"tx rejected pre-pool; nonce cache rolled back to chain pending"
+							);
+						} else {
+							tracing::warn!(
+								chain_id,
+								signer = %from,
+								nonce_used = ?tx_attempt.nonce,
+								cache_before = ?cache_before,
+								cache_after = ?cache_after,
+								error = %first_err_str,
+								pending_fetch_error = ?fetch_err,
+								"tx rejected pre-pool BUT chain-pending fetch failed; nonce cache kept advanced (no authoritative state)"
+							);
+						}
+						return Err(DeliveryError::Network(format!(
+							"Failed to send transaction: {first_err}"
+						)));
+					},
+					action @ NonceCacheAction::Keep => {
+						let mgr = self.get_nonce_manager(chain_id)?;
+						let cache_after = apply_nonce_cache_action(mgr, from, action, None);
+						tracing::warn!(
+							chain_id,
+							signer = %from,
+							nonce_used = ?tx_attempt.nonce,
+							cache_after = ?cache_after,
+							outcome = ?outcome,
+							error = %first_err_str,
+							"tx submission did not accept; nonce cache kept advanced (replacement-class or ambiguous error)"
+						);
+						return Err(DeliveryError::Network(format!(
+							"Failed to send transaction: {first_err}"
+						)));
+					},
+				}
+			},
+		};
 
 		// Get the transaction hash
 		let tx_hash = *pending_tx.tx_hash();
 		let tx_hash_obj = TransactionHash(tx_hash.0.to_vec());
 
+		// POST-SUBMIT DIAGNOSTIC. Logged at DEBUG so it's silent in normal ops
+		// but available via RUST_LOG=solver_delivery=debug for forensic runs.
+		// NOTE: load-balanced RPC providers (e.g. Alchemy) have eventual
+		// consistency between write and read endpoints — `pending_nonce` after
+		// a successful submit can report the pre-submit value for tens of
+		// seconds even though the tx has been accepted, propagated, and is on
+		// its way to mining. Do NOT use it to decide retry/failure.
+		let post_submit_pending = provider.get_transaction_count(from).pending().await.ok();
+		let to_hex = tx_attempt
+			.to
+			.as_ref()
+			.map(|addr| format!("0x{}", hex::encode(&addr.0)));
+		tracing::debug!(
+			chain_id,
+			%tx_hash,
+			signer = %from,
+			to = ?to_hex,
+			value_wei = %tx_attempt.value,
+			data_len = tx_attempt.data.len(),
+			tx_nonce = ?tx_attempt.nonce,
+			gas_limit = ?tx_attempt.gas_limit,
+			gas_price = ?tx_attempt.gas_price,
+			max_fee_per_gas = ?tx_attempt.max_fee_per_gas,
+			max_priority_fee_per_gas = ?tx_attempt.max_priority_fee_per_gas,
+			pre_submit_pending_nonce = ?pre_submit_pending,
+			post_submit_pending_nonce = ?post_submit_pending,
+			pre_submit_balance_wei = ?pre_submit_balance.map(|b| b.to_string()),
+			gas_budget_wei = ?native_gas_budget.as_ref().map(|b| b.gas_budget_wei.to_string()),
+			required_wei = ?native_gas_budget.as_ref().map(|b| b.required_wei.to_string()),
+			"POST-SUBMIT diagnostic snapshot (read-replica lag may make pending_nonce stale)"
+		);
+
+		// NOTE: a previous version of this code did a 3-attempt
+		// `get_transaction_by_hash` "visibility check" right after submit and
+		// returned an error + reset the nonce cache when the read came back
+		// null. That was a false-positive trap: Alchemy's read endpoints lag
+		// by tens of seconds (load-balanced read replicas), so a tx that has
+		// been accepted by the pool, propagated, and is on its way to mining
+		// can still return null for `get_transaction_by_hash`. Verified: a tx
+		// declared "ghost" by that check actually mined at the requested
+		// nonce. Removing the check; rely on `monitor_transaction` (when
+		// tracking is provided) to detect actual confirmation, and on the
+		// existing nonce-too-low retry path to handle stale local nonce.
+
 		// If tracking is provided, set up monitoring
 		if let Some(tracking) = tracking {
 			let tx_hash_clone = tx_hash_obj.clone();
+			// Erase the root provider to a `DynProvider` so it matches
+			// `monitor_transaction`'s signature (and `ProviderProbe` inside it).
+			let provider_clone = pending_tx.provider().clone().erased();
 			tokio::spawn(async move {
 				let result = monitor_transaction(
-					pending_tx,
+					provider_clone,
+					tx_hash,
 					tracking.min_confirmations,
-					tracking.monitoring_timeout_seconds,
+					Duration::from_secs(tracking.tx_confirmation_timeout_seconds),
 				)
 				.await;
 
 				match result {
-					Ok(receipt) => {
+					PollOutcome::Confirmed(receipt) => {
 						(tracking.tracking.callback)(TransactionMonitoringEvent::Confirmed {
 							id: tracking.tracking.id,
 							tx_hash: tx_hash_clone,
@@ -276,12 +1037,20 @@ impl DeliveryInterface for AlloyDelivery {
 							receipt,
 						});
 					},
-					Err(error) => {
+					PollOutcome::Reverted(error) => {
 						(tracking.tracking.callback)(TransactionMonitoringEvent::Failed {
 							id: tracking.tracking.id,
 							tx_hash: tx_hash_clone,
 							tx_type: tracking.tracking.tx_type,
-							error: error.to_string(),
+							error,
+						});
+					},
+					PollOutcome::Indeterminate(reason) => {
+						(tracking.tracking.callback)(TransactionMonitoringEvent::Indeterminate {
+							id: tracking.tracking.id,
+							tx_hash: tx_hash_clone,
+							tx_type: tracking.tracking.tx_type,
+							reason,
 						});
 					},
 				}
@@ -559,67 +1328,146 @@ impl DeliveryInterface for AlloyDelivery {
 	}
 }
 
-/// Monitors a pending transaction for confirmation or timeout.
-/// First checks if the receipt already exists (to handle fast-mining transactions),
-/// then falls back to alloy's subscription-based monitoring.
-async fn monitor_transaction(
-	pending_tx: alloy_provider::PendingTransactionBuilder<alloy_network::Ethereum>,
+/// Alias for the Ethereum-flavored transaction receipt returned by
+/// `provider.get_transaction_receipt(...)`. Used in the `ConfirmationProbe`
+/// trait so production and test impls share the exact type the provider
+/// already returns at the existing receipt-check call site.
+type AlloyReceipt = alloy_rpc_types::TransactionReceipt;
+
+/// Probe abstraction over the two RPC calls the polling monitor needs.
+/// Production impl wraps a real `DynProvider`; tests provide a `MockProbe`
+/// with controllable response queues so the polling loop can be exercised
+/// deterministically without anvil.
+#[async_trait]
+trait ConfirmationProbe: Send + Sync {
+	async fn get_receipt(&self, tx_hash: B256) -> Result<Option<AlloyReceipt>, TransportError>;
+	async fn get_block_number(&self) -> Result<u64, TransportError>;
+}
+
+/// Production `ConfirmationProbe` that defers to a `DynProvider`.
+struct ProviderProbe(DynProvider);
+
+#[async_trait]
+impl ConfirmationProbe for ProviderProbe {
+	async fn get_receipt(&self, tx_hash: B256) -> Result<Option<AlloyReceipt>, TransportError> {
+		self.0.get_transaction_receipt(tx_hash).await
+	}
+
+	async fn get_block_number(&self) -> Result<u64, TransportError> {
+		self.0.get_block_number().await
+	}
+}
+
+/// Polling loop that drives a transaction from "submitted" to one of
+/// `Confirmed` / `Reverted` / `Indeterminate`.
+///
+/// - Transient RPC errors (failures from `get_receipt` or `get_block_number`)
+///   are logged at `warn` and the loop continues until the deadline. A single
+///   transient error must not fail the order.
+/// - A receipt with `status() == false` returns `Reverted` immediately, no
+///   further polling.
+/// - When confirmations >= `min_confirmations`, returns `Confirmed`.
+/// - When `confirmation_timeout` elapses without sufficient confirmations,
+///   returns `Indeterminate`. The caller MUST map this to a non-terminal
+///   event; see `PollOutcome` doc.
+async fn poll_for_confirmation(
+	probe: &dyn ConfirmationProbe,
+	tx_hash: B256,
 	min_confirmations: u64,
-	monitoring_timeout_seconds: u64,
-) -> Result<TransactionReceipt, DeliveryError> {
-	use std::time::Duration;
+	confirmation_timeout: Duration,
+	poll_interval: Duration,
+) -> PollOutcome {
+	let deadline = Instant::now() + confirmation_timeout;
+	let mut last_logged_confirmations: Option<u64> = None;
 
-	let tx_hash = *pending_tx.tx_hash();
-	let provider = pending_tx.provider().clone();
-	let timeout_duration = Duration::from_secs(monitoring_timeout_seconds);
+	tracing::debug!(?tx_hash, min_confirmations, "Starting tx confirmation poll");
 
-	// First, check if the transaction is already mined (handles race condition where
-	// tx mines before the subscription is set up)
-	if let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await {
-		if receipt.status() {
-			// Transaction already mined and successful, check confirmations
-			if min_confirmations > 0 {
-				if let Some(block_number) = receipt.block_number {
-					if let Ok(current_block) = provider.get_block_number().await {
-						let confirmations = current_block.saturating_sub(block_number);
-						if confirmations >= min_confirmations {
-							return Ok(TransactionReceipt::from(&receipt));
-						}
-						// Not enough confirmations yet, fall through to subscription
-					}
-				}
-			} else {
-				// No confirmations required
-				return Ok(TransactionReceipt::from(&receipt));
-			}
-		} else {
-			return Err(DeliveryError::TransactionFailed(
-				"Transaction reverted".to_string(),
+	loop {
+		if Instant::now() >= deadline {
+			tracing::warn!(?tx_hash, "Tx confirmation deadline reached → Indeterminate");
+			return PollOutcome::Indeterminate(format!(
+				"Tx {tx_hash:?} did not reach {min_confirmations} confirmations within timeout"
 			));
 		}
-	}
 
-	// Use alloy's subscription-based monitoring for pending transactions
-	match pending_tx
-		.with_required_confirmations(min_confirmations)
-		.with_timeout(Some(timeout_duration))
-		.get_receipt()
-		.await
-	{
-		Ok(receipt) => {
-			// Check status for consistency with pre-mined path
-			if receipt.status() {
-				Ok(TransactionReceipt::from(&receipt))
-			} else {
-				Err(DeliveryError::TransactionFailed(
-					"Transaction reverted".to_string(),
-				))
-			}
-		},
-		Err(e) => Err(DeliveryError::TransactionFailed(format!(
-			"Transaction monitoring failed: {e}"
-		))),
+		match probe.get_receipt(tx_hash).await {
+			Ok(Some(receipt)) => {
+				if !receipt.status() {
+					tracing::warn!(?tx_hash, "Tx reverted on chain");
+					return PollOutcome::Reverted("Transaction reverted".to_string());
+				}
+				let receipt_block = match receipt.block_number {
+					Some(b) => b,
+					None => {
+						// Mined into pending block but no number yet — keep polling.
+						tokio::time::sleep(poll_interval).await;
+						continue;
+					},
+				};
+				match probe.get_block_number().await {
+					Ok(current_block) => {
+						let confirmations = current_block.saturating_sub(receipt_block);
+						if last_logged_confirmations != Some(confirmations) {
+							tracing::debug!(
+								?tx_hash,
+								receipt_block,
+								current_block,
+								confirmations,
+								"Tx mined; tracking confirmations"
+							);
+							last_logged_confirmations = Some(confirmations);
+						}
+						if confirmations >= min_confirmations {
+							return PollOutcome::Confirmed(TransactionReceipt::from(&receipt));
+						}
+					},
+					Err(e) => {
+						tracing::warn!(
+							?tx_hash,
+							error = %e,
+							"get_block_number transient error; will retry"
+						);
+					},
+				}
+			},
+			Ok(None) => {
+				// Receipt not yet available — normal pending state.
+			},
+			Err(e) => {
+				tracing::warn!(
+					?tx_hash,
+					error = %e,
+					"get_transaction_receipt transient error; will retry"
+				);
+			},
+		}
+
+		tokio::time::sleep(poll_interval).await;
 	}
+}
+
+/// Monitors a submitted transaction for confirmation, revert, or timeout.
+///
+/// Thin wrapper around `poll_for_confirmation` that wraps the provider in a
+/// `ProviderProbe` and supplies the module-level poll interval. Returns a
+/// `PollOutcome` so the caller can map a deadline expiry to a non-terminal
+/// `TransactionMonitoringEvent::Indeterminate` rather than the terminal
+/// `Failed` event (which would leave the order permanently `OrderStatus::Failed`
+/// even if the tx later confirms; recovery skips Failed orders).
+async fn monitor_transaction(
+	provider: DynProvider,
+	tx_hash: B256,
+	min_confirmations: u64,
+	confirmation_timeout: Duration,
+) -> PollOutcome {
+	poll_for_confirmation(
+		&ProviderProbe(provider),
+		tx_hash,
+		min_confirmations,
+		confirmation_timeout,
+		TX_CONFIRMATION_POLL_INTERVAL,
+	)
+	.await
 }
 
 /// Factory function to create an HTTP-based delivery provider from configuration.
@@ -819,6 +1667,90 @@ mod tests {
 	// The tests below focus on the logic paths using real RPCs where possible.
 	// ========================================================================
 
+	#[test]
+	fn nonce_action_for_outcome_maps_correctly() {
+		use NonceCacheAction::*;
+		use SubmissionOutcome::*;
+		assert_eq!(
+			nonce_action_for_outcome(DefinitelyRejected),
+			AttemptRollback
+		);
+		assert_eq!(nonce_action_for_outcome(Replacement), Keep);
+		assert_eq!(nonce_action_for_outcome(Ambiguous), Keep);
+		assert_eq!(nonce_action_for_outcome(NonceTooLow), NonceTooLowRetry);
+	}
+
+	#[test]
+	fn apply_nonce_cache_action_rollback_with_pending_resets_cache() {
+		use NonceCacheAction::*;
+		let mgr = ResettableNonceManager::new();
+		let signer = Address::ZERO;
+		mgr.reset_next_nonce(signer, 101);
+		assert_eq!(mgr.peek(signer), Some(101));
+
+		let after = apply_nonce_cache_action(&mgr, signer, AttemptRollback, Some(100));
+		assert_eq!(
+			after,
+			Some(100),
+			"cache must reset to authoritative pending"
+		);
+		assert_eq!(mgr.peek(signer), Some(100));
+	}
+
+	#[test]
+	fn apply_nonce_cache_action_rollback_without_pending_keeps_cache() {
+		use NonceCacheAction::*;
+		let mgr = ResettableNonceManager::new();
+		let signer = Address::ZERO;
+		mgr.reset_next_nonce(signer, 101);
+
+		let after = apply_nonce_cache_action(&mgr, signer, AttemptRollback, None);
+		assert_eq!(
+			after,
+			Some(101),
+			"no authoritative chain state → cache must NOT be reset"
+		);
+		assert_eq!(mgr.peek(signer), Some(101));
+	}
+
+	#[test]
+	fn apply_nonce_cache_action_keep_does_not_mutate() {
+		use NonceCacheAction::*;
+		let mgr = ResettableNonceManager::new();
+		let signer = Address::ZERO;
+		mgr.reset_next_nonce(signer, 101);
+
+		let after = apply_nonce_cache_action(&mgr, signer, Keep, Some(95));
+		assert_eq!(after, Some(101));
+		assert_eq!(mgr.peek(signer), Some(101), "Keep must not touch the cache");
+	}
+
+	#[test]
+	fn apply_nonce_cache_action_nonce_too_low_is_noop() {
+		use NonceCacheAction::*;
+		let mgr = ResettableNonceManager::new();
+		let signer = Address::ZERO;
+		mgr.reset_next_nonce(signer, 101);
+
+		// The NonceTooLow path is handled by the existing retry branch; the
+		// helper must not double-handle it.
+		let after = apply_nonce_cache_action(&mgr, signer, NonceTooLowRetry, Some(50));
+		assert_eq!(after, Some(101));
+		assert_eq!(mgr.peek(signer), Some(101));
+	}
+
+	#[test]
+	fn drift_severity_escalates_with_sustained_ticks() {
+		use DriftSeverity::*;
+		assert_eq!(drift_severity_for_ticks(0), Normal);
+		assert_eq!(drift_severity_for_ticks(1), Normal);
+		assert_eq!(drift_severity_for_ticks(4), Normal);
+		assert_eq!(drift_severity_for_ticks(5), Warn);
+		assert_eq!(drift_severity_for_ticks(14), Warn);
+		assert_eq!(drift_severity_for_ticks(15), Error);
+		assert_eq!(drift_severity_for_ticks(100), Error);
+	}
+
 	mod monitor_transaction_tests {
 		use super::*;
 
@@ -955,6 +1887,201 @@ mod tests {
 				AlloyDelivery::new(vec![1, 137], &networks, network_signers, default_signer).await;
 
 			assert!(delivery.is_ok());
+		}
+
+		// ====================================================================
+		// poll_for_confirmation tests (Task 5 of polling-fallback plan)
+		// ====================================================================
+
+		use std::sync::Mutex as StdMutex;
+
+		/// In-memory probe for the polling tests. Each call to `get_receipt` /
+		/// `get_block_number` pops the next queued response. If a queue empties,
+		/// subsequent calls return the LAST response indefinitely (so a single
+		/// "stuck" value can simulate the chain not advancing).
+		struct MockProbe {
+			receipts: StdMutex<Vec<Result<Option<AlloyReceipt>, TransportError>>>,
+			blocks: StdMutex<Vec<Result<u64, TransportError>>>,
+		}
+
+		impl MockProbe {
+			fn new(
+				receipts: Vec<Result<Option<AlloyReceipt>, TransportError>>,
+				blocks: Vec<Result<u64, TransportError>>,
+			) -> Self {
+				// Reverse so we can pop from the end.
+				let mut r = receipts;
+				r.reverse();
+				let mut b = blocks;
+				b.reverse();
+				Self {
+					receipts: StdMutex::new(r),
+					blocks: StdMutex::new(b),
+				}
+			}
+
+			fn pop_or_last_receipt(&self) -> Result<Option<AlloyReceipt>, TransportError> {
+				let mut q = self.receipts.lock().unwrap();
+				if q.len() > 1 {
+					q.pop().unwrap()
+				} else if let Some(last) = q.last() {
+					match last {
+						Ok(Some(r)) => Ok(Some(r.clone())),
+						Ok(None) => Ok(None),
+						Err(_) => Err(TransportError::local_usage_str("transient")),
+					}
+				} else {
+					Ok(None)
+				}
+			}
+
+			fn pop_or_last_block(&self) -> Result<u64, TransportError> {
+				let mut q = self.blocks.lock().unwrap();
+				if q.len() > 1 {
+					q.pop().unwrap()
+				} else if let Some(last) = q.last() {
+					match last {
+						Ok(n) => Ok(*n),
+						Err(_) => Err(TransportError::local_usage_str("transient")),
+					}
+				} else {
+					Err(TransportError::local_usage_str("queue empty"))
+				}
+			}
+		}
+
+		#[async_trait]
+		impl ConfirmationProbe for MockProbe {
+			async fn get_receipt(
+				&self,
+				_tx_hash: B256,
+			) -> Result<Option<AlloyReceipt>, TransportError> {
+				self.pop_or_last_receipt()
+			}
+
+			async fn get_block_number(&self) -> Result<u64, TransportError> {
+				self.pop_or_last_block()
+			}
+		}
+
+		/// Build an `AlloyReceipt` with a chosen `status` and `block_number` for
+		/// these unit tests. We construct via JSON deserialization because the
+		/// public `TransactionReceipt` struct has many fields we don't care
+		/// about and serde gives us defaults for free.
+		fn make_receipt(success: bool, block_number: u64) -> AlloyReceipt {
+			let status_hex = if success { "0x1" } else { "0x0" };
+			let json = serde_json::json!({
+				"transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000001",
+				"transactionIndex": "0x0",
+				"blockHash": "0x0000000000000000000000000000000000000000000000000000000000000002",
+				"blockNumber": format!("0x{:x}", block_number),
+				"from": "0x0000000000000000000000000000000000000003",
+				"to": "0x0000000000000000000000000000000000000004",
+				"cumulativeGasUsed": "0x0",
+				"gasUsed": "0x0",
+				"effectiveGasPrice": "0x0",
+				"logs": [],
+				"logsBloom": format!("0x{}", "0".repeat(512)),
+				"status": status_hex,
+				"type": "0x2",
+			});
+			serde_json::from_value(json).expect("AlloyReceipt fixture should deserialize")
+		}
+
+		const POLL: Duration = Duration::from_millis(10);
+		const TIMEOUT_LONG: Duration = Duration::from_secs(5);
+		const TIMEOUT_SHORT: Duration = Duration::from_millis(200);
+
+		#[tokio::test]
+		async fn confirms_when_receipt_appears_after_n_polls() {
+			// Receipt: None, None, Some(success at block 100); blocks: 100, 100, 103.
+			let probe = MockProbe::new(
+				vec![
+					Ok(None),
+					Ok(None),
+					Ok(Some(make_receipt(true, 100))),
+					Ok(Some(make_receipt(true, 100))),
+				],
+				vec![Ok(100), Ok(100), Ok(103)],
+			);
+			let outcome = poll_for_confirmation(&probe, B256::ZERO, 3, TIMEOUT_LONG, POLL).await;
+			assert!(
+				matches!(outcome, PollOutcome::Confirmed(_)),
+				"expected Confirmed, got {outcome:?}",
+			);
+		}
+
+		#[tokio::test]
+		async fn waits_when_receipt_exists_but_confirmations_insufficient() {
+			// Receipt is mined at block 100 from the start; chain head climbs 100→103.
+			let probe = MockProbe::new(
+				vec![
+					Ok(Some(make_receipt(true, 100))),
+					Ok(Some(make_receipt(true, 100))),
+					Ok(Some(make_receipt(true, 100))),
+					Ok(Some(make_receipt(true, 100))),
+				],
+				vec![Ok(100), Ok(101), Ok(103)],
+			);
+			let outcome = poll_for_confirmation(&probe, B256::ZERO, 3, TIMEOUT_LONG, POLL).await;
+			assert!(matches!(outcome, PollOutcome::Confirmed(_)));
+		}
+
+		#[tokio::test]
+		async fn fails_immediately_on_reverted_receipt() {
+			// First poll returns a reverted receipt — should NOT keep polling.
+			let probe = MockProbe::new(vec![Ok(Some(make_receipt(false, 100)))], vec![Ok(100)]);
+			let outcome = poll_for_confirmation(&probe, B256::ZERO, 3, TIMEOUT_LONG, POLL).await;
+			assert!(matches!(outcome, PollOutcome::Reverted(_)));
+		}
+
+		#[tokio::test]
+		async fn tolerates_transient_rpc_errors_then_confirms() {
+			// First two receipt calls error; third sees None; fourth sees the
+			// receipt. Block-number queue: error, then 99, 100, 103.
+			let probe = MockProbe::new(
+				vec![
+					Err(TransportError::local_usage_str("transient")),
+					Err(TransportError::local_usage_str("transient")),
+					Ok(None),
+					Ok(Some(make_receipt(true, 100))),
+					Ok(Some(make_receipt(true, 100))),
+				],
+				vec![
+					Err(TransportError::local_usage_str("transient")),
+					Ok(99),
+					Ok(100),
+					Ok(103),
+				],
+			);
+			let outcome = poll_for_confirmation(&probe, B256::ZERO, 3, TIMEOUT_LONG, POLL).await;
+			assert!(
+				matches!(outcome, PollOutcome::Confirmed(_)),
+				"expected Confirmed after transient errors; got {outcome:?}",
+			);
+		}
+
+		#[tokio::test]
+		async fn returns_indeterminate_when_receipt_never_appears() {
+			// Receipt: None forever. Blocks: 99 forever.
+			// Confirmation timeout is short; expect Indeterminate within ~200ms.
+			let probe = MockProbe::new(vec![Ok(None)], vec![Ok(99)]);
+			let outcome = poll_for_confirmation(&probe, B256::ZERO, 3, TIMEOUT_SHORT, POLL).await;
+			assert!(
+				matches!(outcome, PollOutcome::Indeterminate(_)),
+				"expected Indeterminate on deadline; got {outcome:?}",
+			);
+		}
+
+		// Allow {outcome:?} formatting in the assertions above.
+		impl std::fmt::Debug for PollOutcome {
+			fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+				match self {
+					PollOutcome::Confirmed(_) => write!(f, "Confirmed(<receipt>)"),
+					PollOutcome::Reverted(s) => write!(f, "Reverted({s:?})"),
+					PollOutcome::Indeterminate(s) => write!(f, "Indeterminate({s:?})"),
+				}
+			}
 		}
 	}
 
@@ -1181,6 +2308,154 @@ mod tests {
 		use super::*;
 		use alloy_primitives::U256;
 
+		#[test]
+		fn applies_mainnet_priority_fee_floor_when_gas_fields_are_missing() {
+			let mut tx = SolverTransaction {
+				to: Some(solver_types::Address(vec![0x12; 20])),
+				data: vec![0xab, 0xcd],
+				value: U256::ZERO,
+				chain_id: ETHEREUM_MAINNET_CHAIN_ID,
+				nonce: None,
+				gas_limit: Some(50_000),
+				gas_price: None,
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+			};
+
+			assert!(apply_mainnet_priority_fee_floor(&mut tx, 1_100_000_000));
+
+			assert_eq!(
+				tx.max_priority_fee_per_gas,
+				Some(MAINNET_PRIORITY_FEE_FLOOR_WEI)
+			);
+			assert_eq!(tx.max_fee_per_gas, Some(3_100_000_000));
+		}
+
+		#[test]
+		fn leaves_non_mainnet_transactions_on_alloy_defaults() {
+			let mut tx = SolverTransaction {
+				to: Some(solver_types::Address(vec![0x12; 20])),
+				data: vec![],
+				value: U256::ZERO,
+				chain_id: 747474,
+				nonce: None,
+				gas_limit: Some(50_000),
+				gas_price: None,
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+			};
+
+			assert!(!apply_mainnet_priority_fee_floor(&mut tx, 1_100_000_000));
+
+			assert_eq!(tx.max_priority_fee_per_gas, None);
+			assert_eq!(tx.max_fee_per_gas, None);
+		}
+
+		#[test]
+		fn preserves_higher_mainnet_priority_fee_but_sets_missing_max_fee() {
+			let mut tx = SolverTransaction {
+				to: Some(solver_types::Address(vec![0x12; 20])),
+				data: vec![],
+				value: U256::ZERO,
+				chain_id: ETHEREUM_MAINNET_CHAIN_ID,
+				nonce: None,
+				gas_limit: Some(50_000),
+				gas_price: None,
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: Some(3_000_000_000),
+			};
+
+			assert!(apply_mainnet_priority_fee_floor(&mut tx, 1_100_000_000));
+
+			assert_eq!(tx.max_priority_fee_per_gas, Some(3_000_000_000));
+			assert_eq!(tx.max_fee_per_gas, Some(4_100_000_000));
+		}
+
+		#[test]
+		fn native_gas_budget_uses_eip1559_max_fee_plus_value() {
+			let tx = SolverTransaction {
+				chain_id: 1,
+				to: None,
+				data: vec![],
+				value: U256::from(10_884_382_513_223u128),
+				gas_limit: Some(1_319_423),
+				gas_price: None,
+				max_fee_per_gas: Some(4_332_712_539),
+				max_priority_fee_per_gas: Some(2_000_000_000),
+				nonce: None,
+			};
+
+			let budget = native_gas_budget_wei(&tx).expect("budget should be calculable");
+
+			assert_eq!(budget.gas_budget_wei.to_string(), "5716680576344997");
+			assert_eq!(budget.required_wei.to_string(), "5727564958858220");
+		}
+
+		#[test]
+		fn native_gas_budget_uses_legacy_gas_price_plus_value() {
+			let tx = SolverTransaction {
+				chain_id: 1,
+				to: None,
+				data: vec![],
+				value: U256::from(1_000u64),
+				gas_limit: Some(21_000),
+				gas_price: Some(2_000_000_000),
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+				nonce: None,
+			};
+
+			let budget = native_gas_budget_wei(&tx).expect("budget should be calculable");
+
+			assert_eq!(budget.required_wei.to_string(), "42000000001000");
+		}
+
+		#[test]
+		fn native_gas_budget_prefers_eip1559_max_fee_over_legacy_gas_price() {
+			let tx = SolverTransaction {
+				chain_id: 1,
+				to: None,
+				data: vec![],
+				value: U256::ZERO,
+				gas_limit: Some(21_000),
+				gas_price: Some(1_000_000_000),
+				max_fee_per_gas: Some(2_000_000_000),
+				max_priority_fee_per_gas: Some(1_000_000_000),
+				nonce: None,
+			};
+
+			let budget = native_gas_budget_wei(&tx).expect("budget should be calculable");
+
+			assert_eq!(budget.required_wei.to_string(), "42000000000000");
+		}
+
+		#[test]
+		fn native_gas_budget_is_none_without_gas_limit_or_fee() {
+			let tx = SolverTransaction {
+				chain_id: 1,
+				to: None,
+				data: vec![],
+				value: U256::ZERO,
+				gas_limit: None,
+				gas_price: None,
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+				nonce: None,
+			};
+
+			assert!(native_gas_budget_wei(&tx).is_none());
+		}
+
+		#[test]
+		fn insufficient_native_gas_shortfall_is_calculated_before_submit() {
+			let balance = U256::from(2_049_950_990_035_729u128);
+			let required = U256::from(5_727_564_958_858_220u128);
+
+			let shortfall = native_gas_shortfall(balance, required);
+
+			assert_eq!(shortfall.unwrap().to_string(), "3677613968822491");
+		}
+
 		/// Test Transaction to TransactionRequest conversion
 		#[test]
 		fn test_transaction_to_request_basic() {
@@ -1308,10 +2583,12 @@ mod tests {
 				tracking,
 				min_confirmations: 3,
 				monitoring_timeout_seconds: 300,
+				tx_confirmation_timeout_seconds: 600,
 			};
 
 			assert_eq!(config.min_confirmations, 3);
 			assert_eq!(config.monitoring_timeout_seconds, 300);
+			assert_eq!(config.tx_confirmation_timeout_seconds, 600);
 			assert_eq!(config.tracking.id, "test-order-123");
 		}
 

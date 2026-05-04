@@ -46,7 +46,7 @@ impl StorageReadiness for RedisReadiness {
 		};
 
 		// Use INFO-based check (ACL-safe, works with managed Redis)
-		let health_result = check_redis_health(url, timeout).await;
+		let health_result = check_redis_health(url, timeout, config.cluster_mode).await;
 
 		match health_result {
 			Ok(info) => {
