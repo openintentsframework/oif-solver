@@ -201,14 +201,33 @@ impl LayerZeroBridge {
 
 		// Step 1: allowance precheck. If we already have enough allowance,
 		// skip approve entirely.
-		let current_allowance = self
+		//
+		// On RPC failure we MUST NOT promote to NeedsIntervention via the
+		// generic-error arm in rebalance_token. ERC-20 `approve` is a `set`,
+		// not an `add` — some tokens (e.g. USDT) revert on nonzero-to-nonzero
+		// approvals — so this is a *safe operational fallback*, not strict
+		// idempotency. Any approve failure surfaces cleanly through the
+		// existing ApproveSubmitFailed / ApproveReverted arms instead of
+		// silently stranding the transfer due to a precheck RPC blip.
+		let current_allowance = match self
 			.read_allowance(
 				request.source_chain,
 				request.source_token,
 				self.solver_address,
 				composer_addr,
 			)
-			.await?;
+			.await
+		{
+			Ok(a) => a,
+			Err(e) => {
+				tracing::warn!(
+					chain_id = request.source_chain,
+					error = %e,
+					"read_allowance failed; falling through to approve path"
+				);
+				U256::ZERO
+			},
+		};
 
 		if current_allowance >= request.amount {
 			tracing::info!(
@@ -302,14 +321,29 @@ impl LayerZeroBridge {
 
 		// Step 1: allowance precheck. If we already have enough allowance,
 		// skip approve entirely.
-		let current_allowance = self
+		//
+		// Same safe-operational-fallback rationale as bridge_via_composer:
+		// a transient RPC failure on the precheck must not promote to
+		// NeedsIntervention. See bridge_via_composer for the full comment.
+		let current_allowance = match self
 			.read_allowance(
 				request.source_chain,
 				request.source_token,
 				self.solver_address,
 				request.source_oft,
 			)
-			.await?;
+			.await
+		{
+			Ok(a) => a,
+			Err(e) => {
+				tracing::warn!(
+					chain_id = request.source_chain,
+					error = %e,
+					"read_allowance failed; falling through to approve path"
+				);
+				U256::ZERO
+			},
+		};
 
 		if current_allowance >= request.amount {
 			tracing::info!(
@@ -1124,6 +1158,157 @@ mod tests {
 		let submitted = submitted.lock().unwrap();
 		assert_eq!(submitted.len(), 2);
 		assert_eq!(submitted[1].gas_limit, Some(500_000));
+	}
+
+	#[tokio::test]
+	async fn test_bridge_via_composer_falls_through_to_approve_when_read_allowance_fails() {
+		// Regression: a transient read_allowance failure must NOT promote
+		// the transfer to NeedsIntervention. The bridge must fall through to
+		// the approve path; if approve+deposit both succeed, bridge_asset
+		// returns Ok and the transfer continues normally.
+		let request = bridge_request();
+		let composer = Address::from([0xCC; 20]);
+		let fee = U256::from(12345u64);
+		let submitted = Arc::new(Mutex::new(Vec::<Transaction>::new()));
+		let mut mock = MockDeliveryInterface::new();
+
+		// Allowance precheck FAILS with a transient RPC error. The bridge must
+		// fall through to approve (treating the unknown allowance as 0).
+		mock.expect_get_allowance().times(1).returning(|_, _, _, _| {
+			Box::pin(async move {
+				Err(DeliveryError::Network(
+					"transient gateway timeout".to_string(),
+				))
+			})
+		});
+
+		{
+			let submitted = submitted.clone();
+			mock.expect_submit().times(2).returning(move |tx, _| {
+				let submitted = submitted.clone();
+				Box::pin(async move {
+					submitted.lock().unwrap().push(tx.clone());
+					Ok(TransactionHash(vec![0x11; 32]))
+				})
+			});
+		}
+
+		mock.expect_get_receipt().returning(|_, _| {
+			Box::pin(async move {
+				Ok(TransactionReceipt {
+					hash: TransactionHash(vec![0x11; 32]),
+					block_number: 1,
+					success: true,
+					logs: vec![],
+					block_timestamp: None,
+				})
+			})
+		});
+
+		let expected_composer = composer;
+		mock.expect_eth_call().returning(move |tx| {
+			assert_eq!(
+				tx.to
+					.as_ref()
+					.map(|addr| Address::from_slice(addr.0.as_slice())),
+				Some(expected_composer)
+			);
+			Box::pin(async move { Ok(alloy_primitives::Bytes::from(composer_quote_fee_bytes(fee))) })
+		});
+		mock.expect_estimate_gas()
+			.times(1)
+			.returning(move |_tx| Box::pin(async move { Ok(900_000) }));
+
+		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
+		let result = bridge
+			.bridge_asset(&request)
+			.await
+			.expect("bridge_asset must succeed by falling through to approve");
+
+		assert_eq!(result.tx_hash, format!("0x{}", hex::encode(vec![0x11; 32])));
+
+		// Approve + deposit were both submitted (i.e. precheck did not abort).
+		let submitted = submitted.lock().unwrap();
+		assert_eq!(
+			submitted.len(),
+			2,
+			"expected approve + deposit submissions after precheck fallback"
+		);
+		assert_eq!(tx_to(&submitted[0]), request.source_token);
+		let approve_call: contracts::approveCall = decode_submit(&submitted[0]);
+		assert_eq!(approve_call.spender, composer);
+		assert_eq!(approve_call.amount, request.amount);
+	}
+
+	#[tokio::test]
+	async fn test_bridge_via_oft_send_falls_through_to_approve_when_read_allowance_fails() {
+		// Regression mirror of the composer test, for the OFT-send path.
+		let request = bridge_request();
+		let fee = U256::from(12345u64);
+		let submitted = Arc::new(Mutex::new(Vec::<Transaction>::new()));
+		let mut mock = MockDeliveryInterface::new();
+
+		// Allowance precheck FAILS with a transient RPC error.
+		mock.expect_get_allowance().times(1).returning(|_, _, _, _| {
+			Box::pin(async move {
+				Err(DeliveryError::Network(
+					"transient gateway timeout".to_string(),
+				))
+			})
+		});
+
+		{
+			let submitted = submitted.clone();
+			mock.expect_submit().times(2).returning(move |tx, _| {
+				let submitted = submitted.clone();
+				Box::pin(async move {
+					submitted.lock().unwrap().push(tx.clone());
+					Ok(TransactionHash(vec![0x22; 32]))
+				})
+			});
+		}
+
+		mock.expect_get_receipt().returning(|_, _| {
+			Box::pin(async move {
+				Ok(TransactionReceipt {
+					hash: TransactionHash(vec![0x22; 32]),
+					block_number: 1,
+					success: true,
+					logs: vec![],
+					block_timestamp: None,
+				})
+			})
+		});
+
+		let expected_oft = request.source_oft;
+		mock.expect_eth_call().returning(move |tx| {
+			assert_eq!(
+				tx.to
+					.as_ref()
+					.map(|addr| Address::from_slice(addr.0.as_slice())),
+				Some(expected_oft)
+			);
+			Box::pin(async move { Ok(alloy_primitives::Bytes::from(oft_quote_fee_bytes(fee))) })
+		});
+
+		let bridge = bridge_with_two_chain_delivery(mock, None);
+		let result = bridge
+			.bridge_asset(&request)
+			.await
+			.expect("bridge_asset must succeed by falling through to approve");
+
+		assert_eq!(result.tx_hash, format!("0x{}", hex::encode(vec![0x22; 32])));
+
+		let submitted = submitted.lock().unwrap();
+		assert_eq!(
+			submitted.len(),
+			2,
+			"expected approve + send submissions after precheck fallback"
+		);
+		assert_eq!(tx_to(&submitted[0]), request.source_token);
+		let approve_call: contracts::approveCall = decode_submit(&submitted[0]);
+		assert_eq!(approve_call.spender, request.source_oft);
+		assert_eq!(approve_call.amount, request.amount);
 	}
 
 	#[tokio::test]

@@ -4,7 +4,7 @@
 //! supporting blockchain transaction submission and monitoring using the Alloy library.
 
 use crate::implementations::evm::nonce::{
-	classify_submission_outcome, is_nonce_too_low_error, ResettableNonceManager, SubmissionOutcome,
+	classify_submission_outcome, ResettableNonceManager, SubmissionOutcome,
 };
 use crate::{
 	DeliveryError, DeliveryInterface, InsufficientNativeGasInfo, TransactionMonitoringEvent,
@@ -822,16 +822,76 @@ impl DeliveryInterface for AlloyDelivery {
 							},
 							Err(retry_err) => {
 								let retry_err_str = retry_err.to_string();
-								if is_nonce_too_low_error(&retry_err_str) {
-									tracing::error!(
-										chain_id,
-										retry_nonce,
-										error = %retry_err,
-										"Resynced nonce retry still failed with nonce too low — surfacing structured error"
-									);
-									return Err(DeliveryError::NonceTooLow(format!(
-										"Chain {chain_id}: retry with resynced nonce {retry_nonce} still failed: {retry_err}"
-									)));
+								let retry_outcome = classify_submission_outcome(&retry_err_str);
+								match nonce_action_for_outcome(retry_outcome) {
+									NonceCacheAction::NonceTooLowRetry => {
+										tracing::error!(
+											chain_id,
+											retry_nonce,
+											error = %retry_err,
+											"Resynced nonce retry still failed with nonce too low — surfacing structured error"
+										);
+										let message = format!(
+											"Chain {chain_id}: retry with resynced nonce {retry_nonce} still failed: {retry_err}"
+										);
+										return Err(DeliveryError::NonceTooLow(message));
+									},
+									action @ NonceCacheAction::AttemptRollback => {
+										let mgr = self.get_nonce_manager(chain_id)?;
+										let cache_before = mgr.peek(from);
+										let pending_result =
+											provider.get_transaction_count(from).pending().await;
+										let (pending_opt, fetch_err): (
+											Option<u64>,
+											Option<String>,
+										) = match pending_result {
+											Ok(p) => (Some(p), None),
+											Err(e) => (None, Some(e.to_string())),
+										};
+										let cache_after = apply_nonce_cache_action(
+											mgr,
+											from,
+											action,
+											pending_opt,
+										);
+										if let Some(pending) = pending_opt {
+											tracing::warn!(
+												chain_id,
+												signer = %from,
+												retry_nonce,
+												chain_pending = pending,
+												cache_before = ?cache_before,
+												cache_after = ?cache_after,
+												error = %retry_err_str,
+												"resynced retry rejected pre-pool; nonce cache rolled back to chain pending"
+											);
+										} else {
+											tracing::warn!(
+												chain_id,
+												signer = %from,
+												retry_nonce,
+												cache_before = ?cache_before,
+												cache_after = ?cache_after,
+												error = %retry_err_str,
+												pending_fetch_error = ?fetch_err,
+												"resynced retry rejected pre-pool BUT chain-pending fetch failed; nonce cache kept advanced"
+											);
+										}
+									},
+									action @ NonceCacheAction::Keep => {
+										let mgr = self.get_nonce_manager(chain_id)?;
+										let cache_after =
+											apply_nonce_cache_action(mgr, from, action, None);
+										tracing::warn!(
+											chain_id,
+											signer = %from,
+											retry_nonce,
+											cache_after = ?cache_after,
+											outcome = ?retry_outcome,
+											error = %retry_err_str,
+											"resynced retry failed; nonce cache kept advanced (replacement-class or ambiguous error)"
+										);
+									},
 								}
 								tracing::error!(
 									"Resynced nonce retry failed on chain {}: {}",

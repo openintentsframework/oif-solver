@@ -166,15 +166,13 @@ pub fn classify_submission_outcome(message: &str) -> SubmissionOutcome {
 	// 2. Replacement-class: ANOTHER tx already holds this nonce.
 	//    Keep cache advanced; rolling back would reuse a nonce that already
 	//    has a tx, causing replacement-underpriced loops or self-replacement.
-	if lower.contains("replacement transaction underpriced")
-		|| lower.contains("transaction underpriced")
-		|| lower.contains("already known")
-	{
+	if lower.contains("replacement transaction underpriced") || lower.contains("already known") {
 		return SubmissionOutcome::Replacement;
 	}
 
 	// 3. Definitely rejected pre-pool. Safe to roll back the cache.
 	if lower.contains("insufficient funds")
+		|| lower.contains("transaction underpriced")
 		|| lower.contains("intrinsic gas too low")
 		|| lower.contains("exceeds block gas limit")
 		|| lower.contains("gas required exceeds")
@@ -379,6 +377,10 @@ mod tests {
 			DefinitelyRejected
 		);
 		assert_eq!(
+			classify_submission_outcome("transaction underpriced"),
+			DefinitelyRejected
+		);
+		assert_eq!(
 			classify_submission_outcome("intrinsic gas too low"),
 			DefinitelyRejected
 		);
@@ -423,10 +425,6 @@ mod tests {
 		// These prove ANOTHER tx already holds the nonce. Cache stays advanced.
 		assert_eq!(
 			classify_submission_outcome("replacement transaction underpriced"),
-			Replacement
-		);
-		assert_eq!(
-			classify_submission_outcome("transaction underpriced"),
 			Replacement
 		);
 		assert_eq!(classify_submission_outcome("already known"), Replacement);
