@@ -19,9 +19,25 @@ use std::{
 	path::PathBuf,
 	process::{Child, Command, Stdio},
 	str::FromStr,
+	sync::OnceLock,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tempfile::TempDir;
+use tokio::sync::{Mutex, MutexGuard};
+
+/// Process-global serializer for harness instances. The harness owns fixed
+/// ports (Anvil 8545/8546, solver API 3000), so two `Harness` instances in
+/// the same process must not run concurrently. `cargo test` parallelizes
+/// tests within a binary by default; without this lock the user has to
+/// remember `--test-threads=1`. With it, parallel tests just queue up.
+///
+/// The guard is held for the entire lifetime of `Harness` and dropped
+/// alongside the rest of the harness state, so the next test gets a clean
+/// environment regardless of how the previous one exited.
+fn harness_lock() -> &'static Mutex<()> {
+	static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+	LOCK.get_or_init(|| Mutex::new(()))
+}
 
 // =============================================================================
 // Public sol! types
@@ -90,6 +106,13 @@ sol! {
 		function open(StandardOrder calldata order) external;
 		function orderIdentifier(StandardOrder calldata order) external view returns (bytes32);
 	}
+
+	/// Read-only view onto `MockMailboxV2.dispatchCounter`. Bumps once per
+	/// successful `dispatch(...)` call from `HyperlaneOracle.submit()`.
+	#[sol(rpc)]
+	contract IMailboxMock {
+		function dispatchCounter() external view returns (uint256);
+	}
 }
 
 // =============================================================================
@@ -138,6 +161,11 @@ pub struct ChainDeployment {
 	pub output_oracle: Address,
 	pub input_settler: Address,
 	pub output_settler: Address,
+	/// `MockMailboxV2` address when `HarnessOptions::use_hyperlane_settlement`
+	/// is set. `None` for the default `Direct`-settlement layout.
+	/// Tests can read its `dispatchCounter` to assert the solver actually
+	/// called `HyperlaneOracle.submit()` during PostFill.
+	pub mock_mailbox: Option<Address>,
 }
 
 /// Owns every resource the test needs. Drop tears everything down in reverse.
@@ -155,6 +183,9 @@ pub struct Harness {
 	solver_stderr_path: PathBuf,
 	bootstrap_path: PathBuf,
 	_tempdir: TempDir,
+	/// Held to serialize concurrent `Harness` constructions in the same
+	/// process. Released when the guard is dropped (via the `Drop` impl).
+	_lock: MutexGuard<'static, ()>,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +196,23 @@ pub struct HarnessOptions {
 	pub use_reverting_output_settler: bool,
 	pub enable_admin_api: bool,
 	pub admin_redis_url: Option<String>,
+	/// Switch settlement type from `Direct` (default) to `Hyperlane`. When set,
+	/// the harness deploys `MockMailboxV2` on both chains plus a real
+	/// `HyperlaneOracle` on the destination, and the solver's PostFill step
+	/// dispatches a `submit()` call against that oracle. Tests can read the
+	/// destination's `MockMailboxV2.dispatchCounter` (via
+	/// `Harness::destination_mailbox_dispatch_count`) to assert the call
+	/// actually happened.
+	pub use_hyperlane_settlement: bool,
+	/// Addresses (`"0x..."` strings, any case) to write into a deny list
+	/// JSON file in the harness's tempdir. The harness sets
+	/// `SeedOverrides.deny_list` to that file's path so the solver loads it
+	/// at startup. None / empty = feature off.
+	///
+	/// Mirrors the on-disk file format the solver expects (`Vec<String>`).
+	/// The list is matched against `order.user` and every output recipient,
+	/// case-insensitively. See PR #308 / `IntentHandler::load_deny_list`.
+	pub deny_list_addresses: Option<Vec<String>>,
 	// Future scenario groups can add typed fields here as they get real
 	// call sites, e.g.:
 	// pub enable_permit2: bool,
@@ -182,6 +230,8 @@ impl Default for HarnessOptions {
 			use_reverting_output_settler: false,
 			enable_admin_api: false,
 			admin_redis_url: None,
+			use_hyperlane_settlement: false,
+			deny_list_addresses: None,
 		}
 	}
 }
@@ -193,6 +243,12 @@ impl Harness {
 
 	pub async fn boot_with(options: HarnessOptions) -> Result<Self> {
 		init_tracing();
+
+		// Serialize across concurrent harness constructions in the same
+		// process before doing any port-touching work. See `harness_lock` for
+		// rationale. The guard is moved into the returned `Harness` and held
+		// until the test's harness goes out of scope.
+		let lock_guard = harness_lock().lock().await;
 
 		// Pre-flight: kill any orphans on our fixed ports. solver-demo's
 		// AnvilManager intentionally `mem::forget`s child handles; previous
@@ -246,6 +302,30 @@ impl Harness {
 					.context("deploy RevertingOutputSettler")?;
 		}
 
+		// Hyperlane settlement scenario: deploy a mock mailbox on each chain
+		// (validate_seedless_settlement_requirements demands a mailbox entry
+		// per chain, even chains we never dispatch from), and a real
+		// HyperlaneOracle on the destination using its mailbox. The
+		// HyperlaneOracle replaces AlwaysYesOracle in the destination's
+		// output-oracle role so the solver's PostFill `submit()` call lands
+		// somewhere with the right interface. The origin-chain output role
+		// stays AlwaysYesOracle (unexercised; only required by validation).
+		if options.use_hyperlane_settlement {
+			origin.mock_mailbox = Some(
+				deploy_mock_mailbox_v2(&origin_provider)
+					.await
+					.context("deploy MockMailboxV2 (origin)")?,
+			);
+			let dest_mailbox = deploy_mock_mailbox_v2(&destination_provider)
+				.await
+				.context("deploy MockMailboxV2 (destination)")?;
+			destination.mock_mailbox = Some(dest_mailbox);
+			destination.output_oracle =
+				deploy_hyperlane_oracle(&destination_provider, dest_mailbox)
+					.await
+					.context("deploy HyperlaneOracle (destination)")?;
+		}
+
 		// Mint TOKA to user on origin (for the input leg) and TOKB to solver
 		// on destination (for the fill leg). Solver self-funds the fill —
 		// they bring their own inventory, exactly like production.
@@ -266,10 +346,28 @@ impl Harness {
 		.await
 		.context("mint TOKB to solver")?;
 
+		// Materialize the deny list file when configured. The solver loads
+		// this at startup via `IntentHandler::load_deny_list` and matches
+		// against `order.user` and every output recipient. We write into the
+		// per-test tempdir so the file is auto-cleaned with the rest of the
+		// test state.
+		let deny_list_path = if let Some(addrs) = &options.deny_list_addresses {
+			let path = tempdir.path().join("deny_list.json");
+			std::fs::write(
+				&path,
+				serde_json::to_vec_pretty(addrs).context("serialize deny list")?,
+			)
+			.context("write deny list file")?;
+			Some(path.to_string_lossy().into_owned())
+		} else {
+			None
+		};
+
 		// Write the bootstrap config. SeedOverrides shape — see notes at
 		// build_seed_overrides for why this is what `solver --bootstrap-config`
 		// expects (vs. the runtime Config schema in demo.json).
-		let seed_overrides = build_seed_overrides(&origin, &destination, &options)?;
+		let seed_overrides =
+			build_seed_overrides(&origin, &destination, &options, deny_list_path)?;
 		let bootstrap_path = tempdir.path().join("bootstrap.json");
 		std::fs::write(
 			&bootstrap_path,
@@ -301,6 +399,7 @@ impl Harness {
 			solver_stderr_path,
 			bootstrap_path,
 			_tempdir: tempdir,
+			_lock: lock_guard,
 		})
 	}
 
@@ -353,6 +452,57 @@ impl Harness {
 
 	pub fn api_base_url(&self) -> String {
 		format!("http://127.0.0.1:{SOLVER_API_PORT}/api/v1")
+	}
+
+	/// Read the destination chain's `MockMailboxV2.dispatchCounter`. Returns
+	/// `Ok(0)` if no mock mailbox was deployed (Direct settlement, the
+	/// default). A counter > 0 after a flow finishes is durable proof that
+	/// the solver actually called `HyperlaneOracle.submit()` during PostFill
+	/// — there's no oracle-local event we could correlate to the orderId, so
+	/// this is the cleanest assertion.
+	pub async fn destination_mailbox_dispatch_count(&self) -> Result<U256> {
+		let Some(addr) = self.destination.mock_mailbox else {
+			return Ok(U256::ZERO);
+		};
+		let contract = IMailboxMock::new(addr, &self.destination_provider);
+		let count = contract
+			.dispatchCounter()
+			.call()
+			.await
+			.context("read MockMailboxV2.dispatchCounter")?;
+		Ok(count)
+	}
+
+	/// Override an account's native (ETH) balance on the given chain via
+	/// `anvil_setBalance`. Used by failure tests that need to starve the
+	/// solver of gas after the harness's bootstrap approvals have run.
+	///
+	/// Anvil dev chains expose this RPC; mainnet/testnet providers don't —
+	/// don't call this against anything else.
+	pub async fn set_native_balance(
+		&self,
+		chain_id: u64,
+		account: Address,
+		wei: U256,
+	) -> Result<()> {
+		let provider = self.provider_for(chain_id)?;
+		provider
+			.client()
+			.request::<_, ()>("anvil_setBalance", (account, wei))
+			.await
+			.with_context(|| {
+				format!("anvil_setBalance({account}, {wei}) on chain {chain_id}")
+			})?;
+		Ok(())
+	}
+
+	/// Read native (ETH) balance.
+	pub async fn native_balance(&self, chain_id: u64, account: Address) -> Result<U256> {
+		let provider = self.provider_for(chain_id)?;
+		provider
+			.get_balance(account)
+			.await
+			.with_context(|| format!("get_balance({account}) on chain {chain_id}"))
 	}
 
 	/// Read raw token balance.
@@ -861,7 +1011,32 @@ async fn deploy_chain(
 		output_oracle: always_yes,
 		input_settler,
 		output_settler,
+		mock_mailbox: None,
 	})
+}
+
+/// Deploy `MockMailboxV2` from the pinned artifact. Used only when
+/// `HarnessOptions::use_hyperlane_settlement` is set.
+async fn deploy_mock_mailbox_v2(provider: &DynProvider) -> Result<Address> {
+	let bytecode = load_bytecode("MockMailboxV2")?;
+	deploy_raw(provider, bytecode, Bytes::new()).await
+}
+
+/// Deploy `HyperlaneOracle(mailbox, customHook, ism)`. We use non-zero
+/// placeholder addresses for `customHook` and `ism`; `MailboxClient`'s
+/// constructor only requires non-zero, and the mock mailbox never delegates
+/// to the hook. Bytecode comes from `oif-contracts/out/`, same as the other
+/// oracle deploys.
+async fn deploy_hyperlane_oracle(provider: &DynProvider, mailbox: Address) -> Result<Address> {
+	let bytecode = load_bytecode("HyperlaneOracle")?;
+	let custom_hook: Address = "0x000000000000000000000000000000000000DEAD"
+		.parse()
+		.expect("static address");
+	let ism: Address = "0x000000000000000000000000000000000000bEEF"
+		.parse()
+		.expect("static address");
+	let args = (mailbox, custom_hook, ism).abi_encode_params();
+	deploy_raw(provider, bytecode, Bytes::from(args)).await
 }
 
 async fn mint_erc20(
@@ -900,11 +1075,12 @@ fn build_seed_overrides(
 	origin: &ChainDeployment,
 	destination: &ChainDeployment,
 	options: &HarnessOptions,
+	deny_list_path: Option<String>,
 ) -> Result<solver_types::SeedOverrides> {
 	use solver_types::networks::NetworkType;
 	use solver_types::seed_overrides::{
-		AdminOverride, DirectSettlementOverride, NetworkOverride, OracleOverrides,
-		SettlementOverride, SettlementTypeOverride, Token,
+		AdminOverride, DirectSettlementOverride, HyperlaneSettlementOverride, NetworkOverride,
+		OracleOverrides, SettlementOverride, SettlementTypeOverride, Token,
 	};
 
 	fn token(symbol: &str, address: Address) -> Token {
@@ -945,24 +1121,67 @@ fn build_seed_overrides(
 	routes.insert(origin.chain_id, vec![destination.chain_id]);
 	routes.insert(destination.chain_id, vec![origin.chain_id]);
 
-	let direct = DirectSettlementOverride {
-		oracles: OracleOverrides {
-			input: input_oracles,
-			output: output_oracles,
-		},
-		routes,
-		// AlwaysYesOracle short-circuits dispute logic; 1s keeps the test fast.
-		dispute_period_seconds: Some(1),
-		oracle_selection_strategy: None,
-		intent_min_expiry_seconds: None,
-	};
+	let settlement = if options.use_hyperlane_settlement {
+		// Hyperlane settlement requires per-chain mailbox + IGP entries
+		// (`validate_seedless_settlement_requirements` enforces presence,
+		// not connectivity). Origin's mailbox is unexercised since our flow
+		// only dispatches FROM the destination; we still wire it up because
+		// the validator demands an entry per chain.
+		let origin_mailbox = origin
+			.mock_mailbox
+			.ok_or_else(|| anyhow!("origin mock_mailbox missing — set use_hyperlane_settlement"))?;
+		let dest_mailbox = destination.mock_mailbox.ok_or_else(|| {
+			anyhow!("destination mock_mailbox missing — set use_hyperlane_settlement")
+		})?;
+		let mut mailboxes = HashMap::new();
+		mailboxes.insert(origin.chain_id, origin_mailbox);
+		mailboxes.insert(destination.chain_id, dest_mailbox);
+		// IGP addresses are only validated for presence; the on-chain gas
+		// quote goes through `mailbox.quoteDispatch` (which our mock returns
+		// 0 for). Reuse the mailbox address as the IGP placeholder.
+		let mut igp_addresses = HashMap::new();
+		igp_addresses.insert(origin.chain_id, origin_mailbox);
+		igp_addresses.insert(destination.chain_id, dest_mailbox);
 
-	let settlement = SettlementOverride {
-		settlement_type: SettlementTypeOverride::Direct,
-		priority: Some(vec![SettlementTypeOverride::Direct]),
-		hyperlane: None,
-		direct: Some(direct),
-		broadcaster: None,
+		let hyperlane = HyperlaneSettlementOverride {
+			mailboxes,
+			igp_addresses,
+			oracles: OracleOverrides {
+				input: input_oracles,
+				output: output_oracles,
+			},
+			routes,
+			default_gas_limit: None,
+			message_timeout_seconds: None,
+			finalization_required: None,
+			intent_min_expiry_seconds: None,
+		};
+		SettlementOverride {
+			settlement_type: SettlementTypeOverride::Hyperlane,
+			priority: Some(vec![SettlementTypeOverride::Hyperlane]),
+			hyperlane: Some(hyperlane),
+			direct: None,
+			broadcaster: None,
+		}
+	} else {
+		let direct = DirectSettlementOverride {
+			oracles: OracleOverrides {
+				input: input_oracles,
+				output: output_oracles,
+			},
+			routes,
+			// AlwaysYesOracle short-circuits dispute logic; 1s keeps the test fast.
+			dispute_period_seconds: Some(1),
+			oracle_selection_strategy: None,
+			intent_min_expiry_seconds: None,
+		};
+		SettlementOverride {
+			settlement_type: SettlementTypeOverride::Direct,
+			priority: Some(vec![SettlementTypeOverride::Direct]),
+			hyperlane: None,
+			direct: Some(direct),
+			broadcaster: None,
+		}
 	};
 
 	let admin = if options.enable_admin_api {
@@ -992,7 +1211,7 @@ fn build_seed_overrides(
 		commission_bps: None,
 		rate_buffer_bps: None,
 		monitoring_timeout_seconds: None,
-		deny_list: None,
+		deny_list: deny_list_path,
 		rebalance: None,
 	})
 }
