@@ -1,6 +1,6 @@
 # solver-e2e-tests
 
-Live end-to-end tests for the OIF solver. Each test:
+Live end-to-end tests for the OIF solver. The harness:
 
 1. Spawns two real Anvil chains (31337 origin, 31338 destination).
 2. Deploys real contracts (`MockERC20` × 2 + `AlwaysYesOracle` +
@@ -8,13 +8,14 @@ Live end-to-end tests for the OIF solver. Each test:
    compiled artifacts in `oif-contracts/out/`.
 3. Spawns the real `solver` binary (built from `crates/solver-service`) as a
    subprocess against the freshly-deployed addresses.
-4. As the user, calls `open(StandardOrder)` directly on the input settler.
+4. As the user or API client, drives real order/admin/API flows.
 5. Polls on-chain logs and asserts the orderId from the user's `Open` event
    matches the orderId in the solver's `OutputFilled` event on the destination
    chain and the `Finalised` event on the origin chain.
 
-No mocks. No HTTP API in the loop. The flow under test is the actual
-on-chain path operators run.
+No in-process solver mocks. The flow under test is the actual subprocess
+operators run, with local Anvil chains and pinned test artifacts where a
+specific failure contract is required.
 
 ## Prerequisites
 
@@ -35,7 +36,7 @@ on-chain path operators run.
 ## Running
 
 ```bash
-cargo test -p solver-e2e-tests -- --ignored --test-threads=1 --nocapture
+scripts/e2e/solver_all.sh
 ```
 
 - `--ignored` is required; tests are `#[ignore]` by default so a plain
@@ -48,21 +49,41 @@ cargo test -p solver-e2e-tests -- --ignored --test-threads=1 --nocapture
 For more solver-side detail:
 ```bash
 RUST_LOG=info,solver=debug,solver_core=debug \
-  cargo test -p solver-e2e-tests -- --ignored --test-threads=1 --nocapture
+  scripts/e2e/solver_all.sh
 ```
 
-## What's in the test today
+The raw full ignored command is still useful for exploratory runs:
 
-| File | Path tested | Auth | Settlement | Status |
-|---|---|---|---|---|
-| `tests/happy_e2e_open_fill_settle.rs` | on-chain `open()` | none (ERC20 approve) | Direct + AlwaysYesOracle | happy path |
+```bash
+cargo test -p solver-e2e-tests -- --ignored --test-threads=1 --nocapture
+```
 
-## Planned additions
+Admin API coverage requires Redis. For local CI parity, either point at an
+existing Redis:
 
-- Off-chain `openFor()` with Permit2.
-- Off-chain `openFor()` with EIP-3009.
-- Failure paths: insufficient solver balance on destination, expired order,
-  fill that reverts, settlement timeout, slippage breach.
+```bash
+REDIS_URL=redis://127.0.0.1:6379 scripts/e2e/solver_all.sh
+```
+
+or let the Docker wrapper start and clean up a temporary Redis container:
+
+```bash
+scripts/e2e/solver_all_with_redis.sh
+```
+
+In hosted CI, prefer a Redis service container and run
+`scripts/e2e/solver_all.sh` with `REDIS_URL` set. The Docker wrapper is mainly
+for local reproduction and simple runners that allow Docker-in-Docker.
+
+## Scenario Matrix
+
+| Test File | Coverage | Command | Notes |
+|---|---|---|---|
+| `happy_e2e_open_fill_settle.rs` | on-chain happy path | `cargo test -p solver-e2e-tests --test happy_e2e_open_fill_settle -- --ignored --test-threads=1 --nocapture` | Requires `../oif-contracts/out` |
+| `failure_e2e_onchain.rs` | allowance, balance, expiry, solver liquidity | `cargo test -p solver-e2e-tests --test failure_e2e_onchain -- --ignored --test-threads=1 --nocapture` | Requires `../oif-contracts/out` |
+| `failure_e2e_settlement.rs` | fill revert, oracle not proven | `cargo test -p solver-e2e-tests --test failure_e2e_settlement -- --ignored --test-threads=1 --nocapture` | Requires pinned FalseOracle/RevertingOutputSettler artifacts |
+| `api_e2e_orders.rs` | public assets API | `cargo test -p solver-e2e-tests --test api_e2e_orders -- --ignored --test-threads=1 --nocapture` | Permit2 order flow is prepared but not enabled yet |
+| `admin_api_e2e.rs` | SIWE-authenticated admin API | `cargo test -p solver-e2e-tests --test admin_api_e2e -- --ignored --test-threads=1 --nocapture` | Skips when `REDIS_URL` is unset |
 
 ## Design decisions
 
@@ -207,6 +228,11 @@ The opt-in invocation is one flag (`--ignored`) and is documented above.
 
 - Anvil + `oif-contracts/out` must be present locally. There's no embedded
   fallback.
+- Admin API E2E requires Redis. If `REDIS_URL` is unset, the admin test prints
+  a skip message and exits successfully. Use
+  `scripts/e2e/solver_all_with_redis.sh` for a Docker-backed local run.
+- Permit2 is pinned as canonical runtime bytecode for `anvil_setCode`, not as
+  CREATE initcode.
 - POSIX-only port cleanup (`lsof`). Windows isn't currently supported.
 - First run compiles the `solver` binary. ~30s on a warm machine.
 - No parallelism across tests.
