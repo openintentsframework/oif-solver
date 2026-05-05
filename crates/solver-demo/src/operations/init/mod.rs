@@ -1171,6 +1171,8 @@ mod tests {
 			monitoring_timeout_seconds: None,
 			deny_list: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		}
 	}
 

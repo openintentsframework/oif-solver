@@ -18,7 +18,7 @@ use alloy_provider::{
 };
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types::TransactionRequest;
-use alloy_transport::layers::{RateLimitRetryPolicy, RetryBackoffLayer};
+use alloy_transport::layers::RetryBackoffLayer;
 use alloy_transport::TransportError;
 use async_trait::async_trait;
 use solver_account::AccountSigner;
@@ -383,24 +383,17 @@ impl AlloyDelivery {
 			let signer_address = chain_signer.address();
 			let wallet = EthereumWallet::from(chain_signer);
 
-			// Configure retry layer for handling network errors, rate limits, and execution reverts
-			// Extend the default rate limit policy to also retry execution reverts during transaction submission
-			let retry_policy = RateLimitRetryPolicy::default().or(|error: &TransportError| {
-				match error {
-					TransportError::ErrorResp(payload) => {
-						// Retry execution reverts (error code 3) that may be temporary
-						// These often occur during transaction submission due to network congestion or contract state issues
-						payload.code == 3 && payload.message.contains("execution reverted")
-					},
-					_ => false,
-				}
-			});
-
-			let retry_layer = RetryBackoffLayer::new_with_policy(
-				3,    // max_retry: retry up to 3 times for transaction submission (more conservative)
-				1500, // backoff: slightly longer initial backoff for transaction retries
+			// Retry only the rate-limit / transient cases (default policy). Execution
+			// reverts on read-only calls (eth_estimateGas / eth_call) are deterministic
+			// — retrying wastes the CU budget and stretches every subsequent call's
+			// backoff. Submission-revert handling is now done at the application layer
+			// by `classify_submission_outcome` (see nonce.rs), which routes
+			// definitely-rejected reverts to the cache-rollback policy without needing
+			// blind RPC-layer retries.
+			let retry_layer = RetryBackoffLayer::new(
+				3,    // max_retry
+				1500, // backoff (ms, doubles each retry)
 				10,   // cups: compute units per second
-				retry_policy,
 			);
 
 			// Create RPC client with retry capabilities
@@ -1247,6 +1240,36 @@ impl DeliveryInterface for AlloyDelivery {
 		Ok(gas)
 	}
 
+	async fn estimate_gas_with_overrides(
+		&self,
+		tx: SolverTransaction,
+		state_override: alloy_rpc_types::state::StateOverride,
+	) -> Result<u64, DeliveryError> {
+		// Mirror the existing estimate_gas impl: derive chain_id from
+		// tx.chain_id and route via self.get_provider(chain_id). Per
+		// the DeliveryInterface contract, this method is per-chain at
+		// the trait level but the impl multiplexes via the chain_id
+		// carried on the Transaction itself.
+		let chain_id = tx.chain_id;
+		let provider = self.get_provider(chain_id)?;
+
+		let request: TransactionRequest = tx.into();
+
+		// alloy 1.0.37 EthCall::overrides takes `impl Into<StateOverride>`,
+		// NOT `&StateOverride` — pass the value owned. The state_override
+		// arg isn't used after this point in the method, so consuming is
+		// fine. If a future alloy version changes the signature, swap to
+		// `.overrides_opt(Some(state_override))`.
+		let gas = provider
+			.estimate_gas(request)
+			.overrides(state_override)
+			.await
+			.map_err(|e| {
+				DeliveryError::Network(format!("Failed to estimate gas with overrides: {e}"))
+			})?;
+		Ok(gas)
+	}
+
 	async fn eth_call(&self, tx: SolverTransaction) -> Result<Bytes, DeliveryError> {
 		// Get the chain ID from the transaction
 		let chain_id = tx.chain_id;
@@ -1542,6 +1565,10 @@ impl crate::DeliveryRegistry for Registry {}
 
 #[cfg(test)]
 mod tests {
+	// Note: unit-level coverage of `estimate_gas_with_overrides` is deferred to
+	// Task 6's live integration test — this crate has no `wiremock` or
+	// `alloy-node-bindings` dev-dependency, so a mock RPC harness isn't
+	// available here.
 	use super::*;
 	use alloy_signer_local::PrivateKeySigner;
 	use solver_types::utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder};

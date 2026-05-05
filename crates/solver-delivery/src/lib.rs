@@ -215,6 +215,17 @@ pub trait DeliveryInterface: Send + Sync {
 	/// Implementations should call the chain's estimateGas RPC with the provided transaction.
 	async fn estimate_gas(&self, tx: Transaction) -> Result<u64, DeliveryError>;
 
+	/// Estimate gas with a `stateOverride` applied (Alchemy/Geth/Erigon/Reth).
+	/// Use to simulate calls that depend on contract state that doesn't
+	/// yet exist (e.g. a quote-time post-fill simulation that needs a
+	/// fake fill record). No default impl — every backend explicitly
+	/// declares whether it supports overrides.
+	async fn estimate_gas_with_overrides(
+		&self,
+		tx: Transaction,
+		state_override: alloy_rpc_types::state::StateOverride,
+	) -> Result<u64, DeliveryError>;
+
 	/// Executes a contract call without sending a transaction.
 	///
 	/// This performs an eth_call RPC to read data from smart contracts
@@ -456,6 +467,27 @@ impl DeliveryService {
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
 		implementation.estimate_gas(tx).await
+	}
+
+	/// Estimates gas for a transaction on the specified chain with a
+	/// `stateOverride` applied. Used to simulate calls whose execution
+	/// depends on state that doesn't yet exist on chain (e.g. a fake
+	/// post-fill record when quoting). The `chain_id` is used only to
+	/// pick the backend; the backend itself routes via `tx.chain_id`.
+	pub async fn estimate_gas_with_overrides(
+		&self,
+		chain_id: u64,
+		tx: Transaction,
+		state_override: alloy_rpc_types::state::StateOverride,
+	) -> Result<u64, DeliveryError> {
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
+
+		implementation
+			.estimate_gas_with_overrides(tx, state_override)
+			.await
 	}
 
 	/// Executes a contract call (eth_call) without sending a transaction.

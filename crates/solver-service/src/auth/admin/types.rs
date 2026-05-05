@@ -146,6 +146,7 @@ sol! {
 		uint64 eip3009EscrowPostFill;
 		uint64 eip3009EscrowPreClaim;
 		uint64 eip3009EscrowClaim;
+		uint64[] livePostFillEstimateChainIds;
 		uint256 nonce;
 		uint256 deadline;
 	}
@@ -457,6 +458,11 @@ pub struct UpdateGasConfigContents {
 	pub eip3009_escrow_post_fill: u64,
 	pub eip3009_escrow_pre_claim: u64,
 	pub eip3009_escrow_claim: u64,
+	/// Source-of-truth ordering. The to_eip712 conversion sorts ascending
+	/// before constructing the sol struct so two instances with the same
+	/// logical set produce the same signature regardless of insertion order.
+	#[serde(default)]
+	pub live_post_fill_estimate_chain_ids: Vec<u64>,
 	#[serde(with = "string_or_number")]
 	pub nonce: u64,
 	#[serde(with = "string_or_number")]
@@ -466,6 +472,14 @@ pub struct UpdateGasConfigContents {
 impl UpdateGasConfigContents {
 	/// Convert to EIP-712 struct for hashing
 	pub fn to_eip712(&self) -> UpdateGasConfig {
+		// CRITICAL: sort the chain-id list before constructing the
+		// sol struct. Without this, two semantically-identical lists
+		// ([1, 747474] vs [747474, 1]) produce different EIP-712
+		// hashes and the signature verification becomes
+		// order-dependent.
+		let mut sorted_chain_ids = self.live_post_fill_estimate_chain_ids.clone();
+		sorted_chain_ids.sort_unstable();
+
 		UpdateGasConfig {
 			resourceLockOpen: self.resource_lock_open,
 			resourceLockFill: self.resource_lock_fill,
@@ -482,6 +496,7 @@ impl UpdateGasConfigContents {
 			eip3009EscrowPostFill: self.eip3009_escrow_post_fill,
 			eip3009EscrowPreClaim: self.eip3009_escrow_pre_claim,
 			eip3009EscrowClaim: self.eip3009_escrow_claim,
+			livePostFillEstimateChainIds: sorted_chain_ids,
 			nonce: U256::from(self.nonce),
 			deadline: U256::from(self.deadline),
 		}
@@ -2105,5 +2120,56 @@ mod tests {
 		assert_eq!(parsed_resolve.transfer_id, "transfer-1");
 		assert_eq!(parsed_resolve.resolution, "retry");
 		assert_eq!(parsed_resolve.reason, "operator requested retry");
+	}
+
+	/// Locks in the invariant that `to_eip712` sorts the
+	/// `live_post_fill_estimate_chain_ids` list before constructing
+	/// the sol struct. Without this, two semantically-identical sets
+	/// produce different EIP-712 hashes and signatures become
+	/// order-dependent.
+	#[test]
+	fn live_post_fill_estimate_chain_ids_sort_before_eip712_encoding() {
+		fn make(chain_ids: Vec<u64>) -> UpdateGasConfigContents {
+			UpdateGasConfigContents {
+				resource_lock_open: 1,
+				resource_lock_fill: 2,
+				resource_lock_post_fill: 3,
+				resource_lock_pre_claim: 4,
+				resource_lock_claim: 5,
+				permit2_escrow_open: 6,
+				permit2_escrow_fill: 7,
+				permit2_escrow_post_fill: 8,
+				permit2_escrow_pre_claim: 9,
+				permit2_escrow_claim: 10,
+				eip3009_escrow_open: 11,
+				eip3009_escrow_fill: 12,
+				eip3009_escrow_post_fill: 13,
+				eip3009_escrow_pre_claim: 14,
+				eip3009_escrow_claim: 15,
+				live_post_fill_estimate_chain_ids: chain_ids,
+				nonce: 1u64,
+				deadline: 2u64,
+			}
+		}
+
+		let in_order = make(vec![1, 747474, 42161]);
+		let out_of_order = make(vec![747474, 1, 42161]);
+
+		let hash_a = in_order.struct_hash();
+		let hash_b = out_of_order.struct_hash();
+
+		assert_eq!(
+			hash_a, hash_b,
+			"to_eip712 must sort chain_ids — different insertion orders \
+			 must produce identical EIP-712 hashes"
+		);
+
+		// An actually-different set must produce a different hash.
+		let different = make(vec![1, 747474]);
+		assert_ne!(
+			different.struct_hash(),
+			hash_a,
+			"different logical sets must hash differently"
+		);
 	}
 }

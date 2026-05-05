@@ -12,7 +12,7 @@ use regex::Regex;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use solver_types::{networks::deserialize_networks, NetworksConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use thiserror::Error;
@@ -356,6 +356,10 @@ fn default_live_fill_estimate_enabled() -> bool {
 	true
 }
 
+fn default_live_post_fill_estimate_chain_ids() -> HashSet<u64> {
+	HashSet::new() // empty = disabled everywhere; opt-in per-chain
+}
+
 /// Gas configuration mapping flow identifiers to gas unit overrides.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GasConfig {
@@ -368,6 +372,12 @@ pub struct GasConfig {
 	/// on a chain where eth_estimateGas is unreliable.
 	#[serde(default = "default_live_fill_estimate_enabled")]
 	pub live_fill_estimate_enabled: bool,
+	/// Set of chain IDs on which quote-time post-fill gas estimation
+	/// uses the stateOverride-based live path. Empty (default) = disabled
+	/// on all chains. Operators add chain IDs after validating the
+	/// OutputSettler's storage layout via the integration test.
+	#[serde(default = "default_live_post_fill_estimate_chain_ids")]
+	pub live_post_fill_estimate_chain_ids: HashSet<u64>,
 }
 
 /// Runtime rebalancing configuration.

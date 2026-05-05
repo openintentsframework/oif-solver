@@ -827,6 +827,7 @@ pub fn admin_eip712_types() -> serde_json::Value {
 			{"name": "eip3009EscrowPostFill", "type": "uint64"},
 			{"name": "eip3009EscrowPreClaim", "type": "uint64"},
 			{"name": "eip3009EscrowClaim", "type": "uint64"},
+			{"name": "livePostFillEstimateChainIds", "type": "uint64[]"},
 			{"name": "nonce", "type": "uint256"},
 			{"name": "deadline", "type": "uint256"}
 		],
@@ -1974,8 +1975,8 @@ mod tests {
 			.as_array()
 			.expect("should be an array");
 
-		// UpdateGasConfig should have 17 fields
-		assert_eq!(gas_config.len(), 17);
+		// UpdateGasConfig should have 18 fields
+		assert_eq!(gas_config.len(), 18);
 
 		let names: Vec<&str> = gas_config
 			.iter()
@@ -1996,6 +1997,7 @@ mod tests {
 		assert!(names.contains(&"eip3009EscrowPostFill"));
 		assert!(names.contains(&"eip3009EscrowPreClaim"));
 		assert!(names.contains(&"eip3009EscrowClaim"));
+		assert!(names.contains(&"livePostFillEstimateChainIds"));
 		assert!(names.contains(&"nonce"));
 		assert!(names.contains(&"deadline"));
 	}

@@ -29,7 +29,7 @@ use crate::networks::NetworkType;
 use alloy_primitives::{Address, B256};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Complete operator configuration stored in Redis.
 ///
@@ -440,6 +440,10 @@ fn default_live_fill_estimate_enabled() -> bool {
 	true
 }
 
+fn default_live_post_fill_estimate_chain_ids() -> HashSet<u64> {
+	HashSet::new() // empty = disabled everywhere; opt-in per-chain
+}
+
 /// Gas estimation settings per flow type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperatorGasConfig {
@@ -457,6 +461,18 @@ pub struct OperatorGasConfig {
 	/// Other legs (open/claim) stay static. Defaults to `true`.
 	#[serde(default = "default_live_fill_estimate_enabled")]
 	pub live_fill_estimate_enabled: bool,
+
+	/// Set of chain IDs on which quote-time post-fill gas estimation
+	/// uses the stateOverride-based live path. Empty (default) = disabled
+	/// on all chains. Operators add chain IDs after validating the
+	/// OutputSettler's storage layout via the integration test.
+	///
+	/// Per-chain rather than global because the storage-layout
+	/// assumption is per-chain (different OutputSettler deployments
+	/// may have different impl versions or even different contract
+	/// shapes per chain).
+	#[serde(default = "default_live_post_fill_estimate_chain_ids")]
+	pub live_post_fill_estimate_chain_ids: HashSet<u64>,
 }
 
 /// Gas units for each step in an order flow.
@@ -937,6 +953,7 @@ mod tests {
 				permit2_escrow: OperatorGasFlowUnits::default(),
 				eip3009_escrow: OperatorGasFlowUnits::default(),
 				live_fill_estimate_enabled: true,
+				live_post_fill_estimate_chain_ids: HashSet::new(),
 			},
 			pricing: OperatorPricingConfig {
 				primary: "coingecko".to_string(),

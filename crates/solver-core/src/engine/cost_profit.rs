@@ -6,8 +6,28 @@
 //! - Unified service combining cost estimation and profitability validation
 
 use crate::engine::token_manager::{TokenManager, TokenManagerError};
-use alloy_primitives::{FixedBytes, B256, U256};
+use alloy_primitives::{keccak256, FixedBytes, B256, U256};
 use alloy_sol_types::{sol, SolCall};
+
+/// Discriminator strings for the post-fill live-estimate outcome event.
+/// The call site emits exactly ONE event per quote with one of these values
+/// in the `outcome=` field, so dashboards can aggregate by outcome.
+pub(crate) mod post_fill_outcome {
+	/// Override path returned non-zero units that we then applied.
+	pub const SUCCESS: &str = "success";
+	/// Override path returned `Ok(0)` — kept the static default.
+	pub const FALLBACK_ZERO: &str = "fallback_zero";
+	/// Override path returned `Err(_)` — kept the static default.
+	pub const FALLBACK_ERROR: &str = "fallback_error";
+	/// `build_post_fill_tx_for_quote` failed (config / encode error).
+	pub const SKIPPED_BUILD_TX: &str = "skipped_build_tx";
+	/// `build_post_fill_tx_for_quote` returned `Ok(None)` (no Hyperlane
+	/// post-fill required for this quote).
+	pub const SKIPPED_DISABLED: &str = "skipped_disabled";
+	/// Quote's destination chain is not in
+	/// `live_post_fill_estimate_chain_ids`; static default used.
+	pub const SKIPPED_UNSUPPORTED_CHAIN: &str = "skipped_unsupported_chain";
+}
 use rust_decimal::Decimal;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
@@ -181,6 +201,41 @@ pub struct CallbackSimulationResult {
 	pub chain_id: u64,
 	/// Whether the order has callback data
 	pub has_callback: bool,
+}
+
+/// Inputs needed by the override-based post-fill estimator alongside the
+/// synthetic post-fill `Transaction`. All five fields must agree exactly
+/// with what the on-chain `_isPayloadValid` will look up — the override
+/// pre-populates `_fillRecords[order_id][output_hash]` on
+/// `output_settler` with the value `keccak256(solver || fill_timestamp)`,
+/// so any drift between these and what the contract reconstructs from
+/// the encoded FillDescription payload would re-introduce the revert.
+struct PostFillQuoteTx {
+	/// The synthetic Hyperlane `submit(...)` transaction to estimate.
+	tx: Transaction,
+	/// Address of the OutputSettler whose storage we override.
+	output_settler: Address,
+	/// `orderId` field encoded inside the FillDescription payload —
+	/// matches what `loadOrderIdFromFillDescription` will read.
+	synthetic_order_id: B256,
+	/// Result of `MandateOutputEncodingLib.getMandateOutputHashFromCommonPayload(
+	///     msg.sender (output oracle), settler, dest_chain_id, common_payload
+	/// )` — matches what `_isPayloadValid` recomputes.
+	output_hash: B256,
+	/// Solver identifier (32-byte) embedded in the payload's solver field.
+	solver: B256,
+	/// Timestamp (uint32) embedded in the payload.
+	fill_timestamp: u32,
+}
+
+/// Result of a single override-based post-fill estimate attempt.
+/// Caller is responsible for logging exactly ONE structured outcome
+/// event per call (see `post_fill_outcome`). The helper that returns
+/// this enum performs no I/O beyond the RPC call and emits no logs.
+pub(crate) enum PostFillEstimateOutcome {
+	Success(u64),
+	FallbackZero,
+	FallbackError(solver_delivery::DeliveryError),
 }
 
 /// Unified service for cost estimation and profitability calculation.
@@ -533,6 +588,11 @@ impl CostProfitService {
 		.await
 	}
 
+	#[tracing::instrument(
+		skip_all,
+		fields(chain_id = tracing::field::Empty),
+		name = "calculate_cost_context"
+	)]
 	pub async fn calculate_cost_context_for_flow_keys(
 		&self,
 		request: &solver_types::GetQuoteRequest,
@@ -579,6 +639,11 @@ impl CostProfitService {
 				details: None,
 			})?;
 
+		// Record dest chain on the span so per-chain success rates of the
+		// post-fill outcome events are computable from log aggregation
+		// without joining across events.
+		tracing::Span::current().record("chain_id", dest_chain_id);
+
 		let (open_units, fill_units, post_fill_units, pre_claim_units, claim_units) =
 			estimate_gas_units_from_flow_keys(flow_keys, config, 150000, 150000, 300000, 0, 150000);
 
@@ -595,13 +660,25 @@ impl CostProfitService {
 		// chain so quote-time costs track the transactions the solver will send.
 		// `open` and `claim` stay static — they can't be safely simulated pre-fill
 		// (open needs the user's permit; claim needs the Hyperlane proof of fill).
-		let live_estimate_enabled = config
+		//
+		// Fill and post-fill are gated INDEPENDENTLY (per plan v2 Finding 6):
+		// - `live_fill_estimate_enabled` controls the fill tx live estimate.
+		// - `live_post_fill_estimate_chain_ids` controls the override-based
+		//   post-fill estimate per destination chain. Disabling fill no longer
+		//   disables the override path and vice versa.
+		let fill_enabled = config
 			.gas
 			.as_ref()
 			.map(|g| g.live_fill_estimate_enabled)
 			.unwrap_or(false);
 
-		if live_estimate_enabled {
+		let post_fill_enabled_for_chain = config
+			.gas
+			.as_ref()
+			.map(|g| g.live_post_fill_estimate_chain_ids.contains(&dest_chain_id))
+			.unwrap_or(false);
+
+		if fill_enabled {
 			match self
 				.build_fill_tx_for_quote(
 					request,
@@ -634,7 +711,12 @@ impl CostProfitService {
 					);
 				},
 			}
+		}
 
+		// Build the synthetic post-fill tx + override, then estimate.
+		// All branches log exactly ONE outcome event and yield Option<u64>.
+		// We never `return` — the rest of cost calc must run regardless.
+		let live_post_fill_units: Option<u64> = if post_fill_enabled_for_chain {
 			match self
 				.build_post_fill_tx_for_quote(
 					request,
@@ -644,35 +726,92 @@ impl CostProfitService {
 				)
 				.await
 			{
-				Ok(Some(post_fill_tx)) => {
-					if let Some(live_units) = self
-						.try_live_post_fill_estimate(dest_chain_id, &post_fill_tx)
-						.await
-					{
-						tracing::info!(
-							chain_id = dest_chain_id,
-							static_units = gas_units.post_fill_units,
-							live_units,
-							"Quote-time post-fill gas estimated live"
-						);
-						gas_units.post_fill_units = live_units;
-					}
-					// None ⇒ fall through with static units (helper logged the reason).
-				},
 				Ok(None) => {
+					// Hyperlane config absent / not required for this quote.
 					tracing::debug!(
 						chain_id = dest_chain_id,
-						"Skipping live post-fill estimate: no quote-time post-fill tx required"
+						outcome = post_fill_outcome::SKIPPED_DISABLED,
+						"post-fill gas estimate"
 					);
+					None
 				},
 				Err(e) => {
-					tracing::warn!(
+					tracing::info!(
 						chain_id = dest_chain_id,
+						outcome = post_fill_outcome::SKIPPED_BUILD_TX,
 						error = %e,
-						"Skipping live post-fill estimate: failed to build synthetic post-fill tx"
+						"post-fill gas estimate"
 					);
+					None
+				},
+				Ok(Some(pf)) => {
+					let settler_alloy =
+						alloy_primitives::Address::from_slice(&pf.output_settler.0);
+					let state_override = crate::engine::post_fill_overrides::build_post_fill_state_override(
+						settler_alloy,
+						pf.synthetic_order_id,
+						pf.output_hash,
+						pf.solver,
+						pf.fill_timestamp,
+					);
+					match self
+						.try_live_post_fill_estimate_with_overrides(
+							dest_chain_id,
+							&pf.tx,
+							state_override,
+						)
+						.await
+					{
+						PostFillEstimateOutcome::Success(live_units) => {
+							let static_units = gas_units.post_fill_units;
+							let delta_pct = ((live_units as i64 - static_units as i64) * 100)
+								.checked_div(static_units as i64)
+								.unwrap_or(0);
+							tracing::info!(
+								chain_id = dest_chain_id,
+								outcome = post_fill_outcome::SUCCESS,
+								static_units,
+								live_units,
+								delta_pct,
+								"post-fill gas estimate"
+							);
+							Some(live_units)
+						},
+						PostFillEstimateOutcome::FallbackZero => {
+							tracing::info!(
+								chain_id = dest_chain_id,
+								outcome = post_fill_outcome::FALLBACK_ZERO,
+								static_units = gas_units.post_fill_units,
+								"post-fill gas estimate"
+							);
+							None
+						},
+						PostFillEstimateOutcome::FallbackError(e) => {
+							tracing::info!(
+								chain_id = dest_chain_id,
+								outcome = post_fill_outcome::FALLBACK_ERROR,
+								static_units = gas_units.post_fill_units,
+								error = %e,
+								"post-fill gas estimate"
+							);
+							None
+						},
+					}
 				},
 			}
+		} else {
+			tracing::debug!(
+				chain_id = dest_chain_id,
+				outcome = post_fill_outcome::SKIPPED_UNSUPPORTED_CHAIN,
+				"post-fill gas estimate"
+			);
+			None
+		};
+
+		// Apply the live units if we got them; otherwise keep the static
+		// default. Either way, downstream cost calculation continues.
+		if let Some(live_units) = live_post_fill_units {
+			gas_units.post_fill_units = live_units;
 		}
 
 		// Parse inputs/outputs to proper types for cost calculation
@@ -1388,6 +1527,12 @@ impl CostProfitService {
 		}
 	}
 
+	// Retained for now as a reference / fallback hook. The override-bearing
+	// `try_live_post_fill_estimate_with_overrides` is the live path; per
+	// the plan (Task 4 Step 3) this bare variant is unreachable from the
+	// cost-profit pipeline and will be deleted once override rollout
+	// completes everywhere.
+	#[allow(dead_code)]
 	async fn try_live_post_fill_estimate(
 		&self,
 		dest_chain_id: u64,
@@ -1406,21 +1551,45 @@ impl CostProfitService {
 				);
 				Some(units)
 			},
+			// Demoted from WARN to DEBUG (plan Task 4 Step 5): when overrides
+			// are off and this bare path is reached, the always-revert is
+			// expected and shouldn't be log noise.
 			Ok(_) => {
-				tracing::warn!(
+				tracing::debug!(
 					chain_id = dest_chain_id,
 					"Live post-fill gas estimation returned zero; falling back to static default"
 				);
 				None
 			},
 			Err(e) => {
-				tracing::warn!(
+				tracing::debug!(
 					chain_id = dest_chain_id,
 					error = %e,
 					"Live post-fill gas estimation failed; falling back to static default"
 				);
 				None
 			},
+		}
+	}
+
+	/// Override-bearing variant of `try_live_post_fill_estimate`. The
+	/// caller is responsible for emitting exactly ONE structured outcome
+	/// event per call (see [`post_fill_outcome`]); this helper performs
+	/// no logging itself so outcome aggregation never double-counts.
+	async fn try_live_post_fill_estimate_with_overrides(
+		&self,
+		dest_chain_id: u64,
+		post_fill_tx: &Transaction,
+		state_override: alloy_rpc_types::state::StateOverride,
+	) -> PostFillEstimateOutcome {
+		match self
+			.delivery_service
+			.estimate_gas_with_overrides(dest_chain_id, post_fill_tx.clone(), state_override)
+			.await
+		{
+			Ok(units) if units > 0 => PostFillEstimateOutcome::Success(units),
+			Ok(_) => PostFillEstimateOutcome::FallbackZero,
+			Err(e) => PostFillEstimateOutcome::FallbackError(e),
 		}
 	}
 
@@ -1605,7 +1774,7 @@ impl CostProfitService {
 		resolved_amounts: &std::collections::HashMap<InteropAddress, TokenAmountInfo>,
 		config: &Config,
 		solver_address: &Address,
-	) -> Result<Option<Transaction>, APIError> {
+	) -> Result<Option<PostFillQuoteTx>, APIError> {
 		let Some(hyperlane_config) = hyperlane_config_for_quote(config) else {
 			return Ok(None);
 		};
@@ -1722,16 +1891,44 @@ impl CostProfitService {
 		let mut recipient = [0u8; 32];
 		recipient.copy_from_slice(recipient_bytes32.as_slice());
 
+		let synthetic_order_id_bytes: [u8; 32] = [0u8; 32];
+		let fill_timestamp = current_timestamp().min(u32::MAX as u64) as u32;
+
 		let fill_description = encode_quote_hyperlane_fill_description(
 			solver_identifier,
-			[0u8; 32],
-			current_timestamp().min(u32::MAX as u64) as u32,
+			synthetic_order_id_bytes,
+			fill_timestamp,
 			token,
 			amount,
 			recipient,
 			callback_data_bytes,
 			vec![],
 		)?;
+
+		// Reconstruct the same outputHash the OutputSettler will compute on-chain
+		// in `_isPayloadValid`:
+		//
+		//   keccak256(abi.encodePacked(
+		//       msg.sender (= output oracle, padded to bytes32),
+		//       address(this) (= output settler, padded to bytes32),
+		//       block.chainid (= dest_chain_id, as uint256),
+		//       payload[68:]  (= the FillDescription's common payload)
+		//   ))
+		//
+		// `payload[68:]` skips the 32-byte solver, 32-byte orderId, and 4-byte
+		// timestamp prefix; what remains is the common payload (token | amount
+		// | recipient | call_len | call | ctx_len | ctx). Computed here, before
+		// `fill_description` is consumed by `payloads`, to keep one allocation.
+		let oracle_padded = address20_to_bytes32(&oracle_address.0);
+		let settler_padded = address20_to_bytes32(&output_settler.0);
+		let common_payload = &fill_description[68..];
+		let mut hash_buf = Vec::with_capacity(32 + 32 + 32 + common_payload.len());
+		hash_buf.extend_from_slice(oracle_padded.as_slice());
+		hash_buf.extend_from_slice(settler_padded.as_slice());
+		hash_buf.extend_from_slice(&U256::from(dest_chain_id).to_be_bytes::<32>());
+		hash_buf.extend_from_slice(common_payload);
+		let output_hash = keccak256(&hash_buf);
+
 		let payloads = vec![fill_description];
 		let total_payload_size: usize = payloads.iter().map(|p| p.len()).sum();
 		let message_gas_limit = quote_hyperlane_message_gas_limit(total_payload_size);
@@ -1776,7 +1973,7 @@ impl CostProfitService {
 			payloads: payloads.into_iter().map(Into::into).collect(),
 		};
 
-		Ok(Some(Transaction {
+		let tx = Transaction {
 			to: Some(oracle_address),
 			data: call_data.abi_encode(),
 			value: gas_payment,
@@ -1786,6 +1983,15 @@ impl CostProfitService {
 			gas_price: None,
 			max_fee_per_gas: None,
 			max_priority_fee_per_gas: None,
+		};
+
+		Ok(Some(PostFillQuoteTx {
+			tx,
+			output_settler,
+			synthetic_order_id: B256::from(synthetic_order_id_bytes),
+			output_hash,
+			solver: B256::from(solver_identifier),
+			fill_timestamp,
 		}))
 	}
 
@@ -3199,6 +3405,7 @@ mod tests {
 				},
 			)]),
 			live_fill_estimate_enabled: true,
+			live_post_fill_estimate_chain_ids: std::collections::HashSet::new(),
 		});
 
 		let (open, fill, post_fill, pre_claim, claim) = estimate_gas_units_from_flow_keys(
@@ -3232,6 +3439,7 @@ mod tests {
 				},
 			)]),
 			live_fill_estimate_enabled: true,
+			live_post_fill_estimate_chain_ids: std::collections::HashSet::new(),
 		});
 
 		let (open, fill, post_fill, pre_claim, claim) = estimate_gas_units_from_flow_keys(
@@ -4964,6 +5172,7 @@ mod tests {
 				},
 			)]),
 			live_fill_estimate_enabled: false,
+			live_post_fill_estimate_chain_ids: std::collections::HashSet::new(),
 		});
 
 		let request = create_test_request(true);
@@ -5007,6 +5216,7 @@ mod tests {
 				},
 			)]),
 			live_fill_estimate_enabled: true,
+			live_post_fill_estimate_chain_ids: std::collections::HashSet::new(),
 		});
 
 		let request = create_test_request(true);
@@ -5052,9 +5262,15 @@ mod tests {
 
 	#[tokio::test]
 	async fn cost_context_uses_live_post_fill_units_when_enabled() {
+		// Updated for Task 4: post-fill now flows through the override path
+		// (`estimate_gas_with_overrides`) and is gated by
+		// `live_post_fill_estimate_chain_ids`, not by
+		// `live_fill_estimate_enabled`. Use the override-aware fixture, put
+		// dest_chain_id (137) in the set, and confirm live > static.
 		let live_units: u64 = 5_000_000;
-		let service = cost_profit_service_for_live_estimate(Some(live_units));
-		let mut config = config_for_live_estimate(true);
+		let (service, _override_calls, _bare_calls) =
+			cost_profit_service_for_post_fill_override(None, Some(live_units));
+		let mut config = config_for_live_estimate(false);
 		config.gas = Some(solver_config::GasConfig {
 			flows: HashMap::from([(
 				"permit2_escrow".to_string(),
@@ -5066,7 +5282,8 @@ mod tests {
 					claim: Some(0),
 				},
 			)]),
-			live_fill_estimate_enabled: true,
+			live_fill_estimate_enabled: false,
+			live_post_fill_estimate_chain_ids: std::collections::HashSet::from([137u64]),
 		});
 
 		let request = create_test_request(true);
@@ -5084,10 +5301,11 @@ mod tests {
 			.await
 			.expect("live-estimate cost context should compute");
 
-		let service_static = cost_profit_service_for_live_estimate(Some(live_units));
+		let (service_static, _, _) =
+			cost_profit_service_for_post_fill_override(None, Some(live_units));
 		let mut config_static = config.clone();
 		if let Some(g) = config_static.gas.as_mut() {
-			g.live_fill_estimate_enabled = false;
+			g.live_post_fill_estimate_chain_ids = std::collections::HashSet::new();
 		}
 		let ctx_static = service_static
 			.calculate_cost_context_for_flow_keys(
@@ -5126,6 +5344,7 @@ mod tests {
 				},
 			)]),
 			live_fill_estimate_enabled: true,
+			live_post_fill_estimate_chain_ids: std::collections::HashSet::new(),
 		});
 
 		let request = create_test_request(true);
@@ -5144,6 +5363,849 @@ mod tests {
 		assert!(
 			result.is_ok(),
 			"RPC failure during live estimate must not refuse a quote"
+		);
+	}
+
+	// --- Task 4 Step 6: post-fill override path tests ------------------------
+
+	/// Build a cost-profit service whose destination-chain mock answers
+	/// `estimate_gas` and `estimate_gas_with_overrides` independently. The
+	/// returned counters let tests assert the override path is (or is not)
+	/// exercised, which is how we tell `live_post_fill_estimate_chain_ids`
+	/// gating from a no-op.
+	fn cost_profit_service_for_post_fill_override(
+		fill_estimate_units: Option<u64>,
+		override_estimate_units: Option<u64>,
+	) -> (
+		CostProfitService,
+		std::sync::Arc<std::sync::atomic::AtomicUsize>,
+		std::sync::Arc<std::sync::atomic::AtomicUsize>,
+	) {
+		use std::sync::atomic::{AtomicUsize, Ordering};
+		use std::sync::Arc;
+
+		let mut mock_pricing = MockPricingInterface::new();
+		mock_pricing
+			.expect_convert_asset()
+			.returning(|from, to, amount| {
+				let from = from.to_string();
+				let to = to.to_string();
+				let amount_f64: f64 = amount.parse().unwrap_or(0.0);
+				Box::pin(async move {
+					match (from.as_str(), to.as_str()) {
+						("ETH", "USD") => Ok((amount_f64 * ETH_USD_PRICE).to_string()),
+						("USD", "ETH") => Ok((amount_f64 / ETH_USD_PRICE).to_string()),
+						("USDC", "USD") => Ok((amount_f64 * USDC_USD_PRICE).to_string()),
+						("USD", "USDC") => Ok((amount_f64 / USDC_USD_PRICE).to_string()),
+						_ => Ok("1.0".to_string()),
+					}
+				})
+			});
+		mock_pricing
+			.expect_wei_to_currency()
+			.returning(|wei_str, _| {
+				let wei = wei_str.parse::<u128>().unwrap_or(0);
+				let usd = (wei as f64) / 1e18;
+				Box::pin(async move { Ok(usd.to_string()) })
+			});
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
+
+		let mut mock_origin = MockDeliveryInterface::new();
+		mock_origin.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+		mock_origin
+			.expect_get_gas_price()
+			.returning(|_| Box::pin(async move { Ok("20000000000".to_string()) }));
+		mock_origin
+			.expect_get_block_number()
+			.returning(|_| Box::pin(async move { Ok(12345u64) }));
+
+		let mut mock_dest = MockDeliveryInterface::new();
+		mock_dest.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+		mock_dest
+			.expect_get_gas_price()
+			.returning(|_| Box::pin(async move { Ok("20000000000".to_string()) }));
+		mock_dest
+			.expect_get_block_number()
+			.returning(|_| Box::pin(async move { Ok(12345u64) }));
+		mock_dest.expect_eth_call().returning(|_| {
+			Box::pin(async move {
+				Ok(alloy_primitives::Bytes::from(
+					U256::from(1u64).to_be_bytes::<32>().to_vec(),
+				))
+			})
+		});
+
+		let bare_calls = Arc::new(AtomicUsize::new(0));
+		let bare_calls_for_mock = bare_calls.clone();
+		let fill_units_for_mock = fill_estimate_units;
+		mock_dest.expect_estimate_gas().returning(move |_| {
+			bare_calls_for_mock.fetch_add(1, Ordering::SeqCst);
+			let r = fill_units_for_mock;
+			Box::pin(async move {
+				match r {
+					Some(units) => Ok(units),
+					None => Err(solver_delivery::DeliveryError::Network(
+						"simulated rpc error".into(),
+					)),
+				}
+			})
+		});
+
+		let override_calls = Arc::new(AtomicUsize::new(0));
+		let override_calls_for_mock = override_calls.clone();
+		let override_units_for_mock = override_estimate_units;
+		mock_dest
+			.expect_estimate_gas_with_overrides()
+			.returning(move |_, _| {
+				override_calls_for_mock.fetch_add(1, Ordering::SeqCst);
+				let r = override_units_for_mock;
+				Box::pin(async move {
+					match r {
+						Some(units) => Ok(units),
+						None => Err(solver_delivery::DeliveryError::Network(
+							"simulated override rpc error".into(),
+						)),
+					}
+				})
+			});
+
+		let mut delivery_implementations = HashMap::new();
+		delivery_implementations.insert(
+			1,
+			Arc::new(mock_origin) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		delivery_implementations.insert(
+			137,
+			Arc::new(mock_dest) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 1, 3600, 60));
+
+		let mut networks = solver_types::NetworksConfig::new();
+		networks.insert(
+			1,
+			solver_types::NetworkConfig {
+				name: Some("ethereum".to_string()),
+				network_type: solver_types::networks::NetworkType::Parent,
+				rpc_urls: vec![],
+				input_settler_address: solver_types::Address([0x11; 20].to_vec()),
+				output_settler_address: solver_types::Address([0x22; 20].to_vec()),
+				tokens: vec![solver_types::TokenConfig {
+					address: solver_types::Address(
+						[
+							0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C,
+							0x5C, 0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+						]
+						.to_vec(),
+					),
+					decimals: 18,
+					symbol: "ETH".to_string(),
+					name: Some("Ether".to_string()),
+				}],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		networks.insert(
+			137,
+			solver_types::NetworkConfig {
+				name: Some("polygon".to_string()),
+				network_type: solver_types::networks::NetworkType::Hub,
+				rpc_urls: vec![],
+				input_settler_address: solver_types::Address([0x11; 20].to_vec()),
+				output_settler_address: solver_types::Address([0x22; 20].to_vec()),
+				tokens: vec![solver_types::TokenConfig {
+					address: solver_types::Address(
+						[
+							0xB0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C,
+							0x5C, 0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+						]
+						.to_vec(),
+					),
+					decimals: 6,
+					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
+				}],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		let token_manager = Arc::new(TokenManager::new(
+			networks,
+			delivery.clone(),
+			create_mock_account_service(),
+		));
+
+		let storage = Arc::new(StorageService::new(Box::new(MockStorageInterface::new())));
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		(service, override_calls, bare_calls)
+	}
+
+	#[tokio::test]
+	async fn cost_context_uses_overrides_when_flag_enabled() {
+		// Override path returns concrete units; bare path errors. With chain
+		// 137 enabled in `live_post_fill_estimate_chain_ids` the override
+		// must run, return Ok, and apply to gas_units.post_fill_units (so
+		// gas_post_fill USD must be larger than the all-static baseline).
+		let live_units: u64 = 5_000_000;
+		let (service, override_calls, _bare_calls) =
+			cost_profit_service_for_post_fill_override(None, Some(live_units));
+		let mut config = config_for_live_estimate(false);
+		config.gas = Some(solver_config::GasConfig {
+			flows: HashMap::from([(
+				"permit2_escrow".to_string(),
+				solver_config::GasFlowUnits {
+					open: Some(0),
+					fill: Some(0),
+					post_fill: Some(50_000),
+					pre_claim: Some(0),
+					claim: Some(0),
+				},
+			)]),
+			live_fill_estimate_enabled: false,
+			live_post_fill_estimate_chain_ids: std::collections::HashSet::from([137u64]),
+		});
+
+		let request = create_test_request(true);
+		let context = create_test_validated_context(true);
+		let solver = Address([0xAB; 20].to_vec());
+
+		let ctx_live = service
+			.calculate_cost_context_for_flow_keys(
+				&request,
+				&context,
+				&config,
+				&["permit2_escrow".to_string()],
+				&solver,
+			)
+			.await
+			.expect("override-based cost context should compute");
+
+		assert!(
+			override_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+			"override path must be exercised when chain is enabled"
+		);
+
+		// Compare against a static-only baseline.
+		let (service_static, override_calls_static, _) =
+			cost_profit_service_for_post_fill_override(None, Some(live_units));
+		let mut config_static = config.clone();
+		if let Some(g) = config_static.gas.as_mut() {
+			g.live_post_fill_estimate_chain_ids = std::collections::HashSet::new();
+		}
+		let ctx_static = service_static
+			.calculate_cost_context_for_flow_keys(
+				&request,
+				&context,
+				&config_static,
+				&["permit2_escrow".to_string()],
+				&solver,
+			)
+			.await
+			.expect("static-only cost context should compute");
+
+		assert_eq!(
+			override_calls_static.load(std::sync::atomic::Ordering::SeqCst),
+			0,
+			"override path must NOT run when chain is excluded from the set"
+		);
+		assert!(
+			ctx_live.cost_breakdown.gas_post_fill > ctx_static.cost_breakdown.gas_post_fill,
+			"live override gas_post_fill ({}) should exceed static gas_post_fill ({}) by ~100×",
+			ctx_live.cost_breakdown.gas_post_fill,
+			ctx_static.cost_breakdown.gas_post_fill,
+		);
+	}
+
+	#[tokio::test]
+	async fn cost_context_skips_post_fill_estimate_when_chain_not_enabled() {
+		// Empty chain set → override path never invoked. Mock counter must
+		// stay at zero, and the static post_fill default must drive the
+		// gas_post_fill figure.
+		let (service, override_calls, _bare_calls) =
+			cost_profit_service_for_post_fill_override(None, Some(9_999_999));
+		let mut config = config_for_live_estimate(false);
+		config.gas = Some(solver_config::GasConfig {
+			flows: HashMap::from([(
+				"permit2_escrow".to_string(),
+				solver_config::GasFlowUnits {
+					open: Some(0),
+					fill: Some(0),
+					post_fill: Some(50_000),
+					pre_claim: Some(0),
+					claim: Some(0),
+				},
+			)]),
+			live_fill_estimate_enabled: false,
+			live_post_fill_estimate_chain_ids: std::collections::HashSet::new(),
+		});
+
+		let request = create_test_request(true);
+		let context = create_test_validated_context(true);
+		let solver = Address([0xAB; 20].to_vec());
+
+		let result = service
+			.calculate_cost_context_for_flow_keys(
+				&request,
+				&context,
+				&config,
+				&["permit2_escrow".to_string()],
+				&solver,
+			)
+			.await;
+		assert!(result.is_ok(), "skip path must not refuse a quote");
+		assert_eq!(
+			override_calls.load(std::sync::atomic::Ordering::SeqCst),
+			0,
+			"override path must NOT be invoked when dest_chain_id is not in the set"
+		);
+	}
+
+	#[tokio::test]
+	async fn cost_context_falls_back_on_override_error() {
+		// Chain enabled but override RPC errors. We must NOT panic and must
+		// NOT log a WARN — the call site emits an info-level
+		// outcome=fallback_error event and downstream cost calc continues
+		// against the static post_fill default.
+		let (service, override_calls, _bare_calls) =
+			cost_profit_service_for_post_fill_override(None, None);
+		let mut config = config_for_live_estimate(false);
+		config.gas = Some(solver_config::GasConfig {
+			flows: HashMap::from([(
+				"permit2_escrow".to_string(),
+				solver_config::GasFlowUnits {
+					open: Some(0),
+					fill: Some(0),
+					post_fill: Some(50_000),
+					pre_claim: Some(0),
+					claim: Some(0),
+				},
+			)]),
+			live_fill_estimate_enabled: false,
+			live_post_fill_estimate_chain_ids: std::collections::HashSet::from([137u64]),
+		});
+
+		let request = create_test_request(true);
+		let context = create_test_validated_context(true);
+		let solver = Address([0xAB; 20].to_vec());
+
+		let result = service
+			.calculate_cost_context_for_flow_keys(
+				&request,
+				&context,
+				&config,
+				&["permit2_escrow".to_string()],
+				&solver,
+			)
+			.await;
+		assert!(
+			result.is_ok(),
+			"override RPC failure must not refuse a quote"
+		);
+		assert!(
+			override_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+			"override path must be attempted exactly once"
+		);
+	}
+
+	#[tokio::test]
+	async fn cost_context_fill_and_post_fill_flags_independent() {
+		// Bonus (Task 4 Step 0 invariant): with `live_fill_estimate_enabled =
+		// false` AND chain 137 in `live_post_fill_estimate_chain_ids`, the
+		// override path still runs (proving they are gated independently).
+		let (service, override_calls, bare_calls) =
+			cost_profit_service_for_post_fill_override(Some(7_777), Some(8_888));
+		let mut config = config_for_live_estimate(false);
+		config.gas = Some(solver_config::GasConfig {
+			flows: HashMap::from([(
+				"permit2_escrow".to_string(),
+				solver_config::GasFlowUnits {
+					open: Some(0),
+					fill: Some(50_000),
+					post_fill: Some(50_000),
+					pre_claim: Some(0),
+					claim: Some(0),
+				},
+			)]),
+			live_fill_estimate_enabled: false,
+			live_post_fill_estimate_chain_ids: std::collections::HashSet::from([137u64]),
+		});
+
+		let request = create_test_request(true);
+		let context = create_test_validated_context(true);
+		let solver = Address([0xAB; 20].to_vec());
+
+		let _ = service
+			.calculate_cost_context_for_flow_keys(
+				&request,
+				&context,
+				&config,
+				&["permit2_escrow".to_string()],
+				&solver,
+			)
+			.await
+			.expect("independent-gate cost context should compute");
+
+		assert!(
+			override_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+			"post-fill override must run even when fill flag is off"
+		);
+		assert_eq!(
+			bare_calls.load(std::sync::atomic::Ordering::SeqCst),
+			0,
+			"bare estimate_gas must NOT run when fill flag is off"
+		);
+	}
+
+	// --- Task 7 Step 2b: single-emit telemetry regression test --------------
+
+	/// Captured snapshot of one `tracing::Event`. We only need
+	/// string-equal lookups on a single field (`outcome`), so a flat
+	/// `Display`-formatted map is sufficient — no need to depend on the
+	/// `tracing-test` crate.
+	#[derive(Clone, Debug)]
+	struct CapturedEvent {
+		#[allow(dead_code)] // surfaced via `{:?}` in assertion failure messages
+		level: tracing::Level,
+		fields: std::collections::HashMap<String, String>,
+		message: String,
+	}
+
+	struct FieldVisitor<'a>(&'a mut CapturedEvent);
+
+	impl tracing::field::Visit for FieldVisitor<'_> {
+		fn record_str(&mut self, field: &tracing::field::Field, value: &::std::primitive::str) {
+			if field.name() == "message" {
+				self.0.message = value.to_string();
+			} else {
+				self.0.fields.insert(field.name().to_string(), value.to_string());
+			}
+		}
+
+		fn record_debug(
+			&mut self,
+			field: &tracing::field::Field,
+			value: &dyn ::std::fmt::Debug,
+		) {
+			let formatted = format!("{:?}", value);
+			// `tracing` formats string literals via `record_debug` with
+			// surrounding quotes — strip them so equality with `"success"`
+			// works without callers having to know the encoding.
+			let cleaned = formatted.trim_matches('"').to_string();
+			if field.name() == "message" {
+				self.0.message = cleaned;
+			} else {
+				self.0.fields.insert(field.name().to_string(), cleaned);
+			}
+		}
+
+		fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+			self.0.fields.insert(field.name().to_string(), value.to_string());
+		}
+
+		fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+			self.0.fields.insert(field.name().to_string(), value.to_string());
+		}
+
+		fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+			self.0.fields.insert(field.name().to_string(), value.to_string());
+		}
+	}
+
+	thread_local! {
+		/// Per-thread sink for events the capturing subscriber emits. The
+		/// global subscriber pushes here unconditionally; tests drain this
+		/// sink at known points. Per-thread isolation means parallel
+		/// `cargo test` runners don't see each other's events.
+		static CAPTURED_EVENTS: ::std::cell::RefCell<Vec<CapturedEvent>> =
+			::std::cell::RefCell::new(Vec::new());
+	}
+
+	/// Process-wide subscriber that funnels every `tracing::Event` into
+	/// the calling thread's `CAPTURED_EVENTS` sink. Installed exactly once
+	/// per test process via `set_global_default` (see
+	/// `install_global_capture()`); after that, all `tracing::*` macros
+	/// route through it regardless of thread.
+	struct GlobalCapturingSubscriber;
+
+	impl tracing::Subscriber for GlobalCapturingSubscriber {
+		fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+			true
+		}
+
+		fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+			// Spans are unused by these tests; return a stub id. Reuse a
+			// fixed nonzero id since `Id::from_u64` requires nonzero.
+			tracing::span::Id::from_u64(1)
+		}
+
+		fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+		fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+		fn enter(&self, _span: &tracing::span::Id) {}
+		fn exit(&self, _span: &tracing::span::Id) {}
+
+		fn event(&self, event: &tracing::Event<'_>) {
+			let mut captured = CapturedEvent {
+				level: *event.metadata().level(),
+				fields: std::collections::HashMap::new(),
+				message: String::new(),
+			};
+			let mut visitor = FieldVisitor(&mut captured);
+			event.record(&mut visitor);
+			CAPTURED_EVENTS.with(|cell| cell.borrow_mut().push(captured));
+		}
+	}
+
+	fn install_global_capture() {
+		use std::sync::Once;
+		static INIT: Once = Once::new();
+		INIT.call_once(|| {
+			// `set_global_default` can only succeed once per process. If a
+			// global default was already installed elsewhere (shouldn't
+			// happen in unit tests, but be defensive), we fall back to a
+			// no-op — the test will fail with a clear assertion message.
+			let _ = tracing::subscriber::set_global_default(GlobalCapturingSubscriber);
+		});
+	}
+
+	/// Drain the per-thread event sink, run `f`, and return only the
+	/// `"post-fill gas estimate"` events emitted on this thread during the
+	/// closure. Filtering by message string keeps this test focused on
+	/// the post-fill telemetry contract.
+	async fn capture_post_fill_events<F, Fut>(f: F) -> Vec<CapturedEvent>
+	where
+		F: FnOnce() -> Fut,
+		Fut: ::std::future::Future<Output = ()>,
+	{
+		install_global_capture();
+		// Drain anything carried over from a prior test on this thread —
+		// `cargo test` reuses worker threads, so an earlier test's events
+		// can still sit in the sink.
+		CAPTURED_EVENTS.with(|cell| cell.borrow_mut().clear());
+		f().await;
+		let captured = CAPTURED_EVENTS.with(|cell| cell.borrow_mut().drain(..).collect::<Vec<_>>());
+		captured
+			.into_iter()
+			.filter(|e| e.message == "post-fill gas estimate")
+			.collect()
+	}
+
+	/// Build a config like `config_for_live_estimate(false)` but with the
+	/// Hyperlane settlement entry **omitted**. `hyperlane_config_for_quote`
+	/// returns `None`, the build helper returns `Ok(None)`, and the call
+	/// site logs `outcome=skipped_disabled`.
+	fn config_without_hyperlane_for_post_fill(dest_chain_in_set: bool) -> Config {
+		let mut config = config_for_live_estimate(false);
+		// Wipe the hyperlane implementation so `hyperlane_config_for_quote`
+		// has no oracles to read. Keep `primary` pointing at "hyperlane"
+		// so the lookup miss is via the implementations map, not the
+		// fallback alias.
+		config.settlement.implementations.clear();
+		config.settlement.primary = "hyperlane".to_string();
+		config.gas = Some(solver_config::GasConfig {
+			flows: HashMap::from([(
+				"permit2_escrow".to_string(),
+				solver_config::GasFlowUnits {
+					open: Some(0),
+					fill: Some(0),
+					post_fill: Some(50_000),
+					pre_claim: Some(0),
+					claim: Some(0),
+				},
+			)]),
+			live_fill_estimate_enabled: false,
+			live_post_fill_estimate_chain_ids: if dest_chain_in_set {
+				std::collections::HashSet::from([137u64])
+			} else {
+				std::collections::HashSet::new()
+			},
+		});
+		config
+	}
+
+	/// Like `config_for_live_estimate(false)` but with chain 137 dropped
+	/// from `config.networks`. `build_post_fill_tx_for_quote` then errors
+	/// at the `Network <id> not configured` branch and the call site
+	/// emits `outcome=skipped_build_tx`.
+	///
+	/// The upstream cost calc still resolves because `calculate_swap_amounts`
+	/// reads token info via the `TokenManager`, which carries its own
+	/// per-test networks — `config.networks` is only consulted by the
+	/// post-fill builder.
+	fn config_missing_dest_network_for_post_fill() -> Config {
+		let mut config = config_for_live_estimate(false);
+		config.networks.remove(&137);
+		config.gas = Some(solver_config::GasConfig {
+			flows: HashMap::from([(
+				"permit2_escrow".to_string(),
+				solver_config::GasFlowUnits {
+					open: Some(0),
+					fill: Some(0),
+					post_fill: Some(50_000),
+					pre_claim: Some(0),
+					claim: Some(0),
+				},
+			)]),
+			live_fill_estimate_enabled: false,
+			live_post_fill_estimate_chain_ids: std::collections::HashSet::from([137u64]),
+		});
+		config
+	}
+
+	fn gas_config_post_fill(chain_in_set: bool) -> solver_config::GasConfig {
+		solver_config::GasConfig {
+			flows: HashMap::from([(
+				"permit2_escrow".to_string(),
+				solver_config::GasFlowUnits {
+					open: Some(0),
+					fill: Some(0),
+					post_fill: Some(50_000),
+					pre_claim: Some(0),
+					claim: Some(0),
+				},
+			)]),
+			live_fill_estimate_enabled: false,
+			live_post_fill_estimate_chain_ids: if chain_in_set {
+				std::collections::HashSet::from([137u64])
+			} else {
+				std::collections::HashSet::new()
+			},
+		}
+	}
+
+	#[tokio::test]
+	async fn each_post_fill_branch_emits_exactly_one_outcome_event() {
+		// One outcome value per case. Six cases, six branches. For each, we
+		// run `calculate_cost_context_for_flow_keys` under a capturing
+		// subscriber and assert:
+		//   (a) exactly one `"post-fill gas estimate"` event was emitted, AND
+		//   (b) its `outcome` field equals the expected discriminator.
+		// (a) is the single-emit invariant; (b) is the routing correctness.
+		use post_fill_outcome::*;
+
+		let request = create_test_request(true);
+		let context = create_test_validated_context(true);
+		let solver = Address([0xAB; 20].to_vec());
+
+		// Case 1: SKIPPED_UNSUPPORTED_CHAIN — chain 137 absent from the set.
+		let captured = capture_post_fill_events(|| {
+			let request = request.clone();
+			let context = context.clone();
+			let solver = solver.clone();
+			async move {
+				let (service, _, _) =
+					cost_profit_service_for_post_fill_override(None, Some(5_000_000));
+				let mut config = config_for_live_estimate(false);
+				config.gas = Some(gas_config_post_fill(false));
+				let _ = service
+					.calculate_cost_context_for_flow_keys(
+						&request,
+						&context,
+						&config,
+						&["permit2_escrow".to_string()],
+						&solver,
+					)
+					.await
+					.expect("cost context should compute");
+			}
+		})
+		.await;
+		assert_eq!(
+			captured.len(),
+			1,
+			"SKIPPED_UNSUPPORTED_CHAIN must emit exactly one event, got {captured:#?}"
+		);
+		assert_eq!(
+			captured[0].fields.get("outcome").map(|s| s.as_str()),
+			Some(SKIPPED_UNSUPPORTED_CHAIN),
+			"outcome field mismatch: {captured:#?}",
+		);
+
+		// Case 2: SKIPPED_DISABLED — chain enabled, hyperlane impl absent.
+		let captured = capture_post_fill_events(|| {
+			let request = request.clone();
+			let context = context.clone();
+			let solver = solver.clone();
+			async move {
+				let (service, _, _) =
+					cost_profit_service_for_post_fill_override(None, Some(5_000_000));
+				let config = config_without_hyperlane_for_post_fill(true);
+				let _ = service
+					.calculate_cost_context_for_flow_keys(
+						&request,
+						&context,
+						&config,
+						&["permit2_escrow".to_string()],
+						&solver,
+					)
+					.await
+					.expect("cost context should compute");
+			}
+		})
+		.await;
+		assert_eq!(
+			captured.len(),
+			1,
+			"SKIPPED_DISABLED must emit exactly one event, got {captured:#?}"
+		);
+		assert_eq!(
+			captured[0].fields.get("outcome").map(|s| s.as_str()),
+			Some(SKIPPED_DISABLED),
+			"outcome field mismatch: {captured:#?}",
+		);
+
+		// Case 3: SKIPPED_BUILD_TX — chain enabled, but dest network missing
+		// from `config.networks` so `build_post_fill_tx_for_quote` errors.
+		let captured = capture_post_fill_events(|| {
+			let request = request.clone();
+			let context = context.clone();
+			let solver = solver.clone();
+			async move {
+				let (service, _, _) =
+					cost_profit_service_for_post_fill_override(None, Some(5_000_000));
+				let config = config_missing_dest_network_for_post_fill();
+				let _ = service
+					.calculate_cost_context_for_flow_keys(
+						&request,
+						&context,
+						&config,
+						&["permit2_escrow".to_string()],
+						&solver,
+					)
+					.await
+					.expect("cost context should compute");
+			}
+		})
+		.await;
+		assert_eq!(
+			captured.len(),
+			1,
+			"SKIPPED_BUILD_TX must emit exactly one event, got {captured:#?}"
+		);
+		assert_eq!(
+			captured[0].fields.get("outcome").map(|s| s.as_str()),
+			Some(SKIPPED_BUILD_TX),
+			"outcome field mismatch: {captured:#?}",
+		);
+
+		// Case 4: FALLBACK_ZERO — override returns Ok(0).
+		let captured = capture_post_fill_events(|| {
+			let request = request.clone();
+			let context = context.clone();
+			let solver = solver.clone();
+			async move {
+				let (service, _, _) =
+					cost_profit_service_for_post_fill_override(None, Some(0));
+				let mut config = config_for_live_estimate(false);
+				config.gas = Some(gas_config_post_fill(true));
+				let _ = service
+					.calculate_cost_context_for_flow_keys(
+						&request,
+						&context,
+						&config,
+						&["permit2_escrow".to_string()],
+						&solver,
+					)
+					.await
+					.expect("cost context should compute");
+			}
+		})
+		.await;
+		assert_eq!(
+			captured.len(),
+			1,
+			"FALLBACK_ZERO must emit exactly one event, got {captured:#?}"
+		);
+		assert_eq!(
+			captured[0].fields.get("outcome").map(|s| s.as_str()),
+			Some(FALLBACK_ZERO),
+			"outcome field mismatch: {captured:#?}",
+		);
+
+		// Case 5: FALLBACK_ERROR — override returns Err.
+		let captured = capture_post_fill_events(|| {
+			let request = request.clone();
+			let context = context.clone();
+			let solver = solver.clone();
+			async move {
+				let (service, _, _) =
+					cost_profit_service_for_post_fill_override(None, None);
+				let mut config = config_for_live_estimate(false);
+				config.gas = Some(gas_config_post_fill(true));
+				let _ = service
+					.calculate_cost_context_for_flow_keys(
+						&request,
+						&context,
+						&config,
+						&["permit2_escrow".to_string()],
+						&solver,
+					)
+					.await
+					.expect("cost context should compute");
+			}
+		})
+		.await;
+		assert_eq!(
+			captured.len(),
+			1,
+			"FALLBACK_ERROR must emit exactly one event, got {captured:#?}"
+		);
+		assert_eq!(
+			captured[0].fields.get("outcome").map(|s| s.as_str()),
+			Some(FALLBACK_ERROR),
+			"outcome field mismatch: {captured:#?}",
+		);
+
+		// Case 6: SUCCESS — override returns Ok(units > 0).
+		let captured = capture_post_fill_events(|| {
+			let request = request.clone();
+			let context = context.clone();
+			let solver = solver.clone();
+			async move {
+				let (service, _, _) =
+					cost_profit_service_for_post_fill_override(None, Some(5_000_000));
+				let mut config = config_for_live_estimate(false);
+				config.gas = Some(gas_config_post_fill(true));
+				let _ = service
+					.calculate_cost_context_for_flow_keys(
+						&request,
+						&context,
+						&config,
+						&["permit2_escrow".to_string()],
+						&solver,
+					)
+					.await
+					.expect("cost context should compute");
+			}
+		})
+		.await;
+		assert_eq!(
+			captured.len(),
+			1,
+			"SUCCESS must emit exactly one event, got {captured:#?}"
+		);
+		assert_eq!(
+			captured[0].fields.get("outcome").map(|s| s.as_str()),
+			Some(SUCCESS),
+			"outcome field mismatch: {captured:#?}",
+		);
+		// Bonus: SUCCESS branch must also surface the live_units / static_units
+		// pair we promised dashboards. If a refactor drops them the test
+		// fails loudly here.
+		assert!(
+			captured[0].fields.contains_key("live_units"),
+			"SUCCESS event must include live_units; got {:?}",
+			captured[0].fields,
+		);
+		assert!(
+			captured[0].fields.contains_key("static_units"),
+			"SUCCESS event must include static_units; got {:?}",
+			captured[0].fields,
 		);
 	}
 
@@ -5365,6 +6427,7 @@ mod tests {
 				},
 			)]),
 			live_fill_estimate_enabled: true,
+			live_post_fill_estimate_chain_ids: std::collections::HashSet::new(),
 		});
 
 		let request = create_test_request(true);

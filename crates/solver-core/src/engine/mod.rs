@@ -8,6 +8,7 @@ pub mod context;
 pub mod cost_profit;
 pub mod event_bus;
 pub mod lifecycle;
+pub mod post_fill_overrides;
 pub mod token_manager;
 
 use self::{cost_profit::CostProfitService, token_manager::TokenManager};

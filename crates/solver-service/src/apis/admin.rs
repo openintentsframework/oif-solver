@@ -524,6 +524,11 @@ pub async fn handle_update_gas(
 	operator_config.gas.eip3009_escrow.post_fill = request.eip3009_escrow_post_fill;
 	operator_config.gas.eip3009_escrow.pre_claim = request.eip3009_escrow_pre_claim;
 	operator_config.gas.eip3009_escrow.claim = request.eip3009_escrow_claim;
+	operator_config.gas.live_post_fill_estimate_chain_ids = request
+		.live_post_fill_estimate_chain_ids
+		.iter()
+		.copied()
+		.collect();
 
 	let new_versioned = state
 		.config_store
@@ -1371,7 +1376,7 @@ mod tests {
 		OperatorPricingConfig, OperatorRpcEndpoint, OperatorSettlementConfig,
 		OperatorSettlementType, OperatorSolverConfig, OperatorWithdrawalsConfig,
 	};
-	use std::collections::HashMap;
+	use std::collections::{HashMap, HashSet};
 	use std::str::FromStr;
 
 	#[test]
@@ -1656,6 +1661,7 @@ mod tests {
 				permit2_escrow: OperatorGasFlowUnits::default(),
 				eip3009_escrow: OperatorGasFlowUnits::default(),
 				live_fill_estimate_enabled: true,
+				live_post_fill_estimate_chain_ids: HashSet::new(),
 			},
 			pricing: OperatorPricingConfig {
 				primary: "coingecko".to_string(),
@@ -2758,6 +2764,7 @@ mod tests {
 				claim: 170_000,
 			},
 			live_fill_estimate_enabled: true,
+			live_post_fill_estimate_chain_ids: HashSet::new(),
 		};
 
 		let response = gas_config_response(&gas_config);

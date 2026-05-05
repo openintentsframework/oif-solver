@@ -459,7 +459,24 @@ pub fn merge_to_operator_config(
 				pre_claim: seed.defaults.gas_eip3009_escrow.pre_claim,
 				claim: seed.defaults.gas_eip3009_escrow.claim,
 			},
-			live_fill_estimate_enabled: true,
+			// Prefer the bootstrap-config override; fall back to seed defaults.
+			// This lets operators seed `live_post_fill_estimate_chain_ids` at
+			// boot directly from their bootstrap JSON instead of requiring an
+			// admin EIP-712 call after startup.
+			live_fill_estimate_enabled: initializer
+				.live_fill_estimate_enabled
+				.unwrap_or(seed.defaults.live_fill_estimate_enabled),
+			live_post_fill_estimate_chain_ids: initializer
+				.live_post_fill_estimate_chain_ids
+				.as_deref()
+				.map(|ids| ids.iter().copied().collect())
+				.unwrap_or_else(|| {
+					seed.defaults
+						.live_post_fill_estimate_chain_ids
+						.iter()
+						.copied()
+						.collect()
+				}),
 		},
 		pricing: OperatorPricingConfig {
 			primary: seed.defaults.pricing_primary.to_string(),
@@ -1917,6 +1934,7 @@ fn build_gas_config_from_operator(gas: &OperatorGasConfig) -> GasConfig {
 	GasConfig {
 		flows,
 		live_fill_estimate_enabled: gas.live_fill_estimate_enabled,
+		live_post_fill_estimate_chain_ids: gas.live_post_fill_estimate_chain_ids.clone(),
 	}
 }
 
@@ -2216,12 +2234,14 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 				})
 				.unwrap_or_default(),
 			live_fill_estimate_enabled: g.live_fill_estimate_enabled,
+			live_post_fill_estimate_chain_ids: g.live_post_fill_estimate_chain_ids.clone(),
 		})
 		.unwrap_or(OperatorGasConfig {
 			resource_lock: OperatorGasFlowUnits::default(),
 			permit2_escrow: OperatorGasFlowUnits::default(),
 			eip3009_escrow: OperatorGasFlowUnits::default(),
 			live_fill_estimate_enabled: true,
+			live_post_fill_estimate_chain_ids: HashSet::new(),
 		});
 
 	// Extract pricing config
@@ -3197,7 +3217,52 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		}
+	}
+
+	#[test]
+	fn bootstrap_config_overrides_live_post_fill_estimate_chain_ids() {
+		// Verify the bootstrap-config path: when SeedOverrides supplies the
+		// chain-ids set, merge_to_operator_config uses it instead of falling
+		// back to SeedDefaults (currently empty by default).
+		let mut overrides = test_seed_overrides();
+		overrides.live_post_fill_estimate_chain_ids = Some(vec![11155420, 84532]);
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).expect("build ok");
+
+		// HashSet — any order is fine; both must be present.
+		assert!(op_config
+			.gas
+			.live_post_fill_estimate_chain_ids
+			.contains(&11155420));
+		assert!(op_config
+			.gas
+			.live_post_fill_estimate_chain_ids
+			.contains(&84532));
+		assert_eq!(op_config.gas.live_post_fill_estimate_chain_ids.len(), 2);
+	}
+
+	#[test]
+	fn bootstrap_config_falls_back_to_seed_default_when_chain_ids_omitted() {
+		// When the bootstrap config doesn't set the field, the seed default
+		// applies (currently `&[]` in COMMON_DEFAULTS — empty set).
+		let overrides = test_seed_overrides();
+		assert!(overrides.live_post_fill_estimate_chain_ids.is_none());
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).expect("build ok");
+		assert!(op_config.gas.live_post_fill_estimate_chain_ids.is_empty());
+	}
+
+	#[test]
+	fn bootstrap_config_overrides_live_fill_estimate_enabled() {
+		// Verify `live_fill_estimate_enabled` can also be controlled at boot.
+		let mut overrides = test_seed_overrides();
+		overrides.live_fill_estimate_enabled = Some(false);
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).expect("build ok");
+		assert!(!op_config.gas.live_fill_estimate_enabled);
 	}
 
 	#[test]
@@ -3311,6 +3376,8 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -3368,6 +3435,8 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -3419,6 +3488,8 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -3461,6 +3532,8 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -3549,6 +3622,8 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -3768,6 +3843,8 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -3831,6 +3908,8 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -3919,6 +3998,8 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -3982,6 +4063,8 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -4051,6 +4134,8 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -4170,6 +4255,8 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -4299,6 +4386,8 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4366,6 +4455,8 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4427,6 +4518,8 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4523,6 +4616,8 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4628,6 +4723,8 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4792,6 +4889,8 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4928,6 +5027,8 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5028,6 +5129,8 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5150,6 +5253,8 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5303,6 +5408,8 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -5347,6 +5454,8 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -5405,6 +5514,8 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -5456,6 +5567,8 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -5524,6 +5637,8 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -5630,6 +5745,7 @@ mod tests {
 				permit2_escrow: OperatorGasFlowUnits::default(),
 				eip3009_escrow: OperatorGasFlowUnits::default(),
 				live_fill_estimate_enabled: true,
+				live_post_fill_estimate_chain_ids: HashSet::new(),
 			},
 			pricing: OperatorPricingConfig {
 				primary: "coingecko".to_string(),
@@ -5946,6 +6062,7 @@ mod tests {
 				claim: 900,
 			},
 			live_fill_estimate_enabled: true,
+			live_post_fill_estimate_chain_ids: HashSet::new(),
 		};
 
 		let gas = build_gas_config_from_operator(&op_gas);
@@ -6383,6 +6500,8 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
 		};
 
 		// Step 1: merge_config should create Config with KMS account

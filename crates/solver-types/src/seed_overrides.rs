@@ -44,7 +44,7 @@ use std::collections::HashMap;
 /// This is the top-level structure that specifies which networks
 /// the solver should operate on and what tokens to support.
 /// These values override/extend the seed preset defaults.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SeedOverrides {
 	/// Optional solver ID. If provided, this ID will be used for the solver.
 	/// If not provided, a new UUID-based ID will be generated.
@@ -119,6 +119,18 @@ pub struct SeedOverrides {
 	/// If provided, enables the rebalance monitor and admin endpoints.
 	#[serde(default)]
 	pub rebalance: Option<crate::OperatorRebalanceConfig>,
+
+	/// Override the seed default for the live fill-gas estimation flag.
+	/// If omitted, falls back to `SeedDefaults::live_fill_estimate_enabled`.
+	#[serde(default)]
+	pub live_fill_estimate_enabled: Option<bool>,
+
+	/// Override the seed default for chains that opt-in to live post-fill
+	/// gas estimation via stateOverride at quote time. If omitted, falls
+	/// back to `SeedDefaults::live_post_fill_estimate_chain_ids`. Empty
+	/// vec explicitly disables on all chains.
+	#[serde(default)]
+	pub live_post_fill_estimate_chain_ids: Option<Vec<u64>>,
 }
 
 /// Supported settlement type overrides.

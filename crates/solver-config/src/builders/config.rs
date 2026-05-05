@@ -9,7 +9,7 @@ use crate::{
 	AccountConfig, ApiConfig, Config, DeliveryConfig, DiscoveryConfig, GasConfig, NetworksConfig,
 	OrderConfig, SettlementConfig, SolverConfig, SolverIngressMode, StorageConfig, StrategyConfig,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Builder for creating `Config` instances with a fluent API.
 ///
@@ -203,6 +203,7 @@ impl ConfigBuilder {
 			gas: Some(GasConfig {
 				flows: HashMap::new(),
 				live_fill_estimate_enabled: true,
+				live_post_fill_estimate_chain_ids: HashSet::new(),
 			}),
 			rebalance: None,
 		}

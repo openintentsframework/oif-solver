@@ -798,7 +798,7 @@ mod tests {
 		OperatorRebalancePairConfig, OperatorRpcEndpoint, OperatorSettlementConfig,
 		OperatorSettlementType, OperatorSolverConfig, OperatorWithdrawalsConfig, RebalancePairSide,
 	};
-	use std::collections::HashMap;
+	use std::collections::{HashMap, HashSet};
 	use std::str::FromStr;
 	use std::sync::{Arc, Mutex};
 	use tokio::sync::RwLock;
@@ -992,6 +992,7 @@ mod tests {
 				permit2_escrow: OperatorGasFlowUnits::default(),
 				eip3009_escrow: OperatorGasFlowUnits::default(),
 				live_fill_estimate_enabled: true,
+				live_post_fill_estimate_chain_ids: HashSet::new(),
 			},
 			pricing: OperatorPricingConfig {
 				primary: "coingecko".to_string(),

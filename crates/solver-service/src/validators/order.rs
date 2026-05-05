@@ -324,6 +324,14 @@ mod tests {
 			unimplemented!("estimate_gas not used in tests")
 		}
 
+		async fn estimate_gas_with_overrides(
+			&self,
+			_: solver_types::Transaction,
+			_: alloy_rpc_types::state::StateOverride,
+		) -> Result<u64, DeliveryError> {
+			unimplemented!("estimate_gas_with_overrides not used in tests")
+		}
+
 		async fn eth_call(&self, tx: solver_types::Transaction) -> Result<Bytes, DeliveryError> {
 			self.contract_responses
 				.get(&tx.chain_id)
