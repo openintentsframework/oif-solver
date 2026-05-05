@@ -5192,6 +5192,7 @@ dependencies = [
  "alloy-sol-types",
  "anyhow",
  "hex",
+ "reqwest",
  "serde",
  "serde_json",
  "solver-types",

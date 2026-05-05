@@ -27,7 +27,7 @@ use alloy_primitives::U256;
 use async_trait::async_trait;
 use solver_storage::StorageService;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
 
 /// Errors that can occur during bridge operations.
@@ -440,9 +440,53 @@ impl BridgeService {
 	}
 }
 
+static BRIDGE_REGISTRY: OnceLock<Mutex<HashMap<&'static str, BridgeFactory>>> = OnceLock::new();
+
+/// Runtime-extensible bridge registry.
+///
+/// The production default remains LayerZero. Tests and future bootstrap paths can
+/// register additional bridge factories before the solver constructs services.
+pub struct BridgeRegistry;
+
+impl BridgeRegistry {
+	fn registry() -> &'static Mutex<HashMap<&'static str, BridgeFactory>> {
+		BRIDGE_REGISTRY.get_or_init(|| {
+			let mut implementations = HashMap::new();
+			implementations.insert(
+				"layerzero",
+				implementations::layerzero::create_bridge as BridgeFactory,
+			);
+			Mutex::new(implementations)
+		})
+	}
+
+	pub fn register(name: &'static str, factory: BridgeFactory) -> Result<(), BridgeError> {
+		let mut implementations = Self::registry()
+			.lock()
+			.map_err(|_| BridgeError::Config("bridge registry lock poisoned".to_string()))?;
+		if implementations.contains_key(name) {
+			return Err(BridgeError::Config(format!(
+				"bridge implementation already registered: {name}"
+			)));
+		}
+		implementations.insert(name, factory);
+		Ok(())
+	}
+
+	pub fn all() -> Result<Vec<(&'static str, BridgeFactory)>, BridgeError> {
+		let implementations = Self::registry()
+			.lock()
+			.map_err(|_| BridgeError::Config("bridge registry lock poisoned".to_string()))?;
+		Ok(implementations
+			.iter()
+			.map(|(name, factory)| (*name, *factory))
+			.collect())
+	}
+}
+
 /// Returns all registered bridge implementations.
-pub fn get_all_implementations() -> Vec<(&'static str, BridgeFactory)> {
-	vec![("layerzero", implementations::layerzero::create_bridge)]
+pub fn get_all_implementations() -> Result<Vec<(&'static str, BridgeFactory)>, BridgeError> {
+	BridgeRegistry::all()
 }
 
 #[cfg(test)]
@@ -464,6 +508,14 @@ mod tests {
 		fn new() -> Self {
 			Self::default()
 		}
+	}
+
+	fn registry_test_bridge_factory(
+		_config: &serde_json::Value,
+		_delivery: Arc<solver_delivery::DeliveryService>,
+		_solver: alloy_primitives::Address,
+	) -> Result<Box<dyn BridgeInterface>, BridgeError> {
+		Ok(Box::new(TestBridge::new()))
 	}
 
 	#[async_trait]
@@ -507,6 +559,25 @@ mod tests {
 				.take()
 				.expect("estimate_fee_result not configured")
 		}
+	}
+
+	#[test]
+	fn bridge_registry_includes_runtime_registered_factories() {
+		BridgeRegistry::register("unit-test-bridge", registry_test_bridge_factory)
+			.expect("register test bridge");
+
+		let implementations = get_all_implementations().expect("read bridge registry");
+
+		assert!(
+			implementations.iter().any(|(name, _)| *name == "layerzero"),
+			"default layerzero implementation should remain registered"
+		);
+		assert!(
+			implementations
+				.iter()
+				.any(|(name, _)| *name == "unit-test-bridge"),
+			"runtime registered bridge should be returned"
+		);
 	}
 
 	fn make_service(

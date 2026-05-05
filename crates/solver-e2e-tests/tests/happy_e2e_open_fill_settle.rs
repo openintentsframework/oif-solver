@@ -17,11 +17,10 @@
 //! Marked `#[ignore]` because plain `cargo test` shouldn't try to spawn Anvil
 //! on every dev machine.
 
-use alloy_primitives::{B256, U256};
+use alloy_primitives::B256;
 use solver_e2e_tests::{
-	addr_to_bytes32, addr_to_u256, amount_with_decimals_helper, nonce_from_seed, unix_now_plus,
-	Finalised, Harness, MandateOutput, OutputFilled, StandardOrder, DEST_CHAIN_ID,
-	ORIGIN_CHAIN_ID,
+	amount_with_decimals_helper, Finalised, Harness, OutputFilled, StandardOrderBuilder,
+	DEST_CHAIN_ID, ORIGIN_CHAIN_ID,
 };
 use std::time::Duration;
 
@@ -41,9 +40,7 @@ async fn happy_e2e_open_fill_settle() -> anyhow::Result<()> {
 	let amount_out = amount_with_decimals_helper(990); // small spread for solver profit
 
 	// (a) Snapshot balances before. We assert against these at the end.
-	let user_in_before = h
-		.balance(ORIGIN_CHAIN_ID, h.origin.token_a, user)
-		.await?;
+	let user_in_before = h.balance(ORIGIN_CHAIN_ID, h.origin.token_a, user).await?;
 	let recipient_out_before = h
 		.balance(DEST_CHAIN_ID, h.destination.token_b, recipient)
 		.await?;
@@ -58,25 +55,7 @@ async fn happy_e2e_open_fill_settle() -> anyhow::Result<()> {
 
 	// (c) Build the StandardOrder. orderId is deterministic from these fields,
 	// so we'll match it against the Open event the call emits.
-	let order = StandardOrder {
-		user,
-		nonce: nonce_from_seed("e2e-happy-1"),
-		originChainId: U256::from(ORIGIN_CHAIN_ID),
-		expires: unix_now_plus(60 * 60),       // 1h
-		fillDeadline: unix_now_plus(30 * 60),  // 30m
-		inputOracle: h.origin.input_oracle,
-		inputs: vec![[addr_to_u256(h.origin.token_a), amount_in]],
-		outputs: vec![MandateOutput {
-			oracle: addr_to_bytes32(h.destination.output_oracle),
-			settler: addr_to_bytes32(h.destination.output_settler),
-			chainId: U256::from(DEST_CHAIN_ID),
-			token: addr_to_bytes32(h.destination.token_b),
-			amount: amount_out,
-			recipient: addr_to_bytes32(recipient),
-			callbackData: Default::default(),
-			context: Default::default(),
-		}],
-	};
+	let order = StandardOrderBuilder::happy_path(&h, "e2e-happy-1").build();
 
 	// (d) Submit open(). The receipt's Open event yields the orderId we'll
 	// chase across the next two events.
@@ -123,9 +102,7 @@ async fn happy_e2e_open_fill_settle() -> anyhow::Result<()> {
 	eprintln!("Finalised observed on chain {ORIGIN_CHAIN_ID}");
 
 	// (g) Balance assertions — sanity bound on the event-based assertion.
-	let user_in_after = h
-		.balance(ORIGIN_CHAIN_ID, h.origin.token_a, user)
-		.await?;
+	let user_in_after = h.balance(ORIGIN_CHAIN_ID, h.origin.token_a, user).await?;
 	let recipient_out_after = h
 		.balance(DEST_CHAIN_ID, h.destination.token_b, recipient)
 		.await?;
