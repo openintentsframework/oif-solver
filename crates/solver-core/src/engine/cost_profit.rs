@@ -745,15 +745,15 @@ impl CostProfitService {
 					None
 				},
 				Ok(Some(pf)) => {
-					let settler_alloy =
-						alloy_primitives::Address::from_slice(&pf.output_settler.0);
-					let state_override = crate::engine::post_fill_overrides::build_post_fill_state_override(
-						settler_alloy,
-						pf.synthetic_order_id,
-						pf.output_hash,
-						pf.solver,
-						pf.fill_timestamp,
-					);
+					let settler_alloy = alloy_primitives::Address::from_slice(&pf.output_settler.0);
+					let state_override =
+						crate::engine::post_fill_overrides::build_post_fill_state_override(
+							settler_alloy,
+							pf.synthetic_order_id,
+							pf.output_hash,
+							pf.solver,
+							pf.fill_timestamp,
+						);
 					match self
 						.try_live_post_fill_estimate_with_overrides(
 							dest_chain_id,
@@ -5496,8 +5496,8 @@ mod tests {
 				tokens: vec![solver_types::TokenConfig {
 					address: solver_types::Address(
 						[
-							0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C,
-							0x5C, 0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+							0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
+							0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
 						]
 						.to_vec(),
 					),
@@ -5521,8 +5521,8 @@ mod tests {
 				tokens: vec![solver_types::TokenConfig {
 					address: solver_types::Address(
 						[
-							0xB0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C,
-							0x5C, 0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+							0xB0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
+							0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
 						]
 						.to_vec(),
 					),
@@ -5783,15 +5783,13 @@ mod tests {
 			if field.name() == "message" {
 				self.0.message = value.to_string();
 			} else {
-				self.0.fields.insert(field.name().to_string(), value.to_string());
+				self.0
+					.fields
+					.insert(field.name().to_string(), value.to_string());
 			}
 		}
 
-		fn record_debug(
-			&mut self,
-			field: &tracing::field::Field,
-			value: &dyn ::std::fmt::Debug,
-		) {
+		fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn ::std::fmt::Debug) {
 			let formatted = format!("{:?}", value);
 			// `tracing` formats string literals via `record_debug` with
 			// surrounding quotes — strip them so equality with `"success"`
@@ -5805,15 +5803,21 @@ mod tests {
 		}
 
 		fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-			self.0.fields.insert(field.name().to_string(), value.to_string());
+			self.0
+				.fields
+				.insert(field.name().to_string(), value.to_string());
 		}
 
 		fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-			self.0.fields.insert(field.name().to_string(), value.to_string());
+			self.0
+				.fields
+				.insert(field.name().to_string(), value.to_string());
 		}
 
 		fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-			self.0.fields.insert(field.name().to_string(), value.to_string());
+			self.0
+				.fields
+				.insert(field.name().to_string(), value.to_string());
 		}
 	}
 
@@ -6099,8 +6103,7 @@ mod tests {
 			let context = context.clone();
 			let solver = solver.clone();
 			async move {
-				let (service, _, _) =
-					cost_profit_service_for_post_fill_override(None, Some(0));
+				let (service, _, _) = cost_profit_service_for_post_fill_override(None, Some(0));
 				let mut config = config_for_live_estimate(false);
 				config.gas = Some(gas_config_post_fill(true));
 				let _ = service
@@ -6133,8 +6136,7 @@ mod tests {
 			let context = context.clone();
 			let solver = solver.clone();
 			async move {
-				let (service, _, _) =
-					cost_profit_service_for_post_fill_override(None, None);
+				let (service, _, _) = cost_profit_service_for_post_fill_override(None, None);
 				let mut config = config_for_live_estimate(false);
 				config.gas = Some(gas_config_post_fill(true));
 				let _ = service

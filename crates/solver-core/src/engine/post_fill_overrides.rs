@@ -128,7 +128,9 @@ pub async fn estimate_post_fill_with_overrides_for_test(
 	tx: solver_types::Transaction,
 	state_override: alloy_rpc_types::state::StateOverride,
 ) -> Result<u64, solver_delivery::DeliveryError> {
-	delivery.estimate_gas_with_overrides(tx, state_override).await
+	delivery
+		.estimate_gas_with_overrides(tx, state_override)
+		.await
 }
 
 #[cfg(test)]
@@ -185,10 +187,7 @@ mod tests {
 		let order_id = B256::repeat_byte(0xaa);
 		let a = B256::repeat_byte(0x01);
 		let b = B256::repeat_byte(0x02);
-		assert_ne!(
-			fill_record_slot(order_id, a),
-			fill_record_slot(order_id, b)
-		);
+		assert_ne!(fill_record_slot(order_id, a), fill_record_slot(order_id, b));
 	}
 
 	#[test]
@@ -250,13 +249,7 @@ mod tests {
 		let solver = B256::repeat_byte(0xdd);
 		let timestamp: u32 = 1_700_000_000;
 
-		let ov = build_post_fill_state_override(
-			settler,
-			order_id,
-			output_hash,
-			solver,
-			timestamp,
-		);
+		let ov = build_post_fill_state_override(settler, order_id, output_hash, solver, timestamp);
 
 		let acct = ov.get(&settler).expect("settler key present");
 		let diff = acct.state_diff.as_ref().expect("state_diff present");
@@ -269,13 +262,7 @@ mod tests {
 	#[test]
 	fn build_override_omits_other_accounts() {
 		let settler = Address::repeat_byte(0xcc);
-		let ov = build_post_fill_state_override(
-			settler,
-			B256::ZERO,
-			B256::ZERO,
-			B256::ZERO,
-			0,
-		);
+		let ov = build_post_fill_state_override(settler, B256::ZERO, B256::ZERO, B256::ZERO, 0);
 		assert_eq!(ov.len(), 1);
 		assert!(ov.contains_key(&settler));
 	}

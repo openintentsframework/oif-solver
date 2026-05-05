@@ -143,7 +143,10 @@ fn encode_quote_hyperlane_fill_description(
 	call_data: Vec<u8>,
 	context: Vec<u8>,
 ) -> Vec<u8> {
-	assert!(call_data.len() <= u16::MAX as usize, "test call_data too large");
+	assert!(
+		call_data.len() <= u16::MAX as usize,
+		"test call_data too large"
+	);
 	assert!(context.len() <= u16::MAX as usize, "test context too large");
 	let mut payload =
 		Vec::with_capacity(32 + 32 + 4 + 32 + 32 + 32 + 2 + call_data.len() + 2 + context.len());
@@ -180,10 +183,7 @@ impl LiveRpcDelivery {
 
 struct EmptyConfigSchema;
 impl ConfigSchema for EmptyConfigSchema {
-	fn validate(
-		&self,
-		_config: &serde_json::Value,
-	) -> Result<(), solver_types::ValidationError> {
+	fn validate(&self, _config: &serde_json::Value) -> Result<(), solver_types::ValidationError> {
 		Ok(())
 	}
 }
@@ -258,7 +258,10 @@ impl DeliveryInterface for LiveRpcDelivery {
 	}
 
 	async fn estimate_gas(&self, tx: SolverTransaction) -> Result<u64, DeliveryError> {
-		assert_eq!(tx.chain_id, self.chain_id, "tx chain_id != provider chain_id");
+		assert_eq!(
+			tx.chain_id, self.chain_id,
+			"tx chain_id != provider chain_id"
+		);
 		let request = solver_to_alloy_request(tx);
 		self.provider
 			.estimate_gas(request)
@@ -271,7 +274,10 @@ impl DeliveryInterface for LiveRpcDelivery {
 		tx: SolverTransaction,
 		state_override: alloy_rpc_types::state::StateOverride,
 	) -> Result<u64, DeliveryError> {
-		assert_eq!(tx.chain_id, self.chain_id, "tx chain_id != provider chain_id");
+		assert_eq!(
+			tx.chain_id, self.chain_id,
+			"tx chain_id != provider chain_id"
+		);
 		let request = solver_to_alloy_request(tx);
 		self.provider
 			.estimate_gas(request)
@@ -476,13 +482,9 @@ async fn post_fill_estimate_with_overrides_returns_realistic_units() {
 	);
 
 	// --- Assertion 2: WITH override, estimate must succeed -------------
-	let units = estimate_post_fill_with_overrides_for_test(
-		&delivery,
-		synthetic_tx,
-		state_override,
-	)
-	.await
-	.expect("estimate_gas WITH override should succeed");
+	let units = estimate_post_fill_with_overrides_for_test(&delivery, synthetic_tx, state_override)
+		.await
+		.expect("estimate_gas WITH override should succeed");
 
 	eprintln!("[ok] estimate_gas with override returned {units} units");
 	// Initial sanity range — tighten after the first real run by capturing
