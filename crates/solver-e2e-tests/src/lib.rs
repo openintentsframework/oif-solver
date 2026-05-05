@@ -157,8 +157,44 @@ pub struct Harness {
 	_tempdir: TempDir,
 }
 
+#[derive(Debug, Clone)]
+pub struct HarnessOptions {
+	pub user_token_a_mint: U256,
+	pub solver_token_b_mint: U256,
+	pub use_false_oracle: bool,
+	pub use_reverting_output_settler: bool,
+	pub enable_permit2: bool,
+	pub enable_admin_api: bool,
+	pub admin_redis_url: Option<String>,
+	pub enable_offchain_api: bool,
+	// Phase 2 rebalance fields should plug into the RebalanceOverridesBuilder
+	// added in Task 0b instead of reshaping the seed override path later:
+	// pub enable_rebalance: bool,
+	// pub rebalance_pairs: Vec<solver_types::OperatorRebalancePairConfig>,
+	// pub rebalance_overrides: RebalanceOverridesBuilder,
+}
+
+impl Default for HarnessOptions {
+	fn default() -> Self {
+		Self {
+			user_token_a_mint: amount_with_decimals(1_000_000),
+			solver_token_b_mint: amount_with_decimals(1_000_000),
+			use_false_oracle: false,
+			use_reverting_output_settler: false,
+			enable_permit2: false,
+			enable_admin_api: false,
+			admin_redis_url: None,
+			enable_offchain_api: false,
+		}
+	}
+}
+
 impl Harness {
 	pub async fn boot() -> Result<Self> {
+		Self::boot_with(HarnessOptions::default()).await
+	}
+
+	pub async fn boot_with(options: HarnessOptions) -> Result<Self> {
 		init_tracing();
 
 		// Pre-flight: kill any orphans on our fixed ports. solver-demo's
@@ -196,9 +232,21 @@ impl Harness {
 		// oracle is reused for both input + output roles since it always
 		// returns proven=true and has no per-direction state.
 		tracing::info!("Deploying contracts to origin chain {ORIGIN_CHAIN_ID}");
-		let origin = deploy_chain(&origin_provider, ORIGIN_CHAIN_ID, &origin_rpc).await?;
+		let mut origin = deploy_chain(&origin_provider, ORIGIN_CHAIN_ID, &origin_rpc).await?;
 		tracing::info!("Deploying contracts to destination chain {DEST_CHAIN_ID}");
-		let destination = deploy_chain(&destination_provider, DEST_CHAIN_ID, &dest_rpc).await?;
+		let mut destination = deploy_chain(&destination_provider, DEST_CHAIN_ID, &dest_rpc).await?;
+
+		if options.use_false_oracle {
+			origin.input_oracle = deploy_no_args(&origin_provider, "FalseOracle")
+				.await
+				.context("deploy FalseOracle")?;
+		}
+		if options.use_reverting_output_settler {
+			destination.output_settler =
+				deploy_no_args(&destination_provider, "RevertingOutputSettler")
+					.await
+					.context("deploy RevertingOutputSettler")?;
+		}
 
 		// Mint TOKA to user on origin (for the input leg) and TOKB to solver
 		// on destination (for the fill leg). Solver self-funds the fill —
@@ -207,7 +255,7 @@ impl Harness {
 			&origin_provider,
 			origin.token_a,
 			parse_address(USER_ADDRESS)?,
-			amount_with_decimals(1_000_000),
+			options.user_token_a_mint,
 		)
 		.await
 		.context("mint TOKA to user")?;
@@ -215,7 +263,7 @@ impl Harness {
 			&destination_provider,
 			destination.token_b,
 			parse_address(SOLVER_ADDRESS)?,
-			amount_with_decimals(1_000_000),
+			options.solver_token_b_mint,
 		)
 		.await
 		.context("mint TOKB to solver")?;
@@ -223,12 +271,11 @@ impl Harness {
 		// Write the bootstrap config. SeedOverrides shape — see notes at
 		// build_seed_overrides for why this is what `solver --bootstrap-config`
 		// expects (vs. the runtime Config schema in demo.json).
-		let seed_overrides = build_seed_overrides(&origin, &destination)?;
+		let seed_overrides = build_seed_overrides(&origin, &destination, &options)?;
 		let bootstrap_path = tempdir.path().join("bootstrap.json");
 		std::fs::write(
 			&bootstrap_path,
-			serde_json::to_vec_pretty(&seed_overrides)
-				.context("serialize SeedOverrides")?,
+			serde_json::to_vec_pretty(&seed_overrides).context("serialize SeedOverrides")?,
 		)
 		.context("write bootstrap config")?;
 
@@ -237,7 +284,12 @@ impl Harness {
 		// the test harness is buffering its own stderr. `dump_solver_stderr`
 		// reads it.
 		let solver_stderr_path = tempdir.path().join("solver.stderr.log");
-		let solver = spawn_solver(&bootstrap_path, tempdir.path(), &solver_stderr_path)?;
+		let solver = spawn_solver(
+			&bootstrap_path,
+			tempdir.path(),
+			&solver_stderr_path,
+			&options,
+		)?;
 		wait_for_tcp_ready(SOLVER_API_PORT, SOLVER_HEALTH_TIMEOUT).await?;
 
 		Ok(Self {
@@ -258,7 +310,10 @@ impl Harness {
 	/// to test stderr. Called automatically on `await_event` timeout; tests
 	/// can also call it manually.
 	pub fn dump_solver_stderr(&self) {
-		eprintln!("\n========== solver logs ({}) ==========", self.solver_stderr_path.display());
+		eprintln!(
+			"\n========== solver logs ({}) ==========",
+			self.solver_stderr_path.display()
+		);
 		match std::fs::read_to_string(&self.solver_stderr_path) {
 			Ok(contents) => {
 				let lines: Vec<&str> = contents.lines().collect();
@@ -275,7 +330,10 @@ impl Harness {
 	/// Print the bootstrap config that was passed to the solver. Useful when
 	/// diagnosing config-driven discovery / settlement issues.
 	pub fn dump_bootstrap_config(&self) {
-		eprintln!("\n========== bootstrap config ({}) ==========", self.bootstrap_path.display());
+		eprintln!(
+			"\n========== bootstrap config ({}) ==========",
+			self.bootstrap_path.display()
+		);
 		match std::fs::read_to_string(&self.bootstrap_path) {
 			Ok(s) => eprintln!("{s}"),
 			Err(e) => eprintln!("(could not read: {e})"),
@@ -295,16 +353,18 @@ impl Harness {
 		parse_address(RECIPIENT_ADDRESS).expect("static address")
 	}
 
+	pub fn api_base_url(&self) -> String {
+		format!("http://127.0.0.1:{SOLVER_API_PORT}/api/v1")
+	}
+
 	/// Read raw token balance.
-	pub async fn balance(
-		&self,
-		chain_id: u64,
-		token: Address,
-		owner: Address,
-	) -> Result<U256> {
+	pub async fn balance(&self, chain_id: u64, token: Address, owner: Address) -> Result<U256> {
 		let provider = self.provider_for(chain_id)?;
 		let contract = IERC20::new(token, provider);
-		let result = contract.balanceOf(owner).call().await
+		let result = contract
+			.balanceOf(owner)
+			.call()
+			.await
 			.with_context(|| format!("balanceOf({owner}) on chain {chain_id}"))?;
 		Ok(result)
 	}
@@ -316,11 +376,7 @@ impl Harness {
 		spender: Address,
 		amount: U256,
 	) -> Result<TransactionReceipt> {
-		let provider = build_provider(
-			&self.origin.rpc_http,
-			self.user_signer.clone(),
-		)
-		.await?;
+		let provider = build_provider(&self.origin.rpc_http, self.user_signer.clone()).await?;
 		let contract = IERC20::new(token, provider);
 		let pending = contract
 			.approve(spender, amount)
@@ -333,17 +389,24 @@ impl Harness {
 	/// User submits `open(order)` on the origin input settler. Returns the
 	/// orderId emitted by the `Open` event.
 	pub async fn user_open(&self, order: StandardOrder) -> Result<B256> {
-		let provider = build_provider(
-			&self.origin.rpc_http,
-			self.user_signer.clone(),
-		)
-		.await?;
+		let receipt = self.user_open_result(order).await?;
+
+		extract_order_id_from_receipt(&receipt).ok_or_else(|| {
+			anyhow!(
+				"Open event not found in receipt {:?}",
+				receipt.transaction_hash
+			)
+		})
+	}
+
+	/// User submits `open(order)` on the origin input settler. Unlike
+	/// `user_open`, this returns the raw receipt result so negative tests can
+	/// assert expected reverts.
+	pub async fn user_open_result(&self, order: StandardOrder) -> Result<TransactionReceipt> {
+		let provider = build_provider(&self.origin.rpc_http, self.user_signer.clone()).await?;
 		let contract = IInputSettlerEscrow::new(self.origin.input_settler, provider);
 		let pending = contract.open(order).send().await.context("send open")?;
-		let receipt = pending.get_receipt().await.context("open receipt")?;
-
-		extract_order_id_from_receipt(&receipt)
-			.ok_or_else(|| anyhow!("Open event not found in receipt {:?}", receipt.transaction_hash))
+		Ok(pending.get_receipt().await.context("open receipt")?)
 	}
 
 	/// Poll for the next log on `chain_id` matching the given event signature
@@ -389,6 +452,51 @@ impl Harness {
 					 orderId {order_id} within {timeout:?}",
 					E::SIGNATURE
 				));
+			}
+			from_block = head.saturating_add(1);
+			tokio::time::sleep(POLL_INTERVAL).await;
+		}
+	}
+
+	/// Assert that no matching event appears within `timeout`.
+	pub async fn await_no_event<E: SolEvent>(
+		&self,
+		chain_id: u64,
+		address: Address,
+		order_id: B256,
+		timeout: Duration,
+	) -> Result<()> {
+		const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+		let provider = self.provider_for(chain_id)?;
+		let deadline = Instant::now() + timeout;
+		let mut from_block: u64 = 0;
+
+		loop {
+			let head = provider
+				.get_block_number()
+				.await
+				.context("get_block_number")?;
+			let filter = Filter::new()
+				.address(address)
+				.event_signature(E::SIGNATURE_HASH)
+				.topic1(order_id)
+				.from_block(from_block)
+				.to_block(BlockNumberOrTag::Number(head));
+
+			let logs = provider.get_logs(&filter).await.context("get_logs")?;
+			if let Some(log) = logs.into_iter().next() {
+				E::decode_log(&log.inner).context("decode unexpected event")?;
+				self.dump_solver_stderr();
+				self.dump_bootstrap_config();
+				return Err(anyhow!(
+					"unexpected {} observed on chain {chain_id} address {address} \
+					 orderId {order_id}",
+					E::SIGNATURE
+				));
+			}
+			if Instant::now() >= deadline {
+				return Ok(());
 			}
 			from_block = head.saturating_add(1);
 			tokio::time::sleep(POLL_INTERVAL).await;
@@ -483,7 +591,10 @@ async fn wait_for_rpc_ready(rpc_url: &str, timeout: Duration) -> Result<()> {
 async fn wait_for_tcp_ready(port: u16, timeout: Duration) -> Result<()> {
 	let deadline = Instant::now() + timeout;
 	loop {
-		if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+		if tokio::net::TcpStream::connect(("127.0.0.1", port))
+			.await
+			.is_ok()
+		{
 			return Ok(());
 		}
 		if Instant::now() >= deadline {
@@ -546,6 +657,58 @@ pub fn amount_with_decimals_helper(whole: u64) -> U256 {
 	amount_with_decimals(whole)
 }
 
+pub fn assert_open_failed(result: Result<TransactionReceipt>, context: &str) {
+	match result {
+		Ok(receipt) => {
+			assert!(
+				!receipt.status(),
+				"{context}: expected open transaction to revert"
+			);
+		},
+		Err(error) => {
+			// Alloy may surface expected reverts during gas estimation/preflight instead of
+			// returning a mined receipt, depending on provider/version behavior.
+			// TODO: tighten this to typed Alloy/revm error matching once variants stabilize.
+			let message = error
+				.chain()
+				.map(ToString::to_string)
+				.collect::<Vec<_>>()
+				.join(": ");
+			let debug = format!("{error:?}");
+			assert!(
+				message.contains("revert")
+					|| message.contains("execution reverted")
+					|| message.contains("insufficient")
+					|| message.contains("allowance")
+					|| message.contains("transfer amount exceeds")
+					|| debug.contains("revert")
+					|| debug.contains("execution reverted")
+					|| debug.contains("insufficient")
+					|| debug.contains("allowance")
+					|| debug.contains("transfer amount exceeds"),
+				"{context}: expected revert/preflight failure, got {message}; debug: {debug}"
+			);
+		},
+	}
+}
+
+pub fn assert_reverted_receipt(receipt: &TransactionReceipt, context: &str) {
+	assert!(
+		!receipt.status(),
+		"{context}: expected transaction to revert"
+	);
+}
+
+pub fn assert_balance_delta(before: U256, after: U256, expected: U256, context: &str) {
+	assert_eq!(after - before, expected, "{context}");
+}
+
+pub fn redis_url_or_skip() -> Option<String> {
+	std::env::var("REDIS_URL")
+		.ok()
+		.filter(|value| !value.trim().is_empty())
+}
+
 // =============================================================================
 // Contract deploy
 // =============================================================================
@@ -561,7 +724,8 @@ fn oif_contracts_out() -> Result<PathBuf> {
 			.parent()
 			.and_then(|p| p.parent())
 			.ok_or_else(|| anyhow!("workspace root resolution failed"))?;
-		workspace.parent()
+		workspace
+			.parent()
 			.ok_or_else(|| anyhow!("workspace has no parent"))?
 			.join("oif-contracts")
 	};
@@ -580,10 +744,21 @@ fn oif_contracts_out() -> Result<PathBuf> {
 
 /// Loads creation bytecode from a Foundry artifact JSON.
 fn load_bytecode(contract_name: &str) -> Result<Bytes> {
+	let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+	let pinned_path = manifest
+		.join("artifacts")
+		.join(format!("{contract_name}.json"));
+	if pinned_path.exists() {
+		return load_bytecode_from_artifact(&pinned_path, contract_name);
+	}
+
 	let out = oif_contracts_out()?;
 	let path = out.join(format!("{contract_name}.sol/{contract_name}.json"));
-	let raw = std::fs::read(&path)
-		.with_context(|| format!("read artifact {}", path.display()))?;
+	load_bytecode_from_artifact(&path, contract_name)
+}
+
+fn load_bytecode_from_artifact(path: &std::path::Path, contract_name: &str) -> Result<Bytes> {
+	let raw = std::fs::read(&path).with_context(|| format!("read artifact {}", path.display()))?;
 	let json: serde_json::Value = serde_json::from_slice(&raw)
 		.with_context(|| format!("parse artifact {}", path.display()))?;
 	let hex = json
@@ -592,17 +767,13 @@ fn load_bytecode(contract_name: &str) -> Result<Bytes> {
 		.and_then(|o| o.as_str())
 		.ok_or_else(|| anyhow!("artifact {} missing bytecode.object", path.display()))?;
 	let trimmed = hex.trim_start_matches("0x");
-	let bytes = hex::decode(trimmed)
-		.with_context(|| format!("decode hex bytecode for {contract_name}"))?;
+	let bytes =
+		hex::decode(trimmed).with_context(|| format!("decode hex bytecode for {contract_name}"))?;
 	Ok(Bytes::from(bytes))
 }
 
 /// CREATE-deploys raw `bytecode || ctor_args`. Returns the deployed address.
-async fn deploy_raw(
-	provider: &DynProvider,
-	bytecode: Bytes,
-	ctor_args: Bytes,
-) -> Result<Address> {
+async fn deploy_raw(provider: &DynProvider, bytecode: Bytes, ctor_args: Bytes) -> Result<Address> {
 	let mut data = bytecode.to_vec();
 	data.extend_from_slice(&ctor_args);
 
@@ -615,7 +786,10 @@ async fn deploy_raw(
 		.context("send deploy transaction")?;
 	let receipt = pending.get_receipt().await.context("deploy receipt")?;
 	if !receipt.status() {
-		return Err(anyhow!("deploy reverted (tx {:?})", receipt.transaction_hash));
+		return Err(anyhow!(
+			"deploy reverted (tx {:?})",
+			receipt.transaction_hash
+		));
 	}
 	receipt
 		.contract_address
@@ -633,12 +807,7 @@ async fn deploy_mock_erc20(
 	// `u8` doesn't implement SolValue directly; widen to U256. ABI encoding
 	// for any fixed uint is a 32-byte left-padded slot, so this is identical
 	// on the wire.
-	let args = (
-		name.to_string(),
-		symbol.to_string(),
-		U256::from(decimals),
-	)
-		.abi_encode_params();
+	let args = (name.to_string(), symbol.to_string(), U256::from(decimals)).abi_encode_params();
 	deploy_raw(provider, bytecode, Bytes::from(args)).await
 }
 
@@ -652,15 +821,20 @@ async fn deploy_chain(
 	chain_id: u64,
 	rpc_http: &str,
 ) -> Result<ChainDeployment> {
-	let token_a = deploy_mock_erc20(provider, "Token A", "TOKA", 18).await
+	let token_a = deploy_mock_erc20(provider, "Token A", "TOKA", 18)
+		.await
 		.context("deploy MockERC20 TOKA")?;
-	let token_b = deploy_mock_erc20(provider, "Token B", "TOKB", 18).await
+	let token_b = deploy_mock_erc20(provider, "Token B", "TOKB", 18)
+		.await
 		.context("deploy MockERC20 TOKB")?;
-	let always_yes = deploy_no_args(provider, "AlwaysYesOracle").await
+	let always_yes = deploy_no_args(provider, "AlwaysYesOracle")
+		.await
 		.context("deploy AlwaysYesOracle")?;
-	let input_settler = deploy_no_args(provider, "InputSettlerEscrow").await
+	let input_settler = deploy_no_args(provider, "InputSettlerEscrow")
+		.await
 		.context("deploy InputSettlerEscrow")?;
-	let output_settler = deploy_no_args(provider, "OutputSettlerSimple").await
+	let output_settler = deploy_no_args(provider, "OutputSettlerSimple")
+		.await
 		.context("deploy OutputSettlerSimple")?;
 
 	tracing::info!(
@@ -692,7 +866,11 @@ async fn mint_erc20(
 	amount: U256,
 ) -> Result<()> {
 	let contract = IERC20::new(token, provider);
-	let pending = contract.mint(to, amount).send().await.context("send mint")?;
+	let pending = contract
+		.mint(to, amount)
+		.send()
+		.await
+		.context("send mint")?;
 	let receipt = pending.get_receipt().await.context("mint receipt")?;
 	if !receipt.status() {
 		return Err(anyhow!("mint reverted (tx {:?})", receipt.transaction_hash));
@@ -713,13 +891,33 @@ async fn mint_erc20(
 // keyed by `chain_id` — NOT a HashMap. Hand-writing JSON in the runtime
 // `Config` shape (a map) is what was breaking the previous run.
 
+#[derive(Debug, Clone, Default)]
+pub struct RebalanceOverridesBuilder {
+	pub config: Option<solver_types::OperatorRebalanceConfig>,
+}
+
 fn build_seed_overrides(
 	origin: &ChainDeployment,
 	destination: &ChainDeployment,
+	options: &HarnessOptions,
+) -> Result<solver_types::SeedOverrides> {
+	build_seed_overrides_with_rebalance(
+		origin,
+		destination,
+		options,
+		RebalanceOverridesBuilder::default(),
+	)
+}
+
+fn build_seed_overrides_with_rebalance(
+	origin: &ChainDeployment,
+	destination: &ChainDeployment,
+	options: &HarnessOptions,
+	rebalance: RebalanceOverridesBuilder,
 ) -> Result<solver_types::SeedOverrides> {
 	use solver_types::networks::NetworkType;
 	use solver_types::seed_overrides::{
-		DirectSettlementOverride, NetworkOverride, OracleOverrides,
+		AdminOverride, DirectSettlementOverride, NetworkOverride, OracleOverrides,
 		SettlementOverride, SettlementTypeOverride, Token,
 	};
 
@@ -781,6 +979,19 @@ fn build_seed_overrides(
 		broadcaster: None,
 	};
 
+	let admin = if options.enable_admin_api {
+		Some(AdminOverride {
+			enabled: true,
+			domain: "localhost".to_string(),
+			chain_id: Some(ORIGIN_CHAIN_ID),
+			admin_addresses: vec![parse_address(SOLVER_ADDRESS)?],
+			nonce_ttl_seconds: None,
+			withdrawals: Default::default(),
+		})
+	} else {
+		None
+	};
+
 	Ok(solver_types::SeedOverrides {
 		solver_id: Some("oif-solver-e2e".to_string()),
 		solver_name: Some("E2E test solver".to_string()),
@@ -788,15 +999,15 @@ fn build_seed_overrides(
 		settlement: Some(settlement),
 		routing_defaults: None,
 		account: None,
-		admin: None,
-		auth_enabled: Some(false),
+		admin,
+		auth_enabled: Some(options.enable_admin_api),
 		min_profitability_pct: None,
 		gas_buffer_bps: None,
 		commission_bps: None,
 		rate_buffer_bps: None,
 		monitoring_timeout_seconds: None,
 		deny_list: None,
-		rebalance: None,
+		rebalance: rebalance.config,
 	})
 }
 
@@ -835,7 +1046,9 @@ fn ensure_solver_binary_built() -> Result<()> {
 		.args([
 			"build",
 			"--manifest-path",
-			manifest.to_str().ok_or_else(|| anyhow!("non-utf8 manifest"))?,
+			manifest
+				.to_str()
+				.ok_or_else(|| anyhow!("non-utf8 manifest"))?,
 			"-p",
 			"solver-service",
 			"--bin",
@@ -853,6 +1066,7 @@ fn spawn_solver(
 	bootstrap_path: &std::path::Path,
 	working_dir: &std::path::Path,
 	log_path: &std::path::Path,
+	options: &HarnessOptions,
 ) -> Result<Child> {
 	let bin = solver_binary_path()?;
 	tracing::info!(
@@ -863,8 +1077,8 @@ fn spawn_solver(
 	// We pipe both stdout and stderr into the same file so logs land
 	// regardless of which channel a layer chooses. Two distinct file handles
 	// pointing at the same path; the OS interleaves writes per-line.
-	let stdout_file = std::fs::File::create(log_path)
-		.with_context(|| format!("create log {log_path:?}"))?;
+	let stdout_file =
+		std::fs::File::create(log_path).with_context(|| format!("create log {log_path:?}"))?;
 	let stderr_file = stdout_file
 		.try_clone()
 		.with_context(|| format!("clone log handle {log_path:?}"))?;
@@ -877,7 +1091,8 @@ fn spawn_solver(
 			.to_string()
 	});
 
-	let child = Command::new(&bin)
+	let mut command = Command::new(&bin);
+	command
 		.arg("--bootstrap-config")
 		.arg(bootstrap_path)
 		.arg("--force-seed")
@@ -889,11 +1104,16 @@ fn spawn_solver(
 		// CoinGecko for our fake TOKA/TOKB. The mock impl has TOKA/USD and
 		// TOKB/USD prices baked in — see `MockPricing::new`.
 		.env("PRICING_PRIMARY", "mock")
+		.env("JWT_SECRET", "solver-e2e-admin-jwt-secret")
 		.env("RUST_LOG", rust_log)
 		.stdout(stdout_file)
-		.stderr(stderr_file)
-		.spawn()
-		.with_context(|| format!("spawn {bin:?}"))?;
+		.stderr(stderr_file);
+
+	if let Some(redis_url) = &options.admin_redis_url {
+		command.env("REDIS_URL", redis_url);
+	}
+
+	let child = command.spawn().with_context(|| format!("spawn {bin:?}"))?;
 	Ok(child)
 }
 
@@ -920,7 +1140,11 @@ fn extract_order_id_from_receipt(receipt: &TransactionReceipt) -> Option<B256> {
 /// Returns a unix timestamp `secs` seconds in the future. Use this to set
 /// `expires` and `fillDeadline` on test orders.
 pub fn unix_now_plus(secs: u64) -> u32 {
-	(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() + secs)
+	(SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_secs()
+		+ secs)
 		.try_into()
 		.unwrap_or(u32::MAX)
 }
@@ -943,3 +1167,101 @@ pub fn nonce_from_seed(seed: &str) -> U256 {
 	U256::from_be_bytes::<32>(keccak256(seed.as_bytes()).into())
 }
 
+pub struct StandardOrderBuilder<'a> {
+	harness: &'a Harness,
+	seed: String,
+	amount_in: U256,
+	amount_out: U256,
+	expires: u32,
+	fill_deadline: u32,
+	input_oracle: Address,
+	output_oracle: Address,
+	output_settler: Address,
+	output_token: Address,
+	recipient: Address,
+}
+
+impl<'a> StandardOrderBuilder<'a> {
+	pub fn happy_path(harness: &'a Harness, seed: impl Into<String>) -> Self {
+		Self {
+			harness,
+			seed: seed.into(),
+			amount_in: amount_with_decimals(1_000),
+			amount_out: amount_with_decimals(990),
+			expires: unix_now_plus(60 * 60),
+			fill_deadline: unix_now_plus(30 * 60),
+			input_oracle: harness.origin.input_oracle,
+			output_oracle: harness.destination.output_oracle,
+			output_settler: harness.destination.output_settler,
+			output_token: harness.destination.token_b,
+			recipient: harness.recipient_address(),
+		}
+	}
+
+	pub fn amount_in(mut self, amount: U256) -> Self {
+		self.amount_in = amount;
+		self
+	}
+
+	pub fn amount_out(mut self, amount: U256) -> Self {
+		self.amount_out = amount;
+		self
+	}
+
+	pub fn expires(mut self, expires: u32) -> Self {
+		self.expires = expires;
+		self
+	}
+
+	pub fn fill_deadline(mut self, deadline: u32) -> Self {
+		self.fill_deadline = deadline;
+		self
+	}
+
+	pub fn input_oracle(mut self, oracle: Address) -> Self {
+		self.input_oracle = oracle;
+		self
+	}
+
+	pub fn output_oracle(mut self, oracle: Address) -> Self {
+		self.output_oracle = oracle;
+		self
+	}
+
+	pub fn output_settler(mut self, settler: Address) -> Self {
+		self.output_settler = settler;
+		self
+	}
+
+	pub fn output_token(mut self, token: Address) -> Self {
+		self.output_token = token;
+		self
+	}
+
+	pub fn recipient(mut self, recipient: Address) -> Self {
+		self.recipient = recipient;
+		self
+	}
+
+	pub fn build(self) -> StandardOrder {
+		StandardOrder {
+			user: self.harness.user_address(),
+			nonce: nonce_from_seed(&self.seed),
+			originChainId: U256::from(ORIGIN_CHAIN_ID),
+			expires: self.expires,
+			fillDeadline: self.fill_deadline,
+			inputOracle: self.input_oracle,
+			inputs: vec![[addr_to_u256(self.harness.origin.token_a), self.amount_in]],
+			outputs: vec![MandateOutput {
+				oracle: addr_to_bytes32(self.output_oracle),
+				settler: addr_to_bytes32(self.output_settler),
+				chainId: U256::from(DEST_CHAIN_ID),
+				token: addr_to_bytes32(self.output_token),
+				amount: self.amount_out,
+				recipient: addr_to_bytes32(self.recipient),
+				callbackData: Default::default(),
+				context: Default::default(),
+			}],
+		}
+	}
+}
