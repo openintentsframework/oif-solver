@@ -72,7 +72,10 @@ async fn solver_submits_via_hyperlane_oracle() -> anyhow::Result<()> {
 		.await?;
 	assert_eq!(filled.orderId, order_id);
 	assert_eq!(filled.finalAmount, amount_out);
-	eprintln!("--- STEP 2: OutputFilled (tx={:?}) ---", fill_log.transaction_hash);
+	eprintln!(
+		"--- STEP 2: OutputFilled (tx={:?}) ---",
+		fill_log.transaction_hash
+	);
 
 	// (3) Solver finalises on origin. This is the load-bearing wait — by the
 	// time Finalised fires, the PostFill submit() must have completed (the
