@@ -6,7 +6,7 @@
 //! - Unified service combining cost estimation and profitability validation
 
 use crate::engine::token_manager::{TokenManager, TokenManagerError};
-use alloy_primitives::{keccak256, FixedBytes, B256, U256};
+use alloy_primitives::{keccak256, Address as AlloyAddress, B256, U256};
 use alloy_sol_types::{sol, SolCall};
 
 /// Discriminator strings for the post-fill live-estimate outcome event.
@@ -58,16 +58,6 @@ pub enum CostProfitError {
 	TokenManager(#[from] TokenManagerError),
 	#[error("Storage error: {0}")]
 	Storage(#[from] solver_storage::StorageError),
-}
-
-/// Left-pad a 20-byte EVM address into `bytes32`, right-aligned (occupies
-/// `bytes32[12..32]`). Caller passes raw 20 bytes; on a different length we
-/// truncate / zero-extend so we never panic.
-fn address20_to_bytes32(addr20: &[u8]) -> FixedBytes<32> {
-	let mut buf = [0u8; 32];
-	let len = addr20.len().min(20);
-	buf[32 - len..].copy_from_slice(&addr20[..len]);
-	FixedBytes::<32>::from(buf)
 }
 
 sol! {
@@ -1692,9 +1682,9 @@ impl CostProfitService {
 					message: format!("Output receiver is not an EVM address: {e}"),
 					details: None,
 				})?;
-		let token_bytes32 = address20_to_bytes32(token_addr.as_slice());
-		let recipient_bytes32 = address20_to_bytes32(recipient_addr.as_slice());
-		let settler_bytes32 = address20_to_bytes32(&settler_address.0);
+		let token_bytes32 = AlloyAddress::from_slice(token_addr.as_slice()).into_word();
+		let recipient_bytes32 = AlloyAddress::from_slice(recipient_addr.as_slice()).into_word();
+		let settler_bytes32 = AlloyAddress::from_slice(&settler_address.0).into_word();
 
 		// Hex-decode calldata, mirroring
 		// `crates/solver-service/src/apis/quote/generation.rs:938-951`.
@@ -1716,7 +1706,7 @@ impl CostProfitService {
 		};
 
 		let output_struct = SolMandateOutput {
-			oracle: FixedBytes::<32>::from(B256::ZERO),
+			oracle: B256::ZERO,
 			settler: settler_bytes32,
 			chainId: U256::from(chain_id),
 			token: token_bytes32,
@@ -1726,20 +1716,29 @@ impl CostProfitService {
 			context: Vec::<u8>::new().into(),
 		};
 
-		let filler_data = address20_to_bytes32(&solver_address.0).to_vec();
+		let filler_data = AlloyAddress::from_slice(&solver_address.0)
+			.into_word()
+			.to_vec();
 
 		// `fillDeadline` must be a near-future timestamp, but not too far ahead:
 		// production OutputSettlers reject both `0` (selector 0x9f3ddb90 =
-		// `FillDeadline()` — observed) AND values past their max-fill-window
-		// (which on OIF is typically the same order of magnitude as
-		// `api.quote.fill_deadline_seconds`, ~30 min). Use a tight `now + 60s`
-		// — well above the "must be in future" floor and well below any
-		// reasonable upper bound. Estimation completes in milliseconds, so this
-		// window is more than enough.
-		let fill_deadline_secs = current_timestamp().saturating_add(60);
+		// `FillDeadline()` — observed) AND values past their max-fill-window.
+		//
+		// Derive the window from `api.quote.fill_deadline_seconds` so the
+		// simulation matches what real fills will use — if the operator
+		// configures a longer deadline, the settler's max-fill-window must
+		// already accept it, so the same value is safe here. If config is
+		// missing, fall back to 60s (the historical hardcoded default).
+		let fill_deadline_window = config
+			.api
+			.as_ref()
+			.and_then(|a| a.quote.as_ref())
+			.map(|q| q.fill_deadline_seconds)
+			.unwrap_or(60);
+		let fill_deadline_secs = current_timestamp().saturating_add(fill_deadline_window);
 
 		let data = IOutputSettlerSimple::fillCall {
-			orderId: FixedBytes::<32>::from(B256::ZERO),
+			orderId: B256::ZERO,
 			output: output_struct,
 			fillDeadline: alloy_primitives::Uint::<48, 1>::from(fill_deadline_secs),
 			fillerData: filler_data.into(),
@@ -1867,8 +1866,8 @@ impl CostProfitService {
 					message: format!("Output receiver is not an EVM address: {e}"),
 					details: None,
 				})?;
-		let token_bytes32 = address20_to_bytes32(token_addr.as_slice());
-		let recipient_bytes32 = address20_to_bytes32(recipient_addr.as_slice());
+		let token_bytes32 = AlloyAddress::from_slice(token_addr.as_slice()).into_word();
+		let recipient_bytes32 = AlloyAddress::from_slice(recipient_addr.as_slice()).into_word();
 
 		let callback_data_bytes: Vec<u8> = match output.calldata.as_deref() {
 			None => Vec::new(),
@@ -1885,7 +1884,11 @@ impl CostProfitService {
 		};
 
 		let mut solver_identifier = [0u8; 32];
-		solver_identifier.copy_from_slice(address20_to_bytes32(&solver_address.0).as_slice());
+		solver_identifier.copy_from_slice(
+			AlloyAddress::from_slice(&solver_address.0)
+				.into_word()
+				.as_slice(),
+		);
 		let mut token = [0u8; 32];
 		token.copy_from_slice(token_bytes32.as_slice());
 		let mut recipient = [0u8; 32];
@@ -1919,8 +1922,8 @@ impl CostProfitService {
 		// timestamp prefix; what remains is the common payload (token | amount
 		// | recipient | call_len | call | ctx_len | ctx). Computed here, before
 		// `fill_description` is consumed by `payloads`, to keep one allocation.
-		let oracle_padded = address20_to_bytes32(&oracle_address.0);
-		let settler_padded = address20_to_bytes32(&output_settler.0);
+		let oracle_padded = AlloyAddress::from_slice(&oracle_address.0).into_word();
+		let settler_padded = AlloyAddress::from_slice(&output_settler.0).into_word();
 		let common_payload = &fill_description[68..];
 		let mut hash_buf = Vec::with_capacity(32 + 32 + 32 + common_payload.len());
 		hash_buf.extend_from_slice(oracle_padded.as_slice());
@@ -4891,8 +4894,8 @@ mod tests {
 			IOutputSettlerSimple::fillCall::abi_decode(&tx.data).expect("fillCall should decode");
 		assert_eq!(decoded.output.amount, U256::from(1_000_000u64));
 		// And confirm the placeholder fields are what we documented.
-		assert_eq!(decoded.orderId, FixedBytes::<32>::from(B256::ZERO));
-		assert_eq!(decoded.output.oracle, FixedBytes::<32>::from(B256::ZERO));
+		assert_eq!(decoded.orderId, B256::ZERO);
+		assert_eq!(decoded.output.oracle, B256::ZERO);
 	}
 
 	#[tokio::test]

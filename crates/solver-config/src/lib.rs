@@ -352,10 +352,6 @@ fn default_rate_buffer_bps() -> u32 {
 	14 // 0.14%
 }
 
-fn default_live_fill_estimate_enabled() -> bool {
-	true
-}
-
 fn default_live_post_fill_estimate_chain_ids() -> HashSet<u64> {
 	HashSet::new() // empty = disabled everywhere; opt-in per-chain
 }
@@ -370,7 +366,7 @@ pub struct GasConfig {
 	/// and uses the result instead of `flows.<key>.fill`. Other legs stay static.
 	/// Defaults to true; flip to false via the admin API to disable the live path
 	/// on a chain where eth_estimateGas is unreliable.
-	#[serde(default = "default_live_fill_estimate_enabled")]
+	#[serde(default = "default_true")]
 	pub live_fill_estimate_enabled: bool,
 	/// Set of chain IDs on which quote-time post-fill gas estimation
 	/// uses the stateOverride-based live path. Empty (default) = disabled
