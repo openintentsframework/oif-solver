@@ -133,6 +133,20 @@ pub const USER_ADDRESS: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 /// Anvil's third dev account. Receives the output token on the destination chain.
 pub const RECIPIENT_ADDRESS: &str = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
 
+/// Canonical Permit2 deployment address — same on every EVM chain. The
+/// `InputSettlerEscrow` hardcodes this address when handling Permit2-flavored
+/// `openFor` calls, so the harness must plant Permit2's runtime bytecode
+/// here (via `anvil_setCode`) when `HarnessOptions::enable_permit2` is set.
+pub const PERMIT2_ADDRESS: &str = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
+
+// Re-exports so test files can build EIP-712 payloads + POST `/api/v1/orders`
+// without each one taking a direct `solver-types` dependency.
+pub use solver_types::api::{
+	OifOrder, OrderPayload, OriginMode, OriginSubmission, PostOrderRequest, PostOrderResponse,
+	PostOrderResponseStatus, SignatureType,
+};
+pub use solver_types::utils::eip712::{reconstruct_eip3009_digest, reconstruct_permit2_digest};
+
 // =============================================================================
 // Chain layout — hardcoded to match config/demo.json conventions
 // =============================================================================
@@ -204,6 +218,11 @@ pub struct HarnessOptions {
 	/// `Harness::destination_mailbox_dispatch_count`) to assert the call
 	/// actually happened.
 	pub use_hyperlane_settlement: bool,
+	/// Plant the canonical Permit2 contract on the origin chain via
+	/// `anvil_setCode` and have the user pre-approve Permit2 for unlimited
+	/// TOKA spending. Required for any test that submits Permit2-signed
+	/// orders through the off-chain HTTP API (`OifOrder::OifEscrowV0`).
+	pub enable_permit2: bool,
 	/// Addresses (`"0x..."` strings, any case) to write into a deny list
 	/// JSON file in the harness's tempdir. The harness sets
 	/// `SeedOverrides.deny_list` to that file's path so the solver loads it
@@ -231,6 +250,7 @@ impl Default for HarnessOptions {
 			enable_admin_api: false,
 			admin_redis_url: None,
 			use_hyperlane_settlement: false,
+			enable_permit2: false,
 			deny_list_addresses: None,
 		}
 	}
@@ -326,6 +346,17 @@ impl Harness {
 					.context("deploy HyperlaneOracle (destination)")?;
 		}
 
+		// Permit2 scenario: plant the canonical Permit2 runtime bytecode on
+		// the origin chain. The InputSettlerEscrow hardcodes the canonical
+		// address, so we must `anvil_setCode` there. The user-side ERC20
+		// `approve(Permit2, MAX)` happens after the TOKA mint below — needs
+		// the user to actually have a positive balance first.
+		if options.enable_permit2 {
+			install_permit2_at_canonical(&origin_provider)
+				.await
+				.context("install Permit2 (origin)")?;
+		}
+
 		// Mint TOKA to user on origin (for the input leg) and TOKB to solver
 		// on destination (for the fill leg). Solver self-funds the fill —
 		// they bring their own inventory, exactly like production.
@@ -345,6 +376,22 @@ impl Harness {
 		)
 		.await
 		.context("mint TOKB to solver")?;
+
+		// User-side ERC20 approve to Permit2 for unlimited TOKA spending.
+		// Permit2-signed orders authorize InputSettlerEscrow to invoke
+		// `Permit2.permitWitnessTransferFrom` on the user's behalf — that
+		// internal call needs an upstream allowance from the user to Permit2.
+		// One-time per (user, token), MAX value.
+		if options.enable_permit2 {
+			user_approve_max(
+				&origin_rpc,
+				&user_signer,
+				origin.token_a,
+				parse_address(PERMIT2_ADDRESS)?,
+			)
+			.await
+			.context("user approve(Permit2, MAX) on TOKA")?;
+		}
 
 		// Materialize the deny list file when configured. The solver loads
 		// this at startup via `IntentHandler::load_deny_list` and matches
@@ -366,8 +413,7 @@ impl Harness {
 		// Write the bootstrap config. SeedOverrides shape — see notes at
 		// build_seed_overrides for why this is what `solver --bootstrap-config`
 		// expects (vs. the runtime Config schema in demo.json).
-		let seed_overrides =
-			build_seed_overrides(&origin, &destination, &options, deny_list_path)?;
+		let seed_overrides = build_seed_overrides(&origin, &destination, &options, deny_list_path)?;
 		let bootstrap_path = tempdir.path().join("bootstrap.json");
 		std::fs::write(
 			&bootstrap_path,
@@ -454,6 +500,47 @@ impl Harness {
 		format!("http://127.0.0.1:{SOLVER_API_PORT}/api/v1")
 	}
 
+	/// Compute the on-chain orderId for a `StandardOrder` by calling the
+	/// origin input settler's `orderIdentifier(order)` view. Off-chain
+	/// submission tests need this *before* the `Open` event fires so we can
+	/// build a log filter — the HTTP API's response may or may not echo the
+	/// orderId synchronously, and even when it does, computing it locally
+	/// gives a deterministic value to assert against.
+	pub async fn compute_order_id(&self, order: StandardOrder) -> Result<B256> {
+		let contract = IInputSettlerEscrow::new(self.origin.input_settler, &self.origin_provider);
+		contract
+			.orderIdentifier(order)
+			.call()
+			.await
+			.context("orderIdentifier view call")
+	}
+
+	/// POST a signed off-chain order to `/api/v1/orders`. Returns the
+	/// `PostOrderResponse` for inspection (status, optional orderId).
+	pub async fn submit_post_order(&self, request: &PostOrderRequest) -> Result<PostOrderResponse> {
+		let url = format!("{}/orders", self.api_base_url());
+		let resp = reqwest::Client::new()
+			.post(&url)
+			.json(request)
+			.send()
+			.await
+			.context("POST /orders")?;
+		let status = resp.status();
+		let body = resp.bytes().await.context("read /orders response body")?;
+		if !status.is_success() {
+			return Err(anyhow!(
+				"POST /orders status {status}, body: {}",
+				String::from_utf8_lossy(&body)
+			));
+		}
+		serde_json::from_slice::<PostOrderResponse>(&body).with_context(|| {
+			format!(
+				"decode PostOrderResponse from {} bytes (status {status})",
+				body.len()
+			)
+		})
+	}
+
 	/// Read the destination chain's `MockMailboxV2.dispatchCounter`. Returns
 	/// `Ok(0)` if no mock mailbox was deployed (Direct settlement, the
 	/// default). A counter > 0 after a flow finishes is durable proof that
@@ -490,9 +577,7 @@ impl Harness {
 			.client()
 			.request::<_, ()>("anvil_setBalance", (account, wei))
 			.await
-			.with_context(|| {
-				format!("anvil_setBalance({account}, {wei}) on chain {chain_id}")
-			})?;
+			.with_context(|| format!("anvil_setBalance({account}, {wei}) on chain {chain_id}"))?;
 		Ok(())
 	}
 
@@ -1037,6 +1122,59 @@ async fn deploy_hyperlane_oracle(provider: &DynProvider, mailbox: Address) -> Re
 		.expect("static address");
 	let args = (mailbox, custom_hook, ism).abi_encode_params();
 	deploy_raw(provider, bytecode, Bytes::from(args)).await
+}
+
+/// Plant Permit2's runtime bytecode at its canonical address via
+/// `anvil_setCode`. Reads `deployedBytecode.object` (NOT `bytecode.object`)
+/// from `artifacts/Permit2.json` — the canonical Permit2 address holds
+/// already-deployed code, never the CREATE initcode. After this, the
+/// `InputSettlerEscrow`'s hardcoded references to `0x...22D473` resolve to a
+/// working Permit2 instance.
+async fn install_permit2_at_canonical(provider: &DynProvider) -> Result<()> {
+	let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+	let path = manifest.join("artifacts/Permit2.json");
+	let raw = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+	let json: serde_json::Value =
+		serde_json::from_slice(&raw).with_context(|| format!("parse {}", path.display()))?;
+	let hex = json
+		.get("deployedBytecode")
+		.and_then(|d| d.get("object"))
+		.and_then(|o| o.as_str())
+		.ok_or_else(|| anyhow!("Permit2 artifact missing deployedBytecode.object"))?;
+	let addr = parse_address(PERMIT2_ADDRESS)?;
+	provider
+		.client()
+		.request::<_, ()>("anvil_setCode", (addr, hex.to_string()))
+		.await
+		.context("anvil_setCode for Permit2")?;
+	Ok(())
+}
+
+/// User-signed ERC20 `approve(spender, MAX_UINT256)`. Used to grant Permit2
+/// (or any other contract) unlimited spending authority over the user's
+/// tokens — Permit2's own typed-data signatures are downstream of this
+/// allowance.
+async fn user_approve_max(
+	rpc_url: &str,
+	user_signer: &PrivateKeySigner,
+	token: Address,
+	spender: Address,
+) -> Result<()> {
+	let provider = build_provider(rpc_url, user_signer.clone()).await?;
+	let contract = IERC20::new(token, provider);
+	let pending = contract
+		.approve(spender, U256::MAX)
+		.send()
+		.await
+		.context("send approve(MAX)")?;
+	let receipt = pending.get_receipt().await.context("approve receipt")?;
+	if !receipt.status() {
+		return Err(anyhow!(
+			"approve(MAX) reverted (tx {:?})",
+			receipt.transaction_hash
+		));
+	}
+	Ok(())
 }
 
 async fn mint_erc20(
