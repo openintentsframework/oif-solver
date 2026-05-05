@@ -4,7 +4,7 @@
 //! without depending on solver-internal state.
 
 use solver_e2e_tests::{
-	amount_with_decimals_helper, assert_open_failed, unix_now_plus, Harness, HarnessOptions,
+	amount_with_decimals_helper, assert_open_failed, unix_now_minus, Harness, HarnessOptions,
 	OutputFilled, StandardOrderBuilder, DEST_CHAIN_ID,
 };
 use std::time::Duration;
@@ -50,8 +50,8 @@ async fn expired_order_open_fails() -> anyhow::Result<()> {
 	let amount_in = amount_with_decimals_helper(1_000);
 	let order = StandardOrderBuilder::happy_path(&h, "e2e-expired-order")
 		.amount_in(amount_in)
-		.expires(unix_now_plus(0).saturating_sub(10))
-		.fill_deadline(unix_now_plus(0).saturating_sub(10))
+		.expires(unix_now_minus(10))
+		.fill_deadline(unix_now_minus(10))
 		.build();
 
 	h.user_approve(h.origin.token_a, h.origin.input_settler, amount_in)

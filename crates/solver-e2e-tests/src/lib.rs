@@ -1,9 +1,9 @@
 //! End-to-end test harness for the OIF solver.
 //!
-//! Lifecycle: spawn two Anvil processes → deploy MockERC20s + AlwaysYesOracle
-//! + InputSettlerEscrow + OutputSettlerSimple on each chain → write a typed
+//! Lifecycle: spawn two Anvil processes → deploy MockERC20s, AlwaysYesOracle,
+//! InputSettlerEscrow, and OutputSettlerSimple on each chain → write a typed
 //! `SeedOverrides` bootstrap config → spawn the `solver` binary → expose
-//! deployed addresses + signers to the test.
+//! deployed addresses and signers to the test.
 //!
 //! Design choices are documented in `crates/solver-e2e-tests/README.md`.
 
@@ -163,15 +163,14 @@ pub struct HarnessOptions {
 	pub solver_token_b_mint: U256,
 	pub use_false_oracle: bool,
 	pub use_reverting_output_settler: bool,
-	pub enable_permit2: bool,
 	pub enable_admin_api: bool,
 	pub admin_redis_url: Option<String>,
-	pub enable_offchain_api: bool,
-	// Phase 2 rebalance fields should plug into the RebalanceOverridesBuilder
-	// added in Task 0b instead of reshaping the seed override path later:
+	// Future scenario groups can add typed fields here as they get real
+	// call sites, e.g.:
+	// pub enable_permit2: bool,
+	// pub enable_offchain_api: bool,
 	// pub enable_rebalance: bool,
 	// pub rebalance_pairs: Vec<solver_types::OperatorRebalancePairConfig>,
-	// pub rebalance_overrides: RebalanceOverridesBuilder,
 }
 
 impl Default for HarnessOptions {
@@ -181,10 +180,8 @@ impl Default for HarnessOptions {
 			solver_token_b_mint: amount_with_decimals(1_000_000),
 			use_false_oracle: false,
 			use_reverting_output_settler: false,
-			enable_permit2: false,
 			enable_admin_api: false,
 			admin_redis_url: None,
-			enable_offchain_api: false,
 		}
 	}
 }
@@ -210,9 +207,10 @@ impl Harness {
 
 		// Boot two anvil processes. We track the children so Drop can SIGKILL
 		// them, even if the test panics.
-		let mut anvils = Vec::new();
-		anvils.push(spawn_anvil(ORIGIN_CHAIN_ID, ORIGIN_RPC_PORT)?);
-		anvils.push(spawn_anvil(DEST_CHAIN_ID, DEST_RPC_PORT)?);
+		let anvils = vec![
+			spawn_anvil(ORIGIN_CHAIN_ID, ORIGIN_RPC_PORT)?,
+			spawn_anvil(DEST_CHAIN_ID, DEST_RPC_PORT)?,
+		];
 
 		let origin_rpc = format!("http://127.0.0.1:{ORIGIN_RPC_PORT}");
 		let dest_rpc = format!("http://127.0.0.1:{DEST_RPC_PORT}");
@@ -383,7 +381,7 @@ impl Harness {
 			.send()
 			.await
 			.context("send approve")?;
-		Ok(pending.get_receipt().await.context("approve receipt")?)
+		pending.get_receipt().await.context("approve receipt")
 	}
 
 	/// User submits `open(order)` on the origin input settler. Returns the
@@ -406,7 +404,7 @@ impl Harness {
 		let provider = build_provider(&self.origin.rpc_http, self.user_signer.clone()).await?;
 		let contract = IInputSettlerEscrow::new(self.origin.input_settler, provider);
 		let pending = contract.open(order).send().await.context("send open")?;
-		Ok(pending.get_receipt().await.context("open receipt")?)
+		pending.get_receipt().await.context("open receipt")
 	}
 
 	/// Poll for the next log on `chain_id` matching the given event signature
@@ -421,26 +419,15 @@ impl Harness {
 	) -> Result<(E, Log)> {
 		const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-		let provider = self.provider_for(chain_id)?;
 		let deadline = Instant::now() + timeout;
 		let mut from_block: u64 = 0;
 
 		loop {
-			let head = provider
-				.get_block_number()
-				.await
-				.context("get_block_number")?;
-			let filter = Filter::new()
-				.address(address)
-				.event_signature(E::SIGNATURE_HASH)
-				.topic1(order_id)
-				.from_block(from_block)
-				.to_block(BlockNumberOrTag::Number(head));
-
-			let logs = provider.get_logs(&filter).await.context("get_logs")?;
-			if let Some(log) = logs.into_iter().next() {
-				let decoded = E::decode_log(&log.inner).context("decode event")?;
-				return Ok((decoded.data, log));
+			let (event, next_from_block) = self
+				.poll_event_once::<E>(chain_id, address, order_id, from_block)
+				.await?;
+			if let Some((event, log)) = event {
+				return Ok((event, log));
 			}
 			if Instant::now() >= deadline {
 				// Self-diagnostic: dump solver stderr + bootstrap config so the
@@ -453,7 +440,7 @@ impl Harness {
 					E::SIGNATURE
 				));
 			}
-			from_block = head.saturating_add(1);
+			from_block = next_from_block;
 			tokio::time::sleep(POLL_INTERVAL).await;
 		}
 	}
@@ -468,25 +455,14 @@ impl Harness {
 	) -> Result<()> {
 		const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-		let provider = self.provider_for(chain_id)?;
 		let deadline = Instant::now() + timeout;
 		let mut from_block: u64 = 0;
 
 		loop {
-			let head = provider
-				.get_block_number()
-				.await
-				.context("get_block_number")?;
-			let filter = Filter::new()
-				.address(address)
-				.event_signature(E::SIGNATURE_HASH)
-				.topic1(order_id)
-				.from_block(from_block)
-				.to_block(BlockNumberOrTag::Number(head));
-
-			let logs = provider.get_logs(&filter).await.context("get_logs")?;
-			if let Some(log) = logs.into_iter().next() {
-				E::decode_log(&log.inner).context("decode unexpected event")?;
+			let (event, next_from_block) = self
+				.poll_event_once::<E>(chain_id, address, order_id, from_block)
+				.await?;
+			if event.is_some() {
 				self.dump_solver_stderr();
 				self.dump_bootstrap_config();
 				return Err(anyhow!(
@@ -498,9 +474,39 @@ impl Harness {
 			if Instant::now() >= deadline {
 				return Ok(());
 			}
-			from_block = head.saturating_add(1);
+			from_block = next_from_block;
 			tokio::time::sleep(POLL_INTERVAL).await;
 		}
+	}
+
+	async fn poll_event_once<E: SolEvent>(
+		&self,
+		chain_id: u64,
+		address: Address,
+		order_id: B256,
+		from_block: u64,
+	) -> Result<(Option<(E, Log)>, u64)> {
+		let provider = self.provider_for(chain_id)?;
+		let head = provider
+			.get_block_number()
+			.await
+			.context("get_block_number")?;
+		let filter = Filter::new()
+			.address(address)
+			.event_signature(E::SIGNATURE_HASH)
+			.topic1(order_id)
+			.from_block(from_block)
+			.to_block(BlockNumberOrTag::Number(head));
+
+		let logs = provider.get_logs(&filter).await.context("get_logs")?;
+		let event = if let Some(log) = logs.into_iter().next() {
+			let decoded = E::decode_log(&log.inner).context("decode event")?;
+			Some((decoded.data, log))
+		} else {
+			None
+		};
+
+		Ok((event, head.saturating_add(1)))
 	}
 
 	fn provider_for(&self, chain_id: u64) -> Result<&DynProvider> {
@@ -561,7 +567,10 @@ fn spawn_anvil(chain_id: u64, port: u16) -> Result<Child> {
 			"--accounts",
 			"10",
 			"--block-time",
-			"1", // 1s block time keeps log indexing snappy without busy-mining
+			"1", // 1s block-time keeps block.timestamp moving so settlement's
+			     // dispute period actually elapses. Auto-mine breaks this:
+			     // origin chain produces no blocks while the solver waits, so
+			     // dispute_period_seconds never appears to pass.
 		])
 		.stdout(Stdio::null())
 		.stderr(Stdio::null())
@@ -692,15 +701,11 @@ pub fn assert_open_failed(result: Result<TransactionReceipt>, context: &str) {
 	}
 }
 
-pub fn assert_reverted_receipt(receipt: &TransactionReceipt, context: &str) {
-	assert!(
-		!receipt.status(),
-		"{context}: expected transaction to revert"
-	);
-}
-
 pub fn assert_balance_delta(before: U256, after: U256, expected: U256, context: &str) {
-	assert_eq!(after - before, expected, "{context}");
+	let actual = after
+		.checked_sub(before)
+		.unwrap_or_else(|| panic!("{context}: balance decreased"));
+	assert_eq!(actual, expected, "{context}");
 }
 
 pub fn redis_url_or_skip() -> Option<String> {
@@ -758,7 +763,7 @@ fn load_bytecode(contract_name: &str) -> Result<Bytes> {
 }
 
 fn load_bytecode_from_artifact(path: &std::path::Path, contract_name: &str) -> Result<Bytes> {
-	let raw = std::fs::read(&path).with_context(|| format!("read artifact {}", path.display()))?;
+	let raw = std::fs::read(path).with_context(|| format!("read artifact {}", path.display()))?;
 	let json: serde_json::Value = serde_json::from_slice(&raw)
 		.with_context(|| format!("parse artifact {}", path.display()))?;
 	let hex = json
@@ -891,29 +896,10 @@ async fn mint_erc20(
 // keyed by `chain_id` — NOT a HashMap. Hand-writing JSON in the runtime
 // `Config` shape (a map) is what was breaking the previous run.
 
-#[derive(Debug, Clone, Default)]
-pub struct RebalanceOverridesBuilder {
-	pub config: Option<solver_types::OperatorRebalanceConfig>,
-}
-
 fn build_seed_overrides(
 	origin: &ChainDeployment,
 	destination: &ChainDeployment,
 	options: &HarnessOptions,
-) -> Result<solver_types::SeedOverrides> {
-	build_seed_overrides_with_rebalance(
-		origin,
-		destination,
-		options,
-		RebalanceOverridesBuilder::default(),
-	)
-}
-
-fn build_seed_overrides_with_rebalance(
-	origin: &ChainDeployment,
-	destination: &ChainDeployment,
-	options: &HarnessOptions,
-	rebalance: RebalanceOverridesBuilder,
 ) -> Result<solver_types::SeedOverrides> {
 	use solver_types::networks::NetworkType;
 	use solver_types::seed_overrides::{
@@ -1007,7 +993,7 @@ fn build_seed_overrides_with_rebalance(
 		rate_buffer_bps: None,
 		monitoring_timeout_seconds: None,
 		deny_list: None,
-		rebalance: rebalance.config,
+		rebalance: None,
 	})
 }
 
@@ -1104,11 +1090,13 @@ fn spawn_solver(
 		// CoinGecko for our fake TOKA/TOKB. The mock impl has TOKA/USD and
 		// TOKB/USD prices baked in — see `MockPricing::new`.
 		.env("PRICING_PRIMARY", "mock")
-		.env("JWT_SECRET", "solver-e2e-admin-jwt-secret")
 		.env("RUST_LOG", rust_log)
 		.stdout(stdout_file)
 		.stderr(stderr_file);
 
+	if options.enable_admin_api {
+		command.env("JWT_SECRET", "solver-e2e-admin-jwt-secret");
+	}
 	if let Some(redis_url) = &options.admin_redis_url {
 		command.env("REDIS_URL", redis_url);
 	}
@@ -1149,6 +1137,17 @@ pub fn unix_now_plus(secs: u64) -> u32 {
 		.unwrap_or(u32::MAX)
 }
 
+/// Returns a unix timestamp `secs` seconds in the past.
+pub fn unix_now_minus(secs: u64) -> u32 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_secs()
+		.saturating_sub(secs)
+		.try_into()
+		.unwrap_or(0)
+}
+
 /// Address as bytes32 (left-padded). Required by MandateOutput's bytes32 fields.
 pub fn addr_to_bytes32(addr: Address) -> B256 {
 	let mut b = [0u8; 32];
@@ -1167,6 +1166,7 @@ pub fn nonce_from_seed(seed: &str) -> U256 {
 	U256::from_be_bytes::<32>(keccak256(seed.as_bytes()).into())
 }
 
+#[must_use = "call .build() to produce a StandardOrder"]
 pub struct StandardOrderBuilder<'a> {
 	harness: &'a Harness,
 	seed: String,

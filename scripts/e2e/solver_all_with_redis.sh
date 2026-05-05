@@ -4,6 +4,14 @@ set -euo pipefail
 container_name="${E2E_REDIS_CONTAINER_NAME:-oif-solver-e2e-redis}"
 redis_port="${E2E_REDIS_PORT:-6379}"
 redis_image="${E2E_REDIS_IMAGE:-redis:7-alpine}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "${script_dir}/../.." && pwd)"
+solver_all="${script_dir}/solver_all.sh"
+
+run_solver_all() {
+  cd "${repo_root}"
+  "${solver_all}"
+}
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "docker is required when REDIS_URL is not already set" >&2
@@ -11,7 +19,8 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 if [ -n "${REDIS_URL:-}" ]; then
-  exec scripts/e2e/solver_all.sh
+  run_solver_all
+  exit $?
 fi
 
 cleanup() {
@@ -29,7 +38,7 @@ docker run \
 for _ in $(seq 1 30); do
   if docker exec "${container_name}" redis-cli ping >/dev/null 2>&1; then
     export REDIS_URL="redis://127.0.0.1:${redis_port}"
-    scripts/e2e/solver_all.sh
+    run_solver_all
     exit $?
   fi
   sleep 1

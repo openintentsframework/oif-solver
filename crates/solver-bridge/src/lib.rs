@@ -473,19 +473,19 @@ impl BridgeRegistry {
 		Ok(())
 	}
 
-	pub fn all() -> Vec<(&'static str, BridgeFactory)> {
+	pub fn all() -> Result<Vec<(&'static str, BridgeFactory)>, BridgeError> {
 		let implementations = Self::registry()
 			.lock()
-			.expect("bridge registry lock poisoned");
-		implementations
+			.map_err(|_| BridgeError::Config("bridge registry lock poisoned".to_string()))?;
+		Ok(implementations
 			.iter()
 			.map(|(name, factory)| (*name, *factory))
-			.collect()
+			.collect())
 	}
 }
 
 /// Returns all registered bridge implementations.
-pub fn get_all_implementations() -> Vec<(&'static str, BridgeFactory)> {
+pub fn get_all_implementations() -> Result<Vec<(&'static str, BridgeFactory)>, BridgeError> {
 	BridgeRegistry::all()
 }
 
@@ -566,7 +566,7 @@ mod tests {
 		BridgeRegistry::register("unit-test-bridge", registry_test_bridge_factory)
 			.expect("register test bridge");
 
-		let implementations = get_all_implementations();
+		let implementations = get_all_implementations().expect("read bridge registry");
 
 		assert!(
 			implementations.iter().any(|(name, _)| *name == "layerzero"),
