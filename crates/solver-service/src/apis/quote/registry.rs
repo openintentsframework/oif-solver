@@ -233,9 +233,7 @@ pub struct TokenCapabilities {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use solver_delivery::{
-		DeliveryError, DeliveryInterface, DeliveryService, MockDeliveryInterface,
-	};
+	use solver_delivery::{DeliveryInterface, DeliveryService, MockDeliveryInterface};
 	use std::{collections::HashMap, sync::Arc};
 
 	#[test]
@@ -286,10 +284,15 @@ mod tests {
 			.parse()
 			.unwrap();
 
+		// A definitive negative: the contract responded with 32 bytes that are NOT
+		// the expected RECEIVE_WITH_AUTHORIZATION_TYPEHASH. Only definitive outcomes
+		// (Ok with matching or mismatching bytes) are cached; transport errors are
+		// intentionally retried instead of poisoning the cache.
 		let mut mock_delivery = MockDeliveryInterface::new();
-		mock_delivery.expect_eth_call().times(1).returning(|_| {
-			Box::pin(async { Err(DeliveryError::Network("unsupported selector".to_string())) })
-		});
+		mock_delivery
+			.expect_eth_call()
+			.times(1)
+			.returning(|_| Box::pin(async { Ok(alloy_primitives::Bytes::from(vec![0u8; 32])) }));
 
 		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
 		implementations.insert(1, Arc::new(mock_delivery));
