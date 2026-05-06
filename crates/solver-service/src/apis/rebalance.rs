@@ -847,30 +847,8 @@ mod tests {
 
 	#[async_trait]
 	impl AccountInterface for DummyAccount {
-		fn config_schema(&self) -> Box<dyn solver_types::ConfigSchema> {
-			Box::new(solver_account::implementations::local::LocalWalletSchema)
-		}
-
 		async fn address(&self) -> Result<solver_types::Address, solver_account::AccountError> {
 			Ok(self.address.clone())
-		}
-
-		async fn sign_transaction(
-			&self,
-			_tx: &solver_types::Transaction,
-		) -> Result<solver_types::Signature, solver_account::AccountError> {
-			Err(solver_account::AccountError::Implementation(
-				"not needed in rebalance tests".to_string(),
-			))
-		}
-
-		async fn sign_message(
-			&self,
-			_message: &[u8],
-		) -> Result<solver_types::Signature, solver_account::AccountError> {
-			Err(solver_account::AccountError::Implementation(
-				"not needed in rebalance tests".to_string(),
-			))
 		}
 
 		fn signer(&self) -> AccountSigner {

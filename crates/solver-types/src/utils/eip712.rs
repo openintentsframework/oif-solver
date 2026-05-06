@@ -828,6 +828,7 @@ pub fn admin_eip712_types() -> serde_json::Value {
 			{"name": "eip3009EscrowPreClaim", "type": "uint64"},
 			{"name": "eip3009EscrowClaim", "type": "uint64"},
 			{"name": "livePostFillEstimateChainIds", "type": "uint64[]"},
+			{"name": "liveFillEstimateEnabled", "type": "bool"},
 			{"name": "nonce", "type": "uint256"},
 			{"name": "deadline", "type": "uint256"}
 		],
@@ -1998,6 +1999,7 @@ mod tests {
 		assert!(names.contains(&"eip3009EscrowPreClaim"));
 		assert!(names.contains(&"eip3009EscrowClaim"));
 		assert!(names.contains(&"livePostFillEstimateChainIds"));
+		assert!(names.contains(&"liveFillEstimateEnabled"));
 		assert!(names.contains(&"nonce"));
 		assert!(names.contains(&"deadline"));
 	}

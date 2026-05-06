@@ -261,13 +261,18 @@ impl IntentHandler {
 		let order_bytes = &intent.order_bytes;
 
 		// For on-chain discovered intents, we use a simple callback that returns the intent ID
-		// since the order ID was already computed during discovery
-		let intent_id = intent.id.clone();
+		// since the order ID was already computed during discovery.
+		//
+		// Normalize the id before handing it to `hex::decode`. Discovery sources may emit
+		// ids with or without the `0x` prefix; without normalization a prefixed intent
+		// passes the dedupe step above (which canonicalizes via `with_0x_prefix`) but
+		// then fails order creation here, since `alloy_primitives::hex::decode` rejects
+		// `0x...`-prefixed inputs.
+		let intent_id = solver_types::without_0x_prefix(&intent.id).to_string();
 		let order_id_callback: solver_types::OrderIdCallback =
 			Box::new(move |_chain_id, _tx_data| {
 				let id = intent_id.clone();
 				Box::pin(async move {
-					// Return the intent ID as bytes (it's already a hex string)
 					alloy_primitives::hex::decode(&id)
 						.map_err(|e| format!("Failed to decode intent ID: {e}"))
 				})

@@ -187,7 +187,7 @@ The override path pre-populates the OutputSettler's `_fillRecords[orderId][outpu
 
 Run the live integration test against the destination chain whose ID you want to add. The test sends two `eth_estimateGas` calls for a synthetic post-fill `submit(...)` — one bare (which must revert) and one with the override (which must return realistic units):
 
-```
+```bash
 OIF_LIVE_RPC=1 \
 OIF_TEST_DEST_RPC_URL=<destination_chain_rpc_url> \
 OIF_TEST_DEST_CHAIN_ID=<chain_id_to_validate> \

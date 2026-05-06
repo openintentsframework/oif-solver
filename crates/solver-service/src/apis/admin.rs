@@ -550,6 +550,7 @@ pub async fn handle_update_gas(
 		.iter()
 		.copied()
 		.collect();
+	operator_config.gas.live_fill_estimate_enabled = request.live_fill_estimate_enabled;
 
 	let new_versioned = state
 		.config_store
@@ -1633,26 +1634,8 @@ mod tests {
 
 	#[async_trait]
 	impl AccountInterface for DummyAccount {
-		fn config_schema(&self) -> Box<dyn solver_types::ConfigSchema> {
-			Box::new(solver_account::implementations::local::LocalWalletSchema)
-		}
-
 		async fn address(&self) -> Result<solver_types::Address, solver_account::AccountError> {
 			Ok(self.address.clone())
-		}
-
-		async fn sign_transaction(
-			&self,
-			_tx: &solver_types::Transaction,
-		) -> Result<solver_types::Signature, solver_account::AccountError> {
-			Ok(solver_types::Signature(vec![0u8; 65]))
-		}
-
-		async fn sign_message(
-			&self,
-			_message: &[u8],
-		) -> Result<solver_types::Signature, solver_account::AccountError> {
-			Ok(solver_types::Signature(vec![0u8; 65]))
 		}
 
 		fn signer(&self) -> AccountSigner {

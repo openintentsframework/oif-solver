@@ -147,6 +147,7 @@ sol! {
 		uint64 eip3009EscrowPreClaim;
 		uint64 eip3009EscrowClaim;
 		uint64[] livePostFillEstimateChainIds;
+		bool liveFillEstimateEnabled;
 		uint256 nonce;
 		uint256 deadline;
 	}
@@ -439,6 +440,14 @@ impl UpdateFeeConfigContents {
 	}
 }
 
+/// `live_fill_estimate_enabled` defaults to `true` when omitted from the
+/// signed payload, matching `OperatorGasConfig`'s default. This keeps existing
+/// admin clients (which haven't started signing the new field yet) from
+/// accidentally turning live fill estimation off on the next gas-config update.
+fn default_live_fill_estimate_enabled() -> bool {
+	true
+}
+
 /// UpdateGasConfig action contents
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -463,6 +472,8 @@ pub struct UpdateGasConfigContents {
 	/// logical set produce the same signature regardless of insertion order.
 	#[serde(default)]
 	pub live_post_fill_estimate_chain_ids: Vec<u64>,
+	#[serde(default = "default_live_fill_estimate_enabled")]
+	pub live_fill_estimate_enabled: bool,
 	#[serde(with = "string_or_number")]
 	pub nonce: u64,
 	#[serde(with = "string_or_number")]
@@ -497,6 +508,7 @@ impl UpdateGasConfigContents {
 			eip3009EscrowPreClaim: self.eip3009_escrow_pre_claim,
 			eip3009EscrowClaim: self.eip3009_escrow_claim,
 			livePostFillEstimateChainIds: sorted_chain_ids,
+			liveFillEstimateEnabled: self.live_fill_estimate_enabled,
 			nonce: U256::from(self.nonce),
 			deadline: U256::from(self.deadline),
 		}
@@ -2147,6 +2159,7 @@ mod tests {
 				eip3009_escrow_pre_claim: 14,
 				eip3009_escrow_claim: 15,
 				live_post_fill_estimate_chain_ids: chain_ids,
+				live_fill_estimate_enabled: true,
 				nonce: 1u64,
 				deadline: 2u64,
 			}
