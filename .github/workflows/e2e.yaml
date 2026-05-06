@@ -48,7 +48,9 @@ jobs:
           path: oif-contracts
           # forge-std, permit2, the-compact, openzeppelin-contracts, broadcaster
           submodules: recursive
-          # Pin to a SHA for stricter reproducibility; default tracks main.
+          # Tracks upstream main. Replace with a commit SHA if you need
+          # strict reproducibility across CI runs (cache key is keyed on the
+          # resolved SHA either way, so upstream changes invalidate cleanly).
           ref: main
 
       # Forge cache key invalidates on any change to oif-contracts source or
