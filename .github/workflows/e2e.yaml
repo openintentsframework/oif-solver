@@ -12,14 +12,12 @@ on:
     paths-ignore:
       - docs/**
       - "**.md"
-      - .github/**
   push:
     branches:
       - main
     paths-ignore:
       - docs/**
       - "**.md"
-      - .github/**
   workflow_dispatch:
 
 jobs:
