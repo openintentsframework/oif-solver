@@ -134,9 +134,16 @@ mod tests {
 	}
 
 	fn create_test_app(jwt_service: Arc<JwtService>) -> Router {
+		create_test_app_with_scope(jwt_service, AuthScope::ReadOrders)
+	}
+
+	fn create_test_app_with_scope(
+		jwt_service: Arc<JwtService>,
+		required_scope: AuthScope,
+	) -> Router {
 		let auth_state = AuthState {
 			jwt_service,
-			required_scope: AuthScope::ReadOrders,
+			required_scope,
 		};
 
 		Router::new()
@@ -224,6 +231,70 @@ mod tests {
 
 		let app = create_test_app(jwt_service);
 
+		let response = app
+			.oneshot(
+				Request::builder()
+					.uri("/protected")
+					.header("Authorization", format!("Bearer {token}"))
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(response.status(), StatusCode::FORBIDDEN);
+	}
+
+	#[tokio::test]
+	async fn test_admin_all_grants_admin_read_route() {
+		let config = AuthConfig {
+			enabled: true,
+			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars"),
+			access_token_expiry_hours: 1,
+			refresh_token_expiry_hours: 720,
+			issuer: "test".to_string(),
+			public_register_enabled: false,
+			admin: None,
+		};
+
+		let jwt_service = Arc::new(JwtService::new(config).unwrap());
+		let token = jwt_service
+			.generate_access_token("admin", vec![AuthScope::AdminAll])
+			.unwrap();
+
+		let app = create_test_app_with_scope(jwt_service, AuthScope::AdminRead);
+		let response = app
+			.oneshot(
+				Request::builder()
+					.uri("/protected")
+					.header("Authorization", format!("Bearer {token}"))
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(response.status(), StatusCode::OK);
+	}
+
+	#[tokio::test]
+	async fn test_admin_read_does_not_grant_admin_all_route() {
+		let config = AuthConfig {
+			enabled: true,
+			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars"),
+			access_token_expiry_hours: 1,
+			refresh_token_expiry_hours: 720,
+			issuer: "test".to_string(),
+			public_register_enabled: false,
+			admin: None,
+		};
+
+		let jwt_service = Arc::new(JwtService::new(config).unwrap());
+		let token = jwt_service
+			.generate_access_token("readonly", vec![AuthScope::AdminRead])
+			.unwrap();
+
+		let app = create_test_app_with_scope(jwt_service, AuthScope::AdminAll);
 		let response = app
 			.oneshot(
 				Request::builder()

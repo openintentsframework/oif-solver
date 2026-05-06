@@ -408,7 +408,10 @@ pub fn merge_to_operator_config(
 			domain: admin_override.domain.clone(),
 			chain_id: admin_override.chain_id.unwrap_or(chain_ids[0]),
 			nonce_ttl_seconds: admin_override.nonce_ttl_seconds.unwrap_or(300),
-			admin_addresses: admin_override.admin_addresses.clone(),
+			whitelist: OperatorAdminConfig::normalize_whitelist(
+				&admin_override.admin_addresses,
+				&admin_override.whitelist,
+			),
 			withdrawals: OperatorWithdrawalsConfig {
 				enabled: admin_override.withdrawals.enabled,
 			},
@@ -1926,7 +1929,7 @@ fn build_api_config_from_operator(
 				domain: admin.domain.clone(),
 				chain_id: Some(admin.chain_id),
 				nonce_ttl_seconds: admin.nonce_ttl_seconds,
-				admin_addresses: admin.admin_addresses.clone(),
+				whitelist: admin.whitelist.clone(),
 			})
 		} else {
 			None
@@ -2230,7 +2233,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 				.chain_id
 				.unwrap_or(chain_ids.first().copied().unwrap_or(1)),
 			nonce_ttl_seconds: a.nonce_ttl_seconds,
-			admin_addresses: a.admin_addresses.clone(),
+			whitelist: a.normalized_whitelist(),
 			withdrawals: OperatorWithdrawalsConfig::default(),
 		})
 		.unwrap_or_default();
@@ -3095,6 +3098,7 @@ mod tests {
 	use rust_decimal::Decimal;
 	use serial_test::serial;
 	use solver_types::seed_overrides::AdminOverride;
+	use solver_types::{AdminRole, AdminWhitelistEntry};
 	use std::ffi::OsString;
 	use std::str::FromStr;
 
@@ -5488,6 +5492,7 @@ mod tests {
 				chain_id: Some(1),
 				nonce_ttl_seconds: Some(600),
 				admin_addresses: vec![address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")],
+				whitelist: Vec::new(),
 				withdrawals: solver_types::seed_overrides::WithdrawalsOverride::default(),
 			}),
 			auth_enabled: None,
@@ -5508,7 +5513,67 @@ mod tests {
 		assert_eq!(op_config.admin.domain, "test.solver.com");
 		assert_eq!(op_config.admin.chain_id, 1);
 		assert_eq!(op_config.admin.nonce_ttl_seconds, 600);
-		assert_eq!(op_config.admin.admin_addresses.len(), 1);
+		assert_eq!(op_config.admin.admin_addresses().len(), 1);
+	}
+
+	#[test]
+	fn test_merge_to_operator_config_normalizes_typed_whitelist() {
+		let admin_address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+		let read_only_address = address!("70997970C51812dc3A010C7d01b50e0d17dc79C8");
+		let mut overrides = test_seed_overrides();
+		overrides.admin = Some(AdminOverride {
+			enabled: true,
+			domain: "test.solver.com".to_string(),
+			chain_id: Some(1),
+			nonce_ttl_seconds: Some(600),
+			admin_addresses: Vec::new(),
+			whitelist: vec![
+				AdminWhitelistEntry {
+					address: admin_address,
+					role: AdminRole::Admin,
+				},
+				AdminWhitelistEntry {
+					address: read_only_address,
+					role: AdminRole::ReadOnly,
+				},
+			],
+			withdrawals: solver_types::seed_overrides::WithdrawalsOverride::default(),
+		});
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+
+		assert_eq!(
+			op_config.admin.role_for(&admin_address),
+			Some(AdminRole::Admin)
+		);
+		assert_eq!(
+			op_config.admin.role_for(&read_only_address),
+			Some(AdminRole::ReadOnly)
+		);
+		assert_eq!(op_config.admin.whitelist.len(), 2);
+	}
+
+	#[test]
+	fn test_merge_to_operator_config_deduplicates_with_admin_winning() {
+		let address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+		let mut overrides = test_seed_overrides();
+		overrides.admin = Some(AdminOverride {
+			enabled: true,
+			domain: "test.solver.com".to_string(),
+			chain_id: Some(1),
+			nonce_ttl_seconds: Some(600),
+			admin_addresses: vec![address],
+			whitelist: vec![AdminWhitelistEntry {
+				address,
+				role: AdminRole::ReadOnly,
+			}],
+			withdrawals: solver_types::seed_overrides::WithdrawalsOverride::default(),
+		});
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+
+		assert_eq!(op_config.admin.whitelist.len(), 1);
+		assert_eq!(op_config.admin.role_for(&address), Some(AdminRole::Admin));
 	}
 
 	#[test]
@@ -5960,7 +6025,10 @@ mod tests {
 			domain: "solver.example.com".to_string(),
 			chain_id: 1,
 			nonce_ttl_seconds: 300,
-			admin_addresses: vec![address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")],
+			whitelist: vec![solver_types::AdminWhitelistEntry {
+				address: address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+				role: solver_types::AdminRole::Admin,
+			}],
 			withdrawals: OperatorWithdrawalsConfig::default(),
 		};
 
@@ -5988,7 +6056,7 @@ mod tests {
 			domain: "".to_string(),
 			chain_id: 0,
 			nonce_ttl_seconds: 0,
-			admin_addresses: vec![],
+			whitelist: vec![],
 			withdrawals: OperatorWithdrawalsConfig::default(),
 		};
 
@@ -6010,7 +6078,7 @@ mod tests {
 			domain: "".to_string(),
 			chain_id: 0,
 			nonce_ttl_seconds: 0,
-			admin_addresses: vec![],
+			whitelist: vec![],
 			withdrawals: OperatorWithdrawalsConfig::default(),
 		};
 
@@ -6133,7 +6201,10 @@ mod tests {
 			domain: "test.com".to_string(),
 			chain_id: 1,
 			nonce_ttl_seconds: 300,
-			admin_addresses: vec![address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")],
+			whitelist: vec![solver_types::AdminWhitelistEntry {
+				address: address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+				role: solver_types::AdminRole::Admin,
+			}],
 			withdrawals: OperatorWithdrawalsConfig::default(),
 		};
 		let api = build_api_config_from_operator(&admin, false).unwrap();

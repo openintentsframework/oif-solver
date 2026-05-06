@@ -1011,7 +1011,10 @@ mod tests {
 				domain: "test.example.com".to_string(),
 				chain_id: 1,
 				nonce_ttl_seconds: 300,
-				admin_addresses: vec![admin_address],
+				whitelist: vec![solver_types::AdminWhitelistEntry {
+					address: admin_address,
+					role: solver_types::AdminRole::Admin,
+				}],
 				withdrawals: OperatorWithdrawalsConfig { enabled: false },
 			},
 			auth_enabled: false,
@@ -1069,7 +1072,10 @@ mod tests {
 				domain: "test.example.com".to_string(),
 				chain_id: Some(1),
 				nonce_ttl_seconds: 300,
-				admin_addresses: vec![alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")],
+				whitelist: vec![solver_types::AdminWhitelistEntry {
+					address: alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+					role: solver_types::AdminRole::Admin,
+				}],
 			},
 			1,
 		);

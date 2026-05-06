@@ -155,11 +155,13 @@ paths:
     get:
       summary: Get operator configuration (redacted)
       description: |
-        Returns a redacted view of the current operator configuration.
+        Returns a redacted view of the current operator configuration. Requires
+        `admin-read` or `admin-all` scope.
       operationId: getAdminConfig
       tags:
         - Admin
-      security: []
+      security:
+        - bearerAuth: []
       responses:
         "200":
           description: Current operator configuration
@@ -178,7 +180,8 @@ paths:
     get:
       summary: Get admin whitelist
       description: |
-        Returns the configured list of admin wallet addresses.
+        Returns the configured typed admin whitelist. Requires `admin-read` or
+        `admin-all` scope.
       operationId: getAdminWhitelist
       tags:
         - Admin
@@ -192,9 +195,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/AdminWhitelistResponse"
               example:
-                admins:
-                  - "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
-                  - "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
+                entries:
+                  - address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+                    role: "admin"
+                  - address: "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
+                    role: "read-only"
                 count: 2
         "401":
           description: Unauthorized (JWT failure)
@@ -215,11 +220,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/AdminAuthErrorResponse"
     post:
-      summary: Add an admin
+      summary: Set admin whitelist role
       description: |
-        Adds a new admin address to the authorized list.
-        Requires an EIP-712 signed request body.
-      operationId: addAdmin
+        Adds or updates a wallet in the typed admin whitelist. Requires an
+        EIP-712 signed request body from an `admin-all` signer.
+      operationId: setAdminRole
       tags:
         - Admin
       security:
@@ -229,16 +234,17 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/SignedAdminRequestAddAdmin"
+              $ref: "#/components/schemas/SignedAdminRequestSetAdminRole"
             example:
               signature: "0x..."
               contents:
-                newAdmin: "0x1234567890abcdef1234567890abcdef12345678"
+                account: "0x1234567890abcdef1234567890abcdef12345678"
+                role: "read-only"
                 nonce: "12345678901234"
                 deadline: "1706184000"
       responses:
         "200":
-          description: Admin added
+          description: Whitelist role set
           content:
             application/json:
               schema:
@@ -849,22 +855,40 @@ components:
     AdminWhitelistResponse:
       type: object
       required:
-        - admins
+        - entries
         - count
       properties:
-        admins:
+        entries:
           type: array
-          description: Configured admin wallet addresses
+          description: Configured admin wallet addresses and roles
           items:
-            type: string
-            pattern: "^0x[a-fA-F0-9]{40}$"
+            $ref: "#/components/schemas/AdminWhitelistEntry"
           example:
-            - "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
-            - "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
+            - address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+              role: "admin"
+            - address: "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
+              role: "read-only"
         count:
           type: integer
-          description: Number of configured admin wallet addresses
+          description: Number of configured whitelist entries
           example: 2
+
+    AdminWhitelistEntry:
+      type: object
+      required:
+        - address
+        - role
+      properties:
+        address:
+          type: string
+          pattern: "^0x[a-fA-F0-9]{40}$"
+          example: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+        role:
+          type: string
+          enum:
+            - admin
+            - read-only
+          example: "read-only"
 
     SignedAdminRequestAddToken:
       type: object
@@ -892,7 +916,7 @@ components:
         contents:
           $ref: "#/components/schemas/AddTokensContents"
 
-    SignedAdminRequestAddAdmin:
+    SignedAdminRequestSetAdminRole:
       type: object
       required:
         - signature
@@ -903,19 +927,26 @@ components:
           description: Hex-encoded EIP-712 signature (65 bytes)
           pattern: "^0x[a-fA-F0-9]+$"
         contents:
-          $ref: "#/components/schemas/AddAdminContents"
+          $ref: "#/components/schemas/SetAdminRoleContents"
 
-    AddAdminContents:
+    SetAdminRoleContents:
       type: object
       required:
-        - newAdmin
+        - account
+        - role
         - nonce
         - deadline
       properties:
-        newAdmin:
+        account:
           type: string
           pattern: "^0x[a-fA-F0-9]{40}$"
           example: "0x1234567890abcdef1234567890abcdef12345678"
+        role:
+          type: string
+          enum:
+            - admin
+            - read-only
+          example: "read-only"
         nonce:
           type: string
           description: Nonce as a string (number also accepted by server)

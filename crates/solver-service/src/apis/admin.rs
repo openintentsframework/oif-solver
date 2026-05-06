@@ -27,21 +27,24 @@ use solver_storage::{
 };
 pub use solver_types::admin_api::{
 	AdminActionResponse, AdminConfigResponse, AdminConfigSummary, AdminNetworkResponse,
-	AdminSolverResponse, AdminTokenResponse, AdminWhitelistResponse, ApproveTokensResponse,
-	BalancesResponse, ChainBalances, Eip712Domain, Eip712TypeInfo, FeeConfigResponse,
-	GasConfigResponse, GasFlowResponse, NonceResponse, TokenBalance, WithdrawalResponse,
+	AdminSolverResponse, AdminTokenResponse, AdminWhitelistEntry, AdminWhitelistResponse,
+	ApproveTokensResponse, BalancesResponse, ChainBalances, Eip712Domain, Eip712TypeInfo,
+	FeeConfigResponse, GasConfigResponse, GasFlowResponse, NonceResponse, TokenBalance,
+	WithdrawalResponse,
 };
+#[cfg(test)]
+use solver_types::AdminWhitelistEntry as SolverAdminWhitelistEntry;
 use solver_types::{
-	format_token_amount, with_0x_prefix, AdminConfig, OperatorAdminConfig, OperatorConfig,
-	OperatorToken,
+	format_token_amount, with_0x_prefix, AdminConfig, AdminRole, OperatorAdminConfig,
+	OperatorConfig, OperatorToken,
 };
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::auth::admin::{
-	AddAdminContents, AddTokenContents, AddTokensContents, AdminActionVerifier, AdminAuthError,
-	ApproveTokensContents, RemoveAdminContents, RemoveTokenContents, SignedAdminRequest,
-	UpdateFeeConfigContents, UpdateGasConfigContents, WithdrawContents,
+	AddTokenContents, AddTokensContents, AdminActionVerifier, AdminAuthError,
+	ApproveTokensContents, RemoveAdminContents, RemoveTokenContents, SetAdminRoleContents,
+	SignedAdminRequest, UpdateFeeConfigContents, UpdateGasConfigContents, WithdrawContents,
 };
 use crate::config_merge::build_runtime_config;
 
@@ -116,7 +119,7 @@ impl AdminApiState {
 				domain: admin_config.domain.clone(),
 				chain_id: Some(admin_config.chain_id),
 				nonce_ttl_seconds: admin_config.nonce_ttl_seconds,
-				admin_addresses: admin_config.admin_addresses.clone(),
+				whitelist: admin_config.whitelist.clone(),
 			},
 			admin_config.chain_id,
 		);
@@ -124,7 +127,7 @@ impl AdminApiState {
 		*self.verifier.write().await = new_verifier;
 
 		tracing::info!(
-			admin_count = admin_config.admin_addresses.len(),
+			admin_count = admin_config.admin_addresses().len(),
 			chain_id = admin_config.chain_id,
 			"Admin verifier rebuilt with updated config"
 		);
@@ -326,50 +329,42 @@ pub async fn handle_get_whitelist(
 	State(state): State<AdminApiState>,
 ) -> Result<Json<AdminWhitelistResponse>, AdminAuthError> {
 	let versioned = state.config_store.get().await.map_err(config_store_error)?;
-	let admins: Vec<String> = versioned
+	let entries: Vec<AdminWhitelistEntry> = versioned
 		.data
 		.admin
-		.admin_addresses
+		.whitelist
 		.iter()
-		.map(|addr| with_0x_prefix(&hex::encode(addr.as_slice())))
+		.map(|entry| AdminWhitelistEntry {
+			address: with_0x_prefix(&hex::encode(entry.address.as_slice())),
+			role: entry.role,
+		})
 		.collect();
 
 	Ok(Json(AdminWhitelistResponse {
-		count: admins.len(),
-		admins,
+		count: entries.len(),
+		entries,
 	}))
 }
 
 /// POST /api/v1/admin/whitelist
 ///
-/// Add an admin address to the authorized list.
-pub async fn handle_add_admin(
+/// Set an admin whitelist role.
+pub async fn handle_set_admin_role(
 	State(state): State<AdminApiState>,
-	VerifiedAdmin { admin, contents }: VerifiedAdmin<AddAdminContents>,
+	VerifiedAdmin { admin, contents }: VerifiedAdmin<SetAdminRoleContents>,
 ) -> Result<Json<AdminActionResponse>, AdminAuthError> {
-	if contents.new_admin == alloy_primitives::Address::ZERO {
+	if contents.account == alloy_primitives::Address::ZERO {
 		return Err(AdminAuthError::InvalidMessage(
-			"Admin address cannot be zero".to_string(),
+			"Whitelist address cannot be zero".to_string(),
 		));
 	}
 
 	let versioned = state.config_store.get().await.map_err(config_store_error)?;
 	let mut operator_config = versioned.data;
 
-	if operator_config
-		.admin
-		.admin_addresses
-		.contains(&contents.new_admin)
-	{
-		return Err(AdminAuthError::InvalidMessage(
-			"Admin address already exists".to_string(),
-		));
-	}
-
 	operator_config
 		.admin
-		.admin_addresses
-		.push(contents.new_admin);
+		.set_role(contents.account, contents.role);
 
 	let new_versioned = state
 		.config_store
@@ -391,8 +386,9 @@ pub async fn handle_add_admin(
 	Ok(Json(AdminActionResponse {
 		success: true,
 		message: format!(
-			"Admin added: {}",
-			with_0x_prefix(&hex::encode(contents.new_admin.as_slice()))
+			"Whitelist role set: {} -> {}",
+			with_0x_prefix(&hex::encode(contents.account.as_slice())),
+			contents.role
 		),
 		admin: with_0x_prefix(&hex::encode(&admin.0)),
 	}))
@@ -408,17 +404,19 @@ pub async fn handle_remove_admin(
 	let versioned = state.config_store.get().await.map_err(config_store_error)?;
 	let mut operator_config = versioned.data;
 
-	if !operator_config
+	if operator_config
 		.admin
-		.admin_addresses
-		.contains(&contents.admin_to_remove)
+		.role_for(&contents.admin_to_remove)
+		.is_none()
 	{
 		return Err(AdminAuthError::InvalidMessage(
-			"Admin address not found".to_string(),
+			"Whitelist address not found".to_string(),
 		));
 	}
 
-	if operator_config.admin.admin_addresses.len() <= 1 {
+	let removing_full_admin =
+		operator_config.admin.role_for(&contents.admin_to_remove) == Some(AdminRole::Admin);
+	if removing_full_admin && operator_config.admin.admin_addresses().len() <= 1 {
 		return Err(AdminAuthError::InvalidMessage(
 			"Cannot remove the last admin".to_string(),
 		));
@@ -426,8 +424,7 @@ pub async fn handle_remove_admin(
 
 	operator_config
 		.admin
-		.admin_addresses
-		.retain(|addr| addr != &contents.admin_to_remove);
+		.remove_admin(&contents.admin_to_remove);
 
 	let new_versioned = state
 		.config_store
@@ -1390,16 +1387,24 @@ mod tests {
 	#[test]
 	fn test_admin_whitelist_response_serialization() {
 		let response = AdminWhitelistResponse {
-			admins: vec![
-				"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
-				"0x70997970c51812dc3a010c7d01b50e0d17dc79c8".to_string(),
+			entries: vec![
+				AdminWhitelistEntry {
+					address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
+					role: AdminRole::Admin,
+				},
+				AdminWhitelistEntry {
+					address: "0x70997970c51812dc3a010c7d01b50e0d17dc79c8".to_string(),
+					role: AdminRole::ReadOnly,
+				},
 			],
 			count: 2,
 		};
 
 		let json = serde_json::to_string(&response).unwrap();
-		assert!(json.contains("\"admins\""));
+		assert!(json.contains("\"entries\""));
 		assert!(json.contains("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"));
+		assert!(json.contains("\"role\":\"admin\""));
+		assert!(json.contains("\"role\":\"read-only\""));
 		assert!(json.contains("\"count\":2"));
 	}
 
@@ -1677,7 +1682,10 @@ mod tests {
 				domain: "test.example.com".to_string(),
 				chain_id: 1,
 				nonce_ttl_seconds: 300,
-				admin_addresses: vec![admin_address],
+				whitelist: vec![solver_types::AdminWhitelistEntry {
+					address: admin_address,
+					role: AdminRole::Admin,
+				}],
 				withdrawals,
 			},
 			auth_enabled: false,
@@ -1749,7 +1757,10 @@ mod tests {
 				domain: "test.example.com".to_string(),
 				chain_id: Some(1),
 				nonce_ttl_seconds: 300,
-				admin_addresses: vec![admin_alloy],
+				whitelist: vec![SolverAdminWhitelistEntry {
+					address: admin_alloy,
+					role: AdminRole::Admin,
+				}],
 			},
 			1,
 		);
@@ -1803,7 +1814,10 @@ mod tests {
 				domain: "test.example.com".to_string(),
 				chain_id: Some(1),
 				nonce_ttl_seconds: 300,
-				admin_addresses: vec![admin_alloy],
+				whitelist: vec![SolverAdminWhitelistEntry {
+					address: admin_alloy,
+					role: AdminRole::Admin,
+				}],
 			},
 			1,
 		);
@@ -2545,7 +2559,9 @@ mod tests {
 		let admin_two = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
 		let mut operator_config =
 			build_operator_config(admin_one, OperatorWithdrawalsConfig { enabled: false });
-		operator_config.admin.admin_addresses.push(admin_two);
+		operator_config
+			.admin
+			.set_role(admin_two, AdminRole::ReadOnly);
 
 		let state = create_admin_state_with_operator_config(
 			operator_config,
@@ -2555,13 +2571,124 @@ mod tests {
 		let response = handle_get_whitelist(State(state)).await.unwrap().0;
 
 		assert_eq!(response.count, 2);
+		let entries = response
+			.entries
+			.iter()
+			.map(|entry| (entry.address.clone(), entry.role))
+			.collect::<Vec<_>>();
 		assert_eq!(
-			response.admins,
+			entries,
 			vec![
-				"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
-				"0x70997970c51812dc3a010c7d01b50e0d17dc79c8".to_string(),
+				(
+					"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
+					AdminRole::Admin,
+				),
+				(
+					"0x70997970c51812dc3a010c7d01b50e0d17dc79c8".to_string(),
+					AdminRole::ReadOnly,
+				),
 			]
 		);
+	}
+
+	#[tokio::test]
+	async fn test_handle_set_admin_role_supports_read_only_role() {
+		let admin = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+		let read_only = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
+		let mut operator_config =
+			build_operator_config(admin, OperatorWithdrawalsConfig { enabled: false });
+		operator_config.networks.insert(
+			1,
+			OperatorNetworkConfig {
+				chain_id: 1,
+				name: "chain-1".to_string(),
+				network_type: NetworkType::Parent,
+				tokens: vec![],
+				rpc_urls: vec![OperatorRpcEndpoint {
+					http: "http://localhost:8545".to_string(),
+					ws: None,
+				}],
+				input_settler_address: alloy_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: alloy_address("0x2222222222222222222222222222222222222222"),
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		operator_config.networks.insert(
+			137,
+			OperatorNetworkConfig {
+				chain_id: 137,
+				name: "chain-137".to_string(),
+				network_type: NetworkType::Hub,
+				tokens: vec![],
+				rpc_urls: vec![OperatorRpcEndpoint {
+					http: "http://localhost:8546".to_string(),
+					ws: None,
+				}],
+				input_settler_address: alloy_address("0x3333333333333333333333333333333333333333"),
+				output_settler_address: alloy_address("0x4444444444444444444444444444444444444444"),
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		let state = create_admin_state_with_operator_config(
+			operator_config,
+			create_delivery_service(None, false),
+		)
+		.await;
+
+		let result = handle_set_admin_role(
+			State(state.clone()),
+			VerifiedAdmin {
+				admin: solver_types::Address::from(admin),
+				contents: SetAdminRoleContents {
+					account: read_only,
+					role: AdminRole::ReadOnly,
+					nonce: 1,
+					deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+				},
+			},
+		)
+		.await
+		.unwrap()
+		.0;
+
+		assert!(result.success);
+		let versioned = state.config_store.get().await.unwrap();
+		assert_eq!(
+			versioned.data.admin.role_for(&read_only),
+			Some(AdminRole::ReadOnly)
+		);
+	}
+
+	#[tokio::test]
+	async fn test_legacy_add_admin_payload_is_rejected() {
+		let state =
+			create_admin_state(None, OperatorWithdrawalsConfig { enabled: false }, false).await;
+		let payload = serde_json::json!({
+			"signature": "0x12",
+			"contents": {
+				"newAdmin": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+				"nonce": 1,
+				"deadline": chrono::Utc::now().timestamp() as u64 + 3600
+			}
+		});
+		let request = Request::builder()
+			.method("POST")
+			.uri("/admin/whitelist")
+			.header("content-type", "application/json")
+			.body(Body::from(payload.to_string()))
+			.unwrap();
+
+		let result = VerifiedAdmin::<SetAdminRoleContents>::from_request(request, &state).await;
+
+		assert!(matches!(
+			result,
+			Err(AdminAuthError::InvalidMessage(message))
+				if message.contains("missing field `account`")
+		));
 	}
 
 	#[tokio::test]

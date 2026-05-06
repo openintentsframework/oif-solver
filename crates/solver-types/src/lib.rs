@@ -54,7 +54,9 @@ pub mod pricing;
 pub use account::*;
 pub use admin_api::*;
 pub use api::*;
-pub use auth::{AdminConfig, AuthConfig, AuthScope, JwtClaims, RefreshTokenData};
+pub use auth::{
+	AdminConfig, AdminRole, AdminWhitelistEntry, AuthConfig, AuthScope, JwtClaims, RefreshTokenData,
+};
 pub use costs::{CostBreakdown, CostContext};
 pub use delivery::*;
 pub use discovery::*;

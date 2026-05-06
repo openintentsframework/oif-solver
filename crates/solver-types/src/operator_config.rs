@@ -25,7 +25,10 @@
 //! config_store.update(config, version).await?;
 //! ```
 
-use crate::networks::NetworkType;
+use crate::{
+	auth::{normalize_admin_whitelist, upsert_admin_role, AdminRole, AdminWhitelistEntry},
+	networks::NetworkType,
+};
 use alloy_primitives::{Address, B256};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -539,8 +542,9 @@ pub struct OperatorAdminConfig {
 	/// Nonce TTL in seconds.
 	pub nonce_ttl_seconds: u64,
 
-	/// Authorized admin wallet addresses.
-	pub admin_addresses: Vec<Address>,
+	/// Typed admin whitelist entries.
+	#[serde(default)]
+	pub whitelist: Vec<AdminWhitelistEntry>,
 
 	/// Withdrawal policy for admin-initiated transfers.
 	#[serde(default)]
@@ -669,7 +673,7 @@ impl OperatorConfig {
 
 	/// Check if an address is an authorized admin.
 	pub fn is_admin(&self, address: &Address) -> bool {
-		self.admin.enabled && self.admin.admin_addresses.contains(address)
+		self.admin.is_authorized(address)
 	}
 }
 
@@ -703,23 +707,59 @@ impl OperatorNetworkConfig {
 impl OperatorAdminConfig {
 	/// Check if admin authentication is enabled and address is authorized.
 	pub fn is_authorized(&self, address: &Address) -> bool {
-		self.enabled && self.admin_addresses.contains(address)
+		self.enabled && self.role_for(address) == Some(AdminRole::Admin)
+	}
+
+	/// Resolve an address to an admin role.
+	pub fn role_for(&self, address: &Address) -> Option<AdminRole> {
+		self.whitelist
+			.iter()
+			.find(|entry| entry.address == *address)
+			.map(|entry| entry.role)
+	}
+
+	/// Return full-admin addresses derived from the typed whitelist.
+	pub fn admin_addresses(&self) -> Vec<Address> {
+		self.whitelist
+			.iter()
+			.filter(|entry| entry.role == AdminRole::Admin)
+			.map(|entry| entry.address)
+			.collect()
+	}
+
+	/// Return normalized typed whitelist entries from legacy + typed sources.
+	pub fn normalize_whitelist(
+		admin_addresses: &[Address],
+		whitelist: &[AdminWhitelistEntry],
+	) -> Vec<AdminWhitelistEntry> {
+		normalize_admin_whitelist(admin_addresses, whitelist)
 	}
 
 	/// Add an admin address.
 	pub fn add_admin(&mut self, address: Address) -> bool {
-		if self.admin_addresses.contains(&address) {
+		if self.role_for(&address) == Some(AdminRole::Admin) {
 			false
 		} else {
-			self.admin_addresses.push(address);
+			upsert_admin_role(&mut self.whitelist, address, AdminRole::Admin);
 			true
 		}
 	}
 
+	/// Set a wallet role in the typed whitelist.
+	pub fn set_role(&mut self, address: Address, role: AdminRole) -> bool {
+		let changed = self.role_for(&address) != Some(role);
+		upsert_admin_role(&mut self.whitelist, address, role);
+		changed
+	}
+
 	/// Remove an admin address.
 	pub fn remove_admin(&mut self, address: &Address) -> bool {
-		if let Some(pos) = self.admin_addresses.iter().position(|a| a == address) {
-			self.admin_addresses.remove(pos);
+		if let Some(pos) = self
+			.whitelist
+			.iter()
+			.position(|entry| &entry.address == address)
+		{
+			self.whitelist.remove(pos);
 			true
 		} else {
 			false
@@ -734,7 +774,7 @@ impl Default for OperatorAdminConfig {
 			domain: String::new(),
 			chain_id: 1,
 			nonce_ttl_seconds: 300,
-			admin_addresses: Vec::new(),
+			whitelist: Vec::new(),
 			withdrawals: OperatorWithdrawalsConfig::default(),
 		}
 	}
@@ -778,7 +818,10 @@ mod tests {
 			domain: "test.example.com".to_string(),
 			chain_id: 1,
 			nonce_ttl_seconds: 300,
-			admin_addresses: vec![test_address()],
+			whitelist: vec![AdminWhitelistEntry {
+				address: test_address(),
+				role: AdminRole::Admin,
+			}],
 			withdrawals: OperatorWithdrawalsConfig::default(),
 		};
 
@@ -936,7 +979,10 @@ mod tests {
 				domain: "test.example.com".to_string(),
 				chain_id: 1,
 				nonce_ttl_seconds: 300,
-				admin_addresses: vec![test_address()],
+				whitelist: vec![AdminWhitelistEntry {
+					address: test_address(),
+					role: AdminRole::Admin,
+				}],
 				withdrawals: OperatorWithdrawalsConfig::default(),
 			},
 			auth_enabled: false,
@@ -951,7 +997,7 @@ mod tests {
 		assert_eq!(parsed.solver_name, Some("Test Solver".to_string()));
 		assert_eq!(parsed.networks.len(), 1);
 		assert!(parsed.networks.contains_key(&10));
-		assert_eq!(parsed.admin.admin_addresses.len(), 1);
+		assert_eq!(parsed.admin.admin_addresses().len(), 1);
 		assert_eq!(parsed.gas.resource_lock.fill, 77298);
 		assert_eq!(
 			parsed.settlement.settlement_type,
@@ -1020,7 +1066,7 @@ mod tests {
 				"domain": "",
 				"chain_id": 1,
 				"nonce_ttl_seconds": 300,
-				"admin_addresses": [],
+				"whitelist": [],
 				"withdrawals": {"enabled": false}
 			},
 			"account": null

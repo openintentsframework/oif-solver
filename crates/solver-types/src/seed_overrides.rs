@@ -33,6 +33,7 @@
 //! }
 //! ```
 
+use crate::auth::AdminWhitelistEntry;
 use crate::networks::NetworkType;
 use alloy_primitives::{Address, B256};
 use rust_decimal::Decimal;
@@ -351,8 +352,13 @@ pub struct AdminOverride {
 	pub chain_id: Option<u64>,
 
 	/// List of authorized admin wallet addresses.
-	/// Only these addresses can perform admin operations.
+	/// Legacy input. These addresses are normalized into Admin whitelist entries.
+	#[serde(default)]
 	pub admin_addresses: Vec<Address>,
+
+	/// Typed admin whitelist entries.
+	#[serde(default)]
+	pub whitelist: Vec<AdminWhitelistEntry>,
 
 	/// Optional nonce TTL in seconds. Default: 300 (5 minutes).
 	#[serde(default)]
