@@ -85,8 +85,8 @@ async fn eip3009_offchain_open_fill_settle() -> anyhow::Result<()> {
 	let user_signer = USER_PRIVATE_KEY
 		.parse::<alloy_signer_local::PrivateKeySigner>()
 		.expect("static key parses");
-	let digest_bytes = reconstruct_eip3009_digest(&payload, None)
-		.map_err(|e| anyhow::anyhow!("digest: {e}"))?;
+	let digest_bytes =
+		reconstruct_eip3009_digest(&payload, None).map_err(|e| anyhow::anyhow!("digest: {e}"))?;
 	let signature = user_signer
 		.sign_hash_sync(&B256::from(digest_bytes))
 		.map_err(|e| anyhow::anyhow!("sign: {e}"))?;
