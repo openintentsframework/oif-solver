@@ -125,7 +125,9 @@ impl LogFilter {
 pub struct ChainData {
 	/// The chain ID.
 	pub chain_id: u64,
-	/// Current gas price as a string in wei.
+	/// Quote-cost-per-gas in wei (decimal string), sourced from the
+	/// delivery layer's resolved [`FeeParams::cost_per_gas`]. This is the
+	/// same value used to price quote gas legs, not raw `eth_gasPrice`.
 	pub gas_price: String,
 	/// Latest block number.
 	pub block_number: u64,

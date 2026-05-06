@@ -81,9 +81,9 @@ pub use registry::ImplementationRegistry;
 pub use secret_string::SecretString;
 pub use seed_overrides::{AccountOverride, NetworkOverride, SeedOverrides, Token};
 pub use seed_overrides::{
-	BroadcasterSettlementOverride, DirectSettlementOverride, HyperlaneSettlementOverride,
-	OracleOverrides, OracleSelectionStrategyOverride, RoutingDefaults, SettlementOverride,
-	SettlementTypeOverride,
+	BroadcasterSettlementOverride, DirectSettlementOverride, FeePolicyChainOverride,
+	FeePolicyOverride, HyperlaneSettlementOverride, OracleOverrides,
+	OracleSelectionStrategyOverride, RoutingDefaults, SettlementOverride, SettlementTypeOverride,
 };
 pub use standards::{
 	eip7683::{Eip7683OrderData, MandateOutput as Eip7683Output},

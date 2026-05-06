@@ -133,14 +133,30 @@ impl ProtocolRegistry {
 			return *cached;
 		}
 
-		// Detect via RPC using function selector
-		let detected = self
+		// Detect via RPC using function selector. Cache only DEFINITIVE outcomes
+		// (the contract responded — `Ok(true)` for hash match, `Ok(false)` for
+		// hash mismatch). Transient transport errors return the bare `false`
+		// without poisoning the cache, so the next call retries instead of
+		// returning a stale `false` for the lifetime of the process.
+		match self
 			.detect_eip3009_via_rpc(chain_id, token_address, delivery_service)
 			.await
-			.unwrap_or(false);
-		self.eip3009_detection_cache
-			.insert((chain_id, token_address), detected);
-		detected
+		{
+			Ok(detected) => {
+				self.eip3009_detection_cache
+					.insert((chain_id, token_address), detected);
+				detected
+			},
+			Err(e) => {
+				tracing::warn!(
+					chain_id,
+					token = %token_address,
+					error = %e,
+					"EIP-3009 detection RPC failed; not caching, will retry next call"
+				);
+				false
+			},
+		}
 	}
 
 	/// Detects EIP-3009 support by checking for RECEIVE_WITH_AUTHORIZATION_TYPEHASH constant
@@ -166,16 +182,22 @@ impl ProtocolRegistry {
 			chain_id,
 		};
 
+		// Only DEFINITIVE outcomes (contract responded) are returned as `Ok(_)`.
+		// Transport-level errors (network timeout, RPC unavailable, etc.) are
+		// propagated as `Err` so the caller can skip the cache insert and retry
+		// on the next call instead of caching a stale `false`. We can't tell
+		// from a transport error alone whether the contract has the function
+		// or not.
 		match delivery_service.contract_call(chain_id, tx).await {
 			Ok(result) => {
-				// Check if the returned value matches the expected EIP-3009 RECEIVE_WITH_AUTHORIZATION_TYPEHASH
-				// Expected: 0xd099cc98ef71107a616c4f0f941f04c322d8e254fe26b3c6668db87aae413de8
+				// Expected RECEIVE_WITH_AUTHORIZATION_TYPEHASH:
+				// 0xd099cc98ef71107a616c4f0f941f04c322d8e254fe26b3c6668db87aae413de8
 				let expected = hex::decode(
 					"d099cc98ef71107a616c4f0f941f04c322d8e254fe26b3c6668db87aae413de8",
 				)?;
 				Ok(result.len() == 32 && result[..] == expected[..])
 			},
-			Err(_) => Ok(false), // Function doesn't exist, no EIP-3009 support
+			Err(e) => Err(Box::new(e)),
 		}
 	}
 
@@ -211,9 +233,7 @@ pub struct TokenCapabilities {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use solver_delivery::{
-		DeliveryError, DeliveryInterface, DeliveryService, MockDeliveryInterface,
-	};
+	use solver_delivery::{DeliveryInterface, DeliveryService, MockDeliveryInterface};
 	use std::{collections::HashMap, sync::Arc};
 
 	#[test]
@@ -264,10 +284,15 @@ mod tests {
 			.parse()
 			.unwrap();
 
+		// A definitive negative: the contract responded with 32 bytes that are NOT
+		// the expected RECEIVE_WITH_AUTHORIZATION_TYPEHASH. Only definitive outcomes
+		// (Ok with matching or mismatching bytes) are cached; transport errors are
+		// intentionally retried instead of poisoning the cache.
 		let mut mock_delivery = MockDeliveryInterface::new();
-		mock_delivery.expect_eth_call().times(1).returning(|_| {
-			Box::pin(async { Err(DeliveryError::Network("unsupported selector".to_string())) })
-		});
+		mock_delivery
+			.expect_eth_call()
+			.times(1)
+			.returning(|_| Box::pin(async { Ok(alloy_primitives::Bytes::from(vec![0u8; 32])) }));
 
 		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
 		implementations.insert(1, Arc::new(mock_delivery));

@@ -798,7 +798,7 @@ mod tests {
 		OperatorRebalancePairConfig, OperatorRpcEndpoint, OperatorSettlementConfig,
 		OperatorSettlementType, OperatorSolverConfig, OperatorWithdrawalsConfig, RebalancePairSide,
 	};
-	use std::collections::HashMap;
+	use std::collections::{HashMap, HashSet};
 	use std::str::FromStr;
 	use std::sync::{Arc, Mutex};
 	use tokio::sync::RwLock;
@@ -847,30 +847,8 @@ mod tests {
 
 	#[async_trait]
 	impl AccountInterface for DummyAccount {
-		fn config_schema(&self) -> Box<dyn solver_types::ConfigSchema> {
-			Box::new(solver_account::implementations::local::LocalWalletSchema)
-		}
-
 		async fn address(&self) -> Result<solver_types::Address, solver_account::AccountError> {
 			Ok(self.address.clone())
-		}
-
-		async fn sign_transaction(
-			&self,
-			_tx: &solver_types::Transaction,
-		) -> Result<solver_types::Signature, solver_account::AccountError> {
-			Err(solver_account::AccountError::Implementation(
-				"not needed in rebalance tests".to_string(),
-			))
-		}
-
-		async fn sign_message(
-			&self,
-			_message: &[u8],
-		) -> Result<solver_types::Signature, solver_account::AccountError> {
-			Err(solver_account::AccountError::Implementation(
-				"not needed in rebalance tests".to_string(),
-			))
 		}
 
 		fn signer(&self) -> AccountSigner {
@@ -991,6 +969,8 @@ mod tests {
 				resource_lock: OperatorGasFlowUnits::default(),
 				permit2_escrow: OperatorGasFlowUnits::default(),
 				eip3009_escrow: OperatorGasFlowUnits::default(),
+				live_fill_estimate_enabled: true,
+				live_post_fill_estimate_chain_ids: HashSet::new(),
 			},
 			pricing: OperatorPricingConfig {
 				primary: "coingecko".to_string(),
@@ -1049,6 +1029,7 @@ mod tests {
 					"vault_addresses": { "1": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
 				})),
 			}),
+			fee_policy: None,
 		}
 	}
 

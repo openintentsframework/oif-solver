@@ -83,6 +83,8 @@ pub struct GasConfigResponse {
 pub struct GasFlowResponse {
 	pub open: u64,
 	pub fill: u64,
+	pub post_fill: u64,
+	pub pre_claim: u64,
 	pub claim: u64,
 }
 

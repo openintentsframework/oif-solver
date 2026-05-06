@@ -700,13 +700,21 @@ paths:
               contents:
                 resourceLockOpen: 50000
                 resourceLockFill: 150000
+                resourceLockPostFill: 300000
+                resourceLockPreClaim: 0
                 resourceLockClaim: 80000
                 permit2EscrowOpen: 60000
                 permit2EscrowFill: 160000
+                permit2EscrowPostFill: 300000
+                permit2EscrowPreClaim: 0
                 permit2EscrowClaim: 90000
                 eip3009EscrowOpen: 55000
                 eip3009EscrowFill: 155000
+                eip3009EscrowPostFill: 300000
+                eip3009EscrowPreClaim: 0
                 eip3009EscrowClaim: 85000
+                livePostFillEstimateChainIds: [1, 747474]
+                liveFillEstimateEnabled: true
                 nonce: "12345678901234"
                 deadline: "1706184000"
       responses:
@@ -1409,6 +1417,8 @@ components:
       required:
         - open
         - fill
+        - postFill
+        - preClaim
         - claim
       properties:
         open:
@@ -1419,6 +1429,19 @@ components:
           type: integer
           format: int64
           example: 150000
+        postFill:
+          type: integer
+          format: int64
+          description: |
+            Gas units for the post-fill settlement step (e.g. Hyperlane oracle dispatch).
+          example: 300000
+        preClaim:
+          type: integer
+          format: int64
+          description: |
+            Gas units for the pre-claim settlement step. May be 0 for routes that don't
+            require a separate pre-claim transaction (e.g. direct settlement).
+          example: 0
         claim:
           type: integer
           format: int64
@@ -1442,12 +1465,18 @@ components:
       required:
         - resourceLockOpen
         - resourceLockFill
+        - resourceLockPostFill
+        - resourceLockPreClaim
         - resourceLockClaim
         - permit2EscrowOpen
         - permit2EscrowFill
+        - permit2EscrowPostFill
+        - permit2EscrowPreClaim
         - permit2EscrowClaim
         - eip3009EscrowOpen
         - eip3009EscrowFill
+        - eip3009EscrowPostFill
+        - eip3009EscrowPreClaim
         - eip3009EscrowClaim
         - nonce
         - deadline
@@ -1460,6 +1489,14 @@ components:
           type: integer
           format: int64
           example: 150000
+        resourceLockPostFill:
+          type: integer
+          format: int64
+          example: 300000
+        resourceLockPreClaim:
+          type: integer
+          format: int64
+          example: 0
         resourceLockClaim:
           type: integer
           format: int64
@@ -1472,6 +1509,14 @@ components:
           type: integer
           format: int64
           example: 160000
+        permit2EscrowPostFill:
+          type: integer
+          format: int64
+          example: 300000
+        permit2EscrowPreClaim:
+          type: integer
+          format: int64
+          example: 0
         permit2EscrowClaim:
           type: integer
           format: int64
@@ -1484,10 +1529,38 @@ components:
           type: integer
           format: int64
           example: 155000
+        eip3009EscrowPostFill:
+          type: integer
+          format: int64
+          example: 300000
+        eip3009EscrowPreClaim:
+          type: integer
+          format: int64
+          example: 0
         eip3009EscrowClaim:
           type: integer
           format: int64
           example: 85000
+        livePostFillEstimateChainIds:
+          type: array
+          description: |
+            Chain ids that opt-in to live post-fill gas estimation via stateOverride
+            at quote time. Optional; defaults to the solver's seed config when omitted.
+            The server sorts the list ascending before EIP-712 hashing, so the signed
+            payload is order-independent — but the signed value MUST match what was
+            sent (don't sort client-side after signing).
+          items:
+            type: integer
+            format: int64
+          example: [1, 747474]
+        liveFillEstimateEnabled:
+          type: boolean
+          description: |
+            Master switch for live fill-leg gas estimation at quote time. When true,
+            quotes use `eth_estimateGas` for the fill transaction; when false, quotes
+            use the static `*Fill` values configured above. Optional; defaults to
+            `true` when omitted from the signed payload.
+          example: true
         nonce:
           type: string
           description: Nonce as a string (number also accepted by server)

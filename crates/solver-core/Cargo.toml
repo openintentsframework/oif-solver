@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 
+[features]
+# Exposes test-only seams (e.g. `post_fill_overrides::estimate_post_fill_with_overrides_for_test`)
+# so integration tests under `tests/` can drive production code paths
+# that are otherwise `pub(crate)`. NEVER enable in release builds.
+test-helpers = []
+
 [dependencies]
 alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-provider = { workspace = true }
@@ -34,6 +40,7 @@ alloy-signer-local = { workspace = true }
 async-trait = { workspace = true }
 hex = { workspace = true }
 mockall = { workspace = true }
+proptest = "1"
 solver-account = { path = "../solver-account", features = ["testing"] }
 # Add testing feature only for tests
 solver-delivery = { path = "../solver-delivery", features = ["testing"] }
@@ -41,4 +48,11 @@ solver-order = { path = "../solver-order", features = ["testing"] }
 solver-pricing = { path = "../solver-pricing", features = ["testing"] }
 solver-settlement = { path = "../solver-settlement", features = ["testing"] }
 solver-storage = { path = "../solver-storage", features = ["testing"] }
+# Self dep with `test-helpers` enabled — integration tests under `tests/`
+# link solver-core as an external library, so they don't see `cfg(test)`
+# on items inside this crate. This dev-only self-dep flips the feature
+# on for the integration-test build, exposing helpers like
+# `engine::post_fill_overrides::estimate_post_fill_with_overrides_for_test`.
+# Cargo handles self-deps in dev-dependencies without recursion.
+solver-core = { path = ".", features = ["test-helpers"] }
 tempfile = { workspace = true }

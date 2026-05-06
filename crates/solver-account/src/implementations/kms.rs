@@ -7,14 +7,11 @@
 //! This module is only available when the `kms` feature is enabled.
 
 use crate::{AccountError, AccountFactoryFuture, AccountInterface, AccountSigner};
-use alloy_consensus::TxLegacy;
-use alloy_network::TxSigner;
-use alloy_primitives::{Address as AlloyAddress, Bytes, TxKind};
 use alloy_signer_aws::AwsSigner;
 use async_trait::async_trait;
 use aws_sdk_kms::Client as KmsClient;
 use serde::Deserialize;
-use solver_types::{Address, ConfigSchema, Signature, Transaction, ValidationError};
+use solver_types::{Address, ConfigSchema, ValidationError};
 
 /// Configuration schema for KMS wallet.
 pub struct KmsWalletSchema;
@@ -108,66 +105,14 @@ impl KmsWallet {
 
 #[async_trait]
 impl AccountInterface for KmsWallet {
-	fn config_schema(&self) -> Box<dyn ConfigSchema> {
-		Box::new(KmsWalletSchema)
-	}
-
 	async fn address(&self) -> Result<Address, AccountError> {
 		let addr = alloy_signer::Signer::address(&self.signer);
 		Ok(Address(addr.as_slice().to_vec()))
 	}
 
-	async fn sign_transaction(&self, tx: &Transaction) -> Result<Signature, AccountError> {
-		let to = if let Some(to_addr) = &tx.to {
-			if to_addr.0.len() != 20 {
-				return Err(AccountError::SigningFailed(
-					"Invalid address length".to_string(),
-				));
-			}
-			let mut addr_bytes = [0u8; 20];
-			addr_bytes.copy_from_slice(&to_addr.0);
-			TxKind::Call(AlloyAddress::from(addr_bytes))
-		} else {
-			TxKind::Create
-		};
-
-		let value = tx.value;
-
-		let mut legacy_tx = TxLegacy {
-			chain_id: Some(tx.chain_id),
-			nonce: tx.nonce.unwrap_or(0),
-			gas_price: tx.gas_price.unwrap_or(0),
-			gas_limit: tx.gas_limit.unwrap_or(0),
-			to,
-			value,
-			input: Bytes::from(tx.data.clone()),
-		};
-
-		let signature = self
-			.signer
-			.sign_transaction(&mut legacy_tx)
-			.await
-			.map_err(|e| AccountError::SigningFailed(format!("Failed to sign transaction: {e}")))?;
-
-		Ok(signature.into())
-	}
-
-	async fn sign_message(&self, message: &[u8]) -> Result<Signature, AccountError> {
-		use alloy_signer::Signer;
-		let sig = self
-			.signer
-			.sign_message(message)
-			.await
-			.map_err(|e| AccountError::SigningFailed(e.to_string()))?;
-		Ok(sig.into()) // Uses From<PrimitiveSignature> impl
-	}
-
 	fn signer(&self) -> AccountSigner {
 		AccountSigner::Kms(self.signer.clone())
 	}
-
-	// Note: get_private_key() uses the default impl which panics
-	// KMS signers cannot expose the private key
 }
 
 /// Factory function to create a KMS wallet from configuration.

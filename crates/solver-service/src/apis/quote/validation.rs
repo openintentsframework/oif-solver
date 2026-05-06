@@ -1551,6 +1551,8 @@ mod tests {
 			cost_breakdown: CostBreakdown {
 				gas_open: Decimal::ZERO,
 				gas_fill: Decimal::ZERO,
+				gas_post_fill: Decimal::ZERO,
+				gas_pre_claim: Decimal::ZERO,
 				gas_claim: Decimal::ZERO,
 				gas_buffer: Decimal::ZERO,
 				rate_buffer: Decimal::ZERO,

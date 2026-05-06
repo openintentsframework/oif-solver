@@ -677,7 +677,9 @@ impl SolverBuilder {
 					BuilderError::Config("Rebalance enabled but bridge_config is missing".into())
 				})?;
 
-				let registered = solver_bridge::get_all_implementations();
+				let registered = solver_bridge::get_all_implementations().map_err(|e| {
+					BuilderError::Config(format!("Failed to read bridge registry: {e}"))
+				})?;
 				let target = &rebalance.implementation;
 				let (_, factory) = registered
 					.iter()

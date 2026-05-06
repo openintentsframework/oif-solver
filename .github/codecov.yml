@@ -14,3 +14,11 @@ coverage:
       default:
         target: 90%
         threshold: 1%
+
+# solver-e2e-tests is a test-only crate (live Anvil + real solver subprocess
+# scenarios). Its `#[ignore]`d tests don't run in the unit-coverage step, so
+# instrumenting it would only add 0% lines to the report. The cargo step
+# already passes `--exclude solver-e2e-tests`; this keeps the codecov report
+# consistent if that flag is ever dropped.
+ignore:
+  - "crates/solver-e2e-tests/**"

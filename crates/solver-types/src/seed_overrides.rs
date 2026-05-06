@@ -45,7 +45,7 @@ use std::collections::HashMap;
 /// This is the top-level structure that specifies which networks
 /// the solver should operate on and what tokens to support.
 /// These values override/extend the seed preset defaults.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SeedOverrides {
 	/// Optional solver ID. If provided, this ID will be used for the solver.
 	/// If not provided, a new UUID-based ID will be generated.
@@ -120,6 +120,74 @@ pub struct SeedOverrides {
 	/// If provided, enables the rebalance monitor and admin endpoints.
 	#[serde(default)]
 	pub rebalance: Option<crate::OperatorRebalanceConfig>,
+
+	/// Override the seed default for the live fill-gas estimation flag.
+	/// If omitted, falls back to `SeedDefaults::live_fill_estimate_enabled`.
+	#[serde(default)]
+	pub live_fill_estimate_enabled: Option<bool>,
+
+	/// Override the seed default for chains that opt-in to live post-fill
+	/// gas estimation via stateOverride at quote time. If omitted, falls
+	/// back to `SeedDefaults::live_post_fill_estimate_chain_ids`. Empty
+	/// vec explicitly disables on all chains.
+	#[serde(default)]
+	pub live_post_fill_estimate_chain_ids: Option<Vec<u64>>,
+
+	/// Optional per-chain fee-policy overrides. Whatever fields/chains you
+	/// specify here are merged on top of the auto-generated delivery config
+	/// (which already covers every chain in `networks` with sensible defaults).
+	/// Chains you don't mention keep their generated defaults.
+	#[serde(default)]
+	pub fee_policy: Option<FeePolicyOverride>,
+}
+
+/// Top-level fee-policy override block.
+///
+/// Embedded as the optional `fee_policy` field in [`SeedOverrides`] and
+/// persisted alongside [`crate::OperatorConfig`]. Whatever you specify in
+/// `chains` is merged on top of the auto-generated defaults. Chains you
+/// don't mention keep their generated defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeePolicyOverride {
+	/// Speed target driving the fee-history percentile selection.
+	/// One of: `"safe_low"`, `"average"`, `"fast"`, `"fastest"`. Defaults to
+	/// `"fast"` (85th percentile).
+	#[serde(default)]
+	pub default_speed: Option<String>,
+
+	/// Per-chain overrides, keyed by chain id rendered as a string
+	/// (JSON object keys must be strings).
+	#[serde(default)]
+	pub chains: HashMap<String, FeePolicyChainOverride>,
+}
+
+/// Per-chain fee-policy override.
+///
+/// Every field is optional. Whatever you specify replaces the default;
+/// whatever you omit keeps the default. Wei values are decimal strings to
+/// avoid the JSON 53-bit float precision pit.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeePolicyChainOverride {
+	/// Hard floor on `max_priority_fee_per_gas`, decimal wei.
+	/// Absent = keep the generated default floor (`"10000000"` / 0.01 gwei).
+	/// Use `"0"` to explicitly remove that generated floor. Empty strings are
+	/// invalid and fail fee-policy parsing.
+	#[serde(default)]
+	pub min_priority_fee_per_gas: Option<String>,
+
+	/// Fallback used when fee-history rewards are all zero, decimal wei.
+	/// Defaults to `"10000000"` (0.01 gwei).
+	#[serde(default)]
+	pub priority_fee_fallback: Option<String>,
+
+	/// Quote-cost strategy. One of: `"max_fee"`, `"effective"`,
+	/// `"buffered_effective_125"`. Defaults to `"buffered_effective_125"`.
+	#[serde(default)]
+	pub quote_cost_strategy: Option<String>,
+
+	/// Hard ceiling on `max_fee_per_gas`, decimal wei. Absent = no ceiling.
+	#[serde(default)]
+	pub gas_price_cap: Option<String>,
 }
 
 /// Supported settlement type overrides.
@@ -648,6 +716,9 @@ mod tests {
 			routing_defaults: None,
 			deny_list: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let chain_ids = config.chain_ids();
@@ -683,6 +754,9 @@ mod tests {
 			routing_defaults: None,
 			deny_list: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		assert!(config.has_chain(10));
@@ -723,6 +797,9 @@ mod tests {
 			routing_defaults: None,
 			deny_list: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let network = config.get_network(10);
@@ -803,6 +880,9 @@ mod tests {
 			routing_defaults: None,
 			deny_list: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let json = serde_json::to_string(&config).unwrap();
