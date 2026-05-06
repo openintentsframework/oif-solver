@@ -1323,6 +1323,9 @@ fn build_seed_overrides(
 		monitoring_timeout_seconds: None,
 		deny_list: deny_list_path,
 		rebalance: None,
+		live_fill_estimate_enabled: None,
+		live_post_fill_estimate_chain_ids: None,
+		fee_policy: None,
 	})
 }
 
